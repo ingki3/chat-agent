@@ -1,0 +1,22 @@
+[
+  {
+    "text": "noted"
+  },
+  {
+    "turn": 0,
+    "modelUsage": [
+      "claude-haiku-5-5",
+      "claude-opus-5-5"
+    ],
+    "subtype": "success",
+    "text": "PINEAPPLE"
+  },
+  {
+    "turn": 1,
+    "modelUsage": [
+      "claude-haiku-5-5",
+      "claude-opus-5-5"
+    ],
+    "subtype": "success"
+  }
+]

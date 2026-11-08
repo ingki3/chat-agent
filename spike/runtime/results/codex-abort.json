@@ -1,0 +1,14 @@
+{
+  "items": [
+    "agent_message"
+  ],
+  "ms": 4050,
+  "events": {
+    "thread.started": 1,
+    "turn.started": 1,
+    "item.completed": 1
+  },
+  "errors": [
+    "The operation was aborted"
+  ]
+}

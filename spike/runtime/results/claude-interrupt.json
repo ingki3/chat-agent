@@ -1,0 +1,9 @@
+{
+  "deltas": 15,
+  "subtype": "error_during_execution",
+  "ms": 13012,
+  "textLen": 201,
+  "errors": [
+    "Claude Code returned an error result: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"
+  ]
+}

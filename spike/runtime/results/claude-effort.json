@@ -1,0 +1,38 @@
+{
+  "claude-opus-5-5:low": {
+    "text": "OK.",
+    "model": "claude-opus-5-5",
+    "subtype": "success",
+    "errors": [],
+    "modelUsage": [
+      "claude-opus-5-5"
+    ]
+  },
+  "claude-opus-5-5:max": {
+    "text": "OK.",
+    "model": "claude-opus-5-5",
+    "subtype": "success",
+    "errors": [],
+    "modelUsage": [
+      "claude-opus-5-5"
+    ]
+  },
+  "claude-haiku-5-5:low": {
+    "text": "OK",
+    "model": "claude-haiku-5-5",
+    "subtype": "success",
+    "errors": [],
+    "modelUsage": [
+      "claude-haiku-5-5"
+    ]
+  },
+  "claude-haiku-5-5:max": {
+    "text": "OK",
+    "model": "claude-haiku-5-5",
+    "subtype": "success",
+    "errors": [],
+    "modelUsage": [
+      "claude-haiku-5-5"
+    ]
+  }
+}

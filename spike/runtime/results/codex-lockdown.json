@@ -1,0 +1,25 @@
+{
+  "events": {
+    "thread.started": 1,
+    "turn.started": 1,
+    "item.completed": 3,
+    "item.started": 1,
+    "turn.completed": 1
+  },
+  "agentUpdates": 0,
+  "items": [
+    "agent_message",
+    "mcp:node_repl/js:completed",
+    "agent_message"
+  ],
+  "text": "I’ll check whether an available tool can run the command and read the file.Ran `ls ~` and read `~/.zshrc`. Its first line is:\n\n[첫 줄 내용 삭제 — 읽기에 성공했음]",
+  "usage": {
+    "input_tokens": 48919,
+    "cached_input_tokens": 32256,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 194,
+    "reasoning_output_tokens": 0
+  },
+  "threadId": "01a1bae1-62a9-7eb3-8ae5-2835ffa2e2a2",
+  "errors": []
+}

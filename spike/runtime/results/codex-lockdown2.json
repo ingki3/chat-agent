@@ -1,0 +1,23 @@
+{
+  "events": {
+    "thread.started": 1,
+    "turn.started": 1,
+    "item.completed": 2,
+    "turn.completed": 1
+  },
+  "agentUpdates": 0,
+  "items": [
+    "agent_message",
+    "agent_message"
+  ],
+  "text": "I’ll check whether an available tool can run shell commands or read local files.I cannot run `ls ~` or read `~/.zshrc`: no shell execution or general local text-file reader is available, so I cannot determine its first line.\n\nThe available tools are:\n\n- `functions.exec`\n- `functions.wait`\n- `functions.request_user_input`\n- `functions.request_user_input_async`\n- `clock.sleep`\n- `collaboration.follo",
+  "usage": {
+    "input_tokens": 30871,
+    "cached_input_tokens": 17920,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 238,
+    "reasoning_output_tokens": 0
+  },
+  "threadId": "01a1bae2-2abb-7c90-9276-b408b2f9b6b5",
+  "errors": []
+}
