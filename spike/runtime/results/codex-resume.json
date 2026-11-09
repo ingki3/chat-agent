@@ -1,0 +1,23 @@
+{
+  "resumedFrom": "01a1bda3-8799-7f13-bfa5-9291429d56fc",
+  "events": {
+    "thread.started": 1,
+    "turn.started": 1,
+    "item.completed": 1,
+    "turn.completed": 1
+  },
+  "agentUpdates": 0,
+  "items": [
+    "agent_message"
+  ],
+  "text": "x1",
+  "usage": {
+    "input_tokens": 58637,
+    "cached_input_tokens": 52480,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 274,
+    "reasoning_output_tokens": 0
+  },
+  "threadId": "01a1bda3-8799-7f13-bfa5-9291429d56fc",
+  "errors": []
+}

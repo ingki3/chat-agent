@@ -1,0 +1,9 @@
+{
+  "deltas": 15,
+  "subtype": "error_during_execution",
+  "interruptToEndMs": 583,
+  "interruptAckMs": 6,
+  "errors": [
+    "Claude Code returned an error result: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"
+  ]
+}

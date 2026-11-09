@@ -1,0 +1,8 @@
+{
+  "initTools": [
+    "mcp__echo__echo_time"
+  ],
+  "toolUses": [],
+  "text": "I couldn't run `ls ~` or read `~/.zshrc`, so I can't tell you the first line of that file. None of my tools can run shell commands or read files.\n\nThe only tool I have is:\n\n- **`mcp__echo__echo_time`** (from the `echo` MCP server): it returns the server time and repeats back a `tag` string you give it.\n\nTo get this done, you'd need to turn on a shell tool (such as Bash) or a file-reading tool (suc",
+  "permissionCallbacks": []
+}

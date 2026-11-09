@@ -1,0 +1,16 @@
+[
+  {
+    "text": "noted",
+    "answeredBy": "claude-opus-5-5",
+    "turn": 0,
+    "subtype": "success",
+    "sessionId": "182aa38d-e6d2-48d5-bbac-9fe31cbd2ec5"
+  },
+  {
+    "text": "PINEAPPLE",
+    "answeredBy": "claude-haiku-5-5",
+    "turn": 1,
+    "subtype": "success",
+    "sessionId": "182aa38d-e6d2-48d5-bbac-9fe31cbd2ec5"
+  }
+]
