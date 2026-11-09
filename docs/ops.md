@@ -66,16 +66,17 @@ pmset -g | grep -E ' sleep|disksleep|autorestart'
 ```bash
 pnpm install && pnpm build
 pnpm keygen                      # 처음 한 번 (3절)
-pnpm launchd print               # 설치될 plist 확인 (변경 없음)
-pnpm launchd install             # sudo · Access 보호 여부를 묻는다
-pnpm launchd status
+pnpm -s launchd print            # 설치될 plist 확인 (변경 없음)
+pnpm -s launchd install          # sudo · Access 보호 여부를 묻는다
+pnpm -s launchd status
 ```
 
 - 템플릿: `ops/launchd/com.agentlee.server.plist` → `/Library/LaunchDaemons/com.agentlee.server.plist` (root:wheel 644).
 - 서비스는 설치한 사용자 계정으로 실행된다(`UserName`). `HOME`을 지정하므로 마스터 키 기본 위치 `~/.agentlee/master.key`가 그대로 쓰인다.
 - `node`는 실제 설치 경로로 고정한다. 버전 관리자(fnm 등)가 셸마다 만드는 임시 경로는 재부팅 뒤 사라지므로 스크립트가 거부한다. 필요하면 `AGENTLEE_NODE=/path/to/node`.
-- 설치 전에 빌드 결과, 설정(`.env`) 유효성, 마스터 키 존재·권한 600을 확인하고, 하나라도 틀리면 설치하지 않는다.
-- `KeepAlive`로 비정상 종료 시 10초 간격 안에서 다시 시작한다. 제거: `pnpm launchd uninstall`.
+- 설치 전에 빌드 결과를 확인하고, **서비스 계정으로** 서버와 같은 로더를 실행해 설정(`.env`)과 마스터 키(존재·32바이트·권한 600·심볼릭 링크 아님·안전한 부모 디렉토리)를 검사한다. 하나라도 틀리면 설치하지 않는다.
+- 서비스 계정은 실제 존재하는 일반 계정이어야 한다(root 거부). 다른 계정으로 돌리려면 `AGENTLEE_USER=<계정>`. plist 값은 XML 이스케이프해서 넣는다.
+- `KeepAlive`로 비정상 종료 시 10초 간격 안에서 다시 시작한다. 제거: `pnpm -s launchd uninstall`.
 
 ### 5.3 업데이트 반영
 
@@ -124,13 +125,18 @@ sudo launchctl kickstart -k system/com.agentlee.server
 
 ```bash
 # 1) .env에 DIAG_STREAM=1 → 서비스 재시작   2) 측정   3) DIAG_STREAM 제거 → 재시작
-pnpm sse-probe "http://127.0.0.1:3000/api/diag/stream?seconds=10"                 # 로컬 기준값
-pnpm sse-probe "https://chat.2prostream.com/api/diag/stream?seconds=180" \
-  -H "Cookie: CF_Authorization=<브라우저에서 복사>" --json sse-probe-result.json
+pnpm -s sse-probe "http://127.0.0.1:3000/api/diag/stream?seconds=10"              # 로컬 기준값
+
+# Access 쿠키는 명령줄이 아니라 파일로 넘긴다 (권한 600, 측정 후 삭제).
+# 파일 내용 한 줄: Cookie: CF_Authorization=<브라우저에서 복사>  — 편집기로 넣는다(셸 기록에 남지 않게).
+install -m 600 /dev/null ~/.agentlee/probe-headers.txt && open -e ~/.agentlee/probe-headers.txt
+pnpm -s sse-probe "https://chat.2prostream.com/api/diag/stream?seconds=180" \
+  --header-file ~/.agentlee/probe-headers.txt --json sse-probe-result.json
+rm ~/.agentlee/probe-headers.txt
 ```
 
-- 판정: 상태 200 · `text/event-stream` · 헤더 2초 이내 · tick 180개 모두 · `done` 수신 · tick 간격 최대 3초 이하 · 몰려 도착한 tick 2개 이하. 실패하면 이유가 `reasons`에 나온다.
-- `-H` 값은 출력·결과 파일에 남지 않는다. 쿠키는 측정 후 브라우저에서 로그아웃해 무효화한다.
+- 판정: 상태 200 · `text/event-stream` · 헤더 2초 이내 · tick 180개 모두 · `done` 수신 · 헤더→첫 tick→…→`done` 간격 최대 3초 · heartbeat 간격 최대 20초 · 몰려 도착한 tick 2개 이하. 30초 동안 아무것도 오지 않거나 전체가 `seconds + 15초`를 넘으면 중단하고 실패로 보고한다. 실패 이유는 `reasons`에 나온다.
+- 헤더 값은 출력·결과 파일·오류 메시지에 남지 않는다. **`pnpm -s`로 실행**해야 pnpm이 명령줄을 다시 출력하지 않는다. `-H "Name: value"`는 로컬 시험용이다(명령줄 값은 셸 기록과 프로세스 목록에 보인다). 측정 후 브라우저에서 로그아웃해 쿠키를 무효화한다.
 
 ## 9. 로그와 가동률
 

@@ -1,8 +1,14 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import http from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
-import { analyse, sseParser, type Arrival } from "../../../scripts/sse-probe.js";
+import { analyse, parseHeaderLines, probe, sseParser, type Arrival } from "../../../scripts/sse-probe.js";
+import { REPO_ROOT } from "../src/config.js";
 
 const apps: { close: () => Promise<unknown> }[] = [];
 afterEach(async () => {
@@ -81,7 +87,7 @@ describe("sse-probe analysis", () => {
   const done: Arrival = { at: 5040, kind: "done" };
 
   it("passes a steady stream", () => {
-    const r = analyse(meta, [...steady, { at: 4000, kind: "comment" }, done]);
+    const r = analyse(meta, [{ at: 125, kind: "open" }, ...steady, { at: 4000, kind: "heartbeat" }, done]);
     expect(r).toMatchObject({ pass: true, ticks: 5, heartbeats: 1, done: true, maxGapMs: 1000, bunched: 0 });
   });
 
@@ -111,7 +117,70 @@ describe("sse-probe analysis", () => {
       ...parse('ck\ndata: {"seq":1,"t":1000}\n'),
       ...parse("\n: hb\n\nevent: done\ndata: {}\n\n"),
     ];
-    expect(got.map((g) => g.kind)).toEqual(["comment", "tick", "comment", "done"]);
+    expect(got.map((g) => g.kind)).toEqual(["open", "tick", "heartbeat", "done"]);
     expect(got[1]!.sentAt).toBe(1000);
+  });
+
+  it("parses CRLF streams, including a CRLF split across chunks", () => {
+    const parse = sseParser(() => 0);
+    const got = [...parse(': open\r\n\r\nevent: tick\r\ndata: {"t":5}\r'), ...parse("\n\r\n: hb\r\n\r\n")];
+    expect(got.map((g) => g.kind)).toEqual(["open", "tick", "heartbeat"]);
+  });
+
+  it("flags a late first tick, a late done and a missing heartbeat", () => {
+    const late = steady.map((a) => ({ ...a, at: a.at + 30_000 }));
+    const r = analyse(meta, [...late, { at: 35_040, kind: "done" }]);
+    expect(r.reasons.join("|")).toMatch(/max gap 30\d{3} ms/);
+    expect(r.reasons.join("|")).toMatch(/no heartbeat for/);
+    const lateDone = analyse(meta, [...steady, { at: 9000, kind: "done" }]);
+    expect(lateDone.reasons.join("|")).toMatch(/max gap 3970 ms/);
+  });
+});
+
+describe("sse-probe runtime safeguards", () => {
+  const tsx = path.join(REPO_ROOT, "node_modules/.bin/tsx");
+  const cli = (args: string[], script = path.join(REPO_ROOT, "scripts/sse-probe.ts")) =>
+    spawnSync(tsx, [script, ...args], { encoding: "utf8", cwd: REPO_ROOT });
+
+  it("gives up on a stream that stops sending (idle deadline) and reports instead of hanging", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(": open\n\n");
+    });
+    apps.push({ close: () => new Promise((r) => (server.closeAllConnections(), server.close(r))) });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as AddressInfo).port;
+    const r = await probe(`http://127.0.0.1:${port}/s?seconds=1`, {}, { idleMs: 200 });
+    expect(r.pass).toBe(false);
+    expect(r.reasons[0]).toBe("request failed: idle deadline");
+  });
+
+  it("never prints header values, even when the request fails", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-"));
+    const hf = path.join(dir, "h.txt");
+    fs.writeFileSync(hf, "# access cookie\nCookie: CF_Authorization=FILE-SECRET\n", { mode: 0o600 });
+    const out = path.join(dir, "out.json");
+    for (const args of [
+      ["http://127.0.0.1:9/api/diag/stream?seconds=1", "--header-file", hf, "--json", out],
+      ["http://127.0.0.1:9/api/diag/stream?seconds=1", "-H", "Cookie: ARG-SECRET"],
+      ["http://127.0.0.1:9/api/diag/stream?seconds=1", "-H", "X-Bad: BAD\u0001SECRET"],
+    ]) {
+      const r = cli(args);
+      expect(r.status, r.stderr).toBe(1);
+      const all = r.stdout + r.stderr + (fs.existsSync(out) ? fs.readFileSync(out, "utf8") : "");
+      expect(all).toMatch(/request failed/);
+      for (const secret of ["FILE-SECRET", "ARG-SECRET", "SECRET"]) expect(all).not.toContain(secret);
+    }
+    expect(parseHeaderLines("A: 1\r\n\n# x\nB:2:3")).toEqual({ A: "1", B: "2:3" });
+  });
+
+  it("runs as a CLI from a path with spaces and non-ASCII characters", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee probe 경로 "));
+    // .mts: outside the repo there is no package.json with "type": "module".
+    const copy = path.join(dir, "sse-probe.mts");
+    fs.copyFileSync(path.join(REPO_ROOT, "scripts/sse-probe.ts"), copy);
+    const r = cli([], copy);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/usage:/);
   });
 });

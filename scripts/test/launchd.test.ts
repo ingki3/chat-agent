@@ -8,7 +8,10 @@ import { describe, expect, it } from "vitest";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(root, "scripts/install-launchd.sh");
 const run = (env: Record<string, string>) =>
-  spawnSync("bash", [script, "print"], { env: { ...process.env, ...env }, encoding: "utf8" });
+  spawnSync("bash", [script, "print"], {
+    env: { ...process.env, AGENTLEE_NODE: process.execPath, ...env },
+    encoding: "utf8",
+  });
 
 describe("install-launchd.sh print", () => {
   it("renders a complete LaunchDaemon plist with a stable node path", () => {
@@ -39,5 +42,27 @@ describe("install-launchd.sh print", () => {
     const r = run({ AGENTLEE_NODE: path.join(dir, "node") });
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/temporary path/);
+  });
+
+  it("treats the user name as data, never as shell code, and refuses root", () => {
+    const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-")), "pwned");
+    const r = run({ AGENTLEE_USER: `$(touch ${marker})` });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/invalid user name/);
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(run({ AGENTLEE_USER: "no-such-user-agentlee" }).stderr).toMatch(/no such user/);
+    expect(run({ AGENTLEE_USER: "root" }).stderr).toMatch(/refusing to run the service as root/);
+  });
+
+  it("XML-escapes values and rejects relative log directories", () => {
+    const r = run({ AGENTLEE_LOG_DIR: "/tmp/a<b&c#d" });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("<string>/tmp/a&lt;b&amp;c#d/server.log</string>");
+    if (process.platform === "darwin") {
+      const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-plist-")), "p.plist");
+      fs.writeFileSync(f, r.stdout);
+      expect(execFileSync("plutil", ["-lint", f], { encoding: "utf8" })).toMatch(/OK/);
+    }
+    expect(run({ AGENTLEE_LOG_DIR: "logs" }).stderr).toMatch(/absolute path/);
   });
 });
