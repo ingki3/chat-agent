@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+coverage/
+playwright-report/
+test-results/
+.claude/worktrees/

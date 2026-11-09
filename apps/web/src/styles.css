@@ -1,0 +1,33 @@
+:root {
+  --bg: #faf9f6;
+  --fg: #1f1e1c;
+  --muted: #6b675f;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1a18;
+    --fg: #ecebe7;
+    --muted: #a39f96;
+  }
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Apple SD Gothic Neo",
+    sans-serif;
+}
+.shell {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  padding: 16px;
+}
+.status {
+  color: var(--muted);
+}
