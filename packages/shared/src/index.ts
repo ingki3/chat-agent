@@ -10,3 +10,5 @@ export const HealthResponse = z.object({
 export type HealthResponse = z.infer<typeof HealthResponse>;
 
 export const SERVICE_NAME = "Agent Lee";
+
+export const broken: number = "not a number";
