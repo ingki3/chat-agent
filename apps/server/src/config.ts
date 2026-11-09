@@ -23,6 +23,8 @@ const ConfigSchema = z.object({
   DATA_DIR: z.string().default("./data"),
   /** Master key file for credential encryption. Must live outside DATA_DIR so backups never include it. */
   MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
+  /** Enables /api/diag/stream for SSE measurements (scripts/sse-probe.ts). Off unless explicitly "1". */
+  DIAG_STREAM: z.enum(["0", "1"]).default("0"),
 });
 
 export type Config = {
@@ -31,6 +33,7 @@ export type Config = {
   port: number;
   dataDir: string;
   masterKeyPath: string;
+  diagStream: boolean;
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
@@ -51,5 +54,12 @@ export function loadConfig(
       "Invalid configuration — MASTER_KEY_PATH must be outside DATA_DIR (backups must not contain the key)",
     );
   }
-  return { env: c.NODE_ENV, host: c.HOST, port: c.PORT, dataDir, masterKeyPath };
+  return {
+    env: c.NODE_ENV,
+    host: c.HOST,
+    port: c.PORT,
+    dataDir,
+    masterKeyPath,
+    diagStream: c.DIAG_STREAM === "1",
+  };
 }
