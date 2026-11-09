@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@agentlee/shared";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
+import { registerGate, type GateOptions } from "./gate.js";
 import { BASE_HEADERS } from "./headers.js";
 import { loggerOptions } from "./logging.js";
 
@@ -42,6 +43,8 @@ export type BuildOptions = {
   logger?: boolean;
   /** Timing overrides for the diagnostic stream (tests). The route exists only when config.diagStream is set. */
   diag?: DiagOptions;
+  /** Rate-limit/clock overrides for the temporary gate (tests). Active only when config.tempGateCode is set. */
+  gate?: Omit<GateOptions, "code">;
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
@@ -53,6 +56,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
     return payload;
   });
+
+  // Before every route, static file and Vite middleware: nothing is served without the code.
+  if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
 
   app.get("/api/health", async (): Promise<HealthResponse> => ({
     status: "ok",
