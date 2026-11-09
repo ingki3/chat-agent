@@ -1,5 +1,5 @@
 {
-  "home": "/var/folders/hz/0v9383yn7p37t6_ylf_xhy500000gn/T/agentlee-codexhome-HLPQCb",
+  "home": "<tmp>/agentlee-codexhome-*",
   "filesAfter": [
     ".sandbox_migration",
     "goals_1.sqlite",
