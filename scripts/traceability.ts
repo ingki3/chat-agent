@@ -35,7 +35,8 @@ export function parsePrd(md: string): PrdParse {
     }
     const top = /^(\d+)\. /.exec(line);
     const indented = /^\s+(\d+)\. /.exec(line);
-    if (inFrChapter && indented) problems.push(`line ${i + 1}: indented numbered item is not tracked: ${line.trim()}`);
+    if (inFrChapter && indented)
+      problems.push(`line ${i + 1}: indented numbered item is not tracked: ${line.trim()}`);
     if (!top) continue;
     if (inFrChapter && !section) {
       problems.push(`line ${i + 1}: numbered requirement outside any FR section`);

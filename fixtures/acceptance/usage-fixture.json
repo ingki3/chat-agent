@@ -8,10 +8,50 @@
     }
   },
   "records": [
-    { "user": "dad", "runtime": "claude-code", "model": "claude-opus-5-5", "connection": "shared-anthropic-key", "auth": "api_key", "input": 100000, "output": 20000, "cacheRead": 50000, "cacheWrite": 0 },
-    { "user": "wife", "runtime": "claude-code", "model": "claude-opus-5-5", "connection": "shared-anthropic-key", "auth": "api_key", "input": 200000, "output": 10000, "cacheRead": 0, "cacheWrite": 40000 },
-    { "user": "son", "runtime": "codex", "model": "gpt-6.1-sol", "connection": "son-chatgpt", "auth": "subscription", "input": 300000, "output": 30000, "cacheRead": 100000, "cacheWrite": 0 },
-    { "user": "wife", "runtime": "codex", "model": "gpt-6.1-sol", "connection": "shared-openai-key", "auth": "api_key", "input": 100000, "output": 50000, "cacheRead": 0, "cacheWrite": 0 }
+    {
+      "user": "dad",
+      "runtime": "claude-code",
+      "model": "claude-opus-5-5",
+      "connection": "shared-anthropic-key",
+      "auth": "api_key",
+      "input": 100000,
+      "output": 20000,
+      "cacheRead": 50000,
+      "cacheWrite": 0
+    },
+    {
+      "user": "wife",
+      "runtime": "claude-code",
+      "model": "claude-opus-5-5",
+      "connection": "shared-anthropic-key",
+      "auth": "api_key",
+      "input": 200000,
+      "output": 10000,
+      "cacheRead": 0,
+      "cacheWrite": 40000
+    },
+    {
+      "user": "son",
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "connection": "son-chatgpt",
+      "auth": "subscription",
+      "input": 300000,
+      "output": 30000,
+      "cacheRead": 100000,
+      "cacheWrite": 0
+    },
+    {
+      "user": "wife",
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "connection": "shared-openai-key",
+      "auth": "api_key",
+      "input": 100000,
+      "output": 50000,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    }
   ],
   "expected": {
     "costUsdByRecord": [2.05, 3.0, null, 1.5],
