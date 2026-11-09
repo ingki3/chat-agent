@@ -1548,7 +1548,7 @@ plt.show()</pre>
     h+=`<h3 style="margin-top:14px">공유 현황 <span class="ref">FR-14.6</span></h3>`;
     h+= it.mode==='off'?'<div class="small muted">공유한 적이 없어요.</div>'
       :`<table><tr><th>가족</th><th>공유 시각</th><th>열어봄</th></tr>${Object.keys(it.seen).map(k=>`<tr><td>${FAM[k]}</td><td>${it.since}</td><td>${it.seen[k]}</td></tr>`).join('')}</table>`;
-    h+=`<div class="row" style="margin-top:14px"><span class="grow"></span><button data-close>취소</button><button class="primary" data-close>저장</button></div>`;
+    h+=`<div class="row" style="margin-top:14px"><span class="grow"></span><button data-close>취소</button><button class="primary" ${ss.mode==='some'&&!ss.rec.length?'disabled':'data-close'}>저장</button></div>`;
     $('#shareModal [data-body]').innerHTML=h;
   }
 
@@ -1611,29 +1611,33 @@ plt.show()</pre>
   // 사용자 추가·수정·비활성화의 초안 (FR-15.2 미리보기 입력)
   let ud={mode:'add',id:'wife',email:'wife@example.com',orig:'wife@example.com'};
   function userFoot(){
-    const add=ud.mode==='add', changed=!add&&ud.email.trim()!==ud.orig;
+    const add=ud.mode==='add', changed=!add&&ud.email.trim()!==ud.orig, pl=accessPlan(), diff=!pl.manual&&(pl.plus.length+pl.minus.length>0);
     const note=add?'<span class="small muted">저장하면 임시 비밀번호가 한 번 보여요 <span class="ref">FR-1.1</span></span>'
       :changed?'<span class="small">이메일이 바뀌어 Access 허용 목록도 바뀌어요. 저장 전에 확인해요. <span class="ref">FR-15.2</span></span>'
-      :'<span class="small muted">이메일이 그대로라 Access 허용 목록은 바뀌지 않아요.</span>';
-    const btn=add||changed?'<button class="primary" data-open="previewModal">다음: Access 변경 확인</button>':'<button class="primary" data-close>저장</button>';
+      :diff?'<span class="small">이메일은 그대로지만 Access 허용 목록이 앱과 달라 저장할 때 함께 맞춰요. 저장 전에 확인해요. <span class="ref">FR-15.2</span></span>'
+      :pl.manual?'<span class="small muted">이메일이 그대로라 Cloudflare에서 직접 바꿀 것이 없어요(수동 관리). <span class="ref">FR-15.4</span></span>':'<span class="small muted">Access 허용 목록이 앱과 같아 바뀌는 것이 없어요.</span>';
+    const btn=add||changed||diff?'<button class="primary" data-open="previewModal">다음: Access 변경 확인</button>':'<button class="primary" data-close>저장</button>';
     $('#userModal [data-ufoot]').innerHTML=`${note}<span class="grow"></span><button data-close>취소</button>${btn}`;
   }
   const EMAIL={dad:'ingki3@gmail.com',son:'son@example.com',wife:'wife@example.com'};
-  function renderPreview(arg){
-    if(arg&&arg.startsWith('dis-')){ const id=arg.slice(4); ud={mode:'dis',id,email:EMAIL[id],orig:EMAIL[id]}; }
+  // 저장 후 목표 목록(앱 활성 사용자 이메일) vs 지금 Access 목록 — 목업 상태별 (FR-15.2)
+  function accessPlan(){
     const st=$('#adminUsers').dataset.state, manual=st==='manual';
-    // 앱 활성 사용자 (변경 전) · 지금 Access 목록 — 목업 상태별
     const app0=st==='drift'?['dad','wife','son']:['dad','son'];
     const access=st==='drift'?['ingki3@gmail.com','wife@example.com','old@example.com']:['ingki3@gmail.com','son@example.com'];
     const em=Object.fromEntries(app0.map(k=>[k,EMAIL[k]]));
     const e=ud.email.trim();
-    if(ud.mode==='add') em[ud.id]=e; else if(ud.mode==='dis') delete em[ud.id]; else em[ud.id]=e;
+    if(ud.mode==='dis') delete em[ud.id]; else em[ud.id]=e;
     em.dad=EMAIL.dad; // 현재 관리자 이메일은 지울 수 없음 (FR-15.2) — 변경은 FR-15.7 절차
-    const target=Object.values(em), mine=new Set([e,ud.mode==='add'?e:ud.orig]);
-    const keep=access.filter(x=>target.includes(x)), plus=target.filter(x=>!access.includes(x)), minus=access.filter(x=>!target.includes(x));
+    const target=Object.values(em), mine=new Set(ud.mode==='add'?[e]:ud.mode==='dis'?[ud.orig]:e!==ud.orig?[e,ud.orig]:[]);
+    return {st,manual,e,keep:access.filter(x=>target.includes(x)),plus:target.filter(x=>!access.includes(x)),minus:access.filter(x=>!target.includes(x)),mine};
+  }
+  function renderPreview(arg){
+    if(arg&&arg.startsWith('dis-')){ const id=arg.slice(4); ud={mode:'dis',id,email:EMAIL[id],orig:EMAIL[id]}; }
+    const {st,manual,e,keep,plus,minus,mine}=accessPlan();
     const tag=x=>mine.has(x)?'<span class="muted">← 이 작업</span>':'<span class="muted">← 기존 불일치 정리</span>';
-    const nm={add:'추가',edit:'이메일 변경',dis:'비활성화'}[ud.mode], who=FAM[ud.id]||ud.id;
-    const what=ud.mode==='edit'?`${who} 이메일 변경 (${ud.orig} → ${e})`:`${who}(${ud.mode==='add'?e:ud.orig}) ${nm}`;
+    const nm={add:'추가',edit:'수정',dis:'비활성화'}[ud.mode], who=FAM[ud.id]||ud.id;
+    const what=ud.mode==='edit'?(e!==ud.orig?`${who} 이메일 변경 (${ud.orig} → ${e})`:`${who} 정보 수정 (이메일 그대로)`):`${who}(${ud.mode==='add'?e:ud.orig}) ${nm}`;
     const drift=plus.concat(minus).some(x=>!mine.has(x));
     const list=keep.map(x=>`&nbsp; ${x}${x===EMAIL.dad?' <span class="muted">(현재 관리자 — 삭제 불가)</span>':''}`)
       .concat(plus.map(x=>`<span class="add">+ ${x}</span> ${tag(x)}`),minus.map(x=>`<span class="del">− ${x}</span> ${tag(x)}`)).join('<br>');
