@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -159,5 +161,44 @@ describe("temporary access-code gate", () => {
       payload: "code=" + "1".repeat(5000),
     });
     expect(big.statusCode).toBe(413);
+  });
+
+  it("works in dev mode (Vite) and refuses Vite's WebSocket upgrade, which bypasses Fastify hooks", async () => {
+    const config = { ...loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: CODE }), port: 0 };
+    const app = await buildApp(config, { vite: true, logger: false });
+    apps.push(app);
+    expect((await app.inject("/")).statusCode).toBe(302);
+    for (const url of ["/gate", "/gate?x=1"]) {
+      const page = await app.inject(url);
+      expect(page.statusCode, url).toBe(200);
+      expect(page.body, url).toMatch(/접속 코드/);
+    }
+    const ok = await post(app, CODE);
+    expect(ok.statusCode).toBe(303);
+    const cookie = cookieOf(ok.headers["set-cookie"]);
+    expect((await app.inject({ url: "/", headers: { cookie } })).body).toContain("/@vite/client");
+
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const port = (app.server.address() as AddressInfo).port;
+    const status = await new Promise<number | string>((resolve) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port,
+        path: "/",
+        headers: {
+          Connection: "Upgrade",
+          Upgrade: "websocket",
+          "Sec-WebSocket-Version": "13",
+          "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+          "Sec-WebSocket-Protocol": "vite-hmr",
+        },
+      });
+      req.on("upgrade", (res, socket) => (socket.destroy(), resolve(res.statusCode ?? 0)));
+      req.on("response", (res) => (res.resume(), resolve(res.statusCode ?? 0)));
+      req.on("error", () => resolve("closed"));
+      req.setTimeout(2000, () => (req.destroy(), resolve("closed")));
+      req.end();
+    });
+    expect(status).not.toBe(101);
   });
 });

@@ -14,6 +14,7 @@ const isApiPath = (url: string | undefined) => {
 
 export const GATE_COOKIE = "al_gate";
 export const GATE_PATH = "/gate";
+export const isGatePath = (url: string | undefined) => (url ?? "/").split("?")[0] === GATE_PATH;
 
 export type GateOptions = {
   code: string;
@@ -111,8 +112,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       .send(page(message));
 
   app.addHook("onRequest", async (req, reply) => {
-    const pathname = (req.url ?? "/").split("?")[0];
-    if (pathname === GATE_PATH) return;
+    if (isGatePath(req.url)) return;
     if (valid(req)) return;
     if (isApiPath(req.url))
       return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
