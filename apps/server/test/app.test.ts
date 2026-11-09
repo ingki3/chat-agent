@@ -112,24 +112,33 @@ describe("logging", () => {
   it("only parses complete lines, even when a record arrives in several chunks", async () => {
     const { sanitizingStream } = await import("../src/logging.js");
     const { Writable } = await import("node:stream");
-    const got: string[] = [];
-    const dest = new Writable({ write: (c, _e, cb) => (got.push(String(c)), cb()) });
-    const s = sanitizingStream(dest);
-    const record =
-      JSON.stringify({ level: 30, msg: "ok", credentials: { msg: "SECRET-SPLIT" }, runId: "r9" }) + "\n";
-    const bytes = Buffer.from(record.replace("ok", "확인"));
-    for (const part of [
-      bytes.subarray(0, 12),
-      bytes.subarray(12, 31),
-      bytes.subarray(31, 33),
-      bytes.subarray(33),
-    ])
-      s.write(part);
-    await new Promise<void>((r) => s.end(r));
-    const out = got.join("");
-    expect(out).not.toContain("SECRET-SPLIT");
+    const run = async (parts: Buffer[]) => {
+      const got: string[] = [];
+      const dest = new Writable({ write: (c, _e, cb) => (got.push(String(c)), cb()) });
+      const s = sanitizingStream(dest);
+      for (const part of parts) s.write(part);
+      await new Promise<void>((r) => s.end(r));
+      return got;
+    };
+    const record = JSON.stringify({
+      level: 30,
+      msg: "확인",
+      credentials: { msg: "SECRET-SPLIT" },
+      runId: "r9",
+    });
+    const bytes = Buffer.from(record + "\n");
+    const hangul = bytes.indexOf(Buffer.from("확"));
+    // Cut inside the multi-byte character and inside the nested object.
+    const cuts = [hangul + 1, hangul + 4, bytes.indexOf(Buffer.from("SECRET")) + 2];
+    const parts = [0, ...cuts].map((start, k) => bytes.subarray(start, [...cuts, bytes.length][k]));
+    const got = await run(parts);
     expect(got).toHaveLength(1);
-    expect(JSON.parse(out)).toMatchObject({ msg: "확인", runId: "r9" });
+    expect(got[0]).not.toContain("SECRET-SPLIT");
+    expect(JSON.parse(got[0]!)).toMatchObject({ msg: "확인", runId: "r9" });
+    // A final record without a trailing newline is emitted exactly once on end().
+    const tail = await run([Buffer.from(record.slice(0, 10)), Buffer.from(record.slice(10))]);
+    expect(tail).toHaveLength(1);
+    expect(JSON.parse(tail[0]!)).toMatchObject({ msg: "확인" });
   });
 
   it("writes only allow-listed fields and strips query strings", async () => {
