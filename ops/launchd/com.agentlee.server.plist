@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Agent Lee server as a LaunchDaemon: starts at boot before any user logs in, restarts on crash.
+  Template — rendered by scripts/install-launchd.sh (placeholders __LIKE_THIS__). No secrets belong here:
+  settings come from <repo>/.env and the master key file (docs/ops.md).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentlee.server</string>
+  <key>UserName</key>
+  <string>__USER__</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>--enable-source-maps</string>
+    <string>__REPO__/apps/server/dist/index.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>StandardOutPath</key>
+  <string>__LOGDIR__/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/server.err.log</string>
+</dict>
+</plist>

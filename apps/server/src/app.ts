@@ -5,6 +5,8 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@agentlee/shared";
 import type { Config } from "./config.js";
+import { registerDiag, type DiagOptions } from "./diag.js";
+import { BASE_HEADERS } from "./headers.js";
 import { loggerOptions } from "./logging.js";
 
 const VERSION = "0.0.0";
@@ -32,14 +34,14 @@ export function isApiPath(url: string | undefined): boolean {
   return pathname === "/api" || pathname.startsWith("/api/");
 }
 
-const BASE_HEADERS = { "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } as const;
-
 export type BuildOptions = {
   /** Directory of the built SPA. Defaults to apps/web/dist. */
   webDist?: string;
   /** Attach Vite in middleware mode (one port for UI + API in development). */
   vite?: boolean;
   logger?: boolean;
+  /** Timing overrides for the diagnostic stream (tests). The route exists only when config.diagStream is set. */
+  diag?: DiagOptions;
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
@@ -58,6 +60,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     version: VERSION,
     uptimeSec: Math.round((Date.now() - startedAt) / 1000),
   }));
+
+  if (config.diagStream) registerDiag(app, opts.diag);
 
   // Unknown API routes are JSON 404s, never the SPA page.
   const apiNotFound = async (
