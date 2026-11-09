@@ -109,6 +109,29 @@ describe("server", () => {
 });
 
 describe("logging", () => {
+  it("only parses complete lines, even when a record arrives in several chunks", async () => {
+    const { sanitizingStream } = await import("../src/logging.js");
+    const { Writable } = await import("node:stream");
+    const got: string[] = [];
+    const dest = new Writable({ write: (c, _e, cb) => (got.push(String(c)), cb()) });
+    const s = sanitizingStream(dest);
+    const record =
+      JSON.stringify({ level: 30, msg: "ok", credentials: { msg: "SECRET-SPLIT" }, runId: "r9" }) + "\n";
+    const bytes = Buffer.from(record.replace("ok", "확인"));
+    for (const part of [
+      bytes.subarray(0, 12),
+      bytes.subarray(12, 31),
+      bytes.subarray(31, 33),
+      bytes.subarray(33),
+    ])
+      s.write(part);
+    await new Promise<void>((r) => s.end(r));
+    const out = got.join("");
+    expect(out).not.toContain("SECRET-SPLIT");
+    expect(got).toHaveLength(1);
+    expect(JSON.parse(out)).toMatchObject({ msg: "확인", runId: "r9" });
+  });
+
   it("writes only allow-listed fields and strips query strings", async () => {
     const lines: string[] = [];
     const { Writable } = await import("node:stream");
@@ -140,7 +163,11 @@ describe("logging", () => {
       headers: { cookie: "sid=SESSION-SECRET" },
       payload: { apiKey: "sk-BODY" },
     });
+    const boom = await app.inject({ method: "GET", url: "/boom" });
+    expect(boom.statusCode).toBe(500);
     const out = lines.join("");
+    expect(out).toContain('"msg":"child"');
+    expect(out).toContain('"msg":"error"');
     for (const leak of [
       "sk-TOPLEVEL",
       "PW-NESTED",
@@ -149,6 +176,9 @@ describe("logging", () => {
       "SESSION-SECRET",
       "sk-BODY",
       "PROMPT-IN-ERROR",
+      "sk-CHILD",
+      "PW-CHILD",
+      "THROWN-WITH-USER-DATA",
     ]) {
       expect(out, leak).not.toContain(leak);
     }

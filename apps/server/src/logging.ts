@@ -1,4 +1,5 @@
 import { Writable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import type { FastifyServerOptions } from "fastify";
 
 /**
@@ -40,18 +41,34 @@ export function sanitizeRecord(record: Obj): Obj {
  * This also covers child-logger bindings, which pino serialises without calling the log formatter.
  */
 export function sanitizingStream(dest: NodeJS.WritableStream = process.stdout): Writable {
+  // Buffer until a newline (and across UTF-8 boundaries) so a record split over several chunks is
+  // only parsed once it is complete — a fragment must never be emitted as its own record.
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  const emit = (line: string) => {
+    if (!line.trim()) return;
+    let out: string;
+    try {
+      out = JSON.stringify(sanitizeRecord(JSON.parse(line) as Obj));
+    } catch {
+      out = JSON.stringify({ level: 50, time: Date.now(), msg: "unparseable log line dropped" });
+    }
+    dest.write(out + "\n");
+  };
   return new Writable({
     write(chunk, _enc, cb) {
-      for (const line of String(chunk).split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          dest.write(JSON.stringify(sanitizeRecord(JSON.parse(line) as Obj)) + "\n");
-        } catch {
-          dest.write(
-            JSON.stringify({ level: 50, time: Date.now(), msg: "unparseable log line dropped" }) + "\n",
-          );
-        }
+      pending += typeof chunk === "string" ? chunk : decoder.write(chunk as Buffer);
+      let nl: number;
+      while ((nl = pending.indexOf("\n")) >= 0) {
+        emit(pending.slice(0, nl));
+        pending = pending.slice(nl + 1);
       }
+      cb();
+    },
+    final(cb) {
+      pending += decoder.end();
+      emit(pending);
+      pending = "";
       cb();
     },
   });
