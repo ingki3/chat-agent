@@ -3,7 +3,7 @@
 //   node scripts/launchd-helper.mjs check    — loads config and the master key exactly as the server does
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const xml = (s) =>
@@ -32,9 +32,11 @@ if (cmd === "render") {
   });
   process.stdout.write(out);
 } else if (cmd === "check") {
-  await import(path.join(repo, "apps/server/dist/env.js"));
-  const { loadConfig } = await import(path.join(repo, "apps/server/dist/config.js"));
-  const { loadMasterKey } = await import(path.join(repo, "apps/server/dist/crypto/secrets.js"));
+  // File URLs, not paths: a repo path containing "#" or "?" would otherwise be misread.
+  const dist = (f) => pathToFileURL(path.join(repo, "apps/server/dist", f)).href;
+  await import(dist("env.js"));
+  const { loadConfig } = await import(dist("config.js"));
+  const { loadMasterKey } = await import(dist("crypto/secrets.js"));
   try {
     const config = loadConfig();
     loadMasterKey(config.masterKeyPath); // throws on missing/short key, wrong mode, symlink, unsafe parent
