@@ -11,6 +11,7 @@
 ```bash
 pnpm install
 cp .env.example .env   # 필요하면 값 수정 (HOST는 루프백 주소만 허용)
+pnpm keygen            # 운영 전 1회: 인증 정보 암호화 마스터 키 생성 (docs/ops.md)
 
 pnpm dev               # 개발: http://localhost:3000 (UI + API 한 포트, Vite HMR)
 pnpm build && pnpm start   # 운영 빌드 실행: http://localhost:3000
@@ -26,7 +27,8 @@ pnpm build && pnpm start   # 운영 빌드 실행: http://localhost:3000
 | `apps/web` | React + TypeScript (Vite) SPA |
 | `packages/shared` | 서버·웹이 함께 쓰는 zod 스키마와 타입 |
 | `packages/mcp-tools` | 두 런타임이 함께 쓰는 공통 MCP 서버 (#43, #21) |
-| `docs/decisions/` | 결정 기록 |
+| `apps/server/drizzle` | SQLite 마이그레이션 (`pnpm db:generate`로 생성, 시작 시 자동 적용) |
+| `docs/` | 운영(`ops.md`), 추적표, 수용 시험 규격, 결정 기록 |
 | `spike/` | 스파이크 코드 (워크스페이스에 포함하지 않음) |
 | `mockup/` | 클릭 가능한 UI 목업 |
 

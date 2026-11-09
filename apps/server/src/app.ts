@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@agentlee/shared";
 import type { Config } from "./config.js";
+import { loggerOptions } from "./logging.js";
 
 const VERSION = "0.0.0";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -42,7 +43,7 @@ export type BuildOptions = {
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: opts.logger ?? config.env !== "test" });
+  const app = Fastify({ logger: (opts.logger ?? config.env !== "test") ? loggerOptions() : false });
   const startedAt = Date.now();
 
   app.addHook("onSend", async (_req, reply, payload) => {

@@ -1,6 +1,8 @@
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { isInside } from "./fs-safety.js";
 
 /** Repository root, resolved from apps/server/{src,dist}. `.env` and relative paths are anchored here. */
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -19,6 +21,8 @@ const ConfigSchema = z.object({
     }),
   PORT: z.coerce.number().int().min(0).max(65535).default(3000),
   DATA_DIR: z.string().default("./data"),
+  /** Master key file for credential encryption. Must live outside DATA_DIR so backups never include it. */
+  MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
 });
 
 export type Config = {
@@ -26,6 +30,7 @@ export type Config = {
   host: string;
   port: number;
   dataDir: string;
+  masterKeyPath: string;
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
@@ -39,5 +44,12 @@ export function loadConfig(
     throw new Error(`Invalid configuration — ${issues}`);
   }
   const c = parsed.data;
-  return { env: c.NODE_ENV, host: c.HOST, port: c.PORT, dataDir: path.resolve(baseDir, c.DATA_DIR) };
+  const dataDir = path.resolve(baseDir, c.DATA_DIR);
+  const masterKeyPath = path.resolve(baseDir, c.MASTER_KEY_PATH);
+  if (isInside(masterKeyPath, dataDir)) {
+    throw new Error(
+      "Invalid configuration — MASTER_KEY_PATH must be outside DATA_DIR (backups must not contain the key)",
+    );
+  }
+  return { env: c.NODE_ENV, host: c.HOST, port: c.PORT, dataDir, masterKeyPath };
 }
