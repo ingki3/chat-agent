@@ -107,3 +107,29 @@ describe("server", () => {
     expect(addr.address).toBe("127.0.0.1");
   });
 });
+
+describe("logging", () => {
+  it("redacts credentials from request logs", async () => {
+    const lines: string[] = [];
+    const { Writable } = await import("node:stream");
+    const stream = new Writable({ write: (c, _e, cb) => (lines.push(String(c)), cb()) });
+    const { default: Fastify } = await import("fastify");
+    const { LOG_REDACT } = await import("../src/app.js");
+    const app = Fastify({ logger: { level: "info", redact: LOG_REDACT, stream } });
+    apps.push(app);
+    app.post("/x", async (req) => {
+      req.log.info({ body: req.body }, "got");
+      return { ok: true };
+    });
+    await app.inject({
+      method: "POST",
+      url: "/x",
+      headers: { cookie: "sid=SESSION-SECRET" },
+      payload: { apiKey: "sk-LOGLEAK", password: "PW-LEAK" },
+    });
+    const out = lines.join("");
+    expect(out).not.toContain("sk-LOGLEAK");
+    expect(out).not.toContain("PW-LEAK");
+    expect(out).toContain("got");
+  });
+});

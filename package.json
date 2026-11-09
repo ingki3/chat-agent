@@ -15,7 +15,9 @@
     "test": "vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "db:migrate": "pnpm --filter @agentlee/server db:migrate",
+    "keygen": "pnpm --filter @agentlee/server keygen"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
@@ -32,6 +34,7 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
+      "better-sqlite3",
       "esbuild"
     ]
   }

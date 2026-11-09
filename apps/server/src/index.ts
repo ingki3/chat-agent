@@ -1,13 +1,12 @@
-import path from "node:path";
-import dotenv from "dotenv";
+import "./env.js";
 import { buildApp } from "./app.js";
-import { loadConfig, REPO_ROOT } from "./config.js";
-
-// Same .env regardless of where the process was started (pnpm runs scripts from apps/server).
-dotenv.config({ path: path.join(REPO_ROOT, ".env"), quiet: true });
+import { initStorage } from "./bootstrap.js";
+import { loadConfig } from "./config.js";
 
 const config = loadConfig();
+const storage = initStorage(config);
 const app = await buildApp(config, { vite: config.env === "development" });
+app.addHook("onClose", async () => storage.db.$client.close());
 
 try {
   await app.listen({ host: config.host, port: config.port });
