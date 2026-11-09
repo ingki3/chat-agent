@@ -1,5 +1,9 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
+
+/** Repository root, resolved from apps/server/{src,dist}. `.env` and relative paths are anchored here. */
+export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
 /** Hosts the server may bind to. The service is reachable from outside only through Cloudflare Tunnel (PRD D4). */
 export const LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "::1"] as const;
@@ -25,12 +29,15 @@ export type Config = {
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
-export function loadConfig(source: Record<string, string | undefined> = process.env): Config {
+export function loadConfig(
+  source: Record<string, string | undefined> = process.env,
+  baseDir: string = REPO_ROOT,
+): Config {
   const parsed = ConfigSchema.safeParse(source);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new Error(`Invalid configuration — ${issues}`);
   }
   const c = parsed.data;
-  return { env: c.NODE_ENV, host: c.HOST, port: c.PORT, dataDir: path.resolve(c.DATA_DIR) };
+  return { env: c.NODE_ENV, host: c.HOST, port: c.PORT, dataDir: path.resolve(baseDir, c.DATA_DIR) };
 }
