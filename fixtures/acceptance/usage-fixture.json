@@ -3,8 +3,18 @@
   "priceTable": {
     "version": "test-v1",
     "usdPerMTok": {
-      "claude-opus-5-5": { "input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5 },
-      "gpt-6.1-sol": { "input": 5, "output": 20, "cacheRead": 0.5, "cacheWrite": 0 }
+      "claude-opus-5-5": {
+        "input": 10,
+        "output": 50,
+        "cacheRead": 1,
+        "cacheWrite": 12.5
+      },
+      "gpt-6.1-sol": {
+        "input": 5,
+        "output": 20,
+        "cacheRead": 0.5,
+        "cacheWrite": 0
+      }
     }
   },
   "records": [
@@ -56,8 +66,14 @@
   "expected": {
     "costUsdByRecord": [2.05, 3.0, null, 1.5],
     "totalCostUsd": 6.55,
-    "byUserCostUsd": { "dad": 2.05, "wife": 4.5, "son": 0 },
-    "subscriptionTokensByUser": { "son": 330000 },
-    "note": "구독 기록은 비용이 아니라 토큰·횟수로만 집계한다(null). 입력 토큰 = input(캐시 읽기·쓰기 제외)."
+    "byUserCostUsd": {
+      "dad": 2.05,
+      "wife": 4.5,
+      "son": 0
+    },
+    "subscriptionTokensByUser": {
+      "son": 430000
+    },
+    "note": "구독 기록은 비용이 아니라 토큰·횟수로만 집계한다(null). 토큰 합계 = input + output + cacheRead + cacheWrite (input은 캐시 읽기·쓰기 제외)."
   }
 }
