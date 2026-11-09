@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@agentlee/shared";
 import type { Config } from "./config.js";
+import { loggerOptions } from "./logging.js";
 
 const VERSION = "0.0.0";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -33,24 +34,6 @@ export function isApiPath(url: string | undefined): boolean {
 
 const BASE_HEADERS = { "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" } as const;
 
-/** Never log credentials or session material (PRD NFR 관측성). Detailed allow-list policy: #46. */
-export const LOG_REDACT = {
-  paths: [
-    "req.headers.authorization",
-    "req.headers.cookie",
-    'req.headers["cf-access-jwt-assertion"]',
-    'res.headers["set-cookie"]',
-    "*.password",
-    "*.passwordHash",
-    "*.apiKey",
-    "*.token",
-    "*.accessToken",
-    "*.refreshToken",
-    "*.secret",
-  ],
-  censor: "***",
-};
-
 export type BuildOptions = {
   /** Directory of the built SPA. Defaults to apps/web/dist. */
   webDist?: string;
@@ -60,7 +43,7 @@ export type BuildOptions = {
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: (opts.logger ?? config.env !== "test") ? { redact: LOG_REDACT } : false });
+  const app = Fastify({ logger: (opts.logger ?? config.env !== "test") ? loggerOptions() : false });
   const startedAt = Date.now();
 
   app.addHook("onSend", async (_req, reply, payload) => {

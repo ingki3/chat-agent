@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { isInside } from "./fs-safety.js";
 
 /** Repository root, resolved from apps/server/{src,dist}. `.env` and relative paths are anchored here. */
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -45,8 +46,7 @@ export function loadConfig(
   const c = parsed.data;
   const dataDir = path.resolve(baseDir, c.DATA_DIR);
   const masterKeyPath = path.resolve(baseDir, c.MASTER_KEY_PATH);
-  const rel = path.relative(dataDir, masterKeyPath);
-  if (rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))) {
+  if (isInside(masterKeyPath, dataDir)) {
     throw new Error(
       "Invalid configuration — MASTER_KEY_PATH must be outside DATA_DIR (backups must not contain the key)",
     );

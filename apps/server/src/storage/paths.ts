@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isInside } from "../fs-safety.js";
 
 /** IDs used in paths must be simple tokens; this blocks traversal ("..", "/", "\\") by construction. */
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -33,8 +34,17 @@ export type StoragePaths = ReturnType<typeof storagePaths>;
 /** Creates the layout with owner-only permissions. Safe to call on every start. */
 export function ensureLayout(dataDir: string): StoragePaths {
   const p = storagePaths(dataDir);
+  fs.mkdirSync(p.root, { recursive: true, mode: 0o700 });
   for (const dir of [p.root, p.files, p.artifacts, p.runtimes, p.sources, p.backups]) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (dir !== p.root) {
+      const st = fs.lstatSync(dir, { throwIfNoEntry: false });
+      if (st?.isSymbolicLink()) throw new Error(`storage directory must not be a symlink: ${dir}`);
+      if (st && !st.isDirectory()) throw new Error(`storage path is not a directory: ${dir}`);
+      if (!st) fs.mkdirSync(dir, { mode: 0o700 });
+      if (!isInside(dir, p.root)) throw new Error(`storage directory escapes DATA_DIR: ${dir}`);
+    }
+    // Tighten permissions of pre-existing directories too (owner only).
+    if ((fs.statSync(dir).mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
   }
   return p;
 }

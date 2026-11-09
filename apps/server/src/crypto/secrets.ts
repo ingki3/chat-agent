@@ -55,15 +55,35 @@ function assertKey(key: Buffer): void {
  * live outside the data directory so backups never contain it (PRD NFR 가용성·백업).
  */
 export function loadMasterKey(keyPath: string): Buffer {
-  const st = fs.statSync(keyPath);
-  if ((st.mode & 0o077) !== 0) {
+  const dir = fs.lstatSync(path.dirname(keyPath));
+  if (!dir.isDirectory() || (dir.mode & 0o022) !== 0) {
     throw new SecretError(
-      `master key ${keyPath} must have mode 600 (found ${(st.mode & 0o777).toString(8)})`,
+      `master key directory ${path.dirname(keyPath)} must be a real directory not writable by others`,
     );
   }
-  const key = Buffer.from(fs.readFileSync(keyPath, "utf8").trim(), "base64");
-  assertKey(key);
-  return key;
+  // Open once without following symlinks, then check and read through the same descriptor (no swap window).
+  let fd: number;
+  try {
+    fd = fs.openSync(keyPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP")
+      throw new SecretError(`master key ${keyPath} must not be a symlink`);
+    throw e;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new SecretError(`master key ${keyPath} must be a regular file`);
+    if ((st.mode & 0o077) !== 0) {
+      throw new SecretError(
+        `master key ${keyPath} must have mode 600 (found ${(st.mode & 0o777).toString(8)})`,
+      );
+    }
+    const key = Buffer.from(fs.readFileSync(fd, "utf8").trim(), "base64");
+    assertKey(key);
+    return key;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Creates a new master key file with mode 600. Refuses to overwrite an existing key. */

@@ -15,7 +15,12 @@ export function initStorage(config: Config): Storage {
   const paths = ensureLayout(config.dataDir);
   let masterKey: Buffer;
   if (fs.existsSync(config.masterKeyPath)) masterKey = loadMasterKey(config.masterKeyPath);
-  else if (config.env !== "production") masterKey = createMasterKey(config.masterKeyPath);
+  else if (config.env !== "production" && !fs.existsSync(paths.db))
+    masterKey = createMasterKey(config.masterKeyPath);
+  else if (config.env !== "production")
+    throw new Error(
+      `master key missing at ${config.masterKeyPath} but ${paths.db} already exists — restore the key (docs/ops.md §3); a new key could not decrypt existing credentials`,
+    );
   else
     throw new Error(`master key not found at ${config.masterKeyPath} — run "pnpm keygen" (see docs/ops.md)`);
   const db = openDb(paths.db);

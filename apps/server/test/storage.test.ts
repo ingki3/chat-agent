@@ -43,6 +43,21 @@ describe("secrets", () => {
     expect(mask("abc")).toBe("••••");
   });
 
+  it("rejects a symlinked key and a key directory writable by others", () => {
+    const dir = tmp();
+    const real = path.join(dir, "real.key");
+    createMasterKey(real);
+    const link = path.join(dir, "link.key");
+    fs.symlinkSync(real, link);
+    expect(() => loadMasterKey(link)).toThrow(/symlink/);
+    const open = path.join(tmp(), "open");
+    fs.mkdirSync(open, { mode: 0o777 });
+    fs.chmodSync(open, 0o777);
+    const k = path.join(open, "master.key");
+    fs.writeFileSync(k, Buffer.alloc(KEY_LEN, 1).toString("base64"), { mode: 0o600 });
+    expect(() => loadMasterKey(k)).toThrow(/not writable by others/);
+  });
+
   it("creates a mode-600 key file, refuses to overwrite, and rejects loose permissions", () => {
     const file = path.join(tmp(), "k", "master.key");
     const created = createMasterKey(file);
@@ -76,7 +91,7 @@ describe("database", () => {
     db.$client.close();
   });
 
-  it("never writes secret plaintext to the database file", () => {
+  it("never writes secret plaintext to the database or its WAL", () => {
     const dir = tmp();
     const file = path.join(dir, "s.db");
     const db = openDb(file);
@@ -85,6 +100,11 @@ describe("database", () => {
     store.setSecret("cloudflare.apiToken", "CF-SECRET-PLAINTEXT-9876");
     store.set("cloudflare.accountName", "family");
     expect(store.get("cloudflare.apiToken")).toBe("CF-SECRET-PLAINTEXT-9876");
+    // Before checkpoint: the change lives in the WAL, which must not hold the plaintext either.
+    const walBytes = () => Buffer.concat(fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f))));
+    expect(fs.existsSync(`${file}-wal`)).toBe(true);
+    expect(walBytes().includes("family")).toBe(true); // sanity: the scan does see stored values
+    expect(walBytes().includes("CF-SECRET-PLAINTEXT-9876")).toBe(false);
     db.$client.pragma("wal_checkpoint(TRUNCATE)");
     db.$client.close();
     const bytes = Buffer.concat(fs.readdirSync(dir).map((f) => fs.readFileSync(path.join(dir, f))));
@@ -99,6 +119,19 @@ describe("storage layout", () => {
     for (const d of [p.root, p.files, p.artifacts, p.runtimes, p.sources, p.backups]) {
       expect(fs.statSync(d).mode & 0o777).toBe(0o700);
     }
+  });
+
+  it("refuses symlinked managed directories and tightens loose permissions", () => {
+    const root = path.join(tmp(), "data");
+    fs.mkdirSync(root, { mode: 0o700 });
+    const outside = tmp();
+    fs.symlinkSync(outside, path.join(root, "files"));
+    expect(() => ensureLayout(root)).toThrow(/symlink/);
+    const root2 = path.join(tmp(), "data");
+    fs.mkdirSync(path.join(root2, "artifacts"), { recursive: true });
+    fs.chmodSync(path.join(root2, "artifacts"), 0o777);
+    ensureLayout(root2);
+    expect(fs.statSync(path.join(root2, "artifacts")).mode & 0o777).toBe(0o700);
   });
 
   it("rejects ids that could escape the layout", () => {
@@ -135,5 +168,18 @@ describe("bootstrap", () => {
       MASTER_KEY_PATH: path.join(dir, "k2", "master.key"),
     });
     expect(() => initStorage(prod)).toThrow(/pnpm keygen/);
+  });
+
+  it("does not create a new key over existing data in development", () => {
+    const dir = tmp();
+    const cfg = loadConfig({
+      NODE_ENV: "development",
+      DATA_DIR: path.join(dir, "data"),
+      MASTER_KEY_PATH: path.join(dir, "k", "master.key"),
+    });
+    initStorage(cfg).db.$client.close();
+    fs.rmSync(cfg.masterKeyPath);
+    expect(() => initStorage(cfg)).toThrow(/restore the key/);
+    expect(fs.existsSync(cfg.masterKeyPath)).toBe(false);
   });
 });

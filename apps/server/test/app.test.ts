@@ -109,27 +109,46 @@ describe("server", () => {
 });
 
 describe("logging", () => {
-  it("redacts credentials from request logs", async () => {
+  it("writes only allow-listed fields and strips query strings", async () => {
     const lines: string[] = [];
     const { Writable } = await import("node:stream");
     const stream = new Writable({ write: (c, _e, cb) => (lines.push(String(c)), cb()) });
     const { default: Fastify } = await import("fastify");
-    const { LOG_REDACT } = await import("../src/app.js");
-    const app = Fastify({ logger: { level: "info", redact: LOG_REDACT, stream } });
+    const { loggerOptions } = await import("../src/logging.js");
+    const app = Fastify({ logger: { ...loggerOptions(), stream } });
     apps.push(app);
     app.post("/x", async (req) => {
-      req.log.info({ body: req.body }, "got");
+      req.log.info(
+        {
+          apiKey: "sk-TOPLEVEL",
+          credentials: { password: "PW-NESTED" },
+          content: "MY-PRIVATE-PROMPT",
+          conversationId: "c1",
+        },
+        "got",
+      );
+      req.log.error(new Error("failed with PROMPT-IN-ERROR"));
       return { ok: true };
     });
     await app.inject({
       method: "POST",
-      url: "/x",
+      url: "/x?token=QUERY-TOKEN",
       headers: { cookie: "sid=SESSION-SECRET" },
-      payload: { apiKey: "sk-LOGLEAK", password: "PW-LEAK" },
+      payload: { apiKey: "sk-BODY" },
     });
     const out = lines.join("");
-    expect(out).not.toContain("sk-LOGLEAK");
-    expect(out).not.toContain("PW-LEAK");
-    expect(out).toContain("got");
+    for (const leak of [
+      "sk-TOPLEVEL",
+      "PW-NESTED",
+      "MY-PRIVATE-PROMPT",
+      "QUERY-TOKEN",
+      "SESSION-SECRET",
+      "sk-BODY",
+      "PROMPT-IN-ERROR",
+    ]) {
+      expect(out, leak).not.toContain(leak);
+    }
+    expect(out).toContain('"conversationId":"c1"');
+    expect(out).toContain('"url":"/x"');
   });
 });
