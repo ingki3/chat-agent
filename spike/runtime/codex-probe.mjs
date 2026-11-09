@@ -47,6 +47,7 @@ const tests = {
     save("codex-stream", { ...r, threadId: t.id ?? r.threadId });
   },
   async resume() {
+    await tests.stream();
     const first = JSON.parse(fs.readFileSync(new URL("./results/codex-stream.json", import.meta.url)));
     const t = codex().resumeThread(first.threadId, threadOpts());
     const r = await run(t, "What tag did you pass to echo_time earlier in this conversation? Answer with the tag only.");
@@ -60,6 +61,13 @@ const tests = {
     const t2 = c.resumeThread(t1.id ?? a.threadId, threadOpts({ modelReasoningEffort: "high" }));
     const b = await run(t2, "What word did I ask you to remember? One word.");
     save("codex-modelswitch", { first: a.text, second: b.text, usage2: b.usage, errors: [...a.errors, ...b.errors] });
+  },
+  async mcp_noapprove() {
+    // Control: MCP server without default_tools_approval_mode under approval policy "never".
+    const cfg = { ...LOCKED, mcp_servers: { echo: { command: process.execPath, args: [ECHO] }, node_repl: { enabled: false } } };
+    const t = codex({ config: cfg }).startThread(threadOpts());
+    const r = await run(t, "Call the echo_time tool with tag 'n1' and report its output.");
+    save("codex-mcp-noapprove", { items: r.items, text: r.text });
   },
   async lockdown() {
     const t = codex().startThread(threadOpts());
@@ -76,7 +84,7 @@ const tests = {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-codexhome-"));
     const t = codex({ env: { CODEX_HOME: home } }).startThread(threadOpts());
     const r = await run(t, "Say OK.");
-    save("codex-codexhome", { home, filesAfter: fs.readdirSync(home), text: r.text, errors: r.errors });
+    save("codex-codexhome", { home: "<tmp>/agentlee-codexhome-*", filesAfter: fs.readdirSync(home), text: r.text, errors: r.errors });
   },
   async effort() {
     const res = {};

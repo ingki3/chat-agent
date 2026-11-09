@@ -1,5 +1,5 @@
 {
-  "dir": "/var/folders/hz/0v9383yn7p37t6_ylf_xhy500000gn/T/agentlee-cfg-UtG7PQ",
+  "dir": "<tmp>/agentlee-cfg-*",
   "filesAfter": [
     ".claude.json",
     "backups",

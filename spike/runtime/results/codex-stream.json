@@ -13,14 +13,14 @@
     "mcp:echo/echo_time:completed",
     "agent_message"
   ],
-  "text": "I’ll count to 30, then call `echo_time` with tag `x1`.\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30\nECHO_OK tag=x1 time=2026-11-08T11:18:11.599Z token=run-456",
+  "text": "I’ll count from 1 to 30, then call `echo_time` with tag `x1`.\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30\n\n`ECHO_OK tag=x1 time=2026-11-09T00:09:40.612Z runToken=present`",
   "usage": {
-    "input_tokens": 43848,
-    "cached_input_tokens": 32384,
+    "input_tokens": 43769,
+    "cached_input_tokens": 37760,
     "cache_write_input_tokens": 0,
-    "output_tokens": 215,
-    "reasoning_output_tokens": 12
+    "output_tokens": 268,
+    "reasoning_output_tokens": 0
   },
-  "threadId": "01a1bae1-2dce-7702-b244-7a810143985c",
+  "threadId": "01a1bda3-8799-7f13-bfa5-9291429d56fc",
   "errors": []
 }

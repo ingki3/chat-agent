@@ -1,5 +1,5 @@
 {
-  "resumedFrom": "01a1bae0-c417-71e1-968c-6f7de5893dc3",
+  "resumedFrom": "01a1bda3-8799-7f13-bfa5-9291429d56fc",
   "events": {
     "thread.started": 1,
     "turn.started": 1,
@@ -12,12 +12,12 @@
   ],
   "text": "x1",
   "usage": {
-    "input_tokens": 58639,
-    "cached_input_tokens": 46848,
+    "input_tokens": 58637,
+    "cached_input_tokens": 52480,
     "cache_write_input_tokens": 0,
-    "output_tokens": 226,
-    "reasoning_output_tokens": 11
+    "output_tokens": 274,
+    "reasoning_output_tokens": 0
   },
-  "threadId": "01a1bae0-c417-71e1-968c-6f7de5893dc3",
+  "threadId": "01a1bda3-8799-7f13-bfa5-9291429d56fc",
   "errors": []
 }

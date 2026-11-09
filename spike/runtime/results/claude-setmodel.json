@@ -1,22 +1,16 @@
 [
   {
-    "text": "noted"
-  },
-  {
+    "text": "noted",
+    "answeredBy": "claude-opus-5-5",
     "turn": 0,
-    "modelUsage": [
-      "claude-haiku-5-5",
-      "claude-opus-5-5"
-    ],
     "subtype": "success",
-    "text": "PINEAPPLE"
+    "sessionId": "182aa38d-e6d2-48d5-bbac-9fe31cbd2ec5"
   },
   {
+    "text": "PINEAPPLE",
+    "answeredBy": "claude-haiku-5-5",
     "turn": 1,
-    "modelUsage": [
-      "claude-haiku-5-5",
-      "claude-opus-5-5"
-    ],
-    "subtype": "success"
+    "subtype": "success",
+    "sessionId": "182aa38d-e6d2-48d5-bbac-9fe31cbd2ec5"
   }
 ]

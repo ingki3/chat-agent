@@ -1,18 +1,18 @@
 {
-  "resumedFrom": "a4f4547d-7aee-4267-9630-88f7a29b8d89",
+  "resumedFrom": "7292dc9d-a447-4d43-a262-27047fe0fc79",
   "deltas": 0,
   "text": "c1",
   "toolUses": [],
   "toolResults": [],
-  "sessionId": "a4f4547d-7aee-4267-9630-88f7a29b8d89",
+  "sessionId": "7292dc9d-a447-4d43-a262-27047fe0fc79",
   "result": {
     "subtype": "success",
     "is_error": false,
-    "cost": 0.1540767,
+    "cost": 0.1347641,
     "usage": {
       "input_tokens": 2,
-      "cache_creation_input_tokens": 1584,
-      "cache_read_input_tokens": 15329,
+      "cache_creation_input_tokens": 839,
+      "cache_read_input_tokens": 14732,
       "output_tokens": 4,
       "output_tokens_details": {
         "thinking_tokens": 0
@@ -23,7 +23,7 @@
       },
       "service_tier": "standard",
       "cache_creation": {
-        "ephemeral_1h_input_tokens": 1584,
+        "ephemeral_1h_input_tokens": 839,
         "ephemeral_5m_input_tokens": 0
       },
       "inference_geo": "global",
@@ -31,11 +31,11 @@
         {
           "input_tokens": 2,
           "output_tokens": 4,
-          "cache_read_input_tokens": 15329,
-          "cache_creation_input_tokens": 1584,
+          "cache_read_input_tokens": 14732,
+          "cache_creation_input_tokens": 839,
           "cache_creation": {
             "ephemeral_5m_input_tokens": 0,
-            "ephemeral_1h_input_tokens": 1584
+            "ephemeral_1h_input_tokens": 839
           },
           "type": "message"
         }
@@ -59,14 +59,14 @@
       },
       "claude-opus-5-5": {
         "inputTokens": 6,
-        "outputTokens": 330,
-        "thinkingTokens": 20,
-        "cacheReadInputTokens": 15329,
-        "cacheCreationInputTokens": 18032,
+        "outputTokens": 209,
+        "thinkingTokens": 0,
+        "cacheReadInputTokens": 29306,
+        "cacheCreationInputTokens": 15571,
         "cacheCreationEphemeral5mInputTokens": 0,
-        "cacheCreationEphemeral1hInputTokens": 18032,
+        "cacheCreationEphemeral1hInputTokens": 15571,
         "webSearchRequests": 0,
-        "costUSD": 0.15394580000000002,
+        "costUSD": 0.1346332,
         "contextWindow": 1000000,
         "maxOutputTokens": 128000,
         "canonicalModel": "claude-opus-5-5",
@@ -87,5 +87,9 @@
     }
   ],
   "model": "claude-opus-5-5",
-  "errors": []
+  "errors": [],
+  "assistantModels": [
+    "claude-opus-5-5"
+  ],
+  "endAt": 1794182849412
 }
