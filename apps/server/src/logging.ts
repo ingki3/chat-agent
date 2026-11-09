@@ -1,3 +1,4 @@
+import { Writable } from "node:stream";
 import type { FastifyServerOptions } from "fastify";
 
 /**
@@ -27,8 +28,40 @@ export const LOG_ALLOWED_FIELDS = new Set([
 
 type Obj = Record<string, unknown>;
 
-export function loggerOptions(): Exclude<FastifyServerOptions["logger"], boolean | undefined> {
+/** Keeps allow-listed keys; any record carrying an error gets a fixed message (error text may hold user data). */
+export function sanitizeRecord(record: Obj): Obj {
+  const out = Object.fromEntries(Object.entries(record).filter(([k]) => LOG_ALLOWED_FIELDS.has(k)));
+  if ("err" in record) out.msg = "error";
+  return out;
+}
+
+/**
+ * Final gate in front of the real destination: re-parses each JSON line and applies `sanitizeRecord`.
+ * This also covers child-logger bindings, which pino serialises without calling the log formatter.
+ */
+export function sanitizingStream(dest: NodeJS.WritableStream = process.stdout): Writable {
+  return new Writable({
+    write(chunk, _enc, cb) {
+      for (const line of String(chunk).split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          dest.write(JSON.stringify(sanitizeRecord(JSON.parse(line) as Obj)) + "\n");
+        } catch {
+          dest.write(
+            JSON.stringify({ level: 50, time: Date.now(), msg: "unparseable log line dropped" }) + "\n",
+          );
+        }
+      }
+      cb();
+    },
+  });
+}
+
+export function loggerOptions(
+  dest?: NodeJS.WritableStream,
+): Exclude<FastifyServerOptions["logger"], boolean | undefined> {
   return {
+    stream: sanitizingStream(dest),
     level: process.env.LOG_LEVEL ?? "info",
     serializers: {
       // Path only: query strings can carry tokens.

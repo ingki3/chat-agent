@@ -115,9 +115,13 @@ describe("logging", () => {
     const stream = new Writable({ write: (c, _e, cb) => (lines.push(String(c)), cb()) });
     const { default: Fastify } = await import("fastify");
     const { loggerOptions } = await import("../src/logging.js");
-    const app = Fastify({ logger: { ...loggerOptions(), stream } });
+    const app = Fastify({ logger: loggerOptions(stream) });
     apps.push(app);
+    app.get("/boom", async () => {
+      throw new Error("THROWN-WITH-USER-DATA");
+    });
     app.post("/x", async (req) => {
+      req.log.child({ apiKey: "sk-CHILD", credentials: { password: "PW-CHILD" }, runId: "r1" }).info("child");
       req.log.info(
         {
           apiKey: "sk-TOPLEVEL",
@@ -150,5 +154,6 @@ describe("logging", () => {
     }
     expect(out).toContain('"conversationId":"c1"');
     expect(out).toContain('"url":"/x"');
+    expect(out).toContain('"runId":"r1"');
   });
 });
