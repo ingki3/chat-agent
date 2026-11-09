@@ -1,0 +1,44 @@
+[
+  {
+    "strict": false,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  },
+  {
+    "strict": false,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  },
+  {
+    "strict": false,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  },
+  {
+    "strict": true,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  },
+  {
+    "strict": true,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  },
+  {
+    "strict": true,
+    "servers": [
+      "echo:connected"
+    ],
+    "nonEchoTools": 0
+  }
+]
