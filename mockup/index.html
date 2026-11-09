@@ -1,0 +1,1787 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Lee — UI 목업 v2</title>
+<style>
+:root{
+  --bg:#f7f6f3; --panel:#ffffff; --side:#efede8; --line:#dedad2; --text:#23211d; --muted:#6f6a60;
+  --accent:#2f5d8a; --accent-weak:#e3ecf5; --ok:#2e7d4f; --ok-weak:#e3f2e8; --warn:#a2581a; --warn-weak:#fbeedd;
+  --err:#b3261e; --err-weak:#fbe4e2; --chip:#ece9e2; --shadow:0 6px 24px rgba(0,0,0,.08);
+  --claude:#c96442; --codex:#3d7a5a; --up:#d23f31; --down:#2f6fd0; --code:#f1efea;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#1d1c1a; --panel:#262522; --side:#201f1c; --line:#3a3833; --text:#ecebe7; --muted:#a09b90;
+    --accent:#7fb0e0; --accent-weak:#24323f; --ok:#6cc08f; --ok-weak:#1f3327; --warn:#e3a066; --warn-weak:#3a2b1d;
+    --err:#f08b84; --err-weak:#3d2220; --chip:#33312d; --shadow:0 6px 24px rgba(0,0,0,.4);
+    --up:#f07a6e; --down:#6fa3f0; --code:#1a1917;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#1d1c1a; --panel:#262522; --side:#201f1c; --line:#3a3833; --text:#ecebe7; --muted:#a09b90;
+  --accent:#7fb0e0; --accent-weak:#24323f; --ok:#6cc08f; --ok-weak:#1f3327; --warn:#e3a066; --warn-weak:#3a2b1d;
+  --err:#f08b84; --err-weak:#3d2220; --chip:#33312d; --shadow:0 6px 24px rgba(0,0,0,.4);
+  --up:#f07a6e; --down:#6fa3f0; --code:#1a1917;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Pretendard","Noto Sans KR",sans-serif}
+a{color:var(--accent)}
+button{font:inherit;color:inherit;background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer;white-space:nowrap}
+td:first-child{white-space:nowrap}
+button.primary{background:var(--accent);color:#fff;border-color:transparent}
+button.ghost{background:transparent;border-color:transparent}
+button.danger{color:var(--err)}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select,textarea{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 9px;width:100%}
+input[type=checkbox],input[type=radio]{width:auto;margin:0}
+textarea{resize:vertical}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+label.ck{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--text);margin:2px 12px 2px 0;cursor:pointer}
+h1,h2,h3{margin:0 0 8px;line-height:1.3}
+h1{font-size:20px} h2{font-size:16px} h3{font-size:14px}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:var(--code);border-radius:4px;padding:0 4px}
+.muted{color:var(--muted)} .small{font-size:12px} .row{display:flex;gap:8px;align-items:center} .wrap{flex-wrap:wrap}
+.grow{flex:1} .sp{justify-content:space-between}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;overflow-x:auto}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:2px 9px;font-size:12px;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.dot.claude{background:var(--claude)} .dot.codex{background:var(--codex)} .dot.none{background:transparent;border:1px solid var(--muted)}
+.badge{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;background:var(--accent-weak);color:var(--accent);white-space:nowrap}
+.badge.ok{background:var(--ok-weak);color:var(--ok)} .badge.warn{background:var(--warn-weak);color:var(--warn)} .badge.err{background:var(--err-weak);color:var(--err)} .badge.gray{background:var(--chip);color:var(--muted)}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.ref{font-size:11px;color:var(--muted);border:1px dashed var(--line);border-radius:6px;padding:1px 6px;margin-left:6px;white-space:nowrap;font-weight:400}
+
+/* mockup nav (리뷰용, 실제 앱에는 없음) */
+#mocknav{position:sticky;top:0;z-index:50;background:#111;color:#ddd;padding:6px 10px;display:flex;gap:4px;align-items:center;overflow-x:auto;font-size:12px;height:34px}
+#mocknav b{color:#fff;margin-right:6px;white-space:nowrap}
+#mocknav a{color:#bbb;text-decoration:none;padding:3px 7px;border-radius:6px;white-space:nowrap}
+#mocknav a.on{background:#333;color:#fff}
+#mocknav .sep{flex:1}
+#mocknav .who{color:#9fd3a8;white-space:nowrap;margin:0 6px}
+#mocknav select{width:auto;background:#222;color:#ddd;border-color:#444;padding:2px 6px;font-size:12px}
+/* 목업 상태 전환 막대 (리뷰용, 실제 앱 UI 아님) */
+.mstate{display:flex;gap:4px;align-items:center;flex-wrap:wrap;background:#111;color:#ccc;border-radius:8px;padding:5px 8px;font-size:11.5px;margin:0 0 10px}
+.mstate b{color:#fff;font-weight:600;margin-right:4px}
+.mstate span[data-mst]{padding:2px 8px;border-radius:6px;cursor:pointer;color:#bbb}
+.mstate span[data-mst].on{background:#3a3a3a;color:#fff}
+
+section[data-screen]{display:none}
+section[data-screen].on{display:block}
+
+/* app shell */
+.app{display:flex;height:calc(100vh - 34px);min-height:560px;position:relative}
+.side{width:264px;flex:none;background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:10px;gap:2px;overflow-y:auto}
+.brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px;padding:4px 6px 10px}
+.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,var(--accent),#6d8fb3);color:#fff;display:grid;place-items:center;font-size:13px;font-weight:800;flex:none}
+.side .item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}
+.side .item:hover,.side .item.on{background:var(--chip)}
+.side .grp{font-size:11px;color:var(--muted);margin:10px 8px 2px}
+.side .conv{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:8px;font-size:13px;color:var(--text);text-decoration:none;white-space:nowrap;overflow:hidden}
+.side .conv .t{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.side .conv:hover,.side .conv.on{background:var(--chip)}
+.side .new{display:inline-block;margin-left:auto;background:var(--accent);color:#fff;border-radius:999px;font-size:10px;padding:0 6px;flex:none}
+.side .me{margin-top:auto;border-top:1px solid var(--line);padding-top:8px}
+.main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
+.topbar{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);position:relative}
+.topbar .title{font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.topbar.mob{display:none;position:sticky;top:0;background:var(--bg);z-index:5}
+.thread{flex:1;overflow-y:auto;padding:18px 0}
+.col{max-width:760px;margin:0 auto;padding:0 18px}
+.msg{margin:0 0 20px}
+.msg.user .bubble{background:var(--chip);border-radius:14px;padding:10px 14px;margin-left:auto;max-width:80%;width:fit-content}
+.msg .meta{font-size:11px;color:var(--muted);display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap}
+.msg.user .meta{justify-content:flex-end}
+.msg.flash{animation:flash 2.4s ease-out}
+@keyframes flash{0%,40%{background:var(--warn-weak);box-shadow:0 0 0 8px var(--warn-weak)}100%{background:transparent;box-shadow:none}}
+.attach{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:6px 10px;font-size:12px;margin:0 6px 6px 0}
+.attach.bad{border-color:var(--err);background:var(--err-weak);color:var(--err)}
+.ft{font-size:10px;font-weight:700;border-radius:4px;padding:1px 4px;color:#fff}
+.ft.pdf{background:#c0392b} .ft.hwp{background:#1f6fb2} .ft.xlsx{background:#1e7a45} .ft.docx{background:#2b5797} .ft.csv{background:#6b6b6b}
+.tools{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin:8px 0;font-size:12px}
+.tools summary{padding:7px 10px;cursor:pointer;color:var(--muted)}
+.tools .t{padding:6px 10px;border-top:1px solid var(--line);font-family:ui-monospace,Menlo,monospace;font-size:11.5px;overflow-wrap:anywhere}
+.cite{display:inline-block;font-size:11px;line-height:1;padding:3px 5px;border-radius:5px;background:var(--accent-weak);color:var(--accent);cursor:pointer;vertical-align:1px;position:relative;text-decoration:none;margin:0 1px}
+.cite:focus{outline:2px solid var(--accent);outline-offset:1px}
+.cite.bad{background:var(--warn-weak);color:var(--warn)}
+.cite.file{background:var(--ok-weak);color:var(--ok)}
+.cite .tip{display:none;position:absolute;left:0;top:20px;width:290px;background:var(--panel);color:var(--text);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:10px;padding:10px;font-size:12px;line-height:1.5;z-index:20;white-space:normal;cursor:default}
+.cite:hover .tip,.cite:focus .tip,.cite:focus-within .tip,.cite.tipopen .tip{display:block}
+.tip q{display:block;margin:4px 0;padding:4px 8px;border-left:3px solid var(--ok);background:var(--bg);quotes:"“" "”"}
+.cite.bad .tip q{border-color:var(--warn)}
+.sources{border-top:1px solid var(--line);margin-top:10px;padding-top:8px;font-size:12px}
+.sources li{margin:3px 0}
+.conflict{border:1px solid var(--warn);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13px}
+.conflict .cmp{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px}
+.conflict .cmp>div{background:var(--bg);border-radius:8px;padding:8px}
+.divider{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12px;margin:18px 0;flex-wrap:wrap;justify-content:center;text-align:center}
+.divider:before,.divider:after{content:"";flex:1;height:1px;background:var(--line);min-width:20px}
+.notice{border-radius:10px;padding:8px 12px;font-size:12.5px;margin:8px 0;display:block}
+.notice.fx{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.notice.info{background:var(--accent-weak);color:var(--accent)}
+.notice.warn{background:var(--warn-weak);color:var(--warn)}
+.notice.err{background:var(--err-weak);color:var(--err)}
+.notice.ok{background:var(--ok-weak);color:var(--ok)}
+.actions{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}
+.actions button{font-size:12px;padding:3px 8px;background:transparent;border-color:transparent;color:var(--muted)}
+.actions button:hover{background:var(--chip)}
+.disc{font-size:11.5px;color:var(--muted);margin-top:8px}
+/* 코드 블록 · 수식 (FR-3.2) */
+.codeblk{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:10px 0;background:var(--code)}
+.codeblk .ch{display:flex;align-items:center;justify-content:space-between;padding:4px 8px 4px 12px;font-size:11.5px;color:var(--muted);border-bottom:1px solid var(--line)}
+.codeblk .ch button{font-size:11.5px;padding:2px 8px;background:transparent}
+.codeblk pre{margin:0;padding:10px 12px;overflow-x:auto;font:12px/1.6 ui-monospace,Menlo,monospace}
+.codeblk .k{color:#a2581a} .codeblk .s{color:#2e7d4f} .codeblk .c{color:var(--muted)}
+.math{font-family:"Times New Roman","STIX Two Math",Cambria,serif;font-size:1.08em;white-space:nowrap}
+.math i{font-style:italic}
+.math .sq{border-top:1px solid currentColor;padding:0 2px;margin-left:1px}
+.math .fr{display:inline-flex;flex-direction:column;vertical-align:middle;text-align:center;margin:0 3px}
+.math .fr>span:first-child{border-bottom:1px solid currentColor;padding:0 3px}
+.mathblk{display:block;text-align:center;font-size:1.25em;margin:10px 0;padding:6px;overflow-x:auto}
+/* 작성기 */
+.composer{padding:10px 18px 16px}
+.composer .box{max-width:760px;margin:0 auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:var(--shadow)}
+.composer textarea{border:none;padding:4px;background:transparent;min-height:44px}
+.composer textarea:focus{outline:none}
+.composer .bar{display:flex;gap:8px;align-items:center}
+.composer .attrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+.composer.disabled .box{opacity:.6}
+.rtchip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;position:relative;white-space:nowrap}
+.pop{position:absolute;bottom:34px;right:0;width:340px;max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:12px;z-index:30;display:none;text-align:left;cursor:default;white-space:normal;max-height:70vh;overflow-y:auto}
+.pop.left{left:0;right:auto}
+.pop.open{display:block}
+.pop .sheet-handle{display:none}
+.opt{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer}
+.opt:hover{background:var(--chip)} .opt.sel{background:var(--accent-weak)}
+.opt.dis{opacity:.45;cursor:not-allowed}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex-wrap:wrap}
+.seg>span{padding:3px 10px;font-size:12px;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+.seg>span.on{background:var(--accent);color:#fff}
+.seg>span.dis{opacity:.4;cursor:not-allowed}
+.toggle{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;color:var(--text);margin:2px 12px 2px 0}
+.toggle.dis{opacity:.5;cursor:not-allowed}
+.sw{width:30px;height:17px;border-radius:999px;background:var(--line);position:relative;display:inline-block;flex:none}
+.sw:after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;transition:.15s}
+.sw.on{background:var(--accent)} .sw.on:after{left:15px}
+.menu{position:absolute;right:12px;top:44px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:6px;z-index:25;width:200px;display:none}
+.menu.open{display:block}
+.menu a{display:flex;gap:8px;padding:7px 10px;border-radius:8px;text-decoration:none;color:var(--text);font-size:13px;cursor:pointer}
+.menu a:hover{background:var(--chip)} .menu a.danger{color:var(--err)}
+.rename{display:none;flex:1;gap:6px;align-items:center}
+.topbar.renaming .rename{display:flex} .topbar.renaming .title{display:none}
+
+/* artifact panel */
+.art{width:44%;max-width:620px;flex:none;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
+.art.closed{display:none}
+.art .head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.art .body{flex:1;overflow:auto;padding:14px}
+.sandbox{border:1px dashed var(--line);border-radius:10px;padding:20px 12px 12px;position:relative;overflow-x:auto;margin-top:6px}
+.sandbox:before{content:"sandbox iframe (불투명 origin, CSP)";position:absolute;top:3px;right:8px;font-size:10px;color:var(--muted)}
+[data-spane]{display:none} [data-spane].on{display:block}
+
+/* pages */
+.page{max-width:1000px;margin:0 auto;padding:22px 18px 60px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:10px 0 16px;overflow-x:auto}
+.tabs a{padding:8px 12px;text-decoration:none;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;cursor:pointer}
+.tabs a.on{color:var(--text);border-color:var(--accent)}
+.tabpane{display:none} .tabpane.on{display:block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.stat{font-size:22px;font-weight:700}
+.diff{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;line-height:1.8}
+.diff .add{color:var(--ok)} .diff .del{color:var(--err)}
+.steps{list-style:none;padding:0;margin:8px 0}
+.steps li{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.steps .n{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:11px;flex:none;background:var(--chip)}
+.steps .n.done{background:var(--ok);color:#fff} .steps .n.cur{background:var(--accent);color:#fff}
+.pw{font:600 20px/1.4 ui-monospace,Menlo,monospace;letter-spacing:1px;background:var(--bg);border:1px dashed var(--line);border-radius:8px;padding:10px;text-align:center}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:60;padding:16px}
+.modal-bg.open{display:flex}
+.modal{background:var(--panel);border-radius:14px;box-shadow:var(--shadow);max-width:580px;width:100%;max-height:90vh;overflow:auto;padding:18px}
+.drawer{position:fixed;top:34px;right:0;bottom:0;width:360px;max-width:100%;background:var(--panel);border-left:1px solid var(--line);box-shadow:var(--shadow);z-index:55;display:none;flex-direction:column;overflow-y:auto}
+.drawer.open{display:flex}
+.noti{display:block;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--text);text-decoration:none}
+.noti.unread{background:var(--accent-weak)}
+.phone{width:320px;border:10px solid #111;border-radius:36px;background:#000;padding:0;overflow:hidden;box-shadow:var(--shadow);flex:none}
+.phone .scr{height:560px;background:linear-gradient(160deg,#3a4a5e,#1c2430);padding:30px 12px;color:#fff}
+.push{background:rgba(255,255,255,.88);color:#111;border-radius:16px;padding:10px 12px;font-size:12.5px;margin-bottom:10px}
+.push b{font-size:12px} .push .tm{float:right;color:#666;font-size:11px}
+.viewer{display:grid;grid-template-columns:150px 1fr;gap:12px}
+.pg{background:#fff;color:#222;border:1px solid var(--line);border-radius:6px;padding:20px;min-height:360px;font-size:12px;line-height:1.7}
+.hl{background:#ffe58a;color:#222}
+.login-wrap{min-height:calc(100vh - 34px);display:grid;place-items:center;padding:20px}
+.cf{background:#fff;color:#222;border-radius:12px;padding:22px;width:320px;box-shadow:var(--shadow);border-top:4px solid #f38020}
+.empty{max-width:560px;margin:0 auto;text-align:center;padding:30px 18px}
+.wl td{padding:5px 6px}
+
+@media (max-width: 900px){
+  .side{display:none}
+  .side.drawer-open{display:flex;position:fixed;z-index:40;top:34px;bottom:0;left:0;box-shadow:var(--shadow);max-width:85vw}
+  .app.drawer-on:after{content:"";position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:39}
+  .art{position:fixed;inset:34px 0 0 0;width:auto;max-width:none;z-index:45}
+  .grid2,.grid3{grid-template-columns:1fr}
+  .viewer{grid-template-columns:1fr}
+  .hamb{display:inline-block!important}
+  .topbar.mob{display:flex}
+  th,td{white-space:nowrap}
+  .conflict .cmp{grid-template-columns:1fr}
+}
+.hamb{display:none}
+.msg p{overflow-wrap:anywhere}
+.inframe .side.drawer-open,.inframe .drawer{top:0}
+.inframe .art{inset:0}
+/* 휴대폰 폭: 작성기 접기 · 팝오버는 하단 시트 (§6) */
+@media (max-width: 600px){
+  .composer{padding:6px 8px 8px}
+  .composer .box{padding:6px 8px;border-radius:14px}
+  .composer textarea{min-height:24px;height:34px}
+  .composer .hide-sm,.rtchip .rt-name,.hide-sm{display:none!important}
+  .composer .bar{flex-wrap:nowrap}
+  .composer .bar .primary{margin-left:auto}
+  .topbar{padding:8px 10px}
+  .topbar .lbl{display:none}
+  .col{padding:0 12px}
+  .pop,.pop.left{position:fixed;left:0;right:0;bottom:0;top:auto;width:auto;max-width:none;border-radius:16px 16px 0 0;max-height:75vh}
+  .pop .sheet-handle{display:block;width:40px;height:4px;border-radius:2px;background:var(--line);margin:0 auto 10px}
+  .pop.open{box-shadow:0 0 0 100vmax rgba(0,0,0,.3)}
+  .cite .tip{position:fixed;left:8px;right:8px;top:auto;bottom:8px;width:auto}
+  .composer .attach{padding:3px 8px;margin:0}
+  .art .head b{flex-basis:100%}
+}
+</style>
+</head>
+<body>
+
+<!-- ========= 목업 탐색 바 (리뷰용 — 실제 앱 UI 아님) ========= -->
+<nav id="mocknav">
+  <b>Agent Lee 목업 v2</b>
+  <a href="#login">로그인</a>
+  <a href="#chat">대화·인용</a>
+  <a href="#chat-new">새 대화</a>
+  <a href="#chat-physics">코드·수식</a>
+  <a href="#finance">금융</a>
+  <a href="#viewer">파일 뷰어</a>
+  <a href="#schedules">예약</a>
+  <a href="#sched-result">예약 결과</a>
+  <a href="#shared">공유받은 대화</a>
+  <a href="#artifacts">아티팩트</a>
+  <a href="#settings">설정</a>
+  <a href="#admin">관리자</a>
+  <a href="#push">알림(휴대폰)</a>
+  <a href="#mobile">모바일</a>
+  <a href="#no-runtime">런타임 없음</a>
+  <a href="#states">오류·예외</a>
+  <span class="sep"></span>
+  <span class="who" id="whoami"></span>
+  <select id="themeSel" title="테마"><option value="">테마: 시스템</option><option value="light">라이트</option><option value="dark">다크</option></select>
+</nav>
+
+<!-- ===================== 1. 로그인 (FR-1) ===================== -->
+<section data-screen="login">
+  <div class="login-wrap">
+    <div class="row wrap" style="gap:22px;align-items:flex-start;justify-content:center">
+      <div>
+        <div class="small muted" style="margin-bottom:6px">① 집 밖 접속: Cloudflare Access <span class="ref">FR-1.3</span></div>
+        <div class="cf">
+          <div style="font-weight:700;margin-bottom:4px">chat.2prostream.com</div>
+          <div class="small" style="color:#555;margin-bottom:12px">Agent Lee에 접속하려면 이메일을 확인하세요.</div>
+          <label style="color:#555">이메일</label>
+          <input value="wife@example.com" style="background:#fff;color:#222;border-color:#ccc">
+          <button class="primary" style="width:100%;margin-top:10px;background:#f38020">일회용 코드 보내기</button>
+          <div style="text-align:center;font-size:12px;color:#777;margin:10px 0">또는</div>
+          <button style="width:100%;background:#fff;color:#222;border-color:#ccc">Google로 로그인</button>
+          <div class="small" style="color:#888;margin-top:12px">허용된 가족 이메일만 통과합니다. (허용 목록은 관리자 화면에서 관리 — FR-15)</div>
+        </div>
+      </div>
+      <div>
+        <div class="small muted" style="margin-bottom:6px">② 앱 로그인 (집 안 <code>localhost:3000</code>은 이 단계만) <span class="ref">FR-1.2</span></div>
+        <div class="card" style="width:320px">
+          <div class="brand" style="padding:0 0 12px"><span class="logo">AL</span>Agent Lee</div>
+          <div class="notice info small">Access 확인됨: wife@example.com</div>
+          <label>아이디</label><input value="wife">
+          <label>비밀번호</label><input type="password" value="••••••••">
+          <button class="primary" style="width:100%;margin-top:12px">로그인</button>
+          <button style="width:100%;margin-top:6px">패스키로 로그인</button>
+          <div class="notice err small" style="margin-top:12px">예시 오류: Access를 통과한 이메일(son@…)과 이 계정의 이메일이 달라 로그인할 수 없어요. <span class="ref">FR-1.3</span></div>
+          <div class="small muted" style="margin-top:8px">로그인 시도가 5회 실패하면 10분간 잠깁니다. <span class="ref">NFR 보안</span></div>
+        </div>
+      </div>
+      <div>
+        <div class="small muted" style="margin-bottom:6px">③ 임시 비밀번호로 첫 로그인 — 새 비밀번호 정하기 <span class="ref">FR-1.1</span></div>
+        <div class="card" style="width:320px">
+          <h2>새 비밀번호를 정해 주세요</h2>
+          <div class="notice info small">엄마님, 관리자가 준 <b>임시 비밀번호</b>로 로그인했어요. 새 비밀번호로 바꿔야 다음 화면으로 갈 수 있어요.</div>
+          <label>임시 비밀번호</label><input type="password" value="••••••••••••" disabled>
+          <label>새 비밀번호 (10자 이상)</label><input type="password" value="••••••••••">
+          <label>새 비밀번호 확인</label><input type="password" value="••••••••••">
+          <button class="primary" style="width:100%;margin-top:12px">바꾸고 시작하기</button>
+          <div class="small muted" style="margin-top:8px">비밀번호 초기화 뒤에도 같은 화면이 나와요. 이 단계에서는 다른 메뉴로 이동할 수 없어요.</div>
+        </div>
+      </div>
+      <div>
+        <div class="small muted" style="margin-bottom:6px">④ 최초 설치 — 관리자 계정 만들기 <span class="ref">FR-1.1</span></div>
+        <div class="card" style="width:320px">
+          <h2>Agent Lee 설치</h2>
+          <div class="small muted">처음 한 번만 보이는 화면이에요.</div>
+          <label>관리자 이메일</label><input value="ingki3@gmail.com">
+          <label>관리자 아이디</label><input value="dad">
+          <label>비밀번호</label><input type="password" value="••••••••••">
+          <label>비밀번호 확인</label><input type="password" value="••••••••••">
+          <button class="primary" style="width:100%;margin-top:12px">관리자 계정 만들기</button>
+          <div class="small muted" style="margin-top:8px">가족 계정은 설치 뒤 관리자 화면에서 추가해요 (임시 비밀번호 발급).</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 공통 사이드바: 화면마다 그 화면 사용자(P)의 데이터로 JS가 채운다 (FR-1.5 · FR-2) -->
+<template id="sideTpl">
+  <aside class="side">
+    <div class="brand"><span class="logo">AL</span>Agent Lee<span class="grow"></span><button class="ghost" data-open="notiDrawer" title="알림함 (FR-13.3)">🔔<span class="badge" style="margin-left:2px" data-nbadge>0</span></button></div>
+    <a class="item" href="#chat-new">✏️ 새 대화</a>
+    <div class="row" style="padding:0 2px 4px"><input placeholder="🔍 내 대화 검색" style="padding:5px 8px;font-size:12px"></div>
+    <div data-convs></div>
+    <div class="grp">바로가기</div>
+    <a class="item" href="#schedules" data-sched>⏰ 예약</a>
+    <a class="item" href="#artifacts">🧩 아티팩트</a>
+    <a class="item" href="#settings">⚙️ 설정</a>
+    <a class="item" href="#admin" data-adminonly>🛠 관리자</a>
+    <div class="me row"><span class="logo" style="width:28px;height:28px" data-pinit>아</span><div class="grow small"><div data-pname>아들</div><div class="muted" data-puse></div></div></div>
+  </aside>
+</template>
+
+<!-- ===================== 2. 대화 · 파일 · 인용 · 런타임 전환 (아들) ===================== -->
+<section data-screen="chat">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar" data-convbar>
+        <button class="ghost hamb" data-hamb>☰</button>
+        <div class="title" data-ctitle>한국사 수행평가 자료 조사</div>
+        <div class="rename"><input value="한국사 수행평가 자료 조사" style="padding:4px 8px"><button class="small primary" data-rename-done>저장</button><button class="small" data-rename-done>취소</button></div>
+        <span class="toggle" title="FR-5.5"><span class="lbl">자료 조사 모드</span> <span class="sw on"></span></span>
+        <button data-open="shareModal" data-arg="conv-hist">👪 <span class="lbl">공유</span></button>
+        <button class="ghost" data-menu title="대화 관리">⋯</button>
+        <div class="menu">
+          <div class="small muted" style="padding:4px 10px">대화 관리 <span class="ref">FR-2.1</span></div>
+          <a data-rename>✎ 이름 변경</a>
+          <a>📌 고정 해제</a>
+          <a data-open="shareModal" data-arg="conv-hist">👪 가족에게 공유</a>
+          <a class="danger" data-open="delModal">🗑 삭제…</a>
+        </div>
+      </div>
+      <div class="thread"><div class="col">
+
+        <div class="msg user">
+          <div style="text-align:right">
+            <span class="attach"><span class="ft pdf">PDF</span>교과서_3단원.pdf <span class="muted">· 42쪽</span></span>
+            <span class="attach"><span class="ft hwp">HWP</span>과제안내.hwp <span class="muted">· 표 4개</span></span>
+          </div>
+          <div class="bubble">과제 안내 파일 기준으로, 교과서 3단원 내용이랑 최근 연구 동향을 같이 정리해줘. 출처 꼭 달아줘.</div>
+          <div class="meta">오후 8:12 <button class="ghost small">✎ 수정 후 다시 보내기</button></div>
+        </div>
+
+        <div class="msg">
+          <details class="tools"><summary>▸ 도구 사용 4개 · 파일 2개 읽음, 웹 검색 2회 <span class="ref">FR-3.4</span></summary>
+            <div class="t">read_file("과제안내.hwp") → 표 4, 문단 38</div>
+            <div class="t">read_file("교과서_3단원.pdf") → 42쪽 (OCR 0쪽)</div>
+            <div class="t">news-search-skill{"query":"조선 후기 실학 연구 2026"} → 6건</div>
+            <div class="t">web_fetch(3건) → 본문 저장, 인용 구절 대조</div>
+          </details>
+          <p>과제안내 파일에 따르면 보고서는 <b>A4 3쪽 이내</b>, <b>1차 사료 1개 이상</b> 인용이 조건이에요<a class="cite file" href="#viewer?f=hwp&amp;loc=t3r2" aria-label="과제안내.hwp 3번째 표 2행 열기">과제안내.hwp · 3번째 표 · 2행<span class="tip"><b>과제안내.hwp · 3번째 표 · 2행</b><q>분량: A4 3쪽 이내 / 1차 사료 1개 이상 인용</q><span class="muted">HWP는 쪽 정보가 없어 표·문단 번호로 표시 (FR-4.4)</span><br>누르면 파일 뷰어가 이 위치를 열고 강조해요 →</span></a>.</p>
+          <p>교과서는 실학을 “현실 문제를 해결하려는 학문적 흐름”으로 설명하고 있어요<a class="cite file" href="#viewer?f=pdf&amp;p=12" aria-label="교과서_3단원.pdf 12쪽 열기">교과서_3단원.pdf · 12쪽<span class="tip"><b>교과서_3단원.pdf · 12쪽</b><q>실학은 조선 후기 사회의 현실 문제를 해결하려는 학문적 흐름으로…</q>누르면 12쪽을 열고 이 문장을 강조해요 →</span></a>.</p>
+          <p>최근 연구에서는 실학을 하나의 학파로 묶기보다 다양한 개혁 논의의 집합으로 보는 시각이 늘고 있어요<a class="cite" href="#" data-noop>1<span class="tip"><b>✓ 원문 구절 확인</b> · 역사학보 · 2026-09-14<q>…단일 학파라기보다 개혁 담론의 스펙트럼으로…</q><span class="muted">가져온 원문에 이 구절이 있는지만 확인했어요. 주장 자체가 옳은지는 보증하지 않아요. (FR-5.2)</span><br>누르면 원문 페이지가 열려요 ↗</span></a>. 한편 일부 기사에서는 ‘실학 박물관 관람객 2배 증가’라고 했지만<a class="cite bad" href="#" data-noop>2 ⚠<span class="tip"><b>⚠ 출처에서 이 내용을 찾지 못했어요</b><br>가져온 페이지 본문에 해당 구절이 없습니다. 이 주장은 확인되지 않은 것으로 봐 주세요. (FR-5.2)<br>누르면 원문 페이지가 열려요 ↗</span></a>, 원문에서 확인되지 않았어요.</p>
+          <div class="conflict">
+            <b>⚖ 출처끼리 다르게 말하는 부분</b> <span class="ref">FR-5.4</span>
+            <div class="small muted">‘실학’이라는 말이 학계에서 쓰이기 시작한 시기</div>
+            <div class="cmp">
+              <div><a class="cite" href="#" data-noop>1<span class="tip"><b>✓ 원문 구절 확인</b> · 역사학보 · 2026-09-14<q>…1930년대 조선학 운동에서 처음 쓰였다…</q></span></a> 역사학보 · <b>2026-09-14</b><div class="small">“1930년대 조선학 운동에서 처음 쓰였다”</div></div>
+              <div><a class="cite" href="#" data-noop>3<span class="tip"><b>✓ 원문 구절 확인</b> · 한국사 개설 자료 · 2019-03-02<q>…해방 이후 1950년대 연구에서 용어가 정착했다…</q></span></a> 한국사 개설 자료 · <b>2019-03-02</b><div class="small">“해방 이후 1950년대에 정착했다”</div></div>
+            </div>
+            <div class="small" style="margin-top:6px">두 자료가 시기를 다르게 적고 있어요. ‘처음 쓰인 때’와 ‘널리 정착한 때’를 구분한 것일 수 있으니, 보고서에는 두 견해와 각 출처를 함께 적는 걸 권해요.</div>
+          </div>
+          <div class="sources">
+            <div class="row sp"><b>출처</b><button class="small" data-open="bibModal">📚 참고문헌 내보내기 <span class="ref">FR-5.6</span></button></div>
+            <ol style="margin:4px 0 0;padding-left:18px">
+              <li><span class="badge ok">✓ 원문 구절 확인</span> 「실학 개념의 재검토」 · 역사학보 · 2026-09-14 · <a href="#" data-noop>kci.go.kr/…</a></li>
+              <li><span class="badge warn">⚠ 구절 확인 안 됨</span> 「실학 박물관 인기」 · ○○일보 · 2026-10-02 · <a href="#" data-noop>news.example.com/…</a></li>
+              <li><span class="badge ok">✓ 원문 구절 확인</span> 「조선 후기 실학」 · 한국사 개설 자료 · 2019-03-02 · <a href="#" data-noop>encykorea.example/…</a></li>
+            </ol>
+            <div class="small muted" style="margin-top:4px">‘원문 구절 확인’ = 가져온 원문에 인용 구절이 실제로 있음. 사실 여부의 보증은 아니에요. <span class="ref">FR-5.2</span></div>
+          </div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 <span>· 오후 8:13</span></div>
+          <div class="actions"><button>⧉ 복사</button><button>↻ 다시 생성</button><button>👍</button><button>👎</button></div>
+        </div>
+
+        <div class="msg user"><div class="bubble">정약용 거중기가 수원 화성 공사 기간을 몇 년이나 줄였는지 숫자로 알려줘.</div><div class="meta">오후 8:15</div></div>
+        <div class="msg">
+          <div class="notice warn small">🔎 자료 조사 모드 · <b>근거가 부족해 결론을 유보해요</b> <span class="ref">FR-5.5</span></div>
+          <p>‘몇 년을 줄였다’는 숫자를 직접 밝힌 출처는 찾지 못했어요. 비교할 수 있는 자료가 <b>1건</b>뿐이라 단정하지 않을게요.</p>
+          <p>확인된 것은 화성 공사가 계획보다 빨리, 약 2년 9개월 만에 끝났다는 기록이에요<a class="cite" href="#" data-noop>4<span class="tip"><b>✓ 원문 구절 확인</b> · 문화유산 해설 자료 · 2025-04-11<q>…공사는 착공 후 약 2년 9개월 만에 마무리되었다…</q><span class="muted">구절이 원문에 있는지만 확인했어요.</span></span></a>. 다만 이 단축이 거중기 덕분인지, 얼마만큼인지는 이 자료에 없어요.</p>
+          <p class="small">더 확인하려면 1차 사료인 『화성성역의궤』의 공사 기록을 직접 찾아보면 좋아요 — 과제 조건(1차 사료 1개 이상)도 함께 채울 수 있어요.</p>
+          <div class="sources"><b>출처</b><ol start="4" style="margin:4px 0 0;padding-left:18px"><li><span class="badge ok">✓ 원문 구절 확인</span> 「수원 화성 축성」 · 문화유산 해설 자료 · 2025-04-11 · <a href="#" data-noop>heritage.example/…</a></li></ol></div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 <span>· 오후 8:16</span></div>
+        </div>
+
+        <div class="notice info small">ℹ 앞부분을 요약했어요 — 대화가 길어져 맥락 한도에 맞춰 요약해 이어갑니다. <span class="ref">FR-3.6</span></div>
+
+        <div class="divider">여기부터 <span class="dot codex"></span> Codex · gpt-6.1-sol · 앞부분은 요약해서 넘겼어요 <span class="ref">FR-3.5 / D8</span></div>
+
+        <div class="msg user"><div class="bubble">위 내용으로 보고서 초안 구조 잡아줘. 표 하나 넣어줘.</div><div class="meta">오후 8:20</div></div>
+
+        <div class="msg">
+          <p>앞에서 정리한 과제 조건(A4 3쪽, 1차 사료 1개 이상)에 맞춰 구조를 잡았어요. 문장을 대신 써주기보다는 각 절에 무엇을 쓰면 좋을지 안내할게요. <span class="ref">NFR 청소년·학습 지원</span></p>
+          <div class="card" style="cursor:pointer" data-open-art>
+            <div class="row"><span>🧩</span><div class="grow"><b>보고서 구조안 — 조선 후기 실학</b><div class="small muted">문서 아티팩트 · v1 만듦 · 누르면 오른쪽 패널에서 열림</div></div><span class="chip">열기</span></div>
+          </div>
+          <div class="meta"><span class="dot codex"></span>Codex · gpt-6.1-sol <span>· 오후 8:21</span></div>
+        </div>
+
+        <div class="msg user"><div class="bubble">표에 ‘필요한 출처’ 열 추가해줘.</div><div class="meta">오후 8:23</div></div>
+        <div class="msg">
+          <p>표에 열을 추가해 <b>v2</b>로 고쳤어요. 이전 버전(v1)은 패널의 버전 목록에서 다시 볼 수 있어요. <span class="ref">FR-6.2</span></p>
+          <div class="meta"><span class="dot codex"></span>Codex · gpt-6.1-sol <span>· 오후 8:24</span></div>
+          <div class="actions"><button>⧉ 복사</button><button>↻ 다시 생성</button></div>
+        </div>
+
+        <div class="msg user"><div class="bubble">‘들어가며’에 쓸 질문 예시만 몇 개 줘.</div><div class="meta">오후 8:26</div></div>
+        <div class="msg">
+          <p>좋아요. 직접 문장을 쓰기 전에 스스로 답해 볼 질문부터</p>
+          <div class="row small muted"><span class="dot codex"></span>응답 생성 중… <button class="small">■ 중지</button> <span class="ref">FR-3.1</span></div>
+        </div>
+      </div></div>
+
+      <div class="composer"><div class="box">
+        <div class="attrow">
+          <span class="attach"><span class="ft docx">DOCX</span>참고자료.docx <button class="ghost small">✕</button></span>
+          <span class="small muted hide-sm">첨부 3/20 · 파일당 50MB까지 <span class="ref">FR-4.6</span></span>
+        </div>
+        <textarea placeholder="메시지를 입력하세요… (파일을 끌어다 놓거나 붙여넣기)"></textarea>
+        <div class="bar">
+          <button class="ghost" title="첨부: PDF·HWP/HWPX·DOCX·XLSX/CSV·PPTX·TXT/MD·이미지 (FR-4.2)">📎</button>
+          <span class="grow hide-sm"></span>
+          <span class="rtchip" data-rtchip data-rt="codex" data-model="gpt-6.1-sol"></span>
+          <button class="primary">↑</button>
+        </div>
+      </div></div>
+    </main>
+
+    <aside class="art" data-art>
+      <div class="head">
+        <b class="grow">보고서 구조안 — 조선 후기 실학</b>
+        <select style="width:auto;padding:3px 6px;font-size:12px" title="버전 (FR-6.2)"><option>v2 (최신)</option><option>v1</option></select>
+        <button class="small" title="FR-6.4">⤓ 내려받기 ▾</button>
+        <button class="small" data-open="shareModal" data-arg="art-report">👪 공유</button>
+        <button class="ghost" data-close-art>✕</button>
+      </div>
+      <div class="body">
+        <div class="small muted">주소: <code>/a/7f3k2</code> · <span class="badge gray">비공개 (만든 사람만)</span> <span class="ref">FR-6.3</span> · 내려받기: DOCX · PDF · HTML</div>
+        <div class="sandbox">
+          <h2>조선 후기 실학 — 보고서 구조안</h2>
+          <ol>
+            <li><b>들어가며</b> — 왜 이 주제를 골랐는지 (3~4문장)</li>
+            <li><b>실학의 등장 배경</b> — 교과서 12쪽 내용을 내 말로 요약</li>
+            <li><b>1차 사료 읽기</b> — 사료 1개 선택, 인용 + 해석</li>
+            <li><b>최근 연구의 시각</b> — 출처 [1]·[3] 비교</li>
+            <li><b>나가며</b> — 내 생각</li>
+          </ol>
+          <table><tr><th>절</th><th>분량</th><th>필요한 출처</th></tr>
+            <tr><td>1</td><td>0.3쪽</td><td>—</td></tr><tr><td>2</td><td>0.7쪽</td><td>교과서 12쪽</td></tr>
+            <tr><td>3</td><td>1쪽</td><td>1차 사료 1개</td></tr><tr><td>4</td><td>0.7쪽</td><td>[1] · [3]</td></tr><tr><td>5</td><td>0.3쪽</td><td>—</td></tr></table>
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- 새 대화(빈 화면): 선택 단계 없이 바로 입력 (FR-3.5, FR-12) -->
+<section data-screen="chat-new">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title muted">새 대화</div></div>
+      <div class="thread" style="display:grid;place-items:center"><div class="col" style="text-align:center">
+        <div class="logo" style="width:44px;height:44px;margin:0 auto 10px;font-size:18px">AL</div>
+        <h1>안녕하세요, 아들님</h1>
+        <div class="muted">무엇이든 물어보세요. 파일을 올려도 돼요.</div>
+        <div class="notice info small" style="justify-content:center;margin-top:16px">새 대화는 고르는 단계 없이 바로 시작해요 — 내 기본값 <b>Claude Code · Opus 5.5</b> (설정에서 변경) <span class="ref">FR-3.5 · FR-12.2 · D3</span></div>
+      </div></div>
+      <div class="composer"><div class="box">
+        <textarea placeholder="메시지를 입력하세요…"></textarea>
+        <div class="bar"><button class="ghost">📎</button><span class="grow hide-sm"></span>
+          <span class="rtchip" data-rtchip data-rt="claude" data-model="claude-opus-5-5"></span><button class="primary">↑</button></div>
+      </div></div>
+    </main>
+  </div>
+</section>
+
+<!-- 코드 블록 · 수식 (FR-3.2) — 아들의 물리 대화 -->
+<section data-screen="chat-physics">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title">물리 실험 보고서 그래프</div><button data-open="shareModal" data-arg="conv-physics">👪 <span class="lbl">공유</span></button><button class="ghost" title="대화 관리 (FR-2.1)">⋯</button></div>
+      <div class="thread"><div class="col">
+        <div class="msg user">
+          <div style="text-align:right"><span class="attach"><span class="ft csv">CSV</span>단진자_측정.csv <span class="muted">· 6행</span></span></div>
+          <div class="bubble">단진자 실험 데이터로 길이–주기 그래프 그리는 파이썬 코드 알려줘. 공식도 같이.</div><div class="meta">오후 7:40</div></div>
+        <div class="msg">
+          <p>단진자의 주기는 진폭이 작을 때 <span class="math"><i>T</i> = 2π<span class="sq">√<i>L</i>/<i>g</i></span></span> 로 근사해요. 양변을 제곱해 정리하면 중력가속도를 구하는 식이 나와요. <span class="ref">FR-3.2 수식(KaTeX)</span></p>
+          <span class="math mathblk"><i>g</i> = <span class="fr"><span>4π²<i>L</i></span><span><i>T</i>²</span></span> &nbsp;≈&nbsp; 9.8 m/s²</span>
+          <p>그래서 <span class="math"><i>T</i>²</span>을 세로축, <span class="math"><i>L</i></span>을 가로축으로 그리면 직선이 되고, 기울기로 <span class="math"><i>g</i></span>를 구할 수 있어요.</p>
+          <div class="codeblk">
+            <div class="ch"><span>python</span><button data-copy>⧉ 복사</button></div>
+<pre><span class="k">import</span> pandas <span class="k">as</span> pd
+<span class="k">import</span> matplotlib.pyplot <span class="k">as</span> plt
+
+df = pd.read_csv(<span class="s">"단진자_측정.csv"</span>)   <span class="c"># 열: L(m), T(s)</span>
+df[<span class="s">"T2"</span>] = df[<span class="s">"T"</span>] ** <span class="k">2</span>
+slope = (df[<span class="s">"T2"</span>] / df[<span class="s">"L"</span>]).mean()
+g = <span class="k">4</span> * <span class="k">3.1416</span>**<span class="k">2</span> / slope
+
+plt.plot(df[<span class="s">"L"</span>], df[<span class="s">"T2"</span>], <span class="s">"o-"</span>)
+plt.xlabel(<span class="s">"L (m)"</span>); plt.ylabel(<span class="s">"T² (s²)"</span>)
+plt.title(<span class="s">f"g ≈ </span>{g:.2f}<span class="s"> m/s²"</span>)
+plt.show()</pre>
+          </div>
+          <p class="small">코드를 그대로 내기보다, 그래프에서 점들이 직선에서 벗어나는 이유(측정 오차, 큰 진폭)를 보고서 ‘오차 분석’에 직접 써 보면 좋아요. <span class="ref">NFR 청소년·학습 지원</span></p>
+          <div class="meta"><span class="dot codex"></span>Codex · gpt-6.1-sol <span>· 오후 7:41</span></div>
+          <div class="actions"><button>⧉ 전체 복사</button><button>↻ 다시 생성</button></div>
+        </div>
+      </div></div>
+      <div class="composer"><div class="box">
+        <textarea placeholder="메시지를 입력하세요…"></textarea>
+        <div class="bar"><button class="ghost">📎</button><span class="grow hide-sm"></span><span class="rtchip" data-rtchip data-rt="codex" data-model="gpt-6.1-sol"></span><button class="primary">↑</button></div>
+      </div></div>
+    </main>
+  </div>
+</section>
+
+<!-- ===================== 3. 금융 (FR-7) — 엄마 ===================== -->
+<section data-screen="finance">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title">삼성전자 vs 엔비디아 6개월</div><button data-open="shareModal" data-arg="conv-fin">👪 <span class="lbl">공유</span></button><button class="ghost" title="대화 관리 (FR-2.1)">⋯</button></div>
+      <div class="thread"><div class="col">
+        <div class="divider">2026년 11월 9일 (월)</div>
+        <div class="msg user"><div class="bubble">삼성전자랑 엔비디아 6개월 차트 비교해줘. 원화 기준으로.</div><div class="meta">오전 9:02</div></div>
+        <div class="msg">
+          <details class="tools"><summary>▸ 도구 사용 3개 · kr-stock-skill, us-stock-skill, 환율 <span class="ref">FR-7.1~7.3</span></summary>
+            <div class="t">kr-stock-skill history 005930 --period 6mo --json</div>
+            <div class="t">us-stock-skill chart --symbol NVDA --period 6mo --json</div>
+            <div class="t">kr-stock-skill fx USD/KRW --period 6mo --json</div>
+          </details>
+          <p>6개월(2026-05-06 ~ 11-06) 수익률은 엔비디아가 삼성전자보다 높았어요. 원화로 환산하면 환율 상승분만큼 차이가 조금 더 커져요.</p>
+          <div class="card">
+            <div class="row sp wrap"><b>요약 표</b><span class="small muted">열 제목을 누르면 정렬 <span class="ref">FR-7.5</span></span></div>
+            <table data-sortable>
+              <thead><tr><th data-k="0">종목 ▾</th><th class="num" data-k="1">종가</th><th class="num" data-k="2">6개월 수익률</th><th class="num" data-k="3">원화 환산 수익률</th><th>기준 시각 · 출처</th></tr></thead>
+              <tbody>
+                <tr><td>삼성전자 (005930)</td><td class="num">₩61,200</td><td class="num">+8.4%</td><td class="num">+8.4%</td><td class="small muted">네이버 증권 · 2026-11-06 (금) 15:30 KST 종가</td></tr>
+                <tr><td>NVIDIA (NVDA)</td><td class="num">$182.40</td><td class="num">+21.7%</td><td class="num">+25.3%</td><td class="small muted">Yahoo Finance · 2026-11-06 (금) 16:00 ET 종가</td></tr>
+                <tr><td>USD/KRW</td><td class="num">₩1,402</td><td class="num">+3.0%</td><td class="num">—</td><td class="small muted">FinanceDataReader · 2026-11-06 (금) 종가</td></tr>
+              </tbody>
+            </table>
+            <div class="small muted" style="margin-top:6px">장중 참고: 삼성전자 ₩61,500 (+0.5%) · 네이버 증권 · 11-09 09:01 KST · <span class="badge warn">지연 시세 · 최대 20분</span> <span class="ref">FR-7.6 지연 표시</span></div>
+            <div class="small muted">⚠ 목업용 예시 숫자입니다. 표·차트·범례는 같은 예시 데이터를 씁니다. <span class="ref">FR-7.6 출처·기준 시각</span></div>
+          </div>
+          <div class="card" style="margin-top:10px;cursor:pointer" data-open-art>
+            <div class="row"><span>📈</span><div class="grow"><b>6개월 비교 차트 (원화 기준)</b><div class="small muted">차트 아티팩트 · 비교·가격 선·캔들·재무 막대 · 확대·PNG 저장</div></div><span class="chip">열기</span></div>
+          </div>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다. 매수·매도는 실행하지 않아요. <span class="ref">FR-7.8</span></div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 오전 9:03</div>
+          <div class="actions"><button>⧉ 복사</button><button>↻ 다시 생성</button><button>⏰ 이걸 매일 받기</button></div>
+        </div>
+        <div class="msg user"><div class="bubble">내 관심 종목 지난주 공시 있어?</div><div class="meta">오전 9:05</div></div>
+        <div class="msg">
+          <p>관심 종목 5개 중 2개에 지난주(11-02 ~ 11-06) 공시가 있어요. <span class="ref">FR-7.4 · FR-7.7</span></p>
+          <table><tr><th>종목</th><th>공시</th><th>요약</th><th>공시 시각 · 출처</th></tr>
+            <tr><td>삼성전자</td><td>DART · 주요사항보고서</td><td>자기주식 취득 결정</td><td class="small muted">DART · 2026-11-05 (목) 16:12 KST · <a href="#" data-noop>dart.fss.or.kr ↗</a></td></tr>
+            <tr><td>NVIDIA</td><td>SEC · Form 4</td><td>임원 주식 매도 신고</td><td class="small muted">SEC EDGAR · 2026-11-04 (수) 17:30 ET 접수 · <a href="#" data-noop>sec.gov ↗</a></td></tr></table>
+          <div class="small muted" style="margin-top:4px">조회: 2026-11-09 09:05 KST · 나머지 3종목(SK하이닉스·KODEX 200·Apple)은 해당 기간 공시 없음</div>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다. <span class="ref">FR-7.8</span></div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 오전 9:05</div>
+        </div>
+      </div></div>
+      <div class="composer"><div class="box"><textarea placeholder="메시지를 입력하세요…"></textarea>
+        <div class="bar"><button class="ghost">📎</button>
+          <span class="rtchip" data-popwrap>⭐ <span class="hide-sm">관심 종목</span> <span data-wlcount>5</span> ▾
+            <div class="pop left">
+              <div class="sheet-handle"></div>
+              <div class="row sp"><b>⭐ 내 관심 종목</b><span class="ref">FR-7.7</span></div>
+              <div class="small muted" style="margin:2px 0 8px">한국·미국 종목을 함께 저장해요. 대화에서 “내 관심 종목”이라고 하면 이 목록을 써요.</div>
+              <input value="현대" placeholder="종목명·코드·티커 검색 (한국·미국)">
+              <table class="wl" style="margin:4px 0 8px" data-wlsearch>
+                <tr><td><span class="badge gray">KR</span> 현대차 <span class="muted small">005380 · KOSPI</span></td><td style="text-align:right"><button class="small" data-wladd>+ 추가</button></td></tr>
+                <tr><td><span class="badge gray">KR</span> 현대모비스 <span class="muted small">012330 · KOSPI</span></td><td style="text-align:right"><button class="small" data-wladd>+ 추가</button></td></tr>
+                <tr><td><span class="badge gray">US</span> Hyundai Motor GDR <span class="muted small">미지원 — 한국·미국 상장 주식만</span></td><td></td></tr>
+              </table>
+              <div class="small muted">저장된 종목</div>
+              <table class="wl" data-wllist>
+                <tr><td><span class="badge gray">KR</span> 삼성전자 <span class="muted small">005930 · KOSPI</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
+                <tr><td><span class="badge gray">KR</span> SK하이닉스 <span class="muted small">000660 · KOSPI</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
+                <tr><td><span class="badge gray">KR</span> KODEX 200 <span class="muted small">069500 · ETF</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
+                <tr><td><span class="badge gray">US</span> NVIDIA <span class="muted small">NVDA · NASDAQ</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
+                <tr><td><span class="badge gray">US</span> Apple <span class="muted small">AAPL · NASDAQ</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
+              </table>
+            </div>
+          </span>
+          <span class="grow hide-sm"></span><span class="rtchip" data-rtchip data-rt="claude" data-model="claude-opus-5-5"></span><button class="primary">↑</button></div></div></div>
+    </main>
+    <aside class="art closed" data-art>
+      <div class="head"><b class="grow">6개월 비교 차트</b><select style="width:auto;padding:3px 6px;font-size:12px"><option>v1</option></select><button class="small">⤓ PNG</button><button class="small" data-open="shareModal" data-arg="art-chart">👪 공유</button><button class="ghost" data-close-art>✕</button></div>
+      <div class="body" data-sproot>
+        <div class="row wrap" style="margin-bottom:8px">
+          <div class="seg"><span class="on" data-sp="c-cmp">수익률 비교</span><span data-sp="c-line">가격 선</span><span data-sp="c-candle">캔들</span><span data-sp="c-bar">재무 막대</span></div><span class="ref">FR-7.5</span>
+        </div>
+
+        <div data-spane="c-cmp" class="on"><div data-sproot>
+          <div class="row wrap" style="margin-bottom:6px"><span class="small muted">기준 통화</span><div class="seg"><span class="on" data-sp="krw">원화</span><span data-sp="usd">달러</span></div>
+            <span class="grow"></span><div class="seg"><span>1M</span><span>3M</span><span class="on">6M</span><span>1Y</span></div></div>
+          <div class="sandbox">
+            <svg data-spane="krw" class="on" viewBox="0 0 520 260" width="100%" role="img" aria-label="6개월 수익률 비교 차트 (원화)">
+              <g stroke="currentColor" opacity=".15"><line x1="40" y1="30" x2="510" y2="30"/><line x1="40" y1="90" x2="510" y2="90"/><line x1="40" y1="150" x2="510" y2="150"/><line x1="40" y1="210" x2="510" y2="210"/></g>
+              <g font-size="10" fill="currentColor" opacity=".6"><text x="4" y="34">+30%</text><text x="4" y="94">+20%</text><text x="4" y="154">+10%</text><text x="10" y="214">0%</text>
+                <text x="40" y="232">5/6</text><text x="106" y="232" text-anchor="middle">6월</text><text x="183" y="232" text-anchor="middle">7월</text><text x="262" y="232" text-anchor="middle">8월</text><text x="341" y="232" text-anchor="middle">9월</text><text x="418" y="232" text-anchor="middle">10월</text><text x="510" y="232" text-anchor="end">11/6</text></g>
+              <polyline fill="none" stroke="var(--codex)" stroke-width="2.5" points="40,210 80,200 120,185 160,190 200,160 240,150 280,130 320,120 360,110 400,95 440,80 480,70 510,58.2"/>
+              <polyline fill="none" stroke="var(--claude)" stroke-width="2.5" points="40,210 80,212 120,205 160,198 200,200 240,190 280,185 320,180 360,178 400,172 440,168 480,164 510,159.6"/>
+              <circle cx="510" cy="58.2" r="4" fill="var(--codex)"/><circle cx="510" cy="159.6" r="4" fill="var(--claude)"/>
+              <!-- 툴팁 상태: 2026-09-08 위에 마우스 -->
+              <line x1="360" y1="24" x2="360" y2="210" stroke="currentColor" stroke-dasharray="3 3" opacity=".5"/>
+              <circle cx="360" cy="110" r="3.5" fill="var(--codex)"/><circle cx="360" cy="178" r="3.5" fill="var(--claude)"/>
+              <g font-size="10.5"><rect x="368" y="116" width="100" height="44" rx="6" fill="var(--panel)" stroke="var(--line)"/>
+                <text x="375" y="129" fill="currentColor" font-weight="600">2026-09-08 (화)</text>
+                <text x="375" y="142" fill="var(--codex)">NVIDIA +16.7%</text><text x="375" y="155" fill="var(--claude)">삼성전자 +5.3%</text></g>
+              <g font-size="11"><rect x="50" y="242" width="10" height="3" fill="var(--codex)"/><text x="64" y="247" fill="currentColor">NVIDIA (원화 환산) +25.3%</text>
+                <rect x="250" y="242" width="10" height="3" fill="var(--claude)"/><text x="264" y="247" fill="currentColor">삼성전자 +8.4%</text></g>
+            </svg>
+            <svg data-spane="usd" viewBox="0 0 520 260" width="100%" role="img" aria-label="6개월 수익률 비교 차트 (달러)">
+              <g stroke="currentColor" opacity=".15"><line x1="40" y1="30" x2="510" y2="30"/><line x1="40" y1="90" x2="510" y2="90"/><line x1="40" y1="150" x2="510" y2="150"/><line x1="40" y1="210" x2="510" y2="210"/></g>
+              <g font-size="10" fill="currentColor" opacity=".6"><text x="4" y="34">+30%</text><text x="4" y="94">+20%</text><text x="4" y="154">+10%</text><text x="10" y="214">0%</text>
+                <text x="40" y="232">5/6</text><text x="106" y="232" text-anchor="middle">6월</text><text x="183" y="232" text-anchor="middle">7월</text><text x="262" y="232" text-anchor="middle">8월</text><text x="341" y="232" text-anchor="middle">9월</text><text x="418" y="232" text-anchor="middle">10월</text><text x="510" y="232" text-anchor="end">11/6</text></g>
+              <polyline fill="none" stroke="var(--codex)" stroke-width="2.5" points="40,210.0 80,201.4 120,188.6 160,192.8 200,167.1 240,158.5 280,141.4 320,132.8 360,124.2 400,111.4 440,98.5 480,89.9 510,79.8"/>
+              <polyline fill="none" stroke="var(--claude)" stroke-width="2.5" points="40,210.0 80,211.2 120,206.9 160,202.6 200,203.8 240,197.6 280,194.5 320,191.4 360,190.2 400,186.5 440,184.0 480,181.5 510,178.8"/>
+              <circle cx="510" cy="79.8" r="4" fill="var(--codex)"/><circle cx="510" cy="178.8" r="4" fill="var(--claude)"/>
+              <g font-size="11"><rect x="50" y="242" width="10" height="3" fill="var(--codex)"/><text x="64" y="247" fill="currentColor">NVIDIA +21.7%</text>
+                <rect x="250" y="242" width="10" height="3" fill="var(--claude)"/><text x="264" y="247" fill="currentColor">삼성전자 (달러 환산) +5.2%</text></g>
+            </svg>
+            <div class="small muted">출처: 네이버 증권, Yahoo Finance, FinanceDataReader · 2026-11-06 (금) 종가 기준 · 달러 환산은 같은 날 USD/KRW ₩1,402 · 목업 예시 데이터</div>
+          </div>
+          <div class="small muted" style="margin-top:8px">상태 예시: 9월 8일 위에 마우스를 올린 툴팁. 드래그하면 구간 확대, 더블클릭하면 전체 보기.</div>
+        </div></div>
+
+        <div data-spane="c-line">
+          <div class="row wrap" style="margin-bottom:6px"><span class="badge">🔍 확대됨: 2026-10-01 ~ 11-06</span><button class="small">전체 보기</button></div>
+          <div class="sandbox">
+            <svg viewBox="0 0 520 240" width="100%" role="img" aria-label="NVIDIA 가격 선 차트 (확대)">
+              <g stroke="currentColor" opacity=".15"><line x1="50" y1="40" x2="510" y2="40"/><line x1="50" y1="100" x2="510" y2="100"/><line x1="50" y1="160" x2="510" y2="160"/><line x1="50" y1="202" x2="510" y2="202"/></g>
+              <g font-size="10" fill="currentColor" opacity=".6"><text x="4" y="44">$190</text><text x="4" y="104">$180</text><text x="4" y="164">$170</text><text x="4" y="206">$163</text>
+                <text x="50" y="222">10/1</text><text x="200" y="222">10/15</text><text x="350" y="222">10/29</text><text x="510" y="222" text-anchor="end">11/6</text></g>
+              <polyline fill="none" stroke="var(--codex)" stroke-width="2.2" points="50,190 80,185 110,176 140,180 170,168 200,160 230,150 260,155 290,140 320,128 350,120 380,124 410,112 440,108 470,103 510,85.6"/>
+              <circle cx="510" cy="85.6" r="4" fill="var(--codex)"/>
+            </svg>
+            <div class="small muted">NVIDIA (NVDA) 종가 · 달러 · Yahoo Finance · 2026-11-06 (금) 16:00 ET 기준 · 마지막 $182.40 · 목업 예시 데이터</div>
+          </div>
+        </div>
+
+        <div data-spane="c-candle">
+          <div class="sandbox">
+            <svg viewBox="0 0 520 240" width="100%" role="img" aria-label="삼성전자 캔들 차트 (최근 10거래일)">
+              <g stroke="currentColor" opacity=".15"><line x1="50" y1="40" x2="510" y2="40"/><line x1="50" y1="80" x2="510" y2="80"/><line x1="50" y1="120" x2="510" y2="120"/><line x1="50" y1="160" x2="510" y2="160"/><line x1="50" y1="200" x2="510" y2="200"/></g>
+              <g font-size="10" fill="currentColor" opacity=".6"><text x="2" y="44">62,000</text><text x="2" y="84">61,000</text><text x="2" y="124">60,000</text><text x="2" y="164">59,000</text><text x="2" y="204">58,000</text></g>
+              <g font-size="10" fill="currentColor">
+              <line x1="70" y1="136.0" x2="70" y2="168.0" stroke="var(--up)"/><rect x="62" y="144.0" width="16" height="16.0" fill="var(--up)"/><text x="70" y="222" text-anchor="middle" opacity=".6">10/26</text><line x1="116" y1="120.0" x2="116" y2="152.0" stroke="var(--up)"/><rect x="108" y="128.0" width="16" height="16.0" fill="var(--up)"/><text x="116" y="222" text-anchor="middle" opacity=".6">10/27</text><line x1="162" y1="124.0" x2="162" y2="160.0" stroke="var(--down)"/><rect x="154" y="128.0" width="16" height="24.0" fill="var(--down)"/><text x="162" y="222" text-anchor="middle" opacity=".6">10/28</text><line x1="208" y1="108.0" x2="208" y2="152.0" stroke="var(--up)"/><rect x="200" y="116.0" width="16" height="32.0" fill="var(--up)"/><text x="208" y="222" text-anchor="middle" opacity=".6">10/29</text><line x1="254" y1="92.0" x2="254" y2="124.0" stroke="var(--up)"/><rect x="246" y="100.0" width="16" height="16.0" fill="var(--up)"/><text x="254" y="222" text-anchor="middle" opacity=".6">10/30</text><line x1="300" y1="88.0" x2="300" y2="116.0" stroke="var(--down)"/><rect x="292" y="96.0" width="16" height="12.0" fill="var(--down)"/><text x="300" y="222" text-anchor="middle" opacity=".6">11/2</text><line x1="346" y1="76.0" x2="346" y2="112.0" stroke="var(--up)"/><rect x="338" y="84.0" width="16" height="24.0" fill="var(--up)"/><text x="346" y="222" text-anchor="middle" opacity=".6">11/3</text><line x1="392" y1="80.0" x2="392" y2="112.0" stroke="var(--down)"/><rect x="384" y="84.0" width="16" height="20.0" fill="var(--down)"/><text x="392" y="222" text-anchor="middle" opacity=".6">11/4</text><line x1="438" y1="80.0" x2="438" y2="108.0" stroke="var(--up)"/><rect x="430" y="88.0" width="16" height="12.0" fill="var(--up)"/><text x="438" y="222" text-anchor="middle" opacity=".6">11/5</text><line x1="484" y1="60.0" x2="484" y2="96.0" stroke="var(--up)"/><rect x="476" y="72.0" width="16" height="16.0" fill="var(--up)"/><text x="484" y="222" text-anchor="middle" opacity=".6">11/6</text>
+              </g>
+            </svg>
+            <div class="small muted">삼성전자 (005930) 일봉 · 원화 · 최근 10거래일 · 네이버 증권 · 2026-11-06 (금) 15:30 KST 종가 ₩61,200 · 상승 빨강 / 하락 파랑 · 목업 예시 데이터</div>
+          </div>
+        </div>
+
+        <div data-spane="c-bar">
+          <div class="sandbox">
+            <svg viewBox="0 0 520 220" width="100%" role="img" aria-label="NVIDIA 분기 매출 막대 차트">
+              <g stroke="currentColor" opacity=".15"><line x1="50" y1="30" x2="510" y2="30"/><line x1="50" y1="100" x2="510" y2="100"/><line x1="50" y1="170" x2="510" y2="170"/></g>
+              <g font-size="10" fill="currentColor" opacity=".6"><text x="4" y="34">$80B</text><text x="4" y="104">$40B</text><text x="14" y="174">$0</text></g>
+              <g fill="var(--codex)"><rect x="90" y="79" width="60" height="91"/><rect x="190" y="68.5" width="60" height="101.5"/><rect x="290" y="58" width="60" height="112"/><rect x="390" y="47.5" width="60" height="122.5"/></g>
+              <g font-size="10.5" fill="currentColor" text-anchor="middle"><text x="120" y="74">$52B</text><text x="220" y="63">$58B</text><text x="320" y="53">$64B</text><text x="420" y="42">$70B</text>
+                <text x="120" y="188" opacity=".7">2025 Q4</text><text x="220" y="188" opacity=".7">2026 Q1</text><text x="320" y="188" opacity=".7">2026 Q2</text><text x="420" y="188" opacity=".7">2026 Q3</text></g>
+            </svg>
+            <div class="small muted">NVIDIA 분기 매출 (달러, 달력 분기 기준) · us-stock-skill 재무제표 · SEC 10-Q 기준 · 조회 2026-11-09 09:03 KST · 목업 예시 데이터</div>
+          </div>
+        </div>
+        <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다. <span class="ref">FR-7.8</span></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ===================== 4. 파일 뷰어 (FR-4.5) — 아들 ===================== -->
+<section data-screen="viewer">
+  <div class="page">
+    <div class="row sp"><h1>파일 뷰어 <span class="ref">FR-4.4 · FR-4.5</span></h1><a href="#chat">← 대화로</a></div>
+    <div class="notice ok small" data-vfrom style="display:none"></div>
+    <div class="tabs"><a class="on" data-tab="v-pdf">교과서_3단원.pdf</a><a data-tab="v-hwp">과제안내.hwp</a><a data-tab="v-err">읽을 수 없는 파일</a></div>
+    <div class="tabpane on" data-pane="v-pdf">
+      <div class="viewer">
+        <div class="small muted">
+          <div class="card" style="padding:8px;margin-bottom:6px">11쪽</div>
+          <div class="card" style="padding:8px;margin-bottom:6px;border-color:var(--accent)"><b>12쪽</b> ← 인용 위치</div>
+          <div class="card" style="padding:8px">13쪽</div>
+        </div>
+        <div class="pg">
+          <div style="color:#999;font-size:11px">교과서_3단원.pdf · 12 / 42쪽</div>
+          <h3 style="color:#222">3. 조선 후기 사회의 변화와 실학</h3>
+          <p>17세기 이후 조선 사회는 전란의 피해를 복구하는 과정에서 여러 변화를 겪었다. <span class="hl">실학은 조선 후기 사회의 현실 문제를 해결하려는 학문적 흐름으로</span>, 토지 제도와 상공업 진흥 등 다양한 개혁안을 제시하였다…</p>
+          <p style="color:#888">(본문 예시)</p>
+        </div>
+      </div>
+    </div>
+    <div class="tabpane" data-pane="v-hwp">
+      <div class="notice info small">HWP는 파일에 쪽 정보가 없어 표·문단 번호로 위치를 보여줘요. PDF 변환이 가능하면 쪽 번호도 함께 보여줘요. <span class="ref">FR-4.4</span></div>
+      <div class="viewer">
+        <div class="small muted">
+          <div class="card" style="padding:8px;margin-bottom:6px">문단 1~12</div>
+          <div class="card" style="padding:8px;margin-bottom:6px">표 1 · 표 2</div>
+          <div class="card" style="padding:8px;margin-bottom:6px;border-color:var(--accent)"><b>표 3 · 2행</b> ← 인용 위치</div>
+          <div class="card" style="padding:8px">표 4 · 각주</div>
+        </div>
+        <div class="pg">
+          <div style="color:#999;font-size:11px">과제안내.hwp · 3번째 표 (≈ PDF 변환 2쪽)</div>
+          <table style="color:#222"><tr><th style="color:#666">항목</th><th style="color:#666">내용</th></tr>
+            <tr><td>주제</td><td>조선 후기 사회 변화 중 1개 선택</td></tr>
+            <tr class="hl"><td>분량·조건</td><td>A4 3쪽 이내 / 1차 사료 1개 이상 인용</td></tr>
+            <tr><td>제출</td><td>11월 20일 (금)까지 학교 시스템</td></tr></table>
+        </div>
+      </div>
+    </div>
+    <div class="tabpane" data-pane="v-err">
+      <div class="small muted" style="margin-bottom:6px">올린 뒤 서버가 읽어 보고 바로 알려주는 경우 <span class="ref">FR-4.4</span></div>
+      <div class="notice err">🔒 「수행평가_배포용.hwp」는 배포용(편집 제한) 문서라 읽을 수 없어요. 원본 파일이나 PDF로 다시 올려 주세요.</div>
+      <div class="notice err">🔒 「수행평가_암호.hwp」는 암호가 걸린 HWP라 읽을 수 없어요. 암호를 푼 파일을 다시 올려 주세요.</div>
+      <div class="notice err">🔒 「모의고사.pdf」는 암호가 걸려 있어 읽을 수 없어요.</div>
+      <div class="notice info">🖼 「칠판사진.jpg」— 사진 속 글자를 읽었어요(OCR). 인식이 불확실한 부분은 [?]로 표시돼요.</div>
+      <div class="small muted" style="margin:12px 0 6px">올리기 전에 막는 경우(용량·개수)는 작성기에서 바로 보여요 <span class="ref">FR-4.6</span> → <a href="#states">오류·예외 상태 · 업로드 전 차단</a></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 5. 예약 (FR-8) — 엄마 ===================== -->
+<section data-screen="schedules">
+  <div class="app">
+    <div data-side></div>
+    <main class="main" style="overflow-y:auto">
+      <div class="topbar mob"><button class="ghost hamb" data-hamb>☰</button><div class="title">⏰ 예약</div></div>
+      <div class="page">
+        <div class="row sp"><h1>⏰ 예약 <span class="ref">FR-8</span></h1><button class="primary" data-open="schedModal">+ 새 예약</button></div>
+        <div class="small muted">대화에서 “매일 아침 8시에 관심 종목 브리핑해줘”라고 말해도 만들어져요. <span class="ref">FR-8.1</span> · 오늘: 2026-11-09 (월)</div>
+        <div class="card" style="margin-top:12px;padding:0 4px">
+        <table>
+          <tr><th>이름</th><th>일정</th><th>런타임 · 모델</th><th>최근 실행</th><th>알림</th><th></th></tr>
+          <tr><td><a href="#sched-result">아침 시장 브리핑</a><div class="small muted">👪 가족 전체에 공유 <span class="ref">FR-8.8</span></div></td><td>평일 08:00 KST<div class="small muted">다음: 11-10 (화) 08:00</div></td><td><span class="dot claude"></span> Claude Code · Opus 5.5</td><td><span class="badge ok">성공</span> 오늘 08:00 · $0.42</td><td style="white-space:nowrap">켜짐</td>
+            <td><div class="row"><button class="small">▶ 바로 실행</button><button class="small">⏸</button><button class="small">✎</button><button class="small danger">🗑</button></div></td></tr>
+          <tr><td>관심 종목 DART 공시 확인<div class="small muted">비공개</div></td><td>평일 18:00 KST<div class="small muted">다음: 오늘 18:00</div></td><td><span class="dot claude"></span> Claude Code · Sonnet 5.5</td><td><span class="badge err">실패</span> 11-06 (금) 18:00 · 재시도 1회 실패</td><td style="white-space:nowrap">켜짐</td>
+            <td><div class="row"><button class="small">▶</button><button class="small">⏸</button><button class="small">✎</button><button class="small danger">🗑</button></div></td></tr>
+          <tr><td>주간 미국 실적 일정<div class="small muted">비공개</div></td><td>매주 월 07:30 KST</td><td><span class="dot codex"></span> Codex · gpt-6.1-sol</td><td><span class="badge gray">일시정지</span> 10-26 (월)부터</td><td style="white-space:nowrap">꺼짐</td>
+            <td><div class="row"><button class="small">▶</button><button class="small">⏵ 재개</button><button class="small">✎</button><button class="small danger">🗑</button></div></td></tr>
+        </table></div>
+        <div class="notice info small" style="margin-top:12px">서버가 꺼져 있던 동안 놓친 예약은 다시 켜질 때 한 번만 실행돼요. 앞 실행이 안 끝났으면 그 회차는 건너뛰어요. <span class="ref">FR-8.7</span></div>
+
+        <h2 style="margin-top:20px">실행 이력 — 아침 시장 브리핑</h2>
+        <div class="card" style="padding:0 4px"><table><tr><th>예정</th><th>시작 · 저장</th><th>결과</th><th class="num">비용</th><th>메모</th></tr>
+          <tr><td>11-09 (월) 08:00</td><td>08:00:02 · 08:01:10</td><td><span class="badge ok">성공</span></td><td class="num">$0.42</td><td><a href="#sched-result?m=r1109">결과 메시지 보기 →</a></td></tr>
+          <tr><td>11-06 (금) 08:00</td><td>08:00:01 · —</td><td><span class="badge err">실패</span></td><td class="num">$0.05</td><td>네이버 증권 응답 없음 → 08:02 재시도도 실패 <span class="ref">FR-8.6</span> · <a href="#sched-result?m=fail">예약 대화의 실패 메시지 →</a></td></tr>
+          <tr><td>11-05 (목) 08:00</td><td>08:00:01 · 08:01:04</td><td><span class="badge ok">성공</span></td><td class="num">$0.40</td><td><a href="#sched-result?m=r1105">결과 메시지 보기 →</a></td></tr>
+          <tr><td>11-04 (수) 08:00</td><td>09:12:30 · 09:13:41</td><td><span class="badge ok">성공 (보정)</span></td><td class="num">$0.41</td><td>서버가 꺼져 있다가 09:12에 켜져 1회만 실행 <span class="ref">FR-8.7</span></td></tr>
+        </table></div>
+        <h2 style="margin-top:20px">실행 이력 — 관심 종목 DART 공시 확인</h2>
+        <div class="card" style="padding:0 4px"><table><tr><th>예정</th><th>결과</th><th class="num">비용</th><th>메모</th></tr>
+          <tr><td>11-06 (금) 18:00</td><td><span class="badge err">실패</span></td><td class="num">$0.03</td><td>OpenDART 응답 시간 초과 → 18:02 재시도 실패 <span class="ref">FR-8.6</span> · <a href="#sched-dart?m=dart-fail">예약 대화의 실패 메시지 →</a></td></tr>
+          <tr><td>11-05 (목) 18:00</td><td><span class="badge ok">성공</span></td><td class="num">$0.11</td><td><a href="#sched-dart?m=dart1105">결과 메시지 보기 →</a> · 공시 1건</td></tr>
+          <tr><td>11-04 (수) 18:00</td><td><span class="badge gray">건너뜀</span></td><td class="num">—</td><td>17:59에 누른 ‘바로 실행’이 아직 진행 중이라 이 회차는 건너뜀 <span class="ref">FR-8.7</span></td></tr></table></div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<section data-screen="sched-result">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title">⏰ 아침 시장 브리핑 <span class="muted small">· 예약 전용 대화</span></div><button data-open="shareModal" data-arg="sched-brief">👪 <span class="lbl">공유</span></button><a href="#schedules"><button>예약 설정</button></a></div>
+      <div class="thread"><div class="col">
+        <div class="divider">2026-11-05 (목) 08:00 실행 · 성공</div>
+        <div class="msg" id="r1105"><p><b>오늘의 브리핑</b> — 관심 종목 5개 중 2개 상승.</p>
+          <table><tr><th>지수·종목</th><th class="num">값</th><th class="num">전일 대비</th><th>기준 · 출처</th></tr>
+            <tr><td>KOSPI</td><td class="num">2,648.10</td><td class="num">−0.3%</td><td class="small muted">네이버 증권 · 11-04 (수) 15:30 KST 종가</td></tr>
+            <tr><td>나스닥</td><td class="num">18,912.4</td><td class="num">+0.8%</td><td class="small muted">Yahoo Finance · 11-04 (수) 16:00 ET 종가</td></tr></table>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다.</div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 예약 실행 · $0.40</div></div>
+
+        <div class="divider">2026-11-06 (금) 08:00 실행 · <span style="color:var(--err)">실패</span></div>
+        <div class="msg" id="fail">
+          <div class="notice err">⛔ <b>실행 실패</b> — 네이버 증권이 응답하지 않아 시세를 가져오지 못했어요. 2분 뒤(08:02) 한 번 더 시도했지만 같은 이유로 실패했어요. <span class="ref">FR-8.6</span></div>
+          <div class="small muted">시도: 08:00:01 · 재시도 08:02:01 · 실패 알림 보냄 08:02:40 <span class="ref">FR-8.4</span></div>
+          <div class="actions"><button>▶ 지금 다시 실행</button><a href="#schedules"><button>실행 이력 보기</button></a></div>
+        </div>
+
+        <div class="divider">11-07 (토) · 11-08 (일) — 평일 일정이라 실행하지 않음</div>
+
+        <div class="divider">2026-11-09 (월) 08:00 실행 · 성공 <span class="new" style="background:var(--accent);color:#fff;border-radius:999px;padding:0 6px;font-size:10px">새 결과</span></div>
+        <div class="msg" id="r1109"><p><b>오늘의 브리핑</b> — 관심 종목 5개 중 3개 상승. 삼성전자는 11-05 자기주식 취득 결정 공시 이후 강세예요.</p>
+          <table><tr><th>지수·종목</th><th class="num">값</th><th class="num">전일 대비</th><th>기준 · 출처</th></tr>
+            <tr><td>KOSPI</td><td class="num">2,671.35</td><td class="num">+0.6%</td><td class="small muted">네이버 증권 · 11-06 (금) 15:30 KST 종가</td></tr>
+            <tr><td>나스닥</td><td class="num">19,104.8</td><td class="num">+0.8%</td><td class="small muted">Yahoo Finance · 11-06 (금) 16:00 ET 종가</td></tr>
+            <tr><td>삼성전자</td><td class="num">₩61,200</td><td class="num">+0.7%</td><td class="small muted">네이버 증권 · 11-06 (금) 15:30 KST 종가</td></tr>
+            <tr><td>NVDA</td><td class="num">$182.40</td><td class="num">+2.4%</td><td class="small muted">Yahoo Finance · 11-06 (금) 16:00 ET 종가</td></tr></table>
+          <div class="small muted" style="margin-top:4px">공시: 삼성전자 DART 주요사항보고서 (11-05 16:12 KST) · NVIDIA SEC Form 4 (11-04 17:30 ET)</div>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다. 매수·매도는 실행하지 않아요. <span class="ref">FR-7.6 · FR-7.8</span></div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 예약 실행 · 예정 08:00 · 시작 08:00:02 · 저장 08:01:10 · $0.42</div></div>
+      </div></div>
+      <div class="composer"><div class="box"><textarea placeholder="이 결과에 대해 질문하기…"></textarea><div class="bar"><span class="grow"></span><span class="rtchip" data-rtchip data-rt="claude" data-model="claude-opus-5-5"></span><button class="primary">↑</button></div></div></div>
+    </main>
+  </div>
+</section>
+
+<!-- ===================== 5b. 예약 결과 대화 — DART 공시 확인 (FR-8.4 실패 알림 목적지) ===================== -->
+<section data-screen="sched-dart">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title">⏰ 관심 종목 DART 공시 확인 <span class="muted small">· 예약 전용 대화</span></div><a href="#schedules"><button>예약 설정</button></a></div>
+      <div class="thread"><div class="col">
+        <div class="divider">2026-11-04 (수) 18:00 · 건너뜀 — 17:59에 누른 ‘바로 실행’이 진행 중이었어요 <span class="ref">FR-8.7</span></div>
+        <div class="divider">2026-11-05 (목) 18:00 실행 · 성공</div>
+        <div class="msg" id="dart1105"><p><b>새 공시 1건</b> — 삼성전자 주요사항보고서(자기주식 취득 결정), 11-05 16:12 KST 접수.</p>
+          <div class="small muted">출처: OpenDART · 조회 11-05 (목) 18:00:41 KST</div>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다.</div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Sonnet 5.5 · 예약 실행 · $0.11</div></div>
+        <div class="divider">2026-11-06 (금) 18:00 실행 · <span style="color:var(--err)">실패</span></div>
+        <div class="msg" id="dart-fail">
+          <div class="notice err">⛔ <b>실행 실패</b> — OpenDART가 제때 응답하지 않아(시간 초과) 공시를 확인하지 못했어요. 2분 뒤(18:02) 한 번 더 시도했지만 같은 이유로 실패했어요. <span class="ref">FR-8.6</span></div>
+          <div class="small muted">시도: 18:00:01 · 재시도 18:02:01 · 실패 알림 보냄 18:02:35 <span class="ref">FR-8.4</span></div>
+          <div class="actions"><button>▶ 지금 다시 실행</button><a href="#schedules"><button>실행 이력 보기</button></a></div>
+        </div>
+      </div></div>
+      <div class="composer"><div class="box"><textarea placeholder="이 결과에 대해 질문하기…"></textarea><div class="bar"><span class="grow"></span><span class="rtchip" data-rtchip data-rt="claude" data-model="claude-sonnet-5-5"></span><button class="primary">↑</button></div></div></div>
+    </main>
+  </div>
+</section>
+
+<!-- ===================== 6. 공유받은 대화 (FR-14) — 아들이 엄마의 예약 결과를 봄 ===================== -->
+<section data-screen="shared">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title">⏰ 아침 시장 브리핑 <span class="badge">👪 엄마가 공유 · 읽기 전용</span></div></div>
+      <div class="thread"><div class="col">
+        <div class="notice info small">엄마가 2026-11-03 (화)에 가족 전체에 공유했어요. 새 결과가 쌓이면 여기도 보여요(살아 있는 공유). <span class="ref">FR-14.3 · FR-14.6</span></div>
+        <div class="divider">2026-11-09 (월) 08:00 실행 · 성공</div>
+        <div class="msg"><p><b>오늘의 브리핑</b> — 관심 종목 5개 중 3개 상승…</p>
+          <table><tr><th>지수</th><th class="num">값</th><th>기준 · 출처</th></tr><tr><td>KOSPI</td><td class="num">2,671.35</td><td class="small muted">네이버 증권 · 11-06 (금) 15:30 KST 종가</td></tr></table>
+          <div class="disc">ℹ 참고용 정보이며 투자 권유가 아닙니다.</div>
+          <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 예약 실행</div></div>
+        <div class="msg"><div class="card"><div class="row"><span>📈</span><div class="grow"><b>주간 수익률 차트</b><div class="small muted">공유된 아티팩트 — 보기·내려받기 가능, 수정은 포크 후 <span class="ref">FR-14.4</span></div></div><span class="chip">열기</span></div></div></div>
+        <div class="row" style="margin:10px 0"><span class="toggle"><span class="sw on"></span> 이 대화의 새 결과 알림 받기</span><span class="ref">FR-8.8</span></div>
+      </div></div>
+      <div class="composer"><div class="box" style="text-align:center">
+        <div class="small muted" style="margin-bottom:8px">공유받은 대화는 읽기 전용이에요.</div>
+        <button class="primary">↪ 이어서 대화하기 (내 대화로 복사)</button>
+        <div class="small muted" style="margin-top:6px">내 기본 런타임 · 내 연결로 이어가요. 원래 대화는 바뀌지 않아요. <span class="ref">FR-14.3</span></div>
+      </div></div>
+    </main>
+  </div>
+</section>
+
+<!-- ===================== 7. 아티팩트 목록 (FR-6.6) — 아들 ===================== -->
+<section data-screen="artifacts">
+  <div class="app">
+    <div data-side></div>
+    <main class="main" style="overflow-y:auto">
+      <div class="topbar mob"><button class="ghost hamb" data-hamb>☰</button><div class="title">🧩 아티팩트</div></div>
+      <div class="page">
+      <h1>🧩 아티팩트 <span class="ref">FR-6.6</span></h1>
+      <div class="tabs"><a class="on" data-tab="a-mine">내가 만든 것</a><a data-tab="a-shared">공유받은 것</a></div>
+      <div class="tabpane on" data-pane="a-mine"><div class="grid3">
+        <div class="card"><div style="height:90px;background:var(--bg);border-radius:8px;display:grid;place-items:center">📄</div><b>보고서 구조안 — 실학</b><div class="small muted">문서 · v2 · <span class="badge gray">비공개</span></div><button class="small" style="margin-top:6px" data-open="shareModal" data-arg="art-report">👪 공유</button></div>
+        <div class="card"><div style="height:90px;background:var(--bg);border-radius:8px;display:grid;place-items:center">📊</div><b>물리 실험 그래프</b><div class="small muted">차트 · v3 · <span class="badge">👪 가족 전체</span></div><button class="small" style="margin-top:6px" data-open="shareModal" data-arg="art-physics">👪 공유 설정</button></div>
+        <div class="card"><div style="height:90px;background:var(--bg);border-radius:8px;display:grid;place-items:center">🗂</div><b>영단어 퀴즈</b><div class="small muted">HTML · v1 · <span class="badge">👪 엄마</span></div><button class="small" style="margin-top:6px" data-open="shareModal" data-arg="art-quiz">👪 공유 설정</button></div>
+      </div></div>
+      <div class="tabpane" data-pane="a-shared"><div class="grid3">
+        <div class="card"><div style="height:90px;background:var(--bg);border-radius:8px;display:grid;place-items:center">📈</div><b>주간 수익률 차트</b><div class="small muted">엄마 · 11-08 (일) 21:10 공유</div><button class="small" style="margin-top:6px">⑂ 포크해서 수정</button></div>
+        <div class="card"><div style="height:90px;background:var(--bg);border-radius:8px;display:grid;place-items:center">🗺</div><b>제주 여행 동선 지도</b><div class="small muted">아빠 · 10-30 (금) 공유</div><button class="small" style="margin-top:6px">⑂ 포크해서 수정</button></div>
+      </div></div>
+    </div></main>
+  </div>
+</section>
+
+<!-- ===================== 8. 설정 (FR-12, FR-13, FR-11 개인 연결) — 아들 ===================== -->
+<section data-screen="settings">
+  <div class="app">
+    <div data-side></div>
+    <main class="main" style="overflow-y:auto">
+      <div class="topbar mob"><button class="ghost hamb" data-hamb>☰</button><div class="title">⚙️ 설정</div></div>
+      <div class="page">
+      <h1>⚙️ 설정</h1>
+      <div class="tabs"><a class="on" data-tab="s-default">기본 런타임</a><a data-tab="s-conn">내 런타임 연결</a><a data-tab="s-noti">알림</a><a data-tab="s-usage">내 사용량</a><a data-tab="s-acc">계정·화면</a></div>
+
+      <div class="tabpane on" data-pane="s-default">
+        <div class="card">
+          <h2>기본 런타임 · 모델 <span class="ref">FR-12.1~12.5</span></h2>
+          <div class="small muted">새 대화와 새 예약에 자동으로 쓰여요. 이미 있는 대화는 바뀌지 않아요.</div>
+          <label>기본 런타임</label>
+          <div class="seg"><span class="on"><span class="dot claude"></span> Claude Code</span><span><span class="dot codex"></span> Codex</span></div>
+          <div class="grid2" style="margin-top:6px">
+            <div><label>Claude Code 기본 모델</label><select data-defm="claude"><option value="claude-opus-5-5">claude-opus-5-5 (Opus 5.5)</option><option value="claude-sonnet-5-5">claude-sonnet-5-5 (Sonnet 5.5)</option></select></div>
+            <div><label>Codex 기본 모델</label><select data-defm="codex"><option value="gpt-6.1-sol">gpt-6.1-sol</option><option value="gpt-6-astra">gpt-6-astra</option></select></div>
+          </div>
+          <label>기본 추론 강도</label><div class="seg"><span>낮음</span><span class="on">보통</span><span>높음</span></div>
+          <div class="small muted" style="margin-top:6px">관리자가 이 계정에 허용한 모델과 내가 쓸 수 있는 연결만 보여요 (아들: Claude Code는 Opus·Sonnet, Codex는 전체). 처음 기본값: Claude Code · Opus 5.5 <span class="ref">D3 · FR-12.4</span></div>
+          <div class="row" style="margin-top:12px"><button class="primary">저장</button></div>
+        </div>
+        <div class="small muted" style="margin-top:8px">기본값을 쓸 수 없게 되면 이 탭 위에 안내가 떠요 → <a href="#states">오류·예외 상태 · 기본값 대체</a> <span class="ref">FR-12.6</span></div>
+      </div>
+
+      <div class="tabpane" data-pane="s-conn">
+        <div class="card">
+          <div class="row sp"><h2>내 런타임 연결 <span class="ref">FR-11.1 개인 · FR-12.7</span></h2><button class="primary" data-open="connModal" data-arg="member">+ 연결 추가</button></div>
+          <div class="small muted">개인 연결은 나만 써요. 같은 런타임에 개인·공용이 둘 다 있으면 개인 연결을 먼저 써요. <span class="ref">FR-11.3</span></div>
+          <table style="margin-top:8px">
+            <tr><th>런타임</th><th>방식</th><th>계정/키</th><th>상태</th><th></th></tr>
+            <tr><td><span class="dot codex"></span> Codex</td><td>ChatGPT 로그인</td><td>son@example.com</td><td><span class="badge err">만료</span> 11-07 (토) 09:40</td><td><div class="row"><button class="small primary" data-open="connModal" data-arg="member-codex">다시 로그인</button><button class="small danger">해제</button></div></td></tr>
+          </table>
+          <h3 style="margin-top:16px">쓸 수 있는 가족 공용 연결 (관리자가 허용)</h3>
+          <table><tr><th>런타임</th><th>방식</th><th>내게 허용된 모델</th><th>상태</th></tr>
+            <tr><td><span class="dot claude"></span> Claude Code</td><td>공용 API 키 ····a91f</td><td>Opus 5.5 · Sonnet 5.5</td><td><span class="badge ok">정상</span></td></tr>
+            <tr><td><span class="dot codex"></span> Codex</td><td>공용 API 키 ····7c20</td><td>gpt-6.1-sol · gpt-6-astra</td><td><span class="badge ok">정상</span> <span class="small muted">개인 연결 만료로 지금 이 연결 사용</span></td></tr></table>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="s-noti">
+        <div class="card" data-mstroot data-state="ask">
+          <h2>알림 <span class="ref">FR-13 · FR-12.8</span></h2>
+          <div class="mstate"><b>목업 상태 · 이 기기</b><span data-mst="ask">아직 허용 안 함</span><span data-mst="denied">권한 거부됨</span><span data-mst="unsupported">지원 안 됨</span><span data-mst="on">켜짐</span></div>
+          <table><tr><th>기기</th><th>상태</th><th></th></tr>
+            <tr><td>💻 MacBook · Chrome</td><td><span class="badge ok">켜짐</span></td><td><button class="small">끄기</button></td></tr>
+            <tr><td>📱 iPhone · 홈 화면 앱</td><td><span class="badge ok">켜짐</span></td><td><button class="small">끄기</button></td></tr>
+            <tr data-only="ask"><td><b>이 기기</b> · 학교 노트북 Chrome</td><td><span class="badge gray">꺼짐</span></td><td><button class="small primary">이 기기에서 알림 켜기</button></td></tr>
+            <tr data-only="on"><td><b>이 기기</b> · 학교 노트북 Chrome</td><td><span class="badge ok">켜짐</span></td><td><button class="small">끄기</button> <button class="small">테스트 알림</button></td></tr>
+            <tr data-only="denied"><td><b>이 기기</b> · 학교 노트북 Chrome</td><td><span class="badge err">브라우저가 차단</span></td><td><button class="small">다시 확인</button></td></tr>
+            <tr data-only="unsupported"><td><b>이 기기</b> · iPhone Safari (홈 화면에 추가 안 함)</td><td><span class="badge warn">지원 안 됨</span></td><td></td></tr>
+          </table>
+          <div data-only="denied" class="notice err small" style="margin-top:10px">🚫 이 브라우저에서 Agent Lee 알림을 <b>차단</b>했어요. 앱에서는 다시 물어볼 수 없어요. 주소창 왼쪽 🔒 → 사이트 설정 → 알림을 ‘허용’으로 바꾼 뒤 ‘다시 확인’을 눌러 주세요. 그동안 알림은 🔔 알림함에만 쌓여요. <span class="ref">FR-13.1 · 13.3</span></div>
+          <div data-only="unsupported" class="notice warn small" style="margin-top:10px">⚠ 지금 화면(Safari 탭)에서는 웹 푸시를 받을 수 없어요. iPhone은 공유 버튼 → “홈 화면에 추가” → 추가된 앱에서 알림을 켜야 해요(iOS 16.4 이상). 그보다 낮은 버전은 지원하지 않아요. 알림은 🔔 알림함에서 볼 수 있어요. <span class="ref">FR-13.1</span></div>
+          <div data-only="ask on" class="notice info small" style="margin-top:10px">📱 iPhone: Safari에서 chat.2prostream.com 열기 → 공유 버튼 → “홈 화면에 추가” → 추가된 앱을 열고 알림 허용 (iOS 16.4 이상). Android: Chrome에서 바로 허용. <span class="ref">FR-13.1</span></div>
+          <label>방해 금지 시간</label><div class="row wrap"><input value="23:00" style="width:100px"> ~ <input value="07:00" style="width:100px"><span class="small muted">이 시간에는 알림함에만 쌓이고, 끝나면 모아서 한 번 보내요 <span class="ref">FR-13.4</span></span></div>
+          <label>받을 알림</label>
+          <div class="row wrap"><span class="toggle"><span class="sw on"></span> 예약 결과 (공유받은 예약 포함)</span><span class="toggle"><span class="sw on"></span> 가족이 공유함</span><span class="toggle"><span class="sw on"></span> 내 연결 끊김</span></div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="s-usage">
+        <div class="grid3">
+          <div class="card"><div class="small muted">이번 달 비용 (공용 API 키 사용분)</div><div class="stat">$4.10</div><div class="small muted">Claude Code $3.20 · Codex $0.90</div></div>
+          <div class="card"><div class="small muted">구독 연결 사용 (Codex · ChatGPT)</div><div class="stat">212회</div><div class="small muted">토큰 1.9M · 11-07 만료 전까지</div></div>
+          <div class="card"><div class="small muted">예산</div><div class="stat">상한 없음</div><div class="small muted">월 예산 기능은 <span class="badge gray">추후 제공</span> <span class="ref">FR-9.1</span></div></div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="s-acc">
+        <div class="card"><h2>계정·화면</h2>
+          <label>이름</label><input value="아들"><label>이메일 (관리자만 변경)</label><input value="son@example.com" disabled>
+          <label>비밀번호</label><div class="row"><button>비밀번호 변경</button><button>패스키 등록</button></div>
+          <label>테마</label><div class="seg"><span>라이트</span><span>다크</span><span class="on">시스템</span></div>
+        </div>
+      </div>
+    </div></main>
+  </div>
+</section>
+
+<!-- ===================== 9. 관리자 (FR-10, FR-11, FR-15, FR-9) — 아빠 ===================== -->
+<section data-screen="admin">
+  <div class="app">
+    <div data-side></div>
+    <main class="main" style="overflow-y:auto">
+      <div class="topbar mob"><button class="ghost hamb" data-hamb>☰</button><div class="title">🛠 관리자</div></div>
+      <div class="page">
+      <h1>🛠 관리자 <span class="ref">FR-10</span></h1>
+      <div class="tabs"><a class="on" data-tab="ad-users">사용자 · Access</a><a data-tab="ad-rt">런타임 연결</a><a data-tab="ad-skills">스킬</a><a data-tab="ad-usage">사용량</a><a data-tab="ad-sys">시스템 상태</a></div>
+
+      <div class="tabpane on" data-pane="ad-users" data-mstroot data-state="auto" id="adminUsers">
+        <div class="mstate"><b>목업 상태</b><span data-mst="manual">A. 토큰 미등록 (아빠·아들)</span><span data-mst="auto">B. 자동 반영 (아빠·아들) — 엄마 추가</span><span data-mst="drift">C. 가족 3명 · 목록 불일치</span></div>
+        <div class="card">
+          <div class="row sp"><h2>사용자 <span class="ref">FR-1 · FR-15.1</span></h2><button class="primary" data-open="userModal" data-arg="add" data-only="manual auto">+ 사용자 추가</button><span class="small muted" data-only="drift">가족 3명 모두 등록됨</span></div>
+          <table>
+            <tr><th>이름</th><th>이메일</th><th>역할</th><th>허용 런타임·모델</th><th>Access</th><th></th></tr>
+            <tr><td>아빠</td><td>ingki3@gmail.com</td><td><span class="badge">admin</span></td><td>전체 · Claude 구독(본인)</td>
+              <td><span data-only="auto drift"><span class="badge ok">반영됨</span></span><span data-only="manual"><span class="badge gray">수동 관리</span></span><div class="small muted">현재 관리자 — 삭제 불가</div></td>
+              <td><button class="small" data-open="adminEmailModal">이메일 변경…</button></td></tr>
+            <tr data-only="drift"><td>엄마</td><td>wife@example.com</td><td>member</td><td>Claude Code(Opus·Sonnet·Haiku) · Codex 전체</td><td><span class="badge ok">반영됨</span></td>
+              <td><div class="row"><button class="small" data-open="userModal" data-arg="edit-wife">✎</button><button class="small" data-open="pwModal" data-arg="reset-wife">비밀번호 초기화</button><button class="small danger" data-open="previewModal" data-arg="dis-wife">비활성화</button></div></td></tr>
+            <tr><td>아들</td><td>son@example.com</td><td>member · 청소년 지침</td><td>Claude Code(Opus·Sonnet) · Codex 전체</td>
+              <td><span data-only="auto"><span class="badge ok">반영됨</span></span><span data-only="manual"><span class="badge gray">수동 관리</span></span><span data-only="drift"><span class="badge warn">반영 안 됨</span> <button class="small">다시 시도</button></span></td>
+              <td><div class="row"><button class="small" data-open="userModal" data-arg="edit-son">✎</button><button class="small" data-open="pwModal" data-arg="reset-son">비밀번호 초기화</button><button class="small danger" data-open="previewModal" data-arg="dis-son">비활성화</button></div></td></tr>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <h2>Cloudflare Access 동기화 <span class="ref">FR-15.2~15.6</span></h2>
+          <label>모드</label><div class="seg"><span data-mst="auto" data-on-in="auto drift" class="on">자동 (API 토큰)</span><span data-mst="manual">수동</span></div>
+
+          <!-- A. 토큰 미등록 · 수동 -->
+          <div data-only="manual">
+            <div class="grid2" style="margin-top:10px">
+              <div>
+                <h3>API 토큰 등록 <span class="badge gray">미등록</span> <span class="ref">FR-15.2 · 15.6</span></h3>
+                <div class="small muted">토큰을 등록하면 사용자를 추가·수정·비활성화할 때마다 Access 허용 목록이 자동으로 맞춰져요.</div>
+                <label>Cloudflare API 토큰 (Access: Apps and Policies 수정 권한만)</label><input placeholder="토큰 붙여넣기">
+                <label>Access 애플리케이션</label><select disabled><option>토큰을 확인하면 목록이 나와요</option></select>
+                <button class="primary" style="margin-top:10px">토큰 확인 후 등록</button>
+                <div class="small muted" style="margin-top:6px">토큰은 암호화해 저장하고 끝 4자리만 보여요.</div>
+              </div>
+              <div>
+                <h3>수동 모드 안내 <span class="ref">FR-15.4</span></h3>
+                <div class="small muted">토큰 없이 쓰는 동안에는 아래 목록을 Cloudflare 대시보드에 직접 넣어 주세요.</div>
+                <label>Access에 넣을 이메일 (앱 활성 사용자)</label>
+                <div class="diff">ingki3@gmail.com<br>son@example.com</div>
+                <button class="small" style="margin-top:6px">⧉ 목록 복사</button>
+                <ol class="small" style="padding-left:18px;margin:10px 0">
+                  <li>Cloudflare 대시보드 → Zero Trust → Access → Applications</li>
+                  <li>「Agent Lee — chat.2prostream.com」 → Policies → 허용 정책 편집</li>
+                  <li>Include → Emails에 위 목록을 그대로 붙여넣기 (목록에 없는 이메일은 지우기)</li>
+                  <li>저장 후 여기서 ‘대시보드에 반영했어요’ 누르기</li>
+                </ol>
+                <button class="small">대시보드에 반영했어요</button> <span class="small muted">마지막 확인: 11-02 (월)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- B. 자동 · 일치 -->
+          <div data-only="auto" class="grid2" style="margin-top:10px">
+            <div>
+              <label>Cloudflare API 토큰</label><div class="row"><input value="····k3Qz · 2026-11-02 등록" disabled><button class="small">교체…</button><button class="small danger">삭제</button></div>
+              <label>Access 애플리케이션</label><select><option>Agent Lee — chat.2prostream.com</option></select>
+              <label>Access 로그인 방식</label><div class="row wrap"><span class="toggle"><span class="sw on"></span> 이메일 일회용 코드</span><span class="toggle"><span class="sw"></span> Google 로그인</span></div>
+            </div>
+            <div>
+              <label>허용 목록 비교 (Access ↔ 앱 활성 사용자)</label>
+              <table><tr><th>이메일</th><th>앱</th><th>Access</th></tr>
+                <tr><td>ingki3@gmail.com</td><td>✓</td><td>✓</td></tr><tr><td>son@example.com</td><td>✓</td><td>✓</td></tr></table>
+              <div class="notice ok small">✓ 일치해요 · 마지막 확인 오늘 10:05</div>
+            </div>
+          </div>
+
+          <!-- C. 운영 중 · 불일치 -->
+          <div data-only="drift" class="grid2" style="margin-top:10px">
+            <div>
+              <label>Cloudflare API 토큰</label><div class="row"><input value="····k3Qz · 2026-11-02 등록" disabled><button class="small">교체…</button></div>
+              <label>Access 애플리케이션</label><select><option>Agent Lee — chat.2prostream.com</option></select>
+            </div>
+            <div>
+              <label>허용 목록 비교 (Access ↔ 앱 활성 사용자)</label>
+              <table><tr><th>이메일</th><th>앱</th><th>Access</th></tr>
+                <tr><td>ingki3@gmail.com</td><td>✓</td><td>✓</td></tr><tr><td>wife@example.com</td><td>✓</td><td>✓</td></tr>
+                <tr><td>son@example.com</td><td>✓</td><td><span class="badge warn">없음</span></td></tr>
+                <tr><td>old@example.com</td><td>—</td><td><span class="badge err">남아 있음</span></td></tr></table>
+              <div class="notice warn small">⚠ 앱과 Access 허용 목록이 달라요 (대시보드에서 직접 바뀌었을 수 있어요). <span class="ref">FR-15.3</span></div>
+              <button class="primary" data-open="syncModal">앱 사용자 목록을 Access에 반영…</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="ad-rt">
+        <div class="card">
+          <div class="row sp wrap"><h2>가족 공용 연결 <span class="ref">FR-11.1 · 11.2</span></h2><button class="primary" data-open="connModal" data-arg="shared">+ 공용 연결 추가 (API 키만)</button></div>
+          <table>
+            <tr><th>런타임</th><th>방식</th><th>키</th><th>모델 목록 (순서 = 대체 순서)</th><th>추론 강도</th><th>쓸 수 있는 가족</th><th>상태</th><th></th></tr>
+            <tr><td><span class="dot claude"></span> Claude Code<div class="small muted">Claude Agent SDK</div></td><td>API 키</td><td>····a91f</td><td>1. Opus 5.5 · 2. Sonnet 5.5 · 3. Haiku 5.5</td><td>낮음~높음</td><td>아빠 · 엄마 · 아들</td><td><span class="badge ok">테스트 통과</span></td><td><div class="row"><button class="small">테스트</button><button class="small">✎</button><button class="small danger">해제</button></div></td></tr>
+            <tr><td><span class="dot codex"></span> Codex<div class="small muted"><code>codex app-server</code></div></td><td>API 키</td><td>····7c20</td><td>1. gpt-6.1-sol · 2. gpt-6-astra</td><td>낮음~높음</td><td>아빠 · 엄마 · 아들</td><td><span class="badge ok">테스트 통과</span></td><td><div class="row"><button class="small">테스트</button><button class="small">✎</button><button class="small danger">해제</button></div></td></tr>
+          </table>
+          <div class="small muted" style="margin-top:8px">구독 로그인은 공용으로 지정할 수 없어요. 사용자별로 어떤 모델을 쓸지는 사용자 편집(✎)에서 정해요. 기본값을 못 쓰면 이 목록 순서대로 대체해요. <span class="ref">D2 · FR-11.4 · FR-12.6</span></div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <div class="row sp wrap"><h2>개인 연결 현황</h2><button data-open="connModal" data-arg="self">+ 내 개인 연결 (관리자 본인)</button></div>
+          <div class="row" style="margin-bottom:6px"><span class="toggle"><span class="sw on"></span> 가족이 직접 개인 연결(API 키 · ChatGPT 로그인)을 추가할 수 있게 허용</span><span class="ref">FR-10.2</span></div>
+          <table><tr><th>사용자</th><th>런타임</th><th>방식</th><th>계정</th><th>상태</th><th></th></tr>
+            <tr><td>아빠</td><td><span class="dot claude"></span> Claude Code</td><td>Claude 구독 (장기 토큰)</td><td>ingki3@gmail.com (Max)</td><td><span class="badge ok">정상</span></td><td><button class="small danger">해제</button> <span class="small muted">관리자 본인만 가능 (D2)</span></td></tr>
+            <tr><td>아들</td><td><span class="dot codex"></span> Codex</td><td>ChatGPT 로그인</td><td>son@example.com</td><td><span class="badge err">만료</span></td><td><button class="small danger">삭제</button> <span class="small muted">원문 보기 불가</span></td></tr>
+            <tr><td>엄마</td><td>—</td><td>—</td><td>—</td><td class="small muted">없음</td><td><button class="small" data-open="connModal" data-arg="forwife">대신 등록</button></td></tr></table>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>연결 테스트 결과 — Claude Code 공용 <span class="ref">FR-11.5</span></h2>
+          <div class="row wrap"><span class="badge ok">✓ 응답</span><span class="badge ok">✓ 스트리밍</span><span class="badge ok">✓ 공통 MCP 도구 (cite.verify)</span><span class="badge ok">✓ 스킬 (kr-stock-skill)</span><span class="small muted">· 2.1초</span></div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="ad-skills">
+        <div class="card">
+          <h2>스킬 허용 목록 <span class="ref">D5 · FR-1.6 · FR-10.3 · §7</span></h2>
+          <div class="small muted">서버에 연결할 스킬과 가족별 사용 여부를 정해요. 바꾸면 다음 메시지부터 적용돼요.</div>
+          <table><tr><th>스킬</th><th>서버 연결</th><th>아빠</th><th>엄마</th><th>아들</th><th>필요한 키</th></tr>
+            <tr><td>kr-stock-skill</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw"></span></span></td><td>—</td></tr>
+            <tr><td>us-stock-skill</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw"></span></span></td><td>—</td></tr>
+            <tr><td>market-disclosure-monitor</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw"></span></span></td><td>OpenDART ····2b1</td></tr>
+            <tr><td>dart-investment-monitor</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw"></span></span></td><td>OpenDART ····2b1</td></tr>
+            <tr><td>news-search-skill</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td>Gemini ····9de</td></tr>
+            <tr><td>google-news-search-skill</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td>—</td></tr>
+            <tr><td>realtime-lookup-skill · summarize</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td>확인 필요</td></tr>
+            <tr><td>pdf · docx · xlsx · pptx · HWP 추출기</td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td>—</td></tr>
+            <tr><td>python-scratchpad <span class="small muted">(샌드박스)</span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td><span class="toggle"><span class="sw on"></span></span></td><td>—</td></tr>
+            <tr><td class="muted">gmail · calendar · contacts · google-docs</td><td><span class="badge err">제외</span></td><td colspan="4" class="small muted">아빠 개인 계정 OAuth — v1 제외 (켤 수 없음)</td></tr>
+            <tr><td class="muted">agent-browser · computer-use · orca-cli · implementation</td><td><span class="badge err">제외</span></td><td colspan="4" class="small muted">로컬 시스템 조작 권한이 큼 (켤 수 없음)</td></tr></table>
+          <div class="row" style="margin-top:10px"><button class="primary">저장</button></div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="ad-usage">
+        <div class="grid3">
+          <div class="card"><div class="small muted">이번 달 누적 (공용 API 키)</div><div class="stat">$38.20</div><div class="small muted">11-01 ~ 11-09</div></div>
+          <div class="card"><div class="small muted">이번 달 예상</div><div class="stat">$127</div><div class="small muted">기본 모델 Opus 5.5 · 지금 속도 기준 <span class="ref">FR-9.5</span></div></div>
+          <div class="card"><div class="small muted">예산 상한</div><div class="stat">없음</div><span class="toggle dis small" title="v1.1에서 제공"><span class="sw"></span> 사용자별 월 예산</span> <span class="badge gray">추후 제공</span> <span class="ref">FR-9.1</span></div>
+        </div>
+        <div class="card" style="margin-top:14px" data-sproot>
+          <div class="row sp wrap"><h2>사용량 <span class="ref">FR-9.3 · 수용 기준 12</span></h2><div class="seg"><span class="on" data-sp="u-user">사용자별</span><span data-sp="u-rt">런타임별</span><span data-sp="u-model">모델별</span><span data-sp="u-conn">연결별</span></div></div>
+          <div data-spane="u-user" class="on"><table><tr><th>사용자</th><th class="num">API 비용</th><th class="num">구독 사용</th><th class="num">토큰</th></tr>
+            <tr><td>아빠</td><td class="num">$12.30</td><td class="num">540회 (Claude 구독)</td><td class="num">3.1M</td></tr>
+            <tr><td>엄마</td><td class="num">$21.80</td><td class="num">—</td><td class="num">4.4M</td></tr>
+            <tr><td>아들</td><td class="num">$4.10</td><td class="num">212회 (ChatGPT)</td><td class="num">2.7M</td></tr>
+            <tr><th>합계</th><th class="num">$38.20</th><th class="num">752회</th><th class="num">10.2M</th></tr></table></div>
+          <div data-spane="u-rt"><table><tr><th>런타임</th><th class="num">API 비용</th><th class="num">구독 사용</th><th class="num">토큰</th></tr>
+            <tr><td><span class="dot claude"></span> Claude Code</td><td class="num">$30.10</td><td class="num">540회</td><td class="num">7.6M</td></tr>
+            <tr><td><span class="dot codex"></span> Codex</td><td class="num">$8.10</td><td class="num">212회</td><td class="num">2.6M</td></tr>
+            <tr><th>합계</th><th class="num">$38.20</th><th class="num">752회</th><th class="num">10.2M</th></tr></table></div>
+          <div data-spane="u-model"><table><tr><th>모델</th><th class="num">API 비용</th><th class="num">구독 사용</th><th class="num">토큰</th></tr>
+            <tr><td>claude-opus-5-5</td><td class="num">$27.40</td><td class="num">498회</td><td class="num">5.9M</td></tr>
+            <tr><td>claude-sonnet-5-5</td><td class="num">$2.50</td><td class="num">42회</td><td class="num">1.4M</td></tr>
+            <tr><td>claude-haiku-5-5</td><td class="num">$0.20</td><td class="num">—</td><td class="num">0.3M</td></tr>
+            <tr><td>gpt-6.1-sol</td><td class="num">$7.30</td><td class="num">190회</td><td class="num">2.3M</td></tr>
+            <tr><td>gpt-6-astra</td><td class="num">$0.80</td><td class="num">22회</td><td class="num">0.3M</td></tr>
+            <tr><th>합계</th><th class="num">$38.20</th><th class="num">752회</th><th class="num">10.2M</th></tr></table></div>
+          <div data-spane="u-conn"><table><tr><th>연결</th><th>범위</th><th>방식</th><th class="num">API 비용</th><th class="num">구독 사용</th></tr>
+            <tr><td><span class="dot claude"></span> Claude Code ····a91f</td><td>가족 공용</td><td>API 키 (비용)</td><td class="num">$30.10</td><td class="num">—</td></tr>
+            <tr><td><span class="dot codex"></span> Codex ····7c20</td><td>가족 공용</td><td>API 키 (비용)</td><td class="num">$8.10</td><td class="num">—</td></tr>
+            <tr><td><span class="dot claude"></span> 아빠 Claude 구독 (Max)</td><td>개인</td><td>구독 (횟수·토큰)</td><td class="num">—</td><td class="num">540회</td></tr>
+            <tr><td><span class="dot codex"></span> 아들 ChatGPT 로그인</td><td>개인</td><td>구독 (횟수·토큰)</td><td class="num">—</td><td class="num">212회 <span class="badge err">만료</span></td></tr></table>
+            <div class="small muted" style="margin-top:6px">구독 연결은 비용 대신 사용 횟수·토큰만 집계해요. <span class="ref">FR-9.2</span></div></div>
+          <label>하루 비용 알림 기준 (선택, 막지 않음)</label><div class="row wrap"><input value="$10" style="width:120px"><span class="small muted">넘으면 관리자에게 알림만 보내요 <span class="ref">FR-9.5</span></span></div>
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="ad-sys">
+        <div class="grid3">
+          <div class="card"><div class="small muted">서버</div><div class="stat">가동 5일</div><div class="small muted">127.0.0.1:3000 · 11-04 09:12 재시작</div></div>
+          <div class="card"><div class="small muted">Cloudflare 터널</div><div class="stat" style="color:var(--ok)">연결됨</div><div class="small muted">chat.2prostream.com</div></div>
+          <div class="card"><div class="small muted">디스크</div><div class="stat">18 GB</div><div class="small muted">파일 14 GB · DB 0.6 GB</div></div>
+        </div>
+        <div class="card" style="margin-top:14px"><h2>런타임 상태 · 최근 오류 <span class="ref">FR-10.4</span></h2>
+          <table><tr><th>시각</th><th>종류</th><th>내용</th></tr>
+            <tr><td>11-07 (토) 09:40</td><td><span class="badge warn">연결</span></td><td>아들 Codex 개인 연결(ChatGPT) 인증 만료</td></tr>
+            <tr><td>11-06 (금) 18:02</td><td><span class="badge err">스킬</span></td><td>dart-investment-monitor 시간 초과 (예약: 관심 종목 DART 공시 확인 · 엄마)</td></tr>
+            <tr><td>11-06 (금) 08:02</td><td><span class="badge err">스킬</span></td><td>kr-stock-skill 네이버 증권 응답 없음 (예약: 아침 시장 브리핑 · 엄마)</td></tr></table></div>
+        <div class="card" style="margin-top:14px"><h2>백업 <span class="ref">FR-10.5 · NFR 백업</span></h2>
+          <div class="row wrap"><span>매일 03:00 자동 · 7일 보관 · 최근 성공 11-09 (월) 03:00</span><span class="grow"></span><button>지금 백업</button><button>복원…</button></div></div>
+      </div>
+    </div></main>
+  </div>
+</section>
+
+<!-- ===================== 10. 알림 (휴대폰) (FR-13) — 엄마의 휴대폰 ===================== -->
+<section data-screen="push">
+  <div class="page">
+    <h1>알림 — 엄마 휴대폰 잠금 화면 <span class="ref">FR-8.4 · FR-13</span></h1>
+    <div class="row wrap" style="gap:28px;align-items:flex-start">
+      <div class="phone"><div class="scr">
+        <div style="text-align:center;font-size:13px;opacity:.85">11월 9일 월요일</div>
+        <div style="text-align:center;font-size:44px;font-weight:300;margin-bottom:20px">8:01</div>
+        <div class="push"><span class="tm">지금</span><b>Agent Lee · 아침 시장 브리핑</b><br>관심 종목 5개 중 3개 상승. 삼성전자 자기주식<br>취득 공시 이후 강세예요.</div>
+        <div class="push"><span class="tm">금 18:02</span><b>Agent Lee · 관심 종목 DART 공시 확인</b><br>실행 실패 — OpenDART 응답 시간 초과</div>
+        <div class="push"><span class="tm">금 08:02</span><b>Agent Lee · 아침 시장 브리핑</b><br>실행 실패 — 네이버 증권 응답 없음</div>
+        <div class="push"><span class="tm">수 19:55</span><b>Agent Lee</b><br>아들이 「물리 실험 그래프」를 공유했어요</div>
+      </div></div>
+      <div class="card" style="max-width:420px">
+        <h2>규칙</h2>
+        <ul class="small">
+          <li>본문은 결과 요약 두 줄까지 (잠금 화면 노출 고려) — FR-13.5</li>
+          <li>공유받은 항목은 제목만, 내용은 본문에 넣지 않음 — FR-13.5</li>
+          <li>누르면 해당 결과 메시지로 바로 이동 (실패 알림 → 예약 대화의 실패 메시지) — FR-8.4</li>
+          <li>실패도 알림 (재시도 후 최종 실패 시 1회) — FR-8.4 · 8.6</li>
+          <li>방해 금지 시간에는 알림함에만, 끝나면 묶어서 1회 — FR-13.4</li>
+          <li>권한 거부·미지원 기기는 알림함으로만 받음 — 설정 → 알림 참고</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 11. 모바일 (§6 반응형) ===================== -->
+<section data-screen="mobile">
+  <div class="page" style="max-width:1440px">
+    <h1>모바일 화면 (휴대폰 폭) <span class="ref">§6 반응형 · PWA</span></h1>
+    <div class="small muted">사이드바는 ☰ 서랍, 아티팩트는 전체 화면, 칩 팝오버는 하단 시트로 열려요. 모든 화면 상단에 ☰가 있어 리뷰용 탐색 바 없이 이동할 수 있어요. 아래는 같은 목업을 휴대폰 폭으로 띄운 것이에요.</div>
+    <div class="row wrap" style="gap:20px;margin-top:12px;align-items:flex-start">
+      <div><div class="small muted">대화 (작성기 접힘)</div><div class="phone"><iframe title="모바일 대화" data-selfsrc="chat" style="width:300px;height:600px;border:0;display:block;background:var(--bg)"></iframe></div></div>
+      <div><div class="small muted">칩 → 하단 시트</div><div class="phone"><iframe title="모바일 런타임 시트" data-selfsrc="chat-new?pop=1" style="width:300px;height:600px;border:0;display:block;background:var(--bg)"></iframe></div></div>
+      <div><div class="small muted">예약 + ☰ 서랍</div><div class="phone"><iframe title="모바일 서랍" data-selfsrc="schedules?drawer=1" style="width:300px;height:600px;border:0;display:block;background:var(--bg)"></iframe></div></div>
+      <div><div class="small muted">아티팩트 전체 화면</div><div class="phone"><iframe title="모바일 아티팩트" data-selfsrc="finance?art=1" style="width:300px;height:600px;border:0;display:block;background:var(--bg)"></iframe></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 12. 쓸 수 있는 런타임 없음 (FR-12.6) — 아들 ===================== -->
+<section data-screen="no-runtime">
+  <div class="app">
+    <div data-side></div>
+    <main class="main">
+      <div class="topbar"><button class="ghost hamb" data-hamb>☰</button><div class="title muted">새 대화</div></div>
+      <div class="thread"><div class="empty">
+        <div style="font-size:34px">🔌</div>
+        <h1>쓸 수 있는 런타임이 없어요 — 관리자에게 문의해 주세요</h1>
+        <div class="muted">지금은 새 대화를 시작할 수 없어요. 이미 있는 대화는 그대로 읽을 수 있어요. <span class="ref">FR-12.6</span></div>
+        <div class="card" style="text-align:left;margin-top:16px">
+          <b class="small">대체 순서대로 확인한 결과</b>
+          <ol class="small" style="padding-left:18px;margin:6px 0">
+            <li>내 기본값 Claude Code · Opus 5.5 — <span class="badge err">불가</span> 공용 Claude Code 연결이 해제됨</li>
+            <li>같은 런타임의 다음 허용 모델 Claude Code · Sonnet 5.5 — <span class="badge err">불가</span> 같은 연결</li>
+            <li>다른 런타임 Codex · gpt-6.1-sol (내 Codex 기본 모델) — <span class="badge err">불가</span> 내 ChatGPT 연결 만료 · 공용 Codex 연결 해제됨</li>
+          </ol>
+          <div class="small muted">관리자(아빠)에게도 공용 연결 해제 경고가 갔어요. <span class="ref">FR-11.8</span></div>
+        </div>
+        <div class="row wrap" style="justify-content:center;margin-top:14px"><a href="#settings?tab=s-conn&amp;modal=connModal&amp;arg=member-codex"><button class="primary">내 Codex 연결 다시 로그인</button></a><a href="#settings"><button>설정 열기</button></a></div>
+      </div></div>
+      <div class="composer disabled"><div class="box">
+        <textarea placeholder="쓸 수 있는 런타임이 없어 메시지를 보낼 수 없어요" disabled></textarea>
+        <div class="bar"><button class="ghost" disabled>📎</button><span class="grow"></span><span class="chip"><span class="dot none"></span>런타임 없음</span><button class="primary" disabled>↑</button></div>
+      </div></div>
+    </main>
+  </div>
+</section>
+
+<!-- ===================== 13. 오류·예외 상태 ===================== -->
+<section data-screen="states">
+  <div class="page">
+    <h1>오류·예외 상태 모음</h1>
+    <div class="small muted" style="margin-bottom:10px">별도 표기가 없으면 아들 계정 기준이에요.</div>
+    <div class="card"><h3>런타임 연결 끊김 (대화 중) — 「화학 정리」 <span class="ref">FR-11.8</span></h3>
+      <div class="notice fx err">⛔ 내 Codex 연결(ChatGPT 로그인)이 만료돼 응답이 중간에 멈췄어요.
+        <span class="grow"></span><a href="#settings"><button class="small">다시 로그인</button></a><button class="small">공용 연결로 이어가기</button><button class="small primary">Claude Code로 이어가기</button></div></div>
+    <div class="card" style="margin-top:10px"><h3>구독 한도 도달 <span class="ref">FR-9.2 · FR-11.3</span></h3>
+      <div class="notice fx warn">⏳ 지금 Codex(내 ChatGPT 구독)는 한도에 걸렸어요.
+        <span class="grow"></span><button class="small primary">공용 연결로 이어가기</button><button class="small">Claude Code로 바꾸기</button></div></div>
+    <div class="card" style="margin-top:10px"><h3>기본값을 쓸 수 없음 — 자동 대체 <span class="ref">FR-12.6</span></h3>
+      <div class="small muted">대체 순서: ① 같은 런타임의 허용 모델(관리자 목록 순) → ② 다른 런타임(Claude Code → Codex)의 내 기본 모델 → ③ 없으면 문의 화면</div>
+      <div class="small" style="margin-top:8px"><b>①</b> 관리자가 아들의 Opus 5.5 허용을 해제한 경우 — 새 대화 칩 옆에 한 번 표시</div>
+      <div class="row wrap" style="margin-top:4px"><span class="chip"><span class="dot claude"></span>Claude Code · Sonnet 5.5 ▾</span><span class="notice info small" style="margin:0">ℹ 기본값(Claude Code · Opus 5.5)을 쓸 수 없어 Claude Code · Sonnet 5.5로 시작했어요.</span></div>
+      <div class="small" style="margin-top:8px"><b>②</b> Claude Code 공용 연결이 끊긴 경우</div>
+      <div class="row wrap" style="margin-top:4px"><span class="chip"><span class="dot codex"></span>Codex · gpt-6.1-sol ▾</span><span class="notice info small" style="margin:0">ℹ 기본값을 쓸 수 없어 Codex · gpt-6.1-sol로 시작했어요.</span></div>
+      <div class="small" style="margin-top:8px"><b>설정 화면 안내</b></div>
+      <div class="notice warn small">⚠ 내 기본값 Claude Code · Opus 5.5를 지금 쓸 수 없어요(관리자 허용 해제). 새 대화는 Claude Code · Sonnet 5.5로 시작해요. <a href="#settings">기본값 다시 고르기</a></div>
+      <div class="small" style="margin-top:8px"><b>③</b> 후보가 없으면 → <a href="#no-runtime">“쓸 수 있는 런타임이 없어요 — 관리자에게 문의” 화면</a></div></div>
+    <div class="card" style="margin-top:10px"><h3>업로드 전 차단 (작성기) <span class="ref">FR-4.6 · FR-4.4</span></h3>
+      <div class="composer" style="padding:6px 0"><div class="box" style="box-shadow:none">
+        <div class="attrow">
+          <span class="attach"><span class="ft pdf">PDF</span>교과서_3단원.pdf</span>
+          <span class="attach bad">⛔ 교과서_전체.pdf · 128MB — 파일당 50MB를 넘어 올리지 않았어요</span>
+          <span class="attach bad">⛔ 21번째 파일 — 이 대화는 20개가 꽉 찼어요 (20/20)</span>
+          <span class="attach bad">🔒 수행평가_암호.hwp — 암호가 걸린 HWP라 읽을 수 없어요</span>
+        </div>
+        <div class="small muted">용량·개수는 올리기 전에 브라우저에서 바로 막고, 암호·배포용 HWP는 올린 직후 서버가 확인해 같은 자리에 표시해요.</div>
+      </div></div></div>
+    <div class="card" style="margin-top:10px"><h3>알림 권한 거부 · 미지원 <span class="ref">FR-13.1</span></h3>
+      <div class="notice err small">🚫 이 브라우저에서 알림을 차단했어요. 사이트 설정에서 ‘허용’으로 바꾼 뒤 다시 확인해 주세요. 그동안은 🔔 알림함에만 쌓여요.</div>
+      <div class="notice warn small">⚠ 이 화면(iPhone Safari 탭)에서는 웹 푸시를 받을 수 없어요. 홈 화면에 추가한 앱에서 켜 주세요.</div>
+      <div class="small muted"><a href="#settings?tab=s-noti">설정 → 알림</a>에서 ‘목업 상태’로 각 상태를 볼 수 있어요.</div></div>
+    <div class="card" style="margin-top:10px"><h3>권한 없음 · 없는 항목 <span class="ref">FR-14.7 · NFR 권한</span></h3>
+      <div class="grid2">
+        <div style="text-align:center;padding:16px"><div style="font-size:30px">🔒</div><b>403 — 볼 수 있는 권한이 없어요</b><div class="small muted">공유가 해제됐거나 나에게 공유되지 않은 항목이에요.</div><a href="#chat">대화로 돌아가기</a></div>
+        <div style="text-align:center;padding:16px"><div style="font-size:30px">🔍</div><b>404 — 없는 항목이에요</b><div class="small muted">삭제됐거나 주소가 잘못됐어요.</div><a href="#chat">대화로 돌아가기</a></div>
+      </div></div>
+    <div class="card" style="margin-top:10px"><h3>연결 끊긴 런타임으로 된 예약 (예시) <span class="ref">FR-11.8</span></h3>
+      <div class="notice warn">⚠ 예약 「주간 미국 실적 일정」이 쓰는 Codex 연결이 끊겼어요. 다음 실행(11-16 (월) 07:30) 전에 다시 연결하세요.</div></div>
+    <div class="card" style="margin-top:10px"><h3>네트워크 재연결 (Cloudflare 경유 스트리밍) <span class="ref">NFR 스트리밍</span></h3>
+      <div class="notice info">↻ 연결이 잠시 끊겨 다시 연결하는 중… 응답은 서버에서 계속 생성되고 있어요.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 모달 · 서랍 ===================== -->
+<!-- 내용이 항목·사용자마다 달라지는 모달은 JS가 채운다 (data-arg) -->
+<div class="modal-bg" id="shareModal"><div class="modal" data-body></div></div>
+<div class="modal-bg" id="connModal"><div class="modal" data-body></div></div>
+<div class="modal-bg" id="userModal"><div class="modal" data-body></div></div>
+<div class="modal-bg" id="previewModal"><div class="modal" data-body></div></div>
+<div class="modal-bg" id="pwModal"><div class="modal" data-body></div></div>
+
+<div class="modal-bg" id="bibModal"><div class="modal">
+  <div class="row sp"><h2>📚 참고문헌 내보내기 <span class="ref">FR-5.6</span></h2><button class="ghost" data-close>✕</button></div>
+  <label>형식</label><div class="seg"><span class="on">APA</span><span>MLA</span><span>학교 양식(간단)</span></div>
+  <label>포함</label><span class="toggle"><span class="sw"></span> ⚠ 구절 확인 안 된 출처도 포함 (표시와 함께)</span>
+  <div class="diff" style="margin-top:10px">홍길동. (2026). 실학 개념의 재검토. <i>역사학보</i>. https://kci.go.kr/…<br>문화유산 해설 자료. (2025). 수원 화성 축성. https://heritage.example/…<br>한국사 개설 자료. (2019). 조선 후기 실학. https://encykorea.example/…<br>교과서_3단원.pdf, 12쪽. (업로드 자료)<br>과제안내.hwp, 3번째 표 2행. (업로드 자료)</div>
+  <div class="row" style="margin-top:12px"><span class="grow"></span><button>⧉ 복사</button><button class="primary">⤓ DOCX</button></div>
+</div></div>
+
+<div class="modal-bg" id="schedModal"><div class="modal" data-sproot>
+  <div class="row sp"><h2>+ 새 예약 <span class="ref">FR-8.2</span></h2><button class="ghost" data-close>✕</button></div>
+  <label>이름</label><input value="아침 시장 브리핑">
+  <label>실행할 프롬프트</label><textarea rows="3">내 관심 종목 시세와 전일 대비, 오늘 나온 공시를 표로 정리해줘.</textarea>
+  <label>일정</label><div class="seg"><span data-sp="once">한 번</span><span data-sp="daily">매일</span><span class="on" data-sp="weekday">평일</span><span data-sp="weekly">매주</span><span data-sp="cron">cron</span></div>
+  <div data-spane="once"><div class="grid2"><div><label>날짜</label><input type="date" value="2026-11-10"></div><div><label>시각</label><input value="08:00"></div></div>
+    <div class="notice info small">다음 실행: 2026-11-10 (화) 08:00 KST · 한 번만</div></div>
+  <div data-spane="daily"><label>시각</label><input value="08:00" style="width:120px">
+    <div class="notice info small">다음 실행: 2026-11-10 (화) 08:00 → 11-11 (수) 08:00 → 11-12 (목) 08:00 (주말 포함 매일)</div></div>
+  <div data-spane="weekday" class="on"><label>시각</label><input value="08:00" style="width:120px">
+    <div class="notice info small">다음 실행: 2026-11-10 (화) 08:00 → 11-11 (수) → 11-12 (목) · 토·일 제외</div></div>
+  <div data-spane="weekly"><label>요일</label><div class="row wrap"><label class="ck"><input type="checkbox" checked> 월</label><label class="ck"><input type="checkbox"> 화</label><label class="ck"><input type="checkbox"> 수</label><label class="ck"><input type="checkbox"> 목</label><label class="ck"><input type="checkbox"> 금</label><label class="ck"><input type="checkbox"> 토</label><label class="ck"><input type="checkbox"> 일</label></div>
+    <label>시각</label><input value="07:30" style="width:120px">
+    <div class="notice info small">다음 실행: 2026-11-16 (월) 07:30 → 11-23 (월) 07:30</div></div>
+  <div data-spane="cron"><label>cron 식 (분 시 일 월 요일)</label><input value="0 8 * * 1-5" style="font-family:ui-monospace,Menlo,monospace">
+    <div class="small muted" style="margin-top:4px">해석: 월~금 08:00</div>
+    <div class="notice info small">다음 실행: 2026-11-10 (화) 08:00 → 11-11 (수) 08:00 → 11-12 (목) 08:00</div></div>
+  <label>시간대</label><select style="width:auto;max-width:100%"><option>Asia/Seoul</option><option>America/New_York</option></select>
+  <div class="small muted" style="margin-top:4px">서머타임이 있는 시간대: 없는 현지 시각은 바로 다음 유효 시각에 1회, 두 번 있는 시각은 첫 번째에만 1회 실행해요. <span class="ref">FR-8.7</span></div>
+  <label>쓸 스킬</label><div class="row wrap"><span class="chip">kr-stock-skill ✕</span><span class="chip">us-stock-skill ✕</span><span class="chip">market-disclosure-monitor ✕</span><span class="chip">+ 추가</span></div>
+  <label>런타임 · 모델</label><div class="row"><span class="chip"><span class="dot claude"></span>Claude Code · Opus 5.5 (내 기본값)</span><button class="small">바꾸기</button><span class="small muted">허용된 모델만 고를 수 있어요</span></div>
+  <label>알림</label><span class="toggle"><span class="sw on"></span> 실행이 끝나면 알림 보내기 (실패 포함)</span>
+  <div class="small muted" style="margin-top:6px">실패하면 2분 뒤 한 번 다시 시도하고, 그래도 실패하면 예약 대화에 이유를 남겨요. <span class="ref">FR-8.6</span></div>
+  <div class="row" style="margin-top:14px"><button>▶ 지금 한 번 테스트</button><span class="grow"></span><button data-close>취소</button><button class="primary" data-close>저장</button></div>
+</div></div>
+
+<div class="modal-bg" id="syncModal"><div class="modal">
+  <div class="row sp"><h2>앱 사용자 목록을 Access에 반영 <span class="ref">FR-15.2 · 15.3</span></h2><button class="ghost" data-close>✕</button></div>
+  <div class="small muted">전체 목록 맞추기(복구)예요. 사용자 추가·수정과 별개로, 지금 다른 부분을 모두 앱 기준으로 고쳐요.</div>
+  <div class="diff" style="margin-top:10px">
+    &nbsp; ingki3@gmail.com <span class="muted">(현재 관리자 — 삭제 불가)</span><br>
+    &nbsp; wife@example.com<br>
+    <span class="add">+ son@example.com</span> <span class="muted">(앱 활성 사용자인데 Access에 없음)</span><br>
+    <span class="del">− old@example.com</span> <span class="muted">(앱에 없는데 Access에 남아 있음)</span>
+  </div>
+  <div class="notice info small" style="margin-top:10px">반영에 실패하면 “Access에 반영 안 됨 — 다시 시도” 상태로 남아요.</div>
+  <div class="row" style="margin-top:14px"><span class="grow"></span><button data-close>취소</button><button class="primary" data-close>Access에 반영</button></div>
+</div></div>
+
+<div class="modal-bg" id="adminEmailModal"><div class="modal">
+  <div class="row sp"><h2>관리자 이메일 변경 <span class="ref">FR-15.7</span></h2><button class="ghost" data-close>✕</button></div>
+  <label>현재 이메일</label><input value="ingki3@gmail.com" disabled>
+  <label>새 이메일</label><input value="ingki3.lee@example.com">
+  <h3 style="margin-top:14px">진행 상태 <span class="badge warn">대기</span></h3>
+  <ol class="steps">
+    <li><span class="n done">✓</span><div>변경 요청을 <b>대기</b>로 저장 <div class="small muted">11-09 10:20</div></div></li>
+    <li><span class="n done">✓</span><div>새 이메일을 Access 허용 목록에 추가 <div class="small muted">ingki3@gmail.com은 그대로 둠</div></div></li>
+    <li><span class="n cur">3</span><div><b>새 이메일로 Access 통과 확인</b><div class="small muted">이 세션에서 아래 버튼을 눌러 chat.2prostream.com을 새 이메일로 다시 통과하세요(일회용 코드가 새 이메일로 가요).</div><button class="small primary" style="margin-top:4px">새 이메일로 Access 확인하기</button></div></li>
+    <li><span class="n">4</span><div>앱 계정 이메일과 로그인 세션을 새 이메일로 전환</div></li>
+    <li><span class="n">5</span><div>이전 이메일(ingki3@gmail.com)을 허용 목록에서 제거</div></li>
+  </ol>
+  <div class="notice info small">어느 단계든 실패하거나 서버가 재시작되면 <b>이전 이메일(ingki3@gmail.com)을 그대로</b> 써요. 이 창에서 대기 상태부터 다시 시도할 수 있어요.</div>
+  <div class="row" style="margin-top:14px"><button class="danger">변경 요청 취소</button><span class="grow"></span><button data-close>닫기 (대기 유지)</button></div>
+</div></div>
+
+<div class="modal-bg" id="delModal"><div class="modal">
+  <div class="row sp"><h2>🗑 대화 삭제 <span class="ref">FR-2.1 · NFR 개인정보</span></h2><button class="ghost" data-close>✕</button></div>
+  <p>「한국사 수행평가 자료 조사」를 삭제할까요? 되돌릴 수 없어요.</p>
+  <div class="card" style="padding:10px">
+    <b class="small">함께 삭제되는 것</b>
+    <ul class="small" style="margin:4px 0;padding-left:18px">
+      <li>메시지 10개와 출처·인용 구절</li>
+      <li>올린 파일 3개 (교과서_3단원.pdf, 과제안내.hwp, 참고자료.docx)</li>
+      <li>아티팩트 1개 — 「보고서 구조안」 v1·v2 (주소 <code>/a/7f3k2</code>도 열리지 않음)</li>
+      <li>이 대화의 가족 공유 0건 (공유 중이면 받은 사람에게서도 즉시 사라짐)</li>
+    </ul>
+    <b class="small">남는 것</b>
+    <ul class="small" style="margin:4px 0;padding-left:18px"><li>가족이 ‘이어서 대화하기’로 포크한 사본은 그 사람의 대화로 남아요</li><li>이번 달 사용량 숫자</li></ul>
+  </div>
+  <div class="row" style="margin-top:14px"><span class="grow"></span><button data-close>취소</button><button class="primary" style="background:var(--err)" data-close>삭제</button></div>
+</div></div>
+
+<aside class="drawer" id="notiDrawer"></aside>
+
+<script>
+(function(){
+  const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
+  const FAM={dad:'아빠',wife:'엄마',son:'아들'};
+  const RTN={claude:'Claude Code',codex:'Codex'};
+  const MN={'claude-opus-5-5':'Opus 5.5','claude-sonnet-5-5':'Sonnet 5.5','claude-haiku-5-5':'Haiku 5.5','gpt-6.1-sol':'gpt-6.1-sol','gpt-6-astra':'gpt-6-astra'};
+
+  // ───── 화면별 사용자 (FR-1.5: 각자 본인 것 + 공유받은 것만) ─────
+  const PS={chat:'son','chat-new':'son','chat-physics':'son',viewer:'son',shared:'son',artifacts:'son',settings:'son','no-runtime':'son',states:'son',
+            finance:'wife',schedules:'wife','sched-result':'wife','sched-dart':'wife',push:'wife',login:'wife',admin:'dad',mobile:'son'};
+  // 대화 항목: [제목, 화면(null=목업에 없는 화면), 마지막 런타임, 공유한 사람, 새 결과]
+  const P={
+    son:{name:'아들',init:'들',color:'#8a6d3b',use:'이번 달 $4.10 · 구독 212회',
+      pinned:[['한국사 수행평가 자료 조사','chat','codex']],
+      recent:[['물리 실험 보고서 그래프','chat-physics','codex'],['영어 에세이 첨삭 방향',null,'claude'],['⚠ 화학 정리 — 연결 끊김','states','codex']],
+      shared:[['⏰ 아침 시장 브리핑','shared','claude','엄마',1],['제주 여행 일정',null,'claude','아빠'],['🧩 주간 수익률 차트','artifacts',null,'엄마']],
+      sched:false,
+      noti:[{t:'⏰ 아침 시장 브리핑 (엄마 공유)',b:'새 결과가 있어요',tm:'오늘 08:01',h:'#shared',u:1},
+            {t:'👪 엄마가 공유함',b:'「주간 수익률 차트」',tm:'어제 21:10',h:'#artifacts',u:1},
+            {t:'⚠ 내 Codex 연결 만료',b:'ChatGPT 로그인을 다시 해 주세요',tm:'11-07 (토) 09:40',h:'#settings',u:1},
+            {t:'👪 아빠가 공유함',b:'「제주 여행 일정」',tm:'10-30 (금)',h:null,u:0}]},
+    wife:{name:'엄마',init:'엄',color:'#7a4f7d',use:'이번 달 $21.80',
+      pinned:[['삼성전자 vs 엔비디아 6개월','finance','claude']],
+      recent:[['⏰ 아침 시장 브리핑','sched-result','claude',null,1],['⏰ 관심 종목 DART 공시 확인','sched-dart','claude'],['미국 배당 성장주 정리',null,'codex'],['김장 재료 장보기 목록',null,'claude']],
+      shared:[['제주 여행 일정',null,'claude','아빠'],['🧩 물리 실험 그래프',null,null,'아들'],['🧩 영단어 퀴즈',null,null,'아들']],
+      sched:true,
+      noti:[{t:'⏰ 아침 시장 브리핑',b:'관심 종목 5개 중 3개 상승…',tm:'오늘 08:01',h:'#sched-result?m=r1109',u:1},
+            {t:'⛔ 관심 종목 DART 공시 확인 — 실행 실패',b:'OpenDART 응답 시간 초과 (재시도 후)',tm:'11-06 (금) 18:02',h:'#sched-dart?m=dart-fail',u:1},
+            {t:'⛔ 아침 시장 브리핑 — 실행 실패',b:'네이버 증권 응답 없음 (재시도 후)',tm:'11-06 (금) 08:02',h:'#sched-result?m=fail',u:0},
+            {t:'👪 아들이 공유함',b:'「물리 실험 그래프」',tm:'11-04 (수) 19:55',h:null,u:0}]},
+    dad:{name:'아빠 (관리자)',init:'빠',color:'#3b6d8a',use:'이번 달 $12.30 · 구독 540회',
+      pinned:[['제주 여행 일정',null,'claude']],
+      recent:[['집 서버 디스크 정리',null,'codex'],['공유기 교체 비교',null,'claude']],
+      shared:[['⏰ 아침 시장 브리핑',null,'claude','엄마'],['🧩 물리 실험 그래프',null,null,'아들']],
+      sched:false,
+      noti:[{t:'⚠ 시스템: Access 허용 목록 불일치',b:'son@example.com 반영 안 됨',tm:'오늘 10:05',h:'#admin',u:1},
+            {t:'⚠ 시스템: 스킬 실행 실패',b:'dart-investment-monitor 시간 초과',tm:'11-06 (금) 18:02',h:'#admin',u:1},
+            {t:'👪 엄마가 공유함',b:'「아침 시장 브리핑」',tm:'11-03 (화)',h:null,u:0}]}
+  };
+  // 관리자가 허용한 모델 (FR-1.6 · FR-3.5 · FR-12.1) — 순서 = 관리자 모델 목록 순서
+  const MODELS={son:{claude:['claude-opus-5-5','claude-sonnet-5-5'],codex:['gpt-6.1-sol','gpt-6-astra']},
+                wife:{claude:['claude-opus-5-5','claude-sonnet-5-5','claude-haiku-5-5'],codex:['gpt-6.1-sol','gpt-6-astra']},
+                dad:{claude:['claude-opus-5-5','claude-sonnet-5-5','claude-haiku-5-5'],codex:['gpt-6.1-sol','gpt-6-astra']}};
+  // 사용자별 · 런타임별 기본 모델 (FR-12.3). 설정 화면에서 바꾸면 칩의 런타임 전환에 따라와요.
+  const DEFM={son:{claude:'claude-opus-5-5',codex:'gpt-6.1-sol'},wife:{claude:'claude-opus-5-5',codex:'gpt-6.1-sol'},dad:{claude:'claude-opus-5-5',codex:'gpt-6.1-sol'}};
+  const defModel=(w,rt)=>MODELS[w][rt].includes(DEFM[w][rt])?DEFM[w][rt]:MODELS[w][rt][0];
+  // 쓸 수 있는 연결 (FR-11.3 개인 우선) — Claude 구독은 관리자 본인만 (D2)
+  const CONN={son:{claude:[['가족 공용 API 키 ····a91f',1]],codex:[['내 ChatGPT 로그인 (son@…)',0,'만료 — 설정에서 다시 로그인'],['가족 공용 API 키 ····7c20',1]]},
+              wife:{claude:[['가족 공용 API 키 ····a91f',1]],codex:[['가족 공용 API 키 ····7c20',1]]},
+              dad:{claude:[['내 Claude 구독 (Max)',1],['가족 공용 API 키 ····a91f',1]],codex:[['가족 공용 API 키 ····7c20',1]]}};
+
+  const who=el=>PS[(el.closest('section')||{}).dataset?.screen]||cur;
+  let cur='son';
+
+  // ───── 사이드바 ─────
+  function convLink(c,grpShared){
+    const [title,scr,rt,from,isNew]=c;
+    const dot=rt?`<span class="dot ${rt}" title="마지막 런타임: ${RTN[rt]}" aria-label="마지막 런타임 ${RTN[rt]}"></span>`:`<span class="dot none" title="아티팩트"></span>`;
+    const href=scr?'#'+scr:'#';
+    return `<a class="conv" href="${href}" ${scr?`data-scr="${scr}"`:'data-noop title="목업에 없는 화면"'}>${dot}<span class="t">${title}</span>${from?` <span class="muted small">· ${from}</span>`:''}${isNew?`<span class="new">${grpShared?'새':'새 결과'}</span>`:''}</a>`;
+  }
+  const tpl=$('#sideTpl');
+  $$('[data-side]').forEach(el=>{
+    const w=who(el), p=P[w], f=tpl.content.cloneNode(true);
+    f.querySelector('[data-convs]').innerHTML=
+      `<div class="grp">📌 고정</div>${p.pinned.map(c=>convLink(c)).join('')}`+
+      `<div class="grp">최근</div>${p.recent.map(c=>convLink(c)).join('')}`+
+      `<div class="grp">👪 가족 공유 <span class="small">(나에게 공유된 것)</span></div>${p.shared.map(c=>convLink(c,1)).join('')}`;
+    f.querySelector('[data-pname]').textContent=p.name;
+    const pi=f.querySelector('[data-pinit]'); pi.textContent=p.init; pi.style.background=p.color;
+    f.querySelector('[data-puse]').textContent=p.use;
+    f.querySelector('[data-nbadge]').textContent=p.noti.filter(n=>n.u).length;
+    if(p.sched) f.querySelector('[data-sched]').insertAdjacentHTML('beforeend','<span class="new">새 결과</span>');
+    if(w!=='dad') f.querySelector('[data-adminonly]').remove();
+    el.replaceWith(f);
+  });
+
+  // ───── 런타임 칩 + 팝오버 (허용 모델·연결만) ─────
+  function paintChip(chip){
+    const w=who(chip), rt=chip.dataset.rt, m=chip.dataset.model;
+    chip.innerHTML=`<span class="dot ${rt}"></span><span class="rt-name">${RTN[rt]} · </span><span class="rt-model">${MN[m]}</span> ▾`+
+      `<div class="pop" data-pop>${popHTML(w,rt,m)}</div>`;
+  }
+  function popHTML(w,rt,m){
+    const conns=CONN[w][rt], usable=conns.filter(c=>c[1]);
+    return `<div class="sheet-handle"></div><div class="row sp"><b>이 대화의 런타임·모델</b><span class="ref">FR-3.5</span></div>
+      <div class="small muted" style="margin:2px 0 8px">이 대화에만 적용돼요. 기본값은 설정에서 바꿔요.</div>
+      <div class="small muted">런타임</div>
+      ${['claude','codex'].map(r=>`<div class="opt ${r===rt?'sel':''}" data-rt="${r}"><span class="dot ${r}"></span><div class="grow">${RTN[r]}<div class="small muted">${CONN[w][r].filter(c=>c[1]).map(c=>c[0]).join(' · ')}</div></div></div>`).join('')}
+      <div class="small muted" style="margin-top:8px">모델 <span class="small">(관리자가 허용한 것만)</span></div>
+      <select data-model>${MODELS[w][rt].map(x=>`<option value="${x}" ${x===m?'selected':''}>${x}${MN[x]!==x?' ('+MN[x]+')':''}</option>`).join('')}</select>
+      <div class="small muted" style="margin-top:8px">추론 강도</div>
+      <div class="seg"><span>낮음</span><span class="on">보통</span><span>높음</span></div>
+      <div class="small muted" style="margin-top:8px">연결 <span class="ref">FR-11.3</span></div>
+      ${conns.map(c=>`<div class="small">${c[1]?'●':'○'} ${c[0]} ${c[1]?'':`<span class="badge err">${c[2]}</span>`}</div>`).join('')}
+      ${usable.length>1?'<div class="seg" style="margin-top:4px"><span class="on">개인 우선</span><span>공용으로 쓰기</span></div>':''}
+      <div class="notice info small" style="margin-top:10px">런타임을 바꾸면 다음 메시지부터 적용되고 구분선이 생겨요. 대화 기록·파일·아티팩트·출처가 넘어가요. (D8)</div>`;
+  }
+  $$('[data-rtchip]').forEach(paintChip);
+
+  // ───── 공유 모달 (FR-14) — 항목명·종류·현재 상태, 항목 종류·사용자별로 달라짐 ─────
+  const SH={
+    'conv-hist':{owner:'son',type:'대화',name:'한국사 수행평가 자료 조사',mode:'off',
+      all:'새 메시지도 계속 보여요(살아 있는 공유). 올린 파일 2개와 아티팩트 「보고서 구조안」(최신 v2)도 함께 보여요.',
+      msgs:[['m1','오후 8:13 응답까지 — 파일·출처 정리','메시지 2개 · 파일 2개(교과서_3단원.pdf, 과제안내.hwp — 그 메시지의 revision) · 출처 [1]~[3]과 인용 구절','이후 메시지 8개 · 「보고서 구조안」 v1·v2 · 출처 [4]'],
+            ['m2','오후 8:16 응답까지 — 근거 부족 답변','메시지 4개 · 파일 2개 · 출처 [1]~[4]','이후 메시지 6개 · 「보고서 구조안」 v1·v2'],
+            ['m3','오후 8:21 응답까지 — 보고서 구조안 v1','메시지 6개 · 파일 2개 · 출처 [1]~[4] · 「보고서 구조안」 <b>v1</b> (이 메시지가 만든 버전)','이후 메시지 4개 · 「보고서 구조안」 <b>v2</b> (공유 전에 이미 있었지만 경계 뒤 메시지가 만듦)'],
+            ['m4','오후 8:24 응답까지 — 보고서 구조안 v2','메시지 8개 · 파일 2개 · 출처 [1]~[4] · 「보고서 구조안」 v1·v2','이후 메시지 2개(생성 중인 응답 포함)']]},
+    'conv-physics':{owner:'son',type:'대화',name:'물리 실험 보고서 그래프',mode:'off',all:'새 메시지도 계속 보여요. 올린 파일 1개(단진자_측정.csv)도 함께 보여요.',
+      msgs:[['p1','오후 7:41 응답까지 — 코드·수식','메시지 2개 · 파일 1개(단진자_측정.csv)','이후 메시지']]},
+    'art-report':{owner:'son',type:'아티팩트 · 문서',name:'보고서 구조안 — 조선 후기 실학',mode:'off',ver:'v2'},
+    'art-physics':{owner:'son',type:'아티팩트 · 차트',name:'물리 실험 그래프',mode:'all',ver:'v3',since:'11-04 (수) 19:55',seen:{wife:'✓ 11-04 20:10',dad:'—'}},
+    'art-quiz':{owner:'son',type:'아티팩트 · HTML',name:'영단어 퀴즈',mode:'some',rec:['wife'],ver:'v1',since:'10-29 (목) 21:00',seen:{wife:'✓ 10-29 21:30'}},
+    'conv-fin':{owner:'wife',type:'대화',name:'삼성전자 vs 엔비디아 6개월',mode:'off',all:'새 메시지도 계속 보여요. 아티팩트 「6개월 비교 차트」(최신 v1)도 함께 보여요.',
+      msgs:[['f1','오전 9:03 응답까지 — 비교 표·차트','메시지 2개 · 「6개월 비교 차트」 v1 · 출처 3개','공시 질문과 답변(메시지 2개)']]},
+    'art-chart':{owner:'wife',type:'아티팩트 · 차트',name:'6개월 비교 차트',mode:'off',ver:'v1'},
+    'sched-brief':{owner:'wife',type:'예약 결과 대화',name:'⏰ 아침 시장 브리핑',mode:'all',since:'11-03 (화) 07:40',seen:{dad:'✓ 11-09 08:15',son:'✓ 11-06 19:02'},
+      all:'새 실행 결과가 쌓이면 공유본에도 계속 보여요(살아 있는 공유).',
+      msgs:[['r1106','11-06 (금) 실행까지','11-05 결과 · 11-06 실패 메시지','11-09 이후 결과']]}
+  };
+  let ss=null;
+  function stText(it){ return it.mode==='off'?'<span class="badge gray">비공개 (나만)</span>':it.mode==='all'?`<span class="badge">👪 가족 전체에 공유 중</span> <span class="small muted">${it.since}부터</span>`:`<span class="badge">👪 ${it.rec.map(r=>FAM[r]).join('·')}에게만 공유 중</span> <span class="small muted">${it.since}부터</span>`; }
+  function renderShare(){
+    const it=SH[ss.id], rec=Object.keys(FAM).filter(k=>k!==it.owner), isConv=!!it.msgs;
+    let h=`<div class="row sp"><h2>👪 가족에게 공유 <span class="ref">FR-14</span></h2><button class="ghost" data-close>✕</button></div>
+      <div class="card" style="padding:10px;margin:6px 0 4px"><div class="row wrap"><span class="badge gray">${it.type}</span><b class="grow">${it.name}</b></div>
+      <div class="small muted" style="margin-top:4px">만든 사람: ${FAM[it.owner]} · 현재: ${stText(it)}</div></div>
+      <div class="small muted">기본은 비공개예요. 언제든 끌 수 있고, 끄면 즉시 안 보여요. <span class="ref">FR-14.2</span></div>
+      <label>공유 대상</label>
+      <div class="seg">${[['off','끄기 (비공개)'],['all','가족 전체'],['some','특정 가족']].map(([k,l])=>`<span data-sm="${k}" class="${ss.mode===k?'on':''}">${l}</span>`).join('')}</div>`;
+    if(ss.mode==='some') h+=`<div class="row wrap" style="margin-top:6px">${rec.map(r=>`<span class="toggle" data-rec="${r}"><span class="sw ${ss.rec.includes(r)?'on':''}"></span> ${FAM[r]}</span>`).join('')}</div>${ss.rec.length?'':'<div class="small" style="color:var(--err);margin-top:4px">받을 가족을 한 명 이상 골라 주세요. 아무도 안 고르면 저장할 수 없어요.</div>'}`;
+    if(ss.mode==='all') h+=`<div class="small muted" style="margin-top:6px">${rec.map(r=>FAM[r]).join('·')} 모두 볼 수 있어요.</div>`;
+    if(ss.mode==='off') h+=`<div class="small muted" style="margin-top:6px">${it.mode!=='off'?'저장하면 지금 공유받는 가족에게서 <b>즉시</b> 사라져요.':'아직 공유하지 않았어요. 대상을 고르면 공유가 켜져요.'}</div>`;
+    if(ss.mode!=='off'){
+      if(isConv){
+        h+=`<label>공유 범위 <span class="ref">FR-14.3</span></label><select data-scope><option value="all" ${ss.scope==='all'?'selected':''}>대화 전체 (새 메시지도 보임)</option>${it.msgs.map(m=>`<option value="${m[0]}" ${ss.scope===m[0]?'selected':''}>이 메시지까지: ${m[1]}</option>`).join('')}</select>`;
+        const m=it.msgs.find(x=>x[0]===ss.scope);
+        h+= m?`<div class="card" style="padding:10px;margin-top:6px;font-size:12px"><b>고른 메시지 기준으로 고정돼요</b> <span class="muted">(공유할 때 목록을 만들어 바꾸지 않음)</span>
+            <div style="margin-top:4px">✓ 보이는 것: ${m[2]}</div><div>✕ 안 보이는 것: ${m[3]}</div>
+            <div class="muted" style="margin-top:4px">경계 안 메시지를 나중에 고쳐도 공유본은 그대로예요. 경계 뒤 메시지가 만든 파일·아티팩트 버전·출처는 공유 전에 있었어도 안 보여요.</div></div>`
+          :`<div class="small muted" style="margin-top:6px">${it.all} 공유를 끄면 함께 안 보여요.</div>`;
+      } else {
+        h+=`<div class="notice info small" style="margin-top:10px">받은 가족은 보기·내려받기만 할 수 있고, 고치려면 ‘포크’해서 자기 아티팩트로 만들어요. 공유 중에는 최신 버전(지금 ${it.ver})이 보여요. 주소 <code>/a/…</code>는 로그인한 공유받은 가족만 열 수 있어요. <span class="ref">FR-14.4 · FR-14.7</span></div>`;
+      }
+      if(it.type==='예약 결과 대화') h+=`<div class="small muted" style="margin-top:6px">받은 가족은 새 결과 알림을 받을지 각자 골라요. <span class="ref">FR-8.8</span></div>`;
+    }
+    h+=`<h3 style="margin-top:14px">공유 현황 <span class="ref">FR-14.6</span></h3>`;
+    h+= it.mode==='off'?'<div class="small muted">공유한 적이 없어요.</div>'
+      :`<table><tr><th>가족</th><th>공유 시각</th><th>열어봄</th></tr>${Object.keys(it.seen).map(k=>`<tr><td>${FAM[k]}</td><td>${it.since}</td><td>${it.seen[k]}</td></tr>`).join('')}</table>`;
+    h+=`<div class="row" style="margin-top:14px"><span class="grow"></span><button data-close>취소</button><button class="primary" ${ss.mode==='some'&&!ss.rec.length?'disabled':'data-close'}>저장</button></div>`;
+    $('#shareModal [data-body]').innerHTML=h;
+  }
+
+  // ───── 런타임 연결 모달 (FR-11) — 범위·인증 방식 조합 제한 ─────
+  const CX={
+    member:{t:'내 런타임 연결 추가',scope:'개인 (나만 사용)',note:'개인 연결만 추가할 수 있어요. 가족 공용 연결은 관리자가 등록해요.',auth:{claude:['api'],codex:['api','chatgpt']},who:'아들'},
+    shared:{t:'가족 공용 연결 추가',scope:'가족 공용 (허용한 가족이 사용)',note:'공용 연결은 <b>API 키로만</b> 만들 수 있어요. 구독 로그인은 공용으로 지정할 수 없어요. <span class="ref">D2 · FR-11.4</span>',auth:{claude:['api'],codex:['api']}},
+    self:{t:'내 개인 연결 추가 (관리자 본인)',scope:'개인 (관리자 본인만 사용)',note:'관리자 본인 대화에만 쓰여요. 가족 화면에는 보이지 않아요.',auth:{claude:['api','claudesub'],codex:['api','chatgpt']},who:'아빠'},
+    forwife:{t:'엄마 대신 개인 연결 등록',scope:'개인 (엄마만 사용)',note:'Claude 구독 연결은 관리자 본인 계정에서만 만들 수 있어 여기에는 없어요. <span class="ref">FR-11.4</span>',auth:{claude:['api'],codex:['api','chatgpt']},who:'엄마'}
+  };
+  const AL={api:'API 키',claudesub:'Claude 구독 (장기 토큰)',chatgpt:'ChatGPT 로그인'};
+  let cs=null;
+  function renderConn(){
+    const c=CX[cs.ctx], opts=c.auth[cs.rt]; if(!opts.includes(cs.auth)) cs.auth=opts[0];
+    let h=`<div class="row sp"><h2>${c.t} <span class="ref">FR-11</span></h2><button class="ghost" data-close>✕</button></div>
+      <label>런타임</label><div class="seg">${['claude','codex'].map(r=>`<span data-cv="rt:${r}" class="${cs.rt===r?'on':''}"><span class="dot ${r}"></span> ${RTN[r]}</span>`).join('')}</div>
+      <label>범위</label><div class="chip">${c.scope}</div><div class="small muted" style="margin-top:4px">${c.note}</div>
+      <label>인증 방식</label>`;
+    h+= opts.length>1?`<div class="seg">${opts.map(a=>`<span data-cv="auth:${a}" class="${cs.auth===a?'on':''}">${AL[a]}</span>`).join('')}</div>`:`<div class="chip">${AL[opts[0]]}만</div>`;
+    if(cs.auth==='api') h+=`<label>${cs.rt==='claude'?'Anthropic':'OpenAI'} API 키</label><input placeholder="${cs.rt==='claude'?'sk-ant-…':'sk-…'}">`;
+    if(cs.auth==='claudesub') h+=`<div class="notice warn small" style="margin-top:10px">⚠ 본인 구독만 연결하세요. 한 사람의 구독을 여러 명이 쓰는 것은 이용 정책에 어긋날 수 있습니다. 이 연결은 공용으로 바꿀 수 없어요. <span class="ref">FR-11.4 · D2</span></div>
+      <div class="small">① 이 Mac의 터미널에서 <code>claude setup-token</code> 실행 → ② 출력된 장기 토큰을 붙여넣기</div>
+      <label>Claude 장기 토큰</label><input placeholder="sk-ant-oat01-…">`;
+    if(cs.auth==='chatgpt') h+=`<div class="notice warn small" style="margin-top:10px">⚠ 본인 구독만 연결하세요. 한 사람의 구독을 여러 명이 쓰는 것은 이용 정책에 어긋날 수 있습니다. 이 연결은 공용으로 바꿀 수 없어요. <span class="ref">FR-11.4</span></div>
+      <div class="card" style="padding:10px"><div class="small">${cs.ctx==='forwife'?'<b>엄마가 직접 본인 ChatGPT 계정으로</b> 로그인해야 해요. 아래 코드를 엄마에게 전달하세요.<br>':''}① ‘로그인 페이지 열기’를 누르고 ② 디바이스 코드 <b style="font-family:ui-monospace,Menlo,monospace">KQ7M-2XRP</b>를 입력하세요.</div>
+      <div class="row" style="margin-top:8px"><button class="primary small">로그인 페이지 열기 ↗</button><span class="small muted">로그인 기다리는 중… (15분 안에)</span></div></div>`;
+    if(cs.ctx==='shared') h+=`<label>쓸 수 있는 가족</label><div class="row wrap"><label class="ck"><input type="checkbox" checked> 아빠</label><label class="ck"><input type="checkbox" checked> 엄마</label><label class="ck"><input type="checkbox" checked> 아들</label></div>
+      <label>모델 목록 (순서 = 기본값 대체 순서) <span class="ref">FR-11.2 · FR-12.6</span></label><div class="row wrap">${(cs.rt==='claude'?['claude-opus-5-5','claude-sonnet-5-5','claude-haiku-5-5']:['gpt-6.1-sol','gpt-6-astra']).map((m,i)=>`<label class="ck"><input type="checkbox" checked> ${i+1}. ${MN[m]}</label>`).join('')}</div>
+      <label>허용 추론 강도</label><div class="row wrap"><label class="ck"><input type="checkbox" checked> 낮음</label><label class="ck"><input type="checkbox" checked> 보통</label><label class="ck"><input type="checkbox" checked> 높음</label></div>`;
+    h+=`<div class="small muted" style="margin-top:10px">인증 정보는 암호화해 저장하고 끝 4자리 또는 계정 이메일만 보여요. 개인 연결은 관리자도 원문을 볼 수 없어요. <span class="ref">FR-11.6</span></div>
+      <div class="row" style="margin-top:14px"><span class="small muted">테스트를 통과해야 선택기에 보여요 <span class="ref">FR-11.5</span></span><span class="grow"></span><button data-close>취소</button><button class="primary">연결 테스트 후 저장</button></div>`;
+    $('#connModal [data-body]').innerHTML=h;
+  }
+
+  // ───── 사용자 추가·수정 (FR-1.1 · FR-1.6 · FR-10 · FR-15) ─────
+  const UM={
+    add:{t:'+ 사용자 추가',name:'엄마',email:'wife@example.com',id:'wife',teen:0,cm:[1,1,1],xm:[1,1],fin:1,pc:1},
+    'edit-son':{t:'사용자 수정 — 아들',name:'아들',email:'son@example.com',id:'son',teen:1,cm:[1,1,0],xm:[1,1],fin:0,pc:1},
+    'edit-wife':{t:'사용자 수정 — 엄마',name:'엄마',email:'wife@example.com',id:'wife',teen:0,cm:[1,1,1],xm:[1,1],fin:1,pc:1}
+  };
+  const cb=(on,l)=>`<label class="ck"><input type="checkbox" ${on?'checked':''}> ${l}</label>`;
+  function renderUser(arg){
+    const [mode,keep]=String(arg).split('|'), u=UM[mode], add=mode==='add';
+    const email=keep&&ud&&ud.id===u.id?ud.email:u.email;
+    $('#userModal [data-body]').innerHTML=`<div class="row sp"><h2>${u.t} <span class="ref">FR-15.1 · FR-1.6</span></h2><button class="ghost" data-close>✕</button></div>
+      <div class="grid2"><div><label>이름</label><input value="${u.name}"></div><div><label>이메일 (Access 로그인·알림)</label><input data-uemail value="${email}"></div>
+      <div><label>아이디</label><input value="${u.id}" ${add?'':'disabled'}></div><div><label>역할</label><select><option>member</option><option>admin</option></select></div></div>
+      <label>계정 지침</label><span class="toggle"><span class="sw ${u.teen?'on':''}"></span> 청소년 안전 지침 적용</span>
+      <label>허용 런타임 · 모델 <span class="ref">FR-10.2 · FR-12.1</span></label>
+      <table><tr><td style="width:120px">${cb(1,'<span class="dot claude"></span> Claude Code')}</td><td>${['Opus 5.5','Sonnet 5.5','Haiku 5.5'].map((m,i)=>cb(u.cm[i],m)).join('')}</td></tr>
+        <tr><td>${cb(1,'<span class="dot codex"></span> Codex')}</td><td>${['gpt-6.1-sol','gpt-6-astra'].map((m,i)=>cb(u.xm[i],m)).join('')}</td></tr>
+        <tr><td class="small muted">추론 강도</td><td>${cb(1,'낮음')}${cb(1,'보통')}${cb(1,'높음')}</td></tr></table>
+      <label>개인 연결</label><span class="toggle"><span class="sw ${u.pc?'on':''}"></span> 본인 개인 연결 추가 허용 (API 키 · ChatGPT 로그인)</span><div class="small muted">Claude 구독 연결은 관리자 본인만 만들 수 있어요. <span class="ref">D2 · FR-11.4</span></div>
+      <label>초기 기본값 (사용자가 아직 안 정했을 때) <span class="ref">FR-12.4</span></label>
+      <select style="width:auto"><option>Claude Code · Opus 5.5 (권장)</option><option>Claude Code · Sonnet 5.5</option><option>Codex · gpt-6.1-sol</option></select>
+      <label>스킬 <span class="ref">FR-10.3 · D5</span></label><div class="row wrap">${cb(u.fin,'금융 4종 (kr/us-stock, 공시 2종)')}${cb(1,'뉴스·조사')}${cb(1,'파일 (pdf·docx·xlsx·pptx·HWP)')}${cb(1,'계산 (python-scratchpad)')}</div>
+      <div class="row" style="margin-top:14px" data-ufoot></div>`;
+    ud={mode:add?'add':'edit',id:u.id,email,orig:add?email:u.email}; userFoot();
+  }
+  // 사용자 추가·수정·비활성화의 초안 (FR-15.2 미리보기 입력)
+  let ud={mode:'add',id:'wife',email:'wife@example.com',orig:'wife@example.com'};
+  function userFoot(){
+    const add=ud.mode==='add', changed=!add&&ud.email.trim()!==ud.orig, pl=accessPlan(), diff=!pl.manual&&(pl.plus.length+pl.minus.length>0);
+    const note=add?'<span class="small muted">저장하면 임시 비밀번호가 한 번 보여요 <span class="ref">FR-1.1</span></span>'
+      :changed?'<span class="small">이메일이 바뀌어 Access 허용 목록도 바뀌어요. 저장 전에 확인해요. <span class="ref">FR-15.2</span></span>'
+      :diff?'<span class="small">이메일은 그대로지만 Access 허용 목록이 앱과 달라 저장할 때 함께 맞춰요. 저장 전에 확인해요. <span class="ref">FR-15.2</span></span>'
+      :pl.manual?'<span class="small muted">이메일이 그대로라 Cloudflare에서 직접 바꿀 것이 없어요(수동 관리). <span class="ref">FR-15.4</span></span>':'<span class="small muted">Access 허용 목록이 앱과 같아 바뀌는 것이 없어요.</span>';
+    const btn=add||changed||diff?'<button class="primary" data-open="previewModal">다음: Access 변경 확인</button>':'<button class="primary" data-close>저장</button>';
+    $('#userModal [data-ufoot]').innerHTML=`${note}<span class="grow"></span><button data-close>취소</button>${btn}`;
+  }
+  const EMAIL={dad:'ingki3@gmail.com',son:'son@example.com',wife:'wife@example.com'};
+  // 저장 후 목표 목록(앱 활성 사용자 이메일) vs 지금 Access 목록 — 목업 상태별 (FR-15.2)
+  function accessPlan(){
+    const st=$('#adminUsers').dataset.state, manual=st==='manual';
+    const app0=st==='drift'?['dad','wife','son']:['dad','son'];
+    const access=st==='drift'?['ingki3@gmail.com','wife@example.com','old@example.com']:['ingki3@gmail.com','son@example.com'];
+    const em=Object.fromEntries(app0.map(k=>[k,EMAIL[k]]));
+    const e=ud.email.trim();
+    if(ud.mode==='dis') delete em[ud.id]; else em[ud.id]=e;
+    em.dad=EMAIL.dad; // 현재 관리자 이메일은 지울 수 없음 (FR-15.2) — 변경은 FR-15.7 절차
+    const target=Object.values(em), mine=new Set(ud.mode==='add'?[e]:ud.mode==='dis'?[ud.orig]:e!==ud.orig?[e,ud.orig]:[]);
+    return {st,manual,e,keep:access.filter(x=>target.includes(x)),plus:target.filter(x=>!access.includes(x)),minus:access.filter(x=>!target.includes(x)),mine};
+  }
+  function renderPreview(arg){
+    if(arg&&arg.startsWith('dis-')){ const id=arg.slice(4); ud={mode:'dis',id,email:EMAIL[id],orig:EMAIL[id]}; }
+    const {st,manual,e,keep,plus,minus,mine}=accessPlan();
+    const tag=x=>mine.has(x)?'<span class="muted">← 이 작업</span>':'<span class="muted">← 기존 불일치 정리</span>';
+    const nm={add:'추가',edit:'수정',dis:'비활성화'}[ud.mode], who=FAM[ud.id]||ud.id;
+    const what=ud.mode==='edit'?(e!==ud.orig?`${who} 이메일 변경 (${ud.orig} → ${e})`:`${who} 정보 수정 (이메일 그대로)`):`${who}(${ud.mode==='add'?e:ud.orig}) ${nm}`;
+    const drift=plus.concat(minus).some(x=>!mine.has(x));
+    const list=keep.map(x=>`&nbsp; ${x}${x===EMAIL.dad?' <span class="muted">(현재 관리자 — 삭제 불가)</span>':''}`)
+      .concat(plus.map(x=>`<span class="add">+ ${x}</span> ${tag(x)}`),minus.map(x=>`<span class="del">− ${x}</span> ${tag(x)}`)).join('<br>');
+    const next=ud.mode==='add'?(manual?'add-manual':'add'):null;
+    $('#previewModal [data-body]').innerHTML=`<div class="row sp"><h2>${manual?'저장 전 확인':'Access 허용 목록 변경 미리보기'} <span class="ref">FR-15.2</span></h2><button class="ghost" data-close>✕</button></div>
+      <div class="small muted">이 작업: <b>${what}</b></div>
+      ${manual?`<div class="notice warn small" style="margin-top:10px">자동 반영이 꺼져 있어요(API 토큰 미등록). 저장한 뒤 Cloudflare 대시보드에서 직접 바꾸세요: ${plus.map(x=>'<b>+ '+x+'</b>').concat(minus.map(x=>'<b>− '+x+'</b>')).join(' · ')||'바꿀 것 없음'}. 수동 모드 안내에 새 목록이 보여요. <span class="ref">FR-15.4</span></div>`
+      :`<div class="small" style="margin-top:8px">Access 허용 목록을 앱의 활성 사용자 이메일과 <b>똑같이</b> 맞춰요.</div>
+      <div class="diff" style="margin-top:6px">${list}</div>
+      ${drift?'<div class="notice warn small" style="margin-top:6px">⚠ 이 작업과 별개로 이미 어긋나 있던 항목도 함께 정리돼요. <span class="ref">FR-15.2 · FR-15.3</span></div>':''}
+      <div class="notice info small" style="margin-top:10px">반영에 실패해도 앱 쪽 변경은 저장되고 “Access에 반영 안 됨 — 다시 시도” 상태로 남아요.</div>`}
+      <div class="row" style="margin-top:14px">${ud.mode==='dis'?'':`<button data-open="userModal" data-arg="${ud.mode==='add'?'add':'edit-'+ud.id}|keep">← 이전</button>`}<span class="grow"></span><button data-close>취소</button>${next?`<button class="primary" data-open="pwModal" data-arg="${next}">${manual?'저장':'확인하고 저장 · Access에 반영'}</button>`:`<button class="primary ${ud.mode==='dis'?'danger':''}" data-close>${manual?'저장':'확인하고 저장 · Access에 반영'}</button>`}</div>`;
+  }
+  function renderPw(kind){
+    const nm=kind==='reset-son'?'아들':'엄마', add=kind.startsWith('add');
+    $('#pwModal [data-body]').innerHTML=`<div class="row sp"><h2>${add?'엄마 계정을 만들었어요':nm+' 비밀번호를 초기화했어요'} <span class="ref">FR-1.1</span></h2><button class="ghost" data-close>✕</button></div>
+      ${kind==='add'?'<div class="notice ok small">✓ Access 허용 목록에 반영됨 — wife@example.com · 11-09 10:12</div>':''}
+      ${kind==='add-manual'?'<div class="notice warn small">Cloudflare 대시보드에 wife@example.com을 직접 추가해야 엄마가 밖에서 들어올 수 있어요.</div>':''}
+      <label>임시 비밀번호 — <b>이 창을 닫으면 다시 볼 수 없어요</b></label>
+      <div class="pw">${add?'Lee-7Q4m-T2xa':'Lee-9Rk2-W8pd'}</div>
+      <div class="row" style="margin-top:8px"><button class="small">⧉ 복사</button><span class="small muted">${nm}에게 직접 전달하세요. 첫 로그인 때 새 비밀번호로 바꿔야 다음 화면으로 갈 수 있어요.</span></div>
+      ${add?'':'<div class="small muted" style="margin-top:6px">기존 로그인 세션은 모두 끊겼어요.</div>'}
+      <div class="row" style="margin-top:14px"><span class="grow"></span><button class="primary" data-close>전달했어요 · 닫기</button></div>`;
+  }
+
+  // ───── 알림함 (사용자별) ─────
+  function renderNoti(){
+    const p=P[cur];
+    $('#notiDrawer').innerHTML=`<div class="row sp" style="padding:12px 14px;border-bottom:1px solid var(--line)"><b>🔔 ${p.name.replace(' (관리자)','')}의 알림함 <span class="ref">FR-13.3</span></b><div class="row"><button class="small">모두 읽음</button><button class="ghost" data-close>✕</button></div></div>`+
+      p.noti.map(n=>`<a class="noti ${n.u?'unread':''}" href="${n.h||'#'}" ${n.h?'':'data-noop'}><b>${n.t}</b> — ${n.b}<div class="small muted">${n.tm}${n.u?' · 안 읽음':''}</div></a>`).join('')+
+      `<div class="noti small muted">방해 금지 시간(23:00~07:00) 동안 온 알림은 여기에만 쌓였다가 07:00에 한 번 보내져요. <span class="ref">FR-13.4</span></div>`;
+  }
+
+  // ───── 라우팅 (#화면?키=값) ─────
+  const screens=$$('section[data-screen]');
+  function params(){ const q=(location.hash.split('?')[1]||''); return Object.fromEntries(new URLSearchParams(q)); }
+  function show(){
+    const h=(location.hash||'#chat').slice(1).split('?')[0];
+    const name=screens.some(s=>s.dataset.screen===h)?h:'chat';
+    const q=params(); cur=PS[name]||'son';
+    screens.forEach(s=>s.classList.toggle('on',s.dataset.screen===name));
+    $$('#mocknav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+name));
+    $$('.side a.item').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+name));
+    $$('.side a.conv').forEach(a=>a.classList.toggle('on',a.dataset.scr===name));
+    $('#whoami').textContent='화면 사용자: '+P[cur].name;
+    document.querySelectorAll('.modal-bg.open,.drawer.open').forEach(m=>m.classList.remove('open'));
+    const sec=$(`section[data-screen="${name}"]`);
+    if(name==='viewer'){ const f=q.f||'pdf'; const tab=sec.querySelector(`[data-tab="v-${f}"]`); if(tab) selectTab(tab);
+      const b=sec.querySelector('[data-vfrom]'); b.style.display=q.f?'flex':'none';
+      b.textContent=q.f==='hwp'?'↪ 인용에서 열림: 과제안내.hwp · 3번째 표 · 2행 (강조 표시)':q.f==='pdf'?'↪ 인용에서 열림: 교과서_3단원.pdf · 12쪽 (강조 표시)':''; }
+    if(q.m){ const el=document.getElementById(q.m); if(el){ el.scrollIntoView({block:'center'}); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); } }
+    if(q.drawer){ const sd=sec.querySelector('.side'); if(sd){ sd.classList.add('drawer-open'); sec.querySelector('.app').classList.add('drawer-on'); } }
+    if(q.pop){ const c=sec.querySelector('[data-rtchip] [data-pop]'); c&&c.classList.add('open'); }
+    if(q.art){ const a=sec.querySelector('[data-art]'); a&&a.classList.remove('closed'); }
+    // 리뷰·스크린샷용 바로가기: ?tab= ?mst= ?sp=a,b ?wl=1 ?menu=1 ?modal=ID&arg=
+    if(q.tab){ const tb=sec.querySelector(`[data-tab="${q.tab}"]`); tb&&selectTab(tb); }
+    if(q.mst){ const m=sec.querySelector(`.tabpane.on [data-mst="${q.mst}"],[data-mst="${q.mst}"]`); m&&setMst(m.closest('[data-mstroot]'),q.mst); }
+    if(q.wl){ const w=sec.querySelector('[data-popwrap] .pop'); w&&w.classList.add('open'); }
+    if(q.menu){ const m=sec.querySelector('.menu'); m&&m.classList.add('open'); }
+    if(q.modal&&document.getElementById(q.modal)){ R[q.modal]&&R[q.modal](q.arg); if(q.modal==='shareModal'&&q.sm){ ss.mode=q.sm; if(q.sm==='some') ss.rec=[Object.keys(FAM).filter(k=>k!==SH[ss.id].owner)[0]]; if(q.scope) ss.scope=q.scope; renderShare(); } if(q.modal==='connModal'&&q.rt){ cs.rt=q.rt; if(q.auth) cs.auth=q.auth; renderConn(); } document.getElementById(q.modal).classList.add('open'); }
+    if(q.sp) q.sp.split(',').forEach(k=>{ const s=(q.modal?document.getElementById(q.modal):sec).querySelector(`[data-sp="${k}"]`); s&&s.click(); });
+  }
+  function selectTab(tab){ const root=tab.closest('.page'); root.querySelectorAll('[data-tab]').forEach(a=>a.classList.toggle('on',a===tab)); root.querySelectorAll('[data-pane]').forEach(p=>p.classList.toggle('on',p.dataset.pane===tab.dataset.tab)); }
+
+  // 목업 상태 막대
+  function setMst(root,st){ root.dataset.state=st; root.querySelectorAll('[data-only]').forEach(e=>e.style.display=e.dataset.only.split(' ').includes(st)?'':'none'); root.querySelectorAll('[data-mst]').forEach(e=>e.classList.toggle('on',(e.dataset.onIn||e.dataset.mst).split(' ').includes(st))); }
+  $$('[data-mstroot]').forEach(r=>setMst(r,r.dataset.state));
+
+  if(matchMedia('(max-width: 900px)').matches) $$('[data-art]').forEach(a=>a.classList.add('closed'));
+  if(window.self!==window.top){ $('#mocknav').style.display='none'; document.documentElement.classList.add('inframe'); $$('.app,.login-wrap').forEach(e=>e.style.height='100vh'); }
+  const frames=()=>{ const th=document.documentElement.dataset.theme; $$('iframe[data-selfsrc]').forEach(f=>{ const u=f.dataset.selfsrc; f.src=location.pathname+'#'+u+(th?(u.includes('?')?'&':'?')+'theme='+th:''); }); };
+
+  const sel=$('#themeSel');
+  sel.addEventListener('change',()=>{ if(sel.value) document.documentElement.dataset.theme=sel.value; else delete document.documentElement.dataset.theme; frames(); });
+  { const th=params().theme; if(th){ document.documentElement.dataset.theme=th; sel.value=th; } }
+  frames();
+
+  const R={shareModal:a=>{const it=SH[a]; ss={id:a,mode:it.mode,rec:[...(it.rec||[])],scope:'all'}; renderShare();},
+           connModal:a=>{const D={member:['member','claude','api'],'member-codex':['member','codex','chatgpt'],shared:['shared','claude','api'],self:['self','claude','claudesub'],forwife:['forwife','codex','chatgpt']}[a]; cs={ctx:D[0],rt:D[1],auth:D[2]}; renderConn();},
+           userModal:renderUser, previewModal:renderPreview, pwModal:renderPw, notiDrawer:renderNoti};
+
+  document.addEventListener('input',e=>{ if(e.target.matches('#userModal [data-uemail]')){ ud.email=e.target.value; if(ud.mode==='add') ud.orig=ud.email; userFoot(); } });
+  document.addEventListener('change',e=>{
+    const t=e.target;
+    if(t.matches('[data-defm]')){ const w=who(t); DEFM[w][t.dataset.defm]=t.value; }
+    if(t.matches('#shareModal [data-scope]')){ ss.scope=t.value; renderShare(); }
+    if(t.matches('[data-pop] [data-model]')){ const chip=t.closest('[data-rtchip]'); chip.dataset.model=t.value; chip.querySelector('.rt-model').textContent=MN[t.value]; }
+  });
+
+  document.addEventListener('click',e=>{
+    const t=e.target;
+    if(t.closest('[data-noop]')){ e.preventDefault(); }
+    // 터치 기기: 인용 첫 탭은 미리보기, 두 번째 탭(또는 미리보기 안 링크)이 원문 열기
+    const ct=t.closest('a.cite');
+    if(ct && matchMedia('(hover: none)').matches && !ct.classList.contains('tipopen')){ e.preventDefault(); $$('.cite.tipopen').forEach(c=>c.classList.remove('tipopen')); ct.classList.add('tipopen'); return; }
+    // 모달·서랍
+    const op=t.closest('[data-open]'); if(op){ e.preventDefault(); $$('.modal-bg.open').forEach(m=>m.classList.remove('open')); $$('.menu.open').forEach(m=>m.classList.remove('open'));
+      const id=op.dataset.open; if(R[id]) R[id](op.dataset.arg); document.getElementById(id).classList.add('open'); return; }
+    if(t.closest('[data-close]')){ t.closest('.modal-bg,.drawer').classList.remove('open'); return; }
+    if(t.classList.contains('modal-bg')){ t.classList.remove('open'); return; }
+    // 공유 모달 · 연결 모달 내부 상태
+    const rc=t.closest('#shareModal [data-rec]'); if(rc){ const k=rc.dataset.rec; ss.rec=ss.rec.includes(k)?ss.rec.filter(x=>x!==k):[...ss.rec,k]; renderShare(); return; }
+    const sm=t.closest('#shareModal [data-sm]'); if(sm){ ss.mode=sm.dataset.sm; if(ss.mode==='some'&&!ss.rec.length) ss.rec=[Object.keys(FAM).filter(k=>k!==SH[ss.id].owner)[0]]; renderShare(); return; }
+    const cv=t.closest('#connModal [data-cv]'); if(cv){ const [k,v]=cv.dataset.cv.split(':'); cs[k]=v; renderConn(); return; }
+    // 목업 상태
+    const ms=t.closest('[data-mst]'); if(ms){ setMst(ms.closest('[data-mstroot]'),ms.dataset.mst); return; }
+    // 대화 관리 메뉴
+    const mb=t.closest('[data-menu]'); $$('.menu.open').forEach(m=>{ if(!mb||m!==mb.nextElementSibling) m.classList.remove('open'); });
+    if(mb){ mb.nextElementSibling.classList.toggle('open'); return; }
+    if(t.closest('[data-rename]')){ const bar=t.closest('.topbar'); bar.classList.add('renaming'); t.closest('.menu').classList.remove('open'); bar.querySelector('.rename input').focus(); return; }
+    if(t.closest('[data-rename-done]')){ const bar=t.closest('.topbar'); if(t.classList.contains('primary')) bar.querySelector('[data-ctitle]').textContent=bar.querySelector('.rename input').value; bar.classList.remove('renaming'); return; }
+    // 팝오버 (런타임 칩 · 관심 종목)
+    const wrap=t.closest('[data-rtchip],[data-popwrap]');
+    $$('.pop.open').forEach(p=>{ if(!wrap||!wrap.contains(p)) p.classList.remove('open'); });
+    if(wrap && !t.closest('.pop')){ wrap.querySelector('.pop').classList.toggle('open'); return; }
+    const rt=t.closest('[data-rt]'); if(rt && rt.classList.contains('opt')){
+      const chip=rt.closest('[data-rtchip]'), w=who(chip); chip.dataset.rt=rt.dataset.rt; chip.dataset.model=defModel(w,rt.dataset.rt);
+      paintChip(chip); chip.querySelector('[data-pop]').classList.add('open'); return; }
+    // 관심 종목 추가·제거
+    if(t.closest('[data-wldel]')){ const pop=t.closest('.pop'); t.closest('tr').remove(); pop.closest('[data-popwrap]').querySelector('[data-wlcount]').textContent=pop.querySelectorAll('[data-wllist] tr').length; return; }
+    if(t.closest('[data-wladd]')){ const pop=t.closest('.pop'), tr=t.closest('tr'); t.outerHTML='<button class="small ghost" data-wldel title="제거">✕</button>'; pop.querySelector('[data-wllist]').appendChild(tr); pop.closest('[data-popwrap]').querySelector('[data-wlcount]').textContent=pop.querySelectorAll('[data-wllist] tr').length; return; }
+    // 코드 복사
+    if(t.closest('[data-copy]')){ const b=t.closest('[data-copy]'); b.textContent='✓ 복사됨'; setTimeout(()=>b.textContent='⧉ 복사',1500); return; }
+    // 세그먼트(+연결된 패널) · 토글
+    const sg=t.closest('.seg>span'); if(sg && !sg.classList.contains('dis')){ sg.parentNode.querySelectorAll(':scope>span').forEach(s=>s.classList.toggle('on',s===sg));
+      if(sg.dataset.sp){ const root=sg.closest('[data-sproot]'); root.querySelectorAll('[data-spane]').forEach(p=>{ if(p.closest('[data-sproot]')===root) p.classList.toggle('on',p.dataset.spane===sg.dataset.sp); }); } }
+    const tg=t.closest('.toggle'); if(tg && !tg.classList.contains('dis')){ const s=tg.querySelector('.sw'); s&&s.classList.toggle('on'); }
+    // 탭
+    const tab=t.closest('[data-tab]'); if(tab) selectTab(tab);
+    // 아티팩트 패널
+    if(t.closest('[data-open-art]')){ t.closest('.app').querySelector('[data-art]').classList.remove('closed'); }
+    if(t.closest('[data-close-art]')){ t.closest('[data-art]').classList.add('closed'); }
+    // 모바일 사이드바 서랍
+    if(t.closest('[data-hamb]')){ const app=t.closest('.app'); app.querySelector('.side').classList.toggle('drawer-open'); app.classList.toggle('drawer-on'); return; }
+    const app=t.closest('.app.drawer-on'); if(app && !t.closest('.side')){ app.classList.remove('drawer-on'); app.querySelector('.side').classList.remove('drawer-open'); }
+    // 표 정렬
+    const th=t.closest('table[data-sortable] th[data-k]'); if(th){
+      const tb=th.closest('table').tBodies[0]; const k=+th.dataset.k; const rows=[...tb.rows];
+      const num=v=>parseFloat(v.replace(/[^\d.\-+]/g,''))||0; const dir=th.dataset.dir==='a'?-1:1; th.dataset.dir=dir===1?'a':'d';
+      rows.sort((a,b)=>{const x=a.cells[k].textContent,y=b.cells[k].textContent;return (k?num(x)-num(y):x.localeCompare(y))*dir;}); rows.forEach(r=>tb.appendChild(r)); }
+  });
+
+  addEventListener('hashchange',show); show();
+})();
+</script>
+</body>
+</html>
