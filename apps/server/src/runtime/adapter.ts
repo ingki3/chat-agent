@@ -32,6 +32,8 @@ export type StartContext = {
   effort?: string | undefined;
   /** Allowed tools (common MCP server + allow-listed skills, #43/#21). */
   tools: string[];
+  /** Token the runtime's MCP calls carry: scoped to this user, conversation and run (#42). */
+  mcpToken?: string;
 };
 
 /** Normalised events. `reasoning_delta` is stored but never streamed to the browser. */

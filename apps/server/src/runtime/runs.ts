@@ -6,6 +6,7 @@ import type { ConversationStore, MessageRow } from "../conversations/store.js";
 import type { Db } from "../db/client.js";
 import { runEvents, runs } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
+import { McpTokens } from "../isolation/tokens.js";
 import { SessionGoneError, type RuntimeRegistry, type RuntimeSession, type RuntimeTurn } from "./adapter.js";
 
 export type RunRow = typeof runs.$inferSelect;
@@ -118,6 +119,8 @@ export type RunManagerOptions = {
  */
 export class RunManager {
   private readonly live = new Map<string, Live>();
+  /** MCP call tokens: one per run, revoked when the run ends (#42). */
+  readonly mcpTokens = new McpTokens();
   /** Set by shutdown(): no new run may start after that. */
   private stopping = false;
   private readonly now: () => number;
@@ -324,8 +327,10 @@ export class RunManager {
    */
   async shutdown(): Promise<void> {
     this.stopping = true;
-    const lives = [...this.live.values()];
+    const entries = [...this.live.entries()];
+    const lives = entries.map(([, l]) => l);
     this.live.clear();
+    for (const [id] of entries) this.mcpTokens.revokeRun(id); // runtimes must not call our tools any more
     for (const live of lives) {
       clearTimeout(live.graceTimer);
       live.settled = true;
@@ -386,6 +391,7 @@ export class RunManager {
 
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
   private drop(runId: string, live: Live): void {
+    this.mcpTokens.revokeRun(runId);
     live.settled = true;
     clearTimeout(live.graceTimer);
     fireInterrupt(live);
@@ -402,6 +408,7 @@ export class RunManager {
       this.emit(r.id, { type: "error", code, message: FAILURE_TEXT[code] ?? FAILURE_TEXT.runtime_error! });
     }
     this.emit(r.id, { type: "done", messageId: r.assistantMessageId, status: messageStatus });
+    this.mcpTokens.revokeRun(r.id);
     this.db.update(runs).set({ status, errorCode, endedAt: this.now() }).where(eq(runs.id, r.id)).run();
     const live = this.live.get(r.id);
     this.live.delete(r.id);
@@ -422,6 +429,11 @@ export class RunManager {
       model: run.model,
       effort: run.effort ?? undefined,
       tools: [],
+      mcpToken: this.mcpTokens.issue({
+        userId: run.userId,
+        conversationId: run.conversationId,
+        runId: run.id,
+      }),
     };
     // Resume only a session that saw exactly this history (#45 refines the matching and summarising), and only
     // on runtimes that can resume at all.
