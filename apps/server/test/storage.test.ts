@@ -81,6 +81,8 @@ describe("database", () => {
     expect(tables).toEqual([
       "conversations",
       "messages",
+      "run_events",
+      "runs",
       "runtime_sessions",
       "sessions",
       "settings",

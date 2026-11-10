@@ -188,3 +188,27 @@ export function autoTitle(text: string, max = 40): string {
   const chars = Array.from(sentence);
   return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : sentence || "새 대화";
 }
+
+export const RunStatus = z.enum(["queued", "running", "done", "interrupted", "failed"]);
+export const Run = z.object({
+  id: z.string(),
+  conversationId: z.string(),
+  assistantMessageId: z.string(),
+  status: RunStatus,
+  errorCode: z.string().nullable(),
+  runtime: z.string(),
+  model: z.string(),
+  effort: z.string().nullable(),
+  createdAt: z.number(),
+  endedAt: z.number().nullable(),
+});
+export type Run = z.infer<typeof Run>;
+
+/** Response of send / edit / regenerate: the new messages and the run generating the reply. */
+export const StartRunResponse = z.object({
+  message: Message.nullable(),
+  assistant: Message,
+  run: Run,
+  revision: z.number().int(),
+});
+export type StartRunResponse = z.infer<typeof StartRunResponse>;

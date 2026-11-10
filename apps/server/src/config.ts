@@ -29,6 +29,8 @@ const ConfigSchema = z.object({
   MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
   /** Enables /api/diag/stream for SSE measurements (scripts/sse-probe.ts). Off unless explicitly "1". */
   DIAG_STREAM: z.enum(["0", "1"]).default("0"),
+  /** Registers the scripted FakeRuntime (development and testing only, never with real family data). */
+  FAKE_RUNTIME: z.enum(["0", "1"]).default("0"),
   /** Public hostname served through Cloudflare Tunnel. Requests with this Host need a valid Access JWT. */
   PUBLIC_HOST: z
     .string()
@@ -58,6 +60,7 @@ export type Config = {
   dataDir: string;
   masterKeyPath: string;
   diagStream: boolean;
+  fakeRuntime: boolean;
   tempGateCode?: string | undefined;
   publicHost: string;
   /** Present when Cloudflare Access is configured. */
@@ -92,6 +95,7 @@ export function loadConfig(
     dataDir,
     masterKeyPath,
     diagStream: c.DIAG_STREAM === "1",
+    fakeRuntime: c.FAKE_RUNTIME === "1",
     tempGateCode: c.TEMP_GATE_CODE,
     publicHost: c.PUBLIC_HOST,
     access:

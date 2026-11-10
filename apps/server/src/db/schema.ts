@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 const now = sql`(unixepoch() * 1000)`;
 
@@ -134,4 +134,54 @@ export const runtimeSessions = sqliteTable(
     updatedAt: integer("updated_at").notNull().default(now),
   },
   (t) => [index("runtime_sessions_conversation_idx").on(t.conversationId)],
+);
+
+/**
+ * One generation of an assistant reply (#12). At most one queued/running run per conversation. Survives
+ * restarts: a run left queued/running at startup is marked failed ("서버 재시작으로 중단").
+ */
+export const runs = sqliteTable(
+  "runs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The user message that started it (null for "다시 생성"). */
+    userMessageId: text("user_message_id"),
+    assistantMessageId: text("assistant_message_id").notNull(),
+    status: text("status", { enum: ["queued", "running", "done", "interrupted", "failed"] }).notNull(),
+    errorCode: text("error_code"),
+    runtime: text("runtime").notNull(),
+    model: text("model").notNull(),
+    effort: text("effort"),
+    /** Client `Idempotency-Key`: the same key from the same user returns the same run. */
+    idempotencyKey: text("idempotency_key"),
+    /** Next event sequence number (SSE id). */
+    nextEventSeq: integer("next_event_seq").notNull().default(1),
+    createdAt: integer("created_at").notNull().default(now),
+    endedAt: integer("ended_at"),
+  },
+  (t) => [
+    index("runs_conversation_idx").on(t.conversationId, t.status),
+    uniqueIndex("runs_user_idempotency_idx").on(t.userId, t.idempotencyKey),
+  ],
+);
+
+/** Stream events of a run, kept for replay (`Last-Event-ID`) until an hour after the run ends. */
+export const runEvents = sqliteTable(
+  "run_events",
+  {
+    runId: text("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "cascade" }),
+    seq: integer("seq").notNull(),
+    /** StreamEvent (@agentlee/shared). */
+    data: text("data", { mode: "json" }).$type<unknown>().notNull(),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [primaryKey({ columns: [t.runId, t.seq] })],
 );

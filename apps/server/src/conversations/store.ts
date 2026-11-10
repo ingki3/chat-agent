@@ -238,6 +238,35 @@ export class ConversationStore {
     })();
   }
 
+  /** Updates a message being generated (parts so far, final status). */
+  updateMessage(
+    id: string,
+    patch: {
+      parts?: MessagePart[];
+      status?: MessageRow["status"];
+      runtime?: string;
+      model?: string;
+      effort?: string | null;
+    },
+  ): void {
+    const parts = patch.parts ? MessagePart.array().parse(patch.parts) : undefined;
+    this.db
+      .update(messages)
+      .set({
+        ...(parts ? { parts, searchText: searchTextOf(parts) } : {}),
+        ...(patch.status ? { status: patch.status } : {}),
+        ...(patch.runtime ? { runtime: patch.runtime } : {}),
+        ...(patch.model ? { model: patch.model } : {}),
+        ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
+      })
+      .where(eq(messages.id, id))
+      .run();
+  }
+
+  messageById(id: string): MessageRow | undefined {
+    return this.db.select().from(messages).where(eq(messages.id, id)).get();
+  }
+
   message(conversationId: string, messageId: string): MessageRow | undefined {
     return this.db
       .select()
@@ -404,6 +433,37 @@ export class ConversationStore {
     if (messageId === null) return;
     const m = this.message(conversationId, messageId);
     if (!m || !m.active) throw new Error("checkpoint must be an active message of this conversation");
+  }
+
+  /**
+   * Moves a session's checkpoint after a completed turn. Same rules as `saveSession`: the revision the runtime
+   * reflects must be current and the message an active one of this conversation — otherwise the session is
+   * invalidated instead of being made to look current.
+   */
+  touchSession(id: string, lastMessageId: string, conversationRevision: number): void {
+    const s = this.db.select().from(runtimeSessions).where(eq(runtimeSessions.id, id)).get();
+    if (!s) return;
+    const conv = this.get(s.conversationId);
+    try {
+      if (!conv || conversationRevision !== conv.revision) throw new Error("stale");
+      this.assertCheckpoint(s.conversationId, lastMessageId);
+    } catch {
+      this.invalidateSession(id);
+      return;
+    }
+    this.db
+      .update(runtimeSessions)
+      .set({ lastMessageId, conversationRevision, updatedAt: this.now() })
+      .where(eq(runtimeSessions.id, id))
+      .run();
+  }
+
+  invalidateSession(id: string): void {
+    this.db
+      .update(runtimeSessions)
+      .set({ invalidated: true, updatedAt: this.now() })
+      .where(eq(runtimeSessions.id, id))
+      .run();
   }
 
   invalidateSessions(conversationId: string): void {

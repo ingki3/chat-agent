@@ -13,6 +13,10 @@ import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
 import { registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
 import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
+import { RuntimeRegistry } from "./runtime/adapter.js";
+import { FakeRuntime } from "./runtime/fake.js";
+import { registerRunRoutes } from "./runtime/routes.js";
+import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -49,6 +53,7 @@ declare module "fastify" {
     users: UserStore | undefined;
     appEvents: AppEvents;
     conversations: ConversationStore | undefined;
+    runs: RunManager | undefined;
   }
 }
 
@@ -69,6 +74,11 @@ export type BuildOptions = {
   /** Login rate-limit/clock overrides (tests). */
   auth?: AuthRouteOptions;
   events?: AppEvents;
+  /** Runtime adapters (tests pass FakeRuntime instances). Default: real adapters (#15/#16), FakeRuntime if FAKE_RUNTIME=1. */
+  runtimes?: RuntimeRegistry;
+  runs?: RunManagerOptions;
+  /** SSE timing overrides (tests). */
+  sse?: { heartbeatMs?: number };
   /** User-admin overrides (tests). */
   userAdmin?: UserAdminOptions;
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
@@ -108,7 +118,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   if (users) {
     registerAuthRoutes(app, { config, users, ...opts.auth });
     registerUserAdmin(app, users, opts.userAdmin);
-    registerConversationRoutes(app, app.conversations!);
+    const runtimes = opts.runtimes ?? new RuntimeRegistry();
+    if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
+    const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, opts.runs);
+    // Runs left running by a previous process cannot be continued: mark them failed before serving.
+    runManager.recover();
+    const purge = setInterval(() => runManager.purgeEvents(), 10 * 60_000);
+    purge.unref();
+    app.addHook("onClose", async () => clearInterval(purge));
+    app.decorate("runs", runManager);
+    registerConversationRoutes(app, app.conversations!, runManager);
+    registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
   }
 
   app.get(

@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   CreateConversationRequest,
   EditMessageRequest,
@@ -9,6 +9,8 @@ import {
 } from "@agentlee/shared";
 import type { z } from "zod";
 import { deny } from "../auth/plugin.js";
+import { idempotencyKey, MessageNotFoundError, startRun } from "../runtime/routes.js";
+import type { RunManager } from "../runtime/runs.js";
 import { toConversation, toMessage, type ConversationStore } from "./store.js";
 
 const KIND = "conversation";
@@ -33,7 +35,11 @@ type MsgParams = { id: string; messageId: string };
  * the handlers below only ever see conversations the caller may use. Messages are looked up within the
  * conversation, so a message id from another conversation is simply not found.
  */
-export function registerConversationRoutes(app: FastifyInstance, store: ConversationStore): void {
+export function registerConversationRoutes(
+  app: FastifyInstance,
+  store: ConversationStore,
+  runs: RunManager,
+): void {
   app.resources.register(KIND, (id) => {
     const c = store.get(id);
     // Sharing (#29) will fill sharedWith from its projection.
@@ -103,15 +109,35 @@ export function registerConversationRoutes(app: FastifyInstance, store: Conversa
     },
   );
 
-  // Appends the user's message. Generating the reply is the runtime pipeline's job (#12).
+  // Send / edit / regenerate all start a run (#12): the user message (if any) and a pending assistant message
+  // are created in the same transaction as the one-run-per-conversation check.
+  const key = (req: FastifyRequest, reply: FastifyReply) => {
+    const k = idempotencyKey(req);
+    if (k === false) void deny(reply, 400, "invalid_request");
+    return k;
+  };
+  const pending = (conversationId: string) =>
+    store.append(conversationId, { role: "assistant", parts: [], status: "pending" });
+
   app.post<{ Params: IdParams }>(
     "/api/conversations/:id/messages",
     { config: conv("write") },
     async (req, reply) => {
       const body = parse(SendMessageRequest, req.body, reply);
-      if (!body) return reply;
-      const m = store.append(req.params.id, { role: "user", parts: [{ type: "text", text: body.text }] });
-      return reply.code(201).send(toMessage(m));
+      const k = body && key(req, reply);
+      if (!body || k === false) return reply;
+      return startRun(reply, runs, store, {
+        conversationId: req.params.id,
+        userId: req.ctx.user!.id,
+        idempotencyKey: k,
+        prepare: () => {
+          const user = store.append(req.params.id, {
+            role: "user",
+            parts: [{ type: "text", text: body.text }],
+          });
+          return { user, assistant: pending(req.params.id) };
+        },
+      });
     },
   );
 
@@ -120,10 +146,24 @@ export function registerConversationRoutes(app: FastifyInstance, store: Conversa
     { config: conv("write") },
     async (req, reply) => {
       const body = parse(EditMessageRequest, req.body, reply);
-      if (!body) return reply;
-      const m = store.edit(req.params.id, req.params.messageId, body.text);
-      if (!m) return notFound(reply);
-      return reply.send({ message: toMessage(m), revision: store.get(req.params.id)!.revision });
+      const k = body && key(req, reply);
+      if (!body || k === false) return reply;
+      return startRun(
+        reply,
+        runs,
+        store,
+        {
+          conversationId: req.params.id,
+          userId: req.ctx.user!.id,
+          idempotencyKey: k,
+          prepare: () => {
+            const user = store.edit(req.params.id, req.params.messageId, body.text);
+            if (!user) throw new MessageNotFoundError();
+            return { user, assistant: pending(req.params.id) };
+          },
+        },
+        200,
+      );
     },
   );
 
@@ -131,9 +171,24 @@ export function registerConversationRoutes(app: FastifyInstance, store: Conversa
     "/api/conversations/:id/messages/:messageId/regenerate",
     { config: conv("write") },
     async (req, reply) => {
-      const m = store.regenerate(req.params.id, req.params.messageId);
-      if (!m) return notFound(reply);
-      return reply.send({ message: toMessage(m), revision: store.get(req.params.id)!.revision });
+      const k = key(req, reply);
+      if (k === false) return reply;
+      return startRun(
+        reply,
+        runs,
+        store,
+        {
+          conversationId: req.params.id,
+          userId: req.ctx.user!.id,
+          idempotencyKey: k,
+          prepare: () => {
+            const assistant = store.regenerate(req.params.id, req.params.messageId);
+            if (!assistant) throw new MessageNotFoundError();
+            return { user: null, assistant };
+          },
+        },
+        200,
+      );
     },
   );
 

@@ -64,7 +64,25 @@ const withMessage = (key: "userMessageId" | "assistantMessageId") => (f: Family)
  * Until sharing (#29) exists nothing is shared, so the "shared" caller is refused like a stranger.
  */
 const NOT_SHARED = (e: MatrixRow["expect"]): MatrixRow["expect"] => ({ ...e, shared: 403 });
+/** A finished run of `owner` (the real app has no runtime in tests, so it fails at once — events stay). */
+function run(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  const r = f.app.runs!.begin({
+    conversationId: c.id,
+    userId: f.users.owner.id,
+    prepare: () => ({
+      user: f.app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "q" }] }),
+      assistant: f.app.conversations!.append(c.id, { role: "assistant", parts: [], status: "pending" }),
+    }),
+  });
+  return r.run.id;
+}
+
 export const APP_MATRIX: MatrixRow[] = [
+  { route: "GET /api/runs/:id", expect: NOT_SHARED(READ), fixture: run },
+  { route: "GET /api/runs/:id/events", expect: NOT_SHARED(READ), fixture: run },
+  { route: "POST /api/runs/:id/interrupt", expect: OWNER_ONLY, fixture: run },
+  { route: "GET /api/conversations/:id/active-run", expect: NOT_SHARED(READ), fixture: conversation },
   { route: "GET /api/conversations/:id", expect: NOT_SHARED(READ), fixture: conversation },
   {
     route: "PATCH /api/conversations/:id",
