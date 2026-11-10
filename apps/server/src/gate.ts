@@ -1,16 +1,15 @@
 import crypto from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import "./auth/context.js";
+import { readCookie } from "./auth/plugin.js";
+import { isApiPath } from "./paths.js";
 
 /**
  * Temporary access-code gate (until Cloudflare Access is configured, docs/ops.md §7).
- * With TEMP_GATE_CODE set, every request except the code page needs a signed cookie obtained by entering
+ * With TEMP_GATE_CODE set, every tunnel request (Host = PUBLIC_HOST) except the code page needs a signed cookie obtained by entering
  * the code. The code is compared in constant time, failures are rate-limited per client and globally,
  * and neither the code nor the cookie is ever logged (request bodies and headers are not logged at all).
  */
-const isApiPath = (url: string | undefined) => {
-  const p = (url ?? "/").split("?")[0] ?? "/";
-  return p === "/api" || p.startsWith("/api/");
-};
 
 export const GATE_COOKIE = "al_gate";
 export const GATE_PATH = "/gate";
@@ -32,27 +31,6 @@ const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").dige
 
 export function codeMatches(input: string, code: string): boolean {
   return crypto.timingSafeEqual(sha256(input), sha256(code));
-}
-
-function readCookie(header: string | undefined, name: string): string | undefined {
-  for (const part of (header ?? "").split(";")) {
-    const i = part.indexOf("=");
-    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
-  }
-  return undefined;
-}
-
-/** Client identity for rate limiting. Behind the tunnel every connection is 127.0.0.1; Cloudflare adds the real IP. */
-function clientKey(req: FastifyRequest): string {
-  const cf = req.headers["cf-connecting-ip"];
-  return (typeof cf === "string" && cf) || req.ip;
-}
-
-function isHttps(req: FastifyRequest): boolean {
-  return (
-    req.headers["x-forwarded-proto"] === "https" ||
-    /"scheme":"https"/.test(String(req.headers["cf-visitor"] ?? ""))
-  );
 }
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -112,7 +90,8 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       .send(page(message));
 
   app.addHook("onRequest", async (req, reply) => {
-    if (isGatePath(req.url)) return;
+    // Only tunnel requests are gated; local requests already passed the trust boundary (Host + no Cf-* headers).
+    if (req.ctx.origin !== "edge" || isGatePath(req.url)) return;
     if (valid(req)) return;
     if (isApiPath(req.url))
       return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
@@ -129,7 +108,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
     );
     scope.get(GATE_PATH, async (req, reply) => (valid(req) ? reply.redirect("/", 303) : send(reply, 200)));
     scope.post(GATE_PATH, async (req, reply) => {
-      const client = clientKey(req);
+      const client = req.ctx.clientIp;
       const mine = recent(failures.get(client) ?? []);
       globalFails = recent(globalFails);
       if (mine.length >= perClient || globalFails.length >= globalMax)
@@ -150,7 +129,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
         "HttpOnly",
         "SameSite=Lax",
         `Max-Age=${Math.floor(ttlMs / 1000)}`,
-        ...(isHttps(req) ? ["Secure"] : []),
+        ...(req.ctx.origin === "edge" ? ["Secure"] : []),
       ].join("; ");
       return reply.header("Set-Cookie", cookie).header("Cache-Control", "no-store").redirect("/", 303);
     });
