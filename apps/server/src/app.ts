@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@agentlee/shared";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
+import { isGatePath, registerGate, type GateOptions } from "./gate.js";
 import { BASE_HEADERS } from "./headers.js";
 import { loggerOptions } from "./logging.js";
 
@@ -42,6 +43,8 @@ export type BuildOptions = {
   logger?: boolean;
   /** Timing overrides for the diagnostic stream (tests). The route exists only when config.diagStream is set. */
   diag?: DiagOptions;
+  /** Rate-limit/clock overrides for the temporary gate (tests). Active only when config.tempGateCode is set. */
+  gate?: Omit<GateOptions, "code">;
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
@@ -53,6 +56,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
     return payload;
   });
+
+  // Before every route, static file and Vite middleware: nothing is served without the code.
+  if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
 
   app.get("/api/health", async (): Promise<HealthResponse> => ({
     status: "ok",
@@ -77,13 +83,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     await app.register(middie);
     const vite = await createServer({
       root: WEB_ROOT,
-      server: { middlewareMode: true, hmr: { server: app.server } },
+      // Vite's WebSocket upgrade bypasses Fastify hooks, so it is switched off while the code gate is on.
+      server: config.tempGateCode
+        ? { middlewareMode: true, hmr: false, ws: false }
+        : { middlewareMode: true, hmr: { server: app.server } },
       appType: "spa",
     });
     // API routes must reach Fastify; Vite's SPA fallback would otherwise answer /api/* with index.html.
     // Vite ends responses itself (onSend never runs), so set the base headers before handing over.
     app.use((req, res, next) => {
-      if (isApiPath(req.url)) return next();
+      if (isApiPath(req.url) || isGatePath(req.url)) return next();
       for (const [k, v] of Object.entries(BASE_HEADERS)) res.setHeader(k, v);
       return vite.middlewares(req, res, next);
     });

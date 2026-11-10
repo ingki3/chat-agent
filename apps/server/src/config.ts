@@ -25,6 +25,11 @@ const ConfigSchema = z.object({
   MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
   /** Enables /api/diag/stream for SSE measurements (scripts/sse-probe.ts). Off unless explicitly "1". */
   DIAG_STREAM: z.enum(["0", "1"]).default("0"),
+  /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
+  TEMP_GATE_CODE: z
+    .string()
+    .regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" })
+    .optional(),
 });
 
 export type Config = {
@@ -34,6 +39,7 @@ export type Config = {
   dataDir: string;
   masterKeyPath: string;
   diagStream: boolean;
+  tempGateCode?: string | undefined;
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
@@ -61,5 +67,6 @@ export function loadConfig(
     dataDir,
     masterKeyPath,
     diagStream: c.DIAG_STREAM === "1",
+    tempGateCode: c.TEMP_GATE_CODE,
   };
 }
