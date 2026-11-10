@@ -4,7 +4,12 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { openInside, PathDeniedError, resolveInside } from "../src/isolation/paths.js";
+import {
+  openInside,
+  PathDeniedError,
+  resolveInside,
+  UnsupportedPlatformError,
+} from "../src/isolation/paths.js";
 import { BlockedRequestError, isBlockedAddress, safeFetch } from "../src/isolation/net.js";
 import {
   allowEnv,
@@ -126,6 +131,11 @@ describe("hard links", () => {
     const t = familyTree();
     fs.linkSync(path.join(t.mom, "diary.txt"), path.join(t.son, "hard.txt"));
     expect(() => resolveInside("hard.txt", [t.son])).toThrow(PathDeniedError);
+    if (process.platform !== "darwin") {
+      // openInside needs O_NOFOLLOW_ANY and fails closed elsewhere.
+      await expect(openInside("homework.txt", [t.son])).rejects.toBeInstanceOf(UnsupportedPlatformError);
+      return;
+    }
     await expect(openInside("hard.txt", [t.son])).rejects.toBeInstanceOf(PathDeniedError);
     await expect(openInside("hard.txt", [t.son], "w")).rejects.toBeInstanceOf(PathDeniedError);
     expect(fs.readFileSync(path.join(t.mom, "diary.txt"), "utf8")).toBe("MOM-SECRET");
