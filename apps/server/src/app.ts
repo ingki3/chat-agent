@@ -125,10 +125,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     runManager.recover();
     const purge = setInterval(() => runManager.purgeEvents(), 10 * 60_000);
     purge.unref();
-    app.addHook("onClose", async () => {
-      clearInterval(purge);
-      await runManager.shutdown();
-    });
+    app.addHook("onClose", async () => clearInterval(purge));
+    // preClose: before Fastify waits for open connections, end the event streams that would otherwise hold it.
+    app.addHook("preClose", async () => runManager.shutdown());
     app.decorate("runs", runManager);
     registerConversationRoutes(app, app.conversations!, runManager);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});

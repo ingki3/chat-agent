@@ -594,3 +594,118 @@ describe("runs: robustness (review #74)", () => {
     expect(app.conversations!.sessions(c.id).length).toBeGreaterThanOrEqual(1);
   });
 });
+
+/** An adapter whose start, interrupt and close the test controls. Counts closes per session. */
+function controlledRuntime(o: {
+  startDelayMs?: number;
+  interruptHangs?: boolean;
+  events?: RuntimeEvent[];
+  endless?: boolean;
+}) {
+  const stats = { opened: 0, closes: 0 };
+  const adapter: RuntimeAdapter = {
+    id: "claude-code",
+    capabilities: () => ({
+      models: [{ id: "c", label: "C", efforts: [] }],
+      canSwitchModelInSession: false,
+      canResume: false,
+    }),
+    resume: () => Promise.reject(new Error("no")),
+    start: async () => {
+      await new Promise((r) => setTimeout(r, o.startDelayMs ?? 0));
+      stats.opened++;
+      return {
+        externalSessionId: `ctl-${stats.opened}`,
+        setModel: async () => {},
+        close: async () => {
+          stats.closes++;
+        },
+        turn: () => ({
+          events: (async function* () {
+            for (const e of o.events ?? [{ type: "text_delta", text: "x" } as RuntimeEvent]) yield e;
+            if (o.endless) await new Promise(() => {});
+          })(),
+          interrupt: () => (o.interruptHangs ? new Promise<void>(() => {}) : Promise.resolve()),
+        }),
+      };
+    },
+  };
+  return { adapter, stats };
+}
+
+describe("runs: robustness, round 2 (review #74)", () => {
+  it("a tool call without input or output is stored as null and the history still loads", async () => {
+    const { adapter } = controlledRuntime({
+      events: [
+        { type: "tool_start", callId: "t1", name: "noop" },
+        { type: "tool_end", callId: "t1" },
+        { type: "text_delta", text: "끝" },
+      ],
+    });
+    const { mom, conversation, send, waitRun } = await start({ adapter });
+    const c = conversation();
+    await waitRun((await send(c.id, "x")).json().run.id);
+    const r = await mom.get(`/api/conversations/${c.id}/messages`);
+    expect(r.statusCode).toBe(200);
+    expect(r.json().items.at(-1).parts.slice(0, 2)).toEqual([
+      { type: "tool_call", id: "t1", name: "noop", input: null },
+      { type: "tool_result", callId: "t1", output: null },
+    ]);
+  });
+
+  it("closes a session that finished opening after its conversation was deleted", async () => {
+    const { adapter, stats } = controlledRuntime({ startDelayMs: 150 });
+    const { app, conversation, send } = await start({ adapter });
+    const c = conversation();
+    await send(c.id, "x");
+    await new Promise((r) => setTimeout(r, 30));
+    app.conversations!.delete(c.id);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(stats.opened).toBe(1);
+    expect(stats.closes).toBe(1);
+    expect(app.runs!.liveCount()).toBe(0);
+  });
+
+  it("a hanging interrupt blocks neither the request nor shutdown", async () => {
+    const { adapter, stats } = controlledRuntime({ interruptHangs: true, endless: true });
+    const { app, mom, conversation, send, waitRun } = await start({ adapter, graceMs: 100 });
+    const run = (await send(conversation().id, "x")).json().run as Run;
+    for (let i = 0; i < 100 && stats.opened === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    const t0 = Date.now();
+    expect((await mom.post(`/api/runs/${run.id}/interrupt`)).statusCode).toBe(200);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect((await waitRun(run.id)).status).toBe("interrupted");
+    // Another run that hangs, then shutdown.
+    const run2 = (await send(conversation().id, "y")).json().run as Run;
+    for (let i = 0; i < 100 && stats.opened < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    const t1 = Date.now();
+    await app.runs!.shutdown();
+    expect(Date.now() - t1).toBeLessThan(2500);
+    expect(stats.closes).toBe(2);
+    void run2;
+  });
+
+  it("shutdown ends open event streams", async () => {
+    const { app, conversation, send, stream } = await start({
+      script: () => Array.from({ length: 300 }, (_, i) => [{ text: `${i} ` }, { delayMs: 10 }]).flat(),
+    });
+    const run = (await send(conversation().id, "x")).json().run as Run;
+    const s = await stream(run.id);
+    await s.read((fr) => fr.filter((x) => x.data).length >= 2);
+    await app.runs!.shutdown();
+    expect((await s.read()).ended).toBe(true);
+  });
+
+  it("closes a session exactly once when shutdown and delete overlap", async () => {
+    const { adapter, stats } = controlledRuntime({ interruptHangs: true, endless: true });
+    const { app, conversation, send } = await start({ adapter });
+    const c = conversation();
+    await send(c.id, "x");
+    for (let i = 0; i < 100 && stats.opened === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    const down = app.runs!.shutdown();
+    app.conversations!.delete(c.id);
+    await down;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(stats.closes).toBe(1);
+  });
+});

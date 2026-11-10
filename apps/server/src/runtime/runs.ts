@@ -21,7 +21,25 @@ type Live = {
   /** Ended (finished, force-stopped or its conversation deleted): later runtime events are ignored. */
   settled: boolean;
   graceTimer?: NodeJS.Timeout;
+  /** Set once the session is being closed, so it is closed exactly once whoever ends the run. */
+  closing?: Promise<void>;
 };
+
+/** Closes the run's session once (later calls share the first close) and never waits for longer than `ms`. */
+function closeSession(live: Live, ms = 2000): Promise<void> {
+  if (!live.session) return Promise.resolve();
+  live.closing ??= live.session.close().catch(() => {});
+  return Promise.race([live.closing, new Promise<void>((r) => setTimeout(r, ms).unref())]);
+}
+
+/** Asks the runtime to stop without waiting for it (an adapter's interrupt may never return). */
+function fireInterrupt(live: Live): void {
+  try {
+    void live.turn?.interrupt().catch(() => {});
+  } catch {
+    // synchronous throw from the adapter: the grace timer / settle path ends the run anyway
+  }
+}
 
 export const EVENT_RETENTION_MS = 3600_000;
 export const DEFAULT_RUNTIME: RuntimeId = "claude-code";
@@ -232,11 +250,8 @@ export class RunManager {
         this.opts.interruptGraceMs ?? 3000,
       );
       live.graceTimer.unref();
-      try {
-        await live.turn?.interrupt();
-      } catch {
-        // The grace timer ends the run anyway.
-      }
+      // Not awaited: the request returns at once; the grace timer ends the run if the runtime never stops.
+      fireInterrupt(live);
     } else if (!live) {
       const r = this.get(id);
       if (r && (r.status === "queued" || r.status === "running")) this.finish(r, "interrupted", null);
@@ -276,17 +291,20 @@ export class RunManager {
     return this.live.size;
   }
 
-  /** On shutdown: stop runtimes and release their sessions (the runs are failed by `recover()` on restart). */
+  /**
+   * On shutdown (preClose): ends every open event stream, stops runtimes and releases their sessions without
+   * waiting on a runtime that hangs. The runs themselves are failed by `recover()` on the next start.
+   */
   async shutdown(): Promise<void> {
-    await Promise.all(
-      [...this.live.values()].map(async (live) => {
-        clearTimeout(live.graceTimer);
-        live.settled = true;
-        await live.turn?.interrupt().catch(() => {});
-        await live.session?.close().catch(() => {});
-      }),
-    );
+    const lives = [...this.live.values()];
     this.live.clear();
+    for (const live of lives) {
+      clearTimeout(live.graceTimer);
+      live.settled = true;
+      fireInterrupt(live);
+      live.emitter.emit("end"); // closes the SSE streams following these runs
+    }
+    await Promise.all(lives.map((live) => closeSession(live)));
   }
 
   /** True when the run ended long enough ago that its events were purged. */
@@ -335,15 +353,15 @@ export class RunManager {
     if (!row) return this.drop(runId, live);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
     this.finish(row, status, code);
-    void live.session?.close().catch(() => {});
+    void closeSession(live);
   }
 
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
   private drop(runId: string, live: Live): void {
     live.settled = true;
     clearTimeout(live.graceTimer);
-    void live.turn?.interrupt().catch(() => {});
-    void live.session?.close().catch(() => {});
+    fireInterrupt(live);
+    void closeSession(live);
     this.live.delete(runId);
     live.emitter.emit("end");
   }
@@ -402,14 +420,20 @@ export class RunManager {
       }
     }
     const session = await adapter.start(ctx);
-    const row = this.conversations.saveSession({
-      conversationId: run.conversationId,
-      runtime: run.runtime,
-      externalSessionId: session.externalSessionId,
-      lastMessageId: lastSeen,
-      conversationRevision: conv.revision,
-    });
-    return { session, sessionRowId: row.id, revision: conv.revision };
+    try {
+      // The history may have changed (edit, delete) while the session was opening: then this fails.
+      const row = this.conversations.saveSession({
+        conversationId: run.conversationId,
+        runtime: run.runtime,
+        externalSessionId: session.externalSessionId,
+        lastMessageId: lastSeen,
+        conversationRevision: conv.revision,
+      });
+      return { session, sessionRowId: row.id, revision: conv.revision };
+    } catch (e) {
+      await session.close().catch(() => {});
+      throw e;
+    }
   }
 
   private async execute(runId: string): Promise<void> {
@@ -455,7 +479,7 @@ export class RunManager {
       );
       live.session = session;
       // Interrupted or deleted while the session was opening.
-      if (live.settled) return void session.close().catch(() => {});
+      if (live.settled) return void closeSession(live);
       if (live.interruptRequested) return this.settle(runId, "interrupted", null);
       const turn = session.turn({ text: inputText ?? "", model: run.model, effort: run.effort ?? undefined });
       live.turn = turn;
@@ -468,19 +492,17 @@ export class RunManager {
         } else if (ev.type === "reasoning_delta") {
           appendText("reasoning", ev.text); // stored, never streamed
         } else if (ev.type === "tool_start") {
-          parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input: ev.input });
-          this.emit(runId, {
-            type: "tool_start",
-            messageId,
-            callId: ev.callId,
-            name: ev.name,
-            input: ev.input,
-          });
+          // Missing input/output become null: JSON would drop an undefined key and the stored part would no
+          // longer match the schema.
+          const input = ev.input ?? null;
+          parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input });
+          this.emit(runId, { type: "tool_start", messageId, callId: ev.callId, name: ev.name, input });
           flush(true);
         } else if (ev.type === "tool_end") {
           const extra = ev.isError ? { isError: true } : {};
-          parts.push({ type: "tool_result", callId: ev.callId, output: ev.output, ...extra });
-          this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output: ev.output, ...extra });
+          const output = ev.output ?? null;
+          parts.push({ type: "tool_result", callId: ev.callId, output, ...extra });
+          this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
           flush(true);
         } else if (ev.type === "usage") {
           this.emit(runId, {
