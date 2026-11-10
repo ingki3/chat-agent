@@ -809,3 +809,43 @@ describe("runs: robustness, round 4 (review #74)", () => {
       expect(app.runs!.liveCount()).toBe(0);
     });
 });
+
+describe("runs: MCP call tokens (#42)", () => {
+  it("each run gets a token scoped to its user and conversation, revoked when the run ends", async () => {
+    let seen: string | undefined;
+    let duringRun: unknown;
+    const tokensRef: { tokens?: { verify: (t: string | undefined) => unknown } } = {};
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async (ctx) => {
+        seen = ctx.mcpToken;
+        duringRun = tokensRef.tokens?.verify(ctx.mcpToken);
+        return {
+          externalSessionId: "m",
+          setModel: async () => {},
+          close: async () => {},
+          turn: () => ({
+            events: (async function* (): AsyncGenerator<RuntimeEvent> {
+              yield { type: "text_delta", text: "ok" };
+            })(),
+            interrupt: async () => {},
+          }),
+        };
+      },
+    };
+    const { app, f, conversation, send, waitRun } = await start({ adapter });
+    tokensRef.tokens = app.runs!.mcpTokens;
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    await waitRun(run.id);
+    expect(seen).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(duringRun).toMatchObject({ userId: f.users.owner.id, conversationId: c.id, runId: run.id });
+    expect(app.runs!.mcpTokens.verify(seen)).toBeUndefined();
+  });
+});
