@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { canonicalPath } from "../fs-safety.js";
+import { findHardLinks } from "./paths.js";
 
 /**
  * Process isolation for runtime CLIs and skills (#42, PRD D5). On macOS every child runs under `sandbox-exec`
@@ -17,10 +18,10 @@ export type SandboxPolicy = {
   /** "none" (default), "all", or outbound TCP to these loopback ports only (e.g. our MCP server). */
   network?: "none" | "all" | { loopbackPorts: number[] };
   /**
-   * Whether the process may create child processes. Off by default: a single process cannot escape the limits.
-   * When on (runtime CLIs that start our MCP server), descendants are tracked and killed with it.
+   * Read-only program folders (e.g. a runtime's install directory) that are not scanned for hard links.
+   * Never put family data here.
    */
-  allowFork?: boolean;
+  trusted?: string[];
 };
 
 export type RunIsolatedOptions = SandboxPolicy & {
@@ -32,11 +33,11 @@ export type RunIsolatedOptions = SandboxPolicy & {
   timeoutMs: number;
   /** stdout + stderr beyond this are dropped and the process is killed. */
   maxOutputBytes: number;
-  /** Resident memory limit for the process and all its descendants (checked every 250 ms). */
+  /** Resident memory limit (checked every 250 ms; killed above it, and also when it cannot be measured). */
   maxRssBytes?: number;
   stdin?: string;
-  /** Tests only: replaces the `ps` snapshot used by the monitor. */
-  probe?: () => Promise<{ pid: number; ppid: number; pgid: number; rss: number }[]>;
+  /** Tests only: replaces the `ps` measurement used by the monitor. */
+  probe?: () => Promise<{ pid: number; rss: number }[]>;
 };
 
 export type RunResult = {
@@ -60,11 +61,15 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
     "(deny default)",
     // OS libraries, dyld cache, locale data etc. — what any process needs to start.
     '(import "system.sb")',
-    ...(policy.allowFork ? ["(allow process-fork)"] : []),
+    // No process-fork: a sandboxed process cannot start children, so nothing can outlive it or escape its limits
+    // (process groups and polling cannot guarantee that). Our MCP servers run in the server, reached over a
+    // loopback port, so runtimes do not need to fork for them.
     "(allow signal (target same-sandbox))",
     `(allow process-exec ${exec.map((p) => `(literal ${lit(p)})`).join(" ")})`,
     ...exec.map((p) => `(allow file-read* (literal ${lit(p)}))`),
-    ...read.map((p) => `(allow file-read* (subpath ${lit(p)}))`),
+    ...[...read, ...(policy.trusted ?? []).map(canonicalPath)].map(
+      (p) => `(allow file-read* (subpath ${lit(p)}))`,
+    ),
     ...write.map((p) => `(allow file-read* file-write* (subpath ${lit(p)}))`),
   ];
   const net = policy.network ?? "none";
@@ -83,12 +88,12 @@ export class SandboxUnavailableError extends Error {
   }
 }
 
-export type Proc = { pid: number; ppid: number; pgid: number; rss: number };
+export type Proc = { pid: number; rss: number };
 
-/** One `ps` snapshot. Rejects when ps fails, times out or prints nothing usable. */
-export function snapshot(timeoutMs = 2000): Promise<Proc[]> {
+/** Resident memory (KiB) of one process via `ps`. Rejects when ps fails, times out or prints nothing usable. */
+export function snapshot(pid: number, timeoutMs = 2000): Promise<Proc[]> {
   return new Promise((resolve, reject) => {
-    const ps = spawn("/bin/ps", ["-A", "-o", "pid=,ppid=,pgid=,rss="], { env: {} });
+    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", "-p", String(pid)], { env: {} });
     let out = "";
     const timer = setTimeout(() => {
       ps.kill("SIGKILL");
@@ -99,38 +104,34 @@ export function snapshot(timeoutMs = 2000): Promise<Proc[]> {
       clearTimeout(timer);
       reject(e);
     });
-    ps.on("close", (code) => {
+    ps.on("close", () => {
       clearTimeout(timer);
       const procs = out
         .split("\n")
         .map((l) => l.trim().split(/\s+/).map(Number))
-        .filter((f) => f.length === 4 && f.every(Number.isFinite))
-        .map(([pid, ppid, pgid, rss]) => ({ pid: pid!, ppid: ppid!, pgid: pgid!, rss: rss! }));
-      if (code !== 0 || !procs.length) reject(new Error("ps failed"));
-      else resolve(procs);
+        .filter((f) => f.length === 2 && f.every(Number.isFinite))
+        .map(([p, rss]) => ({ pid: p!, rss: rss! }));
+      // ps exits non-zero once the process is gone; that is not a measuring failure.
+      resolve(procs);
     });
   });
 }
 
-/** The process and everything that descends from it — by parent links, so leaving the process group does not help. */
-export function descendants(root: number, procs: Proc[], known: Set<number>): Set<number> {
-  const set = new Set<number>([root, ...known].filter((pid) => procs.some((p) => p.pid === pid)));
-  for (const p of procs) if (p.pgid === root) set.add(p.pid);
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const p of procs)
-      if (!set.has(p.pid) && set.has(p.ppid)) {
-        set.add(p.pid);
-        grew = true;
-      }
+export class HardLinkError extends Error {
+  constructor(readonly files: string[]) {
+    super(`refusing to run: ${files.length} hard-linked file(s) in the allowed folders`);
   }
-  return set;
 }
 
-/** Runs a command inside the sandbox with time, output and memory limits. Fails closed off macOS. */
+/**
+ * Runs a command inside the sandbox with time, output and memory limits. Fails closed off macOS, and when an
+ * allowed (non-trusted) folder holds a hard-linked file — the sandbox decides by path and could not tell it
+ * from another family member's file.
+ */
 export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
   if (process.platform !== "darwin") return Promise.reject(new SandboxUnavailableError());
+  const linked = [...o.read, ...o.write].flatMap((p) => findHardLinks(canonicalPath(p)));
+  if (linked.length) return Promise.reject(new HardLinkError(linked));
   const profile = buildProfile(o);
   return new Promise((resolve, reject) => {
     const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, o.command, ...o.args], {
@@ -139,31 +140,21 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       detached: true, // own process group
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const root = child.pid!;
+    // sandbox-exec execs the command in place, and the profile forbids fork: this pid is the whole job.
+    const pid = child.pid!;
     let out = "";
     let err = "";
     let bytes = 0;
     let killed: RunResult["killed"] = null;
-    /** Every descendant seen so far — killed with the process even if it left the group or was orphaned. */
-    const known = new Set<number>([root]);
-
-    const killAll = () => {
-      try {
-        process.kill(-root, "SIGKILL");
-      } catch {
-        // group already gone
-      }
-      for (const pid of known)
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // already gone
-        }
-    };
+    let exited = false;
     const kill = (why: NonNullable<RunResult["killed"]>) => {
-      if (killed) return;
+      if (killed || exited) return;
       killed = why;
-      killAll();
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
     };
     const take = (target: "out" | "err") => (chunk: Buffer) => {
       bytes += chunk.length;
@@ -179,49 +170,37 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
 
     let sampling = false;
     const sample = async () => {
-      if (sampling || killed) return;
+      if (sampling || killed || exited) return;
       sampling = true;
       try {
-        const procs = await (o.probe ?? snapshot)();
-        const tree = descendants(root, procs, known);
-        for (const pid of tree) known.add(pid);
-        const kb = procs.filter((p) => tree.has(p.pid)).reduce((a, p) => a + p.rss, 0);
-        if (o.maxRssBytes && kb * 1024 > o.maxRssBytes) kill("memory");
+        const procs = await (o.probe ?? (() => snapshot(pid)))();
+        const me = procs.find((p) => p.pid === pid);
+        if (!me) {
+          if (!exited) kill("monitor"); // running but not measurable → cannot enforce → stop
+        } else if (me.rss * 1024 > o.maxRssBytes!) kill("memory");
       } catch {
-        kill("monitor"); // cannot measure → cannot enforce → stop
+        kill("monitor");
       } finally {
         sampling = false;
       }
     };
-    const monitor = o.maxRssBytes || o.allowFork ? setInterval(() => void sample(), 250) : undefined;
+    const monitor = o.maxRssBytes ? setInterval(() => void sample(), 250) : undefined;
 
-    // When the process exits, nothing may outlive it: find any remaining descendants and kill them all.
-    // (Their kill also closes pipes they kept open, so "close" — and the result — can follow.)
-    let exit: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
-    child.on("exit", (code, signal) => {
-      exit = { code, signal };
+    child.on("exit", () => {
+      exited = true;
       clearTimeout(timer);
       clearInterval(monitor);
-      void (async () => {
-        if (o.allowFork) {
-          try {
-            for (const pid of descendants(root, await snapshot(), known)) known.add(pid);
-          } catch {
-            // best effort; everything already known is still killed
-          }
-        }
-        killAll();
-      })();
     });
     child.on("error", (e) => {
       clearTimeout(timer);
       clearInterval(monitor);
       reject(e);
     });
-    child.on("close", () => resolve({ ...exit, stdout: out, stderr: err, killed }));
+    child.on("close", (code, signal) => resolve({ code, signal, stdout: out, stderr: err, killed }));
     child.stdin.end(o.stdin ?? "");
   });
 }
+
 /** Builds a child environment from an allow-list of the server's variables plus explicit values. */
 export function allowEnv(
   names: readonly string[],

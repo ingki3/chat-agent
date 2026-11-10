@@ -578,6 +578,40 @@ describe("runs: robustness (review #74)", () => {
     expect(app.runs!.liveCount()).toBe(0);
   });
 
+  it("revokes MCP tokens of running runs on shutdown", async () => {
+    let token: string | undefined;
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async (ctx) => {
+        token = ctx.mcpToken;
+        return {
+          externalSessionId: "t",
+          setModel: async () => {},
+          close: async () => {},
+          turn: () => ({
+            events: (async function* (): AsyncGenerator<RuntimeEvent> {
+              yield* [] as RuntimeEvent[];
+              await new Promise(() => {});
+            })(),
+            interrupt: async () => {},
+          }),
+        };
+      },
+    };
+    const { app, conversation, send } = await start({ adapter });
+    await send(conversation().id, "x");
+    for (let i = 0; i < 100 && !token; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(app.runs!.mcpTokens.verify(token)).toBeDefined();
+    await app.runs!.shutdown();
+    expect(app.runs!.mcpTokens.verify(token)).toBeUndefined();
+  });
+
   it("closes running sessions on shutdown", async () => {
     const { app, fake, conversation, send } = await start({ script: () => [{ delayMs: 5000 }] });
     await send(conversation().id, "x");

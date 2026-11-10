@@ -9,7 +9,7 @@ import { BlockedRequestError, isBlockedAddress, safeFetch } from "../src/isolati
 import {
   allowEnv,
   buildProfile,
-  descendants,
+  HardLinkError,
   runIsolated,
   SandboxUnavailableError,
 } from "../src/isolation/sandbox.js";
@@ -68,18 +68,19 @@ describe("path checks", () => {
 
 const darwin = process.platform === "darwin";
 
-describe("descendant tracking", () => {
-  it("follows parent links across process groups and remembers orphans", () => {
-    const procs = [
-      { pid: 100, ppid: 1, pgid: 100, rss: 1 }, // the sandboxed process
-      { pid: 101, ppid: 100, pgid: 100, rss: 1 }, // child in the same group
-      { pid: 102, ppid: 101, pgid: 102, rss: 1 }, // grandchild that called setsid
-      { pid: 103, ppid: 102, pgid: 102, rss: 1 }, // its child
-      { pid: 200, ppid: 1, pgid: 200, rss: 1 }, // unrelated
-      { pid: 104, ppid: 1, pgid: 104, rss: 1 }, // orphan we saw before (re-parented to launchd)
-    ];
-    expect([...descendants(100, procs, new Set([104]))].sort()).toEqual([100, 101, 102, 103, 104]);
-    expect([...descendants(100, procs, new Set())].sort()).toEqual([100, 101, 102, 103]);
+describe.skipIf(process.platform !== "darwin")("safe open", () => {
+  it("refuses to follow a parent folder swapped for a symlink after the check", async () => {
+    const t = familyTree();
+    const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-other-")));
+    fs.mkdirSync(path.join(t.son, "sub"));
+    fs.writeFileSync(path.join(t.son, "sub", "f.txt"), "mine");
+    fs.writeFileSync(path.join(other, "f.txt"), "OTHER-SECRET");
+    await expect(
+      openInside("sub/f.txt", [t.son], "r", () => {
+        fs.renameSync(path.join(t.son, "sub"), path.join(t.son, "sub.old"));
+        fs.symlinkSync(other, path.join(t.son, "sub"));
+      }),
+    ).rejects.toBeInstanceOf(PathDeniedError);
   });
 });
 
@@ -245,7 +246,8 @@ describe.skipIf(!darwin)("process sandbox (macOS sandbox-exec)", () => {
         ],
         cwd: t.son,
         env: {},
-        read: [nodeHome],
+        read: [],
+        trusted: [nodeHome],
         write: [],
         network,
         timeoutMs: 6000,
@@ -276,36 +278,40 @@ describe.skipIf(!darwin)("process sandbox (macOS sandbox-exec)", () => {
     expect(fs.existsSync(path.join(t.son, "out", "steal.txt"))).toBe(false);
   });
 
-  it("forks only when allowed, and kills descendants that left the process group when the parent exits", async () => {
+  it("cannot start child processes at all (so nothing can outlive it or escape its limits)", async () => {
     const node = fs.realpathSync(process.execPath);
     const nodeHome = path.dirname(path.dirname(node));
-    // The parent starts a detached grandchild (its own session and group), prints its pid and exits.
-    const script = `const c=require("child_process").spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"ignore"});c.unref();process.stdout.write(String(c.pid));setTimeout(()=>process.exit(0),300)`;
-    const run = (allowFork: boolean) =>
+    const script = `try{const c=require("child_process").spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"ignore"});c.on("error",e=>{process.stdout.write("ERR "+e.code);process.exit(0)});c.on("spawn",()=>{process.stdout.write("SPAWNED "+c.pid);process.exit(0)})}catch(e){process.stdout.write("ERR "+e.code)}`;
+    const r = await runIsolated({
+      command: node,
+      args: ["-e", script],
+      cwd: t.son,
+      env: {},
+      read: [],
+      trusted: [nodeHome],
+      write: [],
+      timeoutMs: 8000,
+      maxOutputBytes: 10_000,
+    });
+    expect(r.stdout).toMatch(/^ERR/);
+    expect(r.stdout).not.toMatch(/SPAWNED/);
+  });
+
+  it("refuses to run while an allowed folder holds a hard-linked file", async () => {
+    const t2 = familyTree();
+    fs.linkSync(path.join(t2.mom, "diary.txt"), path.join(t2.son, "hard.txt"));
+    await expect(
       runIsolated({
-        command: node,
-        args: ["-e", script],
-        cwd: t.son,
+        command: "/bin/cat",
+        args: [path.join(t2.son, "hard.txt")],
+        cwd: t2.son,
         env: {},
-        read: [nodeHome],
+        read: [t2.son],
         write: [],
-        allowFork,
-        timeoutMs: 8000,
-        maxOutputBytes: 10_000,
-      });
-    const denied = await run(false);
-    expect(denied.code).not.toBe(0);
-    const r = await run(true);
-    const pid = Number(r.stdout);
-    expect(pid).toBeGreaterThan(0);
-    await new Promise((res) => setTimeout(res, 200));
-    let alive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      alive = false;
-    }
-    expect(alive).toBe(false);
+        timeoutMs: 5000,
+        maxOutputBytes: 1000,
+      }),
+    ).rejects.toBeInstanceOf(HardLinkError);
   });
 
   it("a child that exits before reading its input does not crash the server", async () => {

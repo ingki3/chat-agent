@@ -327,8 +327,10 @@ export class RunManager {
    */
   async shutdown(): Promise<void> {
     this.stopping = true;
-    const lives = [...this.live.values()];
+    const entries = [...this.live.entries()];
+    const lives = entries.map(([, l]) => l);
     this.live.clear();
+    for (const [id] of entries) this.mcpTokens.revokeRun(id); // runtimes must not call our tools any more
     for (const live of lives) {
       clearTimeout(live.graceTimer);
       live.settled = true;
