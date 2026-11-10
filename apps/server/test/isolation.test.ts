@@ -84,6 +84,43 @@ describe.skipIf(process.platform !== "darwin")("safe open", () => {
   });
 });
 
+describe.skipIf(process.platform !== "darwin")("safe open: special files", () => {
+  it("refuses a FIFO without blocking the server's file I/O", async () => {
+    const t = familyTree();
+    const { execFileSync } = await import("node:child_process");
+    for (let i = 0; i < 6; i++) execFileSync("/usr/bin/mkfifo", [path.join(t.son, `pipe${i}`)]);
+    const t0 = Date.now();
+    const results = await Promise.allSettled(
+      Array.from({ length: 6 }, (_, i) => openInside(`pipe${i}`, [t.son])),
+    );
+    expect(results.every((r) => r.status === "rejected" && r.reason instanceof PathDeniedError)).toBe(true);
+    // Other file I/O still runs (the worker pool was never stuck).
+    await fs.promises.stat(t.son);
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+});
+
+describe("the server never creates hard links", () => {
+  // Hard links into family folders could otherwise appear while a sandboxed process runs. Sandboxed processes
+  // cannot link to outside files (kernel-checked, see the sandbox tests); this keeps the server from doing it.
+  // fs.link / fs.promises.link / linkSync calls, or `link` imported from node:fs.
+  const LINK_CALL =
+    /\b(?:fs|fsp|promises)\.link(?:Sync)?\s*\(|\blinkSync\s*\(|import\s*\{[^}]*\blink\b[^}]*\}\s*from\s*["'](?:node:)?fs/;
+  it("has no link()/linkSync() in its source", () => {
+    const src = path.join(__dirname, "..", "src");
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (/\.ts$/.test(e.name) && LINK_CALL.test(fs.readFileSync(full, "utf8"))) hits.push(full);
+      }
+    };
+    walk(src);
+    expect(hits).toEqual([]);
+  });
+});
+
 describe("hard links", () => {
   it("refuses a hard link to another family member's file, for checks, reads and writes", async () => {
     const t = familyTree();

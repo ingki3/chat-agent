@@ -69,7 +69,8 @@ export async function openInside(
 ): Promise<fs.promises.FileHandle> {
   if (process.platform !== "darwin") throw new UnsupportedPlatformError();
   const full = resolveInside(candidate, roots);
-  const noFollow = O_NOFOLLOW_ANY;
+  // O_NONBLOCK: a FIFO or device must not block a libuv worker before the descriptor check below rejects it.
+  const noFollow = O_NOFOLLOW_ANY | fs.constants.O_NONBLOCK;
   const mode = {
     r: fs.constants.O_RDONLY,
     "r+": fs.constants.O_RDWR,
