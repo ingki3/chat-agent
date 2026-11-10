@@ -65,8 +65,9 @@ export function installRouteRules(app: FastifyInstance): ResourceRegistry {
   app.decorateRequest("resource", undefined);
 
   app.addHook("onRoute", (route) => {
-    if (!needsDeclaration(route.url)) return;
     const cfg = route.config ?? {};
+    // A declared resource is validated and listed wherever it appears, even on a route that needs no declaration.
+    if (!cfg.resource && !needsDeclaration(route.url)) return;
     if (cfg.resource && cfg.noResource)
       throw new Error(`${route.url}: declare resource or noResource, not both`);
     if (!cfg.resource && !cfg.noResource?.trim())
@@ -120,12 +121,17 @@ export function watchAccess(
   users: UserStore | undefined = app.users,
 ): () => void {
   const userId = req.ctx.user?.id;
-  const rule = req.routeOptions.config?.resource;
+  const token = req.ctx.sessionToken;
+  const cfg = req.routeOptions.config ?? {};
+  const rule = cfg.resource;
   const ref = req.resource;
   let done = false;
+  // The same conditions the request passed: the session still exists (not logged out or revoked by a password
+  // change), the account is active and needs no password change, the route's role rule, then the resource.
   const stillAllowed = () => {
-    const user = userId ? users?.byId(userId) : undefined;
-    if (!user?.active) return false;
+    const user = token ? users?.sessionUser(token) : undefined;
+    if (!user || user.id !== userId || !user.active || user.mustChangePassword) return false;
+    if (cfg.auth === "admin" && user.role !== "admin") return false;
     if (!rule || !ref) return true;
     const fresh = app.resources.load(ref.kind, ref.id);
     return !!fresh && can(user, rule.action, fresh);

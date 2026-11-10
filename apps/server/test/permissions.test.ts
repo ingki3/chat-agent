@@ -50,6 +50,20 @@ async function withNotes() {
     n: 1,
   }));
   app.get(
+    "/download",
+    { config: { resource: { ...note, action: "read", from: "query" } } },
+    async () => "file",
+  );
+  app.get(
+    "/api/test/admin-stream",
+    { config: { auth: "admin", noResource: "admin-only feed" } },
+    async (req, reply) => {
+      const stream = openSse(reply, { heartbeatMs: 1000 });
+      stream.onClose(watchAccess(app, req, () => (stream.send("revoked", {}), stream.close())));
+      stream.send("ready", {});
+    },
+  );
+  app.get(
     "/api/test/note-by-query",
     { config: { resource: { ...note, action: "read", from: "query" } } },
     async () => ({}),
@@ -120,6 +134,10 @@ describe("resource routes", () => {
       // Real delete: without a fresh fixture per caller, everyone after the owner would get 404.
       { route: "DELETE /api/test/notes/:id", expect: OWNER_ONLY, fixture: () => create() },
       { route: "GET /api/test/notes/:id/usage", expect: USAGE, fixture: () => create() },
+      // Ids from the query string and the body, and a fixed non-API path.
+      { route: "GET /api/test/note-by-query", expect: READ, fixture: () => create() },
+      { route: "POST /api/test/note-by-body", expect: READ, fixture: () => create() },
+      { route: "GET /download", expect: READ, fixture: () => create() },
       // Not shared: the shared user is a stranger to it.
       {
         route: "GET /api/test/notes/:id",
@@ -205,7 +223,7 @@ describe("resource routes", () => {
 
 describe("open streams re-check access", () => {
   async function openStream(app: App, cookie: string, path: string) {
-    await app.listen({ host: "127.0.0.1", port: 0 });
+    if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
     const port = (app.server.address() as AddressInfo).port;
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       headers: { cookie, host: "localhost:3000" },
@@ -266,6 +284,21 @@ describe("open streams re-check access", () => {
     const end = await s.rest();
     expect(end.text.match(/event: revoked/g)).toHaveLength(1);
     expect(end.ended).toBe(true);
+  });
+
+  it("closes the stream when its session ends (password change elsewhere) or the admin is demoted", async () => {
+    const { app, f, create } = await withNotes();
+    const id = create();
+    const s1 = await openStream(app, f.cookies.shared, `/api/test/notes/${id}/stream`);
+    await s1.until(/event: ready/);
+    // A password change revokes the user's sessions (the one holding the stream included).
+    app.users!.setPassword(f.users.shared.id, f.users.shared.passwordHash!);
+    expect((await s1.rest()).text).toMatch(/event: revoked/);
+
+    const s2 = await openStream(app, f.cookies.admin, "/api/test/admin-stream");
+    await s2.until(/event: ready/);
+    app.users!.setRole(f.users.admin.id, "member");
+    expect((await s2.rest()).text).toMatch(/event: revoked/);
   });
 
   it("closes a non-resource stream when its user is deactivated", async () => {

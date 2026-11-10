@@ -80,17 +80,33 @@ export async function runMatrix(f: Family, rows: MatrixRow[]): Promise<string[]>
   for (const row of rows) {
     const [method, pattern] = row.route.split(" ") as [string, string];
     const safe = method === "GET" || method === "HEAD";
-    const send = (who: Who, id: string) =>
-      f.app.inject({
+    // Put the id where the route's declaration says it is read from.
+    const rule = f.app.resources.routes.find((r) => `${r.method} ${r.url}` === row.route)?.rule;
+    if (!rule) {
+      failures.push(`${row.route}: no route declared with config.resource`);
+      continue;
+    }
+    const param = rule.param ?? "id";
+    const send = (who: Who, id: string) => {
+      const from = rule.from ?? "params";
+      const url =
+        from === "params"
+          ? pattern.replace(param === "*" ? "*" : `:${param}`, param === "*" ? id : encodeURIComponent(id))
+          : from === "query"
+            ? `${pattern}${pattern.includes("?") ? "&" : "?"}${encodeURIComponent(param)}=${encodeURIComponent(id)}`
+            : pattern;
+      const body = from === "body" ? { ...((row.body as object) ?? {}), [param]: id } : (row.body ?? {});
+      return f.app.inject({
         method: method as "GET",
-        url: pattern.replace(/:id\b/, encodeURIComponent(id)),
+        url,
         headers: {
           ...LOCAL,
           ...(who === "anon" ? {} : { cookie: f.cookies[who] }),
           ...(safe ? {} : { origin: "http://localhost:3000", [CSRF_HEADER]: "1" }),
         },
-        ...(safe ? {} : { payload: (row.body ?? {}) as object }),
+        ...(safe ? {} : { payload: body as object }),
       });
+    };
     for (const who of Object.keys(row.expect) as Who[]) {
       const got = (await send(who, await row.fixture(f))).statusCode;
       if (got !== row.expect[who])
