@@ -91,6 +91,10 @@ export function registerRunRoutes(
       if (runs.eventsExpired(run)) return reply.code(410).send({ error: "events_expired" });
 
       const stream = openSse(reply, opts.heartbeatMs === undefined ? {} : { heartbeatMs: opts.heartbeatMs });
+      // Access first: it may have been revoked since the request was checked. Nothing is replayed if so.
+      const stopWatching = watchAccess(app, req, () => stream.close());
+      stream.onClose(stopWatching);
+      if (stream.closed) return;
       let sent = after;
       const send = (seq: number, data: { type: string }) => {
         if (seq <= sent) return; // replay and live overlap: never twice
@@ -108,11 +112,7 @@ export function registerRunRoutes(
       for (const e of runs.eventsAfter(run.id, after)) send(e.seq, e.data);
       replaying = false;
       for (const [seq, e] of buffered) send(seq, e);
-      const stopWatching = watchAccess(app, req, () => stream.close());
-      stream.onClose(() => {
-        unsubscribe?.();
-        stopWatching();
-      });
+      stream.onClose(() => unsubscribe?.());
       // Already over (or ended during the replay): nothing more will come.
       if (!unsubscribe || runs.get(run.id)!.endedAt !== null) stream.close();
     },

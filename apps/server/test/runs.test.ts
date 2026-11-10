@@ -5,7 +5,12 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { runs as runsTable } from "../src/db/schema.js";
-import { RuntimeRegistry } from "../src/runtime/adapter.js";
+import {
+  RuntimeRegistry,
+  type RuntimeAdapter,
+  type RuntimeEvent,
+  type RuntimeSession,
+} from "../src/runtime/adapter.js";
 import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
 import { EVENT_RETENTION_MS, RunManager } from "../src/runtime/runs.js";
 import { createFamily } from "./helpers/permission-matrix.js";
@@ -26,20 +31,35 @@ runtimeContract("FakeRuntime", () => new FakeRuntime(), {
 });
 
 let clock = 0;
-async function start(opts: { script?: FakeScript; heartbeatMs?: number; noRuntime?: boolean } = {}) {
+async function start(
+  opts: {
+    script?: FakeScript;
+    heartbeatMs?: number;
+    noRuntime?: boolean;
+    adapter?: RuntimeAdapter;
+    canResume?: boolean;
+    graceMs?: number;
+    beforeListen?: (app: App) => void;
+  } = {},
+) {
   const db = createTestDb();
   const runtimes = new RuntimeRegistry();
-  const fake = new FakeRuntime(opts.script ? { script: opts.script } : {});
-  if (!opts.noRuntime) runtimes.register(fake);
+  const fake = new FakeRuntime({
+    ...(opts.script ? { script: opts.script } : {}),
+    ...(opts.canResume === undefined ? {} : { canResume: opts.canResume }),
+  });
+  if (opts.adapter) runtimes.register(opts.adapter);
+  else if (!opts.noRuntime) runtimes.register(fake);
   clock = Date.now();
   const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
     db,
     logger: false,
     runtimes,
-    runs: { flushMs: 0 },
+    runs: { flushMs: 0, interruptGraceMs: opts.graceMs ?? 3000 },
     sse: { heartbeatMs: opts.heartbeatMs ?? 1000 },
   });
   apps.push(app);
+  opts.beforeListen?.(app);
   const f = await createFamily(app);
   await app.listen({ host: "127.0.0.1", port: 0 });
   const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
@@ -422,3 +442,155 @@ describe("runs: sessions, permissions, restart, retention", () => {
 function app_last(res: { json: () => { items: Message[] } }): Message {
   return res.json().items.at(-1)!;
 }
+
+/** A runtime that hangs: its turn never ends and interrupt() does nothing (or its session never opens). */
+function stuckRuntime(mode: "turn" | "start"): RuntimeAdapter {
+  const session: RuntimeSession = {
+    externalSessionId: "stuck",
+    setModel: async () => {},
+    close: async () => {},
+    turn: () => ({
+      events: (async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { type: "text_delta", text: "부분 " };
+        yield { type: "text_delta", text: "응답" };
+        await new Promise(() => {}); // never ends
+      })(),
+      interrupt: async () => {
+        throw new Error("cannot interrupt");
+      },
+    }),
+  };
+  return {
+    id: "claude-code",
+    capabilities: () => ({
+      models: [{ id: "stuck", label: "Stuck", efforts: [] }],
+      canSwitchModelInSession: false,
+      canResume: false,
+    }),
+    start: () => (mode === "start" ? new Promise(() => {}) : Promise.resolve(session)),
+    resume: () => Promise.reject(new Error("no")),
+  };
+}
+
+describe("runs: robustness (review #74)", () => {
+  it("replays nothing when access was revoked between the request check and the stream", async () => {
+    const { f, conversation, send, waitRun, base } = await start({
+      // After the resource check, before the handler: end the session.
+      beforeListen: (a) =>
+        a.addHook("preHandler", async (req) => {
+          if (req.headers["x-revoke"] && req.ctx.sessionToken) a.users!.deleteSession(req.ctx.sessionToken);
+        }),
+    });
+    const run = (await send(conversation().id, "x")).json().run as Run;
+    await waitRun(run.id);
+    const r = await openEvents(`${base}/api/runs/${run.id}/events`, {
+      cookie: f.cookies.owner,
+      "x-revoke": "1",
+    });
+    const { frames, ended } = await r.read();
+    expect(ended).toBe(true);
+    expect(frames.filter((x) => x.data)).toEqual([]);
+  }, 10_000);
+
+  it("deleting the conversation during a run stops it cleanly", async () => {
+    const { app, fake, conversation, send, stream } = await start({
+      script: () => Array.from({ length: 200 }, (_, i) => [{ text: `${i} ` }, { delayMs: 10 }]).flat(),
+    });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const s = await stream(run.id);
+    await s.read((fr) => fr.filter((x) => x.data).length >= 3);
+    const t0 = Date.now();
+    app.conversations!.delete(c.id);
+    expect((await s.read()).ended).toBe(true);
+    // Promptly — not when the (2-second) reply would have finished on its own.
+    expect(Date.now() - t0).toBeLessThan(500);
+    await new Promise((r) => setTimeout(r, 100)); // let the runtime notice; nothing may throw meanwhile
+    expect(app.runs!.liveCount()).toBe(0);
+    expect(app.runs!.get(run.id)).toBeUndefined();
+    expect(fake.closed).toBe(fake.opened);
+  });
+
+  it("a runtime that ignores interrupt is not waited for: the run ends after the grace period", async () => {
+    const { app, mom, conversation, send, waitRun } = await start({
+      adapter: stuckRuntime("turn"),
+      graceMs: 150,
+    });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    for (let i = 0; i < 100 && !app.conversations!.messageById(run.assistantMessageId)!.searchText; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    await mom.post(`/api/runs/${run.id}/interrupt`);
+    expect((await waitRun(run.id)).status).toBe("interrupted");
+    const reply = app.conversations!.messageById(run.assistantMessageId)!;
+    expect(reply.status).toBe("stopped");
+    expect(JSON.stringify(reply.parts)).toMatch(/부분/);
+    // The conversation is free again.
+    expect((await send(c.id, "다음")).statusCode).toBe(201);
+    expect(app.runs!.liveCount()).toBe(1); // only the new run
+  });
+
+  it("an interrupt while the runtime is still opening its session also ends the run", async () => {
+    const { mom, conversation, send, waitRun } = await start({
+      adapter: stuckRuntime("start"),
+      graceMs: 100,
+    });
+    const run = (await send(conversation().id, "x")).json().run as Run;
+    await new Promise((r) => setTimeout(r, 30));
+    await mom.post(`/api/runs/${run.id}/interrupt`);
+    expect((await waitRun(run.id)).status).toBe("interrupted");
+  });
+
+  it("delta part indexes match the message API even with reasoning in between", async () => {
+    const { mom, conversation, send, stream, waitRun } = await start({
+      script: () => [
+        { reasoning: "생각" },
+        { text: "첫 문단" },
+        { reasoning: "더 생각" },
+        { text: "둘째 문단" },
+      ],
+    });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const reply = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items.at(-1) as Message;
+    for (const e of events(frames))
+      if (e.type === "delta") expect((reply.parts[e.partIndex] as { text: string }).text).toContain(e.text);
+    expect(reply.parts).toEqual([
+      { type: "text", text: "첫 문단" },
+      { type: "text", text: "둘째 문단" },
+    ]);
+  });
+
+  it("keeps nothing in memory for a run that failed at once, and closes every session it opened", async () => {
+    const none = await start({ noRuntime: true });
+    await none.send(none.conversation().id, "x");
+    expect(none.app.runs!.liveCount()).toBe(0);
+
+    const { app, fake, conversation, send, waitRun } = await start();
+    const c = conversation();
+    await waitRun((await send(c.id, "하나")).json().run.id);
+    await waitRun((await send(c.id, "둘")).json().run.id);
+    expect(fake.opened).toBe(2);
+    expect(fake.closed).toBe(2);
+    expect(app.runs!.liveCount()).toBe(0);
+  });
+
+  it("closes running sessions on shutdown", async () => {
+    const { app, fake, conversation, send } = await start({ script: () => [{ delayMs: 5000 }] });
+    await send(conversation().id, "x");
+    for (let i = 0; i < 100 && fake.opened === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    await app.runs!.shutdown();
+    expect(fake.closed).toBe(fake.opened);
+    expect(app.runs!.liveCount()).toBe(0);
+  });
+
+  it("never resumes on a runtime that cannot resume", async () => {
+    const { app, conversation, send, waitRun } = await start({ canResume: false });
+    const c = conversation();
+    expect((await waitRun((await send(c.id, "하나")).json().run.id)).status).toBe("done");
+    expect((await waitRun((await send(c.id, "둘")).json().run.id)).status).toBe("done");
+    expect(app.conversations!.sessions(c.id).length).toBeGreaterThanOrEqual(1);
+  });
+});

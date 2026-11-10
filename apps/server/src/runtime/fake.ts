@@ -63,6 +63,9 @@ const sleep = (ms: number, signal: AbortSignal) =>
 
 export class FakeRuntime implements RuntimeAdapter {
   readonly id: RuntimeId;
+  /** Sessions opened and closed — tests check that the run manager releases every session it opens. */
+  opened = 0;
+  closed = 0;
   /** Sessions this "runtime" remembers (forget() simulates a runtime that lost them). */
   private readonly sessions = new Map<string, { model: string; memory: string[] }>();
 
@@ -71,6 +74,7 @@ export class FakeRuntime implements RuntimeAdapter {
       id?: RuntimeId;
       script?: FakeScript;
       models?: RuntimeCapabilities["models"];
+      canResume?: boolean;
     } = {},
   ) {
     this.id = opts.id ?? "claude-code";
@@ -88,7 +92,7 @@ export class FakeRuntime implements RuntimeAdapter {
         { id: "fake-small", label: "Fake Small", efforts: [] },
       ],
       canSwitchModelInSession: true,
-      canResume: true,
+      canResume: this.opts.canResume ?? true,
     };
   }
 
@@ -106,11 +110,13 @@ export class FakeRuntime implements RuntimeAdapter {
   }
 
   async resume(externalSessionId: string): Promise<RuntimeSession> {
+    if (this.opts.canResume === false) throw new Error("this runtime cannot resume");
     if (!this.sessions.has(externalSessionId)) throw new SessionGoneError();
     return this.session(externalSessionId);
   }
 
   private session(id: string): RuntimeSession {
+    this.opened++;
     const state = this.sessions.get(id)!;
     const script = this.opts.script ?? defaultScript;
     return {
@@ -118,7 +124,9 @@ export class FakeRuntime implements RuntimeAdapter {
       setModel: async (model) => {
         state.model = model;
       },
-      close: async () => {},
+      close: async () => {
+        this.closed++;
+      },
       turn: (input): RuntimeTurn => {
         state.memory.push(input.text);
         const ctrl = new AbortController();

@@ -68,6 +68,7 @@ export function runtimeContract(
         const events = await collect(s.turn({ text: o.short, model: a.capabilities().models[0]!.id }).events);
         expect(events.filter((e) => e.type === "text_delta").length).toBeGreaterThan(1);
         expect(text(events).length).toBeGreaterThan(0);
+        await s.close();
       },
       timeout,
     );
@@ -76,12 +77,15 @@ export function runtimeContract(
       "resumes a session by id and remembers it",
       async () => {
         const a = await make();
+        if (!a.capabilities().canResume) return; // the run manager then always starts fresh sessions
         const model = a.capabilities().models[0]!.id;
         const s1 = await a.start(ctx(model));
         await collect(s1.turn({ text: o.remember, model }).events);
+        await s1.close();
         const s2 = await a.resume(s1.externalSessionId, ctx(model));
         expect(s2.externalSessionId).toBe(s1.externalSessionId);
         expect(o.recallCheck(text(await collect(s2.turn({ text: o.recall, model }).events)))).toBe(true);
+        await s2.close();
       },
       timeout,
     );
@@ -102,6 +106,7 @@ export function runtimeContract(
         expect(interruptedAt).toBeGreaterThan(0);
         expect(Date.now() - interruptedAt).toBeLessThan(3000);
         expect(Date.now() - t0).toBeLessThan(timeout);
+        await s.close();
       },
       timeout,
     );
@@ -116,6 +121,7 @@ export function runtimeContract(
         await s.setModel(caps.models[1]!.id);
         const events = await collect(s.turn({ text: o.short, model: caps.models[1]!.id }).events);
         expect(text(events).length).toBeGreaterThan(0);
+        await s.close();
       },
       timeout,
     );

@@ -9,7 +9,19 @@ import type { AppEvents } from "../events.js";
 import { SessionGoneError, type RuntimeRegistry, type RuntimeSession, type RuntimeTurn } from "./adapter.js";
 
 export type RunRow = typeof runs.$inferSelect;
-type Live = { emitter: EventEmitter; turn?: RuntimeTurn; interruptRequested: boolean };
+/** In-memory state of a run that is being executed by this process. */
+type Live = {
+  conversationId: string;
+  emitter: EventEmitter;
+  session?: RuntimeSession;
+  turn?: RuntimeTurn;
+  /** The reply so far (internal parts included) — saved when the run ends, however it ends. */
+  parts: MessagePart[];
+  interruptRequested: boolean;
+  /** Ended (finished, force-stopped or its conversation deleted): later runtime events are ignored. */
+  settled: boolean;
+  graceTimer?: NodeJS.Timeout;
+};
 
 export const EVENT_RETENTION_MS = 3600_000;
 export const DEFAULT_RUNTIME: RuntimeId = "claude-code";
@@ -52,6 +64,8 @@ export type RunManagerOptions = {
   now?: () => number;
   /** How often partial replies are written to the message row while streaming. */
   flushMs?: number;
+  /** After interrupt(), how long the runtime gets to stop before the run is ended without it. */
+  interruptGraceMs?: number;
   systemPrompt?: string;
 };
 
@@ -74,6 +88,10 @@ export class RunManager {
   ) {
     this.now = opts.now ?? Date.now;
     this.flushMs = opts.flushMs ?? 500;
+    // Deleting a conversation (its runs cascade) stops what is running there first.
+    conversations.onDelete((conversationId) => {
+      for (const [id, live] of this.live) if (live.conversationId === conversationId) this.drop(id, live);
+    });
     // A deactivated user's runs stop (their streams are closed by watchAccess).
     events.on("user-access-changed", (e) => {
       if (e.reason !== "deactivated") return;
@@ -182,21 +200,44 @@ export class RunManager {
         return { run, user, assistant, reused: false };
       })
       .immediate();
-    if (!created.reused && created.run.status === "queued") {
-      this.live.set(created.run.id, { emitter: new EventEmitter(), interruptRequested: false });
-      // Detached from the request: the run outlives the HTTP connection.
-      setImmediate(() => void this.execute(created.run.id));
+    // The persisted status decides: a run that already failed inside the transaction (no runtime) is not started.
+    const run = this.get(created.run.id)!;
+    if (!created.reused && run.status === "queued") {
+      this.live.set(run.id, {
+        conversationId: run.conversationId,
+        emitter: new EventEmitter(),
+        parts: [],
+        interruptRequested: false,
+        settled: false,
+      });
+      // Detached from the request: the run outlives the HTTP connection. Nothing may escape as a rejection.
+      setImmediate(() => {
+        this.execute(run.id).catch(() => this.settle(run.id, "failed", "runtime_error"));
+      });
     }
-    return { ...created, run: this.get(created.run.id)! };
+    return { ...created, run };
   }
 
-  /** Stops a run; the partial reply is kept as "stopped". Idempotent. */
+  /**
+   * Stops a run; the partial reply is kept as "stopped". Idempotent. A runtime that does not stop within the
+   * grace period (or is still opening its session) is not waited for: the run ends without it, and whatever
+   * it sends later is ignored — the conversation never stays locked.
+   */
   async interrupt(id: string): Promise<RunRow | undefined> {
     const live = this.live.get(id);
-    if (live) {
+    if (live && !live.settled) {
       live.interruptRequested = true;
-      await live.turn?.interrupt();
-    } else {
+      live.graceTimer ??= setTimeout(
+        () => this.settle(id, "interrupted", null),
+        this.opts.interruptGraceMs ?? 3000,
+      );
+      live.graceTimer.unref();
+      try {
+        await live.turn?.interrupt();
+      } catch {
+        // The grace timer ends the run anyway.
+      }
+    } else if (!live) {
       const r = this.get(id);
       if (r && (r.status === "queued" || r.status === "running")) this.finish(r, "interrupted", null);
     }
@@ -230,6 +271,24 @@ export class RunManager {
     };
   }
 
+  /** Runs this process is executing right now. */
+  liveCount(): number {
+    return this.live.size;
+  }
+
+  /** On shutdown: stop runtimes and release their sessions (the runs are failed by `recover()` on restart). */
+  async shutdown(): Promise<void> {
+    await Promise.all(
+      [...this.live.values()].map(async (live) => {
+        clearTimeout(live.graceTimer);
+        live.settled = true;
+        await live.turn?.interrupt().catch(() => {});
+        await live.session?.close().catch(() => {});
+      }),
+    );
+    this.live.clear();
+  }
+
   /** True when the run ended long enough ago that its events were purged. */
   eventsExpired(r: RunRow): boolean {
     return r.endedAt !== null && this.now() - r.endedAt > EVENT_RETENTION_MS;
@@ -256,13 +315,37 @@ export class RunManager {
           .set({ nextEventSeq: sql`${runs.nextEventSeq} + 1` })
           .where(eq(runs.id, runId))
           .returning({ seq: runs.nextEventSeq })
-          .get()!;
+          .get();
+        if (!r) return undefined; // the run is gone (its conversation was deleted)
         const s = r.seq - 1;
         this.db.insert(runEvents).values({ runId, seq: s, data, createdAt: this.now() }).run();
         return s;
       })
       .immediate();
-    this.live.get(runId)?.emitter.emit("event", seq, data);
+    if (seq !== undefined) this.live.get(runId)?.emitter.emit("event", seq, data);
+  }
+
+  /** Ends a live run exactly once: saves the reply so far and records the outcome. Later calls do nothing. */
+  private settle(runId: string, status: "done" | "interrupted" | "failed", code: string | null): void {
+    const live = this.live.get(runId);
+    if (!live || live.settled) return;
+    live.settled = true;
+    clearTimeout(live.graceTimer);
+    const row = this.get(runId);
+    if (!row) return this.drop(runId, live);
+    this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
+    this.finish(row, status, code);
+    void live.session?.close().catch(() => {});
+  }
+
+  /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
+  private drop(runId: string, live: Live): void {
+    live.settled = true;
+    clearTimeout(live.graceTimer);
+    void live.turn?.interrupt().catch(() => {});
+    void live.session?.close().catch(() => {});
+    this.live.delete(runId);
+    live.emitter.emit("end");
   }
 
   private finish(r: RunRow, status: "done" | "interrupted" | "failed", errorCode: string | null): void {
@@ -293,16 +376,19 @@ export class RunManager {
       effort: run.effort ?? undefined,
       tools: [],
     };
-    // Resume only a session that saw exactly this history (#45 refines the matching and summarising).
+    // Resume only a session that saw exactly this history (#45 refines the matching and summarising), and only
+    // on runtimes that can resume at all.
     const lastSeen = history.at(-1)?.id ?? null;
-    const prev = this.conversations
-      .sessions(run.conversationId)
-      .find(
-        (s) =>
-          s.runtime === run.runtime &&
-          s.conversationRevision === conv.revision &&
-          s.lastMessageId === lastSeen,
-      );
+    const prev = !adapter.capabilities().canResume
+      ? undefined
+      : this.conversations
+          .sessions(run.conversationId)
+          .find(
+            (s) =>
+              s.runtime === run.runtime &&
+              s.conversationRevision === conv.revision &&
+              s.lastMessageId === lastSeen,
+          );
     if (prev) {
       try {
         return {
@@ -330,7 +416,7 @@ export class RunManager {
     const run = this.get(runId);
     const live = this.live.get(runId);
     if (!run || !live || run.status !== "queued") return;
-    if (live.interruptRequested) return this.finish(run, "interrupted", null);
+    if (live.interruptRequested) return this.settle(runId, "interrupted", null);
     this.db.update(runs).set({ status: "running" }).where(eq(runs.id, runId)).run();
     const messageId = run.assistantMessageId;
     this.conversations.updateMessage(messageId, { status: "streaming" });
@@ -343,18 +429,19 @@ export class RunManager {
       ?.flatMap((p) => (p.type === "text" ? [p.text] : []))
       .join("\n");
 
-    const parts: MessagePart[] = [];
+    const parts = live.parts;
     let lastFlush = this.now();
     const flush = (force = false) => {
-      if (!force && this.now() - lastFlush < this.flushMs) return;
+      if (live.settled || (!force && this.now() - lastFlush < this.flushMs)) return;
       lastFlush = this.now();
       this.conversations.updateMessage(messageId, { parts });
     };
+    /** Appends text; returns the index among the *public* parts (what the message API shows). */
     const appendText = (type: "text" | "reasoning", text: string): number => {
       const last = parts.at(-1);
       if (last && last.type === type) last.text += text;
       else parts.push({ type, text });
-      return parts.length - 1;
+      return parts.filter((p) => p.type !== "reasoning").length - 1;
     };
 
     let outcome: { status: "done" | "interrupted" | "failed"; code: string | null } = {
@@ -366,74 +453,61 @@ export class RunManager {
         run,
         before.filter((m) => m !== lastUser),
       );
-      if (live.interruptRequested) {
-        outcome = { status: "interrupted", code: null };
-      } else {
-        const turn = session.turn({
-          text: inputText ?? "",
-          model: run.model,
-          effort: run.effort ?? undefined,
-        });
-        live.turn = turn;
-        for await (const ev of turn.events) {
-          if (ev.type === "text_delta") {
-            const partIndex = appendText("text", ev.text);
-            this.emit(runId, { type: "delta", messageId, partIndex, text: ev.text });
-            flush();
-          } else if (ev.type === "reasoning_delta") {
-            appendText("reasoning", ev.text); // stored, never streamed
-          } else if (ev.type === "tool_start") {
-            parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input: ev.input });
-            this.emit(runId, {
-              type: "tool_start",
-              messageId,
-              callId: ev.callId,
-              name: ev.name,
-              input: ev.input,
-            });
-            flush(true);
-          } else if (ev.type === "tool_end") {
-            parts.push({
-              type: "tool_result",
-              callId: ev.callId,
-              output: ev.output,
-              ...(ev.isError ? { isError: true } : {}),
-            });
-            this.emit(runId, {
-              type: "tool_end",
-              messageId,
-              callId: ev.callId,
-              output: ev.output,
-              ...(ev.isError ? { isError: true } : {}),
-            });
-            flush(true);
-          } else if (ev.type === "usage") {
-            this.emit(runId, {
-              type: "usage",
-              messageId,
-              inputTokens: ev.inputTokens,
-              outputTokens: ev.outputTokens,
-              ...(ev.costUsd === undefined ? {} : { costUsd: ev.costUsd }),
-            }); // stored per run/attempt by #44
-          } else if (ev.type === "notice") {
-            this.emit(runId, ev);
-          } else if (ev.type === "limit") {
-            this.emit(runId, { type: "notice", level: "warn", code: ev.code, message: ev.message });
-            outcome = { status: "failed", code: "usage_limit" };
-          }
+      live.session = session;
+      // Interrupted or deleted while the session was opening.
+      if (live.settled) return void session.close().catch(() => {});
+      if (live.interruptRequested) return this.settle(runId, "interrupted", null);
+      const turn = session.turn({ text: inputText ?? "", model: run.model, effort: run.effort ?? undefined });
+      live.turn = turn;
+      for await (const ev of turn.events) {
+        if (live.settled) break; // force-stopped or deleted: whatever arrives now is ignored
+        if (ev.type === "text_delta") {
+          const partIndex = appendText("text", ev.text);
+          this.emit(runId, { type: "delta", messageId, partIndex, text: ev.text });
+          flush();
+        } else if (ev.type === "reasoning_delta") {
+          appendText("reasoning", ev.text); // stored, never streamed
+        } else if (ev.type === "tool_start") {
+          parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input: ev.input });
+          this.emit(runId, {
+            type: "tool_start",
+            messageId,
+            callId: ev.callId,
+            name: ev.name,
+            input: ev.input,
+          });
+          flush(true);
+        } else if (ev.type === "tool_end") {
+          const extra = ev.isError ? { isError: true } : {};
+          parts.push({ type: "tool_result", callId: ev.callId, output: ev.output, ...extra });
+          this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output: ev.output, ...extra });
+          flush(true);
+        } else if (ev.type === "usage") {
+          this.emit(runId, {
+            type: "usage",
+            messageId,
+            inputTokens: ev.inputTokens,
+            outputTokens: ev.outputTokens,
+            ...(ev.costUsd === undefined ? {} : { costUsd: ev.costUsd }),
+          }); // stored per run/attempt by #44
+        } else if (ev.type === "notice") {
+          this.emit(runId, ev);
+        } else if (ev.type === "limit") {
+          this.emit(runId, { type: "notice", level: "warn", code: ev.code, message: ev.message });
+          outcome = { status: "failed", code: "usage_limit" };
         }
-        if (live.interruptRequested) outcome = { status: "interrupted", code: null };
-        // The session now reflects this reply as well.
-        if (outcome.status === "done") this.conversations.touchSession(sessionRowId, messageId, revision);
-        else this.conversations.invalidateSession(sessionRowId);
       }
+      if (live.settled) return;
+      if (live.interruptRequested) outcome = { status: "interrupted", code: null };
+      // The session now reflects this reply as well; otherwise it must not be resumed.
+      if (outcome.status === "done") this.conversations.touchSession(sessionRowId, messageId, revision);
+      else this.conversations.invalidateSession(sessionRowId);
     } catch {
       // Only interrupts we asked for count as "stopped"; any other error is a failure (spike #39).
       outcome = live.interruptRequested
         ? { status: "interrupted", code: null }
         : { status: "failed", code: "runtime_error" };
     }
-    this.conversations.updateMessage(messageId, { parts });
-    this.finish(this.get(runId)!, outcome.status, outcome.code);
+    this.settle(runId, outcome.status, outcome.code);
   }
 }
