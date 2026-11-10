@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { PASSWORD_MIN, SERVICE_NAME, type AuthState } from "@agentlee/shared";
 import { auth, errorText } from "./api.js";
+import { UserAdmin } from "./UserAdmin.js";
 
 /** Auth screens (#9): first-run admin, login, forced password change. The real app layout lands in #13. */
 export function App() {
@@ -203,6 +204,7 @@ function Home({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => v
         <ErrorText text={error} />
         <button disabled={busy}>로그아웃</button>
       </form>
+      {user.role === "admin" && <UserAdmin selfId={user.id} />}
     </Card>
   );
 }

@@ -12,6 +12,13 @@ export const users = sqliteTable("users", {
   passwordHash: text("password_hash"),
   mustChangePassword: integer("must_change_password", { mode: "boolean" }).notNull().default(false),
   active: integer("active", { mode: "boolean" }).notNull().default(true),
+  /** What the user may use (runtimes, models, skills) — JSON, see `UserPermissions` in @agentlee/shared. */
+  permissions: text("permissions", { mode: "json" })
+    .$type<{ runtimes: string[]; models: "all" | string[]; skills: "all" | string[] }>()
+    .notNull()
+    .default(sql`'{"runtimes":["claude-code","codex"],"models":"all","skills":"all"}'`),
+  /** The user's default runtime for new conversations (FR-12); null = service default. */
+  defaultRuntime: text("default_runtime"),
   createdAt: integer("created_at").notNull().default(now),
   updatedAt: integer("updated_at").notNull().default(now),
 });

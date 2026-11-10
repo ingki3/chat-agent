@@ -1,0 +1,2 @@
+ALTER TABLE `users` ADD `permissions` text DEFAULT '{"runtimes":["claude-code","codex"],"models":"all","skills":"all"}' NOT NULL;--> statement-breakpoint
+ALTER TABLE `users` ADD `default_runtime` text;

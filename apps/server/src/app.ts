@@ -10,6 +10,7 @@ import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plu
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
 import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
+import { registerUserAdmin } from "./users/routes.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -98,7 +99,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   registerSession(app, users);
   // After the login check: resource load + policy (404 / 403).
   registerResourceCheck(app);
-  if (users) registerAuthRoutes(app, { config, users, ...opts.auth });
+  if (users) {
+    registerAuthRoutes(app, { config, users, ...opts.auth });
+    registerUserAdmin(app, users);
+  }
 
   app.get(
     "/api/health",

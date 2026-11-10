@@ -101,3 +101,69 @@ body {
   color: var(--error);
   font-size: 14px;
 }
+.card:has(.admin) {
+  width: min(560px, calc(100vw - 32px));
+}
+.admin {
+  margin-top: 24px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  display: grid;
+  gap: 14px;
+}
+.admin h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.users {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  font-size: 14px;
+}
+.users li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.users li.inactive {
+  color: var(--muted);
+}
+.users .actions {
+  display: flex;
+  gap: 6px;
+}
+.users .actions button {
+  padding: 6px 10px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--line);
+}
+.field select {
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+}
+.notice {
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+.notice p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.notice code {
+  font-size: 16px;
+  user-select: all;
+}
