@@ -79,7 +79,9 @@ export function installRouteRules(app: FastifyInstance): ResourceRegistry {
       throw new Error(`${route.url}: resource param ":${param}" not in path`);
     if (cfg.auth === "public") throw new Error(`${route.url}: a resource route cannot be public`);
     const methods = Array.isArray(route.method) ? route.method : [route.method];
-    for (const method of methods) registry.routes.push({ method, url: route.url, rule: cfg.resource });
+    // HEAD routes are Fastify's automatic mirrors of GET (same config, same check): list the GET only.
+    for (const method of methods)
+      if (method !== "HEAD") registry.routes.push({ method, url: route.url, rule: cfg.resource });
   });
   return registry;
 }

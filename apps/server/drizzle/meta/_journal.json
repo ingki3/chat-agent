@@ -15,6 +15,13 @@
       "when": 1794285515659,
       "tag": "0001_user_permissions",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794286697813,
+      "tag": "0002_conversations",
+      "breakpoints": true
     }
   ]
 }

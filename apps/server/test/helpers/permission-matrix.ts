@@ -18,22 +18,22 @@ export type Family = {
   cookies: Record<Member, string>;
 };
 
+export type Fixture = string | { id: string; params?: Record<string, string> };
+
 export type MatrixRow = {
   /** `${METHOD} ${route pattern}` exactly as registered, e.g. "GET /api/conversations/:id". */
   route: string;
   /** Status per caller for a resource owned by `owner` and shared (read) with `shared`. */
   expect: Record<Who, number>;
   /**
-   * Creates a fresh resource owned by `f.users.owner` and shared with `f.users.shared`; returns its id.
+   * Creates a fresh resource owned by `f.users.owner` and shared with `f.users.shared`; returns its id
+   * (and values for other path params, e.g. `{ id, params: { messageId } }`).
    * Called before every single request, so one caller's delete or change never affects the next caller.
    */
-  fixture: (f: Family) => string | Promise<string>;
+  fixture: (f: Family) => Fixture | Promise<Fixture>;
   /** Request body for non-GET routes. */
   body?: unknown;
 };
-
-/** Rows for the real app's resource routes. Add one with each new resource route (#11, #22, #27, ...). */
-export const APP_MATRIX: MatrixRow[] = [];
 
 /** Standard expectations. */
 export const READ: MatrixRow["expect"] = { owner: 200, shared: 200, admin: 403, stranger: 403, anon: 401 };
@@ -45,6 +45,58 @@ export const OWNER_ONLY: MatrixRow["expect"] = {
   anon: 401,
 };
 export const USAGE: MatrixRow["expect"] = { owner: 200, shared: 403, admin: 200, stranger: 403, anon: 401 };
+
+/** A conversation of `owner` (sharing comes with #29) with one user and one assistant message. */
+function conversation(f: Family) {
+  const store = f.app.conversations!;
+  const c = store.create(f.users.owner.id);
+  const user = store.append(c.id, { role: "user", parts: [{ type: "text", text: "질문" }] });
+  const reply = store.append(c.id, { role: "assistant", parts: [{ type: "text", text: "답" }] });
+  return { id: c.id, params: { userMessageId: user.id, assistantMessageId: reply.id } };
+}
+const withMessage = (key: "userMessageId" | "assistantMessageId") => (f: Family) => {
+  const fx = conversation(f);
+  return { id: fx.id, params: { messageId: fx.params[key] } };
+};
+
+/**
+ * Rows for the real app's resource routes. Add one with each new resource route (#22, #27, ...).
+ * Until sharing (#29) exists nothing is shared, so the "shared" caller is refused like a stranger.
+ */
+const NOT_SHARED = (e: MatrixRow["expect"]): MatrixRow["expect"] => ({ ...e, shared: 403 });
+export const APP_MATRIX: MatrixRow[] = [
+  { route: "GET /api/conversations/:id", expect: NOT_SHARED(READ), fixture: conversation },
+  {
+    route: "PATCH /api/conversations/:id",
+    expect: OWNER_ONLY,
+    fixture: conversation,
+    body: { title: "새 이름" },
+  },
+  { route: "DELETE /api/conversations/:id", expect: OWNER_ONLY, fixture: conversation },
+  { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
+  {
+    route: "POST /api/conversations/:id/messages",
+    expect: { ...OWNER_ONLY, owner: 201 },
+    fixture: conversation,
+    body: { text: "안녕" },
+  },
+  {
+    route: "POST /api/conversations/:id/messages/:messageId/edit",
+    expect: OWNER_ONLY,
+    fixture: withMessage("userMessageId"),
+    body: { text: "고친 질문" },
+  },
+  {
+    route: "POST /api/conversations/:id/messages/:messageId/regenerate",
+    expect: OWNER_ONLY,
+    fixture: withMessage("assistantMessageId"),
+  },
+  {
+    route: "GET /api/conversations/:id/messages/:messageId/versions",
+    expect: NOT_SHARED(READ),
+    fixture: withMessage("userMessageId"),
+  },
+];
 
 const LOCAL = { host: "localhost:3000" };
 const PW = "matrix-password-1";
@@ -87,14 +139,19 @@ export async function runMatrix(f: Family, rows: MatrixRow[]): Promise<string[]>
       continue;
     }
     const param = rule.param ?? "id";
-    const send = (who: Who, id: string) => {
+    const send = (who: Who, fx: Fixture) => {
+      const id = typeof fx === "string" ? fx : fx.id;
+      // Other path params (e.g. :messageId) come from the fixture.
+      let path = pattern;
+      for (const [k, v] of Object.entries(typeof fx === "string" ? {} : (fx.params ?? {})))
+        path = path.replace(`:${k}`, encodeURIComponent(v));
       const from = rule.from ?? "params";
       const url =
         from === "params"
-          ? pattern.replace(param === "*" ? "*" : `:${param}`, param === "*" ? id : encodeURIComponent(id))
+          ? path.replace(param === "*" ? "*" : `:${param}`, param === "*" ? id : encodeURIComponent(id))
           : from === "query"
-            ? `${pattern}${pattern.includes("?") ? "&" : "?"}${encodeURIComponent(param)}=${encodeURIComponent(id)}`
-            : pattern;
+            ? `${path}${path.includes("?") ? "&" : "?"}${encodeURIComponent(param)}=${encodeURIComponent(id)}`
+            : path;
       const body = from === "body" ? { ...((row.body as object) ?? {}), [param]: id } : (row.body ?? {});
       return f.app.inject({
         method: method as "GET",
@@ -118,7 +175,10 @@ export async function runMatrix(f: Family, rows: MatrixRow[]): Promise<string[]>
       ["stranger", 404],
       ["anon", 401],
     ] as const) {
-      const got = (await send(who, "missing-id")).statusCode;
+      // Keep the fixture's other params real, so only the resource id is missing.
+      const fx = await row.fixture(f);
+      const got = (await send(who, typeof fx === "string" ? "missing-id" : { ...fx, id: "missing-id" }))
+        .statusCode;
       if (got !== want) failures.push(`${row.route} missing id as ${who}: expected ${want}, got ${got}`);
     }
   }

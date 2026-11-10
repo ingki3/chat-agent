@@ -1,4 +1,8 @@
 import { z } from "zod";
+import { RuntimeId } from "./runtime.js";
+
+export * from "./runtime.js";
+export * from "./chat.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({
@@ -54,9 +58,6 @@ export const PasswordChangeRequest = z.object({
 });
 
 // ---- Users (#41) ----
-
-export const RuntimeId = z.enum(["claude-code", "codex"]);
-export type RuntimeId = z.infer<typeof RuntimeId>;
 
 /** What a user may use. Enforced by #17/#19/#21; set by the admin (#35). */
 export const UserPermissions = z.object({
