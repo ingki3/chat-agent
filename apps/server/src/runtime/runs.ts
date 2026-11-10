@@ -65,6 +65,9 @@ export class ShuttingDownError extends Error {
   }
 }
 
+/** The run ended while its session was being opened; nothing more to do. */
+class RunEndedError extends Error {}
+
 export class RunBusyError extends Error {
   constructor() {
     super("a run is already in progress for this conversation");
@@ -408,6 +411,7 @@ export class RunManager {
   private async openSession(
     run: RunRow,
     history: MessageRow[],
+    live: Live,
   ): Promise<{ session: RuntimeSession; sessionRowId: string; revision: number }> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
@@ -444,6 +448,8 @@ export class RunManager {
         this.conversations.invalidateSession(prev.id);
       }
     }
+    // The run may have ended while resume() was pending (interrupt, delete, shutdown): open nothing new then.
+    if (live.settled || live.interruptRequested || this.stopping) throw new RunEndedError();
     const session = await adapter.start(ctx);
     try {
       // The history may have changed (edit, delete) while the session was opening: then this fails.
@@ -501,6 +507,7 @@ export class RunManager {
       const { session, sessionRowId, revision } = await this.openSession(
         run,
         before.filter((m) => m !== lastUser),
+        live,
       );
       live.session = session;
       // Interrupted or deleted while the session was opening.

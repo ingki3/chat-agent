@@ -7,6 +7,7 @@ import { createTestDb } from "../src/db/client.js";
 import { runs as runsTable } from "../src/db/schema.js";
 import {
   RuntimeRegistry,
+  SessionGoneError,
   type RuntimeAdapter,
   type RuntimeEvent,
   type RuntimeSession,
@@ -757,4 +758,54 @@ describe("runs: robustness, round 3 (review #74)", () => {
     for (let i = 0; i < 100 && opened < 2; i++) await new Promise((r) => setTimeout(r, 10));
     await expect(app.runs!.shutdown()).resolves.toBeUndefined();
   });
+});
+
+describe("runs: robustness, round 4 (review #74)", () => {
+  function goneOnResume() {
+    const stats = { starts: 0, resumes: 0 };
+    const session = (id: string): RuntimeSession => ({
+      externalSessionId: id,
+      setModel: async () => {},
+      close: async () => {},
+      turn: () => ({
+        events: (async function* (): AsyncGenerator<RuntimeEvent> {
+          yield { type: "text_delta", text: "ok" };
+        })(),
+        interrupt: async () => {},
+      }),
+    });
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: true,
+      }),
+      start: async () => session(`s-${++stats.starts}`),
+      // Slow, then "the runtime lost it" — the run ends meanwhile.
+      resume: async () => {
+        stats.resumes++;
+        await new Promise((r) => setTimeout(r, 150));
+        throw new SessionGoneError();
+      },
+    };
+    return { adapter, stats };
+  }
+
+  for (const how of ["interrupt", "delete", "shutdown"] as const)
+    it(`does not open a new session after the run ended during resume (${how})`, async () => {
+      const { adapter, stats } = goneOnResume();
+      const { app, mom, conversation, send, waitRun } = await start({ adapter, graceMs: 30 });
+      const c = conversation();
+      await waitRun((await send(c.id, "하나")).json().run.id);
+      expect(stats.starts).toBe(1);
+      const run = (await send(c.id, "둘")).json().run as Run;
+      for (let i = 0; i < 100 && stats.resumes === 0; i++) await new Promise((r) => setTimeout(r, 5));
+      if (how === "interrupt") await mom.post(`/api/runs/${run.id}/interrupt`);
+      if (how === "delete") app.conversations!.delete(c.id);
+      if (how === "shutdown") await app.runs!.shutdown();
+      await new Promise((r) => setTimeout(r, 300));
+      expect(stats.starts).toBe(1);
+      expect(app.runs!.liveCount()).toBe(0);
+    });
 });
