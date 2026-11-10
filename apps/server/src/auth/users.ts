@@ -127,6 +127,33 @@ export class UserStore {
     this.events.emit("user-access-changed", { userId, reason: "password_changed" });
   }
 
+  /**
+   * Deactivates unless that would leave no active admin. Check and change run in one transaction, so two admins
+   * deactivating each other at the same moment cannot both succeed. Returns false when refused.
+   */
+  deactivateUnlessLastAdmin(userId: string): boolean {
+    const ok = this.db.$client
+      .transaction(() => {
+        const target = this.byId(userId);
+        if (!target) return false;
+        if (target.role === "admin" && target.active) {
+          const admins =
+            this.db
+              .select({ n: count() })
+              .from(users)
+              .where(and(eq(users.role, "admin"), eq(users.active, true)))
+              .get()?.n ?? 0;
+          if (admins <= 1) return false;
+        }
+        this.db.update(users).set({ active: false, updatedAt: this.now() }).where(eq(users.id, userId)).run();
+        this.db.delete(sessions).where(eq(sessions.userId, userId)).run();
+        return true;
+      })
+      .immediate();
+    if (ok) this.events.emit("user-access-changed", { userId, reason: "deactivated" });
+    return ok;
+  }
+
   /** Deactivates the account and ends every session at once. */
   deactivate(userId: string): void {
     this.db.update(users).set({ active: false, updatedAt: this.now() }).where(eq(users.id, userId)).run();

@@ -23,8 +23,12 @@ const write = { ...local, origin: "http://localhost:3000", [CSRF_HEADER]: "1" };
 const ADMIN_PW = "admin-password-1";
 const cookieOf = (sc: unknown) => String(Array.isArray(sc) ? sc[0] : sc).split(";")[0]!;
 
-async function start() {
-  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: createTestDb(), logger: false });
+async function start(userAdmin = {}) {
+  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+    db: createTestDb(),
+    logger: false,
+    userAdmin,
+  });
   apps.push(app);
   const r = await app.inject({
     method: "POST",
@@ -181,5 +185,85 @@ describe("user management (admin)", () => {
     };
     expect(JSON.parse(row.permissions)).toEqual(DEFAULT_PERMISSIONS);
     expect(row.default_runtime).toBeNull();
+  });
+
+  describe("races", () => {
+    async function twoAdmins(userAdmin = {}) {
+      const ctx = await start(userAdmin);
+      const r = await ctx.admin.post("/api/admin/users", {
+        name: "엄마",
+        email: "mom@example.com",
+        role: "admin",
+      });
+      const { user, temporaryPassword: temp } = CreateUserResponse.parse(r.json());
+      const momCookie = cookieOf((await ctx.login("mom@example.com", temp)).headers["set-cookie"]);
+      await ctx
+        .as(momCookie)
+        .post("/api/auth/password", { currentPassword: temp, newPassword: "moms-own-password" });
+      const dadId = ctx.app.users!.byEmail("ingki3@gmail.com")!.id;
+      return { ...ctx, mom: ctx.as(momCookie), momId: user.id, dadId };
+    }
+
+    it("two admins deactivating each other at once: exactly one wins, an active admin remains", async () => {
+      const { app, admin, mom, momId, dadId } = await twoAdmins();
+      const rs = await Promise.all([
+        admin.post(`/api/admin/users/${momId}/deactivate`),
+        mom.post(`/api/admin/users/${dadId}/deactivate`),
+      ]);
+      expect(rs.map((r) => r.statusCode).sort()).toEqual([200, 403]);
+      expect(app.users!.list().filter((u) => u.active && u.role === "admin")).toHaveLength(1);
+    });
+
+    it("never deactivates the last active admin", async () => {
+      const { app, dadId } = await twoAdmins();
+      const users = app.users!;
+      const momId = users.byEmail("mom@example.com")!.id;
+      expect(users.deactivateUnlessLastAdmin(momId)).toBe(true);
+      expect(users.deactivateUnlessLastAdmin(dadId)).toBe(false);
+      expect(users.byId(dadId)!.active).toBe(true);
+    });
+
+    it("a reset or create whose caller lost admin rights while hashing is refused", async () => {
+      const held: (() => void)[] = [];
+      let hold = false;
+      const hash = async (pw: string) => {
+        const { hashPassword } = await import("../src/auth/passwords.js");
+        const h = await hashPassword(pw);
+        if (hold) await new Promise<void>((r) => held.push(r));
+        return h;
+      };
+      const { app, admin, mom, momId, dadId } = await twoAdmins({ hash });
+      const waitHeld = async () => {
+        while (!held.length) await new Promise((r) => setTimeout(r, 5));
+        return held.shift()!;
+      };
+      hold = true;
+      const reset = mom.post(`/api/admin/users/${dadId}/reset-password`);
+      const release = await waitHeld();
+      app.users!.deactivate(momId);
+      release();
+      const r = await reset;
+      expect(r.statusCode).toBe(403);
+      expect(r.body).not.toMatch(/temporaryPassword/);
+      // Dad's sessions are untouched.
+      expect((await admin.get("/api/admin/users")).statusCode).toBe(200);
+
+      const create = admin.post("/api/admin/users", { name: "아들", email: "son@example.com" });
+      const release2 = await waitHeld();
+      app.users!.setRole(dadId, "member");
+      release2();
+      expect((await create).statusCode).toBe(403);
+      expect(app.users!.byEmail("son@example.com")).toBeUndefined();
+    });
+
+    it("two creates with the same email at once: 201 and 409, one account", async () => {
+      const { app, admin } = await start();
+      const rs = await Promise.all([
+        admin.post("/api/admin/users", { name: "a", email: "same@example.com" }),
+        admin.post("/api/admin/users", { name: "b", email: "same@example.com" }),
+      ]);
+      expect(rs.map((r) => r.statusCode).sort()).toEqual([201, 409]);
+      expect(app.users!.list().filter((u) => u.email === "same@example.com")).toHaveLength(1);
+    });
   });
 });

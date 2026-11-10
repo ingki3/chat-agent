@@ -10,7 +10,7 @@ import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plu
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
 import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
-import { registerUserAdmin } from "./users/routes.js";
+import { registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -66,6 +66,8 @@ export type BuildOptions = {
   /** Login rate-limit/clock overrides (tests). */
   auth?: AuthRouteOptions;
   events?: AppEvents;
+  /** User-admin overrides (tests). */
+  userAdmin?: UserAdminOptions;
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
 };
@@ -101,7 +103,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   registerResourceCheck(app);
   if (users) {
     registerAuthRoutes(app, { config, users, ...opts.auth });
-    registerUserAdmin(app, users);
+    registerUserAdmin(app, users, opts.userAdmin);
   }
 
   app.get(

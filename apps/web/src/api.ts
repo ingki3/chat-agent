@@ -58,6 +58,8 @@ export const admin = {
 const MESSAGES: Record<string, string> = {
   email_taken: "이미 등록된 이메일이에요.",
   cannot_change_self: "본인 계정에는 할 수 없어요.",
+  last_admin: "마지막 관리자는 비활성화할 수 없어요.",
+  forbidden: "권한이 없어요. 다시 로그인해 보세요.",
   invalid_credentials: "이메일 또는 비밀번호가 맞지 않아요.",
   too_many_attempts: "시도가 너무 많아요. 15분 뒤에 다시 시도하세요.",
   access_email_mismatch: "Cloudflare로 로그인한 이메일과 같은 계정으로만 들어올 수 있어요.",

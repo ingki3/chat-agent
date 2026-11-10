@@ -105,4 +105,5 @@ export type AuthError =
   | "invalid_request"
   | "email_taken"
   | "cannot_change_self"
+  | "last_admin"
   | "not_found";
