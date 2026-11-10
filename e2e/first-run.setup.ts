@@ -1,5 +1,6 @@
 import { expect, test as setup } from "@playwright/test";
-import { ADMIN, MOM, SON, csrf } from "./helpers.js";
+import fs from "node:fs";
+import { ADMIN, AUTH_DIR, MOM, SON, authFile, csrf } from "./helpers.js";
 
 // Runs once before the desktop and mobile projects: the first-run screen creates the admin, then the admin adds
 // two family accounts whose temporary passwords are replaced, so every other test can sign in directly.
@@ -11,6 +12,8 @@ setup("first run: admin and family accounts", async ({ page, baseURL }) => {
   await page.getByLabel("비밀번호 확인").fill(ADMIN.password);
   await page.getByRole("button", { name: "관리자 만들기" }).click();
   await expect(page.getByTestId("whoami")).toHaveText(ADMIN.name);
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  await page.context().storageState({ path: authFile(ADMIN) });
 
   for (const who of [MOM, SON]) {
     const created = await page.request.post("/api/admin/users", {
@@ -31,6 +34,7 @@ setup("first run: admin and family accounts", async ({ page, baseURL }) => {
       headers: csrf(baseURL!),
     });
     expect(changed.ok()).toBe(true);
+    await ctx.storageState({ path: authFile(who) });
     await ctx.close();
   }
 });

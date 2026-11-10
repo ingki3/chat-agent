@@ -1,35 +1,88 @@
-import { createContext, useContext, useEffect, useState } from "react";
-import { Outlet, useLocation } from "react-router";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { Outlet } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
 import { Sidebar } from "./Sidebar.js";
 
-type ShellCtx = { openDrawer: () => void };
+type ShellCtx = { openDrawer: (trigger: HTMLElement) => void };
 const Ctx = createContext<ShellCtx>({ openDrawer: () => {} });
 export const useShell = () => useContext(Ctx);
 
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 /**
  * Three-column app frame (claude.ai-like, mockup v2): sidebar · main · (artifact panel, #28).
- * At 900px and below the sidebar becomes a drawer opened with ☰ from every screen.
+ * At 900px and below the sidebar becomes a modal drawer opened with ☰ from every screen: focus moves into it
+ * and stays there, the rest of the page is inert, and closing returns focus to ☰. Any navigation closes it.
  */
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
-  const location = useLocation();
-  // The drawer belongs to the screen it was opened on: moving to another screen closes it.
-  const [openedOn, setOpenedOn] = useState<string | null>(null);
-  const drawer = openedOn === location.pathname;
-  const setDrawer = (open: boolean) => setOpenedOn(open ? location.pathname : null);
+  const [drawer, setDrawer] = useState(false);
+  const trigger = useRef<HTMLElement | null>(null);
+  const aside = useRef<HTMLElement | null>(null);
+
+  // Focus goes back to ☰ once the drawer is closed (while it is open, the rest of the page is inert).
+  const restoreFocus = useRef(false);
+  const close = () => {
+    restoreFocus.current = true;
+    setDrawer(false);
+  };
+  useEffect(() => {
+    if (drawer || !restoreFocus.current) return;
+    restoreFocus.current = false;
+    trigger.current?.focus();
+  }, [drawer]);
+
   useEffect(() => {
     if (!drawer) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpenedOn(null);
+    aside.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        restoreFocus.current = true;
+        setDrawer(false);
+      }
+      if (e.key !== "Tab" || !aside.current) return;
+      const items = [...aside.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
+      if (!items.length) return;
+      const first = items[0]!;
+      const last = items[items.length - 1]!;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    // Back/forward also closes it (it must never reopen on a page it was left open on).
+    const onPop = () => setDrawer(false);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("popstate", onPop);
+    };
   }, [drawer]);
 
   return (
-    <Ctx.Provider value={{ openDrawer: () => setDrawer(true) }}>
+    <Ctx.Provider
+      value={{
+        openDrawer: (el) => {
+          trigger.current = el;
+          setDrawer(true);
+        },
+      }}
+    >
       <div className={`app${drawer ? " drawer-on" : ""}`}>
-        <Sidebar user={user} open={drawer} onSignedOut={onSignedOut} onClose={() => setDrawer(false)} />
-        {drawer && <div className="scrim" data-testid="scrim" onClick={() => setDrawer(false)} />}
-        <main className="main">
+        <Sidebar
+          ref={aside}
+          user={user}
+          open={drawer}
+          onSignedOut={onSignedOut}
+          onClose={close}
+          // Picking anything in the drawer (a conversation, a shortcut) closes it.
+          onNavigate={() => setDrawer(false)}
+        />
+        {drawer && <div className="scrim" data-testid="scrim" onClick={close} />}
+        <main className="main" inert={drawer || undefined}>
           <Outlet />
         </main>
       </div>
@@ -38,11 +91,17 @@ export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: 
 }
 
 /** Top bar of a screen: ☰ (narrow screens), title, actions. */
-export function TopBar({ title, children }: { title: React.ReactNode; children?: React.ReactNode }) {
+export function TopBar({ title, children }: { title: ReactNode; children?: ReactNode }) {
   const { openDrawer } = useShell();
   return (
     <div className="topbar">
-      <button type="button" className="ghost hamb" aria-label="메뉴 열기" onClick={openDrawer}>
+      <button
+        type="button"
+        className="ghost hamb"
+        aria-label="메뉴 열기"
+        aria-haspopup="dialog"
+        onClick={(e) => openDrawer(e.currentTarget)}
+      >
         ☰
       </button>
       <div className="title">{title}</div>

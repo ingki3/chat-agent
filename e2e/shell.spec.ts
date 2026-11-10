@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
-import { MOM, SON, newConversation, signIn } from "./helpers.js";
+import { ADMIN, MOM, SON, csrf, newConversation, useAccount } from "./helpers.js";
 
 test("drawer opens and closes on narrow screens; moving to a conversation closes it", async ({
   page,
   baseURL,
 }, info) => {
-  await signIn(page, MOM, baseURL!);
+  await useAccount(page, MOM);
   const c = await newConversation(page.request, baseURL!, `서랍 ${info.project.name} ${Date.now()}`);
   await page.goto("/");
   const sidebar = page.getByTestId("sidebar");
@@ -35,22 +35,25 @@ test("each family member sees only their own conversations, after reload and in 
   baseURL,
 }, info) => {
   const tag = `${info.project.name}-${Date.now()}`;
-  const mom = await browser.newContext({ baseURL: baseURL! });
-  const son = await browser.newContext({ baseURL: baseURL! });
-  const momPage = await mom.newPage();
-  const sonPage = await son.newPage();
-  await signIn(momPage, MOM, baseURL!);
-  await signIn(sonPage, SON, baseURL!);
-  await newConversation(momPage.request, baseURL!, `엄마 대화 ${tag}`);
-  await newConversation(sonPage.request, baseURL!, `아들 대화 ${tag}`);
-  for (const [p, mine, theirs] of [
-    [momPage, `엄마 대화 ${tag}`, `아들 대화 ${tag}`],
-    [sonPage, `아들 대화 ${tag}`, `엄마 대화 ${tag}`],
-  ] as const) {
+  const people = [
+    { who: ADMIN, title: `아빠 대화 ${tag}` },
+    { who: MOM, title: `엄마 대화 ${tag}` },
+    { who: SON, title: `아들 대화 ${tag}` },
+  ];
+  const pages = [];
+  for (const p of people) {
+    const ctx = await browser.newContext({ baseURL: baseURL! });
+    const page = await ctx.newPage();
+    await useAccount(page, p.who);
+    await newConversation(page.request, baseURL!, p.title);
+    pages.push({ ...p, ctx, page });
+  }
+  for (const { page: p, title: mine } of pages) {
+    const theirs = people.map((x) => x.title).filter((t) => t !== mine);
     await p.goto("/");
     if (info.project.name === "mobile") await p.getByRole("button", { name: "메뉴 열기" }).click();
     await expect(p.getByTestId("sidebar").getByText(mine)).toBeVisible();
-    await expect(p.getByTestId("sidebar").getByText(theirs)).toHaveCount(0);
+    for (const t of theirs) await expect(p.getByTestId("sidebar").getByText(t)).toHaveCount(0);
     await p.reload();
     if (info.project.name === "mobile") await p.getByRole("button", { name: "메뉴 열기" }).click();
     await expect(p.getByTestId("sidebar").getByText(mine)).toBeVisible();
@@ -58,15 +61,15 @@ test("each family member sees only their own conversations, after reload and in 
   // Another browser (a fresh context) signed in as mom sees the same list.
   const other = await browser.newContext({ baseURL: baseURL! });
   const otherPage = await other.newPage();
-  await signIn(otherPage, MOM, baseURL!);
+  await useAccount(otherPage, MOM);
   await otherPage.goto("/");
   if (info.project.name === "mobile") await otherPage.getByRole("button", { name: "메뉴 열기" }).click();
   await expect(otherPage.getByTestId("sidebar").getByText(`엄마 대화 ${tag}`)).toBeVisible();
-  await Promise.all([mom.close(), son.close(), other.close()]);
+  await Promise.all([...pages.map((x) => x.ctx.close()), other.close()]);
 });
 
-test("a new chat starts by typing; the reply streams in (fake runtime)", async ({ page, baseURL }) => {
-  await signIn(page, SON, baseURL!);
+test("a new chat starts by typing; the reply streams in (fake runtime)", async ({ page }) => {
+  await useAccount(page, SON);
   await page.goto("/");
   await page.getByLabel("메시지 입력").fill("사과 바나나 포도");
   await page.getByRole("button", { name: "보내기" }).click();
@@ -77,7 +80,7 @@ test("a new chat starts by typing; the reply streams in (fake runtime)", async (
 });
 
 test("expired session: login again on the same address", async ({ page, baseURL }) => {
-  await signIn(page, SON, baseURL!);
+  await useAccount(page, SON);
   const c = await newConversation(page.request, baseURL!, `복귀 ${Date.now()}`);
   await page.context().clearCookies();
   await page.goto(`/c/${c.id}`);
@@ -88,8 +91,8 @@ test("expired session: login again on the same address", async ({ page, baseURL 
   await expect(page.locator(".topbar .title")).toHaveText(c.title);
 });
 
-test("dark mode follows the system and can be set by hand", async ({ page, baseURL }) => {
-  await signIn(page, SON, baseURL!);
+test("dark mode follows the system and can be set by hand", async ({ page }) => {
+  await useAccount(page, SON);
   await page.emulateMedia({ colorScheme: "dark" });
   await page.goto("/settings");
   const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
@@ -109,4 +112,68 @@ test("PWA manifest and service worker are served", async ({ request }) => {
   const sw = await request.get("/sw.js");
   expect(sw.ok()).toBe(true);
   expect(await sw.text()).toMatch(/never caches API/);
+});
+
+test("signing out in one tab signs out the other tab too, without leaving data on screen", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await browser.newContext({ baseURL: baseURL! });
+  const a = await ctx.newPage();
+  // Its own login: signing out must not end the saved session the other tests share.
+  const login = await a.request.post("/api/auth/login", {
+    data: { email: MOM.email, password: MOM.password },
+    headers: csrf(baseURL!),
+  });
+  expect(login.ok()).toBe(true);
+  const title = `탭 ${Date.now()}`;
+  await newConversation(a.request, baseURL!, title);
+  await a.goto("/settings");
+  const b = await ctx.newPage();
+  await b.goto("/settings");
+  if (info.project.name === "mobile") await b.getByRole("button", { name: "메뉴 열기" }).click();
+  await b.getByRole("button", { name: "로그아웃" }).click();
+  await expect(a.getByRole("button", { name: "로그인" })).toBeVisible();
+  await expect(a.getByText(title)).toHaveCount(0);
+  await ctx.close();
+});
+
+test("going back to a conversation that is still streaming does not repeat the text", async ({
+  page,
+  baseURL,
+}, info) => {
+  await useAccount(page, SON);
+  const other = await newConversation(page.request, baseURL!, `다른 ${Date.now()}`);
+  await page.goto("/");
+  await page.getByLabel("메시지 입력").fill("/long 60");
+  await page.getByRole("button", { name: "보내기" }).click();
+  await expect(page.getByTestId("assistant").last()).toContainText("단어3");
+  const here = page.url();
+  await page.goto(`/c/${other.id}`);
+  await page.goto(here);
+  await expect(page.getByTestId("assistant").last()).toContainText("단어60", { timeout: 10_000 });
+  const text = (await page.getByTestId("assistant").last().textContent()) ?? "";
+  expect(text.match(/단어1 /g)).toHaveLength(1);
+  void info;
+});
+
+test("drawer: focus moves in and back, and Back never reopens it", async ({ page, baseURL }, info) => {
+  test.skip(info.project.name !== "mobile", "the drawer exists on narrow screens");
+  await useAccount(page, MOM);
+  const c = await newConversation(page.request, baseURL!, `포커스 ${Date.now()}`);
+  await page.goto("/settings");
+  const sidebar = page.getByTestId("sidebar");
+  await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await expect(page.getByRole("dialog", { name: "사이드바" })).toBeVisible();
+  expect(await sidebar.evaluate((el) => el.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(sidebar).toBeHidden();
+  await expect(page.getByRole("button", { name: "메뉴 열기" })).toBeFocused();
+  // Open, pick a conversation, then go back: the drawer stays closed.
+  await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await sidebar.getByRole("link", { name: c.title }).click();
+  await expect(sidebar).toBeHidden();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/settings$/);
+  await expect(sidebar).toBeHidden();
 });

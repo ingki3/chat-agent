@@ -28,6 +28,18 @@ export const setUnauthenticatedHandler = (fn: () => void) => {
 
 type Method = "GET" | "POST" | "PATCH" | "DELETE";
 
+/**
+ * The outer layers (Cloudflare Access, the temporary code page) answer with these when *their* login ran out.
+ * The app cannot renew those itself: reload the page so they can — they bring the user back to this address.
+ */
+const OUTER_AUTH = new Set(["gate_required", "access_denied", "access_not_configured"]);
+let reloading = false;
+function reauthenticateOuter() {
+  if (reloading) return;
+  reloading = true;
+  window.location.reload();
+}
+
 async function call(method: Method, url: string, body?: unknown, headers: Record<string, string> = {}) {
   const res = await fetch(url, {
     method,
@@ -42,7 +54,8 @@ async function call(method: Method, url: string, body?: unknown, headers: Record
   });
   const json = (await res.json().catch(() => ({}))) as { error?: string };
   if (!res.ok) {
-    if (res.status === 401 && !url.startsWith("/api/auth/")) onUnauthenticated();
+    if (json.error && OUTER_AUTH.has(json.error)) reauthenticateOuter();
+    else if (res.status === 401 && !url.startsWith("/api/auth/")) onUnauthenticated();
     throw new ApiError(res.status, json.error ?? "unknown");
   }
   return json as unknown;

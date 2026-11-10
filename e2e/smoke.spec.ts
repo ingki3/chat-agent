@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { ADMIN, MOM, csrf } from "./helpers.js";
+import { ADMIN, csrf, useAccount } from "./helpers.js";
 
 test("login screen: wrong password, then sign in and out", async ({ page }) => {
   await page.goto("/");
@@ -19,7 +19,7 @@ test("a temporary password must be changed first (admin resets mom's)", async ({
   baseURL,
 }) => {
   // Admin resets a throwaway account, not mom (other tests sign in as her).
-  await page.request.post("/api/auth/login", { data: ADMIN, headers: csrf(baseURL!) });
+  await useAccount(page, ADMIN);
   const email = `tmp-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
   const created = await page.request.post("/api/admin/users", {
     data: { name: "임시", email },
@@ -42,7 +42,6 @@ test("a temporary password must be changed first (admin resets mom's)", async ({
   await expect(p.getByRole("link", { name: /관리자/ })).toHaveCount(0);
   expect((await p.request.get("/api/admin/users")).status()).toBe(403);
   await ctx.close();
-  void MOM;
 });
 
 test("client routes fall back to the SPA; cross-site POSTs are refused", async ({ page, request }) => {

@@ -1,4 +1,4 @@
-import { useDeferredValue, useState } from "react";
+import { useDeferredValue, useState, type RefObject } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
 import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
@@ -8,7 +8,12 @@ export const CONVERSATIONS_KEY = ["conversations"] as const;
 
 const RUNTIME_LABEL: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
 
-export function Sidebar(props: {
+export function Sidebar({
+  ref,
+  ...props
+}: {
+  ref?: RefObject<HTMLElement | null>;
+  onNavigate?: () => void;
   user: AuthUser;
   open: boolean;
   onClose: () => void;
@@ -25,7 +30,17 @@ export function Sidebar(props: {
   const signOut = async () => props.onSignedOut(await auth.logout());
 
   return (
-    <aside className={`side${props.open ? " drawer-open" : ""}`} aria-label="사이드바" data-testid="sidebar">
+    <aside
+      ref={ref}
+      className={`side${props.open ? " drawer-open" : ""}`}
+      aria-label="사이드바"
+      data-testid="sidebar"
+      // As an open drawer (narrow screens) it is a modal dialog.
+      {...(props.open ? { role: "dialog", "aria-modal": true } : {})}
+      onClick={(e) => {
+        if ((e.target as HTMLElement).closest("a")) props.onNavigate?.();
+      }}
+    >
       <div className="brand">
         <span className="logo">AL</span>Agent Lee
         <span className="grow" />
@@ -117,7 +132,6 @@ export function ConvMenu({ c }: { c: Conversation }) {
   const [open, setOpen] = useState(false);
   const qc = useQueryClient();
   const navigate = useNavigate();
-  const viewing = useMatch(`/c/${c.id}`);
   const refresh = () => qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
   const act = useMutation({
     mutationFn: async (kind: "rename" | "pin" | "delete") => {
@@ -132,7 +146,8 @@ export function ConvMenu({ c }: { c: Conversation }) {
         )
       ) {
         await conversations.remove(c.id);
-        if (viewing) navigate("/", { replace: true });
+        // Leave only if this conversation is still the one on screen (the user may have moved on meanwhile).
+        if (window.location.pathname === `/c/${c.id}`) navigate("/", { replace: true });
       }
     },
     onSettled: async () => {
