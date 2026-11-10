@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router";
 import type { Message, PublicPart, Run, StreamEvent } from "@agentlee/shared";
 import { conversations, errorText, runs } from "../api.js";
@@ -75,7 +75,14 @@ export function ChatPage() {
   const { id = "" } = useParams();
   const qc = useQueryClient();
   const conv = useQuery({ queryKey: ["conversation", id], queryFn: () => conversations.get(id) });
-  const messages = useQuery({ queryKey: ["messages", id], queryFn: () => conversations.messages(id) });
+  // Newest page first; "이전 메시지 보기" loads older pages (shown above).
+  const messages = useInfiniteQuery({
+    queryKey: ["messages", id],
+    queryFn: ({ pageParam }) => conversations.messages(id, pageParam),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (last) => last.nextBefore ?? undefined,
+  });
+  const list = messages.data ? [...messages.data.pages].reverse().flatMap((p) => p.items) : undefined;
   const active = useQuery({ queryKey: ["active-run", id], queryFn: () => conversations.activeRun(id) });
   const refresh = () =>
     Promise.all([
@@ -86,10 +93,11 @@ export function ChatPage() {
     ]);
   const live = useRunStream(active.data, () => void refresh());
   const bottom = useRef<HTMLDivElement>(null);
+  const newestId = list?.at(-1)?.id; // scroll down for new messages, not when older ones load above
   // Braces matter: newer browsers return a Promise from scrollIntoView, and an effect must not return one.
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: "end" });
-  }, [messages.data?.length, live?.text]);
+  }, [newestId, live?.text]);
 
   const send = async (text: string) => {
     const r = await conversations.send(id, text);
@@ -103,7 +111,17 @@ export function ChatPage() {
       <TopBar title={conv.data?.title ?? "…"}>{conv.data && <ConvMenu c={conv.data} />}</TopBar>
       <div className="thread" data-testid="thread">
         <div className="col">
-          {messages.data?.map((m) =>
+          {messages.hasNextPage && (
+            <button
+              type="button"
+              className="ghost small older"
+              disabled={messages.isFetchingNextPage}
+              onClick={() => void messages.fetchNextPage()}
+            >
+              {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
+            </button>
+          )}
+          {list?.map((m) =>
             live && m.id === live.messageId ? (
               <LiveReply key={m.id} live={live} />
             ) : (

@@ -40,21 +40,45 @@ function reauthenticateOuter() {
   window.location.reload();
 }
 
+/**
+ * A fetch that failed outright may be Cloudflare Access sending an expired session to its login page (a
+ * cross-origin redirect a fetch cannot follow). Check without following redirects; reload only in that case.
+ */
+async function checkOuterRedirect() {
+  try {
+    const r = await fetch("/api/health", { redirect: "manual", credentials: "same-origin" });
+    if (r.type === "opaqueredirect" || r.status === 401) reauthenticateOuter();
+  } catch {
+    // really offline / server down: nothing to re-authenticate
+  }
+}
+
 async function call(method: Method, url: string, body?: unknown, headers: Record<string, string> = {}) {
-  const res = await fetch(url, {
-    method,
-    credentials: "same-origin",
-    headers: {
-      Accept: "application/json",
-      // Required on every state-changing call (CSRF, see apps/server/src/auth/plugin.ts).
-      ...(method === "GET" ? {} : { "Content-Type": "application/json", [CSRF_HEADER]: "1" }),
-      ...headers,
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  const json = (await res.json().catch(() => ({}))) as { error?: string };
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method,
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        // Cloudflare Access answers an expired session with 401 (not a login-page redirect) for such requests.
+        "X-Requested-With": "XMLHttpRequest",
+        // Required on every state-changing call (CSRF, see apps/server/src/auth/plugin.ts).
+        ...(method === "GET" ? {} : { "Content-Type": "application/json", [CSRF_HEADER]: "1" }),
+        ...headers,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  } catch (e) {
+    void checkOuterRedirect();
+    throw e;
+  }
+  const isJson = (res.headers.get("content-type") ?? "").includes("application/json");
+  const json = (isJson ? await res.json().catch(() => ({})) : {}) as { error?: string };
   if (!res.ok) {
-    if (json.error && OUTER_AUTH.has(json.error)) reauthenticateOuter();
+    // Our server always answers JSON; a 401/403 page that is not JSON comes from Access in front of it.
+    if ((json.error && OUTER_AUTH.has(json.error)) || ((res.status === 401 || res.status === 403) && !isJson))
+      reauthenticateOuter();
     else if (res.status === 401 && !url.startsWith("/api/auth/")) onUnauthenticated();
     throw new ApiError(res.status, json.error ?? "unknown");
   }
@@ -87,11 +111,13 @@ export const admin = {
 const enc = encodeURIComponent;
 
 export const conversations = {
-  list: async (q = "") => {
-    const r = (await call("GET", `/api/conversations?limit=100${q ? `&q=${enc(q)}` : ""}`)) as {
-      items: unknown[];
-    };
-    return Conversation.array().parse(r.items);
+  /** One page of the list; pass the returned cursor for the next one. */
+  list: async (q = "", cursor?: string) => {
+    const r = (await call(
+      "GET",
+      `/api/conversations?limit=50${q ? `&q=${enc(q)}` : ""}${cursor ? `&cursor=${enc(cursor)}` : ""}`,
+    )) as { items: unknown[]; nextCursor: string | null };
+    return { items: Conversation.array().parse(r.items), nextCursor: r.nextCursor };
   },
   get: async (id: string) => Conversation.parse(await call("GET", `/api/conversations/${enc(id)}`)),
   create: async () => Conversation.parse(await call("POST", "/api/conversations", {})),
@@ -100,9 +126,13 @@ export const conversations = {
   pin: async (id: string, pinned: boolean) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { pinned })),
   remove: async (id: string) => call("DELETE", `/api/conversations/${enc(id)}`),
-  messages: async (id: string) => {
-    const r = (await call("GET", `/api/conversations/${enc(id)}/messages?limit=200`)) as { items: unknown[] };
-    return Message.array().parse(r.items);
+  /** A page of messages, oldest → newest; `before` asks for the page older than that seq. */
+  messages: async (id: string, before?: number) => {
+    const r = (await call(
+      "GET",
+      `/api/conversations/${enc(id)}/messages?limit=100${before ? `&before=${before}` : ""}`,
+    )) as { items: unknown[]; nextBefore: number | null };
+    return { items: Message.array().parse(r.items), nextBefore: r.nextBefore };
   },
   send: async (id: string, text: string) =>
     StartRunResponse.parse(

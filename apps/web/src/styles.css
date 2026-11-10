@@ -648,3 +648,12 @@ h2 {
     padding: 6px 8px 8px;
   }
 }
+.side .more,
+.thread .older {
+  margin: 4px 8px;
+  color: var(--accent);
+}
+.thread .older {
+  display: block;
+  margin: 0 auto 16px;
+}

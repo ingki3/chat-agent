@@ -148,13 +148,20 @@ test("going back to a conversation that is still streaming does not repeat the t
   await page.getByLabel("메시지 입력").fill("/long 60");
   await page.getByRole("button", { name: "보내기" }).click();
   await expect(page.getByTestId("assistant").last()).toContainText("단어3");
-  const here = page.url();
-  await page.goto(`/c/${other.id}`);
-  await page.goto(here);
+  const here = new URL(page.url()).pathname;
+  // Move inside the app (no page reload): A → B → A through the sidebar.
+  const nav = async (path: string, title?: string) => {
+    if (info.project.name === "mobile") await page.getByRole("button", { name: "메뉴 열기" }).click();
+    const sidebar = page.getByTestId("sidebar");
+    if (title) await sidebar.getByRole("link", { name: title }).click();
+    else await sidebar.locator(`a[href="${path}"]`).click();
+    await expect(page).toHaveURL(new RegExp(`${path}$`));
+  };
+  await nav(`/c/${other.id}`, other.title);
+  await nav(here);
   await expect(page.getByTestId("assistant").last()).toContainText("단어60", { timeout: 10_000 });
   const text = (await page.getByTestId("assistant").last().textContent()) ?? "";
   expect(text.match(/단어1 /g)).toHaveLength(1);
-  void info;
 });
 
 test("drawer: focus moves in and back, and Back never reopens it", async ({ page, baseURL }, info) => {
@@ -176,4 +183,30 @@ test("drawer: focus moves in and back, and Back never reopens it", async ({ page
   await page.goBack();
   await expect(page).toHaveURL(/\/settings$/);
   await expect(sidebar).toBeHidden();
+});
+
+test("widening the window with the drawer open leaves a usable page", async ({ page }, info) => {
+  test.skip(info.project.name !== "mobile", "starts on a narrow screen");
+  await useAccount(page, MOM);
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await expect(page.getByRole("dialog", { name: "사이드바" })).toBeVisible();
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await expect(page.getByRole("dialog", { name: "사이드바" })).toHaveCount(0);
+  expect(await page.locator("main").evaluate((m) => (m as HTMLElement).inert)).toBe(false);
+  await page.getByText("어둡게").click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+});
+
+test("long lists load more: conversations and older messages", async ({ page, baseURL }) => {
+  await useAccount(page, ADMIN);
+  // Admin's own list grows with the other tests; add enough to need a second page either way.
+  for (let i = 0; i < 55; i++) await newConversation(page.request, baseURL!, `목록 ${i}`);
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.goto("/");
+  const sidebar = page.getByTestId("sidebar");
+  await expect(sidebar.getByRole("button", { name: "더 보기" })).toBeVisible();
+  const before = await sidebar.getByTestId("conv").count();
+  await sidebar.getByRole("button", { name: "더 보기" }).click();
+  await expect.poll(() => sidebar.getByTestId("conv").count()).toBeGreaterThan(before);
 });

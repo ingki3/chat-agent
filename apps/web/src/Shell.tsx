@@ -16,6 +16,15 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabi
  */
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
   const [drawer, setDrawer] = useState(false);
+  // The drawer exists only at 900px and below: widening the window closes it (and with it the modal state).
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 900px)");
+    const onChange = () => {
+      if (!mq.matches) setDrawer(false);
+    };
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
   const trigger = useRef<HTMLElement | null>(null);
   const aside = useRef<HTMLElement | null>(null);
 

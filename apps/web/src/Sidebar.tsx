@@ -1,5 +1,5 @@
 import { useDeferredValue, useState, type RefObject } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
 import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
 import { auth, conversations, errorText } from "./api.js";
@@ -21,12 +21,16 @@ export function Sidebar({
 }) {
   const [q, setQ] = useState("");
   const query = useDeferredValue(q.trim());
-  const list = useQuery({
+  // Pages of 50, pinned first then most recent (server order); "더 보기" loads the next page.
+  const list = useInfiniteQuery({
     queryKey: [...CONVERSATIONS_KEY, query],
-    queryFn: () => conversations.list(query),
+    queryFn: ({ pageParam }) => conversations.list(query, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
   });
-  const pinned = list.data?.filter((c) => c.pinned) ?? [];
-  const recent = list.data?.filter((c) => !c.pinned) ?? [];
+  const items = list.data?.pages.flatMap((p) => p.items);
+  const pinned = items?.filter((c) => c.pinned) ?? [];
+  const recent = items?.filter((c) => !c.pinned) ?? [];
   const signOut = async () => props.onSignedOut(await auth.logout());
 
   return (
@@ -71,7 +75,17 @@ export function Sidebar({
       {recent.map((c) => (
         <ConvItem key={c.id} c={c} />
       ))}
-      {list.data?.length === 0 && (
+      {list.hasNextPage && (
+        <button
+          type="button"
+          className="ghost small more"
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage()}
+        >
+          {list.isFetchingNextPage ? "불러오는 중…" : "더 보기"}
+        </button>
+      )}
+      {items?.length === 0 && (
         <p className="muted small pad">{query ? "찾는 대화가 없어요." : "아직 대화가 없어요."}</p>
       )}
       <div className="grp">가족 공유</div>
