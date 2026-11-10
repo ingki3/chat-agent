@@ -1,6 +1,13 @@
 import crypto from "node:crypto";
 import { and, count, eq, gt, lt, ne } from "drizzle-orm";
-import type { AuthUser, Role } from "@agentlee/shared";
+import {
+  DEFAULT_PERMISSIONS,
+  type AdminUser,
+  type AuthUser,
+  type Role,
+  type RuntimeId,
+  type UserPermissions,
+} from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { sessions, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
@@ -16,6 +23,25 @@ export const normalizeEmail = (e: string) => e.trim().toLowerCase();
 
 export function toAuthUser(u: UserRow): AuthUser {
   return { id: u.id, email: u.email, name: u.name, role: u.role, mustChangePassword: u.mustChangePassword };
+}
+
+export function toAdminUser(u: UserRow): AdminUser {
+  return {
+    ...toAuthUser(u),
+    active: u.active,
+    permissions: u.permissions as UserPermissions,
+    defaultRuntime: (u.defaultRuntime as RuntimeId | null) ?? null,
+    createdAt: u.createdAt,
+  };
+}
+
+/** Readable temporary password, e.g. `k7mq-3xtp-w9hd` (no 0/o/1/l/i): ~62 bits, shown to the admin once. */
+export function temporaryPassword(): string {
+  const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+  const groups = Array.from({ length: 3 }, () =>
+    Array.from({ length: 4 }, () => alphabet[crypto.randomInt(alphabet.length)]).join(""),
+  );
+  return groups.join("-");
 }
 
 /** Accounts and login sessions. Session cookies hold a random token; the database stores only its hash. */
@@ -38,6 +64,10 @@ export class UserStore {
       .get();
   }
 
+  list(): UserRow[] {
+    return this.db.select().from(users).orderBy(users.createdAt).all();
+  }
+
   byId(id: string): UserRow | undefined {
     return this.db.select().from(users).where(eq(users.id, id)).get();
   }
@@ -48,6 +78,8 @@ export class UserStore {
     role: Role;
     passwordHash: string;
     mustChangePassword?: boolean;
+    permissions?: UserPermissions;
+    defaultRuntime?: RuntimeId | null;
   }): UserRow {
     const row = {
       id: crypto.randomUUID(),
@@ -57,6 +89,8 @@ export class UserStore {
       passwordHash: input.passwordHash,
       mustChangePassword: input.mustChangePassword ?? false,
       active: true,
+      permissions: input.permissions ?? DEFAULT_PERMISSIONS,
+      defaultRuntime: input.defaultRuntime ?? null,
       createdAt: this.now(),
       updatedAt: this.now(),
     };
@@ -91,6 +125,33 @@ export class UserStore {
       .where(keep ? and(eq(sessions.userId, userId), ne(sessions.id, keep)) : eq(sessions.userId, userId))
       .run();
     this.events.emit("user-access-changed", { userId, reason: "password_changed" });
+  }
+
+  /**
+   * Deactivates unless that would leave no active admin. Check and change run in one transaction, so two admins
+   * deactivating each other at the same moment cannot both succeed. Returns false when refused.
+   */
+  deactivateUnlessLastAdmin(userId: string): boolean {
+    const ok = this.db.$client
+      .transaction(() => {
+        const target = this.byId(userId);
+        if (!target) return false;
+        if (target.role === "admin" && target.active) {
+          const admins =
+            this.db
+              .select({ n: count() })
+              .from(users)
+              .where(and(eq(users.role, "admin"), eq(users.active, true)))
+              .get()?.n ?? 0;
+          if (admins <= 1) return false;
+        }
+        this.db.update(users).set({ active: false, updatedAt: this.now() }).where(eq(users.id, userId)).run();
+        this.db.delete(sessions).where(eq(sessions.userId, userId)).run();
+        return true;
+      })
+      .immediate();
+    if (ok) this.events.emit("user-access-changed", { userId, reason: "deactivated" });
+    return ok;
   }
 
   /** Deactivates the account and ends every session at once. */

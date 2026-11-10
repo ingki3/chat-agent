@@ -9,20 +9,60 @@ test("first run creates the admin, then login and logout work", async ({ page },
   test.skip(info.project.name !== "desktop", "account state is shared; run the flow once");
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Agent Lee 처음 설정" })).toBeVisible();
-  await page.getByLabel("이름").fill("관리자");
+  await page.getByLabel("이름", { exact: true }).fill("관리자");
   await page.getByLabel(/^비밀번호 \(/).fill(PW);
   await page.getByLabel("비밀번호 확인").fill(PW);
   await page.getByRole("button", { name: "관리자 만들기" }).click();
   await expect(page.getByTestId("whoami")).toContainText("관리자님");
 
   await page.getByRole("button", { name: "로그아웃" }).click();
-  await page.getByLabel("이메일").fill("ingki3@gmail.com");
-  await page.getByLabel("비밀번호").fill("wrong-password!");
+  await expect(page.getByRole("button", { name: "로그인" })).toBeVisible();
+  await page.getByLabel("이메일", { exact: true }).fill("ingki3@gmail.com");
+  await page.getByLabel("비밀번호", { exact: true }).fill("wrong-password!");
   await page.getByRole("button", { name: "로그인" }).click();
   await expect(page.getByRole("alert")).toHaveText(/맞지 않아요/);
-  await page.getByLabel("비밀번호").fill(PW);
+  await page.getByLabel("비밀번호", { exact: true }).fill(PW);
   await page.getByRole("button", { name: "로그인" }).click();
   await expect(page.getByTestId("whoami")).toContainText("ingki3@gmail.com");
+});
+
+test("admin adds family accounts; a temporary password must be changed at first login", async ({
+  page,
+}, info) => {
+  test.skip(info.project.name !== "desktop", "account state is shared; run the flow once");
+  await page.goto("/");
+  await page.getByLabel("이메일", { exact: true }).fill("ingki3@gmail.com");
+  await page.getByLabel("비밀번호", { exact: true }).fill(PW);
+  await page.getByRole("button", { name: "로그인" }).click();
+  const temps: Record<string, string> = {};
+  for (const [name, email] of [
+    ["엄마", "mom@example.com"],
+    ["아들", "son@example.com"],
+  ] as const) {
+    await page.getByLabel("이름", { exact: true }).fill(name);
+    await page.getByLabel("새 가족 이메일").fill(email);
+    await page.getByRole("button", { name: "계정 추가" }).click();
+    const notice = page.getByTestId("temp-password");
+    await expect(notice).toContainText(email);
+    temps[email] = (await notice.locator("code").textContent())!;
+    await page.getByRole("button", { name: "확인했어요" }).click();
+  }
+  await expect(page.getByRole("listitem")).toHaveCount(3);
+  await page.getByRole("button", { name: "로그아웃" }).click();
+  await expect(page.getByRole("button", { name: "로그인" })).toBeVisible();
+
+  await page.getByLabel("이메일", { exact: true }).fill("son@example.com");
+  await page.getByLabel("비밀번호", { exact: true }).fill(temps["son@example.com"]!);
+  await page.getByRole("button", { name: "로그인" }).click();
+  await expect(page.getByRole("heading", { name: "비밀번호 변경" })).toBeVisible();
+  await page.getByLabel("현재 비밀번호").fill(temps["son@example.com"]!);
+  await page.getByLabel(/^새 비밀번호 \(/).fill("sons-new-password");
+  await page.getByLabel("새 비밀번호 확인").fill("sons-new-password");
+  await page.getByRole("button", { name: "변경" }).click();
+  await expect(page.getByTestId("whoami")).toContainText("아들님 (가족)");
+  await expect(page.getByRole("region", { name: "가족 계정" })).toHaveCount(0);
+  // The member cannot call the user API directly either.
+  expect((await page.request.get("/api/admin/users")).status()).toBe(403);
 });
 
 test("client routes fall back to the SPA and private APIs need a session", async ({ page, request }) => {
