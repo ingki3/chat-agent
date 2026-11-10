@@ -111,6 +111,13 @@ export async function safeFetch(input: string, o: SafeFetchOptions = {}): Promis
   throw new BlockedRequestError("too many redirects");
 }
 
+/**
+ * Our own agents: never the global ones, which newer Node versions may route through HTTP(S)_PROXY
+ * (NODE_USE_ENV_PROXY) — a proxy would resolve the name itself and the address policy would never see it.
+ */
+const httpAgent = new http.Agent({ keepAlive: false });
+const httpsAgent = new https.Agent({ keepAlive: false });
+
 function request(url: URL, o: SafeFetchOptions): Promise<SafeResponse> {
   const host = url.hostname.replace(/^\[|\]$/g, "");
   // The lookup the socket actually uses: every resolved address must be allowed, and that address is used.
@@ -138,6 +145,7 @@ function request(url: URL, o: SafeFetchOptions): Promise<SafeResponse> {
       {
         method: "GET",
         lookup,
+        agent: url.protocol === "https:" ? httpsAgent : httpAgent,
         headers: { "user-agent": "AgentLee/1.0", ...o.headers },
         timeout: o.timeoutMs ?? 10_000,
       },

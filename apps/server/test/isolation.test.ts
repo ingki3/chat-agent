@@ -4,9 +4,15 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { PathDeniedError, resolveInside } from "../src/isolation/paths.js";
+import { openInside, PathDeniedError, resolveInside } from "../src/isolation/paths.js";
 import { BlockedRequestError, isBlockedAddress, safeFetch } from "../src/isolation/net.js";
-import { allowEnv, buildProfile, runIsolated, SandboxUnavailableError } from "../src/isolation/sandbox.js";
+import {
+  allowEnv,
+  buildProfile,
+  descendants,
+  runIsolated,
+  SandboxUnavailableError,
+} from "../src/isolation/sandbox.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 import {
   assertOnlyOurMcp,
@@ -61,6 +67,36 @@ describe("path checks", () => {
 });
 
 const darwin = process.platform === "darwin";
+
+describe("descendant tracking", () => {
+  it("follows parent links across process groups and remembers orphans", () => {
+    const procs = [
+      { pid: 100, ppid: 1, pgid: 100, rss: 1 }, // the sandboxed process
+      { pid: 101, ppid: 100, pgid: 100, rss: 1 }, // child in the same group
+      { pid: 102, ppid: 101, pgid: 102, rss: 1 }, // grandchild that called setsid
+      { pid: 103, ppid: 102, pgid: 102, rss: 1 }, // its child
+      { pid: 200, ppid: 1, pgid: 200, rss: 1 }, // unrelated
+      { pid: 104, ppid: 1, pgid: 104, rss: 1 }, // orphan we saw before (re-parented to launchd)
+    ];
+    expect([...descendants(100, procs, new Set([104]))].sort()).toEqual([100, 101, 102, 103, 104]);
+    expect([...descendants(100, procs, new Set())].sort()).toEqual([100, 101, 102, 103]);
+  });
+});
+
+describe("hard links", () => {
+  it("refuses a hard link to another family member's file, for checks, reads and writes", async () => {
+    const t = familyTree();
+    fs.linkSync(path.join(t.mom, "diary.txt"), path.join(t.son, "hard.txt"));
+    expect(() => resolveInside("hard.txt", [t.son])).toThrow(PathDeniedError);
+    await expect(openInside("hard.txt", [t.son])).rejects.toBeInstanceOf(PathDeniedError);
+    await expect(openInside("hard.txt", [t.son], "w")).rejects.toBeInstanceOf(PathDeniedError);
+    expect(fs.readFileSync(path.join(t.mom, "diary.txt"), "utf8")).toBe("MOM-SECRET");
+    // Ordinary files open fine.
+    const fh = await openInside("homework.txt", [t.son]);
+    expect((await fh.readFile("utf8")).toString()).toBe("son's homework");
+    await fh.close();
+  });
+});
 
 describe.skipIf(!darwin)("process sandbox (macOS sandbox-exec)", () => {
   const t = familyTree();
@@ -225,6 +261,84 @@ describe.skipIf(!darwin)("process sandbox (macOS sandbox-exec)", () => {
     });
   });
 
+  it("cannot create a hard link to a file outside its folders", async () => {
+    const r = await runIsolated({
+      command: "/bin/ln",
+      args: [path.join(t.mom, "diary.txt"), path.join(t.son, "out", "steal.txt")],
+      cwd: t.son,
+      env: {},
+      read: [t.son],
+      write: [path.join(t.son, "out")],
+      timeoutMs: 5000,
+      maxOutputBytes: 10_000,
+    });
+    expect(r.code).not.toBe(0);
+    expect(fs.existsSync(path.join(t.son, "out", "steal.txt"))).toBe(false);
+  });
+
+  it("forks only when allowed, and kills descendants that left the process group when the parent exits", async () => {
+    const node = fs.realpathSync(process.execPath);
+    const nodeHome = path.dirname(path.dirname(node));
+    // The parent starts a detached grandchild (its own session and group), prints its pid and exits.
+    const script = `const c=require("child_process").spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"ignore"});c.unref();process.stdout.write(String(c.pid));setTimeout(()=>process.exit(0),300)`;
+    const run = (allowFork: boolean) =>
+      runIsolated({
+        command: node,
+        args: ["-e", script],
+        cwd: t.son,
+        env: {},
+        read: [nodeHome],
+        write: [],
+        allowFork,
+        timeoutMs: 8000,
+        maxOutputBytes: 10_000,
+      });
+    const denied = await run(false);
+    expect(denied.code).not.toBe(0);
+    const r = await run(true);
+    const pid = Number(r.stdout);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((res) => setTimeout(res, 200));
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  });
+
+  it("a child that exits before reading its input does not crash the server", async () => {
+    const r = await runIsolated({
+      command: "/usr/bin/true",
+      args: [],
+      cwd: t.son,
+      env: {},
+      read: [],
+      write: [],
+      timeoutMs: 5000,
+      maxOutputBytes: 1000,
+      stdin: "x".repeat(4 * 1024 * 1024),
+    });
+    expect(r.code).toBe(0);
+  });
+
+  it("stops the process when its memory cannot be measured", async () => {
+    const r = await runIsolated({
+      command: "/bin/sleep",
+      args: ["5"],
+      cwd: t.son,
+      env: {},
+      read: [],
+      write: [],
+      timeoutMs: 8000,
+      maxOutputBytes: 1000,
+      maxRssBytes: 1024 * 1024 * 1024,
+      probe: () => Promise.reject(new Error("ps failed")),
+    });
+    expect(r.killed).toBe("monitor");
+  });
+
   it("escapes paths in the profile", () => {
     const dir = fs.realpathSync(os.tmpdir());
     const p = buildProfile({ command: "/bin/cat", read: [path.join(dir, 'a"b\\c')], write: [] });
@@ -322,6 +436,28 @@ describe("network policy", () => {
       allow: (address, host) => host === "public.test" && address === "127.0.0.1",
     });
     await expect(res).rejects.toBeInstanceOf(BlockedRequestError);
+  });
+
+  it("ignores proxy settings from the environment (the policy must see the real address)", async () => {
+    let proxied = 0;
+    const proxy = http.createServer((_q, r) => {
+      proxied++;
+      r.end("via proxy");
+    });
+    await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", r));
+    const saved = { ...process.env };
+    process.env.HTTP_PROXY = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+    process.env.HTTPS_PROXY = process.env.HTTP_PROXY;
+    process.env.NODE_USE_ENV_PROXY = "1";
+    try {
+      await expect(
+        safeFetch("http://rebind.test/", { resolve: async () => ["10.0.0.1"] }),
+      ).rejects.toBeInstanceOf(BlockedRequestError);
+      expect(proxied).toBe(0);
+    } finally {
+      process.env = saved;
+      await new Promise<void>((r) => proxy.close(() => r()));
+    }
   });
 
   it("refuses other schemes and credentials in the URL", async () => {
