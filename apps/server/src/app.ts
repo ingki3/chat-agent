@@ -64,6 +64,8 @@ export type BuildOptions = {
   /** Login rate-limit/clock overrides (tests). */
   auth?: AuthRouteOptions;
   events?: AppEvents;
+  /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
+  hmrPort?: number;
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
@@ -115,11 +117,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     await app.register(middie);
     const vite = await createServer({
       root: WEB_ROOT,
-      // Vite's WebSocket upgrade bypasses Fastify hooks, so it is switched off while the code gate is on.
+      // A WebSocket upgrade on the app port would bypass every Fastify hook (trust boundary, gate, session), so
+      // HMR never shares the app server: it gets its own loopback-only port, which the tunnel does not reach,
+      // and is switched off entirely while the code gate is on.
       // Host is already checked by the trust boundary; let Vite serve the public host too.
       server: config.tempGateCode
         ? { middlewareMode: true, hmr: false, ws: false, allowedHosts: [config.publicHost] }
-        : { middlewareMode: true, hmr: { server: app.server }, allowedHosts: [config.publicHost] },
+        : {
+            middlewareMode: true,
+            hmr: { host: "127.0.0.1", port: opts.hmrPort ?? 24678 },
+            allowedHosts: [config.publicHost],
+          },
       appType: "spa",
     });
     // API routes must reach Fastify; Vite's SPA fallback would otherwise answer /api/* with index.html.

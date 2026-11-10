@@ -2,7 +2,7 @@ import net from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { CSRF_HEADER, type AuthError } from "@agentlee/shared";
 import type { Config } from "../config.js";
-import { isApiPath } from "../paths.js";
+import { isApiRequest } from "../paths.js";
 import type { AccessVerifier } from "./access-jwt.js";
 import "./context.js";
 import type { UserStore } from "./users.js";
@@ -87,7 +87,7 @@ export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): vo
  */
 export function registerCsrf(app: FastifyInstance, config: Config): void {
   app.addHook("onRequest", async (req, reply) => {
-    if (SAFE_METHODS.has(req.method) || !isApiPath(req.url)) return;
+    if (SAFE_METHODS.has(req.method) || !isApiRequest(req)) return;
     const expected =
       req.ctx.origin === "edge"
         ? `https://${config.publicHost}`
@@ -116,7 +116,7 @@ export function registerSession(app: FastifyInstance, users: UserStore | undefin
   // Route rules. API routes are private unless they opt out, so a new route cannot be public by accident.
   app.addHook("preHandler", async (req, reply) => {
     const cfg = req.routeOptions.config ?? {};
-    const rule = cfg.auth ?? (isApiPath(req.url) ? "user" : "public");
+    const rule = cfg.auth ?? (isApiRequest(req) ? "user" : "public");
     if (rule === "public") return;
     if (req.ctx.emailMismatch) return deny(reply, 403, "access_email_mismatch");
     const user = req.ctx.user;

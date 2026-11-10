@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import "./auth/context.js";
 import { readCookie } from "./auth/plugin.js";
-import { isApiPath } from "./paths.js";
+import { isApiRequest, routerPath } from "./paths.js";
 
 /**
  * Temporary access-code gate (until Cloudflare Access is configured, docs/ops.md §7).
@@ -13,7 +13,7 @@ import { isApiPath } from "./paths.js";
 
 export const GATE_COOKIE = "al_gate";
 export const GATE_PATH = "/gate";
-export const isGatePath = (url: string | undefined) => (url ?? "/").split("?")[0] === GATE_PATH;
+export const isGatePath = (url: string | undefined) => routerPath(url) === GATE_PATH;
 
 export type GateOptions = {
   code: string;
@@ -93,7 +93,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
     // Only tunnel requests are gated; local requests already passed the trust boundary (Host + no Cf-* headers).
     if (req.ctx.origin !== "edge" || isGatePath(req.url)) return;
     if (valid(req)) return;
-    if (isApiPath(req.url))
+    if (isApiRequest(req))
       return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
     if (req.method === "GET" || req.method === "HEAD")
       return reply.code(302).header("Cache-Control", "no-store").redirect(GATE_PATH);

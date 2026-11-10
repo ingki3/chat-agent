@@ -31,6 +31,14 @@ export class FailureLimiter {
     this.hits.set(key, list);
   }
 
+  /** Takes back the most recent entry (an attempt reserved with `fail` that turned out to succeed). */
+  release(key: string): void {
+    const list = this.recent(key);
+    list.pop();
+    if (list.length) this.hits.set(key, list);
+    else this.hits.delete(key);
+  }
+
   reset(key: string): void {
     this.hits.delete(key);
   }

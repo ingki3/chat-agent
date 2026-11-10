@@ -392,6 +392,93 @@ describe("login rate limits", () => {
   });
 });
 
+describe("races", () => {
+  it("refuses a login whose password check was overtaken by a password change or deactivation", async () => {
+    const gates: (() => void)[] = [];
+    const verify = async (hash: string, pw: string) => {
+      const real = await (await import("../src/auth/passwords.js")).verifyPassword(hash, pw);
+      await new Promise<void>((r) => gates.push(r));
+      return real;
+    };
+    const { app } = await start({}, { verify });
+    const users = app.users!;
+    const son = users.create({
+      email: "son@example.com",
+      name: "아들",
+      role: "member",
+      passwordHash: await hashPassword(PW),
+    });
+    const waitGate = async () => {
+      while (!gates.length) await new Promise((r) => setTimeout(r, 5));
+      return gates.shift()!;
+    };
+
+    const pending = login(app, "son@example.com", PW);
+    const release = await waitGate();
+    users.setPassword(son.id, await hashPassword("a-brand-new-password"));
+    release();
+    expect((await pending).statusCode).toBe(401);
+
+    users.setPassword(son.id, await hashPassword(PW));
+    const pending2 = login(app, "son@example.com", PW);
+    const release2 = await waitGate();
+    users.deactivate(son.id);
+    release2();
+    expect((await pending2).statusCode).toBe(401);
+  });
+
+  it("counts parallel guesses against the limit before the slow password check", async () => {
+    const { app } = await start({}, { perAccount: 1, perIp: 100 });
+    await setup(app);
+    const rs = await Promise.all(Array.from({ length: 6 }, () => login(app, ADMIN, "wrong password!")));
+    expect(rs.map((r) => r.statusCode).sort()).toEqual([401, 429, 429, 429, 429, 429]);
+  });
+
+  it("does not count a successful login against the IP budget", async () => {
+    const { app } = await start({}, { perIp: 2 });
+    await setup(app);
+    for (let i = 0; i < 4; i++) expect((await login(app, ADMIN, PW)).statusCode).toBe(200);
+  });
+});
+
+describe("encoded paths", () => {
+  it("applies CSRF and the private-by-default rule to percent-encoded API paths", async () => {
+    const { app } = await start();
+    const r = await app.inject({
+      method: "POST",
+      url: "/%61pi/auth/setup",
+      headers: local,
+      payload: { name: "x", password: PW },
+    });
+    expect(r.statusCode).toBe(403);
+    expect(r.json()).toEqual({ error: "csrf" });
+    for (const url of ["/%61pi/test/user", "/%61%70%69/test/user", "/api/test/%75ser"])
+      expect((await app.inject({ url, headers: local })).statusCode, url).toBe(401);
+  });
+
+  it("does the same behind the temporary gate (Access not configured)", async () => {
+    const { app } = await start({ CF_ACCESS_TEAM_DOMAIN: "", CF_ACCESS_AUD: "", TEMP_GATE_CODE: "12345678" });
+    const edgeHost = { host: HOST };
+    const g = await app.inject({
+      method: "POST",
+      url: "/gate",
+      headers: { ...edgeHost, "content-type": "application/x-www-form-urlencoded" },
+      payload: "code=12345678",
+    });
+    const cookie = cookieOf(g.headers["set-cookie"]);
+    const r = await app.inject({
+      method: "POST",
+      url: "/%61pi/auth/setup",
+      headers: { ...edgeHost, cookie },
+      payload: { name: "x", password: PW },
+    });
+    expect(r.statusCode).toBe(403);
+    expect((await app.inject({ url: "/%61pi/test/user", headers: { ...edgeHost, cookie } })).statusCode).toBe(
+      401,
+    );
+  });
+});
+
 describe("CSRF", () => {
   it("refuses state-changing API calls without the right Origin or the custom header", async () => {
     const { app } = await start();
