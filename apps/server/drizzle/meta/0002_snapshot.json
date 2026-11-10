@@ -102,10 +102,7 @@
       "indexes": {
         "conversations_owner_updated_idx": {
           "name": "conversations_owner_updated_idx",
-          "columns": [
-            "owner_id",
-            "updated_at"
-          ],
+          "columns": ["owner_id", "updated_at"],
           "isUnique": false
         }
       },
@@ -114,12 +111,8 @@
           "name": "conversations_owner_id_users_id_fk",
           "tableFrom": "conversations",
           "tableTo": "users",
-          "columnsFrom": [
-            "owner_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["owner_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -258,19 +251,12 @@
       "indexes": {
         "messages_conversation_seq_idx": {
           "name": "messages_conversation_seq_idx",
-          "columns": [
-            "conversation_id",
-            "seq"
-          ],
+          "columns": ["conversation_id", "seq"],
           "isUnique": true
         },
         "messages_conversation_active_idx": {
           "name": "messages_conversation_active_idx",
-          "columns": [
-            "conversation_id",
-            "active",
-            "seq"
-          ],
+          "columns": ["conversation_id", "active", "seq"],
           "isUnique": false
         }
       },
@@ -279,12 +265,8 @@
           "name": "messages_conversation_id_conversations_id_fk",
           "tableFrom": "messages",
           "tableTo": "conversations",
-          "columnsFrom": [
-            "conversation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["conversation_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -373,9 +355,7 @@
       "indexes": {
         "runtime_sessions_conversation_idx": {
           "name": "runtime_sessions_conversation_idx",
-          "columns": [
-            "conversation_id"
-          ],
+          "columns": ["conversation_id"],
           "isUnique": false
         }
       },
@@ -384,12 +364,8 @@
           "name": "runtime_sessions_conversation_id_conversations_id_fk",
           "tableFrom": "runtime_sessions",
           "tableTo": "conversations",
-          "columnsFrom": [
-            "conversation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["conversation_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -442,9 +418,7 @@
       "indexes": {
         "sessions_user_idx": {
           "name": "sessions_user_idx",
-          "columns": [
-            "user_id"
-          ],
+          "columns": ["user_id"],
           "isUnique": false
         }
       },
@@ -453,12 +427,8 @@
           "name": "sessions_user_id_users_id_fk",
           "tableFrom": "sessions",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -596,9 +566,7 @@
       "indexes": {
         "users_email_unique": {
           "name": "users_email_unique",
-          "columns": [
-            "email"
-          ],
+          "columns": ["email"],
           "isUnique": true
         }
       },

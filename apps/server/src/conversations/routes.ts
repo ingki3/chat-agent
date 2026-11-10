@@ -95,12 +95,10 @@ export function registerConversationRoutes(app: FastifyInstance, store: Conversa
     async (req, reply) => {
       const q = parse(ListMessagesQuery, req.query, reply);
       if (!q) return reply;
-      const rows = store.messages(req.params.id, { before: q.before, limit: q.limit });
-      const oldest = rows[0];
+      const page = store.messagePage(req.params.id, { before: q.before, limit: q.limit });
       return reply.header("Cache-Control", "no-store").send({
-        items: rows.map(toMessage),
-        // Older page exists when the oldest returned message is not the first one.
-        nextBefore: oldest && rows.length === q.limit ? oldest.seq : null,
+        items: page.items.map(toMessage),
+        nextBefore: page.hasMore ? page.items[0]!.seq : null,
       });
     },
   );

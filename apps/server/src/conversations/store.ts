@@ -246,6 +246,16 @@ export class ConversationStore {
       .get();
   }
 
+  /** One page of the active history (oldest → newest) and whether older messages exist. */
+  messagePage(
+    conversationId: string,
+    opts: { before?: number | undefined; limit: number },
+  ): { items: MessageRow[]; hasMore: boolean } {
+    const rows = this.messages(conversationId, { ...opts, limit: opts.limit + 1 });
+    const hasMore = rows.length > opts.limit;
+    return { items: hasMore ? rows.slice(1) : rows, hasMore };
+  }
+
   /** Active history, newest page first by `before`, returned oldest → newest. */
   messages(conversationId: string, opts: { before?: number | undefined; limit: number }): MessageRow[] {
     const rows = this.db
@@ -338,6 +348,7 @@ export class ConversationStore {
         runtime: target.runtime,
         model: target.model,
         effort: target.effort,
+        connectionId: target.connectionId,
         replaces: target.id,
       });
     })();
@@ -345,15 +356,23 @@ export class ConversationStore {
 
   // ---- runtime sessions (used by #12 / #45) ----
 
+  /**
+   * Records a runtime session and what it has seen: `conversationRevision` is the revision the runtime actually
+   * reflects, `lastMessageId` the last message it saw (an active message of this conversation, or null).
+   * A session that saw an older revision is refused — it must never look current to #45.
+   */
   saveSession(s: {
     conversationId: string;
     runtime: string;
     connectionId?: string | null;
     externalSessionId: string;
     lastMessageId: string | null;
+    conversationRevision: number;
   }): SessionRow {
     const conv = this.get(s.conversationId);
     if (!conv) throw new Error("conversation not found");
+    if (s.conversationRevision !== conv.revision) throw new Error("session reflects an older revision");
+    this.assertCheckpoint(s.conversationId, s.lastMessageId);
     const t = this.now();
     const row: SessionRow = {
       id: crypto.randomUUID(),
@@ -362,7 +381,7 @@ export class ConversationStore {
       connectionId: s.connectionId ?? null,
       externalSessionId: s.externalSessionId,
       lastMessageId: s.lastMessageId,
-      conversationRevision: conv.revision,
+      conversationRevision: s.conversationRevision,
       invalidated: false,
       createdAt: t,
       updatedAt: t,
@@ -379,6 +398,12 @@ export class ConversationStore {
       .where(and(eq(runtimeSessions.conversationId, conversationId), eq(runtimeSessions.invalidated, false)))
       .orderBy(asc(runtimeSessions.createdAt))
       .all();
+  }
+
+  private assertCheckpoint(conversationId: string, messageId: string | null): void {
+    if (messageId === null) return;
+    const m = this.message(conversationId, messageId);
+    if (!m || !m.active) throw new Error("checkpoint must be an active message of this conversation");
   }
 
   invalidateSessions(conversationId: string): void {
