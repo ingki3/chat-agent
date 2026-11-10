@@ -142,9 +142,22 @@ export function watchAccess(
   const onResource = (e: { kind: string; id: string }) => {
     if (ref && e.kind === ref.kind && e.id === ref.id) check();
   };
+  // Sessions also end by time: re-check when this one expires (in steps — setTimeout caps near 24.8 days).
+  let expiryTimer: NodeJS.Timeout | undefined;
+  const scheduleExpiry = () => {
+    const expiresAt = token ? users?.sessionExpiresAt(token) : undefined;
+    if (expiresAt === undefined) return;
+    const wait = Math.min(Math.max(expiresAt - Date.now(), 0) + 50, 24 * 3600_000);
+    expiryTimer = setTimeout(() => {
+      check();
+      if (!done) scheduleExpiry();
+    }, wait);
+    expiryTimer.unref();
+  };
   const unsubscribe = () => {
     app.appEvents.off("user-access-changed", onUser);
     app.appEvents.off("resource-access-changed", onResource);
+    clearTimeout(expiryTimer);
   };
   function check() {
     if (done || stillAllowed()) return;
@@ -155,5 +168,6 @@ export function watchAccess(
   app.appEvents.on("user-access-changed", onUser);
   app.appEvents.on("resource-access-changed", onResource);
   check();
+  if (!done) scheduleExpiry();
   return unsubscribe;
 }

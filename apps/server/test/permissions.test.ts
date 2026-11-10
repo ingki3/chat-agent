@@ -22,8 +22,10 @@ afterEach(async () => {
   while (apps.length) await apps.pop()!.close();
 });
 
+let lastDb: ReturnType<typeof createTestDb>;
 const newApp = async () => {
-  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: createTestDb(), logger: false });
+  lastDb = createTestDb();
+  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: lastDb, logger: false });
   apps.push(app);
   return app;
 };
@@ -93,6 +95,7 @@ async function withNotes() {
   });
   // A non-API page that addresses a resource (like /a/:id for artifacts).
   app.get("/n/:id", { config: { resource: { ...note, action: "read" } } }, async () => "page");
+  app.post("/n/:id", { config: { resource: { ...note, action: "write" } } }, async () => "saved");
   const f = await createFamily(app);
   const create = (opts: { shared?: boolean } = {}) => {
     const id = `n${++seq}`;
@@ -212,6 +215,26 @@ describe("resource routes", () => {
     ).toBe(200);
   });
 
+  it("applies CSRF to state-changing non-API resource routes", async () => {
+    const { app, f, create } = await withNotes();
+    const id = create();
+    const post = (headers: Record<string, string>) =>
+      app.inject({
+        method: "POST",
+        url: `/n/${id}`,
+        headers: {
+          host: "localhost:3000",
+          cookie: f.cookies.owner,
+          "content-type": "text/plain",
+          ...headers,
+        },
+        payload: "x",
+      });
+    expect((await post({ origin: "http://localhost:4000" })).statusCode).toBe(403);
+    expect((await post({})).statusCode).toBe(403);
+    expect((await post({ origin: "http://localhost:3000", "x-agent-lee": "1" })).statusCode).toBe(200);
+  });
+
   it("every resource route of the real app has a matrix row, and every row holds", async () => {
     const app = await newApp();
     await app.ready();
@@ -299,6 +322,33 @@ describe("open streams re-check access", () => {
     await s2.until(/event: ready/);
     app.users!.setRole(f.users.admin.id, "member");
     expect((await s2.rest()).text).toMatch(/event: revoked/);
+  });
+
+  it("closes the stream on logout and when the session expires", async () => {
+    const { app, f } = await withNotes();
+    const s1 = await openStream(app, f.cookies.shared, "/api/test/feed");
+    await s1.until(/event: ready/);
+    await app.inject({
+      method: "POST",
+      url: "/api/auth/logout",
+      headers: {
+        host: "localhost:3000",
+        cookie: f.cookies.shared,
+        origin: "http://localhost:3000",
+        "x-agent-lee": "1",
+      },
+    });
+    expect((await s1.rest()).text).toMatch(/event: revoked/);
+
+    // The owner's session runs out 300 ms from now; the open stream must end with it.
+    lastDb.$client
+      .prepare("update sessions set expires_at = ? where user_id = ?")
+      .run(Date.now() + 300, f.users.owner.id);
+    const s2 = await openStream(app, f.cookies.owner, "/api/test/feed");
+    await s2.until(/event: ready/);
+    const t0 = Date.now();
+    expect((await s2.rest()).text).toMatch(/event: revoked/);
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
 
   it("closes a non-resource stream when its user is deactivated", async () => {

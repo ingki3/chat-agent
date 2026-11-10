@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
  */
 export type UserAccessChanged = {
   userId: string;
-  reason: "deactivated" | "role_changed" | "password_changed";
+  reason: "deactivated" | "role_changed" | "password_changed" | "session_ended";
 };
 
 /** Sharing of a resource changed (e.g. share revoked, #29): open streams on it must re-check access. */

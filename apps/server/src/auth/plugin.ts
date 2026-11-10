@@ -87,7 +87,8 @@ export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): vo
  */
 export function registerCsrf(app: FastifyInstance, config: Config): void {
   app.addHook("onRequest", async (req, reply) => {
-    if (SAFE_METHODS.has(req.method) || !isApiRequest(req)) return;
+    // All API calls, and any route that acts on a resource (non-API ones like /a/:id included).
+    if (SAFE_METHODS.has(req.method) || !(isApiRequest(req) || req.routeOptions.config?.resource)) return;
     const expected =
       req.ctx.origin === "edge"
         ? `https://${config.publicHost}`
