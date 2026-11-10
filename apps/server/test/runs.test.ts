@@ -709,3 +709,52 @@ describe("runs: robustness, round 2 (review #74)", () => {
     expect(stats.closes).toBe(1);
   });
 });
+
+describe("runs: robustness, round 3 (review #74)", () => {
+  it("refuses new runs once shutdown has started", async () => {
+    const { app, conversation, send } = await start();
+    await app.runs!.shutdown();
+    const r = await send(conversation().id, "x");
+    expect(r.statusCode).toBe(503);
+    expect(r.json()).toEqual({ error: "shutting_down" });
+    expect(app.runs!.liveCount()).toBe(0);
+  });
+
+  it("a session whose close() throws synchronously cannot crash the grace timer or shutdown", async () => {
+    let opened = 0;
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async () => {
+        opened++;
+        return {
+          externalSessionId: `x-${opened}`,
+          setModel: async () => {},
+          close: () => {
+            throw new Error("sync close failure");
+          },
+          turn: () => ({
+            events: (async function* (): AsyncGenerator<RuntimeEvent> {
+              yield { type: "text_delta", text: "a" };
+              await new Promise(() => {});
+            })(),
+            interrupt: () => new Promise<void>(() => {}),
+          }),
+        };
+      },
+    };
+    const { app, mom, conversation, send, waitRun } = await start({ adapter, graceMs: 50 });
+    const run = (await send(conversation().id, "x")).json().run as Run;
+    for (let i = 0; i < 100 && opened === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    await mom.post(`/api/runs/${run.id}/interrupt`);
+    expect((await waitRun(run.id)).status).toBe("interrupted"); // grace timer → settle → close threw, contained
+    await send(conversation().id, "y");
+    for (let i = 0; i < 100 && opened < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    await expect(app.runs!.shutdown()).resolves.toBeUndefined();
+  });
+});

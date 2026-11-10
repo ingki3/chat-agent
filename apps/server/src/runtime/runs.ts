@@ -25,11 +25,26 @@ type Live = {
   closing?: Promise<void>;
 };
 
-/** Closes the run's session once (later calls share the first close) and never waits for longer than `ms`. */
+/**
+ * Closes the run's session once — later calls share the first close — and resolves after at most `ms`.
+ * The adapter's close() is called inside a promise, so even a synchronous throw cannot escape (e.g. from the
+ * interrupt grace timer, where it would be an uncaught exception).
+ */
 function closeSession(live: Live, ms = 2000): Promise<void> {
-  if (!live.session) return Promise.resolve();
-  live.closing ??= live.session.close().catch(() => {});
-  return Promise.race([live.closing, new Promise<void>((r) => setTimeout(r, ms).unref())]);
+  const session = live.session;
+  if (!session) return Promise.resolve();
+  live.closing ??= new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+    Promise.resolve()
+      .then(() => session.close())
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+  });
+  return live.closing;
 }
 
 /** Asks the runtime to stop without waiting for it (an adapter's interrupt may never return). */
@@ -43,6 +58,12 @@ function fireInterrupt(live: Live): void {
 
 export const EVENT_RETENTION_MS = 3600_000;
 export const DEFAULT_RUNTIME: RuntimeId = "claude-code";
+
+export class ShuttingDownError extends Error {
+  constructor() {
+    super("the server is shutting down");
+  }
+}
 
 export class RunBusyError extends Error {
   constructor() {
@@ -94,6 +115,8 @@ export type RunManagerOptions = {
  */
 export class RunManager {
   private readonly live = new Map<string, Live>();
+  /** Set by shutdown(): no new run may start after that. */
+  private stopping = false;
   private readonly now: () => number;
   private readonly flushMs: number;
 
@@ -163,6 +186,7 @@ export class RunManager {
     idempotencyKey?: string | undefined;
     prepare: () => { user: MessageRow | null; assistant: MessageRow };
   }): { run: RunRow; user: MessageRow | null; assistant: MessageRow; reused: boolean } {
+    if (this.stopping) throw new ShuttingDownError();
     const created = this.db.$client
       .transaction(() => {
         if (input.idempotencyKey) {
@@ -296,6 +320,7 @@ export class RunManager {
    * waiting on a runtime that hangs. The runs themselves are failed by `recover()` on the next start.
    */
   async shutdown(): Promise<void> {
+    this.stopping = true;
     const lives = [...this.live.values()];
     this.live.clear();
     for (const live of lives) {

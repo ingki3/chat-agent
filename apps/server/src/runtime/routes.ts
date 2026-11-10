@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { watchAccess } from "../authz/resources.js";
 import { toMessage, type ConversationStore } from "../conversations/store.js";
 import { openSse } from "../sse.js";
-import { IdempotencyConflictError, RunBusyError, toRun, type RunManager } from "./runs.js";
+import { IdempotencyConflictError, RunBusyError, ShuttingDownError, toRun, type RunManager } from "./runs.js";
 
 const KIND = "run";
 
@@ -34,6 +34,7 @@ export function startRun(
     });
   } catch (e) {
     if (e instanceof RunBusyError) return reply.code(409).send({ error: "run_in_progress" });
+    if (e instanceof ShuttingDownError) return reply.code(503).send({ error: "shutting_down" });
     if (e instanceof IdempotencyConflictError) return reply.code(409).send({ error: "idempotency_conflict" });
     if (e instanceof MessageNotFoundError) return reply.code(404).send({ error: "not_found" });
     throw e;
