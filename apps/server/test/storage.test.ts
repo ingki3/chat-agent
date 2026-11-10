@@ -78,7 +78,14 @@ describe("database", () => {
       )
       .all()
       .map((r) => (r as { name: string }).name);
-    expect(tables).toEqual(["sessions", "settings", "users"]);
+    expect(tables).toEqual([
+      "conversations",
+      "messages",
+      "runtime_sessions",
+      "sessions",
+      "settings",
+      "users",
+    ]);
     expect(db.$client.pragma("foreign_keys", { simple: true })).toBe(1);
   });
 

@@ -11,6 +11,8 @@ import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
 import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
 import { registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
+import { registerConversationRoutes } from "./conversations/routes.js";
+import { ConversationStore } from "./conversations/store.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -46,6 +48,7 @@ declare module "fastify" {
     /** Accounts and sessions; undefined when the app is built without a database (some tests). */
     users: UserStore | undefined;
     appEvents: AppEvents;
+    conversations: ConversationStore | undefined;
   }
 }
 
@@ -89,6 +92,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   const users = opts.db ? new UserStore(opts.db, events) : undefined;
   app.decorate("appEvents", events);
   app.decorate("users", users);
+  app.decorate("conversations", opts.db ? new ConversationStore(opts.db) : undefined);
   const verifier = config.access
     ? createAccessVerifier({ ...config.access, ...(opts.accessKeys ? { keys: opts.accessKeys } : {}) })
     : undefined;
@@ -104,6 +108,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   if (users) {
     registerAuthRoutes(app, { config, users, ...opts.auth });
     registerUserAdmin(app, users, opts.userAdmin);
+    registerConversationRoutes(app, app.conversations!);
   }
 
   app.get(
