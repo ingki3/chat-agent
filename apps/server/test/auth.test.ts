@@ -52,8 +52,10 @@ async function start(env: Record<string, string> = {}, auth = {}) {
   });
   const db = createTestDb();
   const app = await buildApp(config, { db, accessKeys: jwks, auth, logger: false });
-  app.get("/api/test/admin-only", { config: { auth: "admin" } }, async () => ({ ok: true }));
-  app.get("/api/test/user", async (req) => ({ id: req.ctx.user!.id }));
+  app.get("/api/test/admin-only", { config: { auth: "admin", noResource: "test" } }, async () => ({
+    ok: true,
+  }));
+  app.get("/api/test/user", { config: { noResource: "test" } }, async (req) => ({ id: req.ctx.user!.id }));
   apps.push(app);
   return { app, db };
 }

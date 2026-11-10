@@ -19,7 +19,7 @@ export function registerDiag(app: FastifyInstance, opts: DiagOptions = {}): void
   // (Access JWT, or the temporary gate) still applies.
   app.get<{ Querystring: { seconds?: string } }>(
     "/api/diag/stream",
-    { config: { auth: "public" } },
+    { config: { auth: "public", noResource: "synthetic measurement stream" } },
     async (req, reply) => {
       const seconds = Number(req.query.seconds ?? 180);
       if (!Number.isInteger(seconds) || seconds < 1 || seconds > DIAG_MAX_SECONDS)

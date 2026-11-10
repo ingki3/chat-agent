@@ -134,11 +134,24 @@ export class UserStore {
     return row.user;
   }
 
+  /** Ends one session (logout). Open streams of that session re-check and close. */
   deleteSession(token: string): void {
-    this.db
+    const row = this.db
       .delete(sessions)
       .where(eq(sessions.id, sha256(token)))
-      .run();
+      .returning({ userId: sessions.userId })
+      .get();
+    if (row) this.events.emit("user-access-changed", { userId: row.userId, reason: "session_ended" });
+  }
+
+  /** Expiry time of a valid session, for streams that must end when it does. */
+  sessionExpiresAt(token: string): number | undefined {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return undefined;
+    return this.db
+      .select({ expiresAt: sessions.expiresAt })
+      .from(sessions)
+      .where(eq(sessions.id, sha256(token)))
+      .get()?.expiresAt;
   }
 
   sessionCount(userId: string): number {

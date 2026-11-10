@@ -6,9 +6,15 @@ import { EventEmitter } from "node:events";
  */
 export type UserAccessChanged = {
   userId: string;
-  reason: "deactivated" | "role_changed" | "password_changed";
+  reason: "deactivated" | "role_changed" | "password_changed" | "session_ended";
 };
 
-type EventMap = { "user-access-changed": [UserAccessChanged] };
+/** Sharing of a resource changed (e.g. share revoked, #29): open streams on it must re-check access. */
+export type ResourceAccessChanged = { kind: string; id: string };
+
+type EventMap = {
+  "user-access-changed": [UserAccessChanged];
+  "resource-access-changed": [ResourceAccessChanged];
+};
 
 export class AppEvents extends EventEmitter<EventMap> {}
