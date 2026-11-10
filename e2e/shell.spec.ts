@@ -145,7 +145,8 @@ test("going back to a conversation that is still streaming does not repeat the t
   await useAccount(page, SON);
   const other = await newConversation(page.request, baseURL!, `다른 ${Date.now()}`);
   await page.goto("/");
-  await page.getByLabel("메시지 입력").fill("/long 60");
+  // Long enough (~15 s) that the check below happens while the reply is still streaming.
+  await page.getByLabel("메시지 입력").fill("/long 300");
   await page.getByRole("button", { name: "보내기" }).click();
   await expect(page.getByTestId("assistant").last()).toContainText("단어3");
   const here = new URL(page.url()).pathname;
@@ -159,9 +160,15 @@ test("going back to a conversation that is still streaming does not repeat the t
   };
   await nav(`/c/${other.id}`, other.title);
   await nav(here);
-  await expect(page.getByTestId("assistant").last()).toContainText("단어60", { timeout: 10_000 });
-  const text = (await page.getByTestId("assistant").last().textContent()) ?? "";
+  // Still streaming (no "done" yet): the replayed text must appear once, not on top of the earlier copy.
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toContainText("단어5 ");
+  await expect(reply.locator(".caret")).toBeVisible();
+  const text = (await reply.textContent()) ?? "";
   expect(text.match(/단어1 /g)).toHaveLength(1);
+  expect(text.match(/단어2 /g)).toHaveLength(1);
+  // Stop it so it does not run on into other tests.
+  await page.getByRole("button", { name: "■ 중지" }).click();
 });
 
 test("drawer: focus moves in and back, and Back never reopens it", async ({ page, baseURL }, info) => {
@@ -198,9 +205,26 @@ test("widening the window with the drawer open leaves a usable page", async ({ p
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 });
 
-test("long lists load more: conversations and older messages", async ({ page, baseURL }) => {
-  await useAccount(page, ADMIN);
-  // Admin's own list grows with the other tests; add enough to need a second page either way.
+test("long lists load more: conversations and older messages", async ({ page, browser, baseURL }) => {
+  // Its own account, so 55 extra conversations push no other test's items off the first page.
+  const admin = await browser.newContext({ baseURL: baseURL! });
+  const adminPage = await admin.newPage();
+  await useAccount(adminPage, ADMIN);
+  const email = `pages-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
+  const created = await adminPage.request.post("/api/admin/users", {
+    data: { name: "목록", email },
+    headers: csrf(baseURL!),
+  });
+  const { temporaryPassword } = (await created.json()) as { temporaryPassword: string };
+  await admin.close();
+  await page.request.post("/api/auth/login", {
+    data: { email, password: temporaryPassword },
+    headers: csrf(baseURL!),
+  });
+  await page.request.post("/api/auth/password", {
+    data: { currentPassword: temporaryPassword, newPassword: "pages-password-1" },
+    headers: csrf(baseURL!),
+  });
   for (let i = 0; i < 55; i++) await newConversation(page.request, baseURL!, `목록 ${i}`);
   await page.setViewportSize({ width: 1200, height: 800 });
   await page.goto("/");
