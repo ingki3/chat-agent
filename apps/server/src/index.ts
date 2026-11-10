@@ -5,7 +5,7 @@ import { loadConfig } from "./config.js";
 
 const config = loadConfig();
 const storage = initStorage(config);
-const app = await buildApp(config, { vite: config.env === "development" });
+const app = await buildApp(config, { vite: config.env === "development", db: storage.db });
 app.addHook("onClose", async () => storage.db.$client.close());
 
 try {

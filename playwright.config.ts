@@ -15,8 +15,9 @@ export default defineConfig({
     { name: "mobile", use: { ...devices["Pixel 7"] } },
   ],
   webServer: {
-    // Production mode requires a master key: create a throwaway one for the e2e run (ignored if present).
-    command: "(node apps/server/dist/cli/keygen.js || true) && node apps/server/dist/index.js",
+    // Production mode requires a master key: create a throwaway one for the e2e run.
+    // Fresh data every run: the first-run (admin setup) screen only exists while there are no users.
+    command: "rm -rf .e2e && node apps/server/dist/cli/keygen.js && node apps/server/dist/index.js",
     url: `http://127.0.0.1:${PORT}/api/health`,
     env: {
       NODE_ENV: "production",

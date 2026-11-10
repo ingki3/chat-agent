@@ -30,7 +30,18 @@ async function start(env: Record<string, string> = { TEMP_GATE_CODE: CODE }, gat
   const config = loadConfig({ NODE_ENV: "production", ...env });
   const app = await buildApp(config, { webDist: webDist(), logger: false, gate: { now: () => t, ...gate } });
   apps.push(app);
-  return { app, clock };
+  return { app: throughTunnel(app), clock };
+}
+
+/** The gate covers tunnel requests only: make every injected request arrive with the public Host. */
+const EDGE = { host: "chat.2prostream.com" };
+function throughTunnel<T extends Awaited<ReturnType<typeof buildApp>>>(app: T): T {
+  const inject = app.inject.bind(app) as (o: object) => ReturnType<T["inject"]>;
+  app.inject = ((o: string | { headers?: object }) =>
+    inject(
+      typeof o === "string" ? { url: o, headers: EDGE } : { ...o, headers: { ...EDGE, ...o.headers } },
+    )) as never;
+  return app;
 }
 
 const post = (
@@ -49,9 +60,17 @@ const cookieOf = (setCookie: string | string[] | undefined) => String(setCookie)
 describe("temporary access-code gate", () => {
   it("is off without TEMP_GATE_CODE", async () => {
     const { app } = await start({});
-    expect((await app.inject("/")).statusCode).toBe(200);
-    expect((await app.inject("/gate")).statusCode).toBe(200); // SPA fallback, not the gate page
-    expect((await app.inject("/gate")).body).not.toMatch(/접속 코드/);
+    // Without the gate (and without Access) the public host fails closed; locally /gate is just a SPA route.
+    expect((await app.inject("/")).json()).toEqual({ error: "access_not_configured" });
+    const page = await app.inject({ url: "/gate", headers: { host: "localhost:3000" } });
+    expect(page.statusCode).toBe(200);
+    expect(page.body).not.toMatch(/접속 코드/);
+  });
+
+  it("does not gate local requests (they already passed the Host check)", async () => {
+    const { app } = await start();
+    const r = await app.inject({ url: "/api/health", headers: { host: "localhost:3000" } });
+    expect(r.statusCode).toBe(200);
   });
 
   it("rejects malformed codes in config", () => {
@@ -61,7 +80,7 @@ describe("temporary access-code gate", () => {
 
   it("blocks pages, static files and the API until the code is entered", async () => {
     const { app } = await start();
-    for (const url of ["/", "/c/1", "/app.js", "/index.html", "/gate/../", "/%67ate"]) {
+    for (const url of ["/", "/c/1", "/app.js", "/index.html", "/gate/../"]) {
       const r = await app.inject(url);
       expect(r.statusCode, url).toBe(302);
       expect(r.headers.location).toBe("/gate");
@@ -72,6 +91,8 @@ describe("temporary access-code gate", () => {
       expect(r.json()).toEqual({ error: "gate_required" });
     }
     expect((await app.inject({ method: "POST", url: "/api/x" })).statusCode).toBe(401);
+    // An encoded /gate is the gate page itself (same path for the router), not a way around it.
+    expect((await app.inject("/%67ate")).body).toMatch(/접속 코드/);
     const page = await app.inject("/gate");
     expect(page.statusCode).toBe(200);
     expect(page.headers["cache-control"]).toBe("no-store");
@@ -88,7 +109,7 @@ describe("temporary access-code gate", () => {
     expect(bad.headers["set-cookie"]).toBeUndefined();
     expect(bad.body).not.toContain(CODE);
 
-    const ok = await post(app, ` ${CODE} `, { "x-forwarded-proto": "https" });
+    const ok = await post(app, ` ${CODE} `);
     expect(ok.statusCode).toBe(303);
     expect(ok.headers.location).toBe("/");
     const sc = String(ok.headers["set-cookie"]);
@@ -107,8 +128,6 @@ describe("temporary access-code gate", () => {
     expect((await app.inject({ url: "/app.js", headers: { cookie } })).statusCode).toBe(200);
     // Already signed in: the gate page sends you home.
     expect((await app.inject({ url: "/gate", headers: { cookie } })).statusCode).toBe(303);
-    // No Secure flag over plain http (local testing).
-    expect(String((await post(app, CODE)).headers["set-cookie"])).not.toMatch(/Secure/);
   });
 
   it("rejects forged, tampered and expired cookies", async () => {
@@ -165,7 +184,7 @@ describe("temporary access-code gate", () => {
 
   it("works in dev mode (Vite) and refuses Vite's WebSocket upgrade, which bypasses Fastify hooks", async () => {
     const config = { ...loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: CODE }), port: 0 };
-    const app = await buildApp(config, { vite: true, logger: false });
+    const app = throughTunnel(await buildApp(config, { vite: true, logger: false }));
     apps.push(app);
     expect((await app.inject("/")).statusCode).toBe(302);
     for (const url of ["/gate", "/gate?x=1"]) {
@@ -200,5 +219,19 @@ describe("temporary access-code gate", () => {
       req.end();
     });
     expect(status).not.toBe(101);
+  });
+
+  it("never lets Vite take WebSocket upgrades on the app port, gate or no gate", async () => {
+    const free = await new Promise<number>((r) => {
+      const srv = http.createServer().listen(0, "127.0.0.1", () => {
+        const p = (srv.address() as AddressInfo).port;
+        srv.close(() => r(p));
+      });
+    });
+    const config = { ...loadConfig({ NODE_ENV: "test" }), port: 0 };
+    const app = await buildApp(config, { vite: true, logger: false, hmrPort: free });
+    apps.push(app);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    expect(app.server.listenerCount("upgrade")).toBe(0);
   });
 });

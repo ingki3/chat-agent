@@ -113,14 +113,17 @@ sudo launchctl kickstart -k system/com.agentlee.server
 2. 로그인 방식: **One-time PIN**(이메일 코드).
 3. 정책: Allow · Include · Emails → `ingki3@gmail.com`만. 가족은 계정을 만든 뒤 10절 절차로 추가.
 4. 세션 기간은 기본값(24시간)으로 둔다.
-5. 애플리케이션 개요의 **AUD 태그**를 `.env`의 `CF_ACCESS_AUD`에 넣는다(#9에서 JWT 검증에 사용). 저장소에는 넣지 않는다.
+5. 애플리케이션 개요의 **AUD 태그**를 `.env`의 `CF_ACCESS_AUD`에, 팀 도메인(`<team>.cloudflareaccess.com`, Zero Trust → Settings → Custom Pages에 표시)을 `CF_ACCESS_TEAM_DOMAIN`에 넣고 재시작한다. 저장소에는 넣지 않는다.
+   - 서버는 `chat.2prostream.com`으로 온 모든 요청(페이지·정적 파일·API)에서 `Cf-Access-Jwt-Assertion`을 검증한다(서명·`iss`·`aud`·만료, 키는 팀 JWKS에서 받아 캐시). 실패하면 403.
+   - 두 값이 없으면 공개 도메인 요청은 모두 403(`access_not_configured`)이다. 7.1의 임시 접속 코드를 켠 경우만 예외.
+   - Access로 들어온 이메일과 다른 앱 계정으로는 로그인할 수 없고, 기존 세션도 거부된다.
 6. 확인: 시크릿 창에서 접속 → Access 로그인 화면이 먼저 나와야 한다. 허용 안 된 이메일로 코드를 요청하면 코드가 오지 않고 거부된다.
 
 ### 7.1 임시 접속 코드 (Access 전 테스트용)
 
 Access를 설정하기 전에 실제 도메인으로 시험해야 할 때만 쓴다.
 
-- `.env`에 `TEMP_GATE_CODE=<8자 이상>`을 넣으면 모든 페이지·정적 파일·API가 `/gate` 코드 입력 화면 뒤로 간다. 코드는 `.env`에만 두고 저장소·메신저에 남기지 않는다.
+- `.env`에 `TEMP_GATE_CODE=<8자 이상>`을 넣으면 공개 도메인으로 온 모든 페이지·정적 파일·API가 `/gate` 코드 입력 화면 뒤로 간다(집 안 `localhost` 접속은 코드 없이 앱 로그인만). 코드는 `.env`에만 두고 저장소·메신저에 남기지 않는다.
 - 맞는 코드를 넣으면 7일짜리 서명 쿠키(HttpOnly, SameSite=Lax, https면 Secure)를 준다. 서버를 재시작하거나 코드를 바꾸면 모두 다시 입력해야 한다.
 - 틀린 시도는 같은 IP에서 15분에 5번, 전체 합쳐 15분에 30번까지다. 넘으면 맞는 코드도 15분간 거부된다(누군가 대량으로 시도하면 가족도 잠시 못 들어올 수 있다).
 - Access를 켜면 `TEMP_GATE_CODE`를 지우고 재시작한다.

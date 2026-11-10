@@ -3,7 +3,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
+import type { JWTVerifyGetKey } from "jose";
 import type { HealthResponse } from "@agentlee/shared";
+import { createAccessVerifier } from "./auth/access-jwt.js";
+import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
+import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
+import { UserStore } from "./auth/users.js";
+import type { Db } from "./db/client.js";
+import { AppEvents } from "./events.js";
+import { isApiPath } from "./paths.js";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
 import { isGatePath, registerGate, type GateOptions } from "./gate.js";
@@ -29,10 +37,14 @@ export const APP_CSP = [
   "object-src 'none'",
 ].join("; ");
 
-/** True for `/api` and `/api/...` (query string ignored). */
-export function isApiPath(url: string | undefined): boolean {
-  const pathname = (url ?? "/").split("?")[0] ?? "/";
-  return pathname === "/api" || pathname.startsWith("/api/");
+export { isApiPath };
+
+declare module "fastify" {
+  interface FastifyInstance {
+    /** Accounts and sessions; undefined when the app is built without a database (some tests). */
+    users: UserStore | undefined;
+    appEvents: AppEvents;
+  }
 }
 
 export type BuildOptions = {
@@ -45,6 +57,15 @@ export type BuildOptions = {
   diag?: DiagOptions;
   /** Rate-limit/clock overrides for the temporary gate (tests). Active only when config.tempGateCode is set. */
   gate?: Omit<GateOptions, "code">;
+  /** Database for accounts and sessions. Without it nobody can sign in and private routes answer 401. */
+  db?: Db;
+  /** Access JWT key source override (tests sign with a local JWKS). */
+  accessKeys?: JWTVerifyGetKey;
+  /** Login rate-limit/clock overrides (tests). */
+  auth?: AuthRouteOptions;
+  events?: AppEvents;
+  /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
+  hmrPort?: number;
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
@@ -57,10 +78,23 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     return payload;
   });
 
-  // Before every route, static file and Vite middleware: nothing is served without the code.
-  if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
+  const events = opts.events ?? new AppEvents();
+  const users = opts.db ? new UserStore(opts.db, events) : undefined;
+  app.decorate("appEvents", events);
+  app.decorate("users", users);
+  const verifier = config.access
+    ? createAccessVerifier({ ...config.access, ...(opts.accessKeys ? { keys: opts.accessKeys } : {}) })
+    : undefined;
 
-  app.get("/api/health", async (): Promise<HealthResponse> => ({
+  // Hook order matters — all of these run before every route, static file and Vite middleware:
+  // trust boundary (Host / Access JWT) → temporary code gate (edge only) → CSRF → session → route rules.
+  registerTrustBoundary(app, { config, verifier });
+  if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
+  registerCsrf(app, config);
+  registerSession(app, users);
+  if (users) registerAuthRoutes(app, { config, users, ...opts.auth });
+
+  app.get("/api/health", { config: { auth: "public" } }, async (): Promise<HealthResponse> => ({
     status: "ok",
     service: "agent-lee",
     version: VERSION,
@@ -74,8 +108,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     _req: unknown,
     reply: { code: (n: number) => { send: (b: unknown) => unknown } },
   ) => reply.code(404).send({ error: "not_found" });
-  app.all("/api", apiNotFound);
-  app.all("/api/*", apiNotFound);
+  app.all("/api", { config: { auth: "public" } }, apiNotFound);
+  app.all("/api/*", { config: { auth: "public" } }, apiNotFound);
 
   if (opts.vite) {
     const { default: middie } = await import("@fastify/middie");
@@ -83,10 +117,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     await app.register(middie);
     const vite = await createServer({
       root: WEB_ROOT,
-      // Vite's WebSocket upgrade bypasses Fastify hooks, so it is switched off while the code gate is on.
+      // A WebSocket upgrade on the app port would bypass every Fastify hook (trust boundary, gate, session), so
+      // HMR never shares the app server: it gets its own loopback-only port, which the tunnel does not reach,
+      // and is switched off entirely while the code gate is on.
+      // Host is already checked by the trust boundary; let Vite serve the public host too.
       server: config.tempGateCode
-        ? { middlewareMode: true, hmr: false, ws: false }
-        : { middlewareMode: true, hmr: { server: app.server } },
+        ? { middlewareMode: true, hmr: false, ws: false, allowedHosts: [config.publicHost] }
+        : {
+            middlewareMode: true,
+            hmr: { host: "127.0.0.1", port: opts.hmrPort ?? 24678 },
+            allowedHosts: [config.publicHost],
+          },
       appType: "spa",
     });
     // API routes must reach Fastify; Vite's SPA fallback would otherwise answer /api/* with index.html.
