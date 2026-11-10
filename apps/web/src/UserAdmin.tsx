@@ -48,7 +48,7 @@ export function UserAdmin({ selfId }: { selfId: string }) {
     <section className="admin" aria-label="가족 계정">
       <h2>가족 계정</h2>
       {shown && (
-        <div className="notice" role="status" data-testid="temp-password">
+        <div className="notice-box" role="status" data-testid="temp-password">
           <p>
             <strong>{shown.email}</strong> 임시 비밀번호: <code>{shown.password}</code>
           </p>

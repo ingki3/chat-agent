@@ -11,8 +11,10 @@ export default defineConfig({
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   use: { baseURL: `http://127.0.0.1:${PORT}`, trace: "retain-on-failure" },
   projects: [
-    { name: "desktop", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile", use: { ...devices["Pixel 7"] } },
+    // Creates the admin through the first-run screen and the family accounts; everything else depends on it.
+    { name: "setup", testMatch: /first-run\.setup\.ts/, use: { ...devices["Desktop Chrome"] } },
+    { name: "desktop", use: { ...devices["Desktop Chrome"] }, dependencies: ["setup"] },
+    { name: "mobile", use: { ...devices["Pixel 7"] }, dependencies: ["setup"] },
   ],
   webServer: {
     // Production mode requires a master key: create a throwaway one for the e2e run.
@@ -24,6 +26,8 @@ export default defineConfig({
       PORT: String(PORT),
       DATA_DIR: "./.e2e/data",
       MASTER_KEY_PATH: "./.e2e/master.key",
+      // Scripted runtime so streaming can be tested end to end.
+      FAKE_RUNTIME: "1",
     },
     reuseExistingServer: false,
     timeout: 30_000,

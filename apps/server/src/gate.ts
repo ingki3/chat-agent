@@ -35,7 +35,13 @@ export function codeMatches(input: string, code: string): boolean {
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
-function page(message?: string): string {
+/** Where to go after the code: a same-site path only (never `//host` or a backslash trick), else "/". */
+export function safeNext(v: unknown): string {
+  if (typeof v !== "string" || v.length > 2000) return "/";
+  return /^\/(?![/\\])[^\s]*$/.test(v) ? v : "/";
+}
+
+function page(message?: string, next = "/"): string {
   return `<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>Agent Lee</title>
@@ -50,6 +56,7 @@ button{font:inherit;padding:11px;border:0;border-radius:10px;background:var(--ac
 .err{color:var(--err);opacity:1}
 </style></head><body>
 <form method="post" action="${GATE_PATH}">
+<input type="hidden" name="next" value="${esc(next)}">
 <h1>Agent Lee</h1><p>테스트 기간 접속 코드를 입력하세요.</p>
 <input name="code" type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="64" required autofocus aria-label="접속 코드">
 ${message ? `<p class="err" role="alert">${esc(message)}</p>` : ""}
@@ -82,12 +89,12 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
-  const send = (reply: FastifyReply, status: number, message?: string) =>
+  const send = (reply: FastifyReply, status: number, message?: string, next = "/") =>
     reply
       .code(status)
       .header("Cache-Control", "no-store")
       .type("text/html; charset=utf-8")
-      .send(page(message));
+      .send(page(message, next));
 
   app.addHook("onRequest", async (req, reply) => {
     // Only tunnel requests are gated; local requests already passed the trust boundary (Host + no Cf-* headers).
@@ -96,7 +103,11 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
     if (isApiRequest(req))
       return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
     if (req.method === "GET" || req.method === "HEAD")
-      return reply.code(302).header("Cache-Control", "no-store").redirect(GATE_PATH);
+      // Remember where they were going, so the code page sends them back there.
+      return reply
+        .code(302)
+        .header("Cache-Control", "no-store")
+        .redirect(req.url === "/" ? GATE_PATH : `${GATE_PATH}?next=${encodeURIComponent(req.url)}`);
     return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
   });
 
@@ -106,20 +117,24 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       { parseAs: "string", bodyLimit: 1024 },
       (_req, body, done) => done(null, new URLSearchParams(body as string)),
     );
-    scope.get(GATE_PATH, async (req, reply) => (valid(req) ? reply.redirect("/", 303) : send(reply, 200)));
+    scope.get(GATE_PATH, async (req, reply) => {
+      const next = safeNext((req.query as { next?: unknown }).next);
+      return valid(req) ? reply.redirect(next, 303) : send(reply, 200, undefined, next);
+    });
     scope.post(GATE_PATH, async (req, reply) => {
+      const next = safeNext(req.body instanceof URLSearchParams ? req.body.get("next") : null);
       const client = req.ctx.clientIp;
       const mine = recent(failures.get(client) ?? []);
       globalFails = recent(globalFails);
       if (mine.length >= perClient || globalFails.length >= globalMax)
-        return send(reply, 429, "시도가 너무 많아요. 잠시 후 다시 시도하세요.");
+        return send(reply, 429, "시도가 너무 많아요. 잠시 후 다시 시도하세요.", next);
       const input = req.body instanceof URLSearchParams ? (req.body.get("code") ?? "") : "";
       if (!codeMatches(input.trim(), opts.code)) {
         mine.push(now());
         failures.set(client, mine);
         globalFails.push(now());
         if (failures.size > 10_000) failures.clear();
-        return send(reply, 401, "코드가 맞지 않아요.");
+        return send(reply, 401, "코드가 맞지 않아요.", next);
       }
       failures.delete(client);
       const exp = now() + ttlMs;
@@ -131,7 +146,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
         `Max-Age=${Math.floor(ttlMs / 1000)}`,
         ...(req.ctx.origin === "edge" ? ["Secure"] : []),
       ].join("; ");
-      return reply.header("Set-Cookie", cookie).header("Cache-Control", "no-store").redirect("/", 303);
+      return reply.header("Set-Cookie", cookie).header("Cache-Control", "no-store").redirect(next, 303);
     });
   });
 }

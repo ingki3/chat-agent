@@ -1,210 +1,96 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { PASSWORD_MIN, SERVICE_NAME, type AuthState } from "@agentlee/shared";
-import { auth, errorText } from "./api.js";
-import { UserAdmin } from "./UserAdmin.js";
+import { useEffect, useState, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
+import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router";
+import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
+import { auth, setUnauthenticatedHandler } from "./api.js";
+import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
+import { AdminPage } from "./pages/AdminPage.js";
+import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
+import { PlaceholderPage } from "./pages/PlaceholderPage.js";
+import { SettingsPage } from "./pages/SettingsPage.js";
+import { Shell } from "./Shell.js";
 
-/** Auth screens (#9): first-run admin, login, forced password change. The real app layout lands in #13. */
+/** Only the login state lives here. Everything an account sees lives in a per-account client (AccountData). */
+const authClient = new QueryClient({
+  defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true } },
+});
+
 export function App() {
-  const [state, setState] = useState<AuthState | "error" | null>(null);
-
-  useEffect(() => {
-    auth
-      .state()
-      .then(setState)
-      .catch(() => setState("error"));
-  }, []);
-
-  if (state === null) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
-  if (state === "error") return <Card title={SERVICE_NAME}>서버에 연결하지 못했어요.</Card>;
-  if (state.setupRequired) return <Setup state={state} onDone={setState} />;
-  if (!state.user) return <Login state={state} onDone={setState} />;
-  if (state.user.mustChangePassword) return <ChangePassword onDone={setState} temporary />;
-  return <Home state={state} onDone={setState} />;
-}
-
-function Card({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <main className="shell">
-      <section className="card">
-        <h1>{title}</h1>
-        {children}
-      </section>
-    </main>
+    <QueryClientProvider client={authClient}>
+      <BrowserRouter>
+        <AuthGate />
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }
 
-function useSubmit(run: () => Promise<void>) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const onSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    run()
-      .catch((err: unknown) => setError(errorText(err)))
-      .finally(() => setBusy(false));
+export const AUTH_KEY = ["auth"] as const;
+
+/** Other tabs of this browser learn about logins and logouts at once (no stale account on screen). */
+const authChannel =
+  typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel("agentlee-auth");
+
+/**
+ * Login comes first. The URL is never changed for it: after login (or after an expired session is renewed)
+ * the same address renders, so the user lands back where they were (#13).
+ */
+function AuthGate() {
+  const qc = useQueryClient();
+  const { data, isError } = useQuery({ queryKey: AUTH_KEY, queryFn: auth.state });
+  const set = (s: AuthState) => {
+    qc.setQueryData(AUTH_KEY, s);
+    authChannel?.postMessage("changed");
   };
-  return { busy, error, onSubmit };
-}
+  useEffect(() => {
+    const recheck = () => void qc.invalidateQueries({ queryKey: AUTH_KEY });
+    setUnauthenticatedHandler(recheck);
+    authChannel?.addEventListener("message", recheck);
+    return () => authChannel?.removeEventListener("message", recheck);
+  }, [qc]);
 
-function Field(props: {
-  label: string;
-  type?: string;
-  value: string;
-  onChange: (v: string) => void;
-  autoComplete: string;
-  readOnly?: boolean;
-  minLength?: number;
-}) {
+  // A failed re-check must not leave the previous account's screens up.
+  if (isError) return <Card title={SERVICE_NAME}>서버에 연결하지 못했어요.</Card>;
+  if (!data) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
+  if (data.setupRequired) return <Setup state={data} onDone={set} />;
+  if (!data.user) return <Login state={data} onDone={set} />;
+  if (data.user.mustChangePassword) return <ChangePassword onDone={set} temporary />;
+  const isAdmin = data.user.role === "admin";
   return (
-    <label className="field">
-      <span>{props.label}</span>
-      <input
-        type={props.type ?? "text"}
-        value={props.value}
-        onChange={(e) => props.onChange(e.target.value)}
-        autoComplete={props.autoComplete}
-        readOnly={props.readOnly}
-        required
-        minLength={props.minLength}
-      />
-    </label>
+    // Keyed by account: switching accounts throws away every cached list, message and open stream.
+    <AccountData key={data.user.id}>
+      <Routes>
+        <Route element={<Shell user={data.user} onSignedOut={set} />}>
+          <Route index element={<NewChatPage />} />
+          <Route path="c/:id" element={<ChatRoute />} />
+          <Route path="shared" element={<PlaceholderPage title="👪 가족 공유" issue="#52" />} />
+          <Route path="schedules" element={<PlaceholderPage title="⏰ 예약" issue="#55" />} />
+          <Route path="artifacts" element={<PlaceholderPage title="🧩 아티팩트" issue="#28" />} />
+          <Route path="settings" element={<SettingsPage onChanged={set} />} />
+          <Route
+            path="admin"
+            element={isAdmin ? <AdminPage selfId={data.user.id} /> : <Navigate to="/" replace />}
+          />
+          <Route path="*" element={<PlaceholderPage title="찾을 수 없는 페이지" />} />
+        </Route>
+      </Routes>
+    </AccountData>
   );
 }
 
-const ErrorText = ({ text }: { text: string | null }) =>
-  text ? (
-    <p className="error" role="alert">
-      {text}
-    </p>
-  ) : null;
-
-function Setup({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
-  const [name, setName] = useState("");
-  const [pw, setPw] = useState("");
-  const [pw2, setPw2] = useState("");
-  const [mismatch, setMismatch] = useState(false);
-  const { busy, error, onSubmit } = useSubmit(async () => {
-    setMismatch(pw !== pw2);
-    if (pw !== pw2) return;
-    onDone(await auth.setup(name, pw));
-  });
-  return (
-    <Card title={`${SERVICE_NAME} 처음 설정`}>
-      <p className="hint">관리자 계정을 만들어요. 이 화면은 한 번만 나와요.</p>
-      <form onSubmit={onSubmit}>
-        <Field
-          label="관리자 이메일"
-          value={state.adminEmail}
-          onChange={() => {}}
-          autoComplete="username"
-          readOnly
-        />
-        <Field label="이름" value={name} onChange={setName} autoComplete="name" />
-        <Field
-          label={`비밀번호 (${PASSWORD_MIN}자 이상)`}
-          type="password"
-          value={pw}
-          onChange={setPw}
-          autoComplete="new-password"
-          minLength={PASSWORD_MIN}
-        />
-        <Field
-          label="비밀번호 확인"
-          type="password"
-          value={pw2}
-          onChange={setPw2}
-          autoComplete="new-password"
-        />
-        <ErrorText text={mismatch ? "비밀번호가 서로 달라요." : error} />
-        <button disabled={busy}>관리자 만들기</button>
-      </form>
-    </Card>
+function AccountData({ children }: { children: ReactNode }) {
+  const [client] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true, staleTime: 5_000 } },
+      }),
   );
+  useEffect(() => () => client.clear(), [client]);
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
-function Login({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
-  const [email, setEmail] = useState(state.accessEmail ?? "");
-  const [pw, setPw] = useState("");
-  const { busy, error, onSubmit } = useSubmit(async () => onDone(await auth.login(email, pw)));
-  return (
-    <Card title={SERVICE_NAME}>
-      <form onSubmit={onSubmit}>
-        <Field
-          label="이메일"
-          type="email"
-          value={email}
-          onChange={setEmail}
-          autoComplete="username"
-          readOnly={!!state.accessEmail}
-        />
-        <Field label="비밀번호" type="password" value={pw} onChange={setPw} autoComplete="current-password" />
-        <ErrorText text={error} />
-        <button disabled={busy}>로그인</button>
-      </form>
-    </Card>
-  );
-}
-
-function ChangePassword({ onDone, temporary }: { onDone: (s: AuthState) => void; temporary?: boolean }) {
-  const [current, setCurrent] = useState("");
-  const [pw, setPw] = useState("");
-  const [pw2, setPw2] = useState("");
-  const [mismatch, setMismatch] = useState(false);
-  const { busy, error, onSubmit } = useSubmit(async () => {
-    setMismatch(pw !== pw2);
-    if (pw !== pw2) return;
-    onDone(await auth.changePassword(current, pw));
-  });
-  return (
-    <Card title="비밀번호 변경">
-      {temporary && (
-        <p className="hint">임시 비밀번호로 로그인했어요. 새 비밀번호를 정해야 계속할 수 있어요.</p>
-      )}
-      <form onSubmit={onSubmit}>
-        <Field
-          label="현재 비밀번호"
-          type="password"
-          value={current}
-          onChange={setCurrent}
-          autoComplete="current-password"
-        />
-        <Field
-          label={`새 비밀번호 (${PASSWORD_MIN}자 이상)`}
-          type="password"
-          value={pw}
-          onChange={setPw}
-          autoComplete="new-password"
-          minLength={PASSWORD_MIN}
-        />
-        <Field
-          label="새 비밀번호 확인"
-          type="password"
-          value={pw2}
-          onChange={setPw2}
-          autoComplete="new-password"
-        />
-        <ErrorText text={mismatch ? "새 비밀번호가 서로 달라요." : error} />
-        <button disabled={busy}>변경</button>
-      </form>
-    </Card>
-  );
-}
-
-function Home({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
-  const { busy, error, onSubmit } = useSubmit(async () => onDone(await auth.logout()));
-  const user = state.user!;
-  return (
-    <Card title={SERVICE_NAME}>
-      <p data-testid="whoami">
-        {user.name}님 ({user.role === "admin" ? "관리자" : "가족"}) · {user.email}
-      </p>
-      <p className="hint">대화 화면은 다음 단계(#13·#14)에서 들어와요.</p>
-      <form onSubmit={onSubmit}>
-        <ErrorText text={error} />
-        <button disabled={busy}>로그아웃</button>
-      </form>
-      {user.role === "admin" && <UserAdmin selfId={user.id} />}
-    </Card>
-  );
+/** One chat screen instance per conversation: no state (e.g. a half-streamed reply) carries over. */
+function ChatRoute() {
+  const { id = "" } = useParams();
+  return <ChatPage key={id} />;
 }

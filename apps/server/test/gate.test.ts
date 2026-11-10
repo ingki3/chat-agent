@@ -73,6 +73,44 @@ describe("temporary access-code gate", () => {
     expect(r.statusCode).toBe(200);
   });
 
+  it("sends you back to the page you asked for, and only to a page of this site", async () => {
+    const { app } = await start();
+    const r = await app.inject("/c/123?x=1");
+    expect(r.headers.location).toBe(`/gate?next=${encodeURIComponent("/c/123?x=1")}`);
+    const page = await app.inject(r.headers.location as string);
+    expect(page.body).toContain('name="next" value="/c/123?x=1"');
+    const ok = await app.inject({
+      method: "POST",
+      url: "/gate",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ code: CODE, next: "/c/123?x=1" }).toString(),
+    });
+    expect(ok.headers.location).toBe("/c/123?x=1");
+    for (const evil of [
+      "//evil.example/x",
+      "/\\evil.example",
+      "https://evil.example",
+      "javascript:alert(1)",
+      "/a b",
+    ]) {
+      const r2 = await app.inject({
+        method: "POST",
+        url: "/gate",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: new URLSearchParams({ code: CODE, next: evil }).toString(),
+      });
+      expect(r2.headers.location, evil).toBe("/");
+    }
+    // A wrong code keeps the destination for the next try, HTML-escaped.
+    const bad = await app.inject({
+      method: "POST",
+      url: "/gate",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ code: "00000000", next: '/x"><script>' }).toString(),
+    });
+    expect(bad.body).not.toContain("<script>");
+  });
+
   it("rejects malformed codes in config", () => {
     expect(() => loadConfig({ TEMP_GATE_CODE: "123" })).toThrow(/TEMP_GATE_CODE/);
     expect(() => loadConfig({ TEMP_GATE_CODE: "1234 5678" })).toThrow(/TEMP_GATE_CODE/);
@@ -83,7 +121,7 @@ describe("temporary access-code gate", () => {
     for (const url of ["/", "/c/1", "/app.js", "/index.html", "/gate/../"]) {
       const r = await app.inject(url);
       expect(r.statusCode, url).toBe(302);
-      expect(r.headers.location).toBe("/gate");
+      expect(r.headers.location).toMatch(/^\/gate(\?next=|$)/);
     }
     for (const url of ["/api/health", "/api/nope", "/api"]) {
       const r = await app.inject(url);

@@ -1,78 +1,55 @@
 import { expect, test } from "@playwright/test";
+import { ADMIN, csrf, useAccount } from "./helpers.js";
 
-// One account flow, in order: the first-run screen exists only until the admin is created.
-test.describe.configure({ mode: "serial" });
-
-const PW = "e2e-admin-password";
-
-test("first run creates the admin, then login and logout work", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop", "account state is shared; run the flow once");
+test("login screen: wrong password, then sign in and out", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Agent Lee 처음 설정" })).toBeVisible();
-  await page.getByLabel("이름", { exact: true }).fill("관리자");
-  await page.getByLabel(/^비밀번호 \(/).fill(PW);
-  await page.getByLabel("비밀번호 확인").fill(PW);
-  await page.getByRole("button", { name: "관리자 만들기" }).click();
-  await expect(page.getByTestId("whoami")).toContainText("관리자님");
-
-  await page.getByRole("button", { name: "로그아웃" }).click();
   await expect(page.getByRole("button", { name: "로그인" })).toBeVisible();
-  await page.getByLabel("이메일", { exact: true }).fill("ingki3@gmail.com");
+  await page.getByLabel("이메일", { exact: true }).fill(ADMIN.email);
   await page.getByLabel("비밀번호", { exact: true }).fill("wrong-password!");
   await page.getByRole("button", { name: "로그인" }).click();
   await expect(page.getByRole("alert")).toHaveText(/맞지 않아요/);
-  await page.getByLabel("비밀번호", { exact: true }).fill(PW);
+  await page.getByLabel("비밀번호", { exact: true }).fill(ADMIN.password);
   await page.getByRole("button", { name: "로그인" }).click();
-  await expect(page.getByTestId("whoami")).toContainText("ingki3@gmail.com");
+  await expect(page.getByTestId("whoami")).toHaveText(ADMIN.name);
 });
 
-test("admin adds family accounts; a temporary password must be changed at first login", async ({
+test("a temporary password must be changed first (admin resets mom's)", async ({
+  browser,
   page,
-}, info) => {
-  test.skip(info.project.name !== "desktop", "account state is shared; run the flow once");
-  await page.goto("/");
-  await page.getByLabel("이메일", { exact: true }).fill("ingki3@gmail.com");
-  await page.getByLabel("비밀번호", { exact: true }).fill(PW);
-  await page.getByRole("button", { name: "로그인" }).click();
-  const temps: Record<string, string> = {};
-  for (const [name, email] of [
-    ["엄마", "mom@example.com"],
-    ["아들", "son@example.com"],
-  ] as const) {
-    await page.getByLabel("이름", { exact: true }).fill(name);
-    await page.getByLabel("새 가족 이메일").fill(email);
-    await page.getByRole("button", { name: "계정 추가" }).click();
-    const notice = page.getByTestId("temp-password");
-    await expect(notice).toContainText(email);
-    temps[email] = (await notice.locator("code").textContent())!;
-    await page.getByRole("button", { name: "확인했어요" }).click();
-  }
-  await expect(page.getByRole("listitem")).toHaveCount(3);
-  await page.getByRole("button", { name: "로그아웃" }).click();
-  await expect(page.getByRole("button", { name: "로그인" })).toBeVisible();
-
-  await page.getByLabel("이메일", { exact: true }).fill("son@example.com");
-  await page.getByLabel("비밀번호", { exact: true }).fill(temps["son@example.com"]!);
-  await page.getByRole("button", { name: "로그인" }).click();
-  await expect(page.getByRole("heading", { name: "비밀번호 변경" })).toBeVisible();
-  await page.getByLabel("현재 비밀번호").fill(temps["son@example.com"]!);
-  await page.getByLabel(/^새 비밀번호 \(/).fill("sons-new-password");
-  await page.getByLabel("새 비밀번호 확인").fill("sons-new-password");
-  await page.getByRole("button", { name: "변경" }).click();
-  await expect(page.getByTestId("whoami")).toContainText("아들님 (가족)");
-  await expect(page.getByRole("region", { name: "가족 계정" })).toHaveCount(0);
-  // The member cannot call the user API directly either.
-  expect((await page.request.get("/api/admin/users")).status()).toBe(403);
+  baseURL,
+}) => {
+  // Admin resets a throwaway account, not mom (other tests sign in as her).
+  await useAccount(page, ADMIN);
+  const email = `tmp-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
+  const created = await page.request.post("/api/admin/users", {
+    data: { name: "임시", email },
+    headers: csrf(baseURL!),
+  });
+  const { temporaryPassword } = (await created.json()) as { temporaryPassword: string };
+  const ctx = await browser.newContext({ baseURL: baseURL! });
+  const p = await ctx.newPage();
+  await p.goto("/");
+  await p.getByLabel("이메일", { exact: true }).fill(email);
+  await p.getByLabel("비밀번호", { exact: true }).fill(temporaryPassword);
+  await p.getByRole("button", { name: "로그인" }).click();
+  await expect(p.getByRole("heading", { name: "비밀번호 변경" })).toBeVisible();
+  await p.getByLabel("현재 비밀번호").fill(temporaryPassword);
+  await p.getByLabel(/^새 비밀번호 \(/).fill("a-new-password-1");
+  await p.getByLabel("새 비밀번호 확인").fill("a-new-password-1");
+  await p.getByRole("button", { name: "변경" }).click();
+  await expect(p.getByTestId("whoami")).toHaveText("임시");
+  // A member has no admin entry and cannot call the user API.
+  await expect(p.getByRole("link", { name: /관리자/ })).toHaveCount(0);
+  expect((await p.request.get("/api/admin/users")).status()).toBe(403);
+  await ctx.close();
 });
 
-test("client routes fall back to the SPA and private APIs need a session", async ({ page, request }) => {
+test("client routes fall back to the SPA; cross-site POSTs are refused", async ({ page, request }) => {
   const res = await page.goto("/c/does-not-exist");
   expect(res?.status()).toBe(200);
-  await expect(page.getByRole("heading", { name: /Agent Lee/ })).toBeVisible();
-  expect((await request.get("/api/auth/state")).status()).toBe(200);
-  // A cross-site POST without the CSRF header is refused.
+  await expect(page.getByRole("heading", { name: /Agent Lee/ }).first()).toBeVisible();
   const forged = await request.post("/api/auth/login", {
-    data: { email: "ingki3@gmail.com", password: PW },
+    data: { email: ADMIN.email, password: ADMIN.password },
     headers: { origin: "https://evil.example" },
   });
   expect(forged.status()).toBe(403);
