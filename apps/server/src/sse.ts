@@ -6,7 +6,8 @@ export const SSE_HEARTBEAT_MS = 15_000;
 
 export type SseStream = {
   /** Sends one event. Data is JSON-encoded on a single line. */
-  send: (event: string, data: unknown) => void;
+  /** `id` becomes the SSE event id (what the browser sends back as `Last-Event-ID`). */
+  send: (event: string, data: unknown, id?: number) => void;
   /** Ends the stream. Safe to call more than once. */
   close: () => void;
   /** True once the client went away or close() ran. */
@@ -48,9 +49,9 @@ export function openSse(reply: FastifyReply, opts: { heartbeatMs?: number } = {}
   res.on("close", finish);
 
   return {
-    send(event, data) {
+    send(event, data, id) {
       if (closed) return;
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      res.write(`${id === undefined ? "" : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     },
     close() {
       if (closed) return;

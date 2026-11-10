@@ -112,11 +112,13 @@ describe("conversations", () => {
     const a = Conversation.parse((await mom.post("/api/conversations")).json());
     const b = Conversation.parse((await mom.post("/api/conversations")).json());
     const ma = Message.parse(
-      (await mom.post(`/api/conversations/${a.id}/messages`, { text: "A의 질문" })).json(),
+      (await mom.post(`/api/conversations/${a.id}/messages`, { text: "A의 질문" })).json().message,
     );
     await mom.post(`/api/conversations/${b.id}/messages`, { text: "B의 질문" });
     const listB = (await mom.get(`/api/conversations/${b.id}/messages`)).json().items as Message[];
-    expect(listB.map((m) => m.parts)).toEqual([[{ type: "text", text: "B의 질문" }]]);
+    expect(listB.filter((m) => m.role === "user").map((m) => m.parts)).toEqual([
+      [{ type: "text", text: "B의 질문" }],
+    ]);
     expect(
       (await mom.post(`/api/conversations/${b.id}/messages/${ma.id}/edit`, { text: "x" })).statusCode,
     ).toBe(404);
@@ -160,7 +162,11 @@ describe("edit and regenerate", () => {
     const edited = Message.parse(r.json().message);
     expect(edited).toMatchObject({ replaces: q1.id, revision: 1, seq: 4 });
     const list = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
-    expect(list.map((m) => m.parts[0])).toEqual([{ type: "text", text: "고친 질문 1" }]);
+    // The edited question, then the reply being generated for it (no runtime here, so it failed at once).
+    expect(list.map((m) => [m.role, m.parts[0]])).toEqual([
+      ["user", { type: "text", text: "고친 질문 1" }],
+      ["assistant", undefined],
+    ]);
     expect(store.sessions(c.id)).toEqual([]);
     const versions = (await mom.get(`/api/conversations/${c.id}/messages/${edited.id}/versions`)).json()
       .items as Message[];
@@ -183,10 +189,12 @@ describe("edit and regenerate", () => {
       model: "opus",
     });
     const r = await mom.post(`/api/conversations/${c.id}/messages/${a.id}/regenerate`);
-    const m = Message.parse(r.json().message);
+    expect(r.json().message).toBeNull();
+    const m = Message.parse(r.json().assistant);
+    // Without a runtime the run fails at once; the reply keeps its runtime and model for the next try.
     expect(m).toMatchObject({
       role: "assistant",
-      status: "pending",
+      status: "error",
       parts: [],
       replaces: a.id,
       runtime: "claude-code",
