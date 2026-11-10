@@ -1,7 +1,6 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
-import { hashPassword } from "../src/auth/passwords.js";
 import { can, type ResourceRef } from "../src/authz/policy.js";
 import { watchAccess } from "../src/authz/resources.js";
 import { loadConfig } from "../src/config.js";
@@ -12,6 +11,7 @@ import {
   OWNER_ONLY,
   READ,
   USAGE,
+  createFamily,
   runMatrix,
   type MatrixRow,
 } from "./helpers/permission-matrix.js";
@@ -22,63 +22,76 @@ afterEach(async () => {
   while (apps.length) await apps.pop()!.close();
 });
 
-const PW = "family-password-1";
-const local = { host: "localhost:3000" };
-
-/** Dad (admin), mom and son (members); a "note" resource kind owned by mom and shared with son. */
-async function family() {
+const newApp = async () => {
   const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: createTestDb(), logger: false });
   apps.push(app);
-  const users = app.users!;
-  const hash = await hashPassword(PW);
-  const dad = users.create({ email: "dad@example.com", name: "아빠", role: "admin", passwordHash: hash });
-  const mom = users.create({ email: "mom@example.com", name: "엄마", role: "member", passwordHash: hash });
-  const son = users.create({ email: "son@example.com", name: "아들", role: "member", passwordHash: hash });
-  const notes = new Map<string, ResourceRef>([
-    ["n1", { kind: "note", id: "n1", ownerId: mom.id, sharedWith: [son.id] }],
-    ["n2", { kind: "note", id: "n2", ownerId: mom.id }],
-  ]);
+  return app;
+};
+
+/** A test resource kind "note" with real write/delete behaviour, owned by `owner` and shared with `shared`. */
+async function withNotes() {
+  const app = await newApp();
+  const notes = new Map<string, ResourceRef & { title: string }>();
+  let seq = 0;
   app.resources.register("note", (id) => notes.get(id));
-  const ok = async (req: { resource?: ResourceRef }) => ({ id: req.resource!.id });
-  app.get("/api/test/notes/:id", { config: { resource: { kind: "note", action: "read" } } }, ok);
-  app.patch("/api/test/notes/:id", { config: { resource: { kind: "note", action: "write" } } }, ok);
-  app.delete("/api/test/notes/:id", { config: { resource: { kind: "note", action: "delete" } } }, ok);
-  app.get("/api/test/notes/:id/usage", { config: { resource: { kind: "note", action: "usage" } } }, ok);
+  const note = { kind: "note" } as const;
+  app.get("/api/test/notes/:id", { config: { resource: { ...note, action: "read" } } }, async (req) => ({
+    title: notes.get(req.resource!.id)!.title,
+  }));
+  app.patch("/api/test/notes/:id", { config: { resource: { ...note, action: "write" } } }, async (req) => {
+    notes.get(req.resource!.id)!.title = "changed";
+    return { ok: true };
+  });
+  app.delete("/api/test/notes/:id", { config: { resource: { ...note, action: "delete" } } }, async (req) => {
+    notes.delete(req.resource!.id);
+    return { ok: true };
+  });
+  app.get("/api/test/notes/:id/usage", { config: { resource: { ...note, action: "usage" } } }, async () => ({
+    n: 1,
+  }));
+  app.get(
+    "/api/test/note-by-query",
+    { config: { resource: { ...note, action: "read", from: "query" } } },
+    async () => ({}),
+  );
+  app.post(
+    "/api/test/note-by-body",
+    { config: { resource: { ...note, action: "read", from: "body" } } },
+    async () => ({}),
+  );
   app.get(
     "/api/test/notes/:id/stream",
-    { config: { resource: { kind: "note", action: "read" } } },
+    { config: { resource: { ...note, action: "read" } } },
     async (req, reply) => {
+      // ?race=1: the share is revoked after the request was authorised but before the stream subscribes.
+      if ((req.query as { race?: string }).race) notes.get(req.resource!.id)!.sharedWith = [];
       const stream = openSse(reply, { heartbeatMs: 1000 });
-      const stop = watchAccess(app, req, () => {
-        stream.send("revoked", {});
-        stream.close();
-      });
+      const stop = watchAccess(app, req, () => (stream.send("revoked", {}), stream.close()));
       stream.onClose(stop);
-      stream.send("ready", {});
+      if (!stream.closed) stream.send("ready", {});
     },
   );
-  // A stream that is not about one resource (e.g. the user's notification feed) — only the user is re-checked.
-  app.get("/api/test/feed", async (req, reply) => {
+  // A stream that is not about one resource (e.g. the user's notification feed): only the user is re-checked.
+  app.get("/api/test/feed", { config: { noResource: "test feed" } }, async (req, reply) => {
     const stream = openSse(reply, { heartbeatMs: 1000 });
     stream.onClose(watchAccess(app, req, () => (stream.send("revoked", {}), stream.close())));
     stream.send("ready", {});
   });
-  const cookie = async (email: string) => {
-    const r = await app.inject({
-      method: "POST",
-      url: "/api/auth/login",
-      headers: { ...local, origin: "http://localhost:3000", "x-agent-lee": "1" },
-      payload: { email, password: PW },
+  // A non-API page that addresses a resource (like /a/:id for artifacts).
+  app.get("/n/:id", { config: { resource: { ...note, action: "read" } } }, async () => "page");
+  const f = await createFamily(app);
+  const create = (opts: { shared?: boolean } = {}) => {
+    const id = `n${++seq}`;
+    notes.set(id, {
+      kind: "note",
+      id,
+      ownerId: f.users.owner.id,
+      sharedWith: opts.shared === false ? [] : [f.users.shared.id],
+      title: "t",
     });
-    return String(r.headers["set-cookie"]).split(";")[0]!;
+    return id;
   };
-  const cookies = {
-    owner: await cookie("mom@example.com"),
-    shared: await cookie("son@example.com"),
-    admin: await cookie("dad@example.com"),
-    stranger: "",
-  };
-  return { app, users, dad, mom, son, notes, cookies };
+  return { app, f, notes, create };
 }
 
 describe("policy", () => {
@@ -100,72 +113,98 @@ describe("policy", () => {
 
 describe("resource routes", () => {
   it("son asking for mom's private note gets 403, the admin too, a missing id 404 (matrix)", async () => {
-    const { app, cookies } = await family();
-    // A third family member with no share plays "stranger".
-    app.users!.create({
-      email: "x@example.com",
-      name: "x",
-      role: "member",
-      passwordHash: await hashPassword(PW),
-    });
-    const stranger = String(
-      (
-        await app.inject({
-          method: "POST",
-          url: "/api/auth/login",
-          headers: { ...local, origin: "http://localhost:3000", "x-agent-lee": "1" },
-          payload: { email: "x@example.com", password: PW },
-        })
-      ).headers["set-cookie"],
-    ).split(";")[0]!;
-    const all = { ...cookies, stranger };
-    const shared: MatrixRow[] = [
-      { route: "GET /api/test/notes/:id", expect: READ },
-      { route: "PATCH /api/test/notes/:id", expect: OWNER_ONLY },
-      { route: "DELETE /api/test/notes/:id", expect: OWNER_ONLY },
-      { route: "GET /api/test/notes/:id/usage", expect: USAGE },
+    const { f, create } = await withNotes();
+    const rows: MatrixRow[] = [
+      { route: "GET /api/test/notes/:id", expect: READ, fixture: () => create() },
+      { route: "PATCH /api/test/notes/:id", expect: OWNER_ONLY, fixture: () => create() },
+      // Real delete: without a fresh fixture per caller, everyone after the owner would get 404.
+      { route: "DELETE /api/test/notes/:id", expect: OWNER_ONLY, fixture: () => create() },
+      { route: "GET /api/test/notes/:id/usage", expect: USAGE, fixture: () => create() },
+      // Not shared: the shared user is a stranger to it.
+      {
+        route: "GET /api/test/notes/:id",
+        expect: { ...READ, shared: 403 },
+        fixture: () => create({ shared: false }),
+      },
     ];
-    expect(await runMatrix(app, shared, { cookies: all, id: "n1", missingId: "nope" })).toEqual([]);
-    // n2 is not shared: the son is a stranger to it.
-    const priv: MatrixRow[] = [{ route: "GET /api/test/notes/:id", expect: { ...READ, shared: 403 } }];
-    expect(await runMatrix(app, priv, { cookies: all, id: "n2", missingId: "../n1" })).toEqual([]);
+    expect(await runMatrix(f, rows)).toEqual([]);
   });
 
-  it("refuses to register a parameterised API route without a permission declaration", async () => {
-    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: createTestDb(), logger: false });
-    apps.push(app);
-    expect(() => app.get("/api/things/:id", async () => ({}))).toThrow(/must declare config.resource/);
+  it("checks ids taken from the query string or the body the same way", async () => {
+    const { app, f, create } = await withNotes();
+    const id = create({ shared: false });
+    const get = (cookie: string, q: string) =>
+      app.inject({ url: `/api/test/note-by-query?${q}`, headers: { host: "localhost:3000", cookie } });
+    expect((await get(f.cookies.owner, `id=${id}`)).statusCode).toBe(200);
+    expect((await get(f.cookies.shared, `id=${id}`)).statusCode).toBe(403);
+    expect((await get(f.cookies.owner, "id=nope")).statusCode).toBe(404);
+    expect((await get(f.cookies.owner, "")).statusCode).toBe(404);
+    const post = (cookie: string, id: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/test/note-by-body",
+        headers: { host: "localhost:3000", cookie, origin: "http://localhost:3000", "x-agent-lee": "1" },
+        payload: { id },
+      });
+    expect((await post(f.cookies.owner, id)).statusCode).toBe(200);
+    expect((await post(f.cookies.admin, id)).statusCode).toBe(403);
+  });
+
+  it("refuses to register a route that could address a resource without a declaration", async () => {
+    const app = await newApp();
+    const h = async () => ({});
+    for (const url of ["/api/things/:id", "/api/things", "/api/things/*", "/a/:id", "/files/*"])
+      expect(() => app.get(url, h), url).toThrow(/must declare config.resource or config.noResource/);
+    expect(() => app.get("/api/x", { config: { noResource: " " } }, h)).toThrow(/must declare/);
     expect(() =>
       app.get(
         "/api/things/:id",
         { config: { resource: { kind: "x", action: "read", param: "thingId" } } },
-        async () => ({}),
+        h,
       ),
     ).toThrow(/not in path/);
     expect(() =>
-      app.get(
-        "/api/things/:id",
-        { config: { auth: "public", resource: { kind: "x", action: "read" } } },
-        async () => ({}),
-      ),
+      app.get("/api/things/:id", { config: { auth: "public", resource: { kind: "x", action: "read" } } }, h),
     ).toThrow(/cannot be public/);
-    // An explicit, reasoned opt-out is accepted.
     expect(() =>
-      app.get("/api/runtimes/:name/models", { config: { noResource: "static catalogue" } }, async () => ({})),
+      app.get("/api/things/:id", { config: { noResource: "x", resource: { kind: "x", action: "read" } } }, h),
+    ).toThrow(/not both/);
+    // Explicit, reasoned opt-out; wildcard and query/body ids are declarable.
+    expect(() =>
+      app.get("/api/runtimes/:name/models", { config: { noResource: "static catalogue" } }, h),
     ).not.toThrow();
+    expect(() =>
+      app.get("/files2/*", { config: { resource: { kind: "x", action: "read", param: "*" } } }, h),
+    ).not.toThrow();
+    // Routes without an id in the path outside /api (pages, static files) need nothing.
+    expect(() => app.get("/about", h)).not.toThrow();
   });
 
-  it("every resource route of the real app has a row in the permission matrix", async () => {
-    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: createTestDb(), logger: false });
-    apps.push(app);
+  it("guards non-API resource routes (e.g. /a/:id) with the login check too", async () => {
+    const { app, f, create } = await withNotes();
+    const id = create();
+    expect((await app.inject({ url: `/n/${id}`, headers: { host: "localhost:3000" } })).statusCode).toBe(401);
+    expect(
+      (await app.inject({ url: `/n/${id}`, headers: { host: "localhost:3000", cookie: f.cookies.stranger } }))
+        .statusCode,
+    ).toBe(403);
+    expect(
+      (await app.inject({ url: `/n/${id}`, headers: { host: "localhost:3000", cookie: f.cookies.shared } }))
+        .statusCode,
+    ).toBe(200);
+  });
+
+  it("every resource route of the real app has a matrix row, and every row holds", async () => {
+    const app = await newApp();
     await app.ready();
     const declared = app.resources.routes.map((r) => `${r.method} ${r.url}`).sort();
     expect(declared).toEqual(APP_MATRIX.map((r) => r.route).sort());
+    expect(await runMatrix(await createFamily(app), APP_MATRIX)).toEqual([]);
   });
 });
 
 describe("open streams re-check access", () => {
-  async function openStream(app: App, cookie: string, path = "/api/test/notes/n1/stream") {
+  async function openStream(app: App, cookie: string, path: string) {
     await app.listen({ host: "127.0.0.1", port: 0 });
     const port = (app.server.address() as AddressInfo).port;
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -183,38 +222,57 @@ describe("open streams re-check access", () => {
       }
       return { text, ended: false };
     };
-    return { until, rest: async () => until(/$^/) };
+    const rest = async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return { text, ended: true };
+        text += decoder.decode(value);
+      }
+    };
+    return { until, rest };
   }
 
   it("closes a shared user's stream when the share is revoked", async () => {
-    const { app, notes, cookies } = await family();
-    const s = await openStream(app, cookies.shared);
+    const { app, f, notes, create } = await withNotes();
+    const id = create();
+    const s = await openStream(app, f.cookies.shared, `/api/test/notes/${id}/stream`);
     await s.until(/event: ready/);
-    notes.set("n1", { ...notes.get("n1")!, sharedWith: [] });
-    app.appEvents.emit("resource-access-changed", { kind: "note", id: "n1" });
+    notes.get(id)!.sharedWith = [];
+    app.appEvents.emit("resource-access-changed", { kind: "note", id });
     const end = await s.rest();
     expect(end.text).toMatch(/event: revoked/);
     expect(end.ended).toBe(true);
   });
 
+  it("catches a revoke that happens between the request check and the subscription", async () => {
+    const { app, f, create } = await withNotes();
+    const s = await openStream(app, f.cookies.shared, `/api/test/notes/${create()}/stream?race=1`);
+    const end = await s.rest();
+    expect(end.text).toMatch(/event: revoked/);
+    expect(end.text).not.toMatch(/event: ready/);
+    expect(end.ended).toBe(true);
+  });
+
   it("closes the stream when the user is deactivated, but not for unrelated changes", async () => {
-    const { app, users, son, dad, cookies } = await family();
-    const s = await openStream(app, cookies.shared);
+    const { app, f, create } = await withNotes();
+    const id = create();
+    const s = await openStream(app, f.cookies.shared, `/api/test/notes/${id}/stream`);
     await s.until(/event: ready/);
-    users.setRole(dad.id, "member"); // someone else: no effect
-    app.appEvents.emit("resource-access-changed", { kind: "note", id: "n2" }); // other note: no effect
-    users.setRole(son.id, "member"); // re-checked, still allowed
-    users.deactivate(son.id);
+    const users = app.users!;
+    users.setRole(f.users.admin.id, "member"); // someone else: no effect
+    app.appEvents.emit("resource-access-changed", { kind: "note", id: "other" }); // other note: no effect
+    users.setRole(f.users.shared.id, "member"); // re-checked, still allowed
+    users.deactivate(f.users.shared.id);
     const end = await s.rest();
     expect(end.text.match(/event: revoked/g)).toHaveLength(1);
     expect(end.ended).toBe(true);
   });
 
   it("closes a non-resource stream when its user is deactivated", async () => {
-    const { app, users, son, cookies } = await family();
-    const s = await openStream(app, cookies.shared, "/api/test/feed");
+    const { app, f } = await withNotes();
+    const s = await openStream(app, f.cookies.shared, "/api/test/feed");
     await s.until(/event: ready/);
-    users.deactivate(son.id);
+    app.users!.deactivate(f.users.shared.id);
     const end = await s.rest();
     expect(end.text).toMatch(/event: revoked/);
     expect(end.ended).toBe(true);

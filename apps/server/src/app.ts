@@ -9,7 +9,7 @@ import { createAccessVerifier } from "./auth/access-jwt.js";
 import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
-import { registerResources } from "./authz/resources.js";
+import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -73,6 +73,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   const app = Fastify({ logger: (opts.logger ?? config.env !== "test") ? loggerOptions() : false });
   const startedAt = Date.now();
 
+  // First, before any route exists: every route that could address a resource must declare its permission.
+  installRouteRules(app);
+
   app.addHook("onSend", async (_req, reply, payload) => {
     reply.headers(BASE_HEADERS);
     if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
@@ -93,16 +96,20 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
   registerCsrf(app, config);
   registerSession(app, users);
-  // After the login check: resource load + policy (404 / 403), and the declaration rule for new routes.
-  registerResources(app);
+  // After the login check: resource load + policy (404 / 403).
+  registerResourceCheck(app);
   if (users) registerAuthRoutes(app, { config, users, ...opts.auth });
 
-  app.get("/api/health", { config: { auth: "public" } }, async (): Promise<HealthResponse> => ({
-    status: "ok",
-    service: "agent-lee",
-    version: VERSION,
-    uptimeSec: Math.round((Date.now() - startedAt) / 1000),
-  }));
+  app.get(
+    "/api/health",
+    { config: { auth: "public", noResource: "service status" } },
+    async (): Promise<HealthResponse> => ({
+      status: "ok",
+      service: "agent-lee",
+      version: VERSION,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+    }),
+  );
 
   if (config.diagStream) registerDiag(app, opts.diag);
 
@@ -111,8 +118,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     _req: unknown,
     reply: { code: (n: number) => { send: (b: unknown) => unknown } },
   ) => reply.code(404).send({ error: "not_found" });
-  app.all("/api", { config: { auth: "public" } }, apiNotFound);
-  app.all("/api/*", { config: { auth: "public" } }, apiNotFound);
+  const notFound = { auth: "public" as const, noResource: "catch-all 404 for unknown API paths" };
+  app.all("/api", { config: notFound }, apiNotFound);
+  app.all("/api/*", { config: notFound }, apiNotFound);
 
   if (opts.vite) {
     const { default: middie } = await import("@fastify/middie");

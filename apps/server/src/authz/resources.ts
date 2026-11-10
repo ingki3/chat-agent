@@ -6,14 +6,24 @@ import { can, type Action, type ResourceRef } from "./policy.js";
 
 export type ResourceLoader = (id: string) => ResourceRef | undefined;
 
-/** Route declaration: which resource the `:param` names and what the route does with it. */
-export type ResourceRule = { kind: string; action: Action; param?: string };
+/**
+ * Route declaration: which resource the request names and what the route does with it.
+ * The id is read from `from` (default the path params) under `param` (default "id"; "*" for a wildcard).
+ */
+export type ResourceRule = {
+  kind: string;
+  action: Action;
+  param?: string;
+  from?: "params" | "query" | "body";
+};
 
 declare module "fastify" {
   interface FastifyContextConfig {
-    /** Required on every API route with a path parameter (or `noResource`), checked at registration. */
+    /**
+     * Every API route, and every route with a path parameter or wildcard, must declare either `resource` or
+     * `noResource` (the reason it does not touch a user-owned resource). Checked at registration.
+     */
     resource?: ResourceRule;
-    /** Explicit opt-out for parameterised API routes that do not address a user-owned resource. */
     noResource?: string;
   }
   interface FastifyRequest {
@@ -42,53 +52,65 @@ export class ResourceRegistry {
   }
 }
 
+/** Routes that must carry a permission declaration: all of /api, and anything taking an id from the path. */
+export const needsDeclaration = (url: string) => isApiPath(url) || url.includes(":") || url.includes("*");
+
 /**
- * Wires the policy into Fastify:
- * - at registration, every API route with a path parameter must declare `config.resource` (or `noResource`
- *   with a reason) — otherwise the server refuses to start;
- * - per request (after the login check), the resource is loaded: missing → 404, not allowed → 403.
+ * Registration rule. Installed first in buildApp, before any route exists: registering a route without a
+ * declaration throws, so the server refuses to start.
  */
-export function registerResources(app: FastifyInstance): ResourceRegistry {
+export function installRouteRules(app: FastifyInstance): ResourceRegistry {
   const registry = new ResourceRegistry();
   app.decorate("resources", registry);
   app.decorateRequest("resource", undefined);
 
   app.addHook("onRoute", (route) => {
-    if (!isApiPath(route.url) || !route.url.includes(":")) return;
+    if (!needsDeclaration(route.url)) return;
     const cfg = route.config ?? {};
     if (cfg.resource && cfg.noResource)
       throw new Error(`${route.url}: declare resource or noResource, not both`);
-    if (!cfg.resource && !cfg.noResource)
-      throw new Error(`${route.url}: API route with a path parameter must declare config.resource (#10)`);
-    if (cfg.resource) {
-      const param = cfg.resource.param ?? "id";
-      if (!route.url.includes(`:${param}`))
-        throw new Error(`${route.url}: resource param ":${param}" not in path`);
-      if (cfg.auth === "public") throw new Error(`${route.url}: a resource route cannot be public`);
-      const methods = Array.isArray(route.method) ? route.method : [route.method];
-      for (const method of methods) registry.routes.push({ method, url: route.url, rule: cfg.resource });
-    }
+    if (!cfg.resource && !cfg.noResource?.trim())
+      throw new Error(`${route.url}: route must declare config.resource or config.noResource (#10)`);
+    if (!cfg.resource) return;
+    const param = cfg.resource.param ?? "id";
+    const from = cfg.resource.from ?? "params";
+    if (from === "params" && !(param === "*" ? route.url.includes("*") : route.url.includes(`:${param}`)))
+      throw new Error(`${route.url}: resource param ":${param}" not in path`);
+    if (cfg.auth === "public") throw new Error(`${route.url}: a resource route cannot be public`);
+    const methods = Array.isArray(route.method) ? route.method : [route.method];
+    for (const method of methods) registry.routes.push({ method, url: route.url, rule: cfg.resource });
   });
+  return registry;
+}
 
+function resourceId(req: FastifyRequest, rule: ResourceRule): string {
+  const source = (rule.from === "query" ? req.query : rule.from === "body" ? req.body : req.params) as
+    Record<string, unknown> | undefined;
+  const v = source?.[rule.param ?? "id"];
+  return typeof v === "string" ? v : "";
+}
+
+/** Per request, after the login check: load the resource — missing → 404, not allowed → 403. */
+export function registerResourceCheck(app: FastifyInstance): void {
   app.addHook("preHandler", async (req, reply) => {
     const rule = req.routeOptions.config?.resource;
     if (!rule) return;
+    // Non-API resource routes (e.g. /a/:id) are not covered by the API login rule, so check login here too.
+    if (req.ctx.emailMismatch) return deny(reply, 403, "access_email_mismatch");
     const user = req.ctx.user;
-    // The login check runs first; this only guards against a route that slipped past it.
     if (!user) return deny(reply, 401, "unauthenticated");
-    const id = (req.params as Record<string, string | undefined>)[rule.param ?? "id"] ?? "";
-    const resource = registry.load(rule.kind, id);
+    if (user.mustChangePassword) return deny(reply, 403, "password_change_required");
+    const resource = app.resources.load(rule.kind, resourceId(req, rule));
     if (!resource) return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
     if (!can(user, rule.action, resource)) return deny(reply, 403, "forbidden");
     req.resource = resource;
   });
-
-  return registry;
 }
 
 /**
  * Re-checks a long-lived request (SSE stream, running job) whenever access may have changed: the user was
- * deactivated or changed role, or the resource's sharing changed. `onRevoke` runs once when access is gone.
+ * deactivated or changed role, or the resource's sharing changed. `onRevoke` runs once when access is gone —
+ * possibly right away, if access was lost between the request's check and this call.
  * Returns an unsubscribe function; call it when the stream ends.
  */
 export function watchAccess(
@@ -108,23 +130,24 @@ export function watchAccess(
     const fresh = app.resources.load(ref.kind, ref.id);
     return !!fresh && can(user, rule.action, fresh);
   };
-  const check = () => {
-    if (done || stillAllowed()) return;
-    done = true;
-    unsubscribe();
-    onRevoke();
-  };
   const onUser = (e: { userId: string }) => {
     if (e.userId === userId) check();
   };
   const onResource = (e: { kind: string; id: string }) => {
     if (ref && e.kind === ref.kind && e.id === ref.id) check();
   };
-  app.appEvents.on("user-access-changed", onUser);
-  app.appEvents.on("resource-access-changed", onResource);
   const unsubscribe = () => {
     app.appEvents.off("user-access-changed", onUser);
     app.appEvents.off("resource-access-changed", onResource);
   };
+  function check() {
+    if (done || stillAllowed()) return;
+    done = true;
+    unsubscribe();
+    onRevoke();
+  }
+  app.appEvents.on("user-access-changed", onUser);
+  app.appEvents.on("resource-access-changed", onResource);
+  check();
   return unsubscribe;
 }
