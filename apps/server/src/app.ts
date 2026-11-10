@@ -9,6 +9,7 @@ import { createAccessVerifier } from "./auth/access-jwt.js";
 import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
+import { registerResources } from "./authz/resources.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -92,6 +93,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
   registerCsrf(app, config);
   registerSession(app, users);
+  // After the login check: resource load + policy (404 / 403), and the declaration rule for new routes.
+  registerResources(app);
   if (users) registerAuthRoutes(app, { config, users, ...opts.auth });
 
   app.get("/api/health", { config: { auth: "public" } }, async (): Promise<HealthResponse> => ({
