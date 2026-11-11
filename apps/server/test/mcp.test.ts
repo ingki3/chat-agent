@@ -561,7 +561,7 @@ describe("runs give runtimes our MCP server (#43)", () => {
     const { app, reply } = await run(adapter);
     expect(JSON.stringify(reply.parts)).toContain("안녕하세요 owner님");
     const ctx = adapter.contexts[0]!;
-    expect(ctx.tools).toEqual(["echo_time", "skill_selftest"]);
+    expect(ctx.tools).toEqual(["echo_time", "web_search", "web_fetch", "skill_selftest"]);
     expect(ctx.mcp!.url).toBe((await app.mcp!.endpoint()).url);
     await expect(connect(ctx.mcp!.url, ctx.mcp!.token)).rejects.toThrow(); // revoked when the run finished
   });

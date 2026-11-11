@@ -433,3 +433,49 @@ export const usageRecords = sqliteTable(
     index("usage_records_created_idx").on(t.createdAt),
   ],
 );
+
+/**
+ * Web material a run looked at (#50, PRD FR-5.1·5.2): fetched pages (`page`, with the readable text the citation
+ * check of #25 compares quotes against) and search results (`search`: title, link and snippet only — leads, not
+ * evidence, so no body). Scoped to the conversation and its owner; gone with the conversation. `runId` names the
+ * run that produced it (no foreign key: run rows are trimmed independently and the id is only a pointer).
+ */
+export const sources = sqliteTable(
+  "sources",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    runId: text("run_id").notNull(),
+    kind: text("kind", { enum: ["page", "search"] }).notNull(),
+    /** What produced it: `web_fetch`, a search provider (`google-news`, `duckduckgo`) or a skill name. */
+    provider: text("provider").notNull(),
+    /** URL asked for (pages) or the result link (search). */
+    url: text("url").notNull(),
+    /** Where the page really came from after redirects (pages only). */
+    finalUrl: text("final_url"),
+    title: text("title").notNull(),
+    site: text("site").notNull(),
+    /** Publication time as ISO 8601 when the page or the result says so. */
+    publishedAt: text("published_at"),
+    fetchedAt: integer("fetched_at").notNull(),
+    contentType: text("content_type"),
+    /** SHA-256 (hex) of `body`. */
+    bodyHash: text("body_hash"),
+    /** Readable text of the page (bounded); null for search results. */
+    body: text("body"),
+    /** True when the page had more text than was kept. */
+    truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+    /** Search results: the snippet the provider showed. */
+    snippet: text("snippet"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [
+    index("sources_conversation_idx").on(t.conversationId, t.createdAt),
+    index("sources_conversation_url_idx").on(t.conversationId, t.url),
+  ],
+);

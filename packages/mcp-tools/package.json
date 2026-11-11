@@ -13,6 +13,11 @@
       "types": "./src/skills.ts",
       "development": "./src/skills.ts",
       "default": "./dist/skills.js"
+    },
+    "./web": {
+      "types": "./src/web.ts",
+      "development": "./src/web.ts",
+      "default": "./dist/web.js"
     }
   },
   "scripts": {

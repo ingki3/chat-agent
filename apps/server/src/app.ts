@@ -30,6 +30,8 @@ import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
 import { McpService, type McpServiceOptions } from "./mcp/service.js";
 import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
+import { SourceStore } from "./web/sources.js";
+import { registerSourceRoutes } from "./web/routes.js";
 import type { Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
 import { KEY_LEN } from "./crypto/secrets.js";
@@ -218,8 +220,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const mcpTokens = new McpTokens();
     // Usage records (#44): replies and connection tests write here, keyed on run and attempt.
     const usage = new UsageStore(opts.db!);
+    // Web search and fetch (#50): results are stored as sources of the run's conversation.
+    const sources = new SourceStore(opts.db!);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
+      web: { sources, providers: config.webSearchProviders },
       ...mcpOptionsFromConfig(config),
       ...opts.mcp,
     });
@@ -258,6 +263,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
     registerConnectionRoutes(app, connections, users, runtimes);
+    registerSourceRoutes(app, app.conversations!, sources);
 
     const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(

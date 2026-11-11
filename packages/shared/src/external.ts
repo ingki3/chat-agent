@@ -22,9 +22,13 @@ const TAG = new RegExp(
   "g",
 );
 
+/** The content as it goes inside a block: every tag of the block's name defused. */
+export const defuseExternal = (content: string): string =>
+  content.replace(TAG, (_m, slash: string) => `&lt;${slash ? "/" : ""}${EXTERNAL_TAG}`);
+
 /** `source` is a short label (URL, file name) — reduced to characters that cannot break the attribute. */
 export function frameExternal(input: { source: string; content: string }): string {
   const source = input.source.replace(/[^\w\-.:/?=&%#@+~ ]/g, "").slice(0, 300);
-  const content = input.content.replace(TAG, (_m, slash: string) => `&lt;${slash ? "/" : ""}${EXTERNAL_TAG}`);
+  const content = defuseExternal(input.content);
   return `<${EXTERNAL_TAG} source="${source}">\n${content}\n</${EXTERNAL_TAG}>`;
 }

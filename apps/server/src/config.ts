@@ -71,6 +71,17 @@ const ConfigSchema = z.object({
   SKILL_PYTHON: optional(z.string()),
   /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
   SKILL_SOURCES: optional(z.string()),
+  /**
+   * Web search providers tried in order (#50), comma-separated: `duckduckgo` (its HTML results page — real
+   * article links, but not an official API and sometimes answered with a bot check; see
+   * docs/decisions/isolation.md "웹 검색·가져오기 (#50)") and `google-news` (the installed google-news-search-skill
+   * — news only, and its links are Google redirect pages web_fetch cannot read). Default: both, in that order.
+   */
+  WEB_SEARCH_PROVIDERS: optional(
+    z.string().regex(/^(google-news|duckduckgo)(,(google-news|duckduckgo))*$/, {
+      message: "WEB_SEARCH_PROVIDERS must list google-news and/or duckduckgo, comma-separated",
+    }),
+  ),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -105,6 +116,8 @@ export type Config = {
    * only into the processes of the skills that declare it (never log this object).
    */
   skillSecrets: Record<string, string>;
+  /** Web search providers in the order they are tried (#50). */
+  webSearchProviders: ("google-news" | "duckduckgo")[];
 };
 
 /** A secret value: printable ASCII, no spaces (API keys). */
@@ -171,5 +184,10 @@ export function loadConfig(
       .filter(Boolean)
       .map((p) => path.resolve(baseDir, p)),
     skillSecrets: skillSecrets(source),
+    webSearchProviders: [
+      ...new Set(
+        (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],
+      ),
+    ],
   };
 }

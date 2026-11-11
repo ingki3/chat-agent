@@ -11,11 +11,14 @@ import {
 } from "@agentlee/mcp-tools";
 import {
   ALWAYS_ON_SKILLS,
+  GOOGLE_NEWS_SKILL,
   SELFTEST_SKILL,
   SKILL_CATALOGUE,
   type BundledSkill,
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
+import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import type { ServerToolInfo } from "@agentlee/mcp-tools";
 import type { UserStore } from "../auth/users.js";
 import { EgressService } from "../isolation/egress.js";
 import type { McpTokens } from "../isolation/tokens.js";
@@ -24,6 +27,17 @@ import { logEvent, type EventLogger } from "../logging.js";
 import { registerToolNames } from "../observability/policy.js";
 import type { InstallState } from "./install.js";
 import type { PythonRuntime } from "./python.js";
+import type { SourceStore } from "../web/sources.js";
+import {
+  DUCKDUCKGO_HOSTS,
+  duckDuckGoProvider,
+  sandboxedWorker,
+  WebService,
+  type Proxy,
+  type SearchProvider,
+  type SearchProviderName,
+  type WebWorker,
+} from "../web/service.js";
 
 /** The bundled skills (always available): the verification skill. Installed skills come from `install.ts`. */
 export const BUNDLED_SKILLS: readonly BundledSkill[] = [SELFTEST_SKILL];
@@ -253,6 +267,18 @@ export type McpServiceOptions = {
   timeZone?: string;
   /** Structured log (#46): one `skill.finished` per call — tool name, outcome code, duration, IDs. No content. */
   log?: EventLogger;
+  /** Web search and fetch (#50). Without it the web tools are not offered (tests without a database). */
+  web?: WebOptions;
+};
+
+export type WebOptions = {
+  sources: SourceStore;
+  /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default duckduckgo, then google-news. */
+  providers?: readonly SearchProviderName[];
+  /** Tests: the worker (in-process), the page proxy, and ready-made providers instead of `providers`. */
+  worker?: WebWorker;
+  fetchProxy?: Proxy;
+  searchProviders?: readonly SearchProvider[];
 };
 
 /** A skill in the admin's list (FR-10.3): the PRD §7 catalogue plus where each one stands on this server. */
@@ -282,6 +308,11 @@ export class McpService {
   private readonly proxies = new Map<string, Pick<EgressService, "endpoint" | "close">>();
   /** Runs whose answered tool calls are being recorded (connection tests, #17). */
   private readonly watched = new Map<string, Set<string>>();
+  private readonly runner: SkillRunner;
+  /** Web search and fetch (#50), when configured. */
+  readonly web: WebService | undefined;
+  /** The server's own tools (web): every active user has them. */
+  private readonly tools: readonly ServerToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -289,18 +320,72 @@ export class McpService {
     private readonly opts: McpServiceOptions = {},
   ) {
     this.skills = (opts.skills ?? BUNDLED_SKILLS).filter((s) => s.kind !== "python" || opts.python);
+    this.runner =
+      opts.runSkill ??
+      sandboxedSkillRunner({
+        ...(opts.limits ? { limits: opts.limits } : {}),
+        python: opts.python,
+        secrets: opts.secrets,
+        proxy: (s) => this.proxyFor(s.name, s.hosts),
+      });
+    this.web = opts.web ? this.buildWeb(opts.web) : undefined;
+    this.tools = this.web ? [...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []), WEB_FETCH_TOOL] : [];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
   }
 
-  /** Every tool this server offers (without the `mcp__agentlee__` prefix) — for log registration. */
-  toolNames(): string[] {
-    return toolNames({ skills: this.skills });
+  /**
+   * Search providers in the configured order. `google-news` runs the installed google-news-search-skill (news
+   * only; leads, not evidence); `duckduckgo` reads its HTML results page through a proxy for that host only.
+   */
+  private buildWeb(o: WebOptions): WebService {
+    const worker = o.worker ?? sandboxedWorker();
+    const news = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
+    const providers =
+      o.searchProviders ??
+      (o.providers ?? ["duckduckgo", "google-news"]).flatMap((name): SearchProvider[] => {
+        if (name === "duckduckgo") {
+          const proxy = {
+            endpoint: () => this.proxyFor("web:duckduckgo", DUCKDUCKGO_HOSTS),
+            close: async () => {},
+          };
+          return [duckDuckGoProvider(worker, proxy)];
+        }
+        if (name === "google-news" && news)
+          return [
+            {
+              name: "google-news",
+              search: async (query, max, scope) => {
+                const r = await this.runner(
+                  news,
+                  { query, maxResults: max, lookbackDays: 30, sort: "relevance" },
+                  scope,
+                );
+                if (!r.ok) return { ok: false, code: "web_search_unavailable" };
+                const out = r.output as { ok?: unknown };
+                if (out?.ok === false) return { ok: false, code: "web_search_unavailable" };
+                return { ok: true, hits: (news.searchHits?.(r.output) ?? []).map((h) => h.hit) };
+              },
+            },
+          ];
+        return [];
+      });
+    return new WebService({
+      sources: o.sources,
+      providers,
+      worker,
+      ...(o.fetchProxy ? { fetchProxy: o.fetchProxy } : {}),
+    });
   }
 
-  /** The tools one user's run gets: echo_time and the skills that user may use (FR-1.6). */
+  /** Every tool this server offers (without the `mcp__agentlee__` prefix) — for log registration. */
+  toolNames(): string[] {
+    return toolNames({ skills: this.skills, tools: this.tools });
+  }
+
+  /** The tools one user's run gets: echo_time, the web tools and the skills that user may use (FR-1.6). */
   toolNamesFor(userId: string): string[] {
-    return toolNames({ skills: this.skillsFor(userId) });
+    return toolNames({ skills: this.skillsFor(userId), tools: this.tools });
   }
 
   /** Whether this user may use this skill now: active, and the skill always on or in their permissions. */
@@ -335,24 +420,19 @@ export class McpService {
     });
   }
 
-  private proxyFor(skill: BundledSkill) {
-    let p = this.proxies.get(skill.name);
+  /** One egress proxy per key (a skill, or a search provider), reaching only its own hosts. */
+  private proxyFor(key: string, hosts: readonly string[]) {
+    let p = this.proxies.get(key);
     if (!p) {
-      p = (this.opts.egress ?? ((allow) => new EgressService({ allow })))(skill.hosts);
-      this.proxies.set(skill.name, p);
+      p = (this.opts.egress ?? ((allow) => new EgressService({ allow })))(hosts);
+      this.proxies.set(key, p);
     }
     return p.endpoint();
   }
 
   private host(): McpHost {
-    const runSkill =
-      this.opts.runSkill ??
-      sandboxedSkillRunner({
-        ...(this.opts.limits ? { limits: this.opts.limits } : {}),
-        python: this.opts.python,
-        secrets: this.opts.secrets,
-        proxy: (s) => this.proxyFor(s),
-      });
+    const runSkill = this.runner;
+    const toolByName = new Map(this.tools.map((t) => [t.name, t]));
     const byName = new Map(this.skills.map((s) => [s.name, s]));
     const now = () => Date.now();
     return {
@@ -384,9 +464,62 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
+      tools: this.tools,
+      runTool: async (name, input, scope) => {
+        const t0 = now();
+        const r = await this.callTool(toolByName.get(name), input, scope);
+        logEvent(this.opts.log, r.ok ? "info" : "warn", "web.finished", {
+          userId: scope.userId,
+          conversationId: scope.conversationId,
+          runId: scope.runId,
+          tool: name,
+          status: r.ok ? "ok" : "error",
+          durationMs: now() - t0,
+          ...(r.ok ? {} : { webCode: r.code }),
+        });
+        return r;
+      },
       ...(this.opts.now ? { now: this.opts.now } : {}),
       ...(this.opts.timeZone ? { timeZone: this.opts.timeZone } : {}),
     };
+  }
+
+  /** A web tool call: active user, strict input, a process slot like a skill, then the web service. */
+  private async callTool(
+    tool: ServerToolInfo | undefined,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): Promise<SkillResult> {
+    const web = this.web;
+    if (!tool || !web || !this.users.byId(scope.userId)?.active)
+      return { ok: false, code: "web_not_allowed" };
+    const parsed = z.strictObject(tool.input).safeParse(input);
+    if (!parsed.success) return { ok: false, code: "web_bad_input" };
+    const data = parsed.data as Record<string, unknown>;
+    return (
+      (await this.withSlot(scope, () =>
+        tool.name === WEB_SEARCH_TOOL.name
+          ? web.search(data as { query: string; maxResults?: number }, scope)
+          : web.fetch(data as { url: string }, scope),
+      )) ?? { ok: false, code: "web_busy" }
+    );
+  }
+
+  /** Runs `fn` in a process slot (total and per run), or returns undefined at once when none is free. */
+  private async withSlot<T>(scope: ToolScope, fn: () => Promise<T>): Promise<T | undefined> {
+    const limit = this.opts.concurrency ?? DEFAULT_SKILL_CONCURRENCY;
+    const mine = this.activeByRun.get(scope.runId) ?? 0;
+    if (this.active >= limit.total || mine >= limit.perRun) return undefined;
+    this.active++;
+    this.activeByRun.set(scope.runId, mine + 1);
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+      const left = (this.activeByRun.get(scope.runId) ?? 1) - 1;
+      if (left > 0) this.activeByRun.set(scope.runId, left);
+      else this.activeByRun.delete(scope.runId);
+    }
   }
 
   private async call(
@@ -402,19 +535,18 @@ export class McpService {
     if (!parsed.success || !skill.args(parsed.data as Record<string, unknown>))
       return { ok: false, code: "skill_bad_input" };
     // Each call is a process: cap them so one batch or one runtime cannot exhaust the machine.
-    const limit = this.opts.concurrency ?? DEFAULT_SKILL_CONCURRENCY;
-    const mine = this.activeByRun.get(scope.runId) ?? 0;
-    if (this.active >= limit.total || mine >= limit.perRun) return { ok: false, code: "skill_busy" };
-    this.active++;
-    this.activeByRun.set(scope.runId, mine + 1);
-    try {
-      return await runSkill(skill, parsed.data as Record<string, unknown>, scope);
-    } finally {
-      this.active--;
-      const left = (this.activeByRun.get(scope.runId) ?? 1) - 1;
-      if (left > 0) this.activeByRun.set(scope.runId, left);
-      else this.activeByRun.delete(scope.runId);
-    }
+    const r = await this.withSlot(scope, () =>
+      runSkill(skill, parsed.data as Record<string, unknown>, scope),
+    );
+    if (!r) return { ok: false, code: "skill_busy" };
+    if (r.ok && skill.searchHits && this.web) this.registerHits(skill, r.output, scope);
+    return r;
+  }
+
+  /** A search skill's results become sources (#50); each item gets its `sourceId` (null when not stored). */
+  private registerHits(skill: BundledSkill, output: unknown, scope: ToolScope): void {
+    for (const { item, hit } of skill.searchHits?.(output) ?? [])
+      item.sourceId = this.web?.registerHit(skill.name, hit, scope)?.id ?? null;
   }
 
   /**
@@ -449,5 +581,6 @@ export class McpService {
     await r?.close();
     await Promise.all([...this.proxies.values()].map((p) => p.close()));
     this.proxies.clear();
+    await this.web?.close();
   }
 }

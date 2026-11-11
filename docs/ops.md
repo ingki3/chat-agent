@@ -15,6 +15,7 @@
 | 스킬 비밀 (#21) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY` | 15.3절 | `.env`와 같다 |
 | 런타임 연결 키·토큰 (#17) | DB `connections.secret`(마스터 키로 암호화) | 설정 → 내 런타임 연결, 관리자 API — 11절 | DB와 함께 포함(암호문) |
 | 사용량 기록 (#44) | DB `usage_records` 표 — 실행 시도(run·attempt)마다 1행, 토큰·원시 비용·요청 수만(내용 없음) | — | DB와 함께 포함 — 16절 |
+| 웹 출처 (#50) | DB `sources` 표: 가져온 페이지 본문·검색 결과 | `WEB_SEARCH_PROVIDERS` — 17절 | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
@@ -473,3 +474,27 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
             count(*) attempts, sum(input_tokens) input, sum(output_tokens) output, round(sum(cost_usd),4) usd
        from usage_records group by d, user_id, runtime, model, purpose order by d desc;"
   ```
+
+## 17. 웹 검색·가져오기 (#50)
+방식과 근거는 `docs/decisions/isolation.md` "웹 검색·가져오기 (#50)"에 있다.
+
+### 17.1 켜져 있는 것
+- `web_fetch`는 모든 활성 사용자의 run에 항상 있다. 따로 설치할 것이 없다. macOS가 아니면 `web_unavailable`로 거부한다(샌드박스 없음).
+- `web_search`는 검색 제공자가 하나라도 있을 때만 있다. `.env`(없으면 기본값):
+  ```
+  WEB_SEARCH_PROVIDERS=duckduckgo,google-news   # 기본. 순서대로 시도
+  WEB_SEARCH_PROVIDERS=google-news              # DuckDuckGo 약관이 걱정될 때(뉴스만, 원문 링크 아님)
+  ```
+  - `duckduckgo`: 키 없음. 공식 API가 아니어서 약관상 회색 지대이고, 연달아 쓰면 봇 확인 페이지가 온다(`web_search_blocked` → 다음 제공자).
+  - `google-news`: `google-news-search-skill`이 설치돼 있고 `SKILL_PYTHON`이 있어야 한다(§15). 링크가 Google 중계 주소라 `web_fetch`로 원문이 열리지 않는다.
+  - 바꾼 뒤에는 서비스를 다시 시작한다.
+
+### 17.2 무엇이 저장되나
+- 가져온 페이지는 `sources` 표에 대화별로 남는다: URL, 최종 URL, 제목, 사이트, 게시일(있을 때), 가져온 시각, 본문 해시, 본문(최대 40만 자). 검색 결과는 제목·링크·스니펫만(본문 없음).
+- 대화를 지우면 그 대화의 출처도 지워진다. DB에 있으므로 백업에 함께 들어간다(1절).
+- 대화 주인은 `GET /api/conversations/<id>/sources`로 목록을 본다(본문 제외). 관리자도 남의 목록은 못 본다.
+
+### 17.3 막히는 것과 로그
+- 이 Mac·집 네트워크 주소(루프백·사설·링크 로컬·메타데이터), `localhost`·`.local` 같은 이름, 80/443 밖 포트, http/https가 아닌 주소, PDF, 3MB 넘는 응답, 20초 넘는 가져오기, 5번 넘는 리다이렉트는 거부된다. 모델은 `web_*` 코드만 본다.
+- 로그에는 호출마다 `web.finished`(도구 이름, 결과 코드 `webCode`, 소요 시간, ID)만 남는다. URL·호스트·검색어·본문은 남지 않는다. 어떤 사이트에서 막혔는지는 로그로 알 수 없다(의도).
+- 자주 보이는 코드: `web_blocked`(정책 거부), `web_unreachable`(연결 실패·없는 이름), `web_no_text`(스크립트로만 그리는 페이지), `web_unsupported_type`(PDF 등), `web_search_blocked`(DuckDuckGo 봇 확인).

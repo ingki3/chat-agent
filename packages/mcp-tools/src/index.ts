@@ -24,6 +24,9 @@ export type SkillInfo = {
 
 export type SkillResult = { ok: true; output: unknown } | { ok: false; code: string };
 
+/** A tool implemented by the host itself (web search and fetch, #50) — offered to every active user. */
+export type ServerToolInfo = SkillInfo;
+
 export type McpHost = {
   /** Token → scope, or undefined when unknown, expired or revoked. Called per HTTP request and again per tool result. */
   authenticate(token: string): ToolScope | undefined;
@@ -41,12 +44,19 @@ export type McpHost = {
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
   /** Told about every answered tool call (the connection test #17 checks that our server really served them). */
   onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
+  /** The host's own tools (named as they are, no prefix), and how to run one. */
+  tools?: readonly ServerToolInfo[];
+  runTool?(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
 };
 
 /** Tool names this server offers (adapters list them as allowed; runtimes see `mcp__agentlee__<name>`). */
 export const skillToolName = (skill: string) => `skill_${skill}`;
-export function toolNames(host: Pick<McpHost, "skills">): string[] {
-  return ["echo_time", ...host.skills.map((s) => skillToolName(s.name))];
+export function toolNames(host: Pick<McpHost, "skills" | "tools">): string[] {
+  return [
+    "echo_time",
+    ...(host.tools ?? []).map((t) => t.name),
+    ...host.skills.map((s) => skillToolName(s.name)),
+  ];
 }
 
 const text = (value: unknown, isError = false) => ({
@@ -84,6 +94,20 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
       });
     },
   );
+
+  for (const tool of host.tools ?? []) {
+    server.registerTool(
+      tool.name,
+      { description: tool.description, inputSchema: z.strictObject(tool.input) },
+      async (input: Record<string, unknown>) => {
+        if (!stillValid() || !host.runTool) return text({ error: "unauthorized" }, true);
+        const r = await host.runTool(tool.name, input, scope);
+        if (!stillValid()) return text({ error: "unauthorized" }, true);
+        host.onToolCall?.(tool.name, scope, r.ok);
+        return r.ok ? text(r.output) : text({ error: r.code }, true);
+      },
+    );
+  }
 
   for (const skill of host.skillsFor(scope.userId)) {
     server.registerTool(

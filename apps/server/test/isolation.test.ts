@@ -446,9 +446,49 @@ describe("network policy", () => {
       "fe80::1",
       "ff02::1",
       "not-an-ip",
+      // #50 review: every non-global IPv6 range, at its boundaries
+      "fec0::1", // site local
+      "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+      "64:ff9b:1::a00:1", // local-use NAT64 (RFC 8215) — whatever it maps to
+      "64:ff9b:1:0:a:0:100:0",
+      "64:ff9b:1::808:808",
+      "64:ff9b::1:808:808", // outside the /96 well-known prefix
+      "64:ff9b::a00:1", // WKP with 10.0.0.1
+      "64:ff9b::7f00:1",
+      "100::1", // discard
+      "100::ffff:ffff:ffff:ffff",
+      "::8.8.8.8", // deprecated IPv4-compatible
+      "::ffff:0:0",
+      "2001::1", // Teredo
+      "2001:1ff:ffff::1", // end of 2001::/23
+      "2001:db8::1",
+      "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+      "2002:808:808::1", // 6to4
+      "2002:7f00:1::1",
+      "3fff::1",
+      "3fff:fff:ffff::1",
+      "5f00::1",
+      "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2000::/3
+      "4000::1", // just above 2000::/3
+      "fd00::1",
+      "ff00::1",
     ];
     for (const ip of blocked) expect(isBlockedAddress(ip), ip).toBe(true);
-    for (const ip of ["8.8.8.8", "1.1.1.1", "172.32.0.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"])
+    for (const ip of [
+      "8.8.8.8",
+      "1.1.1.1",
+      "172.32.0.1",
+      "2606:4700:4700::1111",
+      "::ffff:8.8.8.8",
+      "64:ff9b::808:808", // WKP with a public IPv4
+      "2000::1", // start of 2000::/3
+      "2001:200::1", // first address after 2001::/23
+      "2001:db9::1",
+      "2003::1",
+      "3ffe:ffff::1",
+      "3fff:1000::1", // after 3fff::/20
+      "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    ])
       expect(isBlockedAddress(ip), ip).toBe(false);
   });
 
