@@ -247,12 +247,13 @@ const PRICE_FIELDS = [
 const toDraft = (p: ModelPrice): Draft => ({
   runtime: p.runtime,
   model: p.model,
-  input: p.input === null ? "" : String(p.input),
-  output: p.output === null ? "" : String(p.output),
-  cacheRead: p.cacheRead === null ? "" : String(p.cacheRead),
-  cacheWrite: p.cacheWrite === null ? "" : String(p.cacheWrite),
+  input: p.input ?? "",
+  output: p.output ?? "",
+  cacheRead: p.cacheRead ?? "",
+  cacheWrite: p.cacheWrite ?? "",
 });
-const price = (s: string) => (s.trim() === "" ? null : Number(s));
+/** Sent as the decimal text typed (never a float): the server computes costs exactly from it. */
+const price = (s: string) => (s.trim() === "" ? null : s.trim());
 
 /** Model price table: each save is a new version; rows already costed keep the version they were costed with. */
 function PriceEditor() {
@@ -290,8 +291,8 @@ function PriceEditor() {
         {current
           ? `현재 v${current.version} · ${new Date(current.createdAt).toLocaleString("ko-KR")} 저장 · 버전 ${table.data?.versions.length ?? 0}개`
           : "아직 가격표가 없어요. 가격이 없으면 API 키 사용 비용은 ‘미제공’으로 보여요."}{" "}
-        단위: 100만 토큰당 USD. 빈칸은 미제공이에요. 저장하면 새 버전이 되고, 지난 기록의 비용은 바뀌지
-        않아요.
+        단위: 100만 토큰당 USD, 소수점 아래 6자리까지. 빈칸은 미제공이에요. 저장하면 새 버전이 되고, 지난
+        기록의 비용은 바뀌지 않아요.
       </p>
       <form
         onSubmit={(e) => {
@@ -329,7 +330,7 @@ function PriceEditor() {
                   placeholder={label}
                   type="number"
                   min="0"
-                  step="any"
+                  step="0.000001"
                   inputMode="decimal"
                   value={r[k]}
                   onChange={(e) => set(i, { [k]: e.target.value })}

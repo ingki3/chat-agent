@@ -10,8 +10,18 @@ export const USAGE_PURPOSES = ["chat", "schedule", "title", "summary", "connecti
 export const UsagePurpose = z.enum(USAGE_PURPOSES);
 export type UsagePurpose = z.infer<typeof UsagePurpose>;
 
-/** USD per million tokens; `null` = not provided. */
-const Price = z.number().finite().min(0).max(10_000).nullable();
+/** Decimal places a price may have (USD per million tokens): 6, i.e. down to 1 micro-USD per million tokens. */
+export const PRICE_DECIMALS = 6;
+/**
+ * USD per million tokens as a decimal string ("0.29", "15", "1.234567"), at most 10000 with at most 6 decimals —
+ * never a float, so the server multiplies exactly. `null` = not provided.
+ */
+export const PRICE_PATTERN = /^(0|[1-9]\d{0,4})(\.\d{1,6})?$/;
+const Price = z
+  .string()
+  .regex(PRICE_PATTERN)
+  .refine((v) => Number(v) <= 10_000, { message: "at most 10000" })
+  .nullable();
 
 /** One model's prices. Runtime + model is the key (`runs.model` as the runtime reports it). */
 export const ModelPrice = z.object({
@@ -50,8 +60,17 @@ export type PriceTableResponse = z.infer<typeof PriceTableResponse>;
 
 /** `GET/PUT /api/admin/usage/settings`. The budget switch is not here: it comes in v1.1 (FR-9.1). */
 export const UsageSettings = z.object({
-  /** Today's cost above this → one admin notification (`daily_cost`) per day; null = off. */
-  dailyCostThresholdUsd: z.number().finite().positive().max(100_000).nullable(),
+  /**
+   * Today's cost above this → one admin notification (`daily_cost`) per day; null = off. At most 6 decimals (a
+   * whole micro-USD), so the server compares it exactly.
+   */
+  dailyCostThresholdUsd: z
+    .number()
+    .finite()
+    .positive()
+    .max(100_000)
+    .refine((n) => /^\d+(\.\d{1,6})?$/.test(String(n)), { message: "at most 6 decimals" })
+    .nullable(),
 });
 export type UsageSettings = z.infer<typeof UsageSettings>;
 

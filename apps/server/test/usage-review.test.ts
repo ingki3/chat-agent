@@ -25,11 +25,14 @@ const NOV_11_NOON_KST = Date.UTC(2026, 10, 11, 3, 0, 0);
 const PRICE: ModelPrice = {
   runtime: "claude-code",
   model: "m",
-  input: 1,
-  output: 2,
+  input: "1",
+  output: "2",
   cacheRead: null,
   cacheWrite: null,
 };
+
+/** $0.29 per million input tokens: 50 tokens cost exactly 14.5 micro-USD (a float product gives 14.499999…). */
+const PRICE29: ModelPrice = { ...PRICE, model: "m29", input: "0.29", output: "0" };
 
 async function start(threshold: number | null) {
   const db = createTestDb();
@@ -54,7 +57,7 @@ async function start(threshold: number | null) {
       },
       payload,
     });
-  expect((await put("/api/admin/usage/prices", { prices: [PRICE] })).statusCode).toBe(200);
+  expect((await put("/api/admin/usage/prices", { prices: [PRICE, PRICE29] })).statusCode).toBe(200);
   expect((await put("/api/admin/usage/settings", { dailyCostThresholdUsd: threshold })).statusCode).toBe(200);
   const key = app.connections!.store.create({
     runtime: "claude-code",
@@ -104,10 +107,10 @@ describe("exact cost arithmetic (integer micro-USD)", () => {
     expect(costOf(t, PRICE)).toBe(300_000);
     expect(0.1 * 1 + 0.1 * 2).not.toBe(0.3); // what a float sum would have stored
     // Fractional prices are rounded once, to the nearest micro-USD.
-    expect(costOf({ ...t, outputTokens: 0 }, { ...PRICE, input: 0.3 })).toBe(30_000);
+    expect(costOf({ ...t, outputTokens: 0 }, { ...PRICE, input: "0.3" })).toBe(30_000);
     // 7 × 0.1 is 0.7000000000000001 in floats and 1001 × 1.1 is 1101.1000000000001: always a whole micro-USD.
-    expect(costOf({ ...t, inputTokens: 7, outputTokens: 0 }, { ...PRICE, input: 0.1 })).toBe(1);
-    expect(costOf({ ...t, inputTokens: 1001, outputTokens: 0 }, { ...PRICE, input: 1.1 })).toBe(1101);
+    expect(costOf({ ...t, inputTokens: 7, outputTokens: 0 }, { ...PRICE, input: "0.1" })).toBe(1);
+    expect(costOf({ ...t, inputTokens: 1001, outputTokens: 0 }, { ...PRICE, input: "1.1" })).toBe(1101);
   });
 
   it.each([
@@ -137,6 +140,78 @@ describe("exact cost arithmetic (integer micro-USD)", () => {
     const rep = await t.report();
     expect(rep.total.costMicroUsd).toBe(1_000_000);
     expect(rep.total.costUsd).toBe(1);
+  });
+});
+
+describe("exact decimal prices (review round 2): no float anywhere between the price and the micro-USD", () => {
+  const none = { cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const at = (inputTokens: number, input: string) =>
+    costOf({ inputTokens, outputTokens: 0, ...none }, { ...PRICE, input, output: null });
+
+  it("50 tokens × $0.29/M = 14.5 micro-USD → 15 (half up), though 50 × 0.29 is 14.499999999999998 in floats", () => {
+    expect(50 * 0.29).toBeLessThan(14.5);
+    expect(at(50, "0.29")).toBe(15);
+  });
+
+  it.each([
+    [1, "0.5", 1], // exactly half → up
+    [1, "0.499999", 0], // just below half → down
+    [3, "0.166667", 1], // 0.500001 → up
+    [3, "0.166666", 0], // 0.499998 → down
+    [2, "0.75", 2], // 1.5 → 2
+    [1_000_000_000, "0.000001", 1000], // smallest price step, large token count
+    [7, "0.1", 1], // 0.7 → 1
+    [1001, "1.1", 1101], // 1101.1 → 1101
+    [100_000, "9999.999999", 1_000_000_000], // 999999999.9 → 1000000000
+  ])("%s tokens × $%s/M → %s micro-USD", (tokens, price, want) => expect(at(tokens, price)).toBe(want));
+
+  it("a price that is not an accepted decimal is not costed (미제공), never guessed", () => {
+    expect(at(10, "1e3")).toBeNull();
+    expect(at(10, "0.0000001")).toBeNull();
+    expect(at(10, "-1")).toBeNull();
+  });
+
+  it("667 rows of 50 tokens × $0.29/M = $0.010005 → the $0.01 alert fires at the 667th row, not before", async () => {
+    const t = await start(0.01);
+    for (let i = 0; i < 666; i++) t.record({ model: "m29" }, { inputTokens: 50, outputTokens: 0 });
+    expect(t.alerts()).toBe(0); // 666 × 15 = 9990 micro-USD
+    t.record({ model: "m29" }, { inputTokens: 50, outputTokens: 0 });
+    expect(t.alerts()).toBe(1); // 10005 > 10000
+    expect((await t.report()).today.costMicroUsd).toBe(10_005);
+  });
+
+  it("1000 such rows sum to exactly $0.015", async () => {
+    const t = await start(null);
+    for (let i = 0; i < 1000; i++) t.record({ model: "m29" }, { inputTokens: 50, outputTokens: 0 });
+    const rep = await t.report();
+    expect(rep.total.costMicroUsd).toBe(15_000);
+    expect(rep.total.costUsd).toBe(0.015);
+  });
+
+  it("the admin API takes prices as decimal strings with at most 6 decimals, and thresholds with at most 6", async () => {
+    const t = await start(null);
+    const put = (url: string, payload: object) =>
+      t.app.inject({
+        method: "PUT",
+        url,
+        headers: {
+          host: "localhost:3000",
+          cookie: t.f.cookies.admin,
+          origin: "http://localhost:3000",
+          [CSRF_HEADER]: "1",
+          "content-type": "application/json",
+        },
+        payload,
+      });
+    for (const input of [0.29, "0.2900001", "1e3", "-1", " 1", "01", "10000.000001", "1.", ".5"])
+      expect((await put("/api/admin/usage/prices", { prices: [{ ...PRICE, input }] })).statusCode).toBe(400);
+    for (const input of ["0", "0.29", "10000", "1.234567"])
+      expect((await put("/api/admin/usage/prices", { prices: [{ ...PRICE, input }] })).statusCode).toBe(200);
+    for (const v of [0.0000001, 1.0000001])
+      expect((await put("/api/admin/usage/settings", { dailyCostThresholdUsd: v })).statusCode).toBe(400);
+    expect((await put("/api/admin/usage/settings", { dailyCostThresholdUsd: 0.000001 })).statusCode).toBe(
+      200,
+    );
   });
 });
 

@@ -60,7 +60,10 @@ const RUNTIME_OF: Record<string, string> = { "claude-opus-5-5": "claude-code", "
 const FIXTURE_PRICES: ModelPrice[] = Object.entries(FIXTURE.priceTable.usdPerMTok).map(([model, p]) => ({
   runtime: RUNTIME_OF[model]!,
   model,
-  ...p,
+  input: String(p.input),
+  output: String(p.output),
+  cacheRead: String(p.cacheRead),
+  cacheWrite: String(p.cacheWrite),
 }));
 /** The fixture's input excludes cached tokens; our rows (adapter contract) include them. */
 const reportOf = (r: (typeof FIXTURE.records)[number]) => ({
@@ -78,10 +81,10 @@ describe("cost of one row (#32)", () => {
   const price: ModelPrice = {
     runtime: "claude-code",
     model: "m",
-    input: 10,
-    output: 50,
-    cacheRead: 1,
-    cacheWrite: 12.5,
+    input: "10",
+    output: "50",
+    cacheRead: "1",
+    cacheWrite: "12.5",
   };
 
   it("the AC-12 fixture's API key records cost what the fixture expects", () => {
@@ -178,8 +181,8 @@ function bare() {
   const opus = (input: number, output: number): ModelPrice => ({
     runtime: "claude-code",
     model: "opus",
-    input,
-    output,
+    input: String(input),
+    output: String(output),
     cacheRead: null,
     cacheWrite: null,
   });
@@ -246,7 +249,7 @@ describe("costing at record time (#32): API key only, pinned price version", () 
 
     const v2 = t.prices.save([t.opus(20, 100)], "admin");
     expect(v2.version).toBe(2);
-    expect(t.prices.version(1)!.prices[0]!.input).toBe(10); // version 1 is still there, unchanged
+    expect(t.prices.version(1)!.prices[0]!.input).toBe("10"); // version 1 is still there, unchanged
     expect(t.row(old.runId)).toMatchObject({ priceVersion: 1, pricedCostMicros: 1_000_000 });
 
     // The old attempt reports again (last one wins): its figures change, its version does not.
@@ -471,8 +474,8 @@ describe("admin usage report (#32, FR-9.3·9.5, AC-12)", () => {
       {
         runtime: "claude-code",
         model: "claude-opus-5-5",
-        input: 10,
-        output: 0,
+        input: "10",
+        output: "0",
         cacheRead: null,
         cacheWrite: null,
       },
@@ -580,8 +583,8 @@ describe("daily cost notification (#32, FR-9.5)", () => {
       {
         runtime: "claude-code",
         model: "claude-opus-5-5",
-        input: 10,
-        output: 0,
+        input: "10",
+        output: "0",
         cacheRead: null,
         cacheWrite: null,
       },
@@ -672,7 +675,7 @@ describe("daily cost notification (#32, FR-9.5)", () => {
     );
     const prices = new PriceStore(db, () => NOV_11_NOON_KST);
     prices.save(
-      [{ runtime: "claude-code", model: "m", input: 10, output: 0, cacheRead: null, cacheWrite: null }],
+      [{ runtime: "claude-code", model: "m", input: "10", output: "0", cacheRead: null, cacheWrite: null }],
       "a",
     );
     const store = new UsageStore(db, () => NOV_11_NOON_KST, {
@@ -709,10 +712,10 @@ describe("no budget in v1: usage never blocks a run (#32 완료 기준, FR-9.1)"
         {
           runtime: "claude-code",
           model: "fake-large",
-          input: 1000,
-          output: 1000,
-          cacheRead: 1000,
-          cacheWrite: 1000,
+          input: "1000",
+          output: "1000",
+          cacheRead: "1000",
+          cacheWrite: "1000",
         },
       ]);
       const key = s.conn(s.f.users.owner.id, "api_key");
@@ -751,10 +754,10 @@ describe("no budget in v1: usage never blocks a run (#32 완료 기준, FR-9.1)"
       {
         runtime: "claude-code",
         model: "fake-large",
-        input: 1000,
-        output: 1000,
-        cacheRead: 1000,
-        cacheWrite: 1000,
+        input: "1000",
+        output: "1000",
+        cacheRead: "1000",
+        cacheWrite: "1000",
       },
     ]);
     const key = t.conn(t.f.users.owner.id, "api_key");

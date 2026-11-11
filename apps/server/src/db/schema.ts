@@ -460,14 +460,17 @@ export const usageRecords = sqliteTable(
   ],
 );
 
-/** One model's prices in a price table (#32), USD per million tokens. NULL = not provided ("미제공"). */
+/**
+ * One model's prices in a price table (#32): USD per million tokens as decimal strings (at most 6 decimals, never
+ * floats — the cost is computed exactly from them). NULL = not provided ("미제공").
+ */
 export type ModelPriceRow = {
   runtime: string;
   model: string;
-  input: number | null;
-  output: number | null;
-  cacheRead: number | null;
-  cacheWrite: number | null;
+  input: string | null;
+  output: string | null;
+  cacheRead: string | null;
+  cacheWrite: string | null;
 };
 
 /**

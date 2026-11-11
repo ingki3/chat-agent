@@ -254,7 +254,8 @@ describe("admin-only routes", () => {
     const app = await newApp();
     await app.ready();
     const f = await createFamily(app);
-    // What Fastify actually serves under /api/admin — not what our config says is admin.
+    // What Fastify actually serves under /api/admin — not what our config says is admin. HEAD is swept too: the
+    // automatic mirror of each GET and any explicitly registered HEAD route.
     const isAdminPath = (r: string) => /^[A-Z]+ \/api\/admin(\/|$)/.test(r);
     const routes = fastifyRoutes(app).filter(isAdminPath).sort();
     expect(routes.length).toBeGreaterThan(10);
@@ -277,10 +278,44 @@ describe("admin-only routes", () => {
     expect(failures).toEqual([]);
   });
 
+  it("tells Fastify's automatic HEAD mirror of a GET from an explicitly registered HEAD route", async () => {
+    const app = await newApp();
+    const handler = async () => ({ ok: true });
+    app.get("/api/test/both", { config: { noResource: "test" } }, handler);
+    app.head("/api/test/head-only", { config: { noResource: "test" } }, async () => "");
+    // An explicit HEAD on a path whose GET Fastify did not mirror (exposeHeadRoute off), same handler even.
+    app.get("/api/test/own-head", { exposeHeadRoute: false, config: { noResource: "test" } }, handler);
+    app.head("/api/test/own-head", { config: { noResource: "other" } }, handler);
+    await app.ready();
+    const entry = (method: string, url: string) =>
+      app.resources.allRoutes.filter((r) => r.method === method && r.url === url);
+    expect(entry("HEAD", "/api/test/both")).toEqual([
+      { method: "HEAD", url: "/api/test/both", mirror: true },
+    ]);
+    expect(entry("HEAD", "/api/test/head-only")).toEqual([
+      { method: "HEAD", url: "/api/test/head-only", mirror: false },
+    ]);
+    expect(entry("HEAD", "/api/test/own-head")).toEqual([
+      { method: "HEAD", url: "/api/test/own-head", mirror: false },
+    ]);
+    // In the real app the only explicit HEAD routes under /api are the JSON 404 catch-alls (`app.all`); static
+    // files register their own HEAD too. Every other HEAD it serves is a GET's mirror.
+    const real = await newApp();
+    await real.ready();
+    expect(
+      real.resources.allRoutes
+        .filter((r) => r.method === "HEAD" && !r.mirror && r.url.startsWith("/api"))
+        .map((r) => r.url)
+        .sort(),
+    ).toEqual(["/api", "/api/*"]);
+    expect(real.resources.allRoutes.some((r) => r.method === "HEAD" && r.mirror)).toBe(true);
+  });
+
   it("every usage admin route has a row, and the admin gets its data (#32)", async () => {
     const app = await newApp();
     await app.ready();
     const declared = app.resources.adminRoutes
+      .filter((r) => !r.mirror)
       .filter((r) => ADMIN_MATRIX_PREFIXES.some((p) => r.url === p || r.url.startsWith(`${p}/`)))
       .map((r) => `${r.method} ${r.url}`)
       .sort();

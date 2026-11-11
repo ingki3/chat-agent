@@ -14,34 +14,58 @@ export type TokenFigures = {
 /** 1 USD in micro-USD: costs are stored, summed and compared as integers of this unit. */
 export const MICROS = 1_000_000;
 export const toUsd = (micros: number) => micros / MICROS;
-/** A USD amount (threshold) in micro-USD, rounded to the nearest micro. */
-export const toMicros = (usd: number) => Math.round(usd * MICROS);
 
 /**
- * Cost of one usage row at `price` (USD per million tokens) in integer micro-USD, or null when it cannot be given
- * ("미제공"): no price for the model, input or output tokens not reported, or a price missing for a kind of token
- * the row used. Input tokens include cached ones (adapter contract), so cache reads and writes are taken out of
- * input and charged at their own price. Cache figures the runtime did not report count as none.
- * USD per million tokens × tokens = micro-USD, so the sum is rounded once to a whole micro-USD: no float residue
- * ($0.30 is 300000, not 0.30000000000000004) reaches a total or a threshold comparison.
+ * A non-negative decimal string ("0.29", "15", "1.5") as an exact integer in units of 10^-`scale` (BigInt), or
+ * undefined when it is not one or has more than `scale` decimals. No float is involved anywhere.
+ */
+export function parseDecimal(value: string, scale: number): bigint | undefined {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(value);
+  if (!m) return undefined;
+  const frac = m[2] ?? "";
+  if (frac.length > scale) return undefined;
+  return BigInt(m[1]!) * 10n ** BigInt(scale) + BigInt(frac.padEnd(scale, "0") || "0");
+}
+
+/**
+ * A USD amount (the daily threshold) in integer micro-USD, parsed from its shortest decimal form — exact for the
+ * at-most-6-decimal values the settings accept.
+ */
+export function toMicros(usd: number): number {
+  const exact = parseDecimal(String(usd), 6);
+  if (exact === undefined) throw new Error("amount_not_decimal");
+  return Number(exact);
+}
+
+/**
+ * Cost of one usage row at `price` in integer micro-USD, or null when it cannot be given ("미제공"): no price for the
+ * model, input or output tokens not reported, or a price missing for a kind of token the row used. Input tokens
+ * include cached ones (adapter contract), so cache reads and writes are taken out of input and charged at their own
+ * price. Cache figures the runtime did not report count as none.
+ *
+ * Exact: each price ("USD per million tokens", ≤ 6 decimals) is read as an integer of micro-USD per million tokens,
+ * tokens × that is an integer of 10^-12 USD (BigInt), the parts are summed exactly, and the sum is rounded once to
+ * a whole micro-USD, half up (50 tokens × $0.29/M = 14.5 → 15 micro-USD).
  */
 export function costOf(t: TokenFigures, price: ModelPrice | undefined): number | null {
   if (!price || t.inputTokens === null || t.outputTokens === null) return null;
   const cacheRead = t.cacheReadTokens ?? 0;
   const cacheWrite = t.cacheWriteTokens ?? 0;
-  const parts: [number, number | null][] = [
+  const parts: [number, string | null][] = [
     [Math.max(0, t.inputTokens - cacheRead - cacheWrite), price.input],
     [t.outputTokens, price.output],
     [cacheRead, price.cacheRead],
     [cacheWrite, price.cacheWrite],
   ];
-  let micros = 0;
+  let pico = 0n; // 10^-12 USD
   for (const [tokens, perMillion] of parts) {
     if (tokens === 0) continue;
     if (perMillion === null) return null;
-    micros += tokens * perMillion;
+    const microPerMillion = parseDecimal(perMillion, 6);
+    if (microPerMillion === undefined) return null; // not a price we accept: 미제공, never a guess
+    pico += BigInt(tokens) * microPerMillion;
   }
-  return Math.round(micros);
+  return Number((pico + 500_000n) / 1_000_000n);
 }
 
 /**

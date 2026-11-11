@@ -40,17 +40,22 @@ declare module "fastify" {
   }
 }
 
+export type RouteEntry = { method: string; url: string; mirror: boolean };
+
 export class ResourceRegistry {
   private readonly loaders = new Map<string, ResourceLoader>();
   /** Every route declared with `config.resource` — the permission matrix test needs a row for each. */
   readonly routes: { method: string; url: string; rule: ResourceRule }[] = [];
-  /** Every admin-only route (`config.auth: "admin"`) — the permission matrix test refuses each to non-admins. */
-  readonly adminRoutes: { method: string; url: string }[] = [];
   /**
-   * Every route registered, whatever its config (HEAD mirrors left out) — so the permission test can find an
-   * `/api/admin/…` route that forgot to declare `auth: "admin"`.
+   * Every admin-only route (`config.auth: "admin"`), Fastify's automatic HEAD mirrors included (`mirror: true`) —
+   * the permission matrix test refuses each to non-admins.
    */
-  readonly allRoutes: { method: string; url: string }[] = [];
+  readonly adminRoutes: RouteEntry[] = [];
+  /**
+   * Every route registered, whatever its config — explicit HEAD routes and Fastify's automatic HEAD mirrors of GET
+   * (`mirror: true`) included — so the permission test can find an `/api/admin/…` route that forgot `auth: "admin"`.
+   */
+  readonly allRoutes: RouteEntry[] = [];
 
   register(kind: string, loader: ResourceLoader): void {
     if (this.loaders.has(kind)) throw new Error(`resource kind "${kind}" registered twice`);
@@ -76,12 +81,22 @@ export function installRouteRules(app: FastifyInstance): ResourceRegistry {
   app.decorate("resources", registry);
   app.decorateRequest("resource", undefined);
 
+  /**
+   * Fastify's automatic HEAD route for a GET is registered right after it with the GET's own handler and config
+   * objects. A HEAD with its own handler or config is a route of its own and is checked like any other.
+   */
+  const gets = new Map<string, { handler: unknown; config: unknown }>();
   app.addHook("onRoute", (route) => {
     const cfg = route.config ?? {};
-    for (const method of Array.isArray(route.method) ? route.method : [route.method]) {
-      if (method === "HEAD") continue;
-      registry.allRoutes.push({ method, url: route.url });
-      if (cfg.auth === "admin") registry.adminRoutes.push({ method, url: route.url });
+    const methods = Array.isArray(route.method) ? route.method : [route.method];
+    const get = gets.get(route.url);
+    const mirror =
+      route.method === "HEAD" && !!get && get.handler === route.handler && get.config === route.config;
+    if (methods.includes("GET")) gets.set(route.url, { handler: route.handler, config: route.config });
+    for (const method of methods) {
+      const entry = { method, url: route.url, mirror: method === "HEAD" && mirror };
+      registry.allRoutes.push(entry);
+      if (cfg.auth === "admin") registry.adminRoutes.push(entry);
     }
     // A declared resource is validated and listed wherever it appears, even on a route that needs no declaration.
     if (!cfg.resource && !needsDeclaration(route.url)) return;
@@ -95,10 +110,11 @@ export function installRouteRules(app: FastifyInstance): ResourceRegistry {
     if (from === "params" && !(param === "*" ? route.url.includes("*") : route.url.includes(`:${param}`)))
       throw new Error(`${route.url}: resource param ":${param}" not in path`);
     if (cfg.auth === "public") throw new Error(`${route.url}: a resource route cannot be public`);
-    const methods = Array.isArray(route.method) ? route.method : [route.method];
-    // HEAD routes are Fastify's automatic mirrors of GET (same config, same check): list the GET only.
+    // Fastify's automatic HEAD mirror of a GET has the same config and check: list the GET only. An explicit HEAD
+    // route is listed (and so needs its own matrix row).
     for (const method of methods)
-      if (method !== "HEAD") registry.routes.push({ method, url: route.url, rule: cfg.resource });
+      if (!(method === "HEAD" && mirror))
+        registry.routes.push({ method, url: route.url, rule: cfg.resource });
   });
   return registry;
 }

@@ -197,7 +197,7 @@ export const ADMIN_MATRIX: AdminRow[] = [
     expect: ADMIN_ONLY,
     body: {
       prices: [
-        { runtime: "claude-code", model: "m", input: 1, output: 2, cacheRead: null, cacheWrite: null },
+        { runtime: "claude-code", model: "m", input: "1", output: "2", cacheRead: null, cacheWrite: null },
       ],
     },
   },
@@ -206,8 +206,9 @@ export const ADMIN_MATRIX: AdminRow[] = [
 ];
 
 /**
- * Every route Fastify itself has registered (`METHOD /path`, HEAD mirrors left out), read from its route tree —
- * independent of our route config and registry, so a route that declares nothing is listed too.
+ * Every route Fastify itself has registered (`METHOD /path`, HEAD included — its automatic mirrors of GET and
+ * explicit HEAD routes alike), read from its route tree — independent of our route config and registry, so a route
+ * that declares nothing is listed too.
  */
 export function fastifyRoutes(app: FastifyInstance): string[] {
   const out: string[] = [];
@@ -218,8 +219,7 @@ export function fastifyRoutes(app: FastifyInstance): string[] {
     stack.length = m[1]!.length / 4;
     const full = stack.join("") + m[2]!;
     stack.push(m[2]!);
-    for (const method of (m[3] ?? "").split(", ").filter(Boolean))
-      if (method !== "HEAD") out.push(`${method} ${full}`);
+    for (const method of (m[3] ?? "").split(", ").filter(Boolean)) out.push(`${method} ${full}`);
   }
   return out;
 }
