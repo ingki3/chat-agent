@@ -216,7 +216,7 @@ describe("devices", () => {
     const mom = member("mom");
     for (const endpoint of ["http://fcm.googleapis.com/x", "https://10.0.0.1/x", "https://evil.example/x"])
       expect((await subscribe(mom, endpoint)).r.statusCode).toBe(400);
-    // Markers with "." — a character base64url ciphertext never contains — so a hit can only be plaintext
+    // Markers with "." — a character the base64 ciphertext never contains — so a hit can only be plaintext
     // (short markers like "d1" or "fcm" occur in random ciphertext by chance).
     const { r } = await subscribe(mom, "https://fcm.googleapis.com/fcm/send/plain.endpoint.marker");
     expect(r.statusCode).toBe(201);
