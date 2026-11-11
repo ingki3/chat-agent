@@ -8,7 +8,7 @@ import type {
   SubscriptionLogin,
 } from "@agentlee/shared";
 import { connections, errorText } from "../api.js";
-import { pollStep } from "../login-poll.js";
+import { POLL_TIMEOUT_MS, pollStep } from "../login-poll.js";
 
 const KEY = ["connections"] as const;
 
@@ -157,16 +157,30 @@ export function RuntimeConnections({ isAdmin }: { isAdmin: boolean }) {
         runTest(connection.id); // a new login is tested right away
       } else setMessage(LOGIN_END[login.code ?? login.status] ?? LOGIN_END.login_error);
     };
+    let inFlight: AbortController | undefined;
     const timer = setInterval(() => {
       const base = { expiresAt: pending.expiresAt };
-      void connections.login(pending.id).then(
-        (result) => handle({ ...base, now: Date.now(), result }),
-        (error: unknown) => handle({ ...base, now: Date.now(), error }),
-      );
+      // The page's own clock decides expiry, whether or not the last request came back.
+      handle({ ...base, now: Date.now() });
+      if (over || inFlight) return; // one request at a time; a hung one is cut off below
+      const ctl = new AbortController();
+      inFlight = ctl;
+      const cut = setTimeout(() => ctl.abort(), POLL_TIMEOUT_MS);
+      void connections
+        .login(pending.id, ctl.signal)
+        .then(
+          (result) => handle({ ...base, now: Date.now(), result }),
+          (error: unknown) => handle({ ...base, now: Date.now(), error }), // an abort is a passing failure
+        )
+        .finally(() => {
+          clearTimeout(cut);
+          if (inFlight === ctl) inFlight = undefined;
+        });
     }, 2000);
     return () => {
       over = true;
       clearInterval(timer);
+      inFlight?.abort();
     };
   }, [pending, runTest, qc]);
 

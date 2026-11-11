@@ -894,7 +894,14 @@ describe("recording helper: turns are kept however they end, and replay as recor
 
 // --- The real binary under the real sandbox (macOS) --------------------------------------------------------
 const realBin = isMac ? codexBinary() : undefined;
-const online = !!realBin && spawnSync("/usr/bin/nc", ["-z", "-G", "3", "api.openai.com", "443"]).status === 0;
+/**
+ * Tests that reach OpenAI's real services run only when asked for (`CODEX_ONLINE=1`) — the default suite never
+ * touches the network — and when the host is reachable.
+ */
+const online =
+  process.env.CODEX_ONLINE === "1" &&
+  !!realBin &&
+  spawnSync("/usr/bin/nc", ["-z", "-G", "3", "api.openai.com", "443"]).status === 0;
 
 describe.skipIf(!realBin)("Codex adapter (#16): the pinned binary in the sandbox (macOS)", () => {
   it("is the pinned 0.165.0 and its shipped catalog agrees with our model table", async () => {

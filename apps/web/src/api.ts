@@ -67,7 +67,13 @@ async function checkOuterRedirect() {
   }
 }
 
-async function call(method: Method, url: string, body?: unknown, headers: Record<string, string> = {}) {
+async function call(
+  method: Method,
+  url: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+  signal?: AbortSignal,
+) {
   let res: Response;
   try {
     res = await fetch(url, {
@@ -84,6 +90,7 @@ async function call(method: Method, url: string, body?: unknown, headers: Record
         ...headers,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(signal ? { signal } : {}),
     });
   } catch (e) {
     void checkOuterRedirect();
@@ -223,8 +230,9 @@ export const connections = {
     SubscriptionLogin.parse(
       ((await call("POST", "/api/connections/logins", body)) as { login: unknown }).login,
     ),
-  login: async (id: string) => {
-    const r = (await call("GET", `/api/connections/logins/${enc(id)}`)) as {
+  /** One poll; `signal` ends a request that hangs. */
+  login: async (id: string, signal?: AbortSignal) => {
+    const r = (await call("GET", `/api/connections/logins/${enc(id)}`, undefined, {}, signal)) as {
       login: unknown;
       connection: unknown;
     };

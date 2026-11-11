@@ -19,6 +19,9 @@ type Entry = {
   starting?: boolean;
   /** The user cancelled it (or a newer login of theirs replaced it): never stored, whatever comes back. */
   cancelRequested?: boolean;
+  /** Settles once its process has exited and its folder is gone; the slot is held until then. */
+  gone?: Promise<void>;
+  released?: boolean;
   /** Removed from memory this long after it ended (the page polls for the outcome). */
   endedAt?: number;
 };
@@ -84,9 +87,12 @@ export class SubscriptionLoginService {
     }
   }
 
-  /** Logins that hold a slot: waiting for the code, or still starting — not those already cancelled. */
-  private active(): Entry[] {
-    return [...this.logins.values()].filter((e) => e.view.status === "pending" && !e.cancelRequested);
+  /**
+   * Logins that hold a slot: starting, waiting for the code, or cancelled but whose process has not exited and been
+   * cleaned up yet — a slot is a live process.
+   */
+  private holding(): Entry[] {
+    return [...this.logins.values()].filter((e) => !e.released);
   }
 
   private async startNow(
@@ -114,13 +120,17 @@ export class SubscriptionLoginService {
       )
         throw new ConnectionRuleError(404, "not_found");
     }
+    // The user's earlier login is cancelled, and this start waits until its process is gone (starts of one user
+    // are serialised, so nothing of theirs starts meanwhile).
+    const earlier = this.holding().filter((e) => e.userId === userId);
+    for (const e of earlier) {
+      e.cancelRequested = true;
+      e.login?.cancel();
+    }
+    await Promise.all(earlier.map((e) => e.gone));
+    if (this.closed) throw new ConnectionRuleError(409, "login_unavailable");
     // Everything from here to the reservation below is synchronous: no other start can slip in between.
-    for (const e of this.active())
-      if (e.userId === userId) {
-        e.cancelRequested = true;
-        e.login?.cancel();
-      }
-    if (this.active().length >= (this.hooks.maxActive ?? MAX_ACTIVE))
+    if (this.holding().length >= (this.hooks.maxActive ?? MAX_ACTIVE))
       throw new ConnectionRuleError(409, "login_busy");
 
     const id = crypto.randomUUID();
@@ -145,11 +155,20 @@ export class SubscriptionLoginService {
     try {
       login = await this.provider.start(dir);
     } catch (e) {
-      this.logins.delete(id); // the slot is given back
+      this.logins.delete(id); // nothing was left running (the provider cleans up a start that fails)
       throw e instanceof LoginEnded ? new ConnectionRuleError(409, "login_unavailable") : e;
     }
+    entry.gone = login.result
+      .then(
+        () => {},
+        () => {},
+      )
+      .then(() => {
+        entry.released = true; // the slot is given back only now
+      });
     if (this.closed || entry.cancelRequested) {
       login.cancel();
+      await entry.gone;
       this.logins.delete(id);
       throw new ConnectionRuleError(409, "login_unavailable");
     }

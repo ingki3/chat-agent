@@ -88,3 +88,32 @@ test("a ChatGPT login the server no longer knows (restart: 404) stops waiting an
   await page.waitForTimeout(4500);
   expect(polls).toBe(after); // no more polling
 });
+
+test("a poll that hangs does not keep the login screen waiting past its expiry", async ({ page }) => {
+  await useAccount(page, SON);
+  const login = {
+    id: crypto.randomUUID(),
+    runtime: "codex",
+    status: "pending",
+    verificationUrl: "https://auth.openai.com/codex/device",
+    userCode: "AB1C-2D3E4",
+    // Already past its expiry and the grace: the page's own clock must end it although no poll ever answers.
+    expiresAt: Date.now() - 60_000,
+    connectionId: null,
+    code: null,
+  };
+  await page.route("**/api/connections/logins", (route) =>
+    route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ login }) }),
+  );
+  await page.route(`**/api/connections/logins/${login.id}`, () => {
+    // never answered
+  });
+  await page.goto("/settings");
+  const section = page.locator("#connections");
+  await section.getByLabel("연결 방식").selectOption({ label: "Codex · 내 ChatGPT 계정으로 로그인" });
+  await section.getByRole("button", { name: "ChatGPT로 로그인" }).click();
+  await expect(section.getByRole("status")).toContainText("시간 안에 코드를 입력하지 않아", {
+    timeout: 8000,
+  });
+  await expect(section.getByTestId("device-login")).toHaveCount(0);
+});

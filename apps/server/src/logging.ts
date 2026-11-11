@@ -82,6 +82,7 @@ export const LOG_EVENTS = [
   "connection.login_finished",
   "connection.refreshed",
   "connection.refresh_failed",
+  "connection.login_leftover",
   // Usage storage (#44): a usage row could not be written — IDs, attempt and purpose only.
   "usage.record_failed",
 ] as const;

@@ -1,6 +1,9 @@
 import type { Connection, SubscriptionLogin } from "@agentlee/shared";
 import { ApiError } from "./api.js";
 
+/** A poll that has not come back by then is cut off (and asked again). */
+export const POLL_TIMEOUT_MS = 10_000;
+
 /** How long past its `expiresAt` the page still waits for the server's own verdict (clock skew, a slow poll). */
 export const EXPIRY_GRACE_MS = 30_000;
 

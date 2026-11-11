@@ -243,14 +243,14 @@ rm ~/.agentlee/probe-headers.txt
   - 로그인과 코드는 시작한 사람만 본다(다른 사람은 404). 결과 연결은 그 사람의 개인 연결이라 다른 사람의 선택기에 나오지 않고, id로 직접 써도 403이다(관리자도 같다).
   - "다시 로그인"은 같은 연결에 새로 로그인한다(`connectionId`를 실어 시작). 새 토큰으로 바뀌고, 옛 로그인으로 돌던 실행·테스트는 멈추며, 다시 테스트한다.
   - 화면은 서버가 그 로그인을 모르면(404 — 서버 재시작) 또는 `expiresAt`이 지나면 기다리기를 멈추고 다시 시작하라고 안내한다. 네트워크 오류·5xx만 다시 묻는다.
-  - 동시 요청: 한 사용자의 시작은 하나씩 처리하고(앞의 것은 취소), 프로세스를 띄우기 전에 자리를 잡아 전체 4개를 넘지 않는다(넘으면 409 `login_busy`). 시작이 실패하면 자리를 돌려준다. 취소와 저장은 하나만 이긴다: 저장 직전에 취소가 왔으면 저장하지 않는다.
+  - 동시 요청: 한 사용자의 시작은 하나씩 처리한다. 앞의 것은 취소하고 **그 프로세스가 끝나고 폴더가 지워질 때까지** 기다린다. 자리 하나는 살아 있는 app-server 하나다: 프로세스를 띄우기 전에 자리를 잡고, 취소해도 프로세스가 끝날 때까지 자리를 쥔다. 그래서 동시에 도는 로그인 프로세스는 전체 4개를 넘지 않는다(넘으면 409 `login_busy`). 시작이 실패하면 자리를 돌려준다. 취소와 저장은 하나만 이긴다: 저장 직전에 취소가 왔으면 저장하지 않는다.
   - 링크와 코드는 고정 버전에서 확인한 것만 보여 준다: 링크는 정확히 `https://auth.openai.com/codex/device`(다른 경로·쿼리·fragment 없음), 코드는 `XXXX-XXXXX`(영문 대문자·숫자). 다르면 409 `login_unavailable`.
   - 실패 코드: `login_expired`(코드 만료), `login_failed`(로그인이 끝나지 않음·거부), `login_error`(그 밖의 문제). 어느 경우든 아무것도 저장하지 않는다. 로그에는 `connection.login_started`·`connection.login_finished`와 이 코드만 남는다(코드·링크·이메일·토큰은 남지 않는다).
   - 개발 모드(`FAKE_RUNTIME=1`)와 시험에서는 실제 로그인을 띄우지 않는다(400 `unsupported_auth`).
 - **토큰 갱신(ChatGPT 로그인)**
   - 실행에는 액세스 토큰만 넘긴다(stdin의 `account/login/start {type:"chatgptAuthTokens"}`, 메모리에만). 리프레시 토큰은 런타임 프로세스에 들어가지 않는다.
   - app-server가 토큰이 거부됐다고 새 토큰을 달라고 하면(`account/chatgptAuthTokens/refresh`), 서버가 `https://auth.openai.com/oauth/token`에 리프레시 토큰으로 직접 요청해 새 토큰을 받는다. 받은 토큰은 암호화해 저장하고 `credential_version`을 올린다. 실행 중인 다른 세션은 그대로 이어진다(`credential_base_version`은 그대로 — 같은 로그인으로 본다). 같은 연결의 갱신은 한 번에 하나다(리프레시 토큰은 한 번만 쓸 수 있다).
-  - 만료 직전(2분 안)인 토큰은 세션을 열기 전에 미리 갱신한다. 한 세션이 갱신을 세 번 넘게 달라고 하면 그 세션은 `runtime_auth`로 끝난다.
+  - 만료 직전(2분 안)인 토큰은 세션을 열기 전에 미리 갱신한다. 한 세션이 갱신을 세 번 넘게 달라고 하면 그 세션은 끝난다: 갱신이 일시적인 이유(네트워크, 5xx, 형식이 틀린 응답)로 계속 실패했으면 `runtime_error`(연결은 그대로), 갱신은 됐는데 새 토큰도 계속 거부되면 `runtime_auth`.
   - OpenAI가 리프레시 토큰을 거부하면(400/401/403) 그 로그인은 끝난 것이다: 실행은 `runtime_auth`, 연결은 `expired`, 대화에 `subscription_expired` 안내("ChatGPT 로그인이 만료됐어요 — ‘다시 로그인’을…")가 뜬다. 다른 실패(네트워크, 5xx, 형식이 틀린 응답 — 예: 본문 `null`, `refresh_token: 123`)는 `runtime_error`로 끝나고 저장값과 연결 상태는 그대로다. 응답의 `refresh_token`이 없거나 `null`이면 회전하지 않은 것으로 보고 저장된 것을 쓴다. 로그: `connection.refreshed`, `connection.refresh_failed`(오류 코드만).
 - **구독 한도(FR-9.2)**: 구독 연결이 한도에 걸리면 응답은 `usage_limit`으로 끝나고 대화에 `subscription_limit` 안내 "지금 이 런타임은 한도에 걸렸어요 — 다른 런타임으로 바꿔서 이어갈 수 있어요."가 뜬다. 안내의 `switchTo`에는 지금 쓸 수 있는 다른 런타임이 들어 있다(실제 전환은 칩에서, #19). 한도는 만료가 아니라 연결은 그대로 `passed`다. 구독 사용량은 비용 없이 토큰만 기록한다(`usage_records.cost_usd` NULL).
 - **테스트를 통과한 연결만 쓴다.**
@@ -284,7 +284,7 @@ rm ~/.agentlee/probe-headers.txt
   - 키와 토큰은 마스터 키로 암호화해 DB `connections.secret`에 둔다(AES-256-GCM, AAD `connection:<id>:<런타임>:<인증 방식>`).
   - 어떤 API 응답에도 원문이 없다. 화면에는 끝 4자리(`••••abcd`)만, ChatGPT 로그인은 계정 이메일(`connections.account_email`)만 보인다. 관리자도 다른 사람의 개인 연결 원문은 볼 수 없다(삭제만 할 수 있다).
   - ChatGPT 로그인은 액세스·리프레시·ID 토큰과 계정 id를 JSON으로 묶어 같은 방식으로 암호화한다. 로그인 과정에서 app-server가 잠깐 쓰는 `auth.json`은 서버가 곧바로 읽고 덮어쓴 뒤 로그인 폴더째 지운다.
-  - **남는 위험(파일 저장 방식)**: app-server에는 토큰을 돌려주는 요청이 없어, 로그인 과정만 `auth.json`에 평문으로 쓴다(폴더와 파일은 서버 계정 전용 `0700`/`0600`). 완료 알림부터 서버가 읽고 지우기까지 몇 ms 동안은 디스크에 있다. 그 사이 서버가 죽거나 강제 종료되면 파일이 남는다. 그래서 **서버가 시작할 때마다** `runtimes/logins/login-*`와 `runtimes/<연결 id>/login-*`를 찾아 `auth.json`을 덮어쓴 뒤 폴더를 지우고, 폴더의 `login.pid`가 가리키는 프로세스가 아직 `codex`면 강제 종료한다(심볼릭 링크는 따라가지 않는다). 서버가 다시 시작되지 않은 채 Mac이 꺼지면 다음 시작까지 남는다. 디스크는 copy-on-write라 덮어쓰기가 원래 블록을 지운다는 보장은 없다 — FileVault(디스크 암호화)를 켜 둔다.
+  - **남는 위험(파일 저장 방식)**: app-server에는 토큰을 돌려주는 요청이 없어, 로그인 과정만 `auth.json`에 평문으로 쓴다(폴더와 파일은 서버 계정 전용 `0700`/`0600`). 완료 알림부터 서버가 읽고 지우기까지 몇 ms 동안은 디스크에 있다. 그 사이 서버가 죽거나 강제 종료되면 파일이 남는다. 그래서 **서버가 시작할 때마다** `runtimes/logins/login-*`와 `runtimes/<연결 id>/login-*`를 찾아 `auth.json`을 덮어쓴 뒤 폴더를 지운다. 이 정리는 **어떤 링크도 따라가지 않는다**: 경로의 모든 단계를 `lstat`으로 확인하고, 파일은 `O_NOFOLLOW`로 열어 그 descriptor로 일반 파일·링크 1개·크기·확인한 파일과 같은지를 본 뒤에만 덮어쓴다(하드 링크는 덮어쓰지 않고 이름만 지운다, 링크는 링크만 지운다). 남은 프로세스는 로그인을 시작할 때 서버가 기록한 신원(`login.pid`: 로그인 폴더 이름, pid, 프로세스 그룹, 시작 시각 `ps lstart`, 명령줄)이 **모두** 지금과 같을 때만 강제 종료한다. 하나라도 다르면(재사용된 pid, 같은 이름의 다른 프로세스) 그대로 두고 로그에 `connection.login_leftover`(`loginCode: leftover_process_kept`)를 남긴다. 서버가 다시 시작되지 않은 채 Mac이 꺼지면 다음 시작까지 남는다. 디스크는 copy-on-write라 덮어쓰기가 원래 블록을 지운다는 보장은 없다 — FileVault(디스크 암호화)를 켜 둔다.
   - 로그에는 연결 id·런타임·범위·인증 방식·테스트 코드만 남는다.
   - 런타임에 넘길 때: Claude는 자식 프로세스 환경 변수로만(`ANTHROPIC_API_KEY` 또는 `CLAUDE_CODE_OAUTH_TOKEN`), Codex는 stdin의 `account/login/start`로만(API 키 또는 ChatGPT 액세스 토큰) 넘긴다.
 - **폴더**: 연결과 사용자마다 `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`이다. 서버만 쓰는 세션 정보는 `<…>-meta/`에 둔다.
@@ -367,7 +367,7 @@ rm ~/.agentlee/probe-headers.txt
 - 키는 app-server에 환경 변수가 아니라 시작 직후 stdin의 `account/login/start`로만 넘긴다. 메모리에만 있다(`cli_auth_credentials_store = "ephemeral"`, `auth.json` 없음).
 - 가족 각자의 ChatGPT 로그인(PRD D2, #18): 로그인은 11절의 디바이스 코드 흐름으로 한다. 실행에는 `account/login/start {type:"chatgptAuthTokens"}`로 액세스 토큰만 넘긴다(메모리에만, `ephemeral`). 이 요청은 app-server의 실험 API가 필요해 ChatGPT 세션만 `initialize`에서 `experimentalApi: true`를 켠다(0.165.0: 끄면 거부). 켜도 알림·항목 검사(프로토콜 표, 모르는 것은 차단)는 같다. 토큰 갱신 요청(`account/chatgptAuthTokens/refresh`)은 서버가 받아 처리하고, 그 밖의 서버 요청은 전과 같이 거부·차단한다.
 - 실행 파일은 의존성으로 고정한 `@openai/codex` **0.165.0**의 플랫폼 바이너리다. PATH의 `codex`와 `~/.codex`는 쓰지 않는다.
-  - 버전을 올릴 때는 `pnpm -s test`의 macOS 실바이너리 시험(`apps/server/test/codex.test.ts`)이 통과해야 한다. 이 시험은 설정 키, 모델 표, 노출 도구, fork 없음, 확장 없음을 확인한다.
+  - 버전을 올릴 때는 `pnpm -s test`의 macOS 실바이너리 시험(`apps/server/test/codex.test.ts`)이 통과해야 한다. OpenAI 실서비스에 닿는 시험(가짜 키 401, 디바이스 코드 시작·취소, 작업 공간 확인)은 기본으로 돌지 않는다 — `CODEX_ONLINE=1 pnpm -s test`로 따로 돌린다. 이 시험은 설정 키, 모델 표, 노출 도구, fork 없음, 확장 없음을 확인한다.
   - 그다음 `docs/decisions/runtime-capabilities.md` 2.4절을 갱신한다.
 - 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`.
   - 안에는 `codex-home`(CODEX_HOME: 우리 `config.toml`·`agentlee-models.json`·thread 기록), `home`, `work`, `tmp`가 있다.

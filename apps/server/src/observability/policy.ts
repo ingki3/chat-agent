@@ -128,6 +128,10 @@ export const LOGIN_CODES = set([
   "login_error",
   "cancelled",
   "timeout",
+  // Startup clean-up of logins a previous server left behind.
+  "leftover_cleaned",
+  "leftover_process_killed",
+  "leftover_process_kept",
 ]);
 export const isLoginCode = member(LOGIN_CODES);
 /** `.env` import (#17): which value, and why it was not imported (fixed codes only). */

@@ -616,10 +616,20 @@ export class CodexAdapter implements RuntimeAdapter {
     let onBreach: (() => void) | undefined;
     let policyBreach = false;
     let opened = false;
-    /** A ChatGPT session whose login is over (a refresh was refused): every turn fails `runtime_auth`. */
-    let authBroken = false;
-    /** Set while a turn runs: ends it as runtime_auth. */
-    let onAuthBroken: (() => void) | undefined;
+    /**
+     * A ChatGPT session that cannot go on: `runtime_auth` when the provider refused the login (a refresh was
+     * refused, or freshly refreshed tokens are refused again and again), `runtime_error` when refreshing kept
+     * failing for passing reasons (network, 5xx, malformed answers) — then the login is not marked expired.
+     * Every later turn fails the same way.
+     */
+    let sessionFailure: "runtime_auth" | "runtime_error" | undefined;
+    const authBroken = () => sessionFailure !== undefined;
+    /** Set while a turn runs: ends it with the session's failure. */
+    let onSessionFailure: (() => void) | undefined;
+    const failSession = (code: "runtime_auth" | "runtime_error") => {
+      sessionFailure ??= code;
+      onSessionFailure?.();
+    };
     let refreshes = 0;
     /**
      * The last refresh failed for a passing reason (network, a malformed answer): the refusal app-server then
@@ -638,23 +648,22 @@ export class CodexAdapter implements RuntimeAdapter {
         return tokens;
       } catch (e) {
         // Only the provider refusing the login ends it; anything else (also an unexpected error) is passing.
-        if (e instanceof RuntimeFailure && e.code === "runtime_auth") {
-          authBroken = true;
-          onAuthBroken?.();
-        } else refreshFailedTransiently = true;
+        if (e instanceof RuntimeFailure && e.code === "runtime_auth") failSession("runtime_auth");
+        else refreshFailedTransiently = true;
         throw e;
       }
     };
     /** The provider refused the credential — unless only our last refresh failed for a passing reason. */
     const refusedAuth = () =>
-      new RuntimeFailure(refreshFailedTransiently && !authBroken ? "runtime_error" : "runtime_auth");
+      new RuntimeFailure(sessionFailure ?? (refreshFailedTransiently ? "runtime_error" : "runtime_auth"));
     /** app-server's `account/chatgptAuthTokens/refresh`: new tokens from the server, a few times per session. */
     const answer = (method: string): Promise<Json> | undefined => {
       if (method !== "account/chatgptAuthTokens/refresh" || !chatgpt) return undefined;
-      if (authBroken || ++refreshes > MAX_REFRESHES) {
-        authBroken = true;
-        onAuthBroken?.();
-        return Promise.reject(new RuntimeFailure("runtime_auth"));
+      if (authBroken()) return Promise.reject(new RuntimeFailure(sessionFailure!));
+      if (++refreshes > MAX_REFRESHES) {
+        // Out of refreshes: if they kept failing for passing reasons it is not the login's end.
+        failSession(refreshFailedTransiently ? "runtime_error" : "runtime_auth");
+        return Promise.reject(new RuntimeFailure(sessionFailure!));
       }
       return refreshTokens().then((t) => ({
         accessToken: t.accessToken,
@@ -778,7 +787,7 @@ export class CodexAdapter implements RuntimeAdapter {
       // Thread ids seen before ours was known (a fresh start) must be ours too.
       if ([...early].some((t) => t !== threadId)) policyBreach = true;
       if (policyBreach) throw new RuntimeFailure("runtime_policy");
-      if (authBroken) throw new RuntimeFailure("runtime_auth");
+      if (sessionFailure) throw new RuntimeFailure(sessionFailure);
       cancelled();
       opened = true;
     } catch (e) {
@@ -807,7 +816,7 @@ export class CodexAdapter implements RuntimeAdapter {
       },
       turn: (input): RuntimeTurn => {
         if (policyBreach) throw new RuntimeFailure("runtime_policy"); // seen between turns: closed already
-        if (authBroken) throw new RuntimeFailure("runtime_auth");
+        if (sessionFailure) throw new RuntimeFailure(sessionFailure);
         if (closed || rpc.exited) throw new Error("session closed");
         const cap = this.checkModel(input.model, input.effort);
         model = input.model;
@@ -831,7 +840,7 @@ export class CodexAdapter implements RuntimeAdapter {
           onNotification = undefined;
           onEnd = undefined;
           onBreach = undefined;
-          onAuthBroken = undefined;
+          onSessionFailure = undefined;
           wake?.();
         };
         const stop = () => {
@@ -846,10 +855,10 @@ export class CodexAdapter implements RuntimeAdapter {
 
         onEnd = () => end(interrupted ? undefined : new RuntimeFailure("runtime_error"));
         onBreach = refuse;
-        // The login is over (a refresh was refused): no retries with it.
-        onAuthBroken = () => {
+        // The session cannot go on (see `sessionFailure`): no retries.
+        onSessionFailure = () => {
           stop();
-          end(new RuntimeFailure("runtime_auth"));
+          end(new RuntimeFailure(sessionFailure ?? "runtime_auth"));
         };
         onNotification = (m) => {
           if (done) return;
@@ -909,7 +918,7 @@ export class CodexAdapter implements RuntimeAdapter {
               const err = (p.error ?? {}) as { codexErrorInfo?: unknown };
               if (isAuthError(err.codexErrorInfo)) {
                 // A ChatGPT session gets new tokens first (app-server asks for them, `answer`) and retries.
-                if (chatgpt && p.willRetry === true && !authBroken && refreshes < MAX_REFRESHES) return;
+                if (chatgpt && p.willRetry === true && !authBroken() && refreshes < MAX_REFRESHES) return;
                 stop(); // no retries with a credential that is refused
                 return end(refusedAuth());
               }

@@ -33,9 +33,22 @@ import {
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { codexConnectionFor } from "../src/runtime/codex-config.js";
-import { CodexDeviceLogin, LoginEnded } from "../src/runtime/codex-login.js";
+import {
+  cleanupLeftoverLogins,
+  CodexDeviceLogin,
+  LoginEnded,
+  processIdentity,
+} from "../src/runtime/codex-login.js";
+import {
+  checkPath,
+  readLoginFile,
+  removeLoginTree,
+  shredLoginFile,
+  stillSame,
+} from "../src/runtime/login-files.js";
 import type { DeviceLoginProvider } from "../src/connections/login.js";
 import { spawn } from "node:child_process";
+import type { SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { CODEX_CHATGPT_EGRESS_HOSTS, CODEX_LOGIN_EGRESS_HOSTS } from "../src/isolation/egress.js";
 import { cx, newLog, replaySpawn, type DeviceLoginScript, type Recording } from "./helpers/codex-replay.js";
@@ -131,7 +144,6 @@ async function start(
     dataDir?: string;
     wrapDevice?: (d: DeviceLoginProvider) => DeviceLoginProvider;
     maxActiveLogins?: number;
-    isLoginProcess?: (pid: number) => boolean;
   } = {},
 ) {
   const db = createTestDb();
@@ -184,7 +196,6 @@ async function start(
         }),
       ),
       ...(o.maxActiveLogins ? { maxActiveLogins: o.maxActiveLogins } : {}),
-      ...(o.isLoginProcess ? { isLoginProcess: o.isLoginProcess } : {}),
     },
   });
   closers.push(() => app.close());
@@ -830,15 +841,37 @@ describe("subscription login — review #91 round 1", () => {
           // gone
         }
     });
-    const left = (dir: string, pid: number) => {
+    const left = (dir: string, record: object) => {
       fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
       fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), JSON.stringify(authJson()));
-      fs.writeFileSync(path.join(dir, "login.pid"), String(pid));
+      fs.writeFileSync(path.join(dir, "login.pid"), JSON.stringify(record));
     };
     const fresh = path.join(dataDir, "runtimes", "logins", "login-0199aaaa-1111");
     const again = path.join(dataDir, "runtimes", "conn-1", "login-0199aaaa-2222");
-    left(fresh, orphan.pid!);
-    left(again, bystander.pid!);
+    const reused = path.join(dataDir, "runtimes", "conn-1", "login-0199aaaa-4444");
+    const sameName = path.join(dataDir, "runtimes", "conn-2", "login-0199aaaa-5555");
+    const otherFolder = path.join(dataDir, "runtimes", "conn-2", "login-0199aaaa-6666");
+    // The orphan as it was recorded when its login started: it is killed.
+    left(fresh, { login: "login-0199aaaa-1111", pid: orphan.pid, ...processIdentity(orphan.pid!)! });
+    // No record at all (it never answered): the folder goes, no process is touched.
+    left(again, {});
+    const by = processIdentity(bystander.pid!)!;
+    // The bystander's pid, but recorded for a process that started at another time: a reused pid — kept.
+    left(reused, {
+      login: "login-0199aaaa-4444",
+      pid: bystander.pid,
+      ...by,
+      lstart: "Mon Jan  1 00:00:00 2024",
+    });
+    // Same pid and start, but another command line (a different process of the same name): kept.
+    left(sameName, {
+      login: "login-0199aaaa-5555",
+      pid: bystander.pid,
+      ...by,
+      command: "/opt/codex app-server --listen stdio://",
+    });
+    // A record copied from another login folder: kept.
+    left(otherFolder, { login: "login-0199aaaa-9999", pid: bystander.pid, ...by });
     const session = path.join(dataDir, "runtimes", "conn-1", "user-1", "codex-home");
     fs.mkdirSync(session, { recursive: true });
     fs.writeFileSync(path.join(session, "state"), "keep");
@@ -848,14 +881,15 @@ describe("subscription login — review #91 round 1", () => {
     fs.symlinkSync(outside, path.join(dataDir, "runtimes", "conn-1", "login-0199aaaa-3333"));
     const exited = new Promise<void>((r) => orphan.once("exit", () => r()));
 
-    const t = await start({ dataDir, isLoginProcess: (pid) => pid === orphan.pid });
+    const t = await start({ dataDir });
     await exited; // the left-over login process was killed
-    expect(fs.existsSync(fresh)).toBe(false);
-    expect(fs.existsSync(again)).toBe(false);
+    for (const d of [fresh, again, reused, sameName, otherFolder]) expect(fs.existsSync(d), d).toBe(false);
+    expect(t.log.text()).toMatch(/"loginCode":"leftover_process_killed"/);
+    expect(t.log.text().match(/"loginCode":"leftover_process_kept"/g)).toHaveLength(3);
     expect(walkFiles(path.join(dataDir, "runtimes")).filter((p) => p.endsWith("auth.json"))).toEqual([]);
     expect(fs.readFileSync(path.join(session, "state"), "utf8")).toBe("keep");
     expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("keep"); // a link is never followed
-    expect(() => process.kill(bystander.pid!, 0)).not.toThrow(); // not a login process: left alone
+    expect(() => process.kill(bystander.pid!, 0)).not.toThrow(); // its identity did not match: left alone
     t.noPlaintext();
 
     // A new login's folders are the owner's only.
@@ -1056,5 +1090,283 @@ describe("subscription login — review #91 round 1", () => {
     ).rejects.toMatchObject({
       code: "runtime_auth",
     });
+  });
+});
+
+describe("subscription login — review #91 round 2", () => {
+  const mk = () => {
+    const d = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-lf-"));
+    closers.push(async () => fs.rmSync(d, { recursive: true, force: true }));
+    return d;
+  };
+  const leftover = (dataDir: string) => {
+    const dir = path.join(dataDir, "runtimes", "logins", "login-0199bbbb-1");
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+
+  it("clean-up never follows a link: a linked tokens file, a linked codex-home, a hard link, a swap before the open", () => {
+    const outside = mk();
+    const victim = path.join(outside, "victim");
+    const reset = () => fs.writeFileSync(victim, "OUTSIDE-CONTENT");
+
+    // 1. codex-home/auth.json is a link to a file outside.
+    reset();
+    let data = mk();
+    let dir = leftover(data);
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.symlinkSync(victim, path.join(dir, "codex-home", "auth.json"));
+    cleanupLeftoverLogins(data);
+    expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE-CONTENT");
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // 2. codex-home itself is a link to a folder outside holding an auth.json.
+    reset();
+    fs.writeFileSync(path.join(outside, "auth.json"), "OUTSIDE-TOKENS");
+    data = mk();
+    dir = leftover(data);
+    fs.symlinkSync(outside, path.join(dir, "codex-home"));
+    cleanupLeftoverLogins(data);
+    expect(fs.readFileSync(path.join(outside, "auth.json"), "utf8")).toBe("OUTSIDE-TOKENS");
+    expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE-CONTENT");
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // 3. auth.json is a hard link to a file outside: not overwritten (the other name is not ours), only unlinked.
+    reset();
+    data = mk();
+    dir = leftover(data);
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.linkSync(victim, path.join(dir, "codex-home", "auth.json"));
+    cleanupLeftoverLogins(data);
+    expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE-CONTENT");
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // 4. codex-home is swapped for a link between the checks and the open.
+    reset();
+    fs.writeFileSync(path.join(outside, "auth.json"), "OUTSIDE-TOKENS");
+    data = mk();
+    dir = leftover(data);
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "IN-FOLDER");
+    cleanupLeftoverLogins(data, {
+      hooks: {
+        beforeOpen: () => {
+          fs.renameSync(path.join(dir, "codex-home"), path.join(dir, "moved"));
+          fs.symlinkSync(outside, path.join(dir, "codex-home"));
+        },
+      },
+    });
+    expect(fs.readFileSync(path.join(outside, "auth.json"), "utf8")).toBe("OUTSIDE-TOKENS");
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // 5. A plain file is overwritten through its own descriptor and removed.
+    data = mk();
+    dir = leftover(data);
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "TOKENS");
+    expect(shredLoginFile(dir, ["codex-home", "auth.json"])).toBe("shredded");
+    expect(fs.existsSync(path.join(dir, "codex-home", "auth.json"))).toBe(false);
+  });
+
+  it("reading the tokens file never follows a link the process may have put there", () => {
+    const outside = mk();
+    fs.writeFileSync(path.join(outside, "secret"), "SERVER-SECRET");
+    const dir = mk();
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.symlinkSync(path.join(outside, "secret"), path.join(dir, "codex-home", "auth.json"));
+    expect(readLoginFile(dir, ["codex-home", "auth.json"])).toBeUndefined();
+    fs.unlinkSync(path.join(dir, "codex-home", "auth.json"));
+    fs.linkSync(path.join(outside, "secret"), path.join(dir, "codex-home", "auth.json"));
+    expect(readLoginFile(dir, ["codex-home", "auth.json"])).toBeUndefined(); // more than one link
+    fs.rmSync(path.join(dir, "codex-home"), { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(outside, "auth.json"), "X");
+    expect(readLoginFile(dir, ["codex-home", "auth.json"])).toBeUndefined();
+  });
+
+  it("a slot is a live process: a cancelled login keeps its slot until its process has exited", async () => {
+    let live = 0;
+    let most = 0;
+    const log = newLog();
+    // The scripted app-server, counted while alive; each takes 200 ms to exit after it is killed.
+    const counting = (s: SpawnIsolatedOptions) => {
+      const child = replaySpawn({}, log, {
+        deviceLogin: { userCode: T.code, outcome: "never" },
+        exitDelayMs: 200,
+      })(s);
+      live++;
+      most = Math.max(most, live);
+      child.once("exit", () => live--);
+      return child;
+    };
+    const t = await start({
+      maxActiveLogins: 1,
+      wrapDevice: () =>
+        new CodexDeviceLogin({ executable: "/nonexistent/codex", timeoutMs: 5000, spawn: counting }),
+    });
+    const six = await Promise.all(
+      Array.from({ length: 6 }, () => t.owner.post("/api/connections/logins", { runtime: "codex" })),
+    );
+    expect(six.map((r) => r.statusCode)).toEqual([201, 201, 201, 201, 201, 201]);
+    expect(log.spawns).toHaveLength(6);
+    expect(most).toBe(1); // never two app-servers at once, though each cancel took 200 ms to finish
+    // Another user while the owner's login holds the only slot: refused, and no process is started for it.
+    const other = await t.stranger.post("/api/connections/logins", { runtime: "codex" });
+    expect(other.statusCode).toBe(409);
+    expect(log.spawns).toHaveLength(6);
+    // A cancel answers once the process is gone; then the slot is free.
+    const last = SubscriptionLogin.parse(six.at(-1)!.json<{ login: unknown }>().login);
+    await t.owner.del(`/api/connections/logins/${last.id}`);
+    expect(live).toBe(0);
+    expect((await t.stranger.post("/api/connections/logins", { runtime: "codex" })).statusCode).toBe(201);
+    expect(most).toBe(1);
+  });
+
+  for (const [name, answer] of [
+    ["HTTP 503", { status: 503, body: "" }],
+    ["HTTP 200 with null", { status: 200, body: "null" }],
+  ] as const)
+    it(`refreshes that keep failing for a passing reason (${name}) end as runtime_error, never expired`, async () => {
+      const t = await start({
+        recording: {
+          hi: [
+            { $refresh: true },
+            { $refresh: true },
+            { $refresh: true },
+            { $refresh: true },
+            cx.completed("failed", { responseStreamDisconnected: { httpStatusCode: 401 } }),
+          ],
+        },
+      });
+      t.setTokenAnswer(answer);
+      const { connection } = await t.until((await t.login()).id);
+      t.pass(connection!.id);
+      const run = (await t.send(t.owner, "hi")).json<{ run: Run }>().run;
+      expect(await t.waitRun(run.id)).toMatchObject({ status: "failed", errorCode: "runtime_error" });
+      expect(t.posts).toHaveLength(3);
+      expect(t.app.connections!.store.get(connection!.id)).toMatchObject({
+        status: "passed",
+        credentialVersion: 1,
+      });
+      expect(t.events(run.id).some((e) => e.type === "notice" && e.code === SUBSCRIPTION_EXPIRED_CODE)).toBe(
+        false,
+      );
+    });
+
+  it("an explicit refusal of the refresh token still ends the login (runtime_auth, expired)", async () => {
+    const t = await start({
+      recording: {
+        hi: [
+          { $refresh: true },
+          cx.completed("failed", { responseStreamDisconnected: { httpStatusCode: 401 } }),
+        ],
+      },
+    });
+    t.setTokenAnswer({ status: 400, body: JSON.stringify({ error: "invalid_grant" }) });
+    const { connection } = await t.until((await t.login()).id);
+    t.pass(connection!.id);
+    const run = (await t.send(t.owner, "hi")).json<{ run: Run }>().run;
+    expect(await t.waitRun(run.id)).toMatchObject({ status: "failed", errorCode: "runtime_auth" });
+    expect(t.app.connections!.store.get(connection!.id)!.status).toBe("expired");
+  });
+
+  // Each guard on its own (the clean-up above stacks them, so one alone would hide another's loss).
+  it("guard: every path component is checked without following it", () => {
+    const outside = mk();
+    fs.writeFileSync(path.join(outside, "auth.json"), "X");
+    const dir = mk();
+    fs.symlinkSync(outside, path.join(dir, "codex-home"));
+    expect(checkPath(dir, ["codex-home", "auth.json"])).toBeUndefined(); // a linked folder on the way
+    fs.unlinkSync(path.join(dir, "codex-home"));
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.symlinkSync(path.join(outside, "auth.json"), path.join(dir, "codex-home", "auth.json"));
+    expect(checkPath(dir, ["codex-home", "auth.json"])).toBeUndefined(); // the file itself a link
+  });
+
+  it("guard: the folders are checked again after the open (a folder swapped for a link to the same file)", () => {
+    const dir = mk();
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "TOKENS");
+    const checked = checkPath(dir, ["codex-home", "auth.json"])!;
+    expect(stillSame(checked.dirs)).toBe(true);
+    // Moved away and linked back: the very same file (same inode, one link) is reachable through a link now.
+    const swap = () => {
+      fs.renameSync(path.join(dir, "codex-home"), path.join(dir, "moved"));
+      fs.symlinkSync(path.join(dir, "moved"), path.join(dir, "codex-home"));
+    };
+    expect(shredLoginFile(dir, ["codex-home", "auth.json"], { beforeOpen: swap })).toBe("refused");
+    expect(fs.readFileSync(path.join(dir, "moved", "auth.json"), "utf8")).toBe("TOKENS");
+  });
+
+  it("guard: the file is opened without following a link put there after the checks", () => {
+    const dir = mk();
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "TOKENS");
+    // Moved aside and linked back by name: same inode, one link, same folders — only O_NOFOLLOW tells.
+    const swap = () => {
+      fs.renameSync(path.join(dir, "codex-home", "auth.json"), path.join(dir, "codex-home", "real.json"));
+      fs.symlinkSync(path.join(dir, "codex-home", "real.json"), path.join(dir, "codex-home", "auth.json"));
+    };
+    expect(shredLoginFile(dir, ["codex-home", "auth.json"], { beforeOpen: swap })).toBe("refused");
+    expect(fs.readFileSync(path.join(dir, "codex-home", "real.json"), "utf8")).toBe("TOKENS");
+  });
+
+  it("guard: a hard-linked tokens file is only unlinked, never overwritten", () => {
+    const outside = mk();
+    fs.writeFileSync(path.join(outside, "victim"), "OUTSIDE");
+    const dir = mk();
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.linkSync(path.join(outside, "victim"), path.join(dir, "codex-home", "auth.json"));
+    expect(shredLoginFile(dir, ["codex-home", "auth.json"])).toBe("unlinked");
+    expect(fs.existsSync(path.join(dir, "codex-home", "auth.json"))).toBe(false);
+    expect(fs.readFileSync(path.join(outside, "victim"), "utf8")).toBe("OUTSIDE");
+  });
+
+  it("guard: removing a login tree unlinks links inside it and leaves their targets", () => {
+    const outside = mk();
+    fs.writeFileSync(path.join(outside, "keep"), "KEEP");
+    const dir = path.join(mk(), "login-x");
+    fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, "codex-home", "linked-dir"));
+    fs.symlinkSync(path.join(outside, "keep"), path.join(dir, "linked-file"));
+    removeLoginTree(dir);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("KEEP");
+    // A login folder that is itself a link: only the link goes.
+    const link = path.join(mk(), "login-y");
+    fs.symlinkSync(outside, link);
+    removeLoginTree(link);
+    expect(fs.existsSync(link)).toBe(false);
+    expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("KEEP");
+  });
+
+  it("a cancelled login holds its slot while its process exits: another user cannot slip in meanwhile", async () => {
+    let live = 0;
+    let most = 0;
+    const log = newLog();
+    const counting = (s: SpawnIsolatedOptions) => {
+      const child = replaySpawn({}, log, {
+        deviceLogin: { userCode: T.code, outcome: "never" },
+        exitDelayMs: 300,
+      })(s);
+      live++;
+      most = Math.max(most, live);
+      child.once("exit", () => live--);
+      return child;
+    };
+    const t = await start({
+      maxActiveLogins: 1,
+      wrapDevice: () =>
+        new CodexDeviceLogin({ executable: "/nonexistent/codex", timeoutMs: 5000, spawn: counting }),
+    });
+    expect((await t.owner.post("/api/connections/logins", { runtime: "codex" })).statusCode).toBe(201);
+    // The owner starts again (cancelling the first, whose process takes 300 ms to go) and another user tries
+    // while that process is still alive.
+    const again = t.owner.post("/api/connections/logins", { runtime: "codex" });
+    await new Promise((r) => setTimeout(r, 50));
+    const other = await t.stranger.post("/api/connections/logins", { runtime: "codex" });
+    expect(other.statusCode).toBe(409);
+    expect((await again).statusCode).toBe(201);
+    expect(most).toBe(1);
   });
 });

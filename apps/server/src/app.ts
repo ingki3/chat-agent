@@ -21,7 +21,7 @@ import { codexFromStore } from "./runtime/codex-config.js";
 import { importEnvConnections, pendingImportTests } from "./connections/import.js";
 import { ChatgptTokenService, type TokenPost } from "./connections/chatgpt.js";
 import { SubscriptionLoginService, type DeviceLoginProvider } from "./connections/login.js";
-import { cleanupLeftoverLogins, CodexDeviceLogin } from "./runtime/codex-login.js";
+import { cleanupLeftoverLogins, CodexDeviceLogin, type ProcessIdentity } from "./runtime/codex-login.js";
 import { registerConnectionRoutes } from "./connections/routes.js";
 import { ConnectionService } from "./connections/service.js";
 import { ConnectionStore } from "./connections/store.js";
@@ -144,8 +144,8 @@ export type BuildOptions = {
   subscription?: {
     device?: DeviceLoginProvider;
     tokenPost?: TokenPost;
-    /** Tests: which pid counts as a login process left by a previous server (default: a `codex` process). */
-    isLoginProcess?: (pid: number) => boolean;
+    /** Tests: how a left-over login process is identified (default: `ps`). */
+    identify?: (pid: number) => ProcessIdentity | undefined;
     maxActiveLogins?: number;
   };
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
@@ -314,10 +314,18 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         : new CodexDeviceLogin({ egress: egressFor(CODEX_LOGIN_EGRESS_HOSTS) }));
     // A server that died during a login left its folder (maybe with the tokens file) and maybe its process: both
     // go before anything else runs (#18 review).
-    cleanupLeftoverLogins(
-      config.dataDir,
-      opts.subscription?.isLoginProcess ? { isLoginProcess: opts.subscription.isLoginProcess } : {},
-    );
+    cleanupLeftoverLogins(config.dataDir, {
+      ...(opts.subscription?.identify ? { identify: opts.subscription.identify } : {}),
+      report: (outcome) =>
+        logEvent(
+          app.log,
+          outcome === "leftover_process_kept" ? "warn" : "info",
+          "connection.login_leftover",
+          {
+            loginCode: outcome,
+          },
+        ),
+    });
     const logins = new SubscriptionLoginService(connectionStore, users, device, config.dataDir, {
       replaced: (id) => connections.replaced(id),
       log: app.log,
