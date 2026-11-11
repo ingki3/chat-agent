@@ -188,36 +188,50 @@ describe("snippet check: normalisation without fuzzy matches", () => {
       true,
     );
     expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였었다.")).toBe(false); // still closed
-    // Round 6: after a number, a numeral unit continues the number — never a particle.
-    expect(found("총 투자 금액은 10", "총 투자 금액은 10만 달러입니다.")).toBe(false);
-    expect(found("지난달 신규 가입자는 32", "지난달 신규 가입자는 32만 명이다.")).toBe(false);
-    expect(found("해당 제품의 가격은 3", "해당 제품의 가격은 3만 원이다.")).toBe(false);
-    expect(found("총 투자 금액은 1.5", "총 투자 금액은 1.5억 달러였다.")).toBe(false);
-    expect(found("총 투자 금액은 10만", "총 투자 금액은 10만 달러입니다.")).toBe(true);
-    // A quote that stops at a separator right after a digit is still in the number (`3.` before `만`).
-    expect(found("해당 금액은 무려 3.", "해당 금액은 무려 3.만 원이다.")).toBe(false);
+    // Rounds 6–8: a quote can never stop right before 만 (not a particle — it is also a numeral unit), and no
+    // numeral unit (십 백 천 만 억 조 경) is a particle, so no number is cut before its unit. Quoting through 만 works.
+    for (const [quote, page] of [
+      ["총 투자 금액은 10", "총 투자 금액은 10만 달러입니다."],
+      ["지난달 신규 가입자는 32", "지난달 신규 가입자는 32만 명이다."],
+      ["해당 제품의 가격은 3", "해당 제품의 가격은 3만 원이다."],
+      ["총 투자 금액은 1.5", "총 투자 금액은 1.5억 달러였다."],
+      ["해당 금액은 무려 3.", "해당 금액은 무려 3.만 원이다."],
+      ["총 투자 금액은 천", "총 투자 금액은 천만 달러입니다."],
+      ["지난달 신규 가입자는 십", "지난달 신규 가입자는 십만 명이다."],
+      ["해당 제품의 가격은 삼", "해당 제품의 가격은 삼만 원이다."],
+      ["지난달 신규 가입자는 이십", "지난달 신규 가입자는 이십만 명이다."],
+      ["예상 피해액은 수천", "예상 피해액은 수천만 원입니다."],
+      ["매년 방문객은 수십", "매년 방문객은 수십만 명이다."],
+      ["해당 영상은 수백", "해당 영상은 수백만 회 재생됐다."],
+      ["올해 매출은 무려 2", "올해 매출은 무려 2조 원이었다."],
+      // The accepted limitation: also before 만 meaning "only".
+      ["이번 작업은 전기 공사", "이번 작업은 전기 공사만 포함한다."],
+      ["직원들은 오늘도 일", "직원들은 오늘도 일만 했다."],
+      ["이번 주에는 이사", "이번 주에는 이사만 진행한다."],
+      ["운영 환경에서는 Python 3.12", "운영 환경에서는 Python 3.12만 지원합니다."],
+      ["이번 배포에서는 HTTP/2", "이번 배포에서는 HTTP/2만 허용합니다."],
+      ["방화벽에서는 포트 443", "방화벽에서는 포트 443만 허용합니다."],
+      ["이 계획은 자금", "이 계획은 자금만 있으면 된다."],
+      ["올해 수출은 미국까지", "올해 수출은 미국까지만 늘었다."],
+      ["올해 수출은 미국", "올해 수출은 미국까지만 늘었다."], // no 까지+만 either
+    ])
+      expect(found(quote!, page!), quote).toBe(false);
+    for (const [quote, page] of [
+      ["이번 작업은 전기 공사만", "이번 작업은 전기 공사만 포함한다."],
+      ["총 투자 금액은 10만", "총 투자 금액은 10만 달러입니다."],
+      ["총 투자 금액은 천만", "총 투자 금액은 천만 달러입니다."],
+      ["예상 피해액은 수천만", "예상 피해액은 수천만 원입니다."],
+      ["운영 환경에서는 Python 3.12만", "운영 환경에서는 Python 3.12만 지원합니다."],
+      ["올해 수출은 미국까지만", "올해 수출은 미국까지만 늘었다."],
+      ["올해 수출은 미국까지", "올해 수출은 미국까지도 늘었다."],
+      ["올해 수출은 미국", "올해 수출은 미국까지도 늘었다."], // 까지+도
+      ["올해 수출은 미국", "올해 수출은 미국에서는 늘었다."], // 에서+는
+      ["수출 증가율은 무려 32", "수출 증가율은 무려 32로 집계됐다."],
+      ["10월 반도체 수출", "10월 반도체 수출이 늘었다."],
+    ])
+      expect(found(quote!, page!), quote).toBe(true);
     expect(found("지난달 신규 가입자는 3", "지난달 신규 가입자는 3명이었다.")).toBe(false); // 명 is not a particle
     expect(found("올해의 기준은 10", "올해의 기준은 10월이다.")).toBe(false); // 월 is not a particle
-    expect(found("수출 증가율은 무려 32", "수출 증가율은 무려 32로 집계됐다.")).toBe(true); // 로 after a digit
-    // Round 7: a number in Korean numerals is a number too.
-    expect(found("총 투자 금액은 천", "총 투자 금액은 천만 달러입니다.")).toBe(false);
-    expect(found("지난달 신규 가입자는 십", "지난달 신규 가입자는 십만 명이다.")).toBe(false);
-    expect(found("해당 제품의 가격은 삼", "해당 제품의 가격은 삼만 원이다.")).toBe(false);
-    expect(found("지난달 신규 가입자는 이십", "지난달 신규 가입자는 이십만 명이다.")).toBe(false);
-    expect(found("이십", "이십만 명")).toBe(false); // too short anyway
-    expect(found("총 투자 금액은 천만", "총 투자 금액은 천만 달러입니다.")).toBe(true);
-    // …but a numeral syllable inside a word is not a number: 이 after 출 stays the particle's host.
-    expect(found("늘어난 것은 오직 수출이", "늘어난 것은 오직 수출이만 해당한다.")).toBe(true);
-    expect(found("주요 수입 대상은 국가", "주요 수입 대상은 국가만 해당한다.")).toBe(true);
-    expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true);
-    // Round 7, accepted limitation: right after a number, 만 ("only") cannot be told from the unit, so the quote is
-    // rejected (⚠️) — a false "verified" on an amount would be worse.
-    expect(found("운영 환경에서는 Python 3.12", "운영 환경에서는 Python 3.12만 지원합니다.")).toBe(false);
-    expect(found("이번 배포에서는 HTTP/2", "이번 배포에서는 HTTP/2만 허용합니다.")).toBe(false);
-    expect(found("방화벽에서는 포트 443", "방화벽에서는 포트 443만 허용합니다.")).toBe(false);
-    expect(found("운영 환경에서는 Python 3.12만", "운영 환경에서는 Python 3.12만 지원합니다.")).toBe(true);
-    // 만 after a word (not a number) is still the particle.
-    expect(found("이 계획은 자금", "이 계획은 자금만 있으면 된다.")).toBe(true);
     // Not a particle, or a particle that runs on into more of the word.
     expect(found("이 설정은 유효", "이 설정은 유효하지 않습니다.")).toBe(false);
     // Only listed particles: a syllable outside the list fails even right before a boundary.

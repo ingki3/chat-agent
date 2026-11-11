@@ -30,7 +30,6 @@ const QUOTES = /["'`´‘’‚‛“”„‟«»‹›「」『』〝〞〟＂
 const DASHES = /[‐‑‒–—―−]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
 const DIGIT = /\p{N}/u;
-const LETTER = /[\p{L}\p{M}]/u;
 /**
  * A character that belongs to a token: letter, digit or mark. That covers modifier letters (`ʰ`, \p{Lm} ⊂ \p{L}),
  * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
@@ -41,7 +40,10 @@ const TOKEN = /[\p{L}\p{N}\p{M}]/u;
  * source must continue with one of these and then a token boundary (not a letter, digit or mark, or the end of
  * the text). Whatever the quote ends with: Hangul, a digit, `%`, a unit, `²`, Latin (`32%로`, `32m²로`,
  * `GPT-4o이며`, `Node.js입니다`, `수출이`). `유효하지 않습니다` (`하…`) and `사용불가` (`불…`) are not. A missing
- * rare particle only gives a false "not found" (⚠️).
+ * rare particle only gives a false "not found" (⚠️). `만` is deliberately **not** in the list (review #97 round 8):
+ * it is also a numeral unit (`10만`, `천만`, `수천만`), so a quote can never stop right before 만 — quoting through
+ * 만 (`공사만`, `10만`, `Python 3.12만`) is verified. None of the numeral units (십 백 천 만 억 조 경) is a particle,
+ * so truncating a number before its unit is rejected by this rule alone.
  */
 export const KOREAN_PARTICLES = [
   "은",
@@ -60,7 +62,6 @@ export const KOREAN_PARTICLES = [
   "와",
   "과",
   "도",
-  "만",
   "까지",
   "부터",
   "보다",
@@ -100,7 +101,7 @@ export const KOREAN_PARTICLES = [
   "였는데",
   "이었는데",
 ] as const;
-/** Particles that may take 는 / 도 / 만 after them (`에서는`, `으로는`, `에도`, `까지만` …). */
+/** Particles that may take 는 / 도 after them (`에서는`, `으로는`, `에도`, `까지도` …). */
 export const COMBINING_PARTICLES = [
   "에",
   "에서",
@@ -117,27 +118,10 @@ export const COMBINING_PARTICLES = [
 ] as const;
 const byLength = (xs: readonly string[]) => [...xs].sort((a, b) => b.length - a.length).join("|");
 const PARTICLE_THEN_BOUNDARY = new RegExp(
-  `^(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도|만)|${byLength(KOREAN_PARTICLES)})(?![\\p{L}\\p{N}\\p{M}])`,
+  `^(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도)|${byLength(KOREAN_PARTICLES)})(?![\\p{L}\\p{N}\\p{M}])`,
   "u",
 );
 const PARTICLE_LOOKAHEAD = 7;
-/**
- * Whether the quote ends with a number written in Korean numerals (`천`, `십`, `삼`, `이십오`): its trailing run of
- * numeral characters starts a token — at the quote's start or after a non-letter. So `수출이` (이 after 출) is not a number. Native counters (하나,
- * 둘 …) are not covered.
- */
-const KOREAN_NUMERAL = /[일이삼사오육칠팔구십백천만억조영공]/u;
-function endsInKoreanNumeral(want: string): boolean {
-  const chars = Array.from(want);
-  let k = chars.length;
-  while (k > 0 && KOREAN_NUMERAL.test(chars[k - 1]!)) k--;
-  if (k === chars.length) return false;
-  // A run that is the whole quote starts a token: the start rule already refused a match after a letter.
-  return k === 0 || !LETTER.test(chars[k - 1]!);
-}
-
-/** Korean numeral units: after a number they continue it (`10만`, `천만`, `3억`, `2조`). */
-const NUMERAL_UNIT = /^[십백천만억조경]$/u;
 const SPACE = /\s/u;
 
 const ENTITIES: Record<string, string> = {
@@ -372,12 +356,6 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     if (DIGIT.test(last) && /^[.,]\p{N}/u.test(rest)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
-    // After a number, a numeral unit is more of the number, never a particle (`10` is not in `10만 달러`).
-    const endsInNumber =
-      DIGIT.test(last) ||
-      (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1)))) ||
-      endsInKoreanNumeral(want);
-    if (endsInNumber && NUMERAL_UNIT.test(after)) continue;
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
