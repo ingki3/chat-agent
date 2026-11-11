@@ -12,6 +12,7 @@ import {
   isHttpStatus,
   isId,
   isMethod,
+  isNotificationKind,
   isRoutePattern,
   isRuntime,
   isStatus,
@@ -48,6 +49,12 @@ export const LOG_EVENTS = [
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",
+  // Notifications (#34): counts, kinds and push-service status codes only — never a title, body or endpoint.
+  "push.sent",
+  "push.unsent",
+  "push.failed",
+  "push.cancelled",
+  "push.subscription_gone",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -117,6 +124,12 @@ const FIELDS = new Map<string, Check>([
   ["outputTokens", isInt],
   /** Lines the log file could not write (disk full …), reported once writing works again. */
   ["dropped", isInt],
+  /** Notifications (#34): what kind, how many entries in one push, how many devices took it. */
+  ["notificationKind", isNotificationKind],
+  ["count", isInt],
+  ["devices", isInt],
+  /** Status a push service answered with (404/410 = subscription gone). */
+  ["httpStatus", isHttpStatus],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -357,6 +370,10 @@ export type LogFields = {
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
+  notificationKind?: string;
+  count?: number;
+  devices?: number;
+  httpStatus?: number;
   /** Logged as class name and code only. */
   err?: unknown;
 };

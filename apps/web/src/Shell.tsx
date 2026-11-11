@@ -1,6 +1,8 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { Outlet } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { Outlet, useNavigate } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
+import { notifications, NOTIFICATIONS_KEY } from "./api.js";
 import { Sidebar } from "./Sidebar.js";
 
 type ShellCtx = { openDrawer: (trigger: HTMLElement) => void };
@@ -16,6 +18,7 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabi
  */
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
   const [drawer, setDrawer] = useState(false);
+  usePushMessages();
   // The drawer exists only at 900px and below: widening the window closes it (and with it the modal state).
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
@@ -117,4 +120,35 @@ export function TopBar({ title, children }: { title: ReactNode; children?: React
       {children}
     </div>
   );
+}
+
+/** Same-origin in-app path only (the service worker checks too). */
+const inAppPath = (url: unknown) =>
+  typeof url === "string" && url.startsWith("/") && !url.startsWith("//") && !url.includes("\\") ? url : "/";
+
+/**
+ * Messages from the service worker (#34): a push arrived → refresh the 🔔 badge; a notification was tapped
+ * while the app is open → go there in place (and mark it read). If the session has expired, the login screen
+ * shows on that address and the user lands there after signing in.
+ */
+function usePushMessages() {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: unknown; url?: unknown; id?: unknown } | null;
+      if (data?.type === "agentlee:notification") void qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY });
+      if (data?.type === "agentlee:open") {
+        navigate(inAppPath(data.url));
+        if (typeof data.id === "string")
+          void notifications
+            .read(data.id)
+            .catch(() => {})
+            .finally(() => qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY }));
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [qc, navigate]);
 }

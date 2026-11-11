@@ -78,7 +78,19 @@ function run(f: Family) {
   return r.run.id;
 }
 
+/** An inbox entry of `owner` (#34). */
+const notification = (f: Family) => f.app.notifications!.publish(f.users.owner.id, { kind: "test" })!;
+/** A push device of `owner`, registered from one of owner's sessions (#34). */
+const pushDevice = (f: Family) =>
+  f.app.notifications!.subscribe(f.users.owner.id, f.app.users!.createSession(f.users.owner.id), {
+    endpoint: `https://fcm.googleapis.com/fcm/send/matrix-${Math.random().toString(36).slice(2)}`,
+    keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+    label: "matrix",
+  });
+
 export const APP_MATRIX: MatrixRow[] = [
+  { route: "POST /api/notifications/:id/read", expect: OWNER_ONLY, fixture: notification },
+  { route: "DELETE /api/push/devices/:id", expect: OWNER_ONLY, fixture: pushDevice },
   { route: "GET /api/runs/:id", expect: NOT_SHARED(READ), fixture: run },
   { route: "GET /api/runs/:id/events", expect: NOT_SHARED(READ), fixture: run },
   { route: "POST /api/runs/:id/interrupt", expect: OWNER_ONLY, fixture: run },

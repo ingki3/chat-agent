@@ -657,3 +657,88 @@ h2 {
   display: block;
   margin: 0 auto 16px;
 }
+
+/* ---- notifications (#34) ---- */
+.badge.ok {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: var(--ok);
+}
+.badge.gray {
+  background: var(--chip);
+  color: var(--muted);
+}
+.bell {
+  position: relative;
+  text-decoration: none;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 15px;
+}
+.bell:hover,
+.bell.active {
+  background: var(--chip);
+}
+.bell .count {
+  margin-left: 2px;
+  font-weight: 700;
+  background: var(--error);
+  color: #fff;
+}
+.notis {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.notis li + li {
+  border-top: 1px solid var(--line);
+}
+.noti {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg);
+  font-size: 13px;
+}
+.noti.unread {
+  background: var(--accent-weak);
+}
+.noti-body {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.devices {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.devices td {
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+.devices .actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.devices .actions button + button {
+  margin-left: 6px;
+}
+.quiet h3 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+.quiet input[type="time"] {
+  padding: 6px 8px;
+}
+.row.wrap {
+  flex-wrap: wrap;
+}

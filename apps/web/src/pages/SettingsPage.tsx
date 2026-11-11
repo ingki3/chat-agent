@@ -3,6 +3,7 @@ import type { AuthState } from "@agentlee/shared";
 import { ChangePassword } from "../auth-screens.js";
 import { TopBar } from "../Shell.js";
 import { getTheme, setTheme, type ThemeChoice } from "../theme.js";
+import { NotificationSettings } from "./NotificationSettings.js";
 
 export function SettingsPage({ onChanged }: { onChanged: (s: AuthState) => void }) {
   const [theme, set] = useState<ThemeChoice>(getTheme());
@@ -36,8 +37,9 @@ export function SettingsPage({ onChanged }: { onChanged: (s: AuthState) => void 
               </label>
             ))}
           </div>
-          <p className="muted small">기본 런타임·모델 설정은 #19, 알림 설정은 #34에서 들어와요.</p>
+          <p className="muted small">기본 런타임·모델 설정은 #19에서 들어와요.</p>
         </section>
+        <NotificationSettings />
         <section className="panel">
           {changed ? (
             <p role="status">비밀번호를 바꿨어요. 다른 기기의 로그인은 끊겼어요.</p>
