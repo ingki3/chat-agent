@@ -1,3 +1,4 @@
+import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { CSRF_HEADER, type Run } from "@agentlee/shared";
 import { eq } from "drizzle-orm";
@@ -133,9 +134,11 @@ async function start(script: FakeScript, graceMs = 3000, adapter?: RuntimeAdapte
   const runtimes = new RuntimeRegistry();
   const fake = new FakeRuntime({ script });
   runtimes.register(adapter ?? fake);
+  const lines: string[] = [];
+  const logStream = new Writable({ write: (c, _e, cb) => (lines.push(String(c)), cb()) });
   const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
     db,
-    logger: false,
+    logStream,
     runtimes,
     runs: { flushMs: 0, interruptGraceMs: graceMs },
   });
@@ -173,7 +176,15 @@ async function start(script: FakeScript, graceMs = 3000, adapter?: RuntimeAdapte
     }
     throw new Error("no usage row");
   };
-  return { app, db, f, fake, headers, conversation, send, waitRun, waitUsage };
+  /** The `run.finished` log record of a run (its totals are each attempt's last report). */
+  const finished = (runId: string) =>
+    lines
+      .join("")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((l) => l.msg === "run.finished" && l.runId === runId);
+  return { app, db, f, fake, headers, conversation, send, waitRun, waitUsage, finished };
 }
 
 describe("runs record usage (#44)", () => {
@@ -210,6 +221,25 @@ describe("runs record usage (#44)", () => {
         requestCount: 1,
       }),
     ]);
+    // The log record's totals follow the same rule: the last report, not the sum of both.
+    expect(t.finished(run.id)).toMatchObject({ inputTokens: 120, outputTokens: 7, costUsd: 0.03 });
+  });
+
+  it("a last report without a cost: the row and the log have no cost (last one wins for every figure)", async () => {
+    const t = await start(() => [
+      { text: "안녕" },
+      { usage: { inputTokens: 100, outputTokens: 5, costUsd: 0.03 } },
+      { usage: { inputTokens: 100, outputTokens: 5, costUsd: 0.03 } },
+      { usage: { inputTokens: 130, outputTokens: 9 } },
+    ]);
+    const { run } = await t.send(t.conversation().id, "질문");
+    await t.waitRun(run.id);
+    expect(rows(t.db)).toEqual([
+      expect.objectContaining({ inputTokens: 130, outputTokens: 9, costUsd: null }),
+    ]);
+    const log = t.finished(run.id)!;
+    expect(log).toMatchObject({ inputTokens: 130, outputTokens: 9 });
+    expect(log).not.toHaveProperty("costUsd");
   });
 
   it("an interrupted run still records the usage that arrived before it stopped", async () => {

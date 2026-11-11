@@ -463,8 +463,9 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용) `request_count`(attempt당 1) `created_at` `updated_at`.
   - 런타임이 주지 않은 값은 0이 아니라 **NULL**이다.
   - 프롬프트·답변·도구 입출력 같은 **내용은 저장하지 않는다**.
+  - 행을 쓰지 못하면(디스크·DB 오류) 답변·연결 테스트 결과는 그대로이고 `usage.record_failed` 로그(ID·`attempt`·`purpose`·오류 코드만)가 남는다.
   - 대화·실행·연결에 외래 키가 없다: 대화를 지우거나 연결을 해제해도 사용량은 남는다(월 합계가 줄지 않게).
-- **목적(purpose)**: 답변은 `chat`, 연결 테스트(#17)는 `connection_test`(연결에 묶이고 대화는 없음). 제목·요약(#45)·예약(#33)은 `UsageStore.record`를 같은 방식으로 자기 목적으로 부른다.
+- **목적(purpose)**: 답변은 `chat`, 연결 테스트(#17)는 `connection_test`(연결에 묶이고 대화는 없음). 한도에 걸린 연결 테스트도 턴의 마지막 사용량(Claude `rate_limit` 다음의 `result`)까지 읽어 기록한 뒤 `usage_limit`으로 끝난다. 제목·요약(#45)·예약(#33)은 `UsageStore.record`를 같은 방식으로 자기 목적으로 부른다.
 - 보기(읽기 전용):
   ```bash
   sqlite3 -readonly data/agentlee.db \

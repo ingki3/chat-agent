@@ -226,7 +226,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const connections = new ConnectionService(
       connectionStore,
       users,
-      new ConnectionTester(runtimes, mcp, mcpTokens, { usage, ...opts.connectionTest }),
+      new ConnectionTester(runtimes, mcp, mcpTokens, { usage, log: app.log, ...opts.connectionTest }),
       runtimes,
       app.log,
     );

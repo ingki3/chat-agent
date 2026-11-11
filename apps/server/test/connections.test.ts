@@ -425,7 +425,95 @@ describe("connection test (#17, FR-11.5)", () => {
   });
 });
 
+/** A runtime whose turn plays these events, like an adapter would translate them (#44 review). */
+function scriptedRuntime(evs: RuntimeEvent[]): RuntimeAdapter {
+  return {
+    id: "claude-code",
+    capabilities: () => ({
+      models: [{ id: "fake-large", label: "Fake", efforts: [] }],
+      canSwitchModelInSession: false,
+      canResume: false,
+      usesTools: false,
+      needsConnection: true,
+    }),
+    resume: () => Promise.reject(new Error("no resume")),
+    start: async (): Promise<RuntimeSession> => ({
+      externalSessionId: "s",
+      setModel: async () => {},
+      close: async () => {},
+      turn: () => ({
+        events: (async function* () {
+          yield* evs;
+        })(),
+        interrupt: async () => {},
+      }),
+    }),
+  };
+}
+
 describe("usage of connections (#44)", () => {
+  it("a test that hits a limit still records the turn's final usage (Claude: rate_limit → result)", async () => {
+    const t = await start({
+      adapters: [
+        scriptedRuntime([
+          { type: "text_delta", text: "O" },
+          { type: "limit", code: "rate_limit", message: "한도" },
+          { type: "usage", inputTokens: 25, outputTokens: 0, costUsd: 0.0001 },
+        ]),
+      ],
+    });
+    const c = await t.addMine(t.owner, KEYS.ownerClaude);
+    expect(await t.testMine(t.owner, c.id)).toMatchObject({ status: "failed", code: "usage_limit" });
+    expect(t.db.select().from(usageRecords).all()).toEqual([
+      expect.objectContaining({
+        purpose: "connection_test",
+        connectionId: c.id,
+        inputTokens: 25,
+        outputTokens: 0,
+        costUsd: 0.0001,
+      }),
+    ]);
+  });
+
+  it("a usage row that cannot be written is logged (IDs and codes only) and changes no outcome", async () => {
+    const t = await start();
+    // Every usage insert fails, with a text that must never reach the log.
+    t.db.$client.exec(
+      "CREATE TRIGGER usage_fail BEFORE INSERT ON usage_records BEGIN SELECT RAISE(ABORT, 'SECRET-TRIGGER-TEXT'); END;",
+    );
+    const c = await t.addMine(t.owner, KEYS.ownerClaude);
+    expect((await t.testMine(t.owner, c.id)).status).toBe("passed");
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const run = t.runOf(await t.send(t.owner, conv.id, { text: "안녕" }));
+    expect((await t.waitRun(run.id)).status).toBe("done");
+    expect(t.db.select().from(usageRecords).all()).toEqual([]);
+    const failed = t.log
+      .text()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.msg === "usage.record_failed");
+    expect(failed).toEqual([
+      expect.objectContaining({
+        userId: t.f.users.owner.id,
+        runtime: "claude-code",
+        connectionId: c.id,
+        attempt: 1,
+        purpose: "connection_test",
+        err: { type: "SqliteError", code: "db_error" },
+      }),
+      expect.objectContaining({
+        userId: t.f.users.owner.id,
+        conversationId: conv.id,
+        runId: run.id,
+        attempt: 1,
+        purpose: "chat",
+        err: { type: "SqliteError", code: "db_error" },
+      }),
+    ]);
+    expect(t.log.text()).not.toContain("SECRET-TRIGGER-TEXT");
+  });
+
   it("a connection test records its usage with purpose connection_test, on the connection, without a conversation", async () => {
     const t = await start();
     const c = await t.addMine(t.owner, KEYS.ownerClaude);
