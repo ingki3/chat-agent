@@ -155,8 +155,9 @@ const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
  */
 // A repeated currency sign after a range mark is part of the range (`$100-$200`, `€100 ~ €200`, `$10–$20`).
 const DECIMAL_AFTER = /^[.,]\p{N}/u;
-const RANGE_AFTER = /^ ?[/:\-\u2212~] ?[+\-\u2212]?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
-const RANGE_MARK = /^[/:~]$/u;
+// Also multiplication and powers in scientific notation: `×` `*` `^` `·` (`3×10⁸`, `3*10^8`, `10^9`; round 19).
+const RANGE_AFTER = /^ ?[/:\-\u2212~\u00D7*^\u00B7] ?[+\-\u2212]?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
+const RANGE_MARK = /^[/:~\u00D7*^\u00B7]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
 /** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
 const SIGN = /^[+\-\u2212]$/u;

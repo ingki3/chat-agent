@@ -197,6 +197,30 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
   });
 
+  it("scientific notation and powers are one number (round 19)", () => {
+    expect(found("진공에서 빛의 속력은 약 3", "진공에서 빛의 속력은 약 3×10⁸ m/s이다.")).toBe(false);
+    expect(found("10⁸ m/s라고 설명했다.", "진공에서 빛의 속력은 약 3×10⁸ m/s라고 설명했다.")).toBe(false);
+    expect(found("전파의 주파수는 10", "전파의 주파수는 10^9 Hz이다.")).toBe(false);
+    expect(found("진공에서 빛의 속력은 약 3", "진공에서 빛의 속력은 약 3*10^8 m/s이다.")).toBe(false);
+    expect(found("10^8 m/s라고 설명했다", "빛의 속력은 약 3*10^8 m/s라고 설명했다.")).toBe(false);
+    expect(found("진공에서 빛의 속력은 약 3", "진공에서 빛의 속력은 약 3 × 10⁸ m/s이다.")).toBe(false);
+    expect(found("진공에서 빛의 속력은 약 3", "진공에서 빛의 속력은 약 3·10⁸ m/s이다.")).toBe(false);
+    expect(found("9 Hz라고 했다고 한다", "전파의 주파수는 10^9 Hz라고 했다고 한다.")).toBe(false);
+    expect(found("10⁸ m/s라고 설명했다.", "빛의 속력은 약 3·10⁸ m/s라고 설명했다.")).toBe(false);
+    // A superscript digit after a digit is part of the number (the end token rule).
+    expect(found("빛의 속력은 약 3×10", "빛의 속력은 약 3×10⁸ m/s이다.")).toBe(false);
+    // `e` notation: the letter is part of the token; the exponent's sign continues it.
+    expect(found("측정값은 무려 1", "측정값은 무려 1e9 회였다.")).toBe(false);
+    expect(found("측정값은 무려 1", "측정값은 무려 1E9 회였다.")).toBe(false);
+    expect(found("측정된 농도는 1.5", "측정된 농도는 1.5e-3 mol이다.")).toBe(false);
+    expect(found("측정된 농도는 1.5e", "측정된 농도는 1.5e-3 mol이다.")).toBe(false);
+    expect(found("3 mol이라고 했다", "측정된 농도는 1.5e-3 mol이라고 했다.")).toBe(false);
+    // Controls: the whole notation, and a whole equation.
+    expect(found("진공에서 빛의 속력은 약 3×10⁸ m/s", "진공에서 빛의 속력은 약 3×10⁸ m/s이다.")).toBe(true);
+    expect(found("측정된 농도는 1.5e-3 mol", "측정된 농도는 1.5e-3 mol이다.")).toBe(true);
+    expect(found("간단한 계산은 3 × 4 = 12", "간단한 계산은 3 × 4 = 12이다.")).toBe(true);
+  });
+
   it("a range check looks 3 tokens either side and allows the second value's sign (round 18)", () => {
     expect(found("객실의 하루 요금은 10만 원", "객실의 하루 요금은 10만 원~20만 원이다.")).toBe(false);
     expect(found("20만 원이라고 안내했다.", "객실의 하루 요금은 10만 원~20만 원이라고 안내했다.")).toBe(
