@@ -79,6 +79,7 @@ describe("database", () => {
       .all()
       .map((r) => (r as { name: string }).name);
     expect(tables).toEqual([
+      "connections",
       "conversations",
       "error_log",
       "messages",
@@ -88,6 +89,7 @@ describe("database", () => {
       "push_subscriptions",
       "run_events",
       "runs",
+      "runtime_policies",
       "runtime_sessions",
       "sessions",
       "settings",

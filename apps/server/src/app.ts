@@ -16,8 +16,13 @@ import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
 import { RuntimeRegistry } from "./runtime/adapter.js";
 import { FakeRuntime } from "./runtime/fake.js";
-import { claudeFromConfig } from "./runtime/claude-config.js";
-import { codexFromConfig } from "./runtime/codex-config.js";
+import { claudeFromStore } from "./runtime/claude-config.js";
+import { codexFromStore } from "./runtime/codex-config.js";
+import { importEnvConnections, pendingImportTests } from "./connections/import.js";
+import { registerConnectionRoutes } from "./connections/routes.js";
+import { ConnectionService } from "./connections/service.js";
+import { ConnectionStore } from "./connections/store.js";
+import { ConnectionTester } from "./connections/tester.js";
 import { CLAUDE_EGRESS_HOSTS, CODEX_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
@@ -74,6 +79,8 @@ declare module "fastify" {
     errors: ErrorLog | undefined;
     /** Inbox, quiet hours and web push (#34); undefined without a database. Publishing points call `publish`. */
     notifications: NotificationService | undefined;
+    /** Runtime connections (#17); undefined without a database. */
+    connections: ConnectionService | undefined;
   }
 }
 
@@ -112,6 +119,8 @@ export type BuildOptions = {
   masterKey?: Buffer;
   /** Push transport / clock overrides (tests). */
   notifications?: NotificationServiceOptions;
+  /** Connection test overrides (tests: a short timeout). */
+  connectionTest?: { timeoutMs?: number };
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
 };
@@ -182,6 +191,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   if (users) {
     registerAuthRoutes(app, { config, users, ...opts.auth });
     registerUserAdmin(app, users, opts.userAdmin);
+    if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
+    const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
+    const settingsStore = new SettingsStore(opts.db!, masterKey);
+    // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
+    const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
     else if (!opts.runtimes) {
@@ -192,8 +206,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         app.addHook("onClose", async () => egress.close());
         return egress;
       };
-      if (config.claude) runtimes.register(claudeFromConfig(config, users, egressFor(CLAUDE_EGRESS_HOSTS)));
-      if (config.codex) runtimes.register(codexFromConfig(config, users, egressFor(CODEX_EGRESS_HOSTS)));
+      // Both real runtimes are always there; whether a user can run one depends on their connections (#17).
+      // Tests bring their own runtimes (opts.runtimes) and never start a real CLI.
+      if (config.env !== "test") {
+        runtimes.register(claudeFromStore(connectionStore, users, egressFor(CLAUDE_EGRESS_HOSTS)));
+        runtimes.register(codexFromStore(connectionStore, users, egressFor(CODEX_EGRESS_HOSTS)));
+      }
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
@@ -202,9 +220,21 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       ...mcpOptionsFromConfig(config),
       ...opts.mcp,
     });
+    const connections = new ConnectionService(
+      connectionStore,
+      users,
+      new ConnectionTester(runtimes, mcp, mcpTokens, opts.connectionTest),
+      runtimes,
+      app.log,
+    );
+    app.decorate("connections", connections);
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       mcp,
       mcpTokens,
+      connections: {
+        resolve: (input) => connections.access.resolve(input),
+        runFailed: (run, code) => connections.runFailed(run, code),
+      },
       log: app.log,
       ...(errors ? { errors } : {}),
       ...opts.runs,
@@ -223,10 +253,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
+    registerConnectionRoutes(app, connections, users, runtimes);
 
-    if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
-    const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
-    const vapid = loadOrCreateVapidKeys(new SettingsStore(opts.db!, masterKey));
+    const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(
       opts.db!,
       masterKey,
@@ -239,11 +268,35 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     );
     app.decorate("notifications", notifications);
     registerNotificationRoutes(app, notifications);
+    connections.attach({
+      runs: runManager,
+      notify: (userId, input) => void notifications.publish(userId, input),
+    });
+    // `.env` credentials from before #17, imported once and tested so they keep working (docs/ops.md §11).
+    // A value that cannot be imported is logged and shown to the admin; the server still starts (fix, restart).
+    connections.importFailures = importEnvConnections(
+      config,
+      connectionStore,
+      users,
+      settingsStore,
+      app.log,
+    ).failed;
+    // Every start: imported connections still waiting for their first test are tested (also after a crash).
+    const pending = pendingImportTests(connectionStore, settingsStore);
+    if (pending.length)
+      app.addHook("onReady", async () => {
+        const tester = connectionStore.admins()[0];
+        if (!tester) return; // no admin yet: tested on a later start, or by the admin in the app
+        void (async () => {
+          for (const c of pending) await connections.test(c, c.ownerId ?? tester).catch(() => undefined);
+        })();
+      });
     // Pushes held for quiet hours (or cut off by the last shutdown) are sent once their time has come.
     app.addHook("onReady", async () => notifications.start());
     app.addHook("onClose", async () => notifications.stop());
   } else {
     app.decorate("notifications", undefined);
+    app.decorate("connections", undefined);
   }
 
   app.get(

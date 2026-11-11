@@ -1,42 +1,36 @@
-import path from "node:path";
 import type { UserStore } from "../auth/users.js";
-import type { Config } from "../config.js";
+import type { ConnectionStore } from "../connections/store.js";
+import type { ConnectionRequest } from "./adapter.js";
 import { ClaudeAdapter, type ClaudeConnection } from "./claude.js";
 
 /**
- * Claude Code from `.env` credentials, until connections live in the app (#17). Who may use what (PRD D2):
- * the subscription token only for the admin's own conversations; the API key for every active family member.
+ * Claude Code connections from the database (#17). The run's connection is resolved and re-checked for this user
+ * (connected, passed — or under test — and allowed). A Claude subscription is used for an admin's own runs only
+ * (PRD D2): checked when it is registered, and again here in case the account is no longer an admin.
+ * Folders are per connection *and* user: `data/runtimes/<connection id>/<user id>/` (review #80).
  */
 export function claudeConnectionFor(
-  config: Pick<Config, "claude" | "dataDir" | "adminEmail">,
+  store: Pick<ConnectionStore, "resolve">,
   users: Pick<UserStore, "byId">,
-  userId: string,
+  ctx: ConnectionRequest,
 ): ClaudeConnection | undefined {
-  const u = users.byId(userId);
-  if (!u?.active || !config.claude) return undefined;
-  // One CLI folder per connection *and user*: sessions, caches and transcripts of one family member are never in
-  // another's sandbox (review #80). The user id is a server-generated UUID.
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(u.id)) return undefined;
-  const dir = (id: string) => path.join(config.dataDir, "runtimes", id, u.id);
-  if (config.claude.oauthToken && u.role === "admin" && u.email.toLowerCase() === config.adminEmail)
-    return {
-      id: "claude-admin-subscription",
-      dir: dir("claude-admin-subscription"),
-      auth: { kind: "oauth_token", token: config.claude.oauthToken },
-    };
-  if (config.claude.apiKey)
-    return {
-      id: "claude-api-key",
-      dir: dir("claude-api-key"),
-      auth: { kind: "api_key", apiKey: config.claude.apiKey },
-    };
-  return undefined;
+  const user = users.byId(ctx.userId);
+  const r = store.resolve(ctx.connectionId, user, "claude-code", {
+    test: ctx.connectionTest === true,
+    version: ctx.connectionVersion,
+  });
+  if (!r) return undefined;
+  if (r.authType === "subscription")
+    return user?.role === "admin"
+      ? { id: r.id, dir: r.dir, auth: { kind: "oauth_token", token: r.secret } }
+      : undefined;
+  return { id: r.id, dir: r.dir, auth: { kind: "api_key", apiKey: r.secret } };
 }
 
-export function claudeFromConfig(
-  config: Config,
+export function claudeFromStore(
+  store: ConnectionStore,
   users: UserStore,
   egress: { endpoint(): Promise<{ port: number; url: string }> },
 ): ClaudeAdapter {
-  return new ClaudeAdapter({ connection: (userId) => claudeConnectionFor(config, users, userId), egress });
+  return new ClaudeAdapter({ connection: (ctx) => claudeConnectionFor(store, users, ctx), egress });
 }

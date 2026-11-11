@@ -4,8 +4,15 @@ import { ChangePassword } from "../auth-screens.js";
 import { TopBar } from "../Shell.js";
 import { getTheme, setTheme, type ThemeChoice } from "../theme.js";
 import { NotificationSettings } from "./NotificationSettings.js";
+import { RuntimeConnections } from "./RuntimeConnections.js";
 
-export function SettingsPage({ onChanged }: { onChanged: (s: AuthState) => void }) {
+export function SettingsPage({
+  onChanged,
+  isAdmin,
+}: {
+  onChanged: (s: AuthState) => void;
+  isAdmin: boolean;
+}) {
   const [theme, set] = useState<ThemeChoice>(getTheme());
   const [changed, setChanged] = useState(false);
   return (
@@ -39,6 +46,7 @@ export function SettingsPage({ onChanged }: { onChanged: (s: AuthState) => void 
           </div>
           <p className="muted small">기본 런타임·모델 설정은 #19에서 들어와요.</p>
         </section>
+        <RuntimeConnections isAdmin={isAdmin} />
         <NotificationSettings />
         <section className="panel">
           {changed ? (

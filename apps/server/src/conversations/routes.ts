@@ -4,6 +4,7 @@ import {
   EditMessageRequest,
   ListConversationsQuery,
   ListMessagesQuery,
+  RegenerateRequest,
   SendMessageRequest,
   UpdateConversationRequest,
 } from "@agentlee/shared";
@@ -28,6 +29,13 @@ function parse<T extends z.ZodType>(schema: T, value: unknown, reply: FastifyRep
 }
 
 type IdParams = { id: string };
+
+/** The per-turn choices of a request body (#17), without the text. */
+const choiceOf = (body: z.infer<typeof SendMessageRequest>) => {
+  const choice: Partial<typeof body> = { ...body };
+  delete choice.text;
+  return choice;
+};
 type MsgParams = { id: string; messageId: string };
 
 /**
@@ -131,6 +139,7 @@ export function registerConversationRoutes(
         conversationId: req.params.id,
         userId: req.ctx.user!.id,
         idempotencyKey: k,
+        choice: choiceOf(body),
         prepare: () => {
           const user = store.append(req.params.id, {
             role: "user",
@@ -157,6 +166,7 @@ export function registerConversationRoutes(
           conversationId: req.params.id,
           userId: req.ctx.user!.id,
           idempotencyKey: k,
+          choice: choiceOf(body),
           prepare: () => {
             const user = store.edit(req.params.id, req.params.messageId, body.text);
             if (!user) throw new MessageNotFoundError();
@@ -172,8 +182,9 @@ export function registerConversationRoutes(
     "/api/conversations/:id/messages/:messageId/regenerate",
     { config: conv("write") },
     async (req, reply) => {
-      const k = key(req, reply);
-      if (k === false) return reply;
+      const body = parse(RegenerateRequest, req.body ?? {}, reply);
+      const k = body && key(req, reply);
+      if (!body || k === false) return reply;
       return startRun(
         reply,
         runs,
@@ -182,6 +193,7 @@ export function registerConversationRoutes(
           conversationId: req.params.id,
           userId: req.ctx.user!.id,
           idempotencyKey: k,
+          choice: body,
           prepare: () => {
             const assistant = store.regenerate(req.params.id, req.params.messageId);
             if (!assistant) throw new MessageNotFoundError();

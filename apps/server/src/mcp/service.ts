@@ -280,6 +280,8 @@ export class McpService {
   private active = 0;
   private readonly activeByRun = new Map<string, number>();
   private readonly proxies = new Map<string, Pick<EgressService, "endpoint" | "close">>();
+  /** Runs whose answered tool calls are being recorded (connection tests, #17). */
+  private readonly watched = new Map<string, Set<string>>();
 
   constructor(
     private readonly tokens: McpTokens,
@@ -379,6 +381,9 @@ export class McpService {
         });
         return r;
       },
+      onToolCall: (tool, scope, ok) => {
+        if (ok) this.watched.get(scope.runId)?.add(tool);
+      },
       ...(this.opts.now ? { now: this.opts.now } : {}),
       ...(this.opts.timeZone ? { timeZone: this.opts.timeZone } : {}),
     };
@@ -410,6 +415,16 @@ export class McpService {
       if (left > 0) this.activeByRun.set(scope.runId, left);
       else this.activeByRun.delete(scope.runId);
     }
+  }
+
+  /**
+   * Records which tools this server successfully answered for `runId` until `stop()` — evidence for the connection
+   * test (#17) that the runtime really reached our MCP server, not just that it reported a tool call.
+   */
+  watch(runId: string): { seen: ReadonlySet<string>; stop(): void } {
+    const seen = new Set<string>();
+    this.watched.set(runId, seen);
+    return { seen, stop: () => void this.watched.delete(runId) };
   }
 
   /** Whether a start was requested (tests: runtimes without tools must not open the port). */

@@ -54,29 +54,16 @@ const ConfigSchema = z.object({
    */
   LOG_FILE: optional(z.string()),
   /**
-   * Claude Code credentials until runtime connections are managed in the app (#17). Secrets: `.env` only.
-   * The API key serves every family member; the subscription token (`claude setup-token`) only the admin's own
-   * conversations (PRD D2).
+   * Legacy Claude Code credentials (before #17). Read only for the one-time import into app-managed connections
+   * (connections/import.ts, docs/ops.md §11): the API key becomes a shared connection, the subscription token
+   * (`claude setup-token`) the admin's own personal one (PRD D2). Remove them from `.env` after the import.
    */
-  CLAUDE_API_KEY: optional(
-    z.string().regex(/^sk-ant-[A-Za-z0-9_-]{20,}$/, {
-      message: "CLAUDE_API_KEY must be an Anthropic API key (sk-ant-…)",
-    }),
-  ),
-  CLAUDE_OAUTH_TOKEN: optional(
-    z.string().regex(/^[A-Za-z0-9_.-]{20,}$/, {
-      message: "CLAUDE_OAUTH_TOKEN must be a token from `claude setup-token`",
-    }),
-  ),
-  /**
-   * Codex credential until runtime connections are managed in the app (#17): an OpenAI API key for every active
-   * family member. Each member's own ChatGPT login comes with #18. Secret: `.env` only.
-   */
-  CODEX_API_KEY: optional(
-    z
-      .string()
-      .regex(/^sk-[A-Za-z0-9_-]{20,}$/, { message: "CODEX_API_KEY must be an OpenAI API key (sk-…)" }),
-  ),
+  // Not checked here on purpose: the importer applies the connection rules (formats included), skips a bad
+  // value without marking it imported and the server still starts — the admin sees it and fixes `.env` (review #84).
+  CLAUDE_API_KEY: optional(z.string()),
+  CLAUDE_OAUTH_TOKEN: optional(z.string()),
+  /** Legacy OpenAI API key (before #17), imported once as a shared Codex connection (docs/ops.md §11). */
+  CODEX_API_KEY: optional(z.string()),
   /**
    * Python for python skills (#21): `<install>/bin/python3.x` of a self-contained build (e.g. `uv python install
    * 3.12`, then `uv python find 3.12`). Unset = python skills are not offered. See mcp/python.ts.
@@ -105,9 +92,9 @@ export type Config = {
   adminEmail: string;
   /** Absolute path of the rotated log file; undefined = stdout. */
   logFile?: string | undefined;
-  /** Claude Code credentials (secrets — never log this object). */
+  /** Legacy Claude Code credentials for the one-time import (secrets — never log this object). */
   claude?: { apiKey?: string | undefined; oauthToken?: string | undefined } | undefined;
-  /** Codex credential (secret — never log this object). */
+  /** Legacy Codex credential for the one-time import (secret — never log this object). */
   codex?: { apiKey: string } | undefined;
   /** Interpreter for python skills (validated when the MCP service starts). */
   skillPython?: string | undefined;

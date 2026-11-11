@@ -73,6 +73,9 @@ export const ERROR_TYPES = set([
   "ShuttingDownError",
   "RunBusyError",
   "IdempotencyConflictError",
+  "RunAccessDenied",
+  "ConnectionRuleError",
+  "SecretError",
 ]);
 export const HTTP_METHODS = set([
   "GET",
@@ -99,6 +102,38 @@ export const SKILL_CODES = set([
   "skill_bad_output",
   "skill_changed",
 ]);
+/** Connection test outcomes (#17, connections/tester.ts): fixed codes only. */
+export const TEST_CODES = set([
+  "ok",
+  "test_no_reply",
+  "test_no_stream",
+  "test_no_tool",
+  "test_no_skill",
+  "timeout",
+  "cancelled",
+  "usage_limit",
+  "no_runtime",
+  "runtime_auth",
+  "runtime_error",
+  "runtime_policy",
+  "no_connection",
+]);
+export const isTestCode = member(TEST_CODES);
+/** `.env` import (#17): which value, and why it was not imported (fixed codes only). */
+export const isImportItem = member(set(["claude_api_key", "claude_oauth_token", "codex_api_key"]));
+export const isImportCode = member(
+  set([
+    "import_failed",
+    "invalid_secret",
+    "invalid_request",
+    "subscription_not_allowed",
+    "shared_subscription",
+    "unsupported_auth",
+    "not_found",
+  ]),
+);
+export const isConnectionScope = member(set(["shared", "personal"]));
+export const isAuthType = member(set(["api_key", "subscription"]));
 
 export const isRuntime = member(RUNTIMES);
 export const isSkillCode = member(SKILL_CODES);

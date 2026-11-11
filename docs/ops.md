@@ -13,7 +13,8 @@
 | 암호화 마스터 키 | `~/.agentlee/master.key` | `MASTER_KEY_PATH` | **포함하지 않음** — 아래 3절 |
 | 서버 전용 스킬 폴더 (#21) | `<DATA_DIR>/skills/<스킬>/` (허용 목록 스킬의 복사본, 읽기 전용) | `pnpm skills:install` — 15절 | 포함(코드일 뿐, 비밀 없음) |
 | 스킬 비밀 (#21) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY` | 15.3절 | `.env`와 같다 |
-| 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 11절 |
+| 런타임 연결 키·토큰 (#17) | DB `connections.secret`(마스터 키로 암호화) | 설정 → 내 런타임 연결, 관리자 API — 11절 | DB와 함께 포함(암호문) |
+| 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
 - 서버는 `MASTER_KEY_PATH`가 `DATA_DIR` 안에 있으면 시작을 거부한다.
@@ -213,23 +214,73 @@ rm ~/.agentlee/probe-headers.txt
 3. 가족에게 임시 비밀번호를 직접 전달하고, 휴대폰에서 Access 코드 로그인 → 앱 로그인이 되는지 함께 확인한다.
 4. 가족을 비활성화하면 같은 정책에서 이메일을 지운다. **관리자 이메일(`ingki3@gmail.com`)은 지우지 않는다.**
 
-## 11. Claude Code 연결 (임시 — 앱 안 연결 관리 #17 전까지)
-`.env`에만 넣는다. 저장소·로그·디스크에 남지 않는다. 런타임 프로세스에는 환경 변수로만 넘긴다.
+## 11. 런타임 연결 (#17)
+연결은 앱 안에서 만든다. 하나의 연결은 **런타임 × 인증 방식 × 범위**다(PRD D2, FR-11).
 
-- `CLAUDE_OAUTH_TOKEN`
-  - 관리자 본인 Claude 구독 토큰이다. 터미널에서 `claude setup-token`을 실행해 받는다.
-  - **관리자 본인 대화에만** 쓰인다(PRD D2). 관리자 계정 이메일이 `ADMIN_EMAIL`과 같아야 한다.
-- `CLAUDE_API_KEY`
-  - Anthropic API 키(`sk-ant-…`)다.
-  - 가족 모두가 쓴다. 관리자도 구독 토큰이 없으면 이 키를 쓴다.
-- CLI 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`. 안에는 `config`(세션·설정), `home`, `work`, `tmp`가 있다.
-  - CLI는 이 폴더만 읽고 쓴다(샌드박스).
-  - 서버만 쓰는 세션 정보(시작 시스템 프롬프트, 누적 비용)는 폴더 밖 `<…>-meta/`에 둔다.
-- 네트워크는 루프백만 쓴다: 우리 MCP 포트와 서버 안의 송신 프록시.
-  - 인터넷은 프록시(`HTTPS_PROXY`)로만 나간다. 프록시는 `api.anthropic.com:443`의 CONNECT만 통과시키고, 사설·루프백 주소는 거부한다.
-  - 터널은 최대 64개까지 열고, 5분 동안 오가는 데이터가 없으면 닫는다.
+| 범위 | 누가 만드나 | 누가 쓰나 | 인증 방식 |
+|---|---|---|---|
+| 가족 공용 | 관리자 (`/api/admin/connections`, 관리자 화면 "런타임" 탭은 #35) | 관리자가 허용한 가족 | API 키만 |
+| 개인 | 본인 (설정 → **내 런타임 연결**) 또는 관리자가 대신 등록(`/api/admin/users/:id/connections`) | 본인만 | API 키, 또는 구독 |
+
+- **규칙**(서버가 강제한다)
+  - 공용 연결은 API 키만 받는다. 공용 구독을 만들려 하면 400 `shared_subscription`이다.
+  - 연결의 범위는 바꿀 수 없다. 요청 본문에 `scope`가 있으면 400 `scope_immutable`이다.
+  - **Claude 구독**(`claude setup-token`으로 받은 토큰)은 관리자 본인 계정에만 만들 수 있다. 다른 계정에 만들려 하면 403 `subscription_not_allowed`이다. 관리자가 관리자 권한을 잃으면 그 연결은 더 쓰이지 않는다.
+  - **Codex 구독**(가족 각자의 ChatGPT 로그인)은 #18에서 한다. 지금은 400 `unsupported_auth`이다.
+  - 키 형식이 다르면 400 `invalid_secret`이다. Anthropic은 `sk-ant-…`, OpenAI는 `sk-…`이다.
+- **테스트를 통과한 연결만 쓴다.**
+  - 추가하거나 키를 바꾸면 상태가 `untested`가 된다. 키를 바꾸면 옛 키로 진행 중인 실행도 멈춘다(해제와 같은 방식). "테스트"를 누르면 실제 세션을 하나 연다.
+  - 짧은 프롬프트로 네 가지를 확인한다: 응답, 스트리밍, 공통 MCP 도구 `echo_time` 호출, 검증용 스킬 `skill_selftest` 실행. 스킬은 임의 문자열의 SHA-256으로 확인한다.
+  - 도구를 쓰는 런타임이면, 두 호출을 **우리 MCP 서버가 실제로 처리했는지**도 확인한다.
+  - 테스트도 실행과 같은 허용 정책을 따른다(런타임·모델·추론 강도·개인/공용 연결). 다른 점은 하나뿐이다: 연결이 아직 `passed`가 아니어도 된다. 허용되지 않으면 403이다.
+  - 테스트에는 **허용된** 모델 중 가장 작은 모델(목록의 마지막)을, 허용된 가장 낮은 추론 강도로 쓴다. 제한 시간은 2분이다.
+  - 테스트 중에 연결을 해제하거나 키를 바꾸면 테스트를 멈춘다. 세션을 여는 중이어도 같다.
+    - 순서: MCP 토큰 폐기 → 어댑터에 취소 신호 → 런타임 프로세스 종료 확인(응답이 없으면 강제 종료) → 그다음 연결 폴더 삭제.
+    - 결과는 `cancelled`이고 기록하지 않는다. 결과는 시험한 키 버전에만 기록한다.
+  - 결과는 `passed`나 `failed`(코드 포함)이다. `passed`만 선택기(`GET /api/runtimes`)에 나오고 실행에 쓰인다.
+- **어떤 연결을 쓰나**
+  - 기본은 개인 연결이다. 없으면 공용 연결을 쓴다.
+  - 요청에 `useShared: true`가 있으면 공용 연결을 쓴다. 연결을 콕 집으려면 `connectionId`를 쓴다.
+  - 개인 연결이 한도에 걸렸고 공용 연결을 쓸 수 있으면, 대화에 `personal_limit_use_shared` 안내가 뜬다. 사용자가 `useShared: true`로 다시 보내면 그 선택이 run에 기록된다(`runs.use_shared`).
+- **허용 정책**(`runtime_policies`, 관리자 `PUT /api/admin/users/:id/runtime-policies`)
+  - 사용자별·런타임별로 정한다: 런타임 허용, 모델 목록, 추론 강도 목록, 개인 연결 허용, 공용 연결 허용.
+  - 행이 없으면 그 사용자의 `permissions`(런타임·모델)를 따른다. 그때는 모든 추론 강도와 두 종류의 연결을 허용한다.
+  - 추론 강도를 받는 모델인데 허용된 값이 하나도 없으면 그 모델은 쓸 수 없다(추론 강도를 빼고 보내도 403). 추론 강도 설정이 없는 모델은 그대로 쓸 수 있다.
+  - 보내기·고치기·다시 생성은 모두 같은 검사 함수를 거친다(`connections/access.ts`). 허용되지 않은 런타임·모델·추론 강도·연결은 403이다(`runtime_not_allowed`, `model_not_allowed`, `effort_not_allowed`, `connection_not_allowed`). 이때 메시지는 만들어지지 않는다.
+- **끊김·만료**
+  - 실행 중 공급자가 키나 토큰을 거부하면(`runtime_auth`) 응답은 오류로 끝나고, 대화에 "○○ 연결이 끊겼어요" 안내가 뜬다.
+  - 연결은 `expired`가 된다. 단, run이 쓴 키 버전이 지금 버전일 때만이다(`connections.credential_version`, `runs.connection_version`). 키를 바꾼 뒤 옛 키로 돌던 run이 실패해도 새 키는 그대로다. 개인 연결이면 주인에게 `connection_lost` 알림을, 공용 연결이면 관리자에게 `system_warning` 알림을 한 번 보낸다.
+  - 다시 쓰려면 키를 새로 넣고 테스트한다.
+- **해제**
+  - 대화 기록은 남는다.
+  - 키는 지워진다. 그 연결로 만든 런타임 세션은 무효가 되고, 다시 이어 쓰지 않는다. 같은 연결의 세션만 이어 쓰는 규칙이 하나 더 있다.
+  - 진행 중인 실행과 연결 테스트는 멈춘다. 세션을 여는 중이면 취소 신호로 런타임 프로세스를 죽인다. 이미 끝난 실행이라도(예: 중지 뒤 유예 시간이 지남) 세션 열기·닫기가 남아 있으면 그것까지 기다린다. 세션을 여는 중에 중지를 누르면 열기도 바로 취소한다. 프로세스가 끝난 것을 확인한 뒤(응답이 없으면 강제 종료, 최대 10초) 연결 폴더(`DATA_DIR/runtimes/<연결 id>/`)도 지운다.
+- **비밀 보관**
+  - 키와 토큰은 마스터 키로 암호화해 DB `connections.secret`에 둔다(AES-256-GCM, AAD `connection:<id>:<런타임>:<인증 방식>`).
+  - 어떤 API 응답에도 원문이 없다. 화면에는 끝 4자리(`••••abcd`)만 보인다. 관리자도 다른 사람의 개인 연결 원문은 볼 수 없다(삭제만 할 수 있다).
+  - 로그에는 연결 id·런타임·범위·인증 방식·테스트 코드만 남는다.
+  - 런타임에 넘길 때: Claude는 자식 프로세스 환경 변수로만, Codex는 stdin의 `account/login/start`로만 넘긴다.
+- **폴더**: 연결과 사용자마다 `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`이다. 서버만 쓰는 세션 정보는 `<…>-meta/`에 둔다.
+  - Claude: `config`(세션·설정), `home`, `work`, `tmp`.
+  - Codex: 13절을 본다.
+  - CLI는 이 폴더만 읽고 쓴다(샌드박스). 네트워크는 루프백만 쓴다: 우리 MCP 포트와 런타임별 송신 프록시(Claude는 `api.anthropic.com:443`, Codex는 `api.openai.com:443`만).
+- **`.env`에서 옮기기**(#17 이전 설치)
+  - `CLAUDE_API_KEY`·`CLAUDE_OAUTH_TOKEN`·`CODEX_API_KEY`가 `.env`에 있으면, 서버가 시작할 때 **한 번만** DB 연결로 가져온다.
+    - `CLAUDE_API_KEY` → 공용 Claude Code API 키 연결
+    - `CLAUDE_OAUTH_TOKEN` → 관리자(`ADMIN_EMAIL`) 본인의 개인 Claude 구독 연결. 관리자 계정이 아직 없으면 다음 시작 때 가져온다(첫 실행 화면에서 관리자를 만든 뒤 한 번 재시작).
+    - `CODEX_API_KEY` → 공용 Codex API 키 연결
+  - 가져온 연결은 바로 테스트한다. 그래서 설정이 그대로 동작한다.
+    - 테스트가 아직 안 된(`untested`) 가져온 연결은 **시작할 때마다** 다시 테스트한다. 테스트 전에 서버가 멈췄어도 다음 시작에 회복된다.
+    - 관리자 계정이 있어야 테스트할 수 있다. 없으면 다음 시작이나 관리자가 앱에서 테스트한다.
+  - 가져왔다는 표시는 `settings` 표의 `connections.env_imported.*`에 남는다. 같은 값을 다시 가져오지 않는다.
+  - 실패했을 때:
+    - 연결과 표시는 **전부 한 트랜잭션**으로 쓴다. 중간에 DB 오류가 나면 이번 가져오기 전체가 없던 일이 된다(`import_failed`).
+    - 규칙에 맞지 않는 값 하나(예: 키 형식 `invalid_secret`)는 그 값만 건너뛰고 표시도 남기지 않는다. 나머지는 가져온다. 설정 단계(`config.ts`)는 이 세 값의 형식을 검사하지 않는다 — 형식이 틀려도 서버는 시작하고, 형식 검사는 가져오기의 연결 규칙이 한다.
+    - 어느 경우든 **서버는 정상으로 시작한다**. 실패는 로그(`connection.import_failed`, 항목과 코드만)와 관리자 API `GET /api/admin/connections`의 `importFailures`에 나온다.
+    - `.env`를 고치고 재시작하면 다시 가져온다.
+  - 가져온 뒤에는 `.env`에서 세 값을 지운다. 값을 바꿔도 다시 가져오지 않으니, 새 키는 앱에서 넣는다.
 - 자식 프로세스는 만들 수 없다. 프롬프트는 쓴 그대로 넘긴다(`@파일`·슬래시 명령을 해석하지 않는다).
-- 녹화 갱신: CI는 녹화된 응답을 재생한다. SDK 버전을 올렸거나 동작이 바뀌었다고 의심되면 다시 녹화한다.
+- Claude 녹화 갱신: CI는 녹화된 응답을 재생한다. SDK 버전을 올렸거나 동작이 바뀌었다고 의심되면 다시 녹화한다.
   ```
   pnpm --filter @agentlee/server exec tsx --conditions=development test/record-claude.ts
   ```
@@ -282,17 +333,15 @@ rm ~/.agentlee/probe-headers.txt
 - 실기기(Android Chrome, iPhone 홈 화면 앱): `docs/evidence/push/checklist.md`를 따라 하고 결과를 그 파일에 적는다. 휴대폰은 HTTPS가 필요하므로 `https://chat.2prostream.com`으로 접속한다.
 - 문제 확인: `jq -c 'select(.msg|startswith("push."))' /Library/Logs/agentlee/server.log` — 보낸 수, 받은 기기 수, 실패 상태 코드만 나온다.
 
-## 13. Codex 연결 (임시 — 앱 안 연결 관리 #17 전까지)
-`.env`에만 넣는다. 저장소·로그·디스크에 남지 않는다.
+## 13. Codex 실행 (#16)
+연결(OpenAI API 키, 개인 또는 공용)은 11절대로 앱 안에서 만든다.
 
-- `CODEX_API_KEY`
-  - OpenAI API 키(`sk-…`)다. 가족 모두가 쓴다.
-  - app-server에는 환경 변수가 아니라 시작 직후 stdin의 `account/login/start`로만 넘긴다. 메모리에만 있다(`cli_auth_credentials_store = "ephemeral"`, `auth.json` 없음).
-  - 가족 각자의 ChatGPT 로그인(PRD D2)은 #18에서 한다. app-server의 `chatgptDeviceCode` 로그인이나 `chatgptAuthTokens` 주입을 쓰고, 둘 다 같은 방식으로 메모리에만 둔다.
+- 키는 app-server에 환경 변수가 아니라 시작 직후 stdin의 `account/login/start`로만 넘긴다. 메모리에만 있다(`cli_auth_credentials_store = "ephemeral"`, `auth.json` 없음).
+- 가족 각자의 ChatGPT 로그인(PRD D2)은 #18에서 한다. app-server의 `chatgptDeviceCode` 로그인이나 `chatgptAuthTokens` 주입을 쓰고, 둘 다 같은 방식으로 메모리에만 둔다.
 - 실행 파일은 의존성으로 고정한 `@openai/codex` **0.165.0**의 플랫폼 바이너리다. PATH의 `codex`와 `~/.codex`는 쓰지 않는다.
   - 버전을 올릴 때는 `pnpm -s test`의 macOS 실바이너리 시험(`apps/server/test/codex.test.ts`)이 통과해야 한다. 이 시험은 설정 키, 모델 표, 노출 도구, fork 없음, 확장 없음을 확인한다.
   - 그다음 `docs/decisions/runtime-capabilities.md` 2.4절을 갱신한다.
-- 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/codex-api-key/<사용자 id>/`.
+- 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`.
   - 안에는 `codex-home`(CODEX_HOME: 우리 `config.toml`·`agentlee-models.json`·thread 기록), `home`, `work`, `tmp`가 있다.
   - 프로세스는 이 폴더만 읽는다. 쓰기는 `codex-home`·`tmp`에만 한다.
   - 서버만 쓰는 thread 정보(시작 지시문·이전 대화)는 폴더 밖 `<…>-meta/`에 둔다.

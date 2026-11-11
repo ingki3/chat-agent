@@ -21,6 +21,7 @@ import {
   type RuntimeEvent,
   type RuntimeSession,
   type RuntimeTurn,
+  type ConnectionRequest,
   type StartContext,
 } from "./adapter.js";
 import { assertOnlyOurMcp, claudeLockdown, mcpLoopbackPort, OUR_TOOL_PREFIX } from "./lockdown.js";
@@ -65,8 +66,11 @@ export const CLAUDE_MODELS: ModelCapability[] = [
 ];
 
 export type ClaudeAdapterOptions = {
-  /** The connection this user may use, or undefined (the run then fails with `no_connection`). */
-  connection(userId: string): ClaudeConnection | undefined;
+  /**
+   * The run's connection (`ctx.connectionId`) for this user, or undefined when it is gone or not theirs to use
+   * (the run then fails with `no_connection`). Connections live in the database (#17, connections/store.ts).
+   */
+  connection(ctx: ConnectionRequest): ClaudeConnection | undefined;
   models?: ModelCapability[];
   /** Claude Code executable. Default: the SDK's own platform binary. */
   executable?: string;
@@ -195,7 +199,13 @@ export class ClaudeAdapter implements RuntimeAdapter {
   }
 
   capabilities(): RuntimeCapabilities {
-    return { models: this.models, canSwitchModelInSession: true, canResume: true, usesTools: true };
+    return {
+      models: this.models,
+      canSwitchModelInSession: true,
+      canResume: true,
+      usesTools: true,
+      needsConnection: true,
+    };
   }
 
   async start(ctx: StartContext): Promise<RuntimeSession> {
@@ -217,7 +227,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
   }
 
   private connectionFor(ctx: StartContext): ClaudeConnection {
-    const conn = this.opts.connection(ctx.userId);
+    const conn = this.opts.connection(ctx);
     if (!conn) throw new RuntimeFailure("no_connection");
     return conn;
   }
@@ -230,6 +240,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
   }
 
   private async open(ctx: StartContext, s: { sessionId: string; fresh: boolean }): Promise<RuntimeSession> {
+    /** Cancelled (ctx.signal): nothing more is written to the folder and no CLI is started. */
+    const cancelled = () => {
+      if (ctx.signal?.aborted) throw new RuntimeFailure("runtime_error");
+    };
+    cancelled();
     const conn = this.connectionFor(ctx);
     this.checkModel(ctx.model, ctx.effort);
     ensureDirs(conn.dir);
@@ -241,6 +256,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const mcpPort = ctx.mcp ? mcpLoopbackPort(ctx.mcp) : undefined;
     const proxy = this.opts.egress ? await this.opts.egress.endpoint() : undefined;
     if (proxy) Object.assign(env, { HTTPS_PROXY: proxy.url, NO_PROXY: "127.0.0.1,localhost" });
+    cancelled();
     // The system prompt is fixed when the session starts (with the history it was given) and reused on resume.
     const meta: SessionMeta = s.fresh
       ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx.history), costUsd: 0 }
@@ -249,6 +265,32 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const run = this.opts.query ?? sdkQuery;
     let current: Query | undefined;
     let closed = false;
+    /** CLI processes of this session: closing (or a cancel) waits until they have exited. */
+    const procs = new Set<SpawnedProcess>();
+    const killAll = async () => {
+      current?.close();
+      const waits = [...procs].map(
+        (p) =>
+          new Promise<void>((resolve) => {
+            if (p.exitCode !== null || p.signalCode) return resolve();
+            const timer = setTimeout(() => {
+              p.kill("SIGKILL"); // did not end on the SDK's close: forced
+              resolve();
+            }, 2000);
+            timer.unref();
+            p.once("exit", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+          }),
+      );
+      await Promise.all(waits);
+    };
+    const onAbort = () => {
+      closed = true;
+      void killAll();
+    };
+    ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
     const spawnClaudeCodeProcess = (o: SpawnOptions): SpawnedProcess => {
       const command = fs.realpathSync(o.command);
@@ -256,7 +298,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       const sdkVars = Object.fromEntries(
         Object.entries(o.env).filter(([k, v]) => SDK_ENV.test(k) && v !== undefined && !(k in env)),
       ) as Record<string, string>;
-      return spawnFn({
+      const p = spawnFn({
         command,
         args: o.args,
         cwd: paths.work,
@@ -267,6 +309,9 @@ export class ClaudeAdapter implements RuntimeAdapter {
         network: { loopbackPorts: [mcpPort, proxy?.port].filter((p): p is number => p !== undefined) },
         maxRssBytes,
       });
+      procs.add(p);
+      p.once("exit", () => procs.delete(p));
+      return p;
     };
 
     const session: RuntimeSession = {
@@ -277,10 +322,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
       },
       close: async () => {
         closed = true;
-        current?.close();
+        ctx.signal?.removeEventListener("abort", onAbort);
+        await killAll();
       },
       turn: (input): RuntimeTurn => {
-        if (closed) throw new Error("session closed");
+        if (closed || ctx.signal?.aborted) throw new Error("session closed");
         this.checkModel(input.model, input.effort);
         let endInput!: () => void;
         const inputDone = new Promise<void>((r) => (endInput = r));

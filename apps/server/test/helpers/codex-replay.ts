@@ -41,8 +41,10 @@ export type ReplayLog = {
   requests: { method: string; params: Json }[];
   errors: string[];
   kills: number;
+  /** Processes that have exited (their `exit` event was emitted). */
+  exits: number;
 };
-export const newLog = (): ReplayLog => ({ spawns: [], requests: [], errors: [], kills: 0 });
+export const newLog = (): ReplayLog => ({ spawns: [], requests: [], errors: [], kills: 0, exits: 0 });
 
 let seq = 0;
 const uuid = () => {
@@ -68,6 +70,10 @@ export function replaySpawn(
     /** Sent once a turn's recording has played out, before anything else (between turns). */
     afterTurn?: Json[];
     serverRequestAt?: { prompt: string; method: string };
+    /** `initialize` is answered only once this settles (a slow start, e.g. to cancel while it opens). */
+    initializeGate?: Promise<unknown>;
+    /** The process takes this long to exit after it was killed (default: next tick). */
+    exitDelayMs?: number;
   } = {},
 ): (s: SpawnIsolatedOptions) => CodexChild {
   return (s) => {
@@ -79,7 +85,12 @@ export function replaySpawn(
     const exit = () => {
       if (exited) return;
       exited = true;
-      setImmediate(() => ev.emit("exit", 0, null));
+      const emitExit = () => {
+        log.exits++;
+        ev.emit("exit", 0, null);
+      };
+      if (o.exitDelayMs) setTimeout(emitExit, o.exitDelayMs);
+      else setImmediate(emitExit);
     };
     const send = (m: Json) => {
       if (!exited) stdout.write(JSON.stringify(m) + "\n");
@@ -175,8 +186,10 @@ export function replaySpawn(
         const fail = () => send({ id: m.id, error: { code: -32600, message: "no" } });
         switch (m.method) {
           case "initialize":
-            reply({ userAgent: "replay", codexHome, platformFamily: "unix", platformOs: "macos" });
-            for (const n of o.atStart ?? []) send(n);
+            void Promise.resolve(o.initializeGate).then(() => {
+              reply({ userAgent: "replay", codexHome, platformFamily: "unix", platformOs: "macos" });
+              for (const n of o.atStart ?? []) send(n);
+            });
             break;
           case "account/login/start":
             reply({ type: "apiKey" });

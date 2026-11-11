@@ -91,7 +91,28 @@ const pushDevice = (f: Family) => {
   });
 };
 
+/** A personal Claude API key connection of `owner` (#17). */
+const connection = (f: Family) =>
+  f.app.connections!.store.create({
+    runtime: "claude-code",
+    authType: "api_key",
+    scope: "personal",
+    owner: f.users.owner,
+    createdBy: f.users.owner.id,
+    secret: `sk-ant-matrix${"x".repeat(24)}`,
+  }).id;
+
 export const APP_MATRIX: MatrixRow[] = [
+  { route: "GET /api/connections/:id", expect: OWNER_ONLY, fixture: connection },
+  {
+    route: "PATCH /api/connections/:id",
+    expect: OWNER_ONLY,
+    fixture: connection,
+    body: { label: "새 이름" },
+  },
+  { route: "DELETE /api/connections/:id", expect: OWNER_ONLY, fixture: connection },
+  // No runtime in the matrix app: the test answers 200 with a failed result.
+  { route: "POST /api/connections/:id/test", expect: OWNER_ONLY, fixture: connection },
   { route: "POST /api/notifications/:id/read", expect: OWNER_ONLY, fixture: notification },
   { route: "DELETE /api/push/devices/:id", expect: OWNER_ONLY, fixture: pushDevice },
   { route: "GET /api/runs/:id", expect: NOT_SHARED(READ), fixture: run },

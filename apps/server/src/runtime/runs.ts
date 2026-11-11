@@ -1,7 +1,15 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { and, asc, eq, gt, inArray, isNotNull, lt, sql } from "drizzle-orm";
-import { publicParts, StreamEvent, type MessagePart, type Run, type RuntimeId } from "@agentlee/shared";
+import {
+  publicParts,
+  StreamEvent,
+  type MessagePart,
+  type Run,
+  type RunChoice,
+  type RuntimeId,
+} from "@agentlee/shared";
+import type { RunSettings, RunSettingsInput } from "../connections/access.js";
 import type { ConversationStore, MessageRow } from "../conversations/store.js";
 import type { Db } from "../db/client.js";
 import { runEvents, runs, users } from "../db/schema.js";
@@ -34,6 +42,15 @@ function trustOurTools(names: string[]): string[] {
 /** In-memory state of a run that is being executed by this process. */
 type Live = {
   conversationId: string;
+  /** The run's runtime connection (#17), if any. */
+  connectionId: string | null;
+  /**
+   * Given to the adapter as `StartContext.signal`: stopping the connection (disconnect, new key) aborts opening the
+   * session, so the adapter kills its process instead of carrying on into the removed folder (#17).
+   */
+  abort: AbortController;
+  /** Settles when `execute` has returned (the session open, if any, has settled too). */
+  done: Promise<void>;
   emitter: EventEmitter;
   session?: RuntimeSession;
   turn?: RuntimeTurn;
@@ -119,6 +136,7 @@ export function toRun(r: RunRow): Run {
     runtime: r.runtime,
     model: r.model,
     effort: r.effort ?? null,
+    connectionId: r.connectionId ?? null,
     createdAt: r.createdAt,
     endedAt: r.endedAt ?? null,
   };
@@ -131,7 +149,8 @@ const FAILURE_TEXT: Record<string, string> = {
   server_restart: "서버 재시작으로 중단됐어요. 다시 생성해 주세요.",
   usage_limit: "사용 한도에 도달했어요.",
   runtime_auth: "런타임 로그인이 만료됐거나 키가 맞지 않아요 — 관리자에게 문의하세요.",
-  no_connection: "이 런타임을 쓸 수 있는 연결이 없어요 — 관리자에게 문의하세요.",
+  no_connection:
+    "이 런타임을 쓸 수 있는 연결이 없어요 — 설정 → 내 런타임 연결에서 연결하거나 관리자에게 문의하세요.",
   runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요.",
 };
 
@@ -161,6 +180,16 @@ export type RunManagerOptions = {
   log?: EventLogger;
   /** Recent errors for the admin screen (#46). */
   errors?: ErrorLog;
+  /**
+   * Runtime connections (#17). `resolve` checks the run's runtime, model, effort and connection (throws
+   * `RunAccessDenied` → 403, inside the begin transaction so nothing is created) and picks the connection;
+   * `runFailed` reacts to a failed run on a connection (expiry, limits) with notices for the stream.
+   * Without it every model of the adapter is allowed and no connection is chosen (tests of the run manager alone).
+   */
+  connections?: {
+    resolve(input: RunSettingsInput): RunSettings;
+    runFailed(run: RunRow, code: string): StreamEvent[];
+  };
 };
 
 /**
@@ -170,6 +199,16 @@ export type RunManagerOptions = {
  */
 export class RunManager {
   private readonly live = new Map<string, Live>();
+  /**
+   * Runtime sessions per connection (#17), by their whole lifetime — opening, running, closing — not only while
+   * the run is live: a run that was ended (e.g. after the interrupt grace period) while its session was still
+   * opening stays here until that open has failed or the session has closed. `stopConnection` aborts and awaits all
+   * of them before the connection's folder may go.
+   */
+  private readonly sessionsByConnection = new Map<
+    string,
+    Set<{ abort: AbortController; work: Promise<void> }>
+  >();
   /** MCP call tokens: one per run, revoked when the run ends (#42). */
   readonly mcpTokens: McpTokens;
   /** Set by shutdown(): no new run may start after that. */
@@ -245,6 +284,8 @@ export class RunManager {
     conversationId: string;
     userId: string;
     idempotencyKey?: string | undefined;
+    /** Runtime, model, effort and connection asked for by the request (#17); checked by `opts.connections`. */
+    choice?: RunChoice | undefined;
     prepare: () => { user: MessageRow | null; assistant: MessageRow };
   }): { run: RunRow; user: MessageRow | null; assistant: MessageRow; reused: boolean } {
     if (this.stopping) throw new ShuttingDownError();
@@ -267,13 +308,29 @@ export class RunManager {
         const { user, assistant } = input.prepare();
         // Settings: a regenerated reply keeps its runtime and model; otherwise the conversation's last runtime.
         // Per-user defaults and fallbacks come with #19; per-conversation choice with #19/#45.
+        const choice = input.choice ?? {};
         const runtime =
+          choice.runtime ??
           (assistant.runtime as RuntimeId | null) ??
           (conv.lastRuntime as RuntimeId | null) ??
           DEFAULT_RUNTIME;
-        const adapter = this.registry.get(runtime) ?? this.registry.get(this.registry.ids()[0]!);
+        // An explicitly chosen runtime is never swapped for another one.
+        const adapter =
+          this.registry.get(runtime) ??
+          (choice.runtime ? undefined : this.registry.get(this.registry.ids()[0]!));
         const models = adapter?.capabilities().models ?? [];
-        const model = models.find((m) => m.id === assistant.model) ?? models[0];
+        // #17: the user's policy decides (403 for explicit choices it does not allow); throwing rolls back prepare().
+        const settings =
+          adapter && this.opts.connections
+            ? this.opts.connections.resolve({
+                userId: input.userId,
+                runtime: adapter.id,
+                capabilities: adapter.capabilities(),
+                requested: choice,
+                current: { model: assistant.model, effort: assistant.effort },
+              })
+            : undefined;
+        const model = settings?.model ?? models.find((m) => m.id === assistant.model) ?? models[0];
         const run: RunRow = {
           id: crypto.randomUUID(),
           conversationId: input.conversationId,
@@ -284,9 +341,15 @@ export class RunManager {
           errorCode: null,
           runtime: adapter?.id ?? runtime,
           model: model?.id ?? assistant.model ?? "unknown",
-          effort:
-            (model && assistant.model === model.id ? assistant.effort : null) ?? model?.defaultEffort ?? null,
           instructions: null,
+          effort: settings
+            ? settings.effort
+            : ((model && assistant.model === model.id ? assistant.effort : null) ??
+              model?.defaultEffort ??
+              null),
+          connectionId: settings?.connectionId ?? null,
+          connectionVersion: settings?.connectionVersion ?? null,
+          useShared: settings?.useShared ?? false,
           idempotencyKey: input.idempotencyKey ?? null,
           nextEventSeq: 1,
           createdAt: this.now(),
@@ -298,17 +361,24 @@ export class RunManager {
             runtime: run.runtime,
             model: run.model,
             effort: run.effort,
+            connectionId: run.connectionId,
           });
         // Nothing to run it with: fail right here, so the conversation is free again at once.
         if (!adapter) this.finish(run, "failed", "no_runtime");
+        else if (adapter.capabilities().needsConnection && this.opts.connections && !run.connectionId)
+          this.finish(run, "failed", "no_connection");
         return { run, user, assistant, reused: false };
       })
       .immediate();
     // The persisted status decides: a run that already failed inside the transaction (no runtime) is not started.
     const run = this.get(created.run.id)!;
     if (!created.reused && run.status === "queued") {
+      let executed!: () => void;
       this.live.set(run.id, {
         conversationId: run.conversationId,
+        connectionId: run.connectionId,
+        abort: new AbortController(),
+        done: new Promise<void>((r) => (executed = r)),
         emitter: new EventEmitter(),
         parts: [],
         interruptRequested: false,
@@ -317,9 +387,24 @@ export class RunManager {
         outputTokens: 0,
         tools: new Map(),
       });
+      const live = this.live.get(run.id)!;
+      if (run.connectionId) {
+        const set = this.sessionsByConnection.get(run.connectionId) ?? new Set();
+        this.sessionsByConnection.set(run.connectionId, set);
+        // Over when execute has returned (an open still pending has settled) and the session is closed.
+        const entry = { abort: live.abort, work: live.done.then(() => closeSession(live)) };
+        set.add(entry);
+        void entry.work.finally(() => {
+          set.delete(entry);
+          if (!set.size && this.sessionsByConnection.get(run.connectionId!) === set)
+            this.sessionsByConnection.delete(run.connectionId!);
+        });
+      }
       // Detached from the request: the run outlives the HTTP connection. Nothing may escape as a rejection.
       setImmediate(() => {
-        this.execute(run.id).catch(() => this.settle(run.id, "failed", "runtime_error"));
+        this.execute(run.id)
+          .catch(() => this.settle(run.id, "failed", "runtime_error"))
+          .finally(executed);
       });
     }
     return { ...created, run };
@@ -339,6 +424,8 @@ export class RunManager {
         this.opts.interruptGraceMs ?? 3000,
       );
       live.graceTimer.unref();
+      // A session still opening can do nothing useful any more: abort it (the adapter kills its process).
+      if (!live.session) live.abort.abort();
       // Not awaited: the request returns at once; the grace timer ends the run if the runtime never stops.
       fireInterrupt(live);
     } else if (!live) {
@@ -346,6 +433,27 @@ export class RunManager {
       if (r && (r.status === "queued" || r.status === "running")) this.finish(r, "interrupted", null);
     }
     return this.get(id);
+  }
+
+  /**
+   * Stops every queued or running run on a connection (it was disconnected or got a new key, #17) and resolves once
+   * their runtimes are gone: a session still opening is aborted (the adapter kills its process), an open one is
+   * interrupted and closed. Waits at most `ms` per run — by then the adapters have force-killed their processes.
+   * Only after this may the connection's folder be removed.
+   */
+  async stopConnection(connectionId: string, ms = 10_000): Promise<void> {
+    // Every session of this connection, including those of runs that have already ended while still opening.
+    const mine = [...(this.sessionsByConnection.get(connectionId) ?? [])];
+    for (const e of mine) e.abort.abort();
+    for (const r of this.db
+      .select()
+      .from(runs)
+      .where(and(eq(runs.connectionId, connectionId), inArray(runs.status, ["queued", "running"])))
+      .all())
+      void this.interrupt(r.id);
+    await Promise.all(
+      mine.map((e) => Promise.race([e.work, new Promise<void>((r) => setTimeout(r, ms).unref())])),
+    );
   }
 
   /** Events after `afterSeq`, in order. */
@@ -393,6 +501,7 @@ export class RunManager {
     for (const live of lives) {
       clearTimeout(live.graceTimer);
       live.settled = true;
+      if (!live.session) live.abort.abort(); // sessions still opening: their processes go too
       fireInterrupt(live);
       live.emitter.emit("end"); // closes the SSE streams following these runs
     }
@@ -441,6 +550,8 @@ export class RunManager {
     if (!live || live.settled) return;
     live.settled = true;
     clearTimeout(live.graceTimer);
+    // Ended while its session was still opening (the grace period ran out): that open is cancelled.
+    if (!live.session) live.abort.abort();
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
@@ -451,6 +562,7 @@ export class RunManager {
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
   private drop(runId: string, live: Live): void {
     this.mcpTokens.revokeRun(runId);
+    if (!live.session) live.abort.abort();
     live.settled = true;
     clearTimeout(live.graceTimer);
     fireInterrupt(live);
@@ -540,6 +652,9 @@ export class RunManager {
     const ctx: StartContext = {
       conversationId: run.conversationId,
       userId: run.userId,
+      connectionId: run.connectionId ?? undefined,
+      connectionVersion: run.connectionVersion ?? undefined,
+      signal: live.abort.signal,
       history: history.map((m) => ({ role: m.role, parts: publicParts(m.parts as MessagePart[]) })),
       systemPrompt: instructions.text,
       model: run.model,
@@ -564,15 +679,15 @@ export class RunManager {
     const lastSeen = history.at(-1)?.id ?? null;
     const prev = !adapter.capabilities().canResume
       ? undefined
-      : this.conversations
-          .sessions(run.conversationId)
-          .find(
-            (s) =>
-              s.runtime === run.runtime &&
-              s.conversationRevision === conv.revision &&
-              s.lastMessageId === lastSeen &&
-              s.instructionsHash === instructions.hash,
-          );
+      : this.conversations.sessions(run.conversationId).find(
+          (s) =>
+            s.runtime === run.runtime &&
+            // A session lives in its connection's folder: only the same connection may resume it (#17).
+            (s.connectionId ?? null) === (run.connectionId ?? null) &&
+            s.conversationRevision === conv.revision &&
+            s.lastMessageId === lastSeen &&
+            s.instructionsHash === instructions.hash,
+        );
     if (prev) {
       try {
         return {
@@ -593,6 +708,7 @@ export class RunManager {
       const row = this.conversations.saveSession({
         conversationId: run.conversationId,
         runtime: run.runtime,
+        connectionId: run.connectionId,
         externalSessionId: session.externalSessionId,
         lastMessageId: lastSeen,
         conversationRevision: conv.revision,
@@ -714,6 +830,10 @@ export class RunManager {
         }
       }
     }
+    // A failure on a connection (expired credential, personal limit): its notices go out before the error (#17).
+    if (outcome.status === "failed" && run.connectionId && !live.settled)
+      for (const ev of this.opts.connections?.runFailed(run, outcome.code ?? "runtime_error") ?? [])
+        this.emit(runId, ev);
     this.settle(runId, outcome.status, outcome.code);
   }
 }

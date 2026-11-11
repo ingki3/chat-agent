@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { RunChoice } from "./connections.js";
 import { RuntimeId } from "./runtime.js";
 
 /**
@@ -137,8 +138,11 @@ export const ListMessagesQuery = z.object({
   before: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
-export const SendMessageRequest = z.object({ text: z.string().trim().min(1).max(100_000) });
+/** Text plus the optional per-turn choices (runtime, model, effort, connection — checked by the server, #17). */
+export const SendMessageRequest = RunChoice.extend({ text: z.string().trim().min(1).max(100_000) });
 export const EditMessageRequest = SendMessageRequest;
+/** "다시 생성" may change the runtime, model, effort or connection too (e.g. continue on the shared one). */
+export const RegenerateRequest = RunChoice;
 
 /** Stream events (SSE `event:` name = `type`). */
 export const StreamEvent = z.discriminatedUnion("type", [
@@ -207,6 +211,8 @@ export const Run = z.object({
   runtime: z.string(),
   model: z.string(),
   effort: z.string().nullable(),
+  /** The runtime connection used (#17); null when the runtime needs none. */
+  connectionId: z.string().nullable(),
   createdAt: z.number(),
   endedAt: z.number().nullable(),
 });

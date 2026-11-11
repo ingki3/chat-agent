@@ -19,7 +19,11 @@ import {
   codexEnv,
   type CodexAdapterOptions,
 } from "../src/runtime/codex.js";
+import crypto from "node:crypto";
 import { codexConnectionFor } from "../src/runtime/codex-config.js";
+import { UserStore } from "../src/auth/users.js";
+import { ConnectionStore } from "../src/connections/store.js";
+import { AppEvents } from "../src/events.js";
 import { CODEX_NOTIFICATION_SCOPE } from "../src/runtime/codex-protocol.js";
 import { CODEX_BUILTIN_TOOLS, CODEX_DISABLED_FEATURES } from "../src/runtime/lockdown.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
@@ -688,7 +692,8 @@ describe("Codex adapter (#16) under the run manager: how runs end", () => {
     const codex = adapter({ 질문: turn }).a;
     const wrapped: RuntimeAdapter = {
       id: "claude-code",
-      capabilities: () => codex.capabilities(),
+      // The adapter's own connection stub serves every run here; connection choice is tested in connections.test.ts.
+      capabilities: () => ({ ...codex.capabilities(), needsConnection: false }),
       start: (c) => codex.start(c),
       resume: (id, c) => codex.resume(id, c),
     };
@@ -758,30 +763,37 @@ describe("Codex adapter (#16) under the run manager: how runs end", () => {
   });
 });
 
-describe("Codex connection from .env (#16, until #17)", () => {
-  const users = new Map([
-    ["mom", { id: "mom", role: "member", email: "mom@family.test", active: true }],
-    ["son", { id: "son", role: "member", email: "son@family.test", active: true }],
-    ["gone", { id: "gone", role: "member", email: "gone@family.test", active: false }],
-  ]);
-  const store = { byId: (id: string) => users.get(id) as never };
-  const cfg = { dataDir: "/data", codex: { apiKey: "sk-k" } };
-  it("the API key for every active member, each in their own folder", () => {
-    const a = codexConnectionFor(cfg, store, "mom")!;
-    const b = codexConnectionFor(cfg, store, "son")!;
-    expect(a).toMatchObject({
-      id: "codex-api-key",
-      dir: "/data/runtimes/codex-api-key/mom",
-      auth: { apiKey: "sk-k" },
+describe("Codex connection from the database (#17)", () => {
+  it("the run's API key connection for each member, in a folder per connection and user; nothing else", () => {
+    const db = createTestDb();
+    const users = new UserStore(db, new AppEvents());
+    const store = new ConnectionStore(db, crypto.randomBytes(32), "/data");
+    const mom = users.create({ email: "mom@family.test", name: "엄마", role: "member", passwordHash: "x" });
+    const son = users.create({ email: "son@family.test", name: "아들", role: "member", passwordHash: "x" });
+    const key = `sk-${"k".repeat(30)}`;
+    const shared = store.create({
+      runtime: "codex",
+      authType: "api_key",
+      scope: "shared",
+      owner: null,
+      createdBy: mom.id,
+      secret: key,
     });
-    expect(a.id).toBe(b.id);
+    const ask = (userId: string, test = false) =>
+      codexConnectionFor(store, users, { userId, connectionId: shared.id, connectionTest: test });
+    // Untested: only a connection test may use it.
+    expect(ask(mom.id)).toBeUndefined();
+    expect(ask(mom.id, true)).toMatchObject({ auth: { kind: "api_key", apiKey: key } });
+    store.setTestResult(shared.id, "passed", "ok", store.get(shared.id)!.credentialVersion);
+    const a = ask(mom.id)!;
+    const b = ask(son.id)!;
+    expect(a).toMatchObject({ id: shared.id, dir: `/data/runtimes/${shared.id}/${mom.id}` });
     expect(path.relative(a.dir, b.dir).startsWith("..")).toBe(true);
     expect(path.relative(b.dir, a.dir).startsWith("..")).toBe(true);
-  });
-  it("no key, inactive or unknown users: no connection", () => {
-    expect(codexConnectionFor({ dataDir: "/data" }, store, "mom")).toBeUndefined();
-    expect(codexConnectionFor(cfg, store, "gone")).toBeUndefined();
-    expect(codexConnectionFor(cfg, store, "nobody")).toBeUndefined();
+    expect(codexConnectionFor(store, users, { userId: "nobody", connectionId: shared.id })).toBeUndefined();
+    expect(codexConnectionFor(store, users, { userId: mom.id })).toBeUndefined();
+    users.deactivate(son.id);
+    expect(ask(son.id)).toBeUndefined();
   });
 });
 
@@ -1286,3 +1298,272 @@ describe.skipIf(!fs.existsSync(toolsFixture))(
     });
   },
 );
+
+describe("Codex adapter: a cancel while the session opens (#17 review round 2)", () => {
+  it("kills the process, sends nothing more, and leaves the folder alone once start() has failed", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { a, log, root } = adapter({}, { replay: { initializeGate: gate } });
+    const abort = new AbortController();
+    const starting = a.start(ctx({ signal: abort.signal }));
+    for (let i = 0; i < 200 && !log.requests.length; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+    abort.abort();
+    await expect(starting).rejects.toThrow();
+    expect(log.kills).toBeGreaterThanOrEqual(1);
+    expect(log.exits).toBe(1); // start() failed only after the process was gone
+    // What a disconnect does next: remove the folder. Releasing the slow reply must not bring anything back.
+    fs.rmSync(path.join(root, "conn"), { recursive: true, force: true });
+    release();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+    expect(fs.existsSync(path.join(root, "conn"))).toBe(false);
+  });
+
+  it("close() returns only after the app-server has exited", async () => {
+    const { a, log } = adapter({});
+    const s = await a.start(ctx());
+    expect(log.exits).toBe(0);
+    await s.close();
+    expect(log.kills).toBeGreaterThanOrEqual(1);
+    expect(log.exits).toBe(1);
+  });
+
+  it("an aborted signal before the start creates nothing at all", async () => {
+    const { a, log, root } = adapter({});
+    const abort = new AbortController();
+    abort.abort();
+    await expect(a.start(ctx({ signal: abort.signal }))).rejects.toThrow();
+    expect(log.spawns).toEqual([]);
+    expect(fs.existsSync(path.join(root, "conn"))).toBe(false);
+  });
+});
+
+describe("Codex adapter: disconnecting while a normal run opens its session (#17 review round 3)", () => {
+  it("the run's app-server is killed before the folder goes; nothing runs on afterwards", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const log = newLog();
+    let store: ConnectionStore | undefined;
+    let users: UserStore | undefined;
+    const codex = new CodexAdapter({
+      connection: (c) => codexConnectionFor(store!, users!, c),
+      spawn: replaySpawn({}, log, { initializeGate: gate }),
+      bundledCatalog: async () => CATALOG,
+      executable: "/nonexistent/codex",
+    });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(codex);
+    const dataDir = tmp();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+      db: createTestDb(),
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+      notifications: { sender: async () => {} },
+    });
+    try {
+      store = app.connections!.store;
+      users = app.users!;
+      const f = await createFamily(app);
+      const c = store.create({
+        runtime: "codex",
+        authType: "api_key",
+        scope: "personal",
+        owner: f.users.owner,
+        createdBy: f.users.owner.id,
+        secret: KEY,
+      });
+      store.setTestResult(c.id, "passed", "ok", c.credentialVersion);
+      const conv = app.conversations!.create(f.users.owner.id);
+      const headers = {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      };
+      const sent = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text: "질문", runtime: "codex" },
+      });
+      expect(sent.statusCode).toBe(201);
+      const runId = (sent.json() as { run: Run }).run.id;
+      for (let i = 0; i < 400 && !log.requests.length; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+      const del = await app.inject({
+        method: "DELETE",
+        url: `/api/connections/${c.id}`,
+        headers,
+        payload: {},
+      });
+      expect(del.statusCode).toBe(200);
+      // By the time the disconnect answers, the process was killed and has exited.
+      expect(log.kills).toBeGreaterThanOrEqual(1);
+      expect(log.exits).toBe(1);
+      const folder = path.join(dataDir, "runtimes", c.id);
+      expect(fs.existsSync(folder)).toBe(false);
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+      expect(fs.existsSync(folder)).toBe(false);
+      expect(["interrupted", "failed"]).toContain(app.runs!.get(runId)!.status);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("disconnecting during a turn returns only after the app-server has exited", async () => {
+    const log = newLog();
+    let store: ConnectionStore | undefined;
+    let users: UserStore | undefined;
+    const rec: Recording = {
+      질문: {
+        threadId: cx.threadId,
+        turnId: cx.turnId,
+        messages: [...Array.from({ length: 200 }, (_, i) => cx.delta(`w${i} `)), cx.completed("interrupted")],
+        interruptAt: 200,
+      },
+    };
+    const codex = new CodexAdapter({
+      connection: (c) => codexConnectionFor(store!, users!, c),
+      spawn: replaySpawn(rec, log, { delayMs: 20, exitDelayMs: 150 }),
+      bundledCatalog: async () => CATALOG,
+      executable: "/nonexistent/codex",
+    });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(codex);
+    const dataDir = tmp();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+      db: createTestDb(),
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+      notifications: { sender: async () => {} },
+    });
+    try {
+      store = app.connections!.store;
+      users = app.users!;
+      const f = await createFamily(app);
+      const c = store.create({
+        runtime: "codex",
+        authType: "api_key",
+        scope: "personal",
+        owner: f.users.owner,
+        createdBy: f.users.owner.id,
+        secret: KEY,
+      });
+      store.setTestResult(c.id, "passed", "ok", c.credentialVersion);
+      const conv = app.conversations!.create(f.users.owner.id);
+      const headers = {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      };
+      const sent = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text: "질문", runtime: "codex" },
+      });
+      const runId = (sent.json() as { run: Run }).run.id;
+      for (let i = 0; i < 400 && !app.runs!.eventsAfter(runId, 0).some((e) => e.data.type === "delta"); i++)
+        await new Promise((r) => setTimeout(r, 5));
+      expect(log.exits).toBe(0);
+      const del = await app.inject({
+        method: "DELETE",
+        url: `/api/connections/${c.id}`,
+        headers,
+        payload: {},
+      });
+      expect(del.statusCode).toBe(200);
+      expect(log.kills).toBeGreaterThanOrEqual(1);
+      expect(log.exits).toBe(1);
+      expect(app.runs!.get(runId)!.status).toBe("interrupted");
+      expect(fs.existsSync(path.join(dataDir, "runtimes", c.id))).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("a run stopped while its session opens, then ended by the grace period, is still cleaned up by a disconnect", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const log = newLog();
+    let store: ConnectionStore | undefined;
+    let users: UserStore | undefined;
+    const codex = new CodexAdapter({
+      connection: (c) => codexConnectionFor(store!, users!, c),
+      spawn: replaySpawn({}, log, { initializeGate: gate }),
+      bundledCatalog: async () => CATALOG,
+      executable: "/nonexistent/codex",
+    });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(codex);
+    const dataDir = tmp();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+      db: createTestDb(),
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0, interruptGraceMs: 100 },
+      notifications: { sender: async () => {} },
+    });
+    try {
+      store = app.connections!.store;
+      users = app.users!;
+      const f = await createFamily(app);
+      const c = store.create({
+        runtime: "codex",
+        authType: "api_key",
+        scope: "personal",
+        owner: f.users.owner,
+        createdBy: f.users.owner.id,
+        secret: KEY,
+      });
+      store.setTestResult(c.id, "passed", "ok", c.credentialVersion);
+      const conv = app.conversations!.create(f.users.owner.id);
+      const headers = {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      };
+      const sent = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text: "질문", runtime: "codex" },
+      });
+      const runId = (sent.json() as { run: Run }).run.id;
+      for (let i = 0; i < 400 && !log.requests.length; i++) await new Promise((r) => setTimeout(r, 5));
+      // The stop button while the app-server is still initialising: the open is aborted right away.
+      await app.inject({ method: "POST", url: `/api/runs/${runId}/interrupt`, headers, payload: {} });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(log.kills).toBeGreaterThanOrEqual(1); // before the grace period is over
+      await new Promise((r) => setTimeout(r, 200)); // past the grace period: the run is over
+      expect(app.runs!.get(runId)!.status).toBe("interrupted");
+      expect(log.kills).toBeGreaterThanOrEqual(1);
+      const del = await app.inject({
+        method: "DELETE",
+        url: `/api/connections/${c.id}`,
+        headers,
+        payload: {},
+      });
+      expect(del.statusCode).toBe(200);
+      expect(log.exits).toBe(1);
+      const folder = path.join(dataDir, "runtimes", c.id);
+      expect(fs.existsSync(folder)).toBe(false);
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+      expect(fs.existsSync(folder)).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+});

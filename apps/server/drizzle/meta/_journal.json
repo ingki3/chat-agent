@@ -57,6 +57,13 @@
       "when": 1794366302675,
       "tag": "0007_instructions",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794369580832,
+      "tag": "0008_connections",
+      "breakpoints": true
     }
   ]
 }

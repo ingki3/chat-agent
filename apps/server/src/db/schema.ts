@@ -169,6 +169,18 @@ export const runs = sqliteTable(
     effort: text("effort"),
     /** Instruction template versions the run used, e.g. `common@1,youth@1` (#20); null until its session opens. */
     instructions: text("instructions"),
+    /** The runtime connection the run uses (#17); null for runtimes without connections (FakeRuntime). */
+    connectionId: text("connection_id"),
+    /**
+     * The connection's credential version the run was accepted with (#17): the run uses exactly that credential,
+     * and only a failure of the still-current version marks the connection expired.
+     */
+    connectionVersion: integer("connection_version"),
+    /**
+     * The user asked for the family shared connection (`useShared`), e.g. confirming the "personal connection
+     * reached its limit — continue on the shared one?" notice. Kept on the run it applied to (#17).
+     */
+    useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
     /** Client `Idempotency-Key`: the same key from the same user returns the same run. */
     idempotencyKey: text("idempotency_key"),
     /** Next event sequence number (SSE id). */
@@ -305,3 +317,73 @@ export const pushSessionState = sqliteTable("push_session_state", {
     .references(() => sessions.id, { onDelete: "cascade" }),
   generation: integer("generation").notNull().default(0),
 });
+
+/**
+ * Runtime connections (#17, PRD D2 / FR-11): runtime × auth type × scope.
+ * - `shared`: registered by an admin, API key only, used by the family members the admin allows.
+ * - `personal`: one user's own (`ownerId`); API key or subscription. A subscription is never shared, and its scope
+ *   cannot be changed. A Claude subscription is allowed on an admin's own account only.
+ * `secret` is the credential encrypted with the master key (AES-256-GCM, AAD `connection:<id>`); it is never
+ * returned by any API — `hint` (last 4 characters) is all the UI sees. Disconnecting keeps the row (history refers
+ * to it) but wipes the secret and sets `disconnectedAt`.
+ * Only `passed` connections are offered or used; a runtime auth failure marks the connection `expired`.
+ */
+export const connections = sqliteTable(
+  "connections",
+  {
+    id: text("id").primaryKey(),
+    runtime: text("runtime").notNull(),
+    authType: text("auth_type", { enum: ["api_key", "subscription"] }).notNull(),
+    scope: text("scope", { enum: ["shared", "personal"] }).notNull(),
+    /** The user a personal connection belongs to; null for shared connections. */
+    ownerId: text("owner_id").references(() => users.id, { onDelete: "cascade" }),
+    /** Who registered it (the owner, or an admin on the owner's behalf). */
+    createdBy: text("created_by"),
+    label: text("label").notNull(),
+    secret: text("secret"),
+    /** Goes up whenever the credential is replaced; runs and tests are bound to the version they used. */
+    credentialVersion: integer("credential_version").notNull().default(1),
+    hint: text("hint"),
+    status: text("status", { enum: ["untested", "passed", "failed", "expired"] })
+      .notNull()
+      .default("untested"),
+    lastTestAt: integer("last_test_at"),
+    /** Fixed code of the last test's outcome (`ok`, `test_no_stream`, `runtime_auth`, …) — never runtime text. */
+    lastTestCode: text("last_test_code"),
+    disconnectedAt: integer("disconnected_at"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [
+    index("connections_owner_idx").on(t.ownerId),
+    index("connections_scope_runtime_idx").on(t.scope, t.runtime),
+  ],
+);
+
+/**
+ * What a user may use, per runtime (#17, PRD FR-1.6 / FR-11): the runtime itself, its models and effort values,
+ * and whether personal and shared connections are allowed. Without a row the user's `permissions` apply
+ * (runtime and model lists), with every effort and both kinds of connection allowed.
+ */
+export const runtimePolicies = sqliteTable(
+  "runtime_policies",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    runtime: text("runtime").notNull(),
+    allowed: integer("allowed", { mode: "boolean" }).notNull().default(true),
+    models: text("models", { mode: "json" })
+      .$type<"all" | string[]>()
+      .notNull()
+      .default(sql`'"all"'`),
+    efforts: text("efforts", { mode: "json" })
+      .$type<"all" | string[]>()
+      .notNull()
+      .default(sql`'"all"'`),
+    allowPersonal: integer("allow_personal", { mode: "boolean" }).notNull().default(true),
+    allowShared: integer("allow_shared", { mode: "boolean" }).notNull().default(true),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.runtime] })],
+);

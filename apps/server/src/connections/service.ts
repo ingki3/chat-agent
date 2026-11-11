@@ -1,0 +1,190 @@
+import type { ConnectionTestResult, RuntimeId, StreamEvent } from "@agentlee/shared";
+import type { UserStore } from "../auth/users.js";
+import { logEvent, type EventLogger } from "../logging.js";
+import type { PublishInput } from "../notifications/compose.js";
+import type { RuntimeRegistry } from "../runtime/adapter.js";
+import type { RunRow } from "../runtime/runs.js";
+import { RunAccess } from "./access.js";
+import type { ImportFailure } from "./import.js";
+import { ConnectionRuleError, RUNTIME_LABEL, type ConnectionRow, type ConnectionStore } from "./store.js";
+import type { ConnectionTester } from "./tester.js";
+
+/** Notice code: the personal connection hit its limit and a shared one is available — continue there? */
+export const SHARED_OFFER_CODE = "personal_limit_use_shared";
+export const CONNECTION_LOST_CODE = "connection_lost";
+
+/**
+ * Connections as the rest of the server uses them (#17): run checks (`access`), tests, disconnecting, and what
+ * happens when a run fails on a connection — an expired credential marks it `expired` and notifies the owner
+ * (`connection_lost`) or, for a shared one, the admins (`system_warning`); a personal limit offers the shared one.
+ */
+export class ConnectionService {
+  readonly access: RunAccess;
+  /** Running connection tests: how to cancel one, and its end (disconnect waits for it before removing folders). */
+  private readonly testing = new Map<string, { abort: AbortController; done: Promise<unknown> }>();
+  private runs: { stopConnection(id: string): Promise<void> } | undefined;
+  private notify: ((userId: string, input: PublishInput) => void) | undefined;
+  /** `.env` values this start could not import (admin status, `GET /api/admin/connections`). */
+  importFailures: ImportFailure[] = [];
+
+  constructor(
+    readonly store: ConnectionStore,
+    private readonly users: Pick<UserStore, "byId">,
+    private readonly tester: ConnectionTester,
+    private readonly registry: Pick<RuntimeRegistry, "get">,
+    private readonly log: EventLogger | undefined,
+  ) {
+    this.access = new RunAccess(users, store);
+  }
+
+  /** Late wiring: the run manager and the notification service are built after this service. */
+  attach(deps: {
+    runs?: { stopConnection(id: string): Promise<void> };
+    notify?: (userId: string, input: PublishInput) => void;
+  }): void {
+    if (deps.runs) this.runs = deps.runs;
+    if (deps.notify) this.notify = deps.notify;
+  }
+
+  /** The run manager's hook for a failed run on a connection: notices for the stream, side effects here. */
+  runFailed(run: RunRow, code: string): StreamEvent[] {
+    const c = run.connectionId ? this.store.get(run.connectionId) : undefined;
+    if (!c) return [];
+    const label = RUNTIME_LABEL[c.runtime as RuntimeId] ?? c.runtime;
+    if (code === "runtime_auth") {
+      // Only the first run that finds it broken announces it (passed → expired).
+      if (run.connectionVersion !== null && this.store.markExpired(c.id, run.connectionVersion)) {
+        logEvent(this.log, "warn", "connection.expired", {
+          connectionId: c.id,
+          runtime: c.runtime,
+          scope: c.scope,
+        });
+        this.safeNotify(() => {
+          if (c.scope === "personal" && c.ownerId)
+            this.notify?.(c.ownerId, { kind: "connection_lost", runtimeLabel: label, url: "/settings" });
+          else
+            for (const admin of this.store.admins())
+              this.notify?.(admin, {
+                kind: "system_warning",
+                message: `공용 ${label} 연결(${c.label})이 끊겼어요 — 키를 확인하고 다시 테스트해 주세요.`,
+                url: "/admin",
+              });
+        });
+      }
+      return [
+        {
+          type: "notice",
+          level: "warn",
+          code: CONNECTION_LOST_CODE,
+          message: `${label} 연결이 끊겼어요 — 다시 로그인하거나 다른 런타임으로 이어가기`,
+        },
+      ];
+    }
+    if (code === "usage_limit" && c.scope === "personal") {
+      const user = this.users.byId(run.userId);
+      const shared =
+        user && this.store.usableFor(user, c.runtime as RuntimeId).find((x) => x.scope === "shared");
+      if (shared)
+        return [
+          {
+            type: "notice",
+            level: "info",
+            code: SHARED_OFFER_CODE,
+            message: "개인 연결이 사용 한도에 도달했어요. 공용 연결로 이어갈까요?",
+          },
+        ];
+    }
+    return [];
+  }
+
+  private safeNotify(fn: () => void) {
+    try {
+      fn();
+    } catch {
+      // a notification must never change how the run ends
+    }
+  }
+
+  /**
+   * Runs the connection test as `userId` and records the outcome. The same rules as a run apply — runtime allowed,
+   * personal / shared connections allowed, and the test model and effort taken from what the policy allows (the
+   * smallest allowed model, listed last, at its lowest allowed effort); the only exception is that the connection
+   * need not be `passed` yet. One test per connection at a time (409); disconnecting or a new key cancels it.
+   */
+  async test(c: ConnectionRow, userId: string): Promise<ConnectionTestResult> {
+    if (c.disconnectedAt !== null || !c.secret) throw new ConnectionRuleError(404, "not_found");
+    const runtime = c.runtime as RuntimeId;
+    const user = this.users.byId(userId);
+    if (!user || !this.store.usable(c, user, runtime, { test: true }))
+      throw new ConnectionRuleError(403, "connection_not_allowed");
+    const adapter = this.registry.get(runtime);
+    const model = adapter
+      ? this.access.models(this.store.policy(user, runtime), adapter.capabilities()).at(-1)
+      : undefined;
+    if (adapter && !model) throw new ConnectionRuleError(403, "model_not_allowed");
+    if (this.testing.has(c.id)) throw new ConnectionRuleError(409, "test_in_progress");
+    const abort = new AbortController();
+    const running = this.tester.run({
+      connectionId: c.id,
+      runtime,
+      userId,
+      model: model?.id ?? "",
+      effort: model?.efforts[0],
+      version: c.credentialVersion,
+      signal: abort.signal,
+    });
+    this.testing.set(c.id, { abort, done: running.catch(() => undefined) });
+    try {
+      const r = await running;
+      const status = r.passed ? "passed" : "failed";
+      // Recorded only for the tested credential, and never for a cancelled test.
+      if (r.code !== "cancelled") this.store.setTestResult(c.id, status, r.code, c.credentialVersion);
+      logEvent(this.log, r.passed ? "info" : "warn", "connection.tested", {
+        connectionId: c.id,
+        runtime: c.runtime,
+        scope: c.scope,
+        status: r.passed ? "ok" : "error",
+        testCode: r.code,
+      });
+      return { status: this.store.get(c.id)?.status ?? status, code: r.code, checks: r.checks };
+    } finally {
+      this.testing.delete(c.id);
+    }
+  }
+
+  /** Cancels a running test of `id` and waits (at most `ms`) until its session is closed and its token revoked. */
+  private async cancelTest(id: string, ms = 10_000): Promise<void> {
+    const t = this.testing.get(id);
+    if (!t) return;
+    t.abort.abort();
+    await Promise.race([t.done, new Promise<void>((r) => setTimeout(r, ms).unref())]);
+  }
+
+  /** New label and/or key. A new key stops runs and a test that still use the old key. */
+  async update(
+    id: string,
+    patch: { label?: string | undefined; secret?: string | undefined },
+  ): Promise<ConnectionRow> {
+    const row = this.store.update(id, patch);
+    // A new key: runs and a test still using the old one stop.
+    if (patch.secret !== undefined) await Promise.all([this.runs?.stopConnection(id), this.cancelTest(id)]);
+    return row;
+  }
+
+  /**
+   * Disconnects: running runs and a running test on it stop, its sessions are never resumed, then its folders go
+   * (FR-11.9).
+   */
+  async disconnect(c: ConnectionRow): Promise<boolean> {
+    if (!this.store.disconnect(c.id)) return false;
+    // Runs and a test on it stop, and their runtime processes are gone, before the folder is removed.
+    await Promise.all([this.runs?.stopConnection(c.id), this.cancelTest(c.id)]);
+    this.store.removeFolders(c.id);
+    logEvent(this.log, "info", "connection.disconnected", {
+      connectionId: c.id,
+      runtime: c.runtime,
+      scope: c.scope,
+    });
+    return true;
+  }
+}
