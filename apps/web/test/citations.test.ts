@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   CITATION_MISSING_TEXT,
   CITATION_STATUS_TEXT,
+  citationMarkers,
   type CitationEntry,
   type CitationNotePart,
 } from "@agentlee/shared";
@@ -29,10 +30,15 @@ const entry = (n: number, status: string, o: Partial<CitationEntry> = {}): Citat
     ...o,
   }) as CitationEntry;
 
-const note = (citations: CitationEntry[], missing: CitationNotePart["missing"] = []): CitationNotePart => ({
+const note = (
+  citations: CitationEntry[],
+  missing: CitationNotePart["missing"] = [],
+  text = "",
+): CitationNotePart => ({
   type: "citation_note",
   citations,
   missing,
+  markers: citationMarkers(text),
 });
 
 const html = (el: Parameters<typeof renderToStaticMarkup>[0]) => renderToStaticMarkup(el);
@@ -83,13 +89,18 @@ describe("citation views", () => {
 
 describe("rendering", () => {
   it("markers: verified plain, each failure with ⚠️ in the marker", () => {
-    const n = note([
-      entry(1, "verified"),
-      entry(2, "snippet_not_found"),
-      entry(3, "fetch_failed"),
-      entry(4, "unknown_source"),
-    ]);
-    const out = html(createElement(CitedText, { text: "가[1]. 나[2]. 다[3]. 라[4]. 마[5].", note: n }));
+    const TEXT = "가[1]. 나[2]. 다[3]. 라[4]. 마[5].";
+    const n = note(
+      [
+        entry(1, "verified"),
+        entry(2, "snippet_not_found"),
+        entry(3, "fetch_failed"),
+        entry(4, "unknown_source"),
+      ],
+      [],
+      TEXT,
+    );
+    const out = html(createElement(CitedText, { text: TEXT, note: n }));
     const markers = [...out.matchAll(/data-status="([^"]+)"[^>]*>([^<]*)<\/button>/g)].map((m) => [
       m[1],
       m[2],
@@ -158,7 +169,7 @@ describe("rendering", () => {
   it("missing paragraphs are marked and the warning is shown", () => {
     const text = "가[1].\n\n나는 출처가 없어요.";
     const start = text.indexOf("나");
-    const n = note([entry(1, "verified")], [{ start, end: text.length }]);
+    const n = note([entry(1, "verified")], [{ start, end: text.length }], text);
     expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "marker", "text", "missing"]);
     const body = html(createElement(CitedText, { text, note: n }));
     expect(body).toMatch(
@@ -172,6 +183,21 @@ describe("rendering", () => {
       CITATION_MISSING_TEXT,
     );
     expect(segments("짧다", note([], [{ start: 0, end: 99 }])).map((s) => s.kind)).toEqual(["text"]);
+  });
+
+  it("only the server's marker positions become citations: other [n] stay text, a wrong position is ignored", () => {
+    const text = "a[1] 은 배열이고, 수출은 늘었다[1].";
+    const at = text.lastIndexOf("[1]");
+    const n: CitationNotePart = {
+      ...note([entry(1, "unknown_source")]),
+      markers: [
+        { n: 1, start: at, end: at + 3 },
+        { n: 2, start: 0, end: 3 }, // not "[2]" there
+        { n: 1, start: 90, end: 93 }, // outside the text
+      ],
+    };
+    expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "marker", "text"]);
+    expect(segments(text, n)[0]).toEqual({ kind: "text", text: "a[1] 은 배열이고, 수출은 늘었다" });
   });
 
   it("the source list is sorted by number", () => {

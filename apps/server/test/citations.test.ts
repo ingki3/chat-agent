@@ -9,6 +9,7 @@ import {
   citationUnits,
   citationVerified,
   FINANCE_DISCLAIMER,
+  sentenceEndMarkers,
   uncitedUnits,
   type MessagePart,
 } from "@agentlee/shared";
@@ -16,7 +17,7 @@ import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
 import { citationNote } from "../src/citations/checker.js";
 import { CitationStore, CiteRefused } from "../src/citations/store.js";
-import { findSnippet, normalizeSnippet } from "../src/citations/verify.js";
+import { findSnippet, normalizeSnippet, normalizeWithMap, verifyStats } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb, type Db } from "../src/db/client.js";
 import { citations, sources } from "../src/db/schema.js";
@@ -94,6 +95,71 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("도체 수출이 전년 같은")).toBe(false);
     // A Korean particle after the end is fine.
     expect(found("10월 반도체 수출")).toBe(true);
+  });
+
+  it("not inside a decimal, a thousands group or after a sign (review #97)", () => {
+    expect(found("32% increased this year", "Sales: 1.32% increased this year.")).toBe(false);
+    expect(found("1.32% increased this year", "Sales: 1.32% increased this year.")).toBe(true);
+    expect(found("234 units sold worldwide", "In total 1,234 units sold worldwide.")).toBe(false);
+    expect(found("1,234 units sold worldwide", "In total 1,234 units sold worldwide.")).toBe(true);
+    expect(found("32% 감소했다고 밝혔다", "매출은 -32% 감소했다고 밝혔다.")).toBe(false);
+    expect(found("32% 감소했다고 밝혔다", "매출은 −32% 감소했다고 밝혔다.")).toBe(false);
+    expect(found("32% 감소했다고 밝혔다", "매출은 32% 감소했다고 밝혔다.")).toBe(true);
+    // A sentence end before a number is not a decimal point.
+    expect(found("32% 늘었다고 밝혔다", "끝났다. 32% 늘었다고 밝혔다.")).toBe(true);
+  });
+
+  it("HTML entities, line-end hyphenation and inline footnote numbers in the page (review #97)", () => {
+    const page =
+      "기온은 &minus;5도로 떨어졌다 &amp; 눈이 왔다. 수치는 &#8722;3&nbsp;% 였다. 값은 &#x2212;7이다.";
+    expect(found("기온은 −5도로 떨어졌다 & 눈이 왔다", page)).toBe(true);
+    expect(found("기온은 -5도로 떨어졌다", page)).toBe(true);
+    expect(found("수치는 -3 % 였다", page)).toBe(true);
+    expect(found("값은 −7이다.", page)).toBe(true);
+    expect(
+      findSnippet(page, "기온은 −5도로 떨어졌다").found && findSnippet(page, "기온은 −5도로 떨어졌다"),
+    ).toEqual({
+      found: true,
+      quote: "기온은 &minus;5도로 떨어졌다",
+    });
+    // An unknown or broken entity stays as written.
+    expect(found("a &bogus; b c d e", "x a &bogus; b c d e")).toBe(true);
+    const hyph =
+      "Semicon-\nductor exports rose sharply. A well-\n  known firm said so. The semi-conductor era.";
+    expect(found("Semiconductor exports rose sharply", hyph)).toBe(true);
+    expect(found("A wellknown firm said so", hyph)).toBe(true);
+    // A hyphen inside a line is a hyphen.
+    expect(found("The semiconductor era", hyph)).toBe(false);
+    expect(found("The semi-conductor era", hyph)).toBe(true);
+    // Numbers broken at a line end are not joined.
+    expect(found("값은 1020이다", "값은 10-\n20이다")).toBe(false);
+    expect(found("10year bonds rose", "The 10-\nyear bonds rose.")).toBe(false);
+    const notes = "수출이 크게 늘었다[3]. 업계는 반겼다²³. 정부는 지원을 약속했다[12][13].";
+    expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(true);
+    expect(found("정부는 지원을 약속했다.", notes)).toBe(true);
+    expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(true);
+  });
+
+  it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
+    const base =
+      "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
+    const body = base.repeat(Math.ceil(400_000 / base.length)).slice(0, 400_000);
+    normalizeWithMap(base); // warm the character caches the first page would warm
+    let t = performance.now();
+    expect(findSnippet(body, "없는 구절이에요 정말로", "perf-key").found).toBe(false);
+    const first = performance.now() - t;
+    const normalized = verifyStats.normalized;
+    t = performance.now();
+    expect(findSnippet(body, "없는 다른 구절이에요", "perf-key").found).toBe(false);
+    const again = performance.now() - t;
+    expect(verifyStats.normalized).toBe(normalized + 1); // the snippet only: the page came from the cache
+    // Measured 25–35 ms here (400k characters); generous bounds for slower CI machines.
+    expect(first).toBeLessThan(250);
+    expect(again).toBeLessThan(25);
+    // A changed body under the same key is normalised again, not served from the cache.
+    expect(findSnippet(`${body} 끝에 붙인 새 문장입니다`, "끝에 붙인 새 문장입니다", "perf-key").found).toBe(
+      true,
+    );
   });
 
   it("a snippet must say something: fewer than 8 normalised characters prove nothing", () => {
@@ -403,6 +469,50 @@ describe("paragraphs that need a citation", () => {
     ]);
   });
 
+  it("a disclaimer is only a pure disclaimer: mixed or factual short paragraphs are checked (review #97)", () => {
+    for (const t of [
+      "※ 반도체 수출은 32% 증가했다.",
+      "※ 반도체 수출은 크게 늘었다.",
+      "출처가 부족하지만 양산은 확정됐다.",
+      "출처가 충분하지 않은데 양산은 확정됐다.",
+      "출처가 충분하지 않아요. 양산은 2027년이에요.",
+      "출처가 충분하지 않아요. 양산은 확정됐어요.",
+      "※ 이 답변은 공개 보도를 바탕으로 했어요. 수출은 늘었어요.",
+      `${FINANCE_DISCLAIMER} 삼성전자는 오를 거예요.`,
+      "공식 발표를 확인해 보세요.",
+      "※ 이 답변은 수출이 32% 늘었다는 보도를 바탕으로 했어요.",
+      "출처가 부족해요. 2개 기사뿐이에요.",
+    ])
+      expect(kinds(t)[0]![0], t).toBe("body");
+    for (const t of [
+      "※ 이 답변은 공개 보도를 바탕으로 했어요.",
+      "※ 참고용이에요.",
+      "출처가 충분하지 않아요.",
+      "출처가 충분하지 않아요. 공식 발표를 확인해 보세요.",
+      "자료가 부족해요.",
+      `※ ${FINANCE_DISCLAIMER}`,
+    ])
+      expect(kinds(t)[0]![0], t).toBe("disclaimer");
+  });
+
+  it("sentence-end markers (answers without web tools)", () => {
+    const ns = (t: string) => sentenceEndMarkers(t).map((m) => m.n);
+    expect(ns("최신 수출은 32% 증가했다[1].")).toEqual([1]);
+    expect(ns("늘었다.[2] 그리고")).toEqual([2]);
+    expect(ns("늘었다[1][2]. 끝")).toEqual([1, 2]);
+    expect(ns("늘었다[3]\n다음")).toEqual([3]);
+    expect(ns("Exports rose[4].")).toEqual([4]);
+    for (const t of [
+      "배열 a[1] 은 두 번째",
+      "a[1].length",
+      "x = a[1]\n",
+      "`b[2]`.",
+      "[1](http://x).",
+      "m[1][2] = 3",
+    ])
+      expect(ns(t), t).toEqual([]);
+  });
+
   it("the exclusions are narrow: a colon not before a list, a long 'not enough' paragraph and a long ※ text are body", () => {
     expect(kinds("결론은 이렇습니다:\n\n다음 문단")).toEqual([
       ["body", "결론은 이렇습니다:"],
@@ -411,12 +521,14 @@ describe("paragraphs that need a citation", () => {
     const long = `출처가 충분하지 않지만 ${"반도체 수출은 크게 늘었다. ".repeat(6)}`;
     expect(kinds(long)[0]![0]).toBe("body");
     expect(kinds(`※ ${"가".repeat(300)}`)[0]![0]).toBe("body");
+    expect(kinds("※ 참고용이에요. ".repeat(30))[0]![0]).toBe("body");
     // A lead-in of two lines is a paragraph.
     expect(kinds("첫 줄\n둘째 줄:\n- 항목")[0]![0]).toBe("body");
   });
 
-  it("markers: [n] only — not a markdown link or a footnote", () => {
+  it("markers: [n] only — not a markdown link, a footnote or inline code", () => {
     expect(citationMarkers("a[1] b[12] c[1](http://x) d[^2] e[0] f[ 3 ]").map((m) => m.n)).toEqual([1, 12]);
+    expect(citationMarkers("코드 `x[1]` 와 늘었다[2].").map((m) => m.n)).toEqual([2]);
   });
 });
 
@@ -502,9 +614,47 @@ describe("citationNote", () => {
     expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["나는 출처가 없어요."]);
   });
 
+  it("a short progress note before the first tool call is not flagged; facts before it and notes after it are", () => {
+    const call: MessagePart[] = [
+      { type: "tool_call", id: "t", name: "web_fetch", input: {} },
+      { type: "tool_result", callId: "t", output: {}, isError: false },
+    ];
+    const missingOf = (parts: MessagePart[]) => {
+      const t = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
+      return citationNote(scope.runId, parts, f.cites)!.missing.map((r) => t.slice(r.start, r.end));
+    };
+    expect(missingOf([...text("자료를 찾아 비교해 볼게요.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
+    expect(missingOf([...text("Let me search for that.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
+    // A statement before the tool call, a note with a figure, two sentences, or a note after the call: checked.
+    expect(missingOf([...text("반도체 수출은 늘었어요.\n\n"), ...call, ...text("가[1].")])).toEqual([
+      "반도체 수출은 늘었어요.",
+    ]);
+    expect(missingOf([...text("2026년 자료를 찾아볼게요.\n\n"), ...call, ...text("가[1].")])).toHaveLength(1);
+    expect(
+      missingOf([...text("수출이 늘었어요. 더 찾아볼게요.\n\n"), ...call, ...text("가[1].")]),
+    ).toHaveLength(1);
+    expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);
+  });
+
   it("applies when the run used a web tool or cited — and not otherwise", () => {
     const fresh = crypto.randomUUID();
-    expect(citationNote(fresh, text("그냥 답이에요[1]."), f.cites)).toBeUndefined();
+    // No web tool, no citation, no [n] that stands where a citation stands: no note.
+    for (const t of [
+      "그냥 답이에요.",
+      "배열 a[1] 은 두 번째 값",
+      "a[1].length 는 3",
+      "x = a[1]\n",
+      "`b[2]`.",
+      "[1](http://x).",
+    ])
+      expect(citationNote(fresh, text(t), f.cites), t).toBeUndefined();
+    // A sentence that ends in [n] without any citation pretends to cite: checked, unknown, nothing else marked.
+    const fake = citationNote(fresh, text("최신 수출은 32% 증가했다[1].\n\n출처 없는 다른 문단."), f.cites)!;
+    expect(fake.citations).toEqual([
+      expect.objectContaining({ n: 1, status: "unknown_source", sourceId: null }),
+    ]);
+    expect(fake.markers).toEqual([{ n: 1, start: 15, end: 18 }]);
+    expect(fake.missing).toEqual([]);
     const withFetch: MessagePart[] = [
       { type: "tool_call", id: "t", name: "mcp__agentlee__web_fetch", input: {} },
       { type: "tool_result", callId: "t", output: { error: "web_blocked" }, isError: true },

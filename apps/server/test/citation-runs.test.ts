@@ -224,10 +224,14 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(statuses(own)).toEqual([[1, "verified"]]);
   });
 
-  it("no web tool and no citation: no note, even with [1] in the text", async () => {
+  it("no web tool and no citation: array indexing gets no note, a made-up sentence-end [n] is unknown", async () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
+    // The fake echoes the message.
     expect((await send(f.cookies.owner, c.id, "배열 a[1] 은 두 번째 값")).note).toBeUndefined();
+    const made = await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].");
+    expect(statuses(made)).toEqual([[1, "unknown_source"]]);
+    expect(made.note!.missing).toEqual([]);
   });
 
   it("research mode feeds the instructions of the next run (and cite's rules are in them)", async () => {

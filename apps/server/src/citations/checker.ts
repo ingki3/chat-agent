@@ -5,7 +5,9 @@ import {
   boundText,
   CITATION_LIMITS,
   citationMarkers,
+  sentenceEndMarkers,
   uncitedUnits,
+  type TextRange,
   type CitationEntry,
   type CitationNotePart,
   type MessagePart,
@@ -42,6 +44,31 @@ export function isWebTool(name: string): boolean {
 export const answerText = (parts: readonly MessagePart[]) =>
   parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
 
+/** Where in the answer text the first tool call came (the length of the text written before it). */
+export function firstToolAt(parts: readonly MessagePart[]): number {
+  let at = 0;
+  for (const p of parts) {
+    if (p.type === "tool_call") return at;
+    if (p.type === "text") at += p.text.length;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+/** "자료를 찾아 비교해 볼게요." — what the model says it is about to do, not something it states. */
+const PROGRESS =
+  /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
+
+/**
+ * A short progress note before the first tool call: one sentence, no figure, no marker, saying what comes next.
+ * Paragraphs that state something before a tool call are still checked.
+ */
+export function isProgressNote(text: string, u: TextRange, toolAt: number): boolean {
+  if (u.end > toolAt) return false;
+  const t = text.slice(u.start, u.end).trim();
+  if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
+  return PROGRESS.test(t);
+}
+
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
 
 /** The note for one run's answer, or undefined when the check does not apply (or there is nothing to say). */
@@ -52,11 +79,14 @@ export function citationNote(
 ): CitationNotePart | undefined {
   const rows = store.forRun(runId);
   const used = rows.length > 0 || parts.some((p) => p.type === "tool_call" && isWebTool(p.name));
-  if (!used) return undefined;
   const text = answerText(parts);
   if (!text.trim()) return undefined;
+  // No web tool and no citation: an answer whose sentences still end in `[n]` pretends to cite — those markers
+  // are checked (and are unknown). Other `[n]` (a[1], code, links) and the paragraphs are left alone.
+  const markers = (used ? citationMarkers(text) : sentenceEndMarkers(text)).slice(0, CITATION_LIMITS.markers);
+  if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
-  const numbers = [...new Set(citationMarkers(text).map((m) => m.n))].sort((a, b) => a - b);
+  const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
     const r = byN.get(n);
     // A marker without a citation of this run (made up, or a number of another answer): never shown as normal.
@@ -83,6 +113,15 @@ export function citationNote(
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
     };
   });
-  const missing = uncitedUnits(text).slice(0, CITATION_LIMITS.missing);
-  return { type: "citation_note", citations, missing };
+  const missing = used
+    ? uncitedUnits(text)
+        .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
+        .slice(0, CITATION_LIMITS.missing)
+    : [];
+  return {
+    type: "citation_note",
+    citations,
+    missing,
+    markers: markers.map(({ n, start, end }) => ({ n, start, end })),
+  };
 }

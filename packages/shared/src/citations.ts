@@ -45,6 +45,8 @@ export const CITATION_LIMITS = {
   minSnippet: 8,
   /** Paragraph ranges a note marks at most. */
   missing: 100,
+  /** Marker positions a note lists at most. */
+  markers: 300,
   title: 300,
   site: 120,
   url: 2048,
@@ -94,6 +96,11 @@ export const CitationNotePart = z.object({
   type: z.literal("citation_note"),
   citations: z.array(CitationEntry).max(CITATION_LIMITS.perRun * 2),
   missing: z.array(TextRange).max(CITATION_LIMITS.missing),
+  /**
+   * Where the citation markers are in the answer text (each `[n]` the screen turns into a citation). Only these:
+   * an `[n]` elsewhere (array indexing, code) stays text.
+   */
+  markers: z.array(TextRange.extend({ n: z.number().int().positive() })).max(CITATION_LIMITS.markers),
 });
 export type CitationNotePart = z.infer<typeof CitationNotePart>;
 
@@ -119,16 +126,43 @@ const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const TABLE = /^\s*\|/;
 const LEAD_IN = /[:：]\s*$/;
 
+const SENTENCES = /(?<=[.!?。！？])\s+/u;
+const FIGURE = /\d/u;
+/** A clause joined to more ("…지만", "…는데", "…으나", "…며"): the sentence goes on to state something. */
+const GOES_ON = /(?:지만|는데|은데|으나|이나|하나|며|면서|고,|만,)\s/u;
+/** A `※` note about the answer itself (not about the world). */
+const META_NOTE =
+  /^(?:이\s*(?:답변|내용|정리|요약)[은는이가]?\s.*(?:바탕|기준|참고|작성|정리)|(?:공개\s*)?(?:자료|보도|기사|출처)[를을]\s*바탕으로|참고용|정확하지\s*않을\s*수|최신\s*정보는|자세한\s*내용은|원문을\s*확인|투자\s*권유가\s*아닙니다)/u;
+/** "출처가 충분하지 않아요." and the like — nothing more in the sentence. */
+const NOT_ENOUGH =
+  /^(?:⚠️\s*)?(?:출처|자료|근거)(?:가|는|이)?\s*(?:충분하지\s*않|부족하|부족해|부족합|적어|적습)[^.!?。]*[.!?。]?$/u;
+/** Advice that goes with it ("공식 발표를 확인해 보세요."). */
+const ADVICE =
+  /(?:확인해|찾아|참고해|살펴)\s*보세요[.!。]?$|확인이\s*필요해요[.!。]?$|확인하시길\s*바랍니다[.!。]?$/u;
+
 /**
- * Words that say something about the answer, not about the world: the finance disclaimer, a `※` note, and the
- * research-mode statement that the sources are not enough. Short ones only — a long paragraph that starts like
- * this still states things.
+ * A pure disclaimer: the finance disclaimer, a `※` note about the answer, or the research-mode notice that the
+ * sources are not enough (with advice to check further) — and nothing else. Every sentence must be one of those,
+ * none may carry a figure or go on to state something. `※ 반도체 수출은 32% 증가했다.` and
+ * `출처가 부족하지만 양산은 확정됐다.` are claims.
  */
 function isDisclaimer(t: string): boolean {
-  if (t.includes(FINANCE_DISCLAIMER) || /투자\s*권유가\s*아닙니다/.test(t)) return t.length <= 240;
-  if (/^※/.test(t)) return t.length <= 240;
-  if (/^(?:⚠️\s*)?(?:출처|자료|근거)(?:가|는|이)?\s*(?:충분하지\s*않|부족)/.test(t)) return t.length <= 100;
-  return false;
+  if (t.length > 240) return false;
+  const rest = t
+    .split(FINANCE_DISCLAIMER)
+    .join(" ")
+    .replace(/^[\s※*]+|[\s*]+$/gu, "");
+  if (!rest) return true;
+  const sentences = rest.split(SENTENCES).filter(Boolean);
+  let notice = false;
+  for (const raw of sentences) {
+    const s = raw.replace(/^[※\s]+/u, "");
+    if (FIGURE.test(s) || GOES_ON.test(s)) return false;
+    if (META_NOTE.test(s) && s.length <= 80) notice = true;
+    else if (NOT_ENOUGH.test(s) && s.length <= 60) notice = true;
+    else if (!(ADVICE.test(s) && s.length <= 60)) return false;
+  }
+  return notice || rest !== t;
 }
 
 /**
@@ -210,12 +244,41 @@ export function citationMarkers(
   units: readonly CitationUnit[] = citationUnits(text),
 ): CitationMarker[] {
   const code = units.filter((u) => u.kind === "code");
+  // Inline code spans (`a[1]`) on one line.
+  for (const m of text.matchAll(/`[^`\n]+`/g))
+    code.push({ start: m.index, end: m.index + m[0].length, kind: "code" });
   const out: CitationMarker[] = [];
   for (const m of text.matchAll(/\[(\d{1,3})\](?!\()/g)) {
     const start = m.index;
     if (code.some((c) => start >= c.start && start < c.end)) continue;
     const n = Number(m[1]);
     if (n >= 1) out.push({ n, start, end: start + m[0].length });
+  }
+  return out;
+}
+
+const END = /[.!?。！？]/u;
+/**
+ * Markers that stand where a citation stands — at the end of a sentence: right before sentence punctuation (not
+ * `a[1].length`), right after it (`늘었다.[1]`), or at the end of a line after something that is not an ASCII name
+ * (`늘었다[1]`, not `x = a[1]`). Chained markers (`[1][2]`) count together. For answers that used no web tool:
+ * a marker there pretends to cite, so it is checked; `a[1]` in prose is not.
+ */
+export function sentenceEndMarkers(text: string): CitationMarker[] {
+  const all = citationMarkers(text);
+  const out: CitationMarker[] = [];
+  for (let i = 0; i < all.length;) {
+    let j = i;
+    while (j + 1 < all.length && all[j + 1]!.start === all[j]!.end) j++;
+    const before = text[all[i]!.start - 1] ?? "";
+    const after = text[all[j]!.end] ?? "";
+    const afterNext = text[all[j]!.end + 1] ?? "";
+    const atEnd =
+      (END.test(after) && !/[A-Za-z0-9_(]/.test(afterNext)) ||
+      /[.!?。！？"”)]/u.test(before) ||
+      ((after === "" || after === "\n" || after === "\r") && before !== "" && !/[A-Za-z0-9_\]]/.test(before));
+    if (atEnd) out.push(...all.slice(i, j + 1));
+    i = j + 1;
   }
   return out;
 }

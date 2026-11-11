@@ -29,46 +29,42 @@ export class CitationStore {
     const snippet = boundText(input.snippet, CITATION_LIMITS.snippet);
     const key = normalizeSnippet(snippet);
     if (Array.from(key).length < CITATION_LIMITS.minSnippet) throw new CiteRefused("cite_snippet_too_short");
+    const owner = this.db
+      .select({ ownerId: conversations.ownerId })
+      .from(conversations)
+      .where(eq(conversations.id, scope.conversationId))
+      .get();
+    if (owner?.ownerId !== scope.userId) throw new CiteRefused("cite_not_allowed");
+    const src = this.db
+      .select()
+      .from(sources)
+      .where(and(eq(sources.id, input.sourceId), eq(sources.conversationId, scope.conversationId)))
+      .get();
+    const mine = src && src.userId === scope.userId ? src : undefined;
+    const sourceId = mine?.id ?? null;
+    // Cheap checks first: a repeated citation or one over the limit costs no text comparison.
+    const existing = this.existing(scope.runId, key, sourceId);
+    if (existing) return existing;
+    if (this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
+    let status: CitationStatus;
+    let quote: string | null = null;
+    if (!mine) status = "unknown_source";
+    else if (mine.kind !== "page" || !mine.body) status = "fetch_failed";
+    else {
+      const m = findSnippet(mine.body, snippet, mine.bodyHash ?? undefined);
+      status = m.found ? "verified" : "snippet_not_found";
+      if (m.found) quote = m.quote;
+    }
+    // The transaction holds the numbering only (checked again inside it).
     return this.db.transaction(
-      (tx) => {
-        const owner = tx
-          .select({ ownerId: conversations.ownerId })
-          .from(conversations)
-          .where(eq(conversations.id, scope.conversationId))
-          .get();
-        if (owner?.ownerId !== scope.userId) throw new CiteRefused("cite_not_allowed");
-        const src = tx
-          .select()
-          .from(sources)
-          .where(and(eq(sources.id, input.sourceId), eq(sources.conversationId, scope.conversationId)))
-          .get();
-        const mine = src && src.userId === scope.userId ? src : undefined;
-        let status: CitationStatus;
-        let quote: string | null = null;
-        if (!mine) status = "unknown_source";
-        else if (mine.kind !== "page" || !mine.body) status = "fetch_failed";
-        else {
-          const m = findSnippet(mine.body, snippet);
-          status = m.found ? "verified" : "snippet_not_found";
-          if (m.found) quote = m.quote;
-        }
-        const sourceId = mine?.id ?? null;
-        const same = tx
-          .select()
-          .from(citations)
-          .where(and(eq(citations.runId, scope.runId), eq(citations.snippetKey, key)))
-          .all()
-          .find((c) => c.sourceId === sourceId);
-        if (same) return result(same.n, same.status, same.sourceId);
-        const count =
-          tx
-            .select({ c: sql<number>`count(*)` })
-            .from(citations)
-            .where(eq(citations.runId, scope.runId))
-            .get()?.c ?? 0;
+      () => {
+        const again = this.existing(scope.runId, key, sourceId);
+        if (again) return again;
+        const count = this.count(scope.runId);
         if (count >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
         const n = count + 1;
-        tx.insert(citations)
+        this.db
+          .insert(citations)
           .values({
             id: crypto.randomUUID(),
             runId: scope.runId,
@@ -85,6 +81,26 @@ export class CitationStore {
         return result(n, status, sourceId);
       },
       { behavior: "immediate" },
+    );
+  }
+
+  private existing(runId: string, key: string, sourceId: string | null): CiteResult | undefined {
+    const same = this.db
+      .select()
+      .from(citations)
+      .where(and(eq(citations.runId, runId), eq(citations.snippetKey, key)))
+      .all()
+      .find((c) => c.sourceId === sourceId);
+    return same ? result(same.n, same.status, same.sourceId) : undefined;
+  }
+
+  private count(runId: string): number {
+    return (
+      this.db
+        .select({ c: sql<number>`count(*)` })
+        .from(citations)
+        .where(eq(citations.runId, runId))
+        .get()?.c ?? 0
     );
   }
 

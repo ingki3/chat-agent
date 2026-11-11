@@ -1,7 +1,6 @@
 import {
   CITATION_STATUS_TEXT,
   CitationStatus,
-  citationMarkers,
   citationVerified,
   type CitationEntry,
   type CitationNotePart,
@@ -88,13 +87,15 @@ export function segments(text: string, note: CitationNotePart): Segment[] {
   for (const m of note.missing)
     if (m.start < m.end && m.end <= text.length)
       cuts.push({ start: m.start, end: m.end, seg: { kind: "missing", text: text.slice(m.start, m.end) } });
-  for (const m of citationMarkers(text))
-    if (!cuts.some((c) => m.start < c.end && m.end > c.start))
-      cuts.push({
-        start: m.start,
-        end: m.end,
-        seg: { kind: "marker", view: citationView(m.n, byN.get(m.n)) },
-      });
+  // The server's marker positions; one that does not fit the text (or is not `[n]` there) is ignored.
+  for (const m of note.markers ?? [])
+    if (m.start < m.end && m.end <= text.length && text.slice(m.start, m.end) === `[${m.n}]`)
+      if (!cuts.some((c) => m.start < c.end && m.end > c.start))
+        cuts.push({
+          start: m.start,
+          end: m.end,
+          seg: { kind: "marker", view: citationView(m.n, byN.get(m.n)) },
+        });
   cuts.sort((a, b) => a.start - b.start);
   const out: Segment[] = [];
   let pos = 0;

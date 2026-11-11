@@ -4,6 +4,8 @@ import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   publicParts,
   redactSecrets,
+  type CitationNotePart,
+  type FinanceNotePart,
   StreamEvent,
   type MessagePart,
   type Run,
@@ -710,7 +712,7 @@ export class RunManager {
     }
   }
 
-  private pushNote(row: RunRow, parts: MessagePart[], note: MessagePart): void {
+  private pushNote(row: RunRow, parts: MessagePart[], note: FinanceNotePart | CitationNotePart): void {
     parts.push(note);
     const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
     this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });
