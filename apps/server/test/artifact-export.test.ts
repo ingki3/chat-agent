@@ -1,4 +1,6 @@
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -14,6 +16,8 @@ import { createTestDb } from "../src/db/client.js";
 import {
   browserArgs,
   findBrowser,
+  parseMessage,
+  rendererSandbox,
   sandboxedLauncher,
   unsandboxedLauncher,
   type Launcher,
@@ -30,6 +34,8 @@ import {
 } from "../src/artifacts/export.js";
 import { CDN_ALLOW_LIST } from "../src/artifacts/serve.js";
 import { EXPORT_CODES as LOGGABLE_EXPORT_CODES } from "../src/observability/policy.js";
+import { buildProfile, runIsolated } from "../src/isolation/sandbox.js";
+import { REPO_ROOT } from "../src/config.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 /**
@@ -58,6 +64,8 @@ const app = {
 beforeAll(async () => {
   app.server = http.createServer((req, res) => {
     app.hits.push({ url: req.url ?? "", cookie: req.headers.cookie });
+    if (req.url === "/redirect-to-api")
+      return void res.writeHead(302, { location: "/api/after-redirect" }).end();
     res
       .writeHead(200, { "content-type": "text/plain", "access-control-allow-origin": "*" })
       .end("APP-SECRET");
@@ -540,4 +548,294 @@ describe("export routes (#51)", () => {
     expect(r.statusCode).toBe(503);
     expect(r.json()).toEqual({ error: "export_unavailable" });
   });
+});
+
+const FIXTURES = path.join(path.dirname(new URL(import.meta.url).pathname), "fixtures", "export");
+
+describe("the DevTools pipe is untrusted: a broken or hostile browser fails its render, never the server", () => {
+  it("message shapes: only objects with a positive integer id (reply) or a string method (event)", () => {
+    for (const bad of [
+      "null",
+      "[1]",
+      '"x"',
+      "1",
+      "{oops",
+      "{}",
+      '{"id":"1","result":{}}',
+      '{"id":0,"result":{}}',
+      '{"id":1.5,"result":{}}',
+      '{"id":1,"method":"x"}',
+      '{"method":5}',
+      '{"method":"x","params":null}',
+      '{"method":"x","params":[1]}',
+      '{"id":1,"result":"x"}',
+      '{"method":"x","sessionId":7}',
+    ])
+      expect(parseMessage(bad), bad).toBeUndefined();
+    expect(parseMessage('{"id":3,"result":{"a":1}}')).toEqual({ id: 3, result: { a: 1 } });
+    expect(parseMessage('{"method":"E","sessionId":"s","params":{}}')).toEqual({
+      method: "E",
+      sessionId: "s",
+      params: {},
+    });
+  });
+
+  it("in a separate Node process: closed before the navigation reply, malformed JSON, null, wrong id type, an unknown id, bad params, a bad reply, an oversized reply, a hang — the host survives, the browser is gone, the folder removed", () => {
+    const modes = [
+      "ok",
+      "close-before-navigate",
+      "null",
+      "badjson",
+      "array",
+      "wrong-id",
+      "unknown-id",
+      "bad-result",
+      "bad-reply",
+      "bad-params",
+      "huge",
+      "hang",
+    ];
+    const r = spawnSync(
+      path.join(REPO_ROOT, "node_modules/.bin/tsx"),
+      ["--conditions=development", path.join(FIXTURES, "host.ts"), ...modes],
+      { encoding: "utf8", cwd: REPO_ROOT, timeout: 60_000 },
+    );
+    expect(r.stderr).toBe("");
+    expect(r.status).toBe(0);
+    const { out, leftovers } = JSON.parse(r.stdout) as {
+      out: Record<string, { result: string; alive: boolean; ms: number }>;
+      leftovers: string[];
+    };
+    expect(leftovers).toEqual([]);
+    const want: Record<string, string> = {
+      ok: "ok:%PDF-fake",
+      huge: "export_limit",
+      hang: "export_timeout",
+    };
+    for (const m of modes) {
+      expect(out[m]!.result, m).toBe(want[m] ?? "export_failed");
+      expect(out[m]!.alive, m).toBe(false);
+      // A broken browser is killed at once, not asked to close (and waited for): well under the 1.5 s limit.
+      if (m !== "ok" && m !== "hang") expect(out[m]!.ms, m).toBeLessThan(1000);
+    }
+  }, 90_000);
+});
+
+describe("the production launcher's sandbox policy (checked on every platform)", () => {
+  const spec = () => {
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-policy-")));
+    const browserDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-browser-")));
+    const browser = path.join(browserDir, "chrome-headless-shell");
+    fs.writeFileSync(browser, "");
+    closers.push(async () => {
+      fs.rmSync(workDir, { recursive: true, force: true });
+      fs.rmSync(browserDir, { recursive: true, force: true });
+    });
+    return {
+      browser,
+      browserDir,
+      workDir,
+      proxyPort: 41234,
+      env: { HOME: path.join(workDir, "home"), TMPDIR: path.join(workDir, "tmp") },
+      args: browserArgs(path.join(workDir, "profile"), "http://127.0.0.1:41234"),
+    };
+  };
+
+  it("spawn options: the proxy port only, read = the browser's folder, write = the render's folder, its env, two pipes", () => {
+    const s = spec();
+    const o = rendererSandbox(s);
+    expect(o).toEqual({
+      command: s.browser,
+      args: s.args,
+      cwd: s.workDir,
+      env: s.env,
+      read: [],
+      trusted: [s.browserDir],
+      write: [s.workDir],
+      network: { loopbackPorts: [41234] },
+      extraPipes: 2,
+    });
+  });
+
+  it("the generated profile: deny by default, no fork, no other network, no other writes", () => {
+    const s = spec();
+    const profile = buildProfile(rendererSandbox(s));
+    const lines = profile.trim().split("\n");
+    expect(lines.slice(0, 2)).toEqual(["(version 1)", "(deny default)"]);
+    expect(profile).not.toMatch(/process-fork/);
+    expect(lines.filter((l) => l.includes("network"))).toEqual([
+      '(allow network-outbound (remote ip "localhost:41234"))',
+    ]);
+    expect(lines.filter((l) => l.includes("file-write"))).toEqual([
+      `(allow file-read* file-write* (subpath "${s.workDir}"))`,
+    ]);
+    expect(lines.filter((l) => l.startsWith("(allow process-exec"))).toEqual([
+      `(allow process-exec (literal "${s.browser}"))`,
+    ]);
+    expect(lines.filter((l) => l.includes("(subpath "))).toEqual([
+      `(allow file-read* (subpath "${s.browserDir}"))`,
+      `(allow file-read* file-write* (subpath "${s.workDir}"))`,
+    ]);
+    expect(lines.some((l) => l.includes("mach-lookup") || l.includes("(allow network*)"))).toBe(false);
+  });
+});
+
+/** A UDP listener on 127.0.0.1 that counts what arrives (STUN from WebRTC, anything else). */
+async function udpListener() {
+  const sock = dgram.createSocket("udp4");
+  const got = { n: 0 };
+  sock.on("message", () => got.n++);
+  await new Promise<void>((r) => sock.bind(0, "127.0.0.1", () => r()));
+  closers.push(() => new Promise<void>((r) => sock.close(() => r())));
+  return { port: sock.address().port, got };
+}
+
+const webrtcHtml = (udpPort: number) => `<!doctype html><p>rtc</p><script>
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${udpPort}" }] });
+  pc.createDataChannel("x");
+  pc.createOffer().then((o) => pc.setLocalDescription(o));
+</script>`;
+const dropWebrtcPolicy = (a: string[]) => a.filter((x) => !x.startsWith("--force-webrtc-ip-handling-policy"));
+
+describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", () => {
+  it("WebRTC: no UDP leaves the renderer (control: without the policy switch and the sandbox it does)", async () => {
+    const control = await udpListener();
+    const c = renderer({
+      launcher: unsandboxedLauncher,
+      test: { csp: false, intercept: false, proxy: false, args: dropWebrtcPolicy },
+    });
+    expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
+    expect(control.got.n).toBeGreaterThan(0);
+    const prod = await udpListener();
+    const p = renderer();
+    expect((await p.r.render(job("html", webrtcHtml(prod.port), "pdf"))).ok).toBe(true);
+    expect(prod.got.n).toBe(0);
+    // QUIC (HTTP/3 over UDP) is off too: everything is TCP to the proxy.
+    expect(browserArgs("/p", "http://127.0.0.1:1")).toContain("--disable-quic");
+  }, 60_000);
+
+  it("redirects: every hop is checked again — an allowed URL that redirects to the app is stopped at the hop", async () => {
+    app.hits.length = 0;
+    const redirect = `http://127.0.0.1:${app.port}/redirect-to-api`;
+    const { r, blocked } = renderer({
+      launcher: unsandboxedLauncher,
+      test: { csp: false, proxy: false, allowUrls: [redirect] },
+    });
+    const html = `<!doctype html><p>r</p><script>setTimeout(() => { location.href = "${redirect}"; }, 30);</script>`;
+    await r.render(job("html", html, "pdf"));
+    // The allowed first hop went out (so the test does exercise a redirect); its target never did.
+    expect(app.hits.map((h) => h.url)).toEqual(["/redirect-to-api"]);
+    expect(blocked).toContain(`http://127.0.0.1:${app.port}/api/after-redirect`);
+  }, 30_000);
+
+  it("data:, blob: and file: — a frame, a worker or a navigation from them reaches nothing, and no local file is read", async () => {
+    app.hits.length = 0;
+    const secretDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-secret-")));
+    closers.push(async () => fs.rmSync(secretDir, { recursive: true, force: true }));
+    const secret = path.join(secretDir, "secret.html");
+    fs.writeFileSync(secret, "<p>FAMILY-SECRET</p>");
+    const target = `http://127.0.0.1:${app.port}/api/from-data`;
+    const inner = encodeURIComponent(`<script>fetch("${target}");location.href="${target}"</script>`);
+    const html = `<!doctype html><p>d</p>
+<iframe src="data:text/html,${inner}"></iframe>
+<iframe src="file://${secret}"></iframe>
+<script>
+  const w = new Worker(URL.createObjectURL(new Blob(['fetch("http://127.0.0.1:${app.port}/api/from-blob")'], { type: "text/javascript" })));
+  setTimeout(() => { location.href = "file://${secret}"; }, 30);
+</script>`;
+    const seen: unknown[] = [];
+    const { r } = renderer({
+      test: {
+        csp: false,
+        afterLoad: async (send) => {
+          seen.push(
+            await send("Runtime.evaluate", { expression: "location.href + ' ' + document.body.innerText" }),
+          );
+        },
+      },
+    });
+    await r.render(job("html", html, "pdf"));
+    expect(app.hits).toEqual([]);
+    expect(JSON.stringify(seen)).not.toContain("FAMILY-SECRET");
+    expect(JSON.stringify(seen)).toContain(DOCUMENT_URL);
+  }, 30_000);
+});
+
+describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production launcher)", () => {
+  it("positive control: with every browser layer off, a document still renders inside the sandbox", async () => {
+    const { r } = renderer({
+      launcher: sandboxedLauncher,
+      test: { csp: false, intercept: false, proxy: false },
+    });
+    const png = ok(await r.render(job("chart", chart, "png")));
+    expect(isPng(png)).toBe(true);
+  }, 30_000);
+
+  it("files: the browser itself (asked over DevTools, past every web rule) cannot open a file outside its folders", async () => {
+    const secretDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-secret-")));
+    closers.push(async () => fs.rmSync(secretDir, { recursive: true, force: true }));
+    const secret = path.join(secretDir, "secret.html");
+    fs.writeFileSync(secret, "<p>FAMILY-SECRET</p>");
+    const read = async (launcher: Launcher) => {
+      const seen: unknown[] = [];
+      const { r } = renderer({
+        launcher,
+        test: {
+          afterLoad: async (send) => {
+            await send("Fetch.disable");
+            await send("Page.navigate", { url: `file://${secret}` });
+            await new Promise((res) => setTimeout(res, 500));
+            seen.push(
+              await send("Runtime.evaluate", { expression: "document.body ? document.body.innerText : ''" }),
+            );
+          },
+        },
+      });
+      await r.render(job("markdown", "x", "pdf"));
+      return JSON.stringify(seen);
+    };
+    expect(await read(unsandboxedLauncher)).toContain("FAMILY-SECRET"); // control
+    expect(await read(sandboxedLauncher)).not.toContain("FAMILY-SECRET");
+  }, 60_000);
+
+  it("WebRTC/UDP with the policy switch dropped and every browser layer off: the kernel stops the UDP", async () => {
+    const l = await udpListener();
+    const { r } = renderer({
+      launcher: sandboxedLauncher,
+      test: { csp: false, intercept: false, proxy: false, args: dropWebrtcPolicy },
+    });
+    expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
+    expect(l.got.n).toBe(0);
+  }, 30_000);
+
+  it("the renderer's network policy, probed directly: no DNS, no UDP, no TCP but the proxy port", async () => {
+    const l = await udpListener();
+    const listen = async () => {
+      const srv = net.createServer((c) => c.destroy());
+      await new Promise<void>((res) => srv.listen(0, "127.0.0.1", () => res()));
+      closers.push(() => new Promise<void>((res) => srv.close(() => res())));
+      return (srv.address() as AddressInfo).port;
+    };
+    const proxyPort = await listen();
+    const otherPort = await listen();
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
+    closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
+    const node = fs.realpathSync(process.execPath);
+    const policy = rendererSandbox({ browser: node, args: [], env: {}, workDir, proxyPort });
+    const r = await runIsolated({
+      ...policy,
+      command: node,
+      args: [path.join(FIXTURES, "net-probe.mjs"), String(l.port), String(proxyPort), String(otherPort)],
+      read: [FIXTURES],
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+    });
+    const out = JSON.parse(r.stdout) as Record<string, string>;
+    expect(out.tcpProxy).toBe("ok"); // positive control: the one allowed way works
+    expect(out.tcpOther).toMatch(/^err:/);
+    expect(out.udpLocal).toMatch(/^err:/);
+    expect(out.udpDns).toMatch(/^err:/);
+    expect(out.lookup).toMatch(/^err:/);
+    expect(l.got.n).toBe(0);
+  }, 30_000);
 });

@@ -9,6 +9,7 @@ import {
 } from "@agentlee/shared";
 import { EgressService, type EgressOptions } from "../isolation/egress.js";
 import { snapshot } from "../isolation/sandbox.js";
+import { z } from "zod";
 import { browserArgs, CdpError, CdpPipe, sandboxedLauncher, type Launcher } from "./browser.js";
 import { CDN_ALLOW_LIST, escapeHtml, page, serveVersion, type Served } from "./serve.js";
 
@@ -103,6 +104,10 @@ export type RenderTestHooks = {
   intercept?: boolean;
   /** Default true: the `--proxy-server` switch. */
   proxy?: boolean;
+  /** Changes the browser switches (e.g. drop the WebRTC policy to show the kernel stops UDP by itself). */
+  args?: (args: string[]) => string[];
+  /** More URLs interception lets through (redirect tests). */
+  allowUrls?: string[];
   /** Called after load with a DevTools `send` bound to the page (e.g. to read cookies). */
   afterLoad?: (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => Promise<void>;
   /** What the browser was started with. */
@@ -123,6 +128,32 @@ export type RendererOptions = {
   tmpDir?: string;
   test?: RenderTestHooks;
 };
+
+/**
+ * Shapes of the replies and events the renderer uses. The browser is untrusted (it runs the artifact in its own
+ * process): a reply that does not match fails the render (`export_failed`) — nothing is used unchecked.
+ */
+const TargetCreated = z.object({ targetId: z.string().min(1).max(200) });
+const Attached = z.object({ sessionId: z.string().min(1).max(200) });
+const Data = z.object({ data: z.string().regex(/^[A-Za-z0-9+/]*={0,2}$/) });
+const Size = z.number().finite().nonnegative();
+const Metrics = z.object({ cssContentSize: z.object({ width: Size, height: Size }) });
+const RequestPaused = z.object({
+  requestId: z.string().min(1).max(200),
+  request: z.object({ url: z.string().max(1_000_000) }),
+  resourceType: z.string().max(100).optional(),
+});
+
+export class BadReplyError extends Error {
+  constructor() {
+    super("bad devtools reply");
+  }
+}
+function reply<T>(schema: z.ZodType<T>, v: unknown): T {
+  const r = schema.safeParse(v);
+  if (!r.success) throw new BadReplyError();
+  return r.data;
+}
 
 type Session = {
   send: (method: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -184,7 +215,8 @@ export class Renderer {
     const profile = path.join(workDir, "profile");
     for (const d of [home, tmp, profile]) fs.mkdirSync(d, { mode: 0o700 });
     const env = { HOME: home, TMPDIR: tmp };
-    const args = browserArgs(profile, t.proxy === false ? undefined : proxy.url);
+    const base = browserArgs(profile, t.proxy === false ? undefined : proxy.url);
+    const args = t.args ? t.args(base) : base;
     t.launched?.({ args, env, workDir });
 
     let launched;
@@ -196,7 +228,7 @@ export class Renderer {
     }
     const { child, input, output } = launched;
     const pid = child.pid;
-    let killed: "timeout" | "memory" | "monitor" | undefined;
+    let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
     let exited = false;
     const exit = new Promise<void>((resolve) => {
       child.once("exit", () => {
@@ -238,6 +270,11 @@ export class Renderer {
         .finally(() => (sampling = false));
     }, 250);
     child.once("exit", () => cdp.close(new CdpError("closed")));
+    // A browser that breaks the protocol (malformed or oversized messages — possibly a compromised renderer) is
+    // not asked to close: it is killed at once.
+    cdp.onClose((e) => {
+      if (e.code !== "closed") kill("protocol");
+    });
 
     let result: RenderResult;
     try {
@@ -253,12 +290,16 @@ export class Renderer {
       };
     }
     if (killed === "timeout") result = { ok: false, code: "export_timeout" };
+    else if (killed === "protocol")
+      result = { ok: false, code: cdp.error?.code === "too_large" ? "export_limit" : "export_failed" };
     else if (killed) result = { ok: false, code: "export_limit" };
     clearTimeout(timer);
     clearInterval(monitor);
-    // Close politely, then make sure: the whole process group goes.
+    // A failed render (bad reply, protocol error, limit) is killed outright; a good one is closed politely, then
+    // made sure of: the whole process group goes either way.
+    if (!result.ok) kill("protocol");
     if (!exited) {
-      void cdp.send("Browser.close").catch(() => {});
+      void cdp.send("Browser.close");
       const hard = setTimeout(() => kill("monitor"), 2000);
       await exit;
       clearTimeout(hard);
@@ -272,21 +313,22 @@ export class Renderer {
   private async drive(cdp: CdpPipe, job: RenderJob): Promise<Buffer> {
     const t = this.o.test ?? {};
     const L = this.limits;
-    const { targetId } = await cdp.send<{ targetId: string }>("Target.createTarget", { url: "about:blank" });
-    const { sessionId } = await cdp.send<{ sessionId: string }>("Target.attachToTarget", {
-      targetId,
-      flatten: true,
-    });
+    const { targetId } = reply(TargetCreated, await cdp.send("Target.createTarget", { url: "about:blank" }));
+    const { sessionId } = reply(
+      Attached,
+      await cdp.send("Target.attachToTarget", { targetId, flatten: true }),
+    );
     const s: Session = { send: (m, p) => cdp.send(m, p ?? {}, sessionId) };
 
     // Layer 1: every request of the page stops here. The document is delivered once; exact CDN URLs go on (to the
     // proxy); anything else — the app, loopback, the home network, other hosts, the document navigating itself —
     // fails without leaving the browser.
     let delivered = false;
-    const cdn = new Set(CDN_ALLOW_LIST.map((c) => c.url));
+    const cdn = new Set([...CDN_ALLOW_LIST.map((c) => c.url), ...(t.allowUrls ?? [])]);
     const off = cdp.on((m) => {
       if (m.method !== "Fetch.requestPaused" || m.sessionId !== sessionId) return;
-      const p = m.params as { requestId: string; request: { url: string }; resourceType?: string };
+      // Throws on a malformed event: the pipe then closes and the render fails (CdpPipe.dispatch).
+      const p = RequestPaused.parse(m.params);
       const url = p.request.url;
       if (url === DOCUMENT_URL && !delivered && p.resourceType === "Document") {
         delivered = true;
@@ -297,21 +339,17 @@ export class Renderer {
             ? []
             : job.doc.csp.map((value) => ({ name: "Content-Security-Policy", value }))),
         ];
-        void s
-          .send("Fetch.fulfillRequest", {
-            requestId: p.requestId,
-            responseCode: 200,
-            responseHeaders: headers,
-            body: Buffer.from(job.doc.body, "utf8").toString("base64"),
-          })
-          .catch(() => {});
+        void s.send("Fetch.fulfillRequest", {
+          requestId: p.requestId,
+          responseCode: 200,
+          responseHeaders: headers,
+          body: Buffer.from(job.doc.body, "utf8").toString("base64"),
+        });
       } else if (cdn.has(url) || t.intercept === false) {
-        void s.send("Fetch.continueRequest", { requestId: p.requestId }).catch(() => {});
+        void s.send("Fetch.continueRequest", { requestId: p.requestId });
       } else {
         t.blocked?.(url);
-        void s
-          .send("Fetch.failRequest", { requestId: p.requestId, errorReason: "BlockedByClient" })
-          .catch(() => {});
+        void s.send("Fetch.failRequest", { requestId: p.requestId, errorReason: "BlockedByClient" });
       }
     });
     try {
@@ -329,9 +367,11 @@ export class Renderer {
         mobile: false,
       });
       if (!job.scripts) await s.send("Emulation.setScriptExecutionDisabled", { value: true });
-      const loaded = cdp.wait("Page.loadEventFired", sessionId);
-      await s.send("Page.navigate", { url: DOCUMENT_URL });
-      await loaded;
+      // Both at once: if the browser goes away during the navigation, both reject and both are handled here.
+      await Promise.all([
+        cdp.wait("Page.loadEventFired", sessionId),
+        s.send("Page.navigate", { url: DOCUMENT_URL }),
+      ]);
       await s.send("Runtime.evaluate", {
         expression: "document.fonts.ready.then(() => 1)",
         awaitPromise: true,
@@ -339,28 +379,32 @@ export class Renderer {
       if (job.scripts) await new Promise((r) => setTimeout(r, L.settleMs));
       await t.afterLoad?.((m, p) => s.send(m, p));
       if (job.format === "pdf") {
-        const { data } = (await s.send("Page.printToPDF", {
-          printBackground: true,
-          preferCSSPageSize: true,
-          paperWidth: 8.27,
-          paperHeight: 11.69,
-          marginTop: 0.4,
-          marginBottom: 0.4,
-          marginLeft: 0.4,
-          marginRight: 0.4,
-        })) as { data: string };
+        const { data } = reply(
+          Data,
+          await s.send("Page.printToPDF", {
+            printBackground: true,
+            preferCSSPageSize: true,
+            paperWidth: 8.27,
+            paperHeight: 11.69,
+            marginTop: 0.4,
+            marginBottom: 0.4,
+            marginLeft: 0.4,
+            marginRight: 0.4,
+          }),
+        );
         return Buffer.from(data, "base64");
       }
-      const metrics = (await s.send("Page.getLayoutMetrics")) as {
-        cssContentSize: { width: number; height: number };
-      };
+      const metrics = reply(Metrics, await s.send("Page.getLayoutMetrics"));
       const width = Math.min(Math.ceil(metrics.cssContentSize.width), L.width * 2);
       const height = Math.min(Math.ceil(metrics.cssContentSize.height), L.maxHeight);
-      const { data } = (await s.send("Page.captureScreenshot", {
-        format: "png",
-        captureBeyondViewport: true,
-        clip: { x: 0, y: 0, width: Math.max(width, 1), height: Math.max(height, 1), scale: 1 },
-      })) as { data: string };
+      const { data } = reply(
+        Data,
+        await s.send("Page.captureScreenshot", {
+          format: "png",
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width: Math.max(width, 1), height: Math.max(height, 1), scale: 1 },
+        }),
+      );
       return Buffer.from(data, "base64");
     } finally {
       off();

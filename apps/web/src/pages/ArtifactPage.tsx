@@ -43,8 +43,11 @@ const fileName = (title: string, ext: string) =>
  * Nothing of the sandboxed frame is touched — the SVG is fetched again from the owner-only download.
  */
 export async function captureChartPng(id: string, version: number): Promise<Blob> {
-  const res = await fetch(artifactDownloadPath(id, version), { credentials: "same-origin" });
-  if (!res.ok) throw new Error(`download ${res.status}`);
+  const res = await fetch(artifactDownloadPath(id, version), {
+    credentials: "same-origin",
+    redirect: "manual",
+  });
+  if (!isFile(res, "image/svg+xml")) throw new Error(`download ${res.status}`);
   const svg = await res.text();
   const box = /viewBox="0 0 (\d+(?:\.\d+)?) (\d+(?:\.\d+)?)"/.exec(svg);
   const w = Number(box?.[1] ?? 760);
@@ -75,10 +78,26 @@ export async function captureChartPng(id: string, version: number): Promise<Blob
   }
 }
 
+const EXPORT_TYPES: Record<ArtifactExportFormat, string> = { png: "image/png", pdf: "application/pdf" };
+
+/**
+ * Only the file itself counts: exactly 200 with the expected type. An expired session or gate answers with a
+ * redirect to a login page (refused: `redirect: "manual"` gives an opaque response) or an HTML/JSON error —
+ * never saved as a .png/.pdf.
+ */
+function isFile(res: Response, type: string): boolean {
+  if (res.type === "opaqueredirect" || res.status !== 200) return false;
+  const got = (res.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+  return got === type;
+}
+
 /** The server's isolated renderer (#51): the file, or an error with the server's code. */
 async function serverExport(id: string, version: number, format: ArtifactExportFormat): Promise<Blob> {
-  const res = await fetch(artifactExportPath(id, version, format), { credentials: "same-origin" });
-  if (!res.ok) throw new Error(`export ${res.status}`);
+  const res = await fetch(artifactExportPath(id, version, format), {
+    credentials: "same-origin",
+    redirect: "manual",
+  });
+  if (!isFile(res, EXPORT_TYPES[format])) throw new Error(`export ${res.status}`);
   return res.blob();
 }
 

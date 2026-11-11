@@ -399,3 +399,44 @@ test("document PDF from the isolated renderer; another family member gets 403 on
     expect((await son.request.get(path)).status(), path).toBe(403);
   await ctx.close();
 });
+
+test("an expired gate or session never turns into a saved PNG/PDF (login page, redirect or error body)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const { id } = await makeArtifact(page, baseURL!, "chart", "만료 시험", CHART);
+  await page.goto(`/a/${id}`);
+  await expect(page.getByTestId("artifact-export-png")).toBeVisible();
+  let downloads = 0;
+  page.on("download", () => downloads++);
+  const expectRefused = async (button: "png" | "pdf") => {
+    await page.getByTestId(`artifact-export-${button}`).click();
+    await expect(page.getByTestId("artifact-export-error")).toBeVisible();
+    await page.waitForTimeout(300);
+    expect(downloads).toBe(0);
+  };
+
+  // 1) The gate expired: every request is redirected to the gate page (which would answer 200 HTML).
+  const toGate = { status: 302, headers: { location: "/gate" } };
+  await page.route(`**/a/${id}/v/1/download`, (r) => r.fulfill(toGate));
+  await page.route(`**/a/${id}/v/1/png`, (r) => r.fulfill(toGate));
+  await page.route(`**/a/${id}/v/1/pdf`, (r) => r.fulfill(toGate));
+  await expectRefused("png");
+  await expectRefused("pdf");
+
+  // 2) A login page served as 200 HTML in place of the file.
+  await page.unrouteAll();
+  const login = { status: 200, contentType: "text/html", body: "<!doctype html><title>로그인</title>" };
+  await page.route(`**/a/${id}/v/1/download`, (r) => r.fulfill(login));
+  await page.route(`**/a/${id}/v/1/png`, (r) => r.fulfill(login));
+  await page.route(`**/a/${id}/v/1/pdf`, (r) => r.fulfill(login));
+  await expectRefused("png");
+  await expectRefused("pdf");
+
+  // 3) The session really ended (signed out elsewhere): the server answers 401.
+  await page.unrouteAll();
+  await page.context().clearCookies();
+  await expectRefused("png");
+  await expectRefused("pdf");
+});

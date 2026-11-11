@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { spawnIsolated } from "../isolation/sandbox.js";
+import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 
 /**
  * The headless browser behind PNG/PDF export (#51): Playwright's Chrome Headless Shell (the build pinned by the
@@ -88,6 +88,7 @@ export function browserArgs(userDataDir: string, proxy: string | undefined): str
     "--hide-scrollbars",
     "--disable-features=site-per-process,IsolateOrigins,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--disable-quic",
     ...(proxy ? [`--proxy-server=${proxy}`, "--proxy-bypass-list=<-loopback>"] : []),
     "about:blank",
   ];
@@ -116,13 +117,13 @@ const pipes = (child: ChildProcess): Launched => ({
 });
 
 /**
- * The browser in the process sandbox (macOS, `isolation/sandbox.ts`): reads its own folder (plus the OS
- * libraries and fonts of `system.sb`), writes only the render's folder, cannot fork, and reaches only the egress
- * proxy's loopback port — a request that slips past every check in the browser is still refused by the kernel.
- * Throws `SandboxUnavailableError` elsewhere (export is then unavailable: fail closed).
+ * What the production launcher hands `spawnIsolated` — pure, so its policy (and the profile `buildProfile` makes
+ * of it) is checked on every platform, Linux CI included: network = the proxy's loopback port only, reads = the
+ * browser's own folder, writes = the render's folder, the given environment only, no fork (the profile never
+ * allows it), the two debugging pipes.
  */
-export const sandboxedLauncher: Launcher = (s) => {
-  const child = spawnIsolated({
+export function rendererSandbox(s: LaunchSpec): SpawnIsolatedOptions {
+  return {
     command: s.browser,
     args: s.args,
     cwd: s.workDir,
@@ -132,7 +133,17 @@ export const sandboxedLauncher: Launcher = (s) => {
     write: [s.workDir],
     network: { loopbackPorts: [s.proxyPort] },
     extraPipes: 2,
-  });
+  };
+}
+
+/**
+ * The browser in the process sandbox (macOS, `isolation/sandbox.ts`): reads its own folder (plus the OS
+ * libraries and fonts of `system.sb`), writes only the render's folder, cannot fork, and reaches only the egress
+ * proxy's loopback port — a request that slips past every check in the browser is still refused by the kernel.
+ * Throws `SandboxUnavailableError` elsewhere (export is then unavailable: fail closed).
+ */
+export const sandboxedLauncher: Launcher = (s) => {
+  const child = spawnIsolated(rendererSandbox(s));
   // Nothing is read from stdout (stderr is drained by spawnIsolated): never let a full pipe block the browser.
   child.stdout.resume();
   return pipes(child);
@@ -152,15 +163,56 @@ export const unsandboxedLauncher: Launcher = (s) =>
     }),
   );
 
-/** A DevTools protocol reply or event. */
-type Message = {
+/**
+ * A DevTools protocol reply or event, after `parseMessage`. Everything on the pipe comes from the browser, which
+ * runs untrusted documents in its own process (`--single-process --no-sandbox`): a compromised renderer controls
+ * fd 4. So every message is checked before use, and anything malformed ends that render — never the server.
+ */
+export type Message = {
   id?: number;
   method?: string;
   params?: Record<string, unknown>;
   sessionId?: string;
   result?: Record<string, unknown>;
-  error?: { message: string };
+  error?: unknown;
 };
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** The shape of one pipe message, or undefined when it is not one (wrong JSON type, field types, neither kind). */
+export function parseMessage(text: string): Message | undefined {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isObject(v)) return undefined;
+  const m: Message = {};
+  if (v.id !== undefined) {
+    if (!Number.isSafeInteger(v.id) || (v.id as number) < 1) return undefined;
+    m.id = v.id as number;
+  }
+  if (v.method !== undefined) {
+    if (typeof v.method !== "string") return undefined;
+    m.method = v.method;
+  }
+  if (v.sessionId !== undefined) {
+    if (typeof v.sessionId !== "string") return undefined;
+    m.sessionId = v.sessionId;
+  }
+  for (const k of ["params", "result"] as const)
+    if (v[k] !== undefined) {
+      const x = v[k];
+      if (!isObject(x)) return undefined;
+      m[k] = x;
+    }
+  if (v.error !== undefined) m.error = v.error;
+  // A reply has an id; an event has a method; nothing else is a message.
+  if ((m.id === undefined) === (m.method === undefined)) return undefined;
+  return m;
+}
 
 export class CdpError extends Error {
   constructor(readonly code: "closed" | "too_large" | "protocol") {
@@ -168,9 +220,18 @@ export class CdpError extends Error {
   }
 }
 
+/** A promise whose rejection is never "unhandled" (the caller may await it later — or not at all). */
+function quiet<T>(p: Promise<T>): Promise<T> {
+  p.catch(() => {});
+  return p;
+}
+
 /**
  * DevTools protocol over the debugging pipe: NUL-separated JSON messages. Incoming bytes are bounded
- * (`maxBytes` per message): a reply larger than that (a huge screenshot) closes the connection.
+ * (`maxBytes` per message): a reply larger than that (a huge screenshot) closes the connection. A malformed
+ * message, or a listener that throws on one, closes it too (`protocol`); the render then fails and its process
+ * is killed. No promise of this class can reject unhandled (`quiet`), so a browser that dies at any moment
+ * cannot take the server down.
  */
 export class CdpPipe {
   private next = 1;
@@ -180,19 +241,27 @@ export class CdpPipe {
   private size = 0;
   private closed: CdpError | undefined;
   private readonly waiters = new Set<(e: CdpError) => void>();
+  private readonly closeHandlers = new Set<(e: CdpError) => void>();
 
   constructor(
     private readonly input: Writable,
     output: Readable,
     private readonly maxBytes: number,
   ) {
-    output.on("data", (d: Buffer) => this.take(d));
+    output.on("data", (d: Buffer) => {
+      try {
+        this.take(d);
+      } catch {
+        this.close(new CdpError("protocol"));
+      }
+    });
     output.on("error", () => this.close(new CdpError("closed")));
     output.on("close", () => this.close(new CdpError("closed")));
     input.on("error", () => this.close(new CdpError("closed")));
   }
 
   private take(d: Buffer) {
+    if (this.closed) return;
     let start = 0;
     for (let i = d.indexOf(0); i !== -1; i = d.indexOf(0, start)) {
       this.chunks.push(d.subarray(start, i));
@@ -202,12 +271,8 @@ export class CdpPipe {
       this.chunks = [];
       this.size = 0;
       start = i + 1;
-      let m: Message;
-      try {
-        m = JSON.parse(text) as Message;
-      } catch {
-        return this.close(new CdpError("protocol"));
-      }
+      const m = parseMessage(text);
+      if (!m) return this.close(new CdpError("protocol"));
       this.dispatch(m);
       if (this.closed) return;
     }
@@ -220,18 +285,31 @@ export class CdpPipe {
   private dispatch(m: Message) {
     if (m.id !== undefined) {
       const p = this.pending.get(m.id);
+      // A reply to nothing we asked: the other side is not following the protocol.
+      if (!p) return this.close(new CdpError("protocol"));
       this.pending.delete(m.id);
-      if (!p) return;
-      if (m.error) p.reject(new CdpError("protocol"));
+      if (m.error !== undefined) p.reject(new CdpError("protocol"));
       else p.resolve(m);
       return;
     }
-    for (const l of this.listeners) l(m);
+    for (const l of [...this.listeners]) {
+      try {
+        l(m);
+      } catch {
+        return this.close(new CdpError("protocol"));
+      }
+    }
   }
 
   /** Why the connection ended, if it did. */
   get error(): CdpError | undefined {
     return this.closed;
+  }
+
+  /** Called once when the connection ends (the renderer kills the process on a protocol error). */
+  onClose(fn: (e: CdpError) => void) {
+    if (this.closed) fn(this.closed);
+    else this.closeHandlers.add(fn);
   }
 
   close(e: CdpError) {
@@ -242,19 +320,20 @@ export class CdpPipe {
     this.pending.clear();
     for (const w of this.waiters) w(e);
     this.waiters.clear();
+    for (const h of this.closeHandlers) h(e);
+    this.closeHandlers.clear();
   }
 
-  send<T = Record<string, unknown>>(
-    method: string,
-    params: Record<string, unknown> = {},
-    sessionId?: string,
-  ): Promise<T> {
-    if (this.closed) return Promise.reject(this.closed);
+  /** One command; resolves with its `result` object (`{}` when there is none). */
+  send(method: string, params: Record<string, unknown> = {}, sessionId?: string) {
+    if (this.closed) return quiet(Promise.reject<Record<string, unknown>>(this.closed));
     const id = this.next++;
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: (m) => resolve((m.result ?? {}) as T), reject });
-      this.input.write(`${JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`);
-    });
+    return quiet(
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        this.pending.set(id, { resolve: (m) => resolve(m.result ?? {}), reject });
+        this.input.write(`${JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`);
+      }),
+    );
   }
 
   /** Calls `fn` for every event (until the returned function is called). */
@@ -263,22 +342,24 @@ export class CdpPipe {
     return () => this.listeners.delete(fn);
   }
 
-  /** The next event `method` (of `sessionId`) for which `match` holds. */
-  wait(method: string, sessionId?: string, match: (p: Record<string, unknown>) => boolean = () => true) {
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
-      if (this.closed) return reject(this.closed);
-      const fail = (e: CdpError) => {
-        off();
-        reject(e);
-      };
-      this.waiters.add(fail);
-      const off = this.on((m) => {
-        if (m.method === method && (!sessionId || m.sessionId === sessionId) && match(m.params ?? {})) {
+  /** The next event `method` (of `sessionId`); rejects when the connection ends first. */
+  wait(method: string, sessionId?: string) {
+    return quiet(
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        if (this.closed) return reject(this.closed);
+        const fail = (e: CdpError) => {
           off();
-          this.waiters.delete(fail);
-          resolve(m.params ?? {});
-        }
-      });
-    });
+          reject(e);
+        };
+        this.waiters.add(fail);
+        const off = this.on((m) => {
+          if (m.method === method && (!sessionId || m.sessionId === sessionId)) {
+            off();
+            this.waiters.delete(fail);
+            resolve(m.params ?? {});
+          }
+        });
+      }),
+    );
   }
 }
