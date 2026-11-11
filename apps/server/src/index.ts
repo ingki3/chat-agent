@@ -5,7 +5,11 @@ import { loadConfig } from "./config.js";
 
 const config = loadConfig();
 const storage = initStorage(config);
-const app = await buildApp(config, { vite: config.env === "development", db: storage.db });
+const app = await buildApp(config, {
+  vite: config.env === "development",
+  db: storage.db,
+  masterKey: storage.masterKey,
+});
 app.addHook("onClose", async () => storage.db.$client.close());
 
 try {

@@ -5,7 +5,14 @@ import {
   CreateUserResponse,
   CSRF_HEADER,
   Message,
+  Notification,
+  NotificationList,
+  NotificationPrefs,
+  PushCheckResponse,
+  PushDeviceList,
+  PushKey,
   ResetPasswordResponse,
+  UnreadCount,
   Run,
   StartRunResponse,
   type Role,
@@ -26,7 +33,7 @@ export const setUnauthenticatedHandler = (fn: () => void) => {
   onUnauthenticated = fn;
 };
 
-type Method = "GET" | "POST" | "PATCH" | "DELETE";
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 /**
  * The outer layers (Cloudflare Access, the temporary code page) answer with these when *their* login ran out.
@@ -64,7 +71,9 @@ async function call(method: Method, url: string, body?: unknown, headers: Record
         // Cloudflare Access answers an expired session with 401 (not a login-page redirect) for such requests.
         "X-Requested-With": "XMLHttpRequest",
         // Required on every state-changing call (CSRF, see apps/server/src/auth/plugin.ts).
-        ...(method === "GET" ? {} : { "Content-Type": "application/json", [CSRF_HEADER]: "1" }),
+        ...(method === "GET" ? {} : { [CSRF_HEADER]: "1" }),
+        // Only with a body: Fastify refuses an empty body declared as JSON (a body-less DELETE answered 400).
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         ...headers,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -142,6 +151,48 @@ export const conversations = {
     const r = (await call("GET", `/api/conversations/${enc(id)}/active-run`)) as { run: unknown };
     return r.run === null ? null : Run.parse(r.run);
   },
+};
+
+/** Every notification query lives under this key (badge and list), so one invalidation refreshes both. */
+export const NOTIFICATIONS_KEY = ["notifications"] as const;
+
+/** Inbox (🔔) and notification settings (#34). */
+export const notifications = {
+  list: async () => NotificationList.parse(await call("GET", "/api/notifications?limit=100")),
+  unread: async () => UnreadCount.parse(await call("GET", "/api/notifications/unread")).unread,
+  read: async (id: string) =>
+    Notification.parse(await call("POST", `/api/notifications/${enc(id)}/read`, {})),
+  readAll: async () => UnreadCount.parse(await call("POST", "/api/notifications/read-all", {})).unread,
+  test: async () => call("POST", "/api/notifications/test", {}),
+  prefs: async () => NotificationPrefs.parse(await call("GET", "/api/notifications/prefs")),
+  setPrefs: async (p: NotificationPrefs) =>
+    NotificationPrefs.parse(await call("PUT", "/api/notifications/prefs", p)),
+};
+
+/** Web push devices (#34). */
+export const push = {
+  key: async () => PushKey.parse(await call("GET", "/api/push/key")).publicKey,
+  /** The account's devices and this session's tag. */
+  devices: async () => PushDeviceList.parse(await call("GET", "/api/push/devices")),
+  /**
+   * Registers this browser for the session tagged `sessionTag` (409 `session_changed` if the browser is now
+   * signed in to another one); `replaces` = this session's older device, swapped in one server transaction.
+   */
+  register: async (sub: PushSubscriptionJSON, label: string, sessionTag: string, replaces?: string) =>
+    PushDeviceList.parse(
+      await call("POST", "/api/push/devices", {
+        ...sub,
+        label,
+        sessionTag,
+        ...(replaces ? { replaces } : {}),
+      }),
+    ),
+  /** Removes every device of this login session ("끄기" on this device). */
+  removeCurrent: async () => PushDeviceList.parse(await call("DELETE", "/api/push/devices/current")),
+  remove: async (id: string) => PushDeviceList.parse(await call("DELETE", `/api/push/devices/${enc(id)}`)),
+  /** Is this endpoint hash the one registered by my session? (compared on the server) */
+  check: async (endpointHash: string) =>
+    PushCheckResponse.parse(await call("POST", "/api/push/devices/check", { endpointHash })).match,
 };
 
 export const runs = {

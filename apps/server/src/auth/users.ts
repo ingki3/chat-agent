@@ -19,6 +19,8 @@ export const SESSION_TTL_MS = 30 * 24 * 3600_000;
 const TOUCH_MS = 60_000;
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+/** Database id of a session (the hash of its cookie token) — what push subscriptions are bound to (#34). */
+export const sessionIdOf = (token: string) => sha256(token);
 export const normalizeEmail = (e: string) => e.trim().toLowerCase();
 
 export function toAuthUser(u: UserRow): AuthUser {

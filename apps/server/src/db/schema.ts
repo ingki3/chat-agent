@@ -212,3 +212,85 @@ export const errorLog = sqliteTable(
   },
   (t) => [index("error_log_at_idx").on(t.at)],
 );
+
+/**
+ * In-app notifications (#34, FR-13.3) — the 🔔 inbox, and the push queue at the same time: `pushState` says what
+ * happens with the device push. Rows outlive a restart, so pushes held for quiet hours are still sent afterwards.
+ * - `queued`: to be pushed now (also what a push interrupted by a restart goes back to)
+ * - `held`: quiet hours — pushed as one bundle when they end
+ * - `sending` → `sent` (or `unsent`: no device took it); `cancelled`: permission gone at send time (hidden)
+ * `refKind`/`refId` name the resource the notification is about; access to it is re-checked before every push
+ * and every inbox read.
+ */
+export const notifications = sqliteTable(
+  "notifications",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    kind: text("kind").notNull(),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    url: text("url").notNull(),
+    refKind: text("ref_kind"),
+    refId: text("ref_id"),
+    pushState: text("push_state", {
+      enum: ["queued", "held", "sending", "sent", "unsent", "cancelled"],
+    }).notNull(),
+    createdAt: integer("created_at").notNull(),
+    readAt: integer("read_at"),
+  },
+  (t) => [
+    index("notifications_user_created_idx").on(t.userId, t.createdAt),
+    index("notifications_push_state_idx").on(t.pushState, t.userId),
+  ],
+);
+
+/**
+ * A device that receives web push (#34). Bound to the account *and* the login session that registered it:
+ * logging out, a password change elsewhere, deactivation or an expired session removes it (FK cascade).
+ * The endpoint is a bearer capability: it is stored encrypted (with keys) and found again by its hash.
+ */
+export const pushSubscriptions = sqliteTable(
+  "push_subscriptions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "cascade" }),
+    endpointHash: text("endpoint_hash").notNull().unique(),
+    /** Encrypted JSON `{ endpoint, keys: { p256dh, auth } }` (AAD `push:<id>`). */
+    secret: text("secret").notNull(),
+    label: text("label").notNull(),
+    createdAt: integer("created_at").notNull(),
+    lastSentAt: integer("last_sent_at"),
+  },
+  (t) => [index("push_subscriptions_user_idx").on(t.userId)],
+);
+
+/** Per-user notification settings (FR-12.8): quiet hours in the user's time zone ("HH:MM", null = off). */
+export const notificationPrefs = sqliteTable("notification_prefs", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  quietStart: text("quiet_start"),
+  quietEnd: text("quiet_end"),
+  timeZone: text("time_zone").notNull().default("Asia/Seoul"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * Per-session push generation (#34). Turning a device off (or removing it from another device) bumps it, and it
+ * is part of the session tag every registration must carry — so a re-registration that started before the "off"
+ * (a service worker request still in flight) is refused when it arrives. Gone with the session.
+ */
+export const pushSessionState = sqliteTable("push_session_state", {
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => sessions.id, { onDelete: "cascade" }),
+  generation: integer("generation").notNull().default(0),
+});

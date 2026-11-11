@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,11 @@ import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
 import { McpService, type McpServiceOptions } from "./mcp/service.js";
 import type { Db } from "./db/client.js";
+import { SettingsStore } from "./db/settings-store.js";
+import { KEY_LEN } from "./crypto/secrets.js";
+import { registerNotificationRoutes } from "./notifications/routes.js";
+import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
+import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
 import type { Config } from "./config.js";
@@ -64,6 +70,8 @@ declare module "fastify" {
     mcp: McpService | undefined;
     /** Recent errors (admin, #46); undefined without a database. */
     errors: ErrorLog | undefined;
+    /** Inbox, quiet hours and web push (#34); undefined without a database. Publishing points call `publish`. */
+    notifications: NotificationService | undefined;
   }
 }
 
@@ -95,9 +103,24 @@ export type BuildOptions = {
   sse?: { heartbeatMs?: number };
   /** User-admin overrides (tests). */
   userAdmin?: UserAdminOptions;
+  /**
+   * Master key for stored secrets (VAPID private key, push subscriptions). index.ts passes the real one; without
+   * it (tests) an ephemeral key is used, which production refuses.
+   */
+  masterKey?: Buffer;
+  /** Push transport / clock overrides (tests). */
+  notifications?: NotificationServiceOptions;
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
 };
+
+/** Tests without a master key: one throwaway key per database, so rebuilding the app on it still decrypts. */
+const ephemeralKeys = new WeakMap<Db, Buffer>();
+function ephemeralKey(db: Db): Buffer {
+  let key = ephemeralKeys.get(db);
+  if (!key) ephemeralKeys.set(db, (key = crypto.randomBytes(KEY_LEN)));
+  return key;
+}
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
   const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
@@ -188,6 +211,27 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerConversationRoutes(app, app.conversations!, runManager);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
+
+    if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
+    const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
+    const vapid = loadOrCreateVapidKeys(new SettingsStore(opts.db!, masterKey));
+    const notifications = new NotificationService(
+      opts.db!,
+      masterKey,
+      users,
+      app.resources,
+      vapid,
+      `https://${config.publicHost}`,
+      app.log,
+      opts.notifications,
+    );
+    app.decorate("notifications", notifications);
+    registerNotificationRoutes(app, notifications);
+    // Pushes held for quiet hours (or cut off by the last shutdown) are sent once their time has come.
+    app.addHook("onReady", async () => notifications.start());
+    app.addHook("onClose", async () => notifications.stop());
+  } else {
+    app.decorate("notifications", undefined);
   }
 
   app.get(

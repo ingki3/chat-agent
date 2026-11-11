@@ -1,5 +1,5 @@
 import os from "node:os";
-import { RuntimeId } from "@agentlee/shared";
+import { NotificationKind, RuntimeId } from "@agentlee/shared";
 
 /**
  * What may be written about an event (#46), shared by the log sanitiser and the recent-error store.
@@ -87,6 +87,7 @@ export const HTTP_METHODS = set([
 ]);
 
 export const isRuntime = member(RUNTIMES);
+export const isNotificationKind = member(set(NotificationKind.options));
 export const isStatus = member(STATUSES);
 export const isErrorCode = member(ERROR_CODES);
 export const isCategory = member(ERROR_CATEGORIES);

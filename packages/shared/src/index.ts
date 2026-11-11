@@ -3,6 +3,7 @@ import { RuntimeId } from "./runtime.js";
 
 export * from "./runtime.js";
 export * from "./chat.js";
+export * from "./notifications.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

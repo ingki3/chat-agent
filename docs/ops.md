@@ -11,6 +11,7 @@
 | 데이터 디렉토리 (DB, 파일, 아티팩트, 런타임 홈) | `<repo>/data` | `DATA_DIR` | 포함 (#37) |
 | SQLite DB | `<DATA_DIR>/agentlee.db` (WAL) | — | 포함 |
 | 암호화 마스터 키 | `~/.agentlee/master.key` | `MASTER_KEY_PATH` | **포함하지 않음** — 아래 3절 |
+| 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 11절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
 - 서버는 `MASTER_KEY_PATH`가 `DATA_DIR` 안에 있으면 시작을 거부한다.
@@ -158,8 +159,8 @@ rm ~/.agentlee/probe-headers.txt
 
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`). 로그 파일을 열거나 쓰지 못해도(디스크 가득, 권한 등) 서버는 시작하고 계속 돌며 그 줄만 버린다(파일에는 완전한 JSON 줄만 남는다 — 중간에 끊긴 줄은 잘라낸다). 다시 쓸 수 있게 되면 `log.line_dropped` 레코드에 버린 줄 수(`dropped`)를 남긴다.
 - 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + 우리 MCP 서버의 도구, 예 `mcp__agentlee__echo_time` — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
-  - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens`.
-  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `request.error`, `web.build_missing`, `error`, Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
+  - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`.
+  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
   - `pnpm test`의 유출 fixture 테스트(`apps/server/test/observability.test.ts`)가 대화 문장·키 패턴·쿠키·헤더·접속 코드·이메일을 요청·오류·실행·도구로 흘려 보내고, 로그와 관리자 오류 목록에 하나라도 나오면 실패한다.
 - 읽기:
@@ -233,3 +234,48 @@ rm ~/.agentlee/probe-headers.txt
   - `test/fixtures/claude-*.json`이 갱신된다.
   - 스크립트는 녹화에 자격 증명이 들어 있으면 쓰지 않는다.
 
+## 12. 웹 푸시 알림 (#34)
+
+구성: 서버 `apps/server/src/notifications/`(발행·알림함·방해 금지·전송) → `web-push`(VAPID, 암호화 푸시) → 브라우저 푸시 서비스(FCM·Apple·Mozilla·WNS) → 서비스 워커 `apps/web/public/sw.js`(알림 표시, 누르면 앱 안 주소로 이동).
+
+### 12.1 VAPID 키
+
+- 처음 시작할 때 한 번 만들어 DB `settings` 표에 둔다. 공개 키 `push.vapid.public`은 평문, 개인 키 `push.vapid.private`는 마스터 키로 AES-256-GCM 암호화(AAD `setting:push.vapid.private`). 화면·로그·API 어디에도 개인 키는 나오지 않는다(`GET /api/push/key`는 공개 키만).
+- VAPID subject는 `https://<PUBLIC_HOST>`(이메일을 푸시 서비스에 넘기지 않는다).
+- 기기 구독(엔드포인트·키)도 마스터 키로 암호화해 `push_subscriptions` 표에 둔다(AAD `push:<id>`). 엔드포인트는 그 기기로 푸시를 보낼 수 있는 주소라 로그·화면에 남기지 않는다.
+- **교체(로테이션)**: 키가 유출됐거나 바꿔야 하면 서비스를 멈추고
+  ```bash
+  sqlite3 data/agentlee.db "delete from settings where key in ('push.vapid.public','push.vapid.private'); delete from push_subscriptions;"
+  ```
+  후 다시 시작하면 새 키가 생긴다. 브라우저 구독은 공개 키에 묶여 있어 **모든 기기에서 설정 → 알림 → "이 기기에서 알림 켜기"를 다시 눌러야** 한다(앱이 키가 바뀐 구독을 알아서 버리고 새로 만든다). 알림함은 그대로 남는다.
+- 마스터 키를 잃으면 VAPID 개인 키도 읽을 수 없다 — 위 교체 절차와 같다.
+
+### 12.2 동작 규칙
+
+- 구독은 **계정 + 로그인 세션**에 묶인다. 로그아웃, 다른 기기의 비밀번호 변경(그 기기 세션 종료), 비활성화, 세션 만료(30일), 같은 브라우저에서 다른 계정 로그인, 푸시 서비스의 404/410 응답 → 그 기기 구독이 지워진다. 기기는 **로그인 세션당 1개**(새 등록·워커의 구독 갱신 등록은 같은 트랜잭션에서 그 세션의 이전 기기를 바꾼다), 계정당 최대 20개(넘으면 오래된 것부터). "끄기"는 이 세션의 기기를 모두 지운다(`DELETE /api/push/devices/current`). 끄기(또는 다른 기기에서 그 기기를 끄기)는 그 세션의 **푸시 세대**(`push_session_state`, 마이그레이션 0006)를 올린다. 세션 태그는 세션 id와 세대의 HMAC이라, 끄기 전에 출발한 워커 재등록은 낡은 태그로 도착해 409로 거부된다. 직접 "알림 켜기"를 누르면 새 태그를 읽어 다시 켜진다. 푸시 서비스의 404/410 삭제는 끄기가 아니라 세대를 올리지 않는다.
+- 엔드포인트는 등록할 때 검사한다: `https`, 기본 포트, 알려진 푸시 서비스 호스트만(`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com` 등). IP 주소·`localhost`·사설 이름은 거부(서버가 집 안 네트워크로 요청을 보내게 만들 수 없다).
+- 본문은 서버가 종류별 문구로 만든다: 2줄·줄당 80자 이내, 공유 알림은 "누가 무엇을" 만(내용 없음), 공유로만 보이는 결과는 고정 문구. 주소는 같은 출처 경로만(`/c/<id>`).
+- **전송 직전 재검사**: 계정 활성, 관리자 전용 종류(`system_warning`, `daily_cost`)는 관리자에게만, 알림이 가리키는 리소스(공유 대화 등)를 아직 읽을 수 있는지. 실패하면 푸시를 취소하고 알림함에서도 숨긴다.
+- **방해 금지**: 사용자 시간대 기준 시작~끝(자정 넘김 가능). 그동안 온 알림은 `held`로 DB에 남고, 끝나면 1분 안에 한 번에 묶어 보낸다("알림 N개가 와 있어요" + 첫 두 제목, 누르면 🔔 알림함). 서버를 다시 시작해도 남아 있고, 시작할 때 때가 지난 것은 바로 보낸다. 끊긴 전송(`sending`)도 다시 보낸다.
+- 알림함 항목은 90일 뒤 지운다. 숨겨진 항목(공유 해제·관리자 아님)은 읽음 처리 API도 404로 답한다(목록과 같은 규칙).
+- **알림 누르기**: 서비스 워커가 열린 앱 창을 그 주소로 **이동**시키고(`client.navigate`, 로그인 화면이어도) 앞으로 가져온다. 창이 없으면 새로 연다. 이동할 수 없는 창(워커가 아직 제어하지 않는 창)이면 앱이 메시지를 받아 로그인 전에도 그 주소로 바꾼다. 앱 세션이 끝났으면 그 주소에서 로그인 화면이 뜨고 로그인 후 그 화면이 열린다. 주소는 정규화한 뒤에도 같은 출처 단일 `/` 경로인지 다시 본다(`/a/..//host` 거부).
+- **구독 갱신**: 브라우저가 구독을 바꾸면(`pushsubscriptionchange`) 워커가 새 구독을 **켰던 로그인 세션에만** 등록한다 — 요청에 그 세션의 불투명 태그(`sessionTag`, 세션 id의 HMAC)를 실어 보내고, 브라우저가 그사이 다른 세션·계정으로 로그인했으면 서버가 409(`session_changed`)로 거부한다. 실패하면(오프라인, Access·앱 세션 만료로 401/403, 409) 그 세션 태그를 담은 표시를 남기고, **같은 세션**으로 앱이 다시 시작될 때 등록한다. 다른 세션·계정이 보면 표시를 지우고 꺼진 채로 둔다. 앱은 시작할 때와 설정 → 알림을 열 때마다 **브라우저의 실제 구독**을 이 세션의 서버 등록과 서버에서 비교한다(`POST /api/push/devices/check` — 일치 여부만 답하고, 기기 목록에는 엔드포인트를 가리키는 값이 없다): 구독이 없으면 서버 등록을 지우고, 다르면 `replaces`로 **한 트랜잭션에서** 바꾸며(등록이 실패하면 예전 등록이 그대로 남아 다음 시작에 다시 시도), 같을 때만 "켜짐"으로 보인다. 다른 기기에서 끈 기기나 새 로그인은 자동으로 켜지 않는다("알림 켜기"를 다시 누른다). 등록 요청은 페이지·워커 모두 **항상** 세션 태그를 보내야 한다(없으면 400, 다르면 409) — 동기화 도중 다른 탭에서 계정이 바뀌어도 그 계정에 묶이지 않고, 앱은 복구 표시·결속을 지우고 꺼진 채로 둔다. "끄기"는 복구 표시와 결속을 먼저 지우고, 브라우저가 구독 해제에 실패하면 서버 등록은 지운 채 그 사실을 화면에 알린다(다음 시작에도 다시 켜지지 않는다).
+
+### 12.3 발행 지점 (다른 이슈에서 연결)
+
+서버 코드에서 `app.notifications.publish(userId, input)`(형식은 `apps/server/src/notifications/compose.ts`의 `PublishInput`):
+
+| 종류 | 입력 | 연결할 이슈 |
+|---|---|---|
+| `schedule_succeeded` / `schedule_failed` | 예약 이름, 결과 요약 또는 실패 이유, 결과 메시지 주소, (공유 예약이면) `ref` | #33, #56 |
+| `share_received` | 공유한 사람 이름, 항목 제목, 주소, `ref`(공유 리소스 — 공유 해제 시 취소) | #29, #52 |
+| `connection_lost` | 런타임 이름 | #17 |
+| `daily_cost` (관리자) | 오늘 비용, 기준 | #32 |
+| `system_warning` (관리자) | 서버가 쓴 짧은 고정 문구 | #35 |
+
+### 12.4 시험 방법
+
+- 자동: `pnpm test`(`apps/server/test/notifications.test.ts` — 가짜 푸시 서비스·가짜 시계로 방해 금지 묶음, 재시작 복구, 권한 재검사, 404/410, 로그아웃·비활성화, 엔드포인트 검사, 로그 비노출), `pnpm e2e`(`e2e/notifications.spec.ts` — 권한 요청은 버튼에서만, 차단 상태, 기기 등록·로그아웃 해제, 알림함·배지, 딥링크).
+- 수동(PC): 운영 빌드(`pnpm build && pnpm start`)를 `http://localhost:3000`으로 열고 로그인 → 설정 → 알림 → "이 기기에서 알림 켜기" → 허용 → "테스트 알림". 개발 모드(`pnpm dev`)는 서비스 워커를 등록하지 않아 "지원 안 됨"으로 보인다.
+- 실기기(Android Chrome, iPhone 홈 화면 앱): `docs/evidence/push/checklist.md`를 따라 하고 결과를 그 파일에 적는다. 휴대폰은 HTTPS가 필요하므로 `https://chat.2prostream.com`으로 접속한다.
+- 문제 확인: `jq -c 'select(.msg|startswith("push."))' /Library/Logs/agentlee/server.log` — 보낸 수, 받은 기기 수, 실패 상태 코드만 나온다.

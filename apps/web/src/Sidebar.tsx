@@ -1,8 +1,9 @@
 import { useDeferredValue, useState, type RefObject } from "react";
-import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
 import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
-import { auth, conversations, errorText } from "./api.js";
+import { auth, conversations, errorText, notifications, NOTIFICATIONS_KEY } from "./api.js";
+import { unsubscribeOnSignOut } from "./push.js";
 
 export const CONVERSATIONS_KEY = ["conversations"] as const;
 
@@ -31,7 +32,18 @@ export function Sidebar({
   const items = list.data?.pages.flatMap((p) => p.items);
   const pinned = items?.filter((c) => c.pinned) ?? [];
   const recent = items?.filter((c) => !c.pinned) ?? [];
-  const signOut = async () => props.onSignedOut(await auth.logout());
+  // Unread badge (FR-13.3): refreshed on focus, every minute, and at once when a push arrives (Shell).
+  const unread = useQuery({
+    queryKey: [...NOTIFICATIONS_KEY, "unread"],
+    queryFn: notifications.unread,
+    refetchInterval: 60_000,
+  });
+  const badge = unread.data ?? 0;
+  const signOut = async () => {
+    // This browser stops getting this account's pushes (the server drops the device with the session too).
+    await unsubscribeOnSignOut();
+    props.onSignedOut(await auth.logout());
+  };
 
   return (
     <aside
@@ -48,9 +60,19 @@ export function Sidebar({
       <div className="brand">
         <span className="logo">AL</span>Agent Lee
         <span className="grow" />
-        <button type="button" className="ghost" title="알림함 (#34)" aria-label="알림함" disabled>
+        <NavLink
+          to="/notifications"
+          className="ghost bell"
+          aria-label={badge ? `알림함, 안 읽은 알림 ${badge}개` : "알림함"}
+          title="알림함"
+        >
           🔔
-        </button>
+          {badge > 0 && (
+            <span className="badge count" data-testid="unread-badge">
+              {badge > 99 ? "99+" : badge}
+            </span>
+          )}
+        </NavLink>
         <button type="button" className="ghost close-drawer" aria-label="메뉴 닫기" onClick={props.onClose}>
           ✕
         </button>

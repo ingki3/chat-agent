@@ -1,6 +1,9 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Outlet } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
+import { NOTIFICATIONS_KEY } from "./api.js";
+import { PUSH_DEVICES_KEY, syncPush } from "./push.js";
 import { Sidebar } from "./Sidebar.js";
 
 type ShellCtx = { openDrawer: (trigger: HTMLElement) => void };
@@ -16,6 +19,7 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabi
  */
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
   const [drawer, setDrawer] = useState(false);
+  usePushMessages();
   // The drawer exists only at 900px and below: widening the window closes it (and with it the modal state).
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
@@ -117,4 +121,24 @@ export function TopBar({ title, children }: { title: ReactNode; children?: React
       {children}
     </div>
   );
+}
+
+/**
+ * Push on this account (#34): a push arrived → refresh the 🔔 badge at once; and on every app start, make the
+ * server's registration match this browser's real subscription (a renewal the service worker could not
+ * register — e.g. 403 after Access expired — is registered now). Tapped notifications are handled before login
+ * too, in App (`useNotificationOpen`).
+ */
+function usePushMessages() {
+  const qc = useQueryClient();
+  useQuery({ queryKey: PUSH_DEVICES_KEY, queryFn: syncPush, staleTime: 60_000, retry: false });
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (e: MessageEvent) => {
+      if ((e.data as { type?: unknown } | null)?.type === "agentlee:notification")
+        void qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY });
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [qc]);
 }
