@@ -716,11 +716,17 @@ describe("tunnel status: cloudflared's loopback metrics server only (#35)", () =
       state: "unreachable",
       readyConnections: null,
     });
-    expect(paths.length).toBe(21);
+    // The cap counts bytes: ~2,000 Hangul characters are ~6 KB in UTF-8 but only 2,000 string units.
+    answer = { status: 200, body: `{"readyConnections":4,"pad":"${"가".repeat(2000)}"}` };
+    expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({
+      state: "unreachable",
+      readyConnections: null,
+    });
+    expect(paths.length).toBe(22);
     // A host that is not a loopback IP literal is never asked — not even "localhost" or this machine's name.
     for (const host of ["localhost", os.hostname(), "10.0.0.5", "example.com"])
       expect(await tunnelStatus({ host, port })).toEqual({ state: "unreachable", readyConnections: null });
-    expect(paths.length).toBe(21);
+    expect(paths.length).toBe(22);
     expect(await tunnelStatus(undefined)).toEqual({ state: "unconfigured", readyConnections: null });
     // Closed port.
     const closed = http.createServer();

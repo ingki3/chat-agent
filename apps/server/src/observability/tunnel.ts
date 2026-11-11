@@ -71,16 +71,21 @@ export async function tunnelStatus(
         headers: { accept: "application/json" },
       },
       (res) => {
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (c: string) => {
-          body += c;
-          if (body.length > MAX_READY_BYTES) {
+        // Counted in bytes, not UTF-16 units, so a multi-byte body can't exceed the cap.
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        res.on("data", (c: Buffer) => {
+          bytes += c.length;
+          if (bytes > MAX_READY_BYTES) {
             finish(undefined);
             req.destroy();
+            return;
           }
+          chunks.push(c);
         });
-        res.on("end", () => finish({ status: res.statusCode ?? 0, body }));
+        res.on("end", () =>
+          finish({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }),
+        );
         res.on("error", () => finish(undefined));
         res.on("close", () => finish(undefined));
       },
