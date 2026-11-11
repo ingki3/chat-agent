@@ -13,6 +13,7 @@
     "keygen": "tsx --conditions=development src/cli/keygen.ts"
   },
   "dependencies": {
+    "@agentlee/mcp-tools": "workspace:*",
     "@agentlee/shared": "workspace:*",
     "@fastify/middie": "9.3.6",
     "@fastify/static": "10.1.10",
@@ -26,6 +27,7 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@types/better-sqlite3": "9.6.0",
     "drizzle-kit": "0.31.11"
   }

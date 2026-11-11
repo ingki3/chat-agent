@@ -7,7 +7,13 @@ import type { Db } from "../db/client.js";
 import { runEvents, runs } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
 import { McpTokens } from "../isolation/tokens.js";
-import { SessionGoneError, type RuntimeRegistry, type RuntimeSession, type RuntimeTurn } from "./adapter.js";
+import {
+  SessionGoneError,
+  type RuntimeRegistry,
+  type RuntimeSession,
+  type RuntimeTurn,
+  type StartContext,
+} from "./adapter.js";
 
 export type RunRow = typeof runs.$inferSelect;
 /** In-memory state of a run that is being executed by this process. */
@@ -110,6 +116,10 @@ export type RunManagerOptions = {
   /** After interrupt(), how long the runtime gets to stop before the run is ended without it. */
   interruptGraceMs?: number;
   systemPrompt?: string;
+  /** Our MCP server (#43). Without it, runtimes get no tools. */
+  mcp?: { endpoint(): Promise<{ url: string }>; toolNames(): string[] };
+  /** Token store shared with the MCP server. Default: a private one (then no MCP server can check its tokens). */
+  mcpTokens?: McpTokens;
 };
 
 /**
@@ -120,7 +130,7 @@ export type RunManagerOptions = {
 export class RunManager {
   private readonly live = new Map<string, Live>();
   /** MCP call tokens: one per run, revoked when the run ends (#42). */
-  readonly mcpTokens = new McpTokens();
+  readonly mcpTokens: McpTokens;
   /** Set by shutdown(): no new run may start after that. */
   private stopping = false;
   private readonly now: () => number;
@@ -135,6 +145,7 @@ export class RunManager {
   ) {
     this.now = opts.now ?? Date.now;
     this.flushMs = opts.flushMs ?? 500;
+    this.mcpTokens = opts.mcpTokens ?? new McpTokens();
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
       for (const [id, live] of this.live) if (live.conversationId === conversationId) this.drop(id, live);
@@ -422,19 +433,27 @@ export class RunManager {
   ): Promise<{ session: RuntimeSession; sessionRowId: string; revision: number }> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
-    const ctx = {
+    const mcp = adapter.capabilities().usesTools ? this.opts.mcp : undefined;
+    const ctx: StartContext = {
       conversationId: run.conversationId,
       history: history.map((m) => ({ role: m.role, parts: publicParts(m.parts as MessagePart[]) })),
       systemPrompt: this.opts.systemPrompt ?? "",
       model: run.model,
       effort: run.effort ?? undefined,
-      tools: [],
-      mcpToken: this.mcpTokens.issue({
-        userId: run.userId,
-        conversationId: run.conversationId,
-        runId: run.id,
-      }),
+      tools: mcp ? mcp.toolNames() : [],
     };
+    if (mcp) {
+      const { url } = await mcp.endpoint(); // a server that cannot start fails the run (no silent tool loss)
+      if (live.settled || live.interruptRequested || this.stopping) throw new RunEndedError();
+      ctx.mcp = {
+        url,
+        token: this.mcpTokens.issue({
+          userId: run.userId,
+          conversationId: run.conversationId,
+          runId: run.id,
+        }),
+      };
+    }
     // Resume only a session that saw exactly this history (#45 refines the matching and summarising), and only
     // on runtimes that can resume at all.
     const lastSeen = history.at(-1)?.id ?? null;

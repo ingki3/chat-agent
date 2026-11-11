@@ -64,3 +64,26 @@
   - run 범위 MCP 토큰
   - 두 런타임의 내장 도구 잠금 설정: `runtime/lockdown.ts`
 - **남은 것:** 실제 런타임(#15 Claude, #16 Codex)을 이 래퍼·설정으로 실행한다. "허용 MCP 호출 성공 + 금지 접근 실패"를 같은 시험에서 확인하는 일은 각 어댑터 이슈에서 이 모듈로 한다.
+
+## 공통 MCP 서버 연결 (#43)
+- 우리 MCP 서버(`packages/mcp-tools`)는 Agent Lee 서버 프로세스 안에서 **별도 루프백 포트**(`127.0.0.1:임의 포트`, Streamable HTTP, 경로 `/mcp`)로 연다.
+  - 공개 앱 포트(3000, 터널 연결)와는 다른 포트라서 바깥에서는 닿지 않는다.
+  - 도구를 쓰는 런타임(`capabilities().usesTools`)의 첫 실행 때 연다. 가짜 런타임이나 테스트에서는 포트를 열지 않는다.
+- 요청은 하나하나 따로 확인하고(세션 상태 없음), 다음 경우 거부한다.
+  - 경로가 `/mcp`가 아님
+  - Host가 루프백 주소이면서 이 포트가 아님(DNS 리바인딩 방지)
+  - 브라우저 `Origin` 헤더가 있음
+  - POST가 아님
+  - 본문이 1MB를 넘음
+  - run 범위 토큰(`Authorization: Bearer`)이 없거나, 만료·폐기됐거나, 비활성 사용자의 것임
+  - 도구가 끝났을 때 run이 이미 끝나 토큰이 폐기됐으면, 그 결과도 버린다.
+- 런타임 설정(`runtime/lockdown.ts`):
+  - **Claude:** `mcpServers.agentlee = { type: "http", url, headers: { Authorization } }`
+  - **Codex:** `config.toml`에는 `url`과 `bearer_token_env_var = "AGENTLEE_MCP_TOKEN"`만 적는다. 토큰은 app-server 환경 변수로만 넘긴다(`codexMcpEnv`).
+  - 샌드박스 네트워크는 `{ loopbackPorts: [mcpLoopbackPort(mcp)] }`이다.
+- **스킬:** 허용 목록(`BUNDLED_SKILLS`, 지금은 검증용 `selftest` 하나)에 있는 것만 `skill_<이름>` 도구로 보인다. 실행은 `runIsolated`로 한다.
+  - 읽기: 스킬 폴더와 node 설치 폴더만
+  - 쓰기·네트워크·자식 프로세스·환경 변수: 없음
+  - 입력은 실행 전에 검증한다.
+  - macOS가 아니면 `skill_unavailable`로 거부한다.
+- 샌드박스 프로파일은 허용 경로 **상위 폴더들의 메타데이터(stat)** 를 읽게 한다. 내용과 목록은 읽지 못한다. node가 스크립트 경로를 `realpath`로 풀 때 상위 폴더를 하나씩 stat하기 때문이다.

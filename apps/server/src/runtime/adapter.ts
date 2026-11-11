@@ -1,4 +1,5 @@
 import type { PublicPart, RuntimeId } from "@agentlee/shared";
+import type { McpConnection } from "./lockdown.js";
 
 /**
  * Runtime adapter contract (PRD FR-11 table, spike #39). The server never runs an agent loop itself; each
@@ -20,6 +21,8 @@ export type RuntimeCapabilities = {
   canSwitchModelInSession: boolean;
   /** Session can be resumed by id (`resume`). */
   canResume: boolean;
+  /** Calls our MCP server (real runtimes). False: the run gets no tools and no MCP port is opened for it. */
+  usesTools: boolean;
 };
 
 /** What a fresh session gets: the server's history (summarised by #45 when long) and the turn's settings. */
@@ -30,10 +33,13 @@ export type StartContext = {
   systemPrompt: string;
   model: string;
   effort?: string | undefined;
-  /** Allowed tools (common MCP server + allow-listed skills, #43/#21). */
+  /** Allowed tools of our MCP server, without the `mcp__agentlee__` prefix (#43, skills #21). */
   tools: string[];
-  /** Token the runtime's MCP calls carry: scoped to this user, conversation and run (#42). */
-  mcpToken?: string;
+  /**
+   * Our MCP server for this run: loopback URL + a token scoped to this user, conversation and run (#42/#43).
+   * Adapters turn it into runtime settings with `claudeLockdown` / `codexConfigToml` + `codexMcpEnv`.
+   */
+  mcp?: McpConnection;
 };
 
 /** Normalised events. `reasoning_delta` is stored but never streamed to the browser. */
