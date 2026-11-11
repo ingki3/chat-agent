@@ -4,7 +4,7 @@ import { and, asc, eq, gt, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { publicParts, StreamEvent, type MessagePart, type Run, type RuntimeId } from "@agentlee/shared";
 import type { ConversationStore, MessageRow } from "../conversations/store.js";
 import type { Db } from "../db/client.js";
-import { runEvents, runs } from "../db/schema.js";
+import { runEvents, runs, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
 import { McpTokens } from "../isolation/tokens.js";
 import {
@@ -19,6 +19,7 @@ import { logEvent, type EventLogger } from "../logging.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
+import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -140,7 +141,11 @@ export type RunManagerOptions = {
   flushMs?: number;
   /** After interrupt(), how long the runtime gets to stop before the run is ended without it. */
   interruptGraceMs?: number;
-  systemPrompt?: string;
+  /**
+   * Instruction templates (#20). Default: the repository's `apps/server/instructions/`, read at construction so a
+   * broken template stops the server at startup, not on the first run.
+   */
+  instructions?: Templates;
   /** Our MCP server (#43). Without it, runtimes get no tools. */
   mcp?: { endpoint(): Promise<{ url: string }>; toolNames(): string[] };
   /** Token store shared with the MCP server. Default: a private one (then no MCP server can check its tokens). */
@@ -164,6 +169,7 @@ export class RunManager {
   private stopping = false;
   private readonly now: () => number;
   private readonly flushMs: number;
+  private readonly templates: Templates;
 
   constructor(
     private readonly db: Db,
@@ -175,6 +181,7 @@ export class RunManager {
     this.now = opts.now ?? Date.now;
     this.flushMs = opts.flushMs ?? 500;
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
+    this.templates = opts.instructions ?? defaultTemplates();
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -272,6 +279,7 @@ export class RunManager {
           model: model?.id ?? assistant.model ?? "unknown",
           effort:
             (model && assistant.model === model.id ? assistant.effort : null) ?? model?.defaultEffort ?? null,
+          instructions: null,
           idempotencyKey: input.idempotencyKey ?? null,
           nextEventSeq: 1,
           createdAt: this.now(),
@@ -506,14 +514,29 @@ export class RunManager {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
     const mcp = adapter.capabilities().usesTools ? this.opts.mcp : undefined;
+    const tools = mcp ? trustOurTools(mcp.toolNames()) : [];
+    // The same instructions for every runtime (#20): built per run from the user, the conversation and the tools.
+    const user = this.db.select({ youth: users.youth }).from(users).where(eq(users.id, run.userId)).get();
+    const instructions = assembleInstructions({
+      user: { youth: user?.youth === true },
+      mode: conv.researchMode ? "research" : "normal",
+      tools,
+      now: new Date(this.now()),
+      templates: this.templates,
+    });
+    this.db
+      .update(runs)
+      .set({ instructions: instructions.versions.join(",") })
+      .where(eq(runs.id, run.id))
+      .run();
     const ctx: StartContext = {
       conversationId: run.conversationId,
       userId: run.userId,
       history: history.map((m) => ({ role: m.role, parts: publicParts(m.parts as MessagePart[]) })),
-      systemPrompt: this.opts.systemPrompt ?? "",
+      systemPrompt: instructions.text,
       model: run.model,
       effort: run.effort ?? undefined,
-      tools: mcp ? trustOurTools(mcp.toolNames()) : [],
+      tools,
     };
     if (mcp) {
       const { url } = await mcp.endpoint(); // a server that cannot start fails the run (no silent tool loss)
@@ -527,8 +550,9 @@ export class RunManager {
         }),
       };
     }
-    // Resume only a session that saw exactly this history (#45 refines the matching and summarising), and only
-    // on runtimes that can resume at all.
+    // Resume only a session that saw exactly this history (#45 refines the matching and summarising), was started
+    // with exactly these instructions (runtimes keep their start prompt: a new date, mode or template version
+    // needs a fresh session), and only on runtimes that can resume at all.
     const lastSeen = history.at(-1)?.id ?? null;
     const prev = !adapter.capabilities().canResume
       ? undefined
@@ -538,7 +562,8 @@ export class RunManager {
             (s) =>
               s.runtime === run.runtime &&
               s.conversationRevision === conv.revision &&
-              s.lastMessageId === lastSeen,
+              s.lastMessageId === lastSeen &&
+              s.instructionsHash === instructions.hash,
           );
     if (prev) {
       try {
@@ -563,6 +588,7 @@ export class RunManager {
         externalSessionId: session.externalSessionId,
         lastMessageId: lastSeen,
         conversationRevision: conv.revision,
+        instructionsHash: instructions.hash,
       });
       return { session, sessionRowId: row.id, revision: conv.revision };
     } catch (e) {

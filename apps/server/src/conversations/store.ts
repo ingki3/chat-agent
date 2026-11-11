@@ -29,6 +29,7 @@ export function toConversation(c: ConversationRow): Conversation {
     lastRuntime: (c.lastRuntime as RuntimeId | null) ?? null,
     forkedFrom: c.forkedFrom ?? null,
     revision: c.revision,
+    researchMode: c.researchMode,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -103,6 +104,7 @@ export class ConversationStore {
       forkedFrom: opts.forkedFrom ?? null,
       lastRuntime: null,
       revision: 0,
+      researchMode: false,
       nextSeq: 1,
       createdAt: t,
       updatedAt: t,
@@ -164,6 +166,11 @@ export class ConversationStore {
       .set({ title, titleSource: "user", updatedAt: this.now() })
       .where(eq(conversations.id, id))
       .run();
+  }
+
+  /** 자료 조사 모드 (FR-5.5). Not activity either; the next run picks it up (new instructions → fresh session). */
+  setResearchMode(id: string, researchMode: boolean): void {
+    this.db.update(conversations).set({ researchMode }).where(eq(conversations.id, id)).run();
   }
 
   setPinned(id: string, pinned: boolean): void {
@@ -397,6 +404,8 @@ export class ConversationStore {
     externalSessionId: string;
     lastMessageId: string | null;
     conversationRevision: number;
+    /** Fingerprint of the instructions the session started with (#20). */
+    instructionsHash?: string | null;
   }): SessionRow {
     const conv = this.get(s.conversationId);
     if (!conv) throw new Error("conversation not found");
@@ -411,6 +420,7 @@ export class ConversationStore {
       externalSessionId: s.externalSessionId,
       lastMessageId: s.lastMessageId,
       conversationRevision: s.conversationRevision,
+      instructionsHash: s.instructionsHash ?? null,
       invalidated: false,
       createdAt: t,
       updatedAt: t,

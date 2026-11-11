@@ -19,6 +19,8 @@ export const users = sqliteTable("users", {
     .default(sql`'{"runtimes":["claude-code","codex"],"models":"all","skills":"all"}'`),
   /** The user's default runtime for new conversations (FR-12); null = service default. */
   defaultRuntime: text("default_runtime"),
+  /** Youth account (PRD NFR 청소년 — the son, 고2): its runs get the youth safety and learning-support instructions. */
+  youth: integer("youth", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at").notNull().default(now),
   updatedAt: integer("updated_at").notNull().default(now),
 });
@@ -69,6 +71,8 @@ export const conversations = sqliteTable(
     forkedFrom: text("forked_from"),
     lastRuntime: text("last_runtime"),
     revision: integer("revision").notNull().default(0),
+    /** "자료 조사 모드" toggle (FR-5.5): runs in this conversation get the research instructions (#20). */
+    researchMode: integer("research_mode", { mode: "boolean" }).notNull().default(false),
     /** Next message sequence number (per conversation, monotonically increasing). */
     nextSeq: integer("next_seq").notNull().default(1),
     createdAt: integer("created_at").notNull().default(now),
@@ -129,6 +133,11 @@ export const runtimeSessions = sqliteTable(
     /** Last message the runtime has seen, and the conversation revision at that point. */
     lastMessageId: text("last_message_id"),
     conversationRevision: integer("conversation_revision").notNull(),
+    /**
+     * Fingerprint of the system instructions the session was started with (#20). A session is resumed only with
+     * the same instructions — runtimes keep the start prompt, so a changed one needs a fresh session.
+     */
+    instructionsHash: text("instructions_hash"),
     invalidated: integer("invalidated", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),
@@ -158,6 +167,8 @@ export const runs = sqliteTable(
     runtime: text("runtime").notNull(),
     model: text("model").notNull(),
     effort: text("effort"),
+    /** Instruction template versions the run used, e.g. `common@1,youth@1` (#20); null until its session opens. */
+    instructions: text("instructions"),
     /** Client `Idempotency-Key`: the same key from the same user returns the same run. */
     idempotencyKey: text("idempotency_key"),
     /** Next event sequence number (SSE id). */

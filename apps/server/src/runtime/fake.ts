@@ -23,7 +23,7 @@ export type FakeStep =
   | { text: string }
   | { reasoning: string }
   | { delayMs: number }
-  | { tool: string; ms: number; output?: unknown; isError?: boolean }
+  | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
   | { usage: { inputTokens: number; outputTokens: number; costUsd?: number } }
   | { notice: string }
   | { limit: string }
@@ -66,6 +66,8 @@ export class FakeRuntime implements RuntimeAdapter {
   /** Sessions opened and closed — tests check that the run manager releases every session it opens. */
   opened = 0;
   closed = 0;
+  /** System prompts of the sessions started, in order — tests check what the run manager assembled (#20). */
+  readonly systemPrompts: string[] = [];
   /** Sessions this "runtime" remembers (forget() simulates a runtime that lost them). */
   private readonly sessions = new Map<string, { model: string; memory: string[] }>();
 
@@ -104,6 +106,7 @@ export class FakeRuntime implements RuntimeAdapter {
 
   async start(ctx: StartContext): Promise<RuntimeSession> {
     const id = `fake-${crypto.randomUUID()}`;
+    this.systemPrompts.push(ctx.systemPrompt);
     const memory = ctx.history
       .flatMap((h) => h.parts.map((p) => (p.type === "text" ? p.text : "")))
       .filter(Boolean);
@@ -143,7 +146,7 @@ export class FakeRuntime implements RuntimeAdapter {
             else if ("delayMs" in step) await sleep(step.delayMs, ctrl.signal);
             else if ("tool" in step) {
               const callId = `call-${++seq}`;
-              yield { type: "tool_start", callId, name: step.tool, input: { ms: step.ms } };
+              yield { type: "tool_start", callId, name: step.tool, input: step.input ?? { ms: step.ms } };
               await sleep(step.ms, ctrl.signal);
               if (ctrl.signal.aborted) return;
               yield {

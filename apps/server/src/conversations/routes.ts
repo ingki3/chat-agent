@@ -83,6 +83,7 @@ export function registerConversationRoutes(
     if (!body) return reply;
     if (body.title !== undefined) store.rename(req.params.id, body.title);
     if (body.pinned !== undefined) store.setPinned(req.params.id, body.pinned);
+    if (body.researchMode !== undefined) store.setResearchMode(req.params.id, body.researchMode);
     return reply.send(toConversation(store.get(req.params.id)!));
   });
 

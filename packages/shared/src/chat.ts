@@ -108,6 +108,8 @@ export const Conversation = z.object({
   forkedFrom: z.string().nullable(),
   /** Bumped whenever history is rewritten (edit / regenerate). Runtime sessions record which they reflect. */
   revision: z.number().int(),
+  /** 자료 조사 모드 (FR-5.5): compare several sources, say when evidence is weak (#20). */
+  researchMode: z.boolean(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -122,8 +124,14 @@ export const ListConversationsQuery = z.object({
 });
 export const CreateConversationRequest = z.object({ title: z.string().trim().min(1).max(200).optional() });
 export const UpdateConversationRequest = z
-  .object({ title: z.string().trim().min(1).max(200).optional(), pinned: z.boolean().optional() })
-  .refine((v) => v.title !== undefined || v.pinned !== undefined, { message: "nothing to update" });
+  .object({
+    title: z.string().trim().min(1).max(200).optional(),
+    pinned: z.boolean().optional(),
+    researchMode: z.boolean().optional(),
+  })
+  .refine((v) => v.title !== undefined || v.pinned !== undefined || v.researchMode !== undefined, {
+    message: "nothing to update",
+  });
 export const ListMessagesQuery = z.object({
   /** Return messages with seq below this (older page). */
   before: z.coerce.number().int().positive().optional(),
