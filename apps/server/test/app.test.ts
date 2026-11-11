@@ -125,7 +125,7 @@ describe("logging", () => {
       msg: "run.finished",
       note: "확인",
       credentials: { msg: "SECRET-SPLIT" },
-      runId: "r9",
+      runId: "7c9e6679-7425-40de-944b-e07fc1f90ae7",
     });
     const bytes = Buffer.from(record + "\n");
     const hangul = bytes.indexOf(Buffer.from("확"));
@@ -135,7 +135,10 @@ describe("logging", () => {
     const got = await run(parts);
     expect(got).toHaveLength(1);
     expect(got[0]).not.toContain("SECRET-SPLIT");
-    expect(JSON.parse(got[0]!)).toMatchObject({ msg: "run.finished", runId: "r9" });
+    expect(JSON.parse(got[0]!)).toMatchObject({
+      msg: "run.finished",
+      runId: "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    });
     // A final record without a trailing newline is emitted exactly once on end().
     const tail = await run([Buffer.from(record.slice(0, 10)), Buffer.from(record.slice(10))]);
     expect(tail).toHaveLength(1);
@@ -149,20 +152,27 @@ describe("logging", () => {
     const { default: Fastify } = await import("fastify");
     const { loggerOptions } = await import("../src/logging.js");
     const app = Fastify({ logger: loggerOptions(stream) });
+    // buildApp registers route patterns the same way; only registered patterns may be logged.
+    const { registerRoutePattern } = await import("../src/observability/policy.js");
+    app.addHook("onRoute", (r) => registerRoutePattern(r.url));
     apps.push(app);
     app.get("/boom", async () => {
       throw new Error("THROWN-WITH-USER-DATA");
     });
     app.post("/x", async (req) => {
       req.log
-        .child({ apiKey: "sk-CHILD", credentials: { password: "PW-CHILD" }, runId: "r1" })
+        .child({
+          apiKey: "sk-CHILD",
+          credentials: { password: "PW-CHILD" },
+          runId: "16fd2706-8baf-433b-82eb-8c7fada847da",
+        })
         .info("tool.finished");
       req.log.info(
         {
           apiKey: "sk-TOPLEVEL",
           credentials: { password: "PW-NESTED" },
           content: "MY-PRIVATE-PROMPT",
-          conversationId: "c1",
+          conversationId: "886313e1-3b8a-4372-9b90-0c9aee199e5d",
         },
         "run.finished",
       );
@@ -194,8 +204,8 @@ describe("logging", () => {
     ]) {
       expect(out, leak).not.toContain(leak);
     }
-    expect(out).toContain('"conversationId":"c1"');
+    expect(out).toContain('"conversationId":"886313e1-3b8a-4372-9b90-0c9aee199e5d"');
     expect(out).toContain('"url":"/x"');
-    expect(out).toContain('"runId":"r1"');
+    expect(out).toContain('"runId":"16fd2706-8baf-433b-82eb-8c7fada847da"');
   });
 });

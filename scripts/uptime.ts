@@ -27,6 +27,8 @@ export const DEFAULT_TOKEN_FILE = path.join(os.homedir(), ".agentlee", "uptime-t
 export const DEFAULT_LOCAL = "http://127.0.0.1:3000/api/health";
 export const DEFAULT_EXTERNAL = "https://chat.2prostream.com/api/health";
 export const INTERVAL_MS = 5 * 60_000;
+/** How late a scheduled check may start and still count as on time (launchd start delay, clock jitter). */
+export const TOLERANCE_MS = 60_000;
 export const TIMEOUT_MS = 10_000;
 export const TARGET = 0.99;
 const DAY = 24 * 3600_000;
@@ -164,7 +166,7 @@ export type UptimeReport = {
   target: number;
   /** ok / (slots − planned − unmeasured). Null when nothing could be measured. */
   uptime: number | null;
-  /** 5-minute slots in the window (2016 for 7 days). */
+  /** Scheduled checks in the window (2016 for 7 days at 5 minutes): recorded slots + missed ones. */
   slots: number;
   /** Checks actually recorded in the window. */
   recorded: number;
@@ -176,29 +178,42 @@ export type UptimeReport = {
 };
 
 /**
- * The verdict. The window is cut into 5-minute slots; each slot takes the first check recorded in it. A slot
- * without any check counts as a failure ("missing": the Mac or the checker was down — the checker runs on the
- * same Mac, so a power cut leaves no record at all). Slots overlapping a planned stop are excluded and shown.
+ * The verdict. Checks run on a schedule (launchd StartInterval: every `intervalMs` after the previous start),
+ * so each recorded check stands for one scheduled slot, and the gaps between checks say how many were missed:
+ * a gap longer than one interval plus `toleranceMs` (a late start, clock jitter) means a check that never ran.
+ * A missed check counts as a failure ("missing": the Mac or the checker was down — the checker runs on the
+ * same Mac, so a power cut leaves no record at all). Checks closer together than half an interval (a restart
+ * runs one at load) are one slot, and the worst of them counts. Slots in a planned stop are excluded and shown.
  */
 export function computeUptime(
   records: UptimeRecord[],
-  opts: { now: number; days?: number; intervalMs?: number; target?: number },
+  opts: { now: number; days?: number; intervalMs?: number; toleranceMs?: number; target?: number },
 ): UptimeReport {
   const days = opts.days ?? 7;
   const iv = opts.intervalMs ?? INTERVAL_MS;
+  const tol = opts.toleranceMs ?? TOLERANCE_MS;
   const target = opts.target ?? TARGET;
   const to = opts.now;
   const from = to - days * DAY;
-  const slots = Math.floor((to - from) / iv);
   const planned = plannedWindows(records, to);
-  const checks = records
-    .filter((r): r is CheckRecord => r.kind === "check" && r.at >= from && r.at < from + slots * iv)
+  const inPlanned = (t: number) => planned.some(([a, b]) => t >= a && t < b);
+  const all = records
+    .filter((r): r is CheckRecord => r.kind === "check" && r.at < to)
     .sort((a, b) => a.at - b.at);
-  const bySlot = new Map<number, CheckRecord>();
-  for (const c of checks) {
-    const i = Math.floor((c.at - from) / iv);
-    if (!bySlot.has(i)) bySlot.set(i, c);
+
+  // Merge checks that belong to one slot; the worst result wins.
+  const rank = (c: CheckRecord) => {
+    const r = resultOf(c);
+    return r === "ok" ? 0 : r === "unmeasured" ? 1 : r === "tunnel" ? 2 : 3;
+  };
+  const kept: CheckRecord[] = [];
+  for (const c of all) {
+    const last = kept.at(-1);
+    if (last && c.at - last.at < iv / 2) {
+      if (rank(c) > rank(last)) kept[kept.length - 1] = { ...c, at: last.at };
+    } else kept.push(c);
   }
+
   const counts: Record<SlotResult, number> = {
     ok: 0,
     app: 0,
@@ -208,29 +223,43 @@ export function computeUptime(
     unmeasured: 0,
   };
   const failures: UptimeReport["failures"] = [];
-  for (let i = 0; i < slots; i++) {
-    const s = from + i * iv;
-    const e = s + iv;
-    let result: SlotResult;
-    if (planned.some(([a, b]) => a < e && b > s)) result = "planned";
+  const mark = (t: number, result: SlotResult) => {
+    if (t < from || t >= to) return;
+    const r = result !== "planned" && inPlanned(t) ? "planned" : result;
+    counts[r]++;
+    if (r === "app" || r === "tunnel" || r === "missing")
+      failures.push({ at: new Date(t).toISOString(), kind: r });
+  };
+  const missedBetween = (a: number, b: number) => {
+    const n = Math.max(0, Math.ceil((b - a - iv - tol) / iv));
+    for (let k = 1; k <= n; k++) mark(a + k * iv, "missing");
+  };
+
+  let prev = [...kept].reverse().find((c) => c.at < from)?.at;
+  const inWindow = kept.filter((c) => c.at >= from);
+  for (const c of inWindow) {
+    if (prev !== undefined) missedBetween(prev, c.at);
     else {
-      const c = bySlot.get(i);
-      if (!c) result = "missing";
-      else if ("skipped" in c.external) result = "unmeasured";
-      else if (c.external.ok) result = "ok";
-      else result = "ok" in c.local && c.local.ok ? "tunnel" : "app";
+      // No check before the window: the slots before the first one were missed (coverage is reported below).
+      const n = Math.max(0, Math.floor((c.at - from - tol) / iv));
+      for (let k = n; k >= 1; k--) mark(c.at - k * iv, "missing");
     }
-    counts[result]++;
-    if (result === "app" || result === "tunnel" || result === "missing")
-      failures.push({ at: new Date(s).toISOString(), kind: result });
+    mark(c.at, resultOf(c));
+    prev = c.at;
   }
+  if (prev !== undefined) {
+    const n = Math.max(0, Math.floor((to - prev - tol) / iv));
+    for (let k = 1; k <= n; k++) mark(prev + k * iv, "missing");
+  } else {
+    for (let t = from; t + iv <= to; t += iv) mark(t, "missing");
+  }
+
+  const slots = Object.values(counts).reduce((a, b) => a + b, 0);
   const denominator = slots - counts.planned - counts.unmeasured;
   const uptime = denominator > 0 ? counts.ok / denominator : null;
   const reasons: string[] = [];
-  const firstCheck = records
-    .filter((r): r is CheckRecord => r.kind === "check")
-    .reduce<number | undefined>((m, r) => (m === undefined || r.at < m ? r.at : m), undefined);
-  if (firstCheck === undefined || firstCheck >= from + iv)
+  const firstCheck = all[0]?.at;
+  if (firstCheck === undefined || firstCheck >= from + iv + tol)
     reasons.push(`recording has not covered ${days} days yet`);
   if (counts.unmeasured > 0)
     reasons.push(`${counts.unmeasured} checks without the external path (no service token)`);
@@ -246,11 +275,17 @@ export function computeUptime(
     target,
     uptime,
     slots,
-    recorded: checks.length,
+    recorded: all.filter((c) => c.at >= from).length,
     denominator,
     counts,
-    failures: failures.reverse().slice(0, 50),
+    failures: failures.sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 50),
   };
+}
+
+function resultOf(c: CheckRecord): SlotResult {
+  if ("skipped" in c.external) return "unmeasured";
+  if (c.external.ok) return "ok";
+  return "ok" in c.local && c.local.ok ? "tunnel" : "app";
 }
 
 export function formatReport(r: UptimeReport): string {
@@ -259,7 +294,7 @@ export function formatReport(r: UptimeReport): string {
   return [
     `가동률 ${pct} (목표 ${r.target * 100}%) — ${verdict}`,
     `기간 ${r.from} ~ ${r.to}`,
-    `분모 ${r.denominator} = 5분 칸 ${r.slots} − 계획 정지 ${r.counts.planned} − 외부 미측정 ${r.counts.unmeasured} (기록된 체크 ${r.recorded})`,
+    `분모 ${r.denominator} = 예정 체크 ${r.slots} − 계획 정지 ${r.counts.planned} − 외부 미측정 ${r.counts.unmeasured} (기록된 체크 ${r.recorded})`,
     `성공 ${r.counts.ok} · 앱 실패 ${r.counts.app} · 터널 실패 ${r.counts.tunnel} · 기록 없음 ${r.counts.missing}`,
     ...r.reasons.map((x) => `- ${x}`),
   ].join("\n");

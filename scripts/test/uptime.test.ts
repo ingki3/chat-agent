@@ -92,6 +92,61 @@ describe("uptime report", () => {
     expect(r2.counts.planned).toBe(60);
   });
 
+  it("tolerates jitter and late starts, but counts real misses, outages and restarts correctly", () => {
+    const at = (i: number, delay = 0): CheckRecord => ({
+      kind: "check",
+      at: FROM + i * INTERVAL_MS + 1000 + delay,
+      local: ok,
+      external: ok,
+    });
+    const series = (delay: (i: number) => number, skip: (i: number) => boolean = () => false) =>
+      Array.from({ length: SLOTS }, (_, i) => i)
+        .filter((i) => !skip(i))
+        .map((i) => at(i, delay(i)));
+
+    // ±1 s alternating (the review's case: was 50 %), and late starts up to 50 s.
+    const jitter = computeUptime(
+      series((i) => (i % 2 ? 1000 : -1000)),
+      { now: NOW },
+    );
+    expect(jitter.counts).toMatchObject({ ok: 2016, missing: 0 });
+    expect(jitter.verdict).toBe("pass");
+    const late = computeUptime(
+      series((i) => (i * 7919) % 50_000),
+      { now: NOW },
+    );
+    expect(late.counts.missing).toBe(0);
+    expect(late.slots).toBe(2016);
+
+    // One check that never ran is one miss; a 1-hour outage (12 checks) is 12.
+    expect(
+      computeUptime(
+        series(
+          () => 0,
+          (i) => i === 500,
+        ),
+        { now: NOW },
+      ).counts.missing,
+    ).toBe(1);
+    const outage = computeUptime(
+      series(
+        () => 0,
+        (i) => i >= 700 && i < 712,
+      ),
+      { now: NOW },
+    );
+    expect(outage.counts.missing).toBe(12);
+    expect(outage.slots).toBe(2016);
+
+    // A restart runs one extra check at load (20 s later): still one slot, and the worse result counts.
+    const restart = series(() => 0);
+    restart.push({ ...at(900), at: at(900).at + 20_000, local: down, external: down });
+    const r = computeUptime(restart, { now: NOW });
+    expect(r.slots).toBe(2016);
+    expect(r.counts).toMatchObject({ ok: 2015, app: 1, missing: 0 });
+    expect(r.recorded).toBe(2017);
+  });
+
   it("refuses a verdict before 7 days are recorded or without the external path", () => {
     const partial = week().filter((r) => r.kind !== "check" || r.at > FROM + DAY);
     const r = computeUptime(partial, { now: NOW });

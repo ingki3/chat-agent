@@ -157,7 +157,7 @@ rm ~/.agentlee/probe-headers.txt
 ### 9.1 앱 로그
 
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`).
-- 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값도 모양을 검사한다(아이디는 아이디 모양, 상태는 코드 모양, 숫자는 숫자). 맞지 않으면 그 필드를 버린다. `apps/server/src/logging.ts`가 기준이다.
+- 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + MCP 서버가 등록한 도구 — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
   - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens`.
   - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `request.error`, `web.build_missing`, `error`, Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
@@ -169,15 +169,15 @@ rm ~/.agentlee/probe-headers.txt
   jq -c 'select(.level>=40)' /Library/Logs/agentlee/server.log      # 경고·오류만
   jq -c 'select(.conversationId=="<대화 ID>")' /Library/Logs/agentlee/server.log   # 대화별 도구 호출·비용·오류
   ```
-- 오류 응답: 5xx는 브라우저에도 `{"error":"internal_error"}`만 보낸다(오류 원문 없음).
+- 오류 응답: 5xx는 브라우저에도 `{"error":"internal_error"}`만, 4xx는 상태별 고정 코드(`invalid_request`, `payload_too_large` 등)만 보낸다. 라우팅 전에 나는 오류(잘못된 퍼센트 인코딩 등)도 `{"error":"invalid_request"}`와 보안 헤더로 답한다(요청 URL을 되돌려 주지 않음).
 
 ### 9.2 최근 오류 (관리자)
 
-- `GET /api/admin/errors?limit=50&source=run|tool|http` (관리자만, 최대 200건). 항목: 시각·출처·오류 코드·분류·사용자/대화/실행 ID·런타임·도구명·라우트 패턴·상태 코드. 로그와 같은 정책이라 오류 문장은 없다. DB `error_log` 테이블에 최근 1000건·30일까지 둔다. 화면은 #35.
+- `GET /api/admin/errors?limit=50&source=run|tool|http` (관리자만, 최대 200건). 항목: 시각·출처·오류 코드·분류·사용자/대화/실행 ID·런타임·도구명·라우트 패턴·상태 코드. 로그와 같은 정책이라 오류 문장은 없다. DB `error_log` 테이블에 최근 1000건·30일까지 둔다(1시간마다 정리, 조회도 30일 이내만). 화면은 #35.
 
 ### 9.3 가동률 측정 (목표 99%)
 
-판정 규칙(PRD NFR 가용성): 7일 동안 5분 간격 체크. **성공 = 외부 주소 `https://chat.2prostream.com/api/health`가 10초 안에 200**(그리고 응답이 Agent Lee 헬스 JSON — Access 로그인 페이지는 실패). 실패는 같은 순간의 로컬 체크(`http://127.0.0.1:3000/api/health`)로 나눈다: 로컬도 실패 → **앱**, 로컬 성공·외부 실패 → **터널**(Cloudflare·cloudflared·집 회선). 체크 기록이 아예 없는 5분 칸은 **기록 없음**(Mac·측정기 정지, 정전)으로 실패에 넣는다. **계획 정지** 구간(FileVault 잠금 해제 대기, 계획된 재시작)은 분모에서 빼고 따로 표시한다.
+판정 규칙(PRD NFR 가용성): 7일 동안 5분 간격 체크. **성공 = 외부 주소 `https://chat.2prostream.com/api/health`가 10초 안에 200**(그리고 응답이 Agent Lee 헬스 JSON — Access 로그인 페이지는 실패). 실패는 같은 순간의 로컬 체크(`http://127.0.0.1:3000/api/health`)로 나눈다: 로컬도 실패 → **앱**, 로컬 성공·외부 실패 → **터널**(Cloudflare·cloudflared·집 회선). 체크는 직전 체크 시작 뒤 5분마다 돌므로, 두 기록 사이 간격이 5분 + 허용 지연 1분을 넘으면 그 사이 예정 체크가 빠진 것이다 — **기록 없음**(Mac·측정기 정지, 정전)으로 실패에 넣는다. 몇 초 흔들림이나 늦은 시작은 누락이 아니다. 2분 30초 안에 연달아 기록된 체크(재시작 때 바로 한 번 더 도는 것)는 한 번으로 치고, 나쁜 쪽 결과를 쓴다. **계획 정지** 구간(FileVault 잠금 해제 대기, 계획된 재시작)은 분모에서 빼고 따로 표시한다.
 
 측정기는 집 Mac에서 도는 LaunchDaemon(`com.agentlee.uptime`, 5분마다)이다. 외부 체크는 인터넷으로 나가 Cloudflare 엣지 → Access → 터널 → 앱을 거쳐 돌아오므로 가족이 밖에서 쓰는 경로 전체를 잰다. Mac이 꺼지면 기록이 없으므로 그 시간은 "기록 없음"으로 실패 처리된다.
 
@@ -201,7 +201,7 @@ rm ~/.agentlee/probe-headers.txt
    pnpm -s uptime planned end --file $F                     # 돌아온 뒤
    pnpm -s uptime planned add 2026-11-20T03:10:00+09:00 2026-11-20T03:40:00+09:00 --note filevault --file $F   # 나중에 표시
    ```
-7. 판정: `pnpm -s uptime report --file /Library/Logs/agentlee/uptime.jsonl`(최근 7일, `--json`이면 상세). 출력: 가동률·분모(5분 칸 2016 − 계획 정지 − 외부 미측정)·성공/앱/터널/기록 없음 수·`합격`/`불합격`/`판정 불가`. 종료 코드 0 = 합격, 1 = 불합격, 3 = 판정 불가(7일 미만 기록, 또는 토큰 없이 외부 경로를 못 잰 체크가 있음). 결과를 4절과 #46에 남긴다.
+7. 판정: `pnpm -s uptime report --file /Library/Logs/agentlee/uptime.jsonl`(최근 7일, `--json`이면 상세). 출력: 가동률·분모(예정 체크 약 2016 − 계획 정지 − 외부 미측정)·성공/앱/터널/기록 없음 수·`합격`/`불합격`/`판정 불가`. 종료 코드 0 = 합격, 1 = 불합격, 3 = 판정 불가(7일 미만 기록, 또는 토큰 없이 외부 경로를 못 잰 체크가 있음). 결과를 4절과 #46에 남긴다.
 
 ## 10. 가족 이메일 추가 (수동, 자동 동기화 #36 전까지)
 

@@ -16,6 +16,7 @@ import {
 } from "./adapter.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
+import { toolLabel } from "../observability/policy.js";
 
 export type RunRow = typeof runs.$inferSelect;
 /** In-memory state of a run that is being executed by this process. */
@@ -470,7 +471,8 @@ export class RunManager {
       runId: run.id,
       runtime: run.runtime,
     };
-    const tool = t?.name ?? "unknown";
+    // Only known tool names are logged; whatever else a runtime reports becomes "other".
+    const tool = toolLabel(t?.name ?? "other");
     logEvent(this.opts.log, isError ? "warn" : "info", "tool.finished", {
       ...ids,
       tool,

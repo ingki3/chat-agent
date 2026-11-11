@@ -3,6 +3,21 @@ import path from "node:path";
 import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { FastifyBaseLogger, FastifyServerOptions } from "fastify";
+import {
+  errorSummary,
+  isCategory,
+  isErrorCode,
+  isErrorType,
+  isHostname,
+  isHttpStatus,
+  isId,
+  isMethod,
+  isRoutePattern,
+  isRuntime,
+  isStatus,
+  isToolName,
+  UNMATCHED,
+} from "./observability/policy.js";
 
 /**
  * Log policy (PRD NFR 관측성·개인정보, issue #46). Logs carry *who / what / how long / how it ended* — never
@@ -47,67 +62,71 @@ export const LOG_MESSAGES: ReadonlySet<string> = new Set<string>([...LOG_EVENTS,
 
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const isInt = (v: unknown): v is number => Number.isInteger(v);
-const matches = (re: RegExp) => (v: unknown) => typeof v === "string" && re.test(v);
-
-/** IDs are UUIDs or similar tokens: no spaces, no `@` (so neither a sentence nor an e-mail passes). */
-const ID = matches(/^[A-Za-z0-9_-]{1,64}$/);
-/** Status / error / category codes: snake_case words. */
-const CODE = matches(/^[a-z][a-z0-9_.]{0,63}$/);
-/** Tool names as runtimes report them (`web_search`, `mcp__agentlee__stocks`). */
-const TOOL = matches(/^[A-Za-z0-9_.:-]{1,128}$/);
-const RUNTIME = matches(/^[a-z0-9-]{1,32}$/);
-const HOSTNAME = matches(/^[A-Za-z0-9.-]{1,253}$/);
-const REQ_ID = matches(/^req-[0-9a-z]{1,16}$/);
-const ERR_TYPE = matches(/^[A-Za-z][A-Za-z0-9_]{0,63}$/);
-const ERR_CODE = matches(/^[A-Za-z0-9_.-]{1,64}$/);
-const METHOD = matches(/^[A-Z]{1,10}$/);
-/** A registered route pattern, e.g. `/api/conversations/:id` or `/*` (static files). */
-const ROUTE = matches(/^\/[A-Za-z0-9_\-./:*]{0,200}$/);
+/** Fastify's request IDs (`req-1`, `req-2a`, … a base-36 counter). */
+const isReqId = (v: unknown) => typeof v === "string" && /^req-[0-9a-z]{1,10}$/.test(v);
 
 type Check = (v: unknown) => boolean;
 
-/** Nested objects allowed for these keys only, with their own field checks. */
-const NESTED: Record<string, Record<string, Check>> = {
-  req: { method: METHOD, url: (v) => ROUTE(v) || v === "<unmatched>", reqId: REQ_ID },
-  res: { statusCode: isInt },
-  err: { type: ERR_TYPE, code: ERR_CODE, statusCode: isInt },
-};
-
-/** Allowed top-level fields and the check each value must pass. */
-const FIELDS: Record<string, Check> = {
-  level: isInt,
-  time: isNum,
-  pid: isInt,
-  hostname: HOSTNAME,
-  reqId: REQ_ID,
-  responseTime: isNum,
-  userId: ID,
-  conversationId: ID,
-  runId: ID,
-  runtime: RUNTIME,
-  tool: TOOL,
-  durationMs: isNum,
-  status: CODE,
-  errorCode: CODE,
-  category: CODE,
-  costUsd: isNum,
-  inputTokens: isInt,
-  outputTokens: isInt,
-};
-
-/** Every key that may ever appear in a written record (tests and docs refer to it). */
-export const LOG_ALLOWED_FIELDS: ReadonlySet<string> = new Set([
-  "msg",
-  ...Object.keys(FIELDS),
-  ...Object.keys(NESTED),
+/**
+ * Nested objects allowed for these keys only, with their own field checks. Maps, not object literals: a plain
+ * object would also "find" inherited keys such as `constructor` or `toString` (and treat them as checks).
+ */
+const NESTED = new Map<string, Map<string, Check>>([
+  [
+    "req",
+    new Map<string, Check>([
+      ["method", isMethod],
+      ["url", isRoutePattern],
+      ["reqId", isReqId],
+    ]),
+  ],
+  ["res", new Map<string, Check>([["statusCode", isHttpStatus]])],
+  [
+    "err",
+    new Map<string, Check>([
+      ["type", isErrorType],
+      ["code", isErrorCode],
+      ["statusCode", isHttpStatus],
+    ]),
+  ],
 ]);
 
-function nested(spec: Record<string, Check>, v: unknown): Obj | undefined {
+/**
+ * Allowed top-level fields and the check each value must pass. Strings must come from a fixed set or be
+ * something the server generated (UUIDs, registered routes, known tools) — a shape check alone would let an
+ * API key or the gate code through.
+ */
+const FIELDS = new Map<string, Check>([
+  ["level", isInt],
+  ["time", isNum],
+  ["pid", isInt],
+  ["hostname", isHostname],
+  ["reqId", isReqId],
+  ["responseTime", isNum],
+  ["userId", isId],
+  ["conversationId", isId],
+  ["runId", isId],
+  ["runtime", isRuntime],
+  ["tool", isToolName],
+  ["durationMs", isNum],
+  ["status", isStatus],
+  ["errorCode", isErrorCode],
+  ["category", isCategory],
+  ["costUsd", isNum],
+  ["inputTokens", isInt],
+  ["outputTokens", isInt],
+]);
+
+/** Every key that may ever appear in a written record (tests and docs refer to it). */
+export const LOG_ALLOWED_FIELDS: ReadonlySet<string> = new Set(["msg", ...FIELDS.keys(), ...NESTED.keys()]);
+
+function nested(spec: Map<string, Check>, v: unknown): Obj | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
   const out: Obj = {};
-  for (const [k, check] of Object.entries(spec)) {
+  for (const [k, check] of spec) {
+    if (!Object.hasOwn(v, k)) continue;
     const x = (v as Obj)[k];
-    if (x !== undefined && check(x)) out[k] = x;
+    if (check(x)) out[k] = x;
   }
   return out;
 }
@@ -125,18 +144,18 @@ function message(msg: unknown, hasErr: boolean): string {
 export function sanitizeRecord(record: Obj): Obj {
   const out: Obj = {};
   for (const [k, v] of Object.entries(record)) {
-    const check = FIELDS[k];
+    const check = FIELDS.get(k);
     if (check) {
       if (check(v)) out[k] = v;
       continue;
     }
-    const spec = NESTED[k];
+    const spec = NESTED.get(k);
     if (spec) {
       const n = nested(spec, v);
       if (n) out[k] = n;
     }
   }
-  out.msg = message(record.msg, "err" in record);
+  out.msg = message(Object.hasOwn(record, "msg") ? record.msg : undefined, Object.hasOwn(record, "err"));
   return out;
 }
 
@@ -254,7 +273,7 @@ export function logEvent(
 /** Route pattern of a request (never the raw URL): `/api/conversations/:id`, or `<unmatched>`. */
 function routeOf(req: { routeOptions?: { url?: string | undefined } }): string {
   const url = req.routeOptions?.url;
-  return typeof url === "string" && url ? url : "<unmatched>";
+  return typeof url === "string" && url ? url : UNMATCHED;
 }
 
 export function loggerOptions(
@@ -272,17 +291,9 @@ export function loggerOptions(
       }),
       res: (res) => ({ statusCode: res.statusCode }),
       // Error messages can embed user content or SDK output; keep class name and code only.
-      err: (err) => {
-        const e = err as { name?: unknown; code?: unknown; statusCode?: unknown };
-        // message/stack are emptied here and dropped again by sanitizeRecord (not in the err field list).
-        return {
-          type: typeof e.name === "string" ? e.name : "Error",
-          message: "",
-          stack: "",
-          code: e.code,
-          statusCode: e.statusCode,
-        };
-      },
+      // Error messages can embed user content or SDK output: class name and code from fixed sets only.
+      // message/stack are emptied here and dropped again by sanitizeRecord (not in the err field list).
+      err: (err) => ({ ...errorSummary(err), message: "", stack: "" }),
     },
     hooks: {
       // pino uses an Error's message as the log message; replace it so error text never reaches the log.

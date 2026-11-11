@@ -10,6 +10,7 @@ import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { rotatingFile, sanitizeRecord } from "../src/logging.js";
 import { classifyError, ErrorLog } from "../src/observability/errors.js";
+import { registerToolNames } from "../src/observability/policy.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
@@ -17,6 +18,9 @@ import {
   type RuntimeSession,
 } from "../src/runtime/adapter.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+
+// The MCP server (#42) registers the tools it exposes; only registered or built-in names are logged.
+registerToolNames(["mcp__agentlee__stocks"]);
 
 type App = Awaited<ReturnType<typeof buildApp>>;
 const apps: App[] = [];
@@ -49,11 +53,23 @@ const SECRETS = {
   routeError: "THROWN-ROUTE-LEAK-6c6c",
   title: "대화 제목 TITLE-LEAK-4f4f",
 };
+/**
+ * Secrets made only of characters an ID, code or tool name may contain — a shape check alone lets these through,
+ * so the policy compares against what the server itself produced instead.
+ */
+const ALLOWED_CHAR_SECRETS = {
+  gateCode: "abcdgate1234zz",
+  apiKey: "sk-proj-AAAAallowedchars0123456789",
+  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLWxlYWs",
+  idLike: "sk-ant-api03-ABCDEFGHIJ_klmnopq",
+  snake: "secret_code_leak_42",
+};
 /** Generic patterns: API-key shapes, JWTs, e-mail addresses. */
 const PATTERNS = [/sk-(ant|proj)-/, /eyJ[A-Za-z0-9_-]{5,}\./, /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}/];
 
 function assertNoLeak(text: string) {
-  for (const [name, secret] of Object.entries(SECRETS)) expect(text, `leaked ${name}`).not.toContain(secret);
+  for (const [name, secret] of Object.entries({ ...SECRETS, ...ALLOWED_CHAR_SECRETS }))
+    expect(text, `leaked ${name}`).not.toContain(secret);
   for (const re of PATTERNS) expect(text, `matches ${re}`).not.toMatch(re);
 }
 
@@ -96,6 +112,9 @@ class LeakyRuntime implements RuntimeAdapter {
           yield { type: "tool_end", callId: "c1", output: { text: SECRETS.toolOutput } };
           yield { type: "tool_start", callId: "c2", name: "mcp__agentlee__stocks", input: SECRETS.apiKey };
           yield { type: "tool_end", callId: "c2", output: SECRETS.stderr, isError: true };
+          // A runtime may report any string as a tool name: an unknown (secret-looking) one is logged as "other".
+          yield { type: "tool_start", callId: "c3", name: ALLOWED_CHAR_SECRETS.jwt, input: null };
+          yield { type: "tool_end", callId: "c3", output: null, isError: true };
           yield { type: "usage", inputTokens: 120, outputTokens: 30, costUsd: 0.0125 };
           if (input.text.includes("FAIL")) {
             const err = new Error(`${SECRETS.sdkError} ${input.text} ${SECRETS.apiKey}`) as Error & {
@@ -125,6 +144,40 @@ async function start(env: Record<string, string> = {}) {
   app.get("/api/test/boom", { config: { auth: "public", noResource: "test" } }, async () => {
     throw new Error(`${SECRETS.routeError} ${SECRETS.prompt}`);
   });
+  app.get("/api/test/coded", { config: { auth: "public", noResource: "test" } }, async () => {
+    throw Object.assign(new Error(SECRETS.prompt), {
+      code: ALLOWED_CHAR_SECRETS.apiKey,
+      name: ALLOWED_CHAR_SECRETS.snake,
+    });
+  });
+  app.get("/api/test/client", { config: { auth: "public", noResource: "test" } }, async () => {
+    throw Object.assign(new Error(`${SECRETS.prompt} ${SECRETS.apiKey}`), {
+      statusCode: 422,
+      code: ALLOWED_CHAR_SECRETS.snake,
+    });
+  });
+  app.get("/api/test/bindings", { config: { auth: "public", noResource: "test" } }, async (req) => {
+    req.log
+      .child({
+        constructor: { prompt: SECRETS.prompt, cookie: SECRETS.cookie },
+        toString: SECRETS.apiKey,
+        hasOwnProperty: SECRETS.password,
+        valueOf: { x: SECRETS.title },
+        userId: ALLOWED_CHAR_SECRETS.gateCode,
+        runId: ALLOWED_CHAR_SECRETS.idLike,
+        tool: ALLOWED_CHAR_SECRETS.jwt,
+        status: ALLOWED_CHAR_SECRETS.snake,
+        errorCode: ALLOWED_CHAR_SECRETS.snake,
+        category: ALLOWED_CHAR_SECRETS.gateCode,
+        runtime: ALLOWED_CHAR_SECRETS.gateCode,
+        hostname: ALLOWED_CHAR_SECRETS.gateCode,
+      })
+      .info(
+        { err: { name: ALLOWED_CHAR_SECRETS.snake, code: ALLOWED_CHAR_SECRETS.apiKey } },
+        "tool.finished",
+      );
+    return { ok: true };
+  });
   apps.push(app);
   const f = await createFamily(app);
   const headers = (cookie: string, extra: Record<string, string> = {}) => ({
@@ -151,7 +204,7 @@ describe("log record policy", () => {
       level: 30,
       time: 1,
       msg: "run.finished",
-      runId: "1f0e-uuid",
+      runId: "0d9f6f4e-3c2a-4b7e-9a51-2f8e6c1d7b30",
       userId: SECRETS.email,
       conversationId: SECRETS.prompt,
       status: SECRETS.prompt,
@@ -178,10 +231,10 @@ describe("log record policy", () => {
       level: 30,
       time: 1,
       msg: "run.finished",
-      runId: "1f0e-uuid",
+      runId: "0d9f6f4e-3c2a-4b7e-9a51-2f8e6c1d7b30",
       errorCode: "runtime_error",
       durationMs: 12,
-      err: { type: "Error", code: "E1" },
+      err: { type: "Error" },
       req: { method: "GET" },
     });
   });
@@ -255,6 +308,11 @@ describe("leak fixtures end to end", () => {
         cookie: `al_session=${SECRETS.cookie}`,
       },
     });
+    for (const url of ["/api/test/coded", "/api/test/bindings"])
+      await app.inject({ url, headers: { host: "localhost:3000" } });
+    const client = await app.inject({ url: "/api/test/client", headers: { host: "localhost:3000" } });
+    expect(client.statusCode).toBe(422);
+    expect(client.json()).toEqual({ error: "bad_request" });
     const boom = await app.inject({ url: "/api/test/boom", headers: { host: "localhost:3000" } });
     expect(boom.statusCode).toBe(500);
     expect(boom.json()).toEqual({ error: "internal_error" });
@@ -296,6 +354,7 @@ describe("leak fixtures end to end", () => {
     expect(tools.map((t) => [t.tool, t.status])).toEqual([
       ["web_search", "ok"],
       ["mcp__agentlee__stocks", "error"],
+      ["other", "error"],
     ]);
     expect(typeof tools[0]!.durationMs).toBe("number");
     expect(
@@ -327,7 +386,9 @@ describe("leak fixtures end to end", () => {
       route: "GET /api/test/boom",
       statusCode: 500,
     });
-    expect(errors.find((e) => e.source === "tool")).toMatchObject({ tool: "mcp__agentlee__stocks" });
+    expect(errors.filter((e) => e.source === "tool").map((e) => e.tool)).toEqual(
+      expect.arrayContaining(["mcp__agentlee__stocks", "other"]),
+    );
     const onlyRuns = await app.inject({
       url: "/api/admin/errors?source=run&limit=5",
       headers: headers(f.cookies.admin),
@@ -363,7 +424,99 @@ describe("leak fixtures end to end", () => {
   });
 });
 
+describe("review round 1 regressions", () => {
+  it("does not treat inherited keys (constructor, toString, __proto__) as allowed fields", () => {
+    const raw = JSON.stringify({
+      level: 30,
+      msg: "run.finished",
+      constructor: { prompt: SECRETS.prompt, cookie: SECRETS.cookie },
+      toString: SECRETS.apiKey,
+      hasOwnProperty: SECRETS.password,
+      valueOf: SECRETS.title,
+      req: { method: "GET", constructor: SECRETS.query, toString: SECRETS.bearer },
+      err: { constructor: SECRETS.sdkError },
+    }).replace('"toString"', '"__proto__":{"x":"' + SECRETS.stderr + '"},"toString"');
+    const out = sanitizeRecord(JSON.parse(raw) as Record<string, unknown>);
+    assertNoLeak(JSON.stringify(out));
+    expect(Object.keys(out).sort()).toEqual(["err", "level", "msg", "req"]);
+  });
+
+  it("drops secrets made only of allowed characters", () => {
+    const S = ALLOWED_CHAR_SECRETS;
+    const out = sanitizeRecord({
+      msg: "tool.finished",
+      userId: S.gateCode,
+      conversationId: S.idLike,
+      runId: S.apiKey,
+      tool: S.jwt,
+      status: S.snake,
+      errorCode: S.snake,
+      category: S.gateCode,
+      runtime: S.gateCode,
+      hostname: S.gateCode,
+      reqId: `req-${S.gateCode}`,
+      err: { type: S.snake, code: S.apiKey, statusCode: 99999 },
+      req: { method: S.gateCode.toUpperCase(), url: `/api/${S.apiKey}` },
+    });
+    assertNoLeak(JSON.stringify(out));
+    expect(out).toEqual({ msg: "tool.finished", err: {}, req: {} });
+
+    const store = new ErrorLog(createTestDb());
+    store.record({
+      source: "tool",
+      code: S.snake,
+      category: S.gateCode,
+      userId: S.gateCode,
+      conversationId: S.idLike,
+      runId: S.apiKey,
+      runtime: S.gateCode,
+      tool: S.apiKey,
+      route: `GET /api/${S.jwt}`,
+      statusCode: 12345,
+    });
+    const [row] = store.recent();
+    assertNoLeak(JSON.stringify(row));
+    expect(row).toMatchObject({
+      code: "unknown",
+      category: "app",
+      tool: null,
+      route: null,
+      statusCode: null,
+    });
+  });
+
+  it("answers framework errors (bad encoding, over-long paths) with a fixed body and the security headers", async () => {
+    const { app, log } = await start();
+    const bad = await app.inject({
+      url: `/api/private/${SECRETS.query}/%ZZ?token=${SECRETS.apiKey}`,
+      headers: { host: "localhost:3000" },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toEqual({ error: "invalid_request" });
+    expect(bad.headers["x-content-type-options"]).toBe("nosniff");
+    assertNoLeak(bad.body);
+    const long = await app.inject({
+      url: `/api/conversations/${SECRETS.query}${"A".repeat(5000)}?token=${SECRETS.apiKey}`,
+      headers: { host: "localhost:3000", cookie: "al_session=x" },
+    });
+    expect(long.statusCode).toBeGreaterThanOrEqual(400);
+    assertNoLeak(long.body);
+    assertNoLeak(log.text());
+  });
+});
+
 describe("recent error store", () => {
+  it("forgets entries older than 30 days even when no new error arrives", () => {
+    let t = Date.UTC(2026, 0, 1);
+    const db = createTestDb();
+    const store = new ErrorLog(db, { now: () => t });
+    store.record({ source: "http", code: "internal_error", category: "app" });
+    t += 31 * 24 * 3600_000;
+    expect(store.recent()).toEqual([]);
+    expect(store.prune()).toBe(1);
+    expect(db.$client.prepare("select count(*) as n from error_log").get()).toEqual({ n: 0 });
+  });
+
   it("re-checks fields on the way in and keeps only the newest rows", () => {
     let t = 1000;
     const store = new ErrorLog(createTestDb(), { now: () => t, maxRows: 3 });

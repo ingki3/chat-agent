@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { JWTVerifyGetKey } from "jose";
 import type { HealthResponse } from "@agentlee/shared";
@@ -28,6 +28,7 @@ import { isGatePath, registerGate, type GateOptions } from "./gate.js";
 import { BASE_HEADERS } from "./headers.js";
 import { logEvent, loggerOptions, rotatingFile } from "./logging.js";
 import { ErrorLog } from "./observability/errors.js";
+import { registerRoutePattern } from "./observability/policy.js";
 import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
 
 const VERSION = "0.0.0";
@@ -99,11 +100,24 @@ export type BuildOptions = {
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
   const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
   const logDest = opts.logStream ?? (config.logFile ? rotatingFile(config.logFile) : undefined);
-  const app = Fastify({ logger: logOn ? loggerOptions(logDest) : false });
+  const app = Fastify({
+    logger: logOn ? loggerOptions(logDest) : false,
+    // Errors Fastify raises before routing (bad percent-encoding, …) skip the error handler and every hook, and
+    // their default body repeats the raw URL. Answer them with a fixed body and the usual security headers.
+    frameworkErrors: (err, req, res) => {
+      const reply = res as unknown as FastifyReply;
+      logEvent(req.log, "info", "request.error", { err, errorCode: "bad_request", category: "client" });
+      reply.headers(BASE_HEADERS).header("Cache-Control", "no-store");
+      if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
+      return reply.code(400).send({ error: "invalid_request" });
+    },
+  });
   const startedAt = Date.now();
 
   // First, before any route exists: every route that could address a resource must declare its permission.
   installRouteRules(app);
+  // Route patterns are what logs and the error list may name (observability/policy.ts).
+  app.addHook("onRoute", (route) => registerRoutePattern(route.url));
 
   app.addHook("onSend", async (_req, reply, payload) => {
     reply.headers(BASE_HEADERS);
@@ -118,6 +132,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   app.decorate("conversations", opts.db ? new ConversationStore(opts.db) : undefined);
   const errors = opts.db ? new ErrorLog(opts.db) : undefined;
   app.decorate("errors", errors);
+  if (errors) {
+    // Retention must not depend on new errors arriving.
+    const prune = setInterval(() => errors.prune(), 3600_000);
+    prune.unref();
+    app.addHook("onClose", async () => clearInterval(prune));
+  }
   // Before any route or plugin, so every one inherits it: sanitised error bodies, logs and recent-error entries.
   registerErrorHandling(app, errors);
   const verifier = config.access
