@@ -404,4 +404,3 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
   - 문서(`document`) 종류의 PDF·미리보기는 생성 파일(#49)·파일 변환(#22)과 함께.
   - Chart.js처럼 CDN 스크립트를 쓰는 HTML의 실제 CDN 로드는 네트워크가 있을 때만 확인된다(시험의 프록시는 가짜 연결). 운영 Mac에서 수동 확인: `docs/ops.md` §18.4.
   - 서비스 사용자(LaunchDaemon)가 개발 계정과 다르면 Playwright 캐시 위치가 다르다 — `EXPORT_BROWSER`를 설정한다(ops.md).
-
