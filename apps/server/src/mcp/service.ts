@@ -569,6 +569,18 @@ export class McpService {
             durationMs: now() - t0,
             ...(r.ok ? {} : { financeCode: r.code }),
           });
+          // Finance tools are skills too (PRD §7): their failures join the admin's skill failure list, by tool name
+          // and fixed `finance_*` code only.
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
           return r;
         }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {

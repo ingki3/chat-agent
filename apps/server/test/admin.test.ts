@@ -20,6 +20,8 @@ import { CLAUDE_MODELS } from "../src/runtime/claude.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { parseMetricsAddress, tunnelStatus } from "../src/observability/tunnel.js";
+import type { McpTokens } from "../src/isolation/tokens.js";
+import { callOurTool } from "./helpers/live-mcp.js";
 import { createFamily, type Family } from "./helpers/permission-matrix.js";
 
 const closers: (() => Promise<unknown>)[] = [];
@@ -498,6 +500,28 @@ describe("runtimes tab (#35): model list, shared and on-behalf connections, neve
       expect(b).not.toContain(FAKE_KEY.replace("ADMIN", "SHARE").slice(0, -4));
     }
   });
+
+  it("another admin's own subscription cannot be tested on their behalf (403); their own call can", async () => {
+    const t = await start({ needsConnection: true });
+    // Admin A (stranger promoted) connects their own Claude subscription themselves.
+    const a = t.f.users.stranger;
+    t.app.users!.setRole(a.id, "admin");
+    const own = await t.stranger.post("/api/connections", {
+      runtime: "claude-code",
+      authType: "subscription",
+      secret: `sk-ant-oat01-${"a".repeat(30)}`,
+    });
+    expect(own.statusCode).toBe(201);
+    const id = own.json<{ connection: { id: string } }>().connection.id;
+    // Admin B tries to test it as A: refused, nothing run, the connection stays untested.
+    const r = await t.admin.post(`/api/admin/users/${a.id}/connections/${id}/test`);
+    expect(r.statusCode).toBe(403);
+    expect(r.json()).toEqual({ error: "subscription_self_only" });
+    expect(t.app.connections!.store.get(id)).toMatchObject({ status: "untested", lastTestAt: null });
+    // A on the on-behalf path for their own: allowed (it is theirs), as is their own settings route.
+    expect((await t.stranger.post(`/api/admin/users/${a.id}/connections/${id}/test`)).statusCode).toBe(200);
+    expect((await t.stranger.post(`/api/connections/${id}/test`)).statusCode).toBe(200);
+  });
 });
 
 describe("system status (#35, FR-10.4)", () => {
@@ -560,6 +584,30 @@ describe("system status (#35, FR-10.4)", () => {
     expect(s.disk.databaseBytes).toBeNull(); // in-memory database
   });
 
+  it("a failed finance tool call through our MCP server joins the skill failures (dart_disclosures → finance_unconfigured)", async () => {
+    // No OPENDART_API_KEY in this app: the DART tool answers finance_unconfigured before any network.
+    const t = await start();
+    const mcp = t.app.mcp!;
+    const { url } = await mcp.endpoint();
+    const token = (mcp as unknown as { tokens: McpTokens }).tokens.issue({
+      userId: t.f.users.shared.id,
+      conversationId: "conv-fin",
+      runId: "run-fin",
+    });
+    const r = await callOurTool(url, token, "dart_disclosures", {});
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("finance_unconfigured");
+    const s = SystemStatus.parse((await t.admin.get("/api/admin/system")).json());
+    expect(s.skillFailures).toEqual([
+      { tool: "dart_disclosures", code: "finance_unconfigured", count: 1, lastAt: expect.any(Number) },
+    ]);
+    expect(s.recentErrors[0]).toMatchObject({
+      source: "tool",
+      code: "finance_unconfigured",
+      tool: "dart_disclosures",
+    });
+  });
+
   it("a failed skill call on our MCP server is recorded with its code (not its output)", async () => {
     const t = await start();
     const host = (
@@ -581,9 +629,23 @@ describe("tunnel status: cloudflared's loopback metrics server only (#35)", () =
     expect(parseMetricsAddress("http://127.0.0.1:20241")).toEqual({ host: "127.0.0.1", port: 20241 });
     expect(parseMetricsAddress("http://127.0.0.2:20241/")).toEqual({ host: "127.0.0.2", port: 20241 });
     expect(parseMetricsAddress("http://[::1]:20241")).toEqual({ host: "::1", port: 20241 });
-    // URL parsing normalises other spellings of a loopback address first (still loopback).
-    expect(parseMetricsAddress("http://0x7f000001:20241")).toEqual({ host: "127.0.0.1", port: 20241 });
+    expect(parseMetricsAddress("http://127.255.10.1:65535")).toEqual({ host: "127.255.10.1", port: 65535 });
     for (const bad of [
+      // Other spellings URL parsing would normalise to 127.0.0.1: checked as written, so refused.
+      "http://0x7f000001:20241",
+      "http://127.1:20241",
+      "http://2130706433:20241",
+      "http://0177.0.0.1:20241",
+      "http://127.0.0.01:20241",
+      "http://127.000.000.001:20241",
+      "http://[0:0:0:0:0:0:0:1]:20241",
+      "http://127.0.0.256:20241",
+      "http://127.0.0.1:0",
+      "http://127.0.0.1:65536",
+      "http://127.0.0.1:020241",
+      "HTTP://127.0.0.1:20241",
+      "http://127.0.0.1:20241#x",
+      " http://127.0.0.1:20241",
       "http://localhost:20241",
       "http://10.0.0.5:20241",
       "http://192.168.0.1:20241",
@@ -622,16 +684,43 @@ describe("tunnel status: cloudflared's loopback metrics server only (#35)", () =
     expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({ state: "ok", readyConnections: 4 });
     answer = { status: 503, body: '{"status":503,"readyConnections":0}' };
     expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({ state: "down", readyConnections: 0 });
-    answer = { status: 302, body: "" };
+    // 200 but not ready.
+    answer = { status: 200, body: '{"status":200,"readyConnections":0}' };
+    expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({ state: "down", readyConnections: 0 });
+    // Not cloudflared's answer — some other local service: never "ok".
+    for (const body of [
+      "",
+      "   ",
+      "<html>ok</html>",
+      "{}",
+      '{"readyConnections":"4"}',
+      '{"readyConnections":1.5}',
+      "null",
+      '{"readyConnections":-1}',
+    ])
+      for (const status of [200, 503]) {
+        answer = { status, body };
+        expect(await tunnelStatus({ host: "127.0.0.1", port }), `${status} ${body}`).toEqual({
+          state: "unreachable",
+          readyConnections: null,
+        });
+      }
+    answer = { status: 302, body: '{"readyConnections":4}' };
     expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({
       state: "unreachable",
       readyConnections: null,
     });
-    expect(paths).toEqual(["/ready", "/ready", "/ready"]);
+    // An answer longer than the cap is not read to the end.
+    answer = { status: 200, body: `{"readyConnections":4,"pad":"${"x".repeat(5000)}"}` };
+    expect(await tunnelStatus({ host: "127.0.0.1", port })).toEqual({
+      state: "unreachable",
+      readyConnections: null,
+    });
+    expect(paths.length).toBe(21);
     // A host that is not a loopback IP literal is never asked — not even "localhost" or this machine's name.
     for (const host of ["localhost", os.hostname(), "10.0.0.5", "example.com"])
       expect(await tunnelStatus({ host, port })).toEqual({ state: "unreachable", readyConnections: null });
-    expect(paths.length).toBe(3);
+    expect(paths.length).toBe(21);
     expect(await tunnelStatus(undefined)).toEqual({ state: "unconfigured", readyConnections: null });
     // Closed port.
     const closed = http.createServer();
@@ -642,6 +731,35 @@ describe("tunnel status: cloudflared's loopback metrics server only (#35)", () =
       state: "unreachable",
       readyConnections: null,
     });
+
+    // A slow drip (a byte every 40 ms, never ending) is cut off by the overall deadline, not kept alive by it.
+    const drip = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"readyConnections":4');
+      const t = setInterval(() => res.write(" "), 40);
+      res.on("close", () => clearInterval(t));
+    });
+    await new Promise<void>((r) => drip.listen(0, "127.0.0.1", r));
+    closers.push(() => new Promise((r) => (drip.closeAllConnections(), drip.close(r))));
+    const dripPort = (drip.address() as AddressInfo).port;
+    const t0 = Date.now();
+    expect(await tunnelStatus({ host: "127.0.0.1", port: dripPort }, { timeoutMs: 200 })).toEqual({
+      state: "unreachable",
+      readyConnections: null,
+    });
+    expect(Date.now() - t0).toBeLessThan(1000);
+    // A server that accepts and never answers: the same deadline.
+    const silent = http.createServer(() => {});
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    closers.push(() => new Promise((r) => (silent.closeAllConnections(), silent.close(r))));
+    const t1 = Date.now();
+    expect(
+      await tunnelStatus(
+        { host: "127.0.0.1", port: (silent.address() as AddressInfo).port },
+        { timeoutMs: 200 },
+      ),
+    ).toEqual({ state: "unreachable", readyConnections: null });
+    expect(Date.now() - t1).toBeLessThan(1000);
 
     // Through the app: CLOUDFLARED_METRICS → the admin's system status.
     answer = { status: 200, body: '{"status":200,"readyConnections":2}' };

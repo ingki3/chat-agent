@@ -10,6 +10,7 @@ import {
   isMethod,
   isRoutePattern,
   isRuntime,
+  isFinanceCode,
   isSkillCode,
   isToolName,
   CODE_CATEGORY,
@@ -69,8 +70,8 @@ export class ErrorLog {
         .values({
           at: this.now(),
           source: e.source,
-          // Skill call outcomes too (#35: the admin's skill failure list), all fixed codes.
-          code: keep((c) => isErrorCode(c) || isSkillCode(c), e.code) ?? "unknown",
+          // Skill and finance tool outcomes too (#35: the admin's skill failure list), all fixed codes.
+          code: keep((c) => isErrorCode(c) || isSkillCode(c) || isFinanceCode(c), e.code) ?? "unknown",
           category: keep(isCategory, e.category) ?? "app",
           userId: keep(isId, e.userId),
           conversationId: keep(isId, e.conversationId),
@@ -117,7 +118,7 @@ export class ErrorLog {
 
   /**
    * Failed skill calls of the retention period (#35, FR-10.4 "스킬 실행 실패"): the entries our MCP server records
-   * with a skill outcome code, counted by tool and code, newest first.
+   * with a skill (`skill_*`) or finance tool (`finance_*`) outcome code, counted by tool and code, newest first.
    */
   skillFailures(): { tool: string; code: string; count: number; lastAt: number }[] {
     return this.db
@@ -127,7 +128,7 @@ export class ErrorLog {
         and(
           gte(errorLog.at, this.now() - this.maxAgeMs),
           eq(errorLog.source, "tool"),
-          like(errorLog.code, "skill_%"),
+          or(like(errorLog.code, "skill_%"), like(errorLog.code, "finance_%")),
         ),
       )
       .groupBy(errorLog.tool, errorLog.code)

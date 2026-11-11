@@ -268,14 +268,19 @@ export function registerConnectionRoutes(
       return c ? disconnect(reply, c) : fail(reply, 404, "not_found");
     },
   );
-  // Tests a member's personal connection as that member (their policy, their folder, usage on them) — so one the
-  // admin registered on their behalf can be made usable (#35). The credential is never shown.
+  // Tests a member's personal API key connection as that member (their policy, their folder, usage on them) — so one
+  // the admin registered on their behalf can be made usable (#35). The credential is never shown.
   app.post<{ Params: { id: string; connectionId: string } }>(
     "/api/admin/users/:id/connections/:connectionId/test",
     { config: admin },
     (req, reply) => {
       const c = memberConnection(req.params.id, req.params.connectionId);
-      return c ? test(reply, c, req.params.id) : fail(reply, 404, "not_found");
+      if (!c) return fail(reply, 404, "not_found");
+      // On someone's behalf for API keys only: a subscription is used by its owner alone (D2, FR-11.4) — not
+      // even for a test run by another admin. Their own one is tested from their own settings.
+      if (c.authType !== "api_key" && c.ownerId !== req.ctx.user!.id)
+        return fail(reply, 403, "subscription_self_only");
+      return test(reply, c, req.params.id);
     },
   );
 
