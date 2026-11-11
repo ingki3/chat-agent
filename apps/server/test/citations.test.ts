@@ -131,6 +131,32 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("그는 “좋다”고 말했다", '그는 "좋다"고 말했다.')).toBe(true);
   });
 
+  it("a unit quote is never trimmed off the snippet, and spaces before it still make it a unit (round 13)", () => {
+    // Codex: the trailing `"` after a digit is a unit, not a wrapping quote.
+    expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found('이 망원경의 시야각은 30"', "이 망원경의 시야각은 30’이다.")).toBe(false);
+    expect(found('제품의 전체 길이는 12"', '제품의 전체 길이는 12"이다.')).toBe(true);
+    expect(normalizeSnippet('제품의 전체 길이는 12"')).not.toBe(normalizeSnippet("제품의 전체 길이는 12"));
+    expect(normalizeSnippet('"12" 크기의 제품이다')).not.toBe(normalizeSnippet("12 크기의 제품이다"));
+    // An unpaired quote next to a digit is kept at the start too (it is not known to wrap the snippet).
+    expect(normalizeSnippet('"12 크기의 제품이다')).toBe('"12 크기의 제품이다');
+    // A quote wrapping the whole snippet is still dropped — and the number then may not stop before a unit quote.
+    expect(normalizeSnippet('"제품의 전체 길이는 12"')).toBe("제품의 전체 길이는 12");
+    expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found("제품의 전체 길이는 12", "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12이다.")).toBe(true);
+    // HTML extraction: `<span>12</span>'` reads as `12 '` — still a unit, in the page and in the snippet.
+    expect(found('제품의 전체 길이는 12 "이다', "제품의 전체 길이는 12 '이다.")).toBe(false);
+    expect(found("제품의 전체 길이는 12 '이다", "제품의 전체 길이는 12 '이다.")).toBe(true);
+    expect(found("제품의 전체 길이는 12", "제품의 전체 길이는 12 '이다.")).toBe(false);
+    expect(normalizeSnippet("전체 길이는 12 '이다")).not.toBe(normalizeSnippet('전체 길이는 12 "이다'));
+    // Controls: quoted numbers and ordinary quoted words.
+    expect(found("그는 “100”이라고 말했다", "그는 “100”이라고 말했다.")).toBe(true);
+    expect(found("“그는 좋다고 말했다”", "그는 좋다고 말했다.")).toBe(true);
+    expect(found("그는 “좋다”고 말했다", '그는 "좋다"고 말했다.')).toBe(true);
+    expect(normalizeSnippet("“그는 좋다고 말했다”")).toBe("그는 좋다고 말했다");
+  });
+
   it("a sign across a space belongs to the number (round 12)", () => {
     expect(found("5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다.")).toBe(false);
     expect(found("5도까지 떨어졌다고 한다", "기온은 − 5도까지 떨어졌다고 한다.")).toBe(false);

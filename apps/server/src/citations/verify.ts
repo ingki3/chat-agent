@@ -34,6 +34,8 @@ const QUOTES =
 /** One quote character (any style the fold above maps), whole string. */
 const QUOTE_CHAR =
   /^["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]$/u;
+const UNIT_QUOTE_AFTER =
+  /^ ?["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/u;
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
 /** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
 const TILDES = /[\u223C\u301C]/gu;
@@ -267,8 +269,15 @@ export function normalizeWithMap(text: string): Normalized {
       else put(ch, s, e);
     }
   };
-  /** Whether the source character right before `i` is a digit (a quote mark there is a unit, not a quote). */
-  const afterDigit = (i: number) => i > 0 && DIGIT.test(text[i - 1]!);
+  /**
+   * Whether a digit comes right before `i`, spaces allowed (`12'`, and `12 '` from `<span>12</span>'`): a quote
+   * mark there is a unit (feet, inches, minutes), not a quote.
+   */
+  const afterDigit = (i: number) => {
+    let k = i - 1;
+    while (k >= 0 && SPACE.test(text[k]!)) k--;
+    return k >= 0 && DIGIT.test(text[k]!);
+  };
   let i = 0;
   while (i < len) {
     const c = text.charCodeAt(i);
@@ -322,8 +331,23 @@ function safeFromCodePoint(cp: number): string | undefined {
 }
 
 /** The snippet normalised; surrounding quote marks, ellipses and spaces the model added are dropped. */
+/**
+ * The snippet normalised; the spaces, ellipses and wrapping quote marks the model added around it are dropped. A
+ * quote mark next to a digit (`…12"`, `"12…`, spaces allowed) is kept — it may be a unit — unless it pairs with a
+ * quote mark at the other end (`"…12"` wraps the whole snippet).
+ */
 export function normalizeSnippet(snippet: string): string {
-  return normalizeWithMap(snippet).norm.replace(/^(?:\s|"|\.{3,})+|(?:\s|"|\.{3,})+$/gu, "");
+  let s = normalizeWithMap(snippet).norm;
+  for (;;) {
+    const before = s;
+    s = s.replace(/^(?:\s|\.{3,})+|(?:\s|\.{3,})+$/gu, "");
+    const opens = QUOTE_CHAR.test(firstChar(s));
+    const closes = s.length > 1 && QUOTE_CHAR.test(lastChar(s));
+    if (opens && closes) s = Array.from(s).slice(1, -1).join("");
+    else if (opens && !/^.\s*\p{N}/u.test(s)) s = Array.from(s).slice(1).join("");
+    else if (closes && !/\p{N}\s*.$/u.test(s)) s = Array.from(s).slice(0, -1).join("");
+    if (s === before) return s;
+  }
 }
 
 /** The code point that ends right before `i`. */
@@ -386,6 +410,9 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     // Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number). The
     // mirror at the start (`이` right after `백`) is already refused by the start token rule.
     if (DIGIT.test(last) && NUMBER_AFTER.test(rest)) continue;
+    // Not before a unit quote either (`12` is not in `12'`, `12 '`): after a digit the page's quote marks are kept
+    // as they are, so any quote mark there is a unit.
+    if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
     if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
