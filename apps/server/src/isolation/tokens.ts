@@ -21,7 +21,7 @@ export class McpTokens {
   issue(scope: Omit<McpScope, "expiresAt">, ttlMs = 6 * 3600_000): string {
     const token = crypto.randomBytes(32).toString("base64url");
     this.byHash.set(McpTokens.hash(token), { ...scope, expiresAt: this.now() + ttlMs, token });
-    knownSecrets.add(token); // a runtime that echoes its token never gets it into the reply
+    knownSecrets.add(token, { fresh: true }); // a runtime that echoes its token never gets it into the reply
     return token;
   }
 

@@ -27,6 +27,7 @@ import { ADMIN_KINDS, bundle, compose, SHARED_BODY, type PublishInput } from "./
 import { validPushEndpoint } from "./endpoint.js";
 import { DEFAULT_TIME_ZONE, inQuietHours, isTimeZone } from "./quiet.js";
 import type { VapidKeys } from "./vapid.js";
+import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 
 type Row = typeof notifications.$inferSelect;
 
@@ -116,13 +117,14 @@ export class NotificationService {
     if (ref && c.kind !== "share_received" && this.resources.load(ref.kind, ref.id)?.ownerId !== userId)
       body = SHARED_BODY;
     const t = this.now();
+    // No known secret in a stored notification or on a lock screen (round 25: a connection label holding a key).
     const row: Row = {
       id: crypto.randomUUID(),
       userId,
       kind: c.kind,
-      title: c.title,
-      body,
-      url: c.url,
+      title: scrubKnown(c.title),
+      body: scrubKnown(body),
+      url: scrubKnown(c.url),
       refKind: ref?.kind ?? null,
       refId: ref?.id ?? null,
       // The test button sends at once, quiet hours or not.
@@ -204,7 +206,8 @@ export class NotificationService {
         ? { title: first.title, body: first.body, url: first.url, id: first.id, tag: first.id }
         : { ...bundle(rows.map((r) => r.title)), tag: `bundle-${first.id}` };
     const targets = this.targets(userId);
-    const json = JSON.stringify(payload);
+    // Scrubbed again at the last moment: a secret registered while the notification was held (quiet hours).
+    const json = JSON.stringify(scrubKnownDeep(payload));
     let delivered = 0;
     await Promise.all(
       targets.map(async ({ id, target }) => {

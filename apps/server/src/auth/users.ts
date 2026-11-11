@@ -288,7 +288,7 @@ export class UserStore {
       .insert(sessions)
       .values({ id: sha256(token), userId, createdAt: t, lastSeenAt: t, expiresAt: t + SESSION_TTL_MS })
       .run();
-    knownSecrets.add(token); // the cookie never shows up in a reply
+    knownSecrets.add(token, { fresh: true }); // the cookie never shows up in a reply
     return token;
   }
 

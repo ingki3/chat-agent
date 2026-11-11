@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import { and, asc, eq, gt, inArray, isNotNull, lt, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   publicParts,
   redactSecrets,
@@ -28,7 +28,7 @@ import {
 } from "./adapter.js";
 import type { UsageAttempt, UsagePurpose } from "../usage/store.js";
 import { logEvent, type EventLogger } from "../logging.js";
-import { scrubKnown, scrubKnownDeep, StreamScrubber } from "../secrets/known.js";
+import { scrubEventSequence, scrubKnown, scrubKnownDeep, StreamScrubber } from "../secrets/known.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
@@ -540,13 +540,15 @@ export class RunManager {
    * event was stored never comes back in a replay or a resumed stream.
    */
   eventsAfter(id: string, afterSeq: number): { seq: number; data: StreamEvent }[] {
-    return this.db
+    // The whole run as one stream (round 25: deltas joined must not rebuild a secret), then the part asked for.
+    const all = this.db
       .select()
       .from(runEvents)
-      .where(and(eq(runEvents.runId, id), gt(runEvents.seq, afterSeq)))
+      .where(eq(runEvents.runId, id))
       .orderBy(asc(runEvents.seq))
       .all()
-      .map((e) => ({ seq: e.seq, data: scrubKnownDeep(e.data as StreamEvent, { tail: false }) }));
+      .map((e) => ({ seq: e.seq, data: e.data as StreamEvent }));
+    return scrubEventSequence(all).filter((e) => e.seq > afterSeq);
   }
 
   /** Live event feed of a running run (undefined once it has ended). */

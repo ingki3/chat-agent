@@ -17,10 +17,16 @@ import {
   knownSecrets,
   MAX_KNOWN_LENGTH,
   scrubKnown,
+  scrubEventSequence,
   scrubKnownDeep,
   StreamScrubber,
 } from "../src/secrets/known.js";
-import { createFamily } from "./helpers/permission-matrix.js";
+import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
+import { FinanceResultStore } from "../src/finance/results.js";
+import type { AnswerEvidence } from "../src/finance/checker.js";
+
+const sql_raw = (db: ReturnType<typeof createTestDb>, q: string, ...args: string[]) =>
+  db.$client.prepare(q).run(...args);
 
 /**
  * Review round 23: a secret value the server knows never reaches a stored row, the messages API, a live
@@ -590,5 +596,407 @@ describe("round 24: late registration, and secrets registered while a session op
     expect(handed).not.toContain(lateDuring);
     expect(handed).not.toContain(late);
     expect(rt.seen.at(-1)!.input).toContain("[숨김]");
+  });
+});
+
+describe("round 25: scrubber", () => {
+  it("a replay is scrubbed as one stream: deltas joined cannot rebuild a secret registered after them", () => {
+    const reg = new KnownSecrets();
+    const v = "replay-0123456789abcdef";
+    const ev = (data: object, seq: number) => ({ seq, data });
+    const events = [
+      ev({ type: "delta", text: "답 replay-01" }, 1),
+      ev({ type: "tool_start", callId: "x", name: "t", input: {} }, 2),
+      ev({ type: "delta", text: "23456" }, 3),
+      ev({ type: "delta", text: "789abcdef 끝" }, 4),
+      ev({ type: "done" }, 5),
+    ];
+    const joined = (es: { data: { type?: string; text?: string } }[]) =>
+      es.map((e) => (e.data.type === "delta" ? e.data.text : "")).join("");
+    expect(joined(scrubEventSequence(events, reg) as never)).toContain(v);
+    reg.add(v);
+    const out = scrubEventSequence(events, reg) as never as {
+      seq: number;
+      data: { type: string; text?: string };
+    }[];
+    expect(joined(out)).not.toContain(v);
+    expect(joined(out)).toContain("[숨김]");
+    expect(out.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    // Nothing across the deltas: every event exactly as stored (a replay matches the live stream).
+    const plain = [ev({ type: "delta", text: "안녕 " }, 1), ev({ type: "delta", text: "하세요" }, 2)];
+    expect(scrubEventSequence(plain, reg)).toEqual(plain);
+  });
+
+  it("numbers are compared by their canonical text", () => {
+    const reg = new KnownSecrets();
+    reg.add("84736251");
+    expect(scrubKnownDeep({ value: 84736251, n: 7, list: [84736251] }, { registry: reg })).toEqual({
+      value: "[숨김]",
+      n: 7,
+      list: ["[숨김]"],
+    });
+  });
+
+  it("Python str octal escapes of the code points themselves (ä is \\344)", () => {
+    const reg = new KnownSecrets();
+    const v = "Pässwörd-2026-secret";
+    reg.add(v);
+    const pyStr = [...v].map((c) => "\\" + c.codePointAt(0)!.toString(8).padStart(3, "0")).join("");
+    expect(scrubKnown(`code = "${pyStr}"`, { registry: reg })).toBe('code = "[숨김]"');
+    const s = new StreamScrubber(reg);
+    const r = rng(25);
+    expect(
+      chunks(`x ${pyStr} y`, r)
+        .map((c) => s.push(c))
+        .join("") + s.end(),
+    ).toBe("x [숨김] y");
+  });
+
+  it("a value just over the cap has no short piece: ordinary words stay", () => {
+    const reg = new KnownSecrets();
+    const v = "x".repeat(MAX_KNOWN_LENGTH) + "a";
+    reg.add(v);
+    expect(reg.list().every((p) => p.length === MAX_KNOWN_LENGTH)).toBe(true);
+    expect(scrubKnown("const data = banana;", { registry: reg })).toBe("const data = banana;");
+    expect(scrubKnown(`a ${v} b`, { registry: reg })).toBe("a [숨김] b");
+  });
+
+  it("stays linear: a repeated prefix is not compared from every start", () => {
+    const reg = new KnownSecrets();
+    reg.add("a".repeat(16_384));
+    let t = Date.now();
+    expect(scrubKnown("a".repeat(16_384), { registry: reg })).toBe("[숨김]");
+    expect(Date.now() - t).toBeLessThan(100);
+    // Text that is only ever a prefix (every start a near-match): bounded work, and it fails safe (masked).
+    t = Date.now();
+    const out = scrubKnown("a".repeat(16_383) + "b", { registry: reg });
+    expect(Date.now() - t).toBeLessThan(1000);
+    expect(out).not.toMatch(/a{8192}/);
+    const s = new StreamScrubber(reg);
+    t = Date.now();
+    for (let k = 0; k < 16; k++) s.push("a".repeat(1024));
+    s.end();
+    expect(Date.now() - t).toBeLessThan(1000);
+  });
+});
+
+describe("round 25: every egress and every stored row", () => {
+  it("a numeric gate code returned as a JSON number is masked in rows, API, stream and replay", async () => {
+    const gate = String(10_000_000 + crypto.randomInt(80_000_000));
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: gate }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    const cookie = f.cookies.owner;
+    const conv = app.conversations!.create(f.users.owner.id);
+    rt.script(() => [
+      { type: "tool_start", callId: "n1", name: "web_fetch", input: { n: Number(gate) } },
+      { type: "tool_end", callId: "n1", output: { value: Number(gate) } },
+      { type: "text_delta", text: "끝" },
+    ]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: {
+        host: "localhost:3000",
+        cookie,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      },
+      payload: { text: "숫자" },
+    });
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    const sse = await fetch(`${base}/api/runs/${runId}/events`, {
+      headers: { host: "localhost:3000", cookie },
+    }).then((x) => x.text());
+    const api = (
+      await app.inject({
+        url: `/api/conversations/${conv.id}/messages`,
+        headers: { host: "localhost:3000", cookie },
+      })
+    ).body;
+    const rows =
+      JSON.stringify(db.$client.prepare("select parts from messages").all()) +
+      JSON.stringify(db.$client.prepare("select data from run_events").all());
+    for (const [what, hay] of [
+      ["stream", sse],
+      ["API", api],
+      ["rows", rows],
+      ["replay", JSON.stringify(app.runs!.eventsAfter(runId, 0))],
+    ])
+      expect(hay, what).not.toContain(gate);
+    expect(sse).toContain("[숨김]");
+  });
+
+  it("a secret registered late is gone from stored rows after the rescrub, and replayed deltas cannot rebuild it", async () => {
+    const late = `late25-${crypto.randomBytes(12).toString("base64url")}`;
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id, { title: `제목 ${late}` });
+    // Split across deltas (and a tool call), stored before anyone knows it is a secret.
+    const pieces = [late.slice(0, 5), late.slice(5, 11), late.slice(11)];
+    rt.script(() => [
+      { type: "text_delta", text: `답 ${pieces[0]}` },
+      { type: "text_delta", text: pieces[1]! },
+      { type: "tool_start", callId: "x", name: "web_search", input: { q: "x" } },
+      { type: "tool_end", callId: "x", output: { ok: true } },
+      { type: "text_delta", text: `${pieces[2]} 끝` },
+    ]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      },
+      payload: { text: `질문 ${late}` },
+    });
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    for (let i = 0; i < 400 && !app.runs!.get(runId)?.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    const art = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: conv.id, runId },
+      { kind: "markdown", title: `문서 ${late}`, content: `본문 ${late}` },
+    );
+    app.notifications!.publish(f.users.owner.id, { kind: "connection_lost", runtimeLabel: `연결 ${late}` });
+    const all = () =>
+      [
+        "conversations",
+        "messages",
+        "run_events",
+        "artifacts",
+        "artifact_versions",
+        "notifications",
+        "sources",
+        "finance_results",
+      ]
+        .map((t) => JSON.stringify(db.$client.prepare(`select * from "${t}"`).all()))
+        .join("\n");
+    const joinedDeltas = (events: { data: { type: string; text?: string } }[]) =>
+      events.map((e) => (e.data.type === "delta" ? e.data.text : "")).join("");
+    // Split across stored deltas for sure, in a run of their own whose rows never hold the whole value (the live
+    // holdback above may have joined pieces it was unsure about).
+    const splitRun = crypto.randomUUID();
+    const cols = (db.$client.prepare("pragma table_info(runs)").all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    db.$client
+      .prepare(
+        `insert into runs (${cols.join(", ")}) select ${cols
+          .map((c) => (c === "id" ? "?" : c === "idempotency_key" ? "null" : c))
+          .join(", ")} from runs where id = ?`,
+      )
+      .run(splitRun, runId);
+    const msgOf = app.runs!.get(runId)!.assistantMessageId;
+    pieces.forEach((p, k) =>
+      db.$client
+        .prepare("insert into run_events (run_id, seq, data, created_at) values (?, ?, ?, ?)")
+        .run(
+          splitRun,
+          1 + k,
+          JSON.stringify({ type: "delta", messageId: msgOf, partIndex: 0, text: p }),
+          Date.now(),
+        ),
+    );
+    expect(all()).toContain(late);
+    expect(joinedDeltas(app.runs!.eventsAfter(splitRun, 0))).toContain(late);
+    knownSecrets.add(late);
+    // Replay: the deltas joined do not spell it, even before the rescrub has run.
+    expect(joinedDeltas(app.runs!.eventsAfter(splitRun, 0))).not.toContain(late);
+    await app.storedRescrub!.idle();
+    const rows = all();
+    expect(rows).not.toContain(late);
+    expect(joinedDeltas(app.runs!.eventsAfter(splitRun, 0))).not.toContain(late);
+    const stored = (
+      db.$client.prepare("select data from run_events where run_id = ? order by seq").all(splitRun) as {
+        data: string;
+      }[]
+    )
+      .map((r) => JSON.parse(r.data) as { type: string; text?: string })
+      .map((d) => (d.type === "delta" ? d.text : ""))
+      .join("");
+    expect(stored).not.toContain(late);
+    expect(stored).toContain("[숨김]");
+    // A finance result saved after registration (evidence taken from parts in memory) is stored scrubbed, and
+    // `context()` returns it scrubbed.
+    const msgId = app.runs!.get(runId)!.assistantMessageId;
+    const fin = new FinanceResultStore(db);
+    fin.save({ messageId: msgId, conversationId: conv.id, runId }, {
+      sources: [{ name: late }],
+      values: [],
+      identifiers: [],
+    } as unknown as AnswerEvidence);
+    expect(JSON.stringify(db.$client.prepare("select evidence from finance_results").all())).not.toContain(
+      late,
+    );
+    sql_raw(
+      db,
+      "update finance_results set evidence = ?",
+      JSON.stringify({ sources: [{ name: late }], values: [], identifiers: [] }),
+    );
+    expect(JSON.stringify(fin.context(conv.id, Number.MAX_SAFE_INTEGER) ?? null)).not.toContain(late);
+    // The artifact's hash follows its scrubbed content.
+    const v = db.$client
+      .prepare("select content, content_hash from artifact_versions where artifact_id = ?")
+      .get(art.artifact.id) as {
+      content: string;
+      content_hash: string;
+    };
+    expect(v.content_hash).toBe(crypto.createHash("sha256").update(v.content, "utf8").digest("hex"));
+  });
+
+  it("push payloads and the inbox never carry a known secret", async () => {
+    const key = `pushkey-${crypto.randomBytes(12).toString("base64url")}`;
+    const sent: string[] = [];
+    const db = createTestDb();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      notifications: { sender: async (_t, payload) => void sent.push(payload) },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const headers = {
+      host: "localhost:3000",
+      cookie: f.cookies.owner,
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+      "content-type": "application/json",
+    };
+    const tag = (await app.inject({ url: "/api/push/devices", headers })).json<{ sessionTag: string }>()
+      .sessionTag;
+    const sub = await app.inject({
+      method: "POST",
+      url: "/api/push/devices",
+      headers,
+      payload: {
+        endpoint: "https://fcm.googleapis.com/fcm/send/known25",
+        keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+        label: "Android · Chrome",
+        sessionTag: tag,
+      },
+    });
+    expect(sub.statusCode, sub.body).toBeLessThan(300);
+    knownSecrets.add(key);
+    app.notifications!.publish(f.users.owner.id, { kind: "connection_lost", runtimeLabel: `공용 ${key}` });
+    for (let i = 0; i < 100 && !sent.length; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(sent.length).toBeGreaterThan(0);
+    const inbox = (await app.inject({ url: "/api/notifications", headers })).body;
+    for (const [what, hay] of [
+      ["push", sent.join("\n")],
+      ["inbox", inbox],
+      ["rows", JSON.stringify(db.$client.prepare("select * from notifications").all())],
+    ])
+      expect(hay, what).not.toContain(key);
+  });
+
+  it("every GET route answers without a known secret planted in the database (the response net)", async () => {
+    const planted = `planted-${crypto.randomBytes(12).toString("base64url")}`;
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    // The rows are written raw (as if stored before anyone knew), and the rescrub is off: only reads and the
+    // response net stand between them and a response.
+    app.storedRescrub!.close();
+    const conv = app.conversations!.create(f.users.owner.id);
+    rt.script(() => [{ type: "text_delta", text: "답" }]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      },
+      payload: { text: "질문" },
+    });
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    for (let i = 0; i < 400 && !app.runs!.get(runId)?.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    const art = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: conv.id, runId },
+      { kind: "markdown", title: "문서", content: "본문" },
+    );
+    app.notifications!.publish(f.users.owner.id, { kind: "connection_lost", runtimeLabel: "연결" });
+    const sql = db.$client;
+    sql.prepare("update conversations set title = ?").run(`제목 ${planted}`);
+    sql
+      .prepare("update messages set search_text = ?, parts = ?")
+      .run(planted, JSON.stringify([{ type: "text", text: planted }]));
+    sql.prepare("update run_events set data = json_set(data, '$.message', ?)").run(planted);
+    sql.prepare("update artifacts set title = ?").run(`문서 ${planted}`);
+    const trigger = (
+      sql.prepare("select sql from sqlite_master where name = 'artifact_versions_immutable'").get() as {
+        sql: string;
+      }
+    ).sql;
+    sql.exec("drop trigger artifact_versions_immutable");
+    sql
+      .prepare("update artifact_versions set title = ?, content = ?")
+      .run(`문서 ${planted}`, `본문 ${planted}`);
+    sql.exec(trigger);
+    sql.prepare("update notifications set title = ?, body = ?").run(`알림 ${planted}`, planted);
+    sql.prepare("update users set name = ?").run(`이름 ${planted}`);
+    knownSecrets.add(planted);
+    const ids: Record<string, string> = {
+      conversations: conv.id,
+      artifacts: art.artifact.id,
+      a: art.artifact.id,
+      runs: runId,
+    };
+    const routes = fastifyRoutes(app).filter((r) => r.startsWith("GET "));
+    expect(routes.length).toBeGreaterThan(30);
+    const leaks: string[] = [];
+    for (const route of routes) {
+      const path = route.slice(4);
+      // Path parameters: the planted rows' own ids where the route names them, a placeholder elsewhere.
+      const url = path
+        .split("/")
+        .map((seg, k, all) =>
+          seg.startsWith(":") ? (ids[all[k - 1] ?? ""] ?? (seg === ":version" ? "1" : "matrix-id")) : seg,
+        )
+        .join("/")
+        .replace("*", "matrix-id");
+      for (const who of ["owner", "admin"] as const) {
+        const r = await app.inject({ url, headers: { host: "localhost:3000", cookie: f.cookies[who] } });
+        if (r.body.includes(planted)) leaks.push(`${route} as ${who} (${r.statusCode})`);
+      }
+    }
+    expect(leaks).toEqual([]);
   });
 });

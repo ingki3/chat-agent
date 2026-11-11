@@ -140,7 +140,7 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       failures.delete(client);
       const exp = now() + ttlMs;
       const signature = sign(exp);
-      knownSecrets.add(signature); // the cookie is a bearer pass: never in a reply
+      knownSecrets.add(signature, { fresh: true }); // the cookie is a bearer pass: never in a reply
       const cookie = [
         `${GATE_COOKIE}=${exp}.${signature}`,
         "Path=/",
