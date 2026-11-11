@@ -37,11 +37,12 @@ const QUOTE_CHAR =
 /** Currency signs that may stand right before a number (fullwidth `＄` folds to `$`). */
 const CURRENCY = /^[$€¥£₩₹\uFFE5\uFFE1\uFFE6]$/u;
 /**
- * A multiplier after a number, across a space (closed list, case kept): a Korean numeral unit, an English
- * magnitude word, or `K` `M` `B` `bn` `mn` as a whole token.
+ * An English multiplier after a number (closed list, case kept): a magnitude word, or `K` `M` `B` `bn` `mn` as a
+ * whole token. Korean units: attached (`10만`) they are refused by the end token rule (none is a particle); across a
+ * space see `KOREAN_MULTIPLIER_SPACED`.
  */
 const MULTIPLIER_AFTER =
-  /^ ?(?:[십백천만억조경]|(?:thousand|million|billion|trillion)(?![\p{L}\p{N}\p{M}])|(?:K|M|B|bn|mn)(?![\p{L}\p{N}\p{M}]))/u;
+  /^(?: ?(?:thousand|million|billion|trillion)(?![\p{L}\p{N}\p{M}])| ?(?:K|M|B|bn|mn)(?![\p{L}\p{N}\p{M}]))/u;
 const UNIT_QUOTE_AFTER =
   /^ ?["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/u;
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
@@ -143,18 +144,23 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
 );
 const PARTICLE_LOOKAHEAD = 7;
 /**
+ * Across a space, a Korean multiplier is a whole numeral-unit token: units, optionally 원, optionally a listed
+ * particle, then a boundary (`10 만`, `1 억원입니다`, `3 천만`, `5 조 원`; not `조식`, `조기`, `경로에`, `백화점`).
+ */
+const KOREAN_MULTIPLIER_SPACED = new RegExp(
+  `^ [십백천만억조경]+원?(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도)|${byLength(KOREAN_PARTICLES)})?(?![\\p{L}\\p{N}\\p{M}])`,
+  "u",
+);
+/**
  * Separators inside a number: decimal and thousands (`.` `,`, adjacent only — `3, 4명` is prose), fraction, ratio
  * and range (`/` `:` `-` `−` `~`, also with spaces around them). After the dash and tilde folds, `–` is `-` and
  * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
  */
 const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?\p{N})/u;
-// `-` `−` before the start are left to SIGN_BEFORE, which refuses them with or without a digit before (sign or range).
-const NUMBER_BEFORE = /(?:\p{N}[.,]|\p{N} ?[/:~] ?)$/u;
-/**
- * A sign right before the number, also across a space (`- 5%`, `− 5도` — HTML extraction gives `<span>-</span>5%`
- * as `- 5%`). A sign after a digit is a range, which `NUMBER_BEFORE` refuses as well.
- */
-const SIGN_BEFORE = /[+\-\u2212] ?$/u;
+const RANGE_MARK = /^[/:~]$/u;
+const DECIMAL_MARK = /^[.,]$/u;
+/** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
+const SIGN = /^[+\-\u2212]$/u;
 const KOREAN_UNIT = /^[십백천만억조]$/u;
 const KOREAN_DIGIT = /^[일이삼사오육칠팔구]$/u;
 const SPACE = /\s/u;
@@ -419,25 +425,37 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
   return { found: false, reason: "not_found" };
 }
 
+/**
+ * The start of a number match, walked back over spaces and currency signs (`-$100`, `-$ 100`, `- $100`, `-€5`):
+ * a sign there, a range or fraction mark after a digit (`10 ~ 20`, `1/2`), or — only right at the start — a
+ * decimal or thousands mark after a digit (`1.32`, `1,234`; `3, 4명` is prose) means the number goes on before.
+ */
+function numberGoesOnBefore(norm: string, at: number): boolean {
+  let j = at;
+  while (j > 0 && (norm[j - 1] === " " || CURRENCY.test(norm[j - 1]!))) j--;
+  const c = norm[j - 1] ?? "";
+  if (SIGN.test(c)) return true;
+  const beforeMark = norm[j - 2] === " " ? (norm[j - 3] ?? "") : (norm[j - 2] ?? "");
+  if (RANGE_MARK.test(c) && DIGIT.test(beforeMark)) return true;
+  return j === at && DECIMAL_MARK.test(c) && DIGIT.test(norm[j - 2] ?? "");
+}
+
 /** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
 function matchIn(body: string, { norm, from, to }: Normalized, want: string): string | undefined {
   const first = firstChar(want);
   const second = firstChar(want.slice(first.length));
   const last = lastChar(want);
   // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
-  const numberStart = DIGIT.test(first) || (CURRENCY.test(first) && DIGIT.test(second));
+  const numberStart =
+    DIGIT.test(first) ||
+    (CURRENCY.test(first) && DIGIT.test(second === " " ? firstChar(want.slice(first.length + 1)) : second));
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
     // Not inside a token at the start.
     if (TOKEN.test(before)) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
     // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
-    if (
-      numberStart &&
-      (SIGN_BEFORE.test(norm.slice(Math.max(0, at - 2), at)) ||
-        NUMBER_BEFORE.test(norm.slice(Math.max(0, at - 4), at)))
-    )
-      continue;
+    if (numberStart && numberGoesOnBefore(norm, at)) continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
     // Number continuation at the end: not before `SEP digit` (`1` in `1/2`, `3` in `3.5`, `10` in `10~20`), and a
@@ -448,8 +466,8 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     // as they are, so any quote mark there is a unit.
     if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
     // Not before a multiplier across a space (`10 만`, `1 억` from `<b>10</b>만`; `100 million`, `5 bn`).
-    if (DIGIT.test(last) && MULTIPLIER_AFTER.test(norm.slice(at + want.length, at + want.length + 10)))
-      continue;
+    const next = norm.slice(at + want.length, at + want.length + 16);
+    if (DIGIT.test(last) && (MULTIPLIER_AFTER.test(next) || KOREAN_MULTIPLIER_SPACED.test(next))) continue;
     if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).

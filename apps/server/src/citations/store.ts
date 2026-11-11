@@ -42,10 +42,11 @@ export class CitationStore {
       .get();
     const mine = src && src.userId === scope.userId ? src : undefined;
     const sourceId = mine?.id ?? null;
-    // Cheap checks first: a repeated citation or one over the limit costs no text comparison.
+    // Cheap checks first: a repeated verified citation or one over the limit costs no text comparison. A repeat of
+    // one that did not verify is checked again (the model may have corrected the quote, review #97 round 15).
     const existing = this.existing(scope.runId, key, sourceId);
-    if (existing) return existing;
-    if (this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
+    if (existing?.status === "verified") return result(existing.n, existing.status, existing.sourceId);
+    if (!existing && this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
     let status: CitationStatus;
     let quote: string | null = null;
     if (!mine) status = "unknown_source";
@@ -59,7 +60,13 @@ export class CitationStore {
     return this.db.transaction(
       () => {
         const again = this.existing(scope.runId, key, sourceId);
-        if (again) return again;
+        if (again) {
+          // The same passage again: it keeps its number. A retry that now verifies upgrades the entry; one that
+          // still fails leaves it as it was.
+          if (again.status !== "verified" && status === "verified")
+            this.db.update(citations).set({ status, quote, snippet }).where(eq(citations.id, again.id)).run();
+          return result(again.n, again.status === "verified" ? again.status : status, again.sourceId);
+        }
         const count = this.count(scope.runId);
         if (count >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
         const n = count + 1;
@@ -84,14 +91,13 @@ export class CitationStore {
     );
   }
 
-  private existing(runId: string, key: string, sourceId: string | null): CiteResult | undefined {
-    const same = this.db
+  private existing(runId: string, key: string, sourceId: string | null): CitationRow | undefined {
+    return this.db
       .select()
       .from(citations)
       .where(and(eq(citations.runId, runId), eq(citations.snippetKey, key)))
       .all()
       .find((c) => c.sourceId === sourceId);
-    return same ? result(same.n, same.status, same.sourceId) : undefined;
   }
 
   private count(runId: string): number {

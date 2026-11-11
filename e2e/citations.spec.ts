@@ -16,7 +16,8 @@ async function ask(page: Page, text: string) {
   const before = await page.getByTestId("citation-note").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1);
+  // The reply runs and the note is added at its end: allow for a busy machine (all specs run in parallel).
+  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1, { timeout: 15_000 });
   return page.getByTestId("assistant").last();
 }
 

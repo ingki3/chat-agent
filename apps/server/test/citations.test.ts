@@ -131,6 +131,30 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("그는 “좋다”고 말했다", '그는 "좋다"고 말했다.')).toBe(true);
   });
 
+  it("round 15: one backward walk at the start, whole Korean multiplier tokens", () => {
+    // 1. Leaving the currency sign out does not hide the sign; nor does an HTML space after it.
+    expect(
+      found("100 million in operating profit", "The company reported -$100 million in operating profit."),
+    ).toBe(false);
+    expect(found("5 million in total", "Net income: -€5 million in total.")).toBe(false);
+    expect(found("100 million in profit", "It reported -$ 100 million in profit.")).toBe(false);
+    expect(found("$ 100 million in profit", "It reported -$ 100 million in profit.")).toBe(false);
+    expect(found("100 million in profit", "It reported - $100 million in profit.")).toBe(false);
+    expect(found("100 million in profit", "It reported 1/$100 million in profit.")).toBe(false);
+    expect(found("100 million in profit", "It reported $100 million in profit.")).toBe(true);
+    expect(found("$ 100 million in profit", "It reported $ 100 million in profit.")).toBe(true);
+    // 2. Across a space, only a whole numeral-unit token is a multiplier.
+    expect(found("객실 요금: $100", "객실 요금: $100 조식 포함")).toBe(true);
+    expect(found("여행 총액: $500", "여행 총액: $500 조기 예약 할인")).toBe(true);
+    expect(found("버스 요금: ¥100", "버스 요금: ¥100 경로에 따라 추가 요금")).toBe(true);
+    expect(found("상품권 가격: $50", "상품권 가격: $50 백화점에서 사용")).toBe(true);
+    expect(found("예상 피해액은 1", "예상 피해액은 1 억원입니다.")).toBe(false);
+    expect(found("총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다.")).toBe(false);
+    expect(found("총 투자 금액은 3", "총 투자 금액은 3 천만 원이다.")).toBe(false);
+    expect(found("올해 매출 총액은 5", "올해 매출 총액은 5 조 원이었다.")).toBe(false);
+    expect(found("총 투자 금액은 10", "총 투자 금액은 10 만에 그쳤다.")).toBe(false);
+  });
+
   it("round 14: a sign before a currency sign, multipliers across a space, wrapped quotes kept", () => {
     // 1. The sign before `$100`, also across a space and as HTML puts it.
     expect(
@@ -549,6 +573,41 @@ describe("CitationStore (#25)", () => {
       [3, "snippet_not_found", null],
     ]);
     expect(rows[0]!.source?.id).toBe(src.id);
+  });
+
+  it("a retry of a citation that did not verify is checked again and keeps its number (round 15)", () => {
+    const f = family();
+    const scope = f.run(f.c.id);
+    const body = (t: string) =>
+      f.sources.addPage(scope, {
+        url: `https://e.example/${encodeURIComponent(t)}`,
+        finalUrl: `https://e.example/${encodeURIComponent(t)}`,
+        title: "t",
+        site: "e.example",
+        contentType: "text/html",
+        body: t,
+        truncated: false,
+      })!;
+    for (const [page, bare, exact] of [
+      ["대표는 “올해 매출 목표는 100”이라고 말했다.", "올해 매출 목표는 100", "“올해 매출 목표는 100”"],
+      ["표에 적힌 값은 “1,000,000”이다.", "1,000,000", "“1,000,000”"],
+      ['그는 "내년 성장률 목표는 3.5"라고 했다.', "내년 성장률 목표는 3.5", '"내년 성장률 목표는 3.5"'],
+    ]) {
+      const src = body(page!);
+      const first = f.cites.cite(scope, { sourceId: src.id, snippet: bare! });
+      expect(first.status, bare).toBe("snippet_not_found");
+      const retry = f.cites.cite(scope, { sourceId: src.id, snippet: exact! });
+      expect(retry, exact).toEqual({ ...first, status: "verified" });
+      // A verified entry is not checked again (and a later failing variant cannot downgrade it).
+      expect(f.cites.cite(scope, { sourceId: src.id, snippet: bare! })).toEqual(retry);
+      const row = f.cites.forRun(scope.runId).find((r) => r.n === first.n)!;
+      expect(row.status).toBe("verified");
+      expect(row.quote).not.toBeNull();
+    }
+    // A retry that still fails keeps the entry as it was.
+    const src = body("다른 본문입니다 정말로.");
+    const a = f.cites.cite(scope, { sourceId: src.id, snippet: "없는 구절입니다 정말" });
+    expect(f.cites.cite(scope, { sourceId: src.id, snippet: "“없는 구절입니다 정말”" })).toEqual(a);
   });
 
   it("the duplicate key is case-sensitive: 100Mbps and 100MBps are two citations (round 10)", () => {
