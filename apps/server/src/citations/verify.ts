@@ -47,6 +47,8 @@ const UNIT_QUOTE_AFTER =
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
 /** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
 const TILDES = /[\u223C\u301C]/gu;
+/** The fraction slash `⁄` (U+2044) is `/` (`1⁄2`). */
+const FRACTION_SLASH = /\u2044/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
 const INVISIBLE_CHAR = /^[\u200B-\u200D\u2060\uFEFF\u00AD]$/u;
 const DIGIT = /\p{N}/u;
@@ -55,6 +57,11 @@ const DIGIT = /\p{N}/u;
  * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
  */
 const TOKEN = /[\p{L}\p{N}\p{M}]/u;
+/**
+ * Unit and currency symbols: next to a number they are token characters at a match edge (`3` is not in `3%`,
+ * `3‰`, `20°`, `20℃`, `12′`; `100` is not after `$`; review #97 round 20).
+ */
+const UNIT_SYMBOL = /[%\u2030\u2031\u00B0\u2103\u2109\u2032\u2033$€¥£₩₹\uFFE5\uFFE1\uFFE6]/u;
 /**
  * Korean particles and copula endings a quote may stop right before (review #97 round 5) — a closed list: the
  * source must continue with one of these and then a token boundary (not a letter, digit or mark, or the end of
@@ -157,6 +164,13 @@ const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
 const DECIMAL_AFTER = /^[.,]\p{N}/u;
 // Also multiplication and powers in scientific notation: `×` `*` `^` `·` (`3×10⁸`, `3*10^8`, `10^9`; round 19).
 const RANGE_AFTER = /^ ?[/:\-\u2212~\u00D7*^\u00B7] ?[+\-\u2212]?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
+/**
+ * The neighbouring source token across a space holds a digit — a compound quantity (`1억 2,000만원`, `1 1/2컵`,
+ * `오후 3시 30분`). A token ending with punctuation (`3,` `3.`) is set apart by it: `3, 4명` and `3. 4였다고` are
+ * prose. Accepted limitation (g): `2024년` before ` 3월` is refused too (review #97 round 20).
+ */
+const NUMBER_TOKEN_AFTER = /^ [^ ]*\p{N}/u;
+const NUMBER_TOKEN_BEFORE = /(?:^|[ ])[^ ]*\p{N}[^ ]*[^ ,.;:!?] $|(?:^|[ ])\p{N} $/u;
 const RANGE_MARK = /^[/:~\u00D7*^\u00B7]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
 /** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
@@ -236,7 +250,8 @@ function normCluster(s: string): string {
     .replace(INVISIBLE, "")
     .replace(QUOTES, '"')
     .replace(DASHES, "-")
-    .replace(TILDES, "~");
+    .replace(TILDES, "~")
+    .replace(FRACTION_SLASH, "/");
   if (clusterCache.size < 50_000) clusterCache.set(s, r);
   return r;
 }
@@ -467,13 +482,18 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
   // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
   const firstTokensHaveDigit = DIGIT.test(firstTokens(want, RANGE_WINDOW));
   const lastTokensHaveDigit = DIGIT.test(lastTokens(want, RANGE_WINDOW));
+  // The edge tokens themselves (a token that ends with punctuation — `3,` `3.` — is set apart by it).
+  const firstTokenHasDigit = DIGIT.test(want.split(" ")[0] ?? "");
+  const lastTokenHasDigit = /\p{N}[^ ,.;:!?]*$/u.test(want) && !/[,.;:!?]$/u.test(want);
   const numberStart =
     DIGIT.test(first) ||
     (CURRENCY.test(first) && DIGIT.test(second === " " ? firstChar(want.slice(first.length + 1)) : second));
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
-    // Not inside a token at the start.
-    if (TOKEN.test(before)) continue;
+    // Not inside a token at the start (unit and currency symbols count when the match starts with a number).
+    if (TOKEN.test(before) || (numberStart && UNIT_SYMBOL.test(before))) continue;
+    // Not next to another number token across a space (`2,000만원…` after `1억 `, `1/2컵…` after `1 `).
+    if (firstTokenHasDigit && NUMBER_TOKEN_BEFORE.test(norm.slice(Math.max(0, at - 40), at))) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
     // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
     if (
@@ -499,6 +519,11 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
+    // A unit or currency symbol right after a number is more of it (`3` in `3%`, `3%~5%`).
+    if (DIGIT.test(last) && UNIT_SYMBOL.test(after)) continue;
+    // Not next to another number token across a space (`1억` before ` 2,000만원`, `오후 3시` before ` 30분`).
+    if (lastTokenHasDigit && NUMBER_TOKEN_AFTER.test(norm.slice(at + want.length, at + want.length + 40)))
+      continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
     return boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet);

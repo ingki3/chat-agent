@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 const BODY =
-  "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
+  "산업통상자원부는 10일 발표에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
   'He said "Semiconductor exports rose 132% in October" — a record. 성장률은 3.5%였다. ＡＢＣ전자는 "최대 실적"이라고 했다.';
 
 describe("snippet check: normalisation without fuzzy matches", () => {
@@ -141,7 +141,9 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("$ 100 million in profit", "It reported -$ 100 million in profit.")).toBe(false);
     expect(found("100 million in profit", "It reported - $100 million in profit.")).toBe(false);
     expect(found("100 million in profit", "It reported 1/$100 million in profit.")).toBe(false);
-    expect(found("100 million in profit", "It reported $100 million in profit.")).toBe(true);
+    // Round 20: the currency sign is part of the number token — leaving it out is refused too.
+    expect(found("100 million in profit", "It reported $100 million in profit.")).toBe(false);
+    expect(found("$100 million in profit", "It reported $100 million in profit.")).toBe(true);
     expect(found("$ 100 million in profit", "It reported $ 100 million in profit.")).toBe(true);
     // 2. (Round 16: back to the first-character rule.) After a number, a word that starts with a numeral unit is a
     // multiplier — ordinary words too: accepted limitation (e). Quoting through the word verifies.
@@ -195,6 +197,41 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("A형이었다고 밝혔다", "결과는 3,A형이었다고 밝혔다.")).toBe(true);
     expect(found("A1등급이었다고 밝혔다", "결과는 -A1등급이었다고 밝혔다.")).toBe(true);
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
+  });
+
+  it("unit symbols belong to the number, and a number token next to another number token is not cut (round 20)", () => {
+    // 1. Unit and currency symbols are token characters at the edge.
+    expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3%~5%이다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3%이다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3‰이다.")).toBe(false);
+    expect(found("내일 낮 최고 기온은 20", "내일 낮 최고 기온은 20℃이다.")).toBe(false);
+    expect(found("내일 낮 최고 기온은 20", "내일 낮 최고 기온은 20°C이다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%이다.")).toBe(true);
+    // 2. Compound quantities across a space (Codex).
+    expect(found("총 투자 금액은 1억", "총 투자 금액은 1억 2,000만원이다.")).toBe(false);
+    expect(found("2,000만원이라고 밝혔다.", "총 투자 금액은 1억 2,000만원이라고 밝혔다.")).toBe(false);
+    expect(found("1/2컵이라고 안내했다.", "필요한 밀가루는 1 1/2컵이라고 안내했다.")).toBe(false);
+    expect(found("예약된 열차는 오후 3시", "예약된 열차는 오후 3시 30분에 출발한다.")).toBe(false);
+    expect(found("30분에 출발한다고 했다", "열차는 오후 3시 30분에 출발한다고 했다.")).toBe(false);
+    // Whole compound quantities verify.
+    expect(found("총 투자 금액은 1억 2,000만원", "총 투자 금액은 1억 2,000만원이다.")).toBe(true);
+    expect(found("필요한 밀가루는 1 1/2컵", "필요한 밀가루는 1 1/2컵이라고 안내했다.")).toBe(true);
+    expect(found("예약된 열차는 오후 3시 30분", "예약된 열차는 오후 3시 30분에 출발한다.")).toBe(true);
+    // Accepted limitation (g): any two number tokens side by side.
+    expect(found("10월 반도체 수출이 늘었다", "지난 10일 10월 반도체 수출이 늘었다.")).toBe(false);
+    expect(found("지난 2024년", "지난 2024년 3월에 발표했다.")).toBe(false);
+    expect(found("지난 10일 10월 반도체 수출이 늘었다", "지난 10일 10월 반도체 수출이 늘었다.")).toBe(true);
+    // Only the edge tokens count: a number deeper in the match is fine.
+    expect(found("정부는 3월에 발표했다고 한다", "지난 2024년 정부는 3월에 발표했다고 한다.")).toBe(true);
+    // Punctuation sets tokens apart: a comma or a full stop between them is prose.
+    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
+    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
+    expect(found("매출은 3% 증가,", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
+    expect(found("5% 감소했다고 밝혔다", "매출은 3% 증가, 5% 감소했다고 밝혔다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
+    // 3. The fraction slash folds to `/`.
+    expect(found("필요한 밀가루는 1⁄2컵", "필요한 밀가루는 1/2컵이다.")).toBe(true);
+    expect(found("이번 계약의 지분은 1", "이번 계약의 지분은 1⁄2이다.")).toBe(false);
   });
 
   it("scientific notation and powers are one number (round 19)", () => {
@@ -587,7 +624,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
     const base =
-      "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
+      "산업통상자원부는 10일 발표에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
     const body = base.repeat(Math.ceil(400_000 / base.length)).slice(0, 400_000);
     normalizeWithMap(base); // warm the character caches the first page would warm
     let t = performance.now();
