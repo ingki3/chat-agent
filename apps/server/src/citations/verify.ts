@@ -122,6 +122,10 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
   "u",
 );
 const PARTICLE_LOOKAHEAD = 7;
+/** Separators inside a number: decimal, thousands, fraction, ratio, range (after the dash fold, `–` is `-`). */
+const NUMBER_SEP = /^[.,/:\-~]$/u;
+const KOREAN_UNIT = /^[십백천만억조]$/u;
+const KOREAN_DIGIT = /^[일이삼사오육칠팔구]$/u;
 const SPACE = /\s/u;
 
 const ENTITIES: Record<string, string> = {
@@ -343,17 +347,21 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     const before = charBefore(norm, at);
     // Not inside a token at the start.
     if (TOKEN.test(before)) continue;
-    // Not inside a number: `1.32%`, `1,234`, `-32%` (a sign changes the figure).
+    // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`)
+    // or a sign (`-32%`).
     if (
       DIGIT.test(first) &&
-      /[.,\-+]/u.test(before) &&
-      (before === "-" || before === "+" || DIGIT.test(charBefore(norm, at - 1)))
+      (before === "+" || before === "-" || (NUMBER_SEP.test(before) && DIGIT.test(charBefore(norm, at - 1))))
     )
       continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
-    // Not before the rest of a decimal (`3` in `3.5`).
-    if (DIGIT.test(last) && /^[.,]\p{N}/u.test(rest)) continue;
+    // Number continuation at the end: not before `SEP digit` (`1` in `1/2`, `3` in `3.5`, `10` in `10~20`), and a
+    // Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number). The
+    // mirror at the start (`이` right after `백`) is already refused by the start token rule.
+    if (DIGIT.test(last) && NUMBER_SEP.test(after) && DIGIT.test(firstChar(rest.slice(after.length))))
+      continue;
+    if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;

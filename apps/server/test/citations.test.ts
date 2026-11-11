@@ -101,6 +101,36 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("10월 반도체 수출")).toBe(true);
   });
 
+  it("a match never cuts a number in half: separators and Korean compound numerals (round 9)", () => {
+    // Codex: fractions, at the end and at the start.
+    expect(found("이번 계약의 지분은 1", "이번 계약의 지분은 1/2이다.")).toBe(false);
+    expect(found("해당 사건의 발생 확률은 1", "해당 사건의 발생 확률은 1/100이다.")).toBe(false);
+    expect(found("100원으로 산정됐다고 밝혔다", "금액은 1/100원으로 산정됐다고 밝혔다.")).toBe(false);
+    // Ratios and ranges (every separator), both ends.
+    for (const sep of [".", ",", "/", ":", "-", "–", "~"]) {
+      expect(found("이번 경기의 점수는 3", `이번 경기의 점수는 3${sep}1이었다.`), sep).toBe(false);
+      expect(found("1이었다고 발표했다", `점수는 3${sep}1이었다고 발표했다.`), sep).toBe(false);
+    }
+    expect(found("예상 기온은 10", "예상 기온은 10-20도이다.")).toBe(false);
+    expect(found("예상 기온은 10", "예상 기온은 10~20도이다.")).toBe(false);
+    expect(found("20도라고 예보했다", "기온은 10~20도라고 예보했다.")).toBe(false);
+    // Whole numbers still verify, and a separator followed by a non-digit is no number.
+    expect(found("이번 계약의 지분은 1/2", "이번 계약의 지분은 1/2이다.")).toBe(true);
+    expect(found("예상 기온은 10~20도", "예상 기온은 10~20도이다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
+    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
+    expect(found("3명이 참석했다고 밝혔다", "결과:3명이 참석했다고 밝혔다.")).toBe(true); // `:` after a word
+    // Codex: Korean compound numerals.
+    expect(found("총 참석 인원은 백", "총 참석 인원은 백이 명이었다.")).toBe(false);
+    expect(found("이번 투표 결과는 십", "이번 투표 결과는 십이 대 칠이었다.")).toBe(false);
+    expect(found("그날 기온은 십", "그날 기온은 십이 도였다.")).toBe(false);
+    expect(found("이 명이었다고 밝혔다", "총 인원은 백이 명이었다고 밝혔다.")).toBe(false); // start: token rule
+    expect(found("총 참석 인원은 백이 명", "총 참석 인원은 백이 명이었다.")).toBe(true);
+    // The known over-rejection: a word ending in 백/천/조 followed by the particle 이.
+    expect(found("문서 끝의 공백", "문서 끝의 공백이 남았다.")).toBe(false);
+    expect(found("문서 끝의 공백이", "문서 끝의 공백이 남았다.")).toBe(true);
+  });
+
   it("not inside a decimal, a thousands group or after a sign (review #97)", () => {
     expect(found("32% increased this year", "Sales: 1.32% increased this year.")).toBe(false);
     expect(found("1.32% increased this year", "Sales: 1.32% increased this year.")).toBe(true);
