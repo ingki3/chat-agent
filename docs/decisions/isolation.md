@@ -87,3 +87,12 @@
   - 입력은 실행 전에 검증한다.
   - macOS가 아니면 `skill_unavailable`로 거부한다.
 - 샌드박스 프로파일은 허용 경로 **상위 폴더들의 메타데이터(stat)** 를 읽게 한다. 내용과 목록은 읽지 못한다. node가 스크립트 경로를 `realpath`로 풀 때 상위 폴더를 하나씩 stat하기 때문이다.
+
+## Claude Code CLI를 샌드박스에서 실행 (#15)
+- SDK의 `spawnClaudeCodeProcess`로 CLI를 `spawnIsolated`(`runIsolated`의 장기 실행판)로 띄운다. 같은 프로파일을 쓰고, 하드링크 검사와 메모리 감시도 같다.
+- 허용 범위:
+  - 읽기·쓰기: 연결 폴더(`data/runtimes/<id>`)만
+  - 실행: CLI 바이너리만. 자식 프로세스는 만들 수 없다.
+  - 네트워크: `{ loopbackPorts: [MCP 포트], https: true }` — TCP 443, DNS(mDNSResponder), 인증서 확인(trustd)
+- **fork 없이 동작함을 확인했다**(0.3.312, 2026-11-11). 가짜 API 키로 실행하면 init까지 진행하고, 도구가 0개인 상태에서 API의 401(`authentication_failed`)을 받는다. 연결 폴더에 키 원문은 없다. 이 시험은 macOS 테스트로 남겼다.
+- CLI는 `TMPDIR`과 상관없이 `/tmp/claude-<uid>`를 만들려 한다. 그래서 `CLAUDE_CODE_TMPDIR`을 연결 폴더 안으로 지정한다.

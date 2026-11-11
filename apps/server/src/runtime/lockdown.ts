@@ -53,8 +53,12 @@ export function preToolUse(toolName: string): PreToolUseResult {
  * Claude Agent SDK options. Not relied on: `canUseTool` (not called for read-only commands) and `allowedTools`
  * (auto-approves). Relied on: no built-in tools, no user/project settings, only our MCP server, the hook above.
  */
-export function claudeLockdown(o: { cwd: string; env: Record<string, string>; mcp: McpConnection }) {
-  mcpLoopbackPort(o.mcp);
+export function claudeLockdown(o: {
+  cwd: string;
+  env: Record<string, string>;
+  mcp?: McpConnection | undefined;
+}) {
+  if (o.mcp) mcpLoopbackPort(o.mcp);
   return {
     cwd: o.cwd,
     env: o.env, // replaces the parent environment (SDK: not merged)
@@ -73,13 +77,15 @@ export function claudeLockdown(o: { cwd: string; env: Record<string, string>; mc
     ],
     settingSources: [] as string[],
     strictMcpConfig: true,
-    mcpServers: {
-      [AGENTLEE_MCP]: {
-        type: "http" as const,
-        url: o.mcp.url,
-        headers: { Authorization: `Bearer ${o.mcp.token}` },
-      },
-    },
+    mcpServers: o.mcp
+      ? {
+          [AGENTLEE_MCP]: {
+            type: "http" as const,
+            url: o.mcp.url,
+            headers: { Authorization: `Bearer ${o.mcp.token}` },
+          },
+        }
+      : {},
     hooks: {
       PreToolUse: [{ hooks: [async (input: { tool_name: string }) => preToolUse(input.tool_name)] }],
     },

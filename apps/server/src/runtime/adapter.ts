@@ -28,6 +28,8 @@ export type RuntimeCapabilities = {
 /** What a fresh session gets: the server's history (summarised by #45 when long) and the turn's settings. */
 export type StartContext = {
   conversationId: string;
+  /** Who the run is for — adapters pick the connection (API key, subscription) allowed for this user (#17). */
+  userId: string;
   /** Prior history, public parts only (reasoning never crosses into another session — PRD FR-3.5). */
   history: { role: "user" | "assistant" | "system"; parts: PublicPart[] }[];
   systemPrompt: string;
@@ -48,7 +50,16 @@ export type RuntimeEvent =
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_start"; callId: string; name: string; input?: unknown }
   | { type: "tool_end"; callId: string; output?: unknown; isError?: boolean }
-  | { type: "usage"; inputTokens: number; outputTokens: number; costUsd?: number }
+  | {
+      type: "usage";
+      /** All input tokens of the turn, cached ones included. */
+      inputTokens: number;
+      outputTokens: number;
+      /** Of `inputTokens`: read from / written to the prompt cache, when the runtime reports it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      costUsd?: number;
+    }
   /** Informational (e.g. "fell back to …"). */
   | { type: "notice"; level: "info" | "warn"; code: string; message: string }
   /** Quota / rate limit reached: the turn ends as failed with this code. */
@@ -99,5 +110,15 @@ export class RuntimeRegistry {
   }
   ids(): RuntimeId[] {
     return [...this.adapters.keys()];
+  }
+}
+
+/**
+ * A failure the adapter can name. The run fails with this code (shown to the user through FAILURE_TEXT) instead
+ * of the generic `runtime_error`. Never put secrets or runtime output in `code`.
+ */
+export class RuntimeFailure extends Error {
+  constructor(readonly code: "runtime_auth" | "no_connection" | "runtime_policy" | "runtime_error") {
+    super(code);
   }
 }

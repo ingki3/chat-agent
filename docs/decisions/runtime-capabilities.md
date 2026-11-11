@@ -13,7 +13,7 @@
 
 | 구성 요소 | 버전 |
 |---|---|
-| `@anthropic-ai/claude-agent-sdk` | 0.3.319 (Claude Code CLI 2.1.319) |
+| `@anthropic-ai/claude-agent-sdk` | 스파이크 0.3.319 → **앱은 0.3.312** (2026-10-27 배포. 의존성은 2주 이상 된 버전만 쓴다는 규칙에 따라 #15에서 낮춤. 샌드박스 실행·인증 실패 경로는 0.3.312로 다시 확인) |
 | `@openai/codex-sdk` / `codex` CLI·app-server | 0.167.0 / 0.167.0 |
 | `@modelcontextprotocol/sdk` (시험용 MCP 서버) | 1.32.2 |
 | Node | 22.22.0 |

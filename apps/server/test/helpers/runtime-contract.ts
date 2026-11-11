@@ -20,6 +20,7 @@ export type ContractOptions = {
 
 const ctx = (model: string): StartContext => ({
   conversationId: "contract",
+  userId: "contract",
   history: [],
   systemPrompt: "",
   model,
