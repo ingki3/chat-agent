@@ -23,6 +23,11 @@
       "types": "./src/artifacts.ts",
       "development": "./src/artifacts.ts",
       "default": "./dist/artifacts.js"
+    },
+    "./finance": {
+      "types": "./src/finance.ts",
+      "development": "./src/finance.ts",
+      "default": "./dist/finance.js"
     }
   },
   "scripts": {

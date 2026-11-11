@@ -1,0 +1,104 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_index",
+  "index": "SP500",
+  "market": "US",
+  "symbol": "^GSPC",
+  "name": "S&P 500",
+  "exchange": "SNP",
+  "price": {
+   "value": 7123.45,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "previousClose": {
+   "value": 7140.2,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "change": {
+   "value": -16.75,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "changePercent": {
+   "value": -0.235,
+   "unit": "%",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "dayHigh": {
+   "value": 7125.55,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "dayLow": {
+   "value": 7120.25,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "volume": {
+   "value": 44703800,
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "fiftyTwoWeekHigh": {
+   "value": 355.38,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "fiftyTwoWeekLow": {
+   "value": 243.42,
+   "unit": "pt",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "tradingDay": "2026-11-13",
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "close",
+    "label": "Yahoo Finance · 2026-11-13 16:00 ET 종가"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

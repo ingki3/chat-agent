@@ -1,0 +1,148 @@
+{
+  "tool": "us_financials",
+  "input": {
+    "symbol": "AAPL"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/AAPL?symbol=AAPL&type=annualTotalRevenue,annualOperatingIncome,annualNetIncome,annualDilutedEPS,annualFreeCashFlow&period1=1604966400&period2=1794700800&crumb={crumb}",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "timeseries": {
+          "result": [
+            {
+              "meta": {
+                "symbol": ["AAPL"],
+                "type": ["annualTotalRevenue"]
+              },
+              "timestamp": [1759190400, 1790726400],
+              "annualTotalRevenue": [
+                {
+                  "asOfDate": "2025-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 416161000000
+                  }
+                },
+                {
+                  "asOfDate": "2026-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 478834000000
+                  }
+                }
+              ]
+            },
+            {
+              "meta": {
+                "symbol": ["AAPL"],
+                "type": ["annualOperatingIncome"]
+              },
+              "timestamp": [1759190400, 1790726400],
+              "annualOperatingIncome": [
+                {
+                  "asOfDate": "2025-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 133050000000
+                  }
+                },
+                {
+                  "asOfDate": "2026-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 151200000000
+                  }
+                }
+              ]
+            },
+            {
+              "meta": {
+                "symbol": ["AAPL"],
+                "type": ["annualNetIncome"]
+              },
+              "timestamp": [1759190400, 1790726400],
+              "annualNetIncome": [
+                {
+                  "asOfDate": "2025-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 112010000000
+                  }
+                },
+                {
+                  "asOfDate": "2026-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 132175000000
+                  }
+                }
+              ]
+            },
+            {
+              "meta": {
+                "symbol": ["AAPL"],
+                "type": ["annualDilutedEPS"]
+              },
+              "timestamp": [1759190400, 1790726400],
+              "annualDilutedEPS": [
+                {
+                  "asOfDate": "2025-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 7.46
+                  }
+                },
+                {
+                  "asOfDate": "2026-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 8.96
+                  }
+                }
+              ]
+            },
+            {
+              "meta": {
+                "symbol": ["AAPL"],
+                "type": ["annualFreeCashFlow"]
+              },
+              "timestamp": [1759190400, 1790726400],
+              "annualFreeCashFlow": [
+                {
+                  "asOfDate": "2025-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 98767000000
+                  }
+                },
+                {
+                  "asOfDate": "2026-09-30",
+                  "periodType": "12M",
+                  "currencyCode": "USD",
+                  "reportedValue": {
+                    "raw": 112400000000
+                  }
+                }
+              ]
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

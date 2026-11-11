@@ -1,0 +1,98 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_technicals",
+  "market": "US",
+  "symbol": "AAPL",
+  "price": {
+   "value": 308,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "sma20": {
+   "value": 317.0605,
+   "unit": "USD",
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "sma50": {
+   "value": 329.4738,
+   "unit": "USD",
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "sma200": {
+   "value": 314.4481,
+   "unit": "USD",
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "rsi14": {
+   "value": 4.68,
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "macd": {
+   "value": -5.8495,
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "macdSignal": {
+   "value": -5.3102,
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "macdHistogram": {
+   "value": -0.5393,
+   "source": "Yahoo Finance (Agent Lee 계산)",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "computed"
+  },
+  "bars": 252,
+  "tradingDay": "2026-11-13",
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "close",
+    "label": "Yahoo Finance · 2026-11-13 16:00 ET 종가"
+   },
+   {
+    "source": "Yahoo Finance (Agent Lee 계산)",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "computed",
+    "label": "Yahoo Finance (Agent Lee 계산) · 2026-11-13 16:00 ET 계산값"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

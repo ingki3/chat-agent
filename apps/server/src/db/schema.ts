@@ -586,3 +586,25 @@ export const artifactVersions = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.artifactId, t.version] })],
 );
+
+/**
+ * What the finance tools returned for one answer (#30): sources, numbers and identifiers (`AnswerEvidence`,
+ * finance/checker.ts), written when the answer ends. The common finance output check reads a conversation's rows
+ * in one indexed query to check follow-up answers anywhere later in the conversation — not by scanning messages.
+ * Gone with the message (edit / regenerate keeps the row; the check joins on the message still being active).
+ */
+export const financeResults = sqliteTable(
+  "finance_results",
+  {
+    messageId: text("message_id")
+      .primaryKey()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    runId: text("run_id").notNull(),
+    evidence: text("evidence", { mode: "json" }).$type<unknown>().notNull(),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [index("finance_results_conversation_idx").on(t.conversationId)],
+);

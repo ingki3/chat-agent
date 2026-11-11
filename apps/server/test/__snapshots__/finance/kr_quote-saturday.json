@@ -1,0 +1,53 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "kr_quote",
+  "market": "KRX",
+  "code": "005930",
+  "name": "삼성전자",
+  "exchange": "KOSPI",
+  "type": "stock",
+  "currency": "KRW",
+  "price": {
+   "value": 206000,
+   "unit": "KRW",
+   "source": "네이버 증권",
+   "asOf": "2026-11-13T15:30:00+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": false,
+   "kind": "close"
+  },
+  "change": {
+   "value": 7100,
+   "unit": "KRW",
+   "source": "네이버 증권",
+   "asOf": "2026-11-13T15:30:00+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": false,
+   "kind": "close"
+  },
+  "changePercent": {
+   "value": 3.57,
+   "unit": "%",
+   "source": "네이버 증권",
+   "asOf": "2026-11-13T15:30:00+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": false,
+   "kind": "close"
+  },
+  "tradingDay": "2026-11-13",
+  "url": "https://m.stock.naver.com/domestic/stock/005930/total",
+  "sources": [
+   {
+    "source": "네이버 증권",
+    "asOf": "2026-11-13T15:30:00+09:00",
+    "timeZone": "Asia/Seoul",
+    "delayed": false,
+    "kind": "close",
+    "label": "네이버 증권 · 2026-11-13 15:30 KST 종가"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

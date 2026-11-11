@@ -1,0 +1,44 @@
+{
+  "tool": "kr_quote",
+  "input": {
+    "code": "005930"
+  },
+  "now": "2026-11-12T10:15:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://m.stock.naver.com/api/stock/005930/basic",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "stockEndType": "stock",
+        "itemCode": "005930",
+        "reutersCode": "005930",
+        "stockName": "삼성전자",
+        "closePrice": "198,100",
+        "compareToPreviousClosePrice": "800",
+        "compareToPreviousPrice": {
+          "code": "5",
+          "text": "하락",
+          "name": "FALLING"
+        },
+        "fluctuationsRatio": "-0.40",
+        "marketStatus": "OPEN",
+        "localTradedAt": "2026-11-12T10:14:55+09:00",
+        "stockExchangeType": {
+          "code": "KS",
+          "zoneId": "Asia/Seoul",
+          "nationType": "KOR",
+          "delayTime": 0,
+          "startTime": "0900",
+          "endTime": "1530",
+          "nameKor": "코스피",
+          "nameEng": "KOSPI",
+          "name": "KOSPI"
+        },
+        "stockExchangeName": "KOSPI"
+      }
+    }
+  ]
+}

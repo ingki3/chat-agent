@@ -12,11 +12,12 @@
 | SQLite DB | `<DATA_DIR>/agentlee.db` (WAL) | — | 포함 |
 | 암호화 마스터 키 | `~/.agentlee/master.key` | `MASTER_KEY_PATH` | **포함하지 않음** — 아래 3절 |
 | 서버 전용 스킬 폴더 (#21) | `<DATA_DIR>/skills/<스킬>/` (허용 목록 스킬의 복사본, 읽기 전용) | `pnpm skills:install` — 15절 | 포함(코드일 뿐, 비밀 없음) |
-| 스킬 비밀 (#21) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY` | 15.3절 | `.env`와 같다 |
+| 스킬 비밀 (#21, #30) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY`·`SEC_USER_AGENT` | 15.3절, 19.1절 | `.env`와 같다 |
 | 런타임 연결 키·토큰 (#17) | DB `connections.secret`(마스터 키로 암호화) | 설정 → 내 런타임 연결, 관리자 API — 11절 | DB와 함께 포함(암호문) |
 | 사용량 기록 (#44) | DB `usage_records` 표 — 실행 시도(run·attempt)마다 1행, 토큰·원시 비용·요청 수만(내용 없음) | — | DB와 함께 포함 — 16절 |
 | 웹 출처 (#50) | DB `sources` 표: 가져온 페이지 본문·검색 결과 | `WEB_SEARCH_PROVIDERS` — 17절 | DB와 함께 포함 |
 | 아티팩트 (#27) | DB `artifacts`·`artifact_versions` 표: 버전마다 본문(최대 512KB) | — 18절 | DB와 함께 포함 |
+| 금융 결과 (#30) | DB `finance_results` 표: 금융 도구를 쓴 답변마다 출처·기준 시각·숫자·식별자(후속 답변 검사용) | — 19.3절 | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
@@ -393,7 +394,7 @@ rm ~/.agentlee/probe-headers.txt
 | 섹션 | 들어가는 조건 |
 |---|---|
 | `common` | 항상. 한국어 기본, 외부 콘텐츠 속 지시는 데이터(`<external_content>` 블록), 웹 자료는 `cite`, 최신 사실 날짜, 출처 충돌 명시 |
-| `finance` | 그 실행의 도구에 금융 도구가 있을 때(`isFinanceTool`: `skill_kr-stock-skill`·`skill_us-stock-skill`·`skill_market-disclosure-monitor`·`skill_dart-investment-monitor`, 또는 `finance_*`) |
+| `finance` | 그 실행의 도구에 금융 도구가 있을 때(`isFinanceTool`: `skill_kr-stock-skill`·`skill_us-stock-skill`·`skill_market-disclosure-monitor`·`skill_dart-investment-monitor`, 금융 도구 `kr_*`·`us_*`·`fx_usdkrw`·`dart_disclosures`·`sec_*`(#30), 또는 `finance_*`) |
 | `youth` | 청소년 계정(`users.youth = 1`, 아들)일 때만 |
 | `research` | 대화의 자료 조사 모드(`conversations.research_mode`)가 켜졌을 때 |
 
@@ -453,7 +454,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
 
 ### 15.4 사용자별 스킬 (FR-1.6)
-- 기본은 모든 스킬(`"all"`)이다. 아들처럼 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
+- 기본은 모든 스킬(`"all"`)이다. 청소년 계정은 `"all"`이어도 금융 스킬이 숨겨진다(#30, 19.4절). 어른 계정에서 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
   ```
   PUT /api/admin/users/<id>/skills   {"skills": ["google-news-search-skill"]}
   PUT /api/admin/users/<id>/skills   {"skills": "all"}
@@ -582,3 +583,67 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 ### 18.3 확인 방법
 - `pnpm e2e e2e/artifacts.spec.ts`: 차트가 그려진 뒤 쿠키·API·부모·최상위 창 접근이 실패하고, 허용 밖 CDN이 막히고, 다른 가족은 403인지 본다.
 - 브라우저에서 원본 주소를 직접 열어도 개발자 도구 콘솔의 `self.origin`이 `"null"`이어야 한다(샌드박스).
+
+## 19. 금융 도구 (#30)
+방식과 근거는 `docs/decisions/isolation.md` "금융 도구 (#30)"에 있다. PRD FR-7.1–7.4·7.6·7.8.
+
+### 19.1 켜져 있는 것
+- 도구(모두 우리 MCP 서버의 서버 도구, 설치할 것 없음, macOS 샌드박스 필요 — 아니면 `finance_unavailable`):
+
+  | 스킬 권한(FR-1.6) | 도구 | 데이터 원천 | 필요한 설정 |
+  |---|---|---|---|
+  | `kr-stock-skill` | `kr_quote` `kr_index` `kr_history` `kr_search` `kr_etf` `fx_usdkrw` | 네이버 증권(환율은 Yahoo Finance) | 없음 |
+  | `us-stock-skill` | `us_quote` `us_index` `us_company` `us_history` `us_financials` `us_earnings` `us_valuation` `us_technicals` `us_screener` | Yahoo Finance | 없음 |
+  | `dart-investment-monitor` | `dart_disclosures` | OpenDART | `.env`의 `OPENDART_API_KEY` |
+  | `market-disclosure-monitor` | `sec_8k` `sec_form4` `sec_13f` | SEC EDGAR | `.env`의 `SEC_USER_AGENT` |
+
+- `SEC_USER_AGENT`: SEC는 모든 요청에 "이름 연락처"를 담은 User-Agent를 요구한다. 예: `SEC_USER_AGENT=AgentLee family-assistant 관리자메일@example.com`. 비밀처럼 다룬다(로그·결과에 남지 않음).
+- 값이 없으면 그 도구만 `finance_unconfigured`로 거절한다. 넣거나 바꾼 뒤에는 서비스를 다시 시작한다.
+- `skill_kr-stock-skill`(#21 python 래퍼)은 Alpha Vantage 대체용으로 남아 있다. 그 결과에는 출처·기준 시각 표시가 없어서 출력기가 `tool_meta`로 표시한다(19.3).
+- `GET /api/admin/skills`에서 네 금융 스킬은 금융 도구가 있으면 `available`이다.
+
+### 19.2 응답 형식 (값마다 출처·기준 시각)
+- 숫자 하나하나가 `{ value, unit, source, asOf, timeZone, delayed, kind }`다. 이력·목록은 행마다 같은 필드를 붙인다.
+  - `asOf`: 시장 시간대의 시각 + 오프셋(`2026-11-13T15:30:00+09:00`, `2026-11-13T16:00:00-05:00`).
+  - `kind`: `close` 종가 · `intraday` 장중 · `reported` 보고치(재무) · `estimate` 컨센서스 · `filing` 공시 · `computed` 기술 지표.
+  - `delayed`: 장중 값이 지연일 수 있으면 `true`. 네이버는 지연 분을 알려 주고(0 = 실시간), Yahoo는 알려 주지 않아 장중 값은 늘 `true`다. 종가는 `false`.
+- **종가 판정과 휴장일 규칙(리뷰 #93 1차):** "종가인가"와 "지연인가"를 따로 정한다.
+  - 값의 시각이 정규장 마감 시각 이후일 때만 `close`다(리뷰 #93 2차). 원천의 시장 상태(네이버 `marketStatus: CLOSE`, Yahoo `marketState: POST`)는 종가를 확정하지 않는다 — 지연 피드는 16:00 뒤에도 15:40 체결을 보여 줄 수 있다. 시세에 "이것이 종가"라는 명시 필드를 주는 원천은 없다. `asOf`는 그 거래일의 마감 시각(KRX 15:30 KST, 미국 16:00 ET, 조기 폐장 13:00 ET)이다. 주말·휴장일에는 최근 거래일 — **토요일에 물으면 금요일 종가**다. 그 거래일이 최근 거래일보다 앞이면 `stale: true`.
+  - 그 밖에는 **원래 시각 그대로** `intraday`다. 장이 열려 있고 오늘 장의 값이면 원천의 지연 표시를 따르고, 장이 끝났거나 오늘 값이 아니면 `delayed: true`, `stale: true`(종가가 아직 오지 않음). 예: 16:01에 받은 15:40 값은 "15:40 ET 장중 (지연)"이지 "16:00 종가"가 아니다.
+- 결과 끝에는 `sources`(서로 다른 출처·기준 시각과 라벨, 예: `네이버 증권 · 2026-11-13 15:30 KST 종가`), `warnings`, `disclaimer`가 붙는다. 표시가 빠진 값이 있으면 그 값에 `metaMissing`이, 결과에 `finance_meta_missing` 경고가 붙는다.
+- 휴장일 표: `apps/server/src/finance/calendar.ts`의 `KRX_HOLIDAYS`·`US_HOLIDAYS`·`US_EARLY_CLOSE`(2025–2027). 표 밖의 해는 주말만 쉬는 날로 본다.
+
+### 19.3 공통 금융 출력기
+- 금융 도구를 쓴 **모든 답변**(모든 사용자, 두 런타임, 중지된 답변 포함), 그 대화에 금융 결과가 **하나라도** 있으면 그 뒤의 **숫자가 있는 모든 후속 답변**(얼마나 지났든, 숫자 없는 설명이 사이에 있어도 — 런타임은 앞 대화를 계속 받는다), **예약 실행**(#33 — 같은 실행 관리자를 거친다), **서버 재시작으로 복구한 부분 답변**에 서버가 `finance_note` 부분을 붙인다(`apps/server/src/finance/checker.ts`, `runs.ts`의 `attachNoteTo` — `settle`과 `recover` 둘 다).
+  - 답변마다 금융 결과(출처·숫자·식별자)를 DB `finance_results` 표(0014 마이그레이션, 메시지당 1행, 메시지·대화와 함께 지워짐)에 남긴다. 후속 답변의 검사는 그 대화의 행을 색인 하나(`finance_results_conversation_idx`)로 읽는다. 고치기·다시 생성으로 기록에서 빠진 답변의 결과는 쓰지 않는다.
+  - `sources`: 그 답변이 받은 금융 결과의 출처·기준 시각(후속 답변은 앞 답변의 것).
+  - `missing`: **숫자마다** 검사한다. 숫자의 맥락은 그 문장과, 같은 문단에서 숫자가 없는 문장(머리말 "네이버 증권 · 11월 13일 종가 기준"이나 각주)이다. 도구 값과 같은 숫자는 **그 값의 출처**와 그 출처의 기준 날짜가, 장중 값이면 시각과 시간대(10:14 KST)까지 맥락에 있어야 한다. 도구 값이 아닌 숫자(합계·환산)는 답변이 쓴 출처 중 하나와 그 날짜가 있어야 한다. 숫자의 단위(천·만·억·조와 천만·백억 같은 묶음, K·M·B·T)를 풀어 쓴 정밀도 안에서 도구 값과 맞춘다(20.6만 = 206,000 ± 500). 한국식 복합 금액(`20만 6000원`, `20만6000원`, `1억 2,300만 4,000원`)은 하나의 숫자로 합치고, 정밀도는 마지막으로 쓴 단위의 것이다(리뷰 #93 3차). 하나라도 빠지면 `source`(출처 이름 `네이버`·`Yahoo`·`DART`·`SEC` 등 없음) 또는 `as_of`(2026-11-13, 2026.11.13, 11월 13일, 11/13 없음)이다. 금융 결과에 표시가 빠졌으면 `tool_meta`.
+  - 숫자로 세지 않는 것: 날짜·시각·연도·분기, 공시 양식(8-K, 10-Q, Form 4, 13F-HR, S-1, item 2.02), 지수·ETF 이름(S&P 500, KOSPI 200, KODEX 200), 서수·목록 번호, 0으로 시작하는 6자리 코드, 도구 입력·결과의 코드·티커·이름 — 모두 통째 토큰일 때만, 그리고 바로 뒤에 단위(원·달러·%·pt·주·만·억…)나 앞에 `$`·`₩`가 있으면 금액으로 본다(373220원, 4달러, 나스닥 10000pt는 숫자). ETF 이름은 브랜드·알려진 단어(미국·S&P·선물·인버스·레버리지…)·숫자만 이름으로 보고, 숫자 바로 뒤에 단위가 있으면 가격이다(`KODEX 84540원`).
+  - `disclaimer`: 항상. "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. …"
+- 화면: 답변 아래에 출처 목록과 면책, 빠진 것이 있으면 ⚠️ 안내(`data-testid="finance-note"`).
+- 런타임이 이 부분을 지우거나 바꿀 수 없다(서버가 답변 끝에 붙임). 다음 런타임에게 넘어가는 맥락에는 글 부분만 간다.
+
+### 19.4 사용자별 허용 (아들 기본 숨김)
+- 청소년 계정(`users.youth = 1`, 14.2절)은 스킬 권한이 기본값 `"all"`이어도 **금융 스킬 네 개와 그 도구가 숨겨진다**(목록에 없고, 불러도 `finance_not_allowed`).
+- 켜려면 목록으로 이름을 적는다: `PUT /api/admin/users/<id>/skills {"skills": ["google-news-search-skill", "kr-stock-skill"]}` — `kr-stock-skill`의 도구(`kr_*`, `fx_usdkrw`)만 켜진다.
+- 어른 계정도 목록에서 금융 스킬을 빼면 그 도구가 빠진다. 실행 중에도 다음 호출부터 적용된다.
+- 매년 12월: 다음 해 KRX 휴장일(거래소 공지)과 NYSE 휴장·조기 폐장일을 `calendar.ts`에 넣고 `CALENDAR_YEARS`를 늘린다. 시험(`finance.test.ts` "covers the years around today")이 올해와 내년이 표에 없으면 실패한다.
+
+### 19.5 녹화와 스냅샷 시험
+- 시험은 네트워크를 쓰지 않는다. `apps/server/test/fixtures/finance/<이름>.json`(도구, 입력, 물은 시각 `now`, URL별 응답)을 재생하고(`helpers/finance-replay.ts`), 결과를 `__snapshots__/finance/<이름>.json`과 비교한다.
+- **지금 fixture는 모두 합성이다**(`"synthetic": true`). 2026-11-11에 살아 있는 API의 응답 모양을 확인하고 그 모양으로 만들었다. OpenDART 키와 SEC 연락처가 없어 실제 녹화는 하지 않았다.
+- 실제 녹화로 바꾸기(macOS, 네트워크, 필요하면 `.env`에 `OPENDART_API_KEY`·`SEC_USER_AGENT`):
+  ```
+  pnpm --filter @agentlee/server exec tsx --conditions=development test/record-finance.ts us_quote-saturday
+  pnpm vitest run apps/server/test/finance.test.ts -u     # 스냅샷 갱신
+  git diff apps/server/test/fixtures/finance apps/server/test/__snapshots__/finance   # 검토
+  ```
+  - 서버와 똑같이 샌드박스 작업자 + 그 도구 호스트만 허용하는 프록시로 부른다. `now`는 녹화 시각이 된다.
+  - 저장되지 않는 것: crumb(`{crumb}`)·OpenDART 키(`{key}`)는 URL에서 자리표시자로, 쿠키·crumb 단계와 헤더는 저장 안 함. 본문에 비밀 값이 남으면 쓰지 않고 멈춘다.
+  - 휴장일 규칙 시험(`-saturday`·`-holiday`·`-thanksgiving`·`-intraday`)은 그 시각의 값을 확인한다. 이런 fixture를 다시 녹화하려면 그 조건(토요일, 휴장 다음 날, 장중)에 녹화하거나 합성으로 둔다.
+- 실제 계정·실제 런타임 확인 체크리스트: `docs/evidence/finance/checklist.md`.
+
+### 19.6 막히는 것과 로그
+- 도구마다 자기 호스트만 허용하는 송신 프록시를 쓴다(표: isolation.md). 다른 호스트·포트로는 나가지 못한다.
+- 로그에는 호출마다 `finance.finished`(도구 이름, `financeCode`, 소요 시간, ID)만 남는다. 종목 코드·URL·숫자는 남지 않는다.
+- 자주 보이는 코드: `finance_unconfigured`(키·연락처 없음), `finance_not_found`(없는 종목), `finance_rate_limited`(429·DART 020), `finance_blocked`(허용 밖 호스트), `finance_unreachable`, `finance_bad_response`(응답 모양이 바뀜 — 녹화를 다시 하고 파서를 고친다).

@@ -1,0 +1,56 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "kr_index",
+  "market": "KRX",
+  "code": "KOSPI",
+  "name": "코스피",
+  "exchange": "KOSPI",
+  "type": "index",
+  "currency": null,
+  "price": {
+   "value": 5375.36,
+   "unit": "pt",
+   "source": "네이버 증권",
+   "asOf": "2026-11-12T15:29:59+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": true,
+   "kind": "intraday",
+   "stale": true
+  },
+  "change": {
+   "value": 136.23,
+   "unit": "pt",
+   "source": "네이버 증권",
+   "asOf": "2026-11-12T15:29:59+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": true,
+   "kind": "intraday",
+   "stale": true
+  },
+  "changePercent": {
+   "value": 2.6,
+   "unit": "%",
+   "source": "네이버 증권",
+   "asOf": "2026-11-12T15:29:59+09:00",
+   "timeZone": "Asia/Seoul",
+   "delayed": true,
+   "kind": "intraday",
+   "stale": true
+  },
+  "tradingDay": "2026-11-12",
+  "url": "https://m.stock.naver.com/domestic/index/KOSPI/total",
+  "sources": [
+   {
+    "source": "네이버 증권",
+    "asOf": "2026-11-12T15:29:59+09:00",
+    "timeZone": "Asia/Seoul",
+    "delayed": true,
+    "kind": "intraday",
+    "label": "네이버 증권 · 2026-11-12 15:29 KST 장중 (지연)"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

@@ -1,0 +1,25 @@
+{
+  "tool": "us_quote",
+  "input": {
+    "symbol": "ZZZZQ"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/ZZZZQ?range=5d&interval=1d&includePrePost=false",
+      "status": 404,
+      "contentType": "application/json",
+      "body": {
+        "chart": {
+          "result": null,
+          "error": {
+            "code": "Not Found",
+            "description": "No data found, symbol may be delisted"
+          }
+        }
+      }
+    }
+  ]
+}

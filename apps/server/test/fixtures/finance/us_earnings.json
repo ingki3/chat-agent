@@ -1,0 +1,110 @@
+{
+  "tool": "us_earnings",
+  "input": {
+    "symbol": "AAPL"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v10/finance/quoteSummary/AAPL?modules=earningsHistory,calendarEvents,price&crumb={crumb}",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "quoteSummary": {
+          "result": [
+            {
+              "earningsHistory": {
+                "history": [
+                  {
+                    "epsActual": {
+                      "raw": 2.01
+                    },
+                    "epsEstimate": {
+                      "raw": 1.94275
+                    },
+                    "surprisePercent": {
+                      "raw": 0.0346
+                    },
+                    "quarter": {
+                      "raw": 1774915200
+                    }
+                  },
+                  {
+                    "epsActual": {
+                      "raw": 1.69
+                    },
+                    "epsEstimate": {
+                      "raw": 1.62
+                    },
+                    "surprisePercent": {
+                      "raw": 0.0432
+                    },
+                    "quarter": {
+                      "raw": 1782777600
+                    }
+                  },
+                  {
+                    "epsActual": {
+                      "raw": 2.12
+                    },
+                    "epsEstimate": {
+                      "raw": 2.05
+                    },
+                    "surprisePercent": {
+                      "raw": 0.0341
+                    },
+                    "quarter": {
+                      "raw": 1790726400
+                    }
+                  }
+                ]
+              },
+              "calendarEvents": {
+                "earnings": {
+                  "earningsDate": [
+                    {
+                      "raw": 1801170000,
+                      "fmt": "2027-01-28"
+                    }
+                  ],
+                  "isEarningsDateEstimate": true,
+                  "earningsAverage": {
+                    "raw": 2.91405
+                  },
+                  "earningsLow": {
+                    "raw": 2.83
+                  },
+                  "earningsHigh": {
+                    "raw": 3.18
+                  },
+                  "revenueAverage": {
+                    "raw": 156430011230
+                  }
+                }
+              },
+              "price": {
+                "symbol": "AAPL",
+                "longName": "Apple Inc.",
+                "shortName": "Apple Inc.",
+                "currency": "USD",
+                "exchangeName": "NasdaqGS",
+                "regularMarketTime": 1794603600,
+                "regularMarketPrice": {
+                  "raw": 349.8,
+                  "fmt": "349.80"
+                },
+                "marketCap": {
+                  "raw": 5140000000000,
+                  "fmt": "5.14T"
+                }
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

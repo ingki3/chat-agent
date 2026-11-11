@@ -220,7 +220,7 @@ async function hop(url, o) {
 /**
  * GET with redirects followed by hand: every hop is checked again and goes through a new CONNECT (the proxy
  * re-resolves and re-checks the address).
- * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string> }} o
+ * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string }} o
  */
 export async function get(input, o) {
   const limits = { ...LIMITS, ...o.limits };
@@ -234,6 +234,9 @@ export async function get(input, o) {
   }
   for (let n = 0; n <= limits.maxRedirects; n++) {
     if (Date.now() >= deadline) throw new WebError("web_timeout");
+    // Raw jobs (finance, #30) send a contact header and session cookies: TLS on every hop, the first one and each
+    // redirect (`http://allowed-host:443/` would otherwise pass the proxy's host and port check in clear text).
+    if (o.httpsOnly && url.protocol !== "https:") throw new WebError("web_blocked");
     const r = await hop(url, {
       proxy,
       deadline,
@@ -537,10 +540,151 @@ export async function searchDuckDuckGo(job, o) {
   return { results: parseDuckDuckGo(decode(r.body, String(r.headers["content-type"] ?? "")), job.max) };
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Raw data requests (finance tools, #30): a few GETs of exact URLs the server built, returned as text for the
+// server to parse. The egress proxy of the calling tool lets through its own hosts only.
+
+/** Request headers a step may set (anything else is ignored). */
+const STEP_HEADERS = new Set(["user-agent", "accept"]);
+/** A captured value (Yahoo's crumb) as it may go into a later URL. */
+const CAPTURE = /^[A-Za-z0-9._/~+-]{1,64}$/;
+export const RAW_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024, maxRedirects: 2 };
+/** At most this many session values are remembered per job (each one is scrubbed from every later body). */
+const MAX_SEEN = 200;
+
+const reEscape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** A literal as a pattern in which `%xx` escapes match in either case (`%2F` and `%2f`). */
+const encodedPattern = (t) =>
+  t
+    .split(/(%[0-9A-Fa-f]{2})/)
+    .map((part) =>
+      /^%[0-9A-Fa-f]{2}$/.test(part)
+        ? `%[${part[1].toUpperCase()}${part[1].toLowerCase()}][${part[2].toUpperCase()}${part[2].toLowerCase()}]`
+        : reEscape(part),
+    )
+    .join("");
+
+/**
+ * A data body with every session value seen during this job (every cookie value sent or set — also ones a later
+ * response replaced — and every captured crumb) taken out: a server that reflects them (an echoing API, a profile
+ * text) must not hand them to the model. JSON is rewritten in its canonical form first, so an escaped spelling
+ * (`\u0041`, `\/`) cannot hide a value; the JSON-escaped and URL-encoded (`%2F` or `%2f`) spellings are scrubbed
+ * too. Whatever its length, a value is replaced only as a whole token (no letter or digit on either side), so a
+ * short crumb such as `xyz` does not cut into `xyzzy`. In JSON only string values are scrubbed, never keys; a key,
+ * number or literal that is a whole session value (a cookie `1` and a price `1`) refuses the response
+ * (`web_bad_content` → `finance_bad_response`): it fails closed rather than handing the value on or changing data. Base64 and partial spellings are out of scope (docs/decisions/isolation.md).
+ * @param {string} body @param {Iterable<string>} hidden
+ */
+export function scrubBody(body, hidden) {
+  const values = [...new Set(hidden)].filter((v) => typeof v === "string" && v.length > 0);
+  if (!values.length) return body;
+  // Longest first: a value inside a longer one goes with it.
+  values.sort((a, b) => b.length - a.length);
+  const patterns = values.flatMap((v) =>
+    [...new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)])].map(
+      (form) => new RegExp(`(?<![A-Za-z0-9])${encodedPattern(form)}(?![A-Za-z0-9])`, "g"),
+    ),
+  );
+  const scrub = (t) => patterns.reduce((acc, re) => acc.replace(re, "[redacted]"), t);
+  const hit = (t) => patterns.some((re) => ((re.lastIndex = 0), re.test(t)));
+  // Keys are the data's names, not its text: a short session value that happens to be a field name (`raw`) leaves
+  // them alone. A key carrying a long session value (8+ characters — a token, not a name) refuses the response.
+  const keyHit = (k) =>
+    values.some((v) => v.length >= 8 && new RegExp(`(?<![A-Za-z0-9])${reEscape(v)}(?![A-Za-z0-9])`).test(k));
+  let data;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    return scrub(body); // not JSON: the raw text
+  }
+  // JSON: only string values are scrubbed — never keys (a crumb `raw` must not rename `{"raw": …}` fields and
+  // silently empty the data). A number or literal that is itself a session value is refused (fails closed).
+  const walk = (x) => {
+    if (typeof x === "string") return scrub(x);
+    if (Array.isArray(x)) return x.map(walk);
+    if (x && typeof x === "object")
+      return Object.fromEntries(
+        Object.entries(x).map(([k, v]) => {
+          if (keyHit(k)) throw new WebError("web_bad_content");
+          return [k, walk(v)];
+        }),
+      );
+    if (x !== null && hit(String(x))) throw new WebError("web_bad_content");
+    return x;
+  };
+  return JSON.stringify(walk(data));
+}
+
+/**
+ * Runs the steps in order with one cookie jar (cookies set by a response go with the later requests of this job
+ * only). A step is `{ url, headers?, mode? }`:
+ * - `mode: "cookie"`: only its cookies are kept (any status), nothing is returned;
+ * - `mode: "capture", capture: <name>`: its body (one short token) replaces `{<name>}` in the later URLs and is
+ *   not returned (a session token, never handed back);
+ * - otherwise its `{ status, contentType, body }` is returned, in order.
+ * Cookie and captured values never leave this process.
+ * @param {{ steps?: unknown }} job @param {{ proxy: string, ca?: string }} o
+ */
+export async function fetchRaw(job, o) {
+  const steps = job.steps;
+  if (!Array.isArray(steps) || steps.length < 1 || steps.length > RAW_LIMITS.maxSteps)
+    throw new WebError("web_bad_input");
+  const jar = new Map();
+  const vars = new Map();
+  /** Every session value of the job, kept after the jar replaced it. */
+  const seen = new Set();
+  const responses = [];
+  for (const step of steps) {
+    if (!step || typeof step !== "object" || typeof step.url !== "string")
+      throw new WebError("web_bad_input");
+    const url = step.url.replace(/\{(\w{1,20})\}/g, (m, k) =>
+      vars.has(k) ? encodeURIComponent(vars.get(k)) : m,
+    );
+    /** @type {Record<string,string>} */
+    const headers = {};
+    for (const [k, v] of Object.entries(step.headers ?? {}))
+      if (STEP_HEADERS.has(k.toLowerCase()) && typeof v === "string" && /^[\x20-\x7e]{1,200}$/.test(v))
+        headers[k.toLowerCase()] = v;
+    if (!headers.accept) headers.accept = "application/json,text/plain;q=0.9,*/*;q=0.1";
+    if (jar.size) headers.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+    const r = await get(url, {
+      ...o,
+      headers,
+      httpsOnly: true,
+      limits: { maxBytes: RAW_LIMITS.maxBytes, maxRedirects: RAW_LIMITS.maxRedirects },
+    });
+    const set = r.headers["set-cookie"];
+    for (const c of Array.isArray(set) ? set : set ? [set] : []) {
+      const m = /^([!#$%&'*+.^_`|~0-9A-Za-z-]{1,64})=([^;\s]{0,4096})/.exec(String(c));
+      if (!m) continue;
+      if (seen.size < MAX_SEEN) seen.add(m[2]);
+      if (jar.has(m[1]) || jar.size < 20) jar.set(m[1], m[2]);
+    }
+    if (step.mode === "cookie") continue;
+    const ct = String(r.headers["content-type"] ?? "").toLowerCase();
+    const body = decode(r.body, ct);
+    if (step.mode === "capture") {
+      const v = body.trim();
+      if (r.status !== 200) throw new WebError("web_http_error");
+      if (typeof step.capture !== "string" || !CAPTURE.test(v)) throw new WebError("web_bad_content");
+      vars.set(step.capture, v);
+      seen.add(v);
+      continue;
+    }
+    responses.push({
+      status: r.status,
+      contentType: ct.split(";")[0].trim(),
+      body: scrubBody(body, [...seen, ...jar.values(), ...vars.values()]),
+    });
+  }
+  return { responses };
+}
+
 /** Runs one job. Never throws: a fixed code on failure (no message, which could carry page text). */
 export async function run(job, o) {
   try {
     if (job.op === "fetch") return { ok: true, ...(await fetchPage(job.url, o)) };
+    if (job.op === "raw") return { ok: true, ...(await fetchRaw(job, o)) };
     if (job.op === "search" && job.provider === "duckduckgo")
       return { ok: true, ...(await searchDuckDuckGo(job, o)) };
     return { ok: false, code: "web_bad_input" };

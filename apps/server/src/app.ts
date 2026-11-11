@@ -291,6 +291,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       log: app.log,
       web: { sources, providers: config.webSearchProviders },
       artifacts,
+      // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
+      finance: { secrets: config.skillSecrets },
       ...mcpOptionsFromConfig(config),
       ...opts.mcp,
     });

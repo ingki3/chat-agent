@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { skillToolName } from "@agentlee/mcp-tools";
+import { FINANCE_TOOL_NAMES } from "@agentlee/mcp-tools/finance";
 import { OUR_TOOL_PREFIX } from "../runtime/lockdown.js";
 
 /**
@@ -71,8 +72,8 @@ export function defaultTemplates(): Templates {
 }
 
 /**
- * Finance skills (PRD FR-7) and any future tool named `finance_*`. Tool names may carry the runtime prefix
- * (`mcp__agentlee__`).
+ * Finance skills (PRD FR-7), the finance tools of our MCP server (#30: kr_quote, us_quote, dart_disclosures, …) and
+ * any future tool named `finance_*`. Tool names may carry the runtime prefix (`mcp__agentlee__`).
  */
 export const FINANCE_SKILLS = [
   "kr-stock-skill",
@@ -84,7 +85,7 @@ const FINANCE_TOOLS = new Set<string>(FINANCE_SKILLS.map(skillToolName));
 
 export function isFinanceTool(name: string): boolean {
   const bare = name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name;
-  return FINANCE_TOOLS.has(bare) || bare.startsWith("finance_");
+  return FINANCE_TOOLS.has(bare) || FINANCE_TOOL_NAMES.has(bare) || bare.startsWith("finance_");
 }
 
 /** Today in Seoul as YYYY-MM-DD — the model needs it to date recent facts (FR-5.4). */

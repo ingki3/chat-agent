@@ -1,0 +1,117 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_earnings",
+  "market": "US",
+  "symbol": "AAPL",
+  "history": [
+   {
+    "quarterEnd": "2026-09-30",
+    "epsActual": 2.12,
+    "epsEstimate": 2.05,
+    "surprisePercent": 3.41,
+    "source": "Yahoo Finance",
+    "asOf": "2026-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported"
+   },
+   {
+    "quarterEnd": "2026-06-30",
+    "epsActual": 1.69,
+    "epsEstimate": 1.62,
+    "surprisePercent": 4.32,
+    "source": "Yahoo Finance",
+    "asOf": "2026-06-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported"
+   },
+   {
+    "quarterEnd": "2026-03-31",
+    "epsActual": 2.01,
+    "epsEstimate": 1.94275,
+    "surprisePercent": 3.46,
+    "source": "Yahoo Finance",
+    "asOf": "2026-03-31T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported"
+   }
+  ],
+  "nextEarningsDate": "2027-01-28",
+  "nextEarningsDateIsEstimate": true,
+  "nextEpsEstimate": {
+   "value": 2.91405,
+   "unit": "USD",
+   "source": "Yahoo Finance 컨센서스",
+   "asOf": "2026-11-13T00:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "estimate"
+  },
+  "nextEpsLow": {
+   "value": 2.83,
+   "unit": "USD",
+   "source": "Yahoo Finance 컨센서스",
+   "asOf": "2026-11-13T00:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "estimate"
+  },
+  "nextEpsHigh": {
+   "value": 3.18,
+   "unit": "USD",
+   "source": "Yahoo Finance 컨센서스",
+   "asOf": "2026-11-13T00:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "estimate"
+  },
+  "nextRevenueEstimate": {
+   "value": 156430011230,
+   "unit": "USD",
+   "source": "Yahoo Finance 컨센서스",
+   "asOf": "2026-11-13T00:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "estimate"
+  },
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported",
+    "label": "Yahoo Finance · 2026-09-30 보고치"
+   },
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-06-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported",
+    "label": "Yahoo Finance · 2026-06-30 보고치"
+   },
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-03-31T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported",
+    "label": "Yahoo Finance · 2026-03-31 보고치"
+   },
+   {
+    "source": "Yahoo Finance 컨센서스",
+    "asOf": "2026-11-13T00:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "estimate",
+    "label": "Yahoo Finance 컨센서스 · 2026-11-13 추정치"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

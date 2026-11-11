@@ -31,6 +31,8 @@ import { classifyError, runFailureCategory, type ErrorLog } from "../observabili
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
 import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
+import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/checker.js";
+import { FinanceResultStore } from "../finance/results.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -80,6 +82,8 @@ type Live = {
   tools: Map<string, { name: string; startedAt: number }>;
   /** What made the run fail, for the log (class name and code only are ever written). */
   failure?: unknown;
+  /** Finance results of the recent conversation (#30): a follow-up that states figures is checked too. */
+  financeCarry?: AnswerEvidence | undefined;
 };
 
 /**
@@ -249,6 +253,8 @@ export class RunManager {
   private readonly now: () => number;
   private readonly flushMs: number;
   private readonly templates: Templates;
+  /** Finance results per conversation (#30): follow-ups anywhere later are checked against them. */
+  private readonly financeResults: FinanceResultStore;
 
   constructor(
     private readonly db: Db,
@@ -261,6 +267,7 @@ export class RunManager {
     this.flushMs = opts.flushMs ?? 500;
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
     this.templates = opts.instructions ?? defaultTemplates();
+    this.financeResults = new FinanceResultStore(db);
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -305,7 +312,16 @@ export class RunManager {
       .from(runs)
       .where(inArray(runs.status, ["queued", "running"]))
       .all();
-    for (const r of stale) this.finish(r, "failed", "server_restart");
+    for (const r of stale) {
+      // The partial answer kept from before the restart gets the common finance check too (#30).
+      const msg = this.conversations.messageById(r.assistantMessageId);
+      if (msg) {
+        const parts = msg.parts as MessagePart[];
+        this.attachNoteTo(r, parts, this.financeResults.context(r.conversationId, msg.seq));
+        this.conversations.updateMessage(msg.id, { parts });
+      }
+      this.finish(r, "failed", "server_restart");
+    }
     return stale.length;
   }
 
@@ -590,9 +606,41 @@ export class RunManager {
     if (!live.session) live.abort.abort();
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
+    this.attachNoteTo(row, live.parts, live.financeCarry);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
     this.finish(row, status, code);
     void closeSession(live);
+  }
+
+  /**
+   * The common finance output check (#30): an answer that used a finance tool — or one stating figures while
+   * finance results are in the recent conversation — gets the server's note (sources, as-of times, what the answer
+   * left out, disclaimer), however the run ended, also when it is recovered after a restart. Appends to `parts`
+   * and streams it. A broken check never breaks the reply.
+   */
+  private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
+    if (parts.some((p) => p.type === "finance_note")) return;
+    // This answer's finance results stay for the rest of the conversation's checks.
+    try {
+      const ev = storedEvidence(parts);
+      if (ev)
+        this.financeResults.save(
+          { messageId: row.assistantMessageId, conversationId: row.conversationId, runId: row.id },
+          ev,
+        );
+    } catch {
+      // a storage failure never breaks the reply; the note below is still attached
+    }
+    let note;
+    try {
+      note = financeNote(parts, context);
+    } catch {
+      return;
+    }
+    if (!note) return;
+    parts.push(note);
+    const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
+    this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });
   }
 
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
@@ -801,6 +849,8 @@ export class RunManager {
     const all = this.conversations.messages(run.conversationId, { limit: 10_000 });
     const before = all.filter((m) => m.id !== messageId);
     const lastUser = [...before].reverse().find((m) => m.role === "user");
+    const self = all.find((m) => m.id === messageId);
+    live.financeCarry = this.financeResults.context(run.conversationId, self?.seq ?? Number.MAX_SAFE_INTEGER);
     const inputText = (lastUser?.parts as MessagePart[] | undefined)
       ?.flatMap((p) => (p.type === "text" ? [p.text] : []))
       .join("\n");

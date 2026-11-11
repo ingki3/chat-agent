@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { FINANCE_TOOLS } from "@agentlee/mcp-tools/finance";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CSRF_HEADER, type Run } from "@agentlee/shared";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
@@ -567,6 +568,8 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "web_fetch",
       "artifact_create",
       "artifact_update",
+      // Finance tools (#30): the owner is an adult with every skill.
+      ...FINANCE_TOOLS.map((t) => t.name),
       "skill_selftest",
     ]);
     expect(ctx.mcp!.url).toBe((await app.mcp!.endpoint()).url);

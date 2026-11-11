@@ -1,0 +1,48 @@
+{
+  "tool": "sec_form4",
+  "input": {
+    "cik": "320193"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://data.sec.gov/submissions/CIK0000320193.json",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "cik": "0000320193",
+        "name": "Apple Inc.",
+        "tickers": ["AAPL"],
+        "filings": {
+          "recent": {
+            "accessionNumber": [
+              "0001140361-26-042798",
+              "0001140361-26-042173",
+              "0001140361-26-042149",
+              "0000320193-26-000105"
+            ],
+            "filingDate": ["2026-11-09", "2026-11-06", "2026-11-05", "2026-10-30"],
+            "reportDate": ["2026-11-05", "", "2026-11-03", "2026-10-30"],
+            "acceptanceDateTime": [
+              "2026-11-09T16:30:40.000Z",
+              "2026-11-06T02:54:06.000Z",
+              "2026-11-05T18:30:13.000Z",
+              "2026-10-30T16:31:02.000Z"
+            ],
+            "form": ["8-K", "FWP", "4", "8-K"],
+            "items": ["8.01,9.01", "", "", "2.02,9.01"],
+            "primaryDocument": [
+              "ef20085077_8k.htm",
+              "ny20084621x3_fwp.htm",
+              "xslF345X06/form4.xml",
+              "aapl-20261030.htm"
+            ],
+            "primaryDocDescription": ["8-K", "FWP", "FORM 4", "8-K"]
+          }
+        }
+      }
+    }
+  ]
+}

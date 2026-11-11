@@ -84,6 +84,7 @@ describe("database", () => {
       "connections",
       "conversations",
       "error_log",
+      "finance_results",
       "messages",
       "notification_prefs",
       "notifications",

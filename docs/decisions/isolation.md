@@ -278,6 +278,41 @@ MCP 도구 `web_search(query)`·`web_fetch(url)`이다(`packages/mcp-tools/src/w
 - **API:** `GET /api/conversations/:id/sources` — 대화 주인만(공유와 상관없이: 자원 종류 `conversation-sources`의 공유 목록은 늘 비어 있다. 공유본의 출처는 #29의 고정 목록으로 따로 보인다). 본문은 주지 않는다(글자 수만).
 - **남은 것:** 두 런타임의 실제 녹화(자격 증명 필요, #21과 같음), 실 런타임이 이 도구로 프롬프트 주입 평가(`docs/ops.md` §14.4)를 도는 것.
 
+## 금융 도구 (#30)
+MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdkrw`·`us_*`(9개)·`dart_disclosures`·`sec_8k`·`sec_form4`·`sec_13f`이다(`packages/mcp-tools/src/finance.ts`, 서버 쪽 `apps/server/src/finance/`). 운영은 `docs/ops.md` §19.
+
+- **스킬을 직접 돌리지 않는 이유:** `us-stock-skill`은 스킬 venv(yfinance·curl_cffi·pandas)가 있어야 하고, 두 공시 스킬은 로컬 SQLite에 쓰고 LLM 워커·Telegram을 부르는 상태 있는 모니터다. #21 실행기(독립 실행형 python `-I -S`, 표준 라이브러리, 고정 사본, fork 금지)로는 돌릴 수 없다. 그래서 스킬이 읽는 **같은 데이터 원천**(네이버 증권, Yahoo Finance, OpenDART, SEC EDGAR)을 서버 함수로 읽는다(`docs/skills.md`의 "자식 프로세스·venv가 필요하면 서버 함수로" 원칙). 사용자별 허용은 원래 스킬 이름으로 한다(도구마다 `skill`).
+- **실행 위치:** 웹 도구의 **샌드박스 node 작업자**(`web/worker.mjs`)에 `raw` 작업을 더했다. 서버가 검증한 입력으로 **정확한 URL**을 만들고(`providers.ts`의 `plan`), 작업자는 GET만 하고 본문 글자를 돌려준다. 해석(JSON, 숫자, 시각)은 서버의 순수 함수(`parse`)가 한다 — 녹화·합성 응답으로 스냅샷 시험을 하기 위해서다. JSON 해석뿐이고 남의 HTML을 해석하지 않는다.
+  - 한 작업은 최대 4단계, 단계마다 3MB, 리다이렉트 2번. 작업 안에서만 쿠키 상자를 쓰고(Yahoo 세션 쿠키), `capture` 단계(Yahoo crumb)는 뒤 URL의 `{crumb}`에만 들어간다. 쿠키·crumb는 작업자 밖으로 나오지 않는다(시험).
+  - **반사된 세션 값(리뷰 #93 1·2차):** 작업 중 본 **모든** 세션 값 — 보낸 쿠키, 응답이 새로 설정해 바꾼 쿠키의 이전 값과 새 값, 캡처한 crumb — 을 기억해 두고(작업당 최대 200개), 데이터 본문을 돌려주기 전에 `[redacted]`로 바꾼다(`scrubBody`). 길이와 상관없이 지운다.
+    - 철자: 그대로, JSON 이스케이프, `\uXXXX`(JSON은 먼저 정규형으로 다시 쓴다), URL 인코딩(`%2F`·`%2f` 대소문자 모두).
+    - **통째 토큰만** 바꾼다: 앞뒤에 영문자·숫자가 없을 때. 그래서 `xyz` 같은 짧은 crumb가 `xyzzy`나 `abcxyz` 속을 자르지 않는다(양방향 시험).
+    - **JSON은 문자열 값만** 바꾸고 키는 건드리지 않는다(리뷰 #93 3차: crumb `raw`가 Yahoo의 `{"raw": …}` 키를 바꿔 숫자가 조용히 `null`이 되던 문제). 숫자·리터럴이 세션 값과 통째로 같거나(쿠키 `1`과 가격 `1`), 키에 8자 이상 세션 값이 들어 있으면 응답을 거부한다(`web_bad_content` → `finance_bad_response`) — 데이터를 바꾸지도, 값을 흘리지도 않고 닫힌 쪽으로 실패한다. 서버는 해석이 안 되는 본문을 늘 `finance_bad_response`로 거부한다.
+    - **판정 기준(다음 리뷰용):** 이 값들은 Yahoo가 익명 방문자에게 주는 세션 쿠키·crumb다. 사용자 자격 증명이 아니고 사용자가 넣는 값도 아니며, 계정이나 가족 데이터에 닿지 못한다. 그래서 막는 범위는 "작업자가 받은 값을 그대로(또는 위 표준 인코딩으로) 모델에게 되돌려 주는 것"까지다. **Base64·부분 문자열·그 밖의 변형 반사는 범위 밖**이다 — 그런 응답은 원천 서버가 일부러 만들어야 나오고, 새어도 익명 세션 하나다. 설정된 비밀(`OPENDART_API_KEY`·`SEC_USER_AGENT`)은 이와 별개로 서버가 결과 전체에서 길이와 상관없이 지운다(`redactValue`).
+  - **매 홉 HTTPS(리뷰 #93 1차):** `raw` 작업은 첫 요청과 모든 리다이렉트가 `https:`여야 한다(`httpsOnly`). `http://허용호스트:443/`로의 리다이렉트는 프록시의 호스트·포트 검사를 통과하므로, 작업자가 보내기 전에 `web_blocked`로 거부한다(SEC 연락처 헤더·쿠키가 평문으로 나가지 않음). 일반 `web_fetch`는 그대로 http도 받는다.
+  - 요청 헤더는 고정값 + 단계가 정한 `user-agent`·`accept`만(SEC는 `SEC_USER_AGENT`).
+- **도구별 송신 프록시(정확한 호스트 허용 목록, 443만):** 도구마다 `EgressService({ allow: tool.hosts })`를 따로 연다(`finance:<도구>` 키). 다른 도구의 호스트에도 닿지 못한다.
+
+  | 도구 | 호스트 |
+  |---|---|
+  | `kr_quote`·`kr_index`·`kr_history`·`kr_etf` | `m.stock.naver.com` |
+  | `kr_search` | `ac.stock.naver.com` |
+  | `fx_usdkrw`·`us_quote`·`us_index`·`us_history`·`us_technicals` | `query1.finance.yahoo.com` |
+  | `us_company`·`us_financials`·`us_earnings`·`us_valuation`·`us_screener` | `fc.yahoo.com`(세션 쿠키), `query1.finance.yahoo.com` |
+  | `dart_disclosures` | `opendart.fss.or.kr` |
+  | `sec_8k`·`sec_form4`·`sec_13f` | `www.sec.gov`(티커 → CIK 목록), `data.sec.gov` |
+
+  - 확인한 곳: 2026-11-11 이 Mac에서 각 엔드포인트를 한 번씩 호출해 응답 모양을 봤다(키가 필요한 OpenDART 제외). 기록은 저장소에 넣지 않았다. 합성 fixture는 그 모양을 따른다.
+  - 서버도 실행 전에 계획의 모든 URL이 그 도구 호스트의 https 기본 포트인지 확인한다(`allowed`, 이중 방어 — 하위 도메인·접미 일치 거부).
+  - 시험: 도구마다 프록시 허용 목록이 정확히 `tool.hosts`인지, 그 프록시가 `query2.finance.yahoo.com`·`finance.yahoo.com`·`…yahoo.com.evil.test`·다른 도구의 호스트·80 포트·IP 리터럴을 403으로 막는지(`finance.test.ts` "finance egress").
+- **비밀:** `OPENDART_API_KEY`(DART URL의 `crtfc_key`), `SEC_USER_AGENT`(SEC 연락처 헤더). 작업 JSON(stdin)으로만 작업자에 간다. 작업자는 URL을 돌려주지 않고, 결과는 설정된 비밀 값으로 길이와 상관없이 한 번 더 지운다(`redactValue` — `SEC_USER_AGENT`는 5자도 된다). 없으면 그 도구만 `finance_unconfigured`.
+- **남의 글:** 공시 제목·회사 이름·회사 소개는 `<external_content>` 블록에 넣는다(닫는 태그 흉내는 무력화 — 시험). 항목 목록에는 번호·코드·날짜·링크만 있다.
+- **로그:** 호출마다 `finance.finished`(도구, `ok`/`error`, `financeCode`, 소요 시간, ID). 종목·URL·숫자는 남지 않는다.
+- **리뷰 #93 1차 뒤 변이 시험(2026-11-11):** 20개를 하나씩 넣어 모두 시험이 잡았다 — 반사 값 지우기 제거·JSON 정규화 제거·crumb 빼고 지우기·짧은 비밀 건너뛰기(8자 이상만), raw 홉 https 강제 제거·첫 홉만 검사, 장이 닫히면 무조건 종가·장 밖 장중 값의 지연 표시 제거·원천 종가 표시 무시·네이버/Yahoo 종가 표시 전달 제거, 답변 전체를 한 맥락으로·값의 출처 대신 아무 출처·장중 시각 검사 제거·다른 문단 머리말 인정, 후속 맥락을 바로 앞 답변만·창 없이 전체 대화, 복구 경로 메모 제거, 식별자 제외 제거·결과의 코드·이름 제외 제거.
+- **리뷰 #93 3차 뒤 변이 시험(2026-11-11):** 13개를 하나씩 넣어 모두 시험이 잡았다 — ETF 이름이 아무 글자나 먹기·ETF 숫자의 단위 검사 제거·ETF 접미어 제외, 복합 금액 합치기 제거·첫 부분의 정밀도·공백 아닌 틈 합치기·큰 단위 뒤 합치기·K/M/B/T와 합치기·천만 같은 묶음 단위 무시, JSON 키 다시 지우기·숫자/리터럴 충돌 통과·긴 토큰 키 통과·문자열 값 안 지우기.
+- **리뷰 #93 2차 뒤 변이 시험(2026-11-11):** 16개를 하나씩 넣어 모두 시험이 잡았다 — 바뀐 쿠키 값 잊기·지금 쿠키 상자만 보기·짧은 값 건너뛰기·통째 토큰 경계 없애기·`%xx` 대소문자 구분, 시장 상태로 종가 확정, 식별자를 부분 문자열로 지우기·단위 뒤 무시·통화 기호 앞 무시·지수 이름 숫자 경계 없애기, 단위 배수 무시·정밀도 무시, 금융 결과 저장 안 함·기록에서 빠진 답변 포함·뒤 메시지 포함·다른 대화 포함.
+- **변이 시험(2026-11-11):** 22개 변이를 하나씩 넣어 모두 시험이 잡았다 — 기록 검사 끔·시간대 없는 asOf 허용·tool_meta 표시 제거, 답변의 출처·기준 시각 검사 끔, 면책 비움·실행 관리자 첨부 제거·후속 답변 검사 제거, 아들 숨김 제거·사용자별 도구 거름 제거·호출 시 재확인 제거, 모든 금융 도구가 프록시 하나를 공유·계획 호스트 검사 제거·접미 일치 허용·호스트 목록 확장·호스트 목록 틀림, KRX 성탄절 누락·미국 조기 폐장 누락·주말을 거래일로·휴장 중 값에 원래 시각·오늘이면 무조건 장중.
+
 ## 아티팩트 서빙 (#27)
 에이전트가 만든 HTML·SVG·차트·표·문서·코드를 버전과 함께 저장하고, **실제로 동작하면서** 앱의 쿠키·API·화면에 닿지 못하게 서빙한다(PRD FR-6.5). 코드는 `apps/server/src/artifacts/`(저장 `store.ts`, 서빙 `serve.ts`, 경로 `routes.ts`), 도구 정의는 `packages/mcp-tools/src/artifacts.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
 

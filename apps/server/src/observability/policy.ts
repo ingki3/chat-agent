@@ -187,7 +187,25 @@ export const ARTIFACT_CODES = set([
   "artifact_limit",
 ]);
 
+/** Outcome codes of the finance tools (#30, finance/service.ts `FINANCE_CODES` — a test keeps the two equal). */
+export const FINANCE_CODES = set([
+  "finance_bad_input",
+  "finance_not_allowed",
+  "finance_unconfigured",
+  "finance_unavailable",
+  "finance_blocked",
+  "finance_unreachable",
+  "finance_timeout",
+  "finance_http_error",
+  "finance_rate_limited",
+  "finance_not_found",
+  "finance_bad_response",
+  "finance_busy",
+  "finance_failed",
+]);
+
 export const isRuntime = member(RUNTIMES);
+export const isFinanceCode = member(FINANCE_CODES);
 export const isArtifactCode = member(ARTIFACT_CODES);
 export const isWebCode = member(WEB_CODES);
 export const isSkillCode = member(SKILL_CODES);
