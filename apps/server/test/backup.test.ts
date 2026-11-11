@@ -26,7 +26,8 @@ import {
 } from "../src/backup/backup.js";
 import { FileWriteLock } from "../src/backup/lock.js";
 import {
-  COMPLETE_MARKER,
+  CANDIDATE_ID_FILE,
+  OLD_ID_FILE,
   restoreBackup,
   RestoreError,
   restoreJournalPath,
@@ -973,6 +974,10 @@ describe(
       createMasterKey(L.keyPath);
       const one = await start(L);
       const f = await createFamily(one.app);
+      // An attachment in the backup: the candidate's manifest covers the file stores too.
+      const attachment = path.join(L.dataDir, "files", "u1", "c1", "a.txt");
+      fs.mkdirSync(path.dirname(attachment), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(attachment, "ATTACHED", { mode: 0o600 });
       const id = await backupNow(one.app, f.cookies.admin);
       // The live data folder the restore replaces: recognisable old content (a 5th user, a marker file).
       one.app.users!.create({ email: "old-only@x", name: "old", role: "member", passwordHash: null });
@@ -1111,7 +1116,8 @@ describe(
           o.release();
         }
         expect(fs.existsSync(path.join(t.dataDir, "marker"))).toBe(false);
-        expect(fs.existsSync(path.join(t.dataDir, COMPLETE_MARKER))).toBe(false);
+        expect(fs.existsSync(path.join(t.dataDir, CANDIDATE_ID_FILE))).toBe(false);
+        expect(fs.existsSync(path.join(t.root, asides(t.root)[0]!, OLD_ID_FILE))).toBe(false);
         expect(asides(t.root)).toHaveLength(1);
         expect(fs.readFileSync(path.join(t.root, asides(t.root)[0]!, "marker"), "utf8")).toBe("old");
         expect(leftovers(t.root)).toEqual([]);
@@ -1150,6 +1156,130 @@ describe(
         o.storage.db.$client.close();
         o.release();
       }
+    });
+
+    // Round 3: a kill at every boundary — after each rename (before the journal records it), after each journal
+    // phase, and after each clean-up step. Each start must end with all old data or all new data, nothing lost.
+    const BOUNDARIES = [
+      ["prepared", "old"],
+      ["rename1", "old"],
+      ["old_moved", "new"],
+      ["rename2", "new"],
+      ["swapped", "new"],
+      ["done", "new"],
+      ["journal_removed", "new"],
+      ["cleaned", "new"],
+    ] as const;
+    for (const [at, expected] of BOUNDARIES)
+      it(`killed at "${at}": the next start ends with all ${expected} data`, async () => {
+        const t = await prepared();
+        const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, at]);
+        expect((await c.exited).signal).toBe("SIGKILL");
+        const o = startServer(t);
+        try {
+          expect(users(o)).toBe(expected === "old" ? 5 : 4);
+        } finally {
+          o.storage.db.$client.close();
+          o.release();
+        }
+        expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
+        expect(fs.existsSync(path.join(t.dataDir, CANDIDATE_ID_FILE))).toBe(false);
+        expect(fs.existsSync(path.join(t.dataDir, OLD_ID_FILE))).toBe(false);
+        if (expected === "old") {
+          expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+          expect(asides(t.root)).toEqual([]);
+        } else {
+          expect(fs.readFileSync(path.join(t.dataDir, "files", "u1", "c1", "a.txt"), "utf8")).toBe(
+            "ATTACHED",
+          );
+          // The old folder is kept, whole.
+          expect(fs.readFileSync(path.join(t.root, asides(t.root)[0]!, "marker"), "utf8")).toBe("old");
+        }
+        expect(leftovers(t.root)).toEqual([]);
+        // A second start changes nothing.
+        const again = startServer(t);
+        expect(again.recovered).toBe("none");
+        again.storage.db.$client.close();
+        again.release();
+      });
+
+    it("killed right after the second rename and the restored database zeroed: back to the old data, never 0 users", async () => {
+      const t = await prepared();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "rename2"]);
+      await c.exited;
+      fs.truncateSync(path.join(t.dataDir, DB_FILE), 0);
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("rolled_back");
+        expect(users(o)).toBe(5);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+      // The damaged candidate is moved aside (it was ours), not deleted and not used.
+      const rejected = fs.readdirSync(t.root).filter((n) => n.startsWith("data.restore-rejected-"));
+      expect(rejected).toHaveLength(1);
+      expect(fs.statSync(path.join(t.root, rejected[0]!, DB_FILE)).size).toBe(0);
+    });
+
+    for (const damage of ["deleted", "corrupted", "added"] as const)
+      it(`killed after old_moved with a staging file ${damage}: rolled back, never promoted`, async () => {
+        const t = await prepared();
+        const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "old_moved"]);
+        await c.exited;
+        const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { staging: string };
+        const file = path.join(j.staging, "files", "u1", "c1", "a.txt");
+        if (damage === "deleted") fs.rmSync(file);
+        else if (damage === "corrupted") fs.writeFileSync(file, "ATTACHEX");
+        // Something the manifest does not list: not the candidate either.
+        else fs.writeFileSync(path.join(j.staging, "files", "u1", "c1", "extra.txt"), "?");
+        const o = startServer(t);
+        expect(o.recovered).toBe("rolled_back");
+        o.storage.db.$client.close();
+        o.release();
+        expectOld(t);
+      });
+
+    it("a data folder recovery cannot account for: journal kept, both folders untouched, start refused", async () => {
+      const t = await prepared();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "rename1"]);
+      await c.exited;
+      // Someone put other data at DATA_DIR meanwhile.
+      fs.mkdirSync(t.dataDir, { mode: 0o700 });
+      fs.writeFileSync(path.join(t.dataDir, DB_FILE), "someone else's");
+      // (the lock database's own files aside)
+      const entries = () =>
+        fs
+          .readdirSync(t.root)
+          .filter((n) => !n.startsWith(".data.lock"))
+          .sort();
+      const before = entries();
+      const journalBefore = fs.readFileSync(restoreJournalPath(t.dataDir), "utf8");
+      expect(() => startServer(t)).toThrow(/restore_unresolved/);
+      expect(entries()).toEqual(before);
+      expect(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")).toBe(journalBefore);
+      expect(fs.readFileSync(path.join(t.dataDir, DB_FILE), "utf8")).toBe("someone else's");
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+      // The old folder changed too: still refused (never rolled back to a folder that is not provably the old one).
+      fs.rmSync(t.dataDir, { recursive: true });
+      const old = fs.readdirSync(t.root).find((n) => n.startsWith("data.before-restore-"))!;
+      fs.appendFileSync(path.join(t.root, old, DB_FILE), "x");
+      fs.rmSync(
+        (JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { staging: string }).staging,
+        { recursive: true },
+      );
+      expect(() => startServer(t)).toThrow(/restore_unresolved/);
+      expect(fs.existsSync(path.join(t.root, old))).toBe(true);
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+    });
+
+    it("a 0-byte database next to an earlier copy counts as missing", async () => {
+      const t = await prepared();
+      fs.renameSync(t.dataDir, `${t.dataDir}.before-restore-20261111T000000Z`);
+      fs.mkdirSync(t.dataDir, { mode: 0o700 });
+      fs.writeFileSync(path.join(t.dataDir, DB_FILE), "");
+      expect(() => startServer(t)).toThrow(/earlier one is next to it/);
     });
 
     it("never a fresh empty database while an older copy sits next to the missing data folder", async () => {

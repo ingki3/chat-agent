@@ -51,17 +51,26 @@ if (mode === "lock") {
   }
   process.stdout.write(`acquired=${acquired}\n`);
 } else if (mode === "restore") {
-  const [backup, target, keyPath, killAt] = args as [string, string, string, RestoreStep];
+  // killAt: a step name (after its journal write or clean-up) or `rename1`/`rename2` (right after that rename,
+  // before the journal records it).
+  const [backup, target, keyPath, killAt] = args as [string, string, string, RestoreStep | `rename${number}`];
+  const die = () => {
+    process.kill(process.pid, "SIGKILL");
+    // Never go on to the next step even if the signal took a moment.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
+  };
+  let renames = 0;
   restoreBackup({
     backup,
     target,
     key: loadMasterKey(keyPath),
     hooks: {
+      rename: (from, to) => {
+        fs.renameSync(from, to);
+        if (killAt === `rename${++renames}`) die();
+      },
       step: (s) => {
-        if (s !== killAt) return;
-        process.kill(process.pid, "SIGKILL");
-        // Never go on to the next step even if the signal took a moment.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
+        if (s === killAt) die();
       },
     },
   });

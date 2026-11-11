@@ -7,6 +7,7 @@ data/
 .data.restore-journal.json
 .data.restore-*
 data.before-restore-*/
+data.restore-rejected-*/
 .env
 *.log
 coverage/

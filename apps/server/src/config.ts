@@ -30,7 +30,7 @@ const ConfigSchema = z.object({
   /** Master key file for credential encryption. Must live outside DATA_DIR so backups never include it. */
   MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
   /**
-   * Daily backups (#37): one folder per backup, 7 kept. Must be outside DATA_DIR (a restore replaces DATA_DIR), outside
+   * Daily backups (#37): one folder per backup, each deleted once it is 7 days old. Must be outside DATA_DIR (a restore replaces DATA_DIR), outside
    * the repository (never committed) and must not hold the master key. Unset = `~/agentlee-backups`; in tests unset =
    * no backups at all (a test never writes to the home folder).
    */

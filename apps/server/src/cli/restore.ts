@@ -4,6 +4,7 @@ import { listBackups } from "../backup/backup.js";
 import {
   resolveBackup,
   restoreBackup,
+  RecoveryError,
   RestoreError,
   verifyBackup,
   type RestoreCode,
@@ -114,5 +115,10 @@ try {
   } else fail("usage");
 } catch (e) {
   if (e instanceof RestoreError) fail(e.code);
+  if (e instanceof RecoveryError) {
+    // An interrupted restore the next writer could not resolve: nothing was changed (docs/ops.md §21.4).
+    console.error(`restore failed: ${e.message} — 일지와 두 폴더를 확인하세요(ops.md 21.4절).`);
+    process.exit(1);
+  }
   throw e;
 }
