@@ -8,7 +8,9 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
  *   Hangul and accents match composed ones, then a small explicit fold: fullwidth ASCII to ASCII and `…` to `...`;
  *   spaces of every width count as whitespace. No NFKC: superscripts, subscripts and other compatibility
  *   characters stay distinct (`10²` is not `102`, `H₂O` is not `H2O`);
- * - every quote style to one quote mark, every dash to `-`, invisible characters removed, any run of whitespace to
+ * - typographic quote marks to one quote mark, dash punctuation to `-`, `∼` `〜` to `~` — primes (`′` `″`),
+ *   the backtick, `´` and the minus sign `−` are kept as themselves (`12′` is not `12″`); invisible characters
+ *   removed, any run of whitespace to
  *   one space. **No case folding** (review #97 round 10: `500MW` is not `500mW`, `CO` is not `Co`) — a quote must
  *   keep the page's case;
  * - common HTML entities decoded (`&amp;` `&minus;` `&nbsp;` `&#8722;` `&#x2212;` …) — page text can still carry
@@ -27,8 +29,11 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
  * (the same page is usually cited several times in a run).
  */
 
-const QUOTES = /["'`´‘’‚‛“”„‟«»‹›「」『』〝〞〟＂＇′″]/gu;
-const DASHES = /[‐‑‒–—―−]/gu;
+const QUOTES =
+  /["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/gu;
+const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
+/** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
+const TILDES = /[\u223C\u301C]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
 const DIGIT = /\p{N}/u;
 /**
@@ -123,8 +128,14 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
   "u",
 );
 const PARTICLE_LOOKAHEAD = 7;
-/** Separators inside a number: decimal, thousands, fraction, ratio, range (after the dash fold, `–` is `-`). */
-const NUMBER_SEP = /^[.,/:\-~]$/u;
+/**
+ * Separators inside a number: decimal and thousands (`.` `,`, adjacent only — `3, 4명` is prose), fraction, ratio
+ * and range (`/` `:` `-` `−` `~`, also with spaces around them). After the dash and tilde folds, `–` is `-` and
+ * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
+ */
+const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?\p{N})/u;
+const NUMBER_BEFORE = /(?:\p{N}[.,]|\p{N} ?[/:\-\u2212~] ?)$/u;
+const SIGN = /^[+\-\u2212]$/u;
 const KOREAN_UNIT = /^[십백천만억조]$/u;
 const KOREAN_DIGIT = /^[일이삼사오육칠팔구]$/u;
 const SPACE = /\s/u;
@@ -196,7 +207,11 @@ const clusterCache = new Map<string, string>();
 function normCluster(s: string): string {
   let r = clusterCache.get(s);
   if (r !== undefined) return r;
-  r = fold(s.normalize("NFC")).replace(INVISIBLE, "").replace(QUOTES, '"').replace(DASHES, "-");
+  r = fold(s.normalize("NFC"))
+    .replace(INVISIBLE, "")
+    .replace(QUOTES, '"')
+    .replace(DASHES, "-")
+    .replace(TILDES, "~");
   if (clusterCache.size < 50_000) clusterCache.set(s, r);
   return r;
 }
@@ -252,7 +267,7 @@ export function normalizeWithMap(text: string): Normalized {
       if (c === 32 || (c >= 9 && c <= 13)) {
         space(i);
         i++;
-      } else if (c === 34 || c === 39 || c === 96) {
+      } else if (c === 34 || c === 39) {
         put('"', i, i + 1);
         i++;
       } else if (c === 38) {
@@ -345,20 +360,16 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     const before = charBefore(norm, at);
     // Not inside a token at the start.
     if (TOKEN.test(before)) continue;
-    // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`)
-    // or a sign (`-32%`).
-    if (
-      DIGIT.test(first) &&
-      (before === "+" || before === "-" || (NUMBER_SEP.test(before) && DIGIT.test(charBefore(norm, at - 1))))
-    )
+    // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
+    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`).
+    if (DIGIT.test(first) && (SIGN.test(before) || NUMBER_BEFORE.test(norm.slice(Math.max(0, at - 4), at))))
       continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
     // Number continuation at the end: not before `SEP digit` (`1` in `1/2`, `3` in `3.5`, `10` in `10~20`), and a
     // Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number). The
     // mirror at the start (`이` right after `백`) is already refused by the start token rule.
-    if (DIGIT.test(last) && NUMBER_SEP.test(after) && DIGIT.test(firstChar(rest.slice(after.length))))
-      continue;
+    if (DIGIT.test(last) && NUMBER_AFTER.test(rest)) continue;
     if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).

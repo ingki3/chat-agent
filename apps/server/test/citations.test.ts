@@ -115,6 +115,41 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(normalizeSnippet("회선 속도 100Mbps")).not.toBe(normalizeSnippet("회선 속도 100MBps"));
   });
 
+  it("primes, accents and backticks are not quote marks (round 11)", () => {
+    expect(found("제품의 전체 길이는 12″이다.", "제품의 전체 길이는 12′이다.")).toBe(false);
+    expect(found("이 망원경의 시야각은 30″이다.", "이 망원경의 시야각은 30′이다.")).toBe(false);
+    expect(found("이 함수의 도함수는 f″(x)=2x이다.", "이 함수의 도함수는 f′(x)=2x이다.")).toBe(false);
+    expect(found("제품의 전체 길이는 12′이다.", "제품의 전체 길이는 12′이다.")).toBe(true);
+    expect(found('제품의 전체 길이는 12"이다.', "제품의 전체 길이는 12′이다.")).toBe(false);
+    expect(found("명령어는 `ls -la`이다.", "명령어는 'ls -la'이다.")).toBe(false);
+    expect(found("명령어는 ´ls -la´이다.", "명령어는 'ls -la'이다.")).toBe(false);
+    // Typographic quotes and dashes still fold.
+    expect(found("그는 “좋다”고 말했다 — 정말로", '그는 "좋다"고 말했다 - 정말로.')).toBe(true);
+    // The duplicate key keeps primes apart too.
+    expect(normalizeSnippet("전체 길이는 12′이다")).not.toBe(normalizeSnippet("전체 길이는 12″이다"));
+  });
+
+  it("range and fraction marks with spaces, and every tilde, continue a number (round 11)", () => {
+    expect(found("예상 기온은 10", "예상 기온은 10 ~ 20도이다.")).toBe(false);
+    expect(found("20도라고 예보했다", "기온은 10∼20도라고 예보했다.")).toBe(false);
+    expect(found("20도라고 예보했다", "기온은 10〜20도라고 예보했다.")).toBe(false);
+    expect(found("20도라고 예보했다", "기온은 10～20도라고 예보했다.")).toBe(false);
+    expect(found("5%라고 안내했다", "올해 예상 수익률은 3 ~ 5%라고 안내했다.")).toBe(false);
+    expect(found("실험에서 측정한 확률은 1", "실험에서 측정한 확률은 1 / 2이다.")).toBe(false);
+    expect(found("이번 경기의 점수는 3", "이번 경기의 점수는 3 : 1이었다.")).toBe(false);
+    expect(found("예상 기온은 10", "예상 기온은 10 - 20도이다.")).toBe(false);
+    expect(found("예상 기온은 10", "예상 기온은 10 − 20도이다.")).toBe(false); // the minus sign as a range mark
+    expect(found("20도라고 예보했다", "기온은 10 - 20도라고 예보했다.")).toBe(false);
+    expect(found("20도이다고 했다", "예상 기온은 10 − 20도이다고 했다.")).toBe(false);
+    // `.` and `,` stay adjacent-only: prose lists are not numbers.
+    expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
+    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
+    // Whole ranges verify; a tilde folds to `~` for the quote too.
+    expect(found("예상 기온은 10 ~ 20도", "예상 기온은 10 ~ 20도이다.")).toBe(true);
+    expect(found("기온은 10~20도라고 예보했다", "기온은 10∼20도라고 예보했다.")).toBe(true);
+  });
+
   it("a match never cuts a number in half: separators and Korean compound numerals (round 9)", () => {
     // Codex: fractions, at the end and at the start.
     expect(found("이번 계약의 지분은 1", "이번 계약의 지분은 1/2이다.")).toBe(false);
@@ -161,8 +196,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     const page =
       "기온은 &minus;5도로 떨어졌다 &amp; 눈이 왔다. 수치는 &#8722;3&nbsp;% 였다. 값은 &#x2212;7이다.";
     expect(found("기온은 −5도로 떨어졌다 & 눈이 왔다", page)).toBe(true);
-    expect(found("기온은 -5도로 떨어졌다", page)).toBe(true);
-    expect(found("수치는 -3 % 였다", page)).toBe(true);
+    // Round 11: the minus sign is not a dash — it is kept as itself (only dash punctuation folds to `-`).
+    expect(found("기온은 -5도로 떨어졌다", page)).toBe(false);
+    expect(found("수치는 −3 % 였다", page)).toBe(true);
+    expect(found("수치는 -3 % 였다", page)).toBe(false);
     expect(found("값은 −7이다.", page)).toBe(true);
     expect(
       findSnippet(page, "기온은 −5도로 떨어졌다").found && findSnippet(page, "기온은 −5도로 떨어졌다"),
@@ -180,7 +217,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("Semicon- ductor exports rose sharply", wrapped)).toBe(true);
     expect(found("They resign the deal", wrapped)).toBe(false);
     expect(found("Then xy was used", wrapped)).toBe(false);
-    expect(found("Then x- y was used", wrapped)).toBe(true);
+    expect(found("Then x\u2212 y was used", wrapped)).toBe(true);
     expect(found("Semiconductor exports rose", "Semicon-\r\nductor exports rose.")).toBe(false);
     // Round 4: footnote marks are never removed — the page is compared as written. A quote that leaves one out is
     // not found (⚠️); one that keeps it is.
