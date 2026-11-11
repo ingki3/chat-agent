@@ -38,7 +38,14 @@ import { appliedMigrations, checkSchema, codeMigrations } from "../src/backup/sc
 import { BACKUP_CODES as LOGGABLE_BACKUP_CODES } from "../src/observability/policy.js";
 import { RuntimeFailure, RuntimeRegistry, type StartContext } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
-import { acquireDataLock, dataLockPath, DataLockHeld, realDataDir } from "../src/storage/data-lock.js";
+import {
+  acquireDataLock,
+  caseInsensitive,
+  dataLockPath,
+  DataLockHeld,
+  realDataDir,
+  sameDataDir,
+} from "../src/storage/data-lock.js";
 import { storagePaths } from "../src/storage/paths.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -1550,6 +1557,69 @@ describe(
         expect(fs.realpathSync(alias)).toBe(t.dataDir);
         expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
       });
+
+    // Round 8: a case-insensitive volume (macOS APFS default): `Data` and `data` are one folder.
+    for (const [at, expected] of [
+      ["rename1", "rolled_back"],
+      ["old_moved", "completed"],
+    ] as const)
+      it(`restore to …/Data with DATA_DIR …/data, killed after ${at}: same result as the same-case run`, async (ctx) => {
+        const t = await prepared();
+        if (!caseInsensitive(t.root)) return ctx.skip();
+        const upper = path.join(t.root, "Data");
+        // The on-disk spelling is used for the lock, the journal and its target.
+        expect(realDataDir(upper)).toBe(t.dataDir);
+        expect(dataLockPath(upper)).toBe(dataLockPath(t.dataDir));
+        const c = spawnTs(CHILD, ["restore", t.backup, upper, t.keyPath, at]);
+        expect((await c.exited).signal).toBe("SIGKILL");
+        const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { target: string };
+        expect(j.target).toBe(t.dataDir);
+        const o = startServer(t);
+        try {
+          expect(o.recovered).toBe(expected);
+          expect(users(o)).toBe(expected === "rolled_back" ? 5 : 4);
+        } finally {
+          o.storage.db.$client.close();
+          o.release();
+        }
+        expect(fs.readdirSync(t.root)).toContain("data");
+        expect(fs.readdirSync(t.root)).not.toContain("Data");
+      });
+
+    it("a journal whose target is spelled in another case (folder missing right now) is still this folder", async (ctx) => {
+      const t = await prepared();
+      if (!caseInsensitive(t.root)) return ctx.skip();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "old_moved"]);
+      await c.exited;
+      const file = restoreJournalPath(t.dataDir);
+      const j = JSON.parse(fs.readFileSync(file, "utf8")) as { target: string };
+      fs.writeFileSync(file, JSON.stringify({ ...j, target: path.join(t.root, "DATA") }));
+      expect(fs.existsSync(t.dataDir)).toBe(false);
+      expect(sameDataDir(path.join(t.root, "DATA"), t.dataDir)).toBe(true);
+      expect(sameDataDir(path.join(t.root, "other"), t.dataDir)).toBe(false);
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("completed");
+        expect(users(o)).toBe(4);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      // Moved in under the configured spelling, not the journal's.
+      expect(fs.readdirSync(t.root)).toContain("data");
+      expect(fs.readdirSync(t.root)).not.toContain("DATA");
+    });
+
+    it("the case probe matches the volume (and the folder-name and probe-file paths agree)", () => {
+      const root = tmp();
+      fs.writeFileSync(path.join(root, "probe-a"), "");
+      const truth = fs.existsSync(path.join(root, "PROBE-A"));
+      expect(caseInsensitive(root)).toBe(truth);
+      const digits = path.join(root, "2026");
+      fs.mkdirSync(digits);
+      expect(caseInsensitive(digits)).toBe(truth);
+      expect(fs.readdirSync(digits)).toEqual([]);
+    });
 
     it("a chain of links resolves to the real folder; a link loop is refused with a clear message", async () => {
       const root = tmp();

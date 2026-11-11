@@ -37,11 +37,73 @@ export function realDataDir(dataDir: string): string {
       throw new Error(`DATA_DIR ${dataDir} is a symlink loop (or more than ${MAX_LINK_HOPS} links deep)`);
     p = path.join(canonicalPath(path.dirname(p)), path.basename(p));
     const st = fs.lstatSync(p, { throwIfNoEntry: false });
+    // An existing last component takes its on-disk name (`Data` typed, `data` on a case-insensitive volume).
+    if (st) p = path.join(path.dirname(p), onDiskName(path.dirname(p), path.basename(p)));
     if (!st?.isSymbolicLink()) return p;
     p = path.resolve(path.dirname(p), fs.readlinkSync(p));
   }
 }
 const MAX_LINK_HOPS = 32;
+
+/** The entry of `dir` that `name` refers to, spelled as on disk. */
+function onDiskName(dir: string, name: string): string {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return name;
+  }
+  if (names.includes(name) || !caseInsensitive(dir)) return name;
+  const lower = name.toLowerCase();
+  return names.find((n) => n.toLowerCase() === lower) ?? name;
+}
+
+const caseCache = new Map<string, boolean>();
+const swapCase = (s: string) =>
+  [...s].map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase())).join("");
+
+/**
+ * Whether names in the existing folder `dir` are compared case-insensitively (macOS APFS default). Probed once
+ * per folder: the folder itself under its case-swapped name, or — when its name has no letters — a probe file.
+ */
+export function caseInsensitive(dir: string): boolean {
+  const cached = caseCache.get(dir);
+  if (cached !== undefined) return cached;
+  let result: boolean;
+  try {
+    const base = path.basename(dir);
+    const parent = path.dirname(dir);
+    const st = fs.statSync(dir);
+    if (parent !== dir && swapCase(base) !== base) {
+      const other = fs.statSync(path.join(parent, swapCase(base)), { throwIfNoEntry: false });
+      result = !!other && other.dev === st.dev && other.ino === st.ino;
+    } else {
+      const probe = path.join(dir, `.agentlee-case-probe-${process.pid}-${Date.now()}`);
+      fs.writeFileSync(probe, "", { flag: "wx", mode: 0o600 });
+      try {
+        result = fs.existsSync(path.join(dir, swapCase(path.basename(probe))));
+      } finally {
+        fs.rmSync(probe, { force: true });
+      }
+    }
+  } catch {
+    result = false;
+  }
+  caseCache.set(dir, result);
+  return result;
+}
+
+/**
+ * Whether two real data-folder paths (from `realDataDir`) name the same folder, even when it is missing right now:
+ * the same canonical parent, and the same last component — case-insensitively on a case-insensitive volume.
+ */
+export function sameDataDir(a: string, b: string): boolean {
+  if (a === b) return true;
+  const pa = canonicalPath(path.dirname(a));
+  if (pa !== canonicalPath(path.dirname(b))) return false;
+  const [na, nb] = [path.basename(a), path.basename(b)];
+  return na === nb || (caseInsensitive(pa) && na.toLowerCase() === nb.toLowerCase());
+}
 
 function lockBase(dataDir: string): string {
   const real = realDataDir(dataDir);

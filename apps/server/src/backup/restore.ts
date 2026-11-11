@@ -11,6 +11,8 @@ import {
   dataLockHolder,
   DataLockHeld,
   realDataDir,
+  caseInsensitive,
+  sameDataDir,
   type DataLock,
   type DataLockKind,
 } from "../storage/data-lock.js";
@@ -420,9 +422,12 @@ function dropIdFiles(...dirs: (string | null)[]): void {
  */
 export function recoverInterruptedRestore(dataDir: string): RecoveryOutcome {
   const file = restoreJournalPath(dataDir);
-  const j = readJournal(file);
-  if (!j) return "none";
-  if (j.target !== realDataDir(dataDir)) throw new RecoveryError("the journal names another folder");
+  const read = readJournal(file);
+  if (!read) return "none";
+  const real = realDataDir(dataDir);
+  if (!sameDataDir(read.target, real)) throw new RecoveryError("the journal names another folder");
+  // The same folder: renamed under this spelling (the on-disk one when it exists), never the journal's.
+  const j: Journal = { ...read, target: real };
   const finish = (outcome: RecoveryOutcome) => {
     fs.rmSync(file, { force: true });
     fsyncPath(path.dirname(file));
@@ -493,7 +498,11 @@ export function openStorageForWrite(
     ) {
       const prefix = `${path.basename(real)}.before-restore-`;
       const parent = path.dirname(real);
-      const asides = exists(parent) ? fs.readdirSync(parent).filter((n) => n.startsWith(prefix)) : [];
+      const fold =
+        exists(parent) && caseInsensitive(parent) ? (n: string) => n.toLowerCase() : (n: string) => n;
+      const asides = exists(parent)
+        ? fs.readdirSync(parent).filter((n) => fold(n).startsWith(fold(prefix)))
+        : [];
       if (asides.length)
         throw new RecoveryError(
           `no database in the data folder but an earlier one is next to it (${asides[0]}) — move it back or restore (docs/ops.md §21.4)`,
