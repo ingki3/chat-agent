@@ -277,6 +277,61 @@ describe("Codex adapter (#16): event translation", () => {
     }
   });
 
+  it("a resume knows its thread from the first message: another thread right after initialize fails it", async () => {
+    const other = "01a1c86a-0000-7000-8000-00000000beef";
+    const root = tmp();
+    const first = adapter({ x: cx.answer("ok") }, { root });
+    const s = await first.a.start(ctx());
+    await collect(s.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    await s.close();
+    // Control: messages about our own thread right after initialize are fine.
+    const fine = adapter({}, { root, replay: { atStart: [threadStarted(s.externalSessionId)] } });
+    await expect(fine.a.resume(s.externalSessionId, ctx())).resolves.toBeDefined();
+    for (const m of [
+      threadStarted(other),
+      { method: "thread/status/changed", params: { threadId: other, status: { type: "active" } } },
+      status("agentlee", other),
+    ]) {
+      const again = adapter({}, { root, replay: { atStart: [m] } });
+      await expect(again.a.resume(s.externalSessionId, ctx()), JSON.stringify(m)).rejects.toMatchObject({
+        code: "runtime_policy",
+      });
+      expect(again.log.kills).toBe(1);
+    }
+  });
+
+  it("items are checked whenever they come: a command while the session opens, a foreign tool between turns", async () => {
+    const command = cx.item("started", { type: "commandExecution", id: "c", command: "ls" });
+    const opening = adapter({}, { replay: { afterOpen: [command] } });
+    await expect(opening.a.start(ctx())).rejects.toMatchObject({ code: "runtime_policy" });
+    expect(opening.log.kills).toBe(1);
+
+    const foreign = cx.mcp("started", { id: "f", server: "gmail", tool: "search" });
+    const { a, log } = adapter(
+      { x: cx.answer("ok "), y: cx.answer("never ") },
+      { replay: { afterTurn: [foreign] } },
+    );
+    const s = await a.start(ctx());
+    await collect(s.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(log.kills).toBe(1);
+    expect(() => s.turn({ text: "y", model: "gpt-6.1-sol" })).toThrow(
+      expect.objectContaining({ code: "runtime_policy" }),
+    );
+    // Our own tool between turns is no breach.
+    const ours = adapter(
+      { x: cx.answer("ok "), y: cx.answer("fine ") },
+      { replay: { afterTurn: [cx.mcp("completed", { id: "t", tool: "echo_time" })] } },
+    );
+    const s2 = await ours.a.start(ctx());
+    await collect(s2.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await collect(s2.turn({ text: "y", model: "gpt-6.1-sol" }).events)).toContainEqual({
+      type: "text_delta",
+      text: "fine ",
+    });
+  });
+
   it("an MCP server that joins during a turn stops it at once (runtime_policy, interrupted)", async () => {
     for (const late of [status("claude.ai Gmail", null), status("claude.ai Gmail", cx.threadId)]) {
       const { done, seen, log } = await run({

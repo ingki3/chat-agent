@@ -542,7 +542,8 @@ export class CodexAdapter implements RuntimeAdapter {
     let onBreach: (() => void) | undefined;
     let policyBreach = false;
     let opened = false;
-    let threadId: string | undefined;
+    // A resume knows its thread from the first message on; a fresh start learns it from thread/start.
+    let threadId: string | undefined = resumeId;
     /** Thread ids seen before thread/start told us ours. */
     const early = new Set<string>();
     const allowed = (m: RpcMessage): boolean => {
@@ -552,10 +553,24 @@ export class CodexAdapter implements RuntimeAdapter {
       if (NEVER_NOTIFICATIONS.has(method)) return false;
       const t = notificationThread(method, m.params);
       if (t === "unknown" || t === "malformed") return false; // not in the pinned protocol: fail closed
-      if (t === "global") return true;
-      if (threadId === undefined) early.add(t.thread);
-      else if (t.thread !== threadId) return false; // another thread (a sub-agent)
-      return true;
+      if (t !== "global") {
+        if (threadId === undefined) early.add(t.thread);
+        else if (t.thread !== threadId) return false; // another thread (a sub-agent)
+      }
+      return itemAllowed(m);
+    };
+    /**
+     * Items, whenever they come: only conversation, or a call of one of the run's tools on our server. Anything else
+     * — a built-in (`codex` server), another server, a command, a file change, a sub-agent, a web search — is
+     * refused, before its result is used.
+     */
+    const runTools = new Set(tools);
+    const itemAllowed = (m: RpcMessage): boolean => {
+      if (m.method !== "item/started" && m.method !== "item/completed") return true;
+      const item = (m.params?.item ?? {}) as Json;
+      const type = String(item.type);
+      if (QUIET_ITEMS.has(type)) return true;
+      return type === "mcpToolCall" && item.server === AGENTLEE_MCP && runTools.has(String(item.tool));
     };
     /**
      * Something we do not allow: during a turn it is stopped at once; between turns the session is closed (the
@@ -603,11 +618,9 @@ export class CodexAdapter implements RuntimeAdapter {
         if (typeof started !== "string" || !/^[0-9a-f-]{36}$/.test(started))
           throw new RuntimeFailure("runtime_error");
         threadId = started;
-        if ([...early].some((t) => t !== started)) policyBreach = true;
         writeMeta(conn.dir, threadId, meta);
       } else {
         meta = readMeta(conn.dir, resumeId)!;
-        threadId = resumeId;
         try {
           await rpc.request("thread/resume", {
             threadId: resumeId,
@@ -622,6 +635,8 @@ export class CodexAdapter implements RuntimeAdapter {
           throw e instanceof RpcError ? new SessionGoneError() : e;
         }
       }
+      // Thread ids seen before ours was known (a fresh start) must be ours too.
+      if ([...early].some((t) => t !== threadId)) policyBreach = true;
       if (policyBreach) throw new RuntimeFailure("runtime_policy");
       opened = true;
     } catch (e) {
@@ -631,7 +646,7 @@ export class CodexAdapter implements RuntimeAdapter {
       throw e;
     }
 
-    const id = threadId;
+    const id = threadId!; // set by thread/start or the resume (otherwise the open failed above)
     let closed = false;
     let model = ctx.model;
     const session: RuntimeSession = {
@@ -649,7 +664,6 @@ export class CodexAdapter implements RuntimeAdapter {
         if (closed || rpc.exited) throw new Error("session closed");
         const cap = this.checkModel(input.model, input.effort);
         model = input.model;
-        const runTools = new Set(tools);
         const queue: RuntimeEvent[] = [];
         let wake: (() => void) | undefined;
         let done = false;
@@ -700,11 +714,7 @@ export class CodexAdapter implements RuntimeAdapter {
             case "item/completed": {
               const item = (p.item ?? {}) as Json;
               const type = String(item.type);
-              if (QUIET_ITEMS.has(type)) return;
-              // Only the run's own tools of our server. Anything else — a built-in (`codex` server), another
-              // server, a command, a sub-agent, a web search — stops the turn before its result is used.
-              if (type !== "mcpToolCall" || item.server !== AGENTLEE_MCP || !runTools.has(String(item.tool)))
-                return refuse();
+              if (QUIET_ITEMS.has(type)) return; // anything else that is not our tool was refused by itemAllowed
               const callId = String(item.id);
               if (m.method === "item/started")
                 push({ type: "tool_start", callId, name: String(item.tool), input: item.arguments ?? null });
