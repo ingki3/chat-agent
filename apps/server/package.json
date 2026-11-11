@@ -11,7 +11,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx --conditions=development src/cli/migrate.ts",
     "keygen": "tsx --conditions=development src/cli/keygen.ts",
-    "injection-eval": "tsx --conditions=development src/cli/injection-eval.ts"
+    "injection-eval": "tsx --conditions=development src/cli/injection-eval.ts",
+    "skills": "tsx --conditions=development src/cli/skills.ts"
   },
   "dependencies": {
     "@agentlee/mcp-tools": "workspace:*",

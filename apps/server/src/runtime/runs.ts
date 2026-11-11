@@ -146,8 +146,15 @@ export type RunManagerOptions = {
    * broken template stops the server at startup, not on the first run.
    */
   instructions?: Templates;
-  /** Our MCP server (#43). Without it, runtimes get no tools. */
-  mcp?: { endpoint(): Promise<{ url: string }>; toolNames(): string[] };
+  /**
+   * Our MCP server (#43). Without it, runtimes get no tools. `toolNames()` is everything it offers (for the log),
+   * `toolNamesFor(user)` what one user's run gets (FR-1.6, #21).
+   */
+  mcp?: {
+    endpoint(): Promise<{ url: string }>;
+    toolNames(): string[];
+    toolNamesFor(userId: string): string[];
+  };
   /** Token store shared with the MCP server. Default: a private one (then no MCP server can check its tokens). */
   mcpTokens?: McpTokens;
   /** Structured log (#46): run and tool outcomes with IDs, durations, codes and cost — never content. */
@@ -514,7 +521,8 @@ export class RunManager {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
     const mcp = adapter.capabilities().usesTools ? this.opts.mcp : undefined;
-    const tools = mcp ? trustOurTools(mcp.toolNames()) : [];
+    // Per user: a skill the user may not use is not even offered (and the MCP server refuses it anyway).
+    const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId)) : [];
     // The same instructions for every runtime (#20): built per run from the user, the conversation and the tools.
     const user = this.db.select({ youth: users.youth }).from(users).where(eq(users.id, run.userId)).get();
     const instructions = assembleInstructions({

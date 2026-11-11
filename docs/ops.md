@@ -11,6 +11,8 @@
 | 데이터 디렉토리 (DB, 파일, 아티팩트, 런타임 홈) | `<repo>/data` | `DATA_DIR` | 포함 (#37) |
 | SQLite DB | `<DATA_DIR>/agentlee.db` (WAL) | — | 포함 |
 | 암호화 마스터 키 | `~/.agentlee/master.key` | `MASTER_KEY_PATH` | **포함하지 않음** — 아래 3절 |
+| 서버 전용 스킬 폴더 (#21) | `<DATA_DIR>/skills/<스킬>/` (허용 목록 스킬의 복사본, 읽기 전용) | `pnpm skills:install` — 15절 | 포함(코드일 뿐, 비밀 없음) |
+| 스킬 비밀 (#21) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY` | 15.3절 | `.env`와 같다 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 11절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
@@ -160,7 +162,7 @@ rm ~/.agentlee/probe-headers.txt
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`). 로그 파일을 열거나 쓰지 못해도(디스크 가득, 권한 등) 서버는 시작하고 계속 돌며 그 줄만 버린다(파일에는 완전한 JSON 줄만 남는다 — 중간에 끊긴 줄은 잘라낸다). 다시 쓸 수 있게 되면 `log.line_dropped` 레코드에 버린 줄 수(`dropped`)를 남긴다.
 - 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + 우리 MCP 서버의 도구, 예 `mcp__agentlee__echo_time` — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
   - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`.
-  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
+  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
   - `pnpm test`의 유출 fixture 테스트(`apps/server/test/observability.test.ts`)가 대화 문장·키 패턴·쿠키·헤더·접속 코드·이메일을 요청·오류·실행·도구로 흘려 보내고, 로그와 관리자 오류 목록에 하나라도 나오면 실패한다.
 - 읽기:
@@ -343,3 +345,58 @@ rm ~/.agentlee/probe-headers.txt
   ```
   - 필요: `.env`의 `CLAUDE_API_KEY`·`CODEX_API_KEY`(macOS 샌드박스), 공격 대상 도구(#23 파일, #24 `web_fetch`, #25 `cite`, 예약·알림). 도구가 없으면 런타임이 금지 도구를 시도할 수조차 없어 실측의 의미가 약하다. 지금 자료 전달 방식은 `inline`(사용자 메시지 안 `<external_content>` 블록)이며 결과 파일의 `delivery`에 적힌다.
   - 합격: `summary.violations = 0`, `fail = 0`(INJ-4는 #23 후 `pending`에서 실행으로 바뀐다). 4절 확인 기록과 #20에 남긴다.
+
+## 15. 스킬 (#21)
+스킬 목록과 상태는 `docs/skills.md`에, 실행 방식은 `docs/decisions/isolation.md` "공통 MCP 스킬 실행기 (#21)"에 있다. 관리자 화면은 #35다. 그 전까지는 아래 명령과 API로 관리한다.
+
+### 15.1 스킬이 있는 곳
+- **원본:** 관리자 스킬 폴더 `~/.agents/skills`, `~/.claude/skills`(바꾸려면 `.env`의 `SKILL_SOURCES=경로1:경로2`). 서버는 이 폴더를 읽지 않는다.
+- **서버 사본:** `<DATA_DIR>/skills/<스킬>/`. 서버는 시작할 때 이것을 검사하고, 통과한 내용을 `<DATA_DIR>/skills/.pinned/<해시>/`(읽기 전용)에 고정해 그 사본만 실행한다. 고정 사본은 서버가 관리하므로 손대지 않는다. 바뀌면 그 스킬 호출은 `skill_changed`로 거부된다.
+- 설치 폴더 `<DATA_DIR>/skills/<스킬>/`에는 정의(`packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`)에 적힌 파일과 `.agentlee-skill.json`(파일 해시)만 들어 있다. 이 폴더에 다른 파일을 두거나 파일을 고치면 다음 시작 때 그 스킬은 `broken`이 되어 제공되지 않는다(실행 중인 서버는 고정 사본을 계속 쓴다).
+- **python:** python 스킬은 독립 실행형 python이 있어야 돈다. Homebrew python은 샌드박스에서 못 쓴다(isolation.md).
+  ```
+  uv python install 3.12
+  uv python find 3.12        # 출력된 경로를 .env의 SKILL_PYTHON=에 넣는다
+  ```
+
+### 15.2 설치·확인
+```
+pnpm skills:install                       # 허용 목록 스킬 모두 (google-news-search-skill, kr-stock-skill)
+pnpm skills:install kr-stock-skill        # 하나만
+pnpm skills:status                        # 설치 상태·python·설정된 비밀 이름(값은 안 보임)
+```
+- 설치나 원본 갱신 뒤에는 서비스를 다시 시작한다(서버는 시작할 때 스킬 폴더를 검사한다).
+- 원본 파일이 심볼릭 링크·하드링크이거나 경로에 심볼릭 링크가 있으면 설치를 거부한다.
+- 관리자 API: `GET /api/admin/skills`는 §7 목록과 상태를 돌려준다(`available`·`not_installed`·`broken`·`needs_python`·`planned`·`document`).
+
+### 15.3 비밀
+- `.env`에 이름 그대로 넣는다. 예: `ALPHAVANTAGE_API_KEY=…`(선택, `kr-stock-skill`의 `alpha-quote`만 쓴다).
+- 서버는 `SKILL_SECRET_NAMES`에 있는 이름만 읽는다. 그 값은 그 비밀을 선언한 스킬 프로세스의 환경 변수로만 넘긴다. 인자·로그·결과에는 남지 않는다.
+- 원본 스킬 폴더의 `config.json`·`.env`에 있는 키는 서버가 쓰지 않는다(복사하지 않는다). 쓰려면 `.env`로 옮긴다.
+- 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
+
+### 15.4 사용자별 스킬 (FR-1.6)
+- 기본은 모든 스킬(`"all"`)이다. 아들처럼 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
+  ```
+  PUT /api/admin/users/<id>/skills   {"skills": ["google-news-search-skill"]}
+  PUT /api/admin/users/<id>/skills   {"skills": "all"}
+  ```
+- 목록에 없는 스킬은 그 사용자의 도구 목록에 나오지 않는다. 호출해도 거부된다.
+- 목록 방식이라 **새로 추가된 스킬은 목록을 쓰는 사용자에게 자동으로 켜지지 않는다.**
+- 실행 중인 대화에도 다음 호출부터 바로 적용된다.
+
+### 15.5 스킬 추가
+1. 원본 스킬을 읽고 `docs/skills.md`에 적는다: 진입점, 입출력, 의존성, 비밀, 호스트.
+   - 표준 라이브러리 python 또는 node여야 한다.
+   - 자식 프로세스가 필요하면 샌드박스를 풀지 말고 서버 함수로 만든다.
+2. `skills.ts`에 `SkillSpec`을 추가하고 `SKILL_SPECS`·`SKILL_CATALOGUE`(상태 `implemented`)에 넣는다.
+   - **인자는 입력 필드마다 `--flag=값` 하나로만** 만든다.
+   - 비밀은 `secrets`에, 접속할 호스트는 `hosts`에 적는다.
+   - 금융 스킬이면 `finance: true`로 하고 `instructions/assemble.ts`의 `FINANCE_SKILLS`에도 넣는다(시험이 둘이 같은지 확인한다).
+3. `apps/server/test/skills.test.ts`에 인자 거부 시험을 추가한다.
+4. 실제 스킬로 한 번 확인한다(macOS, 네트워크):
+   ```
+   SKILLS_LIVE=1 pnpm vitest run apps/server/test/skills.test.ts
+   ```
+   `TEST_SKILL_PYTHON` 또는 uv가 필요하다.
+5. `pnpm skills:install <이름>` 후 재시작한다.

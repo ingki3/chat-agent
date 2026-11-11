@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { SKILL_SECRET_NAMES } from "@agentlee/mcp-tools/skills";
 import { isInside } from "./fs-safety.js";
 
 /** Repository root, resolved from apps/server/{src,dist}. `.env` and relative paths are anchored here. */
@@ -76,6 +77,13 @@ const ConfigSchema = z.object({
       .string()
       .regex(/^sk-[A-Za-z0-9_-]{20,}$/, { message: "CODEX_API_KEY must be an OpenAI API key (sk-…)" }),
   ),
+  /**
+   * Python for python skills (#21): `<install>/bin/python3.x` of a self-contained build (e.g. `uv python install
+   * 3.12`, then `uv python find 3.12`). Unset = python skills are not offered. See mcp/python.ts.
+   */
+  SKILL_PYTHON: optional(z.string()),
+  /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
+  SKILL_SOURCES: optional(z.string()),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -101,7 +109,30 @@ export type Config = {
   claude?: { apiKey?: string | undefined; oauthToken?: string | undefined } | undefined;
   /** Codex credential (secret — never log this object). */
   codex?: { apiKey: string } | undefined;
+  /** Interpreter for python skills (validated when the MCP service starts). */
+  skillPython?: string | undefined;
+  /** Folders `pnpm skills:install` copies skills from. */
+  skillSources: string[];
+  /**
+   * Per-skill secrets (`SKILL_SECRET_NAMES`, e.g. ALPHAVANTAGE_API_KEY, OPENDART_API_KEY) from `.env`. Each goes
+   * only into the processes of the skills that declare it (never log this object).
+   */
+  skillSecrets: Record<string, string>;
 };
+
+/** A secret value: printable ASCII, no spaces (API keys). */
+const SECRET = /^[\x21-\x7e]{8,512}$/;
+
+function skillSecrets(source: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of SKILL_SECRET_NAMES) {
+    const v = source[name];
+    if (v === undefined || v === "") continue;
+    if (!SECRET.test(v)) throw new Error(`Invalid configuration — ${name} must be a key without spaces`);
+    out[name] = v;
+  }
+  return out;
+}
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
 export function loadConfig(
@@ -144,5 +175,14 @@ export function loadConfig(
         ? { apiKey: c.CLAUDE_API_KEY, oauthToken: c.CLAUDE_OAUTH_TOKEN }
         : undefined,
     codex: c.CODEX_API_KEY ? { apiKey: c.CODEX_API_KEY } : undefined,
+    skillPython: c.SKILL_PYTHON,
+    skillSources: (
+      c.SKILL_SOURCES ??
+      [path.join(os.homedir(), ".agents", "skills"), path.join(os.homedir(), ".claude", "skills")].join(":")
+    )
+      .split(":")
+      .filter(Boolean)
+      .map((p) => path.resolve(baseDir, p)),
+    skillSecrets: skillSecrets(source),
   };
 }

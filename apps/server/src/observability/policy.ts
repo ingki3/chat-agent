@@ -86,7 +86,22 @@ export const HTTP_METHODS = set([
   "CONNECT",
 ]);
 
+/** Outcome codes of a skill call on our MCP server (#21, mcp/service.ts). */
+export const SKILL_CODES = set([
+  "skill_not_allowed",
+  "skill_bad_input",
+  "skill_busy",
+  "skill_unavailable",
+  "skill_unconfigured",
+  "skill_timeout",
+  "skill_limit",
+  "skill_failed",
+  "skill_bad_output",
+  "skill_changed",
+]);
+
 export const isRuntime = member(RUNTIMES);
+export const isSkillCode = member(SKILL_CODES);
 export const isNotificationKind = member(set(NotificationKind.options));
 export const isStatus = member(STATUSES);
 export const isErrorCode = member(ERROR_CODES);

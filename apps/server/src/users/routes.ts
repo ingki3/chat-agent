@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { CreateUserRequest, SetYouthRequest, type AdminUser } from "@agentlee/shared";
+import { CreateUserRequest, SetUserSkillsRequest, SetYouthRequest, type AdminUser } from "@agentlee/shared";
+import { SKILL_CATALOGUE } from "@agentlee/mcp-tools/skills";
 import { hashPassword } from "../auth/passwords.js";
 import { deny } from "../auth/plugin.js";
 import { temporaryPassword, toAdminUser, type UserStore } from "../auth/users.js";
@@ -87,6 +88,21 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
     if (!target) return deny(reply, 404, "not_found");
     if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
     users.setYouth(target.id, r.data.youth);
+    return reply.header("Cache-Control", "no-store").send({ user: toAdminUser(users.byId(target.id)!) });
+  });
+
+  // Which skills a user may use (FR-1.6, #21): "all" or PRD §7 names — e.g. the son without the finance skills.
+  // Unknown names are refused. The full admin screen is #35.
+  const catalogue = new Set(SKILL_CATALOGUE.map((e) => e.name));
+  app.put<{ Params: { id: string } }>("/api/admin/users/:id/skills", { config: byId }, async (req, reply) => {
+    const r = SetUserSkillsRequest.safeParse(req.body);
+    if (!r.success) return deny(reply, 400, "invalid_request");
+    const skills = r.data.skills;
+    if (skills !== "all" && skills.some((s) => !catalogue.has(s))) return deny(reply, 400, "unknown_skill");
+    const target = users.byId(req.params.id);
+    if (!target) return deny(reply, 404, "not_found");
+    if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
+    users.setSkills(target.id, skills === "all" ? "all" : [...new Set(skills)]);
     return reply.header("Cache-Control", "no-store").send({ user: toAdminUser(users.byId(target.id)!) });
   });
 

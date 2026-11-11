@@ -15,6 +15,7 @@ import {
   isNotificationKind,
   isRoutePattern,
   isRuntime,
+  isSkillCode,
   isStatus,
   isToolName,
   UNMATCHED,
@@ -46,6 +47,8 @@ export const LOG_EVENTS = [
   "request.error",
   "run.finished",
   "tool.finished",
+  // Skill calls on our MCP server (#21): tool name, outcome code, duration and IDs — never input or output.
+  "skill.finished",
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",
@@ -118,6 +121,8 @@ const FIELDS = new Map<string, Check>([
   ["durationMs", isNum],
   ["status", isStatus],
   ["errorCode", isErrorCode],
+  /** Why a skill call did not succeed (#21): one of the fixed `skill_*` codes. */
+  ["skillCode", isSkillCode],
   ["category", isCategory],
   ["costUsd", isNum],
   ["inputTokens", isInt],
@@ -366,6 +371,7 @@ export type LogFields = {
   durationMs?: number;
   status?: string;
   errorCode?: string;
+  skillCode?: string;
   category?: string;
   costUsd?: number;
   inputTokens?: number;
