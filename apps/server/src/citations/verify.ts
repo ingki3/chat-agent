@@ -82,6 +82,22 @@ export const KOREAN_PARTICLES = [
   "라고",
   "이란",
   "란",
+  "인데",
+  // Past-tense copula (review #97 round 6): `반도체였다`, `수출이었다`, `정부였습니다`, `32%였다`.
+  "였다",
+  "이었다",
+  "였습니다",
+  "이었습니다",
+  "였어요",
+  "이었어요",
+  "였고",
+  "이었고",
+  "였으며",
+  "이었으며",
+  "였던",
+  "이었던",
+  "였는데",
+  "이었는데",
 ] as const;
 /** Particles that may take 는 / 도 / 만 after them (`에서는`, `으로는`, `에도`, `까지만` …). */
 export const COMBINING_PARTICLES = [
@@ -103,7 +119,9 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
   `^(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도|만)|${byLength(KOREAN_PARTICLES)})(?![\\p{L}\\p{N}\\p{M}])`,
   "u",
 );
-const PARTICLE_LOOKAHEAD = 6;
+const PARTICLE_LOOKAHEAD = 7;
+/** Korean numeral units: after a digit they continue the number (`10만`, `3억`, `2조`). */
+const NUMERAL_UNIT = /^[십백천만억조경]$/u;
 const SPACE = /\s/u;
 
 const ENTITIES: Record<string, string> = {
@@ -338,6 +356,9 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     if (DIGIT.test(last) && /^[.,]\p{N}/u.test(rest)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
+    // After a number, a numeral unit is more of the number, never a particle (`10` is not in `10만 달러`).
+    const endsInNumber = DIGIT.test(last) || (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1))));
+    if (endsInNumber && NUMERAL_UNIT.test(after)) continue;
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;

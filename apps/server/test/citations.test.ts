@@ -177,6 +177,30 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("10월 반도체 수출", "10월 반도체 수출에서는 감소했다.")).toBe(true);
     expect(found("10월 반도체 수출", "10월 반도체 수출으로는 부족했다.")).toBe(true);
     expect(found("10월 반도체 수출", "10월 반도체 수출이")).toBe(true); // the end of the text is a boundary
+    // Round 6: past-tense copula forms.
+    expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였다.")).toBe(true);
+    expect(found("해당 사업의 유일한 목적은 수출", "해당 사업의 유일한 목적은 수출이었다.")).toBe(true);
+    expect(found("해당 서비스의 운영 주체는 정부", "해당 서비스의 운영 주체는 정부였습니다.")).toBe(true);
+    expect(found("지난해 수출 증가율은 32%", "지난해 수출 증가율은 32%였다.")).toBe(true);
+    expect(found("해당 런타임은 Node.js", "해당 런타임은 Node.js였습니다.")).toBe(true);
+    expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였던 시절.")).toBe(true);
+    expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체인데 지금은 아니다.")).toBe(
+      true,
+    );
+    expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였었다.")).toBe(false); // still closed
+    // Round 6: after a number, a numeral unit continues the number — never a particle.
+    expect(found("총 투자 금액은 10", "총 투자 금액은 10만 달러입니다.")).toBe(false);
+    expect(found("지난달 신규 가입자는 32", "지난달 신규 가입자는 32만 명이다.")).toBe(false);
+    expect(found("해당 제품의 가격은 3", "해당 제품의 가격은 3만 원이다.")).toBe(false);
+    expect(found("총 투자 금액은 1.5", "총 투자 금액은 1.5억 달러였다.")).toBe(false);
+    expect(found("총 투자 금액은 10만", "총 투자 금액은 10만 달러입니다.")).toBe(true);
+    // A quote that stops at a separator right after a digit is still in the number (`3.` before `만`).
+    expect(found("해당 금액은 무려 3.", "해당 금액은 무려 3.만 원이다.")).toBe(false);
+    expect(found("지난달 신규 가입자는 3", "지난달 신규 가입자는 3명이었다.")).toBe(false); // 명 is not a particle
+    expect(found("올해의 기준은 10", "올해의 기준은 10월이다.")).toBe(false); // 월 is not a particle
+    expect(found("수출 증가율은 무려 32", "수출 증가율은 무려 32로 집계됐다.")).toBe(true); // 로 after a digit
+    // 만 after a word (not a number) is still the particle.
+    expect(found("이 계획은 자금", "이 계획은 자금만 있으면 된다.")).toBe(true);
     // Not a particle, or a particle that runs on into more of the word.
     expect(found("이 설정은 유효", "이 설정은 유효하지 않습니다.")).toBe(false);
     // Only listed particles: a syllable outside the list fails even right before a boundary.
