@@ -205,6 +205,25 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "PUT /api/admin/usage/settings", expect: ADMIN_ONLY, body: { dailyCostThresholdUsd: 5 } },
 ];
 
+/**
+ * Every route Fastify itself has registered (`METHOD /path`, HEAD mirrors left out), read from its route tree —
+ * independent of our route config and registry, so a route that declares nothing is listed too.
+ */
+export function fastifyRoutes(app: FastifyInstance): string[] {
+  const out: string[] = [];
+  const stack: string[] = [];
+  for (const line of app.printRoutes({ commonPrefix: false }).split("\n")) {
+    const m = /^(.*?)[└├]── (\S+)(?: \(([^)]*)\))?$/.exec(line);
+    if (!m) continue;
+    stack.length = m[1]!.length / 4;
+    const full = stack.join("") + m[2]!;
+    stack.push(m[2]!);
+    for (const method of (m[3] ?? "").split(", ").filter(Boolean))
+      if (method !== "HEAD") out.push(`${method} ${full}`);
+  }
+  return out;
+}
+
 /** Sends `METHOD /path` (path params filled with a placeholder) as `who`. */
 export function sendAs(f: Family, who: Who, route: string, body?: unknown) {
   const [method, pattern] = route.split(" ") as [string, string];

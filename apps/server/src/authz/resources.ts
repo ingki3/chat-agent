@@ -46,6 +46,11 @@ export class ResourceRegistry {
   readonly routes: { method: string; url: string; rule: ResourceRule }[] = [];
   /** Every admin-only route (`config.auth: "admin"`) — the permission matrix test refuses each to non-admins. */
   readonly adminRoutes: { method: string; url: string }[] = [];
+  /**
+   * Every route registered, whatever its config (HEAD mirrors left out) — so the permission test can find an
+   * `/api/admin/…` route that forgot to declare `auth: "admin"`.
+   */
+  readonly allRoutes: { method: string; url: string }[] = [];
 
   register(kind: string, loader: ResourceLoader): void {
     if (this.loaders.has(kind)) throw new Error(`resource kind "${kind}" registered twice`);
@@ -73,9 +78,11 @@ export function installRouteRules(app: FastifyInstance): ResourceRegistry {
 
   app.addHook("onRoute", (route) => {
     const cfg = route.config ?? {};
-    if (cfg.auth === "admin")
-      for (const method of Array.isArray(route.method) ? route.method : [route.method])
-        if (method !== "HEAD") registry.adminRoutes.push({ method, url: route.url });
+    for (const method of Array.isArray(route.method) ? route.method : [route.method]) {
+      if (method === "HEAD") continue;
+      registry.allRoutes.push({ method, url: route.url });
+      if (cfg.auth === "admin") registry.adminRoutes.push({ method, url: route.url });
+    }
     // A declared resource is validated and listed wherever it appears, even on a route that needs no declaration.
     if (!cfg.resource && !needsDeclaration(route.url)) return;
     if (cfg.resource && cfg.noResource)

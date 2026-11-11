@@ -346,7 +346,7 @@ describe("runs record usage (#44)", () => {
       "updated_at",
       "auth_type",
       "price_version",
-      "priced_cost_usd",
+      "priced_cost_micros",
     ]);
   });
 

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "e1a86f0f-4ef0-44c7-97b2-fac63fc1e3fe",
+  "id": "37dada47-d19c-46e8-91a3-802e25685c02",
   "prevId": "0af9da4d-a8aa-43a9-8b02-53ec468f07b5",
   "tables": {
     "artifact_versions": {
@@ -1915,9 +1915,9 @@
           "notNull": false,
           "autoincrement": false
         },
-        "priced_cost_usd": {
-          "name": "priced_cost_usd",
-          "type": "real",
+        "priced_cost_micros": {
+          "name": "priced_cost_micros",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

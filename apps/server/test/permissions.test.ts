@@ -14,6 +14,7 @@ import {
   READ,
   USAGE,
   createFamily,
+  fastifyRoutes,
   runAdminMatrix,
   runMatrix,
   sendAs,
@@ -253,8 +254,15 @@ describe("admin-only routes", () => {
     const app = await newApp();
     await app.ready();
     const f = await createFamily(app);
-    const routes = app.resources.adminRoutes.map((r) => `${r.method} ${r.url}`);
+    // What Fastify actually serves under /api/admin — not what our config says is admin.
+    const isAdminPath = (r: string) => /^[A-Z]+ \/api\/admin(\/|$)/.test(r);
+    const routes = fastifyRoutes(app).filter(isAdminPath).sort();
     expect(routes.length).toBeGreaterThan(10);
+    // Our registry saw the same routes, and every one of them is declared admin-only.
+    const registered = app.resources.allRoutes.map((r) => `${r.method} ${r.url}`);
+    expect(registered.filter(isAdminPath).sort()).toEqual(routes);
+    const declaredAdmin = new Set(app.resources.adminRoutes.map((r) => `${r.method} ${r.url}`));
+    expect(routes.filter((r) => !declaredAdmin.has(r))).toEqual([]);
     const failures: string[] = [];
     for (const route of routes)
       for (const [who, want] of [

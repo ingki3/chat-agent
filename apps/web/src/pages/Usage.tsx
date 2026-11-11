@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdminUsageReport, ModelPrice, UsageGroup, UsageRecordView } from "@agentlee/shared";
 import { errorText, usage, USAGE_KEY } from "../api.js";
-import { costText, NOT_PROVIDED, tokens, usd } from "../usage-format.js";
+import { costText, recordCost, recordTokens, tokenText, usd } from "../usage-format.js";
 
 const RUNTIMES = [
   ["claude-code", "Claude Code"],
@@ -39,7 +39,7 @@ function GroupTable({ groups, label }: { groups: UsageGroup[]; label: string }) 
           <tr key={g.key}>
             <td>{g.label}</td>
             <td className="num">{g.requests.toLocaleString("ko-KR")}</td>
-            <td className="num">{tokens(g.totalTokens)}</td>
+            <td className="num">{tokenText(g)}</td>
             <td className="num">{costText(g)}</td>
           </tr>
         ))}
@@ -49,7 +49,7 @@ function GroupTable({ groups, label }: { groups: UsageGroup[]; label: string }) 
 }
 
 const COST_NOTE =
-  "비용은 API 키 연결만 계산해요(관리자 가격표 기준). 구독 연결은 요청 수와 토큰만 세요. 가격이 없는 모델은 ‘미제공’이에요.";
+  "비용은 API 키 연결만 계산해요(관리자 가격표 기준). 구독 연결은 요청 수와 토큰만 세요. 가격이 없는 모델·토큰을 받지 못한 기록은 ‘미제공’, 연결을 찾을 수 없는 옛 기록은 ‘미확인’(미제공으로 셈)이에요.";
 
 /** 설정 → 내 사용량 (#32, FR-9.3): the caller's own month, by runtime and model. */
 export function MyUsagePanel() {
@@ -62,7 +62,7 @@ export function MyUsagePanel() {
         <>
           <p data-testid="my-usage-total">
             {mine.data.month} · 요청 {mine.data.total.requests.toLocaleString("ko-KR")}회 · 토큰{" "}
-            {tokens(mine.data.total.totalTokens)} · 비용 {costText(mine.data.total)}
+            {tokenText(mine.data.total)} · 비용 {costText(mine.data.total)}
           </p>
           <GroupTable groups={mine.data.byRuntime} label="런타임" />
           <GroupTable groups={mine.data.byModel} label="모델" />
@@ -80,12 +80,6 @@ const BREAKDOWNS = [
   ["byConnection", "연결별"],
   ["byPurpose", "목적별"],
 ] as const satisfies readonly (readonly [keyof AdminUsageReport, string])[];
-
-function recordCost(r: UsageRecordView): string {
-  if (r.authType === "subscription") return "구독 · 비용 없음";
-  if (r.authType === null) return "—";
-  return r.costUsd === null ? NOT_PROVIDED : usd(r.costUsd);
-}
 
 /** 관리자 → 사용량 (#32, FR-9.3·9.5): this month for everyone, the price table and the daily cost threshold. */
 export function UsageAdmin() {
@@ -105,16 +99,17 @@ export function UsageAdmin() {
             </div>
             <div>
               <div className="muted small">오늘</div>
-              <strong>{usd(r.todayCostUsd)}</strong>
+              <strong data-testid="usage-today-cost">{costText(r.today)}</strong>
             </div>
             <div>
               <div className="muted small">예상 (일평균 × 남은 {r.daysRemaining}일)</div>
-              <strong data-testid="usage-forecast">{usd(r.forecastCostUsd)}</strong>
+              {/* Only the costed rows are forecast: the month's 미제공 rows are named next to it. */}
+              <strong data-testid="usage-forecast">{costText(r.total, r.forecastCostUsd)}</strong>
             </div>
             <div>
               <div className="muted small">요청 · 토큰</div>
               <strong>
-                {r.total.requests.toLocaleString("ko-KR")}회 · {tokens(r.total.totalTokens)}
+                {r.total.requests.toLocaleString("ko-KR")}회 · {tokenText(r.total)}
               </strong>
             </div>
           </div>
@@ -153,7 +148,7 @@ export function UsageAdmin() {
                       {x.model} <span className="muted small">{x.connectionLabel}</span>
                     </td>
                     <td>{PURPOSE[x.purpose]}</td>
-                    <td className="num">{tokens(x.totalTokens)}</td>
+                    <td className="num">{recordTokens(x)}</td>
                     <td
                       className="num"
                       title={x.priceVersion === null ? undefined : `가격표 v${x.priceVersion}`}

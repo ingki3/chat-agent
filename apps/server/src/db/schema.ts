@@ -408,9 +408,11 @@ export const runtimePolicies = sqliteTable(
  * - Token columns and `cost_usd` are NULL when the runtime did not report them (not 0).
  * - `cost_usd` is the runtime's own figure (Claude reports one); it is kept for reference only.
  * - Cost (#32, FR-9.1·9.2): `auth_type` is the connection's way of signing in when the row was first written (NULL
- *   without a connection). Only `api_key` rows are costed: `price_version` pins the price table version used when
- *   the row was first written, and `priced_cost_usd` is the cost from that version — a later price edit makes a new
- *   version and never rewrites these. NULL cost on an `api_key` row = no price for that model ("미제공").
+ *   without a connection; `unknown` when the row names a connection that cannot be found — e.g. rows from before
+ *   0013 whose connection is gone). Only `api_key` rows are costed: `price_version` pins the price table version used
+ *   when the row was first written, and `priced_cost_micros` is the cost from that version in integer micro-USD
+ *   (1e-6 USD, so sums and threshold comparisons are exact) — a later price edit makes a new version and never
+ *   rewrites these. NULL cost on an `api_key` row = no price ("미제공"); `unknown` rows count as 미제공 too.
  *   Subscription rows count requests and tokens only (no version, no cost).
  */
 export const usageRecords = sqliteTable(
@@ -441,12 +443,15 @@ export const usageRecords = sqliteTable(
     requestCount: integer("request_count").notNull().default(1),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
-    /** The connection's auth type at the first write (#32); NULL without a connection. */
-    authType: text("auth_type", { enum: ["api_key", "subscription"] }),
+    /** The connection's auth type at the first write (#32); NULL without a connection, `unknown` if not found. */
+    authType: text("auth_type", { enum: ["api_key", "subscription", "unknown"] }),
     /** Price table version the row is costed with (#32); set once, at the first write. API key rows only. */
     priceVersion: integer("price_version"),
-    /** Cost from `price_version` (#32). NULL = not costed (subscription, no connection) or no price ("미제공"). */
-    pricedCostUsd: real("priced_cost_usd"),
+    /**
+     * Cost from `price_version` (#32) in integer micro-USD. NULL = not costed (subscription, no connection) or no
+     * price ("미제공").
+     */
+    pricedCostMicros: integer("priced_cost_micros"),
   },
   (t) => [
     uniqueIndex("usage_records_run_attempt_idx").on(t.runId, t.attempt),

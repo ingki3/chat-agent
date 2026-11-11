@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { ConnectionAuthType } from "./connections.js";
 
 /**
  * Usage screens (#32, PRD FR-9). Costs are USD and only for API key connections, from a versioned price table;
@@ -56,22 +55,34 @@ export const UsageSettings = z.object({
 });
 export type UsageSettings = z.infer<typeof UsageSettings>;
 
-/** Sums over a set of usage rows. Tokens the runtime did not report count as 0. */
+/**
+ * Sums over a set of usage rows. Tokens the runtime did not report are not counted, and the rows that did not report
+ * them are counted in `tokensMissing` (shown as "미제공", never as 0).
+ */
 export const UsageTotals = z.object({
   requests: z.number().int(),
   inputTokens: z.number().int(),
   outputTokens: z.number().int(),
   cacheReadTokens: z.number().int(),
   cacheWriteTokens: z.number().int(),
-  /** input (cache included) + output. */
+  /** input (cache included) + output, over the rows that reported both. */
   totalTokens: z.number().int(),
-  /** Sum of the costs that could be computed (API key rows with a price). */
+  /** Rows that did not report input or output tokens ("미제공"). */
+  tokensMissing: z.number().int(),
+  /** Sum of the costs that could be computed (API key rows with a price), in integer micro-USD (exact). */
+  costMicroUsd: z.number().int(),
+  /** The same in USD (`costMicroUsd / 1e6`), for display. */
   costUsd: z.number(),
-  /** API key rows whose cost is not provided ("미제공": no price for the model, or tokens not reported). */
+  /**
+   * Rows that should have a cost but have none ("미제공"): API key rows without a price (or without tokens), and
+   * `unknown` rows (their connection could not be found, so whether they cost anything is not known).
+   */
   costMissing: z.number().int(),
   /** Rows on API key connections (costed) and on subscriptions (requests and tokens only). */
   apiKeyRequests: z.number().int(),
   subscriptionRequests: z.number().int(),
+  /** Rows whose connection could not be found ("미확인"); counted in `costMissing`. */
+  unknownRequests: z.number().int(),
 });
 export type UsageTotals = z.infer<typeof UsageTotals>;
 
@@ -96,8 +107,13 @@ export const UsageRecordView = z.object({
   model: z.string(),
   purpose: UsagePurpose,
   connectionLabel: z.string(),
-  authType: ConnectionAuthType.nullable(),
-  totalTokens: z.number().int(),
+  /** `unknown` = the row's connection could not be found ("미확인"). */
+  authType: z.enum(["api_key", "subscription", "unknown"]).nullable(),
+  /** null = the runtime did not report them ("미제공"). */
+  inputTokens: z.number().int().nullable(),
+  outputTokens: z.number().int().nullable(),
+  /** input + output; null when either was not reported. */
+  totalTokens: z.number().int().nullable(),
   /** null = not costed (subscription / no connection) or not provided — see `authType`. */
   costUsd: z.number().nullable(),
   priceVersion: z.number().int().nullable(),
@@ -113,8 +129,12 @@ export const AdminUsageReport = z.object({
   daysElapsed: z.number().int(),
   daysRemaining: z.number().int(),
   total: UsageTotals,
-  todayCostUsd: z.number(),
-  /** This month's cost so far + daily average × days remaining. */
+  /** Today so far, with the same 미제공 counts as the total. */
+  today: UsageTotals,
+  /**
+   * This month's cost so far + daily average × days remaining, over the rows that have a cost. Rows without one
+   * (`total.costMissing`) are not in it: the screen says so next to it ("+ 미제공 n건", or 미제공 when none has a cost).
+   */
   forecastCostUsd: z.number(),
   byUser: z.array(UsageGroup),
   byRuntime: z.array(UsageGroup),

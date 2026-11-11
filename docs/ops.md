@@ -487,7 +487,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
   - "다시 생성"·다음 메시지는 새 실행이라 새 `run_id`다. 브라우저 재연결(`Last-Event-ID`)은 런타임에 아무것도 보내지 않으므로 attempt가 아니고 행도 늘지 않는다.
 - **usage 규칙(어댑터 계약, `runtime/adapter.ts`의 `UsageReport`)**: `usage` 이벤트는 그 attempt의 **지금까지 전체 사용량**이다(증분이 아님). 같은 attempt에 다시 오면 앞의 값을 **바꾼다(마지막 값이 이긴다)** — upsert. 그래서 중복 이벤트·재연결·중지가 행을 늘리거나 두 번 세지 않는다. Claude(`result`)와 Codex(`turn/completed`)는 턴 끝에 한 번 보내고, 세션 누적값(`total_cost_usd`, `tokenUsage.total`)은 그 턴의 차이로 바꿔 보낸다.
 - **언제 쓰나**: `usage` 이벤트가 올 때마다 바로 쓴다. 그래서 **중지되거나 실패한 실행도** 그때까지 온 사용량이 남는다(Claude는 중지 후에도 마지막 `result`로 사용량을 보낸다). 중지 유예 시간이 지나 강제로 끝난 뒤에 오는 이벤트는 버린다.
-- **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용 — 참고용, 화면에는 쓰지 않는다) `request_count`(attempt당 1) `created_at` `updated_at`, 그리고 #32의 `auth_type`(첫 기록 때 연결의 인증 방식, 연결이 없으면 NULL) `price_version`(비용을 계산한 가격표 버전) `priced_cost_usd`(그 버전으로 계산한 비용).
+- **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용 — 참고용, 화면에는 쓰지 않는다) `request_count`(attempt당 1) `created_at` `updated_at`, 그리고 #32의 `auth_type`(첫 기록 때 연결의 인증 방식: `api_key`·`subscription`, 연결이 없으면 NULL, 연결을 찾을 수 없으면 `unknown`) `price_version`(비용을 계산한 가격표 버전) `priced_cost_micros`(그 버전으로 계산한 비용, **정수 마이크로 USD** = 1e-6 USD).
   - 런타임이 주지 않은 값은 0이 아니라 **NULL**이다.
   - 프롬프트·답변·도구 입출력 같은 **내용은 저장하지 않는다**.
   - 행을 쓰지 못하면(디스크·DB 오류) 답변·연결 테스트 결과는 그대로이고 `usage.record_failed` 로그(ID·`attempt`·`purpose`·오류 코드만)가 남는다.
@@ -505,9 +505,12 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 ### 16.1 비용 계산 규칙 (#32, FR-9.1·9.2)
 
 - **API 키 연결만 비용이 있다.** 구독 연결(Claude 관리자 구독, ChatGPT 로그인)은 요청 수와 토큰만 센다. 연결 없이 도는 실행(개발용 `FAKE_RUNTIME=1`)도 비용이 없다.
-- 비용 = 가격표의 100만 토큰당 USD × 토큰. 입력은 캐시를 뺀 입력(`input_tokens − cache_read − cache_write`), 출력, 캐시 읽기, 캐시 쓰기를 각자 가격으로 더한다. 런타임이 준 `cost_usd`는 쓰지 않는다(두 런타임을 같은 표로 계산하려고).
-- **미제공**: 가격표에 그 런타임·모델이 없거나, 쓴 토큰 종류의 가격이 비어 있거나, 런타임이 입력·출력 토큰을 주지 않았으면 비용은 NULL이고 화면에 "미제공"으로 나온다(0이 아님). 합계는 계산된 비용만 더하고 미제공 건수를 따로 보여 준다.
+- 비용 = 가격표의 100만 토큰당 USD × 토큰 = 마이크로 USD. 행마다 한 번 가장 가까운 정수로 반올림해 저장하고, 합계·오늘 비용·기준 비교는 모두 정수로 한다(그래서 정확히 $0.30인 비용은 기준 $0.30을 넘지 않는다). 화면에 보일 때만 USD로 바꾼다. 입력은 캐시를 뺀 입력(`input_tokens − cache_read − cache_write`), 출력, 캐시 읽기, 캐시 쓰기를 각자 가격으로 더한다. 런타임이 준 `cost_usd`는 쓰지 않는다(두 런타임을 같은 표로 계산하려고).
+- **미제공**: 가격표에 그 런타임·모델이 없거나, 쓴 토큰 종류의 가격이 비어 있거나, 런타임이 입력·출력 토큰을 주지 않았으면 비용은 NULL이고 화면에 "미제공"으로 나온다(0이 아님). 합계는 계산된 비용만 더하고 미제공 건수를 따로 보여 준다("$1.20 + 미제공 2건", 모두 미제공이면 "미제공"). 오늘 비용과 예상도 같다 — 예상은 비용이 있는 기록으로만 계산하고 이번 달 미제공 건수를 옆에 적는다. $0.00으로 보이지 않는다.
+- **토큰 미제공**: 런타임이 입력·출력 토큰을 주지 않은 기록은 0이 아니라 "미제공"이다(API의 `totalTokens`·`inputTokens`·`outputTokens`가 null, 합계에는 `tokensMissing` 건수).
+- **미확인**: 기록의 연결을 찾을 수 없으면 `auth_type = 'unknown'`이다. 화면에 "미확인 (미제공)"으로 나오고 미제공 건수에 들어간다. 합계에서 빠지지 않는다.
 - **버전 고정**: attempt의 첫 기록 때 그때의 인증 방식과 현재 가격표 버전이 `auth_type`·`price_version`에 고정된다. 같은 attempt의 다음 usage 이벤트(마지막 값이 이김)는 토큰을 바꾸고 **같은 버전**으로 다시 계산한다. 가격을 고치면 새 버전이 생길 뿐이라 이미 기록된 비용은 바뀌지 않는다. 가격표가 하나도 없을 때 기록된 API 키 행은 `price_version` NULL(미제공)로 남는다 — 나중에 가격표를 저장해도 다시 계산하지 않는다.
+- **업그레이드(0013 이전 기록)**: 마이그레이션이 남아 있는 연결(해제된 연결도 행은 남는다)에서 `auth_type`을 채운다. 연결을 찾을 수 없는 기록은 `unknown`, 연결이 없던 기록은 NULL 그대로다. 옛 기록에는 가격을 적용하지 않는다(`price_version` NULL) — API 키 기록은 "미제공"으로 보인다.
 
 ### 16.2 화면
 
@@ -526,7 +529,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 ### 16.4 일일 비용 알림 (FR-9.5)
 
 - 관리자 → 사용량 → "일일 비용 알림 기준(USD, 선택)". 비우면 꺼진다(`settings`의 `usage.daily_cost_threshold_usd`).
-- 사용량을 쓸 때마다 오늘(서울 기준) API 키 비용 합계를 보고, **기준을 넘으면**(같으면 아님) 활성 관리자 모두에게 `daily_cost` 알림("오늘 $… · 기준 $… (막지는 않아요)")을 보낸다.
+- 사용량을 쓸 때마다 오늘(서울 기준) API 키 비용 합계를 보고(정수 마이크로 USD, 기준도 마이크로 USD로 바꿔 비교), **기준을 넘으면**(같으면 아님) 활성 관리자 모두에게 `daily_cost` 알림("오늘 $… · 기준 $… (막지는 않아요)")을 보낸다.
 - **하루 한 번**: 알림 전에 그날 날짜를 `usage.daily_cost_alerted_day`에 기록(트랜잭션)하고, 같은 날에는 다시 보내지 않는다. 그날 기준을 바꿔도 다시 보내지 않는다. 다음 날 다시 넘으면 다시 보낸다.
 - 막지는 않는다. 알림 전송이 실패해도 실행에는 영향이 없다(`usage.alert_failed`, 오류 코드만). 로그: `usage.daily_cost_alert`(오늘 비용만).
 

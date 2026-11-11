@@ -11,13 +11,19 @@ export type TokenFigures = {
   cacheWriteTokens: number | null;
 };
 
-const PER = 1_000_000;
+/** 1 USD in micro-USD: costs are stored, summed and compared as integers of this unit. */
+export const MICROS = 1_000_000;
+export const toUsd = (micros: number) => micros / MICROS;
+/** A USD amount (threshold) in micro-USD, rounded to the nearest micro. */
+export const toMicros = (usd: number) => Math.round(usd * MICROS);
 
 /**
- * Cost in USD of one usage row at `price` (USD per million tokens), or null when it cannot be given ("미제공"):
- * no price for the model, input or output tokens not reported, or a price missing for a kind of token the row
- * used. Input tokens include cached ones (adapter contract), so cache reads and writes are taken out of input
- * and charged at their own price. Cache figures the runtime did not report count as none.
+ * Cost of one usage row at `price` (USD per million tokens) in integer micro-USD, or null when it cannot be given
+ * ("미제공"): no price for the model, input or output tokens not reported, or a price missing for a kind of token
+ * the row used. Input tokens include cached ones (adapter contract), so cache reads and writes are taken out of
+ * input and charged at their own price. Cache figures the runtime did not report count as none.
+ * USD per million tokens × tokens = micro-USD, so the sum is rounded once to a whole micro-USD: no float residue
+ * ($0.30 is 300000, not 0.30000000000000004) reaches a total or a threshold comparison.
  */
 export function costOf(t: TokenFigures, price: ModelPrice | undefined): number | null {
   if (!price || t.inputTokens === null || t.outputTokens === null) return null;
@@ -29,13 +35,13 @@ export function costOf(t: TokenFigures, price: ModelPrice | undefined): number |
     [cacheRead, price.cacheRead],
     [cacheWrite, price.cacheWrite],
   ];
-  let usd = 0;
+  let micros = 0;
   for (const [tokens, perMillion] of parts) {
     if (tokens === 0) continue;
     if (perMillion === null) return null;
-    usd += (tokens * perMillion) / PER;
+    micros += tokens * perMillion;
   }
-  return usd;
+  return Math.round(micros);
 }
 
 /**

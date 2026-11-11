@@ -85,7 +85,8 @@ export class UsageStore {
         .from(usageRecords)
         .where(and(eq(usageRecords.runId, a.runId), eq(usageRecords.attempt, a.attempt)))
         .get();
-      // Pinned at the first write: the auth type and the price version stay what they were then.
+      // Pinned at the first write: the auth type and the price version stay what they were then. A connection id
+      // that names no connection is `unknown` (shown as 미제공, never dropped from the totals).
       const authType = existing
         ? existing.authType
         : a.connectionId
@@ -93,11 +94,11 @@ export class UsageStore {
               .select({ authType: connections.authType })
               .from(connections)
               .where(eq(connections.id, a.connectionId))
-              .get()?.authType ?? null)
+              .get()?.authType ?? "unknown")
           : null;
       const costed = authType === "api_key";
       const priceVersion = existing ? existing.priceVersion : costed ? this.prices.currentVersion() : null;
-      const pricedCostUsd =
+      const pricedCostMicros =
         costed && priceVersion !== null
           ? costOf(figures, this.prices.priceIn(priceVersion, a.runtime, a.model))
           : null;
@@ -114,12 +115,12 @@ export class UsageStore {
           createdAt: at,
           authType,
           priceVersion,
-          pricedCostUsd,
+          pricedCostMicros,
           ...figures,
         })
         .onConflictDoUpdate({
           target: [usageRecords.runId, usageRecords.attempt],
-          set: { ...figures, pricedCostUsd },
+          set: { ...figures, pricedCostMicros },
         })
         .run();
     });

@@ -89,7 +89,7 @@ describe("cost of one row (#32)", () => {
       const want = FIXTURE.expected.costUsdByRecord[i]!;
       if (want === null) return; // the subscription record: never costed (see the store tests)
       const p = FIXTURE_PRICES.find((x) => x.model === r.model);
-      expect(costOf(reportOf(r), p)).toBeCloseTo(want, 10);
+      expect(costOf(reportOf(r), p)).toBe(Math.round(want * 1_000_000));
     });
   });
 
@@ -100,9 +100,9 @@ describe("cost of one row (#32)", () => {
     expect(costOf({ ...t, outputTokens: null }, price)).toBeNull();
     expect(costOf({ ...t, cacheReadTokens: 500 }, { ...price, cacheRead: null })).toBeNull();
     // A missing price for a kind of token not used does not matter.
-    expect(costOf(t, { ...price, cacheRead: null, cacheWrite: null })).toBeCloseTo(0.015, 10);
+    expect(costOf(t, { ...price, cacheRead: null, cacheWrite: null })).toBe(15_000);
     // Unreported cache figures count as none.
-    expect(costOf({ ...t, cacheReadTokens: null, cacheWriteTokens: null }, price)).toBeCloseTo(0.015, 10);
+    expect(costOf({ ...t, cacheReadTokens: null, cacheWriteTokens: null }, price)).toBe(15_000);
   });
 });
 
@@ -195,7 +195,7 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     expect(t.row(a.runId)).toMatchObject({
       authType: "api_key",
       priceVersion: 1,
-      pricedCostUsd: 1.5,
+      pricedCostMicros: 1_500_000,
       costUsd: 9.99, // the runtime's own figure is kept for reference, not used
     });
   });
@@ -208,7 +208,7 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     expect(t.row(a.runId)).toMatchObject({
       authType: "subscription",
       priceVersion: null,
-      pricedCostUsd: null,
+      pricedCostMicros: null,
       inputTokens: 100_000,
       requestCount: 1,
     });
@@ -221,19 +221,20 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     const b = t.attempt({ connectionId: "gone" });
     t.usage.record(a, { inputTokens: 1000, outputTokens: 10 });
     t.usage.record(b, { inputTokens: 1000, outputTokens: 10 });
-    for (const r of [t.row(a.runId), t.row(b.runId)])
-      expect(r).toMatchObject({ authType: null, priceVersion: null, pricedCostUsd: null });
+    expect(t.row(a.runId)).toMatchObject({ authType: null, priceVersion: null, pricedCostMicros: null });
+    // A connection id that names nothing: explicitly unknown (미확인, counted as 미제공), no price applied.
+    expect(t.row(b.runId)).toMatchObject({ authType: "unknown", priceVersion: null, pricedCostMicros: null });
   });
 
   it("an API key row with no price table, or a model the table does not list → cost NULL (미제공)", () => {
     const t = bare();
     const a = t.attempt();
     t.usage.record(a, { inputTokens: 1000, outputTokens: 10 });
-    expect(t.row(a.runId)).toMatchObject({ authType: "api_key", priceVersion: null, pricedCostUsd: null });
+    expect(t.row(a.runId)).toMatchObject({ authType: "api_key", priceVersion: null, pricedCostMicros: null });
     t.prices.save([t.opus(10, 50)], "admin");
     const b = t.attempt({ model: "haiku" });
     t.usage.record(b, { inputTokens: 1000, outputTokens: 10 });
-    expect(t.row(b.runId)).toMatchObject({ authType: "api_key", priceVersion: 1, pricedCostUsd: null });
+    expect(t.row(b.runId)).toMatchObject({ authType: "api_key", priceVersion: 1, pricedCostMicros: null });
   });
 
   it("editing prices makes a new version and never rewrites past costs; a later report of an old attempt keeps its version", () => {
@@ -241,21 +242,21 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     t.prices.save([t.opus(10, 50)], "admin");
     const old = t.attempt();
     t.usage.record(old, { inputTokens: 100_000, outputTokens: 0 });
-    expect(t.row(old.runId).pricedCostUsd).toBeCloseTo(1, 10);
+    expect(t.row(old.runId).pricedCostMicros).toBe(1_000_000);
 
     const v2 = t.prices.save([t.opus(20, 100)], "admin");
     expect(v2.version).toBe(2);
     expect(t.prices.version(1)!.prices[0]!.input).toBe(10); // version 1 is still there, unchanged
-    expect(t.row(old.runId)).toMatchObject({ priceVersion: 1, pricedCostUsd: 1 });
+    expect(t.row(old.runId)).toMatchObject({ priceVersion: 1, pricedCostMicros: 1_000_000 });
 
     // The old attempt reports again (last one wins): its figures change, its version does not.
     t.usage.record(old, { inputTokens: 200_000, outputTokens: 0 });
     expect(t.row(old.runId)).toMatchObject({ priceVersion: 1, inputTokens: 200_000 });
-    expect(t.row(old.runId).pricedCostUsd).toBeCloseTo(2, 10); // 200k × $10, not × $20
+    expect(t.row(old.runId).pricedCostMicros).toBe(2_000_000); // 200k × $10, not × $20
 
     const fresh = t.attempt();
     t.usage.record(fresh, { inputTokens: 100_000, outputTokens: 0 });
-    expect(t.row(fresh.runId)).toMatchObject({ priceVersion: 2, pricedCostUsd: 2 });
+    expect(t.row(fresh.runId)).toMatchObject({ priceVersion: 2, pricedCostMicros: 2_000_000 });
   });
 
   it("the auth type is pinned at the first write too (a connection that changes later does not recost)", () => {
@@ -265,7 +266,7 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     t.usage.record(a, { inputTokens: 1000, outputTokens: 0 });
     t.db.update(connections).set({ authType: "api_key" }).run();
     t.usage.record(a, { inputTokens: 2000, outputTokens: 0 });
-    expect(t.row(a.runId)).toMatchObject({ authType: "subscription", pricedCostUsd: null });
+    expect(t.row(a.runId)).toMatchObject({ authType: "subscription", pricedCostMicros: null });
 
     // And the other way: an API key attempt stays costed (with its own version) after its connection changes.
     const b = t.attempt({ connectionId: "key" });
@@ -273,7 +274,7 @@ describe("costing at record time (#32): API key only, pinned price version", () 
     t.db.update(connections).set({ authType: "subscription" }).run();
     t.usage.record(b, { inputTokens: 200_000, outputTokens: 0 });
     expect(t.row(b.runId)).toMatchObject({ authType: "api_key", priceVersion: 1 });
-    expect(t.row(b.runId).pricedCostUsd).toBeCloseTo(2, 10);
+    expect(t.row(b.runId).pricedCostMicros).toBe(2_000_000);
   });
 });
 
@@ -497,8 +498,8 @@ describe("admin usage report (#32, FR-9.3·9.5, AC-12)", () => {
       daysRemaining: 19,
     });
     expect(rep.total.costUsd).toBeCloseTo(10, 9);
-    expect(rep.todayCostUsd).toBeCloseTo(1, 9);
-    expect(rep.forecastCostUsd).toBeCloseTo(10 + (10 / 11) * 19, 9);
+    expect(rep.today.costUsd).toBeCloseTo(1, 9);
+    expect(rep.forecastCostUsd).toBeCloseTo(10 + (10 / 11) * 19, 6); // rounded to a micro-USD
   });
 
   it("prices: each save is a new version; the history lists them; bad tables are refused", async () => {
@@ -737,7 +738,9 @@ describe("no budget in v1: usage never blocks a run (#32 완료 기준, FR-9.1)"
     const rows = t.db.select().from(usageRecords).all();
     expect(rows).toHaveLength(3);
     expect(
-      rows.every((r) => r.authType === "api_key" && r.connectionId === t.key && (r.pricedCostUsd ?? 0) > 0),
+      rows.every(
+        (r) => r.authType === "api_key" && r.connectionId === t.key && (r.pricedCostMicros ?? 0) > 0,
+      ),
     ).toBe(true);
     expect(t.inbox(t.f.users.admin.id)).toHaveLength(1); // told, once — never stopped
   });

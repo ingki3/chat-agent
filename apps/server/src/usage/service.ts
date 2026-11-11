@@ -12,6 +12,7 @@ import type { Db } from "../db/client.js";
 import { connections, usageRecords, users } from "../db/schema.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { forecastMonth, monthInfo } from "./calendar.js";
+import { toMicros, toUsd } from "./prices.js";
 import type { UsageRow } from "./store.js";
 
 /** Settings keys (`settings` table). */
@@ -41,28 +42,38 @@ export function emptyTotals(): UsageTotals {
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     totalTokens: 0,
+    tokensMissing: 0,
+    costMicroUsd: 0,
     costUsd: 0,
     costMissing: 0,
     apiKeyRequests: 0,
     subscriptionRequests: 0,
+    unknownRequests: 0,
   };
 }
 
-/** Adds one row. Only API key rows carry a cost; one without a price counts as "미제공" instead. */
+/**
+ * Adds one row. Only API key rows carry a cost (integer micro-USD, summed exactly); an API key row without a price
+ * and a row whose connection is unknown count as "미제공" instead. Unreported tokens are counted as missing, not 0.
+ */
 export function addRow(t: UsageTotals, r: UsageRow): void {
-  const input = r.inputTokens ?? 0;
-  const output = r.outputTokens ?? 0;
   t.requests += r.requestCount;
-  t.inputTokens += input;
-  t.outputTokens += output;
+  t.inputTokens += r.inputTokens ?? 0;
+  t.outputTokens += r.outputTokens ?? 0;
   t.cacheReadTokens += r.cacheReadTokens ?? 0;
   t.cacheWriteTokens += r.cacheWriteTokens ?? 0;
-  t.totalTokens += input + output;
+  if (r.inputTokens === null || r.outputTokens === null) t.tokensMissing += 1;
+  else t.totalTokens += r.inputTokens + r.outputTokens;
   if (r.authType === "api_key") {
     t.apiKeyRequests += r.requestCount;
-    if (r.pricedCostUsd === null) t.costMissing += 1;
-    else t.costUsd += r.pricedCostUsd;
+    if (r.pricedCostMicros === null) t.costMissing += 1;
+    else t.costMicroUsd += r.pricedCostMicros;
   } else if (r.authType === "subscription") t.subscriptionRequests += r.requestCount;
+  else if (r.authType === "unknown") {
+    t.unknownRequests += r.requestCount;
+    t.costMissing += 1;
+  }
+  t.costUsd = toUsd(t.costMicroUsd);
 }
 
 function totalsOf(rows: UsageRow[]): UsageTotals {
@@ -177,8 +188,10 @@ export class UsageService {
       purpose: r.purpose,
       connectionLabel: byConnection(r)[1],
       authType: r.authType,
-      totalTokens: (r.inputTokens ?? 0) + (r.outputTokens ?? 0),
-      costUsd: r.authType === "api_key" ? r.pricedCostUsd : null,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+      totalTokens: r.inputTokens === null || r.outputTokens === null ? null : r.inputTokens + r.outputTokens,
+      costUsd: r.authType === "api_key" && r.pricedCostMicros !== null ? toUsd(r.pricedCostMicros) : null,
       priceVersion: r.priceVersion,
     }));
     return {
@@ -188,8 +201,8 @@ export class UsageService {
       daysElapsed: m.dayOfMonth,
       daysRemaining: m.daysInMonth - m.dayOfMonth,
       total,
-      todayCostUsd: today.costUsd,
-      forecastCostUsd: forecastMonth(total.costUsd, m.dayOfMonth, m.daysInMonth),
+      today,
+      forecastCostUsd: toUsd(Math.round(forecastMonth(total.costMicroUsd, m.dayOfMonth, m.daysInMonth))),
       byUser: groupBy(rows, byUser),
       byRuntime: groupBy(rows, byRuntime),
       byModel: groupBy(rows, byModel),
@@ -201,11 +214,11 @@ export class UsageService {
     };
   }
 
-  /** Today's cost so far (API key rows with a price), in the service zone. */
-  todayCost(at: number): number {
+  /** Today's cost so far (API key rows with a price) in integer micro-USD, in the service zone. */
+  todayCostMicros(at: number): number {
     const m = monthInfo(at, this.timeZone);
     const row = this.db
-      .select({ usd: sum(usageRecords.pricedCostUsd) })
+      .select({ micros: sum(usageRecords.pricedCostMicros) })
       .from(usageRecords)
       .where(
         and(
@@ -215,7 +228,7 @@ export class UsageService {
         ),
       )
       .get();
-    return Number(row?.usd ?? 0);
+    return Number(row?.micros ?? 0);
   }
 
   /**
@@ -230,8 +243,10 @@ export class UsageService {
       if (threshold === null) return;
       const day = monthInfo(at, this.timeZone).today;
       if (this.settings.get(ALERTED_KEY) === day) return;
-      const amount = this.todayCost(at);
-      if (!(amount > threshold)) return;
+      // Integers on both sides: a cost of exactly the threshold is not above it.
+      const micros = this.todayCostMicros(at);
+      if (!(micros > toMicros(threshold))) return;
+      const amount = toUsd(micros);
       const claimed = this.db.transaction(() => {
         if (this.settings.get(ALERTED_KEY) === day) return false;
         this.settings.set(ALERTED_KEY, day);
