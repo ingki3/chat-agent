@@ -1,6 +1,8 @@
 // A separate process for the backup tests (#37): holds or tries the data folder's lock, or runs a restore and kills
 // itself between two steps of the swap. Run with `node --conditions=development --import tsx child.ts <mode> …`.
 import fs from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
 import { restoreBackup, type RestoreStep } from "../../../src/backup/restore.js";
 import { loadMasterKey } from "../../../src/crypto/secrets.js";
 import { acquireDataLock, DataLockHeld, type DataLockKind } from "../../../src/storage/data-lock.js";
@@ -17,6 +19,23 @@ if (mode === "lock") {
   for (let i = 0; i < 5; i++) (globalThis as { gc?: () => void }).gc?.();
   process.stdout.write(typeof (globalThis as { gc?: unknown }).gc === "function" ? "locked\n" : "no-gc\n");
   setInterval(() => (globalThis as { gc?: () => void }).gc?.(), 20);
+} else if (mode === "commit-die") {
+  // Commits one user in WAL mode and dies at once: the row lives only in the -wal file.
+  const db = new Database(path.join(args[0]!, "agentlee.db"));
+  db.pragma("journal_mode = WAL");
+  db.pragma("wal_autocheckpoint = 0");
+  db.prepare("INSERT INTO users (id, email, name, role) VALUES ('wal-user', 'wal@x', 'wal', 'member')").run();
+  process.stdout.write("committed\n");
+  process.kill(process.pid, "SIGKILL");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
+} else if (mode === "hold-reader") {
+  // Another process (not taking the data lock, like a sqlite3 shell) inside a read transaction on the WAL database.
+  const db = new Database(path.join(args[0]!, "agentlee.db"));
+  db.pragma("journal_mode = WAL");
+  db.exec("BEGIN");
+  db.prepare("SELECT count(*) FROM users").get();
+  process.stdout.write("reading\n");
+  setInterval(() => {}, 1000);
 } else if (mode === "try-lock") {
   try {
     acquireDataLock(args[0]!, args[1] as DataLockKind).release();

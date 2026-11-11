@@ -36,6 +36,10 @@ const MESSAGES: Record<RestoreCode, string> = {
   schema_mismatch: "이 백업의 DB 스키마가 이 코드와 맞지 않아요(다른 브랜치의 마이그레이션).",
   server_running: "서버가 아직 이 데이터 폴더를 쓰고 있어요. 먼저 서버를 멈추세요.",
   target_unsafe: "복원 대상 폴더가 안전하지 않아요(백업 폴더·키와 겹치거나 심볼릭 링크).",
+  old_unsettled:
+    "기존 데이터 폴더의 DB를 정리(체크포인트)하지 못했어요. 다른 프로세스가 열고 있지 않은지 확인하세요.",
+  not_durable:
+    "새 데이터 폴더를 디스크에 확실히 쓰지 못했어요(fsync 실패 — 디스크 공간·오류 확인). 아무것도 바꾸지 않았어요.",
 };
 
 function fail(code: RestoreCode | "usage" | "key_unreadable", extra?: string): never {

@@ -771,9 +771,18 @@ pnpm skills:install                                        # 6) 스킬 다시 �
   - 이름 바꾸기가 실패하면(EIO 등) 그 자리에서 되돌린다. 되돌리기·지우기가 중간에 실패해도 일지가 `rolling_back`이라 다음에 이어서 되돌린다.
   - 프로세스가 죽거나 전원이 나가면 **다음 복원·서버 시작·`db:migrate`**가 일지를 보고 정한다. `old_moved` 이후이고 후보가 인정되면 앞으로 끝낸다(`completed`, 옛 폴더는 옆에 그대로). 아니면 인정된 옛 폴더로 되돌린다(`rolled_back`). 제자리에 있던 것이 우리 후보(id 일치)인데 손상됐으면 지우지 않고 `<이름>.restore-rejected-*`로 옮겨 둔다.
   - 어느 쪽도 증명하지 못하면(제자리에 정체 모를 데이터, 옛 폴더가 바뀜·없음) **일지를 그대로 두고 두 폴더 모두 건드리지 않은 채** `restore_unresolved`로 시작을 거부한다. 일지의 `target`·`previous`·`staging` 경로를 보고 직접 정리한 뒤 일지를 지운다.
+  - **수동 복구 순서** (`restore_unresolved`일 때. 서버는 멈춘 채로):
+    1. **확인** — 일지(`.<이름>.restore-journal.json`)의 `target`·`previous`·`staging`을 본다. 각 폴더가 무엇인지 확인한다: 옛 폴더에는 `.restore-old`(일지 `old.id`와 같은 값), 복원본에는 `.restore-candidate`(일지 `candidate.id`)가 있다. 필요하면 `sqlite3 <폴더>/agentlee.db 'PRAGMA integrity_check; SELECT count(*) FROM users;'`로 열어 본다(읽기만).
+    2. **격리** — 쓸 데이터가 아닌 폴더는 지우지 말고 옆 이름으로 옮긴다(예 `mv <DATA_DIR> <DATA_DIR>.manual-hold-<날짜>`). 쓸 폴더(대개 옛 폴더)를 `DATA_DIR` 이름으로 옮긴다.
+    3. **일지 제거 후 재복원** — 일지를 지우고(`rm <부모>/.<이름>.restore-journal.json`), 서버를 한 번 띄워 데이터가 맞는지 본 뒤, 다시 복원할 거라면 서버를 멈추고 `pnpm -s restore check` → `apply`를 처음부터 한다.
+- **옆에 남는 폴더와 지워도 되는 때**: 자동으로 지우지 않는다. 관리자 → 백업 탭이 개수를 알려 준다.
+  - `<이름>.before-restore-*` — 복원 전의 데이터 폴더. 복원한 데이터로 서버를 띄워 로그인·대화·연결을 확인했으면 지운다.
+  - `<이름>.restore-rejected-*` — 끊긴 복원에서 손상된 복원본(백업의 사본일 뿐, 원래 데이터 아님). 지금 `DATA_DIR`이 맞는 데이터인지 확인했고 일지가 없으면 바로 지워도 된다. 지우기 전에 원인(디스크 오류 등)을 확인한다.
+- **옛 DB 정리(WAL)**: 교체 전에 옛 DB를 열어 `wal_checkpoint(TRUNCATE)` 후 `journal_mode = DELETE`로 닫는다(서버는 잠금 때문에 멈춰 있다). `-wal`이 비지 않았거나 `-shm`이 남으면 `old_unsettled`로 멈춘다. 일지의 옛 폴더 정체에는 DB 해시와 함께 `-wal`·`-shm`의 유무·크기·해시도 들어가, 하나라도 다르면 옛 폴더로 인정하지 않는다(`restore_unresolved`).
+- **fsync 오류**: 복사한 파일의 열기·fsync 오류(EIO·ENOSPC 등)는 그대로 실패시켜 교체 전에 멈춘다(`not_durable`, 아무것도 바꾸지 않음). 폴더 fsync는 파일 시스템이 지원하지 않는다는 답(EINVAL·ENOTSUP·EOPNOTSUPP·EISDIR)만 넘긴다.
   - 로그 `restore.recovered`. macOS `renamex_np`의 원자적 교환은 네이티브 모듈 없이 Node에서 쓸 수 없어 일지로 했다.
 - **스키마 버전 호환**: 백업 DB의 `__drizzle_migrations`가 이 코드의 마이그레이션 목록의 앞부분과 같아야 한다(같은 시각·같은 파일 해시). 더 오래된 백업은 괜찮다(빠진 마이그레이션을 복원 때 적용, 출력에 개수). 더 새 서버의 백업이면 `schema_newer` — 코드를 그 버전 이상으로 올린 뒤 복원한다. 다른 브랜치의 마이그레이션이면 `schema_mismatch`.
-- **실패 코드**(종료 코드 1, 아무것도 바꾸지 않음): `wrong_key`(키가 다름 — 3절 사본), `secret_unreadable`(키 확인은 맞는데 마스터 키로 암호화된 값 — 연결 인증 정보, 암호화된 설정(VAPID 개인 키 등), 푸시 구독 — 중 하나라도 안 풀림), `schema_newer`, `schema_mismatch`, `backup_corrupt`(해시·무결성 실패), `manifest_invalid`, `backup_not_found`, `server_running`, `target_unsafe`. 키 파일 자체가 문제면 `key_unreadable`.
+- **실패 코드**(종료 코드 1, 아무것도 바꾸지 않음): `wrong_key`(키가 다름 — 3절 사본), `secret_unreadable`(키 확인은 맞는데 마스터 키로 암호화된 값 — 연결 인증 정보, 암호화된 설정(VAPID 개인 키 등), 푸시 구독 — 중 하나라도 안 풀림), `schema_newer`, `schema_mismatch`, `backup_corrupt`(해시·무결성 실패), `manifest_invalid`, `backup_not_found`, `server_running`, `target_unsafe`, `old_unsettled`, `not_durable`. 키 파일 자체가 문제면 `key_unreadable`, 끊긴 복원을 판단하지 못하면 `restore_unresolved`.
 - 복원 뒤: 로그인 세션도 백업 시점 그대로라 기기에서 다시 로그인할 필요는 보통 없다. 런타임 세션은 새로 시작된다(대화 기록은 그대로). ChatGPT 로그인 토큰은 DB에 암호문으로 있으므로 그대로 쓰이지만, 백업 뒤 갱신된 토큰이면 만료로 보여 다시 로그인이 필요할 수 있다(11절).
 
 **리허설 (분기마다, 4절에 기록)** — 실제 데이터 폴더를 건드리지 않는다.

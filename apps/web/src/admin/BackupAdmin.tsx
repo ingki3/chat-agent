@@ -47,6 +47,19 @@ export function BackupAdmin() {
             DB와 첨부·파일을 같은 시점으로 백업해요. 인증 정보는 암호화된 채로 들어가고,{" "}
             <b>마스터 키는 백업에 들어가지 않아요</b> — 키의 오프라인 사본은 따로 보관하세요(운영 문서 3절).
           </p>
+          {b.leftovers.rejected > 0 && (
+            <p className="error small" data-testid="backup-rejected" role="alert">
+              복원이 중간에 끊겨 손상된 복원본 {b.leftovers.rejected}개를 데이터 폴더 옆(
+              <code>…restore-rejected-…</code>)에 옮겨 뒀어요. 지금 데이터가 맞는지 확인한 뒤 지워도 돼요(운영
+              문서 21.4절).
+            </p>
+          )}
+          {b.leftovers.previous > 0 && (
+            <p className="muted small" data-testid="backup-previous">
+              복원 전 데이터 폴더 {b.leftovers.previous}개가 옆(<code>…before-restore-…</code>)에 남아 있어요.
+              복원 결과를 확인했으면 직접 지우세요.
+            </p>
+          )}
           {!b.available && (
             <p className="error small" data-testid="backup-unavailable">
               이 서버는 백업을 만들지 않아요(BACKUP_DIR 설정 확인).

@@ -115,6 +115,12 @@ export const BackupsResponse = z.object({
   last: z.object({ at: z.number().int(), code: BackupCode }).nullable(),
   /** The database schema version of this server (migrations), to compare with a backup's. */
   schemaMigrations: z.number().int().nonnegative(),
+  /**
+   * Folders a restore left next to the data folder (docs/ops.md §21.4): `previous` = earlier data folders moved aside
+   * (`<name>.before-restore-*`), `rejected` = damaged candidates a recovery moved aside (`<name>.restore-rejected-*`).
+   * Neither is removed automatically.
+   */
+  leftovers: z.object({ previous: z.number().int().nonnegative(), rejected: z.number().int().nonnegative() }),
   items: z.array(BackupItem),
 });
 export type BackupsResponse = z.infer<typeof BackupsResponse>;

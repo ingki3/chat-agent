@@ -1,4 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { FastifyInstance } from "fastify";
+import { realDataDir } from "../storage/data-lock.js";
 import type { BackupsResponse } from "@agentlee/shared";
 import { DEFAULT_TIME_ZONE } from "../notifications/quiet.js";
 import { BACKUP_TIME, RETENTION_DAYS, type BackupService } from "./backup.js";
@@ -8,7 +11,27 @@ import { codeMigrations } from "./schema.js";
  * Admin → 백업 (#37): recent backups, "지금 백업" and the schedule. Admin only. Restore is not here on purpose: it
  * replaces the data folder, which needs the server stopped (`pnpm -s restore`, docs/ops.md §21).
  */
-export function registerBackupRoutes(app: FastifyInstance, service: BackupService | undefined): void {
+/** Folders a restore left next to the data folder (never removed automatically). */
+function leftovers(dataDir: string): { previous: number; rejected: number } {
+  const real = realDataDir(dataDir);
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(path.dirname(real));
+  } catch {
+    // parent unreadable: nothing to report
+  }
+  const base = path.basename(real);
+  return {
+    previous: names.filter((n) => n.startsWith(`${base}.before-restore-`)).length,
+    rejected: names.filter((n) => n.startsWith(`${base}.restore-rejected-`)).length,
+  };
+}
+
+export function registerBackupRoutes(
+  app: FastifyInstance,
+  service: BackupService | undefined,
+  dataDir: string,
+): void {
   const admin = (what: string) => ({ auth: "admin" as const, noResource: what });
   const schemaMigrations = codeMigrations().length;
 
@@ -21,6 +44,7 @@ export function registerBackupRoutes(app: FastifyInstance, service: BackupServic
       nextRunAt: status?.nextRunAt ?? null,
       last: status?.last ?? null,
       schemaMigrations,
+      leftovers: leftovers(dataDir),
       items: service?.list() ?? [],
     };
     return reply.header("Cache-Control", "no-store").send(body);

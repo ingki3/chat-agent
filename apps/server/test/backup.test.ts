@@ -1274,6 +1274,130 @@ describe(
       expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
     });
 
+    // Round 4: the old database's WAL.
+    const commitInWal = async (dataDir: string) => {
+      const c = spawnTs(CHILD, ["commit-die", dataDir]);
+      expect((await c.exited).signal).toBe("SIGKILL");
+      expect(fs.statSync(path.join(dataDir, `${DB_FILE}-wal`)).size).toBeGreaterThan(0);
+    };
+    const countUsers = (dir: string) => {
+      const db = new Database(path.join(dir, DB_FILE), { readonly: true, fileMustExist: true });
+      try {
+        return (db.prepare("SELECT count(*) AS n FROM users").get() as { n: number }).n;
+      } finally {
+        db.close();
+      }
+    };
+
+    it("a normal restore checkpoints the old database first: the folder kept aside holds every committed row", async () => {
+      const t = await prepared();
+      await commitInWal(t.dataDir);
+      const r = restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key });
+      expect(fs.existsSync(`${r.previous!}/${DB_FILE}-wal`)).toBe(false);
+      expect(fs.existsSync(`${r.previous!}/${DB_FILE}-shm`)).toBe(false);
+      // Its main file alone has the WAL-only user.
+      expect(countUsers(r.previous!)).toBe(6);
+    });
+
+    it("the old WAL lost after a kill: the checkpoint already saved its rows — rolled back with all 6 users", async () => {
+      const t = await prepared();
+      await commitInWal(t.dataDir);
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "rename1"]);
+      await c.exited;
+      const old = path.join(t.root, asides(t.root)[0]!);
+      fs.rmSync(path.join(old, `${DB_FILE}-wal`), { force: true });
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("rolled_back");
+        expect(users(o)).toBe(6);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+    });
+
+    it("a -wal that appeared in the old folder after it was identified: not the old database — refused, nothing moved", async () => {
+      const t = await prepared();
+      await commitInWal(t.dataDir);
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "rename1"]);
+      await c.exited;
+      const old = path.join(t.root, asides(t.root)[0]!);
+      fs.writeFileSync(path.join(old, `${DB_FILE}-wal`), "not the WAL that was there");
+      const journalBefore = fs.readFileSync(restoreJournalPath(t.dataDir), "utf8");
+      expect(() => startServer(t)).toThrow(/restore_unresolved/);
+      expect(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")).toBe(journalBefore);
+      expect(fs.existsSync(old)).toBe(true);
+      expect(fs.existsSync(t.dataDir)).toBe(false);
+    });
+
+    it("another process still reading the old database: old_unsettled, nothing changed", async () => {
+      const t = await prepared();
+      await commitInWal(t.dataDir);
+      const reader = spawnTs(CHILD, ["hold-reader", t.dataDir]);
+      await reader.waitFor("reading");
+      expect(restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key }))).toBe(
+        "old_unsettled",
+      );
+      reader.child.kill("SIGKILL");
+      await reader.exited;
+      expect(fs.statSync(path.join(t.dataDir, `${DB_FILE}-wal`)).size).toBeGreaterThan(0);
+      expect(leftovers(t.root)).toEqual([]);
+      expect(asides(t.root)).toEqual([]);
+      expect(fs.existsSync(path.join(t.dataDir, OLD_ID_FILE))).toBe(false);
+    });
+
+    for (const code of ["EIO", "ENOSPC"] as const)
+      it(`fsync of a copied file fails with ${code}: the restore fails before the swap, the old data stays`, async () => {
+        const t = await prepared();
+        const fsynced: string[] = [];
+        expect(
+          restoreCode(() =>
+            restoreBackup({
+              backup: t.backup,
+              target: t.dataDir,
+              key: t.key,
+              hooks: {
+                fsync: (p) => {
+                  fsynced.push(p);
+                  if (p.endsWith(path.join("files", "u1", "c1", "a.txt")))
+                    throw Object.assign(new Error(code), { code });
+                },
+              },
+            }),
+          ),
+        ).toBe("not_durable");
+        expect(fsynced.some((p) => p.endsWith("a.txt"))).toBe(true);
+        expectOld(t);
+      });
+
+    it("directory fsync: an 'unsupported' answer is ignored, a real error is not", async () => {
+      const t = await prepared();
+      const dirError = (code: string) => (p: string) => {
+        if (fs.lstatSync(p).isDirectory()) throw Object.assign(new Error(code), { code });
+      };
+      expect(
+        restoreCode(() =>
+          restoreBackup({
+            backup: t.backup,
+            target: t.dataDir,
+            key: t.key,
+            hooks: { fsync: dirError("EIO") },
+          }),
+        ),
+      ).toBe("not_durable");
+      expectOld(t);
+      expect(
+        restoreCode(() =>
+          restoreBackup({
+            backup: t.backup,
+            target: t.dataDir,
+            key: t.key,
+            hooks: { fsync: dirError("EINVAL") },
+          }),
+        ),
+      ).toBe("ok");
+    });
+
     it("a 0-byte database next to an earlier copy counts as missing", async () => {
       const t = await prepared();
       fs.renameSync(t.dataDir, `${t.dataDir}.before-restore-20261111T000000Z`);
@@ -1558,5 +1682,23 @@ describe("the CLI checks the key it actually uses (#37 review P2)", { timeout: 6
     );
     expect((await ok.exited).code, ok.err()).toBe(0);
     expect(ok.out()).toContain(`restored: ${id}`);
+  });
+});
+
+describe("the backup tab reports what a restore left beside the data folder (#37 review 4 P3)", () => {
+  it("counts before-restore and restore-rejected folders", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start(L);
+    const f = await createFamily(one.app);
+    const get = async () =>
+      BackupsResponse.parse((await send(one.app, f.cookies.admin, "GET", "/api/admin/backups")).json())
+        .leftovers;
+    expect(await get()).toEqual({ previous: 0, rejected: 0 });
+    fs.mkdirSync(`${L.dataDir}.before-restore-20261111T000000Z`);
+    fs.mkdirSync(`${L.dataDir}.restore-rejected-abc123`);
+    fs.mkdirSync(`${L.dataDir}.restore-rejected-def456`);
+    fs.mkdirSync(path.join(L.root, "other.restore-rejected-x"));
+    expect(await get()).toEqual({ previous: 1, rejected: 2 });
   });
 });

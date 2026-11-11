@@ -41,6 +41,10 @@ export const RESTORE_CODES = [
   "schema_mismatch",
   "server_running",
   "target_unsafe",
+  // The old data folder's database could not be settled (checkpointed, no -wal/-shm left) before the swap.
+  "old_unsettled",
+  // A file of the new folder could not be made durable (fsync failed: EIO, ENOSPC …) — nothing was swapped.
+  "not_durable",
 ] as const;
 export type RestoreCode = (typeof RESTORE_CODES)[number];
 
@@ -184,13 +188,17 @@ export function serverRunning(dataDir: string): boolean {
  */
 type Phase = "prepared" | "old_moved" | "swapped" | "done" | "rolling_back";
 type FileEntry = { path: string; bytes: number; sha256: string };
+/** A file's state: absent, or its size and SHA-256. */
+type FileState = { bytes: number; sha256: string } | null;
+const SIDECARS = ["-wal", "-shm"] as const;
+type Sidecar = (typeof SIDECARS)[number];
 type Journal = {
   target: string;
   staging: string;
   previous: string | null;
   phase: Phase;
   /** Null when the target was missing or empty (rolling back = no data folder). */
-  old: { id: string; dbSha256: string | null } | null;
+  old: { id: string; dbSha256: string | null; sidecars: Record<Sidecar, FileState> } | null;
   candidate: { id: string; files: FileEntry[] };
 };
 export type RestoreStep = Phase | "journal_removed" | "cleaned";
@@ -203,16 +211,29 @@ export function restoreJournalPath(dataDir: string): string {
   return path.join(path.dirname(real), `.${path.basename(real)}.restore-journal.json`);
 }
 
+/** Errors a directory fsync may give on file systems that do not support it — the only ones ever ignored. */
+const DIR_FSYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR"]);
+/** Tests: called before every fsync (fault injection). */
+let fsyncHook: ((p: string) => void) | undefined;
+
+/**
+ * fsync of a file or a directory. A file's open or fsync error always propagates (the data is not durable); a
+ * directory's only when it is not one of the "unsupported" answers above.
+ */
 function fsyncPath(p: string): void {
+  let dir = false;
   try {
+    dir = fs.lstatSync(p).isDirectory();
+    fsyncHook?.(p);
     const fd = fs.openSync(p, "r");
     try {
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
-  } catch {
-    // best effort (not every file system allows fsync on a directory)
+  } catch (e) {
+    if (dir && DIR_FSYNC_UNSUPPORTED.has((e as NodeJS.ErrnoException).code ?? "")) return;
+    throw e;
   }
 }
 
@@ -291,6 +312,53 @@ const dbSha = (dir: string): string | null => {
   const st = fs.lstatSync(f, { throwIfNoEntry: false });
   return st?.isFile() && st.size > 0 ? sha256File(f) : null;
 };
+function fileState(f: string): FileState {
+  const st = fs.lstatSync(f, { throwIfNoEntry: false });
+  if (!st) return null;
+  if (!st.isFile()) return { bytes: -1, sha256: "not-a-file" };
+  return { bytes: st.size, sha256: sha256File(f) };
+}
+const sidecarStates = (dir: string) =>
+  Object.fromEntries(SIDECARS.map((x) => [x, fileState(path.join(dir, `${DB_FILE}${x}`))])) as Record<
+    Sidecar,
+    FileState
+  >;
+const sameState = (a: FileState, b: FileState) =>
+  a === null ? b === null : b !== null && a.bytes === b.bytes && a.sha256 === b.sha256;
+
+/**
+ * Settles the old database before it is identified (#37 review 4): the server is stopped (restore holds the lock),
+ * so its WAL is checkpointed into the main file and the journal mode set to DELETE — no committed row lives only in
+ * a `-wal` that could be lost. Afterwards no `-wal` (or an empty one) and no `-shm` may remain.
+ */
+function settleOldDb(dir: string): void {
+  const file = path.join(dir, DB_FILE);
+  const st = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!st?.isFile() || st.size === 0) return;
+  let db: Database.Database;
+  try {
+    db = new Database(file, { fileMustExist: true, timeout: 0 });
+  } catch {
+    throw new RestoreError("old_unsettled");
+  }
+  try {
+    const r = db.pragma("wal_checkpoint(TRUNCATE)") as { busy: number }[];
+    if (r[0]?.busy) throw new RestoreError("old_unsettled");
+    db.pragma("journal_mode = DELETE");
+  } catch (e) {
+    throw e instanceof RestoreError ? e : new RestoreError("old_unsettled");
+  } finally {
+    db.close();
+  }
+  const wal = fs.lstatSync(`${file}-wal`, { throwIfNoEntry: false });
+  if ((wal && wal.size > 0) || exists(`${file}-shm`)) throw new RestoreError("old_unsettled");
+  try {
+    fsyncPath(file);
+    fsyncPath(dir);
+  } catch {
+    throw new RestoreError("not_durable");
+  }
+}
 
 /** `dir` is exactly the journaled candidate. */
 function isCandidate(dir: string, j: Journal): boolean {
@@ -314,7 +382,10 @@ function isCandidate(dir: string, j: Journal): boolean {
 function isOld(dir: string, j: Journal): boolean {
   if (!j.old || !fs.lstatSync(dir, { throwIfNoEntry: false })?.isDirectory()) return false;
   try {
-    return readId(dir, OLD_ID_FILE) === j.old.id && dbSha(dir) === j.old.dbSha256;
+    if (readId(dir, OLD_ID_FILE) !== j.old.id || dbSha(dir) !== j.old.dbSha256) return false;
+    // The database is its main file *and* its sidecars: a lost or changed -wal is a different database.
+    const now = sidecarStates(dir);
+    return SIDECARS.every((x) => sameState(now[x], j.old!.sidecars?.[x] ?? null));
   } catch {
     return false;
   }
@@ -452,6 +523,8 @@ export type RestoreOptions = {
     rename?: (from: string, to: string) => void;
     rm?: (p: string) => void;
     step?: (step: RestoreStep) => void;
+    /** Called before every fsync with its path (throw to inject EIO, ENOSPC …). */
+    fsync?: (p: string) => void;
   };
 };
 
@@ -486,8 +559,10 @@ export function restoreBackup(o: RestoreOptions): RestoreResult {
     throw e;
   }
   try {
+    fsyncHook = o.hooks?.fsync;
     return restoreLocked(o, target, backup);
   } finally {
+    fsyncHook = undefined;
     claim.lock.release();
   }
 }
@@ -498,6 +573,8 @@ function restoreLocked(o: RestoreOptions, target: string, backup: string): Resto
     throw new RestoreError("target_unsafe");
 
   const verified = verifyBackup(backup, o.key, o.code);
+  // Before anything is copied: the old database checkpointed and closed, so its identity is its main file alone.
+  if (existing) settleOldDb(target);
   const { manifest } = verified;
 
   const parent = path.dirname(target);
@@ -533,7 +610,12 @@ function restoreLocked(o: RestoreOptions, target: string, backup: string): Resto
     for (const f of [paths.db, `${paths.db}-wal`, `${paths.db}-shm`])
       if (fs.existsSync(f)) fs.chmodSync(f, 0o600);
     // Power-loss order: every file, then every folder (deepest first), then — in swap() — the id file and journal.
-    syncTree(staging);
+    try {
+      syncTree(staging);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code) throw new RestoreError("not_durable");
+      throw e;
+    }
   } catch (e) {
     fs.rmSync(staging, { recursive: true, force: true });
     throw e;
@@ -571,19 +653,38 @@ function swap(
   const rename = hooks?.rename ?? fs.renameSync;
   const rm = hooks?.rm ?? ((p: string) => fs.rmSync(p, { recursive: true, force: true }));
   const journal = restoreJournalPath(s.target);
-  const candidate = { id: crypto.randomBytes(16).toString("hex"), files: manifestOf(s.staging) };
-  writeDurable(path.join(s.staging, CANDIDATE_ID_FILE), candidate.id);
+  let candidate: Journal["candidate"];
   let old: Journal["old"] = null;
-  if (s.previous) {
-    old = { id: crypto.randomBytes(16).toString("hex"), dbSha256: dbSha(s.target) };
-    writeDurable(path.join(s.target, OLD_ID_FILE), old.id);
+  try {
+    candidate = { id: crypto.randomBytes(16).toString("hex"), files: manifestOf(s.staging) };
+    writeDurable(path.join(s.staging, CANDIDATE_ID_FILE), candidate.id);
+    if (s.previous) {
+      old = {
+        id: crypto.randomBytes(16).toString("hex"),
+        dbSha256: dbSha(s.target),
+        sidecars: sidecarStates(s.target),
+      };
+      writeDurable(path.join(s.target, OLD_ID_FILE), old.id);
+    }
+  } catch (e) {
+    // Nothing journaled or moved yet: drop the candidate, leave the old folder as it was.
+    fs.rmSync(s.staging, { recursive: true, force: true });
+    dropIdFiles(s.target);
+    throw (e as NodeJS.ErrnoException).code ? new RestoreError("not_durable") : e;
   }
   const j: Omit<Journal, "phase"> = { ...s, old, candidate };
   const phase = (p: Phase) => {
     writeDurable(journal, JSON.stringify({ ...j, phase: p } satisfies Journal));
     hooks?.step?.(p);
   };
-  phase("prepared");
+  try {
+    phase("prepared");
+  } catch (e) {
+    fs.rmSync(journal, { force: true });
+    fs.rmSync(s.staging, { recursive: true, force: true });
+    dropIdFiles(s.target);
+    throw (e as NodeJS.ErrnoException).code ? new RestoreError("not_durable") : e;
+  }
   try {
     if (s.previous) {
       rename(s.target, s.previous);

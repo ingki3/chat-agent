@@ -428,7 +428,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
           )
         : undefined;
     app.decorate("backups", backups);
-    registerBackupRoutes(app, backups);
+    registerBackupRoutes(app, backups, config.dataDir);
     if (backups && (config.env !== "test" || opts.backup?.schedule))
       app.addHook("onReady", async () => backups.start());
     // Before the database closes (index.ts closes it in onClose): a backup in progress finishes first.
