@@ -1476,6 +1476,53 @@ describe(
       expect(fs.existsSync(moved)).toBe(true);
     });
 
+    // Round 6: the undo proves the old folder before moving it back (and again before the journal goes).
+    for (const change of ["db", "id", "sidecar"] as const)
+      it(`EIO after the second rename and the old folder's ${change} changed: nothing moved back, journal kept`, async () => {
+        const t = await prepared();
+        const hooks = afterSwapFault("parent_fsync");
+        const rename = hooks.rename;
+        let n = 0;
+        let old = "";
+        hooks.rename = (from, to) => {
+          rename(from, to);
+          if (++n !== 2) return;
+          old = path.join(t.root, asides(t.root)[0]!);
+          if (change === "db") fs.truncateSync(path.join(old, DB_FILE), 0);
+          else if (change === "id") fs.writeFileSync(path.join(old, OLD_ID_FILE), "someone-else");
+          else fs.writeFileSync(path.join(old, `${DB_FILE}-wal`), "a WAL that was not there");
+        };
+        expect(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key, hooks })).toThrow(
+          "EIO",
+        );
+        // The unproven old folder stays where it is; the candidate stays at the target; journal and ids kept.
+        expect(fs.existsSync(old)).toBe(true);
+        expect(fs.existsSync(path.join(t.dataDir, CANDIDATE_ID_FILE))).toBe(true);
+        expect(fs.existsSync(path.join(old, OLD_ID_FILE))).toBe(true);
+        const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { phase: string };
+        expect(j.phase).toBe("rolling_back");
+        expect(rejectedOf(t.root)).toEqual([]);
+        // The next start will not guess.
+        expect(() => startServer(t)).toThrow(/restore_unresolved/);
+        expect(fs.existsSync(old)).toBe(true);
+      });
+
+    it("the old folder changes right after it is moved back: the journal is not removed", async () => {
+      const t = await prepared();
+      const hooks = afterSwapFault("parent_fsync");
+      const rename = hooks.rename;
+      let n = 0;
+      hooks.rename = (from, to) => {
+        rename(from, to);
+        // Renames: old aside, candidate in, candidate aside (undo), old back (undo) — then the folder changes.
+        if (++n === 4) fs.truncateSync(path.join(t.dataDir, DB_FILE), 0);
+      };
+      expect(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key, hooks })).toThrow("EIO");
+      expect(n).toBe(4);
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+      expect(() => startServer(t)).toThrow(/restore_unresolved/);
+    });
+
     it("an error after done is durable: the restore stands (the journal says done)", async () => {
       const t = await prepared();
       let armed = false;

@@ -733,15 +733,27 @@ function undoSwap(
   } catch {
     // best effort: the journal still names both folders, and recovery proves which is which
   }
+  // The same proofs as recovery: the old folder only when its id, database and sidecars match the journal.
+  const proof: Journal = { ...j, phase: "rolling_back" };
+  const isOurCandidate = (dir: string) => exists(dir) && readId(dir, CANDIDATE_ID_FILE) === candidateId;
+  const aside = () => `${s.target}.restore-rejected-${crypto.randomBytes(3).toString("hex")}`;
   try {
     const parent = path.dirname(s.target);
-    // The candidate already at the target (our id file): moved aside, never deleted.
-    if (exists(s.target) && readId(s.target, CANDIDATE_ID_FILE) === candidateId)
-      rename(s.target, `${s.target}.restore-rejected-${crypto.randomBytes(3).toString("hex")}`);
-    if (!exists(s.target) && s.previous && exists(s.previous)) rename(s.previous, s.target);
+    if (s.previous) {
+      if (!isOld(s.target, proof)) {
+        // Nothing further moves unless the folder going back is provably the old one (and the target is free or
+        // holds our candidate): otherwise the journal and both ids stay for `restore_unresolved`.
+        if (!isOld(s.previous, proof)) return;
+        if (exists(s.target)) {
+          if (!isOurCandidate(s.target)) return;
+          rename(s.target, aside());
+        }
+        rename(s.previous, s.target);
+      }
+    } else if (isOurCandidate(s.target)) rename(s.target, aside());
     fsyncPath(parent);
-    // Done only when the folders are where the journal ends: the old one (or none) at the target.
-    const back = s.previous ? exists(s.target) && !exists(s.previous) : !exists(s.target);
+    // Done only when the folders are where the journal ends — checked again before the journal goes.
+    const back = s.previous ? isOld(s.target, proof) && !exists(s.previous) : !exists(s.target);
     if (!back) return;
     rm(s.staging);
     fsyncPath(parent);

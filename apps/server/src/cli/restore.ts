@@ -122,7 +122,7 @@ try {
   if (typeof (e as NodeJS.ErrnoException).code === "string" && !(e instanceof RecoveryError)) {
     // A file-system error during the swap: undone in place, or left to the journal for the next start.
     console.error(
-      `restore failed: ${(e as NodeJS.ErrnoException).code} — 교체 중 디스크 오류. 기존 데이터로 되돌렸거나, 다음 시작이 일지로 되돌려요(ops.md 21.4절).`,
+      `restore failed: ${(e as NodeJS.ErrnoException).code} — 교체 중 디스크 오류. 기존 데이터로 되돌렸어요 — 되돌리지 못했으면 일지가 남아 다음 시작(서버·db:migrate·restore)이 일지로 판단해요: 증명된 쪽에 따라 되돌리거나(옛 데이터) 복원을 마무리하고(새 데이터), 어느 쪽도 증명 못 하면 restore_unresolved로 멈춰요(ops.md 21.4절).`,
     );
     process.exit(1);
   }
