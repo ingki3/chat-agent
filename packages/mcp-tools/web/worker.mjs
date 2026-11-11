@@ -220,7 +220,7 @@ async function hop(url, o) {
 /**
  * GET with redirects followed by hand: every hop is checked again and goes through a new CONNECT (the proxy
  * re-resolves and re-checks the address).
- * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string> }} o
+ * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string }} o
  */
 export async function get(input, o) {
   const limits = { ...LIMITS, ...o.limits };
@@ -234,6 +234,9 @@ export async function get(input, o) {
   }
   for (let n = 0; n <= limits.maxRedirects; n++) {
     if (Date.now() >= deadline) throw new WebError("web_timeout");
+    // Raw jobs (finance, #30) send a contact header and session cookies: TLS on every hop, the first one and each
+    // redirect (`http://allowed-host:443/` would otherwise pass the proxy's host and port check in clear text).
+    if (o.httpsOnly && url.protocol !== "https:") throw new WebError("web_blocked");
     const r = await hop(url, {
       proxy,
       deadline,
@@ -546,6 +549,30 @@ const STEP_HEADERS = new Set(["user-agent", "accept"]);
 /** A captured value (Yahoo's crumb) as it may go into a later URL. */
 const CAPTURE = /^[A-Za-z0-9._/~+-]{1,64}$/;
 export const RAW_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024, maxRedirects: 2 };
+/** Session values shorter than this are not scrubbed from bodies (they cannot be told apart from data). */
+export const MIN_HIDDEN = 4;
+
+/**
+ * A data body with every session value of this job (cookie values, captured crumbs) taken out — a server that
+ * reflects them (an echoing API, a profile text) must not hand them to the model. JSON is rewritten in its
+ * canonical form first, so an escaped spelling (`\u0041`, `\/`) cannot hide a value; the JSON-escaped and
+ * URL-encoded spellings are scrubbed too.
+ * @param {string} body @param {string[]} hidden
+ */
+export function scrubBody(body, hidden) {
+  const values = hidden.filter((v) => typeof v === "string" && v.length >= MIN_HIDDEN);
+  if (!values.length) return body;
+  let text = body;
+  try {
+    text = JSON.stringify(JSON.parse(body));
+  } catch {
+    // not JSON: the raw text
+  }
+  for (const v of values)
+    for (const form of new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)]))
+      text = text.split(form).join("[redacted]");
+  return text;
+}
 
 /**
  * Runs the steps in order with one cookie jar (cookies set by a response go with the later requests of this job
@@ -580,6 +607,7 @@ export async function fetchRaw(job, o) {
     const r = await get(url, {
       ...o,
       headers,
+      httpsOnly: true,
       limits: { maxBytes: RAW_LIMITS.maxBytes, maxRedirects: RAW_LIMITS.maxRedirects },
     });
     const set = r.headers["set-cookie"];
@@ -597,7 +625,11 @@ export async function fetchRaw(job, o) {
       vars.set(step.capture, v);
       continue;
     }
-    responses.push({ status: r.status, contentType: ct.split(";")[0].trim(), body });
+    responses.push({
+      status: r.status,
+      contentType: ct.split(";")[0].trim(),
+      body: scrubBody(body, [...jar.values(), ...vars.values()]),
+    });
   }
   return { responses };
 }

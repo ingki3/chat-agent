@@ -1,0 +1,44 @@
+{
+  "tool": "kr_index",
+  "input": {
+    "index": "KOSPI"
+  },
+  "now": "2026-11-12T16:30:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5 — the source marks the close (marketStatus CLOSE) on a value stamped before 15:30.",
+  "exchanges": [
+    {
+      "url": "https://m.stock.naver.com/api/index/KOSPI/basic",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "stockEndType": "index",
+        "itemCode": "KOSPI",
+        "reutersCode": "KOSPI",
+        "stockName": "코스피",
+        "closePrice": "5,375.36",
+        "compareToPreviousClosePrice": "136.23",
+        "compareToPreviousPrice": {
+          "code": "2",
+          "text": "상승",
+          "name": "RISING"
+        },
+        "fluctuationsRatio": "2.60",
+        "marketStatus": "CLOSE",
+        "localTradedAt": "2026-11-12T15:29:59+09:00",
+        "stockExchangeType": {
+          "code": "KS",
+          "zoneId": "Asia/Seoul",
+          "nationType": "KOR",
+          "delayTime": 0,
+          "startTime": "0900",
+          "endTime": "1530",
+          "nameKor": "코스피",
+          "nameEng": "KOSPI",
+          "name": "KOSPI"
+        },
+        "symbolCode": "KOSPI"
+      }
+    }
+  ]
+}

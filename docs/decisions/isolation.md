@@ -284,6 +284,8 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **스킬을 직접 돌리지 않는 이유:** `us-stock-skill`은 스킬 venv(yfinance·curl_cffi·pandas)가 있어야 하고, 두 공시 스킬은 로컬 SQLite에 쓰고 LLM 워커·Telegram을 부르는 상태 있는 모니터다. #21 실행기(독립 실행형 python `-I -S`, 표준 라이브러리, 고정 사본, fork 금지)로는 돌릴 수 없다. 그래서 스킬이 읽는 **같은 데이터 원천**(네이버 증권, Yahoo Finance, OpenDART, SEC EDGAR)을 서버 함수로 읽는다(`docs/skills.md`의 "자식 프로세스·venv가 필요하면 서버 함수로" 원칙). 사용자별 허용은 원래 스킬 이름으로 한다(도구마다 `skill`).
 - **실행 위치:** 웹 도구의 **샌드박스 node 작업자**(`web/worker.mjs`)에 `raw` 작업을 더했다. 서버가 검증한 입력으로 **정확한 URL**을 만들고(`providers.ts`의 `plan`), 작업자는 GET만 하고 본문 글자를 돌려준다. 해석(JSON, 숫자, 시각)은 서버의 순수 함수(`parse`)가 한다 — 녹화·합성 응답으로 스냅샷 시험을 하기 위해서다. JSON 해석뿐이고 남의 HTML을 해석하지 않는다.
   - 한 작업은 최대 4단계, 단계마다 3MB, 리다이렉트 2번. 작업 안에서만 쿠키 상자를 쓰고(Yahoo 세션 쿠키), `capture` 단계(Yahoo crumb)는 뒤 URL의 `{crumb}`에만 들어간다. 쿠키·crumb는 작업자 밖으로 나오지 않는다(시험).
+  - **반사된 세션 값(리뷰 #93 1차):** 응답 본문이 쿠키 값이나 crumb를 되돌려 주면(그대로, JSON 이스케이프, `\uXXXX`, URL 인코딩) 작업자가 돌려주기 전에 `[redacted]`로 바꾼다. JSON은 먼저 정규형으로 다시 써서 이스케이프로 숨길 수 없다(`scrubBody`). 4자 미만 값은 데이터와 구별할 수 없어 지우지 않는다.
+  - **매 홉 HTTPS(리뷰 #93 1차):** `raw` 작업은 첫 요청과 모든 리다이렉트가 `https:`여야 한다(`httpsOnly`). `http://허용호스트:443/`로의 리다이렉트는 프록시의 호스트·포트 검사를 통과하므로, 작업자가 보내기 전에 `web_blocked`로 거부한다(SEC 연락처 헤더·쿠키가 평문으로 나가지 않음). 일반 `web_fetch`는 그대로 http도 받는다.
   - 요청 헤더는 고정값 + 단계가 정한 `user-agent`·`accept`만(SEC는 `SEC_USER_AGENT`).
 - **도구별 송신 프록시(정확한 호스트 허용 목록, 443만):** 도구마다 `EgressService({ allow: tool.hosts })`를 따로 연다(`finance:<도구>` 키). 다른 도구의 호스트에도 닿지 못한다.
 
@@ -299,9 +301,10 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
   - 확인한 곳: 2026-11-11 이 Mac에서 각 엔드포인트를 한 번씩 호출해 응답 모양을 봤다(키가 필요한 OpenDART 제외). 기록은 저장소에 넣지 않았다. 합성 fixture는 그 모양을 따른다.
   - 서버도 실행 전에 계획의 모든 URL이 그 도구 호스트의 https 기본 포트인지 확인한다(`allowed`, 이중 방어 — 하위 도메인·접미 일치 거부).
   - 시험: 도구마다 프록시 허용 목록이 정확히 `tool.hosts`인지, 그 프록시가 `query2.finance.yahoo.com`·`finance.yahoo.com`·`…yahoo.com.evil.test`·다른 도구의 호스트·80 포트·IP 리터럴을 403으로 막는지(`finance.test.ts` "finance egress").
-- **비밀:** `OPENDART_API_KEY`(DART URL의 `crtfc_key`), `SEC_USER_AGENT`(SEC 연락처 헤더). 작업 JSON(stdin)으로만 작업자에 간다. 작업자는 URL을 돌려주지 않고, 결과는 비밀 값으로 한 번 더 지운다(`redactValue`). 없으면 그 도구만 `finance_unconfigured`.
+- **비밀:** `OPENDART_API_KEY`(DART URL의 `crtfc_key`), `SEC_USER_AGENT`(SEC 연락처 헤더). 작업 JSON(stdin)으로만 작업자에 간다. 작업자는 URL을 돌려주지 않고, 결과는 설정된 비밀 값으로 길이와 상관없이 한 번 더 지운다(`redactValue` — `SEC_USER_AGENT`는 5자도 된다). 없으면 그 도구만 `finance_unconfigured`.
 - **남의 글:** 공시 제목·회사 이름·회사 소개는 `<external_content>` 블록에 넣는다(닫는 태그 흉내는 무력화 — 시험). 항목 목록에는 번호·코드·날짜·링크만 있다.
 - **로그:** 호출마다 `finance.finished`(도구, `ok`/`error`, `financeCode`, 소요 시간, ID). 종목·URL·숫자는 남지 않는다.
+- **리뷰 #93 1차 뒤 변이 시험(2026-11-11):** 20개를 하나씩 넣어 모두 시험이 잡았다 — 반사 값 지우기 제거·JSON 정규화 제거·crumb 빼고 지우기·짧은 비밀 건너뛰기(8자 이상만), raw 홉 https 강제 제거·첫 홉만 검사, 장이 닫히면 무조건 종가·장 밖 장중 값의 지연 표시 제거·원천 종가 표시 무시·네이버/Yahoo 종가 표시 전달 제거, 답변 전체를 한 맥락으로·값의 출처 대신 아무 출처·장중 시각 검사 제거·다른 문단 머리말 인정, 후속 맥락을 바로 앞 답변만·창 없이 전체 대화, 복구 경로 메모 제거, 식별자 제외 제거·결과의 코드·이름 제외 제거.
 - **변이 시험(2026-11-11):** 22개 변이를 하나씩 넣어 모두 시험이 잡았다 — 기록 검사 끔·시간대 없는 asOf 허용·tool_meta 표시 제거, 답변의 출처·기준 시각 검사 끔, 면책 비움·실행 관리자 첨부 제거·후속 답변 검사 제거, 아들 숨김 제거·사용자별 도구 거름 제거·호출 시 재확인 제거, 모든 금융 도구가 프록시 하나를 공유·계획 호스트 검사 제거·접미 일치 허용·호스트 목록 확장·호스트 목록 틀림, KRX 성탄절 누락·미국 조기 폐장 누락·주말을 거래일로·휴장 중 값에 원래 시각·오늘이면 무조건 장중.
 
 ## 아티팩트 서빙 (#27)

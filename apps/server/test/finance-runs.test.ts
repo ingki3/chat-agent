@@ -20,6 +20,7 @@ import { RuntimeRegistry, type RuntimeAdapter } from "../src/runtime/adapter.js"
 import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { FakeRuntime, type FakeScript, defaultScript } from "../src/runtime/fake.js";
+import { RunManager } from "../src/runtime/runs.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { loadFixtures, replayWorker } from "./helpers/finance-replay.js";
@@ -49,8 +50,9 @@ const exchanges = loadFixtures()
   .flatMap((f) => f.fixture.exchanges);
 
 async function start(runtimes: RuntimeRegistry) {
+  const db = createTestDb();
   const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
-    db: createTestDb(),
+    db,
     logger: false,
     runtimes,
     runs: { flushMs: 0 },
@@ -82,7 +84,7 @@ async function start(runtimes: RuntimeRegistry) {
     const run = (res.json() as { run: Run }).run;
     return waitRun(app, run.id);
   };
-  return { app, f, send };
+  return { app, db, f, send };
 }
 
 async function waitRun(app: App, id: string) {
@@ -149,6 +151,56 @@ describe("finance output check under the run manager (#30)", () => {
     });
     const plain = app.conversations!.create(f.users.owner.id);
     expect((await send(f.cookies.owner, plain.id, "안녕 반가워 2번")).note).toBeUndefined();
+  });
+
+  it("an answer without figures in between does not end the finance context (four turns)", async () => {
+    const { app, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    expect((await send(f.cookies.owner, c.id, "/finance")).note).toBeDefined();
+    // An explanation without figures: nothing to check, no note.
+    expect((await send(f.cookies.owner, c.id, "종가라는 뜻이야?")).note).toBeUndefined();
+    // The figures come back two answers later: still checked, with the earlier results' sources.
+    const later = await send(f.cookies.owner, c.id, "두 주 가격은 349.80달러와 206,000원");
+    expect(later.note).toMatchObject({
+      sources: [
+        expect.objectContaining({ source: "Yahoo Finance" }),
+        expect.objectContaining({ source: "네이버 증권" }),
+      ],
+      missing: ["source", "as_of"],
+      disclaimer: FINANCE_DISCLAIMER,
+    });
+  });
+
+  it("a partial finance answer recovered after a restart gets the note", async () => {
+    const hang: FakeScript = (input, memory) => [
+      ...defaultScript({ ...input, text: "/finance" }, memory),
+      { delayMs: 60_000 },
+    ];
+    const { app, db, f } = await start(fake(hang));
+    const c = app.conversations!.create(f.users.owner.id);
+    const r = app.runs!.begin({
+      conversationId: c.id,
+      userId: f.users.owner.id,
+      prepare: () => ({
+        user: app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "x" }] }),
+        assistant: app.conversations!.append(c.id, { role: "assistant", parts: [], status: "pending" }),
+      }),
+    });
+    for (let i = 0; i < 300; i++) {
+      const parts = app.conversations!.messageById(r.assistant.id)!.parts as MessagePart[];
+      if (parts.some((p) => p.type === "text" && p.text.includes("206,000"))) break;
+      await new Promise((res) => setTimeout(res, 10));
+    }
+    // The process dies mid-run: a new manager over the same database recovers it.
+    const manager = new RunManager(db, app.conversations!, new RuntimeRegistry(), app.appEvents);
+    expect(manager.recover()).toBe(1);
+    const row = manager.get(r.run.id)!;
+    expect(row).toMatchObject({ status: "failed", errorCode: "server_restart" });
+    const parts = app.conversations!.messageById(r.assistant.id)!.parts as MessagePart[];
+    const note = parts.find((p): p is FinanceNotePart => p.type === "finance_note");
+    expect(note).toMatchObject({ missing: ["source", "as_of"], disclaimer: FINANCE_DISCLAIMER });
+    expect(note!.sources).toHaveLength(2);
+    expect(manager.eventsAfter(r.run.id, -1).map((e) => e.data.type)).toContain("part_update");
   });
 
   it("scheduled runs (purpose schedule) go through the same check", async () => {

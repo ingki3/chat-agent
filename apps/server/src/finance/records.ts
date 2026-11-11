@@ -58,12 +58,15 @@ export function rowMeta(stamp: Stamp): Omit<Stamp, "tradingDay" | "stale"> {
 }
 
 /**
- * The stamp of a value observed at `t` (ms) on a market, asked at `now`:
- * - 장중 (`intraday`, asOf = `t`) only while the market is open and `t` is from today's session;
- * - otherwise 종가 (`close`) of the trading day `t` belongs to, stamped with that session's close time — on a
- *   weekend or holiday that is the latest trading day (a Saturday request shows Friday's close).
- * `delayMinutes` undefined = the source does not say: an intraday value is then marked delayed (the free feeds
- * may lag). A close is final, never delayed. FX trades around the clock: its value keeps its own time.
+ * The stamp of a value observed at `t` (ms) on a market, asked at `now`. Two questions, decided separately:
+ * - **Is it the close?** Only when the source marks it so (`closed`) or `t` is at or after that session's close.
+ *   Then it is 종가 (`close`) of the trading day `t` belongs to, stamped with the session's close time — on a
+ *   weekend or holiday that is the latest trading day (a Saturday request shows Friday's close). A close is final,
+ *   never delayed; `stale` when that day is before the latest trading day.
+ * - Otherwise it is a **장중 value with its own time**, never relabelled: delayed when the source says so (or does
+ *   not say), and — once the session is over or the value is not from today's open session — `delayed` and
+ *   `stale`: the close is not known yet (a 15:40 US value fetched at 16:01 stays "15:40 장중 (지연)").
+ * FX trades around the clock: its value keeps its own time; it is the close only while the FX market is shut.
  */
 export function marketStamp(o: {
   market: Market;
@@ -71,6 +74,8 @@ export function marketStamp(o: {
   now: number;
   source: string;
   delayMinutes?: number | undefined;
+  /** The source says this value is the session's close (Naver `marketStatus: CLOSE`, Yahoo `marketState: POST`). */
+  closed?: boolean | undefined;
   /** Time zone the asOf is written in (FX default: New York, whose 17:00 ends the FX day). */
   timeZone?: string;
 }): Stamp {
@@ -79,38 +84,44 @@ export function marketStamp(o: {
     const timeZone = o.timeZone ?? FX_TIME_ZONE;
     if (o.t === undefined || !Number.isFinite(o.t))
       return { source: o.source, asOf: null, timeZone, delayed: false, kind: "close" };
-    const live = isOpen("FX", o.now) && o.now - o.t < 2 * 3600_000;
+    const asOf = isoLocal(o.t, timeZone);
+    if (!isOpen("FX", o.now)) return { source: o.source, asOf, timeZone, delayed: false, kind: "close" };
+    const fresh = o.now - o.t < 2 * 3600_000;
     return {
       source: o.source,
-      asOf: isoLocal(o.t, timeZone),
+      asOf,
       timeZone,
-      delayed: live && intradayDelay,
-      kind: live ? "intraday" : "close",
+      delayed: fresh ? intradayDelay : true,
+      kind: "intraday",
+      ...(fresh ? {} : { stale: true }),
     };
   }
   const { timeZone } = SESSIONS[o.market];
   if (o.t === undefined || !Number.isFinite(o.t))
     return { source: o.source, asOf: null, timeZone, delayed: false, kind: "close" };
   const day = sessionDayOf(o.market, o.t);
-  const today = localDate(o.now, timeZone);
-  const stale = day < latestTradingDay(o.market, o.now);
-  if (isOpen(o.market, o.now) && day === today && o.t < closeInstant(o.market, day))
+  const closeAt = closeInstant(o.market, day);
+  if (o.closed === true || o.t >= closeAt) {
+    const stale = day < latestTradingDay(o.market, o.now);
     return {
       source: o.source,
-      asOf: isoLocal(o.t, timeZone),
+      asOf: isoLocal(closeAt, timeZone),
       timeZone,
-      delayed: intradayDelay,
-      kind: "intraday",
+      delayed: false,
+      kind: "close",
       tradingDay: day,
+      ...(stale ? { stale } : {}),
     };
+  }
+  const live = isOpen(o.market, o.now) && day === localDate(o.now, timeZone);
   return {
     source: o.source,
-    asOf: isoLocal(closeInstant(o.market, day), timeZone),
+    asOf: isoLocal(o.t, timeZone),
     timeZone,
-    delayed: false,
-    kind: "close",
+    delayed: live ? intradayDelay : true,
+    kind: "intraday",
     tradingDay: day,
-    ...(stale ? { stale } : {}),
+    ...(live ? {} : { stale: true }),
   };
 }
 

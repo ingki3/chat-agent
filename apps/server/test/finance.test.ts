@@ -1,4 +1,8 @@
+import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import net from "node:net";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +20,14 @@ import {
   sessionDayOf,
   CALENDAR_YEARS,
 } from "../src/finance/calendar.js";
-import { checkAnswer, financeEvidence, financeNote } from "../src/finance/checker.js";
+import {
+  checkAnswer,
+  FINANCE_CONTEXT_MESSAGES,
+  financeContext,
+  financeEvidence,
+  figuresOf,
+  financeNote,
+} from "../src/finance/checker.js";
 import { checkRecords, finalize, marketStamp } from "../src/finance/records.js";
 import { allowed, FINANCE_CODES, FinanceService } from "../src/finance/service.js";
 import { TOOL_IMPLS } from "../src/finance/providers.js";
@@ -37,6 +48,10 @@ afterEach(async () => {
 });
 
 const T = (iso: string) => Date.parse(iso);
+const TLS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/tls");
+/** Self-signed, test-only certificate for `public.test` (web-fixture.ts). */
+const TEST_CA = fs.readFileSync(path.join(TLS_DIR, "test-only.crt"), "utf8");
+const TEST_KEY = fs.readFileSync(path.join(TLS_DIR, "test-only.key"), "utf8");
 const SECRETS = {
   OPENDART_API_KEY: "test-dart-key-0123456789",
   SEC_USER_AGENT: "AgentLee test admin@example.com",
@@ -136,6 +151,57 @@ describe("value stamps (#30)", () => {
       source: "네이버 증권",
     });
     expect(old).toMatchObject({ kind: "close", asOf: "2026-11-11T15:30:00+09:00", stale: true });
+  });
+
+  it("a value from before the close is never relabelled as the close (review #93 round 1)", () => {
+    const at = (t: string, now: string, closed?: boolean) =>
+      marketStamp({
+        market: "US",
+        t: T(t),
+        now: T(now),
+        source: "Yahoo Finance",
+        ...(closed ? { closed } : {}),
+      });
+    // 15:40 seen at 16:01: still the 15:40 value, delayed and stale — the close is not known yet.
+    expect(at("2026-11-13T15:40:00-05:00", "2026-11-13T16:01:00-05:00")).toMatchObject({
+      kind: "intraday",
+      asOf: "2026-11-13T15:40:00-05:00",
+      delayed: true,
+      stale: true,
+    });
+    // On Saturday a Friday 15:59 value is not Friday's close either.
+    expect(at("2026-11-13T15:59:00-05:00", "2026-11-14T10:00:00+09:00")).toMatchObject({
+      kind: "intraday",
+      asOf: "2026-11-13T15:59:00-05:00",
+      stale: true,
+    });
+    // The source says it is the close, or the time is at/after the close: 종가.
+    expect(at("2026-11-13T15:59:59-05:00", "2026-11-14T10:00:00+09:00", true)).toMatchObject({
+      kind: "close",
+      asOf: "2026-11-13T16:00:00-05:00",
+      delayed: false,
+    });
+    expect(at("2026-11-13T16:00:00-05:00", "2026-11-13T16:01:00-05:00")).toMatchObject({ kind: "close" });
+    expect(at("2026-11-13T16:00:00-05:00", "2026-11-13T16:01:00-05:00")).not.toHaveProperty("stale");
+    // A real-time source (no delay) is still "delayed" once its value is behind the session's end.
+    expect(
+      marketStamp({
+        market: "KRX",
+        t: T("2026-11-12T15:20:00+09:00"),
+        now: T("2026-11-12T16:00:00+09:00"),
+        source: "네이버 증권",
+        delayMinutes: 0,
+      }),
+    ).toMatchObject({ kind: "intraday", asOf: "2026-11-12T15:20:00+09:00", delayed: true, stale: true });
+    // FX: on a weekday an old tick stays intraday and stale; on the weekend the last tick is the close.
+    expect(
+      marketStamp({
+        market: "FX",
+        t: T("2026-11-12T08:00:00-05:00"),
+        now: T("2026-11-12T12:00:00-05:00"),
+        source: "Yahoo Finance",
+      }),
+    ).toMatchObject({ kind: "intraday", delayed: true, stale: true });
   });
 
   it("flags every record whose stamp is incomplete and lists the complete ones once", () => {
@@ -297,6 +363,24 @@ describe("finance tools replay their recorded answers (#30)", () => {
     expect(allowed("https://m.stock.naver.com/api/stock/005930/basic", ["m.stock.naver.com"])).toBe(true);
   });
 
+  it("every configured secret is scrubbed from a result, however short (SEC_USER_AGENT may be 5 characters)", async () => {
+    const f = fixtures.find((x) => x.name === "sec_form4")!.fixture;
+    const ua = "ab cd";
+    const echoed = f.exchanges.map((e) => ({
+      ...e,
+      body: { ...(e.body as Record<string, unknown>), name: `Apple Inc. (asked by ${ua})` },
+    }));
+    const r = replayWorker(echoed);
+    const svc = new FinanceService(r.worker, async () => PROXY, {
+      secrets: { SEC_USER_AGENT: ua },
+      now: () => T(f.now),
+    });
+    const out = await svc.run(toolOf("sec_form4"), f.input);
+    expect(out.ok).toBe(true);
+    expect(JSON.stringify(out)).not.toContain(ua);
+    expect(JSON.stringify(out)).toContain("[redacted]");
+  });
+
   it("stored URLs never carry the session crumb or the OpenDART key", () => {
     expect(storedUrl("https://x/y?a=1&crumb=AbC.d/9&b=2")).toBe("https://x/y?a=1&crumb={crumb}&b=2");
     expect(storedUrl("https://x/list.json?crtfc_key=SECRET&b=2")).toBe(
@@ -393,9 +477,9 @@ describe("finance egress (#30)", () => {
       expect(await connect(t), t).toBe(403);
   });
 
-  it("the worker's raw job: cookies and the crumb stay inside, only data steps come back", async () => {
+  it("the worker's raw job: cookies and the crumb stay inside, reflected ones are scrubbed, TLS on every hop", async () => {
     const seen: string[] = [];
-    const site = http.createServer((req, res) => {
+    const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       seen.push(`${req.url} cookie=${req.headers.cookie ?? ""}`);
       if (req.url === "/cookie")
         return res.writeHead(404, { "set-cookie": "A3=s3ss10n; Path=/" }).end("nope");
@@ -404,50 +488,78 @@ describe("finance egress (#30)", () => {
           ? res.writeHead(200, { "content-type": "text/plain" }).end("cRuMb.42/x")
           : res.writeHead(401).end();
       if (req.url === "/data?crumb=cRuMb.42%2Fx")
-        return res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end('{"ok":1}');
+        // A server that reflects the session: plain, JSON-escaped, unicode-escaped and URL-encoded.
+        return res
+          .writeHead(200, { "content-type": "application/json; charset=utf-8" })
+          .end(
+            '{"ok":1,"a":"cRuMb.42/x","b":"cRuMb.42\\/x","c":"\\u0073\\u0033ss10n","d":"cRuMb.42%2Fx","price":206000}',
+          );
+      if (req.url === "/downgrade")
+        return res.writeHead(302, { location: "http://public.test:443/ua" }).end();
       res.writeHead(400).end();
-    });
-    await new Promise<void>((r) => site.listen(0, "127.0.0.1", () => r()));
-    closers.push(() => new Promise((r) => site.close(r)));
-    const sitePort = (site.address() as AddressInfo).port;
+    };
+    const tlsSite = https.createServer({ key: TEST_KEY, cert: TEST_CA }, handler);
+    const plain = http.createServer(handler);
+    for (const srv of [tlsSite, plain]) {
+      await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+      closers.push(() => new Promise((r) => srv.close(r)));
+    }
+    const tlsPort = (tlsSite.address() as AddressInfo).port;
+    const plainPort = (plain.address() as AddressInfo).port;
     const proxy = await startEgressProxy({
-      allow: ["fin.test"],
-      ports: [80],
+      allow: ["public.test"],
+      ports: [80, 443],
       lookup: async () => ["93.184.216.34"],
-      connect: () => net.connect(sitePort, "127.0.0.1"),
+      connect: (_ip, p) => net.connect(p === 443 ? tlsPort : plainPort, "127.0.0.1"),
     });
     closers.push(() => proxy.close());
+    const o = { proxy: proxy.url, ca: TEST_CA };
     const r = (await runWorker(
       {
         op: "raw",
         steps: [
-          { url: "http://fin.test/cookie", mode: "cookie" },
-          { url: "http://fin.test/crumb", mode: "capture", capture: "crumb" },
-          { url: "http://fin.test/data?crumb={crumb}" },
+          { url: "https://public.test/cookie", mode: "cookie" },
+          { url: "https://public.test/crumb", mode: "capture", capture: "crumb" },
+          { url: "https://public.test/data?crumb={crumb}" },
         ],
       },
-      { proxy: proxy.url },
-    )) as { ok: boolean; responses: unknown[] };
+      o,
+    )) as { ok: boolean; responses: { body: string }[] };
     expect(r).toEqual({
       ok: true,
-      responses: [{ status: 200, contentType: "application/json", body: '{"ok":1}' }],
+      responses: [
+        {
+          status: 200,
+          contentType: "application/json",
+          body: '{"ok":1,"a":"[redacted]","b":"[redacted]","c":"[redacted]","d":"[redacted]","price":206000}',
+        },
+      ],
     });
-    expect(JSON.stringify(r)).not.toContain("s3ss10n");
+    expect(JSON.stringify(r)).not.toMatch(/s3ss10n|cRuMb/);
     expect(seen).toEqual([
       "/cookie cookie=",
       "/crumb cookie=A3=s3ss10n",
       "/data?crumb=cRuMb.42%2Fx cookie=A3=s3ss10n",
     ]);
+    // No plain http, neither asked for nor by a redirect to `http://allowed-host:443/` (the proxy would let that
+    // port through): refused before anything is sent.
+    seen.length = 0;
+    for (const steps of [
+      [{ url: "http://public.test/data", headers: { "user-agent": "AgentLee x@example.com" } }],
+      [{ url: "https://public.test/downgrade", headers: { "user-agent": "AgentLee x@example.com" } }],
+    ])
+      expect(await runWorker({ op: "raw", steps }, o)).toEqual({ ok: false, code: "web_blocked" });
+    expect(seen).toEqual(["/downgrade cookie="]);
     // Off the allow-list: refused by the proxy.
-    expect(
-      await runWorker({ op: "raw", steps: [{ url: "http://other.test/x" }] }, { proxy: proxy.url }),
-    ).toEqual({
+    expect(await runWorker({ op: "raw", steps: [{ url: "https://other.test/x" }] }, o)).toEqual({
       ok: false,
       code: "web_blocked",
     });
-    expect(await runWorker({ op: "raw", steps: [] }, { proxy: proxy.url })).toEqual({
+    expect(await runWorker({ op: "raw", steps: [] }, o)).toEqual({ ok: false, code: "web_bad_input" });
+    // General web fetch keeps plain http.
+    expect(await runWorker({ op: "fetch", url: "http://public.test/cookie" }, o)).toMatchObject({
       ok: false,
-      code: "web_bad_input",
+      code: "web_http_error",
     });
   });
 });
@@ -569,11 +681,18 @@ describe("who gets the finance tools (#30, FR-1.6)", () => {
 // ---- the answer check ---------------------------------------------------------------------------------------
 
 describe("finance output check (#30)", () => {
-  const meta = (source: string, asOf: string, timeZone: string) =>
-    ({ source, asOf, timeZone, delayed: false, kind: "close" }) as FinanceMeta;
+  const meta = (source: string, asOf: string, timeZone: string, kind = "close") =>
+    ({ source, asOf, timeZone, delayed: false, kind }) as FinanceMeta;
   const yahoo = meta("Yahoo Finance", "2026-11-13T16:00:00-05:00", "America/New_York");
   const naver = meta("네이버 증권", "2026-11-13T15:30:00+09:00", "Asia/Seoul");
+  const live = meta("네이버 증권", "2026-11-12T10:14:00+09:00", "Asia/Seoul", "intraday");
   const src = (m: FinanceMeta) => ({ ...m, label: financeLabel(m) });
+  const usOut = finalize("us_quote", { symbol: "AAPL", price: { value: 349.8, ...yahoo } });
+  const krOut = finalize("kr_quote", {
+    code: "005930",
+    name: "삼성전자",
+    price: { value: 206000, ...naver },
+  });
   const parts = (text: string, outputs: unknown[], name = "mcp__agentlee__us_quote"): MessagePart[] => [
     ...outputs.flatMap((output, i): MessagePart[] => [
       { type: "tool_call", id: `c${i}`, name, input: {} },
@@ -581,43 +700,100 @@ describe("finance output check (#30)", () => {
     ]),
     { type: "text", text },
   ];
+  const ev = (outputs: unknown[]) => financeEvidence(parts("", outputs));
+  const check = (text: string, outputs: unknown[] = [usOut, krOut]) => checkAnswer(text, ev(outputs));
 
   it("names a source and an as-of date — in any of the usual spellings", () => {
-    const s = [src(yahoo), src(naver)];
-    expect(checkAnswer("AAPL 348.51달러", s)).toEqual(["source", "as_of"]);
-    expect(checkAnswer("AAPL 348.51달러 (Yahoo Finance)", s)).toEqual(["as_of"]);
-    expect(checkAnswer("AAPL 348.51달러 (11월 13일 종가)", s)).toEqual(["source"]);
+    expect(check("AAPL 349.8달러")).toEqual(["source", "as_of"]);
+    expect(check("AAPL 349.8달러 (Yahoo Finance)")).toEqual(["as_of"]);
+    expect(check("AAPL 349.8달러 (11월 13일 종가)")).toEqual(["source"]);
     for (const ok of [
-      "야후 파이낸스 기준 2026-11-13 종가 348.51달러",
-      "Yahoo · 2026.11.13 종가 348.51",
+      "야후 파이낸스 기준 2026-11-13 종가 349.80달러",
+      "Yahoo · 2026.11.13 종가 349.8",
       "네이버 기준 11/13 종가 206,000원",
       "네이버 증권 2026년 11월 13일 206,000원",
     ])
-      expect(checkAnswer(ok, s), ok).toEqual([]);
+      expect(check(ok), ok).toEqual([]);
     // Another day is not the as-of date.
-    expect(checkAnswer("Yahoo 기준 11월 12일 348.51달러", s)).toEqual(["as_of"]);
-    expect(checkAnswer("Yahoo 기준 11/130 348.51달러", s)).toEqual(["as_of"]);
+    expect(check("Yahoo 기준 11월 12일 349.8달러")).toEqual(["as_of"]);
+    expect(check("Yahoo 기준 11/130 349.8달러")).toEqual(["as_of"]);
     // No figures, nothing to check.
-    expect(checkAnswer("조회하지 못했어요.", s)).toEqual([]);
+    expect(check("조회하지 못했어요.")).toEqual([]);
+  });
+
+  it("every figure needs its own source and as-of — one cited value does not cover the others", () => {
+    // Review #93 round 1: Yahoo and Naver numbers, only Yahoo cited.
+    expect(check("Yahoo 2026-11-13 기준 AAPL 349.8달러. 삼성전자 206,000원.")).toEqual(["source", "as_of"]);
+    // The other value's source with its date, but not the value's own: still missing.
+    expect(check("삼성전자 206,000원 (Yahoo Finance · 2026-11-13).")).toEqual(["source"]);
+    expect(check("Yahoo 기준 11월 13일 AAPL 349.8달러, 네이버 증권 기준 삼성전자 206,000원.")).toEqual([]);
+    // A header (or footnote) sentence without figures covers its paragraph — not the next one.
+    expect(check("Yahoo Finance · 2026-11-13 16:00 ET 종가 기준\n- AAPL 349.8달러\n- 합계 350달러")).toEqual(
+      [],
+    );
+    expect(check("AAPL 349.8달러\n(출처: Yahoo Finance, 11월 13일 종가)")).toEqual([]);
+    expect(check("Yahoo Finance · 2026-11-13 종가\n\n삼성전자 206,000원")).toEqual(["source", "as_of"]);
+  });
+
+  it("an intraday value needs its time with its zone", () => {
+    const out = finalize("kr_quote", { code: "005930", price: { value: 198100, ...live } });
+    expect(check("네이버 증권 11월 12일 198,100원", [out])).toEqual(["as_of"]);
+    expect(check("네이버 증권 11월 12일 10:14 198,100원", [out])).toEqual(["as_of"]);
+    expect(check("네이버 증권 11월 12일 10:14 KST 장중 198,100원", [out])).toEqual([]);
+  });
+
+  it("identifiers are not figures: forms, codes, tickers, index names, dates, ordinals", () => {
+    const disclosure = finalize("sec_8k", {
+      items: [
+        {
+          n: 1,
+          form: "8-K",
+          url: "x",
+          ...meta("SEC EDGAR", "2026-11-09T16:30:40-05:00", "America/New_York", "filing"),
+        },
+      ],
+    });
+    for (const t of [
+      "8-K 공시를 조회하지 못했어요.",
+      "Form 4와 13F-HR, 10-Q 공시는 없어요.",
+      "005930(삼성전자)과 KODEX 200, S&P 500 정보를 찾지 못했어요.",
+      "3분기 실적 발표는 2027년 1월 28일이에요.",
+      "두 번째 질문에 답하면, [1] 항목은 item 2.02예요.",
+    ])
+      expect(check(t, [disclosure, krOut]), t).toEqual([]);
+    expect(figuresOf("1. AAPL 349.8달러\n2. 삼성전자 206,000원").map((f) => f.n)).toEqual([349.8, 206000]);
+    // A result's own codes and names count as identifiers too.
+    expect(
+      checkAnswer(
+        "373220(LG에너지솔루션) 시세를 못 가져왔어요.",
+        ev([finalize("kr_quote", { code: "373220" })]),
+      ),
+    ).toEqual([]);
+    expect(
+      checkAnswer(
+        "KODEX 200(069500) 시세를 못 가져왔어요.",
+        ev([finalize("kr_etf", { code: "069500", name: "KODEX 200" })]),
+      ),
+    ).toEqual([]);
   });
 
   it("the note: sources of the run's finance results, what was missing, and always the disclaimer", () => {
-    const out = finalize("us_quote", { price: { value: 348.51, ...yahoo } });
-    const n = financeNote(parts("AAPL은 348.51달러예요.", [out]))!;
+    const n = financeNote(parts("AAPL은 349.8달러예요.", [usOut]))!;
     expect(n).toEqual({
       type: "finance_note",
       sources: [src(yahoo)],
       missing: ["source", "as_of"],
       disclaimer: FINANCE_DISCLAIMER,
     });
-    expect(financeNote(parts("Yahoo Finance · 2026-11-13 16:00 ET 종가 348.51달러", [out]))!.missing).toEqual(
-      [],
-    );
+    expect(
+      financeNote(parts("Yahoo Finance · 2026-11-13 16:00 ET 종가 349.8달러", [usOut]))!.missing,
+    ).toEqual([]);
     // A result without stamps (the kr-stock-skill fallback) or with flagged records: tool_meta.
     expect(
       financeNote(parts("206,000원", [{ value: 206000 }], "mcp__agentlee__skill_kr-stock-skill"))!.missing,
     ).toContain("tool_meta");
     const flagged = finalize("us_quote", { price: { value: 1, ...yahoo, asOf: null } });
+    // The flagged value has no stamp to cite: its figure is unsourced too.
     expect(financeNote(parts("Yahoo 2026-11-13 1달러", [flagged]))!.missing).toEqual([
       "source",
       "as_of",
@@ -627,12 +803,36 @@ describe("finance output check (#30)", () => {
     expect(financeEvidence(parts("x", [{ error: "finance_not_found" }])).sources).toEqual([]);
     expect(financeNote(parts("3 results", [{ results: [] }], "mcp__agentlee__web_search"))).toBeUndefined();
     // Nothing written: no note.
-    expect(financeNote(parts("", [out]))).toBeUndefined();
-    // A follow-up stating figures carries the sources of the answer before.
-    expect(financeNote([{ type: "text", text: "원화로 약 51만 원이에요." }], [src(yahoo)])).toMatchObject({
-      sources: [src(yahoo)],
+    expect(financeNote(parts("", [usOut]))).toBeUndefined();
+  });
+
+  it("follow-ups: finance results anywhere in the recent conversation keep it checked", () => {
+    const history = [
+      { role: "user", parts: [{ type: "text", text: "AAPL, 005930 현재가" }] },
+      { role: "assistant", parts: parts("AAPL 349.8달러, 삼성전자 206,000원", [usOut, krOut]) },
+      { role: "user", parts: [{ type: "text", text: "종가라는 뜻이야?" }] },
+      { role: "assistant", parts: [{ type: "text", text: "네, 정규장 마감 가격이에요." }] },
+      { role: "user", parts: [{ type: "text", text: "두 주 가격은?" }] },
+    ];
+    const ctx = financeContext(history)!;
+    expect(ctx.sources).toEqual([src(yahoo), src(naver)]);
+    expect(financeNote([{ type: "text", text: "349.8달러와 206,000원이에요." }], ctx)).toMatchObject({
+      sources: [src(yahoo), src(naver)],
       missing: ["source", "as_of"],
     });
-    expect(financeNote([{ type: "text", text: "천만에요!" }], [src(yahoo)])).toBeUndefined();
+    expect(
+      financeNote(
+        [{ type: "text", text: "Yahoo 11월 13일 종가 349.8달러, 네이버 증권 11월 13일 종가 206,000원." }],
+        ctx,
+      )!.missing,
+    ).toEqual([]);
+    expect(financeNote([{ type: "text", text: "천만에요!" }], ctx)).toBeUndefined();
+    // Out of the window: no longer a finance conversation.
+    const old = [
+      ...history.slice(0, 2),
+      ...Array.from({ length: FINANCE_CONTEXT_MESSAGES }, () => history[3]!),
+    ];
+    expect(financeContext(old)).toBeUndefined();
+    expect(financeContext(history.slice(2))).toBeUndefined();
   });
 });

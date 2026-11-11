@@ -4,7 +4,6 @@ import { and, asc, eq, gt, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   publicParts,
   StreamEvent,
-  type FinanceSource,
   type MessagePart,
   type Run,
   type RunChoice,
@@ -32,7 +31,7 @@ import { classifyError, runFailureCategory, type ErrorLog } from "../observabili
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
 import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
-import { carriedSources, financeNote } from "../finance/checker.js";
+import { financeContext, financeNote, type AnswerEvidence } from "../finance/checker.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -82,8 +81,8 @@ type Live = {
   tools: Map<string, { name: string; startedAt: number }>;
   /** What made the run fail, for the log (class name and code only are ever written). */
   failure?: unknown;
-  /** The finance note of the answer before this one (#30): a follow-up that states figures is checked too. */
-  financeCarry?: FinanceSource[] | undefined;
+  /** Finance results of the recent conversation (#30): a follow-up that states figures is checked too. */
+  financeCarry?: AnswerEvidence | undefined;
 };
 
 /**
@@ -309,7 +308,19 @@ export class RunManager {
       .from(runs)
       .where(inArray(runs.status, ["queued", "running"]))
       .all();
-    for (const r of stale) this.finish(r, "failed", "server_restart");
+    for (const r of stale) {
+      // The partial answer kept from before the restart gets the common finance check too (#30).
+      const msg = this.conversations.messageById(r.assistantMessageId);
+      if (msg) {
+        const parts = msg.parts as MessagePart[];
+        const history = this.conversations
+          .messages(r.conversationId, { limit: 10_000 })
+          .filter((m) => m.id !== msg.id && m.seq < msg.seq);
+        this.attachNoteTo(r, parts, financeContext(history));
+        this.conversations.updateMessage(msg.id, { parts });
+      }
+      this.finish(r, "failed", "server_restart");
+    }
     return stale.length;
   }
 
@@ -594,29 +605,30 @@ export class RunManager {
     if (!live.session) live.abort.abort();
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
-    this.attachFinanceNote(runId, row, live);
+    this.attachNoteTo(row, live.parts, live.financeCarry);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
     this.finish(row, status, code);
     void closeSession(live);
   }
 
   /**
-   * The common finance output check (#30): an answer that used a finance tool — or a follow-up stating figures
-   * after one — gets the server's note (sources, as-of times, what the answer left out, disclaimer), however the
-   * run ended. A broken check never breaks the reply.
+   * The common finance output check (#30): an answer that used a finance tool — or one stating figures while
+   * finance results are in the recent conversation — gets the server's note (sources, as-of times, what the answer
+   * left out, disclaimer), however the run ended, also when it is recovered after a restart. Appends to `parts`
+   * and streams it. A broken check never breaks the reply.
    */
-  private attachFinanceNote(runId: string, row: RunRow, live: Live): void {
-    if (live.parts.some((p) => p.type === "finance_note")) return;
+  private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
+    if (parts.some((p) => p.type === "finance_note")) return;
     let note;
     try {
-      note = financeNote(live.parts, live.financeCarry);
+      note = financeNote(parts, context);
     } catch {
       return;
     }
     if (!note) return;
-    live.parts.push(note);
-    const partIndex = live.parts.filter((p) => p.type !== "reasoning").length - 1;
-    this.emit(runId, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });
+    parts.push(note);
+    const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
+    this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });
   }
 
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
@@ -825,7 +837,7 @@ export class RunManager {
     const all = this.conversations.messages(run.conversationId, { limit: 10_000 });
     const before = all.filter((m) => m.id !== messageId);
     const lastUser = [...before].reverse().find((m) => m.role === "user");
-    live.financeCarry = carriedSources(before);
+    live.financeCarry = financeContext(before);
     const inputText = (lastUser?.parts as MessagePart[] | undefined)
       ?.flatMap((p) => (p.type === "text" ? [p.text] : []))
       .join("\n");

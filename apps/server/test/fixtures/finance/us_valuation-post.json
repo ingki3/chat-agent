@@ -1,0 +1,72 @@
+{
+  "tool": "us_valuation",
+  "input": {
+    "symbol": "AAPL"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5 — last trade 15:59:58, marketState POST: the regular price is the close.",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v10/finance/quoteSummary/AAPL?modules=summaryDetail,defaultKeyStatistics,price&crumb={crumb}",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "quoteSummary": {
+          "result": [
+            {
+              "summaryDetail": {
+                "trailingPE": {
+                  "raw": 38.81,
+                  "fmt": "38.81"
+                },
+                "forwardPE": {
+                  "raw": 33.2
+                },
+                "dividendYield": {
+                  "raw": 0.0031,
+                  "fmt": "0.31%"
+                },
+                "beta": {
+                  "raw": 1.089
+                },
+                "priceToSalesTrailing12Months": {
+                  "raw": 10.73
+                },
+                "marketCap": {
+                  "raw": 5140000000000
+                }
+              },
+              "defaultKeyStatistics": {
+                "priceToBook": {
+                  "raw": 58.4
+                },
+                "enterpriseToEbitda": {
+                  "raw": 29.6
+                }
+              },
+              "price": {
+                "symbol": "AAPL",
+                "longName": "Apple Inc.",
+                "shortName": "Apple Inc.",
+                "currency": "USD",
+                "exchangeName": "NasdaqGS",
+                "regularMarketTime": 1794603598,
+                "regularMarketPrice": {
+                  "raw": 349.8,
+                  "fmt": "349.80"
+                },
+                "marketCap": {
+                  "raw": 5140000000000,
+                  "fmt": "5.14T"
+                },
+                "marketState": "POST"
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

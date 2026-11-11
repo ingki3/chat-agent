@@ -34,7 +34,7 @@ if (!tool) throw new Error(`unknown tool ${old.tool}`);
 const secrets = Object.fromEntries(
   FINANCE_SECRET_NAMES.flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : [])),
 );
-const secretValues = Object.values(secrets).filter((v) => v.length >= 8);
+const secretValues = Object.values(secrets).filter((v) => v.length >= 1);
 
 const exchanges: Exchange[] = [];
 const real = sandboxedWorker();

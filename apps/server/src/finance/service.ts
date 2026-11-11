@@ -78,7 +78,8 @@ export class FinanceService {
     if (!impl) return { ok: false, code: "finance_not_allowed" };
     const secrets = this.opts.secrets ?? {};
     const ctx = { now: (this.opts.now ?? Date.now)(), secrets };
-    const secretValues = Object.values(secrets).filter((v) => v.length >= 8);
+    // Every configured secret, however short (SEC_USER_AGENT may be 5 characters).
+    const secretValues = Object.values(secrets).filter((v) => v.length >= 1);
     let plan: Plan = impl.plan(input, ctx);
     const rounds: RawResponse[][] = [];
     try {
