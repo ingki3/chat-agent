@@ -1489,4 +1489,81 @@ describe("Codex adapter: disconnecting while a normal run opens its session (#17
       await app.close();
     }
   });
+
+  it("a run stopped while its session opens, then ended by the grace period, is still cleaned up by a disconnect", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const log = newLog();
+    let store: ConnectionStore | undefined;
+    let users: UserStore | undefined;
+    const codex = new CodexAdapter({
+      connection: (c) => codexConnectionFor(store!, users!, c),
+      spawn: replaySpawn({}, log, { initializeGate: gate }),
+      bundledCatalog: async () => CATALOG,
+      executable: "/nonexistent/codex",
+    });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(codex);
+    const dataDir = tmp();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+      db: createTestDb(),
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0, interruptGraceMs: 100 },
+      notifications: { sender: async () => {} },
+    });
+    try {
+      store = app.connections!.store;
+      users = app.users!;
+      const f = await createFamily(app);
+      const c = store.create({
+        runtime: "codex",
+        authType: "api_key",
+        scope: "personal",
+        owner: f.users.owner,
+        createdBy: f.users.owner.id,
+        secret: KEY,
+      });
+      store.setTestResult(c.id, "passed", "ok", c.credentialVersion);
+      const conv = app.conversations!.create(f.users.owner.id);
+      const headers = {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      };
+      const sent = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text: "질문", runtime: "codex" },
+      });
+      const runId = (sent.json() as { run: Run }).run.id;
+      for (let i = 0; i < 400 && !log.requests.length; i++) await new Promise((r) => setTimeout(r, 5));
+      // The stop button while the app-server is still initialising: the open is aborted right away.
+      await app.inject({ method: "POST", url: `/api/runs/${runId}/interrupt`, headers, payload: {} });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(log.kills).toBeGreaterThanOrEqual(1); // before the grace period is over
+      await new Promise((r) => setTimeout(r, 200)); // past the grace period: the run is over
+      expect(app.runs!.get(runId)!.status).toBe("interrupted");
+      expect(log.kills).toBeGreaterThanOrEqual(1);
+      const del = await app.inject({
+        method: "DELETE",
+        url: `/api/connections/${c.id}`,
+        headers,
+        payload: {},
+      });
+      expect(del.statusCode).toBe(200);
+      expect(log.exits).toBe(1);
+      const folder = path.join(dataDir, "runtimes", c.id);
+      expect(fs.existsSync(folder)).toBe(false);
+      release();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(log.requests.map((r) => r.method)).toEqual(["initialize"]);
+      expect(fs.existsSync(folder)).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
 });

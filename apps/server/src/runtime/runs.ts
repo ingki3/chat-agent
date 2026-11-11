@@ -199,6 +199,16 @@ export type RunManagerOptions = {
  */
 export class RunManager {
   private readonly live = new Map<string, Live>();
+  /**
+   * Runtime sessions per connection (#17), by their whole lifetime — opening, running, closing — not only while
+   * the run is live: a run that was ended (e.g. after the interrupt grace period) while its session was still
+   * opening stays here until that open has failed or the session has closed. `stopConnection` aborts and awaits all
+   * of them before the connection's folder may go.
+   */
+  private readonly sessionsByConnection = new Map<
+    string,
+    Set<{ abort: AbortController; work: Promise<void> }>
+  >();
   /** MCP call tokens: one per run, revoked when the run ends (#42). */
   readonly mcpTokens: McpTokens;
   /** Set by shutdown(): no new run may start after that. */
@@ -377,6 +387,19 @@ export class RunManager {
         outputTokens: 0,
         tools: new Map(),
       });
+      const live = this.live.get(run.id)!;
+      if (run.connectionId) {
+        const set = this.sessionsByConnection.get(run.connectionId) ?? new Set();
+        this.sessionsByConnection.set(run.connectionId, set);
+        // Over when execute has returned (an open still pending has settled) and the session is closed.
+        const entry = { abort: live.abort, work: live.done.then(() => closeSession(live)) };
+        set.add(entry);
+        void entry.work.finally(() => {
+          set.delete(entry);
+          if (!set.size && this.sessionsByConnection.get(run.connectionId!) === set)
+            this.sessionsByConnection.delete(run.connectionId!);
+        });
+      }
       // Detached from the request: the run outlives the HTTP connection. Nothing may escape as a rejection.
       setImmediate(() => {
         this.execute(run.id)
@@ -401,6 +424,8 @@ export class RunManager {
         this.opts.interruptGraceMs ?? 3000,
       );
       live.graceTimer.unref();
+      // A session still opening can do nothing useful any more: abort it (the adapter kills its process).
+      if (!live.session) live.abort.abort();
       // Not awaited: the request returns at once; the grace timer ends the run if the runtime never stops.
       fireInterrupt(live);
     } else if (!live) {
@@ -417,8 +442,9 @@ export class RunManager {
    * Only after this may the connection's folder be removed.
    */
   async stopConnection(connectionId: string, ms = 10_000): Promise<void> {
-    const mine = [...this.live.entries()].filter(([, l]) => l.connectionId === connectionId);
-    for (const [, live] of mine) live.abort.abort();
+    // Every session of this connection, including those of runs that have already ended while still opening.
+    const mine = [...(this.sessionsByConnection.get(connectionId) ?? [])];
+    for (const e of mine) e.abort.abort();
     for (const r of this.db
       .select()
       .from(runs)
@@ -426,15 +452,7 @@ export class RunManager {
       .all())
       void this.interrupt(r.id);
     await Promise.all(
-      mine.map(([, live]) =>
-        Promise.race([
-          (async () => {
-            await live.done;
-            await closeSession(live);
-          })(),
-          new Promise<void>((r) => setTimeout(r, ms).unref()),
-        ]),
-      ),
+      mine.map((e) => Promise.race([e.work, new Promise<void>((r) => setTimeout(r, ms).unref())])),
     );
   }
 
@@ -483,6 +501,7 @@ export class RunManager {
     for (const live of lives) {
       clearTimeout(live.graceTimer);
       live.settled = true;
+      if (!live.session) live.abort.abort(); // sessions still opening: their processes go too
       fireInterrupt(live);
       live.emitter.emit("end"); // closes the SSE streams following these runs
     }
@@ -531,6 +550,8 @@ export class RunManager {
     if (!live || live.settled) return;
     live.settled = true;
     clearTimeout(live.graceTimer);
+    // Ended while its session was still opening (the grace period ran out): that open is cancelled.
+    if (!live.session) live.abort.abort();
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
@@ -541,6 +562,7 @@ export class RunManager {
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
   private drop(runId: string, live: Live): void {
     this.mcpTokens.revokeRun(runId);
+    if (!live.session) live.abort.abort();
     live.settled = true;
     clearTimeout(live.graceTimer);
     fireInterrupt(live);

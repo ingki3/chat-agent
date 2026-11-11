@@ -56,7 +56,9 @@ function capture() {
   return { stream, text: () => lines.join("") };
 }
 
-async function start(o: { adapters?: RuntimeAdapter[]; db?: Db; env?: Record<string, string> } = {}) {
+async function start(
+  o: { adapters?: RuntimeAdapter[]; db?: Db; env?: Record<string, string>; graceMs?: number } = {},
+) {
   const db = o.db ?? createTestDb();
   const log = capture();
   const fake = new FakeRuntime({ needsConnection: true, script });
@@ -73,7 +75,7 @@ async function start(o: { adapters?: RuntimeAdapter[]; db?: Db; env?: Record<str
     db,
     logStream: log.stream,
     runtimes,
-    runs: { flushMs: 0 },
+    runs: { flushMs: 0, ...(o.graceMs === undefined ? {} : { interruptGraceMs: o.graceMs }) },
     notifications: { sender: async () => {} },
     mcp: {
       // In-process verification skill (the sandboxed runner is macOS only; its own tests are in mcp.test.ts).
@@ -988,6 +990,51 @@ describe("review #84 round 1", () => {
     expect((await t.owner.del(`/api/connections/${c.id}`)).statusCode).toBe(200);
     expect(closedAt).toBeGreaterThan(0); // closed before the disconnect answered
     expect(t.app.runs!.get(run.id)!.status).toBe("interrupted");
+  });
+
+  it("P2 (round 4): a disconnect waits for a session open that outlived its run, even if the runtime ignores the signal", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let folder = "";
+    let openEndedAt = 0;
+    class StuckOpen implements RuntimeAdapter {
+      readonly id = "claude-code" as const;
+      started = 0;
+      capabilities() {
+        return {
+          models: [{ id: "m", label: "M", efforts: [] }],
+          canSwitchModelInSession: false,
+          canResume: false,
+          usesTools: false,
+          needsConnection: true,
+        };
+      }
+      async resume(): Promise<RuntimeSession> {
+        throw new Error("no");
+      }
+      async start(): Promise<RuntimeSession> {
+        this.started++;
+        await gate; // ignores the abort signal
+        fs.mkdirSync(folder, { recursive: true }); // what a late init would do to the folder
+        openEndedAt = Date.now();
+        throw new Error("gave up");
+      }
+    }
+    const stuck = new StuckOpen();
+    const t = await start({ adapters: [stuck], graceMs: 50 });
+    const c = await t.addMine(t.owner, KEYS.ownerClaude);
+    t.app.connections!.store.setTestResult(c.id, "passed", "ok", 1);
+    folder = path.join(t.dataDir, "runtimes", c.id, t.f.users.owner.id);
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const run = t.runOf(await t.send(t.owner, conv.id, { text: "a" }));
+    for (let i = 0; i < 200 && !stuck.started; i++) await new Promise((r) => setTimeout(r, 5));
+    await t.owner.post(`/api/runs/${run.id}/interrupt`);
+    await new Promise((r) => setTimeout(r, 120)); // the grace period ends the run; its open is still pending
+    expect(t.app.runs!.get(run.id)!.status).toBe("interrupted");
+    setTimeout(release, 100);
+    expect((await t.owner.del(`/api/connections/${c.id}`)).statusCode).toBe(200);
+    expect(openEndedAt).toBeGreaterThan(0); // the disconnect waited for the open to end …
+    expect(fs.existsSync(path.join(t.dataDir, "runtimes", c.id))).toBe(false); // … and removed the folder after it
   });
 
   it("P2: the .env import writes the connection and its flag together; a failure leaves neither", async () => {
