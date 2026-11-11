@@ -601,12 +601,12 @@ describe("log file failures", () => {
     let failWrites = 0;
     const io = {
       ...fs,
-      writeSync: ((fd: number, buf: Buffer) => {
+      writeSync: ((fd: number, buf: Buffer, off?: number, len?: number) => {
         if (failWrites > 0) {
           failWrites--;
           throw enospc();
         }
-        return fs.writeSync(fd, buf);
+        return fs.writeSync(fd, buf, off, len);
       }) as typeof fs.writeSync,
     };
     const s = rotatingFile(file, { io });
@@ -631,6 +631,104 @@ describe("log file failures", () => {
       { msg: "b" },
     ]);
   });
+
+  const tmpLog = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-")), "server.log");
+  const parseAll = (file: string) =>
+    fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { msg?: string; dropped?: number });
+  const writeTo = (s: Writable, line: string) => new Promise<void>((r) => s.write(line + "\n", () => r()));
+
+  it("starts even when the log file cannot be opened, and writes once it can", async () => {
+    const file = tmpLog();
+    let failOpens = 1;
+    const io = {
+      ...fs,
+      openSync: ((...a: Parameters<typeof fs.openSync>) => {
+        if (failOpens > 0) {
+          failOpens--;
+          throw enospc();
+        }
+        return fs.openSync(...a);
+      }) as typeof fs.openSync,
+    };
+    const dest = rotatingFile(file, { io });
+    const errors: unknown[] = [];
+    dest.on("error", (e) => errors.push(e));
+    failOpens = 3; // the first writes cannot open it either
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { logStream: dest });
+    apps.push(app);
+    const health = () => app.inject({ url: "/api/health", headers: { host: "localhost:3000" } });
+    expect((await health()).statusCode).toBe(200);
+    expect(dest.dropped).toBeGreaterThan(0);
+    failOpens = 0;
+    expect((await health()).statusCode).toBe(200);
+    const recs = parseAll(file);
+    expect(recs.some((r) => r.msg === "log.line_dropped" && (r.dropped ?? 0) > 0)).toBe(true);
+    expect(recs.some((r) => r.msg === "request completed")).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  it("starts when LOG_FILE points somewhere that cannot be created", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    fs.writeFileSync(path.join(dir, "not-a-dir"), "");
+    const app = await buildApp(
+      loadConfig({ NODE_ENV: "test", LOG_FILE: path.join(dir, "not-a-dir", "server.log") }),
+      { logger: true },
+    );
+    apps.push(app);
+    expect((await app.inject({ url: "/api/health", headers: { host: "localhost:3000" } })).statusCode).toBe(
+      200,
+    );
+  });
+
+  it("writes every byte of a line despite short writes", async () => {
+    const file = tmpLog();
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) =>
+        fs.writeSync(fd, buf, off, Math.min(8, len))) as typeof fs.writeSync,
+    };
+    const s = rotatingFile(file, { io });
+    for (let i = 0; i < 5; i++) await writeTo(s, JSON.stringify({ msg: "run.finished", n: i }));
+    await new Promise<void>((r) => s.end(r));
+    expect(s.dropped).toBe(0);
+    expect(parseAll(file)).toHaveLength(5);
+  });
+
+  for (const truncateFails of [false, true])
+    it(`never leaves a torn line when a write fails partway (truncate ${truncateFails ? "deferred" : "at once"})`, async () => {
+      const file = tmpLog();
+      let plan: ("short" | "fail")[] = [];
+      let failTruncates = truncateFails ? 1 : 0;
+      const io = {
+        ...fs,
+        writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+          const step = plan.shift();
+          if (step === "fail") throw enospc();
+          return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+        }) as typeof fs.writeSync,
+        ftruncateSync: ((fd: number, n?: number) => {
+          if (failTruncates > 0) {
+            failTruncates--;
+            throw enospc();
+          }
+          return fs.ftruncateSync(fd, n);
+        }) as typeof fs.ftruncateSync,
+      };
+      const s = rotatingFile(file, { io });
+      await writeTo(s, '{"msg":"a"}');
+      plan = ["short", "fail"]; // 8 bytes out, then the disk fills up
+      await writeTo(s, '{"msg":"torn-line-that-is-long"}');
+      expect(s.dropped).toBe(1);
+      await writeTo(s, '{"msg":"b"}');
+      await new Promise<void>((r) => s.end(r));
+      const recs = parseAll(file); // throws if any line is not complete JSON
+      expect(recs.map((r) => r.msg)).toEqual(["a", "log.line_dropped", "b"]);
+      expect(recs[1]!.dropped).toBe(1);
+    });
 
   it("keeps writing to the current file when rotation fails", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));

@@ -201,10 +201,18 @@ export function sanitizingStream(dest: NodeJS.WritableStream = process.stdout): 
   });
 }
 
-/** The file operations rotatingFile uses (tests inject failures such as ENOSPC). */
+/** The file operations rotatingFile uses (tests inject failures such as ENOSPC or short writes). */
 export type LogFileIo = Pick<
   typeof fs,
-  "openSync" | "closeSync" | "fstatSync" | "writeSync" | "renameSync" | "rmSync" | "existsSync"
+  | "mkdirSync"
+  | "openSync"
+  | "closeSync"
+  | "fstatSync"
+  | "writeSync"
+  | "ftruncateSync"
+  | "renameSync"
+  | "rmSync"
+  | "existsSync"
 >;
 export type RotateOptions = { maxBytes?: number; keep?: number; io?: LogFileIo };
 /** A log file stream that never fails: `dropped` counts lines it could not write. */
@@ -215,28 +223,51 @@ export type RotatingFile = Writable & { readonly dropped: number };
  * loses nothing. The service owns the file itself: launchd's StandardOutPath cannot be rotated without a
  * restart (docs/ops.md §9).
  *
- * Logging must never take the service down: a failed write (disk full, file removed, …) drops the line and
- * counts it instead of erroring the stream (an unhandled stream error would end the process). A failed
- * rotation keeps writing to the current file. The next successful write reports how many lines were lost.
+ * Logging must never take the service down, and the file must only ever hold complete JSON lines:
+ * - Opening is retried on the next write — also at startup, so a log file that cannot be opened (disk full,
+ *   permissions) never stops the server from starting. Lines written meanwhile are dropped and counted.
+ * - A line is written until every byte is out (writeSync may write less than asked). If a write fails partway,
+ *   the file is truncated back to the end of the last complete line (at once, or when it is next opened), and
+ *   the line counts as dropped.
+ * - A failed rotation keeps appending to the current file.
+ * - The next successful write reports the loss: `{"msg":"log.line_dropped","dropped":n}`.
  */
 export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFile {
   const io = opts.io ?? fs;
   const maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
   const keep = Math.max(1, opts.keep ?? 5);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  let fd: number | undefined = io.openSync(file, "a", 0o640);
-  let size = io.fstatSync(fd).size;
+  let fd: number | undefined;
+  let size = 0;
+  /** Offset to truncate back to after a torn write that could not be undone at once. */
+  let tornAt: number | undefined;
   let dropped = 0;
   let unreported = 0;
-  const reopen = () => {
+
+  const close = () => {
     try {
       if (fd !== undefined) io.closeSync(fd);
     } catch {
       // already gone
     }
     fd = undefined;
-    fd = io.openSync(file, "a", 0o640);
-    size = io.fstatSync(fd).size;
+  };
+  const open = () => {
+    close();
+    io.mkdirSync(path.dirname(file), { recursive: true });
+    const f = io.openSync(file, "a", 0o640);
+    try {
+      let at = io.fstatSync(f).size;
+      if (tornAt !== undefined && at > tornAt) {
+        io.ftruncateSync(f, tornAt);
+        at = tornAt;
+      }
+      tornAt = undefined;
+      fd = f;
+      size = at;
+    } catch (e) {
+      io.closeSync(f);
+      throw e;
+    }
   };
   const rotate = () => {
     try {
@@ -248,13 +279,39 @@ export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFi
       // Could not rotate: keep appending to the current file rather than lose lines.
       return;
     }
-    reopen();
+    close(); // the next write opens the new file
   };
-  const writeAll = (buf: Buffer) => {
-    if (fd === undefined) reopen();
-    io.writeSync(fd!, buf);
-    size += buf.length;
+  /** Writes one whole line, or nothing: a partial line is cut off again. */
+  const writeLine = (buf: Buffer) => {
+    if (fd === undefined) open();
+    const start = size;
+    let off = 0;
+    try {
+      while (off < buf.length) {
+        const n = io.writeSync(fd!, buf, off, buf.length - off);
+        if (!(n > 0)) throw new Error("log write made no progress");
+        off += n;
+        size += n;
+      }
+    } catch (e) {
+      if (off > 0) {
+        try {
+          io.ftruncateSync(fd!, start);
+          size = start;
+        } catch {
+          tornAt = start; // undone when the file is next opened
+        }
+      }
+      throw e;
+    }
   };
+
+  try {
+    open(); // create the file at startup when possible; otherwise the first write retries
+  } catch {
+    close();
+  }
+
   const stream = new Writable({
     write(chunk, _enc, cb) {
       const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
@@ -262,29 +319,19 @@ export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFi
         if (size > 0 && size + buf.length > maxBytes) rotate();
         if (unreported > 0) {
           const note = { level: 40, time: Date.now(), msg: "log.line_dropped", dropped: unreported };
-          writeAll(Buffer.from(JSON.stringify(note) + "\n"));
+          writeLine(Buffer.from(JSON.stringify(note) + "\n"));
           unreported = 0;
         }
-        writeAll(buf);
+        writeLine(buf);
       } catch {
         dropped++;
         unreported++;
-        // Reopen on the next write (the file may have been removed or the descriptor broken).
-        try {
-          if (fd !== undefined) io.closeSync(fd);
-        } catch {
-          // ignore
-        }
-        fd = undefined;
+        close(); // reopen on the next write (the file may have been removed or the descriptor broken)
       }
       cb();
     },
     final(cb) {
-      try {
-        if (fd !== undefined) io.closeSync(fd);
-      } catch {
-        // ignore
-      }
+      close();
       cb();
     },
   });
