@@ -19,6 +19,8 @@ export function storagePaths(dataDir: string) {
     files: path.join(root, "files"),
     artifacts: path.join(root, "artifacts"),
     runtimes: path.join(root, "runtimes"),
+    /** The server's own skill folder (#21): allow-listed skills copied by `pnpm skills:install`. */
+    skills: path.join(root, "skills"),
     sources: path.join(root, "sources"),
     backups: path.join(root, "backups"),
     conversationFiles: (userId: string, conversationId: string) =>

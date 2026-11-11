@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Options, Query, SDKMessage, SDKUserMessage, query } from "@anthropic-ai/claude-agent-sdk";
+import { callOurTool, isLiveCall } from "./live-mcp.js";
 
 /**
  * Recorded Claude Agent SDK conversations, replayed in CI instead of the real CLI (#15: "CI는 녹화 이벤트
@@ -67,7 +68,12 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
         }
         await sleep();
         if (interrupted && !jumped) continue;
-        yield turn.messages[i++]!;
+        const next = turn.messages[i++]!;
+        if (isLiveCall(next)) {
+          yield* liveToolCall(options, next.id, next.tool, next.args);
+          continue;
+        }
+        yield next;
       }
       if (turn.thrown) throw new Error(turn.thrown);
     }
@@ -85,6 +91,49 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
       },
     }) as unknown as Query;
   }) as typeof query;
+}
+
+/**
+ * What the CLI does for a tool call of the model: asks the PreToolUse hook the adapter configured, and if it
+ * allows, calls the tool on the MCP server from `options.mcpServers` (#21 contract test, `liveCall`).
+ */
+async function* liveToolCall(
+  options: Options,
+  id: string,
+  tool: string,
+  args: unknown,
+): AsyncGenerator<SDKMessage> {
+  const name = `mcp__agentlee__${tool}`;
+  yield sdk.toolUse(id, name, args);
+  const hook = (
+    options.hooks?.PreToolUse?.[0]?.hooks?.[0] as
+      ((input: unknown, id: string, o: { signal: AbortSignal }) => Promise<unknown>) | undefined
+  )?.bind(null);
+  const decision = (await hook?.(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: name,
+      tool_input: args,
+      mcp_server: { name: "agentlee", source: "dynamic" },
+    },
+    id,
+    { signal: new AbortController().signal },
+  )) as { hookSpecificOutput?: { permissionDecision?: string } } | undefined;
+  if (decision?.hookSpecificOutput?.permissionDecision !== "allow") {
+    yield sdk.toolResult(id, "denied by hook", true);
+    return;
+  }
+  const server = options.mcpServers?.agentlee as
+    { url: string; headers: { Authorization: string } } | undefined;
+  if (!server) throw new Error("replay: no agentlee MCP server configured");
+  const r = await callOurTool(server.url, server.headers.Authorization.slice("Bearer ".length), tool, args);
+  yield {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content: r.content, is_error: r.isError }],
+    },
+  } as unknown as SDKMessage;
 }
 
 /**

@@ -82,7 +82,7 @@
   - **Claude:** `mcpServers.agentlee = { type: "http", url, headers: { Authorization } }`
   - **Codex:** `config.toml`에는 `url`과 `bearer_token_env_var = "AGENTLEE_MCP_TOKEN"`만 적는다. 토큰은 app-server 환경 변수로만 넘긴다(`codexMcpEnv`).
   - 샌드박스 네트워크는 `{ loopbackPorts: [mcpLoopbackPort(mcp)] }`이다.
-- **스킬:** 허용 목록(`BUNDLED_SKILLS`, 지금은 검증용 `selftest` 하나)에 있는 것만 `skill_<이름>` 도구로 보인다. 실행은 `runIsolated`로 한다.
+- **스킬:** 허용 목록에 있는 것만 `skill_<이름>` 도구로 보인다. 실행은 `runIsolated`로 한다. #43에는 검증용 `selftest` 하나였다. 허용 목록·사용자별 스킬은 아래 "공통 MCP 스킬 실행기 (#21)"를 본다.
   - 읽기: 스킬 폴더와 node 실행 파일만(설치 폴더는 읽지 못함 — 시스템 라이브러리만 쓰는 공식 빌드 node 필요, 아니면 `skill_failed`로 막힘)
   - 쓰기·네트워크·자식 프로세스·환경 변수: 없음
   - 입력은 실행 전에 검증한다.
@@ -159,3 +159,59 @@
   - 프로세스는 `work`·`home`에 쓸 수 없다. `codex-home`에는 쓸 수 있지만 파일을 쓰는 도구가 없다. 서버도 거기에 파일을 쓰지 않는다.
   - 남는 경로는 세션이 열려 있는 동안 서버 밖의 누군가(이 Mac의 사용자)가 그 폴더에 SKILL.md를 넣는 경우뿐이다. 이는 하드링크 판단과 같은 이유로 격리 대상 밖으로 본다.
   - `@파일`·`/명령`·`!명령`은 글자 그대로 간다(실바이너리 시험으로 확인).
+
+## 공통 MCP 스킬 실행기 (#21)
+목록과 스킬별 사실은 `docs/skills.md`에 있다. 여기서는 실행 방식만 적는다.
+
+- **허용 목록 = 코드의 정의:** `packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`(지금 `google-news-search-skill`·`kr-stock-skill`)와 내장 `selftest`만 도구가 된다.
+  - 정의에는 복사할 파일, 입력 스키마, 인자 빌더, 접속 호스트, 비밀이 들어 있다.
+  - 정의가 없는 스킬(PRD 제외 스킬 포함)은 설치도, 사용자별 허용도 할 수 없다.
+- **서버 전용 스킬 폴더 `<DATA_DIR>/skills/<이름>/`:** `pnpm skills:install`이 관리자 스킬 폴더(`SKILL_SOURCES`, 기본 `~/.agents/skills:~/.claude/skills`)에서 정의에 적힌 파일만 **복사**한다.
+  - **링크하지 않는다.** 링크하면 샌드박스가 관리자의 실제 폴더를 읽어야 한다. 그 폴더에는 `config.json`(API 키)·`.env`·venv·백업이 같이 있다.
+  - 원본 파일은 이런 경우 거부한다: 스킬 폴더 아래 경로에 심볼릭 링크가 있음(`realpath` 비교), 하드링크(링크 수 > 1), 일반 파일이 아님, 4MB 초과.
+  - `O_NOFOLLOW`로 열고 디스크립터로 다시 확인한다.
+  - 복사본은 읽기 전용이다. 해시를 적은 `.agentlee-skill.json`과 함께 임시 폴더에 쓴 뒤 rename 한 번으로 바꾼다.
+  - 정의의 파일 이름은 `..`·절대 경로·역슬래시를 거부한다(`checkSpec`).
+- **서버 시작 때 검사(`loadInstalledSkills`):** 다음을 모두 만족하는 스킬만 제공한다. 하나라도 어긋나면 `broken`이고 도구로 보이지 않는다.
+  - 폴더가 심볼릭 링크가 아님
+  - 목록에 없는 파일이 없음(누가 넣은 키 파일도 스킬이 읽을 수 있기 때문)
+  - 파일마다 심볼릭 링크·하드링크가 아니고 해시가 같음
+
+  실행할 때는 `runIsolated`가 하드링크를 다시 검사한다.
+- **인자:** 모델이 준 글자는 인자가 되지 않는다.
+  - 입력은 엄격한 스키마로 검사한다. 정의에 없는 키는 거부한다(`z.strictObject`, MCP 서버와 서비스 두 곳).
+  - 인자는 정의의 `args()`가 고정된 모양으로 만든다. 값마다 `--flag=값` 한 요소다. 그래서 `--query=--format=markdown`도 값일 뿐 플래그가 되지 않는다.
+  - 자유 글은 `SAFE_TEXT`로 검사한다: 제어 문자, 셸 메타문자(세미콜론·파이프·앰퍼샌드·달러·백틱·꺾쇠·역슬래시), `-`로 시작하는 값을 거부한다.
+  - 명령과 맞지 않는 값(예: `stock`에 `KOSPI`)은 `skill_bad_input`이다. 셸은 어디에도 없다(`spawn` 인자 배열).
+- **python 스킬:**
+  - 샌드박스는 fork를 막는다. Homebrew·python.org 같은 **framework 빌드는 못 쓴다.** `bin/python3.x`가 `Python.app`을 posix_spawn으로 다시 띄우기 때문이다(실측 거부). 확장 모듈도 다른 Homebrew 폴더의 libssl 등을 읽는다.
+  - 그래서 **독립 실행형 빌드**(python-build-standalone, `uv python install 3.12`)를 `SKILL_PYTHON`으로 지정한다.
+    - 그 설치 폴더 하나만 `trusted` 읽기로 연다.
+    - 실행은 `python -I -S -B <entry> <인자>`다. 환경 변수·사용자 site·스크립트 폴더·site-packages를 쓰지 않는다. 표준 라이브러리만 쓴다.
+  - 실측(macOS 27, cpython 3.11.14 standalone)했다:
+    - fork `PermissionError`
+    - 폴더 밖 읽기·홈 목록·쓰기·직접 접속 거부
+    - 프록시 CONNECT는 허용 호스트만 200, 나머지 403
+    - 실제 두 스킬 HTTPS 성공
+  - framework 빌드, 홈 폴더 전체를 포함하는 설치 폴더, `bin/python3…`가 아닌 경로는 `pythonRuntime`이 거부한다. 그러면 python 스킬은 제공하지 않는다(`needs_python`).
+  - venv(pip 패키지)가 필요한 스킬은 아직 돌리지 않는다(#30·#50). **자식 프로세스가 꼭 필요한 스킬**(`summarize` 등)은 샌드박스를 풀지 않고 서버 함수로 대체한다.
+- **네트워크:** 호스트가 있는 스킬은 **스킬마다 따로** 송신 프록시(`EgressService`)를 쓴다. 각 프록시는 그 스킬의 호스트만 허용한다.
+  - 샌드박스는 그 프록시의 루프백 포트 하나만 연다. 호스트가 없으면 네트워크가 없다.
+  - TLS 루트는 `SSL_CERT_FILE=/private/etc/ssl/cert.pem`(trusted 읽기)으로 준다.
+  - 그래서 뉴스 스킬은 증권 사이트에, 증권 스킬은 뉴스 사이트에 닿지 못한다(시험).
+- **비밀:**
+  - `.env`의 `SKILL_SECRET_NAMES`(지금 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY`)만 읽는다.
+  - 그 비밀을 선언한 스킬의 프로세스 환경에만, 그 호출에 필요할 때만(`when`) 넣는다. 예: `kr-stock-skill`의 `alpha-quote` 호출에만 Alpha Vantage 키가 들어간다.
+  - 인자에는 절대 넣지 않는다(`ps`에 보이기 때문). 없으면 `skill_unconfigured`다.
+  - 결과(stdout)에 비밀 값이 보이면 `[redacted]`로 바꾼다. stderr는 버린다. 로그에는 남지 않는다.
+  - 관리자 화면에서 암호화 저장하는 것은 #35에서 한다.
+- **사용자별 스킬(FR-1.6):** `users.permissions.skills`(`"all"` 또는 §7 이름 목록, 0001 마이그레이션의 열)로 정한다. API는 `PUT /api/admin/users/:id/skills`다. `selftest`는 연결 테스트용이라 항상 켜져 있다.
+  - run의 도구 목록은 사용자마다 계산한다(`McpService.toolNamesFor`). 런타임은 그 목록만 허용한다: Claude는 PreToolUse 훅, Codex는 `enabled_tools`와 들어오는 항목 검사.
+  - MCP 서버는 요청마다 토큰 사용자의 허용 스킬만 등록한다. 목록에 없는 도구 호출은 "not found"다.
+  - 서비스가 호출마다 허용을 다시 확인한다(`skill_not_allowed`). 그래서 실행 중에 관리자가 권한을 바꾸면 바로 반영된다.
+- **동시 실행:** 전체 4개, run당 2개(#43 그대로)다. 스킬별 시간 한도는 정의의 `timeoutMs`(네트워크 스킬 40초)다. 출력 256KB, 메모리 256MB다.
+- **로그(#46):** 호출마다 `skill.finished`를 남긴다. 필드는 도구 이름(서버가 등록한 이름), `ok`/`error`, `skillCode`(정해진 `skill_*` 코드), 소요 시간, ID뿐이다. 입력·출력·stderr는 남기지 않는다.
+- **두 런타임에서 같은 결과(D7):** `apps/server/test/skills-contract.test.ts`가 확인한다.
+  - 대본 런타임이 어댑터가 만든 설정(Claude `mcpServers`+훅, Codex `-c mcp_servers.agentlee` + 환경 변수 토큰)으로 우리 MCP 서버를 실제로 호출한다.
+  - Claude Code와 Codex의 도구 결과가 같은지 비교한다.
+  - 실제 런타임 녹화는 자격 증명이 필요해 미뤘다(`test/record-*.ts`).

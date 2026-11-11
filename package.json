@@ -19,6 +19,8 @@
     "db:migrate": "pnpm --filter @agentlee/server db:migrate",
     "keygen": "pnpm --filter @agentlee/server keygen",
     "injection-eval": "pnpm --filter @agentlee/server injection-eval",
+    "skills:install": "pnpm --filter @agentlee/server skills install",
+    "skills:status": "pnpm --filter @agentlee/server skills status",
     "sse-probe": "tsx scripts/sse-probe.ts",
     "uptime": "tsx scripts/uptime.ts",
     "launchd": "bash scripts/install-launchd.sh"

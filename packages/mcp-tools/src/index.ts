@@ -1,5 +1,5 @@
-// Common MCP server shared by both runtimes (PRD D7). Minimal in #43 (connection test + one verification skill);
-// the full skill runner (per-skill wrappers, per-user skills) is #21.
+// Common MCP server shared by both runtimes (PRD D7): the connection test (#43) and the allow-listed skills (#21),
+// each user seeing only the skills they may use.
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -31,7 +31,13 @@ export type McpHost = {
   userName(userId: string): string | undefined;
   now?: () => Date;
   timeZone?: string;
+  /** Every skill this server offers (tool names for the runtimes' allow-lists and the log). */
   skills: readonly SkillInfo[];
+  /**
+   * The skills one user may use right now (FR-1.6). Only these are listed and callable on that user's requests;
+   * `runSkill` checks again (a permission can change while a run is going).
+   */
+  skillsFor(userId: string): readonly SkillInfo[];
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
 };
 
@@ -76,10 +82,11 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     },
   );
 
-  for (const skill of host.skills) {
+  for (const skill of host.skillsFor(scope.userId)) {
     server.registerTool(
       skillToolName(skill.name),
-      { description: skill.description, inputSchema: skill.input },
+      // Strict: an argument the skill does not define is refused, not silently dropped.
+      { description: skill.description, inputSchema: z.strictObject(skill.input) },
       async (input: Record<string, unknown>) => {
         if (!stillValid()) return text({ error: "unauthorized" }, true);
         const r = await host.runSkill(skill.name, input, scope);

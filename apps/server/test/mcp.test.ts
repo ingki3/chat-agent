@@ -323,7 +323,7 @@ describe("common MCP server (#43)", () => {
   });
 
   it("skill policy: its own folder only, no node install folder, no writes, no network", () => {
-    const p = skillPolicy(SELFTEST_SKILL, "/opt/node/bin/node");
+    const p = skillPolicy(SELFTEST_SKILL, { text: "x" }, { node: "/opt/node/bin/node" });
     expect(p).toMatchObject({
       command: "/opt/node/bin/node",
       args: [SELFTEST_SKILL.entry],

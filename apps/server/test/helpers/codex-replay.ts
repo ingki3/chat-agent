@@ -5,6 +5,7 @@ import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { SpawnIsolatedOptions } from "../../src/isolation/sandbox.js";
 import type { CodexChild } from "../../src/runtime/codex.js";
+import { callOurTool, isLiveCall } from "./live-mcp.js";
 
 /**
  * Recorded `codex app-server` conversations, replayed in CI instead of the real binary (#16, like #15: CI replays,
@@ -101,9 +102,56 @@ export function replaySpawn(
         else for (const n of o.afterTurn ?? []) send(ours(n));
         return;
       }
-      const m = rewrite(p.turn.messages[p.i++]!, p.turn, p.turnId);
+      const raw = p.turn.messages[p.i++]!;
+      if (isLiveCall(raw)) {
+        void liveToolCall(raw.id, raw.tool, raw.args, p.turnId).then(() => setTimeout(play, o.delayMs ?? 2));
+        return;
+      }
+      const m = rewrite(raw, p.turn, p.turnId);
       send(m);
       setTimeout(play, o.delayMs ?? 2);
+    };
+    /**
+     * What app-server does for a tool call of the model (#21 contract test, `liveCall`): only a tool of the run's
+     * `enabled_tools`, on the MCP server at the configured url, with the token from `bearer_token_env_var`.
+     */
+    const liveToolCall = async (id: string, tool: string, args: unknown, turnId: string) => {
+      const cfg = s.args.find((a) => a.startsWith("mcp_servers.agentlee=")) ?? "";
+      const url = /url = "([^"]+)"/.exec(cfg)?.[1];
+      const enabled = (/enabled_tools = \[([^\]]*)\]/.exec(cfg)?.[1] ?? "")
+        .split(",")
+        .map((t) => t.trim().replace(/^"|"$/g, ""))
+        .filter(Boolean);
+      const token = s.env.AGENTLEE_MCP_TOKEN;
+      const ids = { threadId, turnId };
+      const item = { type: "mcpToolCall", id, server: "agentlee", tool, arguments: args };
+      send({
+        method: "item/started",
+        params: { ...ids, item: { ...item, status: "inProgress", result: null, error: null } },
+      });
+      if (!url || !token || !enabled.includes(tool)) {
+        send({
+          method: "item/completed",
+          params: {
+            ...ids,
+            item: { ...item, status: "failed", result: null, error: { message: "not enabled" } },
+          },
+        });
+        return;
+      }
+      const r = await callOurTool(url, token, tool, args);
+      send({
+        method: "item/completed",
+        params: {
+          ...ids,
+          item: {
+            ...item,
+            status: "completed",
+            result: { content: r.content, structuredContent: null, ...(r.isError ? { isError: true } : {}) },
+            error: null,
+          },
+        },
+      });
     };
     /** A hand-made message with our placeholder thread id made the replay's own. */
     const ours = (m: Json): Json =>

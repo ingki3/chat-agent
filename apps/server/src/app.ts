@@ -23,6 +23,7 @@ import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
 import { McpService, type McpServiceOptions } from "./mcp/service.js";
+import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
 import type { Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
 import { KEY_LEN } from "./crypto/secrets.js";
@@ -196,7 +197,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
-    const mcp = new McpService(mcpTokens, users, opts.mcp);
+    const mcp = new McpService(mcpTokens, users, {
+      log: app.log,
+      ...mcpOptionsFromConfig(config),
+      ...opts.mcp,
+    });
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       mcp,
       mcpTokens,
@@ -217,6 +222,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerConversationRoutes(app, app.conversations!, runManager);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
+    registerSkillRoutes(app, mcp);
 
     if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
     const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);

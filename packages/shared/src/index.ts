@@ -96,6 +96,29 @@ export const SetYouthRequest = z.object({ youth: z.boolean() });
 export const CreateUserResponse = z.object({ user: AdminUser, temporaryPassword: z.string() });
 export const ResetPasswordResponse = z.object({ temporaryPassword: z.string() });
 
+// ---- Skills (#21, PRD §7, FR-1.6, FR-10.3; the admin screen is #35) ----
+
+/** Which skills one user may use: all of them, or only these (PRD §7 names; e.g. the son without finance). */
+export const SetUserSkillsRequest = z.object({
+  skills: z.union([z.literal("all"), z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)).max(64)]),
+});
+/** A PRD §7 skill and where it stands on this server. */
+export const AdminSkill = z.object({
+  name: z.string(),
+  /** MCP tool name (`skill_<name>`). */
+  tool: z.string(),
+  finance: z.boolean(),
+  /**
+   * available: offered · not_installed: `pnpm skills:install` not run · broken: the installed copy changed ·
+   * needs_python: SKILL_PYTHON missing or unusable · planned: comes with a later issue · document: becomes a server
+   * function (file tools).
+   */
+  status: z.enum(["available", "not_installed", "broken", "needs_python", "planned", "document"]),
+  issue: z.string().optional(),
+});
+export type AdminSkill = z.infer<typeof AdminSkill>;
+export const AdminSkillsResponse = z.object({ skills: z.array(AdminSkill) });
+
 /** Error codes returned as `{ error }` by the auth layer. */
 export type AuthError =
   | "bad_host"
@@ -113,6 +136,7 @@ export type AuthError =
   | "email_taken"
   | "cannot_change_self"
   | "last_admin"
+  | "unknown_skill"
   | "not_found";
 
 /**

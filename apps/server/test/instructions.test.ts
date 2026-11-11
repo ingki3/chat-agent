@@ -405,7 +405,13 @@ async function family(o: { tools?: string[] } = {}) {
       flushMs: 0,
       now: () => NOW.getTime(),
       ...(o.tools
-        ? { mcp: { endpoint: async () => ({ url: "http://127.0.0.1:9/mcp" }), toolNames: () => o.tools! } }
+        ? {
+            mcp: {
+              endpoint: async () => ({ url: "http://127.0.0.1:9/mcp" }),
+              toolNames: () => o.tools!,
+              toolNamesFor: () => o.tools!,
+            },
+          }
         : {}),
     },
   });

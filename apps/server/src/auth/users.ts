@@ -171,6 +171,18 @@ export class UserStore {
     this.db.update(users).set({ youth, updatedAt: this.now() }).where(eq(users.id, userId)).run();
   }
 
+  /**
+   * Which skills the user may use (FR-1.6): "all" or a list of PRD §7 names. Only the `skills` field of the
+   * permissions changes (read and written in one synchronous step). Takes effect at once: the MCP server checks
+   * every call (#21).
+   */
+  setSkills(userId: string, skills: "all" | string[]): void {
+    const u = this.byId(userId);
+    if (!u) return;
+    const permissions = { ...(u.permissions as UserPermissions), skills };
+    this.db.update(users).set({ permissions, updatedAt: this.now() }).where(eq(users.id, userId)).run();
+  }
+
   setRole(userId: string, role: Role): void {
     this.db.update(users).set({ role, updatedAt: this.now() }).where(eq(users.id, userId)).run();
     this.events.emit("user-access-changed", { userId, reason: "role_changed" });
