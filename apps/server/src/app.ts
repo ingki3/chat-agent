@@ -17,6 +17,8 @@ import { RuntimeRegistry } from "./runtime/adapter.js";
 import { FakeRuntime } from "./runtime/fake.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
+import { McpTokens } from "./isolation/tokens.js";
+import { McpService, type McpServiceOptions } from "./mcp/service.js";
 import type { Db } from "./db/client.js";
 import { AppEvents } from "./events.js";
 import { isApiPath } from "./paths.js";
@@ -54,6 +56,7 @@ declare module "fastify" {
     appEvents: AppEvents;
     conversations: ConversationStore | undefined;
     runs: RunManager | undefined;
+    mcp: McpService | undefined;
   }
 }
 
@@ -77,6 +80,8 @@ export type BuildOptions = {
   /** Runtime adapters (tests pass FakeRuntime instances). Default: real adapters (#15/#16), FakeRuntime if FAKE_RUNTIME=1. */
   runtimes?: RuntimeRegistry;
   runs?: RunManagerOptions;
+  /** MCP server overrides (tests: skill runner, clock). */
+  mcp?: McpServiceOptions;
   /** SSE timing overrides (tests). */
   sse?: { heartbeatMs?: number };
   /** User-admin overrides (tests). */
@@ -120,7 +125,14 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerUserAdmin(app, users, opts.userAdmin);
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
-    const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, opts.runs);
+    // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
+    const mcpTokens = new McpTokens();
+    const mcp = new McpService(mcpTokens, users, opts.mcp);
+    const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
+      mcp,
+      mcpTokens,
+      ...opts.runs,
+    });
     // Runs left running by a previous process cannot be continued: mark them failed before serving.
     runManager.recover();
     const purge = setInterval(() => runManager.purgeEvents(), 10 * 60_000);
@@ -128,6 +140,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onClose", async () => clearInterval(purge));
     // preClose: before Fastify waits for open connections, end the event streams that would otherwise hold it.
     app.addHook("preClose", async () => runManager.shutdown());
+    app.addHook("onClose", async () => mcp.close());
+    app.decorate("mcp", mcp);
     app.decorate("runs", runManager);
     registerConversationRoutes(app, app.conversations!, runManager);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});

@@ -75,6 +75,7 @@ export class FakeRuntime implements RuntimeAdapter {
       script?: FakeScript;
       models?: RuntimeCapabilities["models"];
       canResume?: boolean;
+      usesTools?: boolean;
     } = {},
   ) {
     this.id = opts.id ?? "claude-code";
@@ -93,6 +94,7 @@ export class FakeRuntime implements RuntimeAdapter {
       ],
       canSwitchModelInSession: true,
       canResume: this.opts.canResume ?? true,
+      usesTools: this.opts.usesTools ?? false,
     };
   }
 

@@ -544,7 +544,7 @@ describe("MCP call tokens", () => {
 });
 
 describe("runtime lockdown settings", () => {
-  const mcp = { command: "/usr/local/bin/node", args: ["/srv/mcp.js"], env: { AGENTLEE_MCP_TOKEN: "t" } };
+  const mcp = { url: "http://127.0.0.1:41000/mcp", token: "t" };
 
   it("Claude: no built-in tools, no user settings, only our MCP, and a hook that denies anything else", async () => {
     const o = claudeLockdown({ cwd: "/srv/work", env: { PATH: "/usr/bin" }, mcp });
@@ -564,8 +564,11 @@ describe("runtime lockdown settings", () => {
       expect(await hook({ tool_name: name }), name).toMatchObject({
         hookSpecificOutput: { permissionDecision: "deny" },
       });
-    expect(await hook({ tool_name: "mcp__agentlee__echo_time" })).toEqual({});
-    expect(preToolUse("mcp__agentlee__cite")).toEqual({});
+    for (const name of ["mcp__agentlee__echo_time", "mcp__agentlee__skill_selftest"])
+      expect(await hook({ tool_name: name }), name).toMatchObject({
+        hookSpecificOutput: { permissionDecision: "allow" },
+      });
+    expect(preToolUse("mcp__agentlee__cite").hookSpecificOutput.permissionDecision).toBe("allow");
   });
 
   it("Claude: a session with any other MCP server is refused", () => {
@@ -578,11 +581,11 @@ describe("runtime lockdown settings", () => {
   it("Codex: own config with features off and only our MCP server", () => {
     const tomlText = codexConfigToml({
       model: "gpt-6.1-sol",
-      mcp: { ...mcp, env: { AGENTLEE_MCP_TOKEN: 'a"b' } },
+      mcp,
     });
     for (const f of CODEX_DISABLED_FEATURES) expect(tomlText).toContain(`${f} = false`);
     expect(tomlText.match(/^\[mcp_servers\.[^.\]]+\]$/gm)).toEqual(["[mcp_servers.agentlee]"]);
     expect(tomlText).toContain('approval_policy = "never"');
-    expect(tomlText).toContain('AGENTLEE_MCP_TOKEN = "a\\"b"');
+    expect(tomlText).toContain('bearer_token_env_var = "AGENTLEE_MCP_TOKEN"');
   });
 });

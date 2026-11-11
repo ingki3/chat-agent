@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { canonicalPath } from "../fs-safety.js";
 import { findHardLinks } from "./paths.js";
 
@@ -72,6 +73,14 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
     ),
     ...write.map((p) => `(allow file-read* file-write* (subpath ${lit(p)}))`),
   ];
+  // Metadata (stat) of the folders above allowed paths — not their contents or listings. Programs that resolve
+  // their own path (node's realpath of its script) stat every parent and fail without it.
+  const parents = new Set<string>();
+  for (const p of [...read, ...write, ...(policy.trusted ?? []).map(canonicalPath), ...exec])
+    for (let d = path.dirname(p); d !== path.dirname(d); d = path.dirname(d)) parents.add(d);
+  parents.add("/");
+  if (parents.size)
+    lines.push(`(allow file-read-metadata ${[...parents].map((d) => `(literal ${lit(d)})`).join(" ")})`);
   const net = policy.network ?? "none";
   if (net === "all") lines.push("(allow network*)", "(allow mach-lookup)");
   else if (net !== "none")

@@ -586,10 +586,11 @@ describe("runs: robustness (review #74)", () => {
         models: [{ id: "c", label: "C", efforts: [] }],
         canSwitchModelInSession: false,
         canResume: false,
+        usesTools: true,
       }),
       resume: () => Promise.reject(new Error("no")),
       start: async (ctx) => {
-        token = ctx.mcpToken;
+        token = ctx.mcp?.token;
         return {
           externalSessionId: "t",
           setModel: async () => {},
@@ -855,11 +856,12 @@ describe("runs: MCP call tokens (#42)", () => {
         models: [{ id: "c", label: "C", efforts: [] }],
         canSwitchModelInSession: false,
         canResume: false,
+        usesTools: true,
       }),
       resume: () => Promise.reject(new Error("no")),
       start: async (ctx) => {
-        seen = ctx.mcpToken;
-        duringRun = tokensRef.tokens?.verify(ctx.mcpToken);
+        seen = ctx.mcp?.token;
+        duringRun = tokensRef.tokens?.verify(ctx.mcp?.token);
         return {
           externalSessionId: "m",
           setModel: async () => {},
