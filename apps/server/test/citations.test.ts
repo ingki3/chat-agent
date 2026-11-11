@@ -62,6 +62,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("반도\u200B체 수\u00AD출이 전년")).toBe(true);
     expect(found("반도체 수출이 전년 같은 달보다".normalize("NFD"))).toBe(true);
     expect(found("반도체 수출이 전년 같은 달보다", BODY.normalize("NFD"))).toBe(true);
+    // Spaces of every width (round 3: an explicit fold instead of NFKC).
+    expect(found("반도체 수출이 전년 같은 달보다", "반도체\u00A0수출이\u3000전년\u2009같은 달보다")).toBe(
+      true,
+    );
     // Quote marks and ellipses the model put around the passage.
     expect(found("“…반도체 수출이 전년 같은 달보다...”")).toBe(true);
   });
@@ -109,7 +113,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("32% 늘었다고 밝혔다", "끝났다. 32% 늘었다고 밝혔다.")).toBe(true);
   });
 
-  it("HTML entities, line-end hyphenation and inline footnote numbers in the page (review #97)", () => {
+  it("HTML entities, line-end hyphens (not joined) and inline footnote numbers in the page (review #97)", () => {
     const page =
       "기온은 &minus;5도로 떨어졌다 &amp; 눈이 왔다. 수치는 &#8722;3&nbsp;% 였다. 값은 &#x2212;7이다.";
     expect(found("기온은 −5도로 떨어졌다 & 눈이 왔다", page)).toBe(true);
@@ -124,32 +128,31 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     });
     // An unknown or broken entity stays as written.
     expect(found("a &bogus; b c d e", "x a &bogus; b c d e")).toBe(true);
-    const hyph =
-      "Semicon-\nductor exports rose sharply. A well-\n  known firm said so. The semi-conductor era.";
-    expect(found("Semiconductor exports rose sharply", hyph)).toBe(true);
-    expect(found("A wellknown firm said so", hyph)).toBe(true);
-    // A hyphen inside a line is a hyphen.
-    expect(found("The semiconductor era", hyph)).toBe(false);
-    expect(found("The semi-conductor era", hyph)).toBe(true);
-    // Numbers broken at a line end are not joined.
-    expect(found("값은 1020이다", "값은 10-\n20이다")).toBe(false);
-    expect(found("10year bonds rose", "The 10-\nyear bonds rose.")).toBe(false);
-    // Round 2: a space before the hyphen, or a blank line after it, is not a broken word.
-    expect(found("profit margins grew", "The pro -\nfit margins grew.")).toBe(false);
-    expect(found("resign the deal now", "They re-\n\nsign the deal now.")).toBe(false);
-    expect(found("resign the deal now", "They re-\n \nsign the deal now.")).toBe(false);
-    expect(found("resign the deal now", "They re- \nsign the deal now.")).toBe(false);
-    expect(found("Semiconductor exports rose", "Semicon-\r\nductor exports rose.")).toBe(true);
-    // Not through an entity either.
-    expect(found("Semiconductor exports rose", "Semicon&#8208;\nductor exports rose.")).toBe(false);
+    // Round 3: a hyphen at a line end is never joined — it stays a hyphen and a space (x−y is not xy, re-sign is
+    // not resign). A wrapped word then shows as not found (⚠️), which is acceptable.
+    const wrapped =
+      "Semicon-\nductor exports rose sharply. They re-\nsign the deal. Then x\u2212\ny was used.";
+    expect(found("Semiconductor exports rose sharply", wrapped)).toBe(false);
+    expect(found("Semicon- ductor exports rose sharply", wrapped)).toBe(true);
+    expect(found("They resign the deal", wrapped)).toBe(false);
+    expect(found("Then xy was used", wrapped)).toBe(false);
+    expect(found("Then x- y was used", wrapped)).toBe(true);
+    expect(found("Semiconductor exports rose", "Semicon-\r\nductor exports rose.")).toBe(false);
     const notes = "수출이 크게 늘었다[3]. 업계는 반겼다²³. 정부는 지원을 약속했다[12][13].";
     expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(true);
     expect(found("정부는 지원을 약속했다.", notes)).toBe(true);
     expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(true);
-    expect(found("said so. Then they left", "They said so.¹ Then they left.")).toBe(true);
-    // Round 2: superscripts after a digit or a unit are exponents, and [n] next to a digit is not a footnote.
+    // Round 3: a superscript is dropped only after Hangul / Han / Kana — not after punctuation or a bracket.
+    expect(found("said so. Then they left", "They said so.¹ Then they left.")).toBe(false);
+    // Round 2–3: superscripts after a digit or a unit are exponents (and no NFKC: ² is not 2), [n] next to a digit
+    // is not a footnote.
     expect(found("참가자는 10만 명이었다", "참가자는 10²만 명이었다.")).toBe(false);
-    expect(found("참가자는 102만 명이었다", "참가자는 10²만 명이었다.")).toBe(true);
+    expect(found("참가자는 102만 명이었다", "참가자는 10²만 명이었다.")).toBe(false);
+    expect(found("참가자는 10²만 명이었다", "참가자는 10²만 명이었다.")).toBe(true);
+    expect(found("넓이는 (10) 제곱미터였다", "넓이는 (10)² 제곱미터였다.")).toBe(false);
+    expect(found("넓이는 (10)2 제곱미터였다", "넓이는 (10)² 제곱미터였다.")).toBe(false);
+    expect(found("물 분자는 H2O 이다", "물 분자는 H₂O 이다.")).toBe(false);
+    expect(found("첫째는 1 항목이다", "첫째는 ① 항목이다.")).toBe(false);
     expect(found("넓이는 10 제곱미터였다", "넓이는 10² 제곱미터였다.")).toBe(false);
     expect(found("업계는 반겼다정부는 지원했다", "업계는 반겼다²정부는 지원했다.")).toBe(false);
     expect(found("면적은 32m³ 이었다", "면적은 32m² 이었다.")).toBe(false);
@@ -539,6 +542,10 @@ describe("paragraphs that need a citation", () => {
     expect(ns("늘었다[3]\n다음")).toEqual([3]);
     expect(ns("늘었다[3]  \n다음")).toEqual([3]);
     expect(ns("늘었다[3]\t")).toEqual([3]);
+    // Round 3: prose after ASCII words at a line end is a marker; only expressions are indexing.
+    expect(ns("Exports increased this year[1]  \n")).toEqual([1]);
+    expect(ns("신제품 이름은 Galaxy Ultra[1]  \n다음")).toEqual([1]);
+    expect(ns("모델은 X1[2]")).toEqual([2]);
     expect(ns("Exports rose[4].")).toEqual([4]);
     for (const t of [
       "배열 a[1] 은 두 번째",
@@ -547,6 +554,12 @@ describe("paragraphs that need a citation", () => {
       "`b[2]`.",
       "[1](http://x).",
       "m[1][2] = 3",
+      // Round 3: expressions only.
+      "y = foo(a[1]\n",
+      "obj.items[1]\n",
+      "f(x, a[1]\n",
+      "m[0][1]\n",
+      "total += arr[2]  \n",
     ])
       expect(ns(t), t).toEqual([]);
   });
@@ -676,6 +689,10 @@ describe("citationNote", () => {
       "양산이 확정됐으니 자료를 더 찾아볼게요.",
       "양산이 확정돼서 더 찾아볼게요.",
       "Exports rose, so let me check.",
+      // Round 3: a complement clause that carries a fact.
+      "양산이 확정됐음을 알려드리겠습니다.",
+      "양산이 확정됐다는 소식을 확인해 볼게요.",
+      "양산이 확정이라는 기사를 찾아볼게요.",
     ])
       expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toHaveLength(1);
     expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);

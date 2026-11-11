@@ -4,14 +4,18 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
  * The citation check (#25, PRD FR-5.2): is the snippet the model quoted really in the page text we stored?
  *
  * Both texts are normalised the same way:
- * - Unicode NFKC (fullwidth letters, compatibility forms, `…` → `...`), per character cluster (a base character
- *   with its combining marks and Hangul jamo), so decomposed Hangul matches composed Hangul;
+ * - Unicode NFC per character cluster (a base character with its combining marks and Hangul jamo), so decomposed
+ *   Hangul and accents match composed ones, then a small explicit fold: fullwidth ASCII to ASCII and `…` to `...`;
+ *   spaces of every width count as whitespace. No NFKC: superscripts, subscripts and other compatibility
+ *   characters stay distinct (`10²` is not `102`, `H₂O` is not `H2O`);
  * - every quote style to one quote mark, every dash to `-`, invisible characters removed, any run of whitespace to
  *   one space, lower case;
  * - common HTML entities decoded (`&amp;` `&minus;` `&nbsp;` `&#8722;` `&#x2212;` …) — page text can still carry
  *   them;
- * - a word broken with a hyphen at a line end joined again (`semi-\nconductor` → `semiconductor`);
- * - inline footnote numbers dropped: `[3]` (one to three digits in brackets) and superscript digits.
+ * - inline footnote numbers dropped: `[3]` (one to three digits in brackets, not next to a digit) and superscript
+ *   digits right after a Hangul / Han / Kana character at a word end.
+ * A hyphen at a line end is **not** joined (`x−\ny`, `re-\nsign` are ambiguous): a wrapped word shows as not found.
+ * When in doubt, nothing is normalised — a false "not found" shows ⚠️, a false "verified" must not happen.
  * Then the snippet must occur **as a whole**: no fuzzy matching, no partial overlap, no joining of pieces. A match
  * must start at a word boundary and not inside a number (`32%` is not found in `132%`, `1.32%`, `-32%`; `234` not
  * in `1,234`), and must not end in the middle of a number or a Latin word (`3` not in `3.5`); a Korean particle
@@ -26,7 +30,6 @@ const DASHES = /[‐‑‒–—―−]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
 const WORD = /[\p{L}\p{N}]/u;
 const DIGIT = /\p{N}/u;
-const LETTER = /\p{L}/u;
 const LATIN = /\p{Script=Latin}/u;
 const SPACE = /\s/u;
 
@@ -82,12 +85,26 @@ function joins(cp: number): boolean {
   return j;
 }
 
+/**
+ * The small explicit fold after NFC (review #97 round 3: no NFKC — it turns `²` into `2`, `①` into `1`):
+ * fullwidth ASCII to ASCII and `…` to `...` (spaces of every width are whitespace already). Superscripts, subscripts, circled digits and
+ * every other compatibility character stay what they are.
+ */
+function fold(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    out += cp >= 0xff01 && cp <= 0xff5e ? String.fromCharCode(cp - 0xfee0) : cp === 0x2026 ? "..." : ch;
+  }
+  return out;
+}
+
 const clusterCache = new Map<string, string>();
-/** One cluster normalised (NFKC, invisible removed, quotes, dashes, lower case), cached. */
+/** One cluster normalised (NFC + fold, invisible removed, quotes, dashes, lower case), cached. */
 function normCluster(s: string): string {
   let r = clusterCache.get(s);
   if (r !== undefined) return r;
-  r = s.normalize("NFKC").replace(INVISIBLE, "").replace(QUOTES, '"').replace(DASHES, "-").toLowerCase();
+  r = fold(s.normalize("NFC")).replace(INVISIBLE, "").replace(QUOTES, '"').replace(DASHES, "-").toLowerCase();
   if (clusterCache.size < 50_000) clusterCache.set(s, r);
   return r;
 }
@@ -99,7 +116,7 @@ export function normalizeWithMap(text: string): Normalized {
   verifyStats.normalized++;
   const len = text.length;
   const out: string[] = [];
-  // Output is at most a few times the input (NFKC expands some compatibility characters): grown when needed.
+  // Output can be a little longer than the input (`…` → `...`): grown when needed.
   let from = new Int32Array(len + 16);
   let to = new Int32Array(len + 16);
   let n = 0;
@@ -141,34 +158,18 @@ export function normalizeWithMap(text: string): Normalized {
     const c = text.charCodeAt(i - 1);
     return c >= 0xdc00 && c <= 0xdfff && i >= 2 ? text.slice(i - 2, i) : text[i - 1]!;
   };
-  /**
-   * A hyphen at `[hy, after)` that breaks a word at a line end: a letter right before it in the source, then
-   * exactly one line break (CRLF ok) and optional indentation, then a letter. Returns where the word goes on, or
-   * -1. Never across a space before the hyphen or a blank line.
-   */
-  const hyphenBreak = (hy: number, after: number): number => {
-    if (!LETTER.test(rawBefore(hy))) return -1;
-    let j = after;
-    if (text.charCodeAt(j) === 13) j++;
-    if (text.charCodeAt(j) !== 10) return -1;
-    j++;
-    while (j < len && (text.charCodeAt(j) === 32 || text.charCodeAt(j) === 9)) j++;
-    const next = text.codePointAt(j);
-    return next !== undefined && LETTER.test(String.fromCodePoint(next)) ? j : -1;
-  };
   /** A word end after a footnote: end of text, a space, or punctuation (not a letter, digit or unit). */
   const wordEndAt = (j: number) => {
     const next = text.codePointAt(j);
     return next === undefined || !/[\p{L}\p{N}\p{M}]/u.test(String.fromCodePoint(next));
   };
   /**
-   * Superscript digits at `[s, e)` that are a footnote: after a Hangul / CJK character or closing punctuation, at
-   * a word end. After a digit or a Latin letter (`10²`, `m²`) they are an exponent or a unit and are kept.
+   * Superscript digits at `[s, e)` that are a footnote: only right after a Hangul, Han or Kana character, at a word
+   * end (`반겼다²`). Anywhere else (`10²`, `m²`, `(10)²`, `so.¹`) they are kept as the characters they are.
    */
   const superscriptNote = (s: number, e: number) =>
-    /[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}.,;:!?)\]"'”’」』]/u.test(
-      rawBefore(s),
-    ) && wordEndAt(e);
+    /[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(rawBefore(s)) &&
+    wordEndAt(e);
 
   let i = 0;
   while (i < len) {
@@ -184,15 +185,6 @@ export function normalizeWithMap(text: string): Normalized {
       } else if (c === 34 || c === 39 || c === 96) {
         put('"', i, i + 1);
         i++;
-      } else if (c === 45) {
-        const j = hyphenBreak(i, i + 1);
-        if (j >= 0) {
-          pendingSpace = -1;
-          i = j;
-        } else {
-          put("-", i, i + 1);
-          i++;
-        }
       } else if (c === 91) {
         const m = /^\[\d{1,3}\]/.exec(text.slice(i, i + 5));
         // An inline footnote number — not next to a digit, where dropping it would join two numbers.
@@ -215,7 +207,6 @@ export function normalizeWithMap(text: string): Normalized {
           : undefined;
         if (m && decoded !== undefined) {
           const end = i + m[0].length;
-          // No hyphen joining through an entity: when in doubt, not normalised.
           emit(normCluster(decoded), i, end);
           i = end;
         } else {
@@ -244,16 +235,7 @@ export function normalizeWithMap(text: string): Normalized {
       if (!joins(cp)) break;
       i += cp > 0xffff ? 2 : 1;
     }
-    const r = normCluster(text.slice(start, i));
-    if (r === "-") {
-      const j = hyphenBreak(start, i);
-      if (j >= 0) {
-        pendingSpace = -1;
-        i = j;
-        continue;
-      }
-    }
-    emit(r, start, i);
+    emit(normCluster(text.slice(start, i)), start, i);
   }
   return { norm: out.join(""), from: from.subarray(0, n), to: to.subarray(0, n) };
 }

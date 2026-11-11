@@ -62,6 +62,9 @@ const PROGRESS =
 const CONNECTIVE =
   /(?:니까?|서|고|지만|는데|은데|던데|으며|며|면서|므로|라|나|만)[,]?\s|[,;:]|\b(?:and|because|since|so|but|as)\b/iu;
 
+/** A complement clause that carries a fact ("양산이 확정됐음을 알려드리겠습니다", "…다는", "…라는"). */
+const COMPLEMENT = /(?:음을|함을|임을|다는|라는|냐는|다고|라고)\s/u;
+
 /**
  * A short progress note before the first tool call: one sentence, no figure, no marker, saying what comes next.
  * Paragraphs that state something before a tool call are still checked.
@@ -71,7 +74,7 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
   const t = text.slice(u.start, u.end).trim();
   if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
   // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
-  if (CONNECTIVE.test(t)) return false;
+  if (CONNECTIVE.test(t) || COMPLEMENT.test(t)) return false;
   return PROGRESS.test(t);
 }
 

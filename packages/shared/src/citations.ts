@@ -255,10 +255,27 @@ export function citationMarkers(
 }
 
 const END = /[.!?。！？]/u;
+
+/**
+ * Whether a marker at `start` is array indexing in a code-like expression: it directly follows an identifier
+ * (`a[1]`, `items[1]`), and an operator stands right before that identifier (`x = a[1]`, `foo(a[1]`,
+ * `obj.items[1]`, `a[0][1]` is a chain). A prose line ending in `… this year[1]` or `Galaxy Ultra[1]` is not one
+ * (review #97 round 3). Code blocks and inline code are never markers anyway.
+ */
+function inExpression(text: string, start: number): boolean {
+  const prev = text[start - 1] ?? "";
+  if (prev === "]") return true; // a[0][1]
+  if (!/[A-Za-z0-9_]/.test(prev)) return false;
+  let k = start - 1;
+  while (k >= 0 && /[A-Za-z0-9_]/.test(text[k]!)) k--;
+  if (k >= 0 && /[.\]]/.test(text[k]!)) return true; // obj.items[1], a[0][1]
+  while (k >= 0 && (text[k] === " " || text[k] === "\t")) k--;
+  return k >= 0 && /[=(;{,+\-*/<>!&|[]/.test(text[k]!);
+}
 /**
  * Markers that stand where a citation stands — at the end of a sentence: right before sentence punctuation (not
- * `a[1].length`), right after it (`늘었다.[1]`), or at the end of a line after something that is not an ASCII name
- * (`늘었다[1]`, not `x = a[1]`). Chained markers (`[1][2]`) count together. For answers that used no web tool:
+ * `a[1].length`), right after it (`늘었다.[1]`), or at the end of a line (trailing spaces allowed) unless it is
+ * array indexing in an expression (`늘었다[1]`, `this year[1]`; not `x = a[1]`). Chained markers (`[1][2]`) count together. For answers that used no web tool:
  * a marker there pretends to cite, so it is checked; `a[1]` in prose is not.
  */
 export function sentenceEndMarkers(text: string): CitationMarker[] {
@@ -275,7 +292,7 @@ export function sentenceEndMarkers(text: string): CitationMarker[] {
     const atEnd =
       (END.test(after) && !/[A-Za-z0-9_(]/.test(afterNext)) ||
       /[.!?。！？"”)]/u.test(before) ||
-      (lineRest !== null && before !== "" && !/[A-Za-z0-9_\]]/.test(before));
+      (lineRest !== null && before !== "" && !inExpression(text, all[i]!.start));
     if (atEnd) out.push(...all.slice(i, j + 1));
     i = j + 1;
   }
