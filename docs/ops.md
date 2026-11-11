@@ -498,7 +498,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
   sqlite3 -readonly data/agentlee.db \
     "select date(created_at/1000,'unixepoch','localtime') d, user_id, runtime, model, purpose, auth_type,
             count(*) attempts, sum(input_tokens) input, sum(output_tokens) output,
-            round(sum(priced_cost_usd),4) usd, sum(auth_type='api_key' and priced_cost_usd is null) missing
+            round(sum(priced_cost_micros)/1000000.0,6) usd, sum(auth_type in ('api_key','unknown') and priced_cost_micros is null) missing
        from usage_records group by d, user_id, runtime, model, purpose, auth_type order by d desc;"
   ```
 
