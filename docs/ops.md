@@ -279,3 +279,27 @@ rm ~/.agentlee/probe-headers.txt
 - 수동(PC): 운영 빌드(`pnpm build && pnpm start`)를 `http://localhost:3000`으로 열고 로그인 → 설정 → 알림 → "이 기기에서 알림 켜기" → 허용 → "테스트 알림". 개발 모드(`pnpm dev`)는 서비스 워커를 등록하지 않아 "지원 안 됨"으로 보인다.
 - 실기기(Android Chrome, iPhone 홈 화면 앱): `docs/evidence/push/checklist.md`를 따라 하고 결과를 그 파일에 적는다. 휴대폰은 HTTPS가 필요하므로 `https://chat.2prostream.com`으로 접속한다.
 - 문제 확인: `jq -c 'select(.msg|startswith("push."))' /Library/Logs/agentlee/server.log` — 보낸 수, 받은 기기 수, 실패 상태 코드만 나온다.
+
+## 13. Codex 연결 (임시 — 앱 안 연결 관리 #17 전까지)
+`.env`에만 넣는다. 저장소·로그·디스크에 남지 않는다.
+
+- `CODEX_API_KEY`
+  - OpenAI API 키(`sk-…`)다. 가족 모두가 쓴다.
+  - app-server에는 환경 변수가 아니라 시작 직후 stdin의 `account/login/start`로만 넘긴다. 메모리에만 있다(`cli_auth_credentials_store = "ephemeral"`, `auth.json` 없음).
+  - 가족 각자의 ChatGPT 로그인(PRD D2)은 #18에서 한다. app-server의 `chatgptDeviceCode` 로그인이나 `chatgptAuthTokens` 주입을 쓰고, 둘 다 같은 방식으로 메모리에만 둔다.
+- 실행 파일은 의존성으로 고정한 `@openai/codex` **0.165.0**의 플랫폼 바이너리다. PATH의 `codex`와 `~/.codex`는 쓰지 않는다.
+  - 버전을 올릴 때는 `pnpm -s test`의 macOS 실바이너리 시험(`apps/server/test/codex.test.ts`)이 통과해야 한다. 이 시험은 설정 키, 모델 표, 노출 도구, fork 없음, 확장 없음을 확인한다.
+  - 그다음 `docs/decisions/runtime-capabilities.md` 2.4절을 갱신한다.
+- 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/codex-api-key/<사용자 id>/`.
+  - 안에는 `codex-home`(CODEX_HOME: 우리 `config.toml`·`agentlee-models.json`·thread 기록), `home`, `work`, `tmp`가 있다.
+  - 프로세스는 이 폴더만 읽는다. 쓰기는 `codex-home`·`tmp`에만 한다.
+  - 서버만 쓰는 thread 정보(시작 지시문·이전 대화)는 폴더 밖 `<…>-meta/`에 둔다.
+  - `codex-home`의 `AGENTS.md`·`skills`·`prompts`와 `work`·`home`의 내용은 세션을 열 때마다 지워진다. 여기에 파일을 두지 않는다.
+- 네트워크는 루프백만 쓴다: 우리 MCP 포트와 Codex 전용 송신 프록시.
+  - 프록시는 `api.openai.com:443`의 CONNECT만 통과시킨다.
+- 녹화: CI는 녹화된 app-server 메시지를 재생한다. 지금 `test/fixtures/codex-contract.json`은 **손으로 만든 자리표시자**다. 키가 생기면 한 번 녹화한다.
+  ```
+  pnpm --filter @agentlee/server exec tsx --conditions=development test/record-codex.ts
+  ```
+  - `test/fixtures/codex-contract.json`·`codex-tools.json`이 갱신된다(`RECORD_MODEL`로 모델 선택, 기본 `gpt-6-luna`).
+  - 스크립트는 녹화에 키나 MCP 토큰이 들어 있으면 쓰지 않는다.

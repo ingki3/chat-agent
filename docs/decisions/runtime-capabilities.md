@@ -14,7 +14,7 @@
 | 구성 요소 | 버전 |
 |---|---|
 | `@anthropic-ai/claude-agent-sdk` | 스파이크 0.3.319 → **앱은 0.3.312** (2026-10-27 배포. 의존성은 2주 이상 된 버전만 쓴다는 규칙에 따라 #15에서 낮춤. 샌드박스 실행·인증 실패 경로는 0.3.312로 다시 확인) |
-| `@openai/codex-sdk` / `codex` CLI·app-server | 0.167.0 / 0.167.0 |
+| `@openai/codex-sdk` / `codex` CLI·app-server | 스파이크 0.167.0 → **앱은 `@openai/codex` 0.165.0** (2026-10-27 배포. 2주 규칙에 따라 #16에서 낮춤. 0.166.0은 10-29 배포라 아직 2주가 안 됨). 서버는 이 패키지가 함께 내려받는 플랫폼 바이너리(`@openai/codex-darwin-arm64`의 `vendor/aarch64-apple-darwin/bin/codex`)만 실행하고, PATH의 `codex`는 쓰지 않는다. 아래 2.4절에서 핵심 사실을 0.165.0으로 다시 확인 |
 | `@modelcontextprotocol/sdk` (시험용 MCP 서버) | 1.32.2 |
 | Node | 22.22.0 |
 
@@ -75,10 +75,32 @@
 | MCP 승인 설정 필요 | 필수 | **실행** 대조군: `default_tools_approval_mode` 없이 approval `never` → `MCP tool call requires approval` 실패 (`codex-mcp-noapprove.json`). 설정하면 성공 (`codex-stream.json`) |
 | 사용자 설정 병합 | **위험 확인** | **실행** 기본 `CODEX_HOME`에서는 사용자 `~/.codex/config.toml`의 `node_repl` MCP가 붙어 `~/.zshrc`를 읽음 (`codex-lockdown.json`, 내용은 결과 파일에서 삭제) → **연결별 `CODEX_HOME` + 우리 `config.toml`만** 필수 |
 | `read-only` sandbox | 읽기 제한 아님 | **실행** 셸 켜진 상태에서 `head -1 ~/.zshrc` 성공 (`codex-readonly-default.json`) |
-| 내장 도구 끄기 | 지원(조합, 범위 한정) | **실행** `features.shell_tool/unified_exec/plugins/apps/browser_use/computer_use/memories=false` + 사용자 MCP 끄기 → 셸·파일 도구로 읽으려는 시도에서 실패 보고(`codex-lockdown2.json`, `codex-exec.json`의 `functions.exec` 시도는 "파일·셸 접근 없음"으로 실패), MCP는 성공 (app-server turn1). **`code_mode_host`는 끄면 안 됨** — 끄면 MCP 호출도 실패함(app-server 1차 실행에서 관측). code mode 런타임 자체에는 파일·셸 접근이 없음(`codex-exec.json`). 남는 도구: `request_user_input`, `clock.sleep`, `collaboration.*`(하위 에이전트) — 하위 에이전트 차단 설정은 미확인 → #16 |
+| 내장 도구 끄기 | 지원(조합, 범위 한정) | **실행** `features.shell_tool/unified_exec/plugins/apps/browser_use/computer_use/memories=false` + 사용자 MCP 끄기 → 셸·파일 도구로 읽으려는 시도에서 실패 보고(`codex-lockdown2.json`, `codex-exec.json`의 `functions.exec` 시도는 "파일·셸 접근 없음"으로 실패), MCP는 성공 (app-server turn1). **`code_mode_host`는 끄면 안 됨** — 끄면 MCP 호출도 실패함(app-server 1차 실행에서 관측). *→ #16에서 원인 확인: 내장 카탈로그의 code mode 때문. 우리 카탈로그(`tool_mode: "direct"`)로는 끄고도 MCP가 동작하며, 켜 두면 자식 프로세스가 생긴다(2.4절).* code mode 런타임 자체에는 파일·셸 접근이 없음(`codex-exec.json`). 남는 도구: `request_user_input`, `clock.sleep`, `collaboration.*`(하위 에이전트) — 하위 에이전트 차단 설정은 미확인 → #16 *(2.4절: 카탈로그 `multi_agent_version: "disabled"`로 차단)* |
 | `CODEX_HOME` 격리 | 지원 | **실행** 빈 `CODEX_HOME` → 401(로그인 없음), 상태 sqlite·sessions가 그 폴더에 생김 (`codex-codexhome.json`). 401이면 재시도로 약 40초 지연 → 어댑터가 401을 즉시 실패 처리 |
 | 환경변수 상속 차단 | 지원 | **타입·문서** `new Codex({ env })`는 부모 환경을 상속하지 않음. app-server는 우리가 프로세스 환경을 직접 지정 |
 | 사용량 | 토큰만 | **실행** `input/cached_input/cache_write_input/output/reasoning_output` 토큰, 비용 없음 → 가격표로 계산. 기본 입력이 턴당 약 3만~4.4만 토큰(대부분 캐시) |
+
+### 2.4 0.165.0 재확인 (#16, 2026-11-11)
+
+자격 증명 없이 확인했다. 실제 바이너리를 우리 샌드박스(`spawnIsolated`, fork 금지)로 띄우고 **가짜 Responses API**(로컬 SSE 서버, 시험 전용 `model_provider`)에 붙였다. 모델에게 실제로 보낸 요청 본문(도구 목록·지시문·입력)을 그대로 볼 수 있다. OpenAI API 경로는 가짜 키로 401까지만 확인했다. 재현: `apps/server/test/codex.test.ts`의 macOS 실바이너리 시험.
+
+| 항목 | 0.165.0 판정 | 근거 |
+|---|---|---|
+| app-server 메서드 | 지원 | **실행** `initialize` → `account/login/start` → `thread/start`·`thread/resume` → `turn/start` → `turn/interrupt`. 알림: `item/agentMessage/delta`(글자), `item/reasoning/summaryTextDelta`·`textDelta`, `item/started`·`item/completed`(`mcpToolCall`은 `server`·`tool`이 따로 옴 — 이름 접두사 없음), `thread/tokenUsage/updated`, `account/rateLimits/updated`, `error`(`codexErrorInfo`, `willRetry`), `turn/completed`(`completed`·`interrupted`·`failed`) |
+| **`code_mode_host`** | **스파이크 결론을 뒤집음 — 끈다** | **실행** 내장 모델 카탈로그가 모든 모델을 `tool_mode: "code_mode_only"`로 둔다. 이때 MCP 도구는 JavaScript `exec` 도구 안에서만 부를 수 있고, `exec`는 별도 바이너리 `codex-code-mode-host`를 **자식 프로세스로 띄워** 실행한다. 샌드박스에서는 `failed to spawn code-mode host …: Operation not permitted`. 스파이크의 "끄면 MCP도 실패"는 이 때문이었다. **우리 카탈로그**(`model_catalog_json`, 내장 카탈로그에서 만들고 `tool_mode: "direct"`)를 쓰면 MCP 도구가 일반 함수 도구(`mcp__agentlee` 네임스페이스)가 된다. 그러면 `code_mode_host = false`에서도 MCP 호출이 성공하고, 자식 프로세스는 생기지 않는다 |
+| 하위 에이전트(`collaboration.*`) | 막힘(카탈로그로) | **실행** `spawn_agent`·`send_message`·`wait_agent` 등이 기본으로 제공된다. 모델 카탈로그의 `multi_agent_version: "v2"` 때문이라 `features.multi_agent = false`만으로는 **안 빠진다**. 카탈로그에서 `multi_agent_version: "disabled"`로 하면 빠진다. 다른 thread의 알림이 오면 어댑터가 턴을 멈춘다(fail closed) |
+| 최종 도구 목록 | 확인 | **실행** 모델에게 가는 도구는 `functions.list_mcp_resources`·`list_mcp_resource_templates`·`read_mcp_resource`와 그 run의 우리 도구(`mcp__agentlee.<이름>`)뿐이다. `exec`·셸·`apply_patch`·`view_image`·goals·sleep·sub-agent·skills·`request_user_input`(`[tools.experimental_request_user_input] enabled = false`) 없음. `enabled_tools`로 run에 허용된 도구만 노출됨 |
+| MCP 승인 설정 | 여전히 필수 | **실행** `default_tools_approval_mode` 없이 approval `never` → `MCP tool call requires approval, but approval policy is never` |
+| 401 | 즉시 실패 처리 | **실행** 가짜 키로 실제 API(프록시 경유): 첫 `error` 알림이 약 3초에 `willRetry: true`, `responseStreamDisconnected{httpStatusCode: 401}`로 온다. 그대로 두면 WebSocket 5회 + HTTPS 5회 재시도 뒤 15~22초에 실패. 어댑터는 첫 401에서 `turn/interrupt`하고 `runtime_auth` |
+| API 키 전달 | stdin으로만 | **실행** app-server는 환경 변수 `CODEX_API_KEY`·`OPENAI_API_KEY`를 쓰지 않는다("Missing bearer"). `account/login/start {type:"apiKey"}` + `cli_auth_credentials_store = "ephemeral"` → 키는 메모리에만 있고 `auth.json`이 생기지 않는다. 실행 뒤 연결 폴더에 키 원문 없음 |
+| 프록시 | 지원 | **실행** `HTTPS_PROXY`를 WebSocket(`wss://api.openai.com/v1/responses`)과 HTTPS 모두에 쓴다. API 키 경로에서 연결한 호스트는 `api.openai.com`뿐(우리 설정: 카탈로그 고정, 분석·업데이트 확인 끔) |
+| TLS | CA 파일 필요 | **실행** 샌드박스 안에서는 플랫폼 인증서 검증이 trustd에 닿지 못해 `invalid peer certificate: UnknownIssuer`. `CODEX_CA_CERTIFICATE=/private/etc/ssl/cert.pem`(읽기 허용)로 해결 |
+| fork | 없음 | **실행** 위 설정으로 시작·MCP 호출·중단·재개 모두 fork 없이 동작. 단 `shell_snapshot`(기본 켜짐)은 사용자 셸을 띄워 환경 변수를 `shell_snapshots/`에 저장한다(샌드박스 밖 시험에서 환경 변수의 키가 파일에 남는 것을 확인) → 끈다 |
+| 프롬프트 확장 | `$스킬`만 있음 → 막음 | **실행** `@파일`·`/명령`·`!명령`은 글자 그대로 간다. **`$이름`은 SKILL.md를 읽어 프롬프트에 붙인다.** `skills.include_instructions = false`, 내장 스킬 끄기로도 꺼지지 않는다. 찾는 곳: `CODEX_HOME/skills`, `HOME/.agents/skills`, cwd의 `.agents/skills`·`.codex/skills`. 또 `CODEX_HOME/AGENTS.md`는 `project_doc_max_bytes = 0`이어도 읽힌다. 대응: 시작마다 이 파일들을 지우고, 프로세스는 `work`·`home`에 쓸 수 없게 한다(아래 isolation.md) |
+| 도구 실행 중 중단 | 지원 | **실행** 우리 MCP 도구가 20초 걸리는 동안 `turn/interrupt` → 수 ms 안에 `turn/completed status: interrupted`. 그 도구의 `item/completed`는 오지 않는다 |
+| 재개 | 지원 | **실행** 새 프로세스에서 `thread/resume` → 이전 턴 내용이 요청에 포함, 시작 때의 developer 지시(이전 대화)는 한 번만. 없는 thread id는 오류 응답 → `SessionGoneError` |
+| 한도 | 지원 | **실행**(가짜 API) 사용 한도 429 → `codexErrorInfo: "usageLimitExceeded"`, `willRetry: false`. 속도 제한 429 → `responseTooManyFailedAttempts{429}`. 스냅샷의 `rateLimitReachedType`. 어댑터는 실패한 턴만 `limit`으로 본다 |
+| 사용량·캐시 | 토큰만 | **실행** `thread/tokenUsage/updated`의 `total`(thread 누적)·`last`(마지막 요청). `cachedInputTokens`·`cacheWriteInputTokens` 포함, 비용 없음. 요청에 `prompt_cache_key = thread id`. 어댑터는 턴의 첫 보고에서 기준값(`total − last`)을 잡아 그 턴의 몫만 보고. 실제 API의 캐시 적중은 자격 증명이 생기면 녹화로 확인 |
 
 ## 3. 구독 로그인 정책 (공식 문서, 2026-11-08 조회)
 
@@ -93,6 +115,6 @@
 
 1. **어댑터 계약(#12)**: 유지. 추론 강도 허용 범위는 우리 capability 표가 검증. 중단은 "사용자 요청 중단"과 "실패"를 구분하는 상태로 정의.
 2. **Claude 어댑터(#15)**: `tools: []` + `disallowedTools`(내장 도구 이름 전체) + `strictMcpConfig: true` + **`PreToolUse` 훅으로 우리 MCP(`mcp__agentlee__*`) 외 전부 거부** + init의 `mcp_servers`가 우리 서버만이 아니면 세션 중단(계정 커넥터 대비, 관리자 Claude 구독 연결에서 특히 중요). `canUseTool`·`allowedTools`에 의존하지 않음. `settingSources: []`, 연결별 `CLAUDE_CONFIG_DIR`, `env` 허용 목록, 인증 환경변수 주입.
-3. **Codex 어댑터(#16)**: app-server 프로토콜. 연결별 `CODEX_HOME` + 우리 `config.toml`만, 위 features 끄기(**`code_mode_host`는 유지**), MCP `default_tools_approval_mode = "approve"`, 401 즉시 실패, 하위 에이전트 차단 확인, 도구 실행 중 중단 시험.
+3. **Codex 어댑터(#16)**: app-server 프로토콜. 연결별 `CODEX_HOME` + 우리 `config.toml`만, 위 features 끄기, MCP `default_tools_approval_mode = "approve"`, 401 즉시 실패, 하위 에이전트 차단, 도구 실행 중 중단 시험. **0.165.0에서 바뀐 점(2.4절):** 우리 모델 카탈로그(`tool_mode: "direct"`, `multi_agent_version: "disabled"`)를 쓰고 **`code_mode_host`는 끈다**(켜 두면 MCP 호출마다 자식 프로세스).
 4. **실행 격리(#42)**: 1차 방어는 내장 도구 제거(위 2·3), 2차 방어는 OS 수준 경로 제한. Codex `read-only` sandbox에 의존하지 않음. 최종 설정에서 "허용 MCP 성공 + 금지 접근 실패"를 함께 시험.
 5. **구독 로그인(#18)**: Codex는 app-server `chatgptDeviceCode` 로그인 실행 검증, Claude는 관리자 장기 토큰 주입 실행 검증.

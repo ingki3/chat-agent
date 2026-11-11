@@ -24,6 +24,7 @@ import {
   claudeLockdown,
   CODEX_DISABLED_FEATURES,
   codexConfigToml,
+  codexRunConfig,
   preToolUse,
 } from "../src/runtime/lockdown.js";
 
@@ -608,13 +609,13 @@ describe("runtime lockdown settings", () => {
   });
 
   it("Codex: own config with features off and only our MCP server", () => {
-    const tomlText = codexConfigToml({
-      model: "gpt-6.1-sol",
-      mcp,
-    });
+    const tomlText = codexConfigToml({ catalogPath: "/conn/codex-home/agentlee-models.json" });
     for (const f of CODEX_DISABLED_FEATURES) expect(tomlText).toContain(`${f} = false`);
-    expect(tomlText.match(/^\[mcp_servers\.[^.\]]+\]$/gm)).toEqual(["[mcp_servers.agentlee]"]);
+    expect(tomlText).not.toContain("mcp_servers");
     expect(tomlText).toContain('approval_policy = "never"');
-    expect(tomlText).toContain('bearer_token_env_var = "AGENTLEE_MCP_TOKEN"');
+    const run = codexRunConfig({ model: "gpt-6.1-sol", mcp, tools: ["echo_time"] });
+    expect(run.filter((c) => c.startsWith("mcp_servers."))).toHaveLength(1);
+    expect(run.join("\n")).toContain("mcp_servers.agentlee={ url = ");
+    expect(run.join("\n")).toContain('bearer_token_env_var = "AGENTLEE_MCP_TOKEN"');
   });
 });

@@ -67,6 +67,15 @@ const ConfigSchema = z.object({
       message: "CLAUDE_OAUTH_TOKEN must be a token from `claude setup-token`",
     }),
   ),
+  /**
+   * Codex credential until runtime connections are managed in the app (#17): an OpenAI API key for every active
+   * family member. Each member's own ChatGPT login comes with #18. Secret: `.env` only.
+   */
+  CODEX_API_KEY: optional(
+    z
+      .string()
+      .regex(/^sk-[A-Za-z0-9_-]{20,}$/, { message: "CODEX_API_KEY must be an OpenAI API key (sk-…)" }),
+  ),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -90,6 +99,8 @@ export type Config = {
   logFile?: string | undefined;
   /** Claude Code credentials (secrets — never log this object). */
   claude?: { apiKey?: string | undefined; oauthToken?: string | undefined } | undefined;
+  /** Codex credential (secret — never log this object). */
+  codex?: { apiKey: string } | undefined;
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
@@ -132,5 +143,6 @@ export function loadConfig(
       c.CLAUDE_API_KEY || c.CLAUDE_OAUTH_TOKEN
         ? { apiKey: c.CLAUDE_API_KEY, oauthToken: c.CLAUDE_OAUTH_TOKEN }
         : undefined,
+    codex: c.CODEX_API_KEY ? { apiKey: c.CODEX_API_KEY } : undefined,
   };
 }

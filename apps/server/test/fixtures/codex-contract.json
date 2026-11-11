@@ -1,0 +1,2064 @@
+{
+  "_note": "HAND-MADE placeholder in the shapes of codex app-server 0.165.0 — replace by recording the real runtime (test/record-codex.ts)",
+  "prompts": {
+    "short": "Say hello in Korean in one short sentence.",
+    "long": "Count from 1 to 200, separated by spaces.",
+    "remember": "My codename is 토마토. Reply only: OK",
+    "recall": "What is my codename? Reply with the codename only."
+  },
+  "recording": {
+    "Say hello in Korean in one short sentence.": {
+      "threadId": "rec-thread",
+      "turnId": "rec-turn",
+      "messages": [
+        {
+          "method": "turn/started",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "inProgress",
+              "error": null
+            }
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "안녕하세요, "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "반가워요!"
+          }
+        },
+        {
+          "method": "thread/tokenUsage/updated",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "tokenUsage": {
+              "total": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "last": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "modelContextWindow": 258400
+            }
+          }
+        },
+        {
+          "method": "turn/completed",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "completed",
+              "error": null
+            }
+          }
+        }
+      ]
+    },
+    "Count from 1 to 200, separated by spaces.": {
+      "threadId": "rec-thread",
+      "turnId": "rec-turn",
+      "messages": [
+        {
+          "method": "turn/started",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "inProgress",
+              "error": null
+            }
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "1 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "2 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "3 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "4 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "5 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "6 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "7 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "8 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "9 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "10 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "11 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "12 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "13 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "14 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "15 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "16 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "17 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "18 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "19 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "20 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "21 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "22 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "23 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "24 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "25 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "26 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "27 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "28 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "29 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "30 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "31 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "32 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "33 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "34 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "35 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "36 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "37 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "38 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "39 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "40 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "41 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "42 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "43 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "44 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "45 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "46 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "47 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "48 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "49 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "50 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "51 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "52 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "53 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "54 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "55 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "56 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "57 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "58 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "59 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "60 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "61 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "62 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "63 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "64 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "65 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "66 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "67 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "68 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "69 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "70 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "71 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "72 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "73 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "74 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "75 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "76 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "77 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "78 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "79 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "80 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "81 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "82 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "83 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "84 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "85 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "86 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "87 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "88 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "89 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "90 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "91 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "92 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "93 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "94 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "95 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "96 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "97 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "98 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "99 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "100 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "101 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "102 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "103 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "104 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "105 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "106 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "107 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "108 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "109 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "110 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "111 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "112 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "113 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "114 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "115 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "116 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "117 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "118 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "119 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "120 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "121 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "122 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "123 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "124 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "125 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "126 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "127 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "128 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "129 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "130 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "131 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "132 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "133 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "134 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "135 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "136 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "137 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "138 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "139 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "140 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "141 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "142 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "143 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "144 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "145 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "146 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "147 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "148 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "149 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "150 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "151 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "152 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "153 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "154 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "155 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "156 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "157 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "158 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "159 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "160 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "161 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "162 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "163 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "164 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "165 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "166 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "167 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "168 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "169 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "170 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "171 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "172 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "173 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "174 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "175 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "176 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "177 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "178 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "179 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "180 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "181 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "182 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "183 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "184 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "185 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "186 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "187 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "188 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "189 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "190 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "191 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "192 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "193 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "194 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "195 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "196 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "197 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "198 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "199 "
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "200 "
+          }
+        },
+        {
+          "method": "turn/completed",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "interrupted",
+              "error": null
+            }
+          }
+        }
+      ],
+      "interruptAt": 201
+    },
+    "My codename is 토마토. Reply only: OK": {
+      "threadId": "rec-thread",
+      "turnId": "rec-turn",
+      "messages": [
+        {
+          "method": "turn/started",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "inProgress",
+              "error": null
+            }
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "O"
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "K"
+          }
+        },
+        {
+          "method": "thread/tokenUsage/updated",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "tokenUsage": {
+              "total": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "last": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "modelContextWindow": 258400
+            }
+          }
+        },
+        {
+          "method": "turn/completed",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "completed",
+              "error": null
+            }
+          }
+        }
+      ]
+    },
+    "What is my codename? Reply with the codename only.": {
+      "threadId": "rec-thread",
+      "turnId": "rec-turn",
+      "messages": [
+        {
+          "method": "turn/started",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "inProgress",
+              "error": null
+            }
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "토마"
+          }
+        },
+        {
+          "method": "item/agentMessage/delta",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "itemId": "msg_1",
+            "delta": "토"
+          }
+        },
+        {
+          "method": "thread/tokenUsage/updated",
+          "params": {
+            "threadId": "rec-thread",
+            "turnId": "rec-turn",
+            "tokenUsage": {
+              "total": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "last": {
+                "totalTokens": 3008,
+                "inputTokens": 3000,
+                "cachedInputTokens": 2800,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": 8,
+                "reasoningOutputTokens": 0
+              },
+              "modelContextWindow": 258400
+            }
+          }
+        },
+        {
+          "method": "turn/completed",
+          "params": {
+            "threadId": "rec-thread",
+            "turn": {
+              "id": "rec-turn",
+              "items": [],
+              "status": "completed",
+              "error": null
+            }
+          }
+        }
+      ]
+    }
+  }
+}

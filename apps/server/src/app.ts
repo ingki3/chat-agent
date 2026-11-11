@@ -17,7 +17,8 @@ import { ConversationStore } from "./conversations/store.js";
 import { RuntimeRegistry } from "./runtime/adapter.js";
 import { FakeRuntime } from "./runtime/fake.js";
 import { claudeFromConfig } from "./runtime/claude-config.js";
-import { CLAUDE_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
+import { codexFromConfig } from "./runtime/codex-config.js";
+import { CLAUDE_EGRESS_HOSTS, CODEX_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
@@ -182,11 +183,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerUserAdmin(app, users, opts.userAdmin);
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
-    else if (!opts.runtimes && config.claude) {
-      // Runtime CLIs reach the internet only through this proxy (allow-listed API hosts, no private addresses).
-      const egress = new EgressService({ allow: CLAUDE_EGRESS_HOSTS });
-      app.addHook("onClose", async () => egress.close());
-      runtimes.register(claudeFromConfig(config, users, egress));
+    else if (!opts.runtimes) {
+      // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
+      // addresses) — one per runtime, so each reaches only its own provider.
+      const egressFor = (allow: readonly string[]) => {
+        const egress = new EgressService({ allow });
+        app.addHook("onClose", async () => egress.close());
+        return egress;
+      };
+      if (config.claude) runtimes.register(claudeFromConfig(config, users, egressFor(CLAUDE_EGRESS_HOSTS)));
+      if (config.codex) runtimes.register(codexFromConfig(config, users, egressFor(CODEX_EGRESS_HOSTS)));
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
