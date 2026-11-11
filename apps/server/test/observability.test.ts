@@ -9,7 +9,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { rotatingFile, sanitizeRecord } from "../src/logging.js";
-import { classifyError, ErrorLog } from "../src/observability/errors.js";
+import { classifyError, ErrorLog, runFailureCategory } from "../src/observability/errors.js";
 import { registerToolNames } from "../src/observability/policy.js";
 import {
   RuntimeRegistry,
@@ -116,6 +116,8 @@ class LeakyRuntime implements RuntimeAdapter {
           yield { type: "tool_start", callId: "c3", name: ALLOWED_CHAR_SECRETS.jwt, input: null };
           yield { type: "tool_end", callId: "c3", output: null, isError: true };
           yield { type: "usage", inputTokens: 120, outputTokens: 30, costUsd: 0.0125 };
+          if (input.text.includes("RESET"))
+            throw Object.assign(new Error(`${SECRETS.sdkError} socket hang up`), { code: "ECONNRESET" });
           if (input.text.includes("FAIL")) {
             const err = new Error(`${SECRETS.sdkError} ${input.text} ${SECRETS.apiKey}`) as Error & {
               stderr?: string;
@@ -505,6 +507,44 @@ describe("review round 1 regressions", () => {
   });
 });
 
+describe("error categories", () => {
+  it("files a code under the same category everywhere", () => {
+    for (const e of [
+      Object.assign(new Error("x"), { code: "ECONNRESET" }),
+      Object.assign(new Error("x"), { code: "SQLITE_BUSY" }),
+      Object.assign(new Error("x"), { code: "SQLITE_IOERR" }),
+      Object.assign(new Error("x"), { code: "ENOSPC" }),
+      new DOMException("x", "TimeoutError"),
+    ]) {
+      const c = classifyError(e);
+      expect(runFailureCategory(c.code), c.code).toBe(c.category);
+    }
+  });
+
+  it("records a run that failed on a reset connection as network_error / network", async () => {
+    const { app, f, log, headers, waitRun } = await start();
+    const conv = app.conversations!.create(f.users.owner.id);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: headers(f.cookies.owner, { "content-type": "application/json" }),
+      payload: { text: "RESET" },
+    });
+    const run = await waitRun(res.json<StartRunResponse>().run.id);
+    expect(run.errorCode).toBe("network_error");
+    expect(log.records().find((r) => r.msg === "run.finished")).toMatchObject({
+      errorCode: "network_error",
+      category: "network",
+    });
+    const list = await app.inject({ url: "/api/admin/errors?source=run", headers: headers(f.cookies.admin) });
+    expect(RecentErrorsResponse.parse(list.json()).errors[0]).toMatchObject({
+      code: "network_error",
+      category: "network",
+    });
+    assertNoLeak(log.text());
+  });
+});
+
 describe("recent error store", () => {
   it("forgets entries older than 30 days even when no new error arrives", () => {
     let t = Date.UTC(2026, 0, 1);
@@ -549,6 +589,85 @@ describe("rotating log file", () => {
     await new Promise<void>((r) => s.end(r));
     expect(fs.readdirSync(dir).sort()).toEqual(["server.log", "server.log.1", "server.log.2"]);
     for (const f of fs.readdirSync(dir)) expect(fs.statSync(path.join(dir, f)).size).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("log file failures", () => {
+  const enospc = () => Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+
+  it("drops and counts lines it cannot write, never erroring the stream, and reports the loss later", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const file = path.join(dir, "server.log");
+    let failWrites = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer) => {
+        if (failWrites > 0) {
+          failWrites--;
+          throw enospc();
+        }
+        return fs.writeSync(fd, buf);
+      }) as typeof fs.writeSync,
+    };
+    const s = rotatingFile(file, { io });
+    const errors: unknown[] = [];
+    s.on("error", (e) => errors.push(e));
+    const write = (line: string) => new Promise<void>((r) => s.write(line + "\n", () => r()));
+    await write('{"msg":"a"}');
+    failWrites = 3;
+    for (let i = 0; i < 3; i++) await write('{"msg":"lost"}');
+    expect(s.dropped).toBe(3);
+    await write('{"msg":"b"}');
+    await new Promise<void>((r) => s.end(r));
+    expect(errors).toEqual([]);
+    const lines = fs
+      .readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as object);
+    expect(lines).toEqual([
+      { msg: "a" },
+      expect.objectContaining({ msg: "log.line_dropped", dropped: 3 }),
+      { msg: "b" },
+    ]);
+  });
+
+  it("keeps writing to the current file when rotation fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const file = path.join(dir, "server.log");
+    const io = {
+      ...fs,
+      renameSync: (() => {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }) as typeof fs.renameSync,
+    };
+    const s = rotatingFile(file, { maxBytes: 50, io });
+    const errors: unknown[] = [];
+    s.on("error", (e) => errors.push(e));
+    for (let i = 0; i < 5; i++)
+      await new Promise<void>((r) => s.write('{"msg":"xxxxxxxxxxxxxxxxxxxx"}\n', () => r()));
+    await new Promise<void>((r) => s.end(r));
+    expect(errors).toEqual([]);
+    expect(s.dropped).toBe(0);
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(5);
+  });
+
+  it("keeps the server serving while the log disk is full", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const io = {
+      ...fs,
+      writeSync: (() => {
+        throw enospc();
+      }) as typeof fs.writeSync,
+    };
+    const dest = rotatingFile(path.join(dir, "server.log"), { io });
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { logStream: dest });
+    apps.push(app);
+    for (let i = 0; i < 3; i++) {
+      const res = await app.inject({ url: "/api/health", headers: { host: "localhost:3000" } });
+      expect(res.statusCode).toBe(200);
+    }
+    expect(dest.dropped).toBeGreaterThan(0);
   });
 });
 

@@ -16,9 +16,19 @@ import {
 } from "./adapter.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
-import { toolLabel } from "../observability/policy.js";
+import { registerToolNames, toolLabel } from "../observability/policy.js";
+import { OUR_TOOL_PREFIX } from "./lockdown.js";
 
 export type RunRow = typeof runs.$inferSelect;
+
+/**
+ * Our MCP server's tools are trusted names for the log and the recent-error list (#46): registered bare and as
+ * runtimes report them (`mcp__agentlee__<name>`). Returns the list unchanged.
+ */
+function trustOurTools(names: string[]): string[] {
+  registerToolNames(names.flatMap((n) => [n, `${OUR_TOOL_PREFIX}${n}`]));
+  return names;
+}
 /** In-memory state of a run that is being executed by this process. */
 type Live = {
   conversationId: string;
@@ -161,6 +171,7 @@ export class RunManager {
     this.now = opts.now ?? Date.now;
     this.flushMs = opts.flushMs ?? 500;
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
+    if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
       for (const [id, live] of this.live) if (live.conversationId === conversationId) this.drop(id, live);
@@ -497,7 +508,7 @@ export class RunManager {
       systemPrompt: this.opts.systemPrompt ?? "",
       model: run.model,
       effort: run.effort ?? undefined,
-      tools: mcp ? mcp.toolNames() : [],
+      tools: mcp ? trustOurTools(mcp.toolNames()) : [],
     };
     if (mcp) {
       const { url } = await mcp.endpoint(); // a server that cannot start fails the run (no silent tool loss)

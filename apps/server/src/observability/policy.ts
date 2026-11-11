@@ -148,6 +148,26 @@ export const toolLabel = (name: string): string => (tools.has(name) ? name : "ot
 
 export type Classified = { code: string; category: ErrorCategory };
 
+/** The category of every error code — one table, so a code is always filed under the same category. */
+export const CODE_CATEGORY: Readonly<Record<string, ErrorCategory>> = {
+  internal_error: "app",
+  bad_request: "client",
+  timeout: "network",
+  network_error: "network",
+  db_busy: "db",
+  db_error: "db",
+  disk_full: "app",
+  session_gone: "runtime",
+  shutting_down: "restart",
+  runtime_error: "runtime",
+  no_runtime: "app",
+  server_restart: "restart",
+  usage_limit: "limit",
+  tool_error: "tool",
+  unknown: "app",
+};
+const as = (code: string): Classified => ({ code, category: CODE_CATEGORY[code]! });
+
 const NETWORK_CODES = set([
   "ECONNREFUSED",
   "ECONNRESET",
@@ -176,15 +196,15 @@ export function classifyError(
   };
   const name = typeof err.name === "string" ? err.name : "";
   const code = typeof err.code === "string" ? err.code : "";
-  if (name === "AbortError" || name === "TimeoutError") return { code: "timeout", category: "network" };
-  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return { code: "db_busy", category: "db" };
-  if (code.startsWith("SQLITE_")) return { code: "db_error", category: "db" };
-  if (NETWORK_CODES.has(code)) return { code: "network_error", category: "network" };
-  if (code === "ENOSPC") return { code: "disk_full", category: "app" };
-  if (name === "SessionGoneError") return { code: "session_gone", category: "runtime" };
-  if (name === "ShuttingDownError") return { code: "shutting_down", category: "restart" };
+  if (name === "AbortError" || name === "TimeoutError") return as("timeout");
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return as("db_busy");
+  if (code.startsWith("SQLITE_")) return as("db_error");
+  if (NETWORK_CODES.has(code)) return as("network_error");
+  if (code === "ENOSPC") return as("disk_full");
+  if (name === "SessionGoneError") return as("session_gone");
+  if (name === "ShuttingDownError") return as("shutting_down");
   const status = typeof err.statusCode === "number" ? err.statusCode : 0;
-  if (status >= 400 && status < 500) return { code: "bad_request", category: "client" };
+  if (status >= 400 && status < 500) return as("bad_request");
   return fallback;
 }
 

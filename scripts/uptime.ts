@@ -183,7 +183,7 @@ export type UptimeReport = {
  * a gap longer than one interval plus `toleranceMs` (a late start, clock jitter) means a check that never ran.
  * A missed check counts as a failure ("missing": the Mac or the checker was down — the checker runs on the
  * same Mac, so a power cut leaves no record at all). Checks closer together than half an interval (a restart
- * runs one at load) are one slot, and the worst of them counts. Slots in a planned stop are excluded and shown.
+ * runs one at load) are one slot, and the worst of them counts; the schedule continues from the later one. Slots in a planned stop are excluded and shown.
  */
 export function computeUptime(
   records: UptimeRecord[],
@@ -206,12 +206,20 @@ export function computeUptime(
     const r = resultOf(c);
     return r === "ok" ? 0 : r === "unmeasured" ? 1 : r === "tunnel" ? 2 : 3;
   };
-  const kept: CheckRecord[] = [];
+  /**
+   * One scheduled slot: `at` is when it ran (its place in the window, and the end of the gap before it), `base`
+   * is the start the next run is scheduled from. They differ after a restart: launchd counts StartInterval from
+   * the last launch, and a restart launches a check at load — so the schedule continues from the later check.
+   */
+  type Slot = { at: number; base: number; check: CheckRecord };
+  const kept: Slot[] = [];
   for (const c of all) {
     const last = kept.at(-1);
-    if (last && c.at - last.at < iv / 2) {
-      if (rank(c) > rank(last)) kept[kept.length - 1] = { ...c, at: last.at };
-    } else kept.push(c);
+    if (last && c.at - last.base < iv / 2) {
+      // Same slot: the worse result counts, the schedule moves on to the later start.
+      if (rank(c) > rank(last.check)) last.check = c;
+      last.base = c.at;
+    } else kept.push({ at: c.at, base: c.at, check: c });
   }
 
   const counts: Record<SlotResult, number> = {
@@ -235,17 +243,17 @@ export function computeUptime(
     for (let k = 1; k <= n; k++) mark(a + k * iv, "missing");
   };
 
-  let prev = [...kept].reverse().find((c) => c.at < from)?.at;
-  const inWindow = kept.filter((c) => c.at >= from);
-  for (const c of inWindow) {
-    if (prev !== undefined) missedBetween(prev, c.at);
+  let prev = [...kept].reverse().find((k) => k.at < from)?.base;
+  const inWindow = kept.filter((k) => k.at >= from);
+  for (const k of inWindow) {
+    if (prev !== undefined) missedBetween(prev, k.at);
     else {
       // No check before the window: the slots before the first one were missed (coverage is reported below).
-      const n = Math.max(0, Math.floor((c.at - from - tol) / iv));
-      for (let k = n; k >= 1; k--) mark(c.at - k * iv, "missing");
+      const n = Math.max(0, Math.floor((k.at - from - tol) / iv));
+      for (let i = n; i >= 1; i--) mark(k.at - i * iv, "missing");
     }
-    mark(c.at, resultOf(c));
-    prev = c.at;
+    mark(k.at, resultOf(k.check));
+    prev = k.base;
   }
   if (prev !== undefined) {
     const n = Math.max(0, Math.floor((to - prev - tol) / iv));

@@ -11,19 +11,16 @@ import {
   isRoutePattern,
   isRuntime,
   isToolName,
+  CODE_CATEGORY,
   type ErrorCategory,
 } from "./policy.js";
 
 // Error sanitising lives in policy.ts (shared with the log sanitiser); re-exported for callers.
 export { classifyError, type Classified, type ErrorCategory } from "./policy.js";
 
-/** Category of a run failure code (RunManager's `errorCode`). */
+/** Category of a run failure code (RunManager's `errorCode`): the same as classifyError's for shared codes. */
 export function runFailureCategory(code: string): ErrorCategory {
-  if (code === "usage_limit") return "limit";
-  if (code === "server_restart") return "restart";
-  if (code === "no_runtime") return "app";
-  if (code === "tool_error") return "tool";
-  return "runtime";
+  return CODE_CATEGORY[code] ?? "runtime";
 }
 
 export type ErrorEntry = {

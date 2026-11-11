@@ -147,6 +147,37 @@ describe("uptime report", () => {
     expect(r.recorded).toBe(2017);
   });
 
+  it("follows the schedule shifted by restarts (the next check is an interval after the restart check)", () => {
+    // 30 restarts over the week, each 120 s (or 200 s) after a regular check; launchd then runs every 5 minutes
+    // from the restart check, so every later check is shifted.
+    const records: CheckRecord[] = [];
+    let t = FROM + 1000;
+    let restarts = 0;
+    while (t < NOW) {
+      records.push({ kind: "check", at: t, local: ok, external: ok });
+      const i = records.length;
+      if (i % 67 === 0 && restarts < 30) {
+        restarts++;
+        t += restarts % 2 ? 120_000 : 200_000;
+      } else t += INTERVAL_MS;
+    }
+    expect(restarts).toBe(30);
+    const r = computeUptime(records, { now: NOW });
+    expect(r.counts.missing).toBe(0);
+    expect(r.counts.app + r.counts.tunnel).toBe(0);
+    expect(r.verdict).toBe("pass");
+    // The review's minimal case: 0 s → restart check at 120 s → next at 420 s is no miss.
+    const base = FROM + 2 * DAY;
+    const shifted: CheckRecord[] = [];
+    for (let at = FROM + 1000; at <= base; at += INTERVAL_MS)
+      shifted.push({ kind: "check", at, local: ok, external: ok });
+    const restartAt = shifted.at(-1)!.at + 120_000;
+    for (let at = restartAt; at < NOW; at += INTERVAL_MS)
+      shifted.push({ kind: "check", at, local: ok, external: ok });
+    const tiny = computeUptime(shifted, { now: NOW });
+    expect(tiny.counts.missing).toBe(0);
+  });
+
   it("refuses a verdict before 7 days are recorded or without the external path", () => {
     const partial = week().filter((r) => r.kind !== "check" || r.at > FROM + DAY);
     const r = computeUptime(partial, { now: NOW });

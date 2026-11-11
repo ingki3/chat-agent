@@ -115,6 +115,8 @@ const FIELDS = new Map<string, Check>([
   ["costUsd", isNum],
   ["inputTokens", isInt],
   ["outputTokens", isInt],
+  /** Lines the log file could not write (disk full …), reported once writing works again. */
+  ["dropped", isInt],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -199,45 +201,94 @@ export function sanitizingStream(dest: NodeJS.WritableStream = process.stdout): 
   });
 }
 
-export type RotateOptions = { maxBytes?: number; keep?: number };
+/** The file operations rotatingFile uses (tests inject failures such as ENOSPC). */
+export type LogFileIo = Pick<
+  typeof fs,
+  "openSync" | "closeSync" | "fstatSync" | "writeSync" | "renameSync" | "rmSync" | "existsSync"
+>;
+export type RotateOptions = { maxBytes?: number; keep?: number; io?: LogFileIo };
+/** A log file stream that never fails: `dropped` counts lines it could not write. */
+export type RotatingFile = Writable & { readonly dropped: number };
 
 /**
  * Size-rotated log file (`server.log` → `server.log.1` … `server.log.<keep>`), written synchronously so a crash
  * loses nothing. The service owns the file itself: launchd's StandardOutPath cannot be rotated without a
  * restart (docs/ops.md §9).
+ *
+ * Logging must never take the service down: a failed write (disk full, file removed, …) drops the line and
+ * counts it instead of erroring the stream (an unhandled stream error would end the process). A failed
+ * rotation keeps writing to the current file. The next successful write reports how many lines were lost.
  */
-export function rotatingFile(file: string, opts: RotateOptions = {}): Writable {
+export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFile {
+  const io = opts.io ?? fs;
   const maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
   const keep = Math.max(1, opts.keep ?? 5);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  let fd = fs.openSync(file, "a", 0o640);
-  let size = fs.fstatSync(fd).size;
-  const rotate = () => {
-    fs.closeSync(fd);
-    fs.rmSync(`${file}.${keep}`, { force: true });
-    for (let i = keep - 1; i >= 1; i--)
-      if (fs.existsSync(`${file}.${i}`)) fs.renameSync(`${file}.${i}`, `${file}.${i + 1}`);
-    fs.renameSync(file, `${file}.1`);
-    fd = fs.openSync(file, "a", 0o640);
-    size = 0;
+  let fd: number | undefined = io.openSync(file, "a", 0o640);
+  let size = io.fstatSync(fd).size;
+  let dropped = 0;
+  let unreported = 0;
+  const reopen = () => {
+    try {
+      if (fd !== undefined) io.closeSync(fd);
+    } catch {
+      // already gone
+    }
+    fd = undefined;
+    fd = io.openSync(file, "a", 0o640);
+    size = io.fstatSync(fd).size;
   };
-  return new Writable({
+  const rotate = () => {
+    try {
+      io.rmSync(`${file}.${keep}`, { force: true });
+      for (let i = keep - 1; i >= 1; i--)
+        if (io.existsSync(`${file}.${i}`)) io.renameSync(`${file}.${i}`, `${file}.${i + 1}`);
+      io.renameSync(file, `${file}.1`);
+    } catch {
+      // Could not rotate: keep appending to the current file rather than lose lines.
+      return;
+    }
+    reopen();
+  };
+  const writeAll = (buf: Buffer) => {
+    if (fd === undefined) reopen();
+    io.writeSync(fd!, buf);
+    size += buf.length;
+  };
+  const stream = new Writable({
     write(chunk, _enc, cb) {
+      const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
       try {
-        const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
         if (size > 0 && size + buf.length > maxBytes) rotate();
-        fs.writeSync(fd, buf);
-        size += buf.length;
-        cb();
-      } catch (e) {
-        cb(e as Error);
+        if (unreported > 0) {
+          const note = { level: 40, time: Date.now(), msg: "log.line_dropped", dropped: unreported };
+          writeAll(Buffer.from(JSON.stringify(note) + "\n"));
+          unreported = 0;
+        }
+        writeAll(buf);
+      } catch {
+        dropped++;
+        unreported++;
+        // Reopen on the next write (the file may have been removed or the descriptor broken).
+        try {
+          if (fd !== undefined) io.closeSync(fd);
+        } catch {
+          // ignore
+        }
+        fd = undefined;
       }
+      cb();
     },
     final(cb) {
-      fs.closeSync(fd);
+      try {
+        if (fd !== undefined) io.closeSync(fd);
+      } catch {
+        // ignore
+      }
       cb();
     },
   });
+  return Object.defineProperty(stream, "dropped", { get: () => dropped }) as RotatingFile;
 }
 
 /** Fields an application event may carry (all checked again by `sanitizeRecord`). */
