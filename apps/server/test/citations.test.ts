@@ -45,7 +45,7 @@ const BODY =
 describe("snippet check: normalisation without fuzzy matches", () => {
   const found = (s: string, body = BODY) => findSnippet(body, s).found;
 
-  it("whitespace, quote styles, NFKC, case, invisible characters and decomposed Hangul are normalised", () => {
+  it("whitespace, quote styles, fullwidth, invisible characters and decomposed Hangul are normalised", () => {
     // A line break and double spaces in either text.
     expect(found("142억 달러로 집계됐다고 밝혔다. He said")).toBe(true);
     expect(found("32%  늘어난   142억 달러")).toBe(true);
@@ -53,9 +53,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("He said “Semiconductor exports rose 132% in October”")).toBe(true);
     expect(found("He said 'Semiconductor exports rose 132% in October'")).toBe(true);
     expect(found("ABC전자는 「최대 실적」이라고 했다")).toBe(true);
-    // Fullwidth letters (NFKC) and case.
-    expect(found('abc전자는 "최대 실적"')).toBe(true);
-    expect(found("SEMICONDUCTOR EXPORTS ROSE 132%")).toBe(true);
+    // Fullwidth letters fold to ASCII; case is kept (round 10).
+    expect(found('ABC전자는 "최대 실적"')).toBe(true);
+    expect(found('abc전자는 "최대 실적"')).toBe(false);
+    expect(found("SEMICONDUCTOR EXPORTS ROSE 132%")).toBe(false);
     // The dash style.
     expect(found('October" - a record')).toBe(true);
     // A zero-width space and a soft hyphen inside the snippet; Hangul written decomposed (NFD).
@@ -71,7 +72,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
   });
 
   it("the quote is the passage as it stands in the page", () => {
-    expect(findSnippet(BODY, "abc전자는 「최대 실적」")).toEqual({
+    expect(findSnippet(BODY, "ABC전자는 「최대 실적」")).toEqual({
       found: true,
       quote: 'ＡＢＣ전자는 "최대 실적',
     });
@@ -99,6 +100,19 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("도체 수출이 전년 같은")).toBe(false);
     // A Korean particle after the end is fine.
     expect(found("10월 반도체 수출")).toBe(true);
+  });
+
+  it("case is kept: units and formulas that differ only in case are different text (round 10)", () => {
+    expect(found("발전소의 설비 용량은 500mW", "발전소의 설비 용량은 500MW이다.")).toBe(false);
+    expect(found("회선의 최대 속도는 100MBps", "회선의 최대 속도는 100Mbps이다.")).toBe(false);
+    expect(found("검출된 기체는 Co였다고 한다", "검출된 기체는 CO였다고 한다.")).toBe(false);
+    expect(found("Exports rose sharply in October", "exports rose sharply in October.")).toBe(false);
+    // The exact case verifies.
+    expect(found("발전소의 설비 용량은 500MW", "발전소의 설비 용량은 500MW이다.")).toBe(true);
+    expect(found("회선의 최대 속도는 100Mbps", "회선의 최대 속도는 100Mbps이다.")).toBe(true);
+    expect(found("검출된 기체는 CO였다고 한다", "검출된 기체는 CO였다고 한다.")).toBe(true);
+    // The duplicate key keeps them apart too.
+    expect(normalizeSnippet("회선 속도 100Mbps")).not.toBe(normalizeSnippet("회선 속도 100MBps"));
   });
 
   it("a match never cuts a number in half: separators and Korean compound numerals (round 9)", () => {
@@ -334,7 +348,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
   it("a snippet must say something: fewer than 8 normalised characters prove nothing", () => {
     expect(findSnippet(BODY, "  “32%”  ")).toEqual({ found: false, reason: "too_short" });
     expect(findSnippet(BODY, "반도체 수출이")).toEqual({ found: false, reason: "too_short" });
-    expect(normalizeSnippet("  “Hello  World” ")).toBe("hello world");
+    expect(normalizeSnippet("  “Hello  World” ")).toBe("Hello World");
   });
 });
 
@@ -394,6 +408,16 @@ describe("CitationStore (#25)", () => {
       [3, "snippet_not_found", null],
     ]);
     expect(rows[0]!.source?.id).toBe(src.id);
+  });
+
+  it("the duplicate key is case-sensitive: 100Mbps and 100MBps are two citations (round 10)", () => {
+    const f = family();
+    const scope = f.run(f.c.id);
+    const src = f.page(scope);
+    const a = f.cites.cite(scope, { sourceId: src.id, snippet: "회선의 최대 속도는 100Mbps" });
+    const b = f.cites.cite(scope, { sourceId: src.id, snippet: "회선의 최대 속도는 100MBps" });
+    expect([a.n, b.n]).toEqual([1, 2]);
+    expect(f.cites.cite(scope, { sourceId: src.id, snippet: "“회선의 최대 속도는 100Mbps”" }).n).toBe(1);
   });
 
   it("a search result (no page text) is fetch_failed", () => {

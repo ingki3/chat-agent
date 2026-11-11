@@ -9,7 +9,8 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
  *   spaces of every width count as whitespace. No NFKC: superscripts, subscripts and other compatibility
  *   characters stay distinct (`10²` is not `102`, `H₂O` is not `H2O`);
  * - every quote style to one quote mark, every dash to `-`, invisible characters removed, any run of whitespace to
- *   one space, lower case;
+ *   one space. **No case folding** (review #97 round 10: `500MW` is not `500mW`, `CO` is not `Co`) — a quote must
+ *   keep the page's case;
  * - common HTML entities decoded (`&amp;` `&minus;` `&nbsp;` `&#8722;` `&#x2212;` …) — page text can still carry
  *   them;
  * Footnote marks are **not** removed (`[3]`, `²` stay as written — `arr[1]` is not `arr[2]`), and a hyphen at a line end is **not** joined (`x−\ny`, `re-\nsign` are ambiguous): a wrapped word shows as not found.
@@ -191,11 +192,11 @@ function fold(s: string): string {
 }
 
 const clusterCache = new Map<string, string>();
-/** One cluster normalised (NFC + fold, invisible removed, quotes, dashes, lower case), cached. */
+/** One cluster normalised (NFC + fold, invisible removed, quotes, dashes; case kept), cached. */
 function normCluster(s: string): string {
   let r = clusterCache.get(s);
   if (r !== undefined) return r;
-  r = fold(s.normalize("NFC")).replace(INVISIBLE, "").replace(QUOTES, '"').replace(DASHES, "-").toLowerCase();
+  r = fold(s.normalize("NFC")).replace(INVISIBLE, "").replace(QUOTES, '"').replace(DASHES, "-");
   if (clusterCache.size < 50_000) clusterCache.set(s, r);
   return r;
 }
@@ -250,9 +251,6 @@ export function normalizeWithMap(text: string): Normalized {
     if (c < 0x80 && !(i + 1 < len && joins(text.codePointAt(i + 1)!))) {
       if (c === 32 || (c >= 9 && c <= 13)) {
         space(i);
-        i++;
-      } else if (c >= 65 && c <= 90) {
-        put(String.fromCharCode(c + 32), i, i + 1);
         i++;
       } else if (c === 34 || c === 39 || c === 96) {
         put('"', i, i + 1);
