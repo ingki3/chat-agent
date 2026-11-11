@@ -176,6 +176,38 @@ describe("egress proxy (#15, review #80)", () => {
     expect((await send(p.port, req)).head).toMatch(/200/);
   });
 
+  it("closes refused sockets even when the client keeps its side open (no lingering half-open sockets)", async () => {
+    const up = await upstream();
+    const p = await startEgressProxy({
+      allow: ["api.anthropic.com"],
+      lookup: PUBLIC,
+      connect: () => net.connect({ host: "127.0.0.1", port: up.port }),
+      maxTunnels: 1,
+    });
+    closers.push(() => p.close());
+    const req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n";
+    await send(p.port, req); // takes the only slot
+    for (const r of [req, "CONNECT evil.example:443 HTTP/1.1\r\n\r\n"]) {
+      // allowHalfOpen: this client never ends its side; only the server can close the socket.
+      const sock = net.connect({ host: "127.0.0.1", port: p.port, allowHalfOpen: true }, () => sock.write(r));
+      closers.push(async () => sock.destroy());
+      // After the answer, keep writing: a server that really closed the socket resets it; a half-open one
+      // would keep reading forever.
+      sock.on("error", () => {});
+      const closed = new Promise<boolean>((res) => {
+        sock.once("close", () => res(true));
+        const tick = setInterval(() => {
+          if (!sock.destroyed) sock.write("x");
+        }, 100);
+        setTimeout(() => {
+          clearInterval(tick);
+          res(false);
+        }, 2500);
+      });
+      expect(await closed, r).toBe(true);
+    }
+  });
+
   it("listens on loopback only", async () => {
     const { p } = await proxy(PUBLIC, 1);
     expect(p.url).toBe(`http://127.0.0.1:${p.port}`);

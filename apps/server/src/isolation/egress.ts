@@ -63,14 +63,19 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
       client.destroy();
     });
     client.setTimeout(idleMs, () => client.destroy());
+    // A refused socket is closed for good once the answer is out — `end()` alone leaves the read side open
+    // (HTTP sockets are half-open), so a client that never hangs up would keep it (review #80).
+    const hangUp = (line: string) => {
+      client.end(line, () => client.destroy());
+      setTimeout(() => client.destroy(), 1000).unref();
+    };
+    const refuse = (code: number) =>
+      hangUp(`HTTP/1.1 ${code} ${code === 403 ? "Forbidden" : "Bad Gateway"}\r\n\r\n`);
     if (closed) return void client.destroy();
     if (tunnels > maxTunnels) {
-      client.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      hangUp("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       return;
     }
-    const refuse = (code: number) => {
-      client.end(`HTTP/1.1 ${code} ${code === 403 ? "Forbidden" : "Bad Gateway"}\r\n\r\n`);
-    };
     const m = /^([a-z0-9.-]+):(\d+)$/i.exec(req.url ?? "");
     if (!m || Number(m[2]) !== 443 || !allow.has(m[1]!.toLowerCase())) return refuse(403);
     const host = m[1]!.toLowerCase();
