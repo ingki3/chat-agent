@@ -18,13 +18,22 @@
 
 export const KNOWN_PLACEHOLDER = "[숨김]";
 export const MIN_KNOWN_LENGTH = 8;
-/** Longer values are registered by their first `MAX_KNOWN_LENGTH` characters (a prefix that long is the secret). */
+/**
+ * The one length cap (UTF-16 units), for registering and for matching alike (round 24): a value up to this long is
+ * registered and matched whole; a longer one is registered as consecutive pieces of this length (the last one
+ * ending at its end), each matched on its own — so all of it is masked wherever it appears. At most
+ * `MAX_PIECES` pieces (1 MiB); nothing the server holds comes close.
+ */
 export const MAX_KNOWN_LENGTH = 16_384;
+const MAX_PIECES = 64;
 /** A partial match this long (secret characters) at the very end of a finished text is masked too. */
 const TAIL_MIN = 8;
 /** Backslash runs longer than this are not read as one escape (keeps the scan linear). */
 const MAX_BACKSLASH_RUN = 16;
-/** Steps a single start position may take (backtracking only happens around backslashes). */
+/**
+ * Extra steps a single start position may take beyond one per character of the secret (backtracking only happens
+ * around backslashes): a full-length value always gets the steps it needs.
+ */
 const STEP_BUDGET = 4096;
 
 /** Keys of a JSON credential whose string values are secrets in their own right. */
@@ -36,8 +45,10 @@ type Compiled = {
   byFirst: Map<number, number[]>;
   /** Secrets that start with "+" or a space (its form encoding). */
   plusFirst: number[];
-  /** Literal patterns (base64 cores, hex) with the secret they stand for. */
+  /** Base64 cores (case-sensitive), found in the text with whitespace and `\n`-style escapes taken out. */
   literals: string[];
+  /** Hex of the UTF-8 bytes, lower case, found in the same view lower-cased (any mix of cases). */
+  hexes: string[];
 };
 
 export class KnownSecrets {
@@ -46,16 +57,16 @@ export class KnownSecrets {
 
   /** Registers a secret value (idempotent; too short or blank values are ignored). */
   add(value: string | undefined | null): void {
-    const v = normal(value);
-    if (v === undefined || this.values.has(v)) return;
-    this.values.add(v);
-    this.compiled = undefined;
+    for (const v of pieces(value)) {
+      if (this.values.has(v)) continue;
+      this.values.add(v);
+      this.compiled = undefined;
+    }
   }
 
   /** Forgets a value that is no longer valid anywhere (a revoked run token, an ended session). */
   remove(value: string | undefined | null): void {
-    const v = normal(value);
-    if (v !== undefined && this.values.delete(v)) this.compiled = undefined;
+    for (const v of pieces(value)) if (this.values.delete(v)) this.compiled = undefined;
   }
 
   /**
@@ -113,6 +124,7 @@ export class KnownSecrets {
     const byFirst = new Map<number, number[]>();
     const plusFirst: number[] = [];
     const literals: string[] = [];
+    const hexes: string[] = [];
     for (const v of this.values) {
       const i = secrets.length;
       const cps = [...v].map((c) => c.codePointAt(0)!);
@@ -123,26 +135,38 @@ export class KnownSecrets {
       byFirst.set(first, list);
       if (cps[0] === 32 || cps[0] === 43) plusFirst.push(i);
       for (const l of encodedLiterals(v)) literals.push(l);
+      hexes.push(Buffer.from(v, "utf8").toString("hex"));
     }
     const uniq = [...new Set(literals)].filter((l) => l.length >= MIN_KNOWN_LENGTH);
-    this.compiled = { secrets, byFirst, plusFirst, literals: uniq };
+    this.compiled = { secrets, byFirst, plusFirst, literals: uniq, hexes: [...new Set(hexes)] };
     return this.compiled;
   }
 }
 
-function normal(value: string | undefined | null): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const v = value.length > MAX_KNOWN_LENGTH ? value.slice(0, MAX_KNOWN_LENGTH) : value;
-  return v.length < MIN_KNOWN_LENGTH || !/\S/.test(v) ? undefined : v;
+/** What is registered for a value: itself, or pieces of `MAX_KNOWN_LENGTH` covering all of it. */
+function pieces(value: string | undefined | null): string[] {
+  if (typeof value !== "string" || value.length < MIN_KNOWN_LENGTH || !/\S/.test(value)) return [];
+  if (value.length <= MAX_KNOWN_LENGTH) return [value];
+  const out: string[] = [];
+  // Never cut a surrogate pair: a piece boundary moves back by one unit before a low surrogate.
+  const cut = (k: number) => (k > 0 && k < value.length && /[\uDC00-\uDFFF]/.test(value[k]!) ? k - 1 : k);
+  for (let at = 0; at < value.length && out.length < MAX_PIECES - 1;) {
+    const end = cut(Math.min(value.length, at + MAX_KNOWN_LENGTH));
+    out.push(value.slice(at, end));
+    if (end >= value.length) return out;
+    at = end;
+  }
+  out.push(value.slice(cut(value.length - MAX_KNOWN_LENGTH))); // the end, whatever the piece limit left out
+  return out;
 }
 
 /** The process-wide registry: every secret source registers here; every run output is scrubbed against it. */
 export const knownSecrets = new KnownSecrets();
 
-/** Base64 (both alphabets, every alignment) and hex forms of a value's UTF-8 bytes, as literal patterns. */
+/** Base64 (both alphabets, every alignment) of a value's UTF-8 bytes, as literal patterns. */
 function encodedLiterals(v: string): string[] {
   const bytes = Buffer.from(v, "utf8");
-  const out: string[] = [bytes.toString("hex"), bytes.toString("hex").toUpperCase()];
+  const out: string[] = [];
   for (let shift = 0; shift < 3; shift++) {
     const b64 = Buffer.concat([Buffer.alloc(shift), bytes]).toString("base64");
     // Only the characters made from the value's own bits: the same whatever comes before or after it.
@@ -259,7 +283,42 @@ function forms(text: string, i: number, cp: number, out: number[]): void {
       } else hexEscape(text, j + 1, 4, cp, out); // \uXXXX
     }
     if (x === 85) hexEscape(text, j + 1, 8, cp, out); // Python \UXXXXXXXX
+    // Byte escapes of its UTF-8 bytes: octal `\163` (Python, C, Ruby, Bash) or `\xed\x95\x9c` (Python bytes).
+    if ((x >= 48 && x <= 55) || (x === 120 && cp > 0x7f)) byteEscapes(text, i, utf8(cp), out);
   }
+}
+
+/** `bytes` written as one escape each (`\ooo` with 1–3 octal digits, or `\xHH`), each after a backslash run. */
+function byteEscapes(text: string, i: number, bytes: number[], out: number[]): void {
+  const n = text.length;
+  let j = i;
+  for (const b of bytes) {
+    if (j >= n) return void out.push(PARTIAL);
+    if (text.charCodeAt(j) !== 92) return;
+    let r = 0;
+    while (j + r < n && text.charCodeAt(j + r) === 92 && r <= MAX_BACKSLASH_RUN) r++;
+    if (r > MAX_BACKSLASH_RUN) return;
+    j += r;
+    if (j >= n) return void out.push(PARTIAL);
+    const x = text.charCodeAt(j);
+    let v = 0;
+    if (x >= 48 && x <= 55) {
+      let k = 0;
+      while (k < 3 && j + k < n && text.charCodeAt(j + k) >= 48 && text.charCodeAt(j + k) <= 55)
+        v = v * 8 + text.charCodeAt(j + k++) - 48;
+      if (k < 3 && j + k >= n) return void out.push(PARTIAL); // more digits may follow
+      j += k;
+    } else if (x === 120) {
+      if (j + 2 >= n) return void out.push(PARTIAL);
+      const h1 = text.charCodeAt(j + 1);
+      const h2 = text.charCodeAt(j + 2);
+      if (!HEX(h1) || !HEX(h2)) return;
+      v = hexVal(h1) * 16 + hexVal(h2);
+      j += 3;
+    } else return;
+    if (v !== b) return;
+  }
+  out.push(j);
 }
 
 function hexEscape(text: string, at: number, len: number, cp: number, out: number[]): void {
@@ -297,6 +356,7 @@ function braceEscape(text: string, at: number, cp: number, out: number[]): void 
 /** Matches secret `cps` at `start`: its end, PARTIAL (the text ends inside a consistent match), or FAIL. */
 function matchAt(text: string, start: number, cps: number[]): { end: number; depth: number } {
   let steps = 0;
+  const budget = cps.length * 2 + STEP_BUDGET;
   let partialDepth = -1;
   let full = FAIL;
   const buf: number[] = [];
@@ -308,7 +368,7 @@ function matchAt(text: string, start: number, cps: number[]): { end: number; dep
       full = pos;
       break;
     }
-    if (++steps > STEP_BUDGET) break;
+    if (++steps > budget) break;
     buf.length = 0;
     forms(text, pos, cps[k]!, buf);
     for (let b = buf.length - 1; b >= 0; b--) {
@@ -350,20 +410,30 @@ function scan(text: string, m: Compiled): Scan {
       } else if (r.end === PARTIAL && i === partialAt) partialDepth = Math.max(partialDepth, r.depth);
     }
   }
-  for (const l of m.literals) {
-    for (let at = text.indexOf(l); at !== -1; at = text.indexOf(l, at + 1)) found.push([at, at + l.length]);
+  // Base64 and hex: in the text with line breaks, spaces and `\n`-style escapes taken out (base64 wrapped at 76
+  // columns, PEM/MIME, CRLF or LF, a stringified PEM), hex also in any mix of cases.
+  const view = stripped(text);
+  const lower = view.v.replace(/[A-F]/g, (c) => c.toLowerCase());
+  const vn = view.v.length;
+  const origin = (k: number) => (k < vn ? view.origin[k]! : n);
+  const find = (hay: string, l: string, ratio: number) => {
+    for (let at = hay.indexOf(l); at !== -1; at = hay.indexOf(l, at + 1))
+      found.push([origin(at), origin(at + l.length - 1) + 1]);
     // The text ends inside this pattern?
     const first = l.charCodeAt(0);
-    for (let i = Math.max(0, n - l.length + 1); i < n; i++) {
-      if (text.charCodeAt(i) !== first || !l.startsWith(text.slice(i))) continue;
-      const depth = Math.floor(((n - i) * 3) / 4);
+    for (let k = Math.max(0, vn - l.length + 1); k < vn; k++) {
+      if (hay.charCodeAt(k) !== first || !l.startsWith(hay.slice(k))) continue;
+      const i = origin(k);
+      const depth = Math.floor((vn - k) * ratio);
       if (i < partialAt) {
         partialAt = i;
         partialDepth = depth;
       } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
       break;
     }
-  }
+  };
+  for (const l of m.literals) find(view.v, l, 3 / 4);
+  for (const h of m.hexes) find(lower, h, 1 / 2);
   found.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
   const ranges: [number, number][] = [];
   for (const r of found) {
@@ -372,6 +442,37 @@ function scan(text: string, m: Compiled): Scan {
     else ranges.push([r[0], r[1]]);
   }
   return { ranges, partialAt, partialDepth };
+}
+
+/** The text without whitespace and `\n` `\r` `\t` escapes (any backslash run), with each character's offset. */
+function stripped(text: string): { v: string; origin: Int32Array } {
+  const origin = new Int32Array(text.length);
+  let v = "";
+  let from = 0;
+  let len = 0;
+  const flush = (to: number) => {
+    if (to > from) {
+      v += text.slice(from, to);
+      for (let k = from; k < to; k++) origin[len++] = k;
+    }
+  };
+  for (let k = 0; k < text.length;) {
+    const c = text.charCodeAt(k);
+    if (c === 32 || c === 9 || c === 10 || c === 13) {
+      flush(k);
+      from = ++k;
+    } else if (c === 92) {
+      let e = k;
+      while (e < text.length && text.charCodeAt(e) === 92) e++;
+      const x = text.charCodeAt(e);
+      if (x === 110 || x === 114 || x === 116) {
+        flush(k);
+        from = k = e + 1;
+      } else k = e;
+    } else k++;
+  }
+  flush(text.length);
+  return { v, origin: origin.subarray(0, len) };
 }
 
 function apply(text: string, ranges: [number, number][], upTo: number): string {
@@ -448,6 +549,12 @@ export class StreamScrubber {
     }
     const s = scan(text, m);
     let cut = s.partialAt === Infinity ? text.length : s.partialAt;
+    // Held text starts at a word: the reader never sees half a word (`단어1` of `단어173`) while the rest waits.
+    if (cut < text.length) {
+      let w = cut;
+      while (w > 0 && w > cut - 256 && !/\s/.test(text[w - 1]!)) w--;
+      if (w === 0 || /\s/.test(text[w - 1]!)) cut = w;
+    }
     // A complete match that runs past the cut is masked with the held text (next time round).
     for (const [a, b] of s.ranges) if (a < cut && b > cut) cut = a;
     this.pending = text.slice(cut);

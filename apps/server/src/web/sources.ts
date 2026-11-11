@@ -168,7 +168,8 @@ export class SourceStore {
       .from(sources)
       .where(eq(sources.conversationId, conversationId))
       .orderBy(sql`rowid`)
-      .all();
+      .all()
+      .map((r) => scrubKnownDeep(r)); // reads scrubbed too (round 24): secrets registered after storing
   }
 
   /**
@@ -176,10 +177,12 @@ export class SourceStore {
    * An id from another conversation is not found.
    */
   get(conversationId: string, id: string): SourceRow | undefined {
-    return this.db
-      .select()
-      .from(sources)
-      .where(and(eq(sources.id, id), eq(sources.conversationId, conversationId)))
-      .get();
+    return scrubKnownDeep(
+      this.db
+        .select()
+        .from(sources)
+        .where(and(eq(sources.id, id), eq(sources.conversationId, conversationId)))
+        .get(),
+    );
   }
 }

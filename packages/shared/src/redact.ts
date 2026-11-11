@@ -402,8 +402,9 @@ const IDENT = /^[\p{ID_Continue}$-]$/u;
 /**
  * End of the gap at `k`: whitespace (see GAP), line continuations (a backslash before a real line break) and
  * comments (`/* … *\/`, `//…` and `#…` to the line end); with `quotes`, also quotes (`"` `'` `` ` ``) and
- * backslashes. Also whether a quote was among them, and whether a comment's end was not found within the window
- * (`open`) — then what follows cannot be known, and the caller fails closed.
+ * backslashes. Also whether a quote was among them. A comment runs to its real end, however long (round 24: a
+ * long comment is no reason to hide anything — only a separator after it is); one never closed runs to the end
+ * of the text. (`open` is kept for the callers; it is always false now.)
  */
 function gapEnd(d: string, k: number, quotes: boolean): [end: number, quote: boolean, open: boolean] {
   let quote = false;
@@ -414,15 +415,15 @@ function gapEnd(d: string, k: number, quotes: boolean): [end: number, quote: boo
     else if (c === 92 && (d.charCodeAt(k + 1) === 10 || d.charCodeAt(k + 1) === 13))
       k += d.charCodeAt(k + 1) === 13 && d.charCodeAt(k + 2) === 10 ? 3 : 2;
     else if (c === 47 && d.charCodeAt(k + 1) === 42) {
-      // A /* comment */ (looked for within a window: never a scan of the rest of the input).
-      const close = d.slice(k + 2, k + 2 + COMMENT_MAX).indexOf("*/");
-      if (close < 0) return [k, quote, true];
-      k += close + 4;
+      // A /* comment */ (the search is memoised: the scans stay linear).
+      const close = BLOCK_END.next(d, k + 2);
+      if (close < 0) return [d.length, quote, false];
+      k = close + 2;
     } else if ((c === 47 && d.charCodeAt(k + 1) === 47) || c === 35) {
-      // A // or # comment, to the end of the line (LF, CR, NEL, U+2028, U+2029), within a window.
-      const eol = d.slice(k, k + COMMENT_MAX).search(/[\n\r\u0085\u2028\u2029]/);
-      if (eol < 0) return [k, quote, k + COMMENT_MAX < d.length];
-      k += eol;
+      // A // or # comment, to the end of the line (LF, CR, NEL, U+2028, U+2029).
+      const eol = LINE_END.next(d, k);
+      if (eol < 0) return [d.length, quote, false];
+      k = eol;
     } else if (quotes && isQuoteChar(c)) {
       quote = true;
       k++;
@@ -431,6 +432,33 @@ function gapEnd(d: string, k: number, quotes: boolean): [end: number, quote: boo
   }
   return [k, quote, false];
 }
+
+/**
+ * The next match at or after `from`, memoised on the last answer: queries that move forward reuse it (one scan of
+ * the text per pass, however many comments start before the same end).
+ */
+class NextFinder {
+  private d: string | undefined;
+  private from = 0;
+  private at = -1;
+  constructor(private readonly find: (d: string, from: number) => number) {}
+  next(d: string, from: number): number {
+    if (this.d !== d || from < this.from || (this.at >= 0 && from > this.at)) {
+      this.d = d;
+      this.at = this.find(d, from);
+    }
+    this.from = from;
+    return this.at;
+  }
+}
+const BLOCK_END = new NextFinder((d, from) => d.indexOf("*/", from));
+const LINE_END = new NextFinder((d, from) => {
+  for (let k = from; k < d.length; k++) {
+    const c = d.charCodeAt(k);
+    if (c === 10 || c === 13 || c === 0x85 || c === 0x2028 || c === 0x2029) return k;
+  }
+  return -1;
+});
 
 /** A separator at `k` (`:`, `=`, `=>`, `:=`): its length, or 0. */
 function separatorAt(d: string, k: number): number {

@@ -93,6 +93,16 @@ type Live = {
   scrub: { text: StreamScrubber; reasoning: StreamScrubber };
 };
 
+/**
+ * What a runtime is handed, scrubbed again right before it is handed over (round 24): the history and prompt were
+ * built before awaits (the MCP endpoint, a resume attempt) during which a secret may have been registered.
+ */
+function rescrub(ctx: StartContext): StartContext {
+  ctx.history = scrubKnownDeep(ctx.history);
+  ctx.systemPrompt = scrubKnown(ctx.systemPrompt);
+  return ctx;
+}
+
 /** Appends text to the reply; returns the index among the *public* parts (what the message API shows). */
 function appendText(parts: MessagePart[], type: "text" | "reasoning", text: string): number {
   const last = parts.at(-1);
@@ -525,7 +535,10 @@ export class RunManager {
     );
   }
 
-  /** Events after `afterSeq`, in order. */
+  /**
+   * Events after `afterSeq`, in order — scrubbed again on the way out (round 24): a secret registered after an
+   * event was stored never comes back in a replay or a resumed stream.
+   */
   eventsAfter(id: string, afterSeq: number): { seq: number; data: StreamEvent }[] {
     return this.db
       .select()
@@ -533,7 +546,7 @@ export class RunManager {
       .where(and(eq(runEvents.runId, id), gt(runEvents.seq, afterSeq)))
       .orderBy(asc(runEvents.seq))
       .all()
-      .map((e) => ({ seq: e.seq, data: e.data as StreamEvent }));
+      .map((e) => ({ seq: e.seq, data: scrubKnownDeep(e.data as StreamEvent, { tail: false }) }));
   }
 
   /** Live event feed of a running run (undefined once it has ended). */
@@ -665,7 +678,7 @@ export class RunManager {
 
   /**
    * The text the known-secret scrubbers still hold (it might have become a secret with the next chunk): scrubbed
-   * as finished text, appended and streamed. Before a tool event and when the run ends.
+   * as finished text, appended and streamed — only when the run ends (round 24: never at a tool event).
    */
   private releaseHeld(row: RunRow, live: Live): void {
     const reasoning = live.scrub.reasoning.end();
@@ -843,7 +856,7 @@ export class RunManager {
     if (prev) {
       try {
         return {
-          session: await adapter.resume(prev.externalSessionId, ctx),
+          session: await adapter.resume(prev.externalSessionId, rescrub(ctx)),
           sessionRowId: prev.id,
           revision: conv.revision,
         };
@@ -854,7 +867,7 @@ export class RunManager {
     }
     // The run may have ended while resume() was pending (interrupt, delete, shutdown): open nothing new then.
     if (live.settled || live.interruptRequested || this.stopping) throw new RunEndedError();
-    const session = await adapter.start(ctx);
+    const session = await adapter.start(rescrub(ctx));
     try {
       // The history may have changed (edit, delete) while the session was opening: then this fails.
       const row = this.conversations.saveSession({
@@ -916,14 +929,18 @@ export class RunManager {
       // Interrupted or deleted while the session was opening.
       if (live.settled) return void closeSession(live);
       if (live.interruptRequested) return this.settle(runId, "interrupted", null);
-      const turn = session.turn({ text: inputText ?? "", model: run.model, effort: run.effort ?? undefined });
+      // Scrubbed again right before it goes: a secret registered while the session was opening (round 24).
+      const turn = session.turn({
+        text: scrubKnown(inputText ?? ""),
+        model: run.model,
+        effort: run.effort ?? undefined,
+      });
       live.turn = turn;
       for await (const ev of turn.events) {
         if (live.settled) break; // force-stopped or deleted: whatever arrives now is ignored
         // Known secrets (round 23): text streams through a holdback scrubber, so a secret split across chunks
-        // never goes out in pieces; whatever it holds goes out before the next tool event or when the run ends
-        // (usage and notices do not end the text, so they do not release it).
-        if (ev.type === "tool_start" || ev.type === "tool_end") this.releaseHeld(run, live);
+        // never goes out in pieces. What it holds stays held across tool events, usage and notices (round 24: a
+        // key split by a tool call is still one key) and goes out only when the run ends.
         if (ev.type === "text_delta") {
           const text = live.scrub.text.push(ev.text);
           if (text) {

@@ -322,8 +322,10 @@ export class ArtifactStore {
       .get();
   }
 
+  // Reads are scrubbed too (round 24): a secret registered after an artifact was stored never comes back in the
+  // API, the raw page, a download or an export.
   get(id: string): ArtifactRow | undefined {
-    return this.db.select().from(artifacts).where(eq(artifacts.id, id)).get();
+    return scrubKnownDeep(this.db.select().from(artifacts).where(eq(artifacts.id, id)).get());
   }
 
   /** A conversation's artifacts, newest first. */
@@ -333,7 +335,8 @@ export class ArtifactStore {
       .from(artifacts)
       .where(eq(artifacts.conversationId, conversationId))
       .orderBy(desc(artifacts.createdAt), desc(sql`rowid`))
-      .all();
+      .all()
+      .map((r) => scrubKnownDeep(r));
   }
 
   /** Versions of one artifact, oldest first (API responses leave the content out: `toVersionInfo`). */
@@ -343,14 +346,17 @@ export class ArtifactStore {
       .from(artifactVersions)
       .where(eq(artifactVersions.artifactId, id))
       .orderBy(asc(artifactVersions.version))
-      .all();
+      .all()
+      .map((r) => scrubKnownDeep(r));
   }
 
   version(id: string, version: number): ArtifactVersionRow | undefined {
-    return this.db
-      .select()
-      .from(artifactVersions)
-      .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
-      .get();
+    return scrubKnownDeep(
+      this.db
+        .select()
+        .from(artifactVersions)
+        .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
+        .get(),
+    );
   }
 }

@@ -585,6 +585,14 @@ describe("redactSecrets", () => {
   it.each(
     [
       ["plain string before a long comment", 'console.log("hello" /* ' + "x".repeat(513) + ' */, "done");'],
+      ...["password", "token", "passphrase"].map((w) => [
+        `secret name before a long comment (${w})`,
+        `console.log("${w}" /* ${"x".repeat(600)} */, "done");`,
+      ]),
+      [
+        "secret name before a long line comment",
+        'f("password" //' + "x".repeat(600) + String.fromCharCode(10) + ', "done");',
+      ],
       ["regex character class after a comma", 'const r = /a,[b]:c/; const next = "save";'],
       ["Markdown link definition", "[guide]: https://example.com"],
       [

@@ -15,6 +15,7 @@ import {
 import {
   KnownSecrets,
   knownSecrets,
+  MAX_KNOWN_LENGTH,
   scrubKnown,
   scrubKnownDeep,
   StreamScrubber,
@@ -74,7 +75,24 @@ const ENCODINGS: Record<string, (s: string, r: Rng) => string> = {
   base64url: (s, r) => Buffer.from("z".repeat(r.int(3)) + s).toString("base64url"),
   base64Unpadded: (s) => Buffer.from(s).toString("base64").replace(/=+$/, ""),
   hex: (s, r) => Buffer.from(s).toString("hex")[r.next() < 0.5 ? "toLowerCase" : "toUpperCase"](),
+  // Round 24: Python/C octal byte escapes, hex in mixed case, base64 wrapped like MIME/PEM.
+  octal: (s) => [...Buffer.from(s, "utf8")].map((b) => "\\" + b.toString(8).padStart(3, "0")).join(""),
+  octalShort: (s) => [...Buffer.from(s, "utf8")].map((b) => "\\" + b.toString(8)).join("") + "x",
+  hexMixedCase: (s, r) =>
+    [...Buffer.from(s).toString("hex")].map((c) => (r.next() < 0.5 ? c.toUpperCase() : c)).join(""),
+  base64Wrapped: (s, r) => wrap(Buffer.from("q".repeat(r.int(3)) + s).toString("base64"), r),
+  base64WrappedJson: (s, r) => JSON.stringify(wrap(Buffer.from(s).toString("base64"), r)).slice(1, -1),
 };
+
+/** Base64 broken into lines (76 columns as MIME/PEM, or narrower), LF or CRLF, sometimes indented. */
+function wrap(b64: string, r: Rng): string {
+  const width = r.pick([76, 64, 16, 7]);
+  const eol = r.pick(["\n", "\r\n"]);
+  const indent = r.pick(["", "  ", "\t"]);
+  const lines: string[] = [];
+  for (let k = 0; k < b64.length; k += width) lines.push(indent + b64.slice(k, k + width));
+  return lines.join(eol);
+}
 
 function randomSecret(r: Rng): string {
   const alphabet = [...'ABCxyz0189-_.~!"\\/%+ =:&@#한글😀'];
@@ -288,7 +306,7 @@ describe("known secrets never leave the server (property)", () => {
       return out;
     };
 
-    const CASES = 24;
+    const CASES = 48;
     for (let n = 0; n < CASES; n++) {
       // Which known secret: the run's own MCP token is only known inside the script.
       const kind = r.pick(["gate", "skill", "session", "stored", "mcp"] as const);
@@ -300,13 +318,30 @@ describe("known secrets never leave the server (property)", () => {
         return enc;
       };
       const fixed = { gate, skill: dart, session: sessionToken, stored }[kind as "gate"];
-      const where = r.pick(["text", "reasoning", "tool_input", "tool_output", "notice", "end"] as const);
+      const where = r.pick([
+        "text",
+        "textAcrossTools",
+        "reasoning",
+        "tool_input",
+        "tool_output",
+        "notice",
+        "end",
+      ] as const);
       rt.script(({ token }) => {
         const secret = kind === "mcp" ? token! : fixed;
         const enc = encFor(secret);
         const body = `설명 앞부분 ${enc} 그리고 뒷부분`;
         const evs: RuntimeEvent[] = [{ type: "text_delta", text: "시작. " }];
         if (where === "text") for (const c of chunks(body, r)) evs.push({ type: "text_delta", text: c });
+        if (where === "textAcrossTools")
+          // Round 24: tool calls at random split points must not end the holdback.
+          for (const [k, c] of chunks(body, r).entries()) {
+            if (k > 0 || r.next() < 0.5) {
+              evs.push({ type: "tool_start", callId: `t${n}-${k}`, name: "web_search", input: { q: "x" } });
+              evs.push({ type: "tool_end", callId: `t${n}-${k}`, output: { ok: true } });
+            }
+            evs.push({ type: "text_delta", text: c });
+          }
         if (where === "reasoning")
           for (const c of chunks(body, r)) evs.push({ type: "reasoning_delta", text: c });
         if (where === "tool_input" || where === "tool_output") {
@@ -369,13 +404,20 @@ describe("known secrets never leave the server (property)", () => {
         .split("\n")
         .filter((l) => l.startsWith("data: "))
         .map((l) => JSON.parse(l.slice(6)) as { type: string; text?: string })
-        .map((e) => (e.type === "delta" ? e.text : "\n"))
+        .map((e) => (e.type === "delta" ? e.text : ""))
         .join("");
       for (const [what, hay] of [
         ["subscription", sse],
         ["subscription text", joined],
         ["replay", replay],
         ["messages API", api.body + strings(api.json())],
+        [
+          "message text joined",
+          api
+            .json<{ items: { parts: { type: string; text?: string }[] }[] }>()
+            .items.map((m) => m.parts.map((p) => (p.type === "text" ? p.text : "")).join(""))
+            .join("\n"),
+        ],
         ["conversations API", convs.body],
         ["database", dump()],
         ["history", strings(rt.seen.map((s) => [s.history, s.input]))],
@@ -386,5 +428,167 @@ describe("known secrets never leave the server (property)", () => {
     // The registry knows them all (and the run tokens are forgotten once their runs ended).
     for (const v of [gate, dart, sessionToken, stored]) expect(knownSecrets.list()).toContain(v);
     for (const s of rt.seen) expect(knownSecrets.list()).not.toContain(s.token);
+  });
+});
+
+describe("round 24", () => {
+  it("one length cap: values at, just over and far over it are masked whole", () => {
+    const reg = new KnownSecrets();
+    const r = rng(24);
+    const make = (n: number) => {
+      let v = "";
+      while (v.length < n) v += crypto.randomBytes(48).toString("base64url");
+      return v.slice(0, n);
+    };
+    for (const n of [MAX_KNOWN_LENGTH - 1, MAX_KNOWN_LENGTH, MAX_KNOWN_LENGTH + 1, 5_341, 40_000]) {
+      const v = make(n);
+      reg.add(v);
+      expect(scrubKnown(`a ${v} b`, { registry: reg }), `${n}`).toBe("a [숨김] b");
+      const s = new StreamScrubber(reg);
+      const out =
+        chunks(`a ${v} b`, r)
+          .map((c) => s.push(c))
+          .join("") + s.end();
+      expect(out, `${n} streamed`).toMatch(/^a (\[숨김\])+ b$/);
+      expect(scrubKnown(`a ${JSON.stringify(v + '"')} b`, { registry: reg })).not.toContain(v.slice(0, 64));
+    }
+  });
+
+  it("holds back whole words: the reader never sees half a word while the rest waits", () => {
+    const reg = new KnownSecrets();
+    reg.add("rld-secret-1234");
+    const s = new StreamScrubber(reg);
+    expect(s.push("hello wor")).toBe("hello ");
+    expect(s.push("ld again ")).toBe("world again ");
+    expect(s.push("wo")).toBe("wo");
+    expect(s.push("r")).toBe("");
+    expect(s.push("ld-secret-1234!")).toBe("[숨김]!");
+  });
+
+  it("finds octal escapes, mixed-case hex and wrapped base64", () => {
+    const reg = new KnownSecrets();
+    const v = "sk-ant-api03-한글/+=AbCdEf0123456789";
+    reg.add(v);
+    const r = rng(7);
+    for (const name of ["octal", "octalShort", "hexMixedCase", "base64Wrapped", "base64WrappedJson"]) {
+      for (let k = 0; k < 20; k++) {
+        const enc = ENCODINGS[name]!(v, r);
+        const out = scrubKnown(`앞 ${enc} 뒤`, { registry: reg });
+        expect(out, `${name}: ${JSON.stringify(enc)}`).toContain("[숨김]");
+        expect(out).not.toContain(enc);
+      }
+    }
+    // A PEM-style block: 76 columns, CRLF.
+    const pem = Buffer.from(v.repeat(4)).toString("base64").replace(/.{76}/g, "$&\r\n");
+    const out = scrubKnown(`-----BEGIN X-----\r\n${pem}\r\n-----END X-----`, { registry: reg });
+    expect(out.replace(/\s/g, "")).not.toMatch(/[A-Za-z0-9+/]{48,}/);
+  });
+});
+
+describe("round 24: late registration, and secrets registered while a session opens", () => {
+  it("every read path masks a secret registered after it was stored; the runtime gets nothing registered before hand-over", async () => {
+    const late = `late-${crypto.randomBytes(12).toString("base64url")}`;
+    const lateDuring = `during-${crypto.randomBytes(12).toString("base64url")}`;
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    let release: (() => void) | undefined;
+    let gate: Promise<void> = Promise.resolve();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: {
+        flushMs: 0,
+        // A run waits on the MCP endpoint before its runtime gets the history: the test holds it there.
+        mcp: {
+          endpoint: async () => {
+            await gate;
+            return { url: "http://127.0.0.1:9/mcp" };
+          },
+          toolNames: () => [],
+          toolNamesFor: () => [],
+        },
+      },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    const cookie = f.cookies.owner;
+    const headers = {
+      host: "localhost:3000",
+      cookie,
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+      "content-type": "application/json",
+    };
+    const conv = app.conversations!.create(f.users.owner.id, { title: `제목 ${late}` });
+    const send = async (text: string) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text },
+      });
+      expect(res.statusCode, res.body).toBe(201);
+      return res.json<{ run: { id: string } }>().run.id;
+    };
+    const waitDone = async (runId: string) => {
+      for (let i = 0; i < 400; i++) {
+        if (app.runs!.get(runId)?.endedAt) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error("run did not end");
+    };
+    // 1. Stored while nobody knew it was a secret: the reply, its events, an artifact.
+    rt.script(() => [{ type: "text_delta", text: `답 ${late} 끝` }]);
+    const run1 = await send(`질문 ${late} ${lateDuring}`);
+    await waitDone(run1);
+    const art = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: conv.id, runId: run1 },
+      { kind: "markdown", title: `문서 ${late}`, content: `# 본문\n\n${late}\n` },
+    );
+    expect(JSON.stringify(db.$client.prepare("select * from artifact_versions").all())).toContain(late);
+    knownSecrets.add(late);
+    const get = async (url: string) =>
+      (await app.inject({ url, headers: { host: "localhost:3000", cookie } })).body;
+    const id = art.artifact.id;
+    const reads: [string, string][] = [
+      ["messages API", await get(`/api/conversations/${conv.id}/messages`)],
+      ["conversation API", await get(`/api/conversations/${conv.id}`)],
+      ["conversations API", await get(`/api/conversations`)],
+      ["artifact list", await get(`/api/conversations/${conv.id}/artifacts`)],
+      ["artifact", await get(`/api/artifacts/${id}`)],
+      ["artifact version", await get(`/api/artifacts/${id}/versions/1`)],
+      ["artifact raw", await get(`/a/${id}/v/1/raw`)],
+      ["artifact download", await get(`/a/${id}/v/1/download`)],
+      ["sources", await get(`/api/conversations/${conv.id}/sources`)],
+      [
+        "event replay",
+        await fetch(`${base}/api/runs/${run1}/events`, {
+          headers: { host: "localhost:3000", cookie, "last-event-id": "0" },
+        }).then((x) => x.text()),
+      ],
+      ["events after", JSON.stringify(app.runs!.eventsAfter(run1, 0))],
+      ["artifact store", JSON.stringify([app.artifacts!.get(id), app.artifacts!.versions(id)])],
+    ];
+    for (const [what, body] of reads) expect(body, what).not.toContain(late);
+    expect(reads.find(([w]) => w === "artifact raw")![1]).toContain("[숨김]");
+
+    // 2. Registered while the next run waits for its session: the runtime gets neither secret.
+    gate = new Promise<void>((r) => (release = r));
+    rt.script(() => [{ type: "text_delta", text: "두 번째 답" }]);
+    const run2 = await send(`다시 ${lateDuring}`);
+    for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 30)); // waiting on the endpoint now
+    knownSecrets.add(lateDuring);
+    release!();
+    await waitDone(run2);
+    const handed = JSON.stringify(rt.seen.at(-1));
+    expect(handed).not.toContain(lateDuring);
+    expect(handed).not.toContain(late);
+    expect(rt.seen.at(-1)!.input).toContain("[숨김]");
   });
 });
