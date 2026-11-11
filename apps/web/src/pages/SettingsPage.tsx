@@ -5,6 +5,7 @@ import { TopBar } from "../Shell.js";
 import { getTheme, setTheme, type ThemeChoice } from "../theme.js";
 import { NotificationSettings } from "./NotificationSettings.js";
 import { RuntimeConnections } from "./RuntimeConnections.js";
+import { MyUsagePanel } from "./Usage.js";
 
 export function SettingsPage({
   onChanged,
@@ -47,6 +48,7 @@ export function SettingsPage({
           <p className="muted small">기본 런타임·모델 설정은 #19에서 들어와요.</p>
         </section>
         <RuntimeConnections isAdmin={isAdmin} />
+        <MyUsagePanel />
         <NotificationSettings />
         <section className="panel">
           {changed ? (

@@ -27,6 +27,9 @@ import { ConnectionService } from "./connections/service.js";
 import { ConnectionStore } from "./connections/store.js";
 import { ConnectionTester } from "./connections/tester.js";
 import { UsageStore } from "./usage/store.js";
+import { registerUsageRoutes } from "./usage/routes.js";
+import { UsageService, type UsageServiceOptions } from "./usage/service.js";
+import { DEFAULT_TIME_ZONE } from "./notifications/quiet.js";
 import {
   CLAUDE_EGRESS_HOSTS,
   CODEX_CHATGPT_EGRESS_HOSTS,
@@ -97,6 +100,10 @@ declare module "fastify" {
     connections: ConnectionService | undefined;
     /** Artifacts (#27); undefined without a database. */
     artifacts: ArtifactStore | undefined;
+    /** Usage records (#44) and their price tables (#32); undefined without a database. */
+    usageStore: UsageStore | undefined;
+    /** Usage screens and the daily cost check (#32); undefined without a database. */
+    usage: UsageService | undefined;
   }
 }
 
@@ -148,6 +155,8 @@ export type BuildOptions = {
     identify?: (pid: number) => ProcessIdentity | undefined;
     maxActiveLogins?: number;
   };
+  /** Usage screens (#32): time zone and clock overrides (tests). */
+  usage?: UsageServiceOptions;
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
 };
@@ -256,8 +265,23 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
-    // Usage records (#44): replies and connection tests write here, keyed on run and attempt.
-    const usage = new UsageStore(opts.db!);
+    // Usage records (#44): replies and connection tests write here, keyed on run and attempt. Each write is costed
+    // from the current price table (#32) and then checked against the daily cost threshold (notify only).
+    // The daily cost notification goes to every active admin (the inbox re-checks the role before sending).
+    const usageService = new UsageService(
+      opts.db!,
+      settingsStore,
+      (amountUsd, thresholdUsd) => {
+        for (const admin of connectionStore.admins())
+          notifications.publish(admin, { kind: "daily_cost", amountUsd, thresholdUsd, url: "/admin" });
+      },
+      app.log,
+      { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },
+    );
+    const usage = new UsageStore(opts.db!, opts.usage?.now ?? Date.now, {
+      onRecorded: (at) => usageService.checkDailyCost(at),
+    });
+    app.decorate("usageStore", usage);
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
     const sources = new SourceStore(opts.db!);
     // Artifacts (#27): made by the artifact tools, scoped to the run's conversation.
@@ -349,6 +373,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     );
     app.decorate("notifications", notifications);
     registerNotificationRoutes(app, notifications);
+    app.decorate("usage", usageService);
+    registerUsageRoutes(app, usageService, usage.prices);
     connections.attach({
       runs: runManager,
       notify: (userId, input) => void notifications.publish(userId, input),
@@ -379,6 +405,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
     app.decorate("artifacts", undefined);
+    app.decorate("usageStore", undefined);
+    app.decorate("usage", undefined);
   }
 
   app.get(

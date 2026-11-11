@@ -85,6 +85,11 @@ export const LOG_EVENTS = [
   "connection.login_leftover",
   // Usage storage (#44): a usage row could not be written — IDs, attempt and purpose only.
   "usage.record_failed",
+  // Usage screens (#32): a new price table version (who, how many models), the daily cost notification (today's
+  // cost) and a failed daily check (error code only).
+  "usage.prices_saved",
+  "usage.daily_cost_alert",
+  "usage.alert_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

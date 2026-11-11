@@ -2,8 +2,9 @@ import { useDeferredValue, useState, type RefObject } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
 import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
-import { auth, conversations, errorText, notifications, NOTIFICATIONS_KEY } from "./api.js";
+import { auth, conversations, errorText, notifications, NOTIFICATIONS_KEY, usage, USAGE_KEY } from "./api.js";
 import { unsubscribeOnSignOut } from "./push.js";
+import { usageLine } from "./usage-format.js";
 
 export const CONVERSATIONS_KEY = ["conversations"] as const;
 
@@ -39,6 +40,8 @@ export function Sidebar({
     refetchInterval: 60_000,
   });
   const badge = unread.data ?? 0;
+  // My usage this month (#32, FR-9.3): shown only — nothing here can stop a run.
+  const mine = useQuery({ queryKey: [...USAGE_KEY, "me"], queryFn: usage.mine, refetchInterval: 5 * 60_000 });
   const signOut = async () => {
     // This browser stops getting this account's pushes (the server drops the device with the session too).
     await unsubscribeOnSignOut();
@@ -133,9 +136,9 @@ export function Sidebar({
         <span className="logo small-logo">{Array.from(props.user.name)[0]}</span>
         <div className="grow small">
           <div data-testid="whoami">{props.user.name}</div>
-          <div className="muted" title="사용량 (#32)">
-            이번 달 사용량 —
-          </div>
+          <Link to="/settings#usage" className="muted me-usage" data-testid="my-usage">
+            이번 달 {mine.data ? usageLine(mine.data.total) : "—"}
+          </Link>
         </div>
         <button type="button" className="ghost small" onClick={() => void signOut()}>
           로그아웃

@@ -166,7 +166,7 @@ rm ~/.agentlee/probe-headers.txt
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`). 로그 파일을 열거나 쓰지 못해도(디스크 가득, 권한 등) 서버는 시작하고 계속 돌며 그 줄만 버린다(파일에는 완전한 JSON 줄만 남는다 — 중간에 끊긴 줄은 잘라낸다). 다시 쓸 수 있게 되면 `log.line_dropped` 레코드에 버린 줄 수(`dropped`)를 남긴다.
 - 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + 우리 MCP 서버의 도구, 예 `mcp__agentlee__echo_time` — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
   - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`, 사용량(#44): `attempt` `purpose`.
-  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), 사용량(#44) `usage.record_failed`(사용량 행을 쓰지 못함: ID·`attempt`·`purpose`·오류 코드만 — 응답은 계속된다), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
+  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), 사용량(#44) `usage.record_failed`(사용량 행을 쓰지 못함: ID·`attempt`·`purpose`·오류 코드만 — 응답은 계속된다), 사용량 화면(#32) `usage.prices_saved`(관리자 id·모델 수)·`usage.daily_cost_alert`(오늘 비용)·`usage.alert_failed`(오류 코드), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
   - `pnpm test`의 유출 fixture 테스트(`apps/server/test/observability.test.ts`)가 대화 문장·키 패턴·쿠키·헤더·접속 코드·이메일을 요청·오류·실행·도구로 흘려 보내고, 로그와 관리자 오류 목록에 하나라도 나오면 실패한다.
 - 읽기:
@@ -351,7 +351,7 @@ rm ~/.agentlee/probe-headers.txt
 | `schedule_succeeded` / `schedule_failed` | 예약 이름, 결과 요약 또는 실패 이유, 결과 메시지 주소, (공유 예약이면) `ref` | #33, #56 |
 | `share_received` | 공유한 사람 이름, 항목 제목, 주소, `ref`(공유 리소스 — 공유 해제 시 취소) | #29, #52 |
 | `connection_lost` | 런타임 이름 | #17 |
-| `daily_cost` (관리자) | 오늘 비용, 기준 | #32 |
+| `daily_cost` (관리자) | 오늘 비용, 기준 — 연결됨(16.4절) | #32 |
 | `system_warning` (관리자) | 서버가 쓴 짧은 고정 문구 | #35 |
 
 ### 12.4 시험 방법
@@ -478,16 +478,16 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
    `TEST_SKILL_PYTHON` 또는 uv가 필요하다.
 5. `pnpm skills:install <이름>` 후 재시작한다.
 
-## 16. 사용량 기록 (#44)
+## 16. 사용량 기록 (#44)과 화면·비용 (#32)
 
-사용량은 DB `usage_records` 표에 있다(PRD FR-9). 화면·비용 계산·월 집계는 #32에서 붙는다. 그 전에는 SQLite로 직접 본다.
+사용량은 DB `usage_records` 표에 있다(PRD FR-9). 화면·비용 계산·월 집계는 16.1~16.4절(#32)이다.
 
 - **행 하나 = 실행 시도(attempt) 하나.** 키는 (`run_id`, `attempt`)이고 유일 인덱스가 걸려 있다.
   - **attempt**: 같은 답변을 위해 런타임 세션을 열고 턴을 한 번 보낸 것. 지금 실행 관리자는 실행마다 1번만 연다(항상 `attempt = 1`). 같은 실행 안의 재시도나 런타임·모델 대체(#19)는 세션을 열기 전에 `nextAttempt`를 불러 새 attempt가 된다 → 행이 하나 더 생긴다.
   - "다시 생성"·다음 메시지는 새 실행이라 새 `run_id`다. 브라우저 재연결(`Last-Event-ID`)은 런타임에 아무것도 보내지 않으므로 attempt가 아니고 행도 늘지 않는다.
 - **usage 규칙(어댑터 계약, `runtime/adapter.ts`의 `UsageReport`)**: `usage` 이벤트는 그 attempt의 **지금까지 전체 사용량**이다(증분이 아님). 같은 attempt에 다시 오면 앞의 값을 **바꾼다(마지막 값이 이긴다)** — upsert. 그래서 중복 이벤트·재연결·중지가 행을 늘리거나 두 번 세지 않는다. Claude(`result`)와 Codex(`turn/completed`)는 턴 끝에 한 번 보내고, 세션 누적값(`total_cost_usd`, `tokenUsage.total`)은 그 턴의 차이로 바꿔 보낸다.
 - **언제 쓰나**: `usage` 이벤트가 올 때마다 바로 쓴다. 그래서 **중지되거나 실패한 실행도** 그때까지 온 사용량이 남는다(Claude는 중지 후에도 마지막 `result`로 사용량을 보낸다). 중지 유예 시간이 지나 강제로 끝난 뒤에 오는 이벤트는 버린다.
-- **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용) `request_count`(attempt당 1) `created_at` `updated_at`.
+- **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용 — 참고용, 화면에는 쓰지 않는다) `request_count`(attempt당 1) `created_at` `updated_at`, 그리고 #32의 `auth_type`(첫 기록 때 연결의 인증 방식: `api_key`·`subscription`, 연결이 없으면 NULL, 연결을 찾을 수 없으면 `unknown`) `price_version`(비용을 계산한 가격표 버전) `priced_cost_micros`(그 버전으로 계산한 비용, **정수 마이크로 USD** = 1e-6 USD).
   - 런타임이 주지 않은 값은 0이 아니라 **NULL**이다.
   - 프롬프트·답변·도구 입출력 같은 **내용은 저장하지 않는다**.
   - 행을 쓰지 못하면(디스크·DB 오류) 답변·연결 테스트 결과는 그대로이고 `usage.record_failed` 로그(ID·`attempt`·`purpose`·오류 코드만)가 남는다.
@@ -496,10 +496,42 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 보기(읽기 전용):
   ```bash
   sqlite3 -readonly data/agentlee.db \
-    "select date(created_at/1000,'unixepoch','localtime') d, user_id, runtime, model, purpose,
-            count(*) attempts, sum(input_tokens) input, sum(output_tokens) output, round(sum(cost_usd),4) usd
-       from usage_records group by d, user_id, runtime, model, purpose order by d desc;"
+    "select date(created_at/1000,'unixepoch','localtime') d, user_id, runtime, model, purpose, auth_type,
+            count(*) attempts, sum(input_tokens) input, sum(output_tokens) output,
+            round(sum(priced_cost_micros)/1000000.0,6) usd, sum(auth_type in ('api_key','unknown') and priced_cost_micros is null) missing
+       from usage_records group by d, user_id, runtime, model, purpose, auth_type order by d desc;"
   ```
+
+### 16.1 비용 계산 규칙 (#32, FR-9.1·9.2)
+
+- **API 키 연결만 비용이 있다.** 구독 연결(Claude 관리자 구독, ChatGPT 로그인)은 요청 수와 토큰만 센다. 연결 없이 도는 실행(개발용 `FAKE_RUNTIME=1`)도 비용이 없다.
+- 비용 = 가격표의 100만 토큰당 USD × 토큰 = 마이크로 USD. **부동소수점은 쓰지 않는다**: 가격은 십진 문자열(소수점 아래 6자리까지, 예 `"0.29"`)로 저장하고, 100만 토큰당 마이크로 USD 정수(BigInt)로 읽어 토큰과 곱해(10^-12 USD 단위) 정확히 더한 뒤, 행마다 한 번 마이크로 USD로 **반올림(0.5는 올림)** 해 저장한다(50토큰 × $0.29/M = 14.5 → 15). 그다음 합계·오늘 비용·기준 비교는 모두 정수로 한다(그래서 정확히 $0.30인 비용은 기준 $0.30을 넘지 않는다). 화면에 보일 때만 USD로 바꾼다. 입력은 캐시를 뺀 입력(`input_tokens − cache_read − cache_write`), 출력, 캐시 읽기, 캐시 쓰기를 각자 가격으로 더한다. 런타임이 준 `cost_usd`는 쓰지 않는다(두 런타임을 같은 표로 계산하려고).
+- **미제공**: 가격표에 그 런타임·모델이 없거나, 쓴 토큰 종류의 가격이 비어 있거나, 런타임이 입력·출력 토큰을 주지 않았으면 비용은 NULL이고 화면에 "미제공"으로 나온다(0이 아님). 합계는 계산된 비용만 더하고 미제공 건수를 따로 보여 준다("$1.20 + 미제공 2건", 모두 미제공이면 "미제공"). 오늘 비용과 예상도 같다 — 예상은 비용이 있는 기록으로만 계산하고 이번 달 미제공 건수를 옆에 적는다. $0.00으로 보이지 않는다.
+- **토큰 미제공**: 런타임이 입력·출력 토큰을 주지 않은 기록은 0이 아니라 "미제공"이다(API의 `totalTokens`·`inputTokens`·`outputTokens`가 null, 합계에는 `tokensMissing` 건수).
+- **미확인**: 기록의 연결을 찾을 수 없으면 `auth_type = 'unknown'`이다. 화면에 "미확인 (미제공)"으로 나오고 미제공 건수에 들어간다. 합계에서 빠지지 않는다.
+- **버전 고정**: attempt의 첫 기록 때 그때의 인증 방식과 현재 가격표 버전이 `auth_type`·`price_version`에 고정된다. 같은 attempt의 다음 usage 이벤트(마지막 값이 이김)는 토큰을 바꾸고 **같은 버전**으로 다시 계산한다. 가격을 고치면 새 버전이 생길 뿐이라 이미 기록된 비용은 바뀌지 않는다. 가격표가 하나도 없을 때 기록된 API 키 행은 `price_version` NULL(미제공)로 남는다 — 나중에 가격표를 저장해도 다시 계산하지 않는다.
+- **업그레이드(0013 이전 기록)**: 마이그레이션이 남아 있는 연결(해제된 연결도 행은 남는다)에서 `auth_type`을 채운다. 연결을 찾을 수 없는 기록은 `unknown`, 연결이 없던 기록은 NULL 그대로다. 옛 기록에는 가격을 적용하지 않는다(`price_version` NULL) — API 키 기록은 "미제공"으로 보인다.
+
+### 16.2 화면
+
+- **내 사용량**(모든 사용자): 사이드바 아래 "이번 달 …"(비용 · 요청 수 · 토큰)과 설정 → 내 사용량(런타임별·모델별). `GET /api/usage/me` — 사용자 id를 받지 않고 **세션 사용자 것만** 돌려준다.
+- **관리자 → 사용량**: 이번 달 누적 비용, 오늘 비용, **예상 = 누적 + (누적 ÷ 오늘까지 지난 날수) × 남은 날수**(오늘은 지난 날에 넣는다), 요청·토큰. 분류: 사용자별·런타임별·모델별·연결별(연결 없음·삭제된 연결 포함)·목적별(대화·예약·제목·요약·연결 테스트). 다섯 분류의 합계는 항상 같다. 최근 기록 50건(기록별 비용 또는 "미제공"·"구독 · 비용 없음", 가격표 버전).
+- 날짜·월은 서비스 시간대 **Asia/Seoul** 기준이다(`created_at` = attempt의 첫 기록 시각).
+- **예산 스위치**: "월 예산 제한 — 추후 제공"으로 꺼진 채 비활성이다(FR-9.1, v1.1). v1에는 사용량으로 실행을 막는 경로가 없다: 비용 계산·알림은 사용량을 **쓴 뒤**에만 돌고, 실패해도 실행은 그대로 끝난다(`usage.record_failed`·`usage.alert_failed` 로그만).
+- 관리자 API(모두 관리자 전용, 가족 계정은 403): `GET /api/admin/usage`, `GET·PUT /api/admin/usage/prices`, `GET·PUT /api/admin/usage/settings`.
+
+### 16.3 가격표 고치기
+
+1. 관리자 → 사용량 → 모델 가격표에서 "모델 추가" → 런타임, 모델 id(실행 기록의 `model` 값 그대로, 예: `claude-opus-5-5`), 입력·출력·캐시 읽기·캐시 쓰기 가격(100만 토큰당 USD, 0~10000, 소수점 아래 6자리까지 — 더 길거나 `1e3` 같은 표기는 400)을 넣는다. 일일 비용 알림 기준도 소수점 아래 6자리까지다. 모르는 칸은 비워 둔다(미제공).
+2. "새 버전으로 저장" → `price_tables`에 다음 번호(v1, v2, …)로 저장된다. 옛 버전은 지우거나 고치지 않는다. 로그: `usage.prices_saved`(관리자 id, 모델 수).
+3. 실제 요금은 공급자 가격 페이지를 보고 관리자가 넣는다. 저장소에는 가격을 넣어 두지 않는다(처음엔 가격표가 없고 API 키 비용은 미제공).
+
+### 16.4 일일 비용 알림 (FR-9.5)
+
+- 관리자 → 사용량 → "일일 비용 알림 기준(USD, 선택)". 비우면 꺼진다(`settings`의 `usage.daily_cost_threshold_usd`).
+- 사용량을 쓸 때마다 오늘(서울 기준) API 키 비용 합계를 보고(정수 마이크로 USD, 기준도 마이크로 USD로 바꿔 비교), **기준을 넘으면**(같으면 아님) 활성 관리자 모두에게 `daily_cost` 알림("오늘 $… · 기준 $… (막지는 않아요)")을 보낸다.
+- **하루 한 번**: 알림 전에 그날 날짜를 `usage.daily_cost_alerted_day`에 기록(트랜잭션)하고, 같은 날에는 다시 보내지 않는다. 그날 기준을 바꿔도 다시 보내지 않는다. 다음 날 다시 넘으면 다시 보낸다.
+- 막지는 않는다. 알림 전송이 실패해도 실행에는 영향이 없다(`usage.alert_failed`, 오류 코드만). 로그: `usage.daily_cost_alert`(오늘 비용만).
 
 ## 17. 웹 검색·가져오기 (#50)
 방식과 근거는 `docs/decisions/isolation.md` "웹 검색·가져오기 (#50)"에 있다.

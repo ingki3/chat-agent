@@ -774,3 +774,76 @@ h2 {
   border-radius: 10px;
   background: #fff;
 }
+
+/* ---- usage (#32) ---- */
+.me-usage {
+  display: block;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+.usage-summary > div {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.usage-summary strong {
+  font-size: 18px;
+}
+.usage-table th {
+  text-align: left;
+  font-weight: 600;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--line);
+}
+.usage-table .num {
+  text-align: right;
+  white-space: nowrap;
+}
+.usage-admin details {
+  overflow-x: auto;
+}
+.usage-admin .threshold {
+  align-items: end;
+}
+.usage-admin .threshold button,
+.prices button {
+  padding: 8px 12px;
+}
+.budget input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}
+.prices h3 {
+  margin: 8px 0 4px;
+  font-size: 15px;
+}
+.prices form {
+  display: grid;
+  gap: 10px;
+}
+.price-rows {
+  display: grid;
+  gap: 8px;
+}
+.price-row {
+  display: grid;
+  grid-template-columns: 120px minmax(120px, 1fr) repeat(4, minmax(70px, 90px)) auto;
+  gap: 6px;
+  align-items: center;
+}
+.price-row input,
+.price-row select {
+  min-width: 0;
+  padding: 6px 8px;
+}
+@media (max-width: 700px) {
+  .price-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
