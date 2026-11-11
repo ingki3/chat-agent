@@ -205,8 +205,8 @@ const isoOf = (s: string | undefined) => {
 };
 
 /**
- * Characters one `web_search` answer gives the model at most (the framed block and the `results` list together;
- * the query and fixed keys come on top).
+ * Characters one `web_search` answer gives the model at most: the whole MCP text, i.e. `JSON.stringify` of the
+ * answer including the query and fixed keys (see `searchOutput`).
  */
 export const SEARCH_OUTPUT_CHARS = 12_000;
 
