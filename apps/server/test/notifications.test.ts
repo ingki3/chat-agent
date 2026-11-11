@@ -216,11 +216,14 @@ describe("devices", () => {
     const mom = member("mom");
     for (const endpoint of ["http://fcm.googleapis.com/x", "https://10.0.0.1/x", "https://evil.example/x"])
       expect((await subscribe(mom, endpoint)).r.statusCode).toBe(400);
-    const { r, endpoint } = await subscribe(mom);
+    // Markers with "." — a character base64url ciphertext never contains — so a hit can only be plaintext
+    // (short markers like "d1" or "fcm" occur in random ciphertext by chance).
+    const { r } = await subscribe(mom, "https://fcm.googleapis.com/fcm/send/plain.endpoint.marker");
     expect(r.statusCode).toBe(201);
     const row = db.select().from(pushSubscriptions).get()!;
-    expect(row.secret).not.toContain(endpoint.split("/").pop());
-    expect(row.secret).not.toContain("fcm");
+    expect(row.secret).not.toContain("plain.endpoint.marker");
+    expect(row.secret).not.toContain("fcm.googleapis.com");
+    expect(row.secret).not.toMatch(/[.]/);
     const devices = (await api(mom, "GET", "/api/push/devices")).json<{ devices: { current: boolean }[] }>();
     expect(devices.devices).toEqual([expect.objectContaining({ label: "Android · Chrome", current: true })]);
   });
