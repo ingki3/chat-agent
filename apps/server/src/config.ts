@@ -58,18 +58,14 @@ const ConfigSchema = z.object({
    * conversations (PRD D2).
    */
   CLAUDE_API_KEY: optional(
-    z
-      .string()
-      .regex(/^sk-ant-[A-Za-z0-9_-]{20,}$/, {
-        message: "CLAUDE_API_KEY must be an Anthropic API key (sk-ant-…)",
-      }),
+    z.string().regex(/^sk-ant-[A-Za-z0-9_-]{20,}$/, {
+      message: "CLAUDE_API_KEY must be an Anthropic API key (sk-ant-…)",
+    }),
   ),
   CLAUDE_OAUTH_TOKEN: optional(
-    z
-      .string()
-      .regex(/^[A-Za-z0-9_.-]{20,}$/, {
-        message: "CLAUDE_OAUTH_TOKEN must be a token from `claude setup-token`",
-      }),
+    z.string().regex(/^[A-Za-z0-9_.-]{20,}$/, {
+      message: "CLAUDE_OAUTH_TOKEN must be a token from `claude setup-token`",
+    }),
   ),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
