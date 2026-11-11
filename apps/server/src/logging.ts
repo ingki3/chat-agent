@@ -24,6 +24,7 @@ import {
   isImportCode,
   isToolName,
   UNMATCHED,
+  isUsagePurpose,
 } from "./observability/policy.js";
 
 /**
@@ -70,6 +71,8 @@ export const LOG_EVENTS = [
   "connection.disconnected",
   "connection.imported",
   "connection.import_failed",
+  // Usage storage (#44): a usage row could not be written — IDs, attempt and purpose only.
+  "usage.record_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -154,6 +157,9 @@ const FIELDS = new Map<string, Check>([
   ["testCode", isTestCode],
   ["importItem", isImportItem],
   ["importCode", isImportCode],
+  /** Usage records (#44): the run's attempt number and what the usage was for. */
+  ["attempt", isInt],
+  ["purpose", isUsagePurpose],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -405,6 +411,8 @@ export type LogFields = {
   testCode?: string;
   importItem?: string;
   importCode?: string;
+  attempt?: number;
+  purpose?: string;
   /** Logged as class name and code only. */
   err?: unknown;
 };

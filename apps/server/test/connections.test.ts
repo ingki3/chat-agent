@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Connection, CSRF_HEADER, RuntimeOption, type Run } from "@agentlee/shared";
@@ -11,6 +12,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb, type Db } from "../src/db/client.js";
 import { SettingsStore } from "../src/db/settings-store.js";
+import { usageRecords } from "../src/db/schema.js";
 import { importEnvConnections } from "../src/connections/import.js";
 import { CONNECTION_LOST_CODE, SHARED_OFFER_CODE } from "../src/connections/service.js";
 import { TEST_MARKER } from "../src/connections/tester.js";
@@ -420,6 +422,38 @@ describe("connection test (#17, FR-11.5)", () => {
     const t2 = await start({ adapters: [new McpRuntime(false)] });
     const c2 = await t2.addMine(t2.owner, KEYS.ownerClaude);
     expect(await t2.testMine(t2.owner, c2.id)).toMatchObject({ status: "failed", code: "test_no_tool" });
+  });
+});
+
+describe("usage of connections (#44)", () => {
+  it("a connection test records its usage with purpose connection_test, on the connection, without a conversation", async () => {
+    const t = await start();
+    const c = await t.addMine(t.owner, KEYS.ownerClaude);
+    expect((await t.testMine(t.owner, c.id)).status).toBe("passed");
+    const tests = t.db.select().from(usageRecords).all();
+    expect(tests).toEqual([
+      expect.objectContaining({
+        userId: t.f.users.owner.id,
+        conversationId: null,
+        attempt: 1,
+        runtime: "claude-code",
+        connectionId: c.id,
+        purpose: "connection_test",
+        inputTokens: 40,
+        outputTokens: 1,
+        costUsd: 0.0002,
+      }),
+    ]);
+    // A second test is a new test (its own id): a second row, never a merge into the first.
+    await t.testMine(t.owner, c.id);
+    expect(t.db.select().from(usageRecords).all()).toHaveLength(2);
+    // A reply on that connection: a chat row on the same connection, in its conversation.
+    const conv = t.app.conversations!.create(t.f.users.owner.id);
+    const run = t.runOf(await t.send(t.owner, conv.id, { text: "안녕" }));
+    await t.waitRun(run.id);
+    expect(t.db.select().from(usageRecords).where(eq(usageRecords.runId, run.id)).all()).toEqual([
+      expect.objectContaining({ purpose: "chat", conversationId: conv.id, connectionId: c.id }),
+    ]);
   });
 });
 

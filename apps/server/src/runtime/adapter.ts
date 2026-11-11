@@ -70,22 +70,46 @@ export type ConnectionRequest = Pick<
   "userId" | "connectionId" | "connectionVersion" | "connectionTest"
 >;
 
+/**
+ * Usage of one attempt (#44) — one session open + one turn of a run (see runs.ts `Live.attempt`).
+ *
+ * Rule: a `usage` event is the attempt's **whole usage so far** (cumulative for the attempt), never an increment.
+ * A later `usage` event of the same attempt replaces the earlier one — the last one wins — so an adapter may send
+ * usage once at the end of the turn (Claude's `result`, Codex's `turn/completed`) or several times as it grows,
+ * and a duplicate is harmless. An adapter whose runtime reports increments must add them up itself. The figures
+ * are this attempt's only: totals that run on across a session's turns or resumes (Claude `total_cost_usd`, Codex
+ * `tokenUsage.total`) are reported as the turn's difference.
+ * A figure the runtime does not report is left out (stored as NULL), not sent as 0.
+ */
+export type UsageReport = {
+  /** All input tokens of the attempt, cached ones included. */
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  /** Of `inputTokens`: read from / written to the prompt cache, when the runtime reports it. */
+  cacheReadTokens?: number | undefined;
+  cacheWriteTokens?: number | undefined;
+  /** The runtime's own cost figure in USD, when it reports one (API key connections). */
+  costUsd?: number | undefined;
+};
+
+/** The figures of a `usage` event, without its type. */
+export function usageReport(ev: UsageReport): UsageReport {
+  return {
+    inputTokens: ev.inputTokens,
+    outputTokens: ev.outputTokens,
+    cacheReadTokens: ev.cacheReadTokens,
+    cacheWriteTokens: ev.cacheWriteTokens,
+    costUsd: ev.costUsd,
+  };
+}
+
 /** Normalised events. `reasoning_delta` is stored but never streamed to the browser. */
 export type RuntimeEvent =
   | { type: "text_delta"; text: string }
   | { type: "reasoning_delta"; text: string }
   | { type: "tool_start"; callId: string; name: string; input?: unknown }
   | { type: "tool_end"; callId: string; output?: unknown; isError?: boolean }
-  | {
-      type: "usage";
-      /** All input tokens of the turn, cached ones included. */
-      inputTokens: number;
-      outputTokens: number;
-      /** Of `inputTokens`: read from / written to the prompt cache, when the runtime reports it. */
-      cacheReadTokens?: number;
-      cacheWriteTokens?: number;
-      costUsd?: number;
-    }
+  | ({ type: "usage" } & UsageReport)
   /** Informational (e.g. "fell back to …"). */
   | { type: "notice"; level: "info" | "warn"; code: string; message: string }
   /** Quota / rate limit reached: the turn ends as failed with this code. */

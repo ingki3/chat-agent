@@ -470,14 +470,17 @@ export class ClaudeAdapter implements RuntimeAdapter {
               meta.costUsd = m.total_cost_usd;
               writeMeta(conn.dir, s.sessionId, meta);
             }
-            const cacheRead = u.cache_read_input_tokens ?? 0;
-            const cacheWrite = u.cache_creation_input_tokens ?? 0;
+            // Per turn and final: one usage event per attempt (#44). A figure Claude leaves out stays out (NULL).
+            const cacheRead = u.cache_read_input_tokens;
+            const cacheWrite = u.cache_creation_input_tokens;
             yield {
               type: "usage",
-              inputTokens: (u.input_tokens ?? 0) + cacheRead + cacheWrite,
-              outputTokens: u.output_tokens ?? 0,
-              cacheReadTokens: cacheRead,
-              cacheWriteTokens: cacheWrite,
+              ...(u.input_tokens === undefined
+                ? {}
+                : { inputTokens: u.input_tokens + (cacheRead ?? 0) + (cacheWrite ?? 0) }),
+              ...(u.output_tokens === undefined ? {} : { outputTokens: u.output_tokens }),
+              ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
+              ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
               ...(cost === undefined ? {} : { costUsd: cost }),
             };
           }

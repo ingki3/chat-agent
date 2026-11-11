@@ -7,7 +7,10 @@ import {
   type RuntimeSession,
   type RuntimeTurn,
   type StartContext,
+  type UsageReport,
+  usageReport,
 } from "../runtime/adapter.js";
+import type { UsageAttempt } from "../usage/store.js";
 import { OUR_TOOL_PREFIX } from "../runtime/lockdown.js";
 
 /** The verification skill's tool (#43). */
@@ -72,7 +75,11 @@ export class ConnectionTester {
     private readonly registry: RuntimeRegistry,
     private readonly mcp: TestMcp | undefined,
     private readonly tokens: McpTokens,
-    private readonly opts: { timeoutMs?: number } = {},
+    private readonly opts: {
+      timeoutMs?: number;
+      /** Usage storage (#44): a test's usage is kept with purpose `connection_test`, on its connection. */
+      usage?: { record(a: UsageAttempt, u: UsageReport): void } | undefined;
+    } = {},
   ) {}
 
   /**
@@ -186,7 +193,27 @@ export class ConnectionTester {
         } else if (ev.type === "tool_start") calls.set(ev.callId, bare(ev.name));
         else if (ev.type === "tool_end" && !ev.isError)
           results.push({ name: calls.get(ev.callId) ?? "", output: ev.output });
-        else if (ev.type === "limit") return fail("usage_limit");
+        else if (ev.type === "usage") {
+          // One session open + one turn: the test is a single attempt, keyed on its own id (no run row).
+          const report = usageReport(ev);
+          try {
+            this.opts.usage?.record(
+              {
+                userId: input.userId,
+                conversationId: null,
+                runId,
+                attempt: 1,
+                runtime: input.runtime,
+                model,
+                connectionId: input.connectionId,
+                purpose: "connection_test",
+              },
+              report,
+            );
+          } catch {
+            // Losing a test's usage row must not change the test's outcome.
+          }
+        } else if (ev.type === "limit") return fail("usage_limit");
       }
     } catch (e) {
       if (stopped) return fail(stopped);
