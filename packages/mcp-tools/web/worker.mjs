@@ -136,9 +136,15 @@ async function hop(url, o) {
     /** @type {import("node:stream").Readable | undefined} */
     let stream;
     let done = false;
+    /**
+     * A limit that was hit. Recorded before anything is destroyed: destroying the request or socket (or the peer
+     * resetting it meanwhile) emits errors of its own, and the reason must not become `web_unreachable`.
+     */
+    let limit;
     const fail = (e) => {
       if (done) return;
       done = true;
+      if (limit) e = limit;
       clearTimeout(timer);
       // Both ends: the response (raw bytes) and the decompressor, so neither keeps reading.
       stream?.destroy();
@@ -171,7 +177,10 @@ async function hop(url, o) {
         let wire = 0;
         res.on("data", (c) => {
           wire += c.length;
-          if (wire > o.maxBytes) fail(new WebError("web_too_large"));
+          if (wire > o.maxBytes) {
+            limit ??= new WebError("web_too_large");
+            fail(limit);
+          }
         });
         stream = res;
         // Decompressed size is bounded as well (a small gzip can expand to gigabytes).
@@ -184,7 +193,10 @@ async function hop(url, o) {
         let size = 0;
         stream.on("data", (c) => {
           size += c.length;
-          if (size > o.maxBytes) return fail(new WebError("web_too_large"));
+          if (size > o.maxBytes) {
+            limit ??= new WebError("web_too_large");
+            return fail(limit);
+          }
           chunks.push(c);
         });
         stream.on("end", () => {

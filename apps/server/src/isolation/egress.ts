@@ -65,6 +65,9 @@ export function parseTarget(target: string): { host: string; port: number } | un
   return { host, port };
 }
 
+/** How long a closed upstream's last bytes may take to reach the client before the tunnel is cut. */
+const FLUSH_MS = 30_000;
+
 export async function startEgressProxy(o: EgressOptions, port = 0): Promise<RunningEgress> {
   const allow = o.allow === "public" ? undefined : new Set(o.allow.map((h) => h.toLowerCase()));
   const ports = new Set(o.ports ?? [443]);
@@ -134,9 +137,15 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
       upstream.setTimeout(idleMs, () => upstream.destroy());
       sockets.add(upstream);
       const timer = setTimeout(() => upstream.destroy(), o.connectTimeoutMs ?? 10_000);
-      upstream.on("close", () => {
+      upstream.on("close", (hadError) => {
         sockets.delete(upstream);
-        client.destroy();
+        // A clean close comes after the upstream's end, which the pipe passes on as the client's end — but bytes
+        // may still be queued for a slow client. Destroying now would drop them (a response cut short), so wait
+        // until they are flushed; an upstream error, or a client that never drains, ends it at once / in time.
+        if (hadError || client.destroyed || client.writableFinished) return void client.destroy();
+        client.end();
+        client.once("finish", () => client.destroy());
+        setTimeout(() => client.destroy(), FLUSH_MS).unref();
       });
       upstream.on("error", () => {
         clearTimeout(timer);

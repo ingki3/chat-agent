@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import net from "node:net";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GOOGLE_NEWS_SKILL, SELFTEST_SKILL, type BundledSkill } from "@agentlee/mcp-tools/skills";
 import { WEB_WORKER_DIR, WEB_WORKER_ENTRY } from "@agentlee/mcp-tools/web";
@@ -25,7 +26,7 @@ import {
 } from "../src/web/service.js";
 import { defuseExternal, frameExternal } from "@agentlee/shared";
 import { callOurTool } from "./helpers/live-mcp.js";
-import { startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
+import { PUBLIC_IP, startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
 import {
   decodeEntities,
   extractHtml,
@@ -259,6 +260,52 @@ describe("web fetch: limits, content types, no forwarded credentials", () => {
     expect(await fetchVia("http://public.test/fat-header.gz")).toEqual({ ok: false, code: "web_too_large" });
     // Same shape, small: the format itself is fine.
     expect(await fetchVia("http://public.test/small-header.gz")).toMatchObject({ ok: true, text: "ok" });
+  });
+
+  it("proxy: a slow client still gets every byte after the server has closed (no cut-off on upstream close)", async () => {
+    // A stand-in upstream whose last 16 MB, end and close arrive back to back — what a server that writes and
+    // closes can look like to the proxy. The bytes are still queued for the (paused) client when the close comes.
+    const BYTES = 16 * 1024 * 1024;
+    const fake = Object.assign(new PassThrough(), { setTimeout: () => fake }) as unknown as net.Socket;
+
+    const p = await startEgressProxy({
+      allow: "public",
+      ports: [80],
+      lookup: async () => [PUBLIC_IP],
+      connect: () => {
+        setImmediate(() => fake.emit("connect"));
+        return fake;
+      },
+    });
+    closers.push(() => p.close());
+    const got = await new Promise<number>((resolve, reject) => {
+      const s = net.connect(p.port, "127.0.0.1", () => s.write("CONNECT public.test:80 HTTP/1.1\r\n\r\n"));
+      let tunnelled = false;
+      let n = 0;
+      s.on("data", (d: Buffer) => {
+        if (tunnelled) return void (n += d.length);
+        tunnelled = true;
+        // Not reading for a while; meanwhile the upstream sends everything and closes.
+        s.pause();
+        // Its last data, its end and its close, back to back (as a socket reports a server's final write + FIN).
+        fake.emit("data", Buffer.alloc(BYTES, 97));
+        fake.emit("end");
+        fake.emit("close", false);
+        setTimeout(() => s.resume(), 300);
+      });
+      s.on("end", () => resolve(n));
+      s.on("close", () => resolve(n));
+      s.on("error", reject);
+    });
+    expect(got).toBe(BYTES);
+  });
+
+  it("a server that closes right after a big write: every byte arrives through the proxy", async () => {
+    for (let i = 0; i < 5; i++) {
+      const r = await fetchVia("http://public.test/close-after.txt", { maxChars: 3_000_000 });
+      expect(r.ok, `round ${i}`).toBe(true);
+      expect((r as { text: string }).text.length).toBe(2_500_000);
+    }
   });
 
   it("HTTPS: the certificate is checked against the target — a public IP (IP SAN) and a name both verify", async () => {

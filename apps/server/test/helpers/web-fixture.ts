@@ -138,6 +138,10 @@ export async function startWebFixture(): Promise<WebFixture> {
         res.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip" });
         return res.end(Buffer.concat([head, Buffer.from("name\0"), zlib.deflateRawSync(content), tail]));
       }
+      case "/close-after.txt":
+        // 2.5 MB in one write, then the server closes: the proxy must deliver every byte before hanging up.
+        res.writeHead(200, { "content-type": "text/plain", connection: "close" });
+        return res.end(Buffer.alloc(2_500_000, 98));
       case "/gzip.html":
         return res
           .writeHead(200, { "content-type": "text/html", "content-encoding": "gzip" })
