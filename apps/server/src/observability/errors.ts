@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lt, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, like, lt, max, or, sql } from "drizzle-orm";
 import type { RecentError } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { errorLog } from "../db/schema.js";
@@ -10,6 +10,8 @@ import {
   isMethod,
   isRoutePattern,
   isRuntime,
+  isFinanceCode,
+  isSkillCode,
   isToolName,
   CODE_CATEGORY,
   type ErrorCategory,
@@ -68,7 +70,8 @@ export class ErrorLog {
         .values({
           at: this.now(),
           source: e.source,
-          code: keep(isErrorCode, e.code) ?? "unknown",
+          // Skill and finance tool outcomes too (#35: the admin's skill failure list), all fixed codes.
+          code: keep((c) => isErrorCode(c) || isSkillCode(c) || isFinanceCode(c), e.code) ?? "unknown",
           category: keep(isCategory, e.category) ?? "app",
           userId: keep(isId, e.userId),
           conversationId: keep(isId, e.conversationId),
@@ -111,6 +114,27 @@ export class ErrorLog {
     } catch {
       return 0;
     }
+  }
+
+  /**
+   * Failed skill calls of the retention period (#35, FR-10.4 "스킬 실행 실패"): the entries our MCP server records
+   * with a skill (`skill_*`) or finance tool (`finance_*`) outcome code, counted by tool and code, newest first.
+   */
+  skillFailures(): { tool: string; code: string; count: number; lastAt: number }[] {
+    return this.db
+      .select({ tool: errorLog.tool, code: errorLog.code, count: count(), lastAt: max(errorLog.at) })
+      .from(errorLog)
+      .where(
+        and(
+          gte(errorLog.at, this.now() - this.maxAgeMs),
+          eq(errorLog.source, "tool"),
+          or(like(errorLog.code, "skill_%"), like(errorLog.code, "finance_%")),
+        ),
+      )
+      .groupBy(errorLog.tool, errorLog.code)
+      .orderBy(desc(max(errorLog.at)))
+      .all()
+      .map((r) => ({ tool: r.tool ?? "other", code: r.code, count: r.count, lastAt: r.lastAt ?? 0 }));
   }
 
   /** Newest first, never older than the retention period (even if pruning has not run yet). */

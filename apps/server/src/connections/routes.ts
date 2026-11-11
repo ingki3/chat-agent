@@ -76,6 +76,16 @@ export function registerConnectionRoutes(
     if (!body.success) return fail(reply, 400, "invalid_request");
     const owner = ownerId ? users.byId(ownerId) : undefined;
     if (ownerId && !owner?.active) return fail(reply, 404, "not_found");
+    // A subscription is connected by its owner only (FR-11.4, #35): an admin registering on someone's behalf adds
+    // API keys, never a subscription. Members' accounts refuse it anyway (the store's rules); this closes the one
+    // case they allow — an admin pasting a token onto another admin's account.
+    if (
+      owner &&
+      owner.id !== req.ctx.user!.id &&
+      owner.role === "admin" &&
+      body.data.authType === "subscription"
+    )
+      return fail(reply, 403, "subscription_self_only");
     try {
       const c = store.create({ ...body.data, scope, owner: owner ?? null, createdBy: req.ctx.user!.id });
       logEvent(req.log, "info", "connection.created", {
@@ -246,14 +256,31 @@ export function registerConnectionRoutes(
   app.post<{ Params: UserParams }>("/api/admin/users/:id/connections", { config: admin }, (req, reply) =>
     create(req, reply, "personal", req.params.id),
   );
+  const memberConnection = (userId: string, connectionId: string) => {
+    const c = store.get(connectionId);
+    return c && c.scope === "personal" && c.ownerId === userId && c.disconnectedAt === null ? c : undefined;
+  };
   app.delete<{ Params: { id: string; connectionId: string } }>(
     "/api/admin/users/:id/connections/:connectionId",
     { config: admin },
     (req, reply) => {
-      const c = store.get(req.params.connectionId);
-      if (!c || c.scope !== "personal" || c.ownerId !== req.params.id || c.disconnectedAt !== null)
-        return fail(reply, 404, "not_found");
-      return disconnect(reply, c);
+      const c = memberConnection(req.params.id, req.params.connectionId);
+      return c ? disconnect(reply, c) : fail(reply, 404, "not_found");
+    },
+  );
+  // Tests a member's personal API key connection as that member (their policy, their folder, usage on them) — so one
+  // the admin registered on their behalf can be made usable (#35). The credential is never shown.
+  app.post<{ Params: { id: string; connectionId: string } }>(
+    "/api/admin/users/:id/connections/:connectionId/test",
+    { config: admin },
+    (req, reply) => {
+      const c = memberConnection(req.params.id, req.params.connectionId);
+      if (!c) return fail(reply, 404, "not_found");
+      // On someone's behalf for API keys only: a subscription is used by its owner alone (D2, FR-11.4) — not
+      // even for a test run by another admin. Their own one is tested from their own settings.
+      if (c.authType !== "api_key" && c.ownerId !== req.ctx.user!.id)
+        return fail(reply, 403, "subscription_self_only");
+      return test(reply, c, req.params.id);
     },
   );
 

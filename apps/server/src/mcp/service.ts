@@ -31,6 +31,8 @@ import { runIsolated, type RunIsolatedOptions } from "../isolation/sandbox.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { registerToolNames } from "../observability/policy.js";
 import type { InstallState } from "./install.js";
+import type { ErrorLog } from "../observability/errors.js";
+import type { SkillSwitches } from "./switches.js";
 import type { PythonRuntime } from "./python.js";
 import type { SourceStore } from "../web/sources.js";
 import {
@@ -48,6 +50,19 @@ import {
 const FINANCE_SKILLS: ReadonlySet<string> = new Set(
   SKILL_CATALOGUE.filter((e) => e.finance).map((e) => e.name),
 );
+
+export const isFinanceSkill = (skill: string) => FINANCE_SKILLS.has(skill);
+
+/**
+ * Whether a user's own permissions allow `skill` (FR-1.6) — not whether it is offered now (`McpService.allows`
+ * adds the account being active and the server allow-list). "all" = every skill except the finance skills for a
+ * youth account (the son, #30): hidden by default; only an explicit list that names them turns them on.
+ */
+export function skillPermitted(user: { permissions?: unknown; youth?: unknown }, skill: string): boolean {
+  const p = (user as { permissions?: { skills?: unknown } }).permissions?.skills;
+  if (p === "all") return !(user.youth === true && FINANCE_SKILLS.has(skill));
+  return Array.isArray(p) && p.includes(skill);
+}
 
 /** The bundled skills (always available): the verification skill. Installed skills come from `install.ts`. */
 export const BUNDLED_SKILLS: readonly BundledSkill[] = [SELFTEST_SKILL];
@@ -283,6 +298,10 @@ export type McpServiceOptions = {
   artifacts?: ArtifactStore;
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
+  /** The server allow-list switches (#35). Without it every skill is on. */
+  switches?: SkillSwitches;
+  /** Recent errors (#46): failed skill calls are recorded (tool name and code only) for the admin screen. */
+  errors?: ErrorLog;
 };
 
 export type WebOptions = {
@@ -308,6 +327,8 @@ export type SkillOverview = {
   finance: boolean;
   status: SkillStatus;
   issue?: string;
+  /** On the server allow-list (#35). */
+  enabled: boolean;
 };
 
 /**
@@ -425,17 +446,25 @@ export class McpService {
   }
 
   /**
-   * Whether this user may use this skill now: active, and the skill always on or in their permissions. "all" means
-   * every skill — except the finance skills for a youth account (the son, #30): they are hidden by default and
-   * only an explicit list that names them turns them on.
+   * Whether this user may use this skill now: active, and the skill always on, or on the server allow-list (#35)
+   * and allowed by their permissions (`skillPermitted`: youth accounts without finance under "all").
    */
   allows(userId: string, skill: string): boolean {
     const u = this.users.byId(userId);
     if (!u?.active) return false;
     if (ALWAYS_ON_SKILLS.has(skill)) return true;
-    const p = (u as { permissions?: { skills?: unknown } }).permissions?.skills;
-    if (p === "all") return !((u as { youth?: unknown }).youth === true && FINANCE_SKILLS.has(skill));
-    return Array.isArray(p) && p.includes(skill);
+    if (this.opts.switches && !this.opts.switches.enabled(skill)) return false;
+    return skillPermitted(u, skill);
+  }
+
+  /** Turns a catalogue skill on or off on the server allow-list (#35); applies from the next tool list / call. */
+  setServerEnabled(skill: string, enabled: boolean): void {
+    this.opts.switches?.set(skill, enabled);
+  }
+
+  /** The server allow-list switch of a skill (#35). */
+  serverEnabled(skill: string): boolean {
+    return ALWAYS_ON_SKILLS.has(skill) || (this.opts.switches?.enabled(skill) ?? true);
   }
 
   private toolsFor(userId: string): ServerToolInfo[] {
@@ -463,6 +492,7 @@ export class McpService {
         finance: e.finance,
         status,
         ...(e.issue ? { issue: e.issue } : {}),
+        enabled: this.serverEnabled(e.name),
       };
     });
   }
@@ -507,6 +537,17 @@ export class McpService {
           durationMs: now() - t0,
           ...(r.ok ? {} : { skillCode: r.code }),
         });
+        // The admin's "스킬 실행 실패" list (FR-10.4): tool name and code only.
+        if (!r.ok)
+          this.opts.errors?.record({
+            source: "tool",
+            code: r.code,
+            category: "tool",
+            tool: skillToolName(name),
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+          });
         return r;
       },
       onToolCall: (tool, scope, ok) => {
@@ -528,6 +569,18 @@ export class McpService {
             durationMs: now() - t0,
             ...(r.ok ? {} : { financeCode: r.code }),
           });
+          // Finance tools are skills too (PRD §7): their failures join the admin's skill failure list, by tool name
+          // and fixed `finance_*` code only.
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
           return r;
         }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {

@@ -10,6 +10,7 @@ export * from "./sources.js";
 export * from "./artifacts.js";
 export * from "./usage.js";
 export * from "./finance.js";
+export * from "./admin.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({
@@ -79,10 +80,48 @@ export const DEFAULT_PERMISSIONS: UserPermissions = {
   skills: "all",
 };
 
+/**
+ * Default runtime and, per runtime, default model and effort (PRD D3, FR-12.1·12.3·12.4). Stored twice per user:
+ * the user's own choice, and the admin's initial value for that user (used while the user has made none).
+ * Both are checked against the user's policy when they are saved (403 / 400 when not allowed).
+ */
+export const ModelDefault = z
+  .object({ model: z.string().min(1).max(100), effort: z.string().min(1).max(20).nullable() })
+  .strict();
+export type ModelDefault = z.infer<typeof ModelDefault>;
+export const RuntimeDefaults = z
+  .object({
+    runtime: RuntimeId,
+    models: z.object({ "claude-code": ModelDefault.optional(), codex: ModelDefault.optional() }).strict(),
+  })
+  .strict();
+export type RuntimeDefaults = z.infer<typeof RuntimeDefaults>;
+/** Without any saved value (PRD D3, FR-12.4): Claude Code · Opus 5.5. */
+export const SERVICE_DEFAULTS: RuntimeDefaults = {
+  runtime: "claude-code",
+  models: { "claude-code": { model: "claude-opus-5-5", effort: null } },
+};
+/**
+ * `GET /api/settings/defaults`: what new conversations start with — the user's own choice, else the admin's
+ * initial value, else the service default — and which runtimes' saved model is no longer allowed (FR-12.6 notice;
+ * the automatic fallback itself is #19).
+ */
+export const DefaultsResponse = z.object({
+  defaults: RuntimeDefaults,
+  source: z.enum(["own", "initial", "service"]),
+  unavailable: z.array(RuntimeId),
+});
+export type DefaultsResponse = z.infer<typeof DefaultsResponse>;
+/** `PUT /api/settings/defaults` (own) and `PUT /api/admin/users/:id/defaults` (initial; null clears it). */
+export const SetDefaultsRequest = z.object({ defaults: RuntimeDefaults.nullable() }).strict();
+
 export const AdminUser = AuthUser.extend({
   active: z.boolean(),
   permissions: UserPermissions,
+  /** The admin's initial runtime (= `initialDefaults.runtime`); kept for the create form (#41). */
   defaultRuntime: RuntimeId.nullable(),
+  /** The admin's initial defaults for this user (FR-12.4); null = the service default. */
+  initialDefaults: RuntimeDefaults.nullable(),
   /** Youth account (the son): gets the youth safety and learning-support instructions (#20). */
   youth: z.boolean(),
   createdAt: z.number(),
@@ -97,6 +136,20 @@ export const CreateUserRequest = z.object({
   youth: z.boolean().default(false),
 });
 export const SetYouthRequest = z.object({ youth: z.boolean() });
+/**
+ * `PATCH /api/admin/users/:id` (#35, FR-15.1): name, email and role. An admin's email is changed by the #36
+ * procedure only (FR-15.7); the last active admin cannot be demoted.
+ */
+export const UpdateUserRequest = z
+  .object({
+    name: z.string().trim().min(1).max(40).optional(),
+    email: z.string().trim().toLowerCase().max(254).pipe(z.email()).optional(),
+    role: Role.optional(),
+  })
+  .strict()
+  .refine((v) => v.name !== undefined || v.email !== undefined || v.role !== undefined, {
+    message: "nothing to update",
+  });
 /** The temporary password is in this response only; it is never stored or shown again. */
 export const CreateUserResponse = z.object({ user: AdminUser, temporaryPassword: z.string() });
 export const ResetPasswordResponse = z.object({ temporaryPassword: z.string() });
@@ -120,9 +173,32 @@ export const AdminSkill = z.object({
    */
   status: z.enum(["available", "not_installed", "broken", "needs_python", "planned", "document"]),
   issue: z.string().optional(),
+  /** On the server allow-list (FR-10.3). Off: no user gets it, whatever their own permissions say. */
+  enabled: z.boolean(),
 });
 export type AdminSkill = z.infer<typeof AdminSkill>;
 export const AdminSkillsResponse = z.object({ skills: z.array(AdminSkill) });
+/** `PUT /api/admin/skills/:name` (server allow-list) and `PUT /api/admin/users/:id/skills/:name` (one user). */
+export const SetSkillEnabledRequest = z.object({ enabled: z.boolean() }).strict();
+/**
+ * One skill for one user (`GET /api/admin/users/:id/skills`): whether their permissions allow it (`allowed`) and
+ * why — `all` (every skill), `youth_hidden` (finance skill of a youth account under "all"), `listed` / `unlisted`
+ * (an explicit list). `serverEnabled` false = off for everyone on the server allow-list.
+ */
+export const UserSkill = z.object({
+  name: z.string(),
+  finance: z.boolean(),
+  allowed: z.boolean(),
+  reason: z.enum(["all", "youth_hidden", "listed", "unlisted"]),
+  serverEnabled: z.boolean(),
+});
+export type UserSkill = z.infer<typeof UserSkill>;
+export const UserSkillsResponse = z.object({
+  mode: z.enum(["all", "list"]),
+  youth: z.boolean(),
+  skills: z.array(UserSkill),
+});
+export type UserSkillsResponse = z.infer<typeof UserSkillsResponse>;
 
 /** Error codes returned as `{ error }` by the auth layer. */
 export type AuthError =
@@ -141,6 +217,7 @@ export type AuthError =
   | "email_taken"
   | "cannot_change_self"
   | "last_admin"
+  | "admin_email_change"
   | "unknown_skill"
   | "not_found";
 

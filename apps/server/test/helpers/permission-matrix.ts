@@ -191,7 +191,17 @@ export const ADMIN_ONLY: Record<Who, number> = {
  * `ADMIN_MATRIX_PREFIXES` must all have a row (#32: usage).
  */
 export type AdminRow = { route: string; expect: Record<Who, number>; body?: unknown };
-export const ADMIN_MATRIX_PREFIXES = ["/api/admin/usage"];
+export const ADMIN_MATRIX_PREFIXES = [
+  "/api/admin/usage",
+  // #35: the admin screen's runtimes, system status and skill allow-list.
+  "/api/admin/runtimes",
+  "/api/admin/system",
+  "/api/admin/skills",
+  "/api/admin/errors",
+  "/api/admin/connections",
+];
+/** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
+const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
 export const ADMIN_MATRIX: AdminRow[] = [
   { route: "GET /api/admin/usage", expect: ADMIN_ONLY },
   { route: "GET /api/admin/usage/prices", expect: ADMIN_ONLY },
@@ -206,7 +216,125 @@ export const ADMIN_MATRIX: AdminRow[] = [
   },
   { route: "GET /api/admin/usage/settings", expect: ADMIN_ONLY },
   { route: "PUT /api/admin/usage/settings", expect: ADMIN_ONLY, body: { dailyCostThresholdUsd: 5 } },
+  // #35
+  { route: "GET /api/admin/runtimes", expect: ADMIN_ONLY },
+  { route: "GET /api/admin/system", expect: ADMIN_ONLY },
+  { route: "GET /api/admin/skills", expect: ADMIN_ONLY },
+  { route: "PUT /api/admin/skills/:name", expect: ADMIN_BY_ID, body: { enabled: true } },
+  { route: "GET /api/admin/errors", expect: ADMIN_ONLY },
+  { route: "GET /api/admin/connections", expect: ADMIN_ONLY },
+  {
+    route: "POST /api/admin/connections",
+    expect: { ...ADMIN_ONLY, admin: 201 },
+    body: { runtime: "claude-code", authType: "api_key", secret: `sk-ant-matrixshared${"x".repeat(24)}` },
+  },
+  { route: "PATCH /api/admin/connections/:id", expect: ADMIN_BY_ID, body: { label: "x" } },
+  { route: "DELETE /api/admin/connections/:id", expect: ADMIN_BY_ID },
+  { route: "POST /api/admin/connections/:id/test", expect: ADMIN_BY_ID },
 ];
+
+/**
+ * Admin routes on one user (`/api/admin/users/:id…`, #41/#17/#21/#35): run against a real member as the target —
+ * a fresh account for each row, none of the callers — so the admin's call reaches the handler and succeeds.
+ * Every admin route must have a row here or in `ADMIN_MATRIX` (permissions.test).
+ */
+export type AdminUserRow = {
+  route: string;
+  expect: Record<Who, number>;
+  body?: unknown;
+  /** Other path params (e.g. a connection of the target). */
+  params?: (f: Family, target: UserRow) => Record<string, string>;
+};
+const targetConnection = (f: Family, target: UserRow) =>
+  f.app.connections!.store.create({
+    runtime: "claude-code",
+    authType: "api_key",
+    scope: "personal",
+    owner: target,
+    createdBy: target.id,
+    secret: `sk-ant-matrixtarget${"x".repeat(24)}`,
+  }).id;
+export const ADMIN_USER_MATRIX: AdminUserRow[] = [
+  { route: "GET /api/admin/users", expect: ADMIN_ONLY },
+  {
+    route: "POST /api/admin/users",
+    expect: { ...ADMIN_ONLY, admin: 201 },
+    body: { name: "새 가족", email: "matrix-new@matrix.test" },
+  },
+  { route: "PATCH /api/admin/users/:id", expect: ADMIN_ONLY, body: { name: "새 이름" } },
+  { route: "PUT /api/admin/users/:id/youth", expect: ADMIN_ONLY, body: { youth: false } },
+  { route: "PUT /api/admin/users/:id/skills", expect: ADMIN_ONLY, body: { skills: "all" } },
+  { route: "GET /api/admin/users/:id/skills", expect: ADMIN_ONLY },
+  {
+    route: "PUT /api/admin/users/:id/skills/:name",
+    expect: ADMIN_ONLY,
+    body: { enabled: true },
+    params: () => ({ name: "google-news-search-skill" }),
+  },
+  { route: "PUT /api/admin/users/:id/defaults", expect: ADMIN_ONLY, body: { defaults: null } },
+  { route: "GET /api/admin/users/:id/runtime-policies", expect: ADMIN_ONLY },
+  {
+    route: "PUT /api/admin/users/:id/runtime-policies",
+    expect: ADMIN_ONLY,
+    body: {
+      items: [
+        {
+          runtime: "claude-code",
+          allowed: true,
+          models: "all",
+          efforts: "all",
+          allowPersonal: true,
+          allowShared: true,
+        },
+      ],
+    },
+  },
+  { route: "GET /api/admin/users/:id/connections", expect: ADMIN_ONLY },
+  {
+    route: "POST /api/admin/users/:id/connections",
+    expect: { ...ADMIN_ONLY, admin: 201 },
+    body: { runtime: "claude-code", authType: "api_key", secret: `sk-ant-matrixbehalf${"x".repeat(24)}` },
+  },
+  {
+    route: "DELETE /api/admin/users/:id/connections/:connectionId",
+    expect: ADMIN_ONLY,
+    params: (f, target) => ({ connectionId: targetConnection(f, target) }),
+  },
+  {
+    route: "POST /api/admin/users/:id/connections/:connectionId/test",
+    expect: ADMIN_ONLY,
+    params: (f, target) => ({ connectionId: targetConnection(f, target) }),
+  },
+  { route: "POST /api/admin/users/:id/reset-password", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/users/:id/deactivate", expect: ADMIN_ONLY },
+];
+
+let targets = 0;
+/** Runs every per-user admin row for every caller against a fresh target account. Returns the mismatches. */
+export async function runAdminUserMatrix(f: Family, rows: AdminUserRow[]): Promise<string[]> {
+  const failures: string[] = [];
+  for (const row of rows) {
+    const target = f.app.users!.create({
+      email: `target-${++targets}@matrix.test`,
+      name: "target",
+      role: "member",
+      passwordHash: "x",
+    });
+    // The admin last, so a member's refused call is checked against the same, unchanged target.
+    for (const who of (Object.keys(row.expect) as Who[]).sort(
+      (a, b) => +(a === "admin") - +(b === "admin"),
+    )) {
+      const [method, pattern] = row.route.split(" ") as [string, string];
+      let url = pattern.replace(":id", encodeURIComponent(target.id));
+      for (const [k, v] of Object.entries(row.params?.(f, target) ?? {}))
+        url = url.replace(`:${k}`, encodeURIComponent(v));
+      const got = (await sendAs(f, who, `${method} ${url}`, row.body)).statusCode;
+      if (got !== row.expect[who])
+        failures.push(`${row.route} as ${who}: expected ${row.expect[who]}, got ${got}`);
+    }
+  }
+  return failures;
+}
 
 /**
  * Every route Fastify itself has registered (`METHOD /path`, HEAD included — its automatic mirrors of GET and

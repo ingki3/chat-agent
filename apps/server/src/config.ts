@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { SKILL_SECRET_NAMES } from "@agentlee/mcp-tools/skills";
 import { isInside } from "./fs-safety.js";
+import { parseMetricsAddress, type MetricsAddress } from "./observability/tunnel.js";
 
 /** Repository root, resolved from apps/server/{src,dist}. `.env` and relative paths are anchored here. */
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -89,6 +90,16 @@ const ConfigSchema = z.object({
   EXPORT_BROWSER: optional(
     z.string().refine((p) => path.isAbsolute(p), { message: "EXPORT_BROWSER must be an absolute path" }),
   ),
+  /**
+   * `cloudflared`'s metrics server for the admin's tunnel status (#35): `http://127.0.0.1:<port>` or
+   * `http://[::1]:<port>` only (cloudflared `--metrics 127.0.0.1:<port>`). Unset = "미설정".
+   */
+  CLOUDFLARED_METRICS: optional(
+    z.string().refine((v) => parseMetricsAddress(v) !== undefined, {
+      message:
+        "CLOUDFLARED_METRICS must be http://127.0.0.1:<port> or http://[::1]:<port> (loopback IP, no path)",
+    }),
+  ),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -127,6 +138,8 @@ export type Config = {
   exportBrowser?: string | undefined;
   /** Web search providers in the order they are tried (#50). */
   webSearchProviders: ("google-news" | "duckduckgo")[];
+  /** `cloudflared`'s loopback metrics server (#35); undefined = not configured. */
+  tunnelMetrics?: MetricsAddress | undefined;
 };
 
 /** A secret value: printable ASCII, no spaces (API keys). */
@@ -194,6 +207,7 @@ export function loadConfig(
       .map((p) => path.resolve(baseDir, p)),
     skillSecrets: skillSecrets(source),
     exportBrowser: c.EXPORT_BROWSER,
+    tunnelMetrics: c.CLOUDFLARED_METRICS ? parseMetricsAddress(c.CLOUDFLARED_METRICS) : undefined,
     webSearchProviders: [
       ...new Set(
         (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],

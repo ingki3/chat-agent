@@ -11,7 +11,10 @@ import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plu
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
 import { UserStore } from "./auth/users.js";
 import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
-import { registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
+import { registerAccountSettings, registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
+import { DefaultsService } from "./users/defaults.js";
+import { registerAdminSystemRoutes, type SystemRouteOptions } from "./admin/routes.js";
+import { SkillSwitches } from "./mcp/switches.js";
 import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
 import { RuntimeRegistry } from "./runtime/adapter.js";
@@ -166,6 +169,8 @@ export type BuildOptions = {
   usage?: UsageServiceOptions;
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
+  /** System status overrides (tests: the tunnel probe). */
+  system?: Pick<SystemRouteOptions, "tunnel">;
 };
 
 /** Tests without a master key: one throwaway key per database, so rebuilding the app on it still decrypts. */
@@ -300,6 +305,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       artifacts,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: { secrets: config.skillSecrets },
+      // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
+      switches: new SkillSwitches(settingsStore),
+      ...(errors ? { errors } : {}),
       ...mcpOptionsFromConfig(config),
       ...opts.mcp,
     });
@@ -366,6 +374,23 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     app.addHook("onClose", async () => logins.close());
     registerConnectionRoutes(app, connections, users, runtimes, logins);
+    // Admin screen (#35): accounts, defaults, skills, runtimes and system status.
+    registerAccountSettings(app, users, {
+      defaults: new DefaultsService(connections.access, runtimes),
+      mcp,
+    });
+    registerAdminSystemRoutes(
+      app,
+      { registry: runtimes, connections: connectionStore, errors: errors! },
+      {
+        version: VERSION,
+        startedAt,
+        dataDir: config.dataDir,
+        databaseFile: opts.db!.$client.memory ? null : opts.db!.$client.name,
+        tunnelMetrics: config.tunnelMetrics,
+        ...opts.system,
+      },
+    );
     registerSourceRoutes(app, app.conversations!, sources);
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
     let renderer = opts.renderer;

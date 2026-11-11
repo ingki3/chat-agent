@@ -1,4 +1,4 @@
-import type { RunChoice, RuntimeId } from "@agentlee/shared";
+import type { ModelDefault, RunChoice, RuntimeDefaults, RuntimeId } from "@agentlee/shared";
 import type { UserStore } from "../auth/users.js";
 import type { ModelCapability, RuntimeCapabilities } from "../runtime/adapter.js";
 import type { ConnectionRow, ConnectionStore, EffectivePolicy } from "./store.js";
@@ -64,6 +64,59 @@ export class RunAccess {
           : { ...rest, efforts },
       ];
     });
+  }
+
+  /**
+   * Whether `defaults` may be saved for this user (FR-12.1, #35): the default runtime and every runtime's default
+   * model and effort go through `resolve` exactly as an explicit choice of a run would — the same allowed list the
+   * chip (#19) and the run check use. Throws `RunAccessDenied` with the first refusal. `caps` = the runtime's
+   * capabilities on this server (undefined: not registered → `runtime_not_allowed`).
+   */
+  checkDefaults(
+    userId: string,
+    defaults: RuntimeDefaults,
+    caps: (runtime: RuntimeId) => RuntimeCapabilities | undefined,
+  ): void {
+    const code = this.defaultsProblem(userId, defaults.runtime, defaults.models[defaults.runtime], caps);
+    if (code) throw new RunAccessDenied(code);
+    for (const runtime of Object.keys(defaults.models) as RuntimeId[]) {
+      const c = this.defaultsProblem(userId, runtime, defaults.models[runtime], caps);
+      if (c) throw new RunAccessDenied(c);
+    }
+  }
+
+  /** Runtimes of `defaults` whose saved choice is not allowed (any more) — the settings notice (FR-12.6). */
+  unavailableDefaults(
+    userId: string,
+    defaults: RuntimeDefaults,
+    caps: (runtime: RuntimeId) => RuntimeCapabilities | undefined,
+  ): RuntimeId[] {
+    const runtimes = new Set<RuntimeId>([defaults.runtime, ...(Object.keys(defaults.models) as RuntimeId[])]);
+    return [...runtimes].filter((r) => this.defaultsProblem(userId, r, defaults.models[r], caps) !== null);
+  }
+
+  private defaultsProblem(
+    userId: string,
+    runtime: RuntimeId,
+    model: ModelDefault | undefined,
+    caps: (runtime: RuntimeId) => RuntimeCapabilities | undefined,
+  ): RunAccessDenied["code"] | null {
+    const capabilities = caps(runtime);
+    if (!capabilities) return "runtime_not_allowed";
+    try {
+      this.resolve({
+        userId,
+        runtime,
+        // Only the model and effort are checked: whether a connection exists is the run's business.
+        capabilities: { ...capabilities, needsConnection: false },
+        requested: model ? { model: model.model, ...(model.effort ? { effort: model.effort } : {}) } : {},
+        current: { model: null, effort: null },
+      });
+      return null;
+    } catch (e) {
+      if (e instanceof RunAccessDenied) return e.code;
+      throw e;
+    }
   }
 
   resolve(input: RunSettingsInput): RunSettings {

@@ -17,8 +17,18 @@ export const users = sqliteTable("users", {
     .$type<{ runtimes: string[]; models: "all" | string[]; skills: "all" | string[] }>()
     .notNull()
     .default(sql`'{"runtimes":["claude-code","codex"],"models":"all","skills":"all"}'`),
-  /** The user's default runtime for new conversations (FR-12); null = service default. */
+  /**
+   * Superseded by `initial_defaults.runtime` (0015 copied it there); no longer read or written. Kept so the table is
+   * not rebuilt (every user-owned table refers to it).
+   */
   defaultRuntime: text("default_runtime"),
+  /**
+   * The admin's initial defaults for this user (#35, FR-12.4): `RuntimeDefaults` in @agentlee/shared. Used while
+   * the user has saved none of their own. Null = the service default (Claude Code · Opus 5.5).
+   */
+  initialDefaults: text("initial_defaults", { mode: "json" }).$type<unknown>(),
+  /** The user's own defaults (FR-12.1·12.3), saved from settings; null = none saved yet. */
+  defaults: text("defaults", { mode: "json" }).$type<unknown>(),
   /** Youth account (PRD NFR 청소년 — the son, 고2): its runs get the youth safety and learning-support instructions. */
   youth: integer("youth", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at").notNull().default(now),

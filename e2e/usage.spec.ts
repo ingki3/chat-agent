@@ -50,7 +50,9 @@ test("admin: report, breakdowns, price table versions, daily threshold, budget s
   page,
 }) => {
   await useAccount(page, ADMIN);
+  // The usage tab of the admin screen (#35).
   await page.goto("/admin");
+  await page.getByRole("tab", { name: "사용량" }).click();
   const section = page.getByRole("region", { name: "사용량", exact: true });
   await expect(section.getByTestId("usage-summary")).toContainText("예상 (일평균 × 남은");
   // Every breakdown table can be shown.
