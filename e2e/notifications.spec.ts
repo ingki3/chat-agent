@@ -313,15 +313,16 @@ test("a renewed subscription the worker could not register (403) is registered o
 
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
-  expect((await current()).map((d) => d.id)).not.toContain(first!.id);
-  expect(await registered(renewed)).toBe(true);
-  expect(await markerOf(page)).toBeNull();
+  // The page can show the state before its sync's server calls have finished: wait for the server (#87).
+  await expect.poll(async () => (await current()).map((d) => d.id)).not.toContain(first!.id);
+  await expect.poll(() => registered(renewed)).toBe(true);
+  await expect.poll(() => markerOf(page)).toBeNull();
 
   // The real browser state wins: no subscription any more → shown off, and the server forgets the device.
   await page.evaluate(() => localStorage.removeItem("e2e-push-endpoint"));
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
   await ctx.close();
 });
 
@@ -342,7 +343,7 @@ test("session expired, the worker's re-registration failed, then another account
     devices: { current: boolean }[];
   };
   expect(mine.devices.filter((d) => d.current)).toEqual([]);
-  expect(await markerOf(page)).toBeNull();
+  await expect.poll(() => markerOf(page)).toBeNull();
   await ctx.close();
 });
 
@@ -370,7 +371,7 @@ test("replacing the registration is safe: a failed registration (503) keeps it, 
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
   expect((await current()).map((d) => d.id)).not.toContain(first!.id);
-  expect(await registered(renewed)).toBe(true);
+  await expect.poll(() => registered(renewed)).toBe(true);
   await ctx.close();
 });
 
@@ -422,12 +423,12 @@ test("turning off discards recovery even when the browser fails to unsubscribe: 
   await page.getByTestId("this-device").getByRole("button", { name: "끄기", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("구독을 끊지 못했어요");
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await markerOf(page)).toBeNull();
+  await expect.poll(() => markerOf(page)).toBeNull();
   expect(await bindingOf(page)).toBeNull();
   // The browser still holds a subscription; reconnecting must not turn it back on by itself.
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
   await ctx.close();
 });
 
@@ -447,20 +448,20 @@ test("after a successful renewal by the worker, 끄기 with a failing unsubscrib
       }),
     renewed,
   );
-  expect(await markerOf(page)).toBeNull();
+  await expect.poll(() => markerOf(page)).toBeNull();
   // The renewal replaced this session's device: one row, for the renewed endpoint.
-  expect(await current()).toHaveLength(1);
-  expect(await registered(renewed)).toBe(true);
+  await expect.poll(async () => (await current()).length).toBe(1);
+  await expect.poll(() => registered(renewed)).toBe(true);
 
   await page.evaluate(() => localStorage.setItem("e2e-push-unsubscribe-fails", "1"));
   await page.getByTestId("this-device").getByRole("button", { name: "끄기", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("구독을 끊지 못했어요");
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
   // Reconnect: still off, and the server has nothing of this session to push to.
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
   expect(await registered(renewed)).toBe(false);
   await ctx.close();
 });
@@ -502,16 +503,16 @@ test("a worker re-registration still in flight when 끄기 is clicked is refused
   release();
   await inFlight;
   await ctx.unroute("**/api/push/devices");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
   expect(await registered(renewed)).toBe(false);
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toEqual([]);
+  await expect.poll(() => current()).toEqual([]);
 
   // Turning on again by hand works.
   await page.evaluate(() => localStorage.removeItem("e2e-push-unsubscribe-fails"));
   await page.getByRole("button", { name: "이 기기에서 알림 켜기" }).click();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
-  expect(await current()).toHaveLength(1);
+  await expect.poll(async () => (await current()).length).toBe(1);
   await ctx.close();
 });
