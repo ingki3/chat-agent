@@ -19,8 +19,12 @@ import {
   scrubKnown,
   scrubEventSequence,
   scrubKnownDeep,
+  scrubParts,
   StreamScrubber,
 } from "../src/secrets/known.js";
+import { TEXT_COLUMNS } from "../src/secrets/columns.js";
+import { StoredRescrub } from "../src/secrets/rescrub.js";
+import { ConnectionStore } from "../src/connections/store.js";
 import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
 import { FinanceResultStore } from "../src/finance/results.js";
 import type { AnswerEvidence } from "../src/finance/checker.js";
@@ -667,11 +671,23 @@ describe("round 25: scrubber", () => {
     let t = Date.now();
     expect(scrubKnown("a".repeat(16_384), { registry: reg })).toBe("[숨김]");
     expect(Date.now() - t).toBeLessThan(100);
-    // Text that is only ever a prefix (every start a near-match): bounded work, and it fails safe (masked).
+    // Text that is only ever a prefix (every start a near-match): linear (KMP), and nothing is masked — no secret
+    // is there (round 26: the trailing prose stays).
     t = Date.now();
-    const out = scrubKnown("a".repeat(16_383) + "b", { registry: reg });
+    const prose = "a".repeat(16_383) + "b ordinary prose data banana";
+    expect(scrubKnown(prose, { registry: reg })).toBe(prose);
+    expect(Date.now() - t).toBeLessThan(100);
+    const ps = new StreamScrubber(reg);
+    expect(
+      chunks(prose, rng(26))
+        .map((c) => ps.push(c))
+        .join("") + ps.end(),
+    ).toBe(prose);
+    // The same with escapes all through it (the character search runs): bounded, and still nothing masked.
+    const escaped = ("a".repeat(500) + "\\x").repeat(40) + " ordinary prose";
+    t = Date.now();
+    expect(scrubKnown(escaped, { registry: reg })).toBe(escaped);
     expect(Date.now() - t).toBeLessThan(1000);
-    expect(out).not.toMatch(/a{8192}/);
     const s = new StreamScrubber(reg);
     t = Date.now();
     for (let k = 0; k < 16; k++) s.push("a".repeat(1024));
@@ -998,5 +1014,290 @@ describe("round 25: every egress and every stored row", () => {
       }
     }
     expect(leaks).toEqual([]);
+  });
+});
+
+describe("round 26", () => {
+  it("text parts are scrubbed as one text: a secret split around a tool call is found", () => {
+    const reg = new KnownSecrets();
+    const v = "sk-ant-api03-splitAcrossParts99";
+    reg.add(v);
+    const parts = [
+      { type: "text", text: `답 ${v.slice(0, 6)}` },
+      { type: "tool_call", id: "x", name: "t", input: {} },
+      { type: "text", text: `${v.slice(6)} 끝` },
+    ];
+    const out = scrubParts(parts, { registry: reg }) as { type: string; text?: string }[];
+    const joined = out.map((p) => p.text ?? "").join("");
+    expect(joined).not.toContain(v);
+    expect(out[0]!.text).toBe("답 [숨김]");
+    expect(out[2]!.text).toBe(" 끝");
+    // Nothing across parts: the same parts back.
+    const plain = [
+      { type: "text", text: "안녕" },
+      { type: "text", text: "하세요" },
+    ];
+    expect(scrubParts(plain, { registry: reg })).toEqual(plain);
+  });
+
+  it("base64 and hex inside one transport layer (percent-encoding, \\u escapes) are found", () => {
+    const reg = new KnownSecrets();
+    const gate = "~~~?????2026";
+    reg.add(gate);
+    const b64 = Buffer.from(gate).toString("base64"); // fn5+Pz8/Pz8yMDI2
+    expect(encodeURIComponent(b64)).toBe("fn5%2BPz8%2FPz8yMDI2");
+    expect(scrubKnown(`q=${encodeURIComponent(b64)}&x=1`, { registry: reg })).not.toContain("Pz8");
+    const key = "sk-ant-api03-transportLayer-0123";
+    reg.add(key);
+    const kb = Buffer.from(key).toString("base64");
+    const uesc = [...kb].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+    const out = scrubKnown(`"${uesc}"`, { registry: reg });
+    expect(out).toContain("[숨김]");
+    expect(out.length).toBeLessThan(uesc.length / 2);
+    const hexPct = encodeURIComponent(Buffer.from(key).toString("hex").replace(/(..)/g, "$1 ").trim());
+    expect(scrubKnown(hexPct, { registry: reg })).toContain("[숨김]");
+  });
+
+  it("beyond the depth limit a subtree is scrubbed as its JSON text, never returned as it was", () => {
+    const reg = new KnownSecrets();
+    reg.add("deep-secret-0123456789");
+    let v: unknown = { leaf: "deep-secret-0123456789", n: 1 };
+    for (let k = 0; k < 70; k++) v = { child: v };
+    const out = scrubKnownDeep(v, { registry: reg });
+    expect(JSON.stringify(out)).not.toContain("deep-secret-0123456789");
+    // Clean deep trees come back unchanged.
+    let clean: unknown = { leaf: "ok" };
+    for (let k = 0; k < 70; k++) clean = { child: clean };
+    expect(scrubKnownDeep(clean, { registry: reg })).toBe(clean);
+  });
+
+  it("every text column of the schema is scrubbed on write or exempt with a reason", () => {
+    const db = createTestDb();
+    const cols: string[] = [];
+    for (const t of db.$client.prepare("select name from sqlite_master where type = 'table'").all() as {
+      name: string;
+    }[])
+      for (const c of db.$client.prepare(`pragma table_info("${t.name}")`).all() as {
+        name: string;
+        type: string;
+      }[])
+        if (/text/i.test(c.type)) cols.push(`${t.name}.${c.name}`);
+    expect(cols.filter((c) => !(c in TEXT_COLUMNS))).toEqual([]);
+    expect(Object.keys(TEXT_COLUMNS).filter((c) => !cols.includes(c))).toEqual([]);
+    for (const [c, rule] of Object.entries(TEXT_COLUMNS))
+      expect("write" in rule ? rule.write.length : rule.exempt.length, c).toBeGreaterThan(10);
+  });
+});
+
+describe("round 26: writes, rescrub retry, headers, structured content", () => {
+  it("a connection label and a user name holding a registered key are stored scrubbed", async () => {
+    const db = createTestDb();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db, logger: false });
+    apps.push(app);
+    const f = await createFamily(app);
+    const key = `sk-ant-api03-${crypto.randomBytes(30).toString("base64url")}`;
+    const store = new ConnectionStore(db, crypto.randomBytes(32), "/tmp/agentlee-known26");
+    store.create({
+      runtime: "claude-code",
+      authType: "api_key",
+      scope: "shared",
+      createdBy: f.users.admin.id,
+      secret: key,
+      label: `공용 ${key}`,
+    } as never);
+    app.users!.update(f.users.shared.id, { name: `이름 ${key}` } as never);
+    app.users!.create({ email: "known26@matrix.test", name: `새 ${key}`, role: "member", passwordHash: "x" });
+    const rows =
+      JSON.stringify(db.$client.prepare("select label from connections").all()) +
+      JSON.stringify(db.$client.prepare("select name from users").all());
+    expect(rows).not.toContain(key);
+    expect(rows).toContain("[숨김]");
+  });
+
+  it("a failed rescrub keeps its values and retries until the rows are clean", async () => {
+    const db = createTestDb();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db, logger: false });
+    apps.push(app);
+    const f = await createFamily(app);
+    app.storedRescrub!.close();
+    const conv = app.conversations!.create(f.users.owner.id);
+    const secret = `retry-${crypto.randomBytes(12).toString("base64url")}`;
+    db.$client.prepare("update conversations set title = ? where id = ?").run(`제목 ${secret}`, conv.id);
+    // Writes to conversations fail until the test lifts this.
+    db.$client.exec(
+      "create trigger known26_fail before update on conversations begin select raise(abort, 'injected'); end",
+    );
+    const reg = new KnownSecrets();
+    const lines: string[] = [];
+    const log = { info: () => {}, warn: (o: unknown, m: string) => void lines.push(m), error: () => {} };
+    const r = new StoredRescrub(db, { registry: reg, delayMs: 1, retryMs: 10, log: log as never });
+    reg.add(secret);
+    for (let i = 0; i < 200 && r.failed() < 2; i++) await new Promise((res) => setTimeout(res, 5));
+    expect(r.failed()).toBeGreaterThanOrEqual(2);
+    expect(lines).toContain("secrets.rescrub_failed");
+    expect(JSON.stringify(db.$client.prepare("select title from conversations").all())).toContain(secret);
+    db.$client.exec("drop trigger known26_fail");
+    await r.idle();
+    expect(JSON.stringify(db.$client.prepare("select title from conversations").all())).not.toContain(secret);
+    r.close();
+  });
+
+  it("response headers are scrubbed (a Location reflecting the request), Set-Cookie is not", async () => {
+    const code = String(10_000_000 + crypto.randomInt(80_000_000));
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: code }), {
+      db: createTestDb(),
+      logger: false,
+    });
+    apps.push(app);
+    // Any route's headers, not only the gate's (which scrubs its own `next` too).
+    app.get("/known26-echo", { config: { access: "public" } } as never, async (req, reply) =>
+      reply
+        .header("x-echo", (req.query as { v: string }).v)
+        .header("location", `/x?${(req.query as { v: string }).v}`)
+        .send("ok"),
+    );
+    const echo = await app.inject({ url: `/known26-echo?v=${code}`, headers: { host: "localhost:3000" } });
+    expect(echo.headers["x-echo"]).toBeDefined();
+    expect(String(echo.headers["x-echo"])).not.toContain(code);
+    expect(String(echo.headers.location)).not.toContain(code);
+    const res = await app.inject({ url: `/c/view?key=${code}`, headers: { host: "chat.2prostream.com" } });
+    expect(res.statusCode).toBe(302);
+    expect(String(res.headers.location)).toMatch(/^\/gate\?next=/);
+    expect(String(res.headers.location)).not.toContain(code);
+    // The gate's own form never carries it on either.
+    const page = await app.inject({
+      url: `/gate?next=${encodeURIComponent(`/c/view?key=${code}`)}`,
+      headers: { host: "chat.2prostream.com" },
+    });
+    expect(page.body).not.toContain(code);
+    // A cookie for a session created right now is sent as it is.
+    const login = await app.inject({
+      method: "POST",
+      url: "/gate",
+      headers: { host: "chat.2prostream.com", "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ code }).toString(),
+    });
+    expect(String(login.headers["set-cookie"])).toMatch(/\d+\.[A-Za-z0-9_-]{43}/);
+  });
+
+  it("a table artifact holding a numeric secret stays valid JSON after the rescrub (raw and download 200, bytes right)", async () => {
+    const n = 10_000_000 + crypto.randomInt(80_000_000);
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    rt.script(() => [{ type: "text_delta", text: "답" }]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      },
+      payload: { text: "표" },
+    });
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    for (let i = 0; i < 400 && !app.runs!.get(runId)?.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    const art = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: conv.id, runId },
+      { kind: "table", title: "표", table: { columns: ["값", "이름"], rows: [[n, "a"]] } },
+    );
+    knownSecrets.add(String(n));
+    await app.storedRescrub!.idle();
+    const row = db.$client
+      .prepare("select content, bytes, content_hash from artifact_versions where artifact_id = ?")
+      .get(art.artifact.id) as { content: string; bytes: number; content_hash: string };
+    expect(row.content).not.toContain(String(n));
+    expect(() => JSON.parse(row.content)).not.toThrow();
+    expect(row.bytes).toBe(Buffer.byteLength(row.content, "utf8"));
+    expect(row.content_hash).toBe(crypto.createHash("sha256").update(row.content, "utf8").digest("hex"));
+    for (const path of ["raw", "download"]) {
+      const r = await app.inject({
+        url: `/a/${art.artifact.id}/v/1/${path}`,
+        headers: { host: "localhost:3000", cookie: f.cookies.owner },
+      });
+      expect(r.statusCode, path).toBe(200);
+      expect(r.body).not.toContain(String(n));
+    }
+    const api = await app.inject({
+      url: `/api/artifacts/${art.artifact.id}/versions/1`,
+      headers: { host: "localhost:3000", cookie: f.cookies.owner },
+    });
+    expect(api.statusCode).toBe(200);
+    expect(api.body).not.toContain(String(n));
+  });
+
+  it("a secret split across text parts around a tool call is masked in rows, the API and the next run's history", async () => {
+    const key = `sk-ant-api03-${crypto.randomBytes(20).toString("base64url")}`;
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    const headers = {
+      host: "localhost:3000",
+      cookie: f.cookies.owner,
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+      "content-type": "application/json",
+    };
+    const send = async (text: string) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text },
+      });
+      const id = res.json<{ run: { id: string } }>().run.id;
+      for (let i = 0; i < 400 && !app.runs!.get(id)?.endedAt; i++)
+        await new Promise((r) => setTimeout(r, 10));
+      return id;
+    };
+    rt.script(() => [
+      { type: "text_delta", text: "답 sk-ant" },
+      { type: "tool_start", callId: "x", name: "web_search", input: { q: "x" } },
+      { type: "tool_end", callId: "x", output: { ok: true } },
+      { type: "text_delta", text: `${key.slice(6)} 끝` },
+    ]);
+    await send("하나");
+    // Registered afterwards (a connection key), then the rescrub.
+    knownSecrets.add(key);
+    await app.storedRescrub!.idle();
+    const joinedText = (parts: { type: string; text?: string }[]) =>
+      parts.map((p) => (p.type === "text" ? p.text : "")).join("");
+    const rows = (db.$client.prepare("select parts from messages").all() as { parts: string }[]).map((r) =>
+      joinedText(JSON.parse(r.parts) as never),
+    );
+    for (const t of rows) expect(t).not.toContain(key);
+    const api = await app.inject({
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { host: "localhost:3000", cookie: f.cookies.owner },
+    });
+    for (const m of api.json<{ items: { parts: { type: string; text?: string }[] }[] }>().items)
+      expect(joinedText(m.parts)).not.toContain(key);
+    rt.script(() => [{ type: "text_delta", text: "둘" }]);
+    await send("둘");
+    for (const m of rt.seen.at(-1)!.history) expect(joinedText(m.parts as never)).not.toContain(key);
   });
 });

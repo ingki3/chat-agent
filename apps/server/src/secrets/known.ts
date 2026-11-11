@@ -40,7 +40,14 @@ const STEP_BUDGET = 4096;
 const SECRET_KEY = /token|secret|key|password|passwd|auth|credential|cookie|session|endpoint|bearer/i;
 
 type Compiled = {
-  secrets: { cps: number[] }[];
+  secrets: {
+    cps: number[];
+    /** The value itself (raw matches: `indexOf`, and a KMP pass over the text's end for a cut-off one). */
+    raw: string;
+    /** KMP failure table of `raw` (UTF-16 units; equal to code points when `astral` is false). */
+    fail: Int32Array;
+    astral: boolean;
+  }[];
   /** Secret indexes by the first UTF-16 unit of their raw form. */
   byFirst: Map<number, number[]>;
   /** Secret indexes by their first code point (for encoded first characters). */
@@ -160,7 +167,7 @@ export class KnownSecrets {
     for (const v of this.values) {
       const i = secrets.length;
       const cps = [...v].map((c) => c.codePointAt(0)!);
-      secrets.push({ cps });
+      secrets.push({ cps, raw: v, fail: failure(v), astral: cps.length !== v.length });
       const first = v.charCodeAt(0);
       const list = byFirst.get(first) ?? [];
       list.push(i);
@@ -419,32 +426,59 @@ function braceEscape(text: string, at: number, cp: number, out: number[]): void 
   }
 }
 
-/** Matches secret `cps` at `start`: its end, PARTIAL (the text ends inside a consistent match), or FAIL. */
 /** The work left for one scan (steps of `matchAt`): linear in the text; when it runs out the scan fails safe. */
 type Work = { left: number };
 const EXHAUSTED = -3;
+/** "%", "\\" and "+": where an encoded form can start (anything else is matched raw, one unit for one unit). */
+const isSpecial = (c: number) => c === 37 || c === 92 || c === 43;
 
-function matchAt(text: string, start: number, cps: number[], work: Work): { end: number; depth: number } {
+type Match = {
+  /** End of a complete match, PARTIAL (the text ends inside a consistent match), FAIL, or EXHAUSTED. */
+  end: number;
+  /** Characters of the secret matched (for PARTIAL: before the text ran out). */
+  depth: number;
+  /** On FAIL along one path of raw characters only: where it failed, and how many characters it had (KMP). */
+  rawFail?: { pos: number; k: number };
+  /** The furthest text position a consistent path reached. */
+  reach: number;
+};
+
+/**
+ * Matches secret `cps` at `start` (or resumes at `pos` with `k` characters already matched — a KMP shift).
+ * Depth-first over the forms of each character; most characters have exactly one form, so this rarely branches.
+ */
+function matchAt(text: string, start: number, cps: number[], work: Work, pos0 = start, k0 = 0): Match {
   let steps = 0;
   const budget = cps.length * 2 + STEP_BUDGET;
   let partialDepth = -1;
   let full = FAIL;
+  let reach = pos0;
   const buf: number[] = [];
   let seen: Set<number> | undefined;
-  // Depth-first: (position, index into cps). Most characters have exactly one form, so this rarely branches.
-  const stack: [number, number][] = [[start, 0]];
+  // One path of raw characters only, so far (then a failure tells KMP where the next start can be).
+  let rawOnly = true;
+  let last = { pos: pos0, k: k0 };
+  const stack: [number, number][] = [[pos0, k0]];
   while (stack.length && full === FAIL) {
     const [pos, k] = stack.pop()!;
+    if (pos > reach) reach = pos;
     if (k === cps.length) {
       full = pos;
       break;
     }
-    if (++steps > budget || --work.left < 0) return { end: EXHAUSTED, depth: 0 };
+    if (++steps > budget || --work.left < 0) return { end: EXHAUSTED, depth: 0, reach };
     buf.length = 0;
     forms(text, pos, cps[k]!, buf);
     // Two forms ending at the same place (octal of the code point and of its byte) are one state: once the search
     // branches, a state is never explored twice (linear in the secret, not exponential).
-    if (!seen && buf.filter((e) => e >= 0).length > 1) seen = new Set();
+    const valid = buf.filter((e) => e >= 0).length;
+    if (!seen && valid > 1) seen = new Set();
+    if (
+      valid > 1 ||
+      (valid === 1 && (buf.find((e) => e >= 0) !== pos + 1 || isSpecial(text.charCodeAt(pos))))
+    )
+      rawOnly = false;
+    if (valid === 0 && rawOnly) last = { pos, k };
     for (let b = buf.length - 1; b >= 0; b--) {
       const e = buf[b]!;
       if (e === PARTIAL) partialDepth = Math.max(partialDepth, k);
@@ -458,9 +492,9 @@ function matchAt(text: string, start: number, cps: number[], work: Work): { end:
       }
     }
   }
-  if (full !== FAIL) return { end: full, depth: cps.length };
-  if (partialDepth >= 0) return { end: PARTIAL, depth: partialDepth };
-  return { end: FAIL, depth: 0 };
+  if (full !== FAIL) return { end: full, depth: cps.length, reach };
+  if (partialDepth >= 0) return { end: PARTIAL, depth: partialDepth, reach };
+  return { end: FAIL, depth: 0, reach, ...(rawOnly ? { rawFail: last } : {}) };
 }
 
 type Scan = {
@@ -485,18 +519,34 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
   let partialAt = Infinity;
   let partialDepth = 0;
   const n = text.length;
-  // Total work: linear in the text (round 25). Running out never lets anything through: the rest is masked.
+  // Total work: linear in the text. Running out never lets a match through: what the search was in the middle of
+  // is masked (if it already held enough of a secret), the budget is renewed once; a second time, the rest goes.
   const work: Work = { left: 64 * n + 65_536 };
-  // After a complete match of a secret, it is not tried again inside that match (a repeated prefix is not
-  // re-compared from every start).
+  let renewed = false;
+  // Per secret: no start before `skipUntil` can match (inside a complete match, after a partial one that is held
+  // or masked, or skipped by a KMP shift); `resume*` continues a KMP shift's match at its start.
   const skipUntil = new Int32Array(m.secrets.length);
+  const resumeAt = new Int32Array(m.secrets.length).fill(-1);
+  const resumePos = new Int32Array(m.secrets.length);
+  const resumeK = new Int32Array(m.secrets.length);
+  // Next "%", "\\" or "+" at or after each position: a start with none within the secret's length can only
+  // match raw — `indexOf` and the KMP pass below find those, so the character search never runs there.
+  const nextSpecial = new Int32Array(n + 1).fill(n);
+  for (let k = n - 1; k >= 0; k--) nextSpecial[k] = isSpecial(text.charCodeAt(k)) ? k : nextSpecial[k + 1]!;
   const buf: number[] = [];
   let exhaustedAt = -1;
+  const partial = (i: number, depth: number) => {
+    if (i < partialAt) {
+      partialAt = i;
+      partialDepth = depth;
+    } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
+    if (depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
+  };
   outer: for (let i = 0; i < n; i++) {
     const c = text.charCodeAt(i);
     let cand = c === 43 ? m.plusFirst : m.byFirst.get(c);
     if (c === 37 || c === 92) {
-      // "%" and "\" may start an encoded first character: only secrets whose first character this form can
+      // "%" and "\\" may start an encoded first character: only secrets whose first character this form can
       // spell are tried (one check per distinct first character, not per secret).
       cand = [...(cand ?? [])];
       for (const [cp, list] of m.byFirstCp) {
@@ -508,55 +558,96 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
     if (!cand) continue;
     for (const s of cand) {
       if (skipUntil[s]! > i) continue;
-      const r = matchAt(text, i, m.secrets[s]!.cps, work);
+      const sec = m.secrets[s]!;
+      const resuming = resumeAt[s] === i;
+      if (!resuming && !isSpecial(c) && nextSpecial[i]! >= i + sec.raw.length) continue; // raw only: below
+      const r = resuming
+        ? matchAt(text, i, sec.cps, work, resumePos[s], resumeK[s])
+        : matchAt(text, i, sec.cps, work);
+      resumeAt[s] = -1;
       if (r.end === EXHAUSTED) {
-        exhaustedAt = i;
-        break outer;
+        if (r.reach - i >= MIN_KNOWN_LENGTH) found.push([i, r.reach]);
+        skipUntil[s] = Math.max(r.reach, i + 1);
+        if (renewed) {
+          exhaustedAt = r.reach;
+          break outer;
+        }
+        renewed = true;
+        work.left = 64 * n + 65_536;
+        continue;
       }
       if (r.end >= 0) {
         found.push([i, r.end]);
         skipUntil[s] = r.end;
       } else if (r.end === PARTIAL) {
-        if (i < partialAt) {
-          partialAt = i;
-          partialDepth = r.depth;
-        } else if (i === partialAt) partialDepth = Math.max(partialDepth, r.depth);
-        if (r.depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
+        partial(i, r.depth);
         // From here on this secret's text is held (stream) or masked (tail, deep enough): not tried again.
         if (mode === "stream" || (mode === "tail" && r.depth >= TAIL_MIN)) skipUntil[s] = n;
+      } else if (r.rawFail && r.rawFail.k > 0 && !sec.astral) {
+        // A raw path failed after k characters: KMP says where the next possible start is, and with how much of
+        // the secret already matched (the scan stays linear on repeated prefixes).
+        const border = sec.fail[r.rawFail.k - 1]!;
+        const next = i + (r.rawFail.k - border);
+        skipUntil[s] = next;
+        if (border > 0) {
+          resumeAt[s] = next;
+          resumePos[s] = r.rawFail.pos;
+          resumeK[s] = border;
+        }
       }
     }
   }
   if (exhaustedAt >= 0) found.push([exhaustedAt, n]);
+  // Raw matches: every complete one, and one the text ends inside (the longest such suffix, by KMP).
+  for (const sec of m.secrets) {
+    const l = sec.raw;
+    for (let at = text.indexOf(l); at !== -1; at = text.indexOf(l, at + l.length))
+      found.push([at, at + l.length]);
+    let q = 0;
+    for (let k = Math.max(0, n - l.length + 1); k < n; k++) {
+      const ch = text.charCodeAt(k);
+      while (q > 0 && l.charCodeAt(q) !== ch) q = sec.fail[q - 1]!;
+      if (l.charCodeAt(q) === ch) q++;
+      if (q === l.length) q = sec.fail[q - 1]!;
+    }
+    if (q > 0) partial(n - q, q);
+  }
   // Base64 and hex: in the text with line breaks, spaces and `\n`-style escapes taken out (base64 wrapped at 76
   // columns, PEM/MIME, CRLF or LF, a stringified PEM), hex also in any mix of cases.
-  const view = stripped(text);
-  const lower = view.v.replace(/[A-F]/g, (c) => c.toLowerCase());
-  const vn = view.v.length;
-  const origin = (k: number) => (k < vn ? view.origin[k]! : n);
-  const find = (hay: string, l: string, fail: Int32Array, ratio: number) => {
-    // Non-overlapping occurrences (one inside another adds nothing: it is masked with it).
-    for (let at = hay.indexOf(l); at !== -1; at = hay.indexOf(l, at + l.length))
-      found.push([origin(at), origin(at + l.length - 1) + 1]);
-    // The text ends inside this pattern? The longest suffix that is a prefix of it, in one KMP pass (linear).
-    let q = 0;
-    for (let k = Math.max(0, vn - l.length + 1); k < vn; k++) {
-      const c = hay.charCodeAt(k);
-      while (q > 0 && l.charCodeAt(q) !== c) q = fail[q - 1]!;
-      if (l.charCodeAt(q) === c) q++;
-      if (q === l.length) q = fail[q - 1]!; // a whole occurrence: found above
-    }
-    if (q === 0) return;
-    const i = origin(vn - q);
-    const depth = Math.floor(q * ratio);
-    if (i < partialAt) {
-      partialAt = i;
-      partialDepth = depth;
-    } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
-    if (depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
-  };
-  m.literals.forEach((l, k) => find(view.v, l, m.literalFail[k]!, 3 / 4));
-  m.hexes.forEach((h, k) => find(lower, h, m.hexFail[k]!, 1 / 2));
+  // Also with one transport layer decoded first (round 26): percent-encoding (`fn5%2BPz8%2F…`) or JSON/JS escapes
+  // (`\u0066\u006e…`). Longer chains of encodings are out of scope.
+  const views = [stripped(text)];
+  if (text.includes("%")) views.push(compose(percentDecoded(text), stripped));
+  if (text.includes("\\")) views.push(compose(escapeDecoded(text), stripped));
+  for (const view of views) {
+    const lower = view.v.replace(/[A-F]/g, (c) => c.toLowerCase());
+    const vn = view.v.length;
+    const origin = (k: number) => (k < vn ? view.origin[k]! : n);
+    const find = (hay: string, l: string, fail: Int32Array, ratio: number) => {
+      // Non-overlapping occurrences (one inside another adds nothing: it is masked with it).
+      for (let at = hay.indexOf(l); at !== -1; at = hay.indexOf(l, at + l.length))
+        // To where the next character starts (a decoded `%2F` or `\u002f` ends after its whole escape).
+        found.push([origin(at), at + l.length < vn ? origin(at + l.length) : n]);
+      // The text ends inside this pattern? The longest suffix that is a prefix of it, in one KMP pass (linear).
+      let q = 0;
+      for (let k = Math.max(0, vn - l.length + 1); k < vn; k++) {
+        const c = hay.charCodeAt(k);
+        while (q > 0 && l.charCodeAt(q) !== c) q = fail[q - 1]!;
+        if (l.charCodeAt(q) === c) q++;
+        if (q === l.length) q = fail[q - 1]!; // a whole occurrence: found above
+      }
+      if (q === 0) return;
+      const i = origin(vn - q);
+      const depth = Math.floor(q * ratio);
+      if (i < partialAt) {
+        partialAt = i;
+        partialDepth = depth;
+      } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
+      if (depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
+    };
+    m.literals.forEach((l, k) => find(view.v, l, m.literalFail[k]!, 3 / 4));
+    m.hexes.forEach((h, k) => find(lower, h, m.hexFail[k]!, 1 / 2));
+  }
   found.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
   const ranges: [number, number][] = [];
   for (const r of found) {
@@ -567,8 +658,69 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
   return { ranges, partialAt, partialDepth, deepPartialAt };
 }
 
+type View = { v: string; origin: Int32Array };
+
+/** A view of a view: offsets mapped back to the text. */
+function compose(outer: View, inner: (t: string) => View): View {
+  const v = inner(outer.v);
+  const origin = new Int32Array(v.origin.length);
+  for (let k = 0; k < origin.length; k++) origin[k] = outer.origin[v.origin[k]!]!;
+  return { v: v.v, origin };
+}
+
+/** `%XX` decoded (ASCII only: base64 and hex are ASCII); everything else as it is. */
+function percentDecoded(text: string): View {
+  const origin = new Int32Array(text.length);
+  let v = "";
+  let len = 0;
+  for (let k = 0; k < text.length;) {
+    const c = text.charCodeAt(k);
+    if (c === 37 && HEX(text.charCodeAt(k + 1)) && HEX(text.charCodeAt(k + 2))) {
+      const b = hexVal(text.charCodeAt(k + 1)) * 16 + hexVal(text.charCodeAt(k + 2));
+      if (b < 128) {
+        v += String.fromCharCode(b);
+        origin[len++] = k;
+        k += 3;
+        continue;
+      }
+    }
+    v += text[k]!;
+    origin[len++] = k;
+    k++;
+  }
+  return { v, origin: origin.subarray(0, len) };
+}
+
+/** One layer of JSON/JS string escapes decoded: `\uXXXX`, `\/`, `\\`, `\"` (`\n`-style ones stay, `stripped` drops them). */
+function escapeDecoded(text: string): View {
+  const origin = new Int32Array(text.length);
+  let v = "";
+  let len = 0;
+  for (let k = 0; k < text.length;) {
+    if (text.charCodeAt(k) === 92) {
+      const x = text.charCodeAt(k + 1);
+      if (x === 117 && [2, 3, 4, 5].every((d) => HEX(text.charCodeAt(k + d)))) {
+        v += String.fromCharCode(parseInt(text.slice(k + 2, k + 6), 16));
+        origin[len++] = k;
+        k += 6;
+        continue;
+      }
+      if (x === 47 || x === 92 || x === 34 || x === 39) {
+        v += String.fromCharCode(x);
+        origin[len++] = k;
+        k += 2;
+        continue;
+      }
+    }
+    v += text[k]!;
+    origin[len++] = k;
+    k++;
+  }
+  return { v, origin: origin.subarray(0, len) };
+}
+
 /** The text without whitespace and `\n` `\r` `\t` escapes (any backslash run), with each character's offset. */
-function stripped(text: string): { v: string; origin: Int32Array } {
+function stripped(text: string): View {
   const origin = new Int32Array(text.length);
   let v = "";
   let from = 0;
@@ -614,18 +766,89 @@ function apply(text: string, ranges: [number, number][], upTo: number): string {
  * holds `TAIL_MIN` characters of a secret is masked too (a cut-off secret is still a leak).
  */
 export function scrubKnown(text: string, opts: { tail?: boolean; registry?: KnownSecrets } = {}): string {
+  const r = knownMasks(text, opts);
+  return r.length ? apply(text, r, text.length) : text;
+}
+
+/** `scrubKnown` for a header value or a URL: the marker percent-encoded, so the result stays ASCII. */
+export function scrubKnownAscii(
+  text: string,
+  opts: { tail?: boolean; registry?: KnownSecrets } = {},
+): string {
+  const r = knownMasks(text, opts);
+  if (!r.length) return text;
+  return apply(text, r, text.length).split(KNOWN_PLACEHOLDER).join(encodeURIComponent(KNOWN_PLACEHOLDER));
+}
+
+/** The ranges `scrubKnown` masks (sorted, merged; a cut-off secret at the end runs to the end). */
+export function knownMasks(
+  text: string,
+  opts: { tail?: boolean; registry?: KnownSecrets } = {},
+): [number, number][] {
   const m = (opts.registry ?? knownSecrets).matcher();
-  if (!m || !text) return text;
+  if (!m || !text) return [];
   const tail = opts.tail ?? true;
   const s = scan(text, m, tail ? "tail" : "plain");
-  if (!s.ranges.length && s.partialAt === Infinity) return text;
+  if (!s.ranges.length && s.partialAt === Infinity) return [];
   if (tail && s.deepPartialAt !== Infinity) {
     // Everything from the earliest cut-off secret that holds enough of it goes (a complete match it overlaps too).
     let from = s.deepPartialAt;
     for (const [a, b] of s.ranges) if (a < from && b > from) from = a;
-    return apply(text, s.ranges, from) + KNOWN_PLACEHOLDER;
+    return [...s.ranges.filter(([, b]) => b <= from), [from, text.length]];
   }
-  return apply(text, s.ranges, text.length);
+  return s.ranges;
+}
+
+/**
+ * Texts that are read one after another (the text parts of a message, around its tool calls) scrubbed as one
+ * text (round 26): a secret split across them is found, and masked in each piece it touches — the marker goes
+ * where it starts.
+ */
+export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } = {}): string[] {
+  if (texts.length < 2) return texts.map((t) => scrubKnown(t, opts));
+  const joined = texts.join("");
+  const masks = knownMasks(joined, opts);
+  if (!masks.length) return texts;
+  const out: string[] = [];
+  let o = 0;
+  for (const t of texts) {
+    const end = o + t.length;
+    let piece = "";
+    let at = o;
+    for (const [a, b] of masks) {
+      if (b <= o || a >= end) continue;
+      const from = Math.max(a, o);
+      piece += joined.slice(at, from) + (a >= o ? KNOWN_PLACEHOLDER : "");
+      at = Math.min(b, end);
+    }
+    out.push(piece + joined.slice(at, end));
+    o = end;
+  }
+  return out;
+}
+
+/**
+ * A message's parts: every value scrubbed on its own, then the text parts — and, separately, the reasoning parts —
+ * as one text each (`scrubJoined`).
+ */
+export function scrubParts<P>(parts: P[], opts: { registry?: KnownSecrets } = {}): P[] {
+  const deep = scrubKnownDeep(parts, opts);
+  let out = deep;
+  for (const type of ["text", "reasoning"]) {
+    const idx = out.flatMap((p, k) =>
+      (p as { type?: unknown; text?: unknown }).type === type &&
+      typeof (p as { text?: unknown }).text === "string"
+        ? [k]
+        : [],
+    );
+    if (idx.length < 2) continue;
+    const texts = idx.map((k) => (out[k] as { text: string }).text);
+    const next = scrubJoined(texts, opts);
+    if (next.every((t, j) => t === texts[j])) continue;
+    out = out === parts ? [...out] : out === deep ? [...deep] : out;
+    idx.forEach((k, j) => (out[k] = { ...(out[k] as object), text: next[j] } as P));
+  }
+  return out;
 }
 
 /** `scrubKnown` on every string (and object key) of a JSON-like value. Returns the same value when nothing changed. */
@@ -638,7 +861,19 @@ export function scrubKnownDeep<T>(value: T, opts: { tail?: boolean; registry?: K
       const t = String(v);
       return scrubKnown(t, opts) === t ? v : KNOWN_PLACEHOLDER;
     }
-    if (depth > 64 || !v || typeof v !== "object") return v;
+    if (!v || typeof v !== "object") return v;
+    if (depth > 64) {
+      // Too deep to walk: the subtree is scrubbed as its JSON text, and replaced by that text if anything was
+      // found — never handed back as it was (round 26).
+      let json: string;
+      try {
+        json = JSON.stringify(v) ?? "";
+      } catch {
+        return KNOWN_PLACEHOLDER;
+      }
+      const t = scrubKnown(json, opts);
+      return t === json ? v : t;
+    }
     if (Array.isArray(v)) {
       let changed = false;
       const out = v.map((x) => {
@@ -659,6 +894,23 @@ export function scrubKnownDeep<T>(value: T, opts: { tail?: boolean; registry?: K
     return changed ? out : v;
   };
   return walk(value, 0) as T;
+}
+
+/**
+ * An artifact version's content (round 26): canonical JSON (chart, table, document) is scrubbed value by value
+ * and stays valid JSON (a numeric secret becomes a string); any other content as text.
+ */
+export function scrubContent(content: string, opts: { registry?: KnownSecrets } = {}): string {
+  const text = scrubKnown(content, opts);
+  if (text === content) return content;
+  const head = content.trimStart()[0];
+  if (head === "{" || head === "[")
+    try {
+      return JSON.stringify(scrubKnownDeep(JSON.parse(content) as unknown, opts));
+    } catch {
+      // not JSON: the text scrub stands
+    }
+  return text;
 }
 
 /**

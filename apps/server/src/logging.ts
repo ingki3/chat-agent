@@ -105,6 +105,8 @@ export const LOG_EVENTS = [
   "backup.pruned",
   // A restore interrupted mid-swap, finished at server start (#37): `completed` or `rolled_back`.
   "restore.recovered",
+  // Known secrets (review round 26): a background rescrub pass failed; it is retried (fixed code, no content).
+  "secrets.rescrub_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

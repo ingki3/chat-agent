@@ -10,7 +10,7 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, messages, runtimeSessions } from "../db/schema.js";
-import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import { scrubKnown, scrubParts } from "../secrets/known.js";
 
 export type ConversationRow = typeof conversations.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
@@ -44,7 +44,8 @@ export function toMessage(m: MessageRow): Message {
     conversationId: m.conversationId,
     seq: m.seq,
     role: m.role,
-    parts: scrubKnownDeep(publicParts(MessagePart.array().parse(m.parts))),
+    // Text parts scrubbed as one text: a secret split around a tool call is found too (round 26).
+    parts: scrubParts(publicParts(MessagePart.array().parse(m.parts))),
     runtime: (m.runtime as RuntimeId | null) ?? null,
     model: m.model ?? null,
     effort: m.effort ?? null,
@@ -206,7 +207,7 @@ export class ConversationStore {
       const conv = this.get(conversationId);
       if (!conv) throw new Error("conversation not found");
       // Known secrets are never stored (review round 23): not in a message, not in the title made from it.
-      const parts = scrubKnownDeep(MessagePart.array().parse(m.parts));
+      const parts = scrubParts(MessagePart.array().parse(m.parts));
       const t = this.now();
       const row: MessageRow = {
         id: crypto.randomUUID(),
@@ -260,7 +261,7 @@ export class ConversationStore {
       connectionId?: string | null;
     },
   ): void {
-    const parts = patch.parts ? scrubKnownDeep(MessagePart.array().parse(patch.parts)) : undefined;
+    const parts = patch.parts ? scrubParts(MessagePart.array().parse(patch.parts)) : undefined;
     this.db
       .update(messages)
       .set({

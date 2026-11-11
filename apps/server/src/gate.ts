@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import "./auth/context.js";
 import { readCookie } from "./auth/plugin.js";
 import { isApiRequest, routerPath } from "./paths.js";
-import { knownSecrets } from "./secrets/known.js";
+import { knownSecrets, scrubKnownAscii } from "./secrets/known.js";
 
 /**
  * Temporary access-code gate (until Cloudflare Access is configured, docs/ops.md §7).
@@ -39,7 +39,8 @@ const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 /** Where to go after the code: a same-site path only (never `//host` or a backslash trick), else "/". */
 export function safeNext(v: unknown): string {
   if (typeof v !== "string" || v.length > 2000) return "/";
-  return /^\/(?![/\\])[^\s]*$/.test(v) ? v : "/";
+  // A known secret in the query (`?key=…`) never travels on in `next` (round 26).
+  return /^\/(?![/\\])[^\s]*$/.test(v) ? scrubKnownAscii(v) : "/";
 }
 
 function page(message?: string, next = "/"): string {
@@ -108,7 +109,9 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       return reply
         .code(302)
         .header("Cache-Control", "no-store")
-        .redirect(req.url === "/" ? GATE_PATH : `${GATE_PATH}?next=${encodeURIComponent(req.url)}`);
+        .redirect(
+          req.url === "/" ? GATE_PATH : `${GATE_PATH}?next=${encodeURIComponent(scrubKnownAscii(req.url))}`,
+        );
     return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });
   });
 

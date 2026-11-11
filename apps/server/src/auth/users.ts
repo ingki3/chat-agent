@@ -12,7 +12,7 @@ import {
 import type { Db } from "../db/client.js";
 import { sessions, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
-import { knownSecrets } from "../secrets/known.js";
+import { knownSecrets, scrubKnown } from "../secrets/known.js";
 
 export type UserRow = typeof users.$inferSelect;
 
@@ -104,7 +104,8 @@ export class UserStore {
     const row = {
       id: crypto.randomUUID(),
       email: normalizeEmail(input.email),
-      name: input.name,
+      // No known secret in a stored name (round 26: every write of user-supplied text is scrubbed).
+      name: scrubKnown(input.name),
       role: input.role,
       passwordHash: input.passwordHash,
       mustChangePassword: input.mustChangePassword ?? false,
@@ -246,7 +247,7 @@ export class UserStore {
           return { ok: false, code: "last_admin" };
         this.db
           .update(users)
-          .set({ name: patch.name ?? target.name, email, role, updatedAt: this.now() })
+          .set({ name: scrubKnown(patch.name ?? target.name), email, role, updatedAt: this.now() })
           .where(eq(users.id, userId))
           .run();
         if (emailChanged) this.db.delete(sessions).where(eq(sessions.userId, userId)).run();

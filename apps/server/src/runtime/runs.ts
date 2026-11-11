@@ -28,7 +28,13 @@ import {
 } from "./adapter.js";
 import type { UsageAttempt, UsagePurpose } from "../usage/store.js";
 import { logEvent, type EventLogger } from "../logging.js";
-import { scrubEventSequence, scrubKnown, scrubKnownDeep, StreamScrubber } from "../secrets/known.js";
+import {
+  scrubEventSequence,
+  scrubKnown,
+  scrubKnownDeep,
+  scrubParts,
+  StreamScrubber,
+} from "../secrets/known.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
@@ -98,7 +104,7 @@ type Live = {
  * built before awaits (the MCP endpoint, a resume attempt) during which a secret may have been registered.
  */
 function rescrub(ctx: StartContext): StartContext {
-  ctx.history = scrubKnownDeep(ctx.history);
+  ctx.history = ctx.history.map((m) => ({ ...m, parts: scrubParts(m.parts) }));
   ctx.systemPrompt = scrubKnown(ctx.systemPrompt);
   return ctx;
 }
@@ -342,7 +348,7 @@ export class RunManager {
       const msg = this.conversations.messageById(r.assistantMessageId);
       if (msg) {
         // Scrubbed again: a secret registered since it was stored (updateMessage scrubs too).
-        const parts = scrubKnownDeep(msg.parts as MessagePart[]);
+        const parts = scrubParts(msg.parts as MessagePart[]);
         this.attachNoteTo(r, parts, this.financeResults.context(r.conversationId, msg.seq));
         this.conversations.updateMessage(msg.id, { parts });
       }
@@ -821,7 +827,7 @@ export class RunManager {
       // Scrubbed again on the way to the runtime: a secret registered after a message was stored (round 23).
       history: history.map((m) => ({
         role: m.role,
-        parts: scrubKnownDeep(publicParts(m.parts as MessagePart[])),
+        parts: scrubParts(publicParts(m.parts as MessagePart[])),
       })),
       systemPrompt: instructions.text,
       model: run.model,

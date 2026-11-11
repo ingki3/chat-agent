@@ -272,7 +272,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
     // Stored rows are scrubbed again whenever a secret that may already be stored is registered (round 25) —
     // and once now, for everything registered at startup.
-    const storedRescrub = new StoredRescrub(opts.db!);
+    const storedRescrub = new StoredRescrub(opts.db!, { log: app.log });
     app.decorate("storedRescrub", storedRescrub);
     app.addHook("onClose", async () => {
       storedRescrub.close();

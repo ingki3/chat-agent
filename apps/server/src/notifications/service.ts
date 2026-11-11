@@ -451,7 +451,7 @@ export class NotificationService {
             endpointHash,
             secret,
             // eslint-disable-next-line no-control-regex -- strip control characters from the label
-            label: req.label.replace(/[\u0000-\u001f\u007f-\u009f]/g, ""),
+            label: scrubKnown(req.label.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")),
             createdAt: this.now(),
             lastSentAt: null,
           })

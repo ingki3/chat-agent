@@ -12,7 +12,19 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, messages, runs } from "../db/schema.js";
-import { scrubKnownDeep } from "../secrets/known.js";
+import { scrubContent, scrubKnownDeep } from "../secrets/known.js";
+
+/**
+ * A version as read (round 26): its content scrubbed by kind — canonical JSON value by value, so it stays valid —
+ * and its size and hash following the scrubbed content.
+ */
+function scrubVersion(v: ArtifactVersionRow): ArtifactVersionRow {
+  const { content, ...rest } = v;
+  const scrubbed = scrubContent(content);
+  const out = { ...scrubKnownDeep(rest), content: scrubbed };
+  if (scrubbed === content) return out.title === v.title && out.language === v.language ? v : out;
+  return { ...out, bytes: Buffer.byteLength(scrubbed, "utf8"), contentHash: sha256(scrubbed) };
+}
 
 export type ArtifactRow = typeof artifacts.$inferSelect;
 export type ArtifactVersionRow = typeof artifactVersions.$inferSelect;
@@ -347,16 +359,15 @@ export class ArtifactStore {
       .where(eq(artifactVersions.artifactId, id))
       .orderBy(asc(artifactVersions.version))
       .all()
-      .map((r) => scrubKnownDeep(r));
+      .map(scrubVersion);
   }
 
   version(id: string, version: number): ArtifactVersionRow | undefined {
-    return scrubKnownDeep(
-      this.db
-        .select()
-        .from(artifactVersions)
-        .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
-        .get(),
-    );
+    const v = this.db
+      .select()
+      .from(artifactVersions)
+      .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
+      .get();
+    return v && scrubVersion(v);
   }
 }
