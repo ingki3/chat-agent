@@ -80,6 +80,7 @@ describe("database", () => {
       .map((r) => (r as { name: string }).name);
     expect(tables).toEqual([
       "conversations",
+      "error_log",
       "messages",
       "run_events",
       "runs",

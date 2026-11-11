@@ -14,6 +14,8 @@ import {
   type RuntimeTurn,
   type StartContext,
 } from "./adapter.js";
+import { logEvent, type EventLogger } from "../logging.js";
+import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 
 export type RunRow = typeof runs.$inferSelect;
 /** In-memory state of a run that is being executed by this process. */
@@ -30,6 +32,14 @@ type Live = {
   graceTimer?: NodeJS.Timeout;
   /** Set once the session is being closed, so it is closed exactly once whoever ends the run. */
   closing?: Promise<void>;
+  /** Totals for the run's log record (#46): cost and tokens, never content. */
+  costUsd?: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** Open tool calls: name and start time, for the tool's duration. */
+  tools: Map<string, { name: string; startedAt: number }>;
+  /** What made the run fail, for the log (class name and code only are ever written). */
+  failure?: unknown;
 };
 
 /**
@@ -120,6 +130,10 @@ export type RunManagerOptions = {
   mcp?: { endpoint(): Promise<{ url: string }>; toolNames(): string[] };
   /** Token store shared with the MCP server. Default: a private one (then no MCP server can check its tokens). */
   mcpTokens?: McpTokens;
+  /** Structured log (#46): run and tool outcomes with IDs, durations, codes and cost — never content. */
+  log?: EventLogger;
+  /** Recent errors for the admin screen (#46). */
+  errors?: ErrorLog;
 };
 
 /**
@@ -268,6 +282,9 @@ export class RunManager {
         parts: [],
         interruptRequested: false,
         settled: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        tools: new Map(),
       });
       // Detached from the request: the run outlives the HTTP connection. Nothing may escape as a rejection.
       setImmediate(() => {
@@ -423,7 +440,45 @@ export class RunManager {
     this.db.update(runs).set({ status, errorCode, endedAt: this.now() }).where(eq(runs.id, r.id)).run();
     const live = this.live.get(r.id);
     this.live.delete(r.id);
+    this.record(r, status, errorCode, live);
     live?.emitter.emit("end");
+  }
+
+  /** One log record per run, and a recent-error entry when it failed (#46). IDs, codes and numbers only. */
+  private record(r: RunRow, status: string, errorCode: string | null, live: Live | undefined): void {
+    const ids = { userId: r.userId, conversationId: r.conversationId, runId: r.id, runtime: r.runtime };
+    const failed = status === "failed";
+    const code = failed ? (errorCode ?? "runtime_error") : undefined;
+    logEvent(this.opts.log, failed ? "warn" : "info", "run.finished", {
+      ...ids,
+      status,
+      durationMs: this.now() - r.createdAt,
+      ...(code ? { errorCode: code, category: runFailureCategory(code) } : {}),
+      ...(live?.costUsd === undefined ? {} : { costUsd: live.costUsd }),
+      ...(live ? { inputTokens: live.inputTokens, outputTokens: live.outputTokens } : {}),
+      ...(failed && live?.failure !== undefined ? { err: live.failure } : {}),
+    });
+    if (code) this.opts.errors?.record({ source: "run", code, category: runFailureCategory(code), ...ids });
+  }
+
+  private toolEnded(run: RunRow, live: Live, callId: string, isError: boolean): void {
+    const t = live.tools.get(callId);
+    live.tools.delete(callId);
+    const ids = {
+      userId: run.userId,
+      conversationId: run.conversationId,
+      runId: run.id,
+      runtime: run.runtime,
+    };
+    const tool = t?.name ?? "unknown";
+    logEvent(this.opts.log, isError ? "warn" : "info", "tool.finished", {
+      ...ids,
+      tool,
+      status: isError ? "error" : "ok",
+      ...(t ? { durationMs: this.now() - t.startedAt } : {}),
+    });
+    if (isError)
+      this.opts.errors?.record({ source: "tool", code: "tool_error", category: "tool", tool, ...ids });
   }
 
   private async openSession(
@@ -558,16 +613,21 @@ export class RunManager {
           // Missing input/output become null: JSON would drop an undefined key and the stored part would no
           // longer match the schema.
           const input = ev.input ?? null;
+          live.tools.set(ev.callId, { name: ev.name, startedAt: this.now() });
           parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input });
           this.emit(runId, { type: "tool_start", messageId, callId: ev.callId, name: ev.name, input });
           flush(true);
         } else if (ev.type === "tool_end") {
           const extra = ev.isError ? { isError: true } : {};
           const output = ev.output ?? null;
+          this.toolEnded(run, live, ev.callId, ev.isError === true);
           parts.push({ type: "tool_result", callId: ev.callId, output, ...extra });
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
           flush(true);
         } else if (ev.type === "usage") {
+          live.inputTokens += ev.inputTokens;
+          live.outputTokens += ev.outputTokens;
+          if (ev.costUsd !== undefined) live.costUsd = (live.costUsd ?? 0) + ev.costUsd;
           this.emit(runId, {
             type: "usage",
             messageId,
@@ -587,11 +647,16 @@ export class RunManager {
       // The session now reflects this reply as well; otherwise it must not be resumed.
       if (outcome.status === "done") this.conversations.touchSession(sessionRowId, messageId, revision);
       else this.conversations.invalidateSession(sessionRowId);
-    } catch {
-      // Only interrupts we asked for count as "stopped"; any other error is a failure (spike #39).
-      outcome = live.interruptRequested
-        ? { status: "interrupted", code: null }
-        : { status: "failed", code: "runtime_error" };
+    } catch (e) {
+      // Only interrupts we asked for count as "stopped"; any other error is a failure (spike #39). The error's
+      // text is never kept: a fixed code goes to the browser, the log keeps the class name and code only.
+      if (live.interruptRequested) outcome = { status: "interrupted", code: null };
+      else {
+        live.failure = e;
+        const c = classifyError(e, { code: "runtime_error", category: "runtime" });
+        // A 4xx status on a runtime error is the provider's, not the browser's request: still a runtime error.
+        outcome = { status: "failed", code: c.category === "client" ? "runtime_error" : c.code };
+      }
     }
     this.settle(runId, outcome.status, outcome.code);
   }

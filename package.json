@@ -19,6 +19,7 @@
     "db:migrate": "pnpm --filter @agentlee/server db:migrate",
     "keygen": "pnpm --filter @agentlee/server keygen",
     "sse-probe": "tsx scripts/sse-probe.ts",
+    "uptime": "tsx scripts/uptime.ts",
     "launchd": "bash scripts/install-launchd.sh"
   },
   "devDependencies": {

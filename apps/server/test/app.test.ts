@@ -122,7 +122,8 @@ describe("logging", () => {
     };
     const record = JSON.stringify({
       level: 30,
-      msg: "확인",
+      msg: "run.finished",
+      note: "확인",
       credentials: { msg: "SECRET-SPLIT" },
       runId: "r9",
     });
@@ -134,11 +135,11 @@ describe("logging", () => {
     const got = await run(parts);
     expect(got).toHaveLength(1);
     expect(got[0]).not.toContain("SECRET-SPLIT");
-    expect(JSON.parse(got[0]!)).toMatchObject({ msg: "확인", runId: "r9" });
+    expect(JSON.parse(got[0]!)).toMatchObject({ msg: "run.finished", runId: "r9" });
     // A final record without a trailing newline is emitted exactly once on end().
     const tail = await run([Buffer.from(record.slice(0, 10)), Buffer.from(record.slice(10))]);
     expect(tail).toHaveLength(1);
-    expect(JSON.parse(tail[0]!)).toMatchObject({ msg: "확인" });
+    expect(JSON.parse(tail[0]!)).toMatchObject({ msg: "run.finished" });
   });
 
   it("writes only allow-listed fields and strips query strings", async () => {
@@ -153,7 +154,9 @@ describe("logging", () => {
       throw new Error("THROWN-WITH-USER-DATA");
     });
     app.post("/x", async (req) => {
-      req.log.child({ apiKey: "sk-CHILD", credentials: { password: "PW-CHILD" }, runId: "r1" }).info("child");
+      req.log
+        .child({ apiKey: "sk-CHILD", credentials: { password: "PW-CHILD" }, runId: "r1" })
+        .info("tool.finished");
       req.log.info(
         {
           apiKey: "sk-TOPLEVEL",
@@ -161,7 +164,7 @@ describe("logging", () => {
           content: "MY-PRIVATE-PROMPT",
           conversationId: "c1",
         },
-        "got",
+        "run.finished",
       );
       req.log.error(new Error("failed with PROMPT-IN-ERROR"));
       return { ok: true };
@@ -175,7 +178,7 @@ describe("logging", () => {
     const boom = await app.inject({ method: "GET", url: "/boom" });
     expect(boom.statusCode).toBe(500);
     const out = lines.join("");
-    expect(out).toContain('"msg":"child"');
+    expect(out).toContain('"msg":"tool.finished"');
     expect(out).toContain('"msg":"error"');
     for (const leak of [
       "sk-TOPLEVEL",

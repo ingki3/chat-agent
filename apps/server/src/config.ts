@@ -47,6 +47,11 @@ const ConfigSchema = z.object({
   ),
   /** Admin account email, created on the first-run screen (PRD FR-1.1). */
   ADMIN_EMAIL: z.email().default("ingki3@gmail.com"),
+  /**
+   * Log file written by the service itself, size-rotated (#46). Unset = stdout (development). The LaunchDaemon
+   * sets it to /Library/Logs/agentlee/server.log.
+   */
+  LOG_FILE: optional(z.string()),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -66,6 +71,8 @@ export type Config = {
   /** Present when Cloudflare Access is configured. */
   access?: { teamDomain: string; aud: string } | undefined;
   adminEmail: string;
+  /** Absolute path of the rotated log file; undefined = stdout. */
+  logFile?: string | undefined;
 };
 
 /** Parses and validates settings. Throws with a readable message on invalid input. */
@@ -103,5 +110,6 @@ export function loadConfig(
         ? { teamDomain: c.CF_ACCESS_TEAM_DOMAIN, aud: c.CF_ACCESS_AUD }
         : undefined,
     adminEmail: c.ADMIN_EMAIL.toLowerCase(),
+    logFile: c.LOG_FILE ? path.resolve(baseDir, c.LOG_FILE) : undefined,
   };
 }
