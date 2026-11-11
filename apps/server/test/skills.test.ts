@@ -924,6 +924,11 @@ describe("secret redaction of skill results (review #85)", () => {
     expect(JSON.stringify(r)).not.toContain(JSON.stringify(q).slice(1, -1));
     expect(r).toEqual({ ok: true, output: { v: "[redacted]", "[redacted]": 1 } });
   });
+  it("a numeric secret produced by number normalisation is refused (round 3)", () => {
+    for (const stdout of ['{"v":1.2345678e7}', "1.2345678e7", '{"a":[[1.2345678E+7]]}'])
+      expect(out(stdout, ["12345678"]), stdout).toEqual({ ok: false, code: "skill_bad_output" });
+  });
+
   it("a replacement that recreates the secret from its surroundings is refused (round 2)", () => {
     const secret = 'redacted]"';
     expect(out(JSON.stringify({ v: secret + '"' }), [secret])).toEqual({

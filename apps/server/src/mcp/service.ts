@@ -206,7 +206,10 @@ export function redactOutput(stdout: string, secrets: readonly string[]): SkillR
   const output = redactValue(parsed, secrets);
   // Last check on the decoded strings themselves (not their JSON form, which escapes quotes): a replacement can
   // recreate a secret from its surroundings (e.g. secret `redacted]"` next to the `[redacted]` marker).
-  if (containsSecret(output, secrets)) return { ok: false, code: "skill_bad_output" };
+  // Also the serialised form: number normalisation can produce a secret (`1.2345678e7` → `12345678`).
+  const text = JSON.stringify(output);
+  if (containsSecret(output, secrets) || secrets.some((v) => text.includes(v)))
+    return { ok: false, code: "skill_bad_output" };
   return { ok: true, output };
 }
 
@@ -215,8 +218,9 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
   const stack: unknown[] = [v];
   while (stack.length) {
     const x = stack.pop();
-    if (typeof x === "string") {
-      if (secrets.some((s) => x.includes(s))) return true;
+    if (typeof x === "string" || typeof x === "number") {
+      const t = String(x);
+      if (secrets.some((s) => t.includes(s))) return true;
     } else if (Array.isArray(x)) stack.push(...x);
     else if (x && typeof x === "object")
       for (const [k, val] of Object.entries(x)) {
