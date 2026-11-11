@@ -31,6 +31,9 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
 
 const QUOTES =
   /["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/gu;
+/** One quote character (any style the fold above maps), whole string. */
+const QUOTE_CHAR =
+  /^["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]$/u;
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
 /** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
 const TILDES = /[\u223C\u301C]/gu;
@@ -134,8 +137,13 @@ const PARTICLE_LOOKAHEAD = 7;
  * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
  */
 const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?\p{N})/u;
-const NUMBER_BEFORE = /(?:\p{N}[.,]|\p{N} ?[/:\-\u2212~] ?)$/u;
-const SIGN = /^[+\-\u2212]$/u;
+// `-` `−` before the start are left to SIGN_BEFORE, which refuses them with or without a digit before (sign or range).
+const NUMBER_BEFORE = /(?:\p{N}[.,]|\p{N} ?[/:~] ?)$/u;
+/**
+ * A sign right before the number, also across a space (`- 5%`, `− 5도` — HTML extraction gives `<span>-</span>5%`
+ * as `- 5%`). A sign after a digit is a range, which `NUMBER_BEFORE` refuses as well.
+ */
+const SIGN_BEFORE = /[+\-\u2212] ?$/u;
 const KOREAN_UNIT = /^[십백천만억조]$/u;
 const KOREAN_DIGIT = /^[일이삼사오육칠팔구]$/u;
 const SPACE = /\s/u;
@@ -259,6 +267,8 @@ export function normalizeWithMap(text: string): Normalized {
       else put(ch, s, e);
     }
   };
+  /** Whether the source character right before `i` is a digit (a quote mark there is a unit, not a quote). */
+  const afterDigit = (i: number) => i > 0 && DIGIT.test(text[i - 1]!);
   let i = 0;
   while (i < len) {
     const c = text.charCodeAt(i);
@@ -268,7 +278,8 @@ export function normalizeWithMap(text: string): Normalized {
         space(i);
         i++;
       } else if (c === 34 || c === 39) {
-        put('"', i, i + 1);
+        // Right after a digit a quote mark is a unit (`12'`, `12"` — feet, inches, minutes): kept as itself.
+        put(afterDigit(i) ? String.fromCharCode(c) : '"', i, i + 1);
         i++;
       } else if (c === 38) {
         const m = ENTITY.exec(text.slice(i, i + 12));
@@ -279,7 +290,7 @@ export function normalizeWithMap(text: string): Normalized {
           : undefined;
         if (m && decoded !== undefined) {
           const end = i + m[0].length;
-          emit(normCluster(decoded), i, end);
+          emit(afterDigit(i) && QUOTE_CHAR.test(decoded) ? decoded : normCluster(decoded), i, end);
           i = end;
         } else {
           put("&", i, i + 1);
@@ -299,7 +310,8 @@ export function normalizeWithMap(text: string): Normalized {
       if (!joins(cp)) break;
       i += cp > 0xffff ? 2 : 1;
     }
-    emit(normCluster(text.slice(start, i)), start, i);
+    const cluster = text.slice(start, i);
+    emit(afterDigit(start) && QUOTE_CHAR.test(cluster) ? fold(cluster) : normCluster(cluster), start, i);
   }
   return { norm: out.join(""), from: from.subarray(0, n), to: to.subarray(0, n) };
 }
@@ -361,8 +373,12 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     // Not inside a token at the start.
     if (TOKEN.test(before)) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
-    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`).
-    if (DIGIT.test(first) && (SIGN.test(before) || NUMBER_BEFORE.test(norm.slice(Math.max(0, at - 4), at))))
+    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`).
+    if (
+      DIGIT.test(first) &&
+      (SIGN_BEFORE.test(norm.slice(Math.max(0, at - 2), at)) ||
+        NUMBER_BEFORE.test(norm.slice(Math.max(0, at - 4), at)))
+    )
       continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);

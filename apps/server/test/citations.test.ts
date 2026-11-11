@@ -115,6 +115,34 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(normalizeSnippet("회선 속도 100Mbps")).not.toBe(normalizeSnippet("회선 속도 100MBps"));
   });
 
+  it("a quote mark right after a digit is a unit and is kept as itself (round 12)", () => {
+    expect(found('제품의 전체 길이는 12"이다.', "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found("이 망원경의 시야각은 30”이다.", "이 망원경의 시야각은 30’이다.")).toBe(false);
+    expect(found("제품의 전체 길이는 12'이다.", "제품의 전체 길이는 12'이다.")).toBe(true);
+    expect(found("제품의 전체 길이는 12&quot;이다", "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found('제품의 전체 길이는 12"이다.', "제품의 전체 길이는 12&quot;이다.")).toBe(true);
+    expect(found('제품의 전체 길이는 12"이다.', "제품의 전체 길이는 12&rdquo;이다.")).toBe(false); // entity too
+    expect(normalizeSnippet("전체 길이는 12'이다")).not.toBe(normalizeSnippet('전체 길이는 12"이다'));
+    // Elsewhere quotes still fold: the opening quote of a quoted number may differ; the closing one, right after
+    // the digit, must match exactly (accepted limitation (d), ops §22).
+    expect(found("그는 “100”이라고 말했다", "그는 “100”이라고 말했다.")).toBe(true);
+    expect(found('그는 "100”이라고 말했다', "그는 “100”이라고 말했다.")).toBe(true);
+    expect(found('그는 “100"이라고 말했다', "그는 “100”이라고 말했다.")).toBe(false);
+    expect(found("그는 “좋다”고 말했다", '그는 "좋다"고 말했다.')).toBe(true);
+  });
+
+  it("a sign across a space belongs to the number (round 12)", () => {
+    expect(found("5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다.")).toBe(false);
+    expect(found("5도까지 떨어졌다고 한다", "기온은 − 5도까지 떨어졌다고 한다.")).toBe(false);
+    expect(found("5 ~ 5도라고 예보했다", "기온은 - 5 ~ 5도라고 예보했다.")).toBe(false);
+    expect(found("5% 감소했다고 밝혔다", "매출은 + 5% 감소했다고 밝혔다.")).toBe(false);
+    // HTML extraction: `<span>-</span>5%` reads as `-` and `5%` with a break between.
+    expect(found("5% 감소했다고 밝혔다", "매출은 -\n5% 감소했다고 밝혔다.")).toBe(false);
+    // The sign quoted with the number verifies; a word before is no sign.
+    expect(found("- 5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다.")).toBe(true);
+    expect(found("5% 감소했다고 밝혔다", "매출은 약 5% 감소했다고 밝혔다.")).toBe(true);
+  });
+
   it("primes, accents and backticks are not quote marks (round 11)", () => {
     expect(found("제품의 전체 길이는 12″이다.", "제품의 전체 길이는 12′이다.")).toBe(false);
     expect(found("이 망원경의 시야각은 30″이다.", "이 망원경의 시야각은 30′이다.")).toBe(false);
