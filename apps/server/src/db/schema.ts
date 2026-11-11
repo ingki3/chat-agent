@@ -282,3 +282,15 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   timeZone: text("time_zone").notNull().default("Asia/Seoul"),
   updatedAt: integer("updated_at").notNull(),
 });
+
+/**
+ * Per-session push generation (#34). Turning a device off (or removing it from another device) bumps it, and it
+ * is part of the session tag every registration must carry — so a re-registration that started before the "off"
+ * (a service worker request still in flight) is refused when it arrives. Gone with the session.
+ */
+export const pushSessionState = sqliteTable("push_session_state", {
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => sessions.id, { onDelete: "cascade" }),
+  generation: integer("generation").notNull().default(0),
+});

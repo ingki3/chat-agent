@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, count, desc, eq, inArray, isNull, lt, ne } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, lt, ne, sql } from "drizzle-orm";
 import webpush from "web-push";
 import type {
   Notification,
@@ -14,7 +14,13 @@ import { can } from "../authz/policy.js";
 import type { ResourceRegistry } from "../authz/resources.js";
 import { decrypt, encrypt } from "../crypto/secrets.js";
 import type { Db } from "../db/client.js";
-import { notificationPrefs, notifications, pushSubscriptions, sessions } from "../db/schema.js";
+import {
+  notificationPrefs,
+  notifications,
+  pushSessionState,
+  pushSubscriptions,
+  sessions,
+} from "../db/schema.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { classifyError } from "../observability/policy.js";
 import { ADMIN_KINDS, bundle, compose, SHARED_BODY, type PublishInput } from "./compose.js";
@@ -493,13 +499,39 @@ export class NotificationService {
       }));
   }
 
-  /** Opaque, stable for one login session, different for every other (HMAC of the session id). */
+  /**
+   * Opaque tag of a login session *and its push generation* (HMAC of both). It changes whenever push is turned
+   * off for the session (`bumpGeneration`), so a registration that started before the "off" — a service worker
+   * re-registration still in flight — carries a stale tag and is refused (409).
+   */
   sessionTag(sessionToken: string): string {
+    return this.tagFor(sessionIdOf(sessionToken));
+  }
+
+  private tagFor(sessionId: string): string {
+    const generation =
+      this.db
+        .select({ g: pushSessionState.generation })
+        .from(pushSessionState)
+        .where(eq(pushSessionState.sessionId, sessionId))
+        .get()?.g ?? 0;
     return crypto
       .createHmac("sha256", this.masterKey)
-      .update(`push-session:${sessionIdOf(sessionToken)}`)
+      .update(`push-session:${sessionId}:${generation}`)
       .digest("base64url")
       .slice(0, 32);
+  }
+
+  /** Invalidates every tag issued for the session so far (an explicit "off"). */
+  private bumpGeneration(sessionId: string): void {
+    this.db
+      .insert(pushSessionState)
+      .values({ sessionId, generation: 1 })
+      .onConflictDoUpdate({
+        target: pushSessionState.sessionId,
+        set: { generation: sql`${pushSessionState.generation} + 1` },
+      })
+      .run();
   }
 
   /** Whether this session has a device registered with exactly this endpoint (given as its SHA-256). */
@@ -527,16 +559,30 @@ export class NotificationService {
 
   /** Removes every device registered by this login session ("끄기" on this device). */
   removeSessionDevices(userId: string, sessionToken: string): void {
-    this.db
-      .delete(pushSubscriptions)
-      .where(
-        and(eq(pushSubscriptions.userId, userId), eq(pushSubscriptions.sessionId, sessionIdOf(sessionToken))),
-      )
-      .run();
+    const sessionId = sessionIdOf(sessionToken);
+    this.db.$client
+      .transaction(() => {
+        this.db
+          .delete(pushSubscriptions)
+          .where(and(eq(pushSubscriptions.userId, userId), eq(pushSubscriptions.sessionId, sessionId)))
+          .run();
+        this.bumpGeneration(sessionId);
+      })
+      .immediate();
   }
 
+  /** Turns a device off from anywhere (this or another of the user's devices): its session's recovery ends too. */
   removeDevice(id: string): void {
-    this.db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, id)).run();
+    this.db.$client
+      .transaction(() => {
+        const row = this.db
+          .delete(pushSubscriptions)
+          .where(eq(pushSubscriptions.id, id))
+          .returning({ sessionId: pushSubscriptions.sessionId })
+          .get();
+        if (row) this.bumpGeneration(row.sessionId);
+      })
+      .immediate();
   }
 }
 

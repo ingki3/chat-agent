@@ -84,6 +84,7 @@ describe("database", () => {
       "messages",
       "notification_prefs",
       "notifications",
+      "push_session_state",
       "push_subscriptions",
       "run_events",
       "runs",

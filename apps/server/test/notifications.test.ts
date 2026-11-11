@@ -273,14 +273,17 @@ describe("devices", () => {
   });
 
   it("404/410 from the push service deletes the device; other errors keep it", async () => {
-    const { another, member, subscribe, svc, push } = await setup();
+    const { another, member, subscribe, svc, push, tagOf } = await setup();
     const mom = member("mom");
     const gone = await subscribe(mom);
+    const tagBefore = await tagOf(mom);
     const flaky = await subscribe(another(mom));
     push.fail.set(gone.endpoint, 410);
     push.fail.set(flaky.endpoint, 503);
     svc.publish(mom.user.id, { kind: "test" });
     await svc.settled();
+    // Not an "off": the session's tag stays valid, so the worker's renewal can still register.
+    expect(await tagOf(mom)).toBe(tagBefore);
     const left = svc.devices(mom.user.id, undefined);
     expect(left).toHaveLength(1);
     push.fail.clear();
@@ -398,6 +401,45 @@ describe("devices", () => {
       replaces: other,
     });
     expect(svc.devices(mom.user.id, undefined).map((d) => d.id)).toContain(other);
+  });
+
+  it("a worker re-registration still in flight when the user turns push off is refused; turning on again works", async () => {
+    const { member, subscribe, api, svc, push, tagOf, another } = await setup();
+    const mom = member("mom");
+    await subscribe(mom);
+    // The worker read the session's tag (its binding) and its renewal POST is on the way …
+    const workerTag = await tagOf(mom);
+    const renewal = {
+      endpoint: "https://fcm.googleapis.com/fcm/send/renewed-in-flight",
+      keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+      label: "다시 등록된 기기",
+      sessionTag: workerTag,
+    };
+    // … when the user turns it off.
+    const off = await api(mom, "DELETE", "/api/push/devices/current");
+    expect(off.statusCode).toBe(200);
+    const freshTag = off.json<{ sessionTag: string }>().sessionTag;
+    expect(freshTag).not.toBe(workerTag);
+    // The delayed POST arrives: refused, nothing registered, nothing sent.
+    const late = await api(mom, "POST", "/api/push/devices", renewal);
+    expect(late.statusCode).toBe(409);
+    expect(late.json()).toEqual({ error: "session_changed" });
+    expect(svc.devices(mom.user.id, undefined)).toEqual([]);
+    svc.publish(mom.user.id, { kind: "test" });
+    await svc.settled();
+    expect(push.sent).toEqual([]);
+    // An explicit "알림 켜기" reads the current tag and works.
+    const again = await subscribe(mom);
+    expect(again.r.statusCode).toBe(201);
+    expect(svc.devices(mom.user.id, undefined)).toHaveLength(1);
+
+    // Turning a device off from another device ends that device's in-flight recovery too.
+    const laptop = another(mom);
+    const laptopDevice = (await subscribe(laptop)).r.json<{ id: string }>().id;
+    const laptopTag = await tagOf(laptop);
+    expect((await api(mom, "DELETE", `/api/push/devices/${laptopDevice}`)).statusCode).toBe(200);
+    const lateLaptop = await api(laptop, "POST", "/api/push/devices", { ...renewal, sessionTag: laptopTag });
+    expect(lateLaptop.statusCode).toBe(409);
   });
 
   it("a session has one device: a renewal by the worker replaces it; 끄기 removes everything of the session", async () => {

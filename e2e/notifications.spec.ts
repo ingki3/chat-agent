@@ -307,8 +307,9 @@ test("a renewed subscription the worker could not register (403) is registered o
   const [first] = await current();
   const renewed = await renewalFails(ctx, page, sw, 403);
   expect((await markerOf(page))?.sessionTag).toEqual(expect.any(String));
-  // Meanwhile the old endpoint expired at the push service (410) and its device was dropped.
-  await page.request.delete(`/api/push/devices/${first!.id}`, { headers: csrf(baseURL!) });
+  // The server still has the old registration; the next start of this session swaps it for the renewed one.
+  // (The "row already gone after a 410" branch — `register` by the marker — is covered by
+  // apps/web/test/push-reconcile.test.ts: a user's DELETE is an explicit off and ends recovery on purpose.)
 
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
@@ -378,10 +379,8 @@ test("the browser signs in to another account between a sync's check and its reg
   baseURL,
 }, info) => {
   const ctx = await freshContext(browser, baseURL!, info.project.name);
-  const { page, sw, current } = await turnedOn(ctx, SON);
-  const [first] = await current();
+  const { page, sw } = await turnedOn(ctx, SON);
   await renewalFails(ctx, page, sw, 403);
-  await page.request.delete(`/api/push/devices/${first!.id}`, { headers: csrf(baseURL!) });
   // Next start of son's session: the sync reads son's tag, then — before its registration goes out — mom signs
   // in on this browser (another tab), so the registration arrives with mom's cookie.
   let switched = false;
@@ -463,5 +462,56 @@ test("after a successful renewal by the worker, 끄기 with a failing unsubscrib
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
   expect(await current()).toEqual([]);
   expect(await registered(renewed)).toBe(false);
+  await ctx.close();
+});
+
+test("a worker re-registration still in flight when 끄기 is clicked is refused; turning on again works", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw, current, registered } = await turnedOn(ctx, SON);
+  // The browser renews its subscription; the worker's registration POST is held on the way to the server.
+  const renewed = `https://fcm.googleapis.com/fcm/send/e2e-renewed-${Math.random().toString(36).slice(2)}`;
+  await page.evaluate((e) => localStorage.setItem("e2e-push-endpoint", e), renewed);
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let intercepted = false;
+  await ctx.route("**/api/push/devices", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    intercepted = true;
+    await held;
+    return route.continue();
+  });
+  const inFlight = sw.evaluate(
+    (endpoint) =>
+      (globalThis as unknown as { reRegister: (o: unknown, n: unknown) => Promise<void> }).reRegister(null, {
+        toJSON: () => ({ endpoint, keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) } }),
+      }),
+    renewed,
+  );
+  await expect.poll(() => intercepted).toBe(true);
+
+  // Meanwhile the user turns it off (and the browser even fails to drop its subscription).
+  await page.evaluate(() => localStorage.setItem("e2e-push-unsubscribe-fails", "1"));
+  await page.getByTestId("this-device").getByRole("button", { name: "끄기", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("구독을 끊지 못했어요");
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+
+  // The held POST now arrives: refused, nothing registered.
+  release();
+  await inFlight;
+  await ctx.unroute("**/api/push/devices");
+  expect(await current()).toEqual([]);
+  expect(await registered(renewed)).toBe(false);
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await current()).toEqual([]);
+
+  // Turning on again by hand works.
+  await page.evaluate(() => localStorage.removeItem("e2e-push-unsubscribe-fails"));
+  await page.getByRole("button", { name: "이 기기에서 알림 켜기" }).click();
+  await expect(page.getByTestId("device-state")).toHaveText("켜짐");
+  expect(await current()).toHaveLength(1);
   await ctx.close();
 });
