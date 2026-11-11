@@ -155,7 +155,7 @@ const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
  */
 // A repeated currency sign after a range mark is part of the range (`$100-$200`, `€100 ~ €200`, `$10–$20`).
 const DECIMAL_AFTER = /^[.,]\p{N}/u;
-const RANGE_AFTER = /^ ?[/:\-\u2212~] ?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
+const RANGE_AFTER = /^ ?[/:\-\u2212~] ?[+\-\u2212]?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
 const RANGE_MARK = /^[/:~]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
 /** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
@@ -429,24 +429,31 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
  * match start (`-$100`, `-$ 100`, `- $100`, `-€5`):
  * - a sign there (only when the match starts with a number), or — right at the start — a decimal or thousands mark
  *   after a digit (`1.32`, `1,234`; `3, 4명` is prose);
- * - a range or fraction mark (`~` `/` `:`; `-` `−` count as signs) after a token with a digit (`3%~5%`,
- *   `10만원~20만원`, `10°C ~ 20°C`, `1/2`) — whenever the match's first token has a digit (review #97 round 17).
+ * - a range or fraction mark (`~` `/` `:`; `-` `−` `+` count as signs and marks alike), after
+ *   a digit within 3 tokens (`3%~5%`, `10만 원~20만 원`, `$10 million ~ $20 million`, `-10~-5`, `1/2`) —
+ *   whenever the match's first 3 tokens have a digit (review #97 rounds 17–18).
  */
+/** Tokens a range check looks at on each side (`10만 원`, `$10 million`, review #97 round 18). */
+const RANGE_WINDOW = 3;
+const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
+const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
+
 function numberGoesOnBefore(
   norm: string,
   at: number,
   numberStart: boolean,
-  firstTokenHasDigit: boolean,
+  firstTokensHaveDigit: boolean,
 ): boolean {
   let j = at;
   while (j > 0 && (norm[j - 1] === " " || CURRENCY.test(norm[j - 1]!))) j--;
   const c = norm[j - 1] ?? "";
   if (numberStart && SIGN.test(c)) return true;
-  if (firstTokenHasDigit && (RANGE_MARK.test(c) || SIGN.test(c))) {
+  // The second value's own sign (`~-5`, `~+5%`) needs no step of its own: a sign counts as a mark, and the 3 tokens
+  // before it then still hold the first value.
+  if (firstTokensHaveDigit && (RANGE_MARK.test(c) || SIGN.test(c))) {
     let k = j - 1;
     while (k > 0 && norm[k - 1] === " ") k--;
-    const token = norm.slice(Math.max(0, norm.lastIndexOf(" ", k - 1) + 1), k);
-    if (DIGIT.test(token)) return true;
+    if (DIGIT.test(lastTokens(norm.slice(Math.max(0, k - 200), k), RANGE_WINDOW))) return true;
   }
   return numberStart && j === at && DECIMAL_MARK.test(c) && DIGIT.test(norm[j - 2] ?? "");
 }
@@ -457,8 +464,8 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
   const second = firstChar(want.slice(first.length));
   const last = lastChar(want);
   // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
-  const firstTokenHasDigit = DIGIT.test(want.split(" ")[0] ?? "");
-  const lastTokenHasDigit = DIGIT.test(want.slice(want.lastIndexOf(" ") + 1));
+  const firstTokensHaveDigit = DIGIT.test(firstTokens(want, RANGE_WINDOW));
+  const lastTokensHaveDigit = DIGIT.test(lastTokens(want, RANGE_WINDOW));
   const numberStart =
     DIGIT.test(first) ||
     (CURRENCY.test(first) && DIGIT.test(second === " " ? firstChar(want.slice(first.length + 1)) : second));
@@ -468,7 +475,10 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     if (TOKEN.test(before)) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
     // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
-    if ((numberStart || firstTokenHasDigit) && numberGoesOnBefore(norm, at, numberStart, firstTokenHasDigit))
+    if (
+      (numberStart || firstTokensHaveDigit) &&
+      numberGoesOnBefore(norm, at, numberStart, firstTokensHaveDigit)
+    )
       continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
@@ -477,7 +487,7 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     // mirror at the start (`이` right after `백`) is already refused by the start token rule.
     if (DIGIT.test(last) && DECIMAL_AFTER.test(rest)) continue;
     // A range after the match's last token with a digit (`3%`, `10만원`, `10°C` in `3%~5%`, `10만원~20만원`).
-    if (lastTokenHasDigit && RANGE_AFTER.test(rest)) continue;
+    if (lastTokensHaveDigit && RANGE_AFTER.test(rest)) continue;
     // Not before a unit quote either (`12` is not in `12'`, `12 '`): after a digit the page's quote marks are kept
     // as they are, so any quote mark there is a unit.
     if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;

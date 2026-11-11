@@ -185,12 +185,43 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%~이다.")).toBe(true);
     // Only the token at the edge counts: a digit elsewhere in the match does not make a range.
     expect(found("3층 주차장은 B동 A", "3층 주차장은 B동 A-1 구역이다.")).toBe(true);
-    expect(found("최대 20명이라고 했다", "인원은 10~최대 20명이라고 했다.")).toBe(true);
+    // Round 18: a digit within 3 tokens on both sides of the mark is a range (accepted limitation (f)).
+    expect(found("최대 20명이라고 했다", "인원은 10~최대 20명이라고 했다.")).toBe(false);
+    expect(found("그 뒤 최대 인원은 20명이라고 했다", "인원은 10~그 뒤 최대 인원은 20명이라고 했다.")).toBe(
+      true,
+    );
     // A sign or a decimal mark only matters before a number.
     expect(found("A등급이었다고 밝혔다", "결과는 -A등급이었다고 밝혔다.")).toBe(true);
     expect(found("A형이었다고 밝혔다", "결과는 3,A형이었다고 밝혔다.")).toBe(true);
     expect(found("A1등급이었다고 밝혔다", "결과는 -A1등급이었다고 밝혔다.")).toBe(true);
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
+  });
+
+  it("a range check looks 3 tokens either side and allows the second value's sign (round 18)", () => {
+    expect(found("객실의 하루 요금은 10만 원", "객실의 하루 요금은 10만 원~20만 원이다.")).toBe(false);
+    expect(found("20만 원이라고 안내했다.", "객실의 하루 요금은 10만 원~20만 원이라고 안내했다.")).toBe(
+      false,
+    );
+    expect(found("총 투자 금액은 1억 원", "총 투자 금액은 1억 원 ~ 2억 원이다.")).toBe(false);
+    expect(found("$20 million in total.", "The cost is $10 million ~ $20 million in total.")).toBe(false);
+    expect(found("내일 예상 기온은 -10", "내일 예상 기온은 -10~-5도이다.")).toBe(false);
+    expect(found("내일 예상 기온은 -10°C", "내일 예상 기온은 -10°C~-5°C이다.")).toBe(false);
+    expect(found("올해 예상 수익률은 -5%", "올해 예상 수익률은 -5%~+5%이다.")).toBe(false);
+    expect(found("+5%라고 안내했다", "수익률은 -5%~+5%라고 안내했다.")).toBe(false);
+    expect(found("The cost is $10 million", "The cost is $10 million ~ $20 million in total.")).toBe(false);
+    // The window really is 3 tokens: the digit three tokens back still counts, on both sides.
+    expect(found("요금은 무려 10 만 원", "요금은 무려 10 만 원~20만 원이다.")).toBe(false);
+    expect(found("20만 원이라고 안내했다", "요금은 10 만 원~20만 원이라고 안내했다.")).toBe(false);
+    expect(found("20만 원이라고 안내했다", "요금은 10 만 원 ~ 20만 원이라고 안내했다.")).toBe(false);
+    expect(found("만 원 이상 20만 원이라고 했다", "요금은 10~만 원 이상 20만 원이라고 했다.")).toBe(true); // 4th token: outside
+    expect(found("구간은 약 5도이다", "구간은 10~-구간은 약 5도이다.")).toBe(false);
+    // Controls: whole ranges; a comma is no range mark; `A-1` without a digit before the mark.
+    expect(found("객실의 하루 요금은 10만 원~20만 원", "객실의 하루 요금은 10만 원~20만 원이다.")).toBe(true);
+    expect(found("내일 예상 기온은 -10~-5도", "내일 예상 기온은 -10~-5도이다.")).toBe(true);
+    expect(found("매출은 3% 증가", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
+    expect(found("주차는 A-1 구역에서 한다", "주차는 A-1 구역에서 한다.")).toBe(true);
+    // Accepted limitation (f): a dash between two figures within 3 tokens reads as a range.
+    expect(found("매출은 3% 증가", "매출은 3% 증가 - 5% 감소했다.")).toBe(false);
   });
 
   it("a range that repeats the currency sign is one range (round 16)", () => {
