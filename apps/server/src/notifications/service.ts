@@ -53,7 +53,11 @@ export function webPushSender(vapid: VapidKeys, subject: string): PushSender {
   };
 }
 
-export class SubscriptionError extends Error {}
+export class SubscriptionError extends Error {
+  constructor(readonly code: "invalid_request" | "session_changed") {
+    super(code);
+  }
+}
 
 /**
  * Notifications (#34, FR-13): the inbox, quiet hours and web push.
@@ -407,7 +411,11 @@ export class NotificationService {
    * notifications.
    */
   subscribe(userId: string, sessionToken: string, req: PushSubscriptionRequest): string {
-    if (!validPushEndpoint(req.endpoint)) throw new SubscriptionError("push endpoint not allowed");
+    if (!validPushEndpoint(req.endpoint)) throw new SubscriptionError("invalid_request");
+    // A re-registration made for another session (the browser has since signed in elsewhere) is refused.
+    if (req.sessionTag !== undefined && req.sessionTag !== this.sessionTag(sessionToken))
+      throw new SubscriptionError("session_changed");
+    const sessionId = sessionIdOf(sessionToken);
     const id = crypto.randomUUID();
     const secret = encrypt(
       JSON.stringify({ endpoint: req.endpoint, keys: req.keys } satisfies PushTarget),
@@ -418,12 +426,24 @@ export class NotificationService {
     this.db.$client
       .transaction(() => {
         this.db.delete(pushSubscriptions).where(eq(pushSubscriptions.endpointHash, endpointHash)).run();
+        // Replacing this session's own older registration happens in the same transaction.
+        if (req.replaces)
+          this.db
+            .delete(pushSubscriptions)
+            .where(
+              and(
+                eq(pushSubscriptions.id, req.replaces),
+                eq(pushSubscriptions.userId, userId),
+                eq(pushSubscriptions.sessionId, sessionId),
+              ),
+            )
+            .run();
         this.db
           .insert(pushSubscriptions)
           .values({
             id,
             userId,
-            sessionId: sessionIdOf(sessionToken),
+            sessionId,
             endpointHash,
             secret,
             // eslint-disable-next-line no-control-regex -- strip control characters from the label
@@ -475,8 +495,31 @@ export class NotificationService {
         createdAt: s.createdAt,
         lastSentAt: s.lastSentAt,
         current: s.sessionId === current,
-        endpointHash: s.endpointHash,
       }));
+  }
+
+  /** Opaque, stable for one login session, different for every other (HMAC of the session id). */
+  sessionTag(sessionToken: string): string {
+    return crypto
+      .createHmac("sha256", this.masterKey)
+      .update(`push-session:${sessionIdOf(sessionToken)}`)
+      .digest("base64url")
+      .slice(0, 32);
+  }
+
+  /** Whether this session has a device registered with exactly this endpoint (given as its SHA-256). */
+  sessionHasEndpoint(userId: string, sessionToken: string, endpointHash: string): boolean {
+    return !!this.db
+      .select({ id: pushSubscriptions.id })
+      .from(pushSubscriptions)
+      .where(
+        and(
+          eq(pushSubscriptions.userId, userId),
+          eq(pushSubscriptions.sessionId, sessionIdOf(sessionToken)),
+          eq(pushSubscriptions.endpointHash, endpointHash),
+        ),
+      )
+      .get();
   }
 
   device(id: string): { id: string; userId: string } | undefined {

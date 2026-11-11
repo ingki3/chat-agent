@@ -140,23 +140,45 @@ self.addEventListener("notificationclick", (event) => {
   );
 });
 
-async function setReregisterPending(pending) {
+const BINDING = "/push-binding";
+
+/** The session the subscription was turned on under (written by the app, apps/web/src/push.ts). */
+async function readBinding() {
+  try {
+    const r = await caches.match(BINDING, { cacheName: PUSH_STATE });
+    const v = r ? await r.json() : null;
+    return v && typeof v.sessionTag === "string" ? v.sessionTag : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setReregisterPending(sessionTag) {
   try {
     const c = await caches.open(PUSH_STATE);
-    if (pending) await c.put(REREGISTER, new Response("1"));
-    else await c.delete(REREGISTER);
+    if (sessionTag === undefined) await c.delete(REREGISTER);
+    else
+      await c.put(
+        REREGISTER,
+        new Response(JSON.stringify({ sessionTag }), { headers: { "Content-Type": "application/json" } }),
+      );
   } catch {
-    // storage unavailable: the app still compares the subscription with the server on its next start
+    // storage unavailable: the app compares the subscription with the server on its next start anyway
   }
 }
 
 /**
- * The browser replaced the subscription (expiry, key rotation by the push service): register the new one. If that
- * fails — offline, or a 401/403 because the app or Access session ran out — the failure is remembered and the app
- * registers the subscription again on its next start (apps/web/src/push.ts `syncPush`).
+ * The browser replaced the subscription (expiry, key rotation by the push service): register the new one — for
+ * the login session it was turned on under only. The request names that session's tag; if the browser is now
+ * signed in to another session or account the server refuses (409), so a device never moves to whoever happens
+ * to be signed in. If registering fails (offline, 401/403 after the app or Access session ran out, 409), a
+ * marker naming that session is left, and the app registers again on its next start *in that same session*
+ * (apps/web/src/push.ts `syncPush`); any other session drops the marker.
  */
 async function reRegister(oldSub, newSub) {
+  const sessionTag = await readBinding();
   try {
+    if (!sessionTag) throw new Error("not turned on in a known session");
     let sub = newSub;
     if (!sub) {
       const key = oldSub && oldSub.options ? oldSub.options.applicationServerKey : null;
@@ -166,11 +188,11 @@ async function reRegister(oldSub, newSub) {
         applicationServerKey: key,
       });
     }
-    const res = await post("/api/push/devices", { ...sub.toJSON(), label: "다시 등록된 기기" });
+    const res = await post("/api/push/devices", { ...sub.toJSON(), label: "다시 등록된 기기", sessionTag });
     if (!res.ok) throw new Error(`registration answered ${res.status}`);
-    await setReregisterPending(false);
+    await setReregisterPending(undefined);
   } catch {
-    await setReregisterPending(true);
+    await setReregisterPending(sessionTag);
   }
 }
 

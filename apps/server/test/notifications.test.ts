@@ -280,6 +280,106 @@ describe("devices", () => {
     expect(push.sent.map((s) => s.endpoint)).toEqual([flaky.endpoint]);
   });
 
+  it("device lists carry no endpoint identifier; this session's endpoint is compared on the server", async () => {
+    const { app, member, subscribe, api } = await setup();
+    const mom = member("mom");
+    const { r, endpoint } = await subscribe(mom);
+    const body = r.json<{ devices: Record<string, unknown>[]; sessionTag: string }>();
+    expect(Object.keys(body.devices[0]!).sort()).toEqual([
+      "createdAt",
+      "current",
+      "id",
+      "label",
+      "lastSentAt",
+    ]);
+    const hash = (e: string) => crypto.createHash("sha256").update(e).digest("hex");
+    const check = (who: { cookie: string }, e: string) =>
+      api(who, "POST", "/api/push/devices/check", { endpointHash: hash(e) }).then((x) => x.json());
+    expect(await check(mom, endpoint)).toEqual({ match: true });
+    expect(await check(mom, `${endpoint}-other`)).toEqual({ match: false });
+    // Another session of the same account, and another account, are told nothing about it.
+    expect(await check({ cookie: `al_session=${app.users!.createSession(mom.user.id)}` }, endpoint)).toEqual({
+      match: false,
+    });
+    expect(await check(member("son"), endpoint)).toEqual({ match: false });
+  });
+
+  it("each session has its own opaque tag; a re-registration for another session is refused (409)", async () => {
+    const { app, member, subscribe, api, svc } = await setup();
+    const mom = member("mom");
+    const first = (await subscribe(mom)).r.json<{ sessionTag: string }>().sessionTag;
+    expect(first).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(first).not.toContain(mom.token);
+    const again = (await api(mom, "GET", "/api/push/devices")).json<{ sessionTag: string }>().sessionTag;
+    expect(again).toBe(first);
+    const second = { cookie: `al_session=${app.users!.createSession(mom.user.id)}` };
+    const tag2 = (await api(second, "GET", "/api/push/devices")).json<{ sessionTag: string }>().sessionTag;
+    expect(tag2).not.toBe(first);
+    // Session A's worker re-registers after B signed in on the browser: refused, nothing bound to B.
+    const son = member("son");
+    const r = await api(son, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/renewed",
+      keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+      label: "x",
+      sessionTag: first,
+    });
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toEqual({ error: "session_changed" });
+    expect(svc.devices(son.user.id, undefined)).toEqual([]);
+    // With its own tag it is accepted.
+    const ownTag = (await api(son, "GET", "/api/push/devices")).json<{ sessionTag: string }>().sessionTag;
+    const ok = await api(son, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/renewed",
+      keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+      label: "x",
+      sessionTag: ownTag,
+    });
+    expect(ok.statusCode).toBe(201);
+  });
+
+  it("replacing this session's device is one transaction: a failed registration keeps the old one", async () => {
+    const { app, member, subscribe, api, svc } = await setup();
+    const mom = member("mom");
+    const old = (await subscribe(mom)).r.json<{ id: string }>().id;
+    const keys = { p256dh: "B".repeat(87), auth: "A".repeat(22) };
+    const bad = await api(mom, "POST", "/api/push/devices", {
+      endpoint: "https://evil.example/x",
+      keys,
+      label: "x",
+      replaces: old,
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(svc.devices(mom.user.id, undefined).map((d) => d.id)).toEqual([old]);
+    const good = await api(mom, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/renewed",
+      keys,
+      label: "x",
+      replaces: old,
+    });
+    const now = svc.devices(mom.user.id, undefined);
+    expect(now.map((d) => d.id)).toEqual([good.json<{ id: string }>().id]);
+    // `replaces` never reaches another account's (or another session's) device.
+    const son = member("son");
+    const sons = (await subscribe(son)).r.json<{ id: string }>().id;
+    await api(mom, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/third",
+      keys,
+      label: "x",
+      replaces: sons,
+    });
+    expect(svc.devices(son.user.id, undefined).map((d) => d.id)).toEqual([sons]);
+    // … nor mom's own device registered by another of her sessions.
+    const laptop = { cookie: `al_session=${app.users!.createSession(mom.user.id)}` };
+    const other = (await subscribe(laptop)).r.json<{ id: string }>().id;
+    await api(mom, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/fourth",
+      keys,
+      label: "x",
+      replaces: other,
+    });
+    expect(svc.devices(mom.user.id, undefined).map((d) => d.id)).toContain(other);
+  });
+
   it("only the owner can remove a device", async () => {
     const { member, subscribe, api } = await setup();
     const mom = member("mom");
@@ -287,7 +387,7 @@ describe("devices", () => {
     const { r } = await subscribe(mom);
     const id = r.json<{ id: string }>().id;
     expect((await api(son, "DELETE", `/api/push/devices/${id}`)).statusCode).toBe(403);
-    expect((await api(mom, "DELETE", `/api/push/devices/${id}`)).json()).toEqual({ devices: [] });
+    expect((await api(mom, "DELETE", `/api/push/devices/${id}`)).json()).toMatchObject({ devices: [] });
   });
 });
 

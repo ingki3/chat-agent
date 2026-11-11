@@ -60,7 +60,10 @@ export function NotificationSettings() {
     },
   });
   const turnOff = useMutation({
-    mutationFn: (d: PushDevice) => (d.current ? disablePush(d.id) : push.remove(d.id).then(() => {})),
+    mutationFn: async (d: PushDevice) => {
+      if (d.current) await disablePush(d.id);
+      else await push.remove(d.id);
+    },
     onError: (e) => setMessage(errorText(e)),
     onSettled: refresh,
   });

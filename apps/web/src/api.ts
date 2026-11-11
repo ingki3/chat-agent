@@ -8,6 +8,7 @@ import {
   Notification,
   NotificationList,
   NotificationPrefs,
+  PushCheckResponse,
   PushDeviceList,
   PushKey,
   ResetPasswordResponse,
@@ -171,11 +172,17 @@ export const notifications = {
 /** Web push devices (#34). */
 export const push = {
   key: async () => PushKey.parse(await call("GET", "/api/push/key")).publicKey,
-  devices: async () => PushDeviceList.parse(await call("GET", "/api/push/devices")).devices,
-  register: async (sub: PushSubscriptionJSON, label: string) =>
-    PushDeviceList.parse(await call("POST", "/api/push/devices", { ...sub, label })).devices,
-  remove: async (id: string) =>
-    PushDeviceList.parse(await call("DELETE", `/api/push/devices/${enc(id)}`)).devices,
+  /** The account's devices and this session's tag. */
+  devices: async () => PushDeviceList.parse(await call("GET", "/api/push/devices")),
+  /** Registers this browser; `replaces` = this session's older device, swapped in one server transaction. */
+  register: async (sub: PushSubscriptionJSON, label: string, replaces?: string) =>
+    PushDeviceList.parse(
+      await call("POST", "/api/push/devices", { ...sub, label, ...(replaces ? { replaces } : {}) }),
+    ),
+  remove: async (id: string) => PushDeviceList.parse(await call("DELETE", `/api/push/devices/${enc(id)}`)),
+  /** Is this endpoint hash the one registered by my session? (compared on the server) */
+  check: async (endpointHash: string) =>
+    PushCheckResponse.parse(await call("POST", "/api/push/devices/check", { endpointHash })).match,
 };
 
 export const runs = {

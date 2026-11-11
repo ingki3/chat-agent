@@ -57,6 +57,20 @@ export const PushSubscriptionRequest = z.object({
     auth: z.string().regex(/^[A-Za-z0-9_-]{16,32}={0,2}$/),
   }),
   label: z.string().trim().min(1).max(40),
+  /**
+   * Replace this session's device with that id in the same transaction (the browser renewed its subscription):
+   * if registering fails, the old registration is still there.
+   */
+  replaces: z.uuid().optional(),
+  /**
+   * The session tag the subscription was turned on under (service worker re-registration). If the browser is now
+   * signed in to another session or account, the server refuses (409 `session_changed`) instead of binding the
+   * device to whoever is signed in.
+   */
+  sessionTag: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{16,64}$/)
+    .optional(),
 });
 export type PushSubscriptionRequest = z.infer<typeof PushSubscriptionRequest>;
 
@@ -67,14 +81,18 @@ export const PushDevice = z.object({
   createdAt: z.number().int(),
   lastSentAt: z.number().int().nullable(),
   current: z.boolean(),
-  /**
-   * SHA-256 (hex) of the push endpoint, so this browser can tell whether the server has its *current*
-   * subscription (it changes when the browser renews it). The endpoint itself never leaves the server.
-   */
-  endpointHash: z.string(),
 });
 export type PushDevice = z.infer<typeof PushDevice>;
-export const PushDeviceList = z.object({ devices: z.array(PushDevice) });
+/**
+ * `sessionTag`: an opaque tag of the caller's login session (not derivable from the cookie, different for every
+ * session). The page stores it with its subscription so a later recovery only ever re-registers for the same
+ * session.
+ */
+export const PushDeviceList = z.object({ devices: z.array(PushDevice), sessionTag: z.string() });
+export type PushDeviceList = z.infer<typeof PushDeviceList>;
+/** "Is this endpoint (its SHA-256, hex) the one registered by my session?" — answered without revealing anything else. */
+export const PushCheckRequest = z.object({ endpointHash: z.string().regex(/^[0-9a-f]{64}$/) });
+export const PushCheckResponse = z.object({ match: z.boolean() });
 export const PushKey = z.object({ publicKey: z.string() });
 
 /** What the service worker receives (JSON push payload). */

@@ -1,4 +1,5 @@
-import { devices, expect, test, type Browser, type Page } from "@playwright/test";
+import crypto from "node:crypto";
+import { devices, expect, test, type Browser, type Page, type Worker } from "@playwright/test";
 import { ADMIN, MOM, SON, csrf, useAccount } from "./helpers.js";
 
 /**
@@ -235,33 +236,48 @@ test("tapping a notification while the open window shows the login screen lands 
   await ctx.close();
 });
 
-test("a renewed subscription the worker could not register (403) is registered on the next start", async ({
-  browser,
-  baseURL,
-}, info) => {
-  const ctx = await freshContext(browser, baseURL!, info.project.name);
+type Ctx = Awaited<ReturnType<typeof freshContext>>;
+const hashOf = (e: string) => crypto.createHash("sha256").update(e).digest("hex");
+const markerOf = (page: Page) =>
+  page.evaluate(async () => {
+    const r = await caches.match("/push-reregister", { cacheName: "agentlee-push" });
+    return r ? ((await r.json()) as { sessionTag: string | null }) : null;
+  });
+
+/** A fresh login of `who` with push turned on for this session (stubbed push service). */
+async function turnedOn(ctx: Ctx, who: { email: string; password: string }) {
   const page = await ctx.newPage();
   await stubPush(page, "granted");
   await page.goto("/settings");
-  await login(page, SON);
+  await login(page, who);
   await page.getByRole("button", { name: "이 기기에서 알림 켜기" }).click();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
   const sw = await controllingWorker(page);
   const current = async () =>
     (
       (await (await page.request.get("/api/push/devices")).json()) as {
-        devices: { id: string; current: boolean; endpointHash: string }[];
+        devices: { id: string; current: boolean }[];
       }
-    ).devices.find((d) => d.current);
-  const first = (await current())!;
+    ).devices.filter((d) => d.current);
+  /** Server-side comparison for this session (`POST /api/push/devices/check`). */
+  const registered = async (endpoint: string) =>
+    (
+      (await (
+        await page.request.post("/api/push/devices/check", {
+          data: { endpointHash: hashOf(endpoint) },
+          headers: csrf(new URL(page.url()).origin),
+        })
+      ).json()) as { match: boolean }
+    ).match;
+  return { page, sw, current, registered };
+}
 
-  // The browser renews the subscription; the worker's registration is refused (Access/app session ran out).
-  const renewed = "https://fcm.googleapis.com/fcm/send/e2e-renewed-" + info.project.name + Date.now();
+/** The browser renews its subscription and the worker's registration is answered with `status`. */
+async function renewalFails(ctx: Ctx, page: Page, sw: Worker, status: number) {
+  const renewed = `https://fcm.googleapis.com/fcm/send/e2e-renewed-${Math.random().toString(36).slice(2)}`;
   await page.evaluate((e) => localStorage.setItem("e2e-push-endpoint", e), renewed);
   await ctx.route("**/api/push/devices", (route) =>
-    route.request().method() === "POST"
-      ? route.fulfill({ status: 403, json: { error: "access_denied" } })
-      : route.continue(),
+    route.request().method() === "POST" ? route.fulfill({ status, json: { error: "x" } }) : route.continue(),
   );
   await sw.evaluate(
     (endpoint) =>
@@ -270,30 +286,81 @@ test("a renewed subscription the worker could not register (403) is registered o
       }),
     renewed,
   );
-  expect(
-    await page.evaluate(
-      async () => !!(await caches.match("/push-reregister", { cacheName: "agentlee-push" })),
-    ),
-  ).toBe(true);
   await ctx.unroute("**/api/push/devices");
+  return renewed;
+}
+
+test("a renewed subscription the worker could not register (403) is registered on the same session's next start", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw, current, registered } = await turnedOn(ctx, SON);
+  const [first] = await current();
+  const renewed = await renewalFails(ctx, page, sw, 403);
+  expect((await markerOf(page))?.sessionTag).toEqual(expect.any(String));
   // Meanwhile the old endpoint expired at the push service (410) and its device was dropped.
-  await page.request.delete(`/api/push/devices/${first.id}`, { headers: csrf(baseURL!) });
+  await page.request.delete(`/api/push/devices/${first!.id}`, { headers: csrf(baseURL!) });
 
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
-  const after = (await current())!;
-  expect(after.id).not.toBe(first.id);
-  expect(after.endpointHash).not.toBe(first.endpointHash);
-  expect(
-    await page.evaluate(
-      async () => !!(await caches.match("/push-reregister", { cacheName: "agentlee-push" })),
-    ),
-  ).toBe(false);
+  expect((await current()).map((d) => d.id)).not.toContain(first!.id);
+  expect(await registered(renewed)).toBe(true);
+  expect(await markerOf(page)).toBeNull();
 
   // The real browser state wins: no subscription any more → shown off, and the server forgets the device.
   await page.evaluate(() => localStorage.removeItem("e2e-push-endpoint"));
   await page.reload();
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
-  expect(await current()).toBeUndefined();
+  expect(await current()).toEqual([]);
+  await ctx.close();
+});
+
+test("session expired, the worker's re-registration failed, then another account signs in: nothing is turned on for it", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw } = await turnedOn(ctx, SON);
+  await renewalFails(ctx, page, sw, 401);
+  expect(await markerOf(page)).not.toBeNull();
+  // The session ends without a logout (expiry), and mom signs in on this browser.
+  await ctx.clearCookies();
+  await page.reload();
+  await login(page, MOM);
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  const mine = (await (await page.request.get("/api/push/devices")).json()) as {
+    devices: { current: boolean }[];
+  };
+  expect(mine.devices.filter((d) => d.current)).toEqual([]);
+  expect(await markerOf(page)).toBeNull();
+  await ctx.close();
+});
+
+test("replacing the registration is safe: a failed registration (503) keeps it, and the next start replaces it", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, current, registered } = await turnedOn(ctx, SON);
+  const [first] = await current();
+  // The browser has renewed its subscription (the worker never ran, e.g. renewal noticed at start).
+  const renewed = `https://fcm.googleapis.com/fcm/send/e2e-renewed-${Math.random().toString(36).slice(2)}`;
+  await page.evaluate((e) => localStorage.setItem("e2e-push-endpoint", e), renewed);
+  await ctx.route("**/api/push/devices", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 503, json: { error: "x" } })
+      : route.continue(),
+  );
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  // Nothing was deleted: the old registration is still there.
+  expect((await current()).map((d) => d.id)).toEqual([first!.id]);
+  await ctx.unroute("**/api/push/devices");
+
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("켜짐");
+  expect((await current()).map((d) => d.id)).not.toContain(first!.id);
+  expect(await registered(renewed)).toBe(true);
   await ctx.close();
 });

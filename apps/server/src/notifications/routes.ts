@@ -1,5 +1,5 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
-import { NotificationPrefs, PushSubscriptionRequest } from "@agentlee/shared";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { NotificationPrefs, PushCheckRequest, PushSubscriptionRequest } from "@agentlee/shared";
 import { z } from "zod";
 import { deny } from "../auth/plugin.js";
 import { SubscriptionError, toNotification, type NotificationService } from "./service.js";
@@ -23,6 +23,11 @@ function parse<T extends z.ZodType>(schema: T, value: unknown, reply: FastifyRep
  * session's user, and routes naming an id go through the resource check (owner only).
  */
 export function registerNotificationRoutes(app: FastifyInstance, service: NotificationService): void {
+  /** The caller's devices and this session's opaque tag. */
+  const list = (req: FastifyRequest) => ({
+    devices: service.devices(req.ctx.user!.id, req.ctx.sessionToken),
+    sessionTag: service.sessionTag(req.ctx.sessionToken!),
+  });
   app.resources.register(NOTIFICATION, (id) => {
     const n = service.get(id);
     return n && n.pushState !== "cancelled" ? { kind: NOTIFICATION, id: n.id, ownerId: n.userId } : undefined;
@@ -104,8 +109,7 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
   app.get(
     "/api/push/devices",
     { config: { noResource: "lists only the caller's own devices" } },
-    async (req, reply) =>
-      noStore(reply).send({ devices: service.devices(req.ctx.user!.id, req.ctx.sessionToken) }),
+    async (req, reply) => noStore(reply).send(list(req)),
   );
 
   // Binds this browser to the caller's account and current login session (gone on logout).
@@ -119,11 +123,27 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
         const id = service.subscribe(req.ctx.user!.id, req.ctx.sessionToken!, body);
         return noStore(reply)
           .code(201)
-          .send({ devices: service.devices(req.ctx.user!.id, req.ctx.sessionToken), id });
+          .send({ ...list(req), id });
       } catch (e) {
-        if (e instanceof SubscriptionError) return deny(reply, 400, "invalid_request");
+        if (e instanceof SubscriptionError)
+          return e.code === "session_changed"
+            ? noStore(reply).code(409).send({ error: "session_changed" })
+            : deny(reply, 400, "invalid_request");
         throw e;
       }
+    },
+  );
+
+  // Compares on the server: the response says match or not, and carries no identifier of the endpoint.
+  app.post(
+    "/api/push/devices/check",
+    { config: { noResource: "compares against the caller's own session device" } },
+    async (req, reply) => {
+      const body = parse(PushCheckRequest, req.body, reply);
+      if (!body) return reply;
+      return noStore(reply).send({
+        match: service.sessionHasEndpoint(req.ctx.user!.id, req.ctx.sessionToken!, body.endpointHash),
+      });
     },
   );
 
@@ -132,7 +152,7 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
     { config: { resource: { kind: DEVICE, action: "delete" } } },
     async (req, reply) => {
       service.removeDevice(req.params.id);
-      return noStore(reply).send({ devices: service.devices(req.ctx.user!.id, req.ctx.sessionToken) });
+      return noStore(reply).send(list(req));
     },
   );
 }

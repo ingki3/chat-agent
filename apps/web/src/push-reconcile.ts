@@ -2,25 +2,31 @@
  * What to do so the server's registration for this login session matches the browser's real push
  * subscription (#34). Pure, so it is unit-tested (apps/web/test/push-reconcile.test.ts).
  *
- * - `endpointHash`: SHA-256 of the browser's current subscription endpoint, null when it has none (or
- *   notifications are not allowed any more).
- * - `current`: the server's device registered by this session, if any.
- * - `pending`: the service worker could not register a renewed subscription (offline, 401/403 after the app or
- *   Access session ran out) and left a note for the app.
+ * - `hasSubscription`: the browser has a subscription and notifications are allowed.
+ * - `current`: the server has a device registered by *this* session; `match`: the server says one of this
+ *   session's devices has exactly the browser's endpoint (compared on the server, `POST /api/push/devices/check`).
+ * - `marker`: the service worker could not register a renewed subscription (offline, 401/403 after the app or
+ *   Access session ran out) and noted the session tag the subscription had been turned on under.
+ * - `sessionTag`: this login session's tag.
  *
- * The browser decides: no subscription → the server row is stale (`remove`); a different subscription than the
- * one registered → `replace`; a subscription the server lost while re-registering failed → `register`. A
- * subscription with no row and no note stays off: the user turned this device off elsewhere, or this is another
- * account / a new login, which must opt in with the button.
+ * The browser decides, but recovery is bound to the session that opted in:
+ * - no subscription → the server row is stale (`remove`);
+ * - this session's row is for an older subscription → `replace` (one server transaction, so a failure keeps the
+ *   old row and the next start tries again);
+ * - this session lost its row while re-registering failed → `register`, only if the marker names this session;
+ * - anything else stays off: a device turned off elsewhere, a new login, another account — and a marker left by
+ *   another session is dropped. Those must opt in with the button.
  */
 export type ReconcileAction = "none" | "register" | "replace" | "remove";
 
 export function reconcileAction(i: {
-  endpointHash: string | null;
-  current: { endpointHash: string } | undefined;
-  pending: boolean;
+  hasSubscription: boolean;
+  current: boolean;
+  match: boolean;
+  marker: { sessionTag: string | null } | null;
+  sessionTag: string;
 }): ReconcileAction {
-  if (i.endpointHash === null) return i.current ? "remove" : "none";
-  if (i.current) return i.current.endpointHash === i.endpointHash ? "none" : "replace";
-  return i.pending ? "register" : "none";
+  if (!i.hasSubscription) return i.current ? "remove" : "none";
+  if (i.current) return i.match ? "none" : "replace";
+  return i.marker !== null && i.marker.sessionTag === i.sessionTag ? "register" : "none";
 }

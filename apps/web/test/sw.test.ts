@@ -46,12 +46,14 @@ function win(url: string, opts: { uncontrolled?: boolean } = {}): FakeWindow {
   return w;
 }
 
-function worker(o: { windows?: FakeWindow[]; status?: number } = {}) {
+function worker(o: { windows?: FakeWindow[]; status?: number; binding?: string } = {}) {
   const handlers = new Map<string, Handler>();
   const opened: string[] = [];
   const requests: { url: string; method: string; headers: Record<string, string>; body: string }[] = [];
   const store = new Map<string, Map<string, string>>();
   let status = o.status ?? 201;
+  if (o.binding)
+    store.set("agentlee-push", new Map([["/push-binding", JSON.stringify({ sessionTag: o.binding })]]));
   const caches = {
     open: async (name: string) => {
       const m = store.get(name) ?? new Map<string, string>();
@@ -64,7 +66,10 @@ function worker(o: { windows?: FakeWindow[]; status?: number } = {}) {
     },
     keys: async () => [...store.keys()],
     delete: async (k: string) => store.delete(k),
-    match: async () => undefined,
+    match: async (k: string, opts?: { cacheName?: string }) => {
+      const v = store.get(opts?.cacheName ?? "")?.get(k);
+      return v === undefined ? undefined : new Response(v);
+    },
   };
   const subscription = {
     endpoint: "https://fcm.googleapis.com/fcm/send/renewed",
@@ -106,7 +111,10 @@ function worker(o: { windows?: FakeWindow[]; status?: number } = {}) {
     fire,
     opened,
     requests,
-    pending: () => store.get("agentlee-push")?.has("/push-reregister") ?? false,
+    marker: () => {
+      const v = store.get("agentlee-push")?.get("/push-reregister");
+      return v === undefined ? undefined : (JSON.parse(v) as { sessionTag: string | null });
+    },
     setStatus: (s: number) => (status = s),
   };
 }
@@ -158,27 +166,41 @@ describe("service worker: tapping a notification", () => {
 describe("service worker: renewed subscription", () => {
   const oldSubscription = { options: { applicationServerKey: new Uint8Array([4, 1, 2]).buffer } };
 
-  it("remembers a failed re-registration (403 after Access expired) for the app, and clears it once it works", async () => {
-    const w = worker({ status: 403 });
+  it("re-registers for the session it was turned on under, and remembers a failure (403) with that session", async () => {
+    const w = worker({ status: 403, binding: "tag-A" });
     await w.fire("pushsubscriptionchange", { oldSubscription });
     expect(w.requests.map((r) => r.url)).toEqual(["/api/push/devices"]);
-    expect(w.pending()).toBe(true);
+    expect(JSON.parse(w.requests[0]!.body)).toMatchObject({ sessionTag: "tag-A" });
+    expect(w.marker()).toEqual({ sessionTag: "tag-A" });
     w.setStatus(201);
     await w.fire("pushsubscriptionchange", { oldSubscription });
-    expect(w.pending()).toBe(false);
+    expect(w.marker()).toBeUndefined();
   });
 
-  it("uses the browser's new subscription when it is given, and flags a missing key", async () => {
+  it("another session signed in meanwhile (409) is a failure too", async () => {
+    const w = worker({ status: 409, binding: "tag-A" });
+    await w.fire("pushsubscriptionchange", { oldSubscription });
+    expect(w.marker()).toEqual({ sessionTag: "tag-A" });
+  });
+
+  it("without a known session it sends nothing and leaves a marker no session can claim", async () => {
     const w = worker();
+    await w.fire("pushsubscriptionchange", { oldSubscription });
+    expect(w.requests).toEqual([]);
+    expect(w.marker()).toEqual({ sessionTag: null });
+  });
+
+  it("uses the browser's new subscription when it is given", async () => {
+    const w = worker({ binding: "tag-A" });
     await w.fire("pushsubscriptionchange", {
       newSubscription: { toJSON: () => ({ endpoint: "https://fcm.googleapis.com/fcm/send/new" }) },
     });
     expect(JSON.parse(w.requests[0]!.body)).toMatchObject({
       endpoint: "https://fcm.googleapis.com/fcm/send/new",
     });
-    const none = worker();
+    const none = worker({ binding: "tag-A" });
     await none.fire("pushsubscriptionchange", {});
     expect(none.requests).toEqual([]);
-    expect(none.pending()).toBe(true);
+    expect(none.marker()).toEqual({ sessionTag: "tag-A" });
   });
 });

@@ -122,7 +122,8 @@ export async function enablePush(): Promise<void> {
   } catch {
     throw new PushSetupError("failed");
   }
-  await push.register(sub.toJSON(), deviceLabel());
+  const list = await push.register(sub.toJSON(), deviceLabel());
+  await writeState(BINDING, { sessionTag: list.sessionTag });
 }
 
 function sameKey(sub: PushSubscription, publicKey: string): boolean {
@@ -133,23 +134,38 @@ function sameKey(sub: PushSubscription, publicKey: string): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
-/** Where the service worker leaves a note when re-registering a renewed subscription failed (sw.js). */
+/**
+ * Push bookkeeping shared with the service worker (sw.js), in Cache Storage:
+ * - `/push-binding` `{ sessionTag }`: the login session this browser's subscription was turned on under;
+ * - `/push-reregister` `{ sessionTag }`: the worker could not register a renewed subscription for that session.
+ */
 const PUSH_STATE = "agentlee-push";
+const BINDING = "/push-binding";
 const REREGISTER = "/push-reregister";
+type Marker = { sessionTag: string | null };
 
-async function reregisterPending(): Promise<boolean> {
+async function readState(key: string): Promise<Marker | null> {
   try {
-    return !!(await caches.match(REREGISTER, { cacheName: PUSH_STATE }));
+    const r = await caches.match(key, { cacheName: PUSH_STATE });
+    if (!r) return null;
+    const v = (await r.json().catch(() => ({}))) as { sessionTag?: unknown };
+    return { sessionTag: typeof v.sessionTag === "string" ? v.sessionTag : null };
   } catch {
-    return false;
+    return null;
   }
 }
 
-async function clearReregisterPending(): Promise<void> {
+async function writeState(key: string, value: Marker | null): Promise<void> {
   try {
-    await (await caches.open(PUSH_STATE)).delete(REREGISTER);
+    const c = await caches.open(PUSH_STATE);
+    if (value)
+      await c.put(
+        key,
+        new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } }),
+      );
+    else await c.delete(key);
   } catch {
-    // nothing to clear
+    // storage unavailable: recovery falls back to the button
   }
 }
 
@@ -161,40 +177,50 @@ async function sha256Hex(s: string): Promise<string> {
 /**
  * The account's devices, after making the server match this browser's *real* subscription for this login session
  * (see push-reconcile.ts). Runs on every app start and settings visit, so a renewal the service worker could not
- * register (e.g. 403 after Access expired) is registered on the next start, and "켜짐" is only shown when this
- * browser really has the subscription the server will push to.
+ * register (e.g. 403 after Access expired) is registered on the next start of the *same* session, and "켜짐" is
+ * only shown when this browser really has the subscription the server will push to.
  */
 export async function syncPush(): Promise<PushDevice[]> {
-  let devices = await push.devices();
-  if (!pushSupported()) return devices;
+  let list = await push.devices();
+  if (!pushSupported()) return list.devices;
   // Not registered yet (first load, development build): nothing to compare.
   const reg = await navigator.serviceWorker.getRegistration();
-  if (!reg) return devices;
+  if (!reg) return list.devices;
   const sub = await reg.pushManager.getSubscription().catch(() => null);
   const usable = sub && Notification.permission === "granted" ? sub : null;
-  const current = devices.find((d) => d.current);
-  const pending = await reregisterPending();
+  const current = list.devices.find((d) => d.current);
+  const marker = await readState(REREGISTER);
+  const match = usable && current ? await push.check(await sha256Hex(usable.endpoint)) : false;
   const action = reconcileAction({
-    endpointHash: usable ? await sha256Hex(usable.endpoint) : null,
-    current,
-    pending,
+    hasSubscription: !!usable,
+    current: !!current,
+    match,
+    marker,
+    sessionTag: list.sessionTag,
   });
-  if ((action === "remove" || action === "replace") && current) devices = await push.remove(current.id);
-  if ((action === "register" || action === "replace") && usable)
-    devices = await push.register(usable.toJSON(), deviceLabel());
-  if (pending) await clearReregisterPending();
-  return devices;
+  if (action === "remove" && current) list = await push.remove(current.id);
+  // On failure this throws before the marker is cleared; a failed replace leaves the old row (server transaction).
+  if (action === "register" && usable) list = await push.register(usable.toJSON(), deviceLabel());
+  if (action === "replace" && usable && current)
+    list = await push.register(usable.toJSON(), deviceLabel(), current.id);
+  if (marker) await writeState(REREGISTER, null);
+  const on = !!usable && (action === "register" || action === "replace" || (action === "none" && match));
+  await writeState(BINDING, on ? { sessionTag: list.sessionTag } : null);
+  return list.devices;
 }
 
 /** "끄기" on this device: the browser stops the subscription, the server forgets the device. */
 export async function disablePush(deviceId: string | undefined): Promise<void> {
   const sub = await currentSubscription();
   await sub?.unsubscribe().catch(() => {});
+  await writeState(BINDING, null);
   if (deviceId) await push.remove(deviceId);
 }
 
 /** Logging out: this browser stops receiving this account's pushes (the server also drops the device). */
 export async function unsubscribeOnSignOut(): Promise<void> {
+  await writeState(BINDING, null);
+  await writeState(REREGISTER, null);
   try {
     const sub = await currentSubscription();
     await sub?.unsubscribe();
