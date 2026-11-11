@@ -8,6 +8,8 @@ import {
 import { deny } from "../auth/plugin.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { BASE_HEADERS } from "../headers.js";
+import { logEvent } from "../logging.js";
+import { EXPORT_FORMATS, exportDocument, exportFormats, type ExportCode, type Renderer } from "./export.js";
 import { artifactCsp, attachment, downloadVersion, serveVersion } from "./serve.js";
 import { ArtifactError, toArtifact, toVersionInfo, type ArtifactStore } from "./store.js";
 
@@ -39,12 +41,15 @@ const notFound = (reply: FastifyReply) =>
  * - `POST /api/artifacts/:id/revert` `{ version }` — copy an earlier version as the newest
  * - `GET /a/:id` — the app page (viewer); `GET /a/:id/v/:version/raw` — the sandboxed original;
  *   `GET /a/:id/v/:version/download` — the file
+ * - `GET /a/:id/v/:version/png` · `/pdf` — rendered by the isolated browser (#51, `export.ts`); the renderer gets
+ *   the stored version only — never the request, its cookies or session
  */
 export function registerArtifactRoutes(
   app: FastifyInstance,
   conversations: ConversationStore,
   store: ArtifactStore,
   appPage: AppPage,
+  renderer?: Pick<Renderer, "render">,
 ): void {
   app.resources.register(ARTIFACT_KIND, (id) => {
     const a = store.get(id);
@@ -170,4 +175,55 @@ export function registerArtifactRoutes(
       );
     },
   );
+
+  for (const format of EXPORT_FORMATS)
+    app.get<{ Params: { id: string; version: string } }>(
+      `/a/:id/v/:version/${format}`,
+      { config: read },
+      async (req, reply) => {
+        const a = store.get(req.params.id)!;
+        const v = VERSION.test(req.params.version)
+          ? store.version(a.id, Number(req.params.version))
+          : undefined;
+        const doc =
+          v && exportFormats(a.kind).includes(format)
+            ? exportDocument(a.kind, v.title, v.content)
+            : undefined;
+        if (!v || !doc) return notFound(reply);
+        const started = Date.now();
+        const done = (exportCode: ExportCode) =>
+          logEvent(req.log, exportCode === "export_ok" ? "info" : "warn", "artifact.exported", {
+            userId: req.ctx.user!.id,
+            exportFormat: format,
+            exportCode,
+            durationMs: Date.now() - started,
+          });
+        const r = renderer
+          ? await renderer.render({ format, doc, scripts: a.kind === "html" })
+          : ({ ok: false, code: "export_unavailable" } as const);
+        if (!r.ok) {
+          done(r.code);
+          if (r.code === "export_busy") reply.header("Retry-After", "5");
+          return reply
+            .code(EXPORT_STATUS[r.code])
+            .header("Cache-Control", "no-store")
+            .send({ error: r.code });
+        }
+        done("export_ok");
+        return reply
+          .headers(RAW_HEADERS)
+          .header("Content-Security-Policy", artifactCsp([]))
+          .header("Content-Disposition", attachment(v.title, format))
+          .type(r.type)
+          .send(r.body);
+      },
+    );
 }
+
+const EXPORT_STATUS: Record<Exclude<ExportCode, "export_ok">, number> = {
+  export_unavailable: 503,
+  export_busy: 503,
+  export_timeout: 504,
+  export_limit: 413,
+  export_failed: 502,
+};

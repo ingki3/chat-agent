@@ -584,6 +584,25 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - `pnpm e2e e2e/artifacts.spec.ts`: 차트가 그려진 뒤 쿠키·API·부모·최상위 창 접근이 실패하고, 허용 밖 CDN이 막히고, 다른 가족은 403인지 본다.
 - 브라우저에서 원본 주소를 직접 열어도 개발자 도구 콘솔의 `self.origin`이 `"null"`이어야 한다(샌드박스).
 
+### 18.4 PNG·PDF 내보내기 (#51)
+방식과 근거는 `docs/decisions/isolation.md` "아티팩트 내보내기 (#51)"에 있다. 아티팩트 화면의 **PNG**(차트·SVG·HTML)·**PDF**(HTML·차트·표·마크다운·코드) 버튼, 주소는 `/a/<id>/v/<버전>/png`·`/pdf`(만든 사람만).
+- **브라우저 설치:** 서버가 쓰는 것은 Playwright의 Chrome Headless Shell이다(새 패키지 없음). 저장소에서 한 번:
+  ```bash
+  pnpm exec playwright install --only-shell chromium
+  ```
+  저장소의 Playwright 버전을 올리면 다시 실행한다(새 빌드가 캐시에 들어가고, 서버는 다시 시작하면 가장 새 것을 쓴다).
+- **서비스 계정이 다르면:** 서버는 기본으로 **서버를 실행하는 계정의** Playwright 캐시(`~/Library/Caches/ms-playwright`)를 찾는다. LaunchDaemon이 다른 계정으로 돌면 `.env`에 절대 경로를 적는다:
+  ```
+  EXPORT_BROWSER=/Users/<계정>/Library/Caches/ms-playwright/chromium_headless_shell-1254/chrome-headless-shell-mac-arm64/chrome-headless-shell
+  ```
+  서비스 계정이 그 파일을 읽고 실행할 수 있어야 한다. 바꾼 뒤 서비스를 다시 시작한다.
+- **없으면:** 브라우저가 없거나 macOS가 아니면(샌드박스 없음) PNG·PDF는 `export_unavailable`(503)이고 화면은 "만들지 못했어요"를 보인다. 차트 PNG는 브라우저 안에서 먼저 그리므로 그래도 된다.
+- **한도:** 한 번에 20초, 메모리 768MB, 파일 32MB, 동시에 2개(4개까지 기다림 — 넘으면 `export_busy`). 로그에는 `artifact.exported`(형식 `exportFormat`, 결과 `exportCode`, 소요 시간)만 남는다.
+  - 자주 보이는 코드: `export_unavailable`(브라우저 없음·macOS 아님), `export_timeout`(20초 넘는 문서 — 끝나지 않는 스크립트), `export_limit`(메모리·크기), `export_busy`(동시 요청).
+- **확인:**
+  - `pnpm test apps/server/test/artifact-export.test.ts`: 샘플 차트 PNG·문서 PDF, 앱(127.0.0.1)·사설 IP·메타데이터 요청 차단(겹마다 따로), 쿠키 없음, 시간·메모리 한도.
+  - 운영 Mac에서 실제 CDN(Chart.js를 쓰는 HTML) 확인: 그런 아티팩트를 열고 PDF 버튼 → 차트가 그려진 PDF가 받아져야 한다. 렌더러는 `cdn.jsdelivr.net:443`에만 나간다.
+
 ## 19. 금융 도구 (#30)
 방식과 근거는 `docs/decisions/isolation.md` "금융 도구 (#30)"에 있다. PRD FR-7.1–7.4·7.6·7.8.
 

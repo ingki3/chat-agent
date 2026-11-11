@@ -348,4 +348,59 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **남은 위험·미룬 것:**
   - 아티팩트가 **자기 프레임**을 외부 주소로 탐색하는 것은 막지 못한다(CSP에 탐색 제한이 없다 — `navigate-to`는 브라우저가 지원하지 않음). 새 창(`allow-popups` 없음)·최상위 창은 막힌다. 이때 나갈 수 있는 것은 아티팩트 자신의 내용과 그 안에서 사용자가 입력한 것뿐이다(쿠키·API·대화 내용은 아님). 모델이 대화 내용을 아티팩트에 넣게 만드는 프롬프트 주입은 #20 평가(`artifact_create → 숨은 지시 게시`)가 다룬다.
   - `document` 미리보기(pdf.js, DOCX·PPTX·XLSX의 PDF 변환)는 #49·#22. 지금은 참조만 저장하고 화면은 "준비 중".
-  - 아티팩트 패널·메시지 안 카드(`artifact_ref` 부분)·PNG·PDF 내려받기는 #28·#51, 공유는 #29(자원 로더의 `sharedWith`), 목록 화면은 #28·#52.
+  - 아티팩트 패널·메시지 안 카드(`artifact_ref` 부분)는 #28, PNG·PDF 내려받기는 #51(아래 절), 공유는 #29(자원 로더의 `sharedWith`), 목록 화면은 #28·#52.
+
+## 아티팩트 내보내기 (#51)
+차트를 PNG로, HTML·문서를 PDF로 내려받는다(PRD FR-6.4, FR-7.5의 "저장"). 남이 만든 HTML을 서버가 직접 그리는 일이라, 렌더러는 **아티팩트 서빙(#27)과 같은 문서를 #42의 격리 위에서** 연다. 코드: `apps/server/src/artifacts/browser.ts`(브라우저 찾기·스위치·실행기·DevTools 파이프), `export.ts`(렌더러·한도·종류별 형식), 경로는 `routes.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
+
+- **브라우저:** Playwright가 이미 쓰는 **Chrome Headless Shell**(저장소의 `@playwright/test` 1.65.0이 고정한 빌드, 지금 158.0.8127.18 / rev 1254)을 그대로 쓴다. **새 런타임 의존성은 없다**(Playwright 라이브러리도 서버가 불러오지 않는다 — DevTools 프로토콜을 파이프로 직접 말한다). 실행 파일은 `EXPORT_BROWSER`(절대 경로)가 있으면 그것, 없으면 Playwright 캐시(`PLAYWRIGHT_BROWSERS_PATH` 또는 플랫폼 기본 위치)에서 설치가 끝난(`INSTALLATION_COMPLETE`) 가장 새 `chromium_headless_shell-<rev>`. 없으면 내보내기는 `export_unavailable`(503)이다. 설치는 `docs/ops.md` §18.4.
+  - 헤드리스 셸은 폴더 하나에 든 단일 실행 파일이라 샌드박스에서 "읽기 전용 프로그램 폴더"(`trusted`)로 열기 쉽다. 전체 Chromium(.app 번들과 도우미 앱)보다 작고 단순하다.
+- **프로세스 하나, 렌더 하나:** 내보내기마다 새 브라우저 프로세스를 띄우고 끝나면 프로세스 그룹째 끝낸다(`Browser.close` 뒤 2초 안에 안 끝나면 SIGKILL).
+  - `--single-process --no-zygote`: 렌더러·GPU·네트워크 도우미 프로세스가 없다. 그래서 #42의 **fork 금지 프로파일을 그대로** 쓸 수 있고, 메모리 한도가 브라우저 전체에 걸린다. Chrome 자체 샌드박스는 끈다(`--no-sandbox`) — 우리 샌드박스 안에서 돌고, macOS는 seatbelt 프로파일을 겹칠 수 없다.
+  - 조종은 `--remote-debugging-pipe`(fd 3 입력, fd 4 출력). **포트를 열지 않는다** — 다른 로컬 프로세스가 붙을 수 없다. `spawnIsolated`에 `extraPipes`를 더했다(파이프 2개).
+  - 2026-11-11 macOS 27.0.1에서 확인: `(deny default)` + `system.sb` + 읽기 = 브라우저 폴더, 쓰기 = 렌더 폴더, fork 없음, 네트워크 = 프록시 포트 하나로 PNG·PDF가 나온다. 한글 글꼴도 `system.sb`가 여는 시스템 글꼴로 그려진다(샘플 PNG·PDF 확인).
+- **앱 쿠키·세션 없음:**
+  - 렌더마다 새 빈 프로필 폴더(`mkdtemp` → `profile`·`home`·`tmp`, 0700)를 쓰고 끝나면 지운다. 환경 변수는 `HOME`·`TMPDIR` 둘뿐이다(서버 환경을 물려받지 않음).
+  - 문서는 **앱 주소로 열지 않는다.** 가짜 주소 `https://artifact.invalid/`로 탐색하고 그 요청을 DevTools `Fetch.fulfillRequest`로 채운다. 본문과 헤더는 서빙과 같다(`serveVersion` — HTML은 정책 A·B 두 CSP, 그 밖은 스크립트 없는 CSP). 그래서 렌더러 안의 문서도 불투명 출처(`self.origin === "null"`), `connect-src 'none'`, 스크립트 해시·정확한 CDN URL이다. markdown·코드는 서빙이 `text/plain`이라 제목 + `<pre>`(이스케이프) 페이지로 인쇄한다.
+  - 경로 처리기는 렌더러에 **저장된 버전(본문·제목·종류)만** 넘긴다. 요청·쿠키·세션은 넘어가지 않는다(시험: 작업 객체의 키가 `doc·format·scripts`뿐이고 세션 토큰이 없음).
+- **네트워크 — 세 겹, 각각 따로 막는다:**
+  1. **브라우저 안 요청 가로채기**(`Fetch.enable`, 모든 URL): 문서 주소는 한 번만 채우고, `CDN_ALLOW_LIST`의 **정확한 URL**만 계속 보내고, 나머지는 `BlockedByClient`로 실패시킨다. CSP가 막지 못하는 유일한 것 — **문서가 자기 프레임을 다른 주소로 탐색**하는 것(#27 "남은 위험") — 도 여기서 막힌다(시험: `location.href = "http://127.0.0.1:<port>/api/nav"`가 가로채기 목록에 있고 앱 서버에 닿지 않음).
+  2. **송신 프록시**(#42 `EgressService`, 허용 목록 = `CDN_ALLOW_LIST`의 호스트 = `cdn.jsdelivr.net`, 포트 443): 브라우저는 `--proxy-server`로 모든 요청을 여기로 보낸다. `--proxy-bypass-list=<-loopback>`으로 Chrome의 기본 루프백 예외를 없앴다(없으면 `127.0.0.1`·`localhost`는 프록시를 건너뛴다 — 변이 시험으로 확인). 프록시는 평문 HTTP 프록시 요청을 405로, 허용 목록 밖 CONNECT를 403으로 거절하고, 허용 호스트도 답이 루프백·사설·링크 로컬·메타데이터면 거부한다. WebRTC는 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`(프록시를 거치지 않는 UDP 금지).
+  3. **macOS 프로세스 샌드박스**(`sandboxedLauncher` = `spawnIsolated`): 네트워크는 프록시의 루프백 포트 하나뿐. 브라우저 안의 두 겹이 다 뚫려도 커널이 거부한다(시험: CSP·가로채기·프록시 스위치를 모두 끄고 샌드박스만 남겨도 앱 서버에 요청 0).
+  - CSP(#27)는 네 번째 겹이다. Chrome의 "로컬 네트워크 접근" 규칙도 공개 문서의 루프백 하위 요청을 막지만, 우리 경계로 세지 않는다.
+- **DevTools 파이프도 공격면이다(리뷰 #95 1차):** 브라우저 전체가 `--single-process --no-sandbox`로 돈다 — 아티팩트를 그리는 렌더러 코드와 파이프(fd 4)를 쓰는 코드가 **같은 프로세스**이고 Chrome 자체 샌드박스도 없다. 렌더러의 네이티브 취약점 하나면 공격자가 fd 4로 서버에 아무 바이트나 보낼 수 있다(커널 샌드박스는 그 프로세스의 파일·네트워크를 막을 뿐, 이미 열린 파이프는 막지 않는다). 그래서 서버는 파이프에서 오는 모든 것을 적대적인 입력으로 다룬다(`browser.ts` `CdpPipe`, `export.ts`):
+  - 메시지마다 모양 검사(`parseMessage`): JSON 객체, `id`는 양의 정수, `method`·`sessionId`는 문자열, `params`·`result`는 객체, 응답(id)과 이벤트(method) 중 정확히 하나. 아니면 연결을 닫는다(`protocol`). 보낸 적 없는 id의 응답도 같다. 메시지 하나는 48MB까지.
+  - 쓰는 응답·이벤트는 zod로 검사한다(`Target.createTarget`·`attachToTarget`의 id, PNG·PDF의 base64 `data`, `getLayoutMetrics`의 크기, `Fetch.requestPaused`의 `requestId`·`request.url`·`resourceType`). 맞지 않으면 그 렌더만 `export_failed`.
+  - 이벤트 처리기에서 난 예외도 연결을 닫는 것으로 끝난다(`dispatch`의 try). 파이프의 모든 Promise는 만들 때 처리기를 붙인다(`quiet`) — 탐색 응답 전에 브라우저가 죽어도 unhandled rejection으로 서버가 끝나지 않는다(리뷰 P1: `Page.loadEventFired` 대기와 `Page.navigate`를 `Promise.all`로 함께 기다림).
+  - 프로토콜 오류·크기 초과·실패한 렌더는 브라우저에 닫으라고 묻지 않고 **바로 프로세스 그룹을 SIGKILL**한다. 렌더 폴더는 늘 지운다.
+  - 시험: 별도 Node 프로세스(`test/fixtures/export/host.ts`)가 가짜 브라우저(`fake-browser.mjs`)로 탐색 응답 전 종료, 깨진 JSON, `null`, 배열, 문자열 id, 모르는 id, 객체가 아닌 `result`, 틀린 응답 모양, 잘못된 `Fetch.requestPaused` params, 48MB 넘는 응답, 무응답을 차례로 보낸다. 호스트는 끝까지 살아 있고(종료 코드 0, stderr 없음), 각 렌더는 정해진 코드로 끝나며 1초 안에(무응답은 시간 한도에서) 브라우저 프로세스가 없고 렌더 폴더가 남지 않는다.
+- **`system.sb`가 여는 IPC:** 프로파일은 `(import "system.sb")`로 OS 기본 동작(동적 라이브러리, 글꼴, 로캘)을 연다. 여기에는 표준 Mach/XPC 서비스 조회와 syslog(로그) 같은 **IPC도 들어 있다**. 그러니 "디버깅 포트가 없다"가 "IPC가 전혀 없다"는 뜻은 아니다. 뜻하는 바:
+  - 침해된 렌더러는 시스템이 모든 샌드박스 프로세스에 열어 둔 서비스(글꼴 서버, 알림 센터, 로그 등)에 말할 수 있다. 그 서비스들의 취약점은 우리 경계 밖의 위험이다(macOS가 자기 샌드박스 앱에 같은 것을 허용한다).
+  - 우리 앱 서버와의 통로는 열린 파이프 두 개뿐이다(위 검사). 우리 서버는 Mach/XPC 서비스를 내지 않는다.
+  - DNS: 시스템 해석기(mDNSResponder)로 가는 길도 막혀 있다 — 같은 정책의 프로세스에서 `dns.lookup`이 실패한다(macOS 시험). 그래서 이름을 해석하게 해서 정보를 흘리는 길(DNS 유출)도 없다. Chrome은 프록시가 이름을 해석하므로 스스로 해석할 일이 없다.
+  - 네트워크 엔드포인트(TCP·UDP)는 프록시 포트 하나만 열린다(시험). 더 좁히려면(`mach-lookup` 목록 지정) `system.sb`를 쓰지 않는 손으로 쓴 프로파일이 필요하다 — Chrome이 필요한 서비스가 버전마다 바뀌어 지금은 하지 않는다.
+- **한도(`RENDER_LIMITS`):** 렌더 전체 20초(넘으면 프로세스 그룹 SIGKILL → `export_timeout` 504), 메모리 768MB(브라우저 프로세스 RSS를 250ms마다 `ps`로 측정 — 넘거나 **측정이 안 되면** 종료 → `export_limit` 413, fail closed), DevTools 응답 하나 48MB·파일 32MB(`export_limit`), 동시에 2개 + 대기 4개(넘으면 `export_busy` 503, `Retry-After: 5`). HTML은 불러온 뒤 스크립트(차트 애니메이션)에 1.2초를 준다. 그 밖의 종류는 스크립트 실행을 끈다(`Emulation.setScriptExecutionDisabled`). PNG는 폭 800 CSS px·배율 2, 높이는 내용 높이(최대 6000px), PDF는 A4·배경 인쇄·밝은 색 구성표.
+- **형식(`ARTIFACT_EXPORTS`, shared):** PNG — chart·svg·html, PDF — html·chart·table·markdown·code. document(생성 파일 참조)는 #49·#22에서 파일 자체의 변환과 함께(지금 404).
+- **경로(주인만, #27과 같은 자원 검사):** `GET /a/:id/v/:version/png`, `GET /a/:id/v/:version/pdf`. 남·관리자 403, 비로그인 401, 없는 버전·지원하지 않는 형식 404(렌더러를 부르지 않는다). 응답은 내려받기와 같은 헤더(`Content-Disposition: attachment`, 샌드박스 CSP, `no-store`, `nosniff`). 권한 행렬에 2행 추가.
+- **차트는 클라이언트 캡처 먼저:** 화면의 PNG 버튼은 차트면 브라우저에서 먼저 그린다 — 주인만 받는 SVG 내려받기(서버가 그린 SVG, 스크립트 없음)를 `fetch`해서 `<img>`(blob URL) → 캔버스(배율 2, 흰 배경) → `toBlob`. 샌드박스 iframe은 건드리지 않는다. 실패하면(내려받기 실패, 이미지 해석 실패 등) 서버 렌더(`/png`)를 부른다. 그 밖의 PNG·PDF는 서버 렌더다. 실패하면 화면에 "만들지 못했어요"를 보이고 오류 응답을 파일로 저장하지 않는다. 받은 것이 파일인지는 **정확히 200 + 기대한 Content-Type**(`image/svg+xml`·`image/png`·`application/pdf`)으로 판단하고, 리다이렉트는 따라가지 않는다(`redirect: "manual"`). 그래서 게이트·세션이 만료되어 로그인 페이지(302 → 200 HTML)가 와도 그것을 .png·.pdf로 저장하지 않는다(리뷰 #95 1차, e2e: 게이트로 302, 200 로그인 HTML, 실제 세션 종료 401 — 셋 다 오류 문구, 내려받기 0).
+- **로그:** 내보내기마다 `artifact.exported` 하나 — `userId`, `exportFormat`(`png`/`pdf`), `exportCode`(`export_ok`·`export_unavailable`·`export_busy`·`export_timeout`·`export_limit`·`export_failed`), 소요 시간. 제목·본문·URL은 남기지 않는다(시험).
+- **Linux(CI):** sandbox-exec가 없어 운영 실행기는 거부한다(`export_unavailable`, 시험). 대신 **운영 실행기의 정책은 Linux CI에서도 검사한다**(리뷰 #95 1차): `rendererSandbox`(운영 실행기가 `spawnIsolated`에 넘기는 값, 순수 함수)가 네트워크 = 프록시 루프백 포트 하나, 읽기 = 브라우저 폴더, 쓰기 = 렌더 폴더, 넘긴 환경 변수만, 파이프 2개인지와, `buildProfile`이 만든 프로파일 문자열(deny default, `process-fork` 없음, 네트워크 줄은 그 포트 하나, 쓰기 줄은 렌더 폴더 하나, 실행은 브라우저 하나, `(allow network*)`·`mach-lookup` 추가 없음)을 확인한다. `network: "all"`이나 쓰기 경로 넓히기는 Linux에서도 실패한다. 커널이 실제로 막는지는 macOS 시험(이 Mac의 `pnpm test`에서 늘 돈다)이 확인한다. macOS CI 러너는 두지 않았다(비용·저장소 설정 결정). 웹 작업자(#50)와 같은 방식으로, 시험은 Linux에서 같은 브라우저를 샌드박스 없이(`unsandboxedLauncher`, 시험 전용) 돌려 브라우저 안의 겹(가로채기·프록시·CSP)·쿠키 격리·시간·메모리·크기 한도를 확인하고, 커널 겹은 macOS 시험이 확인한다. CI의 `test` 작업이 헤드리스 셸을 설치한다(`playwright install --with-deps --only-shell chromium`). CI에서 브라우저가 없으면 시험 파일이 실패한다(건너뛰지 않음). Linux 결과는 `node:22-bookworm` 컨테이너에서 같은 명령으로 확인했다(2026-11-11, 리뷰 #95 1차 뒤: 25 통과·macOS 전용 5 건너뜀).
+- **시험(`apps/server/test/artifact-export.test.ts`, 실제 헤드리스 셸):**
+  - 샘플: 차트 PNG(1600px 폭, 내용 높이), HTML 문서 PDF(인라인 스크립트가 그린 줄 포함), 표·markdown·코드 PDF, SVG PNG.
+  - **앱·사설 IP 차단(완료 기준):** 한 문서가 `http://127.0.0.1:<시험 서버 포트>/api/…`를 stylesheet·prefetch·script·img·iframe·fetch(credentials)·sendBeacon·WebSocket·**자기 탐색**으로, `10.0.0.1`·`192.168.1.1`·`169.254.169.254`·`localhost`·`[::1]`·공개 호스트(`example.org`)를 요청한다. 시험 서버가 받은 요청 0, 프록시의 이름 해석 0, 업스트림 연결 0(PNG·PDF 모두).
+  - 겹마다 따로: 대조(모든 겹을 끄고 샌드박스 없이 → 앱 서버가 탐색 요청을 받음, 즉 시험이 실제로 닿을 수 있음), CSP만(탐색은 통과 — 다른 겹이 필요한 이유), 가로채기만, 프록시만(루프백 포함), macOS 샌드박스만. 각각 요청 0.
+  - 허용 CDN: 정확한 Chart.js URL만 프록시로 가고(이름 해석은 `cdn.jsdelivr.net`뿐), 같은 호스트의 다른 버전은 가로채기에서 막힌다.
+  - 쿠키·세션: 렌더마다 다른 새 빈 프로필, 환경 변수 2개, 끝나면 폴더 없음, 쿠키 저장소 비어 있음(문서가 쿠키를 심으려 해도), 문서 주소는 가짜 주소, 출처 `null`.
+  - 시간(무한 루프 → 3초 한도에서 `export_timeout`, 프로세스 없음), 메모리(20MB 한도 → `export_limit`, 측정 불가 → `export_limit`), 응답·파일 크기, 동시 1 + 대기 1에서 세 번째는 `export_busy`이고 한 번에 하나만 실행.
+  - 경로: 주인만(남·관리자·공유 대상 403, 비로그인 401 — 거절된 요청은 렌더러에 닿지 않음), 종류별 형식 404, 실패 코드별 상태, 로그에 제목 없음, 시험 환경 기본값은 `export_unavailable`.
+  - e2e(`e2e/artifacts.spec.ts`): 차트 PNG 버튼 → 클라이언트 캡처로 PNG 파일(서버 `/png` 호출 없음), SVG 내려받기를 막으면 서버 렌더로 넘어감(macOS: PNG 파일, Linux: 503 → 오류 문구). HTML 문서 PDF(macOS: `%PDF-` 파일 — e2e 서버가 실제 샌드박스 렌더러로 만든다), 아들 계정은 `/png`·`/pdf` 403.
+- **리뷰 #95 1차 뒤 더한 시험:**
+  - 모든 플랫폼: 파이프 메시지 모양 경계값, 호스트 생존(위), 운영 실행기 정책·프로파일(위). 브라우저: WebRTC가 UDP를 내보내지 못함(대조: 정책 스위치를 빼고 샌드박스 없이 돌리면 시험 UDP 수신기가 STUN을 받음), `--disable-quic`, 리다이렉트는 홉마다 다시 검사(허용한 첫 주소가 앱으로 302 → 첫 홉만 나가고 대상은 가로채기에서 막힘), `data:` iframe·`blob:` 작업자·`file:` iframe·`file:` 탐색이 앱에 닿지 못하고 로컬 파일도 읽지 못함.
+  - macOS 커널(운영 실행기, 브라우저 안의 겹을 모두 끈 채): 양성 대조로 문서가 먼저 그려짐, DevTools로 직접 `file://`을 열게 해도 샌드박스 밖 파일을 못 읽음(대조: 샌드박스 없이는 읽음), WebRTC 정책 스위치를 빼도 UDP 0, 같은 정책의 프로세스로 직접 재 보면 프록시 포트 TCP만 되고(양성 대조) 다른 TCP·로컬 UDP·공개 DNS UDP·이름 해석은 모두 실패.
+- **변이 시험(2026-11-11, macOS):** 하나씩 망가뜨리면 시험이 실패함을 확인했다(15개 모두): 가로채기가 모두 통과, `--proxy-server` 제거, `<-loopback>` 제거(루프백이 프록시를 건너뜀), 프록시를 공개 주소 모드로, 샌드박스 네트워크 `all`, 서버 환경 상속, 렌더 사이 공유 프로필, 렌더 폴더 남김, CSP 헤더 안 보냄(출처 `null` 확인이 잡음), 시간 한도 제거, 메모리 비교 제거, 측정 불가 허용, 응답 크기 무제한, 경로를 `noResource`로(권한 행렬·경로 시험), 렌더러에 요청 쿠키 전달.
+- **변이 시험(리뷰 #95 1차 뒤, 2026-11-11, macOS):** 모두 시험이 잡았다. `quiet` 제거(처리기 없는 전송이 unhandled rejection), `quiet` 제거 + 탐색·load를 차례로 기다림(리뷰가 지적한 그 코드 — 호스트 프로세스가 죽음), `parseMessage`가 아무 JSON이나 받음, 모르는 응답 id 무시(무응답 → 시간 초과로 드러남), 응답 zod 검사 생략, 프로토콜 오류 때 죽이지 않고 닫기를 요청(1초 안 종료 검사가 잡음), 운영 실행기 네트워크 `all`(Linux에서도 정책·프로파일 시험이 잡음), 쓰기 경로를 임시 폴더 전체로, `--disable-quic` 제거, 화면의 파일 판정을 `res.ok`로 + 리다이렉트 따라감(e2e).
+  - 이벤트 처리기 예외의 try만 빼면 통과한다 — 바깥(`data` 처리기의 try)이 같은 일을 하는 두 번째 겹이라서다. 두 겹을 함께 빼면 호스트 생존 시험이 실패한다(확인).
+- **남은 것:**
+  - 문서(`document`) 종류의 PDF·미리보기는 생성 파일(#49)·파일 변환(#22)과 함께.
+  - Chart.js처럼 CDN 스크립트를 쓰는 HTML의 실제 CDN 로드는 네트워크가 있을 때만 확인된다(시험의 프록시는 가짜 연결). 운영 Mac에서 수동 확인: `docs/ops.md` §18.4.
+  - 서비스 사용자(LaunchDaemon)가 개발 계정과 다르면 Playwright 캐시 위치가 다르다 — `EXPORT_BROWSER`를 설정한다(ops.md).

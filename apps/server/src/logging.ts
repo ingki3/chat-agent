@@ -24,6 +24,8 @@ import {
   isImportCode,
   isWebCode,
   isArtifactCode,
+  isExportCode,
+  isExportFormat,
   isLoginCode,
   isFinanceCode,
   isToolName,
@@ -64,6 +66,8 @@ export const LOG_EVENTS = [
   "artifact.finished",
   // Finance tool calls (#30): tool name, outcome code, duration and IDs — never the symbol, URL or numbers.
   "finance.finished",
+  // PNG/PDF export (#51): format, fixed outcome code, duration and IDs — never the title or the content.
+  "artifact.exported",
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",
@@ -164,6 +168,9 @@ const FIELDS = new Map<string, Check>([
   ["artifactCode", isArtifactCode],
   /** Why a finance tool call did not succeed (#30): one of the fixed `finance_*` codes. */
   ["financeCode", isFinanceCode],
+  /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
+  ["exportFormat", isExportFormat],
+  ["exportCode", isExportCode],
   ["category", isCategory],
   ["costUsd", isNum],
   ["inputTokens", isInt],
@@ -428,6 +435,8 @@ export type LogFields = {
   webCode?: string;
   artifactCode?: string;
   financeCode?: string;
+  exportFormat?: string;
+  exportCode?: string;
   category?: string;
   costUsd?: number;
   inputTokens?: number;

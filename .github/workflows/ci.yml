@@ -43,6 +43,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version-file: .node-version, cache: pnpm }
       - run: pnpm install --frozen-lockfile
+      # PNG/PDF export (#51): the renderer tests drive the real Chrome Headless Shell (they fail in CI without it).
+      - run: pnpm exec playwright install --with-deps --only-shell chromium
       - run: pnpm test
 
   build:

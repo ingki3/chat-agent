@@ -172,7 +172,8 @@ const PAGE_STYLE =
   "h1{font-size:16px;margin:0 0 12px}table{border-collapse:collapse}th,td{border:1px solid #dedad2;padding:4px 8px;text-align:left;vertical-align:top}" +
   "th{background:#f3f1ec;position:sticky;top:0}td.n{text-align:right;font-variant-numeric:tabular-nums}";
 
-const page = (title: string, inner: string) =>
+/** A plain page around server-made markup (charts, tables, exported text). */
+export const page = (title: string, inner: string) =>
   `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>${PAGE_STYLE}</style></head><body>${inner}</body></html>`;
 
 /** Series colours (distinct in light and dark, colour-blind friendly order). */
