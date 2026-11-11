@@ -34,11 +34,13 @@ import {
   installSkill,
   loadInstalledSkills,
   MANIFEST,
+  PINNED,
 } from "../src/mcp/install.js";
 import { mcpOptionsFromConfig } from "../src/mcp/routes.js";
 import { pythonRuntime } from "../src/mcp/python.js";
 import {
   McpService,
+  redactOutput,
   sandboxedSkillRunner,
   skillPolicy,
   SkillRefused,
@@ -62,7 +64,14 @@ afterEach(async () => {
 const tmp = (prefix = "skills-") => {
   const d = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
   closers.push(() => {
-    // Installed files are read-only; the folders are not, so a recursive remove works.
+    // Pinned copies have read-only folders: make them writable before removing.
+    const open = (x: string) => {
+      const st = fs.lstatSync(x, { throwIfNoEntry: false });
+      if (!st?.isDirectory()) return;
+      fs.chmodSync(x, 0o755);
+      for (const e of fs.readdirSync(x)) open(path.join(x, e));
+    };
+    open(d);
     fs.rmSync(d, { recursive: true, force: true });
   });
   return d;
@@ -548,7 +557,7 @@ describe("server skill folder: install copies only listed files, refuses links a
     expect(fs.statSync(path.join(installed, "scripts", "google_news_search.py")).mode & 0o222).toBe(0);
     expect(fs.lstatSync(installed).isSymbolicLink()).toBe(false);
     expect(fs.statSync(path.join(installed, "scripts", "google_news_search.py")).nlink).toBe(1);
-    expect(checkInstalled(GOOGLE_NEWS_SKILL, root)).toEqual({ state: "installed", dir: installed });
+    expect(checkInstalled(GOOGLE_NEWS_SKILL, root)).toMatchObject({ state: "installed", dir: installed });
     // Reinstalling replaces the copy in one step.
     fs.writeFileSync(path.join(dir, "scripts", "google_news_search.py"), "print('{\"v\":2}')\n");
     installSkill(GOOGLE_NEWS_SKILL, dir, root);
@@ -556,9 +565,31 @@ describe("server skill folder: install copies only listed files, refuses links a
     expect(fs.readdirSync(root)).toEqual(["google-news-search-skill"]);
     const { skills, states } = loadInstalledSkills(root, SKILL_SPECS);
     expect(states).toEqual({ "google-news-search-skill": "installed", "kr-stock-skill": "not_installed" });
-    expect(skills.map((s) => [s.name, s.entry])).toEqual([
-      ["google-news-search-skill", path.join(installed, "scripts", "google_news_search.py")],
-    ]);
+    // It runs from its pinned copy, not from the install folder.
+    expect(skills.map((s) => s.name)).toEqual(["google-news-search-skill"]);
+    expect(path.dirname(skills[0]!.dir)).toBe(path.join(fs.realpathSync(root), PINNED));
+    expect(skills[0]!.entry).toBe(path.join(skills[0]!.dir, "scripts", "google_news_search.py"));
+    expect(fs.readFileSync(skills[0]!.entry, "utf8")).toContain("v");
+  });
+
+  it("refuses a parent folder swapped for a symlink between the check and the open (review #85)", () => {
+    const outsideDir = tmp("outside-");
+    fs.writeFileSync(path.join(outsideDir, "google_news_search.py"), "OUTSIDE FILE");
+    const { dir } = sourceSkill();
+    const root = path.join(tmp("data-"), "skills");
+    let swapped = 0;
+    expect(() =>
+      installSkill(GOOGLE_NEWS_SKILL, dir, root, {
+        beforeOpen: () => {
+          // The checked path was fine; now its folder becomes a symlink to somewhere else.
+          fs.renameSync(path.join(dir, "scripts"), path.join(dir, "scripts-real"));
+          fs.symlinkSync(outsideDir, path.join(dir, "scripts"));
+          swapped++;
+        },
+      }),
+    ).toThrow(/symlink/);
+    expect(swapped).toBe(1);
+    expect(fs.existsSync(path.join(root, "google-news-search-skill"))).toBe(false);
   });
 
   it("refuses definitions whose files could escape the skill folder", () => {
@@ -766,6 +797,136 @@ describe("skill sandbox policy (#21 on #42)", () => {
     });
     expect(pythonRuntime(fake("x/bin/node").exe).ok).toBe(false);
     expect(pythonRuntime(fake("x/python3").exe).ok).toBe(false);
+  });
+});
+
+describe("pinned copies: what runs is what was verified (review #85)", () => {
+  function loaded() {
+    const src = tmp("src-");
+    const dir = path.join(src, "google-news-search-skill", "scripts");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "google_news_search.py"), "print('{}')\n");
+    const root = path.join(tmp("data-"), "skills");
+    installSkill(GOOGLE_NEWS_SKILL, path.join(src, "google-news-search-skill"), root);
+    const skill = loadInstalledSkills(root, SKILL_SPECS).skills[0]!;
+    const writable = (f: () => void) => {
+      fs.chmodSync(skill.dir, 0o755);
+      fs.chmodSync(path.join(skill.dir, "scripts"), 0o755);
+      f();
+    };
+    return { root, skill, writable, file: skill.entry };
+  }
+
+  it("is read-only, content-addressed, and passes its check while untouched", () => {
+    const { root, skill } = loaded();
+    expect(skill.verify!()).toBe(true);
+    expect(fs.statSync(skill.dir).mode & 0o222).toBe(0);
+    expect(fs.statSync(skill.entry).mode & 0o222).toBe(0);
+    // Loading again reuses the same pin; pins no longer used are removed.
+    const again = loadInstalledSkills(root, SKILL_SPECS).skills[0]!;
+    expect(again.dir).toBe(skill.dir);
+    fs.mkdirSync(path.join(root, PINNED, "stale"));
+    loadInstalledSkills(root, SKILL_SPECS);
+    expect(fs.readdirSync(path.join(root, PINNED))).toEqual([path.basename(skill.dir)]);
+  });
+
+  it("changing the install folder after loading does not change what runs", () => {
+    const { root, skill } = loaded();
+    const installed = path.join(root, "google-news-search-skill", "scripts", "google_news_search.py");
+    fs.chmodSync(installed, 0o644);
+    fs.writeFileSync(installed, "import os; os.system('id')");
+    expect(fs.readFileSync(skill.entry, "utf8")).toBe("print('{}')\n");
+    expect(skill.verify!()).toBe(true);
+  });
+
+  it("any change to the pinned copy fails the check before the run", () => {
+    let x = loaded();
+    x.writable(() => {
+      fs.chmodSync(x.file, 0o644);
+      fs.writeFileSync(x.file, "print('{\"evil\":1}')\n");
+    });
+    expect(x.skill.verify!()).toBe(false);
+
+    x = loaded();
+    x.writable(() => fs.writeFileSync(path.join(x.skill.dir, "scripts", "extra.txt"), "KEY"));
+    expect(x.skill.verify!()).toBe(false);
+
+    x = loaded();
+    const outside = path.join(tmp("outside-"), "evil.py");
+    fs.writeFileSync(outside, "print('{}')\n"); // same content, but a symlink to elsewhere
+    x.writable(() => {
+      fs.rmSync(x.file);
+      fs.symlinkSync(outside, x.file);
+    });
+    expect(x.skill.verify!()).toBe(false);
+
+    x = loaded();
+    x.writable(() => fs.linkSync(x.file, path.join(tmp("outside-"), "second.py")));
+    expect(x.skill.verify!()).toBe(false);
+
+    x = loaded();
+    const moved = path.join(tmp("moved-"), "pin");
+    fs.chmodSync(x.skill.dir, 0o755); // a read-only folder cannot move to another parent
+    fs.renameSync(x.skill.dir, moved);
+    fs.symlinkSync(moved, x.skill.dir); // the pinned folder itself swapped for a symlink
+    expect(x.skill.verify!()).toBe(false);
+
+    // Same content rewritten (new inode and mtime): the full hash still matches, so it passes.
+    x = loaded();
+    x.writable(() => {
+      const body = fs.readFileSync(x.file);
+      fs.rmSync(x.file);
+      fs.writeFileSync(x.file, body);
+    });
+    expect(x.skill.verify!()).toBe(true);
+  });
+
+  it("the runner refuses a skill whose check fails, before starting anything", async () => {
+    const run = sandboxedSkillRunner({ node: "/nonexistent/node" });
+    const r = await run(
+      { ...SELFTEST_SKILL, verify: () => false },
+      { text: "x" },
+      {
+        userId: "u",
+        conversationId: "c",
+        runId: "r",
+      },
+    );
+    expect(r).toEqual({ ok: false, code: "skill_changed" });
+  });
+});
+
+describe("secret redaction of skill results (review #85)", () => {
+  const S = "AVKEY12345";
+  const out = (stdout: string, secrets = [S]) => redactOutput(stdout, secrets);
+  it("plain, JSON-escaped, nested, in keys: the secret never comes back", () => {
+    expect(out(`{"k":"${S}"}`)).toEqual({ ok: true, output: { k: "[redacted]" } });
+    // \u escapes spell the secret only after parsing.
+    expect(out('{"secret":"\\u0041VKEY12345"}')).toEqual({ ok: true, output: { secret: "[redacted]" } });
+    expect(out('{"s":"AVKEY\\u00312345 tail"}')).toEqual({ ok: true, output: { s: "[redacted] tail" } });
+    expect(
+      // Escaped everywhere, so the raw text never contains the secret: only the decoded values do.
+      out(
+        JSON.stringify({ a: [{ b: [`x${S}y`, 1, null] }], [`key-${S}`]: { deep: { deeper: [S] } } })
+          .split(S)
+          .join("\\u0041VKEY12345"),
+      ),
+    ).toEqual({
+      ok: true,
+      output: {
+        a: [{ b: ["x[redacted]y", 1, null] }],
+        "key-[redacted]": { deep: { deeper: ["[redacted]"] } },
+      },
+    });
+    // A secret with characters JSON escapes (quote, backslash) is found after decoding.
+    const q = 'AV"KEY\\12345';
+    const r = out(JSON.stringify({ v: q, [q]: 1 }), [q]);
+    expect(JSON.stringify(r)).not.toContain(JSON.stringify(q).slice(1, -1));
+    expect(r).toEqual({ ok: true, output: { v: "[redacted]", "[redacted]": 1 } });
+  });
+  it("non-JSON output is refused without content; no secrets means untouched output", () => {
+    expect(out(`key is ${S}`)).toEqual({ ok: false, code: "skill_bad_output" });
+    expect(out(`{"k":"${S}"}`, [])).toEqual({ ok: true, output: { k: S } });
   });
 });
 

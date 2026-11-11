@@ -39,7 +39,12 @@ export type SkillSpec = SkillInfo & {
 };
 
 /** A skill ready to run: its definition plus where its files are. */
-export type BundledSkill = SkillSpec & { dir: string; entry: string };
+export type BundledSkill = SkillSpec & {
+  dir: string;
+  entry: string;
+  /** Re-checks the files just before a run (installed skills: their pinned copy is unchanged). */
+  verify?: () => boolean;
+};
 
 /**
  * One line of free text for a skill argument: no control characters, no shell metacharacters (no shell is ever

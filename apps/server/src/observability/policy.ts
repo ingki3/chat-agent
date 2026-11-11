@@ -97,6 +97,7 @@ export const SKILL_CODES = set([
   "skill_limit",
   "skill_failed",
   "skill_bad_output",
+  "skill_changed",
 ]);
 
 export const isRuntime = member(RUNTIMES);

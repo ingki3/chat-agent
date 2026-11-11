@@ -35,11 +35,40 @@ export function checkSpec(spec: Pick<SkillSpec, "name" | "files">): void {
     if (!REL.test(f)) throw new SkillInstallError(`${spec.name}: bad file ${JSON.stringify(f)}`);
 }
 
+/** macOS: fail if *any* component of the path is a symlink (not only the last one), as `openInside` does. */
+const O_NOFOLLOW_ANY = 0x20000000;
+
+/** Tests only: runs between the path check and the open (to swap a folder for a symlink in between). */
+export type OpenHook = (full: string) => void;
+
 /**
- * Reads one file of a source skill folder: a regular file reached without any symlink below the skill folder,
- * with a single link and a sane size. Opened with O_NOFOLLOW and checked on the descriptor.
+ * Opens `full` for reading so that no symlink anywhere on the path is followed, even one swapped in after the
+ * check: O_NOFOLLOW_ANY on macOS (the service's platform). Elsewhere (CI) O_NOFOLLOW guards the last component and
+ * the kernel's own path of the opened descriptor (`/proc/self/fd`) must be the checked path.
  */
-function readSourceFile(base: string, rel: string): Buffer {
+function openNoFollow(full: string): number {
+  const base = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+  if (process.platform === "darwin") return fs.openSync(full, base | O_NOFOLLOW_ANY);
+  const fd = fs.openSync(full, base | fs.constants.O_NOFOLLOW);
+  let real: string | undefined;
+  try {
+    real = fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    real = undefined;
+  }
+  if (real !== full) {
+    fs.closeSync(fd);
+    throw Object.assign(new Error("path changed"), { code: "ELOOP" });
+  }
+  return fd;
+}
+
+/**
+ * Reads one file of a skill folder (`base` is canonical): a regular file reached without any symlink below the
+ * folder — checked by path first, then enforced by the open itself (`openNoFollow`) — single-link, a sane size,
+ * and the very file that was checked (inode).
+ */
+function readSourceFile(base: string, rel: string, beforeOpen?: OpenHook): Buffer {
   const full = path.join(base, rel);
   let real: string;
   try {
@@ -48,12 +77,22 @@ function readSourceFile(base: string, rel: string): Buffer {
     throw new SkillInstallError(`missing file ${rel}`);
   }
   if (real !== full) throw new SkillInstallError(`${rel} goes through a symlink`);
-  const fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  beforeOpen?.(full);
+  let fd: number;
+  try {
+    fd = openNoFollow(full);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") throw new SkillInstallError(`${rel} goes through a symlink`);
+    throw new SkillInstallError(`cannot open ${rel}`);
+  }
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) throw new SkillInstallError(`${rel} is not a regular file`);
     if (st.nlink > 1) throw new SkillInstallError(`${rel} is hard-linked`);
     if (st.size > MAX_FILE_BYTES) throw new SkillInstallError(`${rel} is too large`);
+    const now = fs.lstatSync(full, { throwIfNoEntry: false });
+    if (!now || now.ino !== st.ino || now.dev !== st.dev) throw new SkillInstallError(`${rel} changed`);
     return fs.readFileSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -77,10 +116,15 @@ export function findSource(name: string, sources: readonly string[]): string | u
  * Copies the listed files of one skill from `sourceDir` into `<root>/<name>` (replacing an earlier install in one
  * rename) and writes the manifest with their hashes. Files are read-only. Nothing is linked.
  */
-export function installSkill(spec: SkillSpec, sourceDir: string, root: string): Manifest {
+export function installSkill(
+  spec: SkillSpec,
+  sourceDir: string,
+  root: string,
+  o: { beforeOpen?: OpenHook } = {},
+): Manifest {
   checkSpec(spec);
   const base = fs.realpathSync.native(sourceDir);
-  const contents = spec.files.map((rel) => [rel, readSourceFile(base, rel)] as const);
+  const contents = spec.files.map((rel) => [rel, readSourceFile(base, rel, o.beforeOpen)] as const);
   fs.mkdirSync(root, { recursive: true, mode: 0o755 });
   const rootReal = canonicalPath(root);
   const tmp = fs.mkdtempSync(path.join(rootReal, `.tmp-${spec.name}-`));
@@ -128,7 +172,10 @@ function listAll(dir: string): string[] {
  * Checks one installed skill: a real folder (not a symlink) holding exactly the manifest and the listed files —
  * regular, single-link, no symlink anywhere, same hashes as at install. Anything else is "broken" (not offered).
  */
-export function checkInstalled(spec: SkillSpec, root: string): { state: InstallState; dir?: string } {
+export function checkInstalled(
+  spec: SkillSpec,
+  root: string,
+): { state: InstallState; dir?: string; manifest?: Manifest; contents?: Map<string, Buffer> } {
   checkSpec(spec);
   const dir = path.join(root, spec.name);
   const st = fs.lstatSync(dir, { throwIfNoEntry: false });
@@ -154,25 +201,155 @@ export function checkInstalled(spec: SkillSpec, root: string): { state: InstallS
     );
     for (const e of listAll(real))
       if (e !== MANIFEST && !listed.includes(e) && !dirs.has(e)) return { state: "broken" };
-    for (const rel of listed)
-      if (sha256(readSourceFile(real, rel)) !== manifest.files[rel]) return { state: "broken" };
-    return { state: "installed", dir: real };
+    const contents = new Map<string, Buffer>();
+    for (const rel of listed) {
+      const data = readSourceFile(real, rel);
+      if (sha256(data) !== manifest.files[rel]) return { state: "broken" };
+      contents.set(rel, data);
+    }
+    return { state: "installed", dir: real, manifest, contents };
   } catch {
     return { state: "broken" };
   }
 }
 
-/** The installed, intact skills of `specs` in `root`, and the state of each definition. */
+/** Folder of the pinned copies, inside the skill folder (not a valid skill name, so never taken for a skill). */
+export const PINNED = ".pinned";
+
+type PinnedFile = { rel: string; sha: string; size: number; mtimeMs: number; ino: number; dev: number };
+type Pin = { dir: string; ino: number; dev: number; files: PinnedFile[]; entries: string[] };
+
+/** The relative folders a file list needs (`a/b/c.py` → `a`, `a/b`). */
+const parentsOf = (files: readonly string[]) =>
+  new Set(
+    files.flatMap((f) =>
+      f
+        .split("/")
+        .slice(0, -1)
+        .map((_, i, a) => a.slice(0, i + 1).join("/")),
+    ),
+  );
+
+/** Removes a pinned copy (its folders are read-only). */
+function removePinned(dir: string): void {
+  if (!fs.existsSync(dir)) return;
+  const walk = (d: string) => {
+    fs.chmodSync(d, 0o755);
+    for (const e of fs.readdirSync(d, { withFileTypes: true }))
+      if (e.isDirectory()) walk(path.join(d, e.name));
+  };
+  walk(dir);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+/**
+ * Checks a pinned copy: the same folder (inode), exactly the expected entries, and each file the same regular
+ * single-link file — by inode, size and mtime (cheap), or else by its full hash.
+ */
+export function verifyPinned(pin: Pin): boolean {
+  try {
+    const st = fs.lstatSync(pin.dir);
+    if (!st.isDirectory() || st.ino !== pin.ino || st.dev !== pin.dev) return false;
+    if (JSON.stringify(listAll(pin.dir).sort()) !== JSON.stringify(pin.entries)) return false;
+    for (const f of pin.files) {
+      const fst = fs.lstatSync(path.join(pin.dir, f.rel));
+      if (!fst.isFile() || fst.nlink !== 1) return false;
+      const same = fst.ino === f.ino && fst.dev === f.dev && fst.size === f.size && fst.mtimeMs === f.mtimeMs;
+      if (!same && sha256(readSourceFile(pin.dir, f.rel)) !== f.sha) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pins a verified installed skill: its checked contents are written to `<root>/.pinned/<hash of the manifest>/`
+ * (content-addressed, files and folders read-only) and the skill runs only from there. An existing pin with the
+ * same hash is reused when it is still intact, else rewritten. Returns the pin record for `verifyPinned`.
+ */
+function pinSkill(manifest: Manifest, contents: Map<string, Buffer>, root: string): Pin {
+  const id = sha256(
+    Buffer.from(JSON.stringify([manifest.name, Object.entries(manifest.files).sort()]), "utf8"),
+  );
+  const pinned = path.join(root, PINNED);
+  fs.mkdirSync(pinned, { recursive: true, mode: 0o755 });
+  const dir = path.join(canonicalPath(pinned), id);
+  const rels = [...contents.keys()].sort();
+  const entries = [...rels, ...parentsOf(rels)].sort();
+  const record = (): Pin => {
+    const st = fs.lstatSync(dir);
+    return {
+      dir,
+      ino: st.ino,
+      dev: st.dev,
+      entries,
+      files: rels.map((rel) => {
+        const f = fs.lstatSync(path.join(dir, rel));
+        return { rel, sha: manifest.files[rel]!, size: f.size, mtimeMs: f.mtimeMs, ino: f.ino, dev: f.dev };
+      }),
+    };
+  };
+  if (fs.existsSync(dir)) {
+    try {
+      const existing = record();
+      // Full check of what was there before (a stale pin may have been changed while the server was down).
+      if (verifyPinned({ ...existing, files: existing.files.map((f) => ({ ...f, ino: -1 })) }))
+        return existing;
+    } catch {
+      // rewritten below
+    }
+    removePinned(dir);
+  }
+  const tmp = fs.mkdtempSync(path.join(canonicalPath(pinned), ".tmp-"));
+  try {
+    for (const rel of rels) {
+      const dst = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o755 });
+      fs.writeFileSync(dst, contents.get(rel)!, { flag: "wx", mode: 0o444 });
+    }
+    for (const d of [...parentsOf(rels)].sort().reverse()) fs.chmodSync(path.join(tmp, d), 0o555);
+    fs.chmodSync(tmp, 0o555);
+    fs.renameSync(tmp, dir);
+  } catch (e) {
+    removePinned(tmp);
+    throw e;
+  }
+  return record();
+}
+
+/**
+ * The installed, intact skills of `specs` in `root` — each pinned (see `pinSkill`) and re-checked before every run
+ * (`verify`) — and the state of each definition. Pins no longer used are removed.
+ */
 export function loadInstalledSkills(
   root: string,
   specs: readonly SkillSpec[],
 ): { skills: BundledSkill[]; states: Record<string, InstallState> } {
   const skills: BundledSkill[] = [];
   const states: Record<string, InstallState> = {};
+  const used = new Set<string>();
   for (const spec of specs) {
     const r = checkInstalled(spec, root);
     states[spec.name] = r.state;
-    if (r.dir) skills.push({ ...spec, dir: r.dir, entry: path.join(r.dir, spec.files[0]!) });
+    if (!r.dir || !r.manifest || !r.contents) continue;
+    let pin: Pin;
+    try {
+      pin = pinSkill(r.manifest, r.contents, root);
+    } catch {
+      states[spec.name] = "broken";
+      continue;
+    }
+    used.add(path.basename(pin.dir));
+    skills.push({
+      ...spec,
+      dir: pin.dir,
+      entry: path.join(pin.dir, spec.files[0]!),
+      verify: () => verifyPinned(pin),
+    });
   }
+  const pinned = path.join(root, PINNED);
+  if (fs.existsSync(pinned))
+    for (const e of fs.readdirSync(pinned)) if (!used.has(e)) removePinned(path.join(pinned, e));
   return { skills, states };
 }

@@ -351,7 +351,8 @@ rm ~/.agentlee/probe-headers.txt
 
 ### 15.1 스킬이 있는 곳
 - **원본:** 관리자 스킬 폴더 `~/.agents/skills`, `~/.claude/skills`(바꾸려면 `.env`의 `SKILL_SOURCES=경로1:경로2`). 서버는 이 폴더를 읽지 않는다.
-- **서버 사본:** `<DATA_DIR>/skills/<스킬>/`. 정의(`packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`)에 적힌 파일과 `.agentlee-skill.json`(파일 해시)만 들어 있다. 이 폴더에 다른 파일을 두거나 파일을 고치면 그 스킬은 `broken`이 되어 제공되지 않는다.
+- **서버 사본:** `<DATA_DIR>/skills/<스킬>/`. 서버는 시작할 때 이것을 검사하고, 통과한 내용을 `<DATA_DIR>/skills/.pinned/<해시>/`(읽기 전용)에 고정해 그 사본만 실행한다. 고정 사본은 서버가 관리하므로 손대지 않는다. 바뀌면 그 스킬 호출은 `skill_changed`로 거부된다.
+- 설치 폴더 `<DATA_DIR>/skills/<스킬>/`에는 정의(`packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`)에 적힌 파일과 `.agentlee-skill.json`(파일 해시)만 들어 있다. 이 폴더에 다른 파일을 두거나 파일을 고치면 다음 시작 때 그 스킬은 `broken`이 되어 제공되지 않는다(실행 중인 서버는 고정 사본을 계속 쓴다).
 - **python:** python 스킬은 독립 실행형 python이 있어야 돈다. Homebrew python은 샌드박스에서 못 쓴다(isolation.md).
   ```
   uv python install 3.12

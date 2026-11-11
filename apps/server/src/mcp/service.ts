@@ -144,6 +144,8 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
       return { ok: false, code: e instanceof SkillRefused ? e.code : "skill_unavailable" };
     }
     const { secretValues, ...run } = policy;
+    // An installed skill runs only from its pinned copy, checked again right before each run (install.ts).
+    if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
     let r;
     try {
       r = await runIsolated({
@@ -160,14 +162,51 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
     if (r.code === null || !(skill.okExitCodes ?? [0]).includes(r.code) || !r.stdout.trim())
       return { ok: false, code: "skill_failed" };
     // A skill must never hand a secret back to the model (an API echoing its key, a debug print).
-    let out = r.stdout;
-    for (const v of secretValues) out = out.split(v).join("[redacted]");
-    try {
-      return { ok: true, output: JSON.parse(out) as unknown };
-    } catch {
-      return { ok: false, code: "skill_bad_output" };
-    }
+    return redactOutput(r.stdout, secretValues);
   };
+}
+
+const REDACTED = "[redacted]";
+
+/** Replaces every occurrence of a secret in one string. */
+const scrub = (t: string, secrets: readonly string[]) => {
+  let out = t;
+  for (const v of secrets) out = out.split(v).join(REDACTED);
+  return out;
+};
+
+/** Every string value and object key, recursively, with secrets replaced (after JSON escapes were decoded). */
+export function redactValue(v: unknown, secrets: readonly string[]): unknown {
+  if (typeof v === "string") return scrub(v, secrets);
+  if (Array.isArray(v)) return v.map((x) => redactValue(x, secrets));
+  if (v && typeof v === "object")
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
+        scrub(k, secrets),
+        redactValue(x, secrets),
+      ]),
+    );
+  return v;
+}
+
+/**
+ * A skill's stdout as its result, with no secret left in it. The raw text is scrubbed first (non-JSON output
+ * never gets back anyway: it is refused), then — because JSON escapes such as `\u0041` or `\"` can spell a
+ * secret the raw text does not contain — every decoded string and key is scrubbed again. A result that still
+ * contains a secret after that is refused, not returned.
+ */
+export function redactOutput(stdout: string, secrets: readonly string[]): SkillResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(scrub(stdout, secrets));
+  } catch {
+    return { ok: false, code: "skill_bad_output" };
+  }
+  if (!secrets.length) return { ok: true, output: parsed };
+  const output = redactValue(parsed, secrets);
+  const text = JSON.stringify(output);
+  if (secrets.some((v) => text.includes(v))) return { ok: false, code: "skill_bad_output" };
+  return { ok: true, output };
 }
 
 /** At most this many skill processes at once — in total and per run. Beyond that a call is refused at once. */
