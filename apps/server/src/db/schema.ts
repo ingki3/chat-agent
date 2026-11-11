@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 const now = sql`(unixepoch() * 1000)`;
 
@@ -386,4 +386,50 @@ export const runtimePolicies = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
   },
   (t) => [primaryKey({ columns: [t.userId, t.runtime] })],
+);
+
+/**
+ * Usage records (#44, PRD FR-9): one row per run attempt — tokens, raw cost and request count, never content.
+ * Keyed on (`run_id`, `attempt`): every usage event of the same attempt updates the same row (the last report
+ * wins, see `RuntimeEvent` "usage"), so reconnects, duplicate events and a stop cannot add a second row.
+ * - `run_id`: the run (`runs.id`) for purposes that run in a conversation; for `connection_test` the test's own
+ *   id (there is no run row). No foreign keys on run, conversation or connection: usage outlives a deleted
+ *   conversation or a disconnected connection (the FR-9.3 totals must not shrink).
+ * - Token columns and `cost_usd` are NULL when the runtime did not report them (not 0).
+ * - `cost_usd` is the runtime's own figure (API key connections, Claude); the price table and the screen are #32.
+ */
+export const usageRecords = sqliteTable(
+  "usage_records",
+  {
+    id: integer("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Null for purposes outside a conversation (connection tests). */
+    conversationId: text("conversation_id"),
+    runId: text("run_id").notNull(),
+    /** 1, 2, … within the run: one session open + turn sent for the same reply (see runs.ts `Live.attempt`). */
+    attempt: integer("attempt").notNull(),
+    runtime: text("runtime").notNull(),
+    model: text("model").notNull(),
+    connectionId: text("connection_id"),
+    purpose: text("purpose", {
+      enum: ["chat", "schedule", "title", "summary", "connection_test"],
+    }).notNull(),
+    /** All input tokens, cached ones included (as the adapter contract reports them). */
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    cacheReadTokens: integer("cache_read_tokens"),
+    cacheWriteTokens: integer("cache_write_tokens"),
+    costUsd: real("cost_usd"),
+    /** Requests sent to the runtime in this attempt: one turn = 1. */
+    requestCount: integer("request_count").notNull().default(1),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("usage_records_run_attempt_idx").on(t.runId, t.attempt),
+    index("usage_records_user_created_idx").on(t.userId, t.createdAt),
+    index("usage_records_created_idx").on(t.createdAt),
+  ],
 );

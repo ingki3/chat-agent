@@ -22,7 +22,10 @@ import {
   type RuntimeSession,
   type RuntimeTurn,
   type StartContext,
+  type UsageReport,
+  usageReport,
 } from "./adapter.js";
+import type { UsageAttempt, UsagePurpose } from "../usage/store.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
@@ -62,10 +65,17 @@ type Live = {
   graceTimer?: NodeJS.Timeout;
   /** Set once the session is being closed, so it is closed exactly once whoever ends the run. */
   closing?: Promise<void>;
-  /** Totals for the run's log record (#46): cost and tokens, never content. */
-  costUsd?: number;
-  inputTokens: number;
-  outputTokens: number;
+  /**
+   * The run's current attempt (#44): 0 before the first one. An attempt is one session open + the turn sent on it
+   * for this reply. The run manager opens one per run today; a retry or a runtime/model fallback inside the same
+   * run (#19) must call `nextAttempt` before it opens its session, so its usage gets a row of its own. Reconnects
+   * of the browser's stream are not attempts (nothing is sent to the runtime).
+   */
+  attempt: number;
+  /** What the run's usage is recorded as (#44): `chat`, or `schedule` for scheduled runs (#33). */
+  purpose: UsagePurpose;
+  /** The last usage report of each attempt (last one wins, see `UsageReport`) — the log record's totals (#46). */
+  usage: Map<number, UsageReport>;
   /** Open tool calls: name and start time, for the tool's duration. */
   tools: Map<string, { name: string; startedAt: number }>;
   /** What made the run fail, for the log (class name and code only are ever written). */
@@ -101,6 +111,24 @@ function fireInterrupt(live: Live): void {
   } catch {
     // synchronous throw from the adapter: the grace timer / settle path ends the run anyway
   }
+}
+
+/** Starts the run's next attempt (#44) and returns its number. */
+function nextAttempt(live: Live): number {
+  return ++live.attempt;
+}
+
+/** The run's totals over its attempts, for the log record: each attempt's last report. */
+function usageTotals(live: Live): { inputTokens: number; outputTokens: number; costUsd?: number } {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let costUsd: number | undefined;
+  for (const u of live.usage.values()) {
+    inputTokens += u.inputTokens ?? 0;
+    outputTokens += u.outputTokens ?? 0;
+    if (u.costUsd !== undefined) costUsd = (costUsd ?? 0) + u.costUsd;
+  }
+  return { inputTokens, outputTokens, ...(costUsd === undefined ? {} : { costUsd }) };
 }
 
 export const EVENT_RETENTION_MS = 3600_000;
@@ -180,6 +208,11 @@ export type RunManagerOptions = {
   log?: EventLogger;
   /** Recent errors for the admin screen (#46). */
   errors?: ErrorLog;
+  /**
+   * Usage storage (#44): every usage event is written at once — keyed on (run, attempt), the last report of an
+   * attempt wins — so a run that is stopped or fails keeps what its runtime reported until then.
+   */
+  usage?: { record(a: UsageAttempt, u: UsageReport): void };
   /**
    * Runtime connections (#17). `resolve` checks the run's runtime, model, effort and connection (throws
    * `RunAccessDenied` → 403, inside the begin transaction so nothing is created) and picks the connection;
@@ -286,6 +319,8 @@ export class RunManager {
     idempotencyKey?: string | undefined;
     /** Runtime, model, effort and connection asked for by the request (#17); checked by `opts.connections`. */
     choice?: RunChoice | undefined;
+    /** What its usage is recorded as (#44). Default `chat`; scheduled runs (#33) pass `schedule`. */
+    purpose?: UsagePurpose | undefined;
     prepare: () => { user: MessageRow | null; assistant: MessageRow };
   }): { run: RunRow; user: MessageRow | null; assistant: MessageRow; reused: boolean } {
     if (this.stopping) throw new ShuttingDownError();
@@ -383,8 +418,9 @@ export class RunManager {
         parts: [],
         interruptRequested: false,
         settled: false,
-        inputTokens: 0,
-        outputTokens: 0,
+        attempt: 0,
+        purpose: input.purpose ?? "chat",
+        usage: new Map(),
         tools: new Map(),
       });
       const live = this.live.get(run.id)!;
@@ -597,11 +633,41 @@ export class RunManager {
       status,
       durationMs: this.now() - r.createdAt,
       ...(code ? { errorCode: code, category: runFailureCategory(code) } : {}),
-      ...(live?.costUsd === undefined ? {} : { costUsd: live.costUsd }),
-      ...(live ? { inputTokens: live.inputTokens, outputTokens: live.outputTokens } : {}),
+      ...(live ? usageTotals(live) : {}),
       ...(failed && live?.failure !== undefined ? { err: live.failure } : {}),
     });
     if (code) this.opts.errors?.record({ source: "run", code, category: runFailureCategory(code), ...ids });
+  }
+
+  /**
+   * Writes an attempt's usage (#44). A storage failure is logged (IDs and codes only) and does not fail the reply.
+   */
+  private recordUsage(run: RunRow, live: Live, attempt: number, report: UsageReport): void {
+    try {
+      this.opts.usage?.record(
+        {
+          userId: run.userId,
+          conversationId: run.conversationId,
+          runId: run.id,
+          attempt,
+          runtime: run.runtime,
+          model: run.model,
+          connectionId: run.connectionId,
+          purpose: live.purpose,
+        },
+        report,
+      );
+    } catch (e) {
+      logEvent(this.opts.log, "warn", "usage.record_failed", {
+        userId: run.userId,
+        conversationId: run.conversationId,
+        runId: run.id,
+        runtime: run.runtime,
+        attempt,
+        purpose: live.purpose,
+        err: e,
+      });
+    }
   }
 
   private toolEnded(run: RunRow, live: Live, callId: string, isError: boolean): void {
@@ -757,6 +823,8 @@ export class RunManager {
       status: "done",
       code: null,
     };
+    // One attempt = this session open + the turn below (#44).
+    const attempt = nextAttempt(live);
     try {
       const { session, sessionRowId, revision } = await this.openSession(
         run,
@@ -793,16 +861,17 @@ export class RunManager {
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
           flush(true);
         } else if (ev.type === "usage") {
-          live.inputTokens += ev.inputTokens;
-          live.outputTokens += ev.outputTokens;
-          if (ev.costUsd !== undefined) live.costUsd = (live.costUsd ?? 0) + ev.costUsd;
+          // The attempt's usage so far: replaces the attempt's earlier report, in memory and in storage (#44).
+          const report = usageReport(ev);
+          live.usage.set(attempt, report);
+          this.recordUsage(run, live, attempt, report);
           this.emit(runId, {
             type: "usage",
             messageId,
-            inputTokens: ev.inputTokens,
-            outputTokens: ev.outputTokens,
+            inputTokens: ev.inputTokens ?? 0,
+            outputTokens: ev.outputTokens ?? 0,
             ...(ev.costUsd === undefined ? {} : { costUsd: ev.costUsd }),
-          }); // stored per run/attempt by #44
+          });
         } else if (ev.type === "notice") {
           this.emit(runId, ev);
         } else if (ev.type === "limit") {

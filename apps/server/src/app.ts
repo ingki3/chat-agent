@@ -23,6 +23,7 @@ import { registerConnectionRoutes } from "./connections/routes.js";
 import { ConnectionService } from "./connections/service.js";
 import { ConnectionStore } from "./connections/store.js";
 import { ConnectionTester } from "./connections/tester.js";
+import { UsageStore } from "./usage/store.js";
 import { CLAUDE_EGRESS_HOSTS, CODEX_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
@@ -215,6 +216,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
+    // Usage records (#44): replies and connection tests write here, keyed on run and attempt.
+    const usage = new UsageStore(opts.db!);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       ...mcpOptionsFromConfig(config),
@@ -223,13 +226,14 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const connections = new ConnectionService(
       connectionStore,
       users,
-      new ConnectionTester(runtimes, mcp, mcpTokens, opts.connectionTest),
+      new ConnectionTester(runtimes, mcp, mcpTokens, { usage, log: app.log, ...opts.connectionTest }),
       runtimes,
       app.log,
     );
     app.decorate("connections", connections);
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       mcp,
+      usage,
       mcpTokens,
       connections: {
         resolve: (input) => connections.access.resolve(input),

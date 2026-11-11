@@ -7,8 +7,12 @@ import {
   type RuntimeSession,
   type RuntimeTurn,
   type StartContext,
+  type UsageReport,
+  usageReport,
 } from "../runtime/adapter.js";
+import type { UsageAttempt } from "../usage/store.js";
 import { OUR_TOOL_PREFIX } from "../runtime/lockdown.js";
+import { logEvent, type EventLogger } from "../logging.js";
 
 /** The verification skill's tool (#43). */
 export const TEST_SKILL_TOOL = "skill_selftest";
@@ -72,7 +76,13 @@ export class ConnectionTester {
     private readonly registry: RuntimeRegistry,
     private readonly mcp: TestMcp | undefined,
     private readonly tokens: McpTokens,
-    private readonly opts: { timeoutMs?: number } = {},
+    private readonly opts: {
+      timeoutMs?: number;
+      /** Usage storage (#44): a test's usage is kept with purpose `connection_test`, on its connection. */
+      usage?: { record(a: UsageAttempt, u: UsageReport): void } | undefined;
+      /** Structured log (#46): `usage.record_failed` with IDs and codes only. */
+      log?: EventLogger | undefined;
+    } = {},
   ) {}
 
   /**
@@ -111,6 +121,8 @@ export class ConnectionTester {
     let deltas = 0;
     const calls = new Map<string, string>();
     const results: { name: string; output: unknown }[] = [];
+    /** The runtime reported a usage limit: the test fails with it, after the turn's final usage has been read. */
+    let limited = false;
     try {
       const ctx: StartContext = {
         // Not a real conversation: the MCP token is scoped to this test only, and nothing is stored.
@@ -176,7 +188,7 @@ export class ConnectionTester {
         const next = await Promise.race([iterator.next(), deadline]);
         if (next === "timeout" || next === "cancelled") {
           void turn.interrupt().catch(() => {});
-          return fail(next);
+          return fail(next === "timeout" && limited ? "usage_limit" : next);
         }
         if (next.done) break;
         const ev = next.value;
@@ -186,10 +198,42 @@ export class ConnectionTester {
         } else if (ev.type === "tool_start") calls.set(ev.callId, bare(ev.name));
         else if (ev.type === "tool_end" && !ev.isError)
           results.push({ name: calls.get(ev.callId) ?? "", output: ev.output });
-        else if (ev.type === "limit") return fail("usage_limit");
+        else if (ev.type === "usage") {
+          // One session open + one turn: the test is a single attempt, keyed on its own id (no run row).
+          const report = usageReport(ev);
+          try {
+            this.opts.usage?.record(
+              {
+                userId: input.userId,
+                conversationId: null,
+                runId,
+                attempt: 1,
+                runtime: input.runtime,
+                model,
+                connectionId: input.connectionId,
+                purpose: "connection_test",
+              },
+              report,
+            );
+          } catch (e) {
+            // Losing a test's usage row must not change the test's outcome; it is logged like a run's (#44).
+            logEvent(this.opts.log, "warn", "usage.record_failed", {
+              userId: input.userId,
+              runId,
+              runtime: input.runtime,
+              connectionId: input.connectionId,
+              attempt: 1,
+              purpose: "connection_test",
+              err: e,
+            });
+          }
+        } else if (ev.type === "limit") limited = true; // the turn's final usage still follows (Claude `result`)
       }
+      if (limited) return fail("usage_limit");
     } catch (e) {
-      if (stopped) return fail(stopped);
+      // A cancel stays a cancel (never recorded); a time-out after a limit is the limit.
+      if (stopped) return fail(stopped === "timeout" && limited ? "usage_limit" : stopped);
+      if (limited) return fail("usage_limit");
       return fail(e instanceof RuntimeFailure ? e.code : "runtime_error");
     } finally {
       clearTimeout(timer);

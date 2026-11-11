@@ -319,6 +319,20 @@ describe("Claude adapter (#15): settings it hands to the SDK", () => {
     expect(log.options[0]!.verbatimPrompts).toBe(true);
   });
 
+  it("leaves out usage figures the SDK does not report (stored as NULL, #44)", async () => {
+    const { a } = adapter({
+      x: [
+        sdk.init({ session: "s" }),
+        sdk.delta("ok"),
+        { ...(sdk.result() as object), usage: { output_tokens: 3 }, total_cost_usd: undefined } as SDKMessage,
+      ],
+    });
+    const s = await a.start(ctx());
+    const ev = await collect(s.turn({ text: "x", model: "claude-haiku-5-5" }).events);
+    const u = ev.find((e) => e.type === "usage")!;
+    expect(u).toStrictEqual({ type: "usage", outputTokens: 3 });
+  });
+
   it("reports per-turn cost although the SDK's total runs on across resumes", async () => {
     const withCost = (session: string, total: number): SDKMessage[] => [
       sdk.init({ session }),

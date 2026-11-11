@@ -14,6 +14,7 @@
 | 서버 전용 스킬 폴더 (#21) | `<DATA_DIR>/skills/<스킬>/` (허용 목록 스킬의 복사본, 읽기 전용) | `pnpm skills:install` — 15절 | 포함(코드일 뿐, 비밀 없음) |
 | 스킬 비밀 (#21) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY` | 15.3절 | `.env`와 같다 |
 | 런타임 연결 키·토큰 (#17) | DB `connections.secret`(마스터 키로 암호화) | 설정 → 내 런타임 연결, 관리자 API — 11절 | DB와 함께 포함(암호문) |
+| 사용량 기록 (#44) | DB `usage_records` 표 — 실행 시도(run·attempt)마다 1행, 토큰·원시 비용·요청 수만(내용 없음) | — | DB와 함께 포함 — 16절 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
@@ -162,8 +163,8 @@ rm ~/.agentlee/probe-headers.txt
 
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`). 로그 파일을 열거나 쓰지 못해도(디스크 가득, 권한 등) 서버는 시작하고 계속 돌며 그 줄만 버린다(파일에는 완전한 JSON 줄만 남는다 — 중간에 끊긴 줄은 잘라낸다). 다시 쓸 수 있게 되면 `log.line_dropped` 레코드에 버린 줄 수(`dropped`)를 남긴다.
 - 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + 우리 MCP 서버의 도구, 예 `mcp__agentlee__echo_time` — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
-  - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`.
-  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
+  - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`, 사용량(#44): `attempt` `purpose`.
+  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), 사용량(#44) `usage.record_failed`(사용량 행을 쓰지 못함: ID·`attempt`·`purpose`·오류 코드만 — 응답은 계속된다), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
   - `pnpm test`의 유출 fixture 테스트(`apps/server/test/observability.test.ts`)가 대화 문장·키 패턴·쿠키·헤더·접속 코드·이메일을 요청·오류·실행·도구로 흘려 보내고, 로그와 관리자 오류 목록에 하나라도 나오면 실패한다.
 - 읽기:
@@ -449,3 +450,26 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
    ```
    `TEST_SKILL_PYTHON` 또는 uv가 필요하다.
 5. `pnpm skills:install <이름>` 후 재시작한다.
+
+## 16. 사용량 기록 (#44)
+
+사용량은 DB `usage_records` 표에 있다(PRD FR-9). 화면·비용 계산·월 집계는 #32에서 붙는다. 그 전에는 SQLite로 직접 본다.
+
+- **행 하나 = 실행 시도(attempt) 하나.** 키는 (`run_id`, `attempt`)이고 유일 인덱스가 걸려 있다.
+  - **attempt**: 같은 답변을 위해 런타임 세션을 열고 턴을 한 번 보낸 것. 지금 실행 관리자는 실행마다 1번만 연다(항상 `attempt = 1`). 같은 실행 안의 재시도나 런타임·모델 대체(#19)는 세션을 열기 전에 `nextAttempt`를 불러 새 attempt가 된다 → 행이 하나 더 생긴다.
+  - "다시 생성"·다음 메시지는 새 실행이라 새 `run_id`다. 브라우저 재연결(`Last-Event-ID`)은 런타임에 아무것도 보내지 않으므로 attempt가 아니고 행도 늘지 않는다.
+- **usage 규칙(어댑터 계약, `runtime/adapter.ts`의 `UsageReport`)**: `usage` 이벤트는 그 attempt의 **지금까지 전체 사용량**이다(증분이 아님). 같은 attempt에 다시 오면 앞의 값을 **바꾼다(마지막 값이 이긴다)** — upsert. 그래서 중복 이벤트·재연결·중지가 행을 늘리거나 두 번 세지 않는다. Claude(`result`)와 Codex(`turn/completed`)는 턴 끝에 한 번 보내고, 세션 누적값(`total_cost_usd`, `tokenUsage.total`)은 그 턴의 차이로 바꿔 보낸다.
+- **언제 쓰나**: `usage` 이벤트가 올 때마다 바로 쓴다. 그래서 **중지되거나 실패한 실행도** 그때까지 온 사용량이 남는다(Claude는 중지 후에도 마지막 `result`로 사용량을 보낸다). 중지 유예 시간이 지나 강제로 끝난 뒤에 오는 이벤트는 버린다.
+- **열**: `user_id` `conversation_id`(연결 테스트는 NULL) `run_id`(연결 테스트는 테스트 자체 ID) `attempt` `runtime` `model` `connection_id` `purpose`(`chat`·`schedule`·`title`·`summary`·`connection_test`) `input_tokens`(캐시 포함 전체 입력) `output_tokens` `cache_read_tokens` `cache_write_tokens` `cost_usd`(런타임이 준 원시 비용) `request_count`(attempt당 1) `created_at` `updated_at`.
+  - 런타임이 주지 않은 값은 0이 아니라 **NULL**이다.
+  - 프롬프트·답변·도구 입출력 같은 **내용은 저장하지 않는다**.
+  - 행을 쓰지 못하면(디스크·DB 오류) 답변·연결 테스트 결과는 그대로이고 `usage.record_failed` 로그(ID·`attempt`·`purpose`·오류 코드만)가 남는다.
+  - 대화·실행·연결에 외래 키가 없다: 대화를 지우거나 연결을 해제해도 사용량은 남는다(월 합계가 줄지 않게).
+- **목적(purpose)**: 답변은 `chat`, 연결 테스트(#17)는 `connection_test`(연결에 묶이고 대화는 없음). 한도에 걸린 연결 테스트도 턴의 마지막 사용량(Claude `rate_limit` 다음의 `result`)까지 읽어 기록한 뒤 `usage_limit`으로 끝난다. 제목·요약(#45)·예약(#33)은 `UsageStore.record`를 같은 방식으로 자기 목적으로 부른다.
+- 보기(읽기 전용):
+  ```bash
+  sqlite3 -readonly data/agentlee.db \
+    "select date(created_at/1000,'unixepoch','localtime') d, user_id, runtime, model, purpose,
+            count(*) attempts, sum(input_tokens) input, sum(output_tokens) output, round(sum(cost_usd),4) usd
+       from usage_records group by d, user_id, runtime, model, purpose order by d desc;"
+  ```

@@ -93,6 +93,7 @@ describe("database", () => {
       "runtime_sessions",
       "sessions",
       "settings",
+      "usage_records",
       "users",
     ]);
     expect(db.$client.pragma("foreign_keys", { simple: true })).toBe(1);

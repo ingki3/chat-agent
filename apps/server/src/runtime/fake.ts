@@ -11,6 +11,7 @@ import {
   type RuntimeTurn,
   type StartContext,
   type TurnInput,
+  type UsageReport,
 } from "./adapter.js";
 
 /**
@@ -26,7 +27,7 @@ export type FakeStep =
   | { reasoning: string }
   | { delayMs: number }
   | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
-  | { usage: { inputTokens: number; outputTokens: number; costUsd?: number } }
+  | { usage: UsageReport }
   | { notice: string }
   | { limit: string }
   | { fail: string; code?: RuntimeFailure["code"] };
@@ -51,6 +52,8 @@ function connectionTestSteps(text: string): FakeStep[] {
       },
     },
     { text: "OK" },
+    // A test costs something too (#44): recorded with purpose `connection_test`.
+    { usage: { inputTokens: 40, outputTokens: 1, costUsd: 0.0002 } },
   ];
 }
 

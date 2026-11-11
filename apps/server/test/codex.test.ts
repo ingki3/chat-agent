@@ -165,6 +165,26 @@ describe("Codex adapter (#16): event translation", () => {
     ]);
   });
 
+  it("a token figure codex does not report is left out, not 0 (stored as NULL, #44)", async () => {
+    const { a } = adapter({
+      x: [
+        cx.item("started", { type: "userMessage", id: "u1" }),
+        cx.delta("ok"),
+        cx.usage({ inputTokens: 50, outputTokens: 4 }, { inputTokens: 50, outputTokens: 4 }),
+        cx.completed("completed"),
+      ],
+    });
+    const s = await a.start(ctx());
+    const ev = await collect(s.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    expect(ev.find((e) => e.type === "usage")).toStrictEqual({
+      type: "usage",
+      inputTokens: 50,
+      outputTokens: 4,
+      cacheReadTokens: undefined,
+      cacheWriteTokens: undefined,
+    });
+  });
+
   it("a multi-byte character split across stdout chunks stays whole", async () => {
     const root = tmp();
     const log = newLog();

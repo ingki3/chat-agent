@@ -1,5 +1,6 @@
 import os from "node:os";
 import { NotificationKind, RuntimeId } from "@agentlee/shared";
+import { USAGE_PURPOSES } from "../usage/store.js";
 
 /**
  * What may be written about an event (#46), shared by the log sanitiser and the recent-error store.
@@ -132,6 +133,7 @@ export const isImportCode = member(
     "not_found",
   ]),
 );
+export const isUsagePurpose = member(set(USAGE_PURPOSES));
 export const isConnectionScope = member(set(["shared", "personal"]));
 export const isAuthType = member(set(["api_key", "subscription"]));
 

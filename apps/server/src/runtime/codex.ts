@@ -801,8 +801,14 @@ export class CodexAdapter implements RuntimeAdapter {
                 status?: unknown;
                 error?: { codexErrorInfo?: unknown } | null;
               };
+              // The turn's share, once, at its end: one usage event per attempt (#44). A figure Codex does not
+              // report stays out (NULL) instead of becoming 0.
               if (usage) {
-                const d = (k: string) => Math.max(0, num(usage!.total, k) - num(usage!.baseline, k));
+                const u = usage;
+                const d = (k: string) =>
+                  typeof u.total[k] === "number"
+                    ? Math.max(0, num(u.total, k) - num(u.baseline, k))
+                    : undefined;
                 push({
                   type: "usage",
                   inputTokens: d("inputTokens"),
