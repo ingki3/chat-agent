@@ -278,6 +278,32 @@ MCP 도구 `web_search(query)`·`web_fetch(url)`이다(`packages/mcp-tools/src/w
 - **API:** `GET /api/conversations/:id/sources` — 대화 주인만(공유와 상관없이: 자원 종류 `conversation-sources`의 공유 목록은 늘 비어 있다. 공유본의 출처는 #29의 고정 목록으로 따로 보인다). 본문은 주지 않는다(글자 수만).
 - **남은 것:** 두 런타임의 실제 녹화(자격 증명 필요, #21과 같음), 실 런타임이 이 도구로 프롬프트 주입 평가(`docs/ops.md` §14.4)를 도는 것.
 
+## 금융 도구 (#30)
+MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdkrw`·`us_*`(9개)·`dart_disclosures`·`sec_8k`·`sec_form4`·`sec_13f`이다(`packages/mcp-tools/src/finance.ts`, 서버 쪽 `apps/server/src/finance/`). 운영은 `docs/ops.md` §19.
+
+- **스킬을 직접 돌리지 않는 이유:** `us-stock-skill`은 스킬 venv(yfinance·curl_cffi·pandas)가 있어야 하고, 두 공시 스킬은 로컬 SQLite에 쓰고 LLM 워커·Telegram을 부르는 상태 있는 모니터다. #21 실행기(독립 실행형 python `-I -S`, 표준 라이브러리, 고정 사본, fork 금지)로는 돌릴 수 없다. 그래서 스킬이 읽는 **같은 데이터 원천**(네이버 증권, Yahoo Finance, OpenDART, SEC EDGAR)을 서버 함수로 읽는다(`docs/skills.md`의 "자식 프로세스·venv가 필요하면 서버 함수로" 원칙). 사용자별 허용은 원래 스킬 이름으로 한다(도구마다 `skill`).
+- **실행 위치:** 웹 도구의 **샌드박스 node 작업자**(`web/worker.mjs`)에 `raw` 작업을 더했다. 서버가 검증한 입력으로 **정확한 URL**을 만들고(`providers.ts`의 `plan`), 작업자는 GET만 하고 본문 글자를 돌려준다. 해석(JSON, 숫자, 시각)은 서버의 순수 함수(`parse`)가 한다 — 녹화·합성 응답으로 스냅샷 시험을 하기 위해서다. JSON 해석뿐이고 남의 HTML을 해석하지 않는다.
+  - 한 작업은 최대 4단계, 단계마다 3MB, 리다이렉트 2번. 작업 안에서만 쿠키 상자를 쓰고(Yahoo 세션 쿠키), `capture` 단계(Yahoo crumb)는 뒤 URL의 `{crumb}`에만 들어간다. 쿠키·crumb는 작업자 밖으로 나오지 않는다(시험).
+  - 요청 헤더는 고정값 + 단계가 정한 `user-agent`·`accept`만(SEC는 `SEC_USER_AGENT`).
+- **도구별 송신 프록시(정확한 호스트 허용 목록, 443만):** 도구마다 `EgressService({ allow: tool.hosts })`를 따로 연다(`finance:<도구>` 키). 다른 도구의 호스트에도 닿지 못한다.
+
+  | 도구 | 호스트 |
+  |---|---|
+  | `kr_quote`·`kr_index`·`kr_history`·`kr_etf` | `m.stock.naver.com` |
+  | `kr_search` | `ac.stock.naver.com` |
+  | `fx_usdkrw`·`us_quote`·`us_index`·`us_history`·`us_technicals` | `query1.finance.yahoo.com` |
+  | `us_company`·`us_financials`·`us_earnings`·`us_valuation`·`us_screener` | `fc.yahoo.com`(세션 쿠키), `query1.finance.yahoo.com` |
+  | `dart_disclosures` | `opendart.fss.or.kr` |
+  | `sec_8k`·`sec_form4`·`sec_13f` | `www.sec.gov`(티커 → CIK 목록), `data.sec.gov` |
+
+  - 확인한 곳: 2026-11-11 이 Mac에서 각 엔드포인트를 한 번씩 호출해 응답 모양을 봤다(키가 필요한 OpenDART 제외). 기록은 저장소에 넣지 않았다. 합성 fixture는 그 모양을 따른다.
+  - 서버도 실행 전에 계획의 모든 URL이 그 도구 호스트의 https 기본 포트인지 확인한다(`allowed`, 이중 방어 — 하위 도메인·접미 일치 거부).
+  - 시험: 도구마다 프록시 허용 목록이 정확히 `tool.hosts`인지, 그 프록시가 `query2.finance.yahoo.com`·`finance.yahoo.com`·`…yahoo.com.evil.test`·다른 도구의 호스트·80 포트·IP 리터럴을 403으로 막는지(`finance.test.ts` "finance egress").
+- **비밀:** `OPENDART_API_KEY`(DART URL의 `crtfc_key`), `SEC_USER_AGENT`(SEC 연락처 헤더). 작업 JSON(stdin)으로만 작업자에 간다. 작업자는 URL을 돌려주지 않고, 결과는 비밀 값으로 한 번 더 지운다(`redactValue`). 없으면 그 도구만 `finance_unconfigured`.
+- **남의 글:** 공시 제목·회사 이름·회사 소개는 `<external_content>` 블록에 넣는다(닫는 태그 흉내는 무력화 — 시험). 항목 목록에는 번호·코드·날짜·링크만 있다.
+- **로그:** 호출마다 `finance.finished`(도구, `ok`/`error`, `financeCode`, 소요 시간, ID). 종목·URL·숫자는 남지 않는다.
+- **변이 시험(2026-11-11):** 22개 변이를 하나씩 넣어 모두 시험이 잡았다 — 기록 검사 끔·시간대 없는 asOf 허용·tool_meta 표시 제거, 답변의 출처·기준 시각 검사 끔, 면책 비움·실행 관리자 첨부 제거·후속 답변 검사 제거, 아들 숨김 제거·사용자별 도구 거름 제거·호출 시 재확인 제거, 모든 금융 도구가 프록시 하나를 공유·계획 호스트 검사 제거·접미 일치 허용·호스트 목록 확장·호스트 목록 틀림, KRX 성탄절 누락·미국 조기 폐장 누락·주말을 거래일로·휴장 중 값에 원래 시각·오늘이면 무조건 장중.
+
 ## 아티팩트 서빙 (#27)
 에이전트가 만든 HTML·SVG·차트·표·문서·코드를 버전과 함께 저장하고, **실제로 동작하면서** 앱의 쿠키·API·화면에 닿지 못하게 서빙한다(PRD FR-6.5). 코드는 `apps/server/src/artifacts/`(저장 `store.ts`, 서빙 `serve.ts`, 경로 `routes.ts`), 도구 정의는 `packages/mcp-tools/src/artifacts.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
 

@@ -1,0 +1,20 @@
+{
+  "tool": "kr_quote",
+  "input": {
+    "code": "999999"
+  },
+  "now": "2026-11-12T16:30:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://m.stock.naver.com/api/stock/999999/basic",
+      "status": 409,
+      "contentType": "application/json",
+      "body": {
+        "code": "StockConflict",
+        "message": "invalid"
+      }
+    }
+  ]
+}

@@ -46,6 +46,11 @@ export type McpHost = {
   onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
   /** The host's own tools (named as they are, no prefix), and how to run one. */
   tools?: readonly ServerToolInfo[];
+  /**
+   * The host's tools one user may use right now (finance tools follow the user's skill permissions, #30). Default:
+   * all of `tools`. `runTool` checks again.
+   */
+  toolsFor?(userId: string): readonly ServerToolInfo[];
   runTool?(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
 };
 
@@ -95,7 +100,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     },
   );
 
-  for (const tool of host.tools ?? []) {
+  for (const tool of host.toolsFor?.(scope.userId) ?? host.tools ?? []) {
     server.registerTool(
       tool.name,
       { description: tool.description, inputSchema: z.strictObject(tool.input) },

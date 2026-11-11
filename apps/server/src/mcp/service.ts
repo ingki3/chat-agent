@@ -18,6 +18,8 @@ import {
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { FINANCE_TOOLS, type FinanceToolInfo } from "@agentlee/mcp-tools/finance";
+import { FinanceService, type FinanceOptions } from "../finance/service.js";
 import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
 import { artifactPath, type ArtifactKind } from "@agentlee/shared";
 import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
@@ -41,6 +43,11 @@ import {
   type SearchProviderName,
   type WebWorker,
 } from "../web/service.js";
+
+/** PRD §7 finance skills (FR-7): hidden from youth accounts unless named explicitly (#30). */
+const FINANCE_SKILLS: ReadonlySet<string> = new Set(
+  SKILL_CATALOGUE.filter((e) => e.finance).map((e) => e.name),
+);
 
 /** The bundled skills (always available): the verification skill. Installed skills come from `install.ts`. */
 export const BUNDLED_SKILLS: readonly BundledSkill[] = [SELFTEST_SKILL];
@@ -274,6 +281,8 @@ export type McpServiceOptions = {
   web?: WebOptions;
   /** Artifact storage (#27). Without it the artifact tools are not offered. */
   artifacts?: ArtifactStore;
+  /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
+  finance?: FinanceOptions;
 };
 
 export type WebOptions = {
@@ -288,7 +297,11 @@ export type WebOptions = {
 
 /** A skill in the admin's list (FR-10.3): the PRD §7 catalogue plus where each one stands on this server. */
 export type SkillStatus =
-  Exclude<CatalogueStatus, "implemented"> | "available" | "not_installed" | "broken" | "needs_python";
+  | Exclude<CatalogueStatus, "implemented" | "tools">
+  | "available"
+  | "not_installed"
+  | "broken"
+  | "needs_python";
 export type SkillOverview = {
   name: string;
   tool: string;
@@ -316,8 +329,11 @@ export class McpService {
   private readonly runner: SkillRunner;
   /** Web search and fetch (#50), when configured. */
   readonly web: WebService | undefined;
-  /** The server's own tools (web): every active user has them. */
+  /** The server's own tools (web, artifacts): every active user has them. */
   private readonly tools: readonly ServerToolInfo[];
+  /** Finance tools (#30), when configured: each user gets those of the finance skills they may use. */
+  readonly finance: FinanceService | undefined;
+  private readonly financeTools: readonly FinanceToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -338,6 +354,15 @@ export class McpService {
       ...(this.web ? [...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []), WEB_FETCH_TOOL] : []),
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
     ];
+    this.finance = opts.finance
+      ? new FinanceService(
+          opts.finance.worker ?? sandboxedWorker(),
+          // One proxy per tool, reaching exactly its hosts (docs/decisions/isolation.md "금융 도구 (#30)").
+          (t) => this.proxyFor(`finance:${t.name}`, t.hosts),
+          opts.finance,
+        )
+      : undefined;
+    this.financeTools = this.finance ? FINANCE_TOOLS : [];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
   }
@@ -388,21 +413,33 @@ export class McpService {
 
   /** Every tool this server offers (without the `mcp__agentlee__` prefix) — for log registration. */
   toolNames(): string[] {
-    return toolNames({ skills: this.skills, tools: this.tools });
+    return toolNames({ skills: this.skills, tools: [...this.tools, ...this.financeTools] });
   }
 
-  /** The tools one user's run gets: echo_time, the web tools and the skills that user may use (FR-1.6). */
+  /**
+   * The tools one user's run gets: echo_time, the web and artifact tools, the finance tools and the skills that
+   * user may use (FR-1.6).
+   */
   toolNamesFor(userId: string): string[] {
-    return toolNames({ skills: this.skillsFor(userId), tools: this.tools });
+    return toolNames({ skills: this.skillsFor(userId), tools: this.toolsFor(userId) });
   }
 
-  /** Whether this user may use this skill now: active, and the skill always on or in their permissions. */
+  /**
+   * Whether this user may use this skill now: active, and the skill always on or in their permissions. "all" means
+   * every skill — except the finance skills for a youth account (the son, #30): they are hidden by default and
+   * only an explicit list that names them turns them on.
+   */
   allows(userId: string, skill: string): boolean {
     const u = this.users.byId(userId);
     if (!u?.active) return false;
     if (ALWAYS_ON_SKILLS.has(skill)) return true;
     const p = (u as { permissions?: { skills?: unknown } }).permissions?.skills;
-    return p === "all" || (Array.isArray(p) && p.includes(skill));
+    if (p === "all") return !((u as { youth?: unknown }).youth === true && FINANCE_SKILLS.has(skill));
+    return Array.isArray(p) && p.includes(skill);
+  }
+
+  private toolsFor(userId: string): ServerToolInfo[] {
+    return [...this.tools, ...this.financeTools.filter((t) => this.allows(userId, t.skill))];
   }
 
   private skillsFor(userId: string): BundledSkill[] {
@@ -414,7 +451,9 @@ export class McpService {
     const offered = new Set(this.skills.map((s) => s.name));
     return SKILL_CATALOGUE.map((e) => {
       let status: SkillStatus;
-      if (e.status === "implemented") {
+      if (this.finance && FINANCE_TOOLS.some((t) => t.skill === e.name)) status = "available";
+      else if (e.status === "tools") status = "planned";
+      else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
         status = offered.has(e.name) ? "available" : st === "installed" ? "needs_python" : st;
       } else status = e.status;
@@ -441,6 +480,7 @@ export class McpService {
   private host(): McpHost {
     const runSkill = this.runner;
     const toolByName = new Map(this.tools.map((t) => [t.name, t]));
+    const financeByName = new Map(this.financeTools.map((t) => [t.name, t]));
     const byName = new Map(this.skills.map((s) => [s.name, s]));
     const now = () => Date.now();
     return {
@@ -472,9 +512,24 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
-      tools: this.tools,
+      tools: [...this.tools, ...this.financeTools],
+      toolsFor: (userId) => this.toolsFor(userId),
       runTool: async (name, input, scope) => {
         const t0 = now();
+        const fin = financeByName.get(name);
+        if (fin) {
+          const r = await this.callFinanceTool(fin, input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "finance.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            ...(r.ok ? {} : { financeCode: r.code }),
+          });
+          return r;
+        }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {
           const r = this.callArtifactTool(toolByName.get(name), input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "artifact.finished", {
@@ -547,6 +602,27 @@ export class McpService {
       if (e instanceof ArtifactError) return { ok: false, code: e.code };
       throw e;
     }
+  }
+
+  /**
+   * A finance tool call: the user may use its skill (checked again: a permission can change during a run), strict
+   * input, a process slot like a skill, then the finance service. Input and output are never logged.
+   */
+  private async callFinanceTool(
+    tool: FinanceToolInfo,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): Promise<SkillResult> {
+    const finance = this.finance;
+    if (!finance || !this.allows(scope.userId, tool.skill)) return { ok: false, code: "finance_not_allowed" };
+    const parsed = z.strictObject(tool.input).safeParse(input);
+    if (!parsed.success) return { ok: false, code: "finance_bad_input" };
+    return (
+      (await this.withSlot(scope, () => finance.run(tool, parsed.data as Record<string, unknown>))) ?? {
+        ok: false,
+        code: "finance_busy",
+      }
+    );
   }
 
   /** A web tool call: active user, strict input, a process slot like a skill, then the web service. */

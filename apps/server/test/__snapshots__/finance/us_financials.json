@@ -1,0 +1,60 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_financials",
+  "market": "US",
+  "symbol": "AAPL",
+  "period": "annual",
+  "currency": "USD",
+  "rows": [
+   {
+    "period": "2026-09-30",
+    "periodType": "12M",
+    "revenue": 478834000000,
+    "operatingIncome": 151200000000,
+    "netIncome": 132175000000,
+    "dilutedEps": 8.96,
+    "freeCashFlow": 112400000000,
+    "source": "Yahoo Finance",
+    "asOf": "2026-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported"
+   },
+   {
+    "period": "2025-09-30",
+    "periodType": "12M",
+    "revenue": 416161000000,
+    "operatingIncome": 133050000000,
+    "netIncome": 112010000000,
+    "dilutedEps": 7.46,
+    "freeCashFlow": 98767000000,
+    "source": "Yahoo Finance",
+    "asOf": "2025-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported"
+   }
+  ],
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported",
+    "label": "Yahoo Finance · 2026-09-30 보고치"
+   },
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2025-09-30T00:00:00-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "reported",
+    "label": "Yahoo Finance · 2025-09-30 보고치"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

@@ -146,7 +146,7 @@ export const GOOGLE_NEWS_SKILL: SkillSpec = {
 export const KR_STOCK_SKILL: SkillSpec = {
   name: "kr-stock-skill",
   description:
-    "Korean stock market numbers. command=stock with a 6-digit KRX code (e.g. 005930) or command=index with KOSPI/KOSDAQ: latest Naver m.stock snapshot with price, change, trading time and delay status (JSON). command=alpha-quote with a ticker: Alpha Vantage GLOBAL_QUOTE (fallback only).",
+    "Fallback only — prefer kr_quote / kr_index, whose numbers carry source and as-of time. Korean stock market numbers. command=stock with a 6-digit KRX code (e.g. 005930) or command=index with KOSPI/KOSDAQ: latest Naver m.stock snapshot with price, change, trading time and delay status (JSON). command=alpha-quote with a ticker: Alpha Vantage GLOBAL_QUOTE.",
   input: {
     command: z.enum(["stock", "index", "alpha-quote"]),
     code: z
@@ -189,7 +189,12 @@ export type CatalogueStatus =
   /** Needs more than this runner offers today — the issue that brings it. */
   | "planned"
   /** A library usage guide, not a program: becomes a server function of our MCP server. */
-  | "document";
+  | "document"
+  /**
+   * Its lookups are server functions of our MCP server (the finance tools, #30, `@agentlee/mcp-tools/finance`):
+   * the skill needs a venv or is a stateful monitor, so its data sources are read directly instead.
+   */
+  | "tools";
 
 export type CatalogueEntry = {
   name: string;
@@ -216,10 +221,12 @@ const entry = (
 /** PRD §7, in order. Per-user permissions name these (FR-1.6); unknown names are refused. */
 export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   entry("kr-stock-skill", "implemented", { finance: true, secrets: ["ALPHAVANTAGE_API_KEY"] }),
-  entry("us-stock-skill", "planned", { finance: true, issue: "#30" }),
-  // Reads DART filings from dart-investment-monitor's database; its own keys (OpenRouter, Telegram) come with #30.
-  entry("market-disclosure-monitor", "planned", { finance: true, issue: "#30" }),
-  entry("dart-investment-monitor", "planned", { finance: true, issue: "#30", secrets: ["OPENDART_API_KEY"] }),
+  // us_* finance tools (Yahoo Finance, the source yfinance reads).
+  entry("us-stock-skill", "tools", { finance: true, issue: "#30" }),
+  // sec_* finance tools (SEC EDGAR). SEC asks every client for a User-Agent naming a contact: SEC_USER_AGENT.
+  entry("market-disclosure-monitor", "tools", { finance: true, issue: "#30", secrets: ["SEC_USER_AGENT"] }),
+  // dart_disclosures (OpenDART list API).
+  entry("dart-investment-monitor", "tools", { finance: true, issue: "#30", secrets: ["OPENDART_API_KEY"] }),
   // Needs the skill's venv (google-genai): not runnable with the standard library only. #50 kept it planned.
   entry("news-search-skill", "planned", {
     issue: "#50 후속 (venv 또는 node 재구현 + 키로 실호출 확인)",

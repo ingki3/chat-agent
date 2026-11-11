@@ -1,0 +1,105 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_quote",
+  "market": "US",
+  "symbol": "AAPL",
+  "name": "Apple Inc.",
+  "exchange": "NasdaqGS",
+  "currency": "USD",
+  "price": {
+   "value": 349.8,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "previousClose": {
+   "value": 351.2,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "change": {
+   "value": -1.4,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "changePercent": {
+   "value": -0.399,
+   "unit": "%",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "dayHigh": {
+   "value": 351.9,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "dayLow": {
+   "value": 346.6,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "volume": {
+   "value": 44703800,
+   "unit": "shares",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "fiftyTwoWeekHigh": {
+   "value": 355.38,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "fiftyTwoWeekLow": {
+   "value": 243.42,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T16:00:00-05:00",
+   "timeZone": "America/New_York",
+   "delayed": false,
+   "kind": "close"
+  },
+  "tradingDay": "2026-11-13",
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "close",
+    "label": "Yahoo Finance · 2026-11-13 16:00 ET 종가"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

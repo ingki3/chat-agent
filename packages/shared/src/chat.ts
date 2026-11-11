@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { RunChoice } from "./connections.js";
 import { RuntimeId } from "./runtime.js";
+import { FINANCE_NOTE_MAX_SOURCES, FinanceMissing, FinanceSource } from "./finance.js";
 
 /**
  * Runtime-neutral message and stream formats (#11, PRD D8). Both runtime adapters (#15, #16) translate their
@@ -52,6 +53,17 @@ export const DividerPart = z.object({
   model: z.string().optional(),
 });
 /**
+ * Added by the server under an answer that used a finance tool (#30, FR-7.6·7.8): the sources and as-of times of
+ * the numbers it was given, what the answer itself left out, and the disclaimer. Never written by a runtime.
+ */
+export const FinanceNotePart = z.object({
+  type: z.literal("finance_note"),
+  sources: z.array(FinanceSource).max(FINANCE_NOTE_MAX_SOURCES),
+  missing: z.array(FinanceMissing),
+  disclaimer: z.string(),
+});
+export type FinanceNotePart = z.infer<typeof FinanceNotePart>;
+/**
  * The runtime's internal reasoning. Stored, but internal only: never in API responses, shared views, forks,
  * exports or the context handed to another runtime (see `publicParts`).
  */
@@ -66,6 +78,7 @@ export const MessagePart = z.discriminatedUnion("type", [
   FileRefPart,
   TablePart,
   DividerPart,
+  FinanceNotePart,
   ReasoningPart,
 ]);
 export type MessagePart = z.infer<typeof MessagePart>;

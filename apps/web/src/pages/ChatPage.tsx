@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router";
-import type { Message, PublicPart, Run, StreamEvent } from "@agentlee/shared";
+import type { FinanceNotePart, Message, PublicPart, Run, StreamEvent } from "@agentlee/shared";
 import { conversations, errorText, runs } from "../api.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
@@ -218,12 +218,40 @@ function MessageView({ m }: { m: Message }) {
         </details>
       )}
       <div className="text">{textOf(m.parts as PublicPart[])}</div>
+      {m.parts.map((p, i) => (p.type === "finance_note" ? <FinanceNote key={i} note={p} /> : null))}
       <div className="meta">
         {m.runtime && <span>{RUNTIME[m.runtime] ?? m.runtime}</span>}
         {m.model && <span>· {m.model}</span>}
         {m.status === "stopped" && <span className="badge warn">중지됨</span>}
         {m.status === "error" && <span className="badge err">오류</span>}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The server's note under an answer that used a finance tool (#30, FR-7.6·7.8): where the numbers come from and
+ * as of when, a warning when the answer itself left that out, and the disclaimer.
+ */
+function FinanceNote({ note }: { note: FinanceNotePart }) {
+  return (
+    <div className="finance-note" data-testid="finance-note">
+      {note.missing.length > 0 && (
+        <div className="notice warn" data-testid="finance-missing">
+          ⚠️{" "}
+          {note.missing.includes("tool_meta")
+            ? "일부 숫자는 출처·기준 시각을 확인하지 못했어요."
+            : "답변에 출처·기준 시각이 빠진 부분이 있어 아래 기준을 덧붙였어요."}
+        </div>
+      )}
+      {note.sources.length > 0 && (
+        <ul className="sources" aria-label="출처·기준 시각">
+          {note.sources.map((s) => (
+            <li key={s.label}>{s.label}</li>
+          ))}
+        </ul>
+      )}
+      <p className="disclaimer">{note.disclaimer}</p>
     </div>
   );
 }

@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "dart_disclosures",
+  "items": [],
+  "content": "<external_content source=\"dart:list\">\n(no filings)\n</external_content>",
+  "sources": [],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

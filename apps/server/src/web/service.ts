@@ -82,7 +82,17 @@ export function checkUrl(raw: string): { ok: true; url: URL } | { ok: false; cod
 
 /** A worker job and what comes back (worker.mjs). */
 export type WorkerJob =
-  { op: "fetch"; url: string } | { op: "search"; provider: "duckduckgo"; query: string; max: number };
+  | { op: "fetch"; url: string }
+  | { op: "search"; provider: "duckduckgo"; query: string; max: number }
+  /** Finance tools (#30): exact URLs built by the server, bodies returned as text (worker.mjs `fetchRaw`). */
+  | { op: "raw"; steps: RawStep[] };
+export type RawStep = {
+  url: string;
+  headers?: Record<string, string>;
+  mode?: "cookie" | "capture";
+  capture?: string;
+};
+export type RawResponse = { status: number; contentType: string; body: string };
 export type WorkerOutput = { ok: true; [k: string]: unknown } | { ok: false; code: string };
 /** Runs the worker with the given egress proxy. Default: the sandboxed process. Tests run it in-process. */
 export type WebWorker = (job: WorkerJob, proxy: { url: string; port: number }) => Promise<WorkerOutput>;

@@ -161,7 +161,15 @@ describe("skill catalogue (#21, PRD §7)", () => {
     }
     for (const d of ["pdf", "docx", "xlsx", "pptx"])
       expect(SKILL_CATALOGUE.find((e) => e.name === d)?.status).toBe("document");
-    expect(SKILL_SECRET_NAMES).toEqual(["ALPHAVANTAGE_API_KEY", "GEMINI_API_KEY", "OPENDART_API_KEY"]);
+    expect(SKILL_SECRET_NAMES).toEqual([
+      "ALPHAVANTAGE_API_KEY",
+      "GEMINI_API_KEY",
+      "OPENDART_API_KEY",
+      "SEC_USER_AGENT",
+    ]);
+    // The other finance skills are served as finance tools (#30).
+    for (const n of ["us-stock-skill", "market-disclosure-monitor", "dart-investment-monitor"])
+      expect(SKILL_CATALOGUE.find((e) => e.name === n)?.status, n).toBe("tools");
   });
 
   it("builds fixed argument lists: every value is one --flag=value element", () => {
@@ -467,8 +475,9 @@ describe("per-user skills (FR-1.6, #21)", () => {
       status: "available",
       finance: true,
     });
+    // Served by the finance tools (#30).
     expect(skills.find((s) => s.name === "us-stock-skill")).toMatchObject({
-      status: "planned",
+      status: "available",
       issue: "#30",
     });
     expect(skills.find((s) => s.name === "pdf")?.status).toBe("document");

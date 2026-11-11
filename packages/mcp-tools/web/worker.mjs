@@ -537,10 +537,76 @@ export async function searchDuckDuckGo(job, o) {
   return { results: parseDuckDuckGo(decode(r.body, String(r.headers["content-type"] ?? "")), job.max) };
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Raw data requests (finance tools, #30): a few GETs of exact URLs the server built, returned as text for the
+// server to parse. The egress proxy of the calling tool lets through its own hosts only.
+
+/** Request headers a step may set (anything else is ignored). */
+const STEP_HEADERS = new Set(["user-agent", "accept"]);
+/** A captured value (Yahoo's crumb) as it may go into a later URL. */
+const CAPTURE = /^[A-Za-z0-9._/~+-]{1,64}$/;
+export const RAW_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024, maxRedirects: 2 };
+
+/**
+ * Runs the steps in order with one cookie jar (cookies set by a response go with the later requests of this job
+ * only). A step is `{ url, headers?, mode? }`:
+ * - `mode: "cookie"`: only its cookies are kept (any status), nothing is returned;
+ * - `mode: "capture", capture: <name>`: its body (one short token) replaces `{<name>}` in the later URLs and is
+ *   not returned (a session token, never handed back);
+ * - otherwise its `{ status, contentType, body }` is returned, in order.
+ * Cookie and captured values never leave this process.
+ * @param {{ steps?: unknown }} job @param {{ proxy: string, ca?: string }} o
+ */
+export async function fetchRaw(job, o) {
+  const steps = job.steps;
+  if (!Array.isArray(steps) || steps.length < 1 || steps.length > RAW_LIMITS.maxSteps)
+    throw new WebError("web_bad_input");
+  const jar = new Map();
+  const vars = new Map();
+  const responses = [];
+  for (const step of steps) {
+    if (!step || typeof step !== "object" || typeof step.url !== "string")
+      throw new WebError("web_bad_input");
+    const url = step.url.replace(/\{(\w{1,20})\}/g, (m, k) =>
+      vars.has(k) ? encodeURIComponent(vars.get(k)) : m,
+    );
+    /** @type {Record<string,string>} */
+    const headers = {};
+    for (const [k, v] of Object.entries(step.headers ?? {}))
+      if (STEP_HEADERS.has(k.toLowerCase()) && typeof v === "string" && /^[\x20-\x7e]{1,200}$/.test(v))
+        headers[k.toLowerCase()] = v;
+    if (!headers.accept) headers.accept = "application/json,text/plain;q=0.9,*/*;q=0.1";
+    if (jar.size) headers.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+    const r = await get(url, {
+      ...o,
+      headers,
+      limits: { maxBytes: RAW_LIMITS.maxBytes, maxRedirects: RAW_LIMITS.maxRedirects },
+    });
+    const set = r.headers["set-cookie"];
+    for (const c of Array.isArray(set) ? set : set ? [set] : []) {
+      const m = /^([!#$%&'*+.^_`|~0-9A-Za-z-]{1,64})=([^;\s]{0,4096})/.exec(String(c));
+      if (m && jar.size < 20) jar.set(m[1], m[2]);
+    }
+    if (step.mode === "cookie") continue;
+    const ct = String(r.headers["content-type"] ?? "").toLowerCase();
+    const body = decode(r.body, ct);
+    if (step.mode === "capture") {
+      const v = body.trim();
+      if (r.status !== 200) throw new WebError("web_http_error");
+      if (typeof step.capture !== "string" || !CAPTURE.test(v)) throw new WebError("web_bad_content");
+      vars.set(step.capture, v);
+      continue;
+    }
+    responses.push({ status: r.status, contentType: ct.split(";")[0].trim(), body });
+  }
+  return { responses };
+}
+
 /** Runs one job. Never throws: a fixed code on failure (no message, which could carry page text). */
 export async function run(job, o) {
   try {
     if (job.op === "fetch") return { ok: true, ...(await fetchPage(job.url, o)) };
+    if (job.op === "raw") return { ok: true, ...(await fetchRaw(job, o)) };
     if (job.op === "search" && job.provider === "duckduckgo")
       return { ok: true, ...(await searchDuckDuckGo(job, o)) };
     return { ok: false, code: "web_bad_input" };

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
-import type { RuntimeId } from "@agentlee/shared";
+import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import {
   RuntimeFailure,
@@ -26,6 +26,9 @@ import {
  *   /artifact-update <id> <field>     (next lines: the new content of that field — content, chart, table, document)
  *                     real calls of our MCP tools `artifact_create` / `artifact_update` with the run's token
  *                     (needs `runTools`, as the FAKE_RUNTIME=1 server registers it; #27)
+ *   /finance [cited]   scripted finance tool results (AAPL, 005930 — fixed numbers, no network) and an answer that
+ *                     leaves out (or, with `cited`, states) the sources and as-of dates: the run manager's finance
+ *                     check then adds its note (#30)
  */
 export type FakeStep =
   | { text: string }
@@ -146,9 +149,61 @@ async function callOurTool(
   }
 }
 
+/** A finance tool result in the shape the finance tools return (records with stamps, `sources`, disclaimer). */
+function financeResult(tool: string, data: Record<string, unknown>, meta: FinanceMeta) {
+  const value = (v: number, unit: string) => ({ value: v, unit, ...meta });
+  return {
+    tool,
+    ...data,
+    price: value(data.price as number, data.currency as string),
+    sources: [{ ...meta, label: financeLabel(meta) }],
+    warnings: [],
+    disclaimer: FINANCE_DISCLAIMER,
+  };
+}
+
+/** `/finance [cited]` (see the header comment). Fixed numbers of Friday 2026-11-13, asked on the weekend. */
+function financeSteps(cited: boolean): FakeStep[] {
+  const us: FinanceMeta = {
+    source: "Yahoo Finance",
+    asOf: "2026-11-13T16:00:00-05:00",
+    timeZone: "America/New_York",
+    delayed: false,
+    kind: "close",
+  };
+  const kr: FinanceMeta = {
+    source: "네이버 증권",
+    asOf: "2026-11-13T15:30:00+09:00",
+    timeZone: "Asia/Seoul",
+    delayed: false,
+    kind: "close",
+  };
+  return [
+    {
+      tool: `${OUR_TOOL_PREFIX}us_quote`,
+      ms: 0,
+      input: { symbol: "AAPL" },
+      output: financeResult("us_quote", { symbol: "AAPL", currency: "USD", price: 348.51 }, us),
+    },
+    {
+      tool: `${OUR_TOOL_PREFIX}kr_quote`,
+      ms: 0,
+      input: { code: "005930" },
+      output: financeResult("kr_quote", { code: "005930", currency: "KRW", price: 206000 }, kr),
+    },
+    {
+      text: cited
+        ? "AAPL은 348.51달러(Yahoo Finance · 2026-11-13 16:00 ET 종가), 삼성전자는 206,000원(네이버 증권 · 2026-11-13 15:30 KST 종가)이에요."
+        : "AAPL은 348.51달러, 삼성전자는 206,000원이에요.",
+    },
+  ];
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
+  const fin = /^\/finance(\s+cited)?$/.exec(t);
+  if (fin) return financeSteps(!!fin[1]);
   const artifact = artifactSteps(t);
   if (artifact) return artifact;
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
