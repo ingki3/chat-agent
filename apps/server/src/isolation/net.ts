@@ -58,16 +58,36 @@ export function isBlockedAddress(ip: string): boolean {
   const p = v6parts(ip);
   if (!p) return true;
   const v4tail = () => `${p[6]! >> 8}.${p[6]! & 255}.${p[7]! >> 8}.${p[7]! & 255}`;
-  if (p.every((x) => x === 0)) return true; // ::
-  if (p.slice(0, 7).every((x) => x === 0) && p[7] === 1) return true; // ::1
-  if (p.slice(0, 5).every((x) => x === 0) && p[5] === 0xffff) return isBlockedAddress(v4tail()); // ::ffff:a.b.c.d
-  if (p.slice(0, 6).every((x) => x === 0)) return true; // ::a.b.c.d (deprecated compatible)
-  if (p[0] === 0x64 && p[1] === 0xff9b) return isBlockedAddress(v4tail()); // NAT64
-  if ((p[0]! & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
-  if ((p[0]! & 0xffc0) === 0xfe80) return true; // fe80::/10 link local
-  if ((p[0]! & 0xff00) === 0xff00) return true; // multicast
-  if (p[0] === 0x2001 && p[1] === 0xdb8) return true; // documentation
-  return false;
+  // Two translation forms carry an IPv4 address that decides: IPv4-mapped (::ffff:0:0/96) and the NAT64
+  // well-known prefix (64:ff9b::/96 exactly — RFC 6052). Everything else is judged on the IPv6 address alone.
+  if (inV6(p, V6_MAPPED, 96) || inV6(p, V6_NAT64_WKP, 96)) return isBlockedAddress(v4tail());
+  // Allow-list: only global unicast (2000::/3, RFC 4291) may be reached — this refuses ::, ::1, the deprecated
+  // IPv4-compatible form, 100::/64 discard, 64:ff9b:1::/48 local-use NAT64 (RFC 8215), fc00::/7 unique local,
+  // fec0::/10 site local, fe80::/10 link local and ff00::/8 multicast, and anything not yet assigned.
+  if (!inV6(p, [0x2000], 3)) return true;
+  // ...minus the special-purpose ranges inside it (IANA IPv6 special-purpose address registry).
+  return V6_SPECIAL.some(([prefix, bits]) => inV6(p, prefix, bits));
+}
+
+const V6_MAPPED = [0, 0, 0, 0, 0, 0xffff];
+const V6_NAT64_WKP = [0x64, 0xff9b, 0, 0, 0, 0];
+/** Non-global ranges inside 2000::/3, refused whatever they map to. */
+const V6_SPECIAL: [number[], number][] = [
+  [[0x2001, 0], 23], // IETF protocol assignments: Teredo 2001::/32, benchmarking, ORCHID, AMT, AS112, …
+  [[0x2001, 0xdb8], 32], // documentation
+  [[0x2002], 16], // 6to4 (deprecated; its embedded IPv4 is not checked — refused outright)
+  [[0x3fff, 0], 20], // documentation (RFC 9637)
+  [[0x5f00], 16], // SRv6 SIDs (RFC 9602)
+];
+
+/** True when the first `bits` bits of the address `p` (8 groups) equal those of `prefix` (missing groups = 0). */
+function inV6(p: number[], prefix: number[], bits: number): boolean {
+  for (let i = 0; i < 8 && bits > 0; i++, bits -= 16) {
+    const take = Math.min(16, bits);
+    const mask = (0xffff << (16 - take)) & 0xffff;
+    if ((p[i]! & mask) !== ((prefix[i] ?? 0) & mask)) return false;
+  }
+  return true;
 }
 
 export class BlockedRequestError extends Error {

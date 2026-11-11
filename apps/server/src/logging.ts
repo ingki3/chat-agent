@@ -22,6 +22,7 @@ import {
   isTestCode,
   isImportItem,
   isImportCode,
+  isWebCode,
   isToolName,
   UNMATCHED,
   isUsagePurpose,
@@ -55,6 +56,8 @@ export const LOG_EVENTS = [
   "tool.finished",
   // Skill calls on our MCP server (#21): tool name, outcome code, duration and IDs — never input or output.
   "skill.finished",
+  // Web tool calls (#50): tool name, outcome code, duration and IDs — never the URL, host, query or page text.
+  "web.finished",
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",
@@ -138,6 +141,8 @@ const FIELDS = new Map<string, Check>([
   ["errorCode", isErrorCode],
   /** Why a skill call did not succeed (#21): one of the fixed `skill_*` codes. */
   ["skillCode", isSkillCode],
+  /** Why a web tool call did not succeed (#50): one of the fixed `web_*` codes. */
+  ["webCode", isWebCode],
   ["category", isCategory],
   ["costUsd", isNum],
   ["inputTokens", isInt],

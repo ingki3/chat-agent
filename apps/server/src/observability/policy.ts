@@ -137,7 +137,35 @@ export const isUsagePurpose = member(set(USAGE_PURPOSES));
 export const isConnectionScope = member(set(["shared", "personal"]));
 export const isAuthType = member(set(["api_key", "subscription"]));
 
+/**
+ * Outcome codes of the web tools (#50, web/service.ts `WEB_CODES` — a test keeps the two equal). The URL, its
+ * host and the query are never logged: a host name is chosen by the model (or a page it read) and can carry
+ * anything in its labels, so only these fixed codes say what happened.
+ */
+export const WEB_CODES = set([
+  "web_bad_input",
+  "web_bad_url",
+  "web_blocked",
+  "web_unreachable",
+  "web_timeout",
+  "web_tls",
+  "web_too_large",
+  "web_too_many_redirects",
+  "web_unsupported_type",
+  "web_http_error",
+  "web_bad_content",
+  "web_no_text",
+  "web_search_blocked",
+  "web_search_unavailable",
+  "web_unavailable",
+  "web_limit",
+  "web_failed",
+  "web_busy",
+  "web_not_allowed",
+]);
+
 export const isRuntime = member(RUNTIMES);
+export const isWebCode = member(WEB_CODES);
 export const isSkillCode = member(SKILL_CODES);
 export const isNotificationKind = member(set(NotificationKind.options));
 export const isStatus = member(STATUSES);

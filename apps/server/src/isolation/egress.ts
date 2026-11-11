@@ -12,8 +12,13 @@ import { isBlockedAddress } from "./net.js";
  * stream, never the content.
  */
 export type EgressOptions = {
-  /** Exact host names allowed (lower case). */
-  allow: readonly string[];
+  /**
+   * Exact host names allowed (lower case), or `"public"`: any public name or address (web fetch, #50). In both
+   * cases the name is resolved here and every answer must be a public address — the policy is on the address.
+   */
+  allow: readonly string[] | "public";
+  /** Ports a tunnel may go to (default 443 only; web fetch also opens 80 for plain http). */
+  ports?: readonly number[];
   /** Tests: name resolution and the upstream connection. */
   lookup?: (host: string) => Promise<string[]>;
   connect?: (ip: string, port: number) => net.Socket;
@@ -29,8 +34,43 @@ export type RunningEgress = { readonly port: number; readonly url: string; close
 const defaultLookup = async (host: string) =>
   (await dns.lookup(host, { all: true, verbatim: true })).map((a) => a.address);
 
+/**
+ * Names that are never public, whatever they resolve to (defence in depth — the address check decides anyway):
+ * `localhost` and its subdomains, mDNS `.local`, `.internal` (cloud metadata), `.home.arpa`, `.lan`, single-label
+ * intranet names.
+ */
+export function isPrivateName(host: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, "");
+  if (!h.includes(".")) return true;
+  return /(^|\.)(localhost|local|internal|home\.arpa|lan|intranet|corp)$/.test(h);
+}
+
+/**
+ * The CONNECT target `host:port` as (host, port), or undefined when malformed. Names are LDH labels; addresses are
+ * a canonical dotted IPv4 or a bracketed IPv6. A name whose last label is numeric or hex (`2130706433`,
+ * `0x7f.1`, `0177.0.0.1`) is an address in another spelling: refused unless it is canonical dotted IPv4.
+ */
+export function parseTarget(target: string): { host: string; port: number } | undefined {
+  const m = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d{1,5})$/i.exec(target);
+  if (!m) return undefined;
+  const port = Number(m[2]);
+  let host = m[1]!.toLowerCase();
+  if (host.startsWith("[")) {
+    host = host.slice(1, -1);
+    return net.isIPv6(host) ? { host, port } : undefined;
+  }
+  const last = host.replace(/\.$/, "").split(".").pop() ?? "";
+  if (/^(\d+|0x[0-9a-f]*)$/i.test(last) && !net.isIPv4(host)) return undefined;
+  if (host.split(".").some((l) => l.length > 63) || host.length > 253) return undefined;
+  return { host, port };
+}
+
+/** How long a closed upstream's last bytes may take to reach the client before the tunnel is cut. */
+const FLUSH_MS = 30_000;
+
 export async function startEgressProxy(o: EgressOptions, port = 0): Promise<RunningEgress> {
-  const allow = new Set(o.allow.map((h) => h.toLowerCase()));
+  const allow = o.allow === "public" ? undefined : new Set(o.allow.map((h) => h.toLowerCase()));
+  const ports = new Set(o.ports ?? [443]);
   const lookup = o.lookup ?? defaultLookup;
   const connect = o.connect ?? ((ip: string, p: number) => net.connect({ host: ip, port: p }));
   const sockets = new Set<net.Socket>();
@@ -76,13 +116,15 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
       hangUp("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       return;
     }
-    const m = /^([a-z0-9.-]+):(\d+)$/i.exec(req.url ?? "");
-    if (!m || Number(m[2]) !== 443 || !allow.has(m[1]!.toLowerCase())) return refuse(403);
-    const host = m[1]!.toLowerCase();
+    const t = parseTarget(req.url ?? "");
+    if (!t || !ports.has(t.port)) return refuse(403);
+    const host = t.host;
+    if (allow ? !allow.has(host) : !net.isIP(host) && isPrivateName(host)) return refuse(403);
     void (async () => {
       let ips: string[];
       try {
-        ips = await lookup(host);
+        // An address literal is its own answer (public mode only — an allow-list names hosts).
+        ips = net.isIP(host) ? [host] : await lookup(host);
       } catch {
         return refuse(502);
       }
@@ -90,13 +132,22 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
       if (closed || gone || client.destroyed) return void client.destroy();
       // Any blocked answer refuses the whole name (DNS rebinding to the home network or this machine).
       if (!ips.length || ips.some((ip) => isBlockedAddress(ip))) return refuse(403);
-      const upstream = connect(ips[0]!, 443);
+      // The checked address itself is what we connect to — never the name again (no second resolution).
+      const upstream = connect(ips[0]!, t.port);
       upstream.setTimeout(idleMs, () => upstream.destroy());
       sockets.add(upstream);
       const timer = setTimeout(() => upstream.destroy(), o.connectTimeoutMs ?? 10_000);
-      upstream.on("close", () => {
+      upstream.on("close", (hadError) => {
         sockets.delete(upstream);
-        client.destroy();
+        // A clean close comes after the upstream's end, which the pipe passes on as the client's end — but bytes
+        // may still be queued for a slow client. Destroying now would drop them (a response cut short), so wait
+        // until they are flushed; an upstream error, or a client that never drains, ends it at once / in time.
+        if (hadError || client.destroyed || client.writableFinished) return void client.destroy();
+        client.end();
+        const flushTimer = setTimeout(() => client.destroy(), FLUSH_MS);
+        flushTimer.unref();
+        client.once("finish", () => client.destroy());
+        client.once("close", () => clearTimeout(flushTimer));
       });
       upstream.on("error", () => {
         clearTimeout(timer);

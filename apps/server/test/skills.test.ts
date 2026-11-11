@@ -511,7 +511,14 @@ describe("per-user skills (FR-1.6, #21)", () => {
       return contexts.at(-1)!;
     };
     const sonCtx = await runFor(f.cookies.stranger, son);
-    expect(sonCtx.tools).toEqual(["echo_time", "skill_selftest", "skill_google-news-search-skill"]);
+    // The web tools (#50) are everyone's; web_search is offered because the news skill is its provider here.
+    expect(sonCtx.tools).toEqual([
+      "echo_time",
+      "web_search",
+      "web_fetch",
+      "skill_selftest",
+      "skill_google-news-search-skill",
+    ]);
     expect(sonCtx.tools.some(isFinanceTool)).toBe(false);
     // The finance instructions follow the tools (#20): not in the son's prompt.
     expect(sonCtx.systemPrompt).not.toContain("# 금융 지침");
@@ -747,9 +754,10 @@ describe("skill sandbox policy (#21 on #42)", () => {
       },
     );
     closers.push(() => svc.close());
-    const proxyFor = (
-      svc as unknown as { proxyFor(s: BundledSkill): Promise<{ port: number }> }
-    ).proxyFor.bind(svc);
+    const proxyFor = (s: BundledSkill) =>
+      (
+        svc as unknown as { proxyFor(key: string, hosts: readonly string[]): Promise<{ port: number }> }
+      ).proxyFor(s.name, s.hosts);
     const a = await proxyFor(at(GOOGLE_NEWS_SKILL));
     const b = await proxyFor(at(KR_STOCK_SKILL));
     expect(a.port).not.toBe(b.port);

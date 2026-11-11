@@ -19,6 +19,9 @@ export const SKILLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.ur
 /** A secret env variable a skill gets in its own process only — when the call needs it (`when`, default always). */
 export type SkillSecret = { env: string; when?: (input: Record<string, unknown>) => boolean };
 
+/** One search result a skill returned, to register as a source (#50). Untrusted text: bounded by the host. */
+export type SearchHit = { url: string; title: string; site?: string; publishedAt?: string; snippet?: string };
+
 /** How a skill is started: a node script, or a python script run by the configured self-contained python. */
 export type SkillKind = "node" | "python";
 
@@ -36,7 +39,14 @@ export type SkillSpec = SkillInfo & {
   /** Exit codes whose stdout is a result (default: 0 only). */
   okExitCodes?: readonly number[];
   timeoutMs?: number;
+  /**
+   * The search results in a successful output (#50): each becomes a source of the conversation, and the host
+   * writes its id into the item as `sourceId` (the item is an object of the parsed output).
+   */
+  searchHits?(output: unknown): { item: Record<string, unknown>; hit: SearchHit }[];
 };
+
+const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
 
 /** A skill ready to run: its definition plus where its files are. */
 export type BundledSkill = SkillSpec & {
@@ -109,6 +119,23 @@ export const GOOGLE_NEWS_SKILL: SkillSpec = {
   // 1 = every query attempt failed; stdout is still the JSON report ({ ok: false, ... }).
   okExitCodes: [0, 1],
   timeoutMs: 40_000,
+  // { items: [{ title, link, source, published_at, ... }] }
+  searchHits: (output) => {
+    const items = (output as { items?: unknown } | null)?.items;
+    if (!Array.isArray(items)) return [];
+    return items.flatMap((item: unknown) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const o = item as Record<string, unknown>;
+      const url = str(o.link);
+      const title = str(o.title);
+      if (!url || !title) return [];
+      const site = str(o.source);
+      const publishedAt = str(o.published_at);
+      return [
+        { item: o, hit: { url, title, ...(site ? { site } : {}), ...(publishedAt ? { publishedAt } : {}) } },
+      ];
+    });
+  },
 };
 
 /**
@@ -193,10 +220,16 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   // Reads DART filings from dart-investment-monitor's database; its own keys (OpenRouter, Telegram) come with #30.
   entry("market-disclosure-monitor", "planned", { finance: true, issue: "#30" }),
   entry("dart-investment-monitor", "planned", { finance: true, issue: "#30", secrets: ["OPENDART_API_KEY"] }),
-  entry("news-search-skill", "planned", { issue: "#50", secrets: ["GEMINI_API_KEY"] }),
+  // Needs the skill's venv (google-genai): not runnable with the standard library only. #50 kept it planned.
+  entry("news-search-skill", "planned", {
+    issue: "#50 후속 (venv 또는 node 재구현 + 키로 실호출 확인)",
+    secrets: ["GEMINI_API_KEY"],
+  }),
   entry("google-news-search-skill", "implemented"),
-  entry("realtime-lookup-skill", "planned", { issue: "#50" }),
-  entry("summarize", "planned", { issue: "#50" }),
+  // Imports a package outside its folder (simpleclaw, not installed); its news path is web_search + web_fetch now.
+  entry("realtime-lookup-skill", "planned", { issue: "#50 후속 (스포츠·날씨 구조화 조회)" }),
+  // URL summaries: web_fetch + the runtime's own model. YouTube transcripts: not yet.
+  entry("summarize", "planned", { issue: "#50 후속 (유튜브 자막)" }),
   entry("pdf", "document", { issue: "#48, #49" }),
   entry("docx", "document", { issue: "#48, #49" }),
   entry("xlsx", "document", { issue: "#48, #49" }),

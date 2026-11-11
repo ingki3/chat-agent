@@ -93,6 +93,7 @@ describe("database", () => {
       "runtime_sessions",
       "sessions",
       "settings",
+      "sources",
       "usage_records",
       "users",
     ]);
