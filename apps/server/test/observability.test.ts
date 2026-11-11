@@ -730,6 +730,79 @@ describe("log file failures", () => {
       expect(recs[1]!.dropped).toBe(1);
     });
 
+  it("finishes a pending truncate before rotating, so no archive ends in a torn line", async () => {
+    const file = tmpLog();
+    let plan: ("short" | "fail")[] = [];
+    let failTruncates = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+        const step = plan.shift();
+        if (step === "fail") throw enospc();
+        return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+      }) as typeof fs.writeSync,
+      ftruncateSync: ((fd: number, n?: number) => {
+        if (failTruncates > 0) {
+          failTruncates--;
+          throw enospc();
+        }
+        return fs.ftruncateSync(fd, n);
+      }) as typeof fs.ftruncateSync,
+    };
+    const s = rotatingFile(file, { io, maxBytes: 130, keep: 5 });
+    const line = (n: number, pad = "") => JSON.stringify({ level: 30, msg: "run.finished", n, pad });
+    await writeTo(s, line(1)); // ~50 bytes
+    // Torn write; the immediate truncate fails, so the partial line is still in the file.
+    plan = ["short", "fail"];
+    failTruncates = 1;
+    await writeTo(s, line(2));
+    // The next line is long enough to rotate (size + line > maxBytes) while the truncate is still pending.
+    await writeTo(s, line(3, "x".repeat(80)));
+    await writeTo(s, line(4));
+    await new Promise<void>((r) => s.end(r));
+    const files = fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith("server.log"));
+    expect(files.length).toBeGreaterThan(1); // rotation did happen
+    const all = files.flatMap((f) => parseAll(path.join(path.dirname(file), f))); // every line of every file parses
+    const ns = all.flatMap((r) => ("n" in r ? [(r as { n: number }).n] : []));
+    expect(ns.sort((a, b) => a - b)).toEqual([1, 3, 4]);
+    expect(s.dropped).toBe(1);
+  });
+
+  it("drops the line and does not rotate while the pending truncate keeps failing", async () => {
+    const file = tmpLog();
+    let plan: ("short" | "fail")[] = [];
+    let failTruncates = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+        const step = plan.shift();
+        if (step === "fail") throw enospc();
+        return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+      }) as typeof fs.writeSync,
+      ftruncateSync: ((fd: number, n?: number) => {
+        if (failTruncates > 0) {
+          failTruncates--;
+          throw enospc();
+        }
+        return fs.ftruncateSync(fd, n);
+      }) as typeof fs.ftruncateSync,
+    };
+    const s = rotatingFile(file, { io, maxBytes: 130, keep: 5 });
+    const line = (n: number, pad = "") => JSON.stringify({ level: 30, msg: "run.finished", n, pad });
+    await writeTo(s, line(1));
+    plan = ["short", "fail"];
+    failTruncates = 2; // the immediate truncate and the one before the rotation both fail
+    await writeTo(s, line(2));
+    await writeTo(s, line(3, "x".repeat(80)));
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["server.log"]); // not archived while torn
+    await writeTo(s, line(4, "y".repeat(80)));
+    await new Promise<void>((r) => s.end(r));
+    const files = fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith("server.log"));
+    const all = files.flatMap((f) => parseAll(path.join(path.dirname(file), f)));
+    expect(all.flatMap((r) => ("n" in r ? [(r as { n: number }).n] : [])).sort()).toEqual([1, 4]);
+    expect(s.dropped).toBe(2);
+  });
+
   it("keeps writing to the current file when rotation fails", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
     const file = path.join(dir, "server.log");

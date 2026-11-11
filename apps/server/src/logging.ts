@@ -270,6 +270,7 @@ export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFi
     }
   };
   const rotate = () => {
+    if (tornAt !== undefined) return; // never archive a file that still ends in a partial line
     try {
       io.rmSync(`${file}.${keep}`, { force: true });
       for (let i = keep - 1; i >= 1; i--)
@@ -299,7 +300,8 @@ export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFi
           io.ftruncateSync(fd!, start);
           size = start;
         } catch {
-          tornAt = start; // undone when the file is next opened
+          tornAt = start; // undone when the file is next opened (before any rotation)
+          size = start;
         }
       }
       throw e;
@@ -316,6 +318,9 @@ export function rotatingFile(file: string, opts: RotateOptions = {}): RotatingFi
     write(chunk, _enc, cb) {
       const buf = typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer);
       try {
+        // A torn line pending removal is cut off first (open() does it), so a torn file is never archived: if the
+        // truncate still fails, open() throws and this line is dropped without rotating.
+        if (fd === undefined || tornAt !== undefined) open();
         if (size > 0 && size + buf.length > maxBytes) rotate();
         if (unreported > 0) {
           const note = { level: 40, time: Date.now(), msg: "log.line_dropped", dropped: unreported };
