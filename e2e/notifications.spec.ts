@@ -36,6 +36,9 @@ async function stubPush(page: Page, answer: "granted" | "denied") {
           keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
         }),
         unsubscribe: async () => {
+          // Tests set this to play a browser that fails to drop the subscription.
+          if (localStorage.getItem("e2e-push-unsubscribe-fails"))
+            throw new DOMException("failed", "AbortError");
           localStorage.removeItem(SUB);
           return true;
         },
@@ -238,6 +241,11 @@ test("tapping a notification while the open window shows the login screen lands 
 
 type Ctx = Awaited<ReturnType<typeof freshContext>>;
 const hashOf = (e: string) => crypto.createHash("sha256").update(e).digest("hex");
+const bindingOf = (page: Page) =>
+  page.evaluate(async () => {
+    const r = await caches.match("/push-binding", { cacheName: "agentlee-push" });
+    return r ? ((await r.json()) as { sessionTag: string | null }) : null;
+  });
 const markerOf = (page: Page) =>
   page.evaluate(async () => {
     const r = await caches.match("/push-reregister", { cacheName: "agentlee-push" });
@@ -362,5 +370,64 @@ test("replacing the registration is safe: a failed registration (503) keeps it, 
   await expect(page.getByTestId("device-state")).toHaveText("켜짐");
   expect((await current()).map((d) => d.id)).not.toContain(first!.id);
   expect(await registered(renewed)).toBe(true);
+  await ctx.close();
+});
+
+test("the browser signs in to another account between a sync's check and its registration: refused, nothing bound", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw, current } = await turnedOn(ctx, SON);
+  const [first] = await current();
+  await renewalFails(ctx, page, sw, 403);
+  await page.request.delete(`/api/push/devices/${first!.id}`, { headers: csrf(baseURL!) });
+  // Next start of son's session: the sync reads son's tag, then — before its registration goes out — mom signs
+  // in on this browser (another tab), so the registration arrives with mom's cookie.
+  let switched = false;
+  await ctx.route("**/api/push/devices", async (route) => {
+    if (route.request().method() !== "POST" || switched) return route.continue();
+    switched = true;
+    const r = await ctx.request.post("/api/auth/login", {
+      data: { email: MOM.email, password: MOM.password },
+      headers: csrf(baseURL!),
+    });
+    expect(r.ok()).toBe(true);
+    const cookie = (await ctx.cookies()).find((c) => c.name === "al_session")!;
+    return route.continue({
+      headers: { ...route.request().headers(), cookie: `al_session=${cookie.value}` },
+    });
+  });
+  await page.reload();
+  await expect.poll(() => switched).toBe(true);
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  await ctx.unroute("**/api/push/devices");
+  const moms = (await (await ctx.request.get("/api/push/devices")).json()) as { devices: unknown[] };
+  expect(moms.devices).toEqual([]);
+  await expect.poll(() => markerOf(page)).toBeNull();
+  expect(await bindingOf(page)).toBeNull();
+  await ctx.close();
+});
+
+test("turning off discards recovery even when the browser fails to unsubscribe: the next start stays off", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw, current } = await turnedOn(ctx, SON);
+  await renewalFails(ctx, page, sw, 403);
+  // The recovery marker is pending (no sync since) while the screen still shows "켜짐".
+  expect(await markerOf(page)).not.toBeNull();
+  await expect(page.getByTestId("device-state")).toHaveText("켜짐");
+  await page.evaluate(() => localStorage.setItem("e2e-push-unsubscribe-fails", "1"));
+  await page.getByTestId("this-device").getByRole("button", { name: "끄기", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("구독을 끊지 못했어요");
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await markerOf(page)).toBeNull();
+  expect(await bindingOf(page)).toBeNull();
+  // The browser still holds a subscription; reconnecting must not turn it back on by itself.
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await current()).toEqual([]);
   await ctx.close();
 });

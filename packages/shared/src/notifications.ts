@@ -63,14 +63,12 @@ export const PushSubscriptionRequest = z.object({
    */
   replaces: z.uuid().optional(),
   /**
-   * The session tag the subscription was turned on under (service worker re-registration). If the browser is now
-   * signed in to another session or account, the server refuses (409 `session_changed`) instead of binding the
-   * device to whoever is signed in.
+   * Required: the tag of the session the caller believes it is registering for (read from `GET /api/push/devices`
+   * by the page, or the stored binding by the service worker). If the browser has meanwhile signed in to another
+   * session or account — another tab, an expired session — the server refuses (409 `session_changed`) instead of
+   * binding the device to whoever is signed in now.
    */
-  sessionTag: z
-    .string()
-    .regex(/^[A-Za-z0-9_-]{16,64}$/)
-    .optional(),
+  sessionTag: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/),
 });
 export type PushSubscriptionRequest = z.infer<typeof PushSubscriptionRequest>;
 

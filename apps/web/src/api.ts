@@ -174,10 +174,18 @@ export const push = {
   key: async () => PushKey.parse(await call("GET", "/api/push/key")).publicKey,
   /** The account's devices and this session's tag. */
   devices: async () => PushDeviceList.parse(await call("GET", "/api/push/devices")),
-  /** Registers this browser; `replaces` = this session's older device, swapped in one server transaction. */
-  register: async (sub: PushSubscriptionJSON, label: string, replaces?: string) =>
+  /**
+   * Registers this browser for the session tagged `sessionTag` (409 `session_changed` if the browser is now
+   * signed in to another one); `replaces` = this session's older device, swapped in one server transaction.
+   */
+  register: async (sub: PushSubscriptionJSON, label: string, sessionTag: string, replaces?: string) =>
     PushDeviceList.parse(
-      await call("POST", "/api/push/devices", { ...sub, label, ...(replaces ? { replaces } : {}) }),
+      await call("POST", "/api/push/devices", {
+        ...sub,
+        label,
+        sessionTag,
+        ...(replaces ? { replaces } : {}),
+      }),
     ),
   remove: async (id: string) => PushDeviceList.parse(await call("DELETE", `/api/push/devices/${enc(id)}`)),
   /** Is this endpoint hash the one registered by my session? (compared on the server) */

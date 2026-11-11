@@ -413,8 +413,7 @@ export class NotificationService {
   subscribe(userId: string, sessionToken: string, req: PushSubscriptionRequest): string {
     if (!validPushEndpoint(req.endpoint)) throw new SubscriptionError("invalid_request");
     // A re-registration made for another session (the browser has since signed in elsewhere) is refused.
-    if (req.sessionTag !== undefined && req.sessionTag !== this.sessionTag(sessionToken))
-      throw new SubscriptionError("session_changed");
+    if (req.sessionTag !== this.sessionTag(sessionToken)) throw new SubscriptionError("session_changed");
     const sessionId = sessionIdOf(sessionToken);
     const id = crypto.randomUUID();
     const secret = encrypt(

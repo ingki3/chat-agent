@@ -1,5 +1,5 @@
-import type { PushDevice } from "@agentlee/shared";
-import { push } from "./api.js";
+import type { PushDeviceList } from "@agentlee/shared";
+import { ApiError, push } from "./api.js";
 import { reconcileAction } from "./push-reconcile.js";
 
 /** Query key of this account's devices, already reconciled with the browser (`syncPush`). */
@@ -92,7 +92,9 @@ function keyBytes(base64url: string): Uint8Array<ArrayBuffer> {
 }
 
 export class PushSetupError extends Error {
-  constructor(readonly reason: "denied" | "unsupported" | "failed") {
+  constructor(
+    readonly reason: "denied" | "unsupported" | "failed" | "session_changed" | "unsubscribe_failed",
+  ) {
     super(reason);
   }
 }
@@ -101,8 +103,10 @@ export class PushSetupError extends Error {
  * "알림 켜기": asks for permission (this click is the only place that does), subscribes with the service's
  * VAPID key and registers the device for the signed-in account and session.
  */
-export async function enablePush(): Promise<void> {
+export async function enablePush(sessionTag?: string): Promise<void> {
   if (!pushSupported()) throw new PushSetupError("unsupported");
+  // The session this screen belongs to; if the browser has since signed in elsewhere the server refuses.
+  const tag = sessionTag ?? (await push.devices()).sessionTag;
   const permission = await Notification.requestPermission();
   if (permission !== "granted") throw new PushSetupError(permission === "denied" ? "denied" : "failed");
   const reg = await registration();
@@ -122,9 +126,18 @@ export async function enablePush(): Promise<void> {
   } catch {
     throw new PushSetupError("failed");
   }
-  const list = await push.register(sub.toJSON(), deviceLabel());
+  let list: PushDeviceList;
+  try {
+    list = await push.register(sub.toJSON(), deviceLabel(), tag);
+  } catch (e) {
+    if (isSessionChanged(e)) throw new PushSetupError("session_changed");
+    throw e;
+  }
   await writeState(BINDING, { sessionTag: list.sessionTag });
 }
+
+const isSessionChanged = (e: unknown) =>
+  e instanceof ApiError && e.status === 409 && e.code === "session_changed";
 
 function sameKey(sub: PushSubscription, publicKey: string): boolean {
   const k = sub.options.applicationServerKey;
@@ -180,12 +193,15 @@ async function sha256Hex(s: string): Promise<string> {
  * register (e.g. 403 after Access expired) is registered on the next start of the *same* session, and "켜짐" is
  * only shown when this browser really has the subscription the server will push to.
  */
-export async function syncPush(): Promise<PushDevice[]> {
+export async function syncPush(): Promise<PushDeviceList> {
   let list = await push.devices();
-  if (!pushSupported()) return list.devices;
+  if (!pushSupported()) return list;
   // Not registered yet (first load, development build): nothing to compare.
   const reg = await navigator.serviceWorker.getRegistration();
-  if (!reg) return list.devices;
+  if (!reg) return list;
+  // Everything below is for the session read here: every registration sends its tag, so if the browser signs in
+  // to another session or account meanwhile (another tab), the server refuses instead of binding it there.
+  const sessionTag = list.sessionTag;
   const sub = await reg.pushManager.getSubscription().catch(() => null);
   const usable = sub && Notification.permission === "granted" ? sub : null;
   const current = list.devices.find((d) => d.current);
@@ -196,25 +212,43 @@ export async function syncPush(): Promise<PushDevice[]> {
     current: !!current,
     match,
     marker,
-    sessionTag: list.sessionTag,
+    sessionTag,
   });
-  if (action === "remove" && current) list = await push.remove(current.id);
-  // On failure this throws before the marker is cleared; a failed replace leaves the old row (server transaction).
-  if (action === "register" && usable) list = await push.register(usable.toJSON(), deviceLabel());
-  if (action === "replace" && usable && current)
-    list = await push.register(usable.toJSON(), deviceLabel(), current.id);
+  try {
+    if (action === "remove" && current) list = await push.remove(current.id);
+    // On failure this throws before the marker is cleared; a failed replace leaves the old row (server transaction).
+    if (action === "register" && usable)
+      list = await push.register(usable.toJSON(), deviceLabel(), sessionTag);
+    if (action === "replace" && usable && current)
+      list = await push.register(usable.toJSON(), deviceLabel(), sessionTag, current.id);
+  } catch (e) {
+    if (!isSessionChanged(e)) throw e;
+    // Another session took over this browser: drop every recovery intent of the old one and stay off.
+    await writeState(REREGISTER, null);
+    await writeState(BINDING, null);
+    return push.devices();
+  }
   if (marker) await writeState(REREGISTER, null);
   const on = !!usable && (action === "register" || action === "replace" || (action === "none" && match));
-  await writeState(BINDING, on ? { sessionTag: list.sessionTag } : null);
-  return list.devices;
+  await writeState(BINDING, on ? { sessionTag } : null);
+  return list;
 }
 
 /** "끄기" on this device: the browser stops the subscription, the server forgets the device. */
 export async function disablePush(deviceId: string | undefined): Promise<void> {
-  const sub = await currentSubscription();
-  await sub?.unsubscribe().catch(() => {});
+  // An explicit "off" discards every recovery intent first: nothing may turn this device on again by itself.
+  await writeState(REREGISTER, null);
   await writeState(BINDING, null);
+  let unsubscribed = true;
+  try {
+    const sub = await currentSubscription();
+    if (sub && !(await sub.unsubscribe())) unsubscribed = false;
+  } catch {
+    unsubscribed = false;
+  }
   if (deviceId) await push.remove(deviceId);
+  // The server no longer pushes here either way; say that the browser kept its subscription.
+  if (!unsubscribed) throw new PushSetupError("unsubscribe_failed");
 }
 
 /** Logging out: this browser stops receiving this account's pushes (the server also drops the device). */

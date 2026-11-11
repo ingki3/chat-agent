@@ -38,18 +38,22 @@ export function NotificationSettings() {
   // Reconciled with this browser's real subscription on every visit: "켜짐" only when pushes really arrive here
   // (a withdrawn permission or a lost subscription removes the stale row; a renewed one is registered).
   const devices = useQuery({ queryKey: DEVICES_KEY, queryFn: syncPush, staleTime: 0 });
-  const current = devices.data?.find((d) => d.current);
+  const current = devices.data?.devices.find((d) => d.current);
   const state: DeviceState = browser !== "off" ? browser : current ? "on" : "off";
   const [message, setMessage] = useState<string>();
   const refresh = () => qc.invalidateQueries({ queryKey: DEVICES_KEY });
 
   const turnOn = useMutation({
     // The browser's permission prompt opens from this click only.
-    mutationFn: enablePush,
+    mutationFn: () => enablePush(devices.data?.sessionTag),
     onMutate: () => setMessage(undefined),
     onError: (e) => {
       if (e instanceof PushSetupError && e.reason === "denied") setBrowser("denied");
       else if (e instanceof PushSetupError && e.reason === "unsupported") setBrowser("unsupported");
+      else if (e instanceof PushSetupError && e.reason === "session_changed")
+        setMessage(
+          "이 브라우저가 다른 계정이나 새 로그인으로 바뀌었어요. 페이지를 새로 고친 뒤 다시 켜 주세요.",
+        );
       else if (e instanceof PushSetupError)
         setMessage("알림을 켜지 못했어요. 잠시 뒤 다시 시도하세요. (허용 창을 닫았다면 다시 눌러 주세요.)");
       else setMessage(errorText(e));
@@ -64,7 +68,13 @@ export function NotificationSettings() {
       if (d.current) await disablePush(d.id);
       else await push.remove(d.id);
     },
-    onError: (e) => setMessage(errorText(e)),
+    onMutate: () => setMessage(undefined),
+    onError: (e) =>
+      setMessage(
+        e instanceof PushSetupError && e.reason === "unsubscribe_failed"
+          ? "알림을 껐지만 이 브라우저의 구독을 끊지 못했어요. 이 기기로는 더 보내지 않아요. 브라우저 사이트 설정에서 알림을 차단하면 완전히 멈춰요."
+          : errorText(e),
+      ),
     onSettled: refresh,
   });
   const test = useMutation({
@@ -76,7 +86,7 @@ export function NotificationSettings() {
     onError: (e) => setMessage(errorText(e)),
   });
   const [badgeText, badgeClass] = STATE_BADGE[state];
-  const others = devices.data?.filter((d) => !d.current) ?? [];
+  const others = devices.data?.devices.filter((d) => !d.current) ?? [];
 
   return (
     <section className="panel" id="notifications" aria-labelledby="noti-h">

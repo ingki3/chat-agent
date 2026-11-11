@@ -97,10 +97,14 @@ async function setup(o: { db?: Db; now?: number; log?: PassThrough } = {}) {
       endpoint,
       keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
       label: "Android · Chrome",
+      sessionTag: await tagOf(who),
     });
     return { r, endpoint };
   };
-  return { app, db, clock, push, member, api, subscribe, svc: app.notifications! };
+  /** This session's tag, as the page reads it. */
+  const tagOf = async (who: { cookie: string }) =>
+    (await api(who, "GET", "/api/push/devices")).json<{ sessionTag: string }>().sessionTag;
+  return { app, db, clock, push, member, api, subscribe, tagOf, svc: app.notifications! };
 }
 
 describe("text rules (FR-13.5)", () => {
@@ -335,10 +339,17 @@ describe("devices", () => {
       sessionTag: ownTag,
     });
     expect(ok.statusCode).toBe(201);
+    // Without a tag nothing is registered.
+    const untagged = await api(son, "POST", "/api/push/devices", {
+      endpoint: "https://fcm.googleapis.com/fcm/send/untagged",
+      keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
+      label: "x",
+    });
+    expect(untagged.statusCode).toBe(400);
   });
 
   it("replacing this session's device is one transaction: a failed registration keeps the old one", async () => {
-    const { app, member, subscribe, api, svc } = await setup();
+    const { app, member, subscribe, api, svc, tagOf } = await setup();
     const mom = member("mom");
     const old = (await subscribe(mom)).r.json<{ id: string }>().id;
     const keys = { p256dh: "B".repeat(87), auth: "A".repeat(22) };
@@ -346,6 +357,7 @@ describe("devices", () => {
       endpoint: "https://evil.example/x",
       keys,
       label: "x",
+      sessionTag: await tagOf(mom),
       replaces: old,
     });
     expect(bad.statusCode).toBe(400);
@@ -354,6 +366,7 @@ describe("devices", () => {
       endpoint: "https://fcm.googleapis.com/fcm/send/renewed",
       keys,
       label: "x",
+      sessionTag: await tagOf(mom),
       replaces: old,
     });
     const now = svc.devices(mom.user.id, undefined);
@@ -365,6 +378,7 @@ describe("devices", () => {
       endpoint: "https://fcm.googleapis.com/fcm/send/third",
       keys,
       label: "x",
+      sessionTag: await tagOf(mom),
       replaces: sons,
     });
     expect(svc.devices(son.user.id, undefined).map((d) => d.id)).toEqual([sons]);
@@ -375,6 +389,7 @@ describe("devices", () => {
       endpoint: "https://fcm.googleapis.com/fcm/send/fourth",
       keys,
       label: "x",
+      sessionTag: await tagOf(mom),
       replaces: other,
     });
     expect(svc.devices(mom.user.id, undefined).map((d) => d.id)).toContain(other);
