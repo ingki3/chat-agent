@@ -12,14 +12,15 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
  *   one space, lower case;
  * - common HTML entities decoded (`&amp;` `&minus;` `&nbsp;` `&#8722;` `&#x2212;` …) — page text can still carry
  *   them;
- * - inline footnote numbers dropped: `[3]` (one to three digits in brackets, not next to a digit) and superscript
- *   digits right after a Hangul / Han / Kana character at a word end.
- * A hyphen at a line end is **not** joined (`x−\ny`, `re-\nsign` are ambiguous): a wrapped word shows as not found.
+ * Footnote marks are **not** removed (`[3]`, `²` stay as written — `arr[1]` is not `arr[2]`), and a hyphen at a line end is **not** joined (`x−\ny`, `re-\nsign` are ambiguous): a wrapped word shows as not found.
  * When in doubt, nothing is normalised — a false "not found" shows ⚠️, a false "verified" must not happen.
  * Then the snippet must occur **as a whole**: no fuzzy matching, no partial overlap, no joining of pieces. A match
- * must start at a word boundary and not inside a number (`32%` is not found in `132%`, `1.32%`, `-32%`; `234` not
- * in `1,234`), and must not end in the middle of a number or a Latin word (`3` not in `3.5`); a Korean particle
- * after the end is fine (`반도체 수출` in `반도체 수출이`).
+ * must not start or end inside a token: the source characters right before and after it must not be a letter,
+ * digit, mark, modifier, superscript or subscript (`32m` is not found in `32m²`, `(10)` not in `(10)²`, `H` not
+ * in `H₂O`, `32%` not in `132%`). Exceptions at the end only: a Korean particle (Hangul after a Hangul end —
+ * `반도체 수출` in `반도체 수출이`), and a quote that itself ends with sentence punctuation. A match also must not
+ * start inside a number after a separator or sign (`1.32%`, `1,234`, `-32%`) or end before the rest of a decimal
+ * (`3` not in `3.5`).
  *
  * Normalising is one linear pass with per-character caches; a page's normalised text is cached by its body hash
  * (the same page is usually cited several times in a run).
@@ -28,9 +29,13 @@ import { boundText, CITATION_LIMITS } from "@agentlee/shared";
 const QUOTES = /["'`´‘’‚‛“”„‟«»‹›「」『』〝〞〟＂＇′″]/gu;
 const DASHES = /[‐‑‒–—―−]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
-const WORD = /[\p{L}\p{N}]/u;
 const DIGIT = /\p{N}/u;
-const LATIN = /\p{Script=Latin}/u;
+/**
+ * A character that belongs to a token: letter, digit or mark. That covers modifier letters (`ʰ`, \p{Lm} ⊂ \p{L}),
+ * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
+ */
+const TOKEN = /[\p{L}\p{N}\p{M}]/u;
+const HANGUL = /\p{Script=Hangul}/u;
 const SPACE = /\s/u;
 
 const ENTITIES: Record<string, string> = {
@@ -60,10 +65,6 @@ const ENTITIES: Record<string, string> = {
   percnt: "%",
 };
 const ENTITY = /^&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|([a-zA-Z]{2,8}));/;
-
-/** Superscript digits used as footnote numbers (¹²³⁰⁴…⁹). */
-const isSuperscriptDigit = (c: number) =>
-  c === 0xb9 || c === 0xb2 || c === 0xb3 || (c >= 0x2070 && c <= 0x2079);
 
 /**
  * Whether a code point attaches to the cluster before it: combining marks, Hangul medial/final jamo, joiners and
@@ -152,25 +153,6 @@ export function normalizeWithMap(text: string): Normalized {
       else put(ch, s, e);
     }
   };
-  /** The code point that ends right before `i` in the source text. */
-  const rawBefore = (i: number) => {
-    if (i <= 0) return "";
-    const c = text.charCodeAt(i - 1);
-    return c >= 0xdc00 && c <= 0xdfff && i >= 2 ? text.slice(i - 2, i) : text[i - 1]!;
-  };
-  /** A word end after a footnote: end of text, a space, or punctuation (not a letter, digit or unit). */
-  const wordEndAt = (j: number) => {
-    const next = text.codePointAt(j);
-    return next === undefined || !/[\p{L}\p{N}\p{M}]/u.test(String.fromCodePoint(next));
-  };
-  /**
-   * Superscript digits at `[s, e)` that are a footnote: only right after a Hangul, Han or Kana character, at a word
-   * end (`반겼다²`). Anywhere else (`10²`, `m²`, `(10)²`, `so.¹`) they are kept as the characters they are.
-   */
-  const superscriptNote = (s: number, e: number) =>
-    /[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(rawBefore(s)) &&
-    wordEndAt(e);
-
   let i = 0;
   while (i < len) {
     const c = text.charCodeAt(i);
@@ -185,19 +167,6 @@ export function normalizeWithMap(text: string): Normalized {
       } else if (c === 34 || c === 39 || c === 96) {
         put('"', i, i + 1);
         i++;
-      } else if (c === 91) {
-        const m = /^\[\d{1,3}\]/.exec(text.slice(i, i + 5));
-        // An inline footnote number — not next to a digit, where dropping it would join two numbers.
-        if (
-          m &&
-          !DIGIT.test(rawBefore(i)) &&
-          !/^\p{N}/u.test(text.slice(i + m[0].length, i + m[0].length + 2))
-        )
-          i += m[0].length;
-        else {
-          put("[", i, i + 1);
-          i++;
-        }
       } else if (c === 38) {
         const m = ENTITY.exec(text.slice(i, i + 12));
         const decoded = m
@@ -222,14 +191,6 @@ export function normalizeWithMap(text: string): Normalized {
     // A cluster: this code point and the ones that join it.
     const start = i;
     i += c >= 0xd800 && c <= 0xdbff && i + 1 < len ? 2 : 1;
-    if (isSuperscriptDigit(c)) {
-      let e = i;
-      while (e < len && isSuperscriptDigit(text.charCodeAt(e))) e++;
-      if (superscriptNote(start, e)) {
-        i = e; // a footnote number
-        continue;
-      }
-    }
     while (i < len) {
       const cp = text.codePointAt(i)!;
       if (!joins(cp)) break;
@@ -292,9 +253,11 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
   const { norm, from, to } = normalizedBody(body, cacheKey);
   const first = firstChar(want);
   const last = lastChar(want);
+  const endsSentence = /[.!?。！？]$/u.test(want);
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
-    if (WORD.test(first) && WORD.test(before)) continue;
+    // Not inside a token at the start.
+    if (TOKEN.test(before)) continue;
     // Not inside a number: `1.32%`, `1,234`, `-32%` (a sign changes the figure).
     if (
       DIGIT.test(first) &&
@@ -304,8 +267,11 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
       continue;
     const rest = norm.slice(at + want.length, at + want.length + 3);
     const after = firstChar(rest);
-    if (DIGIT.test(last) && (DIGIT.test(after) || /^[.,]\p{N}/u.test(rest))) continue;
-    if (LATIN.test(last) && LATIN.test(after)) continue;
+    // Not before the rest of a decimal (`3` in `3.5`, also `3.` in `3.5`).
+    if (DIGIT.test(last) && /^[.,]\p{N}/u.test(rest)) continue;
+    if (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1))) && DIGIT.test(after)) continue;
+    // Not inside a token at the end — except a Korean particle, or a quote that ends a sentence.
+    if (TOKEN.test(after) && !(HANGUL.test(last) && HANGUL.test(after)) && !endsSentence) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
     const quote = body.slice(start, end).replace(/\s+/g, " ").trim();

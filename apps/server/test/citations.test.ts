@@ -138,14 +138,19 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("Then xy was used", wrapped)).toBe(false);
     expect(found("Then x- y was used", wrapped)).toBe(true);
     expect(found("Semiconductor exports rose", "Semicon-\r\nductor exports rose.")).toBe(false);
+    // Round 4: footnote marks are never removed — the page is compared as written. A quote that leaves one out is
+    // not found (⚠️); one that keeps it is.
     const notes = "수출이 크게 늘었다[3]. 업계는 반겼다²³. 정부는 지원을 약속했다[12][13].";
-    expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(true);
-    expect(found("정부는 지원을 약속했다.", notes)).toBe(true);
+    expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(false);
+    expect(found("정부는 지원을 약속했다.", notes)).toBe(false);
     expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(true);
-    // Round 3: a superscript is dropped only after Hangul / Han / Kana — not after punctuation or a bracket.
+    expect(found("업계는 반겼다²³. 정부는", notes)).toBe(true);
     expect(found("said so. Then they left", "They said so.¹ Then they left.")).toBe(false);
-    // Round 2–3: superscripts after a digit or a unit are exponents (and no NFKC: ² is not 2), [n] next to a digit
-    // is not a footnote.
+    // Different array elements are different text.
+    expect(found("the value of arr[2] is used", "the value of arr[1] is used here.")).toBe(false);
+    expect(found("the value of arr is used", "the value of arr[1] is used here.")).toBe(false);
+    expect(found("the value of arr[1] is used", "the value of arr[1] is used here.")).toBe(true);
+    // Superscripts after a digit or a unit are exponents (and no NFKC: ² is not 2).
     expect(found("참가자는 10만 명이었다", "참가자는 10²만 명이었다.")).toBe(false);
     expect(found("참가자는 102만 명이었다", "참가자는 10²만 명이었다.")).toBe(false);
     expect(found("참가자는 10²만 명이었다", "참가자는 10²만 명이었다.")).toBe(true);
@@ -161,6 +166,30 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("값은 1234원이었다", "값은 12[3]34원이었다.")).toBe(false);
     expect(found("값은 12원이었다", "값은 12[3]원이었다.")).toBe(false);
     expect(found("값은 34원이었다고", "값은 [3]34원이었다고 했다.")).toBe(false);
+  });
+
+  it("a match neither starts nor ends inside a token (round 4)", () => {
+    // The three review cases: the quote stops right before a superscript or subscript.
+    expect(found("면적은 정확히 32m", "면적은 정확히 32m² 이었다.")).toBe(false);
+    expect(found("넓이는 정확히 (10)", "넓이는 정확히 (10)² 이었다.")).toBe(false);
+    expect(found("이 물질의 화학식은 H", "이 물질의 화학식은 H₂O 이다.")).toBe(false);
+    // Modifier letters and marks count too; the start mirrors the end.
+    expect(found("value was abcdefgh", "the value was abcdefghʰ ok")).toBe(false);
+    // A combining mark that does not compose (x + U+0333) is part of the token.
+    expect(found("value was abcdefgx", "the value was abcdefgx\u0333 ok")).toBe(false);
+    expect(found("value was abcdefgx\u0333", "the value was abcdefgx\u0333 ok")).toBe(true);
+    expect(found("conductor exports rose", "Semiconductor exports rose.")).toBe(false);
+    expect(found("도체 수출이 전년 같은", "반도체 수출이 전년 같은 달.")).toBe(false);
+    expect(found("% 늘었다고 밝혔다", "매출은 132% 늘었다고 밝혔다.")).toBe(false);
+    expect(found("₂O 분자가 있었다", "그 안에 H₂O 분자가 있었다.")).toBe(false);
+    // Positive controls: whole tokens, a Korean particle, a quote that ends its sentence.
+    expect(found("면적은 정확히 32m²", "면적은 정확히 32m² 이었다.")).toBe(true);
+    expect(found("이 물질의 화학식은 H₂O", "이 물질의 화학식은 H₂O 이다.")).toBe(true);
+    expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true);
+    expect(found("수출이 크게 늘었다.", "수출이 크게 늘었다.[3] 업계는")).toBe(true);
+    expect(found("Exports rose sharply.", "Exports rose sharply.²")).toBe(true);
+    // …but a full stop is not a sentence end inside a decimal.
+    expect(found("성장률은 무려 3.", "성장률은 무려 3.5%였다.")).toBe(false);
   });
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
@@ -545,6 +574,10 @@ describe("paragraphs that need a citation", () => {
     // Round 3: prose after ASCII words at a line end is a marker; only expressions are indexing.
     expect(ns("Exports increased this year[1]  \n")).toEqual([1]);
     expect(ns("신제품 이름은 Galaxy Ultra[1]  \n다음")).toEqual([1]);
+    // Round 4: a comma, a hyphen or `&` before the name is prose, not an expression.
+    expect(ns("지원 운영체제는 Windows, Linux[1]\n")).toEqual([1]);
+    expect(ns("사용한 모델은 GPT-4o[1]\n")).toEqual([1]);
+    expect(ns("기준 지수는 S&P500[1]\n")).toEqual([1]);
     expect(ns("모델은 X1[2]")).toEqual([2]);
     expect(ns("Exports rose[4].")).toEqual([4]);
     for (const t of [
@@ -557,7 +590,7 @@ describe("paragraphs that need a citation", () => {
       // Round 3: expressions only.
       "y = foo(a[1]\n",
       "obj.items[1]\n",
-      "f(x, a[1]\n",
+      "f(a[1]\n",
       "m[0][1]\n",
       "total += arr[2]  \n",
     ])

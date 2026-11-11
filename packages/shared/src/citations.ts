@@ -257,20 +257,20 @@ export function citationMarkers(
 const END = /[.!?。！？]/u;
 
 /**
- * Whether a marker at `start` is array indexing in a code-like expression: it directly follows an identifier
- * (`a[1]`, `items[1]`), and an operator stands right before that identifier (`x = a[1]`, `foo(a[1]`,
- * `obj.items[1]`, `a[0][1]` is a chain). A prose line ending in `… this year[1]` or `Galaxy Ultra[1]` is not one
- * (review #97 round 3). Code blocks and inline code are never markers anyway.
+ * Whether a marker at `start` is array indexing: right after an identifier that is itself directly preceded by
+ * `=` (also `+=`, `==`; spaces allowed), `(` (spaces allowed), `.`, `[` or `]` — `x = a[1]`, `f(a[1]`,
+ * `obj.items[1]`, `m[0][1]`. Nothing else counts (review #97 round 4): `Windows, Linux[1]`, `GPT-4o[1]`,
+ * `S&P500[1]` are citation markers. Code blocks and inline code are never markers anyway.
  */
 function inExpression(text: string, start: number): boolean {
   const prev = text[start - 1] ?? "";
-  if (prev === "]") return true; // a[0][1]
+  if (prev === "]") return true; // m[0][1]
   if (!/[A-Za-z0-9_]/.test(prev)) return false;
   let k = start - 1;
   while (k >= 0 && /[A-Za-z0-9_]/.test(text[k]!)) k--;
-  if (k >= 0 && /[.\]]/.test(text[k]!)) return true; // obj.items[1], a[0][1]
+  if (k >= 0 && /[.[\]]/.test(text[k]!)) return true;
   while (k >= 0 && (text[k] === " " || text[k] === "\t")) k--;
-  return k >= 0 && /[=(;{,+\-*/<>!&|[]/.test(text[k]!);
+  return k >= 0 && /[=(]/.test(text[k]!);
 }
 /**
  * Markers that stand where a citation stands — at the end of a sentence: right before sentence punctuation (not
