@@ -34,12 +34,21 @@ const QUOTES =
 /** One quote character (any style the fold above maps), whole string. */
 const QUOTE_CHAR =
   /^["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]$/u;
+/** Currency signs that may stand right before a number (fullwidth `＄` folds to `$`). */
+const CURRENCY = /^[$€¥£₩₹\uFFE5\uFFE1\uFFE6]$/u;
+/**
+ * A multiplier after a number, across a space (closed list, case kept): a Korean numeral unit, an English
+ * magnitude word, or `K` `M` `B` `bn` `mn` as a whole token.
+ */
+const MULTIPLIER_AFTER =
+  /^ ?(?:[십백천만억조경]|(?:thousand|million|billion|trillion)(?![\p{L}\p{N}\p{M}])|(?:K|M|B|bn|mn)(?![\p{L}\p{N}\p{M}]))/u;
 const UNIT_QUOTE_AFTER =
   /^ ?["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/u;
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
 /** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
 const TILDES = /[\u223C\u301C]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
+const INVISIBLE_CHAR = /^[\u200B-\u200D\u2060\uFEFF\u00AD]$/u;
 const DIGIT = /\p{N}/u;
 /**
  * A character that belongs to a token: letter, digit or mark. That covers modifier letters (`ʰ`, \p{Lm} ⊂ \p{L}),
@@ -275,7 +284,7 @@ export function normalizeWithMap(text: string): Normalized {
    */
   const afterDigit = (i: number) => {
     let k = i - 1;
-    while (k >= 0 && SPACE.test(text[k]!)) k--;
+    while (k >= 0 && (SPACE.test(text[k]!) || INVISIBLE_CHAR.test(text[k]!))) k--;
     return k >= 0 && DIGIT.test(text[k]!);
   };
   let i = 0;
@@ -337,16 +346,27 @@ function safeFromCodePoint(cp: number): string | undefined {
  * quote mark at the other end (`"…12"` wraps the whole snippet).
  */
 export function normalizeSnippet(snippet: string): string {
+  return snippetForms(snippet).stripped;
+}
+
+/**
+ * The snippet normalised, and — when the model wrapped it in a pair of quote marks — the form with that first
+ * pair still on (`“올해 매출 목표는 100”`): the page may have the very same quotes around a number.
+ */
+function snippetForms(snippet: string): { stripped: string; wrapped?: string } {
   let s = normalizeWithMap(snippet).norm;
+  let wrapped: string | undefined;
   for (;;) {
     const before = s;
     s = s.replace(/^(?:\s|\.{3,})+|(?:\s|\.{3,})+$/gu, "");
     const opens = QUOTE_CHAR.test(firstChar(s));
     const closes = s.length > 1 && QUOTE_CHAR.test(lastChar(s));
-    if (opens && closes) s = Array.from(s).slice(1, -1).join("");
-    else if (opens && !/^.\s*\p{N}/u.test(s)) s = Array.from(s).slice(1).join("");
+    if (opens && closes) {
+      wrapped ??= s;
+      s = Array.from(s).slice(1, -1).join("");
+    } else if (opens && !/^.\s*\p{N}/u.test(s)) s = Array.from(s).slice(1).join("");
     else if (closes && !/\p{N}\s*.$/u.test(s)) s = Array.from(s).slice(0, -1).join("");
-    if (s === before) return s;
+    if (s === before) return wrapped === undefined ? { stripped: s } : { stripped: s, wrapped };
   }
 }
 
@@ -387,19 +407,33 @@ export type SnippetMatch =
  * normalised text.
  */
 export function findSnippet(body: string, snippet: string, cacheKey?: string): SnippetMatch {
-  const want = normalizeSnippet(snippet);
-  if (Array.from(want).length < CITATION_LIMITS.minSnippet) return { found: false, reason: "too_short" };
-  const { norm, from, to } = normalizedBody(body, cacheKey);
+  const forms = snippetForms(snippet);
+  if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet)
+    return { found: false, reason: "too_short" };
+  const page = normalizedBody(body, cacheKey);
+  // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
+  for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
+    const quote = matchIn(body, page, want);
+    if (quote !== undefined) return { found: true, quote };
+  }
+  return { found: false, reason: "not_found" };
+}
+
+/** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
+function matchIn(body: string, { norm, from, to }: Normalized, want: string): string | undefined {
   const first = firstChar(want);
+  const second = firstChar(want.slice(first.length));
   const last = lastChar(want);
+  // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
+  const numberStart = DIGIT.test(first) || (CURRENCY.test(first) && DIGIT.test(second));
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
     // Not inside a token at the start.
     if (TOKEN.test(before)) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
-    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`).
+    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
     if (
-      DIGIT.test(first) &&
+      numberStart &&
       (SIGN_BEFORE.test(norm.slice(Math.max(0, at - 2), at)) ||
         NUMBER_BEFORE.test(norm.slice(Math.max(0, at - 4), at)))
     )
@@ -413,14 +447,16 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     // Not before a unit quote either (`12` is not in `12'`, `12 '`): after a digit the page's quote marks are kept
     // as they are, so any quote mark there is a unit.
     if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
+    // Not before a multiplier across a space (`10 만`, `1 억` from `<b>10</b>만`; `100 million`, `5 bn`).
+    if (DIGIT.test(last) && MULTIPLIER_AFTER.test(norm.slice(at + want.length, at + want.length + 10)))
+      continue;
     if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
-    const quote = body.slice(start, end).replace(/\s+/g, " ").trim();
-    return { found: true, quote: boundText(quote, CITATION_LIMITS.snippet) };
+    return boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet);
   }
-  return { found: false, reason: "not_found" };
+  return undefined;
 }

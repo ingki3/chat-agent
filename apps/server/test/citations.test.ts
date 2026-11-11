@@ -131,6 +131,56 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("그는 “좋다”고 말했다", '그는 "좋다"고 말했다.')).toBe(true);
   });
 
+  it("round 14: a sign before a currency sign, multipliers across a space, wrapped quotes kept", () => {
+    // 1. The sign before `$100`, also across a space and as HTML puts it.
+    expect(
+      found("$100 million in operating profit", "The company reported -$100 million in operating profit."),
+    ).toBe(false);
+    expect(found("$5 million.", "Net income: - $5 million.")).toBe(false);
+    expect(found("$5 million in total", "Net income: −$5 million in total.")).toBe(false);
+    expect(found("$5 million in total", "Net income: -\n$5 million in total.")).toBe(false); // <span>-</span>$5
+    expect(found("₩5,000 감소했다고 밝혔다", "매출은 -₩5,000 감소했다고 밝혔다.")).toBe(false);
+    expect(
+      found("$100 million in operating profit", "The company reported 1-$100 million in operating profit."),
+    ).toBe(false);
+    expect(
+      found("$100 million in operating profit", "The company reported $100 million in operating profit."),
+    ).toBe(true);
+    expect(
+      found("-$100 million in operating profit", "The company reported -$100 million in operating profit."),
+    ).toBe(true);
+    // A currency sign without a number after it is no number.
+    expect(found("€ 기호는 유로를 뜻한다", "표의 -€ 기호는 유로를 뜻한다.")).toBe(true);
+    // 2. A multiplier across a space after the number.
+    expect(found("총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다.")).toBe(false);
+    expect(found("예상 피해액은 1", "예상 피해액은 1 억원입니다.")).toBe(false);
+    expect(found("총 투자 금액은 3", "총 투자 금액은 3 천만 원이다.")).toBe(false);
+    expect(found("The company reported $100", "The company reported $100 million.")).toBe(false);
+    expect(found("The company reported 5", "The company reported 5 billion dollars.")).toBe(false);
+    expect(found("The company reported 5", "The company reported 5 bn dollars.")).toBe(false);
+    expect(found("The company reported 5", "The company reported 5M dollars.")).toBe(false);
+    expect(found("The company reported 5", "The company reported 5 K users.")).toBe(false);
+    // Controls: other words after the number, a whole quote, case kept (Million is not on the list).
+    expect(found("The company reported $100", "The company reported $100 in fees.")).toBe(true);
+    expect(found("The company reported 5", "The company reported 5 MBps links.")).toBe(true);
+    expect(found("The company reported 5", "The company reported 5 Million users.")).toBe(true);
+    expect(found("총 투자 금액은 10 만", "총 투자 금액은 10 만 달러입니다.")).toBe(true);
+    // 3. A snippet sent with the page's own quotes around a number verifies as sent.
+    expect(found("“올해 매출 목표는 100”", "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(true);
+    expect(found("“1,000,000”", "표에 적힌 값은 “1,000,000”이다.")).toBe(true);
+    expect(found("“1,000,000원”", "표에 적힌 값은 “1,000,000원”이다.")).toBe(true);
+    expect(found('"내년 성장률 목표는 3.5"', '그는 "내년 성장률 목표는 3.5"라고 했다.')).toBe(true);
+    // …the opening quote folds as usual; the closing one after the digit must be the same mark.
+    expect(found('"올해 매출 목표는 100”', "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(true);
+    expect(found('“올해 매출 목표는 100"', "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(false);
+    // The unit rejections stay.
+    expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
+    expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
+    // P3: a zero-width character between the number and the unit quote.
+    expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12\u200B'이다.")).toBe(false);
+    expect(found("제품의 전체 길이는 12'", "제품의 전체 길이는 12\u200B'이다.")).toBe(true);
+  });
+
   it("a unit quote is never trimmed off the snippet, and spaces before it still make it a unit (round 13)", () => {
     // Codex: the trailing `"` after a digit is a unit, not a wrapping quote.
     expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
