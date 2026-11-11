@@ -82,7 +82,7 @@
   - **Codex:** `config.toml`에는 `url`과 `bearer_token_env_var = "AGENTLEE_MCP_TOKEN"`만 적는다. 토큰은 app-server 환경 변수로만 넘긴다(`codexMcpEnv`).
   - 샌드박스 네트워크는 `{ loopbackPorts: [mcpLoopbackPort(mcp)] }`이다.
 - **스킬:** 허용 목록(`BUNDLED_SKILLS`, 지금은 검증용 `selftest` 하나)에 있는 것만 `skill_<이름>` 도구로 보인다. 실행은 `runIsolated`로 한다.
-  - 읽기: 스킬 폴더와 node 설치 폴더만
+  - 읽기: 스킬 폴더와 node 실행 파일만(설치 폴더는 읽지 못함 — 시스템 라이브러리만 쓰는 공식 빌드 node 필요, 아니면 `skill_failed`로 막힘)
   - 쓰기·네트워크·자식 프로세스·환경 변수: 없음
   - 입력은 실행 전에 검증한다.
   - macOS가 아니면 `skill_unavailable`로 거부한다.
