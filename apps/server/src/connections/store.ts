@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, gte, isNull, lte } from "drizzle-orm";
 import {
   DEFAULT_PERMISSIONS,
   type Connection,
@@ -33,11 +33,18 @@ export class ConnectionRuleError extends Error {
 
 /** Provider formats of each credential. A value that does not look like one is refused (400 `invalid_secret`). */
 const SECRET_FORMAT: Record<RuntimeId, Partial<Record<ConnectionAuthType, RegExp>>> = {
-  // Anthropic API key; the Claude subscription's long-lived token from `claude setup-token`.
-  "claude-code": { api_key: /^sk-ant-[A-Za-z0-9_-]{20,}$/, subscription: /^[A-Za-z0-9_.-]{20,}$/ },
-  // OpenAI API key. Each member's own ChatGPT login (device code in the web screen) comes with #18.
+  // Anthropic API key; the Claude subscription's long-lived token from `claude setup-token` (an API key pasted as
+  // a subscription is refused: it would be billed as API use while the screen says "구독").
+  "claude-code": {
+    api_key: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
+    subscription: /^(?!sk-ant-api)[A-Za-z0-9_.-]{20,}$/,
+  },
+  // OpenAI API key only: a ChatGPT login is never pasted — it comes from the device-code login (#18, `login.ts`).
   codex: { api_key: /^sk-[A-Za-z0-9_-]{20,}$/ },
 };
+
+/** Auth types that are created by a login flow on the server, never from a pasted value. */
+const LOGIN_ONLY: Partial<Record<RuntimeId, ConnectionAuthType>> = { codex: "subscription" };
 
 export const RUNTIME_LABEL: Record<RuntimeId, string> = { "claude-code": "Claude Code", codex: "Codex" };
 
@@ -61,6 +68,7 @@ export function toConnection(c: ConnectionRow): Connection {
     ownerId: c.ownerId ?? null,
     label: c.label,
     hint: c.hint ?? null,
+    accountEmail: c.accountEmail ?? null,
     status: c.status,
     lastTestAt: c.lastTestAt ?? null,
     lastTestCode: c.lastTestCode ?? null,
@@ -77,6 +85,8 @@ export type ResolvedConnection = {
   dir: string;
   authType: ConnectionAuthType;
   secret: string;
+  /** The credential's current version (a ChatGPT login refreshes from it). */
+  version: number;
 };
 
 /**
@@ -137,7 +147,8 @@ export class ConnectionStore {
    * Registers a connection. Rules (PRD D2, FR-11.1/11.4), checked here so that every route goes through them:
    * - shared connections take API keys only (400 `shared_subscription`);
    * - a Claude subscription only on an admin's own account (403 `subscription_not_allowed`);
-   * - a Codex subscription (ChatGPT login) is not available yet (#18, 400 `unsupported_auth`);
+   * - a Codex subscription (ChatGPT login) is only made by the device-code login (400 `login_required`,
+   *   `createLogin`);
    * - the credential must look like the provider's (400 `invalid_secret`).
    */
   create(input: {
@@ -155,6 +166,7 @@ export class ConnectionStore {
     if (input.scope === "shared" && input.owner) throw new ConnectionRuleError(400, "invalid_request");
     if (input.authType === "subscription" && input.runtime === "claude-code" && input.owner?.role !== "admin")
       throw new ConnectionRuleError(403, "subscription_not_allowed");
+    if (LOGIN_ONLY[input.runtime] === input.authType) throw new ConnectionRuleError(400, "login_required");
     const format = SECRET_FORMAT[input.runtime][input.authType];
     if (!format) throw new ConnectionRuleError(400, "unsupported_auth");
     const secret = input.secret.trim();
@@ -173,7 +185,9 @@ export class ConnectionStore {
         `${RUNTIME_LABEL[input.runtime]} ${AUTH_LABEL[input.authType]}${input.scope === "shared" ? " (공용)" : ""}`,
       secret: encrypt(secret, this.masterKey, aad({ id, runtime: input.runtime, authType: input.authType })),
       credentialVersion: 1,
+      credentialBaseVersion: 1,
       hint: mask(secret),
+      accountEmail: null,
       status: "untested",
       lastTestAt: null,
       lastTestCode: null,
@@ -193,10 +207,13 @@ export class ConnectionStore {
     if (patch.label !== undefined) set.label = patch.label;
     if (patch.secret !== undefined) {
       const secret = patch.secret.trim();
+      if (LOGIN_ONLY[c.runtime as RuntimeId] === c.authType)
+        throw new ConnectionRuleError(400, "login_required");
       const format = SECRET_FORMAT[c.runtime as RuntimeId]?.[c.authType];
       if (!format?.test(secret)) throw new ConnectionRuleError(400, "invalid_secret");
       set.secret = encrypt(secret, this.masterKey, aad(c));
       set.credentialVersion = c.credentialVersion + 1;
+      set.credentialBaseVersion = c.credentialVersion + 1;
       set.hint = mask(secret);
       set.status = "untested";
       set.lastTestAt = null;
@@ -204,6 +221,115 @@ export class ConnectionStore {
     }
     this.db.update(connections).set(set).where(eq(connections.id, id)).run();
     return this.get(id)!;
+  }
+
+  /**
+   * A personal ChatGPT login (#18): a new Codex subscription connection holding `credential` (the serialized
+   * tokens, `chatgpt.ts`) and showing `email`. Personal and active owners only; it still needs its test.
+   */
+  createLogin(input: {
+    runtime: RuntimeId;
+    owner: Pick<UserRow, "id" | "active">;
+    createdBy: string;
+    label?: string | undefined;
+    credential: string;
+    email: string | null;
+  }): ConnectionRow {
+    if (LOGIN_ONLY[input.runtime] !== "subscription") throw new ConnectionRuleError(400, "unsupported_auth");
+    if (!input.owner.active) throw new ConnectionRuleError(404, "not_found");
+    const t = this.now();
+    const id = crypto.randomUUID();
+    const row: ConnectionRow = {
+      id,
+      runtime: input.runtime,
+      authType: "subscription",
+      scope: "personal",
+      ownerId: input.owner.id,
+      createdBy: input.createdBy,
+      label: input.label ?? `${RUNTIME_LABEL[input.runtime]} ChatGPT 로그인`,
+      secret: encrypt(
+        input.credential,
+        this.masterKey,
+        aad({ id, runtime: input.runtime, authType: "subscription" }),
+      ),
+      credentialVersion: 1,
+      credentialBaseVersion: 1,
+      hint: null,
+      accountEmail: input.email,
+      status: "untested",
+      lastTestAt: null,
+      lastTestCode: null,
+      disconnectedAt: null,
+      createdAt: t,
+      updatedAt: t,
+    };
+    this.db.insert(connections).values(row).run();
+    return row;
+  }
+
+  /**
+   * Logging in again on an existing login connection: the credential is replaced (a new base version — runs on
+   * the old login never use the new one) and it must be tested again.
+   */
+  replaceLogin(id: string, credential: string, email: string | null): ConnectionRow {
+    const c = this.get(id);
+    if (!c || c.disconnectedAt !== null || LOGIN_ONLY[c.runtime as RuntimeId] !== c.authType)
+      throw new ConnectionRuleError(404, "not_found");
+    const v = c.credentialVersion + 1;
+    this.db
+      .update(connections)
+      .set({
+        secret: encrypt(credential, this.masterKey, aad(c)),
+        credentialVersion: v,
+        credentialBaseVersion: v,
+        hint: null,
+        accountEmail: email,
+        status: "untested",
+        lastTestAt: null,
+        lastTestCode: null,
+        updatedAt: this.now(),
+      })
+      .where(and(eq(connections.id, id), isNull(connections.disconnectedAt)))
+      .run();
+    return this.get(id)!;
+  }
+
+  /** The current credential of a login connection, decrypted, with its versions (token refresh only). */
+  subscriptionCredential(id: string): { secret: string; version: number; baseVersion: number } | undefined {
+    const c = this.get(id);
+    if (!c?.secret || c.disconnectedAt !== null || LOGIN_ONLY[c.runtime as RuntimeId] !== c.authType)
+      return undefined;
+    return {
+      secret: decrypt(c.secret, this.masterKey, aad(c)),
+      version: c.credentialVersion,
+      baseVersion: c.credentialBaseVersion,
+    };
+  }
+
+  /**
+   * Refreshed tokens of the same login: stored encrypted under a new version, only if the credential is still
+   * version `from` (no other refresh, no new login, not disconnected). Status and base version stay. Returns the
+   * new version, or undefined when nothing was written.
+   */
+  refreshCredential(id: string, from: number, credential: string): number | undefined {
+    const c = this.get(id);
+    if (!c || c.credentialVersion !== from) return undefined;
+    const changed = this.db
+      .update(connections)
+      .set({
+        secret: encrypt(credential, this.masterKey, aad(c)),
+        credentialVersion: from + 1,
+        updatedAt: this.now(),
+      })
+      .where(
+        and(
+          eq(connections.id, id),
+          eq(connections.credentialVersion, from),
+          isNull(connections.disconnectedAt),
+        ),
+      )
+      .run().changes;
+    return changed > 0 ? from + 1 : undefined;
   }
 
   /**
@@ -260,7 +386,9 @@ export class ConnectionStore {
         .where(
           and(
             eq(connections.id, id),
-            eq(connections.credentialVersion, testedVersion),
+            // The tested credential, or the same login refreshed since (#18).
+            lte(connections.credentialBaseVersion, testedVersion),
+            gte(connections.credentialVersion, testedVersion),
             isNull(connections.disconnectedAt),
           ),
         )
@@ -282,7 +410,8 @@ export class ConnectionStore {
         .where(
           and(
             eq(connections.id, id),
-            eq(connections.credentialVersion, version),
+            lte(connections.credentialBaseVersion, version),
+            gte(connections.credentialVersion, version),
             eq(connections.status, "passed"),
             isNull(connections.disconnectedAt),
           ),
@@ -373,13 +502,19 @@ export class ConnectionStore {
     if (!connectionId || !user || !SAFE_ID.test(connectionId) || !SAFE_ID.test(user.id)) return undefined;
     const c = this.get(connectionId);
     if (!c?.secret || !this.usable(c, user, runtime, opts)) return undefined;
-    // Bound to the version the run or test was accepted with: a replaced key is never used for it.
-    if (opts.version !== undefined && c.credentialVersion !== opts.version) return undefined;
+    // Bound to the version the run or test was accepted with: a replaced key is never used for it. Refreshed
+    // tokens of the same login (#18) are the same credential: any version from the base version on.
+    if (
+      opts.version !== undefined &&
+      (opts.version < c.credentialBaseVersion || opts.version > c.credentialVersion)
+    )
+      return undefined;
     return {
       id: c.id,
       dir: path.join(this.dataDir, "runtimes", c.id, user.id),
       authType: c.authType,
       secret: decrypt(c.secret, this.masterKey, aad(c)),
+      version: c.credentialVersion,
     };
   }
 

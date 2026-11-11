@@ -352,6 +352,29 @@ describe("Claude adapter (#15): settings it hands to the SDK", () => {
     expect((c2 as { costUsd: number }).costUsd).toBeCloseTo(0.25, 10);
   });
 
+  it("a subscription reports tokens only, never a cost (#18, PRD FR-9.2)", async () => {
+    const { a } = adapter(
+      {
+        x: [
+          sdk.init({ session: "s" }),
+          sdk.delta("ok"),
+          {
+            ...(sdk.result() as object),
+            usage: { input_tokens: 10, output_tokens: 3 },
+            total_cost_usd: 0.5,
+          } as SDKMessage,
+        ],
+      },
+      { auth: { kind: "oauth_token", token: "oat-123" } },
+    );
+    const ev = await collect((await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" }).events);
+    expect(ev.find((e) => e.type === "usage")).toStrictEqual({
+      type: "usage",
+      inputTokens: 10,
+      outputTokens: 3,
+    });
+  });
+
   it("a usage limit stays a limit even when the runtime then reports an error result", async () => {
     const { a } = adapter({
       x: [

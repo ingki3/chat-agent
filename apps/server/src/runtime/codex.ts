@@ -25,6 +25,7 @@ import {
   mcpLoopbackPort,
 } from "./lockdown.js";
 import { notificationThread } from "./codex-protocol.js";
+import { tokenExpiry } from "../connections/chatgpt.js";
 
 /**
  * Codex runtime (#16) through `codex app-server` (stdio JSON-RPC, pinned @openai/codex 0.165.0). One app-server
@@ -40,11 +41,34 @@ import { notificationThread } from "./codex-protocol.js";
  *     so does any request the app-server makes of us (approvals, user input, elicitation).
  *  3. The process runs under `sandbox-exec` (`spawnIsolated`): it reads and writes only its connection × user
  *     folder, cannot start child processes, and reaches only loopback ports (our MCP server, the egress proxy).
- *  4. Credentials: the API key goes over stdin (`account/login/start`) into memory only
- *     (`cli_auth_credentials_store = "ephemeral"`) — never in the environment, arguments or on disk.
+ *  4. Credentials go over stdin (`account/login/start`) into memory only (`cli_auth_credentials_store =
+ *     "ephemeral"`) — never in the environment, arguments or on disk: the API key, or a ChatGPT login's access
+ *     token (`chatgptAuthTokens`, #18). The refresh token never reaches the process: when app-server asks for new
+ *     tokens (`account/chatgptAuthTokens/refresh`) the server refreshes them itself (connections/chatgpt.ts).
  */
 
-export type CodexAuth = { kind: "api_key"; apiKey: string };
+/** New ChatGPT tokens for a running session (`refresh`): access token and account only. */
+export type CodexChatgptTokens = { accessToken: string; accountId: string; planType: string | null };
+
+export type CodexAuth =
+  | { kind: "api_key"; apiKey: string }
+  | {
+      kind: "chatgpt";
+      accessToken: string;
+      accountId: string;
+      planType: string | null;
+      /**
+       * New tokens when app-server finds the current ones refused (or they are about to expire). Rejects with
+       * `RuntimeFailure("runtime_auth")` when the login is over (the turn fails `runtime_auth`), anything else for
+       * a passing failure (`runtime_error`).
+       */
+      refresh(): Promise<CodexChatgptTokens>;
+    };
+
+/** Refreshes one session may ask for: app-server asks again on every retry of a refused request. */
+const MAX_REFRESHES = 3;
+/** An access token this close to its expiry is refreshed before the session starts. */
+const REFRESH_AHEAD_MS = 2 * 60_000;
 
 /** One Codex connection (#17 manages them): its folder `data/runtimes/<id>/<user id>` and its credential. */
 export type CodexConnection = { id: string; dir: string; auth: CodexAuth };
@@ -99,6 +123,10 @@ export type CodexAdapterOptions = {
    * ports: this proxy and our MCP server. Without it the process has no internet at all.
    */
   egress?: { endpoint(): Promise<{ port: number; url: string }> };
+  /**
+   * Egress proxy for ChatGPT-login sessions (#18: `chatgpt.com` instead of the API host). Default: `egress`.
+   */
+  chatgptEgress?: { endpoint(): Promise<{ port: number; url: string }> };
   /** How long a JSON-RPC request may take before the session fails. */
   requestTimeoutMs?: number;
   /** Tests: replaces the sandboxed spawn (recorded-message replay). */
@@ -255,18 +283,27 @@ function toolOutput(result: unknown): unknown {
   }
 }
 
-type Json = Record<string, unknown>;
-type RpcMessage = { id?: number | string; method?: string; params?: Json; result?: Json; error?: Json };
+export type Json = Record<string, unknown>;
+export type RpcMessage = {
+  id?: number | string;
+  method?: string;
+  params?: Json;
+  result?: Json;
+  error?: Json;
+};
 
 /** The JSON-RPC failure of one request (the app-server answered with an error). Never carries its text. */
-class RpcError extends Error {
+export class RpcError extends Error {
   constructor(readonly method: string) {
     super(`codex ${method} failed`);
   }
 }
 
-/** Line-delimited JSON-RPC over the child's stdin/stdout. Server requests are always refused. */
-class Rpc {
+/**
+ * Line-delimited JSON-RPC over the child's stdin/stdout. Server requests are refused unless `answer` takes one
+ * (only a ChatGPT session's token refresh, #18).
+ */
+export class Rpc {
   private buf = "";
   private nextId = 1;
   private readonly pending = new Map<number, { resolve(m: RpcMessage): void; reject(e: Error): void }>();
@@ -275,8 +312,10 @@ class Rpc {
     private readonly child: CodexChild,
     private readonly handlers: {
       notification(m: RpcMessage): void;
-      /** A request from the app-server (approval, user input, …). It has been refused already. */
+      /** A request from the app-server (approval, user input, …) that `answer` did not take: refused already. */
       serverRequest(method: string): void;
+      /** Takes a server request: its answer (an error is sent when it rejects). Undefined = refused. */
+      answer?(method: string, params: Json): Promise<Json> | undefined;
       exit(): void;
     },
     private readonly timeoutMs: number,
@@ -307,8 +346,17 @@ class Rpc {
         continue; // not a protocol message
       }
       if (m.id !== undefined && m.method) {
-        this.write({ id: m.id, error: { code: -32601, message: "not supported by Agent Lee" } });
-        this.handlers.serverRequest(m.method);
+        const id = m.id;
+        const answer = this.handlers.answer?.(m.method, m.params ?? {});
+        if (answer)
+          answer.then(
+            (result) => this.write({ id, result }),
+            () => this.write({ id, error: { code: -32000, message: "refused by Agent Lee" } }),
+          );
+        else {
+          this.write({ id, error: { code: -32601, message: "not supported by Agent Lee" } });
+          this.handlers.serverRequest(m.method);
+        }
       } else if (m.id !== undefined) {
         const p = this.pending.get(Number(m.id));
         this.pending.delete(Number(m.id));
@@ -522,7 +570,9 @@ export class CodexAdapter implements RuntimeAdapter {
     const env = codexEnv(conn);
     const mcpPort = ctx.mcp ? mcpLoopbackPort(ctx.mcp) : undefined;
     if (ctx.mcp) Object.assign(env, codexMcpEnv(ctx.mcp));
-    const proxy = this.opts.egress ? await this.opts.egress.endpoint() : undefined;
+    const chatgpt = conn.auth.kind === "chatgpt" ? conn.auth : undefined;
+    const egress = chatgpt ? (this.opts.chatgptEgress ?? this.opts.egress) : this.opts.egress;
+    const proxy = egress ? await egress.endpoint() : undefined;
     if (proxy) Object.assign(env, { HTTPS_PROXY: proxy.url, NO_PROXY: "127.0.0.1,localhost" });
     cancelled();
     const providerPort = this.opts.provider ? Number(new URL(this.opts.provider.baseUrl).port) : undefined;
@@ -566,6 +616,42 @@ export class CodexAdapter implements RuntimeAdapter {
     let onBreach: (() => void) | undefined;
     let policyBreach = false;
     let opened = false;
+    /** A ChatGPT session whose login is over (a refresh was refused): every turn fails `runtime_auth`. */
+    let authBroken = false;
+    /** Set while a turn runs: ends it as runtime_auth. */
+    let onAuthBroken: (() => void) | undefined;
+    let refreshes = 0;
+    /** The session's current ChatGPT tokens (a refresh replaces them). */
+    let tokens = chatgpt
+      ? { accessToken: chatgpt.accessToken, accountId: chatgpt.accountId, planType: chatgpt.planType }
+      : undefined;
+    const refreshTokens = async () => {
+      if (!chatgpt) throw new RuntimeFailure("runtime_auth");
+      try {
+        tokens = await chatgpt.refresh();
+        return tokens;
+      } catch (e) {
+        if (!(e instanceof RuntimeFailure) || e.code === "runtime_auth") {
+          authBroken = true;
+          onAuthBroken?.();
+        }
+        throw e;
+      }
+    };
+    /** app-server's `account/chatgptAuthTokens/refresh`: new tokens from the server, a few times per session. */
+    const answer = (method: string): Promise<Json> | undefined => {
+      if (method !== "account/chatgptAuthTokens/refresh" || !chatgpt) return undefined;
+      if (authBroken || ++refreshes > MAX_REFRESHES) {
+        authBroken = true;
+        onAuthBroken?.();
+        return Promise.reject(new RuntimeFailure("runtime_auth"));
+      }
+      return refreshTokens().then((t) => ({
+        accessToken: t.accessToken,
+        chatgptAccountId: t.accountId,
+        chatgptPlanType: t.planType,
+      }));
+    };
     // A resume knows its thread from the first message on; a fresh start learns it from thread/start.
     let threadId: string | undefined = resumeId;
     /** Thread ids seen before thread/start told us ours. */
@@ -613,6 +699,7 @@ export class CodexAdapter implements RuntimeAdapter {
           onNotification?.(m);
         },
         serverRequest: () => breach(),
+        answer,
         exit: () => onEnd?.(),
       },
       this.opts.requestTimeoutMs ?? 30_000,
@@ -622,12 +709,28 @@ export class CodexAdapter implements RuntimeAdapter {
     try {
       await rpc.request("initialize", {
         clientInfo: { name: "agentlee", title: null, version: "0.1.0" },
-        capabilities: { experimentalApi: false, requestAttestation: false },
+        // `chatgptAuthTokens` needs the experimental API (0.165.0: refused otherwise). It adds nothing we allow:
+        // every notification and item is still checked against the pinned protocol table (fail closed).
+        capabilities: { experimentalApi: chatgpt !== undefined, requestAttestation: false },
       });
       rpc.notify("initialized", {});
       cancelled();
-      const login = await rpc.request("account/login/start", { type: "apiKey", apiKey: conn.auth.apiKey });
-      if (login.type !== "apiKey") throw new RuntimeFailure("runtime_auth");
+      if (chatgpt) {
+        // A token about to expire is refreshed first: one refused request fewer.
+        const exp = tokenExpiry(tokens!.accessToken);
+        if (exp !== undefined && exp < Date.now() + REFRESH_AHEAD_MS) await refreshTokens();
+        cancelled();
+        const login = await rpc.request("account/login/start", {
+          type: "chatgptAuthTokens",
+          accessToken: tokens!.accessToken,
+          chatgptAccountId: tokens!.accountId,
+          chatgptPlanType: tokens!.planType,
+        });
+        if (login.type !== "chatgptAuthTokens") throw new RuntimeFailure("runtime_auth");
+      } else if (conn.auth.kind === "api_key") {
+        const login = await rpc.request("account/login/start", { type: "apiKey", apiKey: conn.auth.apiKey });
+        if (login.type !== "apiKey") throw new RuntimeFailure("runtime_auth");
+      }
       cancelled();
       if (resumeId === undefined) {
         meta = { instructions: ctx.systemPrompt, history: historyText(ctx.history) };
@@ -665,6 +768,7 @@ export class CodexAdapter implements RuntimeAdapter {
       // Thread ids seen before ours was known (a fresh start) must be ours too.
       if ([...early].some((t) => t !== threadId)) policyBreach = true;
       if (policyBreach) throw new RuntimeFailure("runtime_policy");
+      if (authBroken) throw new RuntimeFailure("runtime_auth");
       cancelled();
       opened = true;
     } catch (e) {
@@ -693,6 +797,7 @@ export class CodexAdapter implements RuntimeAdapter {
       },
       turn: (input): RuntimeTurn => {
         if (policyBreach) throw new RuntimeFailure("runtime_policy"); // seen between turns: closed already
+        if (authBroken) throw new RuntimeFailure("runtime_auth");
         if (closed || rpc.exited) throw new Error("session closed");
         const cap = this.checkModel(input.model, input.effort);
         model = input.model;
@@ -716,6 +821,7 @@ export class CodexAdapter implements RuntimeAdapter {
           onNotification = undefined;
           onEnd = undefined;
           onBreach = undefined;
+          onAuthBroken = undefined;
           wake?.();
         };
         const stop = () => {
@@ -730,6 +836,11 @@ export class CodexAdapter implements RuntimeAdapter {
 
         onEnd = () => end(interrupted ? undefined : new RuntimeFailure("runtime_error"));
         onBreach = refuse;
+        // The login is over (a refresh was refused): no retries with it.
+        onAuthBroken = () => {
+          stop();
+          end(new RuntimeFailure("runtime_auth"));
+        };
         onNotification = (m) => {
           if (done) return;
           const p = m.params ?? {};
@@ -787,6 +898,8 @@ export class CodexAdapter implements RuntimeAdapter {
             case "error": {
               const err = (p.error ?? {}) as { codexErrorInfo?: unknown };
               if (isAuthError(err.codexErrorInfo)) {
+                // A ChatGPT session gets new tokens first (app-server asks for them, `answer`) and retries.
+                if (chatgpt && p.willRetry === true && !authBroken && refreshes < MAX_REFRESHES) return;
                 stop(); // no retries with a credential that is refused
                 return end(new RuntimeFailure("runtime_auth"));
               }

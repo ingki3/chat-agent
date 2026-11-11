@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   CreateConnectionRequest,
   RuntimePolicy,
+  StartSubscriptionLoginRequest,
   UpdateConnectionRequest,
   type RuntimeId,
   type RuntimeOption,
@@ -10,6 +11,7 @@ import { z } from "zod";
 import type { UserStore } from "../auth/users.js";
 import { logEvent } from "../logging.js";
 import type { RuntimeRegistry } from "../runtime/adapter.js";
+import type { SubscriptionLoginService } from "./login.js";
 import type { ConnectionService } from "./service.js";
 import { ConnectionRuleError, toConnection, type ConnectionRow } from "./store.js";
 
@@ -39,12 +41,15 @@ function handle(reply: FastifyReply, e: unknown) {
  * - `/api/admin/users/:id/connections…`: an admin registers or removes a member's personal connection; the
  *   credential cannot be read back by anyone.
  * - `/api/runtimes`: what the caller's picker may show.
+ * - `/api/connections/logins…`: the caller's own Codex ChatGPT login (device code, #18). Only the caller sees
+ *   their code; the result is a personal connection of theirs (only its account email is shown).
  */
 export function registerConnectionRoutes(
   app: FastifyInstance,
   service: ConnectionService,
   users: UserStore,
   registry: RuntimeRegistry,
+  logins?: SubscriptionLoginService,
 ): void {
   const store = service.store;
   app.resources.register(KIND, (id) => {
@@ -106,6 +111,53 @@ export function registerConnectionRoutes(
     await service.disconnect(c);
     return send(reply, 200, { ok: true });
   };
+
+  // ---- my ChatGPT logins (#18) — registered before `/api/connections/:id` ----
+
+  const noLogin = (reply: FastifyReply) => fail(reply, 400, "unsupported_auth");
+  app.post(
+    "/api/connections/logins",
+    { config: { noResource: "starts the caller's own subscription login" } },
+    async (req, reply) => {
+      if (!logins) return noLogin(reply);
+      const body = StartSubscriptionLoginRequest.safeParse(req.body);
+      if (!body.success) return fail(reply, 400, "invalid_request");
+      try {
+        return send(reply, 201, { login: await logins.start(req.ctx.user!.id, body.data) });
+      } catch (e) {
+        return handle(reply, e);
+      }
+    },
+  );
+  app.get<{ Params: { loginId: string } }>(
+    "/api/connections/logins/:loginId",
+    { config: { noResource: "the caller's own login only (others are 404)" } },
+    (req, reply) => {
+      if (!logins) return noLogin(reply);
+      try {
+        const login = logins.get(req.ctx.user!.id, req.params.loginId);
+        const c = login.connectionId ? store.get(login.connectionId) : undefined;
+        return send(reply, 200, {
+          login,
+          connection: c && login.status === "completed" && c.disconnectedAt === null ? toConnection(c) : null,
+        });
+      } catch (e) {
+        return handle(reply, e);
+      }
+    },
+  );
+  app.delete<{ Params: { loginId: string } }>(
+    "/api/connections/logins/:loginId",
+    { config: { noResource: "the caller's own login only (others are 404)" } },
+    async (req, reply) => {
+      if (!logins) return noLogin(reply);
+      try {
+        return send(reply, 200, { login: await logins.cancel(req.ctx.user!.id, req.params.loginId) });
+      } catch (e) {
+        return handle(reply, e);
+      }
+    },
+  );
 
   // ---- my connections ----
 

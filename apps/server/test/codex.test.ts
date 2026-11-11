@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import dns from "node:dns/promises";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -25,9 +26,10 @@ import { UserStore } from "../src/auth/users.js";
 import { ConnectionStore } from "../src/connections/store.js";
 import { AppEvents } from "../src/events.js";
 import { CODEX_NOTIFICATION_SCOPE } from "../src/runtime/codex-protocol.js";
-import { CODEX_BUILTIN_TOOLS, CODEX_DISABLED_FEATURES } from "../src/runtime/lockdown.js";
+import { CODEX_BUILTIN_TOOLS, CODEX_DISABLED_FEATURES, codexConfigToml } from "../src/runtime/lockdown.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
-import { CODEX_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
+import { CODEX_EGRESS_HOSTS, CODEX_LOGIN_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
+import { CodexDeviceLogin } from "../src/runtime/codex-login.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
 import {
@@ -981,6 +983,131 @@ describe.skipIf(!realBin)("Codex adapter (#16): the pinned binary in the sandbox
     // On a mismatch, this is the table to put in src/runtime/codex-protocol.ts.
     expect(CODEX_NOTIFICATION_SCOPE).toEqual(derived);
   }, 60_000);
+
+  it("the login protocol #18 relies on is in the pinned bindings", async () => {
+    const out = tmp();
+    const r = await runIsolated({
+      command: realBin!,
+      args: ["app-server", "generate-ts", "--out", out],
+      cwd: out,
+      env: { PATH: "/usr/bin:/bin", HOME: out, CODEX_HOME: out },
+      read: [out],
+      write: [out],
+      network: "none",
+      timeoutMs: 30_000,
+      maxOutputBytes: 1024 * 1024,
+    });
+    expect(r.code).toBe(0);
+    const read = (f: string) => fs.readFileSync(path.join(out, f), "utf8");
+    expect(read("v2/LoginAccountParams.ts")).toMatch(/"type": "chatgptDeviceCode"/);
+    expect(read("v2/LoginAccountParams.ts")).toMatch(
+      /"type": "chatgptAuthTokens",[\s\S]*accessToken: string/,
+    );
+    expect(read("v2/LoginAccountResponse.ts")).toMatch(/verificationUrl: string[\s\S]*userCode: string/);
+    expect(read("v2/AccountLoginCompletedNotification.ts")).toMatch(
+      /loginId: string \| null, success: boolean/,
+    );
+    expect(read("ServerRequest.ts")).toContain('"method": "account/chatgptAuthTokens/refresh"');
+    expect(read("v2/ChatgptAuthTokensRefreshResponse.ts")).toMatch(
+      /accessToken: string, chatgptAccountId: string/,
+    );
+    expect(read("v2/CliAuthCredentialsStoreMode.ts")).toMatch(/"file"[\s\S]*"ephemeral"/);
+  }, 60_000);
+
+  it("chatgptAuthTokens needs the experimental API and is taken offline, in memory only (#18)", async () => {
+    const dir = tmp();
+    const p = {
+      codexHome: path.join(dir, "codex-home"),
+      work: path.join(dir, "work"),
+      tmp: path.join(dir, "tmp"),
+    };
+    for (const d of Object.values(p)) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(p.codexHome, "config.toml"), codexConfigToml({}));
+    const token = `e30.e30.CHATGPTMARKER${"x".repeat(20)}`;
+    const attempt = async (experimentalApi: boolean) => {
+      const child = spawnIsolated({
+        command: realBin!,
+        args: ["app-server", "--strict-config", "--listen", "stdio://"],
+        cwd: p.work,
+        env: codexEnv({ dir }),
+        read: [dir, CA_BUNDLE],
+        write: [p.codexHome, p.tmp],
+        network: { loopbackPorts: [] },
+        maxRssBytes: 2 * 1024 ** 3,
+        onStderr: () => {},
+      });
+      let buf = "";
+      const answers = new Map<number, (m: Record<string, unknown>) => void>();
+      child.stdout.on("data", (d: Buffer) => {
+        buf += d.toString();
+        let i: number;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const m = JSON.parse(buf.slice(0, i)) as { id?: number; method?: string };
+          buf = buf.slice(i + 1);
+          if (m.id !== undefined && !m.method) answers.get(m.id)?.(m);
+        }
+      });
+      const req = (id: number, method: string, params: object) =>
+        new Promise<Record<string, unknown>>((res) => {
+          answers.set(id, res);
+          child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+        });
+      await req(1, "initialize", {
+        clientInfo: { name: "agentlee", title: null, version: "0.1.0" },
+        capabilities: { experimentalApi, requestAttestation: false },
+      });
+      child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
+      const r = await req(2, "account/login/start", {
+        type: "chatgptAuthTokens",
+        accessToken: token,
+        chatgptAccountId: "acct-test",
+        chatgptPlanType: null,
+      });
+      child.kill("SIGKILL");
+      await new Promise((res) => child.once("exit", res));
+      return r;
+    };
+    expect((await attempt(false)).error).toBeTruthy();
+    expect((await attempt(true)).result).toEqual({ type: "chatgptAuthTokens" });
+    expect(fs.existsSync(path.join(p.codexHome, "auth.json"))).toBe(false);
+    const leaked: string[] = [];
+    const walk = (d: string) => {
+      for (const n of fs.readdirSync(d)) {
+        const f = path.join(d, n);
+        if (fs.lstatSync(f).isDirectory()) walk(f);
+        else if (fs.readFileSync(f).includes("CHATGPTMARKER")) leaked.push(f);
+      }
+    };
+    walk(dir);
+    expect(leaked).toEqual([]);
+  }, 60_000);
+
+  it.skipIf(!online)(
+    "the device-code login against the real service: OpenAI's page and a code, through auth.openai.com only; a cancel leaves nothing (#18)",
+    async () => {
+      const root = tmp();
+      const hosts: string[] = [];
+      const egress = new EgressService({
+        allow: CODEX_LOGIN_EGRESS_HOSTS,
+        lookup: async (h) => {
+          hosts.push(h);
+          return (await dns.lookup(h, { all: true })).map((a) => a.address);
+        },
+      });
+      try {
+        const login = await new CodexDeviceLogin({ egress }).start(path.join(root, "login"));
+        expect(login.verificationUrl).toBe("https://auth.openai.com/codex/device");
+        expect(login.userCode).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4,6}$/);
+        login.cancel();
+        await expect(login.result).rejects.toMatchObject({ code: "cancelled" });
+      } finally {
+        await egress.close();
+      }
+      expect([...new Set(hosts)]).toEqual(["auth.openai.com"]);
+      expect(fs.existsSync(path.join(root, "login"))).toBe(false);
+    },
+    60_000,
+  );
 
   /** The real binary, sandboxed, against a local fake Responses API and our real MCP server. */
   async function realRun(

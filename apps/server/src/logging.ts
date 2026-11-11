@@ -24,6 +24,7 @@ import {
   isImportCode,
   isWebCode,
   isArtifactCode,
+  isLoginCode,
   isToolName,
   UNMATCHED,
   isUsagePurpose,
@@ -76,6 +77,11 @@ export const LOG_EVENTS = [
   "connection.disconnected",
   "connection.imported",
   "connection.import_failed",
+  // Subscription logins (#18): ids, runtime and fixed outcome codes — never a token, the one-time code or an email.
+  "connection.login_started",
+  "connection.login_finished",
+  "connection.refreshed",
+  "connection.refresh_failed",
   // Usage storage (#44): a usage row could not be written — IDs, attempt and purpose only.
   "usage.record_failed",
 ] as const;
@@ -166,6 +172,8 @@ const FIELDS = new Map<string, Check>([
   ["testCode", isTestCode],
   ["importItem", isImportItem],
   ["importCode", isImportCode],
+  /** Subscription login outcome (#18): a fixed code. */
+  ["loginCode", isLoginCode],
   /** Usage records (#44): the run's attempt number and what the usage was for. */
   ["attempt", isInt],
   ["purpose", isUsagePurpose],
@@ -422,6 +430,7 @@ export type LogFields = {
   testCode?: string;
   importItem?: string;
   importCode?: string;
+  loginCode?: string;
   attempt?: number;
   purpose?: string;
   /** Logged as class name and code only. */

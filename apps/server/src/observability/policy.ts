@@ -120,6 +120,16 @@ export const TEST_CODES = set([
   "no_connection",
 ]);
 export const isTestCode = member(TEST_CODES);
+/** Subscription login outcomes (#18, connections/login.ts). */
+export const LOGIN_CODES = set([
+  "completed",
+  "login_failed",
+  "login_expired",
+  "login_error",
+  "cancelled",
+  "timeout",
+]);
+export const isLoginCode = member(LOGIN_CODES);
 /** `.env` import (#17): which value, and why it was not imported (fixed codes only). */
 export const isImportItem = member(set(["claude_api_key", "claude_oauth_token", "codex_api_key"]));
 export const isImportCode = member(

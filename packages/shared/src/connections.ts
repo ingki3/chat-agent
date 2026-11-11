@@ -21,8 +21,10 @@ export const Connection = z.object({
   /** The user a personal connection belongs to; null for shared ones. */
   ownerId: z.string().nullable(),
   label: z.string(),
-  /** `••••abcd` — never more of the credential. */
+  /** `••••abcd` — never more of the credential. Null for a ChatGPT login (only its email is shown). */
   hint: z.string().nullable(),
+  /** The signed-in account's email (ChatGPT login, #18) — the only thing shown of a login. */
+  accountEmail: z.string().nullable(),
   status: ConnectionStatus,
   lastTestAt: z.number().nullable(),
   /** Fixed code of the last test (`ok`, `test_no_stream`, `test_no_tool`, `test_no_skill`, `runtime_auth`, …). */
@@ -52,6 +54,40 @@ export const CreateConnectionRequest = z
   })
   .strict();
 export type CreateConnectionRequest = z.infer<typeof CreateConnectionRequest>;
+
+/**
+ * Codex ChatGPT login (#18, PRD D2 / FR-11.2): app-server's device-code flow, run on the server, shown in the web
+ * screen. `POST /api/connections/logins` starts one — for a new personal connection, or with `connectionId` to log
+ * in again on an existing one (its credential is replaced).
+ */
+export const StartSubscriptionLoginRequest = z
+  .object({
+    runtime: z.literal("codex"),
+    label: Label.optional(),
+    connectionId: z.string().min(1).max(100).optional(),
+  })
+  .strict();
+export type StartSubscriptionLoginRequest = z.infer<typeof StartSubscriptionLoginRequest>;
+/**
+ * - `pending`: waiting for the user to enter `userCode` at `verificationUrl` (until `expiresAt`);
+ * - `completed`: logged in — `connectionId` is the connection (it still needs its test);
+ * - `failed` (`code`: `login_failed`, `login_expired`, `login_error`), `cancelled`, `timeout`: nothing was stored.
+ */
+export const SubscriptionLoginStatus = z.enum(["pending", "completed", "failed", "cancelled", "timeout"]);
+export type SubscriptionLoginStatus = z.infer<typeof SubscriptionLoginStatus>;
+export const SubscriptionLogin = z.object({
+  id: z.string(),
+  runtime: RuntimeId,
+  status: SubscriptionLoginStatus,
+  /** Where to sign in (always `https://auth.openai.com/…`). Null once the login has ended. */
+  verificationUrl: z.string().nullable(),
+  /** One-time code to type there. Shown to the user who started the login only; null once it has ended. */
+  userCode: z.string().nullable(),
+  expiresAt: z.number().nullable(),
+  connectionId: z.string().nullable(),
+  code: z.string().nullable(),
+});
+export type SubscriptionLogin = z.infer<typeof SubscriptionLogin>;
 
 /** Label and credential can change; scope, runtime and auth type never do (a new connection is made instead). */
 export const UpdateConnectionRequest = z

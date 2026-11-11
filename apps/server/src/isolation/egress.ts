@@ -208,7 +208,20 @@ export const CLAUDE_EGRESS_HOSTS = ["api.anthropic.com"] as const;
 
 /**
  * Hosts codex app-server needs with an API key (0.165.0, our config: no model-list fetch, no analytics or update
- * checks): the Responses API, over HTTPS and WebSocket. A ChatGPT login (#18) adds chatgpt.com (and
- * auth.openai.com for token refresh) — added with #18 once checked.
+ * checks): the Responses API, over HTTPS and WebSocket.
  */
 export const CODEX_EGRESS_HOSTS = ["api.openai.com"] as const;
+
+/**
+ * Hosts a ChatGPT-login session needs (#18, checked on 0.165.0 through this proxy with `chatgptAuthTokens`):
+ * `chatgpt.com` only — the ChatGPT backend (`/backend-api/codex/responses`, its model list and workspace routing).
+ * No `api.openai.com`, and no `auth.openai.com`: the server refreshes tokens itself (connections/chatgpt.ts).
+ */
+export const CODEX_CHATGPT_EGRESS_HOSTS = ["chatgpt.com"] as const;
+
+/**
+ * Hosts the device-code login process needs (#18, codex-login.ts): `auth.openai.com` (device code, polling, token
+ * exchange — checked on 0.165.0: the code request goes there and nowhere else) and `chatgpt.com` (the account
+ * read after the login).
+ */
+export const CODEX_LOGIN_EGRESS_HOSTS = ["auth.openai.com", "chatgpt.com"] as const;

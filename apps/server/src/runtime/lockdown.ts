@@ -195,15 +195,21 @@ const toml = (v: string) => JSON.stringify(v); // TOML basic strings use the sam
  * `provider` replaces the OpenAI API with another Responses endpoint — tests only (a local fake API).
  */
 export function codexConfigToml(o: {
-  /** Absolute path of the model catalog file (`codexModelCatalog`). */
-  catalogPath: string;
+  /** Absolute path of the model catalog file (`codexModelCatalog`). Left out only by the login process. */
+  catalogPath?: string | undefined;
   provider?: { baseUrl: string } | undefined;
+  /**
+   * Where a login keeps its credentials. Always `ephemeral` (memory) for runs. Only the short-lived device-code
+   * login process (#18, codex-login.ts) uses `file`: the server reads the tokens it wrote at once, stores them
+   * encrypted and removes the whole login folder — app-server offers no other way to hand them over.
+   */
+  credentialsStore?: "ephemeral" | "file";
 }): string {
   const lines = [
-    `model_catalog_json = ${toml(o.catalogPath)}`,
+    ...(o.catalogPath ? [`model_catalog_json = ${toml(o.catalogPath)}`] : []),
     `approval_policy = "never"`,
     `sandbox_mode = "read-only"`,
-    `cli_auth_credentials_store = "ephemeral"`,
+    `cli_auth_credentials_store = "${o.credentialsStore ?? "ephemeral"}"`,
     `web_search = "disabled"`,
     `include_permissions_instructions = false`,
     `include_apps_instructions = false`,

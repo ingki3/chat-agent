@@ -186,6 +186,11 @@ export const StreamEvent = z.discriminatedUnion("type", [
     level: z.enum(["info", "warn"]),
     code: z.string(),
     message: z.string(),
+    /**
+     * Runtimes the user could continue with instead (a subscription limit, an expired login — #18). Only a hint:
+     * switching itself is the conversation's runtime change (#19).
+     */
+    switchTo: z.array(RuntimeId).optional(),
   }),
   z.object({ type: z.literal("error"), code: z.string(), message: z.string() }),
   z.object({ type: z.literal("done"), messageId: z.string(), status: MessageStatus }),

@@ -19,12 +19,21 @@ import { FakeRuntime } from "./runtime/fake.js";
 import { claudeFromStore } from "./runtime/claude-config.js";
 import { codexFromStore } from "./runtime/codex-config.js";
 import { importEnvConnections, pendingImportTests } from "./connections/import.js";
+import { ChatgptTokenService, type TokenPost } from "./connections/chatgpt.js";
+import { SubscriptionLoginService, type DeviceLoginProvider } from "./connections/login.js";
+import { CodexDeviceLogin } from "./runtime/codex-login.js";
 import { registerConnectionRoutes } from "./connections/routes.js";
 import { ConnectionService } from "./connections/service.js";
 import { ConnectionStore } from "./connections/store.js";
 import { ConnectionTester } from "./connections/tester.js";
 import { UsageStore } from "./usage/store.js";
-import { CLAUDE_EGRESS_HOSTS, CODEX_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
+import {
+  CLAUDE_EGRESS_HOSTS,
+  CODEX_CHATGPT_EGRESS_HOSTS,
+  CODEX_EGRESS_HOSTS,
+  CODEX_LOGIN_EGRESS_HOSTS,
+  EgressService,
+} from "./isolation/egress.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
@@ -128,6 +137,11 @@ export type BuildOptions = {
   notifications?: NotificationServiceOptions;
   /** Connection test overrides (tests: a short timeout). */
   connectionTest?: { timeoutMs?: number };
+  /**
+   * Codex ChatGPT login (#18). `device`: how a device-code login is started (default: the pinned app-server in its
+   * sandbox; tests script it); `tokenPost`: the token endpoint for refreshes (tests: a fake).
+   */
+  subscription?: { device?: DeviceLoginProvider; tokenPost?: TokenPost };
   /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
   hmrPort?: number;
 };
@@ -207,21 +221,31 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const settingsStore = new SettingsStore(opts.db!, masterKey);
     // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
     const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
+    // ChatGPT logins (#18): tokens refreshed by the server, never by a runtime process.
+    const chatgptTokens = new ChatgptTokenService(connectionStore, {
+      log: app.log,
+      ...(opts.subscription?.tokenPost ? { post: opts.subscription.tokenPost } : {}),
+    });
+    const egressFor = (allow: readonly string[]) => {
+      const egress = new EgressService({ allow });
+      app.addHook("onClose", async () => egress.close());
+      return egress;
+    };
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime({ runTools: true }));
     else if (!opts.runtimes) {
       // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
-      // addresses) — one per runtime, so each reaches only its own provider.
-      const egressFor = (allow: readonly string[]) => {
-        const egress = new EgressService({ allow });
-        app.addHook("onClose", async () => egress.close());
-        return egress;
-      };
+      // addresses) — one per runtime and way of signing in, so each reaches only its own provider's hosts.
       // Both real runtimes are always there; whether a user can run one depends on their connections (#17).
       // Tests bring their own runtimes (opts.runtimes) and never start a real CLI.
       if (config.env !== "test") {
         runtimes.register(claudeFromStore(connectionStore, users, egressFor(CLAUDE_EGRESS_HOSTS)));
-        runtimes.register(codexFromStore(connectionStore, users, egressFor(CODEX_EGRESS_HOSTS)));
+        runtimes.register(
+          codexFromStore(connectionStore, users, egressFor(CODEX_EGRESS_HOSTS), {
+            tokens: chatgptTokens,
+            egress: egressFor(CODEX_CHATGPT_EGRESS_HOSTS),
+          }),
+        );
       }
     }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
@@ -274,7 +298,20 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
-    registerConnectionRoutes(app, connections, users, runtimes);
+    // Codex ChatGPT device-code logins (#18): the pinned app-server, sandboxed, behind its own egress proxy.
+    // Tests script it (opts.subscription.device) and never start a real process; neither does the development
+    // FakeRuntime mode (no real Codex there to use the login with).
+    const device =
+      opts.subscription?.device ??
+      (config.env === "test" || config.fakeRuntime
+        ? undefined
+        : new CodexDeviceLogin({ egress: egressFor(CODEX_LOGIN_EGRESS_HOSTS) }));
+    const logins = new SubscriptionLoginService(connectionStore, users, device, config.dataDir, {
+      replaced: (id) => connections.replaced(id),
+      log: app.log,
+    });
+    app.addHook("onClose", async () => logins.close());
+    registerConnectionRoutes(app, connections, users, runtimes, logins);
     registerSourceRoutes(app, app.conversations!, sources);
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url));
 

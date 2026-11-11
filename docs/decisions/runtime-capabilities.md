@@ -39,8 +39,9 @@
 | 환경변수 상속 차단 | 지원 | **타입·문서** `options.env`는 부모 환경을 대체(병합 아님) — 설치된 SDK 소스와 일치 |
 | 사용량 | 지원 | **실행** `usage`(입력·출력·캐시 생성·캐시 읽기), `modelUsage`, `total_cost_usd`(추정치, 구독에서도 나옴) |
 | 프롬프트 캐싱 | 자동 | **실행** resume 시 `cache_read_input_tokens` 약 14.7k (`claude-resume.json`) |
-| 구독 한도 신호 | 미확인 | 한도 미도달 → #18에서 확인 |
-| 구독 장기 토큰 | 경로만 | **타입·문서** `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`. 실제 주입 시험은 관리자의 1회 발급 필요(#18) |
+| 구독 한도 신호 | 미확인(실계정) | 한도 미도달. 어댑터는 `rate_limit` 오류·`rate_limit_event rejected`를 한도로 본다(#15). #18: 구독 연결의 한도는 `subscription_limit` 안내로 이어진다. 실제 신호는 수동 확인(`docs/evidence/subscription/checklist.md`) |
+| 구독 장기 토큰 | 경로만 | **타입·문서** `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`. #18: 저장(암호화)·관리자 전용 규칙·환경 변수 주입·만료 처리는 시험으로 확인(`claude.test.ts`, `subscription.test.ts`). 실제 토큰으로 로그인·응답·만료 확인은 관리자 수동 확인으로 남김(`docs/evidence/subscription/checklist.md`) |
+| 구독 사용량 | 토큰만 기록 | #18: CLI는 구독에서도 `total_cost_usd`(API 가격으로 친 추정치)를 주지만, 구독에는 호출당 비용이 없으므로(FR-9.2) 어댑터가 비용을 빼고 토큰만 보고한다 |
 
 ## 2. Codex
 
@@ -55,7 +56,7 @@
 | 중단 | 지원 | **실행** delta 10개 후 `turn/interrupt` → 9ms 뒤 `turn/completed status: interrupted` (turn3). 도구 실행 중 중단은 미검증 → #16 |
 | 모델 목록 | 지원 | **실행** `model/list` → 8개 (`gpt-6.1-sol`, `gpt-6-astra` 등) |
 | 한도 신호 | 지원 | **실행** `account/rateLimits/read` 응답에 `rateLimits.primary` 존재. `account/rateLimits/updated` 알림은 **타입·문서** |
-| 로그인 | 있음 | **타입·문서** `account/login/start`: `apiKey`, `chatgpt`, `chatgptDeviceCode`, `chatgptAuthTokens`. 실행 미검증 → #18 |
+| 로그인 | 있음 | `account/login/start`: `apiKey`, `chatgpt`, `chatgptDeviceCode`, `chatgptAuthTokens`. 0.165.0에서 실행 확인 → 2.5절(#18) |
 | 상태 | experimental | `codex app-server --help`에 실험적 표시 → 버전 고정, 업그레이드 시 프로브 재실행 |
 
 ### 2.2 SDK (`@openai/codex-sdk`, 내부적으로 `codex exec --json`) — 대체 구현으로 쓰지 않음
@@ -103,6 +104,23 @@
 | 한도 | 지원 | **실행**(가짜 API) 사용 한도 429 → `codexErrorInfo: "usageLimitExceeded"`, `willRetry: false`. 속도 제한 429 → `responseTooManyFailedAttempts{429}`. 스냅샷의 `rateLimitReachedType`. 어댑터는 실패한 턴만 `limit`으로 본다 |
 | 사용량·캐시 | 토큰만 | **실행** `thread/tokenUsage/updated`의 `total`(thread 누적)·`last`(마지막 요청). `cachedInputTokens`·`cacheWriteInputTokens` 포함, 비용 없음. 요청에 `prompt_cache_key = thread id`. 어댑터는 턴의 첫 보고에서 기준값(`total − last`)을 잡아 그 턴의 몫만 보고. 실제 API의 캐시 적중은 자격 증명이 생기면 녹화로 확인 |
 
+### 2.5 ChatGPT 로그인 (#18, 0.165.0, 2026-11-11)
+
+실제 ChatGPT 계정 없이 확인했다(사용자의 `~/.codex` 로그인은 쓰지 않음). 고정 바이너리를 우리 샌드박스와 송신 프록시로 띄우고, 프록시가 받은 CONNECT 호스트를 기록했다. 재현: `apps/server/test/codex.test.ts`의 macOS 시험 3개(`#18`), 프로토콜은 `codex app-server generate-ts`.
+
+| 항목 | 판정 | 근거 |
+|---|---|---|
+| 디바이스 코드 시작 | 지원 | **실행** `account/login/start {type:"chatgptDeviceCode"}` → `{type, loginId, verificationUrl: "https://auth.openai.com/codex/device", userCode: "XXXX-XXXXX"}`. 이때 연결한 호스트는 **`auth.openai.com`뿐**. 계정이 필요 없는 요청이라 실제 서비스로 시험한다(온라인일 때) |
+| 취소 | 지원 | **실행** `account/login/cancel {loginId}` → `{status:"canceled"}`, 이어서 `account/login/completed {loginId, success:false, error:"Login was not completed"}` |
+| 완료 알림 | 바인딩 | **바인딩** `account/login/completed {loginId, success, error}`. 성공은 실제 계정이 있어야 해서 수동 확인(`docs/evidence/subscription/checklist.md`) |
+| 토큰 꺼내기 | 파일로만 | **바인딩·문자열** app-server에는 토큰을 돌려주는 요청이 없다(`account/read`는 `{type:"chatgpt", email, planType}`만). 그래서 **로그인 과정 하나만** `cli_auth_credentials_store = "file"`로 띄워, 끝나면 `CODEX_HOME/auth.json`(`tokens.{id_token, access_token, refresh_token, account_id}`)을 서버가 곧바로 읽고 덮어쓴 뒤 로그인 폴더째 지운다. 파일 형식은 고정 버전 기준이라 버전을 올리면 수동 확인을 다시 한다 |
+| 실행에 토큰 주입 | 지원 | **실행** `account/login/start {type:"chatgptAuthTokens", accessToken, chatgptAccountId, chatgptPlanType}` → `{type:"chatgptAuthTokens"}`. **`initialize`에서 `experimentalApi: true`가 있어야 한다**(없으면 `requires experimentalApi capability` 오류). 네트워크 없이도 받아들이고, `auth.json`은 생기지 않으며 폴더에 토큰이 남지 않는다 |
+| 갱신 요청 | 지원 | **실행**(가짜 토큰) 백엔드가 거부하면 app-server가 클라이언트에게 서버 요청 `account/chatgptAuthTokens/refresh {reason:"unauthorized", previousAccountId}`를 보낸다. 응답 `{accessToken, chatgptAccountId, chatgptPlanType}`. 거부하면 재시도할 때마다(웹소켓 5회 + HTTPS 5회) 다시 묻고, 오류 알림은 `httpStatusCode: null`("workspace routing discovery unauthorized (401)")로 온다 → 어댑터는 갱신 거부·3회 초과 시 `runtime_auth`로 끝낸다. 외부 토큰 모드에서는 app-server가 스스로 갱신하지 않는다(`GetAccountParams.refreshToken` 설명) |
+| 갱신 방법 | 서버가 직접 | **문자열** 바이너리의 OAuth 클라이언트 id `app_EMoamEEZ73f0CkXaXp7hrann`, 토큰 엔드포인트 `https://auth.openai.com/oauth/token`(`grant_type: refresh_token`, `scope: "openid profile email"`, JSON). 서버(`connections/chatgpt.ts`)가 이 요청을 보내고 결과를 암호화해 저장한다. 리프레시 토큰은 런타임 프로세스에 들어가지 않는다. 실제 응답 형식은 수동 확인 대상 |
+| ChatGPT 세션의 호스트 | `chatgpt.com`만 | **실행**(가짜 토큰) 모델 목록 `https://chatgpt.com/backend-api/codex/models`, 작업 공간 확인, 응답 요청이 모두 `chatgpt.com`. `api.openai.com`·`auth.openai.com`·`ab.chatgpt.com`(분석, 꺼 둠)은 연결하지 않음 |
+| 송신 허용 | 근거 | API 키 세션: `api.openai.com`(그대로). ChatGPT 세션: `chatgpt.com`(`CODEX_CHATGPT_EGRESS_HOSTS`). 로그인 과정: `auth.openai.com`(코드·폴링·토큰 교환) + `chatgpt.com`(로그인 뒤 계정 읽기 대비)(`CODEX_LOGIN_EGRESS_HOSTS`). 서버 자신은 갱신 때 `auth.openai.com`에 직접 요청한다(`safeFetch`, 사설 주소 차단). 셋은 프록시가 따로라 API 키 세션은 `chatgpt.com`에, ChatGPT 세션은 `auth.openai.com`에 닿지 못한다 |
+| 구독 한도 | 기존 신호 | `usageLimitExceeded` 등 2.4절과 같은 신호. 구독이면 대화에 `subscription_limit` 안내("지금 이 런타임은 한도에 걸렸어요")와 다른 런타임 제안(`switchTo`) |
+
 ## 3. 구독 로그인 정책 (공식 문서, 2026-11-08 조회)
 
 | 회사 | 판정 | 근거 |
@@ -118,4 +136,4 @@
 2. **Claude 어댑터(#15)**: `tools: []` + `disallowedTools`(내장 도구 이름 전체) + `strictMcpConfig: true` + **`PreToolUse` 훅으로 우리 MCP(`mcp__agentlee__*`) 외 전부 거부** + init의 `mcp_servers`가 우리 서버만이 아니면 세션 중단(계정 커넥터 대비, 관리자 Claude 구독 연결에서 특히 중요). `canUseTool`·`allowedTools`에 의존하지 않음. `settingSources: []`, 연결별 `CLAUDE_CONFIG_DIR`, `env` 허용 목록, 인증 환경변수 주입.
 3. **Codex 어댑터(#16)**: app-server 프로토콜. 연결별 `CODEX_HOME` + 우리 `config.toml`만, 위 features 끄기, MCP `default_tools_approval_mode = "approve"`, 401 즉시 실패, 하위 에이전트 차단, 도구 실행 중 중단 시험. **0.165.0에서 바뀐 점(2.4절):** 우리 모델 카탈로그(`tool_mode: "direct"`, `multi_agent_version: "disabled"`)를 쓰고 **`code_mode_host`는 끈다**(켜 두면 MCP 호출마다 자식 프로세스).
 4. **실행 격리(#42)**: 1차 방어는 내장 도구 제거(위 2·3), 2차 방어는 OS 수준 경로 제한. Codex `read-only` sandbox에 의존하지 않음. 최종 설정에서 "허용 MCP 성공 + 금지 접근 실패"를 함께 시험.
-5. **구독 로그인(#18)**: Codex는 app-server `chatgptDeviceCode` 로그인 실행 검증, Claude는 관리자 장기 토큰 주입 실행 검증.
+5. **구독 로그인(#18)**: Codex는 디바이스 코드 시작·취소, `chatgptAuthTokens` 주입, 갱신 요청을 0.165.0으로 실행 확인(2.5절). 실제 계정으로의 로그인 완료·응답·만료와 Claude 장기 토큰 주입은 수동 확인으로 남김(`docs/evidence/subscription/checklist.md`).

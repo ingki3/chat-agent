@@ -12,6 +12,19 @@ import type { ConnectionTester } from "./tester.js";
 /** Notice code: the personal connection hit its limit and a shared one is available — continue there? */
 export const SHARED_OFFER_CODE = "personal_limit_use_shared";
 export const CONNECTION_LOST_CODE = "connection_lost";
+/** Notice code: a subscription login (Claude token, ChatGPT login) expired — log in again (#18). */
+export const SUBSCRIPTION_EXPIRED_CODE = "subscription_expired";
+/** Notice code: a subscription hit its plan's limit — another runtime can take over (#18, PRD FR-9.2). */
+export const SUBSCRIPTION_LIMIT_CODE = "subscription_limit";
+export const SUBSCRIPTION_LIMIT_MESSAGE = "지금 이 런타임은 한도에 걸렸어요";
+
+/** What to do about an expired subscription login, per runtime (FR-11.8). */
+const RELOGIN: Record<RuntimeId, string> = {
+  "claude-code":
+    "Claude 구독 토큰이 만료됐어요 — 터미널에서 `claude setup-token`으로 새 토큰을 만들어 설정 → 내 런타임 연결에 붙여 넣어 주세요. 그동안 다른 런타임으로 이어갈 수 있어요.",
+  codex:
+    "ChatGPT 로그인이 만료됐어요 — 설정 → 내 런타임 연결에서 ‘다시 로그인’을 눌러 주세요. 그동안 다른 런타임으로 이어갈 수 있어요.",
+};
 
 /**
  * Connections as the rest of the server uses them (#17): run checks (`access`), tests, disconnecting, and what
@@ -46,11 +59,30 @@ export class ConnectionService {
     if (deps.notify) this.notify = deps.notify;
   }
 
+  /**
+   * Runtimes other than `runtime` that `userId` could continue with right now (allowed, with a usable connection or
+   * none needed) — the hint of a limit or expiry notice; the switch itself is the conversation's (#19).
+   */
+  private others(userId: string, runtime: RuntimeId): RuntimeId[] {
+    const user = this.users.byId(userId);
+    if (!user) return [];
+    return (["claude-code", "codex"] as RuntimeId[]).filter((id) => {
+      if (id === runtime) return false;
+      const adapter = this.registry.get(id);
+      if (!adapter) return false;
+      const caps = adapter.capabilities();
+      if (!this.access.models(this.store.policy(user, id), caps).length) return false;
+      return !caps.needsConnection || this.store.usableFor(user, id).length > 0;
+    });
+  }
+
   /** The run manager's hook for a failed run on a connection: notices for the stream, side effects here. */
   runFailed(run: RunRow, code: string): StreamEvent[] {
     const c = run.connectionId ? this.store.get(run.connectionId) : undefined;
     if (!c) return [];
-    const label = RUNTIME_LABEL[c.runtime as RuntimeId] ?? c.runtime;
+    const runtime = c.runtime as RuntimeId;
+    const label = RUNTIME_LABEL[runtime] ?? c.runtime;
+    const subscription = c.authType === "subscription";
     if (code === "runtime_auth") {
       // Only the first run that finds it broken announces it (passed → expired).
       if (run.connectionVersion !== null && this.store.markExpired(c.id, run.connectionVersion)) {
@@ -71,30 +103,52 @@ export class ConnectionService {
               });
         });
       }
+      const switchTo = this.others(run.userId, runtime);
       return [
-        {
-          type: "notice",
-          level: "warn",
-          code: CONNECTION_LOST_CODE,
-          message: `${label} 연결이 끊겼어요 — 다시 로그인하거나 다른 런타임으로 이어가기`,
-        },
+        subscription
+          ? {
+              type: "notice",
+              level: "warn",
+              code: SUBSCRIPTION_EXPIRED_CODE,
+              message: RELOGIN[runtime] ?? `${label} 로그인이 만료됐어요 — 다시 로그인해 주세요.`,
+              ...(switchTo.length ? { switchTo } : {}),
+            }
+          : {
+              type: "notice",
+              level: "warn",
+              code: CONNECTION_LOST_CODE,
+              message: `${label} 연결이 끊겼어요 — 다시 로그인하거나 다른 런타임으로 이어가기`,
+              ...(switchTo.length ? { switchTo } : {}),
+            },
       ];
+    }
+    const out: StreamEvent[] = [];
+    if (code === "usage_limit" && subscription) {
+      // The plan's limit (FR-9.2): no cost to show, only that this runtime is out for now — and where to go on.
+      const switchTo = this.others(run.userId, runtime);
+      out.push({
+        type: "notice",
+        level: "warn",
+        code: SUBSCRIPTION_LIMIT_CODE,
+        message: switchTo.length
+          ? `${SUBSCRIPTION_LIMIT_MESSAGE} — 다른 런타임으로 바꿔서 이어갈 수 있어요.`
+          : `${SUBSCRIPTION_LIMIT_MESSAGE} — 잠시 뒤 다시 시도해 주세요.`,
+        ...(switchTo.length ? { switchTo } : {}),
+      });
     }
     if (code === "usage_limit" && c.scope === "personal") {
       const user = this.users.byId(run.userId);
       const shared =
         user && this.store.usableFor(user, c.runtime as RuntimeId).find((x) => x.scope === "shared");
       if (shared)
-        return [
-          {
-            type: "notice",
-            level: "info",
-            code: SHARED_OFFER_CODE,
-            message: "개인 연결이 사용 한도에 도달했어요. 공용 연결로 이어갈까요?",
-          },
-        ];
+        out.push({
+          type: "notice",
+          level: "info",
+          code: SHARED_OFFER_CODE,
+          message: "개인 연결이 사용 한도에 도달했어요. 공용 연결로 이어갈까요?",
+        });
     }
-    return [];
+    return out;
   }
 
   private safeNotify(fn: () => void) {
@@ -158,6 +212,11 @@ export class ConnectionService {
     if (!t) return;
     t.abort.abort();
     await Promise.race([t.done, new Promise<void>((r) => setTimeout(r, ms).unref())]);
+  }
+
+  /** A new login replaced the credential of `id` (#18): runs and a test still on the old login stop. */
+  async replaced(id: string): Promise<void> {
+    await Promise.all([this.runs?.stopConnection(id), this.cancelTest(id)]);
   }
 
   /** New label and/or key. A new key stops runs and a test that still use the old key. */
