@@ -6,7 +6,14 @@ import { connectionAad } from "../connections/store.js";
 import { decrypt } from "../crypto/secrets.js";
 import { openDb, runMigrations } from "../db/client.js";
 import { isInside } from "../fs-safety.js";
-import { acquireDataLock, dataLockHolder, DataLockHeld, type DataLock } from "../storage/data-lock.js";
+import {
+  acquireDataLock,
+  dataLockHolder,
+  DataLockHeld,
+  realDataDir,
+  type DataLock,
+  type DataLockKind,
+} from "../storage/data-lock.js";
 import { ensureLayout } from "../storage/paths.js";
 import {
   BACKUP_FILE_ROOTS,
@@ -156,28 +163,53 @@ export function serverRunning(dataDir: string): boolean {
 // ---- The swap and its journal ----
 
 /**
- * `<parent>/.<name>.restore-journal.json`: written once the new folder is complete, before the first rename, and
- * removed after the last. A restore interrupted between the renames (killed, power cut) is finished by the next
- * restore or server start (`recoverInterruptedRestore`) — the new folder was already checked, so it is moved in.
+ * `<parent>/.<name>.restore-journal.json` (real path): the swap's phases, fsynced before each step.
+ *
+ *   prepared     the new folder is complete and checked (its `.restore-complete` marker written); nothing moved yet
+ *   old_moved    the old folder is at `previous`
+ *   swapped      the new folder is at the target
+ *   done         only clean-up left
+ *   rolling_back a step failed: going back to the old folder (written before anything is undone)
+ *
+ * Recovery (`recoverInterruptedRestore`, run by every writer before it opens anything) rolls *forward* only from
+ * `old_moved` with a staging folder whose marker matches its database and whose database opens and passes a quick
+ * check — or once `swapped`. Every other case rolls *back* to the old folder. A target it cannot account for (data
+ * that is neither the old folder nor the checked new one) stops it: never a fresh empty database over a journal.
  */
-type Journal = { target: string; staging: string; previous: string | null; step: "staged" | "moved_old" };
-export type RestoreStep = Journal["step"] | "swapped";
+type Phase = "prepared" | "old_moved" | "swapped" | "done" | "rolling_back";
+type Journal = { target: string; staging: string; previous: string | null; phase: Phase };
+export type RestoreStep = Phase;
+export const COMPLETE_MARKER = ".restore-complete";
 
 export function restoreJournalPath(dataDir: string): string {
-  const abs = path.resolve(dataDir);
-  return path.join(path.dirname(abs), `.${path.basename(abs)}.restore-journal.json`);
+  const real = realDataDir(dataDir);
+  return path.join(path.dirname(real), `.${path.basename(real)}.restore-journal.json`);
 }
 
-function writeJournal(file: string, j: Journal): void {
+function fsyncDir(dir: string): void {
+  try {
+    const fd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // best effort (not every file system allows it)
+  }
+}
+
+function writeDurable(file: string, text: string): void {
   const tmp = `${file}.tmp`;
   const fd = fs.openSync(tmp, "w", 0o600);
   try {
-    fs.writeSync(fd, JSON.stringify(j));
+    fs.writeSync(fd, text);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
   }
   fs.renameSync(tmp, file);
+  fsyncDir(path.dirname(file));
 }
 
 function readJournal(file: string): Journal | undefined {
@@ -189,42 +221,112 @@ function readJournal(file: string): Journal | undefined {
     throw e;
   }
   const j = JSON.parse(text) as Partial<Journal>;
-  if (typeof j.target !== "string" || typeof j.staging !== "string" || !("previous" in j))
+  const phases: Phase[] = ["prepared", "old_moved", "swapped", "done", "rolling_back"];
+  if (
+    typeof j.target !== "string" ||
+    typeof j.staging !== "string" ||
+    !("previous" in j) ||
+    !phases.includes(j.phase as Phase)
+  )
     throw new Error("restore journal is unreadable");
   return j as Journal;
 }
 
 const exists = (p: string) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
 
+/** The marker of a complete, checked new data folder: the SHA-256 of its database. */
+function writeMarker(dir: string): void {
+  writeDurable(path.join(dir, COMPLETE_MARKER), JSON.stringify({ db: sha256File(path.join(dir, DB_FILE)) }));
+}
+
+/** True when `dir` is a complete new data folder: marker present, database unchanged since, opens, quick check ok. */
+export function isCompleteStaging(dir: string): boolean {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(dir, COMPLETE_MARKER), "utf8")) as { db?: unknown };
+    const dbFile = path.join(dir, DB_FILE);
+    if (typeof m.db !== "string" || sha256File(dbFile) !== m.db) return false;
+    const db = new Database(dbFile, { readonly: true, fileMustExist: true });
+    try {
+      return db.pragma("quick_check", { simple: true }) === "ok";
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
 export type RecoveryOutcome = "none" | "completed" | "rolled_back";
 
-/**
- * Finishes a restore that was interrupted during the swap. Call with the data folder's lock held. The journal names
- * the checked new folder (`staging`), the target and where the old folder goes (`previous`):
- * - the new folder still exists → the swap is completed (old folder aside, new one in);
- * - it is gone and the target is missing → the old folder is moved back;
- * - it is gone and the target exists → the swap had finished, only the journal is left.
- */
+export class RecoveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RecoveryError";
+  }
+}
+
+/** Finishes or undoes a restore interrupted during the swap. Call with the data folder's lock held. */
 export function recoverInterruptedRestore(dataDir: string): RecoveryOutcome {
   const file = restoreJournalPath(dataDir);
   const j = readJournal(file);
   if (!j) return "none";
-  if (path.resolve(j.target) !== path.resolve(dataDir))
-    throw new Error("restore journal names another folder");
+  if (j.target !== realDataDir(dataDir)) throw new RecoveryError("restore journal names another folder");
+  const forward =
+    j.phase === "swapped" ||
+    j.phase === "done" ||
+    (j.phase === "old_moved" && (isCompleteStaging(j.staging) || isCompleteStaging(j.target)));
   let outcome: RecoveryOutcome;
-  if (exists(j.staging)) {
-    if (exists(j.target)) {
-      if (j.previous) fs.renameSync(j.target, j.previous);
-      else fs.rmdirSync(j.target); // planned as empty: anything in it makes this fail (nothing lost)
-    }
-    fs.renameSync(j.staging, j.target);
+  if (forward) {
+    if (!exists(j.target)) fs.renameSync(j.staging, j.target);
+    else if (!isCompleteStaging(j.target))
+      throw new RecoveryError("restore journal: the data folder is neither the old one nor the restored one");
+    fs.rmSync(path.join(j.target, COMPLETE_MARKER), { force: true });
     outcome = "completed";
-  } else if (!exists(j.target) && j.previous && exists(j.previous)) {
-    fs.renameSync(j.previous, j.target);
+  } else {
+    // Back to the old folder, whatever is in staging (possibly half-deleted).
+    writeDurable(file, JSON.stringify({ ...j, phase: "rolling_back" } satisfies Journal));
+    if (exists(j.target) && isCompleteStaging(j.target) && j.previous && exists(j.previous))
+      fs.renameSync(j.target, `${j.staging}.undo`);
+    if (!exists(j.target) && j.previous && exists(j.previous)) fs.renameSync(j.previous, j.target);
+    if (!exists(j.target) && j.previous)
+      throw new RecoveryError("restore journal: the old data folder is missing — nothing was started");
+    fs.rmSync(j.staging, { recursive: true, force: true });
+    fs.rmSync(`${j.staging}.undo`, { recursive: true, force: true });
     outcome = "rolled_back";
-  } else outcome = exists(j.target) ? "completed" : "rolled_back";
+  }
   fs.rmSync(file, { force: true });
+  fsyncDir(path.dirname(file));
   return outcome;
+}
+
+/**
+ * Everything that writes the data folder starts here — the server, `pnpm db:migrate`, `pnpm restore`: the lock (a
+ * second writer is refused), then recovery of an interrupted restore, then a check that the folder is not simply
+ * missing while an older copy sits next to it (a fresh empty database must never replace the family's data
+ * unnoticed). Only then may the caller open the layout and the database.
+ */
+export function openStorageForWrite(
+  dataDir: string,
+  kind: DataLockKind,
+): { lock: DataLock; recovered: RecoveryOutcome; dataDir: string } {
+  const lock = acquireDataLock(dataDir, kind);
+  try {
+    const recovered = recoverInterruptedRestore(dataDir);
+    const real = realDataDir(dataDir);
+    if (kind !== "restore" && !exists(path.join(real, DB_FILE))) {
+      const prefix = `${path.basename(real)}.before-restore-`;
+      const parent = path.dirname(real);
+      const asides = exists(parent) ? fs.readdirSync(parent).filter((n) => n.startsWith(prefix)) : [];
+      if (asides.length)
+        throw new RecoveryError(
+          `no database in the data folder but an earlier one is next to it (${asides[0]}) — move it back or restore (docs/ops.md §21.4)`,
+        );
+    }
+    return { lock, recovered, dataDir: real };
+  } catch (e) {
+    lock.release();
+    throw e;
+  }
 }
 
 export type RestoreOptions = {
@@ -240,8 +342,15 @@ export type RestoreOptions = {
   now?: () => number;
   /** Tests: the code's migrations. */
   code?: AppliedMigration[];
-  /** Tests: the swap's renames (fault injection) and a call after each step (a kill between steps). */
-  hooks?: { rename?: (from: string, to: string) => void; step?: (step: RestoreStep) => void };
+  /**
+   * Tests: the swap's renames and removals (fault injection) and a call after each journal phase is written (a kill
+   * between steps).
+   */
+  hooks?: {
+    rename?: (from: string, to: string) => void;
+    rm?: (p: string) => void;
+    step?: (step: RestoreStep) => void;
+  };
 };
 
 export type RestoreResult = {
@@ -253,7 +362,8 @@ export type RestoreResult = {
 };
 
 export function restoreBackup(o: RestoreOptions): RestoreResult {
-  const target = path.resolve(o.target);
+  // The real path: renaming through a symlinked alias would move the link, not the folder.
+  const target = realDataDir(o.target);
   const backup = path.resolve(o.backup);
   if (
     isInside(target, backup) ||
@@ -266,18 +376,17 @@ export function restoreBackup(o: RestoreOptions): RestoreResult {
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   // The scheduler and every writer live in the server process: it must be stopped. The lock also keeps a server
   // from starting (and another restore from running) until the swap is done.
-  let lock: DataLock;
+  let claim: ReturnType<typeof openStorageForWrite>;
   try {
-    lock = acquireDataLock(target, "restore");
+    claim = openStorageForWrite(target, "restore");
   } catch (e) {
     if (e instanceof DataLockHeld) throw new RestoreError("server_running");
     throw e;
   }
   try {
-    recoverInterruptedRestore(target);
     return restoreLocked(o, target, backup);
   } finally {
-    lock.release();
+    claim.lock.release();
   }
 }
 
@@ -315,11 +424,13 @@ function restoreLocked(o: RestoreOptions, target: string, backup: string): Resto
       // from the server's history (as after a rewrite).
       db.$client.prepare("UPDATE runtime_sessions SET invalidated = 1").run();
       db.$client.pragma("wal_checkpoint(TRUNCATE)");
+      db.$client.pragma("journal_mode = DELETE");
     } finally {
       db.$client.close();
     }
     for (const f of [paths.db, `${paths.db}-wal`, `${paths.db}-shm`])
       if (fs.existsSync(f)) fs.chmodSync(f, 0o600);
+    writeMarker(staging);
   } catch (e) {
     fs.rmSync(staging, { recursive: true, force: true });
     throw e;
@@ -330,43 +441,45 @@ function restoreLocked(o: RestoreOptions, target: string, backup: string): Resto
     const stamp = new Date((o.now ?? Date.now)()).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "Z");
     previous = `${target}.before-restore-${stamp}`;
     if (exists(previous)) previous = `${previous}-${crypto.randomBytes(2).toString("hex")}`;
-  }
-  swap({ target, staging, previous, targetExists: !!existing }, o.hooks);
+  } else if (existing) fs.rmdirSync(target);
+  swap({ target, staging, previous }, o.hooks);
   return { manifest, pending: verified.pending, previous: previous ?? undefined };
 }
 
-/** Old folder aside, new one in — journaled, and undone in place when a rename fails. */
+/** Old folder aside, new one in — every phase journaled; a failure is undone in place, a kill by the next writer. */
 function swap(
-  s: { target: string; staging: string; previous: string | null; targetExists: boolean },
+  s: { target: string; staging: string; previous: string | null },
   hooks: RestoreOptions["hooks"],
 ): void {
   const rename = hooks?.rename ?? fs.renameSync;
+  const rm = hooks?.rm ?? ((p: string) => fs.rmSync(p, { recursive: true, force: true }));
   const journal = restoreJournalPath(s.target);
-  const j: Journal = { target: s.target, staging: s.staging, previous: s.previous, step: "staged" };
-  writeJournal(journal, j);
-  hooks?.step?.("staged");
-  let moved = false;
+  const phase = (p: Phase) => {
+    writeDurable(journal, JSON.stringify({ ...s, phase: p } satisfies Journal));
+    hooks?.step?.(p);
+  };
+  phase("prepared");
   try {
     if (s.previous) {
       rename(s.target, s.previous);
-      moved = true;
-      writeJournal(journal, { ...j, step: "moved_old" });
-      hooks?.step?.("moved_old");
-    } else if (s.targetExists) fs.rmdirSync(s.target);
+      phase("old_moved");
+    }
     rename(s.staging, s.target);
-    hooks?.step?.("swapped");
   } catch (e) {
-    // Undo: the old folder goes back to its place, the new one is dropped. If even that fails, the journal stays
-    // and the next restore or server start finishes the swap.
+    // Recorded first, so a crash in the middle of undoing is undone too (never rolled forward).
     try {
-      if (moved && s.previous && !exists(s.target)) fs.renameSync(s.previous, s.target);
-      else if (!s.previous && s.targetExists && !exists(s.target)) fs.mkdirSync(s.target, { mode: 0o700 });
-      fs.rmSync(s.staging, { recursive: true, force: true });
+      phase("rolling_back");
+      if (!exists(s.target) && s.previous && exists(s.previous)) rename(s.previous, s.target);
+      rm(s.staging);
       fs.rmSync(journal, { force: true });
     } catch {
-      // left for recoverInterruptedRestore
+      // the journal says rolling_back: the next writer finishes the undo
     }
     throw e;
   }
+  phase("swapped");
+  fs.rmSync(path.join(s.target, COMPLETE_MARKER), { force: true });
+  phase("done");
   fs.rmSync(journal, { force: true });
+  fsyncDir(path.dirname(journal));
 }

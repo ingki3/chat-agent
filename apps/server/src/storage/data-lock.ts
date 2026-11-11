@@ -1,117 +1,126 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { processIdentity } from "./process-identity.js";
+import Database from "better-sqlite3";
+import { canonicalPath } from "../fs-safety.js";
 
 /**
  * The data folder's cross-process lock (#37). One holder at a time: the server for its whole life (taken before the
  * database is opened), `pnpm restore` while it replaces the folder, `pnpm db:migrate`. A second server refuses to
  * start; a restore refuses while a server holds it.
  *
- * The lock is a file next to the data folder — `<parent>/.<name>.lock` — not inside it, so it stays put while a
- * restore swaps the folder. It is created with `O_EXCL` (`wx`) and holds the holder's pid and its start time as `ps`
- * reports it. It is stale when that pid is gone or now belongs to another process (a different start time); a
- * stale lock is moved away and the creation retried. Node has no `flock` without a native module; this is the
- * dependency-free equivalent, and every holder releases it on exit.
+ * It is a kernel lock: a small SQLite database next to the data folder (`<parent>/.<name>.lock.db`, outside the
+ * folder so a restore's swap leaves it alone) opened with `locking_mode = EXCLUSIVE` and an exclusive transaction.
+ * SQLite takes a POSIX `fcntl` lock on the file and keeps it while the connection is open; the system drops it when
+ * the process dies (kill -9 included). So there is no stale-lock logic and no window between "check" and "take": a
+ * second opener simply gets SQLITE_BUSY (busy timeout 0). The holder's pid and role are written to a side file only
+ * for the refusal message — never to decide anything.
+ *
+ * The folder is named by its real path (symlinks resolved): `alias → data` and `data` share one lock.
  */
 export type DataLockKind = "server" | "restore" | "migrate";
-type Record_ = { pid: number; lstart: string; kind: DataLockKind; at: number };
 
 export class DataLockHeld extends Error {
-  constructor(readonly holder: DataLockKind) {
+  constructor(readonly holder: DataLockKind | "unknown") {
     super(`data folder is in use (${holder})`);
     this.name = "DataLockHeld";
   }
 }
 
-export function dataLockPath(dataDir: string): string {
-  const abs = path.resolve(dataDir);
-  return path.join(path.dirname(abs), `.${path.basename(abs)}.lock`);
+/** The data folder's real path (symlinks of it and of its parents resolved; a missing tail kept as written). */
+export function realDataDir(dataDir: string): string {
+  return canonicalPath(dataDir);
 }
 
-function readRecord(file: string): Record_ | undefined {
+function lockBase(dataDir: string): string {
+  const real = realDataDir(dataDir);
+  return path.join(path.dirname(real), `.${path.basename(real)}.lock`);
+}
+export const dataLockPath = (dataDir: string) => `${lockBase(dataDir)}.db`;
+const infoPath = (dataDir: string) => `${lockBase(dataDir)}.info`;
+
+/** Opens the lock file without following a symlink, creating it owner-only. */
+function lockFile(file: string): void {
+  const st = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (st && (st.isSymbolicLink() || !st.isFile()))
+    throw new Error(`data lock ${file} must be a regular file`);
+  if (!st) {
+    try {
+      fs.closeSync(
+        fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600),
+      );
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+  }
+  if ((fs.lstatSync(file).mode & 0o077) !== 0) fs.chmodSync(file, 0o600);
+}
+
+const isBusy = (e: unknown) =>
+  typeof (e as { code?: unknown }).code === "string" &&
+  /^SQLITE_(BUSY|LOCKED)/.test((e as { code: string }).code);
+
+function holderKind(dataDir: string): DataLockKind | "unknown" {
   try {
-    const r = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<Record_>;
-    if (!Number.isInteger(r.pid) || typeof r.lstart !== "string" || typeof r.kind !== "string")
-      return undefined;
-    return r as Record_;
+    const k = (JSON.parse(fs.readFileSync(infoPath(dataDir), "utf8")) as { kind?: unknown }).kind;
+    return k === "server" || k === "restore" || k === "migrate" ? k : "unknown";
   } catch {
-    return undefined;
+    return "unknown";
   }
-}
-
-/** Whether the process that wrote `r` is still that process. */
-function alive(r: Record_): boolean {
-  if (r.pid <= 0) return false;
-  try {
-    process.kill(r.pid, 0);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EPERM") return false;
-  }
-  const id = processIdentity(r.pid);
-  // Alive but `ps` could not tell who it is: treat as held (never steal a lock that may be live).
-  return id ? id.lstart === r.lstart : true;
-}
-
-/** The holder of the lock, when it is held by a live process. */
-export function dataLockHolder(dataDir: string): DataLockKind | undefined {
-  const r = readRecord(dataLockPath(dataDir));
-  return r && alive(r) ? r.kind : undefined;
 }
 
 export type DataLock = { release: () => void };
 
-/** Takes the lock or throws `DataLockHeld`. */
+/**
+ * Open lock connections. Kept here so a holder that drops its `DataLock` cannot lose the lock to garbage collection
+ * (a collected connection is closed, and closing drops the fcntl lock).
+ */
+const held = new Set<Database.Database>();
+
+/** Takes the lock or throws `DataLockHeld`. Held until `release()` or the end of the process. */
 export function acquireDataLock(dataDir: string, kind: DataLockKind): DataLock {
   const file = dataLockPath(dataDir);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const me = processIdentity(process.pid);
-  if (!me) throw new Error("data lock: cannot identify this process");
-  const record: Record_ = { pid: process.pid, lstart: me.lstart, kind, at: Date.now() };
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const fd = fs.openSync(file, "wx", 0o600);
-      try {
-        fs.writeSync(fd, JSON.stringify(record));
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      let released = false;
-      return {
-        release: () => {
-          if (released) return;
-          released = true;
-          const now = readRecord(file);
-          if (now?.pid === record.pid && now.lstart === record.lstart) fs.rmSync(file, { force: true });
-        },
-      };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    }
-    const held = readRecord(file);
-    if (held && alive(held)) throw new DataLockHeld(held.kind);
-    // Stale (or half-written by a holder that died at once): move it away, then make sure what was moved is the
-    // stale one — another process may have replaced it meanwhile, and that one is put back.
-    const aside = `${file}.stale-${crypto.randomBytes(4).toString("hex")}`;
-    try {
-      fs.renameSync(file, aside);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw e;
-    }
-    const moved = readRecord(aside);
-    if (moved && alive(moved)) {
-      // Put the live holder's record back, unless yet another one exists by now (held either way).
-      try {
-        fs.writeFileSync(file, JSON.stringify(moved), { mode: 0o600, flag: "wx" });
-      } catch {
-        // someone else holds it now
-      }
-      fs.rmSync(aside, { force: true });
-      throw new DataLockHeld(moved.kind);
-    }
-    fs.rmSync(aside, { force: true });
+  lockFile(file);
+  const db = new Database(file, { timeout: 0 });
+  try {
+    db.pragma("locking_mode = EXCLUSIVE");
+    db.pragma("journal_mode = DELETE");
+    // The first write takes the EXCLUSIVE lock; in exclusive locking mode it is kept after COMMIT until close.
+    db.exec("BEGIN EXCLUSIVE");
+    db.exec("CREATE TABLE IF NOT EXISTS holder (kind TEXT, pid INTEGER, at INTEGER)");
+    db.prepare("DELETE FROM holder").run();
+    db.prepare("INSERT INTO holder VALUES (?, ?, ?)").run(kind, process.pid, Date.now());
+    db.exec("COMMIT");
+  } catch (e) {
+    db.close();
+    if (isBusy(e)) throw new DataLockHeld(holderKind(dataDir));
+    throw e;
   }
-  throw new DataLockHeld(readRecord(file)?.kind ?? "server");
+  // For messages only (another process cannot read the locked database).
+  try {
+    fs.writeFileSync(infoPath(dataDir), JSON.stringify({ kind, pid: process.pid }), { mode: 0o600 });
+  } catch {
+    // informational
+  }
+  held.add(db);
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      held.delete(db);
+      db.close();
+    },
+  };
+}
+
+/** Who holds the lock right now (undefined = nobody): tries to take it and gives it back at once. */
+export function dataLockHolder(dataDir: string): DataLockKind | "unknown" | undefined {
+  try {
+    acquireDataLock(dataDir, "restore").release();
+    return undefined;
+  } catch (e) {
+    if (e instanceof DataLockHeld) return e.holder;
+    throw e;
+  }
 }

@@ -21,7 +21,7 @@ import { appliedMigrations } from "./schema.js";
  * reads it), the runtime folders (`runtimes/`: CLI session caches, login folders that may hold a provider's tokens
  * file in clear while a login is under way, and the login quarantine), the server skill folder (`skills/`:
  * reinstalled from the allow-list with `pnpm skills:install`, which verifies every file), temp folders and
- * `server.pid`. Credentials stay what they are in the database: AES-256-GCM ciphertext.
+ * the data folder lock (outside DATA_DIR anyway). Credentials stay what they are in the database: AES-256-GCM ciphertext.
  */
 
 export const BACKUP_CODES = [
@@ -34,7 +34,7 @@ export const BACKUP_CODES = [
 export type BackupCode = (typeof BACKUP_CODES)[number];
 
 export const BACKUP_FORMAT = 1;
-/** Kept for this long; the next backup after that deletes it (the newest one is always kept). */
+/** Kept for this long; the next prune (every backup attempt, and server start) deletes it — the newest one too. */
 export const RETENTION_DAYS = 7;
 const DAY_MS = 86_400_000;
 /** Every day at this local time (service time zone, Asia/Seoul) — the family is asleep. */

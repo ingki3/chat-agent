@@ -26,7 +26,7 @@ import {
 } from "../src/backup/backup.js";
 import { FileWriteLock } from "../src/backup/lock.js";
 import {
-  recoverInterruptedRestore,
+  COMPLETE_MARKER,
   restoreBackup,
   RestoreError,
   restoreJournalPath,
@@ -39,7 +39,6 @@ import { RuntimeFailure, RuntimeRegistry, type StartContext } from "../src/runti
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { acquireDataLock, dataLockPath, DataLockHeld } from "../src/storage/data-lock.js";
 import { storagePaths } from "../src/storage/paths.js";
-import { processIdentity } from "../src/storage/process-identity.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 type App = Awaited<ReturnType<typeof buildApp>>;
@@ -446,15 +445,11 @@ describe("restore refuses clearly and changes nothing (#37)", () => {
     fs.writeFileSync(path.join(escape, MANIFEST_FILE), JSON.stringify(m));
     expect(restoreCode(() => restoreBackup({ backup: escape, target, key: t.key }))).toBe("manifest_invalid");
     nothingWritten(t.root, target);
-    // A server still holding the target's lock (a live process — the real cross-process case is below).
+    // A server still holding the target's lock (the cross-process case is below).
     fs.mkdirSync(target, { mode: 0o700 });
-    const ppid = processIdentity(process.ppid)!;
-    fs.writeFileSync(
-      dataLockPath(target),
-      JSON.stringify({ pid: process.ppid, lstart: ppid.lstart, kind: "server", at: 0 }),
-    );
+    const held = acquireDataLock(target, "server");
     expect(restoreCode(() => restoreBackup({ backup: t.backup, target, key: t.key }))).toBe("server_running");
-    fs.rmSync(dataLockPath(target));
+    held.release();
     // Into the backup folder, or over the key: refused.
     expect(
       restoreCode(() =>
@@ -827,12 +822,16 @@ const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures"
 const CLI = path.join(REPO_ROOT, "apps", "server", "src", "cli", "restore.ts");
 
 /** A separate Node process running TypeScript (the real lock, the real CLI). */
-function spawnTs(file: string, args: string[], env: Record<string, string> = {}) {
-  const child = spawn(process.execPath, ["--conditions=development", "--import", "tsx", file, ...args], {
-    cwd: REPO_ROOT,
-    env: { ...process.env, ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+function spawnTs(file: string, args: string[], env: Record<string, string> = {}, node: string[] = []) {
+  const child = spawn(
+    process.execPath,
+    [...node, "--conditions=development", "--import", "tsx", file, ...args],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   let out = "";
   let err = "";
   child.stdout.on("data", (d) => (out += String(d)));
@@ -863,147 +862,304 @@ const tryLock = async (dataDir: string, kind = "server") => {
   return c.out().trim();
 };
 
-describe("data folder lock across processes (#37 review P1)", () => {
-  it("a second server refuses to start, a restore refuses, and a dead holder's lock is cleared", async () => {
-    const L = layout();
-    createMasterKey(L.keyPath);
-    const holder = spawnTs(CHILD, ["lock", L.dataDir, "server"]);
-    await holder.waitFor("locked");
-    // Another process: refused, whatever it is.
-    expect(await tryLock(L.dataDir, "server")).toBe("held:server");
-    expect(await tryLock(L.dataDir, "restore")).toBe("held:server");
-    // This process starting a server: refused before the database is opened.
-    const cfg = loadConfig({ NODE_ENV: "test", DATA_DIR: L.dataDir, MASTER_KEY_PATH: L.keyPath });
-    expect(() => openServerStorage(cfg)).toThrow(DataLockHeld);
-    expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
-    // A restore: server_running, nothing written.
-    const backup = await (async () => {
+describe(
+  "data folder lock across processes (#37 review P1, round 2: kernel lock)",
+  { timeout: 60_000 },
+  () => {
+    it("a second server refuses to start, a restore refuses, and kill -9 releases the lock", async () => {
+      const L = layout();
+      createMasterKey(L.keyPath);
+      const holder = spawnTs(CHILD, ["lock", L.dataDir, "server"]);
+      await holder.waitFor("locked");
+      // Another process: refused, whatever it is (the holder's role comes from the side file).
+      expect(await tryLock(L.dataDir, "server")).toBe("held:server");
+      expect(await tryLock(L.dataDir, "restore")).toBe("held:server");
+      // This process starting a server: refused before the database is opened.
+      const cfg = loadConfig({ NODE_ENV: "test", DATA_DIR: L.dataDir, MASTER_KEY_PATH: L.keyPath });
+      expect(() => openServerStorage(cfg)).toThrow(DataLockHeld);
+      expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
+      // A restore: server_running, nothing written.
+      const backup = await (async () => {
+        const M = layout();
+        createMasterKey(M.keyPath);
+        const one = await start(M);
+        const f = await createFamily(one.app);
+        const id = await backupNow(one.app, f.cookies.admin);
+        await one.close();
+        return { dir: path.join(M.backupDir, id), key: loadMasterKey(M.keyPath) };
+      })();
+      expect(
+        restoreCode(() => restoreBackup({ backup: backup.dir, target: L.dataDir, key: backup.key })),
+      ).toBe("server_running");
+      expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
+      // kill -9: the system drops the holder's lock — no stale-lock logic involved.
+      holder.child.kill("SIGKILL");
+      await holder.exited;
+      expect(await tryLock(L.dataDir)).toBe("acquired");
+      const opened = openServerStorage(cfg);
+      expect(await tryLock(L.dataDir)).toBe("held:server");
+      opened.storage.db.$client.close();
+      opened.release();
+      expect(await tryLock(L.dataDir)).toBe("acquired");
+      // The lock file is owner-only and never a symlink.
+      expect(fs.statSync(dataLockPath(L.dataDir)).mode & 0o777).toBe(0o600);
+      const other = path.join(tmp(), "data");
+      fs.symlinkSync(path.join(tmp(), "elsewhere.db"), dataLockPath(other));
+      expect(() => acquireDataLock(other, "server")).toThrow(/regular file/);
+    });
+
+    it("a holder that drops its handle keeps the lock (garbage collection never releases it)", async () => {
+      const dir = path.join(tmp(), "data");
+      const holder = spawnTs(CHILD, ["lock-drop", dir], {}, ["--expose-gc"]);
+      await holder.waitFor("locked");
+      await new Promise((r) => setTimeout(r, 100));
+      expect(await tryLock(dir)).toBe("held:server");
+    });
+
+    it("contenders racing in a loop never hold it together", async () => {
+      const dir = path.join(tmp(), "data");
+      const sentinel = path.join(path.dirname(dir), "inside");
+      const racers = [0, 1, 2].map(() => spawnTs(CHILD, ["race", dir, sentinel, "150"]));
+      const results = await Promise.all(racers.map(async (r) => (await r.exited, r.out().trim())));
+      for (const r of racers) expect(r.err()).toBe("");
+      const counts = results.map((o) => {
+        expect(o).not.toContain("OVERLAP");
+        return Number(/acquired=(\d+)/.exec(o)![1]);
+      });
+      // Every racer got it sometimes; the total proves the loop really contended.
+      expect(counts.every((n) => n > 0)).toBe(true);
+    });
+
+    it("a symlinked DATA_DIR shares the real folder's lock and journal", async () => {
+      const root = tmp();
+      const real = path.join(root, "data");
+      fs.mkdirSync(real, { mode: 0o700 });
+      const alias = path.join(root, "alias");
+      fs.symlinkSync(real, alias);
+      expect(dataLockPath(alias)).toBe(dataLockPath(real));
+      expect(restoreJournalPath(alias)).toBe(restoreJournalPath(real));
+      const holder = spawnTs(CHILD, ["lock", alias, "server"]);
+      await holder.waitFor("locked");
+      expect(await tryLock(real, "restore")).toBe("held:server");
+      expect(() => acquireDataLock(real, "restore")).toThrow(DataLockHeld);
+      holder.child.kill("SIGKILL");
+      await holder.exited;
+      const viaReal = acquireDataLock(real, "server");
+      expect(await tryLock(alias, "restore")).toBe("held:server");
+      viaReal.release();
+      // A restore through the alias replaces the real folder; the alias stays a link to it.
       const M = layout();
       createMasterKey(M.keyPath);
       const one = await start(M);
       const f = await createFamily(one.app);
       const id = await backupNow(one.app, f.cookies.admin);
       await one.close();
-      return { dir: path.join(M.backupDir, id), key: loadMasterKey(M.keyPath) };
-    })();
-    expect(restoreCode(() => restoreBackup({ backup: backup.dir, target: L.dataDir, key: backup.key }))).toBe(
-      "server_running",
-    );
-    expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
-    // The holder dies without releasing (kill -9): its lock is stale and the next one takes it.
-    holder.child.kill("SIGKILL");
-    await holder.exited;
-    expect(fs.existsSync(dataLockPath(L.dataDir))).toBe(true);
-    expect(await tryLock(L.dataDir)).toBe("acquired");
-    const opened = openServerStorage(cfg);
-    expect(await tryLock(L.dataDir)).toBe("held:server");
-    opened.storage.db.$client.close();
-    opened.release();
-    expect(fs.existsSync(dataLockPath(L.dataDir))).toBe(false);
-  });
+      fs.writeFileSync(path.join(real, "marker"), "old");
+      restoreBackup({ backup: path.join(M.backupDir, id), target: alias, key: loadMasterKey(M.keyPath) });
+      expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(path.join(real, DB_FILE))).toBe(true);
+      expect(fs.existsSync(path.join(real, "marker"))).toBe(false);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("data.before-restore-"))).toHaveLength(1);
+    });
+  },
+);
 
-  it("a lock whose pid now belongs to another process (other start time) is stale", async () => {
-    const dir = path.join(tmp(), "data");
-    fs.writeFileSync(
-      dataLockPath(dir),
-      JSON.stringify({ pid: process.ppid, lstart: "Thu Jan 1 00:00:00 1970", kind: "server", at: 0 }),
-    );
-    expect(await tryLock(dir)).toBe("acquired");
-    // The same pid with its real start time is live.
-    fs.writeFileSync(
-      dataLockPath(dir),
-      JSON.stringify({
-        pid: process.ppid,
-        lstart: processIdentity(process.ppid)!.lstart,
-        kind: "restore",
-        at: 0,
-      }),
-    );
-    expect(await tryLock(dir)).toBe("held:restore");
-    expect(() => acquireDataLock(dir, "server")).toThrow(DataLockHeld);
-  });
-});
-
-describe("the swap survives a failed rename and a kill (#37 review P1)", () => {
-  async function prepared() {
-    const L = layout();
-    createMasterKey(L.keyPath);
-    const one = await start(L);
-    const f = await createFamily(one.app);
-    const id = await backupNow(one.app, f.cookies.admin);
-    await one.close();
-    // The live data folder the restore replaces: recognisable old content.
-    fs.writeFileSync(path.join(L.dataDir, "marker"), "old");
-    return { ...L, backup: path.join(L.backupDir, id), key: loadMasterKey(L.keyPath) };
-  }
-  const leftovers = (root: string) =>
-    fs.readdirSync(root).filter((n) => n.includes(".restore-") || n.includes("restore-journal"));
-
-  it("EIO on the second rename: the old folder is put back, nothing else is left", async () => {
-    const t = await prepared();
-    const eio = Object.assign(new Error("EIO"), { code: "EIO" });
-    let renames = 0;
-    expect(() =>
-      restoreBackup({
-        backup: t.backup,
-        target: t.dataDir,
-        key: t.key,
-        hooks: {
-          rename: (from, to) => {
-            if (++renames === 2) throw eio;
-            fs.renameSync(from, to);
-          },
-        },
-      }),
-    ).toThrow("EIO");
-    expect(renames).toBe(2);
-    expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
-    expect(leftovers(t.root)).toEqual([]);
-    expect(fs.readdirSync(t.root).filter((n) => n.includes("before-restore"))).toEqual([]);
-    expect(fs.existsSync(dataLockPath(t.dataDir))).toBe(false);
-  });
-
-  for (const step of ["staged", "moved_old"] as const)
-    it(`killed after "${step}": the next server start finishes the restore`, async () => {
-      const t = await prepared();
-      const keyFile = path.join(t.root, "keys", "master.key");
-      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, keyFile, step]);
-      expect((await c.exited).signal).toBe("SIGKILL");
-      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
-      if (step === "moved_old") expect(fs.existsSync(t.dataDir)).toBe(false);
-      // Server start: takes the dead restore's stale lock, finishes the swap, opens the restored data.
-      const opened = openServerStorage(
-        loadConfig({ NODE_ENV: "test", DATA_DIR: t.dataDir, MASTER_KEY_PATH: t.keyPath }),
-      );
+describe(
+  "the swap survives failures and kills (#37 review P1, round 2: journal phases)",
+  { timeout: 60_000 },
+  () => {
+    async function prepared() {
+      const L = layout();
+      createMasterKey(L.keyPath);
+      const one = await start(L);
+      const f = await createFamily(one.app);
+      const id = await backupNow(one.app, f.cookies.admin);
+      // The live data folder the restore replaces: recognisable old content (a 5th user, a marker file).
+      one.app.users!.create({ email: "old-only@x", name: "old", role: "member", passwordHash: null });
+      await one.close();
+      fs.writeFileSync(path.join(L.dataDir, "marker"), "old");
+      return { ...L, backup: path.join(L.backupDir, id), key: loadMasterKey(L.keyPath) };
+    }
+    const leftovers = (root: string) =>
+      fs.readdirSync(root).filter((n) => n.includes(".restore-") || n.includes("restore-journal"));
+    const asides = (root: string) => fs.readdirSync(root).filter((n) => n.startsWith("data.before-restore-"));
+    const startServer = (t: { dataDir: string; keyPath: string }) =>
+      openServerStorage(loadConfig({ NODE_ENV: "test", DATA_DIR: t.dataDir, MASTER_KEY_PATH: t.keyPath }));
+    const users = (o: ReturnType<typeof startServer>) =>
+      (o.storage.db.$client.prepare("SELECT count(*) AS n FROM users").get() as { n: number }).n;
+    const expectOld = (t: { root: string; dataDir: string; keyPath: string }) => {
+      expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+      const o = startServer(t);
       try {
-        expect(opened.recovered).toBe("completed");
-        expect(fs.existsSync(path.join(t.dataDir, "marker"))).toBe(false);
-        expect(opened.storage.db.$client.prepare("SELECT count(*) AS n FROM users").get()).toEqual({ n: 4 });
+        expect(o.recovered).toBe("none");
+        expect(users(o)).toBe(5);
       } finally {
-        opened.storage.db.$client.close();
-        opened.release();
+        o.storage.db.$client.close();
+        o.release();
       }
-      const aside = fs.readdirSync(t.root).filter((n) => n.startsWith("data.before-restore-"));
-      expect(aside).toHaveLength(1);
-      expect(fs.readFileSync(path.join(t.root, aside[0]!, "marker"), "utf8")).toBe("old");
+      expect(leftovers(t.root)).toEqual([]);
+      expect(asides(t.root)).toEqual([]);
+    };
+    const eio = () => Object.assign(new Error("EIO"), { code: "EIO" });
+
+    it("EIO on the second rename: the old folder is put back, nothing else is left", async () => {
+      const t = await prepared();
+      let renames = 0;
+      expect(() =>
+        restoreBackup({
+          backup: t.backup,
+          target: t.dataDir,
+          key: t.key,
+          hooks: {
+            rename: (from, to) => {
+              if (++renames === 2) throw eio();
+              fs.renameSync(from, to);
+            },
+          },
+        }),
+      ).toThrow("EIO");
+      expectOld(t);
+    });
+
+    it("EIO on the second rename, then the clean-up dies half-way: a restart keeps the original data", async () => {
+      const t = await prepared();
+      let renames = 0;
+      expect(() =>
+        restoreBackup({
+          backup: t.backup,
+          target: t.dataDir,
+          key: t.key,
+          hooks: {
+            rename: (from, to) => {
+              if (++renames === 2) throw eio();
+              fs.renameSync(from, to);
+            },
+            // Deletes the staged database, then fails: a half-deleted candidate stays behind.
+            rm: (p) => {
+              fs.rmSync(path.join(p, DB_FILE));
+              throw eio();
+            },
+          },
+        }),
+      ).toThrow("EIO");
+      expect(JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")).phase).toBe("rolling_back");
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("rolled_back");
+        expect(users(o)).toBe(5);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
       expect(leftovers(t.root)).toEqual([]);
     });
 
-  it("killed after the old folder moved and the new one is lost: the old folder comes back", async () => {
-    const t = await prepared();
-    const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "moved_old"]);
-    await c.exited;
-    const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { staging: string };
-    fs.rmSync(j.staging, { recursive: true });
-    // The next restore run recovers first (then fails on its own: wrong key — the data folder is back anyway).
-    expect(
-      restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: crypto.randomBytes(32) })),
-    ).toBe("wrong_key");
-    expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
-    expect(leftovers(t.root)).toEqual([]);
-    expect(recoverInterruptedRestore(t.dataDir)).toBe("none");
-  });
-});
+    it("the move back fails too: the journal stays rolling_back and the next start moves the old folder back", async () => {
+      const t = await prepared();
+      let renames = 0;
+      expect(() =>
+        restoreBackup({
+          backup: t.backup,
+          target: t.dataDir,
+          key: t.key,
+          hooks: {
+            rename: (from, to) => {
+              if (++renames >= 2) throw eio();
+              fs.renameSync(from, to);
+            },
+          },
+        }),
+      ).toThrow("EIO");
+      expect(fs.existsSync(t.dataDir)).toBe(false);
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("rolled_back");
+        expect(users(o)).toBe(5);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      expect(leftovers(t.root)).toEqual([]);
+    });
+
+    it(`killed after "prepared" (nothing moved yet): the next start rolls back`, async () => {
+      const t = await prepared();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "prepared"]);
+      expect((await c.exited).signal).toBe("SIGKILL");
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+      const o = startServer(t);
+      expect(o.recovered).toBe("rolled_back");
+      o.storage.db.$client.close();
+      o.release();
+      expectOld(t);
+    });
+
+    for (const step of ["old_moved", "swapped"] as const)
+      it(`killed after "${step}": the next server start finishes the restore`, async () => {
+        const t = await prepared();
+        const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, step]);
+        expect((await c.exited).signal).toBe("SIGKILL");
+        expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+        if (step === "old_moved") expect(fs.existsSync(t.dataDir)).toBe(false);
+        const o = startServer(t);
+        try {
+          expect(o.recovered).toBe("completed");
+          expect(users(o)).toBe(4);
+        } finally {
+          o.storage.db.$client.close();
+          o.release();
+        }
+        expect(fs.existsSync(path.join(t.dataDir, "marker"))).toBe(false);
+        expect(fs.existsSync(path.join(t.dataDir, COMPLETE_MARKER))).toBe(false);
+        expect(asides(t.root)).toHaveLength(1);
+        expect(fs.readFileSync(path.join(t.root, asides(t.root)[0]!, "marker"), "utf8")).toBe("old");
+        expect(leftovers(t.root)).toEqual([]);
+      });
+
+    it("killed after old_moved with a damaged candidate: rolled back, never promoted", async () => {
+      const t = await prepared();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "old_moved"]);
+      await c.exited;
+      const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { staging: string };
+      fs.appendFileSync(path.join(j.staging, DB_FILE), "x"); // no longer what its marker says
+      const o = startServer(t);
+      expect(o.recovered).toBe("rolled_back");
+      o.storage.db.$client.close();
+      o.release();
+      expectOld(t);
+    });
+
+    it("killed after old_moved, then pnpm db:migrate: it finishes the restore instead of creating a new database", async () => {
+      const t = await prepared();
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "old_moved"]);
+      await c.exited;
+      const m = spawnTs(path.join(REPO_ROOT, "apps", "server", "src", "cli", "migrate.ts"), [], {
+        NODE_ENV: "development",
+        DATA_DIR: t.dataDir,
+        MASTER_KEY_PATH: t.keyPath,
+        BACKUP_DIR: t.backupDir,
+      });
+      expect((await m.exited).code, m.err()).toBe(0);
+      expect(m.out()).toContain("interrupted restore completed");
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("none");
+        expect(users(o)).toBe(4);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+    });
+
+    it("never a fresh empty database while an older copy sits next to the missing data folder", async () => {
+      const t = await prepared();
+      fs.renameSync(t.dataDir, `${t.dataDir}.before-restore-20261111T000000Z`);
+      expect(() => startServer(t)).toThrow(/earlier one is next to it/);
+      expect(fs.existsSync(path.join(t.dataDir, DB_FILE))).toBe(false);
+    });
+  },
+);
 
 describe("file errors fail the backup (#37 review P2)", () => {
   async function app(backup: BuildOptions["backup"] = {}) {
@@ -1240,7 +1396,7 @@ describe("restore checks every secret and upgrades an older schema (#37 review P
   });
 });
 
-describe("the CLI checks the key it actually uses (#37 review P2)", () => {
+describe("the CLI checks the key it actually uses (#37 review P2)", { timeout: 60_000 }, () => {
   it("--key inside --target is refused and the key stays where it is", async () => {
     const L = layout();
     createMasterKey(L.keyPath);

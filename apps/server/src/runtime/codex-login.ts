@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
@@ -94,8 +95,20 @@ const AUTH_FILE = ["codex-home", "auth.json"];
  * alone is not an identity — the system reuses it. Recorded when a login process starts; a left-over process is
  * killed only when all three still match (and the record belongs to that very login folder).
  */
-export { processIdentity, type ProcessIdentity } from "../storage/process-identity.js";
-import { processIdentity, type ProcessIdentity } from "../storage/process-identity.js";
+export type ProcessIdentity = { pgid: number; lstart: string; command: string };
+
+export function processIdentity(pid: number): ProcessIdentity | undefined {
+  const r = spawnSync("/bin/ps", ["-o", "pgid=,lstart=,command=", "-p", String(pid)], {
+    encoding: "utf8",
+    env: {},
+    timeout: 2000,
+  });
+  if (r.status !== 0) return undefined;
+  // "<pgid> <Www Mmm dd hh:mm:ss yyyy> <command…>"
+  const m = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+[\d:]{8}\s+\d{4})\s+(.+?)\s*$/.exec(r.stdout);
+  if (!m) return undefined;
+  return { pgid: Number(m[1]), lstart: m[2]!.replace(/\s+/g, " "), command: m[3]! };
+}
 
 type PidRecord = { login: string; pid: number } & ProcessIdentity;
 
