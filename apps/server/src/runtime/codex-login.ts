@@ -5,7 +5,14 @@ import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.j
 import { CHATGPT_ISSUER, credentialFromAuthJson, type ChatgptCredential } from "../connections/chatgpt.js";
 import { CA_BUNDLE, codexBinary, codexEnv, codexPaths, Rpc, RpcError, type CodexChild } from "./codex.js";
 import { codexConfigToml } from "./lockdown.js";
-import { readLoginFile, removeLoginTree, shredLoginFile, type LoginFileHooks } from "./login-files.js";
+import {
+  disposeLoginFolder,
+  emptyQuarantine,
+  quarantineDir,
+  readLoginFile,
+  shredLoginFile,
+  type LoginFileHooks,
+} from "./login-files.js";
 
 /**
  * Codex ChatGPT device-code login (#18, PRD D2 / FR-11.2), run by the server for the web screen. A short-lived
@@ -176,10 +183,11 @@ export function cleanupLeftoverLogins(
         }
       } else if (now !== undefined) outcome = "leftover_process_kept"; // that pid is someone else's now
     }
-    shredLoginFile(dir, AUTH_FILE, o.hooks);
-    removeLoginTree(dir);
+    // A writer may still be alive (its identity did not match): quarantine first, then remove (login-files.ts).
+    disposeLoginFolder(dir, quarantineDir(dataDir), o.hooks);
     o.report?.(outcome);
   }
+  emptyQuarantine(quarantineDir(dataDir), o.hooks);
   return dirs.length;
 }
 
@@ -189,7 +197,9 @@ export class CodexDeviceLogin {
   /** Starts a login in `dir` (created empty; removed when the login ends). Rejects with `LoginEnded("login_error")`. */
   async start(dir: string): Promise<DeviceLogin> {
     const now = this.opts.now ?? Date.now;
-    removeLoginTree(dir);
+    // Login folders sit at `runtimes/<logins | connection id>/login-<id>`: the quarantine is `runtimes/.quarantine`.
+    const quarantine = path.join(path.dirname(path.dirname(dir)), ".quarantine");
+    disposeLoginFolder(dir, quarantine);
     const p = codexPaths(dir);
     for (const d of [dir, ...Object.values(p)]) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
     // The folder holding login folders is the server's only, also when something else made it first.
@@ -198,8 +208,8 @@ export class CodexDeviceLogin {
       mode: 0o600,
     });
     const removeDir = () => {
-      shredLoginFile(dir, AUTH_FILE);
-      removeLoginTree(dir);
+      // The process is stopped by now, but nothing here relies on that: quarantine first (login-files.ts).
+      disposeLoginFolder(dir, quarantine);
     };
 
     let child: CodexChild;
@@ -316,7 +326,9 @@ export class CodexDeviceLogin {
         if (!done.success) throw new LoginEnded(rpc.exited ? "login_error" : endCode(done.error));
         // Never through a link the process may have put there, only a plain single-link file (login-files.ts).
         let text = readLoginFile(dir, AUTH_FILE);
-        shredLoginFile(dir, AUTH_FILE); // the tokens are in memory now; nothing stays in the folder
+        // The tokens are in memory now: the file is zeroed through its own descriptor at once. Its name is removed
+        // with the folder, after quarantine — the process is still alive here (account/read below).
+        shredLoginFile(dir, AUTH_FILE, undefined, { keepName: true });
         if (text === undefined) throw new LoginEnded("login_error");
         const credential = credentialFromAuthJson(text);
         text = "";

@@ -41,6 +41,8 @@ import {
 } from "../src/runtime/codex-login.js";
 import {
   checkPath,
+  disposeLoginFolder,
+  quarantineDir,
   readLoginFile,
   removeLoginTree,
   shredLoginFile,
@@ -48,7 +50,8 @@ import {
 } from "../src/runtime/login-files.js";
 import type { DeviceLoginProvider } from "../src/connections/login.js";
 import { spawn } from "node:child_process";
-import type { SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
+import { buildProfile, spawnIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
+import { spawnSync } from "node:child_process";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { CODEX_CHATGPT_EGRESS_HOSTS, CODEX_LOGIN_EGRESS_HOSTS } from "../src/isolation/egress.js";
 import { cx, newLog, replaySpawn, type DeviceLoginScript, type Recording } from "./helpers/codex-replay.js";
@@ -331,6 +334,8 @@ describe("Codex ChatGPT device-code login (#18, PRD D2 / FR-11.2)", () => {
     expect(loginDir.startsWith(path.join(t.dataDir, "runtimes", "logins"))).toBe(true);
     expect(s.write.every((w) => w.startsWith(loginDir))).toBe(true);
     expect(fs.existsSync(loginDir)).toBe(false);
+    // It went through the quarantine (moved there, then removed), never walked in place.
+    expect(fs.readdirSync(quarantineDir(t.dataDir))).toEqual([]);
     expect(t.loginLog.requests.map((r) => r.method)).toEqual([
       "initialize",
       "account/login/start",
@@ -1150,9 +1155,11 @@ describe("subscription login — review #91 round 2", () => {
     fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "IN-FOLDER");
     cleanupLeftoverLogins(data, {
       hooks: {
-        beforeOpen: () => {
-          fs.renameSync(path.join(dir, "codex-home"), path.join(dir, "moved"));
-          fs.symlinkSync(outside, path.join(dir, "codex-home"));
+        // The folder is in quarantine by now: swap where the file actually is.
+        beforeOpen: (file) => {
+          const home = path.dirname(file);
+          fs.renameSync(home, path.join(path.dirname(home), "moved"));
+          fs.symlinkSync(outside, home);
         },
       },
     });
@@ -1368,5 +1375,165 @@ describe("subscription login — review #91 round 2", () => {
     expect(other.statusCode).toBe(409);
     expect((await again).statusCode).toBe(201);
     expect(most).toBe(1);
+  });
+});
+
+describe("subscription login — review #91 round 3", () => {
+  const mk = () => {
+    const d = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-q-"));
+    closers.push(async () => fs.rmSync(d, { recursive: true, force: true }));
+    return d;
+  };
+
+  it("a folder swapped for an outside link mid-walk cannot reach outside: the walk runs in quarantine", () => {
+    const outside = mk();
+    fs.writeFileSync(path.join(outside, "victim"), "VICTIM");
+    const data = mk();
+    const dir = path.join(data, "runtimes", "logins", "login-0199cccc-1");
+    fs.mkdirSync(path.join(dir, "codex-home", "cache"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "codex-home", "cache", "victim"), "in-tree");
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), JSON.stringify(authJson()));
+    // Planted before: a link to the outside folder. After the rename: a writer swapping cache for that link at
+    // the path it knows. Either way the outside victim stays.
+    fs.symlinkSync(outside, path.join(dir, "codex-home", "planted"));
+    // And something an earlier disposal left half-way in the quarantine.
+    fs.mkdirSync(path.join(quarantineDir(data), "login-old-x", "codex-home"), { recursive: true });
+    fs.writeFileSync(path.join(quarantineDir(data), "login-old-x", "codex-home", "auth.json"), "OLD");
+    const seen: string[] = [];
+    cleanupLeftoverLogins(data, {
+      hooks: {
+        // Right after the walk found `cache` to be a real folder, a writer swaps it at the path it knows.
+        beforeList: (d) => {
+          seen.push(d);
+          if (path.basename(d) !== "cache") return;
+          try {
+            fs.rmSync(path.join(dir, "codex-home", "cache"), { recursive: true, force: true });
+            fs.symlinkSync(outside, path.join(dir, "codex-home", "cache"));
+          } catch {
+            // the folder is not there any more: it was moved into the quarantine first
+          }
+        },
+      },
+    });
+    expect(fs.readFileSync(path.join(outside, "victim"), "utf8")).toBe("VICTIM");
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((d) => path.basename(d) === "cache")).toBe(true); // the swap was tried mid-walk
+    expect(seen.every((d) => d.startsWith(quarantineDir(data) + path.sep))).toBe(true); // walked only there
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(fs.readdirSync(quarantineDir(data))).toEqual([]);
+    expect(fs.statSync(quarantineDir(data)).mode & 0o077).toBe(0);
+  });
+
+  it("the quarantine is outside every path the login process's sandbox may write", async () => {
+    const t = await start();
+    t.device.script = { userCode: T.code, outcome: "never" };
+    const l = await t.login();
+    const s = t.loginLog.spawns[0]!;
+    const profile = buildProfile({ ...s, command: "/usr/bin/true" });
+    const writable = [...profile.matchAll(/\(allow file-read\* file-write\* \(subpath "([^"]+)"\)\)/g)].map(
+      (m) => m[1]!,
+    );
+    expect(writable.length).toBeGreaterThan(0);
+    const q = fs.realpathSync(path.dirname(quarantineDir(t.dataDir))) + path.sep + ".quarantine";
+    for (const w of writable) expect(q === w || q.startsWith(w + path.sep), w).toBe(false);
+    // Nor the login folder itself (whose entry is renamed): only its codex-home and tmp.
+    const loginDir = fs.realpathSync(path.dirname(s.env.CODEX_HOME!));
+    expect(writable.sort()).toEqual([path.join(loginDir, "codex-home"), path.join(loginDir, "tmp")].sort());
+    await t.owner.del(`/api/connections/logins/${l.id}`);
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "a sandboxed writer still alive cannot create anything once its folder is in quarantine (real sandbox)",
+    async () => {
+      const data = mk();
+      const dir = path.join(data, "runtimes", "logins", "login-0199cccc-2");
+      const home = path.join(dir, "codex-home");
+      const tmpd = path.join(dir, "tmp");
+      fs.mkdirSync(home, { recursive: true });
+      fs.mkdirSync(tmpd, { recursive: true });
+      const code = `
+        const fs = require("fs");
+        process.chdir(${JSON.stringify(home)});
+        const tryIt = (f) => { try { f(); return "ok"; } catch (e) { return e.code || "ERR"; } };
+        const before = tryIt(() => fs.writeFileSync("before", "x"));
+        process.stdout.write("ready " + before + "\\n");
+        process.stdin.once("data", () => {
+          const file = tryIt(() => fs.writeFileSync("after", "x"));
+          const link = tryIt(() => fs.symlinkSync("/etc", "link-after"));
+          const dirr = tryIt(() => fs.mkdirSync("dir-after"));
+          process.stdout.write("after " + file + " " + link + " " + dirr + "\\n");
+          process.exit(0);
+        });`;
+      const child = spawnIsolated({
+        command: process.execPath,
+        args: ["-e", code],
+        cwd: home,
+        env: { PATH: "/usr/bin:/bin", HOME: home, TMPDIR: tmpd },
+        read: [dir],
+        write: [home, tmpd],
+        network: "none",
+        onStderr: () => {},
+      });
+      let out = "";
+      const lines: string[] = [];
+      const next = () =>
+        new Promise<string>((resolve) => {
+          const check = () => {
+            const i = out.indexOf("\n");
+            if (i >= 0) {
+              const line = out.slice(0, i);
+              out = out.slice(i + 1);
+              resolve(line);
+            } else setTimeout(check, 10);
+          };
+          check();
+        });
+      child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+      try {
+        lines.push(await next());
+        expect(lines[0]).toBe("ready ok"); // it could write there before
+        // Move the folder into the quarantine (what disposeLoginFolder does first) while the writer lives.
+        const q = quarantineDir(data);
+        fs.mkdirSync(q, { recursive: true, mode: 0o700 });
+        const moved = path.join(q, "moved");
+        fs.renameSync(dir, moved);
+        child.stdin.write("go\n");
+        lines.push(await next());
+        const [, file, link, mkd] = lines[1]!.split(" ");
+        for (const r of [file, link, mkd]) expect(r).not.toBe("ok");
+        expect(fs.readdirSync(path.join(moved, "codex-home")).sort()).toEqual(["before"]);
+        expect(disposeLoginFolder(moved, path.join(data, "other-q"))).toBe(true);
+      } finally {
+        child.kill("SIGKILL");
+      }
+    },
+    20_000,
+  );
+
+  it("a tokens file swapped for a FIFO before the open is refused at once (no blocked event loop)", () => {
+    const dir = mk();
+    fs.mkdirSync(path.join(dir, "codex-home"));
+    fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), "TOKENS");
+    const mod = path.join(import.meta.dirname, "..", "src", "runtime", "login-files.ts");
+    // In a child with a short timeout: a regression would block forever, not hang the suite.
+    const auth = path.join(dir, "codex-home", "auth.json");
+    const code = `
+      const { execFileSync } = await import("node:child_process");
+      const fs = (await import("node:fs")).default;
+      const m = await import(${JSON.stringify(mod)});
+      const hook = { beforeOpen: (f) => { fs.unlinkSync(f); execFileSync("/usr/bin/mkfifo", [f]); } };
+      const read = m.readLoginFile(${JSON.stringify(dir)}, ["codex-home", "auth.json"], hook);
+      fs.unlinkSync(${JSON.stringify(auth)});
+      fs.writeFileSync(${JSON.stringify(auth)}, "TOKENS");
+      const shred = m.shredLoginFile(${JSON.stringify(dir)}, ["codex-home", "auth.json"], hook);
+      process.stdout.write(JSON.stringify({ read: read ?? null, shred }));`;
+    const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], {
+      cwd: path.join(import.meta.dirname, ".."),
+      timeout: 8000,
+      encoding: "utf8",
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.signal).toBeNull();
+    expect(JSON.parse(r.stdout)).toEqual({ read: null, shred: "refused" });
   });
 });

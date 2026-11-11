@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,10 +12,16 @@ import path from "node:path";
  */
 
 const MAX_TOKENS_FILE = 1024 * 1024;
-const { O_RDONLY, O_RDWR, O_NOFOLLOW } = fs.constants;
+// O_NONBLOCK: a name swapped for a FIFO after the checks must not block the event loop on open (review #91 3차);
+// the descriptor's type is checked right after, before any read or write.
+const { O_RDONLY, O_RDWR, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
 
 /** Test hooks: run between the checks and the open (to swap a path component). */
-export type LoginFileHooks = { beforeOpen?: (file: string) => void };
+export type LoginFileHooks = {
+  beforeOpen?: (file: string) => void;
+  /** Called for each folder of a tree walk, right before it is listed (to swap something in mid-walk). */
+  beforeList?: (dir: string) => void;
+};
 
 type Id = { dev: number; ino: number };
 const same = (a: Id, b: Id) => a.dev === b.dev && a.ino === b.ino;
@@ -72,7 +79,7 @@ function withFile<T>(
   hooks.beforeOpen?.(file);
   let fd: number;
   try {
-    fd = fs.openSync(file, flags | O_NOFOLLOW);
+    fd = fs.openSync(file, flags | O_NOFOLLOW | O_NONBLOCK);
   } catch {
     return undefined; // a link at the last component (ELOOP), or gone
   }
@@ -115,6 +122,7 @@ export function shredLoginFile(
   root: string,
   rel: string[],
   hooks?: LoginFileHooks,
+  o: { keepName?: boolean } = {},
 ): "shredded" | "unlinked" | "missing" | "refused" {
   const file = path.join(root, ...rel);
   let st: fs.Stats;
@@ -126,8 +134,10 @@ export function shredLoginFile(
   const checked = checkPath(root, rel);
   // Not a plain file (a link, …): the entry itself is removed when the folders above it are real; its target, or
   // anything behind a linked folder, is never touched.
-  if (!checked) return removeEntryIfDirect(root, rel) ? "unlinked" : "refused";
-  if (st.nlink !== 1) return removeEntryIfDirect(root, rel) ? "unlinked" : "refused";
+  // `keepName`: the folder may still have a live writer, so nothing is removed by name here (a swapped folder above
+  // it would make that name point elsewhere) — the zeroed file goes with the folder, after quarantine.
+  if (!checked) return !o.keepName && removeEntryIfDirect(root, rel) ? "unlinked" : "refused";
+  if (st.nlink !== 1) return !o.keepName && removeEntryIfDirect(root, rel) ? "unlinked" : "refused";
   const done = withFile(
     root,
     rel,
@@ -140,6 +150,7 @@ export function shredLoginFile(
     hooks,
   );
   if (!done) return "refused";
+  if (o.keepName) return "shredded";
   return removeEntryIfDirect(root, rel) ? "shredded" : "refused";
 }
 
@@ -159,10 +170,11 @@ function removeEntryIfDirect(root: string, rel: string[]): boolean {
 }
 
 /**
- * Removes a login folder tree without following links: links and other non-folders are unlinked themselves,
- * real folders are emptied and removed. `root` itself must be a real folder (a link there is only unlinked).
+ * Removes a folder tree without following links: links and other non-folders are unlinked themselves, real
+ * folders are emptied and removed. Works by path (Node has no openat/fdopendir), so it is only safe on a tree
+ * nobody else can change meanwhile — a login folder goes through `disposeLoginFolder` (quarantine) first.
  */
-export function removeLoginTree(root: string): void {
+export function removeLoginTree(root: string, hooks: LoginFileHooks = {}): void {
   let st: fs.Stats;
   try {
     st = fs.lstatSync(root);
@@ -178,6 +190,7 @@ export function removeLoginTree(root: string): void {
     return;
   }
   let names: string[] = [];
+  hooks.beforeList?.(root);
   try {
     names = fs.readdirSync(root);
   } catch {
@@ -186,7 +199,7 @@ export function removeLoginTree(root: string): void {
   for (const n of names) {
     const p = path.join(root, n);
     try {
-      if (fs.lstatSync(p).isDirectory()) removeLoginTree(p);
+      if (fs.lstatSync(p).isDirectory()) removeLoginTree(p, hooks);
       else fs.unlinkSync(p);
     } catch {
       // gone meanwhile
@@ -196,5 +209,80 @@ export function removeLoginTree(root: string): void {
     fs.rmdirSync(root);
   } catch {
     // something appeared meanwhile: best effort, the next start tries again
+  }
+}
+
+/**
+ * The server's quarantine for login folders: `DATA_DIR/runtimes/.quarantine`, owner-only. No sandbox profile
+ * allows writing there — a login process may write only its own `codex-home` and `tmp`, session processes only
+ * theirs (checked against `buildProfile` in the tests) — and its name never matches a connection or login folder.
+ */
+export function quarantineDir(dataDir: string): string {
+  return path.join(dataDir, "runtimes", ".quarantine");
+}
+
+function ensureQuarantine(q: string): boolean {
+  try {
+    fs.mkdirSync(q, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(q);
+    if (!st.isDirectory()) return false;
+    fs.chmodSync(q, 0o700);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Disposes of a login folder that a login process could write to — maybe one still alive (review #91 3차):
+ *  1. the whole folder is renamed into the quarantine (one atomic `rename` on the same file system; the folder's
+ *     own entry is not writable by the process — its parent is not in its profile);
+ *  2. sandbox-exec's write rules are path rules (`(subpath …)` of `codex-home` and `tmp`): once the tree is under
+ *     the quarantine, a writer still alive can no longer create, link or rename anything in it, even through
+ *     descriptors it holds — the check is on the path the object has now;
+ *  3. only then is the tokens file zeroed and the tree walked and removed, never following a link (a link planted
+ *     before the rename is unlinked itself).
+ * If the rename fails the folder is left as it is (never walked in place) and the next start tries again.
+ */
+export function disposeLoginFolder(dir: string, quarantine: string, hooks?: LoginFileHooks): boolean {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(dir);
+  } catch {
+    return true; // nothing there
+  }
+  if (!st.isDirectory()) {
+    try {
+      fs.unlinkSync(dir); // a link where the folder should be: only the link goes
+    } catch {
+      // gone
+    }
+    return true;
+  }
+  if (!ensureQuarantine(quarantine)) return false;
+  const target = path.join(quarantine, `${path.basename(dir)}-${crypto.randomUUID()}`);
+  try {
+    fs.renameSync(dir, target);
+  } catch {
+    return false;
+  }
+  shredLoginFile(target, ["codex-home", "auth.json"], hooks);
+  removeLoginTree(target, hooks);
+  return true;
+}
+
+/** Startup: whatever an earlier disposal left in the quarantine (it died mid-walk) is removed. */
+export function emptyQuarantine(quarantine: string, hooks?: LoginFileHooks): void {
+  let names: string[];
+  try {
+    if (!fs.lstatSync(quarantine).isDirectory()) return;
+    names = fs.readdirSync(quarantine);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    const p = path.join(quarantine, n);
+    shredLoginFile(p, ["codex-home", "auth.json"], hooks);
+    removeLoginTree(p, hooks);
   }
 }

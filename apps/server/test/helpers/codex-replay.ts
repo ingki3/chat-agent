@@ -301,7 +301,10 @@ export function replaySpawn(
             completeLogin(false, "Login was not completed");
             break;
           case "account/read":
-            log.authJsonAtRead = fs.existsSync(path.join(codexHome, "auth.json"));
+            // Tokens still readable in the file (zeroed is fine: its name goes with the folder later).
+            log.authJsonAtRead =
+              fs.existsSync(path.join(codexHome, "auth.json")) &&
+              fs.readFileSync(path.join(codexHome, "auth.json")).some((b) => b !== 0);
             o.deviceLogin?.onAccountRead?.();
             setTimeout(
               () =>
