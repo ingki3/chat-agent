@@ -28,8 +28,20 @@ export class DataLockHeld extends Error {
 
 /** The data folder's real path (symlinks of it and of its parents resolved; a missing tail kept as written). */
 export function realDataDir(dataDir: string): string {
-  return canonicalPath(dataDir);
+  // readlink semantics, not realpath: a restore interrupted mid-swap leaves a symlinked DATA_DIR dangling (its
+  // target was moved aside), and realpath/exists would then name the link itself — another lock, another
+  // journal. Each hop: the parent made canonical, then the last component followed if it is a link.
+  let p = path.resolve(dataDir);
+  for (let hops = 0; ; hops++) {
+    if (hops > MAX_LINK_HOPS)
+      throw new Error(`DATA_DIR ${dataDir} is a symlink loop (or more than ${MAX_LINK_HOPS} links deep)`);
+    p = path.join(canonicalPath(path.dirname(p)), path.basename(p));
+    const st = fs.lstatSync(p, { throwIfNoEntry: false });
+    if (!st?.isSymbolicLink()) return p;
+    p = path.resolve(path.dirname(p), fs.readlinkSync(p));
+  }
 }
+const MAX_LINK_HOPS = 32;
 
 function lockBase(dataDir: string): string {
   const real = realDataDir(dataDir);

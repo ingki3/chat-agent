@@ -38,7 +38,7 @@ import { appliedMigrations, checkSchema, codeMigrations } from "../src/backup/sc
 import { BACKUP_CODES as LOGGABLE_BACKUP_CODES } from "../src/observability/policy.js";
 import { RuntimeFailure, RuntimeRegistry, type StartContext } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
-import { acquireDataLock, dataLockPath, DataLockHeld } from "../src/storage/data-lock.js";
+import { acquireDataLock, dataLockPath, DataLockHeld, realDataDir } from "../src/storage/data-lock.js";
 import { storagePaths } from "../src/storage/paths.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -1521,6 +1521,50 @@ describe(
       expect(n).toBe(4);
       expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
       expect(() => startServer(t)).toThrow(/restore_unresolved/);
+    });
+
+    // Round 7: DATA_DIR is a symlink, and the kill leaves it dangling (its target was moved aside).
+    for (const [at, expected] of [
+      ["rename1", "rolled_back"],
+      ["old_moved", "completed"],
+    ] as const)
+      it(`through alias → data, killed after ${at}: a restart via the alias ends like one via the real path`, async () => {
+        const t = await prepared();
+        const alias = path.join(t.root, "alias");
+        fs.symlinkSync(t.dataDir, alias);
+        const c = spawnTs(CHILD, ["restore", t.backup, alias, t.keyPath, at]);
+        expect((await c.exited).signal).toBe("SIGKILL");
+        // The link dangles now (data was moved aside) — it must still name the same lock and journal.
+        expect(fs.existsSync(alias)).toBe(false);
+        expect(dataLockPath(alias)).toBe(dataLockPath(t.dataDir));
+        expect(restoreJournalPath(alias)).toBe(restoreJournalPath(t.dataDir));
+        const o = startServer({ dataDir: alias, keyPath: t.keyPath });
+        try {
+          expect(o.recovered).toBe(expected);
+          expect(users(o)).toBe(expected === "rolled_back" ? 5 : 4);
+        } finally {
+          o.storage.db.$client.close();
+          o.release();
+        }
+        expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+        expect(fs.realpathSync(alias)).toBe(t.dataDir);
+        expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
+      });
+
+    it("a chain of links resolves to the real folder; a link loop is refused with a clear message", async () => {
+      const root = tmp();
+      const real = path.join(root, "data");
+      fs.symlinkSync(real, path.join(root, "a")); // dangling: data does not exist yet
+      fs.symlinkSync("a", path.join(root, "b")); // relative, to a link
+      fs.symlinkSync(path.join(root, "b"), path.join(root, "c"));
+      expect(realDataDir(path.join(root, "c"))).toBe(real);
+      expect(dataLockPath(path.join(root, "c"))).toBe(dataLockPath(real));
+      fs.symlinkSync("loop2", path.join(root, "loop1"));
+      fs.symlinkSync("loop1", path.join(root, "loop2"));
+      expect(() => realDataDir(path.join(root, "loop1"))).toThrow(/symlink loop/);
+      expect(() =>
+        startServer({ dataDir: path.join(root, "loop1"), keyPath: path.join(root, "k", "master.key") }),
+      ).toThrow(/symlink loop/);
     });
 
     it("an error after done is durable: the restore stands (the journal says done)", async () => {
