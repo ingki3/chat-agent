@@ -9,6 +9,7 @@ import { openSse } from "../src/sse.js";
 import {
   ADMIN_MATRIX,
   ADMIN_MATRIX_PREFIXES,
+  ADMIN_USER_MATRIX,
   APP_MATRIX,
   OWNER_ONLY,
   READ,
@@ -16,6 +17,7 @@ import {
   createFamily,
   fastifyRoutes,
   runAdminMatrix,
+  runAdminUserMatrix,
   runMatrix,
   sendAs,
   type MatrixRow,
@@ -326,6 +328,18 @@ describe("admin-only routes", () => {
       .sort();
     expect(declared).toEqual(ADMIN_MATRIX.map((r) => r.route).sort());
     expect(await runAdminMatrix(await createFamily(app), ADMIN_MATRIX)).toEqual([]);
+  });
+
+  it("every admin route of the admin screen has a row and succeeds for the admin (#35)", async () => {
+    const app = await newApp();
+    await app.ready();
+    const routes = app.resources.adminRoutes.filter((r) => !r.mirror).map((r) => `${r.method} ${r.url}`);
+    const covered = new Set([...ADMIN_MATRIX, ...ADMIN_USER_MATRIX].map((r) => r.route));
+    // No admin route anywhere without its row: the screen's whole API is run as every caller.
+    expect(routes.filter((r) => !covered.has(r)).sort()).toEqual([]);
+    expect([...covered].filter((r) => !routes.includes(r)).sort()).toEqual([]);
+    expect(ADMIN_MATRIX_PREFIXES.length).toBeGreaterThan(1);
+    expect(await runAdminUserMatrix(await createFamily(app), ADMIN_USER_MATRIX)).toEqual([]);
   });
 });
 

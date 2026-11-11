@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { and, count, eq, gt, lt, ne } from "drizzle-orm";
 import {
   DEFAULT_PERMISSIONS,
+  RuntimeDefaults,
   type AdminUser,
   type AuthUser,
   type Role,
@@ -27,16 +28,30 @@ export function toAuthUser(u: UserRow): AuthUser {
   return { id: u.id, email: u.email, name: u.name, role: u.role, mustChangePassword: u.mustChangePassword };
 }
 
+/** A stored defaults value, or null when there is none (or it no longer parses — then it is ignored). */
+export function storedDefaults(v: unknown): RuntimeDefaults | null {
+  if (v === null || v === undefined) return null;
+  const r = RuntimeDefaults.safeParse(v);
+  return r.success ? r.data : null;
+}
+
 export function toAdminUser(u: UserRow): AdminUser {
+  const initial = storedDefaults(u.initialDefaults);
   return {
     ...toAuthUser(u),
     active: u.active,
     permissions: u.permissions as UserPermissions,
-    defaultRuntime: (u.defaultRuntime as RuntimeId | null) ?? null,
+    defaultRuntime: initial?.runtime ?? null,
+    initialDefaults: initial,
     youth: u.youth,
     createdAt: u.createdAt,
   };
 }
+
+/** Outcome of `UserStore.update`. */
+export type UpdateUserResult =
+  | { ok: true; user: UserRow }
+  | { ok: false; code: "not_found" | "email_taken" | "last_admin" | "admin_email_change" };
 
 /** Readable temporary password, e.g. `k7mq-3xtp-w9hd` (no 0/o/1/l/i): ~62 bits, shown to the admin once. */
 export function temporaryPassword(): string {
@@ -94,7 +109,12 @@ export class UserStore {
       mustChangePassword: input.mustChangePassword ?? false,
       active: true,
       permissions: input.permissions ?? DEFAULT_PERMISSIONS,
-      defaultRuntime: input.defaultRuntime ?? null,
+      defaultRuntime: null,
+      // The create form's runtime is the admin's initial default (#35, FR-12.4).
+      initialDefaults: input.defaultRuntime
+        ? ({ runtime: input.defaultRuntime, models: {} } satisfies RuntimeDefaults)
+        : null,
+      defaults: null,
       youth: input.youth ?? false,
       createdAt: this.now(),
       updatedAt: this.now(),
@@ -181,6 +201,76 @@ export class UserStore {
     if (!u) return;
     const permissions = { ...(u.permissions as UserPermissions), skills };
     this.db.update(users).set({ permissions, updatedAt: this.now() }).where(eq(users.id, userId)).run();
+  }
+
+  /** Active admins other than `userId`. */
+  private otherActiveAdmins(userId: string): number {
+    return (
+      this.db
+        .select({ n: count() })
+        .from(users)
+        .where(and(eq(users.role, "admin"), eq(users.active, true), ne(users.id, userId)))
+        .get()?.n ?? 0
+    );
+  }
+
+  /**
+   * Name, email and role (#35, FR-15.1), checked and written in one transaction:
+   * - demoting an active admin is refused when no other active admin would be left (`last_admin`) — the admin
+   *   themselves included: two admins demoting each other at once cannot both succeed;
+   * - an admin's email changes only through the #36 procedure (FR-15.7: Access first), `admin_email_change`;
+   * - an email in use is `email_taken`.
+   * A new email ends the user's sessions (they sign in again with it — through Access the old session would no
+   * longer match); a new role re-checks their open streams.
+   */
+  update(
+    userId: string,
+    patch: { name?: string | undefined; email?: string | undefined; role?: Role | undefined },
+  ): UpdateUserResult {
+    const result = this.db.$client
+      .transaction((): UpdateUserResult & { emailChanged?: boolean; roleChanged?: boolean } => {
+        const target = this.byId(userId);
+        if (!target) return { ok: false, code: "not_found" };
+        const email = patch.email === undefined ? target.email : normalizeEmail(patch.email);
+        const role = patch.role ?? target.role;
+        const emailChanged = email !== target.email;
+        const roleChanged = role !== target.role;
+        if (emailChanged && (target.role === "admin" || role === "admin"))
+          return { ok: false, code: "admin_email_change" };
+        if (emailChanged) {
+          const other = this.byEmail(email);
+          if (other && other.id !== userId) return { ok: false, code: "email_taken" };
+        }
+        if (roleChanged && target.role === "admin" && target.active && this.otherActiveAdmins(userId) === 0)
+          return { ok: false, code: "last_admin" };
+        this.db
+          .update(users)
+          .set({ name: patch.name ?? target.name, email, role, updatedAt: this.now() })
+          .where(eq(users.id, userId))
+          .run();
+        if (emailChanged) this.db.delete(sessions).where(eq(sessions.userId, userId)).run();
+        return { ok: true, user: this.byId(userId)!, emailChanged, roleChanged };
+      })
+      .immediate();
+    if (result.ok && result.emailChanged)
+      this.events.emit("user-access-changed", { userId, reason: "session_ended" });
+    if (result.ok && result.roleChanged)
+      this.events.emit("user-access-changed", { userId, reason: "role_changed" });
+    return result.ok ? { ok: true, user: result.user } : result;
+  }
+
+  /** The admin's initial defaults for the user (FR-12.4); null = the service default. Checked by the caller. */
+  setInitialDefaults(userId: string, d: RuntimeDefaults | null): void {
+    this.db
+      .update(users)
+      .set({ initialDefaults: d, updatedAt: this.now() })
+      .where(eq(users.id, userId))
+      .run();
+  }
+
+  /** The user's own defaults (FR-12.1); null = none. Checked by the caller against the policy. */
+  setDefaults(userId: string, d: RuntimeDefaults | null): void {
+    this.db.update(users).set({ defaults: d, updatedAt: this.now() }).where(eq(users.id, userId)).run();
   }
 
   setRole(userId: string, role: Role): void {

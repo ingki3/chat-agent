@@ -9,12 +9,12 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 
 | 항목 | 내용 | 담당 이슈 | 검증 | 상태 |
 |---|---|---|---|---|
-| FR-1.1 | 가족 계정 생성, 첫 실행 관리자, 임시 비밀번호 | #9, #41, #35 | I, E | 🟨 |
+| FR-1.1 | 가족 계정 생성, 첫 실행 관리자, 임시 비밀번호 | #9, #41, #35 | I, E | 🟨 (#35 관리자 화면 사용자 탭: 추가(청소년 표시 포함)·임시 비밀번호·초기화·비활성화 — `e2e/admin.spec.ts`) |
 | FR-1.2 | 비밀번호 로그인, 세션 쿠키 속성 | #9 | U, I | ✅ |
 | FR-1.3 | 외부 두 겹 인증, 로컬 예외, Access·앱 이메일 일치 | #8, #9, #36 | I, M | 🟨 |
 | FR-1.4 | Access JWT 검증 | #9 | U, I | 🟨 |
 | FR-1.5 | 역할, 본인·공유만 열람, 관리자도 내용 불가 | #10, #29 | I | 🟨 |
-| FR-1.6 | 사용자별 런타임·모델·스킬 허용 | #17, #21, #35 | I, E | 🟨 (#17 런타임·모델·추론 강도·연결 허용 정책과 공통 검사 함수 — 보내기·고치기·다시 생성에 403. #21 스킬: `users.permissions.skills`·`PUT /api/admin/users/:id/skills`, 사용자별 도구 목록·호출 거부 — `skills.test.ts`. #30 청소년 계정은 `"all"`이어도 금융 스킬·도구 숨김 — `finance.test.ts`. 관리자 화면은 #35) |
+| FR-1.6 | 사용자별 런타임·모델·스킬 허용 | #17, #21, #35 | I, E | 🟨 (#17 런타임·모델·추론 강도·연결 허용 정책과 공통 검사 함수 — 보내기·고치기·다시 생성에 403. #21 스킬: `users.permissions.skills`·`PUT /api/admin/users/:id/skills`, 사용자별 도구 목록·호출 거부 — `skills.test.ts`. #30 청소년 계정은 `"all"`이어도 금융 스킬·도구 숨김 — `finance.test.ts`. #35 관리자 화면 권한 탭(런타임·모델·추론 강도·개인/공용 연결 허용·스킬·처음 기본값), 스킬 한 개씩 켜기 `PUT /api/admin/users/:id/skills/:name`(청소년 금융 숨김 유지), 서버 허용 목록 `PUT /api/admin/skills/:name`. 아들 Haiku 해제 → `/api/runtimes`·설정 선택기에서 빠지고 실행·기본값 저장 403 — `admin.test.ts`·`e2e/admin.spec.ts`. 칩(#19)은 같은 `/api/runtimes`를 읽는다) |
 | FR-2.1 | 대화 목록·새 대화·이름 변경·삭제·고정·검색 | #11, #13, #54 | I, E | 🟨 |
 | FR-2.2 | 첫 메시지 뒤 제목 자동 생성 | #11 | I | 🟨 |
 | FR-2.3 | 대화 간 맥락 분리 | #11, #42, #45 | I | 🟨 |
@@ -68,10 +68,10 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-9.3 | 내 사용량, 관리자 분류별 사용량 | #32 | I, E | ✅ (`GET /api/usage/me` 본인 것만 — 사이드바·설정, 관리자 `GET /api/admin/usage` 사용자·런타임·모델·연결·목적별, 다섯 분류 합계 동일, 아들·가족 403(Fastify가 실제 등록한 `/api/admin/**` 전체를 순회 — 관리자 선언이 빠진 경로, 명시적 HEAD 경로도 실패), 토큰 미보고는 "미제공" — `test/usage-screen.test.ts`, `test/permissions.test.ts`, `e2e/usage.spec.ts`) |
 | FR-9.4 | 프롬프트 캐싱 | #15, #16 | M | 🟨 (Claude: cache 읽기·쓰기 토큰 보고. Codex: `cachedInputTokens`·`cacheWriteInputTokens` 보고, 실제 적중은 녹화 대기) |
 | FR-9.5 | 누적·예상 비용, 일일 비용 알림 | #32, #34 | U | ✅ (#34 관리자 전용 `daily_cost` 발행 API. #32 이번 달 누적·오늘·예상(누적 + 일평균 × 남은 일수, 서울 기준), 선택 기준 초과 → 관리자 알림 하루 한 번(날짜를 먼저 기록), 같으면 아님($0.30 = 기준 $0.30 경계 포함), 오늘·예상에도 미제공 건수 표시, 막지 않음 — `test/usage-screen.test.ts`) |
-| FR-10.1 | 사용자 관리 | #41, #35 | I, E | ⬜ |
-| FR-10.2 | 런타임 연결 관리 | #17, #35 | I, E | 🟨 (#17 공용 연결·대신 등록·허용 정책 API. 관리자 화면은 #35) |
-| FR-10.3 | 스킬 허용 목록 | #21, #35 | I | 🟨 (#21 정의 허용 목록·서버 스킬 폴더 `pnpm skills:install`·`GET /api/admin/skills`, 화면 #35) |
-| FR-10.4 | 시스템 상태 | #35, #46 | I, M | 🟨 (#46 최근 오류 API 완료, 가동률 7일 측정 대기, 화면 #35) |
+| FR-10.1 | 사용자 관리 | #41, #35 | I, E | 🟨 (#35 사용자 탭 + 이름·이메일·역할 수정 `PATCH /api/admin/users/:id`, 마지막 관리자 강등·비활성화 거부 — `admin.test.ts`·`e2e/admin.spec.ts`. Access 동기화는 #36) |
+| FR-10.2 | 런타임 연결 관리 | #17, #35 | I, E | 🟨 (#17 공용 연결·대신 등록·허용 정책 API. #35 런타임 탭: 런타임별 모델·capability `GET /api/admin/runtimes`, 공용 연결 등록·테스트·삭제, 가족 대신 API 키 등록·그 사람으로 테스트(`POST /api/admin/users/:id/connections/:connectionId/test`)·삭제, 본인 구독 안내, 다른 관리자 계정에 구독 붙이기 403 `subscription_self_only` — `admin.test.ts`·권한 행렬) |
+| FR-10.3 | 스킬 허용 목록 | #21, #35 | I | 🟨 (#21 정의 허용 목록·서버 스킬 폴더 `pnpm skills:install`·`GET /api/admin/skills`. #35 스킬 탭: 서버 허용 스위치(settings `skills.disabled`, 끄면 누구에게도 제공 안 됨)·사용자별 켜기 — `admin.test.ts`) |
+| FR-10.4 | 시스템 상태 | #35, #46 | I, M | 🟨 (#46 최근 오류 API 완료, 가동률 7일 측정 대기. #35 시스템 상태 탭 `GET /api/admin/system`: 가동 시간, 런타임 연결 상태, 터널(`CLOUDFLARED_METRICS` 루프백 IP만, 없으면 미설정), 최근 오류·스킬 실패(코드만), 디스크 — `admin.test.ts`. 실제 cloudflared 메트릭 확인은 M) |
 | FR-10.5 | 백업·복원 | #37 | I, M | ⬜ |
 | FR-11.1 | 연결 = 런타임 × 인증 × 범위 | #17 | I | ✅ (`connections` 표, 내 연결·공용·관리자 대신 등록 API — `test/connections.test.ts`) |
 | FR-11.2 | 런타임별 연결 정보, 실행 방식 | #15, #16, #18, #39 | I, M | 🟨 (Claude 어댑터, Codex app-server 어댑터 — API 키. #18 Claude 장기 토큰 `CLAUDE_CODE_OAUTH_TOKEN`, Codex 디바이스 코드 로그인·`chatgptAuthTokens`·토큰 갱신 — `subscription.test.ts`, 0.165.0 실바이너리 시험. 실제 계정 확인(M)은 `docs/evidence/subscription/checklist.md`) |
@@ -82,10 +82,10 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-11.7 | 런타임 격리 | #15, #16, #42 | I | 🟨 (Claude·Codex: 잠금 설정 + 샌드박스, fork 없음 확인. Codex는 우리 모델 카탈로그로 code-mode host·하위 에이전트 제거) |
 | FR-11.8 | 연결 끊김·만료 처리 | #17, #18, #14, #56, #34 | I, E | 🟨 (#17 `runtime_auth` → 오류 종료·안내·`expired`·`connection_lost`/관리자 `system_warning`. #18 구독 만료 → `subscription_expired` 재로그인 안내 + `switchTo`, 갱신 거부 → `expired`. 대화 중 전환 UI #14, 예약 알림 #56) |
 | FR-11.9 | 연결 해제 후 기록 유지 | #17 | I | ✅ (기록 유지, 세션 무효화·같은 연결만 resume, 진행 중 실행 중지, 폴더 삭제) |
-| FR-12.1 | 기본 런타임·모델·추론 강도 설정 | #19 | I, E | ⬜ |
+| FR-12.1 | 기본 런타임·모델·추론 강도 설정 | #19, #35 | I, E | 🟨 (#35 저장·검사: `GET/PUT /api/settings/defaults`(허용 밖 403, 런의 검사 함수 그대로)·설정 화면 기본값 섹션 — `admin.test.ts`·`e2e/admin.spec.ts`. 새 대화에 적용·칩은 #19) |
 | FR-12.2 | 새 대화·새 예약에 자동 적용 | #19, #55 | I | ⬜ |
 | FR-12.3 | 런타임별 기본 모델 기억 | #19 | I | ⬜ |
-| FR-12.4 | 초기값 Claude Code · Opus 5.5, 관리자 초기값 | #19, #41 | I | ⬜ |
+| FR-12.4 | 초기값 Claude Code · Opus 5.5, 관리자 초기값 | #19, #41, #35 | I | 🟨 (#35 `users.initial_defaults`·`PUT /api/admin/users/:id/defaults`(대상 사용자 권한 안에서만, 400), 본인 값 → 관리자 초기값 → 서비스 기본값 순 — `admin.test.ts`. 새 대화 적용은 #19) |
 | FR-12.5 | 기본값 변경 시 기존 대화 불변 | #19 | I | ⬜ |
 | FR-12.6 | 기본값 불가 시 대체 순서 | #19 | U, E | ⬜ |
 | FR-12.7 | 내 런타임 연결 관리 | #17, #18 | E | ✅ (#17 설정 → 내 런타임 연결: 추가·테스트·해제, `e2e/connections.spec.ts`. #18 "ChatGPT로 로그인"(코드·링크·취소·다시 로그인), 관리자만 Claude 구독 항목) |
@@ -102,7 +102,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-14.5 | 가족 공유 묶음, 공유 알림 | #52, #34 | E | 🟨 (#34 `share_received` 발행 API — 내용 없이 누가·무엇만, 연결은 #29/#52) |
 | FR-14.6 | 공유한 사람·시각, 열람 확인 | #52 | E | ⬜ |
 | FR-14.7 | 가족 계정끼리만 | #29 | I | ⬜ |
-| FR-15.1 | 이름·이메일·역할 관리 | #35 | E | ⬜ |
+| FR-15.1 | 이름·이메일·역할 관리 | #35 | E | 🟨 (#35 사용자 탭 수정, 이메일 변경 시 세션 종료, 관리자 이메일은 #36 절차로만(409 `admin_email_change`) — `admin.test.ts`·`e2e/admin.spec.ts`. Access 자동 반영은 #36) |
 | FR-15.2 | Access 자동 반영, 미리보기, 실패 재시도, 현재 관리자 이메일 보호 | #36 | I, M | ⬜ |
 | FR-15.3 | 동기화 상태 비교 | #36 | I | ⬜ |
 | FR-15.4 | 토큰 없이 수동 모드 | #36 | E | ⬜ |

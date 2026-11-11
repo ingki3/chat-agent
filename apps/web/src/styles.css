@@ -862,3 +862,86 @@ h2 {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* ---- admin screen (#35) ---- */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 14px;
+}
+.tabs button {
+  border: 0;
+  background: none;
+  padding: 8px 12px;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+}
+.tabs button.on {
+  color: inherit;
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 12px;
+  font-size: 14px;
+}
+.edit-user {
+  flex-basis: 100%;
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.edit-user .actions,
+.users .actions {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.policy,
+.list-choice,
+.defaults-runtime {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 0 0 10px;
+  min-width: 0;
+}
+.list-choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 0;
+}
+.list-choice legend,
+.policy legend,
+.defaults-runtime legend {
+  font-weight: 600;
+  font-size: 14px;
+}
+.defaults-editor {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.skill-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+.user-permissions h3,
+.runtime-models h3 {
+  font-size: 15px;
+  margin: 18px 0 8px;
+}
+.admin td {
+  overflow-wrap: anywhere;
+}

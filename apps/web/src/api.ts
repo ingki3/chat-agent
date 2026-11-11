@@ -1,4 +1,12 @@
 import {
+  AdminRuntimesResponse,
+  AdminSkillsResponse,
+  DefaultsResponse,
+  RuntimeOption,
+  RuntimePolicy,
+  SystemStatus,
+  UserSkillsResponse,
+  type RuntimeDefaults,
   AdminUsageReport,
   MyUsage,
   PriceTable,
@@ -30,6 +38,8 @@ import {
   type Role,
   type RuntimeId,
 } from "@agentlee/shared";
+
+const enc = encodeURIComponent;
 
 export class ApiError extends Error {
   constructor(
@@ -128,16 +138,94 @@ export const auth = {
 export const admin = {
   users: async () =>
     AdminUser.array().parse(((await call("GET", "/api/admin/users")) as { users: unknown }).users),
-  create: async (name: string, email: string, role: Role) =>
-    CreateUserResponse.parse(await call("POST", "/api/admin/users", { name, email, role })),
+  create: async (name: string, email: string, role: Role, youth = false) =>
+    CreateUserResponse.parse(await call("POST", "/api/admin/users", { name, email, role, youth })),
   deactivate: async (id: string) => call("POST", `/api/admin/users/${encodeURIComponent(id)}/deactivate`, {}),
   resetPassword: async (id: string) =>
     ResetPasswordResponse.parse(
       await call("POST", `/api/admin/users/${encodeURIComponent(id)}/reset-password`, {}),
     ),
+  /** Name, email, role (#35). */
+  update: async (id: string, patch: { name?: string; email?: string; role?: Role }) =>
+    AdminUser.parse(((await call("PATCH", `/api/admin/users/${enc(id)}`, patch)) as { user: unknown }).user),
+  setYouth: async (id: string, youth: boolean) =>
+    AdminUser.parse(
+      ((await call("PUT", `/api/admin/users/${enc(id)}/youth`, { youth })) as { user: unknown }).user,
+    ),
+  /** The admin's initial defaults for a user (FR-12.4); null = the service default. */
+  setInitialDefaults: async (id: string, defaults: RuntimeDefaults | null) =>
+    AdminUser.parse(
+      ((await call("PUT", `/api/admin/users/${enc(id)}/defaults`, { defaults })) as { user: unknown }).user,
+    ),
+  policies: async (id: string) =>
+    RuntimePolicy.array().parse(
+      ((await call("GET", `/api/admin/users/${enc(id)}/runtime-policies`)) as { items: unknown }).items,
+    ),
+  setPolicies: async (id: string, items: RuntimePolicy[]) =>
+    RuntimePolicy.array().parse(
+      ((await call("PUT", `/api/admin/users/${enc(id)}/runtime-policies`, { items })) as { items: unknown })
+        .items,
+    ),
+  userSkills: async (id: string) =>
+    UserSkillsResponse.parse(await call("GET", `/api/admin/users/${enc(id)}/skills`)),
+  setUserSkill: async (id: string, name: string, enabled: boolean) =>
+    UserSkillsResponse.parse(
+      await call("PUT", `/api/admin/users/${enc(id)}/skills/${enc(name)}`, { enabled }),
+    ),
+  skills: async () => AdminSkillsResponse.parse(await call("GET", "/api/admin/skills")).skills,
+  setServerSkill: async (name: string, enabled: boolean) =>
+    AdminSkillsResponse.parse(await call("PUT", `/api/admin/skills/${enc(name)}`, { enabled })).skills,
+  runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
+  system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
+  /** Family shared connections (#17): API keys only. */
+  sharedConnections: async () =>
+    Connection.array().parse(((await call("GET", "/api/admin/connections")) as { items: unknown }).items),
+  addShared: async (body: { runtime: RuntimeId; secret: string; label?: string }) =>
+    Connection.parse(
+      (
+        (await call("POST", "/api/admin/connections", { ...body, authType: "api_key" })) as {
+          connection: unknown;
+        }
+      ).connection,
+    ),
+  testShared: async (id: string) =>
+    ConnectionTestResult.parse(
+      ((await call("POST", `/api/admin/connections/${enc(id)}/test`, {})) as { result: unknown }).result,
+    ),
+  removeShared: async (id: string) => call("DELETE", `/api/admin/connections/${enc(id)}`),
+  /** A member's personal connections: list, register on their behalf (API keys), test as them, remove. */
+  userConnections: async (id: string) =>
+    Connection.array().parse(
+      ((await call("GET", `/api/admin/users/${enc(id)}/connections`)) as { items: unknown }).items,
+    ),
+  addUserConnection: async (id: string, body: { runtime: RuntimeId; secret: string }) =>
+    Connection.parse(
+      (
+        (await call("POST", `/api/admin/users/${enc(id)}/connections`, { ...body, authType: "api_key" })) as {
+          connection: unknown;
+        }
+      ).connection,
+    ),
+  testUserConnection: async (id: string, connectionId: string) =>
+    ConnectionTestResult.parse(
+      (
+        (await call("POST", `/api/admin/users/${enc(id)}/connections/${enc(connectionId)}/test`, {})) as {
+          result: unknown;
+        }
+      ).result,
+    ),
+  removeUserConnection: async (id: string, connectionId: string) =>
+    call("DELETE", `/api/admin/users/${enc(id)}/connections/${enc(connectionId)}`),
 };
 
-const enc = encodeURIComponent;
+/** 설정 → 기본 런타임·모델 (FR-12.1, #35): what the picker may show and the saved defaults. */
+export const settings = {
+  runtimes: async () =>
+    RuntimeOption.array().parse(((await call("GET", "/api/runtimes")) as { items: unknown }).items),
+  defaults: async () => DefaultsResponse.parse(await call("GET", "/api/settings/defaults")),
+  setDefaults: async (defaults: RuntimeDefaults | null) =>
+    DefaultsResponse.parse(await call("PUT", "/api/settings/defaults", { defaults })),
+};
 
 export const conversations = {
   /** One page of the list; pass the returned cursor for the next one. */
@@ -274,7 +362,9 @@ export function newKey(): string {
 const MESSAGES: Record<string, string> = {
   email_taken: "이미 등록된 이메일이에요.",
   cannot_change_self: "본인 계정에는 할 수 없어요.",
-  last_admin: "마지막 관리자는 비활성화할 수 없어요.",
+  last_admin: "관리자가 한 명도 남지 않게 할 수는 없어요. 다른 관리자를 먼저 지정하세요.",
+  admin_email_change: "관리자 이메일은 Access 확인 절차(#36)로만 바꿔요.",
+  subscription_self_only: "구독은 그 계정 주인이 직접 연결해야 해요.",
   forbidden: "권한이 없어요.",
   invalid_credentials: "이메일 또는 비밀번호가 맞지 않아요.",
   too_many_attempts: "시도가 너무 많아요. 15분 뒤에 다시 시도하세요.",

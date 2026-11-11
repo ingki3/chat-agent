@@ -131,6 +131,15 @@ export class ConnectionStore {
       .all();
   }
 
+  /** Every user's personal connections that are still connected (admin system status: counts only). */
+  allPersonal(): ConnectionRow[] {
+    return this.db
+      .select()
+      .from(connections)
+      .where(and(eq(connections.scope, "personal"), isNull(connections.disconnectedAt)))
+      .all();
+  }
+
   /** Family shared connections that are still connected. */
   shared(): ConnectionRow[] {
     return this.db
