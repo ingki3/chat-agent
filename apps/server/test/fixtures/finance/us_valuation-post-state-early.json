@@ -5,7 +5,7 @@
   },
   "now": "2026-11-14T10:00:00+09:00",
   "synthetic": true,
-  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5 — last trade 15:59:58, marketState POST: the regular price is the close.",
+  "note": "SYNTHETIC — last trade 15:59:58 with marketState POST: still the 15:59:58 value, not the close (review #93 round 2).",
   "exchanges": [
     {
       "url": "https://query1.finance.yahoo.com/v10/finance/quoteSummary/AAPL?modules=summaryDetail,defaultKeyStatistics,price&crumb={crumb}",

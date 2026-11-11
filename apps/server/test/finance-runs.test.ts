@@ -16,6 +16,9 @@ import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
+import { eq } from "drizzle-orm";
+import { financeResults, messages } from "../src/db/schema.js";
+import { FinanceResultStore } from "../src/finance/results.js";
 import { RuntimeRegistry, type RuntimeAdapter } from "../src/runtime/adapter.js";
 import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
@@ -169,6 +172,51 @@ describe("finance output check under the run manager (#30)", () => {
       missing: ["source", "as_of"],
       disclaimer: FINANCE_DISCLAIMER,
     });
+  });
+
+  it("however long the conversation goes on: six exchanges without figures, then a price again (review #93 round 2)", async () => {
+    const { app, db, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    const first = await send(f.cookies.owner, c.id, "/finance");
+    expect(first.note).toBeDefined();
+    // The results are stored per answer and read back with one indexed query (finance/results.ts).
+    expect(
+      db
+        .select()
+        .from(financeResults)
+        .all()
+        .map((r) => r.messageId),
+    ).toEqual([first.run.assistantMessageId]);
+    for (let i = 0; i < 6; i++)
+      expect((await send(f.cookies.owner, c.id, "설명 더 해줘")).note).toBeUndefined();
+    const again = await send(f.cookies.owner, c.id, "349.8달러입니다.");
+    expect(again.note).toMatchObject({
+      sources: [
+        expect.objectContaining({ source: "Yahoo Finance" }),
+        expect.objectContaining({ source: "네이버 증권" }),
+      ],
+      missing: ["source", "as_of"],
+      disclaimer: FINANCE_DISCLAIMER,
+    });
+    // Another conversation of the same user is not about finance.
+    const other = app.conversations!.create(f.users.owner.id);
+    expect((await send(f.cookies.owner, other.id, "349.8달러입니다.")).note).toBeUndefined();
+  });
+
+  it("stored results count only while their answer is in the history before the new one", async () => {
+    const { app, db, f } = await start(fake());
+    const store = new FinanceResultStore(db);
+    const c = app.conversations!.create(f.users.owner.id);
+    const m = app.conversations!.append(c.id, { role: "assistant", parts: [{ type: "text", text: "x" }] });
+    const ev = { sources: [], values: [], identifiers: ["005930"] };
+    store.save({ messageId: m.id, conversationId: c.id, runId: "r" }, ev);
+    expect(store.context(c.id, m.seq + 1)).toEqual(ev);
+    // Not before itself, not in another conversation.
+    expect(store.context(c.id, m.seq)).toBeUndefined();
+    expect(store.context(app.conversations!.create(f.users.owner.id).id, 1e9)).toBeUndefined();
+    // Taken out of the history (edit / regenerate): gone from the check.
+    db.update(messages).set({ active: false }).where(eq(messages.id, m.id)).run();
+    expect(store.context(c.id, m.seq + 1)).toBeUndefined();
   });
 
   it("a partial finance answer recovered after a restart gets the note", async () => {

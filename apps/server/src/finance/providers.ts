@@ -115,7 +115,6 @@ function naverBasic(
     now: ctx.now,
     source: NAVER,
     delayMinutes: delay,
-    closed: b.marketStatus === "CLOSE",
   });
   const dir = obj(b.compareToPreviousPrice)?.name;
   const unit = want === "index" ? "pt" : "KRW";
@@ -494,13 +493,6 @@ function summaryOf(r: RawResponse | undefined): { ok: true; s: Obj } | { ok: fal
   return { ok: true, s };
 }
 /** The price module's stamp (regularMarketTime) — what price-based figures are as of. */
-/**
- * Yahoo's `marketState` outside the regular session (pre-market, after-hours, closed): the regular-market price it
- * gives is then that session's close.
- */
-const yahooClosed = (state: unknown) =>
-  typeof state === "string" && ["PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"].includes(state);
-
 function priceStamp(s: Obj, ctx: FinanceCtx): { stamp: Stamp; price: Obj } {
   const price = obj(s.price) ?? {};
   return {
@@ -510,7 +502,6 @@ function priceStamp(s: Obj, ctx: FinanceCtx): { stamp: Stamp; price: Obj } {
       t: sec(price.regularMarketTime),
       now: ctx.now,
       source: YAHOO,
-      closed: yahooClosed(price.marketState),
     }),
   };
 }
@@ -718,7 +709,6 @@ const usScreener: ToolImpl = {
           now: ctx.now,
           source: YAHOO,
           delayMinutes: delay ?? undefined,
-          closed: yahooClosed(o.marketState),
         });
         const m = rowMeta(s);
         return [

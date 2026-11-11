@@ -549,18 +549,34 @@ const STEP_HEADERS = new Set(["user-agent", "accept"]);
 /** A captured value (Yahoo's crumb) as it may go into a later URL. */
 const CAPTURE = /^[A-Za-z0-9._/~+-]{1,64}$/;
 export const RAW_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024, maxRedirects: 2 };
-/** Session values shorter than this are not scrubbed from bodies (they cannot be told apart from data). */
-export const MIN_HIDDEN = 4;
+/** At most this many session values are remembered per job (each one is scrubbed from every later body). */
+const MAX_SEEN = 200;
+
+const reEscape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** A literal as a pattern in which `%xx` escapes match in either case (`%2F` and `%2f`). */
+const encodedPattern = (t) =>
+  t
+    .split(/(%[0-9A-Fa-f]{2})/)
+    .map((part) =>
+      /^%[0-9A-Fa-f]{2}$/.test(part)
+        ? `%[${part[1].toUpperCase()}${part[1].toLowerCase()}][${part[2].toUpperCase()}${part[2].toLowerCase()}]`
+        : reEscape(part),
+    )
+    .join("");
 
 /**
- * A data body with every session value of this job (cookie values, captured crumbs) taken out — a server that
- * reflects them (an echoing API, a profile text) must not hand them to the model. JSON is rewritten in its
- * canonical form first, so an escaped spelling (`\u0041`, `\/`) cannot hide a value; the JSON-escaped and
- * URL-encoded spellings are scrubbed too.
- * @param {string} body @param {string[]} hidden
+ * A data body with every session value seen during this job (every cookie value sent or set — also ones a later
+ * response replaced — and every captured crumb) taken out: a server that reflects them (an echoing API, a profile
+ * text) must not hand them to the model. JSON is rewritten in its canonical form first, so an escaped spelling
+ * (`\u0041`, `\/`) cannot hide a value; the JSON-escaped and URL-encoded (`%2F` or `%2f`) spellings are scrubbed
+ * too. Whatever its length, a value is replaced only as a whole token (no letter or digit on either side), so a
+ * short crumb such as `xyz` does not cut into `xyzzy`. A value that is a whole JSON token of the data (a cookie
+ * `1` and a price `1`) breaks the JSON, and the server then refuses the answer (`finance_bad_response`): it fails
+ * closed rather than handing the value on. Base64 and partial spellings are out of scope (docs/decisions/isolation.md).
+ * @param {string} body @param {Iterable<string>} hidden
  */
 export function scrubBody(body, hidden) {
-  const values = hidden.filter((v) => typeof v === "string" && v.length >= MIN_HIDDEN);
+  const values = [...new Set(hidden)].filter((v) => typeof v === "string" && v.length > 0);
   if (!values.length) return body;
   let text = body;
   try {
@@ -568,9 +584,13 @@ export function scrubBody(body, hidden) {
   } catch {
     // not JSON: the raw text
   }
+  // Longest first: a value inside a longer one goes with it.
+  values.sort((a, b) => b.length - a.length);
   for (const v of values)
-    for (const form of new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)]))
-      text = text.split(form).join("[redacted]");
+    for (const form of new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)])) {
+      const re = new RegExp(`(?<![A-Za-z0-9])${encodedPattern(form)}(?![A-Za-z0-9])`, "g");
+      text = text.replace(re, "[redacted]");
+    }
   return text;
 }
 
@@ -590,6 +610,8 @@ export async function fetchRaw(job, o) {
     throw new WebError("web_bad_input");
   const jar = new Map();
   const vars = new Map();
+  /** Every session value of the job, kept after the jar replaced it. */
+  const seen = new Set();
   const responses = [];
   for (const step of steps) {
     if (!step || typeof step !== "object" || typeof step.url !== "string")
@@ -613,7 +635,9 @@ export async function fetchRaw(job, o) {
     const set = r.headers["set-cookie"];
     for (const c of Array.isArray(set) ? set : set ? [set] : []) {
       const m = /^([!#$%&'*+.^_`|~0-9A-Za-z-]{1,64})=([^;\s]{0,4096})/.exec(String(c));
-      if (m && jar.size < 20) jar.set(m[1], m[2]);
+      if (!m) continue;
+      if (seen.size < MAX_SEEN) seen.add(m[2]);
+      if (jar.has(m[1]) || jar.size < 20) jar.set(m[1], m[2]);
     }
     if (step.mode === "cookie") continue;
     const ct = String(r.headers["content-type"] ?? "").toLowerCase();
@@ -623,12 +647,13 @@ export async function fetchRaw(job, o) {
       if (r.status !== 200) throw new WebError("web_http_error");
       if (typeof step.capture !== "string" || !CAPTURE.test(v)) throw new WebError("web_bad_content");
       vars.set(step.capture, v);
+      seen.add(v);
       continue;
     }
     responses.push({
       status: r.status,
       contentType: ct.split(";")[0].trim(),
-      body: scrubBody(body, [...jar.values(), ...vars.values()]),
+      body: scrubBody(body, [...seen, ...jar.values(), ...vars.values()]),
     });
   }
   return { responses };

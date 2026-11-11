@@ -12,7 +12,8 @@ import { isFinanceTool } from "../instructions/assemble.js";
 
 /**
  * The common finance output check (#30, PRD FR-7.6·7.8). It runs on every answer that used a finance tool — for
- * every user, in follow-up answers while finance results are in the recent conversation, in scheduled runs (#33
+ * every user, in follow-up answers anywhere later in a conversation that has finance results (finance/results.ts),
+ * in scheduled runs (#33
  * starts them through the same run manager) and on partial answers recovered after a restart — whichever runtime
  * wrote it:
  * - collects the sources, as-of times and numbers the tools returned;
@@ -139,6 +140,11 @@ export function financeEvidence(parts: readonly MessagePart[]): FinanceEvidence 
  * Digits that are not figures: dates, times, years and quarters, filing forms (8-K, 10-Q, Form 4, 13F-HR, S-1),
  * index names with numbers (S&P 500, KOSPI 200), ordinals and list markers, and 6-digit codes with a leading zero.
  */
+/** A unit or magnitude after a number makes it an amount, never an identifier. */
+const UNIT_AFTER = String.raw`\s*(?:원|달러|불|엔|위안|유로|%|퍼센트|pt|포인트|주|배|bp|천|만|억|조|[KMBT](?![A-Za-z])|USD|KRW)`;
+const NUM_END = String.raw`(?!\d|[,.]\d|${UNIT_AFTER})`;
+const NUM_START = String.raw`(?<![\d,.$₩])`;
+
 const NOT_FIGURES: RegExp[] = [
   /\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}\s*일?/g,
   /\d{1,2}\s*월\s*\d{1,2}\s*일/g,
@@ -153,31 +159,61 @@ const NOT_FIGURES: RegExp[] = [
   /\b13[FDG](?:-[A-Z]{1,3})?(?:\/A)?\b/gi,
   /\bForm\s*\d+[A-Z]?\b/gi,
   /\b(?:items?|아이템)\s*\d+(?:\.\d+)?(?:\s*,\s*\d+(?:\.\d+)?)*/gi,
-  /S&P\s*500|Russell\s*2000|(?:KOSPI|코스피)\s*200|(?:NASDAQ|나스닥)[-\s]*100|(?:Dow|다우)\s*30/gi,
-  // Korean ETF brands carry numbers in their names (KODEX 200, TIGER 미국S&P500).
-  /\b(?:KODEX|TIGER|KBSTAR|RISE|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|KIWOOM)\s*[^\s,.]*\d+[^\s,.]*/g,
+  // Index names with numbers — the number must end there (나스닥 10000pt is a level, not "NASDAQ 100").
+  new RegExp(
+    String.raw`(?:S&P\s*500|Russell\s*2000|(?:KOSPI|코스피)\s*200|(?:NASDAQ|나스닥)[-\s]*100|(?:Dow|다우)\s*30)${NUM_END}`,
+    "gi",
+  ),
+  // Korean ETF brands carry numbers in their names (KODEX 200, TIGER 미국S&P500) — not an amount after them.
+  new RegExp(
+    String.raw`\b(?:KODEX|TIGER|KBSTAR|RISE|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|KIWOOM)\s*[A-Za-z가-힣&]*\d+[A-Za-z가-힣&]*${NUM_END}`,
+    "g",
+  ),
   /\d+\s*번째/g,
   /^\s*\d+[.)]\s/gm,
   /\[\d+\]/g,
-  /(?<![\d,.])0\d{5}(?![\d,.])/g,
+  new RegExp(String.raw`${NUM_START}0\d{5}${NUM_END}`, "g"),
 ];
 
-const FIGURE = /[+-]?\d[\d,]*(?:\.\d+)?/g;
+/** A number and an optional magnitude (20.6만, 1.2억, 3.5조, 1.2B, 500K). */
+const FIGURE = /[+-]?\d[\d,]*(?:\.\d+)?(?:\s*(천|만|억|조|[KMBT](?![A-Za-z])))?/g;
+const MAGNITUDE: Record<string, number> = {
+  천: 1e3,
+  만: 1e4,
+  억: 1e8,
+  조: 1e12,
+  K: 1e3,
+  M: 1e6,
+  B: 1e9,
+  T: 1e12,
+};
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** A figure: its value (magnitude applied) and how far a value may be from it and still be the same number. */
+export type Figure = { n: number; tolerance: number };
 
 /** The figures of a text, identifiers and non-figure digits taken out. */
-export function figuresOf(
-  text: string,
-  identifiers: readonly string[] = [],
-): { n: number; decimals: number }[] {
+export function figuresOf(text: string, identifiers: readonly string[] = []): Figure[] {
   let t = text;
-  // Longest first, so a code inside a longer identifier goes with it.
-  for (const id of [...identifiers].sort((a, b) => b.length - a.length)) if (id) t = t.split(id).join(" ");
+  // Longest first, so a code inside a longer identifier goes with it. Only as a whole token, and never when an
+  // amount is written: 373220원 (code 373220) or 4달러 (CIK 4) are prices, ₩373220 too.
+  for (const id of [...new Set(identifiers)].sort((a, b) => b.length - a.length)) {
+    if (!id.trim()) continue;
+    const re = new RegExp(
+      String.raw`(?<![A-Za-z0-9,.$₩])${escapeRe(id)}(?![A-Za-z0-9]|[,.]\d|${UNIT_AFTER})`,
+      "g",
+    );
+    t = t.replace(re, " ");
+  }
   for (const re of NOT_FIGURES) t = t.replace(re, " ");
   return [...t.matchAll(FIGURE)].flatMap((m) => {
-    const raw = m[0].replace(/,/g, "");
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return [];
-    return [{ n, decimals: raw.includes(".") ? raw.split(".")[1]!.length : 0 }];
+    const digits = /[+-]?\d[\d,]*(?:\.\d+)?/.exec(m[0])![0].replace(/,/g, "");
+    const base = Number(digits);
+    if (!Number.isFinite(base)) return [];
+    const mult = m[1] ? MAGNITUDE[m[1]]! : 1;
+    const decimals = digits.includes(".") ? digits.split(".")[1]!.length : 0;
+    // Half a unit of the last written digit: 20.6만 covers 205,500–206,500; 206,000 only 206,000 (±0.5).
+    return [{ n: base * mult, tolerance: 0.5 * 10 ** -decimals * mult }];
   });
 }
 
@@ -226,10 +262,9 @@ function namesTime(text: string, asOf: string, timeZone: string): boolean {
 const hasAsOf = (text: string, s: FinanceSource) =>
   namesDate(text, s.asOf) && (s.kind !== "intraday" || namesTime(text, s.asOf, s.timeZone));
 
-/** Same number as written (rounded to the figure's decimals; the sign may be said in words). */
-function sameNumber(figure: { n: number; decimals: number }, v: number): boolean {
-  const f = 10 ** figure.decimals;
-  return Math.abs(Math.round(Math.abs(v) * f) - Math.round(Math.abs(figure.n) * f)) === 0;
+/** Same number as written, within the precision it was written with (the sign may be said in words). */
+function sameNumber(figure: Figure, v: number): boolean {
+  return Math.abs(Math.abs(v) - Math.abs(figure.n)) <= figure.tolerance * (1 + 1e-9);
 }
 
 /** Paragraphs → sentences (a decimal point is not a sentence end). */
@@ -281,42 +316,38 @@ export function checkAnswer(text: string, ev: AnswerEvidence): FinanceMissing[] 
 export const answerText = (parts: readonly MessagePart[]): string =>
   parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
 
-/** How many messages back finance results keep a conversation "about finance" (follow-ups are checked). */
-export const FINANCE_CONTEXT_MESSAGES = 12;
-
-/**
- * Finance results and notes in the recent conversation (the last FINANCE_CONTEXT_MESSAGES messages), or undefined
- * when there are none: what a follow-up answer goes on from — also after an answer without figures in between.
- */
-export function financeContext(
-  history: readonly { role: string; parts: unknown }[],
-): AnswerEvidence | undefined {
+/** The evidence of several answers as one (a conversation's stored finance results, oldest first). */
+export function mergeEvidence(list: readonly AnswerEvidence[]): AnswerEvidence | undefined {
+  if (!list.length) return undefined;
   const sources = new Map<string, FinanceSource>();
-  const values: FinanceValue[] = [];
   const ids = new Set<string>();
-  let found = false;
-  for (const m of history.slice(-FINANCE_CONTEXT_MESSAGES)) {
-    if (m.role !== "assistant" || !Array.isArray(m.parts)) continue;
-    const parts = m.parts as MessagePart[];
-    const ev = financeEvidence(parts);
-    if (ev.used) found = true;
-    for (const s of ev.sources) sources.set(s.label, s);
-    values.push(...ev.values);
-    for (const i of ev.identifiers) ids.add(i);
-    for (const p of parts)
-      if (p.type === "finance_note") {
-        found = true;
-        for (const s of p.sources) sources.set(s.label, s);
-      }
+  const values: FinanceValue[] = [];
+  for (const e of list) {
+    for (const x of e.sources) sources.set(x.label, x);
+    for (const i of e.identifiers) ids.add(i);
+    values.push(...e.values);
   }
-  if (!found) return undefined;
   return { sources: [...sources.values()], values, identifiers: [...ids] };
+}
+
+/** At most this many numbers of one answer are kept for later answers' checks. */
+export const MAX_STORED_VALUES = 2000;
+
+/** What one answer's finance results leave for the rest of the conversation (stored, finance/results.ts). */
+export function storedEvidence(parts: readonly MessagePart[]): AnswerEvidence | undefined {
+  const ev = financeEvidence(parts);
+  if (!ev.used) return undefined;
+  return {
+    sources: ev.sources,
+    values: ev.values.slice(0, MAX_STORED_VALUES),
+    identifiers: ev.identifiers.slice(0, 200),
+  };
 }
 
 /**
  * The note for an answer, or undefined when none is due:
  * - the answer used a finance tool and wrote something; or
- * - finance results are in the recent conversation (`context`) and the answer states figures.
+ * - finance results are anywhere earlier in the conversation (`context`) and the answer states figures.
  */
 export function financeNote(
   parts: readonly MessagePart[],

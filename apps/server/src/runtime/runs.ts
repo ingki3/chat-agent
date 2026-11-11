@@ -31,7 +31,8 @@ import { classifyError, runFailureCategory, type ErrorLog } from "../observabili
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
 import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
-import { financeContext, financeNote, type AnswerEvidence } from "../finance/checker.js";
+import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/checker.js";
+import { FinanceResultStore } from "../finance/results.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -252,6 +253,8 @@ export class RunManager {
   private readonly now: () => number;
   private readonly flushMs: number;
   private readonly templates: Templates;
+  /** Finance results per conversation (#30): follow-ups anywhere later are checked against them. */
+  private readonly financeResults: FinanceResultStore;
 
   constructor(
     private readonly db: Db,
@@ -264,6 +267,7 @@ export class RunManager {
     this.flushMs = opts.flushMs ?? 500;
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
     this.templates = opts.instructions ?? defaultTemplates();
+    this.financeResults = new FinanceResultStore(db);
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -313,10 +317,7 @@ export class RunManager {
       const msg = this.conversations.messageById(r.assistantMessageId);
       if (msg) {
         const parts = msg.parts as MessagePart[];
-        const history = this.conversations
-          .messages(r.conversationId, { limit: 10_000 })
-          .filter((m) => m.id !== msg.id && m.seq < msg.seq);
-        this.attachNoteTo(r, parts, financeContext(history));
+        this.attachNoteTo(r, parts, this.financeResults.context(r.conversationId, msg.seq));
         this.conversations.updateMessage(msg.id, { parts });
       }
       this.finish(r, "failed", "server_restart");
@@ -619,6 +620,17 @@ export class RunManager {
    */
   private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
     if (parts.some((p) => p.type === "finance_note")) return;
+    // This answer's finance results stay for the rest of the conversation's checks.
+    try {
+      const ev = storedEvidence(parts);
+      if (ev)
+        this.financeResults.save(
+          { messageId: row.assistantMessageId, conversationId: row.conversationId, runId: row.id },
+          ev,
+        );
+    } catch {
+      // a storage failure never breaks the reply; the note below is still attached
+    }
     let note;
     try {
       note = financeNote(parts, context);
@@ -837,7 +849,8 @@ export class RunManager {
     const all = this.conversations.messages(run.conversationId, { limit: 10_000 });
     const before = all.filter((m) => m.id !== messageId);
     const lastUser = [...before].reverse().find((m) => m.role === "user");
-    live.financeCarry = financeContext(before);
+    const self = all.find((m) => m.id === messageId);
+    live.financeCarry = this.financeResults.context(run.conversationId, self?.seq ?? Number.MAX_SAFE_INTEGER);
     const inputText = (lastUser?.parts as MessagePart[] | undefined)
       ?.flatMap((p) => (p.type === "text" ? [p.text] : []))
       .join("\n");

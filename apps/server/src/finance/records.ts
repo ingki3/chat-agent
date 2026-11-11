@@ -43,23 +43,26 @@ export type Value = Stamp & { value: number | null; unit?: string };
 /** A value with its stamp (every value carries its own copy: "값마다"). */
 export function val(value: number | null | undefined, stamp: Stamp, unit?: string): Value {
   const v = typeof value === "number" && Number.isFinite(value) ? value : null;
-  return { value: v, ...(unit ? { unit } : {}), ...rowMeta(stamp), ...(stamp.stale ? { stale: true } : {}) };
+  return { value: v, ...(unit ? { unit } : {}), ...rowMeta(stamp) };
 }
 
-/** The stamp's metadata as it goes on a value or a row (the trading day and staleness are said once, above). */
-export function rowMeta(stamp: Stamp): Omit<Stamp, "tradingDay" | "stale"> {
+/** The stamp's metadata as it goes on a value or a row (the trading day is said once, above; `stale` when so). */
+export function rowMeta(stamp: Stamp): Omit<Stamp, "tradingDay"> {
   return {
     source: stamp.source,
     asOf: stamp.asOf,
     timeZone: stamp.timeZone,
     delayed: stamp.delayed,
     kind: stamp.kind,
+    ...(stamp.stale ? { stale: true } : {}),
   };
 }
 
 /**
  * The stamp of a value observed at `t` (ms) on a market, asked at `now`. Two questions, decided separately:
- * - **Is it the close?** Only when the source marks it so (`closed`) or `t` is at or after that session's close.
+ * - **Is it the close?** Only when `t` is at or after that session's close. A market state outside the regular
+ *   session (Naver `CLOSE`, Yahoo `POST`) does not confirm it: a delayed feed can still be showing a 15:40 trade
+ *   after 16:00 (review #93 round 2). None of our sources has an explicit "this is the close" field for a quote.
  *   Then it is 종가 (`close`) of the trading day `t` belongs to, stamped with the session's close time — on a
  *   weekend or holiday that is the latest trading day (a Saturday request shows Friday's close). A close is final,
  *   never delayed; `stale` when that day is before the latest trading day.
@@ -74,8 +77,6 @@ export function marketStamp(o: {
   now: number;
   source: string;
   delayMinutes?: number | undefined;
-  /** The source says this value is the session's close (Naver `marketStatus: CLOSE`, Yahoo `marketState: POST`). */
-  closed?: boolean | undefined;
   /** Time zone the asOf is written in (FX default: New York, whose 17:00 ends the FX day). */
   timeZone?: string;
 }): Stamp {
@@ -101,7 +102,7 @@ export function marketStamp(o: {
     return { source: o.source, asOf: null, timeZone, delayed: false, kind: "close" };
   const day = sessionDayOf(o.market, o.t);
   const closeAt = closeInstant(o.market, day);
-  if (o.closed === true || o.t >= closeAt) {
+  if (o.t >= closeAt) {
     const stale = day < latestTradingDay(o.market, o.now);
     return {
       source: o.source,

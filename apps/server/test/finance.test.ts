@@ -22,8 +22,8 @@ import {
 } from "../src/finance/calendar.js";
 import {
   checkAnswer,
-  FINANCE_CONTEXT_MESSAGES,
-  financeContext,
+  mergeEvidence,
+  storedEvidence,
   financeEvidence,
   figuresOf,
   financeNote,
@@ -40,7 +40,7 @@ import { sanitizeRecord } from "../src/logging.js";
 import { loadFixtures, replayWorker, storedUrl, type Exchange } from "./helpers/finance-replay.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 // The worker itself (plain JS), run in-process here.
-import { run as runWorker } from "../../../packages/mcp-tools/web/worker.mjs";
+import { run as runWorker, scrubBody } from "../../../packages/mcp-tools/web/worker.mjs";
 
 const closers: (() => Promise<unknown> | unknown)[] = [];
 afterEach(async () => {
@@ -154,13 +154,13 @@ describe("value stamps (#30)", () => {
   });
 
   it("a value from before the close is never relabelled as the close (review #93 round 1)", () => {
-    const at = (t: string, now: string, closed?: boolean) =>
+    const at = (t: string, now: string, delayMinutes?: number) =>
       marketStamp({
         market: "US",
         t: T(t),
         now: T(now),
         source: "Yahoo Finance",
-        ...(closed ? { closed } : {}),
+        ...(delayMinutes === undefined ? {} : { delayMinutes }),
       });
     // 15:40 seen at 16:01: still the 15:40 value, delayed and stale — the close is not known yet.
     expect(at("2026-11-13T15:40:00-05:00", "2026-11-13T16:01:00-05:00")).toMatchObject({
@@ -175,12 +175,15 @@ describe("value stamps (#30)", () => {
       asOf: "2026-11-13T15:59:00-05:00",
       stale: true,
     });
-    // The source says it is the close, or the time is at/after the close: 종가.
-    expect(at("2026-11-13T15:59:59-05:00", "2026-11-14T10:00:00+09:00", true)).toMatchObject({
-      kind: "close",
-      asOf: "2026-11-13T16:00:00-05:00",
-      delayed: false,
+    // A delayed feed (20 min) after the close: the 15:40 value stays 15:40 — only a time at/after the close is the
+    // close (a market state such as POST does not confirm it — us_screener-delayed-post).
+    expect(at("2026-11-13T15:40:00-05:00", "2026-11-13T16:01:00-05:00", 20)).toMatchObject({
+      kind: "intraday",
+      asOf: "2026-11-13T15:40:00-05:00",
+      delayed: true,
+      stale: true,
     });
+    expect(at("2026-11-13T15:59:59-05:00", "2026-11-14T10:00:00+09:00")).toMatchObject({ kind: "intraday" });
     expect(at("2026-11-13T16:00:00-05:00", "2026-11-13T16:01:00-05:00")).toMatchObject({ kind: "close" });
     expect(at("2026-11-13T16:00:00-05:00", "2026-11-13T16:01:00-05:00")).not.toHaveProperty("stale");
     // A real-time source (no delay) is still "delayed" once its value is behind the session's end.
@@ -312,6 +315,23 @@ describe("finance tools replay their recorded answers (#30)", () => {
     });
   });
 
+  it("a market state outside the session does not confirm the close (review #93 round 2)", async () => {
+    // Codex case: 15:40 quote, 20 minutes delayed, marketState POST, asked at 16:01.
+    const scr = await out("us_screener-delayed-post");
+    expect((scr.rows as Record<string, unknown>[])[0]).toMatchObject({
+      symbol: "AAON",
+      kind: "intraday",
+      asOf: "2026-11-13T15:40:00-05:00",
+      delayed: true,
+      stale: true,
+    });
+    expect((scr.rows as Record<string, unknown>[])[1]).toMatchObject({ kind: "close", delayed: false });
+    const val = await out("us_valuation-post-state-early");
+    expect(val.price).toMatchObject({ kind: "intraday", asOf: "2026-11-13T15:59:58-05:00", stale: true });
+    const kr = await out("kr_index-close-state-early");
+    expect(kr.price).toMatchObject({ kind: "intraday", asOf: "2026-11-12T15:29:59+09:00", delayed: true });
+  });
+
   it("while the market is open: 장중 with the source's time", async () => {
     const kr = await out("kr_quote-intraday");
     expect(kr.price).toMatchObject({ kind: "intraday", asOf: "2026-11-12T10:14:55+09:00", delayed: false });
@@ -361,6 +381,20 @@ describe("finance tools replay their recorded answers (#30)", () => {
     expect(allowed("https://evil.m.stock.naver.com/x", ["m.stock.naver.com"])).toBe(false);
     expect(allowed("https://xm.stock.naver.com/x", ["m.stock.naver.com"])).toBe(false);
     expect(allowed("https://m.stock.naver.com/api/stock/005930/basic", ["m.stock.naver.com"])).toBe(true);
+  });
+
+  it("session values are scrubbed as whole tokens, however short — never inside other words or numbers", () => {
+    const body = '{"crumb":"xyz","inWord":"xyzzy abcxyz","sentence":"token xyz.","url":"a?c=xyz&d=1","n":12}';
+    expect(scrubBody(body, ["xyz"])).toBe(
+      '{"crumb":"[redacted]","inWord":"xyzzy abcxyz","sentence":"token [redacted].","url":"a?c=[redacted]&d=1","n":12}',
+    );
+    // Encoded spellings, upper and lower case.
+    expect(scrubBody("a=x%2Fy b=x%2fy c=x/y d=Zx/y", ["x/y"])).toBe(
+      "a=[redacted] b=[redacted] c=[redacted] d=Zx/y",
+    );
+    // A value that is also a whole JSON token of the data breaks the JSON: the server refuses it (fails closed).
+    expect(() => JSON.parse(scrubBody('{"price":1}', ["1"]))).toThrow();
+    expect(scrubBody('{"price":12}', ["1"])).toBe('{"price":12}');
   });
 
   it("every configured secret is scrubbed from a result, however short (SEC_USER_AGENT may be 5 characters)", async () => {
@@ -482,17 +516,21 @@ describe("finance egress (#30)", () => {
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       seen.push(`${req.url} cookie=${req.headers.cookie ?? ""}`);
       if (req.url === "/cookie")
-        return res.writeHead(404, { "set-cookie": "A3=s3ss10n; Path=/" }).end("nope");
+        return res.writeHead(404, { "set-cookie": "A3=oldSession987; Path=/" }).end("nope");
       if (req.url === "/crumb")
-        return req.headers.cookie === "A3=s3ss10n"
-          ? res.writeHead(200, { "content-type": "text/plain" }).end("cRuMb.42/x")
+        // The session rotates: a new cookie replaces the one just sent.
+        return req.headers.cookie === "A3=oldSession987"
+          ? res
+              .writeHead(200, { "content-type": "text/plain", "set-cookie": "A3=newSession654; Path=/" })
+              .end("cRuMb.42/x")
           : res.writeHead(401).end();
       if (req.url === "/data?crumb=cRuMb.42%2Fx")
-        // A server that reflects the session: plain, JSON-escaped, unicode-escaped and URL-encoded.
+        // A server that reflects the session: the replaced cookie and the current one, plain, JSON-escaped,
+        // unicode-escaped and URL-encoded in either case — next to data that only looks alike.
         return res
           .writeHead(200, { "content-type": "application/json; charset=utf-8" })
           .end(
-            '{"ok":1,"a":"cRuMb.42/x","b":"cRuMb.42\\/x","c":"\\u0073\\u0033ss10n","d":"cRuMb.42%2Fx","price":206000}',
+            '{"ok":1,"old":"bio: oldSession987.","new":"\\u006eewSession654","a":"cRuMb.42/x","b":"cRuMb.42\\/x","d":"cRuMb.42%2Fx","e":"cRuMb.42%2fx","word":"XcRuMb.42/xY","price":206000}',
           );
       if (req.url === "/downgrade")
         return res.writeHead(302, { location: "http://public.test:443/ua" }).end();
@@ -531,15 +569,15 @@ describe("finance egress (#30)", () => {
         {
           status: 200,
           contentType: "application/json",
-          body: '{"ok":1,"a":"[redacted]","b":"[redacted]","c":"[redacted]","d":"[redacted]","price":206000}',
+          body: '{"ok":1,"old":"bio: [redacted].","new":"[redacted]","a":"[redacted]","b":"[redacted]","d":"[redacted]","e":"[redacted]","word":"XcRuMb.42/xY","price":206000}',
         },
       ],
     });
-    expect(JSON.stringify(r)).not.toMatch(/s3ss10n|cRuMb/);
+    expect(JSON.stringify(r)).not.toMatch(/Session\d|"cRuMb/);
     expect(seen).toEqual([
       "/cookie cookie=",
-      "/crumb cookie=A3=s3ss10n",
-      "/data?crumb=cRuMb.42%2Fx cookie=A3=s3ss10n",
+      "/crumb cookie=A3=oldSession987",
+      "/data?crumb=cRuMb.42%2Fx cookie=A3=newSession654",
     ]);
     // No plain http, neither asked for nor by a redirect to `http://allowed-host:443/` (the proxy would let that
     // port through): refused before anything is sent.
@@ -806,15 +844,10 @@ describe("finance output check (#30)", () => {
     expect(financeNote(parts("", [usOut]))).toBeUndefined();
   });
 
-  it("follow-ups: finance results anywhere in the recent conversation keep it checked", () => {
-    const history = [
-      { role: "user", parts: [{ type: "text", text: "AAPL, 005930 현재가" }] },
-      { role: "assistant", parts: parts("AAPL 349.8달러, 삼성전자 206,000원", [usOut, krOut]) },
-      { role: "user", parts: [{ type: "text", text: "종가라는 뜻이야?" }] },
-      { role: "assistant", parts: [{ type: "text", text: "네, 정규장 마감 가격이에요." }] },
-      { role: "user", parts: [{ type: "text", text: "두 주 가격은?" }] },
-    ];
-    const ctx = financeContext(history)!;
+  it("follow-ups: the stored evidence of earlier answers, merged, keeps later answers checked", () => {
+    const first = storedEvidence(parts("AAPL 349.8달러, 삼성전자 206,000원", [usOut, krOut]))!;
+    expect(storedEvidence([{ type: "text", text: "네, 정규장 마감 가격이에요." }])).toBeUndefined();
+    const ctx = mergeEvidence([first])!;
     expect(ctx.sources).toEqual([src(yahoo), src(naver)]);
     expect(financeNote([{ type: "text", text: "349.8달러와 206,000원이에요." }], ctx)).toMatchObject({
       sources: [src(yahoo), src(naver)],
@@ -827,12 +860,52 @@ describe("finance output check (#30)", () => {
       )!.missing,
     ).toEqual([]);
     expect(financeNote([{ type: "text", text: "천만에요!" }], ctx)).toBeUndefined();
-    // Out of the window: no longer a finance conversation.
-    const old = [
-      ...history.slice(0, 2),
-      ...Array.from({ length: FINANCE_CONTEXT_MESSAGES }, () => history[3]!),
-    ];
-    expect(financeContext(old)).toBeUndefined();
-    expect(financeContext(history.slice(2))).toBeUndefined();
+    expect(mergeEvidence([])).toBeUndefined();
+  });
+
+  it("identifiers never take a price with them (review #93 round 2)", () => {
+    // Input code 373220 and a price 373,220원 written without a comma.
+    const lg = financeEvidence([
+      { type: "tool_call", id: "a", name: "mcp__agentlee__kr_quote", input: { code: "373220" } },
+      { type: "tool_result", callId: "a", output: krOut },
+      { type: "text", text: "" },
+    ]);
+    expect(checkAnswer("LG에너지솔루션은 373220원이에요.", lg)).toEqual(["source", "as_of"]);
+    expect(checkAnswer("373220 종목은 ₩373220이에요.", lg)).toEqual(["source", "as_of"]);
+    // CIK "4" and a price of 4 dollars.
+    const cik = financeEvidence([
+      { type: "tool_call", id: "a", name: "mcp__agentlee__sec_8k", input: { cik: "4" } },
+      { type: "tool_result", callId: "a", output: usOut },
+      { type: "text", text: "" },
+    ]);
+    expect(checkAnswer("주가는 4달러예요.", cik)).toEqual(["source", "as_of"]);
+    expect(checkAnswer("CIK 4의 공시는 없어요.", cik)).toEqual([]);
+    // An index level after the index name stays a number.
+    expect(figuresOf("나스닥 10000pt").map((f) => f.n)).toEqual([10000]);
+    expect(figuresOf("S&P 500 지수 6000").map((f) => f.n)).toEqual([6000]);
+    expect(figuresOf("KODEX 200 84,540원").map((f) => f.n)).toEqual([84540]);
+    expect(figuresOf("S&P 500, 나스닥 100 모두 올랐어요").map((f) => f.n)).toEqual([]);
+  });
+
+  it("magnitude units are normalised before values are matched (review #93 round 2)", () => {
+    const yahooOut = finalize("us_quote", { symbol: "AAPL", price: { value: 349.8, ...yahoo } });
+    const naverLive = finalize("kr_quote", { code: "005930", price: { value: 206000, ...live } });
+    const both = [yahooOut, naverLive];
+    // Codex example: Naver's intraday 206,000 written as 20.6만원 and cited to Yahoo.
+    expect(check("삼성전자 20.6만원 (Yahoo Finance 2026-11-13).", both)).toEqual(["source", "as_of"]);
+    expect(check("삼성전자 20.6만원 (네이버 증권 11월 12일 10:14 KST 장중).", both)).toEqual([]);
+    // 20.7만 (206,500–207,500) is not Naver's 206,000: any cited source with its date will do.
+    expect(check("20.7만원 (Yahoo Finance 2026-11-13).", both)).toEqual([]);
+    expect(figuresOf("20.6만원 1.2억 3조 1.5B 500K").map((f) => f.n)).toEqual([
+      206000, 1.2e8, 3e12, 1.5e9, 5e5,
+    ]);
+    // Within the written precision only: 20.6만 is 205,500–206,500 and 21만 205,000–215,000; 22만 is not 206,000.
+    const near = financeEvidence(parts("", [naverLive]));
+    expect(
+      checkAnswer("22만원 (Yahoo Finance 2026-11-13)", { ...near, sources: [...near.sources, src(yahoo)] }),
+    ).toEqual([]);
+    expect(
+      checkAnswer("21만원 (Yahoo Finance 2026-11-13)", { ...near, sources: [...near.sources, src(yahoo)] }),
+    ).toEqual(["source", "as_of"]);
   });
 });
