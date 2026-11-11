@@ -204,9 +204,27 @@ export function redactOutput(stdout: string, secrets: readonly string[]): SkillR
   }
   if (!secrets.length) return { ok: true, output: parsed };
   const output = redactValue(parsed, secrets);
-  const text = JSON.stringify(output);
-  if (secrets.some((v) => text.includes(v))) return { ok: false, code: "skill_bad_output" };
+  // Last check on the decoded strings themselves (not their JSON form, which escapes quotes): a replacement can
+  // recreate a secret from its surroundings (e.g. secret `redacted]"` next to the `[redacted]` marker).
+  if (containsSecret(output, secrets)) return { ok: false, code: "skill_bad_output" };
   return { ok: true, output };
+}
+
+/** True if any string value or object key, at any depth, still contains a secret. */
+function containsSecret(v: unknown, secrets: readonly string[]): boolean {
+  const stack: unknown[] = [v];
+  while (stack.length) {
+    const x = stack.pop();
+    if (typeof x === "string") {
+      if (secrets.some((s) => x.includes(s))) return true;
+    } else if (Array.isArray(x)) stack.push(...x);
+    else if (x && typeof x === "object")
+      for (const [k, val] of Object.entries(x)) {
+        if (secrets.some((s) => k.includes(s))) return true;
+        stack.push(val);
+      }
+  }
+  return false;
 }
 
 /** At most this many skill processes at once — in total and per run. Beyond that a call is refused at once. */

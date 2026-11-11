@@ -924,6 +924,22 @@ describe("secret redaction of skill results (review #85)", () => {
     expect(JSON.stringify(r)).not.toContain(JSON.stringify(q).slice(1, -1));
     expect(r).toEqual({ ok: true, output: { v: "[redacted]", "[redacted]": 1 } });
   });
+  it("a replacement that recreates the secret from its surroundings is refused (round 2)", () => {
+    const secret = 'redacted]"';
+    expect(out(JSON.stringify({ v: secret + '"' }), [secret])).toEqual({
+      ok: false,
+      code: "skill_bad_output",
+    });
+    expect(out(JSON.stringify({ [secret + '"']: 1 }), [secret])).toEqual({
+      ok: false,
+      code: "skill_bad_output",
+    });
+    expect(out(JSON.stringify({ a: [[{ b: secret + '"' }]] }), [secret])).toEqual({
+      ok: false,
+      code: "skill_bad_output",
+    });
+  });
+
   it("non-JSON output is refused without content; no secrets means untouched output", () => {
     expect(out(`key is ${S}`)).toEqual({ ok: false, code: "skill_bad_output" });
     expect(out(`{"k":"${S}"}`, [])).toEqual({ ok: true, output: { k: S } });
