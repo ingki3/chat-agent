@@ -138,7 +138,7 @@ describe("database", () => {
 describe("storage layout", () => {
   it("creates owner-only directories", () => {
     const p = ensureLayout(path.join(tmp(), "data"));
-    for (const d of [p.root, p.files, p.artifacts, p.runtimes, p.sources, p.backups]) {
+    for (const d of [p.root, p.files, p.artifacts, p.runtimes, p.sources]) {
       expect(fs.statSync(d).mode & 0o777).toBe(0o700);
     }
   });

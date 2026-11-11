@@ -14,6 +14,9 @@ import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
 import { registerAccountSettings, registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
 import { DefaultsService } from "./users/defaults.js";
 import { registerAdminSystemRoutes, type SystemRouteOptions } from "./admin/routes.js";
+import { BackupService, type BackupServiceOptions } from "./backup/backup.js";
+import { FileWriteLock } from "./backup/lock.js";
+import { registerBackupRoutes } from "./backup/routes.js";
 import { SkillSwitches } from "./mcp/switches.js";
 import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
@@ -109,6 +112,13 @@ declare module "fastify" {
     usageStore: UsageStore | undefined;
     /** Usage screens and the daily cost check (#32); undefined without a database. */
     usage: UsageService | undefined;
+    /**
+     * The data folder's file-write lock (#37): every writer of files under `files/`, `artifacts/` or `sources/`
+     * writes inside `fileWrites.write()`, so a backup's snapshot of rows and files is from one moment.
+     */
+    fileWrites: FileWriteLock;
+    /** Daily backups (#37); undefined without BACKUP_DIR or with an in-memory database. */
+    backups: BackupService | undefined;
   }
 }
 
@@ -171,6 +181,11 @@ export type BuildOptions = {
   hmrPort?: number;
   /** System status overrides (tests: the tunnel probe). */
   system?: Pick<SystemRouteOptions, "tunnel">;
+  /**
+   * Backups (#37): clock and test hooks. The daily schedule runs outside tests; `schedule: true` turns it on in a
+   * test.
+   */
+  backup?: BackupServiceOptions & { schedule?: boolean };
 };
 
 /** Tests without a master key: one throwaway key per database, so rebuilding the app on it still decrypts. */
@@ -214,6 +229,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   });
 
   const events = opts.events ?? new AppEvents();
+  app.decorate("fileWrites", new FileWriteLock());
   const users = opts.db ? new UserStore(opts.db, events) : undefined;
   app.decorate("appEvents", events);
   app.decorate("users", users);
@@ -391,6 +407,32 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         ...opts.system,
       },
     );
+    // Backups (#37): a file database and a backup folder (config.ts keeps it outside DATA_DIR and the repository).
+    const backups =
+      config.backupDir && !opts.db!.$client.memory
+        ? new BackupService(
+            {
+              sqlite: opts.db!.$client,
+              dataDir: config.dataDir,
+              backupDir: config.backupDir,
+              masterKey,
+              lock: app.fileWrites,
+              log: app.log,
+              // Every failure, and an empty backup folder, reach the admins (#34 inbox and push).
+              notifyAdmins: (message) => {
+                for (const admin of connectionStore.admins())
+                  notifications.publish(admin, { kind: "system_warning", message, url: "/admin?tab=backup" });
+              },
+            },
+            opts.backup,
+          )
+        : undefined;
+    app.decorate("backups", backups);
+    registerBackupRoutes(app, backups, config.dataDir);
+    if (backups && (config.env !== "test" || opts.backup?.schedule))
+      app.addHook("onReady", async () => backups.start());
+    // Before the database closes (index.ts closes it in onClose): a backup in progress finishes first.
+    if (backups) app.addHook("preClose", async () => backups.stop());
     registerSourceRoutes(app, app.conversations!, sources);
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
     let renderer = opts.renderer;
@@ -450,6 +492,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("artifacts", undefined);
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);
+    app.decorate("backups", undefined);
   }
 
   app.get(

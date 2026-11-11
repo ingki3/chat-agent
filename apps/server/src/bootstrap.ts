@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createMasterKey, loadMasterKey } from "./crypto/secrets.js";
 import { openDb, runMigrations, type Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
+import { openStorageForWrite, type RecoveryOutcome } from "./backup/restore.js";
 import { ensureLayout, type StoragePaths } from "./storage/paths.js";
 import type { Config } from "./config.js";
 
@@ -26,4 +27,27 @@ export function initStorage(config: Config): Storage {
   const db = openDb(paths.db);
   runMigrations(db);
   return { paths, db, masterKey, settings: new SettingsStore(db, masterKey) };
+}
+
+/**
+ * The server's start (index.ts) through `openStorageForWrite` (#37): the data folder's kernel lock first (a second
+ * server, or one started during a restore, refuses here, before the database is opened), then recovery of a restore
+ * interrupted mid-swap, then storage — on the folder's real path. The lock is held until `release()` (shutdown).
+ */
+export function openServerStorage(config: Config): {
+  storage: Storage;
+  recovered: RecoveryOutcome;
+  release: () => void;
+} {
+  const claim = openStorageForWrite(config.dataDir, "server");
+  try {
+    return {
+      storage: initStorage({ ...config, dataDir: claim.dataDir }),
+      recovered: claim.recovered,
+      release: claim.lock.release,
+    };
+  } catch (e) {
+    claim.lock.release();
+    throw e;
+  }
 }

@@ -22,7 +22,6 @@ export function storagePaths(dataDir: string) {
     /** The server's own skill folder (#21): allow-listed skills copied by `pnpm skills:install`. */
     skills: path.join(root, "skills"),
     sources: path.join(root, "sources"),
-    backups: path.join(root, "backups"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>
@@ -37,7 +36,7 @@ export type StoragePaths = ReturnType<typeof storagePaths>;
 export function ensureLayout(dataDir: string): StoragePaths {
   const p = storagePaths(dataDir);
   fs.mkdirSync(p.root, { recursive: true, mode: 0o700 });
-  for (const dir of [p.root, p.files, p.artifacts, p.runtimes, p.sources, p.backups]) {
+  for (const dir of [p.root, p.files, p.artifacts, p.runtimes, p.sources]) {
     if (dir !== p.root) {
       const st = fs.lstatSync(dir, { throwIfNoEntry: false });
       if (st?.isSymbolicLink()) throw new Error(`storage directory must not be a symlink: ${dir}`);

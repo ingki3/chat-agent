@@ -1,5 +1,7 @@
 import {
   AdminRuntimesResponse,
+  BackupItem,
+  BackupsResponse,
   AdminSkillsResponse,
   DefaultsResponse,
   RuntimeOption,
@@ -177,6 +179,10 @@ export const admin = {
     AdminSkillsResponse.parse(await call("PUT", `/api/admin/skills/${enc(name)}`, { enabled })).skills,
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
+  /** Backups (#37): list and "지금 백업". Restore is the CLI only. */
+  backups: async () => BackupsResponse.parse(await call("GET", "/api/admin/backups")),
+  backupNow: async () =>
+    BackupItem.parse(((await call("POST", "/api/admin/backups", {})) as { item: unknown }).item),
   /** Family shared connections (#17): API keys only. */
   sharedConnections: async () =>
     Connection.array().parse(((await call("GET", "/api/admin/connections")) as { items: unknown }).items),
@@ -386,6 +392,10 @@ const MESSAGES: Record<string, string> = {
   model_not_allowed: "허용되지 않은 모델이에요.",
   effort_not_allowed: "허용되지 않은 추론 강도예요.",
   runtime_not_allowed: "허용되지 않은 런타임이에요.",
+  backup_running: "이미 백업 중이에요. 끝난 뒤 다시 눌러 주세요.",
+  backup_unavailable: "이 서버에서는 백업을 만들지 않아요(BACKUP_DIR 확인).",
+  backup_failed: "백업에 실패했어요. 디스크와 백업 폴더 권한을 확인하세요.",
+  backup_disk_full: "디스크가 가득 차서 백업하지 못했어요.",
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

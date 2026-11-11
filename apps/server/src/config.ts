@@ -29,6 +29,12 @@ const ConfigSchema = z.object({
   DATA_DIR: z.string().default("./data"),
   /** Master key file for credential encryption. Must live outside DATA_DIR so backups never include it. */
   MASTER_KEY_PATH: z.string().default(path.join(os.homedir(), ".agentlee", "master.key")),
+  /**
+   * Daily backups (#37): one folder per backup, each deleted once it is 7 days old. Must be outside DATA_DIR (a restore replaces DATA_DIR), outside
+   * the repository (never committed) and must not hold the master key. Unset = `~/agentlee-backups`; in tests unset =
+   * no backups at all (a test never writes to the home folder).
+   */
+  BACKUP_DIR: optional(z.string()),
   /** Enables /api/diag/stream for SSE measurements (scripts/sse-probe.ts). Off unless explicitly "1". */
   DIAG_STREAM: z.enum(["0", "1"]).default("0"),
   /** Registers the scripted FakeRuntime (development and testing only, never with real family data). */
@@ -112,6 +118,8 @@ export type Config = {
   port: number;
   dataDir: string;
   masterKeyPath: string;
+  /** Backup folder (#37); undefined = backups off (tests without BACKUP_DIR). */
+  backupDir?: string | undefined;
   diagStream: boolean;
   fakeRuntime: boolean;
   tempGateCode?: string | undefined;
@@ -176,12 +184,29 @@ export function loadConfig(
       "Invalid configuration — MASTER_KEY_PATH must be outside DATA_DIR (backups must not contain the key)",
     );
   }
+  const backupDir =
+    c.BACKUP_DIR !== undefined
+      ? path.resolve(baseDir, c.BACKUP_DIR)
+      : c.NODE_ENV === "test"
+        ? undefined
+        : path.join(os.homedir(), "agentlee-backups");
+  if (backupDir !== undefined) {
+    if (isInside(backupDir, dataDir) || isInside(dataDir, backupDir))
+      throw new Error(
+        "Invalid configuration — BACKUP_DIR must be outside DATA_DIR (a restore replaces DATA_DIR) and must not contain it",
+      );
+    if (isInside(masterKeyPath, backupDir))
+      throw new Error("Invalid configuration — BACKUP_DIR must not contain the master key (MASTER_KEY_PATH)");
+    if (isInside(backupDir, REPO_ROOT))
+      throw new Error("Invalid configuration — BACKUP_DIR must be outside the repository");
+  }
   return {
     env: c.NODE_ENV,
     host: c.HOST,
     port: c.PORT,
     dataDir,
     masterKeyPath,
+    backupDir,
     diagStream: c.DIAG_STREAM === "1",
     fakeRuntime: c.FAKE_RUNTIME === "1",
     tempGateCode: c.TEMP_GATE_CODE,

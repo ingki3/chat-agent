@@ -1,6 +1,13 @@
 node_modules/
 dist/
 data/
+# Data folder lock and restore journal (#37), next to DATA_DIR.
+.data.lock.db
+.data.lock.info
+.data.restore-journal.json
+.data.restore-*
+data.before-restore-*/
+data.restore-rejected-*/
 .env
 *.log
 coverage/

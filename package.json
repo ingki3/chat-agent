@@ -18,6 +18,7 @@
     "e2e": "playwright test",
     "db:migrate": "pnpm --filter @agentlee/server db:migrate",
     "keygen": "pnpm --filter @agentlee/server keygen",
+    "restore": "pnpm --filter @agentlee/server restore",
     "injection-eval": "pnpm --filter @agentlee/server injection-eval",
     "skills:install": "pnpm --filter @agentlee/server skills install",
     "skills:status": "pnpm --filter @agentlee/server skills status",
