@@ -674,3 +674,98 @@ describe("recording helper (review #80): turns are kept however they end, and re
     ).rejects.toThrow(/not interrupted/);
   });
 });
+
+describe("review #80 round 2", () => {
+  it("a tool call from an MCP server that joined after init stops the turn (runtime_policy)", async () => {
+    const { a, log } = adapter({
+      x: {
+        messages: [
+          sdk.init({ session: "s" }),
+          ...Array.from({ length: 40 }, (_, i) => sdk.delta(`w${i} `)),
+          sdk.result(),
+        ],
+        interruptAt: 41,
+      },
+    });
+    const turn = (await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" });
+    const hook = (
+      log.options[0] as unknown as {
+        hooks: {
+          PreToolUse: {
+            hooks: ((i: unknown) => Promise<{ hookSpecificOutput: { permissionDecision: string } }>)[];
+          }[];
+        };
+      }
+    ).hooks.PreToolUse[0]!.hooks[0]!;
+    let n = 0;
+    await expect(
+      (async () => {
+        for await (const e of turn.events)
+          if (e.type === "text_delta" && ++n === 2) {
+            const r = await hook({
+              tool_name: "mcp__claude_ai_Gmail__search",
+              mcp_server: { name: "claude.ai Gmail", source: "claudeai" },
+            });
+            expect(r.hookSpecificOutput.permissionDecision).toBe("deny");
+          }
+      })(),
+    ).rejects.toMatchObject({ code: "runtime_policy" });
+    expect(log.interrupts).toBe(1);
+  });
+
+  it("our own tools do not trip the stop", async () => {
+    const { a, log } = adapter({ x: sdk.answer("s", "a b c d e f") });
+    const turn = (await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" });
+    const hook = (
+      log.options[0] as unknown as {
+        hooks: { PreToolUse: { hooks: ((i: unknown) => Promise<unknown>)[] }[] };
+      }
+    ).hooks.PreToolUse[0]!.hooks[0]!;
+    await hook({
+      tool_name: "mcp__agentlee__echo_time",
+      mcp_server: { name: "agentlee", source: "dynamic" },
+    });
+    await expect(collect(turn.events)).resolves.toBeDefined();
+    expect(log.interrupts).toBe(0);
+  });
+
+  it("recording keeps reading after the adapter returns: an error result followed by an SDK exception is all recorded", async () => {
+    const source: Recording = {
+      cut: {
+        messages: [
+          sdk.init({ session: "s" }),
+          ...Array.from({ length: 20 }, (_, i) => sdk.delta(`w${i} `)),
+          {
+            ...(sdk.result({ isError: true, subtype: "error_during_execution" }) as object),
+            total_cost_usd: 7,
+          } as SDKMessage,
+        ],
+        interruptAt: 21,
+        thrown: "Claude Code process aborted by user",
+      },
+    };
+    const rec: Recording = {};
+    const pending: Promise<unknown>[] = [];
+    const root = tmp();
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      query: recordingQuery(
+        replayQuery(source, { options: [], prompts: [], interrupts: 0, closes: 0 }),
+        rec,
+        pending,
+      ),
+    });
+    const turn = (await a.start(ctx())).turn({ text: "cut", model: "claude-haiku-5-5" });
+    let n = 0;
+    const ev: RuntimeEvent[] = [];
+    for await (const e of turn.events) {
+      ev.push(e);
+      if (e.type === "text_delta" && ++n === 3) void turn.interrupt();
+    }
+    await Promise.all(pending);
+    const cut = rec.cut as RecordedTurn;
+    expect(cut.messages.at(-1)).toMatchObject({ type: "result", total_cost_usd: 7 });
+    expect(cut.thrown).toBe("Claude Code process aborted by user");
+    expect(ev.find((e) => e.type === "usage")).toMatchObject({ costUsd: 7 });
+  });
+});

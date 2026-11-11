@@ -71,6 +71,11 @@ export function claudeLockdown(o: {
   mcp?: McpConnection | undefined;
   /** The run's tools of our MCP server, without prefix (StartContext.tools). Nothing else is ever allowed. */
   tools: readonly string[];
+  /**
+   * Called when an MCP tool call is refused — a server other than ours is attached (account connectors can join
+   * after init, review #80). The adapter stops the turn then (fail closed).
+   */
+  onForeignTool?: () => void;
 }) {
   const allowed = o.mcp ? [...o.tools] : [];
   if (o.mcp) mcpLoopbackPort(o.mcp);
@@ -105,8 +110,15 @@ export function claudeLockdown(o: {
       PreToolUse: [
         {
           hooks: [
-            async (input: { tool_name: string; mcp_server?: ToolProvenance }) =>
-              preToolUse(input.tool_name, allowed, input.mcp_server),
+            async (input: { tool_name: string; mcp_server?: ToolProvenance }) => {
+              const r = preToolUse(input.tool_name, allowed, input.mcp_server);
+              if (
+                r.hookSpecificOutput.permissionDecision === "deny" &&
+                (input.tool_name.startsWith("mcp__") || input.mcp_server)
+              )
+                o.onForeignTool?.();
+              return r;
+            },
           ],
         },
       ],

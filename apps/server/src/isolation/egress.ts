@@ -18,6 +18,10 @@ export type EgressOptions = {
   lookup?: (host: string) => Promise<string[]>;
   connect?: (ip: string, port: number) => net.Socket;
   connectTimeoutMs?: number;
+  /** Open tunnels at most (any local process can reach the port: bound its cost). */
+  maxTunnels?: number;
+  /** A tunnel with no traffic either way for this long is closed. */
+  idleMs?: number;
 };
 
 export type RunningEgress = { readonly port: number; readonly url: string; close(): Promise<void> };
@@ -30,14 +34,40 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
   const lookup = o.lookup ?? defaultLookup;
   const connect = o.connect ?? ((ip: string, p: number) => net.connect({ host: ip, port: p }));
   const sockets = new Set<net.Socket>();
+  let closed = false;
+  let tunnels = 0;
+  const maxTunnels = o.maxTunnels ?? 64;
+  const idleMs = o.idleMs ?? 5 * 60_000;
   const server = http.createServer((_req, res) => {
     // Plain HTTP proxying is never offered.
     res.writeHead(405, { "content-type": "text/plain" }).end("CONNECT only");
   });
   server.on("connect", (req: http.IncomingMessage, client: net.Socket, head: Buffer) => {
     sockets.add(client);
-    client.on("close", () => sockets.delete(client));
+    // Counted from the CONNECT on, so pending lookups count too.
+    tunnels++;
+    let counted = true;
+    const release = () => {
+      if (counted) tunnels--;
+      counted = false;
+    };
+    client.on("close", () => {
+      sockets.delete(client);
+      release();
+    });
     client.on("error", () => client.destroy());
+    // The peer hanging up shows as the end of its stream first (the socket can stay half-open).
+    let gone = false;
+    client.on("end", () => {
+      gone = true;
+      client.destroy();
+    });
+    client.setTimeout(idleMs, () => client.destroy());
+    if (closed) return void client.destroy();
+    if (tunnels > maxTunnels) {
+      client.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      return;
+    }
     const refuse = (code: number) => {
       client.end(`HTTP/1.1 ${code} ${code === 403 ? "Forbidden" : "Bad Gateway"}\r\n\r\n`);
     };
@@ -51,9 +81,12 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
       } catch {
         return refuse(502);
       }
+      // The client may have gone, or the proxy closed, while the name was being resolved: open nothing then.
+      if (closed || gone || client.destroyed) return void client.destroy();
       // Any blocked answer refuses the whole name (DNS rebinding to the home network or this machine).
       if (!ips.length || ips.some((ip) => isBlockedAddress(ip))) return refuse(403);
       const upstream = connect(ips[0]!, 443);
+      upstream.setTimeout(idleMs, () => upstream.destroy());
       sockets.add(upstream);
       const timer = setTimeout(() => upstream.destroy(), o.connectTimeoutMs ?? 10_000);
       upstream.on("close", () => {
@@ -72,6 +105,7 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
         client.pipe(upstream);
       });
       client.on("close", () => upstream.destroy());
+      if (client.destroyed) upstream.destroy();
     })();
   });
   await new Promise<void>((resolve, reject) => {
@@ -84,6 +118,7 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
     url: `http://127.0.0.1:${bound}`,
     close: () =>
       new Promise<void>((resolve) => {
+        closed = true;
         for (const s of sockets) s.destroy();
         server.closeAllConnections();
         server.close(() => resolve());

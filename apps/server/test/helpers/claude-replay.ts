@@ -88,11 +88,15 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
 }
 
 /**
- * Wraps the real SDK and stores what it produced, per prompt (run with real credentials, once). The turn is
- * stored however it ends — normally, by the adapter returning early after `result`, or by an SDK error — and
- * remembers where interrupt() was called.
+ * Wraps the real SDK and stores what it produced, per prompt (run with real credentials, once). Collecting is
+ * separate from the consumer: when the adapter returns early (after `result`), the SDK is still read to its
+ * real end, so an error it throws after the result is recorded too. Await `pending` before saving.
  */
-export function recordingQuery(real: typeof query, into: Recording): typeof query {
+export function recordingQuery(
+  real: typeof query,
+  into: Recording,
+  pending: Promise<unknown>[] = [],
+): typeof query {
   return ((params: { prompt: AsyncIterable<SDKUserMessage>; options?: Options }) => {
     const turn: RecordedTurn = { messages: [] };
     let key = "";
@@ -104,17 +108,38 @@ export function recordingQuery(real: typeof query, into: Recording): typeof quer
       }
     })();
     const q = real({ prompt, ...(params.options ? { options: params.options } : {}) });
-    const wrapped = (async function* () {
+    const buffer: SDKMessage[] = [];
+    let done = false;
+    let failure: unknown;
+    let wake: (() => void) | undefined;
+    const collector = (async () => {
       try {
         for await (const m of q) {
           turn.messages.push(m);
-          yield m;
+          buffer.push(m);
+          wake?.();
         }
       } catch (e) {
         turn.thrown = e instanceof Error ? e.message : String(e);
-        throw e;
+        failure = e;
       } finally {
+        done = true;
         into[key] = turn;
+        wake?.();
+      }
+    })();
+    pending.push(collector);
+    const wrapped = (async function* () {
+      for (;;) {
+        if (buffer.length) {
+          yield buffer.shift()!;
+          continue;
+        }
+        if (done) {
+          if (failure !== undefined) throw failure;
+          return;
+        }
+        await new Promise<void>((r) => (wake = r));
       }
     })();
     return Object.assign(wrapped, {

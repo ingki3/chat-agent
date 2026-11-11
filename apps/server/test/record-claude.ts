@@ -13,6 +13,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config as loadEnv } from "dotenv";
 import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
+import { CLAUDE_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
 import type { RuntimeEvent, StartContext } from "../src/runtime/adapter.js";
 import { ClaudeAdapter, type ClaudeAuth } from "../src/runtime/claude.js";
 import { recordingQuery, type Recording } from "./helpers/claude-replay.js";
@@ -30,9 +31,13 @@ const MODEL = process.env.RECORD_MODEL ?? "claude-haiku-5-5";
 
 const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "claude-record-"));
 const rec: Recording = {};
+const pending: Promise<unknown>[] = [];
+// The CLI reaches the API only through the egress proxy, exactly as in the server.
+const egress = new EgressService({ allow: CLAUDE_EGRESS_HOSTS });
 const adapter = new ClaudeAdapter({
   connection: () => ({ id: "record", dir: path.join(root, "conn"), auth }),
-  query: recordingQuery(query, rec),
+  query: recordingQuery(query, rec, pending),
+  egress,
 });
 const ctx = (over: Partial<StartContext> = {}): StartContext => ({
   conversationId: "record",
@@ -78,13 +83,15 @@ const prompts = {
   console.log("recall:", textOf(await collect(r2.turn({ text: prompts.recall, model: MODEL }).events)));
   await r2.close();
 }
+await Promise.all(pending);
 const contract = { prompts, recording: { ...rec } };
 
 // Our MCP tools through the real runtime.
 const toolRec: Recording = {};
 const toolAdapter = new ClaudeAdapter({
   connection: () => ({ id: "record", dir: path.join(root, "conn"), auth }),
-  query: recordingQuery(query, toolRec),
+  query: recordingQuery(query, toolRec, pending),
+  egress,
 });
 const tokens = new McpTokens();
 const mcp = new McpService(tokens, { byId: () => ({ name: "녹화", active: true }) as never });
@@ -107,6 +114,8 @@ const toolPrompt =
   await s.close();
 }
 await mcp.close();
+await Promise.all(pending);
+await egress.close();
 
 const fixtures = path.resolve(import.meta.dirname, "fixtures");
 const write = (name: string, data: unknown) => {

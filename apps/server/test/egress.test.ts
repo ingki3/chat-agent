@@ -126,6 +126,56 @@ describe("egress proxy (#15, review #80)", () => {
     );
   });
 
+  it("opens nothing when the client left, or the proxy closed, while the name was being resolved", async () => {
+    const up = await upstream();
+    let resolveLookup!: (ips: string[]) => void;
+    const pending = () => new Promise<string[]>((r) => (resolveLookup = r));
+    const a = await proxy(pending, up.port);
+    const s1 = net.connect({ host: "127.0.0.1", port: a.p.port }, () =>
+      s1.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n"),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    s1.destroy();
+    await new Promise((r) => setTimeout(r, 50));
+    resolveLookup(["160.79.104.10"]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(a.dialed).toEqual([]);
+
+    const b = await proxy(pending, up.port);
+    const s2 = net.connect({ host: "127.0.0.1", port: b.p.port }, () =>
+      s2.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n"),
+    );
+    closers.push(async () => s2.destroy());
+    await new Promise((r) => setTimeout(r, 50));
+    await b.p.close();
+    resolveLookup(["160.79.104.10"]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(b.dialed).toEqual([]);
+  });
+
+  it("caps open tunnels and closes idle ones", async () => {
+    const up = await upstream();
+    const p = await startEgressProxy({
+      allow: ["api.anthropic.com"],
+      lookup: PUBLIC,
+      connect: () => net.connect({ host: "127.0.0.1", port: up.port }),
+      maxTunnels: 2,
+      idleMs: 200,
+    });
+    closers.push(() => p.close());
+    const req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n";
+    const one = await send(p.port, req);
+    const two = await send(p.port, req);
+    expect(one.head).toMatch(/200/);
+    expect(two.head).toMatch(/200/);
+    expect((await send(p.port, req)).head).toMatch(/^HTTP\/1\.1 503/);
+    // Idle tunnels are closed, which frees their slots.
+    await new Promise<void>((r) => one.sock.once("close", () => r()));
+    await new Promise<void>((r) => (two.sock.destroyed ? r() : two.sock.once("close", () => r())));
+    await new Promise((r) => setTimeout(r, 30));
+    expect((await send(p.port, req)).head).toMatch(/200/);
+  });
+
   it("listens on loopback only", async () => {
     const { p } = await proxy(PUBLIC, 1);
     expect(p.url).toBe(`http://127.0.0.1:${p.port}`);

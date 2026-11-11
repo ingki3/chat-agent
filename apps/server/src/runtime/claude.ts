@@ -294,7 +294,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
           await inputDone; // keep the input open (streaming mode) until the turn is over
         }
         const options: Options = {
-          ...claudeLockdown({ cwd: paths.work, env, mcp: ctx.mcp, tools: ctx.tools }),
+          ...claudeLockdown({
+            cwd: paths.work,
+            env,
+            mcp: ctx.mcp,
+            tools: ctx.tools,
+            onForeignTool: () => {
+              foreign = true;
+              void q.interrupt().catch(() => {});
+            },
+          }),
           // The text is delivered as written: no `@file` expansion, no slash commands (review #80).
           verbatimPrompts: true,
           model: input.model,
@@ -311,11 +320,13 @@ export class ClaudeAdapter implements RuntimeAdapter {
         const q = run({ prompt: prompt(), options });
         current = q;
         let interrupted = false;
+        let foreign = false; // an MCP server that is not ours tried to run a tool: stop the turn
         let limited = false; // a usage limit ends the turn as `limit`, not as a failure (review #80)
 
         async function* events(): AsyncGenerator<RuntimeEvent> {
           try {
             for await (const m of q as AsyncIterable<SDKMessage>) {
+              if (foreign) throw new RuntimeFailure("runtime_policy");
               yield* translate(m);
               if (m.type === "result") {
                 if (m.is_error && !limited && !(interrupted && m.subtype === "error_during_execution"))
@@ -323,6 +334,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
                 return;
               }
             }
+            if (foreign) throw new RuntimeFailure("runtime_policy");
             if (!interrupted) throw new RuntimeFailure("runtime_error"); // ended without a result
           } finally {
             endInput();
