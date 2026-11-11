@@ -18,6 +18,11 @@
       "types": "./src/web.ts",
       "development": "./src/web.ts",
       "default": "./dist/web.js"
+    },
+    "./artifacts": {
+      "types": "./src/artifacts.ts",
+      "development": "./src/artifacts.ts",
+      "default": "./dist/artifacts.js"
     }
   },
   "scripts": {
@@ -25,6 +30,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@agentlee/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "1.32.2",
     "zod": "4.6.7"
   }

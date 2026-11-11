@@ -1,4 +1,6 @@
 import {
+  ArtifactDetail,
+  ArtifactListResponse,
   AdminUser,
   AuthState,
   Connection,
@@ -251,3 +253,13 @@ const MESSAGES: Record<string, string> = {
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
+
+/** Artifacts (#27): one with its versions, a conversation's list, and revert (a copy as the newest version). */
+export const artifacts = {
+  get: async (id: string) => ArtifactDetail.parse(await call("GET", `/api/artifacts/${enc(id)}`)),
+  list: async (conversationId: string) =>
+    ArtifactListResponse.parse(await call("GET", `/api/conversations/${enc(conversationId)}/artifacts`))
+      .items,
+  revert: async (id: string, version: number) =>
+    ArtifactDetail.parse(await call("POST", `/api/artifacts/${enc(id)}/revert`, { version })),
+};

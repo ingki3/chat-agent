@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { deny } from "../auth/plugin.js";
 import type { UserStore } from "../auth/users.js";
 import { isApiPath } from "../paths.js";
@@ -25,6 +25,11 @@ declare module "fastify" {
      */
     resource?: ResourceRule;
     noResource?: string;
+    /**
+     * App pages that address a resource (`/a/:id`): a refusal of the resource check (401 / 403 / 404) keeps its
+     * status but answers with this page (the SPA shell, which shows the login screen or the error) instead of JSON.
+     */
+    deniedPage?: (reply: FastifyReply, status: 401 | 403 | 404) => unknown;
   }
   interface FastifyRequest {
     /** The resource loaded and checked for this request (routes with `config.resource`). */
@@ -98,14 +103,20 @@ export function registerResourceCheck(app: FastifyInstance): void {
   app.addHook("preHandler", async (req, reply) => {
     const rule = req.routeOptions.config?.resource;
     if (!rule) return;
+    const page = req.routeOptions.config?.deniedPage;
+    const refuse = (status: 401 | 403, error: Parameters<typeof deny>[2]) =>
+      page ? page(reply.header("Cache-Control", "no-store"), status) : deny(reply, status, error);
     // Non-API resource routes (e.g. /a/:id) are not covered by the API login rule, so check login here too.
-    if (req.ctx.emailMismatch) return deny(reply, 403, "access_email_mismatch");
+    if (req.ctx.emailMismatch) return refuse(403, "access_email_mismatch");
     const user = req.ctx.user;
-    if (!user) return deny(reply, 401, "unauthenticated");
-    if (user.mustChangePassword) return deny(reply, 403, "password_change_required");
+    if (!user) return refuse(401, "unauthenticated");
+    if (user.mustChangePassword) return refuse(403, "password_change_required");
     const resource = app.resources.load(rule.kind, resourceId(req, rule));
-    if (!resource) return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
-    if (!can(user, rule.action, resource)) return deny(reply, 403, "forbidden");
+    if (!resource) {
+      reply.header("Cache-Control", "no-store");
+      return page ? page(reply, 404) : reply.code(404).send({ error: "not_found" });
+    }
+    if (!can(user, rule.action, resource)) return refuse(403, "forbidden");
     req.resource = resource;
   });
 }

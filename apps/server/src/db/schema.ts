@@ -479,3 +479,59 @@ export const sources = sqliteTable(
     index("sources_conversation_url_idx").on(t.conversationId, t.url),
   ],
 );
+
+/**
+ * Artifacts (#27, PRD FR-6): one row per artifact, owned by the user of the run that made it and scoped to that
+ * run's conversation (gone with the conversation or the user). `messageId` is the assistant message of that run
+ * (cleared if the message row goes); `runId` is a pointer only, like `sources.run_id`. `latestVersion` is the
+ * newest row of `artifact_versions`.
+ */
+export const artifacts = sqliteTable(
+  "artifacts",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    messageId: text("message_id").references(() => messages.id, { onDelete: "set null" }),
+    runId: text("run_id"),
+    kind: text("kind", {
+      enum: ["html", "svg", "markdown", "code", "chart", "table", "document"],
+    }).notNull(),
+    title: text("title").notNull(),
+    /** `code` kind: the latest version's language (each version keeps its own). */
+    language: text("language"),
+    latestVersion: integer("latest_version").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [index("artifacts_conversation_idx").on(t.conversationId, t.createdAt)],
+);
+
+/**
+ * Versions of an artifact — immutable: rows are only ever inserted (a revert inserts a copy). `content` is the
+ * text served (html, svg, markdown, code) or the canonical JSON (chart, table, document); `contentHash` is its
+ * SHA-256.
+ */
+export const artifactVersions = sqliteTable(
+  "artifact_versions",
+  {
+    artifactId: text("artifact_id")
+      .notNull()
+      .references(() => artifacts.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    title: text("title").notNull(),
+    /** `code` kind: this version's language (download name, revert). */
+    language: text("language"),
+    content: text("content").notNull(),
+    contentHash: text("content_hash").notNull(),
+    bytes: integer("bytes").notNull(),
+    runId: text("run_id"),
+    revertedFrom: integer("reverted_from"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.artifactId, t.version] })],
+);

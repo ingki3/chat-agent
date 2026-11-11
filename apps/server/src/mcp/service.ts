@@ -18,6 +18,9 @@ import {
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
 import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
+import { artifactPath, type ArtifactKind } from "@agentlee/shared";
+import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
 import type { ServerToolInfo } from "@agentlee/mcp-tools";
 import type { UserStore } from "../auth/users.js";
 import { EgressService } from "../isolation/egress.js";
@@ -269,6 +272,8 @@ export type McpServiceOptions = {
   log?: EventLogger;
   /** Web search and fetch (#50). Without it the web tools are not offered (tests without a database). */
   web?: WebOptions;
+  /** Artifact storage (#27). Without it the artifact tools are not offered. */
+  artifacts?: ArtifactStore;
 };
 
 export type WebOptions = {
@@ -329,7 +334,10 @@ export class McpService {
         proxy: (s) => this.proxyFor(s.name, s.hosts),
       });
     this.web = opts.web ? this.buildWeb(opts.web) : undefined;
-    this.tools = this.web ? [...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []), WEB_FETCH_TOOL] : [];
+    this.tools = [
+      ...(this.web ? [...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []), WEB_FETCH_TOOL] : []),
+      ...(opts.artifacts ? ARTIFACT_TOOLS : []),
+    ];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
   }
@@ -467,6 +475,19 @@ export class McpService {
       tools: this.tools,
       runTool: async (name, input, scope) => {
         const t0 = now();
+        if (ARTIFACT_TOOLS.some((t) => t.name === name)) {
+          const r = this.callArtifactTool(toolByName.get(name), input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "artifact.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            ...(r.ok ? {} : { artifactCode: r.code }),
+          });
+          return r;
+        }
         const r = await this.callTool(toolByName.get(name), input, scope);
         logEvent(this.opts.log, r.ok ? "info" : "warn", "web.finished", {
           userId: scope.userId,
@@ -482,6 +503,50 @@ export class McpService {
       ...(this.opts.now ? { now: this.opts.now } : {}),
       ...(this.opts.timeZone ? { timeZone: this.opts.timeZone } : {}),
     };
+  }
+
+  /**
+   * An artifact tool call: active user, strict input, then the store — which writes only into the token's own
+   * conversation, after checking that the token's user owns it. Content is never logged or echoed back.
+   */
+  private callArtifactTool(
+    tool: ServerToolInfo | undefined,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): SkillResult {
+    const store = this.opts.artifacts;
+    if (!tool || !store || !this.users.byId(scope.userId)?.active)
+      return { ok: false, code: "artifact_not_allowed" };
+    const parsed = z.strictObject(tool.input).safeParse(input);
+    if (!parsed.success) {
+      // Too long a content is its own code (the model should split or shorten, not fix a field).
+      const long = parsed.error.issues.some((i) => i.code === "too_big" && i.path[0] === "content");
+      return { ok: false, code: long ? "artifact_too_large" : "artifact_bad_input" };
+    }
+    const data = parsed.data as ArtifactBody & { kind?: ArtifactKind; title?: string; artifactId?: string };
+    try {
+      const { artifact, version } =
+        tool.name === ARTIFACT_CREATE_TOOL.name
+          ? store.create(scope, { ...data, kind: data.kind!, title: data.title })
+          : tool.name === ARTIFACT_UPDATE_TOOL.name
+            ? store.update(scope, data.artifactId!, data)
+            : (() => {
+                throw new ArtifactError("artifact_not_allowed");
+              })();
+      return {
+        ok: true,
+        output: {
+          artifactId: artifact.id,
+          kind: artifact.kind,
+          title: artifact.title,
+          version: version.version,
+          url: artifactPath(artifact.id),
+        },
+      };
+    } catch (e) {
+      if (e instanceof ArtifactError) return { ok: false, code: e.code };
+      throw e;
+    }
   }
 
   /** A web tool call: active user, strict input, a process slot like a skill, then the web service. */

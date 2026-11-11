@@ -698,7 +698,8 @@ export class RunManager {
   ): Promise<{ session: RuntimeSession; sessionRowId: string; revision: number }> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
-    const mcp = adapter.capabilities().usesTools ? this.opts.mcp : undefined;
+    const caps = adapter.capabilities();
+    const mcp = caps.usesTools || caps.runTools ? this.opts.mcp : undefined;
     // Per user: a skill the user may not use is not even offered (and the MCP server refuses it anyway).
     const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId)) : [];
     // The same instructions for every runtime (#20): built per run from the user, the conversation and the tools.

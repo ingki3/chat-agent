@@ -41,11 +41,11 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-5.5 | 자료 조사 모드 | #20, #25 | U, I, M | 🟨 (#20 대화별 토글 API·지침 완료, 화면 토글은 #14/#25) |
 | FR-5.6 | 참고문헌 내보내기 | #26 | U | ⬜ |
 | FR-5.7 | 뉴스·실시간·요약 스킬 | #50, #21 | I, M | 🟨 (#21 `google-news-search-skill`, #50 `web_search`·`web_fetch`(샌드박스 작업자 + 공개 주소 송신 프록시, 두 런타임 대본 시험 `web-contract.test.ts`), 뉴스 결과 출처 등록. `news-search-skill`·`realtime-lookup-skill`·`summarize` 유튜브는 미룸 — `docs/skills.md`) |
-| FR-6.1 | 아티팩트 패널 | #27, #28 | E | ⬜ |
-| FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | ⬜ |
-| FR-6.3 | 고유 주소, 기본 비공개 | #27, #29 | I | ⬜ |
+| FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. 패널은 #28) |
+| FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | 🟨 (#27 불변 `artifact_versions`(트리거)·되돌리기 = 복사한 새 버전, `POST /api/artifacts/:id/revert` — `artifacts.test.ts`·e2e. 패널 UI는 #28) |
+| FR-6.3 | 고유 주소, 기본 비공개 | #27, #29 | I | 🟨 (#27 `/a/:id`·원본·내려받기·API 주인만, 남 403 — 권한 행렬 7행·e2e. 공유는 #29) |
 | FR-6.4 | 내려받기 HTML·PNG·PDF·원본 | #28, #51 | I | ⬜ |
-| FR-6.5 | sandbox iframe + CSP, 쿠키·API 접근 불가 | #27 | E | ⬜ |
+| FR-6.5 | sandbox iframe + CSP, 쿠키·API 접근 불가 | #27 | E | 🟨 (#27 `sandbox="allow-scripts"` iframe + 원본 CSP `sandbox`·`connect-src 'none'`·인라인 해시·CDN 정확한 URL+SRI. 차트가 그려진 뒤 쿠키·fetch·parent·top 실패, 허용 밖 CDN 차단, 최상위로 열어도 불투명 출처 — `e2e/artifacts.spec.ts`, 변이 시험 isolation.md. 머지 후 ✅) |
 | FR-6.6 | 아티팩트 목록 화면 | #28, #52 | E | ⬜ |
 | FR-7.1 | 한국 주식 | #30, #21 | U, M | 🟨 (#21 `kr-stock-skill` 네이버 종목·지수 래퍼·실호출 확인, FDR 명령·출력기 #30) |
 | FR-7.2 | 미국 주식 | #30 | U, M | ⬜ |
@@ -129,7 +129,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|
 | NFR 성능 | #38 (측정 규격은 `docs/acceptance.md` §3) | M | ⬜ |
 | NFR 가용성 | #8, #46 | M | 🟨 (#46 측정기·판정 스크립트 완료, Access 후 7일 측정 대기) |
-| NFR 보안 | #5, #7, #9, #10, #42, #50 | U, I, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, 변이 시험 기록 isolation.md) |
+| NFR 보안 | #5, #7, #9, #10, #42, #50, #27 | U, I, E, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, #27 아티팩트 샌드박스·CSP — `e2e/artifacts.spec.ts`, 변이 시험 기록 isolation.md) |
 | NFR 스트리밍 | #8, #12 | I, M | ⬜ |
 | NFR 격리 | #15, #16, #42, #47, #21 | I | ⬜ |
 | NFR 권한 | #10, #29 | I | ⬜ |

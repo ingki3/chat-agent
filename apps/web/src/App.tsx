@@ -5,6 +5,7 @@ import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
 import { auth, setUnauthenticatedHandler } from "./api.js";
 import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
+import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
@@ -36,6 +37,12 @@ const authChannel =
  * Login comes first. The URL is never changed for it: after login (or after an expired session is renewed)
  * the same address renders, so the user lands back where they were (#13).
  */
+/** Keyed by id: another artifact starts from its own latest version. */
+function ArtifactRoute() {
+  const { id = "" } = useParams();
+  return <ArtifactPage key={id} id={id} />;
+}
+
 function AuthGate() {
   const qc = useQueryClient();
   const { data, isError } = useQuery({ queryKey: AUTH_KEY, queryFn: auth.state });
@@ -68,6 +75,7 @@ function AuthGate() {
           <Route path="shared" element={<PlaceholderPage title="👪 가족 공유" issue="#52" />} />
           <Route path="schedules" element={<PlaceholderPage title="⏰ 예약" issue="#55" />} />
           <Route path="artifacts" element={<PlaceholderPage title="🧩 아티팩트" issue="#28" />} />
+          <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
           <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />
           <Route

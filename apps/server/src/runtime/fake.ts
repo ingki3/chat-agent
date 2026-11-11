@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
 import type { RuntimeId } from "@agentlee/shared";
+import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -21,12 +22,18 @@ import {
  *   /error            the turn fails
  *   /limit            a usage-limit signal
  *   /long <n>         n words, slowly (to try the stop button)
+ *   /artifact <kind> <title>          (next lines: the content; JSON for chart, table, document)
+ *   /artifact-update <id> <field>     (next lines: the new content of that field — content, chart, table, document)
+ *                     real calls of our MCP tools `artifact_create` / `artifact_update` with the run's token
+ *                     (needs `runTools`, as the FAKE_RUNTIME=1 server registers it; #27)
  */
 export type FakeStep =
   | { text: string }
   | { reasoning: string }
   | { delayMs: number }
   | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
+  /** A real call of one of our MCP server's tools with this run's token (StartContext.mcp). */
+  | { call: string; input: Record<string, unknown> }
   | { usage: UsageReport }
   | { notice: string }
   | { limit: string }
@@ -57,9 +64,93 @@ function connectionTestSteps(text: string): FakeStep[] {
   ];
 }
 
+/** `/artifact …` and `/artifact-update …` (see the header comment), or undefined for any other text. */
+function artifactSteps(t: string): FakeStep[] | undefined {
+  const nl = t.indexOf("\n");
+  const head = nl === -1 ? t : t.slice(0, nl);
+  const body = nl === -1 ? "" : t.slice(nl + 1);
+  const json = (s: string): unknown => {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return s;
+    }
+  };
+  let m = /^\/artifact\s+(\w+)\s+(.+)$/.exec(head);
+  if (m) {
+    const kind = m[1]!;
+    const field = ["chart", "table", "document"].includes(kind) ? kind : "content";
+    return [
+      { text: "아티팩트를 만들게요. " },
+      {
+        call: "artifact_create",
+        input: { kind, title: m[2]!, [field]: field === "content" ? body : json(body) },
+      },
+      { text: "만들었어요." },
+    ];
+  }
+  m = /^\/artifact-update\s+(\S+)\s+(content|chart|table|document)$/.exec(head);
+  if (m)
+    return [
+      { text: "새 버전을 만들게요. " },
+      {
+        call: "artifact_update",
+        input: { artifactId: m[1]!, [m[2]!]: m[2] === "content" ? body : json(body) },
+      },
+      { text: "고쳤어요." },
+    ];
+  return undefined;
+}
+
+const parseOr = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text }; // the MCP SDK's own input validation answers in words
+  }
+};
+
+/** One `tools/call` to our MCP server (stateless JSON-RPC over HTTP), as a runtime would make it. */
+async function callOurTool(
+  mcp: McpConnection | undefined,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<{ output: unknown; isError: boolean }> {
+  if (!mcp) return { output: { error: "no_mcp" }, isError: true };
+  try {
+    const res = await fetch(mcp.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${mcp.token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+    });
+    const j = (await res.json()) as {
+      result?: { content?: { text?: string }[]; isError?: boolean };
+      error?: unknown;
+    };
+    const text = j.result?.content?.[0]?.text;
+    return {
+      output: text === undefined ? (j.error ?? { error: `http_${res.status}` }) : parseOr(text),
+      isError: !!j.error || !!j.result?.isError,
+    };
+  } catch {
+    return { output: { error: "mcp_unreachable" }, isError: true };
+  }
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
+  const artifact = artifactSteps(t);
+  if (artifact) return artifact;
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [
@@ -100,7 +191,10 @@ export class FakeRuntime implements RuntimeAdapter {
   /** Every StartContext passed to start/resume (tests check the connection the run manager chose). */
   readonly contexts: StartContext[] = [];
   /** Sessions this "runtime" remembers (forget() simulates a runtime that lost them). */
-  private readonly sessions = new Map<string, { model: string; memory: string[] }>();
+  private readonly sessions = new Map<
+    string,
+    { model: string; memory: string[]; mcp?: McpConnection | undefined }
+  >();
 
   constructor(
     private readonly opts: {
@@ -109,6 +203,8 @@ export class FakeRuntime implements RuntimeAdapter {
       models?: RuntimeCapabilities["models"];
       canResume?: boolean;
       usesTools?: boolean;
+      /** Runs get our MCP server (for `call` steps) while the connection test stays scripted (FAKE_RUNTIME=1). */
+      runTools?: boolean;
       /** Act like a real runtime that needs a connection (#17). */
       needsConnection?: boolean;
     } = {},
@@ -130,6 +226,7 @@ export class FakeRuntime implements RuntimeAdapter {
       canSwitchModelInSession: true,
       canResume: this.opts.canResume ?? true,
       usesTools: this.opts.usesTools ?? false,
+      ...(this.opts.runTools ? { runTools: true } : {}),
       needsConnection: this.opts.needsConnection ?? false,
     };
   }
@@ -145,14 +242,17 @@ export class FakeRuntime implements RuntimeAdapter {
     const memory = ctx.history
       .flatMap((h) => h.parts.map((p) => (p.type === "text" ? p.text : "")))
       .filter(Boolean);
-    this.sessions.set(id, { model: ctx.model, memory });
+    this.sessions.set(id, { model: ctx.model, memory, mcp: ctx.mcp });
     return this.session(id);
   }
 
   async resume(externalSessionId: string, ctx?: StartContext): Promise<RuntimeSession> {
     if (ctx) this.contexts.push(ctx);
     if (this.opts.canResume === false) throw new Error("this runtime cannot resume");
-    if (!this.sessions.has(externalSessionId)) throw new SessionGoneError();
+    const known = this.sessions.get(externalSessionId);
+    if (!known) throw new SessionGoneError();
+    // Every run has its own MCP token: the resumed session calls tools with this run's.
+    known.mcp = ctx?.mcp;
     this.resumed++;
     return this.session(externalSessionId);
   }
@@ -192,6 +292,12 @@ export class FakeRuntime implements RuntimeAdapter {
                 output: step.output,
                 ...(step.isError ? { isError: true } : {}),
               };
+            } else if ("call" in step) {
+              const callId = `call-${++seq}`;
+              yield { type: "tool_start", callId, name: `${OUR_TOOL_PREFIX}${step.call}`, input: step.input };
+              const r = await callOurTool(state.mcp, step.call, step.input);
+              if (ctrl.signal.aborted) return;
+              yield { type: "tool_end", callId, output: r.output, ...(r.isError ? { isError: true } : {}) };
             } else if ("usage" in step) yield { type: "usage", ...step.usage };
             else if ("notice" in step)
               yield { type: "notice", level: "info", code: "fake", message: step.notice };
