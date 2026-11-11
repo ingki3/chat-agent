@@ -209,3 +209,27 @@ rm ~/.agentlee/probe-headers.txt
 2. Zero Trust → Access → Applications → Agent Lee → 정책 → Include Emails에 그 가족 이메일을 추가하고 저장한다.
 3. 가족에게 임시 비밀번호를 직접 전달하고, 휴대폰에서 Access 코드 로그인 → 앱 로그인이 되는지 함께 확인한다.
 4. 가족을 비활성화하면 같은 정책에서 이메일을 지운다. **관리자 이메일(`ingki3@gmail.com`)은 지우지 않는다.**
+
+## 11. Claude Code 연결 (임시 — 앱 안 연결 관리 #17 전까지)
+`.env`에만 넣는다. 저장소·로그·디스크에 남지 않는다. 런타임 프로세스에는 환경 변수로만 넘긴다.
+
+- `CLAUDE_OAUTH_TOKEN`
+  - 관리자 본인 Claude 구독 토큰이다. 터미널에서 `claude setup-token`을 실행해 받는다.
+  - **관리자 본인 대화에만** 쓰인다(PRD D2). 관리자 계정 이메일이 `ADMIN_EMAIL`과 같아야 한다.
+- `CLAUDE_API_KEY`
+  - Anthropic API 키(`sk-ant-…`)다.
+  - 가족 모두가 쓴다. 관리자도 구독 토큰이 없으면 이 키를 쓴다.
+- CLI 폴더는 연결과 사용자마다 따로 둔다: `DATA_DIR/runtimes/<연결 id>/<사용자 id>/`. 안에는 `config`(세션·설정), `home`, `work`, `tmp`가 있다.
+  - CLI는 이 폴더만 읽고 쓴다(샌드박스).
+  - 서버만 쓰는 세션 정보(시작 시스템 프롬프트, 누적 비용)는 폴더 밖 `<…>-meta/`에 둔다.
+- 네트워크는 루프백만 쓴다: 우리 MCP 포트와 서버 안의 송신 프록시.
+  - 인터넷은 프록시(`HTTPS_PROXY`)로만 나간다. 프록시는 `api.anthropic.com:443`의 CONNECT만 통과시키고, 사설·루프백 주소는 거부한다.
+  - 터널은 최대 64개까지 열고, 5분 동안 오가는 데이터가 없으면 닫는다.
+- 자식 프로세스는 만들 수 없다. 프롬프트는 쓴 그대로 넘긴다(`@파일`·슬래시 명령을 해석하지 않는다).
+- 녹화 갱신: CI는 녹화된 응답을 재생한다. SDK 버전을 올렸거나 동작이 바뀌었다고 의심되면 다시 녹화한다.
+  ```
+  pnpm --filter @agentlee/server exec tsx --conditions=development test/record-claude.ts
+  ```
+  - `test/fixtures/claude-*.json`이 갱신된다.
+  - 스크립트는 녹화에 자격 증명이 들어 있으면 쓰지 않는다.
+

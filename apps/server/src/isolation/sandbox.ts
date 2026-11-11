@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import { canonicalPath } from "../fs-safety.js";
 import { findHardLinks } from "./paths.js";
@@ -16,7 +16,10 @@ export type SandboxPolicy = {
   write: string[];
   /** Executables the process may start (the command itself is added automatically). */
   exec?: string[];
-  /** "none" (default), "all", or outbound TCP to these loopback ports only (e.g. our MCP server). */
+  /**
+   * "none" (default), "all", or outbound TCP to these loopback ports only — our MCP server and, for runtime
+   * CLIs, the egress proxy (isolation/egress.ts) that is their only way to the internet.
+   */
   network?: "none" | "all" | { loopbackPorts: number[] };
   /**
    * Read-only program folders (e.g. a runtime's install directory) that are not scanned for hard links.
@@ -83,11 +86,12 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
     lines.push(`(allow file-read-metadata ${[...parents].map((d) => `(literal ${lit(d)})`).join(" ")})`);
   const net = policy.network ?? "none";
   if (net === "all") lines.push("(allow network*)", "(allow mach-lookup)");
-  else if (net !== "none")
+  else if (net !== "none") {
     for (const port of net.loopbackPorts) {
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`bad port ${port}`);
       lines.push(`(allow network-outbound (remote ip "localhost:${port}"))`);
     }
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -208,6 +212,85 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
     child.on("close", (code, signal) => resolve({ code, signal, stdout: out, stderr: err, killed }));
     child.stdin.end(o.stdin ?? "");
   });
+}
+
+export type SpawnIsolatedOptions = SandboxPolicy & {
+  command: string;
+  args: string[];
+  cwd: string;
+  /** The complete environment of the child. Not merged with process.env. */
+  env: Record<string, string>;
+  /** Resident memory limit (checked every 250 ms; killed above it, and also when it cannot be measured). */
+  maxRssBytes?: number;
+  /** stderr is read (so the child never blocks on a full pipe) and handed here, at most this many bytes. */
+  onStderr?: (chunk: string) => void;
+  maxStderrBytes?: number;
+  /** Tests only: replaces the `ps` measurement used by the monitor. */
+  probe?: () => Promise<{ pid: number; rss: number }[]>;
+};
+
+/**
+ * Long-lived variant of `runIsolated` for runtime CLIs that talk over stdin/stdout (Claude Code, codex
+ * app-server): same profile, same pre-checks (macOS only, no hard links), own process group, memory monitor.
+ * Returns the child; the caller owns its lifetime. `killed` says why the monitor stopped it, if it did.
+ */
+export function spawnIsolated(o: SpawnIsolatedOptions): ChildProcessWithoutNullStreams & {
+  isolationKill?: "memory" | "monitor";
+} {
+  if (process.platform !== "darwin") throw new SandboxUnavailableError();
+  const linked = [...o.read, ...o.write].flatMap((p) => findHardLinks(canonicalPath(p)));
+  if (linked.length) throw new HardLinkError(linked);
+  const profile = buildProfile(o);
+  const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, o.command, ...o.args], {
+    cwd: o.cwd,
+    env: o.env,
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  }) as ChildProcessWithoutNullStreams & { isolationKill?: "memory" | "monitor" };
+  const pid = child.pid;
+  let exited = false;
+  const kill = (why: "memory" | "monitor") => {
+    if (exited || child.isolationKill) return;
+    child.isolationKill = why;
+    try {
+      process.kill(-pid!, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  };
+  let errBytes = 0;
+  const maxErr = o.maxStderrBytes ?? 64 * 1024;
+  child.stderr.on("data", (c: Buffer) => {
+    if (errBytes >= maxErr) return;
+    const part = c.subarray(0, maxErr - errBytes);
+    errBytes += part.length;
+    o.onStderr?.(part.toString("utf8"));
+  });
+  child.stdin.on("error", () => {}); // a child that died does not take the server with it
+  let sampling = false;
+  const monitor =
+    o.maxRssBytes && pid
+      ? setInterval(() => {
+          if (sampling || exited) return;
+          sampling = true;
+          (o.probe ?? (() => snapshot(pid)))()
+            .then((procs) => {
+              const me = procs.find((p) => p.pid === pid);
+              if (!me) {
+                if (!exited) kill("monitor");
+              } else if (me.rss * 1024 > o.maxRssBytes!) kill("memory");
+            })
+            .catch(() => kill("monitor"))
+            .finally(() => (sampling = false));
+        }, 250)
+      : undefined;
+  monitor?.unref();
+  child.on("exit", () => {
+    exited = true;
+    clearInterval(monitor);
+  });
+  child.on("error", () => clearInterval(monitor));
+  return child;
 }
 
 /** Builds a child environment from an allow-list of the server's variables plus explicit values. */

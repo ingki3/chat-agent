@@ -452,7 +452,7 @@ describe("common MCP server (#43)", () => {
 describe("runtime connection settings (#43, used by #15/#16)", () => {
   const mcp = { url: "http://127.0.0.1:43123/mcp", token: "tok-abc" };
   it("Claude: our server over HTTP with the run token as bearer", () => {
-    const o = claudeLockdown({ cwd: "/srv/w", env: {}, mcp });
+    const o = claudeLockdown({ cwd: "/srv/w", env: {}, mcp, tools: [] });
     expect(o.mcpServers).toEqual({
       agentlee: { type: "http", url: mcp.url, headers: { Authorization: "Bearer tok-abc" } },
     });
@@ -474,7 +474,7 @@ describe("runtime connection settings (#43, used by #15/#16)", () => {
     ])
       expect(() => mcpLoopbackPort({ url, token: "t" }), url).toThrow();
     expect(() =>
-      claudeLockdown({ cwd: "/", env: {}, mcp: { url: "http://evil.example:1/mcp", token: "t" } }),
+      claudeLockdown({ cwd: "/", env: {}, mcp: { url: "http://evil.example:1/mcp", token: "t" }, tools: [] }),
     ).toThrow();
   });
 });

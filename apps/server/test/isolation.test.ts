@@ -547,28 +547,57 @@ describe("runtime lockdown settings", () => {
   const mcp = { url: "http://127.0.0.1:41000/mcp", token: "t" };
 
   it("Claude: no built-in tools, no user settings, only our MCP, and a hook that denies anything else", async () => {
-    const o = claudeLockdown({ cwd: "/srv/work", env: { PATH: "/usr/bin" }, mcp });
+    const o = claudeLockdown({
+      cwd: "/srv/work",
+      env: { PATH: "/usr/bin" },
+      mcp,
+      tools: ["echo_time", "skill_selftest"],
+    });
     expect(o.tools).toEqual([]);
     expect(o.settingSources).toEqual([]);
     expect(o.strictMcpConfig).toBe(true);
     expect(Object.keys(o.mcpServers)).toEqual(["agentlee"]);
     expect(o.disallowedTools).toEqual(expect.arrayContaining(["Bash", "Read", "Write", "WebFetch"]));
     const hook = o.hooks.PreToolUse[0]!.hooks[0]!;
-    for (const name of [
-      "Bash",
-      "Read",
-      "mcp__claude_ai_Google_Drive__read_file_content",
-      "mcp__agentleeX__t",
-      "mcp__evil__agentlee",
-    ])
-      expect(await hook({ tool_name: name }), name).toMatchObject({
-        hookSpecificOutput: { permissionDecision: "deny" },
-      });
+    const ours = { name: "agentlee", source: "dynamic" };
+    const deny = { hookSpecificOutput: { permissionDecision: "deny" } };
+    for (const [tool_name, mcp_server] of [
+      ["Bash", undefined],
+      ["Read", undefined],
+      [
+        "mcp__claude_ai_Google_Drive__read_file_content",
+        { name: "claude.ai Google Drive", source: "claudeai" },
+      ],
+      ["mcp__agentleeX__t", ours],
+      ["mcp__evil__agentlee", ours],
+      // Look-alike names (review #80): a connector "agentlee__extra" yields mcp__agentlee__extra__search.
+      ["mcp__agentlee__extra__search", { name: "agentlee__extra", source: "claudeai" }],
+      ["mcp__agentlee__extra__search", ours], // not one of the run's tools
+      // Our tool name, but not from our configured server, or with no provenance at all.
+      ["mcp__agentlee__echo_time", { name: "agentlee", source: "claudeai" }],
+      ["mcp__agentlee__echo_time", { name: "other", source: "dynamic" }],
+      ["mcp__agentlee__echo_time", undefined],
+    ] as const)
+      expect(
+        await hook({ tool_name, ...(mcp_server ? { mcp_server } : {}) }),
+        `${tool_name} ${JSON.stringify(mcp_server)}`,
+      ).toMatchObject(deny);
     for (const name of ["mcp__agentlee__echo_time", "mcp__agentlee__skill_selftest"])
-      expect(await hook({ tool_name: name }), name).toMatchObject({
+      expect(await hook({ tool_name: name, mcp_server: ours }), name).toMatchObject({
         hookSpecificOutput: { permissionDecision: "allow" },
       });
-    expect(preToolUse("mcp__agentlee__cite").hookSpecificOutput.permissionDecision).toBe("allow");
+    // Tools not given to this run are refused even when they are ours.
+    expect(preToolUse("mcp__agentlee__cite", ["echo_time"], ours).hookSpecificOutput.permissionDecision).toBe(
+      "deny",
+    );
+    expect(preToolUse("mcp__agentlee__cite", ["cite"], ours).hookSpecificOutput.permissionDecision).toBe(
+      "allow",
+    );
+    // A run without our MCP server allows nothing.
+    const none = claudeLockdown({ cwd: "/", env: {}, tools: ["echo_time"] });
+    expect(
+      await none.hooks.PreToolUse[0]!.hooks[0]!({ tool_name: "mcp__agentlee__echo_time", mcp_server: ours }),
+    ).toMatchObject(deny);
   });
 
   it("Claude: a session with any other MCP server is refused", () => {

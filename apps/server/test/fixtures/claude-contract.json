@@ -1,0 +1,2348 @@
+{
+  "_note": "HAND-MADE placeholder — replace by recording the real runtime (scripts/record-claude.ts)",
+  "prompts": {
+    "short": "Say hello in Korean in one short sentence.",
+    "long": "Count from 1 to 200, separated by spaces.",
+    "remember": "My codename is 토마토. Reply only: OK",
+    "recall": "What is my codename? Reply with the codename only."
+  },
+  "recording": {
+    "Say hello in Korean in one short sentence.": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "e512ebf7-16ab-4650-9061-36199fb53ff4",
+        "tools": [],
+        "mcp_servers": [],
+        "model": "claude-haiku-5-5",
+        "apiKeySource": "none"
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "안녕하세요, "
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "반가워요!"
+          }
+        }
+      },
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        },
+        "total_cost_usd": 0.0
+      }
+    ],
+    "Count from 1 to 200, separated by spaces.": {
+      "messages": [
+        {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "d0859eb6-c5e7-43d8-805e-c9ed1feb8d40",
+          "tools": [],
+          "mcp_servers": [],
+          "model": "claude-haiku-5-5",
+          "apiKeySource": "none"
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "1 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "2 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "3 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "4 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "5 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "6 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "7 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "8 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "9 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "10 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "11 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "12 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "13 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "14 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "15 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "16 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "17 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "18 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "19 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "20 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "21 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "22 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "23 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "24 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "25 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "26 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "27 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "28 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "29 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "30 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "31 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "32 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "33 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "34 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "35 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "36 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "37 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "38 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "39 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "40 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "41 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "42 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "43 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "44 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "45 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "46 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "47 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "48 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "49 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "50 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "51 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "52 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "53 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "54 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "55 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "56 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "57 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "58 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "59 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "60 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "61 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "62 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "63 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "64 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "65 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "66 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "67 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "68 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "69 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "70 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "71 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "72 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "73 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "74 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "75 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "76 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "77 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "78 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "79 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "80 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "81 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "82 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "83 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "84 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "85 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "86 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "87 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "88 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "89 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "90 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "91 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "92 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "93 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "94 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "95 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "96 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "97 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "98 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "99 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "100 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "101 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "102 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "103 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "104 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "105 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "106 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "107 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "108 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "109 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "110 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "111 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "112 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "113 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "114 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "115 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "116 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "117 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "118 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "119 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "120 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "121 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "122 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "123 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "124 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "125 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "126 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "127 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "128 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "129 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "130 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "131 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "132 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "133 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "134 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "135 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "136 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "137 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "138 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "139 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "140 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "141 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "142 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "143 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "144 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "145 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "146 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "147 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "148 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "149 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "150 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "151 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "152 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "153 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "154 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "155 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "156 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "157 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "158 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "159 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "160 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "161 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "162 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "163 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "164 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "165 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "166 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "167 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "168 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "169 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "170 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "171 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "172 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "173 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "174 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "175 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "176 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "177 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "178 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "179 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "180 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "181 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "182 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "183 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "184 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "185 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "186 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "187 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "188 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "189 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "190 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "191 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "192 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "193 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "194 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "195 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "196 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "197 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "198 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "199 "
+            }
+          }
+        },
+        {
+          "type": "stream_event",
+          "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+              "type": "text_delta",
+              "text": "200"
+            }
+          }
+        },
+        {
+          "type": "result",
+          "subtype": "error_during_execution",
+          "is_error": true,
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 3
+          },
+          "total_cost_usd": 0.0
+        }
+      ],
+      "interruptAt": 201
+    },
+    "My codename is 토마토. Reply only: OK": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "1b1a440c-018a-4fcc-ac60-bdc1f8b9d45d",
+        "tools": [],
+        "mcp_servers": [],
+        "model": "claude-haiku-5-5",
+        "apiKeySource": "none"
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "OK"
+          }
+        }
+      },
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        },
+        "total_cost_usd": 0.0
+      }
+    ],
+    "What is my codename? Reply with the codename only.": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "b7ad0bba-8666-4060-983e-459c94417202",
+        "tools": [],
+        "mcp_servers": [],
+        "model": "claude-haiku-5-5",
+        "apiKeySource": "none"
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "토마토"
+          }
+        }
+      },
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        },
+        "total_cost_usd": 0.0
+      }
+    ]
+  }
+}

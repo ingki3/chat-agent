@@ -15,6 +15,8 @@ import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
 import { RuntimeRegistry } from "./runtime/adapter.js";
 import { FakeRuntime } from "./runtime/fake.js";
+import { claudeFromConfig } from "./runtime/claude-config.js";
+import { CLAUDE_EGRESS_HOSTS, EgressService } from "./isolation/egress.js";
 import { registerRunRoutes } from "./runtime/routes.js";
 import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
 import { McpTokens } from "./isolation/tokens.js";
@@ -157,6 +159,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerUserAdmin(app, users, opts.userAdmin);
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
+    else if (!opts.runtimes && config.claude) {
+      // Runtime CLIs reach the internet only through this proxy (allow-listed API hosts, no private addresses).
+      const egress = new EgressService({ allow: CLAUDE_EGRESS_HOSTS });
+      app.addHook("onClose", async () => egress.close());
+      runtimes.register(claudeFromConfig(config, users, egress));
+    }
     // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
     const mcpTokens = new McpTokens();
     const mcp = new McpService(mcpTokens, users, opts.mcp);

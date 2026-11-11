@@ -8,6 +8,7 @@ import { runEvents, runs } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
 import { McpTokens } from "../isolation/tokens.js";
 import {
+  RuntimeFailure,
   SessionGoneError,
   type RuntimeRegistry,
   type RuntimeSession,
@@ -128,6 +129,9 @@ const FAILURE_TEXT: Record<string, string> = {
   runtime_error: "응답 중 오류가 났어요. 다시 시도해 주세요.",
   server_restart: "서버 재시작으로 중단됐어요. 다시 생성해 주세요.",
   usage_limit: "사용 한도에 도달했어요.",
+  runtime_auth: "런타임 로그인이 만료됐거나 키가 맞지 않아요 — 관리자에게 문의하세요.",
+  no_connection: "이 런타임을 쓸 수 있는 연결이 없어요 — 관리자에게 문의하세요.",
+  runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요.",
 };
 
 export type RunManagerOptions = {
@@ -504,6 +508,7 @@ export class RunManager {
     const mcp = adapter.capabilities().usesTools ? this.opts.mcp : undefined;
     const ctx: StartContext = {
       conversationId: run.conversationId,
+      userId: run.userId,
       history: history.map((m) => ({ role: m.role, parts: publicParts(m.parts as MessagePart[]) })),
       systemPrompt: this.opts.systemPrompt ?? "",
       model: run.model,
@@ -663,12 +668,16 @@ export class RunManager {
     } catch (e) {
       // Only interrupts we asked for count as "stopped"; any other error is a failure (spike #39). The error's
       // text is never kept: a fixed code goes to the browser, the log keeps the class name and code only.
+      // An adapter's named failure (RuntimeFailure: runtime_auth, no_connection, runtime_policy) keeps its code.
       if (live.interruptRequested) outcome = { status: "interrupted", code: null };
       else {
         live.failure = e;
-        const c = classifyError(e, { code: "runtime_error", category: "runtime" });
-        // A 4xx status on a runtime error is the provider's, not the browser's request: still a runtime error.
-        outcome = { status: "failed", code: c.category === "client" ? "runtime_error" : c.code };
+        if (e instanceof RuntimeFailure) outcome = { status: "failed", code: e.code };
+        else {
+          const c = classifyError(e, { code: "runtime_error", category: "runtime" });
+          // A 4xx status on a runtime error is the provider's, not the browser's request: still a runtime error.
+          outcome = { status: "failed", code: c.category === "client" ? "runtime_error" : c.code };
+        }
       }
     }
     this.settle(runId, outcome.status, outcome.code);
