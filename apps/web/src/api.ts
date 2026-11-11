@@ -1,4 +1,10 @@
 import {
+  AdminUsageReport,
+  MyUsage,
+  PriceTable,
+  PriceTableResponse,
+  UsageSettings,
+  type ModelPrice,
   ArtifactDetail,
   ArtifactListResponse,
   AdminUser,
@@ -242,6 +248,18 @@ export const connections = {
     };
   },
   cancelLogin: async (id: string) => call("DELETE", `/api/connections/logins/${enc(id)}`),
+};
+
+/** Usage (#32): my own this month (sidebar, settings) and the admin's report, price table and threshold. */
+export const USAGE_KEY = ["usage"] as const;
+export const usage = {
+  mine: async () => MyUsage.parse(await call("GET", "/api/usage/me")),
+  report: async () => AdminUsageReport.parse(await call("GET", "/api/admin/usage")),
+  prices: async () => PriceTableResponse.parse(await call("GET", "/api/admin/usage/prices")),
+  savePrices: async (prices: ModelPrice[]) =>
+    PriceTable.parse(await call("PUT", "/api/admin/usage/prices", { prices })),
+  saveSettings: async (s: UsageSettings) =>
+    UsageSettings.parse(await call("PUT", "/api/admin/usage/settings", s)),
 };
 
 export const runs = {

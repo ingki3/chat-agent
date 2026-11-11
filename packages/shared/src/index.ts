@@ -8,6 +8,7 @@ export * from "./external.js";
 export * from "./connections.js";
 export * from "./sources.js";
 export * from "./artifacts.js";
+export * from "./usage.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

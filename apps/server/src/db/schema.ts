@@ -406,7 +406,12 @@ export const runtimePolicies = sqliteTable(
  *   id (there is no run row). No foreign keys on run, conversation or connection: usage outlives a deleted
  *   conversation or a disconnected connection (the FR-9.3 totals must not shrink).
  * - Token columns and `cost_usd` are NULL when the runtime did not report them (not 0).
- * - `cost_usd` is the runtime's own figure (API key connections, Claude); the price table and the screen are #32.
+ * - `cost_usd` is the runtime's own figure (Claude reports one); it is kept for reference only.
+ * - Cost (#32, FR-9.1·9.2): `auth_type` is the connection's way of signing in when the row was first written (NULL
+ *   without a connection). Only `api_key` rows are costed: `price_version` pins the price table version used when
+ *   the row was first written, and `priced_cost_usd` is the cost from that version — a later price edit makes a new
+ *   version and never rewrites these. NULL cost on an `api_key` row = no price for that model ("미제공").
+ *   Subscription rows count requests and tokens only (no version, no cost).
  */
 export const usageRecords = sqliteTable(
   "usage_records",
@@ -436,6 +441,12 @@ export const usageRecords = sqliteTable(
     requestCount: integer("request_count").notNull().default(1),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
+    /** The connection's auth type at the first write (#32); NULL without a connection. */
+    authType: text("auth_type", { enum: ["api_key", "subscription"] }),
+    /** Price table version the row is costed with (#32); set once, at the first write. API key rows only. */
+    priceVersion: integer("price_version"),
+    /** Cost from `price_version` (#32). NULL = not costed (subscription, no connection) or no price ("미제공"). */
+    pricedCostUsd: real("priced_cost_usd"),
   },
   (t) => [
     uniqueIndex("usage_records_run_attempt_idx").on(t.runId, t.attempt),
@@ -443,6 +454,28 @@ export const usageRecords = sqliteTable(
     index("usage_records_created_idx").on(t.createdAt),
   ],
 );
+
+/** One model's prices in a price table (#32), USD per million tokens. NULL = not provided ("미제공"). */
+export type ModelPriceRow = {
+  runtime: string;
+  model: string;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+};
+
+/**
+ * Model price table (#32, FR-9.1): every admin edit adds a new version; versions are never changed or deleted, so
+ * a usage row's `price_version` always finds the prices it was costed with. The current table = highest version.
+ */
+export const priceTables = sqliteTable("price_tables", {
+  version: integer("version").primaryKey(),
+  prices: text("prices", { mode: "json" }).$type<ModelPriceRow[]>().notNull(),
+  /** The admin who saved it (no foreign key: the version outlives the account). */
+  createdBy: text("created_by"),
+  createdAt: integer("created_at").notNull(),
+});
 
 /**
  * Web material a run looked at (#50, PRD FR-5.1·5.2): fetched pages (`page`, with the readable text the citation

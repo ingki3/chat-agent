@@ -173,6 +173,67 @@ export const APP_MATRIX: MatrixRow[] = [
   },
 ];
 
+/** Admin-only data: every member — the son's account included — 403, the admin 200, before login 401. */
+export const ADMIN_ONLY: Record<Who, number> = {
+  owner: 403,
+  shared: 403,
+  admin: 200,
+  stranger: 403,
+  anon: 401,
+};
+
+/**
+ * Admin-only routes (`config.auth: "admin"`) of the real app. Every admin route is swept for 403/401 without a row
+ * (permissions.test.ts); a route listed here is also run as the admin and must succeed. Routes under a prefix in
+ * `ADMIN_MATRIX_PREFIXES` must all have a row (#32: usage).
+ */
+export type AdminRow = { route: string; expect: Record<Who, number>; body?: unknown };
+export const ADMIN_MATRIX_PREFIXES = ["/api/admin/usage"];
+export const ADMIN_MATRIX: AdminRow[] = [
+  { route: "GET /api/admin/usage", expect: ADMIN_ONLY },
+  { route: "GET /api/admin/usage/prices", expect: ADMIN_ONLY },
+  {
+    route: "PUT /api/admin/usage/prices",
+    expect: ADMIN_ONLY,
+    body: {
+      prices: [
+        { runtime: "claude-code", model: "m", input: 1, output: 2, cacheRead: null, cacheWrite: null },
+      ],
+    },
+  },
+  { route: "GET /api/admin/usage/settings", expect: ADMIN_ONLY },
+  { route: "PUT /api/admin/usage/settings", expect: ADMIN_ONLY, body: { dailyCostThresholdUsd: 5 } },
+];
+
+/** Sends `METHOD /path` (path params filled with a placeholder) as `who`. */
+export function sendAs(f: Family, who: Who, route: string, body?: unknown) {
+  const [method, pattern] = route.split(" ") as [string, string];
+  const safe = method === "GET" || method === "HEAD";
+  const url = pattern.replace(/:[A-Za-z]+/g, "matrix-id").replace("*", "matrix-id");
+  return f.app.inject({
+    method: method as "GET",
+    url,
+    headers: {
+      ...LOCAL,
+      ...(who === "anon" ? {} : { cookie: f.cookies[who] }),
+      ...(safe ? {} : { origin: "http://localhost:3000", [CSRF_HEADER]: "1" }),
+    },
+    ...(safe ? {} : { payload: (body ?? {}) as object }),
+  });
+}
+
+/** Runs every admin row for every caller. Returns the mismatches. */
+export async function runAdminMatrix(f: Family, rows: AdminRow[]): Promise<string[]> {
+  const failures: string[] = [];
+  for (const row of rows)
+    for (const who of Object.keys(row.expect) as Who[]) {
+      const got = (await sendAs(f, who, row.route, row.body)).statusCode;
+      if (got !== row.expect[who])
+        failures.push(`${row.route} as ${who}: expected ${row.expect[who]}, got ${got}`);
+    }
+  return failures;
+}
+
 const LOCAL = { host: "localhost:3000" };
 const PW = "matrix-password-1";
 

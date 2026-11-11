@@ -7,12 +7,16 @@ import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { openSse } from "../src/sse.js";
 import {
+  ADMIN_MATRIX,
+  ADMIN_MATRIX_PREFIXES,
   APP_MATRIX,
   OWNER_ONLY,
   READ,
   USAGE,
   createFamily,
+  runAdminMatrix,
   runMatrix,
+  sendAs,
   type MatrixRow,
 } from "./helpers/permission-matrix.js";
 
@@ -241,6 +245,39 @@ describe("resource routes", () => {
     const declared = app.resources.routes.map((r) => `${r.method} ${r.url}`).sort();
     expect(declared).toEqual(APP_MATRIX.map((r) => r.route).sort());
     expect(await runMatrix(await createFamily(app), APP_MATRIX)).toEqual([]);
+  });
+});
+
+describe("admin-only routes", () => {
+  it("every admin route of the real app refuses members (the son too) with 403 and anonymous callers with 401", async () => {
+    const app = await newApp();
+    await app.ready();
+    const f = await createFamily(app);
+    const routes = app.resources.adminRoutes.map((r) => `${r.method} ${r.url}`);
+    expect(routes.length).toBeGreaterThan(10);
+    const failures: string[] = [];
+    for (const route of routes)
+      for (const [who, want] of [
+        ["owner", 403],
+        ["shared", 403],
+        ["stranger", 403],
+        ["anon", 401],
+      ] as const) {
+        const got = (await sendAs(f, who, route)).statusCode;
+        if (got !== want) failures.push(`${route} as ${who}: expected ${want}, got ${got}`);
+      }
+    expect(failures).toEqual([]);
+  });
+
+  it("every usage admin route has a row, and the admin gets its data (#32)", async () => {
+    const app = await newApp();
+    await app.ready();
+    const declared = app.resources.adminRoutes
+      .filter((r) => ADMIN_MATRIX_PREFIXES.some((p) => r.url === p || r.url.startsWith(`${p}/`)))
+      .map((r) => `${r.method} ${r.url}`)
+      .sort();
+    expect(declared).toEqual(ADMIN_MATRIX.map((r) => r.route).sort());
+    expect(await runAdminMatrix(await createFamily(app), ADMIN_MATRIX)).toEqual([]);
   });
 });
 
