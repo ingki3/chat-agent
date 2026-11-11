@@ -144,8 +144,10 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
         // until they are flushed; an upstream error, or a client that never drains, ends it at once / in time.
         if (hadError || client.destroyed || client.writableFinished) return void client.destroy();
         client.end();
+        const flushTimer = setTimeout(() => client.destroy(), FLUSH_MS);
+        flushTimer.unref();
         client.once("finish", () => client.destroy());
-        setTimeout(() => client.destroy(), FLUSH_MS).unref();
+        client.once("close", () => clearTimeout(flushTimer));
       });
       upstream.on("error", () => {
         clearTimeout(timer);
