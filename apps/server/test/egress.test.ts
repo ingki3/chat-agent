@@ -187,6 +187,7 @@ describe("egress proxy (#15, review #80)", () => {
     closers.push(() => p.close());
     const req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n";
     await send(p.port, req); // takes the only slot
+    // 503 (over the cap), 403 (not allowed); 502 is covered by a proxy whose lookup fails, below.
     for (const r of [req, "CONNECT evil.example:443 HTTP/1.1\r\n\r\n"]) {
       // allowHalfOpen: this client never ends its side; only the server can close the socket.
       const sock = net.connect({ host: "127.0.0.1", port: p.port, allowHalfOpen: true }, () => sock.write(r));
@@ -206,6 +207,32 @@ describe("egress proxy (#15, review #80)", () => {
       });
       expect(await closed, r).toBe(true);
     }
+  });
+
+  it("closes a 502-refused socket even when the client keeps its side open", async () => {
+    const p = await startEgressProxy({
+      allow: ["api.anthropic.com"],
+      lookup: async () => {
+        throw new Error("ENOTFOUND");
+      },
+    });
+    closers.push(() => p.close());
+    const sock = net.connect({ host: "127.0.0.1", port: p.port, allowHalfOpen: true }, () =>
+      sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n"),
+    );
+    closers.push(async () => sock.destroy());
+    sock.on("error", () => {});
+    const closed = await new Promise<boolean>((res) => {
+      sock.once("close", () => res(true));
+      const tick = setInterval(() => {
+        if (!sock.destroyed) sock.write("x");
+      }, 100);
+      setTimeout(() => {
+        clearInterval(tick);
+        res(false);
+      }, 2500);
+    });
+    expect(closed).toBe(true);
   });
 
   it("listens on loopback only", async () => {
