@@ -20,6 +20,7 @@ import {
   type CodexAdapterOptions,
 } from "../src/runtime/codex.js";
 import { codexConnectionFor } from "../src/runtime/codex-config.js";
+import { CODEX_NOTIFICATION_SCOPE } from "../src/runtime/codex-protocol.js";
 import { CODEX_BUILTIN_TOOLS, CODEX_DISABLED_FEATURES } from "../src/runtime/lockdown.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
 import { CODEX_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
@@ -243,16 +244,100 @@ describe("Codex adapter (#16): event translation", () => {
     expect(interrupts(log)).toBe(1);
   });
 
-  it("another MCP server at session start fails the session (runtime_policy)", async () => {
-    const startup = (name: string) => ({
-      method: "mcpServer/startupStatus/updated",
-      params: { threadId: "x", name, status: "ready" },
-    });
-    const ok = adapter({}, { replay: { atStart: [startup("agentlee")] } });
+  const status = (name: string, threadId: string | null) => ({
+    method: "mcpServer/startupStatus/updated",
+    params: { threadId, name, status: "ready", error: null, failureReason: null },
+  });
+  const threadStarted = (id: string) => ({ method: "thread/started", params: { thread: { id, turns: [] } } });
+
+  it("another MCP server, or another thread, while the session opens fails it (runtime_policy)", async () => {
+    // Ours, globally (threadId null) or on our thread, and our own thread/started: fine.
+    const ok = adapter(
+      {},
+      {
+        replay: {
+          atStart: [status("agentlee", null)],
+          afterOpen: [threadStarted(cx.threadId), status("agentlee", cx.threadId), status("agentlee", null)],
+        },
+      },
+    );
     await expect(ok.a.start(ctx())).resolves.toBeDefined();
-    const bad = adapter({}, { replay: { atStart: [startup("agentlee"), startup("claude.ai Gmail")] } });
-    await expect(bad.a.start(ctx())).rejects.toMatchObject({ code: "runtime_policy" });
-    expect(bad.log.kills).toBe(1);
+    for (const replay of [
+      { atStart: [status("agentlee", null), status("claude.ai Gmail", null)] },
+      { afterOpen: [status("claude.ai Gmail", cx.threadId)] },
+      { atStart: [threadStarted("01a1c86a-0000-7000-8000-00000000beef")] }, // a thread before ours: not ours
+      { afterOpen: [threadStarted("01a1c86a-0000-7000-8000-00000000beef")] },
+      { afterOpen: [status("agentlee", "01a1c86a-0000-7000-8000-00000000beef")] },
+    ]) {
+      const bad = adapter({}, { replay });
+      await expect(bad.a.start(ctx()), JSON.stringify(replay)).rejects.toMatchObject({
+        code: "runtime_policy",
+      });
+      expect(bad.log.kills).toBe(1);
+    }
+  });
+
+  it("an MCP server that joins during a turn stops it at once (runtime_policy, interrupted)", async () => {
+    for (const late of [status("claude.ai Gmail", null), status("claude.ai Gmail", cx.threadId)]) {
+      const { done, seen, log } = await run({
+        threadId: cx.threadId,
+        turnId: cx.turnId,
+        messages: [cx.delta("a "), late, cx.delta("never "), cx.completed("completed")],
+        interruptAt: 2,
+      });
+      await expect(done).rejects.toMatchObject({ code: "runtime_policy" });
+      expect(seen).not.toContainEqual({ type: "text_delta", text: "never " });
+      expect(interrupts(log)).toBe(1);
+    }
+  });
+
+  it("an MCP server that joins between turns closes the session: the next turn fails closed", async () => {
+    const { a, log } = adapter(
+      { x: cx.answer("ok "), y: cx.answer("never ") },
+      { replay: { afterTurn: [status("claude.ai Gmail", null)] } },
+    );
+    const s = await a.start(ctx());
+    await collect(s.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(log.kills).toBe(1);
+    expect(() => s.turn({ text: "y", model: "gpt-6.1-sol" })).toThrow(
+      expect.objectContaining({ code: "runtime_policy" }),
+    );
+  });
+
+  it("notification shapes of 0.165.0: thread ids read where each type keeps them; null = global", async () => {
+    const other = "01a1c86a-0000-7000-8000-00000000beef";
+    const fine = [
+      threadStarted(cx.threadId),
+      status("agentlee", null),
+      status("agentlee", cx.threadId),
+      { method: "warning", params: { threadId: null, message: "x" } },
+      { method: "account/rateLimits/updated", params: { rateLimits: {} } },
+      { method: "thread/status/changed", params: { threadId: cx.threadId, status: { type: "active" } } },
+    ];
+    const { done, seen } = await run([...fine, cx.delta("ok"), cx.completed("completed")]);
+    await done;
+    expect(seen).toEqual([{ type: "text_delta", text: "ok" }]);
+    const refused = [
+      threadStarted(other), // the id is in params.thread.id
+      { method: "warning", params: { threadId: other, message: "x" } },
+      { method: "thread/status/changed", params: { threadId: other, status: { type: "active" } } },
+      status("agentlee", other),
+      { method: "item/agentMessage/delta", params: { turnId: cx.turnId, delta: "x" } }, // threadId missing
+      { method: "thread/started", params: {} },
+      { method: "brand/new/notification", params: {} }, // not in the pinned protocol
+      { method: "process/outputDelta", params: { processId: "p", delta: "x" } },
+    ];
+    for (const m of refused) {
+      const r = await run({
+        threadId: cx.threadId,
+        turnId: cx.turnId,
+        messages: [m, cx.delta("never "), cx.completed("completed")],
+        interruptAt: 1,
+      });
+      await expect(r.done, JSON.stringify(m)).rejects.toMatchObject({ code: "runtime_policy" });
+      expect(r.seen).toEqual([]);
+    }
   });
 
   it("usage limits end the turn as a limit; a refused credential fails at once as runtime_auth; other errors fail", async () => {
@@ -770,6 +855,45 @@ describe.skipIf(!realBin)("Codex adapter (#16): the pinned binary in the sandbox
         expect(Object.keys(c)).toContain(k);
     }
   }, 30_000);
+
+  it("the notification table matches the protocol bindings the pinned binary generates", async () => {
+    const out = tmp();
+    const r = await runIsolated({
+      command: realBin!,
+      args: ["app-server", "generate-ts", "--out", out],
+      cwd: out,
+      env: { PATH: "/usr/bin:/bin", HOME: out, CODEX_HOME: out },
+      read: [out],
+      write: [out],
+      network: "none",
+      timeoutMs: 30_000,
+      maxOutputBytes: 1024 * 1024,
+    });
+    expect(r.code).toBe(0);
+    const union = fs.readFileSync(path.join(out, "ServerNotification.ts"), "utf8");
+    const entries = [...union.matchAll(/"method": "([^"]+)", "params": (\w+)/g)].map((m) => [m[1]!, m[2]!]);
+    expect(entries.length).toBeGreaterThan(50);
+    const derived: Record<string, string> = {};
+    for (const [method, type] of entries) {
+      const file = [path.join(out, "v2", `${type}.ts`), path.join(out, `${type}.ts`)].find((f) =>
+        fs.existsSync(f),
+      )!;
+      const body = fs
+        .readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => !l.startsWith("//") && !l.startsWith("import"))
+        .join(" ");
+      derived[method] = /threadId: string \| null/.test(body)
+        ? "threadOrGlobal"
+        : /threadId: string/.test(body)
+          ? "thread"
+          : /\bthread: Thread\b/.test(body)
+            ? "threadObject"
+            : "global";
+    }
+    // On a mismatch, this is the table to put in src/runtime/codex-protocol.ts.
+    expect(CODEX_NOTIFICATION_SCOPE).toEqual(derived);
+  }, 60_000);
 
   /** The real binary, sandboxed, against a local fake Responses API and our real MCP server. */
   async function realRun(

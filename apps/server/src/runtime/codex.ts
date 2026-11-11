@@ -23,6 +23,7 @@ import {
   codexRunConfig,
   mcpLoopbackPort,
 } from "./lockdown.js";
+import { notificationThread } from "./codex-protocol.js";
 
 /**
  * Codex runtime (#16) through `codex app-server` (stdio JSON-RPC, pinned @openai/codex 0.165.0). One app-server
@@ -363,6 +364,22 @@ function isLimitError(info: unknown): boolean {
   return false;
 }
 
+/** Notifications naming an MCP server (`params.name`): only ours may appear. */
+const MCP_SERVER_NOTIFICATIONS = new Set([
+  "mcpServer/startupStatus/updated",
+  "mcpServer/oauthLogin/completed",
+]);
+/** Output of processes or commands — nothing of ours starts any, so these never belong to a session of ours. */
+const NEVER_NOTIFICATIONS = new Set([
+  "process/outputDelta",
+  "process/exited",
+  "command/exec/outputDelta",
+  "item/commandExecution/outputDelta",
+  "item/commandExecution/terminalInteraction",
+  "item/fileChange/outputDelta",
+  "item/fileChange/patchUpdated",
+]);
+
 /** Items that are only conversation: they produce no event of their own (text comes as deltas). */
 const QUIET_ITEMS = new Set(["userMessage", "agentMessage", "reasoning", "plan", "contextCompaction"]);
 
@@ -517,24 +534,46 @@ export class CodexAdapter implements RuntimeAdapter {
       }
     };
 
-    // Everything the app-server sends while a turn runs is routed to it; between turns it is checked only.
+    // Every message is checked first, whenever it comes — while the session opens, between turns, during a turn
+    // (`allowed`). What passes is routed to the running turn, if any.
     let onNotification: ((m: RpcMessage) => void) | undefined;
     let onEnd: (() => void) | undefined;
+    /** Set while a turn runs: stops it as runtime_policy. */
+    let onBreach: (() => void) | undefined;
     let policyBreach = false;
+    let opened = false;
     let threadId: string | undefined;
+    /** Thread ids seen before thread/start told us ours. */
+    const early = new Set<string>();
+    const allowed = (m: RpcMessage): boolean => {
+      const method = String(m.method);
+      // A server other than ours (the config has only ours; account connectors could join late, review #80).
+      if (MCP_SERVER_NOTIFICATIONS.has(method) && m.params?.name !== AGENTLEE_MCP) return false;
+      if (NEVER_NOTIFICATIONS.has(method)) return false;
+      const t = notificationThread(method, m.params);
+      if (t === "unknown" || t === "malformed") return false; // not in the pinned protocol: fail closed
+      if (t === "global") return true;
+      if (threadId === undefined) early.add(t.thread);
+      else if (t.thread !== threadId) return false; // another thread (a sub-agent)
+      return true;
+    };
+    /**
+     * Something we do not allow: during a turn it is stopped at once; between turns the session is closed (the
+     * next turn fails closed); while opening, the open fails.
+     */
+    const breach = () => {
+      policyBreach = true;
+      if (onBreach) onBreach();
+      else if (opened) kill();
+    };
     const rpc = new Rpc(
       child,
       {
         notification: (m) => {
-          // A server other than ours (the config has only ours, so this would be a leak): fail closed.
-          if (m.method === "mcpServer/startupStatus/updated" && m.params?.name !== AGENTLEE_MCP)
-            policyBreach = true;
+          if (!allowed(m)) return breach();
           onNotification?.(m);
         },
-        serverRequest: () => {
-          policyBreach = true;
-          onNotification?.({ method: "agentlee/serverRequest" });
-        },
+        serverRequest: () => breach(),
         exit: () => onEnd?.(),
       },
       this.opts.requestTimeoutMs ?? 30_000,
@@ -560,12 +599,15 @@ export class CodexAdapter implements RuntimeAdapter {
           developerInstructions: meta.history || null,
           ephemeral: false,
         });
-        threadId = (r.thread as { id?: unknown } | undefined)?.id as string | undefined;
-        if (typeof threadId !== "string" || !/^[0-9a-f-]{36}$/.test(threadId))
+        const started = (r.thread as { id?: unknown } | undefined)?.id;
+        if (typeof started !== "string" || !/^[0-9a-f-]{36}$/.test(started))
           throw new RuntimeFailure("runtime_error");
+        threadId = started;
+        if ([...early].some((t) => t !== started)) policyBreach = true;
         writeMeta(conn.dir, threadId, meta);
       } else {
         meta = readMeta(conn.dir, resumeId)!;
+        threadId = resumeId;
         try {
           await rpc.request("thread/resume", {
             threadId: resumeId,
@@ -579,9 +621,9 @@ export class CodexAdapter implements RuntimeAdapter {
         } catch (e) {
           throw e instanceof RpcError ? new SessionGoneError() : e;
         }
-        threadId = resumeId;
       }
       if (policyBreach) throw new RuntimeFailure("runtime_policy");
+      opened = true;
     } catch (e) {
       kill();
       if (e instanceof RpcError)
@@ -603,10 +645,11 @@ export class CodexAdapter implements RuntimeAdapter {
         kill();
       },
       turn: (input): RuntimeTurn => {
+        if (policyBreach) throw new RuntimeFailure("runtime_policy"); // seen between turns: closed already
         if (closed || rpc.exited) throw new Error("session closed");
         const cap = this.checkModel(input.model, input.effort);
         model = input.model;
-        const allowed = new Set(tools);
+        const runTools = new Set(tools);
         const queue: RuntimeEvent[] = [];
         let wake: (() => void) | undefined;
         let done = false;
@@ -626,6 +669,7 @@ export class CodexAdapter implements RuntimeAdapter {
           done = true;
           onNotification = undefined;
           onEnd = undefined;
+          onBreach = undefined;
           wake?.();
         };
         const stop = () => {
@@ -639,11 +683,10 @@ export class CodexAdapter implements RuntimeAdapter {
         const num = (o: Json, k: string) => (typeof o[k] === "number" ? o[k] : 0);
 
         onEnd = () => end(interrupted ? undefined : new RuntimeFailure("runtime_error"));
+        onBreach = refuse;
         onNotification = (m) => {
           if (done) return;
-          if (m.method === "agentlee/serverRequest") return refuse();
           const p = m.params ?? {};
-          if (p.threadId !== undefined && p.threadId !== id) return refuse(); // another thread (a sub-agent)
           if (turnId && p.turnId !== undefined && p.turnId !== turnId) return;
           switch (m.method) {
             case "item/agentMessage/delta":
@@ -660,7 +703,7 @@ export class CodexAdapter implements RuntimeAdapter {
               if (QUIET_ITEMS.has(type)) return;
               // Only the run's own tools of our server. Anything else — a built-in (`codex` server), another
               // server, a command, a sub-agent, a web search — stops the turn before its result is used.
-              if (type !== "mcpToolCall" || item.server !== AGENTLEE_MCP || !allowed.has(String(item.tool)))
+              if (type !== "mcpToolCall" || item.server !== AGENTLEE_MCP || !runTools.has(String(item.tool)))
                 return refuse();
               const callId = String(item.id);
               if (m.method === "item/started")
@@ -755,7 +798,6 @@ export class CodexAdapter implements RuntimeAdapter {
             if (interrupted || failure) stop(); // asked before codex told us the turn id
           })
           .catch(() => end(interrupted ? undefined : new RuntimeFailure("runtime_error")));
-        if (policyBreach) refuse();
 
         async function* events(): AsyncGenerator<RuntimeEvent> {
           try {

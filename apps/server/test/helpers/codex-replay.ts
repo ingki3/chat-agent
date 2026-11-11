@@ -58,7 +58,16 @@ const uuid = () => {
 export function replaySpawn(
   rec: Recording,
   log: ReplayLog,
-  o: { delayMs?: number; atStart?: Json[]; serverRequestAt?: { prompt: string; method: string } } = {},
+  o: {
+    delayMs?: number;
+    /** Sent right after `initialize` (before any thread exists). */
+    atStart?: Json[];
+    /** Sent right after the thread opened (`rec-thread` becomes the replay's thread id). */
+    afterOpen?: Json[];
+    /** Sent once a turn's recording has played out, before anything else (between turns). */
+    afterTurn?: Json[];
+    serverRequestAt?: { prompt: string; method: string };
+  } = {},
 ): (s: SpawnIsolatedOptions) => CodexChild {
   return (s) => {
     log.spawns.push(s);
@@ -89,12 +98,20 @@ export function replaySpawn(
       if (p.i >= p.turn.messages.length) {
         playing = undefined;
         if (p.turn.exited) exit();
+        else for (const n of o.afterTurn ?? []) send(ours(n));
         return;
       }
       const m = rewrite(p.turn.messages[p.i++]!, p.turn, p.turnId);
       send(m);
       setTimeout(play, o.delayMs ?? 2);
     };
+    /** A hand-made message with our placeholder thread id made the replay's own. */
+    const ours = (m: Json): Json =>
+      JSON.parse(
+        JSON.stringify(m)
+          .split(T)
+          .join(threadId ?? T),
+      ) as Json;
     let buf = "";
     const dec = new StringDecoder("utf8");
     stdin.on("data", (d: Buffer) => {
@@ -123,6 +140,7 @@ export function replaySpawn(
             fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(path.join(dir, `rollout-2026-11-11T00-00-00-${threadId}.jsonl`), "{}\n");
             reply({ thread: { id: threadId }, model: m.params?.model });
+            for (const n of o.afterOpen ?? []) send(ours(n));
             break;
           }
           case "thread/resume": {
@@ -131,6 +149,7 @@ export function replaySpawn(
             if (fs.existsSync(path.join(dir, `rollout-2026-11-11T00-00-00-${id}.jsonl`))) {
               threadId = id;
               reply({ thread: { id }, model: m.params?.model });
+              for (const n of o.afterOpen ?? []) send(ours(n));
             } else fail();
             break;
           }

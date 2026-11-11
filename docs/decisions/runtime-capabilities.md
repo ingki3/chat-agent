@@ -97,6 +97,7 @@
 | TLS | CA 파일 필요 | **실행** 샌드박스 안에서는 플랫폼 인증서 검증이 trustd에 닿지 못해 `invalid peer certificate: UnknownIssuer`. `CODEX_CA_CERTIFICATE=/private/etc/ssl/cert.pem`(읽기 허용)로 해결 |
 | fork | 없음 | **실행** 위 설정으로 시작·MCP 호출·중단·재개 모두 fork 없이 동작. 단 `shell_snapshot`(기본 켜짐)은 사용자 셸을 띄워 환경 변수를 `shell_snapshots/`에 저장한다(샌드박스 밖 시험에서 환경 변수의 키가 파일에 남는 것을 확인) → 끈다 |
 | 프롬프트 확장 | `$스킬`만 있음 → 막음 | **실행** `@파일`·`/명령`·`!명령`은 글자 그대로 간다. **`$이름`은 SKILL.md를 읽어 프롬프트에 붙인다.** `skills.include_instructions = false`, 내장 스킬 끄기로도 꺼지지 않는다. 찾는 곳: `CODEX_HOME/skills`, `HOME/.agents/skills`, cwd의 `.agents/skills`·`.codex/skills`. 또 `CODEX_HOME/AGENTS.md`는 `project_doc_max_bytes = 0`이어도 읽힌다. 대응: 시작마다 이 파일들을 지우고, 프로세스는 `work`·`home`에 쓸 수 없게 한다(아래 isolation.md) |
+| 알림의 thread 표시 | 형태가 여러 가지 | **바인딩** `generate-ts`(0.165.0): 대부분 `params.threadId`(문자열). `mcpServer/startupStatus/updated`·`oauthLogin/completed`·`warning`은 `string \| null`(null = 전역). `thread/started`는 `params.thread.id`. 계정·속도 제한 등은 thread 없음. 표는 `apps/server/src/runtime/codex-protocol.ts` |
 | 도구 실행 중 중단 | 지원 | **실행** 우리 MCP 도구가 20초 걸리는 동안 `turn/interrupt` → 수 ms 안에 `turn/completed status: interrupted`. 그 도구의 `item/completed`는 오지 않는다 |
 | 재개 | 지원 | **실행** 새 프로세스에서 `thread/resume` → 이전 턴 내용이 요청에 포함, 시작 때의 developer 지시(이전 대화)는 한 번만. 없는 thread id는 오류 응답 → `SessionGoneError` |
 | 한도 | 지원 | **실행**(가짜 API) 사용 한도 429 → `codexErrorInfo: "usageLimitExceeded"`, `willRetry: false`. 속도 제한 429 → `responseTooManyFailedAttempts{429}`. 스냅샷의 `rateLimitReachedType`. 어댑터는 실패한 턴만 `limit`으로 본다 |
