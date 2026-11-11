@@ -932,6 +932,20 @@ describe("finance output check (#30)", () => {
     expect(check("삼성전자 20만 6000원 (네이버 증권 11월 12일 10:14 KST 장중).", both)).toEqual([]);
   });
 
+  it("a leading sign applies to the whole compound amount (review #93 round 4)", () => {
+    expect(figuresOf("-1만 2천원").map((f) => f.n)).toEqual([-12000]);
+    expect(figuresOf("-1억 2천만원").map((f) => f.n)).toEqual([-120000000]);
+    expect(figuresOf("-1억 2,300만 4,000원").map((f) => f.n)).toEqual([-123004000]);
+    expect(figuresOf("-1만 2천원")[0]!.tolerance).toBe(500);
+    // Codex example: Naver's intraday change -12,000 written as -1만 2천원 and cited to Yahoo.
+    const change = [
+      finalize("us_quote", { symbol: "AAPL", price: { value: 349.8, ...yahoo } }),
+      finalize("kr_quote", { code: "005930", change: { value: -12000, ...live } }),
+    ];
+    expect(check("전일 대비 -1만 2천원 (Yahoo Finance 2026-11-13).", change)).toEqual(["source", "as_of"]);
+    expect(check("전일 대비 -1.2만원 (Yahoo Finance 2026-11-13).", change)).toEqual(["source", "as_of"]);
+  });
+
   it("magnitude units are normalised before values are matched (review #93 round 2)", () => {
     const yahooOut = finalize("us_quote", { symbol: "AAPL", price: { value: 349.8, ...yahoo } });
     const naverLive = finalize("kr_quote", { code: "005930", price: { value: 206000, ...live } });

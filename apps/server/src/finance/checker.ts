@@ -282,7 +282,8 @@ export function figuresOf(text: string, identifiers: readonly string[] = []): Fi
         next.n < 0
       )
         break;
-      n += next.n;
+      // A leading sign applies to the whole amount: -1만 2천원 is -12,000, not -8,000.
+      n += head.n < 0 ? -next.n : next.n;
       last = next;
       j++;
     }
