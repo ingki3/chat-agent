@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import {
   startMcpServer,
   toolNames,
@@ -28,27 +27,31 @@ export const DEFAULT_SKILL_LIMITS: SkillLimits = {
 };
 
 /**
- * A bundled skill as a sandboxed node process: reads only its own folder (and node itself), writes nothing,
- * no network, no child processes, empty environment. Input on stdin, JSON result on stdout.
+ * Sandbox policy of a bundled skill: reads its own folder only — node itself is readable as the executable
+ * (`process-exec` literal), nothing else of its install. Writes nothing, no network, no child processes, empty
+ * environment. Needs a self-contained node binary (official builds link only system libraries); a node that
+ * loads libraries from elsewhere fails closed (`skill_failed`).
  */
+export function skillPolicy(skill: BundledSkill, node = fs.realpathSync(process.execPath)) {
+  return {
+    command: node,
+    args: [skill.entry],
+    cwd: skill.dir,
+    env: {} as Record<string, string>,
+    read: [skill.dir],
+    trusted: [] as string[],
+    write: [] as string[],
+    network: "none" as const,
+  };
+}
+
+/** Runs a bundled skill under `skillPolicy`. Input on stdin, JSON result on stdout. */
 export function sandboxedSkillRunner(limits: SkillLimits = DEFAULT_SKILL_LIMITS): SkillRunner {
   const node = fs.realpathSync(process.execPath);
-  const nodeHome = path.dirname(path.dirname(node));
   return async (skill, input) => {
     let r;
     try {
-      r = await runIsolated({
-        command: node,
-        args: [skill.entry],
-        cwd: skill.dir,
-        env: {},
-        read: [skill.dir],
-        trusted: [nodeHome],
-        write: [],
-        network: "none",
-        stdin: JSON.stringify(input),
-        ...limits,
-      });
+      r = await runIsolated({ ...skillPolicy(skill, node), stdin: JSON.stringify(input), ...limits });
     } catch {
       return { ok: false, code: "skill_unavailable" }; // no sandbox here (not macOS), hard links, spawn failure
     }
@@ -63,7 +66,12 @@ export function sandboxedSkillRunner(limits: SkillLimits = DEFAULT_SKILL_LIMITS)
   };
 }
 
+/** At most this many skill processes at once — in total and per run. Beyond that a call is refused at once. */
+export type SkillConcurrency = { total: number; perRun: number };
+export const DEFAULT_SKILL_CONCURRENCY: SkillConcurrency = { total: 4, perRun: 2 };
+
 export type McpServiceOptions = {
+  concurrency?: SkillConcurrency;
   /** Allow-list of skills offered as tools. Default: the bundled ones. */
   skills?: readonly BundledSkill[];
   runSkill?: SkillRunner;
@@ -81,6 +89,8 @@ export class McpService {
   private running: Promise<RunningMcpServer> | undefined;
   private closed = false;
   private readonly skills: readonly BundledSkill[];
+  private active = 0;
+  private readonly activeByRun = new Map<string, number>();
 
   constructor(
     private readonly tokens: McpTokens,
@@ -112,7 +122,20 @@ export class McpService {
       runSkill: async (name, input, scope) => {
         const skill = byName.get(name);
         if (!skill) return { ok: false, code: "skill_not_allowed" };
-        return runSkill(skill, input, scope);
+        // Each call is a process: cap them so one batch or one runtime cannot exhaust the machine.
+        const limit = this.opts.concurrency ?? DEFAULT_SKILL_CONCURRENCY;
+        const mine = this.activeByRun.get(scope.runId) ?? 0;
+        if (this.active >= limit.total || mine >= limit.perRun) return { ok: false, code: "skill_busy" };
+        this.active++;
+        this.activeByRun.set(scope.runId, mine + 1);
+        try {
+          return await runSkill(skill, input, scope);
+        } finally {
+          this.active--;
+          const left = (this.activeByRun.get(scope.runId) ?? 1) - 1;
+          if (left > 0) this.activeByRun.set(scope.runId, left);
+          else this.activeByRun.delete(scope.runId);
+        }
       },
       ...(this.opts.now ? { now: this.opts.now } : {}),
       ...(this.opts.timeZone ? { timeZone: this.opts.timeZone } : {}),

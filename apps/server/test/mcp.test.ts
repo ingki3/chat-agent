@@ -9,7 +9,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { McpTokens } from "../src/isolation/tokens.js";
-import { McpService, sandboxedSkillRunner, type SkillRunner } from "../src/mcp/service.js";
+import { McpService, sandboxedSkillRunner, skillPolicy, type SkillRunner } from "../src/mcp/service.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
@@ -27,7 +27,9 @@ afterEach(async () => {
 });
 
 type User = { id: string; name: string; active: boolean };
-function setup(opts: { runSkill?: SkillRunner; users?: User[] } = {}) {
+function setup(
+  opts: { runSkill?: SkillRunner; users?: User[]; concurrency?: { total: number; perRun: number } } = {},
+) {
   const users = new Map((opts.users ?? [{ id: "u-mom", name: "엄마", active: true }]).map((u) => [u.id, u]));
   const tokens = new McpTokens();
   const svc = new McpService(
@@ -37,6 +39,7 @@ function setup(opts: { runSkill?: SkillRunner; users?: User[] } = {}) {
       now: () => new Date("2026-11-11T03:04:05Z"),
       timeZone: "Asia/Seoul",
       ...(opts.runSkill ? { runSkill: opts.runSkill } : {}),
+      ...(opts.concurrency ? { concurrency: opts.concurrency } : {}),
     },
   );
   closers.push(() => svc.close());
@@ -254,6 +257,84 @@ describe("common MCP server (#43)", () => {
     expect(textOf(r)).toEqual({ error: "unauthorized" });
   });
 
+  it("a skill runs with the calling token's own scope (user, conversation, run)", async () => {
+    const scopes: unknown[] = [];
+    const { svc, issue } = setup({
+      users: [
+        { id: "u-mom", name: "엄마", active: true },
+        { id: "u-son", name: "아들", active: true },
+      ],
+      runSkill: async (_s, _i, scope) => {
+        scopes.push(scope);
+        return { ok: true, output: {} };
+      },
+    });
+    const { url } = await svc.endpoint();
+    await (
+      await connect(url, issue("u-son", "r2", "c2"))
+    ).callTool({ name: "skill_selftest", arguments: { text: "a" } });
+    await (
+      await connect(url, issue("u-mom", "r1", "c1"))
+    ).callTool({ name: "skill_selftest", arguments: { text: "b" } });
+    expect(scopes).toEqual([
+      { userId: "u-son", conversationId: "c2", runId: "r2" },
+      { userId: "u-mom", conversationId: "c1", runId: "r1" },
+    ]);
+  });
+
+  it("caps concurrent skill processes per run and in total; refused calls never start one", async () => {
+    let running = 0;
+    let release!: () => void;
+    let gate = new Promise<void>((r) => (release = r));
+    const { svc, issue } = setup({
+      concurrency: { total: 3, perRun: 2 },
+      runSkill: async () => {
+        running++;
+        await gate;
+        running--;
+        return { ok: true, output: { done: true } };
+      },
+    });
+    const { url } = await svc.endpoint();
+    const r1 = await connect(url, issue("u-mom", "r1"));
+    const r2 = await connect(url, issue("u-mom", "r2", "c2"));
+    const call = (c: Client) =>
+      c.callTool({ name: "skill_selftest", arguments: { text: "x" } }) as Promise<unknown>;
+    const busy = (r: unknown) =>
+      (r as { isError?: boolean }).isError === true && textOf(r).error === "skill_busy";
+    const first = [call(r1), call(r1)];
+    for (let i = 0; running < 2; i++) {
+      if (i === 100) throw new Error(`stuck at running=${running}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(busy(await call(r1))).toBe(true); // per run
+    const third = call(r2);
+    for (let i = 0; running < 3; i++) {
+      if (i === 100) throw new Error(`stuck at running=${running} (2)`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(busy(await call(r2))).toBe(true); // total
+    expect(running).toBe(3);
+    release();
+    for (const r of await Promise.all([...first, third])) expect(textOf(r)).toEqual({ done: true });
+    gate = new Promise<void>((r) => (release = r));
+    release();
+    expect(textOf(await call(r1))).toEqual({ done: true }); // slots are given back
+  });
+
+  it("skill policy: its own folder only, no node install folder, no writes, no network", () => {
+    const p = skillPolicy(SELFTEST_SKILL, "/opt/node/bin/node");
+    expect(p).toMatchObject({
+      command: "/opt/node/bin/node",
+      args: [SELFTEST_SKILL.entry],
+      read: [SELFTEST_SKILL.dir],
+      trusted: [],
+      write: [],
+      network: "none",
+      env: {},
+    });
+  });
+
   it("validates skill input before starting the skill", async () => {
     let calls = 0;
     const { svc, issue } = setup({
@@ -314,11 +395,29 @@ describe("common MCP server (#43)", () => {
           `import fs from "node:fs";let r;try{r=fs.readFileSync(${secret},"utf8")}catch(e){r="ERR "+e.code}process.stdout.write(JSON.stringify({r}))`,
         ),
       ).toMatch(/^ERR/);
+      // A server that really answers: reachable from here, not from the skill.
+      const target = http.createServer((_q, res) => res.end("OPEN"));
+      await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+      closers.push(() => new Promise((r) => target.close(r)));
+      const tport = (target.address() as import("node:net").AddressInfo).port;
+      expect(await (await fetch(`http://127.0.0.1:${tport}/`)).text()).toBe("OPEN");
       expect(
         await out(
-          `fetch("http://127.0.0.1:9/").then(()=>"OPEN",e=>"ERR "+(e.cause?.code??e.message)).then(r=>process.stdout.write(JSON.stringify({r})))`,
+          `fetch("http://127.0.0.1:${tport}/").then(r=>r.text(),e=>"ERR "+(e.cause?.code??e.message)).then(r=>process.stdout.write(JSON.stringify({r})))`,
         ),
       ).toMatch(/^ERR/);
+      // node's own install folder is not readable (only the executable itself).
+      const nodeHome = path.dirname(path.dirname(fs.realpathSync(process.execPath)));
+      const readme = fs.readdirSync(nodeHome).find((n) => fs.statSync(path.join(nodeHome, n)).isFile());
+      if (readme) {
+        const file = JSON.stringify(path.join(nodeHome, readme));
+        expect(fs.readFileSync(path.join(nodeHome, readme)).length).toBeGreaterThan(0);
+        expect(
+          await out(
+            `import fs from "node:fs";let r;try{fs.readFileSync(${file});r="READ"}catch(e){r="ERR "+e.code}process.stdout.write(JSON.stringify({r}))`,
+          ),
+        ).toMatch(/^ERR/);
+      }
       expect(
         await out(
           `import cp from "node:child_process";let r;try{cp.execFileSync("/bin/echo",["x"]);r="SPAWNED"}catch(e){r="ERR "+(e.code??e.message)}process.stdout.write(JSON.stringify({r}))`,

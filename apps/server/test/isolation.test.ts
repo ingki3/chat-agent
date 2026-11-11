@@ -564,8 +564,11 @@ describe("runtime lockdown settings", () => {
       expect(await hook({ tool_name: name }), name).toMatchObject({
         hookSpecificOutput: { permissionDecision: "deny" },
       });
-    expect(await hook({ tool_name: "mcp__agentlee__echo_time" })).toEqual({});
-    expect(preToolUse("mcp__agentlee__cite")).toEqual({});
+    for (const name of ["mcp__agentlee__echo_time", "mcp__agentlee__skill_selftest"])
+      expect(await hook({ tool_name: name }), name).toMatchObject({
+        hookSpecificOutput: { permissionDecision: "allow" },
+      });
+    expect(preToolUse("mcp__agentlee__cite").hookSpecificOutput.permissionDecision).toBe("allow");
   });
 
   it("Claude: a session with any other MCP server is refused", () => {

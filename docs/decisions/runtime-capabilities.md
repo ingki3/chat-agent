@@ -31,6 +31,7 @@
 | 중단 | 지원 | **실행** `interrupt()` 응답 6ms, 종료까지 583ms. 결과는 `error_during_execution` + 예외 (`claude-interrupt.json`). 어댑터는 **우리가 interrupt를 요청한 run만** "중지됨"으로 매핑하고, 그 밖의 `error_during_execution`은 실패로 처리 |
 | 추론 강도 | 수락만 확인 | **실행** Opus·Haiku 모두 `effort: low`·`max`를 오류 없이 수락하고 해당 모델이 응답 (`claude-effort.json`). 값이 실제 적용·무시·정규화되는지는 확인하지 않음 → 허용 범위는 우리 capability 표(관리자 설정 + 문서 근거)로 검증 |
 | MCP 연결 | 지원 | **실행** stdio MCP `echo_time` 호출 성공, MCP 프로세스에 run 토큰 전달(`runToken=present`) (`claude-stream.json`) |
+| MCP 연결 — 우리 HTTP 서버 (#43) | 지원 | **실행** 2026-11-11 `http-mcp-probe.mjs claude`: `{ type: "http", url, headers: { Authorization: "Bearer …" } }` → init `agentlee: connected`, 도구는 `mcp__agentlee__echo_time` 하나, 서버가 토큰 일치 확인, 응답에 사용자 이름. **`PreToolUse` 훅이 `{}`(결정 없음)만 돌려주면 SDK가 권한을 물어 호출이 실패**하므로, 훅은 우리 도구에 `permissionDecision: "allow"`를 명시한다 |
 | 내장 도구 차단 | 지원 — **방식 주의** | **실행** (`claude-gate.json`, `claude-lockdown*.json`): ① `tools: []` → 내장 도구가 목록에서 빠짐(`claude-lockdown.json` 실행에서는 도구가 `mcp__echo__echo_time` 하나뿐. 단 아래 "계정 커넥터" 행 참조) ② `disallowedTools: ["Bash"]` → 도구 자체가 사라짐 ③ `PreToolUse` 훅 → 읽기 전용 명령까지 모든 호출을 잡아 거부 ④ **`canUseTool`은 읽기 전용 명령(`echo`)에는 호출되지 않고 그대로 실행됨**(쓰기 명령 `touch`에만 호출) ⑤ `allowedTools`에 넣으면 자동 승인. → **`canUseTool`·`allowedTools`에 의존하지 않는다** |
 | claude.ai 계정 커넥터 노출 | **간헐 발생 — 차단 필요** | **실행** claude.ai 로그인 상태의 한 실행(`claude-stream.json`)에서 `settingSources: []`인데도 계정 커넥터(Claude Docs·Google Drive 연결됨, Gmail·Calendar 인증 필요)가 MCP로 붙고 도구 20여 개가 노출됨. 이후 같은 조건 9회(`claude-mcp-scope.json`, `claude-mcp-repeat.json`, `strictMcpConfig` 유무 각각)에서는 재현되지 않음. 대응: `strictMcpConfig: true` + `PreToolUse` 훅은 **우리 MCP 서버 이름만** 허용 + **세션 시작(init) 때 `mcp_servers` 목록이 우리 서버만이 아니면 즉시 중단(fail closed)**. 훅이 커넥터 호출을 실제로 막는지는 재현이 안 돼 미검증 → #15에서 가짜 MCP 서버로 시험 |
 | 사용자 설정 격리 | 지원 | **실행** `settingSources: []` → `~/.claude/CLAUDE.md` 미로딩(NO), `['user']`면 로딩(YES) (`claude-isolation.json`) |
@@ -48,6 +49,7 @@
 | 항목 | 판정 | 근거 |
 |---|---|---|
 | 토큰 단위 스트리밍 | 지원 | **실행** `item/agentMessage/delta` 48개, 첫 delta 약 2.7초 (`codex-appserver.json` turn1) |
+| MCP 호출 — 우리 HTTP 서버 (#43) | 지원 | **실행** 2026-11-11 `http-mcp-probe.mjs codex`(`codex exec`, 0.167.0): `mcp_servers.agentlee.url` + `bearer_token_env_var = "AGENTLEE_MCP_TOKEN"` + `default_tools_approval_mode = "approve"` → `mcp_tool_call agentlee/echo_time` 완료, 서버가 토큰 일치 확인. app-server·연결별 `CODEX_HOME`에서의 확인은 #16 |
 | MCP 호출(잠금 설정) | 지원 | **실행** features 끄기 + 사용자 MCP `node_repl` 끄기 설정에서 `mcpToolCall echo/echo_time: completed` (turn1). 같은 턴에 `~/.zshrc` 읽기를 요청했으나 **도구 호출 시도 자체가 관측되지 않았고** 모델이 "읽지 못했다"고만 답함 → 파일 접근 차단은 **접근 미관측**일 뿐 입증 아님. 또한 이 시험은 별도 `CODEX_HOME`이 아니라 기본 홈에서 사용자 MCP 하나만 끈 대용 설정 → **최종 격리 설정(연결별 `CODEX_HOME`)은 미검증**, #16·#42에서 로그인한 격리 홈으로 실행 검증 |
 | 턴 사이 모델 변경 | 지원 | **실행** 같은 thread에서 `turn/start {model: "gpt-6-astra"}` → 앞 턴 태그 `a1` 기억, 이후 `thread/resume` 응답 모델이 `gpt-6-astra` (turn2) |
 | 중단 | 지원 | **실행** delta 10개 후 `turn/interrupt` → 9ms 뒤 `turn/completed status: interrupted` (turn3). 도구 실행 중 중단은 미검증 → #16 |

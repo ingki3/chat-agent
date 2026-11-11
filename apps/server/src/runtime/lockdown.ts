@@ -25,27 +25,28 @@ export function mcpLoopbackPort(mcp: McpConnection): number {
   return Number(u.port);
 }
 
-export type PreToolUseResult =
-  | Record<string, never>
-  | {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse";
-        permissionDecision: "deny";
-        permissionDecisionReason: string;
-      };
-    };
+export type PreToolUseResult = {
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse";
+    permissionDecision: "allow" | "deny";
+    permissionDecisionReason: string;
+  };
+};
 
-/** Allows our MCP tools only. Everything else (Bash, Read, account connectors, …) is denied. */
+/**
+ * Allows our MCP tools — explicitly: without an "allow" the SDK asks for permission, and with nobody to ask the call
+ * fails (checked against the pinned SDK with our HTTP MCP server, #43). Everything else (Bash, Read, account
+ * connectors, …) is denied.
+ */
 export function preToolUse(toolName: string): PreToolUseResult {
-  return toolName.startsWith(OUR_TOOL_PREFIX)
-    ? {}
-    : {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "deny",
-          permissionDecisionReason: "Agent Lee: only Agent Lee tools are allowed",
-        },
-      };
+  const ours = toolName.startsWith(OUR_TOOL_PREFIX);
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: ours ? "allow" : "deny",
+      permissionDecisionReason: ours ? "Agent Lee tool" : "Agent Lee: only Agent Lee tools are allowed",
+    },
+  };
 }
 
 /**
