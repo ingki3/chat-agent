@@ -136,3 +136,20 @@ export const artifactRawPath = (id: string, version: number) =>
   `/a/${encodeURIComponent(id)}/v/${version}/raw`;
 export const artifactDownloadPath = (id: string, version: number) =>
   `/a/${encodeURIComponent(id)}/v/${version}/download`;
+
+/** PNG/PDF export (#51): which formats each kind exports to (pictures → PNG, documents → PDF). */
+export const ARTIFACT_EXPORT_FORMATS = ["png", "pdf"] as const;
+export type ArtifactExportFormat = (typeof ARTIFACT_EXPORT_FORMATS)[number];
+export const ARTIFACT_EXPORTS: Record<ArtifactKind, readonly ArtifactExportFormat[]> = {
+  chart: ["png", "pdf"],
+  svg: ["png"],
+  html: ["png", "pdf"],
+  table: ["pdf"],
+  markdown: ["pdf"],
+  code: ["pdf"],
+  // A generated file's own preview and conversion are #49/#22.
+  document: [],
+};
+/** Server-rendered export of one version (owner only, like the original). */
+export const artifactExportPath = (id: string, version: number, format: ArtifactExportFormat) =>
+  `/a/${encodeURIComponent(id)}/v/${version}/${format}`;

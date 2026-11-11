@@ -227,6 +227,11 @@ export type SpawnIsolatedOptions = SandboxPolicy & {
   maxStderrBytes?: number;
   /** Tests only: replaces the `ps` measurement used by the monitor. */
   probe?: () => Promise<{ pid: number; rss: number }[]>;
+  /**
+   * Extra pipes after stdin/stdout/stderr (fd 3, 4, …): e.g. Chrome's `--remote-debugging-pipe` reads fd 3 and
+   * writes fd 4 (#51), so the renderer is driven without a listening port.
+   */
+  extraPipes?: number;
 };
 
 /**
@@ -245,7 +250,7 @@ export function spawnIsolated(o: SpawnIsolatedOptions): ChildProcessWithoutNullS
     cwd: o.cwd,
     env: o.env,
     detached: true,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: Array<"pipe">(3 + (o.extraPipes ?? 0)).fill("pipe"),
   }) as ChildProcessWithoutNullStreams & { isolationKill?: "memory" | "monitor" };
   const pid = child.pid;
   let exited = false;

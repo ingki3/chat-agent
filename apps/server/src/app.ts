@@ -45,6 +45,8 @@ import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
 import { SourceStore } from "./web/sources.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
+import { findBrowser } from "./artifacts/browser.js";
+import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import type { Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
@@ -126,6 +128,11 @@ export type BuildOptions = {
   /** Login rate-limit/clock overrides (tests). */
   auth?: AuthRouteOptions;
   events?: AppEvents;
+  /**
+   * PNG/PDF export (#51). Default: the sandboxed browser found by `findBrowser` (none in the test environment —
+   * tests bring their own renderer).
+   */
+  renderer?: Pick<Renderer, "render">;
   /** Runtime adapters (tests pass FakeRuntime instances). Default: real adapters (#15/#16), FakeRuntime if FAKE_RUNTIME=1. */
   runtimes?: RuntimeRegistry;
   runs?: RunManagerOptions;
@@ -360,7 +367,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onClose", async () => logins.close());
     registerConnectionRoutes(app, connections, users, runtimes, logins);
     registerSourceRoutes(app, app.conversations!, sources);
-    registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url));
+    // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
+    let renderer = opts.renderer;
+    if (!renderer) {
+      const own = new Renderer({
+        browser: config.env === "test" ? undefined : findBrowser(config.exportBrowser),
+      });
+      app.addHook("onClose", async () => own.close());
+      renderer = own;
+    }
+    registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
 
     const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(

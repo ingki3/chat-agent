@@ -320,3 +320,82 @@ test("with the network, the allow-listed Chart.js loads (SRI checked) and draws"
   });
   expect(drawn).toBe(true);
 });
+
+/** PNG/PDF export (#51). The server renders only on macOS (process sandbox); elsewhere it refuses (503). */
+const SERVER_RENDERS = process.platform === "darwin";
+const CHART = JSON.stringify({
+  type: "bar",
+  title: "월별 매출",
+  labels: ["1월", "2월", "3월"],
+  series: [{ name: "매출", values: [3, 7, 5] }],
+});
+const head = async (path: string, n: number) => (await import("node:fs")).readFileSync(path).subarray(0, n);
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+test("chart PNG: drawn in the browser first, the server's isolated renderer only when that fails", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const { id } = await makeArtifact(page, baseURL!, "chart", "매출 차트", CHART);
+  const serverCalls: string[] = [];
+  page.on("request", (r) => {
+    if (/\/v\/1\/(png|pdf)$/.test(new URL(r.url()).pathname)) serverCalls.push(r.url());
+  });
+  await page.goto(`/a/${id}`);
+  await expect(page.getByTestId("artifact-export-png")).toBeVisible();
+
+  // 1) Client capture: a PNG, and the server renderer was not asked.
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByTestId("artifact-export-png").click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("매출 차트.png");
+  expect((await head((await download.path())!, 8)).equals(PNG_MAGIC)).toBe(true);
+  expect(serverCalls).toEqual([]);
+
+  // 2) Capture fails (the SVG cannot be fetched): the server renders instead.
+  await page.route(`**/a/${id}/v/1/download`, (route) => route.abort());
+  if (SERVER_RENDERS) {
+    const [again] = await Promise.all([
+      page.waitForEvent("download"),
+      page.getByTestId("artifact-export-png").click(),
+    ]);
+    expect((await head((await again.path())!, 8)).equals(PNG_MAGIC)).toBe(true);
+  } else {
+    await page.getByTestId("artifact-export-png").click();
+    await expect(page.getByTestId("artifact-export-error")).toBeVisible();
+  }
+  expect(serverCalls).toHaveLength(1);
+  expect(serverCalls[0]).toMatch(new RegExp(`/a/${id}/v/1/png$`));
+});
+
+test("document PDF from the isolated renderer; another family member gets 403 on the exports", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"></head><body><h1>여행 계획</h1>
+<p>첫째 날</p><script>fetch("/api/conversations").catch(() => {}); setTimeout(() => { location.href = "/api/conversations"; }, 30);</script></body></html>`;
+  const { id } = await makeArtifact(page, baseURL!, "html", "여행 계획", html);
+  await page.goto(`/a/${id}`);
+  if (SERVER_RENDERS) {
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.getByTestId("artifact-export-pdf").click(),
+    ]);
+    expect(download.suggestedFilename()).toBe("여행 계획.pdf");
+    expect((await head((await download.path())!, 5)).toString("latin1")).toBe("%PDF-");
+  } else {
+    await page.getByTestId("artifact-export-pdf").click();
+    await expect(page.getByTestId("artifact-export-error")).toBeVisible();
+    expect((await page.request.get(`/a/${id}/v/1/pdf`)).status()).toBe(503);
+  }
+  const ctx = await browser.newContext({ baseURL: baseURL! });
+  const son = await ctx.newPage();
+  await useAccount(son, SON);
+  for (const path of [`/a/${id}/v/1/png`, `/a/${id}/v/1/pdf`])
+    expect((await son.request.get(path)).status(), path).toBe(403);
+  await ctx.close();
+});

@@ -44,14 +44,14 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. 패널은 #28) |
 | FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | 🟨 (#27 불변 `artifact_versions`(트리거)·되돌리기 = 복사한 새 버전, `POST /api/artifacts/:id/revert` — `artifacts.test.ts`·e2e. 패널 UI는 #28) |
 | FR-6.3 | 고유 주소, 기본 비공개 | #27, #29 | I | 🟨 (#27 `/a/:id`·원본·내려받기·API 주인만, 남 403 — 권한 행렬 7행·e2e. 공유는 #29) |
-| FR-6.4 | 내려받기 HTML·PNG·PDF·원본 | #28, #51 | I | ⬜ |
+| FR-6.4 | 내려받기 HTML·PNG·PDF·원본 | #28, #51 | U, I, E | 🟨 (#27 원본·SVG·CSV 내려받기, #51 PNG(차트·SVG·HTML — 차트는 클라이언트 캡처 먼저, 실패 시 서버)·PDF(HTML·차트·표·마크다운·코드): 격리 렌더러(헤드리스 셸 + #42 샌드박스·CDN 전용 송신 프록시·요청 가로채기, 쿠키·세션 없음, 시간·메모리 한도), 앱·사설 IP 차단과 샘플 생성 — `artifact-export.test.ts`·e2e·권한 행렬, 변이 시험 isolation.md. 패널 버튼은 #28) |
 | FR-6.5 | sandbox iframe + CSP, 쿠키·API 접근 불가 | #27 | E | 🟨 (#27 `sandbox="allow-scripts"` iframe + 원본 CSP `sandbox`·`connect-src 'none'`·인라인 해시·CDN 정확한 URL+SRI. 차트가 그려진 뒤 쿠키·fetch·parent·top 실패, 허용 밖 CDN 차단, 최상위로 열어도 불투명 출처 — `e2e/artifacts.spec.ts`, 변이 시험 isolation.md. 머지 후 ✅) |
 | FR-6.6 | 아티팩트 목록 화면 | #28, #52 | E | ⬜ |
 | FR-7.1 | 한국 주식 | #30, #21 | U, M | 🟨 (#30 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`(네이버 증권) — 합성 응답 스냅샷 `finance.test.ts`. 실데이터 녹화·실런타임 확인은 `docs/evidence/finance/checklist.md`) |
 | FR-7.2 | 미국 주식 | #30 | U, M | 🟨 (#30 `us_*` 9개(Yahoo Finance) — 합성 응답 스냅샷. 녹화·실런타임은 체크리스트) |
 | FR-7.3 | 환율(비교·환산에만) | #30, #31 | U | 🟨 (#30 `fx_usdkrw` — 비교·환산 용도 명시. 비교 화면은 #31) |
 | FR-7.4 | 공시 DART·SEC | #30 | U, M | 🟨 (#30 `dart_disclosures`·`sec_8k`·`sec_form4`·`sec_13f` — 합성 응답 스냅샷, 제목은 `<external_content>`. 키(`OPENDART_API_KEY`·`SEC_USER_AGENT`)로 실호출 확인은 체크리스트) |
-| FR-7.5 | 정렬 표·대화형 차트·통화 기준 | #31 | U, E | ⬜ |
+| FR-7.5 | 정렬 표·대화형 차트·통화 기준 | #31, #51 | U, E | ⬜ (#51 차트 저장 = PNG·PDF 내보내기 완료. 표·차트 자체는 #31) |
 | FR-7.6 | 모든 숫자에 출처·기준 시각 | #30, #31 | U | 🟨 (#30 값마다 `{source, asOf, timeZone, delayed, kind}`, 휴장일 → 최근 거래일 종가, 결과 검사(`finalize`)와 답변 검사(`finance_note`) — `finance.test.ts`·`finance-runs.test.ts`·`e2e/finance.spec.ts`. 차트·표는 #31) |
 | FR-7.7 | 관심 종목 | #31 | I, E | ⬜ |
 | FR-7.8 | 면책 문구, 매매 금지 | #20, #30 | U | ✅ (#20 금융 지침, #30 공통 금융 출력기가 금융 도구를 쓴 모든 답변·후속 답변·예약 실행에 면책 첨부 — `finance-runs.test.ts`, 변이 시험) |
@@ -129,7 +129,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|
 | NFR 성능 | #38 (측정 규격은 `docs/acceptance.md` §3) | M | ⬜ |
 | NFR 가용성 | #8, #46 | M | 🟨 (#46 측정기·판정 스크립트 완료, Access 후 7일 측정 대기) |
-| NFR 보안 | #5, #7, #9, #10, #42, #50, #27 | U, I, E, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, #27 아티팩트 샌드박스·CSP — `e2e/artifacts.spec.ts`, 변이 시험 기록 isolation.md) |
+| NFR 보안 | #5, #7, #9, #10, #42, #50, #27, #51 | U, I, E, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, #27 아티팩트 샌드박스·CSP — `e2e/artifacts.spec.ts`, #51 내보내기 렌더러 격리(앱·사설 IP 차단, 쿠키 없음) — `artifact-export.test.ts`, 변이 시험 기록 isolation.md) |
 | NFR 스트리밍 | #8, #12 | I, M | ⬜ |
 | NFR 격리 | #15, #16, #42, #47, #21 | I | ⬜ |
 | NFR 권한 | #10, #29 | I | ⬜ |

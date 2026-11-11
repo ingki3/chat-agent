@@ -122,6 +122,9 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /a/:id", expect: NOT_SHARED(READ), fixture: artifact },
   { route: "GET /a/:id/v/:version/raw", expect: NOT_SHARED(READ), fixture: artifact },
   { route: "GET /a/:id/v/:version/download", expect: NOT_SHARED(READ), fixture: artifact },
+  // PNG/PDF export (#51): the same check before anything is rendered (the matrix app has a stand-in renderer).
+  { route: "GET /a/:id/v/:version/png", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /a/:id/v/:version/pdf", expect: NOT_SHARED(READ), fixture: artifact },
   { route: "GET /api/connections/:id", expect: OWNER_ONLY, fixture: connection },
   {
     route: "PATCH /api/connections/:id",

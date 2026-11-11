@@ -204,8 +204,21 @@ export const FINANCE_CODES = set([
   "finance_failed",
 ]);
 
+/** Outcome codes of PNG/PDF export (#51, artifacts/export.ts `EXPORT_CODES` — a test keeps the two equal). */
+export const EXPORT_CODES = set([
+  "export_ok",
+  "export_unavailable",
+  "export_busy",
+  "export_timeout",
+  "export_limit",
+  "export_failed",
+]);
+export const EXPORT_FORMATS = set(["png", "pdf"]);
+
 export const isRuntime = member(RUNTIMES);
 export const isFinanceCode = member(FINANCE_CODES);
+export const isExportCode = member(EXPORT_CODES);
+export const isExportFormat = member(EXPORT_FORMATS);
 export const isArtifactCode = member(ARTIFACT_CODES);
 export const isWebCode = member(WEB_CODES);
 export const isSkillCode = member(SKILL_CODES);

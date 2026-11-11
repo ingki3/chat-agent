@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { artifactDownloadPath, artifactRawPath, type ArtifactDetail } from "@agentlee/shared";
+import {
+  ARTIFACT_EXPORTS,
+  artifactDownloadPath,
+  artifactExportPath,
+  artifactRawPath,
+  type ArtifactDetail,
+  type ArtifactExportFormat,
+} from "@agentlee/shared";
 import { ApiError, artifacts } from "../api.js";
 import { TopBar } from "../Shell.js";
 
@@ -14,6 +21,67 @@ const KIND_LABEL: Record<ArtifactDetail["kind"], string> = {
   document: "문서",
 };
 
+/** Saves a blob as a file (a temporary link; the object URL is released right after). */
+function saveBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** A file name from the title (characters file systems refuse are replaced). */
+const fileName = (title: string, ext: string) =>
+  // eslint-disable-next-line no-control-regex -- control characters are not allowed in a file name
+  `${title.replace(/[\\/:*?"<>|\0-\x1f\x7f]+/g, "_").slice(0, 100) || "artifact"}.${ext}`;
+
+/**
+ * Chart → PNG in the browser (#51): the chart's SVG (the server-drawn download, no script) is drawn on a canvas.
+ * Nothing of the sandboxed frame is touched — the SVG is fetched again from the owner-only download.
+ */
+export async function captureChartPng(id: string, version: number): Promise<Blob> {
+  const res = await fetch(artifactDownloadPath(id, version), { credentials: "same-origin" });
+  if (!res.ok) throw new Error(`download ${res.status}`);
+  const svg = await res.text();
+  const box = /viewBox="0 0 (\d+(?:\.\d+)?) (\d+(?:\.\d+)?)"/.exec(svg);
+  const w = Number(box?.[1] ?? 760);
+  const h = Number(box?.[2] ?? 420);
+  // Fixed size instead of width="100%" (an image has no container to fill); dark text on white.
+  const sized = svg
+    .replace(/^<svg /, `<svg width="${w}" height="${h}" color="#23211d" `)
+    .replace(' width="100%"', "");
+  const url = URL.createObjectURL(new Blob([sized], { type: "image/svg+xml" }));
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const scale = 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = w * scale;
+    canvas.height = h * scale;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no canvas");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("no png"))), "image/png"),
+    );
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** The server's isolated renderer (#51): the file, or an error with the server's code. */
+async function serverExport(id: string, version: number, format: ArtifactExportFormat): Promise<Blob> {
+  const res = await fetch(artifactExportPath(id, version, format), { credentials: "same-origin" });
+  if (!res.ok) throw new Error(`export ${res.status}`);
+  return res.blob();
+}
+
 /**
  * `/a/:id` (#27): one artifact, minimal viewer. The original is shown in `<iframe sandbox="allow-scripts">` —
  * no allow-same-origin, so it runs with an opaque origin and cannot reach this page, its cookies or the API (its
@@ -24,6 +92,8 @@ export function ArtifactPage({ id }: { id: string }) {
   const key = ["artifact", id];
   const { data, error } = useQuery({ queryKey: key, queryFn: () => artifacts.get(id), retry: false });
   const [picked, setPicked] = useState<number | undefined>();
+  const [exporting, setExporting] = useState<ArtifactExportFormat | undefined>();
+  const [exportError, setExportError] = useState<string | undefined>();
   const revert = useMutation({
     mutationFn: (version: number) => artifacts.revert(id, version),
     onSuccess: (d) => {
@@ -59,6 +129,23 @@ export function ArtifactPage({ id }: { id: string }) {
 
   const version = picked ?? data.latestVersion;
   const info = data.versions.find((v) => v.version === version);
+  const title = info?.title ?? data.title;
+  // A chart's PNG is drawn here first; the server renders it only when that fails. Everything else is the server's.
+  const exportAs = async (format: ArtifactExportFormat) => {
+    setExporting(format);
+    setExportError(undefined);
+    try {
+      let blob: Blob | undefined;
+      if (format === "png" && data.kind === "chart")
+        blob = await captureChartPng(data.id, version).catch(() => undefined);
+      blob ??= await serverExport(data.id, version, format);
+      saveBlob(blob, fileName(title, format));
+    } catch {
+      setExportError(`${format.toUpperCase()} 파일을 만들지 못했어요. 잠시 뒤 다시 해 보세요.`);
+    } finally {
+      setExporting(undefined);
+    }
+  };
   return (
     <>
       <TopBar title={`🧩 ${data.title}`}>
@@ -94,7 +181,23 @@ export function ArtifactPage({ id }: { id: string }) {
               내려받기
             </a>
           )}
+          {ARTIFACT_EXPORTS[data.kind].map((format) => (
+            <button
+              key={format}
+              type="button"
+              disabled={!!exporting}
+              onClick={() => void exportAs(format)}
+              data-testid={`artifact-export-${format}`}
+            >
+              {exporting === format ? "만드는 중…" : format.toUpperCase()}
+            </button>
+          ))}
         </div>
+        {exportError && (
+          <p role="alert" className="small" data-testid="artifact-export-error">
+            {exportError}
+          </p>
+        )}
         {revert.isError && (
           <p role="alert" className="small">
             되돌리지 못했어요.

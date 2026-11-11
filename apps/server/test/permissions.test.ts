@@ -30,7 +30,12 @@ afterEach(async () => {
 let lastDb: ReturnType<typeof createTestDb>;
 const newApp = async () => {
   lastDb = createTestDb();
-  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db: lastDb, logger: false });
+  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+    db: lastDb,
+    logger: false,
+    // Export routes (#51) answer 200 for whoever passes the check; the browser itself is tested elsewhere.
+    renderer: { render: async () => ({ ok: true, body: Buffer.from("x"), type: "image/png" }) },
+  });
   apps.push(app);
   return app;
 };

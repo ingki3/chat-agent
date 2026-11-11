@@ -82,6 +82,13 @@ const ConfigSchema = z.object({
       message: "WEB_SEARCH_PROVIDERS must list google-news and/or duckduckgo, comma-separated",
     }),
   ),
+  /**
+   * Browser for PNG/PDF export (#51): an absolute path to Playwright's `chrome-headless-shell`. Unset = the newest
+   * one in Playwright's cache (`pnpm exec playwright install --only-shell chromium`); none = export unavailable.
+   */
+  EXPORT_BROWSER: optional(
+    z.string().refine((p) => path.isAbsolute(p), { message: "EXPORT_BROWSER must be an absolute path" }),
+  ),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -116,6 +123,8 @@ export type Config = {
    * only into the processes of the skills that declare it (never log this object).
    */
   skillSecrets: Record<string, string>;
+  /** Browser executable for PNG/PDF export (#51); undefined = look in Playwright's cache. */
+  exportBrowser?: string | undefined;
   /** Web search providers in the order they are tried (#50). */
   webSearchProviders: ("google-news" | "duckduckgo")[];
 };
@@ -184,6 +193,7 @@ export function loadConfig(
       .filter(Boolean)
       .map((p) => path.resolve(baseDir, p)),
     skillSecrets: skillSecrets(source),
+    exportBrowser: c.EXPORT_BROWSER,
     webSearchProviders: [
       ...new Set(
         (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],
