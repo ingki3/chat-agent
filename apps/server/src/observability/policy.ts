@@ -164,7 +164,17 @@ export const WEB_CODES = set([
   "web_not_allowed",
 ]);
 
+/** Outcome codes of the artifact tools (#27, artifacts/store.ts `ARTIFACT_CODES` — a test keeps the two equal). */
+export const ARTIFACT_CODES = set([
+  "artifact_bad_input",
+  "artifact_too_large",
+  "artifact_not_found",
+  "artifact_not_allowed",
+  "artifact_limit",
+]);
+
 export const isRuntime = member(RUNTIMES);
+export const isArtifactCode = member(ARTIFACT_CODES);
 export const isWebCode = member(WEB_CODES);
 export const isSkillCode = member(SKILL_CODES);
 export const isNotificationKind = member(set(NotificationKind.options));

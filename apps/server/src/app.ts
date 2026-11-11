@@ -31,6 +31,8 @@ import { McpTokens } from "./isolation/tokens.js";
 import { McpService, type McpServiceOptions } from "./mcp/service.js";
 import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
 import { SourceStore } from "./web/sources.js";
+import { ArtifactStore } from "./artifacts/store.js";
+import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import type { Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
@@ -39,7 +41,7 @@ import { registerNotificationRoutes } from "./notifications/routes.js";
 import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
 import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
 import { AppEvents } from "./events.js";
-import { isApiPath } from "./paths.js";
+import { isApiPath, isArtifactPath } from "./paths.js";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
 import { isGatePath, registerGate, type GateOptions } from "./gate.js";
@@ -84,6 +86,8 @@ declare module "fastify" {
     notifications: NotificationService | undefined;
     /** Runtime connections (#17); undefined without a database. */
     connections: ConnectionService | undefined;
+    /** Artifacts (#27); undefined without a database. */
+    artifacts: ArtifactStore | undefined;
   }
 }
 
@@ -152,6 +156,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     },
   });
   const startedAt = Date.now();
+  /** The SPA's index.html for app routes the server answers itself (`/a/:id`); set once the UI is attached. */
+  let appPage: AppPage = async () => undefined;
 
   // First, before any route exists: every route that could address a resource must declare its permission.
   installRouteRules(app);
@@ -160,7 +166,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
 
   app.addHook("onSend", async (_req, reply, payload) => {
     reply.headers(BASE_HEADERS);
-    if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
+    // A route that sets its own CSP keeps it (artifact originals, #27: a stricter, sandboxing one).
+    if (config.env === "production" && !reply.hasHeader("Content-Security-Policy"))
+      reply.header("Content-Security-Policy", APP_CSP);
     return payload;
   });
 
@@ -200,7 +208,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
     const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
-    if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime());
+    if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime({ runTools: true }));
     else if (!opts.runtimes) {
       // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
       // addresses) — one per runtime, so each reaches only its own provider.
@@ -222,9 +230,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const usage = new UsageStore(opts.db!);
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
     const sources = new SourceStore(opts.db!);
+    // Artifacts (#27): made by the artifact tools, scoped to the run's conversation.
+    const artifacts = new ArtifactStore(opts.db!);
+    app.decorate("artifacts", artifacts);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       web: { sources, providers: config.webSearchProviders },
+      artifacts,
       ...mcpOptionsFromConfig(config),
       ...opts.mcp,
     });
@@ -264,6 +276,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerSkillRoutes(app, mcp);
     registerConnectionRoutes(app, connections, users, runtimes);
     registerSourceRoutes(app, app.conversations!, sources);
+    registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url));
 
     const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(
@@ -307,6 +320,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   } else {
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
+    app.decorate("artifacts", undefined);
   }
 
   app.get(
@@ -352,8 +366,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     // API routes must reach Fastify; Vite's SPA fallback would otherwise answer /api/* with index.html.
     // Vite ends responses itself (onSend never runs), so set the base headers before handing over.
+    // App pages answered by Fastify routes (`/a/...`, #27) get Vite's index.html from there.
+    const indexFile = path.join(WEB_ROOT, "index.html");
+    appPage = (url) => vite.transformIndexHtml(url, fs.readFileSync(indexFile, "utf8"));
     app.use((req, res, next) => {
-      if (isApiPath(req.url) || isGatePath(req.url)) return next();
+      if (isApiPath(req.url) || isGatePath(req.url) || isArtifactPath(req.url)) return next();
       for (const [k, v] of Object.entries(BASE_HEADERS)) res.setHeader(k, v);
       return vite.middlewares(req, res, next);
     });
@@ -362,6 +379,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const webDist = opts.webDist ?? DEFAULT_WEB_DIST;
     if (fs.existsSync(path.join(webDist, "index.html"))) {
       const indexHtml = fs.readFileSync(path.join(webDist, "index.html"));
+      appPage = async () => indexHtml;
       await app.register(fastifyStatic, { root: webDist, index: ["index.html"], wildcard: false });
       // SPA fallback: client-side routes (e.g. /c/123) get index.html.
       app.setNotFoundHandler((req, reply) => {

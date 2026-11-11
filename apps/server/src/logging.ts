@@ -23,6 +23,7 @@ import {
   isImportItem,
   isImportCode,
   isWebCode,
+  isArtifactCode,
   isToolName,
   UNMATCHED,
   isUsagePurpose,
@@ -58,6 +59,7 @@ export const LOG_EVENTS = [
   "skill.finished",
   // Web tool calls (#50): tool name, outcome code, duration and IDs — never the URL, host, query or page text.
   "web.finished",
+  "artifact.finished",
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",
@@ -143,6 +145,8 @@ const FIELDS = new Map<string, Check>([
   ["skillCode", isSkillCode],
   /** Why a web tool call did not succeed (#50): one of the fixed `web_*` codes. */
   ["webCode", isWebCode],
+  /** Why an artifact tool call did not succeed (#27): one of the fixed `artifact_*` codes. */
+  ["artifactCode", isArtifactCode],
   ["category", isCategory],
   ["costUsd", isNum],
   ["inputTokens", isInt],
@@ -402,6 +406,8 @@ export type LogFields = {
   status?: string;
   errorCode?: string;
   skillCode?: string;
+  webCode?: string;
+  artifactCode?: string;
   category?: string;
   costUsd?: number;
   inputTokens?: number;

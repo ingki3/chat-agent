@@ -31,6 +31,9 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
   if (req.method !== "GET" || url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/") || url.pathname === "/gate") return;
+  // Artifact originals and downloads (#27): always from the server, with their sandboxing headers — never the
+  // cached app shell in their place.
+  if (/^\/a\/[^/]+\/v\//.test(url.pathname)) return;
   // Pages: network first (always the latest app), the cached shell when offline.
   if (req.mode === "navigate") {
     event.respondWith(fetch(req).catch(() => caches.match("/")));

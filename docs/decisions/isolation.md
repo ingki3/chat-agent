@@ -273,3 +273,38 @@ MCP 도구 `web_search(query)`·`web_fetch(url)`이다(`packages/mcp-tools/src/w
 - **검색 결과도 출처다:** `web_search` 결과와 `google-news-search-skill` 결과(스킬로 직접 부른 것 포함)는 `kind = "search"` 출처로 저장하고 결과마다 `sourceId`를 붙인다. 본문이 없으므로 인용 검증의 근거가 아니다. 인용하려면 그 링크를 `web_fetch`해서 `page` 출처를 만든다.
 - **API:** `GET /api/conversations/:id/sources` — 대화 주인만(공유와 상관없이: 자원 종류 `conversation-sources`의 공유 목록은 늘 비어 있다. 공유본의 출처는 #29의 고정 목록으로 따로 보인다). 본문은 주지 않는다(글자 수만).
 - **남은 것:** 두 런타임의 실제 녹화(자격 증명 필요, #21과 같음), 실 런타임이 이 도구로 프롬프트 주입 평가(`docs/ops.md` §14.4)를 도는 것.
+
+## 아티팩트 서빙 (#27)
+에이전트가 만든 HTML·SVG·차트·표·문서·코드를 버전과 함께 저장하고, **실제로 동작하면서** 앱의 쿠키·API·화면에 닿지 못하게 서빙한다(PRD FR-6.5). 코드는 `apps/server/src/artifacts/`(저장 `store.ts`, 서빙 `serve.ts`, 경로 `routes.ts`), 도구 정의는 `packages/mcp-tools/src/artifacts.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
+
+- **만들기:** MCP 도구 `artifact_create`·`artifact_update`(모든 활성 사용자). 누구의·어느 대화의 아티팩트인지는 **run 토큰의 범위**에서만 정해진다(입력에 사용자·대화 필드가 없고, 모르는 필드는 거부). 저장 전에 그 대화의 주인이 토큰의 사용자인지 다시 확인한다. `artifact_update`는 토큰의 대화에 있는 아티팩트만 찾는다(다른 대화의 id는 `artifact_not_found`).
+  - 종류: `html`·`svg`·`markdown`·`code`(본문 글자), `chart`(데이터 명세 — 서버가 SVG로 그린다, 스크립트 없음), `table`(열·행 — HTML 표, CSV 내려받기), `document`(생성 파일 참조 `fileId`·이름·형식만. 미리보기는 #49·#22 뒤).
+  - 한도: 한 버전 512KB(UTF-8 바이트, 서버가 잼), 제목 200자, 아티팩트당 버전 100개, 대화당 아티팩트 200개, 차트 라벨 500·계열 10, 표 열 50·행 5000·칸 1000자.
+  - 오류 코드: `artifact_bad_input`, `artifact_too_large`, `artifact_not_found`, `artifact_not_allowed`, `artifact_limit`. 입력 모양이 틀리면 MCP SDK의 스키마 검사가 먼저 거부한다(서버가 한 번 더 검사).
+  - 로그: 호출마다 `artifact.finished`(도구 이름, `ok`/`error`, `artifactCode`, 소요 시간, ID). **제목·본문은 남기지 않는다**(시험: 본문·제목 문자열이 로그에 없음).
+- **저장(0011 마이그레이션):** `artifacts`(사용자·대화·메시지·run, 종류, 제목, 최신 버전)와 `artifact_versions`(버전 번호, 제목, 본문, SHA-256, 바이트 수, run, 복원 원본). **버전 행은 바뀌지 않는다** — 수정·되돌리기는 새 행을 넣고, DB 트리거가 `UPDATE`를 거부한다. 같은 본문·제목으로 다시 고치면 새 버전을 만들지 않는다. 대화나 사용자를 지우면 함께 지워진다(FK cascade, 시험). 메시지 행이 사라지면 `message_id`만 비운다.
+- **되돌리기:** `POST /api/artifacts/:id/revert {version}` = 그 버전의 제목·본문을 복사한 새 버전(`revertedFrom`). 주인만.
+- **읽기 API(주인만, 공유는 #29):** `GET /api/conversations/:id/artifacts`, `GET /api/artifacts/:id`(버전 목록, 본문 없음), `GET /api/artifacts/:id/versions/:version`(본문 JSON — 앱이 렌더링하지 않는다).
+- **화면 `/a/:id`:** 앱 페이지(SPA). 서버가 먼저 권한을 검사한다 — 남은 403, 로그인 안 함은 401, 없는 id는 404이고 몸은 앱 셸(로그인·오류 화면)이다. 본문은 `<iframe sandbox="allow-scripts">`로만 보인다(`allow-same-origin`·`allow-top-navigation`·`allow-popups`·`allow-forms` 없음).
+- **원본 `/a/:id/v/:ver/raw`:** 같은 권한 검사(남 403). 응답 헤더:
+  - `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src <인라인 스크립트 sha256…> https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; frame-ancestors 'self'; base-uri 'none'`
+  - `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Permissions-Policy`(카메라·마이크·위치 등 끔).
+  - 앱의 `onSend` 훅은 CSP가 이미 있는 응답에는 앱 CSP를 덮어쓰지 않는다(운영 모드에서도 원본은 위 CSP — 시험).
+  - 종류별: html은 `text/html`(스크립트 해시), svg는 `image/svg+xml`(**스크립트 허용 없음** `script-src 'none'` — 대화형은 html로), chart·표는 서버가 그린 HTML(스크립트 없음), markdown·code는 `text/plain`. document는 원본이 아직 없어 404.
+  - 내려받기 `/a/:id/v/:ver/download`: 원본 파일(html·svg·md·코드), 차트는 SVG, 표는 CSV(UTF-8 BOM, `= + - @`로 시작하는 칸은 `'`를 붙여 수식 실행 방지). `Content-Disposition: attachment` + 같은 샌드박스 CSP.
+- **iframe이 쿠키를 들고 원본을 불러오는 방법:** iframe의 `src`는 같은 출처의 원본 주소다. 문서가 불투명 출처가 되는 것은 **응답을 받은 뒤**(iframe `sandbox` 속성과 CSP `sandbox`)이고, 요청 자체는 부모(앱 페이지, 같은 사이트)가 시작한 탐색이라 `SameSite=Lax` 세션 쿠키가 실린다. 그래서 원본도 보통 경로처럼 권한을 검사할 수 있다. 쿠키 자체는 `HttpOnly`라 원래도 스크립트가 못 읽지만, 시험은 일부러 HttpOnly가 아닌 쿠키(`al_probe`)를 넣고 앱 페이지는 읽고 아티팩트는 못 읽음을 확인한다. 아티팩트 안에서 같은 출처로 다시 탐색하는 요청(불투명 출처가 시작)은 교차 사이트로 취급될 수 있어 쿠키가 안 실릴 수 있다 — 그래도 열리는 것은 그 사용자의 다른 원본뿐이고, 역시 샌드박스다.
+- **원본을 최상위 창으로 열어도:** CSP `sandbox`는 최상위 문서에도 적용된다. 출처는 `null`, `document.cookie`·`localStorage`는 SecurityError, `fetch('/api/…')`는 `connect-src`로 막힌다(시험). 그래서 링크로 원본을 직접 열게 해도 앱을 공격하는 페이지가 되지 못한다. `frame-ancestors 'self'`라 다른 사이트에 끼워 넣을 수도 없다.
+- **인라인 스크립트:** 서빙할 때마다 서버가 각 인라인 `<script>`의 SHA-256을 계산해 `script-src`에 넣는다(생성 HTML이 그대로 동작). 찾기(`findScripts`)는 HTML 토크나이저를 따른다: 주석 건너뜀, 따옴표 속 `>`, 대소문자, `</script` 뒤 공백·`/`·`>`, 닫히지 않은 스크립트. 해시 전 줄바꿈 정규화(CRLF·CR → LF)와 NUL → U+FFFD(파서와 같게). 브라우저와 다르게 읽는 드문 경우(`<!--<script>` 이중 이스케이프, SVG 안의 `<script>`, `<textarea>` 속 글자)는 해시가 맞지 않아 **그 스크립트가 막힐 뿐**이다 — 어긋남이 다른 것을 허용하지는 않는다. 해시는 문서당 256개까지.
+  - 해시가 아티팩트 작성자(모델)를 제한하는 장치는 아니다: 문서에 든 스크립트는 다 돌 수 있다. 보안 경계는 불투명 출처 + `connect-src 'none'` + 외부 스크립트 허용 목록이다.
+  - **인라인 이벤트 속성(`onclick=` 등)과 `javascript:` URL은 실행되지 않는다**('unsafe-inline'·'unsafe-hashes' 없음, 시험: 클릭해도 실행 안 되고 `script-src-attr` 위반). 생성 HTML은 `addEventListener`를 쓴다(도구 설명에 적음).
+- **허용 CDN(`CDN_ALLOW_LIST`):** 버전·경로를 고정한 정확한 URL만(경로가 `/`로 끝나지 않는 CSP 소스는 정확히 그 경로만 맞는다). 지금은 Chart.js 4.4.1 하나(`https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js`). 서빙할 때 그 URL의 `<script src>`에 SRI `integrity`(sha384)와 `crossorigin="anonymous"`를 넣는다(작성자가 이미 넣은 integrity는 그대로). 다른 호스트(`evil.example.com`), 같은 호스트의 다른 버전(`chart.js@4.4.0`)은 막힌다(시험). 추가 방법은 `docs/ops.md` §18.
+- **서비스 워커:** `/a/<id>/v/…`는 가로채지 않는다(오프라인 셸이 원본 자리에 나오지 않게).
+- **시험:**
+  - Playwright(`e2e/artifacts.spec.ts`, FakeRuntime `/artifact` 명령 → 실제 MCP `artifact_create` 호출): 자체 포함 캔버스·SVG 차트가 **실제로 그려짐**(캔버스 픽셀 `rgb(47,111,176)`, SVG 막대 4개)을 먼저 확인한 뒤 같은 문서에서 출처 `null`, `document.cookie` SecurityError, `localStorage` SecurityError, `parent.document` SecurityError, `top.location` 변경 SecurityError(주소 그대로), `fetch('/api/conversations')` TypeError(`connect-src` 위반, 서버로 나간 요청 없음), 허용 밖 CDN 2개 `script-src-elem` 위반, 인라인 `onclick` 미실행. 최상위로 연 원본도 같다. 아들 계정은 `/a/:id`·원본·내려받기·API 모두 403(화면은 "권한이 없어요"). 되돌리기 화면 흐름.
+  - CDN 실제 로드(`E2E_NETWORK=1`일 때만 — CI가 네트워크에 기대지 않게): Chart.js가 SRI 검사를 지나 로드되고 막대를 그린다(2026-11-11 로컬 통과). 네트워크 없이도 도는 시험이 SRI 주입과 `script-src`의 https 소스가 정확히 그 URL 하나임을 확인한다.
+  - 단위·통합(`apps/server/test/artifacts.test.ts`): 스크립트 찾기 경계값, CSP 문자열 전체, SRI 주입, CSV, 저장 범위·한도·불변·cascade, MCP 경로(다른 대화 토큰, 남의 대화, 모르는 필드, 바이트 한도), 헤더(테스트·운영 모드), 권한 행렬 7행.
+- **변이 시험(2026-11-11):** 하나씩 망가뜨리면 시험이 실패함을 확인했다. 저장의 대화 주인 검사 제거, 고치기의 대화 범위 검사 제거, 자원 로더가 모두에게 공유, 원본 경로를 `noResource`로, `onSend`가 원본 CSP를 덮어씀, 줄바꿈 정규화 제거, 주석 건너뛰기 제거, CSV 수식 방지 제거, 불변 트리거 제거, 바이트 대신 글자 수로 한도, SRI 주입 제거, 차트 값 개수 검사 제거, CSP `sandbox` 제거(최상위 시험이 잡음 — iframe 시험은 iframe 속성만으로도 통과: 두 겹이 따로 막는다는 뜻), `connect-src 'self'`, 인라인 해시 없음(차트가 안 그려짐), CDN을 호스트 전체로, `allow-top-navigation` 추가, iframe에 `allow-same-origin` 추가, iframe `sandbox` 속성 제거.
+- **남은 위험·미룬 것:**
+  - 아티팩트가 **자기 프레임**을 외부 주소로 탐색하는 것은 막지 못한다(CSP에 탐색 제한이 없다 — `navigate-to`는 브라우저가 지원하지 않음). 새 창(`allow-popups` 없음)·최상위 창은 막힌다. 이때 나갈 수 있는 것은 아티팩트 자신의 내용과 그 안에서 사용자가 입력한 것뿐이다(쿠키·API·대화 내용은 아님). 모델이 대화 내용을 아티팩트에 넣게 만드는 프롬프트 주입은 #20 평가(`artifact_create → 숨은 지시 게시`)가 다룬다.
+  - `document` 미리보기(pdf.js, DOCX·PPTX·XLSX의 PDF 변환)는 #49·#22. 지금은 참조만 저장하고 화면은 "준비 중".
+  - 아티팩트 패널·메시지 안 카드(`artifact_ref` 부분)·PNG·PDF 내려받기는 #28·#51, 공유는 #29(자원 로더의 `sharedWith`), 목록 화면은 #28·#52.

@@ -1,0 +1,538 @@
+import crypto from "node:crypto";
+import { Writable } from "node:stream";
+import { afterEach, describe, expect, it } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ARTIFACT_LIMITS, CSRF_HEADER, type ArtifactDetail } from "@agentlee/shared";
+import { APP_CSP, buildApp } from "../src/app.js";
+import { loadConfig } from "../src/config.js";
+import { createTestDb } from "../src/db/client.js";
+import { artifactVersions } from "../src/db/schema.js";
+import { RuntimeRegistry } from "../src/runtime/adapter.js";
+import { FakeRuntime } from "../src/runtime/fake.js";
+import {
+  CDN_ALLOW_LIST,
+  artifactCsp,
+  attachment,
+  chartSvg,
+  findScripts,
+  prepareHtml,
+  tableCsv,
+} from "../src/artifacts/serve.js";
+import { ARTIFACT_CODES, ArtifactError } from "../src/artifacts/store.js";
+import { ARTIFACT_CODES as LOGGABLE_ARTIFACT_CODES } from "../src/observability/policy.js";
+import { RAW_HEADERS } from "../src/artifacts/routes.js";
+import { createFamily } from "./helpers/permission-matrix.js";
+
+type App = Awaited<ReturnType<typeof buildApp>>;
+const closers: (() => Promise<unknown>)[] = [];
+afterEach(async () => {
+  while (closers.length) await closers.pop()!();
+});
+
+const sha = (s: string) => `'sha256-${crypto.createHash("sha256").update(s, "utf8").digest("base64")}'`;
+const LOCAL = { host: "localhost:3000" };
+const WRITE = { ...LOCAL, origin: "http://localhost:3000", [CSRF_HEADER]: "1" };
+
+async function newApp(env: Record<string, string> = { NODE_ENV: "test" }, extra = {}) {
+  const lines: Record<string, unknown>[] = [];
+  const logStream = new Writable({
+    write(chunk, _enc, cb) {
+      for (const l of String(chunk).split("\n").filter(Boolean)) lines.push(JSON.parse(l));
+      cb();
+    },
+  });
+  const runtimes = new RuntimeRegistry();
+  runtimes.register(new FakeRuntime({ runTools: true }));
+  const app = await buildApp(loadConfig(env), {
+    db: createTestDb(),
+    runtimes,
+    logStream,
+    ...(env.NODE_ENV === "production" ? { masterKey: crypto.randomBytes(32) } : {}),
+    ...extra,
+  });
+  closers.push(() => app.close());
+  const f = await createFamily(app);
+  return { app, f, lines };
+}
+
+/** A run of `who`'s conversation whose message is a FakeRuntime command; waits until the run has ended. */
+async function runCommand(app: App, cookie: string, conversationId: string, text: string) {
+  const r = await app.inject({
+    method: "POST",
+    url: `/api/conversations/${conversationId}/messages`,
+    headers: { ...WRITE, cookie },
+    payload: { text },
+  });
+  expect(r.statusCode).toBe(201);
+  const runId = (r.json() as { run: { id: string } }).run.id;
+  for (let i = 0; i < 200; i++) {
+    const run = app.runs!.get(runId)!;
+    if (!["queued", "running"].includes(run.status)) break;
+    await new Promise((res) => setTimeout(res, 20));
+  }
+  const msgs = await app.inject({
+    url: `/api/conversations/${conversationId}/messages`,
+    headers: { ...LOCAL, cookie },
+  });
+  const last = (
+    msgs.json() as { items: { parts: { type: string; output?: unknown; isError?: boolean }[] }[] }
+  ).items.at(-1)!;
+  const result = last.parts.find((p) => p.type === "tool_result")!;
+  return { runId, output: result.output as Record<string, unknown>, isError: !!result.isError };
+}
+
+describe("inline scripts and CSP (serve.ts)", () => {
+  it("finds inline scripts like the HTML tokenizer: attributes with '>', comments, case, CRLF, unclosed", () => {
+    const html = [
+      `<script>a()</script>`,
+      `<SCRIPT type="module" data-x='a>b'>b()</SCRIPT >`,
+      `<!-- <script>notAScript()</script> -->`,
+      `<script\nsrc="https://x.example/y.js"></script>`,
+      `<scripts>no</scripts>`,
+      `<script>c()\r\nd()\re()</script/>`,
+      `<script>last(`,
+    ].join("");
+    const s = findScripts(html);
+    expect(s.map((x) => x.text)).toEqual(["a()", "b()", undefined, "c()\nd()\ne()", "last("]);
+    expect(s[1]!.attrs.get("data-x")).toBe("a>b");
+    expect(s[2]!.attrs.get("src")).toBe("https://x.example/y.js");
+  });
+
+  it("the CSP allows exactly the document's inline scripts and the pinned CDN URLs", () => {
+    const { csp, body } = prepareHtml(
+      `<p onclick="x()">hi</p><script>draw()</script><script>draw()</script><script>more()</script>`,
+    );
+    expect(body).toContain(`onclick="x()"`); // left as is — it does not run: no 'unsafe-inline'/'unsafe-hashes'
+    const cdn = CDN_ALLOW_LIST.map((c) => c.url).join(" ");
+    expect(csp).toBe(
+      `sandbox allow-scripts; default-src 'none'; script-src ${sha("draw()")} ${sha("more()")} ${cdn}; ` +
+        `style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; ` +
+        `frame-ancestors 'self'; base-uri 'none'`,
+    );
+    const scriptSrc = csp.split("; ").find((d) => d.startsWith("script-src"))!;
+    expect(scriptSrc).not.toMatch(/'unsafe-inline'|'unsafe-eval'|'unsafe-hashes'|\*|https:(?!\/\/)/);
+    expect(csp).not.toMatch(/allow-same-origin|allow-top-navigation|allow-popups|allow-forms/);
+    expect(artifactCsp([])).toContain("script-src 'none'");
+  });
+
+  it("adds SRI to allow-listed CDN tags only, keeps an author's own integrity", () => {
+    const cdn = CDN_ALLOW_LIST[0]!;
+    const { body } = prepareHtml(
+      `<script src="${cdn.url}"></script>` +
+        `<script src='${cdn.url}' defer/>` +
+        `<script src="${cdn.url}" integrity="sha384-own"></script>` +
+        `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>`,
+    );
+    expect(body.split(`integrity="${cdn.integrity}" crossorigin="anonymous"`).length - 1).toBe(2);
+    expect(body).toContain(
+      `<script src='${cdn.url}' defer integrity="${cdn.integrity}" crossorigin="anonymous"/>`,
+    );
+    expect(body).toContain(`integrity="sha384-own"></script>`);
+    expect(body).toContain(`chart.js@4.4.0/dist/chart.umd.min.js"></script>`);
+  });
+
+  it("CSV: quoting, BOM, and formula cells defused", () => {
+    expect(
+      tableCsv({
+        columns: ["a", "b"],
+        rows: [
+          ["x,y", 1],
+          ['say "hi"', null],
+          ["=1+1", "-2"],
+        ],
+      }),
+    ).toBe(`\uFEFFa,b\r\n"x,y",1\r\n"say ""hi""",\r\n'=1+1,'-2\r\n`);
+  });
+
+  it("chart: drawn as SVG without script, text escaped", () => {
+    const svg = chartSvg({
+      type: "bar",
+      title: "<b>수익</b>",
+      labels: ["1월", "2월"],
+      series: [{ name: "A", values: [1, -2] }],
+    });
+    expect(svg).not.toMatch(/<script|<b>/);
+    expect(svg).toContain("&lt;b&gt;수익&lt;/b&gt;");
+    expect(svg.match(/class="bar"/g)).toHaveLength(2);
+  });
+
+  it("download names: ASCII fallback and RFC 5987 title", () => {
+    expect(attachment('주간 "차트"/v2', "csv")).toBe(
+      `attachment; filename="__ ____v2.csv"; filename*=UTF-8''${encodeURIComponent("주간 _차트_v2.csv")}`,
+    );
+    expect(attachment("a;b%c\r\n", "md")).toBe(
+      `attachment; filename="a_b_c_.md"; filename*=UTF-8''a%3Bb%25c_.md`,
+    );
+  });
+});
+
+describe("artifact store", () => {
+  it("versions are immutable rows; update adds one, the same content adds none; revert copies", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    const c = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
+    const { artifact } = store.create(scope, { kind: "html", title: " 차트 ", content: "<p>1</p>" });
+    expect(artifact).toMatchObject({ title: "차트", latestVersion: 1, kind: "html", messageId: null });
+    expect(store.update(scope, artifact.id, { content: "<p>2</p>" }).version.version).toBe(2);
+    expect(store.update(scope, artifact.id, { content: "<p>2</p>" }).version.version).toBe(2);
+    const r = store.revert(artifact.id, 1);
+    expect(r.version).toMatchObject({ version: 3, revertedFrom: 1, content: "<p>1</p>" });
+    expect(store.versions(artifact.id).map((v) => v.contentHash)).toEqual(
+      ["<p>1</p>", "<p>2</p>", "<p>1</p>"].map((s) => crypto.createHash("sha256").update(s).digest("hex")),
+    );
+    const db = (app as unknown as { artifacts: { db: ReturnType<typeof createTestDb> } }).artifacts.db;
+    expect(() => db.update(artifactVersions).set({ content: "changed" }).run()).toThrow(/immutable/);
+  });
+
+  it("scope: only into the token user's own conversation; another conversation's artifact is not found", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    const mine = app.conversations!.create(f.users.owner.id);
+    const other = app.conversations!.create(f.users.owner.id);
+    const theirs = app.conversations!.create(f.users.stranger.id);
+    const s = (conversationId: string, userId = f.users.owner.id) => ({ userId, conversationId, runId: "r" });
+    const code = (fn: () => unknown) => {
+      try {
+        fn();
+      } catch (e) {
+        return e instanceof ArtifactError ? e.code : "other";
+      }
+      return "ok";
+    };
+    expect(code(() => store.create(s(theirs.id), { kind: "markdown", title: "t", content: "x" }))).toBe(
+      "artifact_not_allowed",
+    );
+    const { artifact } = store.create(s(mine.id), { kind: "markdown", title: "t", content: "x" });
+    expect(code(() => store.update(s(other.id), artifact.id, { content: "y" }))).toBe("artifact_not_found");
+    expect(code(() => store.update(s(theirs.id, f.users.stranger.id), artifact.id, { content: "y" }))).toBe(
+      "artifact_not_found",
+    );
+  });
+
+  it("validates each kind and the limits", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    const c = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: c.id, runId: "r" };
+    const code = (input: Parameters<typeof store.create>[1]) => {
+      try {
+        store.create(scope, input);
+        return "ok";
+      } catch (e) {
+        return (e as ArtifactError).code;
+      }
+    };
+    const big = "x".repeat(ARTIFACT_LIMITS.contentBytes - 2) + "가"; // 3 bytes: one over
+    expect(code({ kind: "markdown", title: "t", content: big })).toBe("artifact_too_large");
+    expect(code({ kind: "markdown", title: "t", content: big.slice(1) })).toBe("ok");
+    expect(code({ kind: "html", title: "t", chart: {} })).toBe("artifact_bad_input");
+    expect(code({ kind: "html", title: "t", content: "<p>", table: { columns: ["a"], rows: [] } })).toBe(
+      "artifact_bad_input",
+    );
+    expect(code({ kind: "svg", title: "t", content: "<p>not svg</p>" })).toBe("artifact_bad_input");
+    expect(code({ kind: "html", title: "a\nb", content: "<p>" })).toBe("artifact_bad_input");
+    expect(code({ kind: "html", title: "t", content: "<p>", language: "js" })).toBe("artifact_bad_input");
+    expect(code({ kind: "code", title: "t", content: "print()", language: "python" })).toBe("ok");
+    const chart = { type: "line", labels: ["a", "b"], series: [{ name: "s", values: [1] }] };
+    expect(code({ kind: "chart", title: "t", chart })).toBe("artifact_bad_input"); // values ≠ labels
+    expect(
+      code({ kind: "chart", title: "t", chart: { ...chart, series: [{ name: "s", values: [1, 2] }] } }),
+    ).toBe("ok");
+    expect(code({ kind: "table", title: "t", table: { columns: ["a", "b"], rows: [[1]] } })).toBe(
+      "artifact_bad_input",
+    );
+    expect(
+      code({
+        kind: "document",
+        title: "t",
+        document: { fileId: "f1", name: "a.pdf", mimeType: "application/pdf" },
+      }),
+    ).toBe("ok");
+    expect(
+      code({ kind: "document", title: "t", document: { fileId: "../x", name: "a", mimeType: "a/b" } }),
+    ).toBe("artifact_bad_input");
+  });
+
+  it("deleting the conversation or the user removes artifacts and versions", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    const c1 = app.conversations!.create(f.users.owner.id);
+    const c2 = app.conversations!.create(f.users.owner.id);
+    const mk = (cid: string) =>
+      store.create(
+        { userId: f.users.owner.id, conversationId: cid, runId: "r" },
+        { kind: "markdown", title: "t", content: "x" },
+      ).artifact.id;
+    const a1 = mk(c1.id);
+    const a2 = mk(c2.id);
+    app.conversations!.delete(c1.id);
+    expect(store.get(a1)).toBeUndefined();
+    expect(store.versions(a1)).toEqual([]);
+    expect(store.get(a2)).toBeDefined();
+    const db = (app.artifacts as unknown as { db: ReturnType<typeof createTestDb> }).db;
+    db.$client.prepare("delete from users where id = ?").run(f.users.owner.id);
+    expect(store.get(a2)).toBeUndefined();
+    expect(store.versions(a2)).toEqual([]);
+  });
+});
+
+describe("artifact tools over MCP (#27)", () => {
+  it("a run creates and updates an artifact through the real MCP path; linked to its message and run", async () => {
+    const { app, f, lines } = await newApp();
+    const c = app.conversations!.create(f.users.owner.id);
+    const html = "<h1>SECRET-CONTENT-123</h1><script>1</script>";
+    const created = await runCommand(app, f.cookies.owner, c.id, `/artifact html 주간 차트\n${html}`);
+    expect(created.isError).toBe(false);
+    const id = String(created.output.artifactId);
+    expect(created.output).toEqual({
+      artifactId: id,
+      kind: "html",
+      title: "주간 차트",
+      version: 1,
+      url: `/a/${id}`,
+    });
+    const a = app.artifacts!.get(id)!;
+    expect(a).toMatchObject({ userId: f.users.owner.id, conversationId: c.id, runId: created.runId });
+    expect(a.messageId).toBe(app.runs!.get(created.runId)!.assistantMessageId);
+
+    const updated = await runCommand(app, f.cookies.owner, c.id, `/artifact-update ${id} content\n<p>v2</p>`);
+    expect(updated.output).toMatchObject({ artifactId: id, version: 2 });
+    expect(app.artifacts!.version(id, 2)).toMatchObject({ runId: updated.runId, content: "<p>v2</p>" });
+
+    // Bad input: a fixed code back to the model; the log has the code, never the content or the title.
+    // (A wrong shape is refused by the MCP SDK's schema check first; this one passes it: values ≠ labels.)
+    const chart = { type: "bar", labels: ["a", "b"], series: [{ name: "s", values: [1] }] };
+    const bad = await runCommand(
+      app,
+      f.cookies.owner,
+      c.id,
+      `/artifact chart 나쁜 차트\n${JSON.stringify(chart)}`,
+    );
+    expect(bad).toMatchObject({ isError: true, output: { error: "artifact_bad_input" } });
+    const shape = await runCommand(app, f.cookies.owner, c.id, `/artifact chart 나쁜 차트\n{"type":"pie"}`);
+    expect(shape.isError).toBe(true);
+    expect(app.artifacts!.list(c.id)).toHaveLength(1);
+    const finished = lines.filter((l) => l.msg === "artifact.finished");
+    expect(finished.map((l) => [l.tool, l.status, l.artifactCode])).toEqual([
+      ["artifact_create", "ok", undefined],
+      ["artifact_update", "ok", undefined],
+      ["artifact_create", "error", "artifact_bad_input"],
+    ]);
+    const all = JSON.stringify(lines);
+    expect(all).not.toContain("SECRET-CONTENT");
+    expect(all).not.toContain("주간 차트");
+  });
+
+  it("a token of one conversation cannot touch another conversation's artifact; unknown fields refused", async () => {
+    const { app, f } = await newApp();
+    const mine = app.conversations!.create(f.users.owner.id);
+    const other = app.conversations!.create(f.users.owner.id);
+    const { artifact } = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: other.id, runId: "r0" },
+      { kind: "markdown", title: "t", content: "x" },
+    );
+    const { url } = await app.mcp!.endpoint();
+    const tokens = app.runs!.mcpTokens;
+    const call = async (
+      conversationId: string,
+      userId: string,
+      name: string,
+      args: Record<string, unknown>,
+    ) => {
+      const client = new Client({ name: "t", version: "0" });
+      const token = tokens.issue({ userId, conversationId, runId: crypto.randomUUID() });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(url), {
+          requestInit: { headers: { Authorization: `Bearer ${token}` } },
+        }),
+      );
+      closers.push(() => client.close());
+      const r = (await client.callTool({ name, arguments: args })) as {
+        content: { text: string }[];
+        isError?: boolean;
+      };
+      const text = r.content[0]!.text;
+      return {
+        isError: !!r.isError,
+        out: (text.startsWith("{") ? JSON.parse(text) : { sdk: text }) as Record<string, unknown>,
+      };
+    };
+    expect(
+      await call(mine.id, f.users.owner.id, "artifact_update", { artifactId: artifact.id, content: "y" }),
+    ).toEqual({
+      isError: true,
+      out: { error: "artifact_not_found" },
+    });
+    // Someone else's conversation (a token can only be scoped by the server, but the store checks again).
+    expect(
+      await call(other.id, f.users.stranger.id, "artifact_create", {
+        kind: "markdown",
+        title: "t",
+        content: "x",
+      }),
+    ).toEqual({ isError: true, out: { error: "artifact_not_allowed" } });
+    const extra = await call(mine.id, f.users.owner.id, "artifact_create", {
+      kind: "markdown",
+      title: "t",
+      content: "x",
+      userId: f.users.stranger.id,
+    });
+    expect(extra.isError).toBe(true);
+    expect(String(extra.out.sdk)).toMatch(/MCP error/);
+    expect(app.artifacts!.list(mine.id)).toEqual([]);
+    expect(
+      await call(mine.id, f.users.owner.id, "artifact_create", {
+        kind: "markdown",
+        title: "t",
+        content: "가".repeat(ARTIFACT_LIMITS.contentBytes / 2),
+      }),
+    ).toEqual({
+      isError: true,
+      out: { error: "artifact_too_large" },
+    });
+  });
+
+  it("logged codes are exactly the store's codes", () => {
+    expect([...LOGGABLE_ARTIFACT_CODES].sort()).toEqual([...ARTIFACT_CODES].sort());
+  });
+});
+
+describe("artifact routes (#27)", () => {
+  async function withArtifact(env?: Record<string, string>) {
+    const ctx = await newApp(env);
+    const c = ctx.app.conversations!.create(ctx.f.users.owner.id);
+    const scope = { userId: ctx.f.users.owner.id, conversationId: c.id, runId: "r" };
+    const html = `<!doctype html><canvas id=c></canvas><script>draw()</script>`;
+    const { artifact } = ctx.app.artifacts!.create(scope, { kind: "html", title: "차트", content: html });
+    return { ...ctx, c, id: artifact.id, html, scope };
+  }
+  const get = (app: App, url: string, cookie?: string) =>
+    app.inject({ url, headers: { ...LOCAL, ...(cookie ? { cookie } : {}) } });
+
+  it("the original: sandboxing CSP with the script's hash, and the isolation headers; production too", async () => {
+    for (const NODE_ENV of ["test", "production"]) {
+      const { app, f, id } = await withArtifact({ NODE_ENV });
+      const r = await get(app, `/a/${id}/v/1/raw`, f.cookies.owner);
+      expect(r.statusCode).toBe(200);
+      expect(r.headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(r.headers["content-security-policy"]).toBe(prepareHtml(r.body).csp);
+      expect(r.headers["content-security-policy"]).toMatch(
+        /^sandbox allow-scripts; default-src 'none'; script-src 'sha256-/,
+      );
+      expect(r.headers["content-security-policy"]).toContain(sha("draw()"));
+      for (const [k, v] of Object.entries(RAW_HEADERS)) expect(r.headers[k.toLowerCase()]).toBe(v);
+      expect(r.headers).toMatchObject({
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+        "cross-origin-resource-policy": "same-origin",
+        "referrer-policy": "no-referrer",
+      });
+      // The app page itself keeps the app CSP (production) and is never the sandboxed one.
+      const page = await get(app, `/a/${id}`, f.cookies.owner);
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["content-type"]).toMatch(/^text\/html/);
+      expect(page.headers["content-security-policy"]).toBe(NODE_ENV === "production" ? APP_CSP : undefined);
+    }
+  }, 30_000);
+
+  it("other users get 403 on the page, the original and the download; anonymous 401; unknown version 404", async () => {
+    const { app, f, id } = await withArtifact();
+    for (const path of [`/a/${id}`, `/a/${id}/v/1/raw`, `/a/${id}/v/1/download`, `/api/artifacts/${id}`]) {
+      expect((await get(app, path, f.cookies.stranger)).statusCode, path).toBe(403);
+      expect((await get(app, path, f.cookies.admin)).statusCode, path).toBe(403);
+      expect((await get(app, path)).statusCode, path).toBe(401);
+      expect((await get(app, path, f.cookies.owner)).statusCode, path).toBe(200);
+    }
+    // The page answers refusals with the app shell (login / error screen), status kept; never the artifact.
+    const denied = await get(app, `/a/${id}`, f.cookies.stranger);
+    expect(denied.headers["content-type"]).toMatch(/^text\/html/);
+    expect(denied.body).not.toContain("draw()");
+    for (const v of ["2", "0", "01", "x", "1.0"])
+      expect((await get(app, `/a/${id}/v/${v}/raw`, f.cookies.owner)).statusCode, v).toBe(404);
+    expect((await get(app, `/a/nope/v/1/raw`, f.cookies.owner)).statusCode).toBe(404);
+  });
+
+  it("svg, markdown, code, chart and table originals; downloads; document has none yet", async () => {
+    const { app, f, scope } = await withArtifact();
+    const store = app.artifacts!;
+    const mk = (input: Parameters<typeof store.create>[1]) => store.create(scope, input).artifact.id;
+    const svg = mk({
+      kind: "svg",
+      title: "도형",
+      content: `<svg xmlns="http://www.w3.org/2000/svg"><script>x()</script></svg>`,
+    });
+    const md = mk({ kind: "markdown", title: "글", content: "# <script>x()</script>" });
+    const chart = mk({
+      kind: "chart",
+      title: "c",
+      chart: { type: "bar", labels: ["a"], series: [{ name: "s", values: [1] }] },
+    });
+    const table = mk({ kind: "table", title: "표", table: { columns: ["a"], rows: [["=cmd"]] } });
+    const doc = mk({
+      kind: "document",
+      title: "보고서",
+      document: { fileId: "f1", name: "r.pdf", mimeType: "application/pdf" },
+    });
+    const raw = (id: string) => get(app, `/a/${id}/v/1/raw`, f.cookies.owner);
+    const s = await raw(svg);
+    expect(s.headers["content-type"]).toBe("image/svg+xml; charset=utf-8");
+    expect(s.headers["content-security-policy"]).toBe(artifactCsp([])); // SVG scripts never allowed
+    const m = await raw(md);
+    expect(m.headers["content-type"]).toBe("text/plain; charset=utf-8");
+    expect(m.body).toBe("# <script>x()</script>");
+    const ch = await raw(chart);
+    expect(ch.body).toContain("<svg");
+    expect(ch.headers["content-security-policy"]).toContain("script-src 'none'");
+    const t = await raw(table);
+    expect(t.body).toContain("<td>=cmd</td>");
+    const csv = await get(app, `/a/${table}/v/1/download`, f.cookies.owner);
+    expect(csv.headers["content-type"]).toBe("text/csv; charset=utf-8");
+    expect(csv.headers["content-disposition"]).toMatch(/^attachment; filename="_\.csv"/);
+    expect(csv.headers["content-security-policy"]).toBe(artifactCsp([]));
+    expect(csv.body).toBe("\uFEFFa\r\n'=cmd\r\n");
+    expect((await raw(doc)).statusCode).toBe(404);
+    expect((await get(app, `/a/${doc}/v/1/download`, f.cookies.owner)).statusCode).toBe(404);
+  });
+
+  it("read API: list, detail with versions, one version's text; revert adds a copy", async () => {
+    const { app, f, c, id, html, scope } = await withArtifact();
+    app.artifacts!.update(scope, id, { content: "<p>v2</p>", title: "새 차트" });
+    const list = await get(app, `/api/conversations/${c.id}/artifacts`, f.cookies.owner);
+    expect(list.json()).toMatchObject({ items: [{ id, latestVersion: 2, title: "새 차트" }] });
+    expect((await get(app, `/api/conversations/${c.id}/artifacts`, f.cookies.stranger)).statusCode).toBe(403);
+    const v1 = await get(app, `/api/artifacts/${id}/versions/1`, f.cookies.owner);
+    expect(v1.json()).toEqual({ version: 1, kind: "html", content: html });
+    const rev = await app.inject({
+      method: "POST",
+      url: `/api/artifacts/${id}/revert`,
+      headers: { ...WRITE, cookie: f.cookies.owner },
+      payload: { version: 1 },
+    });
+    const d = rev.json() as ArtifactDetail;
+    expect(d.latestVersion).toBe(3);
+    expect(d.title).toBe("차트");
+    expect(d.versions.map((v) => [v.version, v.revertedFrom])).toEqual([
+      [1, null],
+      [2, null],
+      [3, 1],
+    ]);
+    expect(JSON.stringify(d)).not.toContain("draw()"); // detail lists versions without their content
+    const bad = await app.inject({
+      method: "POST",
+      url: `/api/artifacts/${id}/revert`,
+      headers: { ...WRITE, cookie: f.cookies.owner },
+      payload: { version: 9 },
+    });
+    expect(bad.statusCode).toBe(404);
+    // Cross-site POST refused before anything (CSRF on non-API resource routes too).
+    const forged = await app.inject({
+      method: "POST",
+      url: `/api/artifacts/${id}/revert`,
+      headers: { ...LOCAL, cookie: f.cookies.owner, origin: "https://evil.example" },
+      payload: { version: 1 },
+    });
+    expect(forged.statusCode).toBe(403);
+  });
+});

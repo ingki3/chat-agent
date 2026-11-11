@@ -516,6 +516,8 @@ describe("per-user skills (FR-1.6, #21)", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "artifact_create",
+      "artifact_update",
       "skill_selftest",
       "skill_google-news-search-skill",
     ]);

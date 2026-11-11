@@ -24,6 +24,12 @@ export type RuntimeCapabilities = {
   /** Calls our MCP server (real runtimes). False: the run gets no tools and no MCP port is opened for it. */
   usesTools: boolean;
   /**
+   * Runs get our MCP server although `usesTools` is false: the scripted FakeRuntime in development and e2e
+   * (FAKE_RUNTIME=1), whose runs may call real tools (artifacts, #27) while its connection test (#17) is answered
+   * from its script. Real runtimes never set it.
+   */
+  runTools?: boolean;
+  /**
    * Runs need a runtime connection (#17): the run manager picks one before the run starts (personal first, then
    * shared) and fails it with `no_connection` when there is none. Default false (the development FakeRuntime).
    */

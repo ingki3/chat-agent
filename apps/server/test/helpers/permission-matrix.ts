@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { CSRF_HEADER } from "@agentlee/shared";
 import { hashPassword } from "../../src/auth/passwords.js";
@@ -102,7 +103,25 @@ const connection = (f: Family) =>
     secret: `sk-ant-matrix${"x".repeat(24)}`,
   }).id;
 
+/** An HTML artifact (two versions) in a conversation of `owner`, made as a run of that conversation would. */
+function artifact(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
+  const store = f.app.artifacts!;
+  const { artifact: a } = store.create(scope, { kind: "html", title: "표", content: "<p>v1</p>" });
+  store.update(scope, a.id, { content: "<p>v2</p>" });
+  return { id: a.id, params: { version: "1" } };
+}
+
 export const APP_MATRIX: MatrixRow[] = [
+  // Artifacts (#27): owner only until sharing (#29); the page and the originals check the same way.
+  { route: "GET /api/conversations/:id/artifacts", expect: OWNER_ONLY, fixture: conversation },
+  { route: "GET /api/artifacts/:id", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /api/artifacts/:id/versions/:version", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "POST /api/artifacts/:id/revert", expect: OWNER_ONLY, fixture: artifact, body: { version: 1 } },
+  { route: "GET /a/:id", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /a/:id/v/:version/raw", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /a/:id/v/:version/download", expect: NOT_SHARED(READ), fixture: artifact },
   { route: "GET /api/connections/:id", expect: OWNER_ONLY, fixture: connection },
   {
     route: "PATCH /api/connections/:id",

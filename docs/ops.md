@@ -16,6 +16,7 @@
 | 런타임 연결 키·토큰 (#17) | DB `connections.secret`(마스터 키로 암호화) | 설정 → 내 런타임 연결, 관리자 API — 11절 | DB와 함께 포함(암호문) |
 | 사용량 기록 (#44) | DB `usage_records` 표 — 실행 시도(run·attempt)마다 1행, 토큰·원시 비용·요청 수만(내용 없음) | — | DB와 함께 포함 — 16절 |
 | 웹 출처 (#50) | DB `sources` 표: 가져온 페이지 본문·검색 결과 | `WEB_SEARCH_PROVIDERS` — 17절 | DB와 함께 포함 |
+| 아티팩트 (#27) | DB `artifacts`·`artifact_versions` 표: 버전마다 본문(최대 512KB) | — 18절 | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
@@ -498,3 +499,29 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 이 Mac·집 네트워크 주소(루프백·사설·링크 로컬·메타데이터), `localhost`·`.local` 같은 이름, 80/443 밖 포트, http/https가 아닌 주소, PDF, 3MB 넘는 응답, 20초 넘는 가져오기, 5번 넘는 리다이렉트는 거부된다. 모델은 `web_*` 코드만 본다.
 - 로그에는 호출마다 `web.finished`(도구 이름, 결과 코드 `webCode`, 소요 시간, ID)만 남는다. URL·호스트·검색어·본문은 남지 않는다. 어떤 사이트에서 막혔는지는 로그로 알 수 없다(의도).
 - 자주 보이는 코드: `web_blocked`(정책 거부), `web_unreachable`(연결 실패·없는 이름), `web_no_text`(스크립트로만 그리는 페이지), `web_unsupported_type`(PDF 등), `web_search_blocked`(DuckDuckGo 봇 확인).
+
+## 18. 아티팩트 (#27)
+방식과 근거는 `docs/decisions/isolation.md` "아티팩트 서빙 (#27)"에 있다.
+
+### 18.1 무엇이 어디에
+- 에이전트가 `artifact_create`·`artifact_update` 도구로 만든다(모든 활성 사용자, 설치할 것 없음). 주소는 `/a/<id>`, 원본은 `/a/<id>/v/<버전>/raw`, 내려받기는 `/a/<id>/v/<버전>/download`. 만든 사람만 연다(관리자도 못 본다). 가족 공유는 #29.
+- DB의 `artifacts`·`artifact_versions` 표(0011 마이그레이션)에 본문까지 들어 있다 — 백업에 함께 들어간다(1절). 대화를 지우면 그 대화의 아티팩트도 지워진다.
+- 버전 행은 고칠 수 없다(트리거). 되돌리기는 이전 버전을 복사한 새 버전이다.
+- 로그에는 `artifact.finished`(도구, 결과 코드 `artifactCode`, 소요 시간, ID)만 남는다. 제목·본문은 남지 않는다.
+
+### 18.2 허용 CDN 추가하기
+아티팩트 HTML이 외부 스크립트를 받을 수 있는 곳은 `apps/server/src/artifacts/serve.ts`의 `CDN_ALLOW_LIST`뿐이다. 버전이 박힌 **정확한 파일 URL**만 넣는다(`@latest`·폴더·호스트 전체 금지).
+1. 게시된 지 2주 넘은 버전을 고른다. URL 예: `https://cdn.jsdelivr.net/npm/<패키지>@<정확한 버전>/dist/<파일>.min.js` 또는 `https://cdnjs.cloudflare.com/ajax/libs/<이름>/<버전>/<파일>.min.js`.
+2. 파일을 받아 SRI 해시를 만든다(스크래치 폴더에서):
+   ```bash
+   curl -sSfo lib.js '<URL>'
+   echo "sha384-$(openssl dgst -sha384 -binary lib.js | openssl base64 -A)"
+   ```
+   CDN이 공개한 SRI 값이 있으면 같은지 비교한다.
+3. `CDN_ALLOW_LIST`에 `{ name, url, integrity }`를 더하고, `packages/mcp-tools/src/artifacts.ts`의 도구 설명에 URL을 적는다(모델이 알게).
+4. `pnpm test`, 그리고 네트워크가 되는 곳에서 `E2E_NETWORK=1 E2E_PORT=3112 pnpm e2e e2e/artifacts.spec.ts`로 실제 로드를 확인한다(e2e의 CDN 시험은 지금 Chart.js 기준 — 새 항목을 쓰는 시험을 더한다).
+- 그 CDN이 **CORS(`Access-Control-Allow-Origin: *`)를 보내야** 한다: 아티팩트는 불투명 출처라 SRI 검사에 CORS 응답이 필요하다(jsDelivr·cdnjs는 보냄).
+
+### 18.3 확인 방법
+- `pnpm e2e e2e/artifacts.spec.ts`: 차트가 그려진 뒤 쿠키·API·부모·최상위 창 접근이 실패하고, 허용 밖 CDN이 막히고, 다른 가족은 403인지 본다.
+- 브라우저에서 원본 주소를 직접 열어도 개발자 도구 콘솔의 `self.origin`이 `"null"`이어야 한다(샌드박스).

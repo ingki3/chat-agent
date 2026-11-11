@@ -21,3 +21,8 @@ export function isApiPath(url: string | undefined): boolean {
 export function isApiRequest(req: { url: string; routeOptions?: { url?: string | undefined } }): boolean {
   return isApiPath(req.url) || (req.routeOptions?.url !== undefined && isApiPath(req.routeOptions.url));
 }
+
+/** `/a/...` — artifact pages and originals (#27), always answered by Fastify routes (never the SPA fallback). */
+export function isArtifactPath(url: string | undefined): boolean {
+  return routerPath(url).startsWith("/a/");
+}
