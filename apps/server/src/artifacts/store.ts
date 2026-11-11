@@ -12,6 +12,7 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, messages, runs } from "../db/schema.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 
 export type ArtifactRow = typeof artifacts.$inferSelect;
 export type ArtifactVersionRow = typeof artifactVersions.$inferSelect;
@@ -165,9 +166,11 @@ export class ArtifactStore {
 
   create(
     scope: ArtifactScope,
-    input: { kind: ArtifactKind; title: unknown } & ArtifactBody,
+    raw: { kind: ArtifactKind; title: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
+    // A runtime's artifact never stores a known secret (review round 23).
+    const input = scrubKnownDeep(raw);
     const title = cleanTitle(input.title);
     const { content, language } = encodeBody(input.kind, input);
     return this.db.transaction((tx) => {
@@ -214,9 +217,10 @@ export class ArtifactStore {
   update(
     scope: ArtifactScope,
     artifactId: string,
-    input: { title?: unknown } & ArtifactBody,
+    raw: { title?: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
+    const input = scrubKnownDeep(raw);
     const a = this.get(artifactId);
     if (!a || a.conversationId !== scope.conversationId || a.userId !== scope.userId)
       throw new ArtifactError("artifact_not_found");

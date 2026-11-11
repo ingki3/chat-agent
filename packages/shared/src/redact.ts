@@ -495,9 +495,16 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
       }
     }
     for (let open = next[0]!; open >= 0; open = next[open + 1]!) {
-      const close = next[open + 1]!;
+      let close = next[open + 1]!;
       if (close < 0) break;
-      const raw = d.slice(open + 1, close);
+      let raw = d.slice(open + 1, close);
+      // YAML single-quoted style: `''` is one quote inside the string (`'pass''word': x` has the key pass'word).
+      while (quote === 39 && d.charCodeAt(close + 1) === 39) {
+        const more = next[close + 2]!;
+        if (more < 0) break;
+        raw += "'" + d.slice(close + 2, more);
+        close = more;
+      }
       // Bash ANSI-C quoting, `$'…'`: the quotes hold the whole assignment (`export $'\560assword=x'`).
       if (quote === 39 && d.charCodeAt(open - 1) === 36) {
         const eq = raw.indexOf("=");
@@ -512,35 +519,46 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
       let [g, , unclosed] = gapEnd(d, close + 1, false);
       // A computed key: `["…"]:`, `` [`…`]: ``.
       if (!unclosed && d.charCodeAt(g) === 93) [g, , unclosed] = gapEnd(d, g + 1, false);
+      const key = readKey(raw);
+      // A template literal with `${…}` computes its text: unknown.
+      if (quote === 96 && raw.includes("${")) key.unknown = true;
+      // A plain string that is not a secret's name is no key to worry about, whatever follows it (round 23:
+      // `console.log("hello" /* long comment */, "done")` stays as it is).
+      if (!key.unknown && !isSecretKey(key.name)) continue;
       if (unclosed) {
-        // A comment whose end we cannot find: what follows the key cannot be known. Fail closed.
+        // A comment whose end we cannot find after a key: what follows it cannot be known. Fail closed.
         hideFrom(g);
         break;
       }
       const sep = separatorAt(d, g);
       if (!sep) continue;
-      const key = readKey(raw);
-      // A template literal with `${…}` computes its text: unknown.
-      if (quote === 96 && raw.includes("${")) key.unknown = true;
-      if (!key.unknown && !isSecretKey(key.name)) continue;
       if (tagged(g + sep)) continue;
       hideFrom(g + sep);
       break; // later keys of this pass start further on
     }
   }
 
-  // C. Computed keys `[…]:` where a key starts (after `{` or `,`): anything but one plain string literal inside
-  // the brackets (`[("a")]`, `["pa" + "ss"]`, `` [`a${b}`] ``) computes the key — unknown, so fail closed.
+  // C. Computed keys `[…]:` where a key starts — after `{` or `,` (comments between allowed), directly inside an
+  // object literal's braces: anything but one plain string literal inside the brackets (`[("a")]`,
+  // `["pa" + "ss"]`, `` [`a${b}`] ``) computes the key — unknown, so fail closed. Not in a regex character
+  // class (`/a,[b]:c/`) or a Markdown link definition (`[guide]: https://…`): no object brace is open there.
   // Brackets are matched in one pass (a stack), so no `[` is ever scanned twice.
-  const stack: number[] = [];
+  const stack: { c: number; at: number; inObject: boolean }[] = [];
   for (let k = 0; k < n; k++) {
     const c = d.charCodeAt(k);
-    if (c === 91) stack.push(k);
-    else if (c === 93 && stack.length) {
-      const open = stack.pop()!;
-      let b = open - 1;
-      while (b >= 0 && isGap(d.charCodeAt(b))) b--;
-      const before = b < 0 ? 123 : d.charCodeAt(b);
+    if (c === 123 || c === 40 || c === 91) {
+      stack.push({ c, at: k, inObject: stack.at(-1)?.c === 123 });
+      continue;
+    }
+    if (c !== 125 && c !== 41 && c !== 93) continue;
+    const want = c === 125 ? 123 : c === 41 ? 40 : 91;
+    if (stack.at(-1)?.c !== want) continue; // unbalanced: ignored
+    const top = stack.pop()!;
+    if (c === 93) {
+      const open = top.at;
+      if (!top.inObject) continue;
+      const b = gapBefore(d, open - 1);
+      const before = b < 0 ? -1 : d.charCodeAt(b);
       if (before !== 123 && before !== 44) continue;
       // One plain string literal: the quoted pass reads it (only short contents are looked at).
       if (k - open <= COMMENT_MAX && SIMPLE_LITERAL.test(d.slice(open + 1, k))) continue;
@@ -571,10 +589,30 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
         c === 95 ||
         c === 45 ||
         c === 36 ||
-        c === 46
+        c === 46 ||
+        // HTTP field names and INI/properties keys take these too (`pass!word: x`, `pass/word=x`).
+        (j > i && (c === 33 || (c === 47 && d.charCodeAt(j + 1) !== 47 && d.charCodeAt(j + 1) !== 42)))
       ) {
         name += d[j]!;
         j++;
+        continue;
+      }
+      // A percent-encoded character of a URL query name (`?%70assword=x` is "password"): decoded, joined.
+      if (c === 37 && isHexCode(d.charCodeAt(j + 1)) && isHexCode(d.charCodeAt(j + 2))) {
+        const ch = String.fromCharCode(parseInt(d.slice(j + 1, j + 3), 16));
+        if (/[\s"'`:=&?#;,]/.test(ch)) break;
+        name += ch;
+        j += 3;
+        continue;
+      }
+      // Shell quoting inside a word (`pass'word'=x`, `pass""word=x`): the quoted letters are part of the name.
+      if (j > i && (c === 39 || c === 34)) {
+        const rel = d.slice(j + 1, j + 66).indexOf(d[j]!);
+        const close = rel < 0 ? -1 : j + 1 + rel;
+        const inner = close > 0 ? d.slice(j + 1, close) : undefined;
+        if (inner === undefined || !/^[A-Za-z0-9_]*$/.test(inner)) break;
+        name += inner;
+        j = close + 1;
         continue;
       }
       if (c > 127 && c !== TAG_CODE) {
@@ -590,6 +628,12 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
       if (next === 10 || next === 13) {
         // A line continuation inside the key (`pass\⏎word`): joined.
         j += next === 13 && d.charCodeAt(j + 2) === 10 ? 3 : 2;
+        continue;
+      }
+      if (next === 32 && j > i) {
+        // An escaped space inside a properties key (`pass\ word=x` is "pass word").
+        name += " ";
+        j += 2;
         continue;
       }
       if (j + 1 >= n || isGap(next) || isQuoteChar(next) || next === 92) break;
@@ -630,7 +674,42 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
       break;
     }
     const sep = separatorAt(d, g);
-    if (!sep) continue;
+    if (!sep) {
+      // Java properties also separate key and value by whitespace alone (`password hunter2`): only a whole line
+      // of exactly that, with a secret's name and a clear credential as the value.
+      if (
+        !unknown &&
+        isSecretKey(name) &&
+        lineStart(d, i0) &&
+        (d.charCodeAt(j) === 32 || d.charCodeAt(j) === 9)
+      ) {
+        let p = j;
+        while (d.charCodeAt(p) === 32 || d.charCodeAt(p) === 9) p++;
+        let end = p;
+        while (
+          end < n &&
+          !isGap(d.charCodeAt(end)) &&
+          !isQuoteChar(d.charCodeAt(end)) &&
+          d.charCodeAt(end) !== 92
+        )
+          end++;
+        let after = end;
+        while (d.charCodeAt(after) === 32 || d.charCodeAt(after) === 9) after++;
+        // The line (or the string holding it: `"password hunter2"`, `…\npassword hunter2\n…`) ends there.
+        const ca = d.charCodeAt(after);
+        const eol =
+          after >= n ||
+          ca === 10 ||
+          ca === 13 ||
+          isQuoteChar(ca) ||
+          (ca === 92 && /[nr"'\\]/.test(d[after + 1] ?? ""));
+        if (eol && end > p && credentialLike(d.slice(p, end))) {
+          ranges.push([at(p), at(end)]);
+          i = Math.max(i, end);
+        }
+      }
+      continue;
+    }
     // Rule A (an unknown key fails closed) applies to a bare token only where a key can start: at the start of
     // the text or a line, or after `{`, `,`, `(` (whitespace between allowed) — not inside a regex or a path
     // (`/\d{2}:\d{2}/`, `\\?\C:\Users`).
@@ -665,6 +744,43 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
     i = Math.max(i, end);
   }
   return { fire, ranges };
+}
+
+const isHexCode = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+
+/**
+ * `k` starts a line: only spaces or tabs before it on its line, or the start of the text — also inside a string
+ * (an opening quote, or an escaped line break `\n` of a stringified document, right before it).
+ */
+function lineStart(d: string, k: number): boolean {
+  let b = k - 1;
+  while (b >= 0 && (d.charCodeAt(b) === 32 || d.charCodeAt(b) === 9)) b--;
+  if (b < 0 || d.charCodeAt(b) === 10 || d.charCodeAt(b) === 13) return true;
+  if ((d.charCodeAt(b) === 110 || d.charCodeAt(b) === 114) && d.charCodeAt(b - 1) === 92) return true;
+  if (!isQuoteChar(d.charCodeAt(b))) return false;
+  const stop = b - 16;
+  while (b >= 0 && b > stop && (isQuoteChar(d.charCodeAt(b)) || d.charCodeAt(b) === 92)) b--;
+  return (
+    b < 0 ||
+    isGap(d.charCodeAt(b)) ||
+    d.charCodeAt(b) === 58 ||
+    d.charCodeAt(b) === 91 ||
+    d.charCodeAt(b) === 44
+  );
+}
+
+/** The last non-gap character at or before `b`, stepping back over whitespace and `/* … *\/` comments. */
+function gapBefore(d: string, b: number): number {
+  // A few comments at most (keeps the scan linear); more than that and the bracket is not taken for a key.
+  for (let comments = 0; comments < 4; comments++) {
+    while (b >= 0 && isGap(d.charCodeAt(b))) b--;
+    if (b < 1 || d.charCodeAt(b) !== 47 || d.charCodeAt(b - 1) !== 42) return b;
+    const from = Math.max(0, b - 1 - COMMENT_MAX);
+    const open = d.slice(from, b - 1).lastIndexOf("/*");
+    if (open < 0) return b;
+    b = from + open - 1;
+  }
+  return -1;
 }
 
 /** Decoded layers pass C looks at (layer 0 is the text itself); deeper wrapping is hidden, fail-closed. */

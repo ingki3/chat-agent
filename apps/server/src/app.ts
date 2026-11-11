@@ -70,6 +70,7 @@ import { logEvent, loggerOptions, rotatingFile } from "./logging.js";
 import { ErrorLog } from "./observability/errors.js";
 import { registerRoutePattern } from "./observability/policy.js";
 import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
+import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -197,6 +198,8 @@ function ephemeralKey(db: Db): Buffer {
 }
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
+  // Review round 23: every secret this server holds is known before anything can produce output.
+  registerConfigSecrets(config);
   const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
   const logDest = opts.logStream ?? (config.logFile ? rotatingFile(config.logFile) : undefined);
   const app = Fastify({
@@ -261,6 +264,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerUserAdmin(app, users, opts.userAdmin);
     if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
     const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
+    primeStoredSecrets(opts.db!, masterKey);
     const settingsStore = new SettingsStore(opts.db!, masterKey);
     // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
     const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);

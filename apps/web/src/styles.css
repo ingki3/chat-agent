@@ -956,6 +956,7 @@ label.inline {
 }
 .admin td {
   overflow-wrap: anywhere;
+}
 /* ---- chat content (#14): markdown, code, math, tables, tools, dividers ---- */
 .thread {
   overflow-anchor: auto;

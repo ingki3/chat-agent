@@ -3,6 +3,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 
 export type SourceRow = typeof sources.$inferSelect;
 
@@ -81,8 +82,10 @@ export class SourceStore {
   }
 
   /** Stores a fetched page. Undefined when the scope does not own the conversation. */
-  addPage(scope: SourceScope, p: PageInput): SourceRow | undefined {
+  addPage(scope: SourceScope, raw: PageInput): SourceRow | undefined {
     if (!this.owns(scope)) return undefined;
+    // A fetched page never stores a known secret (review round 23) — e.g. a key the model put in the URL.
+    const p = scrubKnownDeep(raw);
     const bodyHash = sha256(p.body);
     const same = this.db
       .select()
@@ -122,8 +125,9 @@ export class SourceStore {
   }
 
   /** Stores a search result (no body). Undefined when the scope does not own the conversation. */
-  addSearchResult(scope: SourceScope, s: SearchInput): SourceRow | undefined {
+  addSearchResult(scope: SourceScope, raw: SearchInput): SourceRow | undefined {
     if (!this.owns(scope)) return undefined;
+    const s = scrubKnownDeep(raw);
     const same = this.db
       .select()
       .from(sources)

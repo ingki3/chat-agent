@@ -28,6 +28,7 @@ import {
 } from "./adapter.js";
 import type { UsageAttempt, UsagePurpose } from "../usage/store.js";
 import { logEvent, type EventLogger } from "../logging.js";
+import { scrubKnown, scrubKnownDeep, StreamScrubber } from "../secrets/known.js";
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
@@ -85,7 +86,20 @@ type Live = {
   failure?: unknown;
   /** Finance results of the recent conversation (#30): a follow-up that states figures is checked too. */
   financeCarry?: AnswerEvidence | undefined;
+  /**
+   * Known-secret scrubbers of the text and reasoning streams (review round 23): what may still turn into a secret
+   * with the next chunk is held back here, and goes out (scrubbed) at the next tool event or when the run ends.
+   */
+  scrub: { text: StreamScrubber; reasoning: StreamScrubber };
 };
+
+/** Appends text to the reply; returns the index among the *public* parts (what the message API shows). */
+function appendText(parts: MessagePart[], type: "text" | "reasoning", text: string): number {
+  const last = parts.at(-1);
+  if (last && last.type === type) last.text += text;
+  else parts.push({ type, text });
+  return parts.filter((p) => p.type !== "reasoning").length - 1;
+}
 
 /**
  * Closes the run's session once — later calls share the first close — and resolves after at most `ms`.
@@ -317,7 +331,8 @@ export class RunManager {
       // The partial answer kept from before the restart gets the common finance check too (#30).
       const msg = this.conversations.messageById(r.assistantMessageId);
       if (msg) {
-        const parts = msg.parts as MessagePart[];
+        // Scrubbed again: a secret registered since it was stored (updateMessage scrubs too).
+        const parts = scrubKnownDeep(msg.parts as MessagePart[]);
         this.attachNoteTo(r, parts, this.financeResults.context(r.conversationId, msg.seq));
         this.conversations.updateMessage(msg.id, { parts });
       }
@@ -439,6 +454,7 @@ export class RunManager {
         purpose: input.purpose ?? "chat",
         usage: new Map(),
         tools: new Map(),
+        scrub: { text: new StreamScrubber(), reasoning: new StreamScrubber() },
       });
       const live = this.live.get(run.id)!;
       if (run.connectionId) {
@@ -579,7 +595,9 @@ export class RunManager {
   // ---- internals ----
 
   private emit(runId: string, event: StreamEvent): void {
-    const data = StreamEvent.parse(event);
+    // Last net for every event stored and streamed (review round 23): no known secret, whatever produced it.
+    // Text deltas were scrubbed with their holdback already; `tail: false` keeps them as they are.
+    const data = StreamEvent.parse(scrubKnownDeep(event, { tail: false }));
     const seq = this.db.$client
       .transaction(() => {
         const r = this.db
@@ -607,6 +625,7 @@ export class RunManager {
     if (!live.session) live.abort.abort();
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
+    this.releaseHeld(row, live);
     this.attachNoteTo(row, live.parts, live.financeCarry);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
     this.finish(row, status, code);
@@ -642,6 +661,19 @@ export class RunManager {
     parts.push(note);
     const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
     this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });
+  }
+
+  /**
+   * The text the known-secret scrubbers still hold (it might have become a secret with the next chunk): scrubbed
+   * as finished text, appended and streamed. Before a tool event and when the run ends.
+   */
+  private releaseHeld(row: RunRow, live: Live): void {
+    const reasoning = live.scrub.reasoning.end();
+    if (reasoning) appendText(live.parts, "reasoning", reasoning);
+    const text = live.scrub.text.end();
+    if (!text) return;
+    const partIndex = appendText(live.parts, "text", text);
+    this.emit(row.id, { type: "delta", messageId: row.assistantMessageId, partIndex, text });
   }
 
   /** Forgets a live run without recording anything (its rows are being deleted with the conversation). */
@@ -771,7 +803,11 @@ export class RunManager {
       connectionId: run.connectionId ?? undefined,
       connectionVersion: run.connectionVersion ?? undefined,
       signal: live.abort.signal,
-      history: history.map((m) => ({ role: m.role, parts: publicParts(m.parts as MessagePart[]) })),
+      // Scrubbed again on the way to the runtime: a secret registered after a message was stored (round 23).
+      history: history.map((m) => ({
+        role: m.role,
+        parts: scrubKnownDeep(publicParts(m.parts as MessagePart[])),
+      })),
       systemPrompt: instructions.text,
       model: run.model,
       effort: run.effort ?? undefined,
@@ -853,7 +889,7 @@ export class RunManager {
     const self = all.find((m) => m.id === messageId);
     live.financeCarry = this.financeResults.context(run.conversationId, self?.seq ?? Number.MAX_SAFE_INTEGER);
     const inputText = (lastUser?.parts as MessagePart[] | undefined)
-      ?.flatMap((p) => (p.type === "text" ? [p.text] : []))
+      ?.flatMap((p) => (p.type === "text" ? [scrubKnown(p.text)] : []))
       .join("\n");
 
     const parts = live.parts;
@@ -862,13 +898,6 @@ export class RunManager {
       if (live.settled || (!force && this.now() - lastFlush < this.flushMs)) return;
       lastFlush = this.now();
       this.conversations.updateMessage(messageId, { parts });
-    };
-    /** Appends text; returns the index among the *public* parts (what the message API shows). */
-    const appendText = (type: "text" | "reasoning", text: string): number => {
-      const last = parts.at(-1);
-      if (last && last.type === type) last.text += text;
-      else parts.push({ type, text });
-      return parts.filter((p) => p.type !== "reasoning").length - 1;
     };
 
     let outcome: { status: "done" | "interrupted" | "failed"; code: string | null } = {
@@ -891,23 +920,31 @@ export class RunManager {
       live.turn = turn;
       for await (const ev of turn.events) {
         if (live.settled) break; // force-stopped or deleted: whatever arrives now is ignored
+        // Known secrets (round 23): text streams through a holdback scrubber, so a secret split across chunks
+        // never goes out in pieces; whatever it holds goes out before the next tool event or when the run ends
+        // (usage and notices do not end the text, so they do not release it).
+        if (ev.type === "tool_start" || ev.type === "tool_end") this.releaseHeld(run, live);
         if (ev.type === "text_delta") {
-          const partIndex = appendText("text", ev.text);
-          this.emit(runId, { type: "delta", messageId, partIndex, text: ev.text });
+          const text = live.scrub.text.push(ev.text);
+          if (text) {
+            const partIndex = appendText(parts, "text", text);
+            this.emit(runId, { type: "delta", messageId, partIndex, text });
+          }
           flush();
         } else if (ev.type === "reasoning_delta") {
-          appendText("reasoning", ev.text); // stored, never streamed
+          const text = live.scrub.reasoning.push(ev.text);
+          if (text) appendText(parts, "reasoning", text); // stored, never streamed
         } else if (ev.type === "tool_start") {
           // Missing input/output become null: JSON would drop an undefined key and the stored part would no
-          // longer match the schema. Secret-looking values never leave the runtime (FR-3.4).
-          const input = redactSecrets(ev.input ?? null);
+          // longer match the schema. Known secrets, then secret-looking values, never leave the runtime (FR-3.4).
+          const input = redactSecrets(scrubKnownDeep(ev.input ?? null));
           live.tools.set(ev.callId, { name: ev.name, startedAt: this.now() });
           parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input });
           this.emit(runId, { type: "tool_start", messageId, callId: ev.callId, name: ev.name, input });
           flush(true);
         } else if (ev.type === "tool_end") {
           const extra = ev.isError ? { isError: true } : {};
-          const output = redactSecrets(ev.output ?? null);
+          const output = redactSecrets(scrubKnownDeep(ev.output ?? null));
           this.toolEnded(run, live, ev.callId, ev.isError === true);
           parts.push({ type: "tool_result", callId: ev.callId, output, ...extra });
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
@@ -932,6 +969,7 @@ export class RunManager {
         }
       }
       if (live.settled) return;
+      this.releaseHeld(run, live);
       if (live.interruptRequested) outcome = { status: "interrupted", code: null };
       // The session now reflects this reply as well; otherwise it must not be resumed.
       if (outcome.status === "done") this.conversations.touchSession(sessionRowId, messageId, revision);

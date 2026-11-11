@@ -12,6 +12,7 @@ import {
 import type { Db } from "../db/client.js";
 import { sessions, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
+import { knownSecrets } from "../secrets/known.js";
 
 export type UserRow = typeof users.$inferSelect;
 
@@ -287,6 +288,7 @@ export class UserStore {
       .insert(sessions)
       .values({ id: sha256(token), userId, createdAt: t, lastSeenAt: t, expiresAt: t + SESSION_TTL_MS })
       .run();
+    knownSecrets.add(token); // the cookie never shows up in a reply
     return token;
   }
 
@@ -302,6 +304,7 @@ export class UserStore {
       .where(and(eq(sessions.id, id), gt(sessions.expiresAt, t), eq(users.active, true)))
       .get();
     if (!row) return undefined;
+    knownSecrets.add(token); // sessions from before a restart are known again once used
     if (t - row.lastSeenAt > TOUCH_MS)
       this.db.update(sessions).set({ lastSeenAt: t }).where(eq(sessions.id, id)).run();
     return row.user;
@@ -309,6 +312,7 @@ export class UserStore {
 
   /** Ends one session (logout). Open streams of that session re-check and close. */
   deleteSession(token: string): void {
+    knownSecrets.remove(token);
     const row = this.db
       .delete(sessions)
       .where(eq(sessions.id, sha256(token)))

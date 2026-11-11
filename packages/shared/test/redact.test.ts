@@ -552,11 +552,53 @@ describe("redactSecrets", () => {
       [`22: ${name}, stringified`, JSON.stringify(raw), []],
       [`22: ${name}, stringified twice`, JSON.stringify(JSON.stringify(raw)), []],
     ]),
+    // Round 23 (best effort, P3): the cheap data-format ones.
+    ...(
+      [
+        ["properties whitespace separator", "password hunter2"],
+        [
+          "properties whitespace separator, later line",
+          "user kim" + String.fromCharCode(10) + "password hunter2",
+        ],
+        ["URL query name percent-encoded", "https://x.test/login?%70assword=hunter2"],
+        ["YAML doubled single quote", "'pass''word': hunter2"],
+        ["shell single-quoted part", "export pass'word'='hunter2'"],
+        ["shell empty double quotes", 'export pass""word=hunter2'],
+        ["HTTP field name with !", "pass!word: hunter2"],
+        ["INI key with /", "pass/word=hunter2"],
+        ["properties escaped space", "pass" + BS + " word=hunter2"],
+        ["comment before a computed key", '({/*field*/["pass" + "word"]: \'hunter2\'})'],
+      ] as [string, string][]
+    ).flatMap(([name, raw]): [string, string, string[]][] => [
+      [`23: ${name}`, raw, []],
+      [`23: ${name}, stringified`, JSON.stringify(raw), []],
+      [`23: ${name}, stringified twice`, JSON.stringify(JSON.stringify(raw)), []],
+    ]),
   ];
   it.each(REGRESSIONS)("review round %s", (_round, input, kept) => {
     const out = redactString(input);
     expect(out).not.toMatch(/hunter2|123456/);
     for (const k of kept) expect(out).toContain(k);
+  });
+
+  // Round 23 (P2): no key structure, so nothing is hidden — raw, stringified once and twice.
+  it.each(
+    [
+      ["plain string before a long comment", 'console.log("hello" /* ' + "x".repeat(513) + ' */, "done");'],
+      ["regex character class after a comma", 'const r = /a,[b]:c/; const next = "save";'],
+      ["Markdown link definition", "[guide]: https://example.com"],
+      [
+        "Markdown link definition in a reply",
+        "자세한 내용은 [guide]를 보세요." + String.fromCharCode(10) + "[guide]: https://example.com/docs",
+      ],
+      ["prose with password and a word", "password reset" + String.fromCharCode(10) + "다음 줄"],
+    ].flatMap(([name, raw]) => [
+      [name!, raw!],
+      [`${name}, stringified`, JSON.stringify(raw)],
+      [`${name}, stringified twice`, JSON.stringify(JSON.stringify(raw))],
+    ]),
+  )("review round 23 keeps: %s", (_name, input) => {
+    expect(redactString(input)).toBe(input);
   });
 
   it("pass A's placeholder survives pass B decoding and re-encoding a literal that overlaps it", () => {

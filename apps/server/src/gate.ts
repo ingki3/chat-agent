@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import "./auth/context.js";
 import { readCookie } from "./auth/plugin.js";
 import { isApiRequest, routerPath } from "./paths.js";
+import { knownSecrets } from "./secrets/known.js";
 
 /**
  * Temporary access-code gate (until Cloudflare Access is configured, docs/ops.md §7).
@@ -138,8 +139,10 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
       }
       failures.delete(client);
       const exp = now() + ttlMs;
+      const signature = sign(exp);
+      knownSecrets.add(signature); // the cookie is a bearer pass: never in a reply
       const cookie = [
-        `${GATE_COOKIE}=${exp}.${sign(exp)}`,
+        `${GATE_COOKIE}=${exp}.${signature}`,
         "Path=/",
         "HttpOnly",
         "SameSite=Lax",
