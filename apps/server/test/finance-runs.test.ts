@@ -19,6 +19,7 @@ import { createTestDb } from "../src/db/client.js";
 import { eq } from "drizzle-orm";
 import { financeResults, messages } from "../src/db/schema.js";
 import { FinanceResultStore } from "../src/finance/results.js";
+import { finalize } from "../src/finance/records.js";
 import { RuntimeRegistry, type RuntimeAdapter } from "../src/runtime/adapter.js";
 import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
@@ -201,6 +202,34 @@ describe("finance output check under the run manager (#30)", () => {
     // Another conversation of the same user is not about finance.
     const other = app.conversations!.create(f.users.owner.id);
     expect((await send(f.cookies.owner, other.id, "349.8달러입니다.")).note).toBeUndefined();
+  });
+
+  it("an ETF price written after the brand is checked as a figure (review #93 round 3)", async () => {
+    const meta = {
+      source: "네이버 증권",
+      asOf: "2026-11-13T15:30:00+09:00",
+      timeZone: "Asia/Seoul",
+      delayed: false,
+      kind: "close",
+    } as const;
+    const etf = finalize("kr_etf", { code: "069500", name: "KODEX 200", price: { value: 84540, ...meta } });
+    const script: FakeScript = (input, memory) =>
+      input.text === "KODEX 200 시세"
+        ? [
+            { tool: "mcp__agentlee__kr_etf", ms: 0, input: { code: "069500" }, output: etf },
+            { text: "확인했어요." },
+          ]
+        : defaultScript(input, memory);
+    const { app, f, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "KODEX 200 시세");
+    // The follow-up states the price after the brand only: it is a figure, so the note is due and flagged.
+    const r = await send(f.cookies.owner, c.id, "KODEX 84540원입니다.");
+    expect(r.note).toMatchObject({
+      sources: [expect.objectContaining({ label: "네이버 증권 · 2026-11-13 15:30 KST 종가" })],
+      missing: ["source", "as_of"],
+      disclaimer: FINANCE_DISCLAIMER,
+    });
   });
 
   it("stored results count only while their answer is in the history before the new one", async () => {

@@ -392,9 +392,18 @@ describe("finance tools replay their recorded answers (#30)", () => {
     expect(scrubBody("a=x%2Fy b=x%2fy c=x/y d=Zx/y", ["x/y"])).toBe(
       "a=[redacted] b=[redacted] c=[redacted] d=Zx/y",
     );
-    // A value that is also a whole JSON token of the data breaks the JSON: the server refuses it (fails closed).
-    expect(() => JSON.parse(scrubBody('{"price":1}', ["1"]))).toThrow();
+    // A number or literal that is itself a session value refuses the response (fails closed, never changes data).
+    expect(() => scrubBody('{"price":1}', ["1"])).toThrow(/web_bad_content/);
+    expect(() => scrubBody('{"ok":true}', ["true"])).toThrow(/web_bad_content/);
     expect(scrubBody('{"price":12}', ["1"])).toBe('{"price":12}');
+    // Keys are never scrubbed (review #93 round 3): a crumb `raw` leaves Yahoo's `{"raw": …}` fields intact.
+    expect(scrubBody('{"raw":5,"fmt":"raw","x":{"raw":1.2,"note":"raw data"}}', ["raw"])).toBe(
+      '{"raw":5,"fmt":"[redacted]","x":{"raw":1.2,"note":"[redacted] data"}}',
+    );
+    // …but a key carrying a long session value (a token, not a name) refuses the response.
+    expect(() => scrubBody('{"oldSession987":1}', ["oldSession987"])).toThrow(/web_bad_content/);
+    // Not JSON: the text.
+    expect(scrubBody("a raw b", ["raw"])).toBe("a [redacted] b");
   });
 
   it("every configured secret is scrubbed from a result, however short (SEC_USER_AGENT may be 5 characters)", async () => {
@@ -885,6 +894,42 @@ describe("finance output check (#30)", () => {
     expect(figuresOf("S&P 500 지수 6000").map((f) => f.n)).toEqual([6000]);
     expect(figuresOf("KODEX 200 84,540원").map((f) => f.n)).toEqual([84540]);
     expect(figuresOf("S&P 500, 나스닥 100 모두 올랐어요").map((f) => f.n)).toEqual([]);
+  });
+
+  it("ETF names never take a price with them (review #93 round 3)", () => {
+    expect(figuresOf("KODEX 84540원입니다.").map((f) => f.n)).toEqual([84540]);
+    expect(figuresOf("KODEX 200 84,540원").map((f) => f.n)).toEqual([84540]);
+    expect(figuresOf("KODEX 200은 84,540원").map((f) => f.n)).toEqual([84540]);
+    expect(figuresOf("TIGER 미국S&P500 15,000원").map((f) => f.n)).toEqual([15000]);
+    expect(figuresOf("KODEX 200선물인버스2X 2,000원").map((f) => f.n)).toEqual([2000]);
+    expect(figuresOf("TIGER 1000원짜리").map((f) => f.n)).toEqual([1000]);
+    const etf = financeEvidence(
+      parts("", [
+        finalize("kr_etf", { code: "069500", name: "KODEX 200", price: { value: 84540, ...naver } }),
+      ]),
+    );
+    expect(checkAnswer("KODEX 84540원입니다.", etf)).toEqual(["source", "as_of"]);
+  });
+
+  it("Korean compound amounts are one figure (review #93 round 3)", () => {
+    expect(figuresOf("20만 6000원").map((f) => f.n)).toEqual([206000]);
+    expect(figuresOf("20만6000원").map((f) => f.n)).toEqual([206000]);
+    expect(figuresOf("1억 2,300만 4,000원").map((f) => f.n)).toEqual([123004000]);
+    expect(figuresOf("3조 2억원").map((f) => f.n)).toEqual([3000200000000]);
+    // Not a chain: a comma between, or a larger unit after a smaller one.
+    expect(figuresOf("20만, 6000원").map((f) => f.n)).toEqual([200000, 6000]);
+    expect(figuresOf("5만 3억").map((f) => f.n)).toEqual([50000, 300000000]);
+    // The precision of the last written part: 20만 6000원 is exactly 206,000.
+    expect(figuresOf("20만 6000원")[0]!.tolerance).toBe(0.5);
+    expect(figuresOf("1억 2천만원")[0]).toEqual({ n: 120000000, tolerance: 5000000 });
+    // Codex example: Naver's intraday 206,000 written as 20만 6000원 and cited to Yahoo.
+    const both = [
+      finalize("us_quote", { symbol: "AAPL", price: { value: 349.8, ...yahoo } }),
+      finalize("kr_quote", { code: "005930", price: { value: 206000, ...live } }),
+    ];
+    expect(check("삼성전자 20만 6000원 (Yahoo Finance 2026-11-13).", both)).toEqual(["source", "as_of"]);
+    expect(check("삼성전자 20만6000원 (Yahoo Finance 2026-11-13).", both)).toEqual(["source", "as_of"]);
+    expect(check("삼성전자 20만 6000원 (네이버 증권 11월 12일 10:14 KST 장중).", both)).toEqual([]);
   });
 
   it("magnitude units are normalised before values are matched (review #93 round 2)", () => {

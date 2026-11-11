@@ -144,6 +144,37 @@ export function financeEvidence(parts: readonly MessagePart[]): FinanceEvidence 
 const UNIT_AFTER = String.raw`\s*(?:원|달러|불|엔|위안|유로|%|퍼센트|pt|포인트|주|배|bp|천|만|억|조|[KMBT](?![A-Za-z])|USD|KRW)`;
 const NUM_END = String.raw`(?!\d|[,.]\d|${UNIT_AFTER})`;
 const NUM_START = String.raw`(?<![\d,.$₩])`;
+/** Words around the number in Korean ETF names. */
+const ETF_WORDS = [
+  "미국",
+  "코리아",
+  "차이나",
+  "중국",
+  "일본",
+  "인도",
+  "글로벌",
+  "선진국",
+  "S&P",
+  "나스닥",
+  "NASDAQ",
+  "코스피",
+  "KOSPI",
+  "코스닥",
+  "KOSDAQ",
+  "KRX",
+  "MSCI",
+  "TOP",
+  "선물",
+  "레버리지",
+  "인버스",
+  "커버드콜",
+  "채권",
+  "국채",
+  "액티브",
+  "TR",
+  "IT",
+  "반도체",
+].join("|");
 
 const NOT_FIGURES: RegExp[] = [
   /\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}\s*일?/g,
@@ -164,9 +195,11 @@ const NOT_FIGURES: RegExp[] = [
     String.raw`(?:S&P\s*500|Russell\s*2000|(?:KOSPI|코스피)\s*200|(?:NASDAQ|나스닥)[-\s]*100|(?:Dow|다우)\s*30)${NUM_END}`,
     "gi",
   ),
-  // Korean ETF brands carry numbers in their names (KODEX 200, TIGER 미국S&P500) — not an amount after them.
+  // Korean ETF brands carry numbers in their names (KODEX 200, TIGER 미국S&P500, KODEX 200선물인버스2X): the brand,
+  // known market words, the number — which must not be an amount (no unit right after its digits: KODEX 84540원
+  // is a price) — and known suffix words. Nothing else is taken with it.
   new RegExp(
-    String.raw`\b(?:KODEX|TIGER|KBSTAR|RISE|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|KIWOOM)\s*[A-Za-z가-힣&]*\d+[A-Za-z가-힣&]*${NUM_END}`,
+    String.raw`\b(?:KODEX|TIGER|KBSTAR|RISE|ACE|SOL|HANARO|KOSEF|ARIRANG|PLUS|KIWOOM)(?:\s*(?:${ETF_WORDS}))*\s*\d+${NUM_END}(?:\s*(?:${ETF_WORDS}|\d?X))*`,
     "g",
   ),
   /\d+\s*번째/g,
@@ -175,8 +208,14 @@ const NOT_FIGURES: RegExp[] = [
   new RegExp(String.raw`${NUM_START}0\d{5}${NUM_END}`, "g"),
 ];
 
-/** A number and an optional magnitude (20.6만, 1.2억, 3.5조, 1.2B, 500K). */
-const FIGURE = /[+-]?\d[\d,]*(?:\.\d+)?(?:\s*(천|만|억|조|[KMBT](?![A-Za-z])))?/g;
+/**
+ * A number and an optional magnitude (20.6만, 1.2억, 3.5조, 1.2B, 500K). Korean compound amounts (`20만 6000원`,
+ * `20만6000원`, `1억 2,300만 4,000원`) are joined into one figure in `figuresOf`.
+ */
+const FIGURE = /[+-]?\d[\d,]*(?:\.\d+)?(?:\s*([십백천]?[만억조]|천|[KMBT](?![A-Za-z])))?/g;
+const KOREAN_PREFIX: Record<string, number> = { 십: 10, 백: 100, 천: 1000 };
+/** 만 = 1e4, 천만 = 1e7, 백억 = 1e10, K = 1e3 … */
+const magnitude = (u: string) => (u.length === 2 ? KOREAN_PREFIX[u[0]!]! * MAGNITUDE[u[1]!]! : MAGNITUDE[u]!);
 const MAGNITUDE: Record<string, number> = {
   천: 1e3,
   만: 1e4,
@@ -206,15 +245,52 @@ export function figuresOf(text: string, identifiers: readonly string[] = []): Fi
     t = t.replace(re, " ");
   }
   for (const re of NOT_FIGURES) t = t.replace(re, " ");
-  return [...t.matchAll(FIGURE)].flatMap((m) => {
+  type Part = { n: number; mult: number; korean: boolean; tolerance: number; start: number; end: number };
+  const parts: Part[] = [...t.matchAll(FIGURE)].flatMap((m) => {
     const digits = /[+-]?\d[\d,]*(?:\.\d+)?/.exec(m[0])![0].replace(/,/g, "");
     const base = Number(digits);
     if (!Number.isFinite(base)) return [];
-    const mult = m[1] ? MAGNITUDE[m[1]]! : 1;
+    const mult = m[1] ? magnitude(m[1]) : 1;
     const decimals = digits.includes(".") ? digits.split(".")[1]!.length : 0;
     // Half a unit of the last written digit: 20.6만 covers 205,500–206,500; 206,000 only 206,000 (±0.5).
-    return [{ n: base * mult, tolerance: 0.5 * 10 ** -decimals * mult }];
+    return [
+      {
+        n: base * mult,
+        mult,
+        korean: !!m[1] && /[천만억조]/.test(m[1]),
+        tolerance: 0.5 * 10 ** -decimals * mult,
+        start: m.index,
+        end: m.index + m[0].length,
+      },
+    ];
   });
+  // Korean compound amounts: 조 → 억 → 만 → (천) → units, each part a smaller unit, only spaces between.
+  const out: Figure[] = [];
+  for (let i = 0; i < parts.length;) {
+    const head = parts[i]!;
+    let n = head.n;
+    let last = head;
+    let j = i + 1;
+    while (j < parts.length) {
+      const next = parts[j]!;
+      const gap = t.slice(last.end, next.start);
+      if (
+        !last.korean ||
+        !(next.korean || next.mult === 1) ||
+        !/^\s*$/.test(gap) ||
+        next.mult >= last.mult ||
+        next.n < 0
+      )
+        break;
+      n += next.n;
+      last = next;
+      j++;
+    }
+    // The precision is that of the last written part (20만 6000원: ±0.5).
+    out.push({ n, tolerance: last.tolerance });
+    i = j;
+  }
+  return out;
 }
 
 // ---- naming a source, a date, a time ------------------------------------------------------------------------

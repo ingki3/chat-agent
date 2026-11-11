@@ -570,28 +570,49 @@ const encodedPattern = (t) =>
  * text) must not hand them to the model. JSON is rewritten in its canonical form first, so an escaped spelling
  * (`\u0041`, `\/`) cannot hide a value; the JSON-escaped and URL-encoded (`%2F` or `%2f`) spellings are scrubbed
  * too. Whatever its length, a value is replaced only as a whole token (no letter or digit on either side), so a
- * short crumb such as `xyz` does not cut into `xyzzy`. A value that is a whole JSON token of the data (a cookie
- * `1` and a price `1`) breaks the JSON, and the server then refuses the answer (`finance_bad_response`): it fails
- * closed rather than handing the value on. Base64 and partial spellings are out of scope (docs/decisions/isolation.md).
+ * short crumb such as `xyz` does not cut into `xyzzy`. In JSON only string values are scrubbed, never keys; a key,
+ * number or literal that is a whole session value (a cookie `1` and a price `1`) refuses the response
+ * (`web_bad_content` → `finance_bad_response`): it fails closed rather than handing the value on or changing data. Base64 and partial spellings are out of scope (docs/decisions/isolation.md).
  * @param {string} body @param {Iterable<string>} hidden
  */
 export function scrubBody(body, hidden) {
   const values = [...new Set(hidden)].filter((v) => typeof v === "string" && v.length > 0);
   if (!values.length) return body;
-  let text = body;
-  try {
-    text = JSON.stringify(JSON.parse(body));
-  } catch {
-    // not JSON: the raw text
-  }
   // Longest first: a value inside a longer one goes with it.
   values.sort((a, b) => b.length - a.length);
-  for (const v of values)
-    for (const form of new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)])) {
-      const re = new RegExp(`(?<![A-Za-z0-9])${encodedPattern(form)}(?![A-Za-z0-9])`, "g");
-      text = text.replace(re, "[redacted]");
-    }
-  return text;
+  const patterns = values.flatMap((v) =>
+    [...new Set([v, JSON.stringify(v).slice(1, -1), encodeURIComponent(v)])].map(
+      (form) => new RegExp(`(?<![A-Za-z0-9])${encodedPattern(form)}(?![A-Za-z0-9])`, "g"),
+    ),
+  );
+  const scrub = (t) => patterns.reduce((acc, re) => acc.replace(re, "[redacted]"), t);
+  const hit = (t) => patterns.some((re) => ((re.lastIndex = 0), re.test(t)));
+  // Keys are the data's names, not its text: a short session value that happens to be a field name (`raw`) leaves
+  // them alone. A key carrying a long session value (8+ characters — a token, not a name) refuses the response.
+  const keyHit = (k) =>
+    values.some((v) => v.length >= 8 && new RegExp(`(?<![A-Za-z0-9])${reEscape(v)}(?![A-Za-z0-9])`).test(k));
+  let data;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    return scrub(body); // not JSON: the raw text
+  }
+  // JSON: only string values are scrubbed — never keys (a crumb `raw` must not rename `{"raw": …}` fields and
+  // silently empty the data). A number or literal that is itself a session value is refused (fails closed).
+  const walk = (x) => {
+    if (typeof x === "string") return scrub(x);
+    if (Array.isArray(x)) return x.map(walk);
+    if (x && typeof x === "object")
+      return Object.fromEntries(
+        Object.entries(x).map(([k, v]) => {
+          if (keyHit(k)) throw new WebError("web_bad_content");
+          return [k, walk(v)];
+        }),
+      );
+    if (x !== null && hit(String(x))) throw new WebError("web_bad_content");
+    return x;
+  };
+  return JSON.stringify(walk(data));
 }
 
 /**
