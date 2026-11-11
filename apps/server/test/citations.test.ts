@@ -166,6 +166,33 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("총 투자 금액은 10", "총 투자 금액은 10 만에 그쳤다.")).toBe(false);
   });
 
+  it("a range with units is cut at neither side: token-based range boundary (round 17)", () => {
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%~5%이다.")).toBe(false);
+    expect(found("객실의 하루 요금은 10만원", "객실의 하루 요금은 10만원~20만원이다.")).toBe(false);
+    expect(found("내일 예상 기온은 10°C", "내일 예상 기온은 10°C~20°C이다.")).toBe(false);
+    expect(found("5%라고 안내했다.", "올해 예상 수익률은 3%~5%라고 안내했다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3% ~ 5%이다.")).toBe(false);
+    expect(found("5%라고 안내했다.", "올해 예상 수익률은 3% ~ 5%라고 안내했다.")).toBe(false);
+    expect(found("20만원이라고 안내했다", "요금은 10만원~20만원이라고 안내했다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%/5%이다.")).toBe(false);
+    // Controls: the whole range; prose with numbers on both sides of a comma; a separator not followed by a digit.
+    expect(found("올해 예상 수익률은 3%~5%", "올해 예상 수익률은 3%~5%이다.")).toBe(true);
+    expect(found("매출은 3% 증가, 5% 감소했다", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
+    expect(found("매출은 3% 증가", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
+    expect(found("5% 감소했다고 밝혔다", "매출은 3% 증가, 5% 감소했다고 밝혔다.")).toBe(true);
+    expect(found("주차는 A-1 구역에서 한다", "주차는 A-1 구역에서 한다.")).toBe(true);
+    expect(found("주차 위치는 B동 A", "주차 위치는 B동 A-1 구역이다.")).toBe(true);
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%~이다.")).toBe(true);
+    // Only the token at the edge counts: a digit elsewhere in the match does not make a range.
+    expect(found("3층 주차장은 B동 A", "3층 주차장은 B동 A-1 구역이다.")).toBe(true);
+    expect(found("최대 20명이라고 했다", "인원은 10~최대 20명이라고 했다.")).toBe(true);
+    // A sign or a decimal mark only matters before a number.
+    expect(found("A등급이었다고 밝혔다", "결과는 -A등급이었다고 밝혔다.")).toBe(true);
+    expect(found("A형이었다고 밝혔다", "결과는 3,A형이었다고 밝혔다.")).toBe(true);
+    expect(found("A1등급이었다고 밝혔다", "결과는 -A1등급이었다고 밝혔다.")).toBe(true);
+    expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
+  });
+
   it("a range that repeats the currency sign is one range (round 16)", () => {
     expect(found("객실의 하루 요금은 $100", "객실의 하루 요금은 $100-$200이다.")).toBe(false);
     expect(found("객실의 하루 요금은 €100", "객실의 하루 요금은 €100 ~ €200이다.")).toBe(false);

@@ -154,7 +154,8 @@ const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
  * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
  */
 // A repeated currency sign after a range mark is part of the range (`$100-$200`, `€100 ~ €200`, `$10–$20`).
-const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N})/u;
+const DECIMAL_AFTER = /^[.,]\p{N}/u;
+const RANGE_AFTER = /^ ?[/:\-\u2212~] ?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
 const RANGE_MARK = /^[/:~]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
 /** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
@@ -424,18 +425,30 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
 }
 
 /**
- * The start of a number match, walked back over spaces and currency signs (`-$100`, `-$ 100`, `- $100`, `-€5`):
- * a sign there, a range or fraction mark after a digit (`10 ~ 20`, `1/2`), or — only right at the start — a
- * decimal or thousands mark after a digit (`1.32`, `1,234`; `3, 4명` is prose) means the number goes on before.
+ * Whether the number a match starts with goes on before it. Walked back over spaces and currency signs from the
+ * match start (`-$100`, `-$ 100`, `- $100`, `-€5`):
+ * - a sign there (only when the match starts with a number), or — right at the start — a decimal or thousands mark
+ *   after a digit (`1.32`, `1,234`; `3, 4명` is prose);
+ * - a range or fraction mark (`~` `/` `:`; `-` `−` count as signs) after a token with a digit (`3%~5%`,
+ *   `10만원~20만원`, `10°C ~ 20°C`, `1/2`) — whenever the match's first token has a digit (review #97 round 17).
  */
-function numberGoesOnBefore(norm: string, at: number): boolean {
+function numberGoesOnBefore(
+  norm: string,
+  at: number,
+  numberStart: boolean,
+  firstTokenHasDigit: boolean,
+): boolean {
   let j = at;
   while (j > 0 && (norm[j - 1] === " " || CURRENCY.test(norm[j - 1]!))) j--;
   const c = norm[j - 1] ?? "";
-  if (SIGN.test(c)) return true;
-  const beforeMark = norm[j - 2] === " " ? (norm[j - 3] ?? "") : (norm[j - 2] ?? "");
-  if (RANGE_MARK.test(c) && DIGIT.test(beforeMark)) return true;
-  return j === at && DECIMAL_MARK.test(c) && DIGIT.test(norm[j - 2] ?? "");
+  if (numberStart && SIGN.test(c)) return true;
+  if (firstTokenHasDigit && (RANGE_MARK.test(c) || SIGN.test(c))) {
+    let k = j - 1;
+    while (k > 0 && norm[k - 1] === " ") k--;
+    const token = norm.slice(Math.max(0, norm.lastIndexOf(" ", k - 1) + 1), k);
+    if (DIGIT.test(token)) return true;
+  }
+  return numberStart && j === at && DECIMAL_MARK.test(c) && DIGIT.test(norm[j - 2] ?? "");
 }
 
 /** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
@@ -444,6 +457,8 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
   const second = firstChar(want.slice(first.length));
   const last = lastChar(want);
   // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
+  const firstTokenHasDigit = DIGIT.test(want.split(" ")[0] ?? "");
+  const lastTokenHasDigit = DIGIT.test(want.slice(want.lastIndexOf(" ") + 1));
   const numberStart =
     DIGIT.test(first) ||
     (CURRENCY.test(first) && DIGIT.test(second === " " ? firstChar(want.slice(first.length + 1)) : second));
@@ -453,13 +468,16 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     if (TOKEN.test(before)) continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
     // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
-    if (numberStart && numberGoesOnBefore(norm, at)) continue;
+    if ((numberStart || firstTokenHasDigit) && numberGoesOnBefore(norm, at, numberStart, firstTokenHasDigit))
+      continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
     // Number continuation at the end: not before `SEP digit` (`1` in `1/2`, `3` in `3.5`, `10` in `10~20`), and a
     // Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number). The
     // mirror at the start (`이` right after `백`) is already refused by the start token rule.
-    if (DIGIT.test(last) && NUMBER_AFTER.test(rest)) continue;
+    if (DIGIT.test(last) && DECIMAL_AFTER.test(rest)) continue;
+    // A range after the match's last token with a digit (`3%`, `10만원`, `10°C` in `3%~5%`, `10만원~20만원`).
+    if (lastTokenHasDigit && RANGE_AFTER.test(rest)) continue;
     // Not before a unit quote either (`12` is not in `12'`, `12 '`): after a digit the page's quote marks are kept
     // as they are, so any quote mark there is a unit.
     if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
