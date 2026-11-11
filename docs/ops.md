@@ -26,6 +26,7 @@
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
 - 서버는 `MASTER_KEY_PATH`가 `DATA_DIR` 안에 있으면 시작을 거부한다.
 - `BACKUP_DIR`이 `DATA_DIR` 안(또는 `DATA_DIR`을 품는 곳), 레포 안이거나 마스터 키를 품으면 시작을 거부한다(21절).
+- **알려진 비밀 값 가림 (#14 리뷰 23~27차)**: 서버가 아는 비밀 값(연결 키·토큰, `.env` 비밀, 게이트 코드, 세션·MCP 토큰, 암호화되는 모든 값)은 저장·응답·스트림·런타임 전달 전에 가려진다. 스키마의 텍스트 열마다 쓰기 가림 또는 제외 이유가 `apps/server/src/secrets/columns.ts`에 있다. **받아들인 한계**: `users.email`과 `connections.account_email`은 식별자(관리자가 정하거나 공급자가 발급)라 저장값을 가리지 않는다 — 가리면 로그인이, 해시하면 관리자 화면과 Access 동기화(#36)가 깨진다. 이 값을 보여 주는 응답은 그래도 가려진다. 멱등 키(`runs.idempotency_key`)는 SHA-256으로만 저장한다.
 
 ## 2. 처음 설치
 

@@ -1301,3 +1301,225 @@ describe("round 26: writes, rescrub retry, headers, structured content", () => {
     for (const m of rt.seen.at(-1)!.history) expect(joinedText(m.parts as never)).not.toContain(key);
   });
 });
+
+describe("round 27", () => {
+  const key = "sk-ant-api03-round27TransportCase-0123";
+  const pct = (s: string) =>
+    [...Buffer.from(s, "utf8")].map((b) => "%" + b.toString(16).toUpperCase().padStart(2, "0")).join("");
+  const uEsc1 = (s: string) =>
+    [...s].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+  const oct = (s: string) => [...Buffer.from(s)].map((b) => "\\" + b.toString(8).padStart(3, "0")).join("");
+
+  it("every encoding inside one transport layer: unicode escapes, octal or percent, then percent-encoded", () => {
+    const reg = new KnownSecrets();
+    reg.add(key);
+    for (const [name, enc] of [
+      ["unicode escape, then percent", pct(uEsc1(key))],
+      ["octal, then percent", pct(oct(key))],
+      ["percent, then percent", pct(pct(key))],
+      ["percent inside JSON escapes", uEsc1(pct(key))],
+    ] as const) {
+      const out = scrubKnown(`앞 ${enc} 뒤`, { registry: reg });
+      expect(out, name).toBe("앞 [숨김] 뒤");
+    }
+  });
+
+  it("a stream cut inside a transport escape is held: no cut point releases the whole form", () => {
+    const reg = new KnownSecrets();
+    reg.add(key);
+    const forms = {
+      "base64 in \\u escapes": uEsc1(Buffer.from(key).toString("base64")),
+      "hex in \\u escapes": uEsc1(Buffer.from(key).toString("hex")),
+      "base64 percent-encoded": pct(Buffer.from(key).toString("base64")),
+      "key in \\u escapes, percent-encoded": pct(uEsc1(key)),
+    };
+    for (const [name, enc] of Object.entries(forms)) {
+      const text = `앞 ${enc} 뒤`;
+      const leaks: number[] = [];
+      for (let cut = 1; cut < text.length; cut++) {
+        const s = new StreamScrubber(reg);
+        const out = s.push(text.slice(0, cut)) + s.push(text.slice(cut)) + s.end();
+        if (out.includes(enc) || !out.includes("[숨김]")) leaks.push(cut);
+      }
+      expect(leaks, name).toEqual([]);
+    }
+  });
+
+  it("a part ending in a secret's first letters stays when the joined text holds no secret", () => {
+    const reg = new KnownSecrets();
+    reg.add("a".repeat(16) + "X");
+    const parts = [
+      { type: "text", text: "a".repeat(16) },
+      { type: "text", text: "b ordinary prose data banana" },
+    ];
+    expect(scrubParts(parts, { registry: reg })).toEqual(parts);
+    // A secret at the end of the last part is still masked as cut off.
+    const cut = [{ type: "text", text: "끝 " + "a".repeat(16) }];
+    expect(scrubParts(cut, { registry: reg })).toEqual([{ type: "text", text: "끝 [숨김]" }]);
+  });
+
+  it("the mask of an encoded secret ends where it ends (the line break after it stays)", () => {
+    const reg = new KnownSecrets();
+    reg.add(key);
+    const code = `// token ${Buffer.from(key).toString("base64")}\nconsole.log("ordinary code");`;
+    expect(scrubKnown(code, { registry: reg })).toBe('// token [숨김]\nconsole.log("ordinary code");');
+    const pctCode = `// token ${encodeURIComponent(Buffer.from(key).toString("base64"))}\nnext();`;
+    expect(scrubKnown(pctCode, { registry: reg })).toBe("// token [숨김]\nnext();");
+  });
+
+  it("a masked number in chart data is missing (null): the other bars keep valid coordinates", async () => {
+    const n = 10_000_000 + crypto.randomInt(80_000_000);
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    rt.script(() => [{ type: "text_delta", text: "답" }]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/json",
+      },
+      payload: { text: "차트" },
+    });
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    for (let i = 0; i < 400 && !app.runs!.get(runId)?.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    const art = app.artifacts!.create({ userId: f.users.owner.id, conversationId: conv.id, runId }, {
+      kind: "chart",
+      title: "차트",
+      chart: { type: "bar", labels: ["a", "b"], series: [{ name: "s", values: [n, 2] }] },
+    } as never);
+    knownSecrets.add(String(n));
+    await app.storedRescrub!.idle();
+    const row = db.$client
+      .prepare("select content from artifact_versions where artifact_id = ?")
+      .get(art.artifact.id) as {
+      content: string;
+    };
+    expect(JSON.parse(row.content).series[0].values).toEqual([null, 2]);
+    const raw = await app.inject({
+      url: `/a/${art.artifact.id}/v/1/raw`,
+      headers: { host: "localhost:3000", cookie: f.cookies.owner },
+    });
+    expect(raw.statusCode).toBe(200);
+    expect(raw.body).not.toContain("NaN");
+    expect(raw.body).not.toContain(String(n));
+    expect(raw.body).toMatch(/<rect[^>]+height="[0-9.]+"/);
+  });
+
+  it("idempotency keys are stored hashed and still find the same run", async () => {
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    rt.script(() => [{ type: "text_delta", text: "답" }]);
+    const ik = `idem-${crypto.randomBytes(16).toString("base64url")}`;
+    const post = () =>
+      app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers: {
+          host: "localhost:3000",
+          cookie: f.cookies.owner,
+          origin: "http://localhost:3000",
+          [CSRF_HEADER]: "1",
+          "content-type": "application/json",
+          "idempotency-key": ik,
+        },
+        payload: { text: "한 번" },
+      });
+    const a = (await post()).json<{ run: { id: string } }>().run.id;
+    const b = (await post()).json<{ run: { id: string } }>().run.id;
+    expect(b).toBe(a);
+    const stored = JSON.stringify(db.$client.prepare("select idempotency_key from runs").all());
+    expect(stored).not.toContain(ik);
+    expect(stored).toContain("sha256:");
+  });
+
+  it("protocol and security headers keep their meaning whatever is registered; the body is still scrubbed", async () => {
+    for (const code of ["application/json", "no-store", "script-src"]) {
+      const db = createTestDb();
+      const app = await buildApp(loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: code }), {
+        db,
+        logger: false,
+      });
+      apps.push(app);
+      const f = await createFamily(app);
+      const conv = app.conversations!.create(f.users.owner.id);
+      db.$client.prepare("update conversations set title = ? where id = ?").run(`제목 ${code} 끝`, conv.id);
+      const r = await app.inject({
+        url: `/api/conversations/${conv.id}`,
+        headers: { host: "localhost:3000", cookie: f.cookies.owner },
+      });
+      expect(r.statusCode, code).toBe(200);
+      expect(String(r.headers["content-type"]), code).toMatch(/^application\/json/);
+      expect(String(r.headers["cache-control"]), code).toContain("no-store");
+      expect(r.json<{ title: string }>().title, code).toBe("제목 [숨김] 끝");
+      // An artifact's raw page: its own CSP and nosniff headers intact, its body scrubbed.
+      const art = app.artifacts!.create(
+        { userId: f.users.owner.id, conversationId: conv.id, runId: "none" },
+        { kind: "markdown", title: "문서", content: `본문 ${code} 끝` },
+      );
+      const raw = await app.inject({
+        url: `/a/${art.artifact.id}/v/1/raw`,
+        headers: { host: "localhost:3000", cookie: f.cookies.owner },
+      });
+      expect(raw.statusCode, code).toBe(200);
+      expect(String(raw.headers["content-security-policy"]), code).toMatch(/script-src|default-src/);
+      expect(String(raw.headers["content-security-policy"]), code).not.toContain("%5B");
+      expect(String(raw.headers["x-content-type-options"]), code).toBe("nosniff");
+      expect(String(raw.headers["content-type"]), code).not.toContain("%5B");
+    }
+  });
+
+  it("the rescrub of messages.parts finds a secret split across text parts (joined in SQL)", async () => {
+    const db = createTestDb();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db, logger: false });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    const k = `sk-ant-api03-${crypto.randomBytes(20).toString("base64url")}`;
+    const m = app.conversations!.append(conv.id, { role: "assistant", parts: [{ type: "text", text: "x" }] });
+    db.$client.prepare("update messages set parts = ? where id = ?").run(
+      JSON.stringify([
+        { type: "text", text: `답 ${k.slice(0, 6)}` },
+        { type: "tool_call", id: "t", name: "web_search", input: {} },
+        { type: "text", text: `${k.slice(6)} 끝` },
+      ]),
+      m.id,
+    );
+    knownSecrets.add(k);
+    await app.storedRescrub!.idle();
+    const parts = JSON.parse(
+      (db.$client.prepare("select parts from messages where id = ?").get(m.id) as { parts: string }).parts,
+    ) as {
+      type: string;
+      text?: string;
+    }[];
+    expect(parts.map((p) => p.text ?? "").join("")).not.toContain(k);
+    expect(parts[0]!.text).toBe("답 [숨김]");
+  });
+});

@@ -182,7 +182,7 @@ export class ArtifactStore {
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
     // A runtime's artifact never stores a known secret (review round 23).
-    const input = scrubKnownDeep(raw);
+    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
     const title = cleanTitle(input.title);
     const { content, language } = encodeBody(input.kind, input);
     return this.db.transaction((tx) => {
@@ -232,7 +232,7 @@ export class ArtifactStore {
     raw: { title?: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
-    const input = scrubKnownDeep(raw);
+    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
     const a = this.get(artifactId);
     if (!a || a.conversationId !== scope.conversationId || a.userId !== scope.userId)
       throw new ArtifactError("artifact_not_found");

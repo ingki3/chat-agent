@@ -513,7 +513,54 @@ type Scan = {
  */
 type ScanMode = "stream" | "tail" | "plain";
 
+/**
+ * The whole search (round 27): every encoding on the text itself, and again on the text with one transport layer
+ * decoded — percent-encoding, or JSON/JS string escapes — mapped back (`%5Cu0073…`, `%5C163…`, `%2573…`). An
+ * escape the text ends inside (`%5`, `\\u00`) is held like any partial match: the next chunk may complete it.
+ */
 function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
+  const out = scanCore(text, m, mode);
+  const views: View[] = [];
+  if (text.includes("%")) views.push(percentDecoded(text));
+  if (text.includes("\\")) views.push(escapeDecoded(text));
+  if (!views.length) return out;
+  const found = [...out.ranges];
+  let { partialAt, partialDepth, deepPartialAt } = out;
+  const partial = (i: number, depth: number) => {
+    if (i < partialAt) {
+      partialAt = i;
+      partialDepth = depth;
+    } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
+    if (depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
+  };
+  for (const view of views) {
+    const sub = scanCore(view.v, m, mode);
+    const vn = view.v.length;
+    const at = (k: number) => (k < vn ? view.start[k]! : (view.incompleteAt ?? text.length));
+    for (const [a, b] of sub.ranges) found.push([at(a), b > 0 && b <= vn ? view.end[b - 1]! : text.length]);
+    if (sub.partialAt !== Infinity) partial(at(sub.partialAt), sub.partialDepth);
+    if (sub.deepPartialAt !== Infinity) partial(at(sub.deepPartialAt), TAIL_MIN);
+    if (view.incompleteAt !== undefined) partial(view.incompleteAt, 0);
+  }
+  return { ranges: merge(found), partialAt, partialDepth, deepPartialAt };
+}
+
+/** Base64 (both alphabets) and padding characters. */
+const B64_EDGE = /[A-Za-z0-9+/_=-]/;
+
+function merge(found: [number, number][]): [number, number][] {
+  found.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const ranges: [number, number][] = [];
+  for (const r of found) {
+    const last = ranges.at(-1);
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else ranges.push([r[0], r[1]]);
+  }
+  return ranges;
+}
+
+/** Every encoding on one text (no transport layer decoded): the character search, raw matches, base64 and hex. */
+function scanCore(text: string, m: Compiled, mode: ScanMode): Scan {
   let deepPartialAt = Infinity;
   const found: [number, number][] = [];
   let partialAt = Infinity;
@@ -614,20 +661,31 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
   }
   // Base64 and hex: in the text with line breaks, spaces and `\n`-style escapes taken out (base64 wrapped at 76
   // columns, PEM/MIME, CRLF or LF, a stringified PEM), hex also in any mix of cases.
-  // Also with one transport layer decoded first (round 26): percent-encoding (`fn5%2BPz8%2F…`) or JSON/JS escapes
-  // (`\u0066\u006e…`). Longer chains of encodings are out of scope.
-  const views = [stripped(text)];
-  if (text.includes("%")) views.push(compose(percentDecoded(text), stripped));
-  if (text.includes("\\")) views.push(compose(escapeDecoded(text), stripped));
-  for (const view of views) {
+  // (One transport layer decoded first: `scan`.)
+  {
+    const view = stripped(text);
     const lower = view.v.replace(/[A-F]/g, (c) => c.toLowerCase());
     const vn = view.v.length;
-    const origin = (k: number) => (k < vn ? view.origin[k]! : n);
+    const origin = (k: number) => (k < vn ? view.start[k]! : n);
     const find = (hay: string, l: string, fail: Int32Array, ratio: number) => {
-      // Non-overlapping occurrences (one inside another adds nothing: it is masked with it).
-      for (let at = hay.indexOf(l); at !== -1; at = hay.indexOf(l, at + l.length))
-        // To where the next character starts (a decoded `%2F` or `\u002f` ends after its whole escape).
-        found.push([origin(at), at + l.length < vn ? origin(at + l.length) : n]);
+      // Non-overlapping occurrences (one inside another adds nothing: it is masked with it). A match ends where its
+      // last character ends (round 27: not at the next one — the line break after a token stays).
+      for (let at = hay.indexOf(l); at !== -1; at = hay.indexOf(l, at + l.length)) {
+        // The core plus the few characters around it that mix its bits with its neighbours' (base64 edges,
+        // padding): up to 3 on each side, of the encoding's own alphabet.
+        let a = at;
+        let b = at + l.length;
+        // Only characters right next to it in the text itself (not across a space or a line break taken out).
+        for (
+          let k = 0;
+          k < 3 && a > 0 && B64_EDGE.test(hay[a - 1]!) && view.end[a - 1] === view.start[a];
+          k++
+        )
+          a--;
+        for (let k = 0; k < 3 && b < vn && B64_EDGE.test(hay[b]!) && view.start[b] === view.end[b - 1]; k++)
+          b++;
+        found.push([origin(a), view.end[b - 1]!]);
+      }
       // The text ends inside this pattern? The longest suffix that is a prefix of it, in one KMP pass (linear).
       let q = 0;
       for (let k = Math.max(0, vn - l.length + 1); k < vn; k++) {
@@ -648,89 +706,150 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
     m.literals.forEach((l, k) => find(view.v, l, m.literalFail[k]!, 3 / 4));
     m.hexes.forEach((h, k) => find(lower, h, m.hexFail[k]!, 1 / 2));
   }
-  found.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
-  const ranges: [number, number][] = [];
-  for (const r of found) {
-    const last = ranges.at(-1);
-    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
-    else ranges.push([r[0], r[1]]);
+  return { ranges: merge(found), partialAt, partialDepth, deepPartialAt };
+}
+
+/**
+ * A decoded or stripped view of a text: for each of its characters, where it starts and ends in the text; and
+ * where an escape the text ends inside starts (left out of the view).
+ */
+type View = { v: string; start: Int32Array; end: Int32Array; incompleteAt?: number };
+
+class ViewBuilder {
+  v = "";
+  private readonly s: Int32Array;
+  private readonly e: Int32Array;
+  private n = 0;
+  constructor(size: number) {
+    this.s = new Int32Array(size);
+    this.e = new Int32Array(size);
   }
-  return { ranges, partialAt, partialDepth, deepPartialAt };
+  /** Appends `chars` standing for text[from, to) (each character gets the whole span). */
+  add(chars: string, from: number, to: number): void {
+    for (let k = 0; k < chars.length; k++) {
+      this.s[this.n] = from;
+      this.e[this.n++] = to;
+    }
+    this.v += chars;
+  }
+  /** Appends text[from, to) as it is. */
+  slice(text: string, from: number, to: number): void {
+    if (to <= from) return;
+    for (let k = from; k < to; k++) {
+      this.s[this.n] = k;
+      this.e[this.n++] = k + 1;
+    }
+    this.v += text.slice(from, to);
+  }
+  done(incompleteAt?: number): View {
+    return {
+      v: this.v,
+      start: this.s.subarray(0, this.n),
+      end: this.e.subarray(0, this.n),
+      ...(incompleteAt === undefined ? {} : { incompleteAt }),
+    };
+  }
 }
 
-type View = { v: string; origin: Int32Array };
+/** UTF-8 sequence length from its first byte (0: not a valid first byte). */
+const utf8Len = (b: number) =>
+  b < 0x80 ? 1 : b >= 0xc2 && b <= 0xdf ? 2 : b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf4 ? 4 : 0;
 
-/** A view of a view: offsets mapped back to the text. */
-function compose(outer: View, inner: (t: string) => View): View {
-  const v = inner(outer.v);
-  const origin = new Int32Array(v.origin.length);
-  for (let k = 0; k < origin.length; k++) origin[k] = outer.origin[v.origin[k]!]!;
-  return { v: v.v, origin };
-}
-
-/** `%XX` decoded (ASCII only: base64 and hex are ASCII); everything else as it is. */
+/** One layer of percent-encoding decoded (UTF-8 sequences whole); everything else as it is. */
 function percentDecoded(text: string): View {
-  const origin = new Int32Array(text.length);
-  let v = "";
-  let len = 0;
-  for (let k = 0; k < text.length;) {
-    const c = text.charCodeAt(k);
-    if (c === 37 && HEX(text.charCodeAt(k + 1)) && HEX(text.charCodeAt(k + 2))) {
-      const b = hexVal(text.charCodeAt(k + 1)) * 16 + hexVal(text.charCodeAt(k + 2));
-      if (b < 128) {
-        v += String.fromCharCode(b);
-        origin[len++] = k;
-        k += 3;
-        continue;
+  const n = text.length;
+  const out = new ViewBuilder(n);
+  const byteAt = (k: number) =>
+    text.charCodeAt(k) === 37 && HEX(text.charCodeAt(k + 1)) && HEX(text.charCodeAt(k + 2))
+      ? hexVal(text.charCodeAt(k + 1)) * 16 + hexVal(text.charCodeAt(k + 2))
+      : -1;
+  for (let k = 0; k < n;) {
+    if (text.charCodeAt(k) === 37) {
+      // The text ends inside `%X` (or inside a multi-byte sequence): held, not decoded.
+      if (k + 2 >= n && (k + 1 >= n || HEX(text.charCodeAt(k + 1)))) return out.done(k);
+      const b = byteAt(k);
+      const len = b < 0 ? 0 : utf8Len(b);
+      if (len) {
+        const bytes = [b];
+        let j = k + 3;
+        while (bytes.length < len && byteAt(j) >= 0x80 && byteAt(j) < 0xc0) {
+          bytes.push(byteAt(j));
+          j += 3;
+        }
+        if (bytes.length < len && j >= n - 2 && (j >= n || text.charCodeAt(j) === 37)) return out.done(k);
+        if (bytes.length === len) {
+          out.add(Buffer.from(bytes).toString("utf8"), k, j);
+          k = j;
+          continue;
+        }
       }
     }
-    v += text[k]!;
-    origin[len++] = k;
+    out.add(text[k]!, k, k + 1);
     k++;
   }
-  return { v, origin: origin.subarray(0, len) };
+  return out.done();
 }
 
-/** One layer of JSON/JS string escapes decoded: `\uXXXX`, `\/`, `\\`, `\"` (`\n`-style ones stay, `stripped` drops them). */
+const JSON_SIMPLE: Record<string, string> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  "'": "'",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/** One layer of JSON/JS string escapes decoded (`\uXXXX` with surrogate pairs, `\xHH`, `\"`, `\n`, …). */
 function escapeDecoded(text: string): View {
-  const origin = new Int32Array(text.length);
-  let v = "";
-  let len = 0;
-  for (let k = 0; k < text.length;) {
+  const n = text.length;
+  const out = new ViewBuilder(n);
+  const hexRun = (at: number, len: number) => {
+    for (let d = 0; d < len; d++) if (!HEX(text.charCodeAt(at + d))) return -1;
+    return parseInt(text.slice(at, at + len), 16);
+  };
+  for (let k = 0; k < n;) {
     if (text.charCodeAt(k) === 92) {
-      const x = text.charCodeAt(k + 1);
-      if (x === 117 && [2, 3, 4, 5].every((d) => HEX(text.charCodeAt(k + d)))) {
-        v += String.fromCharCode(parseInt(text.slice(k + 2, k + 6), 16));
-        origin[len++] = k;
-        k += 6;
-        continue;
+      const x = text[k + 1];
+      // The text ends inside an escape (`\`, `\u00`, `\x4`): held, not decoded.
+      if (x === undefined) return out.done(k);
+      if ((x === "u" && k + 6 > n) || (x === "x" && k + 4 > n)) {
+        const digits = text.slice(k + 2);
+        if (/^[0-9a-fA-F]*$/.test(digits)) return out.done(k);
       }
-      if (x === 47 || x === 92 || x === 34 || x === 39) {
-        v += String.fromCharCode(x);
-        origin[len++] = k;
+      if (x === "u") {
+        const v = hexRun(k + 2, 4);
+        if (v >= 0) {
+          out.add(String.fromCharCode(v), k, k + 6);
+          k += 6;
+          continue;
+        }
+      } else if (x === "x") {
+        const v = hexRun(k + 2, 2);
+        if (v >= 0) {
+          out.add(String.fromCharCode(v), k, k + 4);
+          k += 4;
+          continue;
+        }
+      } else if (x in JSON_SIMPLE) {
+        out.add(JSON_SIMPLE[x]!, k, k + 2);
         k += 2;
         continue;
       }
     }
-    v += text[k]!;
-    origin[len++] = k;
+    out.add(text[k]!, k, k + 1);
     k++;
   }
-  return { v, origin: origin.subarray(0, len) };
+  return out.done();
 }
 
 /** The text without whitespace and `\n` `\r` `\t` escapes (any backslash run), with each character's offset. */
 function stripped(text: string): View {
-  const origin = new Int32Array(text.length);
-  let v = "";
+  const out = new ViewBuilder(text.length);
   let from = 0;
-  let len = 0;
-  const flush = (to: number) => {
-    if (to > from) {
-      v += text.slice(from, to);
-      for (let k = from; k < to; k++) origin[len++] = k;
-    }
-  };
+  const flush = (to: number) => out.slice(text, from, to);
   for (let k = 0; k < text.length;) {
     const c = text.charCodeAt(k);
     if (c === 32 || c === 9 || c === 10 || c === 13) {
@@ -747,7 +866,7 @@ function stripped(text: string): View {
     } else k++;
   }
   flush(text.length);
-  return { v, origin: origin.subarray(0, len) };
+  return out.done();
 }
 
 function apply(text: string, ranges: [number, number][], upTo: number): string {
@@ -832,8 +951,22 @@ export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } =
  * as one text each (`scrubJoined`).
  */
 export function scrubParts<P>(parts: P[], opts: { registry?: KnownSecrets } = {}): P[] {
-  const deep = scrubKnownDeep(parts, opts);
-  let out = deep;
+  // Every value on its own — but a text or reasoning part's text only for complete matches: whether its end is a
+  // cut-off secret is judged on the joined text (round 27: a part ending in a secret's first letters stays).
+  let changedAny = false;
+  const deep = parts.map((p) => {
+    const q = p as { type?: unknown; text?: unknown };
+    let r: P;
+    if ((q.type === "text" || q.type === "reasoning") && typeof q.text === "string") {
+      const { text, ...rest } = q;
+      const restOut = scrubKnownDeep(rest, opts);
+      const textOut = scrubKnown(text, { ...opts, tail: false });
+      r = restOut === rest && textOut === text ? p : ({ ...restOut, text: textOut } as P);
+    } else r = scrubKnownDeep(p, opts);
+    if (r !== p) changedAny = true;
+    return r;
+  });
+  let out = changedAny ? deep : parts;
   for (const type of ["text", "reasoning"]) {
     const idx = out.flatMap((p, k) =>
       (p as { type?: unknown; text?: unknown }).type === type &&
@@ -841,25 +974,33 @@ export function scrubParts<P>(parts: P[], opts: { registry?: KnownSecrets } = {}
         ? [k]
         : [],
     );
-    if (idx.length < 2) continue;
+    if (!idx.length) continue;
     const texts = idx.map((k) => (out[k] as { text: string }).text);
     const next = scrubJoined(texts, opts);
     if (next.every((t, j) => t === texts[j])) continue;
-    out = out === parts ? [...out] : out === deep ? [...deep] : out;
+    out = out === parts || out === deep ? [...out] : out;
     idx.forEach((k, j) => (out[k] = { ...(out[k] as object), text: next[j] } as P));
   }
   return out;
 }
 
 /** `scrubKnown` on every string (and object key) of a JSON-like value. Returns the same value when nothing changed. */
-export function scrubKnownDeep<T>(value: T, opts: { tail?: boolean; registry?: KnownSecrets } = {}): T {
+export function scrubKnownDeep<T>(
+  value: T,
+  opts: { tail?: boolean; registry?: KnownSecrets; numberMask?: string | null } = {},
+): T {
   if (!(opts.registry ?? knownSecrets).matcher()) return value;
   const walk = (v: unknown, depth: number): unknown => {
     if (typeof v === "string") return scrubKnown(v, opts);
-    // A number is compared by its canonical text (round 25: an all-digit secret returned as a JSON number).
+    // A number is compared by its canonical text (round 25: an all-digit secret returned as a JSON number). It
+    // becomes the marker — or `numberMask` (null for chart and table data, which treat it as missing).
     if (typeof v === "number" || typeof v === "bigint") {
       const t = String(v);
-      return scrubKnown(t, opts) === t ? v : KNOWN_PLACEHOLDER;
+      return scrubKnown(t, opts) === t
+        ? v
+        : opts.numberMask === undefined
+          ? KNOWN_PLACEHOLDER
+          : opts.numberMask;
     }
     if (!v || typeof v !== "object") return v;
     if (depth > 64) {
@@ -906,7 +1047,8 @@ export function scrubContent(content: string, opts: { registry?: KnownSecrets } 
   const head = content.trimStart()[0];
   if (head === "{" || head === "[")
     try {
-      return JSON.stringify(scrubKnownDeep(JSON.parse(content) as unknown, opts));
+      // A masked number becomes null: charts skip it (the other bars keep their scale), tables show an empty cell.
+      return JSON.stringify(scrubKnownDeep(JSON.parse(content) as unknown, { ...opts, numberMask: null }));
     } catch {
       // not JSON: the text scrub stands
     }

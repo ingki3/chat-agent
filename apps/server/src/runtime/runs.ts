@@ -99,6 +99,10 @@ type Live = {
   scrub: { text: StreamScrubber; reasoning: StreamScrubber };
 };
 
+/** What `runs.idempotency_key` holds: the client's key hashed (it is only ever compared). */
+export const idempotencyHash = (key: string) =>
+  "sha256:" + crypto.createHash("sha256").update(key, "utf8").digest("hex");
+
 /**
  * What a runtime is handed, scrubbed again right before it is handed over (round 24): the history and prompt were
  * built before awaits (the MCP endpoint, a resume attempt) during which a secret may have been registered.
@@ -299,6 +303,13 @@ export class RunManager {
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
     this.templates = opts.instructions ?? defaultTemplates();
     this.financeResults = new FinanceResultStore(db);
+    // Rows from before keys were hashed (round 27): hashed once, in place.
+    for (const r of db.$client
+      .prepare(
+        "select id, idempotency_key as k from runs where idempotency_key is not null and idempotency_key not like 'sha256:%'",
+      )
+      .all() as { id: string; k: string }[])
+      db.$client.prepare("update runs set idempotency_key = ? where id = ?").run(idempotencyHash(r.k), r.id);
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -328,11 +339,12 @@ export class RunManager {
       .get();
   }
 
+  /** The run started with this idempotency key (stored as its SHA-256 only, round 27: the key is client text). */
   byIdempotencyKey(userId: string, key: string): RunRow | undefined {
     return this.db
       .select()
       .from(runs)
-      .where(and(eq(runs.userId, userId), eq(runs.idempotencyKey, key)))
+      .where(and(eq(runs.userId, userId), eq(runs.idempotencyKey, idempotencyHash(key))))
       .get();
   }
 
@@ -433,7 +445,7 @@ export class RunManager {
           connectionId: settings?.connectionId ?? null,
           connectionVersion: settings?.connectionVersion ?? null,
           useShared: settings?.useShared ?? false,
-          idempotencyKey: input.idempotencyKey ?? null,
+          idempotencyKey: input.idempotencyKey ? idempotencyHash(input.idempotencyKey) : null,
           nextEventSeq: 1,
           createdAt: this.now(),
           endedAt: null,

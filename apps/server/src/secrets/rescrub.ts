@@ -181,7 +181,18 @@ export class StoredRescrub {
     const hit = (text: string) => scrubKnown(text, { registry: look, tail: false }) !== text;
     const sql = this.db.$client;
     for (const t of RESCRUB_TABLES) {
-      const cols = t.columns.map((c) => `"${c.name}"`).join(", ");
+      // A parts column is also looked at as its text parts joined, and its reasoning parts joined (round 27: a
+      // secret split around a tool call is in neither part on its own) — computed in SQL, nothing parsed here.
+      const joinedOf = (col: string, type: string) =>
+        `(select group_concat(json_extract(j.value, '$.text'), '') from json_each("${col}") as j
+          where json_extract(j.value, '$.type') = '${type}') as "_j_${type}_${col}"`;
+      const cols = t.columns
+        .flatMap((c) =>
+          c.kind === "parts"
+            ? [`"${c.name}"`, joinedOf(c.name, "text"), joinedOf(c.name, "reasoning")]
+            : [`"${c.name}"`],
+        )
+        .join(", ");
       let after = 0;
       for (;;) {
         if (this.closed) return;
@@ -194,7 +205,9 @@ export class StoredRescrub {
           const set: Record<string, unknown> = {};
           for (const c of t.columns) {
             const v = row[c.name];
-            if (typeof v !== "string" || !hit(v)) continue;
+            if (typeof v !== "string") continue;
+            const joined = [row[`_j_text_${c.name}`], row[`_j_reasoning_${c.name}`]];
+            if (!hit(v) && !joined.some((j) => typeof j === "string" && hit(j))) continue;
             const next = rescrubValue(v, c.kind, this.registry);
             if (next !== v) set[c.name] = next;
           }

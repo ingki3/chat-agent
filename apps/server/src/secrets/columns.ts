@@ -23,9 +23,12 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "settings.key": { exempt: "a setting name chosen by the server" },
   "settings.value": { exempt: "server settings (thresholds, keys); secret ones are ciphertext" },
   "users.id": ID,
+  // Accepted limitation (round 27, decided by the coordinator): emails are identifiers the admin chooses or the
+  // provider issues; a known secret inside one is not a realistic leak path. Scrubbing would break sign-in, hashing
+  // would break the admin screen and the Access sync (#36). Every response that shows one is still scrubbed.
   "users.email": {
     exempt:
-      "the sign-in identifier (exact match on login); scrubbing would lock the account out — every response is scrubbed",
+      "accepted limitation: the sign-in identifier (exact match on login, admin screen, Access sync); responses are scrubbed",
   },
   "users.name": { write: "UserStore.create / update", rescrub: "text" },
   "users.role": ENUM,
@@ -80,9 +83,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "runs.runtime": ENUM,
   "runs.model": ENUM,
   "runs.effort": ENUM,
-  "runs.idempotency_key": {
-    exempt: "the client's retry key (compared exactly, never shown)",
-  },
+  "runs.idempotency_key": { exempt: "the client's retry key, stored as its SHA-256 only (round 27)" },
   "runs.instructions": { exempt: "template version ids" },
   "runs.connection_id": ID,
   "error_log.source": ENUM,
@@ -126,7 +127,8 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "connections.status": ENUM,
   "connections.last_test_code": ENUM,
   "connections.account_email": {
-    exempt: "the provider account's email (from its own token, not typed); every response is scrubbed",
+    exempt:
+      "accepted limitation (as users.email): the provider account's email from its own token; responses are scrubbed",
   },
   "runtime_policies.user_id": ID,
   "runtime_policies.runtime": ENUM,
