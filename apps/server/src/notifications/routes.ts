@@ -147,6 +147,16 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
     },
   );
 
+  // "끄기" on this device: everything this session registered goes, whatever the browser still holds.
+  app.delete(
+    "/api/push/devices/current",
+    { config: { noResource: "removes the caller's own session devices" } },
+    async (req, reply) => {
+      service.removeSessionDevices(req.ctx.user!.id, req.ctx.sessionToken!);
+      return noStore(reply).send(list(req));
+    },
+  );
+
   app.delete<{ Params: { id: string } }>(
     "/api/push/devices/:id",
     { config: { resource: { kind: DEVICE, action: "delete" } } },

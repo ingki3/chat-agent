@@ -187,6 +187,8 @@ export const push = {
         ...(replaces ? { replaces } : {}),
       }),
     ),
+  /** Removes every device of this login session ("끄기" on this device). */
+  removeCurrent: async () => PushDeviceList.parse(await call("DELETE", "/api/push/devices/current")),
   remove: async (id: string) => PushDeviceList.parse(await call("DELETE", `/api/push/devices/${enc(id)}`)),
   /** Is this endpoint hash the one registered by my session? (compared on the server) */
   check: async (endpointHash: string) =>

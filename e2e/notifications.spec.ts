@@ -431,3 +431,37 @@ test("turning off discards recovery even when the browser fails to unsubscribe: 
   expect(await current()).toEqual([]);
   await ctx.close();
 });
+
+test("after a successful renewal by the worker, 끄기 with a failing unsubscribe still leaves nothing on", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const { page, sw, current, registered } = await turnedOn(ctx, SON);
+  // The browser renews its subscription and the worker registers the new one (succeeds this time).
+  const renewed = `https://fcm.googleapis.com/fcm/send/e2e-renewed-${Math.random().toString(36).slice(2)}`;
+  await page.evaluate((e) => localStorage.setItem("e2e-push-endpoint", e), renewed);
+  await sw.evaluate(
+    (endpoint) =>
+      (globalThis as unknown as { reRegister: (o: unknown, n: unknown) => Promise<void> }).reRegister(null, {
+        toJSON: () => ({ endpoint, keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) } }),
+      }),
+    renewed,
+  );
+  expect(await markerOf(page)).toBeNull();
+  // The renewal replaced this session's device: one row, for the renewed endpoint.
+  expect(await current()).toHaveLength(1);
+  expect(await registered(renewed)).toBe(true);
+
+  await page.evaluate(() => localStorage.setItem("e2e-push-unsubscribe-fails", "1"));
+  await page.getByTestId("this-device").getByRole("button", { name: "끄기", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("구독을 끊지 못했어요");
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await current()).toEqual([]);
+  // Reconnect: still off, and the server has nothing of this session to push to.
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await current()).toEqual([]);
+  expect(await registered(renewed)).toBe(false);
+  await ctx.close();
+});

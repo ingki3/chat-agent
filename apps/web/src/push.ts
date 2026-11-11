@@ -235,7 +235,7 @@ export async function syncPush(): Promise<PushDeviceList> {
 }
 
 /** "끄기" on this device: the browser stops the subscription, the server forgets the device. */
-export async function disablePush(deviceId: string | undefined): Promise<void> {
+export async function disablePush(): Promise<void> {
   // An explicit "off" discards every recovery intent first: nothing may turn this device on again by itself.
   await writeState(REREGISTER, null);
   await writeState(BINDING, null);
@@ -246,7 +246,8 @@ export async function disablePush(deviceId: string | undefined): Promise<void> {
   } catch {
     unsubscribed = false;
   }
-  if (deviceId) await push.remove(deviceId);
+  // Every device this session registered (not just the one on screen), so nothing is pushed here any more.
+  await push.removeCurrent();
   // The server no longer pushes here either way; say that the browser kept its subscription.
   if (!unsubscribed) throw new PushSetupError("unsubscribe_failed");
 }

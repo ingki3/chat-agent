@@ -425,18 +425,14 @@ export class NotificationService {
     this.db.$client
       .transaction(() => {
         this.db.delete(pushSubscriptions).where(eq(pushSubscriptions.endpointHash, endpointHash)).run();
-        // Replacing this session's own older registration happens in the same transaction.
-        if (req.replaces)
-          this.db
-            .delete(pushSubscriptions)
-            .where(
-              and(
-                eq(pushSubscriptions.id, req.replaces),
-                eq(pushSubscriptions.userId, userId),
-                eq(pushSubscriptions.sessionId, sessionId),
-              ),
-            )
-            .run();
+        // One device per login session (a session is one browser): a new registration — the page's, or the
+        // worker's after the browser renewed its subscription — replaces this session's previous one in the same
+        // transaction. So a renewal never leaves the old row behind, and a failed one leaves it intact.
+        // (`replaces`, when given, names that same row; it can never reach another session's device.)
+        this.db
+          .delete(pushSubscriptions)
+          .where(and(eq(pushSubscriptions.userId, userId), eq(pushSubscriptions.sessionId, sessionId)))
+          .run();
         this.db
           .insert(pushSubscriptions)
           .values({
@@ -527,6 +523,16 @@ export class NotificationService {
       .from(pushSubscriptions)
       .where(eq(pushSubscriptions.id, id))
       .get();
+  }
+
+  /** Removes every device registered by this login session ("끄기" on this device). */
+  removeSessionDevices(userId: string, sessionToken: string): void {
+    this.db
+      .delete(pushSubscriptions)
+      .where(
+        and(eq(pushSubscriptions.userId, userId), eq(pushSubscriptions.sessionId, sessionIdOf(sessionToken))),
+      )
+      .run();
   }
 
   removeDevice(id: string): void {

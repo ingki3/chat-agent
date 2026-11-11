@@ -104,7 +104,12 @@ async function setup(o: { db?: Db; now?: number; log?: PassThrough } = {}) {
   /** This session's tag, as the page reads it. */
   const tagOf = async (who: { cookie: string }) =>
     (await api(who, "GET", "/api/push/devices")).json<{ sessionTag: string }>().sessionTag;
-  return { app, db, clock, push, member, api, subscribe, tagOf, svc: app.notifications! };
+  /** Another login session of the same account (another browser): its own device. */
+  const another = (who: { user: { id: string } }) => ({
+    user: who.user,
+    cookie: `al_session=${users.createSession(who.user.id)}`,
+  });
+  return { app, db, clock, push, member, api, subscribe, tagOf, another, svc: app.notifications! };
 }
 
 describe("text rules (FR-13.5)", () => {
@@ -268,10 +273,10 @@ describe("devices", () => {
   });
 
   it("404/410 from the push service deletes the device; other errors keep it", async () => {
-    const { member, subscribe, svc, push } = await setup();
+    const { another, member, subscribe, svc, push } = await setup();
     const mom = member("mom");
     const gone = await subscribe(mom);
-    const flaky = await subscribe(mom);
+    const flaky = await subscribe(another(mom));
     push.fail.set(gone.endpoint, 410);
     push.fail.set(flaky.endpoint, 503);
     svc.publish(mom.user.id, { kind: "test" });
@@ -395,6 +400,27 @@ describe("devices", () => {
     expect(svc.devices(mom.user.id, undefined).map((d) => d.id)).toContain(other);
   });
 
+  it("a session has one device: a renewal by the worker replaces it; 끄기 removes everything of the session", async () => {
+    const { member, subscribe, api, svc, push, another } = await setup();
+    const mom = member("mom");
+    const laptop = another(mom);
+    await subscribe(laptop);
+    await subscribe(mom);
+    // The browser renewed its subscription and the worker registered it (with the session's tag, no `replaces`).
+    const renewed = await subscribe(mom, "https://fcm.googleapis.com/fcm/send/renewed-by-worker");
+    expect(renewed.r.statusCode).toBe(201);
+    const mine = svc.devices(mom.user.id, mom.cookie.slice("al_session=".length)).filter((d) => d.current);
+    expect(mine).toHaveLength(1);
+    expect(svc.devices(mom.user.id, undefined)).toHaveLength(2); // the laptop's is untouched
+    // "끄기" on this device, even if the browser could not unsubscribe: nothing of this session is left.
+    const off = await api(mom, "DELETE", "/api/push/devices/current");
+    expect(off.json<{ devices: { current: boolean }[] }>().devices.filter((d) => d.current)).toEqual([]);
+    svc.publish(mom.user.id, { kind: "test" });
+    await svc.settled();
+    expect(push.sent.map((p) => p.endpoint)).not.toContain(renewed.endpoint);
+    expect(push.sent).toHaveLength(1); // the laptop only
+  });
+
   it("only the owner can remove a device", async () => {
     const { member, subscribe, api } = await setup();
     const mom = member("mom");
@@ -408,10 +434,10 @@ describe("devices", () => {
 
 describe("publish and push", () => {
   it("stores the entry, pushes title/two-line body/same-origin url to every device", async () => {
-    const { member, subscribe, svc, push, api } = await setup();
+    const { another, member, subscribe, svc, push, api } = await setup();
     const mom = member("mom");
     const one = await subscribe(mom);
-    const two = await subscribe(mom);
+    const two = await subscribe(another(mom));
     const id = svc.publish(mom.user.id, {
       kind: "schedule_succeeded",
       scheduleName: "아침 시장 브리핑",
@@ -725,10 +751,10 @@ describe("logs", () => {
     const log = new PassThrough();
     let out = "";
     log.on("data", (c: Buffer) => (out += c.toString()));
-    const { member, subscribe, svc, push } = await setup({ log });
+    const { another, member, subscribe, svc, push } = await setup({ log });
     const mom = member("mom");
     const { endpoint } = await subscribe(mom);
-    const gone = await subscribe(mom);
+    const gone = await subscribe(another(mom));
     push.fail.set(gone.endpoint, 410);
     svc.publish(mom.user.id, {
       kind: "schedule_succeeded",
