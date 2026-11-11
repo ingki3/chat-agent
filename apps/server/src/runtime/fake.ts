@@ -29,6 +29,10 @@ import {
  *   /finance [cited]   scripted finance tool results (AAPL, 005930 — fixed numbers, no network) and an answer that
  *                     leaves out (or, with `cited`, states) the sources and as-of dates: the run manager's finance
  *                     check then adds its note (#30)
+ *   /burst <n>        n words as fast as possible, in paragraphs (rendering performance, #14)
+ *   /md               markdown sample: GFM table, code blocks, KaTeX math, links (#14)
+ *   /xss              hostile markup that must never run (#14)
+ *   /secrettool       a tool call whose input and output carry secret-looking fields (#14)
  */
 export type FakeStep =
   | { text: string }
@@ -198,6 +202,26 @@ function financeSteps(cited: boolean): FakeStep[] {
     },
   ];
 }
+/** Markdown the chat screen must render (FR-3.2). */
+export const FAKE_MARKDOWN = [
+  "## 단진자 정리\n\n",
+  "주기는 진폭이 작을 때 $T = 2\\pi\\sqrt{L/g}$ 로 근사해요.\n\n",
+  "$$\ng = \\frac{4\\pi^2 L}{T^2}\n$$\n\n",
+  "| 길이 (m) | 주기 (s) |\n|---:|---:|\n| 0.5 | 1.42 |\n| 1.0 | 2.01 |\n\n",
+  "```python\nimport math\nprint(2 * math.pi * math.sqrt(1.0 / 9.8))\n```\n\n",
+  "- **굵게**, *기울임*, `인라인 코드`, ~~취소선~~\n- [참고 링크](https://example.com/pendulum)\n",
+];
+
+/** Hostile output: none of it may run or reach the DOM as markup (FR-3.2 sanitize). */
+export const FAKE_XSS = [
+  '<img src="x" onerror="window.__xss=1">\n\n',
+  "<script>window.__xss=1</script>\n\n",
+  "[눌러 보세요](javascript:window.__xss=1) ",
+  '<a href="javascript:window.__xss=1">raw</a>\n\n',
+  "![그림](javascript:window.__xss=1)\n\n",
+  "$\\href{javascript:window.__xss=1}{수식 링크}$\n\n",
+  '<iframe src="javascript:window.__xss=1"></iframe> 끝',
+];
 
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
@@ -206,6 +230,29 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (fin) return financeSteps(!!fin[1]);
   const artifact = artifactSteps(t);
   if (artifact) return artifact;
+  if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
+  if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
+  if (t === "/secrettool")
+    return [
+      { text: "검색할게요. " },
+      {
+        tool: "web_search",
+        ms: 200,
+        input: { query: "단진자 주기", apiKey: "sk-fake-secret-123", nested: { password: "hunter2" } },
+        output: { results: 3, token: "tok-fake-456" },
+      },
+      { text: "3건 찾았어요." },
+    ];
+  const burst = /^\/burst\s+(\d+)/.exec(t);
+  if (burst) {
+    const n = Number(burst[1]);
+    const steps: FakeStep[] = [];
+    for (let i = 1; i <= n; i++) {
+      steps.push({ text: i % 60 === 0 ? `**단어${i}**\n\n` : `단어${i} ` });
+      if (i % 20 === 0) steps.push({ delayMs: 1 });
+    }
+    return steps;
+  }
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [

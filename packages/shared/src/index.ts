@@ -11,6 +11,7 @@ export * from "./artifacts.js";
 export * from "./usage.js";
 export * from "./finance.js";
 export * from "./admin.js";
+export * from "./redact.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

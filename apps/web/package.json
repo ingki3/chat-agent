@@ -10,9 +10,15 @@
   "dependencies": {
     "@agentlee/shared": "workspace:*",
     "@tanstack/react-query": "5.105.0",
+    "katex": "0.16.47",
     "react": "19.3.1",
     "react-dom": "19.3.1",
-    "react-router": "8.5.1"
+    "react-markdown": "10.1.0",
+    "react-router": "8.5.1",
+    "rehype-highlight": "7.0.2",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0"
   },
   "devDependencies": {
     "@types/react": "19.3.0",

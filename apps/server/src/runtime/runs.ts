@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { and, asc, eq, gt, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   publicParts,
+  redactSecrets,
   StreamEvent,
   type MessagePart,
   type Run,
@@ -898,15 +899,15 @@ export class RunManager {
           appendText("reasoning", ev.text); // stored, never streamed
         } else if (ev.type === "tool_start") {
           // Missing input/output become null: JSON would drop an undefined key and the stored part would no
-          // longer match the schema.
-          const input = ev.input ?? null;
+          // longer match the schema. Secret-looking values never leave the runtime (FR-3.4).
+          const input = redactSecrets(ev.input ?? null);
           live.tools.set(ev.callId, { name: ev.name, startedAt: this.now() });
           parts.push({ type: "tool_call", id: ev.callId, name: ev.name, input });
           this.emit(runId, { type: "tool_start", messageId, callId: ev.callId, name: ev.name, input });
           flush(true);
         } else if (ev.type === "tool_end") {
           const extra = ev.isError ? { isError: true } : {};
-          const output = ev.output ?? null;
+          const output = redactSecrets(ev.output ?? null);
           this.toolEnded(run, live, ev.callId, ev.isError === true);
           parts.push({ type: "tool_result", callId: ev.callId, output, ...extra });
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });

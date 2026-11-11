@@ -35,6 +35,7 @@ import {
   SubscriptionLogin,
   UnreadCount,
   Run,
+  type RunChoice,
   StartRunResponse,
   type ConnectionAuthType,
   type Role,
@@ -257,9 +258,32 @@ export const conversations = {
     )) as { items: unknown[]; nextBefore: number | null };
     return { items: Message.array().parse(r.items), nextBefore: r.nextBefore };
   },
-  send: async (id: string, text: string) =>
+  /** `choice`: runtime / model / connection for this reply (#17, #19); none = the defaults. */
+  send: async (id: string, text: string, choice: RunChoice = {}) =>
     StartRunResponse.parse(
-      await call("POST", `/api/conversations/${enc(id)}/messages`, { text }, { "Idempotency-Key": newKey() }),
+      await call(
+        "POST",
+        `/api/conversations/${enc(id)}/messages`,
+        { ...choice, text },
+        { "Idempotency-Key": newKey() },
+      ),
+    ),
+  /** "수정 후 다시 보내기": replaces a user message (and everything after it) and starts a new reply. */
+  edit: async (id: string, messageId: string, text: string, choice: RunChoice = {}) =>
+    StartRunResponse.parse(
+      await call(
+        "POST",
+        `/api/conversations/${enc(id)}/messages/${enc(messageId)}/edit`,
+        { ...choice, text },
+        { "Idempotency-Key": newKey() },
+      ),
+    ),
+  /** "다시 생성": replaces an assistant reply with a new one. */
+  regenerate: async (id: string, messageId: string, choice: RunChoice = {}) =>
+    StartRunResponse.parse(
+      await call("POST", `/api/conversations/${enc(id)}/messages/${enc(messageId)}/regenerate`, choice, {
+        "Idempotency-Key": newKey(),
+      }),
     ),
   activeRun: async (id: string) => {
     const r = (await call("GET", `/api/conversations/${enc(id)}/active-run`)) as { run: unknown };
@@ -357,6 +381,7 @@ export const usage = {
 };
 
 export const runs = {
+  get: async (id: string) => Run.parse(await call("GET", `/api/runs/${enc(id)}`)),
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
 };
 
@@ -396,6 +421,7 @@ const MESSAGES: Record<string, string> = {
   backup_unavailable: "이 서버에서는 백업을 만들지 않아요(BACKUP_DIR 확인).",
   backup_failed: "백업에 실패했어요. 디스크와 백업 폴더 권한을 확인하세요.",
   backup_disk_full: "디스크가 가득 차서 백업하지 못했어요.",
+  shutting_down: "서버가 다시 시작하는 중이에요. 잠시 뒤에 다시 시도하세요.",
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

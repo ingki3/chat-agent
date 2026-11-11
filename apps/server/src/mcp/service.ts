@@ -260,8 +260,9 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
     if (typeof x === "string" || typeof x === "number") {
       const t = String(x);
       if (secrets.some((s) => t.includes(s))) return true;
-    } else if (Array.isArray(x)) stack.push(...x);
-    else if (x && typeof x === "object")
+    } else if (Array.isArray(x)) {
+      for (const item of x) stack.push(item); // (no spread: a huge array would overflow the call stack)
+    } else if (x && typeof x === "object")
       for (const [k, val] of Object.entries(x)) {
         if (secrets.some((s) => k.includes(s))) return true;
         stack.push(val);
