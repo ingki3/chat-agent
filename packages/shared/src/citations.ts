@@ -127,24 +127,30 @@ const TABLE = /^\s*\|/;
 const LEAD_IN = /[:：]\s*$/;
 
 const SENTENCES = /(?<=[.!?。！？])\s+/u;
-const FIGURE = /\d/u;
-/** A clause joined to more ("…지만", "…는데", "…으나", "…며"): the sentence goes on to state something. */
-const GOES_ON = /(?:지만|는데|은데|으나|이나|하나|며|면서|고,|만,)\s/u;
-/** A `※` note about the answer itself (not about the world). */
-const META_NOTE =
-  /^(?:이\s*(?:답변|내용|정리|요약)[은는이가]?\s.*(?:바탕|기준|참고|작성|정리)|(?:공개\s*)?(?:자료|보도|기사|출처)[를을]\s*바탕으로|참고용|정확하지\s*않을\s*수|최신\s*정보는|자세한\s*내용은|원문을\s*확인|투자\s*권유가\s*아닙니다)/u;
-/** "출처가 충분하지 않아요." and the like — nothing more in the sentence. */
-const NOT_ENOUGH =
-  /^(?:⚠️\s*)?(?:출처|자료|근거)(?:가|는|이)?\s*(?:충분하지\s*않|부족하|부족해|부족합|적어|적습)[^.!?。]*[.!?。]?$/u;
-/** Advice that goes with it ("공식 발표를 확인해 보세요."). */
-const ADVICE =
-  /(?:확인해|찾아|참고해|살펴)\s*보세요[.!。]?$|확인이\s*필요해요[.!。]?$|확인하시길\s*바랍니다[.!。]?$/u;
+/**
+ * The pure notices a disclaimer may be made of — a small closed set, each a whole sentence (only its ending may
+ * vary). Anything else, however it starts, is something stated and is checked (review #97 round 2: no prefixes).
+ */
+const NOTICES: readonly RegExp[] = [
+  /^(?:출처|자료|근거)(?:가|는)\s*(?:충분하지\s*않아요|충분하지\s*않습니다|충분하지\s*않다|부족해요|부족합니다|부족하다)$/u,
+  /^(?:공식\s*발표를|원문을)\s*확인해\s*(?:보세요|주세요)$/u,
+  /^(?:최신\s*정보는|자세한\s*내용은)\s*원문을\s*확인해\s*(?:보세요|주세요)$/u,
+  /^(?:이\s*답변은\s*)?공개\s*(?:보도|자료)를\s*바탕으로\s*(?:했어요|했습니다|했다|작성했어요|작성했습니다)$/u,
+  /^(?:이\s*답변은\s*)?참고용(?:이에요|입니다|이다)$/u,
+  /^(?:이\s*답변은\s*)?정확하지\s*않을\s*수\s*(?:있어요|있습니다|있다)$/u,
+];
+const isNotice = (sentence: string) => {
+  const s = sentence
+    .replace(/^[※\s]+/u, "")
+    .replace(/[.!。\s]+$/u, "")
+    .replace(/\s+/gu, " ");
+  return NOTICES.some((re) => re.test(s));
+};
 
 /**
- * A pure disclaimer: the finance disclaimer, a `※` note about the answer, or the research-mode notice that the
- * sources are not enough (with advice to check further) — and nothing else. Every sentence must be one of those,
- * none may carry a figure or go on to state something. `※ 반도체 수출은 32% 증가했다.` and
- * `출처가 부족하지만 양산은 확정됐다.` are claims.
+ * A pure disclaimer: the finance disclaimer and the notices above, nothing else — every sentence must be one of
+ * them, whole. `※ 반도체 수출은 32% 증가했다.`, `출처가 부족하지만 양산은 확정됐다.`, `출처가 부족합니다만 …` and
+ * `※ 최신 정보는 양산이 확정됐다는 소식입니다.` are claims.
  */
 function isDisclaimer(t: string): boolean {
   if (t.length > 240) return false;
@@ -153,16 +159,7 @@ function isDisclaimer(t: string): boolean {
     .join(" ")
     .replace(/^[\s※*]+|[\s*]+$/gu, "");
   if (!rest) return true;
-  const sentences = rest.split(SENTENCES).filter(Boolean);
-  let notice = false;
-  for (const raw of sentences) {
-    const s = raw.replace(/^[※\s]+/u, "");
-    if (FIGURE.test(s) || GOES_ON.test(s)) return false;
-    if (META_NOTE.test(s) && s.length <= 80) notice = true;
-    else if (NOT_ENOUGH.test(s) && s.length <= 60) notice = true;
-    else if (!(ADVICE.test(s) && s.length <= 60)) return false;
-  }
-  return notice || rest !== t;
+  return rest.split(SENTENCES).filter(Boolean).every(isNotice);
 }
 
 /**
@@ -273,10 +270,12 @@ export function sentenceEndMarkers(text: string): CitationMarker[] {
     const before = text[all[i]!.start - 1] ?? "";
     const after = text[all[j]!.end] ?? "";
     const afterNext = text[all[j]!.end + 1] ?? "";
+    // The line end may come after trailing spaces.
+    const lineRest = /^[ \t]*(\r?\n|$)/.exec(text.slice(all[j]!.end, all[j]!.end + 200));
     const atEnd =
       (END.test(after) && !/[A-Za-z0-9_(]/.test(afterNext)) ||
       /[.!?。！？"”)]/u.test(before) ||
-      ((after === "" || after === "\n" || after === "\r") && before !== "" && !/[A-Za-z0-9_\]]/.test(before));
+      (lineRest !== null && before !== "" && !/[A-Za-z0-9_\]]/.test(before));
     if (atEnd) out.push(...all.slice(i, j + 1));
     i = j + 1;
   }

@@ -58,6 +58,10 @@ export function firstToolAt(parts: readonly MessagePart[]): number {
 const PROGRESS =
   /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
 
+/** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
+const CONNECTIVE =
+  /(?:니까?|서|고|지만|는데|은데|던데|으며|며|면서|므로|라|나|만)[,]?\s|[,;:]|\b(?:and|because|since|so|but|as)\b/iu;
+
 /**
  * A short progress note before the first tool call: one sentence, no figure, no marker, saying what comes next.
  * Paragraphs that state something before a tool call are still checked.
@@ -66,6 +70,8 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
   if (u.end > toolAt) return false;
   const t = text.slice(u.start, u.end).trim();
   if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
+  // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
+  if (CONNECTIVE.test(t)) return false;
   return PROGRESS.test(t);
 }
 

@@ -134,10 +134,30 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     // Numbers broken at a line end are not joined.
     expect(found("값은 1020이다", "값은 10-\n20이다")).toBe(false);
     expect(found("10year bonds rose", "The 10-\nyear bonds rose.")).toBe(false);
+    // Round 2: a space before the hyphen, or a blank line after it, is not a broken word.
+    expect(found("profit margins grew", "The pro -\nfit margins grew.")).toBe(false);
+    expect(found("resign the deal now", "They re-\n\nsign the deal now.")).toBe(false);
+    expect(found("resign the deal now", "They re-\n \nsign the deal now.")).toBe(false);
+    expect(found("resign the deal now", "They re- \nsign the deal now.")).toBe(false);
+    expect(found("Semiconductor exports rose", "Semicon-\r\nductor exports rose.")).toBe(true);
+    // Not through an entity either.
+    expect(found("Semiconductor exports rose", "Semicon&#8208;\nductor exports rose.")).toBe(false);
     const notes = "수출이 크게 늘었다[3]. 업계는 반겼다²³. 정부는 지원을 약속했다[12][13].";
     expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(true);
     expect(found("정부는 지원을 약속했다.", notes)).toBe(true);
     expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(true);
+    expect(found("said so. Then they left", "They said so.¹ Then they left.")).toBe(true);
+    // Round 2: superscripts after a digit or a unit are exponents, and [n] next to a digit is not a footnote.
+    expect(found("참가자는 10만 명이었다", "참가자는 10²만 명이었다.")).toBe(false);
+    expect(found("참가자는 102만 명이었다", "참가자는 10²만 명이었다.")).toBe(true);
+    expect(found("넓이는 10 제곱미터였다", "넓이는 10² 제곱미터였다.")).toBe(false);
+    expect(found("업계는 반겼다정부는 지원했다", "업계는 반겼다²정부는 지원했다.")).toBe(false);
+    expect(found("면적은 32m³ 이었다", "면적은 32m² 이었다.")).toBe(false);
+    expect(found("면적은 32m 이었다", "면적은 32m² 이었다.")).toBe(false);
+    expect(found("면적은 32m² 이었다", "면적은 32m² 이었다.")).toBe(true);
+    expect(found("값은 1234원이었다", "값은 12[3]34원이었다.")).toBe(false);
+    expect(found("값은 12원이었다", "값은 12[3]원이었다.")).toBe(false);
+    expect(found("값은 34원이었다고", "값은 [3]34원이었다고 했다.")).toBe(false);
   });
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
@@ -160,6 +180,13 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(findSnippet(`${body} 끝에 붙인 새 문장입니다`, "끝에 붙인 새 문장입니다", "perf-key").found).toBe(
       true,
     );
+  });
+
+  it("composed and decomposed accents are the same text (round 2)", () => {
+    const nfc = "Le café prices rose sharply in Paris.";
+    expect(found("café prices rose sharply", nfc.normalize("NFD"))).toBe(true);
+    expect(found("café prices rose sharply".normalize("NFD"), nfc)).toBe(true);
+    expect(found("cafe prices rose sharply", nfc)).toBe(false);
   });
 
   it("a snippet must say something: fewer than 8 normalised characters prove nothing", () => {
@@ -479,9 +506,16 @@ describe("paragraphs that need a citation", () => {
       "출처가 충분하지 않아요. 양산은 확정됐어요.",
       "※ 이 답변은 공개 보도를 바탕으로 했어요. 수출은 늘었어요.",
       `${FINANCE_DISCLAIMER} 삼성전자는 오를 거예요.`,
-      "공식 발표를 확인해 보세요.",
       "※ 이 답변은 수출이 32% 늘었다는 보도를 바탕으로 했어요.",
       "출처가 부족해요. 2개 기사뿐이에요.",
+      // Round 2: prefixes of a notice that go on to state something.
+      "출처가 부족합니다만 양산은 확정됐습니다.",
+      "※ 최신 정보는 양산이 확정됐다는 소식입니다.",
+      "출처가 충분하지 않은데요 양산은 확정됐어요.",
+      "출처가 부족하지만요, 양산은 확정이에요.",
+      "자료가 부족합니다만, 확인해 보세요.",
+      "※ 참고용이지만 양산은 확정됐어요.",
+      "공식 발표를 확인해 보니 양산은 확정이에요.",
     ])
       expect(kinds(t)[0]![0], t).toBe("body");
     for (const t of [
@@ -490,6 +524,8 @@ describe("paragraphs that need a citation", () => {
       "출처가 충분하지 않아요.",
       "출처가 충분하지 않아요. 공식 발표를 확인해 보세요.",
       "자료가 부족해요.",
+      "출처가 충분하지 않습니다.",
+      "공식 발표를 확인해 보세요.",
       `※ ${FINANCE_DISCLAIMER}`,
     ])
       expect(kinds(t)[0]![0], t).toBe("disclaimer");
@@ -501,6 +537,8 @@ describe("paragraphs that need a citation", () => {
     expect(ns("늘었다.[2] 그리고")).toEqual([2]);
     expect(ns("늘었다[1][2]. 끝")).toEqual([1, 2]);
     expect(ns("늘었다[3]\n다음")).toEqual([3]);
+    expect(ns("늘었다[3]  \n다음")).toEqual([3]);
+    expect(ns("늘었다[3]\t")).toEqual([3]);
     expect(ns("Exports rose[4].")).toEqual([4]);
     for (const t of [
       "배열 a[1] 은 두 번째",
@@ -633,6 +671,13 @@ describe("citationNote", () => {
     expect(
       missingOf([...text("수출이 늘었어요. 더 찾아볼게요.\n\n"), ...call, ...text("가[1].")]),
     ).toHaveLength(1);
+    // Round 2: a fact joined to the note.
+    for (const note of [
+      "양산이 확정됐으니 자료를 더 찾아볼게요.",
+      "양산이 확정돼서 더 찾아볼게요.",
+      "Exports rose, so let me check.",
+    ])
+      expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toHaveLength(1);
     expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);
   });
 

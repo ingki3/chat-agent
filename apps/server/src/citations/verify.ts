@@ -104,7 +104,6 @@ export function normalizeWithMap(text: string): Normalized {
   let to = new Int32Array(len + 16);
   let n = 0;
   let pendingSpace = -1; // start of a whitespace run not yet written
-  let last = ""; // last character written (one code point)
   const put = (ch: string, s: number, e: number) => {
     if (pendingSpace >= 0 && n > 0) write(" ", pendingSpace, s);
     pendingSpace = -1;
@@ -125,7 +124,6 @@ export function normalizeWithMap(text: string): Normalized {
       n++;
     }
     out.push(ch);
-    last = ch; // one code point: `put` is called per character
   };
   const space = (s: number) => {
     if (pendingSpace < 0) pendingSpace = s;
@@ -137,24 +135,46 @@ export function normalizeWithMap(text: string): Normalized {
       else put(ch, s, e);
     }
   };
-  /** After a `-` at `i`: the index past a line-end break that joins two letters, or -1. */
-  const hyphenBreak = (i: number): number => {
-    if (!LETTER.test(last)) return -1;
-    let j = i;
-    while (j < len && (text.charCodeAt(j) === 32 || text.charCodeAt(j) === 9)) j++;
+  /** The code point that ends right before `i` in the source text. */
+  const rawBefore = (i: number) => {
+    if (i <= 0) return "";
+    const c = text.charCodeAt(i - 1);
+    return c >= 0xdc00 && c <= 0xdfff && i >= 2 ? text.slice(i - 2, i) : text[i - 1]!;
+  };
+  /**
+   * A hyphen at `[hy, after)` that breaks a word at a line end: a letter right before it in the source, then
+   * exactly one line break (CRLF ok) and optional indentation, then a letter. Returns where the word goes on, or
+   * -1. Never across a space before the hyphen or a blank line.
+   */
+  const hyphenBreak = (hy: number, after: number): number => {
+    if (!LETTER.test(rawBefore(hy))) return -1;
+    let j = after;
     if (text.charCodeAt(j) === 13) j++;
     if (text.charCodeAt(j) !== 10) return -1;
     j++;
-    while (j < len && SPACE.test(text[j]!)) j++;
+    while (j < len && (text.charCodeAt(j) === 32 || text.charCodeAt(j) === 9)) j++;
     const next = text.codePointAt(j);
     return next !== undefined && LETTER.test(String.fromCodePoint(next)) ? j : -1;
   };
+  /** A word end after a footnote: end of text, a space, or punctuation (not a letter, digit or unit). */
+  const wordEndAt = (j: number) => {
+    const next = text.codePointAt(j);
+    return next === undefined || !/[\p{L}\p{N}\p{M}]/u.test(String.fromCodePoint(next));
+  };
+  /**
+   * Superscript digits at `[s, e)` that are a footnote: after a Hangul / CJK character or closing punctuation, at
+   * a word end. After a digit or a Latin letter (`10²`, `m²`) they are an exponent or a unit and are kept.
+   */
+  const superscriptNote = (s: number, e: number) =>
+    /[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}.,;:!?)\]"'”’」』]/u.test(
+      rawBefore(s),
+    ) && wordEndAt(e);
 
   let i = 0;
   while (i < len) {
     const c = text.charCodeAt(i);
-    if (c < 0x80) {
-      // ASCII fast path.
+    // ASCII fast path — unless a combining mark follows (NFD `cafe\u0301` must equal NFC `café`).
+    if (c < 0x80 && !(i + 1 < len && joins(text.codePointAt(i + 1)!))) {
       if (c === 32 || (c >= 9 && c <= 13)) {
         space(i);
         i++;
@@ -165,7 +185,7 @@ export function normalizeWithMap(text: string): Normalized {
         put('"', i, i + 1);
         i++;
       } else if (c === 45) {
-        const j = hyphenBreak(i + 1);
+        const j = hyphenBreak(i, i + 1);
         if (j >= 0) {
           pendingSpace = -1;
           i = j;
@@ -175,8 +195,13 @@ export function normalizeWithMap(text: string): Normalized {
         }
       } else if (c === 91) {
         const m = /^\[\d{1,3}\]/.exec(text.slice(i, i + 5));
-        if (m)
-          i += m[0].length; // an inline footnote number
+        // An inline footnote number — not next to a digit, where dropping it would join two numbers.
+        if (
+          m &&
+          !DIGIT.test(rawBefore(i)) &&
+          !/^\p{N}/u.test(text.slice(i + m[0].length, i + m[0].length + 2))
+        )
+          i += m[0].length;
         else {
           put("[", i, i + 1);
           i++;
@@ -190,12 +215,9 @@ export function normalizeWithMap(text: string): Normalized {
           : undefined;
         if (m && decoded !== undefined) {
           const end = i + m[0].length;
-          const r = normCluster(decoded);
-          if (r === "-" && hyphenBreak(end) >= 0) i = hyphenBreak(end);
-          else {
-            emit(r, i, end);
-            i = end;
-          }
+          // No hyphen joining through an entity: when in doubt, not normalised.
+          emit(normCluster(decoded), i, end);
+          i = end;
         } else {
           put("&", i, i + 1);
           i++;
@@ -209,7 +231,14 @@ export function normalizeWithMap(text: string): Normalized {
     // A cluster: this code point and the ones that join it.
     const start = i;
     i += c >= 0xd800 && c <= 0xdbff && i + 1 < len ? 2 : 1;
-    if (isSuperscriptDigit(c)) continue; // a footnote number
+    if (isSuperscriptDigit(c)) {
+      let e = i;
+      while (e < len && isSuperscriptDigit(text.charCodeAt(e))) e++;
+      if (superscriptNote(start, e)) {
+        i = e; // a footnote number
+        continue;
+      }
+    }
     while (i < len) {
       const cp = text.codePointAt(i)!;
       if (!joins(cp)) break;
@@ -217,7 +246,7 @@ export function normalizeWithMap(text: string): Normalized {
     }
     const r = normCluster(text.slice(start, i));
     if (r === "-") {
-      const j = hyphenBreak(i);
+      const j = hyphenBreak(start, i);
       if (j >= 0) {
         pendingSpace = -1;
         i = j;
