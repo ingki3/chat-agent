@@ -119,6 +119,13 @@ try {
   } else fail("usage");
 } catch (e) {
   if (e instanceof RestoreError) fail(e.code);
+  if (typeof (e as NodeJS.ErrnoException).code === "string" && !(e instanceof RecoveryError)) {
+    // A file-system error during the swap: undone in place, or left to the journal for the next start.
+    console.error(
+      `restore failed: ${(e as NodeJS.ErrnoException).code} — 교체 중 디스크 오류. 기존 데이터로 되돌렸거나, 다음 시작이 일지로 되돌려요(ops.md 21.4절).`,
+    );
+    process.exit(1);
+  }
   if (e instanceof RecoveryError) {
     // An interrupted restore the next writer could not resolve: nothing was changed (docs/ops.md §21.4).
     console.error(`restore failed: ${e.message} — 일지와 두 폴더를 확인하세요(ops.md 21.4절).`);

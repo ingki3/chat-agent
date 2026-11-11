@@ -242,10 +242,14 @@ function writeDurable(file: string, text: string): void {
   const fd = fs.openSync(tmp, "w", 0o600);
   try {
     fs.writeSync(fd, text);
+    fsyncHook?.(tmp);
     fs.fsyncSync(fd);
-  } finally {
+  } catch (e) {
     fs.closeSync(fd);
+    fs.rmSync(tmp, { force: true });
+    throw e;
   }
+  fs.closeSync(fd);
   fs.renameSync(tmp, file);
   fsyncPath(path.dirname(file));
 }
@@ -685,6 +689,9 @@ function swap(
     dropIdFiles(s.target);
     throw (e as NodeJS.ErrnoException).code ? new RestoreError("not_durable") : e;
   }
+  // From the first rename until `done` is durably written, any error is handled the same way: back to the old
+  // folder. The journal is removed only once the folders are back where it says they end and that is synced;
+  // if any undo step fails, the `rolling_back` journal and both id files stay for the next writer.
   try {
     if (s.previous) {
       rename(s.target, s.previous);
@@ -693,24 +700,55 @@ function swap(
     }
     rename(s.staging, s.target);
     fsyncPath(path.dirname(s.target));
+    phase("swapped");
+    phase("done");
   } catch (e) {
-    // Recorded first, so a crash in the middle of undoing is undone too (never rolled forward).
-    try {
-      phase("rolling_back");
-      if (!exists(s.target) && s.previous && exists(s.previous)) rename(s.previous, s.target);
-      rm(s.staging);
-      fs.rmSync(journal, { force: true });
-      dropIdFiles(s.target);
-    } catch {
-      // the journal says rolling_back: the next writer finishes the undo
-    }
+    undoSwap(s, candidate.id, journal, j, rename, rm);
     throw e;
   }
-  phase("swapped");
-  phase("done");
-  fs.rmSync(journal, { force: true });
-  fsyncPath(path.dirname(journal));
-  hooks?.step?.("journal_removed");
-  dropIdFiles(s.target, s.previous);
-  hooks?.step?.("cleaned");
+  // `done` is durable: the folders are final. Clean-up is best effort — a journal left behind says `done` and the
+  // next writer only finishes this clean-up.
+  try {
+    fs.rmSync(journal, { force: true });
+    fsyncPath(path.dirname(journal));
+    hooks?.step?.("journal_removed");
+    dropIdFiles(s.target, s.previous);
+    hooks?.step?.("cleaned");
+  } catch {
+    // finished by recoverInterruptedRestore
+  }
+}
+
+/** Undo of a failed swap, in place. Throws nothing; leaves the journal whenever it could not finish. */
+function undoSwap(
+  s: { target: string; staging: string; previous: string | null },
+  candidateId: string,
+  journal: string,
+  j: Omit<Journal, "phase">,
+  rename: (from: string, to: string) => void,
+  rm: (p: string) => void,
+): void {
+  try {
+    writeDurable(journal, JSON.stringify({ ...j, phase: "rolling_back" } satisfies Journal));
+  } catch {
+    // best effort: the journal still names both folders, and recovery proves which is which
+  }
+  try {
+    const parent = path.dirname(s.target);
+    // The candidate already at the target (our id file): moved aside, never deleted.
+    if (exists(s.target) && readId(s.target, CANDIDATE_ID_FILE) === candidateId)
+      rename(s.target, `${s.target}.restore-rejected-${crypto.randomBytes(3).toString("hex")}`);
+    if (!exists(s.target) && s.previous && exists(s.previous)) rename(s.previous, s.target);
+    fsyncPath(parent);
+    // Done only when the folders are where the journal ends: the old one (or none) at the target.
+    const back = s.previous ? exists(s.target) && !exists(s.previous) : !exists(s.target);
+    if (!back) return;
+    rm(s.staging);
+    fsyncPath(parent);
+    fs.rmSync(journal, { force: true });
+    fsyncPath(path.dirname(journal));
+    dropIdFiles(s.target);
+  } catch {
+    // the journal (rolling_back, or an earlier phase) stays: the next writer finishes the undo
+  }
 }

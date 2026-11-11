@@ -1370,6 +1370,142 @@ describe(
         expectOld(t);
       });
 
+    // Round 5: a one-time error after the candidate is in place, before `done` is durable.
+    const afterSwapFault = (
+      which: "parent_fsync" | "swapped_journal" | "done_journal",
+      alsoFail?: "move_back",
+    ) => {
+      let renames = 0;
+      let armed = false;
+      let journalWrites = 0;
+      let fired = false;
+      return {
+        rename: (from: string, to: string) => {
+          if (alsoFail === "move_back" && fired && to.endsWith("/data")) throw eio();
+          fs.renameSync(from, to);
+          if (++renames === 2) armed = true;
+        },
+        fsync: (p: string) => {
+          if (!armed || fired) return;
+          const isJournal = p.endsWith(".restore-journal.json.tmp");
+          if (isJournal) journalWrites++;
+          const hit =
+            which === "parent_fsync"
+              ? !isJournal
+              : which === "swapped_journal"
+                ? isJournal && journalWrites === 1
+                : isJournal && journalWrites === 2;
+          if (hit) {
+            fired = true;
+            throw eio();
+          }
+        },
+      };
+    };
+    const rejectedOf = (root: string) =>
+      fs.readdirSync(root).filter((n) => n.startsWith("data.restore-rejected-"));
+
+    for (const which of ["parent_fsync", "swapped_journal", "done_journal"] as const)
+      it(`one-time EIO on the ${which} after the second rename: rolled back in place, never a silent swap`, async () => {
+        const t = await prepared();
+        const hooks = afterSwapFault(which);
+        expect(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key, hooks })).toThrow(
+          "EIO",
+        );
+        // The old data is active again, the candidate is aside, no journal.
+        expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
+        expect(rejectedOf(t.root)).toHaveLength(1);
+        for (const r of rejectedOf(t.root)) fs.rmSync(path.join(t.root, r), { recursive: true });
+        expectOld(t);
+      });
+
+    it("EIO after the second rename and the move back fails too: the journal stays and the next start rolls back", async () => {
+      const t = await prepared();
+      const hooks = afterSwapFault("parent_fsync", "move_back");
+      expect(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key, hooks })).toThrow("EIO");
+      const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { phase: string };
+      expect(j.phase).toBe("rolling_back");
+      const o = startServer(t);
+      try {
+        expect(o.recovered).toBe("rolled_back");
+        expect(users(o)).toBe(5);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
+    });
+
+    it("after the second rename the parent folder is fsynced before the swapped journal", async () => {
+      const t = await prepared();
+      let renames = 0;
+      const after: string[] = [];
+      restoreBackup({
+        backup: t.backup,
+        target: t.dataDir,
+        key: t.key,
+        hooks: {
+          rename: (from, to) => {
+            fs.renameSync(from, to);
+            renames++;
+          },
+          fsync: (p) => {
+            if (renames === 2) after.push(p);
+          },
+        },
+      });
+      expect(after[0]).toBe(t.root);
+      expect(after[1]).toMatch(/restore-journal\.json\.tmp$/);
+    });
+
+    it("the undo cannot put the old folder back (it vanished): the journal stays, nothing claims success", async () => {
+      const t = await prepared();
+      const hooks = afterSwapFault("parent_fsync");
+      const moved = path.join(t.root, "elsewhere");
+      const rename = hooks.rename;
+      let n = 0;
+      hooks.rename = (from, to) => {
+        rename(from, to);
+        // Right after the candidate is in place, the old folder disappears (another hand moved it).
+        if (++n === 2) fs.renameSync(path.join(t.root, asides(t.root)[0]!), moved);
+      };
+      expect(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key, hooks })).toThrow("EIO");
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+      expect(() => startServer(t)).toThrow(/restore_unresolved/);
+      expect(fs.existsSync(moved)).toBe(true);
+    });
+
+    it("an error after done is durable: the restore stands (the journal says done)", async () => {
+      const t = await prepared();
+      let armed = false;
+      const r = restoreBackup({
+        backup: t.backup,
+        target: t.dataDir,
+        key: t.key,
+        hooks: {
+          step: (st) => {
+            if (st === "done") armed = true;
+          },
+          fsync: () => {
+            if (armed) {
+              armed = false;
+              throw eio();
+            }
+          },
+        },
+      });
+      expect(r.previous).toBeDefined();
+      const o = startServer(t);
+      try {
+        expect(users(o)).toBe(4);
+      } finally {
+        o.storage.db.$client.close();
+        o.release();
+      }
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(false);
+    });
+
     it("directory fsync: an 'unsupported' answer is ignored, a real error is not", async () => {
       const t = await prepared();
       const dirError = (code: string) => (p: string) => {
