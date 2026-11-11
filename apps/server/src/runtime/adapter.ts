@@ -23,13 +23,33 @@ export type RuntimeCapabilities = {
   canResume: boolean;
   /** Calls our MCP server (real runtimes). False: the run gets no tools and no MCP port is opened for it. */
   usesTools: boolean;
+  /**
+   * Runs need a runtime connection (#17): the run manager picks one before the run starts (personal first, then
+   * shared) and fails it with `no_connection` when there is none. Default false (the development FakeRuntime).
+   */
+  needsConnection?: boolean;
 };
 
 /** What a fresh session gets: the server's history (summarised by #45 when long) and the turn's settings. */
 export type StartContext = {
   conversationId: string;
-  /** Who the run is for — adapters pick the connection (API key, subscription) allowed for this user (#17). */
+  /** Who the run is for. */
   userId: string;
+  /**
+   * The connection the run manager chose for this run (#17). Adapters resolve it — credential and folder — through
+   * their `connection` option, which checks again that this user may use it.
+   */
+  connectionId?: string | undefined;
+  /** The connection's credential version the run (or test) was accepted with (#17). */
+  connectionVersion?: number | undefined;
+  /** A connection test (#17): the connection may still be untested or failed. Set by the server only. */
+  connectionTest?: boolean;
+  /**
+   * Cancels opening the session (a connection test that is cancelled by a disconnect or a new key, #17). Once it
+   * fires, the adapter must not create anything more in the connection folder, must kill a process it started, and
+   * must settle `start()` / `resume()` (with an error) only after that process has exited.
+   */
+  signal?: AbortSignal;
   /** Prior history, public parts only (reasoning never crosses into another session — PRD FR-3.5). */
   history: { role: "user" | "assistant" | "system"; parts: PublicPart[] }[];
   systemPrompt: string;
@@ -43,6 +63,12 @@ export type StartContext = {
    */
   mcp?: McpConnection;
 };
+
+/** What an adapter's connection resolver is asked: whose run, which connection, and whether it is a test. */
+export type ConnectionRequest = Pick<
+  StartContext,
+  "userId" | "connectionId" | "connectionVersion" | "connectionTest"
+>;
 
 /** Normalised events. `reasoning_delta` is stored but never streamed to the browser. */
 export type RuntimeEvent =

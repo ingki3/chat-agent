@@ -5,6 +5,7 @@ export * from "./runtime.js";
 export * from "./chat.js";
 export * from "./notifications.js";
 export * from "./external.js";
+export * from "./connections.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

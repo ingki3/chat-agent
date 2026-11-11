@@ -39,6 +39,8 @@ export type McpHost = {
    */
   skillsFor(userId: string): readonly SkillInfo[];
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
+  /** Told about every answered tool call (the connection test #17 checks that our server really served them). */
+  onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
 };
 
 /** Tool names this server offers (adapters list them as allowed; runtimes see `mcp__agentlee__<name>`). */
@@ -73,6 +75,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
       if (!name || !stillValid()) return text({ error: "unauthorized" }, true);
       const now = (host.now ?? (() => new Date()))();
       const timeZone = host.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+      host.onToolCall?.("echo_time", scope, true);
       return text({
         now: now.toISOString(),
         local: now.toLocaleString("ko-KR", { timeZone }),
@@ -91,6 +94,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
         if (!stillValid()) return text({ error: "unauthorized" }, true);
         const r = await host.runSkill(skill.name, input, scope);
         if (!stillValid()) return text({ error: "unauthorized" }, true);
+        host.onToolCall?.(skillToolName(skill.name), scope, r.ok);
         return r.ok ? text(r.output) : text({ error: r.code }, true);
       },
     );

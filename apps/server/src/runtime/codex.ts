@@ -13,6 +13,7 @@ import {
   type RuntimeEvent,
   type RuntimeSession,
   type RuntimeTurn,
+  type ConnectionRequest,
   type StartContext,
 } from "./adapter.js";
 import {
@@ -83,8 +84,11 @@ export type CodexChild = {
 };
 
 export type CodexAdapterOptions = {
-  /** The connection this user may use, or undefined (the run then fails with `no_connection`). */
-  connection(userId: string): CodexConnection | undefined;
+  /**
+   * The run's connection (`ctx.connectionId`) for this user, or undefined when it is gone or not theirs to use
+   * (the run then fails with `no_connection`). Connections live in the database (#17, connections/store.ts).
+   */
+  connection(ctx: ConnectionRequest): CodexConnection | undefined;
   models?: ModelCapability[];
   /** codex executable. Default: the pinned package's own platform binary (never a `codex` on PATH). */
   executable?: string;
@@ -400,7 +404,13 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   capabilities(): RuntimeCapabilities {
-    return { models: this.models, canSwitchModelInSession: true, canResume: true, usesTools: true };
+    return {
+      models: this.models,
+      canSwitchModelInSession: true,
+      canResume: true,
+      usesTools: true,
+      needsConnection: true,
+    };
   }
 
   async start(ctx: StartContext): Promise<RuntimeSession> {
@@ -419,7 +429,7 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   private connectionFor(ctx: StartContext): CodexConnection {
-    const conn = this.opts.connection(ctx.userId);
+    const conn = this.opts.connection(ctx);
     if (!conn) throw new RuntimeFailure("no_connection");
     return conn;
   }
@@ -485,13 +495,20 @@ export class CodexAdapter implements RuntimeAdapter {
   }
 
   private async openNow(ctx: StartContext, resumeId: string | undefined): Promise<RuntimeSession> {
+    /** Cancelled (ctx.signal): nothing more is written to the folder and nothing is started. */
+    const cancelled = () => {
+      if (ctx.signal?.aborted) throw new RuntimeFailure("runtime_error");
+    };
+    cancelled(); // also covers the wait for an earlier opening of this folder
     const conn = this.connectionFor(ctx);
     this.checkModel(ctx.model, ctx.effort);
     scrub(conn.dir);
     ensureDirs(conn.dir);
     const paths = codexPaths(conn.dir);
+    const bundled = await this.bundledCatalog(conn.dir);
+    cancelled();
     const catalog = codexModelCatalog(
-      await this.bundledCatalog(conn.dir),
+      bundled,
       this.models.map((m) => m.id),
     );
     const catalogPath = path.join(paths.codexHome, "agentlee-models.json");
@@ -507,6 +524,7 @@ export class CodexAdapter implements RuntimeAdapter {
     if (ctx.mcp) Object.assign(env, codexMcpEnv(ctx.mcp));
     const proxy = this.opts.egress ? await this.opts.egress.endpoint() : undefined;
     if (proxy) Object.assign(env, { HTTPS_PROXY: proxy.url, NO_PROXY: "127.0.0.1,localhost" });
+    cancelled();
     const providerPort = this.opts.provider ? Number(new URL(this.opts.provider.baseUrl).port) : undefined;
     const spawnFn = this.opts.spawn ?? spawnIsolated;
     const child = spawnFn({
@@ -533,6 +551,12 @@ export class CodexAdapter implements RuntimeAdapter {
         child.kill("SIGKILL");
       }
     };
+    /** Resolves when the process has exited (or after `ms` — it was SIGKILLed, so it is going). */
+    const exitedP = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    const gone = (ms = 2000) => Promise.race([exitedP, new Promise<void>((r) => setTimeout(r, ms).unref())]);
+    // A cancel while the session opens kills the process: the pending request fails, the open throws below.
+    const onAbort = () => kill();
+    ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
     // Every message is checked first, whenever it comes — while the session opens, between turns, during a turn
     // (`allowed`). What passes is routed to the running turn, if any.
@@ -601,8 +625,10 @@ export class CodexAdapter implements RuntimeAdapter {
         capabilities: { experimentalApi: false, requestAttestation: false },
       });
       rpc.notify("initialized", {});
+      cancelled();
       const login = await rpc.request("account/login/start", { type: "apiKey", apiKey: conn.auth.apiKey });
       if (login.type !== "apiKey") throw new RuntimeFailure("runtime_auth");
+      cancelled();
       if (resumeId === undefined) {
         meta = { instructions: ctx.systemPrompt, history: historyText(ctx.history) };
         const r = await rpc.request("thread/start", {
@@ -618,6 +644,7 @@ export class CodexAdapter implements RuntimeAdapter {
         if (typeof started !== "string" || !/^[0-9a-f-]{36}$/.test(started))
           throw new RuntimeFailure("runtime_error");
         threadId = started;
+        cancelled();
         writeMeta(conn.dir, threadId, meta);
       } else {
         meta = readMeta(conn.dir, resumeId)!;
@@ -638,9 +665,12 @@ export class CodexAdapter implements RuntimeAdapter {
       // Thread ids seen before ours was known (a fresh start) must be ours too.
       if ([...early].some((t) => t !== threadId)) policyBreach = true;
       if (policyBreach) throw new RuntimeFailure("runtime_policy");
+      cancelled();
       opened = true;
     } catch (e) {
       kill();
+      ctx.signal?.removeEventListener("abort", onAbort);
+      await gone(); // the open has failed only once the process is gone
       if (e instanceof RpcError)
         throw new RuntimeFailure(e.method === "account/login/start" ? "runtime_auth" : "runtime_error");
       throw e;
@@ -657,7 +687,9 @@ export class CodexAdapter implements RuntimeAdapter {
       },
       close: async () => {
         closed = true;
+        ctx.signal?.removeEventListener("abort", onAbort);
         kill();
+        await gone();
       },
       turn: (input): RuntimeTurn => {
         if (policyBreach) throw new RuntimeFailure("runtime_policy"); // seen between turns: closed already

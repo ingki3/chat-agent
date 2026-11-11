@@ -742,3 +742,10 @@ h2 {
 .row.wrap {
   flex-wrap: wrap;
 }
+
+/* 설정 → 내 런타임 연결 (#17) */
+.add-connection {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}

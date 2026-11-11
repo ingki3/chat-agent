@@ -1,6 +1,8 @@
 import {
   AdminUser,
   AuthState,
+  Connection,
+  ConnectionTestResult,
   Conversation,
   CreateUserResponse,
   CSRF_HEADER,
@@ -15,7 +17,9 @@ import {
   UnreadCount,
   Run,
   StartRunResponse,
+  type ConnectionAuthType,
   type Role,
+  type RuntimeId,
 } from "@agentlee/shared";
 
 export class ApiError extends Error {
@@ -195,6 +199,24 @@ export const push = {
     PushCheckResponse.parse(await call("POST", "/api/push/devices/check", { endpointHash })).match,
 };
 
+/** 설정 → 내 런타임 연결 (#17). Credentials go up once and never come back — the list shows a hint only. */
+export const connections = {
+  list: async () =>
+    Connection.array().parse(((await call("GET", "/api/connections")) as { items: unknown }).items),
+  create: async (body: {
+    runtime: RuntimeId;
+    authType: ConnectionAuthType;
+    secret: string;
+    label?: string;
+  }) =>
+    Connection.parse(((await call("POST", "/api/connections", body)) as { connection: unknown }).connection),
+  test: async (id: string) =>
+    ConnectionTestResult.parse(
+      ((await call("POST", `/api/connections/${enc(id)}/test`, {})) as { result: unknown }).result,
+    ),
+  remove: async (id: string) => call("DELETE", `/api/connections/${enc(id)}`),
+};
+
 export const runs = {
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
 };
@@ -217,6 +239,15 @@ const MESSAGES: Record<string, string> = {
   csrf: "요청이 거부됐어요. 페이지를 새로 고친 뒤 다시 시도하세요.",
   run_in_progress: "아직 답하는 중이에요. 끝나거나 멈춘 뒤에 보내세요.",
   not_found: "찾을 수 없어요.",
+  invalid_secret: "키 형식이 맞지 않아요. 복사한 값을 다시 확인하세요.",
+  subscription_not_allowed: "이 계정에서는 이 구독을 연결할 수 없어요.",
+  unsupported_auth: "아직 지원하지 않는 연결 방식이에요.",
+  shared_subscription: "공용 연결은 API 키로만 만들 수 있어요.",
+  test_in_progress: "이미 테스트 중이에요.",
+  connection_not_allowed: "이 연결은 쓸 수 없어요. 설정 → 내 런타임 연결을 확인하세요.",
+  model_not_allowed: "허용되지 않은 모델이에요.",
+  effort_not_allowed: "허용되지 않은 추론 강도예요.",
+  runtime_not_allowed: "허용되지 않은 런타임이에요.",
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";

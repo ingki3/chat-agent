@@ -5,7 +5,9 @@ import { StringDecoder } from "node:string_decoder";
 import type { FastifyBaseLogger, FastifyServerOptions } from "fastify";
 import {
   errorSummary,
+  isAuthType,
   isCategory,
+  isConnectionScope,
   isErrorCode,
   isErrorType,
   isHostname,
@@ -17,6 +19,9 @@ import {
   isRuntime,
   isSkillCode,
   isStatus,
+  isTestCode,
+  isImportItem,
+  isImportCode,
   isToolName,
   UNMATCHED,
 } from "./observability/policy.js";
@@ -58,6 +63,13 @@ export const LOG_EVENTS = [
   "push.failed",
   "push.cancelled",
   "push.subscription_gone",
+  // Runtime connections (#17): ids, runtime, scope, auth type and fixed test codes only — never a key or a token.
+  "connection.created",
+  "connection.tested",
+  "connection.expired",
+  "connection.disconnected",
+  "connection.imported",
+  "connection.import_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -135,6 +147,13 @@ const FIELDS = new Map<string, Check>([
   ["devices", isInt],
   /** Status a push service answered with (404/410 = subscription gone). */
   ["httpStatus", isHttpStatus],
+  /** Runtime connections (#17). */
+  ["connectionId", isId],
+  ["scope", isConnectionScope],
+  ["authType", isAuthType],
+  ["testCode", isTestCode],
+  ["importItem", isImportItem],
+  ["importCode", isImportCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -380,6 +399,12 @@ export type LogFields = {
   count?: number;
   devices?: number;
   httpStatus?: number;
+  connectionId?: string;
+  scope?: string;
+  authType?: string;
+  testCode?: string;
+  importItem?: string;
+  importCode?: string;
   /** Logged as class name and code only. */
   err?: unknown;
 };

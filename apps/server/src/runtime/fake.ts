@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
+import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
 import type { RuntimeId } from "@agentlee/shared";
 import {
+  RuntimeFailure,
   SessionGoneError,
   type RuntimeAdapter,
   type RuntimeCapabilities,
@@ -27,12 +29,34 @@ export type FakeStep =
   | { usage: { inputTokens: number; outputTokens: number; costUsd?: number } }
   | { notice: string }
   | { limit: string }
-  | { fail: string };
+  | { fail: string; code?: RuntimeFailure["code"] };
 
 export type FakeScript = (input: TurnInput, memory: string[]) => FakeStep[];
 
+/**
+ * The connection test prompt (#17), answered like a real runtime would: our tool, the verification skill (its
+ * output computed the way the skill does) and a short reply. A fake without tools has no MCP server to ask.
+ */
+function connectionTestSteps(text: string): FakeStep[] {
+  const nonce = /with text "([^"]*)"/.exec(text)?.[1] ?? "";
+  return [
+    { tool: TEST_TOOL, ms: 0, output: { now: new Date().toISOString() } },
+    {
+      tool: TEST_SKILL_TOOL,
+      ms: 0,
+      output: {
+        characters: [...nonce].length,
+        sha256: crypto.createHash("sha256").update(nonce, "utf8").digest("hex"),
+        reversed: [...nonce].reverse().join(""),
+      },
+    },
+    { text: "OK" },
+  ];
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
+  if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [
@@ -66,8 +90,12 @@ export class FakeRuntime implements RuntimeAdapter {
   /** Sessions opened and closed — tests check that the run manager releases every session it opens. */
   opened = 0;
   closed = 0;
+  /** Sessions resumed (not started). */
+  resumed = 0;
   /** System prompts of the sessions started, in order — tests check what the run manager assembled (#20). */
   readonly systemPrompts: string[] = [];
+  /** Every StartContext passed to start/resume (tests check the connection the run manager chose). */
+  readonly contexts: StartContext[] = [];
   /** Sessions this "runtime" remembers (forget() simulates a runtime that lost them). */
   private readonly sessions = new Map<string, { model: string; memory: string[] }>();
 
@@ -78,6 +106,8 @@ export class FakeRuntime implements RuntimeAdapter {
       models?: RuntimeCapabilities["models"];
       canResume?: boolean;
       usesTools?: boolean;
+      /** Act like a real runtime that needs a connection (#17). */
+      needsConnection?: boolean;
     } = {},
   ) {
     this.id = opts.id ?? "claude-code";
@@ -97,6 +127,7 @@ export class FakeRuntime implements RuntimeAdapter {
       canSwitchModelInSession: true,
       canResume: this.opts.canResume ?? true,
       usesTools: this.opts.usesTools ?? false,
+      needsConnection: this.opts.needsConnection ?? false,
     };
   }
 
@@ -105,6 +136,7 @@ export class FakeRuntime implements RuntimeAdapter {
   }
 
   async start(ctx: StartContext): Promise<RuntimeSession> {
+    this.contexts.push(ctx);
     const id = `fake-${crypto.randomUUID()}`;
     this.systemPrompts.push(ctx.systemPrompt);
     const memory = ctx.history
@@ -114,9 +146,11 @@ export class FakeRuntime implements RuntimeAdapter {
     return this.session(id);
   }
 
-  async resume(externalSessionId: string): Promise<RuntimeSession> {
+  async resume(externalSessionId: string, ctx?: StartContext): Promise<RuntimeSession> {
+    if (ctx) this.contexts.push(ctx);
     if (this.opts.canResume === false) throw new Error("this runtime cannot resume");
     if (!this.sessions.has(externalSessionId)) throw new SessionGoneError();
+    this.resumed++;
     return this.session(externalSessionId);
   }
 
@@ -161,7 +195,7 @@ export class FakeRuntime implements RuntimeAdapter {
             else if ("limit" in step) {
               yield { type: "limit", code: "usage_limit", message: step.limit };
               return;
-            } else if ("fail" in step) throw new Error(step.fail);
+            } else if ("fail" in step) throw step.code ? new RuntimeFailure(step.code) : new Error(step.fail);
           }
         }
         return { events: events(), interrupt: async () => ctrl.abort() };

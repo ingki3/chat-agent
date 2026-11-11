@@ -12,7 +12,14 @@ import {
   type StartContext,
 } from "../src/runtime/adapter.js";
 import { ClaudeAdapter, claudeEnv, type ClaudeAuth } from "../src/runtime/claude.js";
+import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { claudeConnectionFor } from "../src/runtime/claude-config.js";
+import { UserStore } from "../src/auth/users.js";
+import { ConnectionStore } from "../src/connections/store.js";
+import { createTestDb } from "../src/db/client.js";
+import { AppEvents } from "../src/events.js";
 import { runIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
 import { CLAUDE_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
 import {
@@ -551,47 +558,76 @@ describe.skipIf(!isMac || !realBin)("Claude adapter (#15): real CLI in the sandb
   });
 });
 
-describe("Claude connection from .env (#15, until #17)", () => {
-  const users = new Map([
-    ["admin", { id: "admin", role: "admin", email: "Ingki3@gmail.com", active: true }],
-    ["admin2", { id: "admin2", role: "admin", email: "other@family.test", active: true }],
-    ["son", { id: "son", role: "member", email: "son@family.test", active: true }],
-    ["gone", { id: "gone", role: "member", email: "gone@family.test", active: false }],
-  ]);
-  const store = { byId: (id: string) => users.get(id) as never };
-  const base = { dataDir: "/data", adminEmail: "ingki3@gmail.com" };
-  const both = { ...base, claude: { apiKey: "sk-ant-k", oauthToken: "oat" } };
-  it("subscription only for the admin themself; the API key for everyone else", () => {
-    expect(claudeConnectionFor(both, store, "admin")).toMatchObject({
-      id: "claude-admin-subscription",
-      auth: { kind: "oauth_token" },
+describe("Claude connection from the database (#17)", () => {
+  function setup() {
+    const db = createTestDb();
+    const users = new UserStore(db, new AppEvents());
+    const store = new ConnectionStore(db, crypto.randomBytes(32), "/data");
+    const mk = (email: string, role: "admin" | "member") =>
+      users.create({ email, name: email, role, passwordHash: "x" });
+    const pass = (id: string) => store.setTestResult(id, "passed", "ok", store.get(id)!.credentialVersion);
+    return { db, users, store, mk, pass };
+  }
+  const apiKey = `sk-ant-${"a".repeat(30)}`;
+  const token = `sk-ant-oat01-${"t".repeat(30)}`;
+
+  it("the admin's own subscription for the admin; the shared API key for everyone, a folder per user", () => {
+    const { users, store, mk, pass } = setup();
+    const admin = mk("admin@family.test", "admin");
+    const son = mk("son@family.test", "member");
+    const sub = store.create({
+      runtime: "claude-code",
+      authType: "subscription",
+      scope: "personal",
+      owner: admin,
+      createdBy: admin.id,
+      secret: token,
     });
-    expect(claudeConnectionFor(both, store, "admin2")).toMatchObject({
-      id: "claude-api-key",
-      auth: { kind: "api_key" },
+    const shared = store.create({
+      runtime: "claude-code",
+      authType: "api_key",
+      scope: "shared",
+      owner: null,
+      createdBy: admin.id,
+      secret: apiKey,
     });
-    expect(claudeConnectionFor(both, store, "son")).toMatchObject({
-      id: "claude-api-key",
-      dir: "/data/runtimes/claude-api-key/son",
+    pass(sub.id);
+    pass(shared.id);
+    const ask = (userId: string, connectionId: string) =>
+      claudeConnectionFor(store, users, { userId, connectionId });
+    expect(ask(admin.id, sub.id)).toMatchObject({ id: sub.id, auth: { kind: "oauth_token", token } });
+    // Someone else's personal subscription: never.
+    expect(ask(son.id, sub.id)).toBeUndefined();
+    const a = ask(admin.id, shared.id)!;
+    const b = ask(son.id, shared.id)!;
+    expect(b).toMatchObject({
+      auth: { kind: "api_key", apiKey },
+      dir: `/data/runtimes/${shared.id}/${son.id}`,
     });
-  });
-  it("every user gets their own CLI folder, even on the shared API key (sessions never in another's sandbox)", () => {
-    const mom = { ...both, claude: { apiKey: "sk-ant-k" } };
-    users.set("mom", { id: "mom", role: "member", email: "mom@family.test", active: true });
-    const a = claudeConnectionFor(mom, store, "mom")!;
-    const b = claudeConnectionFor(mom, store, "son")!;
     expect(a.id).toBe(b.id);
-    expect(a.dir).not.toBe(b.dir);
     expect(path.relative(a.dir, b.dir).startsWith("..")).toBe(true);
     expect(path.relative(b.dir, a.dir).startsWith("..")).toBe(true);
   });
-  it("without an API key, family members have no Claude connection; inactive users never", () => {
-    const sub = { ...base, claude: { oauthToken: "oat" } };
-    expect(claudeConnectionFor(sub, store, "son")).toBeUndefined();
-    expect(claudeConnectionFor(sub, store, "admin2")).toBeUndefined();
-    expect(claudeConnectionFor(both, store, "gone")).toBeUndefined();
-    expect(claudeConnectionFor(both, store, "nobody")).toBeUndefined();
-    expect(claudeConnectionFor(base, store, "admin")).toBeUndefined();
+
+  it("a subscription stops working when its owner is no longer an admin; inactive users never", () => {
+    const { users, store, mk, pass } = setup();
+    const admin = mk("admin@family.test", "admin");
+    mk("admin2@family.test", "admin");
+    const sub = store.create({
+      runtime: "claude-code",
+      authType: "subscription",
+      scope: "personal",
+      owner: admin,
+      createdBy: admin.id,
+      secret: token,
+    });
+    pass(sub.id);
+    users.setRole(admin.id, "member");
+    expect(claudeConnectionFor(store, users, { userId: admin.id, connectionId: sub.id })).toBeUndefined();
+    users.setRole(admin.id, "admin");
+    users.deactivate(admin.id);
+    expect(claudeConnectionFor(store, users, { userId: admin.id, connectionId: sub.id })).toBeUndefined();
+    expect(claudeConnectionFor(store, users, { userId: "nobody", connectionId: sub.id })).toBeUndefined();
   });
 });
 
@@ -767,5 +803,131 @@ describe("review #80 round 2", () => {
     expect(cut.messages.at(-1)).toMatchObject({ type: "result", total_cost_usd: 7 });
     expect(cut.thrown).toBe("Claude Code process aborted by user");
     expect(ev.find((e) => e.type === "usage")).toMatchObject({ costUsd: 7 });
+  });
+});
+
+describe("Claude adapter: a cancel while the session opens or runs (#17 review round 2)", () => {
+  it("a cancel during the slow start writes nothing into the folder and starts no CLI", async () => {
+    const root = tmp();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let queries = 0;
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c1", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      egress: { endpoint: async () => (await gate, { port: 1, url: "http://127.0.0.1:1" }) },
+      query: (() => {
+        queries++;
+        throw new Error("no query expected");
+      }) as never,
+    });
+    const abort = new AbortController();
+    const starting = a.start(ctx({ signal: abort.signal }));
+    await new Promise((r) => setTimeout(r, 10));
+    abort.abort();
+    fs.rmSync(path.join(root, "conn"), { recursive: true, force: true }); // what the disconnect does
+    release();
+    await expect(starting).rejects.toThrow();
+    expect(queries).toBe(0);
+    expect(fs.existsSync(path.join(root, "conn"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "conn-meta"))).toBe(false);
+  });
+
+  it("a cancel during a turn kills the CLI", async () => {
+    const root = tmp();
+    const kills: string[] = [];
+    let exited = false;
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c1", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      spawn: () => {
+        const ev = new EventEmitter();
+        return Object.assign(ev, {
+          stdin: new PassThrough(),
+          stdout: new PassThrough(),
+          killed: false,
+          exitCode: null,
+          kill: (sig: string) => {
+            kills.push(sig);
+            setTimeout(() => {
+              exited = true;
+              ev.emit("exit", null, sig);
+            }, 20);
+            return true;
+          },
+        }) as never;
+      },
+      // Like the SDK: starts the CLI through spawnClaudeCodeProcess, and close() ends the process.
+      query: ((p: { options: Options }) => {
+        const proc = p.options.spawnClaudeCodeProcess!({
+          command: process.execPath,
+          args: [],
+          cwd: root,
+          env: {},
+          signal: new AbortController().signal,
+        });
+        async function* gen(): AsyncGenerator<SDKMessage> {
+          yield* await new Promise<SDKMessage[]>(() => {}); // never answers
+        }
+        return Object.assign(gen(), {
+          interrupt: async () => {},
+          close: () => void proc.kill("SIGTERM"),
+          setModel: async () => {},
+        });
+      }) as never,
+    });
+    const abort = new AbortController();
+    const s = await a.start(ctx({ signal: abort.signal }));
+    s.turn({ text: "안녕", model: "claude-haiku-5-5" });
+    abort.abort();
+    // The abort alone ends the CLI (the test runner closes the session afterwards, but must not have to).
+    for (let i = 0; i < 100 && !exited; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(kills.length).toBeGreaterThanOrEqual(1);
+    expect(exited).toBe(true);
+    await s.close();
+    expect(() => s.turn({ text: "또", model: "claude-haiku-5-5" })).toThrow();
+  });
+
+  it("close() returns only after the CLI has exited", async () => {
+    const root = tmp();
+    let exited = false;
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c1", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      spawn: () => {
+        const ev = new EventEmitter();
+        return Object.assign(ev, {
+          stdin: new PassThrough(),
+          stdout: new PassThrough(),
+          killed: false,
+          exitCode: null,
+          kill: (sig: string) => {
+            setTimeout(() => {
+              exited = true;
+              ev.emit("exit", null, sig);
+            }, 20);
+            return true;
+          },
+        }) as never;
+      },
+      query: ((p: { options: Options }) => {
+        const proc = p.options.spawnClaudeCodeProcess!({
+          command: process.execPath,
+          args: [],
+          cwd: root,
+          env: {},
+          signal: new AbortController().signal,
+        });
+        async function* gen(): AsyncGenerator<SDKMessage> {
+          yield* await new Promise<SDKMessage[]>(() => {}); // never answers
+        }
+        return Object.assign(gen(), {
+          interrupt: async () => {},
+          close: () => void proc.kill("SIGTERM"),
+          setModel: async () => {},
+        });
+      }) as never,
+    });
+    const s = await a.start(ctx());
+    s.turn({ text: "안녕", model: "claude-haiku-5-5" });
+    await s.close();
+    expect(exited).toBe(true);
   });
 });

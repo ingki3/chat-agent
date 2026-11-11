@@ -69,7 +69,7 @@ function AuthGate() {
           <Route path="schedules" element={<PlaceholderPage title="⏰ 예약" issue="#55" />} />
           <Route path="artifacts" element={<PlaceholderPage title="🧩 아티팩트" issue="#28" />} />
           <Route path="notifications" element={<NotificationsPage />} />
-          <Route path="settings" element={<SettingsPage onChanged={set} />} />
+          <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />
           <Route
             path="admin"
             element={isAdmin ? <AdminPage selfId={data.user.id} /> : <Navigate to="/" replace />}

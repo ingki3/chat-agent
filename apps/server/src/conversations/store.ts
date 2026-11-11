@@ -254,6 +254,7 @@ export class ConversationStore {
       runtime?: string;
       model?: string;
       effort?: string | null;
+      connectionId?: string | null;
     },
   ): void {
     const parts = patch.parts ? MessagePart.array().parse(patch.parts) : undefined;
@@ -265,6 +266,7 @@ export class ConversationStore {
         ...(patch.runtime ? { runtime: patch.runtime } : {}),
         ...(patch.model ? { model: patch.model } : {}),
         ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
+        ...(patch.connectionId !== undefined ? { connectionId: patch.connectionId } : {}),
       })
       .where(eq(messages.id, id))
       .run();
