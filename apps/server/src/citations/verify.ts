@@ -35,7 +35,75 @@ const DIGIT = /\p{N}/u;
  * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
  */
 const TOKEN = /[\p{L}\p{N}\p{M}]/u;
-const HANGUL = /\p{Script=Hangul}/u;
+/**
+ * Korean particles and copula endings a quote may stop right before (review #97 round 5) — a closed list: the
+ * source must continue with one of these and then a token boundary (not a letter, digit or mark, or the end of
+ * the text). Whatever the quote ends with: Hangul, a digit, `%`, a unit, `²`, Latin (`32%로`, `32m²로`,
+ * `GPT-4o이며`, `Node.js입니다`, `수출이`). `유효하지 않습니다` (`하…`) and `사용불가` (`불…`) are not. A missing
+ * rare particle only gives a false "not found" (⚠️).
+ */
+export const KOREAN_PARTICLES = [
+  "은",
+  "는",
+  "이",
+  "가",
+  "을",
+  "를",
+  "의",
+  "에",
+  "에서",
+  "에게",
+  "께",
+  "로",
+  "으로",
+  "와",
+  "과",
+  "도",
+  "만",
+  "까지",
+  "부터",
+  "보다",
+  "처럼",
+  "이나",
+  "나",
+  "이며",
+  "며",
+  "이고",
+  "고",
+  "이다",
+  "다",
+  "입니다",
+  "이에요",
+  "예요",
+  "인",
+  "이라",
+  "라",
+  "이라고",
+  "라고",
+  "이란",
+  "란",
+] as const;
+/** Particles that may take 는 / 도 / 만 after them (`에서는`, `으로는`, `에도`, `까지만` …). */
+export const COMBINING_PARTICLES = [
+  "에",
+  "에서",
+  "에게",
+  "께",
+  "로",
+  "으로",
+  "와",
+  "과",
+  "까지",
+  "부터",
+  "보다",
+  "처럼",
+] as const;
+const byLength = (xs: readonly string[]) => [...xs].sort((a, b) => b.length - a.length).join("|");
+const PARTICLE_THEN_BOUNDARY = new RegExp(
+  `^(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도|만)|${byLength(KOREAN_PARTICLES)})(?![\\p{L}\\p{N}\\p{M}])`,
+  "u",
+);
+const PARTICLE_LOOKAHEAD = 6;
 const SPACE = /\s/u;
 
 const ENTITIES: Record<string, string> = {
@@ -253,7 +321,6 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
   const { norm, from, to } = normalizedBody(body, cacheKey);
   const first = firstChar(want);
   const last = lastChar(want);
-  const endsSentence = /[.!?。！？]$/u.test(want);
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
     // Not inside a token at the start.
@@ -265,13 +332,13 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
       (before === "-" || before === "+" || DIGIT.test(charBefore(norm, at - 1)))
     )
       continue;
-    const rest = norm.slice(at + want.length, at + want.length + 3);
+    const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
-    // Not before the rest of a decimal (`3` in `3.5`, also `3.` in `3.5`).
+    // Not before the rest of a decimal (`3` in `3.5`).
     if (DIGIT.test(last) && /^[.,]\p{N}/u.test(rest)) continue;
-    if (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1))) && DIGIT.test(after)) continue;
-    // Not inside a token at the end — except a Korean particle, or a quote that ends a sentence.
-    if (TOKEN.test(after) && !(HANGUL.test(last) && HANGUL.test(after)) && !endsSentence) continue;
+    // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
+    // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
+    if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
     const quote = body.slice(start, end).replace(/\s+/g, " ").trim();

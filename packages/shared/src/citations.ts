@@ -257,10 +257,11 @@ export function citationMarkers(
 const END = /[.!?。！？]/u;
 
 /**
- * Whether a marker at `start` is array indexing: right after an identifier that is itself directly preceded by
- * `=` (also `+=`, `==`; spaces allowed), `(` (spaces allowed), `.`, `[` or `]` — `x = a[1]`, `f(a[1]`,
- * `obj.items[1]`, `m[0][1]`. Nothing else counts (review #97 round 4): `Windows, Linux[1]`, `GPT-4o[1]`,
- * `S&P500[1]` are citation markers. Code blocks and inline code are never markers anyway.
+ * Whether a marker at `start` is array indexing: right after `]` (`m[0][1]`), or right after an identifier that is
+ * itself directly preceded by `[` or `]`, or by `=` (also `+=`, `==`) or `(` with spaces allowed — `x = a[1]`,
+ * `f(a[1]`. Nothing else counts (review #97 rounds 4–5): `Windows, Linux[1]`, `GPT-4o[1]`, `S&P500[1]`,
+ * `Node.js[1]`, `Python 3.12[1]`, `example.com[1]` are citation markers — and so is `obj.items[1]` at a prose line
+ * end (a rare over-warning). Code blocks and inline code are never markers anyway.
  */
 function inExpression(text: string, start: number): boolean {
   const prev = text[start - 1] ?? "";
@@ -268,7 +269,7 @@ function inExpression(text: string, start: number): boolean {
   if (!/[A-Za-z0-9_]/.test(prev)) return false;
   let k = start - 1;
   while (k >= 0 && /[A-Za-z0-9_]/.test(text[k]!)) k--;
-  if (k >= 0 && /[.[\]]/.test(text[k]!)) return true;
+  if (k >= 0 && /[[\]]/.test(text[k]!)) return true;
   while (k >= 0 && (text[k] === " " || text[k] === "\t")) k--;
   return k >= 0 && /[=(]/.test(text[k]!);
 }

@@ -168,6 +168,27 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("값은 34원이었다고", "값은 [3]34원이었다고 했다.")).toBe(false);
   });
 
+  it("the end may stop only before a Korean particle from the closed list, then a boundary (round 5)", () => {
+    // The review's positive controls: a particle after a figure, a unit, a product name.
+    expect(found("수출 증가율은 32%", "수출 증가율은 32%로 집계됐다.")).toBe(true);
+    expect(found("공장 건물의 면적은 32m²", "공장 건물의 면적은 32m²로 집계됐다.")).toBe(true);
+    expect(found("사용한 모델은 GPT-4o", "사용한 모델은 GPT-4o이며 공개형이다.")).toBe(true);
+    expect(found("해당 런타임은 Node.js", "해당 런타임은 Node.js입니다.")).toBe(true);
+    expect(found("10월 반도체 수출", "10월 반도체 수출에서는 감소했다.")).toBe(true);
+    expect(found("10월 반도체 수출", "10월 반도체 수출으로는 부족했다.")).toBe(true);
+    expect(found("10월 반도체 수출", "10월 반도체 수출이")).toBe(true); // the end of the text is a boundary
+    // Not a particle, or a particle that runs on into more of the word.
+    expect(found("이 설정은 유효", "이 설정은 유효하지 않습니다.")).toBe(false);
+    // Only listed particles: a syllable outside the list fails even right before a boundary.
+    expect(found("이 설정은 유효", "이 설정은 유효하, 그리고 끝.")).toBe(false);
+    expect(found("이 기능은 사용", "이 기능은 사용불가 상태다.")).toBe(false);
+    expect(found("10월 반도체 수", "10월 반도체 수출이 늘었다.")).toBe(false);
+    expect(found("수출 증가율은 32%", "수출 증가율은 32%로써 확정됐다.")).toBe(false);
+    expect(found("사용한 모델은 GPT-4", "사용한 모델은 GPT-4o이며 공개형이다.")).toBe(false);
+    expect(found("공장 건물의 면적은 32m", "공장 건물의 면적은 32m²로 집계됐다.")).toBe(false);
+    expect(found("10월 반도체 수출", "10월 반도체 수출이다1")).toBe(false);
+  });
+
   it("a match neither starts nor ends inside a token (round 4)", () => {
     // The three review cases: the quote stops right before a superscript or subscript.
     expect(found("면적은 정확히 32m", "면적은 정확히 32m² 이었다.")).toBe(false);
@@ -187,9 +208,13 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("이 물질의 화학식은 H₂O", "이 물질의 화학식은 H₂O 이다.")).toBe(true);
     expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true);
     expect(found("수출이 크게 늘었다.", "수출이 크게 늘었다.[3] 업계는")).toBe(true);
-    expect(found("Exports rose sharply.", "Exports rose sharply.²")).toBe(true);
+    // Round 5: one closed rule at the end — no exception for a quote that ends a sentence.
+    expect(found("Exports rose sharply.", "Exports rose sharply.²")).toBe(false);
+    expect(found("Exports rose sharply.", "Exports rose sharply. Then")).toBe(true);
     // …but a full stop is not a sentence end inside a decimal.
     expect(found("성장률은 무려 3.", "성장률은 무려 3.5%였다.")).toBe(false);
+    expect(found("성장률은 무려 3", "성장률은 무려 3.5%였다.")).toBe(false);
+    expect(found("총 판매량은 무려 1", "총 판매량은 무려 1,234대였다.")).toBe(false);
   });
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
@@ -578,6 +603,11 @@ describe("paragraphs that need a citation", () => {
     expect(ns("지원 운영체제는 Windows, Linux[1]\n")).toEqual([1]);
     expect(ns("사용한 모델은 GPT-4o[1]\n")).toEqual([1]);
     expect(ns("기준 지수는 S&P500[1]\n")).toEqual([1]);
+    // Round 5: a dot is not an expression context (obj.items[1] at a prose line end is a marker too).
+    expect(ns("해당 런타임은 Node.js[1]\n")).toEqual([1]);
+    expect(ns("권장 버전은 Python 3.12[1]\n")).toEqual([1]);
+    expect(ns("공식 사이트는 example.com[1]\n")).toEqual([1]);
+    expect(ns("설정값은 obj.items[1]\n")).toEqual([1]);
     expect(ns("모델은 X1[2]")).toEqual([2]);
     expect(ns("Exports rose[4].")).toEqual([4]);
     for (const t of [
@@ -589,10 +619,10 @@ describe("paragraphs that need a citation", () => {
       "m[1][2] = 3",
       // Round 3: expressions only.
       "y = foo(a[1]\n",
-      "obj.items[1]\n",
       "f(a[1]\n",
       "m[0][1]\n",
       "total += arr[2]  \n",
+      "arr[idx[1]\n",
     ])
       expect(ns(t), t).toEqual([]);
   });
