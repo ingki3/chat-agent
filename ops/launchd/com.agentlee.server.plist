@@ -29,6 +29,8 @@
     <string>__HOME__</string>
     <key>PATH</key>
     <string>__NODE_DIR__:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LOG_FILE</key>
+    <string>__LOGDIR__/server.log</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -38,8 +40,9 @@
   <integer>10</integer>
   <key>ProcessType</key>
   <string>Standard</string>
+  <!-- The app writes (and rotates) server.log itself via LOG_FILE; stdout only catches stray output. -->
   <key>StandardOutPath</key>
-  <string>__LOGDIR__/server.log</string>
+  <string>__LOGDIR__/server.out.log</string>
   <key>StandardErrorPath</key>
   <string>__LOGDIR__/server.err.log</string>
 </dict>

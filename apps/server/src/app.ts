@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { JWTVerifyGetKey } from "jose";
 import type { HealthResponse } from "@agentlee/shared";
@@ -26,7 +26,10 @@ import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
 import { isGatePath, registerGate, type GateOptions } from "./gate.js";
 import { BASE_HEADERS } from "./headers.js";
-import { loggerOptions } from "./logging.js";
+import { logEvent, loggerOptions, rotatingFile } from "./logging.js";
+import { ErrorLog } from "./observability/errors.js";
+import { registerRoutePattern } from "./observability/policy.js";
+import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
 
 const VERSION = "0.0.0";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +60,8 @@ declare module "fastify" {
     conversations: ConversationStore | undefined;
     runs: RunManager | undefined;
     mcp: McpService | undefined;
+    /** Recent errors (admin, #46); undefined without a database. */
+    errors: ErrorLog | undefined;
   }
 }
 
@@ -66,6 +71,8 @@ export type BuildOptions = {
   /** Attach Vite in middleware mode (one port for UI + API in development). */
   vite?: boolean;
   logger?: boolean;
+  /** Log destination (tests capture it). Implies logging on; otherwise LOG_FILE, else stdout. */
+  logStream?: NodeJS.WritableStream;
   /** Timing overrides for the diagnostic stream (tests). The route exists only when config.diagStream is set. */
   diag?: DiagOptions;
   /** Rate-limit/clock overrides for the temporary gate (tests). Active only when config.tempGateCode is set. */
@@ -91,11 +98,26 @@ export type BuildOptions = {
 };
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: (opts.logger ?? config.env !== "test") ? loggerOptions() : false });
+  const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
+  const logDest = opts.logStream ?? (config.logFile ? rotatingFile(config.logFile) : undefined);
+  const app = Fastify({
+    logger: logOn ? loggerOptions(logDest) : false,
+    // Errors Fastify raises before routing (bad percent-encoding, …) skip the error handler and every hook, and
+    // their default body repeats the raw URL. Answer them with a fixed body and the usual security headers.
+    frameworkErrors: (err, req, res) => {
+      const reply = res as unknown as FastifyReply;
+      logEvent(req.log, "info", "request.error", { err, errorCode: "bad_request", category: "client" });
+      reply.headers(BASE_HEADERS).header("Cache-Control", "no-store");
+      if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
+      return reply.code(400).send({ error: "invalid_request" });
+    },
+  });
   const startedAt = Date.now();
 
   // First, before any route exists: every route that could address a resource must declare its permission.
   installRouteRules(app);
+  // Route patterns are what logs and the error list may name (observability/policy.ts).
+  app.addHook("onRoute", (route) => registerRoutePattern(route.url));
 
   app.addHook("onSend", async (_req, reply, payload) => {
     reply.headers(BASE_HEADERS);
@@ -108,6 +130,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   app.decorate("appEvents", events);
   app.decorate("users", users);
   app.decorate("conversations", opts.db ? new ConversationStore(opts.db) : undefined);
+  const errors = opts.db ? new ErrorLog(opts.db) : undefined;
+  app.decorate("errors", errors);
+  if (errors) {
+    // Retention must not depend on new errors arriving.
+    const prune = setInterval(() => errors.prune(), 3600_000);
+    prune.unref();
+    app.addHook("onClose", async () => clearInterval(prune));
+  }
+  // Before any route or plugin, so every one inherits it: sanitised error bodies, logs and recent-error entries.
+  registerErrorHandling(app, errors);
   const verifier = config.access
     ? createAccessVerifier({ ...config.access, ...(opts.accessKeys ? { keys: opts.accessKeys } : {}) })
     : undefined;
@@ -131,6 +163,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       mcp,
       mcpTokens,
+      log: app.log,
+      ...(errors ? { errors } : {}),
       ...opts.runs,
     });
     // Runs left running by a previous process cannot be continued: mark them failed before serving.
@@ -145,6 +179,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("runs", runManager);
     registerConversationRoutes(app, app.conversations!, runManager);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
+    registerErrorRoutes(app, errors!);
   }
 
   app.get(
@@ -208,7 +243,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         return reply.type("text/html; charset=utf-8").header("Cache-Control", "no-cache").send(indexHtml);
       });
     } else {
-      app.log.warn(`web build not found at ${webDist} — run "pnpm build" first`);
+      // The path is not logged (log policy): the default is apps/web/dist — run "pnpm build" first.
+      logEvent(app.log, "warn", "web.build_missing");
     }
   }
 

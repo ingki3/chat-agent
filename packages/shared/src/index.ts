@@ -108,3 +108,25 @@ export type AuthError =
   | "cannot_change_self"
   | "last_admin"
   | "not_found";
+
+/**
+ * One entry of the admin "최근 오류" list (`GET /api/admin/errors`, #46). Same policy as the logs: IDs, sanitised
+ * codes and route patterns only — never an error message, prompt or tool output.
+ */
+export const RecentError = z.object({
+  id: z.number().int(),
+  at: z.number().int(),
+  source: z.enum(["http", "run", "tool"]),
+  code: z.string(),
+  category: z.string(),
+  userId: z.string().nullable(),
+  conversationId: z.string().nullable(),
+  runId: z.string().nullable(),
+  runtime: z.string().nullable(),
+  tool: z.string().nullable(),
+  route: z.string().nullable(),
+  statusCode: z.number().int().nullable(),
+});
+export type RecentError = z.infer<typeof RecentError>;
+export const RecentErrorsResponse = z.object({ errors: z.array(RecentError) });
+export type RecentErrorsResponse = z.infer<typeof RecentErrorsResponse>;

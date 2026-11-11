@@ -7,8 +7,8 @@ import { describe, expect, it } from "vitest";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const script = path.join(root, "scripts/install-launchd.sh");
-const run = (env: Record<string, string>) =>
-  spawnSync("bash", [script, "print"], {
+const run = (env: Record<string, string>, cmd = "print") =>
+  spawnSync("bash", [script, cmd], {
     env: { ...process.env, AGENTLEE_NODE: process.execPath, ...env },
     encoding: "utf8",
   });
@@ -29,6 +29,32 @@ describe("install-launchd.sh print", () => {
     expect(xml).toMatch(/<key>UserName<\/key>\s*<string>[^<]+<\/string>/);
     if (process.platform === "darwin") {
       const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-plist-")), "p.plist");
+      fs.writeFileSync(f, xml);
+      expect(execFileSync("plutil", ["-lint", f], { encoding: "utf8" })).toMatch(/OK/);
+    }
+  });
+
+  it("has the app write and rotate server.log itself (LOG_FILE), stdout only as a fallback", () => {
+    const xml = run({ AGENTLEE_LOG_DIR: "/Library/Logs/agentlee" }).stdout;
+    expect(xml).toMatch(/<key>LOG_FILE<\/key>\s*<string>\/Library\/Logs\/agentlee\/server.log<\/string>/);
+    expect(xml).toMatch(
+      /<key>StandardOutPath<\/key>\s*<string>\/Library\/Logs\/agentlee\/server.out.log<\/string>/,
+    );
+  });
+
+  it("renders the 5-minute uptime check daemon", () => {
+    const r = run({ AGENTLEE_LOG_DIR: "/Library/Logs/agentlee" }, "print-uptime");
+    expect(r.status, r.stderr).toBe(0);
+    const xml = r.stdout;
+    expect(xml).not.toMatch(/__[A-Z_]+__/);
+    expect(xml).toContain("<string>com.agentlee.uptime</string>");
+    expect(xml).toMatch(/<key>StartInterval<\/key>\s*<integer>300<\/integer>/);
+    expect(xml).toContain(`<string>${root}/node_modules/tsx/dist/cli.mjs</string>`);
+    expect(xml).toContain(`<string>${root}/scripts/uptime.ts</string>`);
+    expect(xml).toContain("<string>/Library/Logs/agentlee/uptime.jsonl</string>");
+    expect(xml).toMatch(/<string>[^<]+\/\.agentlee\/uptime-token<\/string>/);
+    if (process.platform === "darwin") {
+      const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-plist-")), "u.plist");
       fs.writeFileSync(f, xml);
       expect(execFileSync("plutil", ["-lint", f], { encoding: "utf8" })).toMatch(/OK/);
     }

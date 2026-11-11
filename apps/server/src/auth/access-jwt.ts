@@ -1,13 +1,15 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 
-export type AccessIdentity = { email: string };
+/** A family member, or a Cloudflare Access service token (the uptime check — allowed on /api/health only). */
+export type AccessIdentity = { email: string } | { serviceToken: string };
 export type AccessVerifier = (token: string) => Promise<AccessIdentity>;
 
 /**
  * Verifies the `Cf-Access-Jwt-Assertion` header as Cloudflare documents it: RS256 signature against the team's
  * JWKS (`https://<team>/cdn-cgi/access/certs`, cached, refetched for an unknown `kid` so key rotation works),
- * `iss` = team domain, `aud` = the application's AUD tag, `exp`/`nbf`. Tokens without an email (service tokens)
- * are refused — every request must map to a family member.
+ * `iss` = team domain, `aud` = the application's AUD tag, `exp`/`nbf`. A token without an email is accepted only
+ * as a service token (`common_name` = its client ID); the trust boundary lets those reach the health check and
+ * nothing else (#46 uptime measurement).
  */
 export function createAccessVerifier(opts: {
   teamDomain: string;
@@ -31,7 +33,10 @@ export function createAccessVerifier(opts: {
       clockTolerance: 30,
       requiredClaims: ["exp", "iat"],
     });
-    if (typeof payload.email !== "string" || !payload.email.includes("@")) throw new Error("no email claim");
-    return { email: payload.email.trim().toLowerCase() };
+    if (typeof payload.email === "string" && payload.email.includes("@"))
+      return { email: payload.email.trim().toLowerCase() };
+    const cn = payload.common_name;
+    if (payload.email === undefined && typeof cn === "string" && cn.length > 0) return { serviceToken: cn };
+    throw new Error("no email claim");
   };
 }

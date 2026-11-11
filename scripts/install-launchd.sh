@@ -5,11 +5,14 @@
 #   pnpm -s launchd install     # needs sudo; asks for confirmation (Access must protect the hostname)
 #   pnpm -s launchd uninstall   # needs sudo
 #   pnpm -s launchd status
+#   pnpm -s launchd print-uptime | install-uptime | uninstall-uptime   # 5-minute uptime check (#46, §9)
 #
 # Overrides: AGENTLEE_USER (service account, default: you), AGENTLEE_NODE (node binary), AGENTLEE_LOG_DIR.
 set -euo pipefail
 
 LABEL=com.agentlee.server
+UPTIME_LABEL=com.agentlee.uptime
+UPTIME_TARGET="/Library/LaunchDaemons/$UPTIME_LABEL.plist"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 HELPER="$REPO/scripts/launchd-helper.mjs"
 TARGET="/Library/LaunchDaemons/$LABEL.plist"
@@ -41,7 +44,7 @@ resolve_node() {
 }
 NODE="$(resolve_node)"
 
-render() { AL_USER="$RUN_USER" AL_HOME="$RUN_HOME" AL_NODE="$NODE" AL_LOGDIR="$LOGDIR" "$NODE" "$HELPER" render; }
+render() { AL_USER="$RUN_USER" AL_HOME="$RUN_HOME" AL_NODE="$NODE" AL_LOGDIR="$LOGDIR" "$NODE" "$HELPER" render "${1:-server}"; }
 
 preflight() {
   [ -f "$REPO/apps/server/dist/index.js" ] || die "server not built — run: pnpm build"
@@ -78,8 +81,30 @@ case "${1:-}" in
     launchctl bootout system "$TARGET" 2>/dev/null || true
     rm -f "$TARGET"; echo "removed $TARGET (logs kept in $LOGDIR)"
     ;;
+  print-uptime) render uptime ;;
+  install-uptime)
+    if [ "$(id -u)" != 0 ]; then
+      exec sudo /usr/bin/env AGENTLEE_USER="$RUN_USER" AGENTLEE_NODE="$NODE" AGENTLEE_LOG_DIR="$LOGDIR" \
+        bash "$0" install-uptime
+    fi
+    [ -f "$REPO/node_modules/tsx/dist/cli.mjs" ] || die "tsx not installed — run: pnpm install"
+    tok="$RUN_HOME/.agentlee/uptime-token"
+    [ -f "$tok" ] || echo "note: $tok not found — checks record the local path only until it exists (docs/ops.md §9)"
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    render uptime > "$tmp"; plutil -lint "$tmp" >/dev/null || die "rendered plist is invalid"
+    install -d -m 755 -o "$RUN_USER" -g staff "$LOGDIR"
+    launchctl bootout system "$UPTIME_TARGET" 2>/dev/null || true
+    install -m 644 -o root -g wheel "$tmp" "$UPTIME_TARGET"
+    launchctl bootstrap system "$UPTIME_TARGET"
+    echo "installed $UPTIME_TARGET — checks in $LOGDIR/uptime.jsonl"
+    ;;
+  uninstall-uptime)
+    [ "$(id -u)" = 0 ] || exec sudo bash "$0" uninstall-uptime
+    launchctl bootout system "$UPTIME_TARGET" 2>/dev/null || true
+    rm -f "$UPTIME_TARGET"; echo "removed $UPTIME_TARGET (records kept in $LOGDIR)"
+    ;;
   status)
     launchctl print "system/$LABEL" 2>/dev/null | grep -E "state =|pid =|last exit code" || echo "$LABEL not loaded"
     ;;
-  *) sed -n '2,9p' "$0"; exit 2 ;;
+  *) sed -n '2,10p' "$0"; exit 2 ;;
 esac

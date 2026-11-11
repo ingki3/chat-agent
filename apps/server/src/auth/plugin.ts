@@ -2,7 +2,7 @@ import net from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { CSRF_HEADER, type AuthError } from "@agentlee/shared";
 import type { Config } from "../config.js";
-import { isApiRequest } from "../paths.js";
+import { isApiRequest, routerPath } from "../paths.js";
 import type { AccessVerifier } from "./access-jwt.js";
 import "./context.js";
 import type { UserStore } from "./users.js";
@@ -29,6 +29,10 @@ function rawHeaderValues(req: FastifyRequest, name: string): string[] {
   for (let i = 0; i < raw.length; i += 2) if (raw[i]!.toLowerCase() === name) out.push(raw[i + 1]!);
   return out;
 }
+
+/** `GET|HEAD /api/health` — the only thing an Access service token may reach. */
+export const isHealthCheck = (req: FastifyRequest) =>
+  (req.method === "GET" || req.method === "HEAD") && routerPath(req.url) === "/api/health";
 
 export type TrustDeps = { config: Config; verifier: AccessVerifier | undefined };
 
@@ -66,11 +70,15 @@ export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): vo
       }
       const token = req.headers["cf-access-jwt-assertion"];
       if (typeof token !== "string" || !token) return deny(reply, 403, "access_denied");
+      let id;
       try {
-        ctx.accessEmail = (await verifier(token)).email;
+        id = await verifier(token);
       } catch {
         return deny(reply, 403, "access_denied");
       }
+      if ("email" in id) ctx.accessEmail = id.email;
+      // A service token (no person behind it) may only read the health check — the external uptime probe.
+      else if (!isHealthCheck(req)) return deny(reply, 403, "access_denied");
       return;
     }
 

@@ -185,3 +185,30 @@ export const runEvents = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.runId, t.seq] })],
 );
+
+/**
+ * Recent errors for the admin screen (#46, FR-10.4) — the same policy as the logs: IDs, codes and route patterns
+ * only, never an error message, prompt, tool input/output or SDK text. Trimmed to the newest rows by ErrorLog.
+ * No foreign keys: an entry outlives the conversation it mentions, but it holds nothing from it.
+ */
+export const errorLog = sqliteTable(
+  "error_log",
+  {
+    id: integer("id").primaryKey(),
+    at: integer("at").notNull(),
+    /** Where it happened: an HTTP request, a run, or a tool call inside a run. */
+    source: text("source", { enum: ["http", "run", "tool"] }).notNull(),
+    /** Sanitised code (`runtime_error`, `usage_limit`, `internal_error`, …). */
+    code: text("code").notNull(),
+    category: text("category").notNull(),
+    userId: text("user_id"),
+    conversationId: text("conversation_id"),
+    runId: text("run_id"),
+    runtime: text("runtime"),
+    tool: text("tool"),
+    /** `METHOD /route/:pattern` for HTTP errors. */
+    route: text("route"),
+    statusCode: integer("status_code"),
+  },
+  (t) => [index("error_log_at_idx").on(t.at)],
+);

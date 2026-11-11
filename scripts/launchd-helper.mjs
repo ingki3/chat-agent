@@ -1,5 +1,5 @@
 // Helper for scripts/install-launchd.sh (plain JS so it runs without a build step or tsx).
-//   node scripts/launchd-helper.mjs render   — template from stdin-less file, values from AL_* env, XML-escaped
+//   node scripts/launchd-helper.mjs render [server|uptime]   — plist template, values from AL_* env, XML-escaped
 //   node scripts/launchd-helper.mjs check    — loads config and the master key exactly as the server does
 import fs from "node:fs";
 import path from "node:path";
@@ -25,7 +25,10 @@ if (cmd === "render") {
     LOGDIR: process.env.AL_LOGDIR,
   };
   for (const [k, v] of Object.entries(values)) if (!v) throw new Error(`missing value for __${k}__`);
-  const template = fs.readFileSync(path.join(repo, "ops/launchd/com.agentlee.server.plist"), "utf8");
+  // Which daemon: the server (default) or the 5-minute uptime check (#46).
+  const name = process.argv[3] ?? "server";
+  if (name !== "server" && name !== "uptime") throw new Error(`unknown template ${name}`);
+  const template = fs.readFileSync(path.join(repo, `ops/launchd/com.agentlee.${name}.plist`), "utf8");
   const out = template.replace(/<!--[\s\S]*?-->\n/g, "").replace(/__([A-Z_]+)__/g, (m, k) => {
     if (!(k in values)) throw new Error(`unknown placeholder ${m}`);
     return xml(values[k]);
