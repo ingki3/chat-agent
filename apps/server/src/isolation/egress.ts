@@ -154,3 +154,10 @@ export class EgressService {
 
 /** Hosts Claude Code needs with nonessential traffic off: the API (API keys and subscription tokens alike). */
 export const CLAUDE_EGRESS_HOSTS = ["api.anthropic.com"] as const;
+
+/**
+ * Hosts codex app-server needs with an API key (0.165.0, our config: no model-list fetch, no analytics or update
+ * checks): the Responses API, over HTTPS and WebSocket. A ChatGPT login (#18) adds chatgpt.com (and
+ * auth.openai.com for token refresh) — added with #18 once checked.
+ */
+export const CODEX_EGRESS_HOSTS = ["api.openai.com"] as const;

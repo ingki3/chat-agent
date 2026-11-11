@@ -17,7 +17,7 @@ import {
   type RuntimeSession,
   type StartContext,
 } from "../src/runtime/adapter.js";
-import { claudeLockdown, codexConfigToml, codexMcpEnv, mcpLoopbackPort } from "../src/runtime/lockdown.js";
+import { claudeLockdown, codexMcpEnv, codexRunConfig, mcpLoopbackPort } from "../src/runtime/lockdown.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 const isMac = process.platform === "darwin";
@@ -458,7 +458,7 @@ describe("runtime connection settings (#43, used by #15/#16)", () => {
     });
   });
   it("Codex: URL in config.toml, token only in the environment", () => {
-    const toml = codexConfigToml({ model: "m", mcp });
+    const toml = codexRunConfig({ model: "m", mcp, tools: ["echo_time"] }).join("\n");
     expect(toml).toContain(`url = "${mcp.url}"`);
     expect(toml).toContain('bearer_token_env_var = "AGENTLEE_MCP_TOKEN"');
     expect(toml).not.toContain("tok-abc");
