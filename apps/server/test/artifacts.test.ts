@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -105,14 +107,20 @@ describe("inline scripts and CSP (serve.ts)", () => {
     );
     expect(body).toContain(`onclick="x()"`); // left as is — it does not run: no 'unsafe-inline'/'unsafe-hashes'
     const cdn = CDN_ALLOW_LIST.map((c) => c.url).join(" ");
-    expect(csp).toBe(
+    // Two policies, both enforced: A (hashes + CDN) and B (external scripts only from the CDN URLs — a hash in A
+    // must not admit an external script carrying that hash as its integrity, CSP3).
+    expect(csp).toEqual([
       `sandbox allow-scripts; default-src 'none'; script-src ${sha("draw()")} ${sha("more()")} ${cdn}; ` +
         `style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; ` +
         `frame-ancestors 'self'; base-uri 'none'`,
-    );
-    const scriptSrc = csp.split("; ").find((d) => d.startsWith("script-src"))!;
+      `script-src 'unsafe-inline' ${cdn}`,
+    ]);
+    const [a, b] = csp as [string, string];
+    const scriptSrc = a.split("; ").find((d) => d.startsWith("script-src"))!;
     expect(scriptSrc).not.toMatch(/'unsafe-inline'|'unsafe-eval'|'unsafe-hashes'|\*|https:(?!\/\/)/);
-    expect(csp).not.toMatch(/allow-same-origin|allow-top-navigation|allow-popups|allow-forms/);
+    expect(a).not.toMatch(/allow-same-origin|allow-top-navigation|allow-popups|allow-forms/);
+    // B names no hash (a hash would switch its 'unsafe-inline' off and re-open the hole) and no other source.
+    expect(b).not.toMatch(/sha|nonce|\*|;/);
     expect(artifactCsp([])).toContain("script-src 'none'");
   });
 
@@ -161,6 +169,11 @@ describe("inline scripts and CSP (serve.ts)", () => {
     expect(attachment('주간 "차트"/v2', "csv")).toBe(
       `attachment; filename="__ ____v2.csv"; filename*=UTF-8''${encodeURIComponent("주간 _차트_v2.csv")}`,
     );
+    // Cut by code points: an emoji at the boundary is kept whole or dropped, never split (URIError → 500).
+    const emoji = attachment("a".repeat(99) + "😀", "txt");
+    expect(emoji).toContain(`filename*=UTF-8''${"a".repeat(99)}${encodeURIComponent("😀")}.txt`);
+    expect(attachment("a".repeat(100) + "😀", "txt")).toContain(`filename*=UTF-8''${"a".repeat(100)}.txt`);
+    expect(attachment("x\uD800y", "txt")).toContain(`filename*=UTF-8''x${encodeURIComponent("\uFFFD")}y.txt`);
     expect(attachment("a;b%c\r\n", "md")).toBe(
       `attachment; filename="a_b_c_.md"; filename*=UTF-8''a%3Bb%25c_.md`,
     );
@@ -417,11 +430,36 @@ describe("artifact routes (#27)", () => {
       const r = await get(app, `/a/${id}/v/1/raw`, f.cookies.owner);
       expect(r.statusCode).toBe(200);
       expect(r.headers["content-type"]).toBe("text/html; charset=utf-8");
-      expect(r.headers["content-security-policy"]).toBe(prepareHtml(r.body).csp);
-      expect(r.headers["content-security-policy"]).toMatch(
-        /^sandbox allow-scripts; default-src 'none'; script-src 'sha256-/,
+      // Two Content-Security-Policy headers (each its own policy, both enforced).
+      expect(r.headers["content-security-policy"]).toEqual(prepareHtml(r.body).csp);
+      // On the wire too (a real socket, not inject): two separate header lines.
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const port = (app.server.address() as AddressInfo).port;
+      const wire = await new Promise<string[]>((resolve, reject) =>
+        http
+          .get(
+            {
+              host: "127.0.0.1",
+              port,
+              path: `/a/${id}/v/1/raw`,
+              headers: { ...LOCAL, cookie: f.cookies.owner },
+            },
+            (res) => {
+              res.resume();
+              const raw = res.rawHeaders;
+              resolve(
+                raw
+                  .filter((_, i) => i % 2 === 0 && raw[i]!.toLowerCase() === "content-security-policy")
+                  .map((_, i) => String(i)),
+              );
+            },
+          )
+          .on("error", reject),
       );
-      expect(r.headers["content-security-policy"]).toContain(sha("draw()"));
+      expect(wire).toHaveLength(2);
+      const [policyA] = r.headers["content-security-policy"] as string[];
+      expect(policyA).toMatch(/^sandbox allow-scripts; default-src 'none'; script-src 'sha256-/);
+      expect(policyA).toContain(sha("draw()"));
       for (const [k, v] of Object.entries(RAW_HEADERS)) expect(r.headers[k.toLowerCase()]).toBe(v);
       expect(r.headers).toMatchObject({
         "x-content-type-options": "nosniff",
@@ -494,6 +532,48 @@ describe("artifact routes (#27)", () => {
     expect(csv.body).toBe("\uFEFFa\r\n'=cmd\r\n");
     expect((await raw(doc)).statusCode).toBe(404);
     expect((await get(app, `/a/${doc}/v/1/download`, f.cookies.owner)).statusCode).toBe(404);
+  });
+
+  it("code: each version keeps its own language (download name, revert, a language-only change)", async () => {
+    const { app, f, scope } = await withArtifact();
+    const store = app.artifacts!;
+    const { artifact } = store.create(scope, {
+      kind: "code",
+      title: "스크립트",
+      content: "print(1)",
+      language: "python",
+    });
+    const id = artifact.id;
+    const ext = async (v: number) =>
+      /filename="[^"]*\.(\w+)"/.exec(
+        String((await get(app, `/a/${id}/v/${v}/download`, f.cookies.owner)).headers["content-disposition"]),
+      )![1];
+    expect(
+      store.update(scope, id, { content: "console.log(1)", language: "javascript" }).version.version,
+    ).toBe(2);
+    expect(await ext(1)).toBe("py"); // v1 stays python after v2 changed the language
+    expect(await ext(2)).toBe("js");
+    // Only the language changes: a new version, not a duplicate.
+    expect(
+      store.update(scope, id, { content: "console.log(1)", language: "typescript" }).version,
+    ).toMatchObject({
+      version: 3,
+      language: "typescript",
+    });
+    // No language given: the latest version's is kept.
+    expect(store.update(scope, id, { content: "let x = 1" }).version.language).toBe("typescript");
+    const r = store.revert(id, 1);
+    expect(r.version).toMatchObject({ version: 5, language: "python", revertedFrom: 1 });
+    expect(r.artifact.language).toBe("python");
+    expect(await ext(5)).toBe("py");
+    const detail = (await get(app, `/api/artifacts/${id}`, f.cookies.owner)).json() as ArtifactDetail;
+    expect(detail.versions.map((v) => v.language)).toEqual([
+      "python",
+      "javascript",
+      "typescript",
+      "typescript",
+      "python",
+    ]);
   });
 
   it("read API: list, detail with versions, one version's text; revert adds a copy", async () => {

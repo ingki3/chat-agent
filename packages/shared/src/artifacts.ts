@@ -104,6 +104,8 @@ export const ArtifactVersionInfo = z.object({
   contentHash: z.string(),
   bytes: z.number().int().nonnegative(),
   title: z.string(),
+  /** `code` kind: this version's language. */
+  language: z.string().nullable(),
   runId: z.string().nullable(),
   /** Set when this version is a copy of an earlier one (revert). */
   revertedFrom: z.number().int().positive().nullable(),

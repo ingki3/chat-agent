@@ -2,6 +2,7 @@ CREATE TABLE `artifact_versions` (
 	`artifact_id` text NOT NULL,
 	`version` integer NOT NULL,
 	`title` text NOT NULL,
+	`language` text,
 	`content` text NOT NULL,
 	`content_hash` text NOT NULL,
 	`bytes` integer NOT NULL,

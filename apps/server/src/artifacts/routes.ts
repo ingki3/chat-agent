@@ -139,7 +139,11 @@ export function registerArtifactRoutes(
       // The CSP set here is kept by the app's onSend hook (it adds the app CSP only where none is set).
       return reply
         .headers(RAW_HEADERS)
-        .header("Content-Security-Policy", served.csp)
+        .header(
+          "Content-Security-Policy",
+          // One header line per policy (Fastify sends an array as repeated headers).
+          served.csp.length === 1 ? served.csp[0]! : [...served.csp],
+        )
         .type(served.type)
         .send(served.body);
     },
@@ -153,7 +157,7 @@ export function registerArtifactRoutes(
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
-      const file = v && downloadVersion(a.kind, v.content, a.language);
+      const file = v && downloadVersion(a.kind, v.content, v.language ?? null);
       if (!v || !file) return notFound(reply);
       return (
         reply

@@ -125,6 +125,7 @@ export function toVersionInfo(v: ArtifactVersionRow): ArtifactVersionInfo {
     contentHash: v.contentHash,
     bytes: v.bytes,
     title: v.title,
+    language: v.language ?? null,
     runId: v.runId ?? null,
     revertedFrom: v.revertedFrom ?? null,
     createdAt: v.createdAt,
@@ -194,14 +195,21 @@ export class ArtifactStore {
         })
         .returning()
         .get();
-      const version = this.insertVersion(tx, artifact.id, 1, { title, content, runId: scope.runId, at });
+      const version = this.insertVersion(tx, artifact.id, 1, {
+        title,
+        content,
+        language,
+        runId: scope.runId,
+        at,
+      });
       return { artifact, version };
     });
   }
 
   /**
    * A new version of an artifact of the scope's conversation. An id from another conversation (or user) is not
-   * found. The same content and title as the latest version adds nothing (a repeated call returns it).
+   * found. The same content, title and language as the latest version adds nothing (a repeated call returns
+   * it). A code artifact keeps the latest version's language unless the call gives one.
    */
   update(
     scope: ArtifactScope,
@@ -214,7 +222,9 @@ export class ArtifactStore {
       throw new ArtifactError("artifact_not_found");
     const title = input.title === undefined ? a.title : cleanTitle(input.title);
     const enc = encodeBody(a.kind, input);
-    const language = a.kind === "code" && input.language === undefined ? a.language : enc.language;
+    const latest = this.version(a.id, a.latestVersion);
+    const language =
+      a.kind === "code" && input.language === undefined ? (latest?.language ?? null) : enc.language;
     return this.append(a.id, {
       title,
       content: enc.content,
@@ -224,7 +234,7 @@ export class ArtifactStore {
     });
   }
 
-  /** Restores version `version` by copying it as the newest version. */
+  /** Restores version `version` by copying it (title, content, language) as the newest version. */
   revert(artifactId: string, version: number): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     const old = this.version(artifactId, version);
     const a = this.get(artifactId);
@@ -232,7 +242,7 @@ export class ArtifactStore {
     return this.append(a.id, {
       title: old.title,
       content: old.content,
-      language: a.language,
+      language: old.language ?? null,
       runId: null,
       revertedFrom: old.version,
     });
@@ -256,7 +266,12 @@ export class ArtifactStore {
         .from(artifactVersions)
         .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, a.latestVersion)))
         .get()!;
-      if (v.revertedFrom === null && latest.contentHash === sha256(v.content) && latest.title === v.title)
+      if (
+        v.revertedFrom === null &&
+        latest.contentHash === sha256(v.content) &&
+        latest.title === v.title &&
+        (latest.language ?? null) === v.language
+      )
         return { artifact: a, version: latest };
       if (a.latestVersion >= ARTIFACT_LIMITS.versionsPerArtifact) throw new ArtifactError("artifact_limit");
       const at = this.now();
@@ -276,7 +291,14 @@ export class ArtifactStore {
     tx: Pick<Db, "insert">,
     artifactId: string,
     version: number,
-    v: { title: string; content: string; runId: string | null; revertedFrom?: number | null; at: number },
+    v: {
+      title: string;
+      content: string;
+      language: string | null;
+      runId: string | null;
+      revertedFrom?: number | null;
+      at: number;
+    },
   ): ArtifactVersionRow {
     return tx
       .insert(artifactVersions)
@@ -285,6 +307,7 @@ export class ArtifactStore {
         version,
         title: v.title,
         content: v.content,
+        language: v.language,
         contentHash: sha256(v.content),
         bytes: Buffer.byteLength(v.content, "utf8"),
         runId: v.runId,

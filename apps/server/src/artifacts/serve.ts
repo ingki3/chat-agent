@@ -124,10 +124,20 @@ export function artifactCsp(scripts: readonly string[]): string {
 }
 
 /**
- * An HTML artifact ready to serve: its inline scripts' hashes and the allow-listed CDN URLs in `script-src`, and
- * the SRI `integrity` (+ `crossorigin`) added to `<script src>` tags of allow-listed URLs that have none.
+ * The second, independent policy sent with an HTML artifact. Under CSP3 a hash source also admits an *external*
+ * script whose `integrity` names that hash (§ "allowing external JavaScript via hashes"), so policy A alone would
+ * let `<script src="https://anywhere/x.js" integrity="sha256-<hash of an inline script>">` run. The browser
+ * enforces every policy it receives; this one admits external scripts only from the exact CDN URLs, and leaves
+ * inline scripts to policy A (which still demands the hash and blocks event-handler attributes).
  */
-export function prepareHtml(html: string): { body: string; csp: string } {
+export const cdnOnlyCsp = () => `script-src 'unsafe-inline' ${CDN_ALLOW_LIST.map((c) => c.url).join(" ")}`;
+
+/**
+ * An HTML artifact ready to serve: its inline scripts' hashes and the allow-listed CDN URLs in `script-src` (policy
+ * A) plus the CDN-only policy B (`cdnOnlyCsp`) — sent as two CSP headers, enforced together — and the SRI
+ * `integrity` (+ `crossorigin`) added to `<script src>` tags of allow-listed URLs that have none.
+ */
+export function prepareHtml(html: string): { body: string; csp: readonly string[] } {
   const scripts = findScripts(html);
   const hashes = new Set<string>();
   const edits: { at: number; text: string }[] = [];
@@ -147,7 +157,10 @@ export function prepareHtml(html: string): { body: string; csp: string } {
   }
   let body = html;
   for (const e of edits.reverse()) body = body.slice(0, e.at) + e.text + body.slice(e.at);
-  return { body, csp: artifactCsp([...hashes, ...CDN_ALLOW_LIST.map((c) => c.url)]) };
+  return {
+    body,
+    csp: [artifactCsp([...hashes, ...CDN_ALLOW_LIST.map((c) => c.url)]), cdnOnlyCsp()],
+  };
 }
 
 export const escapeHtml = (s: string) =>
@@ -280,7 +293,8 @@ export function tableCsv(t: TableData): string {
   return `\uFEFF${[t.columns, ...t.rows].map((r) => r.map(cell).join(",")).join("\r\n")}\r\n`;
 }
 
-export type Served = { type: string; body: string; csp: string };
+/** `csp`: the policies to send, one `Content-Security-Policy` header each (all are enforced). */
+export type Served = { type: string; body: string; csp: readonly string[] };
 
 /**
  * What `/a/:id/v/:ver/raw` sends for one version: HTML with its scripts allowed by hash, SVG as an image document
@@ -288,7 +302,7 @@ export type Served = { type: string; body: string; csp: string };
  * `document` has no original yet (#49/#22): undefined.
  */
 export function serveVersion(kind: ArtifactKind, title: string, content: string): Served | undefined {
-  const none = artifactCsp([]);
+  const none = [artifactCsp([])];
   switch (kind) {
     case "html": {
       const { body, csp } = prepareHtml(content);
@@ -372,8 +386,13 @@ const codeExt = (l: string | null) => {
  * that file systems or headers do not take are replaced.
  */
 export function attachment(title: string, ext: string): string {
-  // eslint-disable-next-line no-control-regex -- control characters are not allowed in a file name
-  const base = title.replace(/[\\/:*?"<>|\0-\x1f\x7f]+/g, "_").slice(0, 100) || "artifact";
+  const clean = title
+    // A lone surrogate cannot be percent-encoded (encodeURIComponent throws): replace it.
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD")
+    // eslint-disable-next-line no-control-regex -- control characters are not allowed in a file name
+    .replace(/[\\/:*?"<>|\0-\x1f\x7f]+/g, "_");
+  // Cut by code points, never inside a surrogate pair.
+  const base = Array.from(clean).slice(0, 100).join("") || "artifact";
   const ascii = base.replace(/[^\x20-\x7e]/g, "_").replace(/[%;]/g, "_");
   return `attachment; filename="${ascii}.${ext}"; filename*=UTF-8''${encodeURIComponent(`${base}.${ext}`)}`;
 }

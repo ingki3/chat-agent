@@ -502,7 +502,7 @@ export const artifacts = sqliteTable(
       enum: ["html", "svg", "markdown", "code", "chart", "table", "document"],
     }).notNull(),
     title: text("title").notNull(),
-    /** `code` kind: language label. */
+    /** `code` kind: the latest version's language (each version keeps its own). */
     language: text("language"),
     latestVersion: integer("latest_version").notNull(),
     createdAt: integer("created_at").notNull(),
@@ -524,6 +524,8 @@ export const artifactVersions = sqliteTable(
       .references(() => artifacts.id, { onDelete: "cascade" }),
     version: integer("version").notNull(),
     title: text("title").notNull(),
+    /** `code` kind: this version's language (download name, revert). */
+    language: text("language"),
     content: text("content").notNull(),
     contentHash: text("content_hash").notNull(),
     bytes: integer("bytes").notNull(),

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "dc9235c6-3153-4488-bbad-092d67f4c605",
+  "id": "b96b9c20-d32d-4ee4-a539-551f2aeed642",
   "prevId": "c68cf691-f6b0-43f2-a1a5-f299f6b310e3",
   "tables": {
     "artifact_versions": {
@@ -26,6 +26,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "language": {
+          "name": "language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "content": {

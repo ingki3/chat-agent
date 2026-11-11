@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { expect, test, type APIRequestContext, type Frame, type Page } from "@playwright/test";
 import { MOM, SON, csrf, newConversation, useAccount } from "./helpers.js";
 
@@ -169,11 +170,13 @@ test("the original opened as a top-level page is still sandboxed (opaque origin,
   const res = await page.goto(`/a/${id}/v/1/raw`);
   expect(res!.status()).toBe(200);
   const h = res!.headers();
-  expect(h["content-security-policy"]).toMatch(
-    /^sandbox allow-scripts; default-src 'none'; script-src 'sha256-/,
-  );
-  expect(h["content-security-policy"]).toContain(`${CHART_JS};`);
-  expect(h["content-security-policy"]).toContain("connect-src 'none'");
+  // Two policies, two header lines: A (sandbox, hashes, everything else) and B (external scripts: CDN URL only).
+  const policies = await res!.headerValues("content-security-policy");
+  expect(policies).toHaveLength(2);
+  expect(policies[0]).toMatch(/^sandbox allow-scripts; default-src 'none'; script-src 'sha256-/);
+  expect(policies[0]).toContain(`${CHART_JS};`);
+  expect(policies[0]).toContain("connect-src 'none'");
+  expect(policies[1]).toBe(`script-src 'unsafe-inline' ${CHART_JS}`);
   expect(h["x-content-type-options"]).toBe("nosniff");
   expect(h["cache-control"]).toBe("no-store");
   expect(h["cross-origin-resource-policy"]).toBe("same-origin");
@@ -225,6 +228,45 @@ test("another family member gets 403 on the page and the original; the owner can
   await expect((await artifactFrame(page)).locator("body")).toHaveText("# 비밀 메모");
 });
 
+test("an external script carrying an allowed inline script's hash as its integrity does not run", async ({
+  page,
+  baseURL,
+}) => {
+  // CSP3: a hash source also admits an external script whose integrity names it. The second policy (external
+  // scripts only from the exact CDN URLs) must stop it even though the body and SRI match an allowed inline script.
+  const BODY = "window.hits=(window.hits||0)+1;document.documentElement.dataset.hits=String(window.hits);";
+  const hash = crypto.createHash("sha256").update(BODY, "utf8").digest("base64");
+  let served = 0;
+  await page.route("https://evil.example.com/**", (route) => {
+    served++;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      headers: { "access-control-allow-origin": "*" },
+      body: BODY,
+    });
+  });
+  await useAccount(page, MOM);
+  const html = `<!doctype html><body>
+<script>document.addEventListener("securitypolicyviolation", (e) => {
+  document.documentElement.dataset.violations = (document.documentElement.dataset.violations || "") + "|" + e.effectiveDirective + " " + e.blockedURI;
+});</script>
+<script>${BODY}</script>
+<script src="https://evil.example.com/same.js" integrity="sha256-${hash}" crossorigin="anonymous"></script>
+<script>document.body.dataset.done = "1";</script>
+</body>`;
+  const { id } = await makeArtifact(page, baseURL!, "html", "해시 우회 시험", html);
+  await page.goto(`/a/${id}`);
+  const frame = await artifactFrame(page);
+  await expect(frame.locator("body[data-done='1']")).toBeAttached();
+  await page.waitForTimeout(200);
+  expect(await frame.evaluate(() => document.documentElement.dataset.hits)).toBe("1"); // the inline copy only
+  expect(await frame.evaluate(() => document.documentElement.dataset.violations ?? "")).toContain(
+    "script-src-elem https://evil.example.com/same.js",
+  );
+  expect(served).toBe(0); // refused before any request
+});
+
 const CHART_HTML = `<canvas id="c" width="300" height="150"></canvas><script src="${CHART_JS}"></script>
 <script>
   if (window.Chart) {
@@ -250,8 +292,11 @@ test("the allow-listed CDN script gets its SRI hash; only that exact URL is allo
       `<script src="${CHART_JS.replace(/[.]/g, "\\.")}" integrity="sha384-[A-Za-z0-9+/=]+" crossorigin="anonymous">`,
     ),
   );
-  const csp = raw.headers()["content-security-policy"]!;
-  const scriptSrc = csp.split("; ").find((d) => d.startsWith("script-src"))!;
+  const [csp] = raw
+    .headersArray()
+    .filter((x) => x.name.toLowerCase() === "content-security-policy")
+    .map((x) => x.value);
+  const scriptSrc = csp!.split("; ").find((d) => d.startsWith("script-src"))!;
   // Exact path only: no host-wide or prefix source that would admit other versions or packages.
   expect(scriptSrc.split(" ").filter((s) => s.startsWith("https:"))).toEqual([CHART_JS]);
 });
