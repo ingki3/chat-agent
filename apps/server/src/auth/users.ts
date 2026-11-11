@@ -33,6 +33,7 @@ export function toAdminUser(u: UserRow): AdminUser {
     active: u.active,
     permissions: u.permissions as UserPermissions,
     defaultRuntime: (u.defaultRuntime as RuntimeId | null) ?? null,
+    youth: u.youth,
     createdAt: u.createdAt,
   };
 }
@@ -82,6 +83,7 @@ export class UserStore {
     mustChangePassword?: boolean;
     permissions?: UserPermissions;
     defaultRuntime?: RuntimeId | null;
+    youth?: boolean;
   }): UserRow {
     const row = {
       id: crypto.randomUUID(),
@@ -93,6 +95,7 @@ export class UserStore {
       active: true,
       permissions: input.permissions ?? DEFAULT_PERMISSIONS,
       defaultRuntime: input.defaultRuntime ?? null,
+      youth: input.youth ?? false,
       createdAt: this.now(),
       updatedAt: this.now(),
     };
@@ -161,6 +164,11 @@ export class UserStore {
     this.db.update(users).set({ active: false, updatedAt: this.now() }).where(eq(users.id, userId)).run();
     this.db.delete(sessions).where(eq(sessions.userId, userId)).run();
     this.events.emit("user-access-changed", { userId, reason: "deactivated" });
+  }
+
+  /** Marks a youth account (#20). Takes effect from the user's next run (new instructions → fresh session). */
+  setYouth(userId: string, youth: boolean): void {
+    this.db.update(users).set({ youth, updatedAt: this.now() }).where(eq(users.id, userId)).run();
   }
 
   setRole(userId: string, role: Role): void {

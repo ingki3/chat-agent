@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { CreateUserRequest, type AdminUser } from "@agentlee/shared";
+import { CreateUserRequest, SetYouthRequest, type AdminUser } from "@agentlee/shared";
 import { hashPassword } from "../auth/passwords.js";
 import { deny } from "../auth/plugin.js";
 import { temporaryPassword, toAdminUser, type UserStore } from "../auth/users.js";
@@ -50,6 +50,7 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
         name: r.data.name,
         role: r.data.role,
         defaultRuntime: r.data.defaultRuntime,
+        youth: r.data.youth,
         passwordHash,
         mustChangePassword: true,
       });
@@ -77,6 +78,17 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
       return reply.header("Cache-Control", "no-store").send({ user: toAdminUser(users.byId(target.id)!) });
     },
   );
+
+  // Youth account (the son, PRD NFR 청소년): his runs get the youth instructions (#20). The full admin screen is #35.
+  app.put<{ Params: { id: string } }>("/api/admin/users/:id/youth", { config: byId }, async (req, reply) => {
+    const r = SetYouthRequest.safeParse(req.body);
+    if (!r.success) return deny(reply, 400, "invalid_request");
+    const target = users.byId(req.params.id);
+    if (!target) return deny(reply, 404, "not_found");
+    if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
+    users.setYouth(target.id, r.data.youth);
+    return reply.header("Cache-Control", "no-store").send({ user: toAdminUser(users.byId(target.id)!) });
+  });
 
   app.post<{ Params: { id: string } }>(
     "/api/admin/users/:id/reset-password",

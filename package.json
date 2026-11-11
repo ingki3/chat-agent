@@ -18,6 +18,7 @@
     "e2e": "playwright test",
     "db:migrate": "pnpm --filter @agentlee/server db:migrate",
     "keygen": "pnpm --filter @agentlee/server keygen",
+    "injection-eval": "pnpm --filter @agentlee/server injection-eval",
     "sse-probe": "tsx scripts/sse-probe.ts",
     "uptime": "tsx scripts/uptime.ts",
     "launchd": "bash scripts/install-launchd.sh"

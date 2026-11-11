@@ -4,6 +4,7 @@ import { RuntimeId } from "./runtime.js";
 export * from "./runtime.js";
 export * from "./chat.js";
 export * from "./notifications.js";
+export * from "./external.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({
@@ -77,6 +78,8 @@ export const AdminUser = AuthUser.extend({
   active: z.boolean(),
   permissions: UserPermissions,
   defaultRuntime: RuntimeId.nullable(),
+  /** Youth account (the son): gets the youth safety and learning-support instructions (#20). */
+  youth: z.boolean(),
   createdAt: z.number(),
 });
 export type AdminUser = z.infer<typeof AdminUser>;
@@ -86,7 +89,9 @@ export const CreateUserRequest = z.object({
   email: z.string().trim().toLowerCase().max(254).pipe(z.email()),
   role: Role.default("member"),
   defaultRuntime: RuntimeId.nullable().default(null),
+  youth: z.boolean().default(false),
 });
+export const SetYouthRequest = z.object({ youth: z.boolean() });
 /** The temporary password is in this response only; it is never stored or shown again. */
 export const CreateUserResponse = z.object({ user: AdminUser, temporaryPassword: z.string() });
 export const ResetPasswordResponse = z.object({ temporaryPassword: z.string() });
