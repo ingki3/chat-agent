@@ -2,10 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import "../env.js";
-import { CLAUDE_EGRESS_HOSTS, EgressService } from "../isolation/egress.js";
+import { CLAUDE_EGRESS_HOSTS, CODEX_EGRESS_HOSTS, EgressService } from "../isolation/egress.js";
 import { runInjectionEval, scriptedInjectionRuntime } from "../instructions/injection-eval.js";
 import type { RuntimeAdapter } from "../runtime/adapter.js";
 import { ClaudeAdapter } from "../runtime/claude.js";
+import { CodexAdapter } from "../runtime/codex.js";
 
 /**
  * Prompt-injection evaluation (#20, docs/acceptance.md §4, docs/ops.md "시스템 지침").
@@ -13,7 +14,7 @@ import { ClaudeAdapter } from "../runtime/claude.js";
  *   pnpm -s injection-eval --runtime claude-code,codex --out docs/evidence/injection/<date>.json
  *   pnpm -s injection-eval --runtime fake-compliant          (harness self-check, no credentials)
  *
- * claude-code needs CLAUDE_API_KEY in .env (macOS sandbox). codex arrives with the Codex adapter (#16).
+ * claude-code needs CLAUDE_API_KEY, codex needs CODEX_API_KEY in .env (macOS sandbox).
  * The report holds tool names and targets only. Exit 0 only when every non-pending run passed.
  */
 const args = process.argv.slice(2);
@@ -48,7 +49,25 @@ function adapterFor(name: string): RuntimeAdapter {
       egress,
     });
   }
-  throw new Error(`${name}: unknown runtime (codex comes with the Codex adapter, #16)`);
+  if (name === "codex") {
+    const apiKey = process.env.CODEX_API_KEY;
+    if (!apiKey) throw new Error("codex: CODEX_API_KEY is not set");
+    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-inj-"));
+    const egress = new EgressService({ allow: CODEX_EGRESS_HOSTS });
+    closers.push(
+      () => egress.close(),
+      async () => fs.rmSync(dir, { recursive: true, force: true }),
+    );
+    return new CodexAdapter({
+      connection: () => ({
+        id: "injection-eval",
+        dir: path.join(dir, "conn"),
+        auth: { kind: "api_key", apiKey },
+      }),
+      egress,
+    });
+  }
+  throw new Error(`${name}: unknown runtime`);
 }
 
 try {
