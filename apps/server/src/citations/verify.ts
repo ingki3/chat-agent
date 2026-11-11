@@ -38,8 +38,7 @@ const QUOTE_CHAR =
 const CURRENCY = /^[$€¥£₩₹\uFFE5\uFFE1\uFFE6]$/u;
 /**
  * An English multiplier after a number (closed list, case kept): a magnitude word, or `K` `M` `B` `bn` `mn` as a
- * whole token. Korean units: attached (`10만`) they are refused by the end token rule (none is a particle); across a
- * space see `KOREAN_MULTIPLIER_SPACED`.
+ * whole token. Korean units: see `KOREAN_MULTIPLIER_AFTER`.
  */
 const MULTIPLIER_AFTER =
   /^(?: ?(?:thousand|million|billion|trillion)(?![\p{L}\p{N}\p{M}])| ?(?:K|M|B|bn|mn)(?![\p{L}\p{N}\p{M}]))/u;
@@ -144,19 +143,18 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
 );
 const PARTICLE_LOOKAHEAD = 7;
 /**
- * Across a space, a Korean multiplier is a whole numeral-unit token: units, optionally 원, optionally a listed
- * particle, then a boundary (`10 만`, `1 억원입니다`, `3 천만`, `5 조 원`; not `조식`, `조기`, `경로에`, `백화점`).
+ * After a number, across an optional space, a word that starts with a Korean numeral unit is taken as a multiplier
+ * (`10만`, `10 만`, `1 억원대`, `10 만원대로`, `1 만여 명`). Ordinary words that start with one (`조식`, `경로`)
+ * are refused too — accepted limitation (e): quoting through that word verifies (review #97 round 16).
  */
-const KOREAN_MULTIPLIER_SPACED = new RegExp(
-  `^ [십백천만억조경]+원?(?:(?:${byLength(COMBINING_PARTICLES)})(?:는|도)|${byLength(KOREAN_PARTICLES)})?(?![\\p{L}\\p{N}\\p{M}])`,
-  "u",
-);
+const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
 /**
  * Separators inside a number: decimal and thousands (`.` `,`, adjacent only — `3, 4명` is prose), fraction, ratio
  * and range (`/` `:` `-` `−` `~`, also with spaces around them). After the dash and tilde folds, `–` is `-` and
  * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
  */
-const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?\p{N})/u;
+// A repeated currency sign after a range mark is part of the range (`$100-$200`, `€100 ~ €200`, `$10–$20`).
+const NUMBER_AFTER = /^(?:[.,]\p{N}| ?[/:\-\u2212~] ?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N})/u;
 const RANGE_MARK = /^[/:~]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
 /** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
@@ -467,7 +465,7 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
     // Not before a multiplier across a space (`10 만`, `1 억` from `<b>10</b>만`; `100 million`, `5 bn`).
     const next = norm.slice(at + want.length, at + want.length + 16);
-    if (DIGIT.test(last) && (MULTIPLIER_AFTER.test(next) || KOREAN_MULTIPLIER_SPACED.test(next))) continue;
+    if (DIGIT.test(last) && (MULTIPLIER_AFTER.test(next) || KOREAN_MULTIPLIER_AFTER.test(next))) continue;
     if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).

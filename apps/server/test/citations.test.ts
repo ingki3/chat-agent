@@ -143,16 +143,38 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("100 million in profit", "It reported 1/$100 million in profit.")).toBe(false);
     expect(found("100 million in profit", "It reported $100 million in profit.")).toBe(true);
     expect(found("$ 100 million in profit", "It reported $ 100 million in profit.")).toBe(true);
-    // 2. Across a space, only a whole numeral-unit token is a multiplier.
-    expect(found("객실 요금: $100", "객실 요금: $100 조식 포함")).toBe(true);
-    expect(found("여행 총액: $500", "여행 총액: $500 조기 예약 할인")).toBe(true);
-    expect(found("버스 요금: ¥100", "버스 요금: ¥100 경로에 따라 추가 요금")).toBe(true);
-    expect(found("상품권 가격: $50", "상품권 가격: $50 백화점에서 사용")).toBe(true);
+    // 2. (Round 16: back to the first-character rule.) After a number, a word that starts with a numeral unit is a
+    // multiplier — ordinary words too: accepted limitation (e). Quoting through the word verifies.
+    expect(found("객실 요금: $100", "객실 요금: $100 조식 포함")).toBe(false);
+    expect(found("여행 총액: $500", "여행 총액: $500 조기 예약 할인")).toBe(false);
+    expect(found("버스 요금: ¥100", "버스 요금: ¥100 경로에 따라 추가 요금")).toBe(false);
+    expect(found("상품권 가격: $50", "상품권 가격: $50 백화점에서 사용")).toBe(false);
+    expect(found("객실 요금: $100 조식 포함", "객실 요금: $100 조식 포함")).toBe(true);
+    expect(found("버스 요금: ¥100 경로에 따라", "버스 요금: ¥100 경로에 따라 추가 요금")).toBe(true);
+    expect(found("상품권 가격: $50 백화점에서", "상품권 가격: $50 백화점에서 사용")).toBe(true);
+    // Round 16, Codex: quantity expressions the whole-token rule missed.
+    expect(found("올해 예상 피해액은 1", "올해 예상 피해액은 1 억원대에 달했다.")).toBe(false);
+    expect(found("숙박 요금은 10", "숙박 요금은 10 만원대로 안내됐다.")).toBe(false);
+    expect(found("누적 방문자는 1", "누적 방문자는 1 만여 명에 이른다.")).toBe(false);
+    expect(found("올해 참가 인원은 3", "올해 참가 인원은 3 만명으로 집계됐다.")).toBe(false);
+    expect(found("숙박 요금은 10", "숙박 요금은 10만원대로 안내됐다.")).toBe(false); // <strong>10</strong>만원대로, attached
+    expect(found("숙박 요금은 10 만원대로", "숙박 요금은 10 만원대로 안내됐다.")).toBe(true);
     expect(found("예상 피해액은 1", "예상 피해액은 1 억원입니다.")).toBe(false);
     expect(found("총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다.")).toBe(false);
     expect(found("총 투자 금액은 3", "총 투자 금액은 3 천만 원이다.")).toBe(false);
     expect(found("올해 매출 총액은 5", "올해 매출 총액은 5 조 원이었다.")).toBe(false);
     expect(found("총 투자 금액은 10", "총 투자 금액은 10 만에 그쳤다.")).toBe(false);
+  });
+
+  it("a range that repeats the currency sign is one range (round 16)", () => {
+    expect(found("객실의 하루 요금은 $100", "객실의 하루 요금은 $100-$200이다.")).toBe(false);
+    expect(found("객실의 하루 요금은 €100", "객실의 하루 요금은 €100 ~ €200이다.")).toBe(false);
+    expect(found("Admission prices are $10", "Admission prices are $10–$20 per person.")).toBe(false);
+    expect(found("Admission prices are $10", "Admission prices are $10 – $ 20 per person.")).toBe(false);
+    // Whole ranges verify; a currency sign after a range mark without a number is no range.
+    expect(found("객실의 하루 요금은 $100-$200", "객실의 하루 요금은 $100-$200이다.")).toBe(true);
+    expect(found("객실의 하루 요금은 €100 ~ €200", "객실의 하루 요금은 €100 ~ €200이다.")).toBe(true);
+    expect(found("Admission prices are $10", "Admission prices are $10 - $ is the sign.")).toBe(true);
   });
 
   it("round 14: a sign before a currency sign, multipliers across a space, wrapped quotes kept", () => {
