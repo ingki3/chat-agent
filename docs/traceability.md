@@ -72,7 +72,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-10.2 | 런타임 연결 관리 | #17, #35 | I, E | 🟨 (#17 공용 연결·대신 등록·허용 정책 API. #35 런타임 탭: 런타임별 모델·capability `GET /api/admin/runtimes`, 공용 연결 등록·테스트·삭제, 가족 대신 API 키 등록·그 사람으로 테스트(`POST /api/admin/users/:id/connections/:connectionId/test`)·삭제, 본인 구독 안내, 다른 관리자 계정에 구독 붙이기·남의 구독 대신 테스트 403 `subscription_self_only` — `admin.test.ts`·권한 행렬) |
 | FR-10.3 | 스킬 허용 목록 | #21, #35 | I | 🟨 (#21 정의 허용 목록·서버 스킬 폴더 `pnpm skills:install`·`GET /api/admin/skills`. #35 스킬 탭: 서버 허용 스위치(settings `skills.disabled`, 끄면 누구에게도 제공 안 됨)·사용자별 켜기 — `admin.test.ts`) |
 | FR-10.4 | 시스템 상태 | #35, #46 | I, M | 🟨 (#46 최근 오류 API 완료, 가동률 7일 측정 대기. #35 시스템 상태 탭 `GET /api/admin/system`: 가동 시간, 런타임 연결 상태, 터널(`CLOUDFLARED_METRICS` 루프백 IP만, 없으면 미설정), 최근 오류·스킬·금융 도구 실패(코드만), 디스크 — `admin.test.ts`. 실제 cloudflared 메트릭 확인은 M) |
-| FR-10.5 | 백업·복원 | #37 | I, M | ⬜ |
+| FR-10.5 | 백업·복원 | #37 | I, M | 🟨 (#37 매일 03:30(서울) `VACUUM INTO` + 파일 쓰기 잠금으로 같은 시점, 7일 보관(최신 정상 1개는 유지), 관리자 → 백업 탭(목록·지금 백업·복원 안내, `/api/admin/backups` 관리자만 — 권한 행렬), 복원은 서버를 멈춘 뒤 `pnpm -s restore check/apply`(키 확인 → 해시 → 무결성 → 스키마 버전 → 인증 정보 복호화, 옛 폴더는 옆으로) — `test/backup.test.ts`·`e2e/admin.spec.ts`. 실제 맥에서 분기 리허설(M)은 ops.md 21.4절) |
 | FR-11.1 | 연결 = 런타임 × 인증 × 범위 | #17 | I | ✅ (`connections` 표, 내 연결·공용·관리자 대신 등록 API — `test/connections.test.ts`) |
 | FR-11.2 | 런타임별 연결 정보, 실행 방식 | #15, #16, #18, #39 | I, M | 🟨 (Claude 어댑터, Codex app-server 어댑터 — API 키. #18 Claude 장기 토큰 `CLAUDE_CODE_OAUTH_TOKEN`, Codex 디바이스 코드 로그인·`chatgptAuthTokens`·토큰 갱신 — `subscription.test.ts`, 0.165.0 실바이너리 시험. 실제 계정 확인(M)은 `docs/evidence/subscription/checklist.md`) |
 | FR-11.3 | 개인 우선, 공용 선택, 한도 시 확인 | #17 | I | ✅ (개인 우선, `useShared`, 한도 시 `personal_limit_use_shared` 안내 → `runs.use_shared`. 칩 UI는 #19) |
@@ -137,7 +137,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | NFR 개인정보 | #54, #46 | I | 🟨 (#46 로그·오류 비노출 완료) |
 | NFR 청소년 | #20 (평가 규격은 `docs/acceptance.md` §5) | U, I, M | 🟨 (#20 청소년 지침·아들 계정 표시(`users.youth`) 완료, 20문항 평가는 두 런타임 연결 후) |
 | NFR 관측성 | #46 | U | 🟨 (#46 로그·오류 정제 완료, 7일 가동률 측정 대기) |
-| NFR 백업 | #37 | I, M | ⬜ |
+| NFR 백업 | #37 | I, M | 🟨 (#37 매일 자동·7일 보관, 연결 인증 정보는 암호문 그대로·마스터 키 미포함(모든 형태 바이트 검색), 런타임 폴더·격리 폴더·스킬 제외, 폴더 700·파일 600, 지운 대화가 8일 안에 모든 백업에서 사라짐, 별도 폴더·되살린 키 리허설(로그인·대화·첨부·아티팩트·연결 테스트 통과), 틀린 키 `wrong_key`·새 스키마 `schema_newer` — `test/backup.test.ts`, 변이 시험. 실제 키 사본 리허설(M) 대기 — ops.md 3절·21.4절) |
 
 ## 수용 기준 (AC, PRD §11) — 절차는 `docs/acceptance.md`
 

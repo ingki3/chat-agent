@@ -215,6 +215,17 @@ export const EXPORT_CODES = set([
 ]);
 export const EXPORT_FORMATS = set(["png", "pdf"]);
 
+/** Backup outcomes (#37, backup/backup.ts `BACKUP_CODES` — a test keeps the two equal). */
+export const BACKUP_CODES = set([
+  "backup_ok",
+  "backup_running",
+  "backup_unavailable",
+  "backup_failed",
+  "backup_disk_full",
+]);
+export const isBackupCode = member(BACKUP_CODES);
+export const isBackupTrigger = member(set(["scheduled", "manual"]));
+
 export const isRuntime = member(RUNTIMES);
 export const isFinanceCode = member(FINANCE_CODES);
 export const isExportCode = member(EXPORT_CODES);

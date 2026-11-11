@@ -199,6 +199,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/skills",
   "/api/admin/errors",
   "/api/admin/connections",
+  // #37: backups (list, "지금 백업").
+  "/api/admin/backups",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -231,6 +233,10 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "PATCH /api/admin/connections/:id", expect: ADMIN_BY_ID, body: { label: "x" } },
   { route: "DELETE /api/admin/connections/:id", expect: ADMIN_BY_ID },
   { route: "POST /api/admin/connections/:id/test", expect: ADMIN_BY_ID },
+  // #37: the matrix app has an in-memory database, so it makes no backups — the admin reaches the handler (409
+  // `backup_unavailable`); a real backup as the admin is in backup.test.ts.
+  { route: "GET /api/admin/backups", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/backups", expect: { ...ADMIN_ONLY, admin: 409 } },
 ];
 
 /**

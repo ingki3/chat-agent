@@ -27,3 +27,18 @@ export function initStorage(config: Config): Storage {
   runMigrations(db);
   return { paths, db, masterKey, settings: new SettingsStore(db, masterKey) };
 }
+
+/**
+ * Marks the data folder as served by this process (`server.pid`, mode 600) so `pnpm restore` refuses to replace it
+ * underneath (#37). A file left by a crashed server names a dead pid and is simply overwritten. Returns the release.
+ */
+export function claimDataDir(paths: StoragePaths): () => void {
+  fs.writeFileSync(paths.serverPid, `${process.pid}\n`, { mode: 0o600 });
+  return () => {
+    try {
+      if (fs.readFileSync(paths.serverPid, "utf8").trim() === String(process.pid)) fs.rmSync(paths.serverPid);
+    } catch {
+      // already gone
+    }
+  };
+}

@@ -1,6 +1,10 @@
+import os from "node:os";
+import path from "node:path";
 import { defineConfig, devices } from "@playwright/test";
 
 const PORT = Number(process.env.E2E_PORT ?? 3100);
+/** Backups (#37) never go into the repository: a throwaway folder in the system temp dir, emptied per run. */
+const BACKUP_DIR = path.join(os.tmpdir(), `agentlee-e2e-backups-${PORT}`);
 
 // Runs against the production build (pnpm build first). One port for UI + API, as in production.
 export default defineConfig({
@@ -19,13 +23,14 @@ export default defineConfig({
   webServer: {
     // Production mode requires a master key: create a throwaway one for the e2e run.
     // Fresh data every run: the first-run (admin setup) screen only exists while there are no users.
-    command: "rm -rf .e2e && node apps/server/dist/cli/keygen.js && node apps/server/dist/index.js",
+    command: `rm -rf .e2e "${BACKUP_DIR}" && node apps/server/dist/cli/keygen.js && node apps/server/dist/index.js`,
     url: `http://127.0.0.1:${PORT}/api/health`,
     env: {
       NODE_ENV: "production",
       PORT: String(PORT),
       DATA_DIR: "./.e2e/data",
       MASTER_KEY_PATH: "./.e2e/master.key",
+      BACKUP_DIR,
       // Scripted runtime so streaming can be tested end to end.
       FAKE_RUNTIME: "1",
     },

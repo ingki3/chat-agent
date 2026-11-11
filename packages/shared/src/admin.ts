@@ -84,3 +84,37 @@ export const SystemStatus = z.object({
   }),
 });
 export type SystemStatus = z.infer<typeof SystemStatus>;
+
+/** Backups (#37, FR-10.5): the admin screen's list, schedule and "지금 백업". Restore is a CLI — the screen only explains it. */
+export const BackupCode = z.enum([
+  "backup_ok",
+  "backup_running",
+  "backup_unavailable",
+  "backup_failed",
+  "backup_disk_full",
+]);
+export type BackupCode = z.infer<typeof BackupCode>;
+export const BackupItem = z.object({
+  /** `20261111-183000Z-1a2b3c` — also what `pnpm -s restore` takes. */
+  id: z.string(),
+  createdAt: z.number().int(),
+  bytes: z.number().int().nonnegative(),
+  fileCount: z.number().int().nonnegative(),
+  /** Migrations applied to the backed-up database (its schema version). */
+  migrations: z.number().int().nonnegative(),
+  /** False when the manifest is missing or damaged (it cannot be restored). */
+  valid: z.boolean(),
+});
+export type BackupItem = z.infer<typeof BackupItem>;
+export const BackupsResponse = z.object({
+  /** False when this server makes no backups (no BACKUP_DIR in tests, an in-memory database). */
+  available: z.boolean(),
+  schedule: z.object({ time: z.string(), timeZone: z.string(), retentionDays: z.number().int() }),
+  running: z.boolean(),
+  nextRunAt: z.number().int().nullable(),
+  last: z.object({ at: z.number().int(), code: BackupCode }).nullable(),
+  /** The database schema version of this server (migrations), to compare with a backup's. */
+  schemaMigrations: z.number().int().nonnegative(),
+  items: z.array(BackupItem),
+});
+export type BackupsResponse = z.infer<typeof BackupsResponse>;

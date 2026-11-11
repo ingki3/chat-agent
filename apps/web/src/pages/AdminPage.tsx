@@ -5,6 +5,7 @@ import { PermissionsAdmin } from "../admin/PermissionsAdmin.js";
 import { RuntimesAdmin } from "../admin/RuntimesAdmin.js";
 import { SkillsAdmin } from "../admin/SkillsAdmin.js";
 import { SystemAdmin } from "../admin/SystemAdmin.js";
+import { BackupAdmin } from "../admin/BackupAdmin.js";
 import { UsageAdmin } from "./Usage.js";
 
 const TABS = [
@@ -13,13 +14,14 @@ const TABS = [
   ["runtimes", "런타임"],
   ["skills", "스킬"],
   ["system", "시스템 상태"],
+  ["backup", "백업"],
   ["usage", "사용량"],
 ] as const;
 type Tab = (typeof TABS)[number][0];
 
 /**
  * Admin screen (#35, PRD FR-10): users (#41 + edit), per-user permissions, runtimes and connections, skills, system
- * status and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
+ * status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
  */
 export function AdminPage({ selfId }: { selfId: string }) {
   const [params, setParams] = useSearchParams();
@@ -50,6 +52,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
           {tab === "runtimes" && <RuntimesAdmin />}
           {tab === "skills" && <SkillsAdmin />}
           {tab === "system" && <SystemAdmin />}
+          {tab === "backup" && <BackupAdmin />}
           {tab === "usage" && <UsageAdmin />}
         </div>
       </div>

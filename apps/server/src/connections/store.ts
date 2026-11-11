@@ -51,8 +51,9 @@ export const RUNTIME_LABEL: Record<RuntimeId, string> = { "claude-code": "Claude
 const AUTH_LABEL: Record<ConnectionAuthType, string> = { api_key: "API 키", subscription: "구독" };
 
 /** AAD of a stored credential: a ciphertext copied to another row, runtime or auth type does not decrypt. */
-const aad = (c: Pick<ConnectionRow, "id" | "runtime" | "authType">) =>
+export const connectionAad = (c: Pick<ConnectionRow, "id" | "runtime" | "authType">) =>
   `connection:${c.id}:${c.runtime}:${c.authType}`;
+const aad = connectionAad;
 
 /** Connection ids are server-generated UUIDs; anything else is never used as a folder name. */
 const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;

@@ -155,7 +155,13 @@ test("members (the son too) get 403 from every admin screen API and never see th
   baseURL,
 }) => {
   await useAccount(page, SON);
-  for (const url of ["/api/admin/system", "/api/admin/runtimes", "/api/admin/skills", "/api/admin/users"])
+  for (const url of [
+    "/api/admin/system",
+    "/api/admin/runtimes",
+    "/api/admin/skills",
+    "/api/admin/users",
+    "/api/admin/backups",
+  ])
     expect((await page.request.get(url)).status()).toBe(403);
   const me = (await (await page.request.get("/api/auth/state")).json()) as { user: { id: string } };
   for (const [method, url, data] of [
@@ -163,8 +169,32 @@ test("members (the son too) get 403 from every admin screen API and never see th
     ["PUT", `/api/admin/users/${me.user.id}/skills/kr-stock-skill`, { enabled: true }],
     ["PUT", "/api/admin/skills/kr-stock-skill", { enabled: false }],
     ["PUT", `/api/admin/users/${me.user.id}/defaults`, { defaults: null }],
+    ["POST", "/api/admin/backups", {}],
   ] as const)
     expect((await page.request.fetch(url, { method, data, headers: csrf(baseURL!) })).status()).toBe(403);
   await page.goto("/admin");
   await expect(page).toHaveURL(/\/$/);
+});
+
+test("backup tab: schedule, 지금 백업 adds a backup to the list, restore is instructions only (#37)", async ({
+  page,
+}) => {
+  await useAccount(page, ADMIN);
+  await page.goto("/admin?tab=backup");
+  const backup = page.getByRole("region", { name: "백업" });
+  await expect(backup.getByTestId("backup-schedule")).toContainText("매일 03:30 (서울) 자동 백업 · 7일 보관");
+  await expect(backup).toContainText("마스터 키는 백업에 들어가지 않아요");
+  // Restore: steps with the CLI, no button that would restore from the screen.
+  await expect(backup.getByTestId("restore-steps")).toContainText("pnpm -s restore check");
+  await expect(backup.getByTestId("restore-steps")).toContainText("pnpm -s restore apply");
+  await expect(backup.getByRole("button", { name: /복원/ })).toHaveCount(0);
+  const table = backup.getByRole("table", { name: "최근 백업" });
+  const before = (await table.isVisible()) ? await table.locator("tbody tr").count() : 0;
+  // Desktop and mobile run at once: one of them may find the other's backup in progress — try again then.
+  await expect(async () => {
+    await backup.getByRole("button", { name: "지금 백업" }).click();
+    await expect(backup.getByRole("status")).toContainText("백업했어요", { timeout: 2000 });
+  }).toPass({ timeout: 20_000 });
+  await expect(table.locator("tbody tr")).not.toHaveCount(before);
+  await expect(table).toContainText("(현재)");
 });
