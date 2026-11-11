@@ -501,7 +501,7 @@ describe("web tools on our MCP server", () => {
   it("web_fetch stores the page and gives the model the source id and a bounded, framed excerpt", async () => {
     const f = family();
     const { svc, call, logs } = service(f);
-    expect(svc.toolNamesFor(f.mom.id)).toEqual(["echo_time", "web_fetch", "skill_selftest"]); // no provider: no search
+    expect(svc.toolNamesFor(f.mom.id)).toEqual(["echo_time", "web_fetch", "sources_list", "skill_selftest"]); // no provider: no search
     const r = await call("web_fetch", { url: "http://public.test/article.html" });
     expect(r.isError).toBe(false);
     const [row] = f.sources.list(f.c.id);
@@ -804,6 +804,7 @@ describe("web tools on our MCP server", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "sources_list",
       "skill_selftest",
       "skill_google-news-search-skill",
     ]);

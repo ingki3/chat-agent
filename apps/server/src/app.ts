@@ -49,6 +49,9 @@ import { McpTokens } from "./isolation/tokens.js";
 import { McpService, type McpServiceOptions } from "./mcp/service.js";
 import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
 import { SourceStore } from "./web/sources.js";
+import { CitationStore } from "./citations/store.js";
+import { fixtureWebWorker } from "./runtime/fake-citations.js";
+import { sandboxedWorker } from "./web/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
 import { findBrowser } from "./artifacts/browser.js";
@@ -156,6 +159,11 @@ export type BuildOptions = {
   runs?: RunManagerOptions;
   /** MCP server overrides (tests: skill runner, clock). */
   mcp?: McpServiceOptions;
+  /**
+   * Web tool overrides (tests: an in-process worker, stub proxies and providers), merged into the web options
+   * that hold the app's own source and citation stores.
+   */
+  web?: Partial<Omit<NonNullable<McpServiceOptions["web"]>, "sources" | "citations">>;
   /** SSE timing overrides (tests). */
   sse?: { heartbeatMs?: number };
   /** User-admin overrides (tests). */
@@ -336,7 +344,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("artifacts", artifacts);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
-      web: { sources, providers: config.webSearchProviders },
+      web: {
+        sources,
+        // Citations (#25): `cite` checks against the stored page text; the run's note reads them back.
+        citations: new CitationStore(opts.db!),
+        providers: config.webSearchProviders,
+        // The FakeRuntime mode (e2e, local tries) answers the citation fixture pages in-process (no network).
+        ...(config.fakeRuntime ? { worker: fixtureWebWorker(sandboxedWorker()) } : {}),
+        ...opts.web,
+      },
       artifacts,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: { secrets: config.skillSecrets },

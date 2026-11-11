@@ -173,6 +173,15 @@ export class SourceStore {
   }
 
   /**
+   * The sources of the token's conversation (#25 `sources_list`), oldest first — undefined when the token's user
+   * does not own it. Only that user's rows (a conversation has one owner; this is the second check).
+   */
+  listFor(scope: SourceScope): SourceRow[] | undefined {
+    if (!this.owns(scope)) return undefined;
+    return this.list(scope.conversationId).filter((r) => r.userId === scope.userId);
+  }
+
+  /**
    * One source of one conversation, with its body — for the citation check (#25), which cites by source id.
    * An id from another conversation is not found.
    */

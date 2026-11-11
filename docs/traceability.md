@@ -34,11 +34,11 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-4.5 | 파일 인용 → 뷰어 위치 열기·강조 | #24 | E | ⬜ |
 | FR-4.6 | 크기·개수 한도, 업로드 전 안내 | #22 | I, E | ⬜ |
 | FR-4.7 | 에이전트가 만든 파일 내려받기 | #49, #22 | I | ⬜ |
-| FR-5.1 | 번호 인용과 출처 목록 | #25, #50 | I, E | 🟨 (#50 `sources` 저장·`GET /api/conversations/:id/sources`(소유자만) 완료 — `web.test.ts`·권한 행렬, 화면·번호 인용은 #25) |
-| FR-5.2 | 인용 구절 검증, 실패 ⚠️ | #50, #25 | U, I | 🟨 (#50 가져온 본문·해시를 출처 id로 저장(`SourceStore.get`), 검증·⚠️ 표시는 #25) |
-| FR-5.3 | 미리보기, 원문 열기 | #25 | E | ⬜ |
-| FR-5.4 | 날짜 명시, 출처 충돌 표시 | #20, #25 | U, M | 🟨 (#20 공통 지침·오늘 날짜 주입 완료, 답변 확인은 #25 후) |
-| FR-5.5 | 자료 조사 모드 | #20, #25 | U, I, M | 🟨 (#20 대화별 토글 API·지침 완료, 화면 토글은 #14/#25) |
+| FR-5.1 | 번호 인용과 출처 목록 | #25, #50 | I, E | 🟨 (#50 `sources` 저장·`GET /api/conversations/:id/sources`(소유자만). #25 `cite` 번호(`[n]`)·서버 `citation_note`(실행 끝 `attachNoteTo` — 중지·복구 포함)·답변 아래 출처 목록(제목·사이트·날짜·URL·상태), 인용 없는 문단 "일부 내용에 출처 표시 없음"(제목·머리말·면책 제외) — `citation-runs.test.ts`·`e2e/citations.spec.ts`. 머지 후 ✅) |
+| FR-5.2 | 인용 구절 검증, 실패 ⚠️ | #50, #25 | U, I | 🟨 (#25 `cite {sourceId, snippet}` → 저장 본문과 대조(NFKC·따옴표·대시·공백·대소문자 정규화 후 통째 일치, 단어·숫자 경계, 8자 이상) → `verified`·`snippet_not_found`·`fetch_failed`·`unknown_source`(다른 대화·다른 사용자 — 범위는 토큰에서만), `citations` 표(0016). 실패는 화면 모든 경로에서 ⚠️ — `citations.test.ts`·`apps/web/test/citations.test.ts`, 변이 시험 36개 isolation.md) |
+| FR-5.3 | 미리보기, 원문 열기 | #25 | E | 🟨 (#25 데스크톱 hover·모바일 탭 → 상태·인용 구절·"원문 열기"(http(s)만, 새 창 `noopener`) — `e2e/citations.spec.ts` 두 프로젝트. 머지 후 ✅) |
+| FR-5.4 | 날짜 명시, 출처 충돌 표시 | #20, #25 | U, M | 🟨 (#20 공통 지침·오늘 날짜 주입. #25 충돌 fixture(두 출처 각각 인용) 두 런타임 재생, 지침 `common@2`·`research@2`. 실런타임 답변 확인은 `docs/evidence/citations/checklist.md` A) |
+| FR-5.5 | 자료 조사 모드 | #20, #25 | U, I, M | 🟨 (#20 대화별 토글 API·지침. #25 화면 토글 `ResearchToggle`(대화별, 서버 저장) → 다음 실행 `research@2` — `citation-runs.test.ts`·`e2e/citations.spec.ts`. 실런타임 "출처가 충분하지 않아요"는 체크리스트 B) |
 | FR-5.6 | 참고문헌 내보내기 | #26 | U | ⬜ |
 | FR-5.7 | 뉴스·실시간·요약 스킬 | #50, #21 | I, M | 🟨 (#21 `google-news-search-skill`, #50 `web_search`·`web_fetch`(샌드박스 작업자 + 공개 주소 송신 프록시, 두 런타임 대본 시험 `web-contract.test.ts`), 뉴스 결과 출처 등록. `news-search-skill`·`realtime-lookup-skill`·`summarize` 유튜브는 미룸 — `docs/skills.md`) |
 | FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. 패널은 #28) |
@@ -129,7 +129,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|
 | NFR 성능 | #38 (측정 규격은 `docs/acceptance.md` §3) | M | ⬜ |
 | NFR 가용성 | #8, #46 | M | 🟨 (#46 측정기·판정 스크립트 완료, Access 후 7일 측정 대기) |
-| NFR 보안 | #5, #7, #9, #10, #42, #50, #27, #51 | U, I, E, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, #27 아티팩트 샌드박스·CSP — `e2e/artifacts.spec.ts`, #51 내보내기 렌더러 격리(앱·사설 IP 차단, 쿠키 없음) — `artifact-export.test.ts`, 변이 시험 기록 isolation.md) |
+| NFR 보안 | #5, #7, #9, #10, #42, #50, #27, #51, #25 | U, I, E, S | 🟨 (#5 완료, #50 SSRF fixture 전부 거부 — `web.test.ts`, #27 아티팩트 샌드박스·CSP — `e2e/artifacts.spec.ts`, #51 내보내기 렌더러 격리(앱·사설 IP 차단, 쿠키 없음) — `artifact-export.test.ts`, #25 `cite` 범위는 토큰에서만·출처 글은 글자로만 그림, 변이 시험 기록 isolation.md) |
 | NFR 스트리밍 | #8, #12 | I, M | ⬜ |
 | NFR 격리 | #15, #16, #42, #47, #21 | I | ⬜ |
 | NFR 권한 | #10, #29 | I | ⬜ |
@@ -145,7 +145,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|---|
 | AC-1 | #5, #8, #9, #13 | E, M | — | ⬜ |
 | AC-2 | #48, #23, #24 | E, M | 예 | ⬜ |
-| AC-3 | #25 | U, E | 예 | ⬜ |
+| AC-3 | #25 | U, E | 예 | 🟨 (#25 실패 상태마다 ⚠️, 정상 표시 경로 없음(모르는 상태 값 포함) — 단위·E2E. 두 런타임 녹화 형식 재생으로 네 fixture 시나리오 같은 결과 — `citation-runs.test.ts`. 실런타임은 `docs/evidence/citations/checklist.md`) |
 | AC-4 | #30, #31 | U, E, M | 예 | 🟨 (#30 두 런타임 녹화 형식 재생으로 "AAPL, 005930 현재가" → 출처·기준 시각·면책(`finance-runs.test.ts`), 화면 `e2e/finance.spec.ts`. 표·차트 아티팩트는 #31, 실런타임은 `docs/evidence/finance/checklist.md`) |
 | AC-5 | #33, #56, #34, #57 | U, M | — | 🟨 (#34 알림 부분: 자동 시험 완료, 실기기 체크리스트 대기) |
 | AC-6 | #10, #29 | I | — | ⬜ |

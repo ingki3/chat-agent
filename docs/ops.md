@@ -405,23 +405,23 @@ rm ~/.agentlee/probe-headers.txt
 
 | 섹션 | 들어가는 조건 |
 |---|---|
-| `common` | 항상. 한국어 기본, 외부 콘텐츠 속 지시는 데이터(`<external_content>` 블록), 웹 자료는 `cite`, 최신 사실 날짜, 출처 충돌 명시 |
+| `common` | 항상. 한국어 기본, 외부 콘텐츠 속 지시는 데이터(`<external_content>` 블록), 웹 자료는 `cite`(그대로 복사한 구절, 돌려받은 `[n]`을 문장 끝에, `verified`가 아니면 ⚠️, 앞 답변의 출처는 `sources_list` — #25), 최신 사실 날짜, 출처 충돌 명시 |
 | `finance` | 그 실행의 도구에 금융 도구가 있을 때(`isFinanceTool`: `skill_kr-stock-skill`·`skill_us-stock-skill`·`skill_market-disclosure-monitor`·`skill_dart-investment-monitor`, 금융 도구 `kr_*`·`us_*`·`fx_usdkrw`·`dart_disclosures`·`sec_*`(#30), 또는 `finance_*`) |
 | `youth` | 청소년 계정(`users.youth = 1`, 아들)일 때만 |
-| `research` | 대화의 자료 조사 모드(`conversations.research_mode`)가 켜졌을 때 |
+| `research` | 대화의 자료 조사 모드(`conversations.research_mode`)가 켜졌을 때. 여러 출처 비교, 부족하면 "출처가 충분하지 않아요", 사실 문장마다 검증된 `[n]`, 충돌은 출처별로 나란히(#25) |
 
 - 마지막에 오늘 날짜(Asia/Seoul)를 붙인다. 이름·이메일 같은 사용자 정보는 넣지 않는다.
-- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@1,youth@1`).
+- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@2,youth@2`). #25에서 `common@2`·`research@2`로 올렸다(인용 규칙).
 - 런타임 세션은 시작할 때의 지침을 그대로 쓰므로, `runtime_sessions.instructions_hash`가 지금 조립한 지침과 같을 때만 이어 쓴다. 날짜가 바뀌거나, 모드·계정 표시·템플릿이 바뀌면 다음 실행은 새 세션으로 시작한다(대화 기록은 서버가 다시 넘긴다).
 
 ### 14.2 계정·모드 설정
 - 아들 계정 표시: 만들 때 `POST /api/admin/users` 본문에 `"youth": true`, 나중에 바꿀 때 `PUT /api/admin/users/<id>/youth` `{"youth": true}`(관리자만). 관리자 화면(#35) 전까지는 이 API로 한다. 이미 만든 아들 계정은 한 번 켠다.
-- 자료 조사 모드: `PATCH /api/conversations/<id>` `{"researchMode": true}`(대화 주인). 화면 토글은 #14/#25에서 붙인다.
+- 자료 조사 모드: 대화 화면 위쪽의 **🔎 자료 조사** 버튼(대화별, 켜지면 "🔎 자료 조사 켜짐" — #25 `apps/web/src/citations/ResearchToggle.tsx`). API로는 `PATCH /api/conversations/<id>` `{"researchMode": true}`(대화 주인). 다음 답변부터 `research` 섹션이 들어간다(지침이 바뀌므로 새 런타임 세션).
 
 ### 14.3 지침 바꾸기
 1. 해당 `.md`의 본문을 고친다.
 2. 머리글의 `version:`을 1 올린다(내용이 바뀌면 항상). 머리글 형식(`---` / `id: <파일 이름>` / `version: <n>` / `---`)이 틀리면 서버가 시작하지 않는다.
-3. `pnpm -s vitest run apps/server/test/instructions.test.ts -u`로 스냅샷을 갱신하고, 바뀐 스냅샷과 버전 기대값(`common@1` 등)을 PR에서 함께 검토한다.
+3. `pnpm -s vitest run apps/server/test/instructions.test.ts -u`로 스냅샷을 갱신하고, 바뀐 스냅샷과 버전 기대값(`common@2` 등 — `instructions.test.ts`, `citation-runs.test.ts`)을 PR에서 함께 검토한다.
 4. 금융·청소년 문구를 바꾸면 아래 평가(14.4, `docs/acceptance.md` §4·§5)를 다시 돌린다.
 
 ### 14.4 프롬프트 주입 평가 (`docs/acceptance.md` §4)
@@ -794,3 +794,31 @@ pnpm skills:install                                        # 6) 스킬 다시 �
 4. 그 폴더로 서버를 다른 포트에서 띄운다: `DATA_DIR=/tmp/agentlee-rehearsal MASTER_KEY_PATH=/tmp/keytest/master.key BACKUP_DIR=/tmp/agentlee-rehearsal-backups PORT=3001 pnpm start`. 로그인 → 대화·첨부·아티팩트가 보이는지, 설정 → 내 런타임 연결에서 "테스트"가 `사용 가능`인지 확인.
 5. 서버를 끄고 `/tmp/agentlee-rehearsal*`·`/tmp/keytest`를 지운다.
 - 자동 시험이 같은 절차를 돈다(`apps/server/test/backup.test.ts` "rehearsal"): 별도 폴더·되살린 키로 복원 → 로그인·대화·첨부·아티팩트·암호화된 연결(연결 테스트 통과, 런타임이 받은 키가 원래 키와 같음). 다른 키면 서버가 시작을 거부하고, 복원은 `wrong_key`로 멈춘다.
+
+## 22. 인용 검증과 출처 표시 (#25)
+PRD FR-5.1–5.5, G2, 수용 기준 3·11. 방식과 근거는 `docs/decisions/isolation.md` "인용 검증 (#25)".
+
+### 22.1 동작
+- 도구(우리 MCP 서버, 웹 도구가 있는 모든 사용자, 설치할 것 없음):
+  - `cite {sourceId, snippet}` — 서버가 그 출처의 **저장된 본문**(§17.2)에서 구절을 찾는다. 정규화: Unicode NFKC, 모든 따옴표 모양을 하나로, 대시를 `-`로, 보이지 않는 문자 제거, 공백 묶음을 한 칸으로, 소문자. 그 뒤 **구절 전체가 그대로** 있어야 한다(유사도·일부 일치·"…"로 이은 조각 없음). 단어 중간에서 시작하거나 숫자 중간에서 끝나면 아니다(`132%` 속 `32%`). 정규화 후 8자 미만은 `cite_snippet_too_short`.
+  - 결과(`status`): `verified` · `snippet_not_found`(본문에 없음) · `fetch_failed`(본문이 없는 출처 — 검색 결과, 못 읽은 페이지) · `unknown_source`(이 대화·이 사용자의 출처가 아님, 지어낸 id). 번호(`[n]`)는 답변마다 1부터, 같은 출처·같은 구절은 같은 번호. 답변당 50개.
+  - `sources_list {}` — 이 대화의 출처 목록(id, 종류, 사이트, 날짜, URL, 본문 유무). 앞 답변에서 가져온 페이지를 다시 인용할 때. 제목은 `<external_content>` 블록 안에만.
+  - 범위(누구·어느 대화·어느 실행)는 **실행 토큰**에서만 온다. 다른 대화·다른 사용자의 `sourceId`는 `unknown_source`이고 그 id는 저장하지 않는다. 같은 대화의 기존 출처는 인용할 때마다 저장된 본문으로 다시 확인한다.
+- 실행이 끝나면(완료·중지·실패, 서버 재시작 복구 포함 — 금융 출력기와 같은 `attachNoteTo`) 웹 도구(`web_search`·`web_fetch`·`sources_list`·`cite`·`skill_google-news-search-skill`)를 썼거나 인용을 남긴 답변에 서버가 `citation_note` 부분을 붙인다(`apps/server/src/citations/checker.ts`). 런타임이 쓰거나 고칠 수 없다.
+  - `citations`: 답변 글의 `[n]`마다 서버가 인용할 때 정한 상태와 출처(제목·사이트·날짜·URL)·구절(확인됨: 페이지 원문 그대로, 그 밖: 모델이 보낸 구절). 어떤 `cite`도 만들지 않은 `[n]`은 `unknown_source`.
+  - `missing`: 인용 표시가 없는 본문 문단(빈 줄로 나뉜 문단, 목록 항목, 표). 빼는 것: 제목(`#`, 굵은 글씨만 있는 줄), 목록 바로 앞의 짧은 머리말(`…:`), 면책(금융 면책, `※`로 시작, "출처가 충분하지 않아요" 같은 짧은 문장), 구분선, 코드 블록. 규칙은 `packages/shared/src/citations.ts`(`citationUnits`) 하나를 서버와 화면이 같이 쓴다.
+- 기록: DB `citations` 표(0016 마이그레이션, 실행·번호마다 1행, 대화와 함께 지워짐). 본문은 `sources`에만 있다.
+
+### 22.2 화면
+- 문장 끝 `[n]`: 확인됨은 보통 표시, 그 밖은 `[n⚠️]`. 데스크톱은 마우스를 올리면, 모바일은 누르면 미리보기(상태, 제목, 사이트·날짜, 인용 구절, **원문 열기** — http(s) 주소만 링크). 누르면 고정, Esc·바깥 누르기로 닫힘.
+- 답변 아래 출처 목록: 번호, 제목, 사이트·날짜, URL, 상태 — "원문 구절 확인" / "⚠️ 출처에서 이 내용을 찾지 못했어요" / "⚠️ 출처를 가져오지 못했어요"(`fetch_failed`와 `unknown_source`). 화면이 모르는 상태 값도 ⚠️다(정상 표시 경로 없음).
+- 인용 없는 문단은 연한 경고색 + ⚠️, 목록 위에 "⚠️ 일부 내용에 출처 표시 없음".
+- 페이지 제목·구절은 글자로만 그린다(HTML로 해석하지 않음).
+- 코드: `apps/web/src/citations/`(새 파일), `ChatPage.tsx`에는 연결 지점 셋뿐(본문 `CitedText`, 출처 목록 `CitationSources`, 위쪽 막대 `ResearchToggle`). 데이터 형식은 `@agentlee/shared`의 `CitationNotePart`·`CITATION_STATUS_TEXT`·`citationUnits`.
+
+### 22.3 로그와 시험
+- 로그에는 호출마다 `citation.finished`(도구, `ok`/`error`, `citeCode` = 상태나 거부 코드, 소요 시간, ID)만 남는다. 출처 id·구절·본문·URL은 남지 않는다.
+- 자주 보이는 코드: `cite_snippet_too_short`, `cite_not_allowed`(토큰의 사용자가 그 대화의 주인이 아님), `cite_limit`, `cite_bad_input`.
+- 시험(네트워크 없음): `citations.test.ts`(정규화·오탐 없음, 범위, 문단 규칙), `citation-runs.test.ts`(FakeRuntime 네 시나리오 — 충돌·자료 부족·부분 누락·기존 출처 재사용, 다른 대화·다른 사용자, 복구·중지, 자료 조사 모드 지침, Claude·Codex 녹화 형식 재생으로 같은 시나리오), `apps/web/test/citations.test.ts`(⚠️ 표시), `e2e/citations.spec.ts`(데스크톱 hover·모바일 탭).
+- 시나리오와 가짜 페이지: `apps/server/src/runtime/fake-citations.ts`. `FAKE_RUNTIME=1`에서 `/cite conflict|insufficient|partial|reuse`, `/cite-id <sourceId> <구절>`. 이 모드에서는 `https://fixture.agentlee.test/…` 주소와 그 검색어만 서버 안에서 답한다(다른 주소는 평소대로).
+- 실런타임 확인 체크리스트: `docs/evidence/citations/checklist.md`.

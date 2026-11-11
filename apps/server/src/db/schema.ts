@@ -618,3 +618,36 @@ export const financeResults = sqliteTable(
   },
   (t) => [index("finance_results_conversation_idx").on(t.conversationId)],
 );
+
+/**
+ * Citations registered with the `cite` tool (#25, PRD FR-5.2): numbered per run (`[n]` of that answer), checked
+ * against the stored page text when they are made. Written by the server only — the citation note at the end of
+ * the run is built from these rows, not from what a runtime reports. `sourceId` is null for an unknown source
+ * (another conversation's or user's id is never kept). Gone with the conversation.
+ */
+export const citations = sqliteTable(
+  "citations",
+  {
+    id: text("id").primaryKey(),
+    /** The run's token scope (a connection test's run has no `runs` row, so no foreign key). */
+    runId: text("run_id").notNull(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    n: integer("n").notNull(),
+    sourceId: text("source_id"),
+    status: text("status", {
+      enum: ["verified", "snippet_not_found", "fetch_failed", "unknown_source"],
+    }).notNull(),
+    /** The snippet as the model sent it (bounded), normalised form for de-duplication. */
+    snippet: text("snippet").notNull(),
+    snippetKey: text("snippet_key").notNull(),
+    /** Verified: the passage as it stands in the stored page text. */
+    quote: text("quote"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],
+);

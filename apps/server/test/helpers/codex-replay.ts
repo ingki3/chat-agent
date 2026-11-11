@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { SpawnIsolatedOptions } from "../../src/isolation/sandbox.js";
 import type { CodexChild } from "../../src/runtime/codex.js";
-import { callOurTool, isLiveCall } from "./live-mcp.js";
+import { callOurTool, isLiveCall, liveArgs } from "./live-mcp.js";
 
 /**
  * Recorded `codex app-server` conversations, replayed in CI instead of the real binary (#16, like #15: CI replays,
@@ -172,7 +172,8 @@ export function replaySpawn(
      * What app-server does for a tool call of the model (#21 contract test, `liveCall`): only a tool of the run's
      * `enabled_tools`, on the MCP server at the configured url, with the token from `bearer_token_env_var`.
      */
-    const liveToolCall = async (id: string, tool: string, args: unknown, turnId: string) => {
+    const liveToolCall = async (id: string, tool: string, rawArgs: unknown, turnId: string) => {
+      const args = liveArgs(rawArgs);
       const cfg = s.args.find((a) => a.startsWith("mcp_servers.agentlee=")) ?? "";
       const url = /url = "([^"]+)"/.exec(cfg)?.[1];
       const enabled = (/enabled_tools = \[([^\]]*)\]/.exec(cfg)?.[1] ?? "")
@@ -196,7 +197,7 @@ export function replaySpawn(
         });
         return;
       }
-      const r = await callOurTool(url, token, tool, args);
+      const r = await callOurTool(url, token, tool, args, id);
       send({
         method: "item/completed",
         params: {

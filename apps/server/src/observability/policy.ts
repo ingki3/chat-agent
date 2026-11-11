@@ -178,6 +178,18 @@ export const WEB_CODES = set([
   "web_not_allowed",
 ]);
 
+/** Outcomes of `cite` and `sources_list` (#25): a citation status or why nothing was registered. */
+export const CITE_CODES = set([
+  "verified",
+  "snippet_not_found",
+  "fetch_failed",
+  "unknown_source",
+  "cite_bad_input",
+  "cite_not_allowed",
+  "cite_snippet_too_short",
+  "cite_limit",
+]);
+
 /** Outcome codes of the artifact tools (#27, artifacts/store.ts `ARTIFACT_CODES` — a test keeps the two equal). */
 export const ARTIFACT_CODES = set([
   "artifact_bad_input",
@@ -229,6 +241,7 @@ export const isRestoreRecovery = member(set(["completed", "rolled_back"]));
 
 export const isRuntime = member(RUNTIMES);
 export const isFinanceCode = member(FINANCE_CODES);
+export const isCiteCode = member(CITE_CODES);
 export const isExportCode = member(EXPORT_CODES);
 export const isExportFormat = member(EXPORT_FORMATS);
 export const isArtifactCode = member(ARTIFACT_CODES);

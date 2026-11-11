@@ -31,6 +31,7 @@ import {
   isBackupCode,
   isBackupTrigger,
   isRestoreRecovery,
+  isCiteCode,
   isToolName,
   UNMATCHED,
   isUsagePurpose,
@@ -69,6 +70,9 @@ export const LOG_EVENTS = [
   "artifact.finished",
   // Finance tool calls (#30): tool name, outcome code, duration and IDs — never the symbol, URL or numbers.
   "finance.finished",
+  // Citation tool calls (#25): tool name, the citation status or refusal code, duration and IDs — never the
+  // source id, the snippet or the page text.
+  "citation.finished",
   // PNG/PDF export (#51): format, fixed outcome code, duration and IDs — never the title or the content.
   "artifact.exported",
   "web.build_missing",
@@ -178,6 +182,8 @@ const FIELDS = new Map<string, Check>([
   ["artifactCode", isArtifactCode],
   /** Why a finance tool call did not succeed (#30): one of the fixed `finance_*` codes. */
   ["financeCode", isFinanceCode],
+  /** A `cite` call (#25): the citation status or why it registered nothing. */
+  ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
   ["exportFormat", isExportFormat],
   ["exportCode", isExportCode],
@@ -449,6 +455,7 @@ export type LogFields = {
   webCode?: string;
   artifactCode?: string;
   financeCode?: string;
+  citeCode?: string;
   exportFormat?: string;
   exportCode?: string;
   category?: string;

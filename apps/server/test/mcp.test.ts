@@ -566,6 +566,8 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "sources_list",
+      "cite",
       "artifact_create",
       "artifact_update",
       // Finance tools (#30): the owner is an adult with every skill.

@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { resolveRefs } from "../../src/runtime/fake-citations.js";
 
 /**
  * A tool call the scripted runtimes (claude-replay / codex-replay) make for real against our MCP server, through
@@ -26,6 +27,15 @@ export const liveCall = (id: string, tool: string, args: unknown): LiveCall => (
 export const isLiveCall = (m: unknown): m is LiveCall =>
   !!m && typeof m === "object" && (m as { type?: unknown }).type === LIVE_CALL;
 
+/** Answers of earlier live calls by call id (JSON text parsed), for `"$<id>.<path>"` references in later args. */
+const answers = new Map<string, unknown>();
+
+/**
+ * The args of a live call with `"$<id>.<path>"` resolved against earlier live calls' answers (e.g. the sourceId
+ * a web_fetch returned, cited by the next call — fake-citations.ts `resolveRefs`).
+ */
+export const liveArgs = (args: unknown): unknown => resolveRefs(args, (id) => answers.get(id));
+
 export type ToolAnswer = { content: { type: string; text?: string }[]; isError: boolean };
 
 /** One MCP tools/call with a bearer token, as a runtime's MCP client does it. */
@@ -34,6 +44,7 @@ export async function callOurTool(
   token: string,
   tool: string,
   args: unknown,
+  id?: string,
 ): Promise<ToolAnswer> {
   const client = new Client({ name: "scripted-runtime", version: "0.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(url), {
@@ -45,7 +56,16 @@ export async function callOurTool(
       content?: { type: string; text?: string }[];
       isError?: boolean;
     };
-    return { content: r.content ?? [], isError: r.isError === true };
+    const answer = { content: r.content ?? [], isError: r.isError === true };
+    if (id !== undefined) {
+      const text = answer.content.find((c) => c.type === "text")?.text;
+      try {
+        answers.set(id, text === undefined ? undefined : (JSON.parse(text) as unknown));
+      } catch {
+        answers.delete(id);
+      }
+    }
+    return answer;
   } catch (e) {
     // The SDK reports protocol errors (unknown tool, invalid arguments) as exceptions on some paths.
     return { content: [{ type: "text", text: (e as Error).message }], isError: true };
