@@ -341,9 +341,19 @@ export const connections = sqliteTable(
     createdBy: text("created_by"),
     label: text("label").notNull(),
     secret: text("secret"),
-    /** Goes up whenever the credential is replaced; runs and tests are bound to the version they used. */
+    /**
+     * Goes up whenever the stored credential changes — replaced by a person (new key, new login) or refreshed by the
+     * server (a ChatGPT login's tokens, #18). Runs and tests are bound to the version they used.
+     */
     credentialVersion: integer("credential_version").notNull().default(1),
+    /**
+     * The version at which a person last replaced the credential. Refreshes keep it: a run or test bound to any
+     * version from here on still uses this credential, one bound to an older version never does.
+     */
+    credentialBaseVersion: integer("credential_base_version").notNull().default(1),
     hint: text("hint"),
+    /** The signed-in account's email (ChatGPT login) — shown instead of a hint; never logged. */
+    accountEmail: text("account_email"),
     status: text("status", { enum: ["untested", "passed", "failed", "expired"] })
       .notNull()
       .default("untested"),

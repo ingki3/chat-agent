@@ -94,6 +94,7 @@
 - **읽기·쓰기:** 연결 폴더만 쓴다. 폴더는 **연결과 사용자마다** 따로 있다(`data/runtimes/<연결 id>/<사용자 id>`). 그래서 가족이 같은 API 키를 써도 세션·캐시·대화 기록이 다른 사람의 샌드박스 안에 놓이지 않는다(리뷰 #80).
   - 연결 id는 앱이 관리하는 연결(#17)의 UUID다. 런타임 세션은 그 연결 폴더에 있으므로 **같은 연결의 run만** 세션을 이어 쓴다. 연결을 해제하면 세션을 무효화하고 폴더를 지운다.
   - 어댑터는 run마다 연결을 다시 확인한다(해제·만료·정책 변경·주인 확인). Claude 구독은 그 순간에도 주인이 관리자일 때만 넘긴다.
+  - **Claude 구독(#18):** 관리자의 `claude setup-token` 장기 토큰은 `CLAUDE_CODE_OAUTH_TOKEN` 환경 변수로만 넘긴다(API 키와 같은 자리, 인자·파일 없음). 호스트는 API 키와 같은 `api.anthropic.com`이라 송신 허용은 그대로다. 실제 토큰으로의 확인은 `docs/evidence/subscription/checklist.md`.
 - **실행:** CLI 바이너리 하나만 쓰고, 자식 프로세스는 만들 수 없다.
 - **네트워크:** 루프백만 쓴다(`{ loopbackPorts: [MCP 포트, 송신 프록시 포트] }`). 인터넷은 서버 안의 **송신 프록시**(`isolation/egress.ts`, `HTTPS_PROXY`)로만 나간다.
   - 프록시는 `CONNECT <허용 호스트>:443`만 받는다. 지금 허용 호스트는 `api.anthropic.com`뿐이다.
@@ -128,10 +129,13 @@
 - **네트워크:** 루프백만 쓴다(`{ loopbackPorts: [MCP 포트, 송신 프록시 포트] }`).
   - 인터넷은 Codex 전용 송신 프록시(`HTTPS_PROXY`)로만 나간다. 허용 호스트는 `api.openai.com`뿐이다(API 키 경로에서 실측). 런타임마다 프록시를 따로 두므로 Claude CLI는 OpenAI에, Codex는 Anthropic에 닿지 못한다.
   - TLS 루트는 `CODEX_CA_CERTIFICATE`로 준다. 샌드박스 안에서는 플랫폼 검증기가 trustd에 닿지 못하기 때문이다.
-  - ChatGPT 로그인(#18)은 `chatgpt.com` 등이 더 필요하다. #18에서 실측한 뒤 추가한다.
+  - **ChatGPT 로그인(#18)**: 세션은 별도 프록시로 `chatgpt.com`만 허용한다(가짜 토큰으로 실측: 모델 목록·작업 공간 확인·응답이 모두 `chatgpt.com`). 디바이스 코드 로그인 과정은 또 다른 프록시로 `auth.openai.com`·`chatgpt.com`만(실측: 코드 발급은 `auth.openai.com`뿐). 근거는 `runtime-capabilities.md` 2.5절.
 - **자격 증명:**
   - API 키는 환경 변수·인자·디스크 어디에도 두지 않는다. app-server 시작 뒤 stdin의 `account/login/start {type:"apiKey"}`로만 넘긴다.
   - `cli_auth_credentials_store = "ephemeral"`이라 메모리에만 있다(`auth.json` 없음, 시험으로 확인).
+  - ChatGPT 로그인(#18)도 같다: 액세스 토큰만 stdin의 `account/login/start {type:"chatgptAuthTokens"}`로 넘기고 메모리에만 둔다(이 요청 때문에 ChatGPT 세션만 `experimentalApi: true`). 리프레시 토큰은 프로세스에 들어가지 않는다. 프로세스가 새 토큰을 달라고 하면(`account/chatgptAuthTokens/refresh`) 서버가 갱신해 액세스 토큰만 돌려준다. 이 서버 요청 하나만 받고, 다른 요청은 전처럼 거절·차단한다.
+  - **로그인 과정**(`runtime/codex-login.ts`): 로그인마다 app-server를 하나, 같은 샌드박스(그 로그인 폴더만 읽기, `codex-home`·`tmp`만 쓰기, 자식 프로세스 없음, 루프백 프록시만)로 띄운다. app-server에는 토큰을 꺼내는 요청이 없어 이 과정만 `cli_auth_credentials_store = "file"`이다. 로그인이 끝나면 서버가 `auth.json`을 바로 읽고 0으로 덮어쓴 뒤 지우고, 프로세스를 끝낸 다음 로그인 폴더를 통째로 지운다(성공·실패·취소·시간 초과 모두). 토큰이 디스크에 있는 시간은 완료 알림부터 읽기까지 몇 ms다. 그동안 그 폴더를 읽을 수 있는 것은 서버와 그 로그인 프로세스뿐이다(폴더 `0700`). 그 사이 서버가 죽으면 다음 시작 때 남은 로그인 폴더를 지우고, 서버가 폴더에 적어 둔 신원(`login.pid`: 폴더 이름·pid·프로세스 그룹·시작 시각·명령줄)이 모두 맞는 프로세스만 끝낸다(`cleanupLeftoverLogins`). 프로세스가 쓸 수 있는 폴더라, 서버는 거기서 **어떤 링크도 따라가지 않는다**(`runtime/login-files.ts`): 모든 경로 단계 `lstat`, `O_NOFOLLOW`로 열고 descriptor의 `fstat`(일반 파일·링크 1개·크기·같은 inode)과 상위 폴더가 그대로인지 확인한 뒤에만 읽거나 덮어쓴다. 링크·하드 링크는 그 이름만 지운다. 파일은 `O_NONBLOCK`도 함께 열어, 확인 뒤 FIFO로 바뀐 이름이 열기에서 이벤트 루프를 막지 못한다(타입은 descriptor로 바로 확인).
+  - **격리 후 삭제(리뷰 #91 3차):** Node에는 openat·fdopendir가 없어 경로로 하는 트리 삭제는 확인과 사용 사이에 하위 폴더가 링크로 바뀌는 경합을 막을 수 없다. 그래서 로그인 폴더는 먼저 통째로 `DATA_DIR/runtimes/.quarantine/`(서버 전용 `0700`, 같은 파일 시스템)으로 `rename`한 뒤에만 그 안에서 지운다. 근거: sandbox-exec 프로필의 쓰기 규칙은 경로 규칙(`(allow file-write* (subpath "<로그인 폴더>/codex-home"))`, `tmp`)이고, 로그인 폴더 자체와 그 상위·격리 폴더는 어떤 프로필에도 쓰기로 들어가지 않는다(`buildProfile`로 만든 프로필을 시험이 확인). 폴더가 옮겨지면 살아 있는 작성자도 그 안에 파일·링크·폴더를 더 만들 수 없다 — macOS 실 샌드박스 시험: 작업 폴더를 `codex-home`에 둔 프로세스가 옮기기 전에는 쓰고, 옮긴 뒤에는 파일·심볼릭 링크·폴더 생성이 모두 거부된다. 옮기기 전에 심어 둔 링크는 걷기에서 링크만 지운다. 시작할 때의 잔존 정리와 로그인 종료 정리 둘 다 이 경로를 쓰고, 시작할 때는 격리 폴더에 남은 것도 지운다. 로그인 중(프로세스가 살아 있는 동안) 토큰 파일은 descriptor로 0을 덮어쓰기만 하고 이름은 지우지 않는다 — 이름은 폴더와 함께 격리 뒤에 지운다. 남는 위험은 `docs/ops.md` 11절.
   - run의 MCP 토큰은 `bearer_token_env_var`가 가리키는 환경 변수로만 넘긴다. 실행 뒤 연결 폴더에 둘 다 원문이 없음을 시험한다.
   - `shell_snapshot`은 끈다. 사용자 셸을 띄워 환경 변수를 파일로 남기기 때문이다.
 - **설정(`codexConfigToml`)**: `--strict-config`로 읽는다(모르는 키·기능 이름이면 시작 실패, 업그레이드 때 바로 드러남).
@@ -145,7 +149,7 @@
 - **들어오는 것도 검사한다(fail closed):** 다음이 오면 `turn/interrupt` 후 `runtime_policy`로 끝낸다.
   - 그 run의 우리 도구(`server = agentlee`, 허용된 이름)가 아닌 도구 호출. 다른 MCP 서버, 같은 이름을 쓴 다른 서버, `codex` 내장 리소스 도구, 명령·파일 변경·하위 에이전트·웹 검색 항목이 모두 해당한다.
   - 다른 thread의 알림
-  - app-server가 우리에게 보내는 요청(승인·사용자 입력·elicitation 등). 요청은 즉시 거절한다.
+  - app-server가 우리에게 보내는 요청(승인·사용자 입력·elicitation 등). 요청은 즉시 거절한다. 예외는 ChatGPT 세션의 `account/chatgptAuthTokens/refresh` 하나(위 "자격 증명").
   - 우리 것이 아닌 MCP 서버의 알림(`mcpServer/startupStatus/updated`·`oauthLogin/completed`). 계정 커넥터처럼 늦게 붙는 경우까지 막는다(리뷰 #80·#82).
   - 고정 프로토콜에 없는 알림, 그 형태가 틀린 알림, 프로세스·명령 출력 알림
 - **검사 시점:** 모든 메시지를 언제 오든 같은 규칙으로 검사한다. 항목(item)의 종류·서버·도구 검사도 턴 안에서만이 아니라 여는 중과 턴 사이에도 한다(리뷰 #82 2차).

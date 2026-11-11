@@ -208,7 +208,23 @@ export const CLAUDE_EGRESS_HOSTS = ["api.anthropic.com"] as const;
 
 /**
  * Hosts codex app-server needs with an API key (0.165.0, our config: no model-list fetch, no analytics or update
- * checks): the Responses API, over HTTPS and WebSocket. A ChatGPT login (#18) adds chatgpt.com (and
- * auth.openai.com for token refresh) — added with #18 once checked.
+ * checks): the Responses API, over HTTPS and WebSocket.
  */
 export const CODEX_EGRESS_HOSTS = ["api.openai.com"] as const;
+
+/**
+ * Hosts a ChatGPT-login session needs (#18, checked on 0.165.0 through this proxy with `chatgptAuthTokens`):
+ * `chatgpt.com` only — the ChatGPT backend (`/backend-api/codex/responses`, its model list and workspace routing).
+ * No `api.openai.com`, and no `auth.openai.com`: the server refreshes tokens itself (connections/chatgpt.ts).
+ */
+export const CODEX_CHATGPT_EGRESS_HOSTS = ["chatgpt.com"] as const;
+
+/**
+ * Hosts the device-code login process needs (#18, codex-login.ts), both observed on 0.165.0 through this proxy:
+ *  - `auth.openai.com`: the device code (the only host the code request reaches), polling and the token exchange;
+ *  - `chatgpt.com`: once a ChatGPT login is in place, app-server runs "workspace routing discovery" against
+ *    `chatgpt.com` on its own and only then reports `account/login/completed` (its failure ends the login with
+ *    `success: false`); `account/read` does the same. Seen with injected tokens (`codex.test.ts`, macOS, online):
+ *    without `chatgpt.com` a real login could not complete.
+ */
+export const CODEX_LOGIN_EGRESS_HOSTS = ["auth.openai.com", "chatgpt.com"] as const;

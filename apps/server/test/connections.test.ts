@@ -226,7 +226,7 @@ describe("connection rules (#17, PRD D2 / FR-11.4)", () => {
     });
   });
 
-  it("scope is fixed: no scope in a body, members cannot reach the shared API; Codex login waits for #18", async () => {
+  it("scope is fixed: no scope in a body, members cannot reach the shared API; a ChatGPT login is never pasted", async () => {
     const t = await start();
     const withScope = await t.owner.post("/api/connections", {
       runtime: "claude-code",
@@ -255,7 +255,9 @@ describe("connection rules (#17, PRD D2 / FR-11.4)", () => {
       authType: "subscription",
       secret: KEYS.memberCodex,
     });
-    expect(codexSub.json()).toEqual({ error: "unsupported_auth" });
+    // The ChatGPT login comes from the device-code flow only (#18, subscription.test.ts).
+    expect(codexSub.statusCode).toBe(400);
+    expect(codexSub.json()).toEqual({ error: "login_required" });
     const bad = await t.owner.post("/api/connections", {
       runtime: "claude-code",
       authType: "api_key",

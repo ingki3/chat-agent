@@ -55,7 +55,21 @@ function useRunStream(run: Run | null | undefined, onEnd: () => void): Live | nu
           tools: l.tools.map((t) => (t.callId === e.callId ? { ...t, done: true } : t)),
         }));
     });
-    on("notice", (e) => e.type === "notice" && update((l) => ({ ...l, notices: [...l.notices, e.message] })));
+    on(
+      "notice",
+      (e) =>
+        e.type === "notice" &&
+        update((l) => ({
+          ...l,
+          // A limit or an expired login names the runtimes to go on with (the switch itself is the chip, #19).
+          notices: [
+            ...l.notices,
+            e.switchTo?.length
+              ? `${e.message} (이어갈 수 있는 런타임: ${e.switchTo.map((r) => RUNTIME[r] ?? r).join(", ")})`
+              : e.message,
+          ],
+        })),
+    );
     on("error", (e) => e.type === "error" && update((l) => ({ ...l, error: e.message })));
     on("done", () => {
       es.close();

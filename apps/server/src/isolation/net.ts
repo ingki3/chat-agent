@@ -103,6 +103,8 @@ export type SafeFetchOptions = {
   timeoutMs?: number;
   maxBytes?: number;
   headers?: Record<string, string>;
+  /** POST with this body (no redirects are followed for a POST). Default: GET. */
+  body?: string;
   /** Tests only: resolve names here instead of DNS. */
   resolve?: (host: string) => Promise<string[]>;
   /** Tests only: address policy override (default: not `isBlockedAddress`). */
@@ -115,14 +117,17 @@ function checkUrl(u: URL): void {
   if (u.username || u.password) throw new BlockedRequestError("credentials in URL");
 }
 
-/** GET with the address policy applied to every hop. Redirects are followed manually and re-checked. */
+/**
+ * GET (or POST with `body`) with the address policy applied to every hop. Redirects are followed manually and
+ * re-checked (GET only).
+ */
 export async function safeFetch(input: string, o: SafeFetchOptions = {}): Promise<SafeResponse> {
   let url = new URL(input);
   for (let hop = 0; hop <= (o.maxRedirects ?? 5); hop++) {
     checkUrl(url);
     const res = await request(url, o);
     const loc = res.headers.location;
-    if (res.status >= 300 && res.status < 400 && loc) {
+    if (o.body === undefined && res.status >= 300 && res.status < 400 && loc) {
       url = new URL(loc, url);
       continue;
     }
@@ -163,7 +168,7 @@ function request(url: URL, o: SafeFetchOptions): Promise<SafeResponse> {
     const req = mod.request(
       url,
       {
-        method: "GET",
+        method: o.body === undefined ? "GET" : "POST",
         lookup,
         agent: url.protocol === "https:" ? httpsAgent : httpAgent,
         headers: { "user-agent": "AgentLee/1.0", ...o.headers },
@@ -193,6 +198,6 @@ function request(url: URL, o: SafeFetchOptions): Promise<SafeResponse> {
     );
     req.on("timeout", () => req.destroy(new BlockedRequestError("timeout")));
     req.on("error", reject);
-    req.end();
+    req.end(o.body);
   });
 }

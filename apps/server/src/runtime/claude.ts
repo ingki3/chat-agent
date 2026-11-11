@@ -481,7 +481,9 @@ export class ClaudeAdapter implements RuntimeAdapter {
               ...(u.output_tokens === undefined ? {} : { outputTokens: u.output_tokens }),
               ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
               ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
-              ...(cost === undefined ? {} : { costUsd: cost }),
+              // A subscription (PRD FR-9.2) has no per-call price: tokens only. The CLI's figure would be what the
+              // same tokens cost through the API — never shown or stored as money spent.
+              ...(cost === undefined || conn.auth.kind === "oauth_token" ? {} : { costUsd: cost }),
             };
           }
         }

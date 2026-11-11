@@ -39,12 +39,43 @@ const turnOf = (t: RecordedTurn | Json[]): RecordedTurn => ({
 export type ReplayLog = {
   spawns: SpawnIsolatedOptions[];
   requests: { method: string; params: Json }[];
+  /** Whether CODEX_HOME/auth.json still existed when `account/read` came (a device login reads it first). */
+  authJsonAtRead?: boolean;
+  /** Our answers to the app-server's requests (`$refresh` in a recording), in order. */
+  answers: { id: unknown; result?: Json; error?: Json }[];
   errors: string[];
   kills: number;
   /** Processes that have exited (their `exit` event was emitted). */
   exits: number;
 };
-export const newLog = (): ReplayLog => ({ spawns: [], requests: [], errors: [], kills: 0, exits: 0 });
+export const newLog = (): ReplayLog => ({
+  spawns: [],
+  requests: [],
+  answers: [],
+  errors: [],
+  kills: 0,
+  exits: 0,
+});
+
+/**
+ * A scripted ChatGPT device-code login (#18), as app-server 0.165.0 runs it: `account/login/start
+ * {type:"chatgptDeviceCode"}` answers with the code, then — after `delayMs` — `account/login/completed`. On success
+ * the tokens are written to CODEX_HOME/auth.json first (the file store the login process uses), like the binary.
+ * `"never"`: the user never enters the code (only a cancel or the timeout ends it).
+ */
+export type DeviceLoginScript = {
+  verificationUrl?: string;
+  userCode?: string;
+  outcome:
+    | "never"
+    | { success: true; authJson: Json; delayMs?: number }
+    | { success: false; error: string; delayMs?: number };
+  /** What `account/read` answers once logged in. */
+  account?: Json | null;
+  /** Called when `account/read` arrives; the answer then waits `readDelayMs` (to cancel at that very stage). */
+  onAccountRead?: () => void;
+  readDelayMs?: number;
+};
 
 let seq = 0;
 const uuid = () => {
@@ -74,6 +105,10 @@ export function replaySpawn(
     initializeGate?: Promise<unknown>;
     /** The process takes this long to exit after it was killed (default: next tick). */
     exitDelayMs?: number;
+    /** A device-code login (#18). */
+    deviceLogin?: DeviceLoginScript;
+    /** `account/login/start {type:"chatgptAuthTokens"}` is refused. */
+    refuseTokens?: boolean;
   } = {},
 ): (s: SpawnIsolatedOptions) => CodexChild {
   return (s) => {
@@ -114,6 +149,17 @@ export function replaySpawn(
         return;
       }
       const raw = p.turn.messages[p.i++]!;
+      if (raw.$refresh) {
+        // app-server asks for new ChatGPT tokens and waits for the answer before it goes on.
+        const id = `refresh-${p.i}`;
+        waitingAnswer = { id, resume: () => setTimeout(play, o.delayMs ?? 2) };
+        send({
+          id,
+          method: "account/chatgptAuthTokens/refresh",
+          params: { reason: "unauthorized", previousAccountId: "acct-replay" },
+        });
+        return;
+      }
       if (isLiveCall(raw)) {
         void liveToolCall(raw.id, raw.tool, raw.args, p.turnId).then(() => setTimeout(play, o.delayMs ?? 2));
         return;
@@ -171,6 +217,17 @@ export function replaySpawn(
           .split(T)
           .join(threadId ?? T),
       ) as Json;
+    let waitingAnswer: { id: string; resume: () => void } | undefined;
+    let loginId: string | undefined;
+    let loginDone = false;
+    const completeLogin = (success: boolean, error: string | null) => {
+      if (loginDone || !loginId) return;
+      loginDone = true;
+      send({
+        method: "account/login/completed",
+        params: { loginId, success, error, onboardingEntrypoint: null },
+      });
+    };
     let buf = "";
     const dec = new StringDecoder("utf8");
     stdin.on("data", (d: Buffer) => {
@@ -179,8 +236,28 @@ export function replaySpawn(
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i);
         buf = buf.slice(i + 1);
-        const m = JSON.parse(line) as { id?: number; method?: string; params?: Json };
-        if (m.id === undefined || !m.method) continue; // notifications / our answers to server requests
+        const m = JSON.parse(line) as {
+          id?: number;
+          method?: string;
+          params?: Json;
+          result?: Json;
+          error?: Json;
+        };
+        if (m.id !== undefined && !m.method) {
+          // Our answer to a request of the app-server's.
+          log.answers.push({
+            id: m.id,
+            ...(m.result ? { result: m.result } : {}),
+            ...(m.error ? { error: m.error } : {}),
+          });
+          if (waitingAnswer && waitingAnswer.id === (m.id as unknown)) {
+            const w = waitingAnswer;
+            waitingAnswer = undefined;
+            w.resume();
+          }
+          continue;
+        }
+        if (m.id === undefined || !m.method) continue; // notifications
         log.requests.push({ method: m.method, params: m.params ?? {} });
         const reply = (result: Json) => send({ id: m.id, result });
         const fail = () => send({ id: m.id, error: { code: -32600, message: "no" } });
@@ -191,8 +268,52 @@ export function replaySpawn(
               for (const n of o.atStart ?? []) send(n);
             });
             break;
-          case "account/login/start":
-            reply({ type: "apiKey" });
+          case "account/login/start": {
+            const type = m.params?.type;
+            if (type === "apiKey") reply({ type: "apiKey" });
+            else if (type === "chatgptAuthTokens") {
+              if (o.refuseTokens) fail();
+              else reply({ type: "chatgptAuthTokens" });
+            } else if (type === "chatgptDeviceCode" && o.deviceLogin) {
+              const d = o.deviceLogin;
+              loginId = uuid();
+              reply({
+                type: "chatgptDeviceCode",
+                loginId,
+                verificationUrl: d.verificationUrl ?? "https://auth.openai.com/codex/device",
+                userCode: d.userCode ?? "ABCD-12345",
+              });
+              const out = d.outcome;
+              if (out !== "never")
+                setTimeout(() => {
+                  if (loginDone || exited) return;
+                  if (out.success) {
+                    fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify(out.authJson));
+                    completeLogin(true, null);
+                  } else completeLogin(false, out.error);
+                }, out.delayMs ?? 5);
+            } else fail();
+            break;
+          }
+          case "account/login/cancel":
+            // Like the real binary (checked on 0.165.0): "canceled", then the login ends unsuccessfully.
+            reply({ status: loginId && !loginDone ? "canceled" : "notFound" });
+            completeLogin(false, "Login was not completed");
+            break;
+          case "account/read":
+            // Tokens still readable in the file (zeroed is fine: its name goes with the folder later).
+            log.authJsonAtRead =
+              fs.existsSync(path.join(codexHome, "auth.json")) &&
+              fs.readFileSync(path.join(codexHome, "auth.json")).some((b) => b !== 0);
+            o.deviceLogin?.onAccountRead?.();
+            setTimeout(
+              () =>
+                reply({
+                  account: loginDone ? (o.deviceLogin?.account ?? null) : null,
+                  requiresOpenaiAuth: true,
+                }),
+              o.deviceLogin?.readDelayMs ?? 0,
+            );
             break;
           case "thread/start": {
             threadId = uuid();

@@ -16,6 +16,7 @@ import {
   PushDeviceList,
   PushKey,
   ResetPasswordResponse,
+  SubscriptionLogin,
   UnreadCount,
   Run,
   StartRunResponse,
@@ -66,7 +67,13 @@ async function checkOuterRedirect() {
   }
 }
 
-async function call(method: Method, url: string, body?: unknown, headers: Record<string, string> = {}) {
+async function call(
+  method: Method,
+  url: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+  signal?: AbortSignal,
+) {
   let res: Response;
   try {
     res = await fetch(url, {
@@ -83,6 +90,7 @@ async function call(method: Method, url: string, body?: unknown, headers: Record
         ...headers,
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(signal ? { signal } : {}),
     });
   } catch (e) {
     void checkOuterRedirect();
@@ -217,6 +225,23 @@ export const connections = {
       ((await call("POST", `/api/connections/${enc(id)}/test`, {})) as { result: unknown }).result,
     ),
   remove: async (id: string) => call("DELETE", `/api/connections/${enc(id)}`),
+  /** Codex ChatGPT device-code login (#18): start, poll, cancel. `connectionId` = log in again on it. */
+  startLogin: async (body: { runtime: "codex"; connectionId?: string }) =>
+    SubscriptionLogin.parse(
+      ((await call("POST", "/api/connections/logins", body)) as { login: unknown }).login,
+    ),
+  /** One poll; `signal` ends a request that hangs. */
+  login: async (id: string, signal?: AbortSignal) => {
+    const r = (await call("GET", `/api/connections/logins/${enc(id)}`, undefined, {}, signal)) as {
+      login: unknown;
+      connection: unknown;
+    };
+    return {
+      login: SubscriptionLogin.parse(r.login),
+      connection: r.connection ? Connection.parse(r.connection) : null,
+    };
+  },
+  cancelLogin: async (id: string) => call("DELETE", `/api/connections/logins/${enc(id)}`),
 };
 
 export const runs = {
@@ -244,6 +269,9 @@ const MESSAGES: Record<string, string> = {
   invalid_secret: "키 형식이 맞지 않아요. 복사한 값을 다시 확인하세요.",
   subscription_not_allowed: "이 계정에서는 이 구독을 연결할 수 없어요.",
   unsupported_auth: "아직 지원하지 않는 연결 방식이에요.",
+  login_required: "ChatGPT 계정은 ‘ChatGPT로 로그인’으로 연결해요.",
+  login_busy: "지금 진행 중인 로그인이 많아요. 잠시 뒤 다시 시도하세요.",
+  login_unavailable: "로그인을 시작하지 못했어요. 잠시 뒤 다시 시도하세요.",
   shared_subscription: "공용 연결은 API 키로만 만들 수 있어요.",
   test_in_progress: "이미 테스트 중이에요.",
   connection_not_allowed: "이 연결은 쓸 수 없어요. 설정 → 내 런타임 연결을 확인하세요.",
