@@ -2,9 +2,16 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { NotificationPrefs, PushDevice } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
-import { browserState, disablePush, enablePush, PushSetupError, type DeviceState } from "../push.js";
+import {
+  browserState,
+  disablePush,
+  enablePush,
+  PUSH_DEVICES_KEY as DEVICES_KEY,
+  PushSetupError,
+  syncPush,
+  type DeviceState,
+} from "../push.js";
 
-const DEVICES_KEY = ["push-devices"] as const;
 const PREFS_KEY = ["notification-prefs"] as const;
 
 const STATE_BADGE: Record<DeviceState, [string, string]> = {
@@ -21,22 +28,20 @@ export function NotificationSettings() {
   // Re-read the browser's own state when asked ("다시 확인") or when the window gets focus back.
   const [browser, setBrowser] = useState(browserState);
   useEffect(() => {
-    const again = () => setBrowser(browserState());
+    const again = () => {
+      setBrowser(browserState());
+      void qc.invalidateQueries({ queryKey: DEVICES_KEY });
+    };
     window.addEventListener("focus", again);
     return () => window.removeEventListener("focus", again);
-  }, []);
-  const devices = useQuery({ queryKey: DEVICES_KEY, queryFn: push.devices });
+  }, [qc]);
+  // Reconciled with this browser's real subscription on every visit: "켜짐" only when pushes really arrive here
+  // (a withdrawn permission or a lost subscription removes the stale row; a renewed one is registered).
+  const devices = useQuery({ queryKey: DEVICES_KEY, queryFn: syncPush, staleTime: 0 });
   const current = devices.data?.find((d) => d.current);
   const state: DeviceState = browser !== "off" ? browser : current ? "on" : "off";
   const [message, setMessage] = useState<string>();
   const refresh = () => qc.invalidateQueries({ queryKey: DEVICES_KEY });
-
-  // Permission withdrawn in the browser settings: this device can no longer receive anything — forget it.
-  const revokedId = browser === "denied" ? current?.id : undefined;
-  useEffect(() => {
-    if (revokedId) void push.remove(revokedId).then(refresh, () => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [revokedId]);
 
   const turnOn = useMutation({
     // The browser's permission prompt opens from this click only.
@@ -112,7 +117,14 @@ export function NotificationSettings() {
                 </>
               )}
               {state === "denied" && (
-                <button type="button" className="small" onClick={() => setBrowser(browserState())}>
+                <button
+                  type="button"
+                  className="small"
+                  onClick={() => {
+                    setBrowser(browserState());
+                    void refresh();
+                  }}
+                >
                   다시 확인
                 </button>
               )}
@@ -138,6 +150,7 @@ export function NotificationSettings() {
           ))}
         </tbody>
       </table>
+      {devices.isError && <p className="error small">{errorText(devices.error)}</p>}
       {message && (
         <p className="small" role="status">
           {message}

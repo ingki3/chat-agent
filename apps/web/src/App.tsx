@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes, useNavigate, useParams } from "react-router";
 import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
 import { auth, setUnauthenticatedHandler } from "./api.js";
 import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
@@ -39,6 +39,7 @@ const authChannel =
 function AuthGate() {
   const qc = useQueryClient();
   const { data, isError } = useQuery({ queryKey: AUTH_KEY, queryFn: auth.state });
+  useNotificationOpen();
   const set = (s: AuthState) => {
     qc.setQueryData(AUTH_KEY, s);
     authChannel?.postMessage("changed");
@@ -95,4 +96,35 @@ function AccountData({ children }: { children: ReactNode }) {
 function ChatRoute() {
   const { id = "" } = useParams();
   return <ChatPage key={id} />;
+}
+
+/** Same-origin single-slash in-app path only (the service worker checks too). */
+export function inAppPath(url: unknown): string {
+  if (typeof url !== "string" || !url.startsWith("/") || url.startsWith("//") || url.includes("\\"))
+    return "/";
+  try {
+    const u = new URL(url, window.location.origin);
+    const out = u.pathname + u.search + u.hash;
+    return u.origin === window.location.origin && !out.startsWith("//") ? out : "/";
+  } catch {
+    return "/";
+  }
+}
+
+/**
+ * Fallback for a tapped notification when the service worker could not navigate the open window itself (a window
+ * it does not control yet): move there in place. Mounted above the login gate, so it works on the login screen
+ * too — the address changes and the page is shown once the user has signed in.
+ */
+function useNotificationOpen() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: unknown; url?: unknown } | null;
+      if (data?.type === "agentlee:open") void navigate(inAppPath(data.url));
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, [navigate]);
 }

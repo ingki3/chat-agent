@@ -1,8 +1,9 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useNavigate } from "react-router";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Outlet } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
-import { notifications, NOTIFICATIONS_KEY } from "./api.js";
+import { NOTIFICATIONS_KEY } from "./api.js";
+import { PUSH_DEVICES_KEY, syncPush } from "./push.js";
 import { Sidebar } from "./Sidebar.js";
 
 type ShellCtx = { openDrawer: (trigger: HTMLElement) => void };
@@ -122,33 +123,22 @@ export function TopBar({ title, children }: { title: ReactNode; children?: React
   );
 }
 
-/** Same-origin in-app path only (the service worker checks too). */
-const inAppPath = (url: unknown) =>
-  typeof url === "string" && url.startsWith("/") && !url.startsWith("//") && !url.includes("\\") ? url : "/";
-
 /**
- * Messages from the service worker (#34): a push arrived → refresh the 🔔 badge; a notification was tapped
- * while the app is open → go there in place (and mark it read). If the session has expired, the login screen
- * shows on that address and the user lands there after signing in.
+ * Push on this account (#34): a push arrived → refresh the 🔔 badge at once; and on every app start, make the
+ * server's registration match this browser's real subscription (a renewal the service worker could not
+ * register — e.g. 403 after Access expired — is registered now). Tapped notifications are handled before login
+ * too, in App (`useNotificationOpen`).
  */
 function usePushMessages() {
   const qc = useQueryClient();
-  const navigate = useNavigate();
+  useQuery({ queryKey: PUSH_DEVICES_KEY, queryFn: syncPush, staleTime: 60_000, retry: false });
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
     const onMessage = (e: MessageEvent) => {
-      const data = e.data as { type?: unknown; url?: unknown; id?: unknown } | null;
-      if (data?.type === "agentlee:notification") void qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY });
-      if (data?.type === "agentlee:open") {
-        navigate(inAppPath(data.url));
-        if (typeof data.id === "string")
-          void notifications
-            .read(data.id)
-            .catch(() => {})
-            .finally(() => qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY }));
-      }
+      if ((e.data as { type?: unknown } | null)?.type === "agentlee:notification")
+        void qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY });
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => navigator.serviceWorker.removeEventListener("message", onMessage);
-  }, [qc, navigate]);
+  }, [qc]);
 }

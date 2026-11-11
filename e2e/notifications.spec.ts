@@ -7,39 +7,55 @@ import { ADMIN, MOM, SON, csrf, useAccount } from "./helpers.js";
  * registration on the server, the inbox and the badge — is the real thing.
  */
 
-/** Stubs the Notification permission and PushManager; `answer` is what the permission prompt returns. */
+/**
+ * Stubs the Notification permission and PushManager; `answer` is what the permission prompt returns. Both are
+ * kept in localStorage, so they survive reloads like the real browser state does (the endpoint lives under
+ * `e2e-push-endpoint`; tests change it to play a renewal by the browser).
+ */
 async function stubPush(page: Page, answer: "granted" | "denied") {
   await page.addInitScript((answer) => {
     const w = window as unknown as { __asks: number };
     w.__asks = 0;
-    let permission: NotificationPermission = "default";
-    Object.defineProperty(Notification, "permission", { get: () => permission, configurable: true });
+    const PERM = "e2e-push-permission";
+    const SUB = "e2e-push-endpoint";
+    const permission = () => (localStorage.getItem(PERM) ?? "default") as NotificationPermission;
+    Object.defineProperty(Notification, "permission", { get: permission, configurable: true });
     Notification.requestPermission = async () => {
       w.__asks++;
-      permission = answer;
-      return permission;
+      localStorage.setItem(PERM, answer);
+      return answer;
     };
-    let sub: PushSubscription | null = null;
-    PushManager.prototype.subscribe = async function (o?: PushSubscriptionOptionsInit) {
-      const endpoint = `https://fcm.googleapis.com/fcm/send/e2e-${Math.random().toString(36).slice(2)}`;
-      const key = o?.applicationServerKey as Uint8Array;
-      sub = {
+    const make = (endpoint: string) =>
+      ({
         endpoint,
-        options: { applicationServerKey: key.buffer, userVisibleOnly: true },
+        options: { applicationServerKey: null, userVisibleOnly: true },
         toJSON: () => ({
           endpoint,
           expirationTime: null,
           keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) },
         }),
         unsubscribe: async () => {
-          sub = null;
+          localStorage.removeItem(SUB);
           return true;
         },
-      } as unknown as PushSubscription;
-      return sub;
+      }) as unknown as PushSubscription;
+    PushManager.prototype.subscribe = async function () {
+      const endpoint = `https://fcm.googleapis.com/fcm/send/e2e-${Math.random().toString(36).slice(2)}`;
+      localStorage.setItem(SUB, endpoint);
+      return make(endpoint);
     };
-    PushManager.prototype.getSubscription = async () => sub;
+    PushManager.prototype.getSubscription = async () => {
+      const endpoint = localStorage.getItem(SUB);
+      return endpoint ? make(endpoint) : null;
+    };
   }, answer);
+}
+
+/** The app's service worker once it controls `page` (Chromium exposes workers to the test). */
+async function controllingWorker(page: Page) {
+  await page.waitForFunction(() => !!navigator.serviceWorker.controller);
+  const ctx = page.context();
+  return ctx.serviceWorkers()[0] ?? (await ctx.waitForEvent("serviceworker"));
 }
 
 /** A separate browser (no saved session) that looks like this project's device. */
@@ -194,5 +210,90 @@ test("a tapped notification opens its in-app address only; an expired session la
   await login(fresh, MOM);
   await expect(fresh).toHaveURL(/\/notifications$/);
   await expect(fresh.locator(".topbar .title")).toHaveText("🔔 알림함");
+  await ctx.close();
+});
+
+test("tapping a notification while the open window shows the login screen lands there after login", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const page = await ctx.newPage();
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "로그인", exact: true })).toBeVisible();
+  const sw = await controllingWorker(page);
+  // What the worker's notificationclick handler runs, in the real worker against the real window.
+  await sw.evaluate(() =>
+    (globalThis as unknown as { openFromNotification: (u: string) => Promise<void> }).openFromNotification(
+      "/notifications",
+    ),
+  );
+  await expect(page).toHaveURL(/\/notifications$/);
+  await login(page, MOM);
+  await expect(page).toHaveURL(/\/notifications$/);
+  await expect(page.locator(".topbar .title")).toHaveText("🔔 알림함");
+  await ctx.close();
+});
+
+test("a renewed subscription the worker could not register (403) is registered on the next start", async ({
+  browser,
+  baseURL,
+}, info) => {
+  const ctx = await freshContext(browser, baseURL!, info.project.name);
+  const page = await ctx.newPage();
+  await stubPush(page, "granted");
+  await page.goto("/settings");
+  await login(page, SON);
+  await page.getByRole("button", { name: "이 기기에서 알림 켜기" }).click();
+  await expect(page.getByTestId("device-state")).toHaveText("켜짐");
+  const sw = await controllingWorker(page);
+  const current = async () =>
+    (
+      (await (await page.request.get("/api/push/devices")).json()) as {
+        devices: { id: string; current: boolean; endpointHash: string }[];
+      }
+    ).devices.find((d) => d.current);
+  const first = (await current())!;
+
+  // The browser renews the subscription; the worker's registration is refused (Access/app session ran out).
+  const renewed = "https://fcm.googleapis.com/fcm/send/e2e-renewed-" + info.project.name + Date.now();
+  await page.evaluate((e) => localStorage.setItem("e2e-push-endpoint", e), renewed);
+  await ctx.route("**/api/push/devices", (route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({ status: 403, json: { error: "access_denied" } })
+      : route.continue(),
+  );
+  await sw.evaluate(
+    (endpoint) =>
+      (globalThis as unknown as { reRegister: (o: unknown, n: unknown) => Promise<void> }).reRegister(null, {
+        toJSON: () => ({ endpoint, keys: { p256dh: "B".repeat(87), auth: "A".repeat(22) } }),
+      }),
+    renewed,
+  );
+  expect(
+    await page.evaluate(
+      async () => !!(await caches.match("/push-reregister", { cacheName: "agentlee-push" })),
+    ),
+  ).toBe(true);
+  await ctx.unroute("**/api/push/devices");
+  // Meanwhile the old endpoint expired at the push service (410) and its device was dropped.
+  await page.request.delete(`/api/push/devices/${first.id}`, { headers: csrf(baseURL!) });
+
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("켜짐");
+  const after = (await current())!;
+  expect(after.id).not.toBe(first.id);
+  expect(after.endpointHash).not.toBe(first.endpointHash);
+  expect(
+    await page.evaluate(
+      async () => !!(await caches.match("/push-reregister", { cacheName: "agentlee-push" })),
+    ),
+  ).toBe(false);
+
+  // The real browser state wins: no subscription any more → shown off, and the server forgets the device.
+  await page.evaluate(() => localStorage.removeItem("e2e-push-endpoint"));
+  await page.reload();
+  await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
+  expect(await current()).toBeUndefined();
   await ctx.close();
 });

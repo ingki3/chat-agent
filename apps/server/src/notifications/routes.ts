@@ -52,8 +52,10 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
     "/api/notifications/:id/read",
     { config: { resource: { kind: NOTIFICATION, action: "write" } } },
     async (req, reply) => {
-      service.markRead(req.ctx.user!.id, req.params.id);
-      return noStore(reply).send(toNotification(service.get(req.params.id)!));
+      // Same visibility as the list: an entry hidden by a revoked share or a lost admin role is not found.
+      const row = service.markRead(req.ctx.user!.id, req.params.id);
+      if (!row) return noStore(reply).code(404).send({ error: "not_found" });
+      return noStore(reply).send(toNotification(row));
     },
   );
 

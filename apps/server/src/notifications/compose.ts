@@ -98,14 +98,17 @@ export function twoLines(s: string): string {
  * Same-origin in-app path only (`/c/<id>?x#y`). Anything else — another origin, a protocol-relative `//host`,
  * a backslash trick, `javascript:` — becomes `/`. The service worker checks again before opening it.
  */
+const isSinglePath = (p: string) => p.startsWith("/") && !/^\/[/\\]/.test(p) && !/[\s\\]/.test(p);
+
 export function safePath(url: string | undefined): string {
-  if (!url || url.length > 512 || !url.startsWith("/") || /^\/[/\\]/.test(url) || /[\s\\]/.test(url))
-    return "/";
+  if (!url || url.length > 512 || !isSinglePath(url)) return "/";
   try {
     const base = "https://agentlee.invalid";
     const u = new URL(url, base);
     if (u.origin !== base) return "/";
-    return `${u.pathname}${u.search}${u.hash}`;
+    const out = `${u.pathname}${u.search}${u.hash}`;
+    // Normalising can turn "/a/..//evil.example" into "//evil.example": check the result again.
+    return isSinglePath(out) ? out : "/";
   } catch {
     return "/";
   }

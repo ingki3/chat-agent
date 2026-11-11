@@ -121,8 +121,18 @@ describe("text rules (FR-13.5)", () => {
       "javascript:alert(1)",
       "c/1",
       "",
+      // Dot segments that normalise into a protocol-relative "//host" (plain and percent-encoded).
+      "/a/..//evil.example",
+      "/a/../..//evil.example/x",
+      "/a/%2e%2e//evil.example",
+      "/a/%2E%2E//evil.example",
+      "/a/.%2e//evil.example",
+      "/./..//evil.example",
     ])
-      expect(safePath(bad)).toBe("/");
+      expect(safePath(bad), bad).toBe("/");
+    // Harmless dot segments still resolve to the in-app path.
+    expect(safePath("/a/../c/1")).toBe("/c/1");
+    expect(safePath("/a/%2e%2e/c/1")).toBe("/c/1");
   });
 
   it("never puts shared content in a share notification", () => {
@@ -534,6 +544,39 @@ describe("quiet hours (FR-13.4)", () => {
 });
 
 describe("inbox API", () => {
+  it("reading an entry hidden by a revoked share or a lost admin role is not found and returns nothing", async () => {
+    const { app, member, svc, api } = await setup();
+    const son = member("son");
+    const mom = member("mom");
+    const refs = new Map<string, ResourceRef>([
+      ["a", { kind: "share", id: "a", ownerId: son.user.id, sharedWith: [mom.user.id] }],
+    ]);
+    app.resources.register("share", (id) => refs.get(id));
+    const shared = svc.publish(mom.user.id, {
+      kind: "share_received",
+      fromName: "아들",
+      itemTitle: "비밀 그래프",
+      url: "/shared/a",
+      ref: { kind: "share", id: "a" },
+    })!;
+    refs.set("a", { kind: "share", id: "a", ownerId: son.user.id, sharedWith: [] });
+    const r1 = await api(mom, "POST", `/api/notifications/${shared}/read`, {});
+    expect(r1.statusCode).toBe(404);
+    expect(r1.body).not.toContain("비밀");
+    expect(svc.get(shared)!.readAt).toBeNull();
+
+    const dad = member("dad", "admin");
+    const cost = svc.publish(dad.user.id, { kind: "daily_cost", amountUsd: 12.5, thresholdUsd: 10 })!;
+    app.users!.setRole(dad.user.id, "member");
+    const r2 = await api(dad, "POST", `/api/notifications/${cost}/read`, {});
+    expect(r2.statusCode).toBe(404);
+    expect(r2.body).not.toContain("12.50");
+    expect(svc.get(cost)!.readAt).toBeNull();
+    // Re-shared / admin again: visible and readable again.
+    app.users!.setRole(dad.user.id, "admin");
+    expect((await api(dad, "POST", `/api/notifications/${cost}/read`, {})).statusCode).toBe(200);
+  });
+
   it("each user sees only their own entries; read and read-all", async () => {
     const { member, svc, api } = await setup();
     const mom = member("mom");

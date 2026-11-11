@@ -1,4 +1,9 @@
+import type { PushDevice } from "@agentlee/shared";
 import { push } from "./api.js";
+import { reconcileAction } from "./push-reconcile.js";
+
+/** Query key of this account's devices, already reconciled with the browser (`syncPush`). */
+export const PUSH_DEVICES_KEY = ["push-devices"] as const;
 
 /**
  * Web push on this device (#34, FR-13.1). The browser permission prompt is only ever opened from the
@@ -126,6 +131,59 @@ function sameKey(sub: PushSubscription, publicKey: string): boolean {
   const a = new Uint8Array(k);
   const b = keyBytes(publicKey);
   return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/** Where the service worker leaves a note when re-registering a renewed subscription failed (sw.js). */
+const PUSH_STATE = "agentlee-push";
+const REREGISTER = "/push-reregister";
+
+async function reregisterPending(): Promise<boolean> {
+  try {
+    return !!(await caches.match(REREGISTER, { cacheName: PUSH_STATE }));
+  } catch {
+    return false;
+  }
+}
+
+async function clearReregisterPending(): Promise<void> {
+  try {
+    await (await caches.open(PUSH_STATE)).delete(REREGISTER);
+  } catch {
+    // nothing to clear
+  }
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * The account's devices, after making the server match this browser's *real* subscription for this login session
+ * (see push-reconcile.ts). Runs on every app start and settings visit, so a renewal the service worker could not
+ * register (e.g. 403 after Access expired) is registered on the next start, and "켜짐" is only shown when this
+ * browser really has the subscription the server will push to.
+ */
+export async function syncPush(): Promise<PushDevice[]> {
+  let devices = await push.devices();
+  if (!pushSupported()) return devices;
+  // Not registered yet (first load, development build): nothing to compare.
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return devices;
+  const sub = await reg.pushManager.getSubscription().catch(() => null);
+  const usable = sub && Notification.permission === "granted" ? sub : null;
+  const current = devices.find((d) => d.current);
+  const pending = await reregisterPending();
+  const action = reconcileAction({
+    endpointHash: usable ? await sha256Hex(usable.endpoint) : null,
+    current,
+    pending,
+  });
+  if ((action === "remove" || action === "replace") && current) devices = await push.remove(current.id);
+  if ((action === "register" || action === "replace") && usable)
+    devices = await push.register(usable.toJSON(), deviceLabel());
+  if (pending) await clearReregisterPending();
+  return devices;
 }
 
 /** "끄기" on this device: the browser stops the subscription, the server forgets the device. */

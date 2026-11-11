@@ -343,12 +343,26 @@ export class NotificationService {
     return this.db.select().from(notifications).where(eq(notifications.id, id)).get();
   }
 
-  markRead(userId: string, id: string): void {
+  /**
+   * One entry of the user's inbox, under the same rule as `list`: hidden (undefined) when it was cancelled, or
+   * the user may no longer see it (share revoked, no longer an admin for an admin kind).
+   */
+  visible(userId: string, id: string): Row | undefined {
+    const user = this.users.byId(userId);
+    const r = this.get(id);
+    if (!user || !r || r.userId !== userId || r.pushState === "cancelled") return undefined;
+    return this.allowed(user, r.kind, r.refKind, r.refId) ? r : undefined;
+  }
+
+  /** Marks one visible entry read; returns it, or undefined when it is hidden (nothing changes then). */
+  markRead(userId: string, id: string): Row | undefined {
+    if (!this.visible(userId, id)) return undefined;
     this.db
       .update(notifications)
       .set({ readAt: this.now() })
       .where(and(eq(notifications.id, id), eq(notifications.userId, userId), isNull(notifications.readAt)))
       .run();
+    return this.get(id);
   }
 
   markAllRead(userId: string): void {
@@ -461,6 +475,7 @@ export class NotificationService {
         createdAt: s.createdAt,
         lastSentAt: s.lastSentAt,
         current: s.sessionId === current,
+        endpointHash: s.endpointHash,
       }));
   }
 

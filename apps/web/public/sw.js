@@ -2,6 +2,9 @@
 // streams or anything personal — only the built static files and the page itself.
 // Web push (#34): shows pushed notifications and opens their in-app address when tapped.
 const CACHE = "agentlee-shell-v1";
+/** Push bookkeeping shared with the page (not app data): a failed re-registration waiting for the app. */
+const PUSH_STATE = "agentlee-push";
+const REREGISTER = "/push-reregister";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -16,7 +19,9 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) =>
+        Promise.all(keys.filter((k) => k !== CACHE && k !== PUSH_STATE).map((k) => caches.delete(k))),
+      )
       .then(() => self.clients.claim()),
   );
 });
@@ -51,13 +56,16 @@ self.addEventListener("fetch", (event) => {
 
 // ---- Web push (#34) ----
 
+const singlePath = (p) => p.startsWith("/") && !p.startsWith("//") && !p.includes("\\");
+
 /** Same-origin in-app path only; anything else opens the app's start page. */
 function inAppPath(url) {
-  if (typeof url !== "string" || !url.startsWith("/") || url.startsWith("//") || url.includes("\\"))
-    return "/";
+  if (typeof url !== "string" || !singlePath(url)) return "/";
   try {
     const u = new URL(url, self.location.origin);
-    return u.origin === self.location.origin ? u.pathname + u.search + u.hash : "/";
+    const out = u.pathname + u.search + u.hash;
+    // Dot segments can normalise "/a/..//host" into "//host" (another site): check the result again.
+    return u.origin === self.location.origin && singlePath(out) ? out : "/";
   } catch {
     return "/";
   }
@@ -90,42 +98,82 @@ self.addEventListener("push", (event) => {
   );
 });
 
-// Tapping a notification: reuse an open app window (the app navigates in place), otherwise open the address.
-// If the app or Cloudflare Access session has expired, the normal login flow runs on that same address and
-// returns there afterwards.
+const post = (path, body) =>
+  fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "x-agent-lee": "1" },
+    body: JSON.stringify(body),
+  });
+
+/**
+ * Tapping a notification. An open app window is *navigated* to the address (a real page load, whatever it shows
+ * now — the login screen included), otherwise a new window opens there. If the app session has expired the
+ * login screen shows on that address and the app renders it after login; an expired Cloudflare Access session
+ * goes through Access's login, which returns to the same address.
+ */
+async function openFromNotification(url, id) {
+  // Mark it read on the way (fails quietly when the session has expired).
+  const read = id ? post(`/api/notifications/${encodeURIComponent(id)}/read`, {}).catch(() => {}) : null;
+  const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const win = list.find((c) => new URL(c.url).origin === self.location.origin);
+  if (!win) {
+    await self.clients.openWindow(url);
+  } else {
+    try {
+      const moved = await win.navigate(url);
+      await (moved || win).focus().catch(() => {});
+    } catch {
+      // A window this worker does not control yet cannot be navigated: the page moves itself (App listener).
+      await win.focus().catch(() => {});
+      win.postMessage({ type: "agentlee:open", url });
+    }
+  }
+  await read;
+}
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const data = event.notification.data || {};
-  const url = inAppPath(data.url);
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (list) => {
-      const win = list.find((c) => new URL(c.url).origin === self.location.origin);
-      if (win) {
-        await win.focus().catch(() => {});
-        win.postMessage({ type: "agentlee:open", url, id: data.id });
-        return;
-      }
-      await self.clients.openWindow(url);
-    }),
+    openFromNotification(inAppPath(data.url), typeof data.id === "string" ? data.id : undefined),
   );
 });
 
-// The browser replaced the subscription (expiry, key rotation by the push service): register the new one.
+async function setReregisterPending(pending) {
+  try {
+    const c = await caches.open(PUSH_STATE);
+    if (pending) await c.put(REREGISTER, new Response("1"));
+    else await c.delete(REREGISTER);
+  } catch {
+    // storage unavailable: the app still compares the subscription with the server on its next start
+  }
+}
+
+/**
+ * The browser replaced the subscription (expiry, key rotation by the push service): register the new one. If that
+ * fails — offline, or a 401/403 because the app or Access session ran out — the failure is remembered and the app
+ * registers the subscription again on its next start (apps/web/src/push.ts `syncPush`).
+ */
+async function reRegister(oldSub, newSub) {
+  try {
+    let sub = newSub;
+    if (!sub) {
+      const key = oldSub && oldSub.options ? oldSub.options.applicationServerKey : null;
+      if (!key) throw new Error("no key to subscribe again");
+      sub = await self.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: key,
+      });
+    }
+    const res = await post("/api/push/devices", { ...sub.toJSON(), label: "다시 등록된 기기" });
+    if (!res.ok) throw new Error(`registration answered ${res.status}`);
+    await setReregisterPending(false);
+  } catch {
+    await setReregisterPending(true);
+  }
+}
+
 self.addEventListener("pushsubscriptionchange", (event) => {
-  const old = event.oldSubscription;
-  const key = old && old.options ? old.options.applicationServerKey : null;
-  if (!key) return;
-  event.waitUntil(
-    self.registration.pushManager
-      .subscribe({ userVisibleOnly: true, applicationServerKey: key })
-      .then((sub) =>
-        fetch("/api/push/devices", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json", "x-agent-lee": "1" },
-          body: JSON.stringify({ ...sub.toJSON(), label: "다시 등록된 기기" }),
-        }),
-      )
-      .catch(() => {}),
-  );
+  event.waitUntil(reRegister(event.oldSubscription, event.newSubscription));
 });

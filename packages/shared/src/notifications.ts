@@ -67,6 +67,11 @@ export const PushDevice = z.object({
   createdAt: z.number().int(),
   lastSentAt: z.number().int().nullable(),
   current: z.boolean(),
+  /**
+   * SHA-256 (hex) of the push endpoint, so this browser can tell whether the server has its *current*
+   * subscription (it changes when the browser renews it). The endpoint itself never leaves the server.
+   */
+  endpointHash: z.string(),
 });
 export type PushDevice = z.infer<typeof PushDevice>;
 export const PushDeviceList = z.object({ devices: z.array(PushDevice) });
