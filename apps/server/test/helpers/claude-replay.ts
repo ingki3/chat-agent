@@ -7,20 +7,31 @@ import type { Options, Query, SDKMessage, SDKUserMessage, query } from "@anthrop
  * 재생, 로컬은 실제 키로 수동 1회 기록"). A recording maps the turn's prompt text to the SDK messages the
  * real runtime produced for it (see `recordingQuery`).
  */
-export type Recording = Record<string, SDKMessage[]>;
+export type RecordedTurn = {
+  messages: SDKMessage[];
+  /** Index in `messages` at which interrupt() was called (what follows is what the runtime sent after it). */
+  interruptAt?: number;
+  /** The SDK threw this at the end (e.g. after an interrupted turn), after the last message. */
+  thrown?: string;
+};
+/** Prompt text → the turn the runtime produced. A bare array is a turn without interrupt or error. */
+export type Recording = Record<string, RecordedTurn | SDKMessage[]>;
+const turnOf = (t: RecordedTurn | SDKMessage[]): RecordedTurn => (Array.isArray(t) ? { messages: t } : t);
 
 /** Also records what the adapter asked for, so tests can check the options it passed. */
 export type ReplayLog = { options: Options[]; prompts: string[]; interrupts: number; closes: number };
 
-const firstText = async (
-  prompt: AsyncIterable<SDKUserMessage>,
-): Promise<{ text: string; rest: AsyncIterator<SDKUserMessage> }> => {
-  const it = prompt[Symbol.asyncIterator]();
-  const first = await it.next();
+const firstText = async (prompt: AsyncIterable<SDKUserMessage>): Promise<string> => {
+  const first = await prompt[Symbol.asyncIterator]().next();
   const c = (first.value as SDKUserMessage | undefined)?.message.content;
-  return { text: typeof c === "string" ? c : JSON.stringify(c), rest: it };
+  return typeof c === "string" ? c : JSON.stringify(c);
 };
 
+/**
+ * Replays a recording. An interrupt jumps to what the runtime really sent after the interrupt in the recording
+ * (`interruptAt`), then ends the way it ended (`thrown`). A turn recorded without an interrupt cannot be
+ * interrupted in replay — that fails loudly instead of inventing an ending.
+ */
 export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof query {
   return ((params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options }) => {
     const options = params.options ?? {};
@@ -33,31 +44,32 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
         setTimeout(r, delayMs);
       });
     async function* gen(): AsyncGenerator<SDKMessage> {
-      const { text } = await firstText(params.prompt as AsyncIterable<SDKUserMessage>);
+      const text = await firstText(params.prompt as AsyncIterable<SDKUserMessage>);
       log.prompts.push(text);
-      const msgs = rec[text];
-      if (!msgs) throw new Error(`no recording for prompt: ${text.slice(0, 40)}`);
-      // Like the CLI: a new session gets its transcript file in the config folder.
+      const recorded = rec[text];
+      if (!recorded) throw new Error(`no recording for prompt: ${text.slice(0, 40)}`);
+      const turn = turnOf(recorded);
+      // Like the CLI: a session gets its transcript file in the config folder.
       const cfg = options.env?.CLAUDE_CONFIG_DIR;
       const id = options.sessionId ?? options.resume;
       if (cfg && id) {
         fs.mkdirSync(path.join(cfg, "projects", "replay"), { recursive: true });
         fs.appendFileSync(path.join(cfg, "projects", "replay", `${id}.jsonl`), "{}\n");
       }
-      for (const m of msgs) {
-        if (interrupted) {
-          yield {
-            type: "result",
-            subtype: "error_during_execution",
-            is_error: true,
-            usage: {},
-            total_cost_usd: 0,
-          } as unknown as SDKMessage;
-          return;
+      let i = 0;
+      let jumped = false;
+      while (i < turn.messages.length) {
+        if (interrupted && !jumped) {
+          if (turn.interruptAt === undefined) throw new Error("replay: this recording was not interrupted");
+          jumped = true;
+          i = Math.max(i, turn.interruptAt);
+          continue;
         }
         await sleep();
-        yield m;
+        if (interrupted && !jumped) continue;
+        yield turn.messages[i++]!;
       }
+      if (turn.thrown) throw new Error(turn.thrown);
     }
     const g = gen();
     return Object.assign(g, {
@@ -75,10 +87,14 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
   }) as typeof query;
 }
 
-/** Wraps the real SDK and stores what it produced, per prompt (run with real credentials, once). */
+/**
+ * Wraps the real SDK and stores what it produced, per prompt (run with real credentials, once). The turn is
+ * stored however it ends — normally, by the adapter returning early after `result`, or by an SDK error — and
+ * remembers where interrupt() was called.
+ */
 export function recordingQuery(real: typeof query, into: Recording): typeof query {
   return ((params: { prompt: AsyncIterable<SDKUserMessage>; options?: Options }) => {
-    const out: SDKMessage[] = [];
+    const turn: RecordedTurn = { messages: [] };
     let key = "";
     const prompt = (async function* () {
       for await (const m of params.prompt) {
@@ -89,14 +105,23 @@ export function recordingQuery(real: typeof query, into: Recording): typeof quer
     })();
     const q = real({ prompt, ...(params.options ? { options: params.options } : {}) });
     const wrapped = (async function* () {
-      for await (const m of q) {
-        out.push(m);
-        yield m;
+      try {
+        for await (const m of q) {
+          turn.messages.push(m);
+          yield m;
+        }
+      } catch (e) {
+        turn.thrown = e instanceof Error ? e.message : String(e);
+        throw e;
+      } finally {
+        into[key] = turn;
       }
-      into[key] = out;
     })();
     return Object.assign(wrapped, {
-      interrupt: () => q.interrupt(),
+      interrupt: () => {
+        turn.interruptAt ??= turn.messages.length;
+        return q.interrupt();
+      },
       setModel: (m?: string) => q.setModel(m),
       close: () => q.close(),
     }) as unknown as Query;

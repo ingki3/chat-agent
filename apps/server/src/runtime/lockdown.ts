@@ -33,13 +33,25 @@ export type PreToolUseResult = {
   };
 };
 
+/** Where an MCP tool call comes from (SDK `McpServerProvenance`). Our server, passed in options, is "dynamic". */
+export type ToolProvenance = { name: string; source: string };
+
 /**
- * Allows our MCP tools — explicitly: without an "allow" the SDK asks for permission, and with nobody to ask the call
- * fails (checked against the pinned SDK with our HTTP MCP server, #43). Everything else (Bash, Read, account
- * connectors, …) is denied.
+ * Allows exactly the run's own tools of our MCP server — explicitly: without an "allow" the SDK asks for
+ * permission, and with nobody to ask the call fails (#43). A call is ours only if its name is one of
+ * `mcp__agentlee__<allowed>` *and* the SDK says it comes from our server as configured in the options. Names
+ * alone are not proof (a connector called `agentlee__extra` produces `mcp__agentlee__extra__…`, review #80), and
+ * a call without provenance is refused. Everything else (Bash, Read, account connectors, …) is denied.
  */
-export function preToolUse(toolName: string): PreToolUseResult {
-  const ours = toolName.startsWith(OUR_TOOL_PREFIX);
+export function preToolUse(
+  toolName: string,
+  allowed: readonly string[],
+  provenance?: ToolProvenance,
+): PreToolUseResult {
+  const ours =
+    allowed.some((t) => toolName === OUR_TOOL_PREFIX + t) &&
+    provenance?.name === AGENTLEE_MCP &&
+    provenance.source === "dynamic";
   return {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -57,7 +69,10 @@ export function claudeLockdown(o: {
   cwd: string;
   env: Record<string, string>;
   mcp?: McpConnection | undefined;
+  /** The run's tools of our MCP server, without prefix (StartContext.tools). Nothing else is ever allowed. */
+  tools: readonly string[];
 }) {
+  const allowed = o.mcp ? [...o.tools] : [];
   if (o.mcp) mcpLoopbackPort(o.mcp);
   return {
     cwd: o.cwd,
@@ -87,7 +102,14 @@ export function claudeLockdown(o: {
         }
       : {},
     hooks: {
-      PreToolUse: [{ hooks: [async (input: { tool_name: string }) => preToolUse(input.tool_name)] }],
+      PreToolUse: [
+        {
+          hooks: [
+            async (input: { tool_name: string; mcp_server?: ToolProvenance }) =>
+              preToolUse(input.tool_name, allowed, input.mcp_server),
+          ],
+        },
+      ],
     },
   };
 }

@@ -72,10 +72,41 @@ export type ClaudeAdapterOptions = {
   executable?: string;
   /** Memory limit of the CLI process. */
   maxRssBytes?: number;
+  /**
+   * Egress proxy the CLI must use for the internet (HTTPS_PROXY). The sandbox then opens only loopback ports:
+   * this proxy and our MCP server. Without it the CLI has no internet at all.
+   */
+  egress?: { endpoint(): Promise<{ port: number; url: string }> };
   /** Tests: replaces the SDK (recorded-event replay) and the sandboxed spawn. */
   query?: typeof sdkQuery;
   spawn?: (o: SpawnIsolatedOptions) => SpawnedProcess;
 };
+
+/**
+ * What the server remembers per session, outside the folder the CLI can write: the system prompt the session
+ * started with (resumes send the same one — the SDK's own system-prompt snapshot is not available everywhere)
+ * and the cumulative cost already reported (results carry running totals across resumes).
+ */
+type SessionMeta = { systemPrompt: string; costUsd: number };
+const metaDir = (dir: string) => `${dir}-meta`;
+const metaFile = (dir: string, id: string) => path.join(metaDir(dir), `${id}.json`);
+function readMeta(dir: string, id: string): SessionMeta | undefined {
+  try {
+    const m = JSON.parse(fs.readFileSync(metaFile(dir, id), "utf8")) as SessionMeta;
+    return typeof m.systemPrompt === "string" && typeof m.costUsd === "number" ? m : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function writeMeta(dir: string, id: string, m: SessionMeta) {
+  fs.mkdirSync(metaDir(dir), { recursive: true, mode: 0o700 });
+  const f = metaFile(dir, id);
+  fs.writeFileSync(`${f}.tmp`, JSON.stringify(m), { mode: 0o600 });
+  fs.renameSync(`${f}.tmp`, f);
+}
+
+/** Variables the SDK adds for its CLI (entrypoint, SDK version, feature flags) — kept; nothing secret. */
+const SDK_ENV = /^(CLAUDE_CODE_ENTRYPOINT|CLAUDE_AGENT_SDK_[A-Z0-9_]+|CLAUDE_CODE_SDK_[A-Z0-9_]+)$/;
 
 /** Folders inside a connection folder. Created on first use, owner-only. */
 export function connectionPaths(dir: string) {
@@ -181,7 +212,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
       fs
         .readdirSync(projects)
         .some((d) => fs.existsSync(path.join(projects, d, `${externalSessionId}.jsonl`)));
-    if (!found) throw new SessionGoneError();
+    if (!found || !readMeta(conn.dir, externalSessionId)) throw new SessionGoneError();
     return this.open(ctx, { sessionId: externalSessionId, fresh: false });
   }
 
@@ -198,7 +229,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     return m;
   }
 
-  private open(ctx: StartContext, s: { sessionId: string; fresh: boolean }): RuntimeSession {
+  private async open(ctx: StartContext, s: { sessionId: string; fresh: boolean }): Promise<RuntimeSession> {
     const conn = this.connectionFor(ctx);
     this.checkModel(ctx.model, ctx.effort);
     ensureDirs(conn.dir);
@@ -208,20 +239,32 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const spawnFn = this.opts.spawn ?? spawnIsolated;
     const maxRssBytes = this.opts.maxRssBytes ?? 2 * 1024 ** 3;
     const mcpPort = ctx.mcp ? mcpLoopbackPort(ctx.mcp) : undefined;
+    const proxy = this.opts.egress ? await this.opts.egress.endpoint() : undefined;
+    if (proxy) Object.assign(env, { HTTPS_PROXY: proxy.url, NO_PROXY: "127.0.0.1,localhost" });
+    // The system prompt is fixed when the session starts (with the history it was given) and reused on resume.
+    const meta: SessionMeta = s.fresh
+      ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx.history), costUsd: 0 }
+      : readMeta(conn.dir, s.sessionId)!;
+    if (s.fresh) writeMeta(conn.dir, s.sessionId, meta);
     const run = this.opts.query ?? sdkQuery;
     let current: Query | undefined;
     let closed = false;
 
     const spawnClaudeCodeProcess = (o: SpawnOptions): SpawnedProcess => {
       const command = fs.realpathSync(o.command);
+      // Ours, plus only the SDK's own non-secret variables (never the server's environment).
+      const sdkVars = Object.fromEntries(
+        Object.entries(o.env).filter(([k, v]) => SDK_ENV.test(k) && v !== undefined && !(k in env)),
+      ) as Record<string, string>;
       return spawnFn({
         command,
         args: o.args,
         cwd: paths.work,
-        env, // ours — not the SDK's merged one (it would carry nothing else anyway: options.env replaces)
+        env: { ...sdkVars, ...env },
         read: [conn.dir],
         write: [conn.dir],
-        network: { loopbackPorts: mcpPort ? [mcpPort] : [], https: true },
+        // Loopback only: our MCP server and the egress proxy. No direct internet, no home network.
+        network: { loopbackPorts: [mcpPort, proxy?.port].filter((p): p is number => p !== undefined) },
         maxRssBytes,
       });
     };
@@ -251,10 +294,12 @@ export class ClaudeAdapter implements RuntimeAdapter {
           await inputDone; // keep the input open (streaming mode) until the turn is over
         }
         const options: Options = {
-          ...claudeLockdown({ cwd: paths.work, env, mcp: ctx.mcp }),
+          ...claudeLockdown({ cwd: paths.work, env, mcp: ctx.mcp, tools: ctx.tools }),
+          // The text is delivered as written: no `@file` expansion, no slash commands (review #80).
+          verbatimPrompts: true,
           model: input.model,
           ...(input.effort ? { effort: input.effort as NonNullable<Options["effort"]> } : {}),
-          systemPrompt: ctx.systemPrompt + (s.fresh ? historyPrompt(ctx.history) : ""),
+          systemPrompt: meta.systemPrompt,
           includePartialMessages: true,
           persistSession: true,
           ...(s.fresh ? { sessionId: s.sessionId } : { resume: s.sessionId }),
@@ -266,13 +311,14 @@ export class ClaudeAdapter implements RuntimeAdapter {
         const q = run({ prompt: prompt(), options });
         current = q;
         let interrupted = false;
+        let limited = false; // a usage limit ends the turn as `limit`, not as a failure (review #80)
 
         async function* events(): AsyncGenerator<RuntimeEvent> {
           try {
             for await (const m of q as AsyncIterable<SDKMessage>) {
               yield* translate(m);
               if (m.type === "result") {
-                if (m.is_error && !(interrupted && m.subtype === "error_during_execution"))
+                if (m.is_error && !limited && !(interrupted && m.subtype === "error_during_execution"))
                   throw new RuntimeFailure("runtime_error");
                 return;
               }
@@ -308,6 +354,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
           }
           if (m.type === "assistant") {
             if (m.error === "rate_limit") {
+              limited = true;
               yield { type: "limit", code: "rate_limit", message: "Claude 사용 한도에 도달했어요." };
               return;
             }
@@ -344,6 +391,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
             return;
           }
           if (m.type === "rate_limit_event" && m.rate_limit_info.status === "rejected") {
+            limited = true;
             yield { type: "limit", code: "rate_limit", message: "Claude 사용 한도에 도달했어요." };
             return;
           }
@@ -354,6 +402,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
               cache_read_input_tokens?: number;
               cache_creation_input_tokens?: number;
             };
+            // total_cost_usd runs on across resumes: report only what this turn added.
+            let cost: number | undefined;
+            if (typeof m.total_cost_usd === "number") {
+              cost = Math.max(
+                0,
+                m.total_cost_usd >= meta.costUsd ? m.total_cost_usd - meta.costUsd : m.total_cost_usd,
+              );
+              meta.costUsd = m.total_cost_usd;
+              writeMeta(conn.dir, s.sessionId, meta);
+            }
             const cacheRead = u.cache_read_input_tokens ?? 0;
             const cacheWrite = u.cache_creation_input_tokens ?? 0;
             yield {
@@ -362,7 +420,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
               outputTokens: u.output_tokens ?? 0,
               cacheReadTokens: cacheRead,
               cacheWriteTokens: cacheWrite,
-              ...(typeof m.total_cost_usd === "number" ? { costUsd: m.total_cost_usd } : {}),
+              ...(cost === undefined ? {} : { costUsd: cost }),
             };
           }
         }

@@ -17,10 +17,10 @@ export type SandboxPolicy = {
   /** Executables the process may start (the command itself is added automatically). */
   exec?: string[];
   /**
-   * "none" (default), "all", or outbound TCP to these loopback ports only (e.g. our MCP server) — optionally
-   * plus HTTPS (TCP 443) to the internet with DNS, for runtime CLIs that talk to their provider's API.
+   * "none" (default), "all", or outbound TCP to these loopback ports only — our MCP server and, for runtime
+   * CLIs, the egress proxy (isolation/egress.ts) that is their only way to the internet.
    */
-  network?: "none" | "all" | { loopbackPorts: number[]; https?: boolean };
+  network?: "none" | "all" | { loopbackPorts: number[] };
   /**
    * Read-only program folders (e.g. a runtime's install directory) that are not scanned for hard links.
    * Never put family data here.
@@ -91,13 +91,6 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`bad port ${port}`);
       lines.push(`(allow network-outbound (remote ip "localhost:${port}"))`);
     }
-    if (net.https)
-      lines.push(
-        '(allow network-outbound (remote tcp "*:443"))',
-        // Name resolution goes through mDNSResponder; certificate checks through trustd.
-        '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
-        '(allow mach-lookup (global-name "com.apple.dnssd.service") (global-name "com.apple.trustd") (global-name "com.apple.trustd.agent") (global-name "com.apple.SystemConfiguration.configd"))',
-      );
   }
   return lines.join("\n") + "\n";
 }

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,7 +14,15 @@ import {
 import { ClaudeAdapter, claudeEnv, type ClaudeAuth } from "../src/runtime/claude.js";
 import { claudeConnectionFor } from "../src/runtime/claude-config.js";
 import { runIsolated, type SpawnIsolatedOptions } from "../src/isolation/sandbox.js";
-import { replayQuery, sdk, type Recording, type ReplayLog } from "./helpers/claude-replay.js";
+import { CLAUDE_EGRESS_HOSTS, EgressService } from "../src/isolation/egress.js";
+import {
+  recordingQuery,
+  replayQuery,
+  sdk,
+  type RecordedTurn,
+  type Recording,
+  type ReplayLog,
+} from "./helpers/claude-replay.js";
 import { runtimeContract } from "./helpers/runtime-contract.js";
 import recorded from "./fixtures/claude-contract.json" with { type: "json" };
 
@@ -176,11 +185,15 @@ describe("Claude adapter (#15): event translation", () => {
 
   it("an interrupt we asked for ends the turn quietly (error_during_execution is not a failure then)", async () => {
     const { a, log } = adapter({
-      long: [
-        sdk.init({ session: "s" }),
-        ...Array.from({ length: 200 }, (_, i) => sdk.delta(`w${i} `)),
-        sdk.result(),
-      ],
+      long: {
+        messages: [
+          sdk.init({ session: "s" }),
+          ...Array.from({ length: 200 }, (_, i) => sdk.delta(`w${i} `)),
+          // What the runtime sends after an interrupt (spike #39): an error result for the cut-off turn.
+          sdk.result({ isError: true, subtype: "error_during_execution" }),
+        ],
+        interruptAt: 201,
+      },
     });
     const turn = (await a.start(ctx())).turn({ text: "long", model: "claude-haiku-5-5" });
     const ev: RuntimeEvent[] = [];
@@ -219,7 +232,12 @@ describe("Claude adapter (#15): settings it hands to the SDK", () => {
     expect(await hook({ tool_name: "Bash" })).toMatchObject({
       hookSpecificOutput: { permissionDecision: "deny" },
     });
-    expect(await hook({ tool_name: "mcp__agentlee__echo_time" })).toMatchObject({
+    expect(
+      await hook({
+        tool_name: "mcp__agentlee__echo_time",
+        mcp_server: { name: "agentlee", source: "dynamic" },
+      } as never),
+    ).toMatchObject({
       hookSpecificOutput: { permissionDecision: "allow" },
     });
     // Environment: only ours, the credential only here, every folder inside the connection folder.
@@ -267,7 +285,7 @@ describe("Claude adapter (#15): settings it hands to the SDK", () => {
       args: ["--x"],
       read: [path.join(root, "conn")],
       write: [path.join(root, "conn")],
-      network: { loopbackPorts: [45678], https: true },
+      network: { loopbackPorts: [45678] },
       env: log.options[0]!.env,
     });
     expect(spawns[0]!.trusted ?? []).toEqual([]);
@@ -282,7 +300,91 @@ describe("Claude adapter (#15): settings it hands to the SDK", () => {
     const s2 = await a.resume(s.externalSessionId, ctx({ history }));
     await collect(s2.turn({ text: "y", model: "claude-haiku-5-5" }).events);
     expect(log.options[1]!.resume).toBe(s.externalSessionId);
-    expect(log.options[1]!.systemPrompt).not.toContain("토마토");
+    // A resume sends exactly the prompt the session started with (history included once, not re-derived).
+    expect(log.options[1]!.systemPrompt).toBe(log.options[0]!.systemPrompt);
+  });
+
+  it("prompts go verbatim (no @file expansion, no slash commands)", async () => {
+    const { a, log } = adapter({ "@../secret.txt /login": sdk.answer("s", "ok") });
+    await collect(
+      (await a.start(ctx())).turn({ text: "@../secret.txt /login", model: "claude-haiku-5-5" }).events,
+    );
+    expect(log.options[0]!.verbatimPrompts).toBe(true);
+  });
+
+  it("reports per-turn cost although the SDK's total runs on across resumes", async () => {
+    const withCost = (session: string, total: number): SDKMessage[] => [
+      sdk.init({ session }),
+      sdk.delta("ok"),
+      { ...(sdk.result() as object), total_cost_usd: total } as SDKMessage,
+    ];
+    const { a } = adapter({ one: withCost("s", 1), two: withCost("s", 1.25) });
+    const s1 = await a.start(ctx());
+    const c1 = (await collect(s1.turn({ text: "one", model: "claude-haiku-5-5" }).events)).find(
+      (e) => e.type === "usage",
+    );
+    const s2 = await a.resume(s1.externalSessionId, ctx());
+    const c2 = (await collect(s2.turn({ text: "two", model: "claude-haiku-5-5" }).events)).find(
+      (e) => e.type === "usage",
+    );
+    expect(c1).toMatchObject({ costUsd: 1 });
+    expect((c2 as { costUsd: number }).costUsd).toBeCloseTo(0.25, 10);
+  });
+
+  it("a usage limit stays a limit even when the runtime then reports an error result", async () => {
+    const { a } = adapter({
+      x: [
+        sdk.init({ session: "s" }),
+        sdk.assistantError("rate_limit"),
+        sdk.result({ isError: true, subtype: "success" }),
+      ],
+    });
+    const ev = await collect((await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" }).events);
+    expect(ev.filter((e) => e.type === "limit")).toHaveLength(1);
+  });
+
+  it("a session without our saved metadata cannot be resumed (its system prompt is unknown)", async () => {
+    const { a, root } = adapter({ x: sdk.answer("s", "ok") });
+    const s = await a.start(ctx());
+    await collect(s.turn({ text: "x", model: "claude-haiku-5-5" }).events);
+    fs.rmSync(path.join(root, "conn-meta"), { recursive: true });
+    await expect(a.resume(s.externalSessionId, ctx())).rejects.toBeInstanceOf(SessionGoneError);
+  });
+
+  it("the CLI gets the SDK's own non-secret variables, the proxy, and nothing from the server's environment", async () => {
+    const root = tmp();
+    const log: ReplayLog = { options: [], prompts: [], interrupts: 0, closes: 0 };
+    const spawns: SpawnIsolatedOptions[] = [];
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c1", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      query: replayQuery({ x: sdk.answer("s", "ok") }, log),
+      egress: { endpoint: async () => ({ port: 41111, url: "http://127.0.0.1:41111" }) },
+      spawn: (o) => {
+        spawns.push(o);
+        throw new Error("not spawned");
+      },
+    });
+    await collect((await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" }).events);
+    const env = log.options[0]!.env as Record<string, string>;
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:41111");
+    expect(() =>
+      log.options[0]!.spawnClaudeCodeProcess!({
+        command: process.execPath,
+        args: [],
+        env: {
+          ...env,
+          CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
+          CLAUDE_AGENT_SDK_VERSION: "0.3.312",
+          SECRET_FROM_SERVER: "x",
+          PATH: "/evil",
+        },
+      } as never),
+    ).toThrow();
+    expect(spawns[0]!.env.CLAUDE_CODE_ENTRYPOINT).toBe("sdk-ts");
+    expect(spawns[0]!.env.CLAUDE_AGENT_SDK_VERSION).toBe("0.3.312");
+    expect(spawns[0]!.env.SECRET_FROM_SERVER).toBeUndefined();
+    expect(spawns[0]!.env.PATH).toBe("/usr/bin:/bin");
+    expect(spawns[0]!.network).toEqual({ loopbackPorts: [45678, 41111] });
   });
 
   it("refuses unknown models and effort values the model does not take; no connection → no_connection", async () => {
@@ -329,17 +431,28 @@ const online =
 
 describe.skipIf(!isMac || !realBin)("Claude adapter (#15): real CLI in the sandbox (macOS)", () => {
   it.skipIf(!online)(
-    "starts without forking, reaches the API over HTTPS, a bad key fails as runtime_auth, and the key is never written",
+    "starts without forking, reaches the API only through the egress proxy, a bad key fails as runtime_auth, and the key is never written",
     async () => {
       const root = tmp();
+      const connects: string[] = [];
+      const egress = new EgressService({
+        allow: CLAUDE_EGRESS_HOSTS,
+        connect: (ip, port) => {
+          connects.push(`${ip}:${port}`);
+          return net.connect({ host: ip, port });
+        },
+      });
       const a = new ClaudeAdapter({
         connection: () => ({ id: "t", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+        egress,
       });
       const s = await a.start(ctx({ mcp: undefined, tools: [] }));
       await expect(collect(s.turn({ text: "hi", model: "claude-haiku-5-5" }).events)).rejects.toMatchObject({
         code: "runtime_auth",
       });
       await s.close();
+      await egress.close();
+      expect(connects.length).toBeGreaterThan(0); // the API was reached — through the proxy
       const hits: string[] = [];
       const walk = (d: string) => {
         for (const n of fs.readdirSync(d)) {
@@ -352,6 +465,45 @@ describe.skipIf(!isMac || !realBin)("Claude adapter (#15): real CLI in the sandb
       walk(root);
       expect(fs.existsSync(path.join(root, "conn", "config", ".claude.json"))).toBe(true); // it did run
       expect(hits).toEqual([]);
+    },
+    60_000,
+  );
+
+  it.skipIf(!online)(
+    "@file in a prompt is not expanded by the real CLI (nothing of the file reaches the session)",
+    async () => {
+      const root = tmp();
+      const egress = new EgressService({ allow: CLAUDE_EGRESS_HOSTS });
+      const conn = path.join(root, "conn");
+      const a = new ClaudeAdapter({
+        connection: () => ({ id: "t", dir: conn, auth: { kind: "api_key", apiKey: KEY } }),
+        egress,
+      });
+      const s = await a.start(ctx({ mcp: undefined, tools: [] }));
+      // Inside the CLI's own folder (so the sandbox would allow the read): only verbatim delivery stops it.
+      fs.mkdirSync(conn, { recursive: true });
+      fs.writeFileSync(path.join(conn, "other-person.txt"), "OTHER-PERSON-MARKER");
+      await collect(
+        s.turn({ text: "@../other-person.txt summarise", model: "claude-haiku-5-5" }).events,
+      ).catch(() => {});
+      await s.close();
+      await egress.close();
+      const found: string[] = [];
+      const walk = (d: string) => {
+        for (const n of fs.readdirSync(d)) {
+          const p = path.join(d, n);
+          const st = fs.lstatSync(p);
+          if (st.isDirectory()) walk(p);
+          else if (
+            st.isFile() &&
+            n !== "other-person.txt" &&
+            fs.readFileSync(p).includes("OTHER-PERSON-MARKER")
+          )
+            found.push(p);
+        }
+      };
+      walk(conn);
+      expect(found).toEqual([]);
     },
     60_000,
   );
@@ -420,8 +572,18 @@ describe("Claude connection from .env (#15, until #17)", () => {
     });
     expect(claudeConnectionFor(both, store, "son")).toMatchObject({
       id: "claude-api-key",
-      dir: "/data/runtimes/claude-api-key",
+      dir: "/data/runtimes/claude-api-key/son",
     });
+  });
+  it("every user gets their own CLI folder, even on the shared API key (sessions never in another's sandbox)", () => {
+    const mom = { ...both, claude: { apiKey: "sk-ant-k" } };
+    users.set("mom", { id: "mom", role: "member", email: "mom@family.test", active: true });
+    const a = claudeConnectionFor(mom, store, "mom")!;
+    const b = claudeConnectionFor(mom, store, "son")!;
+    expect(a.id).toBe(b.id);
+    expect(a.dir).not.toBe(b.dir);
+    expect(path.relative(a.dir, b.dir).startsWith("..")).toBe(true);
+    expect(path.relative(b.dir, a.dir).startsWith("..")).toBe(true);
   });
   it("without an API key, family members have no Claude connection; inactive users never", () => {
     const sub = { ...base, claude: { oauthToken: "oat" } };
@@ -453,3 +615,62 @@ describe.skipIf(!fs.existsSync(toolsFixture))(
     });
   },
 );
+
+describe("recording helper (review #80): turns are kept however they end, and replay as recorded", () => {
+  it("normal end (adapter returns after result), interrupt point and SDK error are all recorded", async () => {
+    const source: Recording = {
+      ok: sdk.answer("s", "one two"),
+      cut: {
+        messages: [
+          sdk.init({ session: "s" }),
+          ...Array.from({ length: 50 }, (_, i) => sdk.delta(`w${i} `)),
+          sdk.delta("tail after interrupt "),
+        ],
+        interruptAt: 51,
+        thrown: "Claude Code process aborted by user",
+      },
+    };
+    const fakeReal = replayQuery(source, { options: [], prompts: [], interrupts: 0, closes: 0 });
+    const rec: Recording = {};
+    const root = tmp();
+    const a = new ClaudeAdapter({
+      connection: () => ({ id: "c", dir: path.join(root, "conn"), auth: { kind: "api_key", apiKey: KEY } }),
+      query: recordingQuery(fakeReal, rec),
+    });
+    await collect((await a.start(ctx())).turn({ text: "ok", model: "claude-haiku-5-5" }).events);
+    const turn = (await a.start(ctx())).turn({ text: "cut", model: "claude-haiku-5-5" });
+    let n = 0;
+    await expect(
+      (async () => {
+        for await (const e of turn.events) if (e.type === "text_delta" && ++n === 3) void turn.interrupt();
+      })(),
+    ).rejects.toThrow(/aborted/);
+    const ok = rec.ok as RecordedTurn;
+    expect(ok.messages.at(-1)).toMatchObject({ type: "result" }); // stored although the adapter returned early
+    const cut = rec.cut as RecordedTurn;
+    expect(cut.interruptAt).toBeGreaterThan(0);
+    expect(cut.interruptAt).toBeLessThan(10);
+    expect(cut.thrown).toBe("Claude Code process aborted by user");
+    // The real tail after the interrupt, not an invented ending.
+    expect(JSON.stringify(cut.messages.at(-1))).toContain("tail after interrupt");
+    // Replaying the recording behaves the same.
+    const again = adapter(rec).a;
+    const t2 = (await again.start(ctx())).turn({ text: "cut", model: "claude-haiku-5-5" });
+    let m = 0;
+    await expect(
+      (async () => {
+        for await (const e of t2.events) if (e.type === "text_delta" && ++m === 2) void t2.interrupt();
+      })(),
+    ).rejects.toThrow(/aborted/);
+  });
+
+  it("a turn recorded without an interrupt refuses to be interrupted in replay (no invented endings)", async () => {
+    const { a } = adapter({ x: sdk.answer("s", "a b c d e f g h i j k l m n o p") });
+    const t = (await a.start(ctx())).turn({ text: "x", model: "claude-haiku-5-5" });
+    await expect(
+      (async () => {
+        for await (const e of t.events) if (e.type === "text_delta") void t.interrupt();
+      })(),
+    ).rejects.toThrow(/not interrupted/);
+  });
+});
