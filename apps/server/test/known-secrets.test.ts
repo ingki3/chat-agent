@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { CSRF_HEADER } from "@agentlee/shared";
@@ -1521,5 +1522,164 @@ describe("round 27", () => {
     }[];
     expect(parts.map((p) => p.text ?? "").join("")).not.toContain(k);
     expect(parts[0]!.text).toBe("답 [숨김]");
+  });
+});
+
+describe("round 28", () => {
+  it("a verified Cloudflare Access token is a known secret: pasted and echoed, it reaches no row, API, stream, replay or turn", async () => {
+    const { exportJWK, generateKeyPair, SignJWT, createLocalJWKSet } = await import("jose");
+    const TEAM = "family.cloudflareaccess.com";
+    const AUD = "b".repeat(64);
+    const HOST = "chat.2prostream.com";
+    const ADMIN = "ingki3@gmail.com";
+    const PW = "correct horse battery";
+    const kp = await generateKeyPair("RS256");
+    const jwks = createLocalJWKSet({
+      keys: [{ ...(await exportJWK(kp.publicKey)), kid: "k1", alg: "RS256" }],
+    });
+    const accessToken = await new SignJWT({ email: ADMIN })
+      .setProtectedHeader({ alg: "RS256", kid: "k1" })
+      .setIssuer(`https://${TEAM}`)
+      .setAudience(AUD)
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(kp.privateKey);
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(
+      loadConfig({ NODE_ENV: "test", CF_ACCESS_TEAM_DOMAIN: TEAM, CF_ACCESS_AUD: AUD }),
+      {
+        db,
+        logger: false,
+        runtimes,
+        accessKeys: jwks,
+        runs: { flushMs: 0 },
+      },
+    );
+    apps.push(app);
+    const local = { host: "localhost:3000", origin: "http://localhost:3000", [CSRF_HEADER]: "1" };
+    const setup = await app.inject({
+      method: "POST",
+      url: "/api/auth/setup",
+      headers: local,
+      payload: { name: "아빠", password: PW },
+    });
+    expect(setup.statusCode, setup.body).toBe(200);
+    const edge = { host: HOST, "cf-connecting-ip": "198.51.100.7", "cf-access-jwt-assertion": accessToken };
+    const edgeWrite = { ...edge, origin: `https://${HOST}`, [CSRF_HEADER]: "1" };
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: edgeWrite,
+      payload: { email: ADMIN, password: PW },
+    });
+    expect(login.statusCode, login.body).toBe(200);
+    const cookie = String(login.headers["set-cookie"]).split(";")[0]!;
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const user = app.users!.byEmail(ADMIN)!;
+    const conv = app.conversations!.create(user.id);
+    // The runtime echoes it back, in pieces and in a tool call.
+    rt.script(() => [
+      { type: "text_delta", text: `값은 ${accessToken.slice(0, 20)}` },
+      { type: "text_delta", text: accessToken.slice(20) + " 이에요" },
+      { type: "tool_start", callId: "j", name: "web_fetch", input: { header: accessToken } },
+      { type: "tool_end", callId: "j", output: { echoed: accessToken } },
+    ]);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { ...edgeWrite, cookie, "content-type": "application/json" },
+      payload: { text: `로그인이 안 돼요. 제 값: ${accessToken}` },
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const runId = res.json<{ run: { id: string } }>().run.id;
+    // Real HTTP with the tunnel's Host (fetch would replace it): node:http.
+    const port = (app.server.address() as AddressInfo).port;
+    const get = (headers: Record<string, string>) =>
+      new Promise<string>((resolve, reject) => {
+        const req = http.get({ host: "127.0.0.1", port, path: `/api/runs/${runId}/events`, headers }, (r) => {
+          let body = "";
+          r.setEncoding("utf8");
+          r.on("data", (c: string) => (body += c));
+          r.on("end", () => resolve(body));
+        });
+        req.on("error", reject);
+      });
+    const sse = await get({ ...edge, cookie });
+    const replay = await get({ ...edge, cookie, "last-event-id": "0" });
+    await app.storedRescrub!.idle();
+    const api = (
+      await app.inject({ url: `/api/conversations/${conv.id}/messages`, headers: { ...edge, cookie } })
+    ).body;
+    const rows = ["messages", "run_events", "conversations"]
+      .map((t) => JSON.stringify(db.$client.prepare(`select * from "${t}"`).all()))
+      .join("\n");
+    const joined = sse
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)) as { type: string; text?: string })
+      .map((e) => (e.type === "delta" ? e.text : ""))
+      .join("");
+    for (const [what, hay] of [
+      ["subscription", sse],
+      ["subscription text", joined],
+      ["replay", replay],
+      ["messages API", api],
+      ["rows", rows],
+      ["turn input", JSON.stringify(rt.seen.map((s) => [s.input, s.history]))],
+    ])
+      expect(hay, what).not.toContain(accessToken);
+    expect(sse).toContain("[숨김]");
+    expect(knownSecrets.list()).toContain(accessToken);
+  });
+
+  it("an unknown \\N{} name outside a key is text: the run's rows, API and the next history keep it", async () => {
+    const db = createTestDb();
+    const rt = scriptedRuntime();
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(rt.adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+    });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    const code = 'print("\\N{SNOWMAN}")\nprint("ordinary done")';
+    const headers = {
+      host: "localhost:3000",
+      cookie: f.cookies.owner,
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+      "content-type": "application/json",
+    };
+    const send = async (text: string) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/conversations/${conv.id}/messages`,
+        headers,
+        payload: { text },
+      });
+      const id = res.json<{ run: { id: string } }>().run.id;
+      for (let i = 0; i < 400 && !app.runs!.get(id)?.endedAt; i++)
+        await new Promise((r) => setTimeout(r, 10));
+    };
+    rt.script(() => [
+      { type: "tool_start", callId: "p", name: "run_python", input: { code } },
+      { type: "tool_end", callId: "p", output: { code, stdout: "snowman\nordinary done" } },
+      { type: "text_delta", text: "실행했어요" },
+    ]);
+    await send("파이썬");
+    rt.script(() => [{ type: "text_delta", text: "다음" }]);
+    await send("다음");
+    const history = JSON.stringify(rt.seen.at(-1)!.history);
+    expect(history).toContain('print(\\"ordinary done\\")');
+    expect(history).not.toContain("[숨김]");
+    const api = (await app.inject({ url: `/api/conversations/${conv.id}/messages`, headers })).body;
+    expect(api).toContain('print(\\"ordinary done\\")');
   });
 });

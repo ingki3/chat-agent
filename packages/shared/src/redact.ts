@@ -310,6 +310,36 @@ function escapeAt(
     : { decoded: simple, length: 2 };
 }
 
+/** Characters a key run (with escapes) may hold, as `escapeInKey` reads it. */
+const KEY_RUN = /[\w$.\-\\{}]/;
+/** The last run looked at: escapes come in order, so one run is read once, not once per escape in it (linear). */
+let keyRun = { d: "", from: -1, end: -1 };
+/** Where the run of key characters starting at `e` ends (at most 256 on from where the run was entered). */
+function keyRunEnd(d: string, e: number): number {
+  if (keyRun.d === d && e >= keyRun.from && e <= keyRun.end) return keyRun.end;
+  let end = e;
+  for (let k = 0; end < d.length && k < 256 && KEY_RUN.test(d[end]!); k++) end++;
+  keyRun = { d, from: e, end };
+  return end;
+}
+
+/**
+ * Whether the escape at `u` is part of a key: after it (and its `{…}`), only more key characters, a closing quote
+ * and a gap until a separator (`:`, `=`, `=>`, `:=`) — or a comment whose end cannot be found.
+ */
+function escapeInKey(d: string, u: number): boolean {
+  let e = u + 2;
+  if (d.charCodeAt(u + 2) === 123) {
+    const close = d.slice(u + 3, u + 83).indexOf("}"); // within the name window only (linear)
+    e = close >= 0 ? u + 3 + close + 1 : u + 3;
+  }
+  e = keyRunEnd(d, e);
+  if (isQuoteChar(d.charCodeAt(e))) e++;
+  if (e >= d.length) return false;
+  const [g, , open] = gapEnd(d, e, false);
+  return open || separatorAt(d, g) > 0;
+}
+
 /**
  * One layer of tolerant unescaping (see `escapeAt`). With `origin` (the layer-0 offset of every character of
  * `s`), also returns the layer-0 offset of every decoded character.
@@ -318,7 +348,9 @@ function decodeLayer(
   s: string,
   origin: Int32Array | null,
 ): { text: string; origin: Int32Array | null; unknownAt: number } {
-  let unknownAt = -1; // layer-0 offset of the first escape we cannot decode for sure (an unknown \N{…})
+  // Layer-0 offset of the first escape we cannot decode for sure (an unknown \N{…}) inside a key — one followed by
+  // a separator (round 28: anywhere else, like `print("\N{SNOWMAN}")`, it is text and nothing is hidden).
+  let unknownAt = -1;
   const parts: string[] = [];
   const out = origin ? new Int32Array(s.length) : null;
   let n = 0;
@@ -326,7 +358,7 @@ function decodeLayer(
   for (let i = 0; i < s.length;) {
     const esc = s.charCodeAt(i) === 92 ? escapeAt(s, i) : null;
     if (esc?.unknown) {
-      if (unknownAt < 0) unknownAt = origin ? origin[i]! : i;
+      if (unknownAt < 0 && escapeInKey(s, i)) unknownAt = origin ? origin[i]! : i;
     } else if (esc) {
       if (i > from) parts.push(s.slice(from, i));
       parts.push(esc.decoded);

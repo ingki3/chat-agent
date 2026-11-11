@@ -596,6 +596,10 @@ describe("redactSecrets", () => {
       ["regex character class after a comma", 'const r = /a,[b]:c/; const next = "save";'],
       ["Markdown link definition", "[guide]: https://example.com"],
       [
+        "Python with an unknown \\N{} name (round 28)",
+        'print("' + BS + 'N{SNOWMAN}")' + String.fromCharCode(10) + 'print("ordinary done")',
+      ],
+      [
         "Markdown link definition in a reply",
         "자세한 내용은 [guide]를 보세요." + String.fromCharCode(10) + "[guide]: https://example.com/docs",
       ],
@@ -934,8 +938,12 @@ describe("redactSecrets", () => {
       BS.repeat(100) + " 끝", // 100 backslashes halve to a lone one within 7 layers
     ])
       expect(redactString(text)).toBe(text);
-    // An escape that cannot be decoded for sure (an unknown \\N{…} name) is hidden from there (round 18).
-    expect(redactString("C:" + BS + "tools" + BS + "N{none} 끝")).toBe("C:" + BS + "tools" + REDACTED);
+    // An escape that cannot be decoded for sure (an unknown \\N{…} name) is hidden from there only inside a key
+    // (round 28; rounds 18–27 hid it anywhere): in plain text it stays.
+    expect(redactString("C:" + BS + "tools" + BS + "N{none} 끝")).toBe(
+      "C:" + BS + "tools" + BS + "N{none} 끝",
+    );
+    expect(redactString("{'pass" + BS + "N{none}word': 'hunter2'}")).not.toContain("hunter2");
     // 5,000 backslashes are wrapping 12 layers deep: beyond the decoded layers, so hidden (fail-closed).
     expect(redactString(BS.repeat(5000) + " 끝")).toBe(REDACTED);
     // Twelve layers of a quote: hidden from the first backslash that still decodes after eight.
@@ -1035,12 +1043,15 @@ describe("redactSecrets", () => {
   }, 60_000);
 
   it("an N-escape name of exactly the window length is read; one character more is fail-closed (round 19)", () => {
-    // 80 characters: the brace is inside the window — read as a name (unknown here, so hidden from the escape).
+    // 80 characters: the brace is inside the window — read as a name (unknown here). In a key: hidden from the
+    // escape; in plain text (round 28): kept.
     const inside = "pre " + BS + "N{" + "Y".repeat(80) + "} post";
-    expect(redactString(inside)).toBe("pre " + REDACTED);
-    // 81 characters: no brace inside the window — fail-closed from the escape all the same.
+    expect(redactString(inside)).toBe(inside);
+    expect(redactString("{'pre" + BS + "N{" + "Y".repeat(80) + "}': 'hunter2'}")).not.toContain("hunter2");
+    // 81 characters: no brace inside the window — the same.
     const outside = "pre " + BS + "N{" + "Y".repeat(81) + "} post";
-    expect(redactString(outside)).toBe("pre " + REDACTED);
+    expect(redactString(outside)).toBe(outside);
+    expect(redactString("{'pre" + BS + "N{" + "Y".repeat(81) + "}': 'hunter2'}")).not.toContain("hunter2");
     // A known name is still decoded (and the text kept) when it closes inside the window.
     const known = "pre " + BS + "N{LATIN SMALL LETTER A} post";
     expect(redactString(known)).toBe(known);

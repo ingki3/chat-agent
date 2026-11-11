@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { CSRF_HEADER, type AuthError } from "@agentlee/shared";
 import type { Config } from "../config.js";
 import { isApiRequest, routerPath } from "../paths.js";
+import { knownSecrets } from "../secrets/known.js";
 import type { AccessVerifier } from "./access-jwt.js";
 import "./context.js";
 import type { UserStore } from "./users.js";
@@ -13,6 +14,24 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 export const deny = (reply: FastifyReply, status: number, error: AuthError) =>
   reply.code(status).header("Cache-Control", "no-store").send({ error });
+
+/** Access tokens registered as known secrets, with the timer that forgets each when it expires. */
+const accessTokens = new Map<string, NodeJS.Timeout>();
+function rememberAccessToken(token: string, expiresAt: number | undefined): void {
+  if (accessTokens.has(token)) return;
+  knownSecrets.add(token);
+  // Cloudflare tokens last hours; without `exp` (never: it is required) a day.
+  const ms = Math.max(0, (expiresAt ?? Date.now() + 86_400_000) - Date.now()) + 60_000;
+  const timer = setTimeout(
+    () => {
+      accessTokens.delete(token);
+      knownSecrets.remove(token);
+    },
+    Math.min(ms, 2 ** 31 - 1),
+  );
+  timer.unref();
+  accessTokens.set(token, timer);
+}
 
 export function readCookie(header: string | undefined, name: string): string | undefined {
   for (const part of (header ?? "").split(";")) {
@@ -76,6 +95,10 @@ export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): vo
       } catch {
         return deny(reply, 403, "access_denied");
       }
+      // A verified Access token is a bearer credential the server knows (round 28): registered on first sight —
+      // not fresh, since the person may have pasted it somewhere already (a rescrub pass looks for it) — and
+      // forgotten when it expires.
+      rememberAccessToken(token, id.expiresAt);
       if ("email" in id) ctx.accessEmail = id.email;
       // A service token (no person behind it) may only read the health check — the external uptime probe.
       else if (!isHealthCheck(req)) return deny(reply, 403, "access_denied");

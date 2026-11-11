@@ -1,7 +1,10 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 
 /** A family member, or a Cloudflare Access service token (the uptime check — allowed on /api/health only). */
-export type AccessIdentity = { email: string } | { serviceToken: string };
+export type AccessIdentity = ({ email: string } | { serviceToken: string }) & {
+  /** When the token expires (ms since the epoch). */
+  expiresAt?: number;
+};
 export type AccessVerifier = (token: string) => Promise<AccessIdentity>;
 
 /**
@@ -33,10 +36,12 @@ export function createAccessVerifier(opts: {
       clockTolerance: 30,
       requiredClaims: ["exp", "iat"],
     });
+    const exp = typeof payload.exp === "number" ? { expiresAt: payload.exp * 1000 } : {};
     if (typeof payload.email === "string" && payload.email.includes("@"))
-      return { email: payload.email.trim().toLowerCase() };
+      return { email: payload.email.trim().toLowerCase(), ...exp };
     const cn = payload.common_name;
-    if (payload.email === undefined && typeof cn === "string" && cn.length > 0) return { serviceToken: cn };
+    if (payload.email === undefined && typeof cn === "string" && cn.length > 0)
+      return { serviceToken: cn, ...exp };
     throw new Error("no email claim");
   };
 }
