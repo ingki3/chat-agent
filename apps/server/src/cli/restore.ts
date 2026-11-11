@@ -63,8 +63,11 @@ for (let i = 0; i < rest.length; i++) {
   else positional.push(a);
 }
 
+/** The key file actually used — resolved once, for loading and for the target checks. */
+const keyFile = path.resolve(cwd, (flags.get("key") as string | undefined) ?? config.masterKeyPath);
+
 function key(): Buffer {
-  const file = path.resolve(cwd, (flags.get("key") as string | undefined) ?? config.masterKeyPath);
+  const file = keyFile;
   try {
     return loadMasterKey(file);
   } catch (e) {
@@ -100,7 +103,8 @@ try {
       target,
       key: key(),
       backupDir: config.backupDir,
-      masterKeyPath: config.masterKeyPath,
+      // Neither the key used nor the configured one may be inside the folder that is replaced.
+      keyPaths: [keyFile, config.masterKeyPath],
     });
     console.log(`restored: ${r.manifest.id} (마이그레이션 ${r.pending}개 적용)`);
     if (r.previous) console.log(`이전 데이터 폴더는 옆에 남겨 뒀어요: ${path.basename(r.previous)}`);

@@ -225,6 +225,7 @@ export const BACKUP_CODES = set([
 ]);
 export const isBackupCode = member(BACKUP_CODES);
 export const isBackupTrigger = member(set(["scheduled", "manual"]));
+export const isRestoreRecovery = member(set(["completed", "rolled_back"]));
 
 export const isRuntime = member(RUNTIMES);
 export const isFinanceCode = member(FINANCE_CODES);

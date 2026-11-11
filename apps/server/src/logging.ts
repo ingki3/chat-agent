@@ -30,6 +30,7 @@ import {
   isFinanceCode,
   isBackupCode,
   isBackupTrigger,
+  isRestoreRecovery,
   isToolName,
   UNMATCHED,
   isUsagePurpose,
@@ -102,6 +103,8 @@ export const LOG_EVENTS = [
   // Backups (#37): trigger (`scheduled`/`manual`), fixed outcome code, duration, file count — never a path or content.
   "backup.finished",
   "backup.pruned",
+  // A restore interrupted mid-swap, finished at server start (#37): `completed` or `rolled_back`.
+  "restore.recovered",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -203,6 +206,7 @@ const FIELDS = new Map<string, Check>([
   /** Backups (#37): what started it and one of the fixed `backup_*` codes. */
   ["backupTrigger", isBackupTrigger],
   ["backupCode", isBackupCode],
+  ["restoreCode", isRestoreRecovery],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -464,6 +468,7 @@ export type LogFields = {
   purpose?: string;
   backupTrigger?: string;
   backupCode?: string;
+  restoreCode?: string;
   /** Logged as class name and code only. */
   err?: unknown;
 };

@@ -132,26 +132,65 @@ export function ensureBackupDir(dir: string): void {
   if ((st.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
 }
 
-/** Copies the file stores under the lock. Returns the copied files (relative POSIX paths) and the skipped count. */
-async function copyFileRoots(dataDir: string, out: string): Promise<{ files: string[]; skipped: number }> {
+/**
+ * Files the database points at, by store (relative POSIX paths under DATA_DIR, e.g. `files/<user>/<conv>/<name>`).
+ * Empty today — no table references a file yet (attachments, artifacts and sources live in the database). A new file
+ * store adds its query here: the backup then refuses to finish when one of these files is missing.
+ */
+export const FILE_REFERENCES: ((db: Database.Database) => string[])[] = [];
+
+const isMissing = (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOENT";
+
+/**
+ * Copies the file stores under the lock. Returns the copied files (relative POSIX paths) and the skipped count.
+ * Only one thing may be absent: a file that vanished during the walk (ENOENT) and that the snapshot does not
+ * reference — deleted after the snapshot. Any other error (EIO, EACCES …) fails the whole backup.
+ */
+async function copyFileRoots(
+  dataDir: string,
+  out: string,
+  referenced: ReadonlySet<string>,
+  beforeCopy?: (rel: string) => Promise<void>,
+): Promise<{ files: string[]; skipped: number }> {
   const files: string[] = [];
   let skipped = 0;
+  const needed = (rel: string) => [...referenced].some((r) => r === rel || r.startsWith(`${rel}/`));
   const walk = async (rel: string) => {
     const src = path.join(dataDir, rel);
-    const st = await fs.promises.lstat(src).catch(() => undefined);
-    if (!st) return;
+    let st: fs.Stats;
+    try {
+      st = await fs.promises.lstat(src);
+    } catch (e) {
+      if (isMissing(e) && !needed(rel)) return;
+      throw e;
+    }
     if (st.isDirectory()) {
+      let names: string[];
+      try {
+        names = await fs.promises.readdir(src);
+      } catch (e) {
+        if (isMissing(e) && !needed(rel)) return;
+        throw e;
+      }
       await fs.promises.mkdir(path.join(out, rel), { mode: 0o700 });
-      for (const name of (await fs.promises.readdir(src)).sort()) await walk(path.posix.join(rel, name));
+      for (const name of names.sort()) await walk(path.posix.join(rel, name));
     } else if (st.isFile()) {
       const dest = path.join(out, rel);
-      // APFS clone when possible (instant, no extra space until either side changes), else a plain copy.
-      await fs.promises.copyFile(src, dest, fs.constants.COPYFILE_FICLONE);
+      await beforeCopy?.(rel);
+      try {
+        // APFS clone when possible (instant, no extra space until either side changes), else a plain copy.
+        await fs.promises.copyFile(src, dest, fs.constants.COPYFILE_FICLONE);
+      } catch (e) {
+        if (isMissing(e) && !needed(rel)) return;
+        throw e;
+      }
       await fs.promises.chmod(dest, 0o600);
       files.push(rel);
     } else skipped++;
   };
   for (const root of BACKUP_FILE_ROOTS) await walk(root);
+  const copied = new Set(files);
+  for (const r of referenced) if (!copied.has(r)) throw new BackupError("backup_failed");
   return { files, skipped };
 }
 
@@ -164,6 +203,10 @@ export type CreateBackupOptions = {
   now: () => number;
   /** Tests: runs between the database snapshot and the file copy, with the lock held. */
   afterDbSnapshot?: () => Promise<void>;
+  /** Tests: runs before each file is copied. */
+  beforeCopy?: (rel: string) => Promise<void>;
+  /** Files the snapshot references (default `FILE_REFERENCES`). */
+  referencedFiles?: (db: Database.Database) => string[];
 };
 
 /** Makes one backup. Visible under its id only once complete (written as `.tmp-…`, then renamed). */
@@ -183,8 +226,13 @@ export async function createBackup(o: CreateBackupOptions): Promise<BackupInfo> 
       // One statement, one read transaction: the snapshot is the database at a single point in time whatever
       // other connections write meanwhile. It is a fresh file — deleted rows are not left behind in free pages.
       o.sqlite.prepare("VACUUM INTO ?").run(dbFile);
+      // Same moment as the snapshot: nothing in this process runs between the two statements, and no other
+      // process writes the database while the server holds the data folder's lock.
+      const referenced = new Set(
+        o.referencedFiles ? o.referencedFiles(o.sqlite) : FILE_REFERENCES.flatMap((q) => q(o.sqlite)),
+      );
       await o.afterDbSnapshot?.();
-      return copyFileRoots(o.dataDir, tmp);
+      return copyFileRoots(o.dataDir, tmp, referenced, o.beforeCopy);
     });
     // A standalone file: rollback journal, so a later read-only open needs no -wal/-shm next to it.
     const snap = new Database(dbFile);
@@ -274,15 +322,14 @@ export function listBackups(backupDir: string): BackupInfo[] {
 }
 
 /**
- * Retention: every backup made `RETENTION_DAYS` or more ago is deleted — except the newest valid one, so a run of
- * failed backups never leaves none. Returns how many were deleted.
+ * Retention: every backup made `RETENTION_DAYS` or more ago is deleted — the newest one too. Deleted data must
+ * leave the backups within the window even when new backups keep failing (then none may remain: the admins are
+ * notified of every failure, and loudly when no backup is left). Returns how many were deleted.
  */
 export function pruneBackups(backupDir: string, now: number, days = RETENTION_DAYS): number {
-  const all = listBackups(backupDir);
-  const keep = all.find((b) => b.valid)?.id;
   let deleted = 0;
-  for (const b of all) {
-    if (b.id === keep || now - b.createdAt < days * DAY_MS) continue;
+  for (const b of listBackups(backupDir)) {
+    if (now - b.createdAt < days * DAY_MS) continue;
     fs.rmSync(path.join(backupDir, b.id), { recursive: true, force: true });
     deleted++;
   }
@@ -310,7 +357,15 @@ export type BackupServiceOptions = {
   /** A missed backup (server off at 03:30) runs this long after start when the newest one is a day old. */
   catchUpMs?: number;
   afterDbSnapshot?: () => Promise<void>;
+  beforeCopy?: (rel: string) => Promise<void>;
+  referencedFiles?: (db: Database.Database) => string[];
 };
+
+/** Admin notification texts (system_warning) — fixed, codes only. */
+export const BACKUP_FAILED_MESSAGE = (code: BackupCode) =>
+  `백업에 실패했어요 (${code}) — 관리자 → 백업에서 디스크와 백업 폴더를 확인하세요.`;
+export const NO_BACKUPS_MESSAGE =
+  "백업이 하나도 남지 않았어요 — 7일 넘게 실패해 모두 만료됐어요. 지금 디스크와 BACKUP_DIR을 확인하세요.";
 
 /** Backup runs (scheduled and "지금 백업"), one at a time, plus retention. */
 export class BackupService {
@@ -329,6 +384,8 @@ export class BackupService {
       masterKey: Buffer;
       lock: FileWriteLock;
       log?: EventLogger;
+      /** Tells every active admin (system_warning). */
+      notifyAdmins?: (message: string) => void;
     },
     private readonly opts: BackupServiceOptions = {},
   ) {
@@ -355,12 +412,15 @@ export class BackupService {
           ...this.deps,
           now: this.now,
           ...(this.opts.afterDbSnapshot ? { afterDbSnapshot: this.opts.afterDbSnapshot } : {}),
+          ...(this.opts.beforeCopy ? { beforeCopy: this.opts.beforeCopy } : {}),
+          ...(this.opts.referencedFiles ? { referencedFiles: this.opts.referencedFiles } : {}),
         });
-        const pruned = pruneBackups(this.deps.backupDir, this.now());
-        if (pruned) logEvent(this.deps.log, "info", "backup.pruned", { count: pruned });
         return { ok: true as const, item };
       } catch (e) {
         return { ok: false as const, code: e instanceof BackupError ? e.code : ("backup_failed" as const) };
+      } finally {
+        // Whatever the outcome: expiry never waits for a successful backup.
+        this.prune();
       }
     })();
     this.running = work;
@@ -374,15 +434,37 @@ export class BackupService {
         durationMs: this.now() - started,
         ...(r.ok ? { count: r.item.fileCount } : {}),
       });
+      if (!r.ok) this.warnAdmins(r.code);
       return r;
     } finally {
       this.running = undefined;
     }
   }
 
+  /** Deletes expired backups (after every run and at start). Never throws. */
+  prune(): void {
+    try {
+      const pruned = pruneBackups(this.deps.backupDir, this.now());
+      if (pruned) logEvent(this.deps.log, "info", "backup.pruned", { count: pruned });
+    } catch (e) {
+      logEvent(this.deps.log, "error", "backup.pruned", { err: e });
+    }
+  }
+
+  private warnAdmins(code: BackupCode): void {
+    try {
+      this.deps.notifyAdmins?.(BACKUP_FAILED_MESSAGE(code));
+      if (!this.list().some((b) => b.valid)) this.deps.notifyAdmins?.(NO_BACKUPS_MESSAGE);
+    } catch {
+      // a notification never breaks the backup service
+    }
+  }
+
   /** Schedules the daily backup (and a catch-up when the newest backup is more than a day old). */
   start(): void {
     if (this.stopped) return;
+    // A server that was off for a while: expired backups go now, not after the next backup.
+    this.prune();
     const now = this.now();
     let at = nextRunAt(now, this.opts.timeZone);
     const newest = this.list().find((b) => b.valid);

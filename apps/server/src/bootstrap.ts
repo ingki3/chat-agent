@@ -2,6 +2,8 @@ import fs from "node:fs";
 import { createMasterKey, loadMasterKey } from "./crypto/secrets.js";
 import { openDb, runMigrations, type Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
+import { recoverInterruptedRestore, type RecoveryOutcome } from "./backup/restore.js";
+import { acquireDataLock } from "./storage/data-lock.js";
 import { ensureLayout, type StoragePaths } from "./storage/paths.js";
 import type { Config } from "./config.js";
 
@@ -29,16 +31,21 @@ export function initStorage(config: Config): Storage {
 }
 
 /**
- * Marks the data folder as served by this process (`server.pid`, mode 600) so `pnpm restore` refuses to replace it
- * underneath (#37). A file left by a crashed server names a dead pid and is simply overwritten. Returns the release.
+ * The server's start (index.ts): takes the data folder's lock first (#37 — a second server, or one started during a
+ * restore, refuses here, before the database is opened), finishes a restore that was interrupted mid-swap, then
+ * opens storage. The lock is held until `release()` (server shutdown).
  */
-export function claimDataDir(paths: StoragePaths): () => void {
-  fs.writeFileSync(paths.serverPid, `${process.pid}\n`, { mode: 0o600 });
-  return () => {
-    try {
-      if (fs.readFileSync(paths.serverPid, "utf8").trim() === String(process.pid)) fs.rmSync(paths.serverPid);
-    } catch {
-      // already gone
-    }
-  };
+export function openServerStorage(config: Config): {
+  storage: Storage;
+  recovered: RecoveryOutcome;
+  release: () => void;
+} {
+  const lock = acquireDataLock(config.dataDir, "server");
+  try {
+    const recovered = recoverInterruptedRestore(config.dataDir);
+    return { storage: initStorage(config), recovered, release: lock.release };
+  } catch (e) {
+    lock.release();
+    throw e;
+  }
 }

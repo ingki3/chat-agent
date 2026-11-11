@@ -418,6 +418,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
               masterKey,
               lock: app.fileWrites,
               log: app.log,
+              // Every failure, and an empty backup folder, reach the admins (#34 inbox and push).
+              notifyAdmins: (message) => {
+                for (const admin of connectionStore.admins())
+                  notifications.publish(admin, { kind: "system_warning", message, url: "/admin?tab=backup" });
+              },
             },
             opts.backup,
           )

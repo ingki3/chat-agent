@@ -2,16 +2,21 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { BackupsResponse, CSRF_HEADER } from "@agentlee/shared";
 import { buildApp, type BuildOptions } from "../src/app.js";
-import { initStorage } from "../src/bootstrap.js";
+import { initStorage, openServerStorage } from "../src/bootstrap.js";
 import { loadConfig, REPO_ROOT } from "../src/config.js";
-import { createMasterKey, loadMasterKey } from "../src/crypto/secrets.js";
+import { createMasterKey, encrypt, loadMasterKey } from "../src/crypto/secrets.js";
+import { MIGRATIONS_DIR, openDb } from "../src/db/client.js";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import {
   BACKUP_CODES,
+  createBackup,
   DB_FILE,
   MANIFEST_FILE,
   nextRunAt,
@@ -20,12 +25,21 @@ import {
   type Manifest,
 } from "../src/backup/backup.js";
 import { FileWriteLock } from "../src/backup/lock.js";
-import { restoreBackup, RestoreError, verifyBackup, type RestoreCode } from "../src/backup/restore.js";
-import { checkSchema, codeMigrations } from "../src/backup/schema.js";
+import {
+  recoverInterruptedRestore,
+  restoreBackup,
+  RestoreError,
+  restoreJournalPath,
+  verifyBackup,
+  type RestoreCode,
+} from "../src/backup/restore.js";
+import { appliedMigrations, checkSchema, codeMigrations } from "../src/backup/schema.js";
 import { BACKUP_CODES as LOGGABLE_BACKUP_CODES } from "../src/observability/policy.js";
 import { RuntimeFailure, RuntimeRegistry, type StartContext } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
+import { acquireDataLock, dataLockPath, DataLockHeld } from "../src/storage/data-lock.js";
 import { storagePaths } from "../src/storage/paths.js";
+import { processIdentity } from "../src/storage/process-identity.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 type App = Awaited<ReturnType<typeof buildApp>>;
@@ -269,7 +283,7 @@ describe("rehearsal: restore into a separate folder with the recovered key (#37 
       target,
       key: loadMasterKey(recoveredKey),
       backupDir: L.backupDir,
-      masterKeyPath: recoveredKey,
+      keyPaths: [recoveredKey],
     });
     expect(r).toMatchObject({ pending: 0, previous: undefined });
     // Owner-only, like a fresh data folder.
@@ -432,10 +446,15 @@ describe("restore refuses clearly and changes nothing (#37)", () => {
     fs.writeFileSync(path.join(escape, MANIFEST_FILE), JSON.stringify(m));
     expect(restoreCode(() => restoreBackup({ backup: escape, target, key: t.key }))).toBe("manifest_invalid");
     nothingWritten(t.root, target);
-    // A server still serving the target (its pid file names a live process).
+    // A server still holding the target's lock (a live process — the real cross-process case is below).
     fs.mkdirSync(target, { mode: 0o700 });
-    fs.writeFileSync(path.join(target, "server.pid"), `${process.ppid}\n`);
+    const ppid = processIdentity(process.ppid)!;
+    fs.writeFileSync(
+      dataLockPath(target),
+      JSON.stringify({ pid: process.ppid, lstart: ppid.lstart, kind: "server", at: 0 }),
+    );
     expect(restoreCode(() => restoreBackup({ backup: t.backup, target, key: t.key }))).toBe("server_running");
+    fs.rmSync(dataLockPath(target));
     // Into the backup folder, or over the key: refused.
     expect(
       restoreCode(() =>
@@ -453,7 +472,7 @@ describe("restore refuses clearly and changes nothing (#37)", () => {
           backup: t.backup,
           target: path.dirname(t.keyPath),
           key: t.key,
-          masterKeyPath: t.keyPath,
+          keyPaths: [t.keyPath],
         }),
       ),
     ).toBe("target_unsafe");
@@ -525,12 +544,11 @@ describe("what a backup holds (#37)", () => {
     );
   });
 
-  it("leaves out runtime folders, the login quarantine, skills, temp files and the pid file", async () => {
+  it("leaves out runtime folders, the login quarantine, skills and temp files", async () => {
     const L = layout();
     createMasterKey(L.keyPath);
     const one = await start(L);
     const f = await createFamily(one.app);
-    const p = storagePaths(L.dataDir);
     for (const [rel, text] of [
       ["runtimes/conn-1/user-1/config/session.json", "RUNTIME-STATE"],
       ["runtimes/logins/login-1/codex-home/auth.json", "LOGIN-TOKENS"],
@@ -541,7 +559,6 @@ describe("what a backup holds (#37)", () => {
       fs.mkdirSync(path.dirname(path.join(L.dataDir, rel)), { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(L.dataDir, rel), text, { mode: 0o600 });
     }
-    fs.writeFileSync(p.serverPid, "1\n");
     const id = await backupNow(one.app, f.cookies.admin);
     const rels = walk(path.join(L.backupDir, id)).map((x) => path.relative(path.join(L.backupDir, id), x));
     expect(rels.filter((r) => fs.statSync(path.join(L.backupDir, id, r)).isFile()).sort()).toEqual(
@@ -678,7 +695,7 @@ describe("retention: 7 days (#37 완료 기준)", () => {
     expect(holders()).toEqual([]);
   });
 
-  it("keeps the newest valid backup even when it is old (failed backups never leave none)", () => {
+  it("expires every backup older than 7 days — the newest and damaged ones too; other folders are left", () => {
     const dir = tmp();
     const make = (id: string, createdAt: number, valid = true) => {
       fs.mkdirSync(path.join(dir, id), { mode: 0o700 });
@@ -702,8 +719,11 @@ describe("retention: 7 days (#37 완료 기준)", () => {
     make("20260102-000000Z-bbbbbb", t0 + DAY);
     make("20260103-000000Z-cccccc", t0 + 2 * DAY, false);
     fs.mkdirSync(path.join(dir, "not-a-backup"));
-    expect(pruneBackups(dir, t0 + 30 * DAY)).toBe(2);
-    expect(fs.readdirSync(dir).sort()).toEqual(["20260102-000000Z-bbbbbb", "not-a-backup"]);
+    make("20260125-000000Z-dddddd", t0 + 24 * DAY);
+    expect(pruneBackups(dir, t0 + 30 * DAY)).toBe(3);
+    expect(fs.readdirSync(dir).sort()).toEqual(["20260125-000000Z-dddddd", "not-a-backup"]);
+    expect(pruneBackups(dir, t0 + 31 * DAY)).toBe(1);
+    expect(fs.readdirSync(dir)).toEqual(["not-a-backup"]);
   });
 });
 
@@ -798,5 +818,459 @@ describe("schedule and admin routes (#37)", () => {
     ]);
     for (const r of recs) expect(JSON.stringify(r)).not.toContain(L.root);
     expect(new Set(BACKUP_CODES)).toEqual(LOGGABLE_BACKUP_CODES);
+  });
+});
+
+// ---- Review round 1 (#37 PR #99) ----
+
+const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "backup", "child.ts");
+const CLI = path.join(REPO_ROOT, "apps", "server", "src", "cli", "restore.ts");
+
+/** A separate Node process running TypeScript (the real lock, the real CLI). */
+function spawnTs(file: string, args: string[], env: Record<string, string> = {}) {
+  const child = spawn(process.execPath, ["--conditions=development", "--import", "tsx", file, ...args], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += String(d)));
+  child.stderr.on("data", (d) => (err += String(d)));
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) =>
+    child.on("exit", (code, signal) => r({ code, signal })),
+  );
+  closers.push(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return {
+    child,
+    exited,
+    out: () => out,
+    err: () => err,
+    waitFor: async (text: string) => {
+      for (let i = 0; i < 1500 && !out.includes(text); i++) {
+        if (child.exitCode !== null) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      if (!out.includes(text)) throw new Error(`child never printed ${text}: ${out} ${err}`);
+    },
+  };
+}
+const tryLock = async (dataDir: string, kind = "server") => {
+  const c = spawnTs(CHILD, ["try-lock", dataDir, kind]);
+  await c.exited;
+  return c.out().trim();
+};
+
+describe("data folder lock across processes (#37 review P1)", () => {
+  it("a second server refuses to start, a restore refuses, and a dead holder's lock is cleared", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const holder = spawnTs(CHILD, ["lock", L.dataDir, "server"]);
+    await holder.waitFor("locked");
+    // Another process: refused, whatever it is.
+    expect(await tryLock(L.dataDir, "server")).toBe("held:server");
+    expect(await tryLock(L.dataDir, "restore")).toBe("held:server");
+    // This process starting a server: refused before the database is opened.
+    const cfg = loadConfig({ NODE_ENV: "test", DATA_DIR: L.dataDir, MASTER_KEY_PATH: L.keyPath });
+    expect(() => openServerStorage(cfg)).toThrow(DataLockHeld);
+    expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
+    // A restore: server_running, nothing written.
+    const backup = await (async () => {
+      const M = layout();
+      createMasterKey(M.keyPath);
+      const one = await start(M);
+      const f = await createFamily(one.app);
+      const id = await backupNow(one.app, f.cookies.admin);
+      await one.close();
+      return { dir: path.join(M.backupDir, id), key: loadMasterKey(M.keyPath) };
+    })();
+    expect(restoreCode(() => restoreBackup({ backup: backup.dir, target: L.dataDir, key: backup.key }))).toBe(
+      "server_running",
+    );
+    expect(fs.existsSync(path.join(L.dataDir, DB_FILE))).toBe(false);
+    // The holder dies without releasing (kill -9): its lock is stale and the next one takes it.
+    holder.child.kill("SIGKILL");
+    await holder.exited;
+    expect(fs.existsSync(dataLockPath(L.dataDir))).toBe(true);
+    expect(await tryLock(L.dataDir)).toBe("acquired");
+    const opened = openServerStorage(cfg);
+    expect(await tryLock(L.dataDir)).toBe("held:server");
+    opened.storage.db.$client.close();
+    opened.release();
+    expect(fs.existsSync(dataLockPath(L.dataDir))).toBe(false);
+  });
+
+  it("a lock whose pid now belongs to another process (other start time) is stale", async () => {
+    const dir = path.join(tmp(), "data");
+    fs.writeFileSync(
+      dataLockPath(dir),
+      JSON.stringify({ pid: process.ppid, lstart: "Thu Jan 1 00:00:00 1970", kind: "server", at: 0 }),
+    );
+    expect(await tryLock(dir)).toBe("acquired");
+    // The same pid with its real start time is live.
+    fs.writeFileSync(
+      dataLockPath(dir),
+      JSON.stringify({
+        pid: process.ppid,
+        lstart: processIdentity(process.ppid)!.lstart,
+        kind: "restore",
+        at: 0,
+      }),
+    );
+    expect(await tryLock(dir)).toBe("held:restore");
+    expect(() => acquireDataLock(dir, "server")).toThrow(DataLockHeld);
+  });
+});
+
+describe("the swap survives a failed rename and a kill (#37 review P1)", () => {
+  async function prepared() {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start(L);
+    const f = await createFamily(one.app);
+    const id = await backupNow(one.app, f.cookies.admin);
+    await one.close();
+    // The live data folder the restore replaces: recognisable old content.
+    fs.writeFileSync(path.join(L.dataDir, "marker"), "old");
+    return { ...L, backup: path.join(L.backupDir, id), key: loadMasterKey(L.keyPath) };
+  }
+  const leftovers = (root: string) =>
+    fs.readdirSync(root).filter((n) => n.includes(".restore-") || n.includes("restore-journal"));
+
+  it("EIO on the second rename: the old folder is put back, nothing else is left", async () => {
+    const t = await prepared();
+    const eio = Object.assign(new Error("EIO"), { code: "EIO" });
+    let renames = 0;
+    expect(() =>
+      restoreBackup({
+        backup: t.backup,
+        target: t.dataDir,
+        key: t.key,
+        hooks: {
+          rename: (from, to) => {
+            if (++renames === 2) throw eio;
+            fs.renameSync(from, to);
+          },
+        },
+      }),
+    ).toThrow("EIO");
+    expect(renames).toBe(2);
+    expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+    expect(leftovers(t.root)).toEqual([]);
+    expect(fs.readdirSync(t.root).filter((n) => n.includes("before-restore"))).toEqual([]);
+    expect(fs.existsSync(dataLockPath(t.dataDir))).toBe(false);
+  });
+
+  for (const step of ["staged", "moved_old"] as const)
+    it(`killed after "${step}": the next server start finishes the restore`, async () => {
+      const t = await prepared();
+      const keyFile = path.join(t.root, "keys", "master.key");
+      const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, keyFile, step]);
+      expect((await c.exited).signal).toBe("SIGKILL");
+      expect(fs.existsSync(restoreJournalPath(t.dataDir))).toBe(true);
+      if (step === "moved_old") expect(fs.existsSync(t.dataDir)).toBe(false);
+      // Server start: takes the dead restore's stale lock, finishes the swap, opens the restored data.
+      const opened = openServerStorage(
+        loadConfig({ NODE_ENV: "test", DATA_DIR: t.dataDir, MASTER_KEY_PATH: t.keyPath }),
+      );
+      try {
+        expect(opened.recovered).toBe("completed");
+        expect(fs.existsSync(path.join(t.dataDir, "marker"))).toBe(false);
+        expect(opened.storage.db.$client.prepare("SELECT count(*) AS n FROM users").get()).toEqual({ n: 4 });
+      } finally {
+        opened.storage.db.$client.close();
+        opened.release();
+      }
+      const aside = fs.readdirSync(t.root).filter((n) => n.startsWith("data.before-restore-"));
+      expect(aside).toHaveLength(1);
+      expect(fs.readFileSync(path.join(t.root, aside[0]!, "marker"), "utf8")).toBe("old");
+      expect(leftovers(t.root)).toEqual([]);
+    });
+
+  it("killed after the old folder moved and the new one is lost: the old folder comes back", async () => {
+    const t = await prepared();
+    const c = spawnTs(CHILD, ["restore", t.backup, t.dataDir, t.keyPath, "moved_old"]);
+    await c.exited;
+    const j = JSON.parse(fs.readFileSync(restoreJournalPath(t.dataDir), "utf8")) as { staging: string };
+    fs.rmSync(j.staging, { recursive: true });
+    // The next restore run recovers first (then fails on its own: wrong key — the data folder is back anyway).
+    expect(
+      restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: crypto.randomBytes(32) })),
+    ).toBe("wrong_key");
+    expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+    expect(leftovers(t.root)).toEqual([]);
+    expect(recoverInterruptedRestore(t.dataDir)).toBe("none");
+  });
+});
+
+describe("file errors fail the backup (#37 review P2)", () => {
+  async function app(backup: BuildOptions["backup"] = {}) {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start({ ...L, backup });
+    const f = await createFamily(one.app);
+    const file = path.join(L.dataDir, "files", "u", "c", "a.txt");
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, "A", { mode: 0o600 });
+    return { ...L, one, f, file };
+  }
+  const post = (t: Awaited<ReturnType<typeof app>>) =>
+    send(t.one.app, t.f.cookies.admin, "POST", "/api/admin/backups");
+
+  it("an unreadable file or folder (EACCES) fails it: nothing listed, nothing left", async () => {
+    for (const target of ["file", "dir"] as const) {
+      const t = await app();
+      const p = target === "file" ? t.file : path.dirname(t.file);
+      fs.chmodSync(p, 0o000);
+      closers.push(() => fs.chmodSync(p, target === "file" ? 0o600 : 0o700));
+      const r = await post(t);
+      expect(r.statusCode, target).toBe(500);
+      expect(r.json()).toEqual({ error: "backup_failed" });
+      expect(fs.readdirSync(t.backupDir)).toEqual([]);
+    }
+  });
+
+  it("a file deleted during the walk: fine when nothing references it, a failure when the snapshot does", async () => {
+    const del = async (rel: string) => {
+      if (rel === "files/u/c/a.txt") fs.rmSync(path.join(t.dataDir, rel));
+    };
+    let referenced: string[] = [];
+    const t = await app({ beforeCopy: async (rel) => del(rel), referencedFiles: () => referenced });
+    const ok = await post(t);
+    expect(ok.statusCode).toBe(201);
+    expect(ok.json<{ item: { fileCount: number } }>().item.fileCount).toBe(0);
+    fs.writeFileSync(t.file, "A", { mode: 0o600 });
+    referenced = ["files/u/c/a.txt"];
+    expect((await post(t)).json()).toEqual({ error: "backup_failed" });
+    // Referenced and present: copied.
+    fs.writeFileSync(t.file, "A", { mode: 0o600 });
+    const t2 = await app({ referencedFiles: () => ["files/u/c/a.txt"] });
+    expect((await post(t2)).json<{ item: { fileCount: number } }>().item.fileCount).toBe(1);
+    // Referenced but never there.
+    const t3 = await app({ referencedFiles: () => ["files/u/c/missing.txt"] });
+    expect((await post(t3)).json()).toEqual({ error: "backup_failed" });
+  });
+});
+
+describe("retention when backups keep failing (#37 review P2)", () => {
+  it("30 days of failures: the deleted conversation leaves every backup, the admins are told each time", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    let clock = Date.UTC(2026, 10, 11, 18, 30);
+    let failing = false;
+    const one = await start({
+      ...L,
+      backup: {
+        now: () => clock,
+        afterDbSnapshot: async () => {
+          if (failing) throw new Error("disk");
+        },
+      },
+    });
+    const f = await createFamily(one.app);
+    const conv = one.app.conversations!.create(f.users.owner.id);
+    one.app.conversations!.append(conv.id, {
+      role: "user",
+      parts: [{ type: "text", text: "GONE-IN-7-DAYS-37" }],
+    });
+    await backupNow(one.app, f.cookies.admin);
+    await send(one.app, f.cookies.owner, "DELETE", `/api/conversations/${conv.id}`);
+    failing = true;
+    const holders = () =>
+      fs
+        .readdirSync(L.backupDir)
+        .filter((id) => fs.readFileSync(path.join(L.backupDir, id, DB_FILE)).includes("GONE-IN-7-DAYS-37"));
+    for (let day = 1; day <= 30; day++) {
+      clock += DAY;
+      expect((await one.app.backups!.run("scheduled")).ok).toBe(false);
+      expect(holders().length, `day ${day}`).toBe(day < 7 ? 1 : 0);
+    }
+    expect(fs.readdirSync(L.backupDir)).toEqual([]);
+    const warnings = (userId: string) =>
+      one.storage.db.$client
+        .prepare("SELECT body, url FROM notifications WHERE user_id = ? AND kind = 'system_warning'")
+        .all(userId) as { body: string; url: string }[];
+    const mine = warnings(f.users.admin.id);
+    expect(mine.filter((n) => n.body.includes("백업에 실패했어요"))).toHaveLength(30);
+    expect(mine.filter((n) => n.body.includes("백업이 하나도 남지 않았어요")).length).toBe(30 - 6);
+    expect(new Set(mine.map((n) => n.url))).toEqual(new Set(["/admin?tab=backup"]));
+    // Members are not told.
+    const member = warnings(f.users.owner.id).map((n) => ({ kind: "system_warning", ...n }));
+    expect(member.filter((n) => n.kind === "system_warning")).toEqual([]);
+  });
+
+  it("a server that was off: expired backups go at start, before any new backup", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    let clock = Date.UTC(2026, 10, 11, 18, 30);
+    const one = await start({ ...L, backup: { now: () => clock } });
+    const f = await createFamily(one.app);
+    await backupNow(one.app, f.cookies.admin);
+    await one.close();
+    clock += 10 * DAY;
+    const two = await start({ ...L, backup: { now: () => clock, schedule: true, catchUpMs: DAY } });
+    await two.app.ready();
+    expect(fs.readdirSync(L.backupDir)).toEqual([]);
+  });
+});
+
+describe("restore checks every secret and upgrades an older schema (#37 review P2/P3)", () => {
+  async function made() {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start(L);
+    const f = await createFamily(one.app);
+    await send(one.app, f.cookies.owner, "POST", "/api/connections", {
+      runtime: "claude-code",
+      authType: "api_key",
+      secret: KEY_SECRET,
+    });
+    // A push subscription row (encrypted with the master key, AAD push:<id>).
+    const session = one.storage.db.$client.prepare("SELECT id FROM sessions LIMIT 1").get() as { id: string };
+    one.storage.db.$client
+      .prepare(
+        "INSERT INTO push_subscriptions (id, user_id, session_id, endpoint_hash, secret, label, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        "push-1",
+        f.users.owner.id,
+        session.id,
+        "h1",
+        encrypt('{"endpoint":"https://push.example/x","keys":{}}', one.storage.masterKey, "push:push-1"),
+        "phone",
+        1,
+      );
+    const id = await backupNow(one.app, f.cookies.admin);
+    await one.close();
+    return { ...L, backup: path.join(L.backupDir, id), key: loadMasterKey(L.keyPath) };
+  }
+
+  it("one bad ciphertext (connection, setting, push subscription) with a good key check: secret_unreadable", async () => {
+    const t = await made();
+    const other = crypto.randomBytes(32);
+    const target = path.join(t.root, "restored");
+    expect(restoreCode(() => verifyBackup(t.backup, t.key))).toBe("ok");
+    const cases: [string, (db: Database.Database) => void][] = [
+      [
+        "connection",
+        (db) => {
+          const c = db.prepare("SELECT id, runtime, auth_type AS a FROM connections").get() as {
+            id: string;
+            runtime: string;
+            a: string;
+          };
+          db.prepare("UPDATE connections SET secret = ?").run(
+            encrypt(KEY_SECRET, other, `connection:${c.id}:${c.runtime}:${c.a}`),
+          );
+        },
+      ],
+      [
+        "setting",
+        (db) =>
+          db
+            .prepare("UPDATE settings SET value = ? WHERE key = 'push.vapid.private' AND encrypted = 1")
+            .run(encrypt("x", other, "setting:push.vapid.private")),
+      ],
+      [
+        "push",
+        (db) =>
+          db
+            .prepare("UPDATE push_subscriptions SET secret = ? WHERE id = 'push-1'")
+            .run(encrypt("{}", other, "push:push-1")),
+      ],
+    ];
+    for (const [name, change] of cases) {
+      const copy = path.join(t.root, `bad-${name}`);
+      fs.cpSync(t.backup, copy, { recursive: true });
+      tamperDb(copy, change);
+      expect(
+        restoreCode(() => restoreBackup({ backup: copy, target, key: t.key })),
+        name,
+      ).toBe("secret_unreadable");
+      expect(fs.existsSync(target)).toBe(false);
+    }
+  });
+
+  it("a backup of an older schema is restored and upgraded to this code's schema", async () => {
+    const root = tmp();
+    // A database made by an older build: only the first migrations (before 0015's initial_defaults).
+    const code = codeMigrations();
+    const older = path.join(root, "older-migrations");
+    fs.cpSync(MIGRATIONS_DIR, older, { recursive: true });
+    const journalFile = path.join(older, "meta", "_journal.json");
+    const journal = JSON.parse(fs.readFileSync(journalFile, "utf8")) as { entries: { tag: string }[] };
+    journal.entries = journal.entries.filter((e) => !e.tag.startsWith("0015_"));
+    fs.writeFileSync(journalFile, JSON.stringify(journal));
+    const dataDir = path.join(root, "data");
+    fs.mkdirSync(dataDir, { mode: 0o700 });
+    const db = openDb(path.join(dataDir, DB_FILE));
+    migrate(db, { migrationsFolder: older });
+    db.$client
+      .prepare(
+        "INSERT INTO users (id, email, name, role, default_runtime) VALUES ('u1', 'u1@x', 'u1', 'member', 'codex')",
+      )
+      .run();
+    const key = crypto.randomBytes(32);
+    const backupDir = path.join(root, "backups");
+    const made = await createBackup({
+      sqlite: db.$client,
+      dataDir,
+      backupDir,
+      masterKey: key,
+      lock: new FileWriteLock(),
+      now: Date.now,
+    });
+    db.$client.close();
+    expect(made.migrations).toBe(code.length - 1);
+    const target = path.join(root, "restored");
+    const r = restoreBackup({ backup: path.join(backupDir, made.id), target, key });
+    expect(r.pending).toBe(1);
+    const restored = new Database(path.join(target, DB_FILE), { readonly: true });
+    try {
+      expect(appliedMigrations(restored).map((m) => m.hash)).toEqual(code.map((m) => m.hash));
+      // 0015 ran on the restored data: the old default runtime became the initial defaults.
+      expect(
+        JSON.parse((restored.prepare("SELECT initial_defaults AS d FROM users").get() as { d: string }).d),
+      ).toMatchObject({ runtime: "codex" });
+    } finally {
+      restored.close();
+    }
+  });
+});
+
+describe("the CLI checks the key it actually uses (#37 review P2)", () => {
+  it("--key inside --target is refused and the key stays where it is", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start(L);
+    const f = await createFamily(one.app);
+    const id = await backupNow(one.app, f.cookies.admin);
+    await one.close();
+    const target = path.join(L.root, "rehearsal");
+    fs.mkdirSync(target, { mode: 0o700 });
+    const inside = path.join(target, "master.key");
+    fs.copyFileSync(L.keyPath, inside);
+    fs.chmodSync(inside, 0o600);
+    const env = {
+      NODE_ENV: "development",
+      DATA_DIR: L.dataDir,
+      MASTER_KEY_PATH: L.keyPath,
+      BACKUP_DIR: L.backupDir,
+    };
+    const c = spawnTs(CLI, ["apply", id, "--target", target, "--key", inside], env);
+    const { code } = await c.exited;
+    expect(code, c.err()).toBe(1);
+    expect(c.err()).toContain("restore failed: target_unsafe");
+    expect(fs.readdirSync(target)).toEqual(["master.key"]);
+    // The same command with the key outside works.
+    const ok = spawnTs(
+      CLI,
+      ["apply", id, "--target", path.join(L.root, "rehearsal2"), "--key", L.keyPath],
+      env,
+    );
+    expect((await ok.exited).code, ok.err()).toBe(0);
+    expect(ok.out()).toContain(`restored: ${id}`);
   });
 });

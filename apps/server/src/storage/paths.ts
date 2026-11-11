@@ -22,11 +22,6 @@ export function storagePaths(dataDir: string) {
     /** The server's own skill folder (#21): allow-listed skills copied by `pnpm skills:install`. */
     skills: path.join(root, "skills"),
     sources: path.join(root, "sources"),
-    /**
-     * The server process's marker (#37): its pid while it runs. `pnpm restore` refuses a data folder whose server is
-     * still running.
-     */
-    serverPid: path.join(root, "server.pid"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>
