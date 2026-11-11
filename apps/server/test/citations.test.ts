@@ -199,6 +199,23 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("지난달 신규 가입자는 3", "지난달 신규 가입자는 3명이었다.")).toBe(false); // 명 is not a particle
     expect(found("올해의 기준은 10", "올해의 기준은 10월이다.")).toBe(false); // 월 is not a particle
     expect(found("수출 증가율은 무려 32", "수출 증가율은 무려 32로 집계됐다.")).toBe(true); // 로 after a digit
+    // Round 7: a number in Korean numerals is a number too.
+    expect(found("총 투자 금액은 천", "총 투자 금액은 천만 달러입니다.")).toBe(false);
+    expect(found("지난달 신규 가입자는 십", "지난달 신규 가입자는 십만 명이다.")).toBe(false);
+    expect(found("해당 제품의 가격은 삼", "해당 제품의 가격은 삼만 원이다.")).toBe(false);
+    expect(found("지난달 신규 가입자는 이십", "지난달 신규 가입자는 이십만 명이다.")).toBe(false);
+    expect(found("이십", "이십만 명")).toBe(false); // too short anyway
+    expect(found("총 투자 금액은 천만", "총 투자 금액은 천만 달러입니다.")).toBe(true);
+    // …but a numeral syllable inside a word is not a number: 이 after 출 stays the particle's host.
+    expect(found("늘어난 것은 오직 수출이", "늘어난 것은 오직 수출이만 해당한다.")).toBe(true);
+    expect(found("주요 수입 대상은 국가", "주요 수입 대상은 국가만 해당한다.")).toBe(true);
+    expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true);
+    // Round 7, accepted limitation: right after a number, 만 ("only") cannot be told from the unit, so the quote is
+    // rejected (⚠️) — a false "verified" on an amount would be worse.
+    expect(found("운영 환경에서는 Python 3.12", "운영 환경에서는 Python 3.12만 지원합니다.")).toBe(false);
+    expect(found("이번 배포에서는 HTTP/2", "이번 배포에서는 HTTP/2만 허용합니다.")).toBe(false);
+    expect(found("방화벽에서는 포트 443", "방화벽에서는 포트 443만 허용합니다.")).toBe(false);
+    expect(found("운영 환경에서는 Python 3.12만", "운영 환경에서는 Python 3.12만 지원합니다.")).toBe(true);
     // 만 after a word (not a number) is still the particle.
     expect(found("이 계획은 자금", "이 계획은 자금만 있으면 된다.")).toBe(true);
     // Not a particle, or a particle that runs on into more of the word.

@@ -30,6 +30,7 @@ const QUOTES = /["'`´‘’‚‛“”„‟«»‹›「」『』〝〞〟＂
 const DASHES = /[‐‑‒–—―−]/gu;
 const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/gu;
 const DIGIT = /\p{N}/u;
+const LETTER = /[\p{L}\p{M}]/u;
 /**
  * A character that belongs to a token: letter, digit or mark. That covers modifier letters (`ʰ`, \p{Lm} ⊂ \p{L}),
  * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
@@ -120,7 +121,22 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
   "u",
 );
 const PARTICLE_LOOKAHEAD = 7;
-/** Korean numeral units: after a digit they continue the number (`10만`, `3억`, `2조`). */
+/**
+ * Whether the quote ends with a number written in Korean numerals (`천`, `십`, `삼`, `이십오`): its trailing run of
+ * numeral characters starts a token — at the quote's start or after a non-letter. So `수출이` (이 after 출) is not a number. Native counters (하나,
+ * 둘 …) are not covered.
+ */
+const KOREAN_NUMERAL = /[일이삼사오육칠팔구십백천만억조영공]/u;
+function endsInKoreanNumeral(want: string): boolean {
+  const chars = Array.from(want);
+  let k = chars.length;
+  while (k > 0 && KOREAN_NUMERAL.test(chars[k - 1]!)) k--;
+  if (k === chars.length) return false;
+  // A run that is the whole quote starts a token: the start rule already refused a match after a letter.
+  return k === 0 || !LETTER.test(chars[k - 1]!);
+}
+
+/** Korean numeral units: after a number they continue it (`10만`, `천만`, `3억`, `2조`). */
 const NUMERAL_UNIT = /^[십백천만억조경]$/u;
 const SPACE = /\s/u;
 
@@ -357,7 +373,10 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
     // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
     // After a number, a numeral unit is more of the number, never a particle (`10` is not in `10만 달러`).
-    const endsInNumber = DIGIT.test(last) || (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1))));
+    const endsInNumber =
+      DIGIT.test(last) ||
+      (/[.,]/u.test(last) && DIGIT.test(lastChar(want.slice(0, -1)))) ||
+      endsInKoreanNumeral(want);
     if (endsInNumber && NUMERAL_UNIT.test(after)) continue;
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     const start = from[at]!;
