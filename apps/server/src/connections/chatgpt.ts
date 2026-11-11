@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { logEvent, type EventLogger } from "../logging.js";
 import { safeFetch } from "../isolation/net.js";
 import { RuntimeFailure } from "../runtime/adapter.js";
@@ -165,20 +166,33 @@ export async function refreshChatgptTokens(
   }
   if (r.status === 400 || r.status === 401 || r.status === 403) throw new RuntimeFailure("runtime_auth");
   if (r.status !== 200) throw new RuntimeFailure("runtime_error");
-  let j: { access_token?: unknown; refresh_token?: unknown; id_token?: unknown };
+  let body: unknown;
   try {
-    j = JSON.parse(r.body) as typeof j;
+    body = JSON.parse(r.body);
   } catch {
     throw new RuntimeFailure("runtime_error");
   }
-  if (typeof j.access_token !== "string" || !TOKEN.test(j.access_token))
-    throw new RuntimeFailure("runtime_error");
+  // A malformed answer is a passing failure: nothing is stored, the login stays as it was.
+  const j = RefreshResponse.safeParse(body);
+  if (!j.success) throw new RuntimeFailure("runtime_error");
   return {
-    accessToken: j.access_token,
-    refreshToken: typeof j.refresh_token === "string" && TOKEN.test(j.refresh_token) ? j.refresh_token : null,
-    idToken: typeof j.id_token === "string" ? j.id_token : null,
+    accessToken: j.data.access_token,
+    refreshToken: j.data.refresh_token ?? null,
+    idToken: j.data.id_token ?? null,
   };
 }
+
+/**
+ * The token endpoint's answer. A field that is left out (or `null`, as Codex's own parser reads it) means "not
+ * rotated"; a field that is there but not a token (a number, an empty string, …) makes the whole answer invalid —
+ * keeping the old refresh token after a rotation we failed to read would break the next refresh.
+ */
+const Token = z.string().regex(TOKEN);
+const RefreshResponse = z.object({
+  access_token: Token,
+  refresh_token: Token.nullish(),
+  id_token: Token.nullish(),
+});
 
 /**
  * Refreshes a connection's ChatGPT tokens for a running session and stores the result encrypted with a new

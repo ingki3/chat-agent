@@ -54,3 +54,37 @@ test("a member's ChatGPT login: the device-code option with the one-person warni
   await expect(section.getByLabel("토큰", { exact: true })).toHaveCount(0);
   await expect(section.getByRole("button", { name: "ChatGPT로 로그인" })).toBeVisible();
 });
+
+test("a ChatGPT login the server no longer knows (restart: 404) stops waiting and asks to start again", async ({
+  page,
+}) => {
+  await useAccount(page, SON);
+  const login = {
+    id: crypto.randomUUID(),
+    runtime: "codex",
+    status: "pending",
+    verificationUrl: "https://auth.openai.com/codex/device",
+    userCode: "AB1C-2D3E4",
+    expiresAt: Date.now() + 15 * 60_000,
+    connectionId: null,
+    code: null,
+  };
+  let polls = 0;
+  await page.route("**/api/connections/logins", (route) =>
+    route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ login }) }),
+  );
+  await page.route(`**/api/connections/logins/${login.id}`, (route) => {
+    polls++;
+    return route.fulfill({ status: 404, contentType: "application/json", body: '{"error":"not_found"}' });
+  });
+  await page.goto("/settings");
+  const section = page.locator("#connections");
+  await section.getByLabel("연결 방식").selectOption({ label: "Codex · 내 ChatGPT 계정으로 로그인" });
+  await section.getByRole("button", { name: "ChatGPT로 로그인" }).click();
+  await expect(section.getByTestId("device-code")).toHaveText("AB1C-2D3E4");
+  await expect(section.getByRole("status")).toContainText("더 이상 진행 중이 아니에요", { timeout: 8000 });
+  await expect(section.getByTestId("device-login")).toHaveCount(0);
+  const after = polls;
+  await page.waitForTimeout(4500);
+  expect(polls).toBe(after); // no more polling
+});

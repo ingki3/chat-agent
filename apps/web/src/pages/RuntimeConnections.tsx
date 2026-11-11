@@ -8,6 +8,7 @@ import type {
   SubscriptionLogin,
 } from "@agentlee/shared";
 import { connections, errorText } from "../api.js";
+import { pollStep } from "../login-poll.js";
 
 const KEY = ["connections"] as const;
 
@@ -35,6 +36,7 @@ const LOGIN_END: Record<string, string> = {
   login_expired: "코드가 만료됐어요. 다시 시도해 주세요.",
   login_failed: "로그인이 완료되지 않았어요. 다시 시도해 주세요.",
   login_error: "로그인 중 문제가 생겼어요. 다시 시도해 주세요.",
+  gone: "로그인이 더 이상 진행 중이 아니에요(서버가 다시 시작됐을 수 있어요). ‘ChatGPT로 로그인’을 다시 눌러 주세요.",
 };
 
 /** The FR-11.4 notice, shown wherever a subscription is connected. */
@@ -129,28 +131,38 @@ export function RuntimeConnections({ isAdmin }: { isAdmin: boolean }) {
     },
   });
 
-  // While a login waits: ask the server every 2 s until it has ended.
+  // While a login waits: ask the server every 2 s until it has ended, it is gone (404) or its time is up.
   const { mutate: runTest } = test;
   useEffect(() => {
     if (!pending) return;
     let over = false;
+    const finish = () => {
+      over = true;
+      clearInterval(timer);
+      setPending(undefined);
+    };
+    const handle = (r: Parameters<typeof pollStep>[0]) => {
+      if (over) return;
+      const step = pollStep(r);
+      if (step.kind === "wait") return;
+      finish();
+      if (step.kind === "gone") return setMessage(LOGIN_END.gone);
+      if (step.kind === "expired") return setMessage(LOGIN_END.timeout);
+      const { login, connection } = step.result;
+      if (login.status === "completed" && connection) {
+        setMessage(
+          `${connection.accountEmail ?? "ChatGPT"} 계정으로 로그인했어요. 연결을 테스트하는 중이에요…`,
+        );
+        void qc.invalidateQueries({ queryKey: KEY });
+        runTest(connection.id); // a new login is tested right away
+      } else setMessage(LOGIN_END[login.code ?? login.status] ?? LOGIN_END.login_error);
+    };
     const timer = setInterval(() => {
-      void connections
-        .login(pending.id)
-        .then((r) => {
-          if (over || r.login.status === "pending") return;
-          over = true;
-          clearInterval(timer);
-          setPending(undefined);
-          if (r.login.status === "completed" && r.connection) {
-            setMessage(
-              `${r.connection.accountEmail ?? "ChatGPT"} 계정으로 로그인했어요. 연결을 테스트하는 중이에요…`,
-            );
-            void qc.invalidateQueries({ queryKey: KEY });
-            runTest(r.connection.id); // a new login is tested right away
-          } else setMessage(LOGIN_END[r.login.code ?? r.login.status] ?? LOGIN_END.login_error);
-        })
-        .catch(() => undefined); // a missed poll: the next one asks again
+      const base = { expiresAt: pending.expiresAt };
+      void connections.login(pending.id).then(
+        (result) => handle({ ...base, now: Date.now(), result }),
+        (error: unknown) => handle({ ...base, now: Date.now(), error }),
+      );
     }, 2000);
     return () => {
       over = true;

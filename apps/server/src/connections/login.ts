@@ -15,6 +15,10 @@ type Entry = {
   view: SubscriptionLogin;
   userId: string;
   login?: DeviceLogin;
+  /** Its app-server is still starting (the slot is taken: counted against the limits). */
+  starting?: boolean;
+  /** The user cancelled it (or a newer login of theirs replaced it): never stored, whatever comes back. */
+  cancelRequested?: boolean;
   /** Removed from memory this long after it ended (the page polls for the outcome). */
   endedAt?: number;
 };
@@ -32,6 +36,8 @@ const MAX_ACTIVE = 4;
  */
 export class SubscriptionLoginService {
   private readonly logins = new Map<string, Entry>();
+  /** Starts of one user run one after another (each cancels the one before). */
+  private readonly userStarts = new Map<string, Promise<unknown>>();
   private closed = false;
 
   constructor(
@@ -44,6 +50,8 @@ export class SubscriptionLoginService {
       replaced(id: string): Promise<void>;
       log?: EventLogger | undefined;
       now?: () => number;
+      /** Logins waiting at once, for everyone (each is an app-server process). Default 4. */
+      maxActive?: number;
     },
   ) {}
 
@@ -59,9 +67,29 @@ export class SubscriptionLoginService {
 
   /**
    * Starts a login for `userId` — for a new connection, or `connectionId` (their own Codex login connection) to log
-   * in again. One login per user at a time: an earlier one still waiting is cancelled.
+   * in again. One login per user at a time: an earlier one still waiting is cancelled. Starts of one user are
+   * serialised, and a login takes its slot (per user and against the global limit) before its process starts.
    */
   async start(
+    userId: string,
+    input: { runtime: "codex"; label?: string | undefined; connectionId?: string | undefined },
+  ): Promise<SubscriptionLogin> {
+    const before = this.userStarts.get(userId) ?? Promise.resolve();
+    const mine = before.catch(() => undefined).then(() => this.startNow(userId, input));
+    this.userStarts.set(userId, mine);
+    try {
+      return await mine;
+    } finally {
+      if (this.userStarts.get(userId) === mine) this.userStarts.delete(userId);
+    }
+  }
+
+  /** Logins that hold a slot: waiting for the code, or still starting — not those already cancelled. */
+  private active(): Entry[] {
+    return [...this.logins.values()].filter((e) => e.view.status === "pending" && !e.cancelRequested);
+  }
+
+  private async startNow(
     userId: string,
     input: { runtime: "codex"; label?: string | undefined; connectionId?: string | undefined },
   ): Promise<SubscriptionLogin> {
@@ -86,10 +114,14 @@ export class SubscriptionLoginService {
       )
         throw new ConnectionRuleError(404, "not_found");
     }
-    for (const e of this.logins.values())
-      if (e.userId === userId && e.view.status === "pending") e.login?.cancel();
-    const active = [...this.logins.values()].filter((e) => e.view.status === "pending").length;
-    if (active >= MAX_ACTIVE) throw new ConnectionRuleError(409, "login_busy");
+    // Everything from here to the reservation below is synchronous: no other start can slip in between.
+    for (const e of this.active())
+      if (e.userId === userId) {
+        e.cancelRequested = true;
+        e.login?.cancel();
+      }
+    if (this.active().length >= (this.hooks.maxActive ?? MAX_ACTIVE))
+      throw new ConnectionRuleError(409, "login_busy");
 
     const id = crypto.randomUUID();
     // The login process's folder: inside the connection's own folder when logging in again, else its own.
@@ -106,17 +138,22 @@ export class SubscriptionLoginService {
         connectionId: target?.id ?? null,
         code: null,
       },
+      starting: true,
     };
+    this.logins.set(id, entry); // the slot is taken from now on
     let login: DeviceLogin;
     try {
       login = await this.provider.start(dir);
     } catch (e) {
+      this.logins.delete(id); // the slot is given back
       throw e instanceof LoginEnded ? new ConnectionRuleError(409, "login_unavailable") : e;
     }
-    if (this.closed) {
+    if (this.closed || entry.cancelRequested) {
       login.cancel();
+      this.logins.delete(id);
       throw new ConnectionRuleError(409, "login_unavailable");
     }
+    delete entry.starting;
     entry.login = login;
     entry.view = {
       ...entry.view,
@@ -124,7 +161,6 @@ export class SubscriptionLoginService {
       userCode: login.userCode,
       expiresAt: login.expiresAt,
     };
-    this.logins.set(id, entry);
     logEvent(this.hooks.log, "info", "connection.login_started", {
       userId,
       runtime: input.runtime,
@@ -145,6 +181,9 @@ export class SubscriptionLoginService {
     try {
       const user = this.users.byId(entry.userId);
       if (!user?.active || this.closed) return this.end(entry, "login_error");
+      // Cancel and store have one winner: a cancel that came first means nothing is stored (checked right before
+      // the synchronous write below); a cancel after it finds the login completed.
+      if (entry.cancelRequested) return this.end(entry, "cancelled");
       const credential = serializeCredential(r.credential);
       let c: ConnectionRow;
       if (entry.view.connectionId) {
@@ -214,6 +253,7 @@ export class SubscriptionLoginService {
     if (!e || e.userId !== userId) throw new ConnectionRuleError(404, "not_found");
     const login = e.login;
     if (login && e.view.status === "pending") {
+      e.cancelRequested = true; // from now on nothing of this login is stored (`finish`)
       login.cancel();
       await login.result.catch(() => undefined);
       // `end` runs on the result's own handler; give it its turn.
@@ -225,6 +265,7 @@ export class SubscriptionLoginService {
   /** Server shutdown: every waiting login is cancelled and its folder removed. */
   async close(): Promise<void> {
     this.closed = true;
+    for (const e of this.logins.values()) e.cancelRequested = true;
     const waiting = [...this.logins.values()].flatMap((e) => (e.login ? [e.login] : []));
     for (const l of waiting) l.cancel();
     await Promise.all(waiting.map((l) => l.result.catch(() => undefined)));

@@ -72,6 +72,9 @@ export type DeviceLoginScript = {
     | { success: false; error: string; delayMs?: number };
   /** What `account/read` answers once logged in. */
   account?: Json | null;
+  /** Called when `account/read` arrives; the answer then waits `readDelayMs` (to cancel at that very stage). */
+  onAccountRead?: () => void;
+  readDelayMs?: number;
 };
 
 let seq = 0;
@@ -299,10 +302,15 @@ export function replaySpawn(
             break;
           case "account/read":
             log.authJsonAtRead = fs.existsSync(path.join(codexHome, "auth.json"));
-            reply({
-              account: loginDone ? (o.deviceLogin?.account ?? null) : null,
-              requiresOpenaiAuth: true,
-            });
+            o.deviceLogin?.onAccountRead?.();
+            setTimeout(
+              () =>
+                reply({
+                  account: loginDone ? (o.deviceLogin?.account ?? null) : null,
+                  requiresOpenaiAuth: true,
+                }),
+              o.deviceLogin?.readDelayMs ?? 0,
+            );
             break;
           case "thread/start": {
             threadId = uuid();

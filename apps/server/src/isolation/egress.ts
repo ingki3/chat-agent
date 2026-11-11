@@ -220,8 +220,11 @@ export const CODEX_EGRESS_HOSTS = ["api.openai.com"] as const;
 export const CODEX_CHATGPT_EGRESS_HOSTS = ["chatgpt.com"] as const;
 
 /**
- * Hosts the device-code login process needs (#18, codex-login.ts): `auth.openai.com` (device code, polling, token
- * exchange — checked on 0.165.0: the code request goes there and nowhere else) and `chatgpt.com` (the account
- * read after the login).
+ * Hosts the device-code login process needs (#18, codex-login.ts), both observed on 0.165.0 through this proxy:
+ *  - `auth.openai.com`: the device code (the only host the code request reaches), polling and the token exchange;
+ *  - `chatgpt.com`: once a ChatGPT login is in place, app-server runs "workspace routing discovery" against
+ *    `chatgpt.com` on its own and only then reports `account/login/completed` (its failure ends the login with
+ *    `success: false`); `account/read` does the same. Seen with injected tokens (`codex.test.ts`, macOS, online):
+ *    without `chatgpt.com` a real login could not complete.
  */
 export const CODEX_LOGIN_EGRESS_HOSTS = ["auth.openai.com", "chatgpt.com"] as const;

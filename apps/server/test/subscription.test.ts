@@ -22,6 +22,7 @@ import {
   CODEX_OAUTH_CLIENT_ID,
   credentialFromAuthJson,
   parseCredential,
+  refreshChatgptTokens,
   type TokenPost,
 } from "../src/connections/chatgpt.js";
 import {
@@ -32,7 +33,9 @@ import {
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { codexConnectionFor } from "../src/runtime/codex-config.js";
-import { CodexDeviceLogin } from "../src/runtime/codex-login.js";
+import { CodexDeviceLogin, LoginEnded } from "../src/runtime/codex-login.js";
+import type { DeviceLoginProvider } from "../src/connections/login.js";
+import { spawn } from "node:child_process";
 import { FakeRuntime } from "../src/runtime/fake.js";
 import { CODEX_CHATGPT_EGRESS_HOSTS, CODEX_LOGIN_EGRESS_HOSTS } from "../src/isolation/egress.js";
 import { cx, newLog, replaySpawn, type DeviceLoginScript, type Recording } from "./helpers/codex-replay.js";
@@ -120,10 +123,20 @@ function walkFiles(root: string): string[] {
   return out;
 }
 
-async function start(o: { timeoutMs?: number; recording?: Recording; tokenPost?: TokenPost } = {}) {
+async function start(
+  o: {
+    timeoutMs?: number;
+    recording?: Recording;
+    tokenPost?: TokenPost;
+    dataDir?: string;
+    wrapDevice?: (d: DeviceLoginProvider) => DeviceLoginProvider;
+    maxActiveLogins?: number;
+    isLoginProcess?: (pid: number) => boolean;
+  } = {},
+) {
   const db = createTestDb();
   const log = capture();
-  const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-sub-"));
+  const dataDir = o.dataDir ?? fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-sub-"));
   closers.push(async () => fs.rmSync(dataDir, { recursive: true, force: true }));
   /** What the next device login does (tests change it between logins). */
   const device: { script: DeviceLoginScript } = { script: success() };
@@ -163,11 +176,15 @@ async function start(o: { timeoutMs?: number; recording?: Recording; tokenPost?:
     notifications: { sender: async () => {} },
     subscription: {
       tokenPost,
-      device: new CodexDeviceLogin({
-        executable: "/nonexistent/codex",
-        timeoutMs: o.timeoutMs ?? 5000,
-        spawn: (s) => replaySpawn({}, loginLog, { deviceLogin: device.script })(s),
-      }),
+      device: (o.wrapDevice ?? ((d) => d))(
+        new CodexDeviceLogin({
+          executable: "/nonexistent/codex",
+          timeoutMs: o.timeoutMs ?? 5000,
+          spawn: (s) => replaySpawn({}, loginLog, { deviceLogin: device.script })(s),
+        }),
+      ),
+      ...(o.maxActiveLogins ? { maxActiveLogins: o.maxActiveLogins } : {}),
+      ...(o.isLoginProcess ? { isLoginProcess: o.isLoginProcess } : {}),
     },
   });
   closers.push(() => app.close());
@@ -417,10 +434,41 @@ describe("Codex ChatGPT device-code login (#18, PRD D2 / FR-11.2)", () => {
     const r = await t.owner.post("/api/connections/logins", { runtime: "codex" });
     expect(r.statusCode).toBe(409);
     expect(r.json()).toEqual({ error: "login_unavailable" });
-    t.device.script = { ...success(), userCode: "<script>" };
-    expect((await t.owner.post("/api/connections/logins", { runtime: "codex" })).statusCode).toBe(409);
+    // Exactly the pinned page and code shape: no other path, query or fragment; no other code shape.
+    for (const verificationUrl of [
+      "https://auth.openai.com/authorize?redirect_uri=https://evil.example",
+      "https://auth.openai.com/codex/device?x=1",
+      "https://auth.openai.com/codex/device#x",
+      "https://auth.openai.com/codex/device/",
+      "https://auth.openai.com/codex/devicex",
+      "http://auth.openai.com/codex/device",
+      "https://auth.openai.com.evil.example/codex/device",
+    ]) {
+      t.device.script = { ...success(), verificationUrl };
+      expect(
+        (await t.owner.post("/api/connections/logins", { runtime: "codex" })).statusCode,
+        verificationUrl,
+      ).toBe(409);
+    }
+    for (const userCode of [
+      "<script>",
+      "----",
+      "ABCD-1234",
+      "ABCD-123456",
+      "abcd-12345",
+      "ABCD12345",
+      " ABCD-12345",
+    ]) {
+      t.device.script = { ...success(), userCode };
+      expect((await t.owner.post("/api/connections/logins", { runtime: "codex" })).statusCode, userCode).toBe(
+        409,
+      );
+    }
+
     expect(walkFiles(path.join(t.dataDir, "runtimes"))).toEqual([]);
     expect(r.body.includes("evil.example")).toBe(false);
+    t.device.script = { ...success(), userCode: "AB1C-2D3E4" };
+    expect((await t.owner.post("/api/connections/logins", { runtime: "codex" })).statusCode).toBe(201);
   });
 
   it("one login per user at a time: a new one cancels the one still waiting", async () => {
@@ -764,5 +812,249 @@ describe("ChatGPT credentials (#18)", () => {
     expect(usage.forRun("r1")).toEqual([
       expect.objectContaining({ attempt: 1, inputTokens: 100, outputTokens: 7, costUsd: null }),
     ]);
+  });
+});
+
+describe("subscription login — review #91 round 1", () => {
+  it("a server that died mid-login: the next start removes every left-over login folder and kills its process", async () => {
+    const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-sub-"));
+    // Left behind: a new-login folder with the tokens file and a still running "login process", a re-login
+    // folder inside a connection folder, and things that must stay (a session folder, a symbolic link).
+    const orphan = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+    const bystander = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+    closers.push(async () => {
+      for (const c of [orphan, bystander])
+        try {
+          process.kill(c.pid!, "SIGKILL");
+        } catch {
+          // gone
+        }
+    });
+    const left = (dir: string, pid: number) => {
+      fs.mkdirSync(path.join(dir, "codex-home"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "codex-home", "auth.json"), JSON.stringify(authJson()));
+      fs.writeFileSync(path.join(dir, "login.pid"), String(pid));
+    };
+    const fresh = path.join(dataDir, "runtimes", "logins", "login-0199aaaa-1111");
+    const again = path.join(dataDir, "runtimes", "conn-1", "login-0199aaaa-2222");
+    left(fresh, orphan.pid!);
+    left(again, bystander.pid!);
+    const session = path.join(dataDir, "runtimes", "conn-1", "user-1", "codex-home");
+    fs.mkdirSync(session, { recursive: true });
+    fs.writeFileSync(path.join(session, "state"), "keep");
+    const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-outside-"));
+    closers.push(async () => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outside, "keep"), "keep");
+    fs.symlinkSync(outside, path.join(dataDir, "runtimes", "conn-1", "login-0199aaaa-3333"));
+    const exited = new Promise<void>((r) => orphan.once("exit", () => r()));
+
+    const t = await start({ dataDir, isLoginProcess: (pid) => pid === orphan.pid });
+    await exited; // the left-over login process was killed
+    expect(fs.existsSync(fresh)).toBe(false);
+    expect(fs.existsSync(again)).toBe(false);
+    expect(walkFiles(path.join(dataDir, "runtimes")).filter((p) => p.endsWith("auth.json"))).toEqual([]);
+    expect(fs.readFileSync(path.join(session, "state"), "utf8")).toBe("keep");
+    expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("keep"); // a link is never followed
+    expect(() => process.kill(bystander.pid!, 0)).not.toThrow(); // not a login process: left alone
+    t.noPlaintext();
+
+    // A new login's folders are the owner's only.
+    t.device.script = { userCode: T.code, outcome: "never" };
+    const l = await t.login();
+    const s = t.loginLog.spawns[0]!;
+    const loginDir = path.dirname(s.env.CODEX_HOME!);
+    for (const d of [path.join(dataDir, "runtimes", "logins"), loginDir, s.env.CODEX_HOME!])
+      expect(fs.statSync(d).mode & 0o077, d).toBe(0);
+    expect(fs.statSync(path.join(s.env.CODEX_HOME!, "config.toml")).mode & 0o077).toBe(0);
+    await t.owner.del(`/api/connections/logins/${l.id}`);
+  });
+
+  it("concurrent starts cannot get past the limits: one per user, the global limit, slots given back on failure", async () => {
+    let running = 0;
+    let most = 0;
+    let fail = false;
+    const slow = (d: DeviceLoginProvider): DeviceLoginProvider => ({
+      start: async (dir) => {
+        running++;
+        most = Math.max(most, running);
+        try {
+          await new Promise((r) => setTimeout(r, 30));
+          if (fail) throw new LoginEnded("login_error");
+          return await d.start(dir);
+        } finally {
+          running--;
+        }
+      },
+    });
+    const t = await start({ wrapDevice: slow, maxActiveLogins: 2 });
+    t.device.script = { userCode: T.code, outcome: "never" };
+    // Six at once from one user: started one after another, and only the last one is still waiting.
+    const six = await Promise.all(
+      Array.from({ length: 6 }, () => t.owner.post("/api/connections/logins", { runtime: "codex" })),
+    );
+    expect(six.map((r) => r.statusCode)).toEqual([201, 201, 201, 201, 201, 201]);
+    expect(most).toBe(1);
+    const ids = six.map((r) => SubscriptionLogin.parse(r.json<{ login: unknown }>().login).id);
+    const states = await Promise.all(
+      ids.map(
+        async (id) =>
+          SubscriptionLogin.parse(
+            (await t.owner.get(`/api/connections/logins/${id}`)).json<{ login: unknown }>().login,
+          ).status,
+      ),
+    );
+    for (let i = 0; i < 20 && states.filter((x) => x === "pending").length > 1; i++)
+      await new Promise((r) => setTimeout(r, 20));
+    const final = await Promise.all(
+      ids.map(
+        async (id) =>
+          SubscriptionLogin.parse(
+            (await t.owner.get(`/api/connections/logins/${id}`)).json<{ login: unknown }>().login,
+          ).status,
+      ),
+    );
+    expect(final.filter((x) => x === "pending")).toHaveLength(1);
+    expect(final.at(-1)).toBe("pending");
+    // Three users at once against a global limit of 2 (the owner's one is still waiting): one more gets in.
+    const others = await Promise.all([
+      t.stranger.post("/api/connections/logins", { runtime: "codex" }),
+      t.admin.post("/api/connections/logins", { runtime: "codex" }),
+    ]);
+    expect(others.map((r) => r.statusCode).sort()).toEqual([201, 409]);
+    expect(others.find((r) => r.statusCode === 409)!.json()).toEqual({ error: "login_busy" });
+    // A start that fails gives its slot back: after the owner's failed start, the user who was turned away gets in.
+    await t.owner.del(`/api/connections/logins/${ids.at(-1)}`);
+    fail = true;
+    const failed = await t.owner.post("/api/connections/logins", { runtime: "codex" });
+    expect(failed.statusCode).toBe(409);
+    expect(failed.json()).toEqual({ error: "login_unavailable" });
+    fail = false;
+    const turnedAway = others[0]!.statusCode === 409 ? t.stranger : t.admin;
+    expect((await turnedAway.post("/api/connections/logins", { runtime: "codex" })).statusCode).toBe(201);
+  });
+
+  it("a cancel while the account is being read wins: nothing is handed out, nothing stored", async () => {
+    // The login process itself: the result is "cancelled", not a credential.
+    const log = newLog();
+    const dir = path.join(
+      fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-sub-")),
+      "login-x",
+    );
+    closers.push(async () => fs.rmSync(path.dirname(dir), { recursive: true, force: true }));
+    let cancel: () => void = () => {};
+    const device = new CodexDeviceLogin({
+      executable: "/nonexistent/codex",
+      spawn: (s) =>
+        replaySpawn({}, log, {
+          deviceLogin: { ...success(), onAccountRead: () => cancel(), readDelayMs: 30 },
+        })(s),
+    });
+    const login = await device.start(dir);
+    cancel = login.cancel;
+    await expect(login.result).rejects.toMatchObject({ code: "cancelled" });
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // Through the service and API: the user's cancel at that stage leaves no connection.
+    const t = await start();
+    let loginId = "";
+    t.device.script = {
+      ...success(),
+      onAccountRead: () => void t.owner.del(`/api/connections/logins/${loginId}`),
+      readDelayMs: 30,
+    };
+    loginId = (await t.login()).id;
+    expect((await t.until(loginId)).login).toMatchObject({ status: "cancelled", connectionId: null });
+    expect(t.app.connections!.store.personal(t.f.users.owner.id)).toEqual([]);
+
+    // And when the process hands a credential out regardless, the service still does not store it.
+    const t2 = await start({
+      wrapDevice: (d) => ({
+        start: async (dir2) => {
+          const l = await d.start(dir2);
+          return { ...l, cancel: () => {} }; // a process that ignores the cancel
+        },
+      }),
+    });
+    let id2 = "";
+    t2.device.script = {
+      ...success(),
+      onAccountRead: () => void t2.owner.del(`/api/connections/logins/${id2}`),
+      readDelayMs: 30,
+    };
+    id2 = (await t2.login()).id;
+    expect((await t2.until(id2)).login).toMatchObject({ status: "cancelled" });
+    expect(t2.app.connections!.store.personal(t2.f.users.owner.id)).toEqual([]);
+  });
+
+  it("a malformed refresh answer is a passing failure: runtime_error, the login stays as it was", async () => {
+    const recording: Recording = {
+      hi: [
+        cx.error({ responseStreamDisconnected: { httpStatusCode: 401 } }, true),
+        { $refresh: true },
+        cx.completed("failed", { responseStreamDisconnected: { httpStatusCode: 401 } }),
+      ],
+    };
+    for (const body of [
+      "null",
+      "[]",
+      '"x"',
+      JSON.stringify({ access_token: 5 }),
+      JSON.stringify({ access_token: T.access2, refresh_token: 123 }),
+      JSON.stringify({ access_token: T.access2, refresh_token: "" }),
+      JSON.stringify({ access_token: T.access2, id_token: {} }),
+      "{not json",
+    ]) {
+      const t = await start({ recording });
+      t.setTokenAnswer({ status: 200, body });
+      const { connection } = await t.until((await t.login()).id);
+      t.pass(connection!.id);
+      const run = (await t.send(t.owner, "hi")).json<{ run: Run }>().run;
+      expect(await t.waitRun(run.id), body).toMatchObject({ status: "failed", errorCode: "runtime_error" });
+      expect(t.app.connections!.store.get(connection!.id), body).toMatchObject({
+        status: "passed",
+        credentialVersion: 1,
+      });
+      expect(
+        parseCredential(t.app.connections!.store.subscriptionCredential(connection!.id)!.secret),
+      ).toMatchObject({ accessToken: T.access1, refreshToken: T.refresh1 });
+    }
+  });
+
+  it("refresh answers: a left-out (or null) refresh token keeps the stored one; a present but invalid one is refused", async () => {
+    const post =
+      (body: string): TokenPost =>
+      async () => ({ status: 200, body });
+    await expect(
+      refreshChatgptTokens(T.refresh1, post(JSON.stringify({ access_token: T.access2 }))),
+    ).resolves.toEqual({
+      accessToken: T.access2,
+      refreshToken: null,
+      idToken: null,
+    });
+    await expect(
+      refreshChatgptTokens(
+        T.refresh1,
+        post(JSON.stringify({ access_token: T.access2, refresh_token: null })),
+      ),
+    ).resolves.toMatchObject({ refreshToken: null });
+    await expect(
+      refreshChatgptTokens(
+        T.refresh1,
+        post(JSON.stringify({ access_token: T.access2, refresh_token: T.refresh2 })),
+      ),
+    ).resolves.toMatchObject({ refreshToken: T.refresh2 });
+    for (const body of [
+      "null",
+      JSON.stringify({ access_token: T.access2, refresh_token: 123 }),
+      JSON.stringify({}),
+    ])
+      await expect(refreshChatgptTokens(T.refresh1, post(body)), body).rejects.toMatchObject({
+        code: "runtime_error",
+      });
+    await expect(
+      refreshChatgptTokens(T.refresh1, async () => ({ status: 401, body: "{}" })),
+    ).rejects.toMatchObject({
+      code: "runtime_auth",
+    });
   });
 });

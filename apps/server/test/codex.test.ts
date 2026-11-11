@@ -1109,6 +1109,83 @@ describe.skipIf(!realBin)("Codex adapter (#16): the pinned binary in the sandbox
     60_000,
   );
 
+  it.skipIf(!online)(
+    "why the login process may reach chatgpt.com: with a ChatGPT login in place, app-server itself checks the workspace there (#18)",
+    async () => {
+      const dir = tmp();
+      const p = {
+        codexHome: path.join(dir, "codex-home"),
+        work: path.join(dir, "work"),
+        tmp: path.join(dir, "tmp"),
+      };
+      for (const d of Object.values(p)) fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(p.codexHome, "config.toml"), codexConfigToml({}));
+      const hosts: string[] = [];
+      // Every host is let through here, to see which ones it uses.
+      const egress = new EgressService({
+        allow: ["auth.openai.com", "chatgpt.com", "api.openai.com", "ab.chatgpt.com"],
+        lookup: async (h) => {
+          hosts.push(h);
+          return (await dns.lookup(h, { all: true })).map((a) => a.address);
+        },
+      });
+      const proxy = await egress.endpoint();
+      const child = spawnIsolated({
+        command: realBin!,
+        args: ["app-server", "--strict-config", "--listen", "stdio://"],
+        cwd: p.work,
+        env: { ...codexEnv({ dir }), HTTPS_PROXY: proxy.url, NO_PROXY: "127.0.0.1,localhost" },
+        read: [dir, CA_BUNDLE],
+        write: [p.codexHome, p.tmp],
+        network: { loopbackPorts: [proxy.port] },
+        maxRssBytes: 2 * 1024 ** 3,
+        onStderr: () => {},
+      });
+      let buf = "";
+      const answers = new Map<number, (m: Record<string, unknown>) => void>();
+      const notes: string[] = [];
+      child.stdout.on("data", (d: Buffer) => {
+        buf += d.toString();
+        let i: number;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const m = JSON.parse(buf.slice(0, i)) as { id?: number; method?: string };
+          buf = buf.slice(i + 1);
+          if (m.id !== undefined && m.method)
+            child.stdin.write(JSON.stringify({ id: m.id, error: { code: -32000, message: "no" } }) + "\n");
+          else if (m.id !== undefined) answers.get(m.id)?.(m);
+          else if (m.method) notes.push(m.method);
+        }
+      });
+      const req = (id: number, method: string, params: object) =>
+        new Promise<Record<string, unknown>>((res) => {
+          answers.set(id, res);
+          child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
+        });
+      try {
+        await req(1, "initialize", {
+          clientInfo: { name: "agentlee", title: null, version: "0.1.0" },
+          capabilities: { experimentalApi: true, requestAttestation: false },
+        });
+        child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
+        await req(2, "account/login/start", {
+          type: "chatgptAuthTokens",
+          accessToken: `e30.e30.FAKE${"x".repeat(20)}`,
+          chatgptAccountId: "acct-test",
+          chatgptPlanType: null,
+        });
+        // No request of ours touches the network yet: the check runs on its own, then the login is reported.
+        for (let i = 0; i < 100 && !notes.includes("account/login/completed"); i++)
+          await new Promise((r) => setTimeout(r, 100));
+        expect(notes).toContain("account/login/completed");
+        expect([...new Set(hosts)]).toEqual(["chatgpt.com"]);
+      } finally {
+        child.kill("SIGKILL");
+        await egress.close();
+      }
+    },
+    60_000,
+  );
+
   /** The real binary, sandboxed, against a local fake Responses API and our real MCP server. */
   async function realRun(
     script: Parameters<typeof startFakeResponses>[0],

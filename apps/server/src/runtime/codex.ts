@@ -621,6 +621,11 @@ export class CodexAdapter implements RuntimeAdapter {
     /** Set while a turn runs: ends it as runtime_auth. */
     let onAuthBroken: (() => void) | undefined;
     let refreshes = 0;
+    /**
+     * The last refresh failed for a passing reason (network, a malformed answer): the refusal app-server then
+     * reports is not the login's end — the turn fails `runtime_error` and the connection is not marked expired.
+     */
+    let refreshFailedTransiently = false;
     /** The session's current ChatGPT tokens (a refresh replaces them). */
     let tokens = chatgpt
       ? { accessToken: chatgpt.accessToken, accountId: chatgpt.accountId, planType: chatgpt.planType }
@@ -629,15 +634,20 @@ export class CodexAdapter implements RuntimeAdapter {
       if (!chatgpt) throw new RuntimeFailure("runtime_auth");
       try {
         tokens = await chatgpt.refresh();
+        refreshFailedTransiently = false;
         return tokens;
       } catch (e) {
-        if (!(e instanceof RuntimeFailure) || e.code === "runtime_auth") {
+        // Only the provider refusing the login ends it; anything else (also an unexpected error) is passing.
+        if (e instanceof RuntimeFailure && e.code === "runtime_auth") {
           authBroken = true;
           onAuthBroken?.();
-        }
+        } else refreshFailedTransiently = true;
         throw e;
       }
     };
+    /** The provider refused the credential — unless only our last refresh failed for a passing reason. */
+    const refusedAuth = () =>
+      new RuntimeFailure(refreshFailedTransiently && !authBroken ? "runtime_error" : "runtime_auth");
     /** app-server's `account/chatgptAuthTokens/refresh`: new tokens from the server, a few times per session. */
     const answer = (method: string): Promise<Json> | undefined => {
       if (method !== "account/chatgptAuthTokens/refresh" || !chatgpt) return undefined;
@@ -901,7 +911,7 @@ export class CodexAdapter implements RuntimeAdapter {
                 // A ChatGPT session gets new tokens first (app-server asks for them, `answer`) and retries.
                 if (chatgpt && p.willRetry === true && !authBroken && refreshes < MAX_REFRESHES) return;
                 stop(); // no retries with a credential that is refused
-                return end(new RuntimeFailure("runtime_auth"));
+                return end(refusedAuth());
               }
               if (isLimitError(err.codexErrorInfo) && p.willRetry !== true && !limited) {
                 limited = true;
@@ -932,7 +942,7 @@ export class CodexAdapter implements RuntimeAdapter {
               }
               if (turn.status === "completed") return end();
               if (turn.status === "interrupted" && interrupted) return end();
-              if (isAuthError(turn.error?.codexErrorInfo)) return end(new RuntimeFailure("runtime_auth"));
+              if (isAuthError(turn.error?.codexErrorInfo)) return end(refusedAuth());
               if (limited || limitReached || isLimitError(turn.error?.codexErrorInfo)) {
                 if (!limited) push(LIMIT_EVENT);
                 limited = true;
