@@ -151,6 +151,16 @@ export function registerConversationRoutes(
         .send({ notice: store.consumeFallbackNotice(req.params.id) } satisfies ConsumeFallbackNoticeResponse),
   );
 
+  // "새 결과" seen (#56, FR-8.3): the owner opened the schedule's result conversation. Only the owner's marker.
+  app.post<{ Params: IdParams }>(
+    "/api/conversations/:id/result-seen",
+    { config: conv("write") },
+    async (req, reply) => {
+      store.clearNewResult(req.params.id);
+      return reply.header("Cache-Control", "no-store").send(toConversation(store.get(req.params.id)!));
+    },
+  );
+
   // The chip (#19, FR-3.5): runtime, model, effort or "공용으로 쓰기" of this conversation, from its next message on —
   // a reply being written now keeps what it started with. Not allowed → 403 with the run check's code. The divider
   // is written when the change takes effect (the next reply), see ConversationStore.syncSwitchDivider.

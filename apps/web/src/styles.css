@@ -167,6 +167,10 @@ h2 {
   background: var(--accent-weak);
   color: var(--accent);
 }
+.badge.new-result {
+  flex: none;
+  margin-left: 6px;
+}
 .badge.warn {
   background: var(--warn-weak);
   color: var(--warn);

@@ -36,6 +36,7 @@ test("예약 화면: 새 예약 폼(다음 실행 미리보기) · 일시정지 
   page,
   browser,
   baseURL,
+  isMobile,
 }) => {
   const me = await newMember(browser, baseURL!, "schedform");
   await signIn(page, baseURL!, me);
@@ -66,6 +67,19 @@ test("예약 화면: 새 예약 폼(다음 실행 미리보기) · 일시정지 
   await expect(run).toContainText("바로 실행");
   await expect(run).toContainText("성공", { timeout: 15_000 });
   await expect(run).toContainText("—");
+  // The result is a new message of the schedule's own conversation (#56): "새 결과" in the sidebar until opened.
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "평일 환율" });
+  await expect(conv.getByTestId("new-result")).toBeVisible();
+  if (isMobile) await page.getByRole("button", { name: "메뉴 닫기" }).click();
+  const back = page.url();
+  await page.getByTestId("schedule-conversation").click();
+  await expect(page.getByTestId("user-message")).toContainText("원·달러 환율 알려줘");
+  await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await expect(conv).toBeVisible();
+  await expect(conv.getByTestId("new-result")).toHaveCount(0);
+  await page.goto(back);
 
   // Edit: the name changes, the rest stays.
   await page.getByRole("link", { name: "✎ 수정" }).click();

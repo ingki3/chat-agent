@@ -100,6 +100,11 @@ export const conversations = sqliteTable(
     }>(),
     /** Next message sequence number (per conversation, monotonically increasing). */
     nextSeq: integer("next_seq").notNull().default(1),
+    /**
+     * A schedule's result conversation (#56, FR-8.3): when a run left a result (or a failure) the owner has not
+     * looked at yet — the sidebar's "새 결과". Cleared when the owner opens the conversation.
+     */
+    newResultAt: integer("new_result_at"),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),
   },
@@ -336,10 +341,16 @@ export const notifications = sqliteTable(
     }).notNull(),
     createdAt: integer("created_at").notNull(),
     readAt: integer("read_at"),
+    /**
+     * The publishing point's own key (#56): a second publish with the same key is the first one (a schedule run's
+     * notification, a schedule's connection warning for one occurrence) — exactly once across a crash.
+     */
+    dedupeKey: text("dedupe_key"),
   },
   (t) => [
     index("notifications_user_created_idx").on(t.userId, t.createdAt),
     index("notifications_push_state_idx").on(t.pushState, t.userId),
+    uniqueIndex("notifications_dedupe_idx").on(t.dedupeKey),
   ],
 );
 
@@ -881,6 +892,42 @@ export const scheduleRuns = sqliteTable(
     index("schedule_runs_status_idx").on(t.status),
   ],
 );
+
+/**
+ * One attempt of a schedule run in its result conversation (#56): the turn the attempt started there — written in the
+ * same transaction as its messages (RunManager.begin's `prepare`), so a crash at any point leaves either both or
+ * neither. The first attempt posts the prompt as a user message; the retry regenerates that attempt's reply. No
+ * foreign keys on the conversation side: the row stays when the conversation is deleted (the run's cost, #55).
+ */
+export const scheduleAttempts = sqliteTable(
+  "schedule_attempts",
+  {
+    scheduleRunId: text("schedule_run_id")
+      .notNull()
+      .references(() => scheduleRuns.id, { onDelete: "cascade" }),
+    attempt: integer("attempt").notNull(),
+    conversationId: text("conversation_id").notNull(),
+    userMessageId: text("user_message_id"),
+    assistantMessageId: text("assistant_message_id").notNull(),
+    /** The conversation run (`runs.id`): set right after it was begun (the cost query also finds it by its reply). */
+    chatRunId: text("chat_run_id"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.scheduleRunId, t.attempt] })],
+);
+
+/**
+ * The result a schedule run left in its conversation (#56, FR-8.3·8.6): the reply (success) or the failure message,
+ * stored once per run — `saveResult` finds this row and returns it again after a crash.
+ */
+export const scheduleResults = sqliteTable("schedule_results", {
+  scheduleRunId: text("schedule_run_id")
+    .primaryKey()
+    .references(() => scheduleRuns.id, { onDelete: "cascade" }),
+  conversationId: text("conversation_id"),
+  messageId: text("message_id"),
+  createdAt: integer("created_at").notNull(),
+});
 
 /**
  * A schedule proposed in a conversation (#55, FR-8.1): the `schedule_create` tool stores what it proposes here and

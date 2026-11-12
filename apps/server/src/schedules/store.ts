@@ -67,6 +67,25 @@ export type RunRow = {
   created_at: number;
 };
 
+/** One attempt's turn in the result conversation (#56). */
+export type AttemptRow = {
+  schedule_run_id: string;
+  attempt: number;
+  conversation_id: string;
+  user_message_id: string | null;
+  assistant_message_id: string;
+  chat_run_id: string | null;
+  created_at: number;
+};
+
+/** What a run left in its result conversation (#56): once per run. */
+export type ResultRow = {
+  schedule_run_id: string;
+  conversation_id: string | null;
+  message_id: string | null;
+  created_at: number;
+};
+
 export type NewSchedule = {
   name: string;
   prompt: string;
@@ -291,14 +310,19 @@ export class ScheduleStore {
 
   /**
    * The history with each run's cost (#55, FR-8.5): the priced usage (`priced_cost_micros`, API-key rows only)
-   * recorded under the run's id or its handler's output reference (the conversation run #56 starts) — null when
-   * none is priced.
+   * recorded under the run's id, its handler's output reference, or any conversation run one of its attempts started
+   * (#56: the first attempt's run counts too when the retry answered) — null when none is priced. A set, so a run
+   * named twice is counted once.
    */
   runsWithCost(scheduleId: string, limit = 50): (RunRow & { cost_micros: number | null })[] {
     return this.sql
       .prepare(
         `select r.*, (select sum(u.priced_cost_micros) from usage_records u
-             where u.run_id in (r.id, coalesce(r.output_ref, r.id)) and u.priced_cost_micros is not null)
+             where u.priced_cost_micros is not null and u.run_id in (
+               select r.id union select r.output_ref
+               union select a.chat_run_id from schedule_attempts a where a.schedule_run_id = r.id
+               union select x.id from runs x join schedule_attempts a on x.assistant_message_id = a.assistant_message_id
+                 where a.schedule_run_id = r.id))
            as cost_micros
          from schedule_runs r where r.schedule_id = ? order by r.scheduled_at desc, r.created_at desc limit ?`,
       )
@@ -307,6 +331,69 @@ export class ScheduleStore {
 
   run(id: string): RunRow | undefined {
     return this.sql.prepare(`select * from schedule_runs where id = ?`).get(id) as RunRow | undefined;
+  }
+
+  // ---- the result conversation (#56) ----
+
+  attempts(runId: string): AttemptRow[] {
+    return this.sql
+      .prepare(`select * from schedule_attempts where schedule_run_id = ? order by attempt`)
+      .all(runId) as AttemptRow[];
+  }
+
+  /** Called inside RunManager.begin's transaction: the attempt and its messages are written together. */
+  recordAttempt(a: Omit<AttemptRow, "chat_run_id">): void {
+    this.sql
+      .prepare(
+        `insert into schedule_attempts (schedule_run_id, attempt, conversation_id, user_message_id,
+           assistant_message_id, created_at) values (?, ?, ?, ?, ?, ?)
+         on conflict (schedule_run_id, attempt) do nothing`,
+      )
+      .run(
+        a.schedule_run_id,
+        a.attempt,
+        a.conversation_id,
+        a.user_message_id,
+        a.assistant_message_id,
+        a.created_at,
+      );
+  }
+
+  setAttemptRun(runId: string, attempt: number, chatRunId: string): void {
+    this.sql
+      .prepare(`update schedule_attempts set chat_run_id = ? where schedule_run_id = ? and attempt = ?`)
+      .run(chatRunId, runId, attempt);
+  }
+
+  result(runId: string): ResultRow | undefined {
+    return this.sql.prepare(`select * from schedule_results where schedule_run_id = ?`).get(runId) as
+      ResultRow | undefined;
+  }
+
+  /** The run's result, once: false when one was stored already (then nothing changes). */
+  recordResult(r: ResultRow): boolean {
+    return (
+      this.sql
+        .prepare(
+          `insert into schedule_results (schedule_run_id, conversation_id, message_id, created_at)
+           values (?, ?, ?, ?) on conflict (schedule_run_id) do nothing`,
+        )
+        .run(r.schedule_run_id, r.conversation_id, r.message_id, r.created_at).changes === 1
+    );
+  }
+
+  /** Active schedules whose next occurrence is in (from, to] — the connection warning's look-ahead (#56). */
+  upcomingBetween(from: number, to: number): ScheduleRow[] {
+    return this.sql
+      .prepare(
+        `select * from schedules where paused = 0 and next_run_at is not null and next_run_at > ? and next_run_at <= ?`,
+      )
+      .all(from, to) as ScheduleRow[];
+  }
+
+  /** Runs `fn` in one immediate transaction (the handler's find-or-create steps). */
+  transaction<T>(fn: () => T): T {
+    return this.sql.transaction(fn).immediate();
   }
 
   // ---- the engine's operations ----

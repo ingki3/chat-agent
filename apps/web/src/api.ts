@@ -292,6 +292,9 @@ export const conversations = {
     ).notice,
   rename: async (id: string, title: string) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { title })),
+  /** The schedule result conversation was opened (#56): its "새 결과" goes. */
+  resultSeen: async (id: string) =>
+    Conversation.parse(await call("POST", `/api/conversations/${enc(id)}/result-seen`, {})),
   pin: async (id: string, pinned: boolean) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { pinned })),
   /** 자료 조사 모드 (FR-5.5, #25): the next reply of this conversation gets the research instructions. */

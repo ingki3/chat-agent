@@ -24,6 +24,19 @@ export type PublishInput =
     }
   | { kind: "schedule_failed"; scheduleName: string; reason: string; url: string; ref?: ResourceRefInput }
   | {
+      /**
+       * The schedule's next run would find no usable runtime connection (#56, FR-11.8): said before it (an hour
+       * ahead). `runtimeLabel` is the runtime's fixed name; `at` the occurrence, shown in the schedule's time zone.
+       */
+      kind: "schedule_warning";
+      scheduleName: string;
+      runtimeLabel: string;
+      at: number;
+      timeZone: string;
+      url: string;
+      ref?: ResourceRefInput;
+    }
+  | {
       /** A family member shared something with the recipient (#29/#52). No content — only who and the title. */
       kind: "share_received";
       fromName: string;
@@ -114,6 +127,17 @@ export function safePath(url: string | undefined): string {
   }
 }
 
+/** "오전 8:00" in the schedule's zone (a bad zone: Seoul). */
+function clock(at: number, timeZone: string): string {
+  const fmt = (tz: string) =>
+    new Intl.DateTimeFormat("ko-KR", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(at);
+  try {
+    return fmt(timeZone);
+  } catch {
+    return fmt("Asia/Seoul");
+  }
+}
+
 const won = (n: number) => `$${n.toFixed(2)}`;
 
 export function compose(input: PublishInput): Composed {
@@ -130,6 +154,16 @@ export function compose(input: PublishInput): Composed {
         kind: input.kind,
         title: oneLine(input.scheduleName),
         body: twoLines(`실행 실패 — ${oneLine(input.reason, LINE_MAX)}`),
+        url: safePath(input.url),
+      };
+    case "schedule_warning":
+      return {
+        kind: input.kind,
+        title: oneLine(input.scheduleName),
+        body: twoLines(
+          `${clock(input.at, input.timeZone)} 실행 전에 확인해 주세요 — ${oneLine(input.runtimeLabel, 30)} 연결을 쓸 수 없어요.\n` +
+            "다시 연결하거나 예약의 런타임을 바꿔 주세요.",
+        ),
         url: safePath(input.url),
       };
     case "share_received":

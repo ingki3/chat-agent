@@ -76,6 +76,7 @@ export function toConversation(c: ConversationRow): Conversation {
     researchMode: c.researchMode,
     settings: settingsOf(c),
     fallbackNotice: noticeOf(c.fallbackNotice),
+    newResult: c.newResultAt !== null && c.newResultAt !== undefined,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -173,6 +174,7 @@ export class ConversationStore {
       useShared: opts.settings?.useShared ?? false,
       fallbackNotice: opts.settings && opts.fallback ? noticeFor(opts.settings, opts.limitedUntil) : null,
       nextSeq: 1,
+      newResultAt: null,
       createdAt: t,
       updatedAt: t,
     };
@@ -359,6 +361,26 @@ export class ConversationStore {
   /** 자료 조사 모드 (FR-5.5). Not activity either; the next run picks it up (new instructions → fresh session). */
   setResearchMode(id: string, researchMode: boolean): void {
     this.db.update(conversations).set({ researchMode }).where(eq(conversations.id, id)).run();
+  }
+
+  /**
+   * A schedule run left a result here (#56, FR-8.3): the sidebar's "새 결과" until the owner opens the conversation.
+   * It is activity: the conversation moves up the "recent" list.
+   */
+  markNewResult(id: string): void {
+    const t = this.now();
+    this.db.update(conversations).set({ newResultAt: t, updatedAt: t }).where(eq(conversations.id, id)).run();
+  }
+
+  /** The owner has seen the result (#56). Not activity. True when there was one. */
+  clearNewResult(id: string): boolean {
+    return (
+      this.db
+        .update(conversations)
+        .set({ newResultAt: null })
+        .where(and(eq(conversations.id, id), sql`${conversations.newResultAt} is not null`))
+        .run().changes > 0
+    );
   }
 
   setPinned(id: string, pinned: boolean): void {

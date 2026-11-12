@@ -38,8 +38,8 @@ export type FakeScheduleHandlerOptions = {
 const never = () => new Promise<never>(() => {});
 
 /**
- * The test / development handler (#33): no runtime, no conversation, no push — it records each step. `FAKE_RUNTIME=1`
- * servers use it until the real handler (#56) exists. Idempotent per run id, as the contract asks.
+ * The engine's test handler (#33): no runtime, no conversation, no push — it records each step. The servers (also
+ * `FAKE_RUNTIME=1`) run the real one (#56, `handler.ts`). Idempotent per run id, as the contract asks.
  */
 export class FakeScheduleHandler implements ScheduleHandler {
   /** Every call, in order (`at` = the clock when it was called). */

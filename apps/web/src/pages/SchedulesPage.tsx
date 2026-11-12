@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import type { Schedule, ScheduleRun } from "@agentlee/shared";
 import { errorText, schedules, SCHEDULES_KEY, settings as settingsApi } from "../api.js";
 import { TopBar } from "../Shell.js";
+import { CONVERSATIONS_KEY } from "../Sidebar.js";
 import { chipLabel } from "../chat/chip.js";
 import { ScheduleForm } from "../schedules/ScheduleForm.js";
 import {
@@ -238,6 +239,13 @@ export function ScheduleDetailPage() {
                 />
               </section>
             )}
+            {s.conversationId && (
+              <p className="small">
+                <Link to={`/c/${s.conversationId}`} data-testid="schedule-conversation">
+                  💬 결과 대화 보기
+                </Link>
+              </p>
+            )}
             <RunHistory scheduleId={s.id} timeZone={s.timeZone} />
           </>
         )}
@@ -255,6 +263,14 @@ function RunHistory({ scheduleId, timeZone }: { scheduleId: string; timeZone: st
     // While a run is going, look again every 2 s (the engine moves it on its own).
     refetchInterval: (q) => (q.state.data?.some(unfinished) ? 2000 : false),
   });
+  // A run that saved its result (#56) made or moved the result conversation: the sidebar ("새 결과") and the link.
+  const qc = useQueryClient();
+  const saved = runs.data?.filter((r) => r.resultSavedAt !== null).length ?? 0;
+  useEffect(() => {
+    if (!saved) return;
+    void qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+    void qc.invalidateQueries({ queryKey: scheduleKey(scheduleId) });
+  }, [saved, qc, scheduleId]);
   return (
     <section className="panel" aria-labelledby="sched-runs-h">
       <h2 id="sched-runs-h">실행 이력</h2>

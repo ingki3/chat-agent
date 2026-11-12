@@ -198,6 +198,8 @@ export const APP_MATRIX: MatrixRow[] = [
   },
   // The fallback notice (#19): only the owner takes it.
   { route: "POST /api/conversations/:id/fallback-notice/consume", expect: OWNER_ONLY, fixture: conversation },
+  // The schedule result marker (#56): only the owner clears it.
+  { route: "POST /api/conversations/:id/result-seen", expect: OWNER_ONLY, fixture: conversation },
   { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
   // Owner only even once sharing exists (#50): a shared view gets its frozen sources, not this list (#29).
   { route: "GET /api/conversations/:id/sources", expect: OWNER_ONLY, fixture: conversation },

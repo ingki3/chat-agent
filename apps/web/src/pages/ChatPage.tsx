@@ -200,6 +200,31 @@ export function ChatPage() {
       if (n) setNotice({ id, text: noticeText(n, usable.data) });
     });
   }, [pendingNotice, id, qc, usable.data, usable.isPending]);
+  // A schedule's result opened (#56, FR-8.3): the sidebar's "새 결과" goes.
+  const newResult = !!conv.data?.newResult;
+  useEffect(() => {
+    if (!newResult) return;
+    void conversations
+      .resultSeen(id)
+      .then((c) => {
+        qc.setQueryData<Conversation>(["conversation", id], (old) =>
+          old ? { ...old, newResult: c.newResult } : old,
+        );
+        return qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      })
+      .catch(() => {});
+  }, [newResult, id, qc]);
+  // A notification's link to the result message (`#m-<id>`, FR-8.4): shown once the messages are there.
+  const loaded = !!list;
+  const scrolledTo = useRef<string | null>(null);
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (!loaded || !hash.startsWith("#m-") || scrolledTo.current === hash) return;
+    const el = document.getElementById(hash.slice(1));
+    if (!el) return;
+    scrolledTo.current = hash;
+    el.scrollIntoView({ block: "start" });
+  }, [loaded, id]);
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);
@@ -533,6 +558,7 @@ const AssistantMessage = memo(function AssistantMessage({
   const text = textOf(parts);
   return (
     <div
+      id={`m-${m.id}`}
       className={`msg assistant${streaming ? " streaming" : ""}`}
       data-testid="assistant"
       data-status={lost ? "lost" : status}

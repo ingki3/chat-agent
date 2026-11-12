@@ -163,6 +163,12 @@ function ConvItem({ c }: { c: Conversation }) {
           aria-label={runtime ? `마지막 응답 ${runtime}` : undefined}
         />
         <span className="t">{c.title}</span>
+        {/* A schedule's result not opened yet (#56, FR-8.3). */}
+        {c.newResult && (
+          <span className="badge new-result" data-testid="new-result" aria-label="새 결과">
+            새 결과
+          </span>
+        )}
       </Link>
       <ConvMenu c={c} />
     </div>

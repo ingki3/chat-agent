@@ -10,6 +10,8 @@ import { z } from "zod";
 export const NotificationKind = z.enum([
   "schedule_succeeded",
   "schedule_failed",
+  /** A schedule's runtime connection is lost or not usable: said before its next run (#56, FR-11.8). */
+  "schedule_warning",
   "share_received",
   "connection_lost",
   "system_warning",

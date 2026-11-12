@@ -18,7 +18,7 @@ import { BackupService, type BackupServiceOptions } from "./backup/backup.js";
 import { FileWriteLock } from "./backup/lock.js";
 import { registerBackupRoutes } from "./backup/routes.js";
 import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
-import { FakeScheduleHandler } from "./schedules/fake.js";
+import { RuntimeScheduleHandler, scheduleUsable, ScheduleWarnings } from "./schedules/handler.js";
 import { registerScheduleRoutes } from "./schedules/routes.js";
 import { registerWatchlistRoutes } from "./watchlist/routes.js";
 import { compactOnce } from "./secrets/compact.js";
@@ -158,10 +158,12 @@ declare module "fastify" {
     /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
     storedRescrub: StoredRescrub | undefined;
     /**
-     * Schedules (#33): the store, and the engine when there is a handler (none until #56; the fake one with
-     * FAKE_RUNTIME=1). undefined without a database.
+     * Schedules (#33): the store, the engine (#56: the real handler unless a test brings its own) and the connection
+     * warnings (FR-11.8). undefined without a database.
      */
-    schedules: { store: ScheduleStore; engine: ScheduleEngine | undefined } | undefined;
+    schedules:
+      | { store: ScheduleStore; engine: ScheduleEngine | undefined; warnings: ScheduleWarnings | undefined }
+      | undefined;
     /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
     scheduleProposals: ScheduleProposalStore | undefined;
     /** 관심 종목 (#31); undefined without a database. */
@@ -246,7 +248,7 @@ export type BuildOptions = {
    */
   docs?: { runner?: DocRunner };
   /**
-   * Schedules (#33): the run handler (default: none — the real one is #56 — or the fake one with FAKE_RUNTIME=1),
+   * Schedules (#33): the run handler (default: the real one, #56 — a turn in the schedule's result conversation),
    * engine timing overrides, and `start: true` to run the engine in a test (it runs by itself only in a server that
    * holds the data folder lock, `dataLock`).
    */
@@ -255,6 +257,8 @@ export type BuildOptions = {
     start?: boolean;
     engine?: ScheduleEngineOptions;
     now?: () => number;
+    /** The real handler's test limits (#56): an attempt's conversation run timeout. */
+    runtime?: { runTimeoutMs?: number };
   };
   /**
    * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
@@ -665,20 +669,39 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => backups.start());
     // Before the database closes (index.ts closes it in onClose): a backup in progress finishes first.
     if (backups) app.addHook("preClose", async () => backups.stop());
-    // Schedules (#33): persistent occurrences and runs; the engine needs a handler and the data folder to be ours.
+    // Schedules (#33): persistent occurrences and runs; the engine runs only where the data folder is ours. The
+    // handler (#56) runs each one as a turn of the schedule's result conversation (FAKE_RUNTIME=1: on the FakeRuntime).
     const scheduleStore = new ScheduleStore(opts.db!);
+    const scheduleNow = opts.schedules?.now ?? opts.schedules?.engine?.now ?? Date.now;
     const scheduleHandler =
-      opts.schedules?.handler ?? (config.fakeRuntime ? new FakeScheduleHandler() : undefined);
+      opts.schedules?.handler ??
+      new RuntimeScheduleHandler({
+        store: scheduleStore,
+        conversations: app.conversations!,
+        runs: runManager,
+        notifications: () => app.notifications,
+        now: scheduleNow,
+        log: app.log,
+        ...opts.schedules?.runtime,
+      });
     const dataLock = opts.dataLock;
-    const scheduleEngine = scheduleHandler
-      ? new ScheduleEngine(scheduleStore, scheduleHandler, {
-          log: app.log,
-          ...(dataLock ? { owned: () => dataLock.held() } : {}),
-          ...(opts.schedules?.now ? { now: opts.schedules.now } : {}),
-          ...opts.schedules?.engine,
-        })
-      : undefined;
-    app.decorate("schedules", { store: scheduleStore, engine: scheduleEngine });
+    const owned = dataLock ? { owned: () => dataLock.held() } : {};
+    const scheduleEngine = new ScheduleEngine(scheduleStore, scheduleHandler, {
+      log: app.log,
+      ...owned,
+      ...(opts.schedules?.now ? { now: opts.schedules.now } : {}),
+      ...opts.schedules?.engine,
+    });
+    // FR-11.8: a schedule whose connection is gone is said before its next run (an hour ahead, once per occurrence).
+    const scheduleWarnings = new ScheduleWarnings({
+      store: scheduleStore,
+      usable: (row) => scheduleUsable(row, { registry: runtimes, access: connections.access }),
+      notifications: () => app.notifications,
+      now: scheduleNow,
+      log: app.log,
+      ...owned,
+    });
+    app.decorate("schedules", { store: scheduleStore, engine: scheduleEngine, warnings: scheduleWarnings });
     registerScheduleRoutes(app, {
       store: scheduleStore,
       proposals: scheduleProposals,
@@ -686,12 +709,18 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       defaults,
       users,
       mcp,
-      now: opts.schedules?.now ?? opts.schedules?.engine?.now ?? Date.now,
+      now: scheduleNow,
     });
-    if (scheduleEngine && (opts.schedules?.start || (config.env !== "test" && dataLock)))
-      app.addHook("onReady", async () => scheduleEngine.start());
+    if (opts.schedules?.start || (config.env !== "test" && dataLock))
+      app.addHook("onReady", async () => {
+        scheduleEngine.start();
+        scheduleWarnings.start();
+      });
     // Before the database closes: runs in progress are aborted and waited for (the rest recover at the next start).
-    if (scheduleEngine) app.addHook("preClose", async () => scheduleEngine.stop());
+    app.addHook("preClose", async () => {
+      scheduleWarnings.stop();
+      await scheduleEngine.stop();
+    });
     registerSourceRoutes(app, app.conversations!, sources);
     registerWatchlistRoutes(app, { store: watchlist, mcp });
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
