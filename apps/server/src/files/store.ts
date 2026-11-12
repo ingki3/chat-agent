@@ -292,6 +292,88 @@ export class FileStore {
   }
 
   /**
+   * Stores a file the agent made (#49, `doc_create`): moved from `tmp` into the store like an upload, its row
+   * linked to the reply that made it (`messageId`, the run's assistant message) and without an upload id — so it is
+   * never a composer file (cannot be attached to another message or removed with ✕) and it reaches a later
+   * session's context while that reply is in the history (#45). It takes one of the conversation's
+   * `FILE_LIMITS.perConversation` places, checked in the same statement as the insert (`FileLimitError`).
+   * `tmp` is gone afterwards either way.
+   */
+  async addGenerated(input: {
+    userId: string;
+    conversationId: string;
+    messageId: string;
+    name: string;
+    kind: FileKind;
+    bytes: number;
+    sha256: string;
+    tmp: string;
+  }): Promise<FileRow> {
+    const row: FileRow = {
+      id: crypto.randomUUID(),
+      userId: input.userId,
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      uploadId: null,
+      name: scrubKnown(cleanName(input.name)) || `document.${input.kind}`,
+      kind: input.kind,
+      mediaType: FILE_KINDS[input.kind].mediaType,
+      bytes: input.bytes,
+      sha256: input.sha256,
+      createdAt: this.now(),
+    };
+    return this.lock.write(() => {
+      const dir = this.storeDir(row.userId, row.conversationId, true);
+      if (!dir) {
+        fs.rmSync(input.tmp, { force: true });
+        throw new StoreLinkError();
+      }
+      fs.renameSync(input.tmp, path.join(dir, row.id));
+      let added = false;
+      try {
+        added =
+          this.db.$client
+            .prepare(
+              `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
+                 sha256, created_at)
+               SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?
+               WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
+            )
+            .run(
+              row.id,
+              row.userId,
+              row.conversationId,
+              row.messageId,
+              row.name,
+              row.kind,
+              row.mediaType,
+              row.bytes,
+              row.sha256,
+              row.createdAt,
+              row.conversationId,
+              FILE_LIMITS.perConversation,
+            ).changes === 1;
+      } finally {
+        if (!added) this.unlinkAndPrune(row);
+      }
+      if (!added) throw new FileLimitError();
+      return row;
+    });
+  }
+
+  /** Files the agent made in the reply `messageId` (#49), oldest first. */
+  generatedOf(conversationId: string, messageId: string): FileRow[] {
+    return this.db
+      .select()
+      .from(files)
+      .where(
+        and(eq(files.conversationId, conversationId), eq(files.messageId, messageId), isNull(files.uploadId)),
+      )
+      .orderBy(asc(files.createdAt), asc(files.id))
+      .all();
+  }
+
+  /**
    * `file_ref` parts for a new message's `fileIds` (in the order given, duplicates dropped). Throws
    * `AttachmentError` unless every id is an unsent file of this conversation. Synchronous: runs inside the
    * transaction that creates the message (`attach` follows in the same one).

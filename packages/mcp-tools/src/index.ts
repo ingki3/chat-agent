@@ -22,7 +22,8 @@ export type SkillInfo = {
   input: z.ZodRawShape;
 };
 
-export type SkillResult = { ok: true; output: unknown } | { ok: false; code: string };
+/** `hint`: fixed words the host adds to a refusal (e.g. what to ask for instead) — never input or file content. */
+export type SkillResult = { ok: true; output: unknown } | { ok: false; code: string; hint?: string };
 
 /** A tool implemented by the host itself (web search and fetch, #50) — offered to every active user. */
 export type ServerToolInfo = SkillInfo;
@@ -109,7 +110,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
         const r = await host.runTool(tool.name, input, scope);
         if (!stillValid()) return text({ error: "unauthorized" }, true);
         host.onToolCall?.(tool.name, scope, r.ok);
-        return r.ok ? text(r.output) : text({ error: r.code }, true);
+        return r.ok ? text(r.output) : text({ error: r.code, ...(r.hint ? { hint: r.hint } : {}) }, true);
       },
     );
   }

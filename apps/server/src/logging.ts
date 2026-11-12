@@ -29,6 +29,8 @@ import {
   isExportFormat,
   isLoginCode,
   isFinanceCode,
+  isDocCode,
+  isDocKind,
   isBackupCode,
   isBackupTrigger,
   isRestoreRecovery,
@@ -73,6 +75,8 @@ export const LOG_EVENTS = [
   // Web tool calls (#50): tool name, outcome code, duration and IDs — never the URL, host, query or page text.
   "web.finished",
   "artifact.finished",
+  // Document generation (#49): format, fixed outcome code, duration and IDs — never the title, blocks or file name.
+  "doc.finished",
   // Finance tool calls (#30): tool name, outcome code, duration and IDs — never the symbol, URL or numbers.
   "finance.finished",
   // Citation tool calls (#25): tool name, the citation status or refusal code, duration and IDs — never the
@@ -204,6 +208,9 @@ const FIELDS = new Map<string, Check>([
   ["artifactCode", isArtifactCode],
   /** Why a finance tool call did not succeed (#30): one of the fixed `finance_*` codes. */
   ["financeCode", isFinanceCode],
+  /** `doc_create` (#49): the requested format and `doc_ok` or one of the fixed `doc_*` codes. */
+  ["docCode", isDocCode],
+  ["docKind", isDocKind],
   /** A `cite` call (#25): the citation status or why it registered nothing. */
   ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
@@ -486,6 +493,8 @@ export type LogFields = {
   webCode?: string;
   artifactCode?: string;
   financeCode?: string;
+  docCode?: string;
+  docKind?: string;
   citeCode?: string;
   exportFormat?: string;
   exportCode?: string;

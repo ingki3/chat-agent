@@ -64,6 +64,8 @@ import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
+import { DocGenService } from "./docgen/service.js";
+import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
 import { storagePaths } from "./storage/paths.js";
 import { isInside } from "./fs-safety.js";
 import type { Db } from "./db/client.js";
@@ -219,6 +221,11 @@ export type BuildOptions = {
   backup?: BackupServiceOptions & { schedule?: boolean };
   /** Uploads (#22): clock and test hooks. */
   files?: FileStoreOptions;
+  /**
+   * Document generation (#49): how the worker runs. Default: sandboxed (`sandboxedDocRunner`); in-process only with
+   * the test switch `ISOLATION_IN_PROCESS_FOR_TESTS=1` outside production (`docRunnerKind`) or a test's own runner.
+   */
+  docs?: { runner?: DocRunner };
   /**
    * Schedules (#33): the run handler (default: none — the real one is #56 — or the fake one with FAKE_RUNTIME=1),
    * engine timing overrides, and `start: true` to run the engine in a test (it runs by itself only in a server that
@@ -420,6 +427,14 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Schedule proposals (#55): `schedule_create` stores them; the owner confirms the card (schedule routes).
     const scheduleProposals = new ScheduleProposalStore(opts.db!);
     app.decorate("scheduleProposals", scheduleProposals);
+    // Documents (#49): made by `doc_create`, stored with the conversation's files (the store is decorated below).
+    const docs = new DocGenService({
+      db: opts.db!,
+      files: () => app.files,
+      runner:
+        opts.docs?.runner ??
+        (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner()),
+    });
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       web: {
@@ -433,6 +448,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       },
       artifacts,
       scheduleProposals,
+      docs,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: { secrets: config.skillSecrets },
       // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
@@ -471,6 +487,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       context: config.context,
       // Uploaded files of the conversation for a fresh session's context (#45): the run manager keeps those of the
       // history's messages (an upload not sent yet, or sent with a message an edit cut, is not). Opening them is #53.
+      // Files the run made (#49): a download chip under the reply.
+      generatedFiles: (conversationId, messageId) =>
+        (app.files?.generatedOf(conversationId, messageId) ?? []).map((f) => ({ id: f.id, name: f.name })),
       contextFiles: (conversationId) =>
         (app.files?.list(conversationId) ?? []).map((f) => ({
           id: f.id,

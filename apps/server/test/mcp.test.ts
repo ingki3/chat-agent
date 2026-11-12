@@ -572,6 +572,7 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "artifact_update",
       // Schedule proposals (#55): the confirmation card's tool.
       "schedule_create",
+      "doc_create",
       // Finance tools (#30): the owner is an adult with every skill.
       ...FINANCE_TOOLS.map((t) => t.name),
       "skill_selftest",

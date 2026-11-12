@@ -6,10 +6,11 @@ import {
   artifactDownloadPath,
   artifactExportPath,
   artifactRawPath,
+  DocumentRef,
   type ArtifactDetail,
   type ArtifactExportFormat,
 } from "@agentlee/shared";
-import { ApiError, artifacts } from "../api.js";
+import { ApiError, artifacts, files } from "../api.js";
 
 /**
  * The artifact viewer shared by the `/a/:id` page (#27) and the panel next to the chat (#28): the sandboxed frame,
@@ -278,17 +279,46 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
   );
 }
 
-/** The chosen version: the sandboxed frame, or the document placeholder. */
+/**
+ * A `document` artifact (#49): the generated file it names, as a download of the original (#22's route — owner
+ * only, never shown inline). The preview comes with the file viewer (#24).
+ */
+function DocumentBody({ id, version }: { id: string; version: number }) {
+  const query = useQuery({
+    queryKey: [...artifactKey(id), "v", version],
+    queryFn: () => artifacts.version(id, version),
+    retry: false,
+  });
+  const ref = query.data ? DocumentRef.safeParse(parseJson(query.data.content)) : undefined;
+  return (
+    <div className="empty">
+      {ref?.success ? (
+        <p>
+          <a href={files.url(ref.data.fileId)} download data-testid="document-download">
+            📄 {ref.data.name} 내려받기
+          </a>
+        </p>
+      ) : (
+        <p>{query.isError ? "문서를 불러오지 못했어요." : "문서를 불러오는 중이에요."}</p>
+      )}
+      <p className="muted small">문서 미리보기는 준비 중이에요.</p>
+    </div>
+  );
+}
+
+const parseJson = (t: string): unknown => {
+  try {
+    return JSON.parse(t);
+  } catch {
+    return undefined;
+  }
+};
+
+/** The chosen version: the sandboxed frame, or the document's download. */
 export function ArtifactBody({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
   if (!data || version === undefined) return null;
-  if (data.kind === "document")
-    return (
-      <div className="empty">
-        <p>문서 미리보기는 준비 중이에요.</p>
-        <p className="muted small">생성 문서 파일(#49)과 미리보기는 다음 단계에서 붙어요.</p>
-      </div>
-    );
+  if (data.kind === "document") return <DocumentBody id={data.id} version={version} />;
   return (
     <iframe
       // A new frame per version: nothing of one version's document carries over to the next.

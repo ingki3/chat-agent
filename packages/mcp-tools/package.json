@@ -33,6 +33,11 @@
       "types": "./src/schedules.ts",
       "development": "./src/schedules.ts",
       "default": "./dist/schedules.js"
+    },
+    "./docgen": {
+      "types": "./src/docgen.ts",
+      "development": "./src/docgen.ts",
+      "default": "./dist/docgen.js"
     }
   },
   "scripts": {

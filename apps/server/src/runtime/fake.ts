@@ -4,6 +4,7 @@ import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } fr
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
 import { SUMMARY_MARKER } from "./context.js";
+import { docScenario } from "./fake-docs.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -42,6 +43,9 @@ import {
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
  *   "매일 아침 8시 관심 종목 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
  *                     daily (or weekday) schedule at that hour, then a reply pointing at the confirmation card (#55)
+ *   /doc <kind> [<fileId>]   "이 내용을 <kind> 보고서로" (#49): real calls of `doc_create` (the report of
+ *                     `fake-docs.ts`, with the picture `fileId` when given) and `artifact_create` (a `document`
+ *                     artifact of that file); kind docx|xlsx|pptx|pdf, or hwp for the refusal
  * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
  * was given — deterministic, so tests can tell which messages a summary covers.
  */
@@ -312,6 +316,15 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (artifact) return artifact;
   const schedule = scheduleSteps(t);
   if (schedule) return schedule;
+  const doc = /^\/doc\s+(docx|xlsx|pptx|pdf|hwp|hwpx)(?:\s+(\S+))?$/.exec(t);
+  if (doc) {
+    const sc = docScenario(doc[1]!, doc[2]);
+    return [
+      { text: "문서를 만들게요. " },
+      ...sc.calls.map((c) => ({ call: c.tool, input: c.input })),
+      { text: sc.answer },
+    ];
+  }
   if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
   if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
   if (t === "/secrettool")
