@@ -228,8 +228,9 @@ export class DocGenService {
   }
 }
 
-const DOC_CODE_SET: ReadonlySet<string> = new Set<DocCode>([
+export const WORKER_CODES: ReadonlySet<string> = new Set<DocCode>([
   "doc_bad_input",
+  "doc_too_large",
   "doc_image_not_found",
   "doc_image_unsupported",
   "doc_image_too_large",
@@ -239,8 +240,12 @@ const DOC_CODE_SET: ReadonlySet<string> = new Set<DocCode>([
   "doc_limit",
   "doc_unavailable",
 ]);
-/** Codes the worker or the runner may give (anything else from it is `doc_failed`). */
-const isDocCode = (c: string): c is DocCode => DOC_CODE_SET.has(c);
+/**
+ * Codes the worker or the runner may give (anything else from it is `doc_failed`): the worker's refusals
+ * (`apps/server/docgen/*.mjs` — input, pictures, layout and size, its own re-open) and the runner's (time, memory,
+ * no sandbox). A test keeps this list equal to every code the worker files contain.
+ */
+const isDocCode = (c: string): c is DocCode => WORKER_CODES.has(c);
 
 /**
  * The stored name: the given name (or the title) as a file name — the last path segment, no control characters,

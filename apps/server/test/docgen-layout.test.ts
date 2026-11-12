@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DocContent, type DocBlock } from "@agentlee/shared";
 import { loadConfig } from "../src/config.js";
 import {
@@ -12,7 +12,13 @@ import {
   docRunnerKind,
   inProcessDocRunner,
 } from "../src/docgen/runner.js";
-import { readPdfItems, readPptx } from "./helpers/doc-parse.js";
+import { WORKER_CODES } from "../src/docgen/service.js";
+import { DOC_FIXTURE } from "../src/runtime/fake-docs.js";
+import { png, readPdfItems, readPptx } from "./helpers/doc-parse.js";
+import { overflows, tableColumns } from "./helpers/pptx-fit.js";
+
+// Documents are made for real (fonts, layout, zip) and re-read: generous under a busy machine.
+vi.setConfig({ testTimeout: 60_000 });
 
 /**
  * Document generation, review round 1 (#49): nothing of a document is lost to layout (PDF table cells, PPTX
@@ -71,54 +77,97 @@ describe("PDF tables keep every character of every cell", () => {
   });
 });
 
-describe("PPTX text never runs off a slide, and every heading has its slide", () => {
+describe("PPTX text never runs off a slide — checked by an independent verifier (helpers/pptx-fit.ts)", () => {
   const BODY_Y = 1188720; // 1.3 in, in EMU
   const TITLE_Y = 274320; // 0.3 in
-  /** Estimated height (pt) of a body's paragraphs at 18 pt — the same rules the generator packs by. */
-  async function heights(buf: Buffer) {
-    const { wrapLines } = (await import(path.join(DOC_WORKER_DIR, "pptx.mjs"))) as {
-      wrapLines(t: string, size: number): { text: string }[];
-    };
-    const p = await readPptx(buf);
-    return p.slides.map((_, i) => {
-      const body = p.shapeAt(i, BODY_Y);
-      return body ? body.reduce((h, t) => h + wrapLines(t, 18).length * 18 * 1.2 + 6, 0) : 0;
-    });
-  }
-  const BOX_PT = 5.8 * 72;
+  const deck = async (blocks: DocBlock[], title = "레이아웃 시험") => {
+    const p = await readPptx(await make("pptx", blocks, title));
+    expect(overflows(p.xml)).toEqual([]);
+    return p;
+  };
+  const body = (p: Awaited<ReturnType<typeof readPptx>>) =>
+    p.slides.flatMap((_, i) => p.shapeAt(i, BODY_Y) ?? []);
 
-  it("one 7,800-character paragraph: cut over several slides, each within the body box, nothing lost", async () => {
-    const text = "가나다라마바사아자차".repeat(780);
-    const buf = await make("pptx", [
-      { type: "heading", text: "긴 문단" },
+  it("one 7,800-character paragraph of W (the widest Latin capital): every character kept, every slide fits", async () => {
+    const text = "W".repeat(7800);
+    const p = await deck([
+      { type: "heading", text: "넓은 글자" },
       { type: "paragraph", text },
     ]);
-    const p = await readPptx(buf);
-    expect(p.slides.length).toBeGreaterThan(5);
-    const bodies = p.slides.map((_, i) => (p.shapeAt(i, BODY_Y) ?? []).join(""));
-    expect(bodies.join("")).toBe(text);
-    for (const h of await heights(buf)) expect(h).toBeLessThanOrEqual(BOX_PT);
-    expect(p.shapeAt(2, TITLE_Y)).toEqual(["긴 문단 (계속)"]);
+    expect(body(p).join("")).toBe(text);
+    expect(p.shapeAt(2, TITLE_Y)).toEqual(["넓은 글자 (계속)"]);
   });
 
-  it("a list item with 150 line breaks: continued over slides, each within the box, every line kept", async () => {
+  it("Hangul, mixed Hangul/Latin, tabs and @ — every character kept in order, every slide fits", async () => {
+    const texts = [
+      "가나다라마바사아자차".repeat(780),
+      "Agent Lee 보고서 MW@ 가족 여행 ".repeat(300),
+      "열\t이름\t값\t".repeat(400),
+    ];
+    for (const text of texts) expect(body(await deck([{ type: "paragraph", text }])).join("")).toBe(text);
+  });
+
+  it("a list item with 150 line breaks: continued over slides, every line kept, every slide fits", async () => {
     const item = Array.from({ length: 150 }, (_, i) => `${i}번 줄`).join("\n");
-    const buf = await make("pptx", [{ type: "list", items: [item, "다음 항목"] }]);
-    const p = await readPptx(buf);
-    const lines = p.slides.flatMap((_, i) => p.shapeAt(i, BODY_Y) ?? []);
-    expect(lines).toEqual([...item.split("\n"), "다음 항목"]);
-    for (const h of await heights(buf)) expect(h).toBeLessThanOrEqual(BOX_PT);
+    const p = await deck([{ type: "list", items: [item, "다음 항목"] }]);
+    expect(body(p)).toEqual([...item.split("\n"), "다음 항목"]);
     expect(p.slides.length).toBeGreaterThan(5);
+  });
+
+  /** A table's columns over all its slides: the header repeated on each, the data cells in order per column. */
+  const columnsOf = (p: Awaited<ReturnType<typeof readPptx>>, header: string[]) => {
+    const tables = tableColumns(p.xml);
+    for (const t of tables) expect(t[0]!.map(strip)).toEqual(header.map(strip));
+    return header.map((_, j) => strip(tables.flatMap((t) => t.slice(1).map((r) => r[j]!)).join("")));
+  };
+
+  it("30 columns × 1,000 Hangul characters per cell: split by column width onto slides, all kept per column", async () => {
+    const letters = Array.from({ length: 30 }, (_, i) => String.fromCharCode(0xac00 + i * 28));
+    const header = letters.map((_, i) => `열${i}`);
+    const p = await deck([{ type: "table", columns: header, rows: [letters.map((l) => l.repeat(1000))] }]);
+    expect(columnsOf(p, header)).toEqual(letters.map((l) => l.repeat(1000)));
+    expect(p.slides.length).toBeGreaterThan(5);
+  });
+
+  it("long headers, a long cell without spaces and many rows: every cell kept in its column, every slide fits", async () => {
+    const header = ["머리".repeat(60), "W".repeat(90), "셋"];
+    const rows = Array.from({ length: 80 }, (_, r) => [
+      `행${r}`,
+      r % 9 === 0 ? "x".repeat(1000) : `값 ${r}`,
+      r * 7,
+    ]);
+    const p = await deck([{ type: "table", columns: header, rows }]);
+    const cols = columnsOf(p, header);
+    expect(cols).toEqual([0, 1, 2].map((j) => strip(rows.map((r) => String(r[j])).join(""))));
+  });
+
+  it("a header taller than half a slide is refused, not cut; table text is never below 8 pt", async () => {
+    // Fits on a slide but would leave too little room under it on every slide.
+    await expect(
+      make("pptx", [{ type: "table", columns: ["가".repeat(600), "b"], rows: [["x", "y"]] }]),
+    ).rejects.toThrow("doc_too_large");
+    // The narrowest columns the input allows (30) still get two characters per line at a legible size.
+    const p = await deck([
+      {
+        type: "table",
+        columns: Array.from({ length: 30 }, (_, i) => `c${i}`),
+        rows: [Array(30).fill("가나다")],
+      },
+    ]);
+    const sizes = p.xml.flatMap((x) =>
+      [...(/<a:tbl>[\s\S]*<\/a:tbl>/.exec(x)?.[0] ?? "").matchAll(/\bsz="(\d+)"/g)].map((m) => Number(m[1])),
+    );
+    expect(sizes.length).toBeGreaterThan(0);
+    expect(Math.min(...sizes)).toBeGreaterThanOrEqual(800);
   });
 
   it("heading A → heading B → paragraph, and a trailing heading: every heading is on a slide", async () => {
-    const buf = await make("pptx", [
+    const p = await deck([
       { type: "heading", text: "제목 A" },
       { type: "heading", text: "제목 B" },
       { type: "paragraph", text: "본문" },
       { type: "heading", text: "마지막 제목" },
     ]);
-    const p = await readPptx(buf);
     const titles = p.slides.map((_, i) => p.shapeAt(i, TITLE_Y)?.join(""));
     expect(titles.slice(1)).toEqual(["제목 A", "제목 B", "마지막 제목"]);
     expect(p.shapeAt(2, BODY_Y)).toEqual(["본문"]);
@@ -126,20 +175,61 @@ describe("PPTX text never runs off a slide, and every heading has its slide", ()
 
   it("a heading too long for the title box opens the body instead (and is kept whole)", async () => {
     const long = "아주 긴 제목 ".repeat(40).trim();
-    const buf = await make("pptx", [
+    const p = await deck([
       { type: "heading", text: long },
       { type: "paragraph", text: "본문" },
     ]);
-    const p = await readPptx(buf);
-    expect(p.text.replace(/\n/g, "")).toContain(long);
-    for (const h of await heights(buf)) expect(h).toBeLessThanOrEqual(BOX_PT);
+    expect(body(p).join("")).toContain(long);
   });
 
   it("an ordered list keeps its numbers across a continuation slide", async () => {
     const items = Array.from({ length: 40 }, (_, i) => `항목 ${i + 1}`);
-    const p = await readPptx(await make("pptx", [{ type: "list", ordered: true, items }]));
-    const lines = p.slides.flatMap((_, i) => p.shapeAt(i, BODY_Y) ?? []);
-    expect(lines).toEqual(items.map((t, i) => `${i + 1}. ${t}`));
+    const p = await deck([{ type: "list", ordered: true, items }]);
+    expect(body(p)).toEqual(items.map((t, i) => `${i + 1}. ${t}`));
+  });
+
+  it("the fixture report and its picture caption fit too", async () => {
+    const r = await runner({
+      kind: "pptx",
+      doc: {
+        ...DOC_FIXTURE,
+        blocks: [...DOC_FIXTURE.blocks, { type: "image", fileId: "p", caption: "사진 ".repeat(60) }],
+      },
+      images: { p: { kind: "png", data: png(400, 300).toString("base64") } },
+    });
+    if (!r.ok) throw new Error(r.code);
+    expect(overflows((await readPptx(r.data)).xml)).toEqual([]);
+  });
+});
+
+describe("size caps: a deck over 500 slides or a PDF over 1,000 pages is refused while it is laid out", () => {
+  const lines = Array.from({ length: 30 }, () => ({
+    type: "paragraph" as const,
+    text: "가\n".repeat(4999) + "끝",
+  }));
+  it("PPTX: 150,000 lines → doc_too_large (stopped at slide 501, before the file is written)", async () => {
+    expect(await runner({ kind: "pptx", doc: { title: "많은 줄", blocks: lines }, images: {} })).toEqual({
+      ok: false,
+      code: "doc_too_large",
+    });
+  });
+  it("PDF: the same → doc_too_large (stopped at page 1,001)", async () => {
+    expect(await runner({ kind: "pdf", doc: { title: "많은 줄", blocks: lines }, images: {} })).toEqual({
+      ok: false,
+      code: "doc_too_large",
+    });
+  }, 120_000);
+  it("the service passes the worker's layout refusal on (doc_too_large, not doc_failed)", async () => {
+    // Every code the worker files can give is on the service's list.
+    const codes = new Set<string>();
+    for (const f of fs.readdirSync(DOC_WORKER_DIR).filter((n) => n.endsWith(".mjs")))
+      for (const m of fs.readFileSync(path.join(DOC_WORKER_DIR, f), "utf8").matchAll(/"(doc_[a-z_]+)"/g))
+        codes.add(m[1]!);
+    for (const m of fs
+      .readFileSync(path.join(DOC_WORKER_DIR, "..", "src", "docgen", "runner.ts"), "utf8")
+      .matchAll(/"(doc_[a-z_]+)"/g))
+      codes.add(m[1]!);
+    expect([...codes].sort()).toEqual([...WORKER_CODES].sort());
   });
 });
 

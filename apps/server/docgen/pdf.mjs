@@ -4,6 +4,8 @@
 import { DEFAULT_REFERENCES_TITLE, DocError, cellText, fit, imageOf } from "./common.mjs";
 
 const MARGIN = 56;
+/** Pages one PDF may have (the sandbox's time and memory limits hold a document this size with room to spare). */
+export const MAX_PAGES = 1000;
 /** A table row is kept below this share of the page's text height (pdfkit clamps — cuts — a taller row). */
 const ROW_SHARE = 0.85;
 
@@ -137,6 +139,11 @@ export async function buildPdf(doc, ctx) {
       Author: doc.author ?? "Agent Lee",
       ...(doc.subtitle ? { Subject: doc.subtitle } : {}),
     },
+  });
+  // Pages are counted as they are started: past MAX_PAGES the document is refused at once (before more is drawn).
+  let pages = 1;
+  pdf.on("pageAdded", () => {
+    if (++pages > MAX_PAGES) throw new DocError("doc_too_large");
   });
   const chunks = [];
   pdf.on("data", (c) => chunks.push(c));

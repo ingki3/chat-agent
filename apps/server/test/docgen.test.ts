@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   CSRF_HEADER,
@@ -42,6 +42,9 @@ import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { png, pngHeader, readDocx, readPdf, readPptx, readXlsx } from "./helpers/doc-parse.js";
 import { liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+
+// Documents are made for real (fonts, layout, zip) and re-read: generous under a busy machine.
+vi.setConfig({ testTimeout: 60_000 });
 
 /**
  * Document generation (#49): `doc_create` makes DOCX, XLSX, PPTX and PDF files from blocks, re-opens them, stores
