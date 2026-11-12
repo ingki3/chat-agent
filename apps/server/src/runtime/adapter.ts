@@ -13,6 +13,13 @@ export type ModelCapability = {
   /** Accepted reasoning-effort values; empty = the model takes no effort setting. */
   efforts: string[];
   defaultEffort?: string;
+  /**
+   * The model's context window in tokens (#45): a fresh session's history is summarised once it reaches the
+   * configured ratio of it. Unset = `DEFAULT_CONTEXT_WINDOW` (context.ts).
+   */
+  contextWindow?: number;
+  /** A cheap model of the runtime: what the conversation summary is written with when the user may use it (#45). */
+  cheap?: boolean;
 };
 
 export type RuntimeCapabilities = {
@@ -56,8 +63,15 @@ export type StartContext = {
    * must settle `start()` / `resume()` (with an error) only after that process has exited.
    */
   signal?: AbortSignal;
-  /** Prior history, public parts only (reasoning never crosses into another session — PRD FR-3.5). */
+  /**
+   * Prior history, public parts only (reasoning never crosses into another session — PRD FR-3.5). When the
+   * conversation is long (#45) this is only what comes after `summary`.
+   */
   history: { role: "user" | "assistant" | "system"; parts: PublicPart[] }[];
+  /** The summary of the earlier part (#45, FR-3.6): it stands in for every message up to `throughMessageId`. */
+  summary?: { text: string; throughMessageId: string } | undefined;
+  /** The conversation's uploaded files, artifacts and cited sources (#45, FR-3.5). Rendered by `renderPriorContext`. */
+  references?: ContextReferences | undefined;
   systemPrompt: string;
   model: string;
   effort?: string | undefined;
@@ -68,6 +82,19 @@ export type StartContext = {
    * Adapters turn it into runtime settings with `claudeLockdown` / `codexConfigToml` + `codexMcpEnv`.
    */
   mcp?: McpConnection;
+};
+
+/**
+ * What a fresh session is told about the conversation besides its messages (PRD FR-3.5: "업로드 파일 목록, 이 대화의
+ * 아티팩트, 인용 출처"). Titles and names are user, page or model text: they reach the runtime as external content.
+ * Whether a file or artifact named here can really be opened by the runtime is #53.
+ */
+export type ContextReferences = {
+  /** Uploaded files sent with a message (#22's file store). */
+  files: { id: string; name: string }[];
+  artifacts: { id: string; title: string; kind: string; version: number }[];
+  /** Sources the conversation's answers cited (server-checked citation notes). */
+  sources: { id: string; title: string | null; site: string | null; url: string }[];
 };
 
 /** What an adapter's connection resolver is asked: whose run, which connection, and whether it is a test. */

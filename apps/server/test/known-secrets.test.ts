@@ -799,6 +799,17 @@ describe("round 25: every egress and every stored row", () => {
       { userId: f.users.owner.id, conversationId: conv.id, runId },
       { kind: "markdown", title: `문서 ${late}`, content: `본문 ${late}` },
     );
+    // A conversation summary (#45, model output) holding it, stored before anyone knew.
+    const firstMsg = app.conversations!.messages(conv.id, { limit: 10 })[0]!;
+    app.runs!.summaries.save({
+      conversationId: conv.id,
+      through: firstMsg,
+      history: [firstMsg],
+      summary: `요약: ${late}`,
+      runtime: "claude-code",
+      model: "claude-haiku-5-5",
+      runId,
+    });
     app.notifications!.publish(f.users.owner.id, { kind: "connection_lost", runtimeLabel: `연결 ${late}` });
     const all = () =>
       [
@@ -810,6 +821,7 @@ describe("round 25: every egress and every stored row", () => {
         "notifications",
         "sources",
         "finance_results",
+        "conversation_summaries",
       ]
         .map((t) => JSON.stringify(db.$client.prepare(`select * from "${t}"`).all()))
         .join("\n");

@@ -26,7 +26,7 @@
 |---|---|---|
 | 토큰 단위 스트리밍 | 지원 | **실행** `includePartialMessages` → `text_delta` 22개 (`claude-stream.json`) |
 | 세션 이어가기 | 지원 | **실행** 같은 실행 묶음에서 stream → `resume: <session_id>`(ID 일치) → 태그 `c1` 기억 (`claude-stream.json`, `claude-resume.json`) |
-| 특정 메시지까지 잘라 이어가기 | 있음 | **타입·문서** `resumeSessionAt` + `resumeDropsTurn` (`sdk.d.ts`). 실행 미검증 → #45에서 시험 |
+| 특정 메시지까지 잘라 이어가기 | 있음 | **타입·문서** `resumeSessionAt` + `resumeDropsTurn` (`sdk.d.ts`). 실행 미검증. *#45: 쓰지 않기로 함 — 수정·재생성 뒤에는 잘라 이어가지 않고 서버 기록으로 새 세션을 연다(ops.md §27.1). 두 런타임이 같은 규칙이고, 런타임 쪽 기록 잘라내기를 믿을 필요가 없다* |
 | 같은 세션에서 모델 변경 | 지원 | **실행** 스트리밍 입력 모드, 1턴 `answeredBy: claude-opus-5-5` → `setModel` → 2턴 `answeredBy: claude-haiku-5-5`, 같은 세션 ID, 앞 내용 기억 (`claude-setmodel.json`) |
 | 중단 | 지원 | **실행** `interrupt()` 응답 6ms, 종료까지 583ms. 결과는 `error_during_execution` + 예외 (`claude-interrupt.json`). 어댑터는 **우리가 interrupt를 요청한 run만** "중지됨"으로 매핑하고, 그 밖의 `error_during_execution`은 실패로 처리 |
 | 추론 강도 | 수락만 확인 | **실행** Opus·Haiku 모두 `effort: low`·`max`를 오류 없이 수락하고 해당 모델이 응답 (`claude-effort.json`). 값이 실제 적용·무시·정규화되는지는 확인하지 않음 → 허용 범위는 우리 capability 표(관리자 설정 + 문서 근거)로 검증 |

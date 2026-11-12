@@ -128,6 +128,10 @@ export const LOG_EVENTS = [
   "schedule.step_failed",
   "schedule.recovered",
   "schedule.engine_stopped",
+  // Context builder (#45): a conversation summary was written (IDs, runtime, attempt, tokens, duration) or could not
+  // be (fixed code) — never the summary or the messages.
+  "context.summarized",
+  "context.summary_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

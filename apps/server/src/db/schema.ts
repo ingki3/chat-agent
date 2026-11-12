@@ -163,11 +163,49 @@ export const runtimeSessions = sqliteTable(
      * the same instructions — runtimes keep the start prompt, so a changed one needs a fresh session.
      */
     instructionsHash: text("instructions_hash"),
+    /**
+     * The model the session answers with now (#45): a model-only change resumes it with `setModel` when the runtime
+     * can, otherwise it needs a fresh session. Null for sessions from before #45 (taken as the run's model).
+     */
+    model: text("model"),
+    /**
+     * The conversation summary the session was started with (#45, `conversation_summaries`), null for none. Resumed
+     * only while that is still the conversation's current summary: a new one means the context reached its limit.
+     */
+    summaryId: text("summary_id"),
     invalidated: integer("invalidated", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),
   },
   (t) => [index("runtime_sessions_conversation_idx").on(t.conversationId)],
+);
+
+/**
+ * Summaries of the earlier part of a conversation (#45, PRD FR-3.6): written when the history a fresh session would
+ * get reaches the model's context limit ratio, then reused for every fresh session while it still covers the same
+ * messages. It covers the active user/assistant messages up to `throughSeq` (`coveredHash` is their ids, so an edit
+ * or regenerate before that point makes it stale). The text is model output: known secrets are scrubbed on write.
+ */
+export const conversationSummaries = sqliteTable(
+  "conversation_summaries",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    /** The last message it covers, and its seq. */
+    throughMessageId: text("through_message_id").notNull(),
+    throughSeq: integer("through_seq").notNull(),
+    /** SHA-256 of the ids of the covered messages, in order. */
+    coveredHash: text("covered_hash").notNull(),
+    summary: text("summary").notNull(),
+    /** Who wrote it, and in which run (its usage is recorded with purpose `summary`). */
+    runtime: text("runtime").notNull(),
+    model: text("model").notNull(),
+    runId: text("run_id"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [index("conversation_summaries_conversation_idx").on(t.conversationId, t.throughSeq)],
 );
 
 /**

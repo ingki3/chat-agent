@@ -76,6 +76,21 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   },
   "runtime_sessions.last_message_id": ID,
   "runtime_sessions.instructions_hash": HASH,
+  "runtime_sessions.model": {
+    exempt: "a model id from the runtime's catalogue (the run's model, checked by RunAccess)",
+  },
+  "runtime_sessions.summary_id": ID,
+  "conversation_summaries.id": ID,
+  "conversation_summaries.conversation_id": ID,
+  "conversation_summaries.through_message_id": ID,
+  "conversation_summaries.covered_hash": HASH,
+  // Model output about the conversation: may repeat anything that was said in it.
+  "conversation_summaries.summary": { write: "SummaryStore.save (scrubKnown)", rescrub: "text" },
+  "conversation_summaries.runtime": ENUM,
+  "conversation_summaries.model": {
+    exempt: "a model id from the runtime's catalogue (the summary model, checked by RunAccess)",
+  },
+  "conversation_summaries.run_id": ID,
   "run_events.run_id": ID,
   "run_events.data": {
     write: "RunManager.emit (every event), replay as one stream",

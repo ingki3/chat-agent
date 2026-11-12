@@ -13,6 +13,7 @@ import {
 import type { Db } from "../db/client.js";
 import { conversations, messages, runtimeSessions } from "../db/schema.js";
 import { scrubKnown, scrubParts } from "../secrets/known.js";
+import { SUMMARY_SWITCH_NOTE } from "../runtime/context.js";
 
 export type ConversationRow = typeof conversations.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
@@ -53,7 +54,14 @@ function noticeOf(v: unknown): FallbackNotice | null {
 }
 
 /** What a reply was answered with — the divider rule compares these (#19). */
-export type AnsweredWith = { runtime: string; model: string; effort: string | null; label: string };
+export type AnsweredWith = {
+  runtime: string;
+  model: string;
+  effort: string | null;
+  label: string;
+  /** A switch to another runtime that hands over a summary (#45): its divider says so (FR-3.5). */
+  summarized?: boolean;
+};
 
 export function toConversation(c: ConversationRow): Conversation {
   return {
@@ -252,6 +260,9 @@ export class ConversationStore {
       if (!sameModel || (prev.effort ?? null) !== next.effort)
         // Only the effort changed: say so, or the divider would name what answered before too.
         label = `여기부터 ${sameModel && next.effort ? `${next.label} · 추론 ${next.effort}` : next.label}`;
+      // Another runtime starts from the summary and the recent messages (#45, FR-3.5).
+      if (label !== null && prev.runtime !== next.runtime && next.summarized)
+        label = `${label} · ${SUMMARY_SWITCH_NOTE}`;
     }
     const keep =
       label === null
@@ -605,6 +616,10 @@ export class ConversationStore {
     conversationRevision: number;
     /** Fingerprint of the instructions the session started with (#20). */
     instructionsHash?: string | null;
+    /** The model it answers with (#45). */
+    model?: string | null;
+    /** The summary its context started from (#45). */
+    summaryId?: string | null;
   }): SessionRow {
     const conv = this.get(s.conversationId);
     if (!conv) throw new Error("conversation not found");
@@ -620,6 +635,8 @@ export class ConversationStore {
       lastMessageId: s.lastMessageId,
       conversationRevision: s.conversationRevision,
       instructionsHash: s.instructionsHash ?? null,
+      model: s.model ?? null,
+      summaryId: s.summaryId ?? null,
       invalidated: false,
       createdAt: t,
       updatedAt: t,
@@ -664,6 +681,29 @@ export class ConversationStore {
       .update(runtimeSessions)
       .set({ lastMessageId, conversationRevision, updatedAt: this.now() })
       .where(eq(runtimeSessions.id, id))
+      .run();
+  }
+
+  /** The session now answers with `model` (#45: a model-only change through `setModel`). */
+  setSessionModel(id: string, model: string): void {
+    this.db
+      .update(runtimeSessions)
+      .set({ model, updatedAt: this.now() })
+      .where(eq(runtimeSessions.id, id))
+      .run();
+  }
+
+  /**
+   * Takes a message the server wrote out of the history (kept, like every cut message, with the revision) — the
+   * summary divider of a summary that could not be written (#45).
+   */
+  deactivate(conversationId: string, messageId: string): void {
+    const conv = this.get(conversationId);
+    if (!conv) return;
+    this.db
+      .update(messages)
+      .set({ active: false, archivedAtRevision: conv.revision })
+      .where(and(eq(messages.id, messageId), eq(messages.conversationId, conversationId)))
       .run();
   }
 

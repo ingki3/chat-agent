@@ -461,6 +461,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       },
       log: app.log,
       ...(errors ? { errors } : {}),
+      context: config.context,
+      // Uploaded files of the conversation for a fresh session's context (#45): those sent with a message (an upload
+      // not sent yet is not part of the conversation). Opening them is #53.
+      contextFiles: (conversationId) =>
+        (app.files?.list(conversationId) ?? [])
+          .filter((f) => f.messageId !== null)
+          .map((f) => ({ id: f.id, name: f.name })),
       ...opts.runs,
     });
     // Runs left running by a previous process cannot be continued: mark them failed before serving.

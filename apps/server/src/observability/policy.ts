@@ -54,6 +54,7 @@ export const ERROR_CODES = set([
   "server_restart",
   "usage_limit",
   "tool_error",
+  "summary_failed",
   "unknown",
 ]);
 /** Error class names worth keeping; any other name is logged as "Error" (a class name can be anything). */

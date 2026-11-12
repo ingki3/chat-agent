@@ -3,6 +3,7 @@ import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.j
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
+import { SUMMARY_MARKER } from "./context.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -39,6 +40,8 @@ import {
  *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
  *                     manager's citation check then adds its note (#25)
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
+ * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
+ * was given — deterministic, so tests can tell which messages a summary covers.
  */
 export type FakeStep =
   | { text: string }
@@ -253,8 +256,23 @@ function citationSteps(t: string): FakeStep[] | undefined {
   return undefined;
 }
 
+/**
+ * The FakeRuntime's summary (#45): every earlier text of the session (a previous summary included) in order, each
+ * on one line and cut to 40 characters.
+ */
+export const fakeSummary = (memory: readonly string[]): string =>
+  `요약: ${memory
+    .filter((m) => !m.startsWith(SUMMARY_MARKER))
+    .map((m) => m.replace(/\s+/g, " ").slice(0, 40).trim())
+    .join(" / ")}`;
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
+  if (t.startsWith(SUMMARY_MARKER))
+    return [
+      { text: fakeSummary(memory) },
+      { usage: { inputTokens: 20 * memory.length, outputTokens: 30, costUsd: 0.0001 } },
+    ];
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
   const cite = citationSteps(t);
   if (cite) return cite;
@@ -320,6 +338,22 @@ export class FakeRuntime implements RuntimeAdapter {
   closed = 0;
   /** Sessions resumed (not started). */
   resumed = 0;
+  /** resume() calls, including those that found no session (the run manager must not even try some, #45). */
+  resumeAttempts = 0;
+  /** setModel() calls: model-only changes inside a resumed session (#45). */
+  readonly setModels: { sessionId: string; model: string }[] = [];
+  /**
+   * What each session knows, in order (#45 contract tests): its start context (the summary, then each history
+   * message with text) and every turn after it — the input, then the reply's text.
+   */
+  readonly transcripts = new Map<string, { role: string; text: string }[]>();
+  /** Per turn: the session and what it knew right before the turn's input. */
+  readonly turnLog: {
+    sessionId: string;
+    model: string;
+    input: string;
+    before: { role: string; text: string }[];
+  }[] = [];
   /** System prompts of the sessions started, in order — tests check what the run manager assembled (#20). */
   readonly systemPrompts: string[] = [];
   /** Every StartContext passed to start/resume (tests check the connection the run manager chose). */
@@ -341,6 +375,8 @@ export class FakeRuntime implements RuntimeAdapter {
       runTools?: boolean;
       /** Act like a real runtime that needs a connection (#17). */
       needsConnection?: boolean;
+      /** `canSwitchModelInSession` (default true): false = a model change needs a fresh session (#45). */
+      canSwitchModel?: boolean;
     } = {},
   ) {
     this.id = opts.id ?? "claude-code";
@@ -357,7 +393,7 @@ export class FakeRuntime implements RuntimeAdapter {
         },
         { id: "fake-small", label: "Fake Small", efforts: [] },
       ],
-      canSwitchModelInSession: true,
+      canSwitchModelInSession: this.opts.canSwitchModel ?? true,
       canResume: this.opts.canResume ?? true,
       usesTools: this.opts.usesTools ?? false,
       ...(this.opts.runTools ? { runTools: true } : {}),
@@ -373,15 +409,27 @@ export class FakeRuntime implements RuntimeAdapter {
     this.contexts.push(ctx);
     const id = `fake-${crypto.randomUUID()}`;
     this.systemPrompts.push(ctx.systemPrompt);
-    const memory = ctx.history
-      .flatMap((h) => h.parts.map((p) => (p.type === "text" ? p.text : "")))
-      .filter(Boolean);
+    const memory = [
+      ...(ctx.summary ? [ctx.summary.text] : []),
+      ...ctx.history.flatMap((h) => h.parts.map((p) => (p.type === "text" ? p.text : ""))),
+    ].filter(Boolean);
     this.sessions.set(id, { model: ctx.model, memory, mcp: ctx.mcp });
+    this.transcripts.set(id, [
+      ...(ctx.summary ? [{ role: "summary", text: ctx.summary.text.trim() }] : []),
+      ...ctx.history.flatMap((h) => {
+        const text = h.parts
+          .flatMap((p) => (p.type === "text" ? [p.text] : []))
+          .join("\n")
+          .trim();
+        return text ? [{ role: h.role, text }] : [];
+      }),
+    ]);
     return this.session(id);
   }
 
   async resume(externalSessionId: string, ctx?: StartContext): Promise<RuntimeSession> {
     if (ctx) this.contexts.push(ctx);
+    this.resumeAttempts++;
     if (this.opts.canResume === false) throw new Error("this runtime cannot resume");
     const known = this.sessions.get(externalSessionId);
     if (!known) throw new SessionGoneError();
@@ -398,12 +446,22 @@ export class FakeRuntime implements RuntimeAdapter {
     return {
       externalSessionId: id,
       setModel: async (model) => {
+        if (this.opts.canSwitchModel === false)
+          throw new Error("this runtime cannot switch models in a session");
+        this.setModels.push({ sessionId: id, model });
         state.model = model;
       },
       close: async () => {
         this.closed++;
       },
       turn: (input): RuntimeTurn => {
+        const transcript = this.transcripts.get(id) ?? [];
+        this.transcripts.set(id, transcript);
+        this.turnLog.push({ sessionId: id, model: input.model, input: input.text, before: [...transcript] });
+        transcript.push({ role: "user", text: input.text.trim() });
+        const reply = { role: "assistant", text: "" };
+        let raw = "";
+        transcript.push(reply);
         state.memory.push(input.text);
         const ctrl = new AbortController();
         const steps = script({ ...input, model: input.model || state.model }, state.memory);
@@ -413,6 +471,8 @@ export class FakeRuntime implements RuntimeAdapter {
           for (const step of steps) {
             if (ctrl.signal.aborted) return;
             if ("text" in step) {
+              raw += step.text;
+              reply.text = raw.trim();
               if (step.text) yield { type: "text_delta", text: step.text };
             } else if ("reasoning" in step) yield { type: "reasoning_delta", text: step.reasoning };
             else if ("delayMs" in step) await sleep(step.delayMs, ctrl.signal);
