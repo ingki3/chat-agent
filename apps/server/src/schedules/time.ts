@@ -104,7 +104,7 @@ export type Cron = {
   days: Set<number>;
   months: Set<number>;
   weekdays: Set<number>;
-  /** Vixie cron: when both day fields are restricted (not exactly "*"), a day matches either one, else both. */
+  /** Vixie cron: neither day field starts with "*" → a day matches either one; otherwise both (the sets). */
   daysRestricted: boolean;
   weekdaysRestricted: boolean;
 };
@@ -140,9 +140,10 @@ export function parseCron(expr: string): Cron {
     months: new Set(field(mon, 1, 12)),
     // 7 is Sunday too
     weekdays: new Set(field(dow, 0, 7).map((d) => d % 7)),
-    // Vixie cron: a field is unrestricted only when it is exactly "*" (`*/2` is restricted).
-    daysRestricted: dom !== "*",
-    weekdaysRestricted: dow !== "*",
+    // Vixie cron (entry.c DOM_STAR / DOW_STAR): a field starting with "*" — `*/2` included — is "star"; its set
+    // (every other day for `*/2`) is still what it matches.
+    daysRestricted: !dom.startsWith("*"),
+    weekdaysRestricted: !dow.startsWith("*"),
   };
 }
 
@@ -189,7 +190,8 @@ function compile(timing: Timing): Compiled {
           if (!c.months.has(date.getUTCMonth() + 1)) return [];
           const dom = c.days.has(date.getUTCDate());
           const dow = c.weekdays.has(weekdayOf(day));
-          // Both restricted: either one; otherwise both (an unrestricted field's set holds every day).
+          // Neither field starts with "*": either one; otherwise both (a "*" field's set — every day, or every n-th —
+          // is still applied, so `*/2` alone is every other day).
           const ok = c.daysRestricted && c.weekdaysRestricted ? dom || dow : dom && dow;
           return ok ? m : [];
         },

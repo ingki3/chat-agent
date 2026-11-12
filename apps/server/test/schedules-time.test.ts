@@ -71,7 +71,7 @@ describe("occurrences of the five types (Asia/Seoul)", () => {
       expect(() => parseCron(bad), bad).toThrow(CronError);
   });
 
-  it("cron day fields (vixie): */n is restricted; both restricted → either, otherwise both (review 1)", () => {
+  it("cron day fields (vixie DOM_STAR/DOW_STAR): a field starting with * makes it AND; neither → OR (reviews 1–2)", () => {
     const UTC = "UTC";
     const days = (cron: string, from: number, n: number) => {
       const out: string[] = [];
@@ -96,7 +96,7 @@ describe("occurrences of the five types (Asia/Seoul)", () => {
       "2026-11-17", // Tue
       "2026-11-19", // Thu
     ]);
-    // both restricted → either: the 1st–7th OR any Monday
+    // neither field starts with "*" → either: the 1st–7th OR any Monday
     expect(days("0 0 1-7 * 1", Date.UTC(2026, 10, 20), 5)).toEqual([
       "2026-11-23", // Mon
       "2026-11-30", // Mon
@@ -104,13 +104,23 @@ describe("occurrences of the five types (Asia/Seoul)", () => {
       "2026-12-02",
       "2026-12-03",
     ]);
-    // a day-of-week step counts as restricted too: the 1st OR Sun/Wed/Sat
-    expect(days("0 0 1 * */3", Date.UTC(2026, 10, 25, 12), 4)).toEqual([
-      "2026-11-28", // Sat
-      "2026-11-29", // Sun
-      "2026-12-01", // the 1st (a Tuesday)
-      "2026-12-02", // Wed
+    // a day-of-week step starts with "*" → both: a 1st that is a Sun/Wed/Sat
+    expect(days("0 0 1 * */3", Date.UTC(2026, 10, 25, 12), 3)).toEqual([
+      "2027-05-01", // Sat
+      "2027-08-01", // Sun
+      "2027-09-01", // Wed
     ]);
+    // a day-of-month step starts with "*" → both: Mondays (every day of the month for */1, odd days for */2)
+    const thu12 = Date.UTC(2026, 10, 12, 12);
+    expect(days("0 0 */1 * 1", thu12, 2)).toEqual(["2026-11-16", "2026-11-23"]);
+    expect(days("0 0 */2 * 1", thu12, 3)).toEqual(["2026-11-23", "2026-12-07", "2026-12-21"]);
+    // the same rule for the latest occurrence (the missed catch-up)
+    const latest = (cron: string, at: number) =>
+      iso(latestOccurrence({ type: "cron", cron }, UTC, at, at - 60 * 86_400_000))!.slice(0, 10);
+    expect(latest("0 0 */1 * 1", Date.UTC(2026, 10, 14, 12))).toBe("2026-11-09");
+    expect(latest("0 0 */2 * 1", Date.UTC(2026, 10, 22, 12))).toBe("2026-11-09");
+    expect(latest("0 0 */2 * *", Date.UTC(2026, 10, 14, 12))).toBe("2026-11-13");
+    expect(latest("0 0 1-7 * 1", Date.UTC(2026, 10, 29, 12))).toBe("2026-11-23");
     // step + list combinations
     expect(days("0 0 1,15-20/5 * *", Date.UTC(2026, 10, 2), 4)).toEqual([
       "2026-11-15",
@@ -118,12 +128,11 @@ describe("occurrences of the five types (Asia/Seoul)", () => {
       "2026-12-01",
       "2026-12-15",
     ]);
-    // both restricted with steps: */10 (1, 11, 21, 31) OR Sunday
-    expect(days("0 0 */10 * 0", Date.UTC(2026, 10, 25), 4)).toEqual([
-      "2026-11-29", // Sun
-      "2026-12-01",
-      "2026-12-06", // Sun
-      "2026-12-11",
+    // a step with a weekday: */10 (1, 11, 21, 31) AND Sunday
+    expect(days("0 0 */10 * 0", Date.UTC(2026, 10, 25), 3)).toEqual([
+      "2027-01-31",
+      "2027-02-21",
+      "2027-03-21",
     ]);
     // only months restricted with a step: day fields * → every day of Jan, Mar, …
     expect(days("0 0 1 */2 *", Date.UTC(2026, 10, 2), 2)).toEqual(["2027-01-01", "2027-03-01"]);
