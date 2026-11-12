@@ -38,6 +38,8 @@ export function openServerStorage(config: Config): {
   storage: Storage;
   recovered: RecoveryOutcome;
   release: () => void;
+  /** Whether the lock is still held (the schedule engine runs only while it is, #33). */
+  held: () => boolean;
 } {
   const claim = openStorageForWrite(config.dataDir, "server");
   try {
@@ -45,6 +47,7 @@ export function openServerStorage(config: Config): {
       storage: initStorage({ ...config, dataDir: claim.dataDir }),
       recovered: claim.recovered,
       release: claim.lock.release,
+      held: claim.lock.held,
     };
   } catch (e) {
     claim.lock.release();

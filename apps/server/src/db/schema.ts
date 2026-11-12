@@ -742,3 +742,90 @@ export const uploadCancellations = sqliteTable(
     index("upload_cancellations_created_idx").on(t.createdAt),
   ],
 );
+
+/**
+ * Schedules (#33, PRD FR-8.2): what to run (prompt, skills, runtime·model·effort checked like the chip's change)
+ * and when (`type` with `date`/`time`/`weekdays`/`cron`, in `time_zone`). `next_run_at` is the engine's persistent
+ * state: the next regular occurrence not yet turned into a run (null: a finished one-off). The UI is #55.
+ */
+export const schedules = sqliteTable(
+  "schedules",
+  {
+    id: text("id").primaryKey(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    prompt: text("prompt").notNull(),
+    type: text("type", { enum: ["once", "daily", "weekdays", "weekly", "cron"] }).notNull(),
+    /** once: the local date "YYYY-MM-DD". */
+    date: text("date"),
+    /** once/daily/weekdays/weekly: the local time "HH:MM". */
+    time: text("time"),
+    /** weekly: JSON array of weekday numbers (0 = Sunday). */
+    weekdays: text("weekdays", { mode: "json" }).$type<number[]>(),
+    /** cron: the 5-field expression. */
+    cron: text("cron"),
+    timeZone: text("time_zone").notNull().default("Asia/Seoul"),
+    /** Skill names the run may use (JSON array). */
+    skills: text("skills", { mode: "json" })
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'`),
+    notify: integer("notify", { mode: "boolean" }).notNull().default(true),
+    runtime: text("runtime").notNull(),
+    model: text("model").notNull(),
+    effort: text("effort"),
+    useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
+    paused: integer("paused", { mode: "boolean" }).notNull().default(false),
+    /** The schedule's own result conversation (#56). */
+    conversationId: text("conversation_id").references(() => conversations.id, { onDelete: "set null" }),
+    nextRunAt: integer("next_run_at"),
+    createdAt: integer("created_at").notNull().default(now),
+    updatedAt: integer("updated_at").notNull().default(now),
+  },
+  (t) => [
+    index("schedules_owner_idx").on(t.ownerId, t.createdAt),
+    index("schedules_next_run_idx").on(t.nextRunAt),
+  ],
+);
+
+/**
+ * One run of a schedule (#33, FR-8.6·8.7). `run_key` is unique: `<schedule id>@<scheduled ms>` for an occurrence
+ * (regular or the one missed catch-up), `<schedule id>@manual:<ms>` for "바로 실행" — the same occurrence can never
+ * become two runs, whoever inserts it. Status: pending → running → succeeded / failed, or skipped at once (overlap).
+ * A failed first attempt goes back to pending with `retry_at` (2 minutes later); `attempts` counts starts, a crash
+ * included. `outcome`, `result_saved_at` and `notified_at` mark the handler's steps, so a restart resumes after
+ * the last finished one.
+ */
+export const scheduleRuns = sqliteTable(
+  "schedule_runs",
+  {
+    id: text("id").primaryKey(),
+    scheduleId: text("schedule_id")
+      .notNull()
+      .references(() => schedules.id, { onDelete: "cascade" }),
+    runKey: text("run_key").notNull(),
+    trigger: text("trigger", { enum: ["regular", "missed", "manual"] }).notNull(),
+    scheduledAt: integer("scheduled_at").notNull(),
+    status: text("status", { enum: ["pending", "running", "succeeded", "failed", "skipped"] }).notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    retryAt: integer("retry_at"),
+    startedAt: integer("started_at"),
+    finishedAt: integer("finished_at"),
+    /** The execute step's result (set before the result is saved). */
+    outcome: text("outcome", { enum: ["succeeded", "failed"] }),
+    errorCode: text("error_code"),
+    /** The handler's references: where its output is (execute) and where it saved the result (saveResult). */
+    outputRef: text("output_ref"),
+    resultRef: text("result_ref"),
+    resultSavedAt: integer("result_saved_at"),
+    notifiedAt: integer("notified_at"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [
+    uniqueIndex("schedule_runs_key_idx").on(t.runKey),
+    index("schedule_runs_schedule_idx").on(t.scheduleId, t.scheduledAt),
+    index("schedule_runs_status_idx").on(t.status),
+  ],
+);

@@ -223,6 +223,32 @@ export const APP_MATRIX: MatrixRow[] = [
   },
 ];
 
+/** A daily schedule of `owner` (#33): the store directly (the matrix app has no runtime to pick defaults from). */
+function schedule(f: Family) {
+  return f.app.schedules!.store.create(
+    f.users.owner.id,
+    {
+      name: "아침 브리핑",
+      prompt: "관심 종목 정리",
+      timing: { type: "daily", time: "08:00" },
+      timeZone: "Asia/Seoul",
+      skills: [],
+      notify: true,
+      settings: { runtime: "claude-code", model: "claude-opus-5-5", effort: null, useShared: false },
+    },
+    Date.now(),
+  ).id;
+}
+
+/** Schedules (#33): the prompt is the owner's content — owner only, the admin refused like anyone else. */
+APP_MATRIX.push(
+  { route: "GET /api/schedules/:id", expect: OWNER_ONLY, fixture: schedule },
+  { route: "GET /api/schedules/:id/runs", expect: OWNER_ONLY, fixture: schedule },
+  { route: "PATCH /api/schedules/:id", expect: OWNER_ONLY, fixture: schedule, body: { paused: true } },
+  { route: "DELETE /api/schedules/:id", expect: { ...OWNER_ONLY, owner: 204 }, fixture: schedule },
+  { route: "POST /api/schedules/:id/run", expect: { ...OWNER_ONLY, owner: 201 }, fixture: schedule },
+);
+
 /** Admin-only data: every member — the son's account included — 403, the admin 200, before login 401. */
 export const ADMIN_ONLY: Record<Who, number> = {
   owner: 403,

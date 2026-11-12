@@ -6,12 +6,14 @@ import { logEvent } from "./logging.js";
 
 const config = loadConfig();
 // Refuses to start when another server, a restore or a migration holds the data folder (#37).
-const { storage, recovered, release: releaseDataDir } = openServerStorage(config);
+const { storage, recovered, release: releaseDataDir, held } = openServerStorage(config);
 process.on("exit", releaseDataDir);
 const app = await buildApp(config, {
   vite: config.env === "development",
   db: storage.db,
   masterKey: storage.masterKey,
+  // The schedule engine (#33) runs only while this process holds the data folder.
+  dataLock: { held },
 });
 if (recovered !== "none") logEvent(app.log, "warn", "restore.recovered", { restoreCode: recovered });
 app.addHook("onClose", async () => {

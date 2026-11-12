@@ -17,6 +17,10 @@ import { registerAdminSystemRoutes, type SystemRouteOptions } from "./admin/rout
 import { BackupService, type BackupServiceOptions } from "./backup/backup.js";
 import { FileWriteLock } from "./backup/lock.js";
 import { registerBackupRoutes } from "./backup/routes.js";
+import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
+import { FakeScheduleHandler } from "./schedules/fake.js";
+import { registerScheduleRoutes } from "./schedules/routes.js";
+import { ScheduleStore } from "./schedules/store.js";
 import { SkillSwitches } from "./mcp/switches.js";
 import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
@@ -133,6 +137,11 @@ declare module "fastify" {
     backups: BackupService | undefined;
     /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
     storedRescrub: StoredRescrub | undefined;
+    /**
+     * Schedules (#33): the store, and the engine when there is a handler (none until #56; the fake one with
+     * FAKE_RUNTIME=1). undefined without a database.
+     */
+    schedules: { store: ScheduleStore; engine: ScheduleEngine | undefined } | undefined;
   }
 }
 
@@ -207,6 +216,22 @@ export type BuildOptions = {
   backup?: BackupServiceOptions & { schedule?: boolean };
   /** Uploads (#22): clock and test hooks. */
   files?: FileStoreOptions;
+  /**
+   * Schedules (#33): the run handler (default: none — the real one is #56 — or the fake one with FAKE_RUNTIME=1),
+   * engine timing overrides, and `start: true` to run the engine in a test (it runs by itself only in a server that
+   * holds the data folder lock, `dataLock`).
+   */
+  schedules?: {
+    handler?: ScheduleHandler;
+    start?: boolean;
+    engine?: ScheduleEngineOptions;
+    now?: () => number;
+  };
+  /**
+   * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
+   * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
+   */
+  dataLock?: { held: () => boolean };
 };
 
 /**
@@ -543,6 +568,32 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => backups.start());
     // Before the database closes (index.ts closes it in onClose): a backup in progress finishes first.
     if (backups) app.addHook("preClose", async () => backups.stop());
+    // Schedules (#33): persistent occurrences and runs; the engine needs a handler and the data folder to be ours.
+    const scheduleStore = new ScheduleStore(opts.db!);
+    const scheduleHandler =
+      opts.schedules?.handler ?? (config.fakeRuntime ? new FakeScheduleHandler() : undefined);
+    const dataLock = opts.dataLock;
+    const scheduleEngine = scheduleHandler
+      ? new ScheduleEngine(scheduleStore, scheduleHandler, {
+          log: app.log,
+          ...(dataLock ? { owned: () => dataLock.held() } : {}),
+          ...(opts.schedules?.now ? { now: opts.schedules.now } : {}),
+          ...opts.schedules?.engine,
+        })
+      : undefined;
+    app.decorate("schedules", { store: scheduleStore, engine: scheduleEngine });
+    registerScheduleRoutes(app, {
+      store: scheduleStore,
+      engine: scheduleEngine,
+      defaults,
+      users,
+      mcp,
+      now: opts.schedules?.now ?? opts.schedules?.engine?.now ?? Date.now,
+    });
+    if (scheduleEngine && (opts.schedules?.start || (config.env !== "test" && dataLock)))
+      app.addHook("onReady", async () => scheduleEngine.start());
+    // Before the database closes: runs in progress are aborted and waited for (the rest recover at the next start).
+    if (scheduleEngine) app.addHook("preClose", async () => scheduleEngine.stop());
     registerSourceRoutes(app, app.conversations!, sources);
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
     let renderer = opts.renderer;
@@ -605,6 +656,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("backups", undefined);
     app.decorate("storedRescrub", undefined);
     app.decorate("files", undefined);
+    app.decorate("schedules", undefined);
   }
 
   app.get(
