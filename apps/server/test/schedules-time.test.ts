@@ -71,6 +71,93 @@ describe("occurrences of the five types (Asia/Seoul)", () => {
       expect(() => parseCron(bad), bad).toThrow(CronError);
   });
 
+  it("cron day fields (vixie): */n is restricted; both restricted → either, otherwise both (review 1)", () => {
+    const UTC = "UTC";
+    const days = (cron: string, from: number, n: number) => {
+      const out: string[] = [];
+      let t: number | null = from;
+      for (let i = 0; i < n; i++)
+        out.push(iso((t = nextOccurrence({ type: "cron", cron }, UTC, t!)))!.slice(0, 10));
+      return out;
+    };
+    const nov13 = Date.UTC(2026, 10, 13, 12); // Friday
+    // day-of-month */2: 1, 3, 5, … (15 after the 13th), across the month end (31 → 1, Nov has 30 → Dec 1)
+    expect(days("0 0 */2 * *", nov13, 4)).toEqual(["2026-11-15", "2026-11-17", "2026-11-19", "2026-11-21"]);
+    expect(days("0 0 */2 * *", Date.UTC(2026, 10, 28), 3)).toEqual([
+      "2026-11-29",
+      "2026-12-01",
+      "2026-12-03",
+    ]);
+    expect(days("0 0 */2 * *", Date.UTC(2026, 11, 30), 2)).toEqual(["2026-12-31", "2027-01-01"]);
+    // day-of-week */2: Sun, Tue, Thu, Sat — not Friday after Thursday
+    expect(days("0 0 * * */2", Date.UTC(2026, 10, 12, 12), 4)).toEqual([
+      "2026-11-14", // Sat
+      "2026-11-15", // Sun
+      "2026-11-17", // Tue
+      "2026-11-19", // Thu
+    ]);
+    // both restricted → either: the 1st–7th OR any Monday
+    expect(days("0 0 1-7 * 1", Date.UTC(2026, 10, 20), 5)).toEqual([
+      "2026-11-23", // Mon
+      "2026-11-30", // Mon
+      "2026-12-01",
+      "2026-12-02",
+      "2026-12-03",
+    ]);
+    // a day-of-week step counts as restricted too: the 1st OR Sun/Wed/Sat
+    expect(days("0 0 1 * */3", Date.UTC(2026, 10, 25, 12), 4)).toEqual([
+      "2026-11-28", // Sat
+      "2026-11-29", // Sun
+      "2026-12-01", // the 1st (a Tuesday)
+      "2026-12-02", // Wed
+    ]);
+    // step + list combinations
+    expect(days("0 0 1,15-20/5 * *", Date.UTC(2026, 10, 2), 4)).toEqual([
+      "2026-11-15",
+      "2026-11-20",
+      "2026-12-01",
+      "2026-12-15",
+    ]);
+    // both restricted with steps: */10 (1, 11, 21, 31) OR Sunday
+    expect(days("0 0 */10 * 0", Date.UTC(2026, 10, 25), 4)).toEqual([
+      "2026-11-29", // Sun
+      "2026-12-01",
+      "2026-12-06", // Sun
+      "2026-12-11",
+    ]);
+    // only months restricted with a step: day fields * → every day of Jan, Mar, …
+    expect(days("0 0 1 */2 *", Date.UTC(2026, 10, 2), 2)).toEqual(["2027-01-01", "2027-03-01"]);
+    // 31st only in long months (month boundaries)
+    expect(days("0 0 31 * *", Date.UTC(2027, 0, 31, 12), 3)).toEqual([
+      "2027-03-31",
+      "2027-05-31",
+      "2027-07-31",
+    ]);
+  });
+
+  it("one-off dates must exist: leap years and month lengths (review 1)", async () => {
+    const { isCalendarDate, LocalDate } = await import("@agentlee/shared");
+    for (const ok of ["2028-02-29", "2000-02-29", "2027-02-28", "2027-04-30", "2027-12-31"])
+      expect(isCalendarDate(ok), ok).toBe(true);
+    for (const bad of [
+      "2027-02-29",
+      "1900-02-29",
+      "2027-02-30",
+      "2027-04-31",
+      "2027-13-01",
+      "2027-00-10",
+      "2027-01-00",
+    ])
+      expect([isCalendarDate(bad), LocalDate.safeParse(bad).success], bad).toEqual([false, false]);
+    const { firstRunAfter, ScheduleInputError } = await import("../src/schedules/store.js");
+    expect(() => firstRunAfter({ type: "once", date: "2027-02-30", time: "08:00" }, SEOUL, THU)).toThrow(
+      ScheduleInputError,
+    );
+    expect(iso(nextOccurrence({ type: "once", date: "2028-02-29", time: "08:00" }, SEOUL, THU))).toBe(
+      "2028-02-28T23:00:00.000Z",
+    );
+  });
+
   it("latest occurrence in a window (the missed catch-up)", () => {
     const sun2 = THU + 3 * 86_400_000 + 2 * 3_600_000;
     expect(iso(latestOccurrence({ type: "daily", time: "08:00" }, SEOUL, sun2, THU))).toBe(

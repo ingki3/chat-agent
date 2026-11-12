@@ -324,13 +324,24 @@ describe("crash recovery at each step (the run left running, then a new process)
     await advanceTo(at8(0) + (script ? RETRY_MS : 0) + 1000);
     await a.engine.stop(); // the process dies: its pending step never returns
     const left = runsOf(w, s.id)[0]!;
+    // What process A left behind, captured before the restart (copies — B must not be able to change them).
+    const before = {
+      results: structuredClone([...outbox.results]),
+      notifications: structuredClone([...outbox.notifications]),
+    };
     await advance(30_000);
     const restart = Date.now();
     const b = proc(w, { outbox });
     b.engine.start();
     await advance(0);
-    return { w, s, outbox, a: a.handler, b: b.handler, left, restart };
+    return { w, s, outbox, a: a.handler, b: b.handler, left, restart, before };
   }
+  /** Each side effect really happened exactly once for the run. */
+  const onceEach = (outbox: FakeOutbox, runId: string) => {
+    expect(outbox.saveWrites.get(runId)).toBe(1);
+    expect(outbox.publishes.get(runId)).toBe(1);
+    expect([...outbox.saveWrites.keys(), ...outbox.publishes.keys()]).toEqual([runId, runId]);
+  };
 
   it("just after start: the start counts as the attempt — the one retry 2 minutes after the restart", async () => {
     const { w, s, b, left, restart, outbox } = await crashAt({ execute: true });
@@ -344,6 +355,7 @@ describe("crash recovery at each step (the run left running, then a new process)
     expect([r!.status, r!.attempts]).toEqual(["succeeded", 2]);
     expect(outbox.results.size).toBe(1);
     expect(outbox.notifications.size).toBe(1);
+    onceEach(outbox, runsOf(w, s.id)[0]!.id);
   });
 
   it("just after the retry's start: no attempt left → failed `interrupted`, saved and notified, not run again", async () => {
@@ -368,15 +380,19 @@ describe("crash recovery at each step (the run left running, then a new process)
     expect(r!.result_saved_at).not.toBeNull();
     expect(outbox.results.size).toBe(1);
     expect(outbox.notifications.size).toBe(1);
+    onceEach(outbox, runsOf(w, s.id)[0]!.id);
   });
 
   it("saved by the handler but not yet recorded: the save is called again and stores nothing twice", async () => {
-    const { w, s, b, outbox } = await crashAt({ saved: true });
-    const first = [...outbox.results.values()][0]!.at;
+    const { w, s, b, outbox, before } = await crashAt({ saved: true });
+    // A had stored the result (and published nothing) before it died.
+    expect(before.results).toHaveLength(1);
+    expect(before.notifications).toHaveLength(0);
     expect(steps(b)).toEqual(["save#1", "notify#1"]);
-    expect(outbox.results.size).toBe(1);
-    expect([...outbox.results.values()][0]!.at).toBe(first);
-    expect(runsOf(w, s.id)[0]!.status).toBe("succeeded");
+    const [r] = runsOf(w, s.id);
+    expect([...outbox.results]).toEqual(before.results);
+    onceEach(outbox, r!.id);
+    expect(r!.status).toBe("succeeded");
   });
 
   it("before the notification: resumes at the notify step — saved once, notified once", async () => {
@@ -390,10 +406,14 @@ describe("crash recovery at each step (the run left running, then a new process)
   });
 
   it("published but not yet recorded: notify is called again and publishes nothing twice", async () => {
-    const { w, s, b, outbox } = await crashAt({ notified: true });
+    const { w, s, b, outbox, before } = await crashAt({ notified: true });
+    expect(before.notifications).toHaveLength(1);
     expect(steps(b)).toEqual(["notify#1"]);
-    expect(outbox.notifications.size).toBe(1);
-    expect(runsOf(w, s.id)[0]!.status).toBe("succeeded");
+    const [r] = runsOf(w, s.id);
+    expect([...outbox.notifications]).toEqual(before.notifications);
+    expect([...outbox.results]).toEqual(before.results);
+    onceEach(outbox, r!.id);
+    expect(r!.status).toBe("succeeded");
   });
 
   it("every step recorded as done is skipped on resume: only the finish is left", async () => {
@@ -432,6 +452,71 @@ describe("crash recovery at each step (the run left running, then a new process)
     await advance(RETRY_MS);
     expect(runsOf(w, s.id)[0]!.status).toBe("succeeded");
     expect(steps(handler).filter((x) => x.startsWith("execute"))).toHaveLength(1);
+  });
+});
+
+describe("a step that returns after shutdown or a lost lock (review 1)", () => {
+  beforeEach(() => fakeClock(THU));
+
+  /** The 08:00 run with `step` held open until the test lets it return. */
+  async function held(step: "execute" | "saveResult" | "notify", ownedFlag?: { v: boolean }) {
+    const w = world();
+    const s = schedule(w, { type: "daily", time: "08:00" });
+    const handler = new FakeScheduleHandler();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const orig = handler[step].bind(handler) as (...a: unknown[]) => Promise<unknown>;
+    (handler as unknown as Record<string, unknown>)[step] = async (...a: unknown[]) => {
+      await gate;
+      return orig(...a);
+    };
+    const engine = new ScheduleEngine(w.store, handler, {
+      stopGraceMs: 0,
+      ...(ownedFlag ? { owned: () => ownedFlag.v } : {}),
+    });
+    engines.push(engine);
+    engine.start();
+    await advanceTo(at8(0) + 1000);
+    const before = { ...runsOf(w, s.id)[0]! };
+    return { w, s, handler, engine, release, before };
+  }
+
+  for (const step of ["execute", "saveResult", "notify"] as const) {
+    it(`${step} returning after shutdown: no later step, the row untouched`, async () => {
+      const { w, s, handler, engine, release, before } = await held(step);
+      await engine.stop();
+      release();
+      await advance(10 * MIN);
+      expect(handler.calls.at(-1)!.step).toBe(step === "saveResult" ? "save" : step);
+      expect(runsOf(w, s.id)[0]).toEqual(before);
+      expect(before.status).toBe("running");
+    });
+
+    it(`${step} returning after the data lock was lost: no later step, the row untouched, the engine stops`, async () => {
+      const owned = { v: true };
+      const { w, s, handler, engine, release, before } = await held(step, owned);
+      owned.v = false;
+      release();
+      await advance(10 * MIN);
+      expect(handler.calls.at(-1)!.step).toBe(step === "saveResult" ? "save" : step);
+      expect(runsOf(w, s.id)[0]).toEqual(before);
+      expect(engine.running).toBe(false);
+    });
+  }
+
+  it("the next process resumes what the late step left", async () => {
+    const { w, s, engine, release, handler } = await held("saveResult");
+    await engine.stop();
+    release();
+    await advance(MIN);
+    const b = proc(w, { outbox: handler.outbox });
+    b.engine.start();
+    await advance(0);
+    expect(steps(b.handler)).toEqual(["save#1", "notify#1"]);
+    const [r] = runsOf(w, s.id);
+    expect(r!.status).toBe("succeeded");
+    expect(handler.outbox.saveWrites.get(r!.id)).toBe(1);
+    expect(handler.outbox.publishes.get(r!.id)).toBe(1);
   });
 });
 
@@ -703,10 +788,22 @@ describe("schedule API (owner only) and the app lifecycle", () => {
       [{ type: "cron", cron: "61 * * * *" }, "cron_invalid"],
       [{ type: "cron", cron: "0 0 31 2 *" }, "schedule_never"],
       [{ type: "once", date: "2020-01-01", time: "08:00" }, "schedule_in_past"],
+      // dates that do not exist are refused (never normalised to another day)
+      [{ type: "once", date: "2027-02-29", time: "08:00" }, "invalid_request"],
+      [{ type: "once", date: "2027-02-30", time: "08:00" }, "invalid_request"],
+      [{ type: "once", date: "2027-04-31", time: "08:00" }, "invalid_request"],
+      [{ type: "once", date: "2027-13-01", time: "08:00" }, "invalid_request"],
     ] as const) {
       const x = await req(f.cookies.owner, "POST", "/api/schedules", { ...create, timing });
       expect([x.statusCode, x.json().error]).toEqual([400, code]);
     }
+    const leap = await req(f.cookies.owner, "POST", "/api/schedules", {
+      ...create,
+      timing: { type: "once", date: "2028-02-29", time: "08:00" },
+    });
+    expect(leap.statusCode).toBe(201);
+    expect(Schedule.parse(leap.json()).nextRunAt).toBe(Date.UTC(2028, 1, 28, 23));
+    await req(f.cookies.owner, "DELETE", `/api/schedules/${leap.json().id}`);
     const tz = await req(f.cookies.owner, "POST", "/api/schedules", { ...create, timeZone: "Mars/Base" });
     expect([tz.statusCode, tz.json().error]).toEqual([400, "invalid_time_zone"]);
     expect((await req(f.cookies.owner, "GET", "/api/schedules")).json().schedules).toHaveLength(1);

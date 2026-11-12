@@ -104,7 +104,7 @@ export type Cron = {
   days: Set<number>;
   months: Set<number>;
   weekdays: Set<number>;
-  /** Vixie cron: when both day fields are restricted, a day matches either one. */
+  /** Vixie cron: when both day fields are restricted (not exactly "*"), a day matches either one, else both. */
   daysRestricted: boolean;
   weekdaysRestricted: boolean;
 };
@@ -140,8 +140,9 @@ export function parseCron(expr: string): Cron {
     months: new Set(field(mon, 1, 12)),
     // 7 is Sunday too
     weekdays: new Set(field(dow, 0, 7).map((d) => d % 7)),
-    daysRestricted: !dom.startsWith("*"),
-    weekdaysRestricted: !dow.startsWith("*"),
+    // Vixie cron: a field is unrestricted only when it is exactly "*" (`*/2` is restricted).
+    daysRestricted: dom !== "*",
+    weekdaysRestricted: dow !== "*",
   };
 }
 
@@ -188,14 +189,8 @@ function compile(timing: Timing): Compiled {
           if (!c.months.has(date.getUTCMonth() + 1)) return [];
           const dom = c.days.has(date.getUTCDate());
           const dow = c.weekdays.has(weekdayOf(day));
-          const ok =
-            c.daysRestricted && c.weekdaysRestricted
-              ? dom || dow
-              : c.daysRestricted
-                ? dom
-                : c.weekdaysRestricted
-                  ? dow
-                  : true;
+          // Both restricted: either one; otherwise both (an unrestricted field's set holds every day).
+          const ok = c.daysRestricted && c.weekdaysRestricted ? dom || dow : dom && dow;
           return ok ? m : [];
         },
       };

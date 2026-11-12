@@ -243,7 +243,23 @@ export class ScheduleEngine {
     logEvent(this.opts.log, "warn", "schedule.step_failed", { runId, scheduleStep: step, err: e });
   }
 
+  /**
+   * Whether this process may still touch the run: not stopped, and still holding the data folder (#33 review 1).
+   * Checked before every step and after every await — a step that returns after shutdown or a lost lock records
+   * nothing and starts no further step; the row stays as it was and the next start resumes it.
+   */
+  private alive(): boolean {
+    if (this.stopped) return false;
+    if (this.opts.owned && !this.opts.owned()) {
+      logEvent(this.opts.log, "warn", "schedule.engine_stopped", { scheduleCode: "storage_not_owned" });
+      void this.stop();
+      return false;
+    }
+    return true;
+  }
+
   private async work(id: string, ctx: ScheduleRunContext, fresh: boolean): Promise<void> {
+    if (!this.alive()) return;
     if (fresh) {
       let ex: ExecuteOutcome;
       try {
@@ -252,7 +268,7 @@ export class ScheduleEngine {
         ex = { ok: false, code: "handler_error" };
       }
       // Stopped meanwhile: nothing is recorded — the next start sees a start without an outcome (an attempt).
-      if (this.stopped) return;
+      if (!this.alive()) return;
       const code = ex.ok ? null : (runCode(ex.code) ?? "handler_error");
       if (!ex.ok && ctx.attempt < MAX_ATTEMPTS) {
         this.store.retryLater(id, code!, this.now() + this.retryMs);
@@ -276,23 +292,30 @@ export class ScheduleEngine {
     };
     let resultRef = row.result_ref;
     if (row.result_saved_at === null) {
+      if (!this.alive()) return;
       try {
         resultRef = ref((await this.handler.saveResult(ctx, outcome)).resultRef);
       } catch (e) {
+        if (!this.alive()) return;
         return this.stepFailed(id, "save", e);
       }
+      if (!this.alive()) return;
       this.store.resultSaved(id, resultRef, this.now());
     }
     if (row.notified_at === null) {
+      if (!this.alive()) return;
       // The switch as it is now (it may have been turned off since the run started).
       if (this.store.byId(ctx.scheduleId)?.notify)
         try {
           await this.handler.notify(ctx, outcome, { resultRef });
         } catch (e) {
+          if (!this.alive()) return;
           return this.stepFailed(id, "notify", e);
         }
+      if (!this.alive()) return;
       this.store.notified(id, this.now());
     }
+    if (!this.alive()) return;
     this.backoff.delete(id);
     this.store.finish(id, this.now());
     logEvent(this.opts.log, outcome.status === "succeeded" ? "info" : "warn", "schedule.run_finished", {

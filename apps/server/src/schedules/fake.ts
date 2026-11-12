@@ -11,8 +11,17 @@ export type FakeOutbox = {
   results: Map<string, RunOutcome & { at: number }>;
   /** runId → the published notification (one per run: `notify` is idempotent). */
   notifications: Map<string, { status: RunOutcome["status"]; at: number }>;
+  /** runId → how many times a result was really written / a notification really published (each must be 1). */
+  saveWrites: Map<string, number>;
+  publishes: Map<string, number>;
 };
-export const fakeOutbox = (): FakeOutbox => ({ results: new Map(), notifications: new Map() });
+export const fakeOutbox = (): FakeOutbox => ({
+  results: new Map(),
+  notifications: new Map(),
+  saveWrites: new Map(),
+  publishes: new Map(),
+});
+const bump = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
 
 export type FakeScheduleHandlerOptions = {
   now?: () => number;
@@ -56,8 +65,10 @@ export class FakeScheduleHandler implements ScheduleHandler {
   async saveResult(ctx: ScheduleRunContext, outcome: RunOutcome): Promise<{ resultRef: string | null }> {
     this.record("save", ctx);
     if (this.opts.hang?.save) return never();
-    if (!this.outbox.results.has(ctx.runId))
+    if (!this.outbox.results.has(ctx.runId)) {
       this.outbox.results.set(ctx.runId, { ...outcome, at: this.now() });
+      bump(this.outbox.saveWrites, ctx.runId);
+    }
     if (this.opts.hang?.saved) return never();
     return { resultRef: `result:${ctx.runId}` };
   }
@@ -65,8 +76,10 @@ export class FakeScheduleHandler implements ScheduleHandler {
   async notify(ctx: ScheduleRunContext, outcome: RunOutcome): Promise<void> {
     this.record("notify", ctx);
     if (this.opts.hang?.notify) return never();
-    if (!this.outbox.notifications.has(ctx.runId))
+    if (!this.outbox.notifications.has(ctx.runId)) {
       this.outbox.notifications.set(ctx.runId, { status: outcome.status, at: this.now() });
+      bump(this.outbox.publishes, ctx.runId);
+    }
     if (this.opts.hang?.notified) return never();
   }
 }

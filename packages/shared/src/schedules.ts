@@ -9,8 +9,18 @@ export type ScheduleType = z.infer<typeof ScheduleType>;
 
 /** Local wall-clock time "HH:MM" (24h) in the schedule's time zone. */
 export const LocalTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
-/** Local calendar date "YYYY-MM-DD" in the schedule's time zone. */
-export const LocalDate = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/);
+/** A real calendar date "YYYY-MM-DD": month lengths and leap years checked (2027-02-29, 2027-04-31 are not). */
+export function isCalendarDate(v: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (mo < 1 || mo > 12 || d < 1) return false;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1]!;
+  return d <= days;
+}
+/** Local calendar date "YYYY-MM-DD" in the schedule's time zone — a date that exists (never normalised). */
+export const LocalDate = z.string().refine(isCalendarDate, { message: "not a calendar date" });
 
 /**
  * When a schedule runs (FR-8.2): once on a date, every day, Monday–Friday, on chosen weekdays (0 = Sunday … 6 =

@@ -8,14 +8,17 @@ import type {
   ScheduleTiming,
   ScheduleTrigger,
 } from "@agentlee/shared";
-import { SCHEDULE_RUN_CODES } from "@agentlee/shared";
+import { isCalendarDate, SCHEDULE_RUN_CODES } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { scrubKnown } from "../secrets/known.js";
 import { CronError, isValidTimeZone, nextOccurrence } from "./time.js";
 
 /** Why a schedule cannot be stored (400). */
 export class ScheduleInputError extends Error {
-  constructor(readonly code: "invalid_time_zone" | "cron_invalid" | "schedule_in_past" | "schedule_never") {
+  constructor(
+    readonly code:
+      "invalid_time_zone" | "invalid_date" | "cron_invalid" | "schedule_in_past" | "schedule_never",
+  ) {
     super(code);
   }
 }
@@ -134,6 +137,8 @@ export function toRun(r: RunRow): ScheduleRun {
 /** The next occurrence after `at`; throws the 400 code when there is none. */
 export function firstRunAfter(timing: ScheduleTiming, timeZone: string, at: number): number {
   if (!isValidTimeZone(timeZone)) throw new ScheduleInputError("invalid_time_zone");
+  // A date that does not exist is refused, never normalised (2027-02-30 is not 2 March).
+  if (timing.type === "once" && !isCalendarDate(timing.date)) throw new ScheduleInputError("invalid_date");
   let next: number | null;
   try {
     next = nextOccurrence(timing, timeZone, at);
