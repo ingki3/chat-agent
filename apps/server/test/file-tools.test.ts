@@ -2741,7 +2741,7 @@ describe("OCR capability", () => {
 describe("review #107 12차: OCR in Tesseract's own order; a page's own text and its picture's text are two layers; boxes from four corners", () => {
   const jpeg = fs.readFileSync(path.join(FIX, "photo.jpg"));
   /** A PDF of pages drawn by `ops` (photo.jpg, 1000 × 300, is `/Im1` on each), with an optional `/Rotate`. */
-  const pdfPages = (pages: { ops: string; rotate?: number }[]) => {
+  const pdfPages = (pages: { ops: string; rotate?: number; crop?: number[] }[]) => {
     const objs: (string | Buffer)[] = [
       "<< /Type /Catalog /Pages 2 0 R >>",
       "",
@@ -2759,7 +2759,7 @@ describe("review #107 12차: OCR in Tesseract's own order; a page's own text and
     for (const pg of pages) {
       kids.push(objs.length + 1);
       objs.push(
-        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]${pg.rotate ? ` /Rotate ${pg.rotate}` : ""} /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents ${objs.length + 2} 0 R >>`,
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]${pg.crop ? ` /CropBox [${pg.crop.join(" ")}]` : ""}${pg.rotate ? ` /Rotate ${pg.rotate}` : ""} /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents ${objs.length + 2} 0 R >>`,
       );
       objs.push(`<< /Length ${Buffer.byteLength(pg.ops)} >>\nstream\n${pg.ops}\nendstream`);
     }
@@ -2934,6 +2934,110 @@ describe("review #107 12차: OCR in Tesseract's own order; a page's own text and
     reg.add(raw);
     expect(scrubFile(segs, reg).map((x) => x.text)).toEqual(["p.1", "total [숨김]\ndone", "next page text"]);
     await nothingSurvives("layers", raw, [enc], blocks, body);
+  }, 60_000);
+
+  it("13차: a box running off the page is clipped at the page's edges first, its size from the clipped edges; wholly off → no box", async () => {
+    /** The page as shown: its crop box turned by `/Rotate` (pdf.js), points → top-left pixels of the view. */
+    const shown = (rotate: number, [x0, y0, x1, y1]: number[]) => {
+      const [cw, ch] = [x1! - x0!, y1! - y0!];
+      const size = rotate % 180 ? [ch, cw] : [cw, ch];
+      const map = ([x, y]: number[]): number[] =>
+        rotate === 0
+          ? [x! - x0!, y1! - y!]
+          : rotate === 90
+            ? [y! - y0!, x! - x0!]
+            : rotate === 180
+              ? [x1! - x!, y! - y0!]
+              : [y1! - y!, x1! - x!];
+      return { size: size as [number, number], map };
+    };
+    /** What the box should be: the word's corners on the page, clipped to the view, then sized. */
+    const expected = (cm: number[], word: number[], rotate: number, crop: number[]) => {
+      const { size, map } = shown(rotate, crop);
+      const toPage = (px: number, py: number) => {
+        const u = px / 1000;
+        const v = 1 - py / 300;
+        return [cm[0]! * u + cm[2]! * v + cm[4]!, cm[1]! * u + cm[3]! * v + cm[5]!];
+      };
+      const pts = [
+        toPage(word[0]!, word[1]!),
+        toPage(word[2]!, word[1]!),
+        toPage(word[2]!, word[3]!),
+        toPage(word[0]!, word[3]!),
+      ].map(map);
+      const clip = (v: number, m: number) => Math.min(m, Math.max(0, v));
+      const l = clip(Math.min(...pts.map((p) => p[0]!)), size[0]);
+      const r = clip(Math.max(...pts.map((p) => p[0]!)), size[0]);
+      const t = clip(Math.min(...pts.map((p) => p[1]!)), size[1]);
+      const b = clip(Math.max(...pts.map((p) => p[1]!)), size[1]);
+      return r > l && b > t ? [l / size[0], t / size[1], (r - l) / size[0], (b - t) / size[1]] : undefined;
+    };
+    const near = (a: number[], b: number[]) => a.every((x, i) => Math.abs(x - b[i]!) < 0.0002);
+    const MEDIA = [0, 0, 612, 792];
+    // A 200 × 100 picture across each edge of the media box (the word is the whole picture).
+    const across: [string, number[]][] = [
+      ["left", [200, 0, 0, 100, -100, 300]],
+      ["right", [200, 0, 0, 100, 512, 300]],
+      ["bottom", [200, 0, 0, 100, 200, -50]],
+      ["top", [200, 0, 0, 100, 200, 742]],
+    ];
+    const cases: {
+      name: string;
+      cm: number[];
+      word: number[];
+      rotate?: number;
+      crop?: number[];
+      want?: number[] | null;
+    }[] = [];
+    for (const rotate of [0, 90, 180, 270])
+      for (const [edge, cm] of across)
+        cases.push({ name: `${edge} edge, /Rotate ${rotate}`, cm, word: [0, 0, 1000, 300], rotate });
+    // Codex's repro: a flipped picture (negative x scale), x −44…164 on the page.
+    cases.push({
+      name: "flipped (Codex's repro)",
+      cm: [-800, 0, 0, 100, 300, 200],
+      word: [170, 30, 430, 210],
+      want: [0, 0.6338, 0.268, 0.0758],
+    });
+    // A crop box: the view is the crop, not the media box — the picture runs past the crop's left edge.
+    for (const rotate of [0, 90])
+      cases.push({
+        name: `past the crop box's left edge, /Rotate ${rotate}`,
+        cm: [200, 0, 0, 100, 0, 300],
+        word: [0, 0, 1000, 300],
+        rotate,
+        crop: [50, 50, 562, 742],
+      });
+    // Wholly off the page: no box at all.
+    cases.push({
+      name: "wholly off the page",
+      cm: [200, 0, 0, 100, -400, 300],
+      word: [0, 0, 1000, 300],
+      want: null,
+    });
+    for (const c of cases) {
+      const body = pdfPages([
+        {
+          ops: `q ${c.cm.join(" ")} cm /Im1 Do Q`,
+          ...(c.rotate ? { rotate: c.rotate } : {}),
+          ...(c.crop ? { crop: c.crop } : {}),
+        },
+      ]);
+      const [x0, y0, x1, y1] = c.word;
+      const segs = await extractWith([[[w("WORDWORD", x0!, y0!, x1!, y1!)]]], body);
+      expect(segs.length, c.name).toBe(1);
+      const box = segs[0]!.marks![0]![2].bbox as number[] | undefined;
+      const want =
+        c.want === null ? undefined : (c.want ?? expected(c.cm, c.word, c.rotate ?? 0, c.crop ?? MEDIA));
+      if (!want) {
+        expect(box, c.name).toBeUndefined();
+        continue;
+      }
+      expect(box, c.name).toBeDefined();
+      expect(near(box!, want), `${c.name}: ${JSON.stringify(box)} ≠ ${JSON.stringify(want)}`).toBe(true);
+      // Inside the page, whatever the rotation.
+      expect(box![0]! + box![2]! <= 1.0001 && box![1]! + box![3]! <= 1.0001, c.name).toBe(true);
+    }
   }, 60_000);
 
   it("boxes from all four corners: a rotated picture, a skewed one, and a page shown rotated (/Rotate 90)", async () => {

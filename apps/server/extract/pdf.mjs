@@ -15,9 +15,10 @@ const r4 = (x) => Math.round(Math.min(1, Math.max(0, x)) * 10000) / 10000;
 /**
  * Points in page space (PDF units) → the box around them as `[x, y, w, h]`, fractions of the page as shown (rotation
  * applied), top-left origin. Every corner is mapped (review #107 12차): two diagonal corners of a rotated or skewed
- * shape do not bound it.
+ * shape do not bound it. The edges are clipped to the page first and the size comes from the clipped edges (13차: a
+ * box running off the page kept the off-page part in its width); nothing on the page → `undefined` (no box).
  */
-function normPoints(vp, points) {
+export function normPoints(vp, points) {
   // The viewport's matrix maps page space to its pixels (scale 1, rotation applied, origin top left).
   const [m0, m1, m2, m3, m4, m5] = vp.transform;
   const xs = [];
@@ -26,13 +27,17 @@ function normPoints(vp, points) {
     xs.push(m0 * x + m2 * y + m4);
     ys.push(m1 * x + m3 * y + m5);
   }
-  const left = Math.min(...xs);
-  const top = Math.min(...ys);
+  const clip = (v, max) => Math.min(max, Math.max(0, v));
+  const left = clip(Math.min(...xs), vp.width);
+  const right = clip(Math.max(...xs), vp.width);
+  const top = clip(Math.min(...ys), vp.height);
+  const bottom = clip(Math.max(...ys), vp.height);
+  if (!(right > left && bottom > top)) return undefined;
   return [
     r4(left / vp.width),
     r4(top / vp.height),
-    r4((Math.max(...xs) - left) / vp.width),
-    r4((Math.max(...ys) - top) / vp.height),
+    r4((right - left) / vp.width),
+    r4((bottom - top) / vp.height),
   ];
 }
 
@@ -97,7 +102,8 @@ function pageLines(items, vp) {
     if (text) text += "\n";
     const s = text.length;
     text += l.text;
-    marks.push([s, text.length, { bbox: normBox(vp, ...l.box) }]);
+    const bbox = normBox(vp, ...l.box);
+    marks.push([s, text.length, bbox ? { bbox } : {}]);
   }
   return { text, marks };
 }
@@ -162,18 +168,16 @@ async function ocrPage(page, vp, OPS, ocr) {
   return {
     text,
     // A word's four corners through the picture's matrix (rotated, skewed or flipped) and the page's rotation.
-    marks: marks.map(([s, e, { box }]) => [
-      s,
-      e,
-      {
-        bbox: normPoints(vp, [
-          toPage(box[0], box[1]),
-          toPage(box[2], box[1]),
-          toPage(box[2], box[3]),
-          toPage(box[0], box[3]),
-        ]),
-      },
-    ]),
+    // A word wholly off the page has no box (its unit's locator stays, without one).
+    marks: marks.map(([s, e, { box }]) => {
+      const bbox = normPoints(vp, [
+        toPage(box[0], box[1]),
+        toPage(box[2], box[1]),
+        toPage(box[2], box[3]),
+        toPage(box[0], box[3]),
+      ]);
+      return [s, e, bbox ? { bbox } : {}];
+    }),
   };
 }
 
