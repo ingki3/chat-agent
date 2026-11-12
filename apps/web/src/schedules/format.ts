@@ -1,9 +1,11 @@
-import type {
-  PublicPart,
-  ScheduleRun,
-  ScheduleRunStatus,
-  ScheduleTiming,
-  ScheduleTrigger,
+import {
+  ProposalChangedResponse,
+  type PublicPart,
+  type ScheduleProposal,
+  type ScheduleRun,
+  type ScheduleRunStatus,
+  type ScheduleTiming,
+  type ScheduleTrigger,
 } from "@agentlee/shared";
 
 /**
@@ -115,4 +117,13 @@ export function proposalIds(parts: readonly PublicPart[]): string[] {
     if (typeof id === "string" && /^[A-Za-z0-9-]{1,64}$/.test(id) && !out.includes(id)) out.push(id);
   }
   return out;
+}
+
+/**
+ * The card as it is now, from a confirm refused with 409 `proposal_changed` (review #108): the defaults or what is
+ * allowed changed after the card was shown. Undefined for any other error.
+ */
+export function changedProposal(body: unknown): ScheduleProposal | undefined {
+  const r = ProposalChangedResponse.safeParse(body);
+  return r.success ? r.data.proposal : undefined;
 }

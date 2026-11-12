@@ -47,7 +47,7 @@ async function start() {
   closers.push(() => app.close());
   await app.ready();
   const f = await createFamily(app);
-  const req = (who: Who, method: "GET" | "POST" | "PATCH" | "DELETE", url: string, body?: object) =>
+  const req = (who: Who, method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", url: string, body?: object) =>
     app.inject({
       method,
       url,
@@ -274,13 +274,21 @@ describe("schedule_create → confirmation card → created only on the owner's 
     // Owner only — the admin and anyone else are refused, and their confirm makes nothing.
     for (const who of ["admin", "stranger", "shared"] as const) {
       expect((await t.req(who, "GET", `/api/schedule-proposals/${id}`)).statusCode).toBe(403);
-      expect((await t.req(who, "POST", `/api/schedule-proposals/${id}/confirm`)).statusCode).toBe(403);
+      expect(
+        (await t.req(who, "POST", `/api/schedule-proposals/${id}/confirm`, { version: card.version }))
+          .statusCode,
+      ).toBe(403);
       expect((await t.req(who, "POST", `/api/schedule-proposals/${id}/dismiss`)).statusCode).toBe(403);
     }
     expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
     expect(t.app.schedules!.store.listFor(t.f.users.admin.id)).toEqual([]);
 
-    const ok = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`);
+    // Without the card's version nothing is made.
+    const bare = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`);
+    expect([bare.statusCode, bare.json().error]).toEqual([400, "invalid_request"]);
+    const ok = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, {
+      version: card.version,
+    });
     expect(ok.statusCode).toBe(201);
     const made = ConfirmScheduleProposalResponse.parse(ok.json());
     expect(made.schedule).toMatchObject({
@@ -291,7 +299,9 @@ describe("schedule_create → confirmation card → created only on the owner's 
     });
     expect(made.proposal).toMatchObject({ status: "confirmed", scheduleId: made.schedule.id });
     // Confirming again (another tab, a reload) gives the same schedule, never a second one.
-    const again = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`);
+    const again = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, {
+      version: card.version,
+    });
     expect([again.statusCode, again.json().schedule.id]).toEqual([200, made.schedule.id]);
     expect((await t.req("owner", "GET", "/api/schedules")).json().schedules).toHaveLength(1);
     const dismiss = await t.req("owner", "POST", `/api/schedule-proposals/${id}/dismiss`);
@@ -303,7 +313,7 @@ describe("schedule_create → confirmation card → created only on the owner's 
     const a = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
     const d = await t.req("owner", "POST", `/api/schedule-proposals/${a}/dismiss`);
     expect(ScheduleProposal.parse(d.json()).status).toBe("dismissed");
-    const c = await t.req("owner", "POST", `/api/schedule-proposals/${a}/confirm`);
+    const c = await t.req("owner", "POST", `/api/schedule-proposals/${a}/confirm`, { version: "any" });
     expect([c.statusCode, c.json().error]).toEqual([409, "proposal_dismissed"]);
     expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
     // Defaults that are not usable at confirm time: no schedule (409), and the proposal stays open.
@@ -316,12 +326,91 @@ describe("schedule_create → confirmation card → created only on the owner's 
       allowPersonal: true,
       allowShared: true,
     });
-    const refused = await t.req("owner", "POST", `/api/schedule-proposals/${b}/confirm`);
+    const refused = await t.req("owner", "POST", `/api/schedule-proposals/${b}/confirm`, { version: "any" });
     expect([refused.statusCode, refused.json().error]).toEqual([409, "no_usable_runtime"]);
     expect(
       ScheduleProposal.parse((await t.req("owner", "GET", `/api/schedule-proposals/${b}`)).json()).status,
     ).toBe("proposed");
     expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
+  });
+
+  it("confirm makes what the card showed: defaults changed since → 409 with the card as it is now (review #108)", async () => {
+    const t = await start();
+    const id = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const shown = ScheduleProposal.parse(
+      (await t.req("owner", "GET", `/api/schedule-proposals/${id}`)).json(),
+    );
+    expect(shown.settings).toMatchObject({ model: "fake-large", effort: "medium" });
+    // The owner changes their defaults in another tab.
+    const set = await t.req("owner", "PUT", "/api/settings/defaults", {
+      defaults: { runtime: "claude-code", models: { "claude-code": { model: "fake-small", effort: null } } },
+    });
+    expect(set.statusCode).toBe(200);
+    const stale = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, {
+      version: shown.version,
+    });
+    expect([stale.statusCode, stale.json().error]).toEqual([409, "proposal_changed"]);
+    const fresh = ScheduleProposal.parse(stale.json().proposal);
+    expect(fresh.settings).toMatchObject({ model: "fake-small", effort: null });
+    expect(fresh.version).not.toBe(shown.version);
+    expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
+    // Pressed again on the refreshed card: made with exactly that.
+    const ok = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, {
+      version: fresh.version,
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(ConfirmScheduleProposalResponse.parse(ok.json()).schedule.settings).toEqual(fresh.settings);
+  });
+
+  it("confirm makes what the card showed: a policy narrowed since (fallback) → 409, nothing made", async () => {
+    const t = await start();
+    const id = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const shown = ScheduleProposal.parse(
+      (await t.req("owner", "GET", `/api/schedule-proposals/${id}`)).json(),
+    );
+    expect(shown.settings).toMatchObject({ model: "fake-large" });
+    t.policy({ models: ["fake-small"] });
+    const stale = await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, {
+      version: shown.version,
+    });
+    expect([stale.statusCode, stale.json().error]).toEqual([409, "proposal_changed"]);
+    expect(ScheduleProposal.parse(stale.json().proposal).settings).toMatchObject({ model: "fake-small" });
+    expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
+    // Unchanged card (same defaults, same policy) still confirms with its version.
+    const now = ScheduleProposal.parse((await t.req("owner", "GET", `/api/schedule-proposals/${id}`)).json());
+    expect(
+      (await t.req("owner", "POST", `/api/schedule-proposals/${id}/confirm`, { version: now.version }))
+        .statusCode,
+    ).toBe(201);
+  });
+
+  it("edit: a skill whose permission was revoked can be removed, and the save then goes through with an allowed one", async () => {
+    const t = await start();
+    const names = (
+      (await t.req("owner", "GET", "/api/schedules/options")).json() as { skills: { name: string }[] }
+    ).skills.map((s) => s.name);
+    expect(names.length).toBeGreaterThanOrEqual(2);
+    const [revoked, kept] = [names[0]!, names[1]!];
+    const s = Schedule.parse(
+      (await t.req("owner", "POST", "/api/schedules", { ...create, skills: [revoked] })).json(),
+    );
+    const off = await t.req("admin", "PUT", `/api/admin/users/${t.f.users.owner.id}/skills/${revoked}`, {
+      enabled: false,
+    });
+    expect(off.statusCode).toBe(200);
+    const after = (
+      (await t.req("owner", "GET", "/api/schedules/options")).json() as { skills: { name: string }[] }
+    ).skills.map((x) => x.name);
+    expect(after).not.toContain(revoked);
+    // Keeping it is refused; a change that leaves the skills alone is not.
+    const keep = await t.req("owner", "PATCH", `/api/schedules/${s.id}`, { skills: [revoked, kept] });
+    expect([keep.statusCode, keep.json().error]).toEqual([403, "skill_not_allowed"]);
+    expect((await t.req("owner", "PATCH", `/api/schedules/${s.id}`, { name: "새 이름" })).statusCode).toBe(
+      200,
+    );
+    const removed = await t.req("owner", "PATCH", `/api/schedules/${s.id}`, { skills: [kept] });
+    expect(removed.statusCode).toBe(200);
+    expect(Schedule.parse(removed.json()).skills).toEqual([kept]);
   });
 
   it("the tool refuses what create would refuse, and proposes only into the run's own conversation", async () => {

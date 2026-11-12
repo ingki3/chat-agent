@@ -277,6 +277,7 @@ APP_MATRIX.push(
     route: "POST /api/schedule-proposals/:id/confirm",
     expect: { ...OWNER_ONLY, owner: 409 },
     fixture: proposal,
+    body: { version: "v" },
     errors: { owner: "no_usable_runtime", admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
   },
   {

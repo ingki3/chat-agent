@@ -4,15 +4,14 @@ import {
   SCHEDULE_DEFAULT_TIME_ZONE,
   type ChangeSettingsRequest,
   type ChatSettings,
-  type CreateScheduleRequest,
   type Schedule,
   type ScheduleTiming,
-  type UpdateScheduleRequest,
 } from "@agentlee/shared";
 import { errorText, schedules, settings as settingsApi } from "../api.js";
 import { ChipChoice } from "../chat/chip.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { TYPE_LABEL, WEEKDAY_NAMES, whenText } from "./format.js";
+import { saveSchedule, skillRows } from "./form.js";
 
 const TIME_ZONES = [
   "Asia/Seoul",
@@ -73,15 +72,6 @@ function timingOf(d: Draft): ScheduleTiming {
       return { type: "cron", cron: d.cron.trim() };
   }
 }
-
-const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-
-const asRequest = (c: ChatSettings): ChangeSettingsRequest => ({
-  runtime: c.runtime,
-  model: c.model,
-  ...(c.effort ? { effort: c.effort } : {}),
-  useShared: c.useShared,
-});
 
 /** `value`, once it has stayed the same for `ms` (the first one at once). */
 function useSettled<T>(value: T, ms: number): T {
@@ -146,31 +136,20 @@ export function ScheduleForm(props: {
     setError(null);
     setSaving(true);
     try {
-      // A chip change still on its way is waited for; a failed one stops the save (its error shows).
-      const settled = chosen ? await choice.settled() : null;
-      const picked = settled ? asRequest(settled) : {};
-      let saved: Schedule;
-      if (editing) {
-        const body: UpdateScheduleRequest = { ...picked };
-        if (d.name.trim() !== editing.name) body.name = d.name;
-        if (d.prompt.trim() !== editing.prompt) body.prompt = d.prompt;
-        if (!same(timing, editing.timing)) body.timing = timing;
-        if (d.timeZone !== editing.timeZone) body.timeZone = d.timeZone;
-        if (!same([...d.skills].sort(), [...editing.skills].sort())) body.skills = d.skills;
-        if (d.notify !== editing.notify) body.notify = d.notify;
-        saved = Object.keys(body).length ? await schedules.update(editing.id, body) : editing;
-      } else {
-        const body: CreateScheduleRequest = {
+      // The chip's choice is always settled first (a pending preview waited for, a failed one stops the save).
+      const saved = await saveSchedule(
+        {
           name: d.name,
           prompt: d.prompt,
           timing,
           timeZone: d.timeZone,
           skills: d.skills,
           notify: d.notify,
-          ...picked,
-        };
-        saved = await schedules.create(body);
-      }
+        },
+        editing,
+        choice,
+        schedules,
+      );
       props.onSaved(saved);
     } catch (err) {
       setError(errorText(err));
@@ -182,7 +161,14 @@ export function ScheduleForm(props: {
   const zones: string[] = TIME_ZONES.includes(d.timeZone as (typeof TIME_ZONES)[number])
     ? [...TIME_ZONES]
     : [d.timeZone, ...TIME_ZONES];
-  const skillList = options.data?.skills ?? [];
+  // The skills I may use now, and this schedule's own ones I may not use any more (to be removed).
+  const skillList = options.data
+    ? skillRows(
+        options.data.skills.map((s) => s.name),
+        d.skills,
+        editing?.skills ?? [],
+      )
+    : undefined;
 
   return (
     <form
@@ -321,15 +307,23 @@ export function ScheduleForm(props: {
 
       <fieldset className="field">
         <legend>스킬</legend>
-        {skillList.length === 0 ? (
+        {!skillList ? (
+          <span className="small muted">불러오는 중…</span>
+        ) : skillList.length === 0 ? (
           <span className="small muted">고를 수 있는 스킬이 없어요.</span>
         ) : (
           <div className="row wrap">
             {skillList.map((s) => (
-              <label key={s.name} className="inline row">
+              <label
+                key={s.name}
+                className={`inline row${s.available ? "" : " muted"}`}
+                data-testid={s.available ? undefined : "skill-revoked"}
+              >
                 <input
                   type="checkbox"
-                  checked={d.skills.includes(s.name)}
+                  checked={s.checked}
+                  disabled={s.disabled}
+                  aria-describedby={s.available ? undefined : f(`revoked-${s.name}`)}
                   onChange={(e) =>
                     set(
                       "skills",
@@ -338,6 +332,11 @@ export function ScheduleForm(props: {
                   }
                 />
                 {s.name}
+                {!s.available && (
+                  <span id={f(`revoked-${s.name}`)} className="badge warn">
+                    사용할 수 없어요{s.checked ? " — 체크를 풀어 빼세요" : ""}
+                  </span>
+                )}
               </label>
             ))}
           </div>

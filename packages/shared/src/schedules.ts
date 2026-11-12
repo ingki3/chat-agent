@@ -218,8 +218,22 @@ export const ScheduleProposal = z.object({
   /** The schedule made from it (status `confirmed`). */
   scheduleId: z.string().nullable(),
   createdAt: z.number(),
+  /**
+   * What the card shows, as the server can check it again (review #108): a hash of the proposal and its resolved
+   * runtime·model. Confirm sends it back; if the defaults (or what is allowed) changed meanwhile it no longer
+   * matches → 409 `proposal_changed` with the card as it is now, to be confirmed again.
+   */
+  version: z.string(),
 });
 export type ScheduleProposal = z.infer<typeof ScheduleProposal>;
+/** `POST /api/schedule-proposals/:id/confirm`: the `version` of the card the user pressed. */
+export const ConfirmScheduleProposalRequest = z.object({ version: z.string().min(1).max(128) }).strict();
+export type ConfirmScheduleProposalRequest = z.infer<typeof ConfirmScheduleProposalRequest>;
+/** 409 `proposal_changed`: the card as it is now. */
+export const ProposalChangedResponse = z.object({
+  error: z.literal("proposal_changed"),
+  proposal: ScheduleProposal,
+});
 /** `POST /api/schedule-proposals/:id/confirm`: the schedule (201 the first time, 200 when it was already made). */
 export const ConfirmScheduleProposalResponse = z.object({ proposal: ScheduleProposal, schedule: Schedule });
 export type ConfirmScheduleProposalResponse = z.infer<typeof ConfirmScheduleProposalResponse>;

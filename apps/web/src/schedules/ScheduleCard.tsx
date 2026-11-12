@@ -1,9 +1,10 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import type { ScheduleProposal } from "@agentlee/shared";
-import { errorText, schedules, SCHEDULES_KEY } from "../api.js";
+import { ApiError, errorText, schedules, SCHEDULES_KEY } from "../api.js";
 import { chipLabel } from "../chat/chip.js";
-import { timingText, whenText } from "./format.js";
+import { changedProposal, timingText, whenText } from "./format.js";
 
 export const proposalKey = (id: string) => ["schedule-proposal", id] as const;
 
@@ -20,9 +21,20 @@ export function ScheduleCard({ id }: { id: string }) {
     qc.setQueryData(proposalKey(id), p);
     void qc.invalidateQueries({ queryKey: SCHEDULES_KEY });
   };
+  // Set when the card changed under the user (409 `proposal_changed`): the refreshed card is shown with a note and
+  // must be pressed again — never made with something the user did not see (review #108).
+  const [changed, setChanged] = useState(false);
   const confirm = useMutation({
-    mutationFn: () => schedules.confirm(id),
+    mutationFn: (version: string) => schedules.confirm(id, version),
+    onMutate: () => setChanged(false),
     onSuccess: (r) => done(r.proposal),
+    onError: (e) => {
+      const fresh = e instanceof ApiError ? changedProposal(e.body) : undefined;
+      if (fresh) {
+        qc.setQueryData(proposalKey(id), fresh);
+        setChanged(true);
+      }
+    },
   });
   const dismiss = useMutation({ mutationFn: () => schedules.dismiss(id), onSuccess: done });
   const p = q.data;
@@ -83,7 +95,7 @@ export function ScheduleCard({ id }: { id: string }) {
             type="button"
             className="primary"
             disabled={busy || p.next.length === 0}
-            onClick={() => confirm.mutate()}
+            onClick={() => confirm.mutate(p.version)}
           >
             {confirm.isPending ? "만드는 중…" : "예약 만들기"}
           </button>
@@ -98,7 +110,13 @@ export function ScheduleCard({ id }: { id: string }) {
           <Link to={`/schedules/${encodeURIComponent(p.scheduleId)}`}>예약 화면에서 보기</Link>
         </p>
       )}
-      {(confirm.error ?? dismiss.error) && (
+      {changed && (
+        <p className="notice warn small" role="alert" data-testid="schedule-card-changed">
+          그사이 기본 런타임·모델(또는 허용 범위)이 바뀌어 카드 내용을 새로 고쳤어요. 확인하고 다시 눌러
+          주세요.
+        </p>
+      )}
+      {!changed && (confirm.error ?? dismiss.error) && (
         <p className="error small" role="alert">
           {errorText(confirm.error ?? dismiss.error)}
         </p>

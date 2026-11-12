@@ -1,5 +1,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
+import crypto from "node:crypto";
 import {
+  ConfirmScheduleProposalRequest,
   CreateScheduleRequest,
   SCHEDULE_PREVIEW_COUNT,
   SchedulePreviewRequest,
@@ -52,6 +54,8 @@ class Refused extends Error {
   constructor(
     readonly status: 400 | 403 | 409,
     readonly code: string,
+    /** More of the answer (e.g. the card as it is now). */
+    readonly extra: Record<string, unknown> = {},
   ) {
     super(code);
   }
@@ -125,9 +129,15 @@ export function registerScheduleRoutes(
       throw e;
     }
   };
-  const create = (user: UserRow, s: Omit<NewSchedule, "settings">, patch: ChangeSettingsRequest) => {
+  /** `fixed`: settings already resolved and shown to the user (a confirmed card) — used as they are. */
+  const create = (
+    user: UserRow,
+    s: Omit<NewSchedule, "settings">,
+    patch: ChangeSettingsRequest,
+    fixed?: ChatSettings,
+  ) => {
     checkSkills(user, s.skills);
-    const settings = settingsFor(user, null, patch);
+    const settings = fixed ?? settingsFor(user, null, patch);
     try {
       const row = store.create(user.id, { ...s, skills: [...new Set(s.skills)], settings }, deps.now());
       deps.engine?.kick();
@@ -147,7 +157,10 @@ export function registerScheduleRoutes(
     try {
       return fn();
     } catch (e) {
-      if (e instanceof Refused) return noStore(reply).code(e.status).send({ error: e.code });
+      if (e instanceof Refused)
+        return noStore(reply)
+          .code(e.status)
+          .send({ error: e.code, ...e.extra });
       throw e;
     }
   };
@@ -301,6 +314,15 @@ export function registerScheduleRoutes(
     } catch (e) {
       if (!(e instanceof ScheduleInputError)) throw e;
     }
+    const skills = JSON.parse(p.skills) as string[];
+    const settings = p.status === "proposed" ? (deps.defaults.start(user)?.settings ?? null) : null;
+    // What the card shows and confirm would make (the next runs move with the clock and are left out).
+    const version = crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify([p.id, p.status, p.name, p.prompt, timing, p.time_zone, skills, !!p.notify, settings]),
+      )
+      .digest("base64url");
     return {
       id: p.id,
       status: p.status,
@@ -308,12 +330,13 @@ export function registerScheduleRoutes(
       prompt: p.prompt,
       timing,
       timeZone: p.time_zone,
-      skills: JSON.parse(p.skills) as string[],
+      skills,
       notify: !!p.notify,
-      settings: p.status === "proposed" ? (deps.defaults.start(user)?.settings ?? null) : null,
+      settings,
       next,
       scheduleId: p.schedule_id,
       createdAt: p.created_at,
+      version,
     };
   };
 
@@ -328,13 +351,17 @@ export function registerScheduleRoutes(
 
   /**
    * The card's "만들기": the schedule is made here — by its owner's own request, with the same checks as
-   * `POST /api/schedules` (skills, the creator's defaults) — once. Again: 200 with the same schedule.
+   * `POST /api/schedules` (skills, the creator's defaults) — once. Again: 200 with the same schedule. It makes exactly
+   * what the pressed card showed (`version`, review #108): when the defaults or what is allowed changed since, the
+   * runtime·model would differ → 409 `proposal_changed` with the card as it is now, nothing made.
    */
   app.post<{ Params: { id: string } }>(
     "/api/schedule-proposals/:id/confirm",
     { config: proposalRule("write") },
     async (req, reply) =>
       answer(reply, () => {
+        const asked = parse(ConfirmScheduleProposalRequest, req.body ?? {}, reply);
+        if (!asked) return reply;
         const user = caller(req.ctx.user!.id);
         const at = deps.now();
         const r = proposals.confirm(
@@ -342,6 +369,9 @@ export function registerScheduleRoutes(
           (p) => {
             const timing = proposalTiming(p);
             if (!timing) throw new Refused(400, "invalid_request");
+            const now = toProposal(p, user);
+            if (!now.settings) throw new Refused(409, "no_usable_runtime");
+            if (now.version !== asked.version) throw new Refused(409, "proposal_changed", { proposal: now });
             return create(
               user,
               {
@@ -353,6 +383,7 @@ export function registerScheduleRoutes(
                 notify: !!p.notify,
               },
               {},
+              now.settings,
             ).id;
           },
           at,
