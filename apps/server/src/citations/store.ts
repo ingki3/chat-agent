@@ -22,15 +22,31 @@ export class CiteRefused extends Error {
  * conversation is that user's. Anything else is `unknown_source` (and the id it named is not kept). A source of
  * an earlier answer of the same conversation can be cited again: it is checked again against the stored text.
  */
+/**
+ * What `citations.snippet_key` holds: the normalised snippet hashed (review #97 round 23). It is only compared, and
+ * normalising folds characters (fullwidth to ASCII), so the normalised text itself could rebuild a known secret
+ * that the stored snippet does not hold.
+ */
+export const snippetKey = (snippet: string) =>
+  "sha256:" + crypto.createHash("sha256").update(normalizeSnippet(snippet), "utf8").digest("hex");
+
 export class CitationStore {
-  constructor(private readonly db: Db) {}
+  constructor(private readonly db: Db) {
+    // Rows from before keys were hashed (round 23): hashed once, in place, from the stored snippet.
+    const old = db.$client
+      .prepare("select id, snippet from citations where snippet_key not like 'sha256:%'")
+      .all() as { id: string; snippet: string }[];
+    const set = db.$client.prepare("update citations set snippet_key = ? where id = ?");
+    for (const r of old) set.run(snippetKey(r.snippet), r.id);
+  }
 
   /** Checks and registers one citation of the run; the same source and snippet twice keep their first number. */
   cite(scope: SourceScope, input: { sourceId: string; snippet: string }): CiteResult {
     // Known secrets are kept out of what is stored (the snippet is model output; the page text is scrubbed too).
     const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
-    const key = normalizeSnippet(snippet);
-    if (Array.from(key).length < CITATION_LIMITS.minSnippet) throw new CiteRefused("cite_snippet_too_short");
+    if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
+      throw new CiteRefused("cite_snippet_too_short");
+    const key = snippetKey(snippet);
     const owner = this.db
       .select({ ownerId: conversations.ownerId })
       .from(conversations)

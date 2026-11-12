@@ -453,12 +453,17 @@ const INLINE_SPACE = /^[ \t\u00A0\u2000-\u200A\u202F\u205F\u3000\u200B-\u200D\u2
 const BOUNDARY_PUNCT = /^[.,!?;:()[\]{}「」『』“”‘’"'…。、！？]$/u;
 
 /**
- * Punctuation between two digits is part of the number (`3.5`, `1,234`, `3:1`), never a clause edge; a ratio's
- * `:` also with spaces (`3 : 1`). `.` and `,` count only when adjacent (`3, 4명` is prose).
+ * Punctuation inside a number is never a clause edge (review #97 round 23):
+ * - between two digits (`3.5`, `1,234`, `3:1`);
+ * - `.`, `,` or `:` with a digit on both sides across inline spaces — extraction puts spaces into `1,<span>234</span>`
+ *   and `1.<b>5</b>`, and dates are written `2026. 11. 12.` (the `.` after `12` has no digit after it and stays);
+ * - a `.` right before a digit: a decimal without its leading zero (`.5%`, `.25 mg`).
  */
 function insideNumber(text: string, i: number): boolean {
+  const c = text[i] ?? "";
   if (DIGIT.test(text[i - 1] ?? "") && DIGIT.test(text[i + 1] ?? "")) return true;
-  if (text[i] !== ":") return false;
+  if (c === "." && DIGIT.test(text[i + 1] ?? "")) return true;
+  if (c !== ":" && c !== "." && c !== ",") return false;
   let a = i - 1;
   while (a >= 0 && INLINE_SPACE.test(text[a]!)) a--;
   let b = i + 1;

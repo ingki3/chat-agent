@@ -16,7 +16,7 @@ import {
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
 import { citationNote } from "../src/citations/checker.js";
-import { CitationStore, CiteRefused } from "../src/citations/store.js";
+import { CitationStore, CiteRefused, snippetKey } from "../src/citations/store.js";
 import { findSnippet, normalizeSnippet, normalizeWithMap, verifyStats } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb, type Db } from "../src/db/client.js";
@@ -201,6 +201,40 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
   });
 
+  it("round 23: a decimal without its leading zero, spaced separators and dates are inside the number", () => {
+    const cases: [page: string, cut: string][] = [
+      ["The loan charges .5% annual interest.", "5% annual interest."],
+      ["The dose is .25 mg per day.", "25 mg per day."],
+      ["신청 마감일은 2026. 11. 12.이다.", "신청 마감일은 2026."],
+      ["신청 마감일은 2026. 11. 12.이다.", "11. 12.이다."],
+      ["행사 일시는 2026. 11. 12. 15:30이다.", "행사 일시는 2026. 11."],
+      ["행사 일시는 2026. 11. 12. 15:30이다.", "행사 일시는 2026. 11. 12."],
+      ["행사 일시는 2026. 11. 12. 15:30이다.", "15:30이다."],
+      ["올해 매출은 1, 234 억 원이다.", "올해 매출은 1"],
+      ["올해 매출은 1, 234 억 원이다.", "234 억 원이다."],
+      ["이 약의 용량은 1. 5 mg이다.", "이 약의 용량은 1"],
+      ["이 약의 용량은 1. 5 mg이다.", "5 mg이다."],
+      ["이 약의 용량은 1 .5 mg이다.", "5 mg이다."],
+    ];
+    for (const [page, cut] of cases) expect(found(cut, page), `${cut} | ${page}`).toBe(false);
+    // The whole quote verifies; the `.` after the date's last number has no digit after it and ends the quote.
+    const whole: [page: string, quote: string][] = [
+      ["The loan charges .5% annual interest.", "The loan charges .5% annual interest."],
+      ["The dose is .25 mg per day.", "The dose is .25 mg per day."],
+      ["신청 마감일은 2026. 11. 12.이다.", "신청 마감일은 2026. 11. 12."],
+      ["신청 마감일은 2026. 11. 12. 다음 줄", "신청 마감일은 2026. 11. 12."],
+      ["행사 일시는 2026. 11. 12. 15:30이다.", "행사 일시는 2026. 11. 12. 15:30이다."],
+      ["올해 매출은 1, 234 억 원이다.", "올해 매출은 1, 234 억 원이다."],
+      ["이 약의 용량은 1. 5 mg이다.", "이 약의 용량은 1. 5 mg이다."],
+      ["앞 문장이다. 이 약의 용량은 1. 5 mg이다. 뒤 문장이다.", "이 약의 용량은 1. 5 mg이다."],
+    ];
+    for (const [page, quote] of whole) expect(found(quote, page), `${quote} | ${page}`).toBe(true);
+    // Prose punctuation without a digit on the other side stays a clause edge.
+    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
+    expect(found("5. 다음 항목", "목록 끝은 4.\n5. 다음 항목")).toBe(true);
+    expect(found("5명은 여성이었다.", "응답자 중 남자는 없었고,5명은 여성이었다.")).toBe(true);
+  });
+
   it("round 22: every Codex numeric case of rounds 6–22 is refused; a number's whole clause verifies", () => {
     // A numeric edge (a digit in the first / last two tokens, or a sign / currency sign first) must be a clause
     // edge: punctuation, a line break or the text's start / end — accepted limitation (h).
@@ -308,7 +342,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("결과는 무려 10", "(결과는 무려 10 ) 이었다.")).toBe(true);
     // A comma between two figures inside a number is not a clause edge; between clauses it is.
     expect(found("총 판매량은 1", "총 판매량은 1,234대였다.")).toBe(false);
-    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(false); // round 23: a spaced separator between digits is in the number
     expect(found("이번 경기의 점수는 3", "이번 경기의 점수는 3 : 1이었다.")).toBe(false);
     // Non-numeric quotes behave as before: a listed particle after the end is fine.
     expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였다.")).toBe(true);
@@ -386,11 +420,11 @@ describe("snippet check: normalisation without fuzzy matches", () => {
       false,
     ); // round 22: mid-clause / glued
     // Punctuation sets tokens apart: a comma or a full stop between them is prose.
-    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
-    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
+    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(false); // round 23: a spaced separator between digits is in the number
+    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(false); // round 23: a spaced separator between digits is in the number
     expect(found("매출은 3% 증가,", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
     expect(found("5% 감소했다고 밝혔다", "매출은 3% 증가, 5% 감소했다고 밝혔다.")).toBe(true);
-    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(false); // round 23: a spaced separator between digits is in the number
     // 3. The fraction slash folds to `/`.
     expect(found("필요한 밀가루는 1⁄2컵", "필요한 밀가루는 1/2컵이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("이번 계약의 지분은 1", "이번 계약의 지분은 1⁄2이다.")).toBe(false);
@@ -581,8 +615,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("20도라고 예보했다", "기온은 10 - 20도라고 예보했다.")).toBe(false);
     expect(found("20도이다고 했다", "예상 기온은 10 − 20도이다고 했다.")).toBe(false);
     // `.` and `,` stay adjacent-only: prose lists are not numbers.
-    expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
-    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
+    expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(false); // round 23: a spaced separator between digits is in the number
+    expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(false); // round 23: a spaced separator between digits is in the number
     expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
     // Whole ranges verify; a tilde folds to `~` for the quote too.
     expect(found("예상 기온은 10 ~ 20도", "예상 기온은 10 ~ 20도이다.")).toBe(false); // round 22: mid-clause / glued
@@ -606,7 +640,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("이번 계약의 지분은 1/2", "이번 계약의 지분은 1/2이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("예상 기온은 10~20도", "예상 기온은 10~20도이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
-    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
+    expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(false); // round 23: a spaced separator between digits is in the number
     expect(found("3명이 참석했다고 밝혔다", "결과:3명이 참석했다고 밝혔다.")).toBe(true); // `:` after a word
     // Codex: Korean compound numerals.
     expect(found("총 참석 인원은 백", "총 참석 인원은 백이 명이었다.")).toBe(false);
@@ -1444,6 +1478,51 @@ describe("citations and known secrets (#78)", () => {
     r.close();
     expect(all()).not.toContain(late);
     const rows = f.db.select().from(citations).all();
-    for (const row of rows) expect(row.snippetKey).toBe(normalizeSnippet(row.snippet));
+    for (const row of rows) expect(row.snippetKey).toBe(snippetKey(row.snippet));
+  });
+
+  it("a fullwidth secret leaves no plaintext in any column, registered before or after (round 23)", async () => {
+    const full = (t: string) => t.replace(/[!-~]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 0xfee0));
+    const all = (f: ReturnType<typeof family>) =>
+      JSON.stringify(f.db.$client.prepare("select * from citations").all());
+    // Registered first.
+    const f = family();
+    const scope = f.run(f.c.id);
+    const src = f.page(scope);
+    const early = `review23-${crypto.randomBytes(9).toString("hex")}-key`;
+    knownSecrets.add(early);
+    f.cites.cite(scope, { sourceId: src.id, snippet: `메모리 가격 하락 ${full(early)} 이 감소를 불렀다` });
+    f.cites.cite(scope, { sourceId: "no-such-source", snippet: `없는 출처 ${full(early)} 의 구절이다` });
+    expect(all(f)).not.toContain(early);
+    // Registered later, then the rescrub.
+    const g = family();
+    const s2 = g.run(g.c.id);
+    const late = `review23-${crypto.randomBytes(9).toString("hex")}-key`;
+    g.cites.cite(s2, { sourceId: g.page(s2).id, snippet: `메모리 가격 하락 ${full(late)} 이 감소를 불렀다` });
+    g.cites.cite(s2, { sourceId: "no-such-source", snippet: `없는 출처 ${full(late)} 의 구절이다` });
+    expect(all(g)).not.toContain(late);
+    const reg = new KnownSecrets();
+    const r = new StoredRescrub(g.db, { registry: reg, delayMs: 1 });
+    reg.add(late);
+    await new Promise((res) => setTimeout(res, 20));
+    await r.idle();
+    r.close();
+    expect(all(g)).not.toContain(late);
+    for (const row of g.db.select().from(citations).all()) {
+      expect(row.snippetKey).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(row.snippetKey).toBe(snippetKey(row.snippet));
+    }
+  });
+
+  it("keys stored before they were hashed are hashed once at startup and still find the same citation", () => {
+    const f = family();
+    const scope = f.run(f.c.id);
+    const src = f.page(scope);
+    const first = f.cites.cite(scope, { sourceId: src.id, snippet: SNIP });
+    f.db.$client.prepare("update citations set snippet_key = ?").run(normalizeSnippet(SNIP));
+    const again = new CitationStore(f.db);
+    expect(f.db.select().from(citations).get()!.snippetKey).toBe(snippetKey(SNIP));
+    expect(again.cite(scope, { sourceId: src.id, snippet: `“${SNIP}”` }).n).toBe(first.n);
+    expect(again.forRun(scope.runId)).toHaveLength(1);
   });
 });

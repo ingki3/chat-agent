@@ -185,6 +185,8 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "citations.source_id": ID,
   "citations.status": ENUM,
   "citations.snippet": { write: "CitationStore.cite", rescrub: "text" },
-  "citations.snippet_key": { exempt: "normalised from the scrubbed snippet; recomputed with it on rescrub" },
+  "citations.snippet_key": {
+    exempt: "a hash of the normalised snippet, no plaintext; recomputed with it on rescrub",
+  },
   "citations.quote": { write: "CitationStore.cite", rescrub: "text" },
 };
