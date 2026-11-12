@@ -2,7 +2,7 @@
 // blocks in order, the pictures and the references; each table gets its own sheet (header row bold and frozen,
 // with a filter), named by its caption, and the first sheet says where it is. Cells keep their type: a number
 // stays a number; a string is always a string cell — never a formula, whatever it starts with.
-import { DEFAULT_REFERENCES_TITLE, fit, imageOf } from "./common.mjs";
+import { DEFAULT_REFERENCES_TITLE, fit, imageOf, checkVolume } from "./common.mjs";
 
 const MAIN = "문서";
 /** Characters Excel refuses in a sheet name, and its length limit. */
@@ -11,6 +11,7 @@ const SHEET_MAX = 31;
 const ROW_PX = 20;
 
 export async function buildXlsx(doc, ctx) {
+  checkVolume("xlsx", doc, ctx.images);
   const ExcelJS = await ctx.lib("exceljs");
   const wb = new ExcelJS.Workbook();
   wb.creator = doc.author ?? "Agent Lee";

@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+import { docLibraries } from "../../src/docgen/runner.js";
 /**
  * An independent check that a generated PPTX never runs text off its boxes (#49 review 2) — written apart from the
  * generator (apps/server/docgen/pptx.mjs) and sharing nothing with it: it re-parses the slide XML and lays every
@@ -53,26 +55,52 @@ function paragraphs(body: string): Para[] {
 }
 
 /**
- * The width classes of the review-3 decision, implemented here on their own (Unicode properties, not the
- * generator's code-point table): a tab four em; a grapheme with an emoji, a regional indicator, U+FE0F or a ZWJ two
- * em; a grapheme whose base is Hangul, Han, kana, Latin, Greek, Cyrillic, a digit, punctuation, a symbol or a space
- * — followed only by non-spacing marks (or, after Hangul, Hangul jamo) — one em; anything else two em.
+ * The width rules of the review-3/4 decisions, implemented here on their own (Unicode properties and a measurement
+ * of the embedded font — not the generator's tables):
+ * - a code point: a tab four em; an emoji pictograph or a regional indicator two em; one em when it is Hangul, Han, kana, Latin, Greek, Cyrillic, a digit, punctuation,
+ *   a symbol or a space and Gothic A1 (regular and bold, measured here with fontkit) does not draw it wider than one
+ *   em; anything else two em;
+ * - a grapheme: the sum of its code points, except a combining mark half an em, Hangul jamo composing to one
+ *   syllable one em, an emoji ZWJ / U+FE0F sequence two em flat, a lone zero-width format character nothing.
  */
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 export const graphemesOf = (t: string) => Array.from(segmenter.segment(t), (s) => s.segment);
-const EMOJI = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\ufe0f|\u200d/u;
-const ONE_EM_BASE =
+const ONE_EM_CLASS =
   /^[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}\p{Nd}\p{P}\p{S}\p{Zs}]$/u;
+
+type Font = {
+  unitsPerEm: number;
+  characterSet: number[];
+  glyphForCodePoint(c: number): { advanceWidth: number };
+};
+let wide: Set<number> | undefined;
+/** Code points the embedded font draws wider than one em, in either weight (measured once). */
+export function measuredWide(): Set<number> {
+  if (wide) return wide;
+  const req = createRequire(createRequire(import.meta.url).resolve("pdfkit"));
+  const fontkit = req("fontkit") as { openSync(p: string): Font };
+  wide = new Set();
+  const fonts = docLibraries().fonts;
+  for (const file of [fonts.regular, fonts.bold]) {
+    const f = fontkit.openSync(file);
+    for (const c of f.characterSet) if (f.glyphForCodePoint(c).advanceWidth / f.unitsPerEm > 1) wide.add(c);
+  }
+  return wide;
+}
+
+export function codePointEmOf(c: string): number {
+  if (c === "\t") return 4;
+  if (/^[\p{Extended_Pictographic}\p{Regional_Indicator}]$/u.test(c)) return 2; // emoji, flag letters
+  return ONE_EM_CLASS.test(c) && !measuredWide().has(c.codePointAt(0)!) ? 1 : 2;
+}
+
 export function emOf(g: string): number {
-  if (g === "\t") return 4;
-  if (EMOJI.test(g)) return 2;
-  const [base, ...rest] = Array.from(g);
-  // After a Hangul base, conjoining jamo complete the same syllable block.
-  const hangul = /^\p{Script=Hangul}$/u.test(base!);
-  return ONE_EM_BASE.test(base!) &&
-    rest.every((c) => /^\p{Mn}$/u.test(c) || (hangul && /^\p{Script=Hangul}$/u.test(c)))
-    ? 1
-    : 2;
+  const cs = Array.from(g);
+  if (cs.length === 1) return ["\u200b", "\u200c", "\u200d", "\ufeff"].includes(g) ? 0 : codePointEmOf(g);
+  if (/\p{Extended_Pictographic}/u.test(g) && (g.includes("\u200d") || g.includes("\ufe0f"))) return 2;
+  if (cs.every((c) => /^\p{Script=Hangul}$/u.test(c)) && Array.from(g.normalize("NFC")).length === 1)
+    return 1;
+  return cs.reduce((em, c) => em + (/^[\p{Mn}\p{Me}]$/u.test(c) ? 0.5 : codePointEmOf(c)), 0);
 }
 
 /** Lines of one paragraph in `widthPt`, by those classes, broken between graphemes. */

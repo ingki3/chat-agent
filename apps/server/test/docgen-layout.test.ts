@@ -266,13 +266,52 @@ describe("graphemes are never split, and only boundable text goes on a slide (#4
       text,
       split.lines("R", text).map((l) => l.text),
     );
+    // Pieces are the lines joined by "\n" (drawn line by line): their lines are cut between graphemes too.
     const pieces = split.pieces("R", text);
     expect(pieces.length).toBeGreaterThan(3);
-    expectCutsOnGraphemes(text, pieces);
+    expectCutsOnGraphemes(
+      text,
+      pieces.flatMap((p) => p.split("\n")),
+    );
+    // A grapheme wider than the column is refused, not cut.
+    const narrow = cellSplitter(pdf, { size: 9.5, inner: 5, pad: 2, limit: 200 });
+    expect(() => narrow.lines("R", "가")).toThrow("doc_too_large");
+  });
+
+  it("PDF drawn lines: jamo sequences and syllables are never split across the lines on the page (pdf.js positions)", async () => {
+    const units = [
+      "\u1100\u1161",
+      "\u1100\u1161\u11a8",
+      "\u1100\uac00",
+      "\u1112\u1161\u11ab",
+      "가\u11a8",
+      "가",
+    ];
+    const text = Array.from({ length: 600 }, (_, i) => units[i % units.length]).join("");
+    const cols = Array.from({ length: 10 }, (_, i) => `c${i}`);
+    const buf = await make("pdf", [{ type: "table", columns: cols, rows: [[text, ...Array(9).fill("")]] }]);
+    // Column 0 of a 10-column A4 table: x from the left margin to a tenth of the text width.
+    const items = (await readPdfItems(buf))
+      .filter(
+        (i) => i.str.trim() && i.x < 56 + 483 / 10 && i.y > 50 && i.str !== "레이아웃 시험" && i.str !== "c0",
+      )
+      .sort((a, b) => a.page - b.page || b.y - a.y);
+    expect(items.length).toBeGreaterThan(50);
+    expect(
+      items
+        .map((i) => i.str)
+        .join("")
+        .normalize("NFC"),
+    ).toBe(text.normalize("NFC"));
+    for (let k = 1; k < items.length; k++) {
+      const a = items[k - 1]!.str;
+      const b = items[k]!.str;
+      expect(graphemesOf(a + b).length, `${a}|${b}`).toBe(graphemesOf(a).length + graphemesOf(b).length);
+    }
   });
 
   it("PPTX refuses ‰ ‱, two- and three-em dashes and Arabic presentation forms (anywhere)", async () => {
-    for (const bad of ["1‰", "‱", "⸺", "⸻", "\ufdfd", "\ufb50", "\ufe70", "\ufeff"]) {
+    for (const bad of ["1‰", "‱", "⸺", "⸻", "\ufdfd", "\ufb50", "\ufe70", "\ufefc"]) {
       for (const blocks of [
         [{ type: "paragraph", text: `앞 ${bad} 뒤` }],
         [{ type: "table", columns: ["a"], rows: [[bad]] }],
@@ -283,6 +322,14 @@ describe("graphemes are never split, and only boundable text goes on a slide (#4
       // The other formats reflow or use real metrics: made.
       for (const kind of ["docx", "xlsx", "pdf"] as const)
         await expect(make(kind, [{ type: "paragraph", text: bad }])).resolves.toBeTruthy();
+    }
+  });
+
+  it("a BOM / zero-width no-break space (U+FEFF) in Korean text is not refused and takes no width", async () => {
+    for (const text of ["\ufeff가족 여행", "가족\ufeff여행", "가족\u200b여행"]) {
+      const p = await readPptx(await make("pptx", [{ type: "paragraph", text }], text));
+      expect(overflows(p.xml)).toEqual([]);
+      expect(p.slides.flatMap((_, i) => p.shapeAt(i, BODY_Y) ?? []).join("")).toBe(text);
     }
   });
 
@@ -336,13 +383,13 @@ describe("graphemes are never split, and only boundable text goes on a slide (#4
       "힣",
       "ㄱ",
       "\u1100\u1161\u11a8",
+      "가\u11a8",
       "漢",
       "あ",
       "ア",
       "W",
       "M",
       "é",
-      "e\u0301",
       "Ω",
       "Ж",
       "0",
@@ -357,10 +404,49 @@ describe("graphemes are never split, and only boundable text goes on a slide (#4
     // viewer's substitute may differ (an accepted limitation, docs/decisions/isolation.md).
     const font = fontkit.openSync(fonts.regular);
     const skipped: string[] = [];
-    for (const g of ["😀", "👨‍👩‍👧‍👦", "🇰🇷", "☀\ufe0f", "\u0e01\u0e32"]) {
+    for (const g of ["😀", "👨‍👩‍👧‍👦", "☀\ufe0f", "1\ufe0f\u20e3"]) {
       expect([emOf(g), widths.graphemeEm(g)], g).toEqual([2, 2]);
       if (Array.from(g).some((c) => !font.hasGlyphForCodePoint(c.codePointAt(0)!))) skipped.push(g);
     }
+    // Sums (review #110 4): a flag is two two-em code points, Thai base + vowel two, a lone zero-width character none.
+    for (const [g, want] of [
+      ["🇰🇷", 4],
+      ["\u0e01\u0e32", 4],
+      ["\ufeff", 0],
+      ["\u200b", 0],
+      ["\u200d", 0],
+    ] as const)
+      expect([emOf(g), widths.graphemeEm(g)], g).toEqual([want, want]);
+    // The verifier's own exceptions, measured from the font here: what Gothic A1 draws wider counts two em.
+    for (const g of ["…", "%", "㈜", "㎏", "①", "→"]) expect(emOf(g), g).toBe(2);
+    // Codex's graphemes and samples of base + marks and of jamo, shaped by fontkit: measured ≤ counted, both rules.
+    for (const file of [fonts.regular, fonts.bold]) {
+      const f = fontkit.openSync(file) as Font & { layout(t: string): { advanceWidth: number } };
+      for (const g of [
+        "O\u0309",
+        "\u1100\uac00",
+        "e\u0301",
+        "a\u0308",
+        "n\u0303",
+        "a\u0308\u0301",
+        "A\u030a",
+        "\u1100\u1161",
+        "\u1100\u1161\u11a8",
+        "가\u11a8",
+        "\u1112\u1161\u11ab",
+        "\u1100\u1100",
+      ]) {
+        if (!Array.from(g).every((c) => f.hasGlyphForCodePoint(c.codePointAt(0)!))) {
+          skipped.push(g);
+          continue;
+        }
+        const measured = f.layout(g).advanceWidth / f.unitsPerEm;
+        expect(measured, `${g} in ${path.basename(file)}`).toBeLessThanOrEqual(widths.graphemeEm(g));
+        expect(measured, `${g} in ${path.basename(file)}`).toBeLessThanOrEqual(emOf(g));
+      }
+    }
+    expect(widths.graphemeEm("O\u0309")).toBe(1.5);
+    expect(widths.graphemeEm("\u1100\uac00")).toBe(2);
     console.info(
       `font check: ${measured} one-em code points measured; not in Gothic A1 (skipped): ${skipped.join(" ")}`,
     );
@@ -423,6 +509,45 @@ describe("size caps (memory of the sandbox): PPTX 500 slides and a volume cap, P
     // The other formats embed the file as it is: not limited this way.
     expect((await runner({ kind: "pptx", doc: doc(2), images: imgs(2, 3500) })).ok).toBe(true);
   }, 120_000);
+  it("PDF: decoded pixels are counted per placement — one 3500×3500 RGBA picture placed twice → doc_too_large", async () => {
+    const one = { p: { kind: "png" as const, data: pngRgba(3500, 3500).toString("base64") } };
+    const placed = (n: number): DocContent => ({
+      title: "그림",
+      blocks: Array.from({ length: n }, () => ({ type: "image", fileId: "p" })),
+    });
+    expect((await runner({ kind: "pdf", doc: placed(1), images: one })).ok).toBe(true);
+    expect(await runner({ kind: "pdf", doc: placed(2), images: one })).toEqual(refused);
+  }, 120_000);
+  it("DOCX, XLSX and PDF volume budgets: lines, cells and picture placements (per KB) — over the cap → doc_too_large", async () => {
+    const { VOLUME, volumeOf } = (await import(path.join(DOC_WORKER_DIR, "common.mjs"))) as {
+      VOLUME: Record<
+        "docx" | "xlsx" | "pdf",
+        { line: number; cell: number; image(kb: number): number; max: number }
+      >;
+      volumeOf(doc: DocContent, images: Map<string, { buf: Buffer }>, w: object): number;
+    };
+    // DOCX: lines count (a 120,000-line document is over; 100,000 is not).
+    const lines = (n: number): DocContent => ({ title: "줄", blocks: big(n) });
+    expect(volumeOf(lines(120_000), new Map(), VOLUME.docx)).toBeGreaterThan(VOLUME.docx.max);
+    expect(await runner({ kind: "docx", doc: lines(125_000), images: {} })).toEqual(refused);
+    expect((await runner({ kind: "docx", doc: lines(100_000), images: {} })).ok).toBe(true);
+    // Picture placements count each time: the same 9 MB picture placed n times costs n times.
+    const pic = Buffer.concat([png(2, 2), Buffer.alloc(9 * 1024 * 1024)]);
+    const placed = (n: number): DocContent => ({
+      title: "그림",
+      blocks: Array.from({ length: n }, () => ({ type: "image", fileId: "p" })),
+    });
+    const one = new Map([["p", { buf: pic }]]);
+    const empty = volumeOf({ title: "그림", blocks: [] }, one, VOLUME.xlsx);
+    expect(volumeOf(placed(4), one, VOLUME.xlsx) - empty).toBeCloseTo(
+      4 * (volumeOf(placed(1), one, VOLUME.xlsx) - empty),
+    );
+    const images = { p: { kind: "png" as const, data: pic.toString("base64") } };
+    expect(await runner({ kind: "xlsx", doc: placed(4), images })).toEqual(refused);
+    expect(await runner({ kind: "pdf", doc: placed(2), images })).toEqual(refused);
+    expect(volumeOf(placed(3), one, VOLUME.xlsx)).toBeLessThan(VOLUME.xlsx.max);
+    expect(volumeOf(placed(1), one, VOLUME.pdf)).toBeLessThan(VOLUME.pdf.max);
+  });
   it("the service passes the worker's layout refusal on (doc_too_large, not doc_failed)", async () => {
     // Every code the worker files can give is on the service's list.
     const codes = new Set<string>();

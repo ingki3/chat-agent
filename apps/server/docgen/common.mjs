@@ -91,3 +91,52 @@ export function imageOf(ctx, block) {
 }
 
 export const DEFAULT_REFERENCES_TITLE = "참고문헌";
+
+/**
+ * Volume budgets of DOCX, XLSX and PDF (review #110 4) — what the worker's memory grows with, measured per format
+ * (docs/ops.md §29.3): every line of text (a text, or each line after a break in it — table cells' lines included),
+ * every table cell (header cells included) and every picture placement (by the size of its file: a picture placed
+ * twice is embedded or decoded twice). Over `max` the document is refused before anything is made (`doc_too_large`).
+ * PPTX keeps its own count while it lays out (pptx.mjs `MAX_VOLUME`).
+ */
+export const VOLUME = {
+  // Units ≈ 3 KB: a line, a cell 3, a picture 0.1 a KB (Word keeps one copy of the file per placement).
+  docx: { line: 1, cell: 3, image: (kb) => 0.1 * kb, max: 120_000 },
+  // Units ≈ 12 KB: a picture 1 a KB (exceljs holds ~12 bytes per byte of each placement), lines and cells little.
+  xlsx: { line: 0.02, cell: 0.25, image: (kb) => kb, max: 34_000 },
+  // Units ≈ 1 MB: pdfkit's cost of a picture grows faster than its size (a 9 MB PNG 340 MB, 2.4 MB ones ~50 MB
+  // each), so 20 a MB plus 2 a MB²; pages are written out as they end, so lines and cells cost little.
+  pdf: { line: 0.0005, cell: 0.007, image: (kb) => 20 * (kb / 1024) + 2 * (kb / 1024) ** 2, max: 450 },
+};
+
+const linesOf = (t) => (t ? t.split("\n").length : 1);
+
+/** The document's volume under `w` (see `VOLUME`). */
+export function volumeOf(doc, images, w) {
+  let v = 0;
+  const text = (t) => (v += w.line * linesOf(t));
+  text(doc.title);
+  if (doc.subtitle) text(doc.subtitle);
+  if (doc.author) text(doc.author);
+  for (const b of doc.blocks) {
+    if (b.text !== undefined) text(b.text);
+    if (b.caption) text(b.caption);
+    if (b.title) text(b.title);
+    for (const i of b.items ?? []) text(i);
+    if (b.type === "table") {
+      v += w.cell * b.columns.length * (b.rows.length + 1);
+      for (const c of b.columns) text(c);
+      for (const r of b.rows) for (const c of r) text(cellText(c));
+    }
+    if (b.type === "image") {
+      const img = images.get(b.fileId);
+      if (img) v += w.image(Math.ceil(img.buf.length / 1024));
+    }
+  }
+  return v;
+}
+
+/** Refuses a document over its format's volume budget. */
+export function checkVolume(kind, doc, images) {
+  if (volumeOf(doc, images, VOLUME[kind]) > VOLUME[kind].max) throw new DocError("doc_too_large");
+}

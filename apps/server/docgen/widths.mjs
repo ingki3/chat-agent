@@ -3,11 +3,12 @@
 //
 // - Text is measured in graphemes (user-perceived characters: "é" as e + U+0301, a ZWJ family, a flag, a Hangul
 //   jamo sequence) and only ever broken between them.
-// - ONE_EM: a grapheme counts one em when its first code point is in `ONE_EM_RANGES` (and not one the embedded font
-//   draws wider, `WIDER_THAN_ONE_EM`) and every other code point is a
-//   non-spacing mark (U+0300 …, never U+FE0F, which asks for an emoji glyph) — or, after Hangul, a conjoining jamo: Hangul, CJK ideographs, kana, Latin,
-//   Greek, Cyrillic, digits and the common punctuation and symbols listed here.
-// - Any other grapheme — emoji, other scripts, other symbols — counts two em. A tab counts four.
+// - A code point counts one em when it is in `ONE_EM_RANGES` and not one the embedded font draws wider
+//   (`WIDER_THAN_ONE_EM`): Hangul, CJK ideographs, kana, Latin, Greek, Cyrillic, digits and the common punctuation
+//   and symbols listed here. Any other code point counts two em; a tab four.
+// - A grapheme counts the sum of its code points (review #110 4), except: a combining mark adds half an em; Hangul
+//   jamo composing to one syllable count one em; an emoji ZWJ / U+FE0F sequence counts two em flat; a zero-width
+//   format character (ZWSP, ZWNJ, ZWJ, U+FEFF) standing alone counts nothing.
 // - REFUSED: blocks with glyphs known to be far wider than two em (Arabic presentation-form ligatures such as
 //   U+FDFD, the per-mille and per-ten-thousand signs, the two- and three-em dashes). A PPTX with one is refused
 //   (`doc_unsupported_text`) before anything is made. DOCX, XLSX and PDF are not affected: Word and Excel reflow,
@@ -160,7 +161,7 @@ export const REFUSED_RANGES = [
   [0x33ae, 0x33af], // CJK compatibility square drawn wider than two em
   [0x33c6, 0x33c6], // CJK compatibility square drawn wider than two em
   [0xfb50, 0xfdff], // Arabic Presentation Forms-A (ﷲ ﷺ ﷽ …)
-  [0xfe70, 0xfeff], // Arabic Presentation Forms-B
+  [0xfe70, 0xfefe], // Arabic Presentation Forms-B (not U+FEFF, the BOM / zero-width no-break space: zero width)
 ];
 
 export const TAB_EM = 4;
@@ -173,31 +174,44 @@ const JAMO_RANGES = [
   [0xd7b0, 0xd7ff],
 ];
 const inRanges = (cp, ranges) => ranges.some(([a, b]) => cp >= a && cp <= b);
-const NON_SPACING = /^\p{Mn}$/u;
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 /** The graphemes of `text`, in order (joined they give `text` back). */
 export const graphemes = (text) => Array.from(segmenter.segment(text), (s) => s.segment);
 
-/** Width of one grapheme in em (see the file comment). */
+/** Width of one code point in em, by its class: one em, or two (anything outside the one-em ranges). */
+export function codePointEm(cp) {
+  if (cp === 0x09) return TAB_EM;
+  return inRanges(cp, ONE_EM_RANGES) && !inRanges(cp, WIDER_THAN_ONE_EM) && !inRanges(cp, REFUSED_RANGES)
+    ? 1
+    : WIDE_EM;
+}
+
+/** Zero-width format characters: ZWSP, ZWNJ, ZWJ, ZWNBSP/BOM — no width when they stand alone. */
+const ZERO_WIDTH = new Set([0x200b, 0x200c, 0x200d, 0xfeff]);
+const MARK = /^[\p{Mn}\p{Me}]$/u;
+const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
+const SYLLABLE = /^[\uac00-\ud7a3]$/u;
+
+/**
+ * Width of one grapheme in em (review #110 4): the sum of its code points' class widths, except
+ * - a combining mark (Mn, Me) adds half an em;
+ * - Hangul jamo that compose (NFC) to exactly one syllable count one em;
+ * - an emoji sequence (a pictograph with ZWJ or U+FE0F) counts two em flat;
+ * - a zero-width format character standing alone counts nothing.
+ */
 export function graphemeEm(g) {
-  if (g === "\t") return TAB_EM;
-  const cps = Array.from(g);
-  const first = cps[0].codePointAt(0);
+  const cps = Array.from(g, (c) => c.codePointAt(0));
+  if (cps.length === 1) return ZERO_WIDTH.has(cps[0]) ? 0 : codePointEm(cps[0]);
+  if (PICTOGRAPHIC.test(g) && (cps.includes(0x200d) || cps.includes(0xfe0f))) return WIDE_EM;
   if (
-    !inRanges(first, ONE_EM_RANGES) ||
-    inRanges(first, WIDER_THAN_ONE_EM) ||
-    inRanges(first, REFUSED_RANGES)
+    cps.every((cp) => inRanges(cp, JAMO_RANGES) || (cp >= 0xac00 && cp <= 0xd7a3)) &&
+    SYLLABLE.test(g.normalize("NFC"))
   )
-    return WIDE_EM;
-  const hangul = inRanges(first, JAMO_RANGES) || (first >= 0xac00 && first <= 0xd7a3);
-  for (const c of cps.slice(1)) {
-    if (c === "\ufe0f") return WIDE_EM; // asks for an emoji glyph
-    // A Hangul syllable block written as jamo (choseong, jungseong, jongseong) is one syllable wide.
-    if (hangul && inRanges(c.codePointAt(0), JAMO_RANGES)) continue;
-    if (!NON_SPACING.test(c)) return WIDE_EM;
-  }
-  return 1;
+    return 1;
+  let em = 0;
+  for (const cp of cps) em += MARK.test(String.fromCodePoint(cp)) ? 0.5 : codePointEm(cp);
+  return em;
 }
 
 /** Whether `text` holds a code point a PPTX cannot bound (REFUSED_RANGES). */

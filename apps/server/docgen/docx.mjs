@@ -1,7 +1,7 @@
 // DOCX (Word) from a checked document (#49) with `docx`: title, headings, paragraphs, lists, tables with a header
 // row, pictures with captions, and the references as a numbered list. Korean text uses 맑은 고딕 (Word's default
 // Korean font on Windows; others substitute their own) — the text itself is plain Unicode.
-import { DEFAULT_REFERENCES_TITLE, cellText, fit, imageOf } from "./common.mjs";
+import { DEFAULT_REFERENCES_TITLE, cellText, fit, imageOf, checkVolume } from "./common.mjs";
 
 const FONT = { ascii: "Malgun Gothic", hAnsi: "Malgun Gothic", eastAsia: "맑은 고딕", cs: "Malgun Gothic" };
 /** Content width of an A4 page with 2.54 cm margins, in pixels at 96 dpi (what ImageRun sizes are in). */
@@ -11,6 +11,7 @@ const PAGE_WIDTH_DXA = 9026;
 const MAX_IMAGE_HEIGHT_PX = 700;
 
 export async function buildDocx(doc, ctx) {
+  checkVolume("docx", doc, ctx.images);
   const d = await ctx.lib("docx");
   const { AlignmentType, Document, HeadingLevel, ImageRun, LevelFormat, Packer, Paragraph, ShadingType } = d;
   const { Table, TableCell, TableRow, TextRun, WidthType } = d;
