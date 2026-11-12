@@ -529,6 +529,7 @@ describe("per-user skills (FR-1.6, #21)", () => {
       "cite",
       "artifact_create",
       "artifact_update",
+      "schedule_create",
       "skill_selftest",
       "skill_google-news-search-skill",
     ]);

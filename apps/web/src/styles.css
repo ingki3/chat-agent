@@ -1464,3 +1464,135 @@ label.inline {
 .msg.user .meta {
   justify-content: flex-end;
 }
+
+/* ---- schedules (#55) ---- */
+.segmented label:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.segmented label + label {
+  border-left: 1px solid var(--line);
+}
+.weekday-pick {
+  padding: 0;
+  flex-wrap: wrap;
+}
+.weekday-pick legend {
+  padding: 0 8px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+a.btnlink {
+  display: inline-block;
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: inherit;
+  text-decoration: none;
+  white-space: nowrap;
+}
+a.btnlink.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+a.btnlink:focus-visible,
+.sched-item button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.sched-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.sched-item {
+  display: grid;
+  gap: 10px;
+}
+.sched-item .sched-name {
+  margin: 0;
+  font-size: 16px;
+}
+.sched-item h1.sched-name {
+  font-size: 20px;
+}
+.sched-item .sched-name a {
+  color: inherit;
+}
+.sched-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+.sched-facts dt {
+  color: var(--muted);
+}
+.sched-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.sched-prompt {
+  white-space: pre-wrap;
+}
+.sched-form {
+  display: grid;
+  gap: 14px;
+}
+.sched-form fieldset {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+.sched-form .segmented {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.sched-form fieldset.segmented {
+  display: inline-flex;
+  padding: 0;
+  gap: 0;
+}
+.sched-form legend {
+  font-size: 14px;
+}
+.sched-form textarea {
+  font-size: 16px;
+  resize: vertical;
+}
+.sched-next {
+  min-height: 1.4em;
+}
+.sched-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px 14px;
+  margin: 8px 0;
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+}
+@media (max-width: 640px) {
+  .sched-facts {
+    grid-template-columns: 1fr;
+  }
+  .sched-facts dd {
+    margin-bottom: 4px;
+  }
+}

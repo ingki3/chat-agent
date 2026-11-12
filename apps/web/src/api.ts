@@ -44,6 +44,17 @@ import {
   UnreadCount,
   Run,
   type RunChoice,
+  Schedule,
+  SchedulesResponse,
+  ScheduleRunsResponse,
+  RunScheduleNowResponse,
+  SchedulePreviewResponse,
+  ScheduleOptionsResponse,
+  ScheduleProposal,
+  ConfirmScheduleProposalResponse,
+  type CreateScheduleRequest,
+  type UpdateScheduleRequest,
+  type SchedulePreviewRequest,
   StartRunResponse,
   type ConnectionAuthType,
   type Role,
@@ -56,6 +67,8 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    /** The whole error answer (e.g. `proposal_changed` carries the card as it is now). */
+    readonly body: unknown = undefined,
   ) {
     super(code);
   }
@@ -133,7 +146,7 @@ async function call(
     if ((json.error && OUTER_AUTH.has(json.error)) || ((res.status === 401 || res.status === 403) && !isJson))
       reauthenticateOuter();
     else if (res.status === 401 && !url.startsWith("/api/auth/")) onUnauthenticated();
-    throw new ApiError(res.status, json.error ?? "unknown");
+    throw new ApiError(res.status, json.error ?? "unknown", json);
   }
   return json as unknown;
 }
@@ -464,6 +477,20 @@ const MESSAGES: Record<string, string> = {
   file_empty: "빈 파일이에요.",
   file_attached: "이미 보낸 파일은 지울 수 없어요.",
   invalid_attachment: "첨부 파일을 찾지 못했어요. 다시 올려 주세요.",
+  // Schedules (#55)
+  cron_invalid: "cron 식이 올바르지 않아요. 분 시 일 월 요일 다섯 칸을 숫자와 * , - / 로 적어 주세요.",
+  schedule_in_past: "이미 지난 시각이에요. 앞으로의 날짜·시각을 고르세요.",
+  schedule_never: "이 일정은 실행될 날이 없어요.",
+  invalid_time_zone: "알 수 없는 시간대예요.",
+  invalid_date: "없는 날짜예요.",
+  skill_not_allowed: "쓸 수 없는 스킬이 들어 있어요.",
+  no_usable_runtime: "쓸 수 있는 런타임이 없어요 — 관리자에게 문의하세요.",
+  schedule_busy: "앞 실행이 아직 끝나지 않았어요. 끝난 뒤에 다시 눌러 주세요.",
+  proposal_dismissed: "취소한 예약 제안이에요.",
+  proposal_gone: "이 제안으로 만든 예약이 지워졌어요.",
+  proposal_confirmed: "이미 만든 예약이에요.",
+  proposal_changed:
+    "그사이 기본 런타임·모델(또는 허용 범위)이 바뀌었어요. 바뀐 내용을 확인하고 다시 눌러 주세요.",
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -500,4 +527,33 @@ export const artifacts = {
     MyArtifactsResponse.parse(
       await call("GET", `/api/artifacts${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`),
     ),
+};
+
+export const SCHEDULES_KEY = ["schedules"] as const;
+/** 예약 (#55, PRD FR-8): the caller's own schedules (owner only — the admin is refused like anyone else). */
+export const schedules = {
+  list: async () => SchedulesResponse.parse(await call("GET", "/api/schedules")).schedules,
+  get: async (id: string) => Schedule.parse(await call("GET", `/api/schedules/${enc(id)}`)),
+  create: async (body: CreateScheduleRequest) => Schedule.parse(await call("POST", "/api/schedules", body)),
+  update: async (id: string, body: UpdateScheduleRequest) =>
+    Schedule.parse(await call("PATCH", `/api/schedules/${enc(id)}`, body)),
+  remove: async (id: string) => call("DELETE", `/api/schedules/${enc(id)}`),
+  runs: async (id: string) =>
+    ScheduleRunsResponse.parse(await call("GET", `/api/schedules/${enc(id)}/runs`)).runs,
+  runNow: async (id: string) =>
+    RunScheduleNowResponse.parse(await call("POST", `/api/schedules/${enc(id)}/run`, {})).run,
+  /** The next occurrences, computed by the server (the form never computes cron itself). */
+  preview: async (body: SchedulePreviewRequest, signal?: AbortSignal) =>
+    SchedulePreviewResponse.parse(await call("POST", "/api/schedules/preview", body, {}, signal)).next,
+  options: async () => ScheduleOptionsResponse.parse(await call("GET", "/api/schedules/options")),
+  /** The confirmation card of `schedule_create` (FR-8.1). */
+  proposal: async (id: string) =>
+    ScheduleProposal.parse(await call("GET", `/api/schedule-proposals/${enc(id)}`)),
+  /** `version`: the card the user pressed; 409 `proposal_changed` (+ the card as it is now) when it is not current. */
+  confirm: async (id: string, version: string) =>
+    ConfirmScheduleProposalResponse.parse(
+      await call("POST", `/api/schedule-proposals/${enc(id)}/confirm`, { version }),
+    ),
+  dismiss: async (id: string) =>
+    ScheduleProposal.parse(await call("POST", `/api/schedule-proposals/${enc(id)}/dismiss`, {})),
 };

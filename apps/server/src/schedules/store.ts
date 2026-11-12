@@ -77,6 +77,35 @@ export type NewSchedule = {
   settings: ChatSettings;
 };
 
+export type SchedulePatch = Partial<Omit<NewSchedule, "settings">> & {
+  paused?: boolean;
+  settings?: ChatSettings;
+};
+
+/** type, date, time, weekdays, cron — the columns of a timing (weekdays sorted and unique, cron spaces normalised). */
+function timingColumns(
+  t: ScheduleTiming,
+): [string, string | null, string | null, string | null, string | null] {
+  return [
+    t.type,
+    t.type === "once" ? t.date : null,
+    t.type === "cron" ? null : t.time,
+    t.type === "weekly" ? JSON.stringify([...new Set(t.weekdays)].sort((a, b) => a - b)) : null,
+    t.type === "cron" ? t.cron.trim().split(/\s+/).join(" ") : null,
+  ];
+}
+
+/** The next `count` occurrences after `at` (#55 preview); throws the 400 code when there is none. */
+export function upcoming(timing: ScheduleTiming, timeZone: string, at: number, count: number): number[] {
+  const out = [firstRunAfter(timing, timeZone, at)];
+  while (out.length < count) {
+    const n = nextOccurrence(timing, timeZone, out.at(-1)!);
+    if (n === null) break;
+    out.push(n);
+  }
+  return out;
+}
+
 /** The run key (#33): one occurrence of one schedule is one run, whoever inserts it. */
 export const occurrenceKey = (scheduleId: string, scheduledAt: number) => `${scheduleId}@${scheduledAt}`;
 /** "바로 실행" has keys of its own: it never takes (or is taken for) an occurrence. */
@@ -119,7 +148,7 @@ const CODES: ReadonlySet<string> = new Set(SCHEDULE_RUN_CODES);
 export const runCode = (c: string | null): ScheduleRunCode | null =>
   c === null ? null : CODES.has(c) ? (c as ScheduleRunCode) : "handler_error";
 
-export function toRun(r: RunRow): ScheduleRun {
+export function toRun(r: RunRow & { cost_micros?: number | null }): ScheduleRun {
   return {
     id: r.id,
     trigger: r.trigger,
@@ -131,6 +160,7 @@ export function toRun(r: RunRow): ScheduleRun {
     resultSavedAt: r.result_saved_at,
     finishedAt: r.finished_at,
     errorCode: runCode(r.error_code),
+    costUsd: r.cost_micros === null || r.cost_micros === undefined ? null : r.cost_micros / 1e6,
   };
 }
 
@@ -175,11 +205,7 @@ export class ScheduleStore {
         ownerId,
         scrubKnown(s.name),
         scrubKnown(s.prompt),
-        t.type,
-        t.type === "once" ? t.date : null,
-        t.type === "cron" ? null : t.time,
-        t.type === "weekly" ? JSON.stringify([...new Set(t.weekdays)].sort((a, b) => a - b)) : null,
-        t.type === "cron" ? t.cron.trim().split(/\s+/).join(" ") : null,
+        ...timingColumns(t),
         s.timeZone,
         JSON.stringify(s.skills),
         s.notify ? 1 : 0,
@@ -205,19 +231,45 @@ export class ScheduleStore {
   }
 
   /**
-   * Pause / resume and the notification switch. Paused: no next occurrence. Resumed: the next one after now — the
-   * occurrences of the paused time are not caught up (nothing was missed: they were not wanted).
+   * Edits a schedule (#55): any field. Name and prompt are scrubbed like on create. Paused: no next occurrence.
+   * Resumed, or a new timing or time zone: the next one after now — the occurrences of the paused time are not
+   * caught up (nothing was missed: they were not wanted). A new timing is checked like on create (400 codes), also
+   * while paused.
    */
-  update(id: string, patch: { paused?: boolean; notify?: boolean }, at: number): ScheduleRow | undefined {
+  update(id: string, patch: SchedulePatch, at: number): ScheduleRow | undefined {
     const row = this.byId(id);
     if (!row) return undefined;
-    let next = row.next_run_at;
+    const timing = patch.timing ?? timingOf(row);
+    const timeZone = patch.timeZone ?? row.time_zone;
+    const moved = patch.timing !== undefined || patch.timeZone !== undefined;
     const paused = patch.paused ?? !!row.paused;
+    let next = row.next_run_at;
+    if (moved) next = firstRunAfter(timing, timeZone, at);
     if (paused) next = null;
-    else if (row.paused) next = nextOccurrence(timingOf(row), row.time_zone, at);
+    else if (row.paused && !moved) next = nextOccurrence(timing, timeZone, at);
+    const s = patch.settings;
     this.sql
-      .prepare(`update schedules set paused = ?, notify = ?, next_run_at = ?, updated_at = ? where id = ?`)
-      .run(paused ? 1 : 0, (patch.notify ?? !!row.notify) ? 1 : 0, next, at, id);
+      .prepare(
+        `update schedules set name = ?, prompt = ?, type = ?, date = ?, time = ?, weekdays = ?, cron = ?,
+           time_zone = ?, skills = ?, notify = ?, runtime = ?, model = ?, effort = ?, use_shared = ?, paused = ?,
+           next_run_at = ?, updated_at = ? where id = ?`,
+      )
+      .run(
+        patch.name !== undefined ? scrubKnown(patch.name) : row.name,
+        patch.prompt !== undefined ? scrubKnown(patch.prompt) : row.prompt,
+        ...timingColumns(timing),
+        timeZone,
+        patch.skills !== undefined ? JSON.stringify(patch.skills) : row.skills,
+        (patch.notify ?? !!row.notify) ? 1 : 0,
+        s ? s.runtime : row.runtime,
+        s ? s.model : row.model,
+        s ? s.effort : row.effort,
+        (s ? s.useShared : !!row.use_shared) ? 1 : 0,
+        paused ? 1 : 0,
+        next,
+        at,
+        id,
+      );
     return this.byId(id);
   }
 
@@ -235,6 +287,22 @@ export class ScheduleStore {
         `select * from schedule_runs where schedule_id = ? order by scheduled_at desc, created_at desc limit ?`,
       )
       .all(scheduleId, limit) as RunRow[];
+  }
+
+  /**
+   * The history with each run's cost (#55, FR-8.5): the priced usage (`priced_cost_micros`, API-key rows only)
+   * recorded under the run's id or its handler's output reference (the conversation run #56 starts) — null when
+   * none is priced.
+   */
+  runsWithCost(scheduleId: string, limit = 50): (RunRow & { cost_micros: number | null })[] {
+    return this.sql
+      .prepare(
+        `select r.*, (select sum(u.priced_cost_micros) from usage_records u
+             where u.run_id in (r.id, coalesce(r.output_ref, r.id)) and u.priced_cost_micros is not null)
+           as cost_micros
+         from schedule_runs r where r.schedule_id = ? order by r.scheduled_at desc, r.created_at desc limit ?`,
+      )
+      .all(scheduleId, limit) as (RunRow & { cost_micros: number | null })[];
   }
 
   run(id: string): RunRow | undefined {

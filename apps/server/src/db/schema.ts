@@ -877,3 +877,39 @@ export const scheduleRuns = sqliteTable(
     index("schedule_runs_status_idx").on(t.status),
   ],
 );
+
+/**
+ * A schedule proposed in a conversation (#55, FR-8.1): the `schedule_create` tool stores what it proposes here and
+ * the reply shows it as a confirmation card. Nothing runs from this table: the schedule is created only when its
+ * owner confirms the card (their own session, the same checks as `POST /api/schedules`), once — `schedule_id` then
+ * names it. `timing` is the validated `ScheduleTiming` JSON.
+ */
+export const scheduleProposals = sqliteTable(
+  "schedule_proposals",
+  {
+    id: text("id").primaryKey(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    runId: text("run_id").notNull(),
+    name: text("name").notNull(),
+    prompt: text("prompt").notNull(),
+    timing: text("timing", { mode: "json" }).notNull(),
+    timeZone: text("time_zone").notNull(),
+    skills: text("skills", { mode: "json" })
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'`),
+    notify: integer("notify", { mode: "boolean" }).notNull().default(true),
+    status: text("status", { enum: ["proposed", "confirmed", "dismissed"] })
+      .notNull()
+      .default("proposed"),
+    scheduleId: text("schedule_id").references(() => schedules.id, { onDelete: "set null" }),
+    createdAt: integer("created_at").notNull().default(now),
+    updatedAt: integer("updated_at").notNull().default(now),
+  },
+  (t) => [index("schedule_proposals_conversation_idx").on(t.conversationId)],
+);
