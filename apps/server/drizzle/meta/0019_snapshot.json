@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "93f4c74c-b451-402c-915b-b4bd5e41bff1",
+  "id": "bdcd6782-060c-4430-849a-1a1cf5298e29",
   "prevId": "97aa31d6-615e-4713-9165-05067c912e37",
   "tables": {
     "artifact_versions": {
@@ -2174,6 +2174,58 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "upload_cancellations": {
+      "name": "upload_cancellations",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "upload_id": {
+          "name": "upload_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "upload_cancellations_created_idx": {
+          "name": "upload_cancellations_created_idx",
+          "columns": ["created_at"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "upload_cancellations_user_id_users_id_fk": {
+          "name": "upload_cancellations_user_id_users_id_fk",
+          "tableFrom": "upload_cancellations",
+          "tableTo": "users",
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "upload_cancellations_user_id_upload_id_pk": {
+          "columns": ["user_id", "upload_id"],
+          "name": "upload_cancellations_user_id_upload_id_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },

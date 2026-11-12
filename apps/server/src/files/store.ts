@@ -33,7 +33,20 @@ export class UploadCancelledError extends Error {
 }
 
 /** How long a cancel is remembered for an upload that has not arrived (longer than any upload can take). */
-const CANCEL_TTL_MS = 6 * 3600_000;
+export const CANCEL_TTL_MS = 6 * 3600_000;
+/** Unresolved cancels (no upload came yet) one user may have at a time (review #102 7차). */
+export const MAX_PENDING_CANCELS = 100;
+/**
+ * Every statement on `upload_cancellations` (review #102 7차): keyed by the primary key `(user_id, upload_id)`, a
+ * user's count by its prefix, expiry by the `created_at` index — never a scan (a test checks the query plans).
+ */
+export const CANCEL_SQL = {
+  find: "SELECT 1 FROM upload_cancellations WHERE user_id = ? AND upload_id = ? AND created_at >= ?",
+  count: "SELECT count(*) AS n FROM upload_cancellations WHERE user_id = ? AND created_at >= ?",
+  insert: "INSERT OR REPLACE INTO upload_cancellations (user_id, upload_id, created_at) VALUES (?, ?, ?)",
+  drop: "DELETE FROM upload_cancellations WHERE user_id = ? AND upload_id = ?",
+  expire: "DELETE FROM upload_cancellations WHERE created_at < ?",
+} as const;
 /** Client upload ids: UUIDs (any version), lower case. */
 export const UPLOAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -103,11 +116,6 @@ export type FileStoreOptions = {
 export class FileStore {
   readonly paths: StoragePaths;
   private readonly now: () => number;
-  /**
-   * Cancelled uploads (`<user>/<upload id>` → when), review #102 6차: a cancel can come before, during or after the
-   * upload itself. Remembered in memory only — an upload under way does not survive a restart either.
-   */
-  private readonly cancelled = new Map<string, number>();
 
   constructor(
     private readonly db: Db,
@@ -241,7 +249,8 @@ export class FileStore {
     return this.lock.write(() => {
       // Cancelled while it came in: discarded here, in the same synchronous step that would store it — a cancel
       // either finds the row (and deletes it) or is found here.
-      if (this.isCancelled(row.userId, input.uploadId)) {
+      // Resolved too: the one upload this cancel was for has come and been refused (`takeCancel`).
+      if (this.takeCancel(row.userId, input.uploadId)) {
         fs.rmSync(input.tmp, { force: true });
         throw new UploadCancelledError();
       }
@@ -326,8 +335,24 @@ export class FileStore {
       .run();
   }
 
+  /** A cancel is on record for this upload (within the last `CANCEL_TTL_MS`): one keyed lookup. */
   isCancelled(userId: string, uploadId: string): boolean {
-    return this.cancelled.has(`${userId}/${uploadId}`);
+    return !!this.db.$client.prepare(CANCEL_SQL.find).get(userId, uploadId, this.now() - CANCEL_TTL_MS);
+  }
+
+  /**
+   * The upload has come and is refused because it was cancelled: true, and its record goes (resolved). Synchronous
+   * (one lookup, one delete): an upload refused here is never stored.
+   */
+  takeCancel(userId: string, uploadId: string): boolean {
+    if (!this.isCancelled(userId, uploadId)) return false;
+    this.db.$client.prepare(CANCEL_SQL.drop).run(userId, uploadId);
+    return true;
+  }
+
+  /** Removes cancels older than `CANCEL_TTL_MS` (start-up and a timer, not only when someone cancels). */
+  expireCancels(): number {
+    return this.db.$client.prepare(CANCEL_SQL.expire).run(this.now() - CANCEL_TTL_MS).changes;
   }
 
   /**
@@ -335,21 +360,31 @@ export class FileStore {
    * discarded when it would be stored), or stored and unsent (deleted now). "attached" when it already went with
    * a message (nothing changes).
    */
-  async cancelUpload(userId: string, uploadId: string): Promise<"cancelled" | "attached"> {
+  async cancelUpload(userId: string, uploadId: string): Promise<"cancelled" | "attached" | "too_many"> {
     return this.lock.write(() => {
       const t = this.now();
-      for (const [k, at] of this.cancelled) if (t - at > CANCEL_TTL_MS) this.cancelled.delete(k);
+      // Keyed by the unique (user_id, upload_id) index.
       const row = this.db
         .select()
         .from(files)
         .where(and(eq(files.userId, userId), eq(files.uploadId, uploadId)))
         .get();
       if (row?.messageId) return "attached";
-      this.cancelled.set(`${userId}/${uploadId}`, t);
       if (row) {
+        // Stored and unsent: resolved now — no record is kept (and none is left behind).
+        this.db.$client.prepare(CANCEL_SQL.drop).run(userId, uploadId);
         this.db.delete(files).where(eq(files.id, row.id)).run();
         this.unlinkAndPrune(row);
+        return "cancelled";
       }
+      // Not arrived (or still coming in): kept on record, also across a restart, until it comes or expires.
+      if (!this.isCancelled(userId, uploadId)) {
+        const pending = (
+          this.db.$client.prepare(CANCEL_SQL.count).get(userId, t - CANCEL_TTL_MS) as { n: number }
+        ).n;
+        if (pending >= MAX_PENDING_CANCELS) return "too_many";
+      }
+      this.db.$client.prepare(CANCEL_SQL.insert).run(userId, uploadId, t);
       return "cancelled";
     });
   }

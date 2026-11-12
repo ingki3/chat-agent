@@ -622,3 +622,35 @@ test("review order 6: B stored, its answer held, the new page lists it, the next
   await expect(page.getByRole("alert")).toHaveCount(0);
   await page.unrouteAll({ behavior: "ignoreErrors" });
 });
+
+test("a file removed while the new chat's conversation is being made is never uploaded", async ({ page }) => {
+  await useAccount(page, SON);
+  await page.goto("/");
+  const createHeld = gate();
+  const createSeen = gate();
+  let uploads = 0;
+  page.on("request", (r) => {
+    if (r.method() === "POST" && isFiles(r.url())) uploads++;
+  });
+  await page.route(/\/api\/conversations$/, async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    createSeen.open();
+    await createHeld.p;
+    await route.fulfill({ response: await route.fetch() });
+  });
+  await page
+    .getByTestId("file-input")
+    .setInputFiles([{ name: "취소.txt", mimeType: "text/plain", buffer: Buffer.from("x") }]);
+  await createSeen.p;
+  await chips(page).first().getByRole("button", { name: /빼기/ }).click();
+  await expect(chips(page)).toHaveCount(0);
+  createHeld.open();
+  await page.getByLabel("메시지 입력").fill("파일 없이");
+  await page.getByRole("button", { name: "보내기" }).click();
+  await expect(page).toHaveURL(/\/c\//);
+  await expect(page.getByTestId("user-message").filter({ hasText: "파일 없이" })).toHaveCount(1);
+  await page.waitForTimeout(300);
+  expect(uploads).toBe(0);
+  await expect(chips(page)).toHaveCount(0);
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});

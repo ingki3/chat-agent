@@ -463,6 +463,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
     registerConversationRoutes(app, app.conversations!, runManager, { defaults, users }, fileStore);
     registerFileRoutes(app, app.conversations!, fileStore);
+    // Cancel records of uploads that never came expire after 6 hours (review #102 7차): at start and every 10 min.
+    app.addHook("onReady", async () => void fileStore.expireCancels());
+    const expireCancels = setInterval(() => fileStore.expireCancels(), 10 * 60_000);
+    expireCancels.unref();
+    app.addHook("onClose", async () => clearInterval(expireCancels));
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);

@@ -16,4 +16,13 @@ CREATE TABLE `files` (
 );
 --> statement-breakpoint
 CREATE INDEX `files_conversation_idx` ON `files` (`conversation_id`,`created_at`);--> statement-breakpoint
-CREATE UNIQUE INDEX `files_user_upload_idx` ON `files` (`user_id`,`upload_id`);
+CREATE UNIQUE INDEX `files_user_upload_idx` ON `files` (`user_id`,`upload_id`);--> statement-breakpoint
+CREATE TABLE `upload_cancellations` (
+	`user_id` text NOT NULL,
+	`upload_id` text NOT NULL,
+	`created_at` integer NOT NULL,
+	PRIMARY KEY(`user_id`, `upload_id`),
+	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade
+);
+--> statement-breakpoint
+CREATE INDEX `upload_cancellations_created_idx` ON `upload_cancellations` (`created_at`);

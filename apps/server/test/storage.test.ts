@@ -101,6 +101,7 @@ describe("database", () => {
       "sessions",
       "settings",
       "sources",
+      "upload_cancellations",
       "usage_records",
       "users",
     ]);

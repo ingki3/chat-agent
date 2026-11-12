@@ -83,6 +83,7 @@ export const FILE_ERRORS = [
   "file_empty",
   "file_attached",
   "upload_cancelled",
+  "too_many_cancels",
 ] as const;
 export type FileError = (typeof FILE_ERRORS)[number];
 

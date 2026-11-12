@@ -43,6 +43,7 @@ const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
   file_empty: 400,
   file_attached: 409,
   upload_cancelled: 409,
+  too_many_cancels: 429,
   invalid_request: 400,
 };
 
@@ -205,8 +206,8 @@ export function registerFileRoutes(
         if (!name) return refuse("invalid_request");
         const uploadId = String(req.headers[UPLOAD_ID_HEADER] ?? "");
         if (!UPLOAD_ID.test(uploadId)) return refuse("invalid_request");
-        // Cancelled before it was even sent: nothing is read.
-        if (store.isCancelled(userId, uploadId)) return refuse("upload_cancelled");
+        // Cancelled before it was even sent: nothing is read, and the cancel is resolved.
+        if (store.takeCancel(userId, uploadId)) return refuse("upload_cancelled");
         const kind = fileKindOf(name);
         if (!kind) return refuse("file_type_unsupported");
         const declared = Number(req.headers["content-length"] ?? NaN);
@@ -286,6 +287,7 @@ export function registerFileRoutes(
       if (!UPLOAD_ID.test(req.params.uploadId)) return fail(reply, "invalid_request");
       const r = await store.cancelUpload(req.ctx.user!.id, req.params.uploadId);
       if (r === "attached") return fail(reply, "file_attached");
+      if (r === "too_many") return fail(reply, "too_many_cancels");
       return reply.header("Cache-Control", "no-store").send({ ok: true });
     },
   );

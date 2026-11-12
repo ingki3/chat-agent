@@ -239,6 +239,7 @@ export const FILE_CODES = set([
   "file_empty",
   "file_attached",
   "upload_cancelled",
+  "too_many_cancels",
 ]);
 export const isFileCode = member(FILE_CODES);
 

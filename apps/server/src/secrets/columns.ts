@@ -212,4 +212,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "files.kind": ENUM,
   "files.media_type": { exempt: "the media type of the detected kind (FILE_KINDS, server-chosen)" },
   "files.sha256": HASH,
+  // Cancelled uploads not yet arrived (review #102 7차): ids only.
+  "upload_cancellations.user_id": ID,
+  "upload_cancellations.upload_id": { exempt: "the client's upload id, a UUID checked on cancel" },
 };

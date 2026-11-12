@@ -722,3 +722,23 @@ export const files = sqliteTable(
     uniqueIndex("files_user_upload_idx").on(t.userId, t.uploadId),
   ],
 );
+
+/**
+ * Cancelled uploads that have not arrived (review #102 7차): `DELETE /api/uploads/:uploadId` came before (or during)
+ * the upload, so the upload is refused when it comes — also after a restart. A record goes when it is resolved (the
+ * upload came and was refused) or after 6 hours; a user has at most 100 at a time (files/store.ts).
+ */
+export const uploadCancellations = sqliteTable(
+  "upload_cancellations",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    uploadId: text("upload_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.uploadId] }),
+    index("upload_cancellations_created_idx").on(t.createdAt),
+  ],
+);

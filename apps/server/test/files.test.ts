@@ -22,7 +22,7 @@ import { createTestDb } from "../src/db/client.js";
 import { DB_FILE, MANIFEST_FILE, type Manifest } from "../src/backup/backup.js";
 import { contentMatches } from "../src/files/detect.js";
 import { FILE_CODES, FILE_CSP, INLINE_KINDS } from "../src/files/routes.js";
-import { cleanName } from "../src/files/store.js";
+import { CANCEL_SQL, cleanName } from "../src/files/store.js";
 import { FILE_CODES as LOGGABLE_FILE_CODES } from "../src/observability/policy.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
@@ -737,7 +737,7 @@ async function newAppOn(dataDir: string) {
     storage.db.$client.close();
   });
   await app.ready();
-  return { app, log: log.lines };
+  return { app, db: storage.db, log: log.lines };
 }
 
 describe("backups and the file-write lock (#37 integration)", () => {
@@ -1036,17 +1036,16 @@ describe("review #102 round 6: cancel by upload id on the server", () => {
   });
 
   it("a send naming a cancelled upload's file is refused, even if its row were still there", async () => {
-    const { app, f } = await newApp();
+    const { app, f, db } = await newApp();
     const conv = app.conversations!.create(f.users.owner.id);
     const uploadId = crypto.randomUUID();
     const a = (
       await upload(app, f.cookies.owner, conv.id, "a.txt", "a", { "x-upload-id": uploadId })
     ).json<UploadedFile>();
     // The guard on its own: the upload marked cancelled while its row is (still) there.
-    (app.files as unknown as { cancelled: Map<string, number> }).cancelled.set(
-      `${f.users.owner.id}/${uploadId}`,
-      Date.now(),
-    );
+    db.$client
+      .prepare("INSERT INTO upload_cancellations (user_id, upload_id, created_at) VALUES (?, ?, ?)")
+      .run(f.users.owner.id, uploadId, Date.now());
     const send = await app.inject({
       method: "POST",
       url: `/api/conversations/${conv.id}/messages`,
@@ -1056,5 +1055,117 @@ describe("review #102 round 6: cancel by upload id on the server", () => {
     expect(send.statusCode).toBe(400);
     expect(send.json()).toEqual({ error: "invalid_attachment" });
     expect(app.files!.get(a.id)!.messageId).toBeNull();
+  });
+});
+
+describe("review #102 round 7: cancel records persist, are bounded and expire", () => {
+  const cancel = (app: App, cookie: string, uploadId: string) =>
+    app.inject({ method: "DELETE", url: `/api/uploads/${uploadId}`, headers: { ...WRITE, cookie } });
+  const records = (db: ReturnType<typeof createTestDb>, uploadId?: string) =>
+    (
+      db.$client
+        .prepare(
+          uploadId
+            ? "SELECT count(*) AS n FROM upload_cancellations WHERE upload_id = ?"
+            : "SELECT count(*) AS n FROM upload_cancellations",
+        )
+        .get(...(uploadId ? [uploadId] : [])) as { n: number }
+    ).n;
+
+  it("a cancel survives a restart: the late upload is 409, a send naming a cancelled upload's file is 400", async () => {
+    const root = tmp();
+    const dataDir = path.join(root, "data");
+    const one = await newApp({ file: true, dataDir });
+    const conv = one.app.conversations!.create(one.f.users.owner.id);
+    const late = crypto.randomUUID();
+    expect((await cancel(one.app, one.f.cookies.owner, late)).statusCode).toBe(200);
+    // A stored file whose cancel is on record too (the send's guard on its own, across the restart).
+    const kept = crypto.randomUUID();
+    const file = (
+      await upload(one.app, one.f.cookies.owner, conv.id, "k.txt", "k", { "x-upload-id": kept })
+    ).json<UploadedFile>();
+    one.db.$client
+      .prepare("INSERT INTO upload_cancellations (user_id, upload_id, created_at) VALUES (?, ?, ?)")
+      .run(one.f.users.owner.id, kept, Date.now());
+    const cookie = one.f.cookies.owner;
+    await closers.pop()!();
+
+    const two = await newAppOn(dataDir);
+    const r = await upload(two.app, cookie, conv.id, "late.txt", "late", { "x-upload-id": late });
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toEqual({ error: "upload_cancelled" });
+    // Resolved: the record goes once the one upload it was for has been refused.
+    expect(records(two.db, late)).toBe(0);
+    const send = await two.app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { ...WRITE, cookie, "idempotency-key": crypto.randomUUID() },
+      payload: { text: "늦은 보내기", fileIds: [file.id] },
+    });
+    expect(send.statusCode).toBe(400);
+    expect(send.json()).toEqual({ error: "invalid_attachment" });
+  });
+
+  it("at most 100 unresolved cancels per user (429); resolved ones free their place; other users unaffected", async () => {
+    const { app, f, db } = await newApp();
+    const conv = app.conversations!.create(f.users.owner.id);
+    const ids = Array.from({ length: 100 }, () => crypto.randomUUID());
+    for (const id of ids) expect((await cancel(app, f.cookies.owner, id)).statusCode).toBe(200);
+    const over = await cancel(app, f.cookies.owner, crypto.randomUUID());
+    expect(over.statusCode).toBe(429);
+    expect(over.json()).toEqual({ error: "too_many_cancels" });
+    expect(records(db)).toBe(100);
+    // The same id again is not a new one; another user has their own allowance.
+    expect((await cancel(app, f.cookies.owner, ids[0]!)).statusCode).toBe(200);
+    expect((await cancel(app, f.cookies.stranger, crypto.randomUUID())).statusCode).toBe(200);
+    // One upload comes and is refused: resolved, its record goes, and there is room for one more.
+    const refused = await upload(app, f.cookies.owner, conv.id, "a.txt", "a", { "x-upload-id": ids[1]! });
+    expect(refused.statusCode).toBe(409);
+    expect(records(db, ids[1]!)).toBe(0);
+    expect((await cancel(app, f.cookies.owner, crypto.randomUUID())).statusCode).toBe(200);
+    // Cancelling a stored, unsent upload keeps no record.
+    const stored = crypto.randomUUID();
+    expect(
+      (await upload(app, f.cookies.owner, conv.id, "s.txt", "s", { "x-upload-id": stored })).statusCode,
+    ).toBe(201);
+    expect((await cancel(app, f.cookies.owner, stored)).statusCode).toBe(200);
+    expect(records(db, stored)).toBe(0);
+  });
+
+  it("cancels older than 6 hours expire at start and on a timer, without any cancel request", async () => {
+    let clock = Date.UTC(2026, 10, 12, 0, 0);
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    closers.push(() => vi.useRealTimers());
+    const { app, f, db } = await newApp({ extra: { files: { now: () => clock } } });
+    const old = crypto.randomUUID();
+    expect((await cancel(app, f.cookies.owner, old)).statusCode).toBe(200);
+    expect(records(db)).toBe(1);
+    clock += 6 * 3600_000 + 1;
+    // Out of the window: no longer counts as cancelled, even before it is removed.
+    expect(app.files!.isCancelled(f.users.owner.id, old)).toBe(false);
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(records(db)).toBe(0);
+  });
+
+  it("every cancel statement is keyed: the primary key or the created_at index, never a scan", async () => {
+    const { db } = await newApp();
+    const plan = (sql: string) =>
+      (
+        db.$client
+          .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+          .all(...Array(sql.split("?").length - 1).fill("x")) as {
+          detail: string;
+        }[]
+      )
+        .map((r) => r.detail)
+        .join(" | ");
+    const pk = "USING INDEX sqlite_autoindex_upload_cancellations_1";
+    expect(plan(CANCEL_SQL.find)).toBe(`SEARCH upload_cancellations ${pk} (user_id=? AND upload_id=?)`);
+    expect(plan(CANCEL_SQL.drop)).toBe(`SEARCH upload_cancellations ${pk} (user_id=? AND upload_id=?)`);
+    // A user's count reads that user's records only (at most 100).
+    expect(plan(CANCEL_SQL.count)).toBe(`SEARCH upload_cancellations ${pk} (user_id=?)`);
+    expect(plan(CANCEL_SQL.expire)).toBe(
+      "SEARCH upload_cancellations USING COVERING INDEX upload_cancellations_created_idx (created_at<?)",
+    );
   });
 });

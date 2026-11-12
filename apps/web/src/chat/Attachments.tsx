@@ -107,6 +107,11 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
         void (async () => {
           try {
             const id = await conversation();
+            // Cancelled while the conversation was being made: never sent at all (review #102 7차).
+            if (discarded.has(a.uploadId!)) {
+              cancelled.current.delete(a.key);
+              return;
+            }
             const uploaded = await filesApi.upload(id, file, a.uploadId!);
             seen.current.add(uploaded.id);
             // Removed while it was uploading: the server was told at once, by upload id (review #102 6차) — it
