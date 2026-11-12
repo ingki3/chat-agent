@@ -239,8 +239,13 @@ export function ChatPage() {
   // The link whose message was found once (review #116) — kept apart from whether it is in the list now (a regenerate,
   // an edit or later pages may take it out): a found link never searches again nor holds back later results.
   const [foundLink, setFoundLink] = useState<string | null>(null);
-  if (found && foundLink !== linkKeyOf(id, hash)) setFoundLink(linkKeyOf(id, hash));
-  const linkKey = linkKeyOf(id, hash);
+  // Every link transition — another hash, the hash removed, the same hash again later — is a new link: its found,
+  // scrolled and stopped states start over (they are all keyed on this). Within one stay of a hash they persist
+  // across list refreshes (review #116).
+  const [linkGen, setLinkGen] = useState({ id, hash, n: 0 });
+  if (linkGen.id !== id || linkGen.hash !== hash) setLinkGen({ id, hash, n: linkGen.n + 1 });
+  const linkKey = `${linkKeyOf(id, hash)}@${linkGen.n}`;
+  if (found && foundLink !== linkKey) setFoundLink(linkKey);
   const foundOnce = foundLink === linkKey;
   useEffect(() => {
     if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };

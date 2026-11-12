@@ -827,6 +827,7 @@ describe("a result saved after it left the history is no '새 결과' (review #1
     await until(() => t.finished(run.id) && t.runRow(run.id).notified_at !== null);
     expect(t.runRow(run.id).result_ref).toBe(answer);
     expect(t.app.conversations!.message(convId, answer)!.active).toBe(false);
+    expect(t.notes(t.f!.users.owner.id).map((n) => n.url)).toEqual([`/c/${convId}`]);
     expect(
       Conversation.parse((await t.req("owner", "GET", `/api/conversations/${convId}`)).json()),
     ).toMatchObject({
@@ -864,5 +865,7 @@ describe("a result saved after it left the history is no '새 결과' (review #1
     await until(() => b.finished(run.id) && b.runRow(run.id).notified_at !== null);
     expect(b.runRow(run.id).result_ref).toBe(answer);
     expect(b.app.conversations!.get(convId)).toMatchObject({ newResultAt: null, newResultMessageId: null });
+    // Its notification opens the conversation, not a message that is no longer there.
+    expect(b.notes(a.f!.users.owner.id).map((n) => n.url)).toEqual([`/c/${convId}`]);
   });
 });

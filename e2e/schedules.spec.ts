@@ -708,3 +708,51 @@ test("결과 링크로 찾은 뒤 그 메시지가 첫 페이지 밖으로 밀�
   await expect.poll(marked).toBe(false);
   await expect(page.getByTestId("link-search-stopped")).toHaveCount(0);
 });
+
+test("결과 링크를 지웠다 다시 붙이거나 다른 링크를 거쳐 돌아와도 다시 찾아 간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkback");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 왕복 예약", prompt: "왕복", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const a = await latestResultId(page);
+  const setHash = (h: string) => page.evaluate((v) => (window.location.hash = v), h);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport();
+  // The hash goes; meanwhile A falls off the first page (51 turns, then a result the view reads again).
+  await setHash("");
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `왕복 ${i}` },
+      headers: csrf(baseURL!),
+    });
+    expect(sent.status()).toBe(201);
+    await idleConversation(page, conversationId);
+  }
+  await runToEnd(page, baseURL!, s.id);
+  const newest = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${newest}`)).toBeVisible();
+  await expect(page.locator(`#m-${a}`)).toHaveCount(0);
+  // A again: a new link — it is looked for and shown.
+  await setHash(`#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport({ timeout: 10_000 });
+  // Through a link that is never found (B), and back to A: shown again.
+  await page.locator(`#m-${newest}`).scrollIntoViewIfNeeded();
+  await expect(page.locator(`#m-${a}`)).not.toBeInViewport();
+  await setHash(`#m-${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}`);
+  await expect(page.getByTestId("link-search-stopped")).toBeVisible();
+  await setHash(`#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport({ timeout: 10_000 });
+  await expect(page.getByTestId("link-search-stopped")).toHaveCount(0);
+});

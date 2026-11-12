@@ -328,9 +328,10 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
     const conversationId = result?.conversation_id ?? null;
     const message =
       conversationId && saved.resultRef ? conversations.message(conversationId, saved.resultRef) : undefined;
-    // Straight to the result message (FR-8.4); the schedule's page when the conversation is gone.
+    // Straight to the result message (FR-8.4) while it is in the history (a reply regenerated or cut off by an edit
+    // before a late save: the conversation itself, review #116); the schedule's page when the conversation is gone.
     const url = conversationId
-      ? `/c/${conversationId}${message ? `#m-${message.id}` : ""}`
+      ? `/c/${conversationId}${message?.active ? `#m-${message.id}` : ""}`
       : `/schedules/${ctx.scheduleId}`;
     const ref = conversationId
       ? { kind: "conversation", id: conversationId }
