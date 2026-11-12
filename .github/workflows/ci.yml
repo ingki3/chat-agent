@@ -44,7 +44,16 @@ jobs:
         with: { node-version-file: .node-version, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       # PNG/PDF export (#51): the renderer tests drive the real Chrome Headless Shell (they fail in CI without it).
-      - run: pnpm exec playwright install --with-deps --only-shell chromium
+      # The runner's apt mirror is sometimes unreachable; retry, then fall back to the browser alone (the ubuntu image already has Chrome's libraries).
+      - name: Install Playwright browser
+        run: |
+          for i in 1 2 3; do
+            pnpm exec playwright install --with-deps --only-shell chromium && exit 0
+            echo "browser install with system packages failed (attempt $i); retrying" >&2
+            sleep 20
+          done
+          echo "falling back to installing the browser without system packages" >&2
+          pnpm exec playwright install --only-shell chromium
       - run: pnpm test
 
   build:
@@ -65,7 +74,16 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version-file: .node-version, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
+      # The runner's apt mirror is sometimes unreachable; retry, then fall back to the browser alone (the ubuntu image already has Chrome's libraries).
+      - name: Install Playwright browser
+        run: |
+          for i in 1 2 3; do
+            pnpm exec playwright install --with-deps chromium && exit 0
+            echo "browser install with system packages failed (attempt $i); retrying" >&2
+            sleep 20
+          done
+          echo "falling back to installing the browser without system packages" >&2
+          pnpm exec playwright install chromium
       - run: pnpm build
       - run: pnpm e2e
       - if: failure()
