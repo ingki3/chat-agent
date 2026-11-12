@@ -1,8 +1,8 @@
 /**
  * An independent check that a generated PPTX never runs text off its boxes (#49 review 2) — written apart from the
  * generator (apps/server/docgen/pptx.mjs) and sharing nothing with it: it re-parses the slide XML and lays every
- * text run out again with a conservative rule of its own — every character one em wide at its run's size (a tab four
- * em), lines broken between characters — using the font size, the exact line spacing (`a:lnSpc/a:spcPts`), the
+ * text run out again with a conservative rule of its own — the grapheme width classes below at its run's size,
+ * lines broken between graphemes — using the font size, the exact line spacing (`a:lnSpc/a:spcPts`), the
  * paragraph spacing, the bullet margin, the box insets, the table column widths and cell margins written in the file.
  *
  * - a text box: its paragraphs' height ≤ its height less the top and bottom insets, and the box ends on the slide
@@ -52,14 +52,37 @@ function paragraphs(body: string): Para[] {
   });
 }
 
-/** Lines of one paragraph in `widthPt`: one em per character (tab four), broken anywhere. */
+/**
+ * The width classes of the review-3 decision, implemented here on their own (Unicode properties, not the
+ * generator's code-point table): a tab four em; a grapheme with an emoji, a regional indicator, U+FE0F or a ZWJ two
+ * em; a grapheme whose base is Hangul, Han, kana, Latin, Greek, Cyrillic, a digit, punctuation, a symbol or a space
+ * — followed only by non-spacing marks (or, after Hangul, Hangul jamo) — one em; anything else two em.
+ */
+const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+export const graphemesOf = (t: string) => Array.from(segmenter.segment(t), (s) => s.segment);
+const EMOJI = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\ufe0f|\u200d/u;
+const ONE_EM_BASE =
+  /^[\p{Script=Hangul}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}\p{Nd}\p{P}\p{S}\p{Zs}]$/u;
+export function emOf(g: string): number {
+  if (g === "\t") return 4;
+  if (EMOJI.test(g)) return 2;
+  const [base, ...rest] = Array.from(g);
+  // After a Hangul base, conjoining jamo complete the same syllable block.
+  const hangul = /^\p{Script=Hangul}$/u.test(base!);
+  return ONE_EM_BASE.test(base!) &&
+    rest.every((c) => /^\p{Mn}$/u.test(c) || (hangul && /^\p{Script=Hangul}$/u.test(c)))
+    ? 1
+    : 2;
+}
+
+/** Lines of one paragraph in `widthPt`, by those classes, broken between graphemes. */
 export function linesAtOneEm(text: string, sizePt: number, widthPt: number): number {
   let lines = 0;
   for (const seg of text.split("\n")) {
     let em = 0;
     let n = 1;
-    for (const c of seg) {
-      const w = c === "\t" ? 4 : 1;
+    for (const g of graphemesOf(seg)) {
+      const w = emOf(g);
       if (em > 0 && (em + w) * sizePt > widthPt) {
         n++;
         em = 0;

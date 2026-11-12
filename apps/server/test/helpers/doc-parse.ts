@@ -131,6 +131,32 @@ export function png(w: number, h: number, rgb: [number, number, number] = [40, 9
   ]);
 }
 
+/** A PNG with an alpha channel (RGBA, one colour): pdfkit has to decode its pixels. Small however large. */
+export function pngRgba(w: number, h: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, "latin1"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(zlib.crc32(td) >>> 0);
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6; // RGBA
+  const row = Buffer.alloc(1 + w * 4, 0x80);
+  row[0] = 0;
+  const raw = zlib.deflateSync(Buffer.concat(Array.from({ length: h }, () => row)));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", raw),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
 /** A PNG whose header claims `w × h` (the pixels are not there): for the picture-size limit. */
 export function pngHeader(w: number, h: number): Buffer {
   const b = png(1, 1);

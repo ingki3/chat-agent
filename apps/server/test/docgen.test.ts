@@ -9,6 +9,7 @@ import {
   CSRF_HEADER,
   DOC_CODES,
   DOC_HWP_HINT,
+  DOC_UNSUPPORTED_TEXT_HINT,
   DOC_LIMITS,
   FILE_KINDS,
   FILE_LIMITS,
@@ -608,6 +609,21 @@ describe("guards: limits, pictures, secrets, validation (#49)", () => {
       expect(
         await create(new DocGenService({ db, files: () => app.files, runner: failing(code) }), scope, {}),
       ).toEqual({ ok: false, code: want });
+    // Text a slide cannot hold is refused with fixed words saying what to do instead.
+    expect(
+      await create(
+        new DocGenService({ db, files: () => app.files, runner: failing("doc_unsupported_text") }),
+        scope,
+        {},
+      ),
+    ).toEqual({ ok: false, code: "doc_unsupported_text", hint: DOC_UNSUPPORTED_TEXT_HINT });
+    expect(
+      await create(
+        new DocGenService({ db, files: () => app.files, runner: failing("doc_too_large") }),
+        scope,
+        {},
+      ),
+    ).toEqual({ ok: false, code: "doc_too_large" });
   });
 
   it("counts against the conversation's file limit (20), like an upload", async () => {

@@ -19,12 +19,14 @@ const MAX_SIDE = 20_000;
 export function imageInfo(buf, kind) {
   let width;
   let height;
+  let decodes = false;
   if (kind === "png") {
     const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     if (buf.length < 33 || !sig.every((b, i) => buf[i] === b) || buf.toString("latin1", 12, 16) !== "IHDR")
       throw new DocError("doc_image_unsupported");
     width = buf.readUInt32BE(16);
     height = buf.readUInt32BE(20);
+    decodes = pngDecodes(buf);
   } else if (kind === "jpg") {
     if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) throw new DocError("doc_image_unsupported");
     let i = 2;
@@ -50,7 +52,26 @@ export function imageInfo(buf, kind) {
   if (!width || !height) throw new DocError("doc_image_unsupported");
   if (width > MAX_SIDE || height > MAX_SIDE || width * height > MAX_PIXELS)
     throw new DocError("doc_image_too_large");
-  return { kind, buf, width, height };
+  return { kind, buf, width, height, decodes };
+}
+
+/**
+ * Whether pdfkit must decode this PNG's pixels to embed it (alpha channel, transparency chunk, 16-bit samples or
+ * interlacing) — that costs memory per pixel (PDF_DECODED_PIXELS); any other PNG is embedded as it is compressed.
+ */
+function pngDecodes(buf) {
+  const depth = buf[24];
+  const colorType = buf[25];
+  const interlace = buf[28];
+  if (colorType === 4 || colorType === 6 || depth === 16 || interlace === 1) return true;
+  for (let at = 8; at + 8 <= buf.length;) {
+    const len = buf.readUInt32BE(at);
+    const type = buf.toString("latin1", at + 4, at + 8);
+    if (type === "tRNS") return true;
+    if (type === "IDAT" || type === "IEND") return false;
+    at += 12 + len;
+  }
+  return false;
 }
 
 /** The size of a `w × h` picture scaled down (never up) to fit `maxW × maxH`. */

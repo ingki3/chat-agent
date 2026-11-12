@@ -1,34 +1,33 @@
 // PDF from a checked document (#49) with `pdfkit`, A4. Korean needs a font in the file: Gothic A1 (regular and
 // bold, SIL Open Font License 1.1, the pinned `@expo-google-fonts/gothic-a1` package) is embedded as a subset of
-// the glyphs used, with a ToUnicode map so the text can be searched and copied. Page numbers at the foot.
+// the glyphs used, with a ToUnicode map so the text can be searched and copied. Page numbers at the foot of each page.
 import { DEFAULT_REFERENCES_TITLE, DocError, cellText, fit, imageOf } from "./common.mjs";
+import { graphemes } from "./widths.mjs";
 
 const MARGIN = 56;
 /** Pages one PDF may have (the sandbox's time and memory limits hold a document this size with room to spare). */
 export const MAX_PAGES = 1000;
+/**
+ * Pixels of the pictures pdfkit must decode (`imageInfo().decodes`), all together: about 15 bytes each while the file
+ * is made (a 40-megapixel PNG with alpha took 700 MB), so more is refused (`doc_too_large`).
+ */
+export const PDF_DECODED_PIXELS = 20_000_000;
 /** A table row is kept below this share of the page's text height (pdfkit clamps — cuts — a taller row). */
 const ROW_SHARE = 0.85;
 
 /**
- * A table that never loses text: columns of equal width, the font made smaller for many columns, and every cell
- * whose text is taller than a row may be cut at character boundaries into pieces that each fit — the pieces of a
- * row go on continuation rows (the header's too, still shaded), which pdfkit moves to the next page as needed.
- * A text that cannot be laid out at all (one character wider or taller than a row) is refused (`doc_too_large`),
- * and so is any row pdfkit would still clamp — the file is never made with part of a cell missing.
+ * Cuts cell text into pieces that each fit one table row of `inner` points' width and `limit` points' height at
+ * `size` (with `pad` around): lines are broken the way the cell wraps (at spaces where a word fits, else between
+ * graphemes — never inside one), pieces are cut between lines and each is measured by pdfkit before it is used.
+ * Exported for tests.
  */
-function drawTable(pdf, b, tableWidth) {
-  const n = b.columns.length;
-  const colWidth = tableWidth / n;
-  const pad = n > 10 ? 2 : 4;
-  const inner = colWidth - 2 * pad;
-  const size = Math.max(5, Math.min(9.5, inner / 1.1));
-  const limit = pdf.page.contentHeight * ROW_SHARE;
+export function cellSplitter(pdf, { size, inner, pad, limit }) {
   const heightOf = (font, text) => {
     pdf.font(font).fontSize(size);
     return pdf.heightOfString(text || " ", { width: inner }) + 2 * pad;
   };
   const widths = new Map();
-  /** Width of one character in `font` (cached: measuring long unbroken text again and again is slow in pdfkit). */
+  /** Width of one grapheme in `font` (cached: measuring long unbroken text again and again is slow in pdfkit). */
   const charWidth = (font, c) => {
     const key = `${font}\u0000${c}`;
     let w = widths.get(key);
@@ -56,9 +55,11 @@ function drawTable(pdf, b, tableWidth) {
         w = 0;
       };
       for (const word of para.split(/(?<=\s)/u)) {
-        const ww = Array.from(word).reduce((a, c) => a + charWidth(font, c), 0);
+        const gs = graphemes(word);
+        const ww = gs.reduce((a, c) => a + charWidth(font, c), 0);
         if (line && w + ww > inner && ww <= inner) push();
-        for (const c of word) {
+        // Graphemes, never code points: a cut never falls inside one ("é", a ZWJ sequence, a flag, jamo).
+        for (const c of gs) {
           const cw = charWidth(font, c);
           if (line && w + cw > inner && !/\s/u.test(c)) push();
           line += c;
@@ -93,6 +94,24 @@ function drawTable(pdf, b, tableWidth) {
     cut(all, per);
     return out;
   };
+  return { pieces, lines };
+}
+
+/**
+ * A table that never loses text: columns of equal width, the font made smaller for many columns, and every cell
+ * whose text is taller than a row may be cut at character boundaries into pieces that each fit — the pieces of a
+ * row go on continuation rows (the header's too, still shaded), which pdfkit moves to the next page as needed.
+ * A text that cannot be laid out at all (one character wider or taller than a row) is refused (`doc_too_large`),
+ * and so is any row pdfkit would still clamp — the file is never made with part of a cell missing.
+ */
+function drawTable(pdf, b, tableWidth) {
+  const n = b.columns.length;
+  const colWidth = tableWidth / n;
+  const pad = n > 10 ? 2 : 4;
+  const inner = colWidth - 2 * pad;
+  const size = Math.max(5, Math.min(9.5, inner / 1.1));
+  const limit = pdf.page.contentHeight * ROW_SHARE;
+  const { pieces } = cellSplitter(pdf, { size, inner, pad, limit });
   /** One table row as rows that fit: piece k of every cell on the k-th row. */
   const split = (cells, font) => {
     const parts = cells.map((c) => pieces(font, c));
@@ -126,11 +145,16 @@ function drawTable(pdf, b, tableWidth) {
 }
 
 export async function buildPdf(doc, ctx) {
+  let decoded = 0;
+  for (const img of ctx.images.values()) if (img.decodes) decoded += img.width * img.height;
+  if (decoded > PDF_DECODED_PIXELS) throw new DocError("doc_too_large");
   const PDFDocument = await ctx.lib("pdfkit");
   const pdf = new PDFDocument({
     size: "A4",
     margins: { top: MARGIN, bottom: MARGIN, left: MARGIN, right: MARGIN },
-    bufferPages: true,
+    // Pages are not buffered: each is written out (compressed) when the next starts, so memory does not grow with
+    // the page count (buffering all pages of a long table took about 2.8 MB a page).
+    bufferPages: false,
     lang: "ko-KR",
     displayTitle: true,
     font: ctx.fonts.regular,
@@ -144,6 +168,7 @@ export async function buildPdf(doc, ctx) {
   let pages = 1;
   pdf.on("pageAdded", () => {
     if (++pages > MAX_PAGES) throw new DocError("doc_too_large");
+    pageNumber(pages);
   });
   const chunks = [];
   pdf.on("data", (c) => chunks.push(c));
@@ -153,6 +178,29 @@ export async function buildPdf(doc, ctx) {
   });
   pdf.registerFont("R", ctx.fonts.regular);
   pdf.registerFont("B", ctx.fonts.bold);
+  /** The page number in the bottom margin of the page just started (the text position and style are kept). */
+  const pageNumber = (n) => {
+    const { x, y } = pdf;
+    const keep = pdf.page.margins.bottom;
+    const kept = { font: pdf._font, size: pdf._fontSize, source: pdf._fontSource, family: pdf._fontFamily };
+    pdf.page.margins.bottom = 0;
+    pdf
+      .font("R")
+      .fontSize(9)
+      .fillColor("#888888")
+      .text(`— ${n} —`, pdf.page.margins.left, pdf.page.height - MARGIN / 2 - 6, {
+        width: pdf.page.width - pdf.page.margins.left - pdf.page.margins.right,
+        align: "center",
+        lineBreak: false,
+      });
+    pdf.page.margins.bottom = keep;
+    pdf.fillColor("black");
+    Object.assign(pdf, { _font: kept.font, _fontSource: kept.source, _fontFamily: kept.family });
+    pdf.fontSize(kept.size);
+    pdf.x = x;
+    pdf.y = y;
+  };
+  pageNumber(1);
   const width = () => pdf.page.width - pdf.page.margins.left - pdf.page.margins.right;
   const bottom = () => pdf.page.height - pdf.page.margins.bottom;
   const say = (text, font, size, opts = {}) =>
@@ -215,23 +263,6 @@ export async function buildPdf(doc, ctx) {
     }
   }
 
-  // Page numbers: written in the bottom margin of every buffered page (no new page is started).
-  const range = pdf.bufferedPageRange();
-  for (let i = range.start; i < range.start + range.count; i++) {
-    pdf.switchToPage(i);
-    const keep = pdf.page.margins.bottom;
-    pdf.page.margins.bottom = 0;
-    pdf
-      .font("R")
-      .fontSize(9)
-      .fillColor("#888888")
-      .text(`${i + 1} / ${range.count}`, pdf.page.margins.left, pdf.page.height - MARGIN / 2 - 6, {
-        width: width(),
-        align: "center",
-        lineBreak: false,
-      });
-    pdf.page.margins.bottom = keep;
-  }
   pdf.end();
   await ended;
   return Buffer.concat(chunks);

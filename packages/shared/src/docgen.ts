@@ -18,6 +18,10 @@ export const DOC_REFUSED_KINDS = ["hwp", "hwpx"] as const;
 export const DOC_HWP_HINT =
   "한글(HWP·HWPX) 파일은 만들 수 없어요. 같은 내용을 DOCX(한글에서도 열려요)나 PDF로 만들 수 있어요 — kind를 docx 또는 pdf로 다시 요청하세요.";
 
+/** What the model is told when a PPTX holds characters whose width cannot be bounded (fixed words, #49). */
+export const DOC_UNSUPPORTED_TEXT_HINT =
+  "슬라이드(PPTX)에는 ‰·‱, 두세 칸 대시(⸺ ⸻), 아랍어 표현형 합자(ﷺ ﷽ 등)를 넣을 수 없어요. 그 글자를 다른 표기로 바꾸거나(예: ‰ → 퍼밀), docx·pdf로 만드세요.";
+
 /**
  * Bounds of one `doc_create` call. The MCP request itself is at most 1 MB (packages/mcp-tools MAX_BODY_BYTES); these
  * keep one document's work small and predictable inside that. The output limit is below the upload limit
@@ -160,6 +164,7 @@ export const DOC_CODES = [
   "doc_not_allowed",
   "doc_bad_input",
   "doc_too_large",
+  "doc_unsupported_text",
   "doc_hwp_unsupported",
   "doc_image_not_found",
   "doc_image_unsupported",

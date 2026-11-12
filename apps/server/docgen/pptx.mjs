@@ -3,14 +3,30 @@
 // repeated on each), each picture its own slide, and the references end the deck.
 //
 // PowerPoint does not flow text from one slide to the next and nothing here shrinks text on open, so all text is laid
-// out here, with an upper bound that holds for any font a viewer may substitute: every character is counted one
-// em wide (a tab four), and every line has an exact line spacing written into the file (`LINE` × size). Text boxes
+// out here, with the widths of `widths.mjs` (graphemes: one em for the supported scripts and symbols, two em for
+// anything else, a tab four; blocks with wider glyphs refused), and every line has an exact line spacing written into the file (`LINE` × size). Text boxes
 // get explicit insets, table cells explicit margins and column widths. Paragraphs, list items and table cells are
 // cut between lines onto continuation slides ("(계속)"); a table whose columns are too narrow for two characters at
 // the smallest legible size is refused (`doc_too_large`), and so is a deck over `MAX_SLIDES`. Nothing of the
 // document is dropped. A heading with nothing under it still gets its slide; a heading too long for the title box
 // opens the body instead.
 import { DEFAULT_REFERENCES_TITLE, DocError, cellText, imageOf } from "./common.mjs";
+import { graphemeEm, graphemes, hasRefused } from "./widths.mjs";
+
+/** Every text of the document (title, blocks, cells, captions, references). */
+function* texts(doc) {
+  yield doc.title;
+  if (doc.subtitle) yield doc.subtitle;
+  if (doc.author) yield doc.author;
+  for (const b of doc.blocks) {
+    if (b.text) yield b.text;
+    if (b.caption) yield b.caption;
+    if (b.title) yield b.title;
+    for (const i of b.items ?? []) yield i;
+    for (const c of b.columns ?? []) yield c;
+    for (const r of b.rows ?? []) for (const c of r) if (typeof c === "string") yield c;
+  }
+}
 
 const FONT = "맑은 고딕";
 const W = 13.333;
@@ -32,12 +48,20 @@ const CELL_MARGIN = 0.04;
 const TABLE_SIZES = [12, 11, 10, 9, 8];
 /** A table's header may take at most this share of the body height (it is repeated on every slide). */
 const HEADER_SHARE = 0.5;
-/** Slides one deck may have (the sandbox's memory limit holds a deck this size with room to spare). */
+/**
+ * Size caps, from measurements of the worker's peak memory (docs/ops.md §29.3). Writing a deck costs about 100 MB,
+ * plus roughly 8.5 KB per "unit" of volume: a paragraph (a text, or each line after a break in it) is one unit, a
+ * table cell three, a slide twenty-five, a picture one per KB of its file. `MAX_VOLUME` keeps the worst case near
+ * 500 MB, under the sandbox's 768 MB; `MAX_SLIDES` bounds the deck's length on its own.
+ */
 export const MAX_SLIDES = 500;
+export const MAX_VOLUME = 40_000;
+const CELL_VOLUME = 3;
+const SLIDE_VOLUME = 25;
 
 const pt = (inches) => inches * 72;
-/** Width of one character in em — an upper bound for any font: one em, a tab four. */
-export const charEm = (c) => (c === "\t" ? 4 : 1);
+/** Width of one grapheme in em — the bounds of `widths.mjs` (one em, two em, a tab four). */
+export const charEm = graphemeEm;
 const lineHeight = (size) => size * LINE;
 
 /**
@@ -51,7 +75,8 @@ export function wrapLines(text, size, widthPt) {
     let line = "";
     let em = 0;
     let first = true;
-    for (const c of segment) {
+    // Graphemes, never code points: a combining mark, a ZWJ sequence or a flag is never split from its base.
+    for (const c of graphemes(segment)) {
       const w = charEm(c);
       if (line && (em + w) * size > widthPt) {
         out.push({ text: line, hard: first && k > 0 });
@@ -69,6 +94,8 @@ export function wrapLines(text, size, widthPt) {
 const joinLines = (lines) => lines.map((l, i) => (i && l.hard ? `\n${l.text}` : l.text)).join("");
 
 export async function buildPptx(doc, ctx) {
+  // Text whose glyphs no width here bounds is refused before anything is made (widths.mjs REFUSED_RANGES).
+  for (const t of texts(doc)) if (hasRefused(t)) throw new DocError("doc_unsupported_text");
   const PptxGenJS = await ctx.lib("pptxgenjs");
   const pres = new PptxGenJS();
   pres.layout = "LAYOUT_WIDE";
@@ -80,7 +107,15 @@ export async function buildPptx(doc, ctx) {
   let slides = 0;
   const newSlide = () => {
     if (++slides > MAX_SLIDES) throw new DocError("doc_too_large");
+    spend([], 0, SLIDE_VOLUME);
     return pres.addSlide();
+  };
+  /** The deck's volume as the memory of writing it grows (see `MAX_VOLUME`); past the cap it is refused. */
+  let volume = 0;
+  const spend = (texts, cells = 0, extra = 0) => {
+    for (const t of texts) volume += t.split("\n").length;
+    volume += CELL_VOLUME * cells + extra;
+    if (volume > MAX_VOLUME) throw new DocError("doc_too_large");
   };
   /** Text box options: explicit insets and exact line spacing (what the layout above assumes). */
   const box = (o, size) => ({
@@ -144,6 +179,7 @@ export async function buildPptx(doc, ctx) {
   /** A slide with `title` in the title box (`title` fits it: `fitsTitle`). */
   const titled = (title) => {
     const s = newSlide();
+    if (title) spend([title]);
     if (title)
       s.addText(
         title,
@@ -208,6 +244,7 @@ export async function buildPptx(doc, ctx) {
     if (cur.length) pages.push(cur);
     pages.forEach((chunk, i) => {
       const s = titled(i ? continued(heading) : heading);
+      spend(chunk.map((l) => l.text));
       s.addText(
         chunk.map((l, j) => ({
           text: l.text,
@@ -252,7 +289,11 @@ export async function buildPptx(doc, ctx) {
     const n = b.columns.length;
     const colPt = pt(boxW) / n;
     const innerPt = colPt - 2 * pt(CELL_MARGIN);
-    const size = TABLE_SIZES.find((s) => Math.floor(innerPt / s) >= 2);
+    // A line must hold two characters, and the widest grapheme of the table (a tab is four em).
+    let widest = 2;
+    for (const t of [...b.columns, ...b.rows.flat().map(cellText)])
+      for (const g of graphemes(t)) widest = Math.max(widest, charEm(g));
+    const size = TABLE_SIZES.find((s) => innerPt / s >= widest);
     if (!size) throw new DocError("doc_too_large");
     const lh = lineHeight(size);
     const pad = 2 * pt(CELL_MARGIN) + 1; // margins and a border
@@ -295,6 +336,7 @@ export async function buildPptx(doc, ctx) {
     if (rows.length || !pagesOf.length) out();
     pagesOf.forEach((page, i) => {
       const s = titled(i ? continued(title) : title);
+      spend([...b.columns, ...page.flatMap((r) => r.map((c) => c.text))], n * (page.length + 1));
       s.addTable([headRow, ...page], {
         x: MARGIN,
         y: BODY_Y,
@@ -343,6 +385,7 @@ export async function buildPptx(doc, ctx) {
       case "image": {
         flush();
         const img = imageOf(ctx, b);
+        spend([], 0, Math.ceil(img.buf.length / 1024));
         shown = true;
         const s = titled(heading);
         // The caption's own height (laid out like the body), the picture fills the rest.

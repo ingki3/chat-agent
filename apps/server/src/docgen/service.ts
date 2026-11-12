@@ -6,6 +6,7 @@ import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
 import { DOC_CREATE_TOOL } from "@agentlee/mcp-tools/docgen";
 import {
   DOC_HWP_HINT,
+  DOC_UNSUPPORTED_TEXT_HINT,
   DOC_KINDS,
   DOC_LIMITS,
   DocContent,
@@ -177,7 +178,10 @@ export class DocGenService {
     }
 
     const made = await this.opts.runner({ kind, doc, images });
-    if (!made.ok) throw new DocError(isDocCode(made.code) ? made.code : "doc_failed");
+    if (!made.ok) {
+      const code = isDocCode(made.code) ? made.code : "doc_failed";
+      throw new DocError(code, code === "doc_unsupported_text" ? DOC_UNSUPPORTED_TEXT_HINT : undefined);
+    }
     if (made.data.length > DOC_LIMITS.outputBytes) throw new DocError("doc_output_too_large");
     if (!made.data.length) throw new DocError("doc_invalid");
 
@@ -231,6 +235,7 @@ export class DocGenService {
 export const WORKER_CODES: ReadonlySet<string> = new Set<DocCode>([
   "doc_bad_input",
   "doc_too_large",
+  "doc_unsupported_text",
   "doc_image_not_found",
   "doc_image_unsupported",
   "doc_image_too_large",
