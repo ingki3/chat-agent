@@ -105,6 +105,8 @@ export const conversations = sqliteTable(
      * looked at yet — the sidebar's "새 결과". Cleared when the owner opens the conversation.
      */
     newResultAt: integer("new_result_at"),
+    /** The result (or failure) message that "새 결과" is about: the page marks it seen once that message is shown. */
+    newResultMessageId: text("new_result_message_id"),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),
   },

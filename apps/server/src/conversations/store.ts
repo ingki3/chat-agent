@@ -77,6 +77,8 @@ export function toConversation(c: ConversationRow): Conversation {
     settings: settingsOf(c),
     fallbackNotice: noticeOf(c.fallbackNotice),
     newResult: c.newResultAt !== null && c.newResultAt !== undefined,
+    newResultMessageId:
+      c.newResultAt !== null && c.newResultAt !== undefined ? (c.newResultMessageId ?? null) : null,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -175,6 +177,7 @@ export class ConversationStore {
       fallbackNotice: opts.settings && opts.fallback ? noticeFor(opts.settings, opts.limitedUntil) : null,
       nextSeq: 1,
       newResultAt: null,
+      newResultMessageId: null,
       createdAt: t,
       updatedAt: t,
     };
@@ -367,18 +370,33 @@ export class ConversationStore {
    * A schedule run left a result here (#56, FR-8.3): the sidebar's "새 결과" until the owner opens the conversation.
    * It is activity: the conversation moves up the "recent" list.
    */
-  markNewResult(id: string): void {
+  markNewResult(id: string, messageId: string | null): void {
     const t = this.now();
-    this.db.update(conversations).set({ newResultAt: t, updatedAt: t }).where(eq(conversations.id, id)).run();
+    this.db
+      .update(conversations)
+      .set({ newResultAt: t, newResultMessageId: messageId, updatedAt: t })
+      .where(eq(conversations.id, id))
+      .run();
   }
 
-  /** The owner has seen the result (#56). Not activity. True when there was one. */
-  clearNewResult(id: string): boolean {
+  /**
+   * The owner has seen the result (#56). Not activity. With `messageId`: only when that is still the result marked
+   * (a newer one stays). True when one was cleared.
+   */
+  clearNewResult(id: string, messageId?: string): boolean {
     return (
       this.db
         .update(conversations)
-        .set({ newResultAt: null })
-        .where(and(eq(conversations.id, id), sql`${conversations.newResultAt} is not null`))
+        .set({ newResultAt: null, newResultMessageId: null })
+        .where(
+          and(
+            eq(conversations.id, id),
+            sql`${conversations.newResultAt} is not null`,
+            messageId === undefined
+              ? undefined
+              : sql`coalesce(${conversations.newResultMessageId}, '') = ${messageId}`,
+          ),
+        )
         .run().changes > 0
     );
   }

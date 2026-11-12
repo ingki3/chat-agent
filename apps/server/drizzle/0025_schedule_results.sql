@@ -19,5 +19,6 @@ CREATE TABLE `schedule_results` (
 );
 --> statement-breakpoint
 ALTER TABLE `conversations` ADD `new_result_at` integer;--> statement-breakpoint
+ALTER TABLE `conversations` ADD `new_result_message_id` text;--> statement-breakpoint
 ALTER TABLE `notifications` ADD `dedupe_key` text;--> statement-breakpoint
 CREATE UNIQUE INDEX `notifications_dedupe_idx` ON `notifications` (`dedupe_key`);

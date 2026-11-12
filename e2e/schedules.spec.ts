@@ -342,6 +342,15 @@ test("결과 링크: 이전 페이지를 못 불러오면 몇 번만 묻고 멈�
   const stopped = page.getByTestId("link-search-stopped");
   await expect(stopped).toBeVisible();
   await page.waitForTimeout(1500);
+  // The result was never shown: "새 결과" stays.
+  const conversationId = url.split("/")[2]!.split("#")[0]!;
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  expect(await marked()).toBe(true);
   // One page asked for (and the client's one retry) — not a loop.
   expect(older).toBeGreaterThan(0);
   expect(older).toBeLessThanOrEqual(2);
@@ -357,6 +366,7 @@ test("결과 링크: 이전 페이지를 못 불러오면 몇 번만 묻고 멈�
   const target = page.locator(`#${url.split("#")[1]}`);
   await expect(target).toBeInViewport({ timeout: 10_000 });
   await expect(stopped).toHaveCount(0);
+  await expect.poll(marked).toBe(false);
 });
 
 test("새 결과: 결과 대화를 열어 둔 채 실행되면 그 화면에 결과가 뜨고 표시가 지워진다 (review #116)", async ({
@@ -425,4 +435,118 @@ test("새 결과: 결과 대화를 열어 둔 채 실행되면 그 화면에 결
   const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "열린 예약" });
   await expect(conv).toBeVisible();
   await expect(conv.getByTestId("new-result")).toHaveCount(0);
+});
+
+/** A schedule (notifications off) whose result conversation exists and is open on this page, seen. */
+async function openResult(page: import("@playwright/test").Page, baseURL: string, name: string) {
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name, prompt: "열어 둔 채", timing: { type: "daily", time: "08:00" }, notify: false },
+      headers: csrf(baseURL),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL, s.id);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}`);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await expect.poll(marked).toBe(false);
+  return { id: s.id, conversationId, marked };
+}
+
+test("새 결과: 사이드바가 다른 것을 검색 중이어도 열린 결과 대화가 갱신된다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedsearch");
+  await signIn(page, baseURL!, me);
+  const r = await openResult(page, baseURL!, "검색 중 예약");
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await page.getByRole("searchbox", { name: "내 대화 검색" }).fill("전혀 다른 것");
+  await expect(page.getByTestId("sidebar").getByTestId("conv")).toHaveCount(0);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 닫기" }).click();
+  await runToEnd(page, baseURL!, r.id);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(r.marked).toBe(false);
+});
+
+test("새 결과: 결과 메시지를 못 불러오면 표시가 남는다 (review #116)", async ({ page, browser, baseURL }) => {
+  const me = await newMember(browser, baseURL!, "schedfail");
+  await signIn(page, baseURL!, me);
+  const r = await openResult(page, baseURL!, "실패 예약");
+  const latest = /\/api\/conversations\/[^/]+\/messages\?limit=100$/;
+  await page.route(latest, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "x" }) }),
+  );
+  await runToEnd(page, baseURL!, r.id);
+  await page.clock.fastForward(61_000);
+  // The client's retry, too.
+  await page.waitForTimeout(500);
+  await page.clock.fastForward(5_000);
+  await page.waitForTimeout(1500);
+  expect(await r.marked()).toBe(true);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  // Readable again: the next look shows it and only then clears the mark.
+  await page.unroute(latest);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(r.marked).toBe(false);
+});
+
+test("보내기: 늦게 온 이전 active-run 응답(null)이 방금 시작한 실행을 지우지 않는다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "activerace");
+  await signIn(page, baseURL!, me);
+  const c = (await (
+    await page.request.post("/api/conversations", { data: {}, headers: csrf(baseURL!) })
+  ).json()) as {
+    id: string;
+  };
+  await page.goto(`/c/${c.id}`);
+  await expect(page.getByRole("textbox", { name: /메시지/ })).toBeVisible();
+  let slow = 0;
+  let armed = false;
+  await page.route(/\/api\/conversations\/[^/]+\/active-run$/, async (route) => {
+    // Only the one background read made below is slow (and says "no run"); every other goes to the server.
+    if (!armed || slow > 0) return route.continue().catch(() => {});
+    slow++;
+    await new Promise((r) => setTimeout(r, 1500));
+    // The page may have cancelled it meanwhile (that is the fix): then there is nothing to answer.
+    await route
+      .fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ run: null }) })
+      .catch(() => {});
+  });
+  // A background read of the active run (focus) is on its way, slowly, with "no run"…
+  await page.waitForTimeout(5_500);
+  armed = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => slow).toBeGreaterThan(0);
+  // Every opening of a run's event stream (a stream closed by a stale "no run" would be opened again).
+  const streams: string[] = [];
+  page.on("request", (r) => {
+    if (/\/api\/runs\/[^/]+\/events/.test(r.url())) streams.push(r.url());
+  });
+  // …when the user sends.
+  const box = page.getByRole("textbox", { name: /메시지/ });
+  await box.fill("/long 60");
+  await box.press("Enter");
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "streaming", { timeout: 5_000 });
+  await page.waitForTimeout(2_000);
+  // The stream stayed open: the reply goes on and ends complete.
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  expect((await reply.innerText()).split(/\s+/).length).toBeGreaterThan(30);
+  // One stream, never closed and reopened on the way.
+  expect(streams).toHaveLength(1);
 });

@@ -168,6 +168,8 @@ export const Conversation = z.object({
    * Cleared by `POST /api/conversations/:id/result-seen`. Optional for older clients' fixtures; the server always sends it.
    */
   newResult: z.boolean().optional(),
+  /** The message that result is (the page clears "새 결과" only once this message is shown); null: not known. */
+  newResultMessageId: z.string().nullable().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7e881f9e-c8e1-4b4c-979f-394f1e093c9a",
+  "id": "013da2f8-5a48-4487-a9bd-2e07bfed9120",
   "prevId": "fdadda3d-5497-4707-866d-a0234924019e",
   "tables": {
     "artifact_versions": {
@@ -838,6 +838,13 @@
         "new_result_at": {
           "name": "new_result_at",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "new_result_message_id": {
+          "name": "new_result_message_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

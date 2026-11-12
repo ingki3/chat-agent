@@ -215,8 +215,18 @@ describe("schedule runs in the result conversation (#56)", () => {
     expect((await t.req("admin", "POST", `/api/conversations/${convId}/result-seen`)).statusCode).toBe(403);
     const list = (await t.req("owner", "GET", "/api/conversations")).json<{ items: Conversation[] }>().items;
     expect(list.find((c) => c.id === convId)?.newResult).toBe(true);
-    const seen = await t.req("owner", "POST", `/api/conversations/${convId}/result-seen`);
-    expect(Conversation.parse(seen.json()).newResult).toBe(false);
+    expect(conv.newResultMessageId).toBe(msgs[1]!.id);
+    // Seen for another (older) message: a newer result stays marked.
+    const stale = await t.req("owner", "POST", `/api/conversations/${convId}/result-seen`, {
+      messageId: msgs[0]!.id,
+    });
+    expect(Conversation.parse(stale.json()).newResult).toBe(true);
+    const bad = await t.req("owner", "POST", `/api/conversations/${convId}/result-seen`, { messageId: 1 });
+    expect(bad.statusCode).toBe(400);
+    const seen = await t.req("owner", "POST", `/api/conversations/${convId}/result-seen`, {
+      messageId: msgs[1]!.id,
+    });
+    expect(Conversation.parse(seen.json())).toMatchObject({ newResult: false, newResultMessageId: null });
   });
 
   it("each run is a new message of the same conversation; the finance check applies to the result (#30)", async () => {

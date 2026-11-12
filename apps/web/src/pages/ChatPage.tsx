@@ -18,6 +18,7 @@ import {
   type ChatSettings,
   type Conversation,
   type Message,
+  type Run,
   type StartRunResponse,
   type UploadedFile,
 } from "@agentlee/shared";
@@ -87,7 +88,13 @@ function useOnline() {
 export function ChatPage() {
   const { id = "" } = useParams();
   const qc = useQueryClient();
-  const conv = useQuery({ queryKey: ["conversation", id], queryFn: () => conversations.get(id) });
+  // Read again every minute while visible (review #116): a schedule result arriving in the open conversation is
+  // noticed here, whatever the sidebar shows (a search, another page).
+  const conv = useQuery({
+    queryKey: ["conversation", id],
+    queryFn: () => conversations.get(id),
+    refetchInterval: 60_000,
+  });
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
@@ -96,7 +103,20 @@ export function ChatPage() {
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
   const list = messages.data ? [...messages.data.pages].reverse().flatMap((p) => p.items) : undefined;
-  const active = useQuery({ queryKey: ["active-run", id], queryFn: () => conversations.activeRun(id) });
+  // The run this page just started (review #116): an answer to an `active-run` request sent before it (a background
+  // refetch still in flight, `null`) never replaces it — the stream would close and the reply never come.
+  const startedHere = useRef<{ id: string; runId: string; at: number } | null>(null);
+  const active = useQuery({
+    queryKey: ["active-run", id],
+    queryFn: async () => {
+      const asked = Date.now();
+      const r = await conversations.activeRun(id);
+      const mine = startedHere.current;
+      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId)
+        return qc.getQueryData<Run | null>(["active-run", id]) ?? null;
+      return r;
+    },
+  });
   const usable = useUsableRuntimes();
   const [after, setAfter] = useState<Record<string, AfterRun>>({});
   const [actionError, setActionError] = useState<string | null>(null);
@@ -150,6 +170,9 @@ export function ChatPage() {
       try {
         const r = await call();
         markStartedHere(r.run.id);
+        startedHere.current = { id, runId: r.run.id, at: Date.now() };
+        // An `active-run` read still in flight would answer from before this run: cancelled first.
+        await qc.cancelQueries({ queryKey: ["active-run", id] });
         qc.setQueryData(["active-run", id], r.run);
         await qc.invalidateQueries({ queryKey: ["messages", id] });
         toBottom();
@@ -202,22 +225,6 @@ export function ChatPage() {
       if (n) setNotice({ id, text: noticeText(n, usable.data) });
     });
   }, [pendingNotice, id, qc, usable.data, usable.isPending]);
-  // A schedule's result opened (#56, FR-8.3): the sidebar's "새 결과" goes.
-  const newResult = !!conv.data?.newResult;
-  // Marked seen only once the messages (with the result) are loaded and not being read again.
-  const resultShown = !!messages.data && !messages.isFetching;
-  useEffect(() => {
-    if (!newResult || !resultShown) return;
-    void conversations
-      .resultSeen(id)
-      .then((c) => {
-        qc.setQueryData<Conversation>(["conversation", id], (old) =>
-          old ? { ...old, newResult: c.newResult } : old,
-        );
-        return qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
-      })
-      .catch(() => {});
-  }, [newResult, resultShown, id, qc]);
   // A notification's link to the result message (`#m-<id>`, FR-8.4): older pages are loaded until it is there (a
   // result followed by many turns), then it is scrolled to — once per link. The search stops at a failed page (500,
   // 403 after a revoked share…) or after SEARCH_PAGES pages, and offers "다시 시도" (review #116).
@@ -261,6 +268,34 @@ export function ChatPage() {
     setSearchStopped(null);
     void fetchNextPage();
   };
+  // A schedule's result (#56, FR-8.3): when the conversation says there is one that is not shown yet, the view is read
+  // again; "새 결과" goes only once that very message has loaded without error (and, for a link, was found).
+  const newResult = !!conv.data?.newResult;
+  const resultId = newResult ? (conv.data?.newResultMessageId ?? null) : null;
+  const settled = messages.isSuccess && !messages.isFetching && !!list;
+  const resultLoaded = settled && (resultId === null || !!list?.some((m) => m.id === resultId));
+  const linkOk = !target || found;
+  const reread = useRef(0);
+  useEffect(() => {
+    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure).
+    if (!newResult || resultLoaded || target || messages.isFetching) return;
+    if (reread.current === conv.dataUpdatedAt) return;
+    reread.current = conv.dataUpdatedAt;
+    void qc.invalidateQueries({ queryKey: ["messages", id] });
+    void qc.invalidateQueries({ queryKey: ["active-run", id] });
+  }, [newResult, resultLoaded, target, messages.isFetching, conv.dataUpdatedAt, id, qc]);
+  useEffect(() => {
+    if (!newResult || !resultLoaded || !linkOk) return;
+    void conversations
+      .resultSeen(id, resultId ?? undefined)
+      .then((c) => {
+        qc.setQueryData<Conversation>(["conversation", id], (old) =>
+          old ? { ...old, newResult: c.newResult, newResultMessageId: c.newResultMessageId ?? null } : old,
+        );
+        return qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      })
+      .catch(() => {});
+  }, [newResult, resultLoaded, linkOk, resultId, id, qc]);
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);

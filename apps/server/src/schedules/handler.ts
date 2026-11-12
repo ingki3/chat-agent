@@ -299,7 +299,7 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
             parts: [{ type: "text", text }],
           }).id;
         }
-        conversations.markNewResult(conversationId);
+        conversations.markNewResult(conversationId, messageId);
       }
       store.recordResult({
         schedule_run_id: ctx.runId,

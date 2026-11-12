@@ -156,7 +156,11 @@ export function registerConversationRoutes(
     "/api/conversations/:id/result-seen",
     { config: conv("write") },
     async (req, reply) => {
-      store.clearNewResult(req.params.id);
+      // `messageId`: the result the page showed — a newer result that came meanwhile stays marked (review #116).
+      const body = (req.body ?? {}) as { messageId?: unknown };
+      if (body.messageId !== undefined && typeof body.messageId !== "string")
+        return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
+      store.clearNewResult(req.params.id, body.messageId);
       return reply.header("Cache-Control", "no-store").send(toConversation(store.get(req.params.id)!));
     },
   );

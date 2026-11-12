@@ -52,6 +52,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "a model id from the runtime's catalogue (checked by RunAccess before it is stored)",
   },
   "conversations.effort": ENUM,
+  "conversations.new_result_message_id": ID,
   "conversations.fallback_notice": {
     exempt: "runtime and model ids (checked by RunAccess before they are stored)",
   },
