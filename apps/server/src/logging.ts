@@ -25,6 +25,8 @@ import {
   isWebCode,
   isArtifactCode,
   isFileCode,
+  isExtractCode,
+  isFileToolCode,
   isExportCode,
   isExportFormat,
   isLoginCode,
@@ -121,6 +123,12 @@ export const LOG_EVENTS = [
   "file.swept",
   // The start-up clean-up did not run: the database is not this data folder's own file (a link elsewhere).
   "file.sweep_skipped",
+  // Extraction (#48): fixed outcome code, duration and IDs — never the file name or its text.
+  "file.extracted",
+  "file.extract_failed",
+  "file.extract_resumed",
+  // File tool calls (#48): tool name, outcome code, duration and IDs — never the query, snippet or file text.
+  "file.tool_finished",
   // A restore interrupted mid-swap, finished at server start (#37): `completed` or `rolled_back`.
   "restore.recovered",
   // Known secrets (review round 26): a background rescrub pass failed; it is retried (fixed code, no content).
@@ -251,6 +259,10 @@ const FIELDS = new Map<string, Check>([
   /** Backups (#37): what started it and one of the fixed `backup_*` codes. */
   /** Uploads (#22): one of the fixed `file_*` codes — never the file's name or content. */
   ["fileCode", isFileCode],
+  /** Extraction (#48): the file's id and one of the fixed codes; file tool calls: the outcome code. */
+  ["fileId", isId],
+  ["extractCode", isExtractCode],
+  ["fileToolCode", isFileToolCode],
   ["backupTrigger", isBackupTrigger],
   ["backupCode", isBackupCode],
   ["restoreCode", isRestoreRecovery],
@@ -524,6 +536,9 @@ export type LogFields = {
   attempt?: number;
   purpose?: string;
   fileCode?: string;
+  fileId?: string;
+  extractCode?: string;
+  fileToolCode?: string;
   backupTrigger?: string;
   backupCode?: string;
   restoreCode?: string;

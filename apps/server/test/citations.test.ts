@@ -879,9 +879,11 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(findSnippet(body, "없는 다른 구절이에요", "perf-key").found).toBe(false);
     const again = performance.now() - t;
     expect(verifyStats.normalized).toBe(normalized + 1); // the snippet only: the page came from the cache
-    // Measured 25–35 ms here (400k characters); generous bounds for slower CI machines.
-    expect(first).toBeLessThan(250);
-    expect(again).toBeLessThan(25);
+    // Measured 25–35 ms here (400k characters). Shared CI runners are several times slower (as in redact.test.ts):
+    // there the caps only catch gross regressions.
+    const slow = process.env.CI ? 4 : 1;
+    expect(first).toBeLessThan(250 * slow);
+    expect(again).toBeLessThan(25 * slow);
     // A changed body under the same key is normalised again, not served from the cache.
     expect(findSnippet(`${body} 끝에 붙인 새 문장입니다`, "끝에 붙인 새 문장입니다", "perf-key").found).toBe(
       true,

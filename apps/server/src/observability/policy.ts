@@ -3,6 +3,7 @@ import {
   DOC_CODES,
   DOC_KINDS,
   DOC_REFUSED_KINDS,
+  EXTRACT_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -257,6 +258,13 @@ export const FILE_CODES = set([
   "too_many_cancels",
 ]);
 export const isFileCode = member(FILE_CODES);
+
+/** Extraction outcomes (#48): `extract_ok` or one of the fixed `EXTRACT_CODES`. */
+export const EXTRACT_LOG_CODES = set(["extract_ok", ...EXTRACT_CODES]);
+export const isExtractCode = member(EXTRACT_LOG_CODES);
+/** File tool outcomes (#48): why a call did not succeed, or the status of a `file_cite`. */
+export const FILE_TOOL_CODES = set(["file_not_allowed", "file_not_found", "file_bad_input", ...CITE_CODES]);
+export const isFileToolCode = member(FILE_TOOL_CODES);
 
 /** Backup outcomes (#37, backup/backup.ts `BACKUP_CODES` — a test keeps the two equal). */
 export const BACKUP_CODES = set([

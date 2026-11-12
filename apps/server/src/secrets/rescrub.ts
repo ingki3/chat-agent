@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { snippetKey } from "../citations/store.js";
+import { parseMarks, scrubFile } from "../files/scrub.js";
 import type { Db } from "../db/client.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { TEXT_COLUMNS, type RescrubKind } from "./columns.js";
@@ -73,13 +74,17 @@ const DERIVED: Record<string, Pick<Table, "immutable" | "derived" | "removeOn">>
   },
 };
 
-/** The tables and columns to rescrub, from `TEXT_COLUMNS` (`run_events` is handled per run, as a stream). */
+/**
+ * The tables and columns to rescrub, from `TEXT_COLUMNS` (`run_events` is handled per run, as a stream, and
+ * `file_segments` per file — `rescrubFiles`).
+ */
 export const RESCRUB_TABLES: readonly Table[] = (() => {
   const byTable = new Map<string, Column[]>();
   for (const [key, rule] of Object.entries(TEXT_COLUMNS)) {
     if (!("rescrub" in rule)) continue;
     const [table, name] = key.split(".") as [string, string];
-    if (table === "run_events") continue;
+    // Run events go per run (a stream), extracted file text per file (its units in document order, #48).
+    if (table === "run_events" || table === "file_segments") continue;
     byTable.set(table, [...(byTable.get(table) ?? []), { name, kind: rule.rescrub }]);
   }
   return [...byTable].map(([table, columns]) => ({ table, columns, ...DERIVED[table] }));
@@ -163,6 +168,15 @@ export class StoredRescrub {
       this.nextCompactAt = Date.now() + this.compactRetryMs;
     }
     if (this.dirty || compactionState(sql) !== "done") this.schedule();
+  }
+
+  /**
+   * Rows were changed elsewhere (a file extracted again over its old text, files/extract.ts) and the marker is set:
+   * a checkpoint soon, like after a pass of its own.
+   */
+  cleanup(): void {
+    this.dirty = true;
+    this.schedule();
   }
 
   /** Failed passes so far (tests, the admin's health view). */
@@ -297,6 +311,79 @@ export class StoredRescrub {
     }
   }
 
+  /**
+   * Extracted file text (#48): each file's units together, in document order (`scrubFile` — a line-wrapped
+   * base64 across two units is one value), looked at with the new values only, recomputed with everything the
+   * registry knows when one is found; texts, marks and the `approximate` flag change together.
+   */
+  private async rescrubFiles(look: KnownSecrets): Promise<void> {
+    const sql = this.db.$client;
+    let after = "";
+    for (;;) {
+      if (this.closed) return;
+      const ids = sql
+        .prepare(`select distinct file_id from file_segments where file_id > ? order by file_id limit ?`)
+        .all(after, 50) as { file_id: string }[];
+      if (!ids.length) return;
+      for (const { file_id } of ids) {
+        const rows = sql
+          .prepare(
+            `select seq, text, marks, approximate, cut, ends_early as endsEarly, locator from file_segments
+             where file_id = ? order by seq`,
+          )
+          .all(file_id) as {
+          seq: number;
+          text: string;
+          marks: string | null;
+          approximate: number;
+          cut: number;
+          endsEarly: number;
+          locator: string;
+        }[];
+        // A file with a unit cut for display is not scrubbed in place (the cut part is not there): it is extracted
+        // again from its original bytes (`FileExtracts.reextractCut`, called when the secret was registered).
+        if (rows.some((r) => r.cut)) continue;
+        // A cut-off secret only where the extractor left text out (`ends_early`).
+        const units = rows.map((r) => ({
+          text: r.text,
+          marks: parseMarks(r.marks),
+          endsEarly: !!r.endsEarly,
+        }));
+        const locHit = rows.some((r) => scrubKnown(r.locator, { registry: look, tail: false }) !== r.locator);
+        if (!locHit && scrubFile(units, look).every((u, i) => u.text === rows[i]!.text)) continue;
+        const next = scrubFile(units, this.registry);
+        let changed = false;
+        sql.transaction(() => {
+          rows.forEach((r, i) => {
+            const n = next[i]!;
+            const locator = rescrubValue(r.locator, "deep", this.registry);
+            const marks = n.marks ? JSON.stringify(n.marks) : null;
+            const approximate = r.approximate || n.approximate ? 1 : 0;
+            if (
+              n.text === r.text &&
+              marks === r.marks &&
+              approximate === r.approximate &&
+              locator === r.locator
+            )
+              return;
+            sql
+              .prepare(
+                `update file_segments set text = ?, marks = ?, approximate = ?, locator = ? where file_id = ? and seq = ?`,
+              )
+              .run(n.text, marks, approximate, locator, file_id, r.seq);
+            changed = true;
+          });
+          // Like every masked row (review #111): the old text may still be in WAL frames and old pages until a
+          // TRUNCATE checkpoint — recorded in the same transaction, so a restart resumes the clean-up.
+          if (changed) markPending(sql);
+        })();
+        if (changed) this.dirty = true;
+      }
+      after = ids.at(-1)!.file_id;
+      await tick();
+    }
+  }
+
   close(): void {
     this.closed = true;
     clearTimeout(this.timer);
@@ -387,6 +474,7 @@ export class StoredRescrub {
         await tick();
       }
     }
+    await this.rescrubFiles(look);
     // Run events: each run as one stream (a secret split across deltas is found too). Looked at without parsing:
     // the raw rows, and the delta texts joined in SQL.
     let afterRun = "";

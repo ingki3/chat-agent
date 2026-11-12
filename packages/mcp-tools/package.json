@@ -38,6 +38,11 @@
       "types": "./src/docgen.ts",
       "development": "./src/docgen.ts",
       "default": "./dist/docgen.js"
+    },
+    "./files": {
+      "types": "./src/files.ts",
+      "development": "./src/files.ts",
+      "default": "./dist/files.js"
     }
   },
   "scripts": {

@@ -66,6 +66,9 @@ type Compiled = {
 export class KnownSecrets {
   private readonly values = new Set<string>();
   private compiled: Compiled | undefined;
+  private gen = 0;
+  /** Like `gen`, for values that may already be stored (not `fresh` ones: a new run token cannot be in a row). */
+  private storedGen = 0;
   private readonly listeners: ((values: string[]) => void)[] = [];
 
   /**
@@ -90,8 +93,10 @@ export class KnownSecrets {
       if (this.values.has(v)) continue;
       this.values.add(v);
       this.compiled = undefined;
+      this.gen++;
       added.push(v);
     }
+    if (added.length && !opts.fresh) this.storedGen++;
     if (added.length && !opts.fresh)
       for (const fn of [...this.listeners]) {
         try {
@@ -104,7 +109,11 @@ export class KnownSecrets {
 
   /** Forgets a value that is no longer valid anywhere (a revoked run token, an ended session). */
   remove(value: string | undefined | null): void {
-    for (const v of pieces(value)) if (this.values.delete(v)) this.compiled = undefined;
+    for (const v of pieces(value))
+      if (this.values.delete(v)) {
+        this.compiled = undefined;
+        this.gen++;
+      }
   }
 
   /**
@@ -152,6 +161,18 @@ export class KnownSecrets {
   clear(): void {
     this.values.clear();
     this.compiled = undefined;
+    this.gen++;
+    this.storedGen++;
+  }
+
+  /** Changes whenever a value is added or removed: what a cache of scrubbed text is keyed on (#48). */
+  get generation(): number {
+    return this.gen;
+  }
+
+  /** Changes whenever a value that may already be stored is registered (#48: extractions made before are stale). */
+  get storedGeneration(): number {
+    return this.storedGen;
   }
 
   /** The matcher for the current set. */

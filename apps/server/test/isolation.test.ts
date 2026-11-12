@@ -162,6 +162,16 @@ describe.skipIf(!darwin)("process sandbox (macOS sandbox-exec)", () => {
       ...extra,
     });
 
+  it("output decoded across chunk boundaries: a character split between two reads stays whole (review #107)", async () => {
+    // 3-byte characters: 65536 is not a multiple of 3, so the pipe's 64 KiB reads split characters.
+    const text = "한".repeat(100_000);
+    fs.writeFileSync(path.join(t.son, "korean.txt"), text);
+    const r = await cat(path.join(t.son, "korean.txt"), { maxOutputBytes: 1_000_000 });
+    expect(r.code).toBe(0);
+    expect(r.stdout.includes("\uFFFD")).toBe(false);
+    expect(r.stdout).toBe(text);
+  });
+
   it("reads inside its own folder", async () => {
     const r = await cat(path.join(t.son, "homework.txt"));
     expect(r.stdout).toBe("son's homework");

@@ -87,6 +87,8 @@ describe("database", () => {
       "conversation_summaries",
       "conversations",
       "error_log",
+      "file_extracts",
+      "file_segments",
       "files",
       "finance_results",
       "messages",

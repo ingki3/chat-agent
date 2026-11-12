@@ -10,6 +10,7 @@ export * from "./connections.js";
 export * from "./sources.js";
 export * from "./artifacts.js";
 export * from "./files.js";
+export * from "./locators.js";
 export * from "./usage.js";
 export * from "./finance.js";
 export * from "./admin.js";
