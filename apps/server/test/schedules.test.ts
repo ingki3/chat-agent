@@ -691,8 +691,9 @@ describe("start accuracy on the real clock", () => {
     const late = r!.started_at! - r!.scheduled_at;
     expect(late).toBeGreaterThanOrEqual(0);
     expect(late).toBeLessThanOrEqual(MIN);
-    // In practice: a few milliseconds (the timer wakes at the occurrence itself).
-    expect(late).toBeLessThan(1000);
+    // In practice: a few milliseconds (the timer wakes at the occurrence itself). A loaded CI runner can stall the
+    // event loop for about a second, so the practical bound is looser there; the ±1 minute requirement above holds.
+    expect(late).toBeLessThan(process.env.CI ? 10_000 : 1000);
   });
 });
 
