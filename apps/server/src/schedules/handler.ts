@@ -284,10 +284,14 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
       if (conversationId && !conversations.get(conversationId)) conversationId = undefined;
       if (!conversationId && row) conversationId = this.conversationFor(row);
       let messageId: string | null = null;
+      // Whether the result is still in the history (review #116): a reply regenerated or cut off by an edit before this
+      // (retried or recovered) save stays the run's reference, but is no "새 결과" — nothing could ever clear it.
+      let shown = true;
       if (conversationId) {
         if (outcome.status === "succeeded") {
           const reply = chat ? conversations.message(conversationId, chat.assistantMessageId) : undefined;
           messageId = reply?.id ?? null;
+          shown = !reply || reply.active;
         } else {
           const attempts = store.run(ctx.runId)?.attempts ?? ctx.attempt;
           const reason = failureReason(chat, outcome.code);
@@ -299,7 +303,7 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
             parts: [{ type: "text", text }],
           }).id;
         }
-        conversations.markNewResult(conversationId, messageId);
+        if (shown) conversations.markNewResult(conversationId, messageId);
       }
       store.recordResult({
         schedule_run_id: ctx.runId,

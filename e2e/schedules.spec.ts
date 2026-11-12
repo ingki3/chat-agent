@@ -587,3 +587,124 @@ test("결과 링크로 연 화면도 다음 결과를 받아 보이고 표시를
   await expect.poll(marked).toBe(false);
   expect(page.url()).toContain("#m-");
 });
+
+/** The newest schedule result's message id (from its notification link). */
+async function latestResultId(page: import("@playwright/test").Page) {
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as { items: { url: string }[] }
+  ).items;
+  return items[0]!.url.split("#m-")[1]!;
+}
+
+async function idleConversation(page: import("@playwright/test").Page, conversationId: string) {
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}/active-run`)).json()) as {
+            run: unknown;
+          }
+        ).run,
+      { timeout: 10_000, intervals: [20, 50, 100] },
+    )
+    .toBeNull();
+}
+
+test("결과 링크로 찾은 뒤 그 답을 다시 생성·앞 질문을 수정해도 다음 결과가 온다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedlinkregen");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 재생성 예약", prompt: "재생성", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const first = await latestResultId(page);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${first}`);
+  await expect(page.locator(`#m-${first}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // The linked answer is regenerated (another tab): it leaves the list.
+  const regen = await page.request.post(`/api/conversations/${conversationId}/messages/${first}/regenerate`, {
+    data: {},
+    headers: csrf(baseURL!),
+  });
+  expect(regen.status()).toBe(200);
+  await idleConversation(page, conversationId);
+  await runToEnd(page, baseURL!, s.id);
+  const second = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${second}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+  // An earlier question is edited (another tab): everything after it leaves, the next result still comes.
+  const firstUser = (
+    (await (await page.request.get(`/api/conversations/${conversationId}/messages`)).json()) as {
+      items: { id: string; role: string }[];
+    }
+  ).items.find((m) => m.role === "user")!;
+  const edited = await page.request.post(
+    `/api/conversations/${conversationId}/messages/${firstUser.id}/edit`,
+    { data: { text: "고친 질문" }, headers: csrf(baseURL!) },
+  );
+  expect(edited.status()).toBe(200);
+  await idleConversation(page, conversationId);
+  await runToEnd(page, baseURL!, s.id);
+  const third = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${third}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+});
+
+test("결과 링크로 찾은 뒤 그 메시지가 첫 페이지 밖으로 밀려도 다음 결과가 온다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkpush");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 밀림 예약", prompt: "밀림", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const first = await latestResultId(page);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${first}`);
+  await expect(page.locator(`#m-${first}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // 51 turns elsewhere (another tab): the linked message is past the first page of 100 now.
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `밀어내기 ${i}` },
+      headers: csrf(baseURL!),
+    });
+    expect(sent.status()).toBe(201);
+    await idleConversation(page, conversationId);
+  }
+  await runToEnd(page, baseURL!, s.id);
+  const next = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${next}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+  await expect(page.getByTestId("link-search-stopped")).toHaveCount(0);
+});

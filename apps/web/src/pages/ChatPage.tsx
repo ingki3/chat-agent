@@ -63,6 +63,7 @@ const SWITCHABLE = new Set([
 const COMPOSER_INPUT = "composer-input";
 /** A result link (`#m-<id>`) loads at most this many older pages looking for its message (review #116). */
 const SEARCH_PAGES = 20;
+const linkKeyOf = (id: string, hash: string) => `${id}${hash}`;
 /** What the chip may offer (#19): allowed runtimes with a passed connection. */
 const USABLE_KEY = ["runtimes", "usable"] as const;
 const useUsableRuntimes = () => useQuery({ queryKey: USABLE_KEY, queryFn: settingsApi.usableRuntimes });
@@ -235,11 +236,17 @@ export function ChatPage() {
   const scrolledTo = useRef<string | null>(null);
   const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
   const [searchStopped, setSearchStopped] = useState<string | null>(null);
-  const linkKey = `${id}${hash}`;
+  // The link whose message was found once (review #116) — kept apart from whether it is in the list now (a regenerate,
+  // an edit or later pages may take it out): a found link never searches again nor holds back later results.
+  const [foundLink, setFoundLink] = useState<string | null>(null);
+  if (found && foundLink !== linkKeyOf(id, hash)) setFoundLink(linkKeyOf(id, hash));
+  const linkKey = linkKeyOf(id, hash);
+  const foundOnce = foundLink === linkKey;
   useEffect(() => {
     if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };
     if (!target || !list || scrolledTo.current === linkKey) return;
     if (!found) {
+      if (foundOnce) return;
       if (isFetchingNextPage || searchStopped === linkKey) return;
       // Not there at all (deleted, another version), a failed page, or the cap: stop and say so.
       if (!hasNextPage || isFetchNextPageError || search.current.pages >= SEARCH_PAGES)
@@ -262,6 +269,7 @@ export function ChatPage() {
     fetchNextPage,
     linkKey,
     searchStopped,
+    foundOnce,
   ]);
   const retrySearch = () => {
     search.current = { key: linkKey, pages: 1 };
@@ -274,11 +282,11 @@ export function ChatPage() {
   const resultId = newResult ? (conv.data?.newResultMessageId ?? null) : null;
   const settled = messages.isSuccess && !messages.isFetching && !!list;
   const resultLoaded = settled && (resultId === null || !!list?.some((m) => m.id === resultId));
-  const linkOk = !target || found;
+  const linkOk = !target || found || foundOnce;
   // The link's own search (searching / found / stopped; the hash stays after it is found): only while it is
   // searching, or stopped on this very result, does it stand in for the refresh below — a found link, or a newer
   // result, is refreshed like any view (review #116).
-  const linkSearching = !!target && !found && searchStopped !== linkKey;
+  const linkSearching = !!target && !found && !foundOnce && searchStopped !== linkKey;
   const linkHolds = linkSearching || (searchStopped === linkKey && resultId === target);
   const reread = useRef(0);
   useEffect(() => {

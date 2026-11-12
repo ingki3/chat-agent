@@ -789,3 +789,80 @@ describe("a result that leaves the history takes its '새 결과' along (review 
     expect(r4).not.toBe(before.id);
   });
 });
+
+describe("a result saved after it left the history is no '새 결과' (review #116)", () => {
+  it("save failed → the owner regenerates → the engine's retry saves: referenced, not marked", async () => {
+    let failed = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = await world({
+      script: () => reply("원래 답"),
+      wrap: (h) => ({
+        ...bind(h),
+        saveResult: async (c, o) => {
+          if (!failed) {
+            failed = true;
+            throw new Error("injected");
+          }
+          await gate;
+          return h.saveResult(c, o);
+        },
+      }),
+    });
+    const { s, run } = await runNow(t);
+    await until(() => failed);
+    const convId = t.app.schedules!.store.byId(s.id)!.conversation_id!;
+    const answer = t.runRow(run.id).output_ref
+      ? t.app.runs!.get(t.runRow(run.id).output_ref!)!.assistantMessageId
+      : "";
+    const regen = await t.req(
+      "owner",
+      "POST",
+      `/api/conversations/${convId}/messages/${answer}/regenerate`,
+      {},
+    );
+    expect(regen.statusCode).toBe(200);
+    await until(() => !t.app.runs!.active(convId));
+    release();
+    await until(() => t.finished(run.id) && t.runRow(run.id).notified_at !== null);
+    expect(t.runRow(run.id).result_ref).toBe(answer);
+    expect(t.app.conversations!.message(convId, answer)!.active).toBe(false);
+    expect(
+      Conversation.parse((await t.req("owner", "GET", `/api/conversations/${convId}`)).json()),
+    ).toMatchObject({
+      newResult: false,
+      newResultMessageId: null,
+    });
+    // The next run is marked as usual.
+    const next = ScheduleRun.parse((await t.req("owner", "POST", `/api/schedules/${s.id}/run`)).json().run);
+    await until(() => t.finished(next.id));
+    expect(
+      Conversation.parse((await t.req("owner", "GET", `/api/conversations/${convId}`)).json()),
+    ).toMatchObject({
+      newResult: true,
+      newResultMessageId: t.runRow(next.id).result_ref,
+    });
+  });
+
+  it("the server dies before saving → an earlier question is edited → the restart saves: not marked, nothing else touched", async () => {
+    const db = createTestDb();
+    let reached = false;
+    const a = await world({
+      db,
+      script: () => reply("원래 답"),
+      wrap: (h) => ({ ...bind(h), saveResult: () => ((reached = true), never()) }),
+    });
+    const { s, run } = await runNow(a);
+    await until(() => reached);
+    await a.app.close();
+    closers.splice(closers.indexOf(closers.at(-1)!), 1);
+    const convId = a.app.schedules!.store.byId(s.id)!.conversation_id!;
+    const user = a.messagesOf(convId).find((m) => m.role === "user")!;
+    const answer = a.app.runs!.get(a.runRow(run.id).output_ref!)!.assistantMessageId;
+    expect(a.app.conversations!.edit(convId, user.id, "고친 질문")).toBeDefined();
+    const b = await world({ db, script: () => reply("x"), family: false });
+    await until(() => b.finished(run.id) && b.runRow(run.id).notified_at !== null);
+    expect(b.runRow(run.id).result_ref).toBe(answer);
+    expect(b.app.conversations!.get(convId)).toMatchObject({ newResultAt: null, newResultMessageId: null });
+  });
+});
