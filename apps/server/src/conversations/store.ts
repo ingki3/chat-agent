@@ -574,6 +574,19 @@ export class ConversationStore {
    */
   private truncateFrom(conv: ConversationRow, target: MessageRow): number {
     const revision = conv.revision + 1;
+    // A schedule's result that leaves the history now (regenerated, or an earlier message edited — the owner is at
+    // it, so it has been seen): its "새 결과" goes with it. Only that result's: a newer one stays (review #116).
+    this.db
+      .update(conversations)
+      .set({ newResultAt: null, newResultMessageId: null })
+      .where(
+        and(
+          eq(conversations.id, conv.id),
+          sql`${conversations.newResultMessageId} in (select ${messages.id} from ${messages}
+            where ${messages.conversationId} = ${conv.id} and ${messages.active} = 1 and ${messages.seq} >= ${target.seq})`,
+        ),
+      )
+      .run();
     this.db
       .update(messages)
       .set({ active: false, archivedAtRevision: revision })

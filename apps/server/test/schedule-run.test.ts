@@ -722,3 +722,70 @@ describe("the schedule's own settings, never more (review #116)", () => {
     ).not.toBe("skill_not_allowed");
   });
 });
+
+describe("a result that leaves the history takes its '새 결과' along (review #116)", () => {
+  it("regenerated, or an earlier message edited: the marker is clean; a stale seen and a newer result are safe", async () => {
+    const t = await world({ script: () => reply("결과") });
+    const made = Schedule.parse((await t.req("owner", "POST", "/api/schedules", create)).json());
+    const runOnce = async () => {
+      const r = ScheduleRun.parse((await t.req("owner", "POST", `/api/schedules/${made.id}/run`)).json().run);
+      await until(() => t.finished(r.id) && t.runRow(r.id).notified_at !== null);
+      return t.runRow(r.id).result_ref!;
+    };
+    const conv = async () =>
+      Conversation.parse(
+        (
+          await t.req(
+            "owner",
+            "GET",
+            `/api/conversations/${t.app.schedules!.store.byId(made.id)!.conversation_id}`,
+          )
+        ).json(),
+      );
+    const chatEnd = async () => {
+      const c = await conv();
+      await until(() => !t.app.runs!.active(c.id));
+    };
+    // The view never managed to show it (seen not called); the owner regenerates the result.
+    const r1 = await runOnce();
+    const c = await conv();
+    expect(c).toMatchObject({ newResult: true, newResultMessageId: r1 });
+    const regen = await t.req("owner", "POST", `/api/conversations/${c.id}/messages/${r1}/regenerate`, {});
+    expect(regen.statusCode).toBe(200);
+    await chatEnd();
+    expect(await conv()).toMatchObject({ newResult: false, newResultMessageId: null });
+    // Again, and this time an earlier message is edited (the result is cut off with it).
+    const r2 = await runOnce();
+    expect((await conv()).newResultMessageId).toBe(r2);
+    const firstUser = t.messagesOf(c.id).find((m) => m.role === "user")!;
+    const edit = await t.req("owner", "POST", `/api/conversations/${c.id}/messages/${firstUser.id}/edit`, {
+      text: "고쳐서",
+    });
+    expect(edit.statusCode).toBe(200);
+    await chatEnd();
+    expect((await conv()).newResult).toBe(false);
+    // Another tab: a seen request for a result an edit already cut off changes nothing (and breaks nothing).
+    const r3 = await runOnce();
+    const user3 = t
+      .messagesOf(c.id)
+      .filter((m) => m.role === "user")
+      .at(-1)!;
+    await t.req("owner", "POST", `/api/conversations/${c.id}/messages/${user3.id}/edit`, { text: "다른 탭" });
+    await chatEnd();
+    const late = await t.req("owner", "POST", `/api/conversations/${c.id}/result-seen`, { messageId: r3 });
+    expect(Conversation.parse(late.json()).newResult).toBe(false);
+    // Only the result that leaves: a marker on a message before the cut stays.
+    const r4 = await runOnce();
+    const before = t.messagesOf(c.id).find((m) => m.role === "assistant")!;
+    t.app.conversations!.markNewResult(c.id, before.id);
+    const tail = t
+      .messagesOf(c.id)
+      .filter((m) => m.role === "user")
+      .at(-1)!;
+    expect(tail.id).not.toBe(before.id);
+    await t.req("owner", "POST", `/api/conversations/${c.id}/messages/${tail.id}/edit`, { text: "끝만" });
+    await chatEnd();
+    expect(await conv()).toMatchObject({ newResult: true, newResultMessageId: before.id });
+    expect(r4).not.toBe(before.id);
+  });
+});

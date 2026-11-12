@@ -550,3 +550,40 @@ test("보내기: 늦게 온 이전 active-run 응답(null)이 방금 시작한 �
   // One stream, never closed and reopened on the way.
   expect(streams).toHaveLength(1);
 });
+
+test("결과 링크로 연 화면도 다음 결과를 받아 보이고 표시를 지운다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedlinknext");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 다음 예약", prompt: "다음 결과", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as { items: { url: string }[] }
+  ).items;
+  const url = items[0]!.url;
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(url);
+  await expect(page.locator(`#${url.split("#")[1]}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // The link's hash stays in the address; the next result still comes into this view.
+  await runToEnd(page, baseURL!, s.id);
+  expect(await marked()).toBe(true);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(marked).toBe(false);
+  expect(page.url()).toContain("#m-");
+});

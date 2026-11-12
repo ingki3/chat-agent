@@ -275,15 +275,20 @@ export function ChatPage() {
   const settled = messages.isSuccess && !messages.isFetching && !!list;
   const resultLoaded = settled && (resultId === null || !!list?.some((m) => m.id === resultId));
   const linkOk = !target || found;
+  // The link's own search (searching / found / stopped; the hash stays after it is found): only while it is
+  // searching, or stopped on this very result, does it stand in for the refresh below — a found link, or a newer
+  // result, is refreshed like any view (review #116).
+  const linkSearching = !!target && !found && searchStopped !== linkKey;
+  const linkHolds = linkSearching || (searchStopped === linkKey && resultId === target);
   const reread = useRef(0);
   useEffect(() => {
     // Not while a result link looks for its message itself (it loads the pages, and stops on a failure).
-    if (!newResult || resultLoaded || target || messages.isFetching) return;
+    if (!newResult || resultLoaded || linkHolds || messages.isFetching) return;
     if (reread.current === conv.dataUpdatedAt) return;
     reread.current = conv.dataUpdatedAt;
     void qc.invalidateQueries({ queryKey: ["messages", id] });
     void qc.invalidateQueries({ queryKey: ["active-run", id] });
-  }, [newResult, resultLoaded, target, messages.isFetching, conv.dataUpdatedAt, id, qc]);
+  }, [newResult, resultLoaded, linkHolds, messages.isFetching, conv.dataUpdatedAt, id, qc]);
   useEffect(() => {
     if (!newResult || !resultLoaded || !linkOk) return;
     void conversations
