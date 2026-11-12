@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { ChatSettings, RuntimeOption } from "@agentlee/shared";
-import { applyChange, canChooseShared, chipLabel, differs } from "../src/chat/chip.js";
+import {
+  applyChange,
+  canChooseShared,
+  chipLabel,
+  differs,
+  runtimeLimit,
+  noticeText,
+  takeFallbackNotice,
+  withoutNotice,
+} from "../src/chat/chip.js";
 
 const conn = (scope: "personal" | "shared") => ({
   id: scope,
@@ -14,6 +23,7 @@ const conn = (scope: "personal" | "shared") => ({
   status: "passed" as const,
   lastTestAt: null,
   lastTestCode: null,
+  limitedUntil: null as number | null,
   registeredByAdmin: false,
   createdAt: 0,
 });
@@ -86,5 +96,58 @@ describe("applyChange mirrors the server's rules on the new-conversation screen"
     expect(applyChange(opus, { effort: "low" }, options, defaults)).toMatchObject({ effort: "low" });
     expect(applyChange(opus, { effort: "max" }, options, defaults)).toBeNull();
     expect(applyChange(opus, { model: "nope" }, options, defaults)).toBeNull();
+  });
+});
+
+describe("the fallback notice on the page (review #101)", () => {
+  it("shows only what the server handed out; a failed consume shows nothing", async () => {
+    const n = { runtime: "codex", model: "gpt-6-luna" };
+    expect(await takeFallbackNotice(async () => n)).toBe(n);
+    expect(await takeFallbackNotice(async () => null)).toBeNull();
+    expect(await takeFallbackNotice(() => Promise.reject(new Error("offline")))).toBeNull();
+    expect(noticeText(n, options)).toBe("기본값을 쓸 수 없어 Codex · GPT-6 Luna로 시작했어요");
+  });
+  it("clears only the notice field of the cached conversation (a newer chip change stays)", () => {
+    const newer = {
+      id: "c",
+      settings: { ...opus, model: "claude-haiku-5-5" },
+      fallbackNotice: { runtime: "codex" },
+    };
+    expect(withoutNotice(newer)).toEqual({ ...newer, fallbackNotice: null });
+  });
+});
+
+describe("usage limits in the chip (review #101)", () => {
+  const now = 1_000_000;
+  const opt = (personal: number | null | undefined, shared: number | null | undefined) =>
+    ({
+      ...options[0]!,
+      connections: [
+        ...(personal === undefined ? [] : [{ ...conn("personal"), limitedUntil: personal }]),
+        ...(shared === undefined ? [] : [{ ...conn("shared"), limitedUntil: shared }]),
+      ],
+    }) as RuntimeOption;
+  it("blocks a runtime whose connections are all at their limit; an expired limit does not count", () => {
+    expect(runtimeLimit(opt(now + 10, undefined), now)).toEqual({
+      blocked: true,
+      viaShared: false,
+      until: now + 10,
+    });
+    expect(runtimeLimit(opt(now + 10, now + 20), now)).toMatchObject({ blocked: true, until: now + 10 });
+    expect(runtimeLimit(opt(now - 1, undefined), now)).toEqual({
+      blocked: false,
+      viaShared: false,
+      until: null,
+    });
+    expect(runtimeLimit(opt(null, undefined), now).blocked).toBe(false);
+  });
+  it("only the personal one limited: switch via 공용으로 쓰기 instead", () => {
+    expect(runtimeLimit(opt(now + 10, null), now)).toEqual({
+      blocked: false,
+      viaShared: true,
+      until: now + 10,
+    });
+    // Shared limited but personal free: the run takes the personal one anyway.
+    expect(runtimeLimit(opt(null, now + 10), now)).toMatchObject({ blocked: false, viaShared: false });
   });
 });

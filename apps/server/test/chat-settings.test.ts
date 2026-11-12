@@ -12,6 +12,7 @@ import {
   type RuntimeId,
 } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
+import { LIMIT_COOLDOWN_MS, limitUntil } from "../src/connections/service.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { CLAUDE_MODELS } from "../src/runtime/claude.js";
@@ -134,6 +135,7 @@ async function start(o: { script?: FakeScript } = {}) {
     newConversation,
     getConversation,
     send,
+    settle,
     messages,
     setDefaults,
     claude,
@@ -312,17 +314,30 @@ describe("FR-12.6 fallback order when the default cannot be used", () => {
 });
 
 describe("the fallback notice is shown once", () => {
-  it("is on the conversation until the page dismisses it, then never again; a new start brings its own", async () => {
+  const consume = (t: T, id: string, who: "owner" | "stranger" = "owner") =>
+    t.app.inject({
+      method: "POST",
+      url: `/api/conversations/${id}/fallback-notice/consume`,
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f.cookies[who],
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+      payload: {},
+    });
+
+  it("is handed out once by consume — never again; a new start brings its own", async () => {
     const t = await start();
     t.connect("codex", null);
     const c = await t.newConversation();
     expect(c.fallbackNotice).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
-    // Sending does not consume it (the page shows it next to the chip, then dismisses it).
+    // Sending or reading does not consume it.
     await t.send(c.id);
     expect((await t.getConversation(c.id)).fallbackNotice).not.toBeNull();
-    const r = await t.owner.patch(`/api/conversations/${c.id}`, { dismissFallbackNotice: true });
-    expect(r.statusCode).toBe(200);
-    expect(Conversation.parse(r.json()).fallbackNotice).toBeNull();
+    const r = await consume(t, c.id);
+    expect([r.statusCode, r.json()]).toEqual([200, { notice: { runtime: "codex", model: "gpt-6.1-sol" } }]);
+    expect((await consume(t, c.id)).json()).toEqual({ notice: null });
     expect((await t.getConversation(c.id)).fallbackNotice).toBeNull();
     await t.send(c.id, "또");
     expect((await t.getConversation(c.id)).fallbackNotice).toBeNull();
@@ -330,10 +345,38 @@ describe("the fallback notice is shown once", () => {
     const other = await t.newConversation();
     expect(other.fallbackNotice).not.toBeNull();
     await t.owner.put(`/api/conversations/${other.id}/settings`, { model: "gpt-6-astra" });
-    expect((await t.getConversation(other.id)).fallbackNotice).toBeNull();
+    expect((await consume(t, other.id)).json()).toEqual({ notice: null });
     // Without a fallback there is no notice.
     t.connect("claude-code", null);
     expect((await t.newConversation()).fallbackNotice).toBeNull();
+  });
+
+  it("two tabs consuming at once: exactly one gets it", async () => {
+    const t = await start();
+    t.connect("codex", null);
+    for (let round = 0; round < 5; round++) {
+      const c = await t.newConversation();
+      const all = await Promise.all([consume(t, c.id), consume(t, c.id), consume(t, c.id)]);
+      const got = all.map((r) => r.json<{ notice: unknown }>().notice).filter((n) => n !== null);
+      expect(got).toHaveLength(1);
+    }
+  });
+
+  it("a consume that fails takes nothing: the notice is still there for the next page", async () => {
+    const t = await start();
+    t.connect("codex", null);
+    const c = await t.newConversation();
+    // Refused (someone else's conversation, a bad CSRF header) → nothing consumed.
+    expect((await consume(t, c.id, "stranger")).statusCode).toBe(403);
+    const noCsrf = await t.app.inject({
+      method: "POST",
+      url: `/api/conversations/${c.id}/fallback-notice/consume`,
+      headers: { host: "localhost:3000", cookie: t.f.cookies.owner },
+      payload: {},
+    });
+    expect(noCsrf.statusCode).toBe(403);
+    expect((await t.getConversation(c.id)).fallbackNotice).not.toBeNull();
+    expect((await consume(t, c.id)).json<{ notice: unknown }>().notice).not.toBeNull();
   });
 
   it("a conversation without settings resolves them on its first message (notice included)", async () => {
@@ -463,19 +506,44 @@ describe("the chip changes a conversation from its next message on (FR-3.5, FR-1
     const r = await t.owner.post(`/api/conversations/${c.id}/messages`, { text: "x", effort: "high" });
     expect([r.statusCode, r.json()]).toEqual([403, { error: "effort_not_allowed" }]);
     expect((await t.owner.put(`/api/conversations/${c.id}/settings`, {})).statusCode).toBe(400);
-    // A conversation of someone else's: the resource check (403) before anything else.
-    const strangers = await t.app.inject({
-      method: "PUT",
-      url: `/api/conversations/${c.id}/settings`,
+  });
+
+  it("someone else's conversation: 403 forbidden even with a choice that would be valid for them, nothing changed", async () => {
+    const t = await start();
+    // Shared connections: the stranger may use Codex · GPT-6 Luna in his own conversations.
+    t.connect("claude-code", null);
+    t.connect("codex", null);
+    const c = await t.newConversation();
+    const as = (who: "stranger" | "shared" | "admin") =>
+      t.app.inject({
+        method: "PUT",
+        url: `/api/conversations/${c.id}/settings`,
+        headers: {
+          host: "localhost:3000",
+          cookie: t.f.cookies[who],
+          origin: "http://localhost:3000",
+          [CSRF_HEADER]: "1",
+        },
+        payload: { runtime: "codex", model: "gpt-6-luna" },
+      });
+    // Valid for him: his own conversation takes exactly this change.
+    const own = await t.app.inject({
+      method: "POST",
+      url: "/api/conversations",
       headers: {
         host: "localhost:3000",
         cookie: t.f.cookies.stranger,
         origin: "http://localhost:3000",
         [CSRF_HEADER]: "1",
       },
-      payload: { model: "claude-haiku-5-5" },
+      payload: { settings: { runtime: "codex", model: "gpt-6-luna" } },
     });
-    expect(strangers.statusCode).toBe(403);
+    expect(own.statusCode).toBe(201);
+    for (const who of ["stranger", "shared", "admin"] as const) {
+      const r = await as(who);
+      expect([who, r.statusCode, r.json()]).toEqual([who, 403, { error: "forbidden" }]);
+    }
+    expect((await t.getConversation(c.id)).settings).toEqual(c.settings);
   });
 
   it("a reply being written keeps its settings; the next one uses the new ones, after a divider", async () => {
@@ -524,6 +592,81 @@ describe("the chip changes a conversation from its next message on (FR-3.5, FR-1
     const dividers = (await t.messages(c.id)).filter((m) => m.role === "system");
     expect(dividers).toHaveLength(2);
     expect(dividers[1]!.parts[0]).toMatchObject({ label: "여기부터 Codex · GPT-6 Luna · 추론 low" });
+  });
+
+  it("regenerating a reply after a switch keeps one divider (review #101: it became two)", async () => {
+    const t = await start();
+    t.connect("claude-code", null);
+    t.connect("codex", null);
+    const c = await t.newConversation();
+    await t.send(c.id, "첫");
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "codex" });
+    await t.send(c.id, "둘째");
+    const shape = async () => (await t.messages(c.id)).map((m) => `${m.role}:${m.runtime ?? "-"}`);
+    expect(await shape()).toEqual([
+      "user:-",
+      "assistant:claude-code",
+      "system:-",
+      "user:-",
+      "assistant:codex",
+    ]);
+    for (let i = 0; i < 2; i++) {
+      const last = (await t.messages(c.id)).at(-1)!;
+      const r = await t.owner.post(`/api/conversations/${c.id}/messages/${last.id}/regenerate`, {});
+      expect(r.statusCode).toBe(200);
+      await t.settle(StartRunResponse.parse(r.json()).run.id);
+      expect(await shape()).toEqual([
+        "user:-",
+        "assistant:claude-code",
+        "system:-",
+        "user:-",
+        "assistant:codex",
+      ]);
+    }
+    // Switched back to Claude: regenerating drops the Codex divider (Claude answered right before).
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "claude-code" });
+    const last = (await t.messages(c.id)).at(-1)!;
+    const r = await t.owner.post(`/api/conversations/${c.id}/messages/${last.id}/regenerate`, {});
+    await t.settle(StartRunResponse.parse(r.json()).run.id);
+    expect(await shape()).toEqual(["user:-", "assistant:claude-code", "user:-", "assistant:claude-code"]);
+  });
+
+  it("editing the switching message after switching back drops the stale divider (review #101)", async () => {
+    const t = await start();
+    t.connect("claude-code", null);
+    t.connect("codex", null);
+    const c = await t.newConversation();
+    await t.send(c.id, "첫");
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "codex" });
+    await t.send(c.id, "둘째");
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "claude-code" });
+    const second = (await t.messages(c.id)).filter((m) => m.role === "user").at(-1)!;
+    const r = await t.owner.post(`/api/conversations/${c.id}/messages/${second.id}/edit`, {
+      text: "고친 둘째",
+    });
+    expect(r.statusCode).toBe(200);
+    await t.settle(StartRunResponse.parse(r.json()).run.id);
+    const ms = await t.messages(c.id);
+    expect(ms.map((m) => `${m.role}:${m.runtime ?? "-"}`)).toEqual([
+      "user:-",
+      "assistant:claude-code",
+      "user:-",
+      "assistant:claude-code",
+    ]);
+    // Editing it again on Codex: exactly one Codex divider, before the edited message.
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "codex" });
+    const edited = (await t.messages(c.id)).filter((m) => m.role === "user").at(-1)!;
+    const r2 = await t.owner.post(`/api/conversations/${c.id}/messages/${edited.id}/edit`, {
+      text: "다시 고침",
+    });
+    await t.settle(StartRunResponse.parse(r2.json()).run.id);
+    expect((await t.messages(c.id)).map((m) => `${m.role}:${m.runtime ?? "-"}`)).toEqual([
+      "user:-",
+      "assistant:claude-code",
+      "system:-",
+      "user:-",
+      "assistant:codex",
+    ]);
   });
 
   it("a change undone before sending leaves no divider; regenerating after a change answers with the new one", async () => {
@@ -601,5 +744,80 @@ describe("changing the defaults never changes an existing conversation (FR-12.5)
     // Clearing the own defaults later does not touch them either.
     await t.setDefaults(null);
     expect((await t.getConversation(old.id)).settings).toEqual(old.settings);
+  });
+});
+
+describe("a usage limit is an FR-12.6 fallback condition (review #101)", () => {
+  it("Claude at its limit: new conversations start on Codex with the notice; back after the reset or a finished reply", async () => {
+    const t = await start();
+    const claudeCon = t.connect("claude-code", null);
+    t.connect("codex", null);
+    const store = t.app.connections!.store;
+    const c = await t.newConversation();
+    expect(c.settings).toMatchObject({ runtime: "claude-code" });
+    const before = Date.now();
+    expect((await t.send(c.id, "/limit")).errorCode).toBe("usage_limit");
+    // No reset time from the fake runtime: the documented cooldown.
+    const until = store.get(claudeCon.id)!.limitedUntil!;
+    expect(until).toBeGreaterThanOrEqual(before + LIMIT_COOLDOWN_MS);
+    expect(until).toBeLessThanOrEqual(Date.now() + LIMIT_COOLDOWN_MS);
+    expect(store.get(claudeCon.id)!.status).toBe("passed");
+
+    const n = await t.newConversation();
+    expect(n.settings).toMatchObject({ runtime: "codex", model: "gpt-6.1-sol" });
+    expect(n.fallbackNotice).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
+    const d = DefaultsResponse.parse((await t.owner.get("/api/settings/defaults")).json());
+    expect(d).toMatchObject({ fallback: true, start: { runtime: "codex" } });
+    // The chip shows it limited and refuses moving onto it; the limited conversation itself may still be tuned.
+    const usable = RuntimeOption.array().parse(
+      (await t.owner.get("/api/runtimes/usable")).json<{ items: unknown }>().items,
+    );
+    expect(usable.find((o) => o.runtime === "claude-code")!.connections[0]!.limitedUntil).toBe(until);
+    const move = await t.owner.put(`/api/conversations/${n.id}/settings`, { runtime: "claude-code" });
+    expect([move.statusCode, move.json()]).toEqual([403, { error: "connection_limited" }]);
+    expect((await t.owner.put(`/api/conversations/${c.id}/settings`, { effort: "low" })).statusCode).toBe(
+      200,
+    );
+
+    // The reset time passes: Claude again, no notice.
+    store.markLimited(claudeCon.id, Date.now() - 1);
+    expect(await t.newConversation()).toMatchObject({
+      settings: { runtime: "claude-code" },
+      fallbackNotice: null,
+    });
+
+    // Limited again; a reply that then finishes on it (the user tried it again by hand) ends the limit.
+    await t.send(c.id, "/limit");
+    expect((await t.newConversation()).settings).toMatchObject({ runtime: "codex" });
+    expect(await t.send(c.id, "다시")).toMatchObject({ status: "done", connectionId: claudeCon.id });
+    expect(store.get(claudeCon.id)!.limitedUntil).toBeNull();
+    expect((await t.newConversation()).settings).toMatchObject({ runtime: "claude-code" });
+
+    // A passed connection test ends it too.
+    await t.send(c.id, "/limit");
+    store.setTestResult(claudeCon.id, "passed", "ok", 1);
+    expect((await t.newConversation()).settings).toMatchObject({ runtime: "claude-code" });
+  });
+
+  it("a reset time the runtime reports is what the connection is limited until", async () => {
+    const resetsAt = Date.now() + 42 * 60_000;
+    const t = await start({
+      script: (input) => (input.text === "한도" ? [{ limit: "한도", resetsAt }] : [{ text: "ok" }]),
+    });
+    const claudeCon = t.connect("claude-code", null);
+    const c = await t.newConversation();
+    expect((await t.send(c.id, "한도")).errorCode).toBe("usage_limit");
+    expect(t.app.connections!.store.get(claudeCon.id)!.limitedUntil).toBe(resetsAt);
+    // Nothing else usable: new conversations have no start (the "no runtime" screen) until it resets.
+    expect((await t.newConversation()).settings).toBeNull();
+  });
+
+  it("the provider's reset time is used, within a minute and a week from now", () => {
+    const now = 1_000_000_000_000;
+    expect(limitUntil(undefined, now)).toBe(now + LIMIT_COOLDOWN_MS);
+    expect(limitUntil(now + 30 * 60_000, now)).toBe(now + 30 * 60_000);
+    expect(limitUntil(now - 5, now)).toBe(now + 60_000);
+    expect(limitUntil(now + 30 * 24 * 60 * 60_000, now)).toBe(now + 7 * 24 * 60 * 60_000);
+    expect(limitUntil(Number.NaN, now)).toBe(now + LIMIT_COOLDOWN_MS);
   });
 });

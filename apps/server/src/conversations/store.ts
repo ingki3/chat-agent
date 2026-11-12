@@ -167,45 +167,101 @@ export class ConversationStore {
       .run();
   }
 
-  /** The fallback notice has been shown: never again for this conversation. */
-  dismissFallbackNotice(id: string): void {
-    this.db.update(conversations).set({ fallbackNotice: null }).where(eq(conversations.id, id)).run();
+  /**
+   * Takes the fallback notice (#19): one statement clears it and returns what it was, so of any number of callers —
+   * tabs, reloads, concurrent requests — exactly one gets it. Null for everyone else.
+   */
+  consumeFallbackNotice(id: string): { runtime: RuntimeId; model: string } | null {
+    // RETURNING gives the new value (null), so: read and clear in one immediate transaction; the clear only counts
+    // when it still found the notice (changes = 1).
+    const n = this.db.$client
+      .transaction(() => {
+        const row = this.db.$client
+          .prepare(
+            "select fallback_notice as n from conversations where id = ? and fallback_notice is not null",
+          )
+          .get(id) as { n: string } | undefined;
+        if (!row) return undefined;
+        const r = this.db.$client
+          .prepare(
+            "update conversations set fallback_notice = null where id = ? and fallback_notice is not null",
+          )
+          .run(id);
+        return r.changes === 1 ? row.n : undefined;
+      })
+      .immediate();
+    if (!n) return null;
+    try {
+      const v = JSON.parse(n) as { runtime?: unknown; model?: unknown };
+      return (v.runtime === "claude-code" || v.runtime === "codex") && typeof v.model === "string"
+        ? { runtime: v.runtime, model: v.model }
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
-   * `── 여기부터 Codex · ○○ ──` (FR-3.5, #19): appended when the reply about to be written is answered with another
-   * runtime, model or effort than the last reply before it. Written when the change takes effect — the next
-   * message — so a change undone before sending leaves no divider, and edits / regenerations that cut the history
-   * get one exactly where the answering side changes. The first reply of a conversation gets none.
+   * `── 여기부터 Codex · ○○ ──` (FR-3.5, #19): makes the history right before the reply about to be written say who
+   * answers it. Written when the change takes effect — the next message — so a change undone before sending leaves no
+   * divider, and the first reply of a conversation gets none.
+   *
+   * The dividers after the last active reply belong to the turn being written: after an edit or a regeneration cut
+   * the history they may be left over from the replaced turn (review #101 P2). Exactly one survives when it already
+   * names who answers now; the others leave the history (kept, like every cut message, with the revision); a new one
+   * is appended only when none fits.
    */
-  appendSwitchDivider(conversationId: string, next: AnsweredWith): MessageRow | undefined {
-    const prev = this.db
+  syncSwitchDivider(conversationId: string, next: AnsweredWith): MessageRow | undefined {
+    const active = this.db
       .select()
       .from(messages)
-      .where(
-        and(
-          eq(messages.conversationId, conversationId),
-          eq(messages.active, true),
-          eq(messages.role, "assistant"),
-          sql`${messages.runtime} is not null`,
-          sql`${messages.model} is not null`,
-        ),
-      )
-      .orderBy(desc(messages.seq))
-      .limit(1)
-      .get();
-    if (!prev) return undefined;
-    const sameModel = prev.runtime === next.runtime && prev.model === next.model;
-    if (sameModel && (prev.effort ?? null) === next.effort) return undefined;
-    // Only the effort changed: say so, or the divider would name what answered before too.
-    const label = sameModel && next.effort ? `${next.label} · 추론 ${next.effort}` : next.label;
+      .where(and(eq(messages.conversationId, conversationId), eq(messages.active, true)))
+      .orderBy(asc(messages.seq))
+      .all();
+    const prev = active.findLast((m) => m.role === "assistant" && m.runtime !== null && m.model !== null);
+    const pending = active.filter(
+      (m) =>
+        m.role === "system" &&
+        (!prev || m.seq > prev.seq) &&
+        (m.parts as MessagePart[]).some((p) => p.type === "divider" && p.kind === "runtime_switch"),
+    );
+    let label: string | null = null;
+    if (prev) {
+      const sameModel = prev.runtime === next.runtime && prev.model === next.model;
+      if (!sameModel || (prev.effort ?? null) !== next.effort)
+        // Only the effort changed: say so, or the divider would name what answered before too.
+        label = `여기부터 ${sameModel && next.effort ? `${next.label} · 추론 ${next.effort}` : next.label}`;
+    }
+    const keep =
+      label === null
+        ? undefined
+        : pending.find((m) => {
+            const d = (m.parts as MessagePart[])[0];
+            return (
+              d?.type === "divider" &&
+              d.label === label &&
+              d.runtime === next.runtime &&
+              d.model === next.model
+            );
+          });
+    const stale = pending.filter((m) => m !== keep);
+    if (stale.length) {
+      const revision = this.get(conversationId)!.revision;
+      for (const m of stale)
+        this.db
+          .update(messages)
+          .set({ active: false, archivedAtRevision: revision })
+          .where(eq(messages.id, m.id))
+          .run();
+    }
+    if (label === null || keep) return keep;
     return this.append(conversationId, {
       role: "system",
       parts: [
         {
           type: "divider",
           kind: "runtime_switch",
-          label: `여기부터 ${label}`,
+          label,
           runtime: next.runtime as RuntimeId,
           model: next.model,
         },

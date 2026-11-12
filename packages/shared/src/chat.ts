@@ -155,7 +155,7 @@ export const Conversation = z.object({
   settings: ChatSettings.nullable(),
   /**
    * Set when the conversation started on the FR-12.6 fallback because the default could not be used: the chip shows
-   * "기본값을 쓸 수 없어 ○○로 시작했어요" once, then the page dismisses it (`dismissFallbackNotice`).
+   * "기본값을 쓸 수 없어 ○○로 시작했어요" once: only the page whose `POST …/fallback-notice/consume` takes it shows it.
    */
   fallbackNotice: z.object({ runtime: RuntimeId, model: z.string() }).nullable(),
   createdAt: z.number(),
@@ -180,17 +180,18 @@ export const UpdateConversationRequest = z
     title: z.string().trim().min(1).max(200).optional(),
     pinned: z.boolean().optional(),
     researchMode: z.boolean().optional(),
-    /** The fallback notice has been shown (#19): it is not shown again. */
-    dismissFallbackNotice: z.literal(true).optional(),
   })
-  .refine(
-    (v) =>
-      v.title !== undefined ||
-      v.pinned !== undefined ||
-      v.researchMode !== undefined ||
-      v.dismissFallbackNotice !== undefined,
-    { message: "nothing to update" },
-  );
+  .refine((v) => v.title !== undefined || v.pinned !== undefined || v.researchMode !== undefined, {
+    message: "nothing to update",
+  });
+/**
+ * `POST /api/conversations/:id/fallback-notice/consume` (#19): takes the fallback notice atomically — the first caller
+ * gets it, every later (or concurrent) one gets null — so it is shown once across tabs and reloads.
+ */
+export const ConsumeFallbackNoticeResponse = z.object({
+  notice: z.object({ runtime: RuntimeId, model: z.string() }).nullable(),
+});
+export type ConsumeFallbackNoticeResponse = z.infer<typeof ConsumeFallbackNoticeResponse>;
 export const ListMessagesQuery = z.object({
   /** Return messages with seq below this (older page). */
   before: z.coerce.number().int().positive().optional(),

@@ -51,7 +51,7 @@ export type FakeStep =
   | { call: string; input: Record<string, unknown> }
   | { usage: UsageReport }
   | { notice: string }
-  | { limit: string }
+  | { limit: string; resetsAt?: number }
   | { fail: string; code?: RuntimeFailure["code"] };
 
 export type FakeScript = (input: TurnInput, memory: string[]) => FakeStep[];
@@ -433,7 +433,12 @@ export class FakeRuntime implements RuntimeAdapter {
             else if ("notice" in step)
               yield { type: "notice", level: "info", code: "fake", message: step.notice };
             else if ("limit" in step) {
-              yield { type: "limit", code: "usage_limit", message: step.limit };
+              yield {
+                type: "limit",
+                code: "usage_limit",
+                message: step.limit,
+                ...(step.resetsAt === undefined ? {} : { resetsAt: step.resetsAt }),
+              };
               return;
             } else if ("fail" in step) throw step.code ? new RuntimeFailure(step.code) : new Error(step.fail);
           }

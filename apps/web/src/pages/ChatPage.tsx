@@ -19,7 +19,7 @@ import {
   type StartRunResponse,
 } from "@agentlee/shared";
 import { ApiError, conversations, errorText, runs, settings as settingsApi } from "../api.js";
-import { applyChange, chipLabel, differs } from "../chat/chip.js";
+import { applyChange, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { DividerView, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -160,20 +160,20 @@ export function ChatPage() {
 
   const lastAssistant = list?.findLast((m) => m.role === "assistant");
   const chatSettings = conv.data?.settings ?? null;
-  // "기본값을 쓸 수 없어 ○○로 시작했어요" — once (FR-12.6): kept on screen while this conversation is open, and
-  // dismissed on the server at once, so reopening or reloading never shows it again.
+  // "기본값을 쓸 수 없어 ○○로 시작했어요" — once (FR-12.6): the server hands it to exactly one caller (another tab, a
+  // reload or a failed request never shows it twice); only that page shows it, while the conversation is open.
   const [notice, setNotice] = useState<{ id: string; text: string } | null>(null);
-  const dismissed = useRef<string | null>(null);
-  const fallback = conv.data?.fallbackNotice;
+  const asked = useRef<string | null>(null);
+  const pendingNotice = !!conv.data?.fallbackNotice;
   useEffect(() => {
-    if (!fallback || dismissed.current === id || usable.isPending) return;
-    dismissed.current = id;
-    setNotice({ id, text: `기본값을 쓸 수 없어 ${chipLabel(fallback, usable.data)}로 시작했어요` });
-    void conversations
-      .dismissFallbackNotice(id)
-      .then((c) => qc.setQueryData(["conversation", id], c))
-      .catch(() => undefined);
-  }, [fallback, id, qc, usable.data, usable.isPending]);
+    if (!pendingNotice || asked.current === id || usable.isPending) return;
+    asked.current = id;
+    void takeFallbackNotice(() => conversations.consumeFallbackNotice(id)).then((n) => {
+      // Only the notice field: a full conversation from this response could undo a newer chip change.
+      qc.setQueryData<Conversation>(["conversation", id], (c) => (c ? withoutNotice(c) : c));
+      if (n) setNotice({ id, text: noticeText(n, usable.data) });
+    });
+  }, [pendingNotice, id, qc, usable.data, usable.isPending]);
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);

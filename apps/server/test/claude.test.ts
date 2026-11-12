@@ -167,6 +167,15 @@ describe("Claude adapter (#15): event translation", () => {
     expect(await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected"), sdk.result()])).toContainEqual(
       expect.objectContaining({ type: "limit" }),
     );
+    // The reset time (seconds since the epoch in the SDK) is passed on in ms (#19); without one, none.
+    expect(
+      await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected", 1_800_000_000), sdk.result()]),
+    ).toContainEqual(expect.objectContaining({ type: "limit", resetsAt: 1_800_000_000_000 }));
+    expect(
+      (await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected"), sdk.result()])).find(
+        (e) => e.type === "limit",
+      ),
+    ).not.toHaveProperty("resetsAt");
     expect(
       (await run([sdk.init({ session: "s" }), sdk.rateLimit("allowed"), sdk.result()])).some(
         (e) => e.type === "limit",

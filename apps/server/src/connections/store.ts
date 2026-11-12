@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { and, asc, eq, gte, isNull, lte } from "drizzle-orm";
+import { and, asc, eq, gte, isNotNull, isNull, lte } from "drizzle-orm";
 import {
   DEFAULT_PERMISSIONS,
   type Connection,
@@ -74,6 +74,7 @@ export function toConnection(c: ConnectionRow): Connection {
     status: c.status,
     lastTestAt: c.lastTestAt ?? null,
     lastTestCode: c.lastTestCode ?? null,
+    limitedUntil: c.limitedUntil !== null && c.limitedUntil > Date.now() ? c.limitedUntil : null,
     // `env-import`: brought over from `.env` (connections/import.ts), not registered by someone else.
     registeredByAdmin:
       c.scope === "personal" && !!c.createdBy && c.createdBy !== c.ownerId && c.createdBy !== "env-import",
@@ -209,6 +210,7 @@ export class ConnectionStore {
       status: "untested",
       lastTestAt: null,
       lastTestCode: null,
+      limitedUntil: null,
       disconnectedAt: null,
       createdAt: t,
       updatedAt: t,
@@ -235,6 +237,7 @@ export class ConnectionStore {
       set.status = "untested";
       set.lastTestAt = null;
       set.lastTestCode = null;
+      set.limitedUntil = null;
     }
     // After the new key (if any) is registered: a label holding it is scrubbed too.
     if (patch.label !== undefined) set.label = scrubKnown(patch.label);
@@ -279,6 +282,7 @@ export class ConnectionStore {
       status: "untested",
       lastTestAt: null,
       lastTestCode: null,
+      limitedUntil: null,
       disconnectedAt: null,
       createdAt: t,
       updatedAt: t,
@@ -307,6 +311,7 @@ export class ConnectionStore {
         status: "untested",
         lastTestAt: null,
         lastTestCode: null,
+        limitedUntil: null,
         updatedAt: this.now(),
       })
       .where(and(eq(connections.id, id), isNull(connections.disconnectedAt)))
@@ -402,7 +407,14 @@ export class ConnectionStore {
     return (
       this.db
         .update(connections)
-        .set({ status, lastTestAt: t, lastTestCode: code, updatedAt: t })
+        // A passed test also ends a usage limit (#19): the provider answers again.
+        .set({
+          status,
+          lastTestAt: t,
+          lastTestCode: code,
+          ...(status === "passed" ? { limitedUntil: null } : {}),
+          updatedAt: t,
+        })
         .where(
           and(
             eq(connections.id, id),
@@ -438,6 +450,26 @@ export class ConnectionStore {
         )
         .run().changes > 0
     );
+  }
+
+  // ---- usage limits (#19, FR-12.6) ----
+
+  /** The provider refused this connection for its usage limit: no new conversation starts on it until `until`. */
+  markLimited(id: string, until: number): void {
+    this.db.update(connections).set({ limitedUntil: until }).where(eq(connections.id, id)).run();
+  }
+
+  /** A reply finished on it (or a test passed): the limit is over. */
+  clearLimit(id: string): void {
+    this.db
+      .update(connections)
+      .set({ limitedUntil: null })
+      .where(and(eq(connections.id, id), isNotNull(connections.limitedUntil)))
+      .run();
+  }
+
+  limited(c: Pick<ConnectionRow, "limitedUntil">): boolean {
+    return c.limitedUntil !== null && c.limitedUntil > this.now();
   }
 
   // ---- policies ----

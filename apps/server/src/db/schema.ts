@@ -381,6 +381,12 @@ export const connections = sqliteTable(
     lastTestAt: integer("last_test_at"),
     /** Fixed code of the last test's outcome (`ok`, `test_no_stream`, `runtime_auth`, …) — never runtime text. */
     lastTestCode: text("last_test_code"),
+    /**
+     * Usage limit (FR-9.2, FR-12.6, #19): until when the provider refuses this connection — its reset time when the
+     * runtime said one, else a fixed cooldown. New conversations do not start on it meanwhile; a reply that
+     * finishes on it or a passed test clears it. The status stays `passed` (a limit is not an expiry).
+     */
+    limitedUntil: integer("limited_until"),
     disconnectedAt: integer("disconnected_at"),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),

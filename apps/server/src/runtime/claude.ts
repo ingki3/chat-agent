@@ -450,7 +450,16 @@ export class ClaudeAdapter implements RuntimeAdapter {
           }
           if (m.type === "rate_limit_event" && m.rate_limit_info.status === "rejected") {
             limited = true;
-            yield { type: "limit", code: "rate_limit", message: "Claude 사용 한도에 도달했어요." };
+            // The SDK's reset time is in seconds since the epoch; only a plain number is taken.
+            const at = m.rate_limit_info.resetsAt;
+            yield {
+              type: "limit",
+              code: "rate_limit",
+              message: "Claude 사용 한도에 도달했어요.",
+              ...(typeof at === "number" && Number.isFinite(at) && at > 0
+                ? { resetsAt: at < 1e12 ? at * 1000 : at }
+                : {}),
+            };
             return;
           }
           if (m.type === "result") {

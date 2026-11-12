@@ -118,8 +118,11 @@ export type RuntimeEvent =
   | ({ type: "usage" } & UsageReport)
   /** Informational (e.g. "fell back to …"). */
   | { type: "notice"; level: "info" | "warn"; code: string; message: string }
-  /** Quota / rate limit reached: the turn ends as failed with this code. */
-  | { type: "limit"; code: string; message: string };
+  /**
+   * Quota / rate limit reached: the turn ends as failed with this code. `resetsAt` (ms since epoch): when the
+   * provider said the limit ends, if it did (#19 keeps new conversations off the connection until then).
+   */
+  | { type: "limit"; code: string; message: string; resetsAt?: number };
 
 export type TurnInput = { text: string; model: string; effort?: string | undefined };
 

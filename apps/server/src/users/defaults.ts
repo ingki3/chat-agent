@@ -78,25 +78,31 @@ export class DefaultsService {
     current: { model: string | null; effort: string | null },
   ): ChatSettings | null {
     try {
-      return this.settle(userId, runtime, requested, current);
+      return this.settle(userId, runtime, requested, current, { limit: true });
     } catch (e) {
       if (e instanceof RunAccessDenied) return null;
       throw e;
     }
   }
 
-  /** As `attempt`, but throws the refusal (403 for the chip). */
+  /**
+   * As `attempt`, but throws the refusal (403 for the chip). `limit`: a connection at its usage limit does not count
+   * (FR-12.6 "한도 도달") — for new conversations, and for the chip when it moves a conversation onto it.
+   */
   private settle(
     userId: string,
     runtime: RuntimeId,
     requested: RunChoice,
     current: { model: string | null; effort: string | null },
+    opts: { limit: boolean },
   ): ChatSettings {
     const capabilities = this.caps(runtime);
     if (!capabilities) throw new RunAccessDenied("runtime_not_allowed");
     const s = this.access.resolve({ userId, runtime, capabilities, requested, current });
     // Allowed but nothing to run it with (no passed connection, or no shared one for "공용으로 쓰기").
     if (capabilities.needsConnection && !s.connectionId) throw new RunAccessDenied("connection_not_allowed");
+    if (opts.limit && s.connectionId && this.access.connectionLimited(s.connectionId))
+      throw new RunAccessDenied("connection_limited");
     return { runtime, model: s.model.id, effort: s.effort, useShared: s.useShared };
   }
 
@@ -162,6 +168,9 @@ export class DefaultsService {
           : { model: patch.model, effort: null };
     } else if (runtimeChanged) preference = { model: saved?.model ?? null, effort: saved?.effort ?? null };
     else preference = { model: base?.model ?? null, effort: base?.effort ?? null };
-    return this.settle(user.id, runtime, requested, preference);
+    // Moving onto another runtime or connection checks its usage limit; changing the model or effort of the one the
+    // conversation is already on does not (the limit is already in its way, and the chip says so).
+    const moves = runtimeChanged || (patch.useShared !== undefined && patch.useShared !== base?.useShared);
+    return this.settle(user.id, runtime, requested, preference, { limit: moves });
   }
 }

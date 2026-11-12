@@ -1,0 +1,1 @@
+ALTER TABLE `connections` ADD `limited_until` integer;

@@ -31,6 +31,19 @@ const RELOGIN: Record<RuntimeId, string> = {
  * happens when a run fails on a connection — an expired credential marks it `expired` and notifies the owner
  * (`connection_lost`) or, for a shared one, the admins (`system_warning`); a personal limit offers the shared one.
  */
+/**
+ * How long a connection counts as limited after the provider refused it for its usage limit (#19): until the reset
+ * time it gave — at least a minute and at most a week ahead — else a cooldown of five hours, the length of Claude's
+ * shortest subscription window, so new conversations do not walk back into a limit that is still there. A reply that
+ * finishes on it (picked by hand) or a passed connection test ends it earlier.
+ */
+export const LIMIT_COOLDOWN_MS = 5 * 60 * 60_000;
+const LIMIT_MAX_MS = 7 * 24 * 60 * 60_000;
+export function limitUntil(resetsAt: number | undefined, now: number): number {
+  if (resetsAt === undefined || !Number.isFinite(resetsAt)) return now + LIMIT_COOLDOWN_MS;
+  return Math.min(Math.max(resetsAt, now + 60_000), now + LIMIT_MAX_MS);
+}
+
 export class ConnectionService {
   readonly access: RunAccess;
   /** Running connection tests: how to cancel one, and its end (disconnect waits for it before removing folders). */
@@ -76,10 +89,17 @@ export class ConnectionService {
     });
   }
 
+  /** A reply finished on the connection: a usage limit it had is over (#19). */
+  runSucceeded(run: RunRow): void {
+    if (run.connectionId) this.store.clearLimit(run.connectionId);
+  }
+
   /** The run manager's hook for a failed run on a connection: notices for the stream, side effects here. */
-  runFailed(run: RunRow, code: string): StreamEvent[] {
+  runFailed(run: RunRow, code: string, info: { resetsAt?: number } = {}): StreamEvent[] {
     const c = run.connectionId ? this.store.get(run.connectionId) : undefined;
     if (!c) return [];
+    // A usage limit (FR-9.2, FR-12.6): new conversations start elsewhere until it resets (#19).
+    if (code === "usage_limit") this.store.markLimited(c.id, limitUntil(info.resetsAt, Date.now()));
     const runtime = c.runtime as RuntimeId;
     const label = RUNTIME_LABEL[runtime] ?? c.runtime;
     const subscription = c.authType === "subscription";

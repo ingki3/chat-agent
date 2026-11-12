@@ -96,6 +96,8 @@ type Live = {
   tools: Map<string, { name: string; startedAt: number }>;
   /** What made the run fail, for the log (class name and code only are ever written). */
   failure?: unknown;
+  /** The provider's reset time of a usage limit this run hit (#19), if it said one. */
+  limitResetsAt?: number;
   /** Finance results of the recent conversation (#30): a follow-up that states figures is checked too. */
   financeCarry?: AnswerEvidence | undefined;
   /**
@@ -266,7 +268,8 @@ export type RunManagerOptions = {
    */
   connections?: {
     resolve(input: RunSettingsInput): RunSettings;
-    runFailed(run: RunRow, code: string): StreamEvent[];
+    runFailed(run: RunRow, code: string, info?: { resetsAt?: number }): StreamEvent[];
+    runSucceeded?(run: RunRow): void;
   };
   /**
    * Start settings of a conversation that has none yet (#19, FR-12.6): the user's defaults with the fallback order.
@@ -471,7 +474,7 @@ export class RunManager {
         const { user, assistant } = input.prepare(() => {
           // `── 여기부터 … ──` when this reply is answered by another runtime, model or effort than the last (#19).
           if (adapter && model)
-            this.conversations.appendSwitchDivider(input.conversationId, {
+            this.conversations.syncSwitchDivider(input.conversationId, {
               runtime: adapter.id,
               model: model.id,
               effort,
@@ -1063,6 +1066,7 @@ export class RunManager {
         } else if (ev.type === "notice") {
           this.emit(runId, ev);
         } else if (ev.type === "limit") {
+          if (ev.resetsAt !== undefined) live.limitResetsAt = ev.resetsAt;
           this.emit(runId, { type: "notice", level: "warn", code: ev.code, message: ev.message });
           outcome = { status: "failed", code: "usage_limit" };
         }
@@ -1090,8 +1094,13 @@ export class RunManager {
     }
     // A failure on a connection (expired credential, personal limit): its notices go out before the error (#17).
     if (outcome.status === "failed" && run.connectionId && !live.settled)
-      for (const ev of this.opts.connections?.runFailed(run, outcome.code ?? "runtime_error") ?? [])
+      for (const ev of this.opts.connections?.runFailed(run, outcome.code ?? "runtime_error", {
+        ...(live.limitResetsAt !== undefined ? { resetsAt: live.limitResetsAt } : {}),
+      }) ?? [])
         this.emit(runId, ev);
+    // A reply that finished on a connection ends its usage limit (#19).
+    if (outcome.status === "done" && run.connectionId && !live.settled)
+      this.opts.connections?.runSucceeded?.(run);
     this.settle(runId, outcome.status, outcome.code);
   }
 }

@@ -29,6 +29,8 @@ export const Connection = z.object({
   lastTestAt: z.number().nullable(),
   /** Fixed code of the last test (`ok`, `test_no_stream`, `test_no_tool`, `test_no_skill`, `runtime_auth`, …). */
   lastTestCode: z.string().nullable(),
+  /** Usage limit reached (#19): until when (ms) — new conversations start elsewhere meanwhile. Null = not limited. */
+  limitedUntil: z.number().nullable(),
   /** Registered by an admin on the owner's behalf. */
   registeredByAdmin: z.boolean(),
   createdAt: z.number(),

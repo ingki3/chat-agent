@@ -406,7 +406,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       mcpTokens,
       connections: {
         resolve: (input) => connections.access.resolve(input),
-        runFailed: (run, code) => connections.runFailed(run, code),
+        runFailed: (run, code, info) => connections.runFailed(run, code, info),
+        runSucceeded: (run) => connections.runSucceeded(run),
       },
       log: app.log,
       ...(errors ? { errors } : {}),

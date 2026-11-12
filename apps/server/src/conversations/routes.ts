@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   ChangeSettingsRequest,
+  type ConsumeFallbackNoticeResponse,
   CreateConversationRequest,
   EditMessageRequest,
   ListConversationsQuery,
@@ -128,13 +129,22 @@ export function registerConversationRoutes(
     if (body.title !== undefined) store.rename(req.params.id, body.title);
     if (body.pinned !== undefined) store.setPinned(req.params.id, body.pinned);
     if (body.researchMode !== undefined) store.setResearchMode(req.params.id, body.researchMode);
-    if (body.dismissFallbackNotice) store.dismissFallbackNotice(req.params.id);
     return reply.send(toConversation(store.get(req.params.id)!));
   });
 
+  // The fallback notice (#19, FR-12.6), taken atomically: only the caller that gets it shows it.
+  app.post<{ Params: IdParams }>(
+    "/api/conversations/:id/fallback-notice/consume",
+    { config: conv("write") },
+    async (req, reply) =>
+      reply
+        .header("Cache-Control", "no-store")
+        .send({ notice: store.consumeFallbackNotice(req.params.id) } satisfies ConsumeFallbackNoticeResponse),
+  );
+
   // The chip (#19, FR-3.5): runtime, model, effort or "공용으로 쓰기" of this conversation, from its next message on —
   // a reply being written now keeps what it started with. Not allowed → 403 with the run check's code. The divider
-  // is written when the change takes effect (the next reply), see ConversationStore.appendSwitchDivider.
+  // is written when the change takes effect (the next reply), see ConversationStore.syncSwitchDivider.
   app.put<{ Params: IdParams }>(
     "/api/conversations/:id/settings",
     { config: conv("write") },

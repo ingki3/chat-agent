@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeSettingsRequest, ChatSettings, RuntimeOption } from "@agentlee/shared";
 import { errorText } from "../api.js";
-import { canChooseShared, chipLabel, RUNTIME_NAME } from "./chip.js";
+import { canChooseShared, chipLabel, RUNTIME_NAME, runtimeLimit } from "./chip.js";
+
+const until = new Intl.DateTimeFormat("ko-KR", {
+  month: "numeric",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+const untilText = (ms: number) => until.format(ms);
 
 const dotClass = (r: string | null | undefined) =>
   r === "codex" ? "codex" : r === "claude-code" ? "claude" : "none";
@@ -21,6 +29,8 @@ export function RuntimeChip(props: {
   pending?: boolean | undefined;
 }) {
   const [open, setOpen] = useState(false);
+  // When the popover was opened: usage limits are shown against it (they end on their own).
+  const [now, setNow] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wrap = useRef<HTMLSpanElement>(null);
@@ -57,6 +67,7 @@ export function RuntimeChip(props: {
     }
   };
   const label = chipLabel(s, options);
+
   return (
     <span className="chipwrap" ref={wrap}>
       {props.notice && (
@@ -76,7 +87,10 @@ export function RuntimeChip(props: {
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label={`런타임·모델: ${label}`}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setNow(Date.now());
+          setOpen((o) => !o);
+        }}
       >
         <span className={`dot ${dotClass(s?.runtime)}`} />
         <span className="rt-name">{label}</span>
@@ -91,21 +105,38 @@ export function RuntimeChip(props: {
             <>
               <fieldset className="chipfield" disabled={busy}>
                 <legend>런타임</legend>
-                {options.map((o) => (
-                  <label key={o.runtime} className="row">
-                    <input
-                      type="radio"
-                      name="chip-runtime"
-                      checked={s?.runtime === o.runtime}
-                      onChange={() => void change({ runtime: o.runtime })}
-                    />
-                    <span className={`dot ${dotClass(o.runtime)}`} />
-                    {RUNTIME_NAME[o.runtime] ?? o.runtime}
-                  </label>
-                ))}
+                {options.map((o) => {
+                  const lim = runtimeLimit(o, now);
+                  const here = s?.runtime === o.runtime;
+                  return (
+                    <label key={o.runtime} className="row">
+                      <input
+                        type="radio"
+                        name="chip-runtime"
+                        checked={here}
+                        disabled={lim.blocked && !here}
+                        onChange={() =>
+                          void change(
+                            lim.viaShared ? { runtime: o.runtime, useShared: true } : { runtime: o.runtime },
+                          )
+                        }
+                      />
+                      <span className={`dot ${dotClass(o.runtime)}`} />
+                      {RUNTIME_NAME[o.runtime] ?? o.runtime}
+                      {lim.blocked && lim.until !== null && (
+                        <span className="badge warn" data-testid="chip-limited">
+                          한도 · {untilText(lim.until)}까지
+                        </span>
+                      )}
+                    </label>
+                  );
+                })}
               </fieldset>
               {s && !option && (
                 <p className="warn">지금 이 런타임은 쓸 수 없어요 — 다른 런타임을 고르세요.</p>
+              )}
+              {option && runtimeLimit(option, now).blocked && (
+                <p className="warn">지금 이 런타임은 사용 한도에 걸렸어요 — 다른 런타임을 고르세요.</p>
               )}
               {option && (
                 <label className="chipfield">
