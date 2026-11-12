@@ -55,7 +55,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-7.6 | 모든 숫자에 출처·기준 시각 | #30, #31 | U | 🟨 (#30 값마다 `{source, asOf, timeZone, delayed, kind}`, 휴장일 → 최근 거래일 종가, 결과 검사(`finalize`)와 답변 검사(`finance_note`) — `finance.test.ts`·`finance-runs.test.ts`·`e2e/finance.spec.ts`. 차트·표는 #31) |
 | FR-7.7 | 관심 종목 | #31 | I, E | ⬜ |
 | FR-7.8 | 면책 문구, 매매 금지 | #20, #30 | U | ✅ (#20 금융 지침, #30 공통 금융 출력기가 금융 도구를 쓴 모든 답변·후속 답변·예약 실행에 면책 첨부 — `finance-runs.test.ts`, 변이 시험) |
-| FR-8.1 | 대화·예약 화면에서 만들기 | #55 | E | ✅ (#55 MCP 도구 `schedule_create`(두 런타임 공통)는 제안만 저장(`schedule_proposals`, 0023) → 답 아래 확인 카드 → 주인이 “예약 만들기”를 눌러야 생성(본인 세션의 API, 한 번만). 화면의 새 예약 폼 — `test/schedule-ui.test.ts`, `e2e/schedules.spec.ts`, 변이 시험. docs/ops.md §28) |
+| FR-8.1 | 대화·예약 화면에서 만들기 | #55 | E | ✅ (#55 MCP 도구 `schedule_create`(두 런타임 공통)는 제안만 저장(`schedule_proposals`, 0022) → 답 아래 확인 카드 → 주인이 “예약 만들기”를 눌러야 생성(본인 세션의 API, 한 번만). 화면의 새 예약 폼 — `test/schedule-ui.test.ts`, `e2e/schedules.spec.ts`, 변이 시험. docs/ops.md §28) |
 | FR-8.2 | 예약 항목, 기본값 자동 적용 | #33, #55 | I | 🟨 (#33 `schedules` 표(0020): 이름·프롬프트(저장 시 가림·재가림)·다섯 유형·시간대(기본 서울)·스킬·알림(기본 켬)·런타임·모델·추론 강도. 만들 때 안 주면 만든 사람의 기본값(FR-12.6 대체), 주면 칩과 같은 검사(403) — `test/schedules.test.ts` "schedule API". #55 폼: 기본값으로 시작, 칩(허용·사용 가능한 것만, 서버 미리보기)으로만 바꿈, 허용 안 된 모델 만들기·수정 403 — `test/schedule-ui.test.ts`) |
 | FR-8.3 | 전용 대화에 결과, 새 결과 표시 | #56 | I, E | ⬜ |
 | FR-8.4 | 실행 결과 알림 | #56, #34, #57 | I, M | 🟨 (#34 발행 API `schedule_succeeded`·`schedule_failed` 완료. #33 핸들러 계약의 `notify` 단계(실행 id마다 멱등, 크래시 뒤 한 번만) — 실제 발행 연결은 #56) |
