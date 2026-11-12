@@ -5,15 +5,24 @@ import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ARTIFACT_LIMITS, CSRF_HEADER, type ArtifactDetail } from "@agentlee/shared";
+import {
+  ARTIFACT_ESCAPE_MESSAGE,
+  ARTIFACT_LIMITS,
+  CSRF_HEADER,
+  type ArtifactDetail,
+  type MessagePart,
+} from "@agentlee/shared";
 import { APP_CSP, buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { artifactVersions } from "../src/db/schema.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
-import { FakeRuntime } from "../src/runtime/fake.js";
+import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
+import { RunManager } from "../src/runtime/runs.js";
 import {
   CDN_ALLOW_LIST,
+  ESCAPE_BRIDGE,
+  ESCAPE_BRIDGE_HASH,
   artifactCsp,
   attachment,
   chartSvg,
@@ -522,7 +531,10 @@ describe("artifact routes (#27)", () => {
     expect(m.body).toBe("# <script>x()</script>");
     const ch = await raw(chart);
     expect(ch.body).toContain("<svg");
-    expect(ch.headers["content-security-policy"]).toContain("script-src 'none'");
+    // In the app's frame the server-drawn page allows exactly one script: the Escape bridge (#28).
+    expect(ch.headers["content-security-policy"]).toBe(artifactCsp([ESCAPE_BRIDGE_HASH]));
+    expect(ch.body.endsWith(ESCAPE_BRIDGE)).toBe(true);
+    expect(ch.body.split("<script").length).toBe(2);
     const t = await raw(table);
     expect(t.body).toContain("<td>=cmd</td>");
     const csv = await get(app, `/a/${table}/v/1/download`, f.cookies.owner);
@@ -614,5 +626,278 @@ describe("artifact routes (#27)", () => {
       payload: { version: 1 },
     });
     expect(forged.statusCode).toBe(403);
+  });
+});
+
+describe("artifact panel, cards and list (#28)", () => {
+  const get = (app: App, url: string, cookie?: string) =>
+    app.inject({ url, headers: { ...LOCAL, ...(cookie ? { cookie } : {}) } });
+  type Part = { type: string; artifactId?: string; version?: number };
+  const lastParts = async (app: App, cookie: string, conversationId: string) => {
+    const r = await get(app, `/api/conversations/${conversationId}/messages`, cookie);
+    return (r.json() as { items: { parts: Part[] }[] }).items.at(-1)!.parts;
+  };
+
+  it("a reply gets one card (artifact_ref) per artifact its run made or changed, from the stored versions", async () => {
+    const { app, f } = await newApp();
+    const c = app.conversations!.create(f.users.owner.id);
+    const created = await runCommand(app, f.cookies.owner, c.id, `/artifact html 카드\n<p>v1</p>`);
+    const id = String(created.output.artifactId);
+    const refs = (parts: Part[]) => parts.filter((p) => p.type === "artifact_ref");
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([
+      { type: "artifact_ref", artifactId: id, version: 1 },
+    ]);
+    // The card comes right after the tool's result (before the closing text), and is streamed as it is added.
+    const p1 = await lastParts(app, f.cookies.owner, c.id);
+    const at = p1.findIndex((p) => p.type === "artifact_ref");
+    expect(p1[at - 1]!.type).toBe("tool_result");
+    expect(app.runs!.eventsAfter(created.runId, -1).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({
+        type: "part_update",
+        partIndex: at,
+        part: { type: "artifact_ref", artifactId: id, version: 1 },
+      }),
+    );
+
+    await runCommand(app, f.cookies.owner, c.id, `/artifact-update ${id} content\n<p>v2</p>`);
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([
+      { type: "artifact_ref", artifactId: id, version: 2 },
+    ]);
+    // Nothing written (the same content again, a refused call): no card.
+    await runCommand(app, f.cookies.owner, c.id, `/artifact-update ${id} content\n<p>v2</p>`);
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([]);
+    await runCommand(
+      app,
+      f.cookies.owner,
+      c.id,
+      `/artifact chart 나쁜\n{"type":"bar","labels":["a"],"series":[]}`,
+    );
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([]);
+    // A version written by another run of another conversation never shows here.
+    const other = app.conversations!.create(f.users.owner.id);
+    const elsewhere = await runCommand(app, f.cookies.owner, other.id, `/artifact html 다른\n<p>x</p>`);
+    expect(app.artifacts!.refsOfRun(c.id, elsewhere.runId)).toEqual([]);
+    expect(refs(await lastParts(app, f.cookies.owner, other.id))).toEqual([
+      { type: "artifact_ref", artifactId: String(elsewhere.output.artifactId), version: 1 },
+    ]);
+  });
+
+  it("refsOfRun: newest version per artifact the run wrote, only in its conversation, in first-touched order", async () => {
+    const { app, f } = await newApp();
+    const c = app.conversations!.create(f.users.owner.id);
+    const other = app.conversations!.create(f.users.owner.id);
+    const store = app.artifacts!;
+    const scope = { userId: f.users.owner.id, conversationId: c.id, runId: "run-a" };
+    const a = store.create(scope, { kind: "html", title: "a", content: "<p>1</p>" }).artifact.id;
+    const b = store.create(scope, { kind: "html", title: "b", content: "<p>1</p>" }).artifact.id;
+    store.update(scope, a, { content: "<p>2</p>" });
+    store.update({ ...scope, runId: "run-b" }, b, { content: "<p>2</p>" });
+    store.create({ ...scope, conversationId: other.id }, { kind: "html", title: "x", content: "<p>1</p>" });
+    expect(store.refsOfRun(c.id, "run-a")).toEqual([
+      { artifactId: a, version: 2 },
+      { artifactId: b, version: 1 },
+    ]);
+    expect(store.refsOfRun(c.id, "run-b")).toEqual([{ artifactId: b, version: 2 }]);
+    expect(store.refsOfRun(other.id, "run-b")).toEqual([]);
+  });
+
+  it("GET /api/artifacts: only the caller's own, across conversations, newest change first, paged", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    let t = 1_000;
+    (store as unknown as { now: () => number }).now = () => ++t;
+    const c1 = app.conversations!.create(f.users.owner.id, { title: "숙제" });
+    const c2 = app.conversations!.create(f.users.owner.id, { title: "여행" });
+    const mine = (cid: string, title: string) =>
+      store.create(
+        { userId: f.users.owner.id, conversationId: cid, runId: "r" },
+        { kind: "html", title, content: `<p>${title}</p>` },
+      ).artifact.id;
+    const a = mine(c1.id, "a");
+    const b = mine(c2.id, "b");
+    const c = mine(c1.id, "c");
+    store.update({ userId: f.users.owner.id, conversationId: c1.id, runId: "r" }, a, {
+      content: "<p>a2</p>",
+    });
+    const sc = app.conversations!.create(f.users.stranger.id);
+    store.create(
+      { userId: f.users.stranger.id, conversationId: sc.id, runId: "r" },
+      { kind: "html", title: "남의 것", content: "<p>x</p>" },
+    );
+    const r = await get(app, "/api/artifacts", f.cookies.owner);
+    expect(r.statusCode).toBe(200);
+    expect(r.headers["cache-control"]).toBe("no-store");
+    const body = r.json() as { items: { id: string; conversationTitle: string; latestVersion: number }[] };
+    expect(body.items.map((i) => [i.id, i.conversationTitle, i.latestVersion])).toEqual([
+      [a, "숙제", 2],
+      [c, "숙제", 1],
+      [b, "여행", 1],
+    ]);
+    expect(JSON.stringify(body)).not.toContain("<p>"); // no content in the list
+    // Pages of two: the cursor goes on where the page ended, nothing twice or missing.
+    const p1 = (await get(app, "/api/artifacts?limit=2", f.cookies.owner)).json() as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(p1.items.map((i) => i.id)).toEqual([a, c]);
+    const p2 = (
+      await get(app, `/api/artifacts?limit=2&cursor=${encodeURIComponent(p1.nextCursor!)}`, f.cookies.owner)
+    ).json() as { items: { id: string }[]; nextCursor: string | null };
+    expect(p2).toEqual({ items: [expect.objectContaining({ id: b })], nextCursor: null });
+    // Everyone else sees only their own: the admin and the stranger never get the owner's.
+    const stranger = (await get(app, "/api/artifacts", f.cookies.stranger)).json() as {
+      items: { title: string }[];
+    };
+    expect(stranger.items.map((i) => i.title)).toEqual(["남의 것"]);
+    expect((await get(app, "/api/artifacts", f.cookies.admin)).json()).toEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect((await get(app, "/api/artifacts", f.cookies.shared)).json()).toEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect((await get(app, "/api/artifacts")).statusCode).toBe(401);
+    expect((await get(app, "/api/artifacts?cursor=x", f.cookies.owner)).statusCode).toBe(400);
+    expect((await get(app, "/api/artifacts?limit=1000", f.cookies.owner)).statusCode).toBe(400);
+  });
+
+  it("download ?format=html: a chart's or table's page as an attachment; other kinds and formats 404; owner only", async () => {
+    const { app, f } = await newApp();
+    const cv = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: cv.id, runId: "r" };
+    const store = app.artifacts!;
+    const chart = store.create(scope, {
+      kind: "chart",
+      title: "차트",
+      chart: { type: "bar", labels: ["a"], series: [{ name: "s", values: [1] }] },
+    }).artifact.id;
+    const table = store.create(scope, {
+      kind: "table",
+      title: "표",
+      table: { columns: ["a"], rows: [["<b>"]] },
+    }).artifact.id;
+    const html = store.create(scope, { kind: "html", title: "h", content: "<p>h</p>" }).artifact.id;
+    for (const id of [chart, table]) {
+      const r = await get(app, `/a/${id}/v/1/download?format=html`, f.cookies.owner);
+      expect(r.statusCode).toBe(200);
+      expect(r.headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(r.headers["content-disposition"]).toMatch(/^attachment; filename=".*\.html"/);
+      expect(r.headers["content-security-policy"]).toBe(artifactCsp([]));
+      expect(r.headers["x-content-type-options"]).toBe("nosniff");
+      expect(r.body).toMatch(/^<!doctype html>/i);
+      expect(r.body).not.toContain("<script");
+      expect((await get(app, `/a/${id}/v/1/download?format=html`, f.cookies.stranger)).statusCode).toBe(403);
+      expect((await get(app, `/a/${id}/v/1/download?format=html`)).statusCode).toBe(401);
+    }
+    expect((await get(app, `/a/${table}/v/1/download?format=html`, f.cookies.owner)).body).toContain(
+      "&lt;b&gt;",
+    );
+    expect((await get(app, `/a/${html}/v/1/download?format=html`, f.cookies.owner)).statusCode).toBe(404);
+    expect((await get(app, `/a/${chart}/v/1/download?format=pdf`, f.cookies.owner)).statusCode).toBe(404);
+    expect((await get(app, `/a/${chart}/v/9/download?format=html`, f.cookies.owner)).statusCode).toBe(404);
+    // Without a format the original as before.
+    expect((await get(app, `/a/${chart}/v/1/download`, f.cookies.owner)).headers["content-type"]).toBe(
+      "image/svg+xml; charset=utf-8",
+    );
+  });
+  /** A run whose runtime stays silent after the tool wrote (no `tool_end` yet): only the end of the run syncs. */
+  async function hangingRun() {
+    const db = createTestDb();
+    const hang: FakeScript = () => [{ delayMs: 60_000 }];
+    const runtimes = new RuntimeRegistry();
+    // No `runTools`: nothing listens (the tool's write is made below, as our MCP server would make it).
+    runtimes.register(new FakeRuntime({ script: hang }));
+    const ctx = await newApp({ NODE_ENV: "test" }, { db, runtimes });
+    const { app, f } = ctx;
+    const c = app.conversations!.create(f.users.owner.id);
+    const r = app.runs!.begin({
+      conversationId: c.id,
+      userId: f.users.owner.id,
+      prepare: () => ({
+        user: app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "만들어 줘" }] }),
+        assistant: app.conversations!.append(c.id, { role: "assistant", parts: [], status: "pending" }),
+      }),
+    });
+    for (let i = 0; i < 200 && app.runs!.get(r.run.id)!.status !== "running"; i++)
+      await new Promise((res) => setTimeout(res, 10));
+    expect(app.runs!.get(r.run.id)!.status).toBe("running");
+    // What our MCP tool stores for this run's token, before the runtime reports the call as finished.
+    const { artifact } = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: c.id, runId: r.run.id },
+      { kind: "html", title: "중간", content: "<p>x</p>" },
+    );
+    const refs = () =>
+      (app.conversations!.messageById(r.assistant.id)!.parts as MessagePart[]).filter(
+        (p) => p.type === "artifact_ref",
+      );
+    return { ...ctx, db, c, r, artifactId: artifact.id, refs };
+  }
+
+  it("a reply stopped after the tool wrote (before tool_end) still gets its card", async () => {
+    const { app, r, artifactId, refs } = await hangingRun();
+    expect(refs()).toEqual([]);
+    await app.runs!.interrupt(r.run.id);
+    for (let i = 0; i < 300 && ["queued", "running"].includes(app.runs!.get(r.run.id)!.status); i++)
+      await new Promise((res) => setTimeout(res, 10));
+    expect(app.runs!.get(r.run.id)!.status).toBe("interrupted");
+    expect(refs()).toEqual([{ type: "artifact_ref", artifactId, version: 1 }]);
+  });
+
+  it("a reply recovered after a restart gets its card, once", async () => {
+    const { app, db, r, artifactId, refs } = await hangingRun();
+    expect(refs()).toEqual([]);
+    const manager = new RunManager(db, app.conversations!, new RuntimeRegistry(), app.appEvents);
+    expect(manager.recover()).toBe(1);
+    expect(manager.get(r.run.id)).toMatchObject({ status: "failed", errorCode: "server_restart" });
+    expect(refs()).toEqual([{ type: "artifact_ref", artifactId, version: 1 }]);
+    expect(manager.eventsAfter(r.run.id, -1).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({
+        type: "part_update",
+        part: { type: "artifact_ref", artifactId, version: 1 },
+      }),
+    );
+  });
+
+  it("Escape bridge: only in the HTML original served to the app's frame, hashed like any inline script", async () => {
+    const { app, f } = await newApp();
+    const cv = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: cv.id, runId: "r" };
+    const html = "<!doctype html><p>문서</p><script>go()</script>";
+    const id = app.artifacts!.create(scope, { kind: "html", title: "h", content: html }).artifact.id;
+    const raw = await get(app, `/a/${id}/v/1/raw`, f.cookies.owner);
+    // Appended after the document (never before its doctype), its hash in policy A; policy B unchanged.
+    expect(raw.body).toBe(html + ESCAPE_BRIDGE);
+    const [a, b] = raw.headers["content-security-policy"] as string[];
+    const bridge = /<script>(.*)<\/script>$/.exec(ESCAPE_BRIDGE)![1]!;
+    expect(a).toContain(sha(bridge));
+    expect(a).toContain(sha("go()"));
+    expect(b).not.toContain("sha256-");
+    // The bridge sends one fixed message and nothing else.
+    expect(bridge).toContain(`postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")`);
+    expect(bridge).not.toMatch(/document\.|innerHTML|location|cookie|fetch/);
+    // Not in the downloaded file; not in other kinds (no scripts there at all).
+    expect((await get(app, `/a/${id}/v/1/download`, f.cookies.owner)).body).toBe(html);
+    const svg = app.artifacts!.create(scope, {
+      kind: "svg",
+      title: "s",
+      content: `<svg xmlns="http://www.w3.org/2000/svg"></svg>`,
+    }).artifact.id;
+    expect((await get(app, `/a/${svg}/v/1/raw`, f.cookies.owner)).body).not.toContain("postMessage");
+    const md = app.artifacts!.create(scope, { kind: "markdown", title: "m", content: "# m" }).artifact.id;
+    expect((await get(app, `/a/${md}/v/1/raw`, f.cookies.owner)).body).toBe("# m");
+    // Chart and table pages: the bridge and only it; their HTML download stays script-free.
+    const table = app.artifacts!.create(scope, {
+      kind: "table",
+      title: "t",
+      table: { columns: ["a"], rows: [["b"]] },
+    }).artifact.id;
+    const t = await get(app, `/a/${table}/v/1/raw`, f.cookies.owner);
+    expect(t.headers["content-security-policy"]).toBe(artifactCsp([ESCAPE_BRIDGE_HASH]));
+    expect(t.body.endsWith(ESCAPE_BRIDGE)).toBe(true);
+    expect(ESCAPE_BRIDGE_HASH).toBe(sha(bridge));
+    expect((await get(app, `/a/${table}/v/1/download?format=html`, f.cookies.owner)).body).not.toContain(
+      "<script",
+    );
   });
 });

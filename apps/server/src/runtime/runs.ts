@@ -47,6 +47,7 @@ import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/che
 import { FinanceResultStore } from "../finance/results.js";
 import { citationNote } from "../citations/checker.js";
 import { CitationStore } from "../citations/store.js";
+import { ArtifactStore } from "../artifacts/store.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -310,6 +311,8 @@ export class RunManager {
   private readonly financeResults: FinanceResultStore;
   /** Citations the `cite` tool registered (#25): the citation note at the end of a run is built from them. */
   private readonly citations: CitationStore;
+  /** Artifacts (#28): a reply gets a card (`artifact_ref`) for each artifact its run made or changed. */
+  private readonly artifacts: ArtifactStore;
 
   constructor(
     private readonly db: Db,
@@ -331,6 +334,7 @@ export class RunManager {
       .all() as { id: string; k: string }[])
       db.$client.prepare("update runs set idempotency_key = ? where id = ?").run(idempotencyHash(r.k), r.id);
     this.citations = new CitationStore(db);
+    this.artifacts = new ArtifactStore(db);
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -733,6 +737,7 @@ export class RunManager {
    *   `[n]` with its server-checked status, paragraphs without a citation).
    */
   private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
+    this.syncArtifactRefs(row, parts);
     if (!parts.some((p) => p.type === "finance_note")) {
       // This answer's finance results stay for the rest of the conversation's checks.
       try {
@@ -759,6 +764,32 @@ export class RunManager {
       } catch {
         // no note rather than no reply
       }
+    }
+  }
+
+  /**
+   * The reply's artifact cards (#28): one `artifact_ref` per artifact this run created or changed, naming the
+   * newest version the run wrote. Taken from the stored versions (what our MCP tools wrote for this run's token),
+   * never from the runtime's own report; a card already there is moved on to a newer version. Never breaks a reply.
+   */
+  private syncArtifactRefs(row: RunRow, parts: MessagePart[]): void {
+    let refs: { artifactId: string; version: number }[];
+    try {
+      refs = this.artifacts.refsOfRun(row.conversationId, row.id);
+    } catch {
+      return;
+    }
+    for (const ref of refs) {
+      const part: MessagePart = { type: "artifact_ref", artifactId: ref.artifactId, version: ref.version };
+      const at = parts.findIndex((p) => p.type === "artifact_ref" && p.artifactId === ref.artifactId);
+      if (at === -1) {
+        parts.push(part);
+      } else if ((parts[at] as { version?: number }).version !== ref.version) {
+        parts[at] = part;
+      } else continue;
+      const i = at === -1 ? parts.length - 1 : at;
+      const partIndex = parts.slice(0, i + 1).filter((p) => p.type !== "reasoning").length - 1;
+      this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part });
     }
   }
 
@@ -1057,6 +1088,8 @@ export class RunManager {
           this.toolEnded(run, live, ev.callId, ev.isError === true);
           parts.push({ type: "tool_result", callId: ev.callId, output, ...extra });
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
+          // An artifact tool has written by now: its card shows while the reply goes on (#28).
+          this.syncArtifactRefs(run, parts);
           flush(true);
         } else if (ev.type === "usage") {
           // The attempt's usage so far: replaces the attempt's earlier report, in memory and in storage (#44).

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { ArtifactKind, ChartSpec, TableData } from "@agentlee/shared";
+import { ARTIFACT_ESCAPE_MESSAGE, type ArtifactKind, type ChartSpec, type TableData } from "@agentlee/shared";
 
 /**
  * How an artifact version is served (#27, PRD FR-6.5, docs/decisions/isolation.md "아티팩트 서빙").
@@ -298,15 +298,34 @@ export function tableCsv(t: TableData): string {
 export type Served = { type: string; body: string; csp: readonly string[] };
 
 /**
+ * The one message an artifact page sends the app (#28): Escape pressed inside the sandboxed frame, so the panel can
+ * close (key events in a frame never reach the parent page). Added to the HTML documents served in the app's frame
+ * only — an HTML original and the server-drawn chart and table pages; not to downloads or exports — as an inline
+ * script allowed by its hash (policy A for HTML; the chart and table pages allow that hash and nothing else). It
+ * carries nothing but its type; the app accepts it only from the frame it shows, in exactly this shape, and only
+ * closes. An artifact that handles Escape itself (`preventDefault`) keeps it.
+ */
+const ESCAPE_SCRIPT = `addEventListener("keydown",function(e){if(e.key==="Escape"&&!e.defaultPrevented&&window.parent!==window)window.parent.postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")})`;
+export const ESCAPE_BRIDGE = `<script>${ESCAPE_SCRIPT}</script>`;
+/** The bridge's `script-src` source. */
+export const ESCAPE_BRIDGE_HASH = hashOf(ESCAPE_SCRIPT);
+
+/**
  * What `/a/:id/v/:ver/raw` sends for one version: HTML with its scripts allowed by hash, SVG as an image document
  * (scripts never allowed), chart and table drawn by the server (no script), markdown and code as plain text.
  * `document` has no original yet (#49/#22): undefined.
  */
-export function serveVersion(kind: ArtifactKind, title: string, content: string): Served | undefined {
+export function serveVersion(
+  kind: ArtifactKind,
+  title: string,
+  content: string,
+  opts: { escapeBridge?: boolean } = {},
+): Served | undefined {
   const none = [artifactCsp([])];
   switch (kind) {
     case "html": {
-      const { body, csp } = prepareHtml(content);
+      // Appended at the end: parsed into the body, never before a doctype (no quirks mode).
+      const { body, csp } = prepareHtml(opts.escapeBridge ? content + ESCAPE_BRIDGE : content);
       return { type: "text/html; charset=utf-8", body, csp };
     }
     case "svg":
@@ -314,18 +333,22 @@ export function serveVersion(kind: ArtifactKind, title: string, content: string)
     case "markdown":
     case "code":
       return { type: "text/plain; charset=utf-8", body: content, csp: none };
+    // Server-drawn pages (everything in them escaped, so the bridge at the end always runs): no script, or in the
+    // app's frame exactly the bridge.
     case "chart":
-      return {
-        type: "text/html; charset=utf-8",
-        body: page(title, chartSvg(JSON.parse(content) as ChartSpec)),
-        csp: none,
-      };
-    case "table":
-      return {
-        type: "text/html; charset=utf-8",
-        body: page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`),
-        csp: none,
-      };
+    case "table": {
+      const body =
+        kind === "chart"
+          ? page(title, chartSvg(JSON.parse(content) as ChartSpec))
+          : page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`);
+      return opts.escapeBridge
+        ? {
+            type: "text/html; charset=utf-8",
+            body: body + ESCAPE_BRIDGE,
+            csp: [artifactCsp([ESCAPE_BRIDGE_HASH])],
+          }
+        : { type: "text/html; charset=utf-8", body, csp: none };
+    }
     case "document":
       return undefined;
   }

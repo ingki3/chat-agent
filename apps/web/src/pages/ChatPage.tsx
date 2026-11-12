@@ -28,6 +28,8 @@ import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
+import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
+import { markStartedHere, useAutoOpen } from "../artifacts/ArtifactPanel.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
@@ -94,6 +96,9 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: ["active-run", id] }),
       qc.invalidateQueries({ queryKey: ["conversation", id] }),
       qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY }),
+      // A run may have made a new version of an open artifact (#28): the panel and the cards show it.
+      qc.invalidateQueries({ queryKey: ["artifact"] }),
+      qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
   };
   const { live, reconnect } = useRunStream(
@@ -108,6 +113,8 @@ export function ChatPage() {
     },
     () => void refresh(),
   );
+  // A new artifact of a run started here opens in the panel by itself (#28, FR-6.1).
+  useAutoOpen(live);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
   const lost = !!live?.lost;
   const recheck = useEffectEvent(() => void refresh());
@@ -128,6 +135,7 @@ export function ChatPage() {
       setActionError(null);
       try {
         const r = await call();
+        markStartedHere(r.run.id);
         qc.setQueryData(["active-run", id], r.run);
         await qc.invalidateQueries({ queryKey: ["messages", id] });
         toBottom();
@@ -298,6 +306,7 @@ export function NewChatPage() {
     );
     qc.setQueryData(["conversation", c.id], c);
     const r = await conversations.send(c.id, text);
+    markStartedHere(r.run.id);
     qc.setQueryData(["active-run", c.id], r.run);
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
     navigate(`/c/${c.id}`);

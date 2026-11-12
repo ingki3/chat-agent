@@ -6,6 +6,7 @@ import { auth, setUnauthenticatedHandler } from "./api.js";
 import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
+import { ArtifactsPage } from "./pages/ArtifactsPage.js";
 import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
@@ -74,7 +75,7 @@ function AuthGate() {
           <Route path="c/:id" element={<ChatRoute />} />
           <Route path="shared" element={<PlaceholderPage title="👪 가족 공유" issue="#52" />} />
           <Route path="schedules" element={<PlaceholderPage title="⏰ 예약" issue="#55" />} />
-          <Route path="artifacts" element={<PlaceholderPage title="🧩 아티팩트" issue="#28" />} />
+          <Route path="artifacts" element={<ArtifactsPage />} />
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
           <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />

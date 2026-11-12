@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, asc, count, desc, eq, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, lt, max, or, sql } from "drizzle-orm";
 import {
   ARTIFACT_LIMITS,
   ChartSpec,
@@ -349,6 +349,65 @@ export class ArtifactStore {
       .orderBy(desc(artifacts.createdAt), desc(sql`rowid`))
       .all()
       .map((r) => scrubKnownDeep(r));
+  }
+
+  /**
+   * The caller's own artifacts across conversations (#28 "내가 만든 것"), most recently changed first, each with
+   * its conversation's title. Only artifacts the user made in a conversation the user owns. Keyset paged by
+   * `(updatedAt, id)`; `cursor` is the last item of the previous page.
+   */
+  listByUser(
+    userId: string,
+    limit: number,
+    cursor?: { updatedAt: number; id: string },
+  ): {
+    items: (ArtifactRow & { conversationTitle: string })[];
+    next: { updatedAt: number; id: string } | null;
+  } {
+    const rows = this.db
+      .select({ a: artifacts, conversationTitle: conversations.title })
+      .from(artifacts)
+      .innerJoin(conversations, eq(conversations.id, artifacts.conversationId))
+      .where(
+        and(
+          eq(artifacts.userId, userId),
+          eq(conversations.ownerId, userId),
+          cursor
+            ? or(
+                lt(artifacts.updatedAt, cursor.updatedAt),
+                and(eq(artifacts.updatedAt, cursor.updatedAt), lt(artifacts.id, cursor.id)),
+              )
+            : undefined,
+        ),
+      )
+      .orderBy(desc(artifacts.updatedAt), desc(artifacts.id))
+      .limit(limit + 1)
+      .all();
+    const items = rows
+      .slice(0, limit)
+      .map((r) => scrubKnownDeep({ ...r.a, conversationTitle: r.conversationTitle }));
+    const last = rows.length > limit ? rows[limit - 1]!.a : undefined;
+    return { items, next: last ? { updatedAt: last.updatedAt, id: last.id } : null };
+  }
+
+  /**
+   * What one run made or changed in its conversation (#28: the artifact cards of its reply): each artifact once,
+   * with the newest version that run wrote, in the order the run first touched them. Read from the stored versions
+   * — never from what the runtime reported.
+   */
+  refsOfRun(conversationId: string, runId: string): { artifactId: string; version: number }[] {
+    return this.db
+      .select({
+        artifactId: artifactVersions.artifactId,
+        version: max(artifactVersions.version),
+      })
+      .from(artifactVersions)
+      .innerJoin(artifacts, eq(artifacts.id, artifactVersions.artifactId))
+      .where(and(eq(artifacts.conversationId, conversationId), eq(artifactVersions.runId, runId)))
+      .groupBy(artifactVersions.artifactId)
+      .orderBy(asc(sql`min(${artifactVersions}.rowid)`))
+      .all()
+      .flatMap((r) => (r.version === null ? [] : [{ artifactId: r.artifactId, version: r.version }]));
   }
 
   /** Versions of one artifact, oldest first (API responses leave the content out: `toVersionInfo`). */
