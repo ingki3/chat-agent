@@ -1,5 +1,13 @@
 import os from "node:os";
-import { NotificationKind, RuntimeId, SCHEDULE_PROPOSAL_CODES, SCHEDULE_RUN_CODES } from "@agentlee/shared";
+import {
+  DOC_CODES,
+  DOC_KINDS,
+  DOC_REFUSED_KINDS,
+  NotificationKind,
+  RuntimeId,
+  SCHEDULE_PROPOSAL_CODES,
+  SCHEDULE_RUN_CODES,
+} from "@agentlee/shared";
 import { USAGE_PURPOSES } from "../usage/store.js";
 
 /**
@@ -200,6 +208,11 @@ export const ARTIFACT_CODES = set([
   "artifact_not_allowed",
   "artifact_limit",
 ]);
+
+/** Outcome codes of `doc_create` (#49, shared `DOC_CODES` plus `doc_ok`) and the formats it may be asked for. */
+export const DOC_CODE_VALUES = set(["doc_ok", ...DOC_CODES]);
+export const isDocCode = member(DOC_CODE_VALUES);
+export const isDocKind = member(set([...DOC_KINDS, ...DOC_REFUSED_KINDS]));
 
 /** Outcome codes of the finance tools (#30, finance/service.ts `FINANCE_CODES` — a test keeps the two equal). */
 export const FINANCE_CODES = set([

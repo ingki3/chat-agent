@@ -16,6 +16,7 @@ import {
   UsageSettings,
   type ModelPrice,
   ArtifactDetail,
+  ArtifactVersionContent,
   ArtifactListResponse,
   MyArtifactsResponse,
   FILE_NAME_HEADER,
@@ -522,6 +523,9 @@ export const artifacts = {
       .items,
   revert: async (id: string, version: number) =>
     ArtifactDetail.parse(await call("POST", `/api/artifacts/${enc(id)}/revert`, { version })),
+  /** One version's stored content (a `document` artifact: the generated file it names, #49). */
+  version: async (id: string, version: number) =>
+    ArtifactVersionContent.parse(await call("GET", `/api/artifacts/${enc(id)}/versions/${version}`)),
   /** "내가 만든 것" (#28): the caller's own artifacts across conversations, one page. */
   mine: async (cursor?: string) =>
     MyArtifactsResponse.parse(

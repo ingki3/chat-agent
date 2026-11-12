@@ -31,6 +31,8 @@ import {
   type ArtifactKind,
   type ScheduleProposalToolOutput,
 } from "@agentlee/shared";
+import { DOC_CREATE_TOOL, DOC_TOOLS } from "@agentlee/mcp-tools/docgen";
+import type { DocGenService } from "../docgen/service.js";
 import { CiteRefused, type CitationStore } from "../citations/store.js";
 import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
 import type { ServerToolInfo } from "@agentlee/mcp-tools";
@@ -324,6 +326,8 @@ export type McpServiceOptions = {
   web?: WebOptions;
   /** Artifact storage (#27). Without it the artifact tools are not offered. */
   artifacts?: ArtifactStore;
+  /** Document generation (#49). Without it `doc_create` is not offered. */
+  docs?: DocGenService;
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
   /** Schedule proposals (#55): `schedule_create` stores what it proposes. Without it the tool is not offered. */
@@ -414,6 +418,7 @@ export class McpService {
         : []),
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
       ...(opts.scheduleProposals ? [SCHEDULE_CREATE_TOOL] : []),
+      ...(opts.docs ? DOC_TOOLS : []),
     ];
     this.finance = opts.finance
       ? new FinanceService(
@@ -664,6 +669,21 @@ export class McpService {
           });
           return r;
         }
+        if (name === DOC_CREATE_TOOL.name) {
+          const r = await this.callDocTool(input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "doc.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // The fixed outcome and the format only: never the title, the blocks or the file name.
+            docCode: r.ok ? "doc_ok" : r.code,
+            ...(typeof input.kind === "string" ? { docKind: input.kind } : {}),
+          });
+          return r;
+        }
         const r = await this.callTool(toolByName.get(name), input, scope);
         logEvent(this.opts.log, r.ok ? "info" : "warn", "web.finished", {
           userId: scope.userId,
@@ -756,6 +776,17 @@ export class McpService {
       note: "Not created yet: the user sees a confirmation card and the schedule is created only if they confirm it there. Tell them to check the card; do not say it was created.",
     };
     return { ok: true, output };
+  }
+
+  /**
+   * `doc_create` (#49): active user, then a process slot like a skill (the document is made by a sandboxed worker),
+   * then the service — which checks the input, writes only into the token's own conversation after checking that
+   * the token's user owns it, and links the file to the run's reply. Content is never logged.
+   */
+  private async callDocTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const docs = this.opts.docs;
+    if (!docs || !this.users.byId(scope.userId)?.active) return { ok: false, code: "doc_not_allowed" };
+    return (await this.withSlot(scope, () => docs.create(scope, input))) ?? { ok: false, code: "doc_busy" };
   }
 
   /**

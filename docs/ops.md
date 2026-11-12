@@ -1025,3 +1025,51 @@ PRD FR-8.1·8.2·8.5, FR-12.2. 엔진은 25절, 실제 실행(전용 대화에 �
 - 자동: `apps/server/test/schedule-ui.test.ts`(기본값, 허용 안 된 모델 만들기·수정 403, 수정 모든 칸·일정 검사·가림, 미리보기, 옵션, 비용, 도구 → 카드 → 주인 확인만 생성·한 번만, 취소, 확인 때의 기본값, 도구 거절), `apps/server/test/helpers/permission-matrix.ts`(제안 경로 주인만), `apps/web/test/schedules.test.ts`, `e2e/schedules.spec.ts`(대화 → 카드 → 만들기 → 예약 화면, 폼 미리보기·일시정지·바로 실행 이력·수정·삭제, 403).
 - review #108: `apps/web/test/schedule-form.test.ts`(미리보기 지연·실패 때 요청 없음, 스킬 행), `schedule-ui.test.ts`(기본값·정책 변경 → 409 `proposal_changed`, 권한 빠진 스킬 빼고 저장), e2e 3개(느린 미리보기, 바뀐 카드, 빠진 스킬).
 - 변이 시험(PR 본문): 제안 주인 검사 제거 → 권한 시험 실패, 허용 안 된 모델 검사 우회 → 403 시험 실패, 도구가 바로 예약을 만들게 → “확인 전 생성 없음” 시험 실패.
+
+## 29. 문서 생성 — DOCX·XLSX·PPTX·PDF (#49)
+PRD FR-4.4(HWP 대신 DOCX·PDF)·FR-4.7(에이전트가 만든 파일 내려받기)·FR-5.6(보고서의 참고문헌 블록). 방식과 근거는 `docs/decisions/isolation.md` "문서 생성 (#49)".
+
+### 29.1 무엇을 하나
+- 공통 MCP 도구 `doc_create {kind, title, subtitle?, author?, fileName?, blocks}` — 두 런타임 모두 같은 도구(`mcp__agentlee__doc_create`). 런타임 내장 셸·파일 쓰기는 막혀 있으므로(#42) 보고서·표·발표 자료는 이 도구로만 만든다.
+- `kind`: `docx`(Word 보고서), `xlsx`(첫 시트 "문서"에 제목·글, 표마다 자기 시트 — 머리 행 굵게·고정·필터, 숫자는 숫자 칸, `=`로 시작하는 글도 **글자 칸**(수식이 되지 않음)), `pptx`(16:9, 제목 슬라이드 → 제목(heading)마다 슬라이드, 길면 "(계속)" 슬라이드, 표·그림은 자기 슬라이드, 표가 길면 머리 행을 반복하며 다음 슬라이드로), `pdf`(A4, 쪽 번호, 한글 글꼴 내장).
+- `hwp`·`hwpx`는 만들지 않는다(FR-4.4): 도구가 `doc_hwp_unsupported`와 안내 문구(`DOC_HWP_HINT` — "DOCX(한글에서도 열려요)나 PDF로")를 돌려준다.
+- 블록: `heading`(1~3단계), `paragraph`, `list`(번호 여부), `table`(머리·행 — 칸은 글·숫자·빈칸, 행 길이 = 머리 길이), `image`(**이 대화의 PNG·JPG 파일 id만** — URL은 받지 않고 아무것도 가져오지 않는다), `references`(참고문헌, `[n]` 번호).
+- 결과: 대화의 파일(#22)로 저장되고 `{fileId, name, kind, mediaType, bytes, url, document, checks}`를 돌려준다. `document`는 그대로 `artifact_create kind=document`에 넘길 수 있다(#27 — 아티팩트 패널에 그 파일의 내려받기가 보인다, 미리보기는 #24). 답 아래에는 서버가 그 run이 만든 파일마다 내려받기 칩(`file_ref`)을 붙인다(런타임의 보고가 아니라 저장된 행 기준).
+- 내려받기: #22의 원본 경로 `GET /api/files/:id/content` 그대로 — 만든 사람만, 항상 `attachment`, nosniff, 샌드박스 CSP(§24.3). 파일 이름은 제목(또는 `fileName`)에 형식의 확장자를 붙인 것(경로 문자·제어 문자 제거, 120자).
+
+### 29.2 생성 파일과 대화·맥락의 연결 (결정)
+- 생성 파일의 `files` 행은 **그 run의 답변 메시지**(`runs.assistant_message_id`)에 `message_id`로 연결되고 `upload_id`는 비어 있다(업로드와 구별). 그래서:
+  - 입력창 파일이 아니다: 다른 메시지에 첨부할 수 없고(400 `invalid_attachment`), ✕로 지울 수 없다(409 `file_attached`). 대화를 지우면 함께 지워진다.
+  - 맥락(#45): 새 세션의 참조 목록은 "지금 기록에 있는 메시지에 붙은 파일"이므로, 그 답이 기록에 있는 동안 다음 턴(런타임 전환 포함)이 `file:<id>`로 그 파일을 안다. 그 답을 다시 생성하거나 앞 메시지를 고쳐 답이 기록에서 빠지면 그 파일도 참조에서 빠진다(파일과 내려받기는 남는다).
+  - 마이그레이션은 필요 없었다(기존 열로 충분 — 새 DB 글자 열 없음). `files.name`은 이미 분류된 열이고 쓰는 곳에 `addGenerated`를 더했다(`secrets/columns.ts`).
+- 대화당 파일 20개 한도(§24.1)에 업로드와 함께 센다 — 행을 넣는 같은 한 문장의 조건으로(`doc_too_many_files`). 사용자별 용량 한도는 아직 없다(업로드에도 없음).
+
+### 29.3 한도 (`DOC_LIMITS`, `packages/shared/src/docgen.ts`)
+- 요청(MCP 요청 자체 1MB 안): 블록 300, 글 한 덩이 1만 자, 문서 전체 글 30만 자, 목록 항목 200, 표 30개·열 30·행 1,000·칸 1,000자·모든 표의 칸 합 2만, 그림 10장(한 장 10MB, 합 25MB, 그림 크기 4천만 화소·한 변 2만 화소 — 작은 파일이 큰 그림일 수 있어 머리만 읽어 거절), 참고문헌 200.
+- 결과 파일 25MB(업로드 한도 50MB 아래). 넘으면 `doc_output_too_large`, 저장하지 않는다.
+- 생성 작업자: 60초, 메모리 768MB, 출력(base64) 약 33.4MB. 동시 실행은 스킬과 같은 슬롯(전체 4, run당 2 — 넘으면 `doc_busy`).
+
+### 29.4 검사와 비밀
+- **알려진 비밀(1절, 라운드 23–27):** 요청의 모든 글자(제목·부제·작성자·블록·칸·참고문헌)와 파일 이름에서 **만들기 전에** 가린다(`[숨김]`). 비밀과 같은 숫자 칸도 `[숨김]` 글자가 된다. 그 시점에 서버가 아는 비밀만 가린다 — 파일이 만들어진 뒤 등록된 비밀은 이미 만든 파일 바이트에서 지우지 않는다(업로드 파일과 같은 원칙, §24.2. 이름 열은 재가림 대상). 블록 경계를 넘어 이어 붙은 비밀(두 칸에 나눠 쓴 값)은 잡지 못한다(아티팩트와 같은 한계).
+- **다시 열기:** (1) 작업자가 만든 파일을 다시 연다 — Office는 ZIP을 풀어 본문 부분(`word/document.xml`·`xl/workbook.xml`·`ppt/presentation.xml`·첫 슬라이드)이 있고 제목 글이 있는지, DOCX는 표 개수, XLSX는 시트 개수(1 + 표 수)가 맞는지. PDF는 `%PDF-` 머리·`%%EOF`·쪽 1개 이상. (2) 서버가 업로드와 같은 형식 판별(`contentMatches`)을 한다. 둘 중 하나라도 실패하면 `doc_invalid`, 저장하지 않는다.
+- **오류 코드**(모델에게 `{ error }`, 로그 `docCode`): `doc_bad_input`, `doc_too_large`, `doc_hwp_unsupported`, `doc_image_not_found`(없음·남의 것·다른 대화·보내지 않음·기록에서 빠진 메시지·해시 불일치 — 모두 같은 답), `doc_image_unsupported`(PNG·JPG 아님), `doc_image_too_large`, `doc_output_too_large`, `doc_too_many_files`, `doc_invalid`, `doc_failed`, `doc_timeout`, `doc_limit`, `doc_busy`, `doc_unavailable`(샌드박스 없음 — macOS가 아닌 곳), `doc_not_allowed`.
+
+### 29.5 의존성 (정확한 버전 고정, 2026-11-12 기준 2주 넘게 지난 배포)
+| 패키지 | 버전 | 배포일 | 라이선스 | 쓰임 |
+|---|---|---|---|---|
+| `docx` | 9.15.0 | 2026-10-27 | MIT | DOCX |
+| `exceljs` | 4.4.0 | 2023-10-19 | MIT | XLSX |
+| `pptxgenjs` | 4.0.1 | 2025-06-26 | MIT | PPTX |
+| `pdfkit` | 0.20.2 | 2026-08-30 | MIT | PDF |
+| `@expo-google-fonts/gothic-a1` | 0.4.1 | 2025-09-12 | MIT(패키지) + **SIL OFL 1.1**(글꼴, `LICENSE_FONT`, © HanYang I&C) | PDF 한글 글꼴(Gothic A1 Regular·Bold, 쓰인 글자만 내장) |
+| `jszip` | 3.10.2 (기존 하위 의존성) | 2026-09-08 | MIT 또는 GPL-3.0 (MIT 선택) | 작업자의 다시 열기, 시험 |
+| `pdfjs-dist` (devDependency) | 6.4.299 | 2026-10-03 | Apache-2.0 | 시험에서만 PDF 글자 추출(#48과 같은 고정) |
+- 하위 의존성 중 2주가 안 된 배포는 `pnpm.overrides`로 고정했다: `@types/node` 22.20.5(`docx`가 26.x를 끌어와 vite 피어가 바뀌던 것), `brace-expansion@1` 1.1.21, `brace-expansion@2` 2.1.7, `@swc/helpers` 0.5.23, `tslib` 2.8.1. `@napi-rs/canvas`(pdfjs-dist의 선택 의존성, 네이티브)는 `ignoredOptionalDependencies`.
+- NanumGothic(`@expo-google-fonts/nanum-gothic`)을 먼저 썼으나 fontkit 2.0.4가 그 글꼴의 공백 글리프를 읽다 실패해(빈 글리프 처리) Gothic A1으로 바꿨다.
+
+### 29.6 로그와 확인
+- 로그: `doc.finished`(도구 이름, 요청 형식 `docKind`, 결과 `docCode` = `doc_ok` 또는 위 코드, 소요 시간, 사용자·대화·run ID). **제목·블록·파일 이름·내용은 남기지 않는다**(시험).
+- 시험: `pnpm test apps/server/test/docgen.test.ts` — 네 형식 fixture(생성 → 각자의 판독기로 열기 → 제목·표·문단·그림 일치: DOCX/PPTX는 ZIP의 글 요소, XLSX는 exceljs로 읽기, PDF는 pdf.js 글자 추출), 긴 내용(여러 쪽·계속 슬라이드), 그림 머리 검사, 작업자 다시 열기, macOS 샌드박스 실행(네 형식), 실행 경로(FakeRuntime `/doc <kind>` — 파일·칩·아티팩트·내려받기·주인만·맥락 참조), HWP 안내, 로그, 한도·그림 소유·비밀·결과 검사·범위·20개 한도, **두 런타임 녹화 재생**(Claude·Codex가 우리 MCP 서버로 `doc_create`·`artifact_create`를 실제 호출 → 네 형식 내려받아 열림).
+- e2e: `E2E_PORT=3117 pnpm e2e e2e/docgen.spec.ts` — "이 내용을 DOCX 보고서로"(`/doc docx`) → 답의 칩으로 브라우저 내려받기 → 파일을 열어 제목·문단·표 확인, 같은 답의 문서 아티팩트 패널에 같은 파일 내려받기. PDF 한글 글자, HWP 안내. 데스크톱·모바일.
+- FakeRuntime 모드(`FAKE_RUNTIME=1`, 개발·e2e 전용)는 샌드박스가 없는 기계(CI Linux)에서도 돌도록 같은 작업자를 서버 프로세스 안에서 실행한다(`inProcessDocRunner`). 운영 기본은 항상 샌드박스(`sandboxedDocRunner`)이고, macOS가 아니면 `doc_unavailable`.
+- 실런타임 확인: 실제 Claude·Codex 연결에서 "이 내용을 DOCX 보고서로"를 보내 칩으로 내려받아 Word·한글·미리보기에서 열리는지 본다(자동 시험은 녹화 재생).

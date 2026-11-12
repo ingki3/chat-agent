@@ -327,6 +327,11 @@ export type RunManagerOptions = {
   startSettings?: (userId: string) => StartSettings | null;
   /** The context builder's limits (#45): summary ratio, recent messages kept, reserve. Default DEFAULT_CONTEXT_OPTIONS. */
   context?: Partial<ContextOptions>;
+  /**
+   * Files the run made with `doc_create` (#49): those linked to its reply message (files/store.ts `generatedOf`).
+   * Each gets a download chip (`file_ref`) under the reply when the run ends.
+   */
+  generatedFiles?: (conversationId: string, messageId: string) => { id: string; name: string }[];
   /** The conversation's uploaded files for a fresh session's context (#45), from the file store (#22). */
   contextFiles?: (
     conversationId: string,
@@ -812,6 +817,7 @@ export class RunManager {
    */
   private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
     this.syncArtifactRefs(row, parts);
+    this.syncFileRefs(row, parts);
     if (!parts.some((p) => p.type === "finance_note")) {
       // This answer's finance results stay for the rest of the conversation's checks.
       try {
@@ -863,6 +869,26 @@ export class RunManager {
       } else continue;
       const i = at === -1 ? parts.length - 1 : at;
       const partIndex = parts.slice(0, i + 1).filter((p) => p.type !== "reasoning").length - 1;
+      this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part });
+    }
+  }
+
+  /**
+   * The reply's file chips (#49): one `file_ref` per file this run made with `doc_create` — taken from the file
+   * store (rows our tool wrote for this run's reply), never from the runtime's own report. Never breaks a reply.
+   */
+  private syncFileRefs(row: RunRow, parts: MessagePart[]): void {
+    let made: { id: string; name: string }[];
+    try {
+      made = this.opts.generatedFiles?.(row.conversationId, row.assistantMessageId) ?? [];
+    } catch {
+      return;
+    }
+    for (const f of made) {
+      if (parts.some((p) => p.type === "file_ref" && p.fileId === f.id)) continue;
+      const part: MessagePart = { type: "file_ref", fileId: f.id, name: f.name };
+      parts.push(part);
+      const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
       this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part });
     }
   }

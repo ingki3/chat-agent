@@ -30,16 +30,16 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-4.1 | 드래그·붙여넣기·첨부, 여러 파일 | #22 | E | 🟨 (#22 입력창 📎·끌어다 놓기·붙여넣기, 여러 파일, 첨부 칩(올리는 중·실패·✕), 새 대화는 첫 파일에 대화 생성, 보낸 메시지의 `file_ref` → 원본 내려받기, 올리는 중 뺀 칩은 끝나면 삭제, 보내지 않은 파일은 새로고침 뒤 칩으로 복원 — `e2e/files.spec.ts`. 머지 후 ✅) |
 | FR-4.2 | 지원 형식 | #22, #48, #23 | U | 🟨 (#22 받는 형식 PDF·HWP·HWPX·DOCX·XLSX·CSV·PPTX·TXT·MD·PNG·JPG(`FILE_KINDS`), 확장자 + 매직 바이트(ZIP 중앙 디렉터리·OLE `FileHeader`) 판별, 위장 확장자·SVG·HTML 거부(최선 판별 — 서빙은 항상 내려받기) — `files.test.ts`, 변이 시험 isolation.md. 추출은 #48·#23) |
 | FR-4.3 | 위치 정보와 함께 추출, 스캔 OCR | #48 | U | ⬜ |
-| FR-4.4 | HWP·HWPX 처리, 암호·배포용 거부, HWP 생성 제외 | #23, #49 | U, M | ⬜ |
+| FR-4.4 | HWP·HWPX 처리, 암호·배포용 거부, HWP 생성 제외 | #23, #49 | U, M | 🟨 (#49 HWP 생성 제외: `doc_create kind=hwp`는 `doc_hwp_unsupported` + 안내 문구(DOCX·PDF로) — `docgen.test.ts`·`e2e/docgen.spec.ts`. HWP 처리는 #23) |
 | FR-4.5 | 파일 인용 → 뷰어 위치 열기·강조 | #24 | E | ⬜ |
 | FR-4.6 | 크기·개수 한도, 업로드 전 안내 | #22 | I, E | 🟨 (#22 파일당 50MB·대화당 20개: 화면이 올리기 전에 칩에 알림, 서버가 `Content-Length`·스트리밍 중 크기(본문을 메모리에 모으지 않음)·한 문장 조건부 INSERT로 개수(동시 21개 → 20개) 재검사 — `files.test.ts`·`e2e/files.spec.ts`, 변이 시험. 머지 후 ✅) |
-| FR-4.7 | 에이전트가 만든 파일 내려받기 | #49, #22 | I | ⬜ (#22 원본 내려받기 경로 `GET /api/files/:id/content`(attachment·nosniff·샌드박스 CSP)는 올린 파일에 완료 — 에이전트가 만든 파일은 #49) |
+| FR-4.7 | 에이전트가 만든 파일 내려받기 | #49, #22 | I | 🟨 (#49 `doc_create`로 DOCX·XLSX·PPTX·PDF 생성(샌드박스 작업자) → 대화 파일로 저장(답 메시지에 연결) → 답의 내려받기 칩·`document` 아티팩트 → #22 원본 경로로 내려받기. 네 형식 fixture(열어서 제목·표·문단 확인), 두 런타임 녹화 재생, e2e 브라우저 내려받기 — `docgen.test.ts`·`e2e/docgen.spec.ts`. 머지 후 ✅) |
 | FR-5.1 | 번호 인용과 출처 목록 | #25, #50 | I, E | 🟨 (#50 `sources` 저장·`GET /api/conversations/:id/sources`(소유자만). #25 `cite` 번호(`[n]`)·서버 `citation_note`(실행 끝 `attachNoteTo` — 중지·복구 포함)·답변 아래 출처 목록(제목·사이트·날짜·URL·상태), 인용 없는 문단 "일부 내용에 출처 표시 없음"(제목·머리말·면책 제외) — `citation-runs.test.ts`·`e2e/citations.spec.ts`. 머지 후 ✅) |
 | FR-5.2 | 인용 구절 검증, 실패 ⚠️ | #50, #25 | U, I | 🟨 (#25 `cite {sourceId, snippet}` → 저장 본문과 대조(NFKC·따옴표·대시·공백·대소문자 정규화 후 통째 일치, 단어·숫자 경계, 8자 이상) → `verified`·`snippet_not_found`·`fetch_failed`·`unknown_source`(다른 대화·다른 사용자 — 범위는 토큰에서만), `citations` 표(0016). 실패는 화면 모든 경로에서 ⚠️ — `citations.test.ts`·`apps/web/test/citations.test.ts`, 변이 시험 36개 isolation.md) |
 | FR-5.3 | 미리보기, 원문 열기 | #25 | E | 🟨 (#25 데스크톱 hover·모바일 탭 → 상태·인용 구절·"원문 열기"(http(s)만, 새 창 `noopener`) — `e2e/citations.spec.ts` 두 프로젝트. 머지 후 ✅) |
 | FR-5.4 | 날짜 명시, 출처 충돌 표시 | #20, #25 | U, M | 🟨 (#20 공통 지침·오늘 날짜 주입. #25 충돌 fixture(두 출처 각각 인용) 두 런타임 재생, 지침 `common@2`·`research@2`. 실런타임 답변 확인은 `docs/evidence/citations/checklist.md` A) |
 | FR-5.5 | 자료 조사 모드 | #20, #25 | U, I, M | 🟨 (#20 대화별 토글 API·지침. #25 화면 토글 `ResearchToggle`(대화별, 서버 저장) → 다음 실행 `research@2` — `citation-runs.test.ts`·`e2e/citations.spec.ts`. 실런타임 "출처가 충분하지 않아요"는 체크리스트 B) |
-| FR-5.6 | 참고문헌 내보내기 | #26 | U | ⬜ |
+| FR-5.6 | 참고문헌 내보내기 | #26 | U | ⬜ (#49: 생성 문서 안의 `references` 블록(`[n]` 목록)만 — 내보내기 화면은 #26) |
 | FR-5.7 | 뉴스·실시간·요약 스킬 | #50, #21 | I, M | 🟨 (#21 `google-news-search-skill`, #50 `web_search`·`web_fetch`(샌드박스 작업자 + 공개 주소 송신 프록시, 두 런타임 대본 시험 `web-contract.test.ts`), 뉴스 결과 출처 등록. `news-search-skill`·`realtime-lookup-skill`·`summarize` 유튜브는 미룸 — `docs/skills.md`) |
 | FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. #28 오른쪽 패널(열 때만, 주소 `?artifact=`, 900px 이하 전체 화면·`main` inert)·대화 속 카드(`artifact_ref` — 서버가 그 run이 저장한 버전으로 붙임), `/a/:id`와 같은 보기 코드(`sandbox="allow-scripts"` 한 곳) — `e2e/artifact-panel.spec.ts` 데스크톱·모바일, `artifacts.test.ts`, 변이 시험 isolation.md. 머지 후 ✅) |
 | FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | 🟨 (#27 불변 `artifact_versions`(트리거)·되돌리기 = 복사한 새 버전, `POST /api/artifacts/:id/revert` — `artifacts.test.ts`·e2e. #28 패널의 버전 선택·되돌리기: 수정 요청 → v2 → v1 보기 → 되돌리기(v3 = v1 복원) — `e2e/artifact-panel.spec.ts`. 머지 후 ✅) |
