@@ -540,8 +540,21 @@ export class McpService {
    * The tools one user's run gets: echo_time, the web and artifact tools, the finance tools and the skills that
    * user may use (FR-1.6).
    */
-  toolNamesFor(userId: string): string[] {
-    return toolNames({ skills: this.skillsFor(userId), tools: this.toolsFor(userId) });
+  toolNamesFor(userId: string, skills?: readonly string[]): string[] {
+    const scope = skills ? { skills } : undefined;
+    return toolNames({ skills: this.skillsFor(userId, scope), tools: this.toolsFor(userId, scope) });
+  }
+
+  /**
+   * Whether a call of this run may use `skill` (#56): the user may (`allows`), and the run's skill scope — a
+   * schedule's selection — names it (no scope: any). Checked for the tool list and again at every call.
+   */
+  private mayUse(scope: Pick<ToolScope, "userId" | "skills">, skill: string): boolean {
+    return this.allows(scope.userId, skill) && (!scope.skills || scope.skills.includes(skill));
+  }
+
+  private mayUseAny(scope: Pick<ToolScope, "userId" | "skills">, skills: readonly string[]): boolean {
+    return skills.some((s) => this.mayUse(scope, s));
   }
 
   /**
@@ -566,11 +579,12 @@ export class McpService {
     return ALWAYS_ON_SKILLS.has(skill) || (this.opts.switches?.enabled(skill) ?? true);
   }
 
-  private toolsFor(userId: string): ServerToolInfo[] {
+  private toolsFor(userId: string, scope?: Pick<ToolScope, "skills">): ServerToolInfo[] {
+    const s = { userId, skills: scope?.skills };
     return [
       ...this.tools,
-      ...this.financeTools.filter((t) => this.allows(userId, t.skill)),
-      ...this.composedTools.filter((t) => this.allowsAny(userId, t.skills)),
+      ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
+      ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
   }
 
@@ -579,8 +593,8 @@ export class McpService {
     return skills.some((s) => this.allows(userId, s));
   }
 
-  private skillsFor(userId: string): BundledSkill[] {
-    return this.skills.filter((s) => this.allows(userId, s.name));
+  private skillsFor(userId: string, scope?: Pick<ToolScope, "skills">): BundledSkill[] {
+    return this.skills.filter((s) => this.mayUse({ userId, skills: scope?.skills }, s.name));
   }
 
   /** The PRD §7 catalogue with each skill's state here (the admin screen is #35). */
@@ -626,14 +640,19 @@ export class McpService {
       authenticate: (token) => {
         const s = this.tokens.verify(token);
         if (!s || !this.users.byId(s.userId)?.active) return undefined;
-        return { userId: s.userId, conversationId: s.conversationId, runId: s.runId };
+        return {
+          userId: s.userId,
+          conversationId: s.conversationId,
+          runId: s.runId,
+          ...(s.skills ? { skills: s.skills } : {}),
+        };
       },
       userName: (id) => {
         const u = this.users.byId(id);
         return u?.active ? u.name : undefined;
       },
       skills: this.skills,
-      skillsFor: (userId) => this.skillsFor(userId),
+      skillsFor: (userId, scope) => this.skillsFor(userId, scope),
       runSkill: async (name, input, scope) => {
         const t0 = now();
         const r = await this.call(byName.get(name), input, scope, runSkill);
@@ -663,7 +682,7 @@ export class McpService {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
       tools: [...this.tools, ...this.financeTools, ...this.composedTools],
-      toolsFor: (userId) => this.toolsFor(userId),
+      toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
         const composed = composedByName.get(name);
@@ -1038,7 +1057,7 @@ export class McpService {
     scope: ToolScope,
   ): Promise<SkillResult> {
     const finance = this.finance;
-    if (!finance || !this.allows(scope.userId, tool.skill)) return { ok: false, code: "finance_not_allowed" };
+    if (!finance || !this.mayUse(scope, tool.skill)) return { ok: false, code: "finance_not_allowed" };
     const parsed = z.strictObject(tool.input).safeParse(input);
     if (!parsed.success) return { ok: false, code: "finance_bad_input" };
     return (
@@ -1058,7 +1077,7 @@ export class McpService {
   private async callFinanceChart(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
     const finance = this.finance;
     const store = this.opts.artifacts;
-    if (!finance || !store || !this.allowsAny(scope.userId, FINANCE_CHART_TOOL.skills))
+    if (!finance || !store || !this.mayUseAny(scope, FINANCE_CHART_TOOL.skills))
       return { ok: false, code: "finance_not_allowed" };
     const parsed = z.strictObject(FINANCE_CHART_TOOL.input).safeParse(input);
     if (!parsed.success) return { ok: false, code: "finance_bad_input" };
@@ -1070,10 +1089,10 @@ export class McpService {
         async (tool, args) => {
           const t = byName.get(tool);
           // Checked again per call: a permission may change during the run.
-          if (!t || !this.allows(scope.userId, t.skill)) return { ok: false, code: "finance_not_allowed" };
+          if (!t || !this.mayUse(scope, t.skill)) return { ok: false, code: "finance_not_allowed" };
           return finance.run(t, args);
         },
-        (skill) => this.allows(scope.userId, skill),
+        (skill) => this.mayUse(scope, skill),
         (this.opts.finance?.now ?? Date.now)(),
       ),
     );
@@ -1112,11 +1131,13 @@ export class McpService {
    */
   private callWatchlist(input: Record<string, unknown>, scope: ToolScope): SkillResult {
     const store = this.opts.watchlist;
-    if (!store || !this.allowsAny(scope.userId, WATCHLIST_GET_TOOL.skills))
+    if (!store || !this.mayUseAny(scope, WATCHLIST_GET_TOOL.skills))
       return { ok: false, code: "finance_not_allowed" };
     if (!z.strictObject(WATCHLIST_GET_TOOL.input).safeParse(input).success)
       return { ok: false, code: "finance_bad_input" };
-    const markets = this.watchMarkets(scope.userId);
+    const markets = this.watchMarkets(scope.userId).filter((m) =>
+      this.mayUse(scope, m === "KR" ? "kr-stock-skill" : "us-stock-skill"),
+    );
     const items = store.list(scope.userId).filter((i) => markets.includes(i.market));
     return {
       ok: true,
@@ -1246,7 +1267,7 @@ export class McpService {
     runSkill: SkillRunner,
   ): Promise<SkillResult> {
     // Checked here as well as by the MCP server's tool list: the permission may have changed during the run.
-    if (!skill || !this.allows(scope.userId, skill.name)) return { ok: false, code: "skill_not_allowed" };
+    if (!skill || !this.mayUse(scope, skill.name)) return { ok: false, code: "skill_not_allowed" };
     const parsed = z.strictObject(skill.input).safeParse(input);
     // The schema, then the wrapper's own argument rules (e.g. a code that does not fit the command).
     if (!parsed.success || !skill.args(parsed.data as Record<string, unknown>))

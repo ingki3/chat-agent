@@ -216,3 +216,104 @@ test("수정: 권한이 빠진 스킬은 ‘사용할 수 없어요’로 보이
   const after = (await (await page.request.get(`/api/schedules/${id}`)).json()) as { skills: string[] };
   expect(after.skills).toEqual(["us-stock-skill"]);
 });
+
+/** Presses "바로 실행" through the API and waits for the run's end; returns the schedule as it is then. */
+async function runToEnd(page: import("@playwright/test").Page, baseURL: string, id: string) {
+  const r = await page.request.post(`/api/schedules/${id}/run`, { headers: csrf(baseURL) });
+  expect(r.status()).toBe(201);
+  await expect
+    .poll(
+      async () => {
+        const runs = (await (await page.request.get(`/api/schedules/${id}/runs`)).json()) as {
+          runs: { status: string; resultSavedAt: number | null }[];
+        };
+        return runs.runs[0]?.status === "succeeded" && runs.runs[0].resultSavedAt !== null;
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  return (await (await page.request.get(`/api/schedules/${id}`)).json()) as { conversationId: string };
+}
+
+test("새 결과: 알림이 꺼져 있고 예약 화면이 닫혀 있어도 사이드바에 뜬다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schednew");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: {
+        name: "조용한 예약",
+        prompt: "조용히",
+        timing: { type: "daily", time: "08:00" },
+        notify: false,
+      },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  // On another conversation, with no push.
+  const other = (await (
+    await page.request.post("/api/conversations", { data: {}, headers: csrf(baseURL!) })
+  ).json()) as { id: string };
+  await page.clock.install();
+  await page.goto(`/c/${other.id}`);
+  await expect(page.getByTestId("sidebar")).toBeAttached();
+  await runToEnd(page, baseURL!, s.id);
+  // Nothing happens on the page (no focus change, no push): the list is looked at again every minute while visible.
+  await page.clock.fastForward(61_000);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "조용한 예약" });
+  await expect(conv.getByTestId("new-result")).toBeVisible();
+  const inbox = (await (await page.request.get("/api/notifications")).json()) as { items: unknown[] };
+  expect(inbox.items).toHaveLength(0);
+});
+
+test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlink");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 예약", prompt: "결과 하나", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as {
+      items: { kind: string; url: string }[];
+    }
+  ).items;
+  const url = items.find((n) => n.kind === "schedule_succeeded")!.url;
+  expect(url).toMatch(new RegExp(`^/c/${conversationId}#m-`));
+  // 51 more turns: the result is no longer in the newest page of messages (100).
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `이어서 ${i}` },
+      headers: csrf(baseURL!),
+    });
+    expect(sent.status()).toBe(201);
+    await expect
+      .poll(
+        async () =>
+          (
+            (await (await page.request.get(`/api/conversations/${conversationId}/active-run`)).json()) as {
+              run: unknown;
+            }
+          ).run,
+        { timeout: 10_000, intervals: [20, 50, 100] },
+      )
+      .toBeNull();
+  }
+  await page.goto(url);
+  const target = page.locator(`#${url.split("#")[1]}`);
+  await expect(target).toBeInViewport({ timeout: 10_000 });
+  await expect(target).toContainText("결과 하나");
+});

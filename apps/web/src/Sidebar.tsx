@@ -29,6 +29,9 @@ export function Sidebar({
     queryFn: ({ pageParam }) => conversations.list(query, pageParam),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
+    // A schedule's "새 결과" (#56) shows without a push (push or the schedule's notification may be off): looked at
+    // every minute while the page is visible, and again when it is shown or focused (the client's default).
+    refetchInterval: 60_000,
   });
   const items = list.data?.pages.flatMap((p) => p.items);
   const pinned = items?.filter((c) => c.pinned) ?? [];

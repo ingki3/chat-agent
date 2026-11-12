@@ -127,15 +127,23 @@ export function safePath(url: string | undefined): string {
   }
 }
 
-/** "오전 8:00" in the schedule's zone (a bad zone: Seoul). */
-function clock(at: number, timeZone: string): string {
-  const fmt = (tz: string) =>
-    new Intl.DateTimeFormat("ko-KR", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(at);
+/**
+ * "오전 8:00" in the schedule's zone (a bad zone: Seoul). Written by hand from the numeric parts, so it reads the same
+ * whatever the server's ICU data or locale (review #116: a small-ICU Node formats ko-KR as "8:00 AM").
+ */
+export function clock(at: number, timeZone: string): string {
+  const parts = (tz: string) =>
+    new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(at)
+      .reduce<Record<string, string>>((o, p) => ({ ...o, [p.type]: p.value }), {});
+  let p: Record<string, string>;
   try {
-    return fmt(timeZone);
+    p = parts(timeZone);
   } catch {
-    return fmt("Asia/Seoul");
+    p = parts("Asia/Seoul");
   }
+  const h = Number(p.hour) % 24;
+  return `${h < 12 ? "오전" : "오후"} ${h % 12 || 12}:${p.minute}`;
 }
 
 const won = (n: number) => `$${n.toFixed(2)}`;

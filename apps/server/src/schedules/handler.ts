@@ -149,12 +149,7 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
     const conversationId = this.conversationFor(row);
     // The schedule's runtime·model·effort, checked for its owner as an explicit choice of a run (403 → not_allowed):
     // a schedule never runs with more than its creator may use now.
-    const choice: RunChoice = {
-      runtime: row.runtime,
-      model: row.model,
-      ...(row.effort ? { effort: row.effort } : {}),
-      ...(row.use_shared ? { useShared: true } : {}),
-    };
+    const choice: RunChoice = { runtime: row.runtime, ...scheduleRequest(row) };
     const prompt = scrubKnown(row.prompt);
     let chat: ChatRunRow;
     try {
@@ -164,6 +159,9 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
         idempotencyKey: attemptKey(ctx.runId, ctx.attempt),
         choice,
         purpose: "schedule",
+        // Only the selected skills (FR-8.2), and of those only what the owner may use at each call (the MCP server
+        // checks the user's permissions and the server allow-list too): an empty selection is no skill at all.
+        skills: JSON.parse(row.skills) as string[],
         inputText: prompt,
         prepare: (divider) => {
           const turn = this.retryTarget(ctx.runId, conversationId);
@@ -349,6 +347,15 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
   }
 }
 
+/**
+ * What a schedule's run asks for — the same for the run and for the connection warning, so both resolve the same
+ * connection. `useShared` is always explicit: a schedule set back to personal never inherits the conversation's
+ * earlier "공용으로 쓰기" (review #116).
+ */
+export function scheduleRequest(row: ScheduleRow): Omit<RunChoice, "runtime"> {
+  return { model: row.model, ...(row.effort ? { effort: row.effort } : {}), useShared: !!row.use_shared };
+}
+
 /** Whether `row`'s next run would find a usable runtime and connection for its owner (FR-11.8). */
 export function scheduleUsable(
   row: ScheduleRow,
@@ -362,11 +369,7 @@ export function scheduleUsable(
       userId: row.owner_id,
       runtime: adapter.id,
       capabilities: caps,
-      requested: {
-        model: row.model,
-        ...(row.effort ? { effort: row.effort } : {}),
-        ...(row.use_shared ? { useShared: true } : {}),
-      },
+      requested: scheduleRequest(row),
       current: { model: null, effort: null },
     });
     return !caps.needsConnection || s.connectionId !== null;

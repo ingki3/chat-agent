@@ -17,6 +17,7 @@ import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { defaultScript, FakeRuntime, type FakeScript, type FakeStep } from "../src/runtime/fake.js";
 import type { ScheduleHandler, ScheduleRunContext } from "../src/schedules/engine.js";
 import { RuntimeScheduleHandler } from "../src/schedules/handler.js";
+import { clock } from "../src/notifications/compose.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { createFamily, type Family } from "./helpers/permission-matrix.js";
 
@@ -57,15 +58,19 @@ async function world(
     script?: FakeScript;
     wrap?: Wrap;
     needsConnection?: boolean;
+    runTools?: boolean;
     runTimeoutMs?: number;
     family?: boolean;
   } = {},
 ) {
   const db = o.db ?? createTestDb();
   const runtimes = new RuntimeRegistry();
-  runtimes.register(
-    new FakeRuntime({ script: o.script ?? defaultScript, needsConnection: o.needsConnection ?? false }),
-  );
+  const runtime = new FakeRuntime({
+    script: o.script ?? defaultScript,
+    needsConnection: o.needsConnection ?? false,
+    ...(o.runTools ? { runTools: true } : {}),
+  });
+  runtimes.register(runtime);
   const box: { h?: ScheduleHandler } = {};
   const handler: ScheduleHandler = {
     execute: (c) => box.h!.execute(c),
@@ -91,7 +96,7 @@ async function world(
   box.h = o.wrap ? o.wrap(inner) : inner;
   await app.ready();
   const f = o.family === false ? undefined : await createFamily(app);
-  return { app, db, f, inner, ...helpers(app, db, f) };
+  return { app, db, f, inner, runtime, ...helpers(app, db, f) };
 }
 
 function helpers(app: FastifyInstance, db: Db, f: Family | undefined) {
@@ -523,6 +528,16 @@ describe("connection warning before the next run (FR-11.8)", () => {
   });
 });
 
+describe("the warning's time (locale-independent, review #116)", () => {
+  it("reads 오전/오후 h:mm in the schedule's zone whatever the server locale", () => {
+    expect(clock(Date.UTC(2026, 10, 13, 0, 0), "Asia/Seoul")).toBe("오전 9:00");
+    expect(clock(Date.UTC(2026, 10, 13, 3, 5), "Asia/Seoul")).toBe("오후 12:05");
+    expect(clock(Date.UTC(2026, 10, 13, 15, 0), "Asia/Seoul")).toBe("오전 12:00");
+    expect(clock(Date.UTC(2026, 10, 13, 13, 30), "America/New_York")).toBe("오전 8:30");
+    expect(clock(Date.UTC(2026, 10, 13, 0, 0), "Mars/Base")).toBe("오전 9:00");
+  });
+});
+
 describe("known secrets (#78)", () => {
   it("the result, the failure reason and the notification carry no known secret — also one registered after storing", async () => {
     const early = `sk-early-${crypto.randomBytes(12).toString("base64url")}`;
@@ -547,5 +562,153 @@ describe("known secrets (#78)", () => {
     expect(all).not.toContain(early);
     expect(all).not.toContain(late);
     expect(t.notes(t.f!.users.owner.id)).toHaveLength(1);
+  });
+});
+
+const CLAUDE_KEY = `sk-ant-SCHEDRUNFAKE${"c".repeat(24)}`;
+
+describe("the schedule's own settings, never more (review #116)", () => {
+  it("useShared is the schedule's: set back to personal, the run uses the personal connection; the warning agrees", async () => {
+    const t = await world({ needsConnection: true, script: () => reply("ok") });
+    const store = t.app.connections!.store;
+    const connect = (personal: boolean) => {
+      const c = store.create({
+        runtime: "claude-code",
+        authType: "api_key",
+        scope: personal ? "personal" : "shared",
+        owner: personal ? t.f!.users.owner : null,
+        createdBy: t.f!.users.admin.id,
+        secret: CLAUDE_KEY,
+      });
+      store.setTestResult(c.id, "passed", "ok", 1);
+      return c;
+    };
+    const mine = connect(true);
+    const shared = connect(false);
+    const made = Schedule.parse(
+      (await t.req("owner", "POST", "/api/schedules", { ...create, useShared: true })).json(),
+    );
+    expect(made.settings.useShared).toBe(true);
+    const runOnce = async () => {
+      const r = ScheduleRun.parse((await t.req("owner", "POST", `/api/schedules/${made.id}/run`)).json().run);
+      await until(() => t.finished(r.id) && t.runRow(r.id).notified_at !== null);
+      return r;
+    };
+    const first = await runOnce();
+    const convId = t.app.schedules!.store.byId(made.id)!.conversation_id!;
+    const connOf = (runId: string) =>
+      (
+        t.sql.prepare(`select connection_id as c from runs where id = ?`).get(t.runRow(runId).output_ref) as {
+          c: string;
+        }
+      ).c;
+    expect(connOf(first.id)).toBe(shared.id);
+    // The conversation now remembers "공용으로 쓰기"; the schedule is set back to personal.
+    expect(t.app.conversations!.get(convId)!.useShared).toBe(true);
+    const patched = await t.req("owner", "PATCH", `/api/schedules/${made.id}`, { useShared: false });
+    expect(patched.statusCode).toBe(200);
+    const second = await runOnce();
+    expect(t.runRow(second.id).status).toBe("succeeded");
+    expect(connOf(second.id)).toBe(mine.id);
+    // Shared access revoked while the schedule asks for it: the warning and the run say the same (both refused).
+    await t.req("owner", "PATCH", `/api/schedules/${made.id}`, { useShared: true });
+    t.app.connections!.store.setPolicy(t.f!.users.owner.id, {
+      runtime: "claude-code",
+      allowed: true,
+      models: "all",
+      efforts: "all",
+      allowPersonal: true,
+      allowShared: false,
+    });
+    const row = t.app.schedules!.store.byId(made.id)!;
+    expect(t.app.schedules!.warnings!.check(row.next_run_at! - 600_000)).toBe(1);
+    const third = await runOnce();
+    expect(t.runRow(third.id)).toMatchObject({ status: "failed", error_code: "not_allowed" });
+    // And back to personal: usable for both.
+    await t.req("owner", "PATCH", `/api/schedules/${made.id}`, { useShared: false });
+    t.sql.prepare(`update schedules set next_run_at = next_run_at + 86400000 where id = ?`).run(made.id);
+    const next = t.app.schedules!.store.byId(made.id)!.next_run_at!;
+    expect(t.app.schedules!.warnings!.check(next - 600_000)).toBe(0);
+    const fourth = await runOnce();
+    expect(t.runRow(fourth.id).status).toBe("succeeded");
+    expect(connOf(fourth.id)).toBe(mine.id);
+  });
+
+  it("only the selected skills, of those only what the owner may use now — in the tool list and at the call", async () => {
+    const t = await world({
+      runTools: true,
+      script: (input) =>
+        input.text === "call kr"
+          ? [{ call: "kr_quote", input: { code: "005930" } }, { text: "done" }]
+          : reply("ok"),
+    });
+    const make = async (skills: string[], prompt = "x") => {
+      const r = await t.req("owner", "POST", "/api/schedules", { ...create, prompt, skills });
+      expect(r.statusCode).toBe(201);
+      return Schedule.parse(r.json());
+    };
+    const runOf = async (made: Schedule) => {
+      const r = ScheduleRun.parse((await t.req("owner", "POST", `/api/schedules/${made.id}/run`)).json().run);
+      await until(() => t.finished(r.id));
+      return { tools: t.runtime.contexts.at(-1)!.tools, made, run: r };
+    };
+    const toolsOf = async (skills: string[], prompt = "x") => runOf(await make(skills, prompt));
+    const finance = (tools: string[]) => tools.filter((x) => /^(kr|us|sec|dart)_|^finance_chart$/.test(x));
+    // Nothing selected: no skill and no finance tool (the built-in tools stay).
+    const none = await toolsOf([]);
+    expect(finance(none.tools)).toEqual([]);
+    expect(none.tools.filter((x) => x.startsWith("skill_"))).toEqual([]);
+    expect(none.tools).toContain("artifact_create");
+    // US only: the us_* tools and the chart, no Korean ones.
+    const us = await toolsOf(["us-stock-skill"]);
+    expect(finance(us.tools).some((x) => x.startsWith("us_"))).toBe(true);
+    expect(finance(us.tools).some((x) => x.startsWith("kr_"))).toBe(false);
+    // A direct call of a tool outside the selection is refused (the MCP server checks the run's scope).
+    const direct = await toolsOf(["us-stock-skill"], "call kr");
+    const convId = t.app.schedules!.store.byId(direct.made.id)!.conversation_id!;
+    const result = t
+      .messagesOf(convId)
+      .at(-1)!
+      .parts.find((p) => p.type === "tool_result");
+    expect(result).toMatchObject({ isError: true });
+    // Not even offered on the MCP server for this run's token.
+    expect(JSON.stringify(result)).toContain("Tool kr_quote not found");
+    // A permission taken away before the run is honoured: Korean selected but no longer allowed.
+    const krMade = await make(["kr-stock-skill"]);
+    t.sql
+      .prepare(`update users set permissions = ? where id = ?`)
+      .run(
+        JSON.stringify({ runtimes: ["claude-code", "codex"], models: "all", skills: ["us-stock-skill"] }),
+        t.f!.users.owner.id,
+      );
+    const kr = await runOf(krMade);
+    expect(finance(kr.tools)).toEqual([]);
+    // And checked again at the call (a permission or scope that changes between the list and the call).
+    type Host = {
+      runTool(n: string, i: object, s: object): Promise<{ ok: boolean; code?: string }>;
+      runSkill(n: string, i: object, s: object): Promise<{ ok: boolean; code?: string }>;
+    };
+    // Every skill allowed again: only the scope refuses now.
+    t.sql
+      .prepare(`update users set permissions = ? where id = ?`)
+      .run(
+        JSON.stringify({ runtimes: ["claude-code", "codex"], models: "all", skills: "all" }),
+        t.f!.users.owner.id,
+      );
+    const host = (t.app.mcp as unknown as { host(): Host }).host();
+    const scope = { userId: t.f!.users.owner.id, conversationId: convId, runId: "r" };
+    expect(
+      await host.runTool("kr_quote", { code: "005930" }, { ...scope, skills: ["us-stock-skill"] }),
+    ).toEqual({
+      ok: false,
+      code: "finance_not_allowed",
+    });
+    expect(await host.runSkill("selftest", { text: "a" }, { ...scope, skills: [] })).toEqual({
+      ok: false,
+      code: "skill_not_allowed",
+    });
+    expect(
+      (await host.runSkill("selftest", { text: "a" }, { ...scope, skills: ["selftest"] })).code,
+    ).not.toBe("skill_not_allowed");
   });
 });

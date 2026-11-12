@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import {
   publicParts,
   type ChangeSettingsRequest,
@@ -214,17 +214,24 @@ export function ChatPage() {
       })
       .catch(() => {});
   }, [newResult, id, qc]);
-  // A notification's link to the result message (`#m-<id>`, FR-8.4): shown once the messages are there.
-  const loaded = !!list;
+  // A notification's link to the result message (`#m-<id>`, FR-8.4): older pages are loaded until it is there (a
+  // result followed by many turns), then it is scrolled to — once per link.
+  const { hash } = useLocation();
+  const target = hash.startsWith("#m-") ? hash.slice(3) : null;
+  const found = !!target && !!list?.some((m) => m.id === target);
+  const { hasNextPage, isFetchingNextPage, fetchNextPage } = messages;
   const scrolledTo = useRef<string | null>(null);
   useEffect(() => {
-    const hash = window.location.hash;
-    if (!loaded || !hash.startsWith("#m-") || scrolledTo.current === hash) return;
-    const el = document.getElementById(hash.slice(1));
+    if (!target || !list || scrolledTo.current === `${id}${hash}`) return;
+    if (!found) {
+      if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
+      return;
+    }
+    const el = document.getElementById(`m-${target}`);
     if (!el) return;
-    scrolledTo.current = hash;
+    scrolledTo.current = `${id}${hash}`;
     el.scrollIntoView({ block: "start" });
-  }, [loaded, id]);
+  }, [target, found, list, hasNextPage, isFetchingNextPage, fetchNextPage, id, hash]);
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);

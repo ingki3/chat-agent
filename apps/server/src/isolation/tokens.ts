@@ -6,7 +6,17 @@ import { knownSecrets } from "../secrets/known.js";
  * conversation and one run, and dies with the run. The MCP server resolves every tool call through `verify`
  * and must refuse resources outside `scope.conversationId` (`allows`).
  */
-export type McpScope = { userId: string; conversationId: string; runId: string; expiresAt: number };
+export type McpScope = {
+  userId: string;
+  conversationId: string;
+  runId: string;
+  expiresAt: number;
+  /**
+   * A narrower skill scope (#56): the only skills this run may use (a schedule's selection). Absent: every skill the
+   * user may use. It never widens anything — the user's own permissions are checked as well.
+   */
+  skills?: readonly string[] | undefined;
+};
 type Entry = McpScope & { token: string };
 
 export class McpTokens {
@@ -35,7 +45,13 @@ export class McpTokens {
       knownSecrets.remove(s.token);
       return undefined;
     }
-    return { userId: s.userId, conversationId: s.conversationId, runId: s.runId, expiresAt: s.expiresAt };
+    return {
+      userId: s.userId,
+      conversationId: s.conversationId,
+      runId: s.runId,
+      expiresAt: s.expiresAt,
+      ...(s.skills ? { skills: [...s.skills] } : {}),
+    };
   }
 
   /** True only for the token's own conversation (and its own user). */

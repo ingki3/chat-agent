@@ -12,7 +12,13 @@ export const MCP_PATH = "/mcp";
 export const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Who a call is for — resolved from the run-scoped token on every request (isolation/tokens.ts, #42). */
-export type ToolScope = { userId: string; conversationId: string; runId: string };
+export type ToolScope = {
+  userId: string;
+  conversationId: string;
+  runId: string;
+  /** The run's narrower skill scope (#56: a schedule's selection); absent = every skill the user may use. */
+  skills?: readonly string[] | undefined;
+};
 
 /** An allow-listed skill as the MCP server sees it; how it runs (sandboxed process) is the host's business. */
 export type SkillInfo = {
@@ -41,7 +47,7 @@ export type McpHost = {
    * The skills one user may use right now (FR-1.6). Only these are listed and callable on that user's requests;
    * `runSkill` checks again (a permission can change while a run is going).
    */
-  skillsFor(userId: string): readonly SkillInfo[];
+  skillsFor(userId: string, scope?: ToolScope): readonly SkillInfo[];
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
   /** Told about every answered tool call (the connection test #17 checks that our server really served them). */
   onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
@@ -51,7 +57,7 @@ export type McpHost = {
    * The host's tools one user may use right now (finance tools follow the user's skill permissions, #30). Default:
    * all of `tools`. `runTool` checks again.
    */
-  toolsFor?(userId: string): readonly ServerToolInfo[];
+  toolsFor?(userId: string, scope?: ToolScope): readonly ServerToolInfo[];
   runTool?(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
 };
 
@@ -101,7 +107,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     },
   );
 
-  for (const tool of host.toolsFor?.(scope.userId) ?? host.tools ?? []) {
+  for (const tool of host.toolsFor?.(scope.userId, scope) ?? host.tools ?? []) {
     server.registerTool(
       tool.name,
       { description: tool.description, inputSchema: z.strictObject(tool.input) },
@@ -115,7 +121,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     );
   }
 
-  for (const skill of host.skillsFor(scope.userId)) {
+  for (const skill of host.skillsFor(scope.userId, scope)) {
     server.registerTool(
       skillToolName(skill.name),
       // Strict: an argument the skill does not define is refused, not silently dropped.

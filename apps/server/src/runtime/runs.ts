@@ -114,6 +114,8 @@ type Live = {
   attempt: number;
   /** What the run's usage is recorded as (#44): `chat`, or `schedule` for scheduled runs (#33). */
   purpose: UsagePurpose;
+  /** A narrower skill scope (#56: a schedule's selection) for the tool list and the MCP token; absent = the user's. */
+  skills?: readonly string[] | undefined;
   /** The last usage report of each attempt (last one wins, see `UsageReport`) — the log record's totals (#46). */
   usage: Map<number, UsageReport>;
   /** Open tool calls: name and start time, for the tool's duration. */
@@ -295,7 +297,8 @@ export type RunManagerOptions = {
   mcp?: {
     endpoint(): Promise<{ url: string }>;
     toolNames(): string[];
-    toolNamesFor(userId: string): string[];
+    /** `skills`: the run's narrower skill scope (#56), if any. */
+    toolNamesFor(userId: string, skills?: readonly string[]): string[];
   };
   /** Token store shared with the MCP server. Default: a private one (then no MCP server can check its tokens). */
   mcpTokens?: McpTokens;
@@ -470,6 +473,11 @@ export class RunManager {
     choice?: RunChoice | undefined;
     /** What its usage is recorded as (#44). Default `chat`; scheduled runs (#33) pass `schedule`. */
     purpose?: UsagePurpose | undefined;
+    /**
+     * Only these skills for this run (#56: a schedule's selection) — its tool list and its MCP token; the user's own
+     * permissions still apply. Absent: every skill the user may use.
+     */
+    skills?: readonly string[] | undefined;
     /** The reply being regenerated (#19): its runtime and model, used only when the conversation has no settings. */
     previous?: { runtime: RuntimeId | null; model: string | null; effort: string | null } | undefined;
     /**
@@ -623,6 +631,7 @@ export class RunManager {
         settled: false,
         attempt: 0,
         purpose: input.purpose ?? "chat",
+        ...(input.skills ? { skills: [...input.skills] } : {}),
         usage: new Map(),
         tools: new Map(),
         scrub: { text: new StreamScrubber(), reasoning: new StreamScrubber() },
@@ -1318,7 +1327,7 @@ export class RunManager {
     const caps = adapter.capabilities();
     const mcp = caps.usesTools || caps.runTools ? this.opts.mcp : undefined;
     // Per user: a skill the user may not use is not even offered (and the MCP server refuses it anyway).
-    const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId)) : [];
+    const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId, live.skills)) : [];
     // The same instructions for every runtime (#20): built per run from the user, the conversation and the tools.
     const user = this.db.select({ youth: users.youth }).from(users).where(eq(users.id, run.userId)).get();
     const instructions = assembleInstructions({
@@ -1359,6 +1368,7 @@ export class RunManager {
           userId: run.userId,
           conversationId: run.conversationId,
           runId: run.id,
+          ...(live.skills ? { skills: live.skills } : {}),
         }),
       };
     }
