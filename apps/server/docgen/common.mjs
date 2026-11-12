@@ -104,9 +104,16 @@ export const VOLUME = {
   docx: { line: 1, cell: 3, image: (kb) => 0.1 * kb, max: 120_000 },
   // Units ≈ 12 KB: a picture 1 a KB (exceljs holds ~12 bytes per byte of each placement), lines and cells little.
   xlsx: { line: 0.02, cell: 0.25, image: (kb) => kb, max: 34_000 },
-  // Units ≈ 1 MB: pdfkit's cost of a picture grows faster than its size (a 9 MB PNG 340 MB, 2.4 MB ones ~50 MB
-  // each), so 20 a MB plus 2 a MB²; pages are written out as they end, so lines and cells cost little.
-  pdf: { line: 0.0005, cell: 0.007, image: (kb) => 20 * (kb / 1024) + 2 * (kb / 1024) ** 2, max: 450 },
+  // Units ≈ 1 MB. A JPEG is embedded as its compressed bytes (never decoded): about 10–15 MB per MB of file per
+  // placement, counted 16. A PNG costs more than its size (pdfkit reads it whole — a 9 MB PNG took 340 MB, 2.4 MB ones
+  // ~50 MB each — and decodes it when it has alpha, transparency, 16 bits or interlacing): 20 a MB plus 2 a MB².
+  // Pages are written out as they end, so lines and cells cost little.
+  pdf: {
+    line: 0.0005,
+    cell: 0.007,
+    image: (kb, img) => (img.kind === "jpg" ? 16 * (kb / 1024) : 20 * (kb / 1024) + 2 * (kb / 1024) ** 2),
+    max: 450,
+  },
 };
 
 const linesOf = (t) => (t ? t.split("\n").length : 1);
@@ -130,7 +137,7 @@ export function volumeOf(doc, images, w) {
     }
     if (b.type === "image") {
       const img = images.get(b.fileId);
-      if (img) v += w.image(Math.ceil(img.buf.length / 1024));
+      if (img) v += w.image(Math.ceil(img.buf.length / 1024), img);
     }
   }
   return v;

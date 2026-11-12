@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import crypto from "node:crypto";
 import zlib from "node:zlib";
 import type ExcelJSType from "exceljs";
 import type JSZipType from "jszip";
@@ -155,6 +156,24 @@ export function pngRgba(w: number, h: number): Buffer {
     chunk("IDAT", raw),
     chunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+/**
+ * A JPEG of `bytes` bytes that says it is `w × h`: real markers (SOI, APP0, SOF0, SOS, EOI) around random scan data.
+ * Nothing here decodes it (the worker reads the frame header; pdfkit embeds the bytes as they are).
+ */
+export function jpegOfSize(w: number, h: number, bytes: number): Buffer {
+  const seg = (marker: number, body: number[]) =>
+    Buffer.from([0xff, marker, (body.length + 2) >> 8, (body.length + 2) & 0xff, ...body]);
+  const head = Buffer.concat([
+    Buffer.from([0xff, 0xd8]),
+    seg(0xe0, [0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]),
+    seg(0xc0, [8, h >> 8, h & 0xff, w >> 8, w & 0xff, 3, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1]),
+    seg(0xda, [3, 1, 0, 2, 0x11, 3, 0x11, 0, 0x3f, 0]),
+  ]);
+  const scan = crypto.randomBytes(bytes - head.length - 2);
+  for (let i = 0; i < scan.length; i++) if (scan[i] === 0xff) scan[i] = 0xfe;
+  return Buffer.concat([head, scan, Buffer.from([0xff, 0xd9])]);
 }
 
 /** A PNG whose header claims `w × h` (the pixels are not there): for the picture-size limit. */

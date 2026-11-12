@@ -15,7 +15,7 @@ import {
 } from "../src/docgen/runner.js";
 import { WORKER_CODES } from "../src/docgen/service.js";
 import { DOC_FIXTURE } from "../src/runtime/fake-docs.js";
-import { png, pngRgba, readPdfItems, readPptx } from "./helpers/doc-parse.js";
+import { jpegOfSize, png, pngRgba, readPdfItems, readPptx } from "./helpers/doc-parse.js";
 import { emOf, graphemesOf, overflows, tableColumns } from "./helpers/pptx-fit.js";
 
 // Documents are made for real (fonts, layout, zip) and re-read: generous under a busy machine.
@@ -548,6 +548,30 @@ describe("size caps (memory of the sandbox): PPTX 500 slides and a volume cap, P
     expect(volumeOf(placed(3), one, VOLUME.xlsx)).toBeLessThan(VOLUME.xlsx.max);
     expect(volumeOf(placed(1), one, VOLUME.pdf)).toBeLessThan(VOLUME.pdf.max);
   });
+  it("PDF: a photo report — three 5.5 MiB JPEGs (embedded as they are) — is made; JPEGs cost linearly per placement", async () => {
+    const photo = jpegOfSize(3200, 2400, Math.round(5.53 * 1024 * 1024));
+    const images = Object.fromEntries(
+      [0, 1, 2].map((i) => [`p${i}`, { kind: "jpg" as const, data: photo.toString("base64") }]),
+    );
+    const doc: DocContent = {
+      title: "사진 보고서",
+      blocks: [0, 1, 2].flatMap((i) => [
+        { type: "heading" as const, text: `사진 ${i + 1}` },
+        { type: "image" as const, fileId: `p${i}`, caption: `현장 사진 ${i + 1}` },
+      ]),
+    };
+    const r = await runner({ kind: "pdf", doc, images });
+    expect(r.ok, JSON.stringify(r.ok ? {} : r)).toBe(true);
+    if (r.ok) expect(r.checks.pages).toBe(3);
+    const { VOLUME } = (await import(path.join(DOC_WORKER_DIR, "common.mjs"))) as {
+      VOLUME: { pdf: { image(kb: number, img: { kind: string }): number; max: number } };
+    };
+    const kb = 5.53 * 1024;
+    // Linear for JPEG (twice the placements, twice the cost); a PNG of the same size costs more and grows faster.
+    expect(VOLUME.pdf.image(2 * kb, { kind: "jpg" })).toBeCloseTo(2 * VOLUME.pdf.image(kb, { kind: "jpg" }));
+    expect(VOLUME.pdf.image(kb, { kind: "png" })).toBeGreaterThan(VOLUME.pdf.image(kb, { kind: "jpg" }));
+    expect(3 * VOLUME.pdf.image(kb, { kind: "jpg" })).toBeLessThan(VOLUME.pdf.max);
+  }, 120_000);
   it("the service passes the worker's layout refusal on (doc_too_large, not doc_failed)", async () => {
     // Every code the worker files can give is on the service's list.
     const codes = new Set<string>();
