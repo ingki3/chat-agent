@@ -4,7 +4,14 @@ import { Link } from "react-router";
 import type { ScheduleProposal } from "@agentlee/shared";
 import { ApiError, errorText, schedules, SCHEDULES_KEY } from "../api.js";
 import { chipLabel } from "../chat/chip.js";
-import { changedProposal, timingText, whenText } from "./format.js";
+import {
+  cardNotice,
+  changedProposal,
+  timingText,
+  whenText,
+  type CardEvent,
+  type CardNotice,
+} from "./format.js";
 
 export const proposalKey = (id: string) => ["schedule-proposal", id] as const;
 
@@ -21,22 +28,33 @@ export function ScheduleCard({ id }: { id: string }) {
     qc.setQueryData(proposalKey(id), p);
     void qc.invalidateQueries({ queryKey: SCHEDULES_KEY });
   };
-  // Set when the card changed under the user (409 `proposal_changed`): the refreshed card is shown with a note and
-  // must be pressed again — never made with something the user did not see (review #108).
-  const [changed, setChanged] = useState(false);
+  // The card's one message, from its last action (`cardNotice`): "changed" when the card changed under the user (409
+  // `proposal_changed`, the refreshed card is shown and must be pressed again — review #108), or an error. Every
+  // new action starts without the previous one's message.
+  const [notice, setNotice] = useState<CardNotice>(null);
+  const on = (e: CardEvent) => setNotice((n) => cardNotice(n, e));
   const confirm = useMutation({
     mutationFn: (version: string) => schedules.confirm(id, version),
-    onMutate: () => setChanged(false),
-    onSuccess: (r) => done(r.proposal),
+    onMutate: () => on({ type: "start" }),
+    onSuccess: (r) => {
+      on({ type: "ok" });
+      done(r.proposal);
+    },
     onError: (e) => {
       const fresh = e instanceof ApiError ? changedProposal(e.body) : undefined;
-      if (fresh) {
-        qc.setQueryData(proposalKey(id), fresh);
-        setChanged(true);
-      }
+      if (fresh) qc.setQueryData(proposalKey(id), fresh);
+      on(fresh ? { type: "changed" } : { type: "error", error: e });
     },
   });
-  const dismiss = useMutation({ mutationFn: () => schedules.dismiss(id), onSuccess: done });
+  const dismiss = useMutation({
+    mutationFn: () => schedules.dismiss(id),
+    onMutate: () => on({ type: "start" }),
+    onSuccess: (p) => {
+      on({ type: "ok" });
+      done(p);
+    },
+    onError: (e) => on({ type: "error", error: e }),
+  });
   const p = q.data;
   const busy = confirm.isPending || dismiss.isPending;
   const headId = `sched-card-${id}`;
@@ -110,15 +128,15 @@ export function ScheduleCard({ id }: { id: string }) {
           <Link to={`/schedules/${encodeURIComponent(p.scheduleId)}`}>예약 화면에서 보기</Link>
         </p>
       )}
-      {changed && (
+      {notice?.kind === "changed" && (
         <p className="notice warn small" role="alert" data-testid="schedule-card-changed">
           그사이 기본 런타임·모델(또는 허용 범위)이 바뀌어 카드 내용을 새로 고쳤어요. 확인하고 다시 눌러
           주세요.
         </p>
       )}
-      {!changed && (confirm.error ?? dismiss.error) && (
-        <p className="error small" role="alert">
-          {errorText(confirm.error ?? dismiss.error)}
+      {notice?.kind === "error" && (
+        <p className="error small" role="alert" data-testid="schedule-card-error">
+          {errorText(notice.error)}
         </p>
       )}
     </section>

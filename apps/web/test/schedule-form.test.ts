@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ChatSettings, Schedule } from "@agentlee/shared";
 import { ChipChoice } from "../src/chat/chip.js";
 import { saveSchedule, skillRows, type FormValues } from "../src/schedules/form.js";
-import { changedProposal } from "../src/schedules/format.js";
+import { cardNotice, changedProposal, type CardEvent, type CardNotice } from "../src/schedules/format.js";
 
 /** Review #108: a save waits for the chip's choice; the skill rows keep a revoked skill visible to remove it. */
 
@@ -140,5 +140,24 @@ describe("a confirm refused because the card changed (review #108)", () => {
     expect(changedProposal({ error: "proposal_changed", proposal })).toEqual(proposal);
     expect(changedProposal({ error: "no_usable_runtime" })).toBeUndefined();
     expect(changedProposal(undefined)).toBeUndefined();
+  });
+});
+
+describe("the card's message (review #108 2차)", () => {
+  const run = (events: CardEvent[]) => events.reduce<CardNotice>(cardNotice, null);
+  it("a dismiss after a 409 clears “다시 눌러 주세요”; a failed dismiss shows its own error", () => {
+    expect(run([{ type: "start" }, { type: "changed" }])).toEqual({ kind: "changed" });
+    // 409, then 취소 succeeds: no stale "press again".
+    expect(run([{ type: "start" }, { type: "changed" }, { type: "start" }, { type: "ok" }])).toBeNull();
+    // 409, then 취소 fails: its error is shown (not hidden behind the old notice).
+    const err = new Error("dismiss failed");
+    expect(
+      run([{ type: "start" }, { type: "changed" }, { type: "start" }, { type: "error", error: err }]),
+    ).toEqual({
+      kind: "error",
+      error: err,
+    });
+    // A confirm error, then a new press: cleared while it is on its way.
+    expect(run([{ type: "error", error: err }, { type: "start" }])).toBeNull();
   });
 });

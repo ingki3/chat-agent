@@ -127,3 +127,26 @@ export function changedProposal(body: unknown): ScheduleProposal | undefined {
   const r = ProposalChangedResponse.safeParse(body);
   return r.success ? r.data.proposal : undefined;
 }
+
+/** The confirmation card's message: the card changed (press again), an error, or none. */
+export type CardNotice = { kind: "changed" } | { kind: "error"; error: unknown } | null;
+/** What happened to a confirm or dismiss of the card. */
+export type CardEvent =
+  { type: "start" } | { type: "ok" } | { type: "changed" } | { type: "error"; error: unknown };
+
+/**
+ * The card's message after an event (review #108): a new confirm or dismiss clears the last one's message (a
+ * dismiss after a 409 must not keep "다시 눌러 주세요"), its own outcome sets it — so a failed dismiss always shows
+ * its error.
+ */
+export function cardNotice(_prev: CardNotice, e: CardEvent): CardNotice {
+  switch (e.type) {
+    case "start":
+    case "ok":
+      return null;
+    case "changed":
+      return { kind: "changed" };
+    case "error":
+      return { kind: "error", error: e.error };
+  }
+}
