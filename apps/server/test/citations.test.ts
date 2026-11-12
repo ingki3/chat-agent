@@ -232,6 +232,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     // Prose punctuation without a digit on the other side stays a clause edge.
     expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
     expect(found("5. 다음 항목", "목록 끝은 4.\n5. 다음 항목")).toBe(true);
+    // A number starting a sentence after a real full stop verifies; the cost is limitation (i): a decimal whose
+    // point and digits extraction split with a space (`. 5%`) is read as a sentence end (round 24).
+    expect(found("3명이 다쳤다.", "차량이 충돌했다. 3명이 다쳤다.")).toBe(true);
+    expect(found("5% annual interest.", "The loan charges . 5% annual interest.")).toBe(true);
     expect(found("5명은 여성이었다.", "응답자 중 남자는 없었고,5명은 여성이었다.")).toBe(true);
   });
 
@@ -1511,6 +1515,24 @@ describe("citations and known secrets (#78)", () => {
     for (const row of g.db.select().from(citations).all()) {
       expect(row.snippetKey).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(row.snippetKey).toBe(snippetKey(row.snippet));
+    }
+  });
+
+  it("an old plaintext key that itself starts with sha256: is still hashed at startup (round 24)", () => {
+    for (const prefix of ["sha256:", "SHA256:"]) {
+      const f = family();
+      const scope = f.run(f.c.id);
+      const src = f.page(scope);
+      const secret = `review24-${crypto.randomBytes(9).toString("hex")}-key`;
+      const snippet = `${prefix}${secret} 메모리 가격 하락이 감소를 불렀다`;
+      const first = f.cites.cite(scope, { sourceId: src.id, snippet });
+      f.db.$client.prepare("update citations set snippet_key = ?").run(normalizeSnippet(snippet));
+      const again = new CitationStore(f.db);
+      const row = f.db.select().from(citations).get()!;
+      expect(row.snippetKey).toBe(snippetKey(snippet));
+      expect(row.snippetKey).not.toContain(secret);
+      expect(again.cite(scope, { sourceId: src.id, snippet }).n).toBe(first.n);
+      expect(again.forRun(scope.runId)).toHaveLength(1);
     }
   });
 

@@ -32,12 +32,19 @@ export const snippetKey = (snippet: string) =>
 
 export class CitationStore {
   constructor(private readonly db: Db) {
-    // Rows from before keys were hashed (round 23): hashed once, in place, from the stored snippet.
-    const old = db.$client
-      .prepare("select id, snippet from citations where snippet_key not like 'sha256:%'")
-      .all() as { id: string; snippet: string }[];
+    // Rows from before keys were hashed (round 23): every key is recomputed from its stored snippet and the ones
+    // that differ are replaced. No test on the stored key's form — an old plaintext key may itself start with
+    // `sha256:` (review #97 round 24). Citations are few, so this is cheap.
+    const rows = db.$client.prepare("select id, snippet, snippet_key as k from citations").all() as {
+      id: string;
+      snippet: string;
+      k: string;
+    }[];
     const set = db.$client.prepare("update citations set snippet_key = ? where id = ?");
-    for (const r of old) set.run(snippetKey(r.snippet), r.id);
+    for (const r of rows) {
+      const key = snippetKey(r.snippet);
+      if (r.k !== key) set.run(key, r.id);
+    }
   }
 
   /** Checks and registers one citation of the run; the same source and snippet twice keep their first number. */
