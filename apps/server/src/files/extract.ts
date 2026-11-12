@@ -39,7 +39,7 @@ import type { FileRow, FileStore } from "./store.js";
  */
 
 /** Bumped whenever the worker's output changes: rows of an older version are extracted again. */
-export const EXTRACTOR_VERSION = "extract-8";
+export const EXTRACTOR_VERSION = "extract-9";
 const MAX_ATTEMPTS = 3;
 
 /** Folder of the extractor (same from src/ and dist/). */

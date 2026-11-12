@@ -12,21 +12,38 @@ const MIN_TEXT = 8;
 
 const r4 = (x) => Math.round(Math.min(1, Math.max(0, x)) * 10000) / 10000;
 
-/** A rectangle in page space (PDF units) → `[x, y, w, h]` as fractions of the page, top-left origin. */
-function normBox(vp, x0, y0, x1, y1) {
+/**
+ * Points in page space (PDF units) → the box around them as `[x, y, w, h]`, fractions of the page as shown (rotation
+ * applied), top-left origin. Every corner is mapped (review #107 12차): two diagonal corners of a rotated or skewed
+ * shape do not bound it.
+ */
+function normPoints(vp, points) {
   // The viewport's matrix maps page space to its pixels (scale 1, rotation applied, origin top left).
   const [m0, m1, m2, m3, m4, m5] = vp.transform;
-  const pt = (x, y) => [m0 * x + m2 * y + m4, m1 * x + m3 * y + m5];
-  const [a, b] = pt(x0, y0);
-  const [c, d] = pt(x1, y1);
-  const left = Math.min(a, c);
-  const top = Math.min(b, d);
+  const xs = [];
+  const ys = [];
+  for (const [x, y] of points) {
+    xs.push(m0 * x + m2 * y + m4);
+    ys.push(m1 * x + m3 * y + m5);
+  }
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
   return [
     r4(left / vp.width),
     r4(top / vp.height),
-    r4(Math.abs(c - a) / vp.width),
-    r4(Math.abs(d - b) / vp.height),
+    r4((Math.max(...xs) - left) / vp.width),
+    r4((Math.max(...ys) - top) / vp.height),
   ];
+}
+
+/** A rectangle in page space (PDF units) → `[x, y, w, h]` (`normPoints` of its four corners). */
+function normBox(vp, x0, y0, x1, y1) {
+  return normPoints(vp, [
+    [x0, y0],
+    [x1, y0],
+    [x1, y1],
+    [x0, y1],
+  ]);
 }
 
 /** A page's text items as lines: `{ text, marks }` with one mark (and box) per line. */
@@ -144,88 +161,20 @@ async function ocrPage(page, vp, OPS, ocr) {
   };
   return {
     text,
-    marks: marks.map(([s, e, { box }]) => {
-      const [ax, ay] = toPage(box[0], box[1]);
-      const [bx, by] = toPage(box[2], box[3]);
-      return [
-        s,
-        e,
-        { bbox: normBox(vp, Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)) },
-      ];
-    }),
+    // A word's four corners through the picture's matrix (rotated, skewed or flipped) and the page's rotation.
+    marks: marks.map(([s, e, { box }]) => [
+      s,
+      e,
+      {
+        bbox: normPoints(vp, [
+          toPage(box[0], box[1]),
+          toPage(box[2], box[1]),
+          toPage(box[2], box[3]),
+          toPage(box[0], box[3]),
+        ]),
+      },
+    ]),
   };
-}
-
-/** A unit's text cut into its lines: each with its marks (offsets in the line) and the union of their boxes. */
-function linesOf(kind, { text, marks }) {
-  const lines = [];
-  let s = 0;
-  for (const line of text.split("\n")) {
-    const e = s + line.length;
-    const ms = (marks ?? []).filter(([a, b]) => a >= s && b <= e).map(([a, b, f]) => [a - s, b - s, f]);
-    if (line.trim()) {
-      const boxes = ms.map(([, , f]) => f?.bbox);
-      const box =
-        boxes.length && boxes.every((b) => Array.isArray(b) && b.length === 4 && b.every(Number.isFinite))
-          ? [
-              Math.min(...boxes.map((b) => b[0])),
-              Math.min(...boxes.map((b) => b[1])),
-              Math.max(...boxes.map((b) => b[0] + b[2])),
-              Math.max(...boxes.map((b) => b[1] + b[3])),
-            ]
-          : null;
-      lines.push({ kind, text: line, marks: ms, box });
-    }
-    s = e + 1;
-  }
-  return lines;
-}
-
-/**
- * Lines (all with a box, page fractions, top-left origin) in reading order: rows top to bottom — a line joins the
- * row before it when their middles are within half the smaller line's height — and left to right in a row.
- */
-export function readingOrder(lines) {
-  const rows = [];
-  for (const l of [...lines].sort((a, b) => a.box[1] - b.box[1] || a.box[0] - b.box[0])) {
-    const mid = (l.box[1] + l.box[3]) / 2;
-    const h = l.box[3] - l.box[1];
-    const row = rows.at(-1);
-    if (row && Math.abs(mid - row.mid) <= Math.min(h, row.h) / 2) row.lines.push(l);
-    else rows.push({ mid, h, lines: [l] });
-  }
-  return rows.flatMap((r) => r.lines.sort((a, b) => a.box[0] - b.box[0]));
-}
-
-/**
- * A page's own text and what OCR read of its picture, merged in reading order (review #107 11차): consecutive lines
- * of one source are one unit (`page` or `ocr_box`), each line keeping its own marks and boxes. Without a box for
- * every line the order is unknown: both are kept, own text first, and each ends early — a secret's piece is never
- * joined with the wrong neighbour, and a cut-off one at either end is masked (docs/decisions/isolation.md).
- */
-export function emitInOrder(out, p, own, read) {
-  const lines = [...linesOf("page", own), ...(read ? linesOf("ocr_box", read) : [])];
-  if (!lines.length) return;
-  if (lines.some((l) => !l.box)) {
-    out.add(p, { kind: "page", page: p }, own.text, own.marks);
-    out.boundary();
-    if (read) out.add(p, { kind: "ocr_box", page: p }, read.text, read.marks);
-    out.boundary();
-    return;
-  }
-  const merged = readingOrder(lines);
-  for (let i = 0; i < merged.length;) {
-    const kind = merged[i].kind;
-    let text = "";
-    const marks = [];
-    for (; i < merged.length && merged[i].kind === kind; i++) {
-      if (text) text += "\n";
-      const off = text.length;
-      text += merged[i].text;
-      for (const [a, b, f] of merged[i].marks) marks.push([a + off, b + off, f]);
-    }
-    out.add(p, { kind, page: p }, text, marks);
-  }
 }
 
 /**
@@ -286,10 +235,16 @@ export async function pdf(buf, out, { pdfjs, assets, ocr, limits = PDF_LIMITS })
           ocrPages++;
           if (state === "none") state = "done";
         }
-        // The page's own few characters are never dropped (review #107 10차), and they and what OCR read come in
-        // the page's reading order (11차): a picture above the text is read first — the server's scrub sees the
-        // text as it stands on the page.
-        emitInOrder(out, p, { text, marks }, read);
+        // Two content layers (review #107 12차 decision): the page's own few characters (never dropped — 10차),
+        // then what OCR read, in Tesseract's own order (block, paragraph, line, word — never re-sorted here).
+        // The own layer ends early when OCR text follows: the layers never join in one match, and a value cut
+        // off at the boundary is masked by the tail rule. A value split across the two layers is out of scope
+        // (docs/decisions/isolation.md).
+        if (text.trim()) out.add(p, { kind: "page", page: p }, text, marks);
+        if (read && read.text.trim()) {
+          if (text.trim()) out.boundary();
+          out.add(p, { kind: "ocr_box", page: p }, read.text, read.marks);
+        }
       }
       page.cleanup();
     }

@@ -2350,14 +2350,12 @@ describe("review #107 9차: every place the extractor drops text — (a) cut aft
     expect(plain).toEqual([false]);
   }, 120_000);
 
-  it("a short page text next to OCR is kept as its own unit, in the page's reading order (never dropped)", async () => {
+  it("a short page text next to OCR is kept as its own layer, before what OCR read, and ends early there (never dropped)", async () => {
     const { run: extractHere } = await import("../extract/worker.mjs");
     const dir = tmp();
-    // Real OCR of the picture (its words in the middle of the page); the page's own text at the top or the bottom.
-    for (const [y, order] of [
-      [785, ["page", "ocr_box"]],
-      [5, ["ocr_box", "page"]],
-    ] as const) {
+    // Real OCR of the picture (its words in the middle of the page); the page's own text at the top or the bottom:
+    // the same two layers either way (review #107 12차 — no position merge).
+    for (const y of [785, 5]) {
       const p = path.join(dir, `short-${y}.pdf`);
       const body = pdfWithScan(["text page"], jpeg, 1000, 300, "QDQ=", y);
       fs.writeFileSync(p, body);
@@ -2372,11 +2370,14 @@ describe("review #107 9차: every place the extractor drops text — (a) cut aft
         segments: { loc: { kind: string; page: number }; text: string; endsEarly?: boolean }[];
       };
       expect(
-        r.segments.map((x) => [x.loc.kind, x.loc.page]),
+        r.segments.map((x) => [x.loc.kind, x.loc.page, !!x.endsEarly]),
         `y ${y}`,
-      ).toEqual([["page", 1], ...order.map((k) => [k, 2])]);
-      expect(r.segments.find((x) => x.loc.kind === "page" && x.loc.page === 2)!.text).toBe("QDQ=");
-      expect(r.segments.some((x) => x.endsEarly)).toBe(false);
+      ).toEqual([
+        ["page", 1, false],
+        ["page", 2, true],
+        ["ocr_box", 2, false],
+      ]);
+      expect(r.segments[1]!.text).toBe("QDQ=");
     }
   }, 60_000);
 
@@ -2737,23 +2738,14 @@ describe("OCR capability", () => {
   });
 });
 
-describe("review #107 11차: a page's own text and what OCR read come in the page's reading order", () => {
+describe("review #107 12차: OCR in Tesseract's own order; a page's own text and its picture's text are two layers; boxes from four corners", () => {
   const jpeg = fs.readFileSync(path.join(FIX, "photo.jpg"));
-  /**
-   * Page 1: a picture (photo.jpg, 1000 × 300, drawn 560 × 70) and a few characters of text, the picture above the
-   * text (`top`) or below it; page 2: one line of text.
-   */
-  const pdfOrder = (top: boolean, short: string, next: string) => {
-    const esc = (t: string) => t.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
-    const [imgY, textY] = top ? [500, 100] : [100, 700];
-    const ops1 = `q 560 0 0 70 20 ${imgY} cm /Im1 Do Q\nBT /F1 14 Tf 20 ${textY} Td (${esc(short)}) Tj ET`;
-    const ops2 = `BT /F1 14 Tf 20 700 Td (${esc(next)}) Tj ET`;
+  /** A PDF of pages drawn by `ops` (photo.jpg, 1000 × 300, is `/Im1` on each), with an optional `/Rotate`. */
+  const pdfPages = (pages: { ops: string; rotate?: number }[]) => {
     const objs: (string | Buffer)[] = [
       "<< /Type /Catalog /Pages 2 0 R >>",
-      "<< /Type /Pages /Kids [4 0 R 7 0 R] /Count 2 >>",
+      "",
       "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>",
-      `<< /Length ${Buffer.byteLength(ops1)} >>\nstream\n${ops1}\nendstream`,
       Buffer.concat([
         Buffer.from(
           `<< /Type /XObject /Subtype /Image /Width 1000 /Height 300 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`,
@@ -2762,9 +2754,16 @@ describe("review #107 11차: a page's own text and what OCR read come in the pag
         jpeg,
         Buffer.from("\nendstream", "latin1"),
       ]),
-      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>",
-      `<< /Length ${Buffer.byteLength(ops2)} >>\nstream\n${ops2}\nendstream`,
     ];
+    const kids: number[] = [];
+    for (const pg of pages) {
+      kids.push(objs.length + 1);
+      objs.push(
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]${pg.rotate ? ` /Rotate ${pg.rotate}` : ""} /Resources << /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents ${objs.length + 2} 0 R >>`,
+      );
+      objs.push(`<< /Length ${Buffer.byteLength(pg.ops)} >>\nstream\n${pg.ops}\nendstream`);
+    }
+    objs[1] = `<< /Type /Pages /Kids [${kids.map((k) => `${k} 0 R`).join(" ")}] /Count ${pages.length} >>`;
     const parts: Buffer[] = [Buffer.from("%PDF-1.4\n", "latin1")];
     let size = parts[0]!.length;
     const offsets: number[] = [];
@@ -2786,178 +2785,209 @@ describe("review #107 11차: a page's own text and what OCR read come in the pag
     );
     return Buffer.concat(parts);
   };
-  /** Tesseract stand-in: the picture reads as `words` (one line across the whole image). */
-  const fakeTesseract = (words: string[]) => ({
+  const esc = (t: string) => t.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  type Word = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number } };
+  const w = (text: string, x0: number, y0: number, x1: number, y1: number): Word => ({
+    text,
+    bbox: { x0, y0, x1, y1 },
+  });
+  /** Tesseract stand-in: `blocks` of lines of words (image pixels), returned in this order. */
+  const fakeTesseract = (blocks: Word[][][]) => ({
     createWorker: async () => ({
       recognize: async () => ({
         data: {
-          blocks: [
-            {
-              paragraphs: [
-                {
-                  lines: [
-                    {
-                      words: words.map((text, k) => ({
-                        text,
-                        bbox: {
-                          x0: (k * 1000) / words.length,
-                          y0: 0,
-                          x1: ((k + 1) * 1000) / words.length,
-                          y1: 300,
-                        },
-                      })),
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
+          blocks: blocks.map((lines) => ({ paragraphs: [{ lines: lines.map((words) => ({ words })) }] })),
         },
       }),
       terminate: async () => {},
     }),
   });
   const runnerWith =
-    (words: string[]): ExtractRunner =>
+    (blocks: Word[][][]): ExtractRunner =>
     async ({ file, path: p }) => {
       const { run: extractHere } = await import("../extract/worker.mjs");
       const job = JSON.parse(extractRunOptions(file, p, undefined).stdin!);
       try {
         return (await extractHere(
           { ...job, ocr: { langDir: "unused" } },
-          {
-            tesseract: fakeTesseract(words),
-          },
+          { tesseract: fakeTesseract(blocks) },
         )) as never;
       } catch (e) {
         return { ok: false, code: (e as { code?: string }).code ?? "extract_failed" };
       }
     };
-  // Codex's repro: a value's hex in three pieces — what the page shows first, the next 6 characters, then page 2.
-  const LAYOUTS = [
-    { name: "the picture above the text", top: true, cut: [24, 30] as const },
-    { name: "the text above the picture", top: false, cut: [6, 30] as const },
-  ];
+  type Seg = {
+    loc: { kind: string; page: number };
+    text: string;
+    marks?: [number, number, { bbox: number[] }][];
+    endsEarly?: boolean;
+  };
+  const extractWith = async (blocks: Word[][][], body: Buffer) => {
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, "x.pdf"), body);
+    const r = (await runnerWith(blocks)({
+      file: { kind: "pdf", bytes: body.length },
+      path: path.join(dir, "x.pdf"),
+    } as never)) as unknown as { segments: Seg[] };
+    return r.segments;
+  };
 
-  for (const layout of LAYOUTS)
-    it(`${layout.name}, the value going on onto page 2: the worker's order is the page's, and nothing survives — DB, API, read; before and after the rescrub`, async () => {
-      for (const when of ["early", "late"] as const) {
-        const raw = `${crypto.randomInt(1e9, 1e10 - 1)}${crypto.randomBytes(10).toString("hex")}`.slice(
-          0,
-          30,
-        );
-        const enc = Buffer.from(raw).toString("hex");
-        const [i, j] = layout.cut;
-        const [first, second, third] = [enc.slice(0, i), enc.slice(i, j), enc.slice(j)];
-        // What the picture holds and what the page's text layer holds.
-        const [pictured, short] = layout.top ? [first, second] : [second, first];
-        const body = pdfOrder(layout.top, short, third);
-        const runner = runnerWith([pictured]);
-
-        // The worker: the page's reading order, each piece its own locator, bbox and no early end.
-        const dir = tmp();
-        fs.writeFileSync(path.join(dir, "o.pdf"), body);
-        const r = (await runner({
-          file: { kind: "pdf", bytes: body.length },
-          path: path.join(dir, "o.pdf"),
-        } as never)) as unknown as {
-          segments: {
-            loc: { kind: string; page: number };
-            text: string;
-            marks?: [number, number, { bbox: number[] }][];
-            endsEarly?: boolean;
-          }[];
-        };
-        expect(r.segments.map((x) => [x.loc.kind, x.loc.page, x.text])).toEqual([
-          [layout.top ? "ocr_box" : "page", 1, first],
-          [layout.top ? "page" : "ocr_box", 1, second],
-          ["page", 2, third],
-        ]);
-        expect(r.segments.some((x) => x.endsEarly)).toBe(false);
-        const ocrBox = r.segments.find((x) => x.loc.kind === "ocr_box")!.marks![0]![2].bbox;
-        const textBox = r.segments.find((x) => x.loc.kind === "page")!.marks![0]![2].bbox;
-        expect(ocrBox[1]! < textBox[1]!).toBe(layout.top);
-
-        if (when === "early") {
-          knownSecrets.add(raw);
-          closers.push(() => knownSecrets.remove(raw));
-        }
-        const { app, db, f, upload, get } = await start(fake(), { extract: { runner } });
-        const c = app.conversations!.create(f.users.owner.id);
-        const up = await upload(f.cookies.owner, c.id, "order.pdf", body);
-        await app.fileExtracts!.idle();
-        if (when === "late") {
-          app.storedRescrub!.close();
-          knownSecrets.add(raw);
-          closers.push(() => knownSecrets.remove(raw));
-          await app.fileExtracts!.idle();
-        }
-        expect(app.fileExtracts!.get(up.id)?.status).toBe("ok");
-        const msg = app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "x" }] });
-        app.files!.attach(c.id, msg.id, [up.id]);
-        const { FileTools } = await import("../src/files/text.js");
-        const tools = new FileTools(app.files!, app.fileExtracts!, app.conversations!, 50);
-        const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
-        const check = async (label: string) => {
-          const stored = (
-            db.$client.prepare("SELECT text FROM file_segments WHERE file_id = ?").all(up.id) as {
-              text: string;
-            }[]
-          )
-            .map((x) => x.text)
-            .join("\n");
-          const seen = {
-            stored: when === "early" || label !== "before the rescrub" ? stored : "",
-            api: (await get(f.cookies.owner, `/api/files/${up.id}/extract`)).body,
-            read: JSON.stringify(await tools.read(scope, { fileId: up.id })),
-          };
-          for (const [where, text] of Object.entries(seen))
-            for (const piece of [raw, enc, first, second, third])
-              expect(text.includes(piece), `${layout.name} ${when} ${label} ${where}: ${piece}`).toBe(false);
-        };
-        await check("before the rescrub");
-        const { StoredRescrub } = await import("../src/secrets/rescrub.js");
-        const rescrub = new StoredRescrub(db, { delayMs: 0 });
-        rescrub.schedule({ all: true });
-        await rescrub.idle();
-        rescrub.close();
-        await check("after the rescrub");
+  /** Upload `body` (extracted with `blocks`), the secret registered before or after: nothing of `pieces` anywhere. */
+  const nothingSurvives = async (
+    label: string,
+    raw: string,
+    pieces: string[],
+    blocks: Word[][][],
+    body: Buffer,
+  ) => {
+    for (const when of ["early", "late"] as const) {
+      if (when === "early") {
+        knownSecrets.add(raw);
+        closers.push(() => knownSecrets.remove(raw));
       }
-    }, 60_000);
+      const { app, db, f, upload, get } = await start(fake(), { extract: { runner: runnerWith(blocks) } });
+      const c = app.conversations!.create(f.users.owner.id);
+      const up = await upload(f.cookies.owner, c.id, "scan.pdf", body);
+      await app.fileExtracts!.idle();
+      if (when === "late") {
+        app.storedRescrub!.close();
+        knownSecrets.add(raw);
+        closers.push(() => knownSecrets.remove(raw));
+        await app.fileExtracts!.idle();
+      }
+      expect(app.fileExtracts!.get(up.id)?.status).toBe("ok");
+      const msg = app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "x" }] });
+      app.files!.attach(c.id, msg.id, [up.id]);
+      const { FileTools } = await import("../src/files/text.js");
+      const tools = new FileTools(app.files!, app.fileExtracts!, app.conversations!, 50);
+      const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
+      const check = async (stage: string) => {
+        const stored = (
+          db.$client.prepare("SELECT text FROM file_segments WHERE file_id = ?").all(up.id) as {
+            text: string;
+          }[]
+        )
+          .map((x) => x.text)
+          .join("\n");
+        const seen = {
+          stored: when === "early" || stage !== "before the rescrub" ? stored : "",
+          api: (await get(f.cookies.owner, `/api/files/${up.id}/extract`)).body,
+          read: JSON.stringify(await tools.read(scope, { fileId: up.id })),
+        };
+        for (const [where, text] of Object.entries(seen))
+          for (const piece of [raw, ...pieces])
+            expect(text.includes(piece), `${label} ${when} ${stage} ${where}: ${piece}`).toBe(false);
+      };
+      await check("before the rescrub");
+      const { StoredRescrub } = await import("../src/secrets/rescrub.js");
+      const rescrub = new StoredRescrub(db, { delayMs: 0 });
+      rescrub.schedule({ all: true });
+      await rescrub.idle();
+      rescrub.close();
+      await check("after the rescrub");
+    }
+  };
 
-  it("unit: rows by height (half a line's tolerance), then left to right; a line without a box keeps both apart", async () => {
-    const { readingOrder } = await import("../extract/pdf.mjs");
-    const l = (text: string, box: number[]) => ({ text, box });
-    // A slightly lower word on the same line still reads after the left one; the next line comes after both.
-    expect(
-      readingOrder([
-        l("c", [0, 0.2, 0.3, 0.22]),
-        l("b", [0.5, 0.104, 0.6, 0.124]),
-        l("a", [0.1, 0.1, 0.2, 0.12]),
-      ]).map((x: { text: string }) => x.text),
-    ).toEqual(["a", "b", "c"]);
-
-    // OCR words without boxes: the order is unknown — both kept, own text first, each ending early.
-    const { Segments } = await import("../extract/segments.mjs");
-    const { emitInOrder } = await import("../extract/pdf.mjs");
-    const out = new Segments();
-    emitInOrder(
-      out,
-      1,
-      { text: "abc", marks: [[0, 3, { bbox: [0, 0.5, 0.1, 0.02] }]] },
-      { text: "def", marks: [] },
-    );
-    expect(
-      out.items.map((x: { loc: { kind: string }; text: string; endsEarly?: boolean }) => [
-        x.loc.kind,
-        x.text,
-        !!x.endsEarly,
-      ]),
-    ).toEqual([
-      ["page", "abc", true],
-      ["ocr_box", "def", true],
+  it("a two-column scanned page, a value across the left column's lines: Tesseract's order kept, masked — DB, API, read; before and after the rescrub", async () => {
+    const raw = `sk-r12-cols-${crypto.randomBytes(12).toString("hex")}`;
+    const enc = Buffer.from(raw).toString("hex");
+    const [a, b] = [enc.slice(0, 40), enc.slice(40)];
+    // Left column (x 0–450): two lines; right column (x 550–1000): two lines at the same heights.
+    const blocks = [
+      [
+        [w("note", 0, 0, 100, 40), w(a, 110, 0, 450, 40)],
+        [w(b, 0, 50, 300, 90), w("end", 310, 50, 450, 90)],
+      ],
+      [
+        [w("right", 550, 0, 700, 40), w("column", 710, 0, 1000, 40)],
+        [w("second", 550, 50, 700, 90), w("line", 710, 50, 1000, 90)],
+      ],
+    ];
+    const body = pdfPages([{ ops: "q 612 0 0 792 0 0 cm /Im1 Do Q" }]);
+    const segs = await extractWith(blocks, body);
+    expect(segs.map((x) => [x.loc.kind, x.text])).toEqual([
+      ["ocr_box", `note ${a}\n${b} end\nright column\nsecond line`],
     ]);
-  });
+    await nothingSurvives("two columns", raw, [enc, a, b], blocks, body);
+  }, 60_000);
+
+  it("a page's own text and its picture's text are separate runs (the own layer ends early); a value inside the OCR layer is masked", async () => {
+    const raw = `sk-r12-layer-${crypto.randomBytes(12).toString("hex")}`;
+    const enc = Buffer.from(raw).toString("hex");
+    // The picture at the top, a few characters of the page's own text below it — and between OCR words on a line
+    // of the picture (Codex's P1 #2): either way, two layers.
+    const blocks = [[[w("total", 0, 0, 300, 100), w(enc, 320, 0, 1000, 100)], [w("done", 0, 150, 300, 250)]]];
+    const body = pdfPages([
+      { ops: `q 560 0 0 70 20 500 cm /Im1 Do Q\nBT /F1 14 Tf 20 100 Td (${esc("p.1")}) Tj ET` },
+      { ops: `BT /F1 14 Tf 20 700 Td (${esc("next page text")}) Tj ET` },
+    ]);
+    const segs = await extractWith(blocks, body);
+    expect(segs.map((x) => [x.loc.kind, x.loc.page, x.text, !!x.endsEarly])).toEqual([
+      ["page", 1, "p.1", true],
+      ["ocr_box", 1, `total ${enc}\ndone`, false],
+      ["page", 2, "next page text", false],
+    ]);
+    // The runs: the own layer is one (ending early), what OCR read and page 2 another — never joined.
+    const { scrubFile } = await import("../src/files/scrub.js");
+    const { KnownSecrets } = await import("../src/secrets/known.js");
+    const reg = new KnownSecrets();
+    reg.add(raw);
+    expect(scrubFile(segs, reg).map((x) => x.text)).toEqual(["p.1", "total [숨김]\ndone", "next page text"]);
+    await nothingSurvives("layers", raw, [enc], blocks, body);
+  }, 60_000);
+
+  it("boxes from all four corners: a rotated picture, a skewed one, and a page shown rotated (/Rotate 90)", async () => {
+    // The word covers the whole picture: its box is the box around the picture's four corners on the page.
+    const whole = [[[w("WORDWORD", 0, 0, 1000, 300)]]];
+    const around = (cm: number[]) => {
+      const pts = [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+      ].map(([u, v]) => [cm[0]! * u! + cm[2]! * v! + cm[4]!, cm[1]! * u! + cm[3]! * v! + cm[5]!]);
+      const xs = pts.map((p) => p[0]!);
+      const ys = pts.map((p) => p[1]!);
+      // Page space has its origin at the bottom; the box is top-left, fractions of 612 × 792.
+      return [
+        Math.min(...xs) / 612,
+        (792 - Math.max(...ys)) / 792,
+        (Math.max(...xs) - Math.min(...xs)) / 612,
+        (Math.max(...ys) - Math.min(...ys)) / 792,
+      ];
+    };
+    const near = (a: number[], b: number[]) => a.every((x, i) => Math.abs(x - b[i]!) < 0.002);
+    const t = (30 * Math.PI) / 180;
+    const cases: { name: string; cm: number[]; rotate?: number; expected?: number[] }[] = [
+      {
+        name: "rotated 30°",
+        cm: [300 * Math.cos(t), 300 * Math.sin(t), -100 * Math.sin(t), 100 * Math.cos(t), 200, 300],
+      },
+      { name: "rotated 45° (Codex's repro)", cm: [200, 200, -200, 200, 300, 300] },
+      { name: "skewed", cm: [300, 0, 150, 100, 100, 300] },
+      // Shown rotated: page (x, y) → (y, x) on a 792 × 612 view; the picture is x 100–300, y 200–300.
+      {
+        name: "/Rotate 90",
+        cm: [200, 0, 0, 100, 100, 200],
+        rotate: 90,
+        expected: [200 / 792, 100 / 612, 100 / 792, 200 / 612],
+      },
+    ];
+    for (const c of cases) {
+      const body = pdfPages([
+        {
+          ops: `q ${c.cm.map((x) => x.toFixed(4)).join(" ")} cm /Im1 Do Q`,
+          ...(c.rotate ? { rotate: c.rotate } : {}),
+        },
+      ]);
+      const segs = await extractWith(whole, body);
+      expect(segs.length, c.name).toBe(1);
+      const box = segs[0]!.marks![0]![2].bbox;
+      const want = c.expected ?? around(c.cm);
+      expect(near(box, want), `${c.name}: ${JSON.stringify(box)} ≠ ${JSON.stringify(want)}`).toBe(true);
+      expect(box[2]! > 0.05 && box[3]! > 0.05, c.name).toBe(true);
+    }
+  }, 60_000);
 });
 
 describe("rebase onto #111: file rows the rescrub masks or a re-extraction replaces mark the files for clean-up", () => {
