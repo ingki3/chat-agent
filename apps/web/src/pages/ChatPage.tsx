@@ -60,6 +60,8 @@ const SWITCHABLE = new Set([
 ]);
 
 const COMPOSER_INPUT = "composer-input";
+/** A result link (`#m-<id>`) loads at most this many older pages looking for its message (review #116). */
+const SEARCH_PAGES = 20;
 /** What the chip may offer (#19): allowed runtimes with a passed connection. */
 const USABLE_KEY = ["runtimes", "usable"] as const;
 const useUsableRuntimes = () => useQuery({ queryKey: USABLE_KEY, queryFn: settingsApi.usableRuntimes });
@@ -202,8 +204,10 @@ export function ChatPage() {
   }, [pendingNotice, id, qc, usable.data, usable.isPending]);
   // A schedule's result opened (#56, FR-8.3): the sidebar's "새 결과" goes.
   const newResult = !!conv.data?.newResult;
+  // Marked seen only once the messages (with the result) are loaded and not being read again.
+  const resultShown = !!messages.data && !messages.isFetching;
   useEffect(() => {
-    if (!newResult) return;
+    if (!newResult || !resultShown) return;
     void conversations
       .resultSeen(id)
       .then((c) => {
@@ -213,25 +217,50 @@ export function ChatPage() {
         return qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
       })
       .catch(() => {});
-  }, [newResult, id, qc]);
+  }, [newResult, resultShown, id, qc]);
   // A notification's link to the result message (`#m-<id>`, FR-8.4): older pages are loaded until it is there (a
-  // result followed by many turns), then it is scrolled to — once per link.
+  // result followed by many turns), then it is scrolled to — once per link. The search stops at a failed page (500,
+  // 403 after a revoked share…) or after SEARCH_PAGES pages, and offers "다시 시도" (review #116).
   const { hash } = useLocation();
   const target = hash.startsWith("#m-") ? hash.slice(3) : null;
   const found = !!target && !!list?.some((m) => m.id === target);
-  const { hasNextPage, isFetchingNextPage, fetchNextPage } = messages;
+  const { hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage } = messages;
   const scrolledTo = useRef<string | null>(null);
+  const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
+  const [searchStopped, setSearchStopped] = useState<string | null>(null);
+  const linkKey = `${id}${hash}`;
   useEffect(() => {
-    if (!target || !list || scrolledTo.current === `${id}${hash}`) return;
+    if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };
+    if (!target || !list || scrolledTo.current === linkKey) return;
     if (!found) {
-      if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
+      if (isFetchingNextPage || searchStopped === linkKey) return;
+      // Not there at all (deleted, another version), a failed page, or the cap: stop and say so.
+      if (!hasNextPage || isFetchNextPageError || search.current.pages >= SEARCH_PAGES)
+        return setSearchStopped(linkKey);
+      search.current.pages++;
+      void fetchNextPage();
       return;
     }
     const el = document.getElementById(`m-${target}`);
     if (!el) return;
-    scrolledTo.current = `${id}${hash}`;
+    scrolledTo.current = linkKey;
     el.scrollIntoView({ block: "start" });
-  }, [target, found, list, hasNextPage, isFetchingNextPage, fetchNextPage, id, hash]);
+  }, [
+    target,
+    found,
+    list,
+    hasNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    fetchNextPage,
+    linkKey,
+    searchStopped,
+  ]);
+  const retrySearch = () => {
+    search.current = { key: linkKey, pages: 1 };
+    setSearchStopped(null);
+    void fetchNextPage();
+  };
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);
@@ -295,6 +324,14 @@ export function ChatPage() {
       {!online && (
         <div className="notice warn banner" role="status">
           오프라인이에요 — 다시 연결되면 이어서 받아와요.
+        </div>
+      )}
+      {searchStopped === linkKey && !found && (
+        <div className="notice warn banner" role="alert" data-testid="link-search-stopped">
+          결과 메시지를 찾지 못했어요.{" "}
+          <button type="button" className="small" onClick={retrySearch}>
+            다시 시도
+          </button>
         </div>
       )}
       {actionError && (

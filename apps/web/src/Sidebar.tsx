@@ -1,4 +1,4 @@
-import { useDeferredValue, useState, type RefObject } from "react";
+import { useDeferredValue, useEffect, useState, type RefObject } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
 import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
@@ -34,6 +34,18 @@ export function Sidebar({
     refetchInterval: 60_000,
   });
   const items = list.data?.pages.flatMap((p) => p.items);
+  // The conversation open on screen got a schedule result (review #116): its own view is read again — the reply,
+  // the conversation and its run — so the result shows there (and the page then marks it seen).
+  const qc = useQueryClient();
+  const openId = useMatch("/c/:id")?.params.id;
+  const openHasResult = !!openId && !!items?.some((c) => c.id === openId && c.newResult);
+  const polledAt = list.dataUpdatedAt;
+  useEffect(() => {
+    if (!openId || !openHasResult) return;
+    void qc.invalidateQueries({ queryKey: ["messages", openId] });
+    void qc.invalidateQueries({ queryKey: ["active-run", openId] });
+    void qc.invalidateQueries({ queryKey: ["conversation", openId] });
+  }, [openId, openHasResult, polledAt, qc]);
   const pinned = items?.filter((c) => c.pinned) ?? [];
   const recent = items?.filter((c) => !c.pinned) ?? [];
   // Unread badge (FR-13.3): refreshed on focus, every minute, and at once when a push arrives (Shell).

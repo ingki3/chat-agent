@@ -271,21 +271,15 @@ test("새 결과: 알림이 꺼져 있고 예약 화면이 닫혀 있어도 사�
   expect(inbox.items).toHaveLength(0);
 });
 
-test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (review #116)", async ({
-  page,
-  browser,
-  baseURL,
-}) => {
-  test.setTimeout(120_000);
-  const me = await newMember(browser, baseURL!, "schedlink");
-  await signIn(page, baseURL!, me);
+/** A schedule result followed by 51 more turns (past the first page of 100); returns the notification's link. */
+async function buriedResult(page: import("@playwright/test").Page, baseURL: string, name: string) {
   const s = (await (
     await page.request.post("/api/schedules", {
-      data: { name: "링크 예약", prompt: "결과 하나", timing: { type: "daily", time: "08:00" } },
-      headers: csrf(baseURL!),
+      data: { name, prompt: "결과 하나", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL),
     })
   ).json()) as { id: string };
-  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const { conversationId } = await runToEnd(page, baseURL, s.id);
   const items = (
     (await (await page.request.get("/api/notifications")).json()) as {
       items: { kind: string; url: string }[];
@@ -293,11 +287,10 @@ test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (
   ).items;
   const url = items.find((n) => n.kind === "schedule_succeeded")!.url;
   expect(url).toMatch(new RegExp(`^/c/${conversationId}#m-`));
-  // 51 more turns: the result is no longer in the newest page of messages (100).
   for (let i = 0; i < 51; i++) {
     const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
       data: { text: `이어서 ${i}` },
-      headers: csrf(baseURL!),
+      headers: csrf(baseURL),
     });
     expect(sent.status()).toBe(201);
     await expect
@@ -312,8 +305,124 @@ test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (
       )
       .toBeNull();
   }
+  return url;
+}
+
+test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlink");
+  await signIn(page, baseURL!, me);
+  const url = await buriedResult(page, baseURL!, "링크 예약");
   await page.goto(url);
   const target = page.locator(`#${url.split("#")[1]}`);
   await expect(target).toBeInViewport({ timeout: 10_000 });
   await expect(target).toContainText("결과 하나");
+});
+
+test("결과 링크: 이전 페이지를 못 불러오면 몇 번만 묻고 멈춘 뒤 '다시 시도'로 이어간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkerr");
+  await signIn(page, baseURL!, me);
+  const url = await buriedResult(page, baseURL!, "링크 오류 예약");
+  let older = 0;
+  let status = 500;
+  await page.route(/\/api\/conversations\/[^/]+\/messages\?.*before=/, async (route) => {
+    older++;
+    await route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: "x" }) });
+  });
+  await page.goto(url);
+  const stopped = page.getByTestId("link-search-stopped");
+  await expect(stopped).toBeVisible();
+  await page.waitForTimeout(1500);
+  // One page asked for (and the client's one retry) — not a loop.
+  expect(older).toBeGreaterThan(0);
+  expect(older).toBeLessThanOrEqual(2);
+  // The permission is gone (403): "다시 시도" asks once more and stops again.
+  status = 403;
+  await stopped.getByRole("button", { name: "다시 시도" }).click();
+  await expect(stopped).toBeVisible();
+  await page.waitForTimeout(1500);
+  expect(older).toBeLessThanOrEqual(4);
+  // Back: "다시 시도" finds it.
+  await page.unroute(/\/api\/conversations\/[^/]+\/messages\?.*before=/);
+  await stopped.getByRole("button", { name: "다시 시도" }).click();
+  const target = page.locator(`#${url.split("#")[1]}`);
+  await expect(target).toBeInViewport({ timeout: 10_000 });
+  await expect(stopped).toHaveCount(0);
+});
+
+test("새 결과: 결과 대화를 열어 둔 채 실행되면 그 화면에 결과가 뜨고 표시가 지워진다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedopen");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: {
+        name: "열린 예약",
+        prompt: "열어 둔 채",
+        timing: { type: "daily", time: "08:00" },
+        notify: false,
+      },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}`);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  // Opened: seen.
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+            newResult: boolean;
+          }
+        ).newResult,
+    )
+    .toBe(false);
+  // Another run while it is open (no push, no focus change).
+  await runToEnd(page, baseURL!, s.id);
+  // The view's messages come slowly: the result is marked seen only once they are there.
+  await page.route(/\/api\/conversations\/[^/]+\/messages\?limit=100$/, async (route) => {
+    await new Promise((r) => setTimeout(r, 2500));
+    await route.continue();
+  });
+  const seen = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.fastForward(61_000);
+  await page.waitForTimeout(1000);
+  expect(await seen()).toBe(true);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+            newResult: boolean;
+          }
+        ).newResult,
+    )
+    .toBe(false);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "열린 예약" });
+  await expect(conv).toBeVisible();
+  await expect(conv.getByTestId("new-result")).toHaveCount(0);
 });
