@@ -116,6 +116,8 @@ export const DefaultsResponse = z.object({
   unavailable: z.array(RuntimeId),
   start: ChatSettings.nullable(),
   fallback: z.boolean(),
+  /** The default is at a usage limit until then (the cause of the fallback, FR-9.2); null otherwise. */
+  limitedUntil: z.number().nullable(),
 });
 export type DefaultsResponse = z.infer<typeof DefaultsResponse>;
 /** `PUT /api/settings/defaults` (own) and `PUT /api/admin/users/:id/defaults` (initial; null clears it). */

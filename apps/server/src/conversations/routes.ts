@@ -94,7 +94,11 @@ export function registerConversationRoutes(
       // New conversations start on the defaults without any picking step (FR-3.5, FR-12.2), with the FR-12.6
       // fallback (noticed once); a choice made on the chip before the first message is checked like a change.
       const user = deps?.users.byId(req.ctx.user!.id);
-      let start: { settings: ReturnType<typeof settingsOf>; fallback: boolean } = {
+      let start: {
+        settings: ReturnType<typeof settingsOf>;
+        fallback: boolean;
+        limitedUntil?: number | undefined;
+      } = {
         settings: null,
         fallback: false,
       };
@@ -113,6 +117,7 @@ export function registerConversationRoutes(
             title: body.title,
             settings: start.settings,
             fallback: start.fallback,
+            limitedUntil: start.limitedUntil,
           }),
         ),
       );

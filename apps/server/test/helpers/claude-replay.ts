@@ -251,10 +251,14 @@ export const sdk = {
       error,
       message: { content: [{ type: "text", text: "error" }] },
     }) as unknown as SDKMessage,
-  rateLimit: (status: "allowed" | "rejected", resetsAt?: number): SDKMessage =>
+  rateLimit: (status: "allowed" | "rejected", resetsAt?: number, rateLimitType?: string): SDKMessage =>
     ({
       type: "rate_limit_event",
-      rate_limit_info: { status, ...(resetsAt === undefined ? {} : { resetsAt }) },
+      rate_limit_info: {
+        status,
+        ...(resetsAt === undefined ? {} : { resetsAt }),
+        ...(rateLimitType === undefined ? {} : { rateLimitType }),
+      },
     }) as unknown as SDKMessage,
   result: (o: { isError?: boolean; subtype?: string } = {}): SDKMessage =>
     ({

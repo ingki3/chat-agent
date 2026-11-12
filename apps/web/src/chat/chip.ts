@@ -1,4 +1,10 @@
-import type { ChangeSettingsRequest, ChatSettings, RuntimeDefaults, RuntimeOption } from "@agentlee/shared";
+import {
+  limitApplies,
+  type ChangeSettingsRequest,
+  type ChatSettings,
+  type RuntimeDefaults,
+  type RuntimeOption,
+} from "@agentlee/shared";
 
 /**
  * The chip's pure parts (#19): its label, what "공용으로 쓰기" needs, and — on the new-conversation screen, where
@@ -26,29 +32,47 @@ export function canChooseShared(option: RuntimeOption | undefined): boolean {
   return scopes.has("personal") && scopes.has("shared");
 }
 
+type Limit = { blocked: boolean; viaShared: boolean; until: number | null };
+
+/** Until when `model` is limited on connection `c` (its latest applicable limit in force), or null. */
+const connUntil = (c: RuntimeOption["connections"][number], model: string, now: number) => {
+  const ends = c.limits.filter((l) => l.until > now && limitApplies(l.scope, model)).map((l) => l.until);
+  return ends.length ? Math.max(...ends) : null;
+};
+
 /**
- * Usage limits of a runtime's connections (#19): `blocked` when every connection the user could use is at its limit
- * (the server refuses moving onto it, 403 `connection_limited`); `viaShared` when only the personal ones are, so the
- * chip can switch with "공용으로 쓰기" instead; `until` = when the earliest limit ends.
+ * Usage limits for one model of a runtime (#19): `blocked` when the connection a run would take (personal first,
+ * FR-11.3) is limited for it and there is no way around it (the server refuses, 403 `connection_limited`);
+ * `viaShared` when only the personal ones are and a shared one is free — the chip switches with "공용으로 쓰기";
+ * `until` = when the earliest of those limits ends.
  */
-export function runtimeLimit(
-  option: RuntimeOption | undefined,
-  now: number,
-): { blocked: boolean; viaShared: boolean; until: number | null } {
+export function modelLimit(option: RuntimeOption | undefined, model: string, now: number): Limit {
   const conns = option?.needsConnection ? option.connections : [];
-  const limited = (c: (typeof conns)[number]) => c.limitedUntil !== null && c.limitedUntil > now;
   const personal = conns.filter((c) => c.scope === "personal");
   const shared = conns.filter((c) => c.scope === "shared");
-  const ends = conns.filter(limited).map((c) => c.limitedUntil!);
+  const ends = conns.map((c) => connUntil(c, model, now)).filter((u): u is number => u !== null);
   const until = ends.length ? Math.min(...ends) : null;
-  // Personal first (FR-11.3): the run would take a personal one when there is any.
   const first = personal.length ? personal : shared;
-  const firstBlocked = first.length > 0 && first.every(limited);
-  const sharedFree = shared.some((c) => !limited(c));
+  const firstBlocked = first.length > 0 && first.every((c) => connUntil(c, model, now) !== null);
+  const sharedFree = shared.some((c) => connUntil(c, model, now) === null);
+  const viaShared = firstBlocked && personal.length > 0 && sharedFree;
+  return { blocked: firstBlocked && !viaShared, viaShared, until };
+}
+
+/**
+ * The same for a whole runtime: switching to it takes its default model, or its first model that is not limited
+ * (the server's rule) — so it is `blocked` only when every model is, `viaShared` when none is free on the personal
+ * connection but one is on the shared one.
+ */
+export function runtimeLimit(option: RuntimeOption | undefined, now: number): Limit {
+  const per = (option?.models ?? []).map((m) => modelLimit(option, m.id, now));
+  if (!per.length) return { blocked: false, viaShared: false, until: null };
+  const free = per.some((l) => !l.blocked && !l.viaShared);
+  const ends = per.map((l) => l.until).filter((u): u is number => u !== null);
   return {
-    blocked: firstBlocked && !(personal.length > 0 && sharedFree),
-    viaShared: firstBlocked && personal.length > 0 && sharedFree,
-    until,
+    blocked: per.every((l) => l.blocked),
+    viaShared: !free && per.some((l) => l.viaShared),
+    until: ends.length ? Math.min(...ends) : null,
   };
 }
 
@@ -97,9 +121,25 @@ export function applyChange(
   return { runtime, model: m.id, effort, useShared };
 }
 
-/** "기본값을 쓸 수 없어 ○○로 시작했어요" (FR-12.6). */
-export const noticeText = (n: { runtime: string; model: string }, options?: RuntimeOption[]) =>
-  `기본값을 쓸 수 없어 ${chipLabel(n, options)}로 시작했어요`;
+const when = new Intl.DateTimeFormat("ko-KR", {
+  month: "numeric",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+/** `11. 12. 오후 3:05` — when a usage limit ends. */
+export const untilText = (ms: number) => when.format(ms);
+
+/**
+ * "기본값을 쓸 수 없어 ○○로 시작했어요" (FR-12.6), with the cause when it was a usage limit: "(사용 한도 · ○○ 이후
+ * 다시 쓸 수 있어요)".
+ */
+export const noticeText = (
+  n: { runtime: string; model: string; limitedUntil?: number | undefined },
+  options?: RuntimeOption[],
+) =>
+  `기본값을 쓸 수 없어 ${chipLabel(n, options)}로 시작했어요` +
+  (n.limitedUntil !== undefined ? ` (사용 한도 · ${untilText(n.limitedUntil)} 이후 다시 쓸 수 있어요)` : "");
 
 /**
  * Asks the server for the fallback notice: what it hands over, or null — also when the request fails, so a notice is

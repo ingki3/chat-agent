@@ -87,7 +87,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-12.3 | 런타임별 기본 모델 기억 | #19 | I | ✅ (칩에서 런타임만 바꾸면 그 런타임의 기본 모델·추론 강도, 없으면 허용된 첫 모델 — `chat-settings.test.ts` "runtime only") |
 | FR-12.4 | 초기값 Claude Code · Opus 5.5, 관리자 초기값 | #19, #41, #35 | I | ✅ (#35 `users.initial_defaults`·`PUT /api/admin/users/:id/defaults`(대상 사용자 권한 안에서만, 400), 본인 값 → 관리자 초기값 → 서비스 기본값 순 — `admin.test.ts`. #19 미설정 사용자의 새 대화가 Opus 5.5, 관리자 초기값으로 시작 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`) |
 | FR-12.5 | 기본값 변경 시 기존 대화 불변 | #19 | I | ✅ (답한 대화·아직 안 답한 대화 모두 설정·다음 답의 런타임·모델·추론 강도 그대로 — `chat-settings.test.ts` "never changes an existing conversation", `e2e/runtime-chip.spec.ts`) |
-| FR-12.6 | 기본값 불가 시 대체 순서 | #19 | U, E | ✅ (같은 런타임 첫 허용 모델 → Claude Code → Codex 순 다른 런타임의 기본 모델 → 후보 없음 화면, `passed` 연결만 셈, 사용 한도(`limited_until`, 해제 시각/5시간, 답 완료·테스트 통과로 해제)도 대체 조건, 칩 옆 안내 1회(서버가 한 번만 넘김), 설정 화면 안내 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`) |
+| FR-12.6 | 기본값 불가 시 대체 순서 | #19 | U, E | ✅ (같은 런타임 첫 허용 모델 → Claude Code → Codex 순 다른 런타임의 기본 모델 → 후보 없음 화면, `passed` 연결만 셈, 사용 한도도 대체 조건(`connection_limits`: 구독은 연결 전체·모델 창별 해제 시각/5시간, API 키는 그 모델만 retry-after/1분, 한도 뒤에 시작한 같은 범위의 성공만 해제), 칩 옆 안내 1회(서버가 한 번만 넘김), 설정 화면 안내 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`) |
 | FR-12.7 | 내 런타임 연결 관리 | #17, #18 | E | ✅ (#17 설정 → 내 런타임 연결: 추가·테스트·해제, `e2e/connections.spec.ts`. #18 "ChatGPT로 로그인"(코드·링크·취소·다시 로그인), 관리자만 Claude 구독 항목) |
 | FR-12.8 | 알림 설정 | #34 | E | ✅ (기기별 켜기/끄기·방해 금지 — `e2e/notifications.spec.ts`) |
 | FR-13.1 | 웹 푸시, 기기별, iOS 안내 | #34 | M | 🟨 (구현·자동 시험 완료, 실기기 확인 대기 — `docs/evidence/push/checklist.md`) |

@@ -124,10 +124,9 @@ export class RunAccess {
     }
   }
 
-  /** Whether the connection is at its usage limit right now (#19, FR-12.6). */
-  connectionLimited(id: string): boolean {
-    const c = this.connections.get(id);
-    return !!c && this.connections.limited(c);
+  /** Until when `model` is at a usage limit on the connection (#19, FR-12.6), or null when it is not. */
+  connectionLimitedUntil(id: string, model: string): number | null {
+    return this.connections.limitedUntil(id, model);
   }
 
   resolve(input: RunSettingsInput): RunSettings {

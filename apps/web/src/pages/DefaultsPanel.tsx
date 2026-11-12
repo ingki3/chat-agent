@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { DefaultsResponse } from "@agentlee/shared";
 import { errorText, settings } from "../api.js";
 import { DefaultsEditor, RUNTIME_LABEL } from "../DefaultsEditor.js";
-import { chipLabel } from "../chat/chip.js";
+import { chipLabel, untilText } from "../chat/chip.js";
 
 const KEY = ["settings", "defaults"] as const;
 const SOURCE = {
@@ -60,8 +60,10 @@ export function DefaultsPanel() {
       {d?.fallback && d.start && (
         <div className="notice warn small" role="note" data-testid="defaults-start">
           기본값({chipLabel(defaultOf(d), runtimes.data)})을 지금 쓸 수 없어 새 대화는{" "}
-          {chipLabel(d.start, runtimes.data)}로 시작해요. 연결(설정 → 내 런타임 연결)을 확인하거나 다른
-          기본값을 고르세요.
+          {chipLabel(d.start, runtimes.data)}로 시작해요.{" "}
+          {d.limitedUntil !== null
+            ? `사용 한도에 걸렸어요 — ${untilText(d.limitedUntil)} 이후 다시 기본값으로 시작해요.`
+            : "연결(설정 → 내 런타임 연결)을 확인하거나 다른 기본값을 고르세요."}
         </div>
       )}
       {(runtimes.isError || defaults.isError) && (

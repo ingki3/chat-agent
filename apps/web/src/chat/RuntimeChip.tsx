@@ -1,15 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeSettingsRequest, ChatSettings, RuntimeOption } from "@agentlee/shared";
 import { errorText } from "../api.js";
-import { canChooseShared, chipLabel, RUNTIME_NAME, runtimeLimit } from "./chip.js";
-
-const until = new Intl.DateTimeFormat("ko-KR", {
-  month: "numeric",
-  day: "numeric",
-  hour: "numeric",
-  minute: "2-digit",
-});
-const untilText = (ms: number) => until.format(ms);
+import { canChooseShared, chipLabel, modelLimit, RUNTIME_NAME, runtimeLimit, untilText } from "./chip.js";
 
 const dotClass = (r: string | null | undefined) =>
   r === "codex" ? "codex" : r === "claude-code" ? "claude" : "none";
@@ -135,8 +127,14 @@ export function RuntimeChip(props: {
               {s && !option && (
                 <p className="warn">지금 이 런타임은 쓸 수 없어요 — 다른 런타임을 고르세요.</p>
               )}
-              {option && runtimeLimit(option, now).blocked && (
-                <p className="warn">지금 이 런타임은 사용 한도에 걸렸어요 — 다른 런타임을 고르세요.</p>
+              {option && model && modelLimit(option, model.id, now).blocked && (
+                <p className="warn" data-testid="chip-model-limited">
+                  지금 이 모델은 사용 한도에 걸렸어요
+                  {modelLimit(option, model.id, now).until !== null
+                    ? ` (${untilText(modelLimit(option, model.id, now).until!)} 이후 다시 쓸 수 있어요)`
+                    : ""}{" "}
+                  — 다른 모델이나 런타임을 고르세요.
+                </p>
               )}
               {option && (
                 <label className="chipfield">
@@ -145,14 +143,24 @@ export function RuntimeChip(props: {
                     aria-label="모델"
                     disabled={busy}
                     value={model ? model.id : ""}
-                    onChange={(e) => void change({ model: e.target.value })}
+                    onChange={(e) =>
+                      void change(
+                        modelLimit(option, e.target.value, now).viaShared
+                          ? { model: e.target.value, useShared: true }
+                          : { model: e.target.value },
+                      )
+                    }
                   >
                     {!model && <option value="">(지금은 쓸 수 없는 모델)</option>}
-                    {option.models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label}
-                      </option>
-                    ))}
+                    {option.models.map((m) => {
+                      const lim = modelLimit(option, m.id, now);
+                      return (
+                        <option key={m.id} value={m.id} disabled={lim.blocked && m.id !== model?.id}>
+                          {m.label}
+                          {lim.blocked && lim.until !== null ? ` (한도 · ${untilText(lim.until)}까지)` : ""}
+                        </option>
+                      );
+                    })}
                   </select>
                 </label>
               )}

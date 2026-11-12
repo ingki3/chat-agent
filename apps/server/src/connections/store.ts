@@ -1,11 +1,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { and, asc, eq, gte, isNotNull, isNull, lte } from "drizzle-orm";
+import { and, asc, eq, gt, gte, isNull, lt, lte } from "drizzle-orm";
 import {
   DEFAULT_PERMISSIONS,
+  limitApplies,
   type Connection,
   type ConnectionAuthType,
+  type ConnectionLimit,
   type ConnectionScope,
   type ConnectionStatus,
   type RuntimeId,
@@ -14,7 +16,7 @@ import {
 import type { UserRow } from "../auth/users.js";
 import { decrypt, encrypt, mask } from "../crypto/secrets.js";
 import type { Db } from "../db/client.js";
-import { connections, runtimePolicies, runtimeSessions, users } from "../db/schema.js";
+import { connectionLimits, connections, runtimePolicies, runtimeSessions, users } from "../db/schema.js";
 import { scrubKnown } from "../secrets/known.js";
 
 export type ConnectionRow = typeof connections.$inferSelect;
@@ -61,7 +63,8 @@ const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export type EffectivePolicy = Omit<RuntimePolicy, "runtime">;
 
-export function toConnection(c: ConnectionRow): Connection {
+/** `limits`: the connection's usage limits in force (`ConnectionStore.limits`). */
+export function toConnection(c: ConnectionRow, limits: ConnectionLimit[] = []): Connection {
   return {
     id: c.id,
     runtime: c.runtime as RuntimeId,
@@ -74,7 +77,7 @@ export function toConnection(c: ConnectionRow): Connection {
     status: c.status,
     lastTestAt: c.lastTestAt ?? null,
     lastTestCode: c.lastTestCode ?? null,
-    limitedUntil: c.limitedUntil !== null && c.limitedUntil > Date.now() ? c.limitedUntil : null,
+    limits,
     // `env-import`: brought over from `.env` (connections/import.ts), not registered by someone else.
     registeredByAdmin:
       c.scope === "personal" && !!c.createdBy && c.createdBy !== c.ownerId && c.createdBy !== "env-import",
@@ -97,7 +100,8 @@ export type ResolvedConnection = {
  * nothing here ever returns a credential except `resolve`, which only adapters call when a run starts.
  */
 export class ConnectionStore {
-  private readonly now: () => number;
+  /** The store's clock (limits are recorded and compared against it). */
+  readonly now: () => number;
   constructor(
     private readonly db: Db,
     private readonly masterKey: Buffer,
@@ -210,7 +214,6 @@ export class ConnectionStore {
       status: "untested",
       lastTestAt: null,
       lastTestCode: null,
-      limitedUntil: null,
       disconnectedAt: null,
       createdAt: t,
       updatedAt: t,
@@ -237,8 +240,8 @@ export class ConnectionStore {
       set.status = "untested";
       set.lastTestAt = null;
       set.lastTestCode = null;
-      set.limitedUntil = null;
     }
+    if (patch.secret !== undefined) this.dropLimits(id);
     // After the new key (if any) is registered: a label holding it is scrubbed too.
     if (patch.label !== undefined) set.label = scrubKnown(patch.label);
     this.db.update(connections).set(set).where(eq(connections.id, id)).run();
@@ -282,7 +285,6 @@ export class ConnectionStore {
       status: "untested",
       lastTestAt: null,
       lastTestCode: null,
-      limitedUntil: null,
       disconnectedAt: null,
       createdAt: t,
       updatedAt: t,
@@ -311,11 +313,11 @@ export class ConnectionStore {
         status: "untested",
         lastTestAt: null,
         lastTestCode: null,
-        limitedUntil: null,
         updatedAt: this.now(),
       })
       .where(and(eq(connections.id, id), isNull(connections.disconnectedAt)))
       .run();
+    this.dropLimits(id);
     return this.get(id)!;
   }
 
@@ -407,14 +409,7 @@ export class ConnectionStore {
     return (
       this.db
         .update(connections)
-        // A passed test also ends a usage limit (#19): the provider answers again.
-        .set({
-          status,
-          lastTestAt: t,
-          lastTestCode: code,
-          ...(status === "passed" ? { limitedUntil: null } : {}),
-          updatedAt: t,
-        })
+        .set({ status, lastTestAt: t, lastTestCode: code, updatedAt: t })
         .where(
           and(
             eq(connections.id, id),
@@ -454,22 +449,62 @@ export class ConnectionStore {
 
   // ---- usage limits (#19, FR-12.6) ----
 
-  /** The provider refused this connection for its usage limit: no new conversation starts on it until `until`. */
-  markLimited(id: string, until: number): void {
-    this.db.update(connections).set({ limitedUntil: until }).where(eq(connections.id, id)).run();
-  }
-
-  /** A reply finished on it (or a test passed): the limit is over. */
-  clearLimit(id: string): void {
+  /**
+   * The provider refused this connection for its usage limit: no new conversation starts on a model `scope` covers
+   * until `until`. `recordedAt`: when it was refused (only later evidence ends it). A newer record of the same scope
+   * replaces the older one.
+   */
+  recordLimit(id: string, scope: string, until: number, recordedAt: number): void {
     this.db
-      .update(connections)
-      .set({ limitedUntil: null })
-      .where(and(eq(connections.id, id), isNotNull(connections.limitedUntil)))
+      .insert(connectionLimits)
+      .values({ connectionId: id, scope, until, recordedAt })
+      .onConflictDoUpdate({
+        target: [connectionLimits.connectionId, connectionLimits.scope],
+        set: { until, recordedAt },
+      })
       .run();
   }
 
-  limited(c: Pick<ConnectionRow, "limitedUntil">): boolean {
-    return c.limitedUntil !== null && c.limitedUntil > this.now();
+  /** The limits in force now. */
+  limits(id: string): ConnectionLimit[] {
+    const now = this.now();
+    return this.db
+      .select()
+      .from(connectionLimits)
+      .where(and(eq(connectionLimits.connectionId, id), gt(connectionLimits.until, now)))
+      .all()
+      .map((r) => ({ scope: r.scope, until: r.until }));
+  }
+
+  /** Until when `model` is limited on this connection (the latest applicable limit), or null. */
+  limitedUntil(id: string, model: string): number | null {
+    const ends = this.limits(id)
+      .filter((l) => limitApplies(l.scope, model))
+      .map((l) => l.until);
+    return ends.length ? Math.max(...ends) : null;
+  }
+
+  /**
+   * Evidence the provider answers again: a reply on `model` that started at `startedAt`, or a passed test. Ends only
+   * the limits recorded *before* that start and covering that model — a run accepted before the limit, finishing
+   * late, or a success on another model proves nothing about them.
+   */
+  clearLimits(id: string, evidence: { model: string; startedAt: number }): void {
+    for (const r of this.db
+      .select()
+      .from(connectionLimits)
+      .where(and(eq(connectionLimits.connectionId, id), lt(connectionLimits.recordedAt, evidence.startedAt)))
+      .all())
+      if (limitApplies(r.scope, evidence.model))
+        this.db
+          .delete(connectionLimits)
+          .where(and(eq(connectionLimits.connectionId, id), eq(connectionLimits.scope, r.scope)))
+          .run();
+  }
+
+  /** A new credential: whatever limited the old one does not apply. */
+  private dropLimits(id: string): void {
+    this.db.delete(connectionLimits).where(eq(connectionLimits.connectionId, id)).run();
   }
 
   // ---- policies ----

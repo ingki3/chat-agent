@@ -176,6 +176,19 @@ describe("Claude adapter (#15): event translation", () => {
         (e) => e.type === "limit",
       ),
     ).not.toHaveProperty("resetsAt");
+    // A model-specific window limits only that family; the plan's own windows the whole connection (#19).
+    const opus = (
+      await run([
+        sdk.init({ session: "s" }),
+        sdk.rateLimit("rejected", undefined, "seven_day_opus"),
+        sdk.result(),
+      ])
+    ).find((e) => e.type === "limit");
+    expect(opus).toMatchObject({ modelFamily: "opus" });
+    const plan = (
+      await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected", undefined, "five_hour"), sdk.result()])
+    ).find((e) => e.type === "limit");
+    expect(plan).not.toHaveProperty("modelFamily");
     expect(
       (await run([sdk.init({ session: "s" }), sdk.rateLimit("allowed"), sdk.result()])).some(
         (e) => e.type === "limit",

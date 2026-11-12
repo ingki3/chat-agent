@@ -5,6 +5,7 @@ import {
   MessagePart,
   publicParts,
   type ChatSettings,
+  type FallbackNotice,
   type Conversation,
   type Message,
   type RuntimeId,
@@ -29,6 +30,23 @@ export function settingsOf(c: ConversationRow): ChatSettings | null {
   return { runtime: c.runtime, model: c.model, effort: c.effort ?? null, useShared: c.useShared };
 }
 
+const noticeFor = (s: ChatSettings, limitedUntil: number | undefined) => ({
+  runtime: s.runtime,
+  model: s.model,
+  ...(limitedUntil !== undefined ? { limitedUntil } : {}),
+});
+/** A stored fallback notice, checked (null when it is not one). */
+function noticeOf(v: unknown): FallbackNotice | null {
+  const n = v as { runtime?: unknown; model?: unknown; limitedUntil?: unknown } | null;
+  if (!n || (n.runtime !== "claude-code" && n.runtime !== "codex") || typeof n.model !== "string")
+    return null;
+  return {
+    runtime: n.runtime,
+    model: n.model,
+    ...(typeof n.limitedUntil === "number" ? { limitedUntil: n.limitedUntil } : {}),
+  };
+}
+
 /** What a reply was answered with — the divider rule compares these (#19). */
 export type AnsweredWith = { runtime: string; model: string; effort: string | null; label: string };
 
@@ -44,10 +62,7 @@ export function toConversation(c: ConversationRow): Conversation {
     revision: c.revision,
     researchMode: c.researchMode,
     settings: settingsOf(c),
-    fallbackNotice:
-      c.fallbackNotice && (c.fallbackNotice.runtime === "claude-code" || c.fallbackNotice.runtime === "codex")
-        ? { runtime: c.fallbackNotice.runtime, model: c.fallbackNotice.model }
-        : null,
+    fallbackNotice: noticeOf(c.fallbackNotice),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -118,6 +133,8 @@ export class ConversationStore {
       settings?: ChatSettings | null | undefined;
       /** The start used the fallback: show the notice once. */
       fallback?: boolean | undefined;
+      /** The default was at a usage limit until then (the notice says so). */
+      limitedUntil?: number | undefined;
     } = {},
   ): ConversationRow {
     const t = this.now();
@@ -136,10 +153,7 @@ export class ConversationStore {
       model: opts.settings?.model ?? null,
       effort: opts.settings?.effort ?? null,
       useShared: opts.settings?.useShared ?? false,
-      fallbackNotice:
-        opts.settings && opts.fallback
-          ? { runtime: opts.settings.runtime, model: opts.settings.model }
-          : null,
+      fallbackNotice: opts.settings && opts.fallback ? noticeFor(opts.settings, opts.limitedUntil) : null,
       nextSeq: 1,
       createdAt: t,
       updatedAt: t,
@@ -153,7 +167,7 @@ export class ConversationStore {
    * Not activity (the "recent" order stays). A change by the chip ends a pending fallback notice — it was about how
    * the conversation started, and the chip now shows the user's own choice.
    */
-  setSettings(id: string, s: ChatSettings, opts: { fallback?: boolean } = {}): void {
+  setSettings(id: string, s: ChatSettings, opts: { fallback?: boolean; limitedUntil?: number } = {}): void {
     this.db
       .update(conversations)
       .set({
@@ -161,7 +175,7 @@ export class ConversationStore {
         model: s.model,
         effort: s.effort,
         useShared: s.useShared,
-        fallbackNotice: opts.fallback ? { runtime: s.runtime, model: s.model } : null,
+        fallbackNotice: opts.fallback ? noticeFor(s, opts.limitedUntil) : null,
       })
       .where(eq(conversations.id, id))
       .run();
@@ -171,7 +185,7 @@ export class ConversationStore {
    * Takes the fallback notice (#19): one statement clears it and returns what it was, so of any number of callers —
    * tabs, reloads, concurrent requests — exactly one gets it. Null for everyone else.
    */
-  consumeFallbackNotice(id: string): { runtime: RuntimeId; model: string } | null {
+  consumeFallbackNotice(id: string): FallbackNotice | null {
     // RETURNING gives the new value (null), so: read and clear in one immediate transaction; the clear only counts
     // when it still found the notice (changes = 1).
     const n = this.db.$client
@@ -192,10 +206,7 @@ export class ConversationStore {
       .immediate();
     if (!n) return null;
     try {
-      const v = JSON.parse(n) as { runtime?: unknown; model?: unknown };
-      return (v.runtime === "claude-code" || v.runtime === "codex") && typeof v.model === "string"
-        ? { runtime: v.runtime, model: v.model }
-        : null;
+      return noticeOf(JSON.parse(n));
     } catch {
       return null;
     }

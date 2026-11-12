@@ -93,7 +93,11 @@ export const conversations = sqliteTable(
     effort: text("effort"),
     useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
     /** `{ runtime, model }` JSON while the "기본값을 쓸 수 없어 ○○로 시작했어요" notice has not been shown yet. */
-    fallbackNotice: text("fallback_notice", { mode: "json" }).$type<{ runtime: string; model: string }>(),
+    fallbackNotice: text("fallback_notice", { mode: "json" }).$type<{
+      runtime: string;
+      model: string;
+      limitedUntil?: number;
+    }>(),
     /** Next message sequence number (per conversation, monotonically increasing). */
     nextSeq: integer("next_seq").notNull().default(1),
     createdAt: integer("created_at").notNull().default(now),
@@ -381,12 +385,6 @@ export const connections = sqliteTable(
     lastTestAt: integer("last_test_at"),
     /** Fixed code of the last test's outcome (`ok`, `test_no_stream`, `runtime_auth`, …) — never runtime text. */
     lastTestCode: text("last_test_code"),
-    /**
-     * Usage limit (FR-9.2, FR-12.6, #19): until when the provider refuses this connection — its reset time when the
-     * runtime said one, else a fixed cooldown. New conversations do not start on it meanwhile; a reply that
-     * finishes on it or a passed test clears it. The status stays `passed` (a limit is not an expiry).
-     */
-    limitedUntil: integer("limited_until"),
     disconnectedAt: integer("disconnected_at"),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
@@ -395,6 +393,26 @@ export const connections = sqliteTable(
     index("connections_owner_idx").on(t.ownerId),
     index("connections_scope_runtime_idx").on(t.scope, t.runtime),
   ],
+);
+
+/**
+ * Usage limits of a connection (#19, FR-9.2, FR-12.6), one row per scope (`ConnectionLimit` in @agentlee/shared:
+ * `all`, `family:<name>`, `model:<id>`). New conversations do not start on a model a limit covers until `until`.
+ * The connection's status stays `passed` (a limit is not an expiry). `recorded_at`: when the provider refused it —
+ * only a reply that *started* after it (on a model in its scope), a passed test started after it, or a new
+ * credential ends it early; an older run finishing late proves nothing.
+ */
+export const connectionLimits = sqliteTable(
+  "connection_limits",
+  {
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => connections.id, { onDelete: "cascade" }),
+    scope: text("scope").notNull(),
+    until: integer("until").notNull(),
+    recordedAt: integer("recorded_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.connectionId, t.scope] })],
 );
 
 /**

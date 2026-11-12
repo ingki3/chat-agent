@@ -52,6 +52,8 @@ export function registerConnectionRoutes(
   logins?: SubscriptionLoginService,
 ): void {
   const store = service.store;
+  // With the usage limits in force (#19): the chip shows them.
+  const out = (c: ConnectionRow) => toConnection(c, store.limits(c.id));
   app.resources.register(KIND, (id) => {
     const c = store.get(id);
     if (!c || c.disconnectedAt !== null) return undefined;
@@ -94,7 +96,7 @@ export function registerConnectionRoutes(
         scope: c.scope,
         authType: c.authType,
       });
-      return send(reply, 201, { connection: toConnection(c) });
+      return send(reply, 201, { connection: out(c) });
     } catch (e) {
       return handle(reply, e);
     }
@@ -104,7 +106,7 @@ export function registerConnectionRoutes(
     const body = UpdateConnectionRequest.safeParse(req.body);
     if (!body.success) return fail(reply, 400, "invalid_request");
     try {
-      return send(reply, 200, { connection: toConnection(await service.update(c.id, body.data)) });
+      return send(reply, 200, { connection: out(await service.update(c.id, body.data)) });
     } catch (e) {
       return handle(reply, e);
     }
@@ -112,7 +114,7 @@ export function registerConnectionRoutes(
   const test = async (reply: FastifyReply, c: ConnectionRow, userId: string) => {
     try {
       const result = await service.test(c, userId);
-      return send(reply, 200, { result, connection: toConnection(store.get(c.id)!) });
+      return send(reply, 200, { result, connection: out(store.get(c.id)!) });
     } catch (e) {
       return handle(reply, e);
     }
@@ -149,7 +151,7 @@ export function registerConnectionRoutes(
         const c = login.connectionId ? store.get(login.connectionId) : undefined;
         return send(reply, 200, {
           login,
-          connection: c && login.status === "completed" && c.disconnectedAt === null ? toConnection(c) : null,
+          connection: c && login.status === "completed" && c.disconnectedAt === null ? out(c) : null,
         });
       } catch (e) {
         return handle(reply, e);
@@ -174,7 +176,7 @@ export function registerConnectionRoutes(
   app.get(
     "/api/connections",
     { config: { noResource: "lists only the caller's own connections" } },
-    (req, reply) => send(reply, 200, { items: store.personal(req.ctx.user!.id).map(toConnection) }),
+    (req, reply) => send(reply, 200, { items: store.personal(req.ctx.user!.id).map(out) }),
   );
   app.post(
     "/api/connections",
@@ -182,7 +184,7 @@ export function registerConnectionRoutes(
     (req, reply) => create(req, reply, "personal", req.ctx.user!.id),
   );
   app.get<{ Params: { id: string } }>("/api/connections/:id", { config: own("read") }, (req, reply) =>
-    send(reply, 200, { connection: toConnection(store.get(req.params.id)!) }),
+    send(reply, 200, { connection: out(store.get(req.params.id)!) }),
   );
   app.patch<{ Params: { id: string } }>("/api/connections/:id", { config: own("write") }, (req, reply) =>
     update(req, reply, store.get(req.params.id)!),
@@ -211,7 +213,7 @@ export function registerConnectionRoutes(
           defaultEffort: m.defaultEffort ?? null,
         })),
         needsConnection: caps.needsConnection === true,
-        connections: caps.needsConnection ? store.usableFor(user, id).map(toConnection) : [],
+        connections: caps.needsConnection ? store.usableFor(user, id).map(out) : [],
       });
     }
     return items;
@@ -241,7 +243,7 @@ export function registerConnectionRoutes(
   };
   app.get("/api/admin/connections", { config: admin }, (_req, reply) =>
     send(reply, 200, {
-      items: store.shared().map(toConnection),
+      items: store.shared().map(out),
       // `.env` values the last start could not import (docs/ops.md §11): fix `.env` and restart.
       importFailures: service.importFailures,
     }),
@@ -265,7 +267,7 @@ export function registerConnectionRoutes(
   type UserParams = { id: string };
   app.get<{ Params: UserParams }>("/api/admin/users/:id/connections", { config: admin }, (req, reply) =>
     users.byId(req.params.id)
-      ? send(reply, 200, { items: store.personal(req.params.id).map(toConnection) })
+      ? send(reply, 200, { items: store.personal(req.params.id).map(out) })
       : fail(reply, 404, "not_found"),
   );
   app.post<{ Params: UserParams }>("/api/admin/users/:id/connections", { config: admin }, (req, reply) =>

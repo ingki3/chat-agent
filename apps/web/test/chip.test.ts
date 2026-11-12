@@ -5,6 +5,7 @@ import {
   canChooseShared,
   chipLabel,
   differs,
+  modelLimit,
   runtimeLimit,
   noticeText,
   takeFallbackNotice,
@@ -23,7 +24,7 @@ const conn = (scope: "personal" | "shared") => ({
   status: "passed" as const,
   lastTestAt: null,
   lastTestCode: null,
-  limitedUntil: null as number | null,
+  limits: [] as { scope: string; until: number }[],
   registeredByAdmin: false,
   createdAt: 0,
 });
@@ -119,35 +120,50 @@ describe("the fallback notice on the page (review #101)", () => {
 
 describe("usage limits in the chip (review #101)", () => {
   const now = 1_000_000;
-  const opt = (personal: number | null | undefined, shared: number | null | undefined) =>
+  type L = { scope: string; until: number }[];
+  const opt = (personal: L | undefined, shared: L | undefined) =>
     ({
       ...options[0]!,
       connections: [
-        ...(personal === undefined ? [] : [{ ...conn("personal"), limitedUntil: personal }]),
-        ...(shared === undefined ? [] : [{ ...conn("shared"), limitedUntil: shared }]),
+        ...(personal === undefined ? [] : [{ ...conn("personal"), limits: personal }]),
+        ...(shared === undefined ? [] : [{ ...conn("shared"), limits: shared }]),
       ],
     }) as RuntimeOption;
-  it("blocks a runtime whose connections are all at their limit; an expired limit does not count", () => {
-    expect(runtimeLimit(opt(now + 10, undefined), now)).toEqual({
+  const all = (until: number) => [{ scope: "all", until }];
+  it("a connection-wide limit blocks every model; an expired one does not count", () => {
+    expect(runtimeLimit(opt(all(now + 10), undefined), now)).toEqual({
       blocked: true,
       viaShared: false,
       until: now + 10,
     });
-    expect(runtimeLimit(opt(now + 10, now + 20), now)).toMatchObject({ blocked: true, until: now + 10 });
-    expect(runtimeLimit(opt(now - 1, undefined), now)).toEqual({
+    expect(runtimeLimit(opt(all(now - 1), undefined), now)).toEqual({
       blocked: false,
       viaShared: false,
       until: null,
     });
-    expect(runtimeLimit(opt(null, undefined), now).blocked).toBe(false);
+  });
+  it("an Opus-only limit blocks Opus, not Haiku — so the runtime stays usable", () => {
+    const o = opt([{ scope: "family:opus", until: now + 10 }], undefined);
+    expect(modelLimit(o, "claude-opus-5-5", now)).toMatchObject({ blocked: true, until: now + 10 });
+    expect(modelLimit(o, "claude-haiku-5-5", now)).toEqual({ blocked: false, viaShared: false, until: null });
+    expect(runtimeLimit(o, now).blocked).toBe(false);
+    // An API key's per-model limit: only that model.
+    const m = opt([{ scope: "model:claude-haiku-5-5", until: now + 10 }], undefined);
+    expect(modelLimit(m, "claude-haiku-5-5", now).blocked).toBe(true);
+    expect(modelLimit(m, "claude-opus-5-5", now).blocked).toBe(false);
   });
   it("only the personal one limited: switch via 공용으로 쓰기 instead", () => {
-    expect(runtimeLimit(opt(now + 10, null), now)).toEqual({
+    expect(runtimeLimit(opt(all(now + 10), []), now)).toEqual({
       blocked: false,
       viaShared: true,
       until: now + 10,
     });
     // Shared limited but personal free: the run takes the personal one anyway.
-    expect(runtimeLimit(opt(null, now + 10), now)).toMatchObject({ blocked: false, viaShared: false });
+    expect(runtimeLimit(opt([], all(now + 10)), now)).toMatchObject({ blocked: false, viaShared: false });
+  });
+  it("the notice names a usage limit as the cause and when it ends", () => {
+    expect(noticeText({ runtime: "codex", model: "gpt-6-luna", limitedUntil: now }, options)).toMatch(
+      /^기본값을 쓸 수 없어 Codex · GPT-6 Luna로 시작했어요 \(사용 한도 · .+ 이후 다시 쓸 수 있어요\)$/,
+    );
   });
 });

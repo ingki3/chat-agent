@@ -15,8 +15,18 @@ import type { RuntimeCapabilities, RuntimeRegistry } from "../runtime/adapter.js
 /** The fixed runtime order of the FR-12.6 fallback ("다른 런타임(Claude Code → Codex 순)"). */
 export const RUNTIME_ORDER: readonly RuntimeId[] = ["claude-code", "codex"];
 
-/** Where a new conversation starts (#19): the settings, and whether the default itself could not be used. */
-export type StartSettings = { settings: ChatSettings; fallback: boolean };
+/**
+ * Where a new conversation starts (#19): the settings, whether the default itself could not be used, and — when that
+ * was a usage limit — until when.
+ */
+export type StartSettings = { settings: ChatSettings; fallback: boolean; limitedUntil?: number };
+
+/** The candidate's connection is at a usage limit covering its model (403 `connection_limited` for the chip). */
+class LimitedError extends RunAccessDenied {
+  constructor(readonly until: number) {
+    super("connection_limited");
+  }
+}
 
 /**
  * Default runtime, model and effort (PRD D3, FR-12.1·12.3·12.4, #35). The user's own choice wins, then the admin's
@@ -59,6 +69,7 @@ export class DefaultsService {
       unavailable,
       start: start?.settings ?? null,
       fallback: start?.fallback ?? false,
+      limitedUntil: start?.limitedUntil ?? null,
     };
   }
 
@@ -69,25 +80,28 @@ export class DefaultsService {
 
   /**
    * One candidate: `runtime` with the explicit `requested` model / effort (null when not allowed) and `current` as
-   * the implicit preference. Usable = the run check passes *and* there is a connection to run it with.
+   * the implicit preference. Usable = the run check passes, there is a connection to run it with, and that connection
+   * is not at a usage limit covering the model. `seen.limitedUntil` notes a limit that stopped it (for the notice).
    */
   private attempt(
     userId: string,
     runtime: RuntimeId,
     requested: RunChoice,
     current: { model: string | null; effort: string | null },
+    seen?: { limitedUntil?: number },
   ): ChatSettings | null {
     try {
       return this.settle(userId, runtime, requested, current, { limit: true });
     } catch (e) {
+      if (e instanceof LimitedError && seen) seen.limitedUntil = e.until;
       if (e instanceof RunAccessDenied) return null;
       throw e;
     }
   }
 
   /**
-   * As `attempt`, but throws the refusal (403 for the chip). `limit`: a connection at its usage limit does not count
-   * (FR-12.6 "한도 도달") — for new conversations, and for the chip when it moves a conversation onto it.
+   * As `attempt`, but throws the refusal (403 for the chip). `limit`: a connection at a usage limit covering the model
+   * does not count (FR-12.6 "한도 도달") — for new conversations, and for the chip when it moves a conversation onto it.
    */
   private settle(
     userId: string,
@@ -101,39 +115,71 @@ export class DefaultsService {
     const s = this.access.resolve({ userId, runtime, capabilities, requested, current });
     // Allowed but nothing to run it with (no passed connection, or no shared one for "공용으로 쓰기").
     if (capabilities.needsConnection && !s.connectionId) throw new RunAccessDenied("connection_not_allowed");
-    if (opts.limit && s.connectionId && this.access.connectionLimited(s.connectionId))
-      throw new RunAccessDenied("connection_limited");
+    const until =
+      opts.limit && s.connectionId ? this.access.connectionLimitedUntil(s.connectionId, s.model.id) : null;
+    if (until !== null) throw new LimitedError(until);
     return { runtime, model: s.model.id, effort: s.effort, useShared: s.useShared };
   }
 
   /** The saved model of `runtime` as a preference: its effort is kept when still allowed, else the model's own. */
-  private withDefault(userId: string, runtime: RuntimeId, d: ModelDefault): ChatSettings | null {
-    return this.attempt(userId, runtime, { model: d.model }, { model: d.model, effort: d.effort });
+  private withDefault(
+    userId: string,
+    runtime: RuntimeId,
+    d: ModelDefault,
+    seen?: { limitedUntil?: number },
+  ): ChatSettings | null {
+    return this.attempt(userId, runtime, { model: d.model }, { model: d.model, effort: d.effort }, seen);
+  }
+
+  /**
+   * The first usable model of `runtime` in the model-list order (the adapter's catalogue — the admin's model list,
+   * 20.3), skipping ones not allowed or at a limit; the saved model keeps its saved effort.
+   */
+  private firstUsable(
+    userId: string,
+    runtime: RuntimeId,
+    saved: ModelDefault | undefined,
+  ): ChatSettings | null {
+    for (const m of this.caps(runtime)?.models ?? []) {
+      const effort = saved?.model === m.id ? saved.effort : null;
+      const s = this.attempt(userId, runtime, { model: m.id }, { model: m.id, effort });
+      if (s) return s;
+    }
+    return null;
   }
 
   /**
    * What a new conversation starts with (FR-3.5, FR-12.2·12.6): the default runtime with its default model; else
-   * the same runtime's first allowed model in the admin's model-list order; else the other runtimes in the order
-   * Claude Code → Codex, each with the user's default model for it (else its first allowed model); else nothing
-   * (null: "쓸 수 있는 런타임이 없어요"). `fallback` = the default runtime·model itself was not usable.
-   * A default runtime without a saved model starts on its first allowed model — that is the default, not a fallback.
+   * the same runtime's first usable allowed model in the model-list order; else the other runtimes in the order
+   * Claude Code → Codex, each with the user's default model for it (else its first usable allowed model); else
+   * nothing (null: "쓸 수 있는 런타임이 없어요"). `fallback` = the default runtime·model itself was not usable;
+   * `limitedUntil` = it was because of a usage limit, until then. A default runtime without a saved model starts on
+   * its first allowed model — that is the default, not a fallback.
    */
   start(user: UserRow): StartSettings | null {
     const { defaults } = this.resolved(user);
     const first = defaults.runtime;
     const saved = defaults.models[first];
     const none = { model: null, effort: null };
-    const exact = saved ? this.withDefault(user.id, first, saved) : this.attempt(user.id, first, {}, none);
+    const seen: { limitedUntil?: number } = {};
+    const exact = saved
+      ? this.withDefault(user.id, first, saved, seen)
+      : this.attempt(user.id, first, {}, none, seen);
     if (exact) return { settings: exact, fallback: false };
-    // 1. the same runtime, its first allowed model (the admin's list order)
-    const sameRuntime = saved ? this.attempt(user.id, first, {}, none) : null;
-    if (sameRuntime) return { settings: sameRuntime, fallback: true };
-    // 2. the other runtimes, Claude Code → Codex: the user's default model there, else its first allowed one
+    const fell = (settings: ChatSettings): StartSettings => ({
+      settings,
+      fallback: true,
+      ...(seen.limitedUntil !== undefined ? { limitedUntil: seen.limitedUntil } : {}),
+    });
+    // 1. the same runtime, its first usable allowed model (the model-list order)
+    const sameRuntime = this.firstUsable(user.id, first, saved);
+    if (sameRuntime) return fell(sameRuntime);
+    // 2. the other runtimes, Claude Code → Codex: the user's default model there, else its first usable one
     for (const runtime of RUNTIME_ORDER) {
       if (runtime === first) continue;
       const d = defaults.models[runtime];
-      const s = (d && this.withDefault(user.id, runtime, d)) ?? this.attempt(user.id, runtime, {}, none);
-      if (s) return { settings: s, fallback: true };
+      const s = (d && this.withDefault(user.id, runtime, d)) ?? this.firstUsable(user.id, runtime, d);
+      if (s) return fell(s);
     }
     return null;
   }
@@ -168,9 +214,27 @@ export class DefaultsService {
           : { model: patch.model, effort: null };
     } else if (runtimeChanged) preference = { model: saved?.model ?? null, effort: saved?.effort ?? null };
     else preference = { model: base?.model ?? null, effort: base?.effort ?? null };
-    // Moving onto another runtime or connection checks its usage limit; changing the model or effort of the one the
+    // Moving onto another runtime, model or connection checks its usage limit; changing only the effort of what the
     // conversation is already on does not (the limit is already in its way, and the chip says so).
-    const moves = runtimeChanged || (patch.useShared !== undefined && patch.useShared !== base?.useShared);
-    return this.settle(user.id, runtime, requested, preference, { limit: moves });
+    const moves =
+      runtimeChanged ||
+      (patch.model !== undefined && patch.model !== base?.model) ||
+      (patch.useShared !== undefined && patch.useShared !== base?.useShared);
+    try {
+      return this.settle(user.id, runtime, requested, preference, { limit: moves });
+    } catch (e) {
+      // Only the runtime was picked and its default model is at a limit: its first model that is not (FR-12.3).
+      if (!(e instanceof LimitedError) || patch.model !== undefined || patch.effort !== undefined) throw e;
+      for (const m of this.caps(runtime)?.models ?? []) {
+        const s = this.attempt(
+          user.id,
+          runtime,
+          { ...requested, model: m.id },
+          { model: m.id, effort: null },
+        );
+        if (s) return s;
+      }
+      throw e;
+    }
   }
 }

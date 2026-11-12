@@ -82,6 +82,7 @@ describe("database", () => {
       "artifact_versions",
       "artifacts",
       "citations",
+      "connection_limits",
       "connections",
       "conversations",
       "error_log",

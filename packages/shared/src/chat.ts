@@ -157,7 +157,7 @@ export const Conversation = z.object({
    * Set when the conversation started on the FR-12.6 fallback because the default could not be used: the chip shows
    * "기본값을 쓸 수 없어 ○○로 시작했어요" once: only the page whose `POST …/fallback-notice/consume` takes it shows it.
    */
-  fallbackNotice: z.object({ runtime: RuntimeId, model: z.string() }).nullable(),
+  fallbackNotice: z.lazy(() => FallbackNotice).nullable(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -188,8 +188,15 @@ export const UpdateConversationRequest = z
  * `POST /api/conversations/:id/fallback-notice/consume` (#19): takes the fallback notice atomically — the first caller
  * gets it, every later (or concurrent) one gets null — so it is shown once across tabs and reloads.
  */
+/** What a conversation started on instead of the default; `limitedUntil` when the default was at a usage limit. */
+export const FallbackNotice = z.object({
+  runtime: RuntimeId,
+  model: z.string(),
+  limitedUntil: z.number().optional(),
+});
+export type FallbackNotice = z.infer<typeof FallbackNotice>;
 export const ConsumeFallbackNoticeResponse = z.object({
-  notice: z.object({ runtime: RuntimeId, model: z.string() }).nullable(),
+  notice: z.lazy(() => FallbackNotice).nullable(),
 });
 export type ConsumeFallbackNoticeResponse = z.infer<typeof ConsumeFallbackNoticeResponse>;
 export const ListMessagesQuery = z.object({

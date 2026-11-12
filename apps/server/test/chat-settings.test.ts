@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +13,7 @@ import {
   type RuntimeId,
 } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
-import { LIMIT_COOLDOWN_MS, limitUntil } from "../src/connections/service.js";
+import { API_KEY_COOLDOWN_MS, SUBSCRIPTION_COOLDOWN_MS, limitFor } from "../src/connections/service.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { CLAUDE_MODELS } from "../src/runtime/claude.js";
@@ -47,6 +48,21 @@ async function start(o: { script?: FakeScript } = {}) {
     runtimes,
     runs: { flushMs: 0 },
     notifications: { sender: async () => {} },
+    // The connection test's skill check, in process (as in connections.test.ts).
+    mcp: {
+      runSkill: async (_skill, input) => {
+        const text = String(input.text);
+        return {
+          ok: true,
+          output: {
+            characters: [...text].length,
+            sha256: crypto.createHash("sha256").update(text, "utf8").digest("hex"),
+            reversed: [...text].reverse().join(""),
+          },
+        };
+      },
+    },
+    connectionTest: { timeoutMs: 5000 },
   });
   closers.push(() => app.close());
   const f = await createFamily(app);
@@ -126,6 +142,7 @@ async function start(o: { script?: FakeScript } = {}) {
     );
   const setDefaults = async (defaults: object | null) => owner.put("/api/settings/defaults", { defaults });
   return {
+    as,
     app,
     f,
     owner,
@@ -747,77 +764,213 @@ describe("changing the defaults never changes an existing conversation (FR-12.5)
   });
 });
 
-describe("a usage limit is an FR-12.6 fallback condition (review #101)", () => {
-  it("Claude at its limit: new conversations start on Codex with the notice; back after the reset or a finished reply", async () => {
-    const t = await start();
-    const claudeCon = t.connect("claude-code", null);
-    t.connect("codex", null);
+describe("a usage limit is an FR-12.6 fallback condition (reviews #101 1·2)", () => {
+  /** Replies by message: limits of each kind, a slow reply, else "ok". */
+  const script: FakeScript = (input) =>
+    input.text === "429"
+      ? [{ limit: "한도" }]
+      : input.text === "429-retry"
+        ? [{ limit: "한도", retryAfterMs: 5 * 60_000 }]
+        : input.text === "opus-window"
+          ? [{ limit: "한도", modelFamily: "opus" }]
+          : input.text === "plan-window"
+            ? [{ limit: "한도" }]
+            : input.text === "느리게"
+              ? [{ delayMs: 150 }, { text: "ok" }]
+              : [{ text: "ok" }];
+  const SUB_TOKEN = `admin-claude-subscription-token-${"t".repeat(20)}`;
+  /** The admin's own Claude subscription (only an admin may have one, D2), passed. */
+  const subscription = (t: T) => {
     const store = t.app.connections!.store;
+    const c = store.create({
+      runtime: "claude-code",
+      authType: "subscription",
+      scope: "personal",
+      owner: t.f.users.admin,
+      createdBy: t.f.users.admin.id,
+      secret: SUB_TOKEN,
+    });
+    store.setTestResult(c.id, "passed", "ok", 1);
+    return c;
+  };
+  const runAs = async (
+    t: T,
+    who: "owner" | "shared" | "admin",
+    conversationId: string,
+    text: string,
+    extra = {},
+  ) => {
+    const r = await t.as(who).post(`/api/conversations/${conversationId}/messages`, { text, ...extra });
+    expect(r.statusCode).toBe(201);
+    return t.settle(StartRunResponse.parse(r.json()).run.id);
+  };
+  const newAs = async (t: T, who: "owner" | "shared" | "admin", body: object = {}) =>
+    Conversation.parse((await t.as(who).post("/api/conversations", body)).json());
+  const limitRows = (t: T, id: string) =>
+    t.app.connections!.store.limits(id).sort((a, b) => a.scope.localeCompare(b.scope));
+
+  it("API key: a 429 limits only its model, for a minute (or the provider's retry-after) — not the whole family's key", async () => {
+    const t = await start({ script });
+    const key = t.connect("claude-code", null); // the shared key
+    t.connect("codex", null);
     const c = await t.newConversation();
-    expect(c.settings).toMatchObject({ runtime: "claude-code" });
     const before = Date.now();
-    expect((await t.send(c.id, "/limit")).errorCode).toBe("usage_limit");
-    // No reset time from the fake runtime: the documented cooldown.
-    const until = store.get(claudeCon.id)!.limitedUntil!;
-    expect(until).toBeGreaterThanOrEqual(before + LIMIT_COOLDOWN_MS);
-    expect(until).toBeLessThanOrEqual(Date.now() + LIMIT_COOLDOWN_MS);
-    expect(store.get(claudeCon.id)!.status).toBe("passed");
+    expect((await t.send(c.id, "429")).errorCode).toBe("usage_limit");
+    const [l] = limitRows(t, key.id);
+    expect(l!.scope).toBe("model:claude-opus-5-5");
+    expect(l!.until).toBeGreaterThanOrEqual(before + API_KEY_COOLDOWN_MS);
+    expect(l!.until).toBeLessThanOrEqual(Date.now() + API_KEY_COOLDOWN_MS);
+    // Mom (same shared key, nothing set → Opus): Claude stays, on its next usable model; the notice names the cause.
+    const mom = await newAs(t, "shared");
+    expect(mom.settings).toMatchObject({ runtime: "claude-code", model: "claude-sonnet-5-5" });
+    expect(mom.fallbackNotice).toEqual({
+      runtime: "claude-code",
+      model: "claude-sonnet-5-5",
+      limitedUntil: l!.until,
+    });
+    // The provider's retry-after is used instead when it gave one.
+    const c2 = await t.newConversation({ settings: { runtime: "claude-code", model: "claude-haiku-5-5" } });
+    const at = Date.now();
+    await t.send(c2.id, "429-retry");
+    const haiku = limitRows(t, key.id).find((x) => x.scope === "model:claude-haiku-5-5")!;
+    expect(haiku.until).toBeGreaterThanOrEqual(at + 5 * 60_000);
+    expect(haiku.until).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+    // The minute passes: Opus again for everyone.
+    t.app.connections!.store.recordLimit(key.id, "model:claude-opus-5-5", Date.now() - 1, Date.now() - 2);
+    expect((await newAs(t, "shared")).settings).toMatchObject({ model: "claude-opus-5-5" });
+  });
 
-    const n = await t.newConversation();
-    expect(n.settings).toMatchObject({ runtime: "codex", model: "gpt-6.1-sol" });
-    expect(n.fallbackNotice).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
-    const d = DefaultsResponse.parse((await t.owner.get("/api/settings/defaults")).json());
-    expect(d).toMatchObject({ fallback: true, start: { runtime: "codex" } });
-    // The chip shows it limited and refuses moving onto it; the limited conversation itself may still be tuned.
-    const usable = RuntimeOption.array().parse(
-      (await t.owner.get("/api/runtimes/usable")).json<{ items: unknown }>().items,
-    );
-    expect(usable.find((o) => o.runtime === "claude-code")!.connections[0]!.limitedUntil).toBe(until);
-    const move = await t.owner.put(`/api/conversations/${n.id}/settings`, { runtime: "claude-code" });
+  it("subscription: a plan window without a reset time limits the whole connection for five hours", async () => {
+    const t = await start({ script });
+    const sub = subscription(t);
+    t.connect("codex", null);
+    const c = await newAs(t, "admin");
+    expect(c.settings).toMatchObject({ runtime: "claude-code", model: "claude-opus-5-5" });
+    const before = Date.now();
+    expect((await runAs(t, "admin", c.id, "plan-window")).connectionId).toBe(sub.id);
+    const [l] = limitRows(t, sub.id);
+    expect(l!.scope).toBe("all");
+    expect(l!.until).toBeGreaterThanOrEqual(before + SUBSCRIPTION_COOLDOWN_MS);
+    const n = await newAs(t, "admin");
+    expect(n.settings).toMatchObject({ runtime: "codex" });
+    expect(n.fallbackNotice).toMatchObject({ runtime: "codex", limitedUntil: l!.until });
+    const d = DefaultsResponse.parse((await t.as("admin").get("/api/settings/defaults")).json());
+    expect(d).toMatchObject({ fallback: true, limitedUntil: l!.until, start: { runtime: "codex" } });
+    // The chip refuses moving onto it (any model); tuning the effort of a conversation already on it is fine.
+    const move = await t.as("admin").put(`/api/conversations/${n.id}/settings`, { runtime: "claude-code" });
     expect([move.statusCode, move.json()]).toEqual([403, { error: "connection_limited" }]);
-    expect((await t.owner.put(`/api/conversations/${c.id}/settings`, { effort: "low" })).statusCode).toBe(
-      200,
+    expect(
+      (await t.as("admin").put(`/api/conversations/${c.id}/settings`, { effort: "low" })).statusCode,
+    ).toBe(200);
+    // The usable list carries the limit for the chip.
+    const usable = RuntimeOption.array().parse(
+      (await t.as("admin").get("/api/runtimes/usable")).json<{ items: unknown }>().items,
     );
-
-    // The reset time passes: Claude again, no notice.
-    store.markLimited(claudeCon.id, Date.now() - 1);
-    expect(await t.newConversation()).toMatchObject({
-      settings: { runtime: "claude-code" },
-      fallbackNotice: null,
-    });
-
-    // Limited again; a reply that then finishes on it (the user tried it again by hand) ends the limit.
-    await t.send(c.id, "/limit");
-    expect((await t.newConversation()).settings).toMatchObject({ runtime: "codex" });
-    expect(await t.send(c.id, "다시")).toMatchObject({ status: "done", connectionId: claudeCon.id });
-    expect(store.get(claudeCon.id)!.limitedUntil).toBeNull();
-    expect((await t.newConversation()).settings).toMatchObject({ runtime: "claude-code" });
-
-    // A passed connection test ends it too.
-    await t.send(c.id, "/limit");
-    store.setTestResult(claudeCon.id, "passed", "ok", 1);
-    expect((await t.newConversation()).settings).toMatchObject({ runtime: "claude-code" });
+    expect(usable.find((o) => o.runtime === "claude-code")!.connections[0]!.limits).toEqual([
+      { scope: "all", until: l!.until },
+    ]);
   });
 
-  it("a reset time the runtime reports is what the connection is limited until", async () => {
-    const resetsAt = Date.now() + 42 * 60_000;
-    const t = await start({
-      script: (input) => (input.text === "한도" ? [{ limit: "한도", resetsAt }] : [{ text: "ok" }]),
+  it("an Opus-only window leaves Sonnet usable; a Sonnet success does not end it", async () => {
+    const t = await start({ script });
+    const sub = subscription(t);
+    t.connect("codex", null);
+    const c = await newAs(t, "admin");
+    await runAs(t, "admin", c.id, "opus-window");
+    expect(limitRows(t, sub.id).map((l) => l.scope)).toEqual(["family:opus"]);
+    // Nothing set (Opus): same runtime, Sonnet — with the cause in the notice.
+    const n = await newAs(t, "admin");
+    expect(n.settings).toMatchObject({ runtime: "claude-code", model: "claude-sonnet-5-5" });
+    expect(n.fallbackNotice).toMatchObject({ model: "claude-sonnet-5-5", limitedUntil: expect.any(Number) });
+    // A Sonnet default stays exactly as it is (no fallback, no notice).
+    await t.as("admin").put("/api/settings/defaults", {
+      defaults: {
+        runtime: "claude-code",
+        models: { "claude-code": { model: "claude-sonnet-5-5", effort: null } },
+      },
     });
-    const claudeCon = t.connect("claude-code", null);
-    const c = await t.newConversation();
-    expect((await t.send(c.id, "한도")).errorCode).toBe("usage_limit");
-    expect(t.app.connections!.store.get(claudeCon.id)!.limitedUntil).toBe(resetsAt);
-    // Nothing else usable: new conversations have no start (the "no runtime" screen) until it resets.
-    expect((await t.newConversation()).settings).toBeNull();
+    const s = await newAs(t, "admin");
+    expect(s).toMatchObject({ settings: { model: "claude-sonnet-5-5" }, fallbackNotice: null });
+    // The chip: Sonnet → Opus is refused while the window lasts.
+    const toOpus = await t
+      .as("admin")
+      .put(`/api/conversations/${s.id}/settings`, { model: "claude-opus-5-5" });
+    expect([toOpus.statusCode, toOpus.json()]).toEqual([403, { error: "connection_limited" }]);
+    // A finished Sonnet reply proves nothing about Opus.
+    expect(await runAs(t, "admin", s.id, "안녕")).toMatchObject({
+      status: "done",
+      model: "claude-sonnet-5-5",
+    });
+    expect(limitRows(t, sub.id).map((l) => l.scope)).toEqual(["family:opus"]);
+    // An Opus reply started after the limit (the conversation already on Opus) does.
+    expect(await runAs(t, "admin", c.id, "다시")).toMatchObject({ status: "done", model: "claude-opus-5-5" });
+    expect(limitRows(t, sub.id)).toEqual([]);
   });
 
-  it("the provider's reset time is used, within a minute and a week from now", () => {
+  it("a reply that started before the limit and finishes after it does not end it (review #101 3)", async () => {
+    const t = await start({ script });
+    const sub = subscription(t);
+    t.connect("codex", null);
+    const a = await newAs(t, "admin");
+    const b = await newAs(t, "admin");
+    // A starts first and takes a while; B hits the plan window meanwhile; then A finishes.
+    const ra = await t.as("admin").post(`/api/conversations/${a.id}/messages`, { text: "느리게" });
+    const runA = StartRunResponse.parse(ra.json()).run;
+    await new Promise((r) => setTimeout(r, 10));
+    expect((await runAs(t, "admin", b.id, "plan-window")).errorCode).toBe("usage_limit");
+    expect(await t.settle(runA.id)).toMatchObject({ status: "done", connectionId: sub.id });
+    expect(limitRows(t, sub.id).map((l) => l.scope)).toEqual(["all"]);
+    expect((await newAs(t, "admin")).settings).toMatchObject({ runtime: "codex" });
+    // A reply started after it (picked by hand) does.
+    await new Promise((r) => setTimeout(r, 2));
+    expect(await runAs(t, "admin", a.id, "안녕")).toMatchObject({ status: "done" });
+    expect(limitRows(t, sub.id)).toEqual([]);
+  });
+
+  it("clearing: only evidence after the limit, on a model it covers; a new credential ends every limit", () => {
+    return (async () => {
+      const t = await start();
+      const key = t.connect("claude-code", null);
+      const store = t.app.connections!.store;
+      const now = Date.now();
+      store.recordLimit(key.id, "family:opus", now + 60_000, now);
+      store.recordLimit(key.id, "model:claude-haiku-5-5", now + 60_000, now);
+      store.clearLimits(key.id, { model: "claude-opus-5-5", startedAt: now }); // same moment: not after
+      store.clearLimits(key.id, { model: "claude-sonnet-5-5", startedAt: now + 1 }); // another model
+      expect(limitRows(t, key.id).map((l) => l.scope)).toEqual(["family:opus", "model:claude-haiku-5-5"]);
+      store.clearLimits(key.id, { model: "claude-opus-5-5", startedAt: now + 1 });
+      expect(limitRows(t, key.id).map((l) => l.scope)).toEqual(["model:claude-haiku-5-5"]);
+      store.update(key.id, { secret: `sk-ant-NEWKEYFAKE${"n".repeat(24)}` });
+      expect(limitRows(t, key.id)).toEqual([]);
+    })();
+  });
+
+  it("a passed connection test ends the limits on its model recorded before it started — not others", async () => {
+    const t = await start();
+    const mine = t.connect("claude-code", "owner");
+    const store = t.app.connections!.store;
+    const now = Date.now();
+    // The test runs on the smallest allowed model (Haiku).
+    store.recordLimit(mine.id, "model:claude-haiku-5-5", now + 60_000, now - 1_000);
+    store.recordLimit(mine.id, "family:opus", now + 60_000, now - 1_000);
+    const r = await t.owner.post(`/api/connections/${mine.id}/test`, {});
+    expect(r.json()).toMatchObject({ result: { status: "passed" } });
+    expect(limitRows(t, mine.id).map((l) => l.scope)).toEqual(["family:opus"]);
+  });
+
+  it("limitFor: by auth type — reset time, retry-after, cooldown; scope from the window", () => {
     const now = 1_000_000_000_000;
-    expect(limitUntil(undefined, now)).toBe(now + LIMIT_COOLDOWN_MS);
-    expect(limitUntil(now + 30 * 60_000, now)).toBe(now + 30 * 60_000);
-    expect(limitUntil(now - 5, now)).toBe(now + 60_000);
-    expect(limitUntil(now + 30 * 24 * 60 * 60_000, now)).toBe(now + 7 * 24 * 60 * 60_000);
-    expect(limitUntil(Number.NaN, now)).toBe(now + LIMIT_COOLDOWN_MS);
+    const sub = (info = {}) => limitFor("subscription", "claude-opus-5-5", info, now);
+    const api = (info = {}) => limitFor("api_key", "claude-opus-5-5", info, now);
+    expect(sub()).toEqual({ scope: "all", until: now + SUBSCRIPTION_COOLDOWN_MS });
+    expect(api()).toEqual({ scope: "model:claude-opus-5-5", until: now + API_KEY_COOLDOWN_MS });
+    expect(api({ retryAfterMs: 7_000 })).toMatchObject({ until: now + 7_000 });
+    expect(api({ retryAfterMs: 0 })).toMatchObject({ until: now + 1_000 });
+    expect(sub({ resetsAt: now + 30 * 60_000 })).toMatchObject({ until: now + 30 * 60_000 });
+    expect(sub({ resetsAt: now - 5 })).toMatchObject({ until: now + 60_000 });
+    expect(sub({ resetsAt: now + 30 * 86_400_000 })).toMatchObject({ until: now + 7 * 86_400_000 });
+    expect(sub({ modelFamily: "opus" })).toMatchObject({ scope: "family:opus" });
+    expect(api({ modelFamily: "sonnet" })).toMatchObject({ scope: "family:sonnet" });
+    expect(sub({ resetsAt: Number.NaN })).toMatchObject({ until: now + SUBSCRIPTION_COOLDOWN_MS });
   });
 });

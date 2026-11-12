@@ -119,10 +119,18 @@ export type RuntimeEvent =
   /** Informational (e.g. "fell back to …"). */
   | { type: "notice"; level: "info" | "warn"; code: string; message: string }
   /**
-   * Quota / rate limit reached: the turn ends as failed with this code. `resetsAt` (ms since epoch): when the
-   * provider said the limit ends, if it did (#19 keeps new conversations off the connection until then).
+   * Quota / rate limit reached: the turn ends as failed with this code. What the provider said about it, if anything
+   * (#19 keeps new conversations off it meanwhile): `resetsAt` (ms since epoch) when it ends, `retryAfterMs` after
+   * how long to retry, `modelFamily` when it is a model-specific window (`opus` for Claude's `seven_day_opus`).
    */
-  | { type: "limit"; code: string; message: string; resetsAt?: number };
+  | {
+      type: "limit";
+      code: string;
+      message: string;
+      resetsAt?: number;
+      retryAfterMs?: number;
+      modelFamily?: string;
+    };
 
 export type TurnInput = { text: string; model: string; effort?: string | undefined };
 
