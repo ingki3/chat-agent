@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 const BODY =
-  "산업통상자원부는 10일 발표에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
+  "산업통상자원부는 10일 낸 자료에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
   'He said "Semiconductor exports rose 132% in October" — a record. 성장률은 3.5%였다. ＡＢＣ전자는 "최대 실적"이라고 했다.';
 
 describe("snippet check: normalisation without fuzzy matches", () => {
@@ -47,7 +47,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
 
   it("whitespace, quote styles, fullwidth, invisible characters and decomposed Hangul are normalised", () => {
     // A line break and double spaces in either text.
-    expect(found("142억 달러로 집계됐다고 밝혔다. He said")).toBe(true);
+    expect(found("달러로 집계됐다고 밝혔다. He said")).toBe(true);
     expect(found("32%  늘어난   142억 달러")).toBe(true);
     // Curly vs straight quotes, any style.
     expect(found("He said “Semiconductor exports rose 132% in October”")).toBe(true);
@@ -76,8 +76,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
       found: true,
       quote: 'ＡＢＣ전자는 "최대 실적',
     });
-    const m = findSnippet(BODY, "142억 달러로 집계됐다고 밝혔다. He said");
-    expect(m).toEqual({ found: true, quote: "142억 달러로 집계됐다고 밝혔다. He said" });
+    const m = findSnippet(BODY, "달러로 집계됐다고 밝혔다. He said");
+    expect(m).toEqual({ found: true, quote: "달러로 집계됐다고 밝혔다. He said" });
   });
 
   it("no partial, fuzzy, joined or reordered matches", () => {
@@ -199,6 +199,44 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
   });
 
+  it("compound units, spaced unit symbols, two-step adjacency and percentage points (round 21)", () => {
+    // 1. `/` and letters after a number token belong to the unit.
+    expect(found("이 구간의 제한속도는 100km", "이 구간의 제한속도는 100km/h이다.")).toBe(false);
+    expect(found("주차요금은 무려 3,000원", "주차요금은 무려 3,000원/시간이다.")).toBe(false);
+    expect(found("자동차의 연비는 15km", "자동차의 연비는 15km/L이다.")).toBe(false);
+    expect(found("h라고 안내했다고 한다", "제한속도는 100km/h라고 안내했다고 한다.")).toBe(false); // start: token rule
+    expect(found("이 구간의 제한속도는 100km/h", "이 구간의 제한속도는 100km/h이다.")).toBe(true);
+    expect(found("주차요금은 무려 3,000원/시간", "주차요금은 무려 3,000원/시간이다.")).toBe(true);
+    expect(found("현재 공정은 A/B 시험 중이다", "현재 공정은 A/B 시험 중이다.")).toBe(true);
+    expect(found("B 시험 중이다", "현재 공정은 A/B 시험 중이다.")).toBe(true); // `A/` holds no number
+    expect(found("값은 무려 100점", "값은 무려 100점/ 이후 생략.")).toBe(true); // `/` without letters
+    // 2a. A unit symbol across one space.
+    expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3 %이다.")).toBe(false);
+    expect(found("내일 최고 기온은 20", "내일 최고 기온은 20 ℃이다.")).toBe(false);
+    expect(found("올해 예상 수익률은 3 %", "올해 예상 수익률은 3 %이다.")).toBe(true);
+    // 2b. Two steps: a number token, one word, a number token.
+    expect(found("The flight takes 2 hours", "The flight takes 2 hours 30 minutes.")).toBe(false);
+    expect(found("30 minutes.", "The flight takes 2 hours 30 minutes.")).toBe(false);
+    expect(found("hours 30 minutes in total", "The flight takes 2 hours 30 minutes in total.")).toBe(false);
+    expect(found("The flight takes 2", "The flight takes 2 hours 30 minutes.")).toBe(false);
+    expect(found("The flight takes 2 hours 30 minutes.", "The flight takes 2 hours 30 minutes.")).toBe(true);
+    // …accepted limitation (g), widened: also without a comma between two figures.
+    expect(found("매출은 3% 증가", "매출은 3% 증가 5% 감소했다.")).toBe(false);
+    expect(found("매출은 3% 증가,", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
+    expect(found("매출은 3% 증가", "매출은 3% 증가 그 뒤 5% 감소했다.")).toBe(true); // two words between
+    expect(found("매출은 무려 3%", "매출은 무려 3% 증가, 5% 감소했다.")).toBe(true); // the comma sets them apart
+    expect(found("매출은 무려 3%", "매출은 무려 3% 증가 이후 5% 감소했다.")).toBe(true); // two words between
+    // 2c. Percentage points.
+    expect(found("기준금리는 0.25%", "기준금리는 0.25% 포인트 인상됐다.")).toBe(false);
+    expect(found("기준금리는 0.25%", "기준금리는 0.25%p 인상됐다.")).toBe(false);
+    expect(found("Rates rose by 0.25%", "Rates rose by 0.25% pp in May.")).toBe(false);
+    expect(found("Spreads widened by 0.25%", "Spreads widened by 0.25% bps today.")).toBe(false);
+    expect(found("Spreads widened by 25", "Spreads widened by 25 bp today.")).toBe(true); // bp only after a %
+    expect(found("기준금리는 0.25% 포인트", "기준금리는 0.25% 포인트 인상됐다.")).toBe(true);
+    expect(found("기준금리는 0.25%", "기준금리는 0.25% 인상됐다.")).toBe(true);
+    expect(found("연 이율은 무려 0.25%", "연 이율은 무려 0.25% pa 수준이다.")).toBe(true); // `pa` is not `p`
+  });
+
   it("unit symbols belong to the number, and a number token next to another number token is not cut (round 20)", () => {
     // 1. Unit and currency symbols are token characters at the edge.
     expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3%~5%이다.")).toBe(false);
@@ -222,7 +260,9 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("지난 2024년", "지난 2024년 3월에 발표했다.")).toBe(false);
     expect(found("지난 10일 10월 반도체 수출이 늘었다", "지난 10일 10월 반도체 수출이 늘었다.")).toBe(true);
     // Only the edge tokens count: a number deeper in the match is fine.
-    expect(found("정부는 3월에 발표했다고 한다", "지난 2024년 정부는 3월에 발표했다고 한다.")).toBe(true);
+    expect(found("정부는 3월에 발표했다고 한다", "지난 2024년 우리 정부는 3월에 발표했다고 한다.")).toBe(
+      true,
+    );
     // Punctuation sets tokens apart: a comma or a full stop between them is prose.
     expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
     expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
@@ -624,7 +664,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
     const base =
-      "산업통상자원부는 10일 발표에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
+      "산업통상자원부는 10일 낸 자료에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
     const body = base.repeat(Math.ceil(400_000 / base.length)).slice(0, 400_000);
     normalizeWithMap(base); // warm the character caches the first page would warm
     let t = performance.now();
@@ -690,7 +730,8 @@ function family(db: Db = createTestDb()) {
   return { db, users, mom, dad, c, other, dads, sources: store, page, run, cites: new CitationStore(db) };
 }
 
-const SNIP = "10월 반도체 수출이 전년 같은 달보다 32% 늘어난";
+// Not ending at `32% 늘어난` before ` 142억` — accepted limitation (g).
+const SNIP = "10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로";
 
 describe("CitationStore (#25)", () => {
   it("verifies, numbers per run, and keeps the first number for the same snippet", () => {
@@ -709,7 +750,7 @@ describe("CitationStore (#25)", () => {
     expect(f.cites.cite(f.run(f.c.id), { sourceId: src.id, snippet: SNIP }).n).toBe(1);
     const rows = f.cites.forRun(scope.runId);
     expect(rows.map((r) => [r.n, r.status, r.quote])).toEqual([
-      [1, "verified", "10월 반도체 수출이 전년 같은 달보다 32% 늘어난"],
+      [1, "verified", SNIP],
       [2, "verified", "메모리 가격 회복이 증가를 이끌었다"],
       [3, "snippet_not_found", null],
     ]);

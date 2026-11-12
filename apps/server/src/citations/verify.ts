@@ -170,6 +170,22 @@ const RANGE_AFTER = /^ ?[/:\-\u2212~\u00D7*^\u00B7] ?[+\-\u2212]?(?:[$€¥£₩
  * prose. Accepted limitation (g): `2024년` before ` 3월` is refused too (review #97 round 20).
  */
 const NUMBER_TOKEN_AFTER = /^ [^ ]*\p{N}/u;
+/**
+ * Two steps: one token without a digit (and not ending with punctuation), then one with a digit (`2 hours` before
+ * ` 30 minutes`; review #97 round 21). Also accepted limitation (g): `3% 증가 5% 감소` without a comma.
+ */
+const NUMBER_TOKEN_AFTER_2 = /^ [^ \p{N}]*[^ \p{N},.;:!?] [^ ]*\p{N}/u;
+/** The same two steps with the word inside the match: `2 hours` before ` 30`, `hours 30…` after `2 `. */
+const NUMBER_THEN_WORD_END = /(?:^|[ ])(?:[^ ]*\p{N}[^ ]*[^ ,.;:!?]|\p{N}) [^ \p{N}]*[^ \p{N},.;:!?]$/u;
+const WORD_THEN_NUMBER_START = /^[^ \p{N}]*[^ \p{N},.;:!?] [^ ]*\p{N}/u;
+const NUMBER_TOKEN_BEFORE_2 = /(?:^|[ ])(?:[^ ]*\p{N}[^ ]*[^ ,.;:!?]|\p{N}) [^ \p{N}]*[^ \p{N},.;:!?] $/u;
+/** A unit symbol across one space after a number (`3 %`, `20 ℃`). */
+const UNIT_SYMBOL_SPACED = /^ [%\u2030\u2031\u00B0\u2103\u2109\u2032\u2033]/u;
+/** `/` and letters right after a number token: a compound unit (`km/h`, `원/시간`, `km/L`). */
+const COMPOUND_UNIT_AFTER = /^\/\p{L}/u;
+const COMPOUND_UNIT_BEFORE = /(?:^|[ ])[^ ]*\p{N}[^ ]*\/$/u;
+/** Percentage points (closed list, case kept) after a percentage. */
+const POINTS_AFTER = /^ ?(?:포인트|%p|pp|bps|bp|p)(?![\p{L}\p{N}\p{M}])/u;
 const NUMBER_TOKEN_BEFORE = /(?:^|[ ])[^ ]*\p{N}[^ ]*[^ ,.;:!?] $|(?:^|[ ])\p{N} $/u;
 const RANGE_MARK = /^[/:~\u00D7*^\u00B7]$/u;
 const DECIMAL_MARK = /^[.,]$/u;
@@ -493,7 +509,14 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     // Not inside a token at the start (unit and currency symbols count when the match starts with a number).
     if (TOKEN.test(before) || (numberStart && UNIT_SYMBOL.test(before))) continue;
     // Not next to another number token across a space (`2,000만원…` after `1억 `, `1/2컵…` after `1 `).
-    if (firstTokenHasDigit && NUMBER_TOKEN_BEFORE.test(norm.slice(Math.max(0, at - 40), at))) continue;
+    const behind = norm.slice(Math.max(0, at - 60), at);
+    // Not the letters of a compound unit (`h…` right after `100km/`).
+    if (/\p{L}/u.test(first) && COMPOUND_UNIT_BEFORE.test(behind)) continue;
+    if (
+      (firstTokenHasDigit && (NUMBER_TOKEN_BEFORE.test(behind) || NUMBER_TOKEN_BEFORE_2.test(behind))) ||
+      (WORD_THEN_NUMBER_START.test(want) && NUMBER_TOKEN_BEFORE.test(behind))
+    )
+      continue;
     // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
     // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
     if (
@@ -520,9 +543,18 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
     if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     // A unit or currency symbol right after a number is more of it (`3` in `3%`, `3%~5%`).
-    if (DIGIT.test(last) && UNIT_SYMBOL.test(after)) continue;
+    if (DIGIT.test(last) && (UNIT_SYMBOL.test(after) || UNIT_SYMBOL_SPACED.test(rest))) continue;
+    // A compound unit with `/` (`100km` in `100km/h`, `3,000원` in `3,000원/시간`; at the start see
+    // COMPOUND_UNIT_BEFORE — `/h…` right after `100km` is refused by the start token rule already).
+    if (lastTokenHasDigit && COMPOUND_UNIT_AFTER.test(rest)) continue;
+    // Percentage points after a percentage (`0.25%` before ` 포인트`, ` %p`, ` bp`).
+    if (last === "%" && POINTS_AFTER.test(rest)) continue;
     // Not next to another number token across a space (`1억` before ` 2,000만원`, `오후 3시` before ` 30분`).
-    if (lastTokenHasDigit && NUMBER_TOKEN_AFTER.test(norm.slice(at + want.length, at + want.length + 40)))
+    const ahead = norm.slice(at + want.length, at + want.length + 60);
+    if (
+      (lastTokenHasDigit && (NUMBER_TOKEN_AFTER.test(ahead) || NUMBER_TOKEN_AFTER_2.test(ahead))) ||
+      (NUMBER_THEN_WORD_END.test(want) && NUMBER_TOKEN_AFTER.test(ahead))
+    )
       continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
