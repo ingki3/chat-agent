@@ -35,6 +35,7 @@ import type { ErrorLog } from "../observability/errors.js";
 import type { SkillSwitches } from "./switches.js";
 import type { PythonRuntime } from "./python.js";
 import type { SourceStore } from "../web/sources.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 import {
   DUCKDUCKGO_HOSTS,
   duckDuckGoProvider,
@@ -200,8 +201,10 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
     if (r.killed) return { ok: false, code: "skill_limit" };
     if (r.code === null || !(skill.okExitCodes ?? [0]).includes(r.code) || !r.stdout.trim())
       return { ok: false, code: "skill_failed" };
-    // A skill must never hand a secret back to the model (an API echoing its key, a debug print).
-    return redactOutput(r.stdout, secretValues);
+    // A skill must never hand a secret back to the model (an API echoing its key, a debug print): its own
+    // secrets exactly (refused if any is left), then every other secret the server knows (review round 23).
+    const res = redactOutput(r.stdout, secretValues);
+    return res.ok ? { ok: true, output: scrubKnownDeep(res.output) } : res;
   };
 }
 
@@ -260,8 +263,9 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
     if (typeof x === "string" || typeof x === "number") {
       const t = String(x);
       if (secrets.some((s) => t.includes(s))) return true;
-    } else if (Array.isArray(x)) stack.push(...x);
-    else if (x && typeof x === "object")
+    } else if (Array.isArray(x)) {
+      for (const item of x) stack.push(item); // (no spread: a huge array would overflow the call stack)
+    } else if (x && typeof x === "object")
       for (const [k, val] of Object.entries(x)) {
         if (secrets.some((s) => k.includes(s))) return true;
         stack.push(val);

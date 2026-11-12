@@ -1,6 +1,7 @@
 import { and, asc, eq, lt } from "drizzle-orm";
 import type { Db } from "../db/client.js";
 import { financeResults, messages } from "../db/schema.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 import { mergeEvidence, type AnswerEvidence } from "./checker.js";
 
 /**
@@ -12,7 +13,9 @@ import { mergeEvidence, type AnswerEvidence } from "./checker.js";
 export class FinanceResultStore {
   constructor(private readonly db: Db) {}
 
-  save(row: { messageId: string; conversationId: string; runId: string }, evidence: AnswerEvidence): void {
+  save(row: { messageId: string; conversationId: string; runId: string }, raw: AnswerEvidence): void {
+    // No known secret is stored (round 25: one registered after the tool result, before the turn ended).
+    const evidence = scrubKnownDeep(raw);
     this.db
       .insert(financeResults)
       .values({ ...row, evidence })
@@ -35,6 +38,6 @@ export class FinanceResultStore {
       )
       .orderBy(asc(messages.seq))
       .all();
-    return mergeEvidence(rows.map((r) => r.evidence as AnswerEvidence));
+    return mergeEvidence(rows.map((r) => scrubKnownDeep(r.evidence as AnswerEvidence)));
   }
 }

@@ -26,6 +26,7 @@
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
 - 서버는 `MASTER_KEY_PATH`가 `DATA_DIR` 안에 있으면 시작을 거부한다.
 - `BACKUP_DIR`이 `DATA_DIR` 안(또는 `DATA_DIR`을 품는 곳), 레포 안이거나 마스터 키를 품으면 시작을 거부한다(21절).
+- **알려진 비밀 값 가림 (#14 리뷰 23~27차)**: 서버가 아는 비밀 값(연결 키·토큰, `.env` 비밀, 게이트 코드, 세션·MCP 토큰, 암호화되는 모든 값)은 저장·응답·스트림·런타임 전달 전에 가려진다. 스키마의 텍스트 열마다 쓰기 가림 또는 제외 이유가 `apps/server/src/secrets/columns.ts`에 있다. **받아들인 한계**: `users.email`과 `connections.account_email`은 식별자(관리자가 정하거나 공급자가 발급)라 저장값을 가리지 않는다 — 가리면 로그인이, 해시하면 관리자 화면과 Access 동기화(#36)가 깨진다. 이 값을 보여 주는 응답은 그래도 가려진다. 멱등 키(`runs.idempotency_key`)는 SHA-256으로만 저장한다.
 
 ## 2. 처음 설치
 
@@ -178,7 +179,7 @@ rm ~/.agentlee/probe-headers.txt
 - 위치: `/Library/Logs/agentlee/server.log`. 앱이 직접 쓰고(`LOG_FILE`, LaunchDaemon이 지정) **10MB마다 순환**해 `server.log.1`…`server.log.5`까지 남긴다(그보다 오래된 것은 지운다). launchd의 stdout은 `server.out.log`(보통 비어 있음), 시작 실패는 `server.err.log`. 개발 모드(`pnpm dev`)는 `LOG_FILE`이 없으면 터미널(stdout)에 쓴다. 수준은 `LOG_LEVEL`(기본 `info`). 로그 파일을 열거나 쓰지 못해도(디스크 가득, 권한 등) 서버는 시작하고 계속 돌며 그 줄만 버린다(파일에는 완전한 JSON 줄만 남는다 — 중간에 끊긴 줄은 잘라낸다). 다시 쓸 수 있게 되면 `log.line_dropped` 레코드에 버린 줄 수(`dropped`)를 남긴다.
 - 형식: JSON 한 줄에 레코드 하나. **허용된 필드만** 쓰고, 각 값은 모양이 아니라 **서버가 만든 값인지**로 검사한다: ID는 서버가 만드는 UUID, 상태·오류 코드·분류·런타임은 정해진 목록, 라우트는 등록된 패턴, 도구명은 알려진 도구(런타임 기본 도구 + 우리 MCP 서버의 도구, 예 `mcp__agentlee__echo_time` — 그 밖은 `other`), 오류 클래스는 알려진 이름(그 밖은 `Error`). 맞지 않으면 그 필드를 버린다(키·토큰·접속 코드가 허용 문자로만 이루어져 있어도 통과하지 못한다). `apps/server/src/logging.ts`가 기준이다.
   - 허용 필드: `level` `time` `pid` `hostname` `msg` `reqId` `req{method,url=라우트 패턴,reqId}` `res{statusCode}` `responseTime` `err{type,code,statusCode}` `userId` `conversationId` `runId` `runtime` `tool` `durationMs` `status` `errorCode` `category` `costUsd` `inputTokens` `outputTokens` `dropped`, 알림(#34): `notificationKind` `count` `devices` `httpStatus`, 사용량(#44): `attempt` `purpose`.
-  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), 사용량(#44) `usage.record_failed`(사용량 행을 쓰지 못함: ID·`attempt`·`purpose`·오류 코드만 — 응답은 계속된다), 사용량 화면(#32) `usage.prices_saved`(관리자 id·모델 수)·`usage.daily_cost_alert`(오늘 비용)·`usage.alert_failed`(오류 코드), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
+  - `msg`는 정해진 이벤트 이름만: `run.finished`(실행 1건: 소요·상태·오류 코드·비용·토큰), `tool.finished`(도구 호출 1건: 도구명·소요·ok/error), `skill.finished`(우리 MCP 서버의 스킬 호출 1건: 도구명·소요·ok/error·`skillCode`, #21), `request.error`, `web.build_missing`, `error`, 알림(#34) `push.sent`·`push.unsent`(보낸 알림 수·받은 기기 수)·`push.failed`(푸시 서비스 상태 코드·오류 코드)·`push.cancelled`(전송 직전 권한 재검사로 취소)·`push.subscription_gone`(404/410으로 기기 삭제), 사용량(#44) `usage.record_failed`(사용량 행을 쓰지 못함: ID·`attempt`·`purpose`·오류 코드만 — 응답은 계속된다), 사용량 화면(#32) `usage.prices_saved`(관리자 id·모델 수)·`usage.daily_cost_alert`(오늘 비용)·`usage.alert_failed`(오류 코드), 비밀 재가림(리뷰 26차) `secrets.rescrub_failed`(저장 행 재가림 실패 — 다시 시도, 오류 코드만), Fastify의 `incoming request`·`request completed`·`Server listening at http://127.0.0.1:3000`. 그 밖의 문장은 `redacted`로 바뀐다.
   - **기록하지 않는 것**: 프롬프트·메시지·파일 내용, 모델 출력, 도구 입출력, SDK 원문 오류·stderr(오류는 클래스 이름과 코드로만 남고 `errorCode`·`category`로 정제), 비밀번호, 토큰, 쿠키·헤더 값(Cookie, Authorization, Cf-Access-Jwt-Assertion, Idempotency-Key 등), 임시 접속 코드, 이메일. 요청은 실제 URL이 아니라 라우트 패턴(`/api/conversations/:id/messages`)으로만 남는다.
   - `pnpm test`의 유출 fixture 테스트(`apps/server/test/observability.test.ts`)가 대화 문장·키 패턴·쿠키·헤더·접속 코드·이메일을 요청·오류·실행·도구로 흘려 보내고, 로그와 관리자 오류 목록에 하나라도 나오면 실패한다.
 - 읽기:
@@ -740,6 +741,7 @@ DB와 파일을 같은 시점으로 매일 백업하고, 서버를 멈춘 상태
 ### 21.3 일정·보관·관리자 화면
 - **매일 03:30(서울)** 서버 안 타이머로 돈다(launchd 작업 없음). 서버가 꺼져 있어 놓쳤으면(마지막 백업이 하루보다 오래됐으면) 시작 10분 뒤 한 번 한다. 한 번에 하나만 돈다.
 - **7일 보관**: 만든 지 7일(168시간)이 된 백업은 **가장 최근 것까지 예외 없이** 지운다. 정리는 백업이 성공하든 실패하든 백업을 시도할 때마다, 그리고 서버가 시작할 때 돈다. 그래서 지운 대화는 백업이 계속 실패해도 지운 뒤 7일(다음 정리 시각까지 최대 8일) 안에 모든 백업에서 사라진다.
+- **알려진 비밀과 백업**: 백업은 DB를 저장된 그대로 복사한다. 비밀이 늦게 등록되면(예: 대화에 먼저 붙여 넣은 키를 나중에 연결로 등록) 서버의 재가림이 저장 행을 그때부터 깨끗하게 하지만, 그 전에 만든 백업에는 원문이 남아 있다가 위 7일 보관에 따라 사라진다(받아들인 한계). 그런 백업을 복원하면 서버 시작 시 재가림 패스가 복원된 행을 다시 가린다.
 - **실패 알림**: 백업이 실패할 때마다 모든 관리자에게 `system_warning` 알림("백업에 실패했어요 (코드) …", 알림함·푸시, 누르면 관리자 → 백업). 실패가 7일 넘게 이어져 **남은 백업이 하나도 없으면** 그때마다 더 강한 알림("백업이 하나도 남지 않았어요 …")이 함께 간다 — 이 상태에서는 복원할 것이 없으므로 디스크·`BACKUP_DIR`을 바로 확인한다.
 - **빠지는 파일**: 파일 저장소를 읽다 생긴 오류(EIO·EACCES 등)는 백업 전체를 실패로 만든다(빠진 채 성공으로 남지 않음). 복사 중에 사라진 파일(ENOENT)만 넘어가는데, 스냅샷의 DB가 그 파일을 가리키면(`FILE_REFERENCES`) 그것도 실패다.
 - **관리자 → 백업 탭**: 일정·다음 시각·마지막 결과, "지금 백업", 최근 백업(시각·ID·크기·파일 수·스키마 버전), 복원 방법 안내. 화면에서 복원하는 버튼은 없다. API `GET /api/admin/backups`·`POST /api/admin/backups`는 관리자만(가족 403, 로그인 전 401 — 권한 행렬). 이미 백업 중이면 409 `backup_running`.

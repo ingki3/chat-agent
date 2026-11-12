@@ -12,6 +12,19 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, messages, runs } from "../db/schema.js";
+import { scrubContent, scrubKnownDeep } from "../secrets/known.js";
+
+/**
+ * A version as read (round 26): its content scrubbed by kind — canonical JSON value by value, so it stays valid —
+ * and its size and hash following the scrubbed content.
+ */
+function scrubVersion(v: ArtifactVersionRow): ArtifactVersionRow {
+  const { content, ...rest } = v;
+  const scrubbed = scrubContent(content);
+  const out = { ...scrubKnownDeep(rest), content: scrubbed };
+  if (scrubbed === content) return out.title === v.title && out.language === v.language ? v : out;
+  return { ...out, bytes: Buffer.byteLength(scrubbed, "utf8"), contentHash: sha256(scrubbed) };
+}
 
 export type ArtifactRow = typeof artifacts.$inferSelect;
 export type ArtifactVersionRow = typeof artifactVersions.$inferSelect;
@@ -165,9 +178,11 @@ export class ArtifactStore {
 
   create(
     scope: ArtifactScope,
-    input: { kind: ArtifactKind; title: unknown } & ArtifactBody,
+    raw: { kind: ArtifactKind; title: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
+    // A runtime's artifact never stores a known secret (review round 23).
+    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
     const title = cleanTitle(input.title);
     const { content, language } = encodeBody(input.kind, input);
     return this.db.transaction((tx) => {
@@ -214,9 +229,10 @@ export class ArtifactStore {
   update(
     scope: ArtifactScope,
     artifactId: string,
-    input: { title?: unknown } & ArtifactBody,
+    raw: { title?: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
+    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
     const a = this.get(artifactId);
     if (!a || a.conversationId !== scope.conversationId || a.userId !== scope.userId)
       throw new ArtifactError("artifact_not_found");
@@ -318,8 +334,10 @@ export class ArtifactStore {
       .get();
   }
 
+  // Reads are scrubbed too (round 24): a secret registered after an artifact was stored never comes back in the
+  // API, the raw page, a download or an export.
   get(id: string): ArtifactRow | undefined {
-    return this.db.select().from(artifacts).where(eq(artifacts.id, id)).get();
+    return scrubKnownDeep(this.db.select().from(artifacts).where(eq(artifacts.id, id)).get());
   }
 
   /** A conversation's artifacts, newest first. */
@@ -329,7 +347,8 @@ export class ArtifactStore {
       .from(artifacts)
       .where(eq(artifacts.conversationId, conversationId))
       .orderBy(desc(artifacts.createdAt), desc(sql`rowid`))
-      .all();
+      .all()
+      .map((r) => scrubKnownDeep(r));
   }
 
   /** Versions of one artifact, oldest first (API responses leave the content out: `toVersionInfo`). */
@@ -339,14 +358,16 @@ export class ArtifactStore {
       .from(artifactVersions)
       .where(eq(artifactVersions.artifactId, id))
       .orderBy(asc(artifactVersions.version))
-      .all();
+      .all()
+      .map(scrubVersion);
   }
 
   version(id: string, version: number): ArtifactVersionRow | undefined {
-    return this.db
+    const v = this.db
       .select()
       .from(artifactVersions)
       .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
       .get();
+    return v && scrubVersion(v);
   }
 }

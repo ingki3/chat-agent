@@ -885,3 +885,342 @@ describe("runs: MCP call tokens (#42)", () => {
     expect(app.runs!.mcpTokens.verify(seen)).toBeUndefined();
   });
 });
+
+describe("runs: chat screen support (#14)", () => {
+  it("tool inputs and outputs reach neither the stream nor the history with their secret fields", async () => {
+    const { mom, conversation, send, stream, waitRun } = await start();
+    const c = conversation();
+    const run = (await send(c.id, "/secrettool")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const list = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
+    for (const blob of [JSON.stringify(frames), JSON.stringify(list)]) {
+      expect(blob).toContain("web_search");
+      expect(blob).toContain("단진자 주기");
+      expect(blob).not.toMatch(/sk-fake-secret-123|hunter2|tok-fake-456/);
+    }
+    const start_ = events(frames).find((e) => e.type === "tool_start");
+    expect(start_).toMatchObject({
+      input: { query: "단진자 주기", apiKey: "[숨김]", nested: { password: "[숨김]" } },
+    });
+  });
+
+  it("numeric secrets and keys inside strings are removed from the stream, the API and the stored row; ordinary data stays", async () => {
+    const script: FakeScript = () => [
+      {
+        tool: "login",
+        ms: 0,
+        input: {
+          user: "kim",
+          otp: 123456,
+          password: 1234,
+          pin: 9876,
+          tokenizer: "cl100k_base",
+          tokenSymbol: "ETH",
+        },
+        output: "request failed with key sk-proj-abcdefgh1234 (401)",
+        isError: true,
+      },
+      { usage: { inputTokens: 3, outputTokens: 4 } },
+    ];
+    const { app, mom, conversation, send, stream, waitRun } = await start({ script });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
+    const stored = app.conversations!.messages(c.id, { limit: 100 });
+    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+      expect(blob).not.toMatch(/123456|1234[^0-9]|9876|sk-proj-abcdefgh1234/);
+      expect(blob).toContain("cl100k_base");
+      expect(blob).toContain("ETH");
+      expect(blob).toContain("request failed with key [숨김] (401)");
+    }
+    const reply = api.at(-1)!;
+    expect(reply.parts[0]).toMatchObject({
+      type: "tool_call",
+      input: { user: "kim", otp: "[숨김]", password: "[숨김]", pin: "[숨김]", tokenizer: "cl100k_base" },
+    });
+  });
+
+  it("JSON held in strings is redacted field by field in the stream, the API and the stored row; prose is kept", async () => {
+    const script: FakeScript = () => [
+      {
+        tool: "http",
+        ms: 0,
+        input: '{"url":"https://api.example","password":"hunter2","otp":123456}',
+        output: 'login failed: {"password":"hunter2","otp":123456} — Basic authentication is an HTTP scheme',
+      },
+    ];
+    const { app, mom, conversation, send, stream, waitRun } = await start({ script });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
+    const stored = app.conversations!.messages(c.id, { limit: 100 });
+    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+      expect(blob).not.toMatch(/hunter2|123456/);
+      expect(blob).toContain("api.example");
+      expect(blob).toContain("Basic authentication is an HTTP scheme");
+    }
+    const parts = api.at(-1)!.parts;
+    expect(parts[0]).toMatchObject({
+      input: '{"url":"https://api.example","password":"[숨김]","otp":"[숨김]"}',
+    });
+  });
+
+  it("JSON printed into tool output is redacted in place in the stored row; other numbers keep their exact lexeme", async () => {
+    const script: FakeScript = () => [
+      {
+        tool: "shell",
+        ms: 0,
+        input: '{"accountId":9007199254740993,"password":"hunter2"}',
+        output: 'stdout: {"password":\n "hunter2","otp":[123456]}\nexit 0',
+      },
+    ];
+    const { app, mom, conversation, send, stream, waitRun } = await start({ script });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
+    const stored = app.conversations!.messages(c.id, { limit: 100 });
+    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+      expect(blob).not.toMatch(/hunter2|123456/);
+      expect(blob).toContain("9007199254740993");
+    }
+    const parts = stored.at(-1)!.parts as { type: string; input?: unknown; output?: unknown }[];
+    expect(parts[0]!.input).toBe('{"accountId":9007199254740993,"password":"[숨김]"}');
+    expect(parts[1]!.output).toBe('stdout: {"password":\n "[숨김]","otp":"[숨김]"}\nexit 0');
+  });
+
+  it("escaped JSON keys and JSON inside JSON strings are redacted in the stored row", async () => {
+    const BSL = String.fromCharCode(92);
+    const doubly = JSON.stringify({ body: '{"token":"tok-double-777","n":1}' });
+    const script: FakeScript = () => [
+      {
+        tool: "shell",
+        ms: 0,
+        input: '{"pass\\u0077ord":"hunter2","\\u006ftp":[123456],"user":"kim"}',
+        output: {
+          stdout: '{"password":"hunter3","otp":[654321]}',
+          nested: doubly,
+          code: 0,
+          // Codex round 5: a JSON string value that is cut off (no closing quote) as raw text.
+          raw: '{"stdout":"{\\"password\\":\\"hunter4\\",\\"otp\\":[111222]}',
+          // Codex round 6: JSON-stringified values printed into text, starting with [ and {.
+          printed: [
+            "stdout: " + JSON.stringify('[{"password":"hunter5","otp":[333444]}]'),
+            "stdout: " + JSON.stringify('{"password":"hunter6","otp":[555666]}'),
+            'x="{"password":"hunter7"}"',
+            // Codex round 7: a broken quoted prefix, then real JSON.
+            'stdout: "[\\"ok\\"] suffix {"password":"hunter8","otp":[777888]}',
+          ].join("\n"),
+          // Codex round 8: shapes passes A and B miss — caught by the fail-closed sweep.
+          // Codex round 9: escaped whitespace, \u0022 quotes, values that start with the placeholder.
+          round9: [
+            "stdout: " + JSON.stringify(' {"password":\n"hunter2","otp":\t"123456"}'),
+            "stdout: " +
+              JSON.stringify(' {"password":"hunter2","otp":[123456]}').replaceAll('\\"', "\\u0022"),
+            "stdout: " + JSON.stringify(' {"password":"[숨김]hunter2","otp":"[숨김]123456"}'),
+          ].join("\n"),
+          // Codex round 10: the colon written as \u003a.
+          round10:
+            "stdout: " + JSON.stringify(' {"password":"hunter2","otp":[123456]}').replaceAll(":", "\\u003a"),
+          // Codex round 11: names after \u0022 quotes, punctuation in names, names over 64 characters.
+          round11a:
+            "stdout: " +
+            JSON.stringify(' {"pin":"1234","auth":"reviewLeak123"}').replaceAll('\\"', "\\u0022"),
+          round11b: "stdout: " + JSON.stringify(' {"pass.word":"hunter2"}'),
+          round11c:
+            "stdout: " + JSON.stringify(" " + JSON.stringify({ ["x".repeat(57) + "Password"]: "hunter2" })),
+          prose: JSON.stringify({ message: "password: 다음에 실제 값을 넣으세요.", count: 1 }),
+          // Codex round 12: separators and escapes inside quoted keys; quoted prose in arrays and values.
+          round12a: "stdout: " + JSON.stringify(" " + JSON.stringify({ "api:key": "hunter2" })),
+          round12b: "stdout: " + JSON.stringify(" " + JSON.stringify({ "api\bkey": "hunter2" })),
+          round12c: "stdout: " + JSON.stringify(' {"api\\u000akey":"hunter2"}'),
+          // Codex round 13: an escaped backslash written as \u005c; a raw line break inside a secret value.
+          round13a: JSON.stringify(
+            " " + JSON.stringify(" " + JSON.stringify({ "api:key": "hunter2" })),
+          ).replace("\\\\", "\\u005c"),
+          round13b: '{"password":"prefix' + String.fromCharCode(10) + 'hunter2"}',
+          // Codex round 14: hex digits of an inner unicode escape escaped one layer out; a broken scalar.
+          round14a: JSON.stringify(
+            " " +
+              JSON.stringify(" " + JSON.stringify({ "api:key": "hunter2" })).replace(
+                BSL + '"',
+                BSL + "u0022",
+              ),
+          ).replace("u0022", "u0" + BSL + "u003022"),
+          round14b: '{"password":123hunter2,"user":"kim"}',
+          // Codex round 15: the tag spelled as an escape; Python-style dicts; ten layers of stringify.
+          round15a:
+            '"' +
+            ["u007b", "u0022api:key", "u0022:", "u0022", "ufdd0hunter2", "u0022}"]
+              .map((x) => BSL + x)
+              .join("") +
+            '"',
+          round15b: "{'api:key':'hunter2'}",
+          round15c: (() => {
+            let x = JSON.stringify({ "api:key": "hunter2" });
+            for (let k = 0; k < 10; k++) x = JSON.stringify(" " + x);
+            return x;
+          })(),
+          // Codex round 16: a Python string wrapping a dict; a quote behind nine escaped backslashes.
+          round16a: "'{" + BSL + "'api:key" + BSL + "': " + BSL + "'hunter2" + BSL + '\', "x": "y"}\'',
+          round16b: (() => {
+            const q = BSL + "u005c".repeat(9) + "u0022";
+            return `{${q}api:key${q}:${q}hunter2${q}}`;
+          })(),
+          // Codex round 17: Python repr() keys with \xHH escapes, raw and stringified.
+          round17a: "{'api" + BSL + "x00key': 'hunter2'}",
+          round17b: JSON.stringify("{'pass" + BSL + "x77ord': 'hunter2'}"),
+          // Codex round 18: \N{…} names we cannot decode, raw and stringified.
+          round18a: "{'api" + BSL + "N{KELVIN SIGN}ey': 'hunter2'}",
+          round18b: JSON.stringify("{'p" + BSL + "N{LATIN CAPITAL LETTER I WITH DOT ABOVE}n': 'hunter2'}"),
+          // Codex round 19: an N-escape name longer than the window (88 characters).
+          round19: JSON.stringify(
+            "{'api" +
+              BSL +
+              "N{BOX DRAWINGS LIGHT DIAGONAL UPPER CENTRE TO MIDDLE RIGHT AND MIDDLE LEFT TO LOWER CENTRE}ey': 'hunter2'}",
+          ),
+          // Codex round 20: an escape no decoder here knows (Ruby), a bare assignment found on a decoded layer, a
+          // form feed between the key and the colon.
+          round20a: '{"api' + BSL + 'ekey" => "hunter2"}',
+          round20b: JSON.stringify("pass" + BSL + "x77ord='hunter2'"),
+          round20c: "{'pass" + BSL + "x77ord'" + String.fromCharCode(12) + ": 'hunter2'}",
+          // Codex round 21: a Ruby octal above 377, a non-ASCII bare key, a computed key after a comment.
+          round21a: '{"' + BSL + '560assword" => "hunter2"}',
+          round21b: JSON.stringify("({pass한word: 'hunter2'})"),
+          round21c: '({["password"] /* field */: "hunter2"})',
+          regex21: "정규식 /" + BSL + "d{2}:" + BSL + "d{2}/로 시각을 검사하세요.",
+          // Codex round 22: Java \uuuu after a semicolon, a concatenated computed key, an INI key with a dot.
+          round22a: "a=1;p" + BSL + 'uuuu0061ssword="hunter2";',
+          round22b: JSON.stringify('({["pass" + "word"]: "hunter2"})'),
+          round22c: "pass.word=hunter2",
+          regex22: "정규식 /(" + BSL + "d{2}:" + BSL + "d{2})/로 시각을 검사하세요.",
+          prose12: JSON.stringify({
+            message: ["password: 다음에 실제 값을 넣으세요."],
+            note: '참고, "password: 다음에"',
+            count: 1,
+          }),
+          broken: [
+            'stdout: {"note":"broken {"password":"hunter9","otp":[999000]}',
+            "stdout: {" + JSON.stringify('{"password":"hunter9","otp":[999000]}'),
+            "stdout: " + JSON.stringify(' {"password":"hunter9","otp":[999000]}'),
+          ].join("\n"),
+        },
+      },
+    ];
+    const { app, mom, conversation, send, stream, waitRun } = await start({ script });
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    const { frames } = await (await stream(run.id)).read();
+    await waitRun(run.id);
+    const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
+    const stored = app.conversations!.messages(c.id, { limit: 100 });
+    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+      expect(blob).not.toMatch(/hunter[2-9]|123456|654321|111222|333444|555666|777888|999000|tok-double-777/);
+      expect(blob).toContain("kim");
+    }
+    const parts = stored.at(-1)!.parts as { type: string; input?: unknown; output?: unknown }[];
+    expect(parts[0]!.input).toBe('{"pass\\u0077ord":"[숨김]","\\u006ftp":"[숨김]","user":"kim"}');
+    const output = parts[1]!.output as {
+      stdout: string;
+      nested: string;
+      code: number;
+      raw: string;
+      printed: string;
+      broken: string;
+      round9: string;
+      round10: string;
+      round11a: string;
+      round11b: string;
+      round11c: string;
+      prose: string;
+      round12a: string;
+      round12b: string;
+      round12c: string;
+      prose12: string;
+      round13a: string;
+      round13b: string;
+      round14a: string;
+      round14b: string;
+      round15a: string;
+      round15b: string;
+      round15c: string;
+      round16a: string;
+      round16b: string;
+      round17a: string;
+      round17b: string;
+      round18a: string;
+      round18b: string;
+      round19: string;
+      round20a: string;
+      round20b: string;
+      round20c: string;
+      round21a: string;
+      round21b: string;
+      round21c: string;
+      regex21: string;
+      round22a: string;
+      round22b: string;
+      round22c: string;
+      regex22: string;
+    };
+    for (const v of [output.round22a, output.round22b, output.round22c]) expect(v).not.toContain("hunter2");
+    expect(output.regex22).toBe("정규식 /(" + BSL + "d{2}:" + BSL + "d{2})/로 시각을 검사하세요.");
+    for (const v of [output.round21a, output.round21b, output.round21c]) expect(v).not.toContain("hunter2");
+    expect(output.regex21).toBe("정규식 /" + BSL + "d{2}:" + BSL + "d{2}/로 시각을 검사하세요.");
+    for (const v of [output.round20a, output.round20b, output.round20c]) expect(v).not.toContain("hunter2");
+    expect(output.round19).not.toContain("hunter2");
+    for (const v of [output.round18a, output.round18b]) expect(v).not.toContain("hunter2");
+    for (const v of [output.round17a, output.round17b]) expect(v).not.toContain("hunter2");
+    for (const v of [output.round16a, output.round16b]) expect(v).not.toContain("hunter2");
+    for (const v of [output.round15a, output.round15b, output.round15c]) expect(v).not.toContain("hunter2");
+    expect(output.round14a).not.toContain("hunter2");
+    expect(output.round14b).toBe('{"password":[숨김]');
+    expect(output.round13a).not.toContain("hunter2");
+    expect(output.round13b).toBe('{"password":[숨김]');
+    for (const v of [output.round12a, output.round12b, output.round12c]) expect(v).not.toContain("hunter2");
+    expect(output.prose12).toBe(
+      JSON.stringify({
+        message: ["password: 다음에 실제 값을 넣으세요."],
+        note: '참고, "password: 다음에"',
+        count: 1,
+      }),
+    );
+    for (const v of [output.round11a, output.round11b, output.round11c])
+      expect(v).not.toMatch(/1234|reviewLeak123|hunter2/);
+    expect(output.prose).toBe(JSON.stringify({ message: "password: 다음에 실제 값을 넣으세요.", count: 1 }));
+    // Where A and B cannot parse, the sweep hides everything after the separator to the end of the value
+    // (round 10): the later lines of these fields go with it.
+    expect(output.broken).toBe('stdout: {"note":"broken {"password":[숨김]');
+    expect(output.round9).toBe('stdout: " {\\"password\\":[숨김]');
+    expect(output.round10).toBe('stdout: " {\\"password\\"\\u003a[숨김]');
+    expect(output.printed.split("\n")).toEqual([
+      "stdout: " + JSON.stringify('[{"password":"[숨김]","otp":"[숨김]"}]'),
+      "stdout: " + JSON.stringify('{"password":"[숨김]","otp":"[숨김]"}'),
+      'x="{"password":"[숨김]"}"',
+      'stdout: "[\\"ok\\"] suffix {"password":"[숨김]","otp":"[숨김]"}',
+    ]);
+    expect(output.raw).toBe('{"stdout":"{\\"password\\":\\"[숨김]\\",\\"otp\\":\\"[숨김]\\"}');
+    expect(output.stdout).toBe('{"password":"[숨김]","otp":"[숨김]"}');
+    expect(JSON.parse(output.nested)).toEqual({ body: '{"token":"[숨김]","n":1}' });
+    expect(output.code).toBe(0);
+  });
+
+  it("FakeRuntime /md, /xss and /burst produce the scripted text", async () => {
+    const { conversation, send, stream } = await start();
+    const read = async (text: string) => {
+      const run = (await send(conversation().id, text)).json().run as Run;
+      return textOf((await (await stream(run.id)).read()).frames);
+    };
+    expect(await read("/md")).toContain("| 길이 (m) | 주기 (s) |");
+    expect(await read("/xss")).toContain("javascript:");
+    const burst = await read("/burst 120");
+    expect(burst).toContain("단어1 ");
+    expect(burst).toContain("**단어120**");
+  });
+});

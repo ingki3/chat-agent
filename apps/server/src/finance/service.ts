@@ -1,6 +1,7 @@
 import type { SkillResult } from "@agentlee/mcp-tools";
 import type { FinanceToolInfo } from "@agentlee/mcp-tools/finance";
 import { redactValue } from "../mcp/service.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 import type { RawResponse, RawStep, WebWorker } from "../web/service.js";
 import { DART_KEY, SEC_UA, TOOL_IMPLS, type FinanceCode, type Plan } from "./providers.js";
 import { finalize } from "./records.js";
@@ -105,7 +106,11 @@ export class FinanceService {
         }
         if (!parsed.ok) return { ok: false, code: parsed.code };
         const output = finalize(tool.name, parsed.data);
-        return { ok: true, output: secretValues.length ? redactValue(output, secretValues) : output };
+        // Its own secrets exactly (however short), then every other secret the server knows (review round 23).
+        return {
+          ok: true,
+          output: scrubKnownDeep(secretValues.length ? redactValue(output, secretValues) : output),
+        };
       }
       return { ok: false, code: "finance_failed" };
     } catch {

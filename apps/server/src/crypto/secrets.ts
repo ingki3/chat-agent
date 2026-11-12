@@ -1,11 +1,14 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { knownSecrets } from "../secrets/known.js";
 
 /**
  * Encryption for stored credentials (PRD FR-11.6, FR-15.6): AES-256-GCM with a random 96-bit IV.
  * Format: "v1:" + base64(iv | authTag | ciphertext). The optional AAD binds a value to its owner/purpose
  * (e.g. "connection:<id>") so a ciphertext copied to another row fails to decrypt.
+ * Every plaintext that is encrypted or decrypted here is a secret this server knows: it is registered with the
+ * known-secrets registry (review round 23), so no run output can carry it.
  */
 const VERSION = "v1";
 const IV_LEN = 12;
@@ -16,6 +19,7 @@ export class SecretError extends Error {}
 
 export function encrypt(plaintext: string, key: Buffer, aad?: string): string {
   assertKey(key);
+  knownSecrets.addCredential(plaintext);
   const iv = crypto.randomBytes(IV_LEN);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   if (aad) cipher.setAAD(Buffer.from(aad, "utf8"));
@@ -33,9 +37,12 @@ export function decrypt(payload: string, key: Buffer, aad?: string): string {
   decipher.setAuthTag(raw.subarray(IV_LEN, IV_LEN + TAG_LEN));
   if (aad) decipher.setAAD(Buffer.from(aad, "utf8"));
   try {
-    return Buffer.concat([decipher.update(raw.subarray(IV_LEN + TAG_LEN)), decipher.final()]).toString(
-      "utf8",
-    );
+    const plaintext = Buffer.concat([
+      decipher.update(raw.subarray(IV_LEN + TAG_LEN)),
+      decipher.final(),
+    ]).toString("utf8");
+    knownSecrets.addCredential(plaintext);
+    return plaintext;
   } catch {
     throw new SecretError("secret failed authentication (wrong key, wrong context or tampered)");
   }
@@ -80,6 +87,7 @@ export function loadMasterKey(keyPath: string): Buffer {
     }
     const key = Buffer.from(fs.readFileSync(fd, "utf8").trim(), "base64");
     assertKey(key);
+    knownSecrets.addKey(key);
     return key;
   } finally {
     fs.closeSync(fd);
@@ -92,5 +100,6 @@ export function createMasterKey(keyPath: string): Buffer {
   fs.mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
   const key = crypto.randomBytes(KEY_LEN);
   fs.writeFileSync(keyPath, key.toString("base64") + "\n", { mode: 0o600, flag: "wx" });
+  knownSecrets.addKey(key);
   return key;
 }

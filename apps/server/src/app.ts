@@ -70,6 +70,9 @@ import { logEvent, loggerOptions, rotatingFile } from "./logging.js";
 import { ErrorLog } from "./observability/errors.js";
 import { registerRoutePattern } from "./observability/policy.js";
 import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
+import { registerResponseScrub } from "./secrets/http.js";
+import { StoredRescrub } from "./secrets/rescrub.js";
+import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +122,8 @@ declare module "fastify" {
     fileWrites: FileWriteLock;
     /** Daily backups (#37); undefined without BACKUP_DIR or with an in-memory database. */
     backups: BackupService | undefined;
+    /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
+    storedRescrub: StoredRescrub | undefined;
   }
 }
 
@@ -197,6 +202,8 @@ function ephemeralKey(db: Db): Buffer {
 }
 
 export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
+  // Review round 23: every secret this server holds is known before anything can produce output.
+  registerConfigSecrets(config);
   const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
   const logDest = opts.logStream ?? (config.logFile ? rotatingFile(config.logFile) : undefined);
   const app = Fastify({
@@ -219,6 +226,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   installRouteRules(app);
   // Route patterns are what logs and the error list may name (observability/policy.ts).
   app.addHook("onRoute", (route) => registerRoutePattern(route.url));
+  // Every JSON and text response is scrubbed of known secrets, whichever route made it (round 25).
+  registerResponseScrub(app);
 
   app.addHook("onSend", async (_req, reply, payload) => {
     reply.headers(BASE_HEADERS);
@@ -261,6 +270,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerUserAdmin(app, users, opts.userAdmin);
     if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
     const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
+    // Stored rows are scrubbed again whenever a secret that may already be stored is registered (round 25) —
+    // and once now, for everything registered at startup.
+    const storedRescrub = new StoredRescrub(opts.db!, { log: app.log });
+    app.decorate("storedRescrub", storedRescrub);
+    app.addHook("onClose", async () => {
+      storedRescrub.close();
+      await storedRescrub.idle();
+    });
+    primeStoredSecrets(opts.db!, masterKey);
+    storedRescrub.schedule({ all: true });
     const settingsStore = new SettingsStore(opts.db!, masterKey);
     // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
     const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
@@ -493,6 +512,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);
     app.decorate("backups", undefined);
+    app.decorate("storedRescrub", undefined);
   }
 
   app.get(

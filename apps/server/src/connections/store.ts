@@ -15,6 +15,7 @@ import type { UserRow } from "../auth/users.js";
 import { decrypt, encrypt, mask } from "../crypto/secrets.js";
 import type { Db } from "../db/client.js";
 import { connections, runtimePolicies, runtimeSessions, users } from "../db/schema.js";
+import { scrubKnown } from "../secrets/known.js";
 
 export type ConnectionRow = typeof connections.$inferSelect;
 
@@ -183,6 +184,12 @@ export class ConnectionStore {
     if (!format.test(secret)) throw new ConnectionRuleError(400, "invalid_secret");
     const t = this.now();
     const id = crypto.randomUUID();
+    // Encrypted first: that registers the key, so a label holding it is scrubbed below (round 26).
+    const encrypted = encrypt(
+      secret,
+      this.masterKey,
+      aad({ id, runtime: input.runtime, authType: input.authType }),
+    );
     const row: ConnectionRow = {
       id,
       runtime: input.runtime,
@@ -190,10 +197,11 @@ export class ConnectionStore {
       scope: input.scope,
       ownerId: input.owner?.id ?? null,
       createdBy: input.createdBy,
-      label:
+      label: scrubKnown(
         input.label ??
-        `${RUNTIME_LABEL[input.runtime]} ${AUTH_LABEL[input.authType]}${input.scope === "shared" ? " (공용)" : ""}`,
-      secret: encrypt(secret, this.masterKey, aad({ id, runtime: input.runtime, authType: input.authType })),
+          `${RUNTIME_LABEL[input.runtime]} ${AUTH_LABEL[input.authType]}${input.scope === "shared" ? " (공용)" : ""}`,
+      ),
+      secret: encrypted,
       credentialVersion: 1,
       credentialBaseVersion: 1,
       hint: mask(secret),
@@ -214,7 +222,6 @@ export class ConnectionStore {
     const c = this.get(id);
     if (!c || c.disconnectedAt !== null) throw new ConnectionRuleError(404, "not_found");
     const set: Partial<ConnectionRow> = { updatedAt: this.now() };
-    if (patch.label !== undefined) set.label = patch.label;
     if (patch.secret !== undefined) {
       const secret = patch.secret.trim();
       if (LOGIN_ONLY[c.runtime as RuntimeId] === c.authType)
@@ -229,6 +236,8 @@ export class ConnectionStore {
       set.lastTestAt = null;
       set.lastTestCode = null;
     }
+    // After the new key (if any) is registered: a label holding it is scrubbed too.
+    if (patch.label !== undefined) set.label = scrubKnown(patch.label);
     this.db.update(connections).set(set).where(eq(connections.id, id)).run();
     return this.get(id)!;
   }
@@ -249,6 +258,11 @@ export class ConnectionStore {
     if (!input.owner.active) throw new ConnectionRuleError(404, "not_found");
     const t = this.now();
     const id = crypto.randomUUID();
+    const encrypted = encrypt(
+      input.credential,
+      this.masterKey,
+      aad({ id, runtime: input.runtime, authType: "subscription" }),
+    );
     const row: ConnectionRow = {
       id,
       runtime: input.runtime,
@@ -256,12 +270,8 @@ export class ConnectionStore {
       scope: "personal",
       ownerId: input.owner.id,
       createdBy: input.createdBy,
-      label: input.label ?? `${RUNTIME_LABEL[input.runtime]} ChatGPT 로그인`,
-      secret: encrypt(
-        input.credential,
-        this.masterKey,
-        aad({ id, runtime: input.runtime, authType: "subscription" }),
-      ),
+      label: scrubKnown(input.label ?? `${RUNTIME_LABEL[input.runtime]} ChatGPT 로그인`),
+      secret: encrypted,
       credentialVersion: 1,
       credentialBaseVersion: 1,
       hint: null,

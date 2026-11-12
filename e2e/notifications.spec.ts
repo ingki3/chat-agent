@@ -385,6 +385,9 @@ test("the browser signs in to another account between a sync's check and its reg
   // Next start of son's session: the sync reads son's tag, then — before its registration goes out — mom signs
   // in on this browser (another tab), so the registration arrives with mom's cookie.
   let switched = false;
+  // Settles once the intercepted registration has been answered (sign-in done, request sent with mom's cookie).
+  let answered!: () => void;
+  const registrationAnswered = new Promise<void>((r) => (answered = r));
   await ctx.route("**/api/push/devices", async (route) => {
     if (route.request().method() !== "POST" || switched) return route.continue();
     switched = true;
@@ -394,12 +397,16 @@ test("the browser signs in to another account between a sync's check and its reg
     });
     expect(r.ok()).toBe(true);
     const cookie = (await ctx.cookies()).find((c) => c.name === "al_session")!;
-    return route.continue({
+    const response = await route.fetch({
       headers: { ...route.request().headers(), cookie: `al_session=${cookie.value}` },
     });
+    await route.fulfill({ response });
+    answered();
   });
   await page.reload();
   await expect.poll(() => switched).toBe(true);
+  // Wait for the intercepted request and the sign-in to finish before checking and removing the route.
+  await registrationAnswered;
   await expect(page.getByTestId("device-state")).toHaveText("꺼짐");
   await ctx.unroute("**/api/push/devices");
   const moms = (await (await ctx.request.get("/api/push/devices")).json()) as { devices: unknown[] };

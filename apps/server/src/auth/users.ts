@@ -12,6 +12,7 @@ import {
 import type { Db } from "../db/client.js";
 import { sessions, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
+import { knownSecrets, scrubKnown } from "../secrets/known.js";
 
 export type UserRow = typeof users.$inferSelect;
 
@@ -103,7 +104,8 @@ export class UserStore {
     const row = {
       id: crypto.randomUUID(),
       email: normalizeEmail(input.email),
-      name: input.name,
+      // No known secret in a stored name (round 26: every write of user-supplied text is scrubbed).
+      name: scrubKnown(input.name),
       role: input.role,
       passwordHash: input.passwordHash,
       mustChangePassword: input.mustChangePassword ?? false,
@@ -245,7 +247,7 @@ export class UserStore {
           return { ok: false, code: "last_admin" };
         this.db
           .update(users)
-          .set({ name: patch.name ?? target.name, email, role, updatedAt: this.now() })
+          .set({ name: scrubKnown(patch.name ?? target.name), email, role, updatedAt: this.now() })
           .where(eq(users.id, userId))
           .run();
         if (emailChanged) this.db.delete(sessions).where(eq(sessions.userId, userId)).run();
@@ -287,6 +289,7 @@ export class UserStore {
       .insert(sessions)
       .values({ id: sha256(token), userId, createdAt: t, lastSeenAt: t, expiresAt: t + SESSION_TTL_MS })
       .run();
+    knownSecrets.add(token, { fresh: true }); // the cookie never shows up in a reply
     return token;
   }
 
@@ -302,6 +305,7 @@ export class UserStore {
       .where(and(eq(sessions.id, id), gt(sessions.expiresAt, t), eq(users.active, true)))
       .get();
     if (!row) return undefined;
+    knownSecrets.add(token); // sessions from before a restart are known again once used
     if (t - row.lastSeenAt > TOUCH_MS)
       this.db.update(sessions).set({ lastSeenAt: t }).where(eq(sessions.id, id)).run();
     return row.user;
@@ -309,6 +313,7 @@ export class UserStore {
 
   /** Ends one session (logout). Open streams of that session re-check and close. */
   deleteSession(token: string): void {
+    knownSecrets.remove(token);
     const row = this.db
       .delete(sessions)
       .where(eq(sessions.id, sha256(token)))
