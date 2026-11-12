@@ -28,6 +28,11 @@
       "types": "./src/finance.ts",
       "development": "./src/finance.ts",
       "default": "./dist/finance.js"
+    },
+    "./schedules": {
+      "types": "./src/schedules.ts",
+      "development": "./src/schedules.ts",
+      "default": "./dist/schedules.js"
     }
   },
   "scripts": {

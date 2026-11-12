@@ -234,8 +234,8 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   // Schedules (#33): the name and the prompt are the user's text; the timing fields are validated values.
   "schedules.id": ID,
   "schedules.owner_id": ID,
-  "schedules.name": { write: "ScheduleStore.create", rescrub: "text" },
-  "schedules.prompt": { write: "ScheduleStore.create", rescrub: "text" },
+  "schedules.name": { write: "ScheduleStore.create / edit", rescrub: "text" },
+  "schedules.prompt": { write: "ScheduleStore.create / edit", rescrub: "text" },
   "schedules.type": ENUM,
   "schedules.date": { exempt: "YYYY-MM-DD, validated" },
   "schedules.time": { exempt: "HH:MM, validated" },
@@ -260,4 +260,19 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "schedule_runs.error_code": ENUM,
   "schedule_runs.output_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
   "schedule_runs.result_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
+  // Schedule proposals (#55): the tool's name and prompt are runtime text; the rest is validated or ids.
+  "schedule_proposals.id": ID,
+  "schedule_proposals.owner_id": ID,
+  "schedule_proposals.conversation_id": ID,
+  "schedule_proposals.run_id": ID,
+  "schedule_proposals.name": { write: "ScheduleProposalStore.create", rescrub: "text" },
+  "schedule_proposals.prompt": { write: "ScheduleProposalStore.create", rescrub: "text" },
+  "schedule_proposals.timing": {
+    exempt:
+      "a ScheduleTiming parsed by its schema (type, HH:MM, a calendar date, weekday numbers, a cron of digits and * , - /)",
+  },
+  "schedule_proposals.time_zone": { exempt: "an IANA zone name, validated" },
+  "schedule_proposals.skills": { exempt: "skill names from the catalogue (validated)" },
+  "schedule_proposals.status": ENUM,
+  "schedule_proposals.schedule_id": ID,
 };

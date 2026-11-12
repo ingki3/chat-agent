@@ -19,6 +19,8 @@ export function RuntimeChip(props: {
   notice?: string | null | undefined;
   /** "다음 메시지부터 …": the next reply differs from the last one. */
   pending?: boolean | undefined;
+  /** The popover's closing note (default: the conversation's "이 대화에만 적용되고 …"); the schedule form has its own. */
+  note?: string | undefined;
 }) {
   const [open, setOpen] = useState(false);
   // When the popover was opened: usage limits are shown against it (they end on their own).
@@ -194,7 +196,7 @@ export function RuntimeChip(props: {
                 </label>
               )}
               <p className="muted">
-                이 대화에만 적용되고, 다음 메시지부터 바뀌어요. 기본값은 설정에서 바꿔요.
+                {props.note ?? "이 대화에만 적용되고, 다음 메시지부터 바뀌어요. 기본값은 설정에서 바꿔요."}
               </p>
             </>
           )}

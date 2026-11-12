@@ -40,6 +40,8 @@ import {
  *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
  *                     manager's citation check then adds its note (#25)
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
+ *   "매일 아침 8시 관심 종목 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
+ *                     daily (or weekday) schedule at that hour, then a reply pointing at the confirmation card (#55)
  * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
  * was given — deterministic, so tests can tell which messages a summary covers.
  */
@@ -266,6 +268,34 @@ export const fakeSummary = (memory: readonly string[]): string =>
     .map((m) => m.replace(/\s+/g, " ").slice(0, 40).trim())
     .join(" / ")}`;
 
+/**
+ * A schedule request in plain words (#55, FR-8.1): "매일 아침 8시 관심 종목 브리핑", "평일 저녁 7시에 … 알려줘". A
+ * real `schedule_create` call (the card), or undefined for any other text.
+ */
+export function scheduleSteps(t: string): FakeStep[] | undefined {
+  const m = /^(매일|평일)\s*(아침|오전|낮|오후|저녁|밤)?\s*(\d{1,2})시(?:\s*(\d{1,2})분)?에?\s+(.+)$/.exec(t);
+  if (!m || !/(브리핑|예약|알려|정리)/.test(m[5]!)) return undefined;
+  let hour = Number(m[3]);
+  if (["오후", "저녁", "밤"].includes(m[2] ?? "") && hour < 12) hour += 12;
+  if (hour > 23 || Number(m[4] ?? 0) > 59) return undefined;
+  const time = `${String(hour).padStart(2, "0")}:${String(Number(m[4] ?? 0)).padStart(2, "0")}`;
+  const what = m[5]!.replace(/(해\s*줘|해\s*주세요|알려\s*줘|예약해\s*줘)[.!]*$/u, "").trim();
+  const name = `${m[2] ? `${m[2]} ` : ""}${what}`.slice(0, 100);
+  return [
+    { text: "이렇게 예약해 둘까요? " },
+    {
+      call: "schedule_create",
+      input: {
+        name,
+        prompt: `${what}해줘`,
+        timing: { type: m[1] === "평일" ? "weekdays" : "daily", time },
+        timeZone: "Asia/Seoul",
+      },
+    },
+    { text: "아래 확인 카드에서 **만들기**를 누르면 예약이 만들어져요." },
+  ];
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(SUMMARY_MARKER))
@@ -280,6 +310,8 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (fin) return financeSteps(!!fin[1]);
   const artifact = artifactSteps(t);
   if (artifact) return artifact;
+  const schedule = scheduleSteps(t);
+  if (schedule) return schedule;
   if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
   if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
   if (t === "/secrettool")

@@ -249,6 +249,44 @@ APP_MATRIX.push(
   { route: "POST /api/schedules/:id/run", expect: { ...OWNER_ONLY, owner: 201 }, fixture: schedule },
 );
 
+/** A schedule proposed by `schedule_create` in a conversation of `owner` (#55): the store directly. */
+function proposal(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  return f.app.scheduleProposals!.create(
+    { userId: f.users.owner.id, conversationId: c.id, runId: "run-1" },
+    {
+      name: "아침 브리핑",
+      prompt: "관심 종목 정리",
+      timing: { type: "daily", time: "08:00" },
+      timeZone: "Asia/Seoul",
+      skills: [],
+      notify: true,
+    },
+    Date.now(),
+  ).id;
+}
+
+/**
+ * Schedule proposals (#55): the card carries the owner's prompt and its confirm makes the owner's schedule — owner
+ * only, the admin refused like anyone else. (The matrix app has no runtime: the owner's confirm is 409
+ * `no_usable_runtime` there — the error code proves it passed the ownership check; schedule-ui.test.ts makes one.)
+ */
+APP_MATRIX.push(
+  { route: "GET /api/schedule-proposals/:id", expect: OWNER_ONLY, fixture: proposal },
+  {
+    route: "POST /api/schedule-proposals/:id/confirm",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: proposal,
+    errors: { owner: "no_usable_runtime", admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+  {
+    route: "POST /api/schedule-proposals/:id/dismiss",
+    expect: OWNER_ONLY,
+    fixture: proposal,
+    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+);
+
 /** Admin-only data: every member — the son's account included — 403, the admin 200, before login 401. */
 export const ADMIN_ONLY: Record<Who, number> = {
   owner: 403,

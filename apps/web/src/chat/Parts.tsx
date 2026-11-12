@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { Fragment, memo, useMemo } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
 import { files } from "../api.js";
 import { RichText } from "./RichText.js";
@@ -8,6 +8,8 @@ import { CitationSources } from "../citations/CitationNote.js";
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
 import { ArtifactCard } from "../artifacts/ArtifactPanel.js";
+import { ScheduleCard } from "../schedules/ScheduleCard.js";
+import { proposalIds } from "../schedules/format.js";
 
 type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
@@ -249,7 +251,16 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
     <>
       {segments(parts).map((s) =>
         s.kind === "tools" ? (
-          <Tools key={`t${s.index}`} calls={s.calls} results={s.results} streaming={streaming} />
+          <Fragment key={`t${s.index}`}>
+            <Tools calls={s.calls} results={s.results} streaming={streaming} />
+            {/* `schedule_create` (#55): its proposal's confirmation card, under the tool line. */}
+            {proposalIds([
+              ...s.calls,
+              ...s.calls.flatMap((c) => (s.results.has(c.id) ? [s.results.get(c.id)!] : [])),
+            ]).map((id) => (
+              <ScheduleCard key={id} id={id} />
+            ))}
+          </Fragment>
         ) : (
           <PartView key={s.index} part={s.part} cite={cite} text={answer} />
         ),

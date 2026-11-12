@@ -1,5 +1,5 @@
 import os from "node:os";
-import { NotificationKind, RuntimeId, SCHEDULE_RUN_CODES } from "@agentlee/shared";
+import { NotificationKind, RuntimeId, SCHEDULE_PROPOSAL_CODES, SCHEDULE_RUN_CODES } from "@agentlee/shared";
 import { USAGE_PURPOSES } from "../usage/store.js";
 
 /**
@@ -262,6 +262,8 @@ export const SCHEDULE_CODES = set([
   "schedule_invalid",
   "storage_not_owned",
   "handler_missing",
+  // The `schedule_create` tool (#55): why a proposal was refused (`ScheduleInputError` codes and the tool's own).
+  ...SCHEDULE_PROPOSAL_CODES,
 ]);
 export const isScheduleCode = member(SCHEDULE_CODES);
 export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));

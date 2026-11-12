@@ -21,6 +21,7 @@ import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from
 import { FakeScheduleHandler } from "./schedules/fake.js";
 import { registerScheduleRoutes } from "./schedules/routes.js";
 import { ScheduleStore } from "./schedules/store.js";
+import { ScheduleProposalStore } from "./schedules/proposals.js";
 import { SkillSwitches } from "./mcp/switches.js";
 import { registerConversationRoutes } from "./conversations/routes.js";
 import { ConversationStore } from "./conversations/store.js";
@@ -142,6 +143,8 @@ declare module "fastify" {
      * FAKE_RUNTIME=1). undefined without a database.
      */
     schedules: { store: ScheduleStore; engine: ScheduleEngine | undefined } | undefined;
+    /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
+    scheduleProposals: ScheduleProposalStore | undefined;
   }
 }
 
@@ -414,6 +417,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Artifacts (#27): made by the artifact tools, scoped to the run's conversation.
     const artifacts = new ArtifactStore(opts.db!);
     app.decorate("artifacts", artifacts);
+    // Schedule proposals (#55): `schedule_create` stores them; the owner confirms the card (schedule routes).
+    const scheduleProposals = new ScheduleProposalStore(opts.db!);
+    app.decorate("scheduleProposals", scheduleProposals);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       web: {
@@ -426,6 +432,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         ...opts.web,
       },
       artifacts,
+      scheduleProposals,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: { secrets: config.skillSecrets },
       // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
@@ -593,6 +600,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("schedules", { store: scheduleStore, engine: scheduleEngine });
     registerScheduleRoutes(app, {
       store: scheduleStore,
+      proposals: scheduleProposals,
       engine: scheduleEngine,
       defaults,
       users,
@@ -666,6 +674,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("storedRescrub", undefined);
     app.decorate("files", undefined);
     app.decorate("schedules", undefined);
+    app.decorate("scheduleProposals", undefined);
   }
 
   app.get(

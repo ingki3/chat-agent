@@ -21,7 +21,16 @@ import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@
 import { FINANCE_TOOLS, type FinanceToolInfo } from "@agentlee/mcp-tools/finance";
 import { FinanceService, type FinanceOptions } from "../finance/service.js";
 import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
-import { artifactPath, frameExternal, type ArtifactKind } from "@agentlee/shared";
+import { SCHEDULE_CREATE_TOOL } from "@agentlee/mcp-tools/schedules";
+import type { ScheduleProposalStore } from "../schedules/proposals.js";
+import { firstRunAfter, ScheduleInputError } from "../schedules/store.js";
+import {
+  artifactPath,
+  frameExternal,
+  ScheduleProposalInput,
+  type ArtifactKind,
+  type ScheduleProposalToolOutput,
+} from "@agentlee/shared";
 import { CiteRefused, type CitationStore } from "../citations/store.js";
 import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
 import type { ServerToolInfo } from "@agentlee/mcp-tools";
@@ -317,6 +326,8 @@ export type McpServiceOptions = {
   artifacts?: ArtifactStore;
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
+  /** Schedule proposals (#55): `schedule_create` stores what it proposes. Without it the tool is not offered. */
+  scheduleProposals?: ScheduleProposalStore;
   /** The server allow-list switches (#35). Without it every skill is on. */
   switches?: SkillSwitches;
   /** Recent errors (#46): failed skill calls are recorded (tool name and code only) for the admin screen. */
@@ -402,6 +413,7 @@ export class McpService {
           ]
         : []),
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
+      ...(opts.scheduleProposals ? [SCHEDULE_CREATE_TOOL] : []),
     ];
     this.finance = opts.finance
       ? new FinanceService(
@@ -626,6 +638,19 @@ export class McpService {
           });
           return r;
         }
+        if (name === SCHEDULE_CREATE_TOOL.name) {
+          const r = this.callScheduleTool(input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "schedule.proposed", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            ...(r.ok ? {} : { scheduleCode: r.code }),
+          });
+          return r;
+        }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {
           const r = this.callArtifactTool(toolByName.get(name), input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "artifact.finished", {
@@ -698,6 +723,39 @@ export class McpService {
       if (e instanceof ArtifactError) return { ok: false, code: e.code };
       throw e;
     }
+  }
+
+  /**
+   * `schedule_create` (#55, FR-8.1): checks the proposal like `POST /api/schedules` would (strict input, skills from
+   * the catalogue that this user may use, a timing with a next occurrence) and stores it for the token's own
+   * conversation — after checking that the token's user owns it. Nothing is scheduled: the user confirms the card.
+   */
+  private callScheduleTool(input: Record<string, unknown>, scope: ToolScope): SkillResult {
+    const store = this.opts.scheduleProposals;
+    if (!store || !this.users.byId(scope.userId)?.active) return { ok: false, code: "schedule_not_allowed" };
+    if (!store.ownsConversation(scope)) return { ok: false, code: "schedule_not_allowed" };
+    const parsed = ScheduleProposalInput.safeParse(input);
+    if (!parsed.success) return { ok: false, code: "schedule_bad_input" };
+    const p = parsed.data;
+    const catalogue = new Set(this.overview().map((s) => s.name));
+    if (p.skills.some((s) => !catalogue.has(s) || !this.allows(scope.userId, s)))
+      return { ok: false, code: "skill_not_allowed" };
+    const at = (this.opts.now?.() ?? new Date()).getTime();
+    let nextRunAt: number;
+    try {
+      nextRunAt = firstRunAfter(p.timing, p.timeZone, at);
+    } catch (e) {
+      if (e instanceof ScheduleInputError) return { ok: false, code: e.code };
+      throw e;
+    }
+    const row = store.create(scope, { ...p, skills: [...new Set(p.skills)] }, at);
+    const output: ScheduleProposalToolOutput = {
+      proposalId: row.id,
+      status: "proposed",
+      nextRunAt,
+      note: "Not created yet: the user sees a confirmation card and the schedule is created only if they confirm it there. Tell them to check the card; do not say it was created.",
+    };
+    return { ok: true, output };
   }
 
   /**

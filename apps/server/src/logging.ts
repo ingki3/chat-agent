@@ -132,6 +132,7 @@ export const LOG_EVENTS = [
   // be (fixed code) — never the summary or the messages.
   "context.summarized",
   "context.summary_failed",
+  "schedule.proposed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

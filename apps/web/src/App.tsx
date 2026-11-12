@@ -11,6 +11,7 @@ import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
+import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
 
 /** Only the login state lives here. Everything an account sees lives in a per-account client (AccountData). */
@@ -74,7 +75,9 @@ function AuthGate() {
           <Route index element={<NewChatPage />} />
           <Route path="c/:id" element={<ChatRoute />} />
           <Route path="shared" element={<PlaceholderPage title="👪 가족 공유" issue="#52" />} />
-          <Route path="schedules" element={<PlaceholderPage title="⏰ 예약" issue="#55" />} />
+          <Route path="schedules" element={<SchedulesPage />} />
+          <Route path="schedules/new" element={<SchedulesPage creating />} />
+          <Route path="schedules/:id" element={<ScheduleRoute />} />
           <Route path="artifacts" element={<ArtifactsPage />} />
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
@@ -99,6 +102,12 @@ function AccountData({ children }: { children: ReactNode }) {
   );
   useEffect(() => () => client.clear(), [client]);
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+/** One schedule screen per schedule: an edit form never carries over to another one. */
+function ScheduleRoute() {
+  const { id = "" } = useParams();
+  return <ScheduleDetailPage key={id} />;
 }
 
 /** One chat screen instance per conversation: no state (e.g. a half-streamed reply) carries over. */
