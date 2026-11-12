@@ -83,6 +83,17 @@ export const conversations = sqliteTable(
     revision: integer("revision").notNull().default(0),
     /** "자료 조사 모드" toggle (FR-5.5): runs in this conversation get the research instructions (#20). */
     researchMode: integer("research_mode", { mode: "boolean" }).notNull().default(false),
+    /**
+     * What the next message is answered with (#19, `ChatSettings`): set at creation from the user's defaults (FR-12.6
+     * fallback applied) and changed only by the chip, so a change of the defaults never reaches an existing
+     * conversation (FR-12.5). Null runtime: none was usable yet — the first message resolves it again.
+     */
+    runtime: text("runtime"),
+    model: text("model"),
+    effort: text("effort"),
+    useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
+    /** `{ runtime, model }` JSON while the "기본값을 쓸 수 없어 ○○로 시작했어요" notice has not been shown yet. */
+    fallbackNotice: text("fallback_notice", { mode: "json" }).$type<{ runtime: string; model: string }>(),
     /** Next message sequence number (per conversation, monotonically increasing). */
     nextSeq: integer("next_seq").notNull().default(1),
     createdAt: integer("created_at").notNull().default(now),

@@ -75,7 +75,7 @@ test("a new chat starts by typing; the reply streams in (fake runtime)", async (
   await page.getByRole("button", { name: "보내기" }).click();
   await expect(page).toHaveURL(/\/c\/[0-9a-f-]+$/);
   await expect(page.getByTestId("assistant").last()).toContainText("사과 바나나 포도");
-  await expect(page.getByTestId("assistant").last()).toContainText("fake-large");
+  await expect(page.getByTestId("assistant").last()).toContainText("claude-opus-5-5");
   await expect(page.locator(".topbar .title")).toHaveText("사과 바나나 포도");
 });
 

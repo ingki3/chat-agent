@@ -150,7 +150,9 @@ export function DividerView({ d }: { d: DividerPart }) {
       {d.kind === "runtime_switch" && d.runtime ? (
         <>
           여기부터 <span className={`dot ${runtimeClass(d.runtime)}`} />
-          {[RUNTIME_LABEL[d.runtime] ?? d.runtime, d.model].filter(Boolean).join(" · ")}
+          {/* The server's label names the model as the chip does (#19); older dividers carry only the ids. */}
+          {d.label.replace(/^여기부터\s*/, "") ||
+            [RUNTIME_LABEL[d.runtime] ?? d.runtime, d.model].filter(Boolean).join(" · ")}
         </>
       ) : (
         d.label || (d.kind === "summary" ? "앞부분은 요약해서 넘겼어요" : "")

@@ -22,6 +22,7 @@ import {
   Connection,
   ConnectionTestResult,
   Conversation,
+  type ChangeSettingsRequest,
   CreateUserResponse,
   CSRF_HEADER,
   Message,
@@ -229,6 +230,9 @@ export const admin = {
 export const settings = {
   runtimes: async () =>
     RuntimeOption.array().parse(((await call("GET", "/api/runtimes")) as { items: unknown }).items),
+  /** The chip (#19): only runtimes that can answer now (allowed, with a passed connection or none needed). */
+  usableRuntimes: async () =>
+    RuntimeOption.array().parse(((await call("GET", "/api/runtimes/usable")) as { items: unknown }).items),
   defaults: async () => DefaultsResponse.parse(await call("GET", "/api/settings/defaults")),
   setDefaults: async (defaults: RuntimeDefaults | null) =>
     DefaultsResponse.parse(await call("PUT", "/api/settings/defaults", { defaults })),
@@ -244,7 +248,14 @@ export const conversations = {
     return { items: Conversation.array().parse(r.items), nextCursor: r.nextCursor };
   },
   get: async (id: string) => Conversation.parse(await call("GET", `/api/conversations/${enc(id)}`)),
-  create: async () => Conversation.parse(await call("POST", "/api/conversations", {})),
+  /** Starts on the defaults (FR-12.6 fallback by the server); `settings` = a chip choice made before sending. */
+  create: async (settings?: ChangeSettingsRequest) =>
+    Conversation.parse(await call("POST", "/api/conversations", settings ? { settings } : {})),
+  /** The chip (#19): from the next message on. */
+  changeSettings: async (id: string, change: ChangeSettingsRequest) =>
+    Conversation.parse(await call("PUT", `/api/conversations/${enc(id)}/settings`, change)),
+  dismissFallbackNotice: async (id: string) =>
+    Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { dismissFallbackNotice: true })),
   rename: async (id: string, title: string) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { title })),
   pin: async (id: string, pinned: boolean) =>
@@ -420,6 +431,7 @@ const MESSAGES: Record<string, string> = {
   model_not_allowed: "허용되지 않은 모델이에요.",
   effort_not_allowed: "허용되지 않은 추론 강도예요.",
   runtime_not_allowed: "허용되지 않은 런타임이에요.",
+  chip_unavailable: "지금은 고를 수 없는 조합이에요.",
   backup_running: "이미 백업 중이에요. 끝난 뒤 다시 눌러 주세요.",
   backup_unavailable: "이 서버에서는 백업을 만들지 않아요(BACKUP_DIR 확인).",
   backup_failed: "백업에 실패했어요. 디스크와 백업 폴더 권한을 확인하세요.",

@@ -62,9 +62,9 @@ test("Enter sends, Shift+Enter starts a new line", async ({ page, baseURL }) => 
   await box.press("Enter");
   await expect(page.getByTestId("user-message")).toHaveText(/첫 줄\s+둘째 줄/);
   await expect(box).toHaveValue("");
-  // Placeholders for what comes with #22 / #19.
+  // File upload comes with #22; the chip shows the defaults (nothing set: Opus 5.5, #19).
   await expect(page.getByRole("button", { name: "파일 첨부" })).toBeDisabled();
-  await expect(page.locator("#runtime-chip")).toContainText("Claude Code · fake-large");
+  await expect(page.locator("#runtime-chip")).toContainText("Claude Code · Opus 5.5");
 });
 
 test("markdown: table, highlighted code with copy, KaTeX, safe links; whole reply copy", async ({
@@ -161,7 +161,8 @@ test("usage limit: notice, error, and an offer to carry on with another runtime"
   await expect(r.getByTestId("notice")).toHaveText("사용 한도에 도달했어요 (가짜)");
   await expect(r.getByRole("alert")).toContainText("사용 한도에 도달했어요.");
   await r.getByRole("button", { name: "다른 런타임으로 이어가기" }).click();
-  await expect(page.getByText("런타임·모델 바꾸기는 곧 지원돼요")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "런타임·모델 선택" })).toBeVisible();
+  await page.keyboard.press("Escape");
 
   await send(page, "/error");
   await expect(reply(page)).toHaveAttribute("data-status", "error");

@@ -149,6 +149,14 @@ export const APP_MATRIX: MatrixRow[] = [
     body: { title: "새 이름" },
   },
   { route: "DELETE /api/conversations/:id", expect: OWNER_ONLY, fixture: conversation },
+  // The chip (#19). No runtime in the matrix app: past the resource check the owner gets the policy's 403
+  // (runtime_not_allowed) — everyone else is stopped before it.
+  {
+    route: "PUT /api/conversations/:id/settings",
+    expect: { ...OWNER_ONLY, owner: 403 },
+    fixture: conversation,
+    body: { runtime: "codex" },
+  },
   { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
   // Owner only even once sharing exists (#50): a shared view gets its frozen sources, not this list (#29).
   { route: "GET /api/conversations/:id/sources", expect: OWNER_ONLY, fixture: conversation },

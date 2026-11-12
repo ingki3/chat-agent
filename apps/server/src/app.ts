@@ -302,7 +302,29 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       return egress;
     };
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
-    if (!opts.runtimes && config.fakeRuntime) runtimes.register(new FakeRuntime({ runTools: true }));
+    // FAKE_RUNTIME=1 (e2e, manual testing): the scripted runtime as "Claude Code", with the service default model
+    // (Opus 5.5, D3) next to the fake ones so a user with nothing set starts where a real one would (#19).
+    if (!opts.runtimes && config.fakeRuntime)
+      runtimes.register(
+        new FakeRuntime({
+          runTools: true,
+          models: [
+            {
+              id: "fake-large",
+              label: "Fake Large",
+              efforts: ["low", "medium", "high"],
+              defaultEffort: "medium",
+            },
+            { id: "fake-small", label: "Fake Small", efforts: [] },
+            {
+              id: "claude-opus-5-5",
+              label: "Opus 5.5",
+              efforts: ["low", "medium", "high"],
+              defaultEffort: "high",
+            },
+          ],
+        }),
+      );
     else if (!opts.runtimes) {
       // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
       // addresses) — one per runtime and way of signing in, so each reaches only its own provider's hosts.
@@ -370,7 +392,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.log,
     );
     app.decorate("connections", connections);
+    // Defaults and the per-conversation settings (#35, #19): one service for the settings screen, new
+    // conversations (FR-12.6 fallback) and the chip — all through the run check itself.
+    const defaults = new DefaultsService(connections.access, runtimes);
+    const startSettings = (userId: string) => {
+      const u = users.byId(userId);
+      return u ? defaults.start(u) : null;
+    };
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
+      startSettings,
       mcp,
       usage,
       mcpTokens,
@@ -392,7 +422,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onClose", async () => mcp.close());
     app.decorate("mcp", mcp);
     app.decorate("runs", runManager);
-    registerConversationRoutes(app, app.conversations!, runManager);
+    registerConversationRoutes(app, app.conversations!, runManager, { defaults, users });
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
@@ -427,7 +457,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerConnectionRoutes(app, connections, users, runtimes, logins);
     // Admin screen (#35): accounts, defaults, skills, runtimes and system status.
     registerAccountSettings(app, users, {
-      defaults: new DefaultsService(connections.access, runtimes),
+      defaults,
       mcp,
     });
     registerAdminSystemRoutes(

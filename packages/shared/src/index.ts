@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { RuntimeId } from "./runtime.js";
+import { ChatSettings } from "./chat.js";
 
 export * from "./runtime.js";
 export * from "./chat.js";
@@ -105,13 +106,16 @@ export const SERVICE_DEFAULTS: RuntimeDefaults = {
 };
 /**
  * `GET /api/settings/defaults`: what new conversations start with — the user's own choice, else the admin's
- * initial value, else the service default — and which runtimes' saved model is no longer allowed (FR-12.6 notice;
- * the automatic fallback itself is #19).
+ * initial value, else the service default — and which runtimes' saved model is no longer allowed (FR-12.6 notice).
+ * `start` is what a new conversation would really start with right now after the FR-12.6 fallback order (#19), null
+ * when nothing is usable ("쓸 수 있는 런타임이 없어요"); `fallback` says the default itself could not be used.
  */
 export const DefaultsResponse = z.object({
   defaults: RuntimeDefaults,
   source: z.enum(["own", "initial", "service"]),
   unavailable: z.array(RuntimeId),
+  start: ChatSettings.nullable(),
+  fallback: z.boolean(),
 });
 export type DefaultsResponse = z.infer<typeof DefaultsResponse>;
 /** `PUT /api/settings/defaults` (own) and `PUT /api/admin/users/:id/defaults` (initial; null clears it). */

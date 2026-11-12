@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { APIRequestContext, Page } from "@playwright/test";
+import { expect, type APIRequestContext, type Browser, type Page } from "@playwright/test";
 
 export const ADMIN = { email: "ingki3@gmail.com", password: "e2e-admin-password", name: "관리자" };
 export const MOM = { email: "mom@example.com", password: "e2e-mom-password", name: "엄마" };
@@ -23,4 +23,35 @@ export async function useAccount(page: Page, who: { email: string }) {
     cookies: Parameters<ReturnType<Page["context"]>["addCookies"]>[0];
   };
   await page.context().addCookies(state.cookies);
+}
+
+/** A fresh family account made by the admin (its own permissions and defaults, so parallel runs never collide). */
+export async function newMember(browser: Browser, baseURL: string, label: string, youth = false) {
+  const ctx = await browser.newContext({ baseURL });
+  const adminPage = await ctx.newPage();
+  await useAccount(adminPage, ADMIN);
+  const email = `${label}-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
+  const name = `${label}${Math.round(Math.random() * 1e4)}`;
+  const created = await adminPage.request.post("/api/admin/users", {
+    data: { name, email, youth },
+    headers: csrf(baseURL),
+  });
+  expect(created.status()).toBe(201);
+  const { user, temporaryPassword } = (await created.json()) as {
+    user: { id: string };
+    temporaryPassword: string;
+  };
+  await ctx.close();
+  return { id: user.id, name, email, temporaryPassword };
+}
+
+export async function signIn(page: Page, baseURL: string, who: { email: string; temporaryPassword: string }) {
+  await page.request.post("/api/auth/login", {
+    data: { email: who.email, password: who.temporaryPassword },
+    headers: csrf(baseURL),
+  });
+  await page.request.post("/api/auth/password", {
+    data: { currentPassword: who.temporaryPassword, newPassword: "admin-e2e-password-1" },
+    headers: csrf(baseURL),
+  });
 }

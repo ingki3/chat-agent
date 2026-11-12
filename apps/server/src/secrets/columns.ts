@@ -47,6 +47,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "conversations.kind": ENUM,
   "conversations.forked_from": ID,
   "conversations.last_runtime": ENUM,
+  "conversations.runtime": ENUM,
+  "conversations.model": {
+    exempt: "a model id from the runtime's catalogue (checked by RunAccess before it is stored)",
+  },
+  "conversations.effort": ENUM,
+  "conversations.fallback_notice": {
+    exempt: "runtime and model ids (checked by RunAccess before they are stored)",
+  },
   "messages.id": ID,
   "messages.conversation_id": ID,
   "messages.role": ENUM,

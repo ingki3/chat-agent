@@ -1,19 +1,32 @@
 import {
   SERVICE_DEFAULTS,
+  type ChangeSettingsRequest,
+  type ChatSettings,
   type DefaultsResponse,
+  type ModelDefault,
+  type RunChoice,
   type RuntimeDefaults,
   type RuntimeId,
 } from "@agentlee/shared";
 import { storedDefaults, type UserRow } from "../auth/users.js";
-import type { RunAccess } from "../connections/access.js";
+import { RunAccessDenied, type RunAccess } from "../connections/access.js";
 import type { RuntimeCapabilities, RuntimeRegistry } from "../runtime/adapter.js";
+
+/** The fixed runtime order of the FR-12.6 fallback ("다른 런타임(Claude Code → Codex 순)"). */
+export const RUNTIME_ORDER: readonly RuntimeId[] = ["claude-code", "codex"];
+
+/** Where a new conversation starts (#19): the settings, and whether the default itself could not be used. */
+export type StartSettings = { settings: ChatSettings; fallback: boolean };
 
 /**
  * Default runtime, model and effort (PRD D3, FR-12.1·12.3·12.4, #35). The user's own choice wins, then the admin's
  * initial value for that user, then the service default (Claude Code · Opus 5.5). Saving either one goes through
  * `RunAccess.checkDefaults` — the same allowed list as the run check and the picker — so a model the admin did not
- * allow can never be saved (403 for the user, 400 for the admin). Applying them to new conversations, with the
- * FR-12.6 fallback order, is #19.
+ * allow can never be saved (403 for the user, 400 for the admin).
+ *
+ * #19 adds what new conversations start with (`start`, the FR-12.6 fallback order) and the chip's per-conversation
+ * change (`change`). Both go through `RunAccess.resolve` — the run check itself — with the runtime's real
+ * capabilities, so "usable" also means a `passed` connection the user may use.
  */
 export class DefaultsService {
   constructor(
@@ -24,22 +37,131 @@ export class DefaultsService {
   private caps = (runtime: RuntimeId): RuntimeCapabilities | undefined =>
     this.registry.get(runtime)?.capabilities();
 
-  effective(user: UserRow): DefaultsResponse {
+  private resolved(user: UserRow): { defaults: RuntimeDefaults; source: DefaultsResponse["source"] } {
     const own = storedDefaults(user.defaults);
     const initial = storedDefaults(user.initialDefaults);
-    const [defaults, source] = own
-      ? ([own, "own"] as const)
+    return own
+      ? { defaults: own, source: "own" }
       : initial
-        ? ([initial, "initial"] as const)
-        : ([SERVICE_DEFAULTS, "service"] as const);
+        ? { defaults: initial, source: "initial" }
+        : { defaults: SERVICE_DEFAULTS, source: "service" };
+  }
+
+  effective(user: UserRow): DefaultsResponse {
+    const { defaults, source } = this.resolved(user);
     // Only a saved value can have become unusable; the service default is whatever the server offers.
     const unavailable =
       source === "service" ? [] : this.access.unavailableDefaults(user.id, defaults, this.caps);
-    return { defaults, source, unavailable };
+    const start = this.start(user);
+    return {
+      defaults,
+      source,
+      unavailable,
+      start: start?.settings ?? null,
+      fallback: start?.fallback ?? false,
+    };
   }
 
   /** Throws `RunAccessDenied` when `defaults` is not allowed for `userId`. */
   check(userId: string, defaults: RuntimeDefaults): void {
     this.access.checkDefaults(userId, defaults, this.caps);
+  }
+
+  /**
+   * One candidate: `runtime` with the explicit `requested` model / effort (null when not allowed) and `current` as
+   * the implicit preference. Usable = the run check passes *and* there is a connection to run it with.
+   */
+  private attempt(
+    userId: string,
+    runtime: RuntimeId,
+    requested: RunChoice,
+    current: { model: string | null; effort: string | null },
+  ): ChatSettings | null {
+    try {
+      return this.settle(userId, runtime, requested, current);
+    } catch (e) {
+      if (e instanceof RunAccessDenied) return null;
+      throw e;
+    }
+  }
+
+  /** As `attempt`, but throws the refusal (403 for the chip). */
+  private settle(
+    userId: string,
+    runtime: RuntimeId,
+    requested: RunChoice,
+    current: { model: string | null; effort: string | null },
+  ): ChatSettings {
+    const capabilities = this.caps(runtime);
+    if (!capabilities) throw new RunAccessDenied("runtime_not_allowed");
+    const s = this.access.resolve({ userId, runtime, capabilities, requested, current });
+    // Allowed but nothing to run it with (no passed connection, or no shared one for "공용으로 쓰기").
+    if (capabilities.needsConnection && !s.connectionId) throw new RunAccessDenied("connection_not_allowed");
+    return { runtime, model: s.model.id, effort: s.effort, useShared: s.useShared };
+  }
+
+  /** The saved model of `runtime` as a preference: its effort is kept when still allowed, else the model's own. */
+  private withDefault(userId: string, runtime: RuntimeId, d: ModelDefault): ChatSettings | null {
+    return this.attempt(userId, runtime, { model: d.model }, { model: d.model, effort: d.effort });
+  }
+
+  /**
+   * What a new conversation starts with (FR-3.5, FR-12.2·12.6): the default runtime with its default model; else
+   * the same runtime's first allowed model in the admin's model-list order; else the other runtimes in the order
+   * Claude Code → Codex, each with the user's default model for it (else its first allowed model); else nothing
+   * (null: "쓸 수 있는 런타임이 없어요"). `fallback` = the default runtime·model itself was not usable.
+   * A default runtime without a saved model starts on its first allowed model — that is the default, not a fallback.
+   */
+  start(user: UserRow): StartSettings | null {
+    const { defaults } = this.resolved(user);
+    const first = defaults.runtime;
+    const saved = defaults.models[first];
+    const none = { model: null, effort: null };
+    const exact = saved ? this.withDefault(user.id, first, saved) : this.attempt(user.id, first, {}, none);
+    if (exact) return { settings: exact, fallback: false };
+    // 1. the same runtime, its first allowed model (the admin's list order)
+    const sameRuntime = saved ? this.attempt(user.id, first, {}, none) : null;
+    if (sameRuntime) return { settings: sameRuntime, fallback: true };
+    // 2. the other runtimes, Claude Code → Codex: the user's default model there, else its first allowed one
+    for (const runtime of RUNTIME_ORDER) {
+      if (runtime === first) continue;
+      const d = defaults.models[runtime];
+      const s = (d && this.withDefault(user.id, runtime, d)) ?? this.attempt(user.id, runtime, {}, none);
+      if (s) return { settings: s, fallback: true };
+    }
+    return null;
+  }
+
+  /**
+   * The chip's change of a conversation (FR-3.5, FR-12.3, #19), from its next message on. Explicit values that are
+   * not allowed — runtime, model, an effort the model does not take or the admin does not allow, "공용으로 쓰기"
+   * without a shared connection — throw `RunAccessDenied` (403). Changing only the runtime brings that runtime's
+   * default model (and effort); changing only the model brings that model's default effort. `current` = the
+   * conversation's settings (null for one that had none yet: its start settings are the base).
+   */
+  change(user: UserRow, current: ChatSettings | null, patch: ChangeSettingsRequest): ChatSettings {
+    const base = current ?? this.start(user)?.settings ?? null;
+    const runtime = patch.runtime ?? base?.runtime;
+    if (!runtime) throw new RunAccessDenied("runtime_not_allowed");
+    const { defaults } = this.resolved(user);
+    const saved = defaults.models[runtime];
+    const runtimeChanged = runtime !== base?.runtime;
+    const requested: RunChoice = {};
+    if (patch.model !== undefined) requested.model = patch.model;
+    if (patch.effort !== undefined) requested.effort = patch.effort;
+    // "공용으로 쓰기" is per runtime: another runtime starts again on the personal connection first.
+    const useShared = patch.useShared ?? (runtimeChanged ? false : (base?.useShared ?? false));
+    if (useShared) requested.useShared = true;
+    let preference: { model: string | null; effort: string | null };
+    if (patch.model !== undefined) {
+      const sameModel = !runtimeChanged && patch.model === base?.model;
+      preference = sameModel
+        ? { model: base!.model, effort: base!.effort }
+        : saved?.model === patch.model
+          ? { model: saved.model, effort: saved.effort }
+          : { model: patch.model, effort: null };
+    } else if (runtimeChanged) preference = { model: saved?.model ?? null, effort: saved?.effort ?? null };
+    else preference = { model: base?.model ?? null, effort: base?.effort ?? null };
+    return this.settle(user.id, runtime, requested, preference);
   }
 }

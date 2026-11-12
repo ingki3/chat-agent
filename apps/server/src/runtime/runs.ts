@@ -13,7 +13,9 @@ import {
   type RuntimeId,
 } from "@agentlee/shared";
 import type { RunSettings, RunSettingsInput } from "../connections/access.js";
-import type { ConversationStore, MessageRow } from "../conversations/store.js";
+import { RUNTIME_LABEL } from "../connections/store.js";
+import { settingsOf, type ConversationStore, type MessageRow } from "../conversations/store.js";
+import type { StartSettings } from "../users/defaults.js";
 import type { Db } from "../db/client.js";
 import { runEvents, runs, users } from "../db/schema.js";
 import type { AppEvents } from "../events.js";
@@ -266,6 +268,11 @@ export type RunManagerOptions = {
     resolve(input: RunSettingsInput): RunSettings;
     runFailed(run: RunRow, code: string): StreamEvent[];
   };
+  /**
+   * Start settings of a conversation that has none yet (#19, FR-12.6): the user's defaults with the fallback order.
+   * Without it such a conversation answers as before #19 (the reply's or last runtime, the first allowed model).
+   */
+  startSettings?: (userId: string) => StartSettings | null;
 };
 
 /**
@@ -389,7 +396,13 @@ export class RunManager {
     choice?: RunChoice | undefined;
     /** What its usage is recorded as (#44). Default `chat`; scheduled runs (#33) pass `schedule`. */
     purpose?: UsagePurpose | undefined;
-    prepare: () => { user: MessageRow | null; assistant: MessageRow };
+    /** The reply being regenerated (#19): its runtime and model, used only when the conversation has no settings. */
+    previous?: { runtime: RuntimeId | null; model: string | null; effort: string | null } | undefined;
+    /**
+     * Creates the messages; calls `divider` where a switch divider belongs (#19) — before the new user message, or
+     * before the regenerated reply. The settings are resolved first, so the divider names who really answers.
+     */
+    prepare: (divider: () => void) => { user: MessageRow | null; assistant: MessageRow };
   }): { run: RunRow; user: MessageRow | null; assistant: MessageRow; reused: boolean } {
     if (this.stopping) throw new ShuttingDownError();
     const created = this.db.$client
@@ -407,21 +420,39 @@ export class RunManager {
           }
         }
         if (this.active(input.conversationId)) throw new RunBusyError();
-        const conv = this.conversations.get(input.conversationId)!;
-        const { user, assistant } = input.prepare();
-        // Settings: a regenerated reply keeps its runtime and model; otherwise the conversation's last runtime.
-        // Per-user defaults and fallbacks come with #19; per-conversation choice with #19/#45.
+        let conv = this.conversations.get(input.conversationId)!;
+        // The conversation's settings (#19) decide the next reply. One that had none (nothing was usable when it was
+        // created, or it is older than #19 and never answered) gets its start settings now, fallback included.
+        if (!settingsOf(conv) && this.opts.startSettings) {
+          const start = this.opts.startSettings(input.userId);
+          if (start) {
+            this.conversations.setSettings(conv.id, start.settings, { fallback: start.fallback });
+            conv = this.conversations.get(conv.id)!;
+          }
+        }
+        const base = settingsOf(conv);
+        // An explicit choice of the request (#17) is for this reply only; otherwise the conversation's settings.
+        // Without settings (the run manager alone in tests): the reply's own runtime, then the last one used.
         const choice = input.choice ?? {};
         const runtime =
           choice.runtime ??
-          (assistant.runtime as RuntimeId | null) ??
+          base?.runtime ??
+          input.previous?.runtime ??
           (conv.lastRuntime as RuntimeId | null) ??
           DEFAULT_RUNTIME;
         // An explicitly chosen runtime is never swapped for another one.
         const adapter =
           this.registry.get(runtime) ??
-          (choice.runtime ? undefined : this.registry.get(this.registry.ids()[0]!));
+          (choice.runtime || base ? undefined : this.registry.get(this.registry.ids()[0]!));
         const models = adapter?.capabilities().models ?? [];
+        const current =
+          base && base.runtime === adapter?.id
+            ? { model: base.model, effort: base.effort }
+            : { model: input.previous?.model ?? null, effort: input.previous?.effort ?? null };
+        const requested: RunChoice =
+          choice.useShared === undefined && base?.useShared && base.runtime === adapter?.id
+            ? { ...choice, useShared: true }
+            : choice;
         // #17: the user's policy decides (403 for explicit choices it does not allow); throwing rolls back prepare().
         const settings =
           adapter && this.opts.connections
@@ -429,11 +460,24 @@ export class RunManager {
                 userId: input.userId,
                 runtime: adapter.id,
                 capabilities: adapter.capabilities(),
-                requested: choice,
-                current: { model: assistant.model, effort: assistant.effort },
+                requested,
+                current,
               })
             : undefined;
-        const model = settings?.model ?? models.find((m) => m.id === assistant.model) ?? models[0];
+        const model = settings?.model ?? models.find((m) => m.id === current.model) ?? models[0];
+        const effort = settings
+          ? settings.effort
+          : ((model && current.model === model.id ? current.effort : null) ?? model?.defaultEffort ?? null);
+        const { user, assistant } = input.prepare(() => {
+          // `── 여기부터 … ──` when this reply is answered by another runtime, model or effort than the last (#19).
+          if (adapter && model)
+            this.conversations.appendSwitchDivider(input.conversationId, {
+              runtime: adapter.id,
+              model: model.id,
+              effort,
+              label: [RUNTIME_LABEL[adapter.id] ?? adapter.id, model.label].join(" · "),
+            });
+        });
         const run: RunRow = {
           id: crypto.randomUUID(),
           conversationId: input.conversationId,
@@ -445,11 +489,7 @@ export class RunManager {
           runtime: adapter?.id ?? runtime,
           model: model?.id ?? assistant.model ?? "unknown",
           instructions: null,
-          effort: settings
-            ? settings.effort
-            : ((model && assistant.model === model.id ? assistant.effort : null) ??
-              model?.defaultEffort ??
-              null),
+          effort,
           connectionId: settings?.connectionId ?? null,
           connectionVersion: settings?.connectionVersion ?? null,
           useShared: settings?.useShared ?? false,

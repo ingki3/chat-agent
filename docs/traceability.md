@@ -14,7 +14,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-1.3 | 외부 두 겹 인증, 로컬 예외, Access·앱 이메일 일치 | #8, #9, #36 | I, M | 🟨 |
 | FR-1.4 | Access JWT 검증 | #9 | U, I | 🟨 |
 | FR-1.5 | 역할, 본인·공유만 열람, 관리자도 내용 불가 | #10, #29 | I | 🟨 |
-| FR-1.6 | 사용자별 런타임·모델·스킬 허용 | #17, #21, #35 | I, E | 🟨 (#17 런타임·모델·추론 강도·연결 허용 정책과 공통 검사 함수 — 보내기·고치기·다시 생성에 403. #21 스킬: `users.permissions.skills`·`PUT /api/admin/users/:id/skills`, 사용자별 도구 목록·호출 거부 — `skills.test.ts`. #30 청소년 계정은 `"all"`이어도 금융 스킬·도구 숨김 — `finance.test.ts`. #35 관리자 화면 권한 탭(런타임·모델·추론 강도·개인/공용 연결 허용·스킬·처음 기본값), 스킬 한 개씩 켜기 `PUT /api/admin/users/:id/skills/:name`(청소년 금융 숨김 유지), 서버 허용 목록 `PUT /api/admin/skills/:name`. 아들 Haiku 해제 → `/api/runtimes`·설정 선택기에서 빠지고 실행·기본값 저장 403 — `admin.test.ts`·`e2e/admin.spec.ts`. 칩(#19)은 같은 `/api/runtimes`를 읽는다) |
+| FR-1.6 | 사용자별 런타임·모델·스킬 허용 | #17, #21, #35 | I, E | 🟨 (#17 런타임·모델·추론 강도·연결 허용 정책과 공통 검사 함수 — 보내기·고치기·다시 생성에 403. #21 스킬: `users.permissions.skills`·`PUT /api/admin/users/:id/skills`, 사용자별 도구 목록·호출 거부 — `skills.test.ts`. #30 청소년 계정은 `"all"`이어도 금융 스킬·도구 숨김 — `finance.test.ts`. #35 관리자 화면 권한 탭(런타임·모델·추론 강도·개인/공용 연결 허용·스킬·처음 기본값), 스킬 한 개씩 켜기 `PUT /api/admin/users/:id/skills/:name`(청소년 금융 숨김 유지), 서버 허용 목록 `PUT /api/admin/skills/:name`. 아들 Haiku 해제 → `/api/runtimes`·설정 선택기에서 빠지고 실행·기본값 저장 403 — `admin.test.ts`·`e2e/admin.spec.ts`. 칩(#19)은 그중 지금 답할 수 있는 것만 `/api/runtimes/usable`) |
 | FR-2.1 | 대화 목록·새 대화·이름 변경·삭제·고정·검색 | #11, #13, #54 | I, E | 🟨 |
 | FR-2.2 | 첫 메시지 뒤 제목 자동 생성 | #11 | I | 🟨 |
 | FR-2.3 | 대화 간 맥락 분리 | #11, #42, #45 | I | 🟨 |
@@ -25,7 +25,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-3.2 | 마크다운·표·코드·수식·링크 | #14 | U, E | 🟨 (#14 구현·U·E, 머지 대기) |
 | FR-3.3 | 다시 생성, 수정 후 다시 보내기 | #11, #14, #45 | I, E | 🟨 (#14 화면·E2E) |
 | FR-3.4 | 도구 진행 상태와 상세 | #14 | E | 🟨 (#14 구현·E, 비밀 필드 제거 U·I, 알려진 비밀 값 가림 — 등록부 하나·인코딩·청크 분할 성질 시험 I, 머지 대기) |
-| FR-3.5 | 기본값으로 시작, 칩, 대화 중 런타임·모델·추론 강도 전환, 구분선, 넘어가는 맥락 | #19, #45, #53 | I, E, M | 🟨 (#14 칩 자리·구분선·메시지별 런타임 표시, 전환은 #19) |
+| FR-3.5 | 기본값으로 시작, 칩, 대화 중 런타임·모델·추론 강도 전환, 구분선, 넘어가는 맥락 | #19, #45, #53 | I, E, M | 🟨 (#14 칩 자리·구분선·메시지별 런타임 표시. #19 선택 단계 없는 새 대화, 칩 팝오버(허용 + `passed`만 `GET /api/runtimes/usable`, 추론 강도, 공용으로 쓰기), `PUT /api/conversations/:id/settings` 다음 메시지부터, 답이 바뀌는 자리에 구분선 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`. 넘어가는 맥락은 #45) |
 | FR-3.6 | 긴 대화 자동 요약 | #45 | I | ⬜ |
 | FR-4.1 | 드래그·붙여넣기·첨부, 여러 파일 | #22 | E | ⬜ |
 | FR-4.2 | 지원 형식 | #22, #48, #23 | U | ⬜ |
@@ -75,19 +75,19 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-10.5 | 백업·복원 | #37 | I, M | 🟨 (#37 매일 03:30(서울) `VACUUM INTO` + 파일 쓰기 잠금으로 같은 시점, 7일 보관(최신 것까지 만료, 백업 실패와 무관하게 정리·실패마다 관리자 알림), 관리자 → 백업 탭(목록·지금 백업·복원 안내, `/api/admin/backups` 관리자만 — 권한 행렬), 복원은 서버를 멈춘 뒤 `pnpm -s restore check/apply`(데이터 폴더 커널 잠금(SQLite 배타 잠금, 실경로 — 별도 프로세스 경합·kill -9 시험)·키 확인 → 해시 → 무결성 → 스키마 버전(이전 스키마는 업그레이드) → 연결·설정·푸시 비밀 복호화, 교체 일지 단계(prepared→old_moved→swapped→done, rolling_back)로 실패·강제 종료 복구, 일지에 옛 폴더 id·DB 해시와 후보 전체 목록(파일별 크기·해시) — 옛 DB는 체크포인트 후 DB·-wal·-shm 상태까지 정체에 포함, 파일 fsync 오류는 교체 전 실패, 증명된 쪽으로만 진행, 증명 못 하면 일지 보존·시작 거부, 모든 단계 경계 강제 종료 시험, 옛 폴더는 옆으로) — `test/backup.test.ts`·`e2e/admin.spec.ts`. 실제 맥에서 분기 리허설(M)은 ops.md 21.4절) |
 | FR-11.1 | 연결 = 런타임 × 인증 × 범위 | #17 | I | ✅ (`connections` 표, 내 연결·공용·관리자 대신 등록 API — `test/connections.test.ts`) |
 | FR-11.2 | 런타임별 연결 정보, 실행 방식 | #15, #16, #18, #39 | I, M | 🟨 (Claude 어댑터, Codex app-server 어댑터 — API 키. #18 Claude 장기 토큰 `CLAUDE_CODE_OAUTH_TOKEN`, Codex 디바이스 코드 로그인·`chatgptAuthTokens`·토큰 갱신 — `subscription.test.ts`, 0.165.0 실바이너리 시험. 실제 계정 확인(M)은 `docs/evidence/subscription/checklist.md`) |
-| FR-11.3 | 개인 우선, 공용 선택, 한도 시 확인 | #17 | I | ✅ (개인 우선, `useShared`, 한도 시 `personal_limit_use_shared` 안내 → `runs.use_shared`. 칩 UI는 #19) |
+| FR-11.3 | 개인 우선, 공용 선택, 한도 시 확인 | #17 | I | ✅ (개인 우선, `useShared`, 한도 시 `personal_limit_use_shared` 안내 → `runs.use_shared`. #19 칩 “공용으로 쓰기” → `conversations.use_shared`, 다른 런타임으로 가면 꺼짐 — `chat-settings.test.ts`) |
 | FR-11.4 | 구독 공유 금지, Claude 구독은 관리자만 | #17, #18 | I, E | ✅ (#17 공용 구독 400, 범위 변경 400, 관리자 외 Claude 구독 403. #18 ChatGPT 로그인은 본인 개인 연결로만, 다른 사람 404/403, 등록 화면 안내 — `subscription.test.ts`, `e2e/connections.spec.ts`) |
 | FR-11.5 | 연결 테스트 | #17, #43 | I, E | ✅ (응답·스트리밍·`echo_time`·`skill_selftest` SHA-256 + MCP 서버 실제 처리 확인, `passed`만 선택기·실행. CI는 가짜 런타임, 실제 키는 같은 경로 — M 기록은 AC-9) |
 | FR-11.6 | 인증 정보 암호화, 원문 비노출 | #7, #17, #18 | U, I | ✅ (#7 암호화 모듈, #17 연결 키 암호화·끝 4자리·응답·로그·DB 원문 검색 시험. #18 ChatGPT 토큰 암호화·갱신 토큰도 암호화·이메일만 표시, 응답·로그·DB·폴더에서 가짜 토큰 검색 — `subscription.test.ts`) |
 | FR-11.7 | 런타임 격리 | #15, #16, #42 | I | 🟨 (Claude·Codex: 잠금 설정 + 샌드박스, fork 없음 확인. Codex는 우리 모델 카탈로그로 code-mode host·하위 에이전트 제거) |
-| FR-11.8 | 연결 끊김·만료 처리 | #17, #18, #14, #56, #34 | I, E | 🟨 (#17 `runtime_auth` → 오류 종료·안내·`expired`·`connection_lost`/관리자 `system_warning`. #18 구독 만료 → `subscription_expired` 재로그인 안내 + `switchTo`, 갱신 거부 → `expired`. #14 화면 오류 안내·재연결 표시·"다른 런타임으로 이어가기" 자리, 전환 UI #19, 예약 알림 #56) |
+| FR-11.8 | 연결 끊김·만료 처리 | #17, #18, #14, #56, #34 | I, E | 🟨 (#17 `runtime_auth` → 오류 종료·안내·`expired`·`connection_lost`/관리자 `system_warning`. #18 구독 만료 → `subscription_expired` 재로그인 안내 + `switchTo`, 갱신 거부 → `expired`. #14 화면 오류 안내·재연결 표시·"다른 런타임으로 이어가기" 자리, #19 그 버튼이 칩을 열고 바꾼 뒤 다시 생성은 새 런타임으로, 예약 알림 #56) |
 | FR-11.9 | 연결 해제 후 기록 유지 | #17 | I | ✅ (기록 유지, 세션 무효화·같은 연결만 resume, 진행 중 실행 중지, 폴더 삭제) |
-| FR-12.1 | 기본 런타임·모델·추론 강도 설정 | #19, #35 | I, E | 🟨 (#35 저장·검사: `GET/PUT /api/settings/defaults`(허용 밖 403, 런의 검사 함수 그대로)·설정 화면 기본값 섹션 — `admin.test.ts`·`e2e/admin.spec.ts`. 새 대화에 적용·칩은 #19) |
-| FR-12.2 | 새 대화·새 예약에 자동 적용 | #19, #55 | I | ⬜ |
-| FR-12.3 | 런타임별 기본 모델 기억 | #19 | I | ⬜ |
-| FR-12.4 | 초기값 Claude Code · Opus 5.5, 관리자 초기값 | #19, #41, #35 | I | 🟨 (#35 `users.initial_defaults`·`PUT /api/admin/users/:id/defaults`(대상 사용자 권한 안에서만, 400), 본인 값 → 관리자 초기값 → 서비스 기본값 순 — `admin.test.ts`. 새 대화 적용은 #19) |
-| FR-12.5 | 기본값 변경 시 기존 대화 불변 | #19 | I | ⬜ |
-| FR-12.6 | 기본값 불가 시 대체 순서 | #19 | U, E | ⬜ |
+| FR-12.1 | 기본 런타임·모델·추론 강도 설정 | #19, #35 | I, E | ✅ (#35 저장·검사: `GET/PUT /api/settings/defaults`(허용 밖 403, 런의 검사 함수 그대로)·설정 화면 기본값 섹션 — `admin.test.ts`·`e2e/admin.spec.ts`. #19 새 대화에 적용 — `e2e/runtime-chip.spec.ts`) |
+| FR-12.2 | 새 대화·새 예약에 자동 적용 | #19, #55 | I | 🟨 (#19 새 대화: 만들 때 기본값(대체 적용)을 대화에 기록, 선택 단계 없음 — `chat-settings.test.ts`. 예약은 #55) |
+| FR-12.3 | 런타임별 기본 모델 기억 | #19 | I | ✅ (칩에서 런타임만 바꾸면 그 런타임의 기본 모델·추론 강도, 없으면 허용된 첫 모델 — `chat-settings.test.ts` "runtime only") |
+| FR-12.4 | 초기값 Claude Code · Opus 5.5, 관리자 초기값 | #19, #41, #35 | I | ✅ (#35 `users.initial_defaults`·`PUT /api/admin/users/:id/defaults`(대상 사용자 권한 안에서만, 400), 본인 값 → 관리자 초기값 → 서비스 기본값 순 — `admin.test.ts`. #19 미설정 사용자의 새 대화가 Opus 5.5, 관리자 초기값으로 시작 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`) |
+| FR-12.5 | 기본값 변경 시 기존 대화 불변 | #19 | I | ✅ (답한 대화·아직 안 답한 대화 모두 설정·다음 답의 런타임·모델·추론 강도 그대로 — `chat-settings.test.ts` "never changes an existing conversation", `e2e/runtime-chip.spec.ts`) |
+| FR-12.6 | 기본값 불가 시 대체 순서 | #19 | U, E | ✅ (같은 런타임 첫 허용 모델 → Claude Code → Codex 순 다른 런타임의 기본 모델 → 후보 없음 화면, `passed` 연결만 셈, 칩 옆 안내 1회, 설정 화면 안내 — `chat-settings.test.ts`·`e2e/runtime-chip.spec.ts`) |
 | FR-12.7 | 내 런타임 연결 관리 | #17, #18 | E | ✅ (#17 설정 → 내 런타임 연결: 추가·테스트·해제, `e2e/connections.spec.ts`. #18 "ChatGPT로 로그인"(코드·링크·취소·다시 로그인), 관리자만 Claude 구독 항목) |
 | FR-12.8 | 알림 설정 | #34 | E | ✅ (기기별 켜기/끄기·방해 금지 — `e2e/notifications.spec.ts`) |
 | FR-13.1 | 웹 푸시, 기기별, iOS 안내 | #34 | M | 🟨 (구현·자동 시험 완료, 실기기 확인 대기 — `docs/evidence/push/checklist.md`) |
@@ -116,7 +116,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|---|
 | D1 | 두 런타임, 어댑터 | #12, #15, #16, #39 | I, M | 🟨 (#39 완료, #15·#16 어댑터 — 실제 녹화 대기) |
 | D2 | 인증 방식·범위, Claude 구독은 관리자만 | #17, #18 | I | ✅ (#17 API 키·Claude 구독 규칙. #18 가족 각자 ChatGPT 디바이스 코드 로그인 — `subscription.test.ts`) |
-| D3 | 기본값으로 바로 시작 | #19 | E | ⬜ |
+| D3 | 기본값으로 바로 시작 | #19 | E | ✅ (`e2e/runtime-chip.spec.ts` 수용 기준 7) |
 | D4 | 자체 호스팅, 127.0.0.1:3000, Tunnel + Access | #5, #8, #9 | U, M | 🟨 (#5 완료) |
 | D5 | 스킬 허용 목록, 설정 격리 | #21, #42, #15, #16 | I | 🟨 (#21 허용 목록 스킬만 서버 폴더로 복사, 링크·하드링크·변조 거부, 샌드박스 실행 — `skills.test.ts`, isolation.md) |
 | D6 | SQLite + 파일 저장소 | #7 | U | ✅ |
@@ -149,10 +149,10 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | AC-4 | #30, #31 | U, E, M | 예 | 🟨 (#30 두 런타임 녹화 형식 재생으로 "AAPL, 005930 현재가" → 출처·기준 시각·면책(`finance-runs.test.ts`), 화면 `e2e/finance.spec.ts`. 표·차트 아티팩트는 #31, 실런타임은 `docs/evidence/finance/checklist.md`) |
 | AC-5 | #33, #56, #34, #57 | U, M | — | 🟨 (#34 알림 부분: 자동 시험 완료, 실기기 체크리스트 대기) |
 | AC-6 | #10, #29 | I | — | ⬜ |
-| AC-7 | #19 | E | — | ⬜ |
+| AC-7 | #19 | E | — | ✅ (설정 → 새 대화 → 바로 보내기가 기본값으로, 미설정은 Opus 5.5, 막히면 대체 + 안내 1회 — `e2e/runtime-chip.spec.ts`) |
 | AC-8 | #45, #53 | I, M | 예 | ⬜ |
 | AC-9 | #17, #18 | I, E, M | 예 | 🟨 (#17 자동 시험: 다른 사용자 개인 연결 403, 관리자 외 Claude 구독 403. #18 자동 시험: 개인 ChatGPT 구독 연결이 다른 사람 선택기에 없음·id로 쓰면 403(관리자 포함) — `subscription.test.ts`. 실제 계정 확인(M: 관리자 Claude 토큰, 가족 1명 이상 ChatGPT)은 `docs/evidence/subscription/checklist.md`, 사용자 확인 대기) |
-| AC-10 | #17, #55 | I | — | 🟨 (#17 메시지 보내기·고치기·다시 생성 403. 예약은 #55) |
+| AC-10 | #17, #55 | I | — | 🟨 (#17 메시지 보내기·고치기·다시 생성 403. #19 대화 설정 변경·새 대화 선택도 403(허용 안 된 추론 강도 포함) — `chat-settings.test.ts`. 예약은 #55) |
 | AC-11 | #38 | S | 예 | ⬜ |
 | AC-12 | #44, #32 | U, I | — | 🟨 (fixture 기록별 비용·총 $6.55·엄마 $4.50·아들 구독 43만 토큰·분류 합계 동일·예산 차단 없음 — `test/usage-screen.test.ts` "AC-12". 화면 스크린샷·구독 한도 안내(2)는 양식 B 기록 대기) |
 | AC-13 | #36 | I, M | — | ⬜ |

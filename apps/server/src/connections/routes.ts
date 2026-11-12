@@ -8,7 +8,7 @@ import {
   type RuntimeOption,
 } from "@agentlee/shared";
 import { z } from "zod";
-import type { UserStore } from "../auth/users.js";
+import type { UserRow, UserStore } from "../auth/users.js";
 import { logEvent } from "../logging.js";
 import type { RuntimeRegistry } from "../runtime/adapter.js";
 import type { SubscriptionLoginService } from "./login.js";
@@ -196,8 +196,7 @@ export function registerConnectionRoutes(
 
   // ---- picker ----
 
-  app.get("/api/runtimes", { config: { noResource: "the caller's own runtime choices" } }, (req, reply) => {
-    const user = users.byId(req.ctx.user!.id)!;
+  const runtimeOptions = (user: UserRow): RuntimeOption[] => {
     const items: RuntimeOption[] = [];
     for (const id of registry.ids()) {
       const caps = registry.get(id)!.capabilities();
@@ -215,8 +214,24 @@ export function registerConnectionRoutes(
         connections: caps.needsConnection ? store.usableFor(user, id).map(toConnection) : [],
       });
     }
-    return send(reply, 200, { items });
-  });
+    return items;
+  };
+  // Everything the user may choose — the settings default selector (a default may name a runtime not connected yet).
+  app.get("/api/runtimes", { config: { noResource: "the caller's own runtime choices" } }, (req, reply) =>
+    send(reply, 200, { items: runtimeOptions(users.byId(req.ctx.user!.id)!) }),
+  );
+  // The chip (#19, FR-3.5·11.5): only what can answer right now — allowed, and with a `passed` connection the user
+  // may use (or none needed). The run check (RunAccess) and the conversation settings API refuse the rest anyway.
+  app.get(
+    "/api/runtimes/usable",
+    { config: { noResource: "the caller's own runtime choices" } },
+    (req, reply) =>
+      send(reply, 200, {
+        items: runtimeOptions(users.byId(req.ctx.user!.id)!).filter(
+          (o) => !o.needsConnection || o.connections.length > 0,
+        ),
+      }),
+  );
 
   // ---- shared connections (admin) ----
 

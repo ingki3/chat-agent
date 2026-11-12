@@ -690,7 +690,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 
 ### 20.2 권한 (사용자별)
 - **런타임·모델·추론 강도·연결**: 런타임마다 허용, 허용 모델(“모든 모델”은 새 모델도 포함), 허용 추론 강도, 개인 연결 허용, 가족 공용 연결 허용. 저장하면 다음 실행부터 적용된다(`PUT /api/admin/users/<id>/runtime-policies`, #17의 `runtime_policies`).
-- 허용하지 않은 모델은 그 사람의 모든 선택기에서 빠진다: 선택기는 모두 `GET /api/runtimes`(허용된 것만)를 읽는다 — 지금은 설정의 기본값 선택기, 칩(#19)도 같은 목록을 쓴다. 서버도 막는다: 그 모델로 보내기·고치기·다시 생성은 403 `model_not_allowed`, 기본값으로 저장도 403(아래).
+- 허용하지 않은 모델은 그 사람의 모든 선택기에서 빠진다: 설정의 기본값 선택기는 `GET /api/runtimes`(허용된 것만), 칩(#19)은 그중 지금 답할 수 있는 것만(`GET /api/runtimes/usable`, 23절)을 읽는다. 서버도 막는다: 그 모델로 보내기·고치기·다시 생성은 403 `model_not_allowed`, 기본값으로 저장도 403(아래).
 - **처음 기본값**(FR-12.4): 그 사람이 설정에서 직접 고르기 전까지의 기본 런타임·모델·추론 강도(`users.initial_defaults`, `PUT /api/admin/users/<id>/defaults`, `null`이면 지움). 저장된 권한 안에서만 고를 수 있다(밖이면 400 + 코드). 계정을 만들 때 고른 런타임도 여기에 들어간다(0015가 옛 `default_runtime`을 옮겼다).
 - **스킬**: 스킬 한 개씩 켜고 끈다(`PUT /api/admin/users/<id>/skills/<이름>` `{"enabled": true|false}`). 서버가 지금 허용된 목록에서 새 목록을 만들므로 **청소년 계정의 금융 스킬은 다른 스킬을 바꿔도 숨겨진 채로 남는다**. 결과가 “모두”와 같으면 다시 `"all"`이 된다.
 
@@ -831,3 +831,31 @@ PRD FR-5.1–5.5, G2, 수용 기준 3·11. 방식과 근거는 `docs/decisions/i
 - 시험(네트워크 없음): `citations.test.ts`(정규화·오탐 없음, 범위, 문단 규칙), `citation-runs.test.ts`(FakeRuntime 네 시나리오 — 충돌·자료 부족·부분 누락·기존 출처 재사용, 다른 대화·다른 사용자, 복구·중지, 자료 조사 모드 지침, Claude·Codex 녹화 형식 재생으로 같은 시나리오), `apps/web/test/citations.test.ts`(⚠️ 표시), `e2e/citations.spec.ts`(데스크톱 hover·모바일 탭).
 - 시나리오와 가짜 페이지: `apps/server/src/runtime/fake-citations.ts`. `FAKE_RUNTIME=1`에서 `/cite conflict|insufficient|partial|reuse`, `/cite-id <sourceId> <구절>`. 이 모드에서는 `https://fixture.agentlee.test/…` 주소와 그 검색어만 서버 안에서 답한다(다른 주소는 평소대로).
 - 실런타임 확인 체크리스트: `docs/evidence/citations/checklist.md`.
+
+## 23. 기본값과 칩 — 대화별 런타임·모델 (#19)
+PRD D3, FR-3.5, FR-12. 새 대화는 아무것도 고르지 않고 바로 시작하고, 칩으로 그 대화만 바꾼다.
+
+### 23.1 새 대화가 무엇으로 시작하나
+- **기본값**: 본인 설정 → 관리자의 처음 값(20.2절) → 서비스 기본값 Claude Code · `claude-opus-5-5` 순(#35). 이 값을 **대화를 만들 때** 대화에 적어 둔다(`conversations.runtime/model/effort/use_shared`, 0016). 그 뒤 기본값을 바꿔도 이미 있는 대화는 그대로다(FR-12.5) — 다음 새 대화부터 적용된다.
+- **쓸 수 있다** = 런의 검사(`RunAccess.resolve`)를 그대로 통과하고, 연결이 필요한 런타임이면 그 사람이 쓸 수 있는 `passed` 연결이 있다(시험 안 한 연결·남의 개인 연결·끊긴 연결은 안 셈).
+- **대체 순서(FR-12.6)** — 기본 런타임·모델을 쓸 수 없을 때:
+  1. 같은 런타임에서 허용된 모델 중 모델 목록(20.3절, 어댑터 순서) 첫 번째
+  2. 다른 런타임(Claude Code → Codex 순)의 그 사람 기본 모델, 없거나 안 되면 그 런타임의 허용된 첫 모델
+  3. 아무것도 없으면 새 대화 화면 대신 “쓸 수 있는 런타임이 없어요 — 관리자에게 문의하세요” 화면. 이때 만들어진 대화(API)는 설정 없이 남고, 첫 메시지를 보낼 때 다시 계산한다.
+  - 추론 강도만 막혔으면 대체가 아니다: 같은 모델로, 허용된 추론 강도(모델 기본값 → 첫 허용값)로 시작한다.
+  - 사용 한도(FR-9.2)는 연결 상태를 바꾸지 않으므로(11절) 대체 조건에 들어가지 않는다. 한도에 걸린 대화는 칩으로 바꾼다.
+- **안내 한 번**: 대체로 시작한 대화에는 `fallbackNotice`가 붙고, 대화 화면이 칩 옆에 “기본값을 쓸 수 없어 ○○로 시작했어요”를 띄운 뒤 바로 지운다(`PATCH /api/conversations/<id>` `{"dismissFallbackNotice": true}`). 다시 열거나 새로 고치면 안 보인다. 칩으로 바꿔도 지워진다.
+- **설정 화면**: 기본값 섹션에 지금 새 대화가 무엇으로 시작하는지 안내한다(`GET /api/settings/defaults`의 `start`·`fallback`) — 대체 중이면 “기본값(…)을 지금 쓸 수 없어 새 대화는 ○○로 시작해요”, 아무것도 없으면 관리자 문의 안내. 권한이 바뀌어 저장된 값이 막힌 경우의 기존 안내(`unavailable`)도 그대로다.
+
+### 23.2 칩
+- 입력창 옆 칩(`Claude Code · Opus 5.5`)을 누르면 런타임·모델·추론 강도와(개인·공용 연결이 둘 다 있을 때) “공용으로 쓰기”를 고른다. 목록은 `GET /api/runtimes/usable` — 허용된 런타임·모델·추론 강도 중 `passed` 연결이 있는 것만(연결이 필요 없는 FakeRuntime은 그대로).
+- 바꾸기: `PUT /api/conversations/<id>/settings` `{runtime?, model?, effort?, useShared?}`. **다음 메시지부터** 적용된다 — 지금 쓰고 있는 답은 시작한 설정 그대로다. 그 대화에만 적용되고 기본값은 바뀌지 않는다.
+  - 런타임만 바꾸면 그 런타임의 내 기본 모델·추론 강도(없거나 막혔으면 허용된 첫 모델), 모델만 바꾸면 그 모델의 기본 추론 강도(내 기본 모델이면 저장한 추론 강도). 다른 런타임으로 가면 “공용으로 쓰기”는 꺼진다.
+  - 허용되지 않은 런타임·모델·추론 강도(모델이 받지 않는 값 포함), 연결 없는 런타임, 공용 연결 없는 “공용으로 쓰기”: 403 + 런 검사와 같은 코드(`runtime_not_allowed`·`model_not_allowed`·`effort_not_allowed`·`connection_not_allowed`), 아무것도 바뀌지 않는다. 메시지 하나에만 쓰는 선택(보내기 본문의 `runtime/model/effort`, #17)도 그대로 있고 같은 검사를 받는다.
+  - 새 대화 화면에서 칩을 바꾸면 대화를 만들 때 함께 보낸다(`POST /api/conversations` `{settings}`, 같은 검사).
+- **구분선**: 답을 쓰기 직전, 그 답의 런타임·모델·추론 강도가 바로 앞 답과 다르면 그 자리에 `── 여기부터 Codex · GPT-6 Luna ──`(시스템 메시지의 `divider` 파트)를 기록한다. 바꿨다가 보내기 전에 되돌리면 구분선이 없고, 여러 번 바꿔도 하나다. 추론 강도만 바뀌면 “· 추론 low”가 붙는다. 바꾼 뒤 “다시 생성”은 새 설정으로 답하고 구분선은 그 답 바로 앞에 들어간다(“다른 런타임으로 이어가기” 버튼은 칩을 연다).
+- 앞 대화 내용을 새 런타임에 넘기는 방식(요약 + 최근 메시지)은 #45다. 지금은 런타임이 바뀌면 새 세션에 기록 전체가 들어간다.
+
+### 23.3 확인 방법
+- 자동: `apps/server/test/chat-settings.test.ts`(대체 순서·안내 한 번·칩 목록·다음 메시지부터·기존 대화 불변·403), `apps/web/test/chip.test.ts`, `e2e/runtime-chip.spec.ts`(수용 기준 7).
+- e2e 서버(`FAKE_RUNTIME=1`)의 FakeRuntime “Claude Code”에는 Fake Large·Fake Small과 서비스 기본값 `claude-opus-5-5`(Opus 5.5)가 있다.
