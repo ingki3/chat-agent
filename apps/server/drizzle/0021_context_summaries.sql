@@ -15,4 +15,5 @@ CREATE TABLE `conversation_summaries` (
 CREATE INDEX `conversation_summaries_conversation_idx` ON `conversation_summaries` (`conversation_id`,`through_seq`);--> statement-breakpoint
 ALTER TABLE `runs` ADD `summary_divider_id` text;--> statement-breakpoint
 ALTER TABLE `runtime_sessions` ADD `model` text;--> statement-breakpoint
-ALTER TABLE `runtime_sessions` ADD `summary_id` text;
+ALTER TABLE `runtime_sessions` ADD `summary_id` text;--> statement-breakpoint
+ALTER TABLE `runtime_sessions` ADD `trimmed` integer DEFAULT false NOT NULL;

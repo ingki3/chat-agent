@@ -130,7 +130,7 @@ export async function startContextApp(
   const sessions = (cid: string) =>
     db.$client
       .prepare(
-        "select id, runtime, connection_id as connectionId, external_session_id as ext, model, summary_id as summaryId, invalidated from runtime_sessions where conversation_id = ? order by created_at, rowid",
+        "select id, runtime, connection_id as connectionId, external_session_id as ext, model, summary_id as summaryId, trimmed, invalidated from runtime_sessions where conversation_id = ? order by created_at, rowid",
       )
       .all(cid) as {
       id: string;
@@ -139,6 +139,7 @@ export async function startContextApp(
       ext: string;
       model: string | null;
       summaryId: string | null;
+      trimmed: number;
       invalidated: number;
     }[];
   const summaries = (cid: string) =>

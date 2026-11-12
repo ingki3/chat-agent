@@ -212,7 +212,15 @@ export class RuntimeRegistry {
  * of the generic `runtime_error`. Never put secrets or runtime output in `code`.
  */
 export class RuntimeFailure extends Error {
-  constructor(readonly code: "runtime_auth" | "no_connection" | "runtime_policy" | "runtime_error") {
+  constructor(
+    readonly code:
+      | "runtime_auth"
+      | "no_connection"
+      | "runtime_policy"
+      | "runtime_error"
+      /** The turn's own message does not fit the model's context window (#45; never cut). Raised by the run manager. */
+      | "context_too_large",
+  ) {
     super(code);
   }
 }

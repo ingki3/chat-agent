@@ -173,6 +173,11 @@ export const runtimeSessions = sqliteTable(
      * only while that is still the conversation's current summary: a new one means the context reached its limit.
      */
     summaryId: text("summary_id"),
+    /**
+     * Its context was cut to fit (#45: a summary failed or the context overflowed): it never holds the full history,
+     * so it is never resumed.
+     */
+    trimmed: integer("trimmed", { mode: "boolean" }).notNull().default(false),
     invalidated: integer("invalidated", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),

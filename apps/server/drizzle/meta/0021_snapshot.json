@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "cfbd8b38-a300-4b5d-ab25-82a8edb223ce",
+  "id": "76a5fc9b-fe1d-4cb2-8d42-96bf6cf6fc9d",
   "prevId": "2f3a1496-e368-4bd6-9ad0-e6cf616b6866",
   "tables": {
     "artifact_versions": {
@@ -1976,6 +1976,14 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "trimmed": {
+          "name": "trimmed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         },
         "invalidated": {
           "name": "invalidated",

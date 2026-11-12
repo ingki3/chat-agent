@@ -620,6 +620,8 @@ export class ConversationStore {
     model?: string | null;
     /** The summary its context started from (#45). */
     summaryId?: string | null;
+    /** Its context was cut to fit (#45): never resumed. */
+    trimmed?: boolean;
   }): SessionRow {
     const conv = this.get(s.conversationId);
     if (!conv) throw new Error("conversation not found");
@@ -637,6 +639,7 @@ export class ConversationStore {
       instructionsHash: s.instructionsHash ?? null,
       model: s.model ?? null,
       summaryId: s.summaryId ?? null,
+      trimmed: s.trimmed ?? false,
       invalidated: false,
       createdAt: t,
       updatedAt: t,

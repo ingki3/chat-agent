@@ -140,8 +140,11 @@ type RunContext = {
   summary: (SummaryRef & { id: string }) | null;
   /** What the fresh session gets as messages: those after the summary (or the newest that fit, see trimToFit). */
   messages: MessageRow[];
-  /** Only a fresh session may get this context: `messages` were cut to fit (#45, review #106). */
-  fresh: boolean;
+  /**
+   * `messages` were cut to fit (#45, review #106): only a fresh session may get this context, and that session is
+   * never resumed (it does not hold the history a full context would).
+   */
+  trimmed: boolean;
   /** The turn's own user message (its attachments are the conversation's too). */
   inputMessageId: string | null;
 };
@@ -268,6 +271,7 @@ const FAILURE_TEXT: Record<string, string> = {
   no_connection:
     "이 런타임을 쓸 수 있는 연결이 없어요 — 설정 → 내 런타임 연결에서 연결하거나 관리자에게 문의하세요.",
   runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요.",
+  context_too_large: "메시지가 너무 길어서 이 모델에 보낼 수 없어요. 나눠서 보내 주세요.",
 };
 
 export type RunManagerOptions = {
@@ -1031,6 +1035,9 @@ export class RunManager {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const window = this.windowOf(adapter, run.model);
     const opts = this.contextOpts;
+    // The user's message is never cut: when it alone (with the reserve) does not fit the window, the run fails before
+    // anything is sent or summarised (review #106 round 2).
+    if (overflows([], null, window, opts, input.text)) throw new RuntimeFailure("context_too_large");
     const current = this.summaries.current(run.conversationId, history);
     // Decided again with the turn's real message (review #106): `begin` may not have known it, or not at all.
     const summarize =
@@ -1064,17 +1071,23 @@ export class RunManager {
       history = history.filter((m) => m.id !== dividerId);
     }
     if (ended !== undefined) throw ended;
-    const summary = written ?? current;
+    let summary = written ?? current;
     let messages = history.filter((m) => !summary || m.seq > summary.throughSeq);
     // A summary that could not be written, or a context that would not fit the window with the turn's message even
-    // so (one huge message): the newest messages that fit go to a *fresh* session — one that holds more would get
-    // the whole history again by being resumed.
-    let fresh = false;
+    // so: the newest messages that fit go to a *fresh* session — one that holds more would get the whole history
+    // again by being resumed — and that session is marked trimmed, so it is never resumed either (review #106 round
+    // 2: once the decision changes, e.g. a higher ratio after a restart, it would pass for the full history).
+    let trimmed = false;
     if (failed || overflows(messages, summary, window, opts, input.text)) {
       messages = trimToFit(history, summary, window, opts, input.text);
-      fresh = true;
+      trimmed = true;
+      // The summary itself and the message do not fit together: the newest messages that fit without it.
+      if (summary && overflows(messages, summary, window, opts, input.text)) {
+        summary = null;
+        messages = trimToFit(history, null, window, opts, input.text);
+      }
     }
-    return { history, summary, messages, fresh, inputMessageId: input.messageId };
+    return { history, summary, messages, trimmed, inputMessageId: input.messageId };
   }
 
   /**
@@ -1283,10 +1296,11 @@ export class RunManager {
               s.lastMessageId === lastSeen &&
               s.instructionsHash === instructions.hash &&
               (s.summaryId ?? null) === (summary?.id ?? null) &&
+              !s.trimmed &&
               (s.model === null || s.model === run.model || caps.canSwitchModelInSession),
           );
     // A cut context goes to a fresh session only; the session that holds the whole history is not used again.
-    if (prev && context.fresh) this.conversations.invalidateSession(prev.id);
+    if (prev && context.trimmed) this.conversations.invalidateSession(prev.id);
     else if (prev) {
       let resumed: RuntimeSession | undefined;
       try {
@@ -1318,6 +1332,7 @@ export class RunManager {
         instructionsHash: instructions.hash,
         model: run.model,
         summaryId: summary?.id ?? null,
+        trimmed: context.trimmed,
       });
       return { session, sessionRowId: row.id, revision: conv.revision };
     } catch (e) {

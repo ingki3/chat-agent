@@ -20,7 +20,7 @@ import {
   type ContextOptions,
 } from "../src/runtime/context.js";
 import { defaultScript, FakeRuntime, fakeSummary, type FakeScript } from "../src/runtime/fake.js";
-import { RunManager, type RunRow } from "../src/runtime/runs.js";
+import { RunManager, type RunManagerOptions, type RunRow } from "../src/runtime/runs.js";
 import { knownSecrets, KNOWN_PLACEHOLDER } from "../src/secrets/known.js";
 import { startContextApp, textOf, type Entry } from "./helpers/context-harness.js";
 
@@ -639,16 +639,129 @@ describe("review #106: the turn's message, cut contexts, cut files, unfinished d
     expect(t.claude.turnLog.at(-1)!.before[0]!.role).toBe("summary");
   });
 
-  it("a message bigger than the window itself: cut to what fits, in a fresh session", async () => {
+  /** Starts a run the way the routes do (divider point, the message text) and waits for its end. */
+  const beginRun = async (
+    t: { app: Awaited<ReturnType<typeof start>>["app"]; f: Awaited<ReturnType<typeof start>>["f"] },
+    runs: RunManager,
+    c: string,
+    text: string,
+  ) => {
+    const { run } = runs.begin({
+      conversationId: c,
+      userId: t.f.users.owner.id,
+      inputText: text,
+      prepare: (divider) => {
+        divider();
+        return {
+          user: t.app.conversations!.append(c, { role: "user", parts: [{ type: "text", text }] }),
+          assistant: t.app.conversations!.append(c, { role: "assistant", parts: [], status: "pending" }),
+        };
+      },
+    });
+    for (let i = 0; i < 1000 && !runs.get(run.id)!.endedAt; i++) await new Promise((r) => setTimeout(r, 5));
+    return runs.get(run.id)!;
+  };
+
+  it("a message bigger than the window itself is never cut: the run fails with context_too_large, nothing is sent", async () => {
     const t = await start({ window: WINDOW, context: OPTS });
     t.connect("claude-code");
     const c = await t.newConversation();
     await t.send(c, "짧은 질문");
-    const r = await t.send(c, "나".repeat(1200));
-    const turns = t.claude.turnLog.filter((x) => !x.input.startsWith(SUMMARY_MARKER));
-    expect(turns.at(-1)!.sessionId).not.toBe(turns[0]!.sessionId);
-    expect(turns.at(-1)!.before).toEqual([]);
-    expect(r.status).toBe("done");
+    const turnsBefore = t.claude.turnLog.length;
+    const run = await beginRun(t, t.app.runs!, c, "나".repeat(1200) + " 마지막 요청");
+    expect(run).toMatchObject({ status: "failed", errorCode: "context_too_large" });
+    expect(t.claude.turnLog).toHaveLength(turnsBefore);
+    const error = t.app.runs!.eventsAfter(run.id, 0).find((e) => e.data.type === "error")!.data;
+    expect(error).toMatchObject({
+      code: "context_too_large",
+      message: "메시지가 너무 길어서 이 모델에 보낼 수 없어요. 나눠서 보내 주세요.",
+    });
+    expect(t.summaries(c)).toEqual([]);
+  });
+
+  it("a summary that does not fit with the message: the newest messages that fit without it", async () => {
+    const big: FakeScript = (input, memory) =>
+      input.text.startsWith(SUMMARY_MARKER) ? [{ text: "요".repeat(1100) }] : defaultScript(input, memory);
+    const t = await start({ window: WINDOW, context: OPTS, script: big });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    for (let i = 0; i < 10; i++)
+      t.app.conversations!.append(c, {
+        role: i % 2 ? "assistant" : "user",
+        parts: [{ type: "text", text: "가".repeat(100) }],
+      });
+    const r = await t.send(c, "첫 입력");
+    expect(t.summaries(c)).toHaveLength(1);
+    const turn = t.claude.turnLog.at(-1)!;
+    expect(turn.before.map((e) => e.role)).not.toContain("summary");
+    const tokens =
+      turn.before.reduce((n, e) => n + estimateTokens(e.text) + 8, 0) + estimateTokens(turn.input) + 8;
+    expect(tokens).toBeLessThan(WINDOW);
+    expect(turn.before.length).toBeGreaterThan(0);
+    // The newest of the server's messages (no summary in front of them).
+    const all = t.app
+      .conversations!.messages(c, { limit: 10_000 })
+      .filter((m) => m.id !== r.assistantMessageId && m.id !== r.userMessageId && textOf(m))
+      .map((m) => ({ role: m.role, text: textOf(m) }));
+    expect(turn.before).toEqual(all.slice(all.length - turn.before.length));
+    expect(t.sessions(c).at(-1)).toMatchObject({ summaryId: null, trimmed: 1 });
+  });
+
+  it("a trimmed session is never resumed: not after the ratio is raised across a restart", async () => {
+    const failing: FakeScript = (input) =>
+      input.text.startsWith(SUMMARY_MARKER) ? [{ fail: "summary failed" }] : [{ text: "ok" }];
+    const claude = new FakeRuntime({ models: CLAUDE_MODELS, needsConnection: true, script: failing });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(claude);
+    const prod = { summaryRatio: 0.3, recentMessages: 6, reserveTokens: 8000 };
+    const t = await startContextApp(runtimes, { closers, context: prod });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    let last: RunRow | undefined;
+    for (let i = 0; i < 7; i++) last = await t.send(c, `fact${i}:` + "가".repeat(10_000));
+    // With 0.3 the summary was due, failed, and the session got a cut context.
+    expect(claude.turnLog.at(-1)!.before.length).toBeLessThan(t.original(last!).entries.length);
+    expect(t.sessions(c).at(-1)!.trimmed).toBe(1);
+    const trimmedSession = claude.turnLog.at(-1)!.sessionId;
+    // Restart with 0.7: the history fits without a summary now — the trimmed session must not pass for it.
+    const old = t.app.runs!;
+    const oldOpts = (old as unknown as { opts: RunManagerOptions }).opts;
+    await old.shutdown();
+    const manager = new RunManager(t.db, t.app.conversations!, runtimes, t.app.appEvents, {
+      ...oldOpts,
+      context: { ...prod, summaryRatio: 0.7 },
+    });
+    closers.push(() => manager.shutdown());
+    expect(manager.recover()).toBe(0);
+    const run = await beginRun(t, manager, c, "처음에 말한 사실?");
+    expect(run.status).toBe("done");
+    const turn = claude.turnLog.at(-1)!;
+    expect(turn.sessionId).not.toBe(trimmedSession);
+    expect(turn.before).toEqual(t.original(run).entries);
+    expect(turn.before[0]!.text.startsWith("fact0:")).toBe(true);
+  });
+
+  it("a trimmed session is never resumed: not after a switch to a model with a larger window", async () => {
+    const failing: FakeScript = (input) =>
+      input.text.startsWith(SUMMARY_MARKER) ? [{ fail: "summary failed" }] : [{ text: "ok" }];
+    const models = CLAUDE_MODELS.map((m) => ({
+      ...m,
+      contextWindow: m.id === "claude-sonnet-5-5" ? 5000 : 1000,
+    }));
+    const claude = new FakeRuntime({ models, needsConnection: true, script: failing });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(claude);
+    const t = await startContextApp(runtimes, { closers, context: OPTS });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    for (let i = 0; i < 9; i++) await t.send(c, `fact${i}:` + "가".repeat(80));
+    expect(t.sessions(c).at(-1)!.trimmed).toBe(1);
+    const prev = claude.turnLog.at(-1)!.sessionId;
+    await t.chip(c, { model: "claude-sonnet-5-5" });
+    const r = await t.send(c, "앞에서 말한 첫 사실?");
+    const turn = claude.turnLog.at(-1)!;
+    expect(turn.sessionId).not.toBe(prev);
+    expect(turn.before).toEqual(t.original(r).entries);
   });
 
   it("files of messages an edit cut leave the references; the edited message keeps its own", async () => {
