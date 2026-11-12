@@ -31,6 +31,48 @@ const RELOGIN: Record<RuntimeId, string> = {
  * happens when a run fails on a connection — an expired credential marks it `expired` and notifies the owner
  * (`connection_lost`) or, for a shared one, the admins (`system_warning`); a personal limit offers the shared one.
  */
+/**
+ * What a usage limit reported by a runtime says (#19): when it ends (`resetsAt`, a plan's reset time) or after how
+ * long to retry (`retryAfterMs`, an API's `retry-after`), and whether it is only for one model family (a plan's
+ * model-specific window, e.g. Claude's `seven_day_opus`).
+ */
+export type LimitInfo = { resetsAt?: number; retryAfterMs?: number; modelFamily?: string };
+
+/** A subscription without a reset time: five hours, the length of Claude's shortest plan window. */
+export const SUBSCRIPTION_COOLDOWN_MS = 5 * 60 * 60_000;
+/**
+ * An API key without a retry time: one minute. API limits are per minute and per model (a 429 is usually over in
+ * seconds), and a shared key's limit must not keep every family member off it for longer than the provider says.
+ */
+export const API_KEY_COOLDOWN_MS = 60_000;
+const LIMIT_MAX_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * How long and for what a connection is limited after the provider refused it (#19, docs/ops.md §22):
+ * - subscription: until the plan's reset time (≥ 1 minute ahead), else `SUBSCRIPTION_COOLDOWN_MS`; the whole
+ *   connection unless the runtime named a model family;
+ * - API key: until the reset time or `retry-after` (≥ 1 second), else `API_KEY_COOLDOWN_MS`; only the run's model
+ *   (API limits are per model) unless a family was named.
+ * Never more than a week ahead.
+ */
+export function limitFor(
+  authType: "api_key" | "subscription",
+  model: string,
+  info: LimitInfo,
+  now: number,
+): { scope: string; until: number } {
+  const valid = (n: number | undefined): n is number => n !== undefined && Number.isFinite(n);
+  const api = authType === "api_key";
+  const at = valid(info.resetsAt)
+    ? info.resetsAt
+    : valid(info.retryAfterMs)
+      ? now + info.retryAfterMs
+      : now + (api ? API_KEY_COOLDOWN_MS : SUBSCRIPTION_COOLDOWN_MS);
+  const until = Math.min(Math.max(at, now + (api ? 1_000 : 60_000)), now + LIMIT_MAX_MS);
+  const scope = info.modelFamily ? `family:${info.modelFamily}` : api ? `model:${model}` : "all";
+  return { scope, until };
+}
+
 export class ConnectionService {
   readonly access: RunAccess;
   /** Running connection tests: how to cancel one, and its end (disconnect waits for it before removing folders). */
@@ -76,10 +118,25 @@ export class ConnectionService {
     });
   }
 
+  /**
+   * A reply finished on the connection (#19): the limits on its model recorded before the run *started* are over.
+   * A run accepted before a limit and finishing after it ends nothing.
+   */
+  runSucceeded(run: RunRow): void {
+    if (run.connectionId)
+      this.store.clearLimits(run.connectionId, { model: run.model, startedAt: run.createdAt });
+  }
+
   /** The run manager's hook for a failed run on a connection: notices for the stream, side effects here. */
-  runFailed(run: RunRow, code: string): StreamEvent[] {
+  runFailed(run: RunRow, code: string, info: LimitInfo = {}): StreamEvent[] {
     const c = run.connectionId ? this.store.get(run.connectionId) : undefined;
     if (!c) return [];
+    // A usage limit (FR-9.2, FR-12.6): new conversations on what it covers start elsewhere until it ends (#19).
+    if (code === "usage_limit") {
+      const now = this.store.now();
+      const l = limitFor(c.authType, run.model, info, now);
+      this.store.recordLimit(c.id, l.scope, l.until, now);
+    }
     const runtime = c.runtime as RuntimeId;
     const label = RUNTIME_LABEL[runtime] ?? c.runtime;
     const subscription = c.authType === "subscription";
@@ -178,6 +235,7 @@ export class ConnectionService {
     if (adapter && !model) throw new ConnectionRuleError(403, "model_not_allowed");
     if (this.testing.has(c.id)) throw new ConnectionRuleError(409, "test_in_progress");
     const abort = new AbortController();
+    const startedAt = this.store.now();
     const running = this.tester.run({
       connectionId: c.id,
       runtime,
@@ -193,6 +251,8 @@ export class ConnectionService {
       const status = r.passed ? "passed" : "failed";
       // Recorded only for the tested credential, and never for a cancelled test.
       if (r.code !== "cancelled") this.store.setTestResult(c.id, status, r.code, c.credentialVersion);
+      // A passed test answers on its model: limits on it recorded before the test started are over (#19).
+      if (r.passed && model) this.store.clearLimits(c.id, { model: model.id, startedAt });
       logEvent(this.log, r.passed ? "info" : "warn", "connection.tested", {
         connectionId: c.id,
         runtime: c.runtime,

@@ -7,7 +7,12 @@ import type { ConnectionRow, ConnectionStore, EffectivePolicy } from "./store.js
 export class RunAccessDenied extends Error {
   constructor(
     readonly code:
-      "runtime_not_allowed" | "model_not_allowed" | "effort_not_allowed" | "connection_not_allowed",
+      | "runtime_not_allowed"
+      | "model_not_allowed"
+      | "effort_not_allowed"
+      | "connection_not_allowed"
+      /** The connection is at its usage limit (#19): not for a new conversation or a switch to it. */
+      | "connection_limited",
   ) {
     super(code);
   }
@@ -117,6 +122,11 @@ export class RunAccess {
       if (e instanceof RunAccessDenied) return e.code;
       throw e;
     }
+  }
+
+  /** Until when `model` is at a usage limit on the connection (#19, FR-12.6), or null when it is not. */
+  connectionLimitedUntil(id: string, model: string): number | null {
+    return this.connections.limitedUntil(id, model);
   }
 
   resolve(input: RunSettingsInput): RunSettings {

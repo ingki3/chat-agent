@@ -47,6 +47,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "conversations.kind": ENUM,
   "conversations.forked_from": ID,
   "conversations.last_runtime": ENUM,
+  "conversations.runtime": ENUM,
+  "conversations.model": {
+    exempt: "a model id from the runtime's catalogue (checked by RunAccess before it is stored)",
+  },
+  "conversations.effort": ENUM,
+  "conversations.fallback_notice": {
+    exempt: "runtime and model ids (checked by RunAccess before they are stored)",
+  },
   "messages.id": ID,
   "messages.conversation_id": ID,
   "messages.role": ENUM,
@@ -115,6 +123,10 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "push_subscriptions.secret": CIPHER,
   "push_subscriptions.label": { write: "NotificationService.subscribe", rescrub: "text" },
   "push_session_state.session_id": HASH,
+  "connection_limits.connection_id": ID,
+  "connection_limits.scope": {
+    exempt: "a limit scope chosen by the server (all, family:<name>, model:<catalogue id>)",
+  },
   "connections.id": ID,
   "connections.runtime": ENUM,
   "connections.auth_type": ENUM,

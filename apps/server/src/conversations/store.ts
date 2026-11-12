@@ -4,6 +4,8 @@ import {
   autoTitle,
   MessagePart,
   publicParts,
+  type ChatSettings,
+  type FallbackNotice,
   type Conversation,
   type Message,
   type RuntimeId,
@@ -21,6 +23,33 @@ export const DEFAULT_TITLE = "새 대화";
 /** Called inside the delete transaction, before rows go — files, artifacts and shares hook in here (#54). */
 export type DeleteHook = (conversationId: string) => void;
 
+/** The conversation's settings for its next message (#19), or null while none was usable yet. */
+export function settingsOf(c: ConversationRow): ChatSettings | null {
+  if (c.runtime !== "claude-code" && c.runtime !== "codex") return null;
+  if (!c.model) return null;
+  return { runtime: c.runtime, model: c.model, effort: c.effort ?? null, useShared: c.useShared };
+}
+
+const noticeFor = (s: ChatSettings, limitedUntil: number | undefined) => ({
+  runtime: s.runtime,
+  model: s.model,
+  ...(limitedUntil !== undefined ? { limitedUntil } : {}),
+});
+/** A stored fallback notice, checked (null when it is not one). */
+function noticeOf(v: unknown): FallbackNotice | null {
+  const n = v as { runtime?: unknown; model?: unknown; limitedUntil?: unknown } | null;
+  if (!n || (n.runtime !== "claude-code" && n.runtime !== "codex") || typeof n.model !== "string")
+    return null;
+  return {
+    runtime: n.runtime,
+    model: n.model,
+    ...(typeof n.limitedUntil === "number" ? { limitedUntil: n.limitedUntil } : {}),
+  };
+}
+
+/** What a reply was answered with — the divider rule compares these (#19). */
+export type AnsweredWith = { runtime: string; model: string; effort: string | null; label: string };
+
 export function toConversation(c: ConversationRow): Conversation {
   return {
     id: c.id,
@@ -32,6 +61,8 @@ export function toConversation(c: ConversationRow): Conversation {
     forkedFrom: c.forkedFrom ?? null,
     revision: c.revision,
     researchMode: c.researchMode,
+    settings: settingsOf(c),
+    fallbackNotice: noticeOf(c.fallbackNotice),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -94,7 +125,17 @@ export class ConversationStore {
 
   create(
     ownerId: string,
-    opts: { title?: string | undefined; kind?: ConversationRow["kind"]; forkedFrom?: string } = {},
+    opts: {
+      title?: string | undefined;
+      kind?: ConversationRow["kind"];
+      forkedFrom?: string;
+      /** Start settings (#19): the user's defaults after the FR-12.6 fallback, or the chip's choice. */
+      settings?: ChatSettings | null | undefined;
+      /** The start used the fallback: show the notice once. */
+      fallback?: boolean | undefined;
+      /** The default was at a usage limit until then (the notice says so). */
+      limitedUntil?: number | undefined;
+    } = {},
   ): ConversationRow {
     const t = this.now();
     const row = {
@@ -108,12 +149,135 @@ export class ConversationStore {
       lastRuntime: null,
       revision: 0,
       researchMode: false,
+      runtime: opts.settings?.runtime ?? null,
+      model: opts.settings?.model ?? null,
+      effort: opts.settings?.effort ?? null,
+      useShared: opts.settings?.useShared ?? false,
+      fallbackNotice: opts.settings && opts.fallback ? noticeFor(opts.settings, opts.limitedUntil) : null,
       nextSeq: 1,
       createdAt: t,
       updatedAt: t,
     };
     this.db.insert(conversations).values(row).run();
     return row;
+  }
+
+  /**
+   * The chip's change (#19), or the first resolution of a conversation that had none: from the next message on.
+   * Not activity (the "recent" order stays). A change by the chip ends a pending fallback notice — it was about how
+   * the conversation started, and the chip now shows the user's own choice.
+   */
+  setSettings(id: string, s: ChatSettings, opts: { fallback?: boolean; limitedUntil?: number } = {}): void {
+    this.db
+      .update(conversations)
+      .set({
+        runtime: s.runtime,
+        model: s.model,
+        effort: s.effort,
+        useShared: s.useShared,
+        fallbackNotice: opts.fallback ? noticeFor(s, opts.limitedUntil) : null,
+      })
+      .where(eq(conversations.id, id))
+      .run();
+  }
+
+  /**
+   * Takes the fallback notice (#19): one statement clears it and returns what it was, so of any number of callers —
+   * tabs, reloads, concurrent requests — exactly one gets it. Null for everyone else.
+   */
+  consumeFallbackNotice(id: string): FallbackNotice | null {
+    // RETURNING gives the new value (null), so: read and clear in one immediate transaction; the clear only counts
+    // when it still found the notice (changes = 1).
+    const n = this.db.$client
+      .transaction(() => {
+        const row = this.db.$client
+          .prepare(
+            "select fallback_notice as n from conversations where id = ? and fallback_notice is not null",
+          )
+          .get(id) as { n: string } | undefined;
+        if (!row) return undefined;
+        const r = this.db.$client
+          .prepare(
+            "update conversations set fallback_notice = null where id = ? and fallback_notice is not null",
+          )
+          .run(id);
+        return r.changes === 1 ? row.n : undefined;
+      })
+      .immediate();
+    if (!n) return null;
+    try {
+      return noticeOf(JSON.parse(n));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * `── 여기부터 Codex · ○○ ──` (FR-3.5, #19): makes the history right before the reply about to be written say who
+   * answers it. Written when the change takes effect — the next message — so a change undone before sending leaves no
+   * divider, and the first reply of a conversation gets none.
+   *
+   * The dividers after the last active reply belong to the turn being written: after an edit or a regeneration cut
+   * the history they may be left over from the replaced turn (review #101 P2). Exactly one survives when it already
+   * names who answers now; the others leave the history (kept, like every cut message, with the revision); a new one
+   * is appended only when none fits.
+   */
+  syncSwitchDivider(conversationId: string, next: AnsweredWith): MessageRow | undefined {
+    const active = this.db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.conversationId, conversationId), eq(messages.active, true)))
+      .orderBy(asc(messages.seq))
+      .all();
+    const prev = active.findLast((m) => m.role === "assistant" && m.runtime !== null && m.model !== null);
+    const pending = active.filter(
+      (m) =>
+        m.role === "system" &&
+        (!prev || m.seq > prev.seq) &&
+        (m.parts as MessagePart[]).some((p) => p.type === "divider" && p.kind === "runtime_switch"),
+    );
+    let label: string | null = null;
+    if (prev) {
+      const sameModel = prev.runtime === next.runtime && prev.model === next.model;
+      if (!sameModel || (prev.effort ?? null) !== next.effort)
+        // Only the effort changed: say so, or the divider would name what answered before too.
+        label = `여기부터 ${sameModel && next.effort ? `${next.label} · 추론 ${next.effort}` : next.label}`;
+    }
+    const keep =
+      label === null
+        ? undefined
+        : pending.find((m) => {
+            const d = (m.parts as MessagePart[])[0];
+            return (
+              d?.type === "divider" &&
+              d.label === label &&
+              d.runtime === next.runtime &&
+              d.model === next.model
+            );
+          });
+    const stale = pending.filter((m) => m !== keep);
+    if (stale.length) {
+      const revision = this.get(conversationId)!.revision;
+      for (const m of stale)
+        this.db
+          .update(messages)
+          .set({ active: false, archivedAtRevision: revision })
+          .where(eq(messages.id, m.id))
+          .run();
+    }
+    if (label === null || keep) return keep;
+    return this.append(conversationId, {
+      role: "system",
+      parts: [
+        {
+          type: "divider",
+          kind: "runtime_switch",
+          label,
+          runtime: next.runtime as RuntimeId,
+          model: next.model,
+        },
+      ],
+    });
   }
 
   /**
@@ -360,12 +524,19 @@ export class ConversationStore {
   }
 
   /** "수정 후 다시 보내기": replaces an active user message; later messages are cut off (kept as versions). */
-  edit(conversationId: string, messageId: string, text: string): MessageRow | undefined {
+  edit(
+    conversationId: string,
+    messageId: string,
+    text: string,
+    /** Runs after the cut, before the new message (the switch divider, #19). */
+    afterCut?: () => void,
+  ): MessageRow | undefined {
     return this.db.$client.transaction(() => {
       const conv = this.get(conversationId);
       const target = this.message(conversationId, messageId);
       if (!conv || !target || !target.active || target.role !== "user") return undefined;
       this.truncateFrom(conv, target);
+      afterCut?.();
       return this.append(conversationId, {
         role: "user",
         parts: [{ type: "text", text }],
@@ -377,12 +548,13 @@ export class ConversationStore {
   /**
    * "다시 생성": replaces an active assistant message with a pending one that the runtime pipeline (#12) fills.
    */
-  regenerate(conversationId: string, messageId: string): MessageRow | undefined {
+  regenerate(conversationId: string, messageId: string, afterCut?: () => void): MessageRow | undefined {
     return this.db.$client.transaction(() => {
       const conv = this.get(conversationId);
       const target = this.message(conversationId, messageId);
       if (!conv || !target || !target.active || target.role !== "assistant") return undefined;
       this.truncateFrom(conv, target);
+      afterCut?.();
       return this.append(conversationId, {
         role: "assistant",
         parts: [],

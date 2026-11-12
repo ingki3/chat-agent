@@ -115,6 +115,31 @@ export const Message = z.object({
 export type Message = z.infer<typeof Message>;
 
 export const ConversationKind = z.enum(["normal", "schedule", "fork"]);
+
+/**
+ * What a conversation answers with from its next message on (#19, PRD FR-3.5, FR-12): set from the user's defaults
+ * (with the FR-12.6 fallback) when the conversation is created, changed only by the chip. Changing the defaults
+ * later never touches it (FR-12.5). `useShared`: "공용으로 쓰기" — the family shared connection even when a personal
+ * one exists (FR-11.3).
+ */
+export const ChatSettings = z.object({
+  runtime: RuntimeId,
+  model: z.string(),
+  effort: z.string().nullable(),
+  useShared: z.boolean(),
+});
+export type ChatSettings = z.infer<typeof ChatSettings>;
+/** `PUT /api/conversations/:id/settings`: the chip's change; at least one field. Runtime alone → its default model. */
+export const ChangeSettingsRequest = z
+  .object({
+    runtime: RuntimeId.optional(),
+    model: z.string().min(1).max(100).optional(),
+    effort: z.string().min(1).max(20).optional(),
+    useShared: z.boolean().optional(),
+  })
+  .strict()
+  .refine((v) => Object.values(v).some((x) => x !== undefined), { message: "nothing to change" });
+export type ChangeSettingsRequest = z.infer<typeof ChangeSettingsRequest>;
 export const Conversation = z.object({
   id: z.string(),
   title: z.string(),
@@ -126,6 +151,13 @@ export const Conversation = z.object({
   revision: z.number().int(),
   /** 자료 조사 모드 (FR-5.5): compare several sources, say when evidence is weak (#20). */
   researchMode: z.boolean(),
+  /** Runtime, model and effort of the next message (#19); null only for a conversation no runtime was usable for yet. */
+  settings: ChatSettings.nullable(),
+  /**
+   * Set when the conversation started on the FR-12.6 fallback because the default could not be used: the chip shows
+   * "기본값을 쓸 수 없어 ○○로 시작했어요" once: only the page whose `POST …/fallback-notice/consume` takes it shows it.
+   */
+  fallbackNotice: z.lazy(() => FallbackNotice).nullable(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -138,7 +170,11 @@ export const ListConversationsQuery = z.object({
   /** Opaque cursor from the previous page. */
   cursor: z.string().max(200).optional(),
 });
-export const CreateConversationRequest = z.object({ title: z.string().trim().min(1).max(200).optional() });
+/** `settings`: the chip was changed on the new-conversation screen before the first message (checked, 403). */
+export const CreateConversationRequest = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  settings: ChangeSettingsRequest.optional(),
+});
 export const UpdateConversationRequest = z
   .object({
     title: z.string().trim().min(1).max(200).optional(),
@@ -148,6 +184,30 @@ export const UpdateConversationRequest = z
   .refine((v) => v.title !== undefined || v.pinned !== undefined || v.researchMode !== undefined, {
     message: "nothing to update",
   });
+/**
+ * `POST /api/conversations/:id/fallback-notice/consume` (#19): takes the fallback notice atomically — the first caller
+ * gets it, every later (or concurrent) one gets null — so it is shown once across tabs and reloads.
+ */
+/**
+ * `POST /api/settings/preview` (#19): the new-conversation screen's chip — what `change` makes of `base` (the start
+ * settings, or the choice so far), by the same rules as a conversation's change, limits included. Nothing is saved.
+ */
+export const PreviewSettingsRequest = z
+  .object({ base: ChatSettings.nullable(), change: ChangeSettingsRequest })
+  .strict();
+export type PreviewSettingsRequest = z.infer<typeof PreviewSettingsRequest>;
+
+/** What a conversation started on instead of the default; `limitedUntil` when the default was at a usage limit. */
+export const FallbackNotice = z.object({
+  runtime: RuntimeId,
+  model: z.string(),
+  limitedUntil: z.number().optional(),
+});
+export type FallbackNotice = z.infer<typeof FallbackNotice>;
+export const ConsumeFallbackNoticeResponse = z.object({
+  notice: z.lazy(() => FallbackNotice).nullable(),
+});
+export type ConsumeFallbackNoticeResponse = z.infer<typeof ConsumeFallbackNoticeResponse>;
 export const ListMessagesQuery = z.object({
   /** Return messages with seq below this (older page). */
   before: z.coerce.number().int().positive().optional(),

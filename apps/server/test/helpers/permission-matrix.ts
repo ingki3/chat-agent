@@ -34,6 +34,11 @@ export type MatrixRow = {
   fixture: (f: Family) => Fixture | Promise<Fixture>;
   /** Request body for non-GET routes. */
   body?: unknown;
+  /**
+   * Error codes to check as well, where the status alone could come from a later check (e.g. a policy 403 after the
+   * resource check): a missing ownership check must still fail the row.
+   */
+  errors?: Partial<Record<Who, string>>;
 };
 
 /** Standard expectations. */
@@ -149,6 +154,18 @@ export const APP_MATRIX: MatrixRow[] = [
     body: { title: "새 이름" },
   },
   { route: "DELETE /api/conversations/:id", expect: OWNER_ONLY, fixture: conversation },
+  // The chip (#19). No runtime in the matrix app: past the resource check the owner gets the policy's 403
+  // (runtime_not_allowed) — everyone else must be stopped before it, by the resource check (`forbidden`). With a
+  // usable runtime the same is tested in chat-settings.test.ts ("someone else's conversation").
+  {
+    route: "PUT /api/conversations/:id/settings",
+    expect: { ...OWNER_ONLY, owner: 403 },
+    errors: { owner: "runtime_not_allowed", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+    fixture: conversation,
+    body: { runtime: "codex" },
+  },
+  // The fallback notice (#19): only the owner takes it.
+  { route: "POST /api/conversations/:id/fallback-notice/consume", expect: OWNER_ONLY, fixture: conversation },
   { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
   // Owner only even once sharing exists (#50): a shared view gets its frozen sources, not this list (#29).
   { route: "GET /api/conversations/:id/sources", expect: OWNER_ONLY, fixture: conversation },
@@ -391,7 +408,7 @@ export async function runAdminMatrix(f: Family, rows: AdminRow[]): Promise<strin
 }
 
 const LOCAL = { host: "localhost:3000" };
-const PW = "matrix-password-1";
+export const PW = "matrix-password-1";
 
 export async function createFamily(app: FastifyInstance): Promise<Family> {
   const store = app.users!;
@@ -457,9 +474,21 @@ export async function runMatrix(f: Family, rows: MatrixRow[]): Promise<string[]>
       });
     };
     for (const who of Object.keys(row.expect) as Who[]) {
-      const got = (await send(who, await row.fixture(f))).statusCode;
+      const res = await send(who, await row.fixture(f));
+      const got = res.statusCode;
       if (got !== row.expect[who])
         failures.push(`${row.route} as ${who}: expected ${row.expect[who]}, got ${got}`);
+      const code = row.errors?.[who];
+      if (code !== undefined) {
+        let error: unknown;
+        try {
+          error = (JSON.parse(res.body) as { error?: unknown }).error;
+        } catch {
+          error = undefined;
+        }
+        if (error !== code)
+          failures.push(`${row.route} as ${who}: expected error ${code}, got ${String(error)}`);
+      }
     }
     // A missing id is 404 for any signed-in user, and 401 before login (existence is not revealed).
     for (const [who, want] of [

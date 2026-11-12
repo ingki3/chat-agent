@@ -1,42 +1,12 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
-import { ADMIN, SON, csrf, newConversation, useAccount } from "./helpers.js";
+import { expect, test, type Page } from "@playwright/test";
+import { ADMIN, SON, csrf, newConversation, newMember, signIn, useAccount } from "./helpers.js";
 
 /**
  * Admin screen (#35): tabs for users, per-user permissions, runtimes, skills, system status and usage. The e2e
- * server runs the scripted FakeRuntime as "Claude Code" (models Fake Large and Fake Small), without connections.
+ * server runs the scripted FakeRuntime as "Claude Code" (models Fake Large, Fake Small and Opus 5.5), without connections.
  * Each test makes its own account, so the desktop and mobile runs never change each other's (or the shared
  * family accounts') permissions.
  */
-
-async function newMember(browser: Browser, baseURL: string, label: string, youth = false) {
-  const ctx = await browser.newContext({ baseURL });
-  const adminPage = await ctx.newPage();
-  await useAccount(adminPage, ADMIN);
-  const email = `${label}-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
-  const name = `${label}${Math.round(Math.random() * 1e4)}`;
-  const created = await adminPage.request.post("/api/admin/users", {
-    data: { name, email, youth },
-    headers: csrf(baseURL),
-  });
-  expect(created.status()).toBe(201);
-  const { user, temporaryPassword } = (await created.json()) as {
-    user: { id: string };
-    temporaryPassword: string;
-  };
-  await ctx.close();
-  return { id: user.id, name, email, temporaryPassword };
-}
-
-async function signIn(page: Page, baseURL: string, who: { email: string; temporaryPassword: string }) {
-  await page.request.post("/api/auth/login", {
-    data: { email: who.email, password: who.temporaryPassword },
-    headers: csrf(baseURL),
-  });
-  await page.request.post("/api/auth/password", {
-    data: { currentPassword: who.temporaryPassword, newPassword: "admin-e2e-password-1" },
-    headers: csrf(baseURL),
-  });
-}
 
 const modelOptions = (page: Page) =>
   page.getByLabel("Claude Code 기본 모델").locator("option").allTextContents();
@@ -71,7 +41,7 @@ test("taking a model away from a youth account removes it from his selector, and
 
   // Gone from his selector…
   await page.reload();
-  await expect.poll(() => modelOptions(page)).toEqual(["허용된 첫 모델", "Fake Large"]);
+  await expect.poll(() => modelOptions(page)).toEqual(["허용된 첫 모델", "Fake Large", "Opus 5.5"]);
   // …and refused by the API: starting a run with it, and saving it as a default.
   const c = await newConversation(page.request, baseURL!, `권한 ${Date.now()}`);
   const run = await page.request.post(`/api/conversations/${c.id}/messages`, {

@@ -433,6 +433,8 @@ async function family(o: { tools?: string[] } = {}) {
     const r = app.runs!.begin({
       conversationId,
       userId,
+      // A runtime for this reply only (the conversation's own settings come from the defaults, #19).
+      ...(runtime ? { choice: { runtime: runtime as "claude-code" | "codex" } } : {}),
       prepare: () => ({
         user: app.conversations!.append(conversationId, {
           role: "user",

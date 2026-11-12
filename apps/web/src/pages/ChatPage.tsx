@@ -1,10 +1,28 @@
-import { memo, useCallback, useEffect, useEffectEvent, useRef, useState, type KeyboardEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router";
-import { publicParts, type Message, type StartRunResponse } from "@agentlee/shared";
-import { conversations, errorText, runs } from "../api.js";
+import {
+  publicParts,
+  type ChangeSettingsRequest,
+  type ChatSettings,
+  type Conversation,
+  type Message,
+  type StartRunResponse,
+} from "@agentlee/shared";
+import { conversations, errorText, runs, settings as settingsApi } from "../api.js";
+import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
-import { Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
+import { DividerView, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
+import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
 import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
 import { TopBar } from "../Shell.js";
@@ -29,6 +47,9 @@ const SWITCHABLE = new Set([
 ]);
 
 const COMPOSER_INPUT = "composer-input";
+/** What the chip may offer (#19): allowed runtimes with a passed connection. */
+const USABLE_KEY = ["runtimes", "usable"] as const;
+const useUsableRuntimes = () => useQuery({ queryKey: USABLE_KEY, queryFn: settingsApi.usableRuntimes });
 const time = new Intl.DateTimeFormat("ko-KR", { hour: "numeric", minute: "2-digit" });
 const dotClass = (r: string | null) => (r === "codex" ? "codex" : r === "claude-code" ? "claude" : "none");
 
@@ -60,6 +81,7 @@ export function ChatPage() {
   });
   const list = messages.data ? [...messages.data.pages].reverse().flatMap((p) => p.items) : undefined;
   const active = useQuery({ queryKey: ["active-run", id], queryFn: () => conversations.activeRun(id) });
+  const usable = useUsableRuntimes();
   const [after, setAfter] = useState<Record<string, AfterRun>>({});
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -137,9 +159,26 @@ export function ChatPage() {
     : undefined;
 
   const lastAssistant = list?.findLast((m) => m.role === "assistant");
-  const chip = lastAssistant?.runtime
-    ? { runtime: lastAssistant.runtime, model: lastAssistant.model }
-    : { runtime: conv.data?.lastRuntime ?? null, model: null };
+  const chatSettings = conv.data?.settings ?? null;
+  // "기본값을 쓸 수 없어 ○○로 시작했어요" — once (FR-12.6): the server hands it to exactly one caller (another tab, a
+  // reload or a failed request never shows it twice); only that page shows it, while the conversation is open.
+  const [notice, setNotice] = useState<{ id: string; text: string } | null>(null);
+  const asked = useRef<string | null>(null);
+  const pendingNotice = !!conv.data?.fallbackNotice;
+  useEffect(() => {
+    if (!pendingNotice || asked.current === id || usable.isPending) return;
+    asked.current = id;
+    void takeFallbackNotice(() => conversations.consumeFallbackNotice(id)).then((n) => {
+      // Only the notice field: a full conversation from this response could undo a newer chip change.
+      qc.setQueryData<Conversation>(["conversation", id], (c) => (c ? withoutNotice(c) : c));
+      if (n) setNotice({ id, text: noticeText(n, usable.data) });
+    });
+  }, [pendingNotice, id, qc, usable.data, usable.isPending]);
+  const changeSettings = async (change: ChangeSettingsRequest) => {
+    const c = await conversations.changeSettings(id, change);
+    qc.setQueryData(["conversation", id], c);
+    setNotice(null);
+  };
 
   if (conv.isError) return <Missing error={conv.error} />;
   return (
@@ -171,6 +210,8 @@ export function ChatPage() {
           {list?.map((m) =>
             m.role === "user" ? (
               <UserMessage key={m.id} m={m} canEdit={!busy} onEdit={edit} />
+            ) : m.role === "system" ? (
+              <SystemMessage key={m.id} m={m} />
             ) : m.role === "assistant" ? (
               <AssistantMessage
                 key={m.id}
@@ -207,24 +248,75 @@ export function ChatPage() {
         busy={busy}
         onSend={send}
         onStop={lost ? undefined : stop}
-        runtime={chip.runtime}
-        model={chip.model}
+        chip={
+          <RuntimeChip
+            settings={chatSettings}
+            options={usable.data}
+            onChange={changeSettings}
+            notice={notice?.id === id ? notice.text : null}
+            pending={differs(chatSettings, lastAssistant)}
+          />
+        }
       />
     </>
   );
 }
 
-/** "/": nothing to choose first — type and go (PRD FR-3.5). */
+/** `── 여기부터 Codex · ○○ ──` written by the server where the answering runtime / model changed (#19). */
+const SystemMessage = memo(function SystemMessage({ m }: { m: Message }) {
+  return (
+    <>{publicParts(m.parts).map((p, i) => (p.type === "divider" ? <DividerView key={i} d={p} /> : null))}</>
+  );
+});
+
+/**
+ * "/": nothing to choose first — type and go (PRD FR-3.5). The chip shows what the conversation will start with (the
+ * defaults after the FR-12.6 fallback, by the server); changing it here is sent along when the conversation is made.
+ * Nothing usable at all: a screen saying so instead of a composer that cannot work.
+ */
 export function NewChatPage() {
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const defaults = useQuery({ queryKey: ["settings", "defaults"], queryFn: settingsApi.defaults });
+  const usable = useUsableRuntimes();
+  const [chosen, setChosen] = useState<ChatSettings | null>(null);
+  const start = chosen ?? defaults.data?.start ?? null;
+  // Every chip change is previewed by the server; a send waits for the latest result (review #101 4차).
+  const [choice] = useState(() => new ChipChoice<ChatSettings>(settingsApi.preview));
   const send = async (text: string) => {
-    const c = await conversations.create();
+    // Waits for a preview still on its way; a failed one stops the send (its error shows under the composer).
+    const chosen = await choice.settled();
+    const c: Conversation = await conversations.create(
+      chosen
+        ? {
+            runtime: chosen.runtime,
+            model: chosen.model,
+            ...(chosen.effort ? { effort: chosen.effort } : {}),
+            useShared: chosen.useShared,
+          }
+        : undefined,
+    );
+    qc.setQueryData(["conversation", c.id], c);
     const r = await conversations.send(c.id, text);
     qc.setQueryData(["active-run", c.id], r.run);
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
     navigate(`/c/${c.id}`);
   };
+  // The server computes the choice (the same rules as the conversation is created with, limits included).
+  const change = async (c: ChangeSettingsRequest) => {
+    if (!start) return;
+    setChosen(await choice.change(start, c));
+  };
+  if (defaults.data && defaults.data.start === null)
+    return (
+      <>
+        <TopBar title={<span className="muted">새 대화</span>} />
+        <div className="empty" data-testid="no-runtime">
+          <h1>쓸 수 있는 런타임이 없어요</h1>
+          <p className="muted">관리자에게 문의하세요. 런타임 연결이나 허용 범위를 확인해야 해요.</p>
+        </div>
+      </>
+    );
   return (
     <>
       <TopBar title={<span className="muted">새 대화</span>} />
@@ -234,7 +326,12 @@ export function NewChatPage() {
           <p className="muted">질문을 입력하면 바로 시작해요.</p>
         </div>
       </div>
-      <Composer busy={false} onSend={send} autoFocus runtime={null} model={null} />
+      <Composer
+        busy={false}
+        onSend={send}
+        autoFocus
+        chip={<RuntimeChip settings={start} options={usable.data} onChange={change} />}
+      />
     </>
   );
 }
@@ -457,13 +554,12 @@ function Composer(props: {
   onSend: (text: string) => Promise<void>;
   onStop?: (() => void) | undefined;
   autoFocus?: boolean;
-  runtime: string | null;
-  model: string | null;
+  /** The runtime chip (#19). */
+  chip: ReactNode;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [chipOpen, setChipOpen] = useState(false);
   const submit = async () => {
     const t = text.trim();
     if (!t || sending || props.busy) return;
@@ -484,9 +580,6 @@ function Composer(props: {
       void submit();
     }
   };
-  const chipLabel = props.runtime
-    ? [RUNTIME_LABEL[props.runtime] ?? props.runtime, props.model].filter(Boolean).join(" · ")
-    : "기본값";
   return (
     <div className="composer">
       <div className="box">
@@ -517,24 +610,7 @@ function Composer(props: {
             </span>
           )}
           <span className="grow" />
-          {/* Runtime / model switching arrives with #19; the chip already shows who answers. */}
-          <span className="chipwrap">
-            <button
-              type="button"
-              id="runtime-chip"
-              className="rtchip"
-              aria-expanded={chipOpen}
-              onClick={() => setChipOpen((o) => !o)}
-            >
-              <span className={`dot ${dotClass(props.runtime)}`} />
-              <span className="rt-name">{chipLabel}</span>
-            </button>
-            {chipOpen && (
-              <span className="pop open small" role="status">
-                런타임·모델 바꾸기는 곧 지원돼요. 지금은 이 대화의 런타임으로 이어서 답해요.
-              </span>
-            )}
-          </span>
+          {props.chip}
           {props.onStop ? (
             <button type="button" onClick={props.onStop}>
               ■ 중지

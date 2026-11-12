@@ -22,6 +22,9 @@ import {
   Connection,
   ConnectionTestResult,
   Conversation,
+  type ChangeSettingsRequest,
+  ChatSettings,
+  ConsumeFallbackNoticeResponse,
   CreateUserResponse,
   CSRF_HEADER,
   Message,
@@ -229,7 +232,13 @@ export const admin = {
 export const settings = {
   runtimes: async () =>
     RuntimeOption.array().parse(((await call("GET", "/api/runtimes")) as { items: unknown }).items),
+  /** The chip (#19): only runtimes that can answer now (allowed, with a passed connection or none needed). */
+  usableRuntimes: async () =>
+    RuntimeOption.array().parse(((await call("GET", "/api/runtimes/usable")) as { items: unknown }).items),
   defaults: async () => DefaultsResponse.parse(await call("GET", "/api/settings/defaults")),
+  /** The new-conversation chip (#19): what `change` makes of `base`, computed by the server (403 when refused). */
+  preview: async (base: ChatSettings | null, change: ChangeSettingsRequest) =>
+    ChatSettings.parse(await call("POST", "/api/settings/preview", { base, change })),
   setDefaults: async (defaults: RuntimeDefaults | null) =>
     DefaultsResponse.parse(await call("PUT", "/api/settings/defaults", { defaults })),
 };
@@ -244,7 +253,17 @@ export const conversations = {
     return { items: Conversation.array().parse(r.items), nextCursor: r.nextCursor };
   },
   get: async (id: string) => Conversation.parse(await call("GET", `/api/conversations/${enc(id)}`)),
-  create: async () => Conversation.parse(await call("POST", "/api/conversations", {})),
+  /** Starts on the defaults (FR-12.6 fallback by the server); `settings` = a chip choice made before sending. */
+  create: async (settings?: ChangeSettingsRequest) =>
+    Conversation.parse(await call("POST", "/api/conversations", settings ? { settings } : {})),
+  /** The chip (#19): from the next message on. */
+  changeSettings: async (id: string, change: ChangeSettingsRequest) =>
+    Conversation.parse(await call("PUT", `/api/conversations/${enc(id)}/settings`, change)),
+  /** Takes the fallback notice (#19): non-null only for the one caller that got it. */
+  consumeFallbackNotice: async (id: string) =>
+    ConsumeFallbackNoticeResponse.parse(
+      await call("POST", `/api/conversations/${enc(id)}/fallback-notice/consume`, {}),
+    ).notice,
   rename: async (id: string, title: string) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { title })),
   pin: async (id: string, pinned: boolean) =>
@@ -417,6 +436,7 @@ const MESSAGES: Record<string, string> = {
   shared_subscription: "공용 연결은 API 키로만 만들 수 있어요.",
   test_in_progress: "이미 테스트 중이에요.",
   connection_not_allowed: "이 연결은 쓸 수 없어요. 설정 → 내 런타임 연결을 확인하세요.",
+  connection_limited: "이 런타임은 지금 사용 한도에 걸렸어요. 다른 런타임을 고르거나 잠시 뒤에 바꿔 주세요.",
   model_not_allowed: "허용되지 않은 모델이에요.",
   effort_not_allowed: "허용되지 않은 추론 강도예요.",
   runtime_not_allowed: "허용되지 않은 런타임이에요.",

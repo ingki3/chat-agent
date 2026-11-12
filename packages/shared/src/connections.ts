@@ -29,11 +29,33 @@ export const Connection = z.object({
   lastTestAt: z.number().nullable(),
   /** Fixed code of the last test (`ok`, `test_no_stream`, `test_no_tool`, `test_no_skill`, `runtime_auth`, …). */
   lastTestCode: z.string().nullable(),
+  /** Usage limits in force now (#19): new conversations whose model they cover start elsewhere meanwhile. */
+  limits: z.array(z.lazy(() => ConnectionLimit)),
   /** Registered by an admin on the owner's behalf. */
   registeredByAdmin: z.boolean(),
   createdAt: z.number(),
 });
 export type Connection = z.infer<typeof Connection>;
+
+/**
+ * A usage limit of a connection (#19, FR-9.2, FR-12.6) and what it covers: `all` (the whole connection — a plan's
+ * five-hour or weekly window), `family:<opus|sonnet|haiku>` (a plan's model-specific window, e.g. Claude's
+ * `seven_day_opus`) or `model:<id>` (an API key's per-model rate limit). `until`: ms since the epoch.
+ */
+export const ConnectionLimit = z.object({ scope: z.string(), until: z.number() });
+export type ConnectionLimit = z.infer<typeof ConnectionLimit>;
+
+/** `opus`, `sonnet` or `haiku` for a Claude model id; null for anything else. */
+export function modelFamily(model: string): string | null {
+  return /(opus|sonnet|haiku)/.exec(model)?.[1] ?? null;
+}
+
+/** Whether a limit of `scope` stops `model` (the one rule for the server's start and chip checks and the chip UI). */
+export function limitApplies(scope: string, model: string): boolean {
+  if (scope === "all") return true;
+  if (scope.startsWith("family:")) return modelFamily(model) === scope.slice("family:".length);
+  return scope === `model:${model}`;
+}
 
 const Label = z.string().trim().min(1).max(60);
 /** Credentials are short single-line tokens; the server checks the provider's own format. */

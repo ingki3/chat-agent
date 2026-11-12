@@ -83,6 +83,21 @@ export const conversations = sqliteTable(
     revision: integer("revision").notNull().default(0),
     /** "자료 조사 모드" toggle (FR-5.5): runs in this conversation get the research instructions (#20). */
     researchMode: integer("research_mode", { mode: "boolean" }).notNull().default(false),
+    /**
+     * What the next message is answered with (#19, `ChatSettings`): set at creation from the user's defaults (FR-12.6
+     * fallback applied) and changed only by the chip, so a change of the defaults never reaches an existing
+     * conversation (FR-12.5). Null runtime: none was usable yet — the first message resolves it again.
+     */
+    runtime: text("runtime"),
+    model: text("model"),
+    effort: text("effort"),
+    useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
+    /** `{ runtime, model }` JSON while the "기본값을 쓸 수 없어 ○○로 시작했어요" notice has not been shown yet. */
+    fallbackNotice: text("fallback_notice", { mode: "json" }).$type<{
+      runtime: string;
+      model: string;
+      limitedUntil?: number;
+    }>(),
     /** Next message sequence number (per conversation, monotonically increasing). */
     nextSeq: integer("next_seq").notNull().default(1),
     createdAt: integer("created_at").notNull().default(now),
@@ -378,6 +393,26 @@ export const connections = sqliteTable(
     index("connections_owner_idx").on(t.ownerId),
     index("connections_scope_runtime_idx").on(t.scope, t.runtime),
   ],
+);
+
+/**
+ * Usage limits of a connection (#19, FR-9.2, FR-12.6), one row per scope (`ConnectionLimit` in @agentlee/shared:
+ * `all`, `family:<name>`, `model:<id>`). New conversations do not start on a model a limit covers until `until`.
+ * The connection's status stays `passed` (a limit is not an expiry). `recorded_at`: when the provider refused it —
+ * only a reply that *started* after it (on a model in its scope), a passed test started after it, or a new
+ * credential ends it early; an older run finishing late proves nothing.
+ */
+export const connectionLimits = sqliteTable(
+  "connection_limits",
+  {
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => connections.id, { onDelete: "cascade" }),
+    scope: text("scope").notNull(),
+    until: integer("until").notNull(),
+    recordedAt: integer("recorded_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.connectionId, t.scope] })],
 );
 
 /**

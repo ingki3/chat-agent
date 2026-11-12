@@ -167,6 +167,28 @@ describe("Claude adapter (#15): event translation", () => {
     expect(await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected"), sdk.result()])).toContainEqual(
       expect.objectContaining({ type: "limit" }),
     );
+    // The reset time (seconds since the epoch in the SDK) is passed on in ms (#19); without one, none.
+    expect(
+      await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected", 1_800_000_000), sdk.result()]),
+    ).toContainEqual(expect.objectContaining({ type: "limit", resetsAt: 1_800_000_000_000 }));
+    expect(
+      (await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected"), sdk.result()])).find(
+        (e) => e.type === "limit",
+      ),
+    ).not.toHaveProperty("resetsAt");
+    // A model-specific window limits only that family; the plan's own windows the whole connection (#19).
+    const opus = (
+      await run([
+        sdk.init({ session: "s" }),
+        sdk.rateLimit("rejected", undefined, "seven_day_opus"),
+        sdk.result(),
+      ])
+    ).find((e) => e.type === "limit");
+    expect(opus).toMatchObject({ modelFamily: "opus" });
+    const plan = (
+      await run([sdk.init({ session: "s" }), sdk.rateLimit("rejected", undefined, "five_hour"), sdk.result()])
+    ).find((e) => e.type === "limit");
+    expect(plan).not.toHaveProperty("modelFamily");
     expect(
       (await run([sdk.init({ session: "s" }), sdk.rateLimit("allowed"), sdk.result()])).some(
         (e) => e.type === "limit",

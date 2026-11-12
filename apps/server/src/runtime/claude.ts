@@ -450,7 +450,19 @@ export class ClaudeAdapter implements RuntimeAdapter {
           }
           if (m.type === "rate_limit_event" && m.rate_limit_info.status === "rejected") {
             limited = true;
-            yield { type: "limit", code: "rate_limit", message: "Claude 사용 한도에 도달했어요." };
+            // The SDK's reset time is in seconds since the epoch; only a plain number is taken. A model-specific
+            // window (`seven_day_opus`, `seven_day_sonnet`) limits only that family (#19).
+            const at = m.rate_limit_info.resetsAt;
+            const family = /^seven_day_(opus|sonnet|haiku)$/.exec(m.rate_limit_info.rateLimitType ?? "")?.[1];
+            yield {
+              type: "limit",
+              code: "rate_limit",
+              message: "Claude 사용 한도에 도달했어요.",
+              ...(typeof at === "number" && Number.isFinite(at) && at > 0
+                ? { resetsAt: at < 1e12 ? at * 1000 : at }
+                : {}),
+              ...(family ? { modelFamily: family } : {}),
+            };
             return;
           }
           if (m.type === "result") {
