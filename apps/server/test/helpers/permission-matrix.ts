@@ -127,6 +127,7 @@ async function uploaded(f: Family) {
   const row = await f.app.files!.add({
     userId: f.users.owner.id,
     conversationId: c.id,
+    uploadId: crypto.randomUUID(),
     name: "메모.txt",
     kind: "txt",
     bytes: 11,

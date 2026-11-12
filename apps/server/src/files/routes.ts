@@ -6,6 +6,7 @@ import {
   FILE_ERRORS,
   FILE_LIMITS,
   FILE_NAME_HEADER,
+  UPLOAD_ID_HEADER,
   fileKindOf,
   type FileError,
   type FileKind,
@@ -16,7 +17,7 @@ import { RAW_HEADERS } from "../artifacts/routes.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
-import { FileLimitError, toUploadedFile, type FileStore } from "./store.js";
+import { FileLimitError, toUploadedFile, UPLOAD_ID, UploadCancelledError, type FileStore } from "./store.js";
 
 /** Resource kind of one uploaded file: its uploader only (family sharing, #29, gets its own projection). */
 export const FILE_KIND = "file";
@@ -41,6 +42,7 @@ const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
   file_type_mismatch: 415,
   file_empty: 400,
   file_attached: 409,
+  upload_cancelled: 409,
   invalid_request: 400,
 };
 
@@ -201,6 +203,10 @@ export function registerFileRoutes(
         if (type !== "application/octet-stream") return refuse("invalid_request");
         const name = decodeName(req.headers[FILE_NAME_HEADER]);
         if (!name) return refuse("invalid_request");
+        const uploadId = String(req.headers[UPLOAD_ID_HEADER] ?? "");
+        if (!UPLOAD_ID.test(uploadId)) return refuse("invalid_request");
+        // Cancelled before it was even sent: nothing is read.
+        if (store.isCancelled(userId, uploadId)) return refuse("upload_cancelled");
         const kind = fileKindOf(name);
         if (!kind) return refuse("file_type_unsupported");
         const declared = Number(req.headers["content-length"] ?? NaN);
@@ -222,11 +228,15 @@ export function registerFileRoutes(
           if (got.bytes === 0) return refuse("file_empty", false);
           if (!contentMatches(tmp, kind)) return refuse("file_type_mismatch", false);
           try {
-            const row = await store.add({ userId, conversationId, name, kind, ...got, tmp });
+            const row = await store.add({ userId, conversationId, uploadId, name, kind, ...got, tmp });
             done("file_ok", "info");
             return reply.code(201).header("Cache-Control", "no-store").send(toUploadedFile(row));
           } catch (e) {
             if (e instanceof FileLimitError) return refuse("too_many_files", false);
+            if (e instanceof UploadCancelledError) return refuse("upload_cancelled", false);
+            // The same upload id twice (unique per user): a client error.
+            if ((e as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE")
+              return refuse("invalid_request", false);
             // The conversation went while the file was coming in (its foreign key).
             if ((e as { code?: unknown }).code === "SQLITE_CONSTRAINT_FOREIGNKEY")
               return reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
@@ -264,6 +274,19 @@ export function registerFileRoutes(
         .header("Content-Length", String(f.bytes))
         .type(f.mediaType)
         .send(fs.createReadStream("", { fd, autoClose: true }));
+    },
+  );
+
+  // Cancel by the client's upload id (review #102 6차): the caller's own uploads only — the id is looked up among
+  // them, so another user's id is just "nothing there" (and is remembered as cancelled for the caller alone).
+  app.delete<{ Params: { uploadId: string } }>(
+    "/api/uploads/:uploadId",
+    { config: { noResource: "the caller's own upload id, looked up among the caller's files only" } },
+    async (req, reply) => {
+      if (!UPLOAD_ID.test(req.params.uploadId)) return fail(reply, "invalid_request");
+      const r = await store.cancelUpload(req.ctx.user!.id, req.params.uploadId);
+      if (r === "attached") return fail(reply, "file_attached");
+      return reply.header("Cache-Control", "no-store").send({ ok: true });
     },
   );
 

@@ -19,6 +19,7 @@ import {
   ArtifactListResponse,
   MyArtifactsResponse,
   FILE_NAME_HEADER,
+  UPLOAD_ID_HEADER,
   FileListResponse,
   UploadedFile,
   AdminUser,
@@ -469,12 +470,16 @@ export const errorText = (e: unknown) =>
 
 /** Uploads (#22): one file per request, the raw bytes as the body and the name in a header. */
 export const files = {
-  upload: async (conversationId: string, file: File) =>
+  /** `uploadId`: the client's id for this upload (a fresh UUID), so it can be cancelled before it is known. */
+  upload: async (conversationId: string, file: File, uploadId: string) =>
     UploadedFile.parse(
       await call("POST", `/api/conversations/${enc(conversationId)}/files`, file, {
         [FILE_NAME_HEADER]: encodeURIComponent(file.name),
+        [UPLOAD_ID_HEADER]: uploadId,
       }),
     ),
+  /** Cancels an upload on the server by its upload id — under way, stored or not yet arrived (review #102 6차). */
+  cancelUpload: async (uploadId: string) => call("DELETE", `/api/uploads/${enc(uploadId)}`),
   list: async (conversationId: string) =>
     FileListResponse.parse(await call("GET", `/api/conversations/${enc(conversationId)}/files`)).items,
   remove: async (id: string) => call("DELETE", `/api/files/${enc(id)}`),

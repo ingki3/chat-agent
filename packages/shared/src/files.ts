@@ -82,11 +82,18 @@ export const FILE_ERRORS = [
   "file_type_mismatch",
   "file_empty",
   "file_attached",
+  "upload_cancelled",
 ] as const;
 export type FileError = (typeof FILE_ERRORS)[number];
 
 /** Header that carries the file name of an upload, percent-encoded UTF-8 (the body is the raw bytes). */
 export const FILE_NAME_HEADER = "x-file-name";
+/**
+ * Header with the upload's own id (a UUID the client makes before it sends anything, review #102 6차): the client
+ * can cancel it on the server (`DELETE /api/uploads/:uploadId`) before it knows the file's id — whether the upload
+ * is still under way or already stored.
+ */
+export const UPLOAD_ID_HEADER = "x-upload-id";
 
 /** One uploaded file as the API returns it. */
 export const UploadedFile = z.object({
@@ -94,6 +101,8 @@ export const UploadedFile = z.object({
   conversationId: z.string(),
   /** The user message it was sent with; null while it is only in the composer. */
   messageId: z.string().nullable(),
+  /** The client's upload id (`UPLOAD_ID_HEADER`). */
+  uploadId: z.string().nullable(),
   name: z.string(),
   kind: FileKind,
   mediaType: z.string(),

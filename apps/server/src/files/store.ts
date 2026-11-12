@@ -24,6 +24,19 @@ export class StoreLinkError extends Error {
   }
 }
 
+/** The uploader cancelled this upload (`DELETE /api/uploads/:uploadId`) before it was stored: nothing is kept. */
+export class UploadCancelledError extends Error {
+  constructor() {
+    super("upload_cancelled");
+    this.name = "UploadCancelledError";
+  }
+}
+
+/** How long a cancel is remembered for an upload that has not arrived (longer than any upload can take). */
+const CANCEL_TTL_MS = 6 * 3600_000;
+/** Client upload ids: UUIDs (any version), lower case. */
+export const UPLOAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export class FileLimitError extends Error {
   constructor() {
     super("too_many_files");
@@ -43,6 +56,7 @@ export function toUploadedFile(f: FileRow): UploadedFile {
     id: f.id,
     conversationId: f.conversationId,
     messageId: f.messageId ?? null,
+    uploadId: f.uploadId ?? null,
     // Stored scrubbed; scrubbed again for secrets registered since (round 25).
     name: scrubKnown(f.name),
     kind: f.kind,
@@ -89,6 +103,11 @@ export type FileStoreOptions = {
 export class FileStore {
   readonly paths: StoragePaths;
   private readonly now: () => number;
+  /**
+   * Cancelled uploads (`<user>/<upload id>` → when), review #102 6차: a cancel can come before, during or after the
+   * upload itself. Remembered in memory only — an upload under way does not survive a restart either.
+   */
+  private readonly cancelled = new Map<string, number>();
 
   constructor(
     private readonly db: Db,
@@ -197,6 +216,7 @@ export class FileStore {
   async add(input: {
     userId: string;
     conversationId: string;
+    uploadId: string;
     name: string;
     kind: FileKind;
     bytes: number;
@@ -209,6 +229,7 @@ export class FileStore {
       userId: input.userId,
       conversationId: input.conversationId,
       messageId: null,
+      uploadId: input.uploadId,
       // Known secrets never reach a stored row (round 26); the rescrub covers ones registered later.
       name: scrubKnown(cleanName(input.name)) || "file",
       kind: input.kind,
@@ -218,6 +239,12 @@ export class FileStore {
       createdAt: this.now(),
     };
     return this.lock.write(() => {
+      // Cancelled while it came in: discarded here, in the same synchronous step that would store it — a cancel
+      // either finds the row (and deletes it) or is found here.
+      if (this.isCancelled(row.userId, input.uploadId)) {
+        fs.rmSync(input.tmp, { force: true });
+        throw new UploadCancelledError();
+      }
       const dir = this.storeDir(row.userId, row.conversationId, true);
       if (!dir) throw new StoreLinkError();
       const dest = path.join(dir, row.id);
@@ -228,15 +255,16 @@ export class FileStore {
         added =
           this.db.$client
             .prepare(
-              `INSERT INTO files (id, user_id, conversation_id, message_id, name, kind, media_type, bytes, sha256,
-                 created_at)
-               SELECT ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?
+              `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
+                 sha256, created_at)
+               SELECT ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?
                WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
             )
             .run(
               row.id,
               row.userId,
               row.conversationId,
+              row.uploadId,
               row.name,
               row.kind,
               row.mediaType,
@@ -271,6 +299,8 @@ export class FileStore {
       .where(and(inArray(files.id, ids), eq(files.conversationId, conversationId), isNull(files.messageId)))
       .all();
     if (rows.length !== ids.length) throw new AttachmentError();
+    // Never a cancelled upload's file, however the client came to name it (review #102 6차).
+    if (rows.some((r) => r.uploadId && this.isCancelled(r.userId, r.uploadId))) throw new AttachmentError();
     const byId = new Map(rows.map((r) => [r.id, r]));
     return ids.map((id) => ({ type: "file_ref" as const, fileId: id, name: byId.get(id)!.name }));
   }
@@ -294,6 +324,34 @@ export class FileStore {
       .set({ messageId: to })
       .where(and(eq(files.conversationId, conversationId), eq(files.messageId, from)))
       .run();
+  }
+
+  isCancelled(userId: string, uploadId: string): boolean {
+    return this.cancelled.has(`${userId}/${uploadId}`);
+  }
+
+  /**
+   * Cancels an upload by the client's id (review #102 6차), wherever it is: not arrived or still coming in (it is
+   * discarded when it would be stored), or stored and unsent (deleted now). "attached" when it already went with
+   * a message (nothing changes).
+   */
+  async cancelUpload(userId: string, uploadId: string): Promise<"cancelled" | "attached"> {
+    return this.lock.write(() => {
+      const t = this.now();
+      for (const [k, at] of this.cancelled) if (t - at > CANCEL_TTL_MS) this.cancelled.delete(k);
+      const row = this.db
+        .select()
+        .from(files)
+        .where(and(eq(files.userId, userId), eq(files.uploadId, uploadId)))
+        .get();
+      if (row?.messageId) return "attached";
+      this.cancelled.set(`${userId}/${uploadId}`, t);
+      if (row) {
+        this.db.delete(files).where(eq(files.id, row.id)).run();
+        this.unlinkAndPrune(row);
+      }
+      return "cancelled";
+    });
   }
 
   /** Removes an unsent file (the composer's ✕): its row, then its bytes. False when it was already sent. */

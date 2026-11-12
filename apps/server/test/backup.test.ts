@@ -269,6 +269,7 @@ describe("rehearsal: restore into a separate folder with the recovered key (#37 
         [CSRF_HEADER]: "1",
         "content-type": "application/octet-stream",
         "x-file-name": encodeURIComponent("리허설.txt"),
+        "x-upload-id": crypto.randomUUID(),
       },
       payload: "UPLOADED-BYTES",
     });

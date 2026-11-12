@@ -180,7 +180,7 @@ test("a chip removed while it uploads: the file is deleted as soon as the upload
   const c = await openChat(page, baseURL!, SON, "업로드 중 빼기");
   let deletes = 0;
   page.on("request", (r) => {
-    if (r.method() === "DELETE" && /^\/api\/files\//.test(new URL(r.url()).pathname)) deletes++;
+    if (r.method() === "DELETE" && /^\/api\/uploads\//.test(new URL(r.url()).pathname)) deletes++;
   });
   // The server stores the file at once; its answer reaches the page only later.
   let answered!: () => void;
@@ -259,6 +259,7 @@ test("20 unsent files restored, one removed: its place is free for a new one", a
         ...csrf(baseURL!),
         "content-type": "application/octet-stream",
         "x-file-name": encodeURIComponent(`${i + 1}.txt`),
+        "x-upload-id": crypto.randomUUID(),
       },
       data: Buffer.from(`file ${i}`),
     });
@@ -458,7 +459,7 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
     await bGo.p;
     await route.fulfill({ response: await route.fetch() });
   });
-  await page.route(/\/api\/files\/[^/]+$/, async (route) => {
+  await page.route(/\/api\/uploads\/[^/]+$/, async (route) => {
     if (route.request().method() !== "DELETE") return route.fallback();
     deletes++;
     delSeen.open();
@@ -538,4 +539,86 @@ test("a send refused for a file that is gone drops that chip; the next send goes
   await expect(chips(page)).toHaveCount(0);
   await page.getByRole("button", { name: "보내기" }).click();
   await expect(page.getByTestId("user-message").filter({ hasText: "첫 시도" })).toHaveCount(1);
+});
+
+test("review order 6: B stored, its answer held, the new page lists it, the next send goes, then B answers", async ({
+  page,
+}) => {
+  await useAccount(page, SON);
+  await page.goto("/");
+  await page
+    .getByTestId("file-input")
+    .setInputFiles([{ name: "A.txt", mimeType: "text/plain", buffer: Buffer.from("a") }]);
+  await expect(chips(page).first()).toHaveAttribute("data-status", "done");
+  const sendHeld = gate();
+  const bStored = gate();
+  const bAnswer = gate();
+  const cancelSeen = gate();
+  const cancelGo = gate();
+  let first = true;
+  const lists: number[] = [];
+  await page.route(/\/api\/conversations\/[^/]+\/messages$/, async (route) => {
+    if (route.request().method() !== "POST" || !first) return route.fallback();
+    first = false;
+    const response = await route.fetch();
+    await sendHeld.p;
+    await route.fulfill({ response });
+  });
+  await page.route(/\/api\/conversations\/[^/]+\/files$/, async (route) => {
+    const req = route.request();
+    if (req.method() === "GET") {
+      const response = await route.fetch();
+      const body = (await response.json()) as { items: { name: string }[] };
+      lists.push(body.items.filter((f) => f.name === "B.txt").length);
+      return route.fulfill({ response });
+    }
+    if (req.headers()["x-file-name"] !== "B.txt") return route.fallback();
+    // B is stored on the server; the page hears about it only at the very end.
+    const response = await route.fetch();
+    bStored.open();
+    await bAnswer.p;
+    await route.fulfill({ response });
+  });
+  await page.route(/\/api\/uploads\/[^/]+$/, async (route) => {
+    cancelSeen.open();
+    await cancelGo.p;
+    await route.fulfill({ response: await route.fetch() });
+  });
+  await page.getByLabel("메시지 입력").fill("A만");
+  await page.getByLabel("메시지 입력").press("Enter");
+  await page
+    .getByTestId("file-input")
+    .setInputFiles([{ name: "B.txt", mimeType: "text/plain", buffer: Buffer.from("b") }]);
+  await bStored.p;
+  await chips(page).filter({ hasText: "B.txt" }).getByRole("button", { name: /빼기/ }).click();
+  await cancelSeen.p;
+  const listed = page.waitForResponse((r) => r.request().method() === "GET" && isFiles(r.url()));
+  sendHeld.open();
+  await expect(page).toHaveURL(/\/c\//);
+  await listed;
+  // The new page's list has B (stored, cancel not through yet) — no chip for it.
+  expect(lists.at(-1)).toBe(1);
+  await expect(chips(page)).toHaveCount(0);
+  await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
+  await page.getByLabel("메시지 입력").fill("다음");
+  await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
+  await page.getByRole("button", { name: "보내기" }).click();
+  const next = page.getByTestId("user-message").filter({ hasText: "다음" });
+  await expect(next).toHaveCount(1);
+  await expect(next.getByTestId("file-ref")).toHaveCount(0);
+  cancelGo.open();
+  bAnswer.open();
+  // B is gone from the server: never attached, deleted by its upload id.
+  const id = new URL(page.url()).pathname.split("/").pop()!;
+  await expect
+    .poll(async () => {
+      const r = (await (await page.request.get(`/api/conversations/${id}/files`)).json()) as {
+        items: { name: string }[];
+      };
+      return r.items.map((f) => f.name);
+    })
+    .toEqual(["A.txt"]);
+  await expect(chips(page)).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.unrouteAll({ behavior: "ignoreErrors" });
 });

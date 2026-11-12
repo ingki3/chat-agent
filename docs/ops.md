@@ -883,7 +883,8 @@ PRD FR-4.1·4.2·4.6. 방식과 근거는 `docs/decisions/isolation.md` "파일 
   - 크기: `Content-Length`가 50MB를 넘으면 본문을 받기 전에 413. 길이를 밝히지 않은 요청(chunked)은 받으면서 세다가 50MB를 넘는 순간 읽기를 멈추고 413을 보낸 뒤 연결을 닫는다. 본문은 메모리에 모으지 않고 `uploads-tmp/`의 임시 파일로 바로 쓴다(그 파일도 50MB를 넘지 않는다).
   - 개수: 받기 전에 한 번(빠른 거절), 그리고 행을 넣는 문장 자체가 `개수 < 20`일 때만 넣는다(한 SQL 문) — 동시에 21개를 올려도 20개만 남는다(시험).
   - 형식: 확장자로 고른 형식과 **내용(매직 바이트)** 이 같아야 한다. 확장자를 바꾼 파일(PNG를 `.pdf`로, 실행 파일을 `.txt`로, HTML을 `.md`로)은 415 `file_type_mismatch`. 이 판별은 최선일 뿐이다(두 형식을 겸한 파일은 지날 수 있다) — 무엇이든 항상 내려받기로만 나가므로(24.3절) 브라우저에서 실행되지 않는다.
-- **오류 코드**: 413 `file_too_large`, 409 `too_many_files`, 415 `file_type_unsupported`·`file_type_mismatch`, 400 `file_empty`·`invalid_request`, 보낸 파일 지우기 409 `file_attached`, 메시지에 없는 파일을 붙임 400 `invalid_attachment`.
+- **취소**: 입력창 칩의 ✕는 업로드 id로 서버에서 취소한다(`DELETE /api/uploads/:uploadId`) — 올리는 중이든, 저장됐든, 아직 서버에 닿지 않았든. 취소한 업로드는 저장되지 않거나 지워지고, 메시지에 실리지 않는다.
+- **오류 코드**: 413 `file_too_large`, 409 `too_many_files`, 415 `file_type_unsupported`·`file_type_mismatch`, 400 `file_empty`·`invalid_request`, 보낸 파일 지우기·취소 409 `file_attached`, 취소된 업로드 409 `upload_cancelled`, 메시지에 없는 파일을 붙임 400 `invalid_attachment`.
 
 ### 24.2 어디에, 어떻게
 - 바이트: `files/<사용자 id>/<대화 id>/<파일 id>`(모두 서버가 만든 id). 사용자가 붙인 파일 이름은 경로에 쓰지 않는다 — DB `files.name`에만 있고, 보여 줄 때와 내려받을 때(`Content-Disposition`)만 쓴다.

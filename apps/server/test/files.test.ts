@@ -103,6 +103,7 @@ function upload(
       cookie,
       "content-type": "application/octet-stream",
       "x-file-name": encodeURIComponent(name),
+      "x-upload-id": crypto.randomUUID(),
       ...headers,
     },
     payload: body,
@@ -317,6 +318,7 @@ describe("upload (FR-4.1·4.6, #22 완료 기준)", () => {
         cookie: f.cookies.owner,
         "content-type": "application/octet-stream",
         "x-file-name": "big.txt",
+        "x-upload-id": crypto.randomUUID(),
         "content-length": String(51 * MB),
       },
     });
@@ -363,6 +365,7 @@ describe("upload (FR-4.1·4.6, #22 완료 기준)", () => {
             cookie: f.cookies.owner,
             "content-type": "application/octet-stream",
             "x-file-name": "big.txt",
+            "x-upload-id": crypto.randomUUID(),
             "transfer-encoding": "chunked",
           },
         });
@@ -488,6 +491,7 @@ describe("upload (FR-4.1·4.6, #22 완료 기준)", () => {
         cookie: f.cookies.owner,
         "content-type": "application/octet-stream",
         "x-file-name": "a.txt",
+        "x-upload-id": crypto.randomUUID(),
       },
       payload: "x",
     });
@@ -959,5 +963,98 @@ describe("review #102 round 2: editing keeps the attachments", () => {
     expect(plainEdit.json<{ message: { parts: unknown[] } }>().message.parts).toEqual([
       { type: "text", text: "여전히 없음" },
     ]);
+  });
+});
+
+describe("review #102 round 6: cancel by upload id on the server", () => {
+  const cancel = (app: App, cookie: string, uploadId: string) =>
+    app.inject({ method: "DELETE", url: `/api/uploads/${uploadId}`, headers: { ...WRITE, cookie } });
+
+  it("cancelled before, during or after the upload: nothing is kept; an attached one is 409", async () => {
+    let hold: (() => Promise<void>) | undefined;
+    const { app, f, dataDir } = await newApp({ extra: { files: { beforeCommit: async () => hold?.() } } });
+    const conv = app.conversations!.create(f.users.owner.id);
+    const up = (uploadId: string, name = "a.txt") =>
+      upload(app, f.cookies.owner, conv.id, name, "bytes", { "x-upload-id": uploadId });
+    // Before: refused without reading the body.
+    const early = crypto.randomUUID();
+    expect((await cancel(app, f.cookies.owner, early)).statusCode).toBe(200);
+    const r1 = await up(early);
+    expect(r1.statusCode).toBe(409);
+    expect(r1.json()).toEqual({ error: "upload_cancelled" });
+    // During: received and checked, cancelled right before it would be stored.
+    const during = crypto.randomUUID();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let arrived!: () => void;
+    const there = new Promise<void>((r) => (arrived = r));
+    hold = async () => {
+      arrived();
+      await held;
+    };
+    const pending = up(during);
+    await there;
+    hold = undefined;
+    expect((await cancel(app, f.cookies.owner, during)).statusCode).toBe(200);
+    release();
+    const r2 = await pending;
+    expect(r2.statusCode).toBe(409);
+    expect(r2.json()).toEqual({ error: "upload_cancelled" });
+    // After: stored, then cancelled — the row and the bytes go.
+    const after = crypto.randomUUID();
+    const r3 = await up(after);
+    expect(r3.statusCode).toBe(201);
+    const stored = r3.json<UploadedFile>();
+    expect(stored.uploadId).toBe(after);
+    expect((await cancel(app, f.cookies.owner, after)).statusCode).toBe(200);
+    expect(app.files!.get(stored.id)).toBeUndefined();
+    expect(app.files!.list(conv.id)).toEqual([]);
+    expect(fs.existsSync(path.join(dataDir, "files", f.users.owner.id))).toBe(false);
+    // Attached: stays, 409.
+    const sentId = crypto.randomUUID();
+    const r4 = (await up(sentId)).json<UploadedFile>();
+    const send = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { ...WRITE, cookie: f.cookies.owner, "idempotency-key": crypto.randomUUID() },
+      payload: { text: "보냄", fileIds: [r4.id] },
+    });
+    expect(send.statusCode).toBe(201);
+    const late = await cancel(app, f.cookies.owner, sentId);
+    expect(late.statusCode).toBe(409);
+    expect(late.json()).toEqual({ error: "file_attached" });
+    expect(app.files!.get(r4.id)).toBeDefined();
+    // Another user cannot cancel the owner's upload (the id is looked up among the caller's own files).
+    const other = crypto.randomUUID();
+    const r5 = (await up(other)).json<UploadedFile>();
+    expect((await cancel(app, f.cookies.stranger, other)).statusCode).toBe(200);
+    expect(app.files!.get(r5.id)).toBeDefined();
+    // The id must be a UUID; the same id twice is refused.
+    expect((await cancel(app, f.cookies.owner, "not-an-id")).statusCode).toBe(400);
+    expect((await up("not-an-id")).statusCode).toBe(400);
+    expect((await up(other, "again.txt")).statusCode).toBe(400);
+  });
+
+  it("a send naming a cancelled upload's file is refused, even if its row were still there", async () => {
+    const { app, f } = await newApp();
+    const conv = app.conversations!.create(f.users.owner.id);
+    const uploadId = crypto.randomUUID();
+    const a = (
+      await upload(app, f.cookies.owner, conv.id, "a.txt", "a", { "x-upload-id": uploadId })
+    ).json<UploadedFile>();
+    // The guard on its own: the upload marked cancelled while its row is (still) there.
+    (app.files as unknown as { cancelled: Map<string, number> }).cancelled.set(
+      `${f.users.owner.id}/${uploadId}`,
+      Date.now(),
+    );
+    const send = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { ...WRITE, cookie: f.cookies.owner, "idempotency-key": crypto.randomUUID() },
+      payload: { text: "보냄", fileIds: [a.id] },
+    });
+    expect(send.statusCode).toBe(400);
+    expect(send.json()).toEqual({ error: "invalid_attachment" });
+    expect(app.files!.get(a.id)!.messageId).toBeNull();
   });
 });

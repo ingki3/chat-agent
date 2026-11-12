@@ -3,6 +3,7 @@ CREATE TABLE `files` (
 	`user_id` text NOT NULL,
 	`conversation_id` text NOT NULL,
 	`message_id` text,
+	`upload_id` text,
 	`name` text NOT NULL,
 	`kind` text NOT NULL,
 	`media_type` text NOT NULL,
@@ -14,4 +15,5 @@ CREATE TABLE `files` (
 	FOREIGN KEY (`message_id`) REFERENCES `messages`(`id`) ON UPDATE no action ON DELETE set null
 );
 --> statement-breakpoint
-CREATE INDEX `files_conversation_idx` ON `files` (`conversation_id`,`created_at`);
+CREATE INDEX `files_conversation_idx` ON `files` (`conversation_id`,`created_at`);--> statement-breakpoint
+CREATE UNIQUE INDEX `files_user_upload_idx` ON `files` (`user_id`,`upload_id`);

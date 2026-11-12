@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "f7c181e0-1f84-41bd-90c5-47967d5d1702",
+  "id": "93f4c74c-b451-402c-915b-b4bd5e41bff1",
   "prevId": "97aa31d6-615e-4713-9165-05067c912e37",
   "tables": {
     "artifact_versions": {
@@ -838,6 +838,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "upload_id": {
+          "name": "upload_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "name": {
           "name": "name",
           "type": "text",
@@ -886,6 +893,11 @@
           "name": "files_conversation_idx",
           "columns": ["conversation_id", "created_at"],
           "isUnique": false
+        },
+        "files_user_upload_idx": {
+          "name": "files_user_upload_idx",
+          "columns": ["user_id", "upload_id"],
+          "isUnique": true
         }
       },
       "foreignKeys": {

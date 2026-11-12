@@ -14,6 +14,8 @@ export type Attachment = {
   bytes: number;
   status: "uploading" | "done" | "failed";
   error?: string;
+  /** The client's id for the upload (sent with it): cancelling by it works before the file's id is known. */
+  uploadId?: string;
   file?: UploadedFile;
 };
 
@@ -33,11 +35,14 @@ export function precheck(file: File, taken: number): string | undefined {
 let seq = 0;
 
 /**
- * Files this browser session has cancelled or removed (review #102 5차), shared by every composer: a composer that
- * mounts later (the new chat's conversation page) never brings one back, even if the server list it got was read
- * before the DELETE finished, and a send never carries one.
+ * Uploads this browser session has cancelled or removed, by upload id (review #102 5·6차), shared by every composer:
+ * known from the moment the upload starts, so a composer that mounts later (the new chat's conversation page) never
+ * brings one back — whatever order the upload, the cancel and its list read finish in — and a send never carries
+ * one. The server refuses them too (FileStore.refs).
  */
 const discarded = new Set<string>();
+/** A file's key in `discarded`: its upload id (files from before upload ids: the file id). */
+const discardKey = (f: UploadedFile) => f.uploadId ?? f.id;
 
 /**
  * `conversation()`: the conversation to upload to (the new-chat screen makes one on the first file);
@@ -55,11 +60,11 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
   const seen = useRef(new Set<string>());
   /** Server files deleted from here: no longer counted, even before the server list is fetched again. */
   const gone = useRef(new Set<string>());
-  /** Chips removed while their upload was still under way. */
-  const cancelled = useRef(new Set<string>());
+  /** Chips removed while their upload was still under way, with their cancel request. */
+  const cancelled = useRef(new Map<string, Promise<unknown>>());
   useEffect(() => {
     const back = existing.filter(
-      (f) => f.messageId === null && !seen.current.has(f.id) && !discarded.has(f.id),
+      (f) => f.messageId === null && !seen.current.has(f.id) && !discarded.has(discardKey(f)),
     );
     if (!back.length) return;
     for (const f of back) seen.current.add(f.id);
@@ -91,7 +96,7 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
           name: file.name,
           bytes: file.size,
           status: error ? "failed" : "uploading",
-          ...(error ? { error } : {}),
+          ...(error ? { error } : { uploadId: crypto.randomUUID() }),
         };
         if (!error) taken++;
         next.push({ a, file });
@@ -102,15 +107,15 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
         void (async () => {
           try {
             const id = await conversation();
-            const uploaded = await filesApi.upload(id, file);
+            const uploaded = await filesApi.upload(id, file, a.uploadId!);
             seen.current.add(uploaded.id);
-            // Removed while it was uploading: the upload is not aborted (an aborted request may still have been
-            // stored, and then its id would be lost) — it is deleted as soon as it is known, and the list is
-            // fetched again only after the delete (review #102 5차: never before — a composer elsewhere would
-            // restore it).
-            if (cancelled.current.delete(a.key)) {
-              discarded.add(uploaded.id);
-              await filesApi.remove(uploaded.id).catch(() => undefined);
+            // Removed while it was uploading: the server was told at once, by upload id (review #102 6차) — it
+            // discards the upload, or deletes it if it was already stored. The list is fetched again once the
+            // cancel is done.
+            const cancel = cancelled.current.get(a.key);
+            if (cancel) {
+              cancelled.current.delete(a.key);
+              await cancel;
               void qc.invalidateQueries({ queryKey: ["files", id] });
               return;
             }
@@ -120,6 +125,7 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
             void qc.invalidateQueries({ queryKey: ["files", id] });
             patch(a.key, { status: "done", file: uploaded });
           } catch (e) {
+            // Cancelled (the server answers `upload_cancelled`) or failed after the chip went: nothing to show.
             if (cancelled.current.delete(a.key)) return;
             patch(a.key, { status: "failed", error: errorText(e) });
           }
@@ -132,17 +138,22 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
   const remove = useCallback((key: string) => {
     const a = itemsRef.current.find((x) => x.key === key);
     setItems((xs) => xs.filter((x) => x.key !== key));
-    if (a?.status === "uploading") cancelled.current.add(key);
-    // An uploaded, unsent file is removed on the server too (a failed delete just leaves it in the conversation;
-    // it comes back as a chip on the next visit).
-    // A removed file frees its place in the 20 once the server has deleted it (review 2).
-    const id = a?.file?.id;
-    if (id) discarded.add(id);
-    if (id)
-      void filesApi
-        .remove(id)
-        .then(() => gone.current.add(id))
-        .catch(() => undefined);
+    if (!a || a.status === "failed") return;
+    // Cancelled on the server by upload id, whether the upload is under way, stored or not yet arrived (review #102
+    // 6차); a file from before upload ids by its file id. A failed cancel just leaves the file in the conversation
+    // (it comes back as a chip on the next visit). A removed file frees its place in the 20 once the server has
+    // cancelled it (review 2).
+    const uploadId = a.uploadId ?? a.file?.uploadId ?? undefined;
+    const fileId = a.file?.id;
+    const key2 = uploadId ?? fileId;
+    if (!key2) return;
+    discarded.add(key2);
+    const request = (uploadId ? filesApi.cancelUpload(uploadId) : filesApi.remove(fileId!))
+      .then(() => {
+        if (fileId) gone.current.add(fileId);
+      })
+      .catch(() => undefined);
+    if (a.status === "uploading") cancelled.current.set(key, request);
   }, []);
 
   /**
@@ -167,7 +178,7 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
   const uploading = items.some((x) => x.status === "uploading");
   // Never a file this session has discarded (a chip restored from a list read before its delete finished).
   const ready = items.flatMap((x) =>
-    x.status === "done" && x.file && !discarded.has(x.file.id) ? [x.file.id] : [],
+    x.status === "done" && x.file && !discarded.has(discardKey(x.file)) ? [x.file.id] : [],
   );
   return { items, add, remove, sent, reconcile, uploading, ready };
 }

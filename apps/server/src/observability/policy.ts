@@ -238,6 +238,7 @@ export const FILE_CODES = set([
   "file_type_mismatch",
   "file_empty",
   "file_attached",
+  "upload_cancelled",
 ]);
 export const isFileCode = member(FILE_CODES);
 

@@ -705,6 +705,8 @@ export const files = sqliteTable(
       .notNull()
       .references(() => conversations.id, { onDelete: "cascade" }),
     messageId: text("message_id").references(() => messages.id, { onDelete: "set null" }),
+    /** The client's id for the upload (a UUID, unique per user): cancelling by it works before the file id is known. */
+    uploadId: text("upload_id"),
     name: text("name").notNull(),
     kind: text("kind", {
       enum: ["pdf", "hwp", "hwpx", "docx", "xlsx", "pptx", "csv", "txt", "md", "png", "jpg"],
@@ -715,5 +717,8 @@ export const files = sqliteTable(
     sha256: text("sha256").notNull(),
     createdAt: integer("created_at").notNull(),
   },
-  (t) => [index("files_conversation_idx").on(t.conversationId, t.createdAt)],
+  (t) => [
+    index("files_conversation_idx").on(t.conversationId, t.createdAt),
+    uniqueIndex("files_user_upload_idx").on(t.userId, t.uploadId),
+  ],
 );

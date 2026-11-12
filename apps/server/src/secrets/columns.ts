@@ -207,6 +207,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "files.user_id": ID,
   "files.conversation_id": ID,
   "files.message_id": ID,
+  "files.upload_id": { exempt: "the client's upload id, a UUID checked on upload (UPLOAD_ID_HEADER)" },
   "files.name": { write: "FileStore.add (cleanName)", rescrub: "text" },
   "files.kind": ENUM,
   "files.media_type": { exempt: "the media type of the detected kind (FILE_KINDS, server-chosen)" },
