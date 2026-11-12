@@ -9,7 +9,16 @@ import { SON, newConversation, useAccount } from "./helpers.js";
  * `doc_create` and `artifact_create` tools (fake.ts `/doc`), the reply shows the file's download chip and the
  * document artifact, and the downloaded file opens with the report's title, table and paragraph. HWP is refused
  * with a guidance message. Desktop and mobile projects.
+ *
+ * The e2e server is a production build, and production always makes documents in the macOS sandbox (the in-process
+ * test switch is refused there, docs/ops.md §29.6) — so this spec runs where that sandbox exists. Elsewhere (Linux
+ * CI) generation answers `doc_unavailable` and the spec is skipped; the same scenario runs on every platform in
+ * `apps/server/test/docgen.test.ts` (FakeRuntime and both runtimes' recorded protocols).
  */
+test.skip(
+  process.platform !== "darwin",
+  "document generation needs the macOS sandbox in a production server",
+);
 
 async function send(page: Page, text: string) {
   const box = page.getByLabel("메시지 입력");

@@ -65,7 +65,7 @@ import { registerSourceRoutes } from "./web/routes.js";
 import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
 import { DocGenService } from "./docgen/service.js";
-import { inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
+import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
 import { storagePaths } from "./storage/paths.js";
 import { isInside } from "./fs-safety.js";
 import type { Db } from "./db/client.js";
@@ -222,8 +222,8 @@ export type BuildOptions = {
   /** Uploads (#22): clock and test hooks. */
   files?: FileStoreOptions;
   /**
-   * Document generation (#49): how the worker runs. Default: sandboxed (`sandboxedDocRunner`); in the FakeRuntime
-   * mode the same worker in-process (development and e2e on machines without the macOS sandbox).
+   * Document generation (#49): how the worker runs. Default: sandboxed (`sandboxedDocRunner`); in-process only with
+   * the test switch `ISOLATION_IN_PROCESS_FOR_TESTS=1` outside production (`docRunnerKind`) or a test's own runner.
    */
   docs?: { runner?: DocRunner };
   /**
@@ -431,7 +431,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const docs = new DocGenService({
       db: opts.db!,
       files: () => app.files,
-      runner: opts.docs?.runner ?? (config.fakeRuntime ? inProcessDocRunner() : sandboxedDocRunner()),
+      runner:
+        opts.docs?.runner ??
+        (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner()),
     });
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,

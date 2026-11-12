@@ -49,10 +49,15 @@ export const DOC_LIMITS = {
   outputBytes: 25 * 1024 * 1024,
 } as const;
 
-// eslint-disable-next-line no-control-regex -- refusing control characters is the point (tab and newline allowed)
-const TEXT = /^[^\0-\x08\x0b\x0c\x0e-\x1f\x7f]*$/u;
+/**
+ * Only characters an XML 1.0 document may hold (the office formats are XML): no C0 controls but tab, line feed and
+ * carriage return, no DEL, no lone surrogate (as code points, `u` flag) and no U+FFFE / U+FFFF. Refused, never
+ * changed: the file says what was asked or is not made.
+ */
+// eslint-disable-next-line no-control-regex -- refusing control characters is the point (tab and newlines allowed)
+const TEXT = /^[^\0-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]*$/u;
 // eslint-disable-next-line no-control-regex -- a single line: no control characters at all except tab
-const LINE = /^[^\0-\x08\x0a-\x1f\x7f]*$/u;
+const LINE = /^[^\0-\x08\x0a-\x1f\x7f\ud800-\udfff\ufffe\uffff]*$/u;
 const text = (max: number = DOC_LIMITS.textChars) => z.string().max(max).regex(TEXT);
 const line = (max: number) => z.string().max(max).regex(LINE);
 

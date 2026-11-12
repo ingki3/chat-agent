@@ -47,17 +47,40 @@ export async function readPptx(buf: Buffer) {
   const names = Object.keys(zip.files)
     .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
     .sort((a, b) => Number(/(\d+)\.xml$/.exec(a)![1]) - Number(/(\d+)\.xml$/.exec(b)![1]));
-  const slides = await Promise.all(
-    names.map(async (n) => textElements(await zip.file(n)!.async("string"), "a")),
-  );
+  const xml = await Promise.all(names.map((n) => zip.file(n)!.async("string")));
+  const slides = xml.map((x) => textElements(x, "a"));
   const media = Object.keys(zip.files).filter((n) => n.startsWith("ppt/media/") && !n.endsWith("/"));
-  return { slides, media, text: slides.map((s) => s.join("\n")).join("\n") };
+  /** Per slide: the shape at `y` EMU (e.g. the body box) as its paragraphs' texts. */
+  const shapeAt = (i: number, y: number): string[] | undefined => {
+    const sp = [...xml[i]!.matchAll(/<p:sp>[\s\S]*?<\/p:sp>/g)].find((m) =>
+      new RegExp(`<a:off x="\\d+" y="${y}"/>`).test(m[0]),
+    );
+    return sp && [...sp[0].matchAll(/<a:p>[\s\S]*?<\/a:p>/g)].map((p) => textElements(p[0], "a").join(""));
+  };
+  return { slides, xml, media, shapeAt, text: slides.map((s) => s.join("\n")).join("\n") };
 }
 
 export async function readXlsx(buf: Buffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf as unknown as ArrayBuffer);
   return wb;
+}
+
+/** Every text item of a PDF with its position (pdf.js), for checks of what a page really holds. */
+export async function readPdfItems(buf: Buffer) {
+  const pdfjs = (await import(require.resolve("pdfjs-dist/legacy/build/pdf.mjs"))) as {
+    getDocument(o: object): { promise: Promise<PdfDoc>; destroy(): Promise<void> };
+  };
+  const task = pdfjs.getDocument({ data: new Uint8Array(buf), isEvalSupported: false, verbosity: 0 });
+  const doc = await task.promise;
+  const items: { str: string; x: number; y: number; page: number }[] = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const content = await (await doc.getPage(i)).getTextContent();
+    for (const it of content.items as { str?: string; transform?: number[] }[])
+      if (it.str) items.push({ str: it.str, x: it.transform![4]!, y: it.transform![5]!, page: i });
+  }
+  await task.destroy();
+  return items;
 }
 
 export async function readPdf(buf: Buffer) {

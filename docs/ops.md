@@ -1051,7 +1051,9 @@ PRD FR-4.4(HWP 대신 DOCX·PDF)·FR-4.7(에이전트가 만든 파일 내려받
 
 ### 29.4 검사와 비밀
 - **알려진 비밀(1절, 라운드 23–27):** 요청의 모든 글자(제목·부제·작성자·블록·칸·참고문헌)와 파일 이름에서 **만들기 전에** 가린다(`[숨김]`). 비밀과 같은 숫자 칸도 `[숨김]` 글자가 된다. 그 시점에 서버가 아는 비밀만 가린다 — 파일이 만들어진 뒤 등록된 비밀은 이미 만든 파일 바이트에서 지우지 않는다(업로드 파일과 같은 원칙, §24.2. 이름 열은 재가림 대상). 블록 경계를 넘어 이어 붙은 비밀(두 칸에 나눠 쓴 값)은 잡지 못한다(아티팩트와 같은 한계).
-- **다시 열기:** (1) 작업자가 만든 파일을 다시 연다 — Office는 ZIP을 풀어 본문 부분(`word/document.xml`·`xl/workbook.xml`·`ppt/presentation.xml`·첫 슬라이드)이 있고 제목 글이 있는지, DOCX는 표 개수, XLSX는 시트 개수(1 + 표 수)가 맞는지. PDF는 `%PDF-` 머리·`%%EOF`·쪽 1개 이상. (2) 서버가 업로드와 같은 형식 판별(`contentMatches`)을 한다. 둘 중 하나라도 실패하면 `doc_invalid`, 저장하지 않는다.
+- **XML에 넣을 수 없는 글자:** 모든 글자 칸은 XML 1.0 문자만 받는다 — 탭·줄바꿈·CR 밖의 C0 제어 문자, DEL, 짝 없는 서로게이트, U+FFFE·U+FFFF는 입력에서 거절(`doc_bad_input`, 바꾸지 않음).
+- **배치에서 잃는 글자 없음(리뷰 #110 1차):** PDF 표는 열 너비를 같게 하고 열이 많으면 글자를 줄이며, 한 행에 담기지 않는 칸은 줄 경계에서 잘라 이어지는 행(머리 행도)으로 나눠 다음 쪽으로 넘긴다. 나눈 조각은 pdfkit으로 다시 재고, 그래도 행이 쪽보다 높아 pdfkit이 잘라 낼 상황이면 파일을 만들지 않는다(`doc_too_large`). PPTX는 문단·목록 항목을 줄 단위로 어림해(한글 등 넓은 글자 1em, 나머지 0.6em — 실제보다 넓게) 본문 상자 높이의 90%까지 채우고 넘치면 문단 안에서도 잘라 "(계속)" 슬라이드로 잇는다. 번호 목록은 번호를 글자로 써서 이어진 슬라이드에서도 번호가 이어진다. 내용 없는 제목·마지막 제목도 자기 슬라이드를 갖고, 제목 상자에 안 들어가는 긴 제목은 본문 첫 줄로 간다.
+- **다시 열기:** (1) 작업자가 만든 파일을 다시 연다 — Office는 ZIP의 **모든 XML 부분(.xml·.rels)을 XML 1.0으로 파싱**(saxes — 잘못된 글자·깨진 구조는 거절)하고 본문 부분(`word/document.xml`·`xl/workbook.xml`·`ppt/presentation.xml`·첫 슬라이드)이 있고 제목 글이 있는지, DOCX는 표 개수, XLSX는 시트 개수(1 + 표 수)가 맞는지. PDF는 `%PDF-` 머리·`%%EOF`·쪽 1개 이상. (2) 서버가 업로드와 같은 형식 판별(`contentMatches`)을 한다. 둘 중 하나라도 실패하면 `doc_invalid`, 저장하지 않는다.
 - **오류 코드**(모델에게 `{ error }`, 로그 `docCode`): `doc_bad_input`, `doc_too_large`, `doc_hwp_unsupported`, `doc_image_not_found`(없음·남의 것·다른 대화·보내지 않음·기록에서 빠진 메시지·해시 불일치 — 모두 같은 답), `doc_image_unsupported`(PNG·JPG 아님), `doc_image_too_large`, `doc_output_too_large`, `doc_too_many_files`, `doc_invalid`, `doc_failed`, `doc_timeout`, `doc_limit`, `doc_busy`, `doc_unavailable`(샌드박스 없음 — macOS가 아닌 곳), `doc_not_allowed`.
 
 ### 29.5 의존성 (정확한 버전 고정, 2026-11-12 기준 2주 넘게 지난 배포)
@@ -1062,7 +1064,8 @@ PRD FR-4.4(HWP 대신 DOCX·PDF)·FR-4.7(에이전트가 만든 파일 내려받
 | `pptxgenjs` | 4.0.1 | 2025-06-26 | MIT | PPTX |
 | `pdfkit` | 0.20.2 | 2026-08-30 | MIT | PDF |
 | `@expo-google-fonts/gothic-a1` | 0.4.1 | 2025-09-12 | MIT(패키지) + **SIL OFL 1.1**(글꼴, `LICENSE_FONT`, © HanYang I&C) | PDF 한글 글꼴(Gothic A1 Regular·Bold, 쓰인 글자만 내장) |
-| `jszip` | 3.10.2 (기존 하위 의존성) | 2026-09-08 | MIT 또는 GPL-3.0 (MIT 선택) | 작업자의 다시 열기, 시험 |
+| `jszip` | 3.10.2 | 2026-09-08 | MIT 또는 GPL-3.0 (MIT 선택) | 작업자의 다시 열기(ZIP), 시험 — 작업자가 쓰므로 `dependencies`(리뷰 #110 1차) |
+| `saxes` | 5.0.1 (exceljs의 기존 하위 의존성) | 2020-04-10 | ISC | 작업자의 다시 열기: 모든 XML 부분을 XML 1.0으로 파싱 |
 | `pdfjs-dist` (devDependency) | 6.4.299 | 2026-10-03 | Apache-2.0 | 시험에서만 PDF 글자 추출(#48과 같은 고정) |
 - 하위 의존성 중 2주가 안 된 배포는 `pnpm.overrides`로 고정했다: `@types/node` 22.20.5(`docx`가 26.x를 끌어와 vite 피어가 바뀌던 것), `brace-expansion@1` 1.1.21, `brace-expansion@2` 2.1.7, `@swc/helpers` 0.5.23, `tslib` 2.8.1. `@napi-rs/canvas`(pdfjs-dist의 선택 의존성, 네이티브)는 `ignoredOptionalDependencies`.
 - NanumGothic(`@expo-google-fonts/nanum-gothic`)을 먼저 썼으나 fontkit 2.0.4가 그 글꼴의 공백 글리프를 읽다 실패해(빈 글리프 처리) Gothic A1으로 바꿨다.
@@ -1071,5 +1074,6 @@ PRD FR-4.4(HWP 대신 DOCX·PDF)·FR-4.7(에이전트가 만든 파일 내려받
 - 로그: `doc.finished`(도구 이름, 요청 형식 `docKind`, 결과 `docCode` = `doc_ok` 또는 위 코드, 소요 시간, 사용자·대화·run ID). **제목·블록·파일 이름·내용은 남기지 않는다**(시험).
 - 시험: `pnpm test apps/server/test/docgen.test.ts` — 네 형식 fixture(생성 → 각자의 판독기로 열기 → 제목·표·문단·그림 일치: DOCX/PPTX는 ZIP의 글 요소, XLSX는 exceljs로 읽기, PDF는 pdf.js 글자 추출), 긴 내용(여러 쪽·계속 슬라이드), 그림 머리 검사, 작업자 다시 열기, macOS 샌드박스 실행(네 형식), 실행 경로(FakeRuntime `/doc <kind>` — 파일·칩·아티팩트·내려받기·주인만·맥락 참조), HWP 안내, 로그, 한도·그림 소유·비밀·결과 검사·범위·20개 한도, **두 런타임 녹화 재생**(Claude·Codex가 우리 MCP 서버로 `doc_create`·`artifact_create`를 실제 호출 → 네 형식 내려받아 열림).
 - e2e: `E2E_PORT=3117 pnpm e2e e2e/docgen.spec.ts` — "이 내용을 DOCX 보고서로"(`/doc docx`) → 답의 칩으로 브라우저 내려받기 → 파일을 열어 제목·문단·표 확인, 같은 답의 문서 아티팩트 패널에 같은 파일 내려받기. PDF 한글 글자, HWP 안내. 데스크톱·모바일.
-- FakeRuntime 모드(`FAKE_RUNTIME=1`, 개발·e2e 전용)는 샌드박스가 없는 기계(CI Linux)에서도 돌도록 같은 작업자를 서버 프로세스 안에서 실행한다(`inProcessDocRunner`). 운영 기본은 항상 샌드박스(`sandboxedDocRunner`)이고, macOS가 아니면 `doc_unavailable`.
+- **샌드박스 밖 실행은 시험 전용 스위치로만:** `ISOLATION_IN_PROCESS_FOR_TESTS=1`(개발·시험 전용)일 때만 생성 작업자를 서버 프로세스 안에서 돌린다(`docRunnerKind` — macOS 샌드박스가 없는 기계에서 개발·단위 시험용). **`NODE_ENV=production`이면 `loadConfig`가 이 값을 거부해 서버가 뜨지 않고**, 실행 시점에도 production이면 무조건 샌드박스다. `FAKE_RUNTIME=1`만으로는 바뀌지 않는다(리뷰 #110 1차: 예전에는 FAKE_RUNTIME이면 프로세스 안 실행이었고 production+FAKE_RUNTIME 설정이 받아들여져 60초·768MB 한도가 사라졌다). 같은 스위치를 파일 추출(#48)도 쓴다. 단위 시험은 실행기를 직접 넣는다(`buildApp({ docs: { runner } })`).
+- e2e(Playwright)는 production 빌드라 macOS에서는 실제 샌드박스로 만들고, 샌드박스가 없는 Linux CI에서는 `e2e/docgen.spec.ts`를 건너뛴다(그 시나리오는 단위 시험이 모든 플랫폼에서 FakeRuntime·두 런타임 재생으로 덮는다).
 - 실런타임 확인: 실제 Claude·Codex 연결에서 "이 내용을 DOCX 보고서로"를 보내 칩으로 내려받아 Word·한글·미리보기에서 열리는지 본다(자동 시험은 녹화 재생).

@@ -3,15 +3,16 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { DOC_LIMITS, type DocContent, type DocKind } from "@agentlee/shared";
+import type { Config } from "../config.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 
 /**
  * How a document is made (#49): `apps/server/docgen/worker.mjs` with the pinned libraries (docx, exceljs, pptxgenjs,
- * pdfkit; jszip to re-open what was made) and the embedded PDF font, in its own sandboxed process (#42) — read
+ * pdfkit; jszip and saxes to re-open and parse what was made) and the embedded PDF font, in its own sandboxed process (#42) — read
  * access to its folder, those packages and the font only (program folders, never family data: the pictures come in
  * on stdin), nothing writable, no network, no child processes, an environment of one flag; time, memory and output
- * limits (`DOC_WORKER_LIMITS`). The FakeRuntime mode and tests may run the same worker in this process
- * (`inProcessDocRunner`).
+ * limits (`DOC_WORKER_LIMITS`). Only tests and development (the `ISOLATION_IN_PROCESS_FOR_TESTS` switch, refused in
+ * production) may run the same worker in this process (`inProcessDocRunner`, `docRunnerKind`).
  */
 
 /** Folder of the worker (the same from src/ and dist/). */
@@ -19,7 +20,7 @@ export const DOC_WORKER_DIR = path.resolve(path.dirname(fileURLToPath(import.met
 export const DOC_WORKER_ENTRY = path.join(DOC_WORKER_DIR, "worker.mjs");
 
 /** The packages the worker imports (by absolute file URL, `modules` of the job). */
-export const DOC_PACKAGES = ["docx", "exceljs", "pptxgenjs", "pdfkit", "jszip"] as const;
+export const DOC_PACKAGES = ["docx", "exceljs", "pptxgenjs", "pdfkit", "jszip", "saxes"] as const;
 /** The PDF font (SIL Open Font License 1.1): Gothic A1 regular and bold, from the pinned npm package. */
 export const DOC_FONT_PACKAGE = "@expo-google-fonts/gothic-a1";
 
@@ -181,8 +182,19 @@ type Worker = {
 };
 
 /**
- * The same worker in this process — for tests and the FakeRuntime mode (development and e2e on machines without
- * the macOS sandbox) only; never the production default.
+ * Which runner the app uses: the sandbox, always in production — whatever else is set (FAKE_RUNTIME included). In
+ * process only with the test switch `ISOLATION_IN_PROCESS_FOR_TESTS=1` (which `loadConfig` refuses in production)
+ * and a non-production environment, checked again here.
+ */
+export function docRunnerKind(
+  config: Pick<Config, "env" | "isolationInProcessForTests">,
+): "sandbox" | "in-process" {
+  return config.env !== "production" && config.isolationInProcessForTests ? "in-process" : "sandbox";
+}
+
+/**
+ * The same worker in this process — for tests and development on machines without the macOS sandbox, behind
+ * `docRunnerKind` — never in production.
  */
 export function inProcessDocRunner(): DocRunner {
   return async (job) => {

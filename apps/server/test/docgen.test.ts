@@ -342,7 +342,14 @@ describe("the sandboxed worker (#42)", () => {
     expect(o.trusted![0]).toBe(DOC_WORKER_DIR);
     for (const p of o.trusted!.slice(1)) expect(p).toMatch(/node_modules/);
     const job = JSON.parse(o.stdin!) as { modules: Record<string, string>; fonts: Record<string, string> };
-    expect(Object.keys(job.modules).sort()).toEqual(["docx", "exceljs", "jszip", "pdfkit", "pptxgenjs"]);
+    expect(Object.keys(job.modules).sort()).toEqual([
+      "docx",
+      "exceljs",
+      "jszip",
+      "pdfkit",
+      "pptxgenjs",
+      "saxes",
+    ]);
     for (const f of Object.values(job.fonts)) expect(o.trusted!.some((t) => f.startsWith(t))).toBe(true);
   });
 

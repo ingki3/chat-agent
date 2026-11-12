@@ -31,8 +31,10 @@
     "exceljs": "4.4.0",
     "fastify": "5.12.8",
     "jose": "6.2.16",
+    "jszip": "3.10.2",
     "pdfkit": "0.20.2",
     "pptxgenjs": "4.0.1",
+    "saxes": "5.0.1",
     "vite": "8.3.6",
     "web-push": "3.6.7",
     "zod": "4.6.7"
@@ -42,7 +44,6 @@
     "@types/better-sqlite3": "9.6.0",
     "@types/web-push": "3.6.4",
     "drizzle-kit": "0.31.11",
-    "jszip": "3.10.2",
     "pdfjs-dist": "6.4.299"
   }
 }

@@ -39,6 +39,12 @@ const ConfigSchema = z.object({
   DIAG_STREAM: z.enum(["0", "1"]).default("0"),
   /** Registers the scripted FakeRuntime (development and testing only, never with real family data). */
   FAKE_RUNTIME: z.enum(["0", "1"]).default("0"),
+  /**
+   * Tests and development only: run the sandboxed workers (document generation #49, file extraction #48) in the
+   * server process, for machines without the macOS sandbox (Linux CI). Refused with NODE_ENV=production — a production
+   * server never runs untrusted-input work outside the sandbox and its time and memory limits.
+   */
+  ISOLATION_IN_PROCESS_FOR_TESTS: z.enum(["0", "1"]).default("0"),
   /** Public hostname served through Cloudflare Tunnel. Requests with this Host need a valid Access JWT. */
   PUBLIC_HOST: z
     .string()
@@ -129,6 +135,8 @@ export type Config = {
   backupDir?: string | undefined;
   diagStream: boolean;
   fakeRuntime: boolean;
+  /** `ISOLATION_IN_PROCESS_FOR_TESTS=1` (never in production — `loadConfig` refuses it). */
+  isolationInProcessForTests: boolean;
   tempGateCode?: string | undefined;
   publicHost: string;
   /** Present when Cloudflare Access is configured. */
@@ -186,6 +194,10 @@ export function loadConfig(
   const c = parsed.data;
   if (!c.CF_ACCESS_TEAM_DOMAIN !== !c.CF_ACCESS_AUD)
     throw new Error("Invalid configuration — set both CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD, or neither");
+  if (c.NODE_ENV === "production" && c.ISOLATION_IN_PROCESS_FOR_TESTS === "1")
+    throw new Error(
+      "Invalid configuration — ISOLATION_IN_PROCESS_FOR_TESTS is for tests and development only, never with NODE_ENV=production",
+    );
   const dataDir = path.resolve(baseDir, c.DATA_DIR);
   const masterKeyPath = path.resolve(baseDir, c.MASTER_KEY_PATH);
   if (isInside(masterKeyPath, dataDir)) {
@@ -218,6 +230,7 @@ export function loadConfig(
     backupDir,
     diagStream: c.DIAG_STREAM === "1",
     fakeRuntime: c.FAKE_RUNTIME === "1",
+    isolationInProcessForTests: c.ISOLATION_IN_PROCESS_FOR_TESTS === "1" && c.NODE_ENV !== "production",
     tempGateCode: c.TEMP_GATE_CODE,
     publicHost: c.PUBLIC_HOST,
     access:

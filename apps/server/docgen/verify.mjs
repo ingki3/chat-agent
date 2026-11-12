@@ -15,6 +15,21 @@ export function xmlText(xml) {
     );
 }
 
+/** Parses one XML part; any well-formedness or character error refuses the file. */
+function wellFormed(SaxesParser, xml) {
+  const parser = new SaxesParser({ xmlns: false });
+  let failed = false;
+  parser.on("error", () => {
+    failed = true;
+  });
+  try {
+    parser.write(xml).close();
+  } catch {
+    failed = true;
+  }
+  if (failed) throw new DocError("doc_invalid");
+}
+
 const MAIN = {
   docx: ["word/document.xml"],
   xlsx: ["xl/workbook.xml"],
@@ -45,6 +60,10 @@ export async function verify(kind, buf, doc, ctx) {
   await read("[Content_Types].xml");
   const main = await Promise.all(MAIN[kind].map(read));
   const names = Object.keys(zip.files);
+  // Every XML part must parse as well-formed XML 1.0 (characters included) — an office application refuses (or
+  // "repairs") a file with one broken part.
+  const { SaxesParser } = await ctx.lib("saxes");
+  for (const name of names.filter((n) => /\.(xml|rels)$/i.test(n))) wellFormed(SaxesParser, await read(name));
   let text;
   const checks = {};
   if (kind === "docx") {
