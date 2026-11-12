@@ -258,6 +258,22 @@ describe("rehearsal: restore into a separate folder with the recovered key (#37 
       fs.mkdirSync(path.dirname(attachment), { recursive: true, mode: 0o700 });
       fs.writeFileSync(attachment, "ATTACHMENT-BYTES", { mode: 0o600 });
     });
+    // An upload through the API (#22): its row and its file.
+    const uploaded = await one.app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/files`,
+      headers: {
+        ...LOCAL,
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        "content-type": "application/octet-stream",
+        "x-file-name": encodeURIComponent("리허설.txt"),
+      },
+      payload: "UPLOADED-BYTES",
+    });
+    expect(uploaded.statusCode, uploaded.body).toBe(201);
+    const fileId = uploaded.json<{ id: string }>().id;
     // Artifact.
     const { artifact } = one.app.artifacts!.create(
       { userId: owner.id, conversationId: conv.id, runId: "r" },
@@ -313,6 +329,9 @@ describe("rehearsal: restore into a separate folder with the recovered key (#37 
     // Attachment.
     const restored = path.join(storagePaths(target).conversationFiles(owner.id, conv.id), "note.txt");
     expect(fs.readFileSync(restored, "utf8")).toBe("ATTACHMENT-BYTES");
+    const original = await send(two.app, cookie, "GET", `/api/files/${fileId}/content`);
+    expect(original.statusCode).toBe(200);
+    expect(original.body).toBe("UPLOADED-BYTES");
     // Artifact.
     const art = await send(two.app, cookie, "GET", `/api/artifacts/${artifact.id}`);
     expect(art.statusCode).toBe(200);
@@ -743,8 +762,8 @@ describe("schedule and admin routes (#37)", () => {
     const L = layout();
     createMasterKey(L.keyPath);
     const realStart = Date.now();
-    // 50 ms before 03:30 Seoul.
-    const base = Date.UTC(2026, 10, 11, 18, 30) - 50;
+    // 500 ms before 03:30 Seoul — room for the start itself (migrations, routes), which takes about 50 ms.
+    const base = Date.UTC(2026, 10, 11, 18, 30) - 500;
     const one = await start({
       ...L,
       backup: { schedule: true, now: () => base + (Date.now() - realStart), catchUpMs: 24 * 3600_000 },
@@ -1903,7 +1922,8 @@ describe("restore checks every secret and upgrades an older schema (#37 review P
   it("a backup of an older schema is restored and upgraded to this code's schema", async () => {
     const root = tmp();
     // A database made by an older build: only the migrations before 0015's initial_defaults (later ones, such as
-    // 0016 citations, are left out too — an older build had none of them).
+    // 0016 citations, are left out too — an older build had none of them). No `files` table either (#22): the
+    // backup's file-reference query must cope with that.
     const code = codeMigrations();
     const older = path.join(root, "older-migrations");
     fs.cpSync(MIGRATIONS_DIR, older, { recursive: true });

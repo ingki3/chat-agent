@@ -686,3 +686,34 @@ export const citations = sqliteTable(
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],
 );
+
+/**
+ * Uploaded files (#22, PRD FR-4.1·4.2·4.6): one row per file of a conversation, owned by its uploader. The bytes
+ * are at `files/<user_id>/<conversation_id>/<id>` under DATA_DIR — server-generated ids only, never the user's
+ * name (files/store.ts). `messageId` is the user message it was sent with (null while it is only in the composer;
+ * cleared if that message row goes). `kind` and `mediaType` are what the server detected (extension and content
+ * agree), never what the browser said. `name` is the user's file name, shown and used for downloads only.
+ */
+export const files = sqliteTable(
+  "files",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    messageId: text("message_id").references(() => messages.id, { onDelete: "set null" }),
+    name: text("name").notNull(),
+    kind: text("kind", {
+      enum: ["pdf", "hwp", "hwpx", "docx", "xlsx", "pptx", "csv", "txt", "md", "png", "jpg"],
+    }).notNull(),
+    mediaType: text("media_type").notNull(),
+    bytes: integer("bytes").notNull(),
+    /** SHA-256 (hex) of the stored bytes. */
+    sha256: text("sha256").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [index("files_conversation_idx").on(t.conversationId, t.createdAt)],
+);

@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { watchAccess } from "../authz/resources.js";
 import { toMessage, type ConversationStore } from "../conversations/store.js";
 import { RunAccessDenied } from "../connections/access.js";
+import { AttachmentError } from "../files/store.js";
 import { openSse } from "../sse.js";
 import { IdempotencyConflictError, RunBusyError, ShuttingDownError, toRun, type RunManager } from "./runs.js";
 
@@ -38,6 +39,8 @@ export function startRun(
     if (e instanceof ShuttingDownError) return reply.code(503).send({ error: "shutting_down" });
     if (e instanceof IdempotencyConflictError) return reply.code(409).send({ error: "idempotency_conflict" });
     if (e instanceof MessageNotFoundError) return reply.code(404).send({ error: "not_found" });
+    // `fileIds` that are not this conversation's unsent files (#22): nothing was created.
+    if (e instanceof AttachmentError) return reply.code(400).send({ error: "invalid_attachment" });
     // Runtime, model, effort or connection not allowed for this user (#17): nothing was created.
     if (e instanceof RunAccessDenied) return reply.code(403).send({ error: e.code });
     throw e;

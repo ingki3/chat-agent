@@ -1,4 +1,7 @@
+import fs from "node:fs";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { can, type ResourceRef } from "../src/authz/policy.js";
@@ -32,13 +35,16 @@ afterEach(async () => {
 let lastDb: ReturnType<typeof createTestDb>;
 const newApp = async () => {
   lastDb = createTestDb();
-  const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+  // Its own data folder: the matrix stores uploaded files (#22), never in the repository's data/.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-perm-"));
+  const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
     db: lastDb,
     logger: false,
     // Export routes (#51) answer 200 for whoever passes the check; the browser itself is tested elsewhere.
     renderer: { render: async () => ({ ok: true, body: Buffer.from("x"), type: "image/png" }) },
   });
   apps.push(app);
+  app.addHook("onClose", async () => fs.rmSync(dataDir, { recursive: true, force: true }));
   return app;
 };
 

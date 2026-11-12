@@ -1,0 +1,247 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FILE_ACCEPT, FILE_LIMITS, fileKindOf, type UploadedFile } from "@agentlee/shared";
+import { useQueryClient } from "@tanstack/react-query";
+import { errorText, files as filesApi } from "../api.js";
+
+/**
+ * Composer attachments (#22, FR-4.1·4.6): files picked, dropped or pasted are checked here first — size, count
+ * and type, so the user hears about it before anything is sent — then uploaded one by one to the conversation.
+ * The server checks everything again; its answer replaces the chip's state.
+ */
+export type Attachment = {
+  key: string;
+  name: string;
+  bytes: number;
+  status: "uploading" | "done" | "failed";
+  error?: string;
+  file?: UploadedFile;
+};
+
+const sizeText = (n: number) =>
+  n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`;
+
+/** Why a file cannot be sent, before uploading it; undefined when it may go. */
+export function precheck(file: File, taken: number): string | undefined {
+  if (!fileKindOf(file.name))
+    return "지원하지 않는 형식이에요 (PDF·한글·Word·Excel·CSV·PowerPoint·텍스트·PNG·JPG).";
+  if (file.size > FILE_LIMITS.bytes) return "50MB를 넘어서 올릴 수 없어요.";
+  if (file.size === 0) return "빈 파일이에요.";
+  if (taken >= FILE_LIMITS.perConversation) return "한 대화에 파일은 20개까지예요.";
+  return undefined;
+}
+
+let seq = 0;
+
+/**
+ * Files this browser session has cancelled or removed (review #102 5차), shared by every composer: a composer that
+ * mounts later (the new chat's conversation page) never brings one back, even if the server list it got was read
+ * before the DELETE finished, and a send never carries one.
+ */
+const discarded = new Set<string>();
+
+/**
+ * `conversation()`: the conversation to upload to (the new-chat screen makes one on the first file);
+ * `existing`: the conversation's files on the server (sent ones count towards the 20 too). Unsent ones — uploaded
+ * before a reload or on another device — come back as chips, so they can be sent or removed (review #102).
+ */
+export function useAttachments(conversation: () => Promise<string>, existing: readonly UploadedFile[]) {
+  const qc = useQueryClient();
+  const [items, setItems] = useState<Attachment[]>([]);
+  const itemsRef = useRef(items);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+  /** Server files this composer has shown or removed: never brought back again (a removed or sent one). */
+  const seen = useRef(new Set<string>());
+  /** Server files deleted from here: no longer counted, even before the server list is fetched again. */
+  const gone = useRef(new Set<string>());
+  /** Chips removed while their upload was still under way. */
+  const cancelled = useRef(new Set<string>());
+  useEffect(() => {
+    const back = existing.filter(
+      (f) => f.messageId === null && !seen.current.has(f.id) && !discarded.has(f.id),
+    );
+    if (!back.length) return;
+    for (const f of back) seen.current.add(f.id);
+    setItems((xs) => [
+      ...back.map((f): Attachment => ({
+        key: `a${++seq}`,
+        name: f.name,
+        bytes: f.bytes,
+        status: "done",
+        file: f,
+      })),
+      ...xs,
+    ]);
+  }, [existing]);
+  const patch = (key: string, p: Partial<Attachment>) =>
+    setItems((xs) => xs.map((x) => (x.key === key ? { ...x, ...p } : x)));
+
+  const add = useCallback(
+    (picked: Iterable<File>) => {
+      const mine = new Set(itemsRef.current.flatMap((x) => (x.file ? [x.file.id] : [])));
+      let taken =
+        existing.filter((f) => !mine.has(f.id) && !gone.current.has(f.id)).length +
+        itemsRef.current.filter((x) => x.status !== "failed").length;
+      const next: { a: Attachment; file: File }[] = [];
+      for (const file of picked) {
+        const error = precheck(file, taken);
+        const a: Attachment = {
+          key: `a${++seq}`,
+          name: file.name,
+          bytes: file.size,
+          status: error ? "failed" : "uploading",
+          ...(error ? { error } : {}),
+        };
+        if (!error) taken++;
+        next.push({ a, file });
+      }
+      setItems((xs) => [...xs, ...next.map((n) => n.a)]);
+      for (const { a, file } of next) {
+        if (a.status === "failed") continue;
+        void (async () => {
+          try {
+            const id = await conversation();
+            const uploaded = await filesApi.upload(id, file);
+            seen.current.add(uploaded.id);
+            // Removed while it was uploading: the upload is not aborted (an aborted request may still have been
+            // stored, and then its id would be lost) — it is deleted as soon as it is known, and the list is
+            // fetched again only after the delete (review #102 5차: never before — a composer elsewhere would
+            // restore it).
+            if (cancelled.current.delete(a.key)) {
+              discarded.add(uploaded.id);
+              await filesApi.remove(uploaded.id).catch(() => undefined);
+              void qc.invalidateQueries({ queryKey: ["files", id] });
+              return;
+            }
+            // The conversation's list is fetched again: if this composer is gone meanwhile (the new chat moved to
+            // its conversation while this upload ran), the composer there shows the file as an unsent chip
+            // (review #102 4차). This one has it in `seen` and does not add it twice.
+            void qc.invalidateQueries({ queryKey: ["files", id] });
+            patch(a.key, { status: "done", file: uploaded });
+          } catch (e) {
+            if (cancelled.current.delete(a.key)) return;
+            patch(a.key, { status: "failed", error: errorText(e) });
+          }
+        })();
+      }
+    },
+    [conversation, existing, qc],
+  );
+
+  const remove = useCallback((key: string) => {
+    const a = itemsRef.current.find((x) => x.key === key);
+    setItems((xs) => xs.filter((x) => x.key !== key));
+    if (a?.status === "uploading") cancelled.current.add(key);
+    // An uploaded, unsent file is removed on the server too (a failed delete just leaves it in the conversation;
+    // it comes back as a chip on the next visit).
+    // A removed file frees its place in the 20 once the server has deleted it (review 2).
+    const id = a?.file?.id;
+    if (id) discarded.add(id);
+    if (id)
+      void filesApi
+        .remove(id)
+        .then(() => gone.current.add(id))
+        .catch(() => undefined);
+  }, []);
+
+  /**
+   * After a send: drops the chips of the files that went with it — only those (review #102 3차: files added while
+   * the send was under way stay as unsent chips).
+   */
+  const sent = useCallback((ids: readonly string[]) => {
+    const went = new Set(ids);
+    setItems((xs) => xs.filter((x) => !(x.file && went.has(x.file.id))));
+  }, []);
+  /**
+   * After a send was refused for its files (`invalid_attachment`): the server's list decides — chips whose file is
+   * gone or already sent are dropped, so the next send goes through (review #102 5차).
+   */
+  const reconcile = useCallback(async () => {
+    const id = await conversation();
+    const list = await filesApi.list(id);
+    void qc.invalidateQueries({ queryKey: ["files", id] });
+    const unsent = new Set(list.flatMap((f) => (f.messageId === null ? [f.id] : [])));
+    setItems((xs) => xs.filter((x) => !x.file || unsent.has(x.file.id)));
+  }, [conversation, qc]);
+  const uploading = items.some((x) => x.status === "uploading");
+  // Never a file this session has discarded (a chip restored from a list read before its delete finished).
+  const ready = items.flatMap((x) =>
+    x.status === "done" && x.file && !discarded.has(x.file.id) ? [x.file.id] : [],
+  );
+  return { items, add, remove, sent, reconcile, uploading, ready };
+}
+
+export function AttachmentChips({
+  items,
+  onRemove,
+}: {
+  items: readonly Attachment[];
+  onRemove: (key: string) => void;
+}) {
+  if (!items.length) return null;
+  return (
+    <ul className="attachments" aria-label="첨부 파일">
+      {items.map((a) => (
+        <li
+          key={a.key}
+          className={`chip attach ${a.status}`}
+          data-testid="attachment"
+          data-status={a.status}
+          title={a.error ?? a.name}
+        >
+          <span aria-hidden>{a.status === "uploading" ? "⏳" : a.status === "failed" ? "⚠️" : "📎"}</span>
+          <span className="attach-name">{a.name}</span>
+          <span className="muted">
+            {a.status === "uploading" ? "올리는 중…" : a.status === "failed" ? "실패" : sizeText(a.bytes)}
+          </span>
+          {a.status === "failed" && a.error && (
+            <span className="attach-error" role="alert">
+              {a.error}
+            </span>
+          )}
+          <button
+            type="button"
+            className="ghost small"
+            aria-label={`${a.name} 빼기`}
+            onClick={() => onRemove(a.key)}
+          >
+            ✕
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The 📎 button and its hidden file picker (several files at once). */
+export function AttachButton({ onPick, disabled }: { onPick: (files: File[]) => void; disabled?: boolean }) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <button
+        type="button"
+        className="ghost"
+        aria-label="파일 첨부"
+        title="파일 첨부 (파일당 50MB, 대화당 20개)"
+        disabled={disabled}
+        onClick={() => input.current?.click()}
+      >
+        📎
+      </button>
+      <input
+        ref={input}
+        type="file"
+        multiple
+        hidden
+        accept={FILE_ACCEPT}
+        data-testid="file-input"
+        onChange={(e) => {
+          const picked = [...(e.target.files ?? [])];
+          e.target.value = "";
+          if (picked.length) onPick(picked);
+        }}
+      />
+    </>
+  );
+}

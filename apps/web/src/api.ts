@@ -18,6 +18,9 @@ import {
   ArtifactDetail,
   ArtifactListResponse,
   MyArtifactsResponse,
+  FILE_NAME_HEADER,
+  FileListResponse,
+  UploadedFile,
   AdminUser,
   AuthState,
   Connection,
@@ -109,10 +112,13 @@ async function call(
         // Required on every state-changing call (CSRF, see apps/server/src/auth/plugin.ts).
         ...(method === "GET" ? {} : { [CSRF_HEADER]: "1" }),
         // Only with a body: Fastify refuses an empty body declared as JSON (a body-less DELETE answered 400).
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        // A Blob (a file upload, #22) is sent as it is, as raw bytes.
+        ...(body === undefined
+          ? {}
+          : { "Content-Type": body instanceof Blob ? "application/octet-stream" : "application/json" }),
         ...headers,
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { body: body instanceof Blob ? body : JSON.stringify(body) }),
       ...(signal ? { signal } : {}),
     });
   } catch (e) {
@@ -281,13 +287,16 @@ export const conversations = {
     )) as { items: unknown[]; nextBefore: number | null };
     return { items: Message.array().parse(r.items), nextBefore: r.nextBefore };
   },
-  /** `choice`: runtime / model / connection for this reply (#17, #19); none = the defaults. */
-  send: async (id: string, text: string, choice: RunChoice = {}) =>
+  /**
+   * `choice`: runtime / model / connection for this reply (#17, #19); none = the defaults. `fileIds`: uploaded,
+   * unsent files of this conversation that go with the message (#22).
+   */
+  send: async (id: string, text: string, choice: RunChoice = {}, fileIds: string[] = []) =>
     StartRunResponse.parse(
       await call(
         "POST",
         `/api/conversations/${enc(id)}/messages`,
-        { ...choice, text },
+        { ...choice, text, ...(fileIds.length ? { fileIds } : {}) },
         { "Idempotency-Key": newKey() },
       ),
     ),
@@ -446,9 +455,32 @@ const MESSAGES: Record<string, string> = {
   backup_failed: "백업에 실패했어요. 디스크와 백업 폴더 권한을 확인하세요.",
   backup_disk_full: "디스크가 가득 차서 백업하지 못했어요.",
   shutting_down: "서버가 다시 시작하는 중이에요. 잠시 뒤에 다시 시도하세요.",
+  file_too_large: "파일이 너무 커요. 한 파일에 50MB까지 올릴 수 있어요.",
+  too_many_files: "한 대화에 파일은 20개까지 올릴 수 있어요.",
+  file_type_unsupported:
+    "지원하지 않는 형식이에요. PDF·한글·Word·Excel·CSV·PowerPoint·텍스트·PNG·JPG만 올릴 수 있어요.",
+  file_type_mismatch: "파일 내용이 확장자와 달라요. 원래 형식 그대로 올려 주세요.",
+  file_empty: "빈 파일이에요.",
+  file_attached: "이미 보낸 파일은 지울 수 없어요.",
+  invalid_attachment: "첨부 파일을 찾지 못했어요. 다시 올려 주세요.",
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
+
+/** Uploads (#22): one file per request, the raw bytes as the body and the name in a header. */
+export const files = {
+  upload: async (conversationId: string, file: File) =>
+    UploadedFile.parse(
+      await call("POST", `/api/conversations/${enc(conversationId)}/files`, file, {
+        [FILE_NAME_HEADER]: encodeURIComponent(file.name),
+      }),
+    ),
+  list: async (conversationId: string) =>
+    FileListResponse.parse(await call("GET", `/api/conversations/${enc(conversationId)}/files`)).items,
+  remove: async (id: string) => call("DELETE", `/api/files/${enc(id)}`),
+  /** The original: a download (`inline` shows a PNG/JPG in the page instead). */
+  url: (id: string, inline = false) => `/api/files/${enc(id)}/content${inline ? "?inline=1" : ""}`,
+};
 
 /** Artifacts (#27): one with its versions, a conversation's list, and revert (a copy as the newest version). */
 export const artifacts = {

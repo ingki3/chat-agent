@@ -6,6 +6,7 @@ import { z } from "zod";
 import { decrypt, encrypt, SecretError } from "../crypto/secrets.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { DEFAULT_TIME_ZONE, minuteOfDay } from "../notifications/quiet.js";
+import { uploadedFileReferences } from "../files/references.js";
 import type { FileWriteLock } from "./lock.js";
 import { appliedMigrations } from "./schema.js";
 
@@ -133,11 +134,11 @@ export function ensureBackupDir(dir: string): void {
 }
 
 /**
- * Files the database points at, by store (relative POSIX paths under DATA_DIR, e.g. `files/<user>/<conv>/<name>`).
- * Empty today — no table references a file yet (attachments, artifacts and sources live in the database). A new file
- * store adds its query here: the backup then refuses to finish when one of these files is missing.
+ * Files the database points at, by store (relative POSIX paths under DATA_DIR, e.g. `files/<user>/<conv>/<id>`):
+ * the backup refuses to finish when one of these files is missing. Uploads (#22) are the first store; artifacts
+ * and sources still live in the database. A new file store adds its query here.
  */
-export const FILE_REFERENCES: ((db: Database.Database) => string[])[] = [];
+export const FILE_REFERENCES: ((db: Database.Database) => string[])[] = [uploadedFileReferences];
 
 const isMissing = (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOENT";
 

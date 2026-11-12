@@ -1,5 +1,6 @@
 import { memo, useMemo } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
+import { files } from "../api.js";
 import { RichText } from "./RichText.js";
 import type { MarkdownCite } from "./Markdown.js";
 import { CitationMarker } from "../citations/CitationMarker.js";
@@ -216,11 +217,20 @@ const PartView = memo(function PartView({
     case "citation_ref":
       return <span className="chip small">{part.label ?? "출처"}</span>;
     case "file_ref":
-      return <span className="chip small">📎 {part.name ?? "파일"}</span>;
+      return <FileRef part={part} />;
     default:
       return null;
   }
 });
+
+/** An uploaded file (#22): a download link to the original (the viewer is #24). */
+export function FileRef({ part }: { part: Extract<PublicPart, { type: "file_ref" }> }) {
+  return (
+    <a className="chip small fileref" href={files.url(part.fileId)} download data-testid="file-ref">
+      📎 {part.name ?? "파일"}
+    </a>
+  );
+}
 
 export function Parts({ parts, streaming = false }: { parts: readonly PublicPart[]; streaming?: boolean }) {
   // Citations (#25): once the answer is finished and carries the server's note, `[n]` become citation buttons.

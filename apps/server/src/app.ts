@@ -57,6 +57,10 @@ import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
 import { findBrowser } from "./artifacts/browser.js";
 import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
+import { FileStore, type FileStoreOptions } from "./files/store.js";
+import { registerFileRoutes } from "./files/routes.js";
+import { storagePaths } from "./storage/paths.js";
+import { isInside } from "./fs-safety.js";
 import type { Db } from "./db/client.js";
 import { SettingsStore } from "./db/settings-store.js";
 import { KEY_LEN } from "./crypto/secrets.js";
@@ -123,6 +127,8 @@ declare module "fastify" {
      * writes inside `fileWrites.write()`, so a backup's snapshot of rows and files is from one moment.
      */
     fileWrites: FileWriteLock;
+    /** Uploaded files (#22); undefined without a database. */
+    files: FileStore | undefined;
     /** Daily backups (#37); undefined without BACKUP_DIR or with an in-memory database. */
     backups: BackupService | undefined;
     /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
@@ -199,7 +205,26 @@ export type BuildOptions = {
    * test.
    */
   backup?: BackupServiceOptions & { schedule?: boolean };
+  /** Uploads (#22): clock and test hooks. */
+  files?: FileStoreOptions;
 };
+
+/**
+ * The database is DATA_DIR's own `agentlee.db`: the opened file itself, links resolved (review #102 — an
+ * `agentlee.db` that is a link to another database is not this folder's), is the real `<DATA_DIR>/agentlee.db`.
+ * "memory" for an in-memory database, "other" for any other file.
+ */
+function databaseOf(db: Db, dataDir: string): "own" | "memory" | "other" {
+  if (db.$client.memory) return "memory";
+  try {
+    const opened = fs.realpathSync.native(db.$client.name);
+    // The folder resolved, the file name not: a link named agentlee.db resolves to somewhere else than this.
+    const own = path.join(fs.realpathSync.native(dataDir), path.basename(storagePaths(dataDir).db));
+    return opened === own && isInside(opened, dataDir) ? "own" : "other";
+  } catch {
+    return "other";
+  }
+}
 
 /** Tests without a master key: one throwaway key per database, so rebuilding the app on it still decrypts. */
 const ephemeralKeys = new WeakMap<Db, Buffer>();
@@ -423,7 +448,21 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onClose", async () => mcp.close());
     app.decorate("mcp", mcp);
     app.decorate("runs", runManager);
-    registerConversationRoutes(app, app.conversations!, runManager, { defaults, users });
+    // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
+    const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
+    app.decorate("files", fileStore);
+    // Left-overs of the last run (cut-off uploads, files whose row never came) — only on the data folder's own
+    // database: an app on another database (tests on the default folder) must not judge this folder's files.
+    const which = databaseOf(opts.db!, config.dataDir);
+    if (which === "own")
+      app.addHook("onReady", async () => {
+        const count = await app.fileWrites.write(() => fileStore.sweep());
+        if (count) logEvent(app.log, "info", "file.swept", { count });
+      });
+    else if (which === "other")
+      app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
+    registerConversationRoutes(app, app.conversations!, runManager, { defaults, users }, fileStore);
+    registerFileRoutes(app, app.conversations!, fileStore);
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
@@ -560,6 +599,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("usage", undefined);
     app.decorate("backups", undefined);
     app.decorate("storedRescrub", undefined);
+    app.decorate("files", undefined);
   }
 
   app.get(

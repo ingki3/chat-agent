@@ -22,6 +22,11 @@ export const DEFAULT_TITLE = "새 대화";
 
 /** Called inside the delete transaction, before rows go — files, artifacts and shares hook in here (#54). */
 export type DeleteHook = (conversationId: string) => void;
+/**
+ * Called right after the delete transaction committed, with the row that went — files on disk go here (#22). The
+ * caller of `delete` holds the file-write lock (`app.fileWrites`), so a backup never sees half of it.
+ */
+export type DeletedHook = (conversation: ConversationRow) => void;
 
 /** The conversation's settings for its next message (#19), or null while none was usable yet. */
 export function settingsOf(c: ConversationRow): ChatSettings | null {
@@ -109,6 +114,7 @@ const likeEscape = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
 
 export class ConversationStore {
   private readonly deleteHooks: DeleteHook[] = [];
+  private readonly deletedHooks: DeletedHook[] = [];
 
   constructor(
     private readonly db: Db,
@@ -117,6 +123,10 @@ export class ConversationStore {
 
   onDelete(hook: DeleteHook): void {
     this.deleteHooks.push(hook);
+  }
+
+  onDeleted(hook: DeletedHook): void {
+    this.deletedHooks.push(hook);
   }
 
   get(id: string): ConversationRow | undefined {
@@ -345,12 +355,18 @@ export class ConversationStore {
     this.db.update(conversations).set({ pinned }).where(eq(conversations.id, id)).run();
   }
 
-  /** Deletes the conversation, its messages and runtime sessions; extension hooks run first, in one transaction. */
+  /**
+   * Deletes the conversation, its messages and runtime sessions; extension hooks run first, in one transaction, and
+   * `onDeleted` hooks after it committed. Callers hold `app.fileWrites` (the conversation may have files).
+   */
   delete(id: string): void {
-    this.db.$client.transaction(() => {
+    const row = this.db.$client.transaction(() => {
+      const row = this.get(id);
       for (const hook of this.deleteHooks) hook(id);
       this.db.delete(conversations).where(eq(conversations.id, id)).run();
+      return row;
     })();
+    if (row) for (const hook of this.deletedHooks) hook(row);
   }
 
   /** Appends to the current history. A first user message names an untitled conversation. */
@@ -537,9 +553,14 @@ export class ConversationStore {
       if (!conv || !target || !target.active || target.role !== "user") return undefined;
       this.truncateFrom(conv, target);
       afterCut?.();
+      // The edit changes the text only: files sent with the message stay with it (#22 review 2). The files' own
+      // link moves in the same transaction (`FileStore.moveToMessage`, called by the route).
+      const files = MessagePart.array()
+        .parse(target.parts)
+        .filter((p) => p.type === "file_ref");
       return this.append(conversationId, {
         role: "user",
-        parts: [{ type: "text", text }],
+        parts: [{ type: "text", text }, ...files],
         replaces: target.id,
       });
     })();

@@ -227,6 +227,20 @@ export const EXPORT_CODES = set([
 ]);
 export const EXPORT_FORMATS = set(["png", "pdf"]);
 
+/** Upload outcomes (#22, files/routes.ts `FILE_CODES` — a test keeps the two equal). */
+export const FILE_CODES = set([
+  "file_ok",
+  "file_aborted",
+  "invalid_request",
+  "file_too_large",
+  "too_many_files",
+  "file_type_unsupported",
+  "file_type_mismatch",
+  "file_empty",
+  "file_attached",
+]);
+export const isFileCode = member(FILE_CODES);
+
 /** Backup outcomes (#37, backup/backup.ts `BACKUP_CODES` — a test keeps the two equal). */
 export const BACKUP_CODES = set([
   "backup_ok",

@@ -62,8 +62,8 @@ test("Enter sends, Shift+Enter starts a new line", async ({ page, baseURL }) => 
   await box.press("Enter");
   await expect(page.getByTestId("user-message")).toHaveText(/첫 줄\s+둘째 줄/);
   await expect(box).toHaveValue("");
-  // File upload comes with #22; the chip shows the defaults (nothing set: Opus 5.5, #19).
-  await expect(page.getByRole("button", { name: "파일 첨부" })).toBeDisabled();
+  // File attach is there (#22, e2e/files.spec.ts); the chip shows the defaults (nothing set: Opus 5.5, #19).
+  await expect(page.getByRole("button", { name: "파일 첨부" })).toBeEnabled();
   await expect(page.locator("#runtime-chip")).toContainText("Claude Code · Opus 5.5");
 });
 
