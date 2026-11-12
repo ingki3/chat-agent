@@ -22,6 +22,8 @@ import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb, type Db } from "../src/db/client.js";
 import { citations, sources } from "../src/db/schema.js";
 import { McpTokens } from "../src/isolation/tokens.js";
+import { KnownSecrets, knownSecrets } from "../src/secrets/known.js";
+import { StoredRescrub } from "../src/secrets/rescrub.js";
 import { McpService } from "../src/mcp/service.js";
 import { sanitizeRecord } from "../src/logging.js";
 import { FIXTURE_PAGES, fixtureWebWorker } from "../src/runtime/fake-citations.js";
@@ -1418,5 +1420,30 @@ describe("citationNote", () => {
     ).toBeDefined();
     // Nothing written: nothing to note.
     expect(citationNote(scope.runId, [], f.cites)).toBeUndefined();
+  });
+});
+
+describe("citations and known secrets (#78)", () => {
+  it("a snippet holding a known secret is stored scrubbed, and the rescrub cleans a late one with its key", async () => {
+    const f = family();
+    const scope = f.run(f.c.id);
+    const src = f.page(scope);
+    const early = `early-${crypto.randomBytes(12).toString("base64url")}`;
+    knownSecrets.add(early);
+    f.cites.cite(scope, { sourceId: src.id, snippet: `메모리 가격 하락 ${early} 이 감소를 불렀다` });
+    const late = `late-${crypto.randomBytes(12).toString("base64url")}`;
+    f.cites.cite(scope, { sourceId: src.id, snippet: `메모리 가격 하락 ${late} 이 감소를 불렀다` });
+    const all = () => JSON.stringify(f.db.select().from(citations).all());
+    expect(all()).not.toContain(early);
+    expect(all()).toContain(late);
+    const reg = new KnownSecrets();
+    const r = new StoredRescrub(f.db, { registry: reg, delayMs: 1 });
+    reg.add(late);
+    await new Promise((res) => setTimeout(res, 20));
+    await r.idle();
+    r.close();
+    expect(all()).not.toContain(late);
+    const rows = f.db.select().from(citations).all();
+    for (const row of rows) expect(row.snippetKey).toBe(normalizeSnippet(row.snippet));
   });
 });

@@ -1,6 +1,11 @@
-import { memo } from "react";
+import { memo, useMemo } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
 import { RichText } from "./RichText.js";
+import type { MarkdownCite } from "./Markdown.js";
+import { CitationMarker } from "../citations/CitationMarker.js";
+import { CitationSources } from "../citations/CitationNote.js";
+import { markerNumbers } from "../citations/markdown.js";
+import { citationNoteOf, citationView } from "../citations/segments.js";
 
 type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
@@ -181,10 +186,20 @@ export function FinanceNote({ note }: { note: FinanceNotePart }) {
   );
 }
 
-const PartView = memo(function PartView({ part }: { part: PublicPart }) {
+const PartView = memo(function PartView({
+  part,
+  cite,
+  text,
+}: {
+  part: PublicPart;
+  cite?: MarkdownCite | undefined;
+  text: string;
+}) {
   switch (part.type) {
     case "text":
-      return <RichText text={part.text} />;
+      return <RichText text={part.text} cite={cite} />;
+    case "citation_note":
+      return <CitationSources note={part} text={text} />;
     case "table":
       return <TableView t={part} />;
     case "divider":
@@ -204,13 +219,25 @@ const PartView = memo(function PartView({ part }: { part: PublicPart }) {
 });
 
 export function Parts({ parts, streaming = false }: { parts: readonly PublicPart[]; streaming?: boolean }) {
+  // Citations (#25): once the answer is finished and carries the server's note, `[n]` become citation buttons.
+  const note = streaming ? undefined : citationNoteOf(parts);
+  const cite = useMemo<MarkdownCite | undefined>(() => {
+    if (!note) return undefined;
+    const byN = new Map(note.citations.map((c) => [c.n, c]));
+    return {
+      numbers: markerNumbers(note),
+      render: (n) => <CitationMarker view={citationView(n, byN.get(n))} />,
+    };
+  }, [note]);
+  // The answer text as the server joined it (the note's ranges point into it).
+  const answer = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
   return (
     <>
       {segments(parts).map((s) =>
         s.kind === "tools" ? (
           <Tools key={`t${s.index}`} calls={s.calls} results={s.results} streaming={streaming} />
         ) : (
-          <PartView key={s.index} part={s.part} />
+          <PartView key={s.index} part={s.part} cite={cite} text={answer} />
         ),
       )}
     </>

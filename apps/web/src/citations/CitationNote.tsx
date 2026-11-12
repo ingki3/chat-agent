@@ -33,14 +33,30 @@ export function CitedText({ text, note }: { text: string; note: CitationNotePart
  * Under the answer: the missing-citation warning and the source list — number, title, site, date, URL and the
  * status ("원문 구절 확인" or the ⚠️ text). Nothing when the note has neither.
  */
-export function CitationSources({ note }: { note: CitationNotePart }) {
+export function CitationSources({ note, text }: { note: CitationNotePart; text?: string }) {
   const views = sourceViews(note);
   if (!views.length && !note.missing.length) return null;
+  // The paragraphs without a citation, as excerpts (the markdown view cannot mark ranges inline).
+  const missing =
+    text === undefined
+      ? []
+      : note.missing
+          .filter((m) => m.start < m.end && m.end <= text.length)
+          .map((m) => text.slice(m.start, m.end));
   return (
     <div className="cite-note" data-testid="citation-note">
       {note.missing.length > 0 && (
-        <div className="notice warn" data-testid="citation-missing-warning">
-          {CITATION_MISSING_TEXT}
+        <div className="notice warn">
+          <span data-testid="citation-missing-warning">{CITATION_MISSING_TEXT}</span>
+          {missing.length > 0 && (
+            <ul className="cite-missing-list">
+              {missing.map((t, i) => (
+                <li key={i} data-testid="citation-missing">
+                  {t}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       {views.length > 0 && (

@@ -112,3 +112,7 @@
   background: var(--accent-weak);
   color: var(--accent);
 }
+.cite-missing-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}

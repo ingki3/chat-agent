@@ -5,6 +5,7 @@ import type { Db } from "../db/client.js";
 import { citations, conversations, sources } from "../db/schema.js";
 import type { SourceScope } from "../web/sources.js";
 import { findSnippet, normalizeSnippet } from "./verify.js";
+import { scrubKnown } from "../secrets/known.js";
 
 export type CitationRow = typeof citations.$inferSelect;
 
@@ -26,7 +27,8 @@ export class CitationStore {
 
   /** Checks and registers one citation of the run; the same source and snippet twice keep their first number. */
   cite(scope: SourceScope, input: { sourceId: string; snippet: string }): CiteResult {
-    const snippet = boundText(input.snippet, CITATION_LIMITS.snippet);
+    // Known secrets are kept out of what is stored (the snippet is model output; the page text is scrubbed too).
+    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
     const key = normalizeSnippet(snippet);
     if (Array.from(key).length < CITATION_LIMITS.minSnippet) throw new CiteRefused("cite_snippet_too_short");
     const owner = this.db
@@ -54,7 +56,7 @@ export class CitationStore {
     else {
       const m = findSnippet(mine.body, snippet, mine.bodyHash ?? undefined);
       status = m.found ? "verified" : "snippet_not_found";
-      if (m.found) quote = m.quote;
+      if (m.found) quote = scrubKnown(m.quote);
     }
     // The transaction holds the numbering only (checked again inside it).
     return this.db.transaction(

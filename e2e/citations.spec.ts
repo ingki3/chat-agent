@@ -102,8 +102,8 @@ test("paragraphs without a citation are marked: 일부 내용에 출처 표시 �
   const { reply } = await newChat(page, "/cite partial");
   await expect(reply.getByTestId("citation-missing-warning")).toHaveText("⚠️ 일부 내용에 출처 표시 없음");
   await expect(reply.getByTestId("citation-missing")).toHaveText([
-    "업계는 내년에도 두 자릿수 증가를 예상해요.⚠️",
-    "- 미국 수출 비중이 가장 컸어요⚠️",
+    "업계는 내년에도 두 자릿수 증가를 예상해요.",
+    "- 미국 수출 비중이 가장 컸어요",
   ]);
 });
 

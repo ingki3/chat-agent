@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { normalizeSnippet } from "../citations/verify.js";
 import type { Db } from "../db/client.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { TEXT_COLUMNS, type RescrubKind } from "./columns.js";
@@ -35,6 +36,10 @@ const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").dige
 
 const DERIVED: Record<string, Pick<Table, "immutable" | "derived">> = {
   sources: { derived: (r) => (typeof r.body === "string" ? { body_hash: sha256(r.body) } : {}) },
+  // The duplicate key follows the scrubbed snippet (#25).
+  citations: {
+    derived: (r) => (typeof r.snippet === "string" ? { snippet_key: normalizeSnippet(r.snippet) } : {}),
+  },
   artifact_versions: {
     immutable: "artifact_versions_immutable",
     derived: (r) =>
