@@ -268,7 +268,9 @@ describe("devices", () => {
     const { clock, member, subscribe, svc, push } = await setup();
     const mom = member("mom");
     await subscribe(mom);
-    clock.now += 31 * 24 * 3600_000;
+    // Sessions are created with the real clock (users.createSession), so move past *their* expiry —
+    // NOON is a fixed date and +31 days from it stops being past a session made after NOON's day.
+    clock.now = Date.now() + 31 * 24 * 3600_000;
     svc.publish(mom.user.id, { kind: "test" });
     await svc.settled();
     expect(push.sent).toEqual([]);
