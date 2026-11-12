@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChatSettings, RuntimeOption } from "@agentlee/shared";
 import {
+  ChipChoice,
   canChooseShared,
   chipLabel,
   differs,
@@ -137,5 +138,68 @@ describe("usage limits in the chip (review #101)", () => {
     expect(noticeText({ runtime: "codex", model: "gpt-6-luna", limitedUntil: now }, options)).toMatch(
       /^기본값을 쓸 수 없어 Codex · GPT-6 Luna로 시작했어요 \(사용 한도 · .+ 이후 다시 쓸 수 있어요\)$/,
     );
+  });
+});
+
+describe("ChipChoice: a send waits for the preview (review #101 4차)", () => {
+  type S = { runtime: string; model: string };
+  const start: S = { runtime: "claude-code", model: "claude-opus-5-5" };
+  /** A preview the test resolves by hand. */
+  const manual = () => {
+    const calls: { base: S; change: object; resolve: (s: S) => void; reject: (e: unknown) => void }[] = [];
+    const preview = (base: S, change: object) =>
+      new Promise<S>((resolve, reject) => calls.push({ base, change, resolve, reject }));
+    return { calls, preview };
+  };
+
+  it("nothing chosen: null at once (the server's start settings)", async () => {
+    expect(await new ChipChoice<S>(async () => start).settled()).toBeNull();
+  });
+
+  it("a send made while the preview is pending gets the previewed settings, not the old ones", async () => {
+    const m = manual();
+    const c = new ChipChoice<S>(m.preview);
+    void c.change(start, { runtime: "codex" });
+    let sent: S | null | undefined;
+    const send = c.settled().then((s) => (sent = s));
+    await Promise.resolve();
+    expect(sent).toBeUndefined(); // still waiting
+    await new Promise((r) => setTimeout(r, 0));
+    m.calls[0]!.resolve({ runtime: "codex", model: "gpt-6.1-sol" });
+    await send;
+    expect(sent).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
+  });
+
+  it("changes are previewed in order, each on the previous result", async () => {
+    const m = manual();
+    const c = new ChipChoice<S>(m.preview);
+    void c.change(start, { runtime: "codex" });
+    void c.change(start, { model: "gpt-6-luna" });
+    const done = c.settled();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(m.calls).toHaveLength(1);
+    m.calls[0]!.resolve({ runtime: "codex", model: "gpt-6.1-sol" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(m.calls[1]!.base).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
+    m.calls[1]!.resolve({ runtime: "codex", model: "gpt-6-luna" });
+    expect(await done).toEqual({ runtime: "codex", model: "gpt-6-luna" });
+  });
+
+  it("a failed preview stops that send once; the next one goes with the last good choice", async () => {
+    const m = manual();
+    const c = new ChipChoice<S>(m.preview);
+    void c.change(start, { runtime: "codex" });
+    await new Promise((r) => setTimeout(r, 0));
+    m.calls[0]!.resolve({ runtime: "codex", model: "gpt-6.1-sol" });
+    const bad = c.change(start, { model: "nope" });
+    bad.catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 0));
+    m.calls[1]!.reject(new Error("model_not_allowed"));
+    await expect(c.settled()).rejects.toThrow("model_not_allowed");
+    expect(await c.settled()).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
+    // A later change builds on the last good one.
+    void c.change(start, { model: "gpt-6-luna" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(m.calls[2]!.base).toEqual({ runtime: "codex", model: "gpt-6.1-sol" });
   });
 });

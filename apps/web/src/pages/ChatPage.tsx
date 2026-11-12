@@ -19,7 +19,7 @@ import {
   type StartRunResponse,
 } from "@agentlee/shared";
 import { conversations, errorText, runs, settings as settingsApi } from "../api.js";
-import { differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
+import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { DividerView, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -281,7 +281,11 @@ export function NewChatPage() {
   const usable = useUsableRuntimes();
   const [chosen, setChosen] = useState<ChatSettings | null>(null);
   const start = chosen ?? defaults.data?.start ?? null;
+  // Every chip change is previewed by the server; a send waits for the latest result (review #101 4차).
+  const [choice] = useState(() => new ChipChoice<ChatSettings>(settingsApi.preview));
   const send = async (text: string) => {
+    // Waits for a preview still on its way; a failed one stops the send (its error shows under the composer).
+    const chosen = await choice.settled();
     const c: Conversation = await conversations.create(
       chosen
         ? {
@@ -301,7 +305,7 @@ export function NewChatPage() {
   // The server computes the choice (the same rules as the conversation is created with, limits included).
   const change = async (c: ChangeSettingsRequest) => {
     if (!start) return;
-    setChosen(await settingsApi.preview(start, c));
+    setChosen(await choice.change(start, c));
   };
   if (defaults.data && defaults.data.start === null)
     return (

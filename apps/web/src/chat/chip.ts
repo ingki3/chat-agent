@@ -1,4 +1,9 @@
-import { limitApplies, type ChatSettings, type RuntimeOption } from "@agentlee/shared";
+import {
+  limitApplies,
+  type ChangeSettingsRequest,
+  type ChatSettings,
+  type RuntimeOption,
+} from "@agentlee/shared";
 
 /**
  * The chip's pure parts (#19): its label, what "공용으로 쓰기" needs, usage limits and the fallback notice. What a
@@ -116,3 +121,41 @@ export const differs = (
   !!last?.runtime &&
   !!last.model &&
   (s.runtime !== last.runtime || s.model !== last.model || s.effort !== last.effort);
+
+/**
+ * The new-conversation chip's choice (#19, review #101 4차): each change is previewed by the server, in order, on
+ * top of the previous result; `settled` is what the first message must be sent with — it waits for every pending
+ * preview, so a message typed while one is still on its way never goes out with the old settings. When the latest
+ * preview failed, `settled` rejects once with its error (the message is not sent) and then falls back to the last
+ * good choice — what the chip still shows.
+ */
+export class ChipChoice<S> {
+  private good: S | null = null;
+  private pending: Promise<S | null> = Promise.resolve(null);
+  constructor(private readonly preview: (base: S, change: ChangeSettingsRequest) => Promise<S>) {}
+
+  /** Previews `change` on the latest choice (or `start`); resolves with the new choice. */
+  change(start: S, change: ChangeSettingsRequest): Promise<S> {
+    const next = this.pending
+      .catch(() => this.good)
+      .then((prev) => this.preview(prev ?? start, change))
+      .then((s) => {
+        this.good = s;
+        return s;
+      });
+    this.pending = next;
+    return next;
+  }
+
+  /** The choice to create the conversation with (null: none made — the server's start settings). */
+  async settled(): Promise<S | null> {
+    const p = this.pending;
+    try {
+      return await p;
+    } catch (e) {
+      // Reported once; the next send goes with the last good choice, unless another change came meanwhile.
+      if (this.pending === p) this.pending = Promise.resolve(this.good);
+      throw e;
+    }
+  }
+}

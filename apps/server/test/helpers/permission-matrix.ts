@@ -408,7 +408,7 @@ export async function runAdminMatrix(f: Family, rows: AdminRow[]): Promise<strin
 }
 
 const LOCAL = { host: "localhost:3000" };
-const PW = "matrix-password-1";
+export const PW = "matrix-password-1";
 
 export async function createFamily(app: FastifyInstance): Promise<Family> {
   const store = app.users!;

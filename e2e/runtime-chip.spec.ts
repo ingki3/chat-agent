@@ -178,3 +178,35 @@ test("the new-chat chip: the server computes the choice, and the first reply use
   await expect(reply(page)).toHaveAttribute("data-status", "complete");
   expect(await lastReply(page)).toMatchObject({ model: "fake-large" });
 });
+
+test("a message sent while the chip's preview is still on its way goes out with the previewed choice", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "slowpreview");
+  await signIn(page, baseURL!, me);
+  // The server's answer to the preview arrives late.
+  let previews = 0;
+  await page.route("**/api/settings/preview", async (route) => {
+    previews++;
+    await new Promise((r) => setTimeout(r, 1200));
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(chip(page)).toContainText("Claude Code · Opus 5.5");
+  await chip(page).click();
+  await page
+    .getByRole("dialog", { name: "런타임·모델 선택" })
+    .getByLabel("모델")
+    .selectOption({ label: "Fake Large" });
+  await page.keyboard.press("Escape");
+  // Sent before the preview has answered: the chip still shows the old choice.
+  await expect(chip(page)).toContainText("Opus 5.5");
+  await box(page).fill("미리보기 전에 보냄");
+  await box(page).press("Enter");
+  await expect(page).toHaveURL(/\/c\/[0-9a-f-]+$/);
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  expect(previews).toBe(1);
+  expect(await lastReply(page)).toMatchObject({ model: "fake-large" });
+});

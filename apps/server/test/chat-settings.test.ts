@@ -21,7 +21,7 @@ import { CLAUDE_MODELS } from "../src/runtime/claude.js";
 import { CODEX_MODELS } from "../src/runtime/codex.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
-import { createFamily, type Family } from "./helpers/permission-matrix.js";
+import { createFamily, PW, type Family } from "./helpers/permission-matrix.js";
 
 /**
  * #19: new conversations start on the defaults with the FR-12.6 fallback, the chip changes a conversation from its
@@ -1028,5 +1028,114 @@ describe("a usage limit is an FR-12.6 fallback condition (reviews #101 1·2)", (
     expect(sub({ modelFamily: "opus" })).toMatchObject({ scope: "family:opus" });
     expect(api({ modelFamily: "sonnet" })).toMatchObject({ scope: "family:sonnet" });
     expect(sub({ resetsAt: Number.NaN })).toMatchObject({ until: now + SUBSCRIPTION_COOLDOWN_MS });
+  });
+});
+
+describe("POST /api/settings/preview: per account, nothing stored (review #101 4차)", () => {
+  const post = (t: T, cookie: string | null, body: object, headers: Record<string, string> = {}) =>
+    t.app.inject({
+      method: "POST",
+      url: "/api/settings/preview",
+      headers: {
+        host: "localhost:3000",
+        ...(cookie ? { cookie } : {}),
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+        ...headers,
+      },
+      payload: body,
+    });
+  const opus = { runtime: "claude-code", model: "claude-opus-5-5", effort: "high", useShared: false };
+
+  it("is computed with the caller's own policy and defaults; a forged base gains nothing", async () => {
+    const t = await start();
+    t.connect("claude-code", null);
+    t.connect("codex", null);
+    // The son (owner) may use Haiku only; mom has everything and a Codex default.
+    t.policy("claude-code", { models: ["claude-haiku-5-5"] });
+    await t.as("shared").put("/api/settings/defaults", {
+      defaults: { runtime: "claude-code", models: { codex: { model: "gpt-6-luna", effort: "max" } } },
+    });
+    const son = await post(t, t.f.cookies.owner, { base: opus, change: { model: "claude-opus-5-5" } });
+    expect([son.statusCode, son.json()]).toEqual([403, { error: "model_not_allowed" }]);
+    expect(son.headers["cache-control"]).toBe("no-store");
+    const mom = await post(t, t.f.cookies.shared, { base: opus, change: { runtime: "codex" } });
+    expect(mom.statusCode).toBe(200);
+    expect(mom.headers["cache-control"]).toBe("no-store");
+    expect(ChatSettings.parse(mom.json())).toEqual({
+      runtime: "codex",
+      model: "gpt-6-luna",
+      effort: "max",
+      useShared: false,
+    });
+    // The same change for the son: his own defaults (none for Codex) → Codex's first model.
+    expect(
+      ChatSettings.parse(
+        (await post(t, t.f.cookies.owner, { base: opus, change: { runtime: "codex" } })).json(),
+      ),
+    ).toMatchObject({ model: "gpt-6.1-sol" });
+    // A forged base naming a model he may not use: only the effort was asked, and he still gets an allowed model.
+    const forged = await post(t, t.f.cookies.owner, { base: opus, change: { effort: "low" } });
+    expect(forged.statusCode).toBe(200);
+    expect(ChatSettings.parse(forged.json())).toMatchObject({
+      runtime: "claude-code",
+      model: "claude-haiku-5-5",
+    });
+    // A forged base on a runtime he may not use at all, and "공용으로 쓰기" without a shared Codex connection for him.
+    t.policy("codex", { allowed: false });
+    const off = await post(t, t.f.cookies.owner, {
+      base: { runtime: "codex", model: "gpt-6-luna", effort: null, useShared: false },
+      change: { effort: "low" },
+    });
+    expect([off.statusCode, off.json()]).toEqual([403, { error: "runtime_not_allowed" }]);
+  });
+
+  it("refuses without a session, without CSRF, with a pending password change and for an inactive account", async () => {
+    const t = await start();
+    t.connect("claude-code", null);
+    const body = { base: opus, change: { effort: "low" } };
+    expect((await post(t, null, body)).statusCode).toBe(401);
+    expect((await post(t, t.f.cookies.owner, body, { [CSRF_HEADER]: "" })).statusCode).toBe(403);
+    const noOrigin = await t.app.inject({
+      method: "POST",
+      url: "/api/settings/preview",
+      headers: { host: "localhost:3000", cookie: t.f.cookies.owner },
+      payload: body,
+    });
+    expect(noOrigin.statusCode).toBe(403);
+    expect((await post(t, t.f.cookies.owner, body)).statusCode).toBe(200);
+    // Mom must change her password first; the stranger is deactivated.
+    const users = t.app.users!;
+    users.setPassword(t.f.users.shared.id, users.byId(t.f.users.shared.id)!.passwordHash!, {
+      mustChange: true,
+    });
+    // The password reset ended her session; signing in again gives one that must change the password first.
+    const login = await t.app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { host: "localhost:3000", origin: "http://localhost:3000", [CSRF_HEADER]: "1" },
+      payload: { email: t.f.users.shared.email, password: PW },
+    });
+    expect(login.statusCode).toBe(200);
+    const pending = await post(t, String(login.headers["set-cookie"]).split(";")[0]!, body);
+    expect([pending.statusCode, pending.json()]).toEqual([403, { error: "password_change_required" }]);
+    users.deactivate(t.f.users.stranger.id);
+    expect([401, 403]).toContain((await post(t, t.f.cookies.stranger, body)).statusCode);
+  });
+
+  it("stores nothing: no defaults, no conversation, no settings", async () => {
+    const t = await start();
+    t.connect("claude-code", null);
+    t.connect("codex", null);
+    const c = await t.newConversation();
+    const before = DefaultsResponse.parse((await t.owner.get("/api/settings/defaults")).json());
+    const list = async () =>
+      (await t.owner.get("/api/conversations")).json<{ items: unknown[] }>().items.length;
+    const n = await list();
+    for (const change of [{ runtime: "codex" }, { model: "claude-haiku-5-5" }, { useShared: false }])
+      expect((await post(t, t.f.cookies.owner, { base: c.settings, change })).statusCode).toBe(200);
+    expect(DefaultsResponse.parse((await t.owner.get("/api/settings/defaults")).json())).toEqual(before);
+    expect(await list()).toBe(n);
+    expect((await t.getConversation(c.id)).settings).toEqual(c.settings);
   });
 });
