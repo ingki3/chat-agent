@@ -87,7 +87,11 @@ function walkResult(x: unknown, values: FinanceValue[], ids: Set<string>, depth 
   }
   for (const [k, v] of Object.entries(o)) {
     if (ID_KEYS.has(k)) {
-      for (const s of Array.isArray(v) ? v : [v]) if (typeof s === "string" && /\d/.test(s)) ids.add(s);
+      // Only the strings under an identifier key are identifiers; objects under it (`items: [{ lastClose: … }]`,
+      // finance_chart #31) are records like any other — their numbers are figures (review #111).
+      const list = Array.isArray(v) ? v : [v];
+      for (const s of list) if (typeof s === "string" && /\d/.test(s)) ids.add(s);
+      for (const x of list) if (x && typeof x === "object") walkResult(x, values, ids, depth + 1);
       continue;
     }
     if (stamp && typeof v === "number" && Number.isFinite(v) && !META_KEYS.has(k))

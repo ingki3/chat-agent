@@ -575,6 +575,9 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "doc_create",
       // Finance tools (#30): the owner is an adult with every skill.
       ...FINANCE_TOOLS.map((t) => t.name),
+      // Finance chart and 관심 종목 (#31): made of the finance tools, offered with them.
+      "finance_chart",
+      "watchlist_get",
       "skill_selftest",
     ]);
     expect(ctx.mcp!.url).toBe((await app.mcp!.endpoint()).url);

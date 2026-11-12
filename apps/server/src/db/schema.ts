@@ -913,3 +913,22 @@ export const scheduleProposals = sqliteTable(
   },
   (t) => [index("schedule_proposals_conversation_idx").on(t.conversationId)],
 );
+
+/**
+ * 관심 종목 (#31, FR-7.7): one person's list of Korean and US symbols, owner only (the admin cannot read it either,
+ * FR-1.5). `name` is the display name picked from the search (third-party text, scrubbed on write).
+ */
+export const watchlistItems = sqliteTable(
+  "watchlist_items",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    market: text("market", { enum: ["KR", "US"] }).notNull(),
+    symbol: text("symbol").notNull(),
+    name: text("name"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [uniqueIndex("watchlist_items_user_symbol_idx").on(t.userId, t.market, t.symbol)],
+);

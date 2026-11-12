@@ -45,6 +45,10 @@ export const TablePart = z.object({
   rows: z.array(z.record(z.string(), z.union([z.string(), z.number(), z.null()]))),
   source: z.string().optional(),
   asOf: z.string().optional(),
+  /** The `table` artifact holding the same data (#31: a finance table is both a part and an artifact). */
+  artifactId: z.string().optional(),
+  /** The version of that artifact this part shows (#31: replaced when the same run stores a newer one). */
+  artifactVersion: z.number().int().positive().optional(),
 });
 /** `── 여기부터 Codex · ○○ ──` and "앞부분은 요약해서 넘겼어요" markers. */
 export const DividerPart = z.object({

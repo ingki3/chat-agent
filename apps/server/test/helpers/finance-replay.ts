@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FinanceWorker } from "../../src/finance/service.js";
-import type { RawResponse, RawStep } from "../../src/web/service.js";
+import { RAW_JOB_LIMITS, type RawResponse, type RawStep } from "../../src/web/service.js";
 
 /**
  * Recorded (or synthetic) answers of the finance tools' data sources (#30), replayed instead of the network.
@@ -56,6 +56,9 @@ export function replayWorker(exchanges: readonly Exchange[]) {
   const missing: string[] = [];
   const used = new Set<Exchange>();
   const worker: FinanceWorker = async (job) => {
+    // The real worker's step limit (worker.mjs RAW_LIMITS): a job it would refuse is refused here too.
+    if (job.steps.length < 1 || job.steps.length > RAW_JOB_LIMITS.maxSteps)
+      return { ok: false, code: "web_bad_input" };
     const responses: RawResponse[] = [];
     for (const step of job.steps) {
       requested.push(step);

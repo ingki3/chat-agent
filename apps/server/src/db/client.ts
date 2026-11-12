@@ -17,6 +17,9 @@ export function openDb(file: string): Db {
   sqlite.pragma("foreign_keys = ON");
   sqlite.pragma("busy_timeout = 5000");
   sqlite.pragma("synchronous = NORMAL");
+  // Freed and overwritten cells are zeroed on every write (review #111): a row the rescrub masks or removes leaves
+  // no copy of the old value in the page — and, once the rescrub checkpoints, in no WAL frame either.
+  sqlite.pragma("secure_delete = ON");
   return drizzle(sqlite, { schema }) as Db;
 }
 

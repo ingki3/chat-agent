@@ -125,6 +125,14 @@ export const LOG_EVENTS = [
   "restore.recovered",
   // Known secrets (review round 26): a background rescrub pass failed; it is retried (fixed code, no content).
   "secrets.rescrub_failed",
+  // The files are not clean yet after a pass changed rows: a reader blocked the WAL checkpoint; retried (#111).
+  "secrets.rescrub_checkpoint_busy",
+  // Settling the clean-up markers after a checkpoint failed (e.g. no space for the write): retried (#111 round 6).
+  "secrets.rescrub_cleanup_failed",
+  // The one-time compaction for secure_delete ran at start-up (#111): duration only.
+  "storage.compacted",
+  // The compaction did not run (most likely no free space for the rewrite): error class only; retried next start.
+  "storage.compact_failed",
   // Schedules (#33): ids, trigger, attempt, lateness and fixed codes — never the name or the prompt.
   "schedule.run_started",
   "schedule.run_finished",

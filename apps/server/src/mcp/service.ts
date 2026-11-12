@@ -18,8 +18,17 @@ import {
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
 import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
-import { FINANCE_TOOLS, type FinanceToolInfo } from "@agentlee/mcp-tools/finance";
+import {
+  FINANCE_CHART_TOOL,
+  FINANCE_TOOLS,
+  WATCHLIST_GET_TOOL,
+  type FinanceComposedToolInfo,
+  type FinanceToolInfo,
+} from "@agentlee/mcp-tools/finance";
 import { FinanceService, type FinanceOptions } from "../finance/service.js";
+import { buildFinanceArtifacts, fetchDataset, type ChartInput } from "../finance/chart.js";
+import { finalize } from "../finance/records.js";
+import { watchSymbolOk, type WatchlistStore } from "../watchlist/store.js";
 import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
 import { SCHEDULE_CREATE_TOOL } from "@agentlee/mcp-tools/schedules";
 import type { ScheduleProposalStore } from "../schedules/proposals.js";
@@ -47,7 +56,7 @@ import type { ErrorLog } from "../observability/errors.js";
 import type { SkillSwitches } from "./switches.js";
 import type { PythonRuntime } from "./python.js";
 import type { SourceStore } from "../web/sources.js";
-import { scrubKnownDeep } from "../secrets/known.js";
+import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import {
   DUCKDUCKGO_HOSTS,
   duckDuckGoProvider,
@@ -286,6 +295,12 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * The query sent in place of one that carries a known secret (watchlist search, review #111 round 3): fixed, never the
+ * user's text, harmless, and its hits are never shown.
+ */
+export const SEARCH_DECOY = "agentlee decoy no match";
+
 /** Sources `sources_list` returns at most (the newest). */
 const SOURCES_LIST_MAX = 100;
 
@@ -330,6 +345,8 @@ export type McpServiceOptions = {
   docs?: DocGenService;
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
+  /** 관심 종목 (#31): `watchlist_get` reads the run's user's list. Without it the tool is not offered. */
+  watchlist?: WatchlistStore;
   /** Schedule proposals (#55): `schedule_create` stores what it proposes. Without it the tool is not offered. */
   scheduleProposals?: ScheduleProposalStore;
   /** The server allow-list switches (#35). Without it every skill is on. */
@@ -391,6 +408,8 @@ export class McpService {
   /** Finance tools (#30), when configured: each user gets those of the finance skills they may use. */
   readonly finance: FinanceService | undefined;
   private readonly financeTools: readonly FinanceToolInfo[];
+  /** `finance_chart` and `watchlist_get` (#31): offered to a user who may use one of their finance skills. */
+  private readonly composedTools: readonly FinanceComposedToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -429,6 +448,10 @@ export class McpService {
         )
       : undefined;
     this.financeTools = this.finance ? FINANCE_TOOLS : [];
+    this.composedTools = [
+      ...(this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : []),
+      ...(opts.watchlist ? [WATCHLIST_GET_TOOL] : []),
+    ];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
   }
@@ -479,7 +502,10 @@ export class McpService {
 
   /** Every tool this server offers (without the `mcp__agentlee__` prefix) — for log registration. */
   toolNames(): string[] {
-    return toolNames({ skills: this.skills, tools: [...this.tools, ...this.financeTools] });
+    return toolNames({
+      skills: this.skills,
+      tools: [...this.tools, ...this.financeTools, ...this.composedTools],
+    });
   }
 
   /**
@@ -513,7 +539,16 @@ export class McpService {
   }
 
   private toolsFor(userId: string): ServerToolInfo[] {
-    return [...this.tools, ...this.financeTools.filter((t) => this.allows(userId, t.skill))];
+    return [
+      ...this.tools,
+      ...this.financeTools.filter((t) => this.allows(userId, t.skill)),
+      ...this.composedTools.filter((t) => this.allowsAny(userId, t.skills)),
+    ];
+  }
+
+  /** Whether this user may use at least one of these skills now (`allows`). */
+  allowsAny(userId: string, skills: readonly string[]): boolean {
+    return skills.some((s) => this.allows(userId, s));
   }
 
   private skillsFor(userId: string): BundledSkill[] {
@@ -556,6 +591,7 @@ export class McpService {
     const runSkill = this.runner;
     const toolByName = new Map(this.tools.map((t) => [t.name, t]));
     const financeByName = new Map(this.financeTools.map((t) => [t.name, t]));
+    const composedByName = new Map(this.composedTools.map((t) => [t.name, t]));
     const byName = new Map(this.skills.map((s) => [s.name, s]));
     const now = () => Date.now();
     return {
@@ -598,10 +634,37 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
-      tools: [...this.tools, ...this.financeTools],
+      tools: [...this.tools, ...this.financeTools, ...this.composedTools],
       toolsFor: (userId) => this.toolsFor(userId),
       runTool: async (name, input, scope) => {
         const t0 = now();
+        const composed = composedByName.get(name);
+        if (composed) {
+          const r =
+            composed.name === FINANCE_CHART_TOOL.name
+              ? await this.callFinanceChart(input, scope)
+              : this.callWatchlist(input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "finance.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            ...(r.ok ? {} : { financeCode: r.code }),
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return r;
+        }
         const fin = financeByName.get(name);
         if (fin) {
           const r = await this.callFinanceTool(fin, input, scope);
@@ -867,6 +930,158 @@ export class McpService {
         code: "finance_busy",
       }
     );
+  }
+
+  /**
+   * `finance_chart` (#31): the data through the finance tools — each part checked against the user's finance skills
+   * (KR → kr-stock-skill, US → us-stock-skill, the exchange rate → kr-stock-skill) — in one process slot, then one
+   * computation into a `table` and a `chart` artifact of the token's conversation (the store checks its owner). The
+   * result is a finance result like the others (stamped values, `sources`, disclaimer) plus the two artifacts.
+   */
+  private async callFinanceChart(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const finance = this.finance;
+    const store = this.opts.artifacts;
+    if (!finance || !store || !this.allowsAny(scope.userId, FINANCE_CHART_TOOL.skills))
+      return { ok: false, code: "finance_not_allowed" };
+    const parsed = z.strictObject(FINANCE_CHART_TOOL.input).safeParse(input);
+    if (!parsed.success) return { ok: false, code: "finance_bad_input" };
+    const data = parsed.data as ChartInput;
+    const byName = new Map(FINANCE_TOOLS.map((t) => [t.name, t]));
+    const r = await this.withSlot(scope, () =>
+      fetchDataset(
+        data,
+        async (tool, args) => {
+          const t = byName.get(tool);
+          // Checked again per call: a permission may change during the run.
+          if (!t || !this.allows(scope.userId, t.skill)) return { ok: false, code: "finance_not_allowed" };
+          return finance.run(t, args);
+        },
+        (skill) => this.allows(scope.userId, skill),
+        (this.opts.finance?.now ?? Date.now)(),
+      ),
+    );
+    if (!r) return { ok: false, code: "finance_busy" };
+    if (!r.ok) return { ok: false, code: r.code };
+    const built = buildFinanceArtifacts(r.data, data.title);
+    try {
+      const table = store.create(scope, { kind: "table", title: built.table.title, table: built.table.data });
+      const chart = store.create(scope, { kind: "chart", title: built.chart.title, chart: built.chart.spec });
+      const ref = (a: typeof table) => ({
+        artifactId: a.artifact.id,
+        version: a.version.version,
+        url: artifactPath(a.artifact.id),
+      });
+      return {
+        ok: true,
+        output: scrubKnownDeep(
+          finalize(FINANCE_CHART_TOOL.name, {
+            ...built.summary,
+            table: { ...ref(table), title: table.artifact.title, rows: built.table.data.rows.length },
+            chartArtifact: { ...ref(chart), title: chart.artifact.title },
+            shown:
+              "The table and the chart are already shown to the user (artifact cards and the table in the answer). Do not repeat the rows; summarise with the labels of sources.",
+          }),
+        ),
+      };
+    } catch (e) {
+      if (e instanceof ArtifactError) return { ok: false, code: e.code };
+      throw e;
+    }
+  }
+
+  /**
+   * `watchlist_get` (#31, FR-7.7): the token's user's own list, only of the markets whose finance skill they may use
+   * now. Names are third-party text (the search), framed as external content.
+   */
+  private callWatchlist(input: Record<string, unknown>, scope: ToolScope): SkillResult {
+    const store = this.opts.watchlist;
+    if (!store || !this.allowsAny(scope.userId, WATCHLIST_GET_TOOL.skills))
+      return { ok: false, code: "finance_not_allowed" };
+    if (!z.strictObject(WATCHLIST_GET_TOOL.input).safeParse(input).success)
+      return { ok: false, code: "finance_bad_input" };
+    const markets = this.watchMarkets(scope.userId);
+    const items = store.list(scope.userId).filter((i) => markets.includes(i.market));
+    return {
+      ok: true,
+      output: scrubKnownDeep({
+        tool: WATCHLIST_GET_TOOL.name,
+        items: items.map((i) => ({ market: i.market, symbol: i.symbol })),
+        names: frameExternal({
+          source: "watchlist",
+          content: items.map((i) => `${i.symbol}: ${i.name ?? ""}`).join("\n") || "(empty)",
+        }),
+        count: items.length,
+        ...(items.length
+          ? {}
+          : { hint: "The list is empty: the user adds symbols on the 관심 종목 screen." }),
+      }),
+    };
+  }
+
+  /** Markets this user may use now: KR with kr-stock-skill, US with us-stock-skill (#31). */
+  watchMarkets(userId: string): ("KR" | "US")[] {
+    return [
+      ...(this.allows(userId, "kr-stock-skill") ? (["KR"] as const) : []),
+      ...(this.allows(userId, "us-stock-skill") ? (["US"] as const) : []),
+    ];
+  }
+
+  /**
+   * The 관심 종목 search (#31): Korean names and codes through `kr_search` (Naver 증권, its own egress) when the user
+   * may use kr-stock-skill; a typed US ticker is offered as it is (there is no US name search). Never throws.
+   */
+  async searchSymbols(
+    userId: string,
+    q: string,
+  ): Promise<
+    | {
+        ok: true;
+        items: { market: "KR" | "US"; symbol: string; name: string | null; exchange: string | null }[];
+      }
+    | { ok: false; code: string }
+  > {
+    const markets = this.watchMarkets(userId);
+    if (!markets.length) return { ok: false, code: "finance_not_allowed" };
+    const items: { market: "KR" | "US"; symbol: string; name: string | null; exchange: string | null }[] = [];
+    // A query that carries a known secret (raw, encoded, cut off) never leaves — and its answer must not tell it
+    // apart from any other query (review #111 rounds 2–3): it takes exactly the ordinary path — the same checks, the
+    // same process slot, the same worker call and error handling (busy, unreachable, timeout) — with a fixed decoy
+    // query in its place, whose hits are dropped. FinanceService checks every outgoing URL again.
+    const upper = q.trim().toUpperCase();
+    const search = FINANCE_TOOLS.find((t) => t.name === "kr_search");
+    // One predicate (review #111 round 4): the egress guard's own decision on the request this query would make
+    // (shared matcher + the configured secrets' windows), and on the typed ticker that would be shown back.
+    const fin = this.finance;
+    const secret =
+      scrubKnown(q) !== q ||
+      scrubKnown(upper) !== upper ||
+      (!!fin && !!search && (fin.refuses(search, { query: q.trim() }) || fin.refusesText(upper)));
+    // A typed ticker is offered only when it may be stored (the same single check as adding, review #111).
+    if (!secret && markets.includes("US") && watchSymbolOk("US", upper))
+      items.push({ market: "US", symbol: upper, name: null, exchange: null });
+    if (markets.includes("KR") && this.finance && search) {
+      const parsed = z.strictObject(search.input).safeParse({ query: q.trim() });
+      if (parsed.success) {
+        const scope = { userId, conversationId: "watchlist", runId: `watchlist:${userId}` };
+        const input = secret ? { query: SEARCH_DECOY } : parsed.data;
+        const r = await this.withSlot(scope, () => this.finance!.run(search, input));
+        if (!r) return { ok: false, code: "finance_busy" };
+        if (r.ok) {
+          const found = secret ? [] : (r.output as { items?: unknown }).items;
+          for (const x of Array.isArray(found) ? found : []) {
+            const o = x as { code?: unknown; name?: unknown; market?: unknown };
+            if (typeof o.code === "string" && /^\d{6}$/.test(o.code))
+              items.push({
+                market: "KR",
+                symbol: o.code,
+                name: typeof o.name === "string" ? o.name : null,
+                exchange: typeof o.market === "string" ? o.market : null,
+              });
+          }
+        } else if (!items.length) return { ok: false, code: r.code };
+      }
+    }
+    return { ok: true, items: items.slice(0, 11) };
   }
 
   /** A web tool call: active user, strict input, a process slot like a skill, then the web service. */

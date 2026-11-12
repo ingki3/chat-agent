@@ -1,4 +1,4 @@
-import { Fragment, memo, useMemo } from "react";
+import { Fragment, memo, useMemo, useState } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
 import { files } from "../api.js";
 import { RichText } from "./RichText.js";
@@ -105,24 +105,57 @@ function Tools({
 
 const fmt = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 6 });
 
-/** Structured table part: numbers right-aligned (finance details come with #31). */
+type Cell = string | number | null | undefined;
+/** Column order: numbers by value, text by Korean collation; empty cells last either way. */
+export function compareCells(a: Cell, b: Cell, dir: 1 | -1): number {
+  const ea = a === null || a === undefined || a === "";
+  const eb = b === null || b === undefined || b === "";
+  if (ea || eb) return ea === eb ? 0 : ea ? 1 : -1;
+  if (typeof a === "number" && typeof b === "number") return (a - b) * dir;
+  return String(a).localeCompare(String(b), "ko", { numeric: true }) * dir;
+}
+
+/**
+ * Structured table part (finance, #31): numbers right-aligned, sortable by any column (click the header again to
+ * reverse; the original order comes back on the third click). A finance table carries a source and an as-of column
+ * on every row and is the same data as its `table` artifact (CSV download there).
+ */
 export function TableView({ t }: { t: TablePart }) {
+  const [sort, setSort] = useState<{ key: string; dir: 1 | -1 } | null>(null);
   const numeric = t.columns.map((c) => t.rows.some((r) => typeof r[c.key] === "number"));
+  const rows = useMemo(() => {
+    if (!sort) return t.rows;
+    return [...t.rows].sort((a, b) => compareCells(a[sort.key], b[sort.key], sort.dir));
+  }, [t.rows, sort]);
+  const toggle = (key: string) =>
+    setSort((s) => (s?.key !== key ? { key, dir: 1 } : s.dir === 1 ? { key, dir: -1 } : null));
   return (
-    <div className="tablewrap" data-testid="table-part">
+    <div className={`tablewrap${t.rows.length > 12 ? " tall" : ""}`} data-testid="table-part">
       <table>
         <thead>
           <tr>
-            {t.columns.map((c, i) => (
-              <th key={c.key} className={numeric[i] ? "num" : undefined}>
-                {c.label}
-                {c.unit ? <span className="muted"> ({c.unit})</span> : null}
-              </th>
-            ))}
+            {t.columns.map((c, i) => {
+              const on = sort?.key === c.key;
+              return (
+                <th
+                  key={c.key}
+                  className={numeric[i] ? "num" : undefined}
+                  aria-sort={on ? (sort.dir === 1 ? "ascending" : "descending") : "none"}
+                >
+                  <button type="button" className="sort" onClick={() => toggle(c.key)}>
+                    {c.label}
+                    {c.unit ? <span className="muted"> ({c.unit})</span> : null}
+                    <span aria-hidden="true" className="sort-mark">
+                      {on ? (sort.dir === 1 ? " ▲" : " ▼") : ""}
+                    </span>
+                  </button>
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
-          {t.rows.map((r, ri) => (
+          {rows.map((r, ri) => (
             <tr key={ri}>
               {t.columns.map((c, i) => {
                 const v = r[c.key];

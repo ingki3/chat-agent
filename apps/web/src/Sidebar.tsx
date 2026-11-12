@@ -124,6 +124,9 @@ export function Sidebar({
       <NavLink className="item" to="/artifacts">
         🧩 아티팩트
       </NavLink>
+      <NavLink className="item" to="/watchlist">
+        ⭐ 관심 종목
+      </NavLink>
       <NavLink className="item" to="/settings">
         ⚙️ 설정
       </NavLink>

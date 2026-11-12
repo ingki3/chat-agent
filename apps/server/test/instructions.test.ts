@@ -132,7 +132,7 @@ describe("assembly", () => {
           const r = assembleInstructions({ user, mode, tools, now: NOW });
           expect(r.versions).toEqual([
             "common@3",
-            ...(kind === "finance" ? ["finance@2"] : []),
+            ...(kind === "finance" ? ["finance@3"] : []),
             ...(user.youth ? ["youth@2"] : []),
             ...(mode === "research" ? ["research@2"] : []),
           ]);
@@ -482,7 +482,7 @@ describe("run manager assembles per run", () => {
   it("the finance section follows the run's tools", async () => {
     const { f, claude, reply } = await family({ tools: ["echo_time", FAKE_FINANCE_TOOL] });
     const { run } = await reply(f.users.owner.id);
-    expect(run.instructions).toBe("common@3,finance@2");
+    expect(run.instructions).toBe("common@3,finance@3");
     expect(claude.systemPrompts[0]).toContain(FINANCE_HEADING);
     const plain = await family({ tools: ["echo_time"] });
     expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@3");

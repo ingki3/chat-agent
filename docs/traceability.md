@@ -49,11 +49,11 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-6.6 | 아티팩트 목록 화면 | #28, #52 | E | 🟨 (#28 "내가 만든 것" — 모든 대화의 내 아티팩트, 최근 순, 그 대화의 패널로 다시 열기, `GET /api/artifacts`(본인만: 가족 네 계정·비로그인 시험) — `artifacts.test.ts`·`e2e/artifact-panel.spec.ts`. "공유받은 것"은 #52까지 빈 화면) |
 | FR-7.1 | 한국 주식 | #30, #21 | U, M | 🟨 (#30 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`(네이버 증권) — 합성 응답 스냅샷 `finance.test.ts`. 실데이터 녹화·실런타임 확인은 `docs/evidence/finance/checklist.md`) |
 | FR-7.2 | 미국 주식 | #30 | U, M | 🟨 (#30 `us_*` 9개(Yahoo Finance) — 합성 응답 스냅샷. 녹화·실런타임은 체크리스트) |
-| FR-7.3 | 환율(비교·환산에만) | #30, #31 | U | 🟨 (#30 `fx_usdkrw` — 비교·환산 용도 명시. 비교 화면은 #31) |
+| FR-7.3 | 환율(비교·환산에만) | #30, #31 | U | 🟨 (#30 `fx_usdkrw` — 비교·환산 용도 명시. #31 `range`로 일별 종가, `finance_chart`의 원화·달러 기준 환산(날짜 이하 최근 종가, 행마다 환율 기준 시각) — `finance-chart.test.ts`. 실데이터는 체크리스트) |
 | FR-7.4 | 공시 DART·SEC | #30 | U, M | 🟨 (#30 `dart_disclosures`·`sec_8k`·`sec_form4`·`sec_13f` — 합성 응답 스냅샷, 제목은 `<external_content>`. 키(`OPENDART_API_KEY`·`SEC_USER_AGENT`)로 실호출 확인은 체크리스트) |
-| FR-7.5 | 정렬 표·대화형 차트·통화 기준 | #31, #51 | U, E | ⬜ (#51 차트 저장 = PNG·PDF 내보내기 완료. 표·차트 자체는 #31) |
-| FR-7.6 | 모든 숫자에 출처·기준 시각 | #30, #31 | U | 🟨 (#30 값마다 `{source, asOf, timeZone, delayed, kind}`, 휴장일 → 최근 거래일 종가, 결과 검사(`finalize`)와 답변 검사(`finance_note`) — `finance.test.ts`·`finance-runs.test.ts`·`e2e/finance.spec.ts`. 차트·표는 #31) |
-| FR-7.7 | 관심 종목 | #31 | I, E | ⬜ |
+| FR-7.5 | 정렬 표·대화형 차트·통화 기준 | #31, #51 | U, E | 🟨 (#31 `finance_chart`: 같은 데이터로 `table`·`chart` 아티팩트와 정렬되는 표 부분, 가격 선·캔들·비교(%)·재무 막대, 툴팁·확대·원화/달러 전환(CSS, 스크립트 없음), 차트 끝점 = 표 값 — `finance-chart.test.ts`·`finance-chart-runs.test.ts`(두 런타임 재생)·`e2e/finance-chart.spec.ts`. #51 PNG·PDF. 합성 데이터 — 실데이터는 ops.md §30.5) |
+| FR-7.6 | 모든 숫자에 출처·기준 시각 | #30, #31 | U | 🟨 (#30 값마다 `{source, asOf, timeZone, delayed, kind}`, 휴장일 → 최근 거래일 종가, 결과 검사(`finalize`)와 답변 검사(`finance_note`) — `finance.test.ts`·`finance-runs.test.ts`·`e2e/finance.spec.ts`. #31 표는 행마다 출처·기준 시각 열, 차트 아래 출처·환율 메모) |
+| FR-7.7 | 관심 종목 | #31 | I, E | ✅ (#31 `/watchlist` 검색·추가·제거, `watchlist_items`(0023), 주인만(권한 행렬), `watchlist_get`(금융 숨김 계정 제외) — `finance-chart-runs.test.ts`·`e2e/finance-chart.spec.ts`) |
 | FR-7.8 | 면책 문구, 매매 금지 | #20, #30 | U | ✅ (#20 금융 지침, #30 공통 금융 출력기가 금융 도구를 쓴 모든 답변·후속 답변·예약 실행에 면책 첨부 — `finance-runs.test.ts`, 변이 시험) |
 | FR-8.1 | 대화·예약 화면에서 만들기 | #55 | E | ✅ (#55 MCP 도구 `schedule_create`(두 런타임 공통)는 제안만 저장(`schedule_proposals`, 0022) → 답 아래 확인 카드 → 주인이 “예약 만들기”를 눌러야 생성(본인 세션의 API, 한 번만). 화면의 새 예약 폼 — `test/schedule-ui.test.ts`, `e2e/schedules.spec.ts`, 변이 시험. docs/ops.md §28) |
 | FR-8.2 | 예약 항목, 기본값 자동 적용 | #33, #55 | I | 🟨 (#33 `schedules` 표(0020): 이름·프롬프트(저장 시 가림·재가림)·다섯 유형·시간대(기본 서울)·스킬·알림(기본 켬)·런타임·모델·추론 강도. 만들 때 안 주면 만든 사람의 기본값(FR-12.6 대체), 주면 칩과 같은 검사(403) — `test/schedules.test.ts` "schedule API". #55 폼: 기본값으로 시작, 칩(허용·사용 가능한 것만, 서버 미리보기)으로만 바꿈, 허용 안 된 모델 만들기·수정 403 — `test/schedule-ui.test.ts`) |
@@ -146,7 +146,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | AC-1 | #5, #8, #9, #13 | E, M | — | ⬜ |
 | AC-2 | #48, #23, #24 | E, M | 예 | ⬜ |
 | AC-3 | #25 | U, E | 예 | 🟨 (#25 실패 상태마다 ⚠️, 정상 표시 경로 없음(모르는 상태 값 포함) — 단위·E2E. 두 런타임 녹화 형식 재생으로 네 fixture 시나리오 같은 결과 — `citation-runs.test.ts`. 실런타임은 `docs/evidence/citations/checklist.md`) |
-| AC-4 | #30, #31 | U, E, M | 예 | 🟨 (#30 두 런타임 녹화 형식 재생으로 "AAPL, 005930 현재가" → 출처·기준 시각·면책(`finance-runs.test.ts`), 화면 `e2e/finance.spec.ts`. 표·차트 아티팩트는 #31, 실런타임은 `docs/evidence/finance/checklist.md`) |
+| AC-4 | #30, #31 | U, E, M | 예 | 🟨 (#30 두 런타임 녹화 형식 재생으로 "AAPL, 005930 현재가" → 출처·기준 시각·면책(`finance-runs.test.ts`), 화면 `e2e/finance.spec.ts`. #31 "AAPL, 005930 6개월 비교 차트" → 표·차트 아티팩트(출처·기준 시각, 차트 끝점 = 표 값)를 두 런타임 녹화 재생과 FakeRuntime으로(`finance-chart-runs.test.ts`), 화면 `e2e/finance-chart.spec.ts` — 합성 시세. 실런타임·실데이터는 `docs/evidence/finance/checklist.md`·ops.md §30.5) |
 | AC-5 | #33, #56, #34, #57 | U, M | — | 🟨 (#34 알림 부분: 자동 시험 완료, 실기기 체크리스트 대기. #33 예외 자동 시험(가짜 시계): 2분 뒤 재시도 1회, 정지 중 회차 2개 이상 → 1회, 겹침 건너뜀, 서머타임 두 규칙, 시작 오차 ±1분 측정(실제 시계 1초 미만) — `test/schedules.test.ts`. 7일 실측은 #56·#57) |
 | AC-6 | #10, #29 | I | — | ⬜ |
 | AC-7 | #19 | E | — | ✅ (설정 → 새 대화 → 바로 보내기가 기본값으로, 미설정은 Opus 5.5, 막히면 대체 + 안내 1회 — `e2e/runtime-chip.spec.ts`) |
