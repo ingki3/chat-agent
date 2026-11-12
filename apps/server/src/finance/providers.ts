@@ -1,6 +1,6 @@
 import { frameExternal } from "@agentlee/shared";
 import type { RawResponse, RawStep } from "../web/service.js";
-import { localDate, previousTradingDay, SESSIONS, zonedInstant } from "./calendar.js";
+import { FX_TIME_ZONE, isoLocal, localDate, previousTradingDay, SESSIONS, zonedInstant } from "./calendar.js";
 import {
   dateStamp,
   dayStamp,
@@ -147,19 +147,37 @@ const krIndex: ToolImpl = {
   parse: (rounds, i, ctx) => naverBasic(rounds[0]?.[0], ctx, "index", String(i.index)),
 };
 
+/** Rows of one Naver price page. */
+const KR_PAGE = 60;
+
 const krHistory: ToolImpl = {
-  plan: (i) => ({
-    steps: [{ url: `${NAVER_API}/stock/${String(i.code)}/price?pageSize=${Number(i.days ?? 20)}&page=1` }],
-  }),
+  plan: (i) => {
+    const days = Number(i.days ?? 20);
+    // Up to 60 a page in one request; longer histories (the 6-month chart, #31) page by 60.
+    if (days <= KR_PAGE)
+      return { steps: [{ url: `${NAVER_API}/stock/${String(i.code)}/price?pageSize=${days}&page=1` }] };
+    return {
+      steps: Array.from({ length: Math.ceil(days / KR_PAGE) }, (_, k) => ({
+        url: `${NAVER_API}/stock/${String(i.code)}/price?pageSize=${KR_PAGE}&page=${k + 1}`,
+      })),
+    };
+  },
   parse: (rounds, i, ctx) => {
-    const j = json(rounds[0]?.[0]);
-    if (!j.ok) return fail(j.code);
-    if (!Array.isArray(j.v)) return fail("finance_bad_response");
-    if (!j.v.length) return fail("finance_not_found");
-    const rows = j.v.slice(0, Number(i.days ?? 20)).flatMap((x) => {
+    const pages: unknown[] = [];
+    for (const r of rounds[0] ?? []) {
+      const j = json(r);
+      if (!j.ok) return fail(j.code);
+      if (!Array.isArray(j.v)) return fail("finance_bad_response");
+      pages.push(...j.v);
+      if (j.v.length < KR_PAGE) break; // the last page
+    }
+    if (!pages.length) return fail("finance_not_found");
+    const seen = new Set<string>();
+    const rows = pages.slice(0, Number(i.days ?? 20)).flatMap((x) => {
       const o = obj(x);
       const day = typeof o?.localTradedAt === "string" ? o.localTradedAt.slice(0, 10) : "";
-      if (!o || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return [];
+      if (!o || !/^\d{4}-\d{2}-\d{2}$/.test(day) || seen.has(day)) return [];
+      seen.add(day);
       const s = dayStamp({ market: "KRX", day, now: ctx.now, source: NAVER });
       const meta = rowMeta(s);
       return [
@@ -323,8 +341,8 @@ const usIndex: ToolImpl = {
 };
 
 const fxUsdKrw: ToolImpl = {
-  plan: () => ({ steps: [{ url: chartUrl("KRW=X", "5d", "1d") }] }),
-  parse: (rounds, _i, ctx) => {
+  plan: (i) => ({ steps: [{ url: chartUrl("KRW=X", i.range ? String(i.range) : "5d", "1d") }] }),
+  parse: (rounds, i, ctx) => {
     const c = chartOf(rounds[0]?.[0]);
     if (!c.ok) return fail(c.code);
     const m = c.c.meta;
@@ -341,10 +359,37 @@ const fxUsdKrw: ToolImpl = {
         change: val(change, stamp, "KRW"),
         changePercent: val(change !== null && prev ? round((change / prev) * 100, 3) : null, stamp, "%"),
         use: "한·미 주식 비교와 원화 환산에만 쓴다 (PRD FR-7.3).",
+        ...(i.range ? { rows: fxRows(c.c, stamp, ctx) } : {}),
       },
     };
   },
 };
+
+/**
+ * USD/KRW daily closes (#31), newest first. Yahoo's FX bars are UTC days; a finished day's close is stamped at that
+ * day's 17:00 New York (the FX day's end, `FX_TIME_ZONE`), the latest bar with the quote's own stamp.
+ */
+function fxRows(c: Chart, latest: Stamp, ctx: FinanceCtx): Obj[] {
+  const rows: Obj[] = [];
+  const last = c.timestamps.length - 1;
+  for (let k = last; k >= 0 && rows.length < HISTORY_ROWS; k--) {
+    const close = num(c.quote.close[k]);
+    if (close === null) continue;
+    const date = localDate(c.timestamps[k]!, "UTC");
+    const stamp: Stamp =
+      k === last
+        ? latest
+        : {
+            source: YAHOO,
+            asOf: isoLocal(Math.min(zonedInstant(date, "17:00", FX_TIME_ZONE), ctx.now), FX_TIME_ZONE),
+            timeZone: FX_TIME_ZONE,
+            delayed: false,
+            kind: "close",
+          };
+    rows.push({ date, close: round(close), ...rowMeta(stamp) });
+  }
+  return rows;
+}
 
 const HISTORY_ROWS = 260;
 

@@ -7,6 +7,7 @@ import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ArtifactsPage } from "./pages/ArtifactsPage.js";
+import { WatchlistPage } from "./pages/WatchlistPage.js";
 import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
@@ -79,6 +80,7 @@ function AuthGate() {
           <Route path="schedules/new" element={<SchedulesPage creating />} />
           <Route path="schedules/:id" element={<ScheduleRoute />} />
           <Route path="artifacts" element={<ArtifactsPage />} />
+          <Route path="watchlist" element={<WatchlistPage />} />
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
           <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />

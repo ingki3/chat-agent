@@ -100,8 +100,13 @@ export const FINANCE_TOOLS: readonly FinanceToolInfo[] = [
     name: "fx_usdkrw",
     skill: "kr-stock-skill",
     hosts: YAHOO_CHART_HOSTS,
-    description: `USD/KRW exchange rate (Yahoo Finance) — only for comparing Korean and US stocks or converting to won. ${NUMBERS}`,
-    input: {},
+    description: `USD/KRW exchange rate (Yahoo Finance) — only for comparing Korean and US stocks or converting to won. With range, also the daily closes (rows, newest first). ${NUMBERS}`,
+    input: {
+      range: z
+        .enum(["1mo", "3mo", "6mo", "1y"])
+        .optional()
+        .describe("Daily closes over this range as well (rows)."),
+    },
   },
   {
     name: "us_quote",
@@ -230,3 +235,50 @@ export const FINANCE_TOOLS: readonly FinanceToolInfo[] = [
 ];
 
 export const FINANCE_TOOL_NAMES: ReadonlySet<string> = new Set(FINANCE_TOOLS.map((t) => t.name));
+
+/**
+ * Finance tools made of the ones above (#31): they belong to several finance skills and are offered to a user who
+ * may use at least one of `skills` (FR-1.6; youth accounts without finance see none, #30). Each call checks again
+ * which of its parts that user may use.
+ */
+export type FinanceComposedToolInfo = ServerToolInfo & { skills: readonly FinanceSkill[] };
+
+const chartSymbol = z
+  .string()
+  .regex(/^(\d{6}|[A-Z][A-Z0-9.-]{0,9})$/)
+  .describe("6-digit KRX code (005930) or US ticker in capitals (AAPL).");
+
+export const FINANCE_CHART_TOOL: FinanceComposedToolInfo = {
+  name: "finance_chart",
+  skills: ["kr-stock-skill", "us-stock-skill"],
+  description:
+    "Makes a finance table and a chart from the same data in one call (Korean and US stocks mixed) and saves both as artifacts the user sees: a `table` artifact (sortable, CSV download, a source and as-of column on every row) and a `chart` artifact (tooltips, zoom, 원화/달러 기준 switch with the exchange rate's as-of time). chart: compare = return % from the first day (default for several symbols), line = price (default for one), candle = OHLC of one symbol, financials = US annual/quarterly figures as bars. Use it whenever the user asks for a chart, a comparison or a table of stock prices; do not draw finance charts with artifact_create. The result has each symbol's first and last close and return with their sources and as-of times — quote them with those labels.",
+  input: {
+    symbols: z.array(chartSymbol).min(1).max(5),
+    chart: z.enum(["compare", "line", "candle", "financials"]).optional(),
+    range: z.enum(["1mo", "3mo", "6mo", "1y"]).optional().describe("Default 6mo (price charts)."),
+    currency: z
+      .enum(["KRW", "USD"])
+      .optional()
+      .describe("Basis shown first when Korean and US stocks are mixed (default KRW). Both can be switched."),
+    metric: z
+      .enum(["revenue", "operatingIncome", "netIncome", "dilutedEps", "freeCashFlow"])
+      .optional()
+      .describe("financials: which figure (default revenue)."),
+    period: z.enum(["annual", "quarterly"]).optional().describe("financials: default annual."),
+    title: z.string().min(1).max(120).regex(SAFE_TEXT).optional(),
+  },
+};
+
+export const WATCHLIST_GET_TOOL: FinanceComposedToolInfo = {
+  name: "watchlist_get",
+  skills: ["kr-stock-skill", "us-stock-skill"],
+  description:
+    "The user's own watchlist (관심 종목, Korean and US stocks): market (KR/US), symbol and name. Use it when the user says 내 관심 종목 / my watchlist, then look the symbols up with the finance tools. Names only, no numbers. The user edits the list on the 관심 종목 screen.",
+  input: {},
+};
+
+export const FINANCE_COMPOSED_TOOLS: readonly FinanceComposedToolInfo[] = [
+  FINANCE_CHART_TOOL,
+  WATCHLIST_GET_TOOL,
+];

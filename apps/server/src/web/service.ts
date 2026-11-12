@@ -93,6 +93,11 @@ export type RawStep = {
   capture?: string;
 };
 export type RawResponse = { status: number; contentType: string; body: string };
+/**
+ * The worker's own bounds of one `raw` job (worker.mjs `RAW_LIMITS`; a test keeps them equal): at most this many
+ * steps, each answer at most this many bytes. A longer plan without session steps is split into several jobs.
+ */
+export const RAW_JOB_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024 } as const;
 export type WorkerOutput = { ok: true; [k: string]: unknown } | { ok: false; code: string };
 /** Runs the worker with the given egress proxy. Default: the sandboxed process. Tests run it in-process. */
 export type WebWorker = (job: WorkerJob, proxy: { url: string; port: number }) => Promise<WorkerOutput>;

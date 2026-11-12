@@ -33,7 +33,7 @@ const body = {
     ),
   language: CodeLanguage.optional().describe("code: language name, e.g. python."),
   chart: ChartSpec.optional().describe(
-    "chart: data drawn by the server as SVG — type bar|line, labels, series (values per label).",
+    "chart: data drawn by the server as SVG — type bar|line|candle, labels, series (values per label; candle also ohlc [open, high, low, close] per label), optional views (other series sets to switch to), sources and notes shown under it. Hover tooltips and zoom come with it. For stock charts use finance_chart instead.",
   ),
   table: TableData.optional().describe("table: columns and rows; shown as a table with a CSV download."),
   document: DocumentRef.optional().describe(

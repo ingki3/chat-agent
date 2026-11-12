@@ -17,6 +17,10 @@ export const ARTIFACT_LIMITS = {
   artifactsPerConversation: 200,
   chartLabels: 500,
   chartSeries: 10,
+  /** Other series sets of one chart (원화·달러 기준, #31). */
+  chartViews: 4,
+  /** Source lines and notes under one chart. */
+  chartNotes: 12,
   tableColumns: 50,
   tableRows: 5000,
   cellChars: 1000,
@@ -28,24 +32,65 @@ export const ARTIFACT_LIMITS = {
 const LINE = /^[^\0-\x08\x0a-\x1f\x7f]*$/u;
 const label = (max: number) => z.string().max(max).regex(LINE);
 
+const ChartSeries = z.strictObject({
+  name: label(100),
+  values: z.array(z.number().finite().nullable()).max(ARTIFACT_LIMITS.chartLabels),
+  /** `candle`: open, high, low and close per label (null where there is none). `values` are the closes. */
+  ohlc: z
+    .array(
+      z
+        .tuple([z.number().finite(), z.number().finite(), z.number().finite(), z.number().finite()])
+        .nullable(),
+    )
+    .max(ARTIFACT_LIMITS.chartLabels)
+    .optional(),
+});
+export type ChartSeries = z.infer<typeof ChartSeries>;
+
+/**
+ * Another set of series over the same labels (#31): e.g. the same comparison 원화 기준 and 달러 기준. The page offers
+ * a switch between the chart's own series (`seriesLabel`) and each view; the download is the chart's own series.
+ */
+export const ChartView = z.strictObject({
+  label: label(40).min(1),
+  yLabel: label(100).optional(),
+  unit: label(20).optional(),
+  series: z.array(ChartSeries).min(1).max(ARTIFACT_LIMITS.chartSeries),
+});
+export type ChartView = z.infer<typeof ChartView>;
+
 /** A chart as data (`chart` kind): the server draws it as SVG, so no script runs for it. */
 export const ChartSpec = z.strictObject({
-  type: z.enum(["bar", "line"]),
+  type: z.enum(["bar", "line", "candle"]),
   title: label(200).optional(),
   xLabel: label(100).optional(),
   yLabel: label(100).optional(),
+  /** Unit of the values, shown in tooltips (e.g. `%`, `KRW`). */
+  unit: label(20).optional(),
   labels: z.array(label(100)).min(1).max(ARTIFACT_LIMITS.chartLabels),
-  series: z
-    .array(
-      z.strictObject({
-        name: label(100),
-        values: z.array(z.number().finite().nullable()).max(ARTIFACT_LIMITS.chartLabels),
-      }),
-    )
-    .min(1)
-    .max(ARTIFACT_LIMITS.chartSeries),
+  series: z.array(ChartSeries).min(1).max(ARTIFACT_LIMITS.chartSeries),
+  /** Name of the chart's own series set when `views` are given (e.g. "원화 기준"). */
+  seriesLabel: label(40).optional(),
+  views: z.array(ChartView).max(ARTIFACT_LIMITS.chartViews).optional(),
+  /** Where the numbers come from and as of when (finance, FR-7.6): shown under the chart and in its download. */
+  sources: z.array(label(200)).max(ARTIFACT_LIMITS.chartNotes).optional(),
+  /** Short notes under the chart (e.g. which exchange rate converted the values, as of when). */
+  notes: z.array(label(300)).max(ARTIFACT_LIMITS.chartNotes).optional(),
 });
 export type ChartSpec = z.infer<typeof ChartSpec>;
+
+/**
+ * Every series of a chart (its own and its views') has one value per label, a candle chart's an OHLC per label —
+ * what the schema cannot say on its own.
+ */
+export function chartShapeOk(c: ChartSpec): boolean {
+  const all = [...c.series, ...(c.views ?? []).flatMap((v) => v.series)];
+  return all.every(
+    (s) =>
+      s.values.length === c.labels.length &&
+      (c.type === "candle" ? s.ohlc?.length === c.labels.length : s.ohlc === undefined),
+  );
+}
 
 /** A table (`table` kind): shown as an HTML table, downloadable as CSV. */
 export const TableData = z.strictObject({

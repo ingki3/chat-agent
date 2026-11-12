@@ -33,6 +33,10 @@ import {
  *   /finance [cited]   scripted finance tool results (AAPL, 005930 — fixed numbers, no network) and an answer that
  *                     leaves out (or, with `cited`, states) the sources and as-of dates: the run manager's finance
  *                     check then adds its note (#30)
+ *   "AAPL, 005930 6개월 비교 차트" (symbols + 차트; 비교·캔들·가격·재무, 1개월·3개월·6개월·1년)   a real call of our
+ *                     `finance_chart` (#31): the table and chart artifacts, the table part and the finance note
+ *                     come from the server (FAKE_RUNTIME=1 answers the finance URLs with synthetic data)
+ *   /watchlist, "내 관심 종목"   a real call of our `watchlist_get` (#31)
  *   /burst <n>        n words as fast as possible, in paragraphs (rendering performance, #14)
  *   /md               markdown sample: GFM table, code blocks, KaTeX math, links (#14)
  *   /xss              hostile markup that must never run (#14)
@@ -225,6 +229,48 @@ function financeSteps(cited: boolean): FakeStep[] {
     },
   ];
 }
+/**
+ * A finance chart request in plain words (#31): "AAPL, 005930 6개월 비교 차트", "NVDA 캔들 차트 3개월". Symbols are
+ * 6-digit codes and capital tickers; the rest picks the chart and the range. Undefined for any other text.
+ */
+export function financeChartSteps(t: string): FakeStep[] | undefined {
+  if (!/차트/.test(t)) return undefined;
+  const symbols = [...new Set(t.match(/\b(\d{6}|[A-Z][A-Z0-9.-]{0,9})\b/g) ?? [])]
+    .filter((x) => x !== "USD" && x !== "KRW")
+    .slice(0, 5);
+  if (!symbols.length) return undefined;
+  const range = /1\s*년/.test(t)
+    ? "1y"
+    : /3\s*개월/.test(t)
+      ? "3mo"
+      : /1\s*개월|한\s*달/.test(t)
+        ? "1mo"
+        : "6mo";
+  const chart = /캔들/.test(t)
+    ? "candle"
+    : /재무|매출|이익/.test(t)
+      ? "financials"
+      : /비교|수익률/.test(t) || symbols.length > 1
+        ? "compare"
+        : "line";
+  const currency = /달러\s*기준|USD/.test(t) ? "USD" : undefined;
+  return [
+    { text: "표와 차트를 만들게요. " },
+    {
+      call: "finance_chart",
+      input: {
+        symbols,
+        chart,
+        ...(chart === "financials" ? {} : { range }),
+        ...(currency ? { currency } : {}),
+      },
+    },
+    {
+      text: "같은 데이터로 표와 차트를 만들었어요. 모든 값의 출처와 기준 시각은 표의 열과 차트 아래에 적었어요.",
+    },
+  ];
+}
+
 /** Markdown the chat screen must render (FR-3.2). */
 export const FAKE_MARKDOWN = [
   "## 단진자 정리\n\n",
@@ -325,6 +371,14 @@ export const defaultScript: FakeScript = (input, memory) => {
       { text: sc.answer },
     ];
   }
+  const chart = financeChartSteps(t);
+  if (chart) return chart;
+  if (t === "/watchlist" || t === "내 관심 종목")
+    return [
+      { text: "관심 종목을 볼게요. " },
+      { call: "watchlist_get", input: {} },
+      { text: "관심 종목 목록을 가져왔어요." },
+    ];
   if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
   if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
   if (t === "/secrettool")

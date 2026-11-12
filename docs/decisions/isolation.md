@@ -313,6 +313,16 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **리뷰 #93 2차 뒤 변이 시험(2026-11-11):** 16개를 하나씩 넣어 모두 시험이 잡았다 — 바뀐 쿠키 값 잊기·지금 쿠키 상자만 보기·짧은 값 건너뛰기·통째 토큰 경계 없애기·`%xx` 대소문자 구분, 시장 상태로 종가 확정, 식별자를 부분 문자열로 지우기·단위 뒤 무시·통화 기호 앞 무시·지수 이름 숫자 경계 없애기, 단위 배수 무시·정밀도 무시, 금융 결과 저장 안 함·기록에서 빠진 답변 포함·뒤 메시지 포함·다른 대화 포함.
 - **변이 시험(2026-11-11):** 22개 변이를 하나씩 넣어 모두 시험이 잡았다 — 기록 검사 끔·시간대 없는 asOf 허용·tool_meta 표시 제거, 답변의 출처·기준 시각 검사 끔, 면책 비움·실행 관리자 첨부 제거·후속 답변 검사 제거, 아들 숨김 제거·사용자별 도구 거름 제거·호출 시 재확인 제거, 모든 금융 도구가 프록시 하나를 공유·계획 호스트 검사 제거·접미 일치 허용·호스트 목록 확장·호스트 목록 틀림, KRX 성탄절 누락·미국 조기 폐장 누락·주말을 거래일로·휴장 중 값에 원래 시각·오늘이면 무조건 장중.
 
+## 금융 표·차트 (#31)
+`finance_chart`·`watchlist_get`(`packages/mcp-tools/src/finance.ts` `FINANCE_COMPOSED_TOOLS`, 서버 `apps/server/src/finance/chart.ts`·`apps/server/src/watchlist/`). 운영은 `docs/ops.md` §30.
+
+- **새 송신 경로 없음:** `finance_chart`는 데이터를 기존 금융 도구(`kr_history`·`us_history`·`fx_usdkrw`·`us_financials`)의 `FinanceService.run`으로만 읽는다 — 도구마다 위 표의 자기 프록시·호스트 그대로. 부분마다 권한을 다시 본다(한국 종목 `kr-stock-skill`, 미국 `us-stock-skill`, 환율 `kr-stock-skill`). 한 호출이 처리 칸 하나(`withSlot`)를 쓴다.
+- **아티팩트는 서버가 만든 데이터:** 표는 `TableData`, 차트는 `ChartSpec`(검증 후 정규 JSON)로 저장되고, 보일 때 서버가 HTML·SVG로 그린다(#27과 같은 경로, 같은 CSP — `sandbox allow-scripts`, `script-src`는 비었거나 Esc 다리 해시 하나). **차트의 기준 전환·확대는 라디오 버튼과 CSS뿐**이고 툴팁은 SVG `<title>`이다 — 새 스크립트·새 CDN·새 의존성이 없다. 그래서 스크립트가 꺼진 내보내기(#51)에서도 첫 기준·전체 기간 그림이 그대로 나온다.
+- **이스케이프:** 제목·축 이름·날짜 라벨·계열 이름·기준 이름·출처·메모·단위·툴팁 글이 모두 `escapeHtml`을 거친다. 요소 id·CSS 선택자는 데이터가 아니라 순번(`cv0`, `cz1`)으로 만든다(시험: `finance-chart.test.ts` "every text of a chart is escaped").
+- **표 부분:** 답변의 `table` 파트는 런타임이 보고한 결과가 아니라 **그 run이 저장한 표 아티팩트 버전**에서 서버가 만든다(`runs.ts` `syncFinanceTables` — 도구 결과는 어느 아티팩트인지만 가리키고, 그 run의 `refsOfRun`에 있어야 한다). 화면은 React 글자로만 그린다.
+- **관심 종목:** 주인만(관리자도 403, 권한 행렬). `watchlist_get`은 토큰의 사용자 것만, 쓸 수 있는 시장의 것만 주고, 이름(검색에서 온 제3자 글)은 `<external_content>` 블록에 넣는다. 저장할 때 알려진 비밀을 가리고 재가림 대상이다. 종목 코드는 가릴 수 없으므로 알려진 비밀이 든 코드는 저장 전에 거절한다 — 형식이 틀린 코드와 **같은** 400 `watchlist_bad_symbol`(두 검사를 늘 함께 실행, 비밀 여부를 묻는 수단이 되지 않게). 관심 종목의 미국 티커는 의도적으로 7자 이하로 묶어(드문 8자 기호는 담지 못함) 최소 8자인 알려진 비밀이 될 수 없다. 재가림은 늘 켠 `secure_delete`, 바뀐 뒤의 `wal_checkpoint(TRUNCATE)`(기다리지 않고 재시도, 재시작해도 DB에 남긴 표시로 이어서), 시작 때 한 번의 `VACUUM`(그 전의 빈 공간)으로 WAL·DB 쪽에 옛 값을 남기지 않는다. 금융 도구의 송신 URL·헤더는 보내기 전에 알려진 비밀을 검사하고, 설정 비밀(OpenDART 키·SEC 연락처)은 제 도구·호스트·칸에서만 허용한다. 관심 종목 검색어에 비밀이 있으면 같은 길로 미끼 검색어를 보내 응답이 구별되지 않게 한다(리뷰 #111). 나중에 비밀로 등록된 행은 재가림이 `secure_delete`로 지운다(리뷰 #111).
+- **합성 데이터의 경계:** `FAKE_RUNTIME=1`에서만 `fixtureFinanceWorker`가 금융 도구의 URL에 합성 시세로 답하고, 그 밖의 금융 URL은 모두 거절한다(네트워크로 나가지 않고, 합성과 실제 숫자가 섞이지 않는다). 운영 서버는 쓰지 않는다.
+
 ## 아티팩트 서빙 (#27)
 에이전트가 만든 HTML·SVG·차트·표·문서·코드를 버전과 함께 저장하고, **실제로 동작하면서** 앱의 쿠키·API·화면에 닿지 못하게 서빙한다(PRD FR-6.5). 코드는 `apps/server/src/artifacts/`(저장 `store.ts`, 서빙 `serve.ts`, 경로 `routes.ts`), 도구 정의는 `packages/mcp-tools/src/artifacts.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
 

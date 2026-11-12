@@ -3,6 +3,7 @@ import { and, asc, count, desc, eq, lt, max, or, sql } from "drizzle-orm";
 import {
   ARTIFACT_LIMITS,
   ChartSpec,
+  chartShapeOk,
   CodeLanguage,
   DocumentRef,
   TableData,
@@ -99,8 +100,7 @@ export function encodeBody(
     }
   } else if (field === "chart") {
     const c = ChartSpec.safeParse(body.chart);
-    if (!c.success || c.data.series.some((s) => s.values.length !== c.data.labels.length))
-      throw new ArtifactError("artifact_bad_input");
+    if (!c.success || !chartShapeOk(c.data)) throw new ArtifactError("artifact_bad_input");
     content = JSON.stringify(c.data);
   } else if (field === "table") {
     const t = TableData.safeParse(body.table);

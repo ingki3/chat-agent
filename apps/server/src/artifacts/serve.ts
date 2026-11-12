@@ -1,5 +1,11 @@
 import crypto from "node:crypto";
-import { ARTIFACT_ESCAPE_MESSAGE, type ArtifactKind, type ChartSpec, type TableData } from "@agentlee/shared";
+import {
+  ARTIFACT_ESCAPE_MESSAGE,
+  type ArtifactKind,
+  type ChartSeries,
+  type ChartSpec,
+  type TableData,
+} from "@agentlee/shared";
 
 /**
  * How an artifact version is served (#27, PRD FR-6.5, docs/decisions/isolation.md "아티팩트 서빙").
@@ -189,58 +195,110 @@ const COLOURS = [
   "#a4a42a",
   "#2a9fa4",
 ];
+/** Candles (Korean convention): rising red, falling blue. */
+const UP = "#d9443a";
+const DOWN = "#2f6fb0";
 
 const fmt = (v: number) =>
   Math.abs(v) >= 1e6 || (Math.abs(v) < 1e-3 && v !== 0) ? v.toExponential(2) : `${+v.toFixed(3)}`;
+const tip = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 4 });
 
-/** Draws a chart spec as an SVG document fragment (no script). */
-export function chartSvg(spec: ChartSpec): string {
+/** What one drawing shows: a chart's own series or one of its views, over all labels or a zoomed window. */
+type Drawing = {
+  type: ChartSpec["type"];
+  title?: string | undefined;
+  xLabel?: string | undefined;
+  yLabel?: string | undefined;
+  unit?: string | undefined;
+  labels: readonly string[];
+  series: readonly ChartSeries[];
+  /** Text lines under the plot (the download carries the sources this way). */
+  footer?: readonly string[];
+};
+
+/**
+ * Draws one chart as an SVG document fragment (no script). Every text — title, labels, series names, tooltips,
+ * footer — comes from the spec and is escaped. Tooltips are SVG `<title>`s: one hover band per label naming every
+ * series' value there.
+ */
+function drawSvg(d: Drawing): string {
   const W = 760;
-  const H = 420;
-  const m = { top: spec.title ? 40 : 16, right: 16, bottom: 64, left: 64 };
+  const footer = (d.footer ?? []).map((l) => l.slice(0, 140));
+  const H = 420 + footer.length * 16;
+  const m = { top: d.title ? 40 : 16, right: 16, bottom: 64 + footer.length * 16, left: 72 };
   const pw = W - m.left - m.right;
   const ph = H - m.top - m.bottom;
-  const vals = spec.series.flatMap((s) => s.values.filter((v): v is number => v !== null));
-  let lo = Math.min(0, ...vals);
-  let hi = Math.max(0, ...vals);
+  const vals = d.series.flatMap((s) => [
+    ...s.values.filter((v): v is number => v !== null),
+    ...(d.type === "candle" ? (s.ohlc ?? []).flatMap((q) => (q ? [q[1], q[2]] : [])) : []),
+  ]);
+  let lo: number;
+  let hi: number;
+  if (d.type === "bar" || !vals.length) {
+    lo = Math.min(0, ...vals);
+    hi = Math.max(0, ...vals);
+  } else {
+    lo = Math.min(...vals);
+    hi = Math.max(...vals);
+  }
   if (lo === hi) hi = lo + 1;
   const pad = (hi - lo) * 0.05;
-  if (hi > 0) hi += pad;
-  if (lo < 0) lo -= pad;
+  if (d.type !== "bar" || hi > 0) hi += pad;
+  if (d.type !== "bar" || lo < 0) lo -= pad;
   const y = (v: number) => m.top + ph - ((v - lo) / (hi - lo)) * ph;
-  const n = spec.labels.length;
+  const n = d.labels.length;
   const band = pw / n;
   const x = (i: number) => m.left + band * (i + 0.5);
+  const unit = d.unit ? ` ${d.unit}` : "";
   const parts: string[] = [];
-  if (spec.title)
+  if (d.title)
     parts.push(
-      `<text x="${W / 2}" y="24" text-anchor="middle" font-size="16" font-weight="600">${escapeHtml(spec.title)}</text>`,
+      `<text x="${W / 2}" y="24" text-anchor="middle" font-size="16" font-weight="600">${escapeHtml(d.title)}</text>`,
     );
+  // Tick labels as precise as their spacing needs (no "35.373" on a 0–40 axis).
+  const digits = Math.min(4, Math.max(0, 1 - Math.floor(Math.log10((hi - lo) / 4))));
+  const tick = (v: number) =>
+    Math.abs(v) >= 1e9 || (Math.abs(v) < 1e-3 && v !== 0)
+      ? fmt(v)
+      : v.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: 0 });
   for (let t = 0; t <= 4; t++) {
     const v = lo + ((hi - lo) * t) / 4;
     parts.push(
       `<line x1="${m.left}" x2="${W - m.right}" y1="${y(v)}" y2="${y(v)}" stroke="#8884" stroke-width="1"/>`,
-      `<text x="${m.left - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11">${fmt(v)}</text>`,
+      `<text x="${m.left - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11">${tick(v)}</text>`,
     );
   }
-  const step = Math.ceil(n / 20);
-  spec.labels.forEach((l, i) => {
+  const step = Math.ceil(n / 8);
+  d.labels.forEach((l, i) => {
     if (i % step === 0)
       parts.push(
         `<text x="${x(i)}" y="${m.top + ph + 18}" text-anchor="middle" font-size="11">${escapeHtml(l.slice(0, 16))}</text>`,
       );
   });
-  const k = spec.series.length;
-  spec.series.forEach((s, si) => {
+  const k = d.series.length;
+  d.series.forEach((s, si) => {
     const colour = COLOURS[si % COLOURS.length]!;
-    if (spec.type === "bar") {
+    if (d.type === "bar") {
       const bw = (band * 0.8) / k;
       s.values.forEach((v, i) => {
         if (v === null) return;
         const top = Math.min(y(v), y(0));
         const h = Math.max(Math.abs(y(v) - y(0)), 0.5);
         parts.push(
-          `<rect class="bar" x="${(x(i) - band * 0.4 + bw * si).toFixed(2)}" y="${top.toFixed(2)}" width="${bw.toFixed(2)}" height="${h.toFixed(2)}" fill="${colour}"><title>${escapeHtml(`${s.name} · ${spec.labels[i]}: ${v}`)}</title></rect>`,
+          `<rect class="bar" x="${(x(i) - band * 0.4 + bw * si).toFixed(2)}" y="${top.toFixed(2)}" width="${bw.toFixed(2)}" height="${h.toFixed(2)}" fill="${colour}"><title>${escapeHtml(`${s.name} · ${d.labels[i]}: ${tip.format(v)}${unit}`)}</title></rect>`,
+        );
+      });
+    } else if (d.type === "candle") {
+      const bw = Math.max(Math.min((band * 0.7) / k, 14), 1);
+      (s.ohlc ?? []).forEach((q, i) => {
+        if (!q) return;
+        const [o, h, l, c] = q;
+        const cx = x(i) - (band * 0.35 * (k - 1)) / Math.max(k, 1) + bw * si;
+        const col = c >= o ? UP : DOWN;
+        const top = Math.min(y(o), y(c));
+        parts.push(
+          `<line class="wick" x1="${cx.toFixed(2)}" x2="${cx.toFixed(2)}" y1="${y(h).toFixed(2)}" y2="${y(l).toFixed(2)}" stroke="${col}" stroke-width="1"/>`,
+          `<rect class="candle" x="${(cx - bw / 2).toFixed(2)}" y="${top.toFixed(2)}" width="${bw.toFixed(2)}" height="${Math.max(Math.abs(y(o) - y(c)), 0.8).toFixed(2)}" fill="${col}"/>`,
         );
       });
     } else {
@@ -251,22 +309,181 @@ export function chartSvg(spec: ChartSpec): string {
       parts.push(`<polyline class="line" points="${pts}" fill="none" stroke="${colour}" stroke-width="2"/>`);
     }
     parts.push(
-      `<rect x="${m.left + si * 130}" y="${H - 22}" width="12" height="12" fill="${colour}"/>`,
-      `<text x="${m.left + si * 130 + 16}" y="${H - 12}" font-size="12">${escapeHtml(s.name.slice(0, 16))}</text>`,
+      `<rect x="${m.left + si * 130}" y="${H - 22 - footer.length * 16}" width="12" height="12" fill="${d.type === "candle" ? UP : colour}"/>`,
+      `<text x="${m.left + si * 130 + 16}" y="${H - 12 - footer.length * 16}" font-size="12">${escapeHtml(s.name.slice(0, 16))}</text>`,
     );
   });
-  parts.push(
-    `<line x1="${m.left}" x2="${W - m.right}" y1="${y(0)}" y2="${y(0)}" stroke="#888" stroke-width="1"/>`,
+  if (lo <= 0 && hi >= 0)
+    parts.push(
+      `<line x1="${m.left}" x2="${W - m.right}" y1="${y(0)}" y2="${y(0)}" stroke="#888" stroke-width="1"/>`,
+    );
+  // Hover bands (line and candle): the date and every series' value there.
+  if (d.type !== "bar")
+    d.labels.forEach((l, i) => {
+      const lines = d.series.flatMap((s) => {
+        const q = d.type === "candle" ? s.ohlc?.[i] : undefined;
+        if (q)
+          return [
+            `${s.name}: 시가 ${tip.format(q[0])} · 고가 ${tip.format(q[1])} · 저가 ${tip.format(q[2])} · 종가 ${tip.format(q[3])}${unit}`,
+          ];
+        const v = s.values[i];
+        if (v === null || v === undefined) return [];
+        // A candle day with a close but no open/high/low: no candle is drawn — say why (review #111).
+        const none = d.type === "candle" ? " (시가·고가·저가 없음)" : "";
+        return [`${s.name}: ${tip.format(v)}${unit}${none}`];
+      });
+      if (!lines.length) return;
+      parts.push(
+        `<rect class="hit" x="${(x(i) - band / 2).toFixed(2)}" y="${m.top}" width="${band.toFixed(2)}" height="${ph}" fill="#888" fill-opacity="0"><title>${escapeHtml([l, ...lines].join("\n"))}</title></rect>`,
+      );
+    });
+  if (d.yLabel)
+    parts.push(
+      `<text transform="translate(14 ${m.top + ph / 2}) rotate(-90)" text-anchor="middle" font-size="12">${escapeHtml(d.yLabel)}</text>`,
+    );
+  if (d.xLabel)
+    parts.push(
+      `<text x="${m.left + pw / 2}" y="${m.top + ph + 38}" text-anchor="middle" font-size="12">${escapeHtml(d.xLabel)}</text>`,
+    );
+  footer.forEach((l, i) =>
+    parts.push(
+      `<text x="8" y="${H - 6 - (footer.length - 1 - i) * 16}" font-size="11">${escapeHtml(l)}</text>`,
+    ),
   );
-  if (spec.yLabel)
-    parts.push(
-      `<text transform="translate(14 ${m.top + ph / 2}) rotate(-90)" text-anchor="middle" font-size="12">${escapeHtml(spec.yLabel)}</text>`,
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${escapeHtml(d.title ?? "chart")}" font-family="system-ui,sans-serif" fill="currentColor">${parts.join("")}</svg>`;
+}
+
+/** Sources and notes as lines (finance: "출처 …", FR-7.6). */
+const footerOf = (spec: ChartSpec) => [
+  ...(spec.sources ?? []).map((s) => `출처 ${s}`),
+  ...(spec.notes ?? []),
+];
+
+/** The chart's own series as one SVG (the download and the PNG/PDF), with its sources and notes under it. */
+export function chartSvg(spec: ChartSpec): string {
+  return drawSvg({ ...spec, footer: footerOf(spec) });
+}
+
+/** One series set to switch to: the chart's own (first) and its views (원화·달러 기준, #31). */
+function seriesSets(spec: ChartSpec) {
+  return [
+    { label: spec.seriesLabel ?? "기본", yLabel: spec.yLabel, unit: spec.unit, series: spec.series },
+    ...(spec.views ?? []).map((v) => ({
+      label: v.label,
+      yLabel: v.yLabel ?? spec.yLabel,
+      unit: v.unit ?? spec.unit,
+      series: v.series,
+    })),
+  ];
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+/** `ymd` minus `months` (clamped to the month's last day). */
+function monthsBefore(ymd: string, months: number): string {
+  const [yy, mm, dd] = ymd.split("-").map(Number) as [number, number, number];
+  const t = new Date(Date.UTC(yy, mm - 1 - months, 1));
+  const last = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + 1, 0)).getUTCDate();
+  t.setUTCDate(Math.min(dd, last));
+  return t.toISOString().slice(0, 10);
+}
+
+/**
+ * Zoom windows of a line or candle chart (#31 "확대"): the whole range and, for long ones, the latest part — by
+ * calendar months when the labels are dates (3개월, 1개월), else the latest half and quarter. A window is the same
+ * values (never re-based), drawn on its own axis.
+ */
+export function zoomWindows(spec: ChartSpec): { label: string; start: number }[] {
+  const n = spec.labels.length;
+  const out = [{ label: "전체", start: 0 }];
+  if (spec.type === "bar" || n < 30) return out;
+  if (spec.labels.every((l) => ISO_DAY.test(l))) {
+    const last = spec.labels[n - 1]!;
+    for (const [months, label] of [
+      [3, "3개월"],
+      [1, "1개월"],
+    ] as const) {
+      const cut = monthsBefore(last, months);
+      const start = spec.labels.findIndex((l) => l > cut);
+      if (start > 0 && n - start >= 5) out.push({ label, start });
+    }
+  } else {
+    out.push(
+      { label: "최근 절반", start: Math.floor(n / 2) },
+      { label: "최근 1/4", start: Math.floor((n * 3) / 4) },
     );
-  if (spec.xLabel)
-    parts.push(
-      `<text x="${m.left + pw / 2}" y="${m.top + ph + 38}" text-anchor="middle" font-size="12">${escapeHtml(spec.xLabel)}</text>`,
+  }
+  return out;
+}
+
+const CHART_STYLE =
+  ".chart{position:relative}.chart>input{position:absolute;opacity:0;width:1px;height:1px;margin:0}" +
+  ".controls{display:flex;flex-wrap:wrap;gap:8px 16px;margin:0 0 8px}.seg{display:flex;gap:4px;align-items:center}" +
+  ".seg span{font-size:12px;opacity:.7;margin-right:2px}.seg label{border:1px solid #8886;border-radius:999px;padding:2px 10px;font-size:13px;cursor:pointer;user-select:none}" +
+  ".cv{display:none}.hit:hover{fill-opacity:.14}" +
+  ".src{margin:8px 0 0;padding-left:18px;font-size:12px}.note{margin:4px 0 0;font-size:12px;opacity:.85}";
+
+/**
+ * The chart page (served original, HTML download, exports): the drawing, a 기준 switch over the series sets and a
+ * zoom switch (#31) — radio buttons and CSS only, so it needs no script (the artifact's CSP allows none but the
+ * Escape bridge) and a PNG/PDF export shows the first set over the whole range — then the sources and notes.
+ */
+export function chartPage(title: string, spec: ChartSpec): string {
+  const sets = seriesSets(spec);
+  const zooms = zoomWindows(spec);
+  const draw = (si: number, zi: number) => {
+    const set = sets[si]!;
+    const start = zooms[zi]!.start;
+    return drawSvg({
+      type: spec.type,
+      title: spec.title,
+      xLabel: spec.xLabel,
+      yLabel: set.yLabel,
+      unit: set.unit,
+      labels: spec.labels.slice(start),
+      series: set.series.map((s) => ({
+        name: s.name,
+        values: s.values.slice(start),
+        ...(s.ohlc ? { ohlc: s.ohlc.slice(start) } : {}),
+      })),
+    });
+  };
+  const notes =
+    (spec.sources?.length
+      ? `<ul class="src" aria-label="출처·기준 시각">${spec.sources.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>`
+      : "") + (spec.notes ?? []).map((n) => `<p class="note">${escapeHtml(n)}</p>`).join("");
+  if (sets.length === 1 && zooms.length === 1) return `<style>${CHART_STYLE}</style>${draw(0, 0)}${notes}`;
+  // Radios first (siblings of .controls and .views, so `:checked ~` selects), labels in .controls.
+  const radio = (g: string, i: number) =>
+    `<input type="radio" name="${g}" id="${g}${i}"${i === 0 ? " checked" : ""}>`;
+  const seg = (g: string, aria: string, items: readonly { label: string }[]) =>
+    items.length > 1
+      ? `<div class="seg" role="radiogroup" aria-label="${aria}"><span>${aria}</span>${items.map((it, i) => `<label for="${g}${i}">${escapeHtml(it.label)}</label>`).join("")}</div>`
+      : "";
+  const css: string[] = [CHART_STYLE];
+  for (const [g, items] of [
+    ["cv", sets],
+    ["cz", zooms],
+  ] as const)
+    items.forEach((_, i) =>
+      css.push(
+        `#${g}${i}:checked~.controls label[for=${g}${i}]{background:#2f6fb0;border-color:#2f6fb0;color:#fff}`,
+        `#${g}${i}:focus-visible~.controls label[for=${g}${i}]{outline:2px solid #d9822b;outline-offset:1px}`,
+      ),
     );
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${escapeHtml(spec.title ?? "chart")}" font-family="system-ui,sans-serif" fill="currentColor">${parts.join("")}</svg>`;
+  const views: string[] = [];
+  sets.forEach((_, si) =>
+    zooms.forEach((__, zi) => {
+      css.push(`#cv${si}:checked~#cz${zi}:checked~.views .v${si}.z${zi}{display:block}`);
+      views.push(`<div class="cv v${si} z${zi}">${draw(si, zi)}</div>`);
+    }),
+  );
+  return (
+    `<style>${css.join("")}</style><div class="chart">` +
+    sets.map((_, i) => radio("cv", i)).join("") +
+    zooms.map((_, i) => radio("cz", i)).join("") +
+    `<div class="controls">${seg("cv", "기준", sets)}${seg("cz", "확대", zooms)}</div>` +
+    `<div class="views">${views.join("")}</div></div>${notes}`
+  );
 }
 
 export function tableHtml(t: TableData): string {
@@ -339,7 +556,7 @@ export function serveVersion(
     case "table": {
       const body =
         kind === "chart"
-          ? page(title, chartSvg(JSON.parse(content) as ChartSpec))
+          ? page(title, chartPage(title, JSON.parse(content) as ChartSpec))
           : page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`);
       return opts.escapeBridge
         ? {

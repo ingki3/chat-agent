@@ -1,4 +1,8 @@
 import {
+  WatchlistItem,
+  WatchlistResponse,
+  WatchlistSearchResponse,
+  type WatchMarket,
   AdminRuntimesResponse,
   BackupItem,
   BackupsResponse,
@@ -490,6 +494,12 @@ const MESSAGES: Record<string, string> = {
   proposal_dismissed: "취소한 예약 제안이에요.",
   proposal_gone: "이 제안으로 만든 예약이 지워졌어요.",
   proposal_confirmed: "이미 만든 예약이에요.",
+  watchlist_duplicate: "이미 관심 종목에 있어요.",
+  watchlist_bad_symbol: "담을 수 없는 종목 코드예요.",
+  watchlist_full: "관심 종목은 50개까지 담을 수 있어요.",
+  finance_not_allowed: "이 계정은 금융 기능을 쓸 수 없어요.",
+  finance_unreachable: "종목 검색 서버에 연결하지 못했어요. 잠시 뒤 다시 해 보세요.",
+  finance_busy: "지금 요청이 많아요. 잠시 뒤 다시 해 보세요.",
   proposal_changed:
     "그사이 기본 런타임·모델(또는 허용 범위)이 바뀌었어요. 바뀐 내용을 확인하고 다시 눌러 주세요.",
 };
@@ -560,4 +570,17 @@ export const schedules = {
     ),
   dismiss: async (id: string) =>
     ScheduleProposal.parse(await call("POST", `/api/schedule-proposals/${enc(id)}/dismiss`, {})),
+};
+
+/** 관심 종목 (#31, FR-7.7): the caller's own list (owner only), the search and add / remove. */
+export const WATCHLIST_KEY = ["watchlist"] as const;
+export const watchlist = {
+  list: async () => WatchlistResponse.parse(await call("GET", "/api/watchlist")),
+  search: async (q: string, signal?: AbortSignal) =>
+    WatchlistSearchResponse.parse(
+      await call("GET", `/api/watchlist/search?q=${encodeURIComponent(q)}`, undefined, {}, signal),
+    ).items,
+  add: async (market: WatchMarket, symbol: string, name?: string | null) =>
+    WatchlistItem.parse(await call("POST", "/api/watchlist", { market, symbol, ...(name ? { name } : {}) })),
+  remove: async (id: string) => call("DELETE", `/api/watchlist/${enc(id)}`),
 };

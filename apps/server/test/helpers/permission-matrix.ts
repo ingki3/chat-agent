@@ -288,6 +288,37 @@ APP_MATRIX.push(
   },
 );
 
+/** A 관심 종목 item of `owner` (#31): the store directly. */
+function watchItem(f: Family) {
+  return f.app.watchlist!.add(f.users.owner.id, {
+    market: "US",
+    symbol: `T${crypto
+      .randomUUID()
+      .slice(0, 6)
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "X")}`,
+  }).id;
+}
+
+/**
+ * 관심 종목 (#31, FR-7.7): what a person invests in is theirs — owner only, the admin refused like anyone else (the
+ * same principle as schedules).
+ */
+APP_MATRIX.push(
+  {
+    route: "GET /api/watchlist/:id",
+    expect: OWNER_ONLY,
+    fixture: watchItem,
+    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+  {
+    route: "DELETE /api/watchlist/:id",
+    expect: { ...OWNER_ONLY, owner: 204 },
+    fixture: watchItem,
+    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+);
+
 /** Admin-only data: every member — the son's account included — 403, the admin 200, before login 401. */
 export const ADMIN_ONLY: Record<Who, number> = {
   owner: 403,

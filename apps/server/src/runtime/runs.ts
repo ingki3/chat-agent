@@ -6,6 +6,7 @@ import {
   type CitationNotePart,
   type FinanceNotePart,
   StreamEvent,
+  TableData,
   type MessagePart,
   type Run,
   type RunChoice,
@@ -49,6 +50,7 @@ import { FinanceResultStore } from "../finance/results.js";
 import { citationNote } from "../citations/checker.js";
 import { CitationStore } from "../citations/store.js";
 import { ArtifactStore } from "../artifacts/store.js";
+import { FINANCE_CHART_TOOL } from "@agentlee/mcp-tools/finance";
 import { SummaryStore } from "../conversations/summaries.js";
 import {
   citedSources,
@@ -818,6 +820,7 @@ export class RunManager {
   private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
     this.syncArtifactRefs(row, parts);
     this.syncFileRefs(row, parts);
+    this.syncFinanceTables(row, parts);
     if (!parts.some((p) => p.type === "finance_note")) {
       // This answer's finance results stay for the rest of the conversation's checks.
       try {
@@ -890,6 +893,62 @@ export class RunManager {
       parts.push(part);
       const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
       this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part });
+    }
+  }
+
+  /**
+   * The finance table of the reply (#31): for each `finance_chart` result, its `table` artifact as a `table` part
+   * (sortable, a source and an as-of column on every row) — read from the version **this run stored** (never from
+   * the runtime's report: the result only names which artifact), so the part and the artifact are the same data.
+   * One part per artifact, naming the version it shows (`artifactVersion`): when this run stores a newer version
+   * (an `artifact_update` later in the same run), the part is replaced in place and streamed again, like the card
+   * (review #111). Another run's versions never touch this answer (`refsOfRun` is this run's). Never breaks a reply.
+   */
+  private syncFinanceTables(row: RunRow, parts: MessagePart[]): void {
+    try {
+      const calls = new Set(
+        parts.flatMap((p) =>
+          p.type === "tool_call" && p.name.replace(OUR_TOOL_PREFIX, "") === FINANCE_CHART_TOOL.name
+            ? [p.id]
+            : [],
+        ),
+      );
+      if (!calls.size) return;
+      const refs = this.artifacts.refsOfRun(row.conversationId, row.id);
+      const ids = new Set<string>();
+      for (const p of parts) {
+        if (p.type !== "tool_result" || p.isError || !calls.has(p.callId)) continue;
+        const out = (typeof p.output === "string" ? safeJson(p.output) : p.output) as {
+          table?: { artifactId?: unknown };
+        } | null;
+        const id = out?.table?.artifactId;
+        if (typeof id === "string") ids.add(id);
+      }
+      for (const id of ids) {
+        const ref = refs.find((r) => r.artifactId === id);
+        const a = ref && this.artifacts.get(id);
+        if (!ref || !a || a.kind !== "table") continue;
+        const at = parts.findIndex((q) => q.type === "table" && q.artifactId === id);
+        if (at !== -1 && (parts[at] as { artifactVersion?: number }).artifactVersion === ref.version)
+          continue;
+        const v = this.artifacts.version(id, ref.version);
+        const data = v && TableData.safeParse(JSON.parse(v.content));
+        if (!data?.success) continue;
+        const part: MessagePart = {
+          type: "table",
+          artifactId: id,
+          artifactVersion: ref.version,
+          columns: data.data.columns.map((label, i) => ({ key: `c${i}`, label })),
+          rows: data.data.rows.map((r) => Object.fromEntries(r.map((cell, i) => [`c${i}`, cell]))),
+        };
+        if (at === -1) parts.push(part);
+        else parts[at] = part;
+        const i = at === -1 ? parts.length - 1 : at;
+        const partIndex = parts.slice(0, i + 1).filter((q) => q.type !== "reasoning").length - 1;
+        this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part });
+      }
+    } catch {
+      // no table part rather than no reply (the artifact card is there)
     }
   }
 
@@ -1452,6 +1511,7 @@ export class RunManager {
           this.emit(runId, { type: "tool_end", messageId, callId: ev.callId, output, ...extra });
           // An artifact tool has written by now: its card shows while the reply goes on (#28).
           this.syncArtifactRefs(run, parts);
+          this.syncFinanceTables(run, parts);
           flush(true);
         } else if (ev.type === "usage") {
           // The attempt's usage so far: replaces the attempt's earlier report, in memory and in storage (#44).
@@ -1510,5 +1570,13 @@ export class RunManager {
     if (outcome.status === "done" && run.connectionId && !live.settled)
       this.opts.connections?.runSucceeded?.(run);
     this.settle(runId, outcome.status, outcome.code);
+  }
+}
+
+function safeJson(t: string): unknown {
+  try {
+    return JSON.parse(t) as unknown;
+  } catch {
+    return null;
   }
 }

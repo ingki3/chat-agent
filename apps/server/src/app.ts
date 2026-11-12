@@ -20,6 +20,10 @@ import { registerBackupRoutes } from "./backup/routes.js";
 import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
 import { FakeScheduleHandler } from "./schedules/fake.js";
 import { registerScheduleRoutes } from "./schedules/routes.js";
+import { registerWatchlistRoutes } from "./watchlist/routes.js";
+import { compactOnce } from "./secrets/compact.js";
+import { WatchlistStore } from "./watchlist/store.js";
+import { fixtureFinanceWorker } from "./runtime/fake-finance.js";
 import { ScheduleStore } from "./schedules/store.js";
 import { ScheduleProposalStore } from "./schedules/proposals.js";
 import { SkillSwitches } from "./mcp/switches.js";
@@ -85,7 +89,7 @@ import { ErrorLog } from "./observability/errors.js";
 import { registerRoutePattern } from "./observability/policy.js";
 import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
 import { registerResponseScrub } from "./secrets/http.js";
-import { StoredRescrub } from "./secrets/rescrub.js";
+import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -147,6 +151,8 @@ declare module "fastify" {
     schedules: { store: ScheduleStore; engine: ScheduleEngine | undefined } | undefined;
     /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
     scheduleProposals: ScheduleProposalStore | undefined;
+    /** 관심 종목 (#31); undefined without a database. */
+    watchlist: WatchlistStore | undefined;
   }
 }
 
@@ -242,6 +248,8 @@ export type BuildOptions = {
    * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
    */
   dataLock?: { held: () => boolean };
+  /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
+  rescrub?: Pick<RescrubOptions, "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs">;
 };
 
 /**
@@ -340,7 +348,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
     // Stored rows are scrubbed again whenever a secret that may already be stored is registered (round 25) —
     // and once now, for everything registered at startup.
-    const storedRescrub = new StoredRescrub(opts.db!, { log: app.log });
+    // Old free space from before `secure_delete` (#111): compacted once, before anything is served or backed up.
+    compactOnce(opts.db!, app.log);
+    const storedRescrub = new StoredRescrub(opts.db!, { log: app.log, ...opts.rescrub });
     app.decorate("storedRescrub", storedRescrub);
     app.addHook("onClose", async () => {
       storedRescrub.close();
@@ -435,6 +445,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         opts.docs?.runner ??
         (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner()),
     });
+    // 관심 종목 (#31): the screen's list and `watchlist_get`.
+    const watchlist = new WatchlistStore(opts.db!);
+    app.decorate("watchlist", watchlist);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       web: {
@@ -450,7 +463,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       scheduleProposals,
       docs,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
-      finance: { secrets: config.skillSecrets },
+      finance: {
+        secrets: config.skillSecrets,
+        // The FakeRuntime mode (e2e, local tries): synthetic histories in-process, never the network (#31).
+        ...(config.fakeRuntime ? { worker: fixtureFinanceWorker() } : {}),
+      },
+      watchlist,
       // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
       switches: new SkillSwitches(settingsStore),
       ...(errors ? { errors } : {}),
@@ -631,6 +649,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Before the database closes: runs in progress are aborted and waited for (the rest recover at the next start).
     if (scheduleEngine) app.addHook("preClose", async () => scheduleEngine.stop());
     registerSourceRoutes(app, app.conversations!, sources);
+    registerWatchlistRoutes(app, { store: watchlist, mcp });
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
     let renderer = opts.renderer;
     if (!renderer) {
@@ -694,6 +713,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("files", undefined);
     app.decorate("schedules", undefined);
     app.decorate("scheduleProposals", undefined);
+    app.decorate("watchlist", undefined);
   }
 
   app.get(

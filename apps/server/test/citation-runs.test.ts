@@ -240,7 +240,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     runtimes.register(rt);
     const { app, f, send, api } = await start(runtimes);
     const c = app.conversations!.create(f.users.owner.id);
-    // The owner has the finance tools too (finance@2): the research section is what is looked at.
+    // The owner has the finance tools too (finance@3): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@3"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });

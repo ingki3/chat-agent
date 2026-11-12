@@ -29,9 +29,18 @@ if (mode === "lock") {
   process.kill(process.pid, "SIGKILL");
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
 } else if (mode === "hold-reader") {
-  // Another process (not taking the data lock, like a sqlite3 shell) inside a read transaction on the WAL database.
+  // Another process (not taking the data lock, like a sqlite3 shell) inside a read transaction on the WAL database
+  // whose snapshot needs the WAL. A snapshot of a fully checkpointed WAL reads the main file alone (SQLite's read
+  // mark 0) and does not stop a TRUNCATE checkpoint — rightly, nothing then lives only in the WAL; whether the dead
+  // writer's frame was still un-checkpointed when this reader started was left to timing (a CI flake, #111). So the
+  // reader commits a frame of its own first (no auto-checkpoint, nobody else running): its snapshot below includes a
+  // frame no checkpoint has copied, deterministically.
   const db = new Database(path.join(args[0]!, "agentlee.db"));
   db.pragma("journal_mode = WAL");
+  db.pragma("wal_autocheckpoint = 0");
+  db.prepare(
+    "INSERT INTO users (id, email, name, role) VALUES ('wal-reader', 'reader@x', 'reader', 'member')",
+  ).run();
   db.exec("BEGIN");
   db.prepare("SELECT count(*) FROM users").get();
   process.stdout.write("reading\n");
