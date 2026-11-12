@@ -284,14 +284,9 @@ export function normalizeWithMap(text: string): Normalized {
         put(afterDigit(i) ? String.fromCharCode(c) : '"', i, i + 1);
         i++;
       } else if (c === 38) {
-        const m = ENTITY.exec(text.slice(i, i + 12));
-        const decoded = m
-          ? m[1] !== undefined || m[2] !== undefined
-            ? safeFromCodePoint(m[1] !== undefined ? Number(m[1]) : parseInt(m[2]!, 16))
-            : ENTITIES[m[3]!.toLowerCase()]
-          : undefined;
-        if (m && decoded !== undefined) {
-          const end = i + m[0].length;
+        const e = entityAt(text, i);
+        if (e) {
+          const { decoded, end } = e;
           emit(afterDigit(i) && QUOTE_CHAR.test(decoded) ? decoded : normCluster(decoded), i, end);
           i = end;
         } else {
@@ -316,6 +311,45 @@ export function normalizeWithMap(text: string): Normalized {
     emit(afterDigit(start) && QUOTE_CHAR.test(cluster) ? fold(cluster) : normCluster(cluster), start, i);
   }
   return { norm: out.join(""), from: from.subarray(0, n), to: to.subarray(0, n) };
+}
+
+/** The known entity at `i` of `text` (`&minus;`, `&#8722;`), decoded, and where it ends; an unknown one is text. */
+function entityAt(text: string, i: number): { decoded: string; end: number } | undefined {
+  const m = ENTITY.exec(text.slice(i, i + 12));
+  if (!m) return undefined;
+  const decoded =
+    m[1] !== undefined || m[2] !== undefined
+      ? safeFromCodePoint(m[1] !== undefined ? Number(m[1]) : parseInt(m[2]!, 16))
+      : ENTITIES[m[3]!.toLowerCase()];
+  return decoded === undefined ? undefined : { decoded, end: i + m[0].length };
+}
+
+/**
+ * The page with its entities decoded and nothing else changed (line breaks kept), and where each original position
+ * lands in it (`at`, one longer than the page). Clause, sign and number checks look at this text, so an entity is
+ * the one character it stands for — never its `&` or `;` (review #97 round 25).
+ */
+export type Decoded = { text: string; at: Int32Array };
+export function decodeWithMap(body: string): Decoded {
+  const at = new Int32Array(body.length + 1);
+  const out: string[] = [];
+  let n = 0;
+  for (let i = 0; i < body.length;) {
+    const e = body.charCodeAt(i) === 38 ? entityAt(body, i) : undefined;
+    if (e) {
+      at.fill(n, i, e.end);
+      out.push(e.decoded);
+      n += e.decoded.length;
+      i = e.end;
+    } else {
+      at[i] = n;
+      out.push(body[i]!);
+      n++;
+      i++;
+    }
+  }
+  at[body.length] = n;
+  return { text: out.join(""), at };
 }
 
 function safeFromCodePoint(cp: number): string | undefined {
@@ -366,20 +400,21 @@ const firstChar = (s: string) => Array.from(s)[0] ?? "";
 const BODY_CACHE_SIZE = 4;
 /** Texts normalised so far, snippets included (tests check that a repeated page comes from the cache). */
 export const verifyStats = { normalized: 0 };
-const bodyCache = new Map<string, { body: string; n: Normalized }>();
-function normalizedBody(body: string, key: string | undefined): Normalized {
-  if (key === undefined) return normalizeWithMap(body);
+type Page = { n: Normalized; d: Decoded };
+const bodyCache = new Map<string, { body: string; page: Page }>();
+function pageOf(body: string, key: string | undefined): Page {
+  if (key === undefined) return { n: normalizeWithMap(body), d: decodeWithMap(body) };
   const hit = bodyCache.get(key);
   if (hit && hit.body === body) {
     bodyCache.delete(key);
     bodyCache.set(key, hit);
-    return hit.n;
+    return hit.page;
   }
-  const n = normalizeWithMap(body);
+  const page = { n: normalizeWithMap(body), d: decodeWithMap(body) };
   bodyCache.delete(key);
-  bodyCache.set(key, { body, n });
+  bodyCache.set(key, { body, page });
   while (bodyCache.size > BODY_CACHE_SIZE) bodyCache.delete(bodyCache.keys().next().value!);
-  return n;
+  return page;
 }
 
 export type SnippetMatch =
@@ -394,10 +429,10 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
   const forms = snippetForms(snippet);
   if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet)
     return { found: false, reason: "too_short" };
-  const page = normalizedBody(body, cacheKey);
+  const page = pageOf(body, cacheKey);
   // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
   for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const quote = matchIn(body, page, want);
+    const quote = matchIn(body, page.n, page.d, want);
     if (quote !== undefined) return { found: true, quote };
   }
   return { found: false, reason: "not_found" };
@@ -407,7 +442,12 @@ const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ")
 const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
 /** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
-function matchIn(body: string, { norm, from, to }: Normalized, want: string): string | undefined {
+function matchIn(
+  body: string,
+  { norm, from, to }: Normalized,
+  dec: Decoded,
+  want: string,
+): string | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
   // (A sign or currency sign first is covered: the number after it is in the first two tokens.)
@@ -422,8 +462,10 @@ function matchIn(body: string, { norm, from, to }: Normalized, want: string): st
     const end = to[at + want.length - 1]!;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
-    if (numericStart && (!startsClause(body, start) || signBefore(body, start))) continue;
-    if (numericEnd && !endsClause(body, end, want)) continue;
+    // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).
+    const d = dec.text;
+    if (numericStart && (!startsClause(d, dec.at[start]!) || signBefore(d, dec.at[start]!))) continue;
+    if (numericEnd && !endsClause(d, dec.at[end]!, want)) continue;
     const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
     const after = firstChar(rest);
     // At a token boundary at the end too: a space, punctuation, nothing — or (below) a listed particle.

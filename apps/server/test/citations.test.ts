@@ -201,6 +201,39 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
   });
 
+  it("round 25: clause, sign and number checks see an entity as the character it stands for", () => {
+    const cases: [page: string, cut: string][] = [
+      ["올해 수익률은 &minus; 5%로 집계됐다.", "5%로 집계됐다."],
+      // The sign walk crosses a line break (the line break alone starts a clause).
+      ["올해 수익률은 &minus;\n5%로 집계됐다.", "5%로 집계됐다."],
+      ["올해 수익률은 &#x2212;\n$5로 집계됐다.", "$5로 집계됐다."],
+      ["올해 수익률은 &minus;5%로 집계됐다.", "5%로 집계됐다."],
+      ["올해 수익률은 &#8722;5%로 집계됐다.", "5%로 집계됐다."],
+      ["올해 수익률은 &#x2212; 5%로 집계됐다.", "5%로 집계됐다."],
+      ["대출 한도는 1&thinsp;234만원이다.", "234만원이다."],
+      ["대출 한도는 1,&thinsp;234만원이다.", "234만원이다."],
+      ["대출 한도는 1,&nbsp;234만원이다.", "234만원이다."],
+      ["대출 한도는 1&thinsp;234만원이다.", "대출 한도는 1"],
+      ["대출 금리는 1.&thinsp;5%로 안내됐다.", "5%로 안내됐다."],
+      ["대출 금리는 1.&nbsp;5%로 안내됐다.", "5%로 안내됐다."],
+      ["대출 금리는 1.&nbsp;5%로 안내됐다.", "대출 금리는 1."],
+      ["행사 일시는 2026.&nbsp;11.&nbsp;12.&nbsp;15:30이다.", "행사 일시는 2026. 11. 12."],
+    ];
+    for (const [page, cut] of cases) expect(found(cut, page), `${cut} | ${page}`).toBe(false);
+    const whole: [page: string, quote: string][] = [
+      ["올해 수익률은 &minus; 5%로 집계됐다.", "올해 수익률은 − 5%로 집계됐다."],
+      ["올해 수익률은 &minus;5%로 집계됐다.", "올해 수익률은 −5%로 집계됐다."],
+      ["대출 한도는 1&thinsp;234만원이다.", "대출 한도는 1 234만원이다."],
+      ["대출 한도는 1,&nbsp;234만원이다.", "대출 한도는 1, 234만원이다."],
+      ["대출 금리는 1.&thinsp;5%로 안내됐다.", "대출 금리는 1. 5%로 안내됐다."],
+      ["앞 문장이다.&nbsp;대출 금리는 1.5%로 안내됐다.&nbsp;뒤 문장이다.", "대출 금리는 1.5%로 안내됐다."],
+      ["결과는 &ldquo;10%&rdquo; 증가였다", "결과는 “10%”"],
+    ];
+    for (const [page, quote] of whole) expect(found(quote, page), `${quote} | ${page}`).toBe(true);
+    // An unknown entity stays as it is written: its `;` is a real `;`.
+    expect(found("5%로 집계됐다.", "올해 수익률은 &zzz;5%로 집계됐다.")).toBe(true);
+  });
+
   it("round 23: a decimal without its leading zero, spaced separators and dates are inside the number", () => {
     const cases: [page: string, cut: string][] = [
       ["The loan charges .5% annual interest.", "5% annual interest."],
