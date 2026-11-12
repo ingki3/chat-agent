@@ -110,6 +110,10 @@ test("XSS payloads in a reply are shown as text and never run", async ({ page, b
   const r = reply(page);
   await expect(r).toHaveAttribute("data-status", "complete");
   await expect(r).toContainText("끝");
+  // The markdown renderer is a lazy chunk; until it loads the reply is plain text, where every check below would pass
+  // without testing anything. Wait for the real render (a slow CI runner loads it late — #103).
+  await expect(r.locator(".md.plain")).toHaveCount(0);
+  await expect(r.locator(".katex").first()).toBeVisible();
   // The markup is visible as text …
   await expect(r).toContainText('<img src="x" onerror="window.__xss=1">');
   await expect(r).toContainText("<script>window.__xss=1</script>");
@@ -121,7 +125,12 @@ test("XSS payloads in a reply are shown as text and never run", async ({ page, b
   await expect(bad).toBeVisible();
   expect(await bad.evaluate((el) => el.closest("a"))).toBeNull();
   await bad.click();
-  await r.getByText("수식 링크").click();
+  // \href in math renders as plain math, not a link. Click its visible rendering: getByText would find KaTeX's hidden
+  // MathML <annotation>, which carries the TeX source, and never become clickable (#103).
+  const math = r.locator(".katex", { hasText: "수식 링크" }).locator(".katex-html");
+  await expect(math).toBeVisible();
+  expect(await r.locator(".katex a").count()).toBe(0);
+  await math.click();
   expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
   expect(dialogs).toEqual([]);
 });
