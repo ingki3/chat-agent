@@ -223,8 +223,16 @@ export class DefaultsService {
     try {
       return this.settle(user.id, runtime, requested, preference, { limit: moves });
     } catch (e) {
-      // Only the runtime was picked and its default model is at a limit: its first model that is not (FR-12.3).
-      if (!(e instanceof LimitedError) || patch.model !== undefined || patch.effort !== undefined) throw e;
+      // Only the runtime was picked (and it really changes) and its default model is at a limit: its first model that
+      // is not (FR-12.3). Anything else — e.g. only "공용으로 쓰기" onto a connection limited for this model — is
+      // refused as it is: the model and effort are never swapped behind the user's back (review #101 3차).
+      if (
+        !(e instanceof LimitedError) ||
+        !runtimeChanged ||
+        patch.model !== undefined ||
+        patch.effort !== undefined
+      )
+        throw e;
       for (const m of this.caps(runtime)?.models ?? []) {
         const s = this.attempt(
           user.id,

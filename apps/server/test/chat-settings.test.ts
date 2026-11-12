@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ChatSettings,
   Conversation,
   CSRF_HEADER,
   DefaultsResponse,
@@ -956,6 +957,61 @@ describe("a usage limit is an FR-12.6 fallback condition (reviews #101 1·2)", (
     const r = await t.owner.post(`/api/connections/${mine.id}/test`, {});
     expect(r.json()).toMatchObject({ result: { status: "passed" } });
     expect(limitRows(t, mine.id).map((l) => l.scope)).toEqual(["family:opus"]);
+  });
+
+  it("new-conversation chip: Claude picked while Opus is limited → the server's preview says Sonnet; the send works (review #101 3차)", async () => {
+    const t = await start({ script });
+    const sub = subscription(t);
+    t.connect("codex", null);
+    await t.as("admin").put("/api/settings/defaults", {
+      defaults: { runtime: "codex", models: { codex: { model: "gpt-6-luna", effort: null } } },
+    });
+    t.app.connections!.store.recordLimit(sub.id, "family:opus", Date.now() + 3_600_000, Date.now() - 1);
+    const d = DefaultsResponse.parse((await t.as("admin").get("/api/settings/defaults")).json());
+    expect(d.start).toMatchObject({ runtime: "codex", model: "gpt-6-luna" });
+    const preview = (change: object, base: unknown = d.start) =>
+      t.as("admin").post("/api/settings/preview", { base, change });
+    const p = await preview({ runtime: "claude-code" });
+    expect(p.statusCode).toBe(200);
+    const chosen = ChatSettings.parse(p.json());
+    expect(chosen).toMatchObject({ runtime: "claude-code", model: "claude-sonnet-5-5" });
+    // What the screen then creates the conversation with is accepted, and it answers.
+    const c = await newAs(t, "admin", { settings: chosen });
+    expect(c.settings).toEqual(chosen);
+    expect(await runAs(t, "admin", c.id, "안녕")).toMatchObject({
+      status: "done",
+      model: "claude-sonnet-5-5",
+    });
+    // Opus itself, and a bad request, are refused like a conversation's change.
+    const opus = await preview({ model: "claude-opus-5-5" }, chosen);
+    expect([opus.statusCode, opus.json()]).toEqual([403, { error: "connection_limited" }]);
+    expect((await preview({})).statusCode).toBe(400);
+    // Nothing was stored by previews.
+    expect(
+      DefaultsResponse.parse((await t.as("admin").get("/api/settings/defaults")).json()).defaults.runtime,
+    ).toBe("codex");
+  });
+
+  it("공용으로 쓰기 alone onto a connection limited for the model: 403, model and effort unchanged (review #101 3차)", async () => {
+    const t = await start({ script });
+    t.connect("claude-code", "owner");
+    const shared = t.connect("claude-code", null);
+    t.connect("codex", null);
+    t.app.connections!.store.recordLimit(shared.id, "family:opus", Date.now() + 3_600_000, Date.now() - 1);
+    const c = await t.newConversation();
+    expect(c.settings).toEqual({
+      runtime: "claude-code",
+      model: "claude-opus-5-5",
+      effort: "high",
+      useShared: false,
+    });
+    const r = await t.owner.put(`/api/conversations/${c.id}/settings`, { useShared: true });
+    expect([r.statusCode, r.json()]).toEqual([403, { error: "connection_limited" }]);
+    expect((await t.getConversation(c.id)).settings).toEqual(c.settings);
+    // A real runtime change still lands on the first model that is not limited.
+    await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "codex" });
+    const back = await t.owner.put(`/api/conversations/${c.id}/settings`, { runtime: "claude-code" });
+    expect(Conversation.parse(back.json()).settings).toMatchObject({ model: "claude-opus-5-5" }); // personal: fine
   });
 
   it("limitFor: by auth type — reset time, retry-after, cooldown; scope from the window", () => {

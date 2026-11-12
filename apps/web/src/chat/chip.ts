@@ -1,16 +1,9 @@
-import {
-  limitApplies,
-  type ChangeSettingsRequest,
-  type ChatSettings,
-  type RuntimeDefaults,
-  type RuntimeOption,
-} from "@agentlee/shared";
+import { limitApplies, type ChatSettings, type RuntimeOption } from "@agentlee/shared";
 
 /**
- * The chip's pure parts (#19): its label, what "공용으로 쓰기" needs, and — on the new-conversation screen, where
- * there is no conversation to send a change to yet — the same change rules as the server
- * (`DefaultsService.change`), so the chip shows what the conversation will be created with. The server checks the
- * result again at creation (403).
+ * The chip's pure parts (#19): its label, what "공용으로 쓰기" needs, usage limits and the fallback notice. What a
+ * change makes of the settings is never computed here — the server does it (`PUT …/settings`, and
+ * `POST /api/settings/preview` on the new-conversation screen), so the screen cannot drift from its rules.
  */
 
 export const RUNTIME_NAME: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
@@ -74,51 +67,6 @@ export function runtimeLimit(option: RuntimeOption | undefined, now: number): Li
     viaShared: !free && per.some((l) => l.viaShared),
     until: ends.length ? Math.min(...ends) : null,
   };
-}
-
-/** The settings after `change`, as the server would make them (runtime only → its default model, …). */
-export function applyChange(
-  current: ChatSettings,
-  change: ChangeSettingsRequest,
-  options: RuntimeOption[],
-  defaults: RuntimeDefaults | undefined,
-): ChatSettings | null {
-  const runtime = change.runtime ?? current.runtime;
-  const option = options.find((o) => o.runtime === runtime);
-  if (!option) return null;
-  const runtimeChanged = runtime !== current.runtime;
-  const saved = defaults?.models[runtime];
-  let model: string;
-  let preferredEffort: string | null;
-  if (change.model !== undefined) {
-    model = change.model;
-    preferredEffort =
-      !runtimeChanged && model === current.model
-        ? current.effort
-        : saved?.model === model
-          ? saved.effort
-          : null;
-  } else if (runtimeChanged) {
-    model = saved?.model ?? "";
-    preferredEffort = saved?.effort ?? null;
-  } else {
-    model = current.model;
-    preferredEffort = current.effort;
-  }
-  const m =
-    option.models.find((x) => x.id === model) ?? (change.model === undefined ? option.models[0] : undefined);
-  if (!m) return null;
-  if (m.id !== model) preferredEffort = null;
-  let effort: string | null;
-  if (change.effort !== undefined) {
-    if (!m.efforts.includes(change.effort)) return null;
-    effort = change.effort;
-  } else if (preferredEffort && m.efforts.includes(preferredEffort)) effort = preferredEffort;
-  else
-    effort =
-      (m.defaultEffort && m.efforts.includes(m.defaultEffort) ? m.defaultEffort : m.efforts[0]) ?? null;
-  const useShared = change.useShared ?? (runtimeChanged ? false : current.useShared);
-  return { runtime, model: m.id, effort, useShared };
 }
 
 const when = new Intl.DateTimeFormat("ko-KR", {

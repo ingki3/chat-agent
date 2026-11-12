@@ -18,8 +18,8 @@ import {
   type Message,
   type StartRunResponse,
 } from "@agentlee/shared";
-import { ApiError, conversations, errorText, runs, settings as settingsApi } from "../api.js";
-import { applyChange, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
+import { conversations, errorText, runs, settings as settingsApi } from "../api.js";
+import { differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { DividerView, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -298,11 +298,10 @@ export function NewChatPage() {
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
     navigate(`/c/${c.id}`);
   };
+  // The server computes the choice (the same rules as the conversation is created with, limits included).
   const change = async (c: ChangeSettingsRequest) => {
-    if (!start || !usable.data) return;
-    const next = applyChange(start, c, usable.data, defaults.data?.defaults);
-    if (!next) throw new ApiError(400, "chip_unavailable");
-    setChosen(next);
+    if (!start) return;
+    setChosen(await settingsApi.preview(start, c));
   };
   if (defaults.data && defaults.data.start === null)
     return (

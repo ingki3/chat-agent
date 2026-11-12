@@ -188,6 +188,15 @@ export const UpdateConversationRequest = z
  * `POST /api/conversations/:id/fallback-notice/consume` (#19): takes the fallback notice atomically — the first caller
  * gets it, every later (or concurrent) one gets null — so it is shown once across tabs and reloads.
  */
+/**
+ * `POST /api/settings/preview` (#19): the new-conversation screen's chip — what `change` makes of `base` (the start
+ * settings, or the choice so far), by the same rules as a conversation's change, limits included. Nothing is saved.
+ */
+export const PreviewSettingsRequest = z
+  .object({ base: ChatSettings.nullable(), change: ChangeSettingsRequest })
+  .strict();
+export type PreviewSettingsRequest = z.infer<typeof PreviewSettingsRequest>;
+
 /** What a conversation started on instead of the default; `limitedUntil` when the default was at a usage limit. */
 export const FallbackNotice = z.object({
   runtime: RuntimeId,

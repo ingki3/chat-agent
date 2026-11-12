@@ -151,3 +151,30 @@ test("a default that cannot be used: the fallback starts the chat and says so on
     "새 대화는 Claude Code · Fake Large로 시작해요",
   );
 });
+
+test("the new-chat chip: the server computes the choice, and the first reply uses it", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "newchip");
+  await signIn(page, baseURL!, me);
+  await page.goto("/");
+  await expect(chip(page)).toContainText("Claude Code · Opus 5.5");
+  const previewed = page.waitForResponse(
+    (r) => r.url().endsWith("/api/settings/preview") && r.status() === 200,
+  );
+  await chip(page).click();
+  await page
+    .getByRole("dialog", { name: "런타임·모델 선택" })
+    .getByLabel("모델")
+    .selectOption({ label: "Fake Large" });
+  await previewed;
+  await expect(chip(page)).toContainText("Claude Code · Fake Large");
+  await page.keyboard.press("Escape");
+  await box(page).fill("새 대화 칩");
+  await box(page).press("Enter");
+  await expect(page).toHaveURL(/\/c\/[0-9a-f-]+$/);
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  expect(await lastReply(page)).toMatchObject({ model: "fake-large" });
+});

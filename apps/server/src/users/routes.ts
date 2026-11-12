@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import {
   CreateUserRequest,
+  PreviewSettingsRequest,
   SetDefaultsRequest,
   SetSkillEnabledRequest,
   SetUserSkillsRequest,
@@ -260,6 +261,24 @@ export function registerAccountSettings(
   });
 
   // ---- the caller's own defaults (FR-12.1) ----
+
+  // The new-conversation chip (#19): the server computes the choice, so the screen cannot drift from the rules the
+  // conversation is created with (runtime only → its default or first model not at a limit; 403 when refused).
+  app.post(
+    "/api/settings/preview",
+    { config: { noResource: "the caller's own runtime choice, nothing stored" } },
+    async (req, reply) => {
+      const r = PreviewSettingsRequest.safeParse(req.body);
+      if (!r.success) return deny(reply, 400, "invalid_request");
+      try {
+        return send(reply, deps.defaults.change(users.byId(req.ctx.user!.id)!, r.data.base, r.data.change));
+      } catch (e) {
+        if (e instanceof RunAccessDenied)
+          return reply.code(403).header("Cache-Control", "no-store").send({ error: e.code });
+        throw e;
+      }
+    },
+  );
 
   app.get(
     "/api/settings/defaults",

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatSettings, RuntimeOption } from "@agentlee/shared";
 import {
-  applyChange,
   canChooseShared,
   chipLabel,
   differs,
@@ -70,33 +69,6 @@ describe("the chip's label and choices (#19)", () => {
     expect(differs(opus, { runtime: "claude-code", model: "claude-opus-5-5", effort: "high" })).toBe(false);
     expect(differs(opus, { runtime: "claude-code", model: "claude-opus-5-5", effort: "low" })).toBe(true);
     expect(differs(opus, undefined)).toBe(false);
-  });
-});
-
-describe("applyChange mirrors the server's rules on the new-conversation screen", () => {
-  const defaults = {
-    runtime: "claude-code" as const,
-    models: { codex: { model: "gpt-6-luna", effort: "max" } },
-  };
-  it("runtime only → that runtime's saved default model and effort, else its first model; 공용 resets", () => {
-    expect(applyChange(opus, { runtime: "codex" }, options, defaults)).toEqual({
-      runtime: "codex",
-      model: "gpt-6-luna",
-      effort: "max",
-      useShared: false,
-    });
-    expect(applyChange(opus, { runtime: "codex" }, options, undefined)).toMatchObject({
-      model: "gpt-6.1-sol",
-      effort: "low",
-    });
-  });
-  it("model only → that model's default effort; an effort it does not take → null (refused)", () => {
-    expect(applyChange(opus, { model: "claude-haiku-5-5" }, options, defaults)).toMatchObject({
-      effort: null,
-    });
-    expect(applyChange(opus, { effort: "low" }, options, defaults)).toMatchObject({ effort: "low" });
-    expect(applyChange(opus, { effort: "max" }, options, defaults)).toBeNull();
-    expect(applyChange(opus, { model: "nope" }, options, defaults)).toBeNull();
   });
 });
 

@@ -23,6 +23,7 @@ import {
   ConnectionTestResult,
   Conversation,
   type ChangeSettingsRequest,
+  ChatSettings,
   ConsumeFallbackNoticeResponse,
   CreateUserResponse,
   CSRF_HEADER,
@@ -235,6 +236,9 @@ export const settings = {
   usableRuntimes: async () =>
     RuntimeOption.array().parse(((await call("GET", "/api/runtimes/usable")) as { items: unknown }).items),
   defaults: async () => DefaultsResponse.parse(await call("GET", "/api/settings/defaults")),
+  /** The new-conversation chip (#19): what `change` makes of `base`, computed by the server (403 when refused). */
+  preview: async (base: ChatSettings | null, change: ChangeSettingsRequest) =>
+    ChatSettings.parse(await call("POST", "/api/settings/preview", { base, change })),
   setDefaults: async (defaults: RuntimeDefaults | null) =>
     DefaultsResponse.parse(await call("PUT", "/api/settings/defaults", { defaults })),
 };
@@ -436,7 +440,6 @@ const MESSAGES: Record<string, string> = {
   model_not_allowed: "허용되지 않은 모델이에요.",
   effort_not_allowed: "허용되지 않은 추론 강도예요.",
   runtime_not_allowed: "허용되지 않은 런타임이에요.",
-  chip_unavailable: "지금은 고를 수 없는 조합이에요.",
   backup_running: "이미 백업 중이에요. 끝난 뒤 다시 눌러 주세요.",
   backup_unavailable: "이 서버에서는 백업을 만들지 않아요(BACKUP_DIR 확인).",
   backup_failed: "백업에 실패했어요. 디스크와 백업 폴더 권한을 확인하세요.",
