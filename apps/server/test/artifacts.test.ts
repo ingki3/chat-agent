@@ -616,3 +616,177 @@ describe("artifact routes (#27)", () => {
     expect(forged.statusCode).toBe(403);
   });
 });
+
+describe("artifact panel, cards and list (#28)", () => {
+  const get = (app: App, url: string, cookie?: string) =>
+    app.inject({ url, headers: { ...LOCAL, ...(cookie ? { cookie } : {}) } });
+  type Part = { type: string; artifactId?: string; version?: number };
+  const lastParts = async (app: App, cookie: string, conversationId: string) => {
+    const r = await get(app, `/api/conversations/${conversationId}/messages`, cookie);
+    return (r.json() as { items: { parts: Part[] }[] }).items.at(-1)!.parts;
+  };
+
+  it("a reply gets one card (artifact_ref) per artifact its run made or changed, from the stored versions", async () => {
+    const { app, f } = await newApp();
+    const c = app.conversations!.create(f.users.owner.id);
+    const created = await runCommand(app, f.cookies.owner, c.id, `/artifact html 카드\n<p>v1</p>`);
+    const id = String(created.output.artifactId);
+    const refs = (parts: Part[]) => parts.filter((p) => p.type === "artifact_ref");
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([
+      { type: "artifact_ref", artifactId: id, version: 1 },
+    ]);
+    // The card comes right after the tool's result (before the closing text), and is streamed as it is added.
+    const p1 = await lastParts(app, f.cookies.owner, c.id);
+    const at = p1.findIndex((p) => p.type === "artifact_ref");
+    expect(p1[at - 1]!.type).toBe("tool_result");
+    expect(app.runs!.eventsAfter(created.runId, -1).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({
+        type: "part_update",
+        partIndex: at,
+        part: { type: "artifact_ref", artifactId: id, version: 1 },
+      }),
+    );
+
+    await runCommand(app, f.cookies.owner, c.id, `/artifact-update ${id} content\n<p>v2</p>`);
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([
+      { type: "artifact_ref", artifactId: id, version: 2 },
+    ]);
+    // Nothing written (the same content again, a refused call): no card.
+    await runCommand(app, f.cookies.owner, c.id, `/artifact-update ${id} content\n<p>v2</p>`);
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([]);
+    await runCommand(
+      app,
+      f.cookies.owner,
+      c.id,
+      `/artifact chart 나쁜\n{"type":"bar","labels":["a"],"series":[]}`,
+    );
+    expect(refs(await lastParts(app, f.cookies.owner, c.id))).toEqual([]);
+    // A version written by another run of another conversation never shows here.
+    const other = app.conversations!.create(f.users.owner.id);
+    const elsewhere = await runCommand(app, f.cookies.owner, other.id, `/artifact html 다른\n<p>x</p>`);
+    expect(app.artifacts!.refsOfRun(c.id, elsewhere.runId)).toEqual([]);
+    expect(refs(await lastParts(app, f.cookies.owner, other.id))).toEqual([
+      { type: "artifact_ref", artifactId: String(elsewhere.output.artifactId), version: 1 },
+    ]);
+  });
+
+  it("refsOfRun: newest version per artifact the run wrote, only in its conversation, in first-touched order", async () => {
+    const { app, f } = await newApp();
+    const c = app.conversations!.create(f.users.owner.id);
+    const other = app.conversations!.create(f.users.owner.id);
+    const store = app.artifacts!;
+    const scope = { userId: f.users.owner.id, conversationId: c.id, runId: "run-a" };
+    const a = store.create(scope, { kind: "html", title: "a", content: "<p>1</p>" }).artifact.id;
+    const b = store.create(scope, { kind: "html", title: "b", content: "<p>1</p>" }).artifact.id;
+    store.update(scope, a, { content: "<p>2</p>" });
+    store.update({ ...scope, runId: "run-b" }, b, { content: "<p>2</p>" });
+    store.create({ ...scope, conversationId: other.id }, { kind: "html", title: "x", content: "<p>1</p>" });
+    expect(store.refsOfRun(c.id, "run-a")).toEqual([
+      { artifactId: a, version: 2 },
+      { artifactId: b, version: 1 },
+    ]);
+    expect(store.refsOfRun(c.id, "run-b")).toEqual([{ artifactId: b, version: 2 }]);
+    expect(store.refsOfRun(other.id, "run-b")).toEqual([]);
+  });
+
+  it("GET /api/artifacts: only the caller's own, across conversations, newest change first, paged", async () => {
+    const { app, f } = await newApp();
+    const store = app.artifacts!;
+    let t = 1_000;
+    (store as unknown as { now: () => number }).now = () => ++t;
+    const c1 = app.conversations!.create(f.users.owner.id, { title: "숙제" });
+    const c2 = app.conversations!.create(f.users.owner.id, { title: "여행" });
+    const mine = (cid: string, title: string) =>
+      store.create(
+        { userId: f.users.owner.id, conversationId: cid, runId: "r" },
+        { kind: "html", title, content: `<p>${title}</p>` },
+      ).artifact.id;
+    const a = mine(c1.id, "a");
+    const b = mine(c2.id, "b");
+    const c = mine(c1.id, "c");
+    store.update({ userId: f.users.owner.id, conversationId: c1.id, runId: "r" }, a, {
+      content: "<p>a2</p>",
+    });
+    const sc = app.conversations!.create(f.users.stranger.id);
+    store.create(
+      { userId: f.users.stranger.id, conversationId: sc.id, runId: "r" },
+      { kind: "html", title: "남의 것", content: "<p>x</p>" },
+    );
+    const r = await get(app, "/api/artifacts", f.cookies.owner);
+    expect(r.statusCode).toBe(200);
+    expect(r.headers["cache-control"]).toBe("no-store");
+    const body = r.json() as { items: { id: string; conversationTitle: string; latestVersion: number }[] };
+    expect(body.items.map((i) => [i.id, i.conversationTitle, i.latestVersion])).toEqual([
+      [a, "숙제", 2],
+      [c, "숙제", 1],
+      [b, "여행", 1],
+    ]);
+    expect(JSON.stringify(body)).not.toContain("<p>"); // no content in the list
+    // Pages of two: the cursor goes on where the page ended, nothing twice or missing.
+    const p1 = (await get(app, "/api/artifacts?limit=2", f.cookies.owner)).json() as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(p1.items.map((i) => i.id)).toEqual([a, c]);
+    const p2 = (
+      await get(app, `/api/artifacts?limit=2&cursor=${encodeURIComponent(p1.nextCursor!)}`, f.cookies.owner)
+    ).json() as { items: { id: string }[]; nextCursor: string | null };
+    expect(p2).toEqual({ items: [expect.objectContaining({ id: b })], nextCursor: null });
+    // Everyone else sees only their own: the admin and the stranger never get the owner's.
+    const stranger = (await get(app, "/api/artifacts", f.cookies.stranger)).json() as {
+      items: { title: string }[];
+    };
+    expect(stranger.items.map((i) => i.title)).toEqual(["남의 것"]);
+    expect((await get(app, "/api/artifacts", f.cookies.admin)).json()).toEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect((await get(app, "/api/artifacts", f.cookies.shared)).json()).toEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect((await get(app, "/api/artifacts")).statusCode).toBe(401);
+    expect((await get(app, "/api/artifacts?cursor=x", f.cookies.owner)).statusCode).toBe(400);
+    expect((await get(app, "/api/artifacts?limit=1000", f.cookies.owner)).statusCode).toBe(400);
+  });
+
+  it("download ?format=html: a chart's or table's page as an attachment; other kinds and formats 404; owner only", async () => {
+    const { app, f } = await newApp();
+    const cv = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: cv.id, runId: "r" };
+    const store = app.artifacts!;
+    const chart = store.create(scope, {
+      kind: "chart",
+      title: "차트",
+      chart: { type: "bar", labels: ["a"], series: [{ name: "s", values: [1] }] },
+    }).artifact.id;
+    const table = store.create(scope, {
+      kind: "table",
+      title: "표",
+      table: { columns: ["a"], rows: [["<b>"]] },
+    }).artifact.id;
+    const html = store.create(scope, { kind: "html", title: "h", content: "<p>h</p>" }).artifact.id;
+    for (const id of [chart, table]) {
+      const r = await get(app, `/a/${id}/v/1/download?format=html`, f.cookies.owner);
+      expect(r.statusCode).toBe(200);
+      expect(r.headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(r.headers["content-disposition"]).toMatch(/^attachment; filename=".*\.html"/);
+      expect(r.headers["content-security-policy"]).toBe(artifactCsp([]));
+      expect(r.headers["x-content-type-options"]).toBe("nosniff");
+      expect(r.body).toMatch(/^<!doctype html>/i);
+      expect(r.body).not.toContain("<script");
+      expect((await get(app, `/a/${id}/v/1/download?format=html`, f.cookies.stranger)).statusCode).toBe(403);
+      expect((await get(app, `/a/${id}/v/1/download?format=html`)).statusCode).toBe(401);
+    }
+    expect((await get(app, `/a/${table}/v/1/download?format=html`, f.cookies.owner)).body).toContain(
+      "&lt;b&gt;",
+    );
+    expect((await get(app, `/a/${html}/v/1/download?format=html`, f.cookies.owner)).statusCode).toBe(404);
+    expect((await get(app, `/a/${chart}/v/1/download?format=pdf`, f.cookies.owner)).statusCode).toBe(404);
+    expect((await get(app, `/a/${chart}/v/9/download?format=html`, f.cookies.owner)).statusCode).toBe(404);
+    // Without a format the original as before.
+    expect((await get(app, `/a/${chart}/v/1/download`, f.cookies.owner)).headers["content-type"]).toBe(
+      "image/svg+xml; charset=utf-8",
+    );
+  });
+});

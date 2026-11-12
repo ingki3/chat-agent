@@ -348,7 +348,7 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **남은 위험·미룬 것:**
   - 아티팩트가 **자기 프레임**을 외부 주소로 탐색하는 것은 막지 못한다(CSP에 탐색 제한이 없다 — `navigate-to`는 브라우저가 지원하지 않음). 새 창(`allow-popups` 없음)·최상위 창은 막힌다. 이때 나갈 수 있는 것은 아티팩트 자신의 내용과 그 안에서 사용자가 입력한 것뿐이다(쿠키·API·대화 내용은 아님). 모델이 대화 내용을 아티팩트에 넣게 만드는 프롬프트 주입은 #20 평가(`artifact_create → 숨은 지시 게시`)가 다룬다.
   - `document` 미리보기(pdf.js, DOCX·PPTX·XLSX의 PDF 변환)는 #49·#22. 지금은 참조만 저장하고 화면은 "준비 중".
-  - 아티팩트 패널·메시지 안 카드(`artifact_ref` 부분)는 #28, PNG·PDF 내려받기는 #51(아래 절), 공유는 #29(자원 로더의 `sharedWith`), 목록 화면은 #28·#52.
+  - 아티팩트 패널·메시지 안 카드(`artifact_ref` 부분)·목록 화면은 #28(아래 "아티팩트 패널·목록" 절), PNG·PDF 내려받기는 #51(아래 절), 공유는 #29(자원 로더의 `sharedWith`), 공유받은 목록은 #52.
 
 ## 아티팩트 내보내기 (#51)
 차트를 PNG로, HTML·문서를 PDF로 내려받는다(PRD FR-6.4, FR-7.5의 "저장"). 남이 만든 HTML을 서버가 직접 그리는 일이라, 렌더러는 **아티팩트 서빙(#27)과 같은 문서를 #42의 격리 위에서** 연다. 코드: `apps/server/src/artifacts/browser.ts`(브라우저 찾기·스위치·실행기·DevTools 파이프), `export.ts`(렌더러·한도·종류별 형식), 경로는 `routes.ts`, 화면은 `apps/web/src/pages/ArtifactPage.tsx`.
@@ -404,6 +404,21 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
   - 문서(`document`) 종류의 PDF·미리보기는 생성 파일(#49)·파일 변환(#22)과 함께.
   - Chart.js처럼 CDN 스크립트를 쓰는 HTML의 실제 CDN 로드는 네트워크가 있을 때만 확인된다(시험의 프록시는 가짜 연결). 운영 Mac에서 수동 확인: `docs/ops.md` §18.4.
   - 서비스 사용자(LaunchDaemon)가 개발 계정과 다르면 Playwright 캐시 위치가 다르다 — `EXPORT_BROWSER`를 설정한다(ops.md).
+
+## 아티팩트 패널·목록 (#28)
+대화 옆 패널에서 아티팩트를 보고 버전을 고르고(PRD FR-6.1·6.2), 내 아티팩트를 한곳에서 다시 연다(FR-6.6). 격리는 #27 그대로다 — 패널은 **같은 보기 코드**를 쓴다. 코드: 화면 `apps/web/src/artifacts/viewer.tsx`(iframe·버전·내려받기, `/a/:id`와 패널이 같이 씀)·`ArtifactPanel.tsx`(패널·카드)·`pages/ArtifactsPage.tsx`(목록), 서버 `artifacts/store.ts`(`listByUser`·`refsOfRun`)·`routes.ts`, 카드 부착은 `runtime/runs.ts` `syncArtifactRefs`.
+
+- **iframe은 한 곳에서만 정의한다:** `ArtifactBody`(viewer.tsx)의 `<iframe sandbox={ARTIFACT_SANDBOX}>`, `ARTIFACT_SANDBOX = "allow-scripts"`(`allow-same-origin` 없음). 버전마다 새 iframe(`key`)이라 한 버전의 문서가 다음 버전으로 이어지지 않는다. 원본은 여전히 `/a/:id/v/:ver/raw`(정책 A·B 두 CSP, #27)에서만 온다 — 패널이 본문을 받아 `srcdoc`로 넣는 일은 없다.
+- **카드(`artifact_ref`)는 서버가 저장된 버전에서 만든다:** 런타임이 보낸 도구 결과(`artifactId` 등)는 믿지 않는다. 도구 호출이 끝날 때마다(`tool_end`)와 run이 끝날 때(복구 포함) `refsOfRun(대화, run)` — 그 대화의 아티팩트 중 **이 run의 토큰으로 쓰인 버전**(`artifact_versions.run_id`)만, 아티팩트마다 가장 새 버전 — 을 읽어 답변 부분에 넣고 `part_update`로 흘린다. 같은 아티팩트를 한 run이 여러 번 고치면 카드 하나가 새 버전으로 바뀐다. 그래서 런타임이 가짜 도구 결과를 지어내도 카드는 생기지 않고, 남의 대화·다른 run의 버전도 붙지 않는다(시험). 카드가 아티팩트를 불러올 때도 `GET /api/artifacts/:id`(주인만)를 거친다.
+- **패널 상태는 주소에:** `/c/<대화>?artifact=<id>&v=<버전>`. 패널은 채팅 화면에서만 열린다(`/c/:id`). 버전을 고르면 `v`만 바뀌고(기록 대체), 되돌리기·최신을 고르면 `v`가 빠져 최신을 따라간다. 주소의 id는 그냥 입력값이다 — 권한은 서버 경로가 정한다(남의 id → 403 → "권한이 없어요", iframe 없음, e2e).
+- **휴대폰:** 900px 이하에서 패널은 `position: fixed; inset: 0`인 `role="dialog" aria-modal`이고 그동안 `<main>`은 `inert`다. 열면 패널 제목으로 초점이 가고, 닫으면 연 카드로 돌아온다. Esc로 닫는다.
+- **목록 `GET /api/artifacts`(로그인한 본인만, `noResource` — id가 없어 남의 것을 가리킬 수 없다):** `artifacts.user_id = 나` **그리고** 그 대화의 주인 = 나. 최근에 바뀐 것부터 `(updatedAt, id)` 키셋 페이지(커서는 `<숫자>:<id>` 형식만, 아니면 400). 본문은 싣지 않는다(시험). 읽을 때 알려진 비밀은 지운다(#78, 대화 제목 포함). `user_id` 인덱스는 없다 — 가족 규모(대화당 200개 한도)에서 전체 훑기로 충분하고, 마이그레이션을 피했다. 커지면 `(user_id, updated_at)` 인덱스를 더한다.
+- **HTML 내려받기 `?format=html`:** 차트·표만(원본이 HTML이 아닌 종류). 본문은 원본 서빙과 같은 서버가 그린 페이지(스크립트 없음), 헤더는 내려받기와 같다(`attachment`, 샌드박스 CSP, `nosniff`, `no-store`). 다른 종류·다른 형식 값은 404. 같은 경로라 권한 행렬의 내려받기 행이 그대로 덮는다.
+- **권한 행렬:** 새 자원 경로는 없다(`GET /api/artifacts`는 id가 없는 본인 목록 — `conversations` 목록과 같은 방식). 본인만 보는지는 `artifacts.test.ts`가 가족 네 계정(주인·공유·관리자·남)과 비로그인으로 확인한다.
+- **시험:**
+  - 단위·통합(`apps/server/test/artifacts.test.ts` "artifact panel, cards and list (#28)"): 실제 MCP 경로의 run이 만든 카드(도구 결과 바로 뒤, `part_update`로 흐름), 수정 → v2 카드, 같은 내용·실패한 호출 → 카드 없음, 다른 대화의 run 버전이 안 붙음, `refsOfRun` 순서·범위, 목록의 본인 한정·정렬·페이지·잘못된 커서 400, HTML 내려받기 헤더·종류·형식·권한.
+  - Playwright(`e2e/artifact-panel.spec.ts`, 데스크톱·모바일): 대화에서 `/artifact` → v1 카드 → 패널(데스크톱은 세 번째 열·HTML 파일 내려받기, 휴대폰은 화면 전체·`main` inert) → `/artifact-update` → v2 카드·패널이 v2로 → v1 선택 시 v1 본문 → 되돌리기 → v3(v1 복원)·v1 본문, v1 카드는 v1을 염, 주소로 다시 열기. 목록: 두 대화의 아티팩트가 최근 순, 누르면 그 대화의 패널, 공유받은 것 빈 화면, 아들은 목록에 없고 엄마의 id로 패널을 열면 권한 없음·iframe 없음.
+- **변이 시험(2026-11-12):** 하나씩 망가뜨리면 시험이 실패함을 확인했다. 목록의 본인 조건 제거(단위), `GET /api/artifacts/:id`를 `noResource`로(권한 행렬·e2e — 아들의 패널에 iframe이 생김), iframe에 `allow-same-origin` 추가(e2e 10개), 버전 선택과 상관없이 최신 원본을 보여 줌(e2e), 되돌리기가 새 버전을 만들지 않음(단위·e2e), 패널이 휴대폰에서도 전체 화면이 아님(`fullScreen={false}`, e2e), 전체 화면 CSS의 `position: fixed` 제거(e2e), `tool_end`에서 카드 부착 안 함(단위), 카드 부착을 아예 안 함(단위).
 
 ## 인용 검증 (#25)
 `cite`·`sources_list`는 프로세스를 띄우지 않는 서버 도구다(`apps/server/src/citations/`, 도구 정의 `packages/mcp-tools/src/web.ts`). 네트워크에 나가지 않는다 — #50이 저장한 본문만 읽는다. 운영은 `docs/ops.md` §22.

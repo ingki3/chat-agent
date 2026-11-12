@@ -1,9 +1,12 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import {
+  ARTIFACT_HTML_DOWNLOAD,
+  MyArtifactsQuery,
   RevertArtifactRequest,
   type ArtifactDetail,
   type ArtifactListResponse,
   type ArtifactVersionContent,
+  type MyArtifactsResponse,
 } from "@agentlee/shared";
 import { deny } from "../auth/plugin.js";
 import type { ConversationStore } from "../conversations/store.js";
@@ -36,11 +39,13 @@ const notFound = (reply: FastifyReply) =>
 /**
  * Artifact API and pages (#27):
  * - `GET /api/conversations/:id/artifacts` — the conversation's artifacts (owner only)
+ * - `GET /api/artifacts` — the caller's own artifacts across conversations (#28 "내가 만든 것"; no id: only the
+ *   session's user, never anyone else's)
  * - `GET /api/artifacts/:id` — one artifact with its versions; `GET /api/artifacts/:id/versions/:version` — one
  *   version's stored text as JSON (never rendered by the app)
  * - `POST /api/artifacts/:id/revert` `{ version }` — copy an earlier version as the newest
  * - `GET /a/:id` — the app page (viewer); `GET /a/:id/v/:version/raw` — the sandboxed original;
- *   `GET /a/:id/v/:version/download` — the file
+ *   `GET /a/:id/v/:version/download` — the file (`?format=html`: a chart's or table's page as HTML, #28)
  * - `GET /a/:id/v/:version/png` · `/pdf` — rendered by the isolated browser (#51, `export.ts`); the renderer gets
  *   the stored version only — never the request, its cookies or session
  */
@@ -70,6 +75,25 @@ export function registerArtifactRoutes(
       reply
         .header("Cache-Control", "no-store")
         .send({ items: store.list(req.params.id).map(toArtifact) } satisfies ArtifactListResponse),
+  );
+
+  app.get(
+    "/api/artifacts",
+    { config: { noResource: "lists only the caller's own artifacts (no id: only the session's user)" } },
+    async (req, reply) => {
+      const q = MyArtifactsQuery.safeParse(req.query);
+      if (!q.success) return deny(reply, 400, "invalid_request");
+      const [at, id] = q.data.cursor ? (q.data.cursor.split(":") as [string, string]) : [];
+      const page = store.listByUser(
+        req.ctx.user!.id,
+        q.data.limit,
+        at !== undefined && id !== undefined ? { updatedAt: Number(at), id } : undefined,
+      );
+      return reply.header("Cache-Control", "no-store").send({
+        items: page.items.map((a) => ({ ...toArtifact(a), conversationTitle: a.conversationTitle })),
+        nextCursor: page.next ? `${page.next.updatedAt}:${page.next.id}` : null,
+      } satisfies MyArtifactsResponse);
+    },
   );
 
   app.get<{ Params: { id: string } }>("/api/artifacts/:id", { config: read }, async (req, reply) => {
@@ -154,7 +178,7 @@ export function registerArtifactRoutes(
     },
   );
 
-  app.get<{ Params: { id: string; version: string } }>(
+  app.get<{ Params: { id: string; version: string }; Querystring: { format?: unknown } }>(
     "/a/:id/v/:version/download",
     { config: read },
     async (req, reply) => {
@@ -162,7 +186,16 @@ export function registerArtifactRoutes(
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
-      const file = v && downloadVersion(a.kind, v.content, v.language ?? null);
+      const format = req.query.format;
+      if (format !== undefined && (format !== "html" || !ARTIFACT_HTML_DOWNLOAD.has(a.kind)))
+        return notFound(reply);
+      // `?format=html` (#28): the page the original is served as (server-drawn, no script), as a file.
+      const page = v && format === "html" ? serveVersion(a.kind, v.title, v.content) : undefined;
+      const file = page
+        ? { type: page.type, body: page.body, ext: "html" }
+        : v && format === undefined
+          ? downloadVersion(a.kind, v.content, v.language ?? null)
+          : undefined;
       if (!v || !file) return notFound(reply);
       return (
         reply

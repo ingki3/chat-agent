@@ -119,6 +119,27 @@ export type ArtifactDetail = z.infer<typeof ArtifactDetail>;
 export const ArtifactListResponse = z.object({ items: z.array(Artifact) });
 export type ArtifactListResponse = z.infer<typeof ArtifactListResponse>;
 
+/**
+ * "내가 만든 것" (#28, FR-6.6): the caller's own artifacts across conversations, most recently changed first, with
+ * the conversation's title. Paged by an opaque cursor.
+ */
+export const MyArtifact = Artifact.extend({ conversationTitle: z.string() });
+export type MyArtifact = z.infer<typeof MyArtifact>;
+export const MY_ARTIFACTS_PAGE = 50;
+export const MyArtifactsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(MY_ARTIFACTS_PAGE),
+  cursor: z
+    .string()
+    .max(200)
+    .regex(/^[0-9]{1,16}:[A-Za-z0-9-]{1,100}$/)
+    .optional(),
+});
+export const MyArtifactsResponse = z.object({
+  items: z.array(MyArtifact),
+  nextCursor: z.string().nullable(),
+});
+export type MyArtifactsResponse = z.infer<typeof MyArtifactsResponse>;
+
 /** One version's stored content as text (JSON text for chart, table and document). Never rendered by the app. */
 export const ArtifactVersionContent = z.object({
   version: z.number().int().positive(),
@@ -134,8 +155,13 @@ export type RevertArtifactRequest = z.infer<typeof RevertArtifactRequest>;
 export const artifactPath = (id: string) => `/a/${encodeURIComponent(id)}`;
 export const artifactRawPath = (id: string, version: number) =>
   `/a/${encodeURIComponent(id)}/v/${version}/raw`;
-export const artifactDownloadPath = (id: string, version: number) =>
-  `/a/${encodeURIComponent(id)}/v/${version}/download`;
+export const artifactDownloadPath = (id: string, version: number, format?: "html") =>
+  `/a/${encodeURIComponent(id)}/v/${version}/download${format ? `?format=${format}` : ""}`;
+/**
+ * Kinds whose original is not HTML but whose served page is (#28 "HTML·원본 내려받기"): the download route also
+ * gives that page as a file (`?format=html`). An html artifact's original already is its HTML.
+ */
+export const ARTIFACT_HTML_DOWNLOAD: ReadonlySet<ArtifactKind> = new Set(["chart", "table"]);
 
 /** PNG/PDF export (#51): which formats each kind exports to (pictures → PNG, documents → PDF). */
 export const ARTIFACT_EXPORT_FORMATS = ["png", "pdf"] as const;

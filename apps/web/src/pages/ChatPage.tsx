@@ -28,6 +28,7 @@ import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
+import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
@@ -94,6 +95,9 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: ["active-run", id] }),
       qc.invalidateQueries({ queryKey: ["conversation", id] }),
       qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY }),
+      // A run may have made a new version of an open artifact (#28): the panel and the cards show it.
+      qc.invalidateQueries({ queryKey: ["artifact"] }),
+      qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
   };
   const { live, reconnect } = useRunStream(

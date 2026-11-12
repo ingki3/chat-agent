@@ -6,6 +6,7 @@ import { CitationMarker } from "../citations/CitationMarker.js";
 import { CitationSources } from "../citations/CitationNote.js";
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
+import { ArtifactCard } from "../artifacts/ArtifactPanel.js";
 
 type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
@@ -208,11 +209,12 @@ const PartView = memo(function PartView({
       return <DividerView d={part} />;
     case "finance_note":
       return <FinanceNote note={part} />;
-    // Citations (#25), artifacts (#28) and files (#22) get their real views later; until then a plain chip.
+    // An artifact the reply made or changed (#28): a card that opens the panel.
+    case "artifact_ref":
+      return <ArtifactCard id={part.artifactId} version={part.version} />;
+    // Citation refs and files (#22) get their real views later; until then a plain chip.
     case "citation_ref":
       return <span className="chip small">{part.label ?? "출처"}</span>;
-    case "artifact_ref":
-      return <span className="chip small">🧩 아티팩트{part.version ? ` v${part.version}` : ""}</span>;
     case "file_ref":
       return <span className="chip small">📎 {part.name ?? "파일"}</span>;
     default:

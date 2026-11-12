@@ -41,12 +41,12 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-5.5 | 자료 조사 모드 | #20, #25 | U, I, M | 🟨 (#20 대화별 토글 API·지침. #25 화면 토글 `ResearchToggle`(대화별, 서버 저장) → 다음 실행 `research@2` — `citation-runs.test.ts`·`e2e/citations.spec.ts`. 실런타임 "출처가 충분하지 않아요"는 체크리스트 B) |
 | FR-5.6 | 참고문헌 내보내기 | #26 | U | ⬜ |
 | FR-5.7 | 뉴스·실시간·요약 스킬 | #50, #21 | I, M | 🟨 (#21 `google-news-search-skill`, #50 `web_search`·`web_fetch`(샌드박스 작업자 + 공개 주소 송신 프록시, 두 런타임 대본 시험 `web-contract.test.ts`), 뉴스 결과 출처 등록. `news-search-skill`·`realtime-lookup-skill`·`summarize` 유튜브는 미룸 — `docs/skills.md`) |
-| FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. 패널은 #28) |
-| FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | 🟨 (#27 불변 `artifact_versions`(트리거)·되돌리기 = 복사한 새 버전, `POST /api/artifacts/:id/revert` — `artifacts.test.ts`·e2e. 패널 UI는 #28) |
+| FR-6.1 | 아티팩트 패널 | #27, #28 | E | 🟨 (#27 저장·`artifact_create`/`artifact_update` 도구·`/a/:id` 보기 화면 — `e2e/artifacts.spec.ts`. #28 오른쪽 패널(열 때만, 주소 `?artifact=`, 900px 이하 전체 화면·`main` inert)·대화 속 카드(`artifact_ref` — 서버가 그 run이 저장한 버전으로 붙임), `/a/:id`와 같은 보기 코드(`sandbox="allow-scripts"` 한 곳) — `e2e/artifact-panel.spec.ts` 데스크톱·모바일, `artifacts.test.ts`, 변이 시험 isolation.md. 머지 후 ✅) |
+| FR-6.2 | 버전, 되돌리기 | #27, #28 | I, E | 🟨 (#27 불변 `artifact_versions`(트리거)·되돌리기 = 복사한 새 버전, `POST /api/artifacts/:id/revert` — `artifacts.test.ts`·e2e. #28 패널의 버전 선택·되돌리기: 수정 요청 → v2 → v1 보기 → 되돌리기(v3 = v1 복원) — `e2e/artifact-panel.spec.ts`. 머지 후 ✅) |
 | FR-6.3 | 고유 주소, 기본 비공개 | #27, #29 | I | 🟨 (#27 `/a/:id`·원본·내려받기·API 주인만, 남 403 — 권한 행렬 7행·e2e. 공유는 #29) |
-| FR-6.4 | 내려받기 HTML·PNG·PDF·원본 | #28, #51 | U, I, E | 🟨 (#27 원본·SVG·CSV 내려받기, #51 PNG(차트·SVG·HTML — 차트는 클라이언트 캡처 먼저, 실패 시 서버)·PDF(HTML·차트·표·마크다운·코드): 격리 렌더러(헤드리스 셸 + #42 샌드박스·CDN 전용 송신 프록시·요청 가로채기, 쿠키·세션 없음, 시간·메모리 한도), 앱·사설 IP 차단과 샘플 생성 — `artifact-export.test.ts`·e2e·권한 행렬, 변이 시험 isolation.md. 패널 버튼은 #28) |
+| FR-6.4 | 내려받기 HTML·PNG·PDF·원본 | #28, #51 | U, I, E | 🟨 (#27 원본·SVG·CSV 내려받기, #51 PNG(차트·SVG·HTML — 차트는 클라이언트 캡처 먼저, 실패 시 서버)·PDF(HTML·차트·표·마크다운·코드): 격리 렌더러(헤드리스 셸 + #42 샌드박스·CDN 전용 송신 프록시·요청 가로채기, 쿠키·세션 없음, 시간·메모리 한도), 앱·사설 IP 차단과 샘플 생성 — `artifact-export.test.ts`·e2e·권한 행렬, 변이 시험 isolation.md. #28 패널에 같은 버튼과 원본·HTML 내려받기(차트·표는 `?format=html`, `attachment`) — `artifacts.test.ts`·`e2e/artifact-panel.spec.ts`) |
 | FR-6.5 | sandbox iframe + CSP, 쿠키·API 접근 불가 | #27 | E | 🟨 (#27 `sandbox="allow-scripts"` iframe + 원본 CSP `sandbox`·`connect-src 'none'`·인라인 해시·CDN 정확한 URL+SRI. 차트가 그려진 뒤 쿠키·fetch·parent·top 실패, 허용 밖 CDN 차단, 최상위로 열어도 불투명 출처 — `e2e/artifacts.spec.ts`, 변이 시험 isolation.md. 머지 후 ✅) |
-| FR-6.6 | 아티팩트 목록 화면 | #28, #52 | E | ⬜ |
+| FR-6.6 | 아티팩트 목록 화면 | #28, #52 | E | 🟨 (#28 "내가 만든 것" — 모든 대화의 내 아티팩트, 최근 순, 그 대화의 패널로 다시 열기, `GET /api/artifacts`(본인만: 가족 네 계정·비로그인 시험) — `artifacts.test.ts`·`e2e/artifact-panel.spec.ts`. "공유받은 것"은 #52까지 빈 화면) |
 | FR-7.1 | 한국 주식 | #30, #21 | U, M | 🟨 (#30 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`(네이버 증권) — 합성 응답 스냅샷 `finance.test.ts`. 실데이터 녹화·실런타임 확인은 `docs/evidence/finance/checklist.md`) |
 | FR-7.2 | 미국 주식 | #30 | U, M | 🟨 (#30 `us_*` 9개(Yahoo Finance) — 합성 응답 스냅샷. 녹화·실런타임은 체크리스트) |
 | FR-7.3 | 환율(비교·환산에만) | #30, #31 | U | 🟨 (#30 `fx_usdkrw` — 비교·환산 용도 명시. 비교 화면은 #31) |

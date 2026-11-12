@@ -17,6 +17,7 @@ import {
   type ModelPrice,
   ArtifactDetail,
   ArtifactListResponse,
+  MyArtifactsResponse,
   AdminUser,
   AuthState,
   Connection,
@@ -457,4 +458,9 @@ export const artifacts = {
       .items,
   revert: async (id: string, version: number) =>
     ArtifactDetail.parse(await call("POST", `/api/artifacts/${enc(id)}/revert`, { version })),
+  /** "내가 만든 것" (#28): the caller's own artifacts across conversations, one page. */
+  mine: async (cursor?: string) =>
+    MyArtifactsResponse.parse(
+      await call("GET", `/api/artifacts${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`),
+    ),
 };
