@@ -71,11 +71,15 @@ const rememberOpener = (el: Element | null) => {
 type PanelState = { panelAuto?: boolean } | null;
 
 /**
- * Runs started from this tab (send, edit, regenerate, a new chat). Only their new artifacts open the panel by
- * themselves — never a run seen again after a reload or one started elsewhere (its parts are replayed, not new).
+ * Runs started from this tab (send, edit, regenerate, a new chat) → the artifacts each has already named. Only their
+ * new artifacts open the panel by themselves — never a run seen again after a reload or one started elsewhere (its
+ * parts are replayed, not new). Tab-wide, not per screen: leaving the conversation and coming back replays the run's
+ * parts too, and an artifact already handled (opened, or closed by the user) never opens again.
  */
-const startedHere = new Set<string>();
-export const markStartedHere = (runId: string) => void startedHere.add(runId);
+const startedHere = new Map<string, Set<string>>();
+export const markStartedHere = (runId: string) => {
+  if (!startedHere.has(runId)) startedHere.set(runId, new Set());
+};
 /** The artifact a reply opened by itself and still on screen; cleared once the user opens one with a card. */
 let autoOpened: string | null = null;
 
@@ -86,12 +90,10 @@ let autoOpened: string | null = null;
  */
 export function useAutoOpen(live: { runId: string; parts: readonly PublicPart[] } | null | undefined) {
   const [params, setParams] = useSearchParams();
-  const seen = useRef<{ runId: string; ids: Set<string> } | undefined>(undefined);
   const current = params.get(PANEL_PARAM);
   useEffect(() => {
-    if (!live || !startedHere.has(live.runId)) return;
-    if (seen.current?.runId !== live.runId) seen.current = { runId: live.runId, ids: new Set() };
-    const ids = seen.current.ids;
+    const ids = live && startedHere.get(live.runId);
+    if (!ids) return;
     for (const p of live.parts) {
       if (p.type !== "artifact_ref" || ids.has(p.artifactId)) continue;
       ids.add(p.artifactId);

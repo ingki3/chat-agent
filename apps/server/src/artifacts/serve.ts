@@ -299,12 +299,16 @@ export type Served = { type: string; body: string; csp: readonly string[] };
 
 /**
  * The one message an artifact page sends the app (#28): Escape pressed inside the sandboxed frame, so the panel can
- * close (key events in a frame never reach the parent page). Added to an HTML original as served in the app's frame
- * only — not to downloads or exports — as an inline script whose hash goes into policy A like any other. It carries
- * nothing but its type; the app accepts it only from the frame it shows, in exactly this shape, and only closes.
- * An artifact that handles Escape itself (`preventDefault`) keeps it.
+ * close (key events in a frame never reach the parent page). Added to the HTML documents served in the app's frame
+ * only — an HTML original and the server-drawn chart and table pages; not to downloads or exports — as an inline
+ * script allowed by its hash (policy A for HTML; the chart and table pages allow that hash and nothing else). It
+ * carries nothing but its type; the app accepts it only from the frame it shows, in exactly this shape, and only
+ * closes. An artifact that handles Escape itself (`preventDefault`) keeps it.
  */
-export const ESCAPE_BRIDGE = `<script>addEventListener("keydown",function(e){if(e.key==="Escape"&&!e.defaultPrevented&&window.parent!==window)window.parent.postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")})</script>`;
+const ESCAPE_SCRIPT = `addEventListener("keydown",function(e){if(e.key==="Escape"&&!e.defaultPrevented&&window.parent!==window)window.parent.postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")})`;
+export const ESCAPE_BRIDGE = `<script>${ESCAPE_SCRIPT}</script>`;
+/** The bridge's `script-src` source. */
+export const ESCAPE_BRIDGE_HASH = hashOf(ESCAPE_SCRIPT);
 
 /**
  * What `/a/:id/v/:ver/raw` sends for one version: HTML with its scripts allowed by hash, SVG as an image document
@@ -329,18 +333,22 @@ export function serveVersion(
     case "markdown":
     case "code":
       return { type: "text/plain; charset=utf-8", body: content, csp: none };
+    // Server-drawn pages (everything in them escaped, so the bridge at the end always runs): no script, or in the
+    // app's frame exactly the bridge.
     case "chart":
-      return {
-        type: "text/html; charset=utf-8",
-        body: page(title, chartSvg(JSON.parse(content) as ChartSpec)),
-        csp: none,
-      };
-    case "table":
-      return {
-        type: "text/html; charset=utf-8",
-        body: page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`),
-        csp: none,
-      };
+    case "table": {
+      const body =
+        kind === "chart"
+          ? page(title, chartSvg(JSON.parse(content) as ChartSpec))
+          : page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`);
+      return opts.escapeBridge
+        ? {
+            type: "text/html; charset=utf-8",
+            body: body + ESCAPE_BRIDGE,
+            csp: [artifactCsp([ESCAPE_BRIDGE_HASH])],
+          }
+        : { type: "text/html; charset=utf-8", body, csp: none };
+    }
     case "document":
       return undefined;
   }

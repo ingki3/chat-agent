@@ -178,6 +178,10 @@ test("the artifact list: mine across conversations, reopened in its conversation
     "href",
     /\/v\/1\/download\?format=html$/,
   );
+  // The server-drawn table page carries the Escape bridge too: Esc after clicking into it closes the panel.
+  await frame.contentFrame().locator("table").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("artifact-panel")).toHaveCount(0);
 
   await page.goto("/artifacts");
   await page.getByRole("tab", { name: "공유받은 것" }).click();
@@ -304,5 +308,34 @@ document.getElementById("ok").addEventListener("click", () => post({ type: "agen
   await page.waitForTimeout(300);
   await expect(panel).toBeVisible();
   await frame.locator("#ok").click();
+  await expect(panel).toHaveCount(0);
+});
+
+test("a panel the user closed does not come back when they leave the conversation and return mid-run", async ({
+  page,
+  baseURL,
+  isMobile,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `닫은 패널 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  const panel = page.getByTestId("artifact-panel");
+  await send(page, `/artifact-slow markdown 닫음 ${tag}\n# 닫음`);
+  await expect(page.getByTestId("artifact-panel-title")).toContainText(`닫음 ${tag}`);
+  await page.getByTestId("artifact-panel-close").click();
+  await expect(panel).toHaveCount(0);
+  // Elsewhere in the app (no reload: the tab's memory stays), then back while the reply still streams.
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await page.locator("aside").getByRole("link", { name: "🧩 아티팩트", exact: true }).click();
+  await expect(page).toHaveURL(/\/artifacts$/);
+  await page.goBack();
+  await expect(page).toHaveURL(new RegExp(`/c/${conv.id}$`));
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply.getByTestId("artifact-card")).toContainText(`닫음 ${tag}`);
+  await expect(reply).toHaveAttribute("data-status", "streaming");
+  await page.waitForTimeout(300);
+  await expect(panel).toHaveCount(0);
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
   await expect(panel).toHaveCount(0);
 });

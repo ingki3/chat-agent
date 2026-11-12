@@ -22,6 +22,7 @@ import { RunManager } from "../src/runtime/runs.js";
 import {
   CDN_ALLOW_LIST,
   ESCAPE_BRIDGE,
+  ESCAPE_BRIDGE_HASH,
   artifactCsp,
   attachment,
   chartSvg,
@@ -530,7 +531,10 @@ describe("artifact routes (#27)", () => {
     expect(m.body).toBe("# <script>x()</script>");
     const ch = await raw(chart);
     expect(ch.body).toContain("<svg");
-    expect(ch.headers["content-security-policy"]).toContain("script-src 'none'");
+    // In the app's frame the server-drawn page allows exactly one script: the Escape bridge (#28).
+    expect(ch.headers["content-security-policy"]).toBe(artifactCsp([ESCAPE_BRIDGE_HASH]));
+    expect(ch.body.endsWith(ESCAPE_BRIDGE)).toBe(true);
+    expect(ch.body.split("<script").length).toBe(2);
     const t = await raw(table);
     expect(t.body).toContain("<td>=cmd</td>");
     const csv = await get(app, `/a/${table}/v/1/download`, f.cookies.owner);
@@ -802,7 +806,8 @@ describe("artifact panel, cards and list (#28)", () => {
     const db = createTestDb();
     const hang: FakeScript = () => [{ delayMs: 60_000 }];
     const runtimes = new RuntimeRegistry();
-    runtimes.register(new FakeRuntime({ runTools: true, script: hang }));
+    // No `runTools`: nothing listens (the tool's write is made below, as our MCP server would make it).
+    runtimes.register(new FakeRuntime({ script: hang }));
     const ctx = await newApp({ NODE_ENV: "test" }, { db, runtimes });
     const { app, f } = ctx;
     const c = app.conversations!.create(f.users.owner.id);
@@ -816,6 +821,7 @@ describe("artifact panel, cards and list (#28)", () => {
     });
     for (let i = 0; i < 200 && app.runs!.get(r.run.id)!.status !== "running"; i++)
       await new Promise((res) => setTimeout(res, 10));
+    expect(app.runs!.get(r.run.id)!.status).toBe("running");
     // What our MCP tool stores for this run's token, before the runtime reports the call as finished.
     const { artifact } = app.artifacts!.create(
       { userId: f.users.owner.id, conversationId: c.id, runId: r.run.id },
@@ -840,6 +846,7 @@ describe("artifact panel, cards and list (#28)", () => {
 
   it("a reply recovered after a restart gets its card, once", async () => {
     const { app, db, r, artifactId, refs } = await hangingRun();
+    expect(refs()).toEqual([]);
     const manager = new RunManager(db, app.conversations!, new RuntimeRegistry(), app.appEvents);
     expect(manager.recover()).toBe(1);
     expect(manager.get(r.run.id)).toMatchObject({ status: "failed", errorCode: "server_restart" });
@@ -877,5 +884,20 @@ describe("artifact panel, cards and list (#28)", () => {
       content: `<svg xmlns="http://www.w3.org/2000/svg"></svg>`,
     }).artifact.id;
     expect((await get(app, `/a/${svg}/v/1/raw`, f.cookies.owner)).body).not.toContain("postMessage");
+    const md = app.artifacts!.create(scope, { kind: "markdown", title: "m", content: "# m" }).artifact.id;
+    expect((await get(app, `/a/${md}/v/1/raw`, f.cookies.owner)).body).toBe("# m");
+    // Chart and table pages: the bridge and only it; their HTML download stays script-free.
+    const table = app.artifacts!.create(scope, {
+      kind: "table",
+      title: "t",
+      table: { columns: ["a"], rows: [["b"]] },
+    }).artifact.id;
+    const t = await get(app, `/a/${table}/v/1/raw`, f.cookies.owner);
+    expect(t.headers["content-security-policy"]).toBe(artifactCsp([ESCAPE_BRIDGE_HASH]));
+    expect(t.body.endsWith(ESCAPE_BRIDGE)).toBe(true);
+    expect(ESCAPE_BRIDGE_HASH).toBe(sha(bridge));
+    expect((await get(app, `/a/${table}/v/1/download?format=html`, f.cookies.owner)).body).not.toContain(
+      "<script",
+    );
   });
 });
