@@ -54,6 +54,8 @@ export const ERROR_CODES = set([
   "server_restart",
   "usage_limit",
   "tool_error",
+  "summary_failed",
+  "context_too_large",
   "unknown",
 ]);
 /** Error class names worth keeping; any other name is logged as "Error" (a class name can be anything). */
@@ -355,6 +357,7 @@ export const CODE_CATEGORY: Readonly<Record<string, ErrorCategory>> = {
   runtime_error: "runtime",
   runtime_auth: "runtime",
   runtime_policy: "runtime",
+  context_too_large: "client",
   no_connection: "app",
   no_runtime: "app",
   server_restart: "restart",

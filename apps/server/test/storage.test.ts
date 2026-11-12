@@ -84,6 +84,7 @@ describe("database", () => {
       "citations",
       "connection_limits",
       "connections",
+      "conversation_summaries",
       "conversations",
       "error_log",
       "files",

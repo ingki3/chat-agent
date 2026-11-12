@@ -106,6 +106,13 @@ const ConfigSchema = z.object({
         "CLOUDFLARED_METRICS must be http://127.0.0.1:<port> or http://[::1]:<port> (loopback IP, no path)",
     }),
   ),
+  /**
+   * Context builder (#45, FR-3.6, docs/ops.md §27): a conversation is summarised once a fresh session's context
+   * reaches this share of the model's window (default 0.7), and the last this-many messages always stay as they are
+   * (default 6).
+   */
+  CONTEXT_SUMMARY_RATIO: optional(z.coerce.number().min(0.3).max(0.95)),
+  CONTEXT_RECENT_MESSAGES: optional(z.coerce.number().int().min(2).max(50)),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -148,6 +155,8 @@ export type Config = {
   webSearchProviders: ("google-news" | "duckduckgo")[];
   /** `cloudflared`'s loopback metrics server (#35); undefined = not configured. */
   tunnelMetrics?: MetricsAddress | undefined;
+  /** Context builder limits (#45) that were set; the rest keep their defaults (runtime/context.ts). */
+  context: { summaryRatio?: number; recentMessages?: number };
 };
 
 /** A secret value: printable ASCII, no spaces (API keys). */
@@ -233,6 +242,10 @@ export function loadConfig(
     skillSecrets: skillSecrets(source),
     exportBrowser: c.EXPORT_BROWSER,
     tunnelMetrics: c.CLOUDFLARED_METRICS ? parseMetricsAddress(c.CLOUDFLARED_METRICS) : undefined,
+    context: {
+      ...(c.CONTEXT_SUMMARY_RATIO !== undefined ? { summaryRatio: c.CONTEXT_SUMMARY_RATIO } : {}),
+      ...(c.CONTEXT_RECENT_MESSAGES !== undefined ? { recentMessages: c.CONTEXT_RECENT_MESSAGES } : {}),
+    },
     webSearchProviders: [
       ...new Set(
         (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],

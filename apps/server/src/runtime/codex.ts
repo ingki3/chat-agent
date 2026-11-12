@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { PublicPart } from "@agentlee/shared";
+import { renderPriorContext } from "./context.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
   RuntimeFailure,
@@ -83,18 +83,23 @@ export const CODEX_MODELS: ModelCapability[] = [
     label: "GPT-6.1 Sol",
     efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     defaultEffort: "low",
+    contextWindow: 258_400,
   },
   {
     id: "gpt-6-astra",
     label: "GPT-6 Astra",
     efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     defaultEffort: "low",
+    contextWindow: 258_400,
   },
   {
     id: "gpt-6-luna",
     label: "GPT-6 Luna",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "medium",
+    contextWindow: 258_400,
+    // Conversation summaries are written with it when the user may use it (#45).
+    cheap: true,
   },
 ];
 
@@ -234,19 +239,8 @@ function writeMeta(dir: string, id: string, m: ThreadMeta) {
   fs.renameSync(`${f}.tmp`, f);
 }
 
-/** Prior history for a fresh thread (a summary replaces it when long, #45). Sent as developer instructions. */
-function historyText(history: StartContext["history"]): string {
-  const lines = history.flatMap((h) => {
-    const text = h.parts
-      .flatMap((p: PublicPart) => (p.type === "text" ? [p.text] : []))
-      .join("\n")
-      .trim();
-    return text
-      ? [`[${h.role === "user" ? "사용자" : h.role === "assistant" ? "assistant" : "system"}]\n${text}`]
-      : [];
-  });
-  return lines.length ? `<earlier_conversation>\n${lines.join("\n\n")}\n</earlier_conversation>` : "";
-}
+/** What a fresh thread knows of the conversation (#45: summary, recent messages, references). Developer instructions. */
+const historyText = (ctx: StartContext): string => renderPriorContext(ctx);
 
 /** A thread's rollout file in CODEX_HOME — without it there is nothing to resume. */
 function hasRollout(codexHome: string, threadId: string): boolean {
@@ -752,7 +746,7 @@ export class CodexAdapter implements RuntimeAdapter {
       }
       cancelled();
       if (resumeId === undefined) {
-        meta = { instructions: ctx.systemPrompt, history: historyText(ctx.history) };
+        meta = { instructions: ctx.systemPrompt, history: historyText(ctx) };
         const r = await rpc.request("thread/start", {
           model: ctx.model,
           cwd: paths.work,

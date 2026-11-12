@@ -10,7 +10,7 @@ import {
   type SpawnedProcess,
   type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { PublicPart } from "@agentlee/shared";
+import { renderPriorContext } from "./context.js";
 import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
   RuntimeFailure,
@@ -43,25 +43,33 @@ export type ClaudeAuth = { kind: "api_key"; apiKey: string } | { kind: "oauth_to
 /** One Claude connection (#17 manages them): its own folder `data/runtimes/<id>` and its credential. */
 export type ClaudeConnection = { id: string; dir: string; auth: ClaudeAuth };
 
-/** Models offered and the effort values each accepts (PRD capability table; the SDK itself accepts anything). */
+/**
+ * Models offered and the effort values each accepts (PRD capability table; the SDK itself accepts anything). The
+ * context windows are the conservative standard size (#45 summarises at a ratio of them; ops.md §27).
+ */
 export const CLAUDE_MODELS: ModelCapability[] = [
   {
     id: "claude-opus-5-5",
     label: "Claude Opus 5.5",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "high",
+    contextWindow: 200_000,
   },
   {
     id: "claude-sonnet-5-5",
     label: "Claude Sonnet 5.5",
     efforts: ["low", "medium", "high", "xhigh", "max"],
     defaultEffort: "medium",
+    contextWindow: 200_000,
   },
   {
     id: "claude-haiku-5-5",
     label: "Claude Haiku 5.5",
     efforts: ["low", "medium", "high"],
     defaultEffort: "low",
+    contextWindow: 200_000,
+    // Conversation summaries are written with it when the user may use it (#45).
+    cheap: true,
   },
 ];
 
@@ -149,18 +157,10 @@ export function claudeEnv(conn: ClaudeConnection): Record<string, string> {
   };
 }
 
-/** Prior history for a fresh session (a summary replaces it when long, #45). */
-function historyPrompt(history: StartContext["history"]): string {
-  const lines = history.flatMap((h) => {
-    const text = h.parts
-      .flatMap((p: PublicPart) => (p.type === "text" ? [p.text] : []))
-      .join("\n")
-      .trim();
-    return text
-      ? [`[${h.role === "user" ? "사용자" : h.role === "assistant" ? "assistant" : "system"}]\n${text}`]
-      : [];
-  });
-  return lines.length ? `\n\n<earlier_conversation>\n${lines.join("\n\n")}\n</earlier_conversation>` : "";
+/** What a fresh session knows of the conversation (#45: summary, recent messages, references), after the prompt. */
+function historyPrompt(ctx: StartContext): string {
+  const prior = renderPriorContext(ctx);
+  return prior ? `\n\n${prior}` : "";
 }
 
 /** Tool result content → our output value (JSON when the tool returned JSON text). */
@@ -259,7 +259,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     cancelled();
     // The system prompt is fixed when the session starts (with the history it was given) and reused on resume.
     const meta: SessionMeta = s.fresh
-      ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx.history), costUsd: 0 }
+      ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx), costUsd: 0 }
       : readMeta(conn.dir, s.sessionId)!;
     if (s.fresh) writeMeta(conn.dir, s.sessionId, meta);
     const run = this.opts.query ?? sdkQuery;
