@@ -98,6 +98,8 @@ describe("database", () => {
       "runs",
       "runtime_policies",
       "runtime_sessions",
+      "schedule_runs",
+      "schedules",
       "sessions",
       "settings",
       "sources",

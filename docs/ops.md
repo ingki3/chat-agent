@@ -903,3 +903,51 @@ PRD FR-4.1·4.2·4.6. 방식과 근거는 `docs/decisions/isolation.md` "파일 
 ### 24.4 로그와 확인
 - 로그: 업로드마다 `file.uploaded`(결과 `fileCode` = `file_ok`·`file_aborted`·위 오류 코드, 소요 시간, 사용자·대화 ID). **파일 이름·내용·크기는 남기지 않는다**(시험).
 - 시험: `pnpm test apps/server/test/files.test.ts`(형식 판별 표, 51MB(길이 밝힘·chunked), 21번째·동시 21개, 위장 확장자, 남의 파일 403, 헤더, 백업 포함·참조 검사, 쓰기 잠금, 지우기·시작 정리), `E2E_PORT=3111 pnpm e2e e2e/files.spec.ts`(첨부 버튼·끌어다 놓기·붙여넣기, 업로드 전 거절, 실패 칩, 새 대화, 남의 파일 403).
+
+## 24. 예약 엔진 (#33)
+PRD FR-8.2·8.6·8.7, 수용 기준 5. 엔진만 — 예약 화면은 #55, 실제 런타임 실행(전용 대화에 결과·푸시)은 #56이다.
+
+### 24.1 무엇이 어디에 있나
+- 표(0019 마이그레이션): `schedules`(이름, 프롬프트, 유형 `once|daily|weekdays|weekly|cron`, `date`·`time`·`weekdays`·`cron`, 시간대(기본 `Asia/Seoul`), 스킬, 알림(기본 켬), 런타임·모델·추론 강도·공용 연결, 일시정지, 주인, 결과 대화(#56), `next_run_at`)와 `schedule_runs`(실행 하나 = 행 하나).
+- **실행 키**(`schedule_runs.run_key`, 유니크): 정규 회차·놓친 회차는 `<예약 id>@<예정 시각 ms>`, 바로 실행은 `<예약 id>@manual:<누른 시각 ms>`. 같은 회차는 누가(재시작한 서버, 두 번째 타이머, 늦게 깬 타이머) 넣어도 행이 하나다(`insert … on conflict do nothing`). 바로 실행은 회차의 키를 쓰지도 빼앗지도 않는다.
+- **상태**: `pending` → `running` → `succeeded`/`failed`, 또는 곧바로 `skipped`. `attempts`는 시작 횟수(죽은 시작 포함), `started_at`(이번 시도 시작)·`retry_at`·`result_saved_at`·`notified_at`·`finished_at`이 모두 남는다(수용 기준 5의 예정·시작·결과 저장 시각). 실패·건너뜀 이유는 고정 코드 `error_code`: `overlap`(앞 실행이 안 끝남), `superseded`(재시작 뒤 더 최근 회차로 대체), `interrupted`(서버가 실행 중에 멈춤), `handler_error`, `run_failed`, `runtime_unavailable`, `not_allowed`, `timeout`(`SCHEDULE_RUN_CODES`).
+- 이름·프롬프트는 사용자 글이라 저장할 때 알려진 비밀을 가리고(`scrubKnown`), 나중에 등록된 비밀은 백그라운드 재가림이 다시 가린다(`secrets/columns.ts`). 나머지 칸은 검증된 값이다(시각 `HH:MM`, 날짜, cron은 숫자와 `* , - /`만, 시간대 이름, 카탈로그의 스킬·모델).
+
+### 24.2 일정 계산과 서머타임
+- 다음 회차는 `Intl`만으로 계산한다(`apps/server/src/schedules/time.ts`, cron 라이브러리 없음). cron은 5칸(분 시 일 월 요일), `*`·목록·범위·`/단계`, 요일 7 = 일요일, 일·요일이 둘 다 지정되면 둘 중 하나만 맞아도 된다(vixie cron). 이름(`MON`, `JAN`)과 `@daily` 같은 줄임은 받지 않는다(400 `cron_invalid`). 맞는 날이 8년 안에 없으면 400 `schedule_never`, 지난 한 번 예약은 400 `schedule_in_past`, 모르는 시간대는 400 `invalid_time_zone`.
+- 회차는 현지 날짜·시각으로 하나씩 세고 각각을 한 순간으로 바꾼다(#3 결정, FR-8.7):
+  - **없는 현지 시각**(봄, America/New_York 3월 둘째 일요일 02:00–02:59): 바로 다음 유효한 순간 = 03:00 EDT에 **1회**. 그 틈에 여러 회차가 있으면(`*/20 2 * * *`) 모두 같은 순간이 되어 실행 키로 하나가 된다.
+  - **두 번 있는 현지 시각**(가을, 11월 첫째 일요일 01:00–01:59): **첫 번째**(EDT)에만 1회. 두 번째 01:30(EST)은 회차로 세지 않는다.
+- `next_run_at`이 엔진의 영속 상태다: 아직 실행으로 바꾸지 않은 다음 정규 회차. 일시정지하면 비우고, 다시 켜면 그때부터의 다음 회차로 정한다(정지 중의 회차는 따라잡지 않는다 — 원하지 않은 것이니 놓친 것이 아니다).
+
+### 24.3 타이머·놓친 실행·겹침·바로 실행
+- 서버 안 타이머 하나(`ScheduleEngine`, launchd 작업 없음). 가장 이른 할 일(다음 회차·재시도)까지 자되 **1분보다 오래 자지 않고** 깨서 DB를 다시 본다 — 긴 타이머의 어긋남, Mac 잠자기, 시계 변경이 있어도 회차는 늦어도 1분 안에 시작된다. 정상 가동 중의 시작 오차는 수 ms다(측정은 24.5절).
+- **놓친 실행(FR-8.7)**: 깨어날 때마다(서버 시작 포함) 예약마다 `next_run_at` 이후 지금까지 온 회차 중 **가장 최근 것 하나만** 실행으로 만들고 다음 회차로 넘어간다. 늦게(1분 넘게) 만든 것은 `trigger = missed`. 그 사이의 회차는 행을 만들지 않는다(몰아서 실행하지 않음).
+- **겹침**: 같은 예약의 실행이 아직 안 끝났으면(`running`, 또는 시작·재시도를 기다리는 `pending`) 새 회차는 `skipped`·`overlap`으로 기록만 한다.
+- **바로 실행**: 자기 실행 키로 곧바로 `pending` → 엔진이 바로 집는다. 안 끝난 실행이 있으면 409 `schedule_busy`(행을 만들지 않음).
+
+### 24.4 재시도와 크래시 복구 — 핸들러 계약
+- 실행은 핸들러(`ScheduleHandler`, `schedules/engine.ts`)의 세 단계로 나뉘고, 엔진은 단계가 끝날 때마다 행에 적는다:
+  1. `execute` — 시도마다 한 번. 시작(`claim`: `pending`→`running`, `attempts + 1`)이 먼저 디스크에 적힌 뒤 부른다. 결과는 `outcome`에 적는다.
+  2. `saveResult` — 결과(실패면 이유)를 사용자에게 남긴다. **실행 id마다 멱등**이어야 한다.
+  3. `notify` — 알림 발행(예약의 알림이 꺼져 있으면 부르지 않음). **실행 id마다 멱등**.
+- **재시도(FR-8.6)**: 첫 시도가 실패하면 **2분 뒤 한 번**(`retry_at = 실패 시각 + 2분`). 결과 저장과 알림은 마지막 시도의 것만 한다. 두 번 다 실패하면 `failed`, 실패 이유 저장과 실패 알림.
+- **크래시 복구**(서버 시작 시 `ScheduleStore.recover`): 
+  - `execute` 중에 죽음(`running`, `outcome` 없음) → 그 시작도 시도 1회로 센다. 남은 시도가 있으면 **재시작 2분 뒤** 재시도, 없으면 `failed`·`interrupted`로 정하고 결과 저장·알림을 이어서 한다.
+  - 결과 저장 전에 죽음(`outcome` 있음, `result_saved_at` 없음) → 다시 실행하지 않고 `saveResult`부터.
+  - 알림 전에 죽음(`result_saved_at` 있음, `notified_at` 없음) → `notify`만.
+  - 핸들러가 저장·발행은 했는데 엔진이 적기 전에 죽으면 그 단계가 한 번 더 불린다 — 그래서 두 단계는 멱등이어야 한다(#56의 실제 핸들러는 실행 id로 메시지·알림을 찾아 이미 있으면 그대로 돌려준다).
+  - `pending`으로 남은 실행(시작 전에 죽음, 재시도 대기 — 방금 복구한 것 포함)보다 새 회차가 이미 왔으면 옛 것은 `skipped`·`superseded`(가장 최근 회차만 실행). 예: 재시도를 기다리던 중 서버가 이틀 꺼져 있었으면 옛 재시도 대신 오늘 회차 1회.
+- 저장·알림 단계가 예외를 던지면 실행은 그대로 두고 2분 뒤(또는 다음 시작 때) 그 단계부터 다시 한다.
+- 서버를 끌 때(`preClose`) 엔진은 새 실행을 멈추고 진행 중인 실행에 중지 신호(`signal`)를 보낸 뒤 5초까지 기다린다. 끝나지 않은 것은 다음 시작의 복구가 처리한다(위 규칙).
+
+### 24.5 데이터 잠금·수명·복원
+- 엔진은 **데이터 폴더 잠금을 가진 서버에서만** 돈다: `index.ts`가 `openStorageForWrite`로 잡은 잠금을 `buildApp`에 넘기고(`dataLock.held()`), 엔진은 시작할 때와 깰 때마다 확인해 잠금이 없으면 멈춘다(`schedule.engine_stopped`·`storage_not_owned`). 시험·`pnpm db:migrate`·복원 명령은 엔진을 띄우지 않는다. 앱이 준비되면(`onReady`) 시작, 닫힐 때(`preClose`, DB를 닫기 전) 멈춘다.
+- 핸들러가 없으면 엔진을 만들지 않는다: 지금 운영 서버는 #56 전까지 예약을 저장·조회만 하고 실행하지 않는다. `FAKE_RUNTIME=1`(e2e·개발)은 기록만 하는 `FakeScheduleHandler`로 돈다.
+- **복원(21.4절)**: 서버를 멈추고 하므로 엔진도 멈춰 있다. 복원한 DB의 `next_run_at`은 백업 시점 그대로라, 복원 뒤 시작하면 예약마다 놓친 회차 중 가장 최근 것 1회가 실행된다(위 규칙). 백업 때 `running`이던 실행은 크래시처럼 복구된다. 0019 이전 백업은 복원 때 이 마이그레이션이 적용된다(빈 표).
+- API(최소, 화면은 #55): `GET·POST /api/schedules`(본인 것만), `GET·PATCH(일시정지·알림)·DELETE /api/schedules/:id`, `GET /api/schedules/:id/runs`, `POST /api/schedules/:id/run`(바로 실행). 프롬프트는 주인의 내용이라 **주인만** — 관리자도 403(FR-1.5, 권한 행렬). 만들 때 런타임·모델·추론 강도를 안 주면 만든 사람의 기본값(FR-12.6 대체 순서 포함, 23절), 주면 칩과 같은 검사(403 `runtime_not_allowed` 등). 쓸 수 있는 런타임이 없으면 409 `no_usable_runtime`, 허용 안 된 스킬은 403 `skill_not_allowed`.
+- 로그: `schedule.run_started`(예약·실행 id, `scheduleTrigger`, 시도, 늦은 정도 `lateMs`), `schedule.run_finished`(`scheduleCode`, `scheduleStatus` = `succeeded`/`failed`/`retrying`), `schedule.run_skipped`(`overlap`), `schedule.step_failed`(`scheduleStep` = `save`/`notify`), `schedule.recovered`(개수), `schedule.engine_stopped`. 이름·프롬프트·결과는 남지 않는다.
+
+### 24.6 확인 방법
+- 자동(가짜 시계, `apps/server/test/schedules.test.ts`): 다섯 유형 일주일, 놓친 회차 3개 → 1회(가장 최근), 5분 전 정지·10분 뒤 시작 → 1회, 실패 → 정확히 2분 뒤 재시도, 두 번 실패, 크래시 시점별(시작 직후·재시도 시작 직후·결과 저장 전·저장 후 기록 전·알림 전·발행 후 기록 전) 복구, 겹침 건너뜀(실행 중·재시도 대기 중), 바로 실행의 별도 키, 실행 키 유일, 일시정지, 잠금 없음 → 실행 안 함, America/New_York 서머타임 시작·종료일(없는 시각·두 번 있는 시각), 시작 오차(모든 실행 0 ≤ 시작 − 예정 ≤ 1분; 실제 시계로 1분 회차 하나 — 1초 미만). 계산만: `schedules-time.test.ts`.
+- 7일 실측(정규 회차 ±1분, 휴대폰 수신)은 #56·#57에서 실제 핸들러로 한다(수용 기준 5 절차 1·3).

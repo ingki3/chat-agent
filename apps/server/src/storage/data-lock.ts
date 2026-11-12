@@ -142,7 +142,11 @@ function holderKind(dataDir: string): DataLockKind | "unknown" {
   }
 }
 
-export type DataLock = { release: () => void };
+export type DataLock = {
+  release: () => void;
+  /** Whether this process still holds it (false after `release()`): what the schedule engine checks (#33). */
+  held: () => boolean;
+};
 
 /**
  * Open lock connections. Kept here so a holder that drops its `DataLock` cannot lose the lock to garbage collection
@@ -185,6 +189,7 @@ export function acquireDataLock(dataDir: string, kind: DataLockKind): DataLock {
       held.delete(db);
       db.close();
     },
+    held: () => !released && db.open,
   };
 }
 

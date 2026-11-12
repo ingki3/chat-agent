@@ -36,6 +36,10 @@ import {
   isToolName,
   UNMATCHED,
   isUsagePurpose,
+  isScheduleCode,
+  isScheduleStatus,
+  isScheduleStep,
+  isScheduleTrigger,
 } from "./observability/policy.js";
 
 /**
@@ -117,6 +121,13 @@ export const LOG_EVENTS = [
   "restore.recovered",
   // Known secrets (review round 26): a background rescrub pass failed; it is retried (fixed code, no content).
   "secrets.rescrub_failed",
+  // Schedules (#33): ids, trigger, attempt, lateness and fixed codes — never the name or the prompt.
+  "schedule.run_started",
+  "schedule.run_finished",
+  "schedule.run_skipped",
+  "schedule.step_failed",
+  "schedule.recovered",
+  "schedule.engine_stopped",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -223,6 +234,13 @@ const FIELDS = new Map<string, Check>([
   ["backupTrigger", isBackupTrigger],
   ["backupCode", isBackupCode],
   ["restoreCode", isRestoreRecovery],
+  /** Schedules (#33): which schedule, why it ran, its outcome code, step, and how late it started. */
+  ["scheduleId", isId],
+  ["scheduleTrigger", isScheduleTrigger],
+  ["scheduleCode", isScheduleCode],
+  ["scheduleStatus", isScheduleStatus],
+  ["scheduleStep", isScheduleStep],
+  ["lateMs", isNum],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -487,6 +505,12 @@ export type LogFields = {
   backupTrigger?: string;
   backupCode?: string;
   restoreCode?: string;
+  scheduleId?: string;
+  scheduleTrigger?: string;
+  scheduleCode?: string;
+  scheduleStatus?: string;
+  scheduleStep?: string;
+  lateMs?: number;
   /** Logged as class name and code only. */
   err?: unknown;
 };

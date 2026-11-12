@@ -1,5 +1,5 @@
 import os from "node:os";
-import { NotificationKind, RuntimeId } from "@agentlee/shared";
+import { NotificationKind, RuntimeId, SCHEDULE_RUN_CODES } from "@agentlee/shared";
 import { USAGE_PURPOSES } from "../usage/store.js";
 
 /**
@@ -253,6 +253,18 @@ export const BACKUP_CODES = set([
 ]);
 export const isBackupCode = member(BACKUP_CODES);
 export const isBackupTrigger = member(set(["scheduled", "manual"]));
+/** Schedules (#33): run outcome / skip codes (shared `SCHEDULE_RUN_CODES`) and the engine's own codes. */
+export const SCHEDULE_CODES = set([
+  ...SCHEDULE_RUN_CODES,
+  "schedule_ok",
+  "schedule_invalid",
+  "storage_not_owned",
+  "handler_missing",
+]);
+export const isScheduleCode = member(SCHEDULE_CODES);
+export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
+export const isScheduleStatus = member(set(["succeeded", "failed", "skipped", "retrying"]));
+export const isScheduleStep = member(set(["save", "notify", "engine"]));
 export const isRestoreRecovery = member(set(["completed", "rolled_back"]));
 
 export const isRuntime = member(RUNTIMES);

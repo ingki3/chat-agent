@@ -215,4 +215,33 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   // Cancelled uploads not yet arrived (review #102 7차): ids only.
   "upload_cancellations.user_id": ID,
   "upload_cancellations.upload_id": { exempt: "the client's upload id, a UUID checked on cancel" },
+  // Schedules (#33): the name and the prompt are the user's text; the timing fields are validated values.
+  "schedules.id": ID,
+  "schedules.owner_id": ID,
+  "schedules.name": { write: "ScheduleStore.create", rescrub: "text" },
+  "schedules.prompt": { write: "ScheduleStore.create", rescrub: "text" },
+  "schedules.type": ENUM,
+  "schedules.date": { exempt: "YYYY-MM-DD, validated" },
+  "schedules.time": { exempt: "HH:MM, validated" },
+  "schedules.weekdays": { exempt: "JSON of weekday numbers 0–6, validated" },
+  "schedules.cron": {
+    exempt: "a cron expression of digits and * , - / (validated by the parser, nothing else gets in)",
+  },
+  "schedules.time_zone": { exempt: "an IANA zone name, validated" },
+  "schedules.skills": { exempt: "skill names from the catalogue (validated)" },
+  "schedules.runtime": ENUM,
+  "schedules.model": {
+    exempt: "a model id from the runtime's catalogue (checked by RunAccess before it is stored)",
+  },
+  "schedules.effort": ENUM,
+  "schedules.conversation_id": ID,
+  "schedule_runs.id": ID,
+  "schedule_runs.schedule_id": ID,
+  "schedule_runs.run_key": { exempt: "built by the server from the schedule id and a time" },
+  "schedule_runs.trigger": ENUM,
+  "schedule_runs.status": ENUM,
+  "schedule_runs.outcome": ENUM,
+  "schedule_runs.error_code": ENUM,
+  "schedule_runs.output_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
+  "schedule_runs.result_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
 };
