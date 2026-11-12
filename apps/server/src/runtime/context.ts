@@ -88,26 +88,44 @@ export type SummaryRef = { id: string; summary: string; throughSeq: number; thro
 export const afterSummary = (history: readonly MessageRow[], summary: SummaryRef | null): MessageRow[] =>
   summary ? history.filter((m) => m.seq > summary.throughSeq) : [...history];
 
-/** Estimated tokens of a fresh session's context: the summary, the messages after it and the reserve. */
+/** Tokens of the turn's own message (it goes to the runtime with the context, review #106). */
+export const inputTokens = (input: string): number => (input ? estimateTokens(input) + MESSAGE_OVERHEAD : 0);
+
+/**
+ * Estimated tokens of what a session gets for the turn: the summary, the messages after it, the turn's own
+ * message (`input`) and the reserve.
+ */
 export function contextTokens(
   history: readonly MessageRow[],
   summary: SummaryRef | null,
   o: ContextOptions,
+  input = "",
 ): number {
-  let n = o.reserveTokens + (summary ? estimateTokens(summary.summary) + MESSAGE_OVERHEAD : 0);
+  let n =
+    o.reserveTokens + inputTokens(input) + (summary ? estimateTokens(summary.summary) + MESSAGE_OVERHEAD : 0);
   for (const m of afterSummary(history, summary)) if (speaks(m)) n += messageTokens(m);
   return n;
 }
 
-/** A new summary is due (FR-3.6): the fresh context has reached `summaryRatio` of the window. */
+/** A new summary is due (FR-3.6): the context with the turn's message has reached `summaryRatio` of the window. */
 export function needsSummary(
   history: readonly MessageRow[],
   summary: SummaryRef | null,
   window: number,
   o: ContextOptions,
+  input = "",
 ): boolean {
-  return contextTokens(history, summary, o) >= o.summaryRatio * window;
+  return contextTokens(history, summary, o, input) >= o.summaryRatio * window;
 }
+
+/** The context with the turn's message does not fit the model's window at all: it must be cut before it goes. */
+export const overflows = (
+  history: readonly MessageRow[],
+  summary: SummaryRef | null,
+  window: number,
+  o: ContextOptions,
+  input = "",
+): boolean => contextTokens(history, summary, o, input) >= window;
 
 /**
  * What a new summary folds in on top of `summary`: the messages after it except the last `recentMessages` with
@@ -127,17 +145,19 @@ export function messagesToFold(
 }
 
 /**
- * The context when no summary could be written (its run failed): the newest messages that fit under the ratio, at
- * least the last one with text. Never breaks the reply; the next run tries to summarise again.
+ * The context when no summary could be written (its run failed) or it would not fit: the newest messages that fit
+ * under the ratio together with the turn's message, at least the last one with text (none when even that is too
+ * much). Never breaks the reply; the next run tries to summarise again.
  */
 export function trimToFit(
   history: readonly MessageRow[],
   summary: SummaryRef | null,
   window: number,
   o: ContextOptions,
+  input = "",
 ): MessageRow[] {
   let msgs = afterSummary(history, summary);
-  while (msgs.filter(speaks).length > 1 && contextTokens(msgs, summary, o) >= o.summaryRatio * window) {
+  while (msgs.some(speaks) && contextTokens(msgs, summary, o, input) >= o.summaryRatio * window) {
     const first = msgs.findIndex(speaks);
     msgs = msgs.slice(first + 1);
   }

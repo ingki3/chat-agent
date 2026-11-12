@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "../src/artifacts/store.js";
 import type { MessageRow } from "../src/conversations/store.js";
@@ -10,6 +11,7 @@ import {
   estimateTokens,
   messagesToFold,
   needsSummary,
+  overflows,
   renderPriorContext,
   SUMMARY_DIVIDER,
   SUMMARY_MARKER,
@@ -18,7 +20,7 @@ import {
   type ContextOptions,
 } from "../src/runtime/context.js";
 import { defaultScript, FakeRuntime, fakeSummary, type FakeScript } from "../src/runtime/fake.js";
-import type { RunRow } from "../src/runtime/runs.js";
+import { RunManager, type RunRow } from "../src/runtime/runs.js";
 import { knownSecrets, KNOWN_PLACEHOLDER } from "../src/secrets/known.js";
 import { startContextApp, textOf, type Entry } from "./helpers/context-harness.js";
 
@@ -384,6 +386,13 @@ describe("automatic summary (#45, FR-3.6)", () => {
     expect(contextTokens(h, s, OPTS)).toBe(18 + 76);
     expect(messagesToFold(h, s, OPTS)).toEqual([]); // only the kept recent ones are left
     expect(trimToFit(h, null, 200, OPTS).map((m) => m.seq)).toEqual([4, 5, 6]);
+    // The turn's own message counts (review #106): 228 + 38 = 266.
+    expect(contextTokens(h, null, OPTS, "가".repeat(30))).toBe(266);
+    expect(needsSummary(h, null, 380, OPTS, "가".repeat(30))).toBe(true); // 266 ≥ 266
+    expect(needsSummary(h, null, 381, OPTS, "가".repeat(30))).toBe(false);
+    expect(overflows(h, null, 266, OPTS, "가".repeat(30))).toBe(true);
+    expect(overflows(h, null, 267, OPTS, "가".repeat(30))).toBe(false);
+    expect(trimToFit(h, null, 200, OPTS, "가".repeat(30)).map((m) => m.seq)).toEqual([5, 6]);
     // Reasoning is not context: it neither counts nor is handed on.
     const withReasoning = [
       {
@@ -411,6 +420,7 @@ describe("automatic summary (#45, FR-3.6)", () => {
         prev && { ...prev, throughMessageId: prev.throughMessageId },
         WINDOW,
         OPTS,
+        long(i),
       );
       const r = await t.send(c, long(i));
       const made = t.summaries(c);
@@ -505,7 +515,7 @@ describe("automatic summary (#45, FR-3.6)", () => {
     const c = await t.newConversation();
     let tried: RunRow | undefined;
     for (let i = 1; i <= 12 && !tried; i++) {
-      const due = needsSummary(historyBefore(t, c), null, WINDOW, OPTS);
+      const due = needsSummary(historyBefore(t, c), null, WINDOW, OPTS, long(i));
       const r = await t.send(c, long(i));
       if (due) tried = r;
     }
@@ -513,23 +523,21 @@ describe("automatic summary (#45, FR-3.6)", () => {
     expect(tried!.status).toBe("done");
     expect(t.summaries(c)).toEqual([]);
     expect((await t.messages(c)).some((m) => m.parts.some((p) => p.type === "divider"))).toBe(false);
-    // The session that already holds the history goes on with it (it knows exactly the server's original).
-    t.check(tried!);
-    // A fresh session (another runtime) gets the newest messages that fit under the ratio.
-    t.connect("codex");
-    await t.chip(c, { runtime: "codex" });
-    const r = await t.send(c, "Codex로");
-    const turn = t.codex.turnLog.at(-1)!;
-    const all = t.original(r).entries;
-    expect(turn.before.length).toBeGreaterThan(0);
-    expect(turn.before.length).toBeLessThan(all.length);
-    expect(turn.before).toEqual(all.slice(all.length - turn.before.length));
+    // Review #106: the cut context goes to a fresh session, even on the same runtime — the session that holds the
+    // whole history is not resumed (it would hand the runtime everything again) and is invalidated.
+    const turns = t.claude.turnLog.filter((x) => !x.input.startsWith(SUMMARY_MARKER));
+    const [prev, last] = turns.slice(-2);
+    expect(last!.sessionId).not.toBe(prev!.sessionId);
+    const all = t.original(tried!).entries;
+    expect(last!.before.length).toBeGreaterThan(0);
+    expect(last!.before.length).toBeLessThan(all.length);
+    expect(last!.before).toEqual(all.slice(all.length - last!.before.length));
+    // What it got fits under the ratio together with the turn's message.
+    const tokens =
+      last!.before.reduce((n, e) => n + estimateTokens(e.text) + 8, 0) + estimateTokens(last!.input) + 8;
+    expect(tokens).toBeLessThan(OPTS.summaryRatio * WINDOW);
+    expect(t.sessions(c).map((s) => s.invalidated)).toEqual([1, 0]);
     expect(t.sessions(c).at(-1)!.summaryId).toBeNull();
-    // Only the switch divider: no "앞부분을 요약했어요" for a summary that was never written.
-    const labels = (await t.messages(c)).flatMap((m) =>
-      m.parts.flatMap((p) => (p.type === "divider" ? [p.kind] : [])),
-    );
-    expect(labels).toEqual(["runtime_switch"]);
   });
 
   it("the summary model is the run's own when the user may not use the cheap one", async () => {
@@ -562,5 +570,166 @@ describe("automatic summary (#45, FR-3.6)", () => {
     const [s] = t.summaries(c);
     expect(s!.summary).toBe(`요약: 키는 ${KNOWN_PLACEHOLDER} 였다`);
     expect(JSON.stringify(t.claude.contexts)).not.toContain(secret);
+  });
+});
+
+describe("review #106: the turn's message, cut contexts, cut files, unfinished dividers", () => {
+  it("a huge message is counted: with the production window it brings the summary the history alone would not", async () => {
+    const claude = new FakeRuntime({ models: CLAUDE_MODELS, needsConnection: true });
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(claude);
+    const t = await startContextApp(runtimes, { closers });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    for (let i = 0; i < 12; i++)
+      t.app.conversations!.append(c, {
+        role: i % 2 ? "assistant" : "user",
+        parts: [{ type: "text", text: "가".repeat(10_000) }],
+      });
+    const history = t.app.conversations!.messages(c, { limit: 100 });
+    // 128,096 tokens: under 0.7 × 200,000 without the message, far over it with it.
+    expect(needsSummary(history, null, 200_000, DEFAULT_CONTEXT_OPTIONS)).toBe(false);
+    const input = "나".repeat(100_000);
+    const r = await t.send(c, input);
+    expect(t.summaries(c)).toHaveLength(1);
+    // Decided at the divider point already (the route passes the message): the divider is there.
+    expect(
+      (await t.messages(c))
+        .flatMap((m) => m.parts)
+        .filter((p) => p.type === "divider" && p.kind === "summary"),
+    ).toHaveLength(1);
+    const turn = claude.turnLog.at(-1)!;
+    expect(turn.before[0]!.role).toBe("summary");
+    const tokens =
+      turn.before.reduce((n, e) => n + estimateTokens(e.text) + 8, 0) + estimateTokens(turn.input) + 8;
+    expect(tokens).toBeLessThan(200_000);
+    expect(r.status).toBe("done");
+  });
+
+  it("execute decides again with the real message when begin could not (no input text at the divider point)", async () => {
+    const t = await start({ window: WINDOW, context: OPTS });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    for (let i = 0; i < 4; i++)
+      t.app.conversations!.append(c, {
+        role: i % 2 ? "assistant" : "user",
+        parts: [{ type: "text", text: "가".repeat(60) }],
+      });
+    // 4 × 68 = 272 tokens: under 700 — with the 500-token message over it.
+    expect(needsSummary(historyBefore(t, c), null, WINDOW, OPTS)).toBe(false);
+    const run = t.app.runs!.begin({
+      conversationId: c,
+      userId: t.f.users.owner.id,
+      // A divider point but no input text (a caller that does not pass it): begin decides "no summary".
+      prepare: (divider) => {
+        divider();
+        return {
+          user: t.app.conversations!.append(c, {
+            role: "user",
+            parts: [{ type: "text", text: "나".repeat(500) }],
+          }),
+          assistant: t.app.conversations!.append(c, { role: "assistant", parts: [], status: "pending" }),
+        };
+      },
+    }).run;
+    for (let i = 0; i < 400 && !t.app.runs!.get(run.id)!.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 5));
+    expect(t.app.runs!.get(run.id)!.status).toBe("done");
+    expect(t.summaries(c)).toHaveLength(1);
+    expect(t.claude.turnLog.at(-1)!.before[0]!.role).toBe("summary");
+  });
+
+  it("a message bigger than the window itself: cut to what fits, in a fresh session", async () => {
+    const t = await start({ window: WINDOW, context: OPTS });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    await t.send(c, "짧은 질문");
+    const r = await t.send(c, "나".repeat(1200));
+    const turns = t.claude.turnLog.filter((x) => !x.input.startsWith(SUMMARY_MARKER));
+    expect(turns.at(-1)!.sessionId).not.toBe(turns[0]!.sessionId);
+    expect(turns.at(-1)!.before).toEqual([]);
+    expect(r.status).toBe("done");
+  });
+
+  it("files of messages an edit cut leave the references; the edited message keeps its own", async () => {
+    const t = await start();
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    const r1 = await t.send(c, "첫 질문");
+    const r2 = await t.send(c, "두번째 질문");
+    const insertFile = t.db.$client.prepare(
+      "insert into files (id, user_id, conversation_id, message_id, name, kind, media_type, bytes, sha256, created_at) values (?, ?, ?, ?, ?, 'pdf', 'application/pdf', 1, 'x', ?)",
+    );
+    insertFile.run("f-first", t.f.users.owner.id, c, r1.userMessageId, "첫.pdf", 1);
+    insertFile.run("f-later", t.f.users.owner.id, c, r2.userMessageId, "나중.pdf", 2);
+    const r3 = await t.edit(c, r2.userMessageId!, "고친 두번째");
+    expect(r3.status).toBe("done");
+    // `edit` moves the edited message's files to its new version (#22): only those stay, with the earlier ones.
+    const refs = t.claude.contexts.at(-1)!.references!.files.map((f) => f.id);
+    expect(refs).toEqual(["f-first", "f-later"]);
+    // Editing the first message cuts the second (and its file) out of the history.
+    await t.edit(c, r1.userMessageId!, "처음부터 다시");
+    expect(t.claude.contexts.at(-1)!.references!.files.map((f) => f.id)).toEqual(["f-first"]);
+  });
+
+  it("a run stopped before its summary ran, or recovered after a restart, leaves no summary divider", async () => {
+    const t = await start({ window: WINDOW, context: OPTS });
+    t.connect("claude-code");
+    const c = await t.newConversation();
+    for (let i = 0; i < 10; i++)
+      t.app.conversations!.append(c, {
+        role: i % 2 ? "assistant" : "user",
+        parts: [{ type: "text", text: "가".repeat(100) }],
+      });
+    const dividers = () =>
+      t.app
+        .conversations!.messages(c, { limit: 10_000 })
+        .flatMap((m) => m.parts as { type: string; kind?: string }[])
+        .filter((p) => p.type === "divider" && p.kind === "summary").length;
+    const begin = () =>
+      t.app.runs!.begin({
+        conversationId: c,
+        userId: t.f.users.owner.id,
+        inputText: "queued",
+        prepare: (divider) => {
+          divider();
+          return {
+            user: t.app.conversations!.append(c, { role: "user", parts: [{ type: "text", text: "queued" }] }),
+            assistant: t.app.conversations!.append(c, { role: "assistant", parts: [], status: "pending" }),
+          };
+        },
+      }).run;
+    const stopped = begin();
+    expect(dividers()).toBe(1);
+    await t.app.runs!.interrupt(stopped.id);
+    for (let i = 0; i < 200 && !t.app.runs!.get(stopped.id)!.endedAt; i++)
+      await new Promise((r) => setTimeout(r, 5));
+    expect(t.app.runs!.get(stopped.id)!.status).toBe("interrupted");
+    expect([t.summaries(c).length, dividers()]).toEqual([0, 0]);
+    await t.send(c, "next");
+    expect([t.summaries(c).length, dividers()]).toEqual([1, 1]);
+
+    // Recovery: a run left queued by a previous process (its divider written, its summary never stored).
+    const c2 = await t.newConversation();
+    for (let i = 0; i < 10; i++)
+      t.app.conversations!.append(c2, {
+        role: i % 2 ? "assistant" : "user",
+        parts: [{ type: "text", text: "가".repeat(100) }],
+      });
+    const divider = t.app.conversations!.append(c2, {
+      role: "system",
+      parts: [{ type: "divider", kind: "summary", label: SUMMARY_DIVIDER }],
+    });
+    const user = t.app.conversations!.append(c2, { role: "user", parts: [{ type: "text", text: "x" }] });
+    const assistant = t.app.conversations!.append(c2, { role: "assistant", parts: [], status: "pending" });
+    const stale = crypto.randomUUID();
+    t.db.$client
+      .prepare(
+        "insert into runs (id, conversation_id, user_id, user_message_id, assistant_message_id, status, runtime, model, summary_divider_id, created_at) values (?, ?, ?, ?, ?, 'running', 'claude-code', 'claude-opus-5-5', ?, ?)",
+      )
+      .run(stale, c2, t.f.users.owner.id, user.id, assistant.id, divider.id, Date.now());
+    const manager = new RunManager(t.db, t.app.conversations!, new RuntimeRegistry(), t.app.appEvents);
+    expect(manager.recover()).toBe(1);
+    expect(t.app.conversations!.messageById(divider.id)!.active).toBe(false);
   });
 });

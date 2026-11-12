@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4e8d93fe-38dd-48c1-9abb-e6cc379e0009",
+  "id": "f8803ccf-75ac-4382-801e-5f5b2fcc8a7e",
   "prevId": "bdcd6782-060c-4430-849a-1a1cf5298e29",
   "tables": {
     "artifact_versions": {
@@ -1746,6 +1746,13 @@
         },
         "idempotency_key": {
           "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "summary_divider_id": {
+          "name": "summary_divider_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

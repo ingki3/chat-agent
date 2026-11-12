@@ -56,7 +56,9 @@ import {
   contextWindowOf,
   DEFAULT_CONTEXT_OPTIONS,
   messagesToFold,
+  messageText,
   needsSummary,
+  overflows,
   REFERENCE_LIMIT,
   SUMMARY_DIVIDER,
   SUMMARY_INSTRUCTIONS,
@@ -138,6 +140,10 @@ type RunContext = {
   summary: (SummaryRef & { id: string }) | null;
   /** What the fresh session gets as messages: those after the summary (or the newest that fit, see trimToFit). */
   messages: MessageRow[];
+  /** Only a fresh session may get this context: `messages` were cut to fit (#45, review #106). */
+  fresh: boolean;
+  /** The turn's own user message (its attachments are the conversation's too). */
+  inputMessageId: string | null;
 };
 
 /** What `runs.idempotency_key` holds: the client's key hashed (it is only ever compared). */
@@ -318,7 +324,9 @@ export type RunManagerOptions = {
   /** The context builder's limits (#45): summary ratio, recent messages kept, reserve. Default DEFAULT_CONTEXT_OPTIONS. */
   context?: Partial<ContextOptions>;
   /** The conversation's uploaded files for a fresh session's context (#45), from the file store (#22). */
-  contextFiles?: (conversationId: string) => ContextReferences["files"];
+  contextFiles?: (
+    conversationId: string,
+  ) => (ContextReferences["files"][number] & { messageId: string | null })[];
 };
 
 /**
@@ -457,6 +465,11 @@ export class RunManager {
      * before the regenerated reply. The settings are resolved first, so the divider names who really answers.
      */
     prepare: (divider: () => void) => { user: MessageRow | null; assistant: MessageRow };
+    /**
+     * The text of the user message about to be written (send, edit), counted in the summary decision at the divider
+     * point (#45). A regenerate needs none: its user message is already in the history.
+     */
+    inputText?: string | undefined;
   }): { run: RunRow; user: MessageRow | null; assistant: MessageRow; reused: boolean } {
     if (this.stopping) throw new ShuttingDownError();
     const decided: { plan?: NonNullable<Live["summaryPlan"]> } = {};
@@ -529,7 +542,7 @@ export class RunManager {
         const { user, assistant } = input.prepare(() => {
           if (!adapter || !model) return;
           // "앞부분을 요약했어요" where a new summary is due (#45, FR-3.6): decided here, written by `execute`.
-          const due = this.summaryDue(input.conversationId, adapter, model.id);
+          const due = this.summaryDue(input.conversationId, adapter, model.id, input.inputText);
           const plan: NonNullable<Live["summaryPlan"]> = { summarize: due.summarize };
           decided.plan = plan;
           if (due.summarize)
@@ -563,6 +576,7 @@ export class RunManager {
           connectionVersion: settings?.connectionVersion ?? null,
           useShared: settings?.useShared ?? false,
           idempotencyKey: input.idempotencyKey ? idempotencyHash(input.idempotencyKey) : null,
+          summaryDividerId: decided.plan?.dividerId ?? null,
           nextEventSeq: 1,
           createdAt: this.now(),
           endedAt: null,
@@ -584,9 +598,6 @@ export class RunManager {
       .immediate();
     // The persisted status decides: a run that already failed inside the transaction (no runtime) is not started.
     const run = this.get(created.run.id)!;
-    // Nothing will be summarised for a run that never starts: its divider goes again.
-    if (!created.reused && run.status !== "queued" && decided.plan?.dividerId)
-      this.conversations.deactivate(run.conversationId, decided.plan.dividerId);
     if (!created.reused && run.status === "queued") {
       let executed!: () => void;
       this.live.set(run.id, {
@@ -884,6 +895,10 @@ export class RunManager {
   }
 
   private finish(r: RunRow, status: "done" | "interrupted" | "failed", errorCode: string | null): void {
+    // However the run ended (failed at once, stopped before or during its summary, recovered after a restart): a
+    // summary divider whose summary was never stored leaves the history (#45).
+    if (r.summaryDividerId && !this.summaries.ofRun(r.conversationId, r.id))
+      this.conversations.deactivate(r.conversationId, r.summaryDividerId);
     const messageStatus = status === "done" ? "complete" : status === "interrupted" ? "stopped" : "error";
     this.conversations.updateMessage(r.assistantMessageId, { status: messageStatus });
     if (status === "failed") {
@@ -988,12 +1003,15 @@ export class RunManager {
     conversationId: string,
     adapter: RuntimeAdapter,
     model: string,
+    inputText: string | undefined,
   ): { summarize: boolean; inUse: boolean } {
     const active = this.conversations.messages(conversationId, { limit: 10_000 });
-    const history = active.at(-1)?.role === "user" ? active.slice(0, -1) : active;
+    const trailingUser = active.at(-1)?.role === "user" ? active.at(-1) : undefined;
+    const history = trailingUser ? active.slice(0, -1) : active;
+    const input = inputText ?? (trailingUser ? messageText(trailingUser.parts as MessagePart[]) : "");
     const current = this.summaries.current(conversationId, history);
     const summarize =
-      needsSummary(history, current, this.windowOf(adapter, model), this.contextOpts) &&
+      needsSummary(history, current, this.windowOf(adapter, model), this.contextOpts, input) &&
       messagesToFold(history, current, this.contextOpts).length > 0;
     return { summarize, inUse: summarize || current !== null };
   }
@@ -1004,20 +1022,30 @@ export class RunManager {
    * the summary model on the run's connection. A summary that cannot be written never breaks the reply: its divider
    * goes, and the session gets the newest messages that fit.
    */
-  private async contextFor(run: RunRow, live: Live, history: MessageRow[]): Promise<RunContext> {
+  private async contextFor(
+    run: RunRow,
+    live: Live,
+    history: MessageRow[],
+    input: { text: string; messageId: string | null },
+  ): Promise<RunContext> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const window = this.windowOf(adapter, run.model);
+    const opts = this.contextOpts;
     const current = this.summaries.current(run.conversationId, history);
-    const summarize = live.summaryPlan?.summarize ?? needsSummary(history, current, window, this.contextOpts);
-    const fold = summarize ? messagesToFold(history, current, this.contextOpts) : [];
+    // Decided again with the turn's real message (review #106): `begin` may not have known it, or not at all.
+    const summarize =
+      live.summaryPlan?.summarize === true || needsSummary(history, current, window, opts, input.text);
+    const fold = summarize ? messagesToFold(history, current, opts) : [];
+    let written: RunContext["summary"] = null;
+    let failed = false;
     let ended: unknown;
     if (fold.length) {
       try {
-        const summary = await this.writeSummary(run, live, adapter, current, fold, history);
-        return { history, summary, messages: history.filter((m) => m.seq > summary.throughSeq) };
+        written = await this.writeSummary(run, live, adapter, current, fold, history);
       } catch (e) {
         if (e instanceof RunEndedError || live.settled || live.interruptRequested) ended = e;
-        else
+        else {
+          failed = true;
           logEvent(this.opts.log, "warn", "context.summary_failed", {
             userId: run.userId,
             conversationId: run.conversationId,
@@ -1026,19 +1054,27 @@ export class RunManager {
             errorCode: "summary_failed",
             err: e,
           });
+        }
       }
     }
     // No new summary: its divider (if `begin` wrote one) is taken back before anything refers to it.
     const dividerId = live.summaryPlan?.dividerId;
-    if (dividerId) {
+    if (!written && dividerId) {
       this.conversations.deactivate(run.conversationId, dividerId);
       history = history.filter((m) => m.id !== dividerId);
     }
     if (ended !== undefined) throw ended;
-    const messages = fold.length
-      ? trimToFit(history, current, window, this.contextOpts)
-      : history.filter((m) => !current || m.seq > current.throughSeq);
-    return { history, summary: current, messages };
+    const summary = written ?? current;
+    let messages = history.filter((m) => !summary || m.seq > summary.throughSeq);
+    // A summary that could not be written, or a context that would not fit the window with the turn's message even
+    // so (one huge message): the newest messages that fit go to a *fresh* session — one that holds more would get
+    // the whole history again by being resumed.
+    let fresh = false;
+    if (failed || overflows(messages, summary, window, opts, input.text)) {
+      messages = trimToFit(history, summary, window, opts, input.text);
+      fresh = true;
+    }
+    return { history, summary, messages, fresh, inputMessageId: input.messageId };
   }
 
   /**
@@ -1144,8 +1180,12 @@ export class RunManager {
     });
   }
 
-  /** The conversation's files, artifacts and cited sources for a fresh session (#45). Never breaks the run. */
-  private referencesOf(conversationId: string, history: MessageRow[]): ContextReferences {
+  /**
+   * The conversation's files, artifacts and cited sources for a fresh session (#45). Files only of the messages that
+   * are the history now, or of the turn's own message — an edit or regenerate takes those of the cut part away
+   * (review #106). Never breaks the run.
+   */
+  private referencesOf(conversationId: string, context: RunContext): ContextReferences {
     let artifacts: ContextReferences["artifacts"] = [];
     try {
       artifacts = this.artifacts
@@ -1157,11 +1197,16 @@ export class RunManager {
     }
     let files: ContextReferences["files"] = [];
     try {
-      files = (this.opts.contextFiles?.(conversationId) ?? []).slice(0, REFERENCE_LIMIT);
+      const active = new Set(context.history.map((m) => m.id));
+      if (context.inputMessageId) active.add(context.inputMessageId);
+      files = (this.opts.contextFiles?.(conversationId) ?? [])
+        .filter((f) => f.messageId !== null && active.has(f.messageId))
+        .slice(-REFERENCE_LIMIT)
+        .map((f) => ({ id: f.id, name: f.name }));
     } catch {
       // none rather than no reply
     }
-    return { files, artifacts, sources: citedSources(history) };
+    return { files, artifacts, sources: citedSources(context.history) };
   }
 
   private async openSession(
@@ -1200,7 +1245,7 @@ export class RunManager {
       // way to the runtime: a secret registered after a message was stored (round 23).
       history: contextHistory(context.messages),
       ...(summary ? { summary: { text: summary.summary, throughMessageId: summary.throughMessageId } } : {}),
-      references: this.referencesOf(run.conversationId, context.history),
+      references: this.referencesOf(run.conversationId, context),
       systemPrompt: instructions.text,
       model: run.model,
       effort: run.effort ?? undefined,
@@ -1240,7 +1285,9 @@ export class RunManager {
               (s.summaryId ?? null) === (summary?.id ?? null) &&
               (s.model === null || s.model === run.model || caps.canSwitchModelInSession),
           );
-    if (prev) {
+    // A cut context goes to a fresh session only; the session that holds the whole history is not used again.
+    if (prev && context.fresh) this.conversations.invalidateSession(prev.id);
+    else if (prev) {
       let resumed: RuntimeSession | undefined;
       try {
         resumed = await adapter.resume(prev.externalSessionId, rescrub(ctx));
@@ -1316,6 +1363,7 @@ export class RunManager {
         run,
         live,
         before.filter((m) => m !== lastUser),
+        { text: inputText ?? "", messageId: lastUser?.id ?? null },
       );
       if (live.settled) return;
       // One attempt = this session open + the turn below (#44).

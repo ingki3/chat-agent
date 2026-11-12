@@ -109,6 +109,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "runs.idempotency_key": { exempt: "the client's retry key, stored as its SHA-256 only (round 27)" },
   "runs.instructions": { exempt: "template version ids" },
   "runs.connection_id": ID,
+  "runs.summary_divider_id": ID,
   "error_log.source": ENUM,
   "error_log.code": ENUM,
   "error_log.category": ENUM,

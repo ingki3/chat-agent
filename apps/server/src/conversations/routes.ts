@@ -226,6 +226,8 @@ export function registerConversationRoutes(
         userId: req.ctx.user!.id,
         idempotencyKey: k,
         choice: choiceOf(body),
+        // Counted in the summary decision (#45): it goes to the runtime with the context.
+        inputText: body.text,
         prepare: (divider) => {
           divider();
           // Files sent with it (#22): unsent files of this conversation, else nothing is created (400).
@@ -259,6 +261,7 @@ export function registerConversationRoutes(
           userId: req.ctx.user!.id,
           idempotencyKey: k,
           choice: choiceOf(body),
+          inputText: body.text,
           prepare: (divider) => {
             const user = store.edit(req.params.id, req.params.messageId, body.text, divider);
             if (!user) throw new MessageNotFoundError();

@@ -246,6 +246,11 @@ export const runs = sqliteTable(
     useShared: integer("use_shared", { mode: "boolean" }).notNull().default(false),
     /** Client `Idempotency-Key`: the same key from the same user returns the same run. */
     idempotencyKey: text("idempotency_key"),
+    /**
+     * The "앞부분을 요약했어요" divider written for this run's summary (#45): taken out of the history again when the
+     * run ends without having stored its summary (failed, stopped before it ran, recovered after a restart).
+     */
+    summaryDividerId: text("summary_divider_id"),
     /** Next event sequence number (SSE id). */
     nextEventSeq: integer("next_event_seq").notNull().default(1),
     createdAt: integer("created_at").notNull().default(now),

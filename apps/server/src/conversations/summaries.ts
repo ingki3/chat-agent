@@ -65,6 +65,22 @@ export class SummaryStore {
     return null;
   }
 
+  /** Whether the run stored a summary (#45: its divider stays only then). */
+  ofRun(conversationId: string, runId: string): boolean {
+    return (
+      this.db
+        .select({ id: conversationSummaries.id })
+        .from(conversationSummaries)
+        .where(
+          and(
+            eq(conversationSummaries.conversationId, conversationId),
+            eq(conversationSummaries.runId, runId),
+          ),
+        )
+        .get() !== undefined
+    );
+  }
+
   get(conversationId: string, id: string): SummaryRow | undefined {
     const r = this.db
       .select()
