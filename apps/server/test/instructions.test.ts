@@ -131,7 +131,7 @@ describe("assembly", () => {
         it(`snapshot: ${who} × ${mode} × ${kind} tools`, () => {
           const r = assembleInstructions({ user, mode, tools, now: NOW });
           expect(r.versions).toEqual([
-            "common@2",
+            "common@3",
             ...(kind === "finance" ? ["finance@2"] : []),
             ...(user.youth ? ["youth@2"] : []),
             ...(mode === "research" ? ["research@2"] : []),
@@ -233,7 +233,7 @@ describe("injection evaluation harness (#40 fixtures)", () => {
       now: NOW,
     });
     expect(report.summary).toEqual({ runs: 8, pass: 6, fail: 0, error: 0, pending: 2, violations: 0 });
-    expect(report.instructions).toEqual(["common@2"]);
+    expect(report.instructions).toEqual(["common@3"]);
     expect(new Set(report.results.map((r) => r.runtime))).toEqual(new Set(["claude-code", "codex"]));
     expect(report.results.find((r) => r.case === "INJ-1")!.calls).toEqual([
       { tool: "web_fetch", target: "http://fixtures.agentlee.test/injection/page-exfil.html" },
@@ -465,10 +465,10 @@ describe("run manager assembles per run", () => {
     const adults = [f.users.owner, f.users.shared, f.users.admin, f.users.stranger];
     for (const u of adults) {
       const { run } = await reply(u.id);
-      expect(run.instructions).toBe("common@2");
+      expect(run.instructions).toBe("common@3");
     }
     const { run } = await reply(son.id);
-    expect(run.instructions).toBe("common@2,youth@2");
+    expect(run.instructions).toBe("common@3,youth@2");
     expect(claude.systemPrompts).toHaveLength(adults.length + 1);
     expect(claude.systemPrompts.slice(0, adults.length).some((p) => p.includes(YOUTH_HEADING))).toBe(false);
     expect(claude.systemPrompts.at(-1)).toContain(YOUTH_HEADING);
@@ -480,10 +480,10 @@ describe("run manager assembles per run", () => {
   it("the finance section follows the run's tools", async () => {
     const { f, claude, reply } = await family({ tools: ["echo_time", FAKE_FINANCE_TOOL] });
     const { run } = await reply(f.users.owner.id);
-    expect(run.instructions).toBe("common@2,finance@2");
+    expect(run.instructions).toBe("common@3,finance@2");
     expect(claude.systemPrompts[0]).toContain(FINANCE_HEADING);
     const plain = await family({ tools: ["echo_time"] });
-    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@2");
+    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@3");
   });
 
   it("both runtimes get the same text for the same user and conversation", async () => {
@@ -516,7 +516,7 @@ describe("run manager assembles per run", () => {
     expect(res.json<{ researchMode: boolean }>().researchMode).toBe(true);
 
     const { run } = await reply(f.users.owner.id, conversationId);
-    expect(run.instructions).toBe("common@2,research@2");
+    expect(run.instructions).toBe("common@3,research@2");
     expect(claude.systemPrompts).toHaveLength(2); // not resumed with the old prompt
     expect(claude.systemPrompts[1]).toContain(RESEARCH_HEADING);
   });
@@ -526,7 +526,7 @@ describe("run manager assembles per run", () => {
     const { conversationId } = await reply(f.users.stranger.id);
     app.users!.setYouth(f.users.stranger.id, true);
     const { run } = await reply(f.users.stranger.id, conversationId);
-    expect(run.instructions).toBe("common@2,youth@2");
+    expect(run.instructions).toBe("common@3,youth@2");
     expect(claude.systemPrompts).toHaveLength(2);
     expect(claude.systemPrompts[1]).toContain(YOUTH_HEADING);
   });

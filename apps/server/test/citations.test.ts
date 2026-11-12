@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 const BODY =
-  "산업통상자원부는 10일 낸 자료에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
+  "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
   'He said "Semiconductor exports rose 132% in October" — a record. 성장률은 3.5%였다. ＡＢＣ전자는 "최대 실적"이라고 했다.';
 
 describe("snippet check: normalisation without fuzzy matches", () => {
@@ -48,7 +48,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
   it("whitespace, quote styles, fullwidth, invisible characters and decomposed Hangul are normalised", () => {
     // A line break and double spaces in either text.
     expect(found("달러로 집계됐다고 밝혔다. He said")).toBe(true);
-    expect(found("32%  늘어난   142억 달러")).toBe(true);
+    expect(found("32%  늘어난   142억 달러")).toBe(false); // round 22: mid-clause / glued
     // Curly vs straight quotes, any style.
     expect(found("He said “Semiconductor exports rose 132% in October”")).toBe(true);
     expect(found("He said 'Semiconductor exports rose 132% in October'")).toBe(true);
@@ -99,7 +99,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("Semiconductor export")).toBe(false);
     expect(found("도체 수출이 전년 같은")).toBe(false);
     // A Korean particle after the end is fine.
-    expect(found("10월 반도체 수출")).toBe(true);
+    expect(found("10월 반도체 수출")).toBe(false); // round 22: mid-clause / glued
   });
 
   it("case is kept: units and formulas that differ only in case are different text (round 10)", () => {
@@ -108,8 +108,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("검출된 기체는 Co였다고 한다", "검출된 기체는 CO였다고 한다.")).toBe(false);
     expect(found("Exports rose sharply in October", "exports rose sharply in October.")).toBe(false);
     // The exact case verifies.
-    expect(found("발전소의 설비 용량은 500MW", "발전소의 설비 용량은 500MW이다.")).toBe(true);
-    expect(found("회선의 최대 속도는 100Mbps", "회선의 최대 속도는 100Mbps이다.")).toBe(true);
+    expect(found("발전소의 설비 용량은 500MW", "발전소의 설비 용량은 500MW이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("회선의 최대 속도는 100Mbps", "회선의 최대 속도는 100Mbps이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("검출된 기체는 CO였다고 한다", "검출된 기체는 CO였다고 한다.")).toBe(true);
     // The duplicate key keeps them apart too.
     expect(normalizeSnippet("회선 속도 100Mbps")).not.toBe(normalizeSnippet("회선 속도 100MBps"));
@@ -143,8 +143,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("100 million in profit", "It reported 1/$100 million in profit.")).toBe(false);
     // Round 20: the currency sign is part of the number token — leaving it out is refused too.
     expect(found("100 million in profit", "It reported $100 million in profit.")).toBe(false);
-    expect(found("$100 million in profit", "It reported $100 million in profit.")).toBe(true);
-    expect(found("$ 100 million in profit", "It reported $ 100 million in profit.")).toBe(true);
+    expect(found("$100 million in profit", "It reported $100 million in profit.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("$ 100 million in profit", "It reported $ 100 million in profit.")).toBe(false); // round 22: mid-clause / glued
     // 2. (Round 16: back to the first-character rule.) After a number, a word that starts with a numeral unit is a
     // multiplier — ordinary words too: accepted limitation (e). Quoting through the word verifies.
     expect(found("객실 요금: $100", "객실 요금: $100 조식 포함")).toBe(false);
@@ -153,14 +153,14 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("상품권 가격: $50", "상품권 가격: $50 백화점에서 사용")).toBe(false);
     expect(found("객실 요금: $100 조식 포함", "객실 요금: $100 조식 포함")).toBe(true);
     expect(found("버스 요금: ¥100 경로에 따라", "버스 요금: ¥100 경로에 따라 추가 요금")).toBe(true);
-    expect(found("상품권 가격: $50 백화점에서", "상품권 가격: $50 백화점에서 사용")).toBe(true);
+    expect(found("상품권 가격: $50 백화점에서", "상품권 가격: $50 백화점에서 사용")).toBe(false); // round 22: mid-clause / glued
     // Round 16, Codex: quantity expressions the whole-token rule missed.
     expect(found("올해 예상 피해액은 1", "올해 예상 피해액은 1 억원대에 달했다.")).toBe(false);
     expect(found("숙박 요금은 10", "숙박 요금은 10 만원대로 안내됐다.")).toBe(false);
     expect(found("누적 방문자는 1", "누적 방문자는 1 만여 명에 이른다.")).toBe(false);
     expect(found("올해 참가 인원은 3", "올해 참가 인원은 3 만명으로 집계됐다.")).toBe(false);
     expect(found("숙박 요금은 10", "숙박 요금은 10만원대로 안내됐다.")).toBe(false); // <strong>10</strong>만원대로, attached
-    expect(found("숙박 요금은 10 만원대로", "숙박 요금은 10 만원대로 안내됐다.")).toBe(true);
+    expect(found("숙박 요금은 10 만원대로", "숙박 요금은 10 만원대로 안내됐다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("예상 피해액은 1", "예상 피해액은 1 억원입니다.")).toBe(false);
     expect(found("총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다.")).toBe(false);
     expect(found("총 투자 금액은 3", "총 투자 금액은 3 천만 원이다.")).toBe(false);
@@ -178,25 +178,145 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("20만원이라고 안내했다", "요금은 10만원~20만원이라고 안내했다.")).toBe(false);
     expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%/5%이다.")).toBe(false);
     // Controls: the whole range; prose with numbers on both sides of a comma; a separator not followed by a digit.
-    expect(found("올해 예상 수익률은 3%~5%", "올해 예상 수익률은 3%~5%이다.")).toBe(true);
+    expect(found("올해 예상 수익률은 3%~5%", "올해 예상 수익률은 3%~5%이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("매출은 3% 증가, 5% 감소했다", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
     expect(found("매출은 3% 증가", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
     expect(found("5% 감소했다고 밝혔다", "매출은 3% 증가, 5% 감소했다고 밝혔다.")).toBe(true);
     expect(found("주차는 A-1 구역에서 한다", "주차는 A-1 구역에서 한다.")).toBe(true);
-    expect(found("주차 위치는 B동 A", "주차 위치는 B동 A-1 구역이다.")).toBe(true);
-    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%~이다.")).toBe(true);
+    expect(found("주차 위치는 B동 A", "주차 위치는 B동 A-1 구역이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%~이다.")).toBe(false); // round 22: mid-clause / glued
     // Only the token at the edge counts: a digit elsewhere in the match does not make a range.
-    expect(found("3층 주차장은 B동 A", "3층 주차장은 B동 A-1 구역이다.")).toBe(true);
+    expect(found("3층 주차장은 B동 A", "3층 주차장은 B동 A-1 구역이다.")).toBe(false); // round 22: mid-clause / glued
     // Round 18: a digit within 3 tokens on both sides of the mark is a range (accepted limitation (f)).
     expect(found("최대 20명이라고 했다", "인원은 10~최대 20명이라고 했다.")).toBe(false);
     expect(found("그 뒤 최대 인원은 20명이라고 했다", "인원은 10~그 뒤 최대 인원은 20명이라고 했다.")).toBe(
-      true,
-    );
+      false,
+    ); // round 22: mid-clause / glued
     // A sign or a decimal mark only matters before a number.
-    expect(found("A등급이었다고 밝혔다", "결과는 -A등급이었다고 밝혔다.")).toBe(true);
+    expect(found("A등급이었다고 밝혔다", "결과는 -A등급이었다고 밝혔다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("A형이었다고 밝혔다", "결과는 3,A형이었다고 밝혔다.")).toBe(true);
-    expect(found("A1등급이었다고 밝혔다", "결과는 -A1등급이었다고 밝혔다.")).toBe(true);
+    expect(found("A1등급이었다고 밝혔다", "결과는 -A1등급이었다고 밝혔다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("A1형이었다고 밝혔다", "결과는 3,A1형이었다고 밝혔다.")).toBe(true);
+  });
+
+  it("round 22: every Codex numeric case of rounds 6–22 is refused; a number's whole clause verifies", () => {
+    // A numeric edge (a digit in the first / last two tokens, or a sign / currency sign first) must be a clause
+    // edge: punctuation, a line break or the text's start / end — accepted limitation (h).
+    for (const [quote, page] of [
+      ["총 투자 금액은 10", "총 투자 금액은 10만 달러입니다."],
+      ["지난달 신규 가입자는 32", "지난달 신규 가입자는 32만 명이다."],
+      ["해당 제품의 가격은 3", "해당 제품의 가격은 3만 원이다."],
+      ["총 투자 금액은 천", "총 투자 금액은 천만 달러입니다."],
+      ["지난달 신규 가입자는 십", "지난달 신규 가입자는 십만 명이다."],
+      ["해당 제품의 가격은 삼", "해당 제품의 가격은 삼만 원이다."],
+      ["예상 피해액은 수천", "예상 피해액은 수천만 원입니다."],
+      ["매년 방문객은 수십", "매년 방문객은 수십만 명이다."],
+      ["해당 영상은 수백", "해당 영상은 수백만 회 재생됐다."],
+      ["총 참석 인원은 백", "총 참석 인원은 백이 명이었다."],
+      ["이번 투표 결과는 십", "이번 투표 결과는 십이 대 칠이었다."],
+      ["그날 기온은 십", "그날 기온은 십이 도였다."],
+      ["이번 계약의 지분은 1", "이번 계약의 지분은 1/2이다."],
+      ["해당 사건의 발생 확률은 1", "해당 사건의 발생 확률은 1/100이다."],
+      ["100원으로 산정됐다고 밝혔다", "금액은 1/100원으로 산정됐다고 밝혔다."],
+      ["발전소의 설비 용량은 500mW", "발전소의 설비 용량은 500MW이다."],
+      ["회선의 최대 속도는 100MBps", "회선의 최대 속도는 100Mbps이다."],
+      ["검출된 기체는 Co였다고 한다", "검출된 기체는 CO였다고 한다."],
+      ["제품의 전체 길이는 12″이다.", "제품의 전체 길이는 12′이다."],
+      ["예상 기온은 10", "예상 기온은 10 ~ 20도이다."],
+      ["20도라고 예보했다", "기온은 10∼20도라고 예보했다."],
+      ["5%라고 안내했다", "올해 예상 수익률은 3 ~ 5%라고 안내했다."],
+      ["실험에서 측정한 확률은 1", "실험에서 측정한 확률은 1 / 2이다."],
+      ['제품의 전체 길이는 12"이다.', "제품의 전체 길이는 12'이다."],
+      ["5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다."],
+      ["5도까지 떨어졌다고 한다", "기온은 − 5도까지 떨어졌다고 한다."],
+      ["5 ~ 5도라고 예보했다", "기온은 - 5 ~ 5도라고 예보했다."],
+      ['제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다."],
+      ['이 망원경의 시야각은 30"', "이 망원경의 시야각은 30’이다."],
+      ["$100 million in operating profit", "The company reported -$100 million in operating profit."],
+      ["$5 million.", "Net income: - $5 million."],
+      ["총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다."],
+      ["예상 피해액은 1", "예상 피해액은 1 억원입니다."],
+      ["100 million in operating profit", "The company reported -$100 million in operating profit."],
+      ["5 million in total", "Net income: -€5 million in total."],
+      ["올해 예상 피해액은 1", "올해 예상 피해액은 1 억원대에 달했다."],
+      ["숙박 요금은 10", "숙박 요금은 10 만원대로 안내됐다."],
+      ["누적 방문자는 1", "누적 방문자는 1 만여 명에 이른다."],
+      ["올해 참가 인원은 3", "올해 참가 인원은 3 만명으로 집계됐다."],
+      ["객실의 하루 요금은 $100", "객실의 하루 요금은 $100-$200이다."],
+      ["객실의 하루 요금은 €100", "객실의 하루 요금은 €100 ~ €200이다."],
+      ["Admission prices are $10", "Admission prices are $10–$20 per person."],
+      ["올해 예상 수익률은 3%", "올해 예상 수익률은 3%~5%이다."],
+      ["객실의 하루 요금은 10만원", "객실의 하루 요금은 10만원~20만원이다."],
+      ["내일 예상 기온은 10°C", "내일 예상 기온은 10°C~20°C이다."],
+      ["5%라고 안내했다.", "올해 예상 수익률은 3%~5%라고 안내했다."],
+      ["객실의 하루 요금은 10만 원", "객실의 하루 요금은 10만 원~20만 원이다."],
+      ["20만 원이라고 안내했다.", "객실의 하루 요금은 10만 원~20만 원이라고 안내했다."],
+      ["총 투자 금액은 1억 원", "총 투자 금액은 1억 원 ~ 2억 원이다."],
+      ["$20 million in total.", "The cost is $10 million ~ $20 million in total."],
+      ["내일 예상 기온은 -10", "내일 예상 기온은 -10~-5도이다."],
+      ["내일 예상 기온은 -10°C", "내일 예상 기온은 -10°C~-5°C이다."],
+      ["올해 예상 수익률은 -5%", "올해 예상 수익률은 -5%~+5%이다."],
+      ["진공에서 빛의 속력은 약 3", "진공에서 빛의 속력은 약 3×10⁸ m/s이다."],
+      ["10⁸ m/s라고 설명했다.", "진공에서 빛의 속력은 약 3×10⁸ m/s라고 설명했다."],
+      ["전파의 주파수는 10", "전파의 주파수는 10^9 Hz이다."],
+      ["올해 예상 수익률은 3", "올해 예상 수익률은 3%~5%이다."],
+      ["올해 예상 수익률은 3", "올해 예상 수익률은 3%이다."],
+      ["총 투자 금액은 1억", "총 투자 금액은 1억 2,000만원이다."],
+      ["2,000만원이라고 밝혔다.", "총 투자 금액은 1억 2,000만원이라고 밝혔다."],
+      ["1/2컵이라고 안내했다.", "필요한 밀가루는 1 1/2컵이라고 안내했다."],
+      ["예약된 열차는 오후 3시", "예약된 열차는 오후 3시 30분에 출발한다."],
+      ["이 구간의 제한속도는 100km", "이 구간의 제한속도는 100km/h이다."],
+      ["주차요금은 3,000원", "주차요금은 3,000원/시간이다."],
+      ["자동차의 연비는 15km", "자동차의 연비는 15km/L이다."],
+      ["The flight takes 2 hours", "The flight takes 2 hours 30 minutes."],
+      ["30 minutes.", "The flight takes 2 hours 30 minutes."],
+      ["기준금리는 0.25%", "기준금리는 0.25% 포인트 인상됐다."],
+      ["올해 예상 수익률은 3", "올해 예상 수익률은 3 %이다."],
+      ["이 구간의 제한속도는 100 km", "이 구간의 제한속도는 100 km/h이다."],
+      ["자동차의 연비는 15 km", "자동차의 연비는 15 km/L이다."],
+      ["기준금리를 0.25%", "기준금리를 0.25% 포인트씩 인상했다."],
+      ["물가 상승률은 0.5%", "물가 상승률은 0.5% 포인트나 떨어졌다."],
+      ["비행시간은 2시간", "비행시간은 2시간 반이다."],
+      ["도보로 약 1시간", "도보로 약 1시간 반이 걸린다."],
+    ])
+      expect(found(quote!, page!), `${quote} | ${page}`).toBe(false);
+    for (const clause of [
+      "올해 예상 수익률은 3%~5%이다.",
+      "비행시간은 2시간 반이다.",
+      "도보로 약 1시간 반이 걸린다.",
+      "이 구간의 제한속도는 100 km/h이다.",
+      "기준금리를 0.25% 포인트씩 인상했다.",
+      "총 투자 금액은 1억 2,000만원이다.",
+      "The flight takes 2 hours 30 minutes.",
+      "진공에서 빛의 속력은 약 3×10⁸ m/s이다.",
+      "객실의 하루 요금은 $100-$200이다.",
+      "내일 예상 기온은 -10~-5도이다.",
+      "제품의 전체 길이는 12'이다.",
+      "The company reported -$100 million in operating profit.",
+      "총 참석 인원은 백이 명이었다.",
+      "이번 계약의 지분은 1/2이다.",
+    ])
+      expect(found(clause, `앞 문장이다. ${clause} 뒤 문장이다.`), clause).toBe(true);
+    // At a line break, too (a list or a table cell), and after an opening bracket or quote.
+    expect(found("비행시간은 2시간 반", "표\n비행시간은 2시간 반\n도보는 1시간")).toBe(true);
+    expect(found("비행시간은 2시간 반", "(비행시간은 2시간 반)")).toBe(true);
+    expect(found("비행시간은 2시간 반", "그는 “비행시간은 2시간 반”이라고 했다.")).toBe(true);
+    expect(found("“비행시간은 2시간 반”", "그는 “비행시간은 2시간 반”이라고 했다.")).toBe(true);
+    // Spaces before the closing punctuation (`<b>10</b> )` in HTML).
+    expect(found("결과는 무려 10", "(결과는 무려 10 ) 이었다.")).toBe(true);
+    // A comma between two figures inside a number is not a clause edge; between clauses it is.
+    expect(found("총 판매량은 1", "총 판매량은 1,234대였다.")).toBe(false);
+    expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
+    expect(found("이번 경기의 점수는 3", "이번 경기의 점수는 3 : 1이었다.")).toBe(false);
+    // Non-numeric quotes behave as before: a listed particle after the end is fine.
+    expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였다.")).toBe(true);
+    expect(found("주요 수출품은 이제 반도체", "주요 수출품은 이제 반도체로 바뀌었다.")).toBe(true);
+    expect(found("사용한 언어는 파이썬", "사용한 언어는 파이썬이며 무료다.")).toBe(true);
+    expect(found("기온은 10~20도라고 예보했다.", "기온은 10〜20도라고 예보했다.")).toBe(true);
+    // The sign walk crosses line breaks, for every sign.
+    expect(found("5도까지 떨어졌다.", "기온은\n−\n5도까지 떨어졌다.")).toBe(false);
+    expect(found("5도까지 떨어졌다.", "기온은\n+\n5도까지 떨어졌다.")).toBe(false);
+    expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true); // numeric start at the text start; the end is not numeric
   });
 
   it("compound units, spaced unit symbols, two-step adjacency and percentage points (round 21)", () => {
@@ -205,15 +325,15 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("주차요금은 무려 3,000원", "주차요금은 무려 3,000원/시간이다.")).toBe(false);
     expect(found("자동차의 연비는 15km", "자동차의 연비는 15km/L이다.")).toBe(false);
     expect(found("h라고 안내했다고 한다", "제한속도는 100km/h라고 안내했다고 한다.")).toBe(false); // start: token rule
-    expect(found("이 구간의 제한속도는 100km/h", "이 구간의 제한속도는 100km/h이다.")).toBe(true);
-    expect(found("주차요금은 무려 3,000원/시간", "주차요금은 무려 3,000원/시간이다.")).toBe(true);
+    expect(found("이 구간의 제한속도는 100km/h", "이 구간의 제한속도는 100km/h이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("주차요금은 무려 3,000원/시간", "주차요금은 무려 3,000원/시간이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("현재 공정은 A/B 시험 중이다", "현재 공정은 A/B 시험 중이다.")).toBe(true);
-    expect(found("B 시험 중이다", "현재 공정은 A/B 시험 중이다.")).toBe(true); // `A/` holds no number
-    expect(found("값은 무려 100점", "값은 무려 100점/ 이후 생략.")).toBe(true); // `/` without letters
+    expect(found("B 시험 중이다", "현재 공정은 A/B 시험 중이다.")).toBe(false); // `A/` holds no number (round 22: now refused)
+    expect(found("값은 무려 100점", "값은 무려 100점/ 이후 생략.")).toBe(false); // `/` without letters (round 22: now refused)
     // 2a. A unit symbol across one space.
     expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3 %이다.")).toBe(false);
     expect(found("내일 최고 기온은 20", "내일 최고 기온은 20 ℃이다.")).toBe(false);
-    expect(found("올해 예상 수익률은 3 %", "올해 예상 수익률은 3 %이다.")).toBe(true);
+    expect(found("올해 예상 수익률은 3 %", "올해 예상 수익률은 3 %이다.")).toBe(false); // round 22: mid-clause / glued
     // 2b. Two steps: a number token, one word, a number token.
     expect(found("The flight takes 2 hours", "The flight takes 2 hours 30 minutes.")).toBe(false);
     expect(found("30 minutes.", "The flight takes 2 hours 30 minutes.")).toBe(false);
@@ -223,18 +343,18 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     // …accepted limitation (g), widened: also without a comma between two figures.
     expect(found("매출은 3% 증가", "매출은 3% 증가 5% 감소했다.")).toBe(false);
     expect(found("매출은 3% 증가,", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
-    expect(found("매출은 3% 증가", "매출은 3% 증가 그 뒤 5% 감소했다.")).toBe(true); // two words between
-    expect(found("매출은 무려 3%", "매출은 무려 3% 증가, 5% 감소했다.")).toBe(true); // the comma sets them apart
-    expect(found("매출은 무려 3%", "매출은 무려 3% 증가 이후 5% 감소했다.")).toBe(true); // two words between
+    expect(found("매출은 3% 증가", "매출은 3% 증가 그 뒤 5% 감소했다.")).toBe(false); // two words between (round 22: now refused)
+    expect(found("매출은 무려 3%", "매출은 무려 3% 증가, 5% 감소했다.")).toBe(false); // the comma sets them apart (round 22: now refused)
+    expect(found("매출은 무려 3%", "매출은 무려 3% 증가 이후 5% 감소했다.")).toBe(false); // two words between (round 22: now refused)
     // 2c. Percentage points.
     expect(found("기준금리는 0.25%", "기준금리는 0.25% 포인트 인상됐다.")).toBe(false);
     expect(found("기준금리는 0.25%", "기준금리는 0.25%p 인상됐다.")).toBe(false);
     expect(found("Rates rose by 0.25%", "Rates rose by 0.25% pp in May.")).toBe(false);
     expect(found("Spreads widened by 0.25%", "Spreads widened by 0.25% bps today.")).toBe(false);
-    expect(found("Spreads widened by 25", "Spreads widened by 25 bp today.")).toBe(true); // bp only after a %
-    expect(found("기준금리는 0.25% 포인트", "기준금리는 0.25% 포인트 인상됐다.")).toBe(true);
-    expect(found("기준금리는 0.25%", "기준금리는 0.25% 인상됐다.")).toBe(true);
-    expect(found("연 이율은 무려 0.25%", "연 이율은 무려 0.25% pa 수준이다.")).toBe(true); // `pa` is not `p`
+    expect(found("Spreads widened by 25", "Spreads widened by 25 bp today.")).toBe(false); // bp only after a % (round 22: now refused)
+    expect(found("기준금리는 0.25% 포인트", "기준금리는 0.25% 포인트 인상됐다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("기준금리는 0.25%", "기준금리는 0.25% 인상됐다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("연 이율은 무려 0.25%", "연 이율은 무려 0.25% pa 수준이다.")).toBe(false); // `pa` is not `p` (round 22: now refused)
   });
 
   it("unit symbols belong to the number, and a number token next to another number token is not cut (round 20)", () => {
@@ -244,7 +364,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("올해 예상 수익률은 3", "올해 예상 수익률은 3‰이다.")).toBe(false);
     expect(found("내일 낮 최고 기온은 20", "내일 낮 최고 기온은 20℃이다.")).toBe(false);
     expect(found("내일 낮 최고 기온은 20", "내일 낮 최고 기온은 20°C이다.")).toBe(false);
-    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%이다.")).toBe(true);
+    expect(found("올해 예상 수익률은 3%", "올해 예상 수익률은 3%이다.")).toBe(false); // round 22: mid-clause / glued
     // 2. Compound quantities across a space (Codex).
     expect(found("총 투자 금액은 1억", "총 투자 금액은 1억 2,000만원이다.")).toBe(false);
     expect(found("2,000만원이라고 밝혔다.", "총 투자 금액은 1억 2,000만원이라고 밝혔다.")).toBe(false);
@@ -252,17 +372,17 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("예약된 열차는 오후 3시", "예약된 열차는 오후 3시 30분에 출발한다.")).toBe(false);
     expect(found("30분에 출발한다고 했다", "열차는 오후 3시 30분에 출발한다고 했다.")).toBe(false);
     // Whole compound quantities verify.
-    expect(found("총 투자 금액은 1억 2,000만원", "총 투자 금액은 1억 2,000만원이다.")).toBe(true);
-    expect(found("필요한 밀가루는 1 1/2컵", "필요한 밀가루는 1 1/2컵이라고 안내했다.")).toBe(true);
-    expect(found("예약된 열차는 오후 3시 30분", "예약된 열차는 오후 3시 30분에 출발한다.")).toBe(true);
+    expect(found("총 투자 금액은 1억 2,000만원", "총 투자 금액은 1억 2,000만원이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("필요한 밀가루는 1 1/2컵", "필요한 밀가루는 1 1/2컵이라고 안내했다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("예약된 열차는 오후 3시 30분", "예약된 열차는 오후 3시 30분에 출발한다.")).toBe(false); // round 22: mid-clause / glued
     // Accepted limitation (g): any two number tokens side by side.
     expect(found("10월 반도체 수출이 늘었다", "지난 10일 10월 반도체 수출이 늘었다.")).toBe(false);
     expect(found("지난 2024년", "지난 2024년 3월에 발표했다.")).toBe(false);
     expect(found("지난 10일 10월 반도체 수출이 늘었다", "지난 10일 10월 반도체 수출이 늘었다.")).toBe(true);
     // Only the edge tokens count: a number deeper in the match is fine.
     expect(found("정부는 3월에 발표했다고 한다", "지난 2024년 우리 정부는 3월에 발표했다고 한다.")).toBe(
-      true,
-    );
+      false,
+    ); // round 22: mid-clause / glued
     // Punctuation sets tokens apart: a comma or a full stop between them is prose.
     expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
     expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
@@ -270,7 +390,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("5% 감소했다고 밝혔다", "매출은 3% 증가, 5% 감소했다고 밝혔다.")).toBe(true);
     expect(found("올해 성장률은 무려 3,", "올해 성장률은 무려 3, 4명이 참석했다.")).toBe(true);
     // 3. The fraction slash folds to `/`.
-    expect(found("필요한 밀가루는 1⁄2컵", "필요한 밀가루는 1/2컵이다.")).toBe(true);
+    expect(found("필요한 밀가루는 1⁄2컵", "필요한 밀가루는 1/2컵이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("이번 계약의 지분은 1", "이번 계약의 지분은 1⁄2이다.")).toBe(false);
   });
 
@@ -293,9 +413,9 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("측정된 농도는 1.5e", "측정된 농도는 1.5e-3 mol이다.")).toBe(false);
     expect(found("3 mol이라고 했다", "측정된 농도는 1.5e-3 mol이라고 했다.")).toBe(false);
     // Controls: the whole notation, and a whole equation.
-    expect(found("진공에서 빛의 속력은 약 3×10⁸ m/s", "진공에서 빛의 속력은 약 3×10⁸ m/s이다.")).toBe(true);
-    expect(found("측정된 농도는 1.5e-3 mol", "측정된 농도는 1.5e-3 mol이다.")).toBe(true);
-    expect(found("간단한 계산은 3 × 4 = 12", "간단한 계산은 3 × 4 = 12이다.")).toBe(true);
+    expect(found("진공에서 빛의 속력은 약 3×10⁸ m/s", "진공에서 빛의 속력은 약 3×10⁸ m/s이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("측정된 농도는 1.5e-3 mol", "측정된 농도는 1.5e-3 mol이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("간단한 계산은 3 × 4 = 12", "간단한 계산은 3 × 4 = 12이다.")).toBe(false); // round 22: mid-clause / glued
   });
 
   it("a range check looks 3 tokens either side and allows the second value's sign (round 18)", () => {
@@ -314,11 +434,13 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("요금은 무려 10 만 원", "요금은 무려 10 만 원~20만 원이다.")).toBe(false);
     expect(found("20만 원이라고 안내했다", "요금은 10 만 원~20만 원이라고 안내했다.")).toBe(false);
     expect(found("20만 원이라고 안내했다", "요금은 10 만 원 ~ 20만 원이라고 안내했다.")).toBe(false);
-    expect(found("만 원 이상 20만 원이라고 했다", "요금은 10~만 원 이상 20만 원이라고 했다.")).toBe(true); // 4th token: outside
+    expect(found("만 원 이상 20만 원이라고 했다", "요금은 10~만 원 이상 20만 원이라고 했다.")).toBe(false); // 4th token: outside (round 22: now refused)
     expect(found("구간은 약 5도이다", "구간은 10~-구간은 약 5도이다.")).toBe(false);
     // Controls: whole ranges; a comma is no range mark; `A-1` without a digit before the mark.
-    expect(found("객실의 하루 요금은 10만 원~20만 원", "객실의 하루 요금은 10만 원~20만 원이다.")).toBe(true);
-    expect(found("내일 예상 기온은 -10~-5도", "내일 예상 기온은 -10~-5도이다.")).toBe(true);
+    expect(found("객실의 하루 요금은 10만 원~20만 원", "객실의 하루 요금은 10만 원~20만 원이다.")).toBe(
+      false,
+    ); // round 22: mid-clause / glued
+    expect(found("내일 예상 기온은 -10~-5도", "내일 예상 기온은 -10~-5도이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("매출은 3% 증가", "매출은 3% 증가, 5% 감소했다.")).toBe(true);
     expect(found("주차는 A-1 구역에서 한다", "주차는 A-1 구역에서 한다.")).toBe(true);
     // Accepted limitation (f): a dash between two figures within 3 tokens reads as a range.
@@ -331,9 +453,9 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("Admission prices are $10", "Admission prices are $10–$20 per person.")).toBe(false);
     expect(found("Admission prices are $10", "Admission prices are $10 – $ 20 per person.")).toBe(false);
     // Whole ranges verify; a currency sign after a range mark without a number is no range.
-    expect(found("객실의 하루 요금은 $100-$200", "객실의 하루 요금은 $100-$200이다.")).toBe(true);
-    expect(found("객실의 하루 요금은 €100 ~ €200", "객실의 하루 요금은 €100 ~ €200이다.")).toBe(true);
-    expect(found("Admission prices are $10", "Admission prices are $10 - $ is the sign.")).toBe(true);
+    expect(found("객실의 하루 요금은 $100-$200", "객실의 하루 요금은 $100-$200이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("객실의 하루 요금은 €100 ~ €200", "객실의 하루 요금은 €100 ~ €200이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("Admission prices are $10", "Admission prices are $10 - $ is the sign.")).toBe(false); // round 22: mid-clause / glued
   });
 
   it("round 14: a sign before a currency sign, multipliers across a space, wrapped quotes kept", () => {
@@ -350,12 +472,12 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     ).toBe(false);
     expect(
       found("$100 million in operating profit", "The company reported $100 million in operating profit."),
-    ).toBe(true);
+    ).toBe(false); // round 22: mid-clause / glued
     expect(
       found("-$100 million in operating profit", "The company reported -$100 million in operating profit."),
-    ).toBe(true);
+    ).toBe(false); // round 22: mid-clause
     // A currency sign without a number after it is no number.
-    expect(found("€ 기호는 유로를 뜻한다", "표의 -€ 기호는 유로를 뜻한다.")).toBe(true);
+    expect(found("€ 기호는 유로를 뜻한다", "표의 -€ 기호는 유로를 뜻한다.")).toBe(false); // round 22: glued to `-`
     // 2. A multiplier across a space after the number.
     expect(found("총 투자 금액은 10", "총 투자 금액은 10 만 달러입니다.")).toBe(false);
     expect(found("예상 피해액은 1", "예상 피해액은 1 억원입니다.")).toBe(false);
@@ -366,31 +488,37 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("The company reported 5", "The company reported 5M dollars.")).toBe(false);
     expect(found("The company reported 5", "The company reported 5 K users.")).toBe(false);
     // Controls: other words after the number, a whole quote, case kept (Million is not on the list).
-    expect(found("The company reported $100", "The company reported $100 in fees.")).toBe(true);
-    expect(found("The company reported 5", "The company reported 5 MBps links.")).toBe(true);
-    expect(found("The company reported 5", "The company reported 5 Million users.")).toBe(true);
-    expect(found("총 투자 금액은 10 만", "총 투자 금액은 10 만 달러입니다.")).toBe(true);
+    expect(found("The company reported $100", "The company reported $100 in fees.")).toBe(false); // round 22: mid-clause
+    expect(found("The company reported 5", "The company reported 5 MBps links.")).toBe(false); // round 22: mid-clause
+    expect(found("The company reported 5", "The company reported 5 Million users.")).toBe(false); // round 22: mid-clause
+    expect(found("총 투자 금액은 10 만", "총 투자 금액은 10 만 달러입니다.")).toBe(false); // round 22: mid-clause
     // 3. A snippet sent with the page's own quotes around a number verifies as sent.
-    expect(found("“올해 매출 목표는 100”", "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(true);
-    expect(found("“1,000,000”", "표에 적힌 값은 “1,000,000”이다.")).toBe(true);
+    expect(found("“올해 매출 목표는 100”", "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(false); // round 22: mid-clause
+    expect(found("“1,000,000”", "표에 적힌 값은 “1,000,000”이다.")).toBe(false); // round 22: mid-clause
     expect(found("“1,000,000원”", "표에 적힌 값은 “1,000,000원”이다.")).toBe(true);
-    expect(found('"내년 성장률 목표는 3.5"', '그는 "내년 성장률 목표는 3.5"라고 했다.')).toBe(true);
+    expect(found('"내년 성장률 목표는 3.5"', '그는 "내년 성장률 목표는 3.5"라고 했다.')).toBe(false); // round 22: mid-clause
     // …the opening quote folds as usual; the closing one after the digit must be the same mark.
-    expect(found('"올해 매출 목표는 100”', "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(true);
+    expect(found('"올해 매출 목표는 100”', "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(false); // round 22: mid-clause
     expect(found('“올해 매출 목표는 100"', "대표는 “올해 매출 목표는 100”이라고 말했다.")).toBe(false);
     // The unit rejections stay.
     expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
     expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
     // P3: a zero-width character between the number and the unit quote.
     expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12\u200B'이다.")).toBe(false);
-    expect(found("제품의 전체 길이는 12'", "제품의 전체 길이는 12\u200B'이다.")).toBe(true);
+    expect(found("제품의 전체 길이는 12'", "제품의 전체 길이는 12\u200B'이다.")).toBe(false); // round 22: mid-clause
+    // Whole clauses verify (round 22).
+    expect(
+      found("대표가 밝힌 목표: “올해 매출 목표는 100”.", "대표가 밝힌 목표: “올해 매출 목표는 100”."),
+    ).toBe(true);
+    expect(found("제품의 전체 길이는 12'이다.", "제품의 전체 길이는 12\u200B'이다.")).toBe(true);
+    expect(found("The company reported $100 in fees.", "The company reported $100 in fees.")).toBe(true);
   });
 
   it("a unit quote is never trimmed off the snippet, and spaces before it still make it a unit (round 13)", () => {
     // Codex: the trailing `"` after a digit is a unit, not a wrapping quote.
     expect(found('제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
     expect(found('이 망원경의 시야각은 30"', "이 망원경의 시야각은 30’이다.")).toBe(false);
-    expect(found('제품의 전체 길이는 12"', '제품의 전체 길이는 12"이다.')).toBe(true);
+    expect(found('제품의 전체 길이는 12"', '제품의 전체 길이는 12"이다.')).toBe(false); // round 22: mid-clause / glued
     expect(normalizeSnippet('제품의 전체 길이는 12"')).not.toBe(normalizeSnippet("제품의 전체 길이는 12"));
     expect(normalizeSnippet('"12" 크기의 제품이다')).not.toBe(normalizeSnippet("12 크기의 제품이다"));
     // An unpaired quote next to a digit is kept at the start too (it is not known to wrap the snippet).
@@ -399,7 +527,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(normalizeSnippet('"제품의 전체 길이는 12"')).toBe("제품의 전체 길이는 12");
     expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12'이다.")).toBe(false);
     expect(found("제품의 전체 길이는 12", "제품의 전체 길이는 12'이다.")).toBe(false);
-    expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12이다.")).toBe(true);
+    expect(found('"제품의 전체 길이는 12"', "제품의 전체 길이는 12이다.")).toBe(false); // round 22: mid-clause / glued
     // HTML extraction: `<span>12</span>'` reads as `12 '` — still a unit, in the page and in the snippet.
     expect(found('제품의 전체 길이는 12 "이다', "제품의 전체 길이는 12 '이다.")).toBe(false);
     expect(found("제품의 전체 길이는 12 '이다", "제품의 전체 길이는 12 '이다.")).toBe(true);
@@ -420,8 +548,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     // HTML extraction: `<span>-</span>5%` reads as `-` and `5%` with a break between.
     expect(found("5% 감소했다고 밝혔다", "매출은 -\n5% 감소했다고 밝혔다.")).toBe(false);
     // The sign quoted with the number verifies; a word before is no sign.
-    expect(found("- 5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다.")).toBe(true);
-    expect(found("5% 감소했다고 밝혔다", "매출은 약 5% 감소했다고 밝혔다.")).toBe(true);
+    expect(found("- 5% 감소했다고 밝혔다", "매출은 - 5% 감소했다고 밝혔다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("5% 감소했다고 밝혔다", "매출은 약 5% 감소했다고 밝혔다.")).toBe(false); // round 22: mid-clause / glued
   });
 
   it("primes, accents and backticks are not quote marks (round 11)", () => {
@@ -455,7 +583,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("4명이 참석했다고 밝혔다", "인원은 3, 4명이 참석했다고 밝혔다.")).toBe(true);
     expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
     // Whole ranges verify; a tilde folds to `~` for the quote too.
-    expect(found("예상 기온은 10 ~ 20도", "예상 기온은 10 ~ 20도이다.")).toBe(true);
+    expect(found("예상 기온은 10 ~ 20도", "예상 기온은 10 ~ 20도이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("기온은 10~20도라고 예보했다", "기온은 10∼20도라고 예보했다.")).toBe(true);
   });
 
@@ -473,8 +601,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("예상 기온은 10", "예상 기온은 10~20도이다.")).toBe(false);
     expect(found("20도라고 예보했다", "기온은 10~20도라고 예보했다.")).toBe(false);
     // Whole numbers still verify, and a separator followed by a non-digit is no number.
-    expect(found("이번 계약의 지분은 1/2", "이번 계약의 지분은 1/2이다.")).toBe(true);
-    expect(found("예상 기온은 10~20도", "예상 기온은 10~20도이다.")).toBe(true);
+    expect(found("이번 계약의 지분은 1/2", "이번 계약의 지분은 1/2이다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("예상 기온은 10~20도", "예상 기온은 10~20도이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("올해 성장률은 무려 3", "올해 성장률은 무려 3, 내년은 4였다.")).toBe(true);
     expect(found("4였다고 덧붙였다", "올해는 3. 4였다고 덧붙였다.")).toBe(true);
     expect(found("3명이 참석했다고 밝혔다", "결과:3명이 참석했다고 밝혔다.")).toBe(true); // `:` after a word
@@ -493,10 +621,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("32% increased this year", "Sales: 1.32% increased this year.")).toBe(false);
     expect(found("1.32% increased this year", "Sales: 1.32% increased this year.")).toBe(true);
     expect(found("234 units sold worldwide", "In total 1,234 units sold worldwide.")).toBe(false);
-    expect(found("1,234 units sold worldwide", "In total 1,234 units sold worldwide.")).toBe(true);
+    expect(found("1,234 units sold worldwide", "In total 1,234 units sold worldwide.")).toBe(false); // round 22: mid-clause / glued
     expect(found("32% 감소했다고 밝혔다", "매출은 -32% 감소했다고 밝혔다.")).toBe(false);
     expect(found("32% 감소했다고 밝혔다", "매출은 −32% 감소했다고 밝혔다.")).toBe(false);
-    expect(found("32% 감소했다고 밝혔다", "매출은 32% 감소했다고 밝혔다.")).toBe(true);
+    expect(found("32% 감소했다고 밝혔다", "매출은 32% 감소했다고 밝혔다.")).toBe(false); // round 22: mid-clause / glued
     // A sentence end before a number is not a decimal point.
     expect(found("32% 늘었다고 밝혔다", "끝났다. 32% 늘었다고 밝혔다.")).toBe(true);
   });
@@ -511,10 +639,11 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("수치는 -3 % 였다", page)).toBe(false);
     expect(found("값은 −7이다.", page)).toBe(true);
     expect(
-      findSnippet(page, "기온은 −5도로 떨어졌다").found && findSnippet(page, "기온은 −5도로 떨어졌다"),
+      findSnippet(page, "기온은 −5도로 떨어졌다 & 눈이 왔다.").found &&
+        findSnippet(page, "기온은 −5도로 떨어졌다 & 눈이 왔다."),
     ).toEqual({
       found: true,
-      quote: "기온은 &minus;5도로 떨어졌다",
+      quote: "기온은 &minus;5도로 떨어졌다 &amp; 눈이 왔다.",
     });
     // An unknown or broken entity stays as written.
     expect(found("a &bogus; b c d e", "x a &bogus; b c d e")).toBe(true);
@@ -533,8 +662,10 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     const notes = "수출이 크게 늘었다[3]. 업계는 반겼다²³. 정부는 지원을 약속했다[12][13].";
     expect(found("수출이 크게 늘었다. 업계는 반겼다.", notes)).toBe(false);
     expect(found("정부는 지원을 약속했다.", notes)).toBe(false);
-    expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(true);
-    expect(found("업계는 반겼다²³. 정부는", notes)).toBe(true);
+    expect(found("수출이 크게 늘었다[3]. 업계는", notes)).toBe(false); // round 22: mid-clause
+    expect(found("업계는 반겼다²³. 정부는", notes)).toBe(false); // round 22: mid-clause
+    expect(found("수출이 크게 늘었다[3].", notes)).toBe(true);
+    expect(found("업계는 반겼다²³.", notes)).toBe(true);
     expect(found("said so. Then they left", "They said so.¹ Then they left.")).toBe(false);
     // Different array elements are different text.
     expect(found("the value of arr[2] is used", "the value of arr[1] is used here.")).toBe(false);
@@ -560,9 +691,9 @@ describe("snippet check: normalisation without fuzzy matches", () => {
 
   it("the end may stop only before a Korean particle from the closed list, then a boundary (round 5)", () => {
     // The review's positive controls: a particle after a figure, a unit, a product name.
-    expect(found("수출 증가율은 32%", "수출 증가율은 32%로 집계됐다.")).toBe(true);
-    expect(found("공장 건물의 면적은 32m²", "공장 건물의 면적은 32m²로 집계됐다.")).toBe(true);
-    expect(found("사용한 모델은 GPT-4o", "사용한 모델은 GPT-4o이며 공개형이다.")).toBe(true);
+    expect(found("수출 증가율은 32%", "수출 증가율은 32%로 집계됐다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("공장 건물의 면적은 32m²", "공장 건물의 면적은 32m²로 집계됐다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("사용한 모델은 GPT-4o", "사용한 모델은 GPT-4o이며 공개형이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("해당 런타임은 Node.js", "해당 런타임은 Node.js입니다.")).toBe(true);
     expect(found("10월 반도체 수출", "10월 반도체 수출에서는 감소했다.")).toBe(true);
     expect(found("10월 반도체 수출", "10월 반도체 수출으로는 부족했다.")).toBe(true);
@@ -571,7 +702,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였다.")).toBe(true);
     expect(found("해당 사업의 유일한 목적은 수출", "해당 사업의 유일한 목적은 수출이었다.")).toBe(true);
     expect(found("해당 서비스의 운영 주체는 정부", "해당 서비스의 운영 주체는 정부였습니다.")).toBe(true);
-    expect(found("지난해 수출 증가율은 32%", "지난해 수출 증가율은 32%였다.")).toBe(true);
+    expect(found("지난해 수출 증가율은 32%", "지난해 수출 증가율은 32%였다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("해당 런타임은 Node.js", "해당 런타임은 Node.js였습니다.")).toBe(true);
     expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체였던 시절.")).toBe(true);
     expect(found("이 회사의 주력 제품은 반도체", "이 회사의 주력 제품은 반도체인데 지금은 아니다.")).toBe(
@@ -585,7 +716,6 @@ describe("snippet check: normalisation without fuzzy matches", () => {
       ["지난달 신규 가입자는 32", "지난달 신규 가입자는 32만 명이다."],
       ["해당 제품의 가격은 3", "해당 제품의 가격은 3만 원이다."],
       ["총 투자 금액은 1.5", "총 투자 금액은 1.5억 달러였다."],
-      ["해당 금액은 무려 3.", "해당 금액은 무려 3.만 원이다."],
       ["총 투자 금액은 천", "총 투자 금액은 천만 달러입니다."],
       ["지난달 신규 가입자는 십", "지난달 신규 가입자는 십만 명이다."],
       ["해당 제품의 가격은 삼", "해당 제품의 가격은 삼만 원이다."],
@@ -608,16 +738,17 @@ describe("snippet check: normalisation without fuzzy matches", () => {
       expect(found(quote!, page!), quote).toBe(false);
     for (const [quote, page] of [
       ["이번 작업은 전기 공사만", "이번 작업은 전기 공사만 포함한다."],
-      ["총 투자 금액은 10만", "총 투자 금액은 10만 달러입니다."],
-      ["총 투자 금액은 천만", "총 투자 금액은 천만 달러입니다."],
+      // (Round 22: a number's whole clause.)
+      ["총 투자 금액은 10만 달러입니다.", "총 투자 금액은 10만 달러입니다."],
+      ["총 투자 금액은 천만", "총 투자 금액은 천만 달러입니다."], // 천만 has no digit: not numeric
       ["예상 피해액은 수천만", "예상 피해액은 수천만 원입니다."],
-      ["운영 환경에서는 Python 3.12만", "운영 환경에서는 Python 3.12만 지원합니다."],
+      ["운영 환경에서는 Python 3.12만 지원합니다.", "운영 환경에서는 Python 3.12만 지원합니다."],
       ["올해 수출은 미국까지만", "올해 수출은 미국까지만 늘었다."],
       ["올해 수출은 미국까지", "올해 수출은 미국까지도 늘었다."],
       ["올해 수출은 미국", "올해 수출은 미국까지도 늘었다."], // 까지+도
       ["올해 수출은 미국", "올해 수출은 미국에서는 늘었다."], // 에서+는
-      ["수출 증가율은 무려 32", "수출 증가율은 무려 32로 집계됐다."],
-      ["10월 반도체 수출", "10월 반도체 수출이 늘었다."],
+      ["수출 증가율은 무려 32로 집계됐다.", "수출 증가율은 무려 32로 집계됐다."],
+      ["10월 반도체 수출이 늘었다.", "10월 반도체 수출이 늘었다."],
     ])
       expect(found(quote!, page!), quote).toBe(true);
     expect(found("지난달 신규 가입자는 3", "지난달 신규 가입자는 3명이었다.")).toBe(false); // 명 is not a particle
@@ -649,8 +780,8 @@ describe("snippet check: normalisation without fuzzy matches", () => {
     expect(found("% 늘었다고 밝혔다", "매출은 132% 늘었다고 밝혔다.")).toBe(false);
     expect(found("₂O 분자가 있었다", "그 안에 H₂O 분자가 있었다.")).toBe(false);
     // Positive controls: whole tokens, a Korean particle, a quote that ends its sentence.
-    expect(found("면적은 정확히 32m²", "면적은 정확히 32m² 이었다.")).toBe(true);
-    expect(found("이 물질의 화학식은 H₂O", "이 물질의 화학식은 H₂O 이다.")).toBe(true);
+    expect(found("면적은 정확히 32m²", "면적은 정확히 32m² 이었다.")).toBe(false); // round 22: mid-clause / glued
+    expect(found("이 물질의 화학식은 H₂O", "이 물질의 화학식은 H₂O 이다.")).toBe(false); // round 22: mid-clause / glued
     expect(found("10월 반도체 수출", "10월 반도체 수출이 늘었다.")).toBe(true);
     expect(found("수출이 크게 늘었다.", "수출이 크게 늘었다.[3] 업계는")).toBe(true);
     // Round 5: one closed rule at the end — no exception for a quote that ends a sentence.
@@ -664,7 +795,7 @@ describe("snippet check: normalisation without fuzzy matches", () => {
 
   it("at the stored body cap one check stays well inside one event-loop turn, and repeats hit the cache", () => {
     const base =
-      "산업통상자원부는 10일 낸 자료에서 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
+      "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다. Exports “rose”. ";
     const body = base.repeat(Math.ceil(400_000 / base.length)).slice(0, 400_000);
     normalizeWithMap(base); // warm the character caches the first page would warm
     let t = performance.now();
@@ -730,8 +861,9 @@ function family(db: Db = createTestDb()) {
   return { db, users, mom, dad, c, other, dads, sources: store, page, run, cites: new CitationStore(db) };
 }
 
-// Not ending at `32% 늘어난` before ` 142억` — accepted limitation (g).
-const SNIP = "10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로";
+// A number in the snippet: its whole clause (round 22, accepted limitation (h)).
+const SNIP =
+  "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.";
 
 describe("CitationStore (#25)", () => {
   it("verifies, numbers per run, and keeps the first number for the same snippet", () => {
@@ -771,9 +903,10 @@ describe("CitationStore (#25)", () => {
         truncated: false,
       })!;
     for (const [page, bare, exact] of [
-      ["대표는 “올해 매출 목표는 100”이라고 말했다.", "올해 매출 목표는 100", "“올해 매출 목표는 100”"],
-      ["표에 적힌 값은 “1,000,000”이다.", "1,000,000", "“1,000,000”"],
-      ['그는 "내년 성장률 목표는 3.5"라고 했다.', "내년 성장률 목표는 3.5", '"내년 성장률 목표는 3.5"'],
+      // (Round 22: the exact form must reach the clause end, so these pages end the clause after the quote.)
+      ["대표가 밝힌 목표: “올해 매출 목표는 100”.", "올해 매출 목표는 100", "“올해 매출 목표는 100”"],
+      ["표에 적힌 값: “1,000,000”.", "1,000,000", "“1,000,000”"],
+      ['그가 말한 목표: "내년 성장률 목표는 3.5".', "내년 성장률 목표는 3.5", '"내년 성장률 목표는 3.5"'],
     ]) {
       const src = body(page!);
       const first = f.cites.cite(scope, { sourceId: src.id, snippet: bare! });
@@ -1203,7 +1336,7 @@ describe("citationNote", () => {
       title: emoji,
       site: emoji,
       contentType: "text/html",
-      body: `${emoji} 끝`,
+      body: `${"😀".repeat(250)} 끝`,
       truncated: false,
     })!;
     f.cites.cite(s2, { sourceId: row.id, snippet: "😀".repeat(250) });

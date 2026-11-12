@@ -9,7 +9,8 @@ import { csrf, MOM, SON, useAccount } from "./helpers.js";
  */
 
 const PAGE_A = "https://fixture.agentlee.test/news/chips-a.html";
-const SNIPPET = "10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다";
+const SNIPPET =
+  "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.";
 const OK = "원문 구절 확인";
 
 async function ask(page: Page, text: string) {

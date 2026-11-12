@@ -144,7 +144,7 @@ function expectScenario(name: CitationScenarioName | "reuse-fresh", r: Result, l
         label,
       ).toEqual(["가나다 신문", "라마바 통계", "라마바 통계"]);
       expect(r.note!.citations[0]!.quote, label).toBe(
-        "10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다",
+        "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.",
       );
       // The heading is not checked; every paragraph has its marker.
       expect(r.note!.missing, label).toEqual([]);
@@ -242,11 +242,11 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     // The owner has the finance tools too (finance@2): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@2"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@3"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
-      "common@2",
+      "common@3",
       "research@2",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
@@ -254,7 +254,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(prompt).toContain("`cite`로 검증한 표시");
     expect(prompt).toContain("`sources_list`");
     await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: false });
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@2"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@3"]);
     expect(rt.systemPrompts.at(-1)).not.toContain("# 자료 조사 모드");
   });
 

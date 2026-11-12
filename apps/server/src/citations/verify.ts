@@ -36,14 +36,6 @@ const QUOTE_CHAR =
   /^["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]$/u;
 /** Currency signs that may stand right before a number (fullwidth `＄` folds to `$`). */
 const CURRENCY = /^[$€¥£₩₹\uFFE5\uFFE1\uFFE6]$/u;
-/**
- * An English multiplier after a number (closed list, case kept): a magnitude word, or `K` `M` `B` `bn` `mn` as a
- * whole token. Korean units: see `KOREAN_MULTIPLIER_AFTER`.
- */
-const MULTIPLIER_AFTER =
-  /^(?: ?(?:thousand|million|billion|trillion)(?![\p{L}\p{N}\p{M}])| ?(?:K|M|B|bn|mn)(?![\p{L}\p{N}\p{M}]))/u;
-const UNIT_QUOTE_AFTER =
-  /^ ?["'\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u300C\u300D\u300E\u300F\u301D\u301E\u301F\uFF02\uFF07]/u;
 const DASHES = /[\u2010\u2011\u2012\u2013\u2014\u2015]/gu;
 /** Tilde-like range marks (`∼` U+223C, `〜` U+301C) are `~` (fullwidth `～` folds with the fullwidth ASCII). */
 const TILDES = /[\u223C\u301C]/gu;
@@ -57,11 +49,6 @@ const DIGIT = /\p{N}/u;
  * superscript and subscript digits (`²`, `₂`, \p{No} ⊂ \p{N}) and subscript letters (\p{Lm}).
  */
 const TOKEN = /[\p{L}\p{N}\p{M}]/u;
-/**
- * Unit and currency symbols: next to a number they are token characters at a match edge (`3` is not in `3%`,
- * `3‰`, `20°`, `20℃`, `12′`; `100` is not after `$`; review #97 round 20).
- */
-const UNIT_SYMBOL = /[%\u2030\u2031\u00B0\u2103\u2109\u2032\u2033$€¥£₩₹\uFFE5\uFFE1\uFFE6]/u;
 /**
  * Korean particles and copula endings a quote may stop right before (review #97 round 5) — a closed list: the
  * source must continue with one of these and then a token boundary (not a letter, digit or mark, or the end of
@@ -149,47 +136,7 @@ const PARTICLE_THEN_BOUNDARY = new RegExp(
   "u",
 );
 const PARTICLE_LOOKAHEAD = 7;
-/**
- * After a number, across an optional space, a word that starts with a Korean numeral unit is taken as a multiplier
- * (`10만`, `10 만`, `1 억원대`, `10 만원대로`, `1 만여 명`). Ordinary words that start with one (`조식`, `경로`)
- * are refused too — accepted limitation (e): quoting through that word verifies (review #97 round 16).
- */
-const KOREAN_MULTIPLIER_AFTER = /^ ?[십백천만억조경]/u;
-/**
- * Separators inside a number: decimal and thousands (`.` `,`, adjacent only — `3, 4명` is prose), fraction, ratio
- * and range (`/` `:` `-` `−` `~`, also with spaces around them). After the dash and tilde folds, `–` is `-` and
- * `∼` `〜` `～` are `~`; the minus sign `−` is kept as itself and listed here.
- */
-// A repeated currency sign after a range mark is part of the range (`$100-$200`, `€100 ~ €200`, `$10–$20`).
-const DECIMAL_AFTER = /^[.,]\p{N}/u;
-// Also multiplication and powers in scientific notation: `×` `*` `^` `·` (`3×10⁸`, `3*10^8`, `10^9`; round 19).
-const RANGE_AFTER = /^ ?[/:\-\u2212~\u00D7*^\u00B7] ?[+\-\u2212]?(?:[$€¥£₩₹\uFFE5\uFFE1\uFFE6] ?)?\p{N}/u;
-/**
- * The neighbouring source token across a space holds a digit — a compound quantity (`1억 2,000만원`, `1 1/2컵`,
- * `오후 3시 30분`). A token ending with punctuation (`3,` `3.`) is set apart by it: `3, 4명` and `3. 4였다고` are
- * prose. Accepted limitation (g): `2024년` before ` 3월` is refused too (review #97 round 20).
- */
-const NUMBER_TOKEN_AFTER = /^ [^ ]*\p{N}/u;
-/**
- * Two steps: one token without a digit (and not ending with punctuation), then one with a digit (`2 hours` before
- * ` 30 minutes`; review #97 round 21). Also accepted limitation (g): `3% 증가 5% 감소` without a comma.
- */
-const NUMBER_TOKEN_AFTER_2 = /^ [^ \p{N}]*[^ \p{N},.;:!?] [^ ]*\p{N}/u;
-/** The same two steps with the word inside the match: `2 hours` before ` 30`, `hours 30…` after `2 `. */
-const NUMBER_THEN_WORD_END = /(?:^|[ ])(?:[^ ]*\p{N}[^ ]*[^ ,.;:!?]|\p{N}) [^ \p{N}]*[^ \p{N},.;:!?]$/u;
-const WORD_THEN_NUMBER_START = /^[^ \p{N}]*[^ \p{N},.;:!?] [^ ]*\p{N}/u;
-const NUMBER_TOKEN_BEFORE_2 = /(?:^|[ ])(?:[^ ]*\p{N}[^ ]*[^ ,.;:!?]|\p{N}) [^ \p{N}]*[^ \p{N},.;:!?] $/u;
-/** A unit symbol across one space after a number (`3 %`, `20 ℃`). */
-const UNIT_SYMBOL_SPACED = /^ [%\u2030\u2031\u00B0\u2103\u2109\u2032\u2033]/u;
-/** `/` and letters right after a number token: a compound unit (`km/h`, `원/시간`, `km/L`). */
-const COMPOUND_UNIT_AFTER = /^\/\p{L}/u;
-const COMPOUND_UNIT_BEFORE = /(?:^|[ ])[^ ]*\p{N}[^ ]*\/$/u;
-/** Percentage points (closed list, case kept) after a percentage. */
-const POINTS_AFTER = /^ ?(?:포인트|%p|pp|bps|bp|p)(?![\p{L}\p{N}\p{M}])/u;
-const NUMBER_TOKEN_BEFORE = /(?:^|[ ])[^ ]*\p{N}[^ ]*[^ ,.;:!?] $|(?:^|[ ])\p{N} $/u;
-const RANGE_MARK = /^[/:~\u00D7*^\u00B7]$/u;
-const DECIMAL_MARK = /^[.,]$/u;
-/** A sign (`-` `−` `+`; after a digit it is a range mark, which counts the same). */
+/** A sign (`-` `−` `+`): a match starting with one is numeric. */
 const SIGN = /^[+\-\u2212]$/u;
 const KOREAN_UNIT = /^[십백천만억조]$/u;
 const KOREAN_DIGIT = /^[일이삼사오육칠팔구]$/u;
@@ -456,109 +403,107 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
   return { found: false, reason: "not_found" };
 }
 
-/**
- * Whether the number a match starts with goes on before it. Walked back over spaces and currency signs from the
- * match start (`-$100`, `-$ 100`, `- $100`, `-€5`):
- * - a sign there (only when the match starts with a number), or — right at the start — a decimal or thousands mark
- *   after a digit (`1.32`, `1,234`; `3, 4명` is prose);
- * - a range or fraction mark (`~` `/` `:`; `-` `−` `+` count as signs and marks alike), after
- *   a digit within 3 tokens (`3%~5%`, `10만 원~20만 원`, `$10 million ~ $20 million`, `-10~-5`, `1/2`) —
- *   whenever the match's first 3 tokens have a digit (review #97 rounds 17–18).
- */
-/** Tokens a range check looks at on each side (`10만 원`, `$10 million`, review #97 round 18). */
-const RANGE_WINDOW = 3;
 const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
 const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
-function numberGoesOnBefore(
-  norm: string,
-  at: number,
-  numberStart: boolean,
-  firstTokensHaveDigit: boolean,
-): boolean {
-  let j = at;
-  while (j > 0 && (norm[j - 1] === " " || CURRENCY.test(norm[j - 1]!))) j--;
-  const c = norm[j - 1] ?? "";
-  if (numberStart && SIGN.test(c)) return true;
-  // The second value's own sign (`~-5`, `~+5%`) needs no step of its own: a sign counts as a mark, and the 3 tokens
-  // before it then still hold the first value.
-  if (firstTokensHaveDigit && (RANGE_MARK.test(c) || SIGN.test(c))) {
-    let k = j - 1;
-    while (k > 0 && norm[k - 1] === " ") k--;
-    if (DIGIT.test(lastTokens(norm.slice(Math.max(0, k - 200), k), RANGE_WINDOW))) return true;
-  }
-  return numberStart && j === at && DECIMAL_MARK.test(c) && DIGIT.test(norm[j - 2] ?? "");
-}
-
 /** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
 function matchIn(body: string, { norm, from, to }: Normalized, want: string): string | undefined {
-  const first = firstChar(want);
-  const second = firstChar(want.slice(first.length));
   const last = lastChar(want);
-  // A number starts the match — a digit, or a currency sign right before one (`$100`, `₩5000`).
-  const firstTokensHaveDigit = DIGIT.test(firstTokens(want, RANGE_WINDOW));
-  const lastTokensHaveDigit = DIGIT.test(lastTokens(want, RANGE_WINDOW));
-  // The edge tokens themselves (a token that ends with punctuation — `3,` `3.` — is set apart by it).
-  const firstTokenHasDigit = DIGIT.test(want.split(" ")[0] ?? "");
-  const lastTokenHasDigit = /\p{N}[^ ,.;:!?]*$/u.test(want) && !/[,.;:!?]$/u.test(want);
-  const numberStart =
-    DIGIT.test(first) ||
-    (CURRENCY.test(first) && DIGIT.test(second === " " ? firstChar(want.slice(first.length + 1)) : second));
+  // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
+  // (A sign or currency sign first is covered: the number after it is in the first two tokens.)
+  const numericStart = DIGIT.test(firstTokens(want, NUMERIC_EDGE_TOKENS));
+  const numericEnd = DIGIT.test(lastTokens(want, NUMERIC_EDGE_TOKENS));
   for (let at = norm.indexOf(want); at !== -1; at = norm.indexOf(want, at + 1)) {
     const before = charBefore(norm, at);
-    // Not inside a token at the start (unit and currency symbols count when the match starts with a number).
-    if (TOKEN.test(before) || (numberStart && UNIT_SYMBOL.test(before))) continue;
-    // Not next to another number token across a space (`2,000만원…` after `1억 `, `1/2컵…` after `1 `).
-    const behind = norm.slice(Math.max(0, at - 60), at);
-    // Not the letters of a compound unit (`h…` right after `100km/`).
-    if (/\p{L}/u.test(first) && COMPOUND_UNIT_BEFORE.test(behind)) continue;
-    if (
-      (firstTokenHasDigit && (NUMBER_TOKEN_BEFORE.test(behind) || NUMBER_TOKEN_BEFORE_2.test(behind))) ||
-      (WORD_THEN_NUMBER_START.test(want) && NUMBER_TOKEN_BEFORE.test(behind))
-    )
-      continue;
-    // Number continuation at the start: not after `digit SEP` (`1.32%`, `1,234`, `1/100`, `3:1`, `10-20`, `10~20`;
-    // range and fraction marks also with spaces: `10 ~ 20`, `1 / 2`) or a sign (`-32%`, `−32%`, `- 5%`, `-$100`).
-    if (
-      (numberStart || firstTokensHaveDigit) &&
-      numberGoesOnBefore(norm, at, numberStart, firstTokensHaveDigit)
-    )
-      continue;
-    const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
-    const after = firstChar(rest);
-    // Number continuation at the end: not before `SEP digit` (`1` in `1/2`, `3` in `3.5`, `10` in `10~20`), and a
-    // Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number). The
-    // mirror at the start (`이` right after `백`) is already refused by the start token rule.
-    if (DIGIT.test(last) && DECIMAL_AFTER.test(rest)) continue;
-    // A range after the match's last token with a digit (`3%`, `10만원`, `10°C` in `3%~5%`, `10만원~20만원`).
-    if (lastTokensHaveDigit && RANGE_AFTER.test(rest)) continue;
-    // Not before a unit quote either (`12` is not in `12'`, `12 '`): after a digit the page's quote marks are kept
-    // as they are, so any quote mark there is a unit.
-    if (DIGIT.test(last) && UNIT_QUOTE_AFTER.test(rest)) continue;
-    // Not before a multiplier across a space (`10 만`, `1 억` from `<b>10</b>만`; `100 million`, `5 bn`).
-    const next = norm.slice(at + want.length, at + want.length + 16);
-    if (DIGIT.test(last) && (MULTIPLIER_AFTER.test(next) || KOREAN_MULTIPLIER_AFTER.test(next))) continue;
-    if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
-    // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
-    // list that itself ends at a token boundary (`32%로`, `GPT-4o이며`, `수출이`).
-    if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
-    // A unit or currency symbol right after a number is more of it (`3` in `3%`, `3%~5%`).
-    if (DIGIT.test(last) && (UNIT_SYMBOL.test(after) || UNIT_SYMBOL_SPACED.test(rest))) continue;
-    // A compound unit with `/` (`100km` in `100km/h`, `3,000원` in `3,000원/시간`; at the start see
-    // COMPOUND_UNIT_BEFORE — `/h…` right after `100km` is refused by the start token rule already).
-    if (lastTokenHasDigit && COMPOUND_UNIT_AFTER.test(rest)) continue;
-    // Percentage points after a percentage (`0.25%` before ` 포인트`, ` %p`, ` bp`).
-    if (last === "%" && POINTS_AFTER.test(rest)) continue;
-    // Not next to another number token across a space (`1억` before ` 2,000만원`, `오후 3시` before ` 30분`).
-    const ahead = norm.slice(at + want.length, at + want.length + 60);
-    if (
-      (lastTokenHasDigit && (NUMBER_TOKEN_AFTER.test(ahead) || NUMBER_TOKEN_AFTER_2.test(ahead))) ||
-      (NUMBER_THEN_WORD_END.test(want) && NUMBER_TOKEN_AFTER.test(ahead))
-    )
-      continue;
+    // At a token boundary at the start: after a space, punctuation or nothing — not inside a word or glued to a
+    // symbol (`h…` after `100km/`, `5도` after `10~`).
+    if (before !== "" && before !== " " && !BOUNDARY_PUNCT.test(before)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
+    // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
+    // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
+    if (numericStart && (!startsClause(body, start) || signBefore(body, start))) continue;
+    if (numericEnd && !endsClause(body, end, want)) continue;
+    const rest = norm.slice(at + want.length, at + want.length + PARTICLE_LOOKAHEAD);
+    const after = firstChar(rest);
+    // At a token boundary at the end too: a space, punctuation, nothing — or (below) a listed particle.
+    if (after !== "" && after !== " " && !BOUNDARY_PUNCT.test(after) && !TOKEN.test(after)) continue;
+    if (!numericEnd) {
+      // A Korean numeral unit not before a numeral digit (`백` in `백이 명`, `십` in `십이 도` — 백이 is one number).
+      if (KOREAN_UNIT.test(last) && KOREAN_DIGIT.test(after)) continue;
+      // Not inside a token at the end — unless the source goes on with a Korean particle or copula from the closed
+      // list that itself ends at a token boundary (`수출이`, `반도체였다`).
+      if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
+    }
     return boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet);
   }
   return undefined;
+}
+
+/** Tokens at each edge of a match that make it numeric. */
+const NUMERIC_EDGE_TOKENS = 2;
+/** Punctuation that ends a clause: sentence and clause marks, closing brackets and quotes, the ellipsis. */
+const CLAUSE_END = /^[.,!?;:)\]}」』”’"'…。、！？]$/u;
+/** Punctuation a clause starts after: sentence and clause marks, opening brackets and quotes. */
+const CLAUSE_START = /^[.,!?;:([{「『“‘"'…。、！？]$/u;
+/** Whitespace in the page that is not a line break (a line break is a clause edge). */
+const INLINE_SPACE = /^[ \t\u00A0\u2000-\u200A\u202F\u205F\u3000\u200B-\u200D\u2060\uFEFF\u00AD]$/u;
+
+/** Any punctuation a token may meet without being cut: clause punctuation, brackets and quotes. */
+const BOUNDARY_PUNCT = /^[.,!?;:()[\]{}「」『』“”‘’"'…。、！？]$/u;
+
+/**
+ * Punctuation between two digits is part of the number (`3.5`, `1,234`, `3:1`), never a clause edge; a ratio's
+ * `:` also with spaces (`3 : 1`). `.` and `,` count only when adjacent (`3, 4명` is prose).
+ */
+function insideNumber(text: string, i: number): boolean {
+  if (DIGIT.test(text[i - 1] ?? "") && DIGIT.test(text[i + 1] ?? "")) return true;
+  if (text[i] !== ":") return false;
+  let a = i - 1;
+  while (a >= 0 && INLINE_SPACE.test(text[a]!)) a--;
+  let b = i + 1;
+  while (b < text.length && INLINE_SPACE.test(text[b]!)) b++;
+  return DIGIT.test(text[a] ?? "") && DIGIT.test(text[b] ?? "");
+}
+
+/** A sign right before the start, across any spaces, line breaks and currency signs (`-$100`, `- 5%`, `-\n$5`). */
+function signBefore(body: string, start: number): boolean {
+  let k = start - 1;
+  while (k >= 0 && (SPACE.test(body[k]!) || INLINE_SPACE.test(body[k]!) || CURRENCY.test(body[k]!))) k--;
+  return k >= 0 && SIGN.test(body[k]!);
+}
+
+/**
+ * Whether the match `[…, end)` of `body` ends a clause: it ends with clause punctuation itself, or the page goes on
+ * (across inline spaces) with clause punctuation, a line break, or nothing. A quote mark right after a digit is a
+ * unit (`12'`), and punctuation between digits is part of the number — neither ends a clause.
+ */
+function endsClause(body: string, end: number, want: string): boolean {
+  const own = end - 1;
+  const ownChar = body[own] ?? "";
+  if (
+    CLAUSE_END.test(ownChar) &&
+    !insideNumber(body, own) &&
+    !(QUOTE_CHAR.test(ownChar) && DIGIT.test(lastChar(want.slice(0, -1))))
+  )
+    return true;
+  let k = end;
+  while (k < body.length && INLINE_SPACE.test(body[k]!)) k++;
+  if (k >= body.length || body[k] === "\n" || body[k] === "\r") return true;
+  const c = body[k]!;
+  if (!CLAUSE_END.test(c) || insideNumber(body, k)) return false;
+  // A quote mark right after the number is its unit, not a closing quote.
+  return !(QUOTE_CHAR.test(c) && DIGIT.test(lastChar(want)));
+}
+
+/**
+ * Whether the match `[start, …)` of `body` starts a clause: the page has (across inline spaces) clause punctuation,
+ * an opening bracket or quote, a line break, or nothing before it. Punctuation between digits is part of a number.
+ * (A wrapped snippet that starts with its own quote mark is also tried without it, so the page's quote counts.)
+ */
+function startsClause(body: string, start: number): boolean {
+  let k = start - 1;
+  while (k >= 0 && INLINE_SPACE.test(body[k]!)) k--;
+  if (k < 0 || body[k] === "\n" || body[k] === "\r") return true;
+  return CLAUSE_START.test(body[k]!) && !insideNumber(body, k);
 }
