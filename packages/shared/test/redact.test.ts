@@ -10,6 +10,10 @@ import {
   redactString,
 } from "../src/redact.js";
 
+// The linearity checks are the ratios; the absolute cap guards the production Mac (1.5 s for 1 MB).
+// Shared CI runners are several times slower, so there the cap only catches gross regressions.
+const ABS_MS = process.env.CI ? 6000 : 1500;
+
 describe("redactSecrets", () => {
   it("hides secret fields at any depth, by exact name or a known secret suffix", () => {
     expect(
@@ -1039,7 +1043,7 @@ describe("redactSecrets", () => {
     const small = time(make(MB / 8));
     const large = time(make(MB));
     expect(large / Math.max(small, 10), `${Math.round(small)} ms → ${Math.round(large)} ms`).toBeLessThan(20);
-    expect(large).toBeLessThan(1500);
+    expect(large).toBeLessThan(ABS_MS);
   }, 60_000);
 
   it("an N-escape name of exactly the window length is read; one character more is fail-closed (round 19)", () => {
@@ -1331,7 +1335,7 @@ describe("redactSecrets", () => {
       // Linear: 8× the input takes about 8× the time; quadratic would be 64× (a review measured 15.3× for 4×).
       // The wide gap keeps this stable on a loaded machine. Small times are noisy: 10 ms floor.
       expect(full / Math.max(eighth, 10), what).toBeLessThan(20);
-      expect(full, what).toBeLessThan(1500); // ~20–500 ms here; the old quadratic patterns took minutes
+      expect(full, what).toBeLessThan(ABS_MS); // ~20–500 ms here; the old quadratic patterns took minutes
     }
   }, 240_000); // many 1 MB inputs, best of three, on a loaded machine: a time budget, not the check itself
 
@@ -1372,7 +1376,7 @@ describe("redactSecrets", () => {
         const what = `${JSON.stringify(unit)} at ${levels} levels: ${Math.round(small)} ms → ${Math.round(large)} ms`;
         // 8× the input: linear ≈ 8×, quadratic ≈ 64×.
         expect(large / Math.max(small, 10), what).toBeLessThan(20);
-        expect(large, what).toBeLessThan(1500);
+        expect(large, what).toBeLessThan(ABS_MS);
       }
   }, 120_000);
 });
