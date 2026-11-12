@@ -525,6 +525,8 @@ describe("per-user skills (FR-1.6, #21)", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "sources_list",
+      "cite",
       "artifact_create",
       "artifact_update",
       "skill_selftest",

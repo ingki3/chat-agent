@@ -4,6 +4,8 @@ import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   publicParts,
   redactSecrets,
+  type CitationNotePart,
+  type FinanceNotePart,
   StreamEvent,
   type MessagePart,
   type Run,
@@ -41,6 +43,8 @@ import { OUR_TOOL_PREFIX } from "./lockdown.js";
 import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
 import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/checker.js";
 import { FinanceResultStore } from "../finance/results.js";
+import { citationNote } from "../citations/checker.js";
+import { CitationStore } from "../citations/store.js";
 
 export type RunRow = typeof runs.$inferSelect;
 
@@ -290,6 +294,8 @@ export class RunManager {
   private readonly templates: Templates;
   /** Finance results per conversation (#30): follow-ups anywhere later are checked against them. */
   private readonly financeResults: FinanceResultStore;
+  /** Citations the `cite` tool registered (#25): the citation note at the end of a run is built from them. */
+  private readonly citations: CitationStore;
 
   constructor(
     private readonly db: Db,
@@ -310,6 +316,7 @@ export class RunManager {
       )
       .all() as { id: string; k: string }[])
       db.$client.prepare("update runs set idempotency_key = ? where id = ?").run(idempotencyHash(r.k), r.id);
+    this.citations = new CitationStore(db);
     if (opts.mcp) trustOurTools(opts.mcp.toolNames());
     // Deleting a conversation (its runs cascade) stops what is running there first.
     conversations.onDelete((conversationId) => {
@@ -356,7 +363,8 @@ export class RunManager {
       .where(inArray(runs.status, ["queued", "running"]))
       .all();
     for (const r of stale) {
-      // The partial answer kept from before the restart gets the common finance check too (#30).
+      // The partial answer kept from before the restart gets the common finance check (#30) and the citation
+      // check (#25) too.
       const msg = this.conversations.messageById(r.assistantMessageId);
       if (msg) {
         // Scrubbed again: a secret registered since it was stored (updateMessage scrubs too).
@@ -666,31 +674,45 @@ export class RunManager {
   }
 
   /**
-   * The common finance output check (#30): an answer that used a finance tool — or one stating figures while
-   * finance results are in the recent conversation — gets the server's note (sources, as-of times, what the answer
-   * left out, disclaimer), however the run ended, also when it is recovered after a restart. Appends to `parts`
-   * and streams it. A broken check never breaks the reply.
+   * The server's notes at the end of an answer, however the run ended (also when it is recovered after a
+   * restart): appended to `parts` and streamed before `done`. A broken check never breaks the reply.
+   * - The common finance output check (#30): an answer that used a finance tool — or one stating figures while
+   *   finance results are in the recent conversation — gets the finance note (sources, as-of times, what the
+   *   answer left out, disclaimer).
+   * - The citation check (#25): an answer that used web tools or cited sources gets the citation note (each
+   *   `[n]` with its server-checked status, paragraphs without a citation).
    */
   private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
-    if (parts.some((p) => p.type === "finance_note")) return;
-    // This answer's finance results stay for the rest of the conversation's checks.
-    try {
-      const ev = storedEvidence(parts);
-      if (ev)
-        this.financeResults.save(
-          { messageId: row.assistantMessageId, conversationId: row.conversationId, runId: row.id },
-          ev,
-        );
-    } catch {
-      // a storage failure never breaks the reply; the note below is still attached
+    if (!parts.some((p) => p.type === "finance_note")) {
+      // This answer's finance results stay for the rest of the conversation's checks.
+      try {
+        const ev = storedEvidence(parts);
+        if (ev)
+          this.financeResults.save(
+            { messageId: row.assistantMessageId, conversationId: row.conversationId, runId: row.id },
+            ev,
+          );
+      } catch {
+        // a storage failure never breaks the reply; the note below is still attached
+      }
+      try {
+        const note = financeNote(parts, context);
+        if (note) this.pushNote(row, parts, note);
+      } catch {
+        // no note rather than no reply
+      }
     }
-    let note;
-    try {
-      note = financeNote(parts, context);
-    } catch {
-      return;
+    if (!parts.some((p) => p.type === "citation_note")) {
+      try {
+        const note = citationNote(row.id, parts, this.citations);
+        if (note) this.pushNote(row, parts, note);
+      } catch {
+        // no note rather than no reply
+      }
     }
-    if (!note) return;
+  }
+
+  private pushNote(row: RunRow, parts: MessagePart[], note: FinanceNotePart | CitationNotePart): void {
     parts.push(note);
     const partIndex = parts.filter((p) => p.type !== "reasoning").length - 1;
     this.emit(row.id, { type: "part_update", messageId: row.assistantMessageId, partIndex, part: note });

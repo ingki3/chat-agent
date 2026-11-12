@@ -249,6 +249,9 @@ export const conversations = {
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { title })),
   pin: async (id: string, pinned: boolean) =>
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { pinned })),
+  /** 자료 조사 모드 (FR-5.5, #25): the next reply of this conversation gets the research instructions. */
+  research: async (id: string, researchMode: boolean) =>
+    Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { researchMode })),
   remove: async (id: string) => call("DELETE", `/api/conversations/${enc(id)}`),
   /** A page of messages, oldest → newest; `before` asks for the page older than that seq. */
   messages: async (id: string, before?: number) => {

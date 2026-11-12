@@ -1,4 +1,5 @@
 import { Component, lazy, Suspense, type ReactNode } from "react";
+import type { MarkdownCite } from "./Markdown.js";
 
 /**
  * Markdown text with the renderer (KaTeX, highlighter) loaded as a separate chunk: the app shell stays small,
@@ -16,7 +17,7 @@ function retry() {
 
 const Plain = ({ text }: { text: string }) => <div className="md plain">{text}</div>;
 
-class Boundary extends Component<{ text: string }, { failed: boolean }> {
+class Boundary extends Component<{ text: string; cite?: MarkdownCite | undefined }, { failed: boolean }> {
   override state = { failed: false };
   static getDerivedStateFromError() {
     return { failed: true };
@@ -45,12 +46,13 @@ class Boundary extends Component<{ text: string }, { failed: boolean }> {
     const Md = Markdown;
     return (
       <Suspense fallback={<Plain text={text} />}>
-        <Md text={text} />
+        <Md text={text} {...(this.props.cite ? { cite: this.props.cite } : {})} />
       </Suspense>
     );
   }
 }
 
-export function RichText({ text }: { text: string }) {
-  return <Boundary text={text} />;
+/** `cite`: the citation markers of a finished answer (#25), drawn as citation buttons. */
+export function RichText({ text, cite }: { text: string; cite?: MarkdownCite | undefined }) {
+  return <Boundary text={text} cite={cite} />;
 }

@@ -17,11 +17,12 @@ import {
   type BundledSkill,
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
-import { WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
 import { FINANCE_TOOLS, type FinanceToolInfo } from "@agentlee/mcp-tools/finance";
 import { FinanceService, type FinanceOptions } from "../finance/service.js";
 import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
-import { artifactPath, type ArtifactKind } from "@agentlee/shared";
+import { artifactPath, frameExternal, type ArtifactKind } from "@agentlee/shared";
+import { CiteRefused, type CitationStore } from "../citations/store.js";
 import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
 import type { ServerToolInfo } from "@agentlee/mcp-tools";
 import type { UserStore } from "../auth/users.js";
@@ -274,6 +275,20 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
   return false;
 }
 
+/** Sources `sources_list` returns at most (the newest). */
+const SOURCES_LIST_MAX = 100;
+
+/** What the model is told per citation status (fixed words). */
+const CITE_HINT: Record<string, string> = {
+  verified: "The passage is in the stored page. Put the marker at the end of the sentence it supports.",
+  snippet_not_found:
+    "The passage is not in the stored page text. Copy a passage exactly from the page and cite again; otherwise the user sees this citation with a warning.",
+  fetch_failed:
+    "This source has no stored page text (a search result or an unreadable page). Read the page with web_fetch and cite that sourceId; otherwise the user sees this citation with a warning.",
+  unknown_source:
+    "Not a source of this conversation. Use a sourceId from web_fetch or sources_list; otherwise the user sees this citation with a warning.",
+};
+
 /** At most this many skill processes at once — in total and per run. Beyond that a call is refused at once. */
 export type SkillConcurrency = { total: number; perRun: number };
 export const DEFAULT_SKILL_CONCURRENCY: SkillConcurrency = { total: 4, perRun: 2 };
@@ -310,6 +325,8 @@ export type McpServiceOptions = {
 
 export type WebOptions = {
   sources: SourceStore;
+  /** Citations (#25): with it, `cite` is offered (checked against `sources`). */
+  citations?: CitationStore;
   /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default duckduckgo, then google-news. */
   providers?: readonly SearchProviderName[];
   /** Tests: the worker (in-process), the page proxy, and ready-made providers instead of `providers`. */
@@ -376,7 +393,14 @@ export class McpService {
       });
     this.web = opts.web ? this.buildWeb(opts.web) : undefined;
     this.tools = [
-      ...(this.web ? [...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []), WEB_FETCH_TOOL] : []),
+      ...(this.web
+        ? [
+            ...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []),
+            WEB_FETCH_TOOL,
+            SOURCES_LIST_TOOL,
+            ...(opts.web?.citations ? [CITE_TOOL] : []),
+          ]
+        : []),
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
     ];
     this.finance = opts.finance
@@ -587,6 +611,21 @@ export class McpService {
             });
           return r;
         }
+        if (name === CITE_TOOL.name || name === SOURCES_LIST_TOOL.name) {
+          const r = this.callCitationTool(toolByName.get(name), input, scope);
+          const status = r.ok ? (r.output as { status?: unknown }).status : undefined;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "citation.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // The fixed outcome only: never the source id, the snippet or the page text.
+            ...(r.ok ? (typeof status === "string" ? { citeCode: status } : {}) : { citeCode: r.code }),
+          });
+          return r;
+        }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {
           const r = this.callArtifactTool(toolByName.get(name), input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "artifact.finished", {
@@ -657,6 +696,65 @@ export class McpService {
       };
     } catch (e) {
       if (e instanceof ArtifactError) return { ok: false, code: e.code };
+      throw e;
+    }
+  }
+
+  /**
+   * `cite` and `sources_list` (#25): active user, strict input, then the stores — which read and write only the
+   * token's own conversation, after checking that the token's user owns it. Page titles reach the model inside an
+   * `<external_content>` block (they are page text).
+   */
+  private callCitationTool(
+    tool: ServerToolInfo | undefined,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): SkillResult {
+    const web = this.opts.web;
+    if (!tool || !web || !this.users.byId(scope.userId)?.active)
+      return { ok: false, code: "cite_not_allowed" };
+    const parsed = z.strictObject(tool.input).safeParse(input);
+    if (!parsed.success) return { ok: false, code: "cite_bad_input" };
+    if (tool.name === SOURCES_LIST_TOOL.name) {
+      const rows = web.sources.listFor(scope);
+      if (!rows) return { ok: false, code: "cite_not_allowed" };
+      const items = rows.slice(-SOURCES_LIST_MAX);
+      return {
+        ok: true,
+        output: {
+          items: items.map((r, i) => ({
+            n: i + 1,
+            sourceId: r.id,
+            kind: r.kind,
+            site: r.site,
+            publishedAt: r.publishedAt ?? null,
+            url: r.finalUrl ?? r.url,
+            hasText: r.kind === "page" && !!r.body,
+          })),
+          content: frameExternal({
+            source: "sources",
+            content: items.map((r, i) => `[${i + 1}] ${r.title}`).join("\n") || "(no sources)",
+          }),
+        },
+      };
+    }
+    if (!web.citations) return { ok: false, code: "cite_not_allowed" };
+    const data = parsed.data as { sourceId: string; snippet: string };
+    try {
+      const r = web.citations.cite(scope, data);
+      const src = r.sourceId ? web.sources.get(scope.conversationId, r.sourceId) : undefined;
+      return {
+        ok: true,
+        output: {
+          ...r,
+          ...(src
+            ? { site: src.site, url: src.finalUrl ?? src.url, publishedAt: src.publishedAt ?? null }
+            : {}),
+          hint: CITE_HINT[r.status],
+        },
+      };
+    } catch (e) {
+      if (e instanceof CiteRefused) return { ok: false, code: e.code };
       throw e;
     }
   }

@@ -1902,13 +1902,15 @@ describe("restore checks every secret and upgrades an older schema (#37 review P
 
   it("a backup of an older schema is restored and upgraded to this code's schema", async () => {
     const root = tmp();
-    // A database made by an older build: only the first migrations (before 0015's initial_defaults).
+    // A database made by an older build: only the migrations before 0015's initial_defaults (later ones, such as
+    // 0016 citations, are left out too — an older build had none of them).
     const code = codeMigrations();
     const older = path.join(root, "older-migrations");
     fs.cpSync(MIGRATIONS_DIR, older, { recursive: true });
     const journalFile = path.join(older, "meta", "_journal.json");
     const journal = JSON.parse(fs.readFileSync(journalFile, "utf8")) as { entries: { tag: string }[] };
-    journal.entries = journal.entries.filter((e) => !e.tag.startsWith("0015_"));
+    journal.entries = journal.entries.filter((e) => Number(e.tag.slice(0, 4)) < 15);
+    const left = code.length - journal.entries.length;
     fs.writeFileSync(journalFile, JSON.stringify(journal));
     const dataDir = path.join(root, "data");
     fs.mkdirSync(dataDir, { mode: 0o700 });
@@ -1930,10 +1932,10 @@ describe("restore checks every secret and upgrades an older schema (#37 review P
       now: Date.now,
     });
     db.$client.close();
-    expect(made.migrations).toBe(code.length - 1);
+    expect(made.migrations).toBe(code.length - left);
     const target = path.join(root, "restored");
     const r = restoreBackup({ backup: path.join(backupDir, made.id), target, key });
-    expect(r.pending).toBe(1);
+    expect(r.pending).toBe(left);
     const restored = new Database(path.join(target, DB_FILE), { readonly: true });
     try {
       expect(appliedMigrations(restored).map((m) => m.hash)).toEqual(code.map((m) => m.hash));

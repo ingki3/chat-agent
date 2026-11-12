@@ -2,6 +2,7 @@ import { z } from "zod";
 import { RunChoice } from "./connections.js";
 import { RuntimeId } from "./runtime.js";
 import { FINANCE_NOTE_MAX_SOURCES, FinanceMissing, FinanceSource } from "./finance.js";
+import { CitationNotePart } from "./citations.js";
 
 /**
  * Runtime-neutral message and stream formats (#11, PRD D8). Both runtime adapters (#15, #16) translate their
@@ -79,6 +80,7 @@ export const MessagePart = z.discriminatedUnion("type", [
   TablePart,
   DividerPart,
   FinanceNotePart,
+  CitationNotePart,
   ReasoningPart,
 ]);
 export type MessagePart = z.infer<typeof MessagePart>;

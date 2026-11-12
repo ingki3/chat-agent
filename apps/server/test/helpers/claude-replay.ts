@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Options, Query, SDKMessage, SDKUserMessage, query } from "@anthropic-ai/claude-agent-sdk";
-import { callOurTool, isLiveCall } from "./live-mcp.js";
+import { callOurTool, isLiveCall, liveArgs } from "./live-mcp.js";
 
 /**
  * Recorded Claude Agent SDK conversations, replayed in CI instead of the real CLI (#15: "CI는 녹화 이벤트
@@ -101,9 +101,10 @@ async function* liveToolCall(
   options: Options,
   id: string,
   tool: string,
-  args: unknown,
+  rawArgs: unknown,
 ): AsyncGenerator<SDKMessage> {
   const name = `mcp__agentlee__${tool}`;
+  const args = liveArgs(rawArgs);
   yield sdk.toolUse(id, name, args);
   const hook = (
     options.hooks?.PreToolUse?.[0]?.hooks?.[0] as
@@ -126,7 +127,13 @@ async function* liveToolCall(
   const server = options.mcpServers?.agentlee as
     { url: string; headers: { Authorization: string } } | undefined;
   if (!server) throw new Error("replay: no agentlee MCP server configured");
-  const r = await callOurTool(server.url, server.headers.Authorization.slice("Bearer ".length), tool, args);
+  const r = await callOurTool(
+    server.url,
+    server.headers.Authorization.slice("Bearer ".length),
+    tool,
+    args,
+    id,
+  );
   yield {
     type: "user",
     message: {

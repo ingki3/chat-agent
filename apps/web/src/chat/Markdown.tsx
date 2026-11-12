@@ -1,4 +1,4 @@
-import { memo, type ComponentProps, type ReactNode } from "react";
+import { memo, useMemo, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { splitBlocks } from "./blocks.js";
 import { CopyButton } from "./CopyButton.js";
+import { rehypeCitationMarkers } from "../citations/markdown.js";
 import "katex/dist/katex.min.css";
 
 /**
@@ -102,13 +103,42 @@ const rehypePlugins: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
   [rehypeHighlight, { detect: false }],
 ];
 
+/**
+ * Citation markers of a finished answer (#25): which `[n]` are citations, and how one is drawn. Without it the
+ * text renders exactly as before.
+ */
+export type MarkdownCite = { numbers: ReadonlySet<number>; render: (n: number) => ReactNode };
+
 /** One block; memoised on its text, so finished blocks are not parsed again while the reply streams. */
-export const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
+export const MarkdownBlock = memo(function MarkdownBlock({
+  text,
+  cite,
+}: {
+  text: string;
+  cite?: MarkdownCite;
+}) {
+  const withCite = useMemo(
+    () =>
+      cite
+        ? {
+            rehype: [...(rehypePlugins ?? []), rehypeCitationMarkers(cite.numbers)],
+            components: {
+              ...components,
+              sup: ({ node, children }: { node?: unknown; children?: ReactNode }) => {
+                const n = (node as { properties?: { dataCiteN?: unknown } } | undefined)?.properties
+                  ?.dataCiteN;
+                return typeof n === "string" ? cite.render(Number(n)) : <sup>{children}</sup>;
+              },
+            } as Components,
+          }
+        : undefined,
+    [cite],
+  );
   return (
     <ReactMarkdown
       remarkPlugins={remarkPlugins}
-      rehypePlugins={rehypePlugins}
-      components={components}
+      rehypePlugins={withCite?.rehype ?? rehypePlugins}
+      components={withCite?.components ?? components}
       urlTransform={safeUrl}
       skipHtml={false}
     >
@@ -117,11 +147,11 @@ export const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: strin
   );
 });
 
-const Markdown = memo(function Markdown({ text }: { text: string }) {
+const Markdown = memo(function Markdown({ text, cite }: { text: string; cite?: MarkdownCite }) {
   return (
     <div className="md">
       {splitBlocks(text).map((b, i) => (
-        <MarkdownBlock key={i} text={b} />
+        <MarkdownBlock key={i} text={b} {...(cite ? { cite } : {})} />
       ))}
     </div>
   );

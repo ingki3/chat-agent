@@ -81,6 +81,7 @@ describe("database", () => {
     expect(tables).toEqual([
       "artifact_versions",
       "artifacts",
+      "citations",
       "connections",
       "conversations",
       "error_log",

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
+import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -33,13 +34,20 @@ import {
  *   /md               markdown sample: GFM table, code blocks, KaTeX math, links (#14)
  *   /xss              hostile markup that must never run (#14)
  *   /secrettool       a tool call whose input and output carry secret-looking fields (#14)
+ *   /cite <scenario>   real calls of our web and citation tools on the fixture pages (`fake-citations.ts`:
+ *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
+ *                     manager's citation check then adds its note (#25)
+ *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
  */
 export type FakeStep =
   | { text: string }
   | { reasoning: string }
   | { delayMs: number }
   | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
-  /** A real call of one of our MCP server's tools with this run's token (StartContext.mcp). */
+  /**
+   * A real call of one of our MCP server's tools with this run's token (StartContext.mcp). Input strings
+   * `"$<i>.<path>"` are values of the i-th call's output of this turn (fake-citations.ts `resolveRefs`).
+   */
   | { call: string; input: Record<string, unknown> }
   | { usage: UsageReport }
   | { notice: string }
@@ -223,9 +231,27 @@ export const FAKE_XSS = [
   '<iframe src="javascript:window.__xss=1"></iframe> 끝',
 ];
 
+/** `/cite <scenario>` and `/cite-id <sourceId> <snippet>` (see the header comment), or undefined. */
+function citationSteps(t: string): FakeStep[] | undefined {
+  const named = /^\/cite\s+(\w+)$/.exec(t);
+  if (named && Object.hasOwn(CITATION_SCENARIOS, named[1]!)) {
+    const sc = CITATION_SCENARIOS[named[1] as CitationScenarioName];
+    return [...sc.calls.map((c) => ({ call: c.tool, input: c.input })), { text: sc.answer }];
+  }
+  const byId = /^\/cite-id\s+(\S+)\s+([\s\S]+)$/.exec(t);
+  if (byId)
+    return [
+      { call: "cite", input: { sourceId: byId[1]!, snippet: byId[2]! } },
+      { text: "그 자료에 따르면 그렇다고 해요[1]." },
+    ];
+  return undefined;
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
+  const cite = citationSteps(t);
+  if (cite) return cite;
   const fin = /^\/finance(\s+cited)?$/.exec(t);
   if (fin) return financeSteps(!!fin[1]);
   const artifact = artifactSteps(t);
@@ -377,6 +403,7 @@ export class FakeRuntime implements RuntimeAdapter {
         const steps = script({ ...input, model: input.model || state.model }, state.memory);
         async function* events(): AsyncGenerator<RuntimeEvent> {
           let seq = 0;
+          const outputs: unknown[] = [];
           for (const step of steps) {
             if (ctrl.signal.aborted) return;
             if ("text" in step) {
@@ -396,8 +423,10 @@ export class FakeRuntime implements RuntimeAdapter {
               };
             } else if ("call" in step) {
               const callId = `call-${++seq}`;
-              yield { type: "tool_start", callId, name: `${OUR_TOOL_PREFIX}${step.call}`, input: step.input };
-              const r = await callOurTool(state.mcp, step.call, step.input);
+              const input = resolveRefs(step.input, (i) => outputs[Number(i)]) as Record<string, unknown>;
+              yield { type: "tool_start", callId, name: `${OUR_TOOL_PREFIX}${step.call}`, input };
+              const r = await callOurTool(state.mcp, step.call, input);
+              outputs.push(r.output);
               if (ctrl.signal.aborted) return;
               yield { type: "tool_end", callId, output: r.output, ...(r.isError ? { isError: true } : {}) };
             } else if ("usage" in step) yield { type: "usage", ...step.usage };

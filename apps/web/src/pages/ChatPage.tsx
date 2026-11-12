@@ -9,6 +9,7 @@ import { useStickToBottom } from "../chat/scroll.js";
 import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
+import { ResearchToggle } from "../citations/ResearchToggle.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
@@ -143,7 +144,10 @@ export function ChatPage() {
   if (conv.isError) return <Missing error={conv.error} />;
   return (
     <>
-      <TopBar title={conv.data?.title ?? "…"}>{conv.data && <ConvMenu c={conv.data} />}</TopBar>
+      <TopBar title={conv.data?.title ?? "…"}>
+        {conv.data && <ResearchToggle c={conv.data} />}
+        {conv.data && <ConvMenu c={conv.data} />}
+      </TopBar>
       <div className="thread" data-testid="thread" ref={scroller}>
         <div className="col" ref={content}>
           {messages.hasNextPage && (

@@ -177,4 +177,16 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "finance_results.conversation_id": ID,
   "finance_results.run_id": ID,
   "finance_results.evidence": { write: "FinanceResultStore.save", rescrub: "deep" },
+  // Citations (#25): the snippet is model output about page text, the quote is page text.
+  "citations.id": ID,
+  "citations.run_id": ID,
+  "citations.conversation_id": ID,
+  "citations.user_id": ID,
+  "citations.source_id": ID,
+  "citations.status": ENUM,
+  "citations.snippet": { write: "CitationStore.cite", rescrub: "text" },
+  "citations.snippet_key": {
+    exempt: "a hash of the normalised snippet, no plaintext; recomputed with it on rescrub",
+  },
+  "citations.quote": { write: "CitationStore.cite", rescrub: "text" },
 };
