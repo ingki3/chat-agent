@@ -201,4 +201,18 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "a hash of the normalised snippet, no plaintext; recomputed with it on rescrub",
   },
   "citations.quote": { write: "CitationStore.cite", rescrub: "text" },
+  // Uploads (#22): the user's file name is scrubbed on write and rescrubbed. The file bytes are on disk, not in a
+  // column, and are stored as they came (the user's own document — docs/ops.md §24).
+  "files.id": ID,
+  "files.user_id": ID,
+  "files.conversation_id": ID,
+  "files.message_id": ID,
+  "files.upload_id": { exempt: "the client's upload id, a UUID checked on upload (UPLOAD_ID_HEADER)" },
+  "files.name": { write: "FileStore.add (cleanName)", rescrub: "text" },
+  "files.kind": ENUM,
+  "files.media_type": { exempt: "the media type of the detected kind (FILE_KINDS, server-chosen)" },
+  "files.sha256": HASH,
+  // Cancelled uploads not yet arrived (review #102 7차): ids only.
+  "upload_cancellations.user_id": ID,
+  "upload_cancellations.upload_id": { exempt: "the client's upload id, a UUID checked on cancel" },
 };

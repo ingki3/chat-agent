@@ -86,6 +86,7 @@ describe("database", () => {
       "connections",
       "conversations",
       "error_log",
+      "files",
       "finance_results",
       "messages",
       "notification_prefs",
@@ -100,6 +101,7 @@ describe("database", () => {
       "sessions",
       "settings",
       "sources",
+      "upload_cancellations",
       "usage_records",
       "users",
     ]);

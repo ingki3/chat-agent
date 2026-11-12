@@ -24,6 +24,7 @@ import {
   isImportCode,
   isWebCode,
   isArtifactCode,
+  isFileCode,
   isExportCode,
   isExportFormat,
   isLoginCode,
@@ -107,6 +108,11 @@ export const LOG_EVENTS = [
   // Backups (#37): trigger (`scheduled`/`manual`), fixed outcome code, duration, file count — never a path or content.
   "backup.finished",
   "backup.pruned",
+  // Uploads (#22): fixed outcome code, duration and IDs — never the file name, its size class or its content.
+  "file.uploaded",
+  "file.swept",
+  // The start-up clean-up did not run: the database is not this data folder's own file (a link elsewhere).
+  "file.sweep_skipped",
   // A restore interrupted mid-swap, finished at server start (#37): `completed` or `rolled_back`.
   "restore.recovered",
   // Known secrets (review round 26): a background rescrub pass failed; it is retried (fixed code, no content).
@@ -212,6 +218,8 @@ const FIELDS = new Map<string, Check>([
   ["attempt", isInt],
   ["purpose", isUsagePurpose],
   /** Backups (#37): what started it and one of the fixed `backup_*` codes. */
+  /** Uploads (#22): one of the fixed `file_*` codes — never the file's name or content. */
+  ["fileCode", isFileCode],
   ["backupTrigger", isBackupTrigger],
   ["backupCode", isBackupCode],
   ["restoreCode", isRestoreRecovery],
@@ -475,6 +483,7 @@ export type LogFields = {
   loginCode?: string;
   attempt?: number;
   purpose?: string;
+  fileCode?: string;
   backupTrigger?: string;
   backupCode?: string;
   restoreCode?: string;

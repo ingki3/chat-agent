@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import type { FastifyInstance } from "fastify";
 import { CSRF_HEADER } from "@agentlee/shared";
 import { hashPassword } from "../../src/auth/passwords.js";
@@ -118,7 +119,36 @@ function artifact(f: Family) {
   return { id: a.id, params: { version: "1" } };
 }
 
+/** An uploaded (unsent) text file in a conversation of `owner` (#22), stored the way an upload stores it. */
+async function uploaded(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  const tmp = f.app.files!.tempFile();
+  fs.writeFileSync(tmp, "matrix file");
+  const row = await f.app.files!.add({
+    userId: f.users.owner.id,
+    conversationId: c.id,
+    uploadId: crypto.randomUUID(),
+    name: "메모.txt",
+    kind: "txt",
+    bytes: 11,
+    sha256: crypto.createHash("sha256").update("matrix file").digest("hex"),
+    tmp,
+  });
+  return row.id;
+}
+
 export const APP_MATRIX: MatrixRow[] = [
+  // Uploads (#22): the uploader only. The matrix sends a JSON body, so the owner's upload reaches the handler and
+  // is refused there (400: not `application/octet-stream`); real uploads are in files.test.ts.
+  {
+    route: "POST /api/conversations/:id/files",
+    expect: { ...OWNER_ONLY, owner: 400 },
+    fixture: conversation,
+  },
+  { route: "GET /api/conversations/:id/files", expect: OWNER_ONLY, fixture: conversation },
+  { route: "GET /api/files/:id", expect: NOT_SHARED(READ), fixture: uploaded },
+  { route: "GET /api/files/:id/content", expect: NOT_SHARED(READ), fixture: uploaded },
+  { route: "DELETE /api/files/:id", expect: OWNER_ONLY, fixture: uploaded },
   // Artifacts (#27): owner only until sharing (#29); the page and the originals check the same way.
   { route: "GET /api/conversations/:id/artifacts", expect: OWNER_ONLY, fixture: conversation },
   { route: "GET /api/artifacts/:id", expect: NOT_SHARED(READ), fixture: artifact },

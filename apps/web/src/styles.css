@@ -518,6 +518,54 @@ h2 {
   align-items: center;
   gap: 8px;
 }
+/* Attachments (#22): chips above the input, a dashed outline while files are dragged over. */
+.composer .box.dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+.attachments {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip.attach {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+.chip.attach .attach-name {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip.attach.failed {
+  background: var(--error-weak);
+  border-color: var(--error);
+}
+.chip.attach .attach-error {
+  flex-basis: 100%;
+  color: var(--error);
+}
+.chip.attach button {
+  padding: 0 4px;
+  min-height: 0;
+}
+.msg.user .files {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+a.chip.fileref {
+  color: inherit;
+  text-decoration: none;
+}
+a.chip.fileref:hover {
+  border-color: var(--accent);
+}
 
 /* ---- auth screens (centered card) ---- */
 .shell {

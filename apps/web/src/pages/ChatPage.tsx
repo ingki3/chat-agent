@@ -5,6 +5,8 @@ import {
   useEffectEvent,
   useRef,
   useState,
+  type ClipboardEvent,
+  type DragEvent,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
@@ -17,11 +19,20 @@ import {
   type Conversation,
   type Message,
   type StartRunResponse,
+  type UploadedFile,
 } from "@agentlee/shared";
-import { conversations, errorText, runs, settings as settingsApi } from "../api.js";
+import {
+  ApiError,
+  conversations,
+  errorText,
+  files as filesApi,
+  runs,
+  settings as settingsApi,
+} from "../api.js";
+import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
-import { DividerView, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
+import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
 import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
@@ -52,6 +63,7 @@ const COMPOSER_INPUT = "composer-input";
 /** What the chip may offer (#19): allowed runtimes with a passed connection. */
 const USABLE_KEY = ["runtimes", "usable"] as const;
 const useUsableRuntimes = () => useQuery({ queryKey: USABLE_KEY, queryFn: settingsApi.usableRuntimes });
+const NO_FILES: readonly UploadedFile[] = [];
 const time = new Intl.DateTimeFormat("ko-KR", { hour: "numeric", minute: "2-digit" });
 const dotClass = (r: string | null) => (r === "codex" ? "codex" : r === "claude-code" ? "claude" : "none");
 
@@ -145,7 +157,13 @@ export function ChatPage() {
     },
     [id, qc, toBottom],
   );
-  const send = (text: string) => start(() => conversations.send(id, text));
+  const send = (text: string, fileIds: string[]) =>
+    start(() => conversations.send(id, text, {}, fileIds)).then(() =>
+      qc.invalidateQueries({ queryKey: ["files", id] }),
+    );
+  // How many files the conversation already has (the 20-per-conversation limit counts sent ones too).
+  const fileList = useQuery({ queryKey: ["files", id], queryFn: () => filesApi.list(id) });
+  const conversationId = useCallback(async () => id, [id]);
   // Stable callbacks: messages are memoised and must not re-render on every streamed frame.
   const edit = useCallback(
     (messageId: string, text: string) => start(() => conversations.edit(id, messageId, text)),
@@ -253,6 +271,7 @@ export function ChatPage() {
         </div>
       )}
       <Composer
+        key={id}
         busy={busy}
         onSend={send}
         onStop={lost ? undefined : stop}
@@ -265,6 +284,8 @@ export function ChatPage() {
             pending={differs(chatSettings, lastAssistant)}
           />
         }
+        conversation={conversationId}
+        existingFiles={fileList.data ?? NO_FILES}
       />
     </>
   );
@@ -291,25 +312,49 @@ export function NewChatPage() {
   const start = chosen ?? defaults.data?.start ?? null;
   // Every chip change is previewed by the server; a send waits for the latest result (review #101 4차).
   const [choice] = useState(() => new ChipChoice<ChatSettings>(settingsApi.preview));
-  const send = async (text: string) => {
+  const asRequest = (c: ChatSettings | null): ChangeSettingsRequest | undefined =>
+    c
+      ? {
+          runtime: c.runtime,
+          model: c.model,
+          ...(c.effort ? { effort: c.effort } : {}),
+          useShared: c.useShared,
+        }
+      : undefined;
+  /**
+   * Made on the first file (uploads need a conversation) or on send, whichever comes first — once, with the chip's
+   * choice at that moment. A failed create is not kept: the next file or send tries again (review #102 4차).
+   */
+  const created = useRef<Promise<{ id: string; with: ChatSettings | null }> | null>(null);
+  const make = useCallback(() => {
+    if (!created.current) {
+      const p = (async () => {
+        const settled = await choice.settled();
+        const c: Conversation = await conversations.create(asRequest(settled));
+        qc.setQueryData(["conversation", c.id], c);
+        return { id: c.id, with: settled };
+      })();
+      p.catch(() => {
+        if (created.current === p) created.current = null;
+      });
+      created.current = p;
+    }
+    return created.current;
+  }, [choice, qc]);
+  const conversation = useCallback(async () => (await make()).id, [make]);
+  const send = async (text: string, fileIds: string[]) => {
     // Waits for a preview still on its way; a failed one stops the send (its error shows under the composer).
     const chosen = await choice.settled();
-    const c: Conversation = await conversations.create(
-      chosen
-        ? {
-            runtime: chosen.runtime,
-            model: chosen.model,
-            ...(chosen.effort ? { effort: chosen.effort } : {}),
-            useShared: chosen.useShared,
-          }
-        : undefined,
-    );
-    qc.setQueryData(["conversation", c.id], c);
-    const r = await conversations.send(c.id, text);
+    const made = await make();
+    const id = made.id;
+    // The conversation was made by a file before the chip changed: the send uses the chip as it is now.
+    const change = made.with !== chosen ? asRequest(chosen) : undefined;
+    if (change) qc.setQueryData(["conversation", id], await conversations.changeSettings(id, change));
+    const r = await conversations.send(id, text, {}, fileIds);
     markStartedHere(r.run.id);
-    qc.setQueryData(["active-run", c.id], r.run);
+    qc.setQueryData(["active-run", id], r.run);
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
-    navigate(`/c/${c.id}`);
+    navigate(`/c/${id}`);
   };
   // The server computes the choice (the same rules as the conversation is created with, limits included).
   const change = async (c: ChangeSettingsRequest) => {
@@ -340,6 +385,8 @@ export function NewChatPage() {
         onSend={send}
         autoFocus
         chip={<RuntimeChip settings={start} options={usable.data} onChange={change} />}
+        conversation={conversation}
+        existingFiles={NO_FILES}
       />
     </>
   );
@@ -437,9 +484,17 @@ const UserMessage = memo(function UserMessage({
         </div>
       </div>
     );
+  const fileRefs = m.parts.flatMap((p) => (p.type === "file_ref" ? [p] : []));
   return (
     <div className="msg user" data-testid="user-message">
       <div className="bubble">{text}</div>
+      {fileRefs.length > 0 && (
+        <div className="files row">
+          {fileRefs.map((p) => (
+            <FileRef key={p.fileId} part={p} />
+          ))}
+        </div>
+      )}
       <div className="meta">
         <span>{time.format(m.createdAt)}</span>
         {canEdit && (
@@ -560,25 +615,36 @@ const AssistantMessage = memo(function AssistantMessage({
 
 function Composer(props: {
   busy: boolean;
-  onSend: (text: string) => Promise<void>;
+  onSend: (text: string, fileIds: string[]) => Promise<unknown>;
   onStop?: (() => void) | undefined;
   autoFocus?: boolean;
   /** The runtime chip (#19). */
   chip: ReactNode;
+  /** The conversation files are uploaded to (#22). */
+  conversation: () => Promise<string>;
+  /** The conversation's files on the server (unsent ones are shown as chips). */
+  existingFiles: readonly UploadedFile[];
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const attach = useAttachments(props.conversation, props.existingFiles);
   const submit = async () => {
     const t = text.trim();
-    if (!t || sending || props.busy) return;
+    if (!t || sending || props.busy || attach.uploading) return;
     setSending(true);
     setError(null);
     try {
-      await props.onSend(t);
+      const fileIds = attach.ready;
+      await props.onSend(t, fileIds);
       setText("");
+      attach.sent(fileIds);
     } catch (e) {
       setError(errorText(e));
+      // Files that are gone (deleted elsewhere, or already sent): drop their chips so the next send works.
+      if (e instanceof ApiError && e.code === "invalid_attachment")
+        void attach.reconcile().catch(() => undefined);
     } finally {
       setSending(false);
     }
@@ -589,10 +655,34 @@ function Composer(props: {
       void submit();
     }
   };
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    setDragging(false);
+    attach.add(e.dataTransfer.files);
+  };
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    // Pasted files (a screenshot, files copied in Finder) are attached; pasted text stays text.
+    if (!e.clipboardData.files.length) return;
+    e.preventDefault();
+    attach.add(e.clipboardData.files);
+  };
   return (
     <div className="composer">
-      <div className="box">
+      <div
+        className={`box${dragging ? " dragging" : ""}`}
+        data-testid="composer"
+        onDragOver={(e) => {
+          if (!e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+      >
+        <AttachmentChips items={attach.items} onRemove={attach.remove} />
         <textarea
+          onPaste={onPaste}
           id={COMPOSER_INPUT}
           aria-label="메시지 입력"
           placeholder="메시지를 입력하세요 (Shift+Enter 줄바꿈)"
@@ -603,16 +693,7 @@ function Composer(props: {
           autoFocus={props.autoFocus}
         />
         <div className="bar">
-          {/* File upload arrives with #22. */}
-          <button
-            type="button"
-            className="ghost"
-            aria-label="파일 첨부"
-            title="파일 첨부는 곧 지원돼요"
-            disabled
-          >
-            📎
-          </button>
+          <AttachButton onPick={attach.add} />
           {error && (
             <span className="error small" role="alert">
               {error}
@@ -628,7 +709,8 @@ function Composer(props: {
             <button
               type="button"
               className="primary"
-              disabled={!text.trim() || sending || props.busy}
+              disabled={!text.trim() || sending || props.busy || attach.uploading}
+              title={attach.uploading ? "파일을 다 올린 뒤에 보낼 수 있어요" : undefined}
               onClick={() => void submit()}
             >
               보내기

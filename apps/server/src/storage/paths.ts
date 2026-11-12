@@ -22,10 +22,23 @@ export function storagePaths(dataDir: string) {
     /** The server's own skill folder (#21): allow-listed skills copied by `pnpm skills:install`. */
     skills: path.join(root, "skills"),
     sources: path.join(root, "sources"),
+    /**
+     * Uploads being received (#22): streamed here first, moved into `files/` once checked. Same file system as
+     * `files/` (a rename), outside every backup root; emptied at server start.
+     */
+    uploadsTmp: path.join(root, "uploads-tmp"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>
       path.join(root, "runtimes", assertSafeId("connection", connectionId)),
+    uploadedFile: (userId: string, conversationId: string, fileId: string) =>
+      path.join(
+        root,
+        "files",
+        assertSafeId("user", userId),
+        assertSafeId("conversation", conversationId),
+        assertSafeId("file", fileId),
+      ),
     artifactDir: (artifactId: string) => path.join(root, "artifacts", assertSafeId("artifact", artifactId)),
   };
 }

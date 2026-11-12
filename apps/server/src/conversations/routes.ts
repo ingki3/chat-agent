@@ -17,6 +17,7 @@ import { RunAccessDenied } from "../connections/access.js";
 import type { DefaultsService } from "../users/defaults.js";
 import { idempotencyKey, MessageNotFoundError, startRun } from "../runtime/routes.js";
 import type { RunManager } from "../runtime/runs.js";
+import { AttachmentError, type FileStore } from "../files/store.js";
 import { settingsOf, toConversation, toMessage, type ConversationStore } from "./store.js";
 
 const KIND = "conversation";
@@ -35,10 +36,11 @@ function parse<T extends z.ZodType>(schema: T, value: unknown, reply: FastifyRep
 
 type IdParams = { id: string };
 
-/** The per-turn choices of a request body (#17), without the text. */
+/** The per-turn choices of a request body (#17), without the text and the files. */
 const choiceOf = (body: z.infer<typeof SendMessageRequest>) => {
   const choice: Partial<typeof body> = { ...body };
   delete choice.text;
+  delete choice.fileIds;
   return choice;
 };
 type MsgParams = { id: string; messageId: string };
@@ -54,6 +56,8 @@ export function registerConversationRoutes(
   runs: RunManager,
   /** Defaults and the chip (#19). Without them conversations start without settings (run manager tests). */
   deps?: { defaults: DefaultsService; users: UserStore },
+  /** Uploads (#22): files sent with a message, kept on edit. */
+  files?: FileStore,
 ): void {
   const refused = (reply: FastifyReply, e: unknown) => {
     // Runtime, model, effort or connection not allowed (#17's codes): 403, nothing changed.
@@ -174,7 +178,8 @@ export function registerConversationRoutes(
     "/api/conversations/:id",
     { config: conv("delete") },
     async (req, reply) => {
-      store.delete(req.params.id);
+      // Its files go with it (FileStore's `onDeleted`): rows and files inside the backup's file-write lock (#37).
+      await app.fileWrites.write(() => store.delete(req.params.id));
       return reply.send({ ok: true });
     },
   );
@@ -223,10 +228,15 @@ export function registerConversationRoutes(
         choice: choiceOf(body),
         prepare: (divider) => {
           divider();
+          // Files sent with it (#22): unsent files of this conversation, else nothing is created (400).
+          const fileIds = body.fileIds ?? [];
+          if (fileIds.length && !files) throw new AttachmentError();
+          const refs = files ? files.refs(req.params.id, fileIds) : [];
           const user = store.append(req.params.id, {
             role: "user",
-            parts: [{ type: "text", text: body.text }],
+            parts: [{ type: "text", text: body.text }, ...refs],
           });
+          files?.attach(req.params.id, user.id, fileIds);
           return { user, assistant: pending(req.params.id) };
         },
       });
@@ -252,6 +262,8 @@ export function registerConversationRoutes(
           prepare: (divider) => {
             const user = store.edit(req.params.id, req.params.messageId, body.text, divider);
             if (!user) throw new MessageNotFoundError();
+            // Its files go with the new version (#22 review 2): the parts were copied by `edit`.
+            files?.moveToMessage(req.params.id, req.params.messageId, user.id);
             return { user, assistant: pending(req.params.id) };
           },
         },

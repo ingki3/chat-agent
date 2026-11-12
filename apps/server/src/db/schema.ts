@@ -686,3 +686,59 @@ export const citations = sqliteTable(
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],
 );
+
+/**
+ * Uploaded files (#22, PRD FR-4.1·4.2·4.6): one row per file of a conversation, owned by its uploader. The bytes
+ * are at `files/<user_id>/<conversation_id>/<id>` under DATA_DIR — server-generated ids only, never the user's
+ * name (files/store.ts). `messageId` is the user message it was sent with (null while it is only in the composer;
+ * cleared if that message row goes). `kind` and `mediaType` are what the server detected (extension and content
+ * agree), never what the browser said. `name` is the user's file name, shown and used for downloads only.
+ */
+export const files = sqliteTable(
+  "files",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    messageId: text("message_id").references(() => messages.id, { onDelete: "set null" }),
+    /** The client's id for the upload (a UUID, unique per user): cancelling by it works before the file id is known. */
+    uploadId: text("upload_id"),
+    name: text("name").notNull(),
+    kind: text("kind", {
+      enum: ["pdf", "hwp", "hwpx", "docx", "xlsx", "pptx", "csv", "txt", "md", "png", "jpg"],
+    }).notNull(),
+    mediaType: text("media_type").notNull(),
+    bytes: integer("bytes").notNull(),
+    /** SHA-256 (hex) of the stored bytes. */
+    sha256: text("sha256").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    index("files_conversation_idx").on(t.conversationId, t.createdAt),
+    uniqueIndex("files_user_upload_idx").on(t.userId, t.uploadId),
+  ],
+);
+
+/**
+ * Cancelled uploads that have not arrived (review #102 7차): `DELETE /api/uploads/:uploadId` came before (or during)
+ * the upload, so the upload is refused when it comes — also after a restart. A record goes when it is resolved (the
+ * upload came and was refused) or after 6 hours; a user has at most 100 at a time (files/store.ts).
+ */
+export const uploadCancellations = sqliteTable(
+  "upload_cancellations",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    uploadId: text("upload_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.uploadId] }),
+    index("upload_cancellations_created_idx").on(t.createdAt),
+  ],
+);

@@ -3,6 +3,7 @@ import { RunChoice } from "./connections.js";
 import { RuntimeId } from "./runtime.js";
 import { FINANCE_NOTE_MAX_SOURCES, FinanceMissing, FinanceSource } from "./finance.js";
 import { CitationNotePart } from "./citations.js";
+import { FILE_LIMITS } from "./files.js";
 
 /**
  * Runtime-neutral message and stream formats (#11, PRD D8). Both runtime adapters (#15, #16) translate their
@@ -214,8 +215,14 @@ export const ListMessagesQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 /** Text plus the optional per-turn choices (runtime, model, effort, connection — checked by the server, #17). */
-export const SendMessageRequest = RunChoice.extend({ text: z.string().trim().min(1).max(100_000) });
-export const EditMessageRequest = SendMessageRequest;
+export const EditMessageRequest = RunChoice.extend({ text: z.string().trim().min(1).max(100_000) });
+/**
+ * A new message. `fileIds`: files uploaded to this conversation and not yet sent (#22) — they become `file_ref`
+ * parts of the message.
+ */
+export const SendMessageRequest = EditMessageRequest.extend({
+  fileIds: z.array(z.string().min(1).max(64)).max(FILE_LIMITS.perConversation).optional(),
+});
 /** "다시 생성" may change the runtime, model, effort or connection too (e.g. continue on the shared one). */
 export const RegenerateRequest = RunChoice;
 
