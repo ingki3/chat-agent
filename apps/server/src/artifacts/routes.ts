@@ -163,7 +163,8 @@ export function registerArtifactRoutes(
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
-      const served = v && serveVersion(a.kind, v.title, v.content);
+      // In the app's frame: Escape inside the artifact reaches the panel (#28, `ESCAPE_BRIDGE`).
+      const served = v && serveVersion(a.kind, v.title, v.content, { escapeBridge: true });
       if (!served) return notFound(reply);
       // The CSP set here is kept by the app's onSend hook (it adds the app CSP only where none is set).
       return reply

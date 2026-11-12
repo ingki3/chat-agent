@@ -24,6 +24,7 @@ import {
  *   /limit            a usage-limit signal
  *   /long <n>         n words, slowly (to try the stop button)
  *   /artifact <kind> <title>          (next lines: the content; JSON for chart, table, document)
+ *   /artifact-slow <kind> <title>     the same, then 4 s more of reply after the artifact is stored
  *   /artifact-update <id> <field>     (next lines: the new content of that field — content, chart, table, document)
  *                     real calls of our MCP tools `artifact_create` / `artifact_update` with the run's token
  *                     (needs `runTools`, as the FAKE_RUNTIME=1 server registers it; #27)
@@ -91,20 +92,25 @@ function artifactSteps(t: string): FakeStep[] | undefined {
       return s;
     }
   };
-  let m = /^\/artifact\s+(\w+)\s+(.+)$/.exec(head);
-  if (m) {
-    const kind = m[1]!;
+  const created = /^\/artifact(-slow)?\s+(\w+)\s+(.+)$/.exec(head);
+  if (created) {
+    const slow = !!created[1];
+    const kind = created[2]!;
+    const title = created[3]!;
     const field = ["chart", "table", "document"].includes(kind) ? kind : "content";
     return [
       { text: "아티팩트를 만들게요. " },
       {
         call: "artifact_create",
-        input: { kind, title: m[2]!, [field]: field === "content" ? body : json(body) },
+        input: { kind, title, [field]: field === "content" ? body : json(body) },
       },
+      // `/artifact-slow`: the reply goes on for a few seconds after the artifact exists (#28: an open page joins
+      // the run while it is still streaming).
+      ...(slow ? [{ delayMs: 4000 }] : []),
       { text: "만들었어요." },
     ];
   }
-  m = /^\/artifact-update\s+(\S+)\s+(content|chart|table|document)$/.exec(head);
+  const m = /^\/artifact-update\s+(\S+)\s+(content|chart|table|document)$/.exec(head);
   if (m)
     return [
       { text: "새 버전을 만들게요. " },

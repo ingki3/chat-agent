@@ -5,15 +5,23 @@ import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ARTIFACT_LIMITS, CSRF_HEADER, type ArtifactDetail } from "@agentlee/shared";
+import {
+  ARTIFACT_ESCAPE_MESSAGE,
+  ARTIFACT_LIMITS,
+  CSRF_HEADER,
+  type ArtifactDetail,
+  type MessagePart,
+} from "@agentlee/shared";
 import { APP_CSP, buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { artifactVersions } from "../src/db/schema.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
-import { FakeRuntime } from "../src/runtime/fake.js";
+import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
+import { RunManager } from "../src/runtime/runs.js";
 import {
   CDN_ALLOW_LIST,
+  ESCAPE_BRIDGE,
   artifactCsp,
   attachment,
   chartSvg,
@@ -788,5 +796,86 @@ describe("artifact panel, cards and list (#28)", () => {
     expect((await get(app, `/a/${chart}/v/1/download`, f.cookies.owner)).headers["content-type"]).toBe(
       "image/svg+xml; charset=utf-8",
     );
+  });
+  /** A run whose runtime stays silent after the tool wrote (no `tool_end` yet): only the end of the run syncs. */
+  async function hangingRun() {
+    const db = createTestDb();
+    const hang: FakeScript = () => [{ delayMs: 60_000 }];
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(new FakeRuntime({ runTools: true, script: hang }));
+    const ctx = await newApp({ NODE_ENV: "test" }, { db, runtimes });
+    const { app, f } = ctx;
+    const c = app.conversations!.create(f.users.owner.id);
+    const r = app.runs!.begin({
+      conversationId: c.id,
+      userId: f.users.owner.id,
+      prepare: () => ({
+        user: app.conversations!.append(c.id, { role: "user", parts: [{ type: "text", text: "만들어 줘" }] }),
+        assistant: app.conversations!.append(c.id, { role: "assistant", parts: [], status: "pending" }),
+      }),
+    });
+    for (let i = 0; i < 200 && app.runs!.get(r.run.id)!.status !== "running"; i++)
+      await new Promise((res) => setTimeout(res, 10));
+    // What our MCP tool stores for this run's token, before the runtime reports the call as finished.
+    const { artifact } = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: c.id, runId: r.run.id },
+      { kind: "html", title: "중간", content: "<p>x</p>" },
+    );
+    const refs = () =>
+      (app.conversations!.messageById(r.assistant.id)!.parts as MessagePart[]).filter(
+        (p) => p.type === "artifact_ref",
+      );
+    return { ...ctx, db, c, r, artifactId: artifact.id, refs };
+  }
+
+  it("a reply stopped after the tool wrote (before tool_end) still gets its card", async () => {
+    const { app, r, artifactId, refs } = await hangingRun();
+    expect(refs()).toEqual([]);
+    await app.runs!.interrupt(r.run.id);
+    for (let i = 0; i < 300 && ["queued", "running"].includes(app.runs!.get(r.run.id)!.status); i++)
+      await new Promise((res) => setTimeout(res, 10));
+    expect(app.runs!.get(r.run.id)!.status).toBe("interrupted");
+    expect(refs()).toEqual([{ type: "artifact_ref", artifactId, version: 1 }]);
+  });
+
+  it("a reply recovered after a restart gets its card, once", async () => {
+    const { app, db, r, artifactId, refs } = await hangingRun();
+    const manager = new RunManager(db, app.conversations!, new RuntimeRegistry(), app.appEvents);
+    expect(manager.recover()).toBe(1);
+    expect(manager.get(r.run.id)).toMatchObject({ status: "failed", errorCode: "server_restart" });
+    expect(refs()).toEqual([{ type: "artifact_ref", artifactId, version: 1 }]);
+    expect(manager.eventsAfter(r.run.id, -1).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({
+        type: "part_update",
+        part: { type: "artifact_ref", artifactId, version: 1 },
+      }),
+    );
+  });
+
+  it("Escape bridge: only in the HTML original served to the app's frame, hashed like any inline script", async () => {
+    const { app, f } = await newApp();
+    const cv = app.conversations!.create(f.users.owner.id);
+    const scope = { userId: f.users.owner.id, conversationId: cv.id, runId: "r" };
+    const html = "<!doctype html><p>문서</p><script>go()</script>";
+    const id = app.artifacts!.create(scope, { kind: "html", title: "h", content: html }).artifact.id;
+    const raw = await get(app, `/a/${id}/v/1/raw`, f.cookies.owner);
+    // Appended after the document (never before its doctype), its hash in policy A; policy B unchanged.
+    expect(raw.body).toBe(html + ESCAPE_BRIDGE);
+    const [a, b] = raw.headers["content-security-policy"] as string[];
+    const bridge = /<script>(.*)<\/script>$/.exec(ESCAPE_BRIDGE)![1]!;
+    expect(a).toContain(sha(bridge));
+    expect(a).toContain(sha("go()"));
+    expect(b).not.toContain("sha256-");
+    // The bridge sends one fixed message and nothing else.
+    expect(bridge).toContain(`postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")`);
+    expect(bridge).not.toMatch(/document\.|innerHTML|location|cookie|fetch/);
+    // Not in the downloaded file; not in other kinds (no scripts there at all).
+    expect((await get(app, `/a/${id}/v/1/download`, f.cookies.owner)).body).toBe(html);
+    const svg = app.artifacts!.create(scope, {
+      kind: "svg",
+      title: "s",
+      content: `<svg xmlns="http://www.w3.org/2000/svg"></svg>`,
+    }).artifact.id;
+    expect((await get(app, `/a/${svg}/v/1/raw`, f.cookies.owner)).body).not.toContain("postMessage");
   });
 });

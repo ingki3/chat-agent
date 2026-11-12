@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { ArtifactKind, ChartSpec, TableData } from "@agentlee/shared";
+import { ARTIFACT_ESCAPE_MESSAGE, type ArtifactKind, type ChartSpec, type TableData } from "@agentlee/shared";
 
 /**
  * How an artifact version is served (#27, PRD FR-6.5, docs/decisions/isolation.md "아티팩트 서빙").
@@ -298,15 +298,30 @@ export function tableCsv(t: TableData): string {
 export type Served = { type: string; body: string; csp: readonly string[] };
 
 /**
+ * The one message an artifact page sends the app (#28): Escape pressed inside the sandboxed frame, so the panel can
+ * close (key events in a frame never reach the parent page). Added to an HTML original as served in the app's frame
+ * only — not to downloads or exports — as an inline script whose hash goes into policy A like any other. It carries
+ * nothing but its type; the app accepts it only from the frame it shows, in exactly this shape, and only closes.
+ * An artifact that handles Escape itself (`preventDefault`) keeps it.
+ */
+export const ESCAPE_BRIDGE = `<script>addEventListener("keydown",function(e){if(e.key==="Escape"&&!e.defaultPrevented&&window.parent!==window)window.parent.postMessage({type:"${ARTIFACT_ESCAPE_MESSAGE}"},"*")})</script>`;
+
+/**
  * What `/a/:id/v/:ver/raw` sends for one version: HTML with its scripts allowed by hash, SVG as an image document
  * (scripts never allowed), chart and table drawn by the server (no script), markdown and code as plain text.
  * `document` has no original yet (#49/#22): undefined.
  */
-export function serveVersion(kind: ArtifactKind, title: string, content: string): Served | undefined {
+export function serveVersion(
+  kind: ArtifactKind,
+  title: string,
+  content: string,
+  opts: { escapeBridge?: boolean } = {},
+): Served | undefined {
   const none = [artifactCsp([])];
   switch (kind) {
     case "html": {
-      const { body, csp } = prepareHtml(content);
+      // Appended at the end: parsed into the body, never before a doctype (no quirks mode).
+      const { body, csp } = prepareHtml(opts.escapeBridge ? content + ESCAPE_BRIDGE : content);
       return { type: "text/html; charset=utf-8", body, csp };
     }
     case "svg":

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { expect, test, type Frame, type Page } from "@playwright/test";
-import { MOM, SON, newConversation, useAccount } from "./helpers.js";
+import { MOM, SON, csrf, newConversation, useAccount } from "./helpers.js";
 
 /**
  * The artifact panel next to the chat (#28, PRD FR-6.1·6.2·6.6): a card in the reply opens the panel; an edit
@@ -39,6 +39,7 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
   await page.goto(`/c/${conv.id}`);
   await expect(page.getByTestId("artifact-panel")).toHaveCount(0); // only while an artifact is open
 
+  const entries = await page.evaluate(() => history.length);
   await send(page, `/artifact html ${title}\n<h1 id="t">첫 버전 ${tag}</h1>`);
   // Locators are lazy: pin each card to its own reply.
   const card1 = page.getByTestId("assistant").nth(0).getByTestId("artifact-card");
@@ -46,9 +47,8 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
   await expect(card1).toContainText(title);
   await expect(card1).toContainText("v1 만듦");
   await expect(lastAssistant(page)).toHaveAttribute("data-status", "complete");
-  await expect(page.getByTestId("artifact-panel")).toHaveCount(0);
 
-  await card1.click();
+  // Made in this reply: the panel opens by itself (FR-6.1 "바로 보인다"), no click.
   const panel = page.getByTestId("artifact-panel");
   await expect(panel).toBeVisible();
   const id = new URL(page.url()).searchParams.get("artifact")!;
@@ -57,6 +57,9 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
   await expect((await panelFrame(page, 1)).locator("#t")).toHaveText(`첫 버전 ${tag}`);
   // The frame is the sandboxed original: no same-origin, so nothing of the app is reachable from it.
   await expect(panel.getByTestId("artifact-frame")).not.toHaveAttribute("sandbox", /allow-same-origin/);
+  // Opened by the reply, the address was replaced (no extra history entry) and follows the newest version.
+  expect(new URL(page.url()).searchParams.get("v")).toBeNull();
+  expect(await page.evaluate(() => history.length)).toBe(entries);
 
   const vp = page.viewportSize()!;
   const box = (await panel.boundingBox())!;
@@ -66,16 +69,20 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
     await expect(panel).toHaveAttribute("role", "dialog");
     expect(box).toEqual({ x: 0, y: 0, width: vp.width, height: vp.height });
     await expect(page.locator("main")).toHaveAttribute("inert", "");
+    await expect(page.getByTestId("artifact-panel-title")).toBeFocused(); // a dialog takes focus
     await page.getByTestId("artifact-panel-close").click();
     await expect(panel).toHaveCount(0);
     await expect(page.locator("main")).not.toHaveAttribute("inert", "");
     expect(new URL(page.url()).searchParams.get("artifact")).toBeNull();
+    await expect(page.getByLabel("메시지 입력")).toBeFocused(); // back to where the user was
   } else {
     // Beside the chat: the third column, the conversation stays usable.
     await expect(panel).toHaveAttribute("data-full", "false");
     expect(box.x).toBeGreaterThan(vp.width / 3);
     expect(box.x + box.width).toBeCloseTo(vp.width, 0);
     await expect(page.locator("main")).not.toHaveAttribute("inert", "");
+    // Beside the chat, a panel the reply opened does not take the focus from the composer.
+    await expect(page.getByLabel("메시지 입력")).toBeFocused();
     // Downloads are attachments: the HTML original as a file.
     const dl = page.waitForEvent("download");
     await panel.getByTestId("artifact-download").click();
@@ -88,8 +95,7 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
   await expect(card2).toHaveAttribute("data-version", "2");
   await expect(card2).toContainText("v2 새 버전");
   await expect(lastAssistant(page)).toHaveAttribute("data-status", "complete");
-  if (isMobile) await card2.click();
-  // Desktop: the open panel followed the newest version by itself.
+  // Desktop: the open panel followed the newest version. Phone (closed before): it opened again by itself.
   await expect(panel).toBeVisible();
   await expect((await panelFrame(page, 2)).locator("#t")).toHaveText(`둘째 버전 ${tag}`);
   await expect(panel.getByTestId("artifact-version")).toHaveValue("2");
@@ -120,9 +126,13 @@ test("edit request → v2 → view v1 → revert, in the panel next to the chat 
   await card1.click();
   await expect((await panelFrame(page, 1)).locator("#t")).toHaveText(`첫 버전 ${tag}`);
 
-  // Escape closes; a link with the address opens it again (a reload keeps it).
+  // Escape closes — also with the focus inside the sandboxed frame (its one message to the app), and the focus goes
+  // back to the card that opened it.
+  await (await panelFrame(page, 1)).locator("#t").click();
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
+  await expect(card1).toBeFocused();
+  // A link with the address opens it again (a reload keeps it).
   await page.goto(`/c/${conv.id}?artifact=${encodeURIComponent(id)}`);
   await expect((await panelFrame(page, 3)).locator("#t")).toHaveText(`첫 버전 ${tag}`);
 });
@@ -194,4 +204,105 @@ test("the artifact list: mine across conversations, reopened in its conversation
   await expect(son.getByTestId("artifact-frame")).toHaveCount(0);
   await expect(son.getByText("메모")).toHaveCount(0);
   await ctx.close();
+});
+
+test("new artifacts open by themselves unless the user picked another; focus returns to the last card; not on reload", async ({
+  page,
+  baseURL,
+  isMobile,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `자동 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  const panel = page.getByTestId("artifact-panel");
+  const title = page.getByTestId("artifact-panel-title");
+  const card = (i: number) => page.getByTestId("assistant").nth(i).getByTestId("artifact-card");
+  const make = async (name: string) => {
+    if (isMobile && (await panel.count())) await page.getByTestId("artifact-panel-close").click();
+    await send(page, `/artifact markdown ${name} ${tag}\n# ${name}`);
+    await expect(lastAssistant(page)).toHaveAttribute("data-status", "complete");
+  };
+
+  await make("가");
+  await expect(title).toContainText(`가 ${tag}`);
+  // The next reply's new artifact replaces one a reply opened.
+  await make("나");
+  await expect(title).toContainText(`나 ${tag}`);
+  // The user's own pick stays: a later new artifact does not take the panel over.
+  if (isMobile) await page.getByTestId("artifact-panel-close").click();
+  await card(0).click();
+  await expect(title).toContainText(`가 ${tag}`);
+  if (!isMobile) {
+    await send(page, `/artifact markdown 다 ${tag}\n# 다`);
+    await expect(lastAssistant(page)).toHaveAttribute("data-status", "complete");
+    await expect(card(2)).toContainText(`다 ${tag}`);
+    await expect(title).toContainText(`가 ${tag}`);
+    // Switching between cards while open: closing returns the focus to the last one used.
+    await card(1).click();
+    await expect(title).toContainText(`나 ${tag}`);
+    await card(0).click();
+    await expect(title).toContainText(`가 ${tag}`);
+    await page.getByTestId("artifact-panel-close").click();
+    await expect(panel).toHaveCount(0);
+    await expect(card(0)).toBeFocused();
+  } else {
+    await page.getByTestId("artifact-panel-close").click();
+    await expect(card(0)).toBeFocused();
+  }
+
+  // Old replies never open the panel: a fresh load of the conversation shows none.
+  await page.goto(`/c/${conv.id}`);
+  await expect(card(0)).toBeVisible();
+  await expect(panel).toHaveCount(0);
+});
+
+test("a run this page did not start (seen again on load) never opens the panel, even while it streams", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `다시 보기 ${tag}`);
+  const r = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+    data: { text: `/artifact-slow markdown 늦은 ${tag}\n# 늦은` },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": `e2e-${tag}` },
+  });
+  expect(r.status()).toBe(201);
+  await page.goto(`/c/${conv.id}`);
+  const reply = page.getByTestId("assistant").last();
+  // Its parts are replayed from the stream while it still runs: the card is there, the panel is not.
+  await expect(reply.getByTestId("artifact-card")).toContainText(`늦은 ${tag}`);
+  await expect(reply).toHaveAttribute("data-status", "streaming");
+  await expect(page.getByTestId("artifact-panel")).toHaveCount(0);
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  await expect(page.getByTestId("artifact-panel")).toHaveCount(0);
+});
+
+test("the frame's Escape message closes the panel only from the frame on screen and only in its exact shape", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `브리지 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  const html = `<button id="bad">bad</button><button id="other">other</button><button id="ok">ok</button>
+<script>
+const post = (m) => parent.postMessage(m, "*");
+document.getElementById("bad").addEventListener("click", () => post({ type: "agentlee:escape", more: 1 }));
+document.getElementById("other").addEventListener("click", () => post({ type: "agentlee:close" }));
+document.getElementById("ok").addEventListener("click", () => post({ type: "agentlee:escape" }));
+</script>`;
+  await send(page, `/artifact html 브리지 ${tag}\n${html}`);
+  const panel = page.getByTestId("artifact-panel");
+  const frame = await panelFrame(page, 1);
+  await frame.locator("#bad").click();
+  await frame.locator("#other").click();
+  // The same message from the app page itself (not the frame) is ignored too.
+  await page.evaluate(() => window.postMessage({ type: "agentlee:escape" }, "*"));
+  await page.waitForTimeout(300);
+  await expect(panel).toBeVisible();
+  await frame.locator("#ok").click();
+  await expect(panel).toHaveCount(0);
 });

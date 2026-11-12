@@ -151,6 +151,12 @@ export type ArtifactVersionContent = z.infer<typeof ArtifactVersionContent>;
 export const RevertArtifactRequest = z.strictObject({ version: z.number().int().positive() });
 export type RevertArtifactRequest = z.infer<typeof RevertArtifactRequest>;
 
+/**
+ * The only message the app accepts from an artifact's frame (#28): Escape was pressed inside it — the panel closes.
+ * Exactly `{ type: ARTIFACT_ESCAPE_MESSAGE }`, from the frame on screen.
+ */
+export const ARTIFACT_ESCAPE_MESSAGE = "agentlee:escape";
+
 /** In-app address of an artifact, and of one version's sandboxed original. */
 export const artifactPath = (id: string) => `/a/${encodeURIComponent(id)}`;
 export const artifactRawPath = (id: string, version: number) =>
