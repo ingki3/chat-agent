@@ -425,8 +425,14 @@ const isFiles = (url: string) => /\/api\/conversations\/[^/]+\/files$/.test(new 
 /**
  * New chat: A sent while B uploads; B's chip is removed. `bFirst`: B's upload (and its DELETE, held) is done before
  * the page moves; otherwise the page moves first and B finishes there (the review's order).
+ *
+ * Both orders end the same way, made certain by the test (#103): the new page's file list is answered only once B is
+ * stored on the server (its DELETE still held), so that list has B. The cancel goes out the moment the chip is
+ * removed — its arrival says nothing about B being stored — so the steps wait on the server's answer to B itself.
+ * C, a file added from elsewhere (not sent), is in the same list: its chip showing up proves the list was applied,
+ * and only then is B's absence checked.
  */
-async function cancelledDuringMove(page: Page, bFirst: boolean) {
+async function cancelledDuringMove(page: Page, baseURL: string, bFirst: boolean) {
   await useAccount(page, SON);
   await page.goto("/");
   await page
@@ -436,12 +442,17 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
   const sendHeld = gate();
   const bSeen = gate();
   const bGo = gate();
+  const bStored = gate();
   const delSeen = gate();
   const delGo = gate();
+  const listSeen = gate();
+  const listGo = gate();
   let deletes = 0;
+  let conversation = "";
   const lists: number[] = [];
   await page.route(/\/api\/conversations\/[^/]+\/messages$/, async (route) => {
     if (route.request().method() !== "POST") return route.fallback();
+    conversation = new URL(route.request().url()).pathname.split("/")[3]!;
     const response = await route.fetch();
     await sendHeld.p;
     await route.fulfill({ response });
@@ -449,6 +460,9 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
   await page.route(/\/api\/conversations\/[^/]+\/files$/, async (route) => {
     const req = route.request();
     if (req.method() === "GET") {
+      // The new page's list is answered only once B is stored and C is there (see above).
+      listSeen.open();
+      await listGo.p;
       const response = await route.fetch();
       const body = (await response.json()) as { items: { name: string }[] };
       lists.push(body.items.filter((f) => f.name === "B.txt").length);
@@ -457,7 +471,11 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
     if (req.headers()["x-file-name"] !== "B.txt") return route.fallback();
     bSeen.open();
     await bGo.p;
-    await route.fulfill({ response: await route.fetch() });
+    const response = await route.fetch();
+    // The server has answered for B: it is stored (its cancel is still held below).
+    expect(response.status()).toBe(201);
+    bStored.open();
+    await route.fulfill({ response });
   });
   await page.route(/\/api\/uploads\/[^/]+$/, async (route) => {
     if (route.request().method() !== "DELETE") return route.fallback();
@@ -466,6 +484,23 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
     await delGo.p;
     await route.fulfill({ response: await route.fetch() });
   });
+  /** C: uploaded from elsewhere (the page's routes do not see it), left unsent — a chip on the new page. */
+  const addC = async () => {
+    const r = await page.request.post(`/api/conversations/${conversation}/files`, {
+      headers: {
+        ...csrf(baseURL),
+        "content-type": "application/octet-stream",
+        "x-file-name": "C.txt",
+        "x-upload-id": crypto.randomUUID(),
+      },
+      data: Buffer.from("c"),
+    });
+    expect(r.status()).toBe(201);
+  };
+  const bAnswered = page.waitForResponse(
+    (r) =>
+      r.request().method() === "POST" && isFiles(r.url()) && r.request().headers()["x-file-name"] === "B.txt",
+  );
   await page.getByLabel("메시지 입력").fill("A만");
   await page.getByLabel("메시지 입력").press("Enter");
   await page
@@ -473,48 +508,59 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
     .setInputFiles([{ name: "B.txt", mimeType: "text/plain", buffer: Buffer.from("b") }]);
   await bSeen.p;
   await chips(page).filter({ hasText: "B.txt" }).getByRole("button", { name: /빼기/ }).click();
+  await delSeen.p; // the cancel went out at the click, and is held
+  expect(conversation).not.toBe("");
   if (bFirst) {
     // B is stored and its DELETE is on its way (held) before the page moves: the new page's first list has B.
     bGo.open();
-    await delSeen.p;
+    await bStored.p;
+    await bAnswered;
   }
-  const listed = page.waitForResponse((r) => r.request().method() === "GET" && isFiles(r.url()));
   sendHeld.open();
   await expect(page).toHaveURL(/\/c\//);
-  await listed;
+  // The new page asked for its list.
+  await listSeen.p;
   if (!bFirst) {
-    // The review's order: B finishes on the new page, its DELETE is held; any list read now still has B.
+    // The review's order: the page has moved on (its list asked for) when B finishes; its DELETE is held.
     bGo.open();
-    await delSeen.p;
-    await page.waitForTimeout(500);
+    await bStored.p;
+    await bAnswered;
   }
-  await expect(chips(page)).toHaveCount(0);
+  await addC();
+  const listed = page.waitForResponse((r) => r.request().method() === "GET" && isFiles(r.url()));
+  listGo.open();
+  await listed;
+  // C's chip: the list (with B in it) has been applied. B is not among the chips.
+  await expect(chips(page)).toHaveText([/C\.txt/]);
+  expect(lists[0]).toBe(1);
   delGo.open();
   await expect.poll(() => deletes).toBe(1);
-  await expect(chips(page)).toHaveCount(0);
+  await expect(chips(page)).toHaveText([/C\.txt/]);
   await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
   await page.getByLabel("메시지 입력").fill("다음 메시지");
   await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
   await page.getByRole("button", { name: "보내기" }).click();
-  await expect(page.getByTestId("user-message").filter({ hasText: "다음 메시지" })).toHaveCount(1);
+  // Only C goes with it: B never comes back.
+  const next = page.getByTestId("user-message").filter({ hasText: "다음 메시지" });
+  await expect(next).toHaveCount(1);
+  await expect(next.getByTestId("file-ref")).toHaveText([/C\.txt/]);
   await expect(page.getByRole("alert")).toHaveCount(0);
   // List reads the page still makes (refetches) must not outlive the test.
   await page.unrouteAll({ behavior: "ignoreErrors" });
-  return lists;
 }
 
 test("a cancelled upload that finishes after the new chat moved on is not restored (review order)", async ({
   page,
+  baseURL,
 }) => {
-  await cancelledDuringMove(page, false);
+  await cancelledDuringMove(page, baseURL!, false);
 });
 
 test("a cancelled upload whose delete is still on its way is not restored from the new page's list", async ({
   page,
+  baseURL,
 }) => {
-  const lists = await cancelledDuringMove(page, true);
-  // The new page's list really had B (the delete had not finished): the session's discarded set kept it out.
-  expect(lists.some((n) => n === 1)).toBe(true);
+  await cancelledDuringMove(page, baseURL!, true);
 });
 
 test("a send refused for a file that is gone drops that chip; the next send goes through", async ({

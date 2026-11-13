@@ -172,8 +172,21 @@ test("turning on registers this device for the session; logging out removes it",
 
 test("quiet hours are saved", async ({ page }) => {
   await useAccount(page, ADMIN);
+  // Held: until the saved value is here, the form cannot be edited (#103). Otherwise a tick made on the defaults
+  // could land just as the stored "on" (the other project's run, or a previous one) arrives, and undo itself.
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  await page.route("**/api/notifications/prefs", async (route) => {
+    if (route.request().method() === "GET") await held;
+    await route.fallback();
+  });
   await page.goto("/settings");
-  await page.getByLabel("사용", { exact: true }).check();
+  const on = page.getByLabel("사용", { exact: true });
+  await expect(on).toBeDisabled();
+  await expect(page.getByLabel("방해 금지 시작")).toBeDisabled();
+  release();
+  await expect(on).toBeEnabled();
+  await on.check();
   await page.getByLabel("방해 금지 시작").fill("22:30");
   await page.getByLabel("방해 금지 끝").fill("06:45");
   await page.getByRole("button", { name: "저장", exact: true }).click();
