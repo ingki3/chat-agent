@@ -8,10 +8,13 @@ import {
   FILE_NAME_HEADER,
   UPLOAD_ID_HEADER,
   fileKindOf,
+  FileLocator,
+  parseLocParam,
   type FileError,
   type FileKind,
   type FileListResponse,
   type FileTextResponse,
+  type FileViewResponse,
 } from "@agentlee/shared";
 import { attachment } from "../artifacts/serve.js";
 import { RAW_HEADERS } from "../artifacts/routes.js";
@@ -20,6 +23,7 @@ import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
 import { toFileExtract, type FileExtracts } from "./extract.js";
 import { segmentLocator } from "./text.js";
+import { resolveTarget, VIEW_LIMIT, VIEW_MAX, viewSegment, viewWindow } from "./viewer.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 import { sharedWith, viewOf } from "../shares/projection.js";
 import { FileLimitError, toUploadedFile, UPLOAD_ID, UploadCancelledError, type FileStore } from "./store.js";
@@ -149,6 +153,7 @@ const nameParts = (name: string) => {
  *   (`?inline=1` shows a PNG/JPG in the page; nothing else is ever inline)
  * - `DELETE /api/files/:id` — an unsent file (409 `file_attached` once it went with a message)
  * - `GET /api/files/:id/extract?from=&limit=` — its extracted text with locators (#48), `FileTextResponse`
+ * - `GET /api/files/:id/view?loc=&from=&to=&limit=` — the viewer's window of it and where `loc` is (#24), `FileViewResponse`
  */
 export function registerFileRoutes(
   app: FastifyInstance,
@@ -345,6 +350,56 @@ export function registerFileRoutes(
         } satisfies FileTextResponse);
       },
     );
+
+  // The file viewer (#24): a window of the extracted text with finer places, and where `loc` is. The same check
+  // as the original (#29); for a shared viewer the citations that may make a range exact are their projection's.
+  if (extracts)
+    app.get<{
+      Params: { id: string };
+      Querystring: { loc?: string; from?: string; to?: string; limit?: string };
+    }>("/api/files/:id/view", { config: read }, async (req, reply) => {
+      const f = store.get(req.params.id)!;
+      const p = viewOf(app, req, { fileIn: f.conversationId });
+      if (p === null || (p && !p.files.has(f.id)))
+        return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
+      const loc = req.query.loc === undefined ? undefined : parseLocParam(req.query.loc);
+      if (req.query.loc !== undefined && !loc)
+        return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
+      const fromRaw = req.query.from === undefined ? undefined : Number.parseInt(req.query.from, 10);
+      const from = fromRaw === undefined || !Number.isFinite(fromRaw) ? undefined : Math.max(0, fromRaw);
+      const limit = Math.max(1, Math.min(VIEW_MAX, Number.parseInt(req.query.limit ?? "", 10) || VIEW_LIMIT));
+      const extract = toFileExtract(f, extracts.get(f.id));
+      const all = extract.status === "ok" ? extracts.segments(f.id, 0, Number.MAX_SAFE_INTEGER) : [];
+      const items = all.map((seg) => viewSegment(f, seg));
+      let target = null;
+      if (loc) {
+        const cited = store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
+          if (p && !p.citations.has(c.id)) return [];
+          try {
+            const raw = JSON.parse(c.locator) as { textHash?: unknown };
+            const l = FileLocator.safeParse(raw);
+            const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
+            return l.success ? [{ locator: l.data, quote: c.quote, textHash }] : [];
+          } catch {
+            return [];
+          }
+        });
+        target = resolveTarget(f, extract, items, loc, cited);
+      }
+      const toRaw = req.query.to === undefined ? undefined : Number.parseInt(req.query.to, 10);
+      const to = toRaw === undefined || !Number.isFinite(toRaw) ? undefined : Math.max(0, toRaw);
+      const window = viewWindow(items, { from, to, limit, around: target?.seqs[0] });
+      const body: FileViewResponse = {
+        file: p ? app.sharing!.file(f, p) : toUploadedFile(f),
+        extract,
+        // Scrubbed with the secrets known now (`segments`), and once more as a whole (as `/extract`).
+        items: scrubKnownDeep(window.items, { tail: false }),
+        prev: window.prev,
+        next: window.next,
+        target,
+      };
+      return reply.header("Cache-Control", "no-store").send(body);
+    });
 
   // Cancel by the client's upload id (review #102 6차): the caller's own uploads only — the id is looked up among
   // them, so another user's id is just "nothing there" (and is remembered as cancelled for the caller alone).

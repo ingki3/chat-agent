@@ -19,7 +19,14 @@ import { fileExtracts, fileSegments } from "../db/schema.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { knownSecrets, scrubKnownDeep, type KnownSecrets } from "../secrets/known.js";
-import { capText, capUnit, parseMarks, scrubFile, type ScrubbedSegment } from "./scrub.js";
+import {
+  capText,
+  capUnit,
+  forgetCitedTextHashes,
+  parseMarks,
+  scrubFile,
+  type ScrubbedSegment,
+} from "./scrub.js";
 
 /** Characters of an XLSX sheet name kept (after it was scrubbed whole). */
 const MAX_SHEET_NAME = 200;
@@ -426,6 +433,8 @@ export class FileExtracts {
     this.db.$client
       .prepare("UPDATE file_extracts SET status = 'pending', attempts = 0, updated_at = ? WHERE file_id = ?")
       .run(this.now(), fileId);
+    // At once, not only when the new text is saved (review #123 2차).
+    forgetCitedTextHashes(this.db.$client, fileId);
     this.cache.delete(fileId);
     this.enqueue(fileId);
   }
@@ -656,6 +665,8 @@ export class FileExtracts {
         return { status: "failed" as const, code: "extract_changed" };
       if (sql.prepare("DELETE FROM file_segments WHERE file_id = ?").run(file.id).changes) {
         setKey(sql, CLEANUP_PENDING_KEY, "1");
+        // Extracted again (a new secret, a new extractor): the citations' check hashes were over the old text.
+        forgetCitedTextHashes(sql, file.id);
         replaced = true;
       }
       let chars = 0;

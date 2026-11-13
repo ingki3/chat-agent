@@ -1,5 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { Link } from "react-router";
 import type { CitationView } from "./segments.js";
+import { useFileViewHref } from "../files/context.js";
 import "./citations.css";
 
 /**
@@ -59,6 +61,8 @@ export function CitationMarker({ view }: { view: CitationView }) {
 }
 
 export function CitationPreview({ id, view }: { id?: string; view: CitationView }) {
+  const fileHref = useFileViewHref();
+  const open = view.locator ? fileHref(view.locator.fileId, view.locator) : null;
   return (
     <span
       id={id}
@@ -77,6 +81,12 @@ export function CitationPreview({ id, view }: { id?: string; view: CitationView 
           <span className="cite-quote-label">{view.ok ? "인용 구절" : "인용하려던 구절"}</span>
           <q>{view.quote}</q>
         </span>
+      )}
+      {/* A file citation (#24): opens the viewer at the passage — a link, so a tap works (no hover needed). */}
+      {open && (
+        <Link className="cite-open" to={open} data-testid="citation-open-file">
+          파일에서 보기 →
+        </Link>
       )}
       {view.href && (
         <a className="cite-open" href={view.href} target="_blank" rel="noopener noreferrer nofollow">

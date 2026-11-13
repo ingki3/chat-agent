@@ -246,6 +246,8 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /api/files/:id/content", expect: READ, fixture: sentFile },
   // Its extracted text (#48): the same check as the original — a shared viewer for a file of their projection (#29).
   { route: "GET /api/files/:id/extract", expect: READ, fixture: sentFile },
+  // The viewer (#24): the same check again (an unsent file, outside the projection: file-viewer.test.ts).
+  { route: "GET /api/files/:id/view", expect: READ, fixture: sentFile },
   { route: "DELETE /api/files/:id", expect: OWNER_ONLY, fixture: uploaded },
   // Artifacts (#27): owner, and the shared caller through the projection (#29); the page and the originals check the
   // same way.

@@ -146,6 +146,22 @@ export class FileStore {
     return this.db.select().from(files).where(eq(files.id, id)).get();
   }
 
+  /**
+   * The verified citations of a file in its conversation (#24, the viewer's "is this range a checked passage"):
+   * id, the stored quote and locator JSON. Never served — the viewer only compares against them.
+   */
+  verifiedCitations(
+    conversationId: string,
+    fileId: string,
+  ): { id: string; quote: string; locator: string }[] {
+    return this.db.$client
+      .prepare(
+        `SELECT id, quote, locator FROM citations
+         WHERE conversation_id = ? AND file_id = ? AND status = 'verified' AND quote IS NOT NULL AND locator IS NOT NULL`,
+      )
+      .all(conversationId, fileId) as { id: string; quote: string; locator: string }[];
+  }
+
   list(conversationId: string): FileRow[] {
     return this.db
       .select()

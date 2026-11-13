@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { snippetKey } from "../citations/store.js";
-import { parseMarks, scrubFile } from "../files/scrub.js";
+import { forgetCitedTextHashes, parseMarks, scrubFile } from "../files/scrub.js";
 import type { Db } from "../db/client.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { TEXT_COLUMNS, type RescrubKind } from "./columns.js";
@@ -373,6 +373,8 @@ export class StoredRescrub {
               .run(n.text, marks, approximate, locator, file_id, r.seq);
             changed = true;
           });
+          // The viewer's check hashes over the old text go with it (#24, review #123 2차).
+          if (changed) forgetCitedTextHashes(sql, file_id);
           // Like every masked row (review #111): the old text may still be in WAL frames and old pages until a
           // TRUNCATE checkpoint — recorded in the same transaction, so a restart resumes the clean-up.
           if (changed) markPending(sql);

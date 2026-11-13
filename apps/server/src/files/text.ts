@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import {
   EXTRACT_CODE_TEXT,
   FileLocator,
@@ -52,13 +53,24 @@ const marksOf = (seg: Pick<SegmentRow, "marks">): Mark[] => {
 /** `split`: one piece of a paragraph or row the extractor split in reading order (HWP, #23) — no exact range. */
 type StoredLoc = UnitLocator & { sheetNo?: number; split?: boolean };
 /** A cited place: the locator, and the cited unit's sheet number for an XLSX cell (stored with the citation). */
-export type CitedLocator = FileLocator & { sheetNo?: number | undefined };
+/**
+ * `textHash` (#24): SHA-256 (hex) of the cited unit's served text up to the passage's end, when the citation was
+ * checked — the viewer claims the range exact only while that text is still the same (a secret registered later
+ * moves offsets). Stored with the citation, never shown to the model or in a note.
+ */
+export type CitedLocator = FileLocator & { sheetNo?: number | undefined; textHash?: string | undefined };
+
+/** The `textHash` of a unit's text up to `end`. */
+export const prefixHash = (text: string, end: number) =>
+  crypto.createHash("sha256").update(text.slice(0, end), "utf8").digest("hex");
 const locOf = (seg: Pick<SegmentRow, "locator">): StoredLoc => JSON.parse(seg.locator) as StoredLoc;
 
-const isBox = (b: unknown): b is [number, number, number, number] =>
+export const isBox = (b: unknown): b is [number, number, number, number] =>
   Array.isArray(b) && b.length === 4 && b.every((x) => typeof x === "number" && x >= 0 && x <= 1);
 
-function union(boxes: [number, number, number, number][]): [number, number, number, number] | undefined {
+export function union(
+  boxes: [number, number, number, number][],
+): [number, number, number, number] | undefined {
   if (!boxes.length) return undefined;
   const x0 = Math.min(...boxes.map((b) => b[0]));
   const y0 = Math.min(...boxes.map((b) => b[1]));
@@ -485,7 +497,8 @@ export class FileTools {
    * no sheet at all.
    */
   modelLocator(loc: CitedLocator): { locator: FileLocator; label: string } {
-    const { sheetNo, ...rest } = loc;
+    const { sheetNo, textHash: _h, ...rest } = loc;
+    void _h;
     return forModel(rest, sheetNo);
   }
 
@@ -516,7 +529,14 @@ export class FileTools {
       return {
         status: "verified",
         quote: m.quote,
-        locator: where ? { ...where, ...(sheetNo !== undefined ? { sheetNo } : {}) } : null,
+        locator: where
+          ? {
+              ...where,
+              ...(sheetNo !== undefined ? { sheetNo } : {}),
+              // Only a passage with a range gets one: the text it was found in, up to its end.
+              ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
+            }
+          : null,
       };
     }
     return { status: "snippet_not_found", quote: null, locator: null };

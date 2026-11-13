@@ -4,6 +4,7 @@ import {
   citationVerified,
   type CitationEntry,
   type CitationNotePart,
+  type FileLocator,
   type MessagePart,
 } from "@agentlee/shared";
 
@@ -39,6 +40,11 @@ export type CitationView = {
   href: string | null;
   url: string | null;
   quote: string | null;
+  /**
+   * A verified file citation (#48): where the passage is — the viewer opens it there (#24). Null for web citations
+   * and for anything not verified (nothing to open at a place the server did not find).
+   */
+  locator: FileLocator | null;
 };
 
 /** An http(s) URL as a link target, or null (anything else is never put into an href). */
@@ -70,6 +76,7 @@ export function citationView(n: number, entry: CitationEntry | undefined): Citat
     href: known ? safeHref(entry.url) : null,
     url: known ? entry.url : null,
     quote: known ? entry.quote : null,
+    locator: ok && entry.locator ? entry.locator : null,
   };
 }
 

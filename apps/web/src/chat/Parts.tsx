@@ -1,6 +1,8 @@
 import { Fragment, memo, useMemo, useState } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
+import { Link } from "react-router";
 import { files } from "../api.js";
+import { useFileViewHref } from "../files/context.js";
 import { RichText } from "./RichText.js";
 import type { MarkdownCite } from "./Markdown.js";
 import { CitationMarker } from "../citations/CitationMarker.js";
@@ -258,12 +260,28 @@ const PartView = memo(function PartView({
   }
 });
 
-/** An uploaded file (#22): a download link to the original (the viewer is #24). */
+/**
+ * A file of the conversation (#22, #49): a download link to the original, and — where the conversation is known —
+ * "보기", the viewer of its extracted text (#24; a link: click or tap, nothing needs hover).
+ */
 export function FileRef({ part }: { part: Extract<PublicPart, { type: "file_ref" }> }) {
+  const view = useFileViewHref()(part.fileId);
   return (
-    <a className="chip small fileref" href={files.url(part.fileId)} download data-testid="file-ref">
-      📎 {part.name ?? "파일"}
-    </a>
+    <span className="fileref-group">
+      <a className="chip small fileref" href={files.url(part.fileId)} download data-testid="file-ref">
+        📎 {part.name ?? "파일"}
+      </a>
+      {view && (
+        <Link
+          className="chip small fileref-open"
+          to={view}
+          data-testid="file-ref-open"
+          aria-label={`${part.name ?? "파일"} 보기`}
+        >
+          보기
+        </Link>
+      )}
+    </span>
   );
 }
 
