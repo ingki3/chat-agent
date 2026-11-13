@@ -1110,6 +1110,7 @@ describe("python_run: the dedicated account (#47 round 2)", () => {
     expect(parseProbe("uid=501 procargs=readable\n", 0)).toEqual({ uid: 501, readBlocked: false });
     expect(parseProbe("uid=502 procargs=error errno=3\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseProbe("uid=502 procargs=error control\n", 0)).toEqual({ uid: 502, readBlocked: false });
+    expect(parseProbe("uid=502 procargs=error sibling\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseProbe("uid=4294967294 procargs=blocked\n", 0)).toEqual({
       uid: 4294967294,
       readBlocked: true,

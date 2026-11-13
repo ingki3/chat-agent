@@ -235,12 +235,12 @@ export async function verifyAccount(opts: {
 
 /**
  * The launcher probe's output → a result (#121 round 8: strict). Exit code 0, and stdout exactly ONE line (plus its
- * newline) of exactly `uid=<n> procargs=<blocked|readable|error control|error errno=<n>>` — no prefix, no second
- * verdict, nothing else — with `<n>` a valid unsigned 32-bit uid. Only `procargs=blocked` (EPERM, with the probe's
+ * newline) of exactly `uid=<n> procargs=<blocked|readable|error control|error sibling|error errno=<n>>` — no prefix, no second
+ * verdict, nothing else — with `<n>` a valid unsigned 32-bit uid. Only `procargs=blocked` (EPERM or EINVAL while the kernel still shows the sibling with another uid — #122 finding, with the probe's
  * own positive control having passed) is a blocked read. Undefined otherwise (a failure, fail closed).
  */
 const PROBE_LINE =
-  /^uid=(0|[1-9][0-9]{0,9}) procargs=(blocked|readable|error control|error errno=[0-9]{1,5})$/;
+  /^uid=(0|[1-9][0-9]{0,9}) procargs=(blocked|readable|error control|error sibling|error errno=[0-9]{1,5})$/;
 export function parseProbe(out: string, exitCode: number | null): ProbeResult | undefined {
   if (exitCode !== 0 || !out.endsWith("\n")) return undefined;
   const lines = out.slice(0, -1).split("\n");
