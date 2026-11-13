@@ -312,6 +312,28 @@ sub links_err {
       my @st = lstat($c);
       return "cannot stat: $c" unless @st;
       if (-l _) {
+        # The link's OWN target, one hop: relative, `..` only as leading components (pnpm's `../../<id>/…`), and,
+        # resolved from this link's real folder, inside the tree. Every link the kernel can meet on the way is in
+        # the tree and is checked here the same way, so no hop of any chain leaves it (round 2: a chain through an
+        # outside, writable link is refused at its first hop). Then the whole chain must end at an existing path.
+        my $t = readlink($c);
+        return "cannot read link: $c" unless defined $t;
+        return "absolute link in trusted tree: $c" if $t =~ m{\A/};
+        my @parts = split m{/}, $t, -1;
+        my ($up, $seen_name) = (0, 0);
+        for my $p (@parts) {
+          return "unsafe link target in trusted tree: $c" if $p eq "" || $p eq ".";
+          if ($p eq "..") {
+            return "link target climbs after a name: $c" if $seen_name;
+            $up++;
+          } else {
+            return "unsafe link target in trusted tree: $c" unless $p =~ $NAME;
+            $seen_name = 1;
+          }
+        }
+        my $base = $d;
+        for (1 .. $up) { $base =~ s{/[^/]*\z}{}; }
+        return "link leaves its trusted tree: $c" unless index("$base/", "$root/") == 0 && $seen_name;
         my $real = Cwd::realpath($c);
         return "dangling link in trusted tree: $c" unless defined $real && -e $real;
         return "link leaves its trusted tree: $c" unless index($real, "$root/") == 0;

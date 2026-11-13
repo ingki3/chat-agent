@@ -86,6 +86,17 @@ function checkTree(root: string): number {
           continue;
         }
         if (!target.startsWith(dir + path.sep)) throw new Error(`a link leaves its tree: ${p}`);
+        // The launcher's one-hop rule: a relative target, `..` only leading, staying in the tree from here.
+        const t = fs.readlinkSync(p);
+        const parts = t.split("/");
+        const firstName = parts.findIndex((x) => x !== "..");
+        if (
+          path.isAbsolute(t) ||
+          firstName < 0 ||
+          parts.slice(firstName).some((x) => x === ".." || x === "." || x === "" || !NAME.test(x)) ||
+          !(path.resolve(d, parts.slice(0, firstName).join("/") || ".") + path.sep).startsWith(dir + path.sep)
+        )
+          throw new Error(`a link target the launcher refuses: ${p}`);
       } else if (e.isDirectory()) stack.push(p);
       else if (!e.isFile()) throw new Error(`not a file or folder: ${p}`);
     }
@@ -138,6 +149,30 @@ export function libraryIds(): { store: string; id: string }[] {
   return [...out].map(([id, store]) => ({ store, id })).sort((a, b) => (a.id < b.id ? -1 : 1));
 }
 
+/**
+ * The resolved dependency graph of those folders, as pnpm links it: for every library folder, each package link in
+ * its `node_modules` (`<name>` or `@scope/<name>`) with its target text — `id<TAB>name<TAB>target`, sorted. Two locks
+ * with the same package set but other links (`a→b@1, c→b@2` vs `a→b@2, c→b@1`) differ here. Dangling links (pnpm's
+ * optional dependencies that are not installed — the bundle drops them) are left out.
+ */
+export function libraryLinks(libs = libraryIds()): string[] {
+  const out: string[] = [];
+  for (const { store, id } of libs) {
+    const nm = path.join(store, id);
+    const visit = (dir: string, prefix: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isSymbolicLink()) {
+          if (!fs.existsSync(p)) continue;
+          out.push(`${id}\t${prefix}${e.name}\t${fs.readlinkSync(p)}`);
+        } else if (e.isDirectory() && e.name.startsWith("@") && !prefix) visit(p, `${e.name}/`);
+      }
+    };
+    visit(nm, "");
+  }
+  return out.sort();
+}
+
 /** What the fingerprints are made of; the defaults are this server's own (tests change one at a time). */
 export type FingerprintSources = {
   body: ReturnType<typeof workerManifestBody>;
@@ -145,6 +180,8 @@ export type FingerprintSources = {
   workerDirs: readonly (readonly [string, string])[];
   /** The library folders' pnpm ids: their versions and peer sets, so a lock change shows. */
   libraryIds: readonly string[];
+  /** Their dependency graph (`libraryLinks`). */
+  libraryLinks: readonly string[];
   ocrFiles: readonly string[];
   node: { exe: string; version: string };
   /** The headless shell's executable; undefined when this server has none. */
@@ -159,6 +196,7 @@ export function defaultFingerprintSources(browser?: string): FingerprintSources 
       [DOC_WORKER_DIR, "docgen"],
     ],
     libraryIds: libraryIds().map((l) => l.id),
+    libraryLinks: libraryLinks(),
     ocrFiles: OCR_LANGS.map(langFile),
     node: { exe: fs.realpathSync(process.execPath), version: process.version },
     browser: findBrowser(browser),
@@ -193,6 +231,7 @@ export async function computeFingerprints(src: FingerprintSources): Promise<Work
       await hashFile(app, path.join(dir, f));
     }
   app.update(`\0libraries\0${src.libraryIds.join("\n")}`);
+  app.update(`\0links\0${src.libraryLinks.join("\n")}`);
   for (const f of src.ocrFiles) {
     app.update(`\0ocr/${path.basename(f)}\0`);
     await hashFile(app, f);

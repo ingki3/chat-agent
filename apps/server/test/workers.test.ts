@@ -34,6 +34,7 @@ import {
   defaultFingerprintSources,
   installedFingerprints,
   kindFingerprint,
+  libraryLinks,
   type FingerprintSources,
 } from "../src/workers/bundle.js";
 import { docAsAccount } from "../src/workers/docgen.js";
@@ -881,6 +882,7 @@ describe("the worker self-check and gates (#122)", () => {
       body: { docgen: { modules: {} as never, fonts: { regular: "r", bold: "b" } } } as never,
       workerDirs: [[w1, "extract"]],
       libraryIds: ["docx@9.15.0/node_modules", "saxes@5.0.1/node_modules"],
+      libraryLinks: [],
       ocrFiles: [file("kor.traineddata.gz", "k")],
       node: { exe: file("node", "n"), version: "v22.22.0" },
       browser: file("chrome-headless-shell", "c"),
@@ -909,6 +911,37 @@ describe("the worker self-check and gates (#122)", () => {
     await differs(() => void fs.writeFileSync(path.join(d, "node"), "N"), ["node"]);
     await differs(() => ({ ...base, node: { ...base.node, version: "v22.23.0" } }), ["node"]);
     await differs(() => void fs.writeFileSync(path.join(d, "chrome-headless-shell"), "C"), ["browser"]);
+    // The dependency graph: the same package set linked the other way round (a→b@1, c→b@2 vs a→b@2, c→b@1).
+    const store = path.join(d, "store");
+    const pkg = (id: string, name: string) =>
+      fs.mkdirSync(path.join(store, id, "node_modules", name), { recursive: true });
+    for (const [id, name] of [
+      ["a@1", "a"],
+      ["c@1", "c"],
+      ["b@1", "b"],
+      ["b@2", "b"],
+    ])
+      pkg(id, name);
+    const link = (from: string, to: string) => {
+      const l = path.join(store, from, "node_modules", "b");
+      fs.rmSync(l, { force: true });
+      fs.symlinkSync(`../../${to}/node_modules/b`, l);
+    };
+    const libs = ["a@1", "b@1", "b@2", "c@1"].map((id) => ({ store, id: `${id}/node_modules` }));
+    link("a@1", "b@1");
+    link("c@1", "b@2");
+    const g1 = libraryLinks(libs);
+    expect(g1).toEqual([
+      "a@1/node_modules\tb\t../../b@1/node_modules/b",
+      "c@1/node_modules\tb\t../../b@2/node_modules/b",
+    ]);
+    link("a@1", "b@2");
+    link("c@1", "b@1");
+    const g2 = libraryLinks(libs);
+    expect(g2).not.toEqual(g1);
+    expect((await computeFingerprints({ ...base, libraryLinks: g1 })).app).not.toBe(
+      (await computeFingerprints({ ...base, libraryLinks: g2 })).app,
+    );
     // What each kind compares: extract/docgen app + node, render the browser.
     const f1 = await computeFingerprints({ ...base, node: { ...base.node, version: "v23" } });
     expect(kindFingerprint(f1, "extract")).not.toBe(kindFingerprint(f0, "extract"));
@@ -1493,9 +1526,9 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     fs.symlinkSync(path.join(outside, "bin"), path.join(r.lib, "node", "bin"));
     const linked = run(r, ["run", "extract", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
     expect(linked.status).toBe(64);
-    expect(linked.stderr).toMatch(/node tree links: link leaves its trusted tree/);
+    expect(linked.stderr).toMatch(/node tree links: absolute link in trusted tree/);
     expect(spawnSync(r.launcher, ["verify", ME], { encoding: "utf8", env: {} }).stdout).toMatch(
-      /check node tree links fail link leaves its trusted tree/,
+      /check node tree links fail absolute link in trusted tree/,
     );
     fs.unlinkSync(path.join(r.lib, "node", "bin"));
     fs.renameSync(path.join(r.lib, "node", "bin.real"), path.join(r.lib, "node", "bin"));
@@ -1504,6 +1537,28 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     expect(dangling.status).toBe(64);
     expect(dangling.stderr).toMatch(/app tree links: dangling link in trusted tree/);
     fs.unlinkSync(path.join(r.lib, "app", "dangling"));
+    // A chain that leaves the tree and comes back (app/module.mjs → outside/bridge → app/real.mjs, with `outside`
+    // writable by anyone, so `bridge` could later be swapped): refused at its first hop, absolute or relative.
+    const out2 = tmp();
+    fs.chmodSync(out2, 0o777);
+    fs.symlinkSync(path.join(r.lib, "app", "docgen", "worker.mjs"), path.join(out2, "bridge"));
+    const relOut = path.relative(path.join(r.lib, "app"), path.join(out2, "bridge"));
+    for (const [target, why] of [
+      [path.join(out2, "bridge"), /absolute link in trusted tree/],
+      [relOut, /link target climbs after a name|link leaves its trusted tree/],
+    ] as const) {
+      fs.symlinkSync(target, path.join(r.lib, "app", "module.mjs"));
+      const chain = run(r, ["run", "docgen", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
+      expect(chain.status, target).toBe(64);
+      expect(chain.stderr).toMatch(why);
+      fs.unlinkSync(path.join(r.lib, "app", "module.mjs"));
+    }
+    // A relative target that climbs after a name, even when it ends inside the tree, is refused too.
+    fs.symlinkSync("docgen/../docgen/worker.mjs", path.join(r.lib, "app", "module.mjs"));
+    expect(run(r, ["run", "docgen", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}").stderr).toMatch(
+      /climbs after a name/,
+    );
+    fs.unlinkSync(path.join(r.lib, "app", "module.mjs"));
     // An in-tree link to an in-tree file is fine (the bundle's pnpm links).
     const ok = run(r, ["run", "docgen", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
     expect(ok.status, ok.stderr).toBe(0);
