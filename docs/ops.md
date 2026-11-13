@@ -954,13 +954,13 @@ PRD FR-8.2·8.6·8.7, 수용 기준 5. 엔진만 — 예약 화면은 #55, 실�
 - 7일 실측(정규 회차 ±1분, 휴대폰 수신)은 #56·#57에서 실제 핸들러로 한다(수용 기준 5 절차 1·3).
 
 ## 26. 파일 추출·위치 색인 (#48)
-PRD FR-4.2·4.3·4.5, 수용 기준 2·11. 방식과 근거는 `docs/decisions/isolation.md` "파일 추출·위치 색인 (#48)". HWP·HWPX는 #23, 파일 뷰어는 #24.
+PRD FR-4.2·4.3·4.5, 수용 기준 2·11. 방식과 근거는 `docs/decisions/isolation.md` "파일 추출·위치 색인 (#48)". HWP·HWPX는 34절(#23), 파일 뷰어는 #24.
 
 ### 26.1 무엇이 일어나나
 - 업로드가 저장되면 서버가 그 파일의 글자를 **위치(locator)와 함께** 뽑는다 — 백그라운드에서 한 번에 한 파일, 샌드박스 안의 별도 node 프로세스(그 파일 하나만 읽고, 쓰기·네트워크·자식 프로세스 없음). 결과는 DB `file_extracts`·`file_segments`(0024 마이그레이션). 파일을 지우면(입력창 ✕, 대화 삭제) 함께 지워진다.
-- 형식과 위치: PDF는 쪽(+ 줄 상자), 스캔본 PDF·사진은 OCR 단어 상자, DOCX는 문단 번호·표 번호와 행, XLSX는 시트와 칸(`B2`), CSV는 행과 칸, PPTX는 슬라이드, TXT·MD는 줄. HWP·HWPX는 아직 `extract_unsupported`(#23).
+- 형식과 위치: PDF는 쪽(+ 줄 상자), 스캔본 PDF·사진은 OCR 단어 상자, DOCX는 문단 번호·표 번호와 행, XLSX는 시트와 칸(`B2`), CSV는 행과 칸, PPTX는 슬라이드, TXT·MD는 줄, HWP·HWPX는 문단 번호·표 번호와 행·각주(34절).
 - 한도: 파일당 글자 2백만 자, PDF 500쪽, OCR 30쪽, 그림 4천만 화소, Office 압축 해제 항목당 64MB·합계 256MB, 추출 시간 60초(OCR이 필요할 수 있는 PDF·사진은 300초), 메모리 768MB(같은 경우 1.5GB). 넘으면 잘라서(`truncated`) 또는 실패 코드로 남긴다.
-- 거부(파일은 저장되지만 읽지 않는다): zip 폭탄(`extract_too_large`), 경로 탈출(`extract_path_escape`), DTD·외부 엔티티(`extract_xml_forbidden`), 손상(`extract_zip_invalid`·`extract_xml_invalid`·`extract_invalid`), 암호 PDF(`extract_encrypted`). 코드와 화면 문구는 `packages/shared/src/locators.ts`의 `EXTRACT_CODES`·`EXTRACT_CODE_TEXT`.
+- 거부(파일은 저장되지만 읽지 않는다): zip 폭탄(`extract_too_large`), 경로 탈출(`extract_path_escape`), DTD·외부 엔티티(`extract_xml_forbidden`), 손상(`extract_zip_invalid`·`extract_xml_invalid`·`extract_invalid`), 암호 PDF·HWP·HWPX(`extract_encrypted`), 배포용 HWP(`extract_distribution`), HWP zlib 폭탄·순환하는 섹터 체인(34절). 코드와 화면 문구는 `packages/shared/src/locators.ts`의 `EXTRACT_CODES`·`EXTRACT_CODE_TEXT`.
 - 서버를 끄면 실행 중인 추출은 멈추고 그 파일은 `pending`으로 남아 다음 시작에 다시 한다(파일마다 3번까지). 추출기 버전(`EXTRACTOR_VERSION`)이 바뀌면 시작할 때 모든 파일을 다시 뽑는다.
 
 ### 26.2 OCR — 설치할 것 없음
@@ -980,7 +980,7 @@ PRD FR-4.2·4.3·4.5, 수용 기준 2·11. 방식과 근거는 `docs/decisions/i
 ### 26.4 로그와 확인
 - 로그: `file.extracted`(`extractCode`, 소요 시간, 파일·대화·사용자 ID), `file.extract_resumed`(개수), `file.tool_finished`(도구, `fileToolCode`). 파일 이름·글자·검색어는 남기지 않는다.
 - 뽑은 글자는 알려진 비밀 값을 가려 저장하고(자르지 않은 전체 글자를 먼저 가린 뒤에만 긴 단위를 20만 자로 잘라 저장), 도구가 읽을 때마다 그때 아는 비밀로 다시 가린다(원본 바이트는 그대로, 24.2절). 새 비밀이 등록되면, 잘라 저장한 단위가 있는 파일은 원본에서 다시 추출하며 그동안은 `pending`이다(아무것도 내주지 않음). 서버가 시작할 때도 그런 파일은 다시 추출한다. 줄 상자·칸 위치는 바뀐 길이를 따라 옮긴다. 비밀이 두 줄·칸에 걸쳐 위치를 지킬 수 없으면 그 단위는 쪽·행 위치만 남고 줄 번호는 주장하지 않는다.
-- 시험: `pnpm test apps/server/test/extract.test.ts`(형식별 fixture·기대 locator, zip 폭탄·XXE·billion laughs·zip slip·경로 탈출 거부, 샌드박스에서 남의 파일 못 읽음, OCR — OCR이 없으면 이유를 밝히고 건너뜀), `apps/server/test/file-tools.test.ts`(업로드 → 추출 → API 권한, 도구 범위, "12쪽 요약"을 FakeRuntime·Claude·Codex 재생에서), `E2E_PORT=3114 pnpm e2e e2e/file-citations.spec.ts`. fixture를 다시 만들려면 `python3 -I fixtures/extract/make-fixtures.py`(Pillow·macOS `cupsfilter` 필요, 시험은 커밋된 파일을 쓴다).
+- 시험: `pnpm test apps/server/test/extract.test.ts`(형식별 fixture·기대 locator, zip 폭탄·XXE·billion laughs·zip slip·경로 탈출 거부, 샌드박스에서 남의 파일 못 읽음, OCR — OCR이 없으면 이유를 밝히고 건너뜀), `apps/server/test/file-tools.test.ts`(업로드 → 추출 → API 권한, 도구 범위, "12쪽 요약"을 FakeRuntime·Claude·Codex 재생에서), `E2E_PORT=3114 pnpm e2e e2e/file-citations.spec.ts`. fixture를 다시 만들려면 `python3 -I fixtures/extract/make-fixtures.py`(Pillow·macOS `cupsfilter` 필요, 시험은 커밋된 파일을 쓴다). HWP·HWPX는 `apps/server/test/hwp.test.ts`와 `make-hwp-fixtures.py`(34절).
 
 ### 26.5 받아들인 한계 — 비밀 가림
 - 스캔 쪽의 원래 글자(8자 미만)와 그 쪽 그림을 OCR한 글자는 **서로 다른 층**으로 저장된다(원래 글자 먼저, OCR 글자는 Tesseract가 읽은 순서 그대로). 한 비밀 값이 두 층에 나뉘어 있으면(일부는 글자, 일부는 그림) 하나의 값으로 알아보지 못한다 — "임의 구분자로 나뉜 값"과 같은 범위 밖. 두 층의 경계에서 잘린 값의 앞부분은 가린다.
@@ -1305,6 +1305,33 @@ PRD FR-14.1~14.3·14.4·14.7, FR-6.3, 수용 기준 6, #3 부분 공유 결정. 
   - 이메일 거부, 쓰기·run·MCP 거부, 아티팩트 공유.
 - `apps/server/test/permissions.test.ts`: 권한 행렬. 모든 리소스 경로에 "shared"(live 공유 대상) 열이 있고, 새 공유 경로 9개의 행이 있다.
 - `E2E_PORT=3121 pnpm e2e e2e/shares.spec.ts`(데스크톱·모바일, 프로젝트마다 새 계정): `/shared`에서 공유하고, 공유받은 사람이 읽기 전용으로 열고, 쓰기는 403이다. 공유를 끄면 열린 화면이 바로 닫히고 URL이 403이다. snapshot 경계와 이메일 거부도 확인한다.
+
+## 34. HWP·HWPX 추출 — 표·문단 위치, 암호·배포용 거부 (#23)
+PRD FR-4.4, 수용 기준 2. 방식·후보 비교·한계는 `docs/decisions/hwp.md`. 파이프라인(샌드박스 작업자, 저장, 비밀 가림, 도구)은 26절 그대로다.
+
+### 34.1 무엇을 하나
+- 올린 한글 파일을 다른 형식처럼 백그라운드에서 읽는다. **HWP 5.0**(바이너리)과 **HWPX**(XML) 모두 직접 파싱한다 — 새 패키지도, 설치할 프로그램(한컴오피스·LibreOffice·Python)도 없다.
+- 인용 위치(쪽 정보가 파일에 없으므로 쪽은 없다):
+  - 본문 문단: "과제안내.hwp · 12번째 문단"(문서 전체에서 비지 않은 문단을 1부터).
+  - 표: "과제안내.hwp · 3번째 표 · 2행"(본문에 바로 든 표를 1부터, 행 하나가 단위, 칸까지 맞으면 "· 2열"). 병합 셀은 첫 행·첫 열에 한 번 나온다.
+  - 단위는 읽는 순서대로 나온다. 문단 안의 각주·표·빠지는 부분 앞뒤로 문단이 나뉘며, 나뉜 조각의 인용에는 글자 범위가 없다(문단 번호는 같다).
+  - 각주·미주: "· 2번째 문단 · 각주 1", "· 1번째 표 · 3행 · 각주 2", "· 미주 1" — 번호는 문서가 저장한 번호(없으면 번호 없이 붙은 자리만).
+  - 셀 주소·병합이 표 크기와 맞지 않는 표(손상·이상한 작성기)는 "· 3번째 표"까지만(행·열을 주장하지 않음).
+  - 표 안의 표·글상자·표 캡션의 글은 그것을 담은 칸·문단의 그 자리에 붙는다. 머리말·꼬리말·숨은 설명은 저장하지 않는다. 서버는 그 글을 남기는 글과 함께 읽는 순서대로 알려진 비밀로 가린 뒤 버린다. 그래서 둘에 나뉜 비밀도 한 값으로 가려진다(결정 기록 "비밀 가림"). 그 옆 단위는 틈이 있는 단위로 저장된다. 비밀이 새로 등록되면 그 파일은 다시 추출된다(그동안 `pending`). HWPX `hp:switch`는 `default`만 읽는다. switch·default는 투명해서, 그 안의 글은 바깥의 칸·각주·머리말에 그대로 속한다. `case`(다른 프로그램용 대체 내용)는 읽지도 저장하지도 않는다. 비밀의 일부가 `case`에만 있는 경우는 그림 속 글자처럼 범위 밖이다(결정 기록 "대체 내용").
+- **읽지 않는 문서**(파일은 저장되고 보낼 수 있다, 글자는 없음): 암호·DRM·공인인증서 암호화 HWP, 암호 HWPX → `extract_encrypted`("암호가 걸린 파일이라 읽을 수 없어요"); 배포용(편집 제한) HWP → `extract_distribution`("배포용(편집 제한) 문서라 읽을 수 없어요"); HWP 5가 아닌 버전 → `extract_unsupported`. 첨부 칩이 올린 직후 그 문구를 보여 주고(추출이 끝날 때까지 1초부터 최대 15초 간격으로 계속 읽음 — 새로고침한 뒤 되살아난 칩도), 모델도 같은 코드·문구를 받는다.
+- 거부(26절과 같은 원칙): zlib 폭탄(구역당 풀린 크기 64MB·합계 256MB → `extract_too_large`), 순환하거나 파일 밖을 가리키는 섹터 체인·디렉터리, 스트림 밖 레코드(`extract_invalid`), HWPX의 DTD(`extract_xml_forbidden`), 패키지 밖 경로(`extract_path_escape`), 깨진 ZIP(`extract_zip_invalid`).
+- 추출기 버전이 `extract-11`이 되어, 이 버전으로 처음 시작할 때 **모든 파일을 다시 뽑는다**(파일 수만큼 시간이 걸리고, 그동안 해당 파일은 `pending`). 지금까지 `extract_unsupported`였던 HWP·HWPX가 이때 읽힌다. DB 마이그레이션은 없다.
+
+### 34.2 확인
+- 시험: `pnpm test apps/server/test/hwp.test.ts`(fixture별 기대 단위·locator — 두 형식에 같은 기대값, 빼는 구조(머리말·꼬리말·숨은 설명)마다 읽는 순서의 그 자리에 숨은 단위(앞·뒤·각주 앞·표 앞 × 종류 × 두 형식), 숨은 글 한도, 저장된 각주 번호, 표 크기와 맞지 않는 셀 주소, 암호·배포용·속성 비트별 거부, zlib 폭탄의 `maxOutputLength`, CFB 손상·순환, 레코드 크기·중첩, HWPX DTD·경로 탈출, 한도에서 `truncated`·`endsEarly`, macOS 샌드박스 실행), `apps/server/test/file-tools.test.ts`의 HWP 묶음(업로드 → 추출 → API, `file_read`·`file_cite` 라벨과 답의 인용 노트 "sample.hwp · 1번째 표 · 3행 · 3열", 암호·배포용 고정 코드, HWPX 표 칸·각주의 비밀 가림, 빼는 구조 × 앞·뒤·각주 앞·표 앞 24가지에서 비밀의 어느 쪽도 DB·API·`file_read`에 없음 — 나중에 등록한 비밀은 다시 추출로, 나뉜 문단의 두 구절 인용은 글자 범위 없이 같은 문단), `apps/web/test/extract-watch.test.ts`(칩 문구), `apps/server/test/instructions.test.ts`(INJ-4가 HWP를 추출한 글로 돈다).
+- fixture 다시 만들기: `python3 -I fixtures/extract/make-hwp-fixtures.py`(표준 라이브러리만, 같은 바이트가 나온다). `fixtures/acceptance/injection/doc-injection.hwp`도 함께 `doc-injection.md`에서 만든다.
+- 손으로: 한글로 표·각주가 있는 문서를 HWP와 HWPX로 각각 저장해 올리고 "표 내용 정리해줘" → 답의 출처가 "… · N번째 표 · R행"으로 붙는지. 같은 문서를 "배포용 문서로 저장"·"문서 암호"로 저장해 올리면 칩에 바로 "… 읽을 수 없어요"가 나오는지.
+
+### 34.3 받아들인 한계
+- fixture는 형식 문서대로 직접 쓴 파일이다. 한글이 만든 실제 파일에서 다르게 보이는 점이 있으면 알려 달라(`file.extracted`의 `extractCode`가 `extract_invalid`인 HWP — 파일 내용은 로그에 남지 않는다).
+- HWPX 배포용은 별도 표식을 확인하지 못해, 걸리더라도 `extract_encrypted`로 나온다.
+- **실제 한글이 만든 파일과의 호환성은 아직 확인하지 않았다** — 34.2의 손 확인이 그 확인이다. 쪽 번호는 없다(안정적인 쪽 매핑을 구현하지 않음).
+- 주입 평가 INJ-4(`pnpm -s injection-eval`)는 HWP를 샌드박스 추출기로 읽는다 — macOS가 아닌 곳에서는 그 사례가 `error`(`material_unavailable`)로 나온다(통과로 치지 않음).
 
 ## 36. 공유 화면·포크·열람 확인·가족 공유 묶음 (#52)
 PRD FR-2.4, FR-8.8, FR-14.3~14.6. 투영·경로 규칙은 §33과 `docs/decisions/sharing.md`를 따른다. 공유받은 사람에게 가는 것은 이 절의 경로에서도 모두 `SharePolicy.project`의 결과뿐이다.

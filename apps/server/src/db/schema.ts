@@ -1034,7 +1034,10 @@ export const fileSegments = sqliteTable(
      * unit's own locator is true — nothing finer (box, range, line) may be claimed.
      */
     approximate: integer("approximate", { mode: "boolean" }).notNull().default(false),
-    /** The stored copy was cut for display after scrubbing (`text` or the sheet name): it has a gap. */
+    /**
+     * The stored copy has a gap: cut for display after scrubbing (`text` or the sheet name), or next to text the
+     * extractor left out (HWP hidden units, #23) — never joined on read; a later secret extracts the file again.
+     */
     cut: integer("cut", { mode: "boolean" }).notNull().default(false),
     /** Text the extractor did not take follows right after this unit: the cut-off-secret rule applies here only. */
     endsEarly: integer("ends_early", { mode: "boolean" }).notNull().default(false),

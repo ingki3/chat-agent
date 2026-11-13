@@ -26,6 +26,7 @@ import {
   FILE_NAME_HEADER,
   UPLOAD_ID_HEADER,
   FileListResponse,
+  FileTextResponse,
   UploadedFile,
   AdminUser,
   AuthState,
@@ -544,6 +545,9 @@ export const files = {
   list: async (conversationId: string) =>
     FileListResponse.parse(await call("GET", `/api/conversations/${enc(conversationId)}/files`)).items,
   remove: async (id: string) => call("DELETE", `/api/files/${enc(id)}`),
+  /** Its extraction's state (#48·#23): `pending`, `ok` or `failed` with a fixed code. */
+  extract: async (id: string) =>
+    FileTextResponse.parse(await call("GET", `/api/files/${enc(id)}/extract?limit=1`)).extract,
   /** The original: a download (`inline` shows a PNG/JPG in the page instead). */
   url: (id: string, inline = false) => `/api/files/${enc(id)}/content${inline ? "?inline=1" : ""}`,
 };

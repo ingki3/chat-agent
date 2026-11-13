@@ -49,7 +49,8 @@ const marksOf = (seg: Pick<SegmentRow, "marks">): Mark[] => {
     return [];
   }
 };
-type StoredLoc = UnitLocator & { sheetNo?: number };
+/** `split`: one piece of a paragraph or row the extractor split in reading order (HWP, #23) — no exact range. */
+type StoredLoc = UnitLocator & { sheetNo?: number; split?: boolean };
 /** A cited place: the locator, and the cited unit's sheet number for an XLSX cell (stored with the citation). */
 export type CitedLocator = FileLocator & { sheetNo?: number | undefined };
 const locOf = (seg: Pick<SegmentRow, "locator">): StoredLoc => JSON.parse(seg.locator) as StoredLoc;
@@ -139,6 +140,8 @@ export function locate(
     if (kind === "cell_range" && typeof f.range === "string") base.range = f.range;
     base.charRange = [start, end];
   } else base.charRange = [start, end];
+  // A piece of a split paragraph or row (review #120): its offsets are not the whole unit's — none claimed.
+  if (locOf(seg).split === true) delete base.charRange;
   return valid(base) ?? own;
 }
 

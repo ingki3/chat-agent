@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FILE_ACCEPT, FILE_LIMITS, fileKindOf, type UploadedFile } from "@agentlee/shared";
 import { useQueryClient } from "@tanstack/react-query";
 import { errorText, files as filesApi } from "../api.js";
+import { watchExtract } from "./extract-watch.js";
 
 /**
  * Composer attachments (#22, FR-4.1·4.6): files picked, dropped or pasted are checked here first — size, count
@@ -17,6 +18,8 @@ export type Attachment = {
   /** The client's id for the upload (sent with it): cancelling by it works before the file's id is known. */
   uploadId?: string;
   file?: UploadedFile;
+  /** The server could not read the file's text (#23): said at once, the file still goes with the message. */
+  notice?: string;
 };
 
 const sizeText = (n: number) =>
@@ -45,6 +48,35 @@ const discarded = new Set<string>();
 const discardKey = (f: UploadedFile) => f.uploadId ?? f.id;
 
 /**
+ * Chips for the conversation's unsent files this composer has not shown yet (uploaded before a reload or on
+ * another device): marked as shown in `seen`, handed to `register` (the composer's list), and only then each
+ * watched until its extraction is final (`watch`) — so a file the server cannot read says so after a reload too
+ * (review #120).
+ */
+export function restoreChips(
+  existing: readonly UploadedFile[],
+  seen: Set<string>,
+  register: (chips: Attachment[]) => void,
+  watch: (key: string, fileId: string) => void,
+): Attachment[] {
+  const back = existing.filter(
+    (f) => f.messageId === null && !seen.has(f.id) && !discarded.has(discardKey(f)),
+  );
+  const out = back.map((f): Attachment => ({
+    key: `a${++seq}`,
+    name: f.name,
+    bytes: f.bytes,
+    status: "done",
+    file: f,
+  }));
+  if (!out.length) return out;
+  for (const a of out) seen.add(a.file!.id);
+  register(out);
+  for (const a of out) watch(a.key, a.file!.id);
+  return out;
+}
+
+/**
  * `conversation()`: the conversation to upload to (the new-chat screen makes one on the first file);
  * `existing`: the conversation's files on the server (sent ones count towards the 20 too). Unsent ones — uploaded
  * before a reload or on another device — come back as chips, so they can be sent or removed (review #102).
@@ -62,25 +94,38 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
   const gone = useRef(new Set<string>());
   /** Chips removed while their upload was still under way, with their cancel request. */
   const cancelled = useRef(new Map<string, Promise<unknown>>());
-  useEffect(() => {
-    const back = existing.filter(
-      (f) => f.messageId === null && !seen.current.has(f.id) && !discarded.has(discardKey(f)),
-    );
-    if (!back.length) return;
-    for (const f of back) seen.current.add(f.id);
-    setItems((xs) => [
-      ...back.map((f): Attachment => ({
-        key: `a${++seq}`,
-        name: f.name,
-        bytes: f.bytes,
-        status: "done",
-        file: f,
-      })),
-      ...xs,
-    ]);
-  }, [existing]);
   const patch = (key: string, p: Partial<Attachment>) =>
     setItems((xs) => xs.map((x) => (x.key === key ? { ...x, ...p } : x)));
+  /** False once the composer is gone: its watches stop. */
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  /**
+   * A file the server cannot read (password, distribution-only HWP, damaged …) is said on its chip — watched until
+   * its extraction is final, for new uploads and for chips restored after a reload (review #120).
+   */
+  const watch = useCallback((key: string, fileId: string) => {
+    void watchExtract(() => filesApi.extract(fileId), {
+      stopped: () => !alive.current || !itemsRef.current.some((x) => x.key === key),
+    }).then((notice) => {
+      if (notice && alive.current) patch(key, { notice });
+    });
+  }, []);
+  useEffect(() => {
+    restoreChips(
+      existing,
+      seen.current,
+      (restored) => {
+        itemsRef.current = [...restored, ...itemsRef.current];
+        setItems((xs) => [...restored, ...xs]);
+      },
+      watch,
+    );
+  }, [existing, watch]);
 
   const add = useCallback(
     (picked: Iterable<File>) => {
@@ -129,6 +174,7 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
             // (review #102 4차). This one has it in `seen` and does not add it twice.
             void qc.invalidateQueries({ queryKey: ["files", id] });
             patch(a.key, { status: "done", file: uploaded });
+            watch(a.key, uploaded.id);
           } catch (e) {
             // Cancelled (the server answers `upload_cancelled`) or failed after the chip went: nothing to show.
             if (cancelled.current.delete(a.key)) return;
@@ -137,7 +183,7 @@ export function useAttachments(conversation: () => Promise<string>, existing: re
         })();
       }
     },
-    [conversation, existing, qc],
+    [conversation, existing, qc, watch],
   );
 
   const remove = useCallback((key: string) => {
@@ -204,13 +250,18 @@ export function AttachmentChips({
           className={`chip attach ${a.status}`}
           data-testid="attachment"
           data-status={a.status}
-          title={a.error ?? a.name}
+          title={a.error ?? a.notice ?? a.name}
         >
           <span aria-hidden>{a.status === "uploading" ? "⏳" : a.status === "failed" ? "⚠️" : "📎"}</span>
           <span className="attach-name">{a.name}</span>
           <span className="muted">
             {a.status === "uploading" ? "올리는 중…" : a.status === "failed" ? "실패" : sizeText(a.bytes)}
           </span>
+          {a.status === "done" && a.notice && (
+            <span className="attach-notice" role="status" data-testid="attachment-notice">
+              {a.notice}
+            </span>
+          )}
           {a.status === "failed" && a.error && (
             <span className="attach-error" role="alert">
               {a.error}

@@ -222,9 +222,11 @@ describe("extractor fixtures: text with locators per format (#48)", () => {
     expect(r.segments[0]!.text).toBe("한글");
   });
 
-  it("HWP/HWPX are not this extractor's (#23): extract_unsupported", async () => {
-    const r = await run({ ...job("sample.txt"), kind: "hwp" }).catch((e: { code: string }) => e.code);
-    expect(r).toBe("extract_unsupported");
+  it("HWP/HWPX have their own extractor (#23, hwp.test.ts): a text file claimed as one is not read", async () => {
+    const hwp = await run({ ...job("sample.txt"), kind: "hwp" }).catch((e: { code: string }) => e.code);
+    expect(hwp).toBe("extract_invalid");
+    const hwpx = await run({ ...job("sample.txt"), kind: "hwpx" }).catch((e: { code: string }) => e.code);
+    expect(hwpx).toBe("extract_zip_invalid");
   });
 
   it("the bytes read must be the stored file's size", async () => {
