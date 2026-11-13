@@ -173,8 +173,8 @@ function citedEntries(db: Db, conversationId: string): Cited[] {
       for (const raw of list) {
         const e = CitationEntry.safeParse(raw);
         if (!e.success) continue;
-        const fileId = (raw as { fileId?: unknown }).fileId;
-        out.push({ entry: e.data, fileId: typeof fileId === "string" && fileId ? fileId : null });
+        // #107 stores the file's id inside the locator, and only for a verified passage.
+        out.push({ entry: e.data, fileId: e.data.locator?.fileId ?? null });
       }
     }
   return out;
@@ -218,17 +218,24 @@ function webSource(a: WebAcc, timeZone: string): CollectedSource | undefined {
 /**
  * File citations (#48 — the `citation_note` entries #107 adds: no source id, no address, the file's name as the
  * title and the place label as the site, verified passages only). Kept apart from the web path: one entry per file
- * (by id when the entry carries one, else by name), the cited places in first-cited order.
+ * (by the locator's file id when the entry carries one, else by name), the cited places in first-cited order.
  */
 type FileAcc = { key: string; order: number; status: CitationStatus; name: string; locators: string[] };
 
 export const isFileEntry = (e: CitationEntry) =>
   e.status !== "unknown_source" && e.sourceId === null && e.url === null && !!e.title;
 
-function addFile(files: Map<string, FileAcc>, c: Cited, order: number): void {
+const fileNameKey = (e: CitationEntry) => cleanText(e.title, REFERENCE_LIMITS.title)?.normalize("NFC");
+
+/**
+ * An entry without an id (a failed passage: #107 keeps the locator for verified ones only) joins the first file of
+ * that name the conversation cites by id, so one file's verified and failed citations stay one entry.
+ */
+function addFile(files: Map<string, FileAcc>, idByName: Map<string, string>, c: Cited, order: number): void {
   const name = cleanText(c.entry.title, REFERENCE_LIMITS.title);
   if (!name) return;
-  const key = c.fileId ? `file:${c.fileId}` : `file-name:${name.normalize("NFC")}`;
+  const fileId = c.fileId ?? idByName.get(name.normalize("NFC")) ?? null;
+  const key = fileId ? `file:${fileId}` : `file-name:${name.normalize("NFC")}`;
   const label = cleanText(c.entry.site, REFERENCE_LIMITS.locator);
   const acc = files.get(key) ?? { key, order, status: c.entry.status, name, locators: [] };
   acc.status = better(acc.status, c.entry.status);
@@ -269,6 +276,11 @@ export function collectReferences(
       rows.set(r.id, r);
 
   const files = new Map<string, FileAcc>();
+  const idByName = new Map<string, string>();
+  for (const c of cited) {
+    const name = c.fileId && isFileEntry(c.entry) ? fileNameKey(c.entry) : undefined;
+    if (name && !idByName.has(name)) idByName.set(name, c.fileId!);
+  }
   // Web citations, grouped by the document they reached (review #115 round 2): a fetched row's identity is where
   // it ended — its `final_url`, or its `url` when it was not redirected. A start address is followed on to its
   // destination only when the cited rows give it exactly one (`/latest` → `/nov-12` and `/latest` → `/nov-13` are
@@ -282,7 +294,7 @@ export function collectReferences(
     const e = c.entry;
     if (e.status === "unknown_source") return;
     if (e.sourceId === null) {
-      if (isFileEntry(e)) addFile(files, c, order);
+      if (isFileEntry(e)) addFile(files, idByName, c, order);
       return;
     }
     const row = rows.get(e.sourceId);

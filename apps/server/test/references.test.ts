@@ -313,15 +313,22 @@ describe("gathering the sources", () => {
   it("file citations (#48 note entries, fixture rows): one entry per file, places in order, fileId when given", async () => {
     const t = await start();
     const c = conversation(t);
-    // #107's shape: no source id, no address, the file name as title, the place label as site (verified only),
-    // plus fields this code does not need (`locator`) — and an id, should an entry carry one.
-    const file = (n: number, status: CitationStatus, name: string, site: string | null, fileId?: string) => ({
-      ...entry(n, status, null, { title: name, site }),
-      locator: { page: n },
-      ...(fileId ? { fileId } : {}),
+    // #107's shape (citations/checker.ts): no source id, no address, the file name as title; a verified passage
+    // also carries the place label as site and the locator (with the file's id); a failed one carries neither.
+    const rev = "a".repeat(64);
+    const file = (n: number, status: CitationStatus, name: string, page: number | null, fileId: string) => ({
+      ...entry(n, status, null, { title: name, site: page ? `${page}쪽` : null }),
+      ...(status === "verified" && page
+        ? { locator: { fileId, fileRevision: rev, kind: "page", page } }
+        : {}),
     });
     const msg = answer(t.app, c.id, []);
-    const fid = crypto.randomUUID();
+    const [report, ledger, same1, same2] = [1, 2, 3, 4].map(() => crypto.randomUUID()) as [
+      string,
+      string,
+      string,
+      string,
+    ];
     t.db
       .update(messages)
       .set({
@@ -332,12 +339,14 @@ describe("gathering the sources", () => {
             missing: [],
             markers: [],
             citations: [
-              file(1, "verified", "과학 보고서.pdf", "3쪽"),
-              file(2, "verified", "과학 보고서.pdf", "5쪽"),
-              file(3, "verified", "과학 보고서.pdf", "3쪽"),
-              file(4, "snippet_not_found", "가계부.xlsx", null),
-              file(5, "verified", "같은 이름.pdf", "1쪽", fid),
-              file(6, "verified", "같은 이름.pdf", "2쪽", crypto.randomUUID()),
+              file(1, "verified", "과학 보고서.pdf", 3, report),
+              file(2, "verified", "과학 보고서.pdf", 5, report),
+              file(3, "verified", "과학 보고서.pdf", 3, report),
+              // A failed passage of the same file has no locator (no id): it joins that file's entry.
+              file(4, "snippet_not_found", "과학 보고서.pdf", null, report),
+              file(5, "snippet_not_found", "가계부.xlsx", null, ledger),
+              file(6, "verified", "같은 이름.pdf", 1, same1),
+              file(7, "verified", "같은 이름.pdf", 2, same2),
             ],
           },
         ],
