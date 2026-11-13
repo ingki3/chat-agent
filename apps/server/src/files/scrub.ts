@@ -53,6 +53,15 @@ export function scrubFile(units: readonly Unit[], registry?: KnownSecrets): Scru
 
 /** One run: the units joined, full matches — and the cut-off rule at its end when it ends early. */
 function scrubRun(units: readonly Unit[], endsEarly: boolean, registry?: KnownSecrets): ScrubbedSegment[] {
+  return runRanges(units, endsEarly, registry).map((r, i) =>
+    applyRanges(units[i]!.text, units[i]!.marks, r.ranges, r.edge),
+  );
+}
+
+type UnitRanges = { ranges: [number, number][]; edge: boolean };
+
+/** The masked ranges of each unit of one run (unit-local, sorted, apart); `edge`: a range crosses its edge. */
+function runRanges(units: readonly Unit[], endsEarly: boolean, registry?: KnownSecrets): UnitRanges[] {
   const full = units.map((u) => u.text).join(UNIT_SEPARATOR);
   const ranges = knownMasks(full, { ...(registry ? { registry } : {}), tail: endsEarly });
   let at = 0;
@@ -70,7 +79,7 @@ function scrubRun(units: readonly Unit[], endsEarly: boolean, registry?: KnownSe
       if (a < start || b > end) edge = true;
       local.push([Math.max(a, start) - start, Math.min(b, end) - start]);
     }
-    return applyRanges(u.text, u.marks, local, edge);
+    return { ranges: local, edge };
   });
 }
 

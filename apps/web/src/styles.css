@@ -553,6 +553,10 @@ h2 {
   flex-basis: 100%;
   color: var(--error);
 }
+.chip.attach .attach-notice {
+  flex-basis: 100%;
+  color: var(--muted);
+}
 .chip.attach button {
   padding: 0 4px;
   min-height: 0;

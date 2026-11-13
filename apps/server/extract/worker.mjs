@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { ExtractError } from "./errors.mjs";
+import { hwp, hwpx, HWP_LIMITS } from "./hwp.mjs";
 import { imageSize } from "./image.mjs";
 import { docx, pptx, xlsx } from "./ooxml.mjs";
 import { pdf, PDF_LIMITS } from "./pdf.mjs";
@@ -52,6 +53,12 @@ export async function run(job, deps = {}) {
     case "pptx":
       r = pptx(openZip(buf, job.limits?.zip), out);
       break;
+    case "hwp":
+      r = hwp(buf, out, { ...HWP_LIMITS, ...job.limits?.hwp });
+      break;
+    case "hwpx":
+      r = hwpx(openZip(buf, job.limits?.zip), out, { ...HWP_LIMITS, ...job.limits?.hwp });
+      break;
     case "csv":
       r = csv(buf, out);
       break;
@@ -94,7 +101,6 @@ export async function run(job, deps = {}) {
       break;
     }
     default:
-      // HWP and HWPX get their own extractor (#23).
       throw new ExtractError("extract_unsupported");
   }
   return {

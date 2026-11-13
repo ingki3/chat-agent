@@ -18,8 +18,8 @@ import type { Db } from "../db/client.js";
 import { fileExtracts, fileSegments } from "../db/schema.js";
 import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
 import { logEvent, type EventLogger } from "../logging.js";
-import { knownSecrets, scrubKnownDeep } from "../secrets/known.js";
-import { capText, capUnit, parseMarks, scrubFile } from "./scrub.js";
+import { knownSecrets, scrubKnownDeep, type KnownSecrets } from "../secrets/known.js";
+import { capText, capUnit, parseMarks, scrubFile, type ScrubbedSegment } from "./scrub.js";
 
 /** Characters of an XLSX sheet name kept (after it was scrubbed whole). */
 const MAX_SHEET_NAME = 200;
@@ -39,7 +39,7 @@ import type { FileRow, FileStore } from "./store.js";
  */
 
 /** Bumped whenever the worker's output changes: rows of an older version are extracted again. */
-export const EXTRACTOR_VERSION = "extract-10";
+export const EXTRACTOR_VERSION = "extract-11";
 const MAX_ATTEMPTS = 3;
 
 /** Folder of the extractor (same from src/ and dist/). */
@@ -63,7 +63,54 @@ export type WorkerSegment = {
   marks?: [number, number, Record<string, unknown>][];
   /** Text the extractor did not take follows right after this unit (`extract/segments.mjs` `boundary`). */
   endsEarly?: boolean;
+  /**
+   * Text the extractor read but leaves out (an HWP header, a hidden comment …, `Segments.hidden`, review #120): at
+   * its place in the reading order, scrubbed with the kept units and then dropped — never stored, served or
+   * logged. No `unit` or `loc`.
+   */
+  hidden?: true;
 };
+
+/** A kept unit after the scrub: its scrubbed text and marks, and what the store records about it. */
+export type KeptSegment = { seg: WorkerSegment; scrubbed: ScrubbedSegment; gap: boolean; endsEarly: boolean };
+
+/**
+ * The one place a worker's units become the text anyone may see (the store, the injection evaluation — review
+ * #120 3차): known secrets masked over the whole, uncut text in reading order — kept and hidden units together, in
+ * one linear pass: a secret across two units, or between kept text and a part the extractor leaves out, either
+ * way round, is found whole; the marks follow the replacements. (An HWPX `hp:case` is never read — its default is
+ * ordinary text in this order; review #120 4차.) The cut-off-secret rule at each point the extractor left text out for a limit (`endsEarly`) —
+ * and only there. Then the hidden units are dropped: only kept ones come out (a long unit is capped for display
+ * only after this — review #107 6차).
+ *
+ * `gap`: the stored copy is not the whole text around it (next to hidden text): like a
+ * capped unit it is never joined on read, and a secret registered later extracts the file again
+ * (`reextractCut`) — scrubbed with the hidden text once more.
+ */
+export function keptSegments(segments: readonly WorkerSegment[], registry?: KnownSecrets): KeptSegment[] {
+  const all = segments.filter(
+    (seg) =>
+      typeof seg?.text === "string" && (seg.hidden === true || (Number.isInteger(seg.unit) && !!seg.loc)),
+  );
+  const scrubbed = scrubFile(
+    all.map((seg) => ({
+      text: seg.text,
+      marks: seg.hidden ? undefined : seg.marks,
+      endsEarly: !!seg.endsEarly,
+    })),
+    registry,
+  );
+  const out: KeptSegment[] = [];
+  for (const [i, seg] of all.entries()) {
+    // Hidden text is dropped here, after the scrub.
+    if (seg.hidden) continue;
+    const gap = !!all[i - 1]?.hidden || !!all[i + 1]?.hidden;
+    // The text after it ended early when a hidden unit right after it did (a limit cut there).
+    const endsEarly = !!seg.endsEarly || (!!all[i + 1]?.hidden && !!all[i + 1]?.endsEarly);
+    out.push({ seg, scrubbed: scrubbed[i]!, gap, endsEarly });
+  }
+  return out;
+}
 export type WorkerResult =
   | {
       ok: true;
@@ -620,18 +667,9 @@ export class FileExtracts {
           `INSERT INTO file_segments (file_id, seq, unit, locator, text, marks, approximate, cut, ends_early)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
-        const segs = r.segments.filter(
-          (seg) => typeof seg?.text === "string" && Number.isInteger(seg.unit) && !!seg.loc,
-        );
-        // Known secrets out of the whole, uncut text in document order (a secret across two units is found, the
-        // marks follow the replacements) — and only then a long unit capped for display (review #107 6차).
-        // The cut-off-secret rule at each point the extractor left text out (`endsEarly`) — and only there.
-        const scrubbed = scrubFile(
-          segs.map((seg) => ({ text: seg.text, marks: seg.marks, endsEarly: !!seg.endsEarly })),
-        );
         this.scrubbedAt.set(file.id, knownSecrets.storedGeneration);
-        for (const [i, seg] of segs.entries()) {
-          const s = capUnit(scrubbed[i]!);
+        for (const { seg, scrubbed, gap, endsEarly } of keptSegments(r.segments)) {
+          const s = capUnit(scrubbed);
           // A sheet name comes whole: scrubbed whole, then capped for display (review #107 9차). A capped name is
           // stored with a gap, like a capped text: the unit counts as cut (a later secret extracts it again).
           const loc = scrubKnownDeep(seg.loc, { tail: false }) as WorkerSegment["loc"];
@@ -642,7 +680,7 @@ export class FileExtracts {
             nameCut = capped.cut;
           }
           if (s.cut || nameCut) capped = true;
-          if (seg.endsEarly) endedEarly = true;
+          if (endsEarly) endedEarly = true;
           insert.run(
             file.id,
             count++,
@@ -651,8 +689,8 @@ export class FileExtracts {
             s.text,
             s.marks ? JSON.stringify(s.marks) : null,
             s.approximate ? 1 : 0,
-            s.cut || nameCut ? 1 : 0,
-            seg.endsEarly ? 1 : 0,
+            s.cut || nameCut || gap ? 1 : 0,
+            endsEarly ? 1 : 0,
           );
           chars += s.text.length;
         }

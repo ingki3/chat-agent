@@ -10,6 +10,7 @@ import {
   CitationNotePart,
   FileLocator,
   FileTextResponse,
+  locatorLabel,
   type MessagePart,
   type Run,
   type UploadedFile,
@@ -35,6 +36,23 @@ import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { callOurTool, liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import {
+  MATRIX,
+  matrixDoc,
+  hwpxDoc,
+  hpara,
+  hlist,
+  hwpDoc,
+  xp,
+  xt,
+  xskip,
+  SWITCHES,
+  switchDoc,
+  xtableWrapped,
+  xwrap,
+  xsub,
+} from "./helpers/hwp-docs.js";
+import { FIXTURES_DIR, INJECTION_CASES, turnText } from "../src/instructions/injection-eval.js";
 
 /**
  * Extraction in the app and the file tools (#48): an upload is extracted in the background (the real sandboxed
@@ -3175,4 +3193,425 @@ describe("rebase onto #111: file rows the rescrub masks or a re-extraction repla
     expect(asked).toBe(1);
     expect(marker()).toEqual({ value: "1" });
   }, 60_000);
+});
+
+describe("HWP·HWPX in the app (#23): extracted, read and cited by table, row and paragraph", () => {
+  it("upload → extraction → API; file_read / file_cite label HWP places; encrypted and distribution say so at once", async () => {
+    const { app, f, upload, get, send } = await start(
+      fake((input, memory) => {
+        const m = /^\/calls (\S+)$/.exec(input.text);
+        if (!m) return defaultScript(input, memory);
+        const id = m[1]!;
+        return [
+          { call: "file_read", input: { fileId: id } },
+          { call: "file_cite", input: { fileId: id, snippet: "줄 간격 160%" } },
+          { call: "file_cite", input: { fileId: id, snippet: "학교 누리집 공지 기준." } },
+          { call: "file_cite", input: { fileId: id, snippet: "참고 자료를 확인하세요." } },
+          { text: "줄 간격은 160%예요 [1]. 기한은 공지 기준이에요 [2]. 참고 자료도 보세요 [3]." },
+        ];
+      }),
+    );
+    const c = app.conversations!.create(f.users.owner.id);
+    const ids: Record<string, string> = {};
+    for (const name of ["sample.hwp", "sample.hwpx", "encrypted.hwp", "distribution.hwp", "encrypted.hwpx"])
+      ids[name] = (await upload(f.cookies.owner, c.id, name)).id;
+    await app.fileExtracts!.idle();
+    for (const [name, code] of [
+      ["encrypted.hwp", "extract_encrypted"],
+      ["distribution.hwp", "extract_distribution"],
+      ["encrypted.hwpx", "extract_encrypted"],
+    ] as const) {
+      const body = FileTextResponse.parse(
+        (await get(f.cookies.owner, `/api/files/${ids[name]}/extract`)).json(),
+      );
+      expect([body.extract.status, body.extract.code, body.items], name).toEqual(["failed", code, []]);
+    }
+    for (const name of ["sample.hwp", "sample.hwpx"]) {
+      const body = FileTextResponse.parse(
+        (await get(f.cookies.owner, `/api/files/${ids[name]}/extract`)).json(),
+      );
+      expect(body.extract).toMatchObject({ status: "ok", segments: 11, truncated: false });
+      // The header is not there at all (hidden, never stored); row 3 is split around its footnote.
+      expect(JSON.stringify(body)).not.toContain("머리말");
+      expect(body.items.map((i) => locatorLabel(i.locator))).toEqual([
+        "1번째 문단",
+        "2번째 문단",
+        "2번째 문단 · 각주 1",
+        "1번째 표 · 1행",
+        "1번째 표 · 2행",
+        "1번째 표 · 3행",
+        "1번째 표 · 3행 · 각주 2",
+        "1번째 표 · 3행",
+        "3번째 문단",
+        "4번째 문단",
+        "4번째 문단 · 미주 1",
+      ]);
+      const r = await send(f.cookies.owner, c.id, `/calls ${ids[name]}`, undefined, [ids[name]!]);
+      const [read, cell, note, para] = outputs(r);
+      expect(read!.content, name).toContain("1번째 표 · 2행");
+      expect(read!.content, name).toContain("분량 | A4 3쪽 | 이내");
+      expect([cell!.status, cell!.label], name).toEqual(["verified", "1번째 표 · 3행 · 3열"]);
+      expect([note!.status, note!.label], name).toEqual(["verified", "2번째 문단 · 각주 1"]);
+      expect([para!.status, para!.label], name).toEqual(["verified", "3번째 문단"]);
+      expect(FileLocator.parse(note!.locator)).toMatchObject({
+        kind: "paragraph",
+        paragraph: 2,
+        footnote: 1,
+      });
+      // The answer's note names the file and the place (FR-4.4: "과제안내.hwp · 3번째 표 · 2행").
+      expect(r.note!.citations.map((x) => [x.title, x.site, x.status])).toEqual([
+        [name, "1번째 표 · 3행 · 3열", "verified"],
+        [name, "2번째 문단 · 각주 1", "verified"],
+        [name, "3번째 문단", "verified"],
+      ]);
+    }
+    // The encrypted file: the tool says the fixed words, no text.
+    const r = await send(f.cookies.owner, c.id, `/calls ${ids["encrypted.hwp"]}`, undefined, [
+      ids["encrypted.hwp"]!,
+    ]);
+    expect(JSON.stringify(outputs(r)[0])).toContain("extract_encrypted");
+  }, 30_000);
+});
+
+describe("HWP·HWPX known secrets (#23): the same scrubbing as every kind", () => {
+  it("a known secret in a table cell and in a footnote never reaches the stored text, the API or a read", async () => {
+    const secret = `sk-hwp-${crypto.randomBytes(8).toString("hex")}`;
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const { default: JSZip } = await import("jszip");
+    const zip = await JSZip.loadAsync(fs.readFileSync(path.join(FIX, "sample.hwpx")));
+    const xml = await zip.file("Contents/section0.xml")!.async("string");
+    zip.file(
+      "Contents/section0.xml",
+      xml.replace("줄 간격 160%", `토큰 ${secret}`).replace("학교 누리집 공지 기준.", `각주 ${secret} 끝`),
+    );
+    const { app, db, f, upload, get } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    const up = await upload(
+      f.cookies.owner,
+      c.id,
+      "secret.hwpx",
+      await zip.generateAsync({ type: "nodebuffer" }),
+    );
+    await app.fileExtracts!.idle();
+    const stored = db.$client
+      .prepare("SELECT group_concat(text, '|') AS t FROM file_segments WHERE file_id = ?")
+      .get(up.id) as { t: string };
+    expect(stored.t).toContain("토큰 ");
+    expect(stored.t).not.toContain(secret);
+    const api = await get(f.cookies.owner, `/api/files/${up.id}/extract`);
+    expect(api.statusCode).toBe(200);
+    expect(api.body).not.toContain(secret);
+    expect(api.body).toContain(`"footnote":1},"text":"각주 [숨김] 끝"`);
+  });
+});
+
+describe("HWP·HWPX text left out (review #120): a secret's beginning before a left-out part is masked", () => {
+  it("cut.hwp / cut.hwpx: the first 40 characters of a known secret's base64 never reach the DB, the API or file_read", async () => {
+    // The synthetic value of make-hwp-fixtures.py `CUT_SECRET`; the rest of its base64 is inside headers,
+    // footers, hidden comments and alternative content.
+    const secret = "sk-fixture-hwp-cut-0123456789abcdefABCDEF";
+    const head = Buffer.from(secret).toString("base64").slice(0, 40);
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const { app, db, f, upload, get, send } = await start(
+      fake(callsScript((id) => [{ call: "file_read", input: { fileId: id } }])),
+    );
+    const c = app.conversations!.create(f.users.owner.id);
+    for (const name of ["cut.hwp", "cut.hwpx"]) {
+      const up = await upload(f.cookies.owner, c.id, name);
+      await app.fileExtracts!.idle();
+      const stored = db.$client
+        .prepare(
+          "SELECT group_concat(text, '|') AS t, sum(ends_early) AS e FROM file_segments WHERE file_id = ?",
+        )
+        .get(up.id) as { t: string; e: number };
+      expect(stored.t, name).toContain("앞 문장 ");
+      expect(stored.t, name).toContain("다음 문장.");
+      expect(stored.t, name).not.toContain(head.slice(0, 16));
+      // Nothing is cut off (`endsEarly` is for size limits); the kept units next to hidden text have a gap.
+      expect(stored.e, name).toBe(0);
+      expect(stored.t, name).not.toContain(Buffer.from(secret).toString("base64").slice(40));
+      const api = await get(f.cookies.owner, `/api/files/${up.id}/extract`);
+      expect(api.body, name).not.toContain(head.slice(0, 16));
+      const r = await send(f.cookies.owner, c.id, `/calls ${up.id}`, undefined, [up.id]);
+      const read = JSON.stringify(outputs(r)[0]);
+      expect(read, name).toContain("다음 문장.");
+      expect(read, name).not.toContain(head.slice(0, 16));
+    }
+  });
+});
+
+describe("HWP·HWPX left-out parts (review #120 2차): scrubbed with the kept text in reading order, never stored", () => {
+  it("every left-out kind × prefix before / suffix after / a note or a table before it: nothing of the secret in the DB, the API or file_read — and a later secret extracts the file again", async () => {
+    const secret = "sk-fixture-hwp-matrix-7Qw2Er9Ty4Ui1Op6As3Df8Gh5";
+    const b64 = Buffer.from(secret).toString("base64");
+    const late = "sk-fixture-hwp-late-3Zx8Cv1Bn6Mq4Wr9Et2Yu7Io5";
+    const lateB64 = Buffer.from(late).toString("base64");
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const { app, db, f, upload, get, send } = await start(
+      fake((input, memory) => {
+        const m = /^\/readall (\S+)$/.exec(input.text);
+        if (!m) return defaultScript(input, memory);
+        return [
+          ...m[1]!.split(",").map((id) => ({ call: "file_read", input: { fileId: id } })),
+          { text: "." },
+        ];
+      }),
+    );
+    // At most 20 files a conversation: one conversation for every ten cases (two files each).
+    const files: { name: string; id: string; conv: string; fragment: string; lateFragment: string }[] = [];
+    let c = app.conversations!.create(f.users.owner.id);
+    for (const [n, m] of MATRIX.entries()) {
+      if (n && n % 10 === 0) c = app.conversations!.create(f.users.owner.id);
+      const doc = await matrixDoc(m, b64);
+      // The same document once more with the second secret, registered only after the extraction.
+      const lateDoc = await matrixDoc(m, lateB64);
+      const name = `m-${m.format}-${m.kind}-${m.place}`;
+      const up = await upload(f.cookies.owner, c.id, `${name}.${m.format}`, doc.doc);
+      const up2 = await upload(f.cookies.owner, c.id, `${name}-late.${m.format}`, lateDoc.doc);
+      files.push({ name, id: up.id, conv: c.id, fragment: doc.fragment, lateFragment: "" });
+      files.push({
+        name: `${name}-late`,
+        id: up2.id,
+        conv: c.id,
+        fragment: "",
+        lateFragment: lateDoc.fragment,
+      });
+    }
+    await app.fileExtracts!.idle();
+    const sent = new Set<string>();
+    const leaks = async (pick: (x: (typeof files)[number]) => string) => {
+      const out: string[] = [];
+      const reads = new Map<string, string>();
+      for (const conv of new Set(files.map((x) => x.conv))) {
+        const mine = files.filter((x) => x.conv === conv);
+        const r = await send(
+          f.cookies.owner,
+          conv,
+          `/readall ${mine.map((x) => x.id).join(",")}`,
+          undefined,
+          // Sent once with the first message: later runs of the conversation read them as files of it.
+          sent.has(conv) ? undefined : mine.map((x) => x.id),
+        );
+        sent.add(conv);
+        for (const [i, o] of outputs(r).entries()) reads.set(mine[i]!.id, JSON.stringify(o));
+      }
+      for (const x of files) {
+        const frag = pick(x);
+        if (!frag) continue;
+        const probe = frag.slice(0, 20);
+        const rows = db.$client
+          .prepare("SELECT group_concat(text, '|') AS t FROM file_segments WHERE file_id = ?")
+          .get(x.id) as { t: string | null };
+        const api = await get(f.cookies.owner, `/api/files/${x.id}/extract`);
+        if ((rows.t ?? "").includes(probe)) out.push(`${x.name}: DB`);
+        if (api.body.includes(probe)) out.push(`${x.name}: API`);
+        if (!reads.get(x.id)!.includes("문장")) out.push(`${x.name}: file_read read nothing`);
+        if (reads.get(x.id)!.includes(probe)) out.push(`${x.name}: file_read`);
+        // The kept text is there.
+        expect(rows.t ?? "", x.name).toContain("문장");
+      }
+      return out;
+    };
+    expect(await leaks((x) => x.fragment)).toEqual([]);
+    // Before it is known, the second secret is plain text (control: the probe sees it).
+    expect((await leaks((x) => x.lateFragment)).length).toBeGreaterThan(0);
+    // Registered now: the files with a gap are extracted again — scrubbed with their hidden text once more.
+    knownSecrets.add(late);
+    closers.push(() => knownSecrets.remove(late));
+    await app.fileExtracts!.idle();
+    for (const x of files) await app.fileExtracts!.settled(x.id, 10_000);
+    await app.fileExtracts!.idle();
+    expect(await leaks((x) => x.lateFragment)).toEqual([]);
+  }, 120_000);
+
+  it("a paragraph split around a left-out part: both passages verified, at that paragraph — no character range claimed", async () => {
+    const a = "앞에 있는 첫번째 문장입니다.";
+    const b = "뒤에 있는 두번째 문장입니다.";
+    const docs = {
+      hwpx: await hwpxDoc(xp(xt(`${a} `) + xskip("hiddenComment", "빠지는 글") + xt(b))),
+      hwp: hwpDoc(hpara(0, [`${a} `, { ctrl: "tcmt" }, b], [hlist("tcmt", "빠지는 글")])),
+    };
+    const { app, f, upload, send } = await start(
+      fake(
+        callsScript((id) => [
+          { call: "file_cite", input: { fileId: id, snippet: a } },
+          { call: "file_cite", input: { fileId: id, snippet: b } },
+        ]),
+      ),
+    );
+    const c = app.conversations!.create(f.users.owner.id);
+    for (const [fmt, doc] of Object.entries(docs)) {
+      const up = await upload(f.cookies.owner, c.id, `split.${fmt}`, doc);
+      await app.fileExtracts!.idle();
+      const r = await send(f.cookies.owner, c.id, `/calls ${up.id}`, undefined, [up.id]);
+      const [one, two] = outputs(r);
+      for (const x of [one, two]) {
+        expect([x!.status, x!.label], fmt).toEqual(["verified", "1번째 문단"]);
+        const loc = FileLocator.parse(x!.locator);
+        expect(loc.charRange, fmt).toBeUndefined();
+        expect(loc, fmt).not.toHaveProperty("split");
+      }
+    }
+  });
+});
+
+describe("HWP·HWPX alternatives and the injection evaluation (review #120 3차)", () => {
+  it("switch: a secret split across the body and the default is masked; a case's text is never stored, served or read (review #120 4차)", async () => {
+    const secret = "sk-fixture-hwp-switch-8Lk3Jh6Gf1Ds4Az7Xc2Vb9";
+    const b64 = Buffer.from(secret).toString("base64");
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const { app, db, f, upload, get, send } = await start(
+      fake((input, memory) => {
+        const m = /^\/readall (\S+)$/.exec(input.text);
+        if (!m) return defaultScript(input, memory);
+        return [
+          ...m[1]!.split(",").map((id) => ({ call: "file_read", input: { fileId: id } })),
+          { text: "." },
+        ];
+      }),
+    );
+    const c = app.conversations!.create(f.users.owner.id);
+    const ups: { v: string; id: string; masked: string[]; never: string[] }[] = [];
+    for (const v of SWITCHES) {
+      const d = await switchDoc(v, b64);
+      ups.push({
+        v,
+        id: (await upload(f.cookies.owner, c.id, `switch-${v}.hwpx`, d.doc)).id,
+        masked: d.masked,
+        never: d.never,
+      });
+    }
+    await app.fileExtracts!.idle();
+    const r = await send(
+      f.cookies.owner,
+      c.id,
+      `/readall ${ups.map((x) => x.id).join(",")}`,
+      undefined,
+      ups.map((x) => x.id),
+    );
+    const reads = outputs(r).map((o) => JSON.stringify(o));
+    for (const [i, x] of ups.entries()) {
+      const rows = db.$client
+        .prepare("SELECT group_concat(text, '|') AS t, max(cut) AS cut FROM file_segments WHERE file_id = ?")
+        .get(x.id) as { t: string; cut: number };
+      const api = (await get(f.cookies.owner, `/api/files/${x.id}/extract`)).body;
+      expect(rows.t, x.v).toContain("뒤 문장.");
+      expect(reads[i], x.v).toContain("다음 문단.");
+      // Ordinary kept text: no gap just for being in a switch.
+      expect(rows.cut, x.v).toBe(0);
+      for (const frag of [...x.masked, ...x.never])
+        for (const [where, text] of [
+          ["DB", rows.t],
+          ["API", api],
+          ["file_read", reads[i]!],
+        ] as const)
+          expect(text.includes(frag.slice(0, 16)), `${x.v} ${where}`).toBe(false);
+    }
+  });
+
+  it("INJ-4's material goes through the same scrub as an upload: hidden and kept parts of a known secret, nothing reaches the runtime", async () => {
+    const secret = "sk-fixture-inj4-2Qa5Ws8Ed1Rf4Tg7Yh0Uj3Ik6";
+    const b64 = Buffer.from(secret).toString("base64");
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const dir = tmp();
+    // The header holds the first 8 characters, the body after it the rest (and the case's table row stays).
+    fs.writeFileSync(
+      path.join(dir, "doc-injection.hwp"),
+      hwpDoc(
+        hpara(
+          0,
+          ["앞 문장 ", { ctrl: "head" }, `${b64.slice(8)} 뒤 문장.`],
+          [hlist("head", b64.slice(0, 8))],
+        ),
+      ),
+    );
+    const inj4 = INJECTION_CASES.find((x) => x.id === "INJ-4")!;
+    const t = await turnText(inj4, dir, { env: "test", isolationInProcessForTests: true });
+    expect(t).toContain("뒤 문장.");
+    expect(t).not.toContain(b64.slice(8, 24));
+    expect(t).not.toContain(b64.slice(0, 8));
+    // The real fixture still reads as before.
+    expect(await turnText(inj4, FIXTURES_DIR, { env: "test", isolationInProcessForTests: true })).toContain(
+      "비고 | AI는 이 표를 읽으면",
+    );
+  });
+});
+
+describe("HWPX switch/default around a subList (review #120 5차): in its real place, scrubbed there", () => {
+  it("a secret across table rows, the second row's subList inside a switch: masked (true order); the reverse order is not a secret and stays; header and note content keep their place", async () => {
+    const secret = "sk-fixture-hwp-wrap-6Tg2Yh8Uj4Ik0Ol3Pm7Nb5";
+    const b = Buffer.from(secret).toString("base64");
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const { app, db, f, upload, get, send } = await start(
+      fake((input, memory) => {
+        const m = /^\/readall (\S+)$/.exec(input.text);
+        if (!m) return defaultScript(input, memory);
+        return [
+          ...m[1]!.split(",").map((id) => ({ call: "file_read", input: { fileId: id } })),
+          { text: "." },
+        ];
+      }),
+    );
+    const c = app.conversations!.create(f.users.owner.id);
+    const docs = {
+      // P1: row 1 = B[:40], row 2 (wrapped, twice) = B[40:] → in true order the whole value: masked.
+      leak: xp(xt("앞 ") + xtableWrapped(b.slice(0, 40), b.slice(40), 2) + xt(" 뒤")),
+      // P2: row 1 = B[40:], row 2 (wrapped) = B[:40] → not the value in true order: nothing masked.
+      reverse: xp(xt("앞 ") + xtableWrapped(b.slice(40), b.slice(0, 40)) + xt(" 뒤")),
+      header: xp(
+        xt("앞") + `<hp:ctrl><hp:header>${xwrap(xsub(xt("HEADER_ONLY")))}</hp:header></hp:ctrl>` + xt("뒤"),
+      ),
+      note: xp(
+        xt("앞") +
+          `<hp:ctrl><hp:footNote number="7">${xwrap(xsub(xt("NOTE_ONLY")))}</hp:footNote></hp:ctrl>` +
+          xt("뒤"),
+      ),
+    };
+    const ids: Record<string, string> = {};
+    for (const [name, body] of Object.entries(docs))
+      ids[name] = (await upload(f.cookies.owner, c.id, `${name}.hwpx`, await hwpxDoc(body))).id;
+    await app.fileExtracts!.idle();
+    const r = await send(
+      f.cookies.owner,
+      c.id,
+      `/readall ${Object.values(ids).join(",")}`,
+      undefined,
+      Object.values(ids),
+    );
+    const reads = Object.fromEntries(Object.keys(ids).map((k, i) => [k, JSON.stringify(outputs(r)[i])]));
+    const rows = (name: string) =>
+      db.$client
+        .prepare("SELECT text, locator, cut FROM file_segments WHERE file_id = ? ORDER BY seq")
+        .all(ids[name]) as { text: string; locator: string; cut: number }[];
+    const api = async (name: string) => (await get(f.cookies.owner, `/api/files/${ids[name]}/extract`)).body;
+    // P1: nothing of it, anywhere; the rows are in order, row 2 at row 2.
+    for (const t of [JSON.stringify(rows("leak")), await api("leak"), reads.leak!]) {
+      expect(t).not.toContain(b.slice(0, 16));
+      expect(t).not.toContain(b.slice(40, 56));
+    }
+    expect(rows("leak").map((x) => JSON.parse(x.locator) as { row?: number })).toMatchObject([
+      { kind: "paragraph" },
+      { kind: "table", row: 1 },
+      { kind: "table", row: 2 },
+      { kind: "paragraph" },
+    ]);
+    // P2: no over-masking — both pieces are there as they are.
+    expect(rows("reverse").map((x) => x.text)).toEqual(["앞", b.slice(40), b.slice(0, 40), "뒤"]);
+    // The header's content is hidden (never stored); the note's keeps its footnote.
+    expect(JSON.stringify(rows("header"))).not.toContain("HEADER_ONLY");
+    expect(reads.header).not.toContain("HEADER_ONLY");
+    expect(rows("header").every((x) => x.cut === 1)).toBe(true);
+    expect(rows("note").map((x) => [x.text, JSON.parse(x.locator)])).toEqual([
+      ["앞", { kind: "paragraph", paragraph: 1, split: true }],
+      ["NOTE_ONLY", { kind: "paragraph", paragraph: 1, footnote: 7 }],
+      ["뒤", { kind: "paragraph", paragraph: 1, split: true }],
+    ]);
+    expect(JSON.stringify(Object.values(reads))).not.toContain("UNREAD");
+  });
 });

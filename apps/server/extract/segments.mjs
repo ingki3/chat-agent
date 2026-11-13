@@ -11,13 +11,17 @@
 // stops: the file's text ends there. A unit is never cut anywhere else (review #107 6차) — the server scrubs known
 // secrets out of the whole, uncut text first and only then caps a long unit for display (files/scrub.ts).
 
-export const SEGMENT_LIMITS = { maxChars: 2_000_000, maxSegments: 20_000 };
+import { ExtractError } from "./errors.mjs";
+
+export const SEGMENT_LIMITS = { maxChars: 2_000_000, maxSegments: 20_000, maxHiddenChars: 2_000_000 };
 
 export class Segments {
   constructor(limits = SEGMENT_LIMITS) {
     this.limits = limits;
     this.items = [];
+    this.kept = 0;
     this.chars = 0;
+    this.hiddenChars = 0;
     this.truncated = false;
   }
 
@@ -28,7 +32,7 @@ export class Segments {
     // it was cut, so a secret cut off there was not at the end any more).
     if (this.truncated) return false;
     if (!text || !text.trim()) return true;
-    if (this.items.length >= this.limits.maxSegments || this.chars >= this.limits.maxChars) {
+    if (this.kept >= this.limits.maxSegments || this.chars >= this.limits.maxChars) {
       this.end();
       return false;
     }
@@ -44,9 +48,25 @@ export class Segments {
       m = m?.filter(([s]) => s < cut).map(([s, e, f]) => [s, Math.min(e, cut), f]);
     }
     this.chars += t.length;
+    this.kept++;
     this.items.push(m?.length ? { unit, loc, text: t, marks: m } : { unit, loc, text: t });
     if (t.length < text.length) this.end();
     return !this.truncated;
+  }
+
+  /**
+   * Text the extractor reads but leaves out (an HWP header, a footer, a hidden comment — #23, review
+   * #120): a **hidden** unit at its place in the reading order. The server scrubs known secrets over the kept and
+   * hidden text together and stores only the kept units; hidden text is never stored, shown or logged. It does not
+   * count against the kept text's limits (it never pushes kept text out); its own total past `maxHiddenChars`
+   * refuses the file (`extract_too_large`) rather than drop any of it.
+   */
+  hidden(text) {
+    if (this.truncated || !text || !text.trim()) return;
+    this.hiddenChars += text.length;
+    if (this.hiddenChars > (this.limits.maxHiddenChars ?? SEGMENT_LIMITS.maxHiddenChars))
+      throw new ExtractError("extract_too_large");
+    this.items.push({ hidden: true, text });
   }
 
   /**
@@ -76,9 +96,7 @@ export class Segments {
   }
 
   get full() {
-    return (
-      this.truncated || this.items.length >= this.limits.maxSegments || this.chars >= this.limits.maxChars
-    );
+    return this.truncated || this.kept >= this.limits.maxSegments || this.chars >= this.limits.maxChars;
   }
 }
 
