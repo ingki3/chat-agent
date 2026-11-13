@@ -3343,14 +3343,17 @@ describe("HWP·HWPX text left out (review #120): a secret's beginning before a l
 });
 
 describe("HWP·HWPX left-out parts (review #120 2차): scrubbed with the kept text in reading order, never stored", () => {
-  it("every left-out kind × prefix before / suffix after / a note or a table before it: nothing of the secret in the DB, the API or file_read — and a later secret extracts the file again", async () => {
-    const secret = "sk-fixture-hwp-matrix-7Qw2Er9Ty4Ui1Op6As3Df8Gh5";
-    const b64 = Buffer.from(secret).toString("base64");
-    const late = "sk-fixture-hwp-late-3Zx8Cv1Bn6Mq4Wr9Et2Yu7Io5";
-    const lateB64 = Buffer.from(late).toString("base64");
-    knownSecrets.add(secret);
-    closers.push(() => knownSecrets.remove(secret));
-    const { app, db, f, upload, get, send } = await start(
+  // One test per case (review #120 2차: 24 cases × kept-text secret, and the same 24 with a secret registered after
+  // the extraction). Each has its own app and conversation; nothing is shared between cases.
+  const SECRET = "sk-fixture-hwp-matrix-7Qw2Er9Ty4Ui1Op6As3Df8Gh5";
+  const LATE = "sk-fixture-hwp-late-3Zx8Cv1Bn6Mq4Wr9Et2Yu7Io5";
+  /** Per case: an app with headroom on the Linux CI (in-process extraction there). */
+  const CASE_MS = 60_000;
+  const cases = MATRIX.map((m) => [`${m.format} ${m.kind} · ${m.place}`, m] as const);
+
+  /** An app that reads the given files with `file_read` on `/readall id,…`. */
+  const reader = () =>
+    start(
       fake((input, memory) => {
         const m = /^\/readall (\S+)$/.exec(input.text);
         if (!m) return defaultScript(input, memory);
@@ -3360,72 +3363,83 @@ describe("HWP·HWPX left-out parts (review #120 2차): scrubbed with the kept te
         ];
       }),
     );
-    // At most 20 files a conversation: one conversation for every ten cases (two files each).
-    const files: { name: string; id: string; conv: string; fragment: string; lateFragment: string }[] = [];
-    let c = app.conversations!.create(f.users.owner.id);
-    for (const [n, m] of MATRIX.entries()) {
-      if (n && n % 10 === 0) c = app.conversations!.create(f.users.owner.id);
-      const doc = await matrixDoc(m, b64);
-      // The same document once more with the second secret, registered only after the extraction.
-      const lateDoc = await matrixDoc(m, lateB64);
-      const name = `m-${m.format}-${m.kind}-${m.place}`;
-      const up = await upload(f.cookies.owner, c.id, `${name}.${m.format}`, doc.doc);
-      const up2 = await upload(f.cookies.owner, c.id, `${name}-late.${m.format}`, lateDoc.doc);
-      files.push({ name, id: up.id, conv: c.id, fragment: doc.fragment, lateFragment: "" });
-      files.push({
-        name: `${name}-late`,
-        id: up2.id,
-        conv: c.id,
-        fragment: "",
-        lateFragment: lateDoc.fragment,
-      });
-    }
-    await app.fileExtracts!.idle();
-    const sent = new Set<string>();
-    const leaks = async (pick: (x: (typeof files)[number]) => string) => {
-      const out: string[] = [];
-      const reads = new Map<string, string>();
-      for (const conv of new Set(files.map((x) => x.conv))) {
-        const mine = files.filter((x) => x.conv === conv);
-        const r = await send(
-          f.cookies.owner,
-          conv,
-          `/readall ${mine.map((x) => x.id).join(",")}`,
-          undefined,
-          // Sent once with the first message: later runs of the conversation read them as files of it.
-          sent.has(conv) ? undefined : mine.map((x) => x.id),
-        );
-        sent.add(conv);
-        for (const [i, o] of outputs(r).entries()) reads.set(mine[i]!.id, JSON.stringify(o));
-      }
-      for (const x of files) {
-        const frag = pick(x);
-        if (!frag) continue;
-        const probe = frag.slice(0, 20);
-        const rows = db.$client
-          .prepare("SELECT group_concat(text, '|') AS t FROM file_segments WHERE file_id = ?")
-          .get(x.id) as { t: string | null };
-        const api = await get(f.cookies.owner, `/api/files/${x.id}/extract`);
-        if ((rows.t ?? "").includes(probe)) out.push(`${x.name}: DB`);
-        if (api.body.includes(probe)) out.push(`${x.name}: API`);
-        if (!reads.get(x.id)!.includes("문장")) out.push(`${x.name}: file_read read nothing`);
-        if (reads.get(x.id)!.includes(probe)) out.push(`${x.name}: file_read`);
-        // The kept text is there.
-        expect(rows.t ?? "", x.name).toContain("문장");
-      }
-      return out;
-    };
-    expect(await leaks((x) => x.fragment)).toEqual([]);
-    // Before it is known, the second secret is plain text (control: the probe sees it).
-    expect((await leaks((x) => x.lateFragment)).length).toBeGreaterThan(0);
-    // Registered now: the files with a gap are extracted again — scrubbed with their hidden text once more.
-    knownSecrets.add(late);
-    closers.push(() => knownSecrets.remove(late));
-    await app.fileExtracts!.idle();
-    for (const x of files) await app.fileExtracts!.settled(x.id, 10_000);
-    await app.fileExtracts!.idle();
-    expect(await leaks((x) => x.lateFragment)).toEqual([]);
-  }, 120_000);
+
+  /** Where a fragment's probe is seen: the DB, the API, `file_read` (and whether the kept text is there at all). */
+  async function surfaces(
+    s: Awaited<ReturnType<typeof reader>>,
+    conv: string,
+    fileId: string,
+    probe: string,
+    firstRead: boolean,
+  ) {
+    const out: string[] = [];
+    const r = await s.send(
+      s.f.cookies.owner,
+      conv,
+      `/readall ${fileId}`,
+      undefined,
+      firstRead ? [fileId] : undefined,
+    );
+    const read = JSON.stringify(outputs(r)[0]);
+    const rows = s.db.$client
+      .prepare("SELECT group_concat(text, '|') AS t FROM file_segments WHERE file_id = ?")
+      .get(fileId) as { t: string | null };
+    const api = await s.get(s.f.cookies.owner, `/api/files/${fileId}/extract`);
+    if ((rows.t ?? "").includes(probe)) out.push("DB");
+    if (api.body.includes(probe)) out.push("API");
+    if (!read.includes("문장")) out.push("file_read read nothing");
+    if (read.includes(probe)) out.push("file_read");
+    // The kept text is there.
+    expect(rows.t ?? "").toContain("문장");
+    return out;
+  }
+
+  it.each(cases)(
+    "%s: nothing of a known secret in the DB, the API or file_read",
+    async (name, m) => {
+      knownSecrets.add(SECRET);
+      closers.push(() => knownSecrets.remove(SECRET));
+      const doc = await matrixDoc(m, Buffer.from(SECRET).toString("base64"));
+      const s = await reader();
+      const c = s.app.conversations!.create(s.f.users.owner.id);
+      const up = await s.upload(
+        s.f.cookies.owner,
+        c.id,
+        `m-${name.replace(/\W+/g, "-")}.${m.format}`,
+        doc.doc,
+      );
+      await s.app.fileExtracts!.idle();
+      expect(await surfaces(s, c.id, up.id, doc.fragment.slice(0, 20), true), name).toEqual([]);
+    },
+    CASE_MS,
+  );
+
+  it.each(cases)(
+    "%s: a secret registered after the extraction extracts the file again — then nothing of it anywhere",
+    async (name, m) => {
+      const doc = await matrixDoc(m, Buffer.from(LATE).toString("base64"));
+      const probe = doc.fragment.slice(0, 20);
+      const s = await reader();
+      const c = s.app.conversations!.create(s.f.users.owner.id);
+      const up = await s.upload(
+        s.f.cookies.owner,
+        c.id,
+        `late-${name.replace(/\W+/g, "-")}.${m.format}`,
+        doc.doc,
+      );
+      await s.app.fileExtracts!.idle();
+      // Before it is known, the secret is plain text (control: the probe sees it).
+      expect((await surfaces(s, c.id, up.id, probe, true)).length, name).toBeGreaterThan(0);
+      // Registered now: the file with a gap is extracted again — scrubbed with its hidden text once more.
+      knownSecrets.add(LATE);
+      closers.push(() => knownSecrets.remove(LATE));
+      await s.app.fileExtracts!.idle();
+      await s.app.fileExtracts!.settled(up.id, 10_000);
+      await s.app.fileExtracts!.idle();
+      expect(await surfaces(s, c.id, up.id, probe, false), name).toEqual([]);
+    },
+    CASE_MS,
+  );
 
   it("a paragraph split around a left-out part: both passages verified, at that paragraph — no character range claimed", async () => {
     const a = "앞에 있는 첫번째 문장입니다.";
