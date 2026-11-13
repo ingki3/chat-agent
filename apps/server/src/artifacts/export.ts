@@ -396,7 +396,10 @@ export class Renderer {
         code: e instanceof CdpError && e.code === "too_large" ? "export_limit" : "export_failed",
       };
     }
-    // The launcher's own limits (account mode): 124 its wall clock, 125 its memory watch.
+    // The launcher's own limits (account mode): 124 its wall clock, 125 its memory watch. Its pipes may close a
+    // moment before its exit is seen: a failed render waits briefly for the exit code.
+    if (worker && !killed && !result.ok && !exited)
+      await Promise.race([exit, new Promise((r) => setTimeout(r, 1000).unref())]);
     if (worker && !killed && exited) {
       if (exitCode === 124) killed = "timeout";
       else if (exitCode === 125) killed = "memory";

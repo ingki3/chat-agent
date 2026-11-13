@@ -1618,3 +1618,92 @@ PRD NFR 개인정보("사용자가 대화를 지우면 파일·아티팩트·공
 - `test/context.test.ts`: 요약의 일회성 세션이 성공·실패 모두 닫힌 뒤 넘어간다. `test/runs.test.ts`: 여는 중에 지워진 세션이 넘어간다.
 - 변이 확인: WAL 정리, 시작 때 대조, 캐시 비움, 업로드 폴더 확인, 백업 제외, run 멈춤 확인, 요약 세션 넘기기, Codex "없음" 판정을 각각 빼면 해당 시험이 실패한다.
 - `E2E_PORT=3102 pnpm e2e e2e/delete-cascade.spec.ts`(데스크톱·모바일, 테스트마다 새 계정): 파일을 붙여 묻고, 공유해 받은 사람이 연 뒤 주인이 사이드바 메뉴로 삭제 → 받은 사람의 공유 화면이 해제 안내로 바뀌고, API는 404/403, 알림함에서 사라지고, `.e2e/data` 아래 어떤 파일에도 그 글이 없다.
+
+## 41. 샌드박스 작업자를 전용 macOS 계정으로 — 추출기·문서 생성기·내보내기 브라우저 (#122)
+방식과 근거는 `docs/decisions/isolation.md` "샌드박스 작업자 전용 계정 (#122)". python_run(§35)과 같은 이유다: macOS 샌드박스는 **같은 UID**의 다른 프로세스 시작 환경(`KERN_PROCARGS2`)을 읽는 것을 막지 못하고, Claude 런타임은 API 키·OAuth 토큰을, 런타임 환경은 MCP bearer 토큰을 시작 환경에 둔다. 추출기(`extract/worker.mjs`, 올린 파일 파싱)·문서 생성기(`docgen/worker.mjs`)·내보내기 브라우저(헤드리스 셸, 아티팩트 문서)는 신뢰할 수 없는 바이트를 다루므로, 작업자가 뚫리면 같은 UID에서는 그 환경을 읽을 수 있다. 그래서 이 셋을 서버·런타임·python 계정과 **다른 UID**의 전용 계정으로 돌린다.
+
+### 41.1 동작
+- **전용 계정 하나, python과 따로:** `WORKER_RUN_USER`(예: `_agentleewk`). `PYTHON_RUN_USER`와 같으면 서버가 시작을 거부한다 — python은 모델이 쓴 코드를, 작업자는 다른 가족의 파일을 다루므로 UID·scratch ACL을 나누지 않는다.
+- **루트 소유 런처** `/usr/local/libexec/agentlee-worker-run`(`ops/workers/agentlee-worker-run`, Perl `-T`): python 런처(§35.2·35.3)의 신뢰 검사(조상 체인·트리 전체·ACL·설정 형식)·커널 신원 실행 기록·`reap`·`clean`·`verify` 함수를 **바이트 그대로** 쓰고(시험이 비교), 종류별 고정 프로그램을 더했다. 서버가 넘기는 것은 작업(`run`·`probe`·`reap`·`clean`·`verify`), 종류(`extract`·`ocr`·`docgen`·`render`), 작업 id(UUID), 시간제한(종류별 상한: 60·300·60·60초), `render`의 egress 프록시 루프백 포트뿐이다. node·작업자 프로그램·라이브러리·OCR 데이터·브라우저·scratch는 **루트 소유 설정**(`/usr/local/etc/agentlee-worker.conf`)에서 읽는다. 어떤 프로그램을 어떤 인자·환경·샌드박스 프로필로 돌릴지는 런처에 고정돼 있다 — 브라우저 스위치는 `browserArgs`와, 프로필은 `buildProfile`(지금의 같은 UID 샌드박스)과 **한 글자도 다르지 않다**(시험).
+- **입력·출력의 UID 경계:** 작업마다 `<DATA_DIR>/worker-scratch/<작업 id>/`를 서버가 만든다(서버 소유 0700, scratch의 상속 ACL로 계정이 쓴다). 추출은 저장 파일을 링크 따라가지 않고 열어(하드링크 거부 — `nlink === 1`) 새 0600 서버 소유 사본으로 복사하고 크기·SHA-256을 행과 대조한다(다르면 `extract_changed`). 추출기 프로필은 그 작업 폴더와 프로그램 트리만 읽고 아무것도 쓰지 못한다. 문서 생성기는 작업 폴더도 못 읽는다(stdin만 — 런처가 계정으로 작업 폴더에 받아 둔 뒤 fd로 넘긴다). 결과는 지금처럼 stdout의 JSON 하나다. 브라우저는 작업 폴더의 `home`·`tmp`·`profile`만 쓰고, 디버깅 파이프(fd 3·4)는 런처가 자기 stdin/stdout과 **중계**한다(sudo는 0~2번만 넘긴다). 작업 뒤에는 런처 `clean`(계정으로, 모드 복구 후 삭제) → 서버의 `removeTree` 순으로 지우고, 서버 시작 때 남은 작업 폴더·`.ctl` 기록을 같은 순서로 지운다(루트와 `.ctl` 폴더는 ACL 때문에 남긴다).
+- **작업자 코드는 매니페스트에서만:** 계정으로 돌 때 런처는 `AGENTLEE_WORKER_APP=<app 트리>`를 준다. 작업자는 그때 라이브러리 경로·pdf.js 데이터·글꼴·OCR 폴더를 그 트리의 `manifest.json`(상대 경로, `..`·절대 경로 거부)에서만 읽고 작업이 준 경로·한도는 버린다 — 서버(또는 서버 UID의 어떤 프로세스)가 계정으로 임의 코드를 import시키지 못한다.
+- **멈춤·한도:** 시간·상주 메모리는 런처가 250ms마다 본다(추출 768MB/60초, OCR 1536MB/300초, 문서 768MB/60초, 렌더 768MB — 서버의 기존 수치). 넘으면 종료 코드 124(시간)·125(메모리) → 기존 코드(`extract_timeout`/`extract_limit`, `doc_timeout`/`doc_limit`, `export_timeout`/`export_limit`). 서버는 다른 UID를 신호로 죽일 수 없으므로 출력 한도·중단·렌더 시간 초과에서는 런처 `reap <작업 id>`(커널 uid·시작 시각 확인, 실패 시 0.5초 간격 3번 재시도)로 멈춘다. 렌더는 서버 타이머(20초)가 먼저, 런처 한도(25초)가 뒤를 받친다.
+- **Chromium `--single-process --no-sandbox`:** 그대로다. macOS는 seatbelt 프로필을 겹칠 수 없어 Chrome 자체 샌드박스는 계속 끄고, 경계는 우리 seatbelt 프로필(프록시 포트만, 쓰기는 그 렌더 폴더만, fork 없음) **더하기 다른 UID**다. 렌더러가 뚫려 네이티브 코드를 얻어도 그 프로세스는 `_agentleewk`이라 서버·런타임 프로세스의 `KERN_PROCARGS2`를 읽지 못하고(커널이 거부), 신호도 보낼 수 없고(다른 UID, 같은 샌드박스만), 서버 소유 파일도 못 연다. 같은 계정의 다른 작업(동시 추출)은 작업마다 다른 프로필(자기 폴더만)이 막는다 — scratch ACL은 모든 작업 폴더에 상속되므로 작업 사이 격리는 ACL이 아니라 프로필에 달려 있다(python과 같음).
+- **실패 시 닫힘 + 기존 동작 유지:** 종류마다 **시작 자가 검사**(권위 있는 검사, `workers/selfcheck.ts`)가 이 기계에서 통과한 뒤에만 그 종류를 계정으로 돌린다. 검사: (0) `bundle` — 설치된 번들의 지문(매니페스트 + 작업자 파일 전체의 SHA-256)이 이 서버 체크아웃의 것과 같은지(`git pull`·lock 갱신 뒤 다시 설치하지 않으면 실패), (1) `probe` — 그 종류의 프로필 그대로(프로그램만 `/usr/bin/perl` — node에는 sysctl이 없다) 계정으로, 서버 UID 형제 프로세스(환경에 합성 비밀)의 `KERN_PROCARGS2`가 막히고 커널이 그 형제를 서버 UID로 여전히 보이는지(사라진 pid는 "막힘"이 아니다), 자기 UID가 서버와 다른지, (2) `run` — 보통 경로 그대로의 실제 작업(추출: 서버 소유 텍스트 파일을 `extract`와 `ocr` 종류로 각각, 문서: DOCX 하나, 렌더: 페이지 하나를 PNG로 — 프록시·중계 파이프·고정 스위치 포함)과 결과 내용 확인, (3) `identity` — 각 작업의 실행 기록(`.ctl/<id>/leader`)이 probe의 UID를 적었고 그 UID 소유인지. 셋 다 서버가 준비된 뒤 백그라운드에서 차례로 돈다(시작을 막지 않음). **통과 전·실패·미설정이면 그 종류는 지금의 같은 UID 샌드박스로 계속 돈다** — 추출·문서·내보내기가 계정을 설치하지 않은 집에서 깨지지 않는다. 대신 관리자 화면 **시스템 상태 → 샌드박스 작업자 격리**에 종류마다 `계정 격리 안 됨 — 같은 UID 샌드박스만`과 이유(미설정·검사 중·실패 단계·중단)가 빨간 배지로 나오고, 로그에 `worker.same_uid`(종류 목록) 경고, 실패는 `worker.self_check_failed`(종류·단계)가 남는다(`GET /api/admin/system`의 `workers` — 코드만, 메시지 없음). 통과한 종류는 `전용 계정으로 격리`. 종료 때 진행 중인 검사는 중단되고(통과로 치지 않음) 최대 10초 정리를 기다린다.
+- **verify는 참고용**(§35.2와 같은 규칙과 한계 — 대상 계정 기준의 ACL 평가). 판정은 자가 검사다.
+
+### 41.2 설치 (한 번 — 관리자, `sudo` 필요. 서버는 sudo를 쓰지 않는다)
+서버 계정을 `agentlee`, 데이터 폴더를 `<DATA_DIR>`(절대 실제 경로)로 가정한다.
+```
+# 0) 헤드리스 셸(내보내기와 같은 것)이 있어야 번들이 만들어진다
+pnpm exec playwright install --only-shell chromium
+
+# 1) 번들 — node 실행 파일, 작업자 프로그램과 고정 라이브러리(pnpm 폴더 그대로, 링크는 번들 안만), OCR 데이터,
+#    헤드리스 셸, manifest.json(상대 경로 + 지문). sudo 없음. 새 폴더를 준다.
+pnpm workers:bundle /tmp/agentlee-workers-bundle
+
+# 2) 루트 소유로 설치 (전용 계정은 읽기만, 아무도 못 고침). 재설치 때는 먼저 지운다.
+sudo rm -rf /usr/local/lib/agentlee-workers
+sudo mkdir -p /usr/local/lib /usr/local/etc /usr/local/libexec
+sudo ditto /tmp/agentlee-workers-bundle /usr/local/lib/agentlee-workers
+sudo chown -R root:wheel /usr/local/lib/agentlee-workers
+sudo find /usr/local/lib/agentlee-workers ! -type l -exec chmod -N {} +   # ACL 전부 제거(링크 제외 — 쓰기 ACL 하나면 런처가 거부)
+sudo chmod -R a+rX,go-w /usr/local/lib/agentlee-workers                  # 루트만 쓰기, 모두 읽기·검색
+rm -rf /tmp/agentlee-workers-bundle
+
+# 3) 숨은 비권한 계정 (로그인 불가, 홈 없음). python 계정(_agentleepy)·서버 계정과 다른 UID여야 한다.
+sudo sysadminctl -addUser _agentleewk -fullName "Agent Lee workers" -home /var/empty -shell /usr/bin/false
+sudo dscl . -create /Users/_agentleewk IsHidden 1
+
+# 4) 런처
+sudo install -o root -g wheel -m 0755 ops/workers/agentlee-worker-run /usr/local/libexec/agentlee-worker-run
+sudo chmod -N /usr/local/libexec/agentlee-worker-run
+
+# 5) 설정: 정확히 네 줄(node·app·browser·scratch), 각 한 번, 공백·주석·빈 줄 금지, 실제(정규) 경로.
+sudo tee /usr/local/etc/agentlee-worker.conf >/dev/null <<CONF
+node=/usr/local/lib/agentlee-workers/node
+app=/usr/local/lib/agentlee-workers/app
+browser=/usr/local/lib/agentlee-workers/browser
+scratch=<DATA_DIR>/worker-scratch
+CONF
+sudo chown root:wheel /usr/local/etc/agentlee-worker.conf
+sudo chmod 0644 /usr/local/etc/agentlee-worker.conf
+sudo chmod -N /usr/local/etc/agentlee-worker.conf
+
+# 6) sudoers: 서버 계정이 그 런처만, 그 계정으로만, 암호 없이 (visudo -f 로 편집)
+sudo visudo -f /etc/sudoers.d/agentlee-workers
+#   내용 한 줄:
+#   agentlee ALL=(_agentleewk) NOPASSWD: /usr/local/libexec/agentlee-worker-run
+
+# 7) worker-scratch 교환: 전용 그룹 + 상속 ACL (python의 scratch와 별개)
+sudo dseditgroup -o create agentleewk-scratch
+sudo dseditgroup -o edit -a _agentleewk -t user agentleewk-scratch
+sudo dseditgroup -o edit -a agentlee    -t user agentleewk-scratch
+mkdir -p <DATA_DIR>/worker-scratch
+sudo chgrp agentleewk-scratch <DATA_DIR>/worker-scratch
+sudo chmod 070 <DATA_DIR>/worker-scratch
+sudo /bin/chmod +a "group:agentleewk-scratch allow list,add_file,add_subdirectory,delete_child,search,readattr,writeattr,file_inherit,directory_inherit" <DATA_DIR>/worker-scratch
+
+# 8) 계정이 worker-scratch까지 통과(search)할 수 있게: 막힌 조상마다 그 그룹의 search만 (읽기 금지)
+sudo /bin/chmod +a "group:agentleewk-scratch allow search" <DATA_DIR>
+#    홈(예: /Users/agentlee)처럼 막힌 조상이 더 있으면 각각에 같은 항목. 어느 것인지는 setup-check의 "scratch traversal" 줄.
+
+# 9) .env
+#    WORKER_RUN_USER=_agentleewk
+```
+확인:
+```
+pnpm workers:setup-check   # sudo 없이 진단만: 런처의 읽기 전용 verify(run과 같은 신뢰 검사, 대상 계정 기준 접근) + scratch == DATA_DIR/worker-scratch
+pnpm workers:check         # 권위 있는 검사: 서버 시작 때와 같은 종류별 자가 검사(bundle·probe·run·identity)
+# 교차 UID 시험(설치 후):
+TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.ts
+```
+- `pnpm workers:check`가 `extract: ok (uid <계정 uid>, KERN_PROCARGS2 blocked; …)`·`docgen: ok …`·`render: ok …`를 찍어야 한다. 그 뒤 **서버를 다시 시작**한다(검사는 시작 때 한 번 돌고 결과를 기억). 관리자 → 시스템 상태 → 샌드박스 작업자 격리의 세 줄이 모두 `전용 계정으로 격리`여야 한다.
+- **업데이트 때마다(작업자 코드·lock·node 변경 — 사실상 `git pull`마다) 1)·2)를 다시** 한다. 안 하면 `bundle` 단계가 실패해 그 종류들은 같은 UID 샌드박스로 돌아가고 상태가 `자가 검사 실패 (bundle)`로 바뀐다(옛 작업자 코드를 계정으로 돌리지 않는다).
+- 되돌리기: `.env`에서 `WORKER_RUN_USER`를 지우고 재시작하면 세 작업자 모두 같은 UID 샌드박스(상태: 미설정)로 돈다.
+
+### 41.3 확인 방법
+- `pnpm vitest run apps/server/test/workers.test.ts` — 모든 플랫폼: 런처 인자(종류·UUID·종류별 시간 상한·render만 포트), probe 판정의 엄격한 한 줄, 실행 기록의 형식·소유자, 같은 계정 설정 거부, **운영 런처 바이트**(고정 설정 경로·`OWNER_ALLOW_SELF=0`·메모리 상수·`-T`·`%ENV` 교체·셸 없음·`exec`는 `sandbox-exec` 목록형만)와 **python 런처와 같은 함수 28개가 바이트 그대로**, perl로 불러 비교한 **종류별 프로필 == `buildProfile`**(probe 프로필 포함)·**브라우저 스위치 == `browserArgs`**, 작업자의 매니페스트 경로(작업의 경로·한도 무시, `..`·절대 경로 거부), 대역 런처로 계정 경로(추출: 0600 서버 소유 사본·인자·작업 폴더 삭제·`ocr` 종류 선택·해시 불일치/하드링크는 실행 안 함, 문서: 경로 없는 stdin, 124/125/출력 한도/중단 → reap, 렌더: 포트 인자·`home`/`tmp`/`profile`·125 → `export_limit`), 게이트 상태(미설정·통과·실패 단계·예외·건너뜀·중단), 관리자 시스템 상태의 `workers`(메시지 없음), 시작 sweep.
+- macOS(자동): 운영 파일에서 상수 줄만 바꾼 **완화 사본**(자기 계정)을 실제 번들(APFS 복제)에 붙여 — verify 통과, 추출(텍스트·PDF·스캔 PDF OCR)과 문서 4형식, 호출자가 넣은 모듈 경로 무시, 자가 검사의 run·identity 단계와 bundle 지문, probe(같은 UID는 readable, 루트 프로세스는 blocked, 사라진 pid는 error), 중계 파이프로 PNG 렌더, 렌더 시간 초과 124와 `status=timeout`, reap로 실행 중 브라우저 종료, 메모리 한도 125 → `doc_limit`, 잘못된 인자·트리의 그룹 쓰기 파일 거부(64), 다른 작업 폴더 읽기 실패.
+- 실계정(`TEST_WORKER_RUN_USER`): 세 종류 자가 검사가 다른 UID·`KERN_PROCARGS2` 차단으로 통과. 이 환경(개발 기계)에서는 계정·sudo가 없어 미실행 — 설치 후 위 명령으로 확인한다.
+- e2e(`e2e/admin.spec.ts`): 계정 미설정에서 시스템 상태의 세 작업자가 `계정 격리 안 됨`과 41절 안내를 보인다.
