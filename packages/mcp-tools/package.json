@@ -43,6 +43,11 @@
       "types": "./src/files.ts",
       "development": "./src/files.ts",
       "default": "./dist/files.js"
+    },
+    "./python": {
+      "types": "./src/python.ts",
+      "development": "./src/python.ts",
+      "default": "./dist/python.js"
     }
   },
   "scripts": {

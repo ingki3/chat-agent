@@ -21,6 +21,7 @@ export * from "./schedules.js";
 export * from "./docgen.js";
 export * from "./references.js";
 export * from "./shares.js";
+export * from "./python.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({
@@ -183,10 +184,20 @@ export const AdminSkill = z.object({
   finance: z.boolean(),
   /**
    * available: offered · not_installed: `pnpm skills:install` not run · broken: the installed copy changed ·
-   * needs_python: SKILL_PYTHON missing or unusable · planned: comes with a later issue · document: becomes a server
-   * function (file tools).
+   * needs_python: SKILL_PYTHON missing or unusable · disabled: PYTHON_RUN off (#47) · needs_account: the python_run
+   * account is missing or its self-check failed (#47) · planned: comes with a later issue · document: becomes a
+   * server function (file tools).
    */
-  status: z.enum(["available", "not_installed", "broken", "needs_python", "planned", "document"]),
+  status: z.enum([
+    "available",
+    "not_installed",
+    "broken",
+    "needs_python",
+    "disabled",
+    "needs_account",
+    "planned",
+    "document",
+  ]),
   issue: z.string().optional(),
   /** On the server allow-list (FR-10.3). Off: no user gets it, whatever their own permissions say. */
   enabled: z.boolean(),

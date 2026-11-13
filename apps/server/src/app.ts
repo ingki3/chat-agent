@@ -88,6 +88,11 @@ import {
   type OcrCapability,
 } from "./files/extract.js";
 import { FileTools } from "./files/text.js";
+import { pythonRuntimeEnv, scratchpadState, type ScratchpadState } from "./python/packages.js";
+import { sandboxedPythonRunner, type PythonRunner } from "./python/runner.js";
+import { PythonScratchpad } from "./python/service.js";
+import { accountFromConfig, type ProbeRunner } from "./python/account.js";
+import { AccountSelfCheckGate, selfCheckAccount, type SelfCheckResult } from "./python/selfcheck.js";
 import { storagePaths } from "./storage/paths.js";
 import { isInside } from "./fs-safety.js";
 import type { Db } from "./db/client.js";
@@ -254,6 +259,19 @@ export type BuildOptions = {
    * the test switch `ISOLATION_IN_PROCESS_FOR_TESTS=1` outside production (`docRunnerKind`) or a test's own runner.
    */
   docs?: { runner?: DocRunner };
+  /**
+   * `python_run` (#47): how the code runs (default: the sandboxed interpreter, `sandboxedPythonRunner` — there is no
+   * other way outside a test's own runner) and what this server can run (default: `scratchpadState` from SKILL_PYTHON
+   * and the installed packages; in tests nothing, unless given).
+   */
+  python?: {
+    runner?: PythonRunner;
+    state?: () => ScratchpadState;
+    probe?: ProbeRunner;
+    /** Tests: the account gate to use (to watch it), and a self-check to run in its place (runs even in tests). */
+    gate?: AccountSelfCheckGate;
+    selfCheck?: (signal: AbortSignal) => Promise<SelfCheckResult>;
+  };
   /**
    * Schedules (#33): the run handler (default: the real one, #56 — a turn in the schedule's result conversation),
    * engine timing overrides, and `start: true` to run the engine in a test (it runs by itself only in a server that
@@ -507,6 +525,68 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       // Bounded: a runner that ignores the stop does not hold the shutdown (its result is not stored anyway).
       await Promise.race([fileExtracts.idle(), new Promise((r) => setTimeout(r, 5000).unref())]);
     });
+    // python_run (#47): the sandboxed interpreter runs as a dedicated, unprivileged account (round 2). It is offered
+    // only when PYTHON_RUN=1, the interpreter and packages are present, the account is configured, AND the startup
+    // self-check proves (on this machine) a different uid and that KERN_PROCARGS2 of a server-uid process is blocked.
+    // The self-check starts in the background once the server is ready (#121 round 9: it may take up to the job
+    // limit, longer than a startup hook may) and its result is memoised; until it passes, and if it fails or throws,
+    // the tool is absent (needs_account, "checking: …" while it runs).
+    const pythonAccount = accountFromConfig(config.pythonRunUser);
+    const gate = opts.python?.gate ?? new AccountSelfCheckGate(pythonAccount);
+    const pythonState = (): ScratchpadState =>
+      scratchpadState(config.skillPython, config.dataDir, {
+        pythonRun: config.pythonRun,
+        ...(gate.verified ? { account: gate.verified } : {}),
+        accountReason: gate.reason,
+      });
+    const scratchpad = new PythonScratchpad({
+      db: opts.db!,
+      dataDir: config.dataDir,
+      files: () => app.files,
+      runner: opts.python?.runner ?? sandboxedPythonRunner(),
+      // Tests inject their own state; otherwise the gated state above (a test never reads SKILL_PYTHON/account).
+      state: opts.python?.state ?? (config.env === "test" ? () => pythonState() : pythonState),
+    });
+    app.addHook("preClose", async () => scratchpad.close());
+    // The one-time account self-check runs in the sweep hook below (#47 round 3: after the sweep, under the same
+    // conditions as a real job — the sweep keeps the scratch root and its ACL).
+    // Never awaited by a startup hook, never throws (the gate catches everything).
+    const startSelfCheck = (): void => {
+      const log = (ok: boolean) =>
+        ok
+          ? logEvent(app.log, "info", "python.self_check_ok")
+          : // Fail closed: the tool stays off (needs_account). The self-check is authoritative — a passing advisory
+            // `verify` (pnpm python:setup-check) does not turn it on.
+            logEvent(app.log, "warn", "python.self_check_failed");
+      if (opts.python?.selfCheck) {
+        void gate.start(opts.python.selfCheck, log);
+        return;
+      }
+      if (opts.python?.state || !config.pythonRun || !pythonAccount || config.env === "test") return;
+      const env = pythonRuntimeEnv(config.skillPython, config.dataDir);
+      if (!env.ok) {
+        gate.skip(env.reason);
+        return;
+      }
+      const account = pythonAccount;
+      // The authoritative self-check: the procargs probe, then a real job through the normal path (#121 round 8).
+      void gate.start(
+        (signal) =>
+          selfCheckAccount({
+            signal,
+            account,
+            env: env.env,
+            dataDir: config.dataDir,
+            serverUid: process.getuid?.() ?? -1,
+            onCleanupError: () => logEvent(app.log, "warn", "python.self_check_cleanup_failed"),
+            ...(opts.python?.probe ? { probe: opts.python.probe } : {}),
+          }),
+        log,
+      );
+    };
+    // Shutdown stops a running check (its probe/job are aborted — the runner reaps the launcher job — and no new
+    // step starts) and waits, bounded, for its cleanup: production exits right after close (#121 round 10).
+    app.addHook("preClose", async () => gate.stop(10_000));
     // Citations (#25): `cite` checks against the stored page text; the run's note reads them back. `file_cite`
     // (#48) numbers file citations in the same sequence.
     const citations = new CitationStore(opts.db!);
@@ -524,6 +604,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       artifacts,
       scheduleProposals,
       docs,
+      // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
+      ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,
@@ -595,9 +677,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => {
         const count = await app.fileWrites.write(() => fileStore.sweep());
         if (count) logEvent(app.log, "info", "file.swept", { count });
+        // python_run job folders of the last process (#47): nothing runs yet, so all are left-overs. Keep the
+        // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
+        if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
+        startSelfCheck();
       });
-    else if (which === "other")
-      app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
+    else {
+      if (which === "other")
+        app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
+      // No sweep here: the self-check (tests that inject one) still starts in the background once ready.
+      app.addHook("onReady", async () => startSelfCheck());
+    }
     // Family sharing (#29): the one projection every shared read goes through (shares/projection.ts). Before the
     // routes whose resource checks ask it who a resource is shared with.
     const sharing = new SharePolicy(

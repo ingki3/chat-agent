@@ -27,6 +27,11 @@ export type SandboxPolicy = {
    * Never put family data here.
    */
   trusted?: string[];
+  /**
+   * No file flag changes (`chflags`, #47 review round 1): code the model wrote could set `uchg` on its own files,
+   * and the server could then not remove the folder. Mode changes (`chmod`) stay allowed.
+   */
+  noFlagChanges?: boolean;
 };
 
 export type RunIsolatedOptions = SandboxPolicy & {
@@ -95,6 +100,8 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
       lines.push(`(allow network-outbound (remote ip "localhost:${port}"))`);
     }
   }
+  // Later rules win: this takes back the flag changes `file-write*` allowed above.
+  if (policy.noFlagChanges) lines.push("(deny file-write-flags)");
   return lines.join("\n") + "\n";
 }
 

@@ -8,6 +8,8 @@ const STATUS: Record<AdminSkill["status"], string> = {
   not_installed: "설치 안 됨 (pnpm skills:install)",
   broken: "설치본이 바뀜 — 다시 설치",
   needs_python: "python 필요 (SKILL_PYTHON)",
+  disabled: "꺼짐 (PYTHON_RUN)",
+  needs_account: "전용 계정 필요 (python_run)",
   planned: "준비 중",
   document: "파일 도구로 제공 예정",
 };

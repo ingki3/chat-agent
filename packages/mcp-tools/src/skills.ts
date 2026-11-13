@@ -241,7 +241,8 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   entry("docx", "document", { issue: "#48, #49" }),
   entry("xlsx", "document", { issue: "#48, #49" }),
   entry("pptx", "document", { issue: "#48, #49" }),
-  entry("python-scratchpad", "planned", { issue: "#21 후속 (대화 작업 폴더 #22 필요)" }),
+  // python_run (#47): a server tool — the sandboxed interpreter with pinned numpy/pandas in a working folder per call.
+  entry("python-scratchpad", "tools", { issue: "#47" }),
 ];
 
 /** Every secret env name any skill may get (the server reads exactly these from its environment). */

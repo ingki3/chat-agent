@@ -42,6 +42,9 @@ import {
 } from "@agentlee/shared";
 import { DOC_CREATE_TOOL, DOC_TOOLS } from "@agentlee/mcp-tools/docgen";
 import type { DocGenService } from "../docgen/service.js";
+import { PYTHON_RUN_TOOL, PYTHON_TOOLS, type PythonToolInfo } from "@agentlee/mcp-tools/python";
+import { PYTHON_SKILL } from "@agentlee/shared";
+import type { PythonScratchpad } from "../python/service.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -364,6 +367,10 @@ export type McpServiceOptions = {
   /** Document generation (#49). Without it `doc_create` is not offered. */
   docs?: DocGenService;
   /**
+   * `python_run` (#47). Without it the tool is not offered. Per user: the `python-scratchpad` skill permission.
+   */
+  scratchpad?: PythonScratchpad;
+  /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
    */
@@ -398,7 +405,10 @@ export type SkillStatus =
   | "available"
   | "not_installed"
   | "broken"
-  | "needs_python";
+  | "needs_python"
+  // python_run (#47 round 2): off by default, or the dedicated account is missing / its self-check failed.
+  | "disabled"
+  | "needs_account";
 export type SkillOverview = {
   name: string;
   tool: string;
@@ -435,6 +445,10 @@ export class McpService {
   private readonly financeTools: readonly FinanceToolInfo[];
   /** `finance_chart` and `watchlist_get` (#31): offered to a user who may use one of their finance skills. */
   private readonly composedTools: readonly FinanceComposedToolInfo[];
+  /** `python_run` (#47), when configured: offered to a user who may use `python-scratchpad`. */
+  private readonly pythonTools: readonly PythonToolInfo[];
+  /** Whether the tool is usable now (PYTHON_RUN on, interpreter, packages, account, self-check — gated state). */
+  private readonly pythonAvailable: () => boolean;
 
   constructor(
     private readonly tokens: McpTokens,
@@ -476,6 +490,9 @@ export class McpService {
         )
       : undefined;
     this.financeTools = this.finance ? FINANCE_TOOLS : [];
+    this.pythonTools = opts.scratchpad ? PYTHON_TOOLS : [];
+    // Whether python_run is offered right now (gated state); cheap, re-checked at each tool list and call.
+    this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
     this.composedTools = [
       ...(this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : []),
       ...(opts.watchlist ? [WATCHLIST_GET_TOOL] : []),
@@ -532,7 +549,7 @@ export class McpService {
   toolNames(): string[] {
     return toolNames({
       skills: this.skills,
-      tools: [...this.tools, ...this.financeTools, ...this.composedTools],
+      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
     });
   }
 
@@ -583,6 +600,7 @@ export class McpService {
     const s = { userId, skills: scope?.skills };
     return [
       ...this.tools,
+      ...(this.pythonAvailable() ? this.pythonTools.filter((t) => this.mayUse(s, t.skill)) : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
@@ -603,7 +621,10 @@ export class McpService {
     return SKILL_CATALOGUE.map((e) => {
       let status: SkillStatus;
       if (this.finance && FINANCE_TOOLS.some((t) => t.skill === e.name)) status = "available";
-      else if (e.status === "tools") status = "planned";
+      else if (e.name === PYTHON_SKILL && this.opts.scratchpad) {
+        const st = this.opts.scratchpad.state();
+        status = st === "available" ? "available" : st;
+      } else if (e.status === "tools") status = "planned";
       else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
         status = offered.has(e.name) ? "available" : st === "installed" ? "needs_python" : st;
@@ -681,7 +702,7 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
-      tools: [...this.tools, ...this.financeTools, ...this.composedTools],
+      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
       toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
@@ -796,6 +817,31 @@ export class McpService {
             durationMs: now() - t0,
             ...(r.ok ? {} : { artifactCode: r.code }),
           });
+          return r;
+        }
+        if (name === PYTHON_RUN_TOOL.name) {
+          const r = await this.callPythonTool(input, scope);
+          const status = r.ok ? (r.output as { status?: unknown }).status : undefined;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "python.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // The fixed outcome only: never the code, its output, the file ids or names.
+            pythonCode: r.ok ? (status === "ok" ? "python_ok" : "python_error") : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
           return r;
         }
         if (name === DOC_CREATE_TOOL.name) {
@@ -916,6 +962,18 @@ export class McpService {
     const docs = this.opts.docs;
     if (!docs || !this.users.byId(scope.userId)?.active) return { ok: false, code: "doc_not_allowed" };
     return (await this.withSlot(scope, () => docs.create(scope, input))) ?? { ok: false, code: "doc_busy" };
+  }
+
+  /**
+   * `python_run` (#47): active user who may use `python-scratchpad` (checked again here — the permission or the
+   * run's skill scope can change while a run is going), then a process slot like a skill, then the service — which
+   * checks the input, reads only the token's own conversation's files and writes only into it after checking that the
+   * token's user owns it. Code and output are never logged.
+   */
+  private async callPythonTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const pad = this.opts.scratchpad;
+    if (!pad || !this.mayUse(scope, PYTHON_SKILL)) return { ok: false, code: "python_not_allowed" };
+    return (await this.withSlot(scope, () => pad.run(scope, input))) ?? { ok: false, code: "python_busy" };
   }
 
   /**

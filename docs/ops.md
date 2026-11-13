@@ -1333,6 +1333,133 @@ PRD FR-4.4, 수용 기준 2. 방식·후보 비교·한계는 `docs/decisions/hw
 - **실제 한글이 만든 파일과의 호환성은 아직 확인하지 않았다** — 34.2의 손 확인이 그 확인이다. 쪽 번호는 없다(안정적인 쪽 매핑을 구현하지 않음).
 - 주입 평가 INJ-4(`pnpm -s injection-eval`)는 HWP를 샌드박스 추출기로 읽는다 — macOS가 아닌 곳에서는 그 사례가 `error`(`material_unavailable`)로 나온다(통과로 치지 않음).
 
+## 35. 계산·데이터 가공 도구 — python_run (#47)
+PRD §7 `python-scratchpad`, NFR 격리. 방식과 근거는 `docs/decisions/isolation.md` "계산 도구 python_run (#47)".
+
+### 35.1 무엇을 하나
+- 공통 MCP 도구 `python_run {code, files?}` — 두 런타임 모두 같은 도구(`mcp__agentlee__python_run`). 사용자별 허용은 스킬 이름 `python-scratchpad`(§15.4, 금융 스킬 아님). 서버 허용 스위치(§20)로 끌 수 있다. 예약(#56)의 스킬 범위에 없으면 그 실행에서는 빠진다.
+- **전용 계정으로만 실행, 기본 꺼짐(`PYTHON_RUN`·`PYTHON_RUN_USER` — 리뷰 #121 1·2차):** macOS 샌드박스는 **같은 UID**의 다른 프로세스 시작 환경을 `KERN_PROCARGS2`로 읽는 것을 막지 못한다(§35.3). 그래서 python 코드는 서버와 **다른 UID**의 전용·비권한 계정으로 돌린다 — 그러면 서버·런타임의 환경에 닿지 못한다. `PYTHON_RUN=1`은 `PYTHON_RUN_USER`(그 계정)가 설정되고, 루트 소유 런처가 설치돼 있고, **시작 자가 검사**(권위 있는 검사, `python/selfcheck.ts` — 리뷰 #121 7·8차)가 이 기계에서 그 계정으로 다음을 모두 통과해야만 켜진다. (1) 런처 `probe`: 자식이 서버와 다른 UID이고, 그 샌드박스 안에서 서버 UID 형제 프로세스의 `KERN_PROCARGS2`를 못 읽음. 출력은 **정확히 한 줄** `uid=<u32> procargs=<blocked|readable|error control|error errno=<n>>`이고 종료 코드 0이어야 한다 — 앞뒤 글자·두 번째 판정·빈 줄·비정상 종료는 모두 거부. (2) **실제 작업을 보통 경로 그대로**: 같은 작업 폴더 생성(`.tmp` 포함), 호출과 똑같이 만든 서버 소유 0600 입력 복사본, 같은 실행기(`sudo … launcher run` — 그 계정으로 런처 신뢰 검사, `.ctl`·실행 기록·stdin 준비, 고정 환경 `HOME`·`TMPDIR`·스레드 제한, 메모리·시간 감시, 샌드박스 프로필). 고정 스크립트가 그 입력을 pandas로 읽고 numpy·pandas를 설정된 패키지에서 import해 출력 파일을 쓴다. 서버는 그 출력을 실제 호출과 같은 수집 함수로 읽고(내용 확인), 그 파일의 소유자가 그 계정인지 확인한 뒤, 런처 `clean`으로 정리한다. 어느 단계든 실패하면 — 예외를 던져도(예: 잘못된 `TMPDIR`) — 실패한 단계 이름(`probe`·`workdir`·`input`·`run`·`report`·`output`·`cleanup`)과 함께 도구가 꺼진다(`needs_account`). 정리(임시 폴더·런처 `clean`·작업 폴더)는 단계마다 따로 시도하고 실패는 `python.self_check_cleanup_failed`로 남길 뿐 던지지 않는다(작업 폴더가 남으면 검사 실패). **자가 검사는 서버 시작을 막지 않는다**(리뷰 #121 9차): 작업 한도(30초)가 시작 훅 제한(10초)보다 길 수 있으므로, 서버가 준비된 뒤 백그라운드에서 돌고, 끝날 때까지 도구는 없고 상태는 `needs_account`(이유 `checking: …`), 통과한 뒤에야 제공된다. 종료 때는 진행 중인 검사를 **중단**한다(리뷰 #121 10차): 중단 신호가 probe와 작업 실행기에 전달되고(실행기는 기존 reap 경로로 런처 작업을 끝낸다), 그 뒤로는 새 단계가 시작되지 않으며, 서버는 정리(작업 폴더·임시 폴더·런처 `clean`)가 끝날 때까지 최대 10초 기다린 뒤 닫힌다. 중단된 검사는 통과로 치지 않는다(이유 `self-check stopped: shutting down`). **probe도 `run`처럼** 자식을 커널 신원으로 `.ctl/<id>/leader`에 기록한 뒤 풀어 주고 감시하며, 자체 벽시계 제한(8초, 넘으면 종료 코드 124)이 있어 혼자서 오래 남지 못한다(리뷰 #121 11차). 서버는 중단·시간 초과 때 sudo에 신호를 보내지 않고(sudo는 SIGKILL을 전달하지 못하고 계정 쪽 자식이 파이프를 쥐고 있을 수 있다) 런처 `reap <id>`로 그 자식을 끝내고, 자기 쪽 파이프를 닫은 뒤 바로 결과를 내어 정리(형제 프로세스 종료, 런처 `clean`으로 probe 작업 폴더·기록 삭제, 서버 쪽 삭제)가 이어지게 한다. 하나라도 아니면 도구는 **아예 제공되지 않는다**(실패 시 닫힘). 설정은 §35.2.
+- 호출마다 새 작업 폴더 `<DATA_DIR>/scratch/<사용자>/<대화>/<호출 id>/`를 만든다. `files`(이 대화의 fileId, 최대 10개)는 저장소의 검사된 열기로 읽어 SHA-256을 확인한 뒤 그 폴더에 파일 이름으로 복사한다. 코드에서는 `FILES["<fileId>"]`가 로컬 이름이다. 다른 사용자·다른 대화·보내지 않은 파일·기록에서 빠진 메시지의 파일·해시가 다른 파일은 모두 `python_file_not_found`.
+- 끝나면 작업 폴더의 **새로 생기거나 바뀐** `.csv`·`.txt`·`.md` 파일(최대 5개, 각 10MB, UTF-8)을 대화 파일로 저장한다. 그 run의 답 메시지에 연결되고(§29.2와 같은 규칙) 답 아래 내려받기 칩이 붙는다. 다른 형식·링크(심볼릭·하드링크)·너무 큰 파일·깊은 폴더(3단계 넘게)·숨김 항목(`.`으로 시작, 임시 폴더 `.tmp` 포함)은 저장하지 않고 `skipped[{name, reason}]`로 알린다. 대화당 20개 한도에 걸리면 `conversation_full`. 작업 폴더는 호출이 끝나면 지우고, 서버 시작 때 `scratch/` 전체를 지운다. 호출 사이에 남는 것은 없다 — 다음 호출에 저장된 파일 id를 다시 넘긴다.
+- 결과: `{status: "ok"|"error", exitCode, stdout, stdoutTruncated, stdoutChars, stderr, stderrTruncated, error?: {type, traceback}, files, skipped, outputFile?}`. 코드가 예외를 내거나 0이 아닌 코드로 끝나면 도구 오류가 아니라 `status: "error"`(모델이 고칠 수 있게). stdout은 앞 8,000자, stderr·traceback은 끝 4,000자. 잘린 stdout은 interpreter가 보관한 전체(최대 20만 자)를 `python-output.txt` 대화 파일(`outputFile`)로 저장한다. stdout·stderr·traceback은 `<external_content>` 블록에 담긴다(파일에서 온 글일 수 있음). 작업 폴더 경로는 `.`, 패키지 폴더는 `<packages>`, python 설치 폴더는 `<python>`, 데이터 폴더는 `<data>`로 바꿔 보인다.
+
+### 35.2 설치 (한 번 — 관리자, `sudo` 필요)
+런처는 호출자(서버)가 준 경로를 믿지 않는다. 작업(run/probe/reap/clean/verify)과 **작업 id(UUID)**만 받고, 인터프리터·runner.py·패키지·scratch는 **루트 소유 설정 파일**에서 읽는다. 그래서 런처·설정·runner·인터프리터 트리·패키지 트리는 모두 **루트 소유, 비(非)루트 변경 불가**여야 한다. 런처는 실행마다 (1) 각 경로의 **조상 전체**(`/`까지 — 루트 소유, 그룹·기타 쓰기 없음, 심볼릭 링크 없음, 쓰기 계열 ACL 허용 항목 없음)와 (2) 두 트리의 **모든 노드**(lstat로 소유자·모드, 트리마다 한 번 엄격 파싱한 `ls -leRA`로 모든 ACL 항목 — 노드 수까지 대조)를 확인하고, 하나라도 아니거나 stat·opendir·ls가 실패하면 거부한다. 거부되는 ACL 허용 권한: `write`·`delete`·`append`·`writeattr`·`writeextattr`·`writesecurity`·`chown`·`add_file`·`add_subdirectory`·`delete_child`(누구에게든). `deny` 항목은 괜찮다(예: 홈의 `group:everyone deny delete`). 홈 아래 uv 경로는 전용 계정이 통과하지 못하므로, 프로그램 일체를 루트 소유 위치로 복사한다.
+
+먼저 인터프리터와 패키지(서버용, `pnpm python:install`), 그 다음 루트 소유 복사:
+```
+uv python install 3.12
+uv python find 3.12            # 출력된 경로를 .env의 SKILL_PYTHON=에 넣는다 (python 스킬과 같은 값, §15.1)
+pnpm python:install            # requirements.lock의 패키지를 <DATA_DIR>/python-packages/<lock 해시>-py3.12/에 설치
+
+# 루트 소유 프로그램 트리 (전용 계정이 읽기만, 아무도 못 고침). uv 인터프리터 경로는 심볼릭 링크일 수 있으니
+# 실제 경로를 풀어(`python -c base_prefix`) 독립 트리로 복사한다(`ditto`는 링크를 따라 복사). 재설치 시 중첩을
+# 막으려 먼저 지운다. 루트 소유 디렉터리 안이면 전용 계정이 내용을 못 바꾼다.
+sudo rm -rf /usr/local/lib/agentlee-python
+sudo mkdir -p /usr/local/lib/agentlee-python /usr/local/etc /usr/local/libexec
+REAL_PY="$("$(uv python find 3.12)" -c 'import sys;print(sys.base_prefix)')"
+sudo ditto "$REAL_PY" /usr/local/lib/agentlee-python/interpreter
+sudo ditto "$(ls -d <DATA_DIR>/python-packages/*-py3.12)" /usr/local/lib/agentlee-python/packages
+sudo cp apps/server/scratchpad/runner.py /usr/local/lib/agentlee-python/runner.py
+sudo chown -R root:wheel /usr/local/lib/agentlee-python
+sudo chmod -R -N /usr/local/lib/agentlee-python          # ditto가 보존한 ACL을 모두 지운다(런처는 쓰기 ACL이 하나라도 있으면 거부)
+sudo chmod -R a+rX,go-w /usr/local/lib/agentlee-python   # 루트만 쓰기, 모두 읽기·검색(a+rX)
+```
+전용 계정·런처·설정·sudoers·scratch(모두 `sudo`, 서버는 하지 않는다 — 관리자가 한 번):
+```
+# 1) 숨은 비권한 계정 (로그인 불가, 홈 없음). 짧은 이름 예: _agentleepy, .env의 PYTHON_RUN_USER=에 넣는다.
+#    서버 계정과 다른 UID여야 한다.
+sudo sysadminctl -addUser _agentleepy -fullName "Agent Lee python_run" -home /var/empty -shell /usr/bin/false
+sudo dscl . -create /Users/_agentleepy IsHidden 1
+
+# 2) 런처: ops/python/agentlee-python-run 를 고정 경로에 루트 소유로 설치
+sudo install -o root -g wheel -m 0755 ops/python/agentlee-python-run /usr/local/libexec/agentlee-python-run
+sudo chmod -N /usr/local/libexec/agentlee-python-run
+
+# 3) 설정: 런처가 읽는 루트 소유 파일. 값은 모두 루트 소유 경로여야 한다(런처가 재확인).
+#    형식은 정확히: `키=값` 네 줄(interpreter·runner·packages·scratch), 각 한 번. 공백·주석·빈 줄·다른 키·중복 키는
+#    거부된다(앞뒤 공백도 다듬지 않는다). 경로는 실제(정규) 경로 — 심볼릭 링크 성분·`//`·끝 `/` 금지.
+sudo tee /usr/local/etc/agentlee-python.conf >/dev/null <<CONF
+interpreter=/usr/local/lib/agentlee-python/interpreter
+runner=/usr/local/lib/agentlee-python/runner.py
+packages=/usr/local/lib/agentlee-python/packages
+scratch=<DATA_DIR>/scratch
+CONF
+sudo chown root:wheel /usr/local/etc/agentlee-python.conf
+sudo chmod 0644 /usr/local/etc/agentlee-python.conf
+sudo chmod -N /usr/local/etc/agentlee-python.conf
+
+# 4) sudoers: 서버 계정이 그 런처만, 그 계정으로만, 암호 없이 (visudo -f 로 편집)
+sudo visudo -f /etc/sudoers.d/agentlee-python
+#   내용 한 줄 (서버 계정이 'agentlee'라고 가정):
+#   agentlee ALL=(_agentleepy) NOPASSWD: /usr/local/libexec/agentlee-python-run
+
+# 5) scratch 교환: 전용 그룹 + 상속 ACL로, 그 계정이 자기 작업 폴더만 쓰고 서버는 결과를 읽게 한다.
+sudo dseditgroup -o create agentleepy-scratch
+sudo dseditgroup -o edit -a _agentleepy -t user agentleepy-scratch
+sudo dseditgroup -o edit -a agentlee    -t user agentleepy-scratch
+mkdir -p <DATA_DIR>/scratch
+sudo chgrp agentleepy-scratch <DATA_DIR>/scratch
+sudo chmod 070 <DATA_DIR>/scratch     # 그룹만 (서버·계정)
+sudo /bin/chmod +a "group:agentleepy-scratch allow list,add_file,add_subdirectory,delete_child,search,readattr,writeattr,file_inherit,directory_inherit" <DATA_DIR>/scratch
+# 6) 계정이 scratch까지 **통과(search, o+x)**할 수 있어야 한다. DATA_DIR과 그 위 조상이 0700이면 막힌다:
+#    조상에 전용 계정(또는 그룹)의 search ACL만 더한다(읽기 금지). 예:
+sudo /bin/chmod +a "group:agentleepy-scratch allow search" <DATA_DIR>
+#    홈(예: /Users/agentlee, 보통 0750)처럼 막힌 조상이 더 있으면 그 각각에도 같은 search 항목을 더한다.
+#    어느 조상이 막혔는지는 `pnpm python:setup-check`의 "scratch traversal" 줄이 알려 준다(그 계정·그 그룹의 search만 센다).
+#    DATA_DIR의 다른 내용(파일·DB·대화 폴더)에는 읽기 권한을 주지 않는다 — scratch만.
+```
+확인:
+```
+pnpm python:setup-check        # sudo 없이 진단만: 런처의 읽기 전용 `verify <계정>`을 직접 실행(run과 같은 신뢰 검사 —
+                               # 조상·트리 전체·ACL·설정 형식, + 계정의 scratch 통과·쓰기) + scratch == DATA_DIR/scratch
+pnpm python:check              # 권위 있는 검사: 서버 시작 때와 같은 자가 검사(probe + 실제 작업 한 번) + 샌드박스에서 numpy·pandas, 합계 5050, "network: blocked"
+pnpm skills:status             # python_run: available | disabled | needs_python | not_installed | needs_account
+# 전용 계정 교차 UID 시험(런처·sudoers·ACL 설치 후):
+TEST_PYTHON_RUN_USER=_agentleepy TEST_PYTHON_PACKAGES=$(ls -d <DATA_DIR>/python-packages/*-py3.12) \
+  pnpm vitest run apps/server/test/python.test.ts
+```
+- `pnpm python:check`가 `account self-check: ok (uid <계정 uid>, KERN_PROCARGS2 blocked; a real job read its input, imported numpy + pandas and wrote its output)`를 찍어야 한다. 그 뒤 서버를 다시 시작한다(자가 검사는 **시작 때 한 번** 돌고 결과를 기억 — 계정·런처·설정·sudoers를 바꾸면 재시작).
+- 패키지는 시스템이나 python 자체에 설치하지 않는다. `pip --target`으로 데이터 폴더 안에만 설치하고(그 뒤 루트 위치로 복사), 네트워크(PyPI)는 `pnpm python:install`만 쓴다. 버전·해시 고정(`--require-hashes --no-deps --only-binary=:all:`).
+- 고정 패키지(`apps/server/scratchpad/requirements.lock`, 2026-11-13 기준 배포 2주 넘음): numpy 2.5.4(2026-10-10), pandas 3.1.0(2026-10-22), python-dateutil 2.9.0.post0, six 1.17.0, tzdata 2026.5. macOS arm64 CPython 3.12 휠만.
+- **격리 메모:** scratch의 ACL은 **모든 작업 폴더에 상속**된다(서버·계정이 어느 작업 폴더든 접근). 그래서 작업(대화) 사이 격리는 이 ACL이 아니라 **작업마다 다른 샌드박스 프로필**(그 작업 폴더만 허용)에 달려 있다.
+- lock을 바꾸면 폴더 이름이 바뀐다 → `pnpm python:install` 재실행 후 루트 위치로 다시 복사. 옛 폴더는 남으니 필요하면 지운다(읽기 전용이면 `chmod -R u+w` 뒤).
+- 상태(관리자 스킬 탭·`GET /api/admin/skills`의 `python-scratchpad`): `available`, `disabled`(`PYTHON_RUN`≠1), `needs_python`(SKILL_PYTHON 문제), `not_installed`(패키지 폴더 없음), `needs_account`(`PYTHON_RUN_USER` 없음 또는 자가 검사 실패). `available`이 아니면 도구는 제공되지 않는다.
+- **운영 런처에는 우회 분기가 없다**(리뷰 #121 4·5차): 설정 경로·소유자 검사·메모리 한도는 고정 상수(`CONF_PATH`·`OWNER_ALLOW_SELF=0`·`MEM_LIMIT_KB=786432`)이고 이를 바꾸는 환경 변수도 없다(시작하자마자 `%ENV` 전체를 `PATH`·`LC_ALL`만으로 교체 — 모든 작업). 프로젝트 시험은 **별도 사본**(이 세 상수 줄만 치환 — 시험이 차이가 정확히 그 줄들인지 확인)을 만들어 자기 계정에서 돌린다 — 운영 바이트에는 그 분기가 없고, 시험이 그 사실(우회 문자열·`setrlimit`·`comm=` 부재, 셸 없음)을 확인한다.
+- **`verify <계정>`은 참고용(advisory)이다**(리뷰 #121 7차): ACL의 일부 경우(예: 일반 파일의 `only_inherit` 표시, 대상 계정의 `readsecurity` 거부 — 후속 이슈)를 놓칠 수 있다. **권위 있는 판정은 그 계정으로 도는 자가 검사**(서버 시작 때, `pnpm python:check`)이고, 그것이 실패하면 verify가 통과해도 도구는 꺼진 채다. 출력 첫 줄이 `advisory …`로 이를 알리고, `pnpm python:check`는 자가 검사가 실패했는데 verify는 통과하면 그 불일치를 분명히 출력한다. uid·gid는 도구마다 표기가 달라(`dsmemberutil`은 nobody를 `-2`, `getpwnam`·`id`는 `4294967294`) 모두 범위를 확인한 뒤 부호 없는 32비트로 맞춰 비교한다.
+- **`verify <계정>`**(리뷰 #121 5차): sudo 없이 서버 계정으로 직접 실행하는 읽기 전용 작업. 설정을 읽고 `run`과 **같은 검사 목록**을 돌려 `check <이름> ok|fail <이유>`·`scratch <경로>`·`result ok|fail` 줄로 보고한다(종료 0/1). 접근 판정은 **진단을 돌린 서버 계정이 아니라 대상 계정** 기준이다(리뷰 #121 6차): 런처는 sudo 뒤 그 계정으로 돌며 런처 자신·설정·runner·인터프리터·패키지를 연다. 그래서 `check account program access`가 그 경로들의 모든 조상 `search`, 런처 `read`·`execute`, 설정·runner `read`, 인터프리터 `read`·`execute`, 두 트리의 모든 디렉터리 `search`·`list`와 모든 파일 `read`를 그 계정으로 평가한다(트리 검사 때 본 노드 목록을 쓰고, 목록에 ACL 줄이 있던 디렉터리의 노드만 `ls -led`로 다시 읽는다). `check scratch traversal`·`check scratch write`는 scratch까지의 `search`와 scratch의 `add_subdirectory`. 평가 규칙: ACL 항목을 순서대로 보며 그 권한을 명시하고 그 계정에 해당하는 **첫 항목**이 결정(`deny`면 막힘). `only_inherit` 항목은 자식에게만 적용되므로 그 노드 판정에서는 건너뛴다. 주체는 `user:`/`group:` 뒤의 이름·숫자 id, 또는 이름을 못 찾을 때 `ls`가 출력하는 **UUID**(접두어가 있거나 없거나) — UUID는 `dsmemberutil getid -X`로 uid/gid로 바꿔 그 계정·그 그룹(`id -G`)과 비교하고, **해석하지 못하는 주체는 무관이 아니라 진단 실패**다(그 권한을 명시한 항목일 때). ACL이 결정하지 않으면 소유자 → 그룹 → 기타 중 그 계정이 속하는 **하나의** 클래스의 POSIX 비트(아래 클래스로 넘어가지 않음). `pnpm python:setup-check`는 자기 규칙 없이 이 보고만 쓴다(실패 시 닫음 — 이해 못 하는 줄·검사 0개·`result ok` 없음이면 실패). 통과해도 참고일 뿐이며 다음 단계는 `pnpm python:check`.
+
+### 35.3 격리와 한도 (`PYTHON_LIMITS`, `packages/shared/src/python.ts`)
+- **전용 계정으로 실행(리뷰 #121 2·3·4차):** 운영에서 서버는 샌드박스를 직접 띄우지 않는다. `sudo -n -u <계정> /usr/local/libexec/agentlee-python-run run <작업 id> <시간제한>`만 띄운다 — **인터프리터·runner·패키지·scratch는 호출자가 주지 않고 런처(Perl, `perl -T`)가 루트 소유 설정(`/usr/local/etc/agentlee-python.conf`)에서 읽는다.** 런처·설정·runner의 **조상 전체**와 인터프리터·패키지 **트리의 모든 노드**가 루트 소유·비루트 쓰기 불가이고 쓰기 계열 ACL 허용 항목이 없는지 확인하고(§35.2), 아니면 거부한다. `reap`·`clean`은 프로그램을 실행하지 않으므로 런처·설정·runner의 조상 검사까지만 한다. 작업 id는 **정확한 UUID 패턴**(개행·NUL 등 거부, 다중 행 주입 불가)이고 SBPL에 넣는 모든 경로는 안전 문자만 통과시킨 값이다. 작업 폴더는 `<scratch>/<id>`(심볼릭 성분 거부). 런처가 그 계정으로 내려가 자식을 **세션 리더로 만든 뒤**(`setsid`) **스스로 프로필을 만들어** `sandbox-exec` + python을 exec한다. run-control은 샌드박스가 쓸 수 없는 `<scratch>/.ctl/<id>/leader`에 `pid uid 시작초 시작µs`로 적는다 — 값은 **커널**(`sysctl(KERN_PROC, KERN_PROC_PID, pid)`의 `kinfo_proc`: 실·유효 uid, `p_starttime`)에서 읽고(argv와 무관 — python이 `argv[0]`을 바꿔도 그대로), 자식은 이 기록이 원자적으로(임시 파일→rename) 써진 **뒤에야** 파이프로 풀려나 python을 exec한다(런처가 먼저 죽으면 EOF → 실행 안 함). 시간 초과·중단 시 런처의 `reap`(sudo)은 기록의 uid가 자신(그 계정)이고, 지금 그 pid의 커널 uid·시작 시각(µs까지)이 기록과 같을 때만 그 pid와 그 그룹(런처가 세션 리더로 만들었으므로 pgid = 그 pid)을 죽인다. 기록이 없거나·못 읽거나·형식이 다르거나·신원이 다르거나(pid 재사용)·커널 조회 자체가 실패하면 **거부**(종료 65, 이유 출력 — 아무것도 확인하지 못했으니 죽이지도 않음)하고, 커널이 "그런 프로세스 없음"(빈 응답)이라고 할 때만 할 일 없이 0. 서버는 reap이 0이 아니면 그 실행이 아직 열려 있는 동안 0.5초 간격으로 최대 3번 다시 부르고(`REAP_RETRIES` — 예: 기록 직전의 경합), 그래도 안 되면 런처 자신의 벽시계 제한이 끝낸다. 이전의 `ps -o comm=`(= argv[0], 사용자 변경 가능)·초 단위 `lstart`·기록 없으면 검사 면제는 모두 없앴다. 런처 자신도 **250ms마다** 자식의 벽시계 시간과 **상주 메모리**(`ps -o rss=`)를 본다(자식 종료는 SIGCHLD로 바로 깨어남 — 빠른 작업이 지연되지 않음). 시간 초과면 SIGKILL 후 **종료 코드 124**와 `.ctl/<id>/status=timeout`(→ `python_timeout`), 메모리가 768MB를 넘거나 **잴 수 없으면**(자식이 아직 살아 있는데 `ps` 실패) SIGKILL 후 **종료 코드 125**와 `status=memory`/`memory-unmeasured`(→ `python_memory_limit`). 감시 실패를 묵살하지 않는다(4차의 `POSIX::setrlimit`은 `/usr/bin/perl` 5.34에 없어 조용히 실패했다). 남는 한계: 코드가 `os._exit(124|125)`로 끝나면 같은 코드로 분류된다(그래도 실패 코드일 뿐 결과가 새지는 않는다). 작업 폴더 정리는 런처 `clean`(그 계정)으로 하고 서버가 뒤를 받친다. 어떤 폴더·어떤 파일인지는 여전히 서버가 정한다.
+
+- **파일 플래그 변경 금지(`noFlagChanges`, 리뷰 #121 1차):** 프로필에 `(deny file-write-flags)`를 더해 `chflags`(예: `uchg`)를 막는다. **권한 변경(`chmod`)은 허용**한다 — `file-write-mode`까지 막으면 `shutil.copy`/`copytree` 등이 깨지기 때문이다(리뷰 #121 4차). 코드가 작업 폴더 모드를 0으로 만들어도 정리는 런처 `clean`(그 계정)이 위에서 아래로 모드를 복구하며 지우고, 못 지우면 실패를 돌려준다. 서버의 `removeTree`가 뒤를 받치고, 시작 sweep 실패는 서버 시작을 막지 않는다(`python.sweep_failed` 경고만).
+- **작업 폴더 측정은 실패 시 닫는다(리뷰 #121 1차):** 200ms마다 재는 중 어떤 폴더·항목을 **읽지 못하면**(코드가 권한을 없앰) 측정이 불완전하므로 그 실행을 `python_workdir_blocked`로 멈춘다(예전에는 못 읽는 폴더를 빈 것으로 세어 한도를 우회할 수 있었다). 측정이 예외를 던져도(읽은 뒤 삭제·권한 변경 경합) 타이머 콜백에서 잡아 그 실행만 멈춘다 — 서버는 영향받지 않는다.
+- **샌드박스 밖 실행 경로는 없다.** `ISOLATION_IN_PROCESS_FOR_TESTS`·`FAKE_RUNTIME`도 바꾸지 않는다. macOS가 아니거나 샌드박스를 못 띄우면 `python_unavailable`. 단위 시험은 실행기를 직접 넣는다(`buildApp({ python: { runner, state } })`).
+- **KERN_PROCARGS2 — 왜 다른 UID인가(리뷰 #121 1·2차):** `system.sb`가 모든 `sysctl-read`를 허용하고, macOS는 **같은 UID**의 다른 프로세스에 대해 `KERN_PROCARGS2`로 그 프로세스의 인자와 **시작 시 환경 변수**를 돌려준다. 같은 UID로 돌리면 python 코드가 서버·런타임의 환경을 읽을 수 있다(1차에서 실기 확인). sysctl 이름 규칙으로는 분리되지 않았다(`(deny sysctl-read)`는 numpy `os.uname()`을 깨고, `hw.`·`kern.ostype` 허용 목록으로도 procargs가 다시 열렸다 — macOS 27.0). 그래서 2차 결정대로 **다른 UID의 전용 계정**으로 돌린다: XNU는 다른 UID·비권한 프로세스에는 대상의 procargs를 주지 않는다. 시작 자가 검사가 바로 이것을 증명하고(다른 uid + 읽기 차단), 증명 못 하면 도구는 꺼진다. 노출 대상 정정: Claude는 API 키·OAuth 토큰을 **시작 환경**에 둔다(`runtime/claude.ts`), Codex는 자격 증명을 **stdin RPC**로 주고 환경에는 MCP bearer 토큰만 둔다(`runtime/codex.ts`·`runtime/lockdown.ts`). python_run 출력은 가림·등록 비밀 검사를 거치지만, 손상된 작업자가 임의 변환·분할로 정보를 돌려보낼 수 있으므로 가림이 격리 경계는 아니다 — 경계는 UID 분리다.
+- 한도: 30초(벽시계) + CPU 30초(`RLIMIT_CPU`), 메모리 768MB(250ms마다 측정 — 운영은 런처가, 시험용 같은 UID 경로는 서버가), 파일 하나 20MB(`RLIMIT_FSIZE` — 넘는 쓰기는 python 안에서 `OSError`), 작업 폴더는 입력 복사본 + 100MB·항목 1,000개(200ms마다 측정, 넘으면 종료), stdout·stderr 각 20만 자 보관(나머지는 개수만), 프로세스 출력 약 2.6MB, 코드 5만 자, 입력 파일 10개·합 100MB.
+- 동시 실행: 서버 전체 2개, 사용자당 1개(`PYTHON_SLOTS`) — 넘으면 바로 `python_busy`(대기열 없음). 스킬과 같은 MCP 슬롯(전체 4, run당 2)도 함께 쓴다.
+
+### 35.4 비밀
+- 알려진 비밀(§1, 라운드 23–27)은 돌아오는 모든 것에서 가린다: stdout·stderr·traceback은 **전체를 먼저 가린 뒤 자른다**(가림의 꼬리 규칙이 interpreter의 20만 자 보관 한도에서 잘린 비밀의 앞부분도 가린다 — 8자 이상이면). 원문·JSON/파이썬 이스케이프·퍼센트·base64·hex 형태 모두(§1). 저장하는 텍스트 파일 내용과 이름도 저장 전에 가린다. 결과 전체를 마지막으로 한 번 더 가린다.
+- 그래서 저장 형식을 텍스트(CSV·TXT·MD)로 제한했다 — XLSX·PNG 같은 이진 형식은 서버가 그 안의 비밀을 볼 수 없다.
+- 남는 한계: 저장한 뒤 등록된 비밀은 이미 저장된 파일 바이트에서 지우지 않는다(업로드·생성 문서와 같은 원칙, §24.2·§29.4). 코드가 비밀을 쪼개 여러 파일에 나눠 쓰면 각각은 잡지 못한다.
+
+### 35.5 오류 코드와 로그
+- 도구 오류(`{ error }`, 로그 `pythonCode`): `python_not_allowed`(권한·범위 — 대화 주인이 아님, run이 그 대화 것이 아님), `python_bad_input`, `python_file_not_found`, `python_files_too_large`, `python_busy`, `python_timeout`(벽시계·CPU), `python_memory_limit`, `python_output_limit`, `python_disk_limit`, `python_workdir_blocked`(작업 폴더를 재지 못함 — 코드가 일부를 못 읽게 만듦, 닫음), `python_failed`(보고가 깨짐 — `os._exit` 등), `python_unavailable`(샌드박스 없음), `python_not_installed`(§35.2). 끝까지 돈 호출은 로그에 `python_ok` 또는 `python_error`(코드가 예외).
+- 로그: `python.finished`(도구 이름, `pythonCode`, 소요 시간, 사용자·대화·run ID). **코드·출력·파일 id·파일 이름은 남기지 않는다**(시험). 실패는 관리자 "최근 오류"에 도구 이름과 코드로 남는다.
+
+### 35.6 확인 방법
+- `pnpm vitest run apps/server/test/python.test.ts` — 도구·권한(목록에서 빠지면 호출 불가, 예약 범위, **기본 꺼짐**, 전용 계정 게이트 — `available`일 때만 제공), 런처 sudo 명령·인자 검증·작업 폴더 범위, 자가 검사 논리(주입 프로브: 다른 uid + 읽기 차단일 때만 통과), 과잉 가림 없음(온전한 텍스트의 `tail:false`, 캡처에서 잘린 꼬리만 꼬리 규칙), 측정 실패·경합 시 그 실행만 멈춤, 입력 거절, 상태 코드, 실행 경로(FakeRuntime `/python sum <fileId>` → 복사·`FILES`·출력 CSV 저장·답 칩·주인만 내려받기·다음 호출 입력), 입력 범위(다른 대화·다른 사용자·보내지 않은 파일·해시 불일치), 출력 규칙(형식·링크·크기·개수·깊이·숨김·바뀌지 않은 입력·20개 한도), 오류 보고, 실행기 실패 코드와 작업 폴더 삭제, 슬롯, 로그, 비밀(자르기 경계에 걸친 비밀, base64·hex, 파일 내용·이름), 환경 변수, 샌드박스 정책, **두 런타임 녹화 재생**(Claude·Codex가 우리 MCP 서버로 `python_run`을 실제 호출 → 결과 파일 칩).
+- **실제 샌드박스(macOS, 독립 실행형 python — `TEST_SKILL_PYTHON` 또는 uv로 찾음, 없으면 건너뜀):** 다른 대화의 작업 폴더·저장 파일·DB·홈·밖 폴더 읽기 실패, 밖 쓰기·fork 실패, 네트워크(외부·루프백·우리 MCP 포트·DNS) 차단, **무한 루프가 시간 한도로 `python_timeout`**, 메모리·파일 크기·폴더 크기 한도, 큰 출력, fd 1 직접 쓰기, 예외·종료 코드, **`chflags` 불가와 `removeTree`의 플래그 복구**. pandas 시험은 `TEST_PYTHON_PACKAGES=<DATA_DIR>/python-packages/<폴더>`를 주면 돈다:
+  ```
+  TEST_PYTHON_PACKAGES=$(ls -d ./data/python-packages/*-py3.12) pnpm vitest run apps/server/test/python.test.ts
+  ```
+- **런처 완화 사본 시험**(`the launcher (relaxed test copy, own user)`, macOS + 독립 실행형 python 3.12일 때 자동): 운영 파일에서 세 상수 줄만 바꾼 사본을 임시 설치(인터프리터는 APFS 복제 `cp -cR`, `chmod -R go-w`·`-N`)에 놓고 자기 계정으로 돌린다 — `verify` 통과와 보고 형식, 작업 실행과 커널 신원 기록, **트리 깊은 파일의 `everyone allow write` ACL·그룹 쓰기 파일·그룹 쓰기 조상·조상의 `add_file` ACL은 run(64)·verify 모두 거부**(`deny` 항목은 통과), 설정의 후행 공백·중복·미지 키·`packages` 누락·주석·빈 줄 거부, **메모리 감시**(작은 한도에서 400MB 할당 → 125·`status=memory` → `python_memory_limit`; 한도 아래는 정상), 시간 초과 → 124, **`argv[0]`을 바꾼 코드도 reap이 죽임**(ps `comm`이 바뀐 것을 확인한 뒤), 시작 시각이 다른 살아 있는 pid·기록 없음·형식 오류는 거부(65, 대상 생존 확인), run·probe가 호출자 환경(합성 비밀·`PATH`·`PERL5OPT`)을 python에 넘기지 않음, **verify가 대상 계정 기준**(모두가 통과할 수 있는 임시 위치에서 `nobody`를 대상으로: 진단 계정 소유 `0700` 프로그램 조상·그 계정이 못 읽는 트리 파일·그 계정에 대한 `deny list` ACL은 실패, 진단 계정 자신은 통과).
+- **ACL 판정 단위 시험**(`the launcher's account ACL evaluation (unit)`): 운영 런처 파일의 dispatch 표시 줄 위(함수만)를 라이브러리로 읽어(운영 파일에 시험 분기 없음) `ls -le` ACL 줄을 직접 넣는다 — UUID 주체(계정·그 그룹·그 그룹 아닌 그룹·다른 사용자·해석 불가 → 실패, 그 권한과 무관한 해석 불가 항목은 무시, 사용자 UUID가 group으로 표시되면 실패), `only_inherit` allow/deny는 그 노드에 적용 안 됨, 첫 해당 항목이 결정(deny 먼저/allow 먼저), POSIX 클래스(아래로 넘어가지 않음). 그 밖에 `perl -Tc`, 적대적 작업 id 거부, clean(중첩 `000` 폴더)은 이전 차수에서 확인. sudo 계정 전환·교차 UID 종료는 이 환경에서 미검증(실계정 필요).
+- **전용 계정 교차 UID 시험**(`TEST_PYTHON_RUN_USER=<계정>`을 주고, 런처·sudoers·scratch ACL이 설치돼 있을 때만; 없으면 건너뜀): 계정 자가 검사가 통과하고(다른 uid·KERN_PROCARGS2 차단), 실제 python_run에서 서버 UID 형제 프로세스의 시작 환경 읽기가 **차단됨**을 확인한다. 런처 동작은 아래 완화 사본 시험이 같은 UID로 검증한다(UID 하강은 sudo가, 실기에서 확인).
+- Linux CI에는 sandbox-exec·독립 실행형 python·그 계정이 없어 실제 샌드박스·계정 묶음은 건너뛰고, 나머지(런처 인자 검증, 게이트, 자가 검사 논리 — 주입 프로브)는 시험용 실행기로 모든 플랫폼에서 돈다. e2e는 만들지 않았다(브라우저 쪽은 #49의 내려받기 칩과 같은 경로라 새 화면이 없다).
+- 실런타임 확인: 실제 Claude·Codex 연결에서 CSV를 올리고 "이 표의 합계를 계산해 CSV로"를 보내 칩으로 내려받는다.
+
 ## 36. 공유 화면·포크·열람 확인·가족 공유 묶음 (#52)
 PRD FR-2.4, FR-8.8, FR-14.3~14.6. 투영·경로 규칙은 §33과 `docs/decisions/sharing.md`를 따른다. 공유받은 사람에게 가는 것은 이 절의 경로에서도 모두 `SharePolicy.project`의 결과뿐이다.
 

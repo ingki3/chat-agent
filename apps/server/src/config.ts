@@ -82,6 +82,19 @@ const ConfigSchema = z.object({
    * 3.12`, then `uv python find 3.12`). Unset = python skills are not offered. See mcp/python.ts.
    */
   SKILL_PYTHON: optional(z.string()),
+  /**
+   * python_run (#47): off unless "1". The macOS sandbox cannot keep code from reading the start-up environment of
+   * other processes of the same user (KERN_PROCARGS2 — review #121 round 1, docs/ops.md §35.3), and runtime CLIs
+   * hold their keys there; turn it on only once that is solved.
+   */
+  PYTHON_RUN: z.enum(["0", "1"]).default("0"),
+  /**
+   * python_run (#47 review round 2): the dedicated, unprivileged macOS account the sandboxed interpreter runs as
+   * (a different uid than the server, so its code cannot read the server's or a runtime's start-up environment —
+   * KERN_PROCARGS2). `PYTHON_RUN=1` is refused unless this is set, the root-owned launcher is installed, and the
+   * startup self-check passes (docs/ops.md §35). A short macOS account name.
+   */
+  PYTHON_RUN_USER: optional(z.string().regex(/^[a-z_][a-z0-9_-]{0,30}$/)),
   /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
   SKILL_SOURCES: optional(z.string()),
   /**
@@ -150,6 +163,10 @@ export type Config = {
   codex?: { apiKey: string } | undefined;
   /** Interpreter for python skills (validated when the MCP service starts). */
   skillPython?: string | undefined;
+  /** `python_run` is offered (#47, `PYTHON_RUN=1`). */
+  pythonRun: boolean;
+  /** The dedicated account `python_run` runs as (#47 round 2); undefined = not configured. */
+  pythonRunUser?: string | undefined;
   /** Folders `pnpm skills:install` copies skills from. */
   skillSources: string[];
   /**
@@ -245,6 +262,8 @@ export function loadConfig(
         : undefined,
     codex: c.CODEX_API_KEY ? { apiKey: c.CODEX_API_KEY } : undefined,
     skillPython: c.SKILL_PYTHON,
+    pythonRun: c.PYTHON_RUN === "1",
+    pythonRunUser: c.PYTHON_RUN_USER,
     skillSources: (
       c.SKILL_SOURCES ??
       [path.join(os.homedir(), ".agents", "skills"), path.join(os.homedir(), ".claude", "skills")].join(":")
