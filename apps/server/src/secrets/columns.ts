@@ -345,4 +345,11 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "fork_items.item_type": ENUM,
   "fork_items.source_id": ID,
   "fork_items.copy_id": ID,
+  "deletion_jobs.id": ID,
+  "deletion_jobs.kind": ENUM,
+  "deletion_jobs.conversation_id": ID,
+  "deletion_jobs.runtime": ENUM,
+  "deletion_jobs.connection_id": ID,
+  "deletion_jobs.user_id": ID,
+  "deletion_jobs.external_session_id": { exempt: "the runtime's own session id (a UUID it generated)" },
 };

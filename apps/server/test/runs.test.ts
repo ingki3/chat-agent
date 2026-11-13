@@ -6,6 +6,8 @@ import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { runs as runsTable } from "../src/db/schema.js";
 import {
+  ExitUnconfirmedError,
+  RuntimeFailure,
   RuntimeRegistry,
   SessionGoneError,
   type RuntimeAdapter,
@@ -692,6 +694,9 @@ describe("runs: robustness, round 2 (review #74)", () => {
   it("closes a session that finished opening after its conversation was deleted", async () => {
     const { adapter, stats } = controlledRuntime({ startDelayMs: 150 });
     const { app, conversation, send } = await start({ adapter });
+    // The delete never saw this session (its row could not be saved): it is handed over to be forgotten (#54).
+    const orphans: unknown[] = [];
+    app.purge!.orphan = (ref) => void orphans.push(ref);
     const c = conversation();
     await send(c.id, "x");
     await new Promise((r) => setTimeout(r, 30));
@@ -700,6 +705,118 @@ describe("runs: robustness, round 2 (review #74)", () => {
     expect(stats.opened).toBe(1);
     expect(stats.closes).toBe(1);
     expect(app.runs!.liveCount()).toBe(0);
+    expect(orphans).toEqual([
+      expect.objectContaining({ conversationId: c.id, runtime: "claude-code", externalSessionId: "ctl-1" }),
+    ]);
+  });
+
+  it("a start that fails after its session existed hands it over to be forgotten (#54 review)", async () => {
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async (ctx) => {
+        ctx.sessionStarted?.("half-open-1");
+        throw new RuntimeFailure("runtime_policy");
+      },
+    };
+    const { app, conversation, send, waitRun } = await start({ adapter });
+    const handed: unknown[] = [];
+    app.purge!.orphan = (ref) => void handed.push(ref);
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    expect((await waitRun(run.id)).status).toBe("failed");
+    expect(handed).toEqual([
+      expect.objectContaining({ conversationId: c.id, externalSessionId: "half-open-1" }),
+    ]);
+  });
+
+  it("a session whose row cannot be written is handed over too, while the conversation still exists (#54 r3)", async () => {
+    const { adapter, stats } = controlledRuntime({});
+    const { app, db, conversation, send, waitRun } = await start({ adapter });
+    const handed: unknown[] = [];
+    app.purge!.orphan = (ref) => void handed.push(ref);
+    db.$client.exec(
+      "CREATE TRIGGER fail_sessions BEFORE INSERT ON runtime_sessions BEGIN SELECT RAISE(ABORT, 'no'); END;",
+    );
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    expect((await waitRun(run.id)).status).toBe("failed");
+    db.$client.exec("DROP TRIGGER fail_sessions");
+    expect(app.conversations!.get(c.id)).toBeDefined();
+    expect(stats.closes).toBe(1);
+    expect(handed).toEqual([expect.objectContaining({ conversationId: c.id, externalSessionId: "ctl-1" })]);
+  });
+
+  it("a failed start's process counts until it has exited: quiet waits for it (#54 r3)", async () => {
+    let exit!: () => void;
+    const gone = new Promise<void>((r) => (exit = r));
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async (ctx) => {
+        ctx.sessionStarted?.("half-open-2", () => gone);
+        throw new RuntimeFailure("runtime_policy");
+      },
+    };
+    const { app, conversation, send, waitRun } = await start({ adapter });
+    app.purge!.orphan = () => {};
+    const c = conversation();
+    const run = (await send(c.id, "x")).json().run as Run;
+    expect((await waitRun(run.id)).status).toBe("failed");
+    expect(await app.runs!.quiet(c.id, 100)).toBe(false);
+    exit();
+    expect(await app.runs!.quiet(c.id, 1000)).toBe(true);
+  });
+
+  it("quiet (#54 review) is true only once the session's process has really exited — not when close gave up", async () => {
+    let exit!: () => void;
+    const gone = new Promise<void>((r) => (exit = r));
+    const adapter: RuntimeAdapter = {
+      id: "claude-code",
+      capabilities: () => ({
+        models: [{ id: "c", label: "C", efforts: [] }],
+        canSwitchModelInSession: false,
+        canResume: false,
+      }),
+      resume: () => Promise.reject(new Error("no")),
+      start: async () => ({
+        externalSessionId: "slow-exit",
+        setModel: async () => {},
+        close: async () => {
+          throw new ExitUnconfirmedError();
+        },
+        exited: () => gone,
+        turn: () => {
+          let stop!: () => void;
+          const stopped = new Promise<void>((r) => (stop = r));
+          return {
+            events: (async function* () {
+              yield { type: "text_delta", text: "x" } as RuntimeEvent;
+              await stopped;
+            })(),
+            interrupt: async () => stop(),
+          };
+        },
+      }),
+    };
+    const { app, conversation, send } = await start({ adapter });
+    const c = conversation();
+    await send(c.id, "x");
+    await new Promise((r) => setTimeout(r, 50));
+    app.conversations!.delete(c.id);
+    expect(await app.runs!.quiet(c.id, 100)).toBe(false);
+    exit();
+    expect(await app.runs!.quiet(c.id, 1000)).toBe(true);
   });
 
   it("a hanging interrupt blocks neither the request nor shutdown", async () => {

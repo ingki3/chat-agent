@@ -12,6 +12,7 @@ import {
   type StartContext,
 } from "../src/runtime/adapter.js";
 import { ClaudeAdapter, claudeEnv, type ClaudeAuth } from "../src/runtime/claude.js";
+import { LinkedFolderError, startedHere } from "../src/runtime/forget.js";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -614,6 +615,107 @@ describe.skipIf(!isMac || !realBin)("Claude adapter (#15): real CLI in the sandb
         `process.stdout.write(require("fs").readFileSync(${JSON.stringify(path.join(root, "conn", "own.txt"))},"utf8"))`,
       ),
     ).toBe("OWN");
+  });
+});
+
+describe("Claude adapter: forget (#54)", () => {
+  it("removes the session's transcript and every per-session file by its id, and our note — nothing else", async () => {
+    const { a, root } = adapter({});
+    const dir = path.join(root, "conn");
+    const id = crypto.randomUUID();
+    const other = crypto.randomUUID();
+    const config = path.join(dir, "config");
+    const project = path.join(config, "projects", "-private-tmp-conn-work");
+    const put = (p: string, text = "MARKER") => {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, text);
+    };
+    // As the CLI lays them out (checked with SDK 0.3.312's CLI, CLAUDE_CONFIG_DIR): one session of each id.
+    for (const sid of [id, other]) {
+      put(path.join(project, `${sid}.jsonl`));
+      put(path.join(project, sid, "subagents", "agent-1.jsonl"));
+      put(path.join(config, "todos", `${sid}-agent-${sid}.json`));
+      put(path.join(config, "file-history", sid, "a@v1"));
+      put(path.join(config, "session-env", sid, "env"));
+      put(path.join(config, "debug", `${sid}.txt`));
+      put(path.join(`${dir}-meta`, `${sid}.json`), JSON.stringify({ systemPrompt: "MARKER", costUsd: 0 }));
+    }
+    put(path.join(config, ".claude.json"), "{}");
+    // A link named after the session points outside: removed as a link, the target stays.
+    const outside = tmp();
+    put(path.join(outside, "keep.txt"), "OUTSIDE");
+    fs.symlinkSync(outside, path.join(config, "projects", id));
+    await a.forget(id, dir);
+    const left = fs.readdirSync(root, { recursive: true }).map(String);
+    expect(left.filter((n) => n.includes(id))).toEqual([]);
+    expect(left.filter((n) => n.includes(other)).length).toBeGreaterThanOrEqual(7);
+    expect(fs.existsSync(path.join(config, ".claude.json"))).toBe(true);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("OUTSIDE");
+    // Again, a bad id, a missing folder: nothing happens, nothing throws.
+    await a.forget(id, dir);
+    await a.forget("../config", dir);
+    await a.forget(id, path.join(root, "nowhere"));
+    expect(left.filter((n) => n.includes(other)).length).toBe(
+      fs
+        .readdirSync(root, { recursive: true })
+        .map(String)
+        .filter((n) => n.includes(other)).length,
+    );
+  });
+
+  it("never walks a linked connection or config folder", async () => {
+    const { a, root } = adapter({});
+    const outside = tmp();
+    const id = crypto.randomUUID();
+    fs.mkdirSync(path.join(outside, "config", "projects", "p"), { recursive: true });
+    fs.writeFileSync(path.join(outside, "config", "projects", "p", `${id}.jsonl`), "keep");
+    fs.symlinkSync(outside, path.join(root, "conn"));
+    // Refused (the caller retries): nothing is removed through a link.
+    await expect(a.forget(id, path.join(root, "conn"))).rejects.toBeInstanceOf(LinkedFolderError);
+    fs.rmSync(path.join(root, "conn"));
+    fs.mkdirSync(path.join(root, "conn"));
+    fs.symlinkSync(path.join(outside, "config"), path.join(root, "conn", "config"));
+    await expect(a.forget(id, path.join(root, "conn"))).rejects.toBeInstanceOf(LinkedFolderError);
+    fs.rmSync(path.join(root, "conn", "config"));
+    fs.symlinkSync(outside, path.join(root, "conn-meta"));
+    await expect(a.forget(id, path.join(root, "conn"))).rejects.toBeInstanceOf(LinkedFolderError);
+    expect(fs.existsSync(path.join(outside, "config", "projects", "p", `${id}.jsonl`))).toBe(true);
+  });
+
+  it("start reports the session id before its note is written, and refuses a linked folder (#54 review)", async () => {
+    const { a, root } = adapter({});
+    const reported: string[] = [];
+    const s = await a.start(ctx({ sessionStarted: (id) => void reported.push(id) }));
+    expect(reported).toEqual([s.externalSessionId]);
+    expect(fs.existsSync(path.join(root, "conn-meta", `${s.externalSessionId}.json`))).toBe(true);
+    expect(startedHere(s.externalSessionId)).toBe(true); // live: the reconciliation leaves it alone
+    await s.close();
+    await new Promise((r) => setImmediate(r));
+    expect(startedHere(s.externalSessionId)).toBe(false); // closed: without a row it is an orphan
+    for (const part of ["", "config", "home", "work", "tmp"]) {
+      const other = adapter({});
+      const outside = tmp();
+      const dir = path.join(other.root, "conn");
+      if (part === "") fs.symlinkSync(outside, dir);
+      else {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.symlinkSync(outside, path.join(dir, part));
+      }
+      await expect(other.a.start(ctx()), part || "dir").rejects.toBeInstanceOf(LinkedFolderError);
+      expect(fs.readdirSync(outside), part).toEqual([]);
+    }
+  });
+
+  it("storedSessions: transcripts and notes — a note alone too (written first, before any transcript)", async () => {
+    const { a, root } = adapter({});
+    const dir = path.join(root, "conn");
+    const [t, n] = [crypto.randomUUID(), crypto.randomUUID()];
+    fs.mkdirSync(path.join(dir, "config", "projects", "-w"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "config", "projects", "-w", `${t}.jsonl`), "x");
+    fs.mkdirSync(`${dir}-meta`);
+    fs.writeFileSync(path.join(`${dir}-meta`, `${n}.json`), "{}");
+    expect(a.storedSessions(dir).sort()).toEqual([t, n].sort());
+    expect(a.storedSessions(path.join(root, "nowhere"))).toEqual([]);
   });
 });
 

@@ -139,7 +139,8 @@ export class FileStore {
     this.paths = storagePaths(dataDir);
     this.now = opts.now ?? Date.now;
     // A deleted conversation's files go right after its rows (the route holds the lock around both).
-    conversations.onDeleted((c) => this.removeConversationFolder(c.ownerId, c.id));
+    // What could not go now stays a job of the delete and is retried (#54, conversations/purge.ts).
+    conversations.onDeleted((c) => void this.removeConversationFiles(c.ownerId, c.id));
   }
 
   get(id: string): FileRow | undefined {
@@ -624,21 +625,30 @@ export class FileStore {
 
   /**
    * After a conversation's rows are gone: its files (names the store gives, nothing else) and the folders left
-   * empty. A failure here leaves files without rows — removed by the next `sweep()`.
+   * empty. True once none of its files is left — checked again afterwards, not assumed (#54: the delete's job retries
+   * until then, conversations/purge.ts). A linked or non-folder place is not ours: nothing is touched there, and the
+   * store never wrote through it (true). The caller holds the file-write lock.
    */
-  private removeConversationFolder(userId: string, conversationId: string): void {
-    // A linked folder is not ours to empty: left as it is (nothing outside the store is touched).
+  removeConversationFiles(userId: string, conversationId: string): boolean {
+    if (!SAFE_DIR.test(userId) || !SAFE_DIR.test(conversationId)) return true;
     const dir = this.storeDir(userId, conversationId);
-    if (!dir) return;
+    if (!dir) return true;
     try {
       for (const e of fs.readdirSync(dir, { withFileTypes: true }))
         // A link in our place is removed as a link (rmSync never follows the last name).
         if (FILE_ID.test(e.name) && (e.isFile() || e.isSymbolicLink()))
           fs.rmSync(path.join(dir, e.name), { force: true });
     } catch {
-      // unreadable: the sweep deals with what is left
+      // unreadable or not removable now: seen below, and tried again
     }
     this.pruneEmpty(userId, conversationId);
+    const left = this.storeDir(userId, conversationId);
+    if (!left) return true;
+    try {
+      return !fs.readdirSync(left).some((n) => FILE_ID.test(n));
+    } catch {
+      return false;
+    }
   }
 
   private unlinkAndPrune(f: Pick<FileRow, "userId" | "conversationId" | "id">): void {

@@ -113,6 +113,7 @@ import { registerRoutePattern } from "./observability/policy.js";
 import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
 import { registerResponseScrub } from "./secrets/http.js";
 import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
+import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -180,6 +181,8 @@ declare module "fastify" {
     scheduleProposals: ScheduleProposalStore | undefined;
     /** 관심 종목 (#31); undefined without a database. */
     watchlist: WatchlistStore | undefined;
+    /** What deleting a conversation does beyond its rows (#54): runtime session state, notifications, the WAL. */
+    purge: ConversationPurge | undefined;
   }
 }
 
@@ -290,6 +293,8 @@ export type BuildOptions = {
    * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
    */
   dataLock?: { held: () => boolean };
+  /** Tests: the deletion jobs' retry timings and clock (#54). */
+  purge?: Pick<PurgeOptions, "retryMs" | "maxRetryMs" | "now">;
   /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
   rescrub?: Pick<RescrubOptions, "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs">;
   /**
@@ -634,7 +639,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       const u = users.byId(userId);
       return u ? defaults.start(u) : null;
     };
+    // Deleting a conversation (#54) — set right below; one-off sessions (summaries) and a session that finished
+    // opening after its conversation went are handed to it by the run manager once closed.
+    const later: { purge?: ConversationPurge } = {};
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
+      forgetSession: (ref) => later.purge?.orphan(ref),
       startSettings,
       mcp,
       usage,
@@ -660,6 +669,22 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         })),
       ...opts.runs,
     });
+    const deletion = new ConversationPurge(opts.db!, app.conversations!, {
+      dataDir: config.dataDir,
+      runtimes,
+      runs: runManager,
+      removeFiles: (userId, conversationId) =>
+        app.fileWrites.write(() => fileStore.removeConversationFiles(userId, conversationId)),
+      cleanup: () => storedRescrub.cleanup(),
+      evictFiles: (ids) => fileExtracts.evict(ids),
+      log: app.log,
+      ...opts.purge,
+    });
+    later.purge = deletion;
+    app.decorate("purge", deletion);
+    // Sessions of conversations deleted before a crash (or waiting for a retry) are forgotten once serving.
+    app.addHook("onReady", async () => deletion.resume());
+    app.addHook("onClose", async () => deletion.close());
     // Runs left running by a previous process cannot be continued: mark them failed before serving.
     runManager.recover();
     const purge = setInterval(() => runManager.purgeEvents(), 10 * 60_000);
@@ -673,6 +698,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Left-overs of the last run (cut-off uploads, files whose row never came) — only on the data folder's own
     // database: an app on another database (tests on the default folder) must not judge this folder's files.
     const which = databaseOf(opts.db!, config.dataDir);
+    // Session state no conversation owns (a crash between a runtime writing it and its row, #54): found now, before
+    // anything can open a session, and forgotten by the jobs — only on this folder's own database, like the sweep.
+    if (which === "own") deletion.reconcile();
     if (which === "own")
       app.addHook("onReady", async () => {
         const count = await app.fileWrites.write(() => fileStore.sweep());
@@ -928,6 +956,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("watchlist", undefined);
     app.decorate("fileExtracts", undefined);
     app.decorate("sharing", undefined);
+    app.decorate("purge", undefined);
   }
 
   app.get(

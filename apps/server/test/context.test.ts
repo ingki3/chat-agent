@@ -540,6 +540,22 @@ describe("automatic summary (#45, FR-3.6)", () => {
     expect(t.sessions(c).at(-1)!.summaryId).toBeNull();
   });
 
+  it("a summary's one-off session is handed over to be forgotten once closed — written or failed (#54)", async () => {
+    const failing: FakeScript = (input, memory) =>
+      input.text.startsWith(SUMMARY_MARKER) ? [{ fail: "summary broke" }] : defaultScript(input, memory);
+    for (const script of [undefined, failing]) {
+      const t = await start({ window: WINDOW, context: OPTS, ...(script ? { script } : {}) });
+      const handed: string[] = [];
+      t.app.purge!.orphan = (ref) => void handed.push(ref.externalSessionId);
+      t.connect("claude-code");
+      const c = await t.newConversation();
+      const summaryTurns = () => t.claude.turnLog.filter((x) => x.input.startsWith(SUMMARY_MARKER));
+      for (let i = 1; i <= 12 && !summaryTurns().length; i++) await t.send(c, long(i));
+      expect(summaryTurns().length).toBeGreaterThan(0);
+      expect(handed).toEqual(summaryTurns().map((x) => x.sessionId));
+    }
+  });
+
   it("the summary model is the run's own when the user may not use the cheap one", async () => {
     const t = await start({ window: WINDOW, context: OPTS });
     t.connect("claude-code");

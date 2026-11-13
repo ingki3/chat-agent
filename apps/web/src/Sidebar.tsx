@@ -249,7 +249,7 @@ export function ConvMenu({ c }: { c: Conversation }) {
         await conversations.pin(c.id, !c.pinned);
       } else if (
         confirm(
-          `"${c.title}" 대화를 삭제할까요?\n메시지와 이 대화의 실행 기록이 모두 지워지고 되돌릴 수 없어요. (이 대화의 파일·아티팩트·공유도 함께 지워져요.)`,
+          `"${c.title}" 대화를 삭제할까요?\n메시지와 실행 기록, 이 대화의 파일·아티팩트·공유가 모두 지워지고 되돌릴 수 없어요. 공유받은 가족이 "이어서 대화하기"로 만든 대화는 그 사람 것으로 남아요. (백업에는 최대 7일 남았다가 지워져요.)`,
         )
       ) {
         await conversations.remove(c.id);

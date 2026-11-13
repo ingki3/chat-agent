@@ -402,6 +402,13 @@ const BODY_CACHE_SIZE = 4;
 export const verifyStats = { normalized: 0 };
 type Page = { n: Normalized; d: Decoded };
 const bodyCache = new Map<string, { body: string; page: Page }>();
+/**
+ * Pages whose rows were deleted (#54, a conversation's delete): their text leaves this cache too. Keyed by the body
+ * hash, so the same page of another conversation is simply normalised again next time.
+ */
+export function evictPages(keys: readonly string[]): void {
+  for (const k of keys) bodyCache.delete(k);
+}
 function pageOf(body: string, key: string | undefined): Page {
   if (key === undefined) return { n: normalizeWithMap(body), d: decodeWithMap(body) };
   const hit = bodyCache.get(key);
