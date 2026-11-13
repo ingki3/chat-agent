@@ -55,10 +55,12 @@ type StoredLoc = UnitLocator & { sheetNo?: number; split?: boolean };
 export type CitedLocator = FileLocator & { sheetNo?: number | undefined };
 const locOf = (seg: Pick<SegmentRow, "locator">): StoredLoc => JSON.parse(seg.locator) as StoredLoc;
 
-const isBox = (b: unknown): b is [number, number, number, number] =>
+export const isBox = (b: unknown): b is [number, number, number, number] =>
   Array.isArray(b) && b.length === 4 && b.every((x) => typeof x === "number" && x >= 0 && x <= 1);
 
-function union(boxes: [number, number, number, number][]): [number, number, number, number] | undefined {
+export function union(
+  boxes: [number, number, number, number][],
+): [number, number, number, number] | undefined {
   if (!boxes.length) return undefined;
   const x0 = Math.min(...boxes.map((b) => b[0]));
   const y0 = Math.min(...boxes.map((b) => b[1]));

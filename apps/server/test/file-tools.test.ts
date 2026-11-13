@@ -2743,6 +2743,45 @@ describe("이 PDF 12쪽 요약 in both runtimes (수용 기준 2·11)", () => {
   });
 });
 
+describe("수용 기준 2: PDF 1 + HWP 1 비교 요약 in both runtimes (#24)", () => {
+  it("Claude Code and Codex: every citation names its file and place — 12쪽 and 3번째 표 · 2행 — and opens there", async () => {
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(unwired(claude()));
+    runtimes.register(unwired(codex()));
+    const { app, f, upload, send, get } = await start(runtimes);
+    const notes: Record<string, unknown> = {};
+    for (const rt of ["claude-code", "codex"]) {
+      const c = app.conversations!.create(f.users.owner.id);
+      const pdf = await upload(f.cookies.owner, c.id, "report.pdf");
+      const hwp = await upload(f.cookies.owner, c.id, "assignment.hwp", undefined);
+      const r = await send(f.cookies.owner, c.id, "/file-compare", rt, [pdf.id, hwp.id]);
+      expect(r.run.runtime).toBe(rt);
+      const cites = r.note!.citations;
+      expect(
+        cites.map((x) => [x.status, x.title, x.site]),
+        rt,
+      ).toEqual([
+        ["verified", "report.pdf", "12쪽"],
+        ["verified", "assignment.hwp", "3번째 표 · 2행 · 2열"],
+      ]);
+      expect(r.note!.missing, rt).toEqual([]);
+      // Each opens in the viewer at its place, exactly.
+      for (const x of cites) {
+        const res = await get(
+          f.cookies.owner,
+          `/api/files/${x.locator!.fileId}/view?loc=${encodeURIComponent(JSON.stringify(x.locator))}`,
+        );
+        expect(res.statusCode, rt).toBe(200);
+        expect((res.json() as { target: { status: string } }).target.status, rt).toBe("exact");
+      }
+      notes[rt] = JSON.parse(
+        JSON.stringify(r.note, (k, v: unknown) => (k === "fileId" || k === "fileRevision" ? "<id>" : v)),
+      );
+    }
+    expect(notes.codex).toEqual(notes["claude-code"]);
+  });
+});
+
 describe("OCR capability", () => {
   it("off with EXTRACT_OCR=off; the language data is copied into one folder otherwise", () => {
     const dir = path.join(tmp(), "ocr");

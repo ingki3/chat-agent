@@ -18,7 +18,13 @@ export const REPORT_PAGE12 = {
   volunteers: "Volunteers from 12 schools joined in March 2026.",
 };
 
+/** The third table's second row of 과제안내.hwp (`fixtures/extract/assignment.hwp`, make-hwp-fixtures.py). */
+export const ASSIGNMENT_TABLE3_ROW2 = "학교 누리집 과제방에 PDF로 올립니다.";
+/** The OCR text of the scanned page (`fixtures/extract/scanned.pdf`, second line). */
+export const SCANNED_LINE2 = "가족 과제 안내문 확인";
+
 const FIRST = "$0.items.0.fileId";
+const SECOND = "$0.items.1.fileId";
 
 export const FILE_SCENARIOS = {
   /** Summarise page 12: list the files, read page 12, cite two of its sentences. Both verified, on page 12. */
@@ -42,6 +48,37 @@ export const FILE_SCENARIOS = {
       },
     ],
     answer: "보고서에는 사업이 취소됐다고 나와요[1].",
+  },
+  /** 과제안내.hwp: one sentence of the third table's second row (#24: the viewer opens and highlights that row). */
+  table3: {
+    calls: [
+      { tool: "file_list", input: {} },
+      { tool: "file_cite", input: { fileId: FIRST, snippet: ASSIGNMENT_TABLE3_ROW2 } },
+    ],
+    answer: "과제는 학교 누리집 과제방에 PDF로 올려요[1].",
+  },
+  /** A scanned PDF: a line OCR read (#24: the viewer shows the passage's box on the page). */
+  scan: {
+    calls: [
+      { tool: "file_list", input: {} },
+      { tool: "file_cite", input: { fileId: FIRST, snippet: SCANNED_LINE2, page: 1 } },
+    ],
+    answer: "스캔한 안내문에는 가족 과제 안내문을 확인하라고 적혀 있어요[1].",
+  },
+  /**
+   * 수용 기준 2: a PDF and an HWP compared — the first upload is report.pdf, the second 과제안내.hwp. Every citation
+   * names its file and place (12쪽, 3번째 표 · 2행 · 2열).
+   */
+  compare: {
+    calls: [
+      { tool: "file_list", input: {} },
+      { tool: "file_read", input: { fileId: FIRST, from: 12, to: 12 } },
+      { tool: "file_read", input: { fileId: SECOND } },
+      { tool: "file_cite", input: { fileId: FIRST, snippet: REPORT_PAGE12.summary, page: 12 } },
+      { tool: "file_cite", input: { fileId: SECOND, snippet: ASSIGNMENT_TABLE3_ROW2 } },
+    ],
+    answer:
+      "## 두 문서 비교\n\n보고서는 강 정화 활동으로 쓰레기 340kg을 치웠다고 해요[1]. 과제 안내문은 결과를 학교 누리집 과제방에 PDF로 올리라고 해요[2].",
   },
 } satisfies Record<string, FileScenario>;
 export type FileScenarioName = keyof typeof FILE_SCENARIOS;

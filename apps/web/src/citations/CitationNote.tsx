@@ -1,4 +1,6 @@
+import { Link } from "react-router";
 import { CITATION_MISSING_TEXT, type CitationNotePart } from "@agentlee/shared";
+import { useFileViewHref } from "../files/context.js";
 import { CitationMarker } from "./CitationMarker.js";
 import { segments, sourceViews } from "./segments.js";
 import "./citations.css";
@@ -35,6 +37,7 @@ export function CitedText({ text, note }: { text: string; note: CitationNotePart
  */
 export function CitationSources({ note, text }: { note: CitationNotePart; text?: string }) {
   const views = sourceViews(note);
+  const fileHref = useFileViewHref();
   if (!views.length && !note.missing.length) return null;
   // The paragraphs without a citation, as excerpts (the markdown view cannot mark ranges inline).
   const missing =
@@ -61,28 +64,50 @@ export function CitationSources({ note, text }: { note: CitationNotePart; text?:
       )}
       {views.length > 0 && (
         <ol className="cite-sources" aria-label="출처">
-          {views.map((v) => (
-            <li key={v.n} className={v.ok ? "" : "warn"} data-testid="citation-source" data-status={v.status}>
-              <span className="cite-n">[{v.n}]</span>{" "}
-              <span className="cite-body">
-                {v.title && <span className="cite-title">{v.title}</span>}
-                {(v.site || v.date) && (
-                  <span className="cite-meta">{[v.site, v.date].filter(Boolean).join(" · ")}</span>
-                )}
-                {v.url &&
-                  (v.href ? (
-                    <a className="cite-url" href={v.href} target="_blank" rel="noopener noreferrer nofollow">
-                      {v.url}
-                    </a>
-                  ) : (
-                    <span className="cite-url">{v.url}</span>
-                  ))}
-                <span className={`cite-status${v.ok ? " ok" : " warn"}`} data-testid="citation-status">
-                  {v.label}
+          {views.map((v) => {
+            const open = v.locator ? fileHref(v.locator.fileId, v.locator) : null;
+            return (
+              <li
+                key={v.n}
+                className={v.ok ? "" : "warn"}
+                data-testid="citation-source"
+                data-status={v.status}
+              >
+                <span className="cite-n">[{v.n}]</span>{" "}
+                <span className="cite-body">
+                  {v.title &&
+                    (open ? (
+                      // A file citation (#24): the file name and place open the viewer there.
+                      <Link className="cite-title" to={open} data-testid="citation-file-link">
+                        {v.title}
+                        {v.site ? ` · ${v.site}` : ""}
+                      </Link>
+                    ) : (
+                      <span className="cite-title">{v.title}</span>
+                    ))}
+                  {!open && (v.site || v.date) && (
+                    <span className="cite-meta">{[v.site, v.date].filter(Boolean).join(" · ")}</span>
+                  )}
+                  {v.url &&
+                    (v.href ? (
+                      <a
+                        className="cite-url"
+                        href={v.href}
+                        target="_blank"
+                        rel="noopener noreferrer nofollow"
+                      >
+                        {v.url}
+                      </a>
+                    ) : (
+                      <span className="cite-url">{v.url}</span>
+                    ))}
+                  <span className={`cite-status${v.ok ? " ok" : " warn"}`} data-testid="citation-status">
+                    {v.label}
+                  </span>
                 </span>
-              </span>
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ol>
       )}
     </div>

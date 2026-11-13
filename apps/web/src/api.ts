@@ -27,6 +27,8 @@ import {
   UPLOAD_ID_HEADER,
   FileListResponse,
   FileTextResponse,
+  FileViewResponse,
+  type FileLocator,
   UploadedFile,
   AdminUser,
   AuthState,
@@ -548,6 +550,17 @@ export const files = {
   /** Its extraction's state (#48·#23): `pending`, `ok` or `failed` with a fixed code. */
   extract: async (id: string) =>
     FileTextResponse.parse(await call("GET", `/api/files/${enc(id)}/extract?limit=1`)).extract,
+  /**
+   * The viewer's window of its text (#24): around `loc` (and how it resolved) or from `from` — scrubbed text with
+   * its finer places, never the original bytes.
+   */
+  view: async (id: string, opts: { loc?: FileLocator | undefined; from?: number | undefined } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.loc) q.set("loc", JSON.stringify(opts.loc));
+    if (opts.from !== undefined) q.set("from", String(opts.from));
+    const qs = q.toString();
+    return FileViewResponse.parse(await call("GET", `/api/files/${enc(id)}/view${qs ? `?${qs}` : ""}`));
+  },
   /** The original: a download (`inline` shows a PNG/JPG in the page instead). */
   url: (id: string, inline = false) => `/api/files/${enc(id)}/content${inline ? "?inline=1" : ""}`,
 };

@@ -16,6 +16,7 @@ import {
 import { Parts } from "../chat/Parts.js";
 import { ArtifactOpenContext } from "../artifacts/ArtifactPanel.js";
 import { TopBar } from "../Shell.js";
+import { FileViewContext } from "../files/context.js";
 
 /** "가족에게 공유" for one of my conversations: live, or "이 메시지까지" (a frozen snapshot, decision #3). */
 function ShareForm() {
@@ -291,13 +292,16 @@ export function SharedViewPage({ id }: { id: string }) {
         <ArtifactOpenContext.Provider
           value={(artifactId) => void navigate(`/a/${encodeURIComponent(artifactId)}`)}
         >
-          <ol className="shared-messages">
-            {d.messages.map((m) => (
-              <li key={m.id} className={`msg ${m.role}`} data-testid="shared-message">
-                <Parts parts={m.parts as PublicPart[]} />
-              </li>
-            ))}
-          </ol>
+          {/* File citations open the viewer (#24) — what it serves is this projection's only (#29). */}
+          <FileViewContext.Provider value={d.conversation?.id ?? null}>
+            <ol className="shared-messages">
+              {d.messages.map((m) => (
+                <li key={m.id} className={`msg ${m.role}`} data-testid="shared-message">
+                  <Parts parts={m.parts as PublicPart[]} />
+                </li>
+              ))}
+            </ol>
+          </FileViewContext.Provider>
         </ArtifactOpenContext.Provider>
         {d.files.length > 0 && (
           <section aria-label="파일">

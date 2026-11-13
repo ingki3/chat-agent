@@ -43,6 +43,7 @@ import { ResearchToggle } from "../citations/ResearchToggle.js";
 import { ReferencesButton } from "../citations/ReferencesExport.js";
 import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
 import { markStartedHere, useAutoOpen } from "../artifacts/ArtifactPanel.js";
+import { FileViewContext } from "../files/context.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
@@ -331,49 +332,52 @@ export function ChatPage() {
         {conv.data?.owned === true && <ConvMenu c={conv.data} />}
       </TopBar>
       <div className="thread" data-testid="thread" ref={scroller}>
-        <div className="col" ref={content}>
-          {conv.data?.kind === "fork" && (
-            <p className="notice info small" data-testid="fork-notice">
-              가족이 공유한 내용을 복사한 내 대화예요. 여기서 이어가도 원래 대화는 바뀌지 않아요.
-            </p>
-          )}
-          {messages.hasNextPage && (
-            <button
-              type="button"
-              className="ghost small older"
-              disabled={messages.isFetchingNextPage}
-              onClick={() => void messages.fetchNextPage()}
-            >
-              {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
-            </button>
-          )}
-          {messages.isError && (
-            <div className="notice err" role="alert">
-              메시지를 불러오지 못했어요. {errorText(messages.error)}{" "}
-              <button type="button" className="small" onClick={() => void messages.refetch()}>
-                다시 시도
+        {/* File citations and file chips open this conversation's file viewer (#24). */}
+        <FileViewContext.Provider value={id}>
+          <div className="col" ref={content}>
+            {conv.data?.kind === "fork" && (
+              <p className="notice info small" data-testid="fork-notice">
+                가족이 공유한 내용을 복사한 내 대화예요. 여기서 이어가도 원래 대화는 바뀌지 않아요.
+              </p>
+            )}
+            {messages.hasNextPage && (
+              <button
+                type="button"
+                className="ghost small older"
+                disabled={messages.isFetchingNextPage}
+                onClick={() => void messages.fetchNextPage()}
+              >
+                {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
               </button>
-            </div>
-          )}
-          {list?.map((m) =>
-            m.role === "user" ? (
-              <UserMessage key={m.id} m={m} canEdit={!busy} onEdit={edit} />
-            ) : m.role === "system" ? (
-              <SystemMessage key={m.id} m={m} />
-            ) : m.role === "assistant" ? (
-              <AssistantMessage
-                key={m.id}
-                m={m}
-                live={live && m.id === live.messageId ? live : null}
-                after={after[m.id]}
-                canRegenerate={!busy && m.id === lastAssistant?.id}
-                onRegenerate={regenerate}
-                onReconnect={reconnect}
-                onStop={stop}
-              />
-            ) : null,
-          )}
-        </div>
+            )}
+            {messages.isError && (
+              <div className="notice err" role="alert">
+                메시지를 불러오지 못했어요. {errorText(messages.error)}{" "}
+                <button type="button" className="small" onClick={() => void messages.refetch()}>
+                  다시 시도
+                </button>
+              </div>
+            )}
+            {list?.map((m) =>
+              m.role === "user" ? (
+                <UserMessage key={m.id} m={m} canEdit={!busy} onEdit={edit} />
+              ) : m.role === "system" ? (
+                <SystemMessage key={m.id} m={m} />
+              ) : m.role === "assistant" ? (
+                <AssistantMessage
+                  key={m.id}
+                  m={m}
+                  live={live && m.id === live.messageId ? live : null}
+                  after={after[m.id]}
+                  canRegenerate={!busy && m.id === lastAssistant?.id}
+                  onRegenerate={regenerate}
+                  onReconnect={reconnect}
+                  onStop={stop}
+                />
+              ) : null,
+            )}
+          </div>
+        </FileViewContext.Provider>
       </div>
       {away && (
         <div className="jump">

@@ -15,6 +15,7 @@ import { SharedViewPage, SharesPage } from "./pages/SharesPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
 import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
+import { FileViewerPage } from "./files/FileViewer.js";
 
 /** Only the login state lives here. Everything an account sees lives in a per-account client (AccountData). */
 const authClient = new QueryClient({
@@ -81,6 +82,7 @@ function AuthGate() {
         <Route element={<Shell user={data.user} onSignedOut={set} />}>
           <Route index element={<NewChatPage />} />
           <Route path="c/:id" element={<ChatRoute />} />
+          <Route path="c/:id/files/:fileId" element={<FileViewRoute />} />
           <Route path="shared" element={<SharesPage />} />
           <Route path="shared/:id" element={<SharedViewRoute />} />
           <Route path="schedules" element={<SchedulesPage />} />
@@ -117,6 +119,12 @@ function AccountData({ children }: { children: ReactNode }) {
 function ScheduleRoute() {
   const { id = "" } = useParams();
   return <ScheduleDetailPage key={id} />;
+}
+
+/** The file viewer (#24), one instance per file: a citation's file at its place. */
+function FileViewRoute() {
+  const { id = "", fileId = "" } = useParams();
+  return <FileViewerPage key={`${id}/${fileId}`} conversationId={id} fileId={fileId} />;
 }
 
 /** One chat screen instance per conversation: no state (e.g. a half-streamed reply) carries over. */

@@ -410,6 +410,26 @@ def report_hwp():
     return [paras(0, items)]
 
 
+def assignment_hwp():
+    # 과제안내.hwp (#24 viewer): paragraphs and three tables; the third table's second row is the cited one
+    # ("3번째 표 · 2행").
+    def simple(rows):
+        return table([(r, c, 1, 1, [text]) for r, row in enumerate(rows) for c, text in enumerate(row)], len(rows), 2)
+
+    items = [
+        ("과제 안내", [section_def()]),
+        "이번 과제는 지역 하천 조사 보고서입니다.",
+        ("", [simple([["구분", "내용"], ["주제", "우리 동네 하천"], ["분량", "A4 3쪽 이내"]])]),
+        "평가 기준은 아래 표를 따릅니다.",
+        ("", [simple([["항목", "배점"], ["조사 내용", "50점"], ["발표", "30점"]])]),
+        "제출 방법과 기한은 다음과 같습니다.",
+        ("", [simple([["항목", "안내"], ["제출 방법", "학교 누리집 과제방에 PDF로 올립니다."],
+                      ["기한", "11월 20일 자정까지"]])]),
+        "궁금한 점은 담임 선생님께 물어보세요.",
+    ]
+    return [paras(0, items)]
+
+
 # A synthetic value the cut tests register as a known secret (never a real one): its base64's first 40 characters
 # end kept text, the rest is in a part that is left out (review #120).
 CUT_SECRET = "sk-fixture-hwp-cut-0123456789abcdefABCDEF"
@@ -666,6 +686,7 @@ ENCRYPTED_MANIFEST = (
 def main():
     out(os.path.join(HERE, "sample.hwp"), hwp(sample_hwp()))
     out(os.path.join(HERE, "report.hwp"), hwp(report_hwp(), props=0, version=4))
+    out(os.path.join(HERE, "assignment.hwp"), hwp(assignment_hwp()))
     out(os.path.join(INJECTION, "doc-injection.hwp"), injection_hwp())
     garbage = deterministic(2048, b"ciphertext")
     # Password (property bit 1): the body stream is ciphertext.
