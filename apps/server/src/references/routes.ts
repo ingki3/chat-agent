@@ -229,14 +229,23 @@ export function registerReferenceRoutes(
       // the registry as it is then: a secret registered meanwhile in a field that was cut (the conversation title at
       // 100 characters, then " · APA 7") cannot be found in the finished line, only in the raw field (review #115
       // round 4).
-      const rebuild = () =>
-        JSON.stringify(
+      // A shared viewer's projection is read again too (review #117 round 4): a share revoked or narrowed while the
+      // worker ran changes what they may have — gone entirely (`null`) is a 403, narrower makes the file again.
+      const rebuild = () => {
+        const now = viewOf(app, req, { conversationId: req.params.id });
+        if (now === null) return null;
+        return JSON.stringify(
           referencesDocument(
             titleOf(req.params.id),
             style,
-            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, view).lines,
+            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, now).lines,
           ),
         );
+      };
+      const gone = () => {
+        done("doc_forbidden");
+        return deny(reply, 403, "forbidden");
+      };
       let built = JSON.stringify(doc);
       let made: DocRunResult | undefined;
       let file: Buffer;
@@ -265,6 +274,7 @@ export function registerReferenceRoutes(
         const parts = await readParts(made.data);
         state = registryState();
         const fresh = rebuild();
+        if (fresh === null) return gone();
         if (fresh !== built) {
           const again = DocContent.safeParse(JSON.parse(fresh));
           if (attempt >= 1 || !again.success || docInputProblem(again.data) || !again.data.blocks.length) {
@@ -291,9 +301,13 @@ export function registerReferenceRoutes(
       }
       // Registered since the check (nothing asynchronous runs in between today; kept so a later change cannot open a
       // gap): the parts read are checked again, synchronously, or the file is refused.
+      // The projection is read once more here, whatever the registry did.
+      const last = rebuild();
+      if (last === null) return gone();
       if (
-        registryState() !== state &&
-        (partsHoldSecret(checked) || scrubKnownDeep(doc, { tail: false }) !== doc || rebuild() !== built)
+        last !== built ||
+        (registryState() !== state &&
+          (partsHoldSecret(checked) || scrubKnownDeep(doc, { tail: false }) !== doc))
       ) {
         done("doc_failed");
         return fail(reply.header("Retry-After", "1"), 503, "references_retry");

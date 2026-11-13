@@ -40,7 +40,7 @@
 
 | 경로 | 상태 |
 |---|---|
-| `GET /api/conversations/:id` (설정·알림 칩은 빼고) | 연결됨 |
+| `GET /api/conversations/:id` (설정·알림 칩·예약 "새 결과" 표시는 빼고) | 연결됨 |
 | `GET /api/conversations/:id/messages` · `…/messages/:messageId/versions` | 연결됨 |
 | `GET /api/conversations/:id/active-run` · `GET /api/runs/:id` · `GET /api/runs/:id/events` (SSE, `projectEvent`) | 연결됨 |
 | `GET /api/conversations/:id/files` · `GET /api/files/:id` · `GET /api/files/:id/content` (원본·다운로드·`?inline=1`) | 연결됨 |
@@ -50,8 +50,8 @@
 | `GET /api/shares/:id/view` · `GET /api/shared-with-me?q=` (검색) | 연결됨 (`bundle`·`search`) |
 | `GET /api/shares/:id/events` (해제 알림 SSE) | 연결됨 (`targets` + `watchAccess`) |
 | `GET /api/artifacts/:id/access?version=n` (아티팩트 화면의 접근 SSE — `/a/:id`·패널) | 연결됨 (주인은 `owner` 후 바로 종료. 공유받은 사람은 아티팩트를 볼 수 없게 되면 `revoked`, 아티팩트는 아직 보이지만 화면의 버전이 빠지면 `scope {versions}`) |
-| 파일 추출·위치 도구 (#48, PR #107) | 미연결 — 아직 dev에 없음. 붙일 때 `viewOf`로 투영을 받고 `p.files`에 있는 파일만 다룬다 |
-| 참고문헌 내보내기 (#26, PR #115) | 미연결 — 아직 dev에 없음. 공유받은 사람용은 `bundle(share, p).sources`만 입력으로 쓴다 |
+| `GET /api/files/:id/extract` (#48 추출 글) | 연결됨 (`/content`와 같은 검사 — `p.files`의 파일만). 파일 도구(`file_list`·`file_read`·`file_cite`)는 run 안에서만 돌고 run은 주인만 만든다 — 해당 없음 |
+| `GET /api/conversations/:id/references` · `…/references/download` (#26) | 연결됨 (투영의 메시지와 그 출처만 — `ReferencesView`. `.docx`는 작업자가 끝난 뒤 투영을 다시 읽어, 그사이 철회되면 403·좁아지면 다시 만든다) |
 | 포크 "이어서 대화하기" (#52) | 미연결 — 다음 이슈. `bundle(share, p)`를 복사한다(메시지·파일·버전·출처 모두 투영된 것만) |
 | 대화 목록 검색 `GET /api/conversations?q=` | 해당 없음 — 본인 대화만 |
 

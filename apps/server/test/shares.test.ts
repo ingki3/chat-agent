@@ -15,6 +15,8 @@ import {
 } from "@agentlee/shared";
 import { eq } from "drizzle-orm";
 import { buildApp } from "../src/app.js";
+import { inProcessDocRunner, type DocRunner } from "../src/docgen/runner.js";
+import { readDocx } from "./helpers/doc-parse.js";
 import { messages } from "../src/db/schema.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
@@ -43,7 +45,7 @@ const script: FakeScript = (input) => [
   { text: `답: ${input.text}` },
 ];
 
-async function start() {
+async function start(o: { runner?: DocRunner } = {}) {
   const db = createTestDb();
   const runtimes = new RuntimeRegistry();
   runtimes.register(new FakeRuntime({ script }));
@@ -55,6 +57,7 @@ async function start() {
     runs: { flushMs: 0 },
     sse: { heartbeatMs: 1000 },
     renderer: { render: async () => ({ ok: true, body: Buffer.from("png"), type: "image/png" }) },
+    ...(o.runner ? { docs: { runner: o.runner } } : {}),
   });
   apps.push(app);
   app.addHook("onClose", async () => fs.rmSync(dataDir, { recursive: true, force: true }));
@@ -165,8 +168,8 @@ async function start() {
  * turn 2 — after the boundary, but before the share — sends F2, makes A v2 and cites S2; the owner then reverts A to
  * v1 (v3, a copy no message made).
  */
-async function snapshotWorld() {
-  const w = await start();
+async function snapshotWorld(o: { runner?: DocRunner } = {}) {
+  const w = await start(o);
   const c = w.app.conversations!.create(w.f.users.owner.id, { title: "과학 보고서" });
   const f1 = await w.upload(c.id, "첫째.txt", "첫째 파일");
   const t1 = await w.say(c.id, "첫 질문 사과", [f1]);
@@ -198,6 +201,50 @@ async function snapshotWorld() {
     boundaryMessageId: t1.assistant.id,
   });
   return { ...w, c, f1, f2, t1, t2, a: artifact.id, s1, s2, share };
+}
+
+/** Each turn's answer cites its page (the note the run's end would write): S1 in turn 1, S2 in turn 2. */
+function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
+  const note = (n: number, sourceId: string, url: string) => ({
+    type: "citation_note",
+    missing: [],
+    markers: [],
+    citations: [
+      {
+        n,
+        status: "verified",
+        sourceId,
+        title: url,
+        site: "example.com",
+        url,
+        publishedAt: null,
+        quote: "인용",
+      },
+    ],
+  });
+  for (const [m, src, url] of [
+    [w.t1.assistant, w.s1, "https://a.example/1"],
+    [w.t2.assistant, w.s2, "https://b.example/2"],
+  ] as const)
+    w.db
+      .update(messages)
+      .set({ parts: [...(m.parts as object[]), note(1, src, url)] as Message["parts"] })
+      .where(eq(messages.id, m.id))
+      .run();
+}
+
+/** A doc runner held until `release()`; `started()` once a run is waiting. */
+function heldRunner() {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((res) => (release = res));
+  let begun: () => void = () => {};
+  const started = new Promise<void>((res) => (begun = res));
+  const runner: DocRunner = async (job) => {
+    begun();
+    await gate;
+    return inProcessDocRunner()(job);
+  };
+  return { runner, started, release: () => release() };
 }
 
 const ids = (xs: { id: string }[]) => xs.map((x) => x.id).sort();
@@ -319,33 +366,7 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
   it("the reference export (#26) of a shared viewer lists what their projection cites only", async () => {
     const w = await snapshotWorld();
     const { viewer, owner, c } = w;
-    // Each turn's answer cites its page (the note the run's end would write).
-    const note = (n: number, sourceId: string, url: string) => ({
-      type: "citation_note",
-      missing: [],
-      markers: [],
-      citations: [
-        {
-          n,
-          status: "verified",
-          sourceId,
-          title: url,
-          site: "example.com",
-          url,
-          publishedAt: null,
-          quote: "인용",
-        },
-      ],
-    });
-    for (const [m, src, url] of [
-      [w.t1.assistant, w.s1, "https://a.example/1"],
-      [w.t2.assistant, w.s2, "https://b.example/2"],
-    ] as const)
-      w.db
-        .update(messages)
-        .set({ parts: [...(m.parts as object[]), note(1, src, url)] as Message["parts"] })
-        .where(eq(messages.id, m.id))
-        .run();
+    citeInNotes(w);
     const list = async (who: typeof viewer) => {
       const r = await who.get(`/api/conversations/${c.id}/references?style=apa`);
       return { status: r.statusCode, text: r.statusCode === 200 ? r.json<{ text: string }>().text : "" };
@@ -366,6 +387,54 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
     // Revoked: nothing at once.
     expect((await owner.send("DELETE", `/api/shares/${w.share.id}`)).statusCode).toBe(200);
     expect((await list(viewer)).status).toBe(403);
+  });
+
+  it("a .docx export follows the projection as it is when the file is done (review #117 round 4)", async () => {
+    // Narrowed while the worker ran: snapshot (turn 1) + live (everything); the live one is revoked mid-way.
+    const held = heldRunner();
+    const w = await snapshotWorld({ runner: held.runner });
+    citeInNotes(w);
+    const live = (
+      await w.owner.send("POST", `/api/conversations/${w.c.id}/shares`, {
+        target: { audience: "users", userIds: [w.f.users.shared.id] },
+        mode: "live",
+      })
+    ).json<Share>();
+    const url = `/api/conversations/${w.c.id}/references/download?style=apa&format=docx`;
+    const pending = w.viewer.get(url);
+    await held.started;
+    expect((await w.owner.send("DELETE", `/api/shares/${live.id}`)).statusCode).toBe(200);
+    held.release();
+    const r = await pending;
+    expect(r.statusCode, r.body).toBe(200);
+    const text = (await readDocx(r.rawPayload)).paragraphs.join("\n");
+    expect(text).toContain("https://a.example/1");
+    expect(text).not.toContain("b.example");
+  });
+
+  it("a .docx export of a share revoked while the worker ran is refused", async () => {
+    const held = heldRunner();
+    const w = await snapshotWorld({ runner: held.runner });
+    citeInNotes(w);
+    const pending = w.viewer.get(`/api/conversations/${w.c.id}/references/download?style=apa&format=docx`);
+    await held.started;
+    expect((await w.owner.send("DELETE", `/api/shares/${w.share.id}`)).statusCode).toBe(200);
+    held.release();
+    expect((await pending).statusCode).toBe(403);
+  });
+
+  it("a schedule's result marker is the owner's: a viewer never sees it (review #117 round 4)", async () => {
+    const w = await snapshotWorld();
+    // A new result after the boundary (the schedule handler's mark).
+    w.app.conversations!.markNewResult(w.c.id, w.t2.assistant.id);
+    expect((await w.owner.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({
+      newResult: true,
+      newResultMessageId: w.t2.assistant.id,
+    });
+    expect((await w.viewer.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({
+      newResult: false,
+      newResultMessageId: null,
+    });
   });
 
   it("a snapshot needs a finished boundary message of the conversation", async () => {

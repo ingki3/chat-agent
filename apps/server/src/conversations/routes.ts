@@ -139,7 +139,17 @@ export function registerConversationRoutes(
     const p = view(req);
     if (p === null) return deny(reply, 403, "forbidden");
     // A shared viewer reads it, never the owner's chip or notices (#29).
-    const out = p ? { ...c, pinned: false, settings: null, fallbackNotice: null } : c;
+    // Nor the schedule result marker (#56): it is the owner's, and may point past a snapshot's boundary.
+    const out = p
+      ? {
+          ...c,
+          pinned: false,
+          settings: null,
+          fallbackNotice: null,
+          newResult: false,
+          newResultMessageId: null,
+        }
+      : c;
     return reply.header("Cache-Control", "no-store").send(out);
   });
 
