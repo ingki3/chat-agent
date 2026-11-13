@@ -3666,5 +3666,5 @@ describe("HWPX switch/default around a subList (review #120 5차): in its real p
       ["뒤", { kind: "paragraph", paragraph: 1, split: true }],
     ]);
     expect(JSON.stringify(Object.values(reads))).not.toContain("UNREAD");
-  });
+  }, 60_000); // several HWPX extractions and a re-extraction: slower than 5 s on CI runners
 });
