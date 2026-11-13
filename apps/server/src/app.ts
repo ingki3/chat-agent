@@ -95,7 +95,13 @@ import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
 import { accountOrSandboxExtractor } from "./workers/extract.js";
-import { installedFingerprint, workerManifest } from "./workers/bundle.js";
+import {
+  computeFingerprints,
+  defaultFingerprintSources,
+  installedFingerprints,
+  kindFingerprint,
+  type WorkerFingerprints,
+} from "./workers/bundle.js";
 import { sweepWorkerScratch } from "./workers/run.js";
 import {
   docJobCheck,
@@ -516,6 +522,14 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // in the background once the server is ready (after the worker-scratch sweep), one kind after another.
     const workerAccount = workerAccountFromConfig(config.workerRunUser);
     const workerGates = opts.workers?.gates ?? new WorkerGates(workerAccount);
+    // The first time a kind runs in the same-uid sandbox (no account, or its check has not passed yet), say so in
+    // the log — once per kind and process (review #130 round 1: not only after the checks finish).
+    const fellBack = new Set<WorkerKind>();
+    const sameUidUse = (kind: WorkerKind) => {
+      if (fellBack.has(kind)) return;
+      fellBack.add(kind);
+      logEvent(app.log, "warn", "worker.same_uid", { workerKinds: kind });
+    };
     // Documents (#49): made by `doc_create`, stored with the conversation's files (the store is decorated below).
     const docRunner =
       opts.docs?.runner ??
@@ -525,6 +539,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             () => workerGates.verified("docgen"),
             sandboxedDocRunner(),
             config.dataDir,
+            () => sameUidUse("docgen"),
           ));
     // Every document worker run (doc_create and the reference export) takes one of the same slots.
     const docSlots = new DocSlots(docRunner);
@@ -556,6 +571,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
               sandboxedExtractor(ocrNow),
               config.dataDir,
               ocrNow,
+              () => sameUidUse("extract"),
             )),
       { log: app.log, onReplaced: () => storedRescrub.cleanup(), ...opts.extract },
     );
@@ -652,7 +668,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         return;
       }
       if (config.env === "test") return;
-      if (!workerAccount) return sameUid();
+      // At check start every kind is still on the same-uid sandbox: say so now (and again for those left after).
+      sameUid();
+      if (!workerAccount) return;
       if (extractorKind(config) === "in-process")
         workerGates.skip("extract", "in-process extraction (tests only)");
       if (docRunnerKind(config) === "in-process")
@@ -661,12 +679,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       if (opts.docs?.runner) workerGates.skip("docgen", "a custom document runner");
       const account = workerAccount;
       const renderer = ownRenderer;
-      let workerFingerprint = "";
-      try {
-        workerFingerprint = workerManifest().fingerprint;
-      } catch {
-        // a package missing here: every check fails at its bundle step (fail closed)
-      }
+      // This checkout's fingerprints, hashed once (node and the browser are large; asynchronously, off the loop).
+      let current: Promise<WorkerFingerprints> | undefined;
+      const currentFor = async (kind: WorkerKind) =>
+        kindFingerprint(
+          await (current ??= computeFingerprints(defaultFingerprintSources(config.exportBrowser))),
+          kind,
+        );
+      const installedFor = (kind: WorkerKind) => {
+        const f = installedFingerprints();
+        return f ? kindFingerprint(f, kind) : undefined;
+      };
       void workerGates
         .start(async (kind, signal) => {
           if (kind === "render" && !renderer)
@@ -677,7 +700,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             dataDir: config.dataDir,
             serverUid: process.getuid?.() ?? -1,
             signal,
-            bundle: { current: () => workerFingerprint, installed: () => installedFingerprint() },
+            bundle: { current: () => currentFor(kind), installed: () => installedFor(kind) },
             job:
               kind === "extract"
                 ? extractJobCheck(config.dataDir, ocrNow)
@@ -987,7 +1010,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       const own = new Renderer({
         browser: config.env === "test" ? undefined : findBrowser(config.exportBrowser),
         // Through the worker account once its render check passed (#122).
-        account: { verified: () => workerGates.verified("render"), dataDir: config.dataDir },
+        account: {
+          verified: () => workerGates.verified("render"),
+          dataDir: config.dataDir,
+          onFallback: () => sameUidUse("render"),
+        },
       });
       ownRenderer = own;
       app.addHook("onClose", async () => own.close());

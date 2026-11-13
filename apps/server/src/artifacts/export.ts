@@ -160,6 +160,8 @@ export type RendererOptions = {
 export type AccountRendering = {
   verified: () => VerifiedWorker | undefined;
   dataDir: string;
+  /** Called on each same-uid render (the app logs the first). */
+  onFallback?: () => void;
   /** Tests only: replace the spawn of sudo, the reap and the clean of a job. */
   spawn?: WorkerSpawn;
   reap?: (account: WorkerAccount, jobId: string, onExit: (code: number | null) => void) => void;
@@ -167,7 +169,12 @@ export type AccountRendering = {
 };
 
 /** One render through the worker account: who, and (the self-check) a look at the job before it is removed. */
-export type RenderVia = { worker: VerifiedWorker; onJob?: ((jobId: string) => void) | undefined };
+export type RenderVia = {
+  worker: VerifiedWorker;
+  onJob?: ((jobId: string) => void) | undefined;
+  /** The self-check's shutdown: the render is stopped (reaped) and fails. */
+  signal?: AbortSignal | undefined;
+};
 
 const defaultWorkerSpawn: WorkerSpawn = (command, args) =>
   spawn(command, args, { env: {}, stdio: ["pipe", "pipe", "pipe"], detached: true });
@@ -230,13 +237,18 @@ export class Renderer {
   async render(job: RenderJob, via?: RenderVia): Promise<RenderResult> {
     const worker = via?.worker ?? this.o.account?.verified();
     if (!worker && !this.o.browser) return { ok: false, code: "export_unavailable" };
+    if (!worker) this.o.account?.onFallback?.();
     if (this.active >= this.limits.concurrent) {
       // A few wait for a free slot (each render is short); beyond that the caller is told to come back.
       if (this.queue.length >= this.limits.queue) return { ok: false, code: "export_busy" };
       await new Promise<void>((resolve) => this.queue.push(resolve));
     } else this.active++;
     try {
-      return await this.run(this.o.browser, job, worker ? { worker, onJob: via?.onJob } : undefined);
+      return await this.run(
+        this.o.browser,
+        job,
+        worker ? { worker, onJob: via?.onJob, signal: via?.signal } : undefined,
+      );
     } finally {
       // Hand the slot straight to the next waiter (it never counted itself), or free it.
       const next = this.queue.shift();
@@ -360,6 +372,13 @@ export class Renderer {
       kill("timeout");
       cdp.close(new CdpError("closed"));
     }, L.timeoutMs);
+    // The self-check's shutdown (account mode): stop the render now; it fails.
+    const onAbort = () => {
+      kill("protocol");
+      cdp.close(new CdpError("closed"));
+    };
+    if (via?.signal?.aborted) onAbort();
+    else via?.signal?.addEventListener("abort", onAbort, { once: true });
     // Memory of the one browser process; not measurable while it runs → stop (fail closed). Under the account the
     // launcher watches it (every 250 ms, exit 125 over the limit): the server's pid is sudo's.
     let sampling = false;
@@ -409,6 +428,7 @@ export class Renderer {
       result = { ok: false, code: cdp.error?.code === "too_large" ? "export_limit" : "export_failed" };
     else if (killed) result = { ok: false, code: "export_limit" };
     clearTimeout(timer);
+    via?.signal?.removeEventListener("abort", onAbort);
     clearInterval(monitor);
     // A failed render (bad reply, protocol error, limit) is killed outright; a good one is closed politely, then
     // made sure of: the whole process group goes either way.

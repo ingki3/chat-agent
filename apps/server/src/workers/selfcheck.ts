@@ -163,7 +163,7 @@ export async function probeWorker(o: {
     // KERN_PROC_PID also answers for a zombie (with its uid), and a zombie's KERN_PROCARGS2 is refused too: the
     // kernel still showing the sibling does not prove it was alive. Our own child must still be running now.
     if (sibling.exitCode !== null || sibling.signalCode !== null)
-      return { ok: false, reason: "the self-check sibling was not running during the probe" };
+      return { ok: false, reason: "the self-check sibling exited before the probe finished" };
     if (!res.readBlocked)
       return { ok: false, reason: "the account could read another process's start-up environment" };
     return { ok: true, uid: res.uid };
@@ -209,6 +209,7 @@ export function extractJobCheck(
       fs.writeFileSync(file, data, { mode: 0o600 });
       const row = { kind: "txt", bytes: data.length, sha256 } as FileRow;
       for (const forceOcrKind of [false, true]) {
+        if (signal?.aborted) return "aborted";
         const r = await extractAsAccount(
           worker,
           dataDir,
@@ -233,12 +234,13 @@ export function docJobCheck(
   dataDir: string,
   hooks: Pick<AccountJobHooks, "spawn" | "clean"> = {},
 ): WorkerJobCheck {
-  return async (worker, onJob) => {
+  return async (worker, onJob, signal) => {
+    // Shutdown: the job is reaped through the launcher (runWorkerJob's abort), and cleaned up as usual.
     const r = await docAsAccount(
       worker,
       dataDir,
       { kind: "docx", doc: { title: "Agent Lee worker self-check", blocks: [] }, images: {} },
-      { ...hooks, onJob },
+      { ...hooks, onJob, signal },
     );
     if (!r.ok) return r.code;
     if (r.data.subarray(0, 2).toString("latin1") !== "PK") return "not a DOCX";
@@ -250,9 +252,10 @@ const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 /** render: a small page to PNG through the renderer's account path (egress proxy, relayed pipe, fixed switches). */
 export function renderJobCheck(renderer: Pick<Renderer, "render">): WorkerJobCheck {
-  return async (worker, onJob) => {
+  return async (worker, onJob, signal) => {
     const doc = exportDocument("markdown", "Agent Lee worker self-check", "Agent Lee worker self-check")!;
-    const r = await renderer.render({ format: "png", doc, scripts: false }, { worker, onJob });
+    // Shutdown: the render is stopped (the launcher reaps the browser) and its folder removed as usual.
+    const r = await renderer.render({ format: "png", doc, scripts: false }, { worker, onJob, signal });
     if (!r.ok) return r.code;
     if (!r.body.subarray(0, 8).equals(PNG)) return "not a PNG";
     return undefined;
@@ -274,12 +277,16 @@ export async function selfCheckWorker(o: {
    * The installed program bundle must be this server's (`workerFingerprint` vs `installedFingerprint`): the account
    * never runs worker code or libraries other than the server's own. Omitted only by tests of the other steps.
    */
-  bundle?: { current: () => string; installed: () => string | undefined };
+  bundle?: { current: () => string | Promise<string>; installed: () => string | undefined };
 }): Promise<SelfCheckResult> {
   let step = "bundle";
+  // Shutdown (review #130 round 1): checked before every step and once more before an "ok" — a check that was
+  // stopped never passes, whatever its job answered afterwards.
+  const aborted = (): SelfCheckResult | undefined =>
+    o.signal?.aborted ? { ok: false, step, reason: "aborted" } : undefined;
   try {
     if (o.bundle) {
-      const want = o.bundle.current();
+      const want = await o.bundle.current();
       const got = o.bundle.installed();
       if (got !== want)
         return {
@@ -291,6 +298,8 @@ export async function selfCheckWorker(o: {
         };
     }
     step = "probe";
+    let stop = aborted();
+    if (stop) return stop;
     const p = await probeWorker({
       account: o.account,
       kind: o.kind,
@@ -301,18 +310,20 @@ export async function selfCheckWorker(o: {
       signal: o.signal,
     });
     if (!p.ok) return { ok: false, step, reason: p.reason };
-    if (o.signal?.aborted) return { ok: false, step, reason: "aborted" };
     step = "run";
+    if ((stop = aborted())) return stop;
     const seen: (number | undefined)[] = [];
     const why = await o.job(
       { account: o.account, uid: p.uid },
       (jobId) => seen.push(leaderUid(workerLeaderFile(o.dataDir, jobId), o.ownerOf)),
       o.signal,
     );
+    if ((stop = aborted())) return stop;
     if (why !== undefined) return { ok: false, step, reason: why };
     step = "identity";
     if (!seen.length) return { ok: false, step, reason: "no job was recorded" };
     if (seen.some((u) => u !== p.uid)) return { ok: false, step, reason: "a job did not run as the account" };
+    if ((stop = aborted())) return stop;
     return { ok: true, uid: p.uid };
   } catch (e) {
     return { ok: false, step, reason: e instanceof Error ? e.message : String(e) };

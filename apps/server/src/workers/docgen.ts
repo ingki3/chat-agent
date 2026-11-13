@@ -32,7 +32,9 @@ export async function docAsAccount(
       timeoutMs: DOC_WORKER_LIMITS.timeoutMs,
       maxOutputBytes: DOC_WORKER_LIMITS.maxOutputBytes,
       stdin: JSON.stringify({ ...job, modules: {}, fonts: {} }),
+      signal: hooks.signal,
       ...(hooks.spawn ? { spawn: hooks.spawn } : {}),
+      ...(hooks.reap ? { reap: hooks.reap } : {}),
     });
     hooks.onJob?.(made.jobId);
     return workerResult(r);
@@ -48,9 +50,12 @@ export function accountOrSandboxDocRunner(
   verified: () => VerifiedWorker | undefined,
   fallback: DocRunner,
   dataDir: string,
+  /** Called on each same-uid run (the app logs the first per kind). */
+  onFallback?: () => void,
 ): DocRunner {
   return (job) => {
     const v = verified();
+    if (!v) onFallback?.();
     return v ? docAsAccount(v, dataDir, job) : fallback(job);
   };
 }

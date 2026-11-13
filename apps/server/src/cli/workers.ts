@@ -11,7 +11,13 @@ import {
   WORKER_LAUNCHER,
   workerAccountFromConfig,
 } from "../workers/account.js";
-import { bundleWorkers, installedFingerprint, workerManifest } from "../workers/bundle.js";
+import {
+  bundleWorkers,
+  computeFingerprints,
+  defaultFingerprintSources,
+  installedFingerprints,
+  kindFingerprint,
+} from "../workers/bundle.js";
 import { docJobCheck, extractJobCheck, renderJobCheck, selfCheckWorker } from "../workers/selfcheck.js";
 
 /**
@@ -34,7 +40,7 @@ if (cmd === "bundle") {
     process.exit(2);
   }
   try {
-    const r = bundleWorkers(out, { browser: config.exportBrowser });
+    const r = await bundleWorkers(out, { browser: config.exportBrowser });
     console.log(`bundle: ${out} (${r.nodes} entries) — install it root-owned as docs/ops.md §41.2 says`);
   } catch (e) {
     console.error(`bundle: refused — ${(e as Error).message}`);
@@ -88,14 +94,18 @@ if (cmd === "bundle") {
   let code = 0;
   try {
     const ocr = () => ocrCapability(storagePaths(config.dataDir).ocrLang);
-    const current = workerManifest().fingerprint;
+    const current = await computeFingerprints(defaultFingerprintSources(config.exportBrowser));
+    const installed = installedFingerprints();
     for (const kind of WORKER_KINDS) {
       const v = await selfCheckWorker({
         kind,
         account,
         dataDir: config.dataDir,
         serverUid: process.getuid?.() ?? -1,
-        bundle: { current: () => current, installed: () => installedFingerprint() },
+        bundle: {
+          current: () => kindFingerprint(current, kind),
+          installed: () => (installed ? kindFingerprint(installed, kind) : undefined),
+        },
         job:
           kind === "extract"
             ? extractJobCheck(config.dataDir, ocr)

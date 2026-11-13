@@ -253,7 +253,8 @@ export class AccountSelfCheckGate<A = PythonAccount> {
     this.done = (async () => {
       try {
         const v = await run(this.abort.signal);
-        if (this.abort.signal.aborted && !v.ok) {
+        // Stopped means stopped (review #130 round 1): a success that arrives after stop() is not accepted either.
+        if (this.abort.signal.aborted) {
           this.why = "self-check stopped: shutting down";
           report(false, "aborted");
           return;

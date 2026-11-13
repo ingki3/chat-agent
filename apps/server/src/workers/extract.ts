@@ -22,6 +22,9 @@ export type AccountJobHooks = {
   /** Tests only. */
   spawn?: WorkerSpawn;
   clean?: (account: VerifiedWorker["account"], jobId: string) => void;
+  reap?: (account: VerifiedWorker["account"], jobId: string, onExit: (code: number | null) => void) => void;
+  /** docgen: stop the job (reap through the launcher) when aborted — the self-check's shutdown. */
+  signal?: AbortSignal | undefined;
   /** The self-check only: run the extractor under the `ocr` kind (its limits) whatever the file's kind. */
   forceOcrKind?: boolean;
 };
@@ -76,6 +79,7 @@ export async function extractAsAccount(
       stdin,
       signal: job.signal,
       ...(hooks.spawn ? { spawn: hooks.spawn } : {}),
+      ...(hooks.reap ? { reap: hooks.reap } : {}),
     });
     hooks.onJob?.(made.jobId);
     return workerResult(r);
@@ -96,9 +100,12 @@ export function accountOrSandboxExtractor(
   fallback: ExtractRunner,
   dataDir: string,
   ocr: () => OcrCapability,
+  /** Called on each same-uid run (the app logs the first per kind). */
+  onFallback?: () => void,
 ): ExtractRunner {
   return (job) => {
     const v = verified();
+    if (!v) onFallback?.();
     return v ? extractAsAccount(v, dataDir, job, ocr) : fallback(job);
   };
 }

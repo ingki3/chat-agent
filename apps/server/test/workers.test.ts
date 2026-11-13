@@ -28,7 +28,14 @@ import {
   workerScratchRoot,
   type WorkerAccount,
 } from "../src/workers/account.js";
-import { bundleWorkers, installedFingerprint, workerManifest } from "../src/workers/bundle.js";
+import {
+  bundleWorkers,
+  computeFingerprints,
+  defaultFingerprintSources,
+  installedFingerprints,
+  kindFingerprint,
+  type FingerprintSources,
+} from "../src/workers/bundle.js";
 import { docAsAccount } from "../src/workers/docgen.js";
 import { accountOrSandboxExtractor, EXTRACT_INPUT, extractAsAccount } from "../src/workers/extract.js";
 import { makeWorkerJobDir, runWorkerJob, sweepWorkerScratch, type WorkerSpawn } from "../src/workers/run.js";
@@ -140,6 +147,7 @@ describe("worker launcher arguments (#122)", () => {
       readBlocked: false,
     });
     expect(parseWorkerProbe("uid=502 procargs=error sibling\n", 0)).toEqual({ uid: 502, readBlocked: false });
+    expect(parseWorkerProbe("uid=502 procargs=error marker\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseWorkerProbe("uid=502 procargs=error errno=22\n", 0)).toEqual({
       uid: 502,
       readBlocked: false,
@@ -155,6 +163,7 @@ describe("worker launcher arguments (#122)", () => {
       ["uid=4294967296 sibling=501 procargs=blocked\n", 0],
       ["uid=502 procargs=blocked\n", 0], // no sibling: not a blocked verdict
       ["uid=502 sibling=501 procargs=error control\n", 0],
+      ["uid=502 procargs=error markers\n", 0],
       ["", 0],
     ] as const)
       expect(parseWorkerProbe(out, code), JSON.stringify(out)).toBeUndefined();
@@ -859,6 +868,169 @@ describe("the worker self-check and gates (#122)", () => {
     expect(fs.readdirSync(workerScratchRoot(dataDir))).toEqual([]);
   });
 
+  it("the fingerprints change with each part: worker code, libraries, OCR data, node, the browser", async () => {
+    const d = tmp();
+    const w1 = path.join(d, "extract");
+    fs.mkdirSync(w1);
+    fs.writeFileSync(path.join(w1, "worker.mjs"), "a");
+    const file = (n: string, c: string) => {
+      fs.writeFileSync(path.join(d, n), c);
+      return path.join(d, n);
+    };
+    const base: FingerprintSources = {
+      body: { docgen: { modules: {} as never, fonts: { regular: "r", bold: "b" } } } as never,
+      workerDirs: [[w1, "extract"]],
+      libraryIds: ["docx@9.15.0/node_modules", "saxes@5.0.1/node_modules"],
+      ocrFiles: [file("kor.traineddata.gz", "k")],
+      node: { exe: file("node", "n"), version: "v22.22.0" },
+      browser: file("chrome-headless-shell", "c"),
+    };
+    const f0 = await computeFingerprints(base);
+    const differs = async (change: () => FingerprintSources | void, parts: (keyof typeof f0)[]) => {
+      const src = change() ?? base;
+      const f = await computeFingerprints(src);
+      for (const k of ["app", "node", "browser"] as const) {
+        if (parts.includes(k)) expect(f[k], k).not.toBe(f0[k]);
+        else expect(f[k], k).toBe(f0[k]);
+      }
+      // Put the files back.
+      fs.writeFileSync(path.join(w1, "worker.mjs"), "a");
+      fs.writeFileSync(path.join(d, "kor.traineddata.gz"), "k");
+      fs.writeFileSync(path.join(d, "node"), "n");
+      fs.writeFileSync(path.join(d, "chrome-headless-shell"), "c");
+      return f;
+    };
+    await differs(() => void fs.writeFileSync(path.join(w1, "worker.mjs"), "b"), ["app"]);
+    await differs(
+      () => ({ ...base, libraryIds: ["docx@9.16.0/node_modules", "saxes@5.0.1/node_modules"] }),
+      ["app"],
+    );
+    await differs(() => void fs.writeFileSync(path.join(d, "kor.traineddata.gz"), "K"), ["app"]);
+    await differs(() => void fs.writeFileSync(path.join(d, "node"), "N"), ["node"]);
+    await differs(() => ({ ...base, node: { ...base.node, version: "v22.23.0" } }), ["node"]);
+    await differs(() => void fs.writeFileSync(path.join(d, "chrome-headless-shell"), "C"), ["browser"]);
+    // What each kind compares: extract/docgen app + node, render the browser.
+    const f1 = await computeFingerprints({ ...base, node: { ...base.node, version: "v23" } });
+    expect(kindFingerprint(f1, "extract")).not.toBe(kindFingerprint(f0, "extract"));
+    expect(kindFingerprint(f1, "render")).toBe(kindFingerprint(f0, "render"));
+    // The installed side: read through the config's app= line; anything malformed is no fingerprint.
+    const app = tmp();
+    const conf = path.join(tmp(), "conf");
+    fs.writeFileSync(conf, `node=/n\napp=${app}\nbrowser=/b\nscratch=/s\n`);
+    fs.writeFileSync(path.join(app, "manifest.json"), JSON.stringify({ version: 1, fingerprints: f0 }));
+    expect(installedFingerprints(conf)).toEqual(f0);
+    for (const bad of [{ fingerprints: { ...f0, app: "x" } }, { fingerprint: f0.app }, {}]) {
+      fs.writeFileSync(path.join(app, "manifest.json"), JSON.stringify(bad));
+      expect(installedFingerprints(conf)).toBeUndefined();
+    }
+    expect(installedFingerprints(path.join(d, "none"))).toBeUndefined();
+  });
+
+  it("a stopped check never passes: abort between steps, during the job, and a success after stop()", async () => {
+    const dataDir = tmp();
+    const ac = new AbortController();
+    // The job finishes successfully — but the check was stopped while it ran.
+    const r = await selfCheckWorker({
+      kind: "docgen",
+      account: ACCT,
+      dataDir,
+      serverUid: SERVER,
+      probe: probe({ uid: 777, siblingUid: SERVER, readBlocked: true }),
+      job: async (w, onJob, signal) => {
+        const why = await job(dataDir, 777)(w, onJob, signal);
+        ac.abort();
+        return why;
+      },
+      clean: () => {},
+      ownerOf: () => 777,
+      signal: ac.signal,
+    });
+    expect(r).toEqual({ ok: false, step: "run", reason: "aborted" });
+    // Aborted before it starts: no probe.
+    let probed = false;
+    expect(
+      await selfCheckWorker({
+        kind: "extract",
+        account: ACCT,
+        dataDir,
+        serverUid: SERVER,
+        probe: async () => {
+          probed = true;
+          return { uid: 777, siblingUid: SERVER, readBlocked: true };
+        },
+        job: job(dataDir, 777),
+        signal: ac.signal,
+      }),
+    ).toMatchObject({ ok: false, reason: "aborted" });
+    expect(probed).toBe(false);
+    // The gate: a check that answers ok after stop() is not accepted.
+    const g = new WorkerGates(ACCT);
+    let finish!: () => void;
+    const done = g.start(
+      () =>
+        new Promise((res) => {
+          finish = () => res({ ok: true, uid: 777 });
+        }),
+    );
+    await new Promise((res) => setTimeout(res, 10));
+    const stopping = g.stop(50);
+    finish();
+    await stopping;
+    await done;
+    expect(g.verified("extract")).toBeUndefined();
+    expect(g.status()[0]).toMatchObject({ isolation: "same_uid", state: "stopped" });
+  });
+
+  it("docgen and render jobs of the check are stopped (reaped) on abort", async () => {
+    // (The stand-ins ignore the fake reap and end after 1 s; the real launcher's reap kills its child.)
+    const dataDir = tmp();
+    const reaped: string[] = [];
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 200);
+    const d = await docAsAccount(
+      VERIFIED,
+      dataDir,
+      { kind: "docx", doc: { title: "t", blocks: [] }, images: {} },
+      {
+        spawn: standIn(() => "setTimeout(() => {}, 1000)"),
+        clean: () => {},
+        signal: ac.signal,
+        reap: (_a, id, onExit) => {
+          reaped.push(id);
+          onExit(0);
+        },
+      },
+    );
+    expect(d).toEqual({ ok: false, code: "doc_limit" });
+    expect(reaped).toHaveLength(1);
+    const rr: string[] = [];
+    const renderer = new Renderer({
+      browser: undefined,
+      account: {
+        verified: () => undefined,
+        dataDir,
+        spawn: standIn(() => "setTimeout(() => {}, 1000)"),
+        reap: (_a, id, onExit) => {
+          rr.push(id);
+          onExit(0);
+        },
+        clean: () => {},
+      },
+    });
+    closers.push(() => renderer.close());
+    const ac2 = new AbortController();
+    setTimeout(() => ac2.abort(), 200);
+    const t0 = Date.now();
+    const out = await renderer.render(
+      { format: "png", doc: exportDocument("markdown", "t", "x")!, scripts: false },
+      { worker: VERIFIED, signal: ac2.signal },
+    );
+    expect(out.ok).toBe(false);
+    expect(rr).toHaveLength(1);
+    // Stopped at once: the stand-in (which a reap would kill) is only waited for until it ends by itself.
+    expect(Date.now() - t0).toBeLessThan(5000);
+  }, 15_000);
+
   it("a sibling that died during the probe is refused, even with a 'blocked' verdict (a zombie is refused too)", async () => {
     const dataDir = tmp();
     const r = await probeWorker({
@@ -873,7 +1045,7 @@ describe("the worker self-check and gates (#122)", () => {
         return { uid: 777, siblingUid: SERVER, readBlocked: true };
       },
     });
-    expect(r).toEqual({ ok: false, reason: "the self-check sibling was not running during the probe" });
+    expect(r).toEqual({ ok: false, reason: "the self-check sibling exited before the probe finished" });
   });
 
   it("gates: not configured → same_uid; a passed kind → account; a failed or throwing one stays same_uid", async () => {
@@ -978,7 +1150,7 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     if (shared) return shared;
 
     const out = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-wkbundle-"))), "b");
-    bundleWorkers(out);
+    await bundleWorkers(out);
     shared = out;
     return out;
   };
@@ -1117,8 +1289,11 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
         job,
         // The rig's bundle was made from this checkout: its fingerprint is ours (read through its config).
         bundle: {
-          current: () => workerManifest().fingerprint,
-          installed: () => installedFingerprint(r.conf),
+          current: async () => kindFingerprint(await computeFingerprints(defaultFingerprintSources()), kind),
+          installed: () => {
+            const f = installedFingerprints(r.conf);
+            return f ? kindFingerprint(f, kind) : undefined;
+          },
         },
       });
       expect(v, kind).toEqual({ ok: true, uid: me });
@@ -1154,6 +1329,12 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
       uid: process.getuid!(),
       readBlocked: false,
     });
+    // "readable" is a real read that shows the sibling's marker: a readable process without it is no verdict.
+    const plain = spawn(process.execPath, ["-e", "setInterval(()=>{},1e9)"], { env: {}, stdio: "ignore" });
+    closers.push(() => plain.kill("SIGKILL"));
+    await new Promise((res) => setTimeout(res, 150));
+    const noMarker = run(r, ["probe", "extract", id, String(plain.pid)]);
+    expect(noMarker.stdout).toBe(`uid=${process.getuid!()} procargs=error marker\n`);
   }, 120_000);
 
   it.skipIf(!fs.existsSync("/bin/cp"))(
@@ -1302,6 +1483,30 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     expect(bad.status).toBe(64);
     expect(bad.stderr).toMatch(/app tree: writable by group\/other/);
     fs.chmodSync(deep, 0o644);
+    // A link on a derived program path (node/bin → a folder outside every trusted tree, with an 0777 "node"
+    // there) and a dangling link inside a tree: both refused, by run and verify (review #130 round 1).
+    const outside = tmp();
+    fs.mkdirSync(path.join(outside, "bin"));
+    fs.copyFileSync(path.join(r.lib, "node", "bin", "node"), path.join(outside, "bin", "node"));
+    fs.chmodSync(path.join(outside, "bin", "node"), 0o777);
+    fs.renameSync(path.join(r.lib, "node", "bin"), path.join(r.lib, "node", "bin.real"));
+    fs.symlinkSync(path.join(outside, "bin"), path.join(r.lib, "node", "bin"));
+    const linked = run(r, ["run", "extract", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
+    expect(linked.status).toBe(64);
+    expect(linked.stderr).toMatch(/node tree links: link leaves its trusted tree/);
+    expect(spawnSync(r.launcher, ["verify", ME], { encoding: "utf8", env: {} }).stdout).toMatch(
+      /check node tree links fail link leaves its trusted tree/,
+    );
+    fs.unlinkSync(path.join(r.lib, "node", "bin"));
+    fs.renameSync(path.join(r.lib, "node", "bin.real"), path.join(r.lib, "node", "bin"));
+    fs.symlinkSync("nowhere", path.join(r.lib, "app", "dangling"));
+    const dangling = run(r, ["run", "docgen", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
+    expect(dangling.status).toBe(64);
+    expect(dangling.stderr).toMatch(/app tree links: dangling link in trusted tree/);
+    fs.unlinkSync(path.join(r.lib, "app", "dangling"));
+    // An in-tree link to an in-tree file is fine (the bundle's pnpm links).
+    const ok = run(r, ["run", "docgen", makeWorkerJobDir(r.dataDir).jobId, "10"], "{}");
+    expect(ok.status, ok.stderr).toBe(0);
     // Job B's extractor cannot read job A's folder (the profile allows its own folder only).
     fs.writeFileSync(path.join(a.dir, "input"), "SECRET-A\n");
     const b = makeWorkerJobDir(r.dataDir);

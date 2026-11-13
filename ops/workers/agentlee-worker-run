@@ -276,16 +276,51 @@ sub program_paths {
   $cfg->{manifest}       = "$cfg->{app}/manifest.json";
 }
 
-sub exe_err {
-  my ($p) = @_;
-  my @ps = lstat($p);
-  return (@ps && -f _ && !-l $p && ($ps[2] & 0o111)) ? "" : "no executable at $p";
-}
-
+# A program path derived from the config (node, the browser, a worker entry, the manifest): its WHOLE chain — every
+# ancestor up to "/" a trusted node, no symlink anywhere — then a regular file (and, for an executable, an x bit).
+# The tree walk does not follow links, so a link on a derived path (`node/bin` → elsewhere) is refused here.
 sub regular_err {
   my ($p) = @_;
+  return file_err($p);
+}
+
+sub exe_err {
+  my ($p) = @_;
+  my $e = file_err($p);
+  return $e if length $e;
   my @ps = lstat($p);
-  return (@ps && -f _ && !-l $p) ? "" : "no file at $p";
+  return (@ps && ($ps[2] & 0o111)) ? "" : "not executable: $p";
+}
+
+# Every symlink below a trusted tree must resolve (no dangling link) to a path inside that same tree — where the
+# tree walk has already checked the target's owner, mode and ACLs. A link out of the tree (to something nobody
+# checked) is refused, whatever it points at. (`tree_err`, shared with python_run's launcher, skips links.)
+sub links_err {
+  my ($root) = @_;
+  my @stack = ($root);
+  my $nodes = 0;
+  while (@stack) {
+    my $d = pop @stack;
+    opendir(my $dh, $d) or return "cannot open: $d";
+    my @names = readdir($dh);
+    closedir($dh) or return "cannot read: $d";
+    for my $n (@names) {
+      next if $n eq "." || $n eq "..";
+      return "unsafe name in trusted tree under $d" unless $n =~ $NAME;
+      return "trusted tree too large: $root" if ++$nodes > TREE_MAX;
+      my ($c) = ("$d/$n") =~ /\A(.*)\z/s;    # untaint: a safe name under a checked dir
+      my @st = lstat($c);
+      return "cannot stat: $c" unless @st;
+      if (-l _) {
+        my $real = Cwd::realpath($c);
+        return "dangling link in trusted tree: $c" unless defined $real && -e $real;
+        return "link leaves its trusted tree: $c" unless index($real, "$root/") == 0;
+        next;
+      }
+      push @stack, $c if -d _;
+    }
+  }
+  return "";
 }
 
 # Every trust check, in order, as [name, err] pairs — the same list for run (dies on the first failure) and for
@@ -314,7 +349,10 @@ sub config_checks {
   program_paths(\%cfg);
   my $all = $need eq "all";
   my @trees = $all ? qw(node app browser) : $need ? @{ $KIND{$need}{tree} } : ();
-  for my $t (@trees) { push @r, ["$t tree", tree_err($cfg{$t})]; }
+  for my $t (@trees) {
+    push @r, ["$t tree", tree_err($cfg{$t})];
+    push @r, ["$t tree links", links_err($cfg{$t})];
+  }
   my %uses = map { $_ => 1 } @trees;
   if ($uses{node}) {
     push @r, ["node", exe_err($cfg{node_exe})];
@@ -693,25 +731,40 @@ sub op_probe {
   # binding, and the question — may this uid, inside this profile, read a server-uid process's KERN_PROCARGS2 — is
   # the same whichever program asks. What a real job needs is checked by the server running one through `run`.
   my $profile = build_profile(kind_policy($cfg, $kind, $workdir), "/usr/bin/perl", $port);
-  # One verdict line. A different uid gets EINVAL (or EPERM) from KERN_PROCARGS2 — and so does a pid that is gone,
-  # so "blocked" also needs the kernel to still show the sibling (by KERN_PROC_PID, which any uid may read), with
-  # its uid. The server checks that uid is its own and differs from ours. No module is loaded (none is readable).
+  # One verdict line, from a REAL read of KERN_PROCARGS2 into a bounded buffer (a size-only query can succeed before
+  # the kernel's uid check, so it proves nothing). Positive control: our own read must succeed and show our own
+  # marker (AGENTLEE_PROBE_SELF, set below). "readable" only when the sibling's read succeeds AND shows the server
+  # sibling's marker variable (AGENTLEE_SELFCHECK=). "blocked" only when the read fails with EPERM or EINVAL while
+  # the kernel (KERN_PROC_PID, which any uid may read) still shows the sibling with the same uid before and after —
+  # a pid that is gone fails the same way. The server also checks the sibling is its own, still-running child, with
+  # its uid, and that ours differs. No module is loaded (none is readable in the profile).
   my $code = <<'PL';
 my $sib = $ARGV[0];
 if (!defined $sib || $sib !~ /\A([0-9]{1,10})\z/) { print "uid=$> procargs=error sibling\n"; exit 0; }
 $sib = $1 + 0;
-sub procargs { my ($pid) = @_; my $mib = pack("i3", 1, 49, $pid); my $len = pack("Q", 0); $! = 0;
-  my $r = syscall(202, $mib, 3, 0, $len, 0, 0); return ($r, $! + 0, unpack("Q", $len)); }
+# The buffer is exactly kern.argmax (the kernel refuses a larger one with EINVAL), at most 16 MB.
+sub argmax { my $mib = pack("i2", 1, 8); my $b = "\0" x 4; my $l = pack("Q", 4);
+  my $r = syscall(202, $mib, 2, $b, $l, 0, 0); my $v = (defined $r && $r == 0) ? unpack("i", $b) : 0;
+  return ($v > 0 && $v <= 16777216) ? $v : 1048576; }
+my $ARGMAX = argmax();
+sub procargs { my ($pid) = @_; my $mib = pack("i3", 1, 49, $pid); my $buf = "\0" x $ARGMAX;
+  my $len = pack("Q", length $buf); $! = 0; my $r = syscall(202, $mib, 3, $buf, $len, 0, 0); my $e = $! + 0;
+  my $n = unpack("Q", $len); $n = length $buf if $n > length $buf;
+  return ($r, $e, (defined $r && $r == 0) ? substr($buf, 0, $n) : ""); }
 sub kuid { my ($pid) = @_; my $mib = pack("i4", 1, 14, 1, $pid); my $buf = "\0" x 1024;
   my $len = pack("Q", length $buf); my $r = syscall(202, $mib, 4, $buf, $len, 0, 0);
   return undef unless defined $r && $r == 0 && unpack("Q", $len) == 648; return unpack("L", substr($buf, 420, 4)); }
 my $me = $>;
-my ($cr, $ce, $cs) = procargs($$);
-if ($cr != 0 || !$cs) { print "uid=$me procargs=error control\n"; exit 0; }
+my ($cr, $ce, $cd) = procargs($$);
+if (!defined $cr || $cr != 0 || index($cd, "\0AGENTLEE_PROBE_SELF=1\0") < 0) { print "uid=$me procargs=error control\n"; exit 0; }
 my $su = kuid($sib);
 if (!defined $su) { print "uid=$me procargs=error sibling\n"; exit 0; }
-my ($tr, $te, $ts) = procargs($sib);
-if ($tr == 0 && $ts) { print "uid=$me sibling=$su procargs=readable\n"; exit 0; }
+my ($tr, $te, $td) = procargs($sib);
+if (defined $tr && $tr == 0) {
+  if (index($td, "\0AGENTLEE_SELFCHECK=") >= 0) { print "uid=$me sibling=$su procargs=readable\n"; }
+  else { print "uid=$me procargs=error marker\n"; }
+  exit 0;
+}
 if ($te != 1 && $te != 22) { print "uid=$me procargs=error errno=$te\n"; exit 0; }
 my $again = kuid($sib);
 if (defined $again && $again == $su) { print "uid=$me sibling=$su procargs=blocked\n"; }
@@ -722,7 +775,7 @@ PL
   watched($ctl, PROBE_TIMEOUT_SEC, $KIND{$kind}{mem}, sub {
     chdir($workdir) or POSIX::_exit(127);
     open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
-    %ENV = (PATH => "/usr/bin:/bin", LC_ALL => "C");
+    %ENV = (PATH => "/usr/bin:/bin", LC_ALL => "C", AGENTLEE_PROBE_SELF => "1");    # the control's own marker
     exec("/usr/bin/sandbox-exec", "-p", $profile, "/usr/bin/perl", "-e", $code, $sibling) or POSIX::_exit(127);
   });
 }

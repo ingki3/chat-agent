@@ -182,12 +182,12 @@ export function runWorkerCleanSync(account: WorkerAccount, jobId: string): void 
 
 /**
  * The launcher probe's output → a result. Exit code 0 and stdout exactly ONE line (plus its newline):
- * `uid=<n> sibling=<n> procargs=<blocked|readable>` or `uid=<n> procargs=error <control|sibling|errno=<n>>` — no
+ * `uid=<n> sibling=<n> procargs=<blocked|readable>` or `uid=<n> procargs=error <control|sibling|marker|errno=<n>>` — no
  * prefix, no second verdict. Undefined otherwise (a failure, fail closed).
  */
 const U32 = "(0|[1-9][0-9]{0,9})";
 const PROBE_LINE = new RegExp(
-  `^uid=${U32} (?:sibling=${U32} procargs=(blocked|readable)|procargs=error (?:control|sibling|errno=[0-9]{1,5}))$`,
+  `^uid=${U32} (?:sibling=${U32} procargs=(blocked|readable)|procargs=error (?:control|sibling|marker|errno=[0-9]{1,5}))$`,
 );
 export type WorkerProbeResult = { uid: number; siblingUid?: number; readBlocked: boolean };
 export function parseWorkerProbe(out: string, exitCode: number | null): WorkerProbeResult | undefined {
