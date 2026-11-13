@@ -143,17 +143,15 @@ export type SkillPolicyContext = {
 };
 
 /**
- * Sandbox policy of one skill call. Every skill reads its own folder only; node is readable as the executable
- * (`process-exec` literal), nothing else of its install; a python skill also reads the interpreter's own install
- * folder. Nothing is written, no child processes, no inherited environment. Network: none, or the skill's own
- * egress proxy (a loopback port) that lets through HTTPS to the skill's hosts only. Secrets are env variables of
- * this process only. Arguments come from the definition's `args` (validated input), never from the model as text.
+ * Every refusal of `skillPolicy` that does not need the egress proxy: bad arguments, a missing secret, a networked
+ * node skill, no python. The runner calls it before it prepares the proxy (#135), so a refused call starts none.
+ * Returns the arguments and the secret environment.
  */
-export function skillPolicy(
+export function skillPrecheck(
   skill: BundledSkill,
   input: Record<string, unknown>,
-  ctx: SkillPolicyContext,
-): Omit<RunIsolatedOptions, "timeoutMs" | "maxOutputBytes" | "maxRssBytes"> & { secretValues: string[] } {
+  ctx: Omit<SkillPolicyContext, "proxy">,
+): { args: string[]; env: Record<string, string>; secretValues: string[] } {
   const args = skill.args(input);
   if (!args || args.some((a) => typeof a !== "string" || a.includes("\0")))
     throw new SkillRefused("skill_bad_input");
@@ -166,6 +164,26 @@ export function skillPolicy(
     env[s.env] = v;
     secretValues.push(v);
   }
+  // A node skill's fetch follows redirects and nothing here can refuse them: a networked node skill would send
+  // requests the server never checked (#129). None exists; one is refused until it has its own guard.
+  if (skill.kind === "node" && skill.hosts.length) throw new SkillRefused("skill_unavailable");
+  if (skill.kind !== "node" && !ctx.python) throw new SkillRefused("skill_unavailable");
+  return { args, env, secretValues };
+}
+
+/**
+ * Sandbox policy of one skill call. Every skill reads its own folder only; node is readable as the executable
+ * (`process-exec` literal), nothing else of its install; a python skill also reads the interpreter's own install
+ * folder. Nothing is written, no child processes, no inherited environment. Network: none, or the skill's own
+ * egress proxy (a loopback port) that lets through HTTPS to the skill's hosts only. Secrets are env variables of
+ * this process only. Arguments come from the definition's `args` (validated input), never from the model as text.
+ */
+export function skillPolicy(
+  skill: BundledSkill,
+  input: Record<string, unknown>,
+  ctx: SkillPolicyContext,
+): Omit<RunIsolatedOptions, "timeoutMs" | "maxOutputBytes" | "maxRssBytes"> & { secretValues: string[] } {
+  const { args, env, secretValues } = skillPrecheck(skill, input, ctx);
   let network: RunIsolatedOptions["network"] = "none";
   if (skill.hosts.length) {
     if (!ctx.proxy) throw new SkillRefused("skill_unavailable");
@@ -173,9 +191,6 @@ export function skillPolicy(
     env.HTTPS_PROXY = env.https_proxy = ctx.proxy.url;
   }
   if (skill.kind === "node") {
-    // A node skill's fetch follows redirects and nothing here can refuse them: a networked node skill would send
-    // requests the server never checked (#129). None exists; one is refused until it has its own guard.
-    if (skill.hosts.length) throw new SkillRefused("skill_unavailable");
     return {
       command: ctx.node,
       args: [skill.entry, ...args],
@@ -226,13 +241,14 @@ const SendRequest = z.strictObject({ host: z.string().min(1).max(253), data: z.s
  *   the request target, on its declared host (Alpha Vantage `apikey=`) — once, like finance's DART exception;
  * - everything else is checked by the one egress predicate (`carriesSecret`, incl. the UTF-8 view of the bytes)
  *   against the registry and every `.env` skill secret.
- * A refusal is final for the call (`denied`): every later send is refused too.
+ * A refusal is final for the call (`denied`): every later send is refused too. `deny()` records a failure of the
+ * gate itself (an over-long request line, an fd 3 error — `serveGate`) as the same refusal (#135).
  */
 export function skillSendGate(
   skill: Pick<BundledSkill, "hosts" | "secrets">,
   input: Record<string, unknown>,
   secrets?: Readonly<Record<string, string>>,
-): { approve(line: string): boolean; readonly denied: boolean; readonly sends: number } {
+): { approve(line: string): boolean; deny(): void; readonly denied: boolean; readonly sends: number } {
   const hosts = new Set(skill.hosts.map((h) => h.toLowerCase()));
   const config = Object.values(secrets ?? {});
   const places = skill.secrets.flatMap((s) => {
@@ -271,6 +287,9 @@ export function skillSendGate(
       }
       if (!ok) denied = true;
       return ok;
+    },
+    deny() {
+      denied = true;
     },
     get denied() {
       return denied;
@@ -349,7 +368,18 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
   const node = o.node ?? fs.realpathSync(process.execPath);
   const limits = o.limits ?? DEFAULT_SKILL_LIMITS;
   return async (skill, input) => {
+    // Order (#135): every check that needs no proxy first — the pinned copy (install.ts), the policy's refusals,
+    // the send gate — and only then the skill's egress proxy, so a refused call never starts one.
+    // An installed skill runs only from its pinned copy (install.ts): checked here (a cheap refusal) and again below.
+    if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
     let policy;
+    try {
+      skillPrecheck(skill, input, { node, python: o.python, secrets: o.secrets });
+    } catch (e) {
+      return { ok: false, code: e instanceof SkillRefused ? e.code : "skill_unavailable" };
+    }
+    // A networked skill asks for each request on fd 3 before it sends it (#129).
+    const gate = skill.hosts.length ? skillSendGate(skill, input, o.secrets) : undefined;
     try {
       const proxy = skill.hosts.length && o.proxy ? await o.proxy(skill) : undefined;
       policy = skillPolicy(skill, input, { node, python: o.python, secrets: o.secrets, proxy });
@@ -357,10 +387,9 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
       return { ok: false, code: e instanceof SkillRefused ? e.code : "skill_unavailable" };
     }
     const { secretValues, ...run } = policy;
-    // An installed skill runs only from its pinned copy, checked again right before each run (install.ts).
+    // Checked again right before the run (review #138): the copy that runs is the one verified, even if it changed
+    // while the proxy was being prepared.
     if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
-    // A networked skill asks for each request on fd 3 before it sends it (#129).
-    const gate = skill.hosts.length ? skillSendGate(skill, input, o.secrets) : undefined;
     let r;
     try {
       r = await runIsolated({
@@ -368,7 +397,8 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
         stdin: JSON.stringify(input),
         ...limits,
         timeoutMs: skill.timeoutMs ?? limits.timeoutMs,
-        ...(gate ? { gate: (line: string) => gate.approve(line) } : {}),
+        // A gate failure (over-long line, fd 3 error) is a refusal: the same `skill_secret_blocked` (#135).
+        ...(gate ? { gate: (line: string) => gate.approve(line), gateFailed: () => gate.deny() } : {}),
       });
     } catch {
       return { ok: false, code: "skill_unavailable" }; // no sandbox here (not macOS), hard links, spawn failure
