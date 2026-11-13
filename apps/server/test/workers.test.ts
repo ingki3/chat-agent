@@ -284,6 +284,10 @@ describe("the shipped worker launcher (#122)", () => {
       "account_eval",
       "account_may",
       "account_traverse",
+      "node_aces",
+      "ace_lines",
+      "account_chains_err",
+      "account_tree_err",
     ];
     for (const name of shared) {
       expect(mine.get(name), name).toBeDefined();
@@ -1243,6 +1247,26 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
   afterAll(() => {
     if (shared) fs.rmSync(path.dirname(shared), { recursive: true, force: true });
   });
+
+  it("verify reads a tree file's ACL with every flag: an only_inherit allow does not count (#125)", async () => {
+    const r = await rig();
+    const verify = () => spawnSync(r.launcher, ["verify", ME], { encoding: "utf8", env: {} });
+    const f = path.join(r.lib, "app", "manifest.json");
+    fs.chmodSync(f, 0o000);
+    // `ls -led` prints this as a plain `allow read`; the entry applies to children only, so the file is unreadable.
+    expect(spawnSync("/bin/chmod", ["+a", `user:${ME} allow read,only_inherit`, f]).status).toBe(0);
+    expect(spawnSync("/bin/ls", ["-led", f], { encoding: "utf8" }).stdout).not.toMatch(/only_inherit/);
+    const bad = verify();
+    expect(bad.status).toBe(1);
+    expect(bad.stdout).toMatch(
+      /check account program access fail the account cannot read .*manifest\.json\n/,
+    );
+    // The same allow without the flag does apply.
+    expect(spawnSync("/bin/chmod", ["-N", f]).status).toBe(0);
+    expect(spawnSync("/bin/chmod", ["+a", `user:${ME} allow read`, f]).status).toBe(0);
+    const ok = verify();
+    expect(ok.status, ok.stdout).toBe(0);
+  }, 120_000);
 
   it("verify passes on a clean install; extract and docgen run through the account path; caller paths are ignored", async () => {
     const r = await rig();
