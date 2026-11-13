@@ -23,7 +23,15 @@ import { RAW_HEADERS } from "../artifacts/routes.js";
 import { logEvent } from "../logging.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { maskEscaped, partsHoldSecret, readParts, registryState, type XmlPart } from "./docx-check.js";
-import { DEFAULT_TIME_ZONE, cleanText, collectReferences, dayIn, type CollectedSource } from "./collect.js";
+import {
+  DEFAULT_TIME_ZONE,
+  cleanText,
+  collectReferences,
+  dayIn,
+  type CollectedSource,
+  type ReferencesView,
+} from "./collect.js";
+import { viewOf } from "../shares/projection.js";
 
 /**
  * Resource kind of a conversation's reference export (#26). Whoever may read the conversation may export it: the
@@ -53,8 +61,10 @@ export function buildExport(
   style: ReferenceStyle,
   includeUnverified: boolean,
   timeZone: string = DEFAULT_TIME_ZONE,
+  /** A shared viewer's projection (#29): the export of what they see, never the whole conversation. */
+  view?: ReferencesView,
 ): ReferenceExport {
-  const { sources, truncated } = collectReferences(db, conversationId, timeZone);
+  const { sources, truncated } = collectReferences(db, conversationId, timeZone, view);
   const included = (s: CollectedSource) => s.verified || includeUnverified;
   const shown = sources.filter(included);
   const hidden = sources.filter((s) => !included(s));
@@ -154,8 +164,11 @@ export function registerReferenceRoutes(
   app.get<{ Params: { id: string } }>("/api/conversations/:id/references", { config }, async (req, reply) => {
     const q = ReferencesQuery.safeParse(req.query);
     if (!q.success) return deny(reply, 400, "invalid_request");
+    // A shared viewer (#29): the loader let them in; the export is of their projection only.
+    const view = viewOf(app, req, { conversationId: req.params.id });
+    if (view === null) return deny(reply, 403, "forbidden");
     const tz = timeZoneOf(deps.db, req.ctx.user!.id);
-    const e = buildExport(deps.db, req.params.id, q.data.style, q.data.includeUnverified === "1", tz);
+    const e = buildExport(deps.db, req.params.id, q.data.style, q.data.includeUnverified === "1", tz, view);
     return reply.header("Cache-Control", "no-store").send({
       style: e.style,
       includeUnverified: e.includeUnverified,
@@ -176,10 +189,12 @@ export function registerReferenceRoutes(
       const q = ReferencesDownloadQuery.safeParse(req.query);
       if (!q.success) return deny(reply, 400, "invalid_request");
       const started = Date.now();
+      const view = viewOf(app, req, { conversationId: req.params.id });
+      if (view === null) return deny(reply, 403, "forbidden");
       const userId = req.ctx.user!.id;
       const tz = timeZoneOf(deps.db, userId);
       const { style, format } = q.data;
-      const e = buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz);
+      const e = buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, view);
       const done = (docCode?: string) =>
         logEvent(req.log, docCode && docCode !== "doc_ok" ? "warn" : "info", "references.exported", {
           userId,
@@ -219,7 +234,7 @@ export function registerReferenceRoutes(
           referencesDocument(
             titleOf(req.params.id),
             style,
-            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz).lines,
+            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, view).lines,
           ),
         );
       let built = JSON.stringify(doc);

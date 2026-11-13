@@ -19,6 +19,7 @@ export * from "./citations.js";
 export * from "./schedules.js";
 export * from "./docgen.js";
 export * from "./references.js";
+export * from "./shares.js";
 
 /** Response of `GET /api/health`. Shared by server and web so both sides agree on the shape. */
 export const HealthResponse = z.object({

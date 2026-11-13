@@ -4,7 +4,16 @@ import { toMessage, type ConversationStore } from "../conversations/store.js";
 import { RunAccessDenied } from "../connections/access.js";
 import { AttachmentError } from "../files/store.js";
 import { openSse } from "../sse.js";
-import { IdempotencyConflictError, RunBusyError, ShuttingDownError, toRun, type RunManager } from "./runs.js";
+import { projectEvent, sharedWith, viewOf } from "../shares/projection.js";
+import type { StreamEvent } from "@agentlee/shared";
+import {
+  IdempotencyConflictError,
+  NotConversationOwnerError,
+  RunBusyError,
+  ShuttingDownError,
+  toRun,
+  type RunManager,
+} from "./runs.js";
 
 const KIND = "run";
 
@@ -35,6 +44,7 @@ export function startRun(
       revision: conversations.get(input.conversationId)!.revision,
     });
   } catch (e) {
+    if (e instanceof NotConversationOwnerError) return reply.code(403).send({ error: "forbidden" });
     if (e instanceof RunBusyError) return reply.code(409).send({ error: "run_in_progress" });
     if (e instanceof ShuttingDownError) return reply.code(503).send({ error: "shutting_down" });
     if (e instanceof IdempotencyConflictError) return reply.code(409).send({ error: "idempotency_conflict" });
@@ -60,7 +70,16 @@ export function registerRunRoutes(
   app.resources.register(KIND, (id) => {
     const r = runs.get(id);
     const c = r && conversations.get(r.conversationId);
-    return r && c ? { kind: KIND, id: r.id, ownerId: c.ownerId, sharedWith: [] } : undefined;
+    return r && c
+      ? {
+          kind: KIND,
+          id: r.id,
+          ownerId: c.ownerId,
+          // A shared viewer (#29) follows a run whose reply is in their projection.
+          sharedWith: sharedWith(app, c.id, (p) => p.messages.has(r.assistantMessageId)),
+          scope: c.id,
+        }
+      : undefined;
   });
 
   app.get<{ Params: { id: string } }>(
@@ -74,7 +93,11 @@ export function registerRunRoutes(
     { config: { resource: { kind: "conversation", action: "read" } } },
     async (req, reply) => {
       const r = runs.active(req.params.id);
-      return reply.header("Cache-Control", "no-store").send({ run: r ? toRun(r) : null });
+      const p = viewOf(app, req, { conversationId: req.params.id });
+      if (p === null) return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
+      // A shared viewer (#29) sees a run only when its reply is in their projection (never past a snapshot).
+      const visible = r && (!p || p.messages.has(r.assistantMessageId)) ? r : undefined;
+      return reply.header("Cache-Control", "no-store").send({ run: visible ? toRun(visible) : null });
     },
   );
 
@@ -103,10 +126,13 @@ export function registerRunRoutes(
       stream.onClose(stopWatching);
       if (stream.closed) return;
       let sent = after;
+      // A shared viewer (#29) gets every event through the projection: no raw tool output, never reasoning.
+      const viewer = viewOf(app, req, { conversationId: run.conversationId }) !== undefined;
       const send = (seq: number, data: { type: string }) => {
         if (seq <= sent) return; // replay and live overlap: never twice
         sent = seq;
-        stream.send(data.type, data, seq);
+        const out = viewer ? projectEvent(data as StreamEvent) : data;
+        if (out) stream.send(out.type, out, seq);
       };
       // Subscribe before replaying so nothing emitted in between is lost; duplicates are skipped by seq.
       const buffered: [number, { type: string }][] = [];

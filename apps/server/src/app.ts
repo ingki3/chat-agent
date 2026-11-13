@@ -69,6 +69,9 @@ import { registerSourceRoutes } from "./web/routes.js";
 import { registerReferenceRoutes } from "./references/routes.js";
 import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
+import { SharePolicy } from "./shares/projection.js";
+import { registerShareRoutes } from "./shares/routes.js";
+import { ShareStore } from "./shares/store.js";
 import { DocGenService } from "./docgen/service.js";
 import { DocSlots } from "./docgen/slots.js";
 import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
@@ -593,6 +596,27 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       });
     else if (which === "other")
       app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
+    // Family sharing (#29): the one projection every shared read goes through (shares/projection.ts). Before the
+    // routes whose resource checks ask it who a resource is shared with.
+    const sharing = new SharePolicy(
+      opts.db!,
+      new ShareStore(opts.db!),
+      users,
+      app.conversations!,
+      artifacts,
+      fileStore,
+      sources,
+    );
+    app.decorate("sharing", sharing);
+    // An owner deactivated (or otherwise changed): their shares reach no one now — open shared streams re-check.
+    events.on("user-access-changed", (e) => {
+      for (const s of sharing.store.activeOwnedBy(e.userId))
+        events.emit("resource-access-changed", { kind: "share", id: s.id, scope: s.conversationId });
+    });
+    // A deleted conversation takes its shares with it (foreign key): its open shared streams close now.
+    app.conversations!.onDeleted((c) =>
+      events.emit("resource-access-changed", { kind: "conversation", id: c.id, scope: c.id }),
+    );
     registerConversationRoutes(app, app.conversations!, runManager, { defaults, users }, fileStore);
     registerFileRoutes(app, app.conversations!, fileStore, fileExtracts);
     // Cancel records of uploads that never came expire after 6 hours (review #102 7차): at start and every 10 min.
@@ -741,6 +765,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       renderer = own;
     }
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
+    registerShareRoutes(app, sharing, users, opts.sse ?? {});
 
     const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(
@@ -796,6 +821,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("scheduleProposals", undefined);
     app.decorate("watchlist", undefined);
     app.decorate("fileExtracts", undefined);
+    app.decorate("sharing", undefined);
   }
 
   app.get(

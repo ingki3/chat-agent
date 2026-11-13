@@ -239,6 +239,8 @@ export class ShuttingDownError extends Error {
 /** The run ended while its session was being opened; nothing more to do. */
 class RunEndedError extends Error {}
 
+/** A run asked for by someone who does not own the conversation (#29: shared viewers are read-only). */
+export class NotConversationOwnerError extends Error {}
 export class RunBusyError extends Error {
   constructor() {
     super("a run is already in progress for this conversation");
@@ -509,6 +511,8 @@ export class RunManager {
         }
         if (this.active(input.conversationId)) throw new RunBusyError();
         let conv = this.conversations.get(input.conversationId)!;
+        // Only the owner runs anything in a conversation (#29): a shared viewer never, whatever route let them in.
+        if (conv.ownerId !== input.userId) throw new NotConversationOwnerError();
         // The conversation's settings (#19) decide the next reply. One that had none (nothing was usable when it was
         // created, or it is older than #19 and never answered) gets its start settings now, fallback included.
         if (!settingsOf(conv) && this.opts.startSettings) {

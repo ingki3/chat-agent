@@ -10,7 +10,12 @@ export type UserAccessChanged = {
 };
 
 /** Sharing of a resource changed (e.g. share revoked, #29): open streams on it must re-check access. */
-export type ResourceAccessChanged = { kind: string; id: string };
+export type ResourceAccessChanged = {
+  kind: string;
+  id: string;
+  /** The conversation the change is in: streams on any resource of it (`ResourceRef.scope`) re-check too. */
+  scope?: string;
+};
 
 type EventMap = {
   "user-access-changed": [UserAccessChanged];

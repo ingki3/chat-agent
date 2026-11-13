@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   ARTIFACT_HTML_DOWNLOAD,
   MyArtifactsQuery,
@@ -14,11 +14,12 @@ import { BASE_HEADERS } from "../headers.js";
 import { logEvent } from "../logging.js";
 import { EXPORT_FORMATS, exportDocument, exportFormats, type ExportCode, type Renderer } from "./export.js";
 import { artifactCsp, attachment, downloadVersion, serveVersion } from "./serve.js";
-import { ArtifactError, toArtifact, toVersionInfo, type ArtifactStore } from "./store.js";
+import { ArtifactError, toArtifact, toVersionInfo, type ArtifactRow, type ArtifactStore } from "./store.js";
+import { sharedWith, viewOf } from "../shares/projection.js";
 
-/** Resource kind of one artifact (owner only until sharing, #29, fills `sharedWith`). */
+/** Resource kind of one artifact: its owner, and shared viewers whose projection holds a version of it (#29). */
 export const ARTIFACT_KIND = "artifact";
-/** Resource kind of a conversation's artifact list: owner only (a shared view gets its own projection, #29). */
+/** Resource kind of a conversation's artifact list: the owner's full list; a shared viewer's projected one (#29). */
 export const CONVERSATION_ARTIFACTS_KIND = "conversation-artifacts";
 
 /** Headers of every served original or download, besides its CSP (`serve.ts`). */
@@ -58,23 +59,53 @@ export function registerArtifactRoutes(
 ): void {
   app.resources.register(ARTIFACT_KIND, (id) => {
     const a = store.get(id);
-    return a ? { kind: ARTIFACT_KIND, id: a.id, ownerId: a.userId, sharedWith: [] } : undefined;
+    return a
+      ? {
+          kind: ARTIFACT_KIND,
+          id: a.id,
+          ownerId: a.userId,
+          // Conversation shares and shares of this artifact alike (#29).
+          sharedWith: sharedWith(app, a.conversationId, (p) => !!p.versions.get(a.id)?.size, false),
+          scope: a.conversationId,
+        }
+      : undefined;
   });
   app.resources.register(CONVERSATION_ARTIFACTS_KIND, (id) => {
     const c = conversations.get(id);
     return c
-      ? { kind: CONVERSATION_ARTIFACTS_KIND, id: c.id, ownerId: c.ownerId, sharedWith: [] }
+      ? {
+          kind: CONVERSATION_ARTIFACTS_KIND,
+          id: c.id,
+          ownerId: c.ownerId,
+          sharedWith: sharedWith(app, c.id),
+          scope: c.id,
+        }
       : undefined;
   });
   const read = { resource: { kind: ARTIFACT_KIND, action: "read" as const } };
+  /**
+   * A shared viewer (#29) gets only the versions of their projection: anything else is 403 — a version made after a
+   * snapshot, or by a message after its boundary. True for the owner.
+   */
+  const versionAllowed = (req: FastifyRequest, a: ArtifactRow, version: string) => {
+    const p = viewOf(app, req, { artifact: a });
+    return p === undefined || (!!p && p.versions.get(a.id)?.has(Number(version)) === true);
+  };
+  const forbidden = (reply: FastifyReply) =>
+    reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
 
   app.get<{ Params: { id: string } }>(
     "/api/conversations/:id/artifacts",
     { config: { resource: { kind: CONVERSATION_ARTIFACTS_KIND, action: "read" } } },
-    async (req, reply) =>
-      reply
-        .header("Cache-Control", "no-store")
-        .send({ items: store.list(req.params.id).map(toArtifact) } satisfies ArtifactListResponse),
+    async (req, reply) => {
+      const p = viewOf(app, req, { conversationId: req.params.id });
+      if (p === null) return forbidden(reply);
+      // A shared viewer (#29): the artifacts with a visible version, each at its newest visible version.
+      const items = p
+        ? store.list(req.params.id).flatMap((a) => app.sharing!.artifact(a, p) ?? [])
+        : store.list(req.params.id).map(toArtifact);
+      return reply.header("Cache-Control", "no-store").send({ items } satisfies ArtifactListResponse);
+    },
   );
 
   app.get(
@@ -98,7 +129,22 @@ export function registerArtifactRoutes(
 
   app.get<{ Params: { id: string } }>("/api/artifacts/:id", { config: read }, async (req, reply) => {
     const a = store.get(req.params.id)!;
-    const detail: ArtifactDetail = { ...toArtifact(a), versions: store.versions(a.id).map(toVersionInfo) };
+    const p = viewOf(app, req, { artifact: a });
+    if (p === null) return forbidden(reply);
+    const shared = p && app.sharing!.artifact(a, p);
+    if (p && !shared) return forbidden(reply);
+    const detail: ArtifactDetail = shared
+      ? (() => {
+          const { versions: visible, ...artifact } = shared;
+          return {
+            ...artifact,
+            versions: store
+              .versions(a.id)
+              .filter((v) => visible.includes(v.version))
+              .map(toVersionInfo),
+          };
+        })()
+      : { ...toArtifact(a), versions: store.versions(a.id).map(toVersionInfo) };
     return reply.header("Cache-Control", "no-store").send(detail);
   });
 
@@ -106,11 +152,12 @@ export function registerArtifactRoutes(
     "/api/artifacts/:id/versions/:version",
     { config: read },
     async (req, reply) => {
+      const a = store.get(req.params.id)!;
+      if (!versionAllowed(req, a, req.params.version)) return forbidden(reply);
       const v = VERSION.test(req.params.version)
         ? store.version(req.params.id, Number(req.params.version))
         : undefined;
       if (!v) return notFound(reply);
-      const a = store.get(req.params.id)!;
       return reply
         .header("Cache-Control", "no-store")
         .send({ version: v.version, kind: a.kind, content: v.content } satisfies ArtifactVersionContent);
@@ -160,6 +207,7 @@ export function registerArtifactRoutes(
     { config: read },
     async (req, reply) => {
       const a = store.get(req.params.id)!;
+      if (!versionAllowed(req, a, req.params.version)) return forbidden(reply);
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
@@ -184,6 +232,7 @@ export function registerArtifactRoutes(
     { config: read },
     async (req, reply) => {
       const a = store.get(req.params.id)!;
+      if (!versionAllowed(req, a, req.params.version)) return forbidden(reply);
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
@@ -216,6 +265,7 @@ export function registerArtifactRoutes(
       { config: read },
       async (req, reply) => {
         const a = store.get(req.params.id)!;
+        if (!versionAllowed(req, a, req.params.version)) return forbidden(reply);
         const v = VERSION.test(req.params.version)
           ? store.version(a.id, Number(req.params.version))
           : undefined;

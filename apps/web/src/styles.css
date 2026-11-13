@@ -1642,3 +1642,30 @@ a.btnlink:focus-visible,
     margin-bottom: 4px;
   }
 }
+
+/* Family sharing (#29): the minimal share screens (#52 replaces them). */
+.card-like {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.share-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.share-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+.shared-messages {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}

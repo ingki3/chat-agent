@@ -1,9 +1,10 @@
-import { useEffect, useEffectEvent, useRef, useSyncExternalStore } from "react";
+import { createContext, useContext, useEffect, useEffectEvent, useRef, useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useLocation, useMatch, useNavigate, useSearchParams } from "react-router";
 import { ARTIFACT_ESCAPE_MESSAGE, artifactPath, type PublicPart } from "@agentlee/shared";
 import { artifacts } from "../api.js";
 import {
+  ArtifactRevoked,
   ArtifactBody,
   ArtifactToolbar,
   KIND_ICON,
@@ -11,6 +12,7 @@ import {
   artifactErrorText,
   artifactKey,
   useArtifactViewer,
+  type ArtifactViewer,
 } from "./viewer.js";
 
 /**
@@ -197,7 +199,7 @@ export function ArtifactPanel({
       close();
     }
   };
-  const { data, error } = v;
+  const { data } = v;
   return (
     <aside
       ref={aside}
@@ -232,22 +234,39 @@ export function ArtifactPanel({
         </button>
       </div>
       <div className="art-body">
-        {error ? (
-          <div className="empty" role="alert">
-            <p>{artifactErrorText(error)}</p>
-          </div>
-        ) : !data ? (
-          <div className="empty muted">불러오는 중…</div>
-        ) : (
-          <>
-            <ArtifactToolbar v={v} />
-            <ArtifactBody v={v} />
-          </>
-        )}
+        <PanelBody v={v} />
       </div>
     </aside>
   );
 }
+
+/**
+ * The panel's body. A lost share comes first (#29, review #117): the viewer has no data then, which must not read as
+ * "loading".
+ */
+export function PanelBody({ v }: { v: ArtifactViewer }) {
+  if (v.revoked) return <ArtifactRevoked />;
+  if (v.error)
+    return (
+      <div className="empty" role="alert">
+        <p>{artifactErrorText(v.error)}</p>
+      </div>
+    );
+  if (!v.data) return <div className="empty muted">불러오는 중…</div>;
+  return (
+    <>
+      <ArtifactToolbar v={v} />
+      <ArtifactBody v={v} />
+    </>
+  );
+}
+
+/**
+ * Where a card opens its artifact when there is no panel (#29: a shared view opens `/a/:id`). Null: the panel.
+ */
+export const ArtifactOpenContext = createContext<((id: string, version: number | undefined) => void) | null>(
+  null,
+);
 
 /**
  * A card in the conversation for an artifact the reply made or changed (`artifact_ref`, set by the server from
@@ -261,6 +280,7 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
   });
   const navigate = useNavigate();
   const open = useOpenArtifact();
+  const openElsewhere = useContext(ArtifactOpenContext);
   const shown = version ?? data?.latestVersion;
   const info = data?.versions.find((x) => x.version === shown);
   if (error)
@@ -279,6 +299,7 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
       aria-current={current || undefined}
       // The newest version opens "following the newest" (a later edit shows in the panel at once).
       onClick={(e) => {
+        if (openElsewhere) return openElsewhere(id, shown);
         rememberOpener(e.currentTarget);
         autoOpened = null;
         void navigate({ search: `?${panelSearch(id, shown === data?.latestVersion ? undefined : shown)}` });

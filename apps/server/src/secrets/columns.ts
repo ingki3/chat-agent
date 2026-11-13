@@ -310,4 +310,20 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   // `rescrub.ts` `removeOn`. New ones are refused at write (`watchlist_bad_symbol`, the same as any bad symbol).
   "watchlist_items.symbol": { write: "WatchlistStore.add (refused)", rescrub: "text" },
   "watchlist_items.name": { write: "WatchlistStore.add", rescrub: "text" },
+  // Family shares (#29): ids, closed sets and hashes only — no shared text is copied into these tables (the
+  // projection reads the original rows, which stay scrubbed by their own rules).
+  "shares.id": ID,
+  "shares.owner_id": ID,
+  "shares.item_kind": ENUM,
+  "shares.item_id": ID,
+  "shares.conversation_id": ID,
+  "shares.audience": ENUM,
+  "shares.mode": ENUM,
+  "shares.boundary_message_id": ID,
+  "share_targets.share_id": ID,
+  "share_targets.user_id": ID,
+  "share_snapshots.share_id": ID,
+  "share_snapshots.item_type": ENUM,
+  "share_snapshots.item_id": ID,
+  "share_snapshots.digest": HASH,
 };

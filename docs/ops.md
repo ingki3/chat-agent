@@ -973,7 +973,7 @@ PRD FR-4.2·4.3·4.5, 수용 기준 2·11. 방식과 근거는 `docs/decisions/i
 ### 26.3 쓰는 곳
 - 파일 도구(두 런타임 공통, 공통 MCP 서버): `file_list`, `file_read(fileId, from, to, sheet)`, `file_search(query)`, `file_cite(fileId, snippet, page)`. 그 실행의 대화에 올린 그 사용자의 파일만 읽는다(남의 파일·다른 대화 파일은 `file_not_found`). 글자는 `<external_content>` 블록 안으로만 런타임에 간다.
 - 인용: `file_cite`는 웹 인용과 같은 번호·같은 검사를 쓰고, 답 아래 출처 목록에 "report.pdf · 12쪽"처럼 파일 이름과 위치가 붙는다. 구절이 파일에 없으면 ⚠️.
-- API: `GET /api/files/:id/extract?from=&limit=` — 상태와 위치가 붙은 글자(올린 사람만, 원본과 같은 권한).
+- API: `GET /api/files/:id/extract?from=&limit=` — 상태와 위치가 붙은 글자(원본과 같은 권한 — 주인, 그리고 #29 공유 투영에 그 파일이 든 공유 대상).
 - 실행이 읽는 파일: **활성 메시지에 실어 보낸 파일만**이다. 입력창에만 있는 파일, 수정·다시 생성으로 잘린 메시지의 파일은 도구에 보이지 않는다(원본은 주인이 파일 경로로 계속 볼 수 있다).
 - XLSX 시트는 모델에게 `sheet-<n>`("2번째 시트")으로만 보인다. 시트 이름은 파일 글자라 `<external_content>` 안에만 있다. 긴 내용은 `file_read`의 `next.cursor`로 이어 읽는다(한 단위 안에서도, 다음 시트로도).
 
@@ -1198,7 +1198,7 @@ PRD FR-5.6. 대화의 답에서 인용한 출처를 보고서용 참고문헌으
 - `GET /api/conversations/:id/references?style=apa|mla|school&includeUnverified=0|1` → `{ style, includeUnverified, items[{id, kind, verified, status, included, text}], text, excluded, truncated }`. `text`가 복사하는 내용(포함된 항목, 줄마다 하나). `id`는 해시(주소가 아님).
 - `GET /api/conversations/:id/references/download?style=…&format=txt|docx&includeUnverified=…` → `attachment`(`참고문헌-APA-<사용자 시간대 날짜>.txt` — 위 파일 이름 규칙), `nosniff`·`no-store`. 넣을 항목이 없으면 409 `references_empty`. `.docx`는 앱의 #49 문서 작업자(production은 언제나 macOS 샌드박스, `ISOLATION_IN_PROCESS_FOR_TESTS`는 시험·개발 전용, FAKE_RUNTIME으로 바뀌지 않음, §29.6)로 만든다 — 제목 "참고문헌", 부제 "대화 제목 · 형식", 항목마다 문단. 작업자가 다시 열어 검사하고 서버는 ZIP 머리를 본다. 실패는 503 `references_unavailable`. 대화 파일로 저장하지 않는다(20개 한도에 세지 않음).
 - **작업자 자리(리뷰 #115 1차):** 문서 작업자 실행은 모두 하나의 조정기(`DocSlots`, `apps/server/src/docgen/slots.ts`)를 지난다 — `doc_create`와 참고문헌 `.docx`가 함께 **서버 전체 2개, 사용자당 1개**. 넘으면 기다리지 않고 바로 거절한다: 내보내기는 503 `references_busy`(`Retry-After: 5`), `doc_create`는 `doc_busy`. 한 사용자가 자리를 잡고 있어도 다른 사용자는 막히지 않는다.
-- **권한:** 자원 `conversation-references` — `conversation` 자원의 로더를 그대로 쓴다(주인, #29가 채울 공유 대상은 읽기). 그 밖(다른 가족·관리자)은 403, 로그인 없으면 401, 없는 대화 404. 권한 행렬 2행. 내보내기에는 대화 메시지(인용 노트)가 이미 보여 주는 것 밖에는 접속일만 더해진다.
+- **권한:** 자원 `conversation-references` — `conversation` 자원의 로더를 그대로 쓴다(주인과 #29 공유 대상). 공유 대상의 내보내기는 그 사람의 공유 투영(§33)에 든 메시지와 그 메시지가 인용한 출처로만 만든다 — 스냅샷 경계 뒤나 철회된 공유의 인용은 나오지 않는다(시험 `shares.test.ts`). 그 밖(다른 가족·관리자)은 403, 로그인 없으면 401, 없는 대화 404. 권한 행렬 2행. 내보내기에는 대화 메시지(인용 노트)가 이미 보여 주는 것 밖에는 접속일만 더해진다.
 - 로그: `references.exported`(사용자·대화 ID, 항목 수, 소요 시간, `.docx`면 `docKind`·`docCode`). 항목·제목·주소는 남기지 않는다(시험).
 - **화면:** 대화 상단 "📚 참고문헌"(좁은 화면은 📚만, 접근 이름 "참고문헌") → 모달 대화상자(`<dialog>` — 포커스 가둠, Esc·바깥 누르기·✕로 닫고 단추로 포커스 복귀): 형식 고르기(라디오 — APA 7·MLA 9·학교용), "검증 실패 출처 포함"(체크 상자, 기본 꺼짐), 항목 목록(포함 항목, 빠진 실패 출처는 이유와 함께 따로), ⧉ 복사·.txt 내려받기·.docx 내려받기, 결과 안내(`role=status`, 오류는 `alert`).
 - 형식이나 토글을 바꾸면 새 목록이 올 때까지 앞 목록을 보여 주되(`keepPreviousData`), **복사·내려받기는 꺼 둔다** — 응답의 형식·포함 여부가 지금 고른 것과 같고 자리 표시 데이터가 아닐 때만 켠다(리뷰 #115 1차: 바꾼 직후 누르면 앞 형식이 복사되던 것).
@@ -1240,3 +1240,68 @@ PRD FR-8.3·8.4·8.6, FR-11.8. 엔진(25절)의 핸들러 계약 위에서, 예�
 ### 32.6 확인 방법
 - `pnpm vitest run apps/server/test/schedule-run.test.ts`(FakeRuntime): 성공(대화·메시지·결과 참조·사용량·비용·알림 제목·두 줄 본문·링크·"새 결과"·관리자 403), 매 실행 새 메시지와 금융 노트, 재시도 후 실패(사용자 메시지 1개·답 재생성·실패 메시지·실패 알림 1개·두 시도 비용), 실패 후 재시도 성공, 권한 줄어듦 → `not_allowed`, 남의 대화·보통 대화에 쓰지 않음, 시간 초과, 같은 시도 두 번 → 런 1개, 크래시(실행 중·결과 저장 전/후·알림 전/후) 각각 → 메시지·결과·알림 1개, 경고(1시간 전, 회차마다 1번, 일시정지·쓸 수 있는 예약은 없음), 알려진 비밀(나중에 등록된 것 포함). 권한 행렬(`result-seen` 주인만), e2e `e2e/schedules.spec.ts`(바로 실행 → 사이드바 "새 결과" → 열면 사라짐; 알림 끔·푸시 없음·다른 대화에서 1분 뒤 "새 결과"; 결과 뒤 51차례가 쌓여도 알림 링크가 그 메시지로). review #116: 공용→개인 전환 시 개인 연결·공용 권한 회수 시 경고와 실행이 같은 판단, 스킬 범위(목록·호출), 로캘과 무관한 시각.
 - 실런타임·실기기 확인(수용 기준 5 절차 1·3): 운영 Mac에서 실제 런타임으로 매일 회차 예약을 7일 돌려 정시 ±1분, 결과 대화, 휴대폰 푸시(제목·두 줄·눌러서 그 메시지로)를 본다. 연결을 끊어 둔 예약은 1시간 전 경고가 휴대폰에 오는지 본다.
+
+## 33. 가족 공유 — 공유 투영·불변 범위·즉시 철회 (#29)
+PRD FR-14.1~14.3·14.4·14.7, FR-6.3, 수용 기준 6, #3 부분 공유 결정. 방식·경로 목록·새 경로 규칙은 `docs/decisions/sharing.md`. 공유 화면 전체(대화 메뉴의 "가족에게 공유", 열람 확인, "이어서 대화하기", 사이드바 묶음)는 #52.
+
+### 33.1 무엇을 하나
+- 대화(예약 결과 대화 포함)나 아티팩트를 **가족 전체** 또는 **고른 가족 계정**에게 읽기 전용으로 공유한다. 가족 밖 공개 링크는 없다.
+- **live**: 원래 대화에 새 메시지가 쌓이면 공유본에도 보인다.
+- **snapshot**("이 메시지까지"): 경계 메시지까지의 메시지와 그 메시지들이 가져온 파일·아티팩트 버전·인용 출처만 공유할 때 고정한다. 그 뒤에 생기거나 바뀐 것은 403이다.
+- 공유받은 사람에게는 `reasoning` 파트와 도구 원본 결과가 어디로도 가지 않는다. 메시지, run 이벤트 SSE, 공유 화면, 검색 모두 같다. 도구 이름·입력은 보인다.
+- 주인 계정을 비활성화하면 그 사람의 공유는 아무에게도 닿지 않는다(403, 열린 스트림 종료). 해제된 것은 아니므로 계정을 다시 활성화하면 돌아온다. 지금은 앱에 다시 활성화하는 기능이 없고, DB에서 `users.active = 1`로 바꾼다.
+- `document` 아티팩트를 공유하면 그 버전들이 가리키는 생성 파일만 함께 내려받을 수 있다(snapshot이면 스냅샷 버전의 파일만). 대화 공유에서도 투영에 든 문서 버전의 파일이 열린다. 되돌리기로 만든 버전의 파일도 마찬가지다.
+- 해제·대상 변경은 즉시 적용된다. 다음 요청부터 403이고, 열린 SSE(공유 화면의 공유 스트림, 진행 중인 답의 run 스트림)는 바로 닫힌다. 이미 내려받은 파일과 포크 사본은 되돌리지 않으며, 화면에 그렇게 안내한다.
+
+### 33.2 API
+- `POST /api/conversations/:id/shares {target, mode, boundaryMessageId?}`, `POST /api/artifacts/:id/shares {target, mode}` → 201 `Share`. 주인만 할 수 있다.
+  - `target`: `{audience:"family"}` 또는 `{audience:"users", userIds:[계정 id]}`.
+  - 이메일·다른 키, 빈 `userIds`는 400이다. 없거나 비활성인 계정, 자기 자신은 400 `invalid_share_target`이다.
+  - snapshot은 `boundaryMessageId`가 꼭 있어야 한다. 그 대화의 활성 메시지가 아니면 400 `share_boundary_not_found`, 답을 쓰는 중이면 409 `share_run_in_progress`이다.
+- 주인만:
+  - `GET /api/conversations/:id/shares`, `GET /api/artifacts/:id/shares`
+  - `GET /api/shares/:id`
+  - `PATCH /api/shares/:id {target}` (대상 변경)
+  - `DELETE /api/shares/:id` (해제 — 행은 남고 `revokedAt`이 채워진다)
+- 공유받은 사람(주인은 미리보기):
+  - `GET /api/shares/:id/view`: 투영된 메시지·파일·아티팩트(보이는 버전)·출처.
+  - `GET /api/shares/:id/events`: SSE. `ready`를 보낸 뒤 공유가 닿는 동안 열려 있고, 끊기면 `revoked`를 보내고 닫힌다.
+  - `GET /api/artifacts/:id/access?version=n`: 아티팩트 화면(`/a/:id`, 패널)이 따르는 SSE. `n`은 화면에 보이는 버전이다. 주인은 `owner`를 받고 바로 끝난다.
+    - 공유받은 사람은 아티팩트를 더는 볼 수 없게 되면 `revoked`를 받는다. 화면은 프레임과 캐시를 지운 뒤 철회 안내를 보인다. 공유 화면에서 연 경우와 새 탭으로 연 경우 모두 그렇다.
+    - 여러 공유 중 하나만 꺼져서 화면의 버전이 빠지면(예: snapshot v1 + live v2에서 live만 해제) `scope {versions}`를 받는다. 화면은 그 버전과 캐시를 버리고 남은 버전을 다시 읽는다.
+- 목록:
+  - `GET /api/shared-with-me?q=`: 나에게 공유된 것. 검색은 제목과 투영된 메시지 글에서만 찾는다.
+  - `GET /api/share-targets`: 공유할 수 있는 가족 계정의 id와 이름(이메일 없음).
+- 기존 읽기 경로는 공유받은 사람에게 투영된 것만 준다. 투영 밖은 403이다. 대상 경로: 대화, 메시지, 메시지 버전, 진행 중인 run, run, run 이벤트, 대화의 파일 목록, 파일, 파일 원본, 아티팩트 목록, 아티팩트, 버전, `/a/:id`, raw, download, png, pdf, 출처 목록.
+- 쓰기 API는 공유받은 사람에게 모두 403이다. `RunManager`도 주인이 아닌 run을 거부한다.
+
+### 33.3 화면 (최소)
+- 사이드바 "👪 가족 공유"(`/shared`)에 세 부분이 있다.
+  - "나에게 공유된 것": 검색, 그리고 누가 언제 공유했는지.
+  - "가족에게 공유": 대화, live 또는 "이 메시지까지"와 경계 메시지, 가족 전체 또는 계정 체크. 처음에는 아무도 고르지 않은 상태이고, 0명이면 안내가 나오며 저장할 수 없다.
+  - "내가 공유한 것": 대상 바꾸기, 공유 끄기, 철회 안내 문구.
+- `/shared/:id`는 읽기 전용 공유 화면이다. 답의 아티팩트 카드를 누르면 `/a/:id`가 열린다. live는 5초마다 새로 읽는다. 공유 스트림이 `revoked`로 닫히면 화면이 "공유가 꺼졌거나 더 이상 나에게 공유되지 않아요"로 바뀐다.
+
+### 33.4 DB (0026 마이그레이션)
+0024는 #107, 0025는 #116이 쓴다. 이 셋을 합칠 때는 `_journal.json`의 순서를 0024 → 0025 → 0026으로 맞춘다. `when`은 이 순서로 커진다.
+- `shares`: 항목 종류·id, 주인, 대화, `audience`, `mode`, 경계 메시지, `created_at`·`updated_at`·`revoked_at`.
+  - 대화에 외래 키(cascade)가 걸려 있어 대화를 지우면 공유도 지워지고, 열린 공유 스트림은 닫힌다.
+- `share_targets`: `users` 공유의 고른 계정. 계정을 지우면 함께 지워진다.
+- `share_snapshots`: snapshot의 불변 목록. 행 종류는 다음과 같다.
+  - `message`: id, revision
+  - `file`: id, sha256
+  - `artifact_version`: 아티팩트 id, 버전
+  - `citation`: id, 구절 해시
+  - `source`: id, 본문 해시
+  - 트리거가 UPDATE를 거부한다.
+- 세 표의 글 칸은 모두 id·고정 값·해시뿐이라 비밀 가림이 필요 없다(`secrets/columns.ts`에 분류). 공유된 글은 원래 행에서 읽고, 원래 행은 지금처럼 저장·응답할 때 가려진다.
+
+### 33.5 확인 방법
+- `pnpm vitest run apps/server/test/shares.test.ts`. 다음을 확인한다.
+  - snapshot 403: 경계 뒤 메시지; 공유 전에 경계 뒤 메시지로 올린 파일, 만든 v2, 인용한 출처; 되돌리기 사본; 공유 후 업로드·새 버전·수정본.
+  - 같은 데이터로 조회·raw·다운로드·내보내기·검색·`bundle`(포크·내보내기 입력)이 투영과 같은지.
+  - live의 새 메시지, reasoning·원본 결과 제외(API와 SSE).
+  - 해제·대상 변경 직후 모든 URL 403과 열린 SSE 종료.
+  - 이메일 거부, 쓰기·run·MCP 거부, 아티팩트 공유.
+- `apps/server/test/permissions.test.ts`: 권한 행렬. 모든 리소스 경로에 "shared"(live 공유 대상) 열이 있고, 새 공유 경로 9개의 행이 있다.
+- `E2E_PORT=3121 pnpm e2e e2e/shares.spec.ts`(데스크톱·모바일, 프로젝트마다 새 계정): `/shared`에서 공유하고, 공유받은 사람이 읽기 전용으로 열고, 쓰기는 403이다. 공유를 끄면 열린 화면이 바로 닫히고 URL이 403이다. snapshot 경계와 이메일 거부도 확인한다.
