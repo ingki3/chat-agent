@@ -3,7 +3,9 @@ import {
   CreateArtifactShareRequest,
   CreateConversationShareRequest,
   IncomingSharesQuery,
+  ShareSubscriptionRequest,
   UpdateShareRequest,
+  type ForkResponse,
   type IncomingSharesResponse,
   type Share,
   type ShareAudience,
@@ -17,7 +19,9 @@ import { deny } from "../auth/plugin.js";
 import type { UserStore } from "../auth/users.js";
 import { openSse } from "../sse.js";
 import { scrubKnown } from "../secrets/known.js";
-import type { SharePolicy } from "./projection.js";
+import { toConversation } from "../conversations/store.js";
+import { ForkRefused, type ForkService, type ForkStart } from "./fork.js";
+import type { Projection, SharePolicy } from "./projection.js";
 import { ShareError, type ShareRow } from "./store.js";
 
 /** Resource kind of one share: its owner manages it (`share`), the accounts it reaches read it (`read`). */
@@ -39,9 +43,12 @@ function parse<T extends z.ZodType>(schema: T, value: unknown, reply: FastifyRep
   return r.data;
 }
 
+/** A refusal with this API's own code (not an auth error). */
+const fail = (reply: FastifyReply, status: number, error: string) =>
+  reply.code(status).header("Cache-Control", "no-store").send({ error });
+
 /**
- * Family sharing API (#29). Only the minimum the policy needs to be used and tested end to end — the share screens,
- * read receipts and forking are #52:
+ * Family sharing API (#29, #52):
  * - `POST /api/conversations/:id/shares` · `POST /api/artifacts/:id/shares` — share (owner only, `share` action)
  * - `GET  /api/conversations/:id/shares` · `GET /api/artifacts/:id/shares` — the item's shares (owner only)
  * - `GET /api/shares/:id` (owner) · `PATCH` (change who, owner) · `DELETE` (revoke, owner)
@@ -49,12 +56,22 @@ function parse<T extends z.ZodType>(schema: T, value: unknown, reply: FastifyRep
  * - `GET /api/shares/:id/events` — SSE kept open while the share reaches the caller; closed the moment it stops
  * - `GET /api/shared-with-me?q=` — what is shared with the caller (search: titles and projected text only)
  * - `GET /api/share-targets` — family accounts to share with (ids and names: there is no email anywhere here)
+ * - `POST /api/shares/:id/fork` — "이어서 대화하기" (#52): the caller's projection copied into a conversation of theirs
+ * - `PUT /api/shares/:id/subscription` — a viewer's "새 결과 알림 받기" for a shared schedule-result conversation (#52)
+ *
+ * A viewer opening the view is recorded (`share_views`, #52): the owner's `Share.views` says who opened it and when.
  */
 export function registerShareRoutes(
   app: FastifyInstance,
   sharing: SharePolicy,
   users: UserStore,
-  opts: { heartbeatMs?: number } = {},
+  opts: {
+    heartbeatMs?: number;
+    /** Forks (#52); without it the fork route answers 503. */
+    fork?: ForkService;
+    /** The forker's start settings (their own defaults, FR-12.6 fallback). */
+    start?: (userId: string) => ForkStart | null;
+  } = {},
 ): void {
   const store = sharing.store;
   app.resources.register(SHARE_KIND, (id) => {
@@ -103,6 +120,19 @@ export function registerShareRoutes(
       return u ? [{ id: u.id, name: scrubKnown(u.name) }] : [];
     }),
     boundaryMessageId: s.boundaryMessageId,
+    views: store.views(s.id).flatMap((v) => {
+      const u = users.byId(v.userId);
+      return u
+        ? [
+            {
+              id: u.id,
+              name: scrubKnown(u.name),
+              firstViewedAt: v.firstViewedAt,
+              lastViewedAt: v.lastViewedAt,
+            },
+          ]
+        : [];
+    }),
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
     revokedAt: s.revokedAt,
@@ -244,9 +274,65 @@ export function registerShareRoutes(
           : null
         : sharing.project(s, user.id);
     if (!p) return deny(reply, 403, "forbidden");
-    return reply
-      .header("Cache-Control", "no-store")
-      .send({ share: sharing.incoming(s), ...sharing.bundle(s, p) } satisfies SharedView);
+    const viewer = s.ownerId !== user.id;
+    // A viewer's look is a read receipt (FR-14.6) — the owner's own preview is not.
+    if (viewer) store.markViewed(s.id, user.id);
+    return reply.header("Cache-Control", "no-store").send({
+      share: sharing.incoming(s, user.id),
+      ...sharing.bundle(s, p),
+      viewer: viewer && scheduleResult(s) ? { notifyResults: store.notifyResults(s.id, user.id) } : null,
+      own: !viewer,
+    } satisfies SharedView);
+  });
+
+  /** A share of a schedule's result conversation (FR-8.8): its viewers may choose to be told of new results. */
+  const scheduleResult = (s: ShareRow) =>
+    s.itemKind === "conversation" && app.conversations?.get(s.conversationId)?.kind === "schedule";
+
+  app.put<{ Params: { id: string } }>(
+    "/api/shares/:id/subscription",
+    // The viewer's own choice about their notifications — nothing of the shared item changes (read access suffices).
+    { config: read },
+    async (req, reply) => {
+      const body = parse(ShareSubscriptionRequest, req.body, reply);
+      if (!body) return reply;
+      const s = store.get(req.params.id)!;
+      const user = req.ctx.user!;
+      // The owner is notified of their own schedule by the schedule itself.
+      if (s.ownerId === user.id) return fail(reply, 400, "share_own_item");
+      if (!sharing.project(s, user.id)) return deny(reply, 403, "forbidden");
+      if (!scheduleResult(s)) return fail(reply, 400, "share_not_schedule_result");
+      store.setNotifyResults(s.id, user.id, body.notifyResults);
+      return reply.header("Cache-Control", "no-store").send({ notifyResults: body.notifyResults });
+    },
+  );
+
+  // "이어서 대화하기" (#52): the caller's projection — nothing else — copied into a new conversation of theirs.
+  app.post<{ Params: { id: string } }>("/api/shares/:id/fork", { config: read }, async (req, reply) => {
+    const user = req.ctx.user!;
+    const first = store.get(req.params.id)!;
+    if (first.ownerId === user.id) return fail(reply, 400, "share_own_item");
+    if (!opts.fork) return fail(reply, 503, "fork_unavailable");
+    const start = opts.start?.(user.id) ?? null;
+    try {
+      const c = await opts.fork.fork({
+        forkerId: user.id,
+        start,
+        // Read again inside the lock and the transaction: a revoke while waiting is seen.
+        read: () => {
+          const s = store.get(req.params.id);
+          const p: Projection | null = s ? sharing.project(s, user.id) : null;
+          return s && p ? { share: s, source: sharing.forkSource(s, p) } : null;
+        },
+      });
+      return reply
+        .code(201)
+        .header("Cache-Control", "no-store")
+        .send({ conversation: toConversation(c) } satisfies ForkResponse);
+    } catch (e) {
+      if (e instanceof ForkRefused) return deny(reply, 403, "forbidden");
+      throw e;
+    }
   });
 
   // Open while the share reaches the caller; closed (after a `revoked` event) the moment it no longer does —
@@ -328,7 +414,9 @@ export function registerShareRoutes(
     async (req, reply) => {
       const q = parse(IncomingSharesQuery, req.query, reply);
       if (!q) return reply;
-      const items = sharing.search(req.ctx.user!.id, q.q || undefined).map((s) => sharing.incoming(s));
+      const items = sharing
+        .search(req.ctx.user!.id, q.q || undefined)
+        .map((s) => sharing.incoming(s, req.ctx.user!.id));
       return reply.header("Cache-Control", "no-store").send({ items } satisfies IncomingSharesResponse);
     },
   );

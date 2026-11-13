@@ -72,6 +72,8 @@ import { registerFileRoutes } from "./files/routes.js";
 import { SharePolicy } from "./shares/projection.js";
 import { registerShareRoutes } from "./shares/routes.js";
 import { ShareStore } from "./shares/store.js";
+import { ForkService } from "./shares/fork.js";
+import { notifyResultSubscribers } from "./shares/notify.js";
 import { DocGenService } from "./docgen/service.js";
 import { DocSlots } from "./docgen/slots.js";
 import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
@@ -710,6 +712,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         conversations: app.conversations!,
         runs: runManager,
         notifications: () => app.notifications,
+        sharedResult: (r) => notifyResultSubscribers(sharing, app.notifications, r),
         now: scheduleNow,
         log: app.log,
         ...opts.schedules?.runtime,
@@ -765,7 +768,20 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       renderer = own;
     }
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
-    registerShareRoutes(app, sharing, users, opts.sse ?? {});
+    registerShareRoutes(app, sharing, users, {
+      ...(opts.sse ?? {}),
+      // "이어서 대화하기" (#52): the projection copied into the forker's own conversation, on their own defaults.
+      fork: new ForkService({
+        db: opts.db!,
+        lock: app.fileWrites,
+        conversations: app.conversations!,
+        files: fileStore,
+        artifacts,
+        sources,
+        extract: (id) => fileExtracts.enqueue(id),
+      }),
+      start: (userId) => startSettings(userId),
+    });
 
     const vapid = loadOrCreateVapidKeys(settingsStore);
     const notifications = new NotificationService(

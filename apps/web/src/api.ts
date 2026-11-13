@@ -64,6 +64,7 @@ import {
   Share,
   SharesResponse,
   SharedView,
+  ForkResponse,
   IncomingSharesResponse,
   ShareTargetsResponse,
   type ShareAudience,
@@ -662,6 +663,18 @@ export const shares = {
     id: string,
     body: { target: ShareAudience; mode: ShareMode; boundaryMessageId?: string },
   ) => Share.parse(await call("POST", `/api/conversations/${enc(id)}/shares`, body)),
+  ofArtifact: async (id: string) =>
+    SharesResponse.parse(await call("GET", `/api/artifacts/${enc(id)}/shares`)).items,
+  shareArtifact: async (id: string, body: { target: ShareAudience; mode: ShareMode }) =>
+    Share.parse(await call("POST", `/api/artifacts/${enc(id)}/shares`, body)),
+  /** "이어서 대화하기" (#52): the share copied into a new conversation of mine. */
+  fork: async (id: string) =>
+    ForkResponse.parse(await call("POST", `/api/shares/${enc(id)}/fork`)).conversation,
+  /** A viewer's "새 결과 알림 받기" for a shared schedule-result conversation (#52, FR-8.8). */
+  setNotifyResults: async (id: string, notifyResults: boolean) =>
+    (await call("PUT", `/api/shares/${enc(id)}/subscription`, { notifyResults })) as {
+      notifyResults: boolean;
+    },
   setTarget: async (id: string, target: ShareAudience) =>
     Share.parse(await call("PATCH", `/api/shares/${enc(id)}`, { target })),
   revoke: async (id: string) => Share.parse(await call("DELETE", `/api/shares/${enc(id)}`)),

@@ -18,7 +18,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-2.1 | 대화 목록·새 대화·이름 변경·삭제·고정·검색 | #11, #13, #54 | I, E | 🟨 |
 | FR-2.2 | 첫 메시지 뒤 제목 자동 생성 | #11 | I | 🟨 |
 | FR-2.3 | 대화 간 맥락 분리 | #11, #42, #45 | I | 🟨 (#45 새 세션 맥락은 그 대화의 활성 기록·요약·참조만, 세션은 대화별 — `context.test.ts`) |
-| FR-2.4 | 사이드바 "가족 공유" 묶음 | #13, #52 | E | 🟨 |
+| FR-2.4 | 사이드바 "가족 공유" 묶음 | #13, #52 | E | 🟨 (#52 공유받은 항목·공유한 사람·시각·"새로" — `e2e/share-screens.spec.ts`. 머지 후 ✅) |
 | FR-2.5 | 프로젝트 (v1.1 선택) | #64 (v1.1 백로그) | — | v1.1 |
 | FR-2.6 | 새로고침·다른 기기에서 이어짐 | #11, #12, #13 | E | 🟨 |
 | FR-3.1 | 스트리밍, 중지 | #12, #14, #15, #16 | I, E, M | 🟨 (#14 화면·FakeRuntime E2E, 실제 런타임은 #15·#16) |
@@ -62,7 +62,7 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-8.5 | 일시정지·바로 실행·수정·삭제·이력 | #55 | E | ✅ (#55 `/schedules`: 목록·일시정지·바로 실행·수정(모든 칸, `PATCH`)·삭제·실행 이력(성공·실패·건너뜀·비용 = `priced_cost_micros` 합) — `test/schedule-ui.test.ts`, `e2e/schedules.spec.ts`. 실제 실행 결과는 #56) |
 | FR-8.6 | 2분 뒤 1회 재시도, 실패 기록 | #33, #56 | U | 🟨 (#33 엔진: 실패 → 정확히 2분 뒤 1회, 결과 저장·알림은 마지막 시도만, 두 번 실패 → `failed`·이유 저장·실패 알림, 크래시한 시작도 시도로 셈 — `test/schedules.test.ts` "retry"·"crash recovery". 실제 실패 이유를 대화에 남기는 것은 #56) |
 | FR-8.7 | 놓친 실행 1회, 겹침 건너뜀, 서머타임 | #33 | U | ✅ (영속 `next_run_at` + 유니크 실행 키(`schedule_runs.run_key`), 시작 시 예약당 가장 최근 놓친 회차 1회, 안 끝난 실행 중 회차 → `skipped`·`overlap`, 바로 실행은 별도 키, America/New_York 없는 시각 → 직후 03:00 1회·두 번 있는 시각 → 첫 번째 1회 — `test/schedules.test.ts`, `test/schedules-time.test.ts`, 변이 시험. docs/ops.md §25) |
-| FR-8.8 | 예약 결과 공유와 알림 선택 | #52, #57 | I | ⬜ |
+| FR-8.8 | 예약 결과 공유와 알림 선택 | #52, #57 | I | 🟨 (#52 `PUT /api/shares/:id/subscription`, 투영에 결과가 있는 사람에게만 공유 본문으로 알림 — `shares.test.ts`) |
 | FR-9.1 | API 비용 기록, 예산 v1.1 | #44, #32 | U | ✅ (#44 `usage_records`: run·attempt마다 1행, 원시 비용·토큰(미제공 NULL)·요청 수, upsert로 멱등 — 같은 attempt 두 번 → 1행, 중지·실패 실행도 기록, `test/usage.test.ts`. #32 버전 가격표 `price_tables`(저장마다 새 버전), 첫 기록 때 `auth_type`·`price_version` 고정 → 가격 수정이 지난 비용을 바꾸지 않음, API 키만 비용(가격은 십진 문자열 ≤ 6자리 → BigInt로 정확히 곱해 행마다 마이크로 USD 반올림(0.5 올림), 정수 합계·기준 비교 — 50×$0.29/M = 15, 667행 $0.01 경계)·미제공 NULL, 0013 업그레이드가 옛 기록의 `auth_type`을 연결에서 채우고 못 찾으면 `unknown`(미확인·미제공, 가격 미적용) — `test/usage-review.test.ts`, 예산 스위치 "추후 제공" 비활성, 예산 꺼진 상태에서 사용량으로 막히는 경로 없음(가격표·알림 실패해도 실행 완료) — `test/usage-screen.test.ts`, `e2e/usage.spec.ts`) |
 | FR-9.2 | 구독 사용 집계, 한도 안내·전환 | #18, #44 | I, M | 🟨 (#44 구독 연결도 같은 표에 토큰·요청 수 기록, 연결 테스트는 `connection_test` — `test/connections.test.ts`. #18 구독은 비용 없이 토큰만(`cost_usd` NULL — `claude.test.ts`, `subscription.test.ts`), 한도 → `subscription_limit` 안내 "지금 이 런타임은 한도에 걸렸어요" + `switchTo`. 실제 전환은 #19, 실제 한도 확인(M)은 체크리스트) |
 | FR-9.3 | 내 사용량, 관리자 분류별 사용량 | #32 | I, E | ✅ (`GET /api/usage/me` 본인 것만 — 사이드바·설정, 관리자 `GET /api/admin/usage` 사용자·런타임·모델·연결·목적별, 다섯 분류 합계 동일, 아들·가족 403(Fastify가 실제 등록한 `/api/admin/**` 전체를 순회 — 관리자 선언이 빠진 경로, 명시적 HEAD 경로도 실패), 토큰 미보고는 "미제공" — `test/usage-screen.test.ts`, `test/permissions.test.ts`, `e2e/usage.spec.ts`) |
@@ -97,10 +97,10 @@ PRD v0.5의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-13.5 | 본문 2줄, 공유 내용 비노출 | #34 | U | ✅ |
 | FR-14.1 | 공유 대상 | #29, #52 | I | ⬜ |
 | FR-14.2 | 기본 비공개, 즉시 해제 | #29 | I | ⬜ |
-| FR-14.3 | 읽기 전용, 살아 있는 공유, 포크, 부분 공유 불변 목록 | #29, #52 | I, E | ⬜ |
-| FR-14.4 | 아티팩트 공유·포크 | #52 | E | ⬜ |
+| FR-14.3 | 읽기 전용, 살아 있는 공유, 포크, 부분 공유 불변 목록 | #29, #52 | I, E | 🟨 (#52 포크 `POST /api/shares/:id/fork` — 투영만 새 행으로 복사, 원래 삭제 뒤에도 유지 — `shares.test.ts`·`e2e/share-screens.spec.ts`) |
+| FR-14.4 | 아티팩트 공유·포크 | #52 | E | 🟨 (#52 아티팩트 화면의 "가족에게 공유", 복사해서 고치기 — `e2e/share-screens.spec.ts`) |
 | FR-14.5 | 가족 공유 묶음, 공유 알림 | #52, #34 | E | 🟨 (#34 `share_received` 발행 API — 내용 없이 누가·무엇만, 연결은 #29/#52) |
-| FR-14.6 | 공유한 사람·시각, 열람 확인 | #52 | E | ⬜ |
+| FR-14.6 | 공유한 사람·시각, 열람 확인 | #52 | E | 🟨 (#52 `share_views`, `Share.views`, 대화상자의 열람 확인 — `e2e/share-screens.spec.ts`) |
 | FR-14.7 | 가족 계정끼리만 | #29 | I | ⬜ |
 | FR-15.1 | 이름·이메일·역할 관리 | #35 | E | 🟨 (#35 사용자 탭 수정, 이메일 변경 시 세션 종료, 관리자 이메일은 #36 절차로만(409 `admin_email_change`) — `admin.test.ts`·`e2e/admin.spec.ts`. Access 자동 반영은 #36) |
 | FR-15.2 | Access 자동 반영, 미리보기, 실패 재시도, 현재 관리자 이메일 보호 | #36 | I, M | ⬜ |

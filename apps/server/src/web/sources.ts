@@ -124,6 +124,37 @@ export class SourceStore {
       .get();
   }
 
+  /**
+   * A fork's copy of a cited source (#52): what the share showed of it (`Source`, never the page text — a viewer is
+   * not served that), as a new row of the forker's conversation. `runId` names the fork (no run fetched it).
+   */
+  copyInto(to: { userId: string; conversationId: string; forkId: string }, raw: Source): SourceRow {
+    const s = scrubKnownDeep(raw);
+    return this.db
+      .insert(sources)
+      .values({
+        id: crypto.randomUUID(),
+        userId: to.userId,
+        conversationId: to.conversationId,
+        runId: to.forkId,
+        kind: s.kind,
+        provider: s.provider,
+        url: s.url,
+        finalUrl: s.finalUrl,
+        title: cut(s.title, SOURCE_LIMITS.title),
+        site: cut(s.site, SOURCE_LIMITS.site),
+        publishedAt: s.publishedAt,
+        fetchedAt: s.fetchedAt,
+        contentType: s.contentType,
+        bodyHash: null,
+        body: null,
+        truncated: s.truncated,
+        snippet: s.snippet === null ? null : cut(s.snippet, SOURCE_LIMITS.snippet),
+      })
+      .returning()
+      .get();
+  }
+
   /** Stores a search result (no body). Undefined when the scope does not own the conversation. */
   addSearchResult(scope: SourceScope, raw: SearchInput): SourceRow | undefined {
     if (!this.owns(scope)) return undefined;

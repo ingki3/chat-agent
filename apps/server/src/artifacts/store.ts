@@ -13,7 +13,7 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, messages, runs } from "../db/schema.js";
-import { scrubContent, scrubKnownDeep } from "../secrets/known.js";
+import { scrubContent, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 
 /**
  * A version as read (round 26): its content scrubbed by kind — canonical JSON value by value, so it stays valid —
@@ -332,6 +332,60 @@ export class ArtifactStore {
       })
       .returning()
       .get();
+  }
+
+  /**
+   * A fork's copy of an artifact (#52, "이어서 대화하기"): a new artifact of `to` (the forker's conversation, which they
+   * own) holding the given versions — the ones the share showed — numbered 1…n, oldest first. Scrubbed like every
+   * write; no run made it (`runId` null), its message is linked by the fork once that is copied (`linkMessage`).
+   */
+  copyInto(
+    to: { userId: string; conversationId: string },
+    src: { kind: ArtifactKind },
+    versions: readonly { title: string; language: string | null; content: string }[],
+  ): ArtifactRow {
+    if (!this.owns({ ...to, runId: "" })) throw new ArtifactError("artifact_not_allowed");
+    if (!versions.length || versions.length > ARTIFACT_LIMITS.versionsPerArtifact)
+      throw new ArtifactError("artifact_bad_input");
+    return this.db.transaction((tx) => {
+      const n = tx
+        .select({ n: count() })
+        .from(artifacts)
+        .where(eq(artifacts.conversationId, to.conversationId))
+        .get()!.n;
+      if (n >= ARTIFACT_LIMITS.artifactsPerConversation) throw new ArtifactError("artifact_limit");
+      const at = this.now();
+      const clean = versions.map((v) => ({
+        title: scrubKnown(v.title),
+        language: v.language === null ? null : scrubKnown(v.language),
+        content: scrubContent(v.content),
+      }));
+      const last = clean.at(-1)!;
+      const artifact = tx
+        .insert(artifacts)
+        .values({
+          id: crypto.randomUUID(),
+          userId: to.userId,
+          conversationId: to.conversationId,
+          messageId: null,
+          runId: null,
+          kind: src.kind,
+          title: last.title,
+          language: last.language,
+          latestVersion: clean.length,
+          createdAt: at,
+          updatedAt: at,
+        })
+        .returning()
+        .get();
+      clean.forEach((v, i) => this.insertVersion(tx, artifact.id, i + 1, { ...v, runId: null, at }));
+      return artifact;
+    });
+  }
+
+  /** The fork's copied message an artifact copy came with (#52). */
+  linkMessage(id: string, messageId: string): void {
+    this.db.update(artifacts).set({ messageId }).where(eq(artifacts.id, id)).run();
   }
 
   // Reads are scrubbed too (round 24): a secret registered after an artifact was stored never comes back in the

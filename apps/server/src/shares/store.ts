@@ -184,6 +184,65 @@ export class ShareStore {
     return this.get(id)!;
   }
 
+  // ---- read receipts (#52, FR-14.6) ----
+
+  /** `userId` opened the share (as a viewer, through the projection): the first time is kept, the last moves on. */
+  markViewed(shareId: string, userId: string): void {
+    const t = this.now();
+    this.sql
+      .prepare(
+        `insert into share_views (share_id, user_id, first_viewed_at, last_viewed_at) values (?, ?, ?, ?)
+           on conflict (share_id, user_id) do update set last_viewed_at = excluded.last_viewed_at`,
+      )
+      .run(shareId, userId, t, t);
+  }
+
+  /** Who opened the share, and when first and last. */
+  views(shareId: string): { userId: string; firstViewedAt: number; lastViewedAt: number }[] {
+    return this.sql
+      .prepare(
+        `select user_id as userId, first_viewed_at as firstViewedAt, last_viewed_at as lastViewedAt
+           from share_views where share_id = ? order by first_viewed_at`,
+      )
+      .all(shareId) as { userId: string; firstViewedAt: number; lastViewedAt: number }[];
+  }
+
+  /** When `userId` first opened the share, or null. */
+  viewedAt(shareId: string, userId: string): number | null {
+    const r = this.sql
+      .prepare("select first_viewed_at as t from share_views where share_id = ? and user_id = ?")
+      .get(shareId, userId) as { t: number } | undefined;
+    return r?.t ?? null;
+  }
+
+  // ---- result notifications of a shared schedule conversation (#52, FR-8.8) ----
+
+  notifyResults(shareId: string, userId: string): boolean {
+    const r = this.sql
+      .prepare("select notify_results as n from share_subscriptions where share_id = ? and user_id = ?")
+      .get(shareId, userId) as { n: number } | undefined;
+    return r?.n === 1;
+  }
+
+  setNotifyResults(shareId: string, userId: string, on: boolean): void {
+    this.sql
+      .prepare(
+        `insert into share_subscriptions (share_id, user_id, notify_results, updated_at) values (?, ?, ?, ?)
+           on conflict (share_id, user_id) do update set notify_results = excluded.notify_results,
+             updated_at = excluded.updated_at`,
+      )
+      .run(shareId, userId, on ? 1 : 0, this.now());
+  }
+
+  /** The accounts that chose to be notified of the share's new results (the projection still decides who gets one). */
+  resultSubscribers(shareId: string): string[] {
+    return (
+      this.sql
+        .prepare("select user_id as u from share_subscriptions where share_id = ? and notify_results = 1")
+        .all(shareId) as { u: string }[]
+    ).map((r) => r.u);
+  }
+
   private writeTargets(shareId: string, target: ShareAudience): void {
     if (target.audience !== "users") return;
     const add = this.sql.prepare("insert or ignore into share_targets (share_id, user_id) values (?, ?)");

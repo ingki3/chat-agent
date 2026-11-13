@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { Message } from "./chat.js";
+import { Conversation, Message } from "./chat.js";
 import { UploadedFile } from "./files.js";
 import { Artifact } from "./artifacts.js";
 import { Source } from "./sources.js";
@@ -66,6 +66,13 @@ export const Share = z.object({
   /** The chosen accounts (`users`), or every family account it reaches right now (`family`). */
   targets: z.array(z.object({ id: z.string(), name: z.string() })),
   boundaryMessageId: z.string().nullable(),
+  /**
+   * Read receipts (#52, FR-14.6): the accounts listed in `targets` that opened it, with when they first and last
+   * did. An account not here has not opened it yet.
+   */
+  views: z.array(
+    z.object({ id: z.string(), name: z.string(), firstViewedAt: z.number(), lastViewedAt: z.number() }),
+  ),
   createdAt: z.number(),
   updatedAt: z.number(),
   revokedAt: z.number().nullable(),
@@ -83,6 +90,8 @@ export const IncomingShare = z.object({
   title: z.string(),
   ownerName: z.string(),
   createdAt: z.number(),
+  /** When the caller first opened it (null: not yet — the sidebar marks it new). */
+  viewedAt: z.number().nullable(),
 });
 export type IncomingShare = z.infer<typeof IncomingShare>;
 export const IncomingSharesQuery = z.object({ q: z.string().trim().max(200).optional() });
@@ -107,8 +116,31 @@ export const SharedView = z.object({
   files: z.array(UploadedFile),
   artifacts: z.array(Artifact.extend({ versions: z.array(z.number().int()) })),
   sources: z.array(Source),
+  /**
+   * The caller's own choices as a viewer (#52, FR-8.8): `notifyResults` for a shared schedule-result conversation —
+   * null for the owner's preview and for any other item (nothing to choose).
+   */
+  viewer: z.object({ notifyResults: z.boolean() }).nullable(),
+  /** The caller is the owner, previewing what the share shows (no fork, no receipt). */
+  own: z.boolean(),
 });
 export type SharedView = z.infer<typeof SharedView>;
+
+/** `PUT /api/shares/:id/subscription`: a viewer's "새 결과 알림 받기" for a shared schedule-result conversation. */
+export const ShareSubscriptionRequest = z.strictObject({ notifyResults: z.boolean() });
+export type ShareSubscriptionRequest = z.infer<typeof ShareSubscriptionRequest>;
+
+/**
+ * `POST /api/shares/:id/fork` — "이어서 대화하기" (#52, FR-14.3·14.4): the share's projection copied into a new
+ * conversation of the caller (messages, files, artifact versions, cited sources — projected ones only), on the
+ * caller's own default runtime. No runtime session, connection or secret of the original comes along.
+ */
+export const ForkResponse = z.object({ conversation: Conversation });
+export type ForkResponse = z.infer<typeof ForkResponse>;
+
+/** Shown next to "이어서 대화하기". */
+export const SHARE_FORK_NOTICE =
+  "공유받은 내용을 내 대화로 복사해요. 원래 대화는 바뀌지 않고, 내 기본 런타임과 내 연결로 이어가요.";
 
 /** Shown wherever a share is changed or revoked (FR-14.2): what a revoke cannot take back. */
 export const SHARE_REVOKE_NOTICE =

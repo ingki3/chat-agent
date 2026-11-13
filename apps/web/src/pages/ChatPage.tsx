@@ -331,6 +331,11 @@ export function ChatPage() {
       </TopBar>
       <div className="thread" data-testid="thread" ref={scroller}>
         <div className="col" ref={content}>
+          {conv.data?.kind === "fork" && (
+            <p className="notice info small" data-testid="fork-notice">
+              가족이 공유한 내용을 복사한 내 대화예요. 여기서 이어가도 원래 대화는 바뀌지 않아요.
+            </p>
+          )}
           {messages.hasNextPage && (
             <button
               type="button"

@@ -52,7 +52,9 @@
 | `GET /api/artifacts/:id/access?version=n` (아티팩트 화면의 접근 SSE — `/a/:id`·패널) | 연결됨 (주인은 `owner` 후 바로 종료. 공유받은 사람은 아티팩트를 볼 수 없게 되면 `revoked`, 아티팩트는 아직 보이지만 화면의 버전이 빠지면 `scope {versions}`) |
 | `GET /api/files/:id/extract` (#48 추출 글) | 연결됨 (`/content`와 같은 검사 — `p.files`의 파일만). 파일 도구(`file_list`·`file_read`·`file_cite`)는 run 안에서만 돌고 run은 주인만 만든다 — 해당 없음 |
 | `GET /api/conversations/:id/references` · `…/references/download` (#26) | 연결됨 (투영의 메시지와 그 출처만 — `ReferencesView`. `.docx`는 작업자가 끝난 뒤 투영을 다시 읽어, 그사이 철회되면 403·좁아지면 다시 만든다) |
-| 포크 "이어서 대화하기" (#52) | 미연결 — 다음 이슈. `bundle(share, p)`를 복사한다(메시지·파일·버전·출처 모두 투영된 것만) |
+| 포크 "이어서 대화하기" `POST /api/shares/:id/fork` (#52) | 연결됨 (`forkSource` = `bundle(share, p)` + 보이는 버전의 내용 + 투영 파일의 바이트. 잠금·트랜잭션 안에서 투영을 다시 읽는다. 출처는 `Source`만 — 본문 없음. docs/ops.md §36) |
+| 예약 결과 알림 받기 `PUT /api/shares/:id/subscription` · 알림 발송 (#52) | 연결됨 (알림은 지금 투영에 그 결과 메시지가 있는 사람에게만, 공유 본문으로 — `shares/notify.ts`) |
+| 열람 기록 (`GET /api/shares/:id/view`의 `share_views`) (#52) | 연결됨 (투영이 있는 공유받은 사람의 열람만 기록. 주인 미리보기·거부는 기록 안 함) |
 | 대화 목록 검색 `GET /api/conversations?q=` | 해당 없음 — 본인 대화만 |
 
 ## 쓰기·런타임·MCP

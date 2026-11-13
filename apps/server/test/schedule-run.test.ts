@@ -11,6 +11,7 @@ import {
 } from "@agentlee/shared";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
+import { notifyResultSubscribers } from "../src/shares/notify.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb, type Db } from "../src/db/client.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
@@ -91,6 +92,8 @@ async function world(
     conversations: app.conversations!,
     runs: app.runs!,
     notifications: () => app.notifications,
+    // As app.ts wires it (#52): the viewers of a shared result conversation who chose "알림 받기".
+    sharedResult: (r) => notifyResultSubscribers(app.sharing!, app.notifications, r),
     runTimeoutMs: o.runTimeoutMs ?? 20_000,
   });
   box.h = o.wrap ? o.wrap(inner) : inner;
@@ -227,6 +230,44 @@ describe("schedule runs in the result conversation (#56)", () => {
       messageId: msgs[1]!.id,
     });
     expect(Conversation.parse(seen.json())).toMatchObject({ newResult: false, newResultMessageId: null });
+  });
+
+  it("a viewer of the shared result conversation who chose it is told too, with the shared body (#52, FR-8.8)", async () => {
+    const t = await world({ script: () => reply("오늘의 결과 비밀 요약", "둘째 줄") });
+    const { s, run } = await runNow(t);
+    await until(() => t.finished(run.id) && t.runRow(run.id).notified_at !== null);
+    const convId = Schedule.parse(
+      (await t.req("owner", "GET", `/api/schedules/${s.id}`)).json(),
+    ).conversationId!;
+    const share = await t.req("owner", "POST", `/api/conversations/${convId}/shares`, {
+      target: { audience: "users", userIds: [t.f!.users.shared.id, t.f!.users.stranger.id] },
+      mode: "live",
+    });
+    expect(share.statusCode).toBe(201);
+    const shareId = share.json<{ id: string }>().id;
+    const sub = await t.app.inject({
+      method: "PUT",
+      url: `/api/shares/${shareId}/subscription`,
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f!.cookies.shared,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+      payload: { notifyResults: true },
+    });
+    expect(sub.statusCode).toBe(200);
+    const again = await t.req("owner", "POST", `/api/schedules/${s.id}/run`);
+    const run2 = ScheduleRun.parse(again.json().run);
+    await until(() => t.finished(run2.id) && t.runRow(run2.id).notified_at !== null);
+    const theirs = t.notes(t.f!.users.shared.id);
+    expect(theirs).toHaveLength(1);
+    expect(theirs[0]).toMatchObject({ kind: "schedule_succeeded", url: `/shared/${shareId}` });
+    expect(theirs[0]!.body).not.toContain("비밀 요약");
+    // Shared with them too, but not chosen: nothing.
+    expect(t.notes(t.f!.users.stranger.id)).toEqual([]);
+    // The owner still gets theirs, one per run.
+    expect(t.notes(t.f!.users.owner.id)).toHaveLength(2);
   });
 
   it("each run is a new message of the same conversation; the finance check applies to the result (#30)", async () => {

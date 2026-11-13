@@ -1114,3 +1114,86 @@ export const shareSnapshots = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.shareId, t.itemType, t.itemId, t.revision] })],
 );
+
+/**
+ * Read receipts (#52, FR-14.6): when each account a share reaches first and last opened it (`GET /api/shares/:id/view`
+ * as a viewer, through the projection). The owner sees, per account it reaches now, whether and when it was opened.
+ * Gone with the share or the account.
+ */
+export const shareViews = sqliteTable(
+  "share_views",
+  {
+    shareId: text("share_id")
+      .notNull()
+      .references(() => shares.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    firstViewedAt: integer("first_viewed_at").notNull(),
+    lastViewedAt: integer("last_viewed_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.shareId, t.userId] }), index("share_views_user_idx").on(t.userId)],
+);
+
+/**
+ * A viewer's choice to be notified of new results of a shared schedule-result conversation (#52, FR-8.8). Off unless
+ * chosen. Only a result inside that viewer's projection notifies them, with the fixed shared body (FR-13.5).
+ */
+export const shareSubscriptions = sqliteTable(
+  "share_subscriptions",
+  {
+    shareId: text("share_id")
+      .notNull()
+      .references(() => shares.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    notifyResults: integer("notify_results", { mode: "boolean" }).notNull().default(false),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.shareId, t.userId] })],
+);
+
+/**
+ * "이어서 대화하기" (#52, FR-14.3·14.4): a copy of what a share showed, made into a conversation of the person it was
+ * shared with. `conversationId` is the copy (the fork goes with it); the source columns are plain ids, no foreign
+ * key — the original may be deleted, the copy stays (#54: "포크 사본은 남음"). Provenance for #54's cascade.
+ */
+export const forks = sqliteTable(
+  "forks",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    shareId: text("share_id").notNull(),
+    sourceConversationId: text("source_conversation_id").notNull(),
+    sourceItemKind: text("source_item_kind", { enum: ["conversation", "artifact"] }).notNull(),
+    sourceItemId: text("source_item_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    index("forks_conversation_idx").on(t.conversationId),
+    index("forks_source_idx").on(t.sourceConversationId),
+  ],
+);
+
+/** Each item a fork copied: the original's id and the copy's (new rows owned by the forker), by type (#52). */
+export const forkItems = sqliteTable(
+  "fork_items",
+  {
+    forkId: text("fork_id")
+      .notNull()
+      .references(() => forks.id, { onDelete: "cascade" }),
+    itemType: text("item_type", { enum: ["message", "file", "artifact", "source"] }).notNull(),
+    sourceId: text("source_id").notNull(),
+    copyId: text("copy_id").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.forkId, t.itemType, t.sourceId] }),
+    index("fork_items_source_idx").on(t.itemType, t.sourceId),
+  ],
+);

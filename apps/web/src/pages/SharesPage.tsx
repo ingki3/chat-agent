@@ -1,65 +1,20 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SHARE_REVOKE_NOTICE, type PublicPart, type Share, type ShareAudience } from "@agentlee/shared";
+import { SHARE_FORK_NOTICE, type PublicPart, type SharedView } from "@agentlee/shared";
 import { ApiError, conversations, errorText, files, shares, SHARES_KEY } from "../api.js";
+import { CONVERSATIONS_KEY } from "../Sidebar.js";
+import {
+  MODE_LABEL,
+  MyShare,
+  TargetPicker,
+  targetOf,
+  when,
+  type TargetDraft,
+} from "../shares/ShareDialog.js";
 import { Parts } from "../chat/Parts.js";
 import { ArtifactOpenContext } from "../artifacts/ArtifactPanel.js";
 import { TopBar } from "../Shell.js";
-
-const MODE_LABEL = { live: "살아 있는 공유", snapshot: "이 메시지까지" } as const;
-
-/**
- * Who a share is for while it is being edited: the whole family, or the accounts ticked — possibly none yet. None is
- * never "the whole family" (unticking the last person must not widen a share): it just cannot be saved.
- */
-export type TargetDraft = { audience: "family" } | { audience: "users"; userIds: string[] };
-/** The draft as the API takes it, or undefined while no one is chosen. */
-export const targetOf = (d: TargetDraft): ShareAudience | undefined =>
-  d.audience === "family"
-    ? d
-    : d.userIds.length
-      ? { audience: "users", userIds: d.userIds as [string, ...string[]] }
-      : undefined;
-const NO_ONE = "공유할 가족을 한 명 이상 고르거나 '가족 전체'를 고르세요.";
-
-/** Who a share is for: "가족 전체" only when picked, or the family accounts ticked (ids from `/api/share-targets`). */
-function TargetPicker({ value, onChange }: { value: TargetDraft; onChange: (t: TargetDraft) => void }) {
-  const targets = useQuery({ queryKey: [...SHARES_KEY, "targets"], queryFn: shares.targets });
-  const chosen = value.audience === "users" ? value.userIds : [];
-  const toggle = (id: string, on: boolean) =>
-    onChange({ audience: "users", userIds: on ? [...chosen, id] : chosen.filter((x) => x !== id) });
-  return (
-    <fieldset className="row wrap" data-testid="share-targets">
-      <legend className="small muted">누구에게</legend>
-      <label>
-        <input
-          type="checkbox"
-          checked={value.audience === "family"}
-          onChange={(e) =>
-            onChange(e.target.checked ? { audience: "family" } : { audience: "users", userIds: [] })
-          }
-        />{" "}
-        가족 전체
-      </label>
-      {(targets.data ?? []).map((t) => (
-        <label key={t.id}>
-          <input
-            type="checkbox"
-            checked={chosen.includes(t.id)}
-            onChange={(e) => toggle(t.id, e.target.checked)}
-          />{" "}
-          {t.name}
-        </label>
-      ))}
-      {!targetOf(value) && (
-        <p className="notice warn small" data-testid="share-no-target">
-          {NO_ONE}
-        </p>
-      )}
-    </fieldset>
-  );
-}
 
 /** "가족에게 공유" for one of my conversations: live, or "이 메시지까지" (a frozen snapshot, decision #3). */
 function ShareForm() {
@@ -154,55 +109,6 @@ function ShareForm() {
   );
 }
 
-/** One of my shares: change who it is for, or turn it off (with what a revoke cannot take back). */
-function MyShare({ s }: { s: Share }) {
-  const qc = useQueryClient();
-  const [target, setTarget] = useState<TargetDraft>(
-    s.audience === "users"
-      ? { audience: "users", userIds: s.targets.map((t) => t.id) }
-      : { audience: "family" },
-  );
-  const done = () => qc.invalidateQueries({ queryKey: SHARES_KEY });
-  const audience = targetOf(target);
-  const change = useMutation({ mutationFn: () => shares.setTarget(s.id, audience!), onSuccess: done });
-  const revoke = useMutation({ mutationFn: () => shares.revoke(s.id), onSuccess: done });
-  return (
-    <li className="share-item" data-testid="my-share">
-      <div className="row wrap">
-        <span className="badge">{MODE_LABEL[s.mode]}</span>
-        <span>{s.audience === "family" ? "가족 전체" : s.targets.map((t) => t.name).join(", ")}</span>
-        <span className="muted small">{new Date(s.createdAt).toLocaleString("ko-KR")}</span>
-      </div>
-      {s.revokedAt === null ? (
-        <>
-          <TargetPicker value={target} onChange={setTarget} />
-          <div className="row wrap">
-            <button type="button" onClick={() => change.mutate()} disabled={!audience || change.isPending}>
-              대상 바꾸기
-            </button>
-            <button
-              type="button"
-              className="danger"
-              onClick={() => revoke.mutate()}
-              disabled={revoke.isPending}
-            >
-              공유 끄기
-            </button>
-          </div>
-          <p className="muted small">{SHARE_REVOKE_NOTICE}</p>
-        </>
-      ) : (
-        <p className="notice info" data-testid="share-revoked-notice">
-          공유를 껐어요. {SHARE_REVOKE_NOTICE}
-        </p>
-      )}
-      {(change.isError || revoke.isError) && (
-        <p className="notice warn">{errorText(change.error ?? revoke.error)}</p>
-      )}
-    </li>
-  );
-}
-
 function MyShares() {
   const list = useQuery({ queryKey: ["conversations", "share-picker"], queryFn: () => conversations.list() });
   const ids = (list.data?.items ?? []).map((c) => c.id);
@@ -264,8 +170,9 @@ function Incoming() {
         {list.data?.map((s) => (
           <li key={s.id} data-testid="incoming-share">
             <Link to={`/shared/${encodeURIComponent(s.id)}`}>{s.title || "(제목 없음)"}</Link>{" "}
+            {s.viewedAt === null && <span className="badge new-share">새로 공유됨</span>}{" "}
             <span className="muted small">
-              {s.ownerName} · {MODE_LABEL[s.mode]} · {new Date(s.createdAt).toLocaleString("ko-KR")}
+              {s.ownerName} · {MODE_LABEL[s.mode]} · {when(s.createdAt)}
             </span>
           </li>
         ))}
@@ -275,8 +182,8 @@ function Incoming() {
 }
 
 /**
- * `/shared` — family sharing (#29): the minimum to share, change, revoke and open what is shared with me. The
- * full share screens (from the conversation menu, read receipts, "이어서 대화하기") are #52.
+ * `/shared` — family sharing (#29, #52): what is shared with me, a share of one of my conversations, and every share
+ * I made with who opened it. The same dialog opens from a conversation's and an artifact's menu ("가족에게 공유").
  */
 export function SharesPage() {
   return (
@@ -288,6 +195,59 @@ export function SharesPage() {
         <MyShares />
       </div>
     </>
+  );
+}
+
+/**
+ * "이어서 대화하기" (#52, FR-14.3·14.4): the share as I see it copied into a new conversation of mine (an artifact
+ * share: a conversation holding my copy of the artifact, to change it there), then opened.
+ */
+function ForkBar({ id, d }: { id: string; d: SharedView }) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const fork = useMutation({
+    mutationFn: () => shares.fork(id),
+    onSuccess: async (c) => {
+      await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      void navigate(`/c/${encodeURIComponent(c.id)}`);
+    },
+  });
+  const artifact = d.share.itemKind === "artifact";
+  return (
+    <div className="fork-bar" data-testid="fork-bar">
+      <button
+        type="button"
+        className="primary"
+        data-testid="fork"
+        disabled={fork.isPending}
+        onClick={() => fork.mutate()}
+      >
+        {fork.isPending ? "복사하는 중…" : artifact ? "내 것으로 복사해서 고치기" : "이어서 대화하기"}
+      </button>
+      <span className="muted small">{SHARE_FORK_NOTICE}</span>
+      {fork.isError && <p className="notice warn">{errorText(fork.error)}</p>}
+    </div>
+  );
+}
+
+/** A shared schedule's result conversation (FR-8.8): whether I am told of its new results. */
+function NotifyToggle({ id, on }: { id: string; on: boolean }) {
+  const qc = useQueryClient();
+  const set = useMutation({
+    mutationFn: (next: boolean) => shares.setNotifyResults(id, next),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...SHARES_KEY, "view", id] }),
+  });
+  return (
+    <label className="row small" data-testid="share-notify">
+      <input
+        type="checkbox"
+        checked={set.isPending ? !!set.variables : on}
+        disabled={set.isPending}
+        onChange={(e) => set.mutate(e.target.checked)}
+      />
+      새 결과가 생기면 알림 받기
+      {set.isError && <span className="notice warn">{errorText(set.error)}</span>}
+    </label>
   );
 }
 
@@ -343,9 +303,10 @@ export function SharedViewPage({ id }: { id: string }) {
       </TopBar>
       <div className="page" data-testid="shared-view">
         <p className="muted small">
-          {d.share.ownerName} 님이 {new Date(d.share.createdAt).toLocaleString("ko-KR")}에 공유했어요 · 읽기
-          전용
+          {d.share.ownerName} 님이 {when(d.share.createdAt)}에 공유했어요 · 읽기 전용
         </p>
+        {!d.own && <ForkBar id={id} d={d} />}
+        {d.viewer && <NotifyToggle id={id} on={d.viewer.notifyResults} />}
         {/* Artifact cards open the shared artifact's own page (there is no panel here). */}
         <ArtifactOpenContext.Provider
           value={(artifactId) => void navigate(`/a/${encodeURIComponent(artifactId)}`)}

@@ -386,6 +386,104 @@ export class FileStore {
     });
   }
 
+  /**
+   * A fork's copy of a stored file (#52, "이어서 대화하기"): its bytes copied into the new conversation's folder (never
+   * a link to the original — the copy outlives it, #54) and a new row owned by `to.userId`, without an upload id and
+   * with no message yet (the fork links it in the same transaction). Synchronous; the caller holds the file-write lock
+   * and the transaction, and calls `discard` for every copy if that transaction does not commit. Undefined when the
+   * original's bytes cannot be read or are not what its row says (nothing is kept then).
+   */
+  copyFrom(src: FileRow, to: { userId: string; conversationId: string }): FileRow | undefined {
+    const fd = this.open(src);
+    if (fd === undefined) return undefined;
+    const row: FileRow = {
+      id: crypto.randomUUID(),
+      userId: to.userId,
+      conversationId: to.conversationId,
+      messageId: null,
+      uploadId: null,
+      name: scrubKnown(cleanName(src.name)) || `file.${src.kind}`,
+      kind: src.kind,
+      mediaType: FILE_KINDS[src.kind].mediaType,
+      bytes: src.bytes,
+      sha256: src.sha256,
+      createdAt: this.now(),
+    };
+    let out: number | undefined;
+    let written = false;
+    try {
+      const dir = this.storeDir(row.userId, row.conversationId, true);
+      if (!dir) throw new StoreLinkError();
+      out = fs.openSync(
+        path.join(dir, row.id),
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+      written = true;
+      const hash = crypto.createHash("sha256");
+      const buf = Buffer.allocUnsafe(1 << 16);
+      let total = 0;
+      for (;;) {
+        const n = fs.readSync(fd, buf, 0, buf.length, null);
+        if (n === 0) break;
+        hash.update(buf.subarray(0, n));
+        let off = 0;
+        while (off < n) off += fs.writeSync(out, buf, off, n - off);
+        total += n;
+      }
+      fs.closeSync(out);
+      out = undefined;
+      if (total !== src.bytes || hash.digest("hex") !== src.sha256) {
+        this.unlinkAndPrune(row);
+        return undefined;
+      }
+    } catch (e) {
+      if (out !== undefined) fs.closeSync(out);
+      if (written) this.unlinkAndPrune(row);
+      throw e;
+    } finally {
+      fs.closeSync(fd);
+    }
+    try {
+      const added =
+        this.db.$client
+          .prepare(
+            `INSERT INTO files (id, user_id, conversation_id, message_id, upload_id, name, kind, media_type, bytes,
+               sha256, created_at)
+             SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?
+             WHERE (SELECT count(*) FROM files WHERE conversation_id = ?) < ?`,
+          )
+          .run(
+            row.id,
+            row.userId,
+            row.conversationId,
+            row.name,
+            row.kind,
+            row.mediaType,
+            row.bytes,
+            row.sha256,
+            row.createdAt,
+            row.conversationId,
+            FILE_LIMITS.perConversation,
+          ).changes === 1;
+      if (!added) throw new FileLimitError();
+    } catch (e) {
+      this.unlinkAndPrune(row);
+      throw e;
+    }
+    return row;
+  }
+
+  /** Removes a copy's bytes (`copyFrom`) whose transaction did not commit. */
+  discard(f: Pick<FileRow, "userId" | "conversationId" | "id">): void {
+    this.unlinkAndPrune(f);
+  }
+
+  /** Links a fork's copied file to its copied message (`copyFrom` leaves none), in the fork's transaction. */
+  linkCopy(id: string, messageId: string): void {
+    this.db.update(files).set({ messageId }).where(eq(files.id, id)).run();
+  }
+
   /** Files the agent made in the reply `messageId` (#49), oldest first. */
   generatedOf(conversationId: string, messageId: string): FileRow[] {
     return this.db

@@ -1,8 +1,19 @@
 import { useDeferredValue, useState, type RefObject } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, useMatch, useNavigate } from "react-router";
-import type { AuthState, AuthUser, Conversation } from "@agentlee/shared";
-import { auth, conversations, errorText, notifications, NOTIFICATIONS_KEY, usage, USAGE_KEY } from "./api.js";
+import type { AuthState, AuthUser, Conversation, IncomingShare } from "@agentlee/shared";
+import {
+  auth,
+  conversations,
+  errorText,
+  notifications,
+  NOTIFICATIONS_KEY,
+  shares,
+  SHARES_KEY,
+  usage,
+  USAGE_KEY,
+} from "./api.js";
+import { ShareDialog, when } from "./shares/ShareDialog.js";
 import { unsubscribeOnSignOut } from "./push.js";
 import { usageLine } from "./usage-format.js";
 
@@ -116,10 +127,7 @@ export function Sidebar({
       {items?.length === 0 && (
         <p className="muted small pad">{query ? "찾는 대화가 없어요." : "아직 대화가 없어요."}</p>
       )}
-      <div className="grp">가족 공유</div>
-      <NavLink className="item" to="/shared">
-        👪 공유받은 항목
-      </NavLink>
+      <SharedWithMe />
       <div className="grp">바로가기</div>
       <NavLink className="item" to="/schedules">
         ⏰ 예약
@@ -154,6 +162,53 @@ export function Sidebar({
   );
 }
 
+/**
+ * The "가족 공유" bundle (FR-2.4, FR-14.5·14.6): what family members shared with me — who shared it and when, and
+ * "새로" until I first open it. Looked at every minute and on focus (a share notification may be off).
+ */
+function SharedWithMe() {
+  const list = useQuery({
+    queryKey: [...SHARES_KEY, "incoming", ""],
+    queryFn: () => shares.incoming(""),
+    refetchInterval: 60_000,
+  });
+  const items = list.data ?? [];
+  return (
+    <div className="shared-side" data-testid="sidebar-shared" aria-label="가족 공유">
+      <div className="grp">가족 공유</div>
+      {items.slice(0, 20).map((s) => (
+        <SharedItem key={s.id} s={s} />
+      ))}
+      <NavLink className="item" to="/shared" end>
+        👪 {items.length ? "모두 보기 · 내가 공유한 것" : "공유받은 항목"}
+      </NavLink>
+    </div>
+  );
+}
+
+function SharedItem({ s }: { s: IncomingShare }) {
+  const active = useMatch(`/shared/${s.id}`);
+  return (
+    <div className={`conv${active ? " on" : ""}`}>
+      <Link to={`/shared/${encodeURIComponent(s.id)}`} className="conv-link" data-testid="shared-item">
+        <span className="dot none" aria-hidden="true" />
+        <span className="t">
+          {s.itemKind === "artifact" ? "🧩 " : ""}
+          {s.title || "(제목 없음)"}
+          <span className="sub">
+            {s.ownerName} · {when(s.createdAt)}
+          </span>
+        </span>
+        {s.viewedAt === null && (
+          <span className="badge new-share" data-testid="shared-new" aria-label="새로 공유됨">
+            새로
+          </span>
+        )}
+      </Link>
+    </div>
+  );
+}
+
 function ConvItem({ c }: { c: Conversation }) {
   const active = useMatch(`/c/${c.id}`);
   const runtime = c.lastRuntime ? RUNTIME_LABEL[c.lastRuntime] : undefined;
@@ -181,6 +236,7 @@ function ConvItem({ c }: { c: Conversation }) {
 /** ⋯ menu: rename, pin, delete (with a confirmation that says what goes). */
 export function ConvMenu({ c }: { c: Conversation }) {
   const [open, setOpen] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const qc = useQueryClient();
   const navigate = useNavigate();
   const refresh = () => qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
@@ -227,10 +283,26 @@ export function ConvMenu({ c }: { c: Conversation }) {
           <button type="button" role="menuitem" onClick={() => act.mutate("pin")}>
             {c.pinned ? "고정 해제" : "고정"}
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              setSharing(true);
+            }}
+          >
+            가족에게 공유
+          </button>
           <button type="button" role="menuitem" className="danger" onClick={() => act.mutate("delete")}>
             삭제
           </button>
         </div>
+      )}
+      {sharing && (
+        <ShareDialog
+          item={{ kind: "conversation", id: c.id, title: c.title }}
+          onClose={() => setSharing(false)}
+        />
       )}
     </div>
   );
