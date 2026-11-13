@@ -167,7 +167,7 @@ const MAX_NESTED = 4;
 //      escape whose meaning differs between languages (see escapeAt), or a template substitution `${…}` is
 //      unknown: it may spell anything, so its value is hidden. For a bare token this applies only where a key
 //      can start (atKeyPosition: start of text or line, after `{` `,` `;` `&` `?` or a statement word such as
-//      `export`), not inside a regex group or a path. Bash `$'…'` holds a whole assignment and is read as one.
+//      `export`), not inside a regex group or a path. Bash `$'…'` holds a whole assignment and is read as one (its `=` may be an escape too: `\x3d`, `\075`).
 //      A computed key `[…]` that is not one plain string literal is unknown too. A comment whose end is not
 //      found within its window means what follows cannot be known: fail closed from there. In short — whenever
 //      the scanner cannot be sure what the key is, it is unknown, never "not a key". This is what makes the rule independent of
@@ -398,6 +398,8 @@ const isQuoteChar = (c: number) => c === 34 || c === 39 || c === 96;
  * with `quotes`, also quotes (`"` `'` `` ` ``) and backslashes — and whether a quote was among them.
  */
 const COMMENT_MAX = 512;
+/** YAML `''` merges read into one quoted key, at most (keys are short; a run of quotes stays linear). */
+const YAML_MERGES = 8;
 /** One plain string literal and nothing else (a computed key we can read). */
 const SIMPLE_LITERAL = /^\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.|\$(?!\{))*`)\s*$/;
 const STATEMENT_WORDS = new Set([
@@ -528,6 +530,25 @@ function readKey(raw: string): { name: string; unknown: boolean } {
 }
 
 /**
+ * The first `=` in the body of a Bash `$'…'` string, written plainly or as an escape that decodes to it (`\x3d`,
+ * `\075`, `\u003d`): its offset and length, or [-1, 0]. One pass over the body.
+ */
+function ansiCEquals(raw: string): [at: number, length: number] {
+  for (let i = 0; i < raw.length;) {
+    const c = raw.charCodeAt(i);
+    if (c === 61) return [i, 1];
+    if (c !== 92) {
+      i++;
+      continue;
+    }
+    const e = escapeAt(raw, i);
+    if (e && !e.unknown && e.decoded === "=") return [i, e.length];
+    i += e && !e.unknown ? e.length : 2;
+  }
+  return [-1, 0];
+}
+
+/**
  * Pass C on one layer `d` (with `origin`, the layer-0 offset of each character; `n0` the length of layer 0).
  * Returns the earliest layer-0 offset to hide from (or -1), and the free-text values to hide (layer-0 ranges).
  */
@@ -559,19 +580,22 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
       if (close < 0) break;
       let raw = d.slice(open + 1, close);
       // YAML single-quoted style: `''` is one quote inside the string (`'pass''word': x` has the key pass'word).
-      while (quote === 39 && d.charCodeAt(close + 1) === 39) {
+      // A key is short: only so far (a run of quotes `''''…` was otherwise rejoined from every quote — quadratic).
+      for (let merges = 0; quote === 39 && d.charCodeAt(close + 1) === 39; merges++) {
         const more = next[close + 2]!;
-        if (more < 0) break;
+        if (more < 0 || merges >= YAML_MERGES || more - open > COMMENT_MAX) break;
         raw += "'" + d.slice(close + 2, more);
         close = more;
       }
       // Bash ANSI-C quoting, `$'…'`: the quotes hold the whole assignment (`export $'\560assword=x'`).
+      // The `=` may itself be an escape there (`$'\560assword\x3dhunter2'`, `\075`, #98): Bash decodes it first.
       if (quote === 39 && d.charCodeAt(open - 1) === 36) {
-        const eq = raw.indexOf("=");
+        const [eq, eqLen] = ansiCEquals(raw);
         if (eq > 0) {
           const key = readKey(raw.slice(0, eq));
-          if ((key.unknown || isSecretKey(key.name)) && !tagged(open + 2 + eq)) {
-            hideFrom(open + 2 + eq);
+          const after = open + 1 + eq + eqLen;
+          if ((key.unknown || isSecretKey(key.name)) && !tagged(after)) {
+            hideFrom(after);
             break;
           }
         }
@@ -598,38 +622,57 @@ function scanLayer(d: string, origin: Int32Array, n0: number): { fire: number; r
     }
   }
 
-  // C. Computed keys `[…]:` where a key starts — after `{` or `,` (comments between allowed), directly inside an
-  // object literal's braces: anything but one plain string literal inside the brackets (`[("a")]`,
-  // `["pa" + "ss"]`, `` [`a${b}`] ``) computes the key — unknown, so fail closed. Not in a regex character
-  // class (`/a,[b]:c/`) or a Markdown link definition (`[guide]: https://…`): no object brace is open there.
-  // Brackets are matched in one pass (a stack), so no `[` is ever scanned twice.
-  const stack: { c: number; at: number; inObject: boolean }[] = [];
-  for (let k = 0; k < n; k++) {
-    const c = d.charCodeAt(k);
-    if (c === 123 || c === 40 || c === 91) {
-      stack.push({ c, at: k, inObject: stack.at(-1)?.c === 123 });
-      continue;
-    }
-    if (c !== 125 && c !== 41 && c !== 93) continue;
-    const want = c === 125 ? 123 : c === 41 ? 40 : 91;
-    if (stack.at(-1)?.c !== want) continue; // unbalanced: ignored
-    const top = stack.pop()!;
-    if (c === 93) {
-      const open = top.at;
-      if (!top.inObject) continue;
-      const b = gapBefore(d, open - 1);
-      const before = b < 0 ? -1 : d.charCodeAt(b);
-      if (before !== 123 && before !== 44) continue;
-      // One plain string literal: the quoted pass reads it (only short contents are looked at).
-      if (k - open <= COMMENT_MAX && SIMPLE_LITERAL.test(d.slice(open + 1, k))) continue;
-      const [g, , unclosed] = gapEnd(d, k + 1, false);
-      if (unclosed) {
-        hideFrom(g);
+  // C. Computed keys `[…]:` where a key starts — after `{` or `,` (comments between allowed, `/* … */` or a `//`
+  // line comment), directly inside an object literal's braces: anything but one plain string literal inside the
+  // brackets (`[("a")]`, `["pa" + "ss"]`, `` [`a${b}`] ``) computes the key — unknown, so fail closed. Not in a
+  // regex character class (`/a,[b]:c/`) or a Markdown link definition (`[guide]: https://…`): no object brace is
+  // open there. Brackets are matched with a stack, twice: once over every character, and once skipping short
+  // one-line string literals inside a candidate key's brackets (a `[` or `]` inside `["pa[ss" + "word"]` must not
+  // break the pairing, #98; only there — outside, a quote may be a wrapping layer's or an apostrophe). Each pass is
+  // one walk, so no `[` is ever scanned twice by a pass.
+  // (The second walk only when the first met a quote inside such brackets.)
+  let quoteInKey = false;
+  for (const skipStrings of [false, true]) {
+    if (skipStrings && !quoteInKey) break;
+    const stack: { c: number; at: number; inObject: boolean }[] = [];
+    let inKey = 0; // candidate key brackets open on the stack
+    for (let k = 0; k < n; k++) {
+      const c = d.charCodeAt(k);
+      if (inKey > 0 && isQuoteChar(c)) {
+        quoteInKey = true;
+        if (!skipStrings) continue;
+        const end = shortLiteralEnd(d, k);
+        if (end > k) k = end;
         continue;
       }
-      const sep = separatorAt(d, g);
-      if (!sep || tagged(g + sep)) continue;
-      hideFrom(g + sep);
+      if (c === 123 || c === 40 || c === 91) {
+        const inObject = stack.at(-1)?.c === 123;
+        if (c === 91 && inObject) inKey++;
+        stack.push({ c, at: k, inObject });
+        continue;
+      }
+      if (c !== 125 && c !== 41 && c !== 93) continue;
+      const want = c === 125 ? 123 : c === 41 ? 40 : 91;
+      if (stack.at(-1)?.c !== want) continue; // unbalanced: ignored
+      const top = stack.pop()!;
+      if (c === 93) {
+        const open = top.at;
+        if (!top.inObject) continue;
+        inKey--;
+        const b = gapBefore(d, open - 1);
+        const before = b < 0 ? -1 : d.charCodeAt(b);
+        if (before !== 123 && before !== 44) continue;
+        // One plain string literal: the quoted pass reads it (only short contents are looked at).
+        if (k - open <= COMMENT_MAX && SIMPLE_LITERAL.test(d.slice(open + 1, k))) continue;
+        const [g, , unclosed] = gapEnd(d, k + 1, false);
+        if (unclosed) {
+          hideFrom(g);
+          continue;
+        }
+        const sep = separatorAt(d, g);
+        if (!sep || tagged(g + sep)) continue;
+        hideFrom(g + sep);
+      }
     }
   }
 
@@ -829,16 +872,70 @@ function lineStart(d: string, k: number): boolean {
   );
 }
 
-/** The last non-gap character at or before `b`, stepping back over whitespace and `/* … *\/` comments. */
+/**
+ * The last non-gap character at or before `b`, stepping back over whitespace, `/* … *\/` comments and `//` line
+ * comments (#98: `{a: 1, // note⏎["pass" + "word"]: x}`). A line comment is only looked for on a line the step
+ * back crossed into, and only one that follows a `{` or `,` (or fills its line): a `//` in a string such as
+ * `"https://…"` is not taken for one.
+ */
 function gapBefore(d: string, b: number): number {
   // A few comments at most (keeps the scan linear); more than that and the bracket is not taken for a key.
   for (let comments = 0; comments < 4; comments++) {
-    while (b >= 0 && isGap(d.charCodeAt(b))) b--;
-    if (b < 1 || d.charCodeAt(b) !== 47 || d.charCodeAt(b - 1) !== 42) return b;
-    const from = Math.max(0, b - 1 - COMMENT_MAX);
-    const open = d.slice(from, b - 1).lastIndexOf("/*");
-    if (open < 0) return b;
-    b = from + open - 1;
+    let crossed = false;
+    while (b >= 0 && isGap(d.charCodeAt(b))) {
+      if (isLineBreak(d.charCodeAt(b))) crossed = true;
+      b--;
+    }
+    if (b >= 1 && d.charCodeAt(b) === 47 && d.charCodeAt(b - 1) === 42) {
+      const from = Math.max(0, b - 1 - COMMENT_MAX);
+      const open = d.slice(from, b - 1).lastIndexOf("/*");
+      if (open < 0) return b;
+      b = from + open - 1;
+      continue;
+    }
+    if (!crossed || b < 0) return b;
+    // The line holding `b` (its last COMMENT_MAX characters): a `//` after `{`, `,` or nothing ends it.
+    let ls = b;
+    while (ls > 0 && ls > b - COMMENT_MAX && !isLineBreak(d.charCodeAt(ls - 1))) ls--;
+    let found = -2;
+    // Searched within that line only (at most COMMENT_MAX characters): never the rest of the input (linear).
+    const line = d.slice(ls, b);
+    for (let r = line.indexOf("//"); r >= 0; r = line.indexOf("//", r + 1)) {
+      const c = ls + r;
+      let p = c - 1;
+      while (p >= ls && isGap(d.charCodeAt(p))) p--;
+      const pc = p >= ls ? d.charCodeAt(p) : -1;
+      if (pc === 123 || pc === 44) return p;
+      if (pc === -1) {
+        found = p; // a line that is only a comment: keep stepping back
+        break;
+      }
+    }
+    if (found === -2) return b;
+    b = found;
+  }
+  return -1;
+}
+
+const isLineBreak = (c: number) => c === 10 || c === 13 || c === 0x85 || c === 0x2028 || c === 0x2029;
+
+/**
+ * End (the closing quote) of the one-line string literal whose opening quote is at `k`, at most COMMENT_MAX
+ * characters on — or -1 when the quote is escaped, or no unescaped closing quote of the same character comes
+ * before the line ends. Linear over a walk: a quote that finds no end scanned only a window holding no other
+ * opening quote of its kind.
+ */
+function shortLiteralEnd(d: string, k: number): number {
+  const q = d.charCodeAt(k);
+  let b = k;
+  while (b > 0 && d.charCodeAt(b - 1) === 92) b--;
+  if ((k - b) % 2 === 1) return -1;
+  const stop = Math.min(d.length, k + 1 + COMMENT_MAX);
+  for (let p = k + 1; p < stop; p++) {
+    const c = d.charCodeAt(p);
+    if (c === q) return p;
+    if (isLineBreak(c)) return -1;
+    if (c === 92) p++;
   }
   return -1;
 }
