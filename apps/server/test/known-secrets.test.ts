@@ -439,7 +439,7 @@ describe("known secrets never leave the server (property)", () => {
     // The registry knows them all (and the run tokens are forgotten once their runs ended).
     for (const v of [gate, dart, sessionToken, stored]) expect(knownSecrets.list()).toContain(v);
     for (const s of rt.seen) expect(knownSecrets.list()).not.toContain(s.token);
-  });
+  }, 60_000); // many cases × encodings × chunk splits through a real app: slower than 5 s on loaded CI runners (#103)
 });
 
 describe("round 24", () => {

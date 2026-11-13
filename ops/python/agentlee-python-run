@@ -497,13 +497,26 @@ def procargs(pid):
     ctypes.set_errno(0)
     r = libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0)
     return r, ctypes.get_errno(), size.value
+def kuid(pid):
+    # KERN_PROC_PID: any uid may read it. struct kinfo_proc is 648 bytes; cr_uid at 420 (arm64 macOS).
+    mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+    buf = ctypes.create_string_buffer(1024)
+    size = ctypes.c_size_t(1024)
+    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value != 648:
+        return None
+    return int.from_bytes(buf.raw[420:424], "little")
 cr, ce, cs = procargs(os.getpid())
 if cr != 0 or cs == 0:
     print("uid=%d procargs=error control" % uid); sys.exit(0)
+su = kuid(sibling)
+if su is None:
+    print("uid=%d procargs=error sibling" % uid); sys.exit(0)
 tr, te, ts = procargs(sibling)
 if tr == 0 and ts:
     print("uid=%d procargs=readable" % uid)
-elif te == errno.EPERM:
+elif te in (errno.EPERM, errno.EINVAL) and su != uid and kuid(sibling) == su:
+    # A different uid gets EINVAL (size query) or EPERM — and so does a pid that is gone, so "blocked" also needs
+    # the kernel to still show the sibling with the same (other) uid (#122 finding).
     print("uid=%d procargs=blocked" % uid)
 else:
     print("uid=%d procargs=error errno=%d" % (uid, te))
