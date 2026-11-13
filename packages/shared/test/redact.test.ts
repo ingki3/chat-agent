@@ -1316,10 +1316,11 @@ describe("redactSecrets", () => {
       "\\u0022:",
       '\\\\\\"a\\\\\\":',
     ];
-    // Best of three: garbage collection and JIT pauses only ever add time.
-    const time = (input: string) => {
+    // Best of up to three: garbage collection and JIT pauses only ever add time. A measurement already under the
+    // bound needs no retry (the check is the same; on CI the retries made this take 150–260 s of a 240 s budget).
+    const time = (input: string, enough = 0) => {
       let best = Infinity;
-      for (let k = 0; k < 3; k++) {
+      for (let k = 0; k < 3 && best >= enough; k++) {
         const t0 = performance.now();
         redactString(input);
         redactString(`{${input}}`);
@@ -1328,9 +1329,9 @@ describe("redactSecrets", () => {
       return best;
     };
     for (const unit of inputs) {
-      time(fill(unit, MB / 16)); // warm up
+      time(fill(unit, MB / 16), Infinity); // warm up: once
       const eighth = time(fill(unit, MB / 8));
-      const full = time(fill(unit));
+      const full = time(fill(unit), Math.min(20 * Math.max(eighth, 10), ABS_MS));
       const what = `pattern unit ${JSON.stringify(unit)}: ${Math.round(eighth)} ms for 128 kB, ${Math.round(full)} ms for 1 MB`;
       // Linear: 8× the input takes about 8× the time; quadratic would be 64× (a review measured 15.3× for 4×).
       // The wide gap keeps this stable on a loaded machine. Small times are noisy: 10 ms floor.
@@ -1345,9 +1346,10 @@ describe("redactSecrets", () => {
       for (let k = 0; k < levels; k++) x = JSON.stringify(x);
       return x;
     };
-    const time = (input: string) => {
+    // Best of up to three, as above: no retry once under the bound.
+    const time = (input: string, enough = 0) => {
       let best = Infinity;
-      for (let k = 0; k < 3; k++) {
+      for (let k = 0; k < 3 && best >= enough; k++) {
         const t0 = performance.now();
         redactString(input);
         best = Math.min(best, performance.now() - t0);
@@ -1370,9 +1372,9 @@ describe("redactSecrets", () => {
       for (let levels = 0; levels <= 4; levels++) {
         const make = (n: number) =>
           "stdout: " + wrap("prefix " + unit.repeat(Math.ceil(n / unit.length)), levels);
-        time(make(16 << 10)); // warm up
+        time(make(16 << 10), Infinity); // warm up: once
         const small = time(make(32 << 10));
-        const large = time(make(256 << 10));
+        const large = time(make(256 << 10), Math.min(20 * Math.max(small, 10), ABS_MS));
         const what = `${JSON.stringify(unit)} at ${levels} levels: ${Math.round(small)} ms → ${Math.round(large)} ms`;
         // 8× the input: linear ≈ 8×, quadratic ≈ 64×.
         expect(large / Math.max(small, 10), what).toBeLessThan(20);
