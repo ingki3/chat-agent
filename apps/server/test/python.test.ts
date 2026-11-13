@@ -2256,6 +2256,10 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
       spawnSyncOk("/bin/chmod", ["+a", "user:nobody deny readsecurity", r.dir]);
       expect(access()?.reason).toMatch(new RegExp(`ACL denies readsecurity to the account at ${r.dir}$`));
       spawnSyncOk("/bin/chmod", ["-N", r.dir]);
+      // lstat asks readattr and readsecurity together: a readattr denial on a 0644 tree file fails it too.
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody deny readattr", deep]);
+      expect(access()?.reason).toMatch(/ACL denies readattr to the account at .*decoder\.py$/);
+      spawnSyncOk("/bin/chmod", ["-N", deep]);
       // A link in a tree: `ls -leRA` reads its own ACL too.
       const link = path.join(path.dirname(deep), "alias.py");
       fs.symlinkSync("decoder.py", link);
@@ -2263,6 +2267,15 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
       spawnSyncOk("/bin/chmod", ["-h", "+a", "user:nobody deny readsecurity", link]);
       expect(access()?.reason).toMatch(/ACL denies readsecurity to the account at .*alias\.py$/);
       fs.unlinkSync(link);
+      // The scratch root: search and add_subdirectory allowed, but the launcher's lstat of it would fail.
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody deny readsecurity", r.scratch]);
+      const sv = verify(r, "nobody");
+      expect(sv.ok).toBe(false);
+      expect(sv.checks.find((c) => c.name === "scratch traversal")?.reason).toMatch(
+        new RegExp(`ACL denies readsecurity to the account at ${r.scratch}$`),
+      );
+      expect(sv.checks.find((c) => c.name === "scratch write")?.ok).toBe(true);
+      spawnSyncOk("/bin/chmod", ["-a", "user:nobody deny readsecurity", r.scratch]);
       expect(verify(r, "nobody").ok).toBe(true);
     },
   );
@@ -2393,7 +2406,6 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
 describe.skipIf(!fs.existsSync("/usr/bin/perl"))("the launcher's account ACL evaluation (unit)", () => {
   type Case = {
     perm: string;
-    bit: number;
     mode: number;
     uid: number;
     gid: number;
@@ -2423,7 +2435,7 @@ my $a = $req->{acct};
 my %u = %{ $a->{uuids} };
 my $acct = { name => $a->{name}, uid => $a->{uid}, groups => { map { $_ => 1 } @{ $a->{groups} } },
   gids => { map { $_ => 1 } @{ $a->{gids} } }, uuid_id => sub { my $x = $u{$_[0]}; return $x ? @$x : () } };
-my @out = map { account_eval($acct, "/n", $_->{perm}, $_->{bit}, $_->{mode}, $_->{uid}, $_->{gid}, @{ $_->{acl} }) }
+my @out = map { account_eval($acct, "/n", $_->{perm}, $_->{mode}, $_->{uid}, $_->{gid}, @{ $_->{acl} }) }
   @{ $req->{cases} };
 print JSON::PP->new->encode(\\@out);
 `;
@@ -2437,9 +2449,8 @@ print JSON::PP->new->encode(\\@out);
     expect(r.status, r.stderr).toBe(0);
     return JSON.parse(r.stdout) as string[];
   };
-  const dir = (mode: number, acl: string[], perm = "search", bit = 1, uid = 501, gid = 20): Case => ({
+  const dir = (mode: number, acl: string[], perm = "search", uid = 501, gid = 20): Case => ({
     perm,
-    bit,
     mode: 0o040000 | mode,
     uid,
     gid,
@@ -2501,7 +2512,7 @@ print JSON::PP->new->encode(\\@out);
         dir(0o755, [" 0: user:-2 deny search"]),
         dir(0o755, [" 0: group:4294967294 deny search"]),
         dir(0o755, [" 0: 55555555-5555-5555-5555-555555555555 deny search"]),
-        dir(0o700, [], "search", 1, -2, 0), // owned by -2 = the account: owner bits
+        dir(0o700, [], "search", -2, 0), // owned by -2 = the account: owner bits
         dir(0o755, [" 0: user:4294967296 deny search"]), // out of range
       ],
       NOBODY,
@@ -2517,11 +2528,11 @@ print JSON::PP->new->encode(\\@out);
 
   it("POSIX: owner, else group, else other — no fall-through to a lower class", () => {
     const [a, b, c, d, e] = evaluate([
-      dir(0o070, [], "search", 1, 300, 20), // the owner without x: no, even though group has it
-      dir(0o701, [], "search", 1, 501, 400), // its group without x: no, even though other has it
-      dir(0o751, [], "search", 1, 501, 20), // other
-      { perm: "read", bit: 4, mode: 0o100640, uid: 0, gid: 400, acl: [] }, // a file readable by its group
-      { perm: "read", bit: 4, mode: 0o100600, uid: 0, gid: 0, acl: [] },
+      dir(0o070, [], "search", 300, 20), // the owner without x: no, even though group has it
+      dir(0o701, [], "search", 501, 400), // its group without x: no, even though other has it
+      dir(0o751, [], "search", 501, 20), // other
+      { perm: "read", mode: 0o100640, uid: 0, gid: 400, acl: [] }, // a file readable by its group
+      { perm: "read", mode: 0o100600, uid: 0, gid: 0, acl: [] },
     ]);
     expect([a, b, c, d]).toEqual([expect.stringMatching(/cannot/), expect.stringMatching(/cannot/), "", ""]);
     expect(e).toMatch(/cannot read/);
@@ -2553,7 +2564,7 @@ describe.skipIf(!fs.existsSync("/usr/bin/perl"))(
       });
       return b.subarray(0, opts.cut ?? b.length).toString("hex");
     };
-    type Case = { hex: string; dir: boolean; perm: string; bit: number; mode: number };
+    type Case = { hex: string; dir: boolean; perm: string; mode: number };
     /** ace_lines on injected bytes, then account_eval of the lines it made (uid/gid 0: "other" for the account). */
     const decode = (cases: Case[]): { err: string; lines: string[]; verdict: string }[] => {
       const src = fs.readFileSync(LAUNCHER_SRC, "utf8");
@@ -2570,7 +2581,7 @@ my @out;
 for my $c (@{ $req->{cases} }) {
   my ($e, $l) = ace_lines("/n", pack("H*", $c->{hex}), $c->{dir} ? 1 : 0);
   my @l = $l ? @$l : ();
-  my $v = length $e ? "" : account_eval($acct, "/n", $c->{perm}, $c->{bit}, $c->{mode}, 0, 0, @l);
+  my $v = length $e ? "" : account_eval($acct, "/n", $c->{perm}, $c->{mode}, 0, 0, @l);
   push @out, { err => $e, lines => \\@l, verdict => $v };
 }
 print JSON::PP->new->encode(\\@out);
@@ -2585,11 +2596,10 @@ print JSON::PP->new->encode(\\@out);
       expect(r.status, r.stderr).toBe(0);
       return JSON.parse(r.stdout) as { err: string; lines: string[]; verdict: string }[];
     };
-    const file = (aces: Ace[] | null, perm = "read", bit = 4, mode = 0o100000): Case => ({
+    const file = (aces: Ace[] | null, perm = "read", mode = 0o100000): Case => ({
       hex: filesec(aces),
       dir: false,
       perm,
-      bit,
       mode,
     });
 
@@ -2597,7 +2607,7 @@ print JSON::PP->new->encode(\\@out);
       const [a, b, c, d] = decode([
         file([{ uuid: NOBODY_UUID, flags: 0x101, rights: 0x2 }]), // allow read,only_inherit on a mode-000 file
         file([{ uuid: NOBODY_UUID, flags: 0x1, rights: 0x2 }]), // a plain allow read: applies
-        file([{ uuid: NOBODY_UUID, flags: 0x102, rights: 0x2 }], "read", 4, 0o100644), // deny,only_inherit: not here
+        file([{ uuid: NOBODY_UUID, flags: 0x102, rights: 0x2 }], "read", 0o100644), // deny,only_inherit: not here
         file([{ uuid: STAFF_UUID, flags: 0x21, rights: 0x2 }]), // staff (not its group), file_inherit
       ]);
       expect(a!.lines).toEqual([` 0: ${NOBODY_UUID} allow read,only_inherit`]);
@@ -2615,7 +2625,6 @@ print JSON::PP->new->encode(\\@out);
           hex: filesec([{ uuid: STAFF_UUID, flags: 0x1e1, rights: 0x3ffe }]),
           dir: true,
           perm: "search",
-          bit: 1,
           mode: 0o040000,
         },
         file([{ uuid: STAFF_UUID, flags: 0x1, rights: 0x3ffe }]),
@@ -2658,7 +2667,7 @@ print JSON::PP->new->encode(\\@out);
     });
 
     it("readsecurity: granted unless an applicable ACL entry denies it (the POSIX mode does not matter)", () => {
-      const rs = (aces: Ace[] | null) => file(aces, "readsecurity", 0, 0o100000);
+      const rs = (aces: Ace[] | null) => file(aces, "readsecurity", 0o100000);
       const [a, b, c, d] = decode([
         rs(null),
         rs([{ uuid: NOBODY_UUID, flags: 0x2, rights: 1 << 11 }]),
@@ -2670,6 +2679,53 @@ print JSON::PP->new->encode(\\@out);
       expect(b!.verdict).toMatch(/ACL denies readsecurity/);
       expect(c!.verdict).toBe("");
       expect(d!.verdict).toBe("");
+    });
+
+    it("one request, one evaluation (kauth_acl_evaluate): lstat's readattr,readsecurity is not two AND-ed verdicts", () => {
+      const META = "readattr,readsecurity";
+      const RA = 1 << 7;
+      const RS = 1 << 11;
+      const UNKNOWN = "99999999-9999-9999-9999-999999999999";
+      const me = (flags: number, rights: number): Ace => ({ uuid: NOBODY_UUID, flags, rights });
+      const [a, b, c, d, e, f, g, h, i] = decode([
+        file([me(0x2, RA)], META, 0o100644), // deny readattr: lstat fails…
+        file([me(0x2, RA)], "readsecurity", 0o100644), // …though readsecurity alone is fine
+        file([me(0x1, RS), me(0x2, RS)], META, 0o100644), // allow rs, then deny rs: readattr still needed → denied
+        file([me(0x1, RS), me(0x2, RS)], "readsecurity", 0o100644), // alone, the allow decides
+        file([me(0x1, RA | RS), me(0x2, RA)], META, 0o100644), // all granted before the deny: allowed
+        file([me(0x1, RA), me(0x2, RS)], META, 0o100644),
+        file([me(0x1, RA), { uuid: UNKNOWN, flags: 0x1, rights: RA }], META), // names only a granted right: skipped
+        file([{ uuid: UNKNOWN, flags: 0x2, rights: RA }], META), // a deny it cannot place
+        file([], "read,readsecurity", 0o100000), // residual read falls to POSIX; readsecurity has no bit
+      ]);
+      expect(a!.verdict).toMatch(/ACL denies readattr to the account/);
+      expect(b!.verdict).toBe("");
+      expect(c!.verdict).toMatch(/ACL denies readsecurity/);
+      expect(d!.verdict).toBe("");
+      expect(e!.verdict).toBe("");
+      expect(f!.verdict).toMatch(/ACL denies readsecurity/);
+      expect(g!.verdict).toBe("");
+      expect(h!.verdict).toMatch(/cannot resolve ACL principal/);
+      expect(i!.verdict).toMatch(/the account cannot read \/n/);
+      expect(decode([file([], "chown")])[0]!.verdict).toMatch(/unknown request chown/);
+    });
+
+    it("the record length must match exactly: the header for no ACL, the header and n entries otherwise", () => {
+      const one = filesec([{ uuid: STAFF_UUID, flags: 1, rights: 2 }]);
+      const out = decode([
+        { ...file([]), hex: filesec([]) + "00" }, // a 45-byte record with no entries
+        { ...file([]), hex: filesec(null) + "00".repeat(24) }, // no-ACL with an entry's worth of trailing bytes
+        { ...file([]), hex: one + "00" },
+        { ...file([]), hex: filesec(null) },
+        { ...file([]), hex: one },
+      ]);
+      expect(out.map((o) => o.err)).toEqual([
+        "bad ACL record at /n",
+        "bad ACL record at /n",
+        "bad ACL record at /n",
+        "",
+        "",
+      ]);
     });
 
     it.skipIf(process.platform !== "darwin")(
