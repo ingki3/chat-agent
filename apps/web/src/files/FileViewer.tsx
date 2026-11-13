@@ -1,5 +1,5 @@
-import { useEffect, useRef, type ReactNode } from "react";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router";
 import {
   EXTRACT_CODE_TEXT,
@@ -24,11 +24,11 @@ import {
   highlightsOf,
   isTargetUnit,
   linesOf,
-  loadedView,
   pieces,
   type Block,
   type Cell,
 } from "./view-model.js";
+import { combine, hasMore, openingQuery, pagingQuery, type ViewFetch } from "./queries.js";
 import "./files.css";
 
 /**
@@ -42,33 +42,24 @@ import "./files.css";
  * response the download uses); PDF pages are never rendered from the original. Every request goes through the
  * share projection on the server (#29).
  */
-type Window = { from: number; to?: number | undefined };
-
 export function FileViewerPage({ conversationId, fileId }: { conversationId: string; fileId: string }) {
   const { search } = useLocation();
   const loc = parseLocParam(new URLSearchParams(search).get("loc"));
   const navigate = useNavigate();
-  const view = useInfiniteQuery({
-    queryKey: ["file-view", fileId, loc ? JSON.stringify(loc) : null],
-    // The opening window resolves the locator; the windows before and after only page the text (review #123: the
-    // target is read from the opening window, wherever it ends up in the list).
-    queryFn: ({ pageParam }) => files.view(fileId, pageParam === undefined ? { loc } : pageParam),
-    initialPageParam: undefined as Window | undefined,
-    getNextPageParam: (last): Window | undefined => (last.next === null ? undefined : { from: last.next }),
-    // A window before ends where the first one shown starts: nothing is shown twice.
-    getPreviousPageParam: (first): Window | undefined =>
-      first.prev === null ? undefined : { from: first.prev, to: first.items[0]?.seq },
-    retry: false,
-    // Still being read: look again until the text is there.
-    refetchInterval: (q) => (q.state.data?.pages[0]?.extract.status === "pending" ? 3000 : false),
-  });
+  const fetch: ViewFetch = (o) => files.view(fileId, o);
+  // The opening window (and the locator's resolution) is its own query; the text before and after it pages from
+  // it, only when asked (review #123 2차: a refetch never loses the opening window).
+  const view = useQuery(openingQuery(fileId, loc, fetch));
+  const [askedBefore, setAskedBefore] = useState(false);
+  const [askedAfter, setAskedAfter] = useState(false);
+  const earlier = useInfiniteQuery(pagingQuery("before", fileId, loc, view.data, fetch, askedBefore));
+  const later = useInfiniteQuery(pagingQuery("after", fileId, loc, view.data, fetch, askedAfter));
   const back = () => {
     // Back where the link was followed from; a link opened on its own goes to the conversation.
     if ((window.history.state as { idx?: number } | null)?.idx) void navigate(-1);
     else void navigate(`/c/${encodeURIComponent(conversationId)}`);
   };
-  const loaded = view.data ? loadedView(view.data) : undefined;
-  const first = loaded?.opening;
+  const first = view.data;
   const refused =
     view.error instanceof ApiError && [400, 403, 404].includes(view.error.status)
       ? true
@@ -104,39 +95,43 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
         </div>
       </>
     );
-  if (!first || !view.data)
+  if (!first)
     return (
       <>
         {bar("📄 파일")}
         <div className="empty muted">불러오는 중…</div>
       </>
     );
-  const items = loaded!.items;
+  const items = combine([...(earlier.data?.pages ?? []), first, ...(later.data?.pages ?? [])]);
+  const more = (asked: boolean, set: (v: boolean) => void, q: typeof earlier) => () => {
+    if (!asked) set(true);
+    else void q.fetchNextPage();
+  };
   return (
     <>
       {bar(`📄 ${first.file.name}`, first.file)}
       <div className="file-view" data-testid="file-view">
         {loc && <TargetNotice loc={loc} target={first.target} />}
         <ExtractNotice d={first} />
-        {view.hasPreviousPage && (
+        {hasMore("before", first, askedBefore, earlier) && (
           <button
             type="button"
             className="ghost small"
-            disabled={view.isFetchingPreviousPage}
-            onClick={() => void view.fetchPreviousPage()}
+            disabled={earlier.isFetching}
+            onClick={more(askedBefore, setAskedBefore, earlier)}
           >
-            {view.isFetchingPreviousPage ? "불러오는 중…" : "↑ 앞부분 더 보기"}
+            {earlier.isFetching ? "불러오는 중…" : "↑ 앞부분 더 보기"}
           </button>
         )}
         <FileBody file={first.file} items={items} target={first.target} />
-        {view.hasNextPage && (
+        {hasMore("after", first, askedAfter, later) && (
           <button
             type="button"
             className="ghost small"
-            disabled={view.isFetchingNextPage}
-            onClick={() => void view.fetchNextPage()}
+            disabled={later.isFetching}
+            onClick={more(askedAfter, setAskedAfter, later)}
           >
-            {view.isFetchingNextPage ? "불러오는 중…" : "↓ 뒷부분 더 보기"}
+            {later.isFetching ? "불러오는 중…" : "↓ 뒷부분 더 보기"}
           </button>
         )}
       </div>
@@ -387,9 +382,12 @@ function RowCells({
   letters?: number;
 }) {
   const cells = cellsOf(segs);
-  const g = cells.length ? columns(cells) : null;
-  if (!cells.length || !g)
-    // No columns kept (a secret's removal cost the marks) or too wide: the row's text as it is.
+  // Every piece must have its columns to be put in the grid: one that lost them (a secret's removal) cannot be
+  // placed, and served text is never dropped (review #123 2차) — then the whole row is drawn as its text, in order.
+  const placed = segs.every((x) => x.marks.some((m) => m.col !== undefined));
+  const g = cells.length && placed ? columns(cells) : null;
+  if (!g)
+    // No columns kept, a piece without them, or too wide: the row's text as it is, piece by piece.
     return (
       <td colSpan={Math.max(1, letters ?? 1)}>
         {segs.map((s) => (

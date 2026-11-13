@@ -1,4 +1,4 @@
-import type { FileViewResponse, ViewSegment, ViewTarget } from "@agentlee/shared";
+import type { ViewSegment, ViewTarget } from "@agentlee/shared";
 
 /**
  * The file viewer's layout (#24) as pure functions: the served segments grouped into what the screen draws —
@@ -196,26 +196,3 @@ export const boxStyle = (b: readonly [number, number, number, number]) => ({
   width: `${Math.max(b[2] * 100, 0.4)}%`,
   height: `${Math.max(b[3] * 100, 0.4)}%`,
 });
-
-/**
- * The windows loaded so far (review #123): the opening one — the one loaded without a paging parameter, which
- * carries the locator's resolution wherever later windows put it in the list — and every segment once, in order.
- */
-export function loadedView<P>(data: {
-  pages: readonly FileViewResponse[];
-  pageParams: readonly (P | undefined)[];
-}): {
-  opening: FileViewResponse | undefined;
-  items: ViewSegment[];
-} {
-  const at = data.pageParams.indexOf(undefined);
-  const seen = new Set<number>();
-  const items: ViewSegment[] = [];
-  for (const p of data.pages)
-    for (const x of p.items)
-      if (!seen.has(x.seq)) {
-        seen.add(x.seq);
-        items.push(x);
-      }
-  return { opening: at === -1 ? undefined : data.pages[at], items };
-}

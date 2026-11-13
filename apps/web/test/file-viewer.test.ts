@@ -1,6 +1,7 @@
 import { createElement, type FunctionComponent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
+import { InfiniteQueryObserver, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import {
   fileViewPath,
@@ -17,16 +18,8 @@ import { CitationPreview } from "../src/citations/CitationMarker.js";
 import { citationView } from "../src/citations/segments.js";
 import { FileViewContext } from "../src/files/context.js";
 import { FileBody } from "../src/files/FileViewer.js";
-import {
-  blocks,
-  cellsOf,
-  colName,
-  columns,
-  highlightsOf,
-  linesOf,
-  loadedView,
-  pieces,
-} from "../src/files/view-model.js";
+import { combine, hasMore, openingQuery, pagingQuery, type ViewFetch } from "../src/files/queries.js";
+import { blocks, cellsOf, colName, columns, highlightsOf, linesOf, pieces } from "../src/files/view-model.js";
 
 /**
  * The file viewer's screen side (#24): file citations and file chips link to `/c/:id/files/:fileId?loc=`
@@ -221,40 +214,78 @@ describe("layout and highlights (pure)", () => {
 });
 
 describe("review #123", () => {
-  it("[P2 2] a window loaded before the opening one keeps the target; [P3 5] overlapping windows show each unit once", () => {
+  it("[P2 2] windows before and after, then refetches (real QueryClient observers): the opening window and its target stay; each unit once", async () => {
     const target: ViewTarget = {
       status: "exact",
       reasons: [],
       seqs: [50],
       range: { seq: 50, start: 0, end: 1 },
     };
-    const page = (from: number, to: number, t: ViewTarget | null) => ({
-      file,
-      extract: {
-        fileId: "f1",
-        fileRevision: REV,
-        status: "ok" as const,
-        code: null,
-        ocr: "none" as const,
-        units: 200,
-        segments: 200,
-        characters: 1,
-        truncated: false,
-      },
-      items: Array.from({ length: to - from }, (_, i) =>
-        seg(from + i, { kind: "slide", slide: from + i + 1 }, "x"),
-      ),
-      prev: null,
-      next: null,
-      target: t,
-    });
-    // "앞부분 더 보기": the earlier window is put first; it carries no target (paging only).
-    const v = loadedView({
-      pages: [page(0, 100, null), page(30, 130, target)],
-      pageParams: [{ from: 0 }, undefined],
-    });
-    expect(v.opening?.target).toEqual(target);
-    expect(v.items.map((x) => x.seq)).toEqual(Array.from({ length: 130 }, (_, i) => i));
+    const ALL = 200;
+    const LIMIT = 10;
+    const calls: string[] = [];
+    // The server's windows (viewer.ts `viewWindow`): around seq 50 (20 before), or from/to.
+    const fetch: ViewFetch = async (o) => {
+      calls.push(JSON.stringify(o));
+      const start = o.from ?? (o.loc ? 30 : 0);
+      let end = Math.min(ALL, start + LIMIT);
+      if (o.to !== undefined) end = Math.max(start, Math.min(end, o.to));
+      return {
+        file,
+        extract: {
+          fileId: "f1",
+          fileRevision: REV,
+          status: "ok",
+          code: null,
+          ocr: "none",
+          units: ALL,
+          segments: ALL,
+          characters: 1,
+          truncated: false,
+        },
+        items: Array.from({ length: end - start }, (_, i) =>
+          seg(start + i, { kind: "slide", slide: start + i + 1 }, "x"),
+        ),
+        prev: start > 0 ? Math.max(0, start - LIMIT) : null,
+        next: end < ALL ? end : null,
+        target: o.loc ? target : null,
+      };
+    };
+    const loc: FileLocator = { ...base, kind: "slide", slide: 51 };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const opening = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const stop1 = opening.subscribe(() => {});
+    const first = (await opening.refetch()).data!;
+    const before = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
+    const after = new InfiniteQueryObserver(client, pagingQuery("after", "f1", loc, first, fetch, true));
+    const stop2 = before.subscribe(() => {});
+    const stop3 = after.subscribe(() => {});
+    await before.refetch();
+    await before.fetchNextPage();
+    await after.refetch();
+    const shown = () =>
+      combine([
+        ...(before.getCurrentResult().data?.pages ?? []),
+        opening.getCurrentResult().data,
+        ...(after.getCurrentResult().data?.pages ?? []),
+      ]).map((x) => x.seq);
+    const expected = Array.from({ length: 40 }, (_, i) => i + 10);
+    expect(shown()).toEqual(expected);
+    // Refetches (focus, interval, a manual one) of every query: the same windows, the target kept.
+    await before.refetch();
+    await after.refetch();
+    await opening.refetch();
+    expect(opening.getCurrentResult().data!.target).toEqual(target);
+    expect(shown()).toEqual(expected);
+    // Windows before end where the next one starts: no overlap was ever asked for.
+    expect(calls).toContain(JSON.stringify({ from: 20, to: 30 }));
+    expect(calls).toContain(JSON.stringify({ from: 10, to: 20 }));
+    expect(hasMore("before", first, true, before.getCurrentResult())).toBe(true);
+    expect(hasMore("before", first, false, before.getCurrentResult())).toBe(true);
+    stop1();
+    stop2();
+    stop3();
+    client.clear();
   });
 
   it("[P2 3] a cell split around a footnote: both pieces of the column are drawn, in order", () => {
@@ -280,6 +311,27 @@ describe("review #123", () => {
     expect(html).toContain("각주 뒤 글");
     expect(html.indexOf("글꼴 11pt")).toBeLessThan(html.indexOf("각주 뒤 글"));
     expect(html).toContain("본문 글꼴 기준.");
+  });
+});
+
+describe("review #123 2차", () => {
+  it("[P2 3] a piece that lost its columns (secret split into the footnote) is drawn with the rest — no served text dropped", () => {
+    // The shape `/view` serves for it (apps/server/test/file-viewer.test.ts "[P2 3 2차]").
+    const items = [
+      seg(0, { kind: "table", table: 1, row: 1 }, "앞의 공개 문장 [숨김]", {
+        split: true,
+        approximate: true,
+      }),
+      seg(1, { kind: "table", table: 1, row: 1, footnote: 1 }, "[숨김]"),
+      seg(2, { kind: "table", table: 1, row: 1 }, "뒤의 공개 문장", {
+        split: true,
+        marks: [{ start: 0, end: 8, col: 1 }],
+      }),
+    ];
+    const html = renderToStaticMarkup(createElement(FileBody, { file, items, target: null }));
+    expect(html).toContain("앞의 공개 문장 [숨김]");
+    expect(html).toContain("뒤의 공개 문장");
+    expect(html.indexOf("앞의 공개 문장")).toBeLessThan(html.indexOf("뒤의 공개 문장"));
   });
 });
 

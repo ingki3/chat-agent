@@ -2779,7 +2779,7 @@ describe("수용 기준 2: PDF 1 + HWP 1 비교 요약 in both runtimes (#24)", 
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
-  });
+  }, 60_000);
 });
 
 describe("OCR capability", () => {

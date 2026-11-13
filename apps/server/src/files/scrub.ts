@@ -183,3 +183,22 @@ export function parseMarks(raw: unknown): Mark[] | null {
     return null;
   }
 }
+
+/**
+ * The viewer's check hashes of a file's citations (#24, `textHash` in `citations.locator`) are dropped: they were
+ * computed over text that a secret registered since is now hidden in — kept, a hash of known context and a guessed
+ * value would tell the value (review #123 2차). Called wherever a file's stored text changes after a citation could
+ * have been made: the background rescrub of the file and its re-extraction. Those citations then open as the unit
+ * ("unverified"), never as an exact range.
+ */
+export function forgetCitedTextHashes(
+  sql: { prepare(sql: string): { run(...args: unknown[]): unknown } },
+  fileId: string,
+) {
+  sql
+    .prepare(
+      `UPDATE citations SET locator = json_remove(locator, '$.textHash')
+       WHERE file_id = ? AND locator IS NOT NULL AND json_valid(locator) AND json_extract(locator, '$.textHash') IS NOT NULL`,
+    )
+    .run(fileId);
+}

@@ -52,8 +52,9 @@ async function start() {
   closers.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const runtimes = new RuntimeRegistry();
   runtimes.register(new FakeRuntime({ script: defaultScript, runTools: true }));
+  const db = createTestDb();
   const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: path.join(dir, "data") }), {
-    db: createTestDb(),
+    db,
     extract: { runner: IN_PROCESS },
     logger: false,
     runtimes,
@@ -108,7 +109,7 @@ async function start() {
       raw: r.body,
     };
   };
-  return { app, f, upload, get, send, view };
+  return { app, db, f, upload, get, send, view };
 }
 
 async function waitNote(app: App, runId: string) {
@@ -368,6 +369,69 @@ describe("review #123", () => {
       [true, [1], "각주 뒤 글"],
     ]);
     expect(items.some((x) => x.locator.footnote === 1 && x.text === "각주 내용.")).toBe(true);
+  });
+
+  it("[P2 3 2차] a secret split between a cell's body and its footnote: the piece that lost its column is still served", async () => {
+    const { app, f, upload, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const secret = `sk-cellnote-${crypto.randomBytes(12).toString("hex")}`;
+    const b64 = Buffer.from(secret).toString("base64");
+    const [head, tail] = [b64.slice(0, 20), b64.slice(20)];
+    const doc = await hwpxDoc(
+      xp(xtable(`${xt(`앞의 공개 문장 ${head}`)}${xnote(tail)}${xt("뒤의 공개 문장")}`)),
+    );
+    const file = await upload(c.id, "note-secret.hwpx", doc);
+    await app.fileExtracts!.idle();
+    app.storedRescrub!.close();
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const v = await view(f.cookies.owner, file.id);
+    expect(v.raw).not.toContain(head);
+    expect(v.raw).not.toContain(tail);
+    const row = v.body!.items.filter((x) => x.locator.kind === "table" && x.locator.footnote === undefined);
+    // Shape the screen gets (apps/web/test/file-viewer.test.ts draws it): one piece without columns, one with.
+    expect(row.map((x) => [x.approximate, x.marks.map((m) => m.col)])).toEqual([
+      [true, []],
+      [false, [1]],
+    ]);
+    expect(row[0]!.text).toContain("앞의 공개 문장");
+    expect(row[1]!.text).toBe("뒤의 공개 문장");
+  });
+
+  it("[P2 2 2차] the check hash goes when the file's stored text changes — the rescrub and a re-extraction; untouched files keep it", async () => {
+    const { app, db, f, upload, send, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const secret = `sk-hash-${crypto.randomBytes(10).toString("hex")}`;
+    const passage = "비밀 뒤에 있는 공개 문장입니다.";
+    const hit = await upload(c.id, "hit.txt", Buffer.from(`앞 ${secret} 그리고 ${passage}\n`));
+    const clean = await upload(c.id, "clean.txt", Buffer.from(`그냥 ${passage}\n`));
+    const a = await send(c.id, `/file-cite ${hit.id} ${passage}`, [hit.id]);
+    const b = await send(c.id, `/file-cite ${clean.id} ${passage}`, [clean.id]);
+    const stored = (fileId: string) =>
+      (
+        db.$client.prepare("SELECT locator FROM citations WHERE file_id = ?").all(fileId) as {
+          locator: string;
+        }[]
+      ).map((r) => (JSON.parse(r.locator) as { textHash?: string }).textHash);
+    expect(stored(hit.id)[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(stored(clean.id)[0]).toMatch(/^[0-9a-f]{64}$/);
+    // The secret is registered; the background rescrub masks it in the stored text — and drops that file's hashes.
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    await app.storedRescrub!.idle();
+    expect(stored(hit.id)).toEqual([undefined]);
+    expect(stored(clean.id)[0]).toMatch(/^[0-9a-f]{64}$/);
+    const hitLoc = a.note!.citations[0]!.locator!;
+    const t = (await view(f.cookies.owner, hit.id, hitLoc)).body!.target!;
+    expect([t.status, t.range]).toEqual(["unit", undefined]);
+    expect((await view(f.cookies.owner, clean.id, b.note!.citations[0]!.locator!)).body!.target!.status).toBe(
+      "exact",
+    );
+    // Extracted again (a new extractor, a capped file and a later secret): its hashes go too.
+    db.$client.prepare("UPDATE file_extracts SET status = 'pending' WHERE file_id = ?").run(clean.id);
+    app.fileExtracts!.enqueue(clean.id);
+    await app.fileExtracts!.idle();
+    expect(stored(clean.id)).toEqual([undefined]);
   });
 
   it("[P3 5] windows before the opening one end where it starts: nothing twice", async () => {

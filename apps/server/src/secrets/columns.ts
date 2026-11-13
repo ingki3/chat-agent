@@ -223,6 +223,8 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "citations.quote": { write: "CitationStore.cite / citeFile", rescrub: "text" },
   // File citations (#48): the cited upload, and where the passage is (the sheet name of an XLSX cell is file text).
   "citations.file_id": ID,
+  // Its `textHash` (#24) is a hash over the cited unit's text: no value to mask, so it is dropped instead whenever
+  // that file's stored text changes — the file rescrub and re-extraction (`forgetCitedTextHashes`, review #123 2차).
   "citations.locator": { write: "CitationStore.citeFile (scrubKnownDeep)", rescrub: "deep" },
   // Uploads (#22): the user's file name is scrubbed on write and rescrubbed. The file bytes are on disk, not in a
   // column, and are stored as they came (the user's own document — docs/ops.md §24).
