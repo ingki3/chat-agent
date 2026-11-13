@@ -7,6 +7,7 @@ import { defuseExternal, frameExternal } from "@agentlee/shared";
 import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
+import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
 /**
@@ -45,10 +46,15 @@ export const WEB_CODES = [
   "web_failed",
   "web_busy",
   "web_not_allowed",
+  "web_secret_blocked",
 ] as const;
 export type WebCode = (typeof WEB_CODES)[number];
 const KNOWN = new Set<string>(WEB_CODES);
 const code = (c: unknown): WebCode => (typeof c === "string" && KNOWN.has(c) ? (c as WebCode) : "web_failed");
+
+/** Redirects one fetch follows at most, and the time all its hops share (worker.mjs `LIMITS`). */
+export const MAX_REDIRECTS = 5;
+export const FETCH_MS = 20_000;
 
 /** Characters of page text the model gets back from one fetch (the stored body is longer). */
 export const EXCERPT_CHARS = 10_000;
@@ -82,10 +88,45 @@ export function checkUrl(raw: string): { ok: true; url: URL } | { ok: false; cod
 
 /** A worker job and what comes back (worker.mjs). */
 export type WorkerJob =
-  | { op: "fetch"; url: string }
+  /**
+   * One page. `redirect: "manual"` (the server, #113): a redirect is not followed but handed back as `redirect`, so
+   * the server checks every hop before it is requested; `timeoutMs` is what is left of the whole fetch's time.
+   */
+  | { op: "fetch"; url: string; redirect?: "manual"; timeoutMs?: number }
   | { op: "search"; provider: "duckduckgo"; query: string; max: number }
   /** Finance tools (#30): exact URLs built by the server, bodies returned as text (worker.mjs `fetchRaw`). */
-  | { op: "raw"; steps: RawStep[] };
+  | {
+      op: "raw";
+      steps: RawStep[];
+      /** Finance (#113): stop at a redirect and hand back `pause` — the server checks the next hop. */
+      redirect?: "manual";
+      /** With `redirect: "manual"`: stop before every send too (the server approves each exact request). */
+      approve?: true;
+      /** What is left of the whole call's time (finance `FINANCE_CALL_MS`): the job's sends share it. */
+      timeoutMs?: number;
+      /** The session a job resumed after a redirect starts with (from the `pause` of the job before). */
+      resume?: RawResume;
+    };
+/** What a raw job hands back when it stops at a redirect (worker.mjs `fetchRaw`, `redirect: "manual"`). */
+export type RawPause = {
+  /** `send`: the next request, not sent yet; `redirect`: the step was redirected (its target, not sent yet). */
+  reason: "send" | "redirect";
+  /** Index of the step (in that job) the request belongs to. */
+  step: number;
+  /** The step's URL as it will be requested (captured values already in it). */
+  url: string;
+  /** The exact request (worker.mjs `wireRequest`): URL, request target, every header incl. the cookie. */
+  request: WireRequest;
+  jar: [string, string][];
+  vars: [string, string][];
+  seen: string[];
+};
+export type WireRequest = { url: string; target: string; headers: Record<string, string> };
+export type RawResume = Omit<RawPause, "reason" | "step" | "url" | "request"> & {
+  literal: true;
+  /** The request the server approved: the resumed job sends its first step only if it builds exactly this. */
+  approved: WireRequest;
+};
 export type RawStep = {
   url: string;
   headers?: Record<string, string>;
@@ -97,7 +138,7 @@ export type RawResponse = { status: number; contentType: string; body: string };
  * The worker's own bounds of one `raw` job (worker.mjs `RAW_LIMITS`; a test keeps them equal): at most this many
  * steps, each answer at most this many bytes. A longer plan without session steps is split into several jobs.
  */
-export const RAW_JOB_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024 } as const;
+export const RAW_JOB_LIMITS = { maxSteps: 4, maxBytes: 3 * 1024 * 1024, maxRedirects: 2 } as const;
 export type WorkerOutput = { ok: true; [k: string]: unknown } | { ok: false; code: string };
 /** Runs the worker with the given egress proxy. Default: the sandboxed process. Tests run it in-process. */
 export type WebWorker = (job: WorkerJob, proxy: { url: string; port: number }) => Promise<WorkerOutput>;
@@ -142,6 +183,49 @@ export function sandboxedWorker(node = fs.realpathSync(process.execPath)): WebWo
   };
 }
 
+/**
+ * Every text one worker job puts on the wire (#113): a page's URL (host, path, query, fragment); a search's query
+ * and the provider URL built from it (worker.mjs `searchDuckDuckGo`); a raw step's URL and headers. The worker adds
+ * only fixed headers of its own (user agent, accept) and sends no body.
+ */
+export function jobTexts(job: WorkerJob): string[] {
+  // A page's URL is already the parser's form (`checkUrl`), which the worker sends as it is (worker.mjs
+  // `wireRequest`: its path and query, and fixed headers); `urlTexts` adds the path read back.
+  if (job.op === "fetch") return urlTexts(job.url);
+  if (job.op === "search") {
+    const u = new URL(DUCKDUCKGO_URL);
+    u.searchParams.set("q", job.query);
+    u.searchParams.set("kl", "kr-kr");
+    return [job.query, u.toString()];
+  }
+  return job.steps.flatMap((s) => [...urlTexts(s.url), ...Object.values(s.headers ?? {})]);
+}
+
+/**
+ * The web tools' egress guard (#113): a job that carries a known secret anywhere (`carriesSecret`, the one predicate
+ * every outbound tool uses) is never started — `web_secret_blocked`, nothing sent, nothing of the request echoed or
+ * logged. Wraps the worker, so every web job (page hop, search) passes it.
+ */
+export function guardWorker(worker: WebWorker): WebWorker {
+  return async (job, proxy) => {
+    if (carriesSecret(jobTexts(job))) return { ok: false, code: "web_secret_blocked" };
+    return worker(job, proxy);
+  };
+}
+
+const blockedResults = new WeakSet<object>();
+function markBlocked<R extends SkillResult>(r: R): R {
+  blockedResults.add(r);
+  return r;
+}
+/**
+ * Whether the egress guard refused this result's request (#113). The model gets an ordinary answer (`web_blocked`,
+ * an empty search); the log records `webCode: web_secret_blocked` from this.
+ */
+export function blockedByEgress(r: SkillResult): boolean {
+  return blockedResults.has(r);
+}
+
 /** A search provider: query → results (untrusted text, bounded on the way into `sources`). */
 export type SearchProvider = {
   name: string;
@@ -158,9 +242,11 @@ export type Proxy = Pick<EgressService, "endpoint" | "close">;
 export const SEARCH_PROVIDER_NAMES = ["google-news", "duckduckgo"] as const;
 export type SearchProviderName = (typeof SEARCH_PROVIDER_NAMES)[number];
 export const DUCKDUCKGO_HOSTS = ["html.duckduckgo.com"] as const;
+const DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/";
 
 /** DuckDuckGo's HTML results page, fetched by the worker through a proxy that reaches that host only. */
-export function duckDuckGoProvider(worker: WebWorker, proxy: Proxy): SearchProvider {
+export function duckDuckGoProvider(raw: WebWorker, proxy: Proxy): SearchProvider {
+  const worker = guardWorker(raw);
   return {
     name: "duckduckgo",
     async search(query, max) {
@@ -257,7 +343,8 @@ export class WebService {
   readonly providers: readonly SearchProvider[];
 
   constructor(private readonly opts: WebServiceOptions) {
-    this.worker = opts.worker ?? sandboxedWorker();
+    // Every page hop goes through the egress guard (#113).
+    this.worker = guardWorker(opts.worker ?? sandboxedWorker());
     this.fetchProxy = opts.fetchProxy ?? new EgressService({ allow: "public", ports: [80, 443] });
     this.providers = opts.providers ?? [];
   }
@@ -287,16 +374,32 @@ export class WebService {
 
   async search(input: { query: string; maxResults?: number }, scope: ToolScope): Promise<SkillResult> {
     const max = input.maxResults ?? 8;
+    // The query is what every provider sends out (a URL parameter, a skill's API request): checked once before any
+    // of them runs (#113), so no provider — ours or a skill — gets it. A query that carries a secret takes exactly
+    // the ordinary path with the fixed decoy in its place (as the watchlist search does, #111): the same providers,
+    // fallbacks and errors; its hits are dropped and the answer is an ordinary empty one. Only the log says why.
+    const blocked = carriesSecret([input.query]);
     let last: string = "web_search_unavailable";
     for (const p of this.providers) {
-      const r = await p.search(input.query, max, scope);
+      const r = await p.search(blocked ? SEARCH_DECOY : input.query, max, scope);
       if (!r.ok) {
+        // A provider's own job refused by the guard: never tried again elsewhere.
+        if (r.code === "web_secret_blocked")
+          return markBlocked({ ok: false, code: "web_search_unavailable" });
         last = r.code;
         continue;
       }
-      return { ok: true, output: this.searchOutput(p.name, input.query, r.hits.slice(0, max), scope) };
+      const out = {
+        ok: true as const,
+        output: this.searchOutput(p.name, input.query, blocked ? [] : r.hits.slice(0, max), scope),
+      };
+      return blocked ? markBlocked(out) : out;
     }
-    return { ok: false, code: code(last) === "web_failed" ? "web_search_unavailable" : code(last) };
+    const failed = {
+      ok: false as const,
+      code: code(last) === "web_failed" ? "web_search_unavailable" : code(last),
+    };
+    return blocked ? markBlocked(failed) : failed;
   }
 
   /**
@@ -374,7 +477,10 @@ export class WebService {
     } catch {
       return { ok: false, code: "web_unavailable" };
     }
-    const r = await this.worker({ op: "fetch", url: checked.url.toString() }, proxy);
+    const r = await this.follow(checked.url, proxy);
+    // A hop refused by the egress guard looks like any other refused hop to the model (`web_blocked`); the log
+    // keeps `web_secret_blocked` (#113 review: no answer tells a known secret apart).
+    if (!r.ok && r.code === "web_secret_blocked") return markBlocked({ ok: false, code: "web_blocked" });
     if (!r.ok) return { ok: false, code: code(r.code) };
     const text = typeof r.text === "string" ? r.text : "";
     const finalUrl = typeof r.finalUrl === "string" ? linkOf(r.finalUrl) : undefined;
@@ -410,6 +516,29 @@ export class WebService {
         content: frameExternal({ source: row.finalUrl ?? row.url, content: excerpt }),
       },
     };
+  }
+
+  /**
+   * A page with its redirects followed here, one worker job per hop (#113): each hop's URL — the first and every
+   * redirect target — gets the server's URL check and the egress guard before it is requested. At most
+   * `MAX_REDIRECTS` redirects, all hops within `FETCH_MS`.
+   */
+  private async follow(first: URL, proxy: { url: string; port: number }): Promise<WorkerOutput> {
+    const deadline = Date.now() + FETCH_MS;
+    let url = first;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const left = deadline - Date.now();
+      if (left <= 0) return { ok: false, code: "web_timeout" };
+      const r = await this.worker(
+        { op: "fetch", url: url.toString(), redirect: "manual", timeoutMs: left },
+        proxy,
+      );
+      if (!r.ok || typeof r.redirect !== "string") return r;
+      const next = checkUrl(r.redirect);
+      if (!next.ok) return next;
+      url = next.url;
+    }
+    return { ok: false, code: "web_too_many_redirects" };
   }
 
   async close(): Promise<void> {

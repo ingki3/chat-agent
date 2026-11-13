@@ -60,6 +60,32 @@ export function checkHop(u) {
 }
 
 /**
+ * The exact request one hop puts on the wire (#113): the URL as parsed, the request target (path and query — a
+ * fragment is never sent) and every header, the fixed ones included. `hop` sends exactly this; a raw job in approval
+ * mode hands it to the server before sending it.
+ * @param {URL | string} url @param {Record<string,string>} [headers]
+ */
+export function wireRequest(url, headers) {
+  const u = url instanceof URL ? url : new URL(url);
+  return {
+    url: u.href,
+    target: `${u.pathname}${u.search}`,
+    headers: { ...HEADERS, ...headers, host: u.host },
+  };
+}
+
+/** JSON with object keys sorted: two requests are the same request when these are equal. */
+function canonical(x) {
+  if (Array.isArray(x)) return `[${x.map(canonical).join(",")}]`;
+  if (x && typeof x === "object")
+    return `{${Object.keys(x)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(x[k])}`)
+      .join(",")}}`;
+  return JSON.stringify(x);
+}
+
+/**
  * A raw TCP stream to host:port through the proxy (CONNECT). The proxy's answer decides: 200 tunnel, 403 refused
  * by policy, anything else unreachable.
  * @param {URL} proxy @param {string} host @param {number} port @param {number} timeoutMs
@@ -152,13 +178,14 @@ async function hop(url, o) {
       sock.destroy();
       reject(e instanceof WebError ? e : new WebError("web_unreachable"));
     };
+    const wire = wireRequest(url, o.headers);
     const req = http.request(
       {
         method: "GET",
         host,
         port,
-        path: `${url.pathname}${url.search}`,
-        headers: { ...HEADERS, ...o.headers, host: url.host },
+        path: wire.target,
+        headers: wire.headers,
         createConnection: () => sock,
       },
       (res) => {
@@ -220,7 +247,9 @@ async function hop(url, o) {
 /**
  * GET with redirects followed by hand: every hop is checked again and goes through a new CONNECT (the proxy
  * re-resolves and re-checks the address).
- * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string }} o
+ * With `manual`, a redirect is not followed: its absolute target comes back as `redirect` (the server checks every
+ * hop's URL before it is requested — #113 — and sends the next hop as a job of its own).
+ * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string, manual?: boolean }} o
  */
 export async function get(input, o) {
   const limits = { ...LIMITS, ...o.limits };
@@ -253,6 +282,7 @@ export async function get(input, o) {
       } catch {
         throw new WebError("web_bad_url");
       }
+      if (o.manual) return { url, ...r, redirect: url };
       continue;
     }
     return { url, ...r };
@@ -435,11 +465,12 @@ const bounded = (t, max) =>
 
 /**
  * Fetches a page and extracts it.
- * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS> }} o
+ * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, manual?: boolean }} o
  */
 export async function fetchPage(input, o) {
   const limits = { ...LIMITS, ...o.limits };
   const r = await get(input, o);
+  if (r.redirect) return { redirect: r.redirect.toString() };
   if (r.status < 200 || r.status >= 300) throw new WebError("web_http_error");
   const ct = String(r.headers["content-type"] ?? "").toLowerCase();
   let mime = ct.split(";")[0].trim();
@@ -622,36 +653,62 @@ export function scrubBody(body, hidden) {
  * - `mode: "capture", capture: <name>`: its body (one short token) replaces `{<name>}` in the later URLs and is
  *   not returned (a session token, never handed back);
  * - otherwise its `{ status, contentType, body }` is returned, in order.
- * Cookie and captured values never leave this process.
+ * Cookie and captured values never reach the model: they leave this process only in a `pause` (manual redirects),
+ * back to the server that started the job, which hands them to the job that resumes it.
  * @param {{ steps?: unknown }} job @param {{ proxy: string, ca?: string }} o
  */
 export async function fetchRaw(job, o) {
   const steps = job.steps;
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > RAW_LIMITS.maxSteps)
     throw new WebError("web_bad_input");
-  const jar = new Map();
-  const vars = new Map();
+  const manual = job.redirect === "manual";
+  // Approval mode (the server, #113 review round 2): no request goes out that the server has not seen in its exact
+  // wire form. The job stops before each send and hands the request back (`pause`, reason "send"); the job that
+  // resumes it carries that request as `approved` and sends it only if it builds exactly the same one.
+  const approve = manual && job.approve === true;
+  const resume = manual ? readResume(job.resume) : undefined;
+  // What is left of the server's whole-call budget (finance): every send of this job shares it.
+  const ms = Number(job.timeoutMs);
+  const jobDeadline = Number.isFinite(ms) && ms > 0 ? Date.now() + ms : undefined;
+  const jar = new Map(resume?.jar);
+  const vars = new Map(resume?.vars);
   /** Every session value of the job, kept after the jar replaced it. */
-  const seen = new Set();
+  const seen = new Set(resume?.seen);
   const responses = [];
-  for (const step of steps) {
+  for (const [i, step] of steps.entries()) {
     if (!step || typeof step !== "object" || typeof step.url !== "string")
       throw new WebError("web_bad_input");
-    const url = step.url.replace(/\{(\w{1,20})\}/g, (m, k) =>
-      vars.has(k) ? encodeURIComponent(vars.get(k)) : m,
-    );
-    /** @type {Record<string,string>} */
-    const headers = {};
-    for (const [k, v] of Object.entries(step.headers ?? {}))
-      if (STEP_HEADERS.has(k.toLowerCase()) && typeof v === "string" && /^[\x20-\x7e]{1,200}$/.test(v))
-        headers[k.toLowerCase()] = v;
-    if (!headers.accept) headers.accept = "application/json,text/plain;q=0.9,*/*;q=0.1";
-    if (jar.size) headers.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+    // A resumed redirect target is the site's URL as the server checked it: nothing is substituted into it.
+    const literal = i === 0 && resume?.literal === true;
+    const url = literal
+      ? step.url
+      : step.url.replace(/\{(\w{1,20})\}/g, (m, k) => (vars.has(k) ? encodeURIComponent(vars.get(k)) : m));
+    const headers = stepHeaders(step, jar);
+    const pauseAt = (reason, target, h) => {
+      let request;
+      try {
+        request = wireRequest(target, h);
+      } catch {
+        throw new WebError("web_bad_url");
+      }
+      return { reason, step: i, url: target, request, jar: [...jar], vars: [...vars], seen: [...seen] };
+    };
+    if (approve) {
+      const next = pauseAt("send", url, headers);
+      const ok =
+        i === 0 && resume?.approved !== undefined && canonical(resume.approved) === canonical(next.request);
+      if (!ok) return { responses, pause: next };
+    }
     const r = await get(url, {
       ...o,
       headers,
       httpsOnly: true,
-      limits: { maxBytes: RAW_LIMITS.maxBytes, maxRedirects: RAW_LIMITS.maxRedirects },
+      limits: {
+        maxBytes: RAW_LIMITS.maxBytes,
+        maxRedirects: RAW_LIMITS.maxRedirects,
+        ...(jobDeadline ? { totalMs: Math.min(LIMITS.totalMs, jobDeadline - Date.now()) } : {}),
+      },
+      ...(manual ? { manual: true } : {}),
     });
     const set = r.headers["set-cookie"];
     for (const c of Array.isArray(set) ? set : set ? [set] : []) {
@@ -660,6 +717,10 @@ export async function fetchRaw(job, o) {
       if (seen.size < MAX_SEEN) seen.add(m[2]);
       if (jar.has(m[1]) || jar.size < 20) jar.set(m[1], m[2]);
     }
+    // `redirect: "manual"` (the server, #113): the job stops at a redirect and hands back its target and the
+    // session so far; the server checks the target and sends the rest of the steps from there as a new job.
+    if (r.redirect)
+      return { responses, pause: pauseAt("redirect", r.redirect.toString(), stepHeaders(step, jar)) };
     if (step.mode === "cookie") continue;
     const ct = String(r.headers["content-type"] ?? "").toLowerCase();
     const body = decode(r.body, ct);
@@ -680,10 +741,56 @@ export async function fetchRaw(job, o) {
   return { responses };
 }
 
+/**
+ * The headers a raw step sends (besides the fixed ones): its own allowed ones, an accept, the cookie jar.
+ * @param {{ headers?: Record<string, unknown> }} step @param {Map<string,string>} jar
+ */
+function stepHeaders(step, jar) {
+  /** @type {Record<string,string>} */
+  const headers = {};
+  for (const [k, v] of Object.entries(step.headers ?? {}))
+    if (STEP_HEADERS.has(k.toLowerCase()) && typeof v === "string" && /^[\x20-\x7e]{1,200}$/.test(v))
+      headers[k.toLowerCase()] = v;
+  if (!headers.accept) headers.accept = "application/json,text/plain;q=0.9,*/*;q=0.1";
+  if (jar.size) headers.cookie = [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+  return headers;
+}
+
+/**
+ * The session a resumed raw job starts with (what an earlier job of the same plan handed back at a redirect):
+ * cookie jar and captured values as `[name, value]` pairs, the seen values; bounded like a job's own.
+ */
+function readResume(x) {
+  if (!x || typeof x !== "object") return undefined;
+  const pairs = (a, max) =>
+    Array.isArray(a)
+      ? a
+          .filter(
+            (p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && typeof p[1] === "string",
+          )
+          .slice(0, max)
+      : [];
+  const strings = (a, max) => (Array.isArray(a) ? a.filter((v) => typeof v === "string").slice(0, max) : []);
+  return {
+    jar: pairs(x.jar, 20),
+    vars: pairs(x.vars, RAW_LIMITS.maxSteps),
+    seen: strings(x.seen, MAX_SEEN),
+    literal: x.literal === true,
+    ...(x.approved && typeof x.approved === "object" ? { approved: x.approved } : {}),
+  };
+}
+
 /** Runs one job. Never throws: a fixed code on failure (no message, which could carry page text). */
 export async function run(job, o) {
   try {
-    if (job.op === "fetch") return { ok: true, ...(await fetchPage(job.url, o)) };
+    if (job.op === "fetch") {
+      // `redirect: "manual"` (the server, #113): one hop only, its time bounded by what the job has left.
+      const manual = job.redirect === "manual";
+      const ms = Number(job.timeoutMs);
+      const totalMs = Number.isFinite(ms) && ms > 0 ? Math.min(ms, LIMITS.totalMs) : undefined;
+      const limits = { ...o.limits, ...(totalMs ? { totalMs } : {}) };
+      return { ok: true, ...(await fetchPage(job.url, { ...o, limits, ...(manual ? { manual } : {}) })) };
+    }
     if (job.op === "raw") return { ok: true, ...(await fetchRaw(job, o)) };
     if (job.op === "search" && job.provider === "duckduckgo")
       return { ok: true, ...(await searchDuckDuckGo(job, o)) };

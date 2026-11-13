@@ -1,3 +1,4 @@
+import { SEARCH_DECOY } from "../secrets/egress.js";
 import fs from "node:fs";
 import { z } from "zod";
 import {
@@ -73,6 +74,7 @@ import {
   duckDuckGoProvider,
   sandboxedWorker,
   WebService,
+  blockedByEgress,
   type Proxy,
   type SearchProvider,
   type SearchProviderName,
@@ -183,7 +185,7 @@ export function skillPolicy(
   if (skill.hosts.length) env.SSL_CERT_FILE = SYSTEM_CA_BUNDLE;
   return {
     command: ctx.python.exe,
-    args: ["-I", "-S", "-B", skill.entry, ...args],
+    args: ["-I", "-S", "-B", ...(skill.noRedirects ? ["-c", NO_REDIRECT_BOOT] : []), skill.entry, ...args],
     cwd: skill.dir,
     env,
     read: [skill.dir],
@@ -193,6 +195,22 @@ export function skillPolicy(
     secretValues,
   };
 }
+
+/**
+ * Runs a python script (argv[1]) with urllib's redirects refused (`BundledSkill.noRedirects`, #113): the redirect
+ * handler's `redirect_request` — which every opener, the default one and any the script builds, goes through —
+ * raises an `HTTPError` instead of building the next request. Nothing else changes: same flags, same `__main__`,
+ * same exit code; the script's own handling of an HTTP error decides what it reports.
+ */
+export const NO_REDIRECT_BOOT = [
+  "import runpy, sys, urllib.error, urllib.request",
+  "def _refuse(self, req, fp, code, msg, headers, newurl):",
+  "    raise urllib.error.HTTPError(req.full_url, code, 'redirect not followed', headers, fp)",
+  "urllib.request.HTTPRedirectHandler.redirect_request = _refuse",
+  "urllib.request.install_opener(urllib.request.build_opener())",
+  "sys.argv = sys.argv[1:]",
+  "runpy.run_path(sys.argv[0], run_name='__main__')",
+].join("\n");
 
 export type SandboxedRunnerOptions = {
   limits?: SkillLimits;
@@ -306,11 +324,8 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
   return false;
 }
 
-/**
- * The query sent in place of one that carries a known secret (watchlist search, review #111 round 3): fixed, never the
- * user's text, harmless, and its hits are never shown.
- */
-export const SEARCH_DECOY = "agentlee decoy no match";
+/** The decoy query (one constant for the watchlist search and web_search — secrets/egress.ts). */
+export { SEARCH_DECOY };
 
 /** Sources `sources_list` returns at most (the newest). */
 const SOURCES_LIST_MAX = 100;
@@ -507,7 +522,11 @@ export class McpService {
    */
   private buildWeb(o: WebOptions): WebService {
     const worker = o.worker ?? sandboxedWorker();
-    const news = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
+    // As a web_search provider the skill runs with redirects refused (#113 review round 3): the query is checked
+    // here, but a redirect's URL is the site's — a 302 to `…/rss/search?q=<secret>` must not go out unchecked. A
+    // refused redirect is a failed search (`web_search_unavailable`): the next provider is tried.
+    const found = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
+    const news = found ? { ...found, noRedirects: true } : undefined;
     const providers =
       o.searchProviders ??
       (o.providers ?? ["duckduckgo", "google-news"]).flatMap((name): SearchProvider[] => {
@@ -867,7 +886,8 @@ export class McpService {
           tool: name,
           status: r.ok ? "ok" : "error",
           durationMs: now() - t0,
-          ...(r.ok ? {} : { webCode: r.code }),
+          // The guard's refusal is told to the model as an ordinary failure; only the log says why (#113).
+          ...(blockedByEgress(r) ? { webCode: "web_secret_blocked" } : r.ok ? {} : { webCode: r.code }),
         });
         return r;
       },

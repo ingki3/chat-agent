@@ -45,6 +45,8 @@ export const ARTICLE = `<!doctype html><html><head><meta charset="utf-8">
 </article>
 <footer>FOOTER_TEXT 저작권</footer></body></html>`;
 
+export type FixtureRoute = { status?: number; headers?: Record<string, string | string[]>; body?: string };
+
 export type WebFixture = {
   proxy: RunningEgress;
   worker: WebWorker;
@@ -56,16 +58,29 @@ export type WebFixture = {
   tlsWorker: WebWorker;
   /** Request headers the fixture saw, by path. */
   seen: Map<string, http.IncomingHttpHeaders>;
+  /** Redirects a test sets: path → Location (a target only the site knows — #113). */
+  redirects: Map<string, string>;
+  /** Answers a test sets: path → status, headers (e.g. Set-Cookie), body. */
+  routes: Map<string, FixtureRoute>;
   lookups: Map<string, number>;
   close(): Promise<void>;
 };
 
 export async function startWebFixture(): Promise<WebFixture> {
   const seen = new Map<string, http.IncomingHttpHeaders>();
+  const redirects = new Map<string, string>();
+  const routes = new Map<string, FixtureRoute>();
   const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://fixture");
     seen.set(url.pathname, req.headers);
     const redirect = (to: string, code = 302) => res.writeHead(code, { location: to }).end();
+    const set = redirects.get(url.pathname);
+    if (set !== undefined) return redirect(set);
+    const route = routes.get(url.pathname);
+    if (route)
+      return res
+        .writeHead(route.status ?? 200, { "content-type": "application/json", ...route.headers })
+        .end(route.body ?? "{}");
     switch (url.pathname) {
       case "/article.html":
         return res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(ARTICLE);
@@ -244,6 +259,8 @@ export async function startWebFixture(): Promise<WebFixture> {
     leaks,
     connects,
     seen,
+    redirects,
+    routes,
     lookups,
     close: async () => {
       await proxy.close();

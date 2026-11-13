@@ -65,6 +65,13 @@ type Compiled = {
 
 export class KnownSecrets {
   private readonly values = new Set<string>();
+  /**
+   * Each registered value whole (the matcher registers long ones in pieces), and how: `plain` (a secret string) or
+   * `document` (a JSON credential registered by `addCredential` — its secret strings are registered on their own).
+   * The egress guard's windows are taken from these (#113): across piece boundaries, and never from a document's
+   * structure. A value registered plainly at least once is `plain`.
+   */
+  private readonly originals = new Map<string, "plain" | "document">();
   private compiled: Compiled | undefined;
   private gen = 0;
   /** Like `gen`, for values that may already be stored (not `fresh` ones: a new run token cannot be in a row). */
@@ -88,8 +95,21 @@ export class KnownSecrets {
    * here (a run token, a new session) — it cannot be in any stored row yet, so no rescrub is needed.
    */
   add(value: string | undefined | null, opts: { fresh?: boolean } = {}): void {
+    this.register(value, opts, "plain");
+  }
+
+  private register(value: string | undefined | null, opts: { fresh?: boolean }, kind: "plain" | "document") {
+    const ps = pieces(value);
+    if (ps.length && typeof value === "string") {
+      const was = this.originals.get(value);
+      const next = was === "plain" || kind === "plain" ? "plain" : "document";
+      if (was !== next) {
+        this.originals.set(value, next);
+        this.gen++;
+      }
+    }
     const added: string[] = [];
-    for (const v of pieces(value)) {
+    for (const v of ps) {
       if (this.values.has(v)) continue;
       this.values.add(v);
       this.compiled = undefined;
@@ -109,6 +129,7 @@ export class KnownSecrets {
 
   /** Forgets a value that is no longer valid anywhere (a revoked run token, an ended session). */
   remove(value: string | undefined | null): void {
+    if (typeof value === "string" && this.originals.delete(value)) this.gen++;
     for (const v of pieces(value))
       if (this.values.delete(v)) {
         this.compiled = undefined;
@@ -121,14 +142,17 @@ export class KnownSecrets {
    * every string under a secret-looking key, so one token of it is found on its own.
    */
   addCredential(plaintext: string): void {
-    this.add(plaintext);
-    if (!/^\s*[[{]/.test(plaintext)) return;
     let parsed: unknown;
-    try {
-      parsed = JSON.parse(plaintext);
-    } catch {
-      return;
-    }
+    if (/^\s*[[{]/.test(plaintext))
+      try {
+        parsed = JSON.parse(plaintext);
+      } catch {
+        parsed = undefined;
+      }
+    // A JSON document (object or array) is a `document`; anything else is a secret string like any other.
+    const doc = !!parsed && typeof parsed === "object";
+    this.register(plaintext, {}, doc ? "document" : "plain");
+    if (!doc) return;
     const walk = (v: unknown, secretKey: boolean, depth: number): void => {
       if (depth > 8) return;
       if (typeof v === "string") {
@@ -148,6 +172,11 @@ export class KnownSecrets {
     this.add(key.toString("hex"));
   }
 
+  /** Every registered value whole, except JSON credential documents (the egress guard's windows, #113). */
+  windowSources(): string[] {
+    return [...this.originals].flatMap(([v, kind]) => (kind === "plain" ? [v] : []));
+  }
+
   /** Every registered value (for the skill and finance output scrubbers, which pull from here too). */
   list(): string[] {
     return [...this.values];
@@ -160,6 +189,7 @@ export class KnownSecrets {
   /** Test helper: forgets everything. */
   clear(): void {
     this.values.clear();
+    this.originals.clear();
     this.compiled = undefined;
     this.gen++;
     this.storedGen++;
