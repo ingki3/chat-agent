@@ -27,6 +27,11 @@ export function storagePaths(dataDir: string) {
      * `files/` (a rename), outside every backup root; emptied at server start.
      */
     uploadsTmp: path.join(root, "uploads-tmp"),
+    /**
+     * The OCR language models (#48), copied from their pinned packages on first use so the extractor reads both
+     * from one folder. Derived data, outside every backup root.
+     */
+    ocrLang: path.join(root, "ocr-lang"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>

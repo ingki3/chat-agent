@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { FINANCE_DISCLAIMER } from "./finance.js";
+import { FileLocator } from "./locators.js";
 
 /**
  * Web citations (#25, PRD FR-5.1–5.5, G2, 수용 기준 3·11). The model cites with the `cite` tool (`{ sourceId,
@@ -78,6 +79,11 @@ export const CitationEntry = z.object({
    * meant to quote) — or null for `unknown_source`.
    */
   quote: z.string().max(CITATION_LIMITS.snippet).nullable(),
+  /**
+   * A citation of an uploaded file (#48, `file_cite`): where the passage is. Then `title` is the file name, `site`
+   * the place ("12쪽", `locatorLabel`), `url` null and `sourceId` null. Absent for web citations.
+   */
+  locator: FileLocator.optional(),
 });
 export type CitationEntry = z.infer<typeof CitationEntry>;
 

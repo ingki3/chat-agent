@@ -1,11 +1,17 @@
 import crypto from "node:crypto";
 import { and, asc, eq, sql } from "drizzle-orm";
-import { boundText, CITATION_LIMITS, type CitationStatus, type CiteResult } from "@agentlee/shared";
+import {
+  boundText,
+  CITATION_LIMITS,
+  type CitationStatus,
+  type CiteResult,
+  type FileLocator,
+} from "@agentlee/shared";
 import type { Db } from "../db/client.js";
-import { citations, conversations, sources } from "../db/schema.js";
+import { citations, conversations, files, sources } from "../db/schema.js";
 import type { SourceScope } from "../web/sources.js";
 import { findSnippet, normalizeSnippet } from "./verify.js";
-import { scrubKnown } from "../secrets/known.js";
+import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 
 export type CitationRow = typeof citations.$inferSelect;
 
@@ -116,13 +122,99 @@ export class CitationStore {
     );
   }
 
-  private existing(runId: string, key: string, sourceId: string | null): CitationRow | undefined {
+  /**
+   * A file citation (#48, `file_cite`), numbered with the run's web citations. `check` looks for the snippet in
+   * the file's extracted text — called only once the file is known to be this conversation's and this user's
+   * (`fileId` null otherwise: `unknown_source`). The same file and snippet twice keep their first number; a retry
+   * that now verifies upgrades the entry (as `cite`).
+   */
+  citeFile(
+    scope: SourceScope,
+    input: { fileId: string | null; snippet: string },
+    check: (snippet: string) => {
+      status: CitationStatus;
+      quote: string | null;
+      locator: (FileLocator & { sheetNo?: number | undefined }) | null;
+    },
+  ): CiteResult & { locator: (FileLocator & { sheetNo?: number | undefined }) | null } {
+    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
+      throw new CiteRefused("cite_snippet_too_short");
+    const key = snippetKey(snippet);
+    const owner = this.db
+      .select({ ownerId: conversations.ownerId })
+      .from(conversations)
+      .where(eq(conversations.id, scope.conversationId))
+      .get();
+    if (owner?.ownerId !== scope.userId) throw new CiteRefused("cite_not_allowed");
+    const fileId = input.fileId;
+    const existing = this.existing(scope.runId, key, null, fileId);
+    if (!existing && this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
+    // The file's state now comes before anything this run registered (review #107 7차): a file being extracted
+    // again (a new secret) or one that failed is `fetch_failed`, whatever an earlier call verified.
+    const found = fileId ? check(snippet) : { status: "unknown_source" as const, quote: null, locator: null };
+    const quote = found.quote === null ? null : scrubKnown(found.quote);
+    const locator = found.locator ? JSON.stringify(scrubKnownDeep(found.locator)) : null;
+    return this.db.transaction(
+      () => {
+        const again = this.existing(scope.runId, key, null, fileId);
+        if (again) {
+          // Only a check that verifies **now** stands (review #107 8차): verified against the text as it is now (an
+          // extraction may have replaced it); any other current result — not found, unreadable, pending —
+          // replaces what an earlier call verified. Its number stays.
+          if (found.status === "verified") {
+            this.db
+              .update(citations)
+              .set({ status: found.status, quote, snippet, locator })
+              .where(eq(citations.id, again.id))
+              .run();
+            return { ...result(again.n, "verified", null), locator: found.locator };
+          }
+          this.db
+            .update(citations)
+            .set({ status: found.status, quote: null, snippet, locator: null })
+            .where(eq(citations.id, again.id))
+            .run();
+          return { ...result(again.n, found.status, null), locator: null };
+        }
+        const count = this.count(scope.runId);
+        if (count >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
+        const n = count + 1;
+        this.db
+          .insert(citations)
+          .values({
+            id: crypto.randomUUID(),
+            runId: scope.runId,
+            conversationId: scope.conversationId,
+            userId: scope.userId,
+            n,
+            sourceId: null,
+            fileId,
+            status: found.status,
+            snippet,
+            snippetKey: key,
+            quote,
+            locator,
+          })
+          .run();
+        return { ...result(n, found.status, null), locator: found.locator };
+      },
+      { behavior: "immediate" },
+    );
+  }
+
+  private existing(
+    runId: string,
+    key: string,
+    sourceId: string | null,
+    fileId: string | null = null,
+  ): CitationRow | undefined {
     return this.db
       .select()
       .from(citations)
       .where(and(eq(citations.runId, runId), eq(citations.snippetKey, key)))
       .all()
-      .find((c) => c.sourceId === sourceId);
+      .find((c) => c.sourceId === sourceId && (c.fileId ?? null) === fileId);
   }
 
   private count(runId: string): number {
@@ -135,8 +227,11 @@ export class CitationStore {
     );
   }
 
-  /** The run's citations by number, with their sources (the note at the end of the run). */
-  forRun(runId: string): (CitationRow & { source: typeof sources.$inferSelect | undefined })[] {
+  /** The run's citations by number, with their sources or files (the note at the end of the run). */
+  forRun(runId: string): (CitationRow & {
+    source: typeof sources.$inferSelect | undefined;
+    file?: { id: string; name: string } | undefined;
+  })[] {
     const rows = this.db
       .select()
       .from(citations)
@@ -150,6 +245,20 @@ export class CitationStore {
             .select()
             .from(sources)
             .where(and(eq(sources.id, r.sourceId), eq(sources.conversationId, r.conversationId)))
+            .get()
+        : undefined,
+      // A file of the same conversation and user only (the row's own scope).
+      file: r.fileId
+        ? this.db
+            .select({ id: files.id, name: files.name })
+            .from(files)
+            .where(
+              and(
+                eq(files.id, r.fileId),
+                eq(files.conversationId, r.conversationId),
+                eq(files.userId, r.userId),
+              ),
+            )
             .get()
         : undefined,
     }));

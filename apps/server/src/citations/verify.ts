@@ -426,14 +426,29 @@ export type SnippetMatch =
  * normalised text.
  */
 export function findSnippet(body: string, snippet: string, cacheKey?: string): SnippetMatch {
+  const m = findSnippetAt(body, snippet, cacheKey);
+  return m.found ? { found: true, quote: m.quote } : m;
+}
+
+/**
+ * `findSnippet` with where the passage is: `[start, end)` of the original text (UTF-16 units). Same rules — the
+ * file citations (#48) use it to place a verified passage on its page, line or cell.
+ */
+export function findSnippetAt(
+  body: string,
+  snippet: string,
+  cacheKey?: string,
+):
+  | { found: true; quote: string; start: number; end: number }
+  | { found: false; reason: "too_short" | "not_found" } {
   const forms = snippetForms(snippet);
   if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet)
     return { found: false, reason: "too_short" };
   const page = pageOf(body, cacheKey);
   // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
   for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const quote = matchIn(body, page.n, page.d, want);
-    if (quote !== undefined) return { found: true, quote };
+    const m = matchIn(body, page.n, page.d, want);
+    if (m !== undefined) return { found: true, ...m };
   }
   return { found: false, reason: "not_found" };
 }
@@ -441,13 +456,13 @@ export function findSnippet(body: string, snippet: string, cacheKey?: string): S
 const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
 const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
-/** The first occurrence of `want` in the page that respects every boundary rule, as the original passage. */
+/** The first occurrence of `want` in the page that respects every boundary rule: the original passage and range. */
 function matchIn(
   body: string,
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
-): string | undefined {
+): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
   // (A sign or currency sign first is covered: the number after it is in the first two tokens.)
@@ -477,7 +492,11 @@ function matchIn(
       // list that itself ends at a token boundary (`수출이`, `반도체였다`).
       if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     }
-    return boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet);
+    return {
+      quote: boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet),
+      start,
+      end,
+    };
   }
   return undefined;
 }

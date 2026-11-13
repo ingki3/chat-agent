@@ -5,6 +5,7 @@ import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
 import { SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
+import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -50,6 +51,10 @@ import {
  *   /doc <kind> [<fileId>]   "이 내용을 <kind> 보고서로" (#49): real calls of `doc_create` (the report of
  *                     `fake-docs.ts`, with the picture `fileId` when given) and `artifact_create` (a `document`
  *                     artifact of that file); kind docx|xlsx|pptx|pdf, or hwp for the refusal
+ *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
+ *                     missing) and the scenario's answer with `[n]` markers (#48)
+ *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
+ *
  * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
  * was given — deterministic, so tests can tell which messages a summary covers.
  */
@@ -299,6 +304,17 @@ function citationSteps(t: string): FakeStep[] | undefined {
     const sc = CITATION_SCENARIOS[named[1] as CitationScenarioName];
     return [...sc.calls.map((c) => ({ call: c.tool, input: c.input })), { text: sc.answer }];
   }
+  const file = /^\/file-(\w+)$/.exec(t);
+  if (file && Object.hasOwn(FILE_SCENARIOS, file[1]!)) {
+    const sc = FILE_SCENARIOS[file[1] as FileScenarioName];
+    return [...sc.calls.map((c) => ({ call: c.tool, input: c.input })), { text: sc.answer }];
+  }
+  const fileById = /^\/file-cite\s+(\S+)\s+([\s\S]+)$/.exec(t);
+  if (fileById)
+    return [
+      { call: "file_cite", input: { fileId: fileById[1]!, snippet: fileById[2]! } },
+      { text: "그 파일에 따르면 그렇다고 해요[1]." },
+    ];
   const byId = /^\/cite-id\s+(\S+)\s+([\s\S]+)$/.exec(t);
   if (byId)
     return [

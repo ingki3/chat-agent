@@ -42,6 +42,14 @@ import {
 } from "@agentlee/shared";
 import { DOC_CREATE_TOOL, DOC_TOOLS } from "@agentlee/mcp-tools/docgen";
 import type { DocGenService } from "../docgen/service.js";
+import {
+  FILE_CITE_TOOL,
+  FILE_LIST_TOOL,
+  FILE_READ_TOOL,
+  FILE_SEARCH_TOOL,
+  FILE_TOOLS,
+} from "@agentlee/mcp-tools/files";
+import type { FileTools } from "../files/text.js";
 import { CiteRefused, type CitationStore } from "../citations/store.js";
 import { ArtifactError, type ArtifactBody, type ArtifactStore } from "../artifacts/store.js";
 import type { ServerToolInfo } from "@agentlee/mcp-tools";
@@ -315,6 +323,18 @@ const CITE_HINT: Record<string, string> = {
     "Not a source of this conversation. Use a sourceId from web_fetch or sources_list; otherwise the user sees this citation with a warning.",
 };
 
+/** What the model is told per file citation status (#48, fixed words). */
+const FILE_CITE_HINT: Record<string, string> = {
+  verified:
+    "The passage is in the file. Put the marker at the end of the sentence it supports; the user sees the file name and this place.",
+  snippet_not_found:
+    "The passage is not in the file's text. Copy a passage exactly from what file_read or file_search returned and cite again; otherwise the user sees this citation with a warning.",
+  fetch_failed:
+    "This file's text could not be read (see its extract status in file_list). Do not state its content as cited; otherwise the user sees this citation with a warning.",
+  unknown_source:
+    "Not a file of this conversation. Use a fileId from file_list; otherwise the user sees this citation with a warning.",
+};
+
 /** At most this many skill processes at once — in total and per run. Beyond that a call is refused at once. */
 export type SkillConcurrency = { total: number; perRun: number };
 export const DEFAULT_SKILL_CONCURRENCY: SkillConcurrency = { total: 4, perRun: 2 };
@@ -343,6 +363,11 @@ export type McpServiceOptions = {
   artifacts?: ArtifactStore;
   /** Document generation (#49). Without it `doc_create` is not offered. */
   docs?: DocGenService;
+  /**
+   * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
+   * `file_cite`. Without it the file tools are not offered.
+   */
+  files?: { tools: FileTools; citations?: CitationStore };
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
   /** 관심 종목 (#31): `watchlist_get` reads the run's user's list. Without it the tool is not offered. */
@@ -438,6 +463,9 @@ export class McpService {
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
       ...(opts.scheduleProposals ? [SCHEDULE_CREATE_TOOL] : []),
       ...(opts.docs ? DOC_TOOLS : []),
+      ...(opts.files
+        ? FILE_TOOLS.filter((t) => t.name !== FILE_CITE_TOOL.name || opts.files?.citations)
+        : []),
     ];
     this.finance = opts.finance
       ? new FinanceService(
@@ -719,6 +747,25 @@ export class McpService {
           });
           return r;
         }
+        if (FILE_TOOLS.some((t) => t.name === name)) {
+          const r = await this.callFileTool(toolByName.get(name), input, scope);
+          const status = r.ok ? (r.output as { status?: unknown }).status : undefined;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "file.tool_finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // The fixed outcome only: never the file id, the query, the snippet or the text.
+            ...(r.ok
+              ? typeof status === "string"
+                ? { fileToolCode: status }
+                : {}
+              : { fileToolCode: r.code }),
+          });
+          return r;
+        }
         if (ARTIFACT_TOOLS.some((t) => t.name === name)) {
           const r = this.callArtifactTool(toolByName.get(name), input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "artifact.finished", {
@@ -850,6 +897,76 @@ export class McpService {
     const docs = this.opts.docs;
     if (!docs || !this.users.byId(scope.userId)?.active) return { ok: false, code: "doc_not_allowed" };
     return (await this.withSlot(scope, () => docs.create(scope, input))) ?? { ok: false, code: "doc_busy" };
+  }
+
+  /**
+   * A file tool call (#48): active user, strict input, then the file tools — which read only the token's own
+   * conversation's files, after checking that the token's user owns it (the #22 rules). File names and text go
+   * back inside `<external_content>` blocks.
+   */
+  private async callFileTool(
+    tool: ServerToolInfo | undefined,
+    input: Record<string, unknown>,
+    scope: ToolScope,
+  ): Promise<SkillResult> {
+    const files = this.opts.files;
+    if (!tool || !files || !this.users.byId(scope.userId)?.active)
+      return { ok: false, code: "file_not_allowed" };
+    const parsed = z.strictObject(tool.input).safeParse(input);
+    if (!parsed.success) return { ok: false, code: "file_bad_input" };
+    const d = parsed.data as {
+      fileId?: string;
+      from?: number;
+      to?: number;
+      sheet?: string;
+      cursor?: string;
+      query?: string;
+      maxResults?: number;
+      snippet?: string;
+      page?: number;
+    };
+    if (tool.name === FILE_LIST_TOOL.name) return files.tools.list(scope);
+    if (tool.name === FILE_READ_TOOL.name)
+      return files.tools.read(scope, {
+        fileId: d.fileId!,
+        from: d.from,
+        to: d.to,
+        sheet: d.sheet,
+        cursor: d.cursor,
+      });
+    if (tool.name === FILE_SEARCH_TOOL.name)
+      return files.tools.search(scope, { query: d.query!, fileId: d.fileId, maxResults: d.maxResults });
+    if (tool.name !== FILE_CITE_TOOL.name || !files.citations) return { ok: false, code: "file_not_allowed" };
+    const file = files.tools.fileFor(scope, d.fileId!);
+    // Looked for before the citation is numbered (an extraction still running is waited for, bounded).
+    const found = file ? await files.tools.check(file, d.snippet!, d.page) : undefined;
+    try {
+      const r = files.citations.citeFile(
+        scope,
+        { fileId: file?.id ?? null, snippet: d.snippet! },
+        () => found!,
+      );
+      // The model's view of the place: a sheet by id, never its name (file text, review #107).
+      const where = r.locator && file ? files.tools.modelLocator(r.locator) : undefined;
+      return {
+        ok: true,
+        // Through the secrets known now, like every file tool output (review #107).
+        output: scrubKnownDeep(
+          {
+            n: r.n,
+            marker: r.marker,
+            status: r.status,
+            fileId: file?.id ?? null,
+            ...(where ? { locator: where.locator, label: where.label } : {}),
+            hint: FILE_CITE_HINT[r.status],
+          },
+          { tail: false },
+        ),
+      };
+    } catch (e) {
+      if (e instanceof CiteRefused) return { ok: false, code: e.code };
+      throw e;
+    }
   }
 
   /**

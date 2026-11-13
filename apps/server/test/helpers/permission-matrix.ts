@@ -148,6 +148,8 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /api/conversations/:id/files", expect: OWNER_ONLY, fixture: conversation },
   { route: "GET /api/files/:id", expect: NOT_SHARED(READ), fixture: uploaded },
   { route: "GET /api/files/:id/content", expect: NOT_SHARED(READ), fixture: uploaded },
+  // Its extracted text (#48): the same check as the original.
+  { route: "GET /api/files/:id/extract", expect: NOT_SHARED(READ), fixture: uploaded },
   { route: "DELETE /api/files/:id", expect: OWNER_ONLY, fixture: uploaded },
   // Artifacts (#27): owner only until sharing (#29); the page and the originals check the same way.
   { route: "GET /api/conversations/:id/artifacts", expect: OWNER_ONLY, fixture: conversation },

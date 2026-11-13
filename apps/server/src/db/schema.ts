@@ -730,6 +730,10 @@ export const citations = sqliteTable(
     snippetKey: text("snippet_key").notNull(),
     /** Verified: the passage as it stands in the stored page text. */
     quote: text("quote"),
+    /** A file citation (#48, `file_cite`): the cited upload (then `source_id` is null). */
+    fileId: text("file_id"),
+    /** A verified file citation: where the passage is (`FileLocator` JSON). */
+    locator: text("locator"),
     createdAt: integer("created_at").notNull().default(now),
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],
@@ -931,4 +935,60 @@ export const watchlistItems = sqliteTable(
     createdAt: integer("created_at").notNull().default(now),
   },
   (t) => [uniqueIndex("watchlist_items_user_symbol_idx").on(t.userId, t.market, t.symbol)],
+);
+
+/**
+ * Text extraction of an upload (#48): one row per file, `pending` until the sandboxed extractor ran. Rows and
+ * segments go with their file (cascade). Written by `FileExtracts` only.
+ */
+export const fileExtracts = sqliteTable("file_extracts", {
+  fileId: text("file_id")
+    .primaryKey()
+    .references(() => files.id, { onDelete: "cascade" }),
+  status: text("status", { enum: ["pending", "ok", "failed"] }).notNull(),
+  /** Why it failed (`EXTRACT_CODES`); null otherwise. */
+  code: text("code"),
+  ocr: text("ocr", { enum: ["none", "done", "partial", "unavailable"] })
+    .notNull()
+    .default("none"),
+  /** Pages, slides, sheets … of the file; null when not known. */
+  units: integer("units"),
+  segments: integer("segments").notNull().default(0),
+  characters: integer("characters").notNull().default(0),
+  truncated: integer("truncated", { mode: "boolean" }).notNull().default(false),
+  /** Some unit ends early (`file_segments.ends_early`): for display — the rule itself reads the units. */
+  endedEarly: integer("ended_early", { mode: "boolean" }).notNull().default(false),
+  /** The extractor version that wrote the row (a newer one extracts again). */
+  extractor: text("extractor").notNull(),
+  /** Attempts so far (a server that died mid-extraction retries it a bounded number of times). */
+  attempts: integer("attempts").notNull().default(0),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/** The extracted text of a file, one unit per row (page, slide, paragraph, table row, sheet row, run of lines). */
+export const fileSegments = sqliteTable(
+  "file_segments",
+  {
+    fileId: text("file_id")
+      .notNull()
+      .references(() => files.id, { onDelete: "cascade" }),
+    seq: integer("seq").notNull(),
+    /** The unit's number in the file's natural order (`file_read` ranges over it). */
+    unit: integer("unit").notNull(),
+    /** `UnitLocator` JSON (kind and fields; the sheet name of an XLSX row). */
+    locator: text("locator").notNull(),
+    text: text("text").notNull(),
+    /** Finer places inside `text`: `[start, end, fields]` JSON (line boxes, cells, OCR words); null when none. */
+    marks: text("marks"),
+    /**
+     * A known secret across two marks was scrubbed out of `text` (files/scrub.ts): the marks are gone and only the
+     * unit's own locator is true — nothing finer (box, range, line) may be claimed.
+     */
+    approximate: integer("approximate", { mode: "boolean" }).notNull().default(false),
+    /** The stored copy was cut for display after scrubbing (`text` or the sheet name): it has a gap. */
+    cut: integer("cut", { mode: "boolean" }).notNull().default(false),
+    /** Text the extractor did not take follows right after this unit: the cut-off-secret rule applies here only. */
+    endsEarly: integer("ends_early", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [primaryKey({ columns: [t.fileId, t.seq] }), index("file_segments_unit_idx").on(t.fileId, t.unit)],
 );

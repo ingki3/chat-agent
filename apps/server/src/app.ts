@@ -70,6 +70,17 @@ import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
 import { DocGenService } from "./docgen/service.js";
 import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
+import {
+  extractorKind,
+  FileExtracts,
+  inProcessExtractor,
+  ocrCapability,
+  sandboxedExtractor,
+  type ExtractRunner,
+  type FileExtractsOptions,
+  type OcrCapability,
+} from "./files/extract.js";
+import { FileTools } from "./files/text.js";
 import { storagePaths } from "./storage/paths.js";
 import { isInside } from "./fs-safety.js";
 import type { Db } from "./db/client.js";
@@ -140,6 +151,8 @@ declare module "fastify" {
     fileWrites: FileWriteLock;
     /** Uploaded files (#22); undefined without a database. */
     files: FileStore | undefined;
+    /** Text extraction of uploads (#48); undefined without a database. */
+    fileExtracts: FileExtracts | undefined;
     /** Daily backups (#37); undefined without BACKUP_DIR or with an in-memory database. */
     backups: BackupService | undefined;
     /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
@@ -250,6 +263,11 @@ export type BuildOptions = {
   dataLock?: { held: () => boolean };
   /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
   rescrub?: Pick<RescrubOptions, "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs">;
+  /**
+   * Extraction (#48): the runner (default: the sandboxed worker), OCR (default: tesseract.js with the pinned
+   * language data, `ocrCapability`) and a clock.
+   */
+  extract?: FileExtractsOptions & { runner?: ExtractRunner; ocr?: () => OcrCapability };
 };
 
 /**
@@ -448,12 +466,41 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // 관심 종목 (#31): the screen's list and `watchlist_get`.
     const watchlist = new WatchlistStore(opts.db!);
     app.decorate("watchlist", watchlist);
+    // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
+    const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
+    app.decorate("files", fileStore);
+    // Their text (#48): extracted in the background by the sandboxed worker, read by the file tools.
+    let ocr: OcrCapability | undefined;
+    const ocrNow = opts.extract?.ocr ?? (() => (ocr ??= ocrCapability(storagePaths(config.dataDir).ocrLang)));
+    const fileExtracts = new FileExtracts(
+      opts.db!,
+      fileStore,
+      opts.extract?.runner ??
+        // A test machine without `sandbox-exec` (the Linux CI's e2e), explicitly: the worker in this process.
+        // Never in production — a real server always extracts in the sandbox.
+        (extractorKind(config) === "in-process" ? inProcessExtractor(ocrNow) : sandboxedExtractor(ocrNow)),
+      { log: app.log, onReplaced: () => storedRescrub.cleanup(), ...opts.extract },
+    );
+    app.decorate("fileExtracts", fileExtracts);
+    app.addHook("onReady", async () => {
+      const count = fileExtracts.resume();
+      if (count) logEvent(app.log, "info", "file.extract_resumed", { count });
+    });
+    // preClose: a running extractor is stopped before the database goes (its file stays pending).
+    app.addHook("preClose", async () => {
+      fileExtracts.close();
+      // Bounded: a runner that ignores the stop does not hold the shutdown (its result is not stored anyway).
+      await Promise.race([fileExtracts.idle(), new Promise((r) => setTimeout(r, 5000).unref())]);
+    });
+    // Citations (#25): `cite` checks against the stored page text; the run's note reads them back. `file_cite`
+    // (#48) numbers file citations in the same sequence.
+    const citations = new CitationStore(opts.db!);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
+      files: { tools: new FileTools(fileStore, fileExtracts, app.conversations!), citations },
       web: {
         sources,
-        // Citations (#25): `cite` checks against the stored page text; the run's note reads them back.
-        citations: new CitationStore(opts.db!),
+        citations,
         providers: config.webSearchProviders,
         // The FakeRuntime mode (e2e, local tries) answers the citation fixture pages in-process (no network).
         ...(config.fakeRuntime ? { worker: fixtureWebWorker(sandboxedWorker()) } : {}),
@@ -526,9 +573,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onClose", async () => mcp.close());
     app.decorate("mcp", mcp);
     app.decorate("runs", runManager);
-    // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
-    const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
-    app.decorate("files", fileStore);
     // Left-overs of the last run (cut-off uploads, files whose row never came) — only on the data folder's own
     // database: an app on another database (tests on the default folder) must not judge this folder's files.
     const which = databaseOf(opts.db!, config.dataDir);
@@ -540,7 +584,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     else if (which === "other")
       app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
     registerConversationRoutes(app, app.conversations!, runManager, { defaults, users }, fileStore);
-    registerFileRoutes(app, app.conversations!, fileStore);
+    registerFileRoutes(app, app.conversations!, fileStore, fileExtracts);
     // Cancel records of uploads that never came expire after 6 hours (review #102 7차): at start and every 10 min.
     app.addHook("onReady", async () => void fileStore.expireCancels());
     const expireCancels = setInterval(() => fileStore.expireCancels(), 10 * 60_000);
@@ -714,6 +758,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("schedules", undefined);
     app.decorate("scheduleProposals", undefined);
     app.decorate("watchlist", undefined);
+    app.decorate("fileExtracts", undefined);
   }
 
   app.get(

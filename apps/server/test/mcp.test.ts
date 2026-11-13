@@ -573,6 +573,11 @@ describe("runs give runtimes our MCP server (#43)", () => {
       // Schedule proposals (#55): the confirmation card's tool.
       "schedule_create",
       "doc_create",
+      // File tools (#48): everyone's, on their own conversation's uploads.
+      "file_list",
+      "file_read",
+      "file_search",
+      "file_cite",
       // Finance tools (#30): the owner is an adult with every skill.
       ...FINANCE_TOOLS.map((t) => t.name),
       // Finance chart and 관심 종목 (#31): made of the finance tools, offered with them.

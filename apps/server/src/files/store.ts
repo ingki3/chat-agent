@@ -64,6 +64,18 @@ export class AttachmentError extends Error {
   }
 }
 
+/**
+ * The one file rule of a run (#48 file tools, #45/#106 context): a file is the run's when it went with a message
+ * that is still active (`isActive`: the conversation's active messages — the turn's input included). Unsent
+ * composer files are not.
+ */
+export function sentWithActive(
+  f: { messageId: string | null },
+  isActive: (messageId: string) => boolean,
+): boolean {
+  return f.messageId !== null && isActive(f.messageId);
+}
+
 export function toUploadedFile(f: FileRow): UploadedFile {
   return {
     id: f.id,
@@ -141,6 +153,19 @@ export class FileStore {
       .where(eq(files.conversationId, conversationId))
       .orderBy(asc(files.createdAt), asc(files.id))
       .all();
+  }
+
+  /**
+   * Whether the file went with a message that is still part of the conversation (`messages.active` — not cut off
+   * by an edit or a regeneration; #48 file tools, #106 context: "files of active messages + the current input").
+   * Unsent composer files are not.
+   */
+  isActiveAttachment(f: Pick<FileRow, "messageId" | "conversationId">): boolean {
+    const active = (id: string) =>
+      !!this.db.$client
+        .prepare("SELECT 1 FROM messages WHERE id = ? AND conversation_id = ? AND active = 1")
+        .get(id, f.conversationId);
+    return sentWithActive(f, active);
   }
 
   count(conversationId: string): number {

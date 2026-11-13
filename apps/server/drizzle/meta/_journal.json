@@ -169,6 +169,13 @@
       "when": 1794504627447,
       "tag": "0023_watchlist",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1794507160749,
+      "tag": "0024_extract",
+      "breakpoints": true
     }
   ]
 }

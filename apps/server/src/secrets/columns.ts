@@ -212,11 +212,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "citations.user_id": ID,
   "citations.source_id": ID,
   "citations.status": ENUM,
-  "citations.snippet": { write: "CitationStore.cite", rescrub: "text" },
+  "citations.snippet": { write: "CitationStore.cite / citeFile", rescrub: "text" },
   "citations.snippet_key": {
     exempt: "a hash of the normalised snippet, no plaintext; recomputed with it on rescrub",
   },
-  "citations.quote": { write: "CitationStore.cite", rescrub: "text" },
+  "citations.quote": { write: "CitationStore.cite / citeFile", rescrub: "text" },
+  // File citations (#48): the cited upload, and where the passage is (the sheet name of an XLSX cell is file text).
+  "citations.file_id": ID,
+  "citations.locator": { write: "CitationStore.citeFile (scrubKnownDeep)", rescrub: "deep" },
   // Uploads (#22): the user's file name is scrubbed on write and rescrubbed. The file bytes are on disk, not in a
   // column, and are stored as they came (the user's own document — docs/ops.md §24).
   "files.id": ID,
@@ -228,6 +231,18 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "files.kind": ENUM,
   "files.media_type": { exempt: "the media type of the detected kind (FILE_KINDS, server-chosen)" },
   "files.sha256": HASH,
+  // Extracted text of uploads (#48): file text, scrubbed on write and rescrubbed; the rest is the server's own.
+  "file_extracts.file_id": ID,
+  "file_extracts.status": ENUM,
+  "file_extracts.code": ENUM,
+  "file_extracts.ocr": ENUM,
+  "file_extracts.extractor": { exempt: "the extractor's version tag (a server constant)" },
+  "file_segments.file_id": ID,
+  "file_segments.locator": { write: "FileExtracts.store (scrubKnownDeep)", rescrub: "deep" },
+  "file_segments.text": { write: "FileExtracts.store (scrubKnown)", rescrub: "text" },
+  "file_segments.marks": {
+    exempt: "offsets, boxes, column numbers and cell references the extractor computed (no file text)",
+  },
   // Cancelled uploads not yet arrived (review #102 7차): ids only.
   "upload_cancellations.user_id": ID,
   "upload_cancellations.upload_id": { exempt: "the client's upload id, a UUID checked on cancel" },

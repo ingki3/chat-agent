@@ -953,6 +953,39 @@ PRD FR-8.2·8.6·8.7, 수용 기준 5. 엔진만 — 예약 화면은 #55, 실�
 - 자동(가짜 시계, `apps/server/test/schedules.test.ts`): 다섯 유형 일주일, 놓친 회차 3개 → 1회(가장 최근), 5분 전 정지·10분 뒤 시작 → 1회, 실패 → 정확히 2분 뒤 재시도, 두 번 실패, 크래시 시점별(시작 직후·재시도 시작 직후·결과 저장 전·저장 후 기록 전·알림 전·발행 후 기록 전) 복구, 겹침 건너뜀(실행 중·재시도 대기 중), 바로 실행의 별도 키, 실행 키 유일, 일시정지, 잠금 없음 → 실행 안 함, America/New_York 서머타임 시작·종료일(없는 시각·두 번 있는 시각), 시작 오차(모든 실행 0 ≤ 시작 − 예정 ≤ 1분; 실제 시계로 1분 회차 하나 — 1초 미만). 계산만: `schedules-time.test.ts`.
 - 7일 실측(정규 회차 ±1분, 휴대폰 수신)은 #56·#57에서 실제 핸들러로 한다(수용 기준 5 절차 1·3).
 
+## 26. 파일 추출·위치 색인 (#48)
+PRD FR-4.2·4.3·4.5, 수용 기준 2·11. 방식과 근거는 `docs/decisions/isolation.md` "파일 추출·위치 색인 (#48)". HWP·HWPX는 #23, 파일 뷰어는 #24.
+
+### 26.1 무엇이 일어나나
+- 업로드가 저장되면 서버가 그 파일의 글자를 **위치(locator)와 함께** 뽑는다 — 백그라운드에서 한 번에 한 파일, 샌드박스 안의 별도 node 프로세스(그 파일 하나만 읽고, 쓰기·네트워크·자식 프로세스 없음). 결과는 DB `file_extracts`·`file_segments`(0024 마이그레이션). 파일을 지우면(입력창 ✕, 대화 삭제) 함께 지워진다.
+- 형식과 위치: PDF는 쪽(+ 줄 상자), 스캔본 PDF·사진은 OCR 단어 상자, DOCX는 문단 번호·표 번호와 행, XLSX는 시트와 칸(`B2`), CSV는 행과 칸, PPTX는 슬라이드, TXT·MD는 줄. HWP·HWPX는 아직 `extract_unsupported`(#23).
+- 한도: 파일당 글자 2백만 자, PDF 500쪽, OCR 30쪽, 그림 4천만 화소, Office 압축 해제 항목당 64MB·합계 256MB, 추출 시간 60초(OCR이 필요할 수 있는 PDF·사진은 300초), 메모리 768MB(같은 경우 1.5GB). 넘으면 잘라서(`truncated`) 또는 실패 코드로 남긴다.
+- 거부(파일은 저장되지만 읽지 않는다): zip 폭탄(`extract_too_large`), 경로 탈출(`extract_path_escape`), DTD·외부 엔티티(`extract_xml_forbidden`), 손상(`extract_zip_invalid`·`extract_xml_invalid`·`extract_invalid`), 암호 PDF(`extract_encrypted`). 코드와 화면 문구는 `packages/shared/src/locators.ts`의 `EXTRACT_CODES`·`EXTRACT_CODE_TEXT`.
+- 서버를 끄면 실행 중인 추출은 멈추고 그 파일은 `pending`으로 남아 다음 시작에 다시 한다(파일마다 3번까지). 추출기 버전(`EXTRACTOR_VERSION`)이 바뀌면 시작할 때 모든 파일을 다시 뽑는다.
+
+### 26.2 OCR — 설치할 것 없음
+- OCR은 **tesseract.js 7.0.0**(WebAssembly)과 고정된 npm 언어 데이터 **`@tesseract.js-data/kor`·`eng` 1.0.0**으로 한다. `pnpm install`이 함께 설치하므로 **Homebrew·시스템 tesseract를 설치하지 않는다**. 실행 중에 아무것도 내려받지 않는다(언어 데이터는 처음 쓸 때 `DATA_DIR/ocr-lang/`에 해시 확인 뒤 복사 — 백업 대상 아님, 지워도 다시 만든다).
+- 끄기: `.env`에 `EXTRACT_OCR=off`. 그러면 사진은 `ocr_unavailable`("이 서버에서는 사진 속 글자를 읽을 수 없어요"), 스캔본 PDF는 글자 없이 `ocr: "unavailable"`. 패키지가 빠진 설치(예: `--prod`로 일부만)도 같은 결과다 — 다시 `pnpm install --frozen-lockfile`.
+- 정확도: 인쇄된 한글·영문은 잘 읽는다. 손글씨, 많이 기울어진 사진, 아주 작은 글자는 약하다.
+- 추출기는 언제나 샌드박스에서 돈다. 예외는 시험 머신의 `ISOLATION_IN_PROCESS_FOR_TESTS=1`뿐이다(샌드박스가 없는 CI에서 추출기를 서버 프로세스 안에서 돌림). 이 스위치는 NODE_ENV=production과 함께면 서버가 시작을 거부한다 — 가족 서버의 `.env`에는 절대 넣지 않는다. FAKE_RUNTIME=1만으로는 샌드박스를 벗어나지 않는다.
+- e2e(`pnpm e2e`)는 운영 모드라 추출이 macOS에서만 된다. Linux에서는 `e2e/file-citations.spec.ts`를 이유와 함께 건너뛰고, 같은 시나리오를 `apps/server/test/file-tools.test.ts`가 돌린다.
+
+### 26.3 쓰는 곳
+- 파일 도구(두 런타임 공통, 공통 MCP 서버): `file_list`, `file_read(fileId, from, to, sheet)`, `file_search(query)`, `file_cite(fileId, snippet, page)`. 그 실행의 대화에 올린 그 사용자의 파일만 읽는다(남의 파일·다른 대화 파일은 `file_not_found`). 글자는 `<external_content>` 블록 안으로만 런타임에 간다.
+- 인용: `file_cite`는 웹 인용과 같은 번호·같은 검사를 쓰고, 답 아래 출처 목록에 "report.pdf · 12쪽"처럼 파일 이름과 위치가 붙는다. 구절이 파일에 없으면 ⚠️.
+- API: `GET /api/files/:id/extract?from=&limit=` — 상태와 위치가 붙은 글자(올린 사람만, 원본과 같은 권한).
+- 실행이 읽는 파일: **활성 메시지에 실어 보낸 파일만**이다. 입력창에만 있는 파일, 수정·다시 생성으로 잘린 메시지의 파일은 도구에 보이지 않는다(원본은 주인이 파일 경로로 계속 볼 수 있다).
+- XLSX 시트는 모델에게 `sheet-<n>`("2번째 시트")으로만 보인다. 시트 이름은 파일 글자라 `<external_content>` 안에만 있다. 긴 내용은 `file_read`의 `next.cursor`로 이어 읽는다(한 단위 안에서도, 다음 시트로도).
+
+### 26.4 로그와 확인
+- 로그: `file.extracted`(`extractCode`, 소요 시간, 파일·대화·사용자 ID), `file.extract_resumed`(개수), `file.tool_finished`(도구, `fileToolCode`). 파일 이름·글자·검색어는 남기지 않는다.
+- 뽑은 글자는 알려진 비밀 값을 가려 저장하고(자르지 않은 전체 글자를 먼저 가린 뒤에만 긴 단위를 20만 자로 잘라 저장), 도구가 읽을 때마다 그때 아는 비밀로 다시 가린다(원본 바이트는 그대로, 24.2절). 새 비밀이 등록되면, 잘라 저장한 단위가 있는 파일은 원본에서 다시 추출하며 그동안은 `pending`이다(아무것도 내주지 않음). 서버가 시작할 때도 그런 파일은 다시 추출한다. 줄 상자·칸 위치는 바뀐 길이를 따라 옮긴다. 비밀이 두 줄·칸에 걸쳐 위치를 지킬 수 없으면 그 단위는 쪽·행 위치만 남고 줄 번호는 주장하지 않는다.
+- 시험: `pnpm test apps/server/test/extract.test.ts`(형식별 fixture·기대 locator, zip 폭탄·XXE·billion laughs·zip slip·경로 탈출 거부, 샌드박스에서 남의 파일 못 읽음, OCR — OCR이 없으면 이유를 밝히고 건너뜀), `apps/server/test/file-tools.test.ts`(업로드 → 추출 → API 권한, 도구 범위, "12쪽 요약"을 FakeRuntime·Claude·Codex 재생에서), `E2E_PORT=3114 pnpm e2e e2e/file-citations.spec.ts`. fixture를 다시 만들려면 `python3 -I fixtures/extract/make-fixtures.py`(Pillow·macOS `cupsfilter` 필요, 시험은 커밋된 파일을 쓴다).
+
+### 26.5 받아들인 한계 — 비밀 가림
+- 스캔 쪽의 원래 글자(8자 미만)와 그 쪽 그림을 OCR한 글자는 **서로 다른 층**으로 저장된다(원래 글자 먼저, OCR 글자는 Tesseract가 읽은 순서 그대로). 한 비밀 값이 두 층에 나뉘어 있으면(일부는 글자, 일부는 그림) 하나의 값으로 알아보지 못한다 — "임의 구분자로 나뉜 값"과 같은 범위 밖. 두 층의 경계에서 잘린 값의 앞부분은 가린다.
+- OCR이 줄을 잘못 묶거나 단 순서를 틀리게 읽으면 그 순서대로 저장된다(서버가 다시 정렬하지 않음).
+
 ## 27. 맥락 빌더·세션 일치 검사·자동 요약 — 대화 중 런타임 전환 (#45)
 대화의 원본은 서버가 가진다(PRD D8). 런타임 세션은 그 원본을 처리하는 작업 단위다. 그래서 런타임·모델·연결을 바꾸거나, 수정·재생성한 뒤에도 런타임은 서버 원본과 같은 맥락으로 답한다.
 

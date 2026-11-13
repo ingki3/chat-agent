@@ -11,12 +11,16 @@ import {
   type FileError,
   type FileKind,
   type FileListResponse,
+  type FileTextResponse,
 } from "@agentlee/shared";
 import { attachment } from "../artifacts/serve.js";
 import { RAW_HEADERS } from "../artifacts/routes.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
+import { toFileExtract, type FileExtracts } from "./extract.js";
+import { segmentLocator } from "./text.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 import { FileLimitError, toUploadedFile, UPLOAD_ID, UploadCancelledError, type FileStore } from "./store.js";
 
 /** Resource kind of one uploaded file: its uploader only (family sharing, #29, gets its own projection). */
@@ -143,11 +147,13 @@ const nameParts = (name: string) => {
  * - `GET /api/files/:id` — one file's metadata; `GET /api/files/:id/content` — the original, a download
  *   (`?inline=1` shows a PNG/JPG in the page; nothing else is ever inline)
  * - `DELETE /api/files/:id` — an unsent file (409 `file_attached` once it went with a message)
+ * - `GET /api/files/:id/extract?from=&limit=` — its extracted text with locators (#48), `FileTextResponse`
  */
 export function registerFileRoutes(
   app: FastifyInstance,
   conversations: ConversationStore,
   store: FileStore,
+  extracts?: FileExtracts,
 ): void {
   app.resources.register(FILE_KIND, (id) => {
     const f = store.get(id);
@@ -231,6 +237,8 @@ export function registerFileRoutes(
           try {
             const row = await store.add({ userId, conversationId, uploadId, name, kind, ...got, tmp });
             done("file_ok", "info");
+            // Its text is read in the background (#48); the file tools wait for it.
+            extracts?.enqueue(row.id);
             return reply.code(201).header("Cache-Control", "no-store").send(toUploadedFile(row));
           } catch (e) {
             if (e instanceof FileLimitError) return refuse("too_many_files", false);
@@ -277,6 +285,30 @@ export function registerFileRoutes(
         .send(fs.createReadStream("", { fd, autoClose: true }));
     },
   );
+
+  // The extracted text with locators (#48), a page of segments at a time — the uploader only, like the original.
+  if (extracts)
+    app.get<{ Params: { id: string }; Querystring: { from?: string; limit?: string } }>(
+      "/api/files/:id/extract",
+      { config: read },
+      async (req, reply) => {
+        const f = store.get(req.params.id)!;
+        const from = Math.max(0, Math.min(1e7, Number.parseInt(req.query.from ?? "0", 10) || 0));
+        const limit = Math.max(1, Math.min(500, Number.parseInt(req.query.limit ?? "200", 10) || 200));
+        const extract = toFileExtract(f, extracts.get(f.id));
+        const rows = extract.status === "ok" ? extracts.segments(f.id, from, limit + 1) : [];
+        return reply.header("Cache-Control", "no-store").send({
+          extract,
+          // Scrubbed with the secrets known now (`segments`), and once more as a whole (review #107).
+          // Full matches only: the end of a unit is not where the text ends early (review #107 8차).
+          items: scrubKnownDeep(
+            rows.slice(0, limit).map((seg) => ({ locator: segmentLocator(f, seg), text: seg.text })),
+            { tail: false },
+          ),
+          next: rows.length > limit ? rows[limit]!.seq : null,
+        } satisfies FileTextResponse);
+      },
+    );
 
   // Cancel by the client's upload id (review #102 6차): the caller's own uploads only — the id is looked up among
   // them, so another user's id is just "nothing there" (and is remembered as cancelled for the caller alone).

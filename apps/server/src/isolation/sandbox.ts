@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { canonicalPath } from "../fs-safety.js";
 import { findHardLinks } from "./paths.js";
 
@@ -40,6 +41,8 @@ export type RunIsolatedOptions = SandboxPolicy & {
   /** Resident memory limit (checked every 250 ms; killed above it, and also when it cannot be measured). */
   maxRssBytes?: number;
   stdin?: string;
+  /** Stops the process (SIGKILL to its group) when aborted — the server shutting down (`killed: "aborted"`). */
+  signal?: AbortSignal;
   /** Tests only: replaces the `ps` measurement used by the monitor. */
   probe?: () => Promise<{ pid: number; rss: number }[]>;
 };
@@ -50,7 +53,7 @@ export type RunResult = {
   stdout: string;
   stderr: string;
   /** Why we killed it: a limit, or "monitor" when its memory could not be measured (fail closed). */
-  killed: null | "timeout" | "output" | "memory" | "monitor";
+  killed: null | "timeout" | "output" | "memory" | "monitor" | "aborted";
 };
 
 /** SBPL string literal. Paths are canonicalised first; quotes and backslashes are escaped. */
@@ -169,17 +172,23 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
         child.kill("SIGKILL");
       }
     };
+    // One decoder per stream: a character split across two chunks is decoded whole (review #107), not as U+FFFD.
+    const outDec = new StringDecoder("utf8");
+    const errDec = new StringDecoder("utf8");
     const take = (target: "out" | "err") => (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > o.maxOutputBytes) return kill("output");
-      if (target === "out") out += chunk.toString("utf8");
-      else err += chunk.toString("utf8");
+      if (target === "out") out += outDec.write(chunk);
+      else err += errDec.write(chunk);
     };
     child.stdout.on("data", take("out"));
     child.stderr.on("data", take("err"));
     // The child may exit before reading its input (EPIPE): that is its failure, not the server's.
     child.stdin.on("error", () => {});
     const timer = setTimeout(() => kill("timeout"), o.timeoutMs);
+    const onAbort = () => kill("aborted");
+    if (o.signal?.aborted) onAbort();
+    else o.signal?.addEventListener("abort", onAbort, { once: true });
 
     let sampling = false;
     const sample = async () => {
@@ -203,13 +212,16 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       exited = true;
       clearTimeout(timer);
       clearInterval(monitor);
+      o.signal?.removeEventListener("abort", onAbort);
     });
     child.on("error", (e) => {
       clearTimeout(timer);
       clearInterval(monitor);
       reject(e);
     });
-    child.on("close", (code, signal) => resolve({ code, signal, stdout: out, stderr: err, killed }));
+    child.on("close", (code, signal) =>
+      resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed }),
+    );
     child.stdin.end(o.stdin ?? "");
   });
 }

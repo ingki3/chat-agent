@@ -1,9 +1,12 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL } from "@agentlee/mcp-tools/skills";
 import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import {
   boundText,
   CITATION_LIMITS,
+  FileLocator,
+  locatorLabel,
   citationMarkers,
   sentenceEndMarkers,
   uncitedUnits,
@@ -18,7 +21,8 @@ import type { CitationStore } from "./store.js";
 /**
  * The citation check at the end of a run (#25, PRD FR-5.1·5.2, 수용 기준 3). It runs where the finance check runs
  * (RunManager `attachNoteTo`: every run end, stopped answers and answers recovered after a restart too) on every
- * answer that used a web tool (search, fetch, the source list, a search skill) or cited a source:
+ * answer that used a web tool (search, fetch, the source list, a search skill), read an uploaded file (#48) or
+ * cited a source:
  * - every `[n]` of the answer, with the status the server gave that citation when the model registered it —
  *   a marker no `cite` produced is `unknown_source`;
  * - the body paragraphs without any marker (headings, list lead-ins, disclaimers excluded) — "일부 내용에 출처
@@ -33,6 +37,10 @@ const WEB_TOOL_NAMES: ReadonlySet<string> = new Set([
   SOURCES_LIST_TOOL.name,
   CITE_TOOL.name,
   skillToolName(GOOGLE_NEWS_SKILL.name),
+  // Reading an uploaded file's text (#48) is using a source too: the same check applies to that answer.
+  FILE_READ_TOOL.name,
+  FILE_SEARCH_TOOL.name,
+  FILE_CITE_TOOL.name,
 ]);
 
 export function isWebTool(name: string): boolean {
@@ -98,6 +106,23 @@ export function citationNote(
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
     const r = byN.get(n);
+    // A file citation (#48): the file's name and the place; the locator only for a verified passage.
+    if (r?.fileId && r.file && r.status !== "unknown_source") {
+      const parsed =
+        r.status === "verified" && r.locator ? FileLocator.safeParse(JSON.parse(r.locator)) : undefined;
+      const locator = parsed?.success ? parsed.data : undefined;
+      return {
+        n,
+        status: r.status,
+        sourceId: null,
+        title: bound(r.file.name, CITATION_LIMITS.title),
+        site: locator ? bound(locatorLabel(locator), CITATION_LIMITS.site) : null,
+        url: null,
+        publishedAt: null,
+        quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
+        ...(locator ? { locator } : {}),
+      };
+    }
     // A marker without a citation of this run (made up, or a number of another answer): never shown as normal.
     if (!r || r.status === "unknown_source" || !r.source)
       return {

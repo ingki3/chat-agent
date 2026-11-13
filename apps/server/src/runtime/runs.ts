@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { sentWithActive } from "../files/store.js";
 import { EventEmitter } from "node:events";
 import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
@@ -1298,7 +1299,7 @@ export class RunManager {
       const active = new Set(context.history.map((m) => m.id));
       if (context.inputMessageId) active.add(context.inputMessageId);
       files = (this.opts.contextFiles?.(conversationId) ?? [])
-        .filter((f) => f.messageId !== null && active.has(f.messageId))
+        .filter((f) => sentWithActive(f, (id) => active.has(id)))
         .slice(-REFERENCE_LIMIT)
         .map((f) => ({ id: f.id, name: f.name }));
     } catch {

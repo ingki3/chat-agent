@@ -881,6 +881,8 @@ describe("review #102: links, the database check, a failing fsync, detection gap
     const openFds = () => fs.readdirSync("/dev/fd").length;
     // Warm up (first upload opens what stays open anyway: folders, lazy modules).
     await upload(app, f.cookies.owner, conv.id, "warm.txt", "warm");
+    // Its text extraction (#48) runs a process with pipes of its own: done before counting.
+    await app.fileExtracts!.idle();
     const before = openFds();
     const spy = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
       throw Object.assign(new Error("no space"), { code: "ENOSPC" });
