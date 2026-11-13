@@ -1000,12 +1000,12 @@ sub ace_lines {
 # names ANY requested right denies the whole request — even a right an earlier allow already granted; an entry that
 # would count but whose principal cannot be resolved is a failure. What no entry granted falls to POSIX — the bit of
 # the one class the account is in (owner, else group, else other): r for read/list, w for write/add_file/
-# add_subdirectory/append, x for execute/search; readattr/readextattr/readsecurity have no POSIX bit and are granted
-# unless denied. "" or why not.
+# add_subdirectory/append, x for execute/search, r for readextattr too (XNU maps it to VREAD); readattr and
+# readsecurity have no POSIX bit and are granted unless denied. "" or why not.
 sub account_eval {
   my ($acct, $p, $perms, $mode, $uid, $gid, @acl) = @_;
   my %bit = (read => 4, list => 4, write => 2, add_file => 2, add_subdirectory => 2, append => 2, execute => 1,
-    search => 1, readattr => 0, readextattr => 0, readsecurity => 0);
+    search => 1, readextattr => 4, readattr => 0, readsecurity => 0);
   my @want = split /,/, $perms;
   for my $w (@want) { return "unknown request $w at $p" unless exists $bit{$w}; }
   my %need = map { $_ => 1 } @want;

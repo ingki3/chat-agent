@@ -2708,6 +2708,15 @@ print JSON::PP->new->encode(\\@out);
       expect(h!.verdict).toMatch(/cannot resolve ACL principal/);
       expect(i!.verdict).toMatch(/the account cannot read \/n/);
       expect(decode([file([], "chown")])[0]!.verdict).toMatch(/unknown request chown/);
+      // readextattr maps to POSIX r (XNU: VREAD) — not granted by default like readattr/readsecurity.
+      const [x0, x1, x2] = decode([
+        file([], "readextattr", 0o100000),
+        file([], "readextattr", 0o100004),
+        file([], "readattr", 0o100000),
+      ]);
+      expect(x0!.verdict).toMatch(/the account cannot readextattr \/n/);
+      expect(x1!.verdict).toBe("");
+      expect(x2!.verdict).toBe("");
     });
 
     it("the record length must match exactly: the header for no ACL, the header and n entries otherwise", () => {
