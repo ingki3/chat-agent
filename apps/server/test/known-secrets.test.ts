@@ -14,6 +14,7 @@ import {
   type StartContext,
 } from "../src/runtime/adapter.js";
 import {
+  CREDENTIAL_FORMATS,
   KnownSecrets,
   knownSecrets,
   MAX_KNOWN_LENGTH,
@@ -29,6 +30,8 @@ import {
 import { TEXT_COLUMNS } from "../src/secrets/columns.js";
 import { StoredRescrub } from "../src/secrets/rescrub.js";
 import { ConnectionStore } from "../src/connections/store.js";
+import { serializeCredential, type ChatgptCredential } from "../src/connections/chatgpt.js";
+import type { PushTarget } from "../src/notifications/service.js";
 import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
 import { FinanceResultStore } from "../src/finance/results.js";
 import type { AnswerEvidence } from "../src/finance/checker.js";
@@ -188,6 +191,50 @@ describe("known-secret scrubber", () => {
     reg.add("short");
     expect(scrubKnown("a access-AAAAAAAAAAAA b refresh-BBBBBBBBBB plus short", { registry: reg })).toBe(
       "a [숨김] b [숨김] plus short",
+    );
+  });
+
+  it("registers a declared credential format's fields whatever their names, and only those (#98)", () => {
+    // Every field of what is stored, with a distinct synthetic value: each one is either registered on its own or
+    // knowingly left out (the objects are tied to the stored types with `satisfies`).
+    const login = {
+      v: 1,
+      accessToken: "synthetic-access-0001",
+      refreshToken: "synthetic-refresh-0002",
+      idToken: "synthetic-idtoken-0003",
+      accountId: "synthetic-account-0004",
+      planType: "synthetic-plan-0005",
+    } satisfies Required<ChatgptCredential>;
+    const push = {
+      endpoint: "https://push.example.test/synthetic-0006",
+      keys: { p256dh: "synthetic-p256dh-0007", auth: "synthetic-auth-0008" },
+    } satisfies PushTarget;
+    const cases: [string, string[], string[]][] = [
+      [
+        serializeCredential(login),
+        [login.accessToken, login.refreshToken, login.idToken],
+        [login.accountId, login.planType],
+      ],
+      [JSON.stringify(push), [push.endpoint, push.keys.p256dh, push.keys.auth], []],
+    ];
+    for (const [doc, secret, notSecret] of cases) {
+      const reg = new KnownSecrets();
+      reg.addCredential(doc);
+      for (const v of secret) expect(scrubKnown(`a ${v} b`, { registry: reg }), v).toBe("a [숨김] b");
+      for (const v of notSecret) expect(scrubKnown(`a ${v} b`, { registry: reg }), v).toBe(`a ${v} b`);
+    }
+    expect(CREDENTIAL_FORMATS.map((f) => f.kind)).toEqual(["chatgpt-login", "push-target"]);
+  });
+
+  it("a format's fields are registered by shape, not by name: a declared opaque field is known (#127 P3)", () => {
+    const doc = JSON.stringify({ opaque: "synthetic-opaque-0009", label: "ordinary words here" });
+    const guessed = new KnownSecrets();
+    guessed.addCredential(doc); // no declared format: the name fallback does not take "opaque"
+    expect(scrubKnown("x synthetic-opaque-0009 y", { registry: guessed })).toBe("x synthetic-opaque-0009 y");
+    const declared = new KnownSecrets();
+    declared.addCredential(doc, { fields: [["opaque"], ["missing"], ["label", "deeper"]] });
+    expect(scrubKnown("x synthetic-opaque-0009 y ordinary words here", { registry: declared })).toBe(
+      "x [숨김] y ordinary words here",
     );
   });
 

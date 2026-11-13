@@ -226,6 +226,7 @@ describe("redactSecrets", () => {
   const wrap9 = (json: string) => "stdout: " + JSON.stringify(" " + json);
   const wrap13 = (s: string) => JSON.stringify(" " + s);
   const BS = String.fromCharCode(92);
+  const LF = String.fromCharCode(10);
   /** `{"api:key":"hunter2"}` with every quote written as a backslash, `u005c` × n, `u0022` (n + 1 decodes). */
   const chain = (n: number) => {
     const q = BS + "u005c".repeat(n) + "u0022";
@@ -578,6 +579,31 @@ describe("redactSecrets", () => {
       [`23: ${name}, stringified`, JSON.stringify(raw), []],
       [`23: ${name}, stringified twice`, JSON.stringify(JSON.stringify(raw)), []],
     ]),
+    // #98 (rounds 23–24, deferred as P3): the key-name bypasses of the sweep.
+    ...(
+      [
+        ["Bash ANSI-C escaped = (hex)", "export $'" + BS + "560assword" + BS + "x3dhunter2'"],
+        ["Bash ANSI-C escaped = (octal)", "export $'" + BS + "560assword" + BS + "075hunter2'"],
+        ["Bash ANSI-C escaped = (u)", "export $'pass" + BS + "u003dhunter2'"],
+        ["[ inside a computed key's string", '({["pa[ss" + "word"]: \'hunter2\'})'],
+        ["] inside a computed key's string", '({["pa]ss" + "word"]: \'hunter2\'})'],
+        ["[ inside a computed key's template", "({[`pa[ss` + `word`]: 'hunter2'})"],
+        ["line comment after { before a computed key", "({// note" + LF + '["pass" + "word"]: \'hunter2\'})'],
+        ["line comment after a comma", "({a: 1, // note" + LF + '["pass" + "word"]: \'hunter2\'})'],
+        [
+          "comment lines after a comma",
+          "({a: 1, // one" + LF + "  // two" + LF + '  ["pass" + "word"]: \'hunter2\'})',
+        ],
+        [
+          "line comment, then a block comment",
+          "({a: 1, // one" + LF + '/* two */ ["pass" + "word"]: \'hunter2\'})',
+        ],
+      ] as [string, string][]
+    ).flatMap(([name, raw]): [string, string, string[]][] => [
+      [`98: ${name}`, raw, []],
+      [`98: ${name}, stringified`, JSON.stringify(raw), []],
+      [`98: ${name}, stringified twice`, JSON.stringify(JSON.stringify(raw)), []],
+    ]),
   ];
   it.each(REGRESSIONS)("review round %s", (_round, input, kept) => {
     const out = redactString(input);
@@ -608,6 +634,103 @@ describe("redactSecrets", () => {
         "자세한 내용은 [guide]를 보세요." + String.fromCharCode(10) + "[guide]: https://example.com/docs",
       ],
       ["prose with password and a word", "password reset" + String.fromCharCode(10) + "다음 줄"],
+      // #98: the same structures with an ordinary key, or with no separator, stay.
+      ["Bash ANSI-C escaped = with an ordinary name", "echo $'a" + BS + "x3db' $'mode" + BS + "075fast'"],
+      ["Bash ANSI-C escapes and no =", "printf $'pass" + BS + "x77ord" + BS + "n'"],
+      [
+        "adjacent literals and no separator",
+        "print('pass' 'word')" + String.fromCharCode(10) + 'msg = "pass" "word"',
+      ],
+      // PR #134 review 1: joined literals and a colon where no key starts.
+      ["adjacent literals in a Python condition", "if answer == 'pass' 'word': print('accepted')"],
+      ["adjacent literals in a shell line", "printf '%s" + BS + "n' 'pass' 'word': documentation"],
+      ["adjacent literals inside a YAML string", "message: \"'pass' 'word': explanatory text\""],
+      // PR #134 review 2: a comma of prose, inside an ordinary string.
+      [
+        "comma in prose before adjacent literals",
+        "Compare these literals, 'pass' 'word': they join into one string.",
+      ],
+      [
+        "comma in a YAML string",
+        "message: \"Compare these literals, 'pass' 'word': they join into one string.\"",
+      ],
+      [
+        "comma in a Python string",
+        "message = \"Compare these literals, 'pass' 'word': they join into one string.\"",
+      ],
+      ["adjacent literals in prose", "The labels are 'pass' 'word': both are ordinary words."],
+      // PR #134 review 3: an open `{` before an ordinary string's comma (adjacent-literal keys stay a P3 limit).
+      ["brace in prose", "The symbol { opens a group, 'pass' 'word': they join into one string."],
+      [
+        "JS template string",
+        "const message = `Use { for groups, 'pass' 'word': ordinary words.`;" +
+          String.fromCharCode(10) +
+          "console.log('done');",
+      ],
+      [
+        "JSON string value",
+        JSON.stringify({
+          message: "Compare these literals, 'pass' 'word': they join into one string.",
+          count: 7,
+        }),
+      ],
+      [
+        "Python dict string value",
+        "record = {'message': \"Compare these literals, 'pass' 'word': ordinary words.\", 'count': 7}",
+      ],
+      [
+        "Python f-string",
+        "message = f\"Use {{ for groups, 'pass' 'word': ordinary words.\"" +
+          String.fromCharCode(10) +
+          "print('done')",
+      ],
+      [
+        "shell brace expansion",
+        "printf '%s" +
+          BS +
+          "n' {hello,\"pass\"'word':documentation}" +
+          String.fromCharCode(10) +
+          "printf '%s" +
+          BS +
+          "n' done",
+      ],
+      [
+        "JS function block",
+        "function explain() {" +
+          String.fromCharCode(10) +
+          "  const message = \"Compare these literals, 'pass' 'word': ordinary words.\";" +
+          String.fromCharCode(10) +
+          "  return message;" +
+          String.fromCharCode(10) +
+          "}",
+      ],
+      [
+        "JSON object text",
+        JSON.stringify({ message: "The symbol { starts a group, 'pass' 'word': ordinary words." }),
+      ],
+      ["balanced braces in prose", "The symbols {} make a group, 'pass' 'word': they join into one string."],
+      ["JS template, no brace", "const message = `Compare these literals, 'pass' 'word': ordinary words.`;"],
+      ["shell, no brace", "printf '%s" + BS + "n' hello,'pass' 'word':documentation"],
+      [
+        "JSON value, no comma",
+        JSON.stringify({ message: "Compare literals 'pass' 'word': ordinary words.", count: 7 }),
+      ],
+      [
+        "JS block, no comma",
+        "function explain() { const message = \"Compare literals 'pass' 'word': ordinary words.\"; }",
+      ],
+      ["adjacent literals making an ordinary key", "{'user' 'name': 'kim', 'mode': 'fast'}"],
+      ["triple-quoted strings", "'''pass word: kept'''" + String.fromCharCode(10) + '"""token list"""'],
+      ["brackets in an ordinary string value", '{"a": "it\'s [ok]", "b": "[x]: y"}'],
+      [
+        "line comment with a URL before an ordinary key",
+        '({url: "https://x.test/a", // see https://x.test' + String.fromCharCode(10) + "  mode: 1})",
+      ],
+      ["line comment before an array value", "({a: 1, // list" + String.fromCharCode(10) + "  b: [1, 2]})"],
+      [
+        "prose with apostrophes and brackets",
+        "It's [fine], isn't it: yes. Don't [worry]: it's 'pass' 'word'.",
+      ],
     ].flatMap(([name, raw]) => [
       [name!, raw!],
       [`${name}, stringified`, JSON.stringify(raw)],
@@ -1315,6 +1438,21 @@ describe("redactSecrets", () => {
       "\\u005c",
       "\\u0022:",
       '\\\\\\"a\\\\\\":',
+      // #98: quote runs (the YAML '' merge, adjacent literals), strings inside a key's brackets, comments before
+      // one, Bash $'…' bodies
+      "'",
+      "''x",
+      "'a' ",
+      '"a" ',
+      '{["[" + ',
+      "{[`",
+      "{// x\n[a]: ",
+      ",//\n",
+      "$'\\x3d",
+      "$'a\\075",
+      // PR #134 review 1: bracket lines with no line comment (the lookback stays on its line)
+      "{\n[a]\n}\n",
+      ",'a' 'b': ",
     ];
     // Best of up to three: garbage collection and JIT pauses only ever add time. A measurement already under the
     // bound needs no retry (the check is the same; on CI the retries made this take 150–260 s of a 240 s budget).

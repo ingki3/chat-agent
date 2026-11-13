@@ -36,8 +36,53 @@ const MAX_BACKSLASH_RUN = 16;
  */
 const STEP_BUDGET = 4096;
 
-/** Keys of a JSON credential whose string values are secrets in their own right. */
+/**
+ * Keys of a JSON credential whose string values are secrets in their own right — the fallback for a JSON document
+ * of no declared format (`CREDENTIAL_FORMATS`). A best-effort guess by name: a field named otherwise
+ * (`{"opaque": "…"}`) is not registered on its own unless its format is declared.
+ */
 const SECRET_KEY = /token|secret|key|password|passwd|auth|credential|cookie|session|endpoint|bearer/i;
+
+/** A path of object keys inside a JSON credential (`["keys", "auth"]`). */
+export type CredentialField = readonly string[];
+
+/**
+ * The JSON credential formats this server stores (PR #127 review, #98), each recognised by its shape, with every
+ * field that is a secret in its own right — registered whatever its name looks like, so each value is a known
+ * value (found raw and encoded, alone) and not only the whole document. Fields left out are identifiers or
+ * metadata, on purpose. **Rule: a new kind of JSON credential that goes through `encrypt` gets an entry here**
+ * (or its caller passes `fields` to `addCredential`); `test/known-secrets.test.ts` checks each entry against the
+ * type it stores. Plain-string credentials (API keys, setup tokens, skill secrets, settings) need nothing: the
+ * whole value is the secret.
+ */
+export const CREDENTIAL_FORMATS: readonly {
+  kind: string;
+  matches: (doc: Record<string, unknown>) => boolean;
+  fields: readonly CredentialField[];
+}[] = [
+  {
+    // A Codex ChatGPT login (`connections/chatgpt.ts` `ChatgptCredential`); `accountId` and `planType` are not secret.
+    kind: "chatgpt-login",
+    matches: (d) => d.v === 1 && typeof d.accessToken === "string" && typeof d.refreshToken === "string",
+    fields: [["accessToken"], ["refreshToken"], ["idToken"]],
+  },
+  {
+    // A browser's Web Push subscription (`notifications/service.ts` `PushTarget`): the endpoint is a capability URL.
+    kind: "push-target",
+    matches: (d) => typeof d.endpoint === "string" && !!d.keys && typeof d.keys === "object",
+    fields: [["endpoint"], ["keys", "p256dh"], ["keys", "auth"]],
+  },
+];
+
+/** The value at `path` in `doc`, if it is a string. */
+function fieldAt(doc: unknown, path: CredentialField): string | undefined {
+  let v = doc;
+  for (const k of path) {
+    if (!v || typeof v !== "object" || Array.isArray(v) || !Object.hasOwn(v, k)) return undefined;
+    v = (v as Record<string, unknown>)[k];
+  }
+  return typeof v === "string" ? v : undefined;
+}
 
 type Compiled = {
   secrets: {
@@ -138,10 +183,11 @@ export class KnownSecrets {
   }
 
   /**
-   * Registers a stored credential: the whole value, and — for a JSON credential (login tokens, push keys) —
-   * every string under a secret-looking key, so one token of it is found on its own.
+   * Registers a stored credential: the whole value, and — for a JSON credential (login tokens, push keys) — each
+   * secret field on its own, so one token of it is found by itself: the `fields` given, the fields of every
+   * declared format it matches (`CREDENTIAL_FORMATS`), and, as a fallback, every string under a secret-looking key.
    */
-  addCredential(plaintext: string): void {
+  addCredential(plaintext: string, opts: { fields?: readonly CredentialField[] } = {}): void {
     let parsed: unknown;
     if (/^\s*[[{]/.test(plaintext))
       try {
@@ -153,6 +199,11 @@ export class KnownSecrets {
     const doc = !!parsed && typeof parsed === "object";
     this.register(plaintext, {}, doc ? "document" : "plain");
     if (!doc) return;
+    const fields = [...(opts.fields ?? [])];
+    if (!Array.isArray(parsed))
+      for (const f of CREDENTIAL_FORMATS)
+        if (f.matches(parsed as Record<string, unknown>)) fields.push(...f.fields);
+    for (const path of fields) this.add(fieldAt(parsed, path));
     const walk = (v: unknown, secretKey: boolean, depth: number): void => {
       if (depth > 8) return;
       if (typeof v === "string") {
