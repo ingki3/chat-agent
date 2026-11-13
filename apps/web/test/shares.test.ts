@@ -2,7 +2,8 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { Share } from "@agentlee/shared";
-import { boundaryOptions, Receipts, targetOf } from "../src/shares/ShareDialog.js";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { boundaryOptions, Receipts, shareStatusText, targetOf } from "../src/shares/ShareDialog.js";
 
 const share = (over: Partial<Share>): Share => ({
   id: "s1",
@@ -73,5 +74,38 @@ describe("the snapshot boundary picker (#52, review #119)", () => {
       { id: "m3", label: "나: 셋" },
       { id: "m4", label: "답: 넷" },
     ]);
+  });
+});
+
+describe("the dialog's status line (#52, review #119 round 2)", () => {
+  it("a failed refetch over a cached empty list says it cannot confirm — never 'private'", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const key = ["shares", "of", "conversation", "c1"];
+    // Read once: nothing shared yet (cached []).
+    qc.setQueryData<Share[]>(key, []);
+    const observer = new QueryObserver<Share[]>(qc, {
+      queryKey: key,
+      queryFn: () => Promise.reject(new Error("network")),
+      staleTime: 0,
+    });
+    const before = observer.getCurrentResult();
+    expect(shareStatusText(before, before.data ?? [])).toContain("비공개");
+    // Shared from another tab meanwhile; the refetch fails.
+    await observer.refetch();
+    const after = observer.getCurrentResult();
+    expect(after.data).toEqual([]);
+    expect(after.isError).toBe(true);
+    const text = shareStatusText(after, after.data ?? []);
+    expect(text).toContain("공유 상태를 확인할 수 없어요");
+    expect(text).not.toContain("비공개");
+  });
+
+  it("says loading, private or who it is shared with", () => {
+    const ok = { isPending: false, isError: false };
+    expect(shareStatusText({ isPending: true, isError: false }, [])).toBe("불러오는 중…");
+    expect(shareStatusText(ok, [])).toContain("비공개");
+    expect(shareStatusText(ok, [share({}), share({ id: "s2", audience: "family", targets: [] })])).toBe(
+      "공유 중 — 엄마, 아들, 가족 전체",
+    );
   });
 });

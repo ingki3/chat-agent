@@ -206,6 +206,23 @@ export function BoundaryPicker({
   );
 }
 
+/**
+ * The dialog's status line. A failed read — first load or a refetch over a cached list — is never "비공개": what is
+ * cached may be out of date (shared from another tab meanwhile), so it says the state cannot be confirmed.
+ */
+export function shareStatusText(
+  q: { isPending: boolean; isError: boolean },
+  active: readonly Share[],
+): string {
+  if (q.isError) return "공유 상태를 확인할 수 없어요. 잠시 뒤 다시 열어 보세요.";
+  if (q.isPending) return "불러오는 중…";
+  if (!active.length) return "비공개 — 아직 아무에게도 공유하지 않았어요.";
+  const names = active.flatMap((s) =>
+    s.audience === "family" ? ["가족 전체"] : s.targets.map((t) => t.name),
+  );
+  return `공유 중 — ${[...new Set(names)].join(", ")}`;
+}
+
 export type ShareItem = { kind: "conversation" | "artifact"; id: string; title: string };
 
 /** A new share of the item: who, and (a conversation) how far — live, or "이 메시지까지" (decision #3). */
@@ -293,9 +310,6 @@ export function ShareDialog({ item, onClose }: { item: ShareItem; onClose: () =>
     const d = dialog.current;
     if (d && !d.open) d.showModal();
   }, []);
-  const names = active.flatMap((s) =>
-    s.audience === "family" ? ["가족 전체"] : s.targets.map((t) => t.name),
-  );
   return (
     <dialog
       ref={dialog}
@@ -327,13 +341,7 @@ export function ShareDialog({ item, onClose }: { item: ShareItem; onClose: () =>
           <strong>{item.title || "(제목 없음)"}</strong>
         </p>
         <p className="small" data-testid="share-status">
-          {list.isPending
-            ? "불러오는 중…"
-            : list.isError && !list.data
-              ? "공유 상태를 확인할 수 없어요. 잠시 뒤 다시 열어 보세요."
-              : active.length
-                ? `공유 중 — ${[...new Set(names)].join(", ")}`
-                : "비공개 — 아직 아무에게도 공유하지 않았어요."}
+          {shareStatusText(list, active)}
         </p>
         {list.isError && <p className="notice warn">{errorText(list.error)}</p>}
         {items.length > 0 && (
