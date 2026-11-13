@@ -425,6 +425,10 @@ const isFiles = (url: string) => /\/api\/conversations\/[^/]+\/files$/.test(new 
 /**
  * New chat: A sent while B uploads; B's chip is removed. `bFirst`: B's upload (and its DELETE, held) is done before
  * the page moves; otherwise the page moves first and B finishes there (the review's order).
+ *
+ * The cancel (`DELETE /api/uploads/:uploadId`) goes out the moment the chip is removed, not when B's upload ends: its
+ * arrival says nothing about B being stored. Each step waits on the server's answer to B itself (`bStored`), so the
+ * new page's list is read only once B is really on the server and its delete is still held (#103).
  */
 async function cancelledDuringMove(page: Page, bFirst: boolean) {
   await useAccount(page, SON);
@@ -436,6 +440,7 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
   const sendHeld = gate();
   const bSeen = gate();
   const bGo = gate();
+  const bStored = gate();
   const delSeen = gate();
   const delGo = gate();
   let deletes = 0;
@@ -457,7 +462,11 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
     if (req.headers()["x-file-name"] !== "B.txt") return route.fallback();
     bSeen.open();
     await bGo.p;
-    await route.fulfill({ response: await route.fetch() });
+    const response = await route.fetch();
+    // The server has answered for B: it is stored (its cancel is still held below).
+    expect(response.status()).toBe(201);
+    bStored.open();
+    await route.fulfill({ response });
   });
   await page.route(/\/api\/uploads\/[^/]+$/, async (route) => {
     if (route.request().method() !== "DELETE") return route.fallback();
@@ -475,8 +484,10 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
   await chips(page).filter({ hasText: "B.txt" }).getByRole("button", { name: /빼기/ }).click();
   if (bFirst) {
     // B is stored and its DELETE is on its way (held) before the page moves: the new page's first list has B.
+    // Waiting on the DELETE alone is not enough: it was sent at the click, while B could still be in flight (#103).
     bGo.open();
     await delSeen.p;
+    await bStored.p;
   }
   const listed = page.waitForResponse((r) => r.request().method() === "GET" && isFiles(r.url()));
   sendHeld.open();
@@ -484,8 +495,17 @@ async function cancelledDuringMove(page: Page, bFirst: boolean) {
   await listed;
   if (!bFirst) {
     // The review's order: B finishes on the new page, its DELETE is held; any list read now still has B.
+    const bAnswered = page.waitForResponse(
+      (r) =>
+        r.request().method() === "POST" &&
+        isFiles(r.url()) &&
+        r.request().headers()["x-file-name"] === "B.txt",
+    );
     bGo.open();
     await delSeen.p;
+    await bStored.p;
+    await bAnswered;
+    // A chip wrongly restored from B's answer would show up now: give it the time to.
     await page.waitForTimeout(500);
   }
   await expect(chips(page)).toHaveCount(0);

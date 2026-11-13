@@ -11,6 +11,9 @@ import { MOM, SON, csrf, newConversation, useAccount } from "./helpers.js";
 async function send(page: Page, text: string) {
   const box = page.getByLabel("메시지 입력");
   await box.fill(text);
+  // The previous reply shows `complete` from its `done` event, but the composer stays busy (■ 중지, Enter does
+  // nothing) until the run is read again as ended. Enter only once "보내기" is there and enabled (#103).
+  await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
   await box.press("Enter");
   await expect(box).toHaveValue("");
 }
