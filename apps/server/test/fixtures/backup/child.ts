@@ -43,8 +43,21 @@ if (mode === "lock") {
   ).run();
   db.exec("BEGIN");
   db.prepare("SELECT count(*) FROM users").get();
-  process.stdout.write("reading\n");
-  setInterval(() => {}, 1000);
+  // The connection must outlive this block: nothing else referred to `db`, so V8 could collect it while the process
+  // idled, and better-sqlite3's finalizer closes the connection — ending the read transaction (and, as the last
+  // connection, checkpointing the WAL) before the restore ran, which then rightly found nothing to wait for (#103).
+  // The interval below keeps it reachable; forced collections (with --expose-gc) prove it, and the reader proves its
+  // snapshot is still open by reading its own WAL-only row inside the same transaction.
+  setInterval(() => void db, 1000);
+  setTimeout(() => {
+    for (let i = 0; i < 5; i++) (globalThis as { gc?: () => void }).gc?.();
+    setTimeout(() => {
+      const own = db.prepare("SELECT count(*) AS n FROM users WHERE id = 'wal-reader'").get() as {
+        n: number;
+      };
+      process.stdout.write(db.inTransaction && own.n === 1 ? "reading\n" : "not-reading\n");
+    }, 50);
+  }, 0);
 } else if (mode === "try-lock") {
   try {
     acquireDataLock(args[0]!, args[1] as DataLockKind).release();

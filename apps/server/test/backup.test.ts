@@ -1363,7 +1363,7 @@ describe(
     it("another process still reading the old database: old_unsettled, nothing changed", async () => {
       const t = await prepared();
       await commitInWal(t.dataDir);
-      const reader = spawnTs(CHILD, ["hold-reader", t.dataDir]);
+      const reader = spawnTs(CHILD, ["hold-reader", t.dataDir], {}, ["--expose-gc"]);
       await reader.waitFor("reading");
       expect(restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key }))).toBe(
         "old_unsettled",
