@@ -859,6 +859,23 @@ describe("the worker self-check and gates (#122)", () => {
     expect(fs.readdirSync(workerScratchRoot(dataDir))).toEqual([]);
   });
 
+  it("a sibling that died during the probe is refused, even with a 'blocked' verdict (a zombie is refused too)", async () => {
+    const dataDir = tmp();
+    const r = await probeWorker({
+      account: ACCT,
+      kind: "extract",
+      dataDir,
+      serverUid: SERVER,
+      clean: () => {},
+      run: async ({ siblingPid }) => {
+        process.kill(siblingPid, "SIGKILL");
+        await new Promise((res) => setTimeout(res, 200));
+        return { uid: 777, siblingUid: SERVER, readBlocked: true };
+      },
+    });
+    expect(r).toEqual({ ok: false, reason: "the self-check sibling was not running during the probe" });
+  });
+
   it("gates: not configured → same_uid; a passed kind → account; a failed or throwing one stays same_uid", async () => {
     expect(new WorkerGates(undefined).status()).toEqual([
       { kind: "extract", isolation: "same_uid", state: "not_configured", step: null },
@@ -1248,7 +1265,19 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     const res = await docAsAccount(
       worker(r),
       r.dataDir,
-      { kind: "docx", doc: { title: "t", blocks: [] }, images: {} },
+      // A PDF of many paragraphs: node alone is over 20 MB, and the job outlasts several 250 ms looks (a tiny
+      // document could end between two looks — that is not what this test is about).
+      {
+        kind: "pdf",
+        doc: {
+          title: "t",
+          blocks: Array.from({ length: 150 }, (_, i) => ({
+            type: "paragraph" as const,
+            text: `문단 ${i} `.repeat(40),
+          })),
+        },
+        images: {},
+      },
       { spawn: direct(r), clean: cleanDirect(r) },
     );
     expect(res).toEqual({ ok: false, code: "doc_limit" });

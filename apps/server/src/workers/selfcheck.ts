@@ -35,7 +35,8 @@ import { makeWorkerJobDir, removeWorkerJob } from "./run.js";
  * 1. `probe`: as the account, inside that kind's sandbox profile (its reads, writes and network, the program
  *    swapped for /usr/bin/perl — node has no sysctl binding), the probe's uid differs from the server's and the
  *    `KERN_PROCARGS2` of a server-uid sibling holding a synthetic secret in its environment cannot be read (the
- *    kernel still shows the sibling, with the server's uid — a vanished pid is not "blocked").
+ *    kernel still shows the sibling, with the server's uid — a vanished pid is not "blocked" — and the server's own
+ *    sibling child is still running afterwards: a zombie is shown with its uid and refused too).
  * 2. `run`: a real job through the normal path (the same functions a request uses): extract — a server-owned text
  *    file copied into a job folder and extracted, under `extract` and again under `ocr` (its limits); docgen — a
  *    DOCX made and opened; render — a page rendered to PNG through the launcher's relayed debugging pipe (the egress
@@ -159,6 +160,10 @@ export async function probeWorker(o: {
     if (res.uid <= 0) return { ok: false, reason: `the account resolved to uid ${res.uid}` };
     if (res.siblingUid !== o.serverUid)
       return { ok: false, reason: "the probe did not see the server's sibling" };
+    // KERN_PROC_PID also answers for a zombie (with its uid), and a zombie's KERN_PROCARGS2 is refused too: the
+    // kernel still showing the sibling does not prove it was alive. Our own child must still be running now.
+    if (sibling.exitCode !== null || sibling.signalCode !== null)
+      return { ok: false, reason: "the self-check sibling was not running during the probe" };
     if (!res.readBlocked)
       return { ok: false, reason: "the account could read another process's start-up environment" };
     return { ok: true, uid: res.uid };
