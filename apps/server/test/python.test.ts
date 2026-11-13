@@ -2234,6 +2234,36 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
       expect(verify(r, "nobody").checks.find((c) => c.name === "account program access")?.reason).toMatch(
         /ACL denies list/,
       );
+      spawnSyncOk("/bin/chmod", ["-N", path.join(r.interp, "lib")]);
+      const access = () => verify(r, "nobody").checks.find((c) => c.name === "account program access");
+      expect(access()?.ok).toBe(true);
+      // #125: a regular file's allow marked only_inherit (which `ls -led` prints as a plain `allow read`) does not
+      // let the account read it; the same allow without the flag does.
+      fs.chmodSync(deep, 0o600);
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody allow read,only_inherit", deep]);
+      expect(execFileSync("/bin/ls", ["-led", deep], { encoding: "utf8" })).not.toMatch(/only_inherit/);
+      expect(access()?.reason).toMatch(/the account cannot read .*decoder\.py$/);
+      spawnSyncOk("/bin/chmod", ["-N", deep]);
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody allow read", deep]);
+      expect(access()?.ok).toBe(true);
+      spawnSyncOk("/bin/chmod", ["-N", deep]);
+      fs.chmodSync(deep, 0o644);
+      // #125: the launcher (as the account) reads ACLs with `ls -le`: a readsecurity denial on a tree node or on an
+      // ancestor of a program path fails it, though every read/search check passes.
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody deny readsecurity", deep]);
+      expect(access()?.reason).toMatch(/ACL denies readsecurity to the account at .*decoder\.py$/);
+      spawnSyncOk("/bin/chmod", ["-N", deep]);
+      spawnSyncOk("/bin/chmod", ["+a", "user:nobody deny readsecurity", r.dir]);
+      expect(access()?.reason).toMatch(new RegExp(`ACL denies readsecurity to the account at ${r.dir}$`));
+      spawnSyncOk("/bin/chmod", ["-N", r.dir]);
+      // A link in a tree: `ls -leRA` reads its own ACL too.
+      const link = path.join(path.dirname(deep), "alias.py");
+      fs.symlinkSync("decoder.py", link);
+      expect(access()?.ok).toBe(true);
+      spawnSyncOk("/bin/chmod", ["-h", "+a", "user:nobody deny readsecurity", link]);
+      expect(access()?.reason).toMatch(/ACL denies readsecurity to the account at .*alias\.py$/);
+      fs.unlinkSync(link);
+      expect(verify(r, "nobody").ok).toBe(true);
     },
   );
 
@@ -2497,3 +2527,180 @@ print JSON::PP->new->encode(\\@out);
     expect(e).toMatch(/cannot read/);
   });
 });
+
+describe.skipIf(!fs.existsSync("/usr/bin/perl"))(
+  "the launcher's ACL source: every flag, readsecurity (#125)",
+  () => {
+    const NOBODY_UUID = "FFFFEEEE-DDDD-CCCC-BBBB-AAAAFFFFFFFE";
+    const STAFF_UUID = "ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000014";
+    const ACCT = {
+      name: "nobody",
+      uid: 4294967294,
+      groups: ["everyone"],
+      gids: [4294967294, 12],
+      uuids: { [NOBODY_UUID]: ["uid", -2], [STAFF_UUID]: ["gid", 20] },
+    };
+    type Ace = { uuid: string; flags: number; rights: number };
+    /** A raw kauth_filesec as getattrlist(ATTR_CMN_EXTENDED_SECURITY) returns it (host byte order). */
+    const filesec = (aces: Ace[] | null, opts: { magic?: number; cut?: number } = {}): string => {
+      const b = Buffer.alloc(44 + 24 * (aces?.length ?? 0));
+      b.writeUInt32LE(opts.magic ?? 0x012cc16d, 0);
+      b.writeUInt32LE(aces === null ? 0xffffffff : aces.length, 36);
+      (aces ?? []).forEach((a, i) => {
+        Buffer.from(a.uuid.replace(/-/g, ""), "hex").copy(b, 44 + 24 * i);
+        b.writeUInt32LE(a.flags >>> 0, 44 + 24 * i + 16);
+        b.writeUInt32LE(a.rights >>> 0, 44 + 24 * i + 20);
+      });
+      return b.subarray(0, opts.cut ?? b.length).toString("hex");
+    };
+    type Case = { hex: string; dir: boolean; perm: string; bit: number; mode: number };
+    /** ace_lines on injected bytes, then account_eval of the lines it made (uid/gid 0: "other" for the account). */
+    const decode = (cases: Case[]): { err: string; lines: string[]; verdict: string }[] => {
+      const src = fs.readFileSync(LAUNCHER_SRC, "utf8");
+      const cut = src.indexOf("\n# ---- dispatch");
+      expect(cut).toBeGreaterThan(0);
+      const harness = `
+use JSON::PP;
+my $req = JSON::PP->new->decode(do { local $/; <STDIN> });
+my $a = $req->{acct};
+my %u = %{ $a->{uuids} };
+my $acct = { name => $a->{name}, uid => $a->{uid}, groups => { map { $_ => 1 } @{ $a->{groups} } },
+  gids => { map { u32($_) => 1 } @{ $a->{gids} } }, uuid_id => sub { my $x = $u{$_[0]}; return $x ? @$x : () } };
+my @out;
+for my $c (@{ $req->{cases} }) {
+  my ($e, $l) = ace_lines("/n", pack("H*", $c->{hex}), $c->{dir} ? 1 : 0);
+  my @l = $l ? @$l : ();
+  my $v = length $e ? "" : account_eval($acct, "/n", $c->{perm}, $c->{bit}, $c->{mode}, 0, 0, @l);
+  push @out, { err => $e, lines => \\@l, verdict => $v };
+}
+print JSON::PP->new->encode(\\@out);
+`;
+      const lib = path.join(tmp(), "lib.pl");
+      fs.writeFileSync(lib, src.slice(0, cut) + "\n" + harness);
+      const r = spawnSync("/usr/bin/perl", ["-T", lib], {
+        input: JSON.stringify({ acct: ACCT, cases }),
+        encoding: "utf8",
+        env: {},
+      });
+      expect(r.status, r.stderr).toBe(0);
+      return JSON.parse(r.stdout) as { err: string; lines: string[]; verdict: string }[];
+    };
+    const file = (aces: Ace[] | null, perm = "read", bit = 4, mode = 0o100000): Case => ({
+      hex: filesec(aces),
+      dir: false,
+      perm,
+      bit,
+      mode,
+    });
+
+    it("a regular file keeps only_inherit / file_inherit (ls -led drops them): such an allow does not apply", () => {
+      const [a, b, c, d] = decode([
+        file([{ uuid: NOBODY_UUID, flags: 0x101, rights: 0x2 }]), // allow read,only_inherit on a mode-000 file
+        file([{ uuid: NOBODY_UUID, flags: 0x1, rights: 0x2 }]), // a plain allow read: applies
+        file([{ uuid: NOBODY_UUID, flags: 0x102, rights: 0x2 }], "read", 4, 0o100644), // deny,only_inherit: not here
+        file([{ uuid: STAFF_UUID, flags: 0x21, rights: 0x2 }]), // staff (not its group), file_inherit
+      ]);
+      expect(a!.lines).toEqual([` 0: ${NOBODY_UUID} allow read,only_inherit`]);
+      expect(a!.verdict).toMatch(/the account cannot read/);
+      expect(b!.lines).toEqual([` 0: ${NOBODY_UUID} allow read`]);
+      expect(b!.verdict).toBe("");
+      expect(c!.verdict).toBe("");
+      expect(d!.lines).toEqual([` 0: ${STAFF_UUID} allow read,file_inherit`]);
+      expect(d!.verdict).toMatch(/cannot read/);
+    });
+
+    it("names follow the node type; inherited, audit, no-ACL and every flag are decoded", () => {
+      const [a, b, c, d, e] = decode([
+        {
+          hex: filesec([{ uuid: STAFF_UUID, flags: 0x1e1, rights: 0x3ffe }]),
+          dir: true,
+          perm: "search",
+          bit: 1,
+          mode: 0o040000,
+        },
+        file([{ uuid: STAFF_UUID, flags: 0x1, rights: 0x3ffe }]),
+        file([{ uuid: NOBODY_UUID, flags: 0x11, rights: 0x2 }]), // inherited allow read
+        file([{ uuid: NOBODY_UUID, flags: 0x3, rights: 0x2 }]), // an audit entry: neither grants nor denies
+        file(null), // KAUTH_FILESEC_NOACL
+      ]);
+      expect(a!.lines).toEqual([
+        ` 0: ${STAFF_UUID} allow list,add_file,search,delete,add_subdirectory,delete_child,readattr,writeattr,` +
+          "readextattr,writeextattr,readsecurity,writesecurity,chown,file_inherit,directory_inherit,limit_inherit,only_inherit",
+      ]);
+      expect(b!.lines).toEqual([
+        ` 0: ${STAFF_UUID} allow read,write,execute,delete,append,delete_child,readattr,writeattr,` +
+          "readextattr,writeextattr,readsecurity,writesecurity,chown",
+      ]);
+      expect(c!.lines).toEqual([` 0: ${NOBODY_UUID} inherited allow read`]);
+      expect(c!.verdict).toBe("");
+      expect(d!.lines).toEqual([]);
+      expect(d!.verdict).toMatch(/cannot read/);
+      expect(e!.lines).toEqual([]);
+    });
+
+    it("what it cannot classify is a diagnostic failure, never unrelated: generic rights, unknown flags, bad records", () => {
+      const out = decode([
+        file([{ uuid: STAFF_UUID, flags: 0x1, rights: 1 << 24 }]), // generic_read
+        file([{ uuid: STAFF_UUID, flags: 0x1, rights: 1 << 20 }]), // synchronize
+        file([{ uuid: STAFF_UUID, flags: 0x801, rights: 0x2 }]), // an unknown flag bit
+        file([{ uuid: STAFF_UUID, flags: 0x5, rights: 0x2 }]), // an unknown entry kind
+        { ...file([]), hex: filesec([], { magic: 0x12345678 }) },
+        { ...file([]), hex: filesec([{ uuid: STAFF_UUID, flags: 1, rights: 2 }], { cut: 60 }) }, // truncated
+      ]);
+      expect(out.map((o) => o.err)).toEqual([
+        "unclassified ACL rights at /n",
+        "unclassified ACL rights at /n",
+        "unclassified ACL entry at /n",
+        "unclassified ACL entry at /n",
+        "bad ACL record at /n",
+        "bad ACL record at /n",
+      ]);
+    });
+
+    it("readsecurity: granted unless an applicable ACL entry denies it (the POSIX mode does not matter)", () => {
+      const rs = (aces: Ace[] | null) => file(aces, "readsecurity", 0, 0o100000);
+      const [a, b, c, d] = decode([
+        rs(null),
+        rs([{ uuid: NOBODY_UUID, flags: 0x2, rights: 1 << 11 }]),
+        rs([{ uuid: NOBODY_UUID, flags: 0x102, rights: 1 << 11 }]), // only_inherit: not for this node
+        rs([{ uuid: STAFF_UUID, flags: 0x2, rights: 1 << 11 }]), // a group it is not in
+      ]);
+      expect(a!.verdict).toBe("");
+      expect(b!.lines).toEqual([` 0: ${NOBODY_UUID} deny readsecurity`]);
+      expect(b!.verdict).toMatch(/ACL denies readsecurity/);
+      expect(c!.verdict).toBe("");
+      expect(d!.verdict).toBe("");
+    });
+
+    it.skipIf(process.platform !== "darwin")(
+      "node_aces reads a real file's flags that `ls -led` hides; an unreadable ACL is a failure",
+      () => {
+        const src = fs.readFileSync(LAUNCHER_SRC, "utf8");
+        const cut = src.indexOf("\n# ---- dispatch");
+        const d = tmp();
+        const f = path.join(d, "f");
+        const g = path.join(d, "g");
+        fs.writeFileSync(f, "");
+        fs.writeFileSync(g, "");
+        spawnSyncOk("/bin/chmod", ["+a", "user:nobody allow read,only_inherit", f]);
+        spawnSyncOk("/bin/chmod", ["+a", `user:${os.userInfo().username} deny readsecurity`, g]);
+        closers.push(() => spawnSync("/bin/chmod", ["-N", g]));
+        expect(execFileSync("/bin/ls", ["-led", f], { encoding: "utf8" })).not.toMatch(/only_inherit/);
+        const harness = `
+use JSON::PP;
+my @out = map { my ($p) = $_ =~ /(.+)/s; my ($e, $l) = node_aces($p); { err => $e, lines => $l // [] } } @ARGV;
+print JSON::PP->new->encode(\\@out);
+`;
+        const lib = path.join(tmp(), "lib.pl");
+        fs.writeFileSync(lib, src.slice(0, cut) + "\n" + harness);
+        const r = spawnSync("/usr/bin/perl", ["-T", lib, f, g, d], { encoding: "utf8", env: {} });
+        expect(r.status, r.stderr).toBe(0);
+        const [a, b, c] = JSON.parse(r.stdout) as { err: string; lines: string[] }[];
+        expect(a).toEqual({ err: "", lines: [` 0: ${NOBODY_UUID} allow read,only_inherit`] });
+        // A readsecurity denial: getattrlist fails (and on current macOS even lstat does — so do `ls` and the launcher).
+        expect(b!.err).toMatch(new RegExp(`^cannot (stat|read ACL): ${g}$`));
+        expect(c).toEqual({ err: "", lines: [] });
+      },
+    );
+  },
+);
