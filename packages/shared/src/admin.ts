@@ -58,6 +58,21 @@ export const SystemStatus = z.object({
    * metrics server does not answer.
    */
   tunnel: z.object({ state: TunnelState, readyConnections: z.number().int().nullable() }),
+  /**
+   * The sandboxed workers (#122) — the extractor, the document worker, the export browser: `account` once a kind's
+   * self-check passed (it runs as the dedicated worker account, a different uid); otherwise `same_uid` — the
+   * server's own uid inside the macOS sandbox only, NOT isolated by account — with why (`state`, a failed `step`).
+   */
+  workers: z
+    .array(
+      z.object({
+        kind: z.enum(["extract", "docgen", "render"]),
+        isolation: z.enum(["account", "same_uid"]),
+        state: z.enum(["ok", "not_configured", "checking", "failed", "stopped", "unavailable"]),
+        step: z.string().nullable(),
+      }),
+    )
+    .default([]),
   /** Newest recent errors (#46): IDs and codes only. */
   recentErrors: z.array(
     z.object({

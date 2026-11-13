@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +11,23 @@ import {
 import { EgressService, type EgressOptions } from "../isolation/egress.js";
 import { snapshot } from "../isolation/sandbox.js";
 import { z } from "zod";
-import { browserArgs, CdpError, CdpPipe, sandboxedLauncher, type Launcher } from "./browser.js";
+import { REAP_RETRIES } from "../python/runner.js";
+import {
+  reapWorker,
+  workerLauncherRun,
+  LAUNCHER_MAX_SEC,
+  type VerifiedWorker,
+  type WorkerAccount,
+} from "../workers/account.js";
+import { makeWorkerJobDir, removeWorkerJob, type WorkerSpawn } from "../workers/run.js";
+import {
+  browserArgs,
+  CdpError,
+  CdpPipe,
+  sandboxedLauncher,
+  type Launched,
+  type Launcher,
+} from "./browser.js";
 import { CDN_ALLOW_LIST, escapeHtml, page, serveVersion, type Served } from "./serve.js";
 
 /**
@@ -28,6 +45,15 @@ import { CDN_ALLOW_LIST, escapeHtml, page, serveVersion, type Served } from "./s
  *  3. the macOS process sandbox: the process can reach only that proxy's loopback port.
  * Time, memory (RSS of the one process — `--single-process`, no fork) and reply size are limited; past a limit
  * the process group is killed.
+ *
+ * Under the worker account (#122, `workers/account.ts`) — once its render self-check passed — the browser is not
+ * started by the server at all: the server asks the root-owned launcher (`sudo -u <account> … run render <job>
+ * <timeout> <proxy port>`), which starts the root-owned copy of the same browser with the same switches and the same
+ * profile rules, as a **different uid**, and relays the debugging pipe over its stdin/stdout. Chrome's own sandbox
+ * stays off (`--no-sandbox`: macOS does not nest seatbelt profiles) — the boundary is the seatbelt profile plus the
+ * other uid, which a renderer exploit would also have to cross to read a runtime's start-up environment. The render
+ * folder is a job folder under `worker-scratch/`; the launcher watches time and memory and the server stops a
+ * render by asking the launcher to `reap` it (it cannot signal another uid).
  */
 
 export const EXPORT_FORMATS = ARTIFACT_EXPORT_FORMATS;
@@ -127,7 +153,24 @@ export type RendererOptions = {
   /** Parent of the per-render folders (default: the OS temp folder). */
   tmpDir?: string;
   test?: RenderTestHooks;
+  /** The worker account (#122): renders run through its launcher while `verified()` gives one. */
+  account?: AccountRendering;
 };
+
+export type AccountRendering = {
+  verified: () => VerifiedWorker | undefined;
+  dataDir: string;
+  /** Tests only: replace the spawn of sudo, the reap and the clean of a job. */
+  spawn?: WorkerSpawn;
+  reap?: (account: WorkerAccount, jobId: string, onExit: (code: number | null) => void) => void;
+  clean?: (account: WorkerAccount, jobId: string) => void;
+};
+
+/** One render through the worker account: who, and (the self-check) a look at the job before it is removed. */
+export type RenderVia = { worker: VerifiedWorker; onJob?: ((jobId: string) => void) | undefined };
+
+const defaultWorkerSpawn: WorkerSpawn = (command, args) =>
+  spawn(command, args, { env: {}, stdio: ["pipe", "pipe", "pipe"], detached: true });
 
 /**
  * Shapes of the replies and events the renderer uses. The browser is untrusted (it runs the artifact in its own
@@ -173,22 +216,27 @@ export class Renderer {
   }
 
   get available(): boolean {
-    return !!this.o.browser;
+    return !!this.o.browser || !!this.o.account?.verified();
   }
 
   close(): Promise<void> {
     return this.egress.close();
   }
 
-  async render(job: RenderJob): Promise<RenderResult> {
-    if (!this.o.browser) return { ok: false, code: "export_unavailable" };
+  /**
+   * One render. Through the worker account when `via` names one (the self-check) or the account's render check has
+   * passed (`account.verified()`); otherwise the same-uid sandbox with `browser`.
+   */
+  async render(job: RenderJob, via?: RenderVia): Promise<RenderResult> {
+    const worker = via?.worker ?? this.o.account?.verified();
+    if (!worker && !this.o.browser) return { ok: false, code: "export_unavailable" };
     if (this.active >= this.limits.concurrent) {
       // A few wait for a free slot (each render is short); beyond that the caller is told to come back.
       if (this.queue.length >= this.limits.queue) return { ok: false, code: "export_busy" };
       await new Promise<void>((resolve) => this.queue.push(resolve));
     } else this.active++;
     try {
-      return await this.run(this.o.browser, job);
+      return await this.run(this.o.browser, job, worker ? { worker, onJob: via?.onJob } : undefined);
     } finally {
       // Hand the slot straight to the next waiter (it never counted itself), or free it.
       const next = this.queue.shift();
@@ -197,7 +245,18 @@ export class Renderer {
     }
   }
 
-  private async run(browser: string, job: RenderJob): Promise<RenderResult> {
+  /** The browser through the worker launcher: its stdin/stdout are the debugging pipe (the launcher relays). */
+  private launchAsAccount(account: WorkerAccount, jobId: string, proxyPort: number): Launched {
+    // The launcher's own limit is a backstop a little past ours (the server stops a render first, by reap).
+    const timeoutSec = Math.min(LAUNCHER_MAX_SEC.render, Math.ceil(this.limits.timeoutMs / 1000) + 5);
+    const { command, args } = workerLauncherRun(account, "render", jobId, timeoutSec, proxyPort);
+    const child = (this.o.account?.spawn ?? defaultWorkerSpawn)(command, args);
+    // The launcher's own messages: read (never let a full pipe block it), not kept.
+    child.stderr?.resume();
+    return { child, input: child.stdin!, output: child.stdout! };
+  }
+
+  private async run(browser: string | undefined, job: RenderJob, via?: RenderVia): Promise<RenderResult> {
     const t = this.o.test ?? {};
     const L = this.limits;
     let proxy;
@@ -206,10 +265,34 @@ export class Renderer {
     } catch {
       return { ok: false, code: "export_unavailable" };
     }
-    // A fresh, empty profile per render: no cookies, storage or cache of anyone, removed afterwards.
-    const workDir = fs.realpathSync(
-      fs.mkdtempSync(path.join(this.o.tmpDir ?? os.tmpdir(), "agentlee-render-")),
-    );
+    // A fresh, empty profile per render: no cookies, storage or cache of anyone, removed afterwards. Under the
+    // account: a job folder of the worker scratch (the launcher finds it by the job id alone).
+    const worker = via?.worker;
+    const dataDir = this.o.account?.dataDir;
+    let made: { jobId: string; dir: string } | undefined;
+    let workDir: string;
+    try {
+      if (worker) {
+        if (!dataDir) return { ok: false, code: "export_unavailable" };
+        made = makeWorkerJobDir(dataDir);
+        workDir = made.dir;
+      } else
+        workDir = fs.realpathSync(
+          fs.mkdtempSync(path.join(this.o.tmpDir ?? os.tmpdir(), "agentlee-render-")),
+        );
+    } catch {
+      return { ok: false, code: "export_unavailable" };
+    }
+    const removeWorkDir = () => {
+      if (made && worker && dataDir) {
+        try {
+          via?.onJob?.(made.jobId);
+        } catch {
+          // the self-check's look never decides the clean-up
+        }
+        removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
+      } else fs.rmSync(workDir, { recursive: true, force: true });
+    };
     const home = path.join(workDir, "home");
     const tmp = path.join(workDir, "tmp");
     const profile = path.join(workDir, "profile");
@@ -221,18 +304,23 @@ export class Renderer {
 
     let launched;
     try {
-      launched = this.launcher({ browser, args, env, workDir, proxyPort: proxy.port });
+      launched =
+        worker && made
+          ? this.launchAsAccount(worker.account, made.jobId, proxy.port)
+          : this.launcher({ browser: browser!, args, env, workDir, proxyPort: proxy.port });
     } catch {
-      fs.rmSync(workDir, { recursive: true, force: true });
+      removeWorkDir();
       return { ok: false, code: "export_unavailable" };
     }
     const { child, input, output } = launched;
     const pid = child.pid;
     let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
     let exited = false;
+    let exitCode: number | null = null;
     const exit = new Promise<void>((resolve) => {
-      child.once("exit", () => {
+      child.once("exit", (code) => {
         exited = true;
+        exitCode = code;
         resolve();
       });
       child.once("error", () => {
@@ -240,8 +328,26 @@ export class Renderer {
         resolve();
       });
     });
+    // Under the account the server cannot signal the browser (another uid): the launcher's reap kills the
+    // recorded, verified process (retried while it could not verify, python_run's rule), and our ends of the pipes
+    // close so nothing waits on them.
+    const reapOnce = (left: number) => {
+      if (!worker || !made) return;
+      const jobId = made.jobId;
+      (this.o.account?.reap ?? reapWorker)(worker.account, jobId, (code) => {
+        if (code !== 0 && left > 0 && !exited) setTimeout(() => reapOnce(left - 1), 500).unref();
+      });
+    };
     const kill = (why: NonNullable<typeof killed>) => {
       if (exited) return;
+      if (worker) {
+        if (killed) return;
+        killed = why;
+        reapOnce(REAP_RETRIES);
+        input.destroy();
+        output.destroy();
+        return;
+      }
       killed ??= why;
       try {
         process.kill(-pid!, "SIGKILL");
@@ -254,10 +360,11 @@ export class Renderer {
       kill("timeout");
       cdp.close(new CdpError("closed"));
     }, L.timeoutMs);
-    // Memory of the one browser process; not measurable while it runs → stop (fail closed).
+    // Memory of the one browser process; not measurable while it runs → stop (fail closed). Under the account the
+    // launcher watches it (every 250 ms, exit 125 over the limit): the server's pid is sudo's.
     let sampling = false;
     const monitor = setInterval(() => {
-      if (sampling || exited || !pid) return;
+      if (worker || sampling || exited || !pid) return;
       sampling = true;
       (t.probe ?? (() => snapshot(pid)))()
         .then((procs) => {
@@ -289,6 +396,11 @@ export class Renderer {
         code: e instanceof CdpError && e.code === "too_large" ? "export_limit" : "export_failed",
       };
     }
+    // The launcher's own limits (account mode): 124 its wall clock, 125 its memory watch.
+    if (worker && !killed && exited) {
+      if (exitCode === 124) killed = "timeout";
+      else if (exitCode === 125) killed = "memory";
+    }
     if (killed === "timeout") result = { ok: false, code: "export_timeout" };
     else if (killed === "protocol")
       result = { ok: false, code: cdp.error?.code === "too_large" ? "export_limit" : "export_failed" };
@@ -305,7 +417,7 @@ export class Renderer {
       clearTimeout(hard);
     }
     cdp.close(new CdpError("closed"));
-    fs.rmSync(workDir, { recursive: true, force: true });
+    removeWorkDir();
     return result;
   }
 

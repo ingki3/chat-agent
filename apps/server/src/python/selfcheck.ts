@@ -185,20 +185,22 @@ export async function selfCheckAccount(opts: {
  * absent (`needs_account`, reason "checking: …"); it is offered only once it has passed; a failure — or anything it
  * throws — keeps it off with the failed step as the reason. `start` never throws or rejects.
  */
-export class AccountSelfCheckGate {
-  private verifiedAccount: { account: PythonAccount; uid: number } | undefined;
+export class AccountSelfCheckGate<A = PythonAccount> {
+  private verifiedAccount: { account: A; uid: number } | undefined;
   private why: string;
   /** The running check, for tests and shutdown. */
   done: Promise<void> = Promise.resolve();
   private readonly abort = new AbortController();
 
-  constructor(private readonly account: PythonAccount | undefined) {
-    this.why = account
-      ? "checking: the account self-check has not started"
-      : "PYTHON_RUN_USER not configured";
+  /** `unconfigured`: the reason while there is no account (the worker gates, #122, name their own setting). */
+  constructor(
+    private readonly account: A | undefined,
+    unconfigured = "PYTHON_RUN_USER not configured",
+  ) {
+    this.why = account ? "checking: the account self-check has not started" : unconfigured;
   }
 
-  get verified(): { account: PythonAccount; uid: number } | undefined {
+  get verified(): { account: A; uid: number } | undefined {
     return this.verifiedAccount;
   }
 

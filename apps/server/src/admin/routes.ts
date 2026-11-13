@@ -1,3 +1,4 @@
+import type { WorkerIsolation } from "../workers/selfcheck.js";
 import fs from "node:fs";
 import type { FastifyInstance } from "fastify";
 import { ConnectionStatus, RuntimeId, type AdminRuntime, type SystemStatus } from "@agentlee/shared";
@@ -15,6 +16,8 @@ export type SystemRouteOptions = {
   tunnelMetrics: MetricsAddress | undefined;
   /** Tests: the tunnel probe. */
   tunnel?: (address: MetricsAddress | undefined) => Promise<TunnelStatus>;
+  /** The sandboxed workers' isolation (#122): by the worker account, or the same-uid sandbox only. */
+  workers?: () => WorkerIsolation[];
 };
 
 const RUNTIMES = RuntimeId.options;
@@ -91,6 +94,7 @@ export function registerAdminSystemRoutes(
         };
       }),
       tunnel: await (opts.tunnel ?? tunnelStatus)(opts.tunnelMetrics),
+      workers: opts.workers?.() ?? [],
       recentErrors: deps.errors.recent({ limit: 20 }).map((e) => ({
         id: e.id,
         at: e.at,

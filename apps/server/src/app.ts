@@ -92,6 +92,17 @@ import { pythonRuntimeEnv, scratchpadState, type ScratchpadState } from "./pytho
 import { sandboxedPythonRunner, type PythonRunner } from "./python/runner.js";
 import { PythonScratchpad } from "./python/service.js";
 import { accountFromConfig, type ProbeRunner } from "./python/account.js";
+import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
+import { accountOrSandboxDocRunner } from "./workers/docgen.js";
+import { accountOrSandboxExtractor } from "./workers/extract.js";
+import { sweepWorkerScratch } from "./workers/run.js";
+import {
+  docJobCheck,
+  extractJobCheck,
+  renderJobCheck,
+  selfCheckWorker,
+  WorkerGates,
+} from "./workers/selfcheck.js";
 import { AccountSelfCheckGate, selfCheckAccount, type SelfCheckResult } from "./python/selfcheck.js";
 import { storagePaths } from "./storage/paths.js";
 import { isInside } from "./fs-safety.js";
@@ -274,6 +285,14 @@ export type BuildOptions = {
     /** Tests: the account gate to use (to watch it), and a self-check to run in its place (runs even in tests). */
     gate?: AccountSelfCheckGate;
     selfCheck?: (signal: AbortSignal) => Promise<SelfCheckResult>;
+  };
+  /**
+   * The sandboxed workers' account (#122). Tests: the gates to use (to watch or pre-verify them), and a self-check
+   * to run in place of the real one (runs even in tests).
+   */
+  workers?: {
+    gates?: WorkerGates;
+    selfCheck?: (kind: WorkerKind, signal: AbortSignal) => Promise<SelfCheckResult>;
   };
   /**
    * Schedules (#33): the run handler (default: the real one, #56 — a turn in the schedule's result conversation),
@@ -489,10 +508,23 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Schedule proposals (#55): `schedule_create` stores them; the owner confirms the card (schedule routes).
     const scheduleProposals = new ScheduleProposalStore(opts.db!);
     app.decorate("scheduleProposals", scheduleProposals);
+    // The sandboxed workers (#122): the extractor, the document worker and the export browser run as the dedicated
+    // worker account (WORKER_RUN_USER, a different uid — a worker exploit then cannot read a runtime's start-up
+    // environment) once that kind's self-check passed on this machine; until then, or without the account, each
+    // keeps the same-uid sandbox and the admin status (`workers`) says it is not isolated by account. The checks run
+    // in the background once the server is ready (after the worker-scratch sweep), one kind after another.
+    const workerAccount = workerAccountFromConfig(config.workerRunUser);
+    const workerGates = opts.workers?.gates ?? new WorkerGates(workerAccount);
     // Documents (#49): made by `doc_create`, stored with the conversation's files (the store is decorated below).
     const docRunner =
       opts.docs?.runner ??
-      (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner());
+      (docRunnerKind(config) === "in-process"
+        ? inProcessDocRunner()
+        : accountOrSandboxDocRunner(
+            () => workerGates.verified("docgen"),
+            sandboxedDocRunner(),
+            config.dataDir,
+          ));
     // Every document worker run (doc_create and the reference export) takes one of the same slots.
     const docSlots = new DocSlots(docRunner);
     const docs = new DocGenService({
@@ -516,7 +548,14 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       opts.extract?.runner ??
         // A test machine without `sandbox-exec` (the Linux CI's e2e), explicitly: the worker in this process.
         // Never in production — a real server always extracts in the sandbox.
-        (extractorKind(config) === "in-process" ? inProcessExtractor(ocrNow) : sandboxedExtractor(ocrNow)),
+        (extractorKind(config) === "in-process"
+          ? inProcessExtractor(ocrNow)
+          : accountOrSandboxExtractor(
+              () => workerGates.verified("extract"),
+              sandboxedExtractor(ocrNow),
+              config.dataDir,
+              ocrNow,
+            )),
       { log: app.log, onReplaced: () => storedRescrub.cleanup(), ...opts.extract },
     );
     app.decorate("fileExtracts", fileExtracts);
@@ -592,6 +631,56 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Shutdown stops a running check (its probe/job are aborted — the runner reaps the launcher job — and no new
     // step starts) and waits, bounded, for its cleanup: production exits right after close (#121 round 10).
     app.addHook("preClose", async () => gate.stop(10_000));
+    // The workers' checks (#122): the renderer is made further down (`ownRenderer`); the checks start once ready.
+    let ownRenderer: Renderer | undefined;
+    const startWorkerChecks = (): void => {
+      const log = (kind: WorkerKind, ok: boolean, step: string) =>
+        ok
+          ? logEvent(app.log, "info", "worker.self_check_ok", { workerKind: kind })
+          : logEvent(app.log, "warn", "worker.self_check_failed", { workerKind: kind, workerStep: step });
+      const sameUid = () => {
+        const kinds = workerGates
+          .status()
+          .filter((w) => w.isolation === "same_uid")
+          .map((w) => w.kind);
+        // Loud on purpose: these workers are then isolated by the sandbox only, not by account (docs/ops.md §41).
+        if (kinds.length) logEvent(app.log, "warn", "worker.same_uid", { workerKinds: kinds.join(",") });
+      };
+      if (opts.workers?.selfCheck) {
+        void workerGates.start(opts.workers.selfCheck, log).then(sameUid);
+        return;
+      }
+      if (config.env === "test") return;
+      if (!workerAccount) return sameUid();
+      if (extractorKind(config) === "in-process")
+        workerGates.skip("extract", "in-process extraction (tests only)");
+      if (docRunnerKind(config) === "in-process")
+        workerGates.skip("docgen", "in-process documents (tests only)");
+      if (opts.extract?.runner) workerGates.skip("extract", "a custom extractor");
+      if (opts.docs?.runner) workerGates.skip("docgen", "a custom document runner");
+      const account = workerAccount;
+      const renderer = ownRenderer;
+      void workerGates
+        .start(async (kind, signal) => {
+          if (kind === "render" && !renderer)
+            return { ok: false, step: "run", reason: "no renderer of this server's own" };
+          return selfCheckWorker({
+            kind,
+            account,
+            dataDir: config.dataDir,
+            serverUid: process.getuid?.() ?? -1,
+            signal,
+            job:
+              kind === "extract"
+                ? extractJobCheck(config.dataDir, ocrNow)
+                : kind === "docgen"
+                  ? docJobCheck(config.dataDir)
+                  : renderJobCheck(renderer!),
+          });
+        }, log)
+        .then(sameUid);
+    };
+    app.addHook("preClose", async () => workerGates.stop(10_000));
     // Citations (#25): `cite` checks against the stored page text; the run's note reads them back. `file_cite`
     // (#48) numbers file citations in the same sequence.
     const citations = new CitationStore(opts.db!);
@@ -709,12 +798,19 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
         startSelfCheck();
+        // Worker job folders of the last process (#122), then the worker account's checks.
+        if (!sweepWorkerScratch(config.dataDir, workerAccount))
+          logEvent(app.log, "warn", "worker.sweep_failed");
+        startWorkerChecks();
       });
     else {
       if (which === "other")
         app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
       // No sweep here: the self-check (tests that inject one) still starts in the background once ready.
-      app.addHook("onReady", async () => startSelfCheck());
+      app.addHook("onReady", async () => {
+        startSelfCheck();
+        startWorkerChecks();
+      });
     }
     // Family sharing (#29): the one projection every shared read goes through (shares/projection.ts). Before the
     // routes whose resource checks ask it who a resource is shared with.
@@ -790,6 +886,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         dataDir: config.dataDir,
         databaseFile: opts.db!.$client.memory ? null : opts.db!.$client.name,
         tunnelMetrics: config.tunnelMetrics,
+        workers: () => workerGates.status(),
         ...opts.system,
       },
     );
@@ -881,7 +978,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     if (!renderer) {
       const own = new Renderer({
         browser: config.env === "test" ? undefined : findBrowser(config.exportBrowser),
+        // Through the worker account once its render check passed (#122).
+        account: { verified: () => workerGates.verified("render"), dataDir: config.dataDir },
       });
+      ownRenderer = own;
       app.addHook("onClose", async () => own.close());
       renderer = own;
     }

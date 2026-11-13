@@ -10,6 +10,21 @@ const TUNNEL: Record<SystemStatus["tunnel"]["state"], [string, string]> = {
   unreachable: ["응답 없음", "err"],
 };
 
+type Worker = SystemStatus["workers"][number];
+const WORKER_LABEL: Record<Worker["kind"], string> = {
+  extract: "파일 추출기",
+  docgen: "문서 생성기",
+  render: "내보내기 브라우저",
+};
+const WORKER_STATE: Record<Worker["state"], string> = {
+  ok: "자가 검사 통과",
+  not_configured: "WORKER_RUN_USER 미설정",
+  checking: "자가 검사 중",
+  failed: "자가 검사 실패",
+  stopped: "자가 검사 중단",
+  unavailable: "이 서버에서 쓰지 않음",
+};
+
 const time = (ms: number) =>
   new Date(ms).toLocaleString("ko-KR", {
     month: "numeric",
@@ -86,6 +101,36 @@ export function SystemAdmin() {
               터널 상태를 보려면 cloudflared 메트릭 주소를 <code>.env</code>의{" "}
               <code>CLOUDFLARED_METRICS</code>에 넣으세요(루프백만, 운영 문서 6절). 7일 가동률은{" "}
               <code>pnpm uptime report</code>로 봐요.
+            </p>
+          )}
+
+          <h3>샌드박스 작업자 격리</h3>
+          <table className="devices" aria-label="샌드박스 작업자 격리" data-testid="worker-isolation">
+            <tbody>
+              {s.workers.map((w) => (
+                <tr key={w.kind} data-testid={`worker-${w.kind}`}>
+                  <td>
+                    <b>{WORKER_LABEL[w.kind]}</b>
+                    <br />
+                    {w.isolation === "account" ? (
+                      <span className="badge ok">전용 계정으로 격리</span>
+                    ) : (
+                      <span className="badge err">계정 격리 안 됨 — 같은 UID 샌드박스만</span>
+                    )}
+                    <span className="muted small">
+                      {" "}
+                      · {WORKER_STATE[w.state]}
+                      {w.step ? ` (${w.step})` : ""}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {s.workers.some((w) => w.isolation === "same_uid") && (
+            <p className="muted small" data-testid="worker-warning">
+              계정 격리가 안 된 작업자는 서버와 같은 UID로 돌아, 작업자가 뚫리면 런타임의 시작 환경(키·토큰)을
+              읽을 수 있어요. 운영 문서 41절대로 전용 계정을 설치하고 서버를 다시 시작하세요.
             </p>
           )}
 
