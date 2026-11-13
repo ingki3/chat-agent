@@ -23,7 +23,15 @@ import { RAW_HEADERS } from "../artifacts/routes.js";
 import { logEvent } from "../logging.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { maskEscaped, partsHoldSecret, readParts, registryState, type XmlPart } from "./docx-check.js";
-import { DEFAULT_TIME_ZONE, cleanText, collectReferences, dayIn, type CollectedSource } from "./collect.js";
+import {
+  DEFAULT_TIME_ZONE,
+  cleanText,
+  collectReferences,
+  dayIn,
+  type CollectedSource,
+  type ReferencesView,
+} from "./collect.js";
+import { viewOf } from "../shares/projection.js";
 
 /**
  * Resource kind of a conversation's reference export (#26). Whoever may read the conversation may export it: the
@@ -53,8 +61,10 @@ export function buildExport(
   style: ReferenceStyle,
   includeUnverified: boolean,
   timeZone: string = DEFAULT_TIME_ZONE,
+  /** A shared viewer's projection (#29): the export of what they see, never the whole conversation. */
+  view?: ReferencesView,
 ): ReferenceExport {
-  const { sources, truncated } = collectReferences(db, conversationId, timeZone);
+  const { sources, truncated } = collectReferences(db, conversationId, timeZone, view);
   const included = (s: CollectedSource) => s.verified || includeUnverified;
   const shown = sources.filter(included);
   const hidden = sources.filter((s) => !included(s));
@@ -154,8 +164,11 @@ export function registerReferenceRoutes(
   app.get<{ Params: { id: string } }>("/api/conversations/:id/references", { config }, async (req, reply) => {
     const q = ReferencesQuery.safeParse(req.query);
     if (!q.success) return deny(reply, 400, "invalid_request");
+    // A shared viewer (#29): the loader let them in; the export is of their projection only.
+    const view = viewOf(app, req, { conversationId: req.params.id });
+    if (view === null) return deny(reply, 403, "forbidden");
     const tz = timeZoneOf(deps.db, req.ctx.user!.id);
-    const e = buildExport(deps.db, req.params.id, q.data.style, q.data.includeUnverified === "1", tz);
+    const e = buildExport(deps.db, req.params.id, q.data.style, q.data.includeUnverified === "1", tz, view);
     return reply.header("Cache-Control", "no-store").send({
       style: e.style,
       includeUnverified: e.includeUnverified,
@@ -176,10 +189,12 @@ export function registerReferenceRoutes(
       const q = ReferencesDownloadQuery.safeParse(req.query);
       if (!q.success) return deny(reply, 400, "invalid_request");
       const started = Date.now();
+      const view = viewOf(app, req, { conversationId: req.params.id });
+      if (view === null) return deny(reply, 403, "forbidden");
       const userId = req.ctx.user!.id;
       const tz = timeZoneOf(deps.db, userId);
       const { style, format } = q.data;
-      const e = buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz);
+      const e = buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, view);
       const done = (docCode?: string) =>
         logEvent(req.log, docCode && docCode !== "doc_ok" ? "warn" : "info", "references.exported", {
           userId,
@@ -214,14 +229,23 @@ export function registerReferenceRoutes(
       // the registry as it is then: a secret registered meanwhile in a field that was cut (the conversation title at
       // 100 characters, then " · APA 7") cannot be found in the finished line, only in the raw field (review #115
       // round 4).
-      const rebuild = () =>
-        JSON.stringify(
+      // A shared viewer's projection is read again too (review #117 round 4): a share revoked or narrowed while the
+      // worker ran changes what they may have — gone entirely (`null`) is a 403, narrower makes the file again.
+      const rebuild = () => {
+        const now = viewOf(app, req, { conversationId: req.params.id });
+        if (now === null) return null;
+        return JSON.stringify(
           referencesDocument(
             titleOf(req.params.id),
             style,
-            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz).lines,
+            buildExport(deps.db, req.params.id, style, q.data.includeUnverified === "1", tz, now).lines,
           ),
         );
+      };
+      const gone = () => {
+        done("doc_forbidden");
+        return deny(reply, 403, "forbidden");
+      };
       let built = JSON.stringify(doc);
       let made: DocRunResult | undefined;
       let file: Buffer;
@@ -250,6 +274,7 @@ export function registerReferenceRoutes(
         const parts = await readParts(made.data);
         state = registryState();
         const fresh = rebuild();
+        if (fresh === null) return gone();
         if (fresh !== built) {
           const again = DocContent.safeParse(JSON.parse(fresh));
           if (attempt >= 1 || !again.success || docInputProblem(again.data) || !again.data.blocks.length) {
@@ -276,9 +301,13 @@ export function registerReferenceRoutes(
       }
       // Registered since the check (nothing asynchronous runs in between today; kept so a later change cannot open a
       // gap): the parts read are checked again, synchronously, or the file is refused.
+      // The projection is read once more here, whatever the registry did.
+      const last = rebuild();
+      if (last === null) return gone();
       if (
-        registryState() !== state &&
-        (partsHoldSecret(checked) || scrubKnownDeep(doc, { tail: false }) !== doc || rebuild() !== built)
+        last !== built ||
+        (registryState() !== state &&
+          (partsHoldSecret(checked) || scrubKnownDeep(doc, { tail: false }) !== doc))
       ) {
         done("doc_failed");
         return fail(reply.header("Retry-After", "1"), 503, "references_retry");

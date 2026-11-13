@@ -19,6 +19,7 @@ import { idempotencyKey, MessageNotFoundError, startRun } from "../runtime/route
 import type { RunManager } from "../runtime/runs.js";
 import { AttachmentError, type FileStore } from "../files/store.js";
 import { settingsOf, toConversation, toMessage, type ConversationStore } from "./store.js";
+import { sharedWith, viewOf } from "../shares/projection.js";
 
 const KIND = "conversation";
 const conv = (action: "read" | "write" | "delete") => ({ resource: { kind: KIND, action } });
@@ -67,9 +68,14 @@ export function registerConversationRoutes(
   };
   app.resources.register(KIND, (id) => {
     const c = store.get(id);
-    // Sharing (#29) will fill sharedWith from its projection.
-    return c ? { kind: KIND, id: c.id, ownerId: c.ownerId, sharedWith: [] } : undefined;
+    // Shared viewers (#29): the accounts a conversation share reaches (shares/projection.ts).
+    return c
+      ? { kind: KIND, id: c.id, ownerId: c.ownerId, sharedWith: sharedWith(app, c.id), scope: c.id }
+      : undefined;
   });
+  /** A shared viewer's projection (#29): undefined for the owner; null → the share went meanwhile (403). */
+  const view = (req: FastifyRequest<{ Params: IdParams }>) =>
+    viewOf(app, req, { conversationId: req.params.id });
 
   app.get(
     "/api/conversations",
@@ -128,9 +134,24 @@ export function registerConversationRoutes(
     },
   );
 
-  app.get<{ Params: IdParams }>("/api/conversations/:id", { config: conv("read") }, async (req, reply) =>
-    reply.header("Cache-Control", "no-store").send(toConversation(store.get(req.params.id)!)),
-  );
+  app.get<{ Params: IdParams }>("/api/conversations/:id", { config: conv("read") }, async (req, reply) => {
+    const c = toConversation(store.get(req.params.id)!);
+    const p = view(req);
+    if (p === null) return deny(reply, 403, "forbidden");
+    // A shared viewer reads it, never the owner's chip or notices (#29).
+    // Nor the schedule result marker (#56): it is the owner's, and may point past a snapshot's boundary.
+    const out = p
+      ? {
+          ...c,
+          pinned: false,
+          settings: null,
+          fallbackNotice: null,
+          newResult: false,
+          newResultMessageId: null,
+        }
+      : c;
+    return reply.header("Cache-Control", "no-store").send(out);
+  });
 
   app.patch<{ Params: IdParams }>("/api/conversations/:id", { config: conv("write") }, async (req, reply) => {
     const body = parse(UpdateConversationRequest, req.body, reply);
@@ -204,6 +225,16 @@ export function registerConversationRoutes(
     async (req, reply) => {
       const q = parse(ListMessagesQuery, req.query, reply);
       if (!q) return reply;
+      const p = view(req);
+      if (p === null) return deny(reply, 403, "forbidden");
+      if (p) {
+        // A shared viewer (#29): the projection's messages only, reasoning and raw tool results left out.
+        const shared = app.sharing!.messagePage(p, { before: q.before, limit: q.limit });
+        return reply.header("Cache-Control", "no-store").send({
+          items: shared.items,
+          nextBefore: shared.hasMore ? shared.items[0]!.seq : null,
+        });
+      }
       const page = store.messagePage(req.params.id, { before: q.before, limit: q.limit });
       return reply.header("Cache-Control", "no-store").send({
         items: page.items.map(toMessage),
@@ -322,6 +353,15 @@ export function registerConversationRoutes(
     { config: conv("read") },
     async (req, reply) => {
       const versions = store.versions(req.params.id, req.params.messageId);
+      const p = view(req);
+      if (p === null) return deny(reply, 403, "forbidden");
+      if (p) {
+        // A shared viewer (#29): only a message of the projection, and only its versions in it — an edit made
+        // after a snapshot is not.
+        if (!p.messages.has(req.params.messageId)) return deny(reply, 403, "forbidden");
+        const items = versions.filter((m) => p.messages.has(m.id)).map((m) => app.sharing!.message(m, p));
+        return reply.header("Cache-Control", "no-store").send({ items });
+      }
       if (!versions.length) return notFound(reply);
       return reply.header("Cache-Control", "no-store").send({ items: versions.map(toMessage) });
     },

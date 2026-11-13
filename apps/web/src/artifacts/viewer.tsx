@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ARTIFACT_EXPORTS,
@@ -9,6 +9,7 @@ import {
   DocumentRef,
   type ArtifactDetail,
   type ArtifactExportFormat,
+  SHARE_REVOKE_NOTICE,
 } from "@agentlee/shared";
 import { ApiError, artifacts, files } from "../api.js";
 
@@ -146,10 +147,72 @@ export type VersionControl = { version: number | undefined; setVersion: (v: numb
  * One artifact as a viewer shows it. The chosen version is the viewer's own, or `control`'s (the panel's address).
  * Nothing chosen (or a version that does not exist) shows the newest one and follows it: a later edit shows at once.
  */
+/**
+ * Follows access to the artifact and the version on screen (#29, `GET /api/artifacts/:id/access?version=`): for the
+ * owner the stream ends at once (`owner`); for someone it is shared with it stays open (`ready`).
+ * - `revoked` — or, after `ready` (or once the artifact was shown), a stream that ended and cannot come back
+ *   (403/404 on reconnect) — means no share shows it any more: `onLost`.
+ * - `scope` means a share went but another still shows the artifact, without the version on screen (review #117):
+ *   everything cached of the artifact is reset, so the frame goes and only the allowed versions are fetched again.
+ * Someone never allowed (whose page never showed it) gets 403 at once and keeps the page's own "no permission" answer.
+ */
+export function useAccessWatch(
+  id: string,
+  opts: { shown: boolean; version: number | undefined; lost: boolean; onLost: () => void },
+): void {
+  const qc = useQueryClient();
+  const shownRef = useRef(opts.shown);
+  const onLostRef = useRef(opts.onLost);
+  useEffect(() => {
+    shownRef.current = opts.shown;
+    onLostRef.current = opts.onLost;
+  });
+  const { lost, version } = opts;
+  useEffect(() => {
+    if (lost || typeof EventSource === "undefined") return;
+    const q = version === undefined ? "" : `?version=${version}`;
+    const es = new EventSource(`/api/artifacts/${encodeURIComponent(id)}/access${q}`);
+    let owner = false;
+    // Lost only means something once it was had: someone never allowed sees the page's own refusal instead.
+    let had = false;
+    es.addEventListener("ready", () => {
+      had = true;
+    });
+    es.addEventListener("owner", () => {
+      owner = true;
+      es.close();
+    });
+    es.addEventListener("scope", () => {
+      es.close();
+      // The version on screen is no longer shared: drop it (and every cached version) and load what still is.
+      void qc.resetQueries({ queryKey: artifactKey(id) });
+    });
+    const gone = () => {
+      es.close();
+      onLostRef.current();
+      // Nothing of it stays in the page's cache: the frame goes, and no cached version can be shown again.
+      qc.removeQueries({ queryKey: artifactKey(id) });
+    };
+    es.addEventListener("revoked", gone);
+    es.onerror = () => {
+      if ((had || shownRef.current) && !owner && es.readyState === EventSource.CLOSED) gone();
+    };
+    return () => es.close();
+  }, [id, lost, version, qc]);
+}
+
 export function useArtifactViewer(id: string, control?: VersionControl) {
   const qc = useQueryClient();
   const key = artifactKey(id);
-  const query = useQuery({ queryKey: key, queryFn: () => artifacts.get(id), retry: false });
+  const [revoked, setRevoked] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const query = useQuery({
+    queryKey: key,
+    queryFn: () => artifacts.get(id),
+    retry: false,
+    enabled: !revoked,
+  });
+  if (query.isSuccess && !loaded) setLoaded(true);
   const data = query.data;
   const [own, setOwn] = useState<number | undefined>();
   const chosen = control ? control.version : own;
@@ -165,6 +228,7 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
     },
   });
   const version = data ? (picked ?? data.latestVersion) : undefined;
+  useAccessWatch(id, { shown: loaded, version, lost: revoked, onLost: () => setRevoked(true) });
   const info = data?.versions.find((v) => v.version === version);
   const title = info?.title ?? data?.title ?? "";
   // A chart's PNG is drawn here first; the server renders it only when that fails. Everything else is the server's.
@@ -187,7 +251,9 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
   // A pick goes back to "follow the newest" when it is the newest.
   const pick = (v: number) => setPicked(data && v === data.latestVersion ? undefined : v);
   return {
-    data,
+    // Access lost (#29): nothing of the artifact is shown any more.
+    revoked,
+    data: revoked ? undefined : data,
     error: query.error,
     version,
     title,
@@ -202,7 +268,7 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
 /** Version picker, revert, downloads (original, HTML) and PNG/PDF export. */
 export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
-  if (!data || version === undefined) return null;
+  if (v.revoked || !data || version === undefined) return null;
   return (
     <>
       <div className="artifact-bar row">
@@ -317,6 +383,7 @@ const parseJson = (t: string): unknown => {
 /** The chosen version: the sandboxed frame, or the document's download. */
 export function ArtifactBody({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
+  if (v.revoked) return <ArtifactRevoked />;
   if (!data || version === undefined) return null;
   if (data.kind === "document") return <DocumentBody id={data.id} version={version} />;
   return (
@@ -331,5 +398,15 @@ export function ArtifactBody({ v }: { v: ArtifactViewer }) {
       data-testid="artifact-frame"
       data-version={version}
     />
+  );
+}
+
+/** What replaces a shared artifact once the share no longer shows it (#29): the frame is gone. */
+export function ArtifactRevoked() {
+  return (
+    <div className="empty" role="alert" data-testid="artifact-revoked">
+      <p>공유가 꺼졌거나 더 이상 나에게 공유되지 않아요.</p>
+      <p className="muted small">{SHARE_REVOKE_NOTICE}</p>
+    </div>
   );
 }

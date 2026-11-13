@@ -150,20 +150,34 @@ type SourceRow = typeof sources.$inferSelect;
 /** One citation of the history, in order: its note entry (checked) and, for a file citation, the file's id if any. */
 type Cited = { entry: CitationEntry; fileId: string | null };
 
+/**
+ * What a shared viewer may see of the conversation (#29, the share projection): its messages (a snapshot keeps its
+ * frozen list, edited away or not) and the sources they cite. Absent for the owner: the active history.
+ */
+export type ReferencesView = { messages: ReadonlySet<string>; sources: ReadonlySet<string> };
+
 /** The citation entries of the conversation's history, oldest answer first, by number within an answer. */
-function citedEntries(db: Db, conversationId: string): Cited[] {
-  const rows = db
-    .select({ parts: messages.parts })
-    .from(messages)
-    .where(
-      and(
-        eq(messages.conversationId, conversationId),
-        eq(messages.active, true),
-        eq(messages.role, "assistant"),
-      ),
-    )
-    .orderBy(asc(messages.seq))
-    .all();
+function citedEntries(db: Db, conversationId: string, view?: ReferencesView): Cited[] {
+  const assistant = and(eq(messages.conversationId, conversationId), eq(messages.role, "assistant"));
+  const select = () => db.select({ seq: messages.seq, parts: messages.parts }).from(messages);
+  let rows: { seq: number; parts: unknown }[];
+  if (!view)
+    rows = select()
+      .where(and(assistant, eq(messages.active, true)))
+      .orderBy(asc(messages.seq))
+      .all();
+  else {
+    const ids = [...view.messages];
+    rows = [];
+    // In chunks (SQLite's variable limit), then in history order.
+    for (let i = 0; i < ids.length; i += 500)
+      rows.push(
+        ...select()
+          .where(and(assistant, inArray(messages.id, ids.slice(i, i + 500))))
+          .all(),
+      );
+    rows.sort((a, b) => a.seq - b.seq);
+  }
   const out: Cited[] = [];
   for (const r of rows)
     for (const p of r.parts as unknown[]) {
@@ -262,9 +276,13 @@ export function collectReferences(
   conversationId: string,
   /** The user's time zone, for access dates. */
   timeZone: string = DEFAULT_TIME_ZONE,
+  /** A shared viewer's projection (#29); absent for the owner. */
+  view?: ReferencesView,
 ): { sources: CollectedSource[]; truncated: boolean } {
-  const cited = citedEntries(db, conversationId);
-  const ids = [...new Set(cited.flatMap((c) => (c.entry.sourceId ? [c.entry.sourceId] : [])))];
+  const cited = citedEntries(db, conversationId, view);
+  const ids = [...new Set(cited.flatMap((c) => (c.entry.sourceId ? [c.entry.sourceId] : [])))].filter(
+    (id) => !view || view.sources.has(id),
+  );
   const rows = new Map<string, SourceRow>();
   // Within this conversation only; in chunks (SQLite's variable limit).
   for (let i = 0; i < ids.length; i += 500)

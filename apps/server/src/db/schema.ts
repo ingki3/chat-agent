@@ -1041,3 +1041,76 @@ export const fileSegments = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.fileId, t.seq] }), index("file_segments_unit_idx").on(t.fileId, t.unit)],
 );
+
+/**
+ * Family shares (#29, PRD FR-14): one row per share of a conversation or an artifact (`item_kind`, `item_id` — no
+ * foreign key, the item is one of two tables; shares go with their item in the conversation's delete hook). The
+ * owner is the item's owner. `audience` `family` reaches every active family account but the owner; `users` the
+ * accounts in `share_targets`. `revoked_at` set: the share is off (kept so its owner sees what it was). Who may see
+ * what is computed by the one projection function (shares/projection.ts) — never read these rows elsewhere.
+ */
+export const shares = sqliteTable(
+  "shares",
+  {
+    id: text("id").primaryKey(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    itemKind: text("item_kind", { enum: ["conversation", "artifact"] }).notNull(),
+    itemId: text("item_id").notNull(),
+    /** The conversation the item belongs to (the item itself for a conversation share). */
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    audience: text("audience", { enum: ["family", "users"] }).notNull(),
+    mode: text("mode", { enum: ["live", "snapshot"] }).notNull(),
+    /** Snapshot of a conversation: "이 메시지까지" — the last message shared. */
+    boundaryMessageId: text("boundary_message_id"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    revokedAt: integer("revoked_at"),
+  },
+  (t) => [
+    index("shares_item_idx").on(t.itemKind, t.itemId),
+    index("shares_conversation_idx").on(t.conversationId),
+    index("shares_owner_idx").on(t.ownerId, t.createdAt),
+  ],
+);
+
+/** The chosen family accounts of a `users` share (#29). */
+export const shareTargets = sqliteTable(
+  "share_targets",
+  {
+    shareId: text("share_id")
+      .notNull()
+      .references(() => shares.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+  },
+  (t) => [primaryKey({ columns: [t.shareId, t.userId] }), index("share_targets_user_idx").on(t.userId)],
+);
+
+/**
+ * The immutable list of a snapshot share (#29, FR-14.3 / decision #3), computed once when the share is made and only
+ * ever inserted: `message` (id, revision), `file` (id, digest = sha256), `artifact_version` (artifact id, version),
+ * `citation` (id, digest = sha256 of its quote) and `source` (id, digest = body hash). The projection reads these
+ * and nothing else for a snapshot: a later edit, upload, version or citation is not in it, so it is 403.
+ */
+export const shareSnapshots = sqliteTable(
+  "share_snapshots",
+  {
+    shareId: text("share_id")
+      .notNull()
+      .references(() => shares.id, { onDelete: "cascade" }),
+    itemType: text("item_type", {
+      enum: ["message", "file", "artifact_version", "citation", "source"],
+    }).notNull(),
+    itemId: text("item_id").notNull(),
+    /** Message revision, artifact version; 0 where the item has none. */
+    revision: integer("revision").notNull().default(0),
+    /** A hash pinning the content (file sha256, quote or page-body hash); null where none applies. */
+    digest: text("digest"),
+  },
+  (t) => [primaryKey({ columns: [t.shareId, t.itemType, t.itemId, t.revision] })],
+);

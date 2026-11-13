@@ -1,6 +1,7 @@
 import { Link } from "react-router";
 import { TopBar } from "../Shell.js";
 import {
+  ArtifactRevoked,
   ArtifactBody,
   ArtifactToolbar,
   KIND_LABEL,
@@ -16,6 +17,13 @@ import { panelLink } from "../artifacts/ArtifactPanel.js";
 export function ArtifactPage({ id }: { id: string }) {
   const v = useArtifactViewer(id);
   const { data, error } = v;
+  if (v.revoked)
+    return (
+      <>
+        <TopBar title="🧩 아티팩트" />
+        <ArtifactRevoked />
+      </>
+    );
   if (error)
     return (
       <>

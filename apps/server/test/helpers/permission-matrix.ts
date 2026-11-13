@@ -53,12 +53,31 @@ export const OWNER_ONLY: MatrixRow["expect"] = {
 };
 export const USAGE: MatrixRow["expect"] = { owner: 200, shared: 403, admin: 200, stranger: 403, anon: 401 };
 
-/** A conversation of `owner` (sharing comes with #29) with one user and one assistant message. */
+/** A live share (#29) of `owner`'s conversation (or one artifact of it) with `shared` — through the store directly. */
+export function shareWithShared(
+  f: Family,
+  conversationId: string,
+  item: { kind: "conversation" | "artifact"; id: string } = { kind: "conversation", id: conversationId },
+) {
+  return f.app.sharing!.store.create({
+    ownerId: f.users.owner.id,
+    itemKind: item.kind,
+    itemId: item.id,
+    conversationId,
+    target: { audience: "users", userIds: [f.users.shared.id] },
+    mode: "live",
+    boundaryMessageId: null,
+    snapshot: [],
+  });
+}
+
+/** A conversation of `owner`, shared live with `shared` (#29), with one user and one assistant message. */
 function conversation(f: Family) {
   const store = f.app.conversations!;
   const c = store.create(f.users.owner.id);
   const user = store.append(c.id, { role: "user", parts: [{ type: "text", text: "질문" }] });
   const reply = store.append(c.id, { role: "assistant", parts: [{ type: "text", text: "답" }] });
+  shareWithShared(f, c.id);
   return { id: c.id, params: { userMessageId: user.id, assistantMessageId: reply.id } };
 }
 /** A conversation of `owner` whose answer cites one verified web source (the reference export, #26). */
@@ -96,12 +115,17 @@ const withMessage = (key: "userMessageId" | "assistantMessageId") => (f: Family)
 
 /**
  * Rows for the real app's resource routes. Add one with each new resource route (#22, #27, ...).
- * Until sharing (#29) exists nothing is shared, so the "shared" caller is refused like a stranger.
+ * Fixtures share with the "shared" caller (#29, a live share): reads of what the projection holds are 200 for them,
+ * every write 403. `NOT_SHARED`: the fixture's resource is outside their projection (e.g. an unsent file).
  */
 const NOT_SHARED = (e: MatrixRow["expect"]): MatrixRow["expect"] => ({ ...e, shared: 403 });
-/** A finished run of `owner` (the real app has no runtime in tests, so it fails at once — events stay). */
+/** A finished run of `owner` (the real app has no runtime in tests, so it fails at once — events stay), shared. */
 function run(f: Family) {
+  return runIn(f).run.id;
+}
+function runIn(f: Family) {
   const c = f.app.conversations!.create(f.users.owner.id);
+  shareWithShared(f, c.id);
   const r = f.app.runs!.begin({
     conversationId: c.id,
     userId: f.users.owner.id,
@@ -110,7 +134,7 @@ function run(f: Family) {
       assistant: f.app.conversations!.append(c.id, { role: "assistant", parts: [], status: "pending" }),
     }),
   });
-  return r.run.id;
+  return { conversationId: c.id, run: r.run };
 }
 
 /** An inbox entry of `owner` (#34). */
@@ -137,19 +161,33 @@ const connection = (f: Family) =>
     secret: `sk-ant-matrix${"x".repeat(24)}`,
   }).id;
 
-/** An HTML artifact (two versions) in a conversation of `owner`, made as a run of that conversation would. */
+/**
+ * An HTML artifact (two versions) in a shared conversation of `owner`, made by a run of that conversation (so it is
+ * linked to the run's reply, and in the live share's projection).
+ */
 function artifact(f: Family) {
-  const c = f.app.conversations!.create(f.users.owner.id);
-  const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
+  const { conversationId, run: r } = runIn(f);
+  const scope = { userId: f.users.owner.id, conversationId, runId: r.id };
   const store = f.app.artifacts!;
   const { artifact: a } = store.create(scope, { kind: "html", title: "표", content: "<p>v1</p>" });
   store.update(scope, a.id, { content: "<p>v2</p>" });
   return { id: a.id, params: { version: "1" } };
 }
 
-/** An uploaded (unsent) text file in a conversation of `owner` (#22), stored the way an upload stores it. */
+/** An artifact of `owner` shared with no one (#29). */
+function unsharedArtifact(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  const scope = { userId: f.users.owner.id, conversationId: c.id, runId: crypto.randomUUID() };
+  return f.app.artifacts!.create(scope, { kind: "html", title: "표", content: "<p>v1</p>" }).artifact.id;
+}
+
+/**
+ * An uploaded (unsent) text file in a shared conversation of `owner` (#22), stored the way an upload stores it. Unsent:
+ * in no message, so in no projection (#29) — the shared caller is refused.
+ */
 async function uploaded(f: Family) {
   const c = f.app.conversations!.create(f.users.owner.id);
+  shareWithShared(f, c.id);
   const tmp = f.app.files!.tempFile();
   fs.writeFileSync(tmp, "matrix file");
   const row = await f.app.files!.add({
@@ -165,6 +203,28 @@ async function uploaded(f: Family) {
   return row.id;
 }
 
+/** A text file sent with a message of a shared conversation (#22, #29): in the live share's projection. */
+async function sentFile(f: Family) {
+  const id = await uploaded(f);
+  const file = f.app.files!.get(id)!;
+  const m = f.app.conversations!.append(file.conversationId, {
+    role: "user",
+    parts: [{ type: "text", text: "파일" }, ...f.app.files!.refs(file.conversationId, [id])],
+  });
+  f.app.files!.attach(file.conversationId, m.id, [id]);
+  return id;
+}
+
+/** A share of `owner` with `shared` (#29); `revoked`: turned off. */
+function share(revoked = false) {
+  return (f: Family) => {
+    const c = conversation(f);
+    const s = f.app.sharing!.store.ofItem("conversation", c.id)[0]!;
+    if (revoked) f.app.sharing!.store.revoke(s.id);
+    return s.id;
+  };
+}
+
 export const APP_MATRIX: MatrixRow[] = [
   // Uploads (#22): the uploader only. The matrix sends a JSON body, so the owner's upload reaches the handler and
   // is refused there (400: not `application/octet-stream`); real uploads are in files.test.ts.
@@ -173,23 +233,24 @@ export const APP_MATRIX: MatrixRow[] = [
     expect: { ...OWNER_ONLY, owner: 400 },
     fixture: conversation,
   },
-  { route: "GET /api/conversations/:id/files", expect: OWNER_ONLY, fixture: conversation },
-  { route: "GET /api/files/:id", expect: NOT_SHARED(READ), fixture: uploaded },
-  { route: "GET /api/files/:id/content", expect: NOT_SHARED(READ), fixture: uploaded },
-  // Its extracted text (#48): the same check as the original.
-  { route: "GET /api/files/:id/extract", expect: NOT_SHARED(READ), fixture: uploaded },
+  { route: "GET /api/conversations/:id/files", expect: READ, fixture: conversation },
+  { route: "GET /api/files/:id", expect: READ, fixture: sentFile },
+  { route: "GET /api/files/:id/content", expect: READ, fixture: sentFile },
+  // Its extracted text (#48): the same check as the original — a shared viewer for a file of their projection (#29).
+  { route: "GET /api/files/:id/extract", expect: READ, fixture: sentFile },
   { route: "DELETE /api/files/:id", expect: OWNER_ONLY, fixture: uploaded },
-  // Artifacts (#27): owner only until sharing (#29); the page and the originals check the same way.
-  { route: "GET /api/conversations/:id/artifacts", expect: OWNER_ONLY, fixture: conversation },
-  { route: "GET /api/artifacts/:id", expect: NOT_SHARED(READ), fixture: artifact },
-  { route: "GET /api/artifacts/:id/versions/:version", expect: NOT_SHARED(READ), fixture: artifact },
+  // Artifacts (#27): owner, and the shared caller through the projection (#29); the page and the originals check the
+  // same way.
+  { route: "GET /api/conversations/:id/artifacts", expect: READ, fixture: conversation },
+  { route: "GET /api/artifacts/:id", expect: READ, fixture: artifact },
+  { route: "GET /api/artifacts/:id/versions/:version", expect: READ, fixture: artifact },
   { route: "POST /api/artifacts/:id/revert", expect: OWNER_ONLY, fixture: artifact, body: { version: 1 } },
-  { route: "GET /a/:id", expect: NOT_SHARED(READ), fixture: artifact },
-  { route: "GET /a/:id/v/:version/raw", expect: NOT_SHARED(READ), fixture: artifact },
-  { route: "GET /a/:id/v/:version/download", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /a/:id", expect: READ, fixture: artifact },
+  { route: "GET /a/:id/v/:version/raw", expect: READ, fixture: artifact },
+  { route: "GET /a/:id/v/:version/download", expect: READ, fixture: artifact },
   // PNG/PDF export (#51): the same check before anything is rendered (the matrix app has a stand-in renderer).
-  { route: "GET /a/:id/v/:version/png", expect: NOT_SHARED(READ), fixture: artifact },
-  { route: "GET /a/:id/v/:version/pdf", expect: NOT_SHARED(READ), fixture: artifact },
+  { route: "GET /a/:id/v/:version/png", expect: READ, fixture: artifact },
+  { route: "GET /a/:id/v/:version/pdf", expect: READ, fixture: artifact },
   { route: "GET /api/connections/:id", expect: OWNER_ONLY, fixture: connection },
   {
     route: "PATCH /api/connections/:id",
@@ -202,11 +263,11 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "POST /api/connections/:id/test", expect: OWNER_ONLY, fixture: connection },
   { route: "POST /api/notifications/:id/read", expect: OWNER_ONLY, fixture: notification },
   { route: "DELETE /api/push/devices/:id", expect: OWNER_ONLY, fixture: pushDevice },
-  { route: "GET /api/runs/:id", expect: NOT_SHARED(READ), fixture: run },
-  { route: "GET /api/runs/:id/events", expect: NOT_SHARED(READ), fixture: run },
+  { route: "GET /api/runs/:id", expect: READ, fixture: run },
+  { route: "GET /api/runs/:id/events", expect: READ, fixture: run },
   { route: "POST /api/runs/:id/interrupt", expect: OWNER_ONLY, fixture: run },
-  { route: "GET /api/conversations/:id/active-run", expect: NOT_SHARED(READ), fixture: conversation },
-  { route: "GET /api/conversations/:id", expect: NOT_SHARED(READ), fixture: conversation },
+  { route: "GET /api/conversations/:id/active-run", expect: READ, fixture: conversation },
+  { route: "GET /api/conversations/:id", expect: READ, fixture: conversation },
   {
     route: "PATCH /api/conversations/:id",
     expect: OWNER_ONLY,
@@ -228,14 +289,14 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "POST /api/conversations/:id/fallback-notice/consume", expect: OWNER_ONLY, fixture: conversation },
   // The schedule result marker (#56): only the owner clears it.
   { route: "POST /api/conversations/:id/result-seen", expect: OWNER_ONLY, fixture: conversation },
-  { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
-  // Owner only even once sharing exists (#50): a shared view gets its frozen sources, not this list (#29).
-  { route: "GET /api/conversations/:id/sources", expect: OWNER_ONLY, fixture: conversation },
-  // The reference export (#26): whoever may read the conversation (its own loader — sharing comes with #29).
-  { route: "GET /api/conversations/:id/references", expect: NOT_SHARED(READ), fixture: withReferences },
+  { route: "GET /api/conversations/:id/messages", expect: READ, fixture: conversation },
+  // The shared caller gets the sources their projection cites, never the full list (#50, #29).
+  { route: "GET /api/conversations/:id/sources", expect: READ, fixture: conversation },
+  // The reference export (#26): whoever may read the conversation — a shared viewer from their projection only (#29).
+  { route: "GET /api/conversations/:id/references", expect: READ, fixture: withReferences },
   {
     route: "GET /api/conversations/:id/references/download",
-    expect: NOT_SHARED(READ),
+    expect: READ,
     fixture: withReferences,
   },
   {
@@ -257,9 +318,42 @@ export const APP_MATRIX: MatrixRow[] = [
   },
   {
     route: "GET /api/conversations/:id/messages/:messageId/versions",
-    expect: NOT_SHARED(READ),
+    expect: READ,
     fixture: withMessage("userMessageId"),
   },
+  // Family sharing (#29): only the owner shares, lists, changes or revokes; the accounts a share reaches read it.
+  // No body takes an email: targets are account ids (shares.test.ts refuses an email in every place).
+  {
+    route: "POST /api/conversations/:id/shares",
+    expect: { ...OWNER_ONLY, owner: 201 },
+    fixture: conversation,
+    body: { target: { audience: "family" }, mode: "live" },
+    errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "GET /api/conversations/:id/shares", expect: OWNER_ONLY, fixture: conversation },
+  {
+    route: "POST /api/artifacts/:id/shares",
+    expect: { ...OWNER_ONLY, owner: 201 },
+    fixture: artifact,
+    body: { target: { audience: "family" }, mode: "snapshot" },
+    errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "GET /api/artifacts/:id/shares", expect: OWNER_ONLY, fixture: artifact },
+  { route: "GET /api/shares/:id", expect: OWNER_ONLY, fixture: share() },
+  {
+    route: "PATCH /api/shares/:id",
+    expect: OWNER_ONLY,
+    fixture: share(),
+    body: { target: { audience: "family" } },
+  },
+  { route: "DELETE /api/shares/:id", expect: OWNER_ONLY, fixture: share() },
+  { route: "GET /api/shares/:id/view", expect: READ, fixture: share() },
+  // Open while a shared viewer may see the artifact (shares.test.ts follows one to its close); the matrix needs
+  // requests that end, so it asks about an artifact not shared with them: the owner's stream ends at once.
+  { route: "GET /api/artifacts/:id/access", expect: NOT_SHARED(READ), fixture: unsharedArtifact },
+  // The stream stays open while the share is on (shares.test.ts follows one to its close); the matrix needs requests
+  // that end, so it asks about a revoked share: the owner's stream ends at once, everyone else is refused.
+  { route: "GET /api/shares/:id/events", expect: NOT_SHARED(READ), fixture: share(true) },
 ];
 
 /** A daily schedule of `owner` (#33): the store directly (the matrix app has no runtime to pick defaults from). */

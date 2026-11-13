@@ -180,8 +180,8 @@ export function watchAccess(
   const onUser = (e: { userId: string }) => {
     if (e.userId === userId) check();
   };
-  const onResource = (e: { kind: string; id: string }) => {
-    if (ref && e.kind === ref.kind && e.id === ref.id) check();
+  const onResource = (e: { kind: string; id: string; scope?: string }) => {
+    if (ref && ((e.kind === ref.kind && e.id === ref.id) || (!!e.scope && e.scope === ref.scope))) check();
   };
   // Sessions also end by time: re-check when this one expires (in steps — setTimeout caps near 24.8 days).
   let expiryTimer: NodeJS.Timeout | undefined;

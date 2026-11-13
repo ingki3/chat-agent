@@ -21,11 +21,12 @@ import { contentMatches } from "./detect.js";
 import { toFileExtract, type FileExtracts } from "./extract.js";
 import { segmentLocator } from "./text.js";
 import { scrubKnownDeep } from "../secrets/known.js";
+import { sharedWith, viewOf } from "../shares/projection.js";
 import { FileLimitError, toUploadedFile, UPLOAD_ID, UploadCancelledError, type FileStore } from "./store.js";
 
-/** Resource kind of one uploaded file: its uploader only (family sharing, #29, gets its own projection). */
+/** Resource kind of one uploaded file: its uploader, and shared viewers whose projection holds it (#29). */
 export const FILE_KIND = "file";
-/** Resource kind of a conversation's file list: owner only, like its artifacts. */
+/** Resource kind of a conversation's file list: the owner's full list; a shared viewer's projected one (#29). */
 export const CONVERSATION_FILES_KIND = "conversation-files";
 
 /** Outcome codes of an upload, logged as `fileCode` (observability/policy.ts keeps the same list). */
@@ -157,11 +158,28 @@ export function registerFileRoutes(
 ): void {
   app.resources.register(FILE_KIND, (id) => {
     const f = store.get(id);
-    return f ? { kind: FILE_KIND, id: f.id, ownerId: f.userId, sharedWith: [] } : undefined;
+    return f
+      ? {
+          kind: FILE_KIND,
+          id: f.id,
+          ownerId: f.userId,
+          // Conversation shares, and a shared document artifact's own file (#29).
+          sharedWith: sharedWith(app, f.conversationId, (p) => p.files.has(f.id), false),
+          scope: f.conversationId,
+        }
+      : undefined;
   });
   app.resources.register(CONVERSATION_FILES_KIND, (id) => {
     const c = conversations.get(id);
-    return c ? { kind: CONVERSATION_FILES_KIND, id: c.id, ownerId: c.ownerId, sharedWith: [] } : undefined;
+    return c
+      ? {
+          kind: CONVERSATION_FILES_KIND,
+          id: c.id,
+          ownerId: c.ownerId,
+          sharedWith: sharedWith(app, c.id),
+          scope: c.id,
+        }
+      : undefined;
   });
 
   const fail = (reply: FastifyReply, error: FileError | "invalid_request", close = false) => {
@@ -174,10 +192,16 @@ export function registerFileRoutes(
   app.get<{ Params: { id: string } }>(
     "/api/conversations/:id/files",
     { config: { resource: { kind: CONVERSATION_FILES_KIND, action: "read" } } },
-    async (req, reply) =>
-      reply
-        .header("Cache-Control", "no-store")
-        .send({ items: store.list(req.params.id).map(toUploadedFile) } satisfies FileListResponse),
+    async (req, reply) => {
+      const p = viewOf(app, req, { conversationId: req.params.id });
+      if (p === null) return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
+      const all = store.list(req.params.id);
+      // A shared viewer (#29): the projection's files only.
+      const items = p
+        ? all.filter((f) => p.files.has(f.id)).map((f) => app.sharing!.file(f, p))
+        : all.map(toUploadedFile);
+      return reply.header("Cache-Control", "no-store").send({ items } satisfies FileListResponse);
+    },
   );
 
   // The upload route reads its body itself (streamed to disk): its own scope, with a parser that hands the
@@ -259,9 +283,13 @@ export function registerFileRoutes(
   });
 
   const read = { resource: { kind: FILE_KIND, action: "read" as const } };
-  app.get<{ Params: { id: string } }>("/api/files/:id", { config: read }, async (req, reply) =>
-    reply.header("Cache-Control", "no-store").send(toUploadedFile(store.get(req.params.id)!)),
-  );
+  app.get<{ Params: { id: string } }>("/api/files/:id", { config: read }, async (req, reply) => {
+    const f = store.get(req.params.id)!;
+    const p = viewOf(app, req, { fileIn: f.conversationId });
+    if (p === null || (p && !p.files.has(f.id)))
+      return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
+    return reply.header("Cache-Control", "no-store").send(p ? app.sharing!.file(f, p) : toUploadedFile(f));
+  });
 
   app.get<{ Params: { id: string }; Querystring: { inline?: string } }>(
     "/api/files/:id/content",
@@ -269,6 +297,10 @@ export function registerFileRoutes(
     { config: read, exposeHeadRoute: false },
     async (req, reply) => {
       const f = store.get(req.params.id)!;
+      // A shared viewer (#29): the loader let them in only for a file of their projection; checked again here.
+      const p = viewOf(app, req, { fileIn: f.conversationId });
+      if (p === null || (p && !p.files.has(f.id)))
+        return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
       // Checked folders only, never a link, a regular file of the size the row says (FileStore.open).
       const fd = store.open(f);
       if (fd === undefined)
@@ -286,13 +318,17 @@ export function registerFileRoutes(
     },
   );
 
-  // The extracted text with locators (#48), a page of segments at a time — the uploader only, like the original.
+  // The extracted text with locators (#48), a page of segments at a time — whoever may read the original.
   if (extracts)
     app.get<{ Params: { id: string }; Querystring: { from?: string; limit?: string } }>(
       "/api/files/:id/extract",
       { config: read },
       async (req, reply) => {
         const f = store.get(req.params.id)!;
+        // The same check as the original (#29): a shared viewer for a file of their projection only.
+        const p = viewOf(app, req, { fileIn: f.conversationId });
+        if (p === null || (p && !p.files.has(f.id)))
+          return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
         const from = Math.max(0, Math.min(1e7, Number.parseInt(req.query.from ?? "0", 10) || 0));
         const limit = Math.max(1, Math.min(500, Number.parseInt(req.query.limit ?? "200", 10) || 200));
         const extract = toFileExtract(f, extracts.get(f.id));

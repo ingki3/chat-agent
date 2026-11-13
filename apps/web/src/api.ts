@@ -61,6 +61,13 @@ import {
   type UpdateScheduleRequest,
   type SchedulePreviewRequest,
   StartRunResponse,
+  Share,
+  SharesResponse,
+  SharedView,
+  IncomingSharesResponse,
+  ShareTargetsResponse,
+  type ShareAudience,
+  type ShareMode,
   type ConnectionAuthType,
   type Role,
   type RuntimeId,
@@ -451,6 +458,10 @@ export function newKey(): string {
 }
 
 const MESSAGES: Record<string, string> = {
+  invalid_share_target: "가족 계정에게만 공유할 수 있어요.",
+  share_boundary_not_found: "고른 메시지를 이 대화에서 찾지 못했어요.",
+  share_run_in_progress: "답을 쓰는 중이에요. 답이 끝난 뒤에 공유해 주세요.",
+  share_revoked: "이미 꺼진 공유예요.",
   email_taken: "이미 등록된 이메일이에요.",
   cannot_change_self: "본인 계정에는 할 수 없어요.",
   last_admin: "관리자가 한 명도 남지 않게 할 수는 없어요. 다른 관리자를 먼저 지정하세요.",
@@ -636,4 +647,27 @@ export const references = {
     }
     return { blob: await res.blob(), name };
   },
+};
+
+export const SHARES_KEY = ["shares"] as const;
+/**
+ * Family sharing (#29): share, change who it is for, revoke, and read what is shared with me — always through the
+ * server's projection. Targets are account ids from `targets()`, never an email (FR-14.7).
+ */
+export const shares = {
+  targets: async () => ShareTargetsResponse.parse(await call("GET", "/api/share-targets")).items,
+  ofConversation: async (id: string) =>
+    SharesResponse.parse(await call("GET", `/api/conversations/${enc(id)}/shares`)).items,
+  shareConversation: async (
+    id: string,
+    body: { target: ShareAudience; mode: ShareMode; boundaryMessageId?: string },
+  ) => Share.parse(await call("POST", `/api/conversations/${enc(id)}/shares`, body)),
+  setTarget: async (id: string, target: ShareAudience) =>
+    Share.parse(await call("PATCH", `/api/shares/${enc(id)}`, { target })),
+  revoke: async (id: string) => Share.parse(await call("DELETE", `/api/shares/${enc(id)}`)),
+  incoming: async (q = "") =>
+    IncomingSharesResponse.parse(await call("GET", `/api/shared-with-me${q ? `?q=${enc(q)}` : ""}`)).items,
+  view: async (id: string) => SharedView.parse(await call("GET", `/api/shares/${enc(id)}/view`)),
+  /** SSE that stays open while the share reaches me; a `revoked` event (or a refused reconnect) means it is gone. */
+  eventsUrl: (id: string) => `/api/shares/${enc(id)}/events`,
 };

@@ -11,6 +11,7 @@ import { WatchlistPage } from "./pages/WatchlistPage.js";
 import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
+import { SharedViewPage, SharesPage } from "./pages/SharesPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
 import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
@@ -41,6 +42,11 @@ const authChannel =
  * the same address renders, so the user lands back where they were (#13).
  */
 /** Keyed by id: another artifact starts from its own latest version. */
+function SharedViewRoute() {
+  const { id } = useParams();
+  return <SharedViewPage key={id} id={id ?? ""} />;
+}
+
 function ArtifactRoute() {
   const { id = "" } = useParams();
   return <ArtifactPage key={id} id={id} />;
@@ -75,7 +81,8 @@ function AuthGate() {
         <Route element={<Shell user={data.user} onSignedOut={set} />}>
           <Route index element={<NewChatPage />} />
           <Route path="c/:id" element={<ChatRoute />} />
-          <Route path="shared" element={<PlaceholderPage title="👪 가족 공유" issue="#52" />} />
+          <Route path="shared" element={<SharesPage />} />
+          <Route path="shared/:id" element={<SharedViewRoute />} />
           <Route path="schedules" element={<SchedulesPage />} />
           <Route path="schedules/new" element={<SchedulesPage creating />} />
           <Route path="schedules/:id" element={<ScheduleRoute />} />

@@ -544,16 +544,16 @@ describe("publish and push", () => {
 });
 
 describe("permission re-check right before sending", () => {
-  /** A resource whose sharing can be revoked. */
+  /** A resource whose sharing can be revoked (a stand-in kind: the real `share` kind is registered by #29). */
   function shares(app: App, ownerId: string) {
     const refs = new Map<string, ResourceRef>();
-    app.resources.register("share", (id) => refs.get(id));
+    app.resources.register("test-share", (id) => refs.get(id));
     return {
       share(id: string, withUser: string) {
-        refs.set(id, { kind: "share", id, ownerId, sharedWith: [withUser] });
+        refs.set(id, { kind: "test-share", id, ownerId, sharedWith: [withUser] });
       },
       revoke(id: string) {
-        refs.set(id, { kind: "share", id, ownerId, sharedWith: [] });
+        refs.set(id, { kind: "test-share", id, ownerId, sharedWith: [] });
       },
     };
   }
@@ -577,7 +577,7 @@ describe("permission re-check right before sending", () => {
         fromName: "아들",
         itemTitle: `그래프 ${id}`,
         url: `/shared/${id}`,
-        ref: { kind: "share", id },
+        ref: { kind: "test-share", id },
       }) as const;
     svc.publish(mom.user.id, input("a"));
     svc.publish(mom.user.id, input("b"));
@@ -605,7 +605,7 @@ describe("permission re-check right before sending", () => {
         fromName: "아들",
         itemTitle: "t",
         url: "/s",
-        ref: { kind: "share", id: "x" },
+        ref: { kind: "test-share", id: "x" },
       }),
     ).toBeUndefined();
     await subscribe(mom);
@@ -737,17 +737,17 @@ describe("inbox API", () => {
     const son = member("son");
     const mom = member("mom");
     const refs = new Map<string, ResourceRef>([
-      ["a", { kind: "share", id: "a", ownerId: son.user.id, sharedWith: [mom.user.id] }],
+      ["a", { kind: "test-share", id: "a", ownerId: son.user.id, sharedWith: [mom.user.id] }],
     ]);
-    app.resources.register("share", (id) => refs.get(id));
+    app.resources.register("test-share", (id) => refs.get(id));
     const shared = svc.publish(mom.user.id, {
       kind: "share_received",
       fromName: "아들",
       itemTitle: "비밀 그래프",
       url: "/shared/a",
-      ref: { kind: "share", id: "a" },
+      ref: { kind: "test-share", id: "a" },
     })!;
-    refs.set("a", { kind: "share", id: "a", ownerId: son.user.id, sharedWith: [] });
+    refs.set("a", { kind: "test-share", id: "a", ownerId: son.user.id, sharedWith: [] });
     const r1 = await api(mom, "POST", `/api/notifications/${shared}/read`, {});
     expect(r1.statusCode).toBe(404);
     expect(r1.body).not.toContain("비밀");
