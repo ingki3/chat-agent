@@ -28,7 +28,15 @@ import {
   type Block,
   type Cell,
 } from "./view-model.js";
-import { combine, hasMore, openingQuery, pagingQuery, type ViewFetch } from "./queries.js";
+import {
+  combine,
+  hasMore,
+  moreAction,
+  openingQuery,
+  pagingQuery,
+  shownPages,
+  type ViewFetch,
+} from "./queries.js";
 import "./files.css";
 
 /**
@@ -102,38 +110,52 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
         <div className="empty muted">불러오는 중…</div>
       </>
     );
-  const items = combine([...(earlier.data?.pages ?? []), first, ...(later.data?.pages ?? [])]);
+  const items = combine([...shownPages(askedBefore, earlier), first, ...shownPages(askedAfter, later)]);
   const more = (asked: boolean, set: (v: boolean) => void, q: typeof earlier) => () => {
-    if (!asked) set(true);
+    const act = moreAction(asked, q);
+    if (act === "ask") set(true);
+    else if (act === "retry") void q.refetch();
     else void q.fetchNextPage();
   };
+  const moreButton = (
+    direction: "before" | "after",
+    asked: boolean,
+    set: (v: boolean) => void,
+    q: typeof earlier,
+  ) =>
+    hasMore(direction, first, asked, q) && (
+      <div className="row">
+        <button
+          type="button"
+          className="ghost small"
+          disabled={q.isFetching}
+          onClick={more(asked, set, q)}
+          data-testid={`file-view-more-${direction}`}
+        >
+          {q.isFetching
+            ? "불러오는 중…"
+            : q.isError && asked
+              ? "다시 시도"
+              : direction === "before"
+                ? "↑ 앞부분 더 보기"
+                : "↓ 뒷부분 더 보기"}
+        </button>
+        {q.isError && asked && !q.isFetching && (
+          <span className="notice warn small" role="alert" data-testid="file-view-more-error">
+            더 불러오지 못했어요. {errorText(q.error)}
+          </span>
+        )}
+      </div>
+    );
   return (
     <>
       {bar(`📄 ${first.file.name}`, first.file)}
       <div className="file-view" data-testid="file-view">
         {loc && <TargetNotice loc={loc} target={first.target} />}
         <ExtractNotice d={first} />
-        {hasMore("before", first, askedBefore, earlier) && (
-          <button
-            type="button"
-            className="ghost small"
-            disabled={earlier.isFetching}
-            onClick={more(askedBefore, setAskedBefore, earlier)}
-          >
-            {earlier.isFetching ? "불러오는 중…" : "↑ 앞부분 더 보기"}
-          </button>
-        )}
+        {moreButton("before", askedBefore, setAskedBefore, earlier)}
         <FileBody file={first.file} items={items} target={first.target} />
-        {hasMore("after", first, askedAfter, later) && (
-          <button
-            type="button"
-            className="ghost small"
-            disabled={later.isFetching}
-            onClick={more(askedAfter, setAskedAfter, later)}
-          >
-            {later.isFetching ? "불러오는 중…" : "↓ 뒷부분 더 보기"}
-          </button>
-        )}
+        {moreButton("after", askedAfter, setAskedAfter, later)}
       </div>
     </>
   );

@@ -18,7 +18,15 @@ import { CitationPreview } from "../src/citations/CitationMarker.js";
 import { citationView } from "../src/citations/segments.js";
 import { FileViewContext } from "../src/files/context.js";
 import { FileBody } from "../src/files/FileViewer.js";
-import { combine, hasMore, openingQuery, pagingQuery, type ViewFetch } from "../src/files/queries.js";
+import {
+  combine,
+  hasMore,
+  moreAction,
+  openingQuery,
+  pagingQuery,
+  shownPages,
+  type ViewFetch,
+} from "../src/files/queries.js";
 import { blocks, cellsOf, colName, columns, highlightsOf, linesOf, pieces } from "../src/files/view-model.js";
 
 /**
@@ -332,6 +340,107 @@ describe("review #123 2차", () => {
     expect(html).toContain("앞의 공개 문장 [숨김]");
     expect(html).toContain("뒤의 공개 문장");
     expect(html.indexOf("앞의 공개 문장")).toBeLessThan(html.indexOf("뒤의 공개 문장"));
+  });
+});
+
+describe("review #123 3차: paging after a visit, and a failed window", () => {
+  const ALL = 100;
+  const LIMIT = 10;
+  /** The server's windows (`viewWindow`) over `text(seq)`; `fail(o)` answers 500 for that request. */
+  const server = (text: (seq: number) => string, fail: (o: object) => boolean = () => false) => {
+    const fetch: ViewFetch = async (o) => {
+      if (fail(o)) throw new Error("500");
+      const start = o.from ?? (o.loc ? 30 : 0);
+      let end = Math.min(ALL, start + LIMIT);
+      if (o.to !== undefined) end = Math.max(start, Math.min(end, o.to));
+      return {
+        file,
+        extract: {
+          fileId: "f1",
+          fileRevision: REV,
+          status: "ok",
+          code: null,
+          ocr: "none",
+          units: ALL,
+          segments: ALL,
+          characters: 1,
+          truncated: false,
+        },
+        items: Array.from({ length: end - start }, (_, i) =>
+          seg(start + i, { kind: "slide", slide: start + i + 1 }, text(start + i)),
+        ),
+        prev: start > 0 ? Math.max(0, start - LIMIT) : null,
+        next: end < ALL ? end : null,
+        target: null,
+      };
+    };
+    return fetch;
+  };
+  const loc: FileLocator = { ...base, kind: "slide", slide: 31 };
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+
+  it("[P2 1] leave and come back after the text changed: no window of the earlier visit is shown", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 5_000 } } });
+    let version = "old [비밀값]";
+    const fetch = server((n) => `${version} ${n}`);
+    // First visit: the opening window and one window before it.
+    const o1 = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const u1 = o1.subscribe(() => {});
+    const first = (await o1.refetch()).data!;
+    const b1 = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
+    const u2 = b1.subscribe(() => {});
+    await b1.refetch();
+    expect(b1.getCurrentResult().data!.pages[0]!.items[0]!.text).toBe("old [비밀값] 20");
+    u1();
+    u2();
+    await tick();
+    // The text changed on the server (a secret registered since is hidden now).
+    version = "new [숨김]";
+    // Second visit, same file and place: nothing of the first visit is kept or shown.
+    expect(client.getQueryCache().getAll()).toHaveLength(0);
+    const o2 = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const u3 = o2.subscribe(() => {});
+    const again = (await o2.refetch()).data!;
+    const b2 = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, again, fetch, false));
+    const u4 = b2.subscribe(() => {});
+    const shown = combine([...shownPages(false, b2.getCurrentResult()), again]);
+    expect(shown.map((x) => x.text).some((t) => t.startsWith("old"))).toBe(false);
+    expect(shown.map((x) => x.seq)).toEqual(Array.from({ length: 10 }, (_, i) => 30 + i));
+    // Even a paging query left in the cache is not shown until asked on this visit.
+    expect(shownPages(false, { data: { pages: [first] }, hasNextPage: true, isError: false })).toEqual([]);
+    u3();
+    u4();
+    client.clear();
+  });
+
+  it("[P2 2] the first window before fails (500): the button stays, says 다시 시도, and retries", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let failing = true;
+    const fetch = server(
+      (n) => `x ${n}`,
+      (o) => failing && "to" in o && (o as { to?: number }).to !== undefined,
+    );
+    const o = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const u1 = o.subscribe(() => {});
+    const first = (await o.refetch()).data!;
+    const b = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
+    const u2 = b.subscribe(() => {});
+    await b.refetch();
+    let r = b.getCurrentResult();
+    expect([r.isError, r.data, r.hasNextPage]).toEqual([true, undefined, false]);
+    // Still offered (the opening window says there is more), as a retry of that first window.
+    expect(hasMore("before", first, true, r)).toBe(true);
+    expect(moreAction(true, r)).toBe("retry");
+    failing = false;
+    await b.refetch();
+    r = b.getCurrentResult();
+    expect(r.data!.pages[0]!.items.map((x) => x.seq)).toEqual(Array.from({ length: 10 }, (_, i) => 20 + i));
+    expect(moreAction(true, r)).toBe("next");
+    // A later window failing keeps the button too.
+    expect(hasMore("before", first, true, { ...r, hasNextPage: false, isError: true })).toBe(true);
+    u1();
+    u2();
+    client.clear();
   });
 });
 

@@ -24,6 +24,9 @@ export function openingQuery(fileId: string, loc: FileLocator | undefined, fetch
     queryKey: [...baseKey(fileId, loc), "opening"],
     queryFn: () => fetch({ loc }),
     retry: false,
+    // File text is not kept once the viewer is gone (review #123 3차): a later visit reads it again — scrubbed with
+    // the secrets known then — instead of showing a cached copy first.
+    gcTime: 0,
     // Still being read: look again until the text is there.
     refetchInterval: (q) => (q.state.data?.extract.status === "pending" ? 3000 : false),
   });
@@ -51,16 +54,41 @@ export function pagingQuery(
     getNextPageParam: (last: FileViewResponse) => step(last),
     enabled: enabled && start !== undefined,
     retry: false,
+    gcTime: 0,
   });
 }
 
-/** Whether there is more text that way: not asked yet and there is some, or the paging query has more. */
+type Paging = {
+  data?: { pages: readonly FileViewResponse[] } | undefined;
+  hasNextPage: boolean;
+  isError: boolean;
+};
+
+/** The windows of a paging query this viewer may show: only once asked here (review #123 3차: no earlier visit's). */
+export const shownPages = (asked: boolean, paging: Paging): readonly FileViewResponse[] =>
+  asked ? (paging.data?.pages ?? []) : [];
+
+/**
+ * Whether there is more text that way. Until the paging query has a window (not asked yet, its first request
+ * still running or failed), the opening window says; then the paging query (a failed later window keeps it: the
+ * button retries — review #123 3차).
+ */
 export const hasMore = (
   direction: "before" | "after",
   opening: FileViewResponse,
   asked: boolean,
-  paging: { hasNextPage: boolean },
-) => (asked ? paging.hasNextPage : (direction === "before" ? opening.prev : opening.next) !== null);
+  paging: Paging,
+) =>
+  asked && paging.data?.pages.length
+    ? paging.hasNextPage || paging.isError
+    : (direction === "before" ? opening.prev : opening.next) !== null;
+
+/**
+ * What "더 보기" does now: ask (the first time — the query starts), `retry` its first window when that failed, or
+ * load the `next` window (again, when that failed).
+ */
+export const moreAction = (asked: boolean, paging: Paging): "ask" | "retry" | "next" =>
+  !asked ? "ask" : paging.data?.pages.length ? "next" : "retry";
 
 /** Every segment loaded, once, in file order. */
 export function combine(windows: readonly (FileViewResponse | undefined)[]): ViewSegment[] {
