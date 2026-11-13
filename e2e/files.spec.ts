@@ -541,9 +541,9 @@ async function cancelledDuringMove(page: Page, baseURL: string, bFirst: boolean)
   await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
   await page.getByRole("button", { name: "보내기" }).click();
   // Only C goes with it: B never comes back.
-  await expect(
-    page.getByTestId("user-message").filter({ hasText: "다음 메시지" }).getByTestId("file-ref"),
-  ).toHaveText([/C\.txt/]);
+  const next = page.getByTestId("user-message").filter({ hasText: "다음 메시지" });
+  await expect(next).toHaveCount(1);
+  await expect(next.getByTestId("file-ref")).toHaveText([/C\.txt/]);
   await expect(page.getByRole("alert")).toHaveCount(0);
   // List reads the page still makes (refetches) must not outlive the test.
   await page.unrouteAll({ behavior: "ignoreErrors" });
