@@ -64,8 +64,11 @@ if (mode === "lock") {
     while (!fs.existsSync(go) && Date.now() < deadline)
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
   }
+  // `n` is the number of successful holds each racer aims for; failed attempts don't count, so a racer that keeps
+  // losing keeps trying (until a wall-clock bound) instead of running out of attempts while another one holds it.
   let acquired = 0;
-  for (let i = 0; i < Number(n); i++) {
+  const until = Date.now() + 20_000;
+  while (acquired < Number(n) && Date.now() < until) {
     let lock;
     try {
       lock = acquireDataLock(dataDir, "server");

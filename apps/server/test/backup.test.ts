@@ -948,7 +948,7 @@ describe(
       const dir = path.join(tmp(), "data");
       const sentinel = path.join(path.dirname(dir), "inside");
       const go = path.join(path.dirname(dir), "go");
-      const racers = [0, 1, 2].map(() => spawnTs(CHILD, ["race", dir, sentinel, "150", go]));
+      const racers = [0, 1, 2].map(() => spawnTs(CHILD, ["race", dir, sentinel, "40", go]));
       await Promise.all(racers.map((r) => r.waitFor("ready")));
       fs.writeFileSync(go, "");
       const results = await Promise.all(racers.map(async (r) => (await r.exited, r.out().trim())));
@@ -957,7 +957,7 @@ describe(
         expect(o).not.toContain("OVERLAP");
         return Number(/acquired=(\d+)/.exec(o)![1]);
       });
-      // The loop really contended: with a common start, every racer got it sometimes.
+      // The loop really contended: with a common start and success-counted rounds, every racer got it sometimes.
       expect(counts.every((n) => n > 0)).toBe(true);
     });
 
