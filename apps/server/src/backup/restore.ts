@@ -350,7 +350,16 @@ function settleOldDb(dir: string): void {
   try {
     const r = db.pragma("wal_checkpoint(TRUNCATE)") as { busy: number }[];
     if (r[0]?.busy) throw new RestoreError("old_unsettled");
-    db.pragma("journal_mode = DELETE");
+    if (db.pragma("journal_mode = DELETE", { simple: true }) !== "delete")
+      throw new RestoreError("old_unsettled");
+    // The checkpoint only sees WAL readers: a database already in rollback-journal mode (e.g. after an earlier
+    // restore) reports busy=0 whoever is reading it (#139 review). In rollback mode every reader holds a SHARED lock
+    // on the main file for its whole transaction, so an EXCLUSIVE lock (no waiting) is the check for both modes —
+    // any other connection inside a transaction, of any kind, makes it fail. Taken and dropped at once, not held
+    // across the swap: the swap hashes the file with plain fs calls, and closing any descriptor of a file drops all
+    // of the process's POSIX locks on it, so a held lock would silently vanish.
+    db.exec("BEGIN EXCLUSIVE");
+    db.exec("ROLLBACK");
   } catch (e) {
     throw e instanceof RestoreError ? e : new RestoreError("old_unsettled");
   } finally {
