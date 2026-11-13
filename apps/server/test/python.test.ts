@@ -1228,6 +1228,17 @@ describe("python_run: the dedicated account (#47 round 2)", () => {
     expect(
       (await verifyAccount({ ...base, run: probe({ uid: serverUid + 7, readBlocked: false }) })).ok,
     ).toBe(false);
+    // A blocked verdict while the server's sibling had already exited (a zombie also refuses procargs): refused.
+    const dead = await verifyAccount({
+      ...base,
+      run: async ({ siblingPid }) => {
+        process.kill(siblingPid, "SIGKILL");
+        await new Promise((r) => setTimeout(r, 300));
+        return { uid: serverUid + 7, readBlocked: true };
+      },
+    });
+    expect(dead.ok).toBe(false);
+    if (!dead.ok) expect(dead.reason).toContain("sibling exited");
     // The probe throwing (sudo not set up) is a closed failure, not a pass.
     const threw = await verifyAccount({
       ...base,

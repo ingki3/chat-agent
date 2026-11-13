@@ -210,6 +210,10 @@ export async function verifyAccount(opts: {
     if (res.uid <= 0) return { ok: false, reason: `the account resolved to uid ${res.uid}` };
     if (!res.readBlocked)
       return { ok: false, reason: "the account could read another process's start-up environment" };
+    // A sibling that had already exited (even a zombie the kernel still lists with its uid) also refuses
+    // KERN_PROCARGS2: "blocked" only counts while the server's own sibling is still running (review #131).
+    if (sibling.exitCode !== null || sibling.signalCode !== null)
+      return { ok: false, reason: "the self-check sibling exited before the probe finished" };
     return { ok: true, uid: res.uid };
   } catch (e) {
     return { ok: false, reason: (e as Error).message };
