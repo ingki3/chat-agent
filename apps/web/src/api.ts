@@ -64,6 +64,10 @@ import {
   type ConnectionAuthType,
   type Role,
   type RuntimeId,
+  REFERENCE_ERRORS,
+  ReferencesResponse,
+  type ReferenceFormat,
+  type ReferenceStyle,
 } from "@agentlee/shared";
 
 const enc = encodeURIComponent;
@@ -507,6 +511,8 @@ const MESSAGES: Record<string, string> = {
   finance_busy: "지금 요청이 많아요. 잠시 뒤 다시 해 보세요.",
   proposal_changed:
     "그사이 기본 런타임·모델(또는 허용 범위)이 바뀌었어요. 바뀐 내용을 확인하고 다시 눌러 주세요.",
+  // Reference export (#26)
+  ...REFERENCE_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -588,4 +594,46 @@ export const watchlist = {
   add: async (market: WatchMarket, symbol: string, name?: string | null) =>
     WatchlistItem.parse(await call("POST", "/api/watchlist", { market, symbol, ...(name ? { name } : {}) })),
   remove: async (id: string) => call("DELETE", `/api/watchlist/${enc(id)}`),
+};
+
+/** 참고문헌 내보내기 (#26): the list in one style, and a download (`.txt` / `.docx`) as a file the page saves. */
+export const references = {
+  url: (id: string, style: ReferenceStyle, includeUnverified: boolean, format?: ReferenceFormat) =>
+    `/api/conversations/${enc(id)}/references${format ? "/download" : ""}?style=${style}` +
+    `${includeUnverified ? "&includeUnverified=1" : ""}${format ? `&format=${format}` : ""}`,
+  list: async (id: string, style: ReferenceStyle, includeUnverified: boolean) =>
+    ReferencesResponse.parse(await call("GET", references.url(id, style, includeUnverified))),
+  /** The file and its name (from `Content-Disposition`); an error answer is thrown as `ApiError`. */
+  download: async (
+    id: string,
+    style: ReferenceStyle,
+    includeUnverified: boolean,
+    format: ReferenceFormat,
+  ) => {
+    const url = references.url(id, style, includeUnverified, format);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        credentials: "same-origin",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+      });
+    } catch (e) {
+      void checkOuterRedirect();
+      throw e;
+    }
+    if (!res.ok) {
+      const json = (await res.json().catch(() => ({}))) as { error?: string };
+      if (res.status === 401) onUnauthenticated();
+      throw new ApiError(res.status, json.error ?? "unknown", json);
+    }
+    const cd = res.headers.get("content-disposition") ?? "";
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(cd)?.[1];
+    let name = `참고문헌.${format}`;
+    try {
+      if (star) name = decodeURIComponent(star);
+    } catch {
+      // keep the plain name
+    }
+    return { blob: await res.blob(), name };
+  },
 };

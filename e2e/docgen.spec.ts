@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Browser, type Page } from "@playwright/test";
 import { readDocx, readPdf } from "../apps/server/test/helpers/doc-parse.js";
-import { SON, newConversation, useAccount } from "./helpers.js";
+import { newConversation, newMember, signIn } from "./helpers.js";
 
 /**
  * Document generation (#49, PRD FR-4.4·4.7): "이 내용을 DOCX 보고서로" in the chat — the FakeRuntime calls our real
@@ -30,8 +30,12 @@ async function send(page: Page, text: string) {
 const lastAssistant = (page: Page) => page.getByTestId("assistant").last();
 const TITLE = "제주 가족 여행 보고서";
 
-async function openChat(page: Page, baseURL: string) {
-  await useAccount(page, SON);
+/**
+ * A youth account of its own for each test: the document worker takes one run per user at a time (`DOC_SLOTS`,
+ * shared with the reference export, #26), and the tests of both projects run at once.
+ */
+async function openChat(page: Page, browser: Browser, baseURL: string) {
+  await signIn(page, baseURL, await newMember(browser, baseURL, "doc-son", true));
   const conv = await newConversation(page.request, baseURL, `문서 ${crypto.randomUUID().slice(0, 8)}`);
   await page.goto(`/c/${conv.id}`);
   return conv;
@@ -39,9 +43,10 @@ async function openChat(page: Page, baseURL: string) {
 
 test("'이 내용을 DOCX 보고서로' → the reply's download chip → the file opens; the document artifact links it", async ({
   page,
+  browser,
   baseURL,
 }) => {
-  await openChat(page, baseURL!);
+  await openChat(page, browser, baseURL!);
   await send(page, "/doc docx");
   const reply = lastAssistant(page);
   await expect(reply).toHaveAttribute("data-status", "complete");
@@ -69,9 +74,10 @@ test("'이 내용을 DOCX 보고서로' → the reply's download chip → the fi
 
 test("PDF: Korean text is in the file (embedded font) and HWP is refused with a guidance message", async ({
   page,
+  browser,
   baseURL,
 }) => {
-  const conv = await openChat(page, baseURL!);
+  const conv = await openChat(page, browser, baseURL!);
   await send(page, "/doc pdf");
   const reply = lastAssistant(page);
   await expect(reply).toHaveAttribute("data-status", "complete");

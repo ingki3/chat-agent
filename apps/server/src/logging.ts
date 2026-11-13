@@ -86,6 +86,9 @@ export const LOG_EVENTS = [
   "citation.finished",
   // PNG/PDF export (#51): format, fixed outcome code, duration and IDs — never the title or the content.
   "artifact.exported",
+  // Reference export (#26): entry count, `docx` and its fixed `doc_*` code, duration and IDs — never an entry,
+  // a title or an address.
+  "references.exported",
   "web.build_missing",
   "server.start_failed",
   "log.line_dropped",

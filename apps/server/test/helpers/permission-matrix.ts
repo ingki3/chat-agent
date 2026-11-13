@@ -61,6 +61,34 @@ function conversation(f: Family) {
   const reply = store.append(c.id, { role: "assistant", parts: [{ type: "text", text: "답" }] });
   return { id: c.id, params: { userMessageId: user.id, assistantMessageId: reply.id } };
 }
+/** A conversation of `owner` whose answer cites one verified web source (the reference export, #26). */
+function withReferences(f: Family) {
+  const fx = conversation(f);
+  f.app.conversations!.append(fx.id, {
+    role: "assistant",
+    parts: [
+      { type: "text", text: "수출이 늘었어요 [1]." },
+      {
+        type: "citation_note",
+        citations: [
+          {
+            n: 1,
+            status: "verified",
+            sourceId: "matrix-source",
+            title: "출처 제목",
+            site: "출처 사이트",
+            url: "https://matrix.example/page",
+            publishedAt: "2026-11-10",
+            quote: "수출이 늘었다",
+          },
+        ],
+        missing: [],
+        markers: [{ n: 1, start: 9, end: 12 }],
+      },
+    ],
+  });
+  return fx.id;
+}
 const withMessage = (key: "userMessageId" | "assistantMessageId") => (f: Family) => {
   const fx = conversation(f);
   return { id: fx.id, params: { messageId: fx.params[key] } };
@@ -203,6 +231,13 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /api/conversations/:id/messages", expect: NOT_SHARED(READ), fixture: conversation },
   // Owner only even once sharing exists (#50): a shared view gets its frozen sources, not this list (#29).
   { route: "GET /api/conversations/:id/sources", expect: OWNER_ONLY, fixture: conversation },
+  // The reference export (#26): whoever may read the conversation (its own loader — sharing comes with #29).
+  { route: "GET /api/conversations/:id/references", expect: NOT_SHARED(READ), fixture: withReferences },
+  {
+    route: "GET /api/conversations/:id/references/download",
+    expect: NOT_SHARED(READ),
+    fixture: withReferences,
+  },
   {
     route: "POST /api/conversations/:id/messages",
     expect: { ...OWNER_ONLY, owner: 201 },

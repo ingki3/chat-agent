@@ -66,9 +66,11 @@ import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
 import { findBrowser } from "./artifacts/browser.js";
 import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
+import { registerReferenceRoutes } from "./references/routes.js";
 import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
 import { DocGenService } from "./docgen/service.js";
+import { DocSlots } from "./docgen/slots.js";
 import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
 import {
   extractorKind,
@@ -460,12 +462,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const scheduleProposals = new ScheduleProposalStore(opts.db!);
     app.decorate("scheduleProposals", scheduleProposals);
     // Documents (#49): made by `doc_create`, stored with the conversation's files (the store is decorated below).
+    const docRunner =
+      opts.docs?.runner ??
+      (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner());
+    // Every document worker run (doc_create and the reference export) takes one of the same slots.
+    const docSlots = new DocSlots(docRunner);
     const docs = new DocGenService({
       db: opts.db!,
       files: () => app.files,
-      runner:
-        opts.docs?.runner ??
-        (docRunnerKind(config) === "in-process" ? inProcessDocRunner() : sandboxedDocRunner()),
+      runner: docRunner,
+      slots: docSlots,
     });
     // 관심 종목 (#31): the screen's list and `watchlist_get`.
     const watchlist = new WatchlistStore(opts.db!);
@@ -723,6 +729,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     registerSourceRoutes(app, app.conversations!, sources);
     registerWatchlistRoutes(app, { store: watchlist, mcp });
+    // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
+    registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
     let renderer = opts.renderer;
     if (!renderer) {
