@@ -1,4 +1,4 @@
-import { SEARCH_DECOY } from "../secrets/egress.js";
+import { carriesSecret, SEARCH_DECOY, withoutParam } from "../secrets/egress.js";
 import fs from "node:fs";
 import { z } from "zod";
 import {
@@ -172,7 +172,10 @@ export function skillPolicy(
     network = { loopbackPorts: [ctx.proxy.port] };
     env.HTTPS_PROXY = env.https_proxy = ctx.proxy.url;
   }
-  if (skill.kind === "node")
+  if (skill.kind === "node") {
+    // A node skill's fetch follows redirects and nothing here can refuse them: a networked node skill would send
+    // requests the server never checked (#129). None exists; one is refused until it has its own guard.
+    if (skill.hosts.length) throw new SkillRefused("skill_unavailable");
     return {
       command: ctx.node,
       args: [skill.entry, ...args],
@@ -184,6 +187,7 @@ export function skillPolicy(
       network,
       secretValues,
     };
+  }
   if (!ctx.python) throw new SkillRefused("skill_unavailable");
   // -I: no PYTHON* variables, no user site, no script folder on sys.path. -S: no site-packages (standard library
   // only). -B: writes no .pyc (it could not anyway).
@@ -191,7 +195,9 @@ export function skillPolicy(
   if (skill.hosts.length) env.SSL_CERT_FILE = SYSTEM_CA_BUNDLE;
   return {
     command: ctx.python.exe,
-    args: ["-I", "-S", "-B", ...(skill.noRedirects ? ["-c", NO_REDIRECT_BOOT] : []), skill.entry, ...args],
+    // Every networked python skill runs under the network boot, as a tool and as a web_search provider (#113 round
+    // 3, #129): urllib's redirects refused, and every request asked for on fd 3 before it is sent (`skillSendGate`).
+    args: ["-I", "-S", "-B", ...(skill.hosts.length ? ["-c", SKILL_NET_BOOT] : []), skill.entry, ...args],
     cwd: skill.dir,
     env,
     read: [skill.dir],
@@ -202,18 +208,129 @@ export function skillPolicy(
   };
 }
 
+/** Why a networked skill call failed: a request it was about to send carried a secret (#129). The log's code. */
+export const SKILL_SECRET_BLOCKED = "skill_secret_blocked";
+
+/** Requests one skill call may send at most (each one asked for on the gate); beyond it every send is refused. */
+export const SKILL_SENDS_MAX = 16;
+
+/** One request the network boot is about to send: the connection's host and the exact bytes (Latin-1 text). */
+const SendRequest = z.strictObject({ host: z.string().min(1).max(253), data: z.string() });
+
 /**
- * Runs a python script (argv[1]) with urllib's redirects refused (`BundledSkill.noRedirects`, #113): the redirect
- * handler's `redirect_request` — which every opener, the default one and any the script builds, goes through —
- * raises an `HTTPError` instead of building the next request. Nothing else changes: same flags, same `__main__`,
- * same exit code; the script's own handling of an HTTP error decides what it reports.
+ * The per-send approval of one networked skill call (#129, the finance raw approach for skills): the network boot
+ * hands over every request exactly as it goes on the wire — after the script composed and urllib encoded it, the
+ * request line, every header, the body; and the proxy CONNECT — and sends it only on `true`.
+ * - the connection's host must be one of the skill's hosts;
+ * - the skill's own declared secret is allowed at its declared place only: the first exact `param=<value>` pair of
+ *   the request target, on its declared host (Alpha Vantage `apikey=`) — once, like finance's DART exception;
+ * - everything else is checked by the one egress predicate (`carriesSecret`, incl. the UTF-8 view of the bytes)
+ *   against the registry and every `.env` skill secret.
+ * A refusal is final for the call (`denied`): every later send is refused too.
  */
-export const NO_REDIRECT_BOOT = [
-  "import runpy, sys, urllib.error, urllib.request",
+export function skillSendGate(
+  skill: Pick<BundledSkill, "hosts" | "secrets">,
+  input: Record<string, unknown>,
+  secrets?: Readonly<Record<string, string>>,
+): { approve(line: string): boolean; readonly denied: boolean; readonly sends: number } {
+  const hosts = new Set(skill.hosts.map((h) => h.toLowerCase()));
+  const config = Object.values(secrets ?? {});
+  const places = skill.secrets.flatMap((s) => {
+    const v = secrets?.[s.env];
+    return s.place && v && (!s.when || s.when(input)) ? [{ ...s.place, value: v }] : [];
+  });
+  let denied = false;
+  let sends = 0;
+  const check = (line: string): boolean => {
+    if (++sends > SKILL_SENDS_MAX) return false;
+    const req = SendRequest.safeParse(JSON.parse(line));
+    if (!req.success) return false;
+    const host = req.data.host.toLowerCase();
+    if (!hosts.has(host)) return false;
+    let data = req.data.data;
+    const eol = data.indexOf("\r\n");
+    const first = eol < 0 ? data : data.slice(0, eol);
+    const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(first);
+    if (!m) return false;
+    let target = m[2]!;
+    for (const p of places.filter((x) => x.host === host)) {
+      const removed = withoutParam(target, p.param, p.value);
+      target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
+    }
+    data = `${m[1]} ${target} ${m[3]}${eol < 0 ? "" : data.slice(eol)}`;
+    return !carriesSecret([data], { config });
+  };
+  return {
+    approve(line) {
+      if (denied) return false;
+      let ok: boolean;
+      try {
+        ok = check(line);
+      } catch {
+        ok = false;
+      }
+      if (!ok) denied = true;
+      return ok;
+    },
+    get denied() {
+      return denied;
+    },
+    get sends() {
+      return sends;
+    },
+  };
+}
+
+/** A value as python's `urlencode` (quote_plus) writes it: `encodeURIComponent` plus `!'()*` escaped. */
+function pythonQuote(v: string): string {
+  return encodeURIComponent(v)
+    .replace(/%20/g, "+")
+    .replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/**
+ * The network boot of every networked python skill (#113, #129), run as `python -I -S -B -c <boot> <script> …`:
+ * - urllib's redirects are refused: the redirect handler's `redirect_request` — which every opener, the default
+ *   one and any the script builds, goes through — raises an `HTTPError` instead of building the next request;
+ * - every request is approved before it is sent: `http.client.HTTPConnection.send` (urllib's and any direct
+ *   http.client use, the proxy CONNECT included) first writes `{"host", "data"}` — the bytes about to go out — as
+ *   one JSON line to fd 3 and reads the verdict; anything but `1` (or a missing fd 3) raises `ConnectionError`,
+ *   which urllib reports as a `URLError` the script handles like any network failure.
+ * Installed before the script runs; the original `send` is reachable only through the closure. Nothing else
+ * changes: same flags, same `__main__`, same exit code.
+ */
+export const SKILL_NET_BOOT = [
+  "import http.client, json, os, runpy, sys, urllib.error, urllib.request",
   "def _refuse(self, req, fp, code, msg, headers, newurl):",
   "    raise urllib.error.HTTPError(req.full_url, code, 'redirect not followed', headers, fp)",
   "urllib.request.HTTPRedirectHandler.redirect_request = _refuse",
   "urllib.request.install_opener(urllib.request.build_opener())",
+  "def _gated(send):",
+  "    def ask(line):",
+  "        while line:",
+  "            line = line[os.write(3, line):]",
+  "        got = b''",
+  "        while not got.endswith(b'\\n') and len(got) < 4:",
+  "            more = os.read(3, 4 - len(got))",
+  "            if not more:",
+  "                break",
+  "            got += more",
+  "        return got == b'1\\n'",
+  "    def guarded(self, data):",
+  "        if not isinstance(data, (bytes, bytearray)):",
+  "            raise ConnectionError('send refused')",
+  "        host = getattr(self, '_tunnel_host', None) or self.host",
+  "        line = (json.dumps({'host': host, 'data': bytes(data).decode('latin-1')}) + '\\n').encode()",
+  "        try:",
+  "            ok = ask(line)",
+  "        except OSError:",
+  "            ok = False",
+  "        if not ok:",
+  "            raise ConnectionError('send refused')",
+  "        return send(self, data)",
+  "    return guarded",
+  "http.client.HTTPConnection.send = _gated(http.client.HTTPConnection.send)",
+  "del _gated",
   "sys.argv = sys.argv[1:]",
   "runpy.run_path(sys.argv[0], run_name='__main__')",
 ].join("\n");
@@ -242,6 +359,8 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
     const { secretValues, ...run } = policy;
     // An installed skill runs only from its pinned copy, checked again right before each run (install.ts).
     if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
+    // A networked skill asks for each request on fd 3 before it sends it (#129).
+    const gate = skill.hosts.length ? skillSendGate(skill, input, o.secrets) : undefined;
     let r;
     try {
       r = await runIsolated({
@@ -249,10 +368,13 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
         stdin: JSON.stringify(input),
         ...limits,
         timeoutMs: skill.timeoutMs ?? limits.timeoutMs,
+        ...(gate ? { gate: (line: string) => gate.approve(line) } : {}),
       });
     } catch {
       return { ok: false, code: "skill_unavailable" }; // no sandbox here (not macOS), hard links, spawn failure
     }
+    // A refused send decides the outcome, whatever the script printed after its request failed.
+    if (gate?.denied) return { ok: false, code: SKILL_SECRET_BLOCKED };
     if (r.killed === "timeout") return { ok: false, code: "skill_timeout" };
     if (r.killed) return { ok: false, code: "skill_limit" };
     if (r.code === null || !(skill.okExitCodes ?? [0]).includes(r.code) || !r.stdout.trim())
@@ -528,11 +650,10 @@ export class McpService {
    */
   private buildWeb(o: WebOptions): WebService {
     const worker = o.worker ?? sandboxedWorker();
-    // As a web_search provider the skill runs with redirects refused (#113 review round 3): the query is checked
-    // here, but a redirect's URL is the site's — a 302 to `…/rss/search?q=<secret>` must not go out unchecked. A
-    // refused redirect is a failed search (`web_search_unavailable`): the next provider is tried.
-    const found = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
-    const news = found ? { ...found, noRedirects: true } : undefined;
+    // As a web_search provider the skill runs as it does as a tool: arguments checked, redirects refused
+    // (`skillPolicy`, #113 review round 3, #129). A refused redirect is a failed search (`web_search_unavailable`):
+    // the next provider is tried.
+    const news = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
     const providers =
       o.searchProviders ??
       (o.providers ?? ["duckduckgo", "google-news"]).flatMap((name): SearchProvider[] => {
@@ -702,6 +823,10 @@ export class McpService {
       runSkill: async (name, input, scope) => {
         const t0 = now();
         const r = await this.call(byName.get(name), input, scope, runSkill);
+        // The guard's refusal is told to the model as an ordinary failure (no oracle for which value is a secret,
+        // #113 round 1); the log and the admin's error list keep why.
+        const shown: SkillResult =
+          !r.ok && r.code === SKILL_SECRET_BLOCKED ? { ok: false, code: "skill_failed" } : r;
         logEvent(this.opts.log, r.ok ? "info" : "warn", "skill.finished", {
           userId: scope.userId,
           conversationId: scope.conversationId,
@@ -722,7 +847,7 @@ export class McpService {
             conversationId: scope.conversationId,
             runId: scope.runId,
           });
-        return r;
+        return shown;
       },
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);

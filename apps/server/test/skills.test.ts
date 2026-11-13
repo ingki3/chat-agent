@@ -42,6 +42,7 @@ import {
   McpService,
   redactOutput,
   sandboxedSkillRunner,
+  SKILL_NET_BOOT,
   skillPolicy,
   SkillRefused,
   SYSTEM_CA_BUNDLE,
@@ -708,11 +709,20 @@ describe("skill sandbox policy (#21 on #42)", () => {
     const p = skillPolicy(
       skill,
       { query: "뉴스" },
-      { node: "/n", python: py, proxy, secrets: { OTHER: "x" } },
+      { node: "/n", python: py, proxy, secrets: { OTHER: "OTHER-SECRET-VALUE" } },
     );
     expect(p).toMatchObject({
       command: py.exe,
-      args: ["-I", "-S", "-B", skill.entry, ...GOOGLE_NEWS_SKILL.args({ query: "뉴스" })!],
+      // A networked python skill always runs with redirects refused (#129).
+      args: [
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        SKILL_NET_BOOT,
+        skill.entry,
+        ...GOOGLE_NEWS_SKILL.args({ query: "뉴스" })!,
+      ],
       cwd: skill.dir,
       read: [skill.dir],
       trusted: [py.root, SYSTEM_CA_BUNDLE],

@@ -17,7 +17,15 @@ import type { SkillInfo } from "./index.js";
 export const SKILLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../skills");
 
 /** A secret env variable a skill gets in its own process only — when the call needs it (`when`, default always). */
-export type SkillSecret = { env: string; when?: (input: Record<string, unknown>) => boolean };
+export type SkillSecret = {
+  env: string;
+  when?: (input: Record<string, unknown>) => boolean;
+  /**
+   * Where the skill sends it (#129): the query parameter `param` of a request to `host`. The host's per-send check
+   * allows the value there only (its first exact pair); anywhere else a request carrying it is refused.
+   */
+  place?: { host: string; param: string };
+};
 
 /** One search result a skill returned, to register as a source (#50). Untrusted text: bounded by the host. */
 export type SearchHit = { url: string; title: string; site?: string; publishedAt?: string; snippet?: string };
@@ -33,7 +41,11 @@ export type SkillSpec = SkillInfo & {
   files: readonly string[];
   /** The arguments after the entry script, built from the validated input. `undefined` refuses the input. */
   args(input: Record<string, unknown>): string[] | undefined;
-  /** Hosts it may reach over HTTPS (through the egress proxy). Empty: no network at all. */
+  /**
+   * Hosts it may reach over HTTPS (through the egress proxy). Empty: no network at all. A skill with hosts must be
+   * python whose requests go through urllib / http.client: the host refuses its redirects and approves every request
+   * before it is sent (#129, docs/ops.md §42); a networked node skill is refused.
+   */
   hosts: readonly string[];
   secrets: readonly SkillSecret[];
   /** Exit codes whose stdout is a result (default: 0 only). */
@@ -54,12 +66,6 @@ export type BundledSkill = SkillSpec & {
   entry: string;
   /** Re-checks the files just before a run (installed skills: their pinned copy is unchanged). */
   verify?: () => boolean;
-  /**
-   * Python only: run with urllib's redirects refused (a redirect becomes an HTTP error the script handles like any
-   * other) — set by the host where every request must be the one it checked (web_search's Google News provider,
-   * #113 review round 3: the next hop's URL is the site's, not the query the server checked).
-   */
-  noRedirects?: boolean;
 };
 
 /**
@@ -179,7 +185,13 @@ export const KR_STOCK_SKILL: SkillSpec = {
     }
   },
   hosts: ["m.stock.naver.com", "www.alphavantage.co"],
-  secrets: [{ env: "ALPHAVANTAGE_API_KEY", when: (i) => i.command === "alpha-quote" }],
+  secrets: [
+    {
+      env: "ALPHAVANTAGE_API_KEY",
+      when: (i) => i.command === "alpha-quote",
+      place: { host: "www.alphavantage.co", param: "apikey" },
+    },
+  ],
   // 1 = the snapshot was not available; stdout is still the JSON report ({ status: "unavailable", ... }).
   okExitCodes: [0, 1],
   timeoutMs: 40_000,

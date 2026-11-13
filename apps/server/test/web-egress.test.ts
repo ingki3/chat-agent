@@ -1,11 +1,11 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+import type { Duplex } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GOOGLE_NEWS_SKILL, SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
@@ -13,9 +13,10 @@ import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb } from "../src/db/client.js";
 import { FINANCE_TOOLS } from "@agentlee/mcp-tools/finance";
 import { carriesKnownSecret, FINANCE_CALL_MS, FinanceService } from "../src/finance/service.js";
+import { serveGate } from "../src/isolation/sandbox.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 import { sanitizeRecord } from "../src/logging.js";
-import { McpService, NO_REDIRECT_BOOT, skillPolicy } from "../src/mcp/service.js";
+import { McpService, SKILL_NET_BOOT, skillPolicy } from "../src/mcp/service.js";
 import type { SkillResult } from "@agentlee/mcp-tools";
 import { carriesSecret, EGRESS_WINDOW, SEARCH_DECOY } from "../src/secrets/egress.js";
 import { knownSecrets } from "../src/secrets/known.js";
@@ -32,8 +33,6 @@ import { SourceStore } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 import { startWebFixture, TEST_CA, type WebFixture } from "./helpers/web-fixture.js";
 import { run as runWorker } from "../../../packages/mcp-tools/web/worker.mjs";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * The web tools' egress guard (#113): no web_search / web_fetch request — URL (host, path, query, fragment), a
@@ -926,17 +925,17 @@ describe("review #127 round 3", () => {
 describe("web_search → Google News: redirects are refused, not followed (review #127 round 3)", () => {
   const skill = { ...GOOGLE_NEWS_SKILL, dir: "/nonexistent", entry: "/nonexistent/google_news_search.py" };
 
-  it("the provider runs the skill with noRedirects; the skill tool itself is unchanged", async () => {
+  it("the provider and the skill tool both run the skill with redirects refused (#129)", async () => {
     const f = scope();
-    const seen: { tool: "search" | "skill"; noRedirects: boolean }[] = [];
-    let mode: "search" | "skill" = "search";
+    const seen: string[] = [];
     const tokens = new McpTokens();
     const svc = new McpService(tokens, f.users, {
       skills: [SELFTEST_SKILL, skill],
       python: { exe: "/opt/py/bin/python3.12", root: "/opt/py" },
-      runSkill: async (s) => {
-        seen.push({ tool: mode, noRedirects: s.noRedirects === true });
+      runSkill: async (s, input) => {
+        seen.push(String(input.query));
         // As a refused redirect ends: the script's own failure report.
+        expect(s.name).toBe(GOOGLE_NEWS_SKILL.name);
         return { ok: true, output: { ok: false, items: [] } };
       },
       web: {
@@ -950,26 +949,13 @@ describe("web_search → Google News: redirects are refused, not followed (revie
       const { url } = await svc.endpoint();
       const r = await callOurTool(url, tokens.issue(f.scope), "web_search", { query: "반도체" });
       expect(JSON.parse(r.content[0]!.text!)).toEqual({ error: "web_search_unavailable" });
-      mode = "skill";
       await callOurTool(url, tokens.issue(f.scope), "skill_google-news-search-skill", { query: "반도체" });
-      expect(seen).toEqual([
-        { tool: "search", noRedirects: true },
-        { tool: "skill", noRedirects: false },
-      ]);
+      expect(seen).toEqual(["반도체", "반도체"]);
     } finally {
       await svc.close();
     }
+    // One policy for both: a python skill with hosts always gets the boot.
     const policy = skillPolicy(
-      { ...skill, noRedirects: true },
-      { query: "x" },
-      {
-        node: process.execPath,
-        python: { exe: "/opt/py/bin/python3.12", root: "/opt/py" },
-        proxy: { url: "http://127.0.0.1:9", port: 9 },
-      },
-    );
-    expect(policy.args.slice(0, 6)).toEqual(["-I", "-S", "-B", "-c", NO_REDIRECT_BOOT, skill.entry]);
-    const plain = skillPolicy(
       skill,
       { query: "x" },
       {
@@ -978,7 +964,7 @@ describe("web_search → Google News: redirects are refused, not followed (revie
         proxy: { url: "http://127.0.0.1:9", port: 9 },
       },
     );
-    expect(plain.args.slice(0, 4)).toEqual(["-I", "-S", "-B", skill.entry]);
+    expect(policy.args.slice(0, 6)).toEqual(["-I", "-S", "-B", "-c", SKILL_NET_BOOT, skill.entry]);
   });
 
   const python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].find((p) =>
@@ -1009,21 +995,32 @@ describe("web_search → Google News: redirects are refused, not followed (revie
             "        print('HTTPError', e.code)",
           ].join("\n"),
         );
+        // As the runner does: the gate on fd 3 (here approving every send — the redirect is what is refused).
         const run = (boot: boolean) =>
-          execFileAsync(
-            python!,
-            [
-              "-I",
-              "-S",
-              "-B",
-              ...(boot ? ["-c", NO_REDIRECT_BOOT] : []),
-              script,
-              `http://127.0.0.1:${port}/start`,
-            ],
-            {
-              env: {},
-            },
-          );
+          new Promise<{ stdout: string }>((resolve, reject) => {
+            const child = spawn(
+              python!,
+              [
+                "-I",
+                "-S",
+                "-B",
+                ...(boot ? ["-c", SKILL_NET_BOOT] : []),
+                script,
+                `http://127.0.0.1:${port}/start`,
+              ],
+              { env: {}, stdio: ["pipe", "pipe", "pipe", "pipe"] },
+            );
+            serveGate(
+              child.stdio[3] as Duplex,
+              () => true,
+              () => child.kill("SIGKILL"),
+            );
+            let stdout = "";
+            child.stdout!.on("data", (d: Buffer) => (stdout += d.toString()));
+            child.on("error", reject);
+            child.on("close", () => resolve({ stdout }));
+            child.stdin!.end();
+          });
         const refused = await run(true);
         expect(refused.stdout.trim().split("\n")).toEqual(["HTTPError 302", "HTTPError 302"]);
         expect(asked).toEqual(["/start", "/start"]);

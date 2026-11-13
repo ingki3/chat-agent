@@ -114,6 +114,8 @@ export const SKILL_CODES = set([
   "skill_failed",
   "skill_bad_output",
   "skill_changed",
+  // The egress guard refused a networked skill call (#129); the model saw `skill_failed`.
+  "skill_secret_blocked",
 ]);
 /** Connection test outcomes (#17, connections/tester.ts): fixed codes only. */
 export const TEST_CODES = set([
