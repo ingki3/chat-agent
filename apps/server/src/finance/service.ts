@@ -1,9 +1,18 @@
 import type { SkillResult } from "@agentlee/mcp-tools";
 import type { FinanceToolInfo } from "@agentlee/mcp-tools/finance";
 import { redactValue } from "../mcp/service.js";
-import { KnownSecrets, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import { carriesSecret, decodedViews, EGRESS_WINDOW, urlTexts, withoutParam } from "../secrets/egress.js";
+import { scrubKnownDeep } from "../secrets/known.js";
 import { DART_HOSTS, SEC_HOSTS } from "@agentlee/mcp-tools/finance";
-import { RAW_JOB_LIMITS, type RawResponse, type RawStep, type WebWorker } from "../web/service.js";
+import {
+  RAW_JOB_LIMITS,
+  type RawPause,
+  type RawResponse,
+  type RawResume,
+  type RawStep,
+  type WebWorker,
+  type WorkerJob,
+} from "../web/service.js";
 import { DART_KEY, SEC_UA, TOOL_IMPLS, type FinanceCode, type Plan } from "./providers.js";
 import { finalize } from "./records.js";
 
@@ -51,7 +60,7 @@ const FROM_WEB: Record<string, FinanceCode> = {
 };
 
 export type FinanceWorker = (
-  job: { op: "raw"; steps: RawStep[] },
+  job: Extract<WorkerJob, { op: "raw" }>,
   proxy: { url: string; port: number },
 ) => ReturnType<WebWorker>;
 
@@ -65,6 +74,12 @@ export type FinanceOptions = {
 
 /** At most this many worker rounds per call (SEC by ticker: the CIK, then the submissions). */
 const MAX_ROUNDS = 2;
+
+/**
+ * The whole call's time (#113 review round 3): every round, job and approval stop shares it. Each job gets what is
+ * left (the worker's own per-request limit still holds); none starts once it is spent — `finance_timeout`.
+ */
+export const FINANCE_CALL_MS = 60_000;
 
 export class FinanceService {
   constructor(
@@ -96,12 +111,70 @@ export class FinanceService {
     return carriesKnownSecret({ url: text }, "", this.opts.secrets ?? {});
   }
 
+  /**
+   * One worker job, every request approved here (#113, review #127 round 2). The worker never sends a request the
+   * server has not seen in its exact wire form (worker.mjs `wireRequest`: the parsed URL, the request target, every
+   * header — the cookies of the jar and captured values included): it stops before each send (`pause`, reason
+   * `send`) and at each redirect (reason `redirect`, the target), and hands back the request with the session so
+   * far. The server checks it — an https URL of the tool's hosts, and the egress predicate on its URL texts and
+   * header values with the allowed places exact per occurrence (`carriesKnownSecret`) — and resumes the steps from
+   * there as a new job carrying that request as `approved`; the worker sends it only if it builds the same one.
+   * At most `RAW_JOB_LIMITS.maxRedirects` redirects per step.
+   */
+  private async runJob(
+    tool: FinanceToolInfo,
+    first: RawStep[],
+    proxy: { url: string; port: number },
+    secrets: Readonly<Record<string, string>>,
+    deadline: number,
+  ): Promise<{ ok: true; responses: RawResponse[] } | { ok: false; code: FinanceCode }> {
+    const now = this.opts.now ?? Date.now;
+    const responses: RawResponse[] = [];
+    let steps = first;
+    let resume: RawResume | undefined;
+    let hops = 0;
+    // Each round sends at most one request: one per step and per redirect, and one to start.
+    const maxRounds = first.length * (RAW_JOB_LIMITS.maxRedirects + 1) + 1;
+    for (let round = 0; round < maxRounds; round++) {
+      const left = deadline - now();
+      if (left <= 0) return { ok: false, code: "finance_timeout" };
+      const r = await this.worker(
+        {
+          op: "raw",
+          steps,
+          redirect: "manual",
+          approve: true,
+          timeoutMs: left,
+          ...(resume ? { resume } : {}),
+        },
+        proxy,
+      );
+      if (!r.ok) return { ok: false, code: FROM_WEB[r.code] ?? "finance_failed" };
+      if (Array.isArray(r.responses)) responses.push(...(r.responses as unknown[]).filter(isResponse));
+      if (r.pause === undefined) return { ok: true, responses };
+      const pause = readPause(r.pause, steps.length);
+      if (!pause) return { ok: false, code: "finance_failed" };
+      // The approved request was not the one the worker built: never approve it again in a loop.
+      if (pause.reason === "send" && resume && pause.step === 0) return { ok: false, code: "finance_failed" };
+      hops = pause.reason === "redirect" ? hops + 1 : 0;
+      if (hops > RAW_JOB_LIMITS.maxRedirects) return { ok: false, code: "finance_blocked" };
+      const req = pause.request;
+      if (!allowed(req.url, tool.hosts)) return { ok: false, code: "finance_blocked" };
+      if (carriesKnownSecret({ url: req.url, headers: req.headers }, tool.name, secrets))
+        return { ok: false, code: "finance_bad_input" };
+      steps = [{ ...steps[pause.step]!, url: pause.url }, ...steps.slice(pause.step + 1)];
+      resume = { jar: pause.jar, vars: pause.vars, seen: pause.seen, literal: true, approved: req };
+    }
+    return { ok: false, code: "finance_failed" };
+  }
+
   /** Runs one validated call. Never throws: a fixed `finance_*` code on failure. */
   async run(tool: FinanceToolInfo, input: Record<string, unknown>): Promise<SkillResult> {
     const impl = TOOL_IMPLS[tool.name];
     if (!impl) return { ok: false, code: "finance_not_allowed" };
     const secrets = this.opts.secrets ?? {};
     const ctx = { now: (this.opts.now ?? Date.now)(), secrets };
+    const deadline = ctx.now + FINANCE_CALL_MS;
     // Every configured secret, however short (SEC_USER_AGENT may be 5 characters).
     const secretValues = Object.values(secrets).filter((v) => v.length >= 1);
     let plan: Plan = impl.plan(input, ctx);
@@ -130,9 +203,9 @@ export class FinanceService {
         if (!jobs) return { ok: false, code: "finance_bad_input" };
         const responses: RawResponse[] = [];
         for (const steps of jobs) {
-          const r = await this.worker({ op: "raw", steps }, proxy);
-          if (!r.ok) return { ok: false, code: FROM_WEB[r.code] ?? "finance_failed" };
-          if (Array.isArray(r.responses)) responses.push(...(r.responses as unknown[]).filter(isResponse));
+          const r = await this.runJob(tool, steps, proxy, secrets, deadline);
+          if (!r.ok) return r;
+          responses.push(...r.responses);
         }
         rounds.push(responses);
         const parsed = impl.parse(rounds, input, ctx);
@@ -155,8 +228,38 @@ export class FinanceService {
   }
 }
 
-/** Characters of a configured secret that count as a leak of it anywhere it is not allowed. */
-export const CONFIG_WINDOW = 16;
+/** A worker's `pause` (a raw job stopped at a redirect), or undefined when it has none or it is malformed. */
+function readPause(x: unknown, steps: number): RawPause | undefined {
+  const p = x as RawPause | null | undefined;
+  if (!p || typeof p !== "object") return undefined;
+  const pair = (a: unknown) =>
+    Array.isArray(a) && a.length === 2 && typeof a[0] === "string" && typeof a[1] === "string";
+  if (
+    !Number.isInteger(p.step) ||
+    p.step < 0 ||
+    p.step >= steps ||
+    typeof p.url !== "string" ||
+    (p.reason !== "send" && p.reason !== "redirect") ||
+    !p.request ||
+    typeof p.request !== "object" ||
+    typeof p.request.url !== "string" ||
+    typeof p.request.target !== "string" ||
+    !p.request.headers ||
+    typeof p.request.headers !== "object" ||
+    !Object.values(p.request.headers).every((v) => typeof v === "string") ||
+    !Array.isArray(p.jar) ||
+    !p.jar.every(pair) ||
+    !Array.isArray(p.vars) ||
+    !p.vars.every(pair) ||
+    !Array.isArray(p.seen) ||
+    !p.seen.every((v) => typeof v === "string")
+  )
+    return undefined;
+  return p;
+}
+
+/** Characters of a configured secret that count as a leak of it anywhere it is not allowed (the shared bound). */
+export const CONFIG_WINDOW = EGRESS_WINDOW;
 
 /**
  * Whether a step carries a known secret — or one of the configured finance secrets — anywhere it may not (review #111
@@ -174,23 +277,18 @@ export function carriesKnownSecret(
   const dartKey = config[DART_KEY];
   const ua = config[SEC_UA];
   let host = "";
-  let url = step.url;
   try {
-    const u = new URL(step.url);
-    host = u.hostname;
-    if (
-      tool === "dart_disclosures" &&
-      dartKey &&
-      (DART_HOSTS as readonly string[]).includes(host) &&
-      u.searchParams.get("crtfc_key") === dartKey
-    ) {
-      u.searchParams.delete("crtfc_key");
-      url = u.toString();
-    }
+    host = new URL(step.url).hostname;
   } catch {
     // not a URL: checked as it is (and refused by the worker)
   }
-  const texts = [url];
+  // The allowed place is one occurrence (review #127 round 2): the first `crtfc_key=<the key>` pair only — another
+  // `crtfc_key`, or the key a second time, stays in the text and is checked.
+  const url =
+    tool === "dart_disclosures" && dartKey && (DART_HOSTS as readonly string[]).includes(host)
+      ? withoutParam(step.url, "crtfc_key", dartKey)
+      : step.url;
+  const texts = urlTexts(url);
   for (const [name, value] of Object.entries(step.headers ?? {})) {
     const allowed =
       tool.startsWith("sec_") &&
@@ -200,67 +298,12 @@ export function carriesKnownSecret(
       (SEC_HOSTS as readonly string[]).includes(host);
     if (!allowed) texts.push(value);
   }
-  const values = Object.values(config).filter((v) => v.length > 0);
-  const cfg = new KnownSecrets();
-  for (const v of values) cfg.add(v, { fresh: true });
-  // A configured secret is also refused in part: any window of `CONFIG_WINDOW` characters of it (all of it when
-  // shorter), raw or URL-encoded — the shared matcher finds a cut-off value only at the end of a text.
-  const windows = values.flatMap((v) => {
-    const w = Math.min(CONFIG_WINDOW, v.length);
-    return Array.from({ length: v.length - w + 1 }, (_, i) => v.slice(i, i + w));
-  });
-  // Full matches: the shared matcher (raw and its encodings). Parts of a configured secret: its windows in the raw
-  // text and in every decoded view of it (review #111 round 5 — two base64 halves of a key each carry a window).
-  return texts.some(
-    (t) =>
-      scrubKnown(t) !== t ||
-      scrubKnown(t, { registry: cfg }) !== t ||
-      (windows.length > 0 && decodedViews(t).some((v) => windows.some((w) => v.includes(w)))),
-  );
+  // The one egress predicate (secrets/egress.ts): whole known or configured secrets in any encoding the shared
+  // matcher knows, and any EGRESS_WINDOW-character window of one, raw or decoded once (review #111 rounds 5–6, #113).
+  return carriesSecret(texts, { config: Object.values(config) });
 }
 
-const percentDecode = (t: string): string | undefined => {
-  if (!t.includes("%")) return undefined;
-  try {
-    return decodeURIComponent(t.replace(/\+/g, " "));
-  } catch {
-    return undefined;
-  }
-};
-
-/** A token's single decodes: base64, base64url and hex, each read as UTF-8 and as Latin-1 text. */
-function tokenDecodes(token: string): string[] {
-  const out: string[] = [];
-  const bytes = (b: Buffer) => {
-    if (b.length) out.push(b.toString("utf8"), b.toString("latin1"));
-  };
-  if (token.length >= 8 && /^[0-9a-fA-F]+$/.test(token) && token.length % 2 === 0)
-    bytes(Buffer.from(token, "hex"));
-  if (token.length >= 8 && /^[A-Za-z0-9+/]+={0,2}$/.test(token)) bytes(Buffer.from(token, "base64"));
-  if (token.length >= 8 && /^[A-Za-z0-9_-]+={0,2}$/.test(token)) bytes(Buffer.from(token, "base64url"));
-  return out;
-}
-
-/**
- * What a text can say once decoded (the common-encodings bound of the shared matcher): the text itself, its
- * percent-decoded form (one transport-escape layer), and every base64 / base64url / hex / percent token in either
- * of those decoded once more. A configured secret's windows are looked for in all of them.
- */
-export function decodedViews(text: string): string[] {
-  const layers = [text, percentDecode(text)].filter((x): x is string => x !== undefined);
-  const views = [...layers];
-  for (const layer of layers) {
-    // base64 / base64url / hex tokens (with their padding), and runs with percent escapes.
-    for (const [token] of layer.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) views.push(...tokenDecodes(token));
-    for (const [token] of layer.matchAll(/(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9+/_=.-]){8,}/g)) {
-      const pd = percentDecode(token);
-      if (pd === undefined) continue;
-      views.push(pd);
-      for (const [inner] of pd.matchAll(/[A-Za-z0-9+/_-]{8,}={0,2}/g)) views.push(...tokenDecodes(inner));
-    }
-  }
-  return views;
-}
+export { decodedViews };
 
 /** The steps as worker jobs within its step limit; undefined when a plan with session steps does not fit one. */
 export function splitJobs(steps: readonly RawStep[]): RawStep[][] | undefined {

@@ -188,6 +188,7 @@ export const WEB_CODES = set([
   "web_failed",
   "web_busy",
   "web_not_allowed",
+  "web_secret_blocked",
 ]);
 
 /** Outcomes of `cite` and `sources_list` (#25): a citation status or why nothing was registered. */
