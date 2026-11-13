@@ -947,17 +947,18 @@ describe(
     it("contenders racing in a loop never hold it together", async () => {
       const dir = path.join(tmp(), "data");
       const sentinel = path.join(path.dirname(dir), "inside");
-      const racers = [0, 1, 2].map(() => spawnTs(CHILD, ["race", dir, sentinel, "150"]));
+      const go = path.join(path.dirname(dir), "go");
+      const racers = [0, 1, 2].map(() => spawnTs(CHILD, ["race", dir, sentinel, "40", go]));
+      await Promise.all(racers.map((r) => r.waitFor("ready")));
+      fs.writeFileSync(go, "");
       const results = await Promise.all(racers.map(async (r) => (await r.exited, r.out().trim())));
       for (const r of racers) expect(r.err()).toBe("");
       const counts = results.map((o) => {
         expect(o).not.toContain("OVERLAP");
         return Number(/acquired=(\d+)/.exec(o)![1]);
       });
-      // The loop really contended: at least two racers got it (all three is not guaranteed on a loaded CI runner,
-      // where one process can be starved for the whole window — fairness is not what this test is about; the
-      // never-together check above is).
-      expect(counts.filter((n) => n > 0).length).toBeGreaterThanOrEqual(2);
+      // The loop really contended: with a common start and success-counted rounds, every racer got it sometimes.
+      expect(counts.every((n) => n > 0)).toBe(true);
     });
 
     it("a symlinked DATA_DIR shares the real folder's lock and journal", async () => {
