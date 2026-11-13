@@ -707,8 +707,10 @@ sub ace_lines {
   my ($magic) = unpack("L", $raw);
   return ("bad ACL record at $p") unless $magic == 0x012cc16d;
   my ($n) = unpack("L", substr($raw, 36, 4));
-  return ("", []) if $n == 0xffffffff;          # KAUTH_FILESEC_NOACL
-  return ("bad ACL record at $p") unless $n <= 128 && length($raw) >= 44 + 24 * $n;
+  if ($n == 0xffffffff) {                       # KAUTH_FILESEC_NOACL: the header only
+    return length($raw) == 44 ? ("", []) : ("bad ACL record at $p");
+  }
+  return ("bad ACL record at $p") unless $n <= 128 && length($raw) == 44 + 24 * $n;
   my @out;
   for my $i (0 .. $n - 1) {
     my $e = substr($raw, 44 + 24 * $i, 24);
@@ -733,40 +735,54 @@ sub ace_lines {
   return ("", \@out);
 }
 
-# May the account do $perm (an ACL permission name) on a node of mode/uid/gid with these ACL lines (node_aces)? The
-# first ACL entry that names $perm and applies to the account decides — entries marked only_inherit apply to
-# children only and are skipped; an entry whose principal cannot be resolved is a failure — then the POSIX bit
-# ($bit: 4 = r, 2 = w, 1 = x) of the class the account falls in (owner, else group, else other). $bit 0: a right
-# the kernel grants unless an ACL entry denies it (readsecurity). "" or why not.
+# May the account make this request — $perms: the ACL permission names the kernel asks for TOGETHER in one call
+# (comma-separated; lstat asks readattr,readsecurity) — on a node of mode/uid/gid with these ACL lines (node_aces)?
+# As XNU's kauth_acl_evaluate: entries in order, only_inherit ones skipped (they apply to children only); an
+# applicable allow removes the rights it names from those still needed (none left: allowed); an applicable deny that
+# names ANY requested right denies the whole request — even a right an earlier allow already granted; an entry that
+# would count but whose principal cannot be resolved is a failure. What no entry granted falls to POSIX — the bit of
+# the one class the account is in (owner, else group, else other): r for read/list, w for write/add_file/
+# add_subdirectory/append, x for execute/search; readattr/readextattr/readsecurity have no POSIX bit and are granted
+# unless denied. "" or why not.
 sub account_eval {
-  my ($acct, $p, $perm, $bit, $mode, $uid, $gid, @acl) = @_;
+  my ($acct, $p, $perms, $mode, $uid, $gid, @acl) = @_;
+  my %bit = (read => 4, list => 4, write => 2, add_file => 2, add_subdirectory => 2, append => 2, execute => 1,
+    search => 1, readattr => 0, readextattr => 0, readsecurity => 0);
+  my @want = split /,/, $perms;
+  for my $w (@want) { return "unknown request $w at $p" unless exists $bit{$w}; }
+  my %need = map { $_ => 1 } @want;
   for my $l (@acl) {
     $l =~ /$ACE/ or return "unparsed ACL line at $p";
-    my ($who, $kind, $perms) = ($2, $3, $4);
-    my %ps = map { $_ => 1 } split /,/, $perms;
-    next if $ps{only_inherit} || !$ps{$perm};
+    my ($who, $kind, $names) = ($2, $3, $4);
+    my %ps = map { $_ => 1 } split /,/, $names;
+    next if $ps{only_inherit};
+    my @hit = grep { $ps{$_} && ($kind eq "deny" || $need{$_}) } @want;
+    next unless @hit;
     my $mine = principal_mine($acct, $who);
     return "cannot resolve ACL principal $who at $p" unless defined $mine;
     next unless $mine;
-    return $kind eq "allow" ? "" : "ACL denies $perm to the account at $p";
+    return "ACL denies " . join(",", @hit) . " to the account at $p" if $kind eq "deny";
+    delete @need{@hit};
+    return "" unless %need;
   }
-  return "" unless $bit;
+  my @posix = grep { $need{$_} && $bit{$_} } @want;
+  return "" unless @posix;
   my ($ou, $og) = (u32($uid), u32($gid));
   return "bad owner ids at $p" unless defined $ou && defined $og;
   my $cls = $ou == $acct->{uid} ? 6 : $acct->{gids}{$og} ? 3 : 0;
-  return "" if ($mode >> $cls) & $bit;
-  return "the account cannot $perm $p";
+  for my $w (@posix) { return "the account cannot $w $p" unless ($mode >> $cls) & $bit{$w}; }
+  return "";
 }
 
 # account_eval on a path, reading its mode and ACL now. Symlinks are refused (every checked path is canonical).
 sub account_may {
-  my ($acct, $p, $perm, $bit) = @_;
+  my ($acct, $p, $perms) = @_;
   my @st = lstat($p);
   return "cannot stat: $p" unless @st;
   return "symlink on a checked path: $p" if -l _;
   my ($e, $acl) = node_aces($p);
   return $e if length $e;
-  return account_eval($acct, $p, $perm, $bit, $st[2], $st[4], $st[5], @$acl);
+  return account_eval($acct, $p, $perms, $st[2], $st[4], $st[5], @$acl);
 }
 
 # Every ancestor of $p (not $p itself) must be searchable by the account.
@@ -776,25 +792,26 @@ sub account_traverse {
     $p =~ s{/[^/]*\z}{};
     $p = "/" if $p eq "";
     next if $done->{$p}++;
-    my $e = account_may($acct, $p, "search", 1);
+    my $e = account_may($acct, $p, "search");
     return $e if length $e;
   }
   return "";
 }
 
-# The trust checks the launcher runs AS the account read the ACL (`ls -led`) of each of these paths and of every
-# ancestor: each must be searchable (ancestors) and its ACL readable (readsecurity — granted unless an ACL entry
-# denies it; a denial makes `ls` fail and the launcher refuse) by the account (#125).
+# The launcher, AS the account, lstats and reads the ACL (`ls -led`) of each of these paths and of every ancestor
+# (and lstats the scratch root): each ancestor must be searchable, and every node must grant the account lstat's
+# request — readattr and readsecurity together, in one evaluation (a denial makes lstat and `ls` fail with EACCES
+# and the launcher refuse) (#125).
 sub account_chains_err {
   my ($acct, @paths) = @_;
-  my (%done, %rs);
+  my (%done, %meta);
   for my $p (@paths) {
     my $e = account_traverse($acct, $p, \%done);
     return $e if length $e;
     my $q = $p;
     while (1) {
-      unless ($rs{$q}++) {
-        $e = account_may($acct, $q, "readsecurity", 0);
+      unless ($meta{$q}++) {
+        $e = account_may($acct, $q, "readattr,readsecurity");
         return $e if length $e;
       }
       last if $q eq "/";
@@ -806,12 +823,12 @@ sub account_chains_err {
 }
 
 # A trusted tree as the account: the root searchable and listable, then every node tree_err saw (its ACL read now,
-# with every flag): a directory searchable, listable and its ACL readable, a file readable and its ACL readable, a
-# link's ACL readable (`ls -leRA` reads it).
+# with every flag): lstat's request (readattr,readsecurity — `ls -leRA` also reads each ACL, links included), then a
+# directory searchable and listable, a file readable — each request evaluated on its own, as the kernel gets them.
 sub account_tree_err {
   my ($acct, $root) = @_;
-  for my $x ([$root, "search", 1], [$root, "list", 4]) {
-    my $e = account_may($acct, @$x);
+  for my $q ("search", "list") {
+    my $e = account_may($acct, $root, $q);
     return $e if length $e;
   }
   my $scan = $TREE_SCAN{$root} or return "tree not scanned: $root";
@@ -820,9 +837,9 @@ sub account_tree_err {
     my ($e, $acl) = node_aces($c);
     return $e if length $e;
     my $link = ($mode & 0o170000) == 0o120000;
-    my @need = $link ? () : POSIX::S_ISDIR($mode) ? (["search", 1], ["list", 4]) : (["read", 4]);
-    for my $q (@need, ["readsecurity", 0]) {
-      $e = account_eval($acct, $c, $q->[0], $q->[1], $mode, $uid, $gid, @$acl);
+    my @need = $link ? () : POSIX::S_ISDIR($mode) ? ("search", "list") : ("read");
+    for my $q ("readattr,readsecurity", @need) {
+      $e = account_eval($acct, $c, $q, $mode, $uid, $gid, @$acl);
       return $e if length $e;
     }
   }
@@ -830,14 +847,14 @@ sub account_tree_err {
 }
 
 # What the launcher, running AS the account, opens: the chains of the launcher, config, runner and both trees
-# (search, and readsecurity for its own `ls -led`), the launcher (read + execute), config and runner (read), the
-# interpreter (read + execute), and every node of both trees (account_tree_err).
+# (search, and lstat's readattr,readsecurity for its own `ls -led`), the launcher (read + execute), config and
+# runner (read), the interpreter (read + execute), and every node of both trees (account_tree_err).
 sub account_program_err {
   my ($acct, $cfg, $self) = @_;
   my $e = account_chains_err($acct, $self, CONF_PATH, $cfg->{runner}, $cfg->{interpreter}, $cfg->{packages});
   return $e if length $e;
-  for my $x ([$self, "read", 4], [$self, "execute", 1], [CONF_PATH, "read", 4], [$cfg->{runner}, "read", 4],
-             [$cfg->{py}, "read", 4], [$cfg->{py}, "execute", 1]) {
+  for my $x ([$self, "read"], [$self, "execute"], [CONF_PATH, "read"], [$cfg->{runner}, "read"],
+             [$cfg->{py}, "read"], [$cfg->{py}, "execute"]) {
     $e = account_may($acct, @$x);
     return $e if length $e;
   }
@@ -867,11 +884,11 @@ sub op_verify {
       my $pe = account_program_err($acct, $cfg, $self);
       if (length $pe) { $bad = 1; print "check account program access fail $pe\n"; }
       else { print "check account program access ok\n"; }
-      my $te = account_traverse($acct, $cfg->{scratch}, {});
-      $te = account_may($acct, $cfg->{scratch}, "search", 1) unless length $te;
+      my $te = account_chains_err($acct, $cfg->{scratch});    # search to it, lstat of it and its ancestors
+      $te = account_may($acct, $cfg->{scratch}, "search") unless length $te;
       if (length $te) { $bad = 1; print "check scratch traversal fail $te\n"; }
       else { print "check scratch traversal ok\n"; }
-      my $we = account_may($acct, $cfg->{scratch}, "add_subdirectory", 2);
+      my $we = account_may($acct, $cfg->{scratch}, "add_subdirectory");
       if (length $we) { $bad = 1; print "check scratch write fail $we\n"; }
       else { print "check scratch write ok\n"; }
     }
