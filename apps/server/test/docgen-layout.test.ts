@@ -15,7 +15,18 @@ import {
 } from "../src/docgen/runner.js";
 import { WORKER_CODES } from "../src/docgen/service.js";
 import { DOC_FIXTURE } from "../src/runtime/fake-docs.js";
-import { jpegOfSize, png, pngRgba, readPdfItems, readPptx } from "./helpers/doc-parse.js";
+import {
+  decodeJpeg,
+  distinctSamples,
+  jpegOfSize,
+  pdfImages,
+  png,
+  pngRgba,
+  readPdfItems,
+  readPptx,
+  withoutSegments,
+  zipFiles,
+} from "./helpers/doc-parse.js";
 import { emOf, graphemesOf, overflows, tableColumns } from "./helpers/pptx-fit.js";
 
 // Documents are made for real (fonts, layout, zip) and re-read: generous under a busy machine.
@@ -563,6 +574,10 @@ describe("size caps (memory of the sandbox): PPTX 500 slides and a volume cap, P
     const r = await runner({ kind: "pdf", doc, images });
     expect(r.ok, JSON.stringify(r.ok ? {} : r)).toBe(true);
     if (r.ok) expect(r.checks.pages).toBe(3);
+    // The photos are really there: pdf.js decodes each one to its 3200 × 2400 pixels (noise — many distinct values).
+    const shown = r.ok ? await pdfImages(r.data) : [];
+    expect(shown.map((i) => [i.width, i.height])).toEqual([0, 1, 2].map(() => [3200, 2400]));
+    for (const img of shown) expect(distinctSamples(img)).toBeGreaterThan(200);
     const { VOLUME } = (await import(path.join(DOC_WORKER_DIR, "common.mjs"))) as {
       VOLUME: { pdf: { image(kb: number, img: { kind: string }): number; max: number } };
     };
@@ -572,6 +587,36 @@ describe("size caps (memory of the sandbox): PPTX 500 slides and a volume cap, P
     expect(VOLUME.pdf.image(kb, { kind: "png" })).toBeGreaterThan(VOLUME.pdf.image(kb, { kind: "jpg" }));
     expect(3 * VOLUME.pdf.image(kb, { kind: "jpg" })).toBeLessThan(VOLUME.pdf.max);
   }, 120_000);
+  it("the JPEG fixture decodes (and a JPEG that only looks right does not): a picture in DOCX, XLSX, PPTX and PDF decodes", async () => {
+    const photo = jpegOfSize(640, 480, 300 * 1024);
+    expect(photo.length).toBe(300 * 1024);
+    const decoded = await decodeJpeg(photo);
+    expect(decoded && [decoded.width, decoded.height]).toEqual([640, 480]);
+    expect(distinctSamples(decoded!)).toBeGreaterThan(200);
+    // The check has teeth: the same file without its quantisation and Huffman tables (what the old fixture was —
+    // markers around bytes no decoder can read) does not decode.
+    expect(await decodeJpeg(withoutSegments(photo, [0xdb, 0xc4]))).toBeUndefined();
+
+    const doc: DocContent = { title: "사진", blocks: [{ type: "image", fileId: "p", caption: "현장 사진" }] };
+    const images = { p: { kind: "jpg" as const, data: photo.toString("base64") } };
+    const media = { docx: /^word\/media\//, xlsx: /^xl\/media\//, pptx: /^ppt\/media\// } as const;
+    for (const kind of ["docx", "xlsx", "pptx"] as const) {
+      const r = await runner({ kind, doc, images });
+      expect(r.ok, `${kind} ${JSON.stringify(r.ok ? {} : r)}`).toBe(true);
+      if (!r.ok) continue;
+      const files = await zipFiles(r.data, media[kind]);
+      expect(files.length, kind).toBe(1);
+      const embedded = files[0]!;
+      expect(embedded.equals(photo), kind).toBe(true);
+      const img = await decodeJpeg(embedded);
+      expect(img && [img.width, img.height], kind).toEqual([640, 480]);
+    }
+    const r = await runner({ kind: "pdf", doc, images });
+    expect(r.ok).toBe(true);
+    const shown = r.ok ? await pdfImages(r.data) : [];
+    expect(shown.map((i) => [i.width, i.height])).toEqual([[640, 480]]);
+    expect(distinctSamples(shown[0]!)).toBeGreaterThan(200);
+  });
   it("the service passes the worker's layout refusal on (doc_too_large, not doc_failed)", async () => {
     // Every code the worker files can give is on the service's list.
     const codes = new Set<string>();
