@@ -229,6 +229,9 @@ function QuietHours() {
     setDraft({ ...value, ...v });
   };
   const invalid = value.on && value.start === value.end;
+  // Not editable before the saved value is here (#103): an edit made on the defaults would be the draft, and the
+  // save would overwrite what was stored (and a tick could land just as the stored "on" arrives, undoing itself).
+  const loading = !prefs.data;
 
   return (
     <form
@@ -240,14 +243,20 @@ function QuietHours() {
     >
       <h3>방해 금지 시간</h3>
       <label className="row">
-        <input type="checkbox" checked={value.on} onChange={(e) => edit({ on: e.target.checked })} /> 사용
+        <input
+          type="checkbox"
+          checked={value.on}
+          disabled={loading}
+          onChange={(e) => edit({ on: e.target.checked })}
+        />{" "}
+        사용
       </label>
       <div className="row wrap">
         <input
           type="time"
           aria-label="방해 금지 시작"
           value={value.start}
-          disabled={!value.on}
+          disabled={loading || !value.on}
           required
           onChange={(e) => edit({ start: e.target.value })}
         />
@@ -256,16 +265,17 @@ function QuietHours() {
           type="time"
           aria-label="방해 금지 끝"
           value={value.end}
-          disabled={!value.on}
+          disabled={loading || !value.on}
           required
           onChange={(e) => edit({ end: e.target.value })}
         />
-        <button type="submit" className="small" disabled={save.isPending || invalid || !prefs.data}>
+        <button type="submit" className="small" disabled={save.isPending || invalid || loading}>
           저장
         </button>
       </div>
       <p className="muted small">이 시간에는 알림함에만 쌓이고, 끝나면 모아서 한 번 보내요.</p>
       {invalid && <p className="error small">시작과 끝을 다르게 정해 주세요.</p>}
+      {prefs.isError && <p className="error small">{errorText(prefs.error)}</p>}
       {save.isError && <p className="error small">{errorText(save.error)}</p>}
       {saved && (
         <p className="small" role="status">
