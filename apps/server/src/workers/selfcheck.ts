@@ -23,7 +23,7 @@ import {
   type WorkerProbeResult,
 } from "./account.js";
 import { docAsAccount } from "./docgen.js";
-import { extractAsAccount } from "./extract.js";
+import { extractAsAccount, type AccountJobHooks } from "./extract.js";
 import { makeWorkerJobDir, removeWorkerJob } from "./run.js";
 
 /**
@@ -191,6 +191,8 @@ export function extractJobCheck(
   dataDir: string,
   ocr: () => OcrCapability,
   tmpDir = os.tmpdir,
+  /** Tests only: the launcher stand-in. */
+  hooks: Pick<AccountJobHooks, "spawn" | "clean"> = {},
 ): WorkerJobCheck {
   return async (worker, onJob, signal) => {
     const src = fs.mkdtempSync(path.join(tmpDir(), "agentlee-worker-check-"));
@@ -206,7 +208,7 @@ export function extractJobCheck(
           dataDir,
           { file: row, path: file, signal: signal ?? new AbortController().signal },
           ocr,
-          { onJob, forceOcrKind },
+          { ...hooks, onJob, forceOcrKind },
         );
         if (!r.ok) return `${forceOcrKind ? "ocr" : "extract"}: ${r.code}`;
         const text = r.segments.map((s) => s.text).join("\n");
@@ -221,13 +223,16 @@ export function extractJobCheck(
 }
 
 /** docgen: a DOCX made from a one-line document; it must be a ZIP that the worker re-opened (its checks). */
-export function docJobCheck(dataDir: string): WorkerJobCheck {
+export function docJobCheck(
+  dataDir: string,
+  hooks: Pick<AccountJobHooks, "spawn" | "clean"> = {},
+): WorkerJobCheck {
   return async (worker, onJob) => {
     const r = await docAsAccount(
       worker,
       dataDir,
       { kind: "docx", doc: { title: "Agent Lee worker self-check", blocks: [] }, images: {} },
-      { onJob },
+      { ...hooks, onJob },
     );
     if (!r.ok) return r.code;
     if (r.data.subarray(0, 2).toString("latin1") !== "PK") return "not a DOCX";

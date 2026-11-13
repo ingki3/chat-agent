@@ -79,8 +79,16 @@ function checkTree(dir: string, root: string): number {
   return n;
 }
 
+/** Copy-on-write clones where the file system has them (APFS), plain copies elsewhere. */
+const CLONE = fs.constants.COPYFILE_FICLONE;
 const copy = (src: string, dest: string) =>
-  fs.cpSync(src, dest, { recursive: true, verbatimSymlinks: true, errorOnExist: true, force: false });
+  fs.cpSync(src, dest, {
+    recursive: true,
+    verbatimSymlinks: true,
+    errorOnExist: true,
+    force: false,
+    mode: CLONE,
+  });
 
 export function bundleWorkers(out: string, o: { browser?: string | undefined } = {}): { nodes: number } {
   const root = path.resolve(out);
@@ -90,7 +98,7 @@ export function bundleWorkers(out: string, o: { browser?: string | undefined } =
   fs.mkdirSync(app, { recursive: true });
 
   // node: the executable alone (official builds link only system libraries).
-  fs.copyFileSync(fs.realpathSync(process.execPath), path.join(root, "node", "bin", "node"));
+  fs.copyFileSync(fs.realpathSync(process.execPath), path.join(root, "node", "bin", "node"), CLONE);
   fs.chmodSync(path.join(root, "node", "bin", "node"), 0o755);
 
   // The worker programs (their .mjs files; nothing else lives there).
@@ -100,7 +108,7 @@ export function bundleWorkers(out: string, o: { browser?: string | undefined } =
   ] as const) {
     fs.mkdirSync(path.join(app, name));
     for (const f of fs.readdirSync(src))
-      if (f.endsWith(".mjs")) fs.copyFileSync(path.join(src, f), path.join(app, name, f));
+      if (f.endsWith(".mjs")) fs.copyFileSync(path.join(src, f), path.join(app, name, f), CLONE);
   }
 
   // Their libraries: the pnpm folders of the packages and everything they depend on, links between them kept.
@@ -118,7 +126,7 @@ export function bundleWorkers(out: string, o: { browser?: string | undefined } =
   // OCR language data (the pinned packages' files, as the server copies them for itself).
   fs.mkdirSync(path.join(app, "ocr"));
   for (const lang of OCR_LANGS)
-    fs.copyFileSync(langFile(lang), path.join(app, "ocr", `${lang}.traineddata.gz`));
+    fs.copyFileSync(langFile(lang), path.join(app, "ocr", `${lang}.traineddata.gz`), CLONE);
 
   const rel = (p: string) => inApp(p.endsWith(path.sep) ? p.slice(0, -1) : p);
   const manifest: WorkerManifest = {
