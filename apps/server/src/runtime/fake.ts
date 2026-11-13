@@ -5,6 +5,7 @@ import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
 import { SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
+import { pythonScenario, type PythonScenario } from "./fake-python.js";
 import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import {
   RuntimeFailure,
@@ -51,6 +52,8 @@ import {
  *   /doc <kind> [<fileId>]   "이 내용을 <kind> 보고서로" (#49): real calls of `doc_create` (the report of
  *                     `fake-docs.ts`, with the picture `fileId` when given) and `artifact_create` (a `document`
  *                     artifact of that file); kind docx|xlsx|pptx|pdf, or hwp for the refusal
+ *   /python <scenario> [<fileId>]   a real call of our `python_run` (#47) with the fixed code of `fake-python.ts`
+ *                     (sum — of the given CSV, writing 합계.csv —, loop, net) and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -386,6 +389,11 @@ export const defaultScript: FakeScript = (input, memory) => {
       ...sc.calls.map((c) => ({ call: c.tool, input: c.input })),
       { text: sc.answer },
     ];
+  }
+  const py = /^\/python\s+(sum|loop|net)(?:\s+(\S+))?$/.exec(t);
+  if (py) {
+    const sc = pythonScenario(py[1] as PythonScenario, py[2]);
+    return [{ text: "계산해 볼게요. " }, { call: "python_run", input: sc.input }, { text: sc.answer }];
   }
   const chart = financeChartSteps(t);
   if (chart) return chart;

@@ -32,6 +32,13 @@ export function storagePaths(dataDir: string) {
      * from one folder. Derived data, outside every backup root.
      */
     ocrLang: path.join(root, "ocr-lang"),
+    /**
+     * `python_run` working folders (#47): `scratch/<user>/<conversation>/<call>`, one per call, removed when the
+     * call ends (and the whole folder at server start). Outside every backup root.
+     */
+    scratch: path.join(root, "scratch"),
+    /** `python_run` packages (#47): `python-packages/<lock hash>/`, made by `pnpm python:install`. Derived data. */
+    pythonPackages: path.join(root, "python-packages"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>

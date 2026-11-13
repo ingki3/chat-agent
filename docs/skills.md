@@ -26,7 +26,7 @@ PRD §7의 스킬을 하나씩 살펴 실제 진입점, 입출력, 의존성, �
 | `docx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `scripts/office/*`) | python-docx, LibreOffice(`soffice`) | 없음 | 없음 |
 | `xlsx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `recalc.py`) | openpyxl, LibreOffice | 없음 | 없음 |
 | `pptx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `scripts/*`) | python-pptx, pptxgenjs, LibreOffice | 없음 | 없음 |
-| `python-scratchpad` | 아니오 | 예정 (대화 작업 폴더 #22 뒤) | `scripts/python_scratchpad.py` | python 표준 라이브러리 | 없음 | 없음(스스로도 막음) |
+| `python-scratchpad` | 아니오 | **서버 도구** #47 (`python_run`) | (스킬 실행 안 함) 우리 `apps/server/scratchpad/runner.py` | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(numpy·pandas, `pnpm python:install`) | 없음 | 없음(샌드박스가 막음) |
 | HWP 추출기(신규) | 아니오 | #23 | 공통 MCP 서버의 파일 도구로 새로 만든다 | — | — | — |
 
 v1 제외(PRD §7): `gmail-skill`, `google-calendar-skill`, `google-contacts-skill`, `google-docs-skill`, `agent-browser`, `computer-use`, `orca-cli`, `implementation-skill`. 정의가 없으므로 설치도, 사용자별 허용도 할 수 없다(`unknown_skill`).
@@ -94,7 +94,11 @@ v1 제외(PRD §7): `gmail-skill`, `google-calendar-skill`, `google-contacts-ski
 - **`summarize` (#50: URL은 대체, 유튜브는 미룸):** 외부 CLI(Homebrew node 앱)이고 자식 프로세스를 쓴다. 샌드박스는 fork를 막으므로 그대로는 못 돌린다.
   - **URL 요약:** 별도 서버 함수를 두지 않는다. 요약은 LLM의 일이고, 대화하는 런타임이 이미 그 LLM이다. `web_fetch`가 본문을 출처로 저장하고 발췌를 주면 런타임이 요약하고, 그 출처로 인용할 수 있다. 두 번째 LLM 키도 필요 없다.
   - **유튜브 요약:** 자막을 가져와야 한다. 공식 Data API는 남의 영상 자막을 내려받지 못하고(소유자 OAuth 필요), 비공식 경로(watch 페이지의 `captionTracks`·innertube)는 자주 바뀌고 동의 페이지·봇 확인이 있다. 믿을 만한 방법을 정할 때까지 미룬다(후속 이슈). 그동안 유튜브 링크는 `web_fetch`로 열어도 자막은 얻지 못한다.
-- **`python-scratchpad`:** 모델이 쓴 코드를 실행한다. 표준 라이브러리만 쓰고 자체 AST 검사도 있어, 샌드박스(fork 금지·네트워크 없음) 안에서는 돌릴 수 있다. 다만 쓰기 가능한 작업 폴더가 대화마다 필요하다. 대화 파일 폴더(#22) 뒤에 붙인다.
+
+## 계산 도구 `python_run` (#47, 스킬이 아님)
+`python-scratchpad`는 스킬 스크립트를 돌리지 않고 우리 MCP 서버의 서버 도구 `python_run {code, files?}`로 만들었다(`skill_` 접두사 없음). 사용자별 허용은 스킬 이름 `python-scratchpad`로 한다(금융 스킬이 아니므로 `"all"`이면 청소년 계정도 쓴다). 정의는 `packages/mcp-tools/src/python.ts`, 실행은 `apps/server/src/python/`, 운영은 `docs/ops.md` §35, 근거는 `docs/decisions/isolation.md` "계산 도구 python_run (#47)".
+- 원래 스킬의 `scripts/python_scratchpad.py`(자체 AST 검사)는 쓰지 않는다. 막는 것은 AST 검사가 아니라 샌드박스다(네트워크·자식 프로세스·작업 폴더 밖 읽기/쓰기 금지, 시간·메모리·디스크 한도).
+- 호출마다 새 작업 폴더(`<DATA_DIR>/scratch/<사용자>/<대화>/<호출>`). 넘긴 대화 파일을 복사해 넣고, 코드가 쓴 `.csv`·`.txt`·`.md`를 대화 파일로 저장한다(답에 연결 — 내려받기 칩). 호출 사이에 남는 것은 없다.
 
 ## 문서형 스킬
 `pdf`·`docx`·`xlsx`·`pptx`는 "이 라이브러리를 이렇게 써라"라는 안내다. 보조 스크립트도 런타임이 셸로 실행하라는 전제다. 우리 런타임에는 셸이 없다(PRD NFR 격리). 그래서 공통 MCP 서버의 파일 도구(서버 함수)로 만든다.

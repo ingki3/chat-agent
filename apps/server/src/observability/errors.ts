@@ -11,6 +11,7 @@ import {
   isRoutePattern,
   isRuntime,
   isFinanceCode,
+  isPythonCode,
   isSkillCode,
   isToolName,
   CODE_CATEGORY,
@@ -70,8 +71,10 @@ export class ErrorLog {
         .values({
           at: this.now(),
           source: e.source,
-          // Skill and finance tool outcomes too (#35: the admin's skill failure list), all fixed codes.
-          code: keep((c) => isErrorCode(c) || isSkillCode(c) || isFinanceCode(c), e.code) ?? "unknown",
+          // Skill, finance and python_run (#47) tool outcomes too (#35: the admin's skill failure list), all fixed codes.
+          code:
+            keep((c) => isErrorCode(c) || isSkillCode(c) || isFinanceCode(c) || isPythonCode(c), e.code) ??
+            "unknown",
           category: keep(isCategory, e.category) ?? "app",
           userId: keep(isId, e.userId),
           conversationId: keep(isId, e.conversationId),

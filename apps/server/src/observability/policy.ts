@@ -4,6 +4,7 @@ import {
   DOC_KINDS,
   DOC_REFUSED_KINDS,
   EXTRACT_CODES,
+  PYTHON_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -214,6 +215,10 @@ export const ARTIFACT_CODES = set([
 export const DOC_CODE_VALUES = set(["doc_ok", ...DOC_CODES]);
 export const isDocCode = member(DOC_CODE_VALUES);
 export const isDocKind = member(set([...DOC_KINDS, ...DOC_REFUSED_KINDS]));
+
+/** Outcome codes of `python_run` (#47, shared `PYTHON_CODES` plus a finished run's `python_ok` / `python_error`). */
+export const PYTHON_CODE_VALUES = set(["python_ok", "python_error", ...PYTHON_CODES]);
+export const isPythonCode = member(PYTHON_CODE_VALUES);
 
 /** Outcome codes of the finance tools (#30, finance/service.ts `FINANCE_CODES` — a test keeps the two equal). */
 export const FINANCE_CODES = set([

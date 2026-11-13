@@ -22,6 +22,9 @@
     "injection-eval": "pnpm --filter @agentlee/server injection-eval",
     "skills:install": "pnpm --filter @agentlee/server skills install",
     "skills:status": "pnpm --filter @agentlee/server skills status",
+    "python:install": "pnpm --filter @agentlee/server skills python-install",
+    "python:setup-check": "pnpm --filter @agentlee/server skills python-setup-check",
+    "python:check": "pnpm --filter @agentlee/server skills python-check",
     "sse-probe": "tsx scripts/sse-probe.ts",
     "uptime": "tsx scripts/uptime.ts",
     "launchd": "bash scripts/install-launchd.sh"

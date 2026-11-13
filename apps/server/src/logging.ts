@@ -33,6 +33,7 @@ import {
   isFinanceCode,
   isDocCode,
   isDocKind,
+  isPythonCode,
   isBackupCode,
   isBackupTrigger,
   isRestoreRecovery,
@@ -79,6 +80,15 @@ export const LOG_EVENTS = [
   "artifact.finished",
   // Document generation (#49): format, fixed outcome code, duration and IDs — never the title, blocks or file name.
   "doc.finished",
+  // python_run (#47): fixed outcome code, duration and IDs — never the code, its output, file ids or names.
+  "python.finished",
+  // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
+  "python.sweep_failed",
+  // python_run account self-check (#47 round 2): the outcome only, no detail.
+  "python.self_check_ok",
+  "python.self_check_failed",
+  // A cleanup step of the self-check (its temp dir, launcher clean or job folder) failed (#121 round 9; no detail).
+  "python.self_check_cleanup_failed",
   // Finance tool calls (#30): tool name, outcome code, duration and IDs — never the symbol, URL or numbers.
   "finance.finished",
   // Citation tool calls (#25): tool name, the citation status or refusal code, duration and IDs — never the
@@ -230,6 +240,8 @@ const FIELDS = new Map<string, Check>([
   /** `doc_create` (#49): the requested format and `doc_ok` or one of the fixed `doc_*` codes. */
   ["docCode", isDocCode],
   ["docKind", isDocKind],
+  /** `python_run` (#47): `python_ok`, `python_error` (the code raised) or one of the fixed `python_*` codes. */
+  ["pythonCode", isPythonCode],
   /** A `cite` call (#25): the citation status or why it registered nothing. */
   ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
@@ -518,6 +530,7 @@ export type LogFields = {
   financeCode?: string;
   docCode?: string;
   docKind?: string;
+  pythonCode?: string;
   citeCode?: string;
   exportFormat?: string;
   exportCode?: string;
