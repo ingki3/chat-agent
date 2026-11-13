@@ -225,6 +225,14 @@ function share(revoked = false) {
   };
 }
 
+/** A live share (#29) of `owner`'s schedule-result conversation (#56) with `shared` — "새 결과 알림 받기" (#52). */
+function scheduleShare(f: Family) {
+  const store = f.app.conversations!;
+  const c = store.create(f.users.owner.id, { title: "아침 브리핑", kind: "schedule" });
+  store.append(c.id, { role: "assistant", parts: [{ type: "text", text: "결과" }] });
+  return shareWithShared(f, c.id).id;
+}
+
 export const APP_MATRIX: MatrixRow[] = [
   // Uploads (#22): the uploader only. The matrix sends a JSON body, so the owner's upload reaches the handler and
   // is refused there (400: not `application/octet-stream`); real uploads are in files.test.ts.
@@ -354,6 +362,22 @@ export const APP_MATRIX: MatrixRow[] = [
   // The stream stays open while the share is on (shares.test.ts follows one to its close); the matrix needs requests
   // that end, so it asks about a revoked share: the owner's stream ends at once, everyone else is refused.
   { route: "GET /api/shares/:id/events", expect: NOT_SHARED(READ), fixture: share(true) },
+  // "이어서 대화하기" (#52): the accounts the share reaches copy their projection into a conversation of their own; the
+  // owner has the original (400). Read access is what it takes — nothing of the shared item is written.
+  {
+    route: "POST /api/shares/:id/fork",
+    expect: { owner: 400, shared: 201, admin: 403, stranger: 403, anon: 401 },
+    fixture: share(),
+    errors: { owner: "share_own_item", admin: "forbidden", stranger: "forbidden" },
+  },
+  // A viewer's own "새 결과 알림 받기" for a shared schedule-result conversation (#52, FR-8.8).
+  {
+    route: "PUT /api/shares/:id/subscription",
+    expect: { owner: 400, shared: 200, admin: 403, stranger: 403, anon: 401 },
+    fixture: scheduleShare,
+    body: { notifyResults: true },
+    errors: { owner: "share_own_item", admin: "forbidden", stranger: "forbidden" },
+  },
 ];
 
 /** A daily schedule of `owner` (#33): the store directly (the matrix app has no runtime to pick defaults from). */

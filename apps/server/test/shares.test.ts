@@ -27,6 +27,9 @@ import { McpTokens } from "../src/isolation/tokens.js";
 import { SourceStore } from "../src/web/sources.js";
 import { CitationStore } from "../src/citations/store.js";
 import { projectEvent, projectPart } from "../src/shares/projection.js";
+import { notifyResultSubscribers } from "../src/shares/notify.js";
+import { remapParts } from "../src/shares/fork.js";
+import { knownSecrets } from "../src/secrets/known.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 type App = Awaited<ReturnType<typeof buildApp>>;
@@ -435,6 +438,14 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
       newResult: false,
       newResultMessageId: null,
     });
+  });
+
+  it("says who owns it: the owner's screens manage it, a shared reader's do not (review #119)", async () => {
+    const w = await snapshotWorld();
+    expect((await w.owner.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({ owned: true });
+    expect((await w.viewer.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({ owned: false });
+    const mine = (await w.owner.get("/api/conversations")).json<{ items: { owned?: boolean }[] }>().items;
+    expect(mine.every((c) => c.owned === true)).toBe(true);
   });
 
   it("a snapshot needs a finished boundary message of the conversation", async () => {
@@ -982,5 +993,399 @@ describe("family sharing — artifact shares (#29, FR-14.4)", () => {
     expect((await w.owner.send("DELETE", `/api/conversations/${c.id}`)).statusCode).toBe(200);
     expect((await s.rest()).ended).toBe(true);
     expect(w.app.sharing!.store.get(share.id)).toBeUndefined();
+  });
+});
+
+// ---- #52: fork ("이어서 대화하기"), read receipts, result notifications --------------------------------------
+
+type Fork = { conversation: { id: string; kind: string; forkedFrom: string | null; settings: unknown } };
+
+describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
+  it("copies exactly the projection into new rows of the forker, and the copy outlives the original", async () => {
+    const w = await snapshotWorld();
+    citeInNotes(w);
+    const { app, viewer, owner, c, db } = w;
+    const s = app.sharing!.store.get(w.share.id)!;
+    const p = app.sharing!.project(s, w.f.users.shared.id)!;
+    const r = await viewer.send("POST", `/api/shares/${w.share.id}/fork`);
+    expect(r.statusCode).toBe(201);
+    const fork = r.json<Fork>().conversation;
+    expect(fork.kind).toBe("fork");
+    expect(fork.forkedFrom).toBe(w.share.id);
+    // On the forker's own start settings — the same a new conversation of theirs gets.
+    const fresh = (await viewer.send("POST", "/api/conversations", {})).json<{ settings: unknown }>();
+    expect(fork.settings).toEqual(fresh.settings);
+    const row = app.conversations!.get(fork.id)!;
+    expect(row.ownerId).toBe(w.f.users.shared.id);
+
+    // Messages: the boundary's turn only, projected (no reasoning, no raw tool output), no connection.
+    const msgs = (await viewer.get(`/api/conversations/${fork.id}/messages`)).json<{ items: Message[] }>()
+      .items;
+    expect(msgs.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(msgs.length).toBe(p.messages.size);
+    const dump = JSON.stringify(
+      db.$client.prepare("select * from messages where conversation_id = ?").all(fork.id),
+    );
+    expect(dump).not.toContain(REASONING);
+    expect(dump).not.toContain(RAW);
+    expect(dump).not.toContain("바나나");
+    expect(dump).toContain("첫 질문 사과");
+    expect(
+      db.$client
+        .prepare("select count(*) as n from messages where conversation_id = ? and connection_id is not null")
+        .get(fork.id),
+    ).toEqual({ n: 0 });
+    // No runtime session, run or summary of the original comes along.
+    for (const t of ["runtime_sessions", "runs", "conversation_summaries"])
+      expect(
+        db.$client.prepare(`select count(*) as n from ${t} where conversation_id = ?`).get(fork.id),
+      ).toEqual({ n: 0 });
+
+    // Files: F1 only, a new row of the forker with its own bytes; the message's chip names the copy.
+    const files = (await viewer.get(`/api/conversations/${fork.id}/files`)).json<{
+      items: { id: string; name: string; messageId: string | null }[];
+    }>().items;
+    expect(files.map((f) => f.name)).toEqual(["첫째.txt"]);
+    const copy = app.files!.get(files[0]!.id)!;
+    expect(copy.id).not.toBe(w.f1);
+    expect(copy.userId).toBe(w.f.users.shared.id);
+    expect(copy.messageId).toBe(msgs[0]!.id);
+    expect(JSON.stringify(msgs[0]!.parts)).toContain(copy.id);
+    expect(JSON.stringify(msgs)).not.toContain(w.f1);
+    expect(fs.realpathSync(app.files!.pathOf(copy))).not.toBe(
+      fs.realpathSync(app.files!.pathOf(app.files!.get(w.f1)!)),
+    );
+    expect((await viewer.get(`/api/files/${copy.id}/content`)).body).toBe("첫째 파일");
+
+    // Artifact: the visible version (v1) only, numbered 1, linked to the copied reply.
+    const arts = (await viewer.get(`/api/conversations/${fork.id}/artifacts`)).json<{
+      items: { id: string; latestVersion: number; messageId: string | null }[];
+    }>().items;
+    expect(arts).toHaveLength(1);
+    expect(arts[0]!.latestVersion).toBe(1);
+    expect(arts[0]!.messageId).toBe(msgs[1]!.id);
+    expect((await viewer.get(`/a/${arts[0]!.id}/v/1/raw`)).body).toContain("v1");
+    // Sources: S1 only, without its page text (a viewer never got that); the note points at the copy.
+    const srcs = (await viewer.get(`/api/conversations/${fork.id}/sources`)).json<{
+      items: { id: string; url: string; characters: number }[];
+    }>().items;
+    expect(srcs.map((x) => x.url)).toEqual(["https://a.example/1"]);
+    expect(srcs[0]!.characters).toBe(0);
+    expect(JSON.stringify(msgs[1]!.parts)).toContain(srcs[0]!.id);
+    expect(JSON.stringify(msgs)).not.toContain(w.s1);
+
+    // Provenance (#54): every copied item names its original.
+    const items = db.$client
+      .prepare(
+        "select i.item_type as t, i.source_id as s, i.copy_id as c from fork_items i join forks f on f.id = i.fork_id where f.conversation_id = ?",
+      )
+      .all(fork.id) as { t: string; s: string; c: string }[];
+    expect(items.filter((i) => i.t === "file")).toEqual([{ t: "file", s: w.f1, c: copy.id }]);
+    expect(items.filter((i) => i.t === "artifact")).toEqual([{ t: "artifact", s: w.a, c: arts[0]!.id }]);
+    expect(
+      items
+        .filter((i) => i.t === "message")
+        .map((i) => i.s)
+        .sort(),
+    ).toEqual([...p.messages].sort());
+    expect(items.filter((i) => i.t === "source").map((i) => i.s)).toEqual([w.s1]);
+
+    // The original goes: the copy stays, bytes and all; the original's owner never sees the copy.
+    expect((await owner.send("DELETE", `/api/conversations/${c.id}`)).statusCode).toBe(200);
+    expect((await viewer.get(`/api/conversations/${fork.id}/messages`)).statusCode).toBe(200);
+    expect((await viewer.get(`/api/files/${copy.id}/content`)).body).toBe("첫째 파일");
+    expect((await viewer.get(`/a/${arts[0]!.id}/v/1/raw`)).statusCode).toBe(200);
+    expect((await owner.get(`/api/conversations/${fork.id}`)).statusCode).toBe(403);
+    // And the forker may continue it: it is theirs.
+    expect(
+      (await viewer.send("PATCH", `/api/conversations/${fork.id}`, { title: "내 사본" })).statusCode,
+    ).toBe(200);
+  });
+
+  it("is refused to the owner, to anyone it does not reach, and once the share is off", async () => {
+    const w = await snapshotWorld();
+    expect((await w.owner.send("POST", `/api/shares/${w.share.id}/fork`)).json()).toEqual({
+      error: "share_own_item",
+    });
+    expect((await w.stranger.send("POST", `/api/shares/${w.share.id}/fork`)).statusCode).toBe(403);
+    expect((await w.owner.send("DELETE", `/api/shares/${w.share.id}`)).statusCode).toBe(200);
+    const before = w.db.$client.prepare("select count(*) as n from conversations").get();
+    expect((await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).statusCode).toBe(403);
+    expect(w.db.$client.prepare("select count(*) as n from conversations").get()).toEqual(before);
+  });
+
+  it("a fork already made is not taken back by a revoke (SHARE_REVOKE_NOTICE)", async () => {
+    const w = await snapshotWorld();
+    const fork = (await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).json<Fork>().conversation;
+    expect((await w.owner.send("DELETE", `/api/shares/${w.share.id}`)).statusCode).toBe(200);
+    expect((await w.viewer.get(`/api/conversations/${fork.id}/messages`)).statusCode).toBe(200);
+  });
+
+  it("keeps a secret registered after the original was stored out of the copy (#78)", async () => {
+    const w = await start();
+    const late = `sk-ant-forklate${crypto.randomUUID().replaceAll("-", "")}`;
+    const c = w.app.conversations!.create(w.f.users.owner.id, { title: `보고서 ${late}` });
+    const t = await w.say(c.id, `질문 ${late}`);
+    const { artifact } = w.app.artifacts!.create(w.artifactScope(c.id, t.run.id), {
+      kind: "markdown",
+      title: `문서 ${late}`,
+      content: `# 본문 ${late}`,
+    });
+    w.cite(c.id, t.run.id, `https://late.example/${late}`, `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`);
+    const share = await w.share(c.id, { target: { audience: "family" }, mode: "live" });
+    knownSecrets.add(late);
+    try {
+      const r = await w.viewer.send("POST", `/api/shares/${share.id}/fork`);
+      expect(r.statusCode).toBe(201);
+      const id = r.json<Fork>().conversation.id;
+      for (const table of ["conversations", "messages", "artifacts", "artifact_versions", "sources"]) {
+        const col =
+          table === "artifact_versions"
+            ? "artifact_id"
+            : table === "conversations"
+              ? "id"
+              : "conversation_id";
+        const where =
+          table === "artifact_versions"
+            ? "artifact_id in (select id from artifacts where conversation_id = ?)"
+            : `${col} = ?`;
+        expect(
+          JSON.stringify(w.db.$client.prepare(`select * from ${table} where ${where}`).all(id)),
+        ).not.toContain(late);
+      }
+      expect(artifact.id).toBeTruthy();
+    } finally {
+      knownSecrets.remove(late);
+    }
+  });
+
+  it("an artifact share forks into a conversation holding the artifact (its document file copied)", async () => {
+    const w = await start();
+    const c = w.app.conversations!.create(w.f.users.owner.id);
+    const t1 = await w.say(c.id, "보고서 만들어 줘");
+    const other = await w.upload(c.id, "다른.txt", "다른 파일");
+    const doc = await w.upload(c.id, "보고서.pdf", "%PDF v1");
+    const scope = w.artifactScope(c.id, t1.run.id);
+    const { artifact } = w.app.artifacts!.create(scope, {
+      kind: "document",
+      title: "보고서",
+      document: { fileId: doc, name: "보고서.pdf", mimeType: "application/pdf" },
+    });
+    const s = await w.owner.send("POST", `/api/artifacts/${artifact.id}/shares`, {
+      target: { audience: "users", userIds: [w.f.users.shared.id] },
+      mode: "live",
+    });
+    const r = await w.viewer.send("POST", `/api/shares/${s.json<Share>().id}/fork`);
+    expect(r.statusCode).toBe(201);
+    const fork = r.json<Fork>().conversation;
+    // Never the conversation's messages: one note with the copied card.
+    const msgs = (await w.viewer.get(`/api/conversations/${fork.id}/messages`)).json<{ items: Message[] }>()
+      .items;
+    expect(msgs).toHaveLength(1);
+    expect(JSON.stringify(msgs)).not.toContain("보고서 만들어 줘");
+    const arts = (await w.viewer.get(`/api/conversations/${fork.id}/artifacts`)).json<{
+      items: { id: string; kind: string }[];
+    }>().items;
+    expect(arts.map((a) => a.kind)).toEqual(["document"]);
+    expect(JSON.stringify(msgs[0]!.parts)).toContain(arts[0]!.id);
+    // The document's own file only, re-pointed at the copy; not the conversation's other file.
+    const files = (await w.viewer.get(`/api/conversations/${fork.id}/files`)).json<{
+      items: { id: string; name: string; messageId: string | null }[];
+    }>().items;
+    expect(files.map((f) => f.name)).toEqual(["보고서.pdf"]);
+    expect(files[0]!.messageId).toBe(msgs[0]!.id); // never an unsent composer file
+    expect(files[0]!.id).not.toBe(doc);
+    const v = w.app.artifacts!.version(arts[0]!.id, 1)!;
+    expect(JSON.parse(v.content)).toMatchObject({ fileId: files[0]!.id });
+    expect(JSON.stringify(files)).not.toContain(other);
+  });
+});
+
+describe("read receipts — 열람 확인 (#52, FR-14.6)", () => {
+  it("the owner sees who opened it and when; the owner's own preview does not count", async () => {
+    const w = await snapshotWorld();
+    const mine = async () => (await w.owner.get(`/api/shares/${w.share.id}`)).json<Share>();
+    expect((await mine()).views).toEqual([]);
+    expect((await w.owner.get(`/api/shares/${w.share.id}/view`)).statusCode).toBe(200);
+    expect((await mine()).views).toEqual([]);
+    const incoming = async () =>
+      (await w.viewer.get("/api/shared-with-me")).json<{ items: { id: string; viewedAt: number | null }[] }>()
+        .items;
+    expect((await incoming())[0]!.viewedAt).toBeNull();
+    const view = SharedView.parse((await w.viewer.get(`/api/shares/${w.share.id}/view`)).json());
+    expect(view.viewer).toBeNull(); // not a schedule result: nothing to choose
+    const seen = (await mine()).views;
+    expect(seen.map((v) => [v.id, v.name])).toEqual([[w.f.users.shared.id, "shared"]]);
+    expect(seen[0]!.firstViewedAt).toBeGreaterThan(0);
+    expect((await incoming())[0]!.viewedAt).toBe(seen[0]!.firstViewedAt);
+    // A stranger's refused look leaves no receipt.
+    expect((await w.stranger.get(`/api/shares/${w.share.id}/view`)).statusCode).toBe(403);
+    expect((await mine()).views).toHaveLength(1);
+    // The viewer never sees receipts (the share itself is the owner's).
+    expect((await w.viewer.get(`/api/shares/${w.share.id}`)).statusCode).toBe(403);
+  });
+});
+
+describe("shared schedule results — 알림 받기 선택 (#52, FR-8.8)", () => {
+  it("a viewer who chose it is told of a new result in their projection, with the shared body", async () => {
+    const w = await start();
+    const c = w.app.conversations!.create(w.f.users.owner.id, { title: "아침 브리핑", kind: "schedule" });
+    w.app.conversations!.append(c.id, { role: "assistant", parts: [{ type: "text", text: "어제 결과" }] });
+    const live = await w.share(c.id, {
+      target: { audience: "users", userIds: [w.f.users.shared.id] },
+      mode: "live",
+    });
+    const normal = w.app.conversations!.create(w.f.users.owner.id);
+    const other = await w.share(normal.id, { target: { audience: "family" }, mode: "live" });
+    const put = (who: typeof w.viewer, id: string, notifyResults: unknown) =>
+      who.send("PUT", `/api/shares/${id}/subscription`, { notifyResults });
+    expect(SharedView.parse((await w.viewer.get(`/api/shares/${live.id}/view`)).json()).viewer).toEqual({
+      notifyResults: false,
+    });
+    expect((await put(w.viewer, other.id, true)).json()).toEqual({ error: "share_not_schedule_result" });
+    expect((await put(w.viewer, live.id, "yes")).statusCode).toBe(400);
+    expect((await put(w.owner, live.id, true)).json()).toEqual({ error: "share_own_item" });
+    expect((await put(w.viewer, live.id, true)).statusCode).toBe(200);
+    expect(SharedView.parse((await w.viewer.get(`/api/shares/${live.id}/view`)).json()).viewer).toEqual({
+      notifyResults: true,
+    });
+
+    const result = w.app.conversations!.append(c.id, {
+      role: "assistant",
+      parts: [{ type: "text", text: "삼성전자 3% 상승 — 비밀 요약" }],
+    });
+    const input = {
+      kind: "schedule_succeeded" as const,
+      scheduleName: "아침 브리핑",
+      summary: "삼성전자 3% 상승 — 비밀 요약",
+      url: `/c/${c.id}`,
+      ref: { kind: "conversation", id: c.id },
+    };
+    notifyResultSubscribers(w.app.sharing!, w.app.notifications, {
+      conversationId: c.id,
+      messageId: result.id,
+      input,
+      dedupeKey: "schedule-run:test-1",
+    });
+    const inbox = async (who: typeof w.viewer) =>
+      (await who.get("/api/notifications"))
+        .json<{ items: { kind: string; body: string; url: string }[] }>()
+        .items.filter((n) => n.kind !== "share_received");
+    const got = await inbox(w.viewer);
+    expect(got).toHaveLength(1);
+    expect(got[0]!.url).toBe(`/shared/${live.id}`);
+    expect(got[0]!.body).not.toContain("삼성전자"); // the result stays off a lock screen that is not the owner's
+    // Not chosen: nothing. Once only per run.
+    expect(await inbox(w.stranger)).toEqual([]);
+    notifyResultSubscribers(w.app.sharing!, w.app.notifications, {
+      conversationId: c.id,
+      messageId: result.id,
+      input,
+      dedupeKey: "schedule-run:test-1",
+    });
+    expect(await inbox(w.viewer)).toHaveLength(1);
+    // The share revoked: no more.
+    expect((await w.owner.send("DELETE", `/api/shares/${live.id}`)).statusCode).toBe(200);
+    notifyResultSubscribers(w.app.sharing!, w.app.notifications, {
+      conversationId: c.id,
+      messageId: result.id,
+      input,
+      dedupeKey: "schedule-run:test-2",
+    });
+    // Nothing new — and the inbox re-checks the share on every read, so the earlier one is gone from it too.
+    expect(await inbox(w.viewer)).toEqual([]);
+  });
+
+  it("a snapshot never tells of a result after its boundary", async () => {
+    const w = await start();
+    const c = w.app.conversations!.create(w.f.users.owner.id, { title: "아침 브리핑", kind: "schedule" });
+    const first = w.app.conversations!.append(c.id, {
+      role: "assistant",
+      parts: [{ type: "text", text: "1" }],
+    });
+    const snap = await w.share(c.id, {
+      target: { audience: "users", userIds: [w.f.users.shared.id] },
+      mode: "snapshot",
+      boundaryMessageId: first.id,
+    });
+    expect(
+      (await w.viewer.send("PUT", `/api/shares/${snap.id}/subscription`, { notifyResults: true })).statusCode,
+    ).toBe(200);
+    const next = w.app.conversations!.append(c.id, {
+      role: "assistant",
+      parts: [{ type: "text", text: "2" }],
+    });
+    notifyResultSubscribers(w.app.sharing!, w.app.notifications, {
+      conversationId: c.id,
+      messageId: next.id,
+      input: { kind: "schedule_failed", scheduleName: "아침 브리핑", reason: "x", url: `/c/${c.id}` },
+      dedupeKey: "schedule-run:snap",
+    });
+    const items = (await w.viewer.get("/api/notifications")).json<{ items: { kind: string }[] }>().items;
+    expect(items.filter((n) => n.kind !== "share_received")).toEqual([]);
+  });
+});
+
+describe("fork — remapParts (#52)", () => {
+  it("moves every id to the copy's and drops what the copy does not have", () => {
+    const ids = {
+      message: new Map<string, string>(),
+      file: new Map([["f1", "F1"]]),
+      artifact: new Map([["a1", { id: "A1", versions: new Map([[3, 1]]) }]]),
+      source: new Map([["s1", "S1"]]),
+    };
+    const out = remapParts(
+      [
+        { type: "text", text: "본문" },
+        { type: "reasoning", text: REASONING },
+        { type: "tool_result", callId: "t", output: { raw: RAW } },
+        { type: "file_ref", fileId: "f1", name: "a.txt" },
+        { type: "file_ref", fileId: "f2" },
+        { type: "artifact_ref", artifactId: "a1", version: 3 },
+        { type: "artifact_ref", artifactId: "a1", version: 2 },
+        { type: "artifact_ref", artifactId: "a9" },
+        { type: "citation_ref", citationId: "c1" },
+        { type: "table", columns: [], rows: [], artifactId: "a9", artifactVersion: 1 },
+        {
+          type: "citation_note",
+          missing: [],
+          markers: [],
+          citations: [
+            {
+              n: 1,
+              status: "verified",
+              sourceId: "s1",
+              title: "t",
+              site: "s",
+              url: "u",
+              publishedAt: null,
+              quote: "q",
+            },
+            {
+              n: 2,
+              status: "verified",
+              sourceId: "s2",
+              title: "t",
+              site: "s",
+              url: "u",
+              publishedAt: null,
+              quote: "q",
+            },
+          ],
+        },
+      ],
+      ids,
+    );
+    const raw = JSON.stringify(out);
+    expect(raw).not.toContain(REASONING);
+    expect(raw).not.toContain(RAW);
+    for (const old of ['"f1"', '"f2"', '"a1"', '"a9"', '"s1"', '"s2"', '"c1"'])
+      expect(raw).not.toContain(old);
+    expect(out).toContainEqual({ type: "file_ref", fileId: "F1", name: "a.txt" });
+    expect(out).toContainEqual({ type: "artifact_ref", artifactId: "A1", version: 1 });
+    expect(out.filter((p) => p.type === "artifact_ref")).toHaveLength(1);
+    expect(out).toContainEqual({ type: "table", columns: [], rows: [] });
+    const note = out.find((p) => p.type === "citation_note")!;
+    expect(note.type === "citation_note" && note.citations.map((c) => c.sourceId)).toEqual(["S1", null]);
   });
 });

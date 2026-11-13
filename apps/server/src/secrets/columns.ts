@@ -326,4 +326,21 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "share_snapshots.item_type": ENUM,
   "share_snapshots.item_id": ID,
   "share_snapshots.digest": HASH,
+  // Read receipts, result-notification choices and fork provenance (#52): ids and closed sets only. The fork's copied
+  // text goes into the ordinary tables (messages, files, artifacts, sources) through their scrubbed writes.
+  "share_views.share_id": ID,
+  "share_views.user_id": ID,
+  "share_subscriptions.share_id": ID,
+  "share_subscriptions.user_id": ID,
+  "forks.id": ID,
+  "forks.user_id": ID,
+  "forks.conversation_id": ID,
+  "forks.share_id": ID,
+  "forks.source_conversation_id": ID,
+  "forks.source_item_kind": ENUM,
+  "forks.source_item_id": ID,
+  "fork_items.fork_id": ID,
+  "fork_items.item_type": ENUM,
+  "fork_items.source_id": ID,
+  "fork_items.copy_id": ID,
 };

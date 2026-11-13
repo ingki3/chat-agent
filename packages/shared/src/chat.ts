@@ -170,6 +170,11 @@ export const Conversation = z.object({
   newResult: z.boolean().optional(),
   /** The message that result is (the page clears "새 결과" only once this message is shown); null: not known. */
   newResultMessageId: z.string().nullable().optional(),
+  /**
+   * The caller owns it (#52): false for a family member reading it through a share — their screens then show no
+   * menu, no share dialog, nothing to manage. Optional for older fixtures; the server always sends it.
+   */
+  owned: z.boolean().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });

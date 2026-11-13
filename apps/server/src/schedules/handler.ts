@@ -95,6 +95,16 @@ export type RuntimeScheduleHandlerDeps = {
   runs: RunManager;
   /** Late-bound: the notification service is made after the engine (app.ts). */
   notifications: () => Publisher | undefined;
+  /**
+   * After the owner's notification: the family members the result conversation is shared with who chose "새 결과
+   * 알림 받기" (#52, FR-8.8) — those whose projection holds the result (shares/notify.ts).
+   */
+  sharedResult?: (r: {
+    conversationId: string;
+    messageId: string;
+    input: PublishInput;
+    dedupeKey: string;
+  }) => void;
   now?: () => number;
   log?: EventLogger;
   /** Tests: a short limit for an attempt's conversation run. */
@@ -349,6 +359,13 @@ export class RuntimeScheduleHandler implements ScheduleHandler {
             ref,
           };
     publisher.publish(ctx.ownerId, input, { dedupeKey: runNotificationKey(ctx.runId) });
+    if (conversationId && message)
+      this.deps.sharedResult?.({
+        conversationId,
+        messageId: message.id,
+        input,
+        dedupeKey: runNotificationKey(ctx.runId),
+      });
   }
 }
 

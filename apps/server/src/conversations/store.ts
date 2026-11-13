@@ -63,8 +63,10 @@ export type AnsweredWith = {
   summarized?: boolean;
 };
 
-export function toConversation(c: ConversationRow): Conversation {
+/** `owned`: whether the caller owns it — every route but the shared read (`GET …/:id`) is the owner's own. */
+export function toConversation(c: ConversationRow, owned = true): Conversation {
   return {
+    owned,
     id: c.id,
     // Known secrets never leave in an API response (review round 23) — also ones registered after this was stored.
     title: scrubKnown(c.title),

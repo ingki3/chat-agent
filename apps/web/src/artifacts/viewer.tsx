@@ -12,6 +12,7 @@ import {
   SHARE_REVOKE_NOTICE,
 } from "@agentlee/shared";
 import { ApiError, artifacts, files } from "../api.js";
+import { ShareButton } from "../shares/ShareDialog.js";
 
 /**
  * The artifact viewer shared by the `/a/:id` page (#27) and the panel next to the chat (#28): the sandboxed frame,
@@ -158,14 +159,23 @@ export type VersionControl = { version: number | undefined; setVersion: (v: numb
  */
 export function useAccessWatch(
   id: string,
-  opts: { shown: boolean; version: number | undefined; lost: boolean; onLost: () => void },
+  opts: {
+    shown: boolean;
+    version: number | undefined;
+    lost: boolean;
+    onLost: () => void;
+    /** The server said the caller owns it (the "가족에게 공유" button shows for the owner only). */
+    onOwner?: () => void;
+  },
 ): void {
   const qc = useQueryClient();
   const shownRef = useRef(opts.shown);
   const onLostRef = useRef(opts.onLost);
+  const onOwnerRef = useRef(opts.onOwner);
   useEffect(() => {
     shownRef.current = opts.shown;
     onLostRef.current = opts.onLost;
+    onOwnerRef.current = opts.onOwner;
   });
   const { lost, version } = opts;
   useEffect(() => {
@@ -181,6 +191,7 @@ export function useAccessWatch(
     es.addEventListener("owner", () => {
       owner = true;
       es.close();
+      onOwnerRef.current?.();
     });
     es.addEventListener("scope", () => {
       es.close();
@@ -228,7 +239,14 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
     },
   });
   const version = data ? (picked ?? data.latestVersion) : undefined;
-  useAccessWatch(id, { shown: loaded, version, lost: revoked, onLost: () => setRevoked(true) });
+  const [owner, setOwner] = useState(false);
+  useAccessWatch(id, {
+    shown: loaded,
+    version,
+    lost: revoked,
+    onLost: () => setRevoked(true),
+    onOwner: () => setOwner(true),
+  });
   const info = data?.versions.find((v) => v.version === version);
   const title = info?.title ?? data?.title ?? "";
   // A chart's PNG is drawn here first; the server renders it only when that fails. Everything else is the server's.
@@ -253,6 +271,8 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
   return {
     // Access lost (#29): nothing of the artifact is shown any more.
     revoked,
+    /** The caller owns it (said by the access stream): sharing is offered (#52). */
+    owner,
     data: revoked ? undefined : data,
     error: query.error,
     version,
@@ -318,6 +338,9 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
               </a>
             )}
           </span>
+        )}
+        {v.owner && (
+          <ShareButton item={{ kind: "artifact", id: data.id, title: data.title }} className="small ghost" />
         )}
         {ARTIFACT_EXPORTS[data.kind].map((format) => (
           <button

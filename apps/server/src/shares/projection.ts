@@ -11,7 +11,12 @@ import {
 import type { UserStore } from "../auth/users.js";
 import type { Db } from "../db/client.js";
 import { toMessage, type ConversationStore, type MessageRow } from "../conversations/store.js";
-import { toArtifact, type ArtifactRow, type ArtifactStore } from "../artifacts/store.js";
+import {
+  toArtifact,
+  type ArtifactRow,
+  type ArtifactStore,
+  type ArtifactVersionRow,
+} from "../artifacts/store.js";
 import { toUploadedFile, type FileRow, type FileStore } from "../files/store.js";
 import { toSource, type SourceStore } from "../web/sources.js";
 import { scrubKnown } from "../secrets/known.js";
@@ -424,7 +429,7 @@ export class SharePolicy {
    * Everything a share shows, as one bundle: the shared view's API answer and the one input for anything that
    * copies a shared item out (fork #52, conversation export, references #26) — none of those may read the stores.
    */
-  bundle(share: ShareRow, p: Projection): Omit<SharedView, "share"> {
+  bundle(share: ShareRow, p: Projection): SharedBundle {
     if (share.itemKind === "artifact") {
       const a = this.artifacts.get(share.itemId);
       const view = a && this.artifact(a, p);
@@ -451,8 +456,25 @@ export class SharePolicy {
     };
   }
 
-  /** Who shared what, when (FR-14.6), for the person it is shared with. */
-  incoming(share: ShareRow): IncomingShare {
+  /**
+   * What a fork (#52) copies: the bundle, and for its artifacts the content of exactly the visible versions, and the
+   * rows of exactly the projection's files (for their bytes). Nothing the bundle does not name.
+   */
+  forkSource(share: ShareRow, p: Projection): ForkSource {
+    const bundle = this.bundle(share, p);
+    const versions = new Map<string, ArtifactVersionRow[]>();
+    for (const a of bundle.artifacts)
+      versions.set(
+        a.id,
+        a.versions.flatMap((n) => this.artifacts.version(a.id, n) ?? []),
+      );
+    const named = new Set(bundle.files.map((f) => f.id));
+    const files = this.files.list(p.conversationId).filter((f) => named.has(f.id) && p.files.has(f.id));
+    return { bundle, versions, files };
+  }
+
+  /** Who shared what, when (FR-14.6), for the person it is shared with (`viewerId`: their first look, if any). */
+  incoming(share: ShareRow, viewerId?: string): IncomingShare {
     const owner = this.users.byId(share.ownerId);
     const artifact = share.itemKind === "artifact" ? this.artifacts.get(share.itemId) : undefined;
     const title =
@@ -467,6 +489,7 @@ export class SharePolicy {
       title: scrubKnown(title),
       ownerName: scrubKnown(owner?.name ?? ""),
       createdAt: share.createdAt,
+      viewedAt: viewerId ? this.store.viewedAt(share.id, viewerId) : null,
     };
   }
 
@@ -482,6 +505,15 @@ export class SharePolicy {
     });
   }
 }
+
+/** One share's contents as served (`GET /api/shares/:id/view` without the caller's own parts). */
+export type SharedBundle = Omit<SharedView, "share" | "viewer" | "own">;
+export type ForkSource = {
+  bundle: SharedBundle;
+  /** Artifact id → its visible versions (scrubbed rows), oldest first. */
+  versions: Map<string, ArtifactVersionRow[]>;
+  files: FileRow[];
+};
 
 declare module "fastify" {
   interface FastifyInstance {
