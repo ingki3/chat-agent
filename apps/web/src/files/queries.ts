@@ -7,23 +7,32 @@ import type { FileLocator, FileViewResponse, ViewSegment } from "@agentlee/share
  * paging queries that start from it (`before` goes back, each window ending where the one after it starts; `after`
  * goes on). A refetch of any of them recomputes its windows from the same start, so the opening window can never
  * be lost among them.
+ *
+ * Every query is keyed by the **visit** (one mount of the viewer, review #123 4차) and, for paging, by the opening
+ * window's extraction: nothing a previous visit asked for — even a request still in flight when it ended — can be
+ * read by this one. Requests are aborted when the viewer goes; nothing is kept (`gcTime: 0`) or trusted as fresh
+ * (`staleTime: 0`): file text is always read with the secrets known now.
  */
 
-export type ViewFetch = (opts: {
-  loc?: FileLocator | undefined;
-  from?: number | undefined;
-  to?: number | undefined;
-}) => Promise<FileViewResponse>;
+export type ViewFetch = (
+  opts: { loc?: FileLocator | undefined; from?: number | undefined; to?: number | undefined },
+  signal?: AbortSignal,
+) => Promise<FileViewResponse>;
 type Window = { from: number; to?: number | undefined };
 
-const baseKey = (fileId: string, loc: FileLocator | undefined) =>
-  ["file-view", fileId, loc ? JSON.stringify(loc) : null] as const;
+let visits = 0;
+/** A new visit id (one per mount of the viewer). */
+export const newVisit = () => ++visits;
 
-export function openingQuery(fileId: string, loc: FileLocator | undefined, fetch: ViewFetch) {
+const baseKey = (visit: number, fileId: string, loc: FileLocator | undefined) =>
+  ["file-view", visit, fileId, loc ? JSON.stringify(loc) : null] as const;
+
+export function openingQuery(visit: number, fileId: string, loc: FileLocator | undefined, fetch: ViewFetch) {
   return queryOptions({
-    queryKey: [...baseKey(fileId, loc), "opening"],
-    queryFn: () => fetch({ loc }),
+    queryKey: [...baseKey(visit, fileId, loc), "opening"],
+    queryFn: ({ signal }) => fetch({ loc }, signal),
     retry: false,
+    staleTime: 0,
     // File text is not kept once the viewer is gone (review #123 3차): a later visit reads it again — scrubbed with
     // the secrets known then — instead of showing a cached copy first.
     gcTime: 0,
@@ -39,6 +48,7 @@ const after = (w: FileViewResponse): Window | undefined => (w.next === null ? un
 
 export function pagingQuery(
   direction: "before" | "after",
+  visit: number,
   fileId: string,
   loc: FileLocator | undefined,
   opening: FileViewResponse | undefined,
@@ -48,12 +58,22 @@ export function pagingQuery(
   const step = direction === "before" ? before : after;
   const start = opening ? step(opening) : undefined;
   return infiniteQueryOptions({
-    queryKey: [...baseKey(fileId, loc), direction, start?.from ?? null, start?.to ?? null],
-    queryFn: ({ pageParam }) => fetch(pageParam),
+    queryKey: [
+      ...baseKey(visit, fileId, loc),
+      direction,
+      // The opening window it starts from: its bytes, its extraction's state and size, where it starts and ends.
+      opening
+        ? `${opening.extract.fileRevision}:${opening.extract.status}:${opening.extract.characters}`
+        : null,
+      start?.from ?? null,
+      start?.to ?? null,
+    ],
+    queryFn: ({ pageParam, signal }) => fetch(pageParam, signal),
     initialPageParam: start ?? { from: 0 },
     getNextPageParam: (last: FileViewResponse) => step(last),
     enabled: enabled && start !== undefined,
     retry: false,
+    staleTime: 0,
     gcTime: 0,
   });
 }

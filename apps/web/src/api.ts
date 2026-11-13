@@ -557,13 +557,16 @@ export const files = {
   view: async (
     id: string,
     opts: { loc?: FileLocator | undefined; from?: number | undefined; to?: number | undefined } = {},
+    signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams();
     if (opts.loc) q.set("loc", JSON.stringify(opts.loc));
     if (opts.from !== undefined) q.set("from", String(opts.from));
     if (opts.to !== undefined) q.set("to", String(opts.to));
     const qs = q.toString();
-    return FileViewResponse.parse(await call("GET", `/api/files/${enc(id)}/view${qs ? `?${qs}` : ""}`));
+    return FileViewResponse.parse(
+      await call("GET", `/api/files/${enc(id)}/view${qs ? `?${qs}` : ""}`, undefined, {}, signal),
+    );
   },
   /** The original: a download (`inline` shows a PNG/JPG in the page instead). */
   url: (id: string, inline = false) => `/api/files/${enc(id)}/content${inline ? "?inline=1" : ""}`,

@@ -22,12 +22,15 @@ import {
   combine,
   hasMore,
   moreAction,
+  newVisit,
   openingQuery,
   pagingQuery,
   shownPages,
   type ViewFetch,
 } from "../src/files/queries.js";
 import { blocks, cellsOf, colName, columns, highlightsOf, linesOf, pieces } from "../src/files/view-model.js";
+
+const VISIT = 1_000_000;
 
 /**
  * The file viewer's screen side (#24): file citations and file chips link to `/c/:id/files/:fileId?loc=`
@@ -261,11 +264,17 @@ describe("review #123", () => {
     };
     const loc: FileLocator = { ...base, kind: "slide", slide: 51 };
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const opening = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const opening = new QueryObserver(client, openingQuery(VISIT, "f1", loc, fetch));
     const stop1 = opening.subscribe(() => {});
     const first = (await opening.refetch()).data!;
-    const before = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
-    const after = new InfiniteQueryObserver(client, pagingQuery("after", "f1", loc, first, fetch, true));
+    const before = new InfiniteQueryObserver(
+      client,
+      pagingQuery("before", VISIT, "f1", loc, first, fetch, true),
+    );
+    const after = new InfiniteQueryObserver(
+      client,
+      pagingQuery("after", VISIT, "f1", loc, first, fetch, true),
+    );
     const stop2 = before.subscribe(() => {});
     const stop3 = after.subscribe(() => {});
     await before.refetch();
@@ -384,10 +393,10 @@ describe("review #123 3차: paging after a visit, and a failed window", () => {
     let version = "old [비밀값]";
     const fetch = server((n) => `${version} ${n}`);
     // First visit: the opening window and one window before it.
-    const o1 = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const o1 = new QueryObserver(client, openingQuery(VISIT, "f1", loc, fetch));
     const u1 = o1.subscribe(() => {});
     const first = (await o1.refetch()).data!;
-    const b1 = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
+    const b1 = new InfiniteQueryObserver(client, pagingQuery("before", VISIT, "f1", loc, first, fetch, true));
     const u2 = b1.subscribe(() => {});
     await b1.refetch();
     expect(b1.getCurrentResult().data!.pages[0]!.items[0]!.text).toBe("old [비밀값] 20");
@@ -398,10 +407,13 @@ describe("review #123 3차: paging after a visit, and a failed window", () => {
     version = "new [숨김]";
     // Second visit, same file and place: nothing of the first visit is kept or shown.
     expect(client.getQueryCache().getAll()).toHaveLength(0);
-    const o2 = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const o2 = new QueryObserver(client, openingQuery(VISIT, "f1", loc, fetch));
     const u3 = o2.subscribe(() => {});
     const again = (await o2.refetch()).data!;
-    const b2 = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, again, fetch, false));
+    const b2 = new InfiniteQueryObserver(
+      client,
+      pagingQuery("before", VISIT, "f1", loc, again, fetch, false),
+    );
     const u4 = b2.subscribe(() => {});
     const shown = combine([...shownPages(false, b2.getCurrentResult()), again]);
     expect(shown.map((x) => x.text).some((t) => t.startsWith("old"))).toBe(false);
@@ -420,10 +432,10 @@ describe("review #123 3차: paging after a visit, and a failed window", () => {
       (n) => `x ${n}`,
       (o) => failing && "to" in o && (o as { to?: number }).to !== undefined,
     );
-    const o = new QueryObserver(client, openingQuery("f1", loc, fetch));
+    const o = new QueryObserver(client, openingQuery(VISIT, "f1", loc, fetch));
     const u1 = o.subscribe(() => {});
     const first = (await o.refetch()).data!;
-    const b = new InfiniteQueryObserver(client, pagingQuery("before", "f1", loc, first, fetch, true));
+    const b = new InfiniteQueryObserver(client, pagingQuery("before", VISIT, "f1", loc, first, fetch, true));
     const u2 = b.subscribe(() => {});
     await b.refetch();
     let r = b.getCurrentResult();
@@ -440,6 +452,84 @@ describe("review #123 3차: paging after a visit, and a failed window", () => {
     expect(hasMore("before", first, true, { ...r, hasNextPage: false, isError: true })).toBe(true);
     u1();
     u2();
+    client.clear();
+  });
+});
+
+describe("review #123 4차: a request still on its way when the viewer is left", () => {
+  it("never reaches the next visit: aborted, keyed by visit, and the first click there makes a new request", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 5_000 } } });
+    let version = "old [비밀값]";
+    const requests: string[] = [];
+    let release: (() => void) | undefined;
+    const aborted: boolean[] = [];
+    const fetch: ViewFetch = async (o, signal) => {
+      requests.push(JSON.stringify(o));
+      const text = version;
+      // The window before is slow: it is still on its way when the viewer is left.
+      if (o.to !== undefined && text.startsWith("old"))
+        await new Promise<void>((r) => {
+          release = r;
+          signal?.addEventListener("abort", () => aborted.push(true));
+        });
+      const start = o.from ?? (o.loc ? 30 : 0);
+      const end = o.to !== undefined ? o.to : Math.min(100, start + 10);
+      return {
+        file,
+        extract: {
+          fileId: "f1",
+          fileRevision: REV,
+          status: "ok",
+          code: null,
+          ocr: "none",
+          units: 100,
+          segments: 100,
+          characters: text.length,
+          truncated: false,
+        },
+        items: Array.from({ length: end - start }, (_, i) =>
+          seg(start + i, { kind: "slide", slide: start + i + 1 }, `${text} ${start + i}`),
+        ),
+        prev: start > 0 ? Math.max(0, start - 10) : null,
+        next: end < 100 ? end : null,
+        target: null,
+      };
+    };
+    const loc: FileLocator = { ...base, kind: "slide", slide: 31 };
+    // Visit 1: open, ask for the window before — it does not answer yet — and leave.
+    const v1 = newVisit();
+    const o1 = new QueryObserver(client, openingQuery(v1, "f1", loc, fetch));
+    const u1 = o1.subscribe(() => {});
+    const first = (await o1.refetch()).data!;
+    const b1 = new InfiniteQueryObserver(client, pagingQuery("before", v1, "f1", loc, first, fetch, true));
+    const u2 = b1.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 5));
+    expect(requests.at(-1)).toBe(JSON.stringify({ from: 20, to: 30 }));
+    u2();
+    u1();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(aborted).toEqual([true]);
+    // The server's text changes; the old answer arrives late anyway.
+    version = "new [숨김]";
+    release!();
+    await new Promise((r) => setTimeout(r, 5));
+    // Visit 2, same file and place: the first click asks the server again; the old pages are never shown.
+    const v2 = newVisit();
+    const o2 = new QueryObserver(client, openingQuery(v2, "f1", loc, fetch));
+    const u3 = o2.subscribe(() => {});
+    const again = (await o2.refetch()).data!;
+    const before = requests.length;
+    const b2 = new InfiniteQueryObserver(client, pagingQuery("before", v2, "f1", loc, again, fetch, true));
+    const u4 = b2.subscribe(() => {});
+    for (let i = 0; i < 50 && !b2.getCurrentResult().data; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(requests.length).toBe(before + 1);
+    const shown = combine([...shownPages(true, b2.getCurrentResult()), again]).map((x) => x.text);
+    expect(shown.length).toBe(20);
+    expect(shown.every((t) => t.startsWith("new"))).toBe(true);
+    // Nothing of visit 1 is in the cache.
+    expect(client.getQueryCache().findAll({ queryKey: ["file-view", v1] })).toHaveLength(0);
+    u3();
+    u4();
     client.clear();
   });
 });

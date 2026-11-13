@@ -32,6 +32,7 @@ import {
   combine,
   hasMore,
   moreAction,
+  newVisit,
   openingQuery,
   pagingQuery,
   shownPages,
@@ -54,14 +55,16 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
   const { search } = useLocation();
   const loc = parseLocParam(new URLSearchParams(search).get("loc"));
   const navigate = useNavigate();
-  const fetch: ViewFetch = (o) => files.view(fileId, o);
+  const fetch: ViewFetch = (o, signal) => files.view(fileId, o, signal);
+  // This visit: no query of an earlier one (a request still on its way included) is ever read here.
+  const [visit] = useState(newVisit);
   // The opening window (and the locator's resolution) is its own query; the text before and after it pages from
   // it, only when asked (review #123 2차: a refetch never loses the opening window).
-  const view = useQuery(openingQuery(fileId, loc, fetch));
+  const view = useQuery(openingQuery(visit, fileId, loc, fetch));
   const [askedBefore, setAskedBefore] = useState(false);
   const [askedAfter, setAskedAfter] = useState(false);
-  const earlier = useInfiniteQuery(pagingQuery("before", fileId, loc, view.data, fetch, askedBefore));
-  const later = useInfiniteQuery(pagingQuery("after", fileId, loc, view.data, fetch, askedAfter));
+  const earlier = useInfiniteQuery(pagingQuery("before", visit, fileId, loc, view.data, fetch, askedBefore));
+  const later = useInfiniteQuery(pagingQuery("after", visit, fileId, loc, view.data, fetch, askedAfter));
   const back = () => {
     // Back where the link was followed from; a link opened on its own goes to the conversation.
     if ((window.history.state as { idx?: number } | null)?.idx) void navigate(-1);
