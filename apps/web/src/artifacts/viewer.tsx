@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ARTIFACT_EXPORTS,
   ARTIFACT_HTML_DOWNLOAD,
+  ARTIFACT_REDACTED_NOTICE,
   artifactDownloadPath,
   artifactExportPath,
   artifactRawPath,
@@ -52,6 +53,7 @@ export const MY_ARTIFACTS_KEY = ["my-artifacts"] as const;
 /** The refusal shown for an artifact that cannot be loaded. */
 export function artifactErrorText(error: unknown): string {
   const status = error instanceof ApiError ? error.status : 0;
+  if (error instanceof ApiError && error.code === "artifact_redacted") return ARTIFACT_REDACTED_NOTICE;
   return status === 403
     ? "이 아티팩트를 볼 권한이 없어요."
     : status === 404
@@ -289,6 +291,8 @@ export function useArtifactViewer(id: string, control?: VersionControl) {
 export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
   if (v.revoked || !data || version === undefined) return null;
+  // A redacted version (#53 review) has nothing to download, export or restore.
+  const redacted = isRedactedVersion(v);
   return (
     <>
       <div className="artifact-bar row">
@@ -304,11 +308,12 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
                 v{x.version}
                 {x.revertedFrom ? ` (v${x.revertedFrom} 복원)` : ""}
                 {x.version === data.latestVersion ? " · 최신" : ""}
+                {x.redacted ? " · 가림" : ""}
               </option>
             ))}
           </select>
         </label>
-        {version !== data.latestVersion && (
+        {version !== data.latestVersion && !redacted && (
           <button
             type="button"
             disabled={v.revert.isPending}
@@ -318,7 +323,7 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
             이 버전으로 되돌리기
           </button>
         )}
-        {data.kind !== "document" && (
+        {data.kind !== "document" && !redacted && (
           <span className="grow-right row">
             <a
               href={artifactDownloadPath(data.id, version)}
@@ -342,7 +347,7 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
         {v.owner && (
           <ShareButton item={{ kind: "artifact", id: data.id, title: data.title }} className="small ghost" />
         )}
-        {ARTIFACT_EXPORTS[data.kind].map((format) => (
+        {(redacted ? [] : ARTIFACT_EXPORTS[data.kind]).map((format) => (
           <button
             key={format}
             type="button"
@@ -403,11 +408,16 @@ const parseJson = (t: string): unknown => {
   }
 };
 
-/** The chosen version: the sandboxed frame, or the document's download. */
+/** Whether the version on screen is redacted (#53 review: its content is never loaded). */
+const isRedactedVersion = (v: Pick<ArtifactViewer, "data" | "version">) =>
+  !!v.data?.versions.find((x) => x.version === v.version)?.redacted;
+
+/** The chosen version: the sandboxed frame, or the document's download — or the notice of a redacted version. */
 export function ArtifactBody({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
   if (v.revoked) return <ArtifactRevoked />;
   if (!data || version === undefined) return null;
+  if (isRedactedVersion(v)) return <ArtifactRedacted />;
   if (data.kind === "document") return <DocumentBody id={data.id} version={version} />;
   return (
     <iframe
@@ -421,6 +431,15 @@ export function ArtifactBody({ v }: { v: ArtifactViewer }) {
       data-testid="artifact-frame"
       data-version={version}
     />
+  );
+}
+
+/** What replaces a redacted version (#53 review): no frame, nothing of it is requested. */
+export function ArtifactRedacted() {
+  return (
+    <div className="empty" role="alert" data-testid="artifact-redacted">
+      <p>{ARTIFACT_REDACTED_NOTICE}</p>
+    </div>
   );
 }
 

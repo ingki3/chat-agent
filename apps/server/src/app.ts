@@ -452,7 +452,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const runtimes = opts.runtimes ?? new RuntimeRegistry();
     // FAKE_RUNTIME=1 (e2e, manual testing): the scripted runtime as "Claude Code", with the service default model
     // (Opus 5.5, D3) next to the fake ones so a user with nothing set starts where a real one would (#19).
-    if (!opts.runtimes && config.fakeRuntime)
+    if (!opts.runtimes && config.fakeRuntime) {
       runtimes.register(
         new FakeRuntime({
           runTools: true,
@@ -473,7 +473,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
           ],
         }),
       );
-    else if (!opts.runtimes) {
+      // FAKE_RUNTIME_CODEX=1 too: the same scripted runtime as "Codex" (#53: a runtime switch end to end).
+      if (config.fakeCodex)
+        runtimes.register(
+          new FakeRuntime({
+            id: "codex",
+            runTools: true,
+            models: [{ id: "fake-codex", label: "Fake Codex", efforts: [] }],
+          }),
+        );
+    } else if (!opts.runtimes) {
       // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
       // addresses) — one per runtime and way of signing in, so each reaches only its own provider's hosts.
       // Both real runtimes are always there; whether a user can run one depends on their connections (#17).
@@ -777,7 +786,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       ...(errors ? { errors } : {}),
       context: config.context,
       // Uploaded files of the conversation for a fresh session's context (#45): the run manager keeps those of the
-      // history's messages (an upload not sent yet, or sent with a message an edit cut, is not). Opening them is #53.
+      // history's messages (an upload not sent yet, or sent with a message an edit cut, is not) — the same files the
+      // file tools serve that run (#53).
       // Files the run made (#49): a download chip under the reply.
       generatedFiles: (conversationId, messageId) =>
         (app.files?.generatedOf(conversationId, messageId) ?? []).map((f) => ({ id: f.id, name: f.name })),
@@ -785,8 +795,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         (app.files?.list(conversationId) ?? []).map((f) => ({
           id: f.id,
           name: f.name,
+          kind: f.kind,
           messageId: f.messageId,
         })),
+      // The conversation's sources for the cited-source references (#53): only ids `cite` knows, with whether their
+      // text is stored.
+      contextSources: (conversationId) => sources.citable(conversationId),
       ...opts.runs,
     });
     const deletion = new ConversationPurge(opts.db!, app.conversations!, {

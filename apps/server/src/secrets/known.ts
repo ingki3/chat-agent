@@ -1089,20 +1089,35 @@ export function scrubKnownDeep<T>(
 }
 
 /**
+ * What a stored artifact version's content becomes when a known secret survives the value-by-value scrub of its
+ * JSON — one that spans keys, delimiters or several values (#53 review): the version is unreadable. Every read path
+ * answers a fixed `artifact_redacted` (409) instead of content; a fork copy keeps this state; the background rescrub
+ * writes it in place of the stored content. NUL characters: never the content of a real version a reader expects.
+ */
+export const REDACTED_CONTENT = "\u0000agentlee:artifact-redacted\u0000";
+export const isRedactedContent = (content: string): boolean => content === REDACTED_CONTENT;
+
+/**
  * An artifact version's content (round 26): canonical JSON (chart, table, document) is scrubbed value by value
- * and stays valid JSON (a numeric secret becomes a string); any other content as text.
+ * and stays valid JSON (a masked number becomes null); any other content as text. When a secret is still in the
+ * serialized result (it spans JSON syntax — #53 review), the content is `REDACTED_CONTENT`: rewriting keys, numbers or
+ * tuples to mask it would break the schema the readers rely on. One matcher pass over each text: linear.
  */
 export function scrubContent(content: string, opts: { registry?: KnownSecrets } = {}): string {
+  if (isRedactedContent(content)) return content;
   const text = scrubKnown(content, opts);
   if (text === content) return content;
   const head = content.trimStart()[0];
-  if (head === "{" || head === "[")
+  if (head === "{" || head === "[") {
+    let json: string | undefined;
     try {
       // A masked number becomes null: charts skip it (the other bars keep their scale), tables show an empty cell.
-      return JSON.stringify(scrubKnownDeep(JSON.parse(content) as unknown, { ...opts, numberMask: null }));
+      json = JSON.stringify(scrubKnownDeep(JSON.parse(content) as unknown, { ...opts, numberMask: null }));
     } catch {
       // not JSON: the text scrub stands
     }
+    if (json !== undefined) return scrubKnown(json, opts) === json ? json : REDACTED_CONTENT;
+  }
   return text;
 }
 

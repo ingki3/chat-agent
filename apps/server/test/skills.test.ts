@@ -529,6 +529,7 @@ describe("per-user skills (FR-1.6, #21)", () => {
       "cite",
       "artifact_create",
       "artifact_update",
+      "artifact_read",
       "schedule_create",
       "doc_create",
       // File tools (#48): everyone's, on their own conversation's uploads.

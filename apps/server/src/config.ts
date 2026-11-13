@@ -40,6 +40,17 @@ const ConfigSchema = z.object({
   /** Registers the scripted FakeRuntime (development and testing only, never with real family data). */
   FAKE_RUNTIME: z.enum(["0", "1"]).default("0"),
   /**
+   * With FAKE_RUNTIME=1: a second scripted runtime as "Codex", so a runtime switch can be tried end to end (#53, the
+   * e2e run). Off unless explicitly "1".
+   */
+  FAKE_RUNTIME_CODEX: z.enum(["0", "1"]).default("0"),
+  /**
+   * The e2e run only (#53 review): the e2e server runs as production (export browser, schedule engine — as the family
+   * server does) with the scripted runtimes. With NODE_ENV=production, FAKE_RUNTIME / FAKE_RUNTIME_CODEX are refused
+   * unless this is exactly "e2e". Never in the family server's `.env`.
+   */
+  FAKE_RUNTIME_IN_PRODUCTION: optional(z.literal("e2e")),
+  /**
    * Tests and development only: run the sandboxed workers (document generation #49, file extraction #48) in the
    * server process, for machines without the macOS sandbox (Linux CI). Refused with NODE_ENV=production — a production
    * server never runs untrusted-input work outside the sandbox and its time and memory limits.
@@ -155,6 +166,8 @@ export type Config = {
   backupDir?: string | undefined;
   diagStream: boolean;
   fakeRuntime: boolean;
+  /** FAKE_RUNTIME_CODEX=1 (with FAKE_RUNTIME=1): the scripted runtime as "Codex" too (#53). */
+  fakeCodex: boolean;
   /** `ISOLATION_IN_PROCESS_FOR_TESTS=1` (never in production — `loadConfig` refuses it). */
   isolationInProcessForTests: boolean;
   tempGateCode?: string | undefined;
@@ -229,6 +242,14 @@ export function loadConfig(
     throw new Error(
       "Invalid configuration — WORKER_RUN_USER must be a different account than PYTHON_RUN_USER",
     );
+  if (
+    c.NODE_ENV === "production" &&
+    (c.FAKE_RUNTIME === "1" || c.FAKE_RUNTIME_CODEX === "1") &&
+    c.FAKE_RUNTIME_IN_PRODUCTION !== "e2e"
+  )
+    throw new Error(
+      "Invalid configuration — FAKE_RUNTIME and FAKE_RUNTIME_CODEX are for development and the e2e run only, never with NODE_ENV=production (the e2e run sets FAKE_RUNTIME_IN_PRODUCTION=e2e)",
+    );
   const dataDir = path.resolve(baseDir, c.DATA_DIR);
   const masterKeyPath = path.resolve(baseDir, c.MASTER_KEY_PATH);
   if (isInside(masterKeyPath, dataDir)) {
@@ -261,6 +282,7 @@ export function loadConfig(
     backupDir,
     diagStream: c.DIAG_STREAM === "1",
     fakeRuntime: c.FAKE_RUNTIME === "1",
+    fakeCodex: c.FAKE_RUNTIME === "1" && c.FAKE_RUNTIME_CODEX === "1",
     isolationInProcessForTests: c.ISOLATION_IN_PROCESS_FOR_TESTS === "1" && c.NODE_ENV !== "production",
     tempGateCode: c.TEMP_GATE_CODE,
     publicHost: c.PUBLIC_HOST,

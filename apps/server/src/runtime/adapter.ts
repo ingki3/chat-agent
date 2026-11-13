@@ -94,14 +94,19 @@ export type StartContext = {
 /**
  * What a fresh session is told about the conversation besides its messages (PRD FR-3.5: "업로드 파일 목록, 이 대화의
  * 아티팩트, 인용 출처"). Titles and names are user, page or model text: they reach the runtime as external content.
- * Whether a file or artifact named here can really be opened by the runtime is #53.
+ * Each id is one the runtime can really use with our tools in this conversation (#53): a file with the file tools, an
+ * artifact with `artifact_read` / `artifact_update`, a source with `cite` (when its text is stored).
  */
 export type ContextReferences = {
-  /** Uploaded files sent with a message (#22's file store). */
-  files: { id: string; name: string }[];
+  /** Uploaded files sent with a message (#22's file store). `kind`: pdf, hwp, docx … (#22). */
+  files: { id: string; name: string; kind: string }[];
   artifacts: { id: string; title: string; kind: string; version: number }[];
-  /** Sources the conversation's answers cited (server-checked citation notes). */
-  sources: { id: string; title: string | null; site: string | null; url: string }[];
+  /**
+   * Sources the conversation's answers cited (server-checked citation notes) that are this conversation's sources.
+   * `text`: the page text is stored, so `cite` can check a passage against it; without it (a fork's copy, #52, or a
+   * search result) the page must be fetched again first.
+   */
+  sources: { id: string; title: string | null; site: string | null; url: string; text: boolean }[];
 };
 
 /** What an adapter's connection resolver is asked: whose run, which connection, and whether it is a test. */

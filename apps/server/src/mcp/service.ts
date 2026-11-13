@@ -30,7 +30,13 @@ import { FinanceService, type FinanceOptions } from "../finance/service.js";
 import { buildFinanceArtifacts, fetchDataset, type ChartInput } from "../finance/chart.js";
 import { finalize } from "../finance/records.js";
 import { watchSymbolOk, type WatchlistStore } from "../watchlist/store.js";
-import { ARTIFACT_CREATE_TOOL, ARTIFACT_TOOLS, ARTIFACT_UPDATE_TOOL } from "@agentlee/mcp-tools/artifacts";
+import {
+  ARTIFACT_CREATE_TOOL,
+  ARTIFACT_READ_CHARS,
+  ARTIFACT_READ_TOOL,
+  ARTIFACT_TOOLS,
+  ARTIFACT_UPDATE_TOOL,
+} from "@agentlee/mcp-tools/artifacts";
 import { SCHEDULE_CREATE_TOOL } from "@agentlee/mcp-tools/schedules";
 import type { ScheduleProposalStore } from "../schedules/proposals.js";
 import { firstRunAfter, ScheduleInputError } from "../schedules/store.js";
@@ -914,8 +920,15 @@ export class McpService {
       const long = parsed.error.issues.some((i) => i.code === "too_big" && i.path[0] === "content");
       return { ok: false, code: long ? "artifact_too_large" : "artifact_bad_input" };
     }
-    const data = parsed.data as ArtifactBody & { kind?: ArtifactKind; title?: string; artifactId?: string };
+    const data = parsed.data as ArtifactBody & {
+      kind?: ArtifactKind;
+      title?: string;
+      artifactId?: string;
+      version?: number;
+      offset?: number;
+    };
     try {
+      if (tool.name === ARTIFACT_READ_TOOL.name) return artifactRead(store, scope, data);
       const { artifact, version } =
         tool.name === ARTIFACT_CREATE_TOOL.name
           ? store.create(scope, { ...data, kind: data.kind!, title: data.title })
@@ -1399,4 +1412,48 @@ export class McpService {
     this.proxies.clear();
     await this.web?.close();
   }
+}
+
+/**
+ * `artifact_read` (#53, FR-3.5): one version of an artifact of the token's own conversation — the store checks that
+ * the token's user owns it — so a runtime that did not write it (after a runtime switch, in a fork) can make the next
+ * version. The stored text is scrubbed as one string before it is cut into pieces (a secret across JSON syntax or a
+ * page end is masked in the whole, so joined pages hold none), title and text go back inside `<external_content>` blocks (artifact content is model
+ * or forked text: data, not instructions). Nothing of it is logged.
+ */
+function artifactRead(
+  store: ArtifactStore,
+  scope: ToolScope,
+  input: { artifactId?: string; version?: number; offset?: number },
+): SkillResult {
+  const { artifact, version } = store.readFor(scope, input.artifactId!, input.version);
+  // The whole stored text through the secrets known now, as one string, before it is cut (#53 review): a secret is
+  // masked wherever it is — across JSON syntax or across the place a page ends.
+  const text = scrubKnown(version.content);
+  const from = Math.min(input.offset ?? 0, text.length);
+  let end = Math.min(text.length, from + ARTIFACT_READ_CHARS);
+  // Never between the two halves of a surrogate pair.
+  if (end < text.length && end > from && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+  // No cut-off-tail rule per page (#53 review round 2): the whole was scrubbed above, so no secret is left anywhere in
+  // it for pages to put back together — and the rule would mask ordinary text that only looks like a secret's start.
+  const page = text.slice(from, end);
+  return {
+    ok: true,
+    output: scrubKnownDeep(
+      {
+        artifactId: artifact.id,
+        kind: artifact.kind,
+        version: version.version,
+        latestVersion: artifact.latestVersion,
+        ...(version.language ? { language: version.language } : {}),
+        url: artifactPath(artifact.id),
+        chars: text.length,
+        offset: from,
+        next: end < text.length ? { offset: end } : null,
+        title: frameExternal({ source: "artifact-title", content: version.title }),
+        content: frameExternal({ source: "artifact", content: page }),
+      },
+      { tail: false },
+    ),
+  };
 }

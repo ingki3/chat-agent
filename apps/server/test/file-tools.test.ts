@@ -1568,7 +1568,15 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
       loadConfig({ ...base, NODE_ENV: "production", ISOLATION_IN_PROCESS_FOR_TESTS: "1", BACKUP_DIR: tmp() }),
     ).toThrow(/ISOLATION_IN_PROCESS_FOR_TESTS/);
     expect(
-      extractorKind(loadConfig({ ...base, NODE_ENV: "production", FAKE_RUNTIME: "1", BACKUP_DIR: tmp() })),
+      extractorKind(
+        loadConfig({
+          ...base,
+          NODE_ENV: "production",
+          FAKE_RUNTIME: "1",
+          FAKE_RUNTIME_IN_PRODUCTION: "e2e",
+          BACKUP_DIR: tmp(),
+        }),
+      ),
     ).toBe("sandbox");
     expect(extractorKind(loadConfig({ ...base, NODE_ENV: "test", FAKE_RUNTIME: "1" }))).toBe("sandbox");
     expect(

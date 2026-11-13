@@ -33,6 +33,10 @@ export default defineConfig({
       BACKUP_DIR,
       // Scripted runtime so streaming can be tested end to end.
       FAKE_RUNTIME: "1",
+      // …also as "Codex", so a runtime switch runs end to end (#53, e2e/runtime-switch.spec.ts).
+      FAKE_RUNTIME_CODEX: "1",
+      // Production mode with the scripted runtimes is refused unless this says it is the e2e run.
+      FAKE_RUNTIME_IN_PRODUCTION: "e2e",
     },
     reuseExistingServer: false,
     timeout: 30_000,

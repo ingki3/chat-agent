@@ -210,6 +210,7 @@ export const ARTIFACT_CODES = set([
   "artifact_not_found",
   "artifact_not_allowed",
   "artifact_limit",
+  "artifact_redacted",
 ]);
 
 /** Outcome codes of `doc_create` (#49, shared `DOC_CODES` plus `doc_ok`) and the formats it may be asked for. */

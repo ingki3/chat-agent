@@ -155,7 +155,14 @@ export const ArtifactVersionInfo = z.object({
   /** Set when this version is a copy of an earlier one (revert). */
   revertedFrom: z.number().int().positive().nullable(),
   createdAt: z.number(),
+  /**
+   * This version's content cannot be read (#53 review): a known secret spans its JSON, so every content path answers
+   * 409 `artifact_redacted`. Absent otherwise.
+   */
+  redacted: z.literal(true).optional(),
 });
+/** What the viewer shows in place of a redacted version (#53 review). */
+export const ARTIFACT_REDACTED_NOTICE = "이 버전은 알려진 비밀이 들어 있어 가렸어요. 내용을 볼 수 없어요.";
 export type ArtifactVersionInfo = z.infer<typeof ArtifactVersionInfo>;
 
 export const ArtifactDetail = Artifact.extend({ versions: z.array(ArtifactVersionInfo) });
