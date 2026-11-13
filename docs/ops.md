@@ -478,7 +478,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 
 ### 15.5 스킬 추가
 1. 원본 스킬을 읽고 `docs/skills.md`에 적는다: 진입점, 입출력, 의존성, 비밀, 호스트.
-   - 표준 라이브러리 python 또는 node여야 한다.
+   - 표준 라이브러리 python 또는 node여야 한다. **네트워크(`hosts`)가 있으면 python이고 요청은 urllib(또는 http.client)**여야 한다 — §42의 부트가 그 `send`에서 요청마다 서버 승인을 받는다. 소켓을 직접 쓰는 스킬은 승인을 지나지 않으므로 받지 않는다. 네트워크 node 스킬은 `skill_unavailable`로 거부된다. 선언한 비밀을 URL에 싣는 스킬은 `secrets`에 `place`(호스트·매개변수)를 적는다.
    - 자식 프로세스가 필요하면 샌드박스를 풀지 말고 서버 함수로 만든다.
 2. `skills.ts`에 `SkillSpec`을 추가하고 `SKILL_SPECS`·`SKILL_CATALOGUE`(상태 `implemented`)에 넣는다.
    - **인자는 입력 필드마다 `--flag=값` 하나로만** 만든다.
@@ -1680,8 +1680,8 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 - **제자리 예외는 한 번만**(리뷰 #127 2차): OpenDART 키는 그 URL의 첫 `crtfc_key=<키>` 한 쌍만 빼고 본다 — 같은 이름의 다른 매개변수, 같은 키의 두 번째 쌍은 남아서 검사된다. SEC 연락처는 `user-agent` 헤더 값이 정확히 그 값일 때만.
 - **헤더 바이트(리뷰 #127 3차):** Node의 헤더 문자열은 글자 하나가 바이트 하나(Latin-1)다. 응답의 `Set-Cookie`에 비ASCII 비밀의 UTF-8 바이트가 오면 그 바이트 그대로 다음 요청에 실린다 — 그래서 0x80–0xFF 글자만 있는 글은 그 바이트를 UTF-8로 읽은 글도 함께 본다(판정기 공통, URL 글·헤더 값 모두).
 - **금융 호출 하나의 시간 한도 `FINANCE_CALL_MS` = 60초**(리뷰 #127 3차): 라운드·작업·승인 멈춤을 모두 합한 시간이다. 작업마다 남은 시간을 받아(`timeoutMs`) 그 작업의 요청들이 나눠 쓰고(요청 하나의 20초 한도는 그대로), 다 쓰면 다음 작업을 시작하지 않고 `finance_timeout`.
-- **`web_search`의 Google News 제공자는 리다이렉트를 따라가지 않는다**(리뷰 #127 3차): 설치된 스크립트는 urllib로 요청하고 urllib는 리다이렉트를 스스로 따라가므로, 서버가 검사한 검색어와 다른 URL(`…/rss/search?q=<비밀>`)이 같은 허용 호스트로 나갈 수 있었다. 제공자로 부를 때는 같은 샌드박스·핀 검사 그대로 `python -I -S -B -c <NO_REDIRECT_BOOT> <스크립트> …`로 실행한다 — `HTTPRedirectHandler.redirect_request`를 바꿔 어떤 opener(기본·스크립트가 만든 것)에서도 리다이렉트가 `HTTPError`가 된다. 스크립트는 그것을 다른 HTTP 오류처럼 실패로 알리고, 검색은 다음 제공자로 넘어간다(`web_search_unavailable`). 스킬 도구로 직접 부를 때는 그대로다(범위 밖, 후속 이슈).
-- **범위 밖(리뷰 #127에서 후속 이슈로):** 키 이름이 비밀처럼 보이지 않는 JSON 자격 증명 필드(`addCredential`의 키 이름 규칙 밖 — #98과 같은 P3), Google News 스킬을 스킬 도구로 직접 부르는 경로.
+- **`web_search`의 Google News 제공자는 리다이렉트를 따라가지 않는다**(리뷰 #127 3차): 설치된 스크립트는 urllib로 요청하고 urllib는 리다이렉트를 스스로 따라가므로, 서버가 검사한 검색어와 다른 URL(`…/rss/search?q=<비밀>`)이 같은 허용 호스트로 나갈 수 있었다. 제공자로 부를 때는 같은 샌드박스·핀 검사 그대로 `python -I -S -B -c <SKILL_NET_BOOT> <스크립트> …`로 실행한다 — `HTTPRedirectHandler.redirect_request`를 바꿔 어떤 opener(기본·스크립트가 만든 것)에서도 리다이렉트가 `HTTPError`가 된다. 스크립트는 그것을 다른 HTTP 오류처럼 실패로 알리고, 검색은 다음 제공자로 넘어간다(`web_search_unavailable`). 스킬 도구로 직접 부를 때도 같다(§42, #129).
+- **범위 밖(리뷰 #127에서 후속 이슈로):** 키 이름이 비밀처럼 보이지 않는 JSON 자격 증명 필드(`addCredential`의 키 이름 규칙 밖 — #98과 같은 P3). Google News 스킬을 스킬 도구로 직접 부르는 경로는 §42(#129)에서 막았다.
 - **범위 밖(§30과 같은 결정):** 16자보다 짧은 조각을 여러 요청에 나눠 보내 바깥에서 합치는 것 — 모델은 알려진 비밀을 받지 않는다(결과·맥락에서 지워짐). 판정은 요청을 마지막으로 검사하는 순간 서버가 아는 값 기준이다 — 그 뒤(요청이 나가는 중)에 등록된 값은 그 요청의 범위 밖이다. 호스트 이름의 대소문자 접기처럼 위 목록에 없는 변형도 범위 밖이다.
 - **과잉 차단:** 등록된 **알려진 값**만 맞춘다. 키처럼 생긴 보통 글은 막지 않는다(15자 조각, 한 글자씩 바뀐 값, 다른 base64·hex 글은 그대로 나간다 — 시험).
 
@@ -1698,6 +1698,45 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 - 리뷰 #127 1차 회귀: 공백·줄바꿈 base64/hex(MIME, 줄을 넘는 구간), `[`·`{`로 시작하는 보통 비밀, 32,768자 비밀의 조각 경계 구간, 짧은 설정 값의 base64/hex, JWT(같은 헤더의 다른 JWT는 통과, 페이로드·서명 구간은 차단), 금융 raw(실제 작업자를 TLS fixture에서 돌리고 도구 호스트를 경로 접두사로 대신함): Yahoo 세션 정상 흐름은 요청 3개가 각각 승인된 뒤 쿠키·crumb와 함께 그대로 나감, 응답 본문 crumb·보통 응답 `Set-Cookie`가 비밀이면 다음 요청 전에 `finance_bad_input`(리뷰 2차 재현 3), `crtfc_key` 중복 쌍(재현 1), `\uXXXX` 경로 리다이렉트(재현 2), 3번째 리다이렉트·다른 호스트·http는 `finance_blocked`, 승인과 다른 요청은 보내지 않음. JWT 공개 헤더가 입력 끝에 있어도 통과.
 - 리뷰 #127 3차 회귀: 한글 비밀의 UTF-8 바이트를 담은 `Set-Cookie`(실제 작업자) → 다음 요청 전에 `finance_bad_input`, 보통 한글 쿠키는 통과. 시간 한도: 작업마다 25초 걸리는 가짜 시계에서 세 번째 작업 뒤 `finance_timeout`, 작업이 받은 남은 시간 60·35·10초. Google News: `web_search`로 부를 때만 `noRedirects`, 정책 인자에 부트 코드, 실제 python으로 `urlopen`·`build_opener().open` 모두 302를 따라가지 않음(대조: 부트 없이는 비밀 URL까지 따라감 — python이 없으면 이 하나만 건너뜀).
 - 금융 회귀: `test/finance*.test.ts`(같은 판정기, 제자리 예외 그대로).
+
+## 42. 네트워크 스킬 직접 호출의 송신 비밀 가드 (#129)
+`skill_google-news-search-skill`·`skill_kr-stock-skill`처럼 **스킬을 도구로 직접 부를 때**도 §40과 같은 판정기(`secrets/egress.ts` `carriesSecret`)·같은 기준(한 요청 안, 전체 또는 16자 구간, 흔한 인코딩 하나 + 전송 한 겹)으로 막는다. 방식은 금융 raw(§40.1)와 같은 **보내는 요청마다 서버 승인**이다. 코드: `apps/server/src/mcp/service.ts` `skillSendGate`·`SKILL_NET_BOOT`, `isolation/sandbox.ts` `serveGate`.
+
+### 42.1 왜 프록시도 인자도 아니고 전송 직전 요청인가
+- 스킬의 송신 프록시(§15, `isolation/egress.ts`)는 **CONNECT의 호스트·포트만** 본다. 그 뒤는 TLS라 URL·쿼리·헤더·본문을 못 본다(호스트는 정확한 허용 목록). 프록시가 TLS를 풀게 하지 않는다.
+- **인자만 보는 것으로는 부족하다**(리뷰 #132 1차 P1): 스크립트가 여러 인자와 상수를 합쳐 요청을 만든다 — google-news의 `q`는 `<검색어> site:<사이트> when:1d`다. 등록된 비밀이 `…zzSYNTH9 site:example.com…`이면 검색어 `zzSYNTH9`와 사이트 `example.com`은 각각 통과하지만 합친 `q`에 24자가 실린다. 또 인자에는 밖으로 나가지 않는 제어 값(`--sort=published`)도 있어 인자 검사는 과잉 차단한다(같은 리뷰 P2). 그래서 인자 검사는 없애고, **스크립트가 다 만든 요청**을 본다.
+
+### 42.2 동작
+- **네트워크 부트(`SKILL_NET_BOOT`):** 네트워크 python 스킬은 도구로 부르든 `web_search` 제공자로 부르든 `python -I -S -B -c <부트> <스크립트> …`로 돈다. 부트는 스크립트보다 먼저
+  - urllib 리다이렉트를 거부한다(`redirect_request` → `HTTPError`, §40.1의 그 방식).
+  - `http.client.HTTPConnection.send`를 감싼다: 소켓에 쓰기 직전, **바로 그 바이트**(스크립트가 합치고 urllib이 인코딩한 요청 줄·모든 헤더·본문, 프록시 CONNECT 포함 — TLS 전 평문)를 연결 호스트와 함께 JSON 한 줄로 **fd 3**에 쓰고 답을 읽는다. `1`이면 보내고, 그 밖(거부, fd 3이 없음, 읽기 실패)이면 `ConnectionError` — urllib에서는 `URLError`라 스크립트가 보통 네트워크 실패로 알린다. 원래 `send`는 클로저 안에만 있다.
+- **서버의 승인(`skillSendGate`):** 실행기가 fd 3 소켓을 받아(`runIsolated`의 `gate`, 샌드박스 안에서도 상속 소켓이라 동작 — macOS 시험) 줄마다
+  - 연결 호스트가 그 스킬의 `hosts`인지,
+  - 스킬이 **선언한 자기 비밀은 선언한 자리 하나만** 빼고(`SkillSecret.place`: `kr-stock-skill` Alpha Vantage 키는 `www.alphavantage.co` 요청 대상의 첫 `apikey=<키>` 한 쌍 — 금융 DART 예외와 같은 규칙, 그 호출이 키를 받을 때(`when`)만),
+  - 나머지 전체를 `carriesSecret`(UTF-8 바이트 뷰 포함, 등록부 + `.env`의 모든 스킬 비밀)으로 본다.
+  한 번 거부하면 그 호출의 이후 요청도 모두 거부하고, 한 호출의 요청은 16개까지(`SKILL_SENDS_MAX`), 한 줄은 256KB까지다(넘으면 거부하고 프로세스를 멈춤).
+- 거부가 있었으면 스크립트가 무엇을 출력했든 결과는 `skill_secret_blocked`다. **모델에게는 보통 실패**(`{"error":"skill_failed"}`, 스크립트가 비정상 종료했을 때와 같은 코드 — §40.2처럼 어떤 값이 비밀인지 답으로 가려내지 못하게). 로그 `skill.finished`의 `skillCode`와 관리자 화면 "스킬 실행 실패"에만 `skill_secret_blocked`. 요청 내용·비밀은 남지 않는다. 남는 차이(받아들인 한계, §40.2와 같음): 막힌 호출은 요청 시간만큼 빨리 끝난다.
+- **네트워크 node 스킬은 거부**(`skill_unavailable`): 부트가 없다. 지금은 없다(`selftest`는 네트워크 없음). 네트워크가 없는 스킬에는 부트도 승인도 없다(밖으로 나갈 곳이 없고, 결과는 §15.3대로 가려진다).
+- `web_search`의 Google News 제공자도 같은 실행기를 지난다. `WebService.search`가 먼저 검색어를 보고 미끼로 바꾸며(§40.2), 합친 `q`가 걸리면 `web_search_unavailable`(다음 제공자).
+
+### 42.3 남는 경로 (범위 밖 — 이유)
+- **http.client 밖의 송신:** 스크립트가 소켓을 직접 쓰거나(`ssl`/`socket`), 부트의 패치를 되돌리면(원래 `send`는 클로저에만 있지만 python 안에서 완전히 숨길 수는 없다) 승인을 지나지 않는다. 지금 두 스크립트는 urllib만 쓰고, 실행되는 것은 검사·고정된 사본뿐이다(바뀌면 `skill_changed`). 스킬을 추가·갱신할 때 §15.5의 조건을 확인한다. 핀 검사는 내용이 그대로인지를 볼 뿐, HTTP 구현이 안전한지를 보증하지는 않는다.
+- **선언한 비밀의 원래 자리:** Alpha Vantage 키는 `www.alphavantage.co`의 `apikey=`로 나간다(목적). 다른 허용 호스트(`m.stock.naver.com`)·다른 매개변수·헤더·두 번째 쌍으로는 승인되지 않는다.
+- **여러 요청에 걸친 재조립·마지막 검사 뒤 등록된 값·UTF-8이 아닌 멀티바이트 인코딩:** §40.1과 같은 결정으로 범위 밖.
+- **렌더러 CDN(§18.4, #51):** 같은 판정기에 넣지 않는다. 브라우저의 요청 가로채기가 **정확한 `CDN_ALLOW_LIST` URL**(상수)과 서버가 넣는 문서 한 번만 내보낸다 — 모델이나 문서가 바꿀 수 있는 URL·쿼리가 없다. 헤더는 Chromium 자신의 것이고 쿠키·저장소 없는 새 프로필이다. 실을 재료가 없으니 검사할 것이 없다.
+- **연결 갱신(ChatGPT 토큰 갱신, `connections/chatgpt.ts`):** 같은 판정기에 넣지 않는다. 고정 URL(`auth.openai.com/oauth/token`)에 **갱신 토큰을 보내는 것이 목적**이다 — 판정기는 정의상 이 요청을 막는다. 본문은 고정 모양(`client_id`·`grant_type`·`refresh_token`·`scope`)이고 모델 입력이 없다.
+- **런타임 CLI의 API 호출(Claude·Codex):** 대화 맥락이 제공자로 가는 것이 목적이다. 모델은 알려진 비밀을 받지 않는다(결과·맥락에서 지워짐, §40.1). 이 가드의 대상이 아니다.
+- 그래서 **모델 입력이 요청에 실리는 송신 경로**(web_search·web_fetch·금융·네트워크 스킬)는 모두 같은 판정기 하나를 지난다. 나머지 송신은 고정 요청이거나 비밀을 보내는 것이 목적인 요청이다.
+
+### 42.4 확인 방법
+- `pnpm -C apps/server exec vitest run test/skill-egress.test.ts`
+  - 승인(`skillSendGate`, 전송될 그대로의 google-news 요청): 합성 비밀 3종(대소문자 토큰, 한글 값, 짧은 코드)과 설정 키 × 전체·16자 구간 × 8가지 인코딩(스크립트의 퍼센트 인코딩이 전송 한 겹)이 검색어에 있으면 거부. **리뷰 #132 재현**(합친 `q`의 24자, `when:30d` 조합, 비밀 전체) 거부. 헤더·본문·한글 비밀의 UTF-8 바이트 쿠키·다른 호스트·다른 호스트로의 CONNECT 거부. 대조군: 보통 검색어·15자 조각·보통 base64·`published`/`relevance`가 등록돼도 보통 호출(정렬 값은 요청에 없음) 통과. Alpha Vantage 키는 자기 호스트의 `apikey=` 한 쌍만 통과, 다른 허용 호스트·다른 매개변수·두 번째 쌍·옆의 다른 비밀·헤더·키를 받지 않는 명령에서는 거부. 형식이 틀린 줄, 17번째 요청, 거부 뒤 요청 거부.
+  - 실제 python(부트 + fd 3): 합친 질의는 보내기 전에 거부되어 사이트가 받은 요청 0개, 승인이 본 것은 urllib이 인코딩한 요청 줄 그대로. 보통 요청은 승인된 그대로 1개. 선언 키는 자리에서만, 같은 키를 기호에도 넣으면 0개. 리다이렉트는 요청 1개 뒤 `HTTPError 302`. fd 3이 없으면 아무것도 보내지 않음.
+  - macOS + `TEST_SKILL_PYTHON`(독립 실행형 python): `sandboxedSkillRunner`가 샌드박스 안에서 승인 소켓을 쓰고, 거부는 `skill_secret_blocked`(요청 0개), 보통 호출은 결과가 나옴.
+  - MCP로 부르면 모델에는 `{"error":"skill_failed"}`, 로그에만 `skill_secret_blocked`(내용 없음).
+- `test/web-egress.test.ts`: 제공자와 스킬 도구가 같은 정책으로 실행됨, 실제 python으로 부트가 `urlopen`·`build_opener().open`의 302를 따라가지 않음(대조: 부트 없이는 비밀 URL까지 따라감).
+- `test/skills.test.ts`: 정책 인자에 부트, 실제 샌드박스 탐침 스킬이 부트 아래에서도 같은 결과.
+- 실제 Google News 스크립트(설치 원본, TLS 직접 연결)로 부트 아래 요청 1개가 그대로 승인되어 나감을 손으로 확인했다(2026-11-14).
 
 ## 41. 샌드박스 작업자를 전용 macOS 계정으로 — 추출기·문서 생성기·내보내기 브라우저 (#122)
 방식과 근거는 `docs/decisions/isolation.md` "샌드박스 작업자 전용 계정 (#122)". python_run(§35)과 같은 이유다: macOS 샌드박스는 **같은 UID**의 다른 프로세스 시작 환경(`KERN_PROCARGS2`)을 읽는 것을 막지 못하고, Claude 런타임은 API 키·OAuth 토큰을, 런타임 환경은 MCP bearer 토큰을 시작 환경에 둔다. 추출기(`extract/worker.mjs`, 올린 파일 파싱)·문서 생성기(`docgen/worker.mjs`)·내보내기 브라우저(헤드리스 셸, 아티팩트 문서)는 신뢰할 수 없는 바이트를 다루므로, 작업자가 뚫리면 같은 UID에서는 그 환경을 읽을 수 있다. 그래서 이 셋을 서버·런타임·python 계정과 **다른 UID**의 전용 계정으로 돌린다.

@@ -210,6 +210,7 @@
   - 샌드박스는 그 프록시의 루프백 포트 하나만 연다. 호스트가 없으면 네트워크가 없다.
   - TLS 루트는 `SSL_CERT_FILE=/private/etc/ssl/cert.pem`(trusted 읽기)으로 준다.
   - 그래서 뉴스 스킬은 증권 사이트에, 증권 스킬은 뉴스 사이트에 닿지 못한다(시험).
+  - **송신 비밀 가드(#129, ops.md §42):** 프록시는 CONNECT의 호스트·포트만 본다(터널 안은 TLS). 인자 검사로는 스크립트가 인자·상수를 합친 요청을 덮지 못한다(리뷰 #132). 그래서 금융 raw처럼 **보내는 요청마다 서버가 승인**한다: 네트워크 python 스킬은 도구로든 `web_search` 제공자로든 `SKILL_NET_BOOT`로 도는데, 부트는 urllib 리다이렉트를 거부하고 `http.client.HTTPConnection.send`를 감싸 소켓에 쓰기 직전의 바이트(TLS 전 평문, CONNECT 포함)를 fd 3(실행기가 준 소켓)으로 서버에 묻는다. 서버(`skillSendGate`)는 호스트가 그 스킬의 것인지, 선언한 자기 비밀은 선언한 자리 한 번(`place`, 예: Alpha Vantage `apikey=`)만 빼고 나머지를 `carriesSecret`으로 본다. 소켓을 직접 쓰는 스크립트는 지나지 않는다 — 스킬 추가 조건(ops §15.5)이고 고정 사본만 실행된다. 부트가 없는 네트워크 node 스킬은 거부한다(지금은 없음).
 - **비밀:**
   - `.env`의 `SKILL_SECRET_NAMES`(지금 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY`)만 읽는다.
   - 그 비밀을 선언한 스킬의 프로세스 환경에만, 그 호출에 필요할 때만(`when`) 넣는다. 예: `kr-stock-skill`의 `alpha-quote` 호출에만 Alpha Vantage 키가 들어간다.

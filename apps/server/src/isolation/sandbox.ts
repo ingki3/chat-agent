@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import type { Duplex } from "node:stream";
 import { canonicalPath } from "../fs-safety.js";
 import { findHardLinks } from "./paths.js";
 
@@ -46,6 +47,11 @@ export type RunIsolatedOptions = SandboxPolicy & {
   /** Resident memory limit (checked every 250 ms; killed above it, and also when it cannot be measured). */
   maxRssBytes?: number;
   stdin?: string;
+  /**
+   * Per-send approval (#129): fd 3 of the child is a socket to this function. The child writes one JSON line per
+   * request it is about to send and blocks until it reads the verdict (`1\n` send, `0\n` refuse). See `serveGate`.
+   */
+  gate?: (line: string) => boolean;
   /** Stops the process (SIGKILL to its group) when aborted — the server shutting down (`killed: "aborted"`). */
   signal?: AbortSignal;
   /** Tests only: replaces the `ps` measurement used by the monitor. */
@@ -161,8 +167,9 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       cwd: o.cwd,
       env: o.env, // the whole environment — no inheritance
       detached: true, // own process group
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: o.gate ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
     });
+    if (o.gate) serveGate(child.stdio[3] as Duplex, o.gate, () => kill("output"));
     // sandbox-exec execs the command in place, and the profile forbids fork: this pid is the whole job.
     const pid = child.pid!;
     let out = "";
@@ -230,6 +237,38 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed }),
     );
     child.stdin.end(o.stdin ?? "");
+  });
+}
+
+/** One request line on the gate at most this long (a request beyond it is refused and the child stopped). */
+export const GATE_LINE_MAX = 256 * 1024;
+
+/**
+ * Answers a child's per-send requests on one socket (`RunIsolatedOptions.gate`): each `\n`-terminated line is
+ * handed to `gate` in order and answered `1\n` (send) or `0\n` (refuse). A line over `GATE_LINE_MAX` is refused
+ * and `onOverflow` stops the child. Anything the child does not wait for is its own failure.
+ */
+export function serveGate(stream: Duplex, gate: (line: string) => boolean, onOverflow: () => void): void {
+  let buf = Buffer.alloc(0);
+  stream.on("error", () => {});
+  stream.on("data", (chunk: Buffer) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (let nl = buf.indexOf(10); nl >= 0; nl = buf.indexOf(10)) {
+      const line = buf.subarray(0, nl).toString("utf8");
+      buf = buf.subarray(nl + 1);
+      let ok: boolean;
+      try {
+        ok = gate(line);
+      } catch {
+        ok = false;
+      }
+      stream.write(ok ? "1\n" : "0\n");
+    }
+    if (buf.length > GATE_LINE_MAX) {
+      buf = Buffer.alloc(0);
+      stream.write("0\n");
+      onOverflow();
+    }
   });
 }
 
