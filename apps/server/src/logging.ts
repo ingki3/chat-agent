@@ -87,6 +87,11 @@ export const LOG_EVENTS = [
   // python_run account self-check (#47 round 2): the outcome only, no detail.
   "python.self_check_ok",
   "python.self_check_failed",
+  /** The sandboxed workers' account (#122): a kind's self-check passed / failed (its step), still same-uid. */
+  "worker.self_check_ok",
+  "worker.self_check_failed",
+  "worker.same_uid",
+  "worker.sweep_failed",
   // A cleanup step of the self-check (its temp dir, launcher clean or job folder) failed (#121 round 9; no detail).
   "python.self_check_cleanup_failed",
   // Finance tool calls (#30): tool name, outcome code, duration and IDs — never the symbol, URL or numbers.
@@ -570,6 +575,10 @@ export type LogFields = {
   scheduleStatus?: string;
   scheduleStep?: string;
   lateMs?: number;
+  /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
+  workerKind?: string;
+  workerStep?: string;
+  workerKinds?: string;
   /** Logged as class name and code only. */
   err?: unknown;
 };

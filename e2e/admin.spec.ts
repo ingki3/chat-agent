@@ -114,6 +114,10 @@ test("admin tabs: edit a user, runtimes with the on-behalf notice, skills allow-
   await expect(system.getByTestId("tunnel-state")).toHaveText("미설정");
   await expect(system.getByRole("table", { name: "런타임 연결 상태" })).toContainText("Claude Code");
   await expect(system.getByTestId("disk-free")).toContainText("남음");
+  // The sandboxed workers (#122): no WORKER_RUN_USER in e2e — each says plainly it is not isolated by account.
+  for (const kind of ["extract", "docgen", "render"])
+    await expect(system.getByTestId(`worker-${kind}`)).toContainText("계정 격리 안 됨");
+  await expect(system.getByTestId("worker-warning")).toContainText("41절");
 
   // A deep link opens its tab.
   await page.goto("/admin?tab=usage");

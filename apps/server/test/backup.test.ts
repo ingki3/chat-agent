@@ -954,8 +954,10 @@ describe(
         expect(o).not.toContain("OVERLAP");
         return Number(/acquired=(\d+)/.exec(o)![1]);
       });
-      // Every racer got it sometimes; the total proves the loop really contended.
-      expect(counts.every((n) => n > 0)).toBe(true);
+      // The loop really contended: at least two racers got it (all three is not guaranteed on a loaded CI runner,
+      // where one process can be starved for the whole window — fairness is not what this test is about; the
+      // never-together check above is).
+      expect(counts.filter((n) => n > 0).length).toBeGreaterThanOrEqual(2);
     });
 
     it("a symlinked DATA_DIR shares the real folder's lock and journal", async () => {

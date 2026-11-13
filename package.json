@@ -25,6 +25,9 @@
     "python:install": "pnpm --filter @agentlee/server skills python-install",
     "python:setup-check": "pnpm --filter @agentlee/server skills python-setup-check",
     "python:check": "pnpm --filter @agentlee/server skills python-check",
+    "workers:bundle": "pnpm --filter @agentlee/server workers bundle",
+    "workers:setup-check": "pnpm --filter @agentlee/server workers setup-check",
+    "workers:check": "pnpm --filter @agentlee/server workers check",
     "sse-probe": "tsx scripts/sse-probe.ts",
     "uptime": "tsx scripts/uptime.ts",
     "launchd": "bash scripts/install-launchd.sh"

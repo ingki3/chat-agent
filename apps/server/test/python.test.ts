@@ -1111,6 +1111,7 @@ describe("python_run: the dedicated account (#47 round 2)", () => {
     expect(parseProbe("uid=502 procargs=error errno=3\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseProbe("uid=502 procargs=error control\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseProbe("uid=502 procargs=error sibling\n", 0)).toEqual({ uid: 502, readBlocked: false });
+    expect(parseProbe("uid=502 procargs=error marker\n", 0)).toEqual({ uid: 502, readBlocked: false });
     expect(parseProbe("uid=4294967294 procargs=blocked\n", 0)).toEqual({
       uid: 4294967294,
       readBlocked: true,
@@ -2305,7 +2306,7 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
     expect(spawnSync(r.launcher, ["reap", id], { env: {} }).status).toBe(65);
   });
 
-  it("run and probe replace the whole environment: nothing from the caller reaches python", () => {
+  it("run and probe replace the whole environment: nothing from the caller reaches python", async () => {
     const r0 = rig();
     const jid = newJob(r0);
     const j = spawnSync(r0.launcher, ["run", jid, "10"], {
@@ -2320,8 +2321,24 @@ describe.skipIf(!PY312 || process.platform !== "darwin")("the launcher (relaxed 
     expect(seen.stdout).toContain("AGENTLEE_PACKAGES");
     const r = rig();
     const id = newJob(r);
-    const sib = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], { stdio: "ignore" });
+    // The server's sibling carries the marker variable the probe must see in a real read (#130 round 1).
+    const sib = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+      stdio: "ignore",
+      env: { AGENTLEE_SELFCHECK: "synthetic" },
+    });
     closers.push(() => sib.kill("SIGKILL"));
+    const plain = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+      stdio: "ignore",
+      env: {},
+    });
+    closers.push(() => plain.kill("SIGKILL"));
+    await new Promise((res) => setTimeout(res, 150));
+    // A readable process without the marker is no verdict: "readable" means the read really showed it.
+    const noMarker = spawnSync(r.launcher, ["probe", newJob(r), String(plain.pid)], {
+      encoding: "utf8",
+      env: {},
+    });
+    expect(noMarker.stdout).toBe(`uid=${process.getuid!()} procargs=error marker\n`);
     const out = spawnSync(r.launcher, ["probe", id, String(sib.pid)], {
       encoding: "utf8",
       env: { AGENTLEE_SECRET_TEST: "synthetic-secret-value", PATH: "/tmp/evil" },

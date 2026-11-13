@@ -37,6 +37,12 @@ export function storagePaths(dataDir: string) {
      * call ends (and the whole folder at server start). Outside every backup root.
      */
     scratch: path.join(root, "scratch"),
+    /**
+     * Sandboxed-worker job folders (#122): `worker-scratch/<job id>`, one per extraction, document or render run
+     * through the worker account's launcher (input copies, the browser profile); removed when the job ends and every
+     * left-over at server start. Its own root and ACL (the worker account's group), apart from python's `scratch`.
+     */
+    workerScratch: path.join(root, "worker-scratch"),
     /** `python_run` packages (#47): `python-packages/<lock hash>/`, made by `pnpm python:install`. Derived data. */
     pythonPackages: path.join(root, "python-packages"),
     conversationFiles: (userId: string, conversationId: string) =>

@@ -60,7 +60,7 @@ export const EXTRACT_LIMITS = {
   /** stdout + stderr of the worker (the result is at most ~2M characters of text with its marks). */
   maxOutputBytes: 64 * 1024 * 1024,
 };
-const OCR_KINDS: ReadonlySet<FileKind> = new Set(["pdf", "png", "jpg"]);
+export const OCR_KINDS: ReadonlySet<FileKind> = new Set(["pdf", "png", "jpg"]);
 
 /** What the worker answers. */
 export type WorkerSegment = {
@@ -168,7 +168,7 @@ export function packageFolders(names: readonly string[]): string[] {
 }
 
 /** pdf.js and tesseract.js as the worker imports them (absolute file URLs) and pdf.js's font and CMap data. */
-function libraries() {
+export function extractLibraries() {
   const pdfjsDir = path.dirname(fs.realpathSync(require.resolve("pdfjs-dist/package.json")));
   return {
     modules: {
@@ -183,8 +183,8 @@ function libraries() {
 }
 
 /** The OCR language models (pinned npm packages): Korean and English, LSTM ("best_int"). */
-const OCR_LANGS = ["kor", "eng"] as const;
-const langFile = (lang: string) => {
+export const OCR_LANGS = ["kor", "eng"] as const;
+export const langFile = (lang: string) => {
   const dir = path.dirname(fs.realpathSync(require.resolve(`@tesseract.js-data/${lang}/package.json`)));
   return path.join(dir, "4.0.0_best_int", `${lang}.traineddata.gz`);
 };
@@ -242,7 +242,7 @@ export function workerResult(r: RunResult): WorkerResult {
   return { ok: false, code: "extract_failed" };
 }
 
-let libCache: ReturnType<typeof libraries> | undefined;
+let libCache: ReturnType<typeof extractLibraries> | undefined;
 let folderCache: string[] | undefined;
 
 /**
@@ -256,7 +256,7 @@ export function extractRunOptions(
   ocr: OcrCapability | undefined,
   node = fs.realpathSync(process.execPath),
 ): RunIsolatedOptions {
-  const libs = (libCache ??= libraries());
+  const libs = (libCache ??= extractLibraries());
   folderCache ??= packageFolders(["pdfjs-dist", "tesseract.js"]);
   const langDir = ocr?.available ? ocr.langDir : undefined;
   return {

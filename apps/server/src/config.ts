@@ -95,6 +95,13 @@ const ConfigSchema = z.object({
    * startup self-check passes (docs/ops.md §35). A short macOS account name.
    */
   PYTHON_RUN_USER: optional(z.string().regex(/^[a-z_][a-z0-9_-]{0,30}$/)),
+  /**
+   * The sandboxed workers (#122): the dedicated, unprivileged macOS account the extractor, the document worker and
+   * the export browser run as (a different uid than the server, the runtimes and PYTHON_RUN_USER). Each worker uses
+   * it only after its startup self-check passes; until then — and without this — it runs in the same-uid sandbox
+   * and the admin status says so (docs/ops.md §41). A short macOS account name.
+   */
+  WORKER_RUN_USER: optional(z.string().regex(/^[a-z_][a-z0-9_-]{0,30}$/)),
   /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
   SKILL_SOURCES: optional(z.string()),
   /**
@@ -167,6 +174,8 @@ export type Config = {
   pythonRun: boolean;
   /** The dedicated account `python_run` runs as (#47 round 2); undefined = not configured. */
   pythonRunUser?: string | undefined;
+  /** The dedicated account the sandboxed workers run as (#122); undefined = not configured (same-uid sandbox). */
+  workerRunUser?: string | undefined;
   /** Folders `pnpm skills:install` copies skills from. */
   skillSources: string[];
   /**
@@ -214,6 +223,11 @@ export function loadConfig(
   if (c.NODE_ENV === "production" && c.ISOLATION_IN_PROCESS_FOR_TESTS === "1")
     throw new Error(
       "Invalid configuration — ISOLATION_IN_PROCESS_FOR_TESTS is for tests and development only, never with NODE_ENV=production",
+    );
+  // Two accounts on purpose (#122): python runs code the model wrote, the workers hold family members' files.
+  if (c.WORKER_RUN_USER !== undefined && c.WORKER_RUN_USER === c.PYTHON_RUN_USER)
+    throw new Error(
+      "Invalid configuration — WORKER_RUN_USER must be a different account than PYTHON_RUN_USER",
     );
   const dataDir = path.resolve(baseDir, c.DATA_DIR);
   const masterKeyPath = path.resolve(baseDir, c.MASTER_KEY_PATH);
@@ -264,6 +278,7 @@ export function loadConfig(
     skillPython: c.SKILL_PYTHON,
     pythonRun: c.PYTHON_RUN === "1",
     pythonRunUser: c.PYTHON_RUN_USER,
+    workerRunUser: c.WORKER_RUN_USER,
     skillSources: (
       c.SKILL_SOURCES ??
       [path.join(os.homedir(), ".agents", "skills"), path.join(os.homedir(), ".claude", "skills")].join(":")
