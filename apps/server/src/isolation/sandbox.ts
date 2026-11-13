@@ -52,6 +52,11 @@ export type RunIsolatedOptions = SandboxPolicy & {
    * request it is about to send and blocks until it reads the verdict (`1\n` send, `0\n` refuse). See `serveGate`.
    */
   gate?: (line: string) => boolean;
+  /**
+   * Called once when the gate itself fails while the child runs — a request line over `GATE_LINE_MAX`, or an error
+   * on fd 3 — so the caller records it as a refusal (#135). An over-long line also stops the child.
+   */
+  gateFailed?: (why: GateFailure) => void;
   /** Stops the process (SIGKILL to its group) when aborted — the server shutting down (`killed: "aborted"`). */
   signal?: AbortSignal;
   /** Tests only: replaces the `ps` measurement used by the monitor. */
@@ -169,7 +174,13 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       detached: true, // own process group
       stdio: o.gate ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
     });
-    if (o.gate) serveGate(child.stdio[3] as Duplex, o.gate, () => kill("output"));
+    if (o.gate)
+      serveGate(child.stdio[3] as Duplex, o.gate, (why) => {
+        // A socket error after we stopped it (or after it exited) is the teardown, not a gate failure.
+        if (why === "error" && (killed || exited)) return;
+        o.gateFailed?.(why);
+        if (why === "overflow") kill("output");
+      });
     // sandbox-exec execs the command in place, and the profile forbids fork: this pid is the whole job.
     const pid = child.pid!;
     let out = "";
@@ -243,17 +254,41 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
 /** One request line on the gate at most this long (a request beyond it is refused and the child stopped). */
 export const GATE_LINE_MAX = 256 * 1024;
 
+/** Why the gate stopped answering: a request line over `GATE_LINE_MAX`, or an error on the socket. */
+export type GateFailure = "overflow" | "error";
+
 /**
  * Answers a child's per-send requests on one socket (`RunIsolatedOptions.gate`): each `\n`-terminated line is
- * handed to `gate` in order and answered `1\n` (send) or `0\n` (refuse). A line over `GATE_LINE_MAX` is refused
- * and `onOverflow` stops the child. Anything the child does not wait for is its own failure.
+ * handed to `gate` in order and answered `1\n` (send) or `0\n` (refuse). The length limit comes first (#135): a
+ * line over `GATE_LINE_MAX` bytes is refused without being handed to `gate` — whether or not its newline has
+ * arrived — and `onFail("overflow")` is called; a socket error calls `onFail("error")`. Either is final: nothing
+ * after it is read or approved. Anything the child does not wait for is its own failure.
  */
-export function serveGate(stream: Duplex, gate: (line: string) => boolean, onOverflow: () => void): void {
+export function serveGate(
+  stream: Duplex,
+  gate: (line: string) => boolean,
+  onFail: (why: GateFailure) => void,
+): void {
   let buf = Buffer.alloc(0);
-  stream.on("error", () => {});
+  let failed = false;
+  const fail = (why: GateFailure) => {
+    if (failed) return;
+    failed = true;
+    buf = Buffer.alloc(0);
+    onFail(why);
+  };
+  stream.on("error", () => fail("error"));
   stream.on("data", (chunk: Buffer) => {
+    if (failed) return;
     buf = Buffer.concat([buf, chunk]);
-    for (let nl = buf.indexOf(10); nl >= 0; nl = buf.indexOf(10)) {
+    for (;;) {
+      const nl = buf.indexOf(10);
+      // Checked before the line is processed: an over-long line is refused even when its newline is here.
+      if ((nl < 0 ? buf.length : nl) > GATE_LINE_MAX) {
+        stream.write("0\n");
+        return fail("overflow");
+      }
+      if (nl < 0) return;
       const line = buf.subarray(0, nl).toString("utf8");
       buf = buf.subarray(nl + 1);
       let ok: boolean;
@@ -263,11 +298,6 @@ export function serveGate(stream: Duplex, gate: (line: string) => boolean, onOve
         ok = false;
       }
       stream.write(ok ? "1\n" : "0\n");
-    }
-    if (buf.length > GATE_LINE_MAX) {
-      buf = Buffer.alloc(0);
-      stream.write("0\n");
-      onOverflow();
     }
   });
 }

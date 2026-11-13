@@ -5,7 +5,7 @@ import http from "node:http";
 import type net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { Duplex } from "node:stream";
+import { Duplex } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   GOOGLE_NEWS_SKILL,
@@ -16,7 +16,7 @@ import {
 import { UserStore } from "../src/auth/users.js";
 import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb } from "../src/db/client.js";
-import { serveGate } from "../src/isolation/sandbox.js";
+import { GATE_LINE_MAX, runIsolated, serveGate, type GateFailure } from "../src/isolation/sandbox.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 import { pythonRuntime } from "../src/mcp/python.js";
 import { sanitizeRecord } from "../src/logging.js";
@@ -213,6 +213,150 @@ describe("skillSendGate: the request as it goes on the wire", () => {
     const many = approves(news, {}, ...Array.from({ length: SKILL_SENDS_MAX + 1 }, () => newsWire("x")));
     expect(many.slice(0, SKILL_SENDS_MAX).every(Boolean)).toBe(true);
     expect(many.at(-1)).toBe(false);
+  });
+
+  it("deny(): a failure of the gate itself is the same final refusal (#135)", () => {
+    const g = skillSendGate(news, {}, SECRETS_ENV);
+    expect(g.approve(newsWire("ordinary"))).toBe(true);
+    expect(g.denied).toBe(false);
+    g.deny();
+    expect(g.denied).toBe(true);
+    expect(g.approve(newsWire("ordinary"))).toBe(false);
+  });
+});
+
+describe("serveGate: the line limit comes first, and a failure is final (#135)", () => {
+  /** A socket stand-in: what the server answers is collected; the child's bytes are emitted as `data`. */
+  const socket = () => {
+    const written: string[] = [];
+    const d = new Duplex({
+      read() {},
+      write(chunk: Buffer, _enc, cb) {
+        written.push(chunk.toString());
+        cb();
+      },
+    });
+    const seen: string[] = [];
+    const failures: GateFailure[] = [];
+    serveGate(
+      d,
+      (l) => (seen.push(l), true),
+      (why) => failures.push(why),
+    );
+    const send = (s: string | Buffer) => d.emit("data", Buffer.from(s));
+    return { d, written, seen, failures, send };
+  };
+
+  it("a line of exactly the limit is handed over; one byte more is refused even with its newline", () => {
+    const at = socket();
+    at.send("x".repeat(GATE_LINE_MAX) + "\n");
+    expect(at.seen).toHaveLength(1);
+    expect(at.written).toEqual(["1\n"]);
+    expect(at.failures).toEqual([]);
+
+    // Review #132 round 2: the over-long line used to be approved when its newline came in the same chunk.
+    const over = socket();
+    over.send("x".repeat(GATE_LINE_MAX + 1) + "\nok\n");
+    expect(over.seen).toEqual([]);
+    expect(over.written).toEqual(["0\n"]);
+    expect(over.failures).toEqual(["overflow"]);
+    over.send("later\n"); // nothing after it is read
+    expect(over.seen).toEqual([]);
+    expect(over.written).toEqual(["0\n"]);
+  });
+
+  it("lines before an over-long one are answered in order; the over-long one, split across chunks, is refused", () => {
+    const g = socket();
+    g.send("a\nb\n" + "x".repeat(GATE_LINE_MAX / 2));
+    expect(g.seen).toEqual(["a", "b"]);
+    g.send("x".repeat(GATE_LINE_MAX / 2 + 1)); // no newline yet: refused as soon as it is too long
+    expect(g.failures).toEqual(["overflow"]);
+    g.send("\n");
+    expect(g.seen).toEqual(["a", "b"]);
+    expect(g.written).toEqual(["1\n", "1\n", "0\n"]);
+  });
+
+  it("a socket error is a failure (once); nothing after it is approved", () => {
+    const g = socket();
+    g.d.emit("error", new Error("EPIPE"));
+    g.d.emit("error", new Error("EPIPE"));
+    expect(g.failures).toEqual(["error"]);
+    g.send("late\n");
+    expect(g.seen).toEqual([]);
+    expect(g.written).toEqual([]);
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")(
+  "runIsolated: the gate's line limit in the sandbox (#135)",
+  () => {
+    /** bash builtins only (the profile forbids fork): one line of `n` bytes on fd 3, then the verdict on stdout. */
+    const ask = (n: number) => {
+      const seen: number[] = [];
+      const failures: GateFailure[] = [];
+      const r = runIsolated({
+        command: "/bin/bash",
+        args: ["-c", `printf '%*s\\n' ${n} '' >&3; read -r -u 3 v; echo "got:$v"`],
+        cwd: os.tmpdir(),
+        env: {},
+        read: [],
+        write: [],
+        timeoutMs: 10_000,
+        maxOutputBytes: 10_000,
+        gate: (l) => (seen.push(l.length), true),
+        gateFailed: (why) => failures.push(why),
+      });
+      return r.then((res) => ({ ...res, seen, failures }));
+    };
+
+    it("a line of the limit is approved; one byte more is refused before the gate sees it and stops the child", async () => {
+      const at = await ask(GATE_LINE_MAX);
+      expect(at.seen).toEqual([GATE_LINE_MAX]);
+      expect(at.failures).toEqual([]);
+      expect(at.stdout).toBe("got:1\n");
+      const over = await ask(GATE_LINE_MAX + 1);
+      expect(over.seen).toEqual([]);
+      expect(over.failures).toEqual(["overflow"]);
+      expect(over.killed).toBe("output");
+      expect(over.stdout).not.toBe("got:1\n");
+    });
+  },
+);
+
+describe("sandboxedSkillRunner: what needs no proxy is checked before the proxy is prepared (#135)", () => {
+  const s = { userId: "u", conversationId: "c", runId: "r" };
+  const counted = () => {
+    let proxies = 0;
+    return {
+      get proxies() {
+        return proxies;
+      },
+      proxy: async () => {
+        proxies++;
+        return { url: "http://127.0.0.1:9", port: 9 };
+      },
+    };
+  };
+
+  it("a changed pinned copy, a missing key, no python, a networked node skill: no proxy", async () => {
+    const c = counted();
+    const python = { exe: "/opt/py/bin/python3.12", root: "/opt/py" };
+    const run = sandboxedSkillRunner({ python, secrets: {}, proxy: c.proxy });
+    expect(await run({ ...news, verify: () => false }, { query: "x" }, s)).toEqual({
+      ok: false,
+      code: "skill_changed",
+    });
+    expect(await run(stock, { command: "alpha-quote", code: "AAPL" }, s)).toEqual({
+      ok: false,
+      code: "skill_unconfigured",
+    });
+    expect(await sandboxedSkillRunner({ proxy: c.proxy })(news, { query: "x" }, s)).toEqual({
+      ok: false,
+      code: "skill_unavailable",
+    });
+    const nodeNet: BundledSkill = { ...SELFTEST_SKILL, hosts: ["example.com"] };
+    expect(await run(nodeNet, { text: "x" }, s)).toEqual({ ok: false, code: "skill_unavailable" });
+    expect(c.proxies).toBe(0);
   });
 });
 
@@ -481,6 +625,41 @@ describe.skipIf(!STANDALONE)("the sandboxed runner: the gate works inside sandbo
       expect(asked).toHaveLength(1);
     } finally {
       server.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an over-long request line is the same skill_secret_blocked (#135)", async () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "skill-gate-long-")));
+    // Writes one line past the limit on fd 3 itself, then reports success: the outcome is still the refusal.
+    fs.writeFileSync(
+      path.join(dir, "long.py"),
+      `import os\nline = b"x" * ${GATE_LINE_MAX + 1} + b"\\n"\nwhile line:\n    line = line[os.write(3, line):]\nprint('{"ok": true}')\n`,
+    );
+    try {
+      const spec: BundledSkill = {
+        name: "long",
+        description: "long",
+        input: {},
+        finance: false,
+        kind: "python",
+        files: ["long.py"],
+        args: () => [],
+        hosts: ["127.0.0.1"],
+        secrets: [],
+        dir,
+        entry: path.join(dir, "long.py"),
+      };
+      const run = sandboxedSkillRunner({
+        python: STANDALONE,
+        proxy: async () => ({ url: "http://127.0.0.1:9", port: 9 }),
+        limits: { timeoutMs: 20_000, maxOutputBytes: 64 * 1024, maxRssBytes: 512 * 1024 * 1024 },
+      });
+      expect(await run(spec, {}, { userId: "u", conversationId: "c", runId: "r" })).toEqual({
+        ok: false,
+        code: SKILL_SECRET_BLOCKED,
+      });
+    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
