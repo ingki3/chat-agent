@@ -1,4 +1,4 @@
-import type { ViewSegment, ViewTarget } from "@agentlee/shared";
+import type { FileViewResponse, ViewSegment, ViewTarget } from "@agentlee/shared";
 
 /**
  * The file viewer's layout (#24) as pure functions: the served segments grouped into what the screen draws —
@@ -68,6 +68,18 @@ export function cellsOf(segs: readonly ViewSegment[]): Cell[] {
           ...(m.range ? { ref: m.range } : {}),
         });
   return out.sort((a, b) => a.col - b.col);
+}
+
+/**
+ * Cells by column (1…max): every piece of a column in reading order (a cell split around a footnote is two pieces
+ * of one column), empty for the gaps of merged cells; null when the row is wider than a grid draws.
+ */
+export function columns(cells: readonly Cell[]): Cell[][] | null {
+  const max = cells.reduce((m, c) => Math.max(m, c.col), 0);
+  if (max > GRID_COLS) return null;
+  const out: Cell[][] = Array.from({ length: max }, () => []);
+  for (const c of cells) out[c.col - 1]!.push(c);
+  return out;
 }
 
 /** One line of a run of lines (its number when the marks still say it). */
@@ -184,3 +196,26 @@ export const boxStyle = (b: readonly [number, number, number, number]) => ({
   width: `${Math.max(b[2] * 100, 0.4)}%`,
   height: `${Math.max(b[3] * 100, 0.4)}%`,
 });
+
+/**
+ * The windows loaded so far (review #123): the opening one — the one loaded without a paging parameter, which
+ * carries the locator's resolution wherever later windows put it in the list — and every segment once, in order.
+ */
+export function loadedView<P>(data: {
+  pages: readonly FileViewResponse[];
+  pageParams: readonly (P | undefined)[];
+}): {
+  opening: FileViewResponse | undefined;
+  items: ViewSegment[];
+} {
+  const at = data.pageParams.indexOf(undefined);
+  const seen = new Set<number>();
+  const items: ViewSegment[] = [];
+  for (const p of data.pages)
+    for (const x of p.items)
+      if (!seen.has(x.seq)) {
+        seen.add(x.seq);
+        items.push(x);
+      }
+  return { opening: at === -1 ? undefined : data.pages[at], items };
+}

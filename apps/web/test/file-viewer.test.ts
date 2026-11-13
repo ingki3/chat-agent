@@ -17,7 +17,16 @@ import { CitationPreview } from "../src/citations/CitationMarker.js";
 import { citationView } from "../src/citations/segments.js";
 import { FileViewContext } from "../src/files/context.js";
 import { FileBody } from "../src/files/FileViewer.js";
-import { blocks, cellsOf, colName, highlightsOf, linesOf, pieces } from "../src/files/view-model.js";
+import {
+  blocks,
+  cellsOf,
+  colName,
+  columns,
+  highlightsOf,
+  linesOf,
+  loadedView,
+  pieces,
+} from "../src/files/view-model.js";
 
 /**
  * The file viewer's screen side (#24): file citations and file chips link to `/c/:id/files/:fileId?loc=`
@@ -208,6 +217,69 @@ describe("layout and highlights (pure)", () => {
       { line: undefined, start: 0, end: 1 },
       { line: undefined, start: 2, end: 4 },
     ]);
+  });
+});
+
+describe("review #123", () => {
+  it("[P2 2] a window loaded before the opening one keeps the target; [P3 5] overlapping windows show each unit once", () => {
+    const target: ViewTarget = {
+      status: "exact",
+      reasons: [],
+      seqs: [50],
+      range: { seq: 50, start: 0, end: 1 },
+    };
+    const page = (from: number, to: number, t: ViewTarget | null) => ({
+      file,
+      extract: {
+        fileId: "f1",
+        fileRevision: REV,
+        status: "ok" as const,
+        code: null,
+        ocr: "none" as const,
+        units: 200,
+        segments: 200,
+        characters: 1,
+        truncated: false,
+      },
+      items: Array.from({ length: to - from }, (_, i) =>
+        seg(from + i, { kind: "slide", slide: from + i + 1 }, "x"),
+      ),
+      prev: null,
+      next: null,
+      target: t,
+    });
+    // "앞부분 더 보기": the earlier window is put first; it carries no target (paging only).
+    const v = loadedView({
+      pages: [page(0, 100, null), page(30, 130, target)],
+      pageParams: [{ from: 0 }, undefined],
+    });
+    expect(v.opening?.target).toEqual(target);
+    expect(v.items.map((x) => x.seq)).toEqual(Array.from({ length: 130 }, (_, i) => i));
+  });
+
+  it("[P2 3] a cell split around a footnote: both pieces of the column are drawn, in order", () => {
+    const items = [
+      seg(0, { kind: "table", table: 1, row: 3 }, "글꼴 11pt", {
+        split: true,
+        marks: [{ start: 0, end: 7, col: 2 }],
+      }),
+      seg(1, { kind: "table", table: 1, row: 3, footnote: 2 }, "본문 글꼴 기준."),
+      seg(2, { kind: "table", table: 1, row: 3 }, "각주 뒤 글", {
+        split: true,
+        marks: [{ start: 0, end: 6, col: 2 }],
+      }),
+      seg(3, { kind: "table", table: 1, row: 3 }, "줄 간격 160%", {
+        split: true,
+        marks: [{ start: 0, end: 9, col: 3 }],
+      }),
+    ];
+    const cols = columns(cellsOf([items[0]!, items[2]!, items[3]!]))!;
+    expect(cols.map((c) => c.map((x) => x.seq))).toEqual([[], [0, 2], [3]]);
+    const html = renderToStaticMarkup(createElement(FileBody, { file, items, target: null }));
+    expect(html).toContain("글꼴 11pt");
+    expect(html).toContain("각주 뒤 글");
+    expect(html.indexOf("글꼴 11pt")).toBeLessThan(html.indexOf("각주 뒤 글"));
+    expect(html).toContain("본문 글꼴 기준.");
   });
 });
 

@@ -12,7 +12,7 @@ import {
 import { scrubKnown } from "../secrets/known.js";
 import type { SegmentRow } from "./extract.js";
 import { parseMarks, type Mark } from "./scrub.js";
-import { isBox, segmentLocator, union } from "./text.js";
+import { isBox, prefixHash, segmentLocator, union } from "./text.js";
 import type { FileRow } from "./store.js";
 
 /**
@@ -30,7 +30,12 @@ import type { FileRow } from "./store.js";
  */
 
 /** A checked passage of a citation of this file: the locator it was given and the quote stored with it. */
-export type CitedPassage = { locator: FileLocator; quote: string };
+export type CitedPassage = {
+  locator: FileLocator;
+  quote: string;
+  /** `prefixHash` of the unit's text up to the passage's end when it was checked (files/text.ts); absent: older. */
+  textHash: string | undefined;
+};
 
 type StoredLoc = { split?: unknown };
 const storedSplit = (seg: Pick<SegmentRow, "locator">): boolean => {
@@ -101,13 +106,20 @@ function sameUnit(sl: FileLocator, s: ViewSegment, loc: FileLocator): boolean {
   }
 }
 
-/** A run of lines that lost its marks (approximate): the one whose first line is the last at or before `line`. */
+/**
+ * A run of lines that lost its marks (approximate) and surely holds `line`: the run whose first line is the last at
+ * or before it, and `line` within the lines its served text still has. The served text is the lower bound of the
+ * run's lines (a hidden secret may have taken a line break with it): a line past it may be in the run or not —
+ * undecidable, so no run (review #123: never the first run for any later line).
+ */
 function approximateRun(items: readonly ViewSegment[], line: number): ViewSegment | undefined {
   let best: ViewSegment | undefined;
   for (const s of items)
     if (s.locator.kind === "line" && s.locator.line !== undefined && s.locator.line <= line)
       if (!best || s.locator.line > best.locator.line!) best = s;
-  return best?.approximate ? best : undefined;
+  if (!best?.approximate) return undefined;
+  const surely = best.text.split("\n").length;
+  return line < best.locator.line! + surely ? best : undefined;
 }
 
 /** The identifying fields of a locator, for "is this the locator a citation was given". */
@@ -195,8 +207,10 @@ export function resolveTarget(
   if (range) {
     const k = key(loc);
     const at = quoteOf(only!.text.slice(range.start, range.end));
-    // A citation the caller may see gave this locator, and its passage is still exactly there.
-    if (!cited.some((c) => key(c.locator) === k && c.quote === at)) {
+    const before = prefixHash(only!.text, range.end);
+    // A citation the caller may see gave this locator, and the unit's text up to the passage's end is still the text
+    // it was checked in (review #123: the same quote elsewhere after a shift is not the cited place).
+    if (!cited.some((c) => key(c.locator) === k && c.quote === at && c.textHash === before)) {
       reasons.add("unverified");
       range = undefined;
     }
@@ -227,12 +241,12 @@ export const VIEW_MAX = 300;
 export const VIEW_BEFORE = 20;
 
 /**
- * The window of segments to send: from the first with `seq >= from` when `from` is given, else around the target
- * (a few before it), else from the start. `prev` / `next`: the `from` of the windows before / after it.
+ * The window of segments to send: from the first with `seq >= from` when `from` is given (up to `to`, exclusive,
+ * when given), else around the target (a few before it), else from the start. `prev` / `next`: the `from` of the windows before / after it.
  */
 export function viewWindow(
   items: readonly ViewSegment[],
-  opts: { from?: number | undefined; limit: number; around?: number | undefined },
+  opts: { from?: number | undefined; to?: number | undefined; limit: number; around?: number | undefined },
 ): { items: ViewSegment[]; prev: number | null; next: number | null } {
   let start = 0;
   if (opts.from !== undefined) {
@@ -242,7 +256,12 @@ export function viewWindow(
     const at = items.findIndex((s) => s.seq === opts.around);
     start = Math.max(0, at - VIEW_BEFORE);
   }
-  const end = Math.min(items.length, start + opts.limit);
+  let end = Math.min(items.length, start + opts.limit);
+  // `to` (exclusive): a window before one already shown ends where that one starts (review #123: no overlap).
+  if (opts.to !== undefined) {
+    const stop = items.findIndex((s) => s.seq >= opts.to!);
+    if (stop !== -1) end = Math.max(start, Math.min(end, stop));
+  }
   return {
     items: items.slice(start, end),
     prev: start > 0 ? items[Math.max(0, start - opts.limit)]!.seq : null,

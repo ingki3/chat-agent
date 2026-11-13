@@ -19,10 +19,12 @@ import {
   boxStyle,
   cellsOf,
   colName,
+  columns,
   GRID_COLS,
   highlightsOf,
   isTargetUnit,
   linesOf,
+  loadedView,
   pieces,
   type Block,
   type Cell,
@@ -40,16 +42,22 @@ import "./files.css";
  * response the download uses); PDF pages are never rendered from the original. Every request goes through the
  * share projection on the server (#29).
  */
+type Window = { from: number; to?: number | undefined };
+
 export function FileViewerPage({ conversationId, fileId }: { conversationId: string; fileId: string }) {
   const { search } = useLocation();
   const loc = parseLocParam(new URLSearchParams(search).get("loc"));
   const navigate = useNavigate();
   const view = useInfiniteQuery({
     queryKey: ["file-view", fileId, loc ? JSON.stringify(loc) : null],
-    queryFn: ({ pageParam }) => files.view(fileId, pageParam === undefined ? { loc } : { from: pageParam }),
-    initialPageParam: undefined as number | undefined,
-    getNextPageParam: (last) => last.next ?? undefined,
-    getPreviousPageParam: (first) => first.prev ?? undefined,
+    // The opening window resolves the locator; the windows before and after only page the text (review #123: the
+    // target is read from the opening window, wherever it ends up in the list).
+    queryFn: ({ pageParam }) => files.view(fileId, pageParam === undefined ? { loc } : pageParam),
+    initialPageParam: undefined as Window | undefined,
+    getNextPageParam: (last): Window | undefined => (last.next === null ? undefined : { from: last.next }),
+    // A window before ends where the first one shown starts: nothing is shown twice.
+    getPreviousPageParam: (first): Window | undefined =>
+      first.prev === null ? undefined : { from: first.prev, to: first.items[0]?.seq },
     retry: false,
     // Still being read: look again until the text is there.
     refetchInterval: (q) => (q.state.data?.pages[0]?.extract.status === "pending" ? 3000 : false),
@@ -59,7 +67,8 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
     if ((window.history.state as { idx?: number } | null)?.idx) void navigate(-1);
     else void navigate(`/c/${encodeURIComponent(conversationId)}`);
   };
-  const first = view.data?.pages[0];
+  const loaded = view.data ? loadedView(view.data) : undefined;
+  const first = loaded?.opening;
   const refused =
     view.error instanceof ApiError && [400, 403, 404].includes(view.error.status)
       ? true
@@ -102,7 +111,7 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
         <div className="empty muted">불러오는 중…</div>
       </>
     );
-  const items = view.data.pages.flatMap((p) => p.items);
+  const items = loaded!.items;
   return (
     <>
       {bar(`📄 ${first.file.name}`, first.file)}
@@ -360,12 +369,6 @@ function PageView({
 }
 
 /** Cells by column (1…max), the gaps of merged cells left empty; null when the row is wider than a grid draws. */
-function grid(cells: readonly Cell[]): (Cell | undefined)[] | null {
-  const max = cells.reduce((m, c) => Math.max(m, c.col), 0);
-  if (max > GRID_COLS) return null;
-  return Array.from({ length: max }, (_, i) => cells.find((c) => c.col === i + 1));
-}
-
 function CellText({ c, segs, target }: { c: Cell; segs: readonly ViewSegment[]; target: ViewTarget | null }) {
   const seg = segs.find((s) => s.seq === c.seq)!;
   return <Text seg={seg} target={target} start={c.start} end={c.end} />;
@@ -384,7 +387,7 @@ function RowCells({
   letters?: number;
 }) {
   const cells = cellsOf(segs);
-  const g = cells.length ? grid(cells) : null;
+  const g = cells.length ? columns(cells) : null;
   if (!cells.length || !g)
     // No columns kept (a secret's removal cost the marks) or too wide: the row's text as it is.
     return (
@@ -400,10 +403,20 @@ function RowCells({
   return (
     <>
       {Array.from({ length: width }, (_, i) => {
-        const c = g[i];
+        // Every piece of the column, in reading order (a cell split around a note is several, review #123).
+        const cs = g[i] ?? [];
         return (
-          <td key={i} className={c && focusIn(c, target) ? "fv-cell-focus" : undefined} title={c?.ref}>
-            {c && <CellText c={c} segs={segs} target={target} />}
+          <td
+            key={i}
+            className={cs.some((c) => focusIn(c, target)) ? "fv-cell-focus" : undefined}
+            title={cs[0]?.ref}
+          >
+            {cs.map((c, k) => (
+              <span key={k}>
+                {k > 0 && " "}
+                <CellText c={c} segs={segs} target={target} />
+              </span>
+            ))}
           </td>
         );
       })}

@@ -20,12 +20,14 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { inProcessExtractor, ocrCapability } from "../src/files/extract.js";
+import { prefixHash } from "../src/files/text.js";
 import { resolveTarget, viewWindow } from "../src/files/viewer.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { FakeRuntime, defaultScript } from "../src/runtime/fake.js";
 import { ASSIGNMENT_TABLE3_ROW2, REPORT_PAGE12, SCANNED_LINE2 } from "../src/runtime/fake-files.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { createFamily, shareWithShared } from "./helpers/permission-matrix.js";
+import { hwpxDoc, xnote, xp, xt, xtable } from "./helpers/hwp-docs.js";
 
 /**
  * The file viewer (#24, PRD FR-4.5, 수용 기준 2): `GET /api/files/:id/view` serves the scrubbed extracted text with
@@ -300,6 +302,146 @@ describe("the viewer and the share projection (#29)", () => {
   });
 });
 
+describe("review #123", () => {
+  it("[P2 1] a secret registered before a repeated sentence: the old range now on the second copy is not claimed", async () => {
+    const { app, f, upload, send, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const S = "같은 문장이 이 파일에 두 번 나옵니다.";
+    // The secret is S.length + 5 long: hidden as "[숨김]" (4), the text before the first copy shrinks by exactly
+    // one copy and its separator — the stored range then lands on the second copy, whose quote is the same.
+    const secret = `sk-dup-${crypto.randomBytes(32).toString("hex")}`.slice(0, S.length + 5);
+    const file = await upload(c.id, "dup.txt", Buffer.from(`앞 ${secret} 뒤 ${S} ${S}\n`));
+    const cited = await send(c.id, `/file-cite ${file.id} ${S}`, [file.id]);
+    const loc = cited.note!.citations[0]!.locator!;
+    expect((await view(f.cookies.owner, file.id, loc)).body!.target!.status).toBe("exact");
+    app.storedRescrub!.close();
+    knownSecrets.add(secret);
+    closers.push(() => knownSecrets.remove(secret));
+    const v = (await view(f.cookies.owner, file.id, loc)).body!;
+    // The range really is on the second copy now (what made the old check pass) …
+    const text = v.items[0]!.text;
+    const [a, b] = loc.charRange!;
+    expect(text.slice(a, b)).toBe(S);
+    expect(text.indexOf(S)).toBeLessThan(a);
+    // … and it is not claimed: only the line.
+    expect([v.target!.status, v.target!.reasons, v.target!.range]).toEqual([
+      "unit",
+      ["unverified"],
+      undefined,
+    ]);
+    expect(JSON.stringify(v)).not.toContain(secret);
+  });
+
+  it("[P2 4] a run of lines that lost its places: a line it surely has is the run; a line past what it shows is nothing", async () => {
+    const { app, f, upload, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const split = `sk-split-${crypto.randomBytes(6).toString("hex")}`;
+    const halves = [split.slice(0, 8), split.slice(8)];
+    const file = await upload(c.id, "b.txt", Buffer.from(`첫째 ${halves[0]}\n${halves[1]} 둘째\n셋째 줄\n`));
+    await app.fileExtracts!.idle();
+    app.storedRescrub!.close();
+    knownSecrets.add(`${halves[0]}\n${halves[1]}`);
+    closers.push(() => knownSecrets.remove(`${halves[0]}\n${halves[1]}`));
+    const rev = (await view(f.cookies.owner, file.id)).body!.extract.fileRevision;
+    const at = async (line: number) =>
+      (await view(f.cookies.owner, file.id, { fileId: file.id, fileRevision: rev, kind: "line", line })).body!
+        .target!;
+    const two = await at(2);
+    expect([two.status, two.seqs]).toEqual(["unit", [0]]);
+    expect(two.reasons).toContain("approximate");
+    for (const line of [3, 9999]) {
+      const t = await at(line);
+      expect([t.status, t.reasons, t.seqs], `line ${line}`).toEqual(["not_found", ["unit_missing"], []]);
+    }
+  });
+
+  it("[P2 3] an HWPX cell with text after its footnote: two pieces of one column, both served (the screen draws both)", async () => {
+    const { app, f, upload, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const doc = await hwpxDoc(xp(xtable(`${xt("각주 앞 글")}${xnote("각주 내용.")}${xt("각주 뒤 글")}`)));
+    const file = await upload(c.id, "cell.hwpx", doc);
+    await app.fileExtracts!.idle();
+    const items = (await view(f.cookies.owner, file.id)).body!.items;
+    const row = items.filter((x) => x.locator.kind === "table" && x.locator.footnote === undefined);
+    expect(row.map((x) => [x.split, x.marks.map((m) => m.col), x.text])).toEqual([
+      [true, [1], "각주 앞 글"],
+      [true, [1], "각주 뒤 글"],
+    ]);
+    expect(items.some((x) => x.locator.footnote === 1 && x.text === "각주 내용.")).toBe(true);
+  });
+
+  it("[P3 5] windows before the opening one end where it starts: nothing twice", async () => {
+    const { app, f, upload, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const body = Array.from({ length: 200 }, (_, i) => `${i + 1}번째 단락입니다.`).join("\n\n");
+    const file = await upload(c.id, "long.md", Buffer.from(body));
+    await app.fileExtracts!.idle();
+    const all = (await view(f.cookies.owner, file.id, undefined, "&limit=300")).body!.items;
+    expect(all.length).toBeGreaterThan(5);
+    const rev = (await view(f.cookies.owner, file.id)).body!.extract.fileRevision;
+    void rev;
+    const first = (await view(f.cookies.owner, file.id, undefined, `&from=${all[3]!.seq}&limit=2`)).body!;
+    const before = (
+      await view(f.cookies.owner, file.id, undefined, `&from=${first.prev}&to=${first.items[0]!.seq}&limit=2`)
+    ).body!;
+    expect(before.items.map((x) => x.seq)).toEqual([all[1]!.seq, all[2]!.seq]);
+    const edge = (await view(f.cookies.owner, file.id, undefined, `&from=0&to=${all[1]!.seq}&limit=2`)).body!;
+    expect(edge.items.map((x) => x.seq)).toEqual([all[0]!.seq]);
+  });
+});
+
+describe("the viewer and every kind of share (#29, review #123)", () => {
+  it("snapshot: a file sent after the boundary is 403; revoked 403; owner deactivated 403", async () => {
+    const { app, f, upload, send, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const before = await upload(c.id, "sample.txt");
+    const r1 = await send(c.id, "안녕", [before.id]);
+    const boundary = app.conversations!.messageById(r1.assistantId)!;
+    const after = await upload(c.id, "assignment.hwp");
+    await send(c.id, "또", [after.id]);
+    const snap = app.sharing!.store.create({
+      ownerId: f.users.owner.id,
+      itemKind: "conversation",
+      itemId: c.id,
+      conversationId: c.id,
+      target: { audience: "users", userIds: [f.users.shared.id] },
+      mode: "snapshot",
+      boundaryMessageId: boundary.id,
+      snapshot: app.sharing!.compute(c.id, { live: false, boundarySeq: boundary.seq }),
+    });
+    expect((await view(f.cookies.shared, before.id)).status).toBe(200);
+    expect((await view(f.cookies.shared, after.id)).status).toBe(403);
+    app.sharing!.store.revoke(snap.id);
+    expect((await view(f.cookies.shared, before.id)).status).toBe(403);
+    // A live share again, then its owner deactivated: it reaches no one.
+    shareWithShared(f, c.id);
+    expect((await view(f.cookies.shared, after.id)).status).toBe(200);
+    app.users!.deactivate(f.users.owner.id);
+    expect((await view(f.cookies.shared, after.id)).status).toBe(403);
+    expect((await view(f.cookies.shared, before.id)).status).toBe(403);
+  });
+
+  it("an artifact share: only the document's own file opens", async () => {
+    const { app, f, upload, send, view } = await start();
+    const c = app.conversations!.create(f.users.owner.id);
+    const other = await upload(c.id, "sample.txt");
+    const r = await send(c.id, "보고서 만들어 줘", [other.id]);
+    const doc = await upload(c.id, "report.pdf");
+    const { artifact } = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: c.id, runId: r.run.id },
+      {
+        kind: "document",
+        title: "보고서",
+        document: { fileId: doc.id, name: "report.pdf", mimeType: "application/pdf" },
+      },
+    );
+    shareWithShared(f, c.id, { kind: "artifact", id: artifact.id });
+    expect((await view(f.cookies.shared, doc.id)).status).toBe(200);
+    expect((await view(f.cookies.shared, other.id)).status).toBe(403);
+    expect((await view(f.cookies.stranger, doc.id)).status).toBe(403);
+  });
+});
+
 describe("resolveTarget and viewWindow (pure)", () => {
   const file = { id: "f1", sha256: "a".repeat(64) };
   const base = { fileId: "f1", fileRevision: "a".repeat(64) };
@@ -336,6 +478,7 @@ describe("resolveTarget and viewWindow (pure)", () => {
       {
         locator: { ...base, kind: "page" as const, page: 1, charRange: [0, 3] as [number, number] },
         quote: "가나다",
+        textHash: prefixHash("가나다 라마바 사아자", 3),
       },
     ];
     const page = resolveTarget(file, { status: "ok" }, items, cited[0]!.locator, cited);
@@ -376,7 +519,15 @@ describe("resolveTarget and viewWindow (pure)", () => {
       s(1, { kind: "line", line: 41 }, "x\ny", { approximate: true }),
     ];
     const loc = { ...base, kind: "line" as const, line: 2, charRange: [5, 10] as [number, number] };
-    const t = resolveTarget(file, { status: "ok" }, items, loc, [{ locator: loc, quote: "인용 구절" }]);
+    const t = resolveTarget(file, { status: "ok" }, items, loc, [
+      { locator: loc, quote: "인용 구절", textHash: prefixHash(text, 14) },
+    ]);
+    // The same, checked in other text (no hash, or another one): the line, not the range.
+    for (const textHash of [undefined, prefixHash("다른 글", 3)])
+      expect(
+        resolveTarget(file, { status: "ok" }, items, loc, [{ locator: loc, quote: "인용 구절", textHash }])
+          .reasons,
+      ).toEqual(["unverified"]);
     expect(t.status).toBe("exact");
     expect(text.slice(t.range!.start, t.range!.end)).toBe("인용 구절");
     expect(t.focus).toEqual({ seq: 0, start: 4, end: 14 });

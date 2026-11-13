@@ -32,10 +32,14 @@ async function uploadAndAsk(
   files: { name: string; mimeType: string; buffer: Buffer }[],
   command: string,
 ) {
-  await page.getByTestId("file-input").setInputFiles(files);
+  // One at a time: `/file-compare` names the files by their order in `file_list` (upload order) — two uploads
+  // stored in the same millisecond would be listed by id.
   const chips = page.getByTestId("attachment");
-  await expect(chips).toHaveCount(files.length);
-  for (let i = 0; i < files.length; i++) await expect(chips.nth(i)).toHaveAttribute("data-status", "done");
+  for (let i = 0; i < files.length; i++) {
+    await page.getByTestId("file-input").setInputFiles([files[i]!]);
+    await expect(chips).toHaveCount(i + 1);
+    await expect(chips.nth(i)).toHaveAttribute("data-status", "done");
+  }
   await page.getByLabel("메시지 입력").fill(command);
   await page.getByLabel("메시지 입력").press("Enter");
   await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 60_000 });
