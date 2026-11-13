@@ -358,6 +358,25 @@ describe("sandboxedSkillRunner: what needs no proxy is checked before the proxy 
     expect(await run(nodeNet, { text: "x" }, s)).toEqual({ ok: false, code: "skill_unavailable" });
     expect(c.proxies).toBe(0);
   });
+
+  it("review #138: a pinned copy changed while the proxy is prepared does not run (verified again before the run)", async () => {
+    let changed = false;
+    let proxies = 0;
+    const verified: boolean[] = [];
+    const run = sandboxedSkillRunner({
+      python: { exe: "/nonexistent/python3", root: "/nonexistent" },
+      proxy: async () => {
+        proxies++;
+        await new Promise((r) => setTimeout(r, 20)); // a slow proxy; the copy changes meanwhile
+        changed = true;
+        return { url: "http://127.0.0.1:9", port: 9 };
+      },
+    });
+    const spec: BundledSkill = { ...news, verify: () => (verified.push(!changed), !changed) };
+    expect(await run(spec, { query: "x" }, s)).toEqual({ ok: false, code: "skill_changed" });
+    expect(proxies).toBe(1);
+    expect(verified).toEqual([true, false]); // checked before the proxy, and again right before the run
+  });
 });
 
 describe("skillPolicy", () => {

@@ -370,7 +370,7 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
   return async (skill, input) => {
     // Order (#135): every check that needs no proxy first — the pinned copy (install.ts), the policy's refusals,
     // the send gate — and only then the skill's egress proxy, so a refused call never starts one.
-    // An installed skill runs only from its pinned copy, checked again before each run (install.ts).
+    // An installed skill runs only from its pinned copy (install.ts): checked here (a cheap refusal) and again below.
     if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
     let policy;
     try {
@@ -387,6 +387,9 @@ export function sandboxedSkillRunner(o: SandboxedRunnerOptions = {}): SkillRunne
       return { ok: false, code: e instanceof SkillRefused ? e.code : "skill_unavailable" };
     }
     const { secretValues, ...run } = policy;
+    // Checked again right before the run (review #138): the copy that runs is the one verified, even if it changed
+    // while the proxy was being prepared.
+    if (skill.verify && !skill.verify()) return { ok: false, code: "skill_changed" };
     let r;
     try {
       r = await runIsolated({
