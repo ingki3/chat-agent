@@ -283,22 +283,24 @@ export function ConvMenu({ c }: { c: Conversation }) {
           <button type="button" role="menuitem" onClick={() => act.mutate("pin")}>
             {c.pinned ? "고정 해제" : "고정"}
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setOpen(false);
-              setSharing(true);
-            }}
-          >
-            가족에게 공유
-          </button>
+          {c.owned === true && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                setSharing(true);
+              }}
+            >
+              가족에게 공유
+            </button>
+          )}
           <button type="button" role="menuitem" className="danger" onClick={() => act.mutate("delete")}>
             삭제
           </button>
         </div>
       )}
-      {sharing && (
+      {sharing && c.owned === true && (
         <ShareDialog
           item={{ kind: "conversation", id: c.id, title: c.title }}
           onClose={() => setSharing(false)}

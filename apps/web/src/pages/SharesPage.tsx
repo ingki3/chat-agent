@@ -5,6 +5,7 @@ import { SHARE_FORK_NOTICE, type PublicPart, type SharedView } from "@agentlee/s
 import { ApiError, conversations, errorText, files, shares, SHARES_KEY } from "../api.js";
 import { CONVERSATIONS_KEY } from "../Sidebar.js";
 import {
+  BoundaryPicker,
   MODE_LABEL,
   MyShare,
   TargetPicker,
@@ -26,11 +27,6 @@ function ShareForm() {
   // No one until chosen: "가족 전체" is a choice too, never a default.
   const [target, setTarget] = useState<TargetDraft>({ audience: "users", userIds: [] });
   const audience = targetOf(target);
-  const msgs = useQuery({
-    queryKey: ["conversations", conversationId, "share-messages"],
-    queryFn: () => conversations.messages(conversationId),
-    enabled: !!conversationId && mode === "snapshot",
-  });
   const create = useMutation({
     mutationFn: () =>
       shares.shareConversation(conversationId, {
@@ -73,24 +69,8 @@ function ShareForm() {
           </label>
         ))}
       </div>
-      {mode === "snapshot" && (
-        <label>
-          이 메시지까지{" "}
-          <select aria-label="경계 메시지" value={boundary} onChange={(e) => setBoundary(e.target.value)}>
-            <option value="">고르세요</option>
-            {(msgs.data?.items ?? [])
-              .filter((m) => m.role !== "system")
-              .map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.role === "user" ? "나" : "답"}:{" "}
-                  {m.parts
-                    .flatMap((p) => (p.type === "text" ? [p.text] : []))
-                    .join(" ")
-                    .slice(0, 40)}
-                </option>
-              ))}
-          </select>
-        </label>
+      {mode === "snapshot" && conversationId && (
+        <BoundaryPicker conversationId={conversationId} value={boundary} onChange={setBoundary} />
       )}
       <TargetPicker value={target} onChange={setTarget} />
       <p className="muted small">

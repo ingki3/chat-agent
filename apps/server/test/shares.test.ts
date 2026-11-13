@@ -440,6 +440,14 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
     });
   });
 
+  it("says who owns it: the owner's screens manage it, a shared reader's do not (review #119)", async () => {
+    const w = await snapshotWorld();
+    expect((await w.owner.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({ owned: true });
+    expect((await w.viewer.get(`/api/conversations/${w.c.id}`)).json()).toMatchObject({ owned: false });
+    const mine = (await w.owner.get("/api/conversations")).json<{ items: { owned?: boolean }[] }>().items;
+    expect(mine.every((c) => c.owned === true)).toBe(true);
+  });
+
   it("a snapshot needs a finished boundary message of the conversation", async () => {
     const w = await start();
     const c = w.app.conversations!.create(w.f.users.owner.id);

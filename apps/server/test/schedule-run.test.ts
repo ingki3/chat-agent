@@ -12,6 +12,7 @@ import {
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { notifyResultSubscribers } from "../src/shares/notify.js";
+import { SHARED_BODY } from "../src/notifications/compose.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb, type Db } from "../src/db/client.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
@@ -257,6 +258,13 @@ describe("schedule runs in the result conversation (#56)", () => {
       payload: { notifyResults: true },
     });
     expect(sub.statusCode).toBe(200);
+    // The owner renames the schedule: its name is the owner's (the viewer cannot read the schedule) — it must not
+    // reach the viewer's notification (review #119 P1).
+    const secretName = "엄마만 아는 새 이름";
+    expect((await t.req("owner", "PATCH", `/api/schedules/${s.id}`, { name: secretName })).statusCode).toBe(
+      200,
+    );
+    expect((await t.req("shared", "GET", `/api/schedules/${s.id}`)).statusCode).not.toBe(200);
     const again = await t.req("owner", "POST", `/api/schedules/${s.id}/run`);
     const run2 = ScheduleRun.parse(again.json().run);
     await until(() => t.finished(run2.id) && t.runRow(run2.id).notified_at !== null);
@@ -264,6 +272,18 @@ describe("schedule runs in the result conversation (#56)", () => {
     expect(theirs).toHaveLength(1);
     expect(theirs[0]).toMatchObject({ kind: "schedule_succeeded", url: `/shared/${shareId}` });
     expect(theirs[0]!.body).not.toContain("비밀 요약");
+    // Every field from the share as the viewer sees it: the shared title, the fixed shared body, the share's link.
+    const view = (await t.req("shared", "GET", `/api/shares/${shareId}/view`)).json<{
+      share: { title: string };
+    }>();
+    expect(theirs[0]!.title).toBe(view.share.title);
+    expect(theirs[0]!.body).toBe(SHARED_BODY);
+    const api = (await t.req("shared", "GET", "/api/notifications")).body;
+    expect(api).not.toContain(secretName);
+    expect(JSON.stringify(theirs)).not.toContain(secretName);
+    expect(JSON.stringify(theirs)).not.toContain(convId);
+    // The owner's own notification does use the new name.
+    expect(t.notes(t.f!.users.owner.id).at(-1)!.title).toBe(secretName);
     // Shared with them too, but not chosen: nothing.
     expect(t.notes(t.f!.users.stranger.id)).toEqual([]);
     // The owner still gets theirs, one per run.

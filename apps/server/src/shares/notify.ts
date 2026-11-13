@@ -1,7 +1,28 @@
 import type { PublishInput } from "../notifications/compose.js";
 import type { Publisher } from "../schedules/handler.js";
 import type { SharePolicy } from "./projection.js";
+import type { ShareRow } from "./store.js";
 import { SHARE_KIND } from "./routes.js";
+
+/**
+ * What a viewer's notification says — built from the share alone, never from the owner's notification (review #119):
+ * the title is the shared item's title as the viewer's own list shows it (`incoming`, the projection's), not the
+ * schedule's name (the owner's, which the viewer cannot read and which may have been renamed since); the body is a
+ * fixed line (no result text, no failure reason — the service replaces it with the shared body anyway); the link and
+ * the reference are the share.
+ */
+function sharedInput(
+  sharing: SharePolicy,
+  s: ShareRow,
+  kind: "schedule_succeeded" | "schedule_failed",
+): PublishInput {
+  const title = sharing.incoming(s).title || "공유받은 예약 결과";
+  const url = `/shared/${s.id}`;
+  const ref = { kind: SHARE_KIND, id: s.id };
+  return kind === "schedule_succeeded"
+    ? { kind, scheduleName: title, summary: "", url, ref }
+    : { kind, scheduleName: title, reason: "", url, ref };
+}
 
 /**
  * A schedule's new result (or failure) in a shared result conversation (#52, FR-8.8): the viewers who chose "새 결과
@@ -15,7 +36,8 @@ export function notifyResultSubscribers(
   publisher: Publisher | undefined,
   r: { conversationId: string; messageId: string; input: PublishInput; dedupeKey: string },
 ): void {
-  if (!publisher || (r.input.kind !== "schedule_succeeded" && r.input.kind !== "schedule_failed")) return;
+  const kind = r.input.kind;
+  if (!publisher || (kind !== "schedule_succeeded" && kind !== "schedule_failed")) return;
   const told = new Set<string>();
   for (const s of sharing.store.activeInConversation(r.conversationId)) {
     if (s.itemKind !== "conversation") continue;
@@ -23,11 +45,9 @@ export function notifyResultSubscribers(
       if (told.has(viewer)) continue;
       if (!sharing.project(s, viewer)?.messages.has(r.messageId)) continue;
       told.add(viewer);
-      publisher.publish(
-        viewer,
-        { ...r.input, url: `/shared/${s.id}`, ref: { kind: SHARE_KIND, id: s.id } },
-        { dedupeKey: `${r.dedupeKey}:shared:${viewer}` },
-      );
+      publisher.publish(viewer, sharedInput(sharing, s, kind), {
+        dedupeKey: `${r.dedupeKey}:shared:${viewer}`,
+      });
     }
   }
 }

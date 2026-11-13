@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SHARE_REVOKE_NOTICE, type Share, type ShareAudience } from "@agentlee/shared";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { SHARE_REVOKE_NOTICE, type Message, type Share, type ShareAudience } from "@agentlee/shared";
 import { conversations, errorText, shares, SHARES_KEY } from "../api.js";
 import "./shares.css";
 
@@ -140,6 +140,72 @@ export function MyShare({ s }: { s: Share }) {
   );
 }
 
+/**
+ * The messages a snapshot may end at, oldest first, from pages of the history as the API gives them (each page oldest
+ * → newest, newest page first): system lines (dividers) are no boundary.
+ */
+export function boundaryOptions(
+  pages: readonly { items: readonly Message[] }[],
+): { id: string; label: string }[] {
+  return [...pages]
+    .reverse()
+    .flatMap((p) => p.items)
+    .filter((m) => m.role !== "system")
+    .map((m) => ({
+      id: m.id,
+      label: `${m.role === "user" ? "나" : "답"}: ${m.parts
+        .flatMap((p) => (p.type === "text" ? [p.text] : []))
+        .join(" ")
+        .slice(0, 40)}`,
+    }));
+}
+
+/** "이 메시지까지": every message of the history can be the boundary — older pages load on request. */
+export function BoundaryPicker({
+  conversationId,
+  value,
+  onChange,
+}: {
+  conversationId: string;
+  value: string;
+  onChange: (id: string) => void;
+}) {
+  const msgs = useInfiniteQuery({
+    queryKey: ["conversations", conversationId, "share-messages"],
+    queryFn: ({ pageParam }) => conversations.messages(conversationId, pageParam),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (last) => last.nextBefore ?? undefined,
+  });
+  const options = boundaryOptions(msgs.data?.pages ?? []);
+  return (
+    <div className="row wrap">
+      <label>
+        이 메시지까지{" "}
+        <select aria-label="경계 메시지" value={value} onChange={(e) => onChange(e.target.value)}>
+          <option value="">고르세요</option>
+          {options.map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {msgs.hasNextPage && (
+        <button
+          type="button"
+          className="ghost small"
+          data-testid="boundary-older"
+          disabled={msgs.isFetchingNextPage}
+          onClick={() => void msgs.fetchNextPage()}
+        >
+          {msgs.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 더 불러오기"}
+        </button>
+      )}
+      {msgs.isError && <p className="notice warn small">{errorText(msgs.error)}</p>}
+    </div>
+  );
+}
+
 export type ShareItem = { kind: "conversation" | "artifact"; id: string; title: string };
 
 /** A new share of the item: who, and (a conversation) how far — live, or "이 메시지까지" (decision #3). */
@@ -151,11 +217,6 @@ function NewShare({ item }: { item: ShareItem }) {
   const [target, setTarget] = useState<TargetDraft>({ audience: "users", userIds: [] });
   const audience = targetOf(target);
   const conversation = item.kind === "conversation";
-  const msgs = useQuery({
-    queryKey: ["conversations", item.id, "share-messages"],
-    queryFn: () => conversations.messages(item.id),
-    enabled: conversation && mode === "snapshot",
-  });
   const create = useMutation({
     mutationFn: () =>
       conversation
@@ -188,23 +249,7 @@ function NewShare({ item }: { item: ShareItem }) {
         </div>
       )}
       {conversation && mode === "snapshot" && (
-        <label>
-          이 메시지까지{" "}
-          <select aria-label="경계 메시지" value={boundary} onChange={(e) => setBoundary(e.target.value)}>
-            <option value="">고르세요</option>
-            {(msgs.data?.items ?? [])
-              .filter((m) => m.role !== "system")
-              .map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.role === "user" ? "나" : "답"}:{" "}
-                  {m.parts
-                    .flatMap((p) => (p.type === "text" ? [p.text] : []))
-                    .join(" ")
-                    .slice(0, 40)}
-                </option>
-              ))}
-          </select>
-        </label>
+        <BoundaryPicker conversationId={item.id} value={boundary} onChange={setBoundary} />
       )}
       <TargetPicker value={target} onChange={setTarget} />
       <p className="muted small">
@@ -258,6 +303,9 @@ export function ShareDialog({ item, onClose }: { item: ShareItem; onClose: () =>
       data-testid="share-dialog"
       aria-labelledby={titleId}
       onClose={onClose}
+      // Keys stay in the dialog (Esc closes the dialog only — the browser's own cancel — never the drawer or the
+      // panel around it; Tab is the modal's own, not the drawer's focus loop).
+      onKeyDown={(e) => e.stopPropagation()}
       onClick={(e) => {
         if (e.target === dialog.current) dialog.current.close();
       }}
@@ -281,9 +329,11 @@ export function ShareDialog({ item, onClose }: { item: ShareItem; onClose: () =>
         <p className="small" data-testid="share-status">
           {list.isPending
             ? "불러오는 중…"
-            : active.length
-              ? `공유 중 — ${[...new Set(names)].join(", ")}`
-              : "비공개 — 아직 아무에게도 공유하지 않았어요."}
+            : list.isError && !list.data
+              ? "공유 상태를 확인할 수 없어요. 잠시 뒤 다시 열어 보세요."
+              : active.length
+                ? `공유 중 — ${[...new Set(names)].join(", ")}`
+                : "비공개 — 아직 아무에게도 공유하지 않았어요."}
         </p>
         {list.isError && <p className="notice warn">{errorText(list.error)}</p>}
         {items.length > 0 && (

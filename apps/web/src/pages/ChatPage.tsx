@@ -325,9 +325,10 @@ export function ChatPage() {
   return (
     <>
       <TopBar title={conv.data?.title ?? "…"}>
-        {conv.data && <ResearchToggle c={conv.data} />}
+        {conv.data?.owned === true && <ResearchToggle c={conv.data} />}
         {conv.data && <ReferencesButton conversationId={conv.data.id} />}
-        {conv.data && <ConvMenu c={conv.data} />}
+        {/* Only the server-confirmed owner manages it (#52): a shared reader gets no menu, no share dialog. */}
+        {conv.data?.owned === true && <ConvMenu c={conv.data} />}
       </TopBar>
       <div className="thread" data-testid="thread" ref={scroller}>
         <div className="col" ref={content}>

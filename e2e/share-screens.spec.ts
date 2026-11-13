@@ -78,6 +78,13 @@ test("share from the conversation menu → the sidebar's 가족 공유 → fork 
   await item.click();
   const view = vpage.getByTestId("shared-view");
   await expect(view.getByTestId("shared-message").first()).toContainText("포크할 첫 질문");
+  const sharedUrl = vpage.url();
+  // Straight at /c/:id: read through the share, no menu, no share dialog, no toggle (review #119).
+  await vpage.goto(`/c/${conv.id}`);
+  await expect(vpage.getByTestId("thread")).toContainText("포크할 첫 질문");
+  await expect(vpage.locator(".topbar").getByRole("button", { name: `${title} 메뉴` })).toHaveCount(0);
+  await expect(vpage.getByTestId("share-open")).toHaveCount(0);
+  await vpage.goto(sharedUrl);
 
   // Owner: the receipt says it was opened (the dialog reads it again when it opens).
   await page.reload();
@@ -160,6 +167,7 @@ test("an artifact shared from its own page is copied by the viewer to change it 
   await expect(vpage.getByTestId("share-open")).toHaveCount(0);
   await vpage.goto("/shared");
   await vpage.getByTestId("incoming-share").getByRole("link").first().click();
+  const sharedUrl = vpage.url();
   await vpage.getByTestId("fork").click();
   await expect(vpage).toHaveURL(/\/c\/[0-9a-f-]+$/);
   const forkId = new URL(vpage.url()).pathname.split("/").pop()!;
@@ -169,5 +177,107 @@ test("an artifact shared from its own page is copied by the viewer to change it 
   expect(arts.items).toHaveLength(1);
   expect(arts.items[0]!.id).not.toBe(artifactId);
   expect((await vpage.request.get(`/a/${arts.items[0]!.id}/v/1/raw`)).status()).toBe(200);
+
+  // Owner, in the chat's artifact panel: Esc closes the share dialog only — the panel stays (review #119).
+  await page.goto(`/c/${conv.id}`);
+  await page.getByTestId("assistant").last().getByTestId("artifact-card").first().click();
+  const panel = page.getByTestId("artifact-panel");
+  await expect(panel.getByTestId("artifact-frame")).toBeVisible();
+  await panel.getByTestId("share-open").click();
+  await expect(page.getByTestId("share-dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("share-dialog")).toHaveCount(0);
+  await expect(panel.getByTestId("artifact-frame")).toBeVisible();
+
+  // The viewer has the shared screen open; the owner turns the share off from the dialog: it goes at once.
+  await vpage.goto(sharedUrl);
+  await expect(vpage.getByTestId("shared-view")).toBeVisible();
+  await panel.getByTestId("share-open").click();
+  const again = page.getByTestId("share-dialog");
+  await again.getByTestId("my-share").getByRole("button", { name: "공유 끄기" }).click();
+  await expect(again.getByTestId("share-revoked-notice")).toBeVisible();
+  await expect(again.getByTestId("share-status")).toContainText("비공개");
+  await expect(vpage.getByTestId("share-closed")).toBeVisible({ timeout: 10_000 });
+  await expect(vpage.getByTestId("shared-view")).toHaveCount(0);
+  // The copy already made is not taken back.
+  expect((await vpage.request.get(`/api/conversations/${forkId}`)).status()).toBe(200);
   await ctx.close();
+});
+
+test("the boundary picker reaches older messages; a failed status read is never 'private' (review #119)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const owner = await newMember(browser, baseURL!, "boundary-owner");
+  const viewer = await newMember(browser, baseURL!, "boundary-viewer");
+  await signIn(page, baseURL!, owner);
+  const title = `경계 ${crypto.randomUUID().slice(0, 6)}`;
+  const conv = await newConversation(page.request, baseURL!, title);
+  await sayAndWait(page.request, baseURL!, conv.id, "가장 오래된 질문");
+  await sayAndWait(page.request, baseURL!, conv.id, "최근 질문");
+  // The first page is cut to the newest message (as a long history's would be): the older ones need "더 불러오기".
+  await page.route(`**/api/conversations/${conv.id}/messages?limit=100`, async (route) => {
+    const res = await route.fetch();
+    const body = (await res.json()) as { items: { seq: number }[] };
+    const last = body.items.at(-1)!;
+    await route.fulfill({ response: res, json: { items: [last], nextBefore: last.seq } });
+  });
+  await page.goto(`/c/${conv.id}`);
+  await page
+    .locator(".topbar")
+    .getByRole("button", { name: `${title} 메뉴` })
+    .click();
+  await page.getByRole("menuitem", { name: "가족에게 공유" }).click();
+  const dialog = page.getByTestId("share-dialog");
+  await dialog
+    .getByLabel(/이 메시지까지/)
+    .first()
+    .check();
+  const pick = dialog.getByLabel("경계 메시지");
+  await expect(pick.locator("option", { hasText: "가장 오래된 질문" })).toHaveCount(0);
+  await dialog.getByTestId("boundary-older").click();
+  await expect(pick.locator("option", { hasText: "가장 오래된 질문" })).toHaveCount(1);
+  await pick.selectOption({ label: "나: 가장 오래된 질문" });
+  await dialog.getByTestId("share-targets").getByLabel(viewer.name, { exact: true }).check();
+  await dialog.getByRole("button", { name: "공유하기" }).click();
+  await expect(dialog.getByTestId("share-status")).toContainText(viewer.name);
+  const [s] = (await (await page.request.get(`/api/conversations/${conv.id}/shares`)).json()).items as {
+    mode: string;
+    boundaryMessageId: string;
+  }[];
+  expect(s!.mode).toBe("snapshot");
+  const msgs = (await (await page.request.get(`/api/conversations/${conv.id}/messages`)).json()) as {
+    items: { id: string }[];
+  };
+  expect(s!.boundaryMessageId).toBe(msgs.items[0]!.id);
+  await dialog.getByRole("button", { name: "닫기" }).click();
+
+  // The share list cannot be read: the dialog says so, never "비공개".
+  await page.route(`**/api/conversations/${conv.id}/shares`, (route) =>
+    route.request().method() === "GET"
+      ? route.fulfill({ status: 500, json: { error: "x" } })
+      : route.fallback(),
+  );
+  await page.reload();
+  await page
+    .locator(".topbar")
+    .getByRole("button", { name: `${title} 메뉴` })
+    .click();
+  await page.getByRole("menuitem", { name: "가족에게 공유" }).click();
+  const status = page.getByTestId("share-dialog").getByTestId("share-status");
+  await expect(status).toContainText("공유 상태를 확인할 수 없어요", { timeout: 10_000 });
+  await expect(status).not.toContainText("비공개");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("share-dialog")).toHaveCount(0);
+
+  // From the sidebar (on a phone: the open drawer): Esc closes the dialog, not the drawer around it.
+  const side = await sidebar(page, isMobile);
+  await side.getByRole("button", { name: `${title} 메뉴` }).click();
+  await side.getByRole("menuitem", { name: "가족에게 공유" }).click();
+  await expect(page.getByTestId("share-dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("share-dialog")).toHaveCount(0);
+  await expect(side).toBeVisible();
 });

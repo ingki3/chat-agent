@@ -91,7 +91,7 @@ export function registerConversationRoutes(
       });
       return reply
         .header("Cache-Control", "no-store")
-        .send({ items: page.items.map(toConversation), nextCursor: page.nextCursor });
+        .send({ items: page.items.map((c) => toConversation(c)), nextCursor: page.nextCursor });
     },
   );
 
@@ -135,9 +135,9 @@ export function registerConversationRoutes(
   );
 
   app.get<{ Params: IdParams }>("/api/conversations/:id", { config: conv("read") }, async (req, reply) => {
-    const c = toConversation(store.get(req.params.id)!);
     const p = view(req);
     if (p === null) return deny(reply, 403, "forbidden");
+    const c = toConversation(store.get(req.params.id)!, !p);
     // A shared viewer reads it, never the owner's chip or notices (#29).
     // Nor the schedule result marker (#56): it is the owner's, and may point past a snapshot's boundary.
     const out = p
