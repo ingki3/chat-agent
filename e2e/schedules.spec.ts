@@ -36,6 +36,7 @@ test("예약 화면: 새 예약 폼(다음 실행 미리보기) · 일시정지 
   page,
   browser,
   baseURL,
+  isMobile,
 }) => {
   const me = await newMember(browser, baseURL!, "schedform");
   await signIn(page, baseURL!, me);
@@ -66,6 +67,19 @@ test("예약 화면: 새 예약 폼(다음 실행 미리보기) · 일시정지 
   await expect(run).toContainText("바로 실행");
   await expect(run).toContainText("성공", { timeout: 15_000 });
   await expect(run).toContainText("—");
+  // The result is a new message of the schedule's own conversation (#56): "새 결과" in the sidebar until opened.
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "평일 환율" });
+  await expect(conv.getByTestId("new-result")).toBeVisible();
+  if (isMobile) await page.getByRole("button", { name: "메뉴 닫기" }).click();
+  const back = page.url();
+  await page.getByTestId("schedule-conversation").click();
+  await expect(page.getByTestId("user-message")).toContainText("원·달러 환율 알려줘");
+  await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await expect(conv).toBeVisible();
+  await expect(conv.getByTestId("new-result")).toHaveCount(0);
+  await page.goto(back);
 
   // Edit: the name changes, the rest stays.
   await page.getByRole("link", { name: "✎ 수정" }).click();
@@ -201,4 +215,544 @@ test("수정: 권한이 빠진 스킬은 ‘사용할 수 없어요’로 보이
   await expect(page.getByRole("form", { name: "예약 수정" })).toHaveCount(0);
   const after = (await (await page.request.get(`/api/schedules/${id}`)).json()) as { skills: string[] };
   expect(after.skills).toEqual(["us-stock-skill"]);
+});
+
+/** Presses "바로 실행" through the API and waits for the run's end; returns the schedule as it is then. */
+async function runToEnd(page: import("@playwright/test").Page, baseURL: string, id: string) {
+  const r = await page.request.post(`/api/schedules/${id}/run`, { headers: csrf(baseURL) });
+  expect(r.status()).toBe(201);
+  await expect
+    .poll(
+      async () => {
+        const runs = (await (await page.request.get(`/api/schedules/${id}/runs`)).json()) as {
+          runs: { status: string; resultSavedAt: number | null }[];
+        };
+        return runs.runs[0]?.status === "succeeded" && runs.runs[0].resultSavedAt !== null;
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  return (await (await page.request.get(`/api/schedules/${id}`)).json()) as { conversationId: string };
+}
+
+test("새 결과: 알림이 꺼져 있고 예약 화면이 닫혀 있어도 사이드바에 뜬다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schednew");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: {
+        name: "조용한 예약",
+        prompt: "조용히",
+        timing: { type: "daily", time: "08:00" },
+        notify: false,
+      },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  // On another conversation, with no push.
+  const other = (await (
+    await page.request.post("/api/conversations", { data: {}, headers: csrf(baseURL!) })
+  ).json()) as { id: string };
+  await page.clock.install();
+  await page.goto(`/c/${other.id}`);
+  await expect(page.getByTestId("sidebar")).toBeAttached();
+  await runToEnd(page, baseURL!, s.id);
+  // Nothing happens on the page (no focus change, no push): the list is looked at again every minute while visible.
+  await page.clock.fastForward(61_000);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "조용한 예약" });
+  await expect(conv.getByTestId("new-result")).toBeVisible();
+  const inbox = (await (await page.request.get("/api/notifications")).json()) as { items: unknown[] };
+  expect(inbox.items).toHaveLength(0);
+});
+
+/** A schedule result followed by 51 more turns (past the first page of 100); returns the notification's link. */
+async function buriedResult(page: import("@playwright/test").Page, baseURL: string, name: string) {
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name, prompt: "결과 하나", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL, s.id);
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as {
+      items: { kind: string; url: string }[];
+    }
+  ).items;
+  const url = items.find((n) => n.kind === "schedule_succeeded")!.url;
+  expect(url).toMatch(new RegExp(`^/c/${conversationId}#m-`));
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `이어서 ${i}` },
+      headers: csrf(baseURL),
+    });
+    expect(sent.status()).toBe(201);
+    await expect
+      .poll(
+        async () =>
+          (
+            (await (await page.request.get(`/api/conversations/${conversationId}/active-run`)).json()) as {
+              run: unknown;
+            }
+          ).run,
+        { timeout: 10_000, intervals: [20, 50, 100] },
+      )
+      .toBeNull();
+  }
+  return url;
+}
+
+test("결과 링크: 뒤에 대화가 많이 쌓여도 그 메시지로 간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlink");
+  await signIn(page, baseURL!, me);
+  const url = await buriedResult(page, baseURL!, "링크 예약");
+  await page.goto(url);
+  const target = page.locator(`#${url.split("#")[1]}`);
+  await expect(target).toBeInViewport({ timeout: 10_000 });
+  await expect(target).toContainText("결과 하나");
+});
+
+test("결과 링크: 이전 페이지를 못 불러오면 몇 번만 묻고 멈춘 뒤 '다시 시도'로 이어간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkerr");
+  await signIn(page, baseURL!, me);
+  const url = await buriedResult(page, baseURL!, "링크 오류 예약");
+  let older = 0;
+  let status = 500;
+  await page.route(/\/api\/conversations\/[^/]+\/messages\?.*before=/, async (route) => {
+    older++;
+    await route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: "x" }) });
+  });
+  await page.goto(url);
+  const stopped = page.getByTestId("link-search-stopped");
+  await expect(stopped).toBeVisible();
+  await page.waitForTimeout(1500);
+  // The result was never shown: "새 결과" stays.
+  const conversationId = url.split("/")[2]!.split("#")[0]!;
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  expect(await marked()).toBe(true);
+  // One page asked for (and the client's one retry) — not a loop.
+  expect(older).toBeGreaterThan(0);
+  expect(older).toBeLessThanOrEqual(2);
+  // The permission is gone (403): "다시 시도" asks once more and stops again.
+  status = 403;
+  await stopped.getByRole("button", { name: "다시 시도" }).click();
+  await expect(stopped).toBeVisible();
+  await page.waitForTimeout(1500);
+  expect(older).toBeLessThanOrEqual(4);
+  // Back: "다시 시도" finds it.
+  await page.unroute(/\/api\/conversations\/[^/]+\/messages\?.*before=/);
+  await stopped.getByRole("button", { name: "다시 시도" }).click();
+  const target = page.locator(`#${url.split("#")[1]}`);
+  await expect(target).toBeInViewport({ timeout: 10_000 });
+  await expect(stopped).toHaveCount(0);
+  await expect.poll(marked).toBe(false);
+});
+
+test("새 결과: 결과 대화를 열어 둔 채 실행되면 그 화면에 결과가 뜨고 표시가 지워진다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedopen");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: {
+        name: "열린 예약",
+        prompt: "열어 둔 채",
+        timing: { type: "daily", time: "08:00" },
+        notify: false,
+      },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}`);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  // Opened: seen.
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+            newResult: boolean;
+          }
+        ).newResult,
+    )
+    .toBe(false);
+  // Another run while it is open (no push, no focus change).
+  await runToEnd(page, baseURL!, s.id);
+  // The view's messages come slowly: the result is marked seen only once they are there.
+  await page.route(/\/api\/conversations\/[^/]+\/messages\?limit=100$/, async (route) => {
+    await new Promise((r) => setTimeout(r, 2500));
+    await route.continue();
+  });
+  const seen = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.fastForward(61_000);
+  await page.waitForTimeout(1000);
+  expect(await seen()).toBe(true);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect(page.getByTestId("assistant").last()).toHaveAttribute("data-status", "complete");
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+            newResult: boolean;
+          }
+        ).newResult,
+    )
+    .toBe(false);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const conv = page.getByTestId("sidebar").getByTestId("conv").filter({ hasText: "열린 예약" });
+  await expect(conv).toBeVisible();
+  await expect(conv.getByTestId("new-result")).toHaveCount(0);
+});
+
+/** A schedule (notifications off) whose result conversation exists and is open on this page, seen. */
+async function openResult(page: import("@playwright/test").Page, baseURL: string, name: string) {
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name, prompt: "열어 둔 채", timing: { type: "daily", time: "08:00" }, notify: false },
+      headers: csrf(baseURL),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL, s.id);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}`);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await expect.poll(marked).toBe(false);
+  return { id: s.id, conversationId, marked };
+}
+
+test("새 결과: 사이드바가 다른 것을 검색 중이어도 열린 결과 대화가 갱신된다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedsearch");
+  await signIn(page, baseURL!, me);
+  const r = await openResult(page, baseURL!, "검색 중 예약");
+  if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  await page.getByRole("searchbox", { name: "내 대화 검색" }).fill("전혀 다른 것");
+  await expect(page.getByTestId("sidebar").getByTestId("conv")).toHaveCount(0);
+  if (isMobile) await page.getByRole("button", { name: "메뉴 닫기" }).click();
+  await runToEnd(page, baseURL!, r.id);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(r.marked).toBe(false);
+});
+
+test("새 결과: 결과 메시지를 못 불러오면 표시가 남는다 (review #116)", async ({ page, browser, baseURL }) => {
+  const me = await newMember(browser, baseURL!, "schedfail");
+  await signIn(page, baseURL!, me);
+  const r = await openResult(page, baseURL!, "실패 예약");
+  const latest = /\/api\/conversations\/[^/]+\/messages\?limit=100$/;
+  await page.route(latest, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "x" }) }),
+  );
+  await runToEnd(page, baseURL!, r.id);
+  await page.clock.fastForward(61_000);
+  // The client's retry, too.
+  await page.waitForTimeout(500);
+  await page.clock.fastForward(5_000);
+  await page.waitForTimeout(1500);
+  expect(await r.marked()).toBe(true);
+  await expect(page.getByTestId("user-message")).toHaveCount(1);
+  // Readable again: the next look shows it and only then clears the mark.
+  await page.unroute(latest);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(r.marked).toBe(false);
+});
+
+test("보내기: 늦게 온 이전 active-run 응답(null)이 방금 시작한 실행을 지우지 않는다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "activerace");
+  await signIn(page, baseURL!, me);
+  const c = (await (
+    await page.request.post("/api/conversations", { data: {}, headers: csrf(baseURL!) })
+  ).json()) as {
+    id: string;
+  };
+  await page.goto(`/c/${c.id}`);
+  await expect(page.getByRole("textbox", { name: /메시지/ })).toBeVisible();
+  let slow = 0;
+  let armed = false;
+  await page.route(/\/api\/conversations\/[^/]+\/active-run$/, async (route) => {
+    // Only the one background read made below is slow (and says "no run"); every other goes to the server.
+    if (!armed || slow > 0) return route.continue().catch(() => {});
+    slow++;
+    await new Promise((r) => setTimeout(r, 1500));
+    // The page may have cancelled it meanwhile (that is the fix): then there is nothing to answer.
+    await route
+      .fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ run: null }) })
+      .catch(() => {});
+  });
+  // A background read of the active run (focus) is on its way, slowly, with "no run"…
+  await page.waitForTimeout(5_500);
+  armed = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => slow).toBeGreaterThan(0);
+  // Every opening of a run's event stream (a stream closed by a stale "no run" would be opened again).
+  const streams: string[] = [];
+  page.on("request", (r) => {
+    if (/\/api\/runs\/[^/]+\/events/.test(r.url())) streams.push(r.url());
+  });
+  // …when the user sends.
+  const box = page.getByRole("textbox", { name: /메시지/ });
+  await box.fill("/long 60");
+  await box.press("Enter");
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "streaming", { timeout: 5_000 });
+  await page.waitForTimeout(2_000);
+  // The stream stayed open: the reply goes on and ends complete.
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  expect((await reply.innerText()).split(/\s+/).length).toBeGreaterThan(30);
+  // One stream, never closed and reopened on the way.
+  expect(streams).toHaveLength(1);
+});
+
+test("결과 링크로 연 화면도 다음 결과를 받아 보이고 표시를 지운다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedlinknext");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 다음 예약", prompt: "다음 결과", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as { items: { url: string }[] }
+  ).items;
+  const url = items[0]!.url;
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(url);
+  await expect(page.locator(`#${url.split("#")[1]}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // The link's hash stays in the address; the next result still comes into this view.
+  await runToEnd(page, baseURL!, s.id);
+  expect(await marked()).toBe(true);
+  await page.clock.fastForward(61_000);
+  await expect(page.getByTestId("user-message")).toHaveCount(2);
+  await expect.poll(marked).toBe(false);
+  expect(page.url()).toContain("#m-");
+});
+
+/** The newest schedule result's message id (from its notification link). */
+async function latestResultId(page: import("@playwright/test").Page) {
+  const items = (
+    (await (await page.request.get("/api/notifications")).json()) as { items: { url: string }[] }
+  ).items;
+  return items[0]!.url.split("#m-")[1]!;
+}
+
+async function idleConversation(page: import("@playwright/test").Page, conversationId: string) {
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conversationId}/active-run`)).json()) as {
+            run: unknown;
+          }
+        ).run,
+      { timeout: 10_000, intervals: [20, 50, 100] },
+    )
+    .toBeNull();
+}
+
+test("결과 링크로 찾은 뒤 그 답을 다시 생성·앞 질문을 수정해도 다음 결과가 온다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "schedlinkregen");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 재생성 예약", prompt: "재생성", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const first = await latestResultId(page);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${first}`);
+  await expect(page.locator(`#m-${first}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // The linked answer is regenerated (another tab): it leaves the list.
+  const regen = await page.request.post(`/api/conversations/${conversationId}/messages/${first}/regenerate`, {
+    data: {},
+    headers: csrf(baseURL!),
+  });
+  expect(regen.status()).toBe(200);
+  await idleConversation(page, conversationId);
+  await runToEnd(page, baseURL!, s.id);
+  const second = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${second}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+  // An earlier question is edited (another tab): everything after it leaves, the next result still comes.
+  const firstUser = (
+    (await (await page.request.get(`/api/conversations/${conversationId}/messages`)).json()) as {
+      items: { id: string; role: string }[];
+    }
+  ).items.find((m) => m.role === "user")!;
+  const edited = await page.request.post(
+    `/api/conversations/${conversationId}/messages/${firstUser.id}/edit`,
+    { data: { text: "고친 질문" }, headers: csrf(baseURL!) },
+  );
+  expect(edited.status()).toBe(200);
+  await idleConversation(page, conversationId);
+  await runToEnd(page, baseURL!, s.id);
+  const third = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${third}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+});
+
+test("결과 링크로 찾은 뒤 그 메시지가 첫 페이지 밖으로 밀려도 다음 결과가 온다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkpush");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 밀림 예약", prompt: "밀림", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const first = await latestResultId(page);
+  const marked = async () =>
+    (
+      (await (await page.request.get(`/api/conversations/${conversationId}`)).json()) as {
+        newResult: boolean;
+      }
+    ).newResult;
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${first}`);
+  await expect(page.locator(`#m-${first}`)).toBeInViewport();
+  await expect.poll(marked).toBe(false);
+  // 51 turns elsewhere (another tab): the linked message is past the first page of 100 now.
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `밀어내기 ${i}` },
+      headers: csrf(baseURL!),
+    });
+    expect(sent.status()).toBe(201);
+    await idleConversation(page, conversationId);
+  }
+  await runToEnd(page, baseURL!, s.id);
+  const next = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${next}`)).toBeVisible();
+  await expect.poll(marked).toBe(false);
+  await expect(page.getByTestId("link-search-stopped")).toHaveCount(0);
+});
+
+test("결과 링크를 지웠다 다시 붙이거나 다른 링크를 거쳐 돌아와도 다시 찾아 간다 (review #116)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(120_000);
+  const me = await newMember(browser, baseURL!, "schedlinkback");
+  await signIn(page, baseURL!, me);
+  const s = (await (
+    await page.request.post("/api/schedules", {
+      data: { name: "링크 왕복 예약", prompt: "왕복", timing: { type: "daily", time: "08:00" } },
+      headers: csrf(baseURL!),
+    })
+  ).json()) as { id: string };
+  const { conversationId } = await runToEnd(page, baseURL!, s.id);
+  const a = await latestResultId(page);
+  const setHash = (h: string) => page.evaluate((v) => (window.location.hash = v), h);
+  await page.clock.install();
+  await page.goto(`/c/${conversationId}#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport();
+  // The hash goes; meanwhile A falls off the first page (51 turns, then a result the view reads again).
+  await setHash("");
+  for (let i = 0; i < 51; i++) {
+    const sent = await page.request.post(`/api/conversations/${conversationId}/messages`, {
+      data: { text: `왕복 ${i}` },
+      headers: csrf(baseURL!),
+    });
+    expect(sent.status()).toBe(201);
+    await idleConversation(page, conversationId);
+  }
+  await runToEnd(page, baseURL!, s.id);
+  const newest = await latestResultId(page);
+  await page.clock.fastForward(61_000);
+  await expect(page.locator(`#m-${newest}`)).toBeVisible();
+  await expect(page.locator(`#m-${a}`)).toHaveCount(0);
+  // A again: a new link — it is looked for and shown.
+  await setHash(`#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport({ timeout: 10_000 });
+  // Through a link that is never found (B), and back to A: shown again.
+  await page.locator(`#m-${newest}`).scrollIntoViewIfNeeded();
+  await expect(page.locator(`#m-${a}`)).not.toBeInViewport();
+  await setHash(`#m-${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}`);
+  await expect(page.getByTestId("link-search-stopped")).toBeVisible();
+  await setHash(`#m-${a}`);
+  await expect(page.locator(`#m-${a}`)).toBeInViewport({ timeout: 10_000 });
+  await expect(page.getByTestId("link-search-stopped")).toHaveCount(0);
 });

@@ -11,13 +11,14 @@ import {
   type ReactNode,
 } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import {
   publicParts,
   type ChangeSettingsRequest,
   type ChatSettings,
   type Conversation,
   type Message,
+  type Run,
   type StartRunResponse,
   type UploadedFile,
 } from "@agentlee/shared";
@@ -60,6 +61,9 @@ const SWITCHABLE = new Set([
 ]);
 
 const COMPOSER_INPUT = "composer-input";
+/** A result link (`#m-<id>`) loads at most this many older pages looking for its message (review #116). */
+const SEARCH_PAGES = 20;
+const linkKeyOf = (id: string, hash: string) => `${id}${hash}`;
 /** What the chip may offer (#19): allowed runtimes with a passed connection. */
 const USABLE_KEY = ["runtimes", "usable"] as const;
 const useUsableRuntimes = () => useQuery({ queryKey: USABLE_KEY, queryFn: settingsApi.usableRuntimes });
@@ -85,7 +89,13 @@ function useOnline() {
 export function ChatPage() {
   const { id = "" } = useParams();
   const qc = useQueryClient();
-  const conv = useQuery({ queryKey: ["conversation", id], queryFn: () => conversations.get(id) });
+  // Read again every minute while visible (review #116): a schedule result arriving in the open conversation is
+  // noticed here, whatever the sidebar shows (a search, another page).
+  const conv = useQuery({
+    queryKey: ["conversation", id],
+    queryFn: () => conversations.get(id),
+    refetchInterval: 60_000,
+  });
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
@@ -94,7 +104,20 @@ export function ChatPage() {
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
   const list = messages.data ? [...messages.data.pages].reverse().flatMap((p) => p.items) : undefined;
-  const active = useQuery({ queryKey: ["active-run", id], queryFn: () => conversations.activeRun(id) });
+  // The run this page just started (review #116): an answer to an `active-run` request sent before it (a background
+  // refetch still in flight, `null`) never replaces it — the stream would close and the reply never come.
+  const startedHere = useRef<{ id: string; runId: string; at: number } | null>(null);
+  const active = useQuery({
+    queryKey: ["active-run", id],
+    queryFn: async () => {
+      const asked = Date.now();
+      const r = await conversations.activeRun(id);
+      const mine = startedHere.current;
+      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId)
+        return qc.getQueryData<Run | null>(["active-run", id]) ?? null;
+      return r;
+    },
+  });
   const usable = useUsableRuntimes();
   const [after, setAfter] = useState<Record<string, AfterRun>>({});
   const [actionError, setActionError] = useState<string | null>(null);
@@ -148,6 +171,9 @@ export function ChatPage() {
       try {
         const r = await call();
         markStartedHere(r.run.id);
+        startedHere.current = { id, runId: r.run.id, at: Date.now() };
+        // An `active-run` read still in flight would answer from before this run: cancelled first.
+        await qc.cancelQueries({ queryKey: ["active-run", id] });
         qc.setQueryData(["active-run", id], r.run);
         await qc.invalidateQueries({ queryKey: ["messages", id] });
         toBottom();
@@ -200,6 +226,94 @@ export function ChatPage() {
       if (n) setNotice({ id, text: noticeText(n, usable.data) });
     });
   }, [pendingNotice, id, qc, usable.data, usable.isPending]);
+  // A notification's link to the result message (`#m-<id>`, FR-8.4): older pages are loaded until it is there (a
+  // result followed by many turns), then it is scrolled to — once per link. The search stops at a failed page (500,
+  // 403 after a revoked share…) or after SEARCH_PAGES pages, and offers "다시 시도" (review #116).
+  const { hash } = useLocation();
+  const target = hash.startsWith("#m-") ? hash.slice(3) : null;
+  const found = !!target && !!list?.some((m) => m.id === target);
+  const { hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage } = messages;
+  const scrolledTo = useRef<string | null>(null);
+  const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
+  const [searchStopped, setSearchStopped] = useState<string | null>(null);
+  // The link whose message was found once (review #116) — kept apart from whether it is in the list now (a regenerate,
+  // an edit or later pages may take it out): a found link never searches again nor holds back later results.
+  const [foundLink, setFoundLink] = useState<string | null>(null);
+  // Every link transition — another hash, the hash removed, the same hash again later — is a new link: its found,
+  // scrolled and stopped states start over (they are all keyed on this). Within one stay of a hash they persist
+  // across list refreshes (review #116).
+  const [linkGen, setLinkGen] = useState({ id, hash, n: 0 });
+  if (linkGen.id !== id || linkGen.hash !== hash) setLinkGen({ id, hash, n: linkGen.n + 1 });
+  const linkKey = `${linkKeyOf(id, hash)}@${linkGen.n}`;
+  if (found && foundLink !== linkKey) setFoundLink(linkKey);
+  const foundOnce = foundLink === linkKey;
+  useEffect(() => {
+    if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };
+    if (!target || !list || scrolledTo.current === linkKey) return;
+    if (!found) {
+      if (foundOnce) return;
+      if (isFetchingNextPage || searchStopped === linkKey) return;
+      // Not there at all (deleted, another version), a failed page, or the cap: stop and say so.
+      if (!hasNextPage || isFetchNextPageError || search.current.pages >= SEARCH_PAGES)
+        return setSearchStopped(linkKey);
+      search.current.pages++;
+      void fetchNextPage();
+      return;
+    }
+    const el = document.getElementById(`m-${target}`);
+    if (!el) return;
+    scrolledTo.current = linkKey;
+    el.scrollIntoView({ block: "start" });
+  }, [
+    target,
+    found,
+    list,
+    hasNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+    fetchNextPage,
+    linkKey,
+    searchStopped,
+    foundOnce,
+  ]);
+  const retrySearch = () => {
+    search.current = { key: linkKey, pages: 1 };
+    setSearchStopped(null);
+    void fetchNextPage();
+  };
+  // A schedule's result (#56, FR-8.3): when the conversation says there is one that is not shown yet, the view is read
+  // again; "새 결과" goes only once that very message has loaded without error (and, for a link, was found).
+  const newResult = !!conv.data?.newResult;
+  const resultId = newResult ? (conv.data?.newResultMessageId ?? null) : null;
+  const settled = messages.isSuccess && !messages.isFetching && !!list;
+  const resultLoaded = settled && (resultId === null || !!list?.some((m) => m.id === resultId));
+  const linkOk = !target || found || foundOnce;
+  // The link's own search (searching / found / stopped; the hash stays after it is found): only while it is
+  // searching, or stopped on this very result, does it stand in for the refresh below — a found link, or a newer
+  // result, is refreshed like any view (review #116).
+  const linkSearching = !!target && !found && !foundOnce && searchStopped !== linkKey;
+  const linkHolds = linkSearching || (searchStopped === linkKey && resultId === target);
+  const reread = useRef(0);
+  useEffect(() => {
+    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure).
+    if (!newResult || resultLoaded || linkHolds || messages.isFetching) return;
+    if (reread.current === conv.dataUpdatedAt) return;
+    reread.current = conv.dataUpdatedAt;
+    void qc.invalidateQueries({ queryKey: ["messages", id] });
+    void qc.invalidateQueries({ queryKey: ["active-run", id] });
+  }, [newResult, resultLoaded, linkHolds, messages.isFetching, conv.dataUpdatedAt, id, qc]);
+  useEffect(() => {
+    if (!newResult || !resultLoaded || !linkOk) return;
+    void conversations
+      .resultSeen(id, resultId ?? undefined)
+      .then((c) => {
+        qc.setQueryData<Conversation>(["conversation", id], (old) =>
+          old ? { ...old, newResult: c.newResult, newResultMessageId: c.newResultMessageId ?? null } : old,
+        );
+        return qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      })
+      .catch(() => {});
+  }, [newResult, resultLoaded, linkOk, resultId, id, qc]);
   const changeSettings = async (change: ChangeSettingsRequest) => {
     const c = await conversations.changeSettings(id, change);
     qc.setQueryData(["conversation", id], c);
@@ -263,6 +377,14 @@ export function ChatPage() {
       {!online && (
         <div className="notice warn banner" role="status">
           오프라인이에요 — 다시 연결되면 이어서 받아와요.
+        </div>
+      )}
+      {searchStopped === linkKey && !found && (
+        <div className="notice warn banner" role="alert" data-testid="link-search-stopped">
+          결과 메시지를 찾지 못했어요.{" "}
+          <button type="button" className="small" onClick={retrySearch}>
+            다시 시도
+          </button>
         </div>
       )}
       {actionError && (
@@ -533,6 +655,7 @@ const AssistantMessage = memo(function AssistantMessage({
   const text = textOf(parts);
   return (
     <div
+      id={`m-${m.id}`}
       className={`msg assistant${streaming ? " streaming" : ""}`}
       data-testid="assistant"
       data-status={lost ? "lost" : status}

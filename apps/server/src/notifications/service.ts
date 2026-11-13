@@ -104,7 +104,12 @@ export class NotificationService {
    * Stores a notification for `userId` and pushes it (now, or bundled after quiet hours). Returns its id, or
    * undefined when the user may not receive it (inactive, not an admin for an admin kind, resource not readable).
    */
-  publish(userId: string, input: PublishInput): string | undefined {
+  publish(userId: string, input: PublishInput, opts: { dedupeKey?: string } = {}): string | undefined {
+    // The same publishing point again (#56: a schedule run's notification after a crash): the first one stands.
+    if (opts.dedupeKey) {
+      const prev = this.byDedupeKey(opts.dedupeKey);
+      if (prev) return prev.userId === userId ? prev.id : undefined;
+    }
     const c = compose(input);
     const ref = "ref" in input && input.ref ? input.ref : undefined;
     const user = this.users.byId(userId);
@@ -131,8 +136,13 @@ export class NotificationService {
       pushState: c.kind === "test" ? "sending" : inQuietHours(this.prefs(userId), t) ? "held" : "queued",
       createdAt: t,
       readAt: null,
+      dedupeKey: opts.dedupeKey ?? null,
     };
-    this.db.insert(notifications).values(row).run();
+    // A key already taken (by a publish between the look-up above and here): nothing is stored twice.
+    if (!this.db.insert(notifications).values(row).onConflictDoNothing().run().changes) {
+      const prev = opts.dedupeKey ? this.byDedupeKey(opts.dedupeKey) : undefined;
+      return prev?.userId === userId ? prev.id : undefined;
+    }
     if (row.pushState === "sending") this.track(this.push(userId, [row]));
     else if (row.pushState === "queued") this.track(this.deliver(userId));
     return row.id;
@@ -350,6 +360,11 @@ export class NotificationService {
       .where(unread)
       .all();
     return withRef.filter((r) => this.allowed(user, r.kind, r.refKind, r.refId)).length;
+  }
+
+  /** The notification published with this key (#56), if any. */
+  byDedupeKey(key: string): Row | undefined {
+    return this.db.select().from(notifications).where(eq(notifications.dedupeKey, key)).get();
   }
 
   get(id: string): Row | undefined {

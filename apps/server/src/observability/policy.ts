@@ -289,7 +289,7 @@ export const SCHEDULE_CODES = set([
 export const isScheduleCode = member(SCHEDULE_CODES);
 export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
 export const isScheduleStatus = member(set(["succeeded", "failed", "skipped", "retrying"]));
-export const isScheduleStep = member(set(["save", "notify", "engine"]));
+export const isScheduleStep = member(set(["save", "notify", "engine", "warn"]));
 export const isRestoreRecovery = member(set(["completed", "rolled_back"]));
 
 export const isRuntime = member(RUNTIMES);

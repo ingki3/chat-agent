@@ -52,6 +52,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "a model id from the runtime's catalogue (checked by RunAccess before it is stored)",
   },
   "conversations.effort": ENUM,
+  "conversations.new_result_message_id": ID,
   "conversations.fallback_notice": {
     exempt: "runtime and model ids (checked by RunAccess before they are stored)",
   },
@@ -132,6 +133,9 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "notifications.ref_kind": ENUM,
   "notifications.ref_id": ID,
   "notifications.push_state": ENUM,
+  "notifications.dedupe_key": {
+    exempt: "built by the server from ids and a time (`schedule-run:<id>`, `schedule-warning:<id>@<ms>`)",
+  },
   "push_subscriptions.id": ID,
   "push_subscriptions.user_id": ID,
   "push_subscriptions.session_id": HASH,
@@ -276,6 +280,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "schedule_runs.output_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
   "schedule_runs.result_ref": { exempt: "a handler's reference (id-shaped, checked by the engine)" },
   // Schedule proposals (#55): the tool's name and prompt are runtime text; the rest is validated or ids.
+  "schedule_attempts.schedule_run_id": ID,
+  "schedule_attempts.conversation_id": ID,
+  "schedule_attempts.user_message_id": ID,
+  "schedule_attempts.assistant_message_id": ID,
+  "schedule_attempts.chat_run_id": ID,
+  "schedule_results.schedule_run_id": ID,
+  "schedule_results.conversation_id": ID,
+  "schedule_results.message_id": ID,
   "schedule_proposals.id": ID,
   "schedule_proposals.owner_id": ID,
   "schedule_proposals.conversation_id": ID,

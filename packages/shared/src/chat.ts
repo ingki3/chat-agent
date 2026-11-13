@@ -163,6 +163,13 @@ export const Conversation = z.object({
    * "기본값을 쓸 수 없어 ○○로 시작했어요" once: only the page whose `POST …/fallback-notice/consume` takes it shows it.
    */
   fallbackNotice: z.lazy(() => FallbackNotice).nullable(),
+  /**
+   * A schedule's result conversation (#56, FR-8.3) with a result the owner has not opened yet: the sidebar's "새 결과".
+   * Cleared by `POST /api/conversations/:id/result-seen`. Optional for older clients' fixtures; the server always sends it.
+   */
+  newResult: z.boolean().optional(),
+  /** The message that result is (the page clears "새 결과" only once this message is shown); null: not known. */
+  newResultMessageId: z.string().nullable().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });

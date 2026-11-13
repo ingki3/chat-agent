@@ -4,7 +4,7 @@ import { Outlet } from "react-router";
 import type { AuthState, AuthUser } from "@agentlee/shared";
 import { NOTIFICATIONS_KEY } from "./api.js";
 import { PUSH_DEVICES_KEY, syncPush } from "./push.js";
-import { Sidebar } from "./Sidebar.js";
+import { CONVERSATIONS_KEY, Sidebar } from "./Sidebar.js";
 import {
   ArtifactPanel,
   PANEL_FULL_SCREEN,
@@ -149,8 +149,11 @@ function usePushMessages() {
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
     const onMessage = (e: MessageEvent) => {
-      if ((e.data as { type?: unknown } | null)?.type === "agentlee:notification")
+      if ((e.data as { type?: unknown } | null)?.type === "agentlee:notification") {
         void qc.invalidateQueries({ queryKey: NOTIFICATIONS_KEY });
+        // A schedule's result (#56): its conversation's "새 결과" in the sidebar.
+        void qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+      }
     };
     navigator.serviceWorker.addEventListener("message", onMessage);
     return () => navigator.serviceWorker.removeEventListener("message", onMessage);
