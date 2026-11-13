@@ -1360,20 +1360,67 @@ describe(
       expect(fs.existsSync(t.dataDir)).toBe(false);
     });
 
+    // The old database in rollback-journal mode, as an earlier restore leaves it.
+    const toRollbackMode = (dataDir: string) => {
+      const db = new Database(path.join(dataDir, DB_FILE), { fileMustExist: true });
+      try {
+        expect(db.pragma("journal_mode = DELETE", { simple: true })).toBe("delete");
+      } finally {
+        db.close();
+      }
+      expect(fs.existsSync(path.join(dataDir, `${DB_FILE}-wal`))).toBe(false);
+    };
+    const holdReader = async (dataDir: string, journal: "wal" | "delete") => {
+      const reader = spawnTs(CHILD, ["hold-reader", dataDir, journal], {}, ["--expose-gc"]);
+      await reader.waitFor("reader-ready");
+      return reader;
+    };
+    // (In WAL mode the refused checkpoint may already have copied frames into the main file — the same rows.)
+    const expectRefusedUntouched = (t: Awaited<ReturnType<typeof prepared>>, dbBefore?: string) => {
+      if (dbBefore) expect(sha256File(path.join(t.dataDir, DB_FILE))).toBe(dbBefore);
+      expect(leftovers(t.root)).toEqual([]);
+      expect(asides(t.root)).toEqual([]);
+      expect(fs.existsSync(path.join(t.dataDir, OLD_ID_FILE))).toBe(false);
+      expect(fs.readFileSync(path.join(t.dataDir, "marker"), "utf8")).toBe("old");
+    };
+
     it("another process still reading the old database: old_unsettled, nothing changed", async () => {
       const t = await prepared();
       await commitInWal(t.dataDir);
-      const reader = spawnTs(CHILD, ["hold-reader", t.dataDir]);
-      await reader.waitFor("reading");
+      const reader = await holdReader(t.dataDir, "wal");
       expect(restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key }))).toBe(
         "old_unsettled",
       );
       reader.child.kill("SIGKILL");
       await reader.exited;
       expect(fs.statSync(path.join(t.dataDir, `${DB_FILE}-wal`)).size).toBeGreaterThan(0);
-      expect(leftovers(t.root)).toEqual([]);
-      expect(asides(t.root)).toEqual([]);
-      expect(fs.existsSync(path.join(t.dataDir, OLD_ID_FILE))).toBe(false);
+      expectRefusedUntouched(t);
+    });
+
+    it("a reader of an old database in rollback-journal mode: old_unsettled too (#139 review), nothing changed", async () => {
+      const t = await prepared();
+      toRollbackMode(t.dataDir);
+      const reader = await holdReader(t.dataDir, "delete");
+      const dbBefore = sha256File(path.join(t.dataDir, DB_FILE));
+      expect(restoreCode(() => restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key }))).toBe(
+        "old_unsettled",
+      );
+      // Its transaction was never broken: the reader is still inside it.
+      expect(reader.child.exitCode).toBe(null);
+      reader.child.kill("SIGKILL");
+      await reader.exited;
+      expectRefusedUntouched(t, dbBefore);
+      // With the reader gone, the same restore goes through.
+      expect(restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key }).previous).toBeDefined();
+    });
+
+    it("an old database in rollback-journal mode with no reader: restored, every old row kept aside", async () => {
+      const t = await prepared();
+      toRollbackMode(t.dataDir);
+      const r = restoreBackup({ backup: t.backup, target: t.dataDir, key: t.key });
+      expect(countUsers(r.previous!)).toBe(5);
+      expect(fs.readFileSync(path.join(r.previous!, "marker"), "utf8")).toBe("old");
+      expect(fs.existsSync(path.join(t.dataDir, "marker"))).toBe(false);
     });
 
     for (const code of ["EIO", "ENOSPC"] as const)

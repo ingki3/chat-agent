@@ -29,22 +29,46 @@ if (mode === "lock") {
   process.kill(process.pid, "SIGKILL");
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
 } else if (mode === "hold-reader") {
-  // Another process (not taking the data lock, like a sqlite3 shell) inside a read transaction on the WAL database
-  // whose snapshot needs the WAL. A snapshot of a fully checkpointed WAL reads the main file alone (SQLite's read
-  // mark 0) and does not stop a TRUNCATE checkpoint — rightly, nothing then lives only in the WAL; whether the dead
-  // writer's frame was still un-checkpointed when this reader started was left to timing (a CI flake, #111). So the
-  // reader commits a frame of its own first (no auto-checkpoint, nobody else running): its snapshot below includes a
-  // frame no checkpoint has copied, deterministically.
+  // Another process (not taking the data lock, like a sqlite3 shell) inside a read transaction on the old database.
+  // `wal` (default): a snapshot that needs the WAL. A snapshot of a fully checkpointed WAL reads the main file alone
+  // (SQLite's read mark 0) and does not stop a TRUNCATE checkpoint — rightly, nothing then lives only in the WAL;
+  // whether the dead writer's frame was still un-checkpointed when this reader started was left to timing (a CI
+  // flake, #111). So the reader commits a frame of its own first (no auto-checkpoint, nobody else running): its
+  // snapshot below includes a frame no checkpoint has copied, deterministically.
+  // `delete`: the database is in rollback-journal mode (e.g. after an earlier restore); the reader's transaction
+  // holds a SHARED lock on the main file, which a WAL checkpoint does not see (#139 review).
+  const journal = args[1] ?? "wal";
   const db = new Database(path.join(args[0]!, "agentlee.db"));
-  db.pragma("journal_mode = WAL");
-  db.pragma("wal_autocheckpoint = 0");
-  db.prepare(
-    "INSERT INTO users (id, email, name, role) VALUES ('wal-reader', 'reader@x', 'reader', 'member')",
-  ).run();
+  if (journal === "wal") {
+    db.pragma("journal_mode = WAL");
+    db.pragma("wal_autocheckpoint = 0");
+    db.prepare(
+      "INSERT INTO users (id, email, name, role) VALUES ('wal-reader', 'reader@x', 'reader', 'member')",
+    ).run();
+  } else if (db.pragma("journal_mode", { simple: true }) !== "delete") {
+    process.stdout.write("reader-failed: not in rollback-journal mode\n");
+    process.exit(1);
+  }
   db.exec("BEGIN");
   db.prepare("SELECT count(*) FROM users").get();
-  process.stdout.write("reading\n");
-  setInterval(() => {}, 1000);
+  // The connection must outlive this block: when nothing referred to `db`, V8 collected it while the process idled
+  // and better-sqlite3's finalizer closed the connection — ending the read transaction (and, as the last
+  // connection, checkpointing and deleting the WAL) before the restore ran, which then rightly found nothing to
+  // wait for (#103). The interval keeps it reachable; forced collections (run with --expose-gc) prove it, and the
+  // reader shows its transaction is still open (in WAL mode: it still sees its own WAL-only row) before it reports.
+  setInterval(() => void db, 1000);
+  setTimeout(() => {
+    for (let i = 0; i < 5; i++) (globalThis as { gc?: () => void }).gc?.();
+    setTimeout(() => {
+      const own =
+        journal !== "wal" || db.prepare("SELECT 1 FROM users WHERE id = 'wal-reader'").get() !== undefined;
+      if (db.inTransaction && own) process.stdout.write("reader-ready\n");
+      else {
+        process.stdout.write("reader-failed\n");
+        process.exit(1);
+      }
+    }, 50);
+  }, 0);
 } else if (mode === "try-lock") {
   try {
     acquireDataLock(args[0]!, args[1] as DataLockKind).release();
