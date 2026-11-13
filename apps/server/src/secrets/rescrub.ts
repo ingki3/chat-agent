@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import { snippetKey } from "../citations/store.js";
+import { checkStructured } from "../artifacts/store.js";
+import type { ArtifactKind } from "@agentlee/shared";
 import { forgetCitedTextHashes, parseMarks, scrubFile } from "../files/scrub.js";
 import type { Db } from "../db/client.js";
 import { logEvent, type EventLogger } from "../logging.js";
@@ -38,7 +40,7 @@ type Table = {
   /** A trigger that makes the rows immutable (lifted for the scrub only, inside its transaction). */
   immutable?: string;
   /** Columns recomputed from the scrubbed ones (content hashes, sizes). */
-  derived?: (row: Record<string, unknown>) => Record<string, unknown>;
+  derived?: (row: Record<string, unknown>, sql: Db["$client"]) => Record<string, unknown>;
   /**
    * Columns that cannot hold a mask (an identifier the row is about, e.g. a watchlist symbol): a row with a hit in
    * one of them is deleted instead — with `secure_delete`, so the freed cell is zeroed, not left in the page.
@@ -67,10 +69,20 @@ const DERIVED: Record<string, Pick<Table, "immutable" | "derived" | "removeOn">>
   },
   artifact_versions: {
     immutable: "artifact_versions_immutable",
-    derived: (r) =>
-      typeof r.content === "string"
-        ? { content_hash: sha256(r.content), bytes: Buffer.byteLength(r.content, "utf8") }
-        : {},
+    // Changed content is checked against its artifact's kind (#53 review): masked chart data that no longer fits
+    // its schema is written as the unreadable state, not as data drawn wrong.
+    derived: (r, sql) => {
+      if (typeof r.content !== "string") return {};
+      const kind = (
+        sql
+          .prepare(
+            "select a.kind as kind from artifact_versions v join artifacts a on a.id = v.artifact_id where v.rowid = ?",
+          )
+          .get(r._rowid) as { kind?: ArtifactKind } | undefined
+      )?.kind;
+      const content = checkStructured(kind, r.content);
+      return { content, content_hash: sha256(content), bytes: Buffer.byteLength(content, "utf8") };
+    },
   },
 };
 
@@ -437,7 +449,7 @@ export class StoredRescrub {
           else if (Object.keys(set).length)
             changes.push({
               rowid: row._rowid as number,
-              set: { ...set, ...(t.derived?.({ ...row, ...set }) ?? {}) },
+              set: { ...set, ...(t.derived?.({ ...row, ...set }, sql) ?? {}) },
             });
         }
         if (removals.length) {

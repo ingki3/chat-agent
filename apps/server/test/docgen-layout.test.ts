@@ -655,10 +655,38 @@ describe("the in-process runner is never a production path (#49 review 1)", () =
     expect(() =>
       loadConfig({ ...base, NODE_ENV: "production", ISOLATION_IN_PROCESS_FOR_TESTS: "1" }),
     ).toThrow(/ISOLATION_IN_PROCESS_FOR_TESTS/);
-    const fakeProd = loadConfig({ ...base, NODE_ENV: "production", FAKE_RUNTIME: "1" });
+    const fakeProd = loadConfig({
+      ...base,
+      NODE_ENV: "production",
+      FAKE_RUNTIME: "1",
+      FAKE_RUNTIME_IN_PRODUCTION: "e2e",
+    });
     expect(docRunnerKind(fakeProd)).toBe("sandbox");
     // Even a config object claiming the switch in production is sandboxed (the check is made twice).
     expect(docRunnerKind({ ...fakeProd, isolationInProcessForTests: true })).toBe("sandbox");
+  });
+
+  it("production refuses the scripted runtimes unless it is the e2e run (#53 review P2)", () => {
+    for (const flags of [
+      { FAKE_RUNTIME: "1" },
+      { FAKE_RUNTIME_CODEX: "1" },
+      { FAKE_RUNTIME: "1", FAKE_RUNTIME_CODEX: "1" },
+    ])
+      expect(() => loadConfig({ ...base, NODE_ENV: "production", ...flags })).toThrow(/FAKE_RUNTIME/);
+    expect(() =>
+      loadConfig({ ...base, NODE_ENV: "production", FAKE_RUNTIME: "1", FAKE_RUNTIME_IN_PRODUCTION: "yes" }),
+    ).toThrow();
+    const e2e = loadConfig({
+      ...base,
+      NODE_ENV: "production",
+      FAKE_RUNTIME: "1",
+      FAKE_RUNTIME_CODEX: "1",
+      FAKE_RUNTIME_IN_PRODUCTION: "e2e",
+    });
+    expect([e2e.fakeRuntime, e2e.fakeCodex]).toEqual([true, true]);
+    // Outside production nothing more is needed; FAKE_RUNTIME_CODEX alone is nothing.
+    expect(loadConfig({ ...base, NODE_ENV: "development", FAKE_RUNTIME_CODEX: "1" }).fakeCodex).toBe(false);
+    expect(loadConfig({ ...base, NODE_ENV: "production" }).fakeRuntime).toBe(false);
   });
 
   it("FAKE_RUNTIME alone never picks it; only the explicit switch outside production does", () => {

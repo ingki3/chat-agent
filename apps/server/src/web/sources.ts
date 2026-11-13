@@ -204,6 +204,19 @@ export class SourceStore {
   }
 
   /**
+   * Which ids are this conversation's sources and whether `cite` can check a passage against their stored text
+   * (#53: the references a fresh session gets). Ids and flags only — no page text is read.
+   */
+  citable(conversationId: string): Map<string, { text: boolean }> {
+    const rows = this.db
+      .select({ id: sources.id, kind: sources.kind, hasBody: sql<number>`${sources.body} is not null` })
+      .from(sources)
+      .where(eq(sources.conversationId, conversationId))
+      .all();
+    return new Map(rows.map((r) => [r.id, { text: r.kind === "page" && r.hasBody === 1 }]));
+  }
+
+  /**
    * The sources of the token's conversation (#25 `sources_list`), oldest first — undefined when the token's user
    * does not own it. Only that user's rows (a conversation has one owner; this is the second check).
    */

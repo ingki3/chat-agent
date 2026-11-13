@@ -3,10 +3,11 @@ import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.j
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
-import { SUMMARY_MARKER } from "./context.js";
+import { renderPriorContext, SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
 import { pythonScenario, type PythonScenario } from "./fake-python.js";
 import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
+import { readReferences, switchSteps, type ReadReferences } from "./fake-switch.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -57,6 +58,9 @@ import {
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
+ *   /ref-file-cite, /ref-cite, /ref-refetch-cite, /ref-artifact-update   after a runtime switch (#53): real calls
+ *                     with the ids this session read from its start context's conversation references
+ *                     (`fake-switch.ts`)
  *
  * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
  * was given — deterministic, so tests can tell which messages a summary covers.
@@ -373,6 +377,8 @@ export const defaultScript: FakeScript = (input, memory) => {
       { usage: { inputTokens: 20 * memory.length, outputTokens: 30, costUsd: 0.0001 } },
     ];
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
+  const switched = switchSteps(t);
+  if (switched) return switched;
   const cite = citationSteps(t);
   if (cite) return cite;
   const fin = /^\/finance(\s+cited)?$/.exec(t);
@@ -484,7 +490,13 @@ export class FakeRuntime implements RuntimeAdapter {
   /** Sessions this "runtime" remembers (forget() simulates a runtime that lost them). */
   private readonly sessions = new Map<
     string,
-    { model: string; memory: string[]; mcp?: McpConnection | undefined }
+    {
+      model: string;
+      memory: string[];
+      mcp?: McpConnection | undefined;
+      /** The ids its start context named (#53), read back from the rendered text like a model would. */
+      refs: ReadReferences;
+    }
   >();
 
   constructor(
@@ -537,7 +549,12 @@ export class FakeRuntime implements RuntimeAdapter {
       ...(ctx.summary ? [ctx.summary.text] : []),
       ...ctx.history.flatMap((h) => h.parts.map((p) => (p.type === "text" ? p.text : ""))),
     ].filter(Boolean);
-    this.sessions.set(id, { model: ctx.model, memory, mcp: ctx.mcp });
+    this.sessions.set(id, {
+      model: ctx.model,
+      memory,
+      mcp: ctx.mcp,
+      refs: readReferences(renderPriorContext(ctx)),
+    });
     this.transcripts.set(id, [
       ...(ctx.summary ? [{ role: "summary", text: ctx.summary.text.trim() }] : []),
       ...ctx.history.flatMap((h) => {
@@ -613,7 +630,9 @@ export class FakeRuntime implements RuntimeAdapter {
               };
             } else if ("call" in step) {
               const callId = `call-${++seq}`;
-              const input = resolveRefs(step.input, (i) => outputs[Number(i)]) as Record<string, unknown>;
+              const input = resolveRefs(step.input, (i) =>
+                i === "refs" ? state.refs : outputs[Number(i)],
+              ) as Record<string, unknown>;
               yield { type: "tool_start", callId, name: `${OUR_TOOL_PREFIX}${step.call}`, input };
               const r = await callOurTool(state.mcp, step.call, input);
               outputs.push(r.output);

@@ -13,15 +13,21 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, messages, runs } from "../db/schema.js";
-import { scrubContent, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import {
+  isRedactedContent,
+  REDACTED_CONTENT,
+  scrubContent,
+  scrubKnown,
+  scrubKnownDeep,
+} from "../secrets/known.js";
 
 /**
  * A version as read (round 26): its content scrubbed by kind — canonical JSON value by value, so it stays valid —
  * and its size and hash following the scrubbed content.
  */
-function scrubVersion(v: ArtifactVersionRow): ArtifactVersionRow {
+function scrubVersion(v: ArtifactVersionRow, kind: ArtifactKind | undefined): ArtifactVersionRow {
   const { content, ...rest } = v;
-  const scrubbed = scrubContent(content);
+  const scrubbed = scrubStored(kind, content);
   const out = { ...scrubKnownDeep(rest), content: scrubbed };
   if (scrubbed === content) return out.title === v.title && out.language === v.language ? v : out;
   return { ...out, bytes: Buffer.byteLength(scrubbed, "utf8"), contentHash: sha256(scrubbed) };
@@ -49,6 +55,8 @@ export const ARTIFACT_CODES = [
   "artifact_not_found",
   "artifact_not_allowed",
   "artifact_limit",
+  /** The version's content is unreadable: a known secret spans its JSON (#53 review, `REDACTED_CONTENT`). */
+  "artifact_redacted",
 ] as const;
 export type ArtifactCode = (typeof ARTIFACT_CODES)[number];
 
@@ -117,6 +125,52 @@ export function encodeBody(
   return { content, language };
 }
 
+/**
+ * Chart, table and document data whose scrub just changed it, checked against the kind's schema again (#53 review): a
+ * masked value that leaves invalid data (a candle's OHLC price) makes the version unreadable (`REDACTED_CONTENT`, 409)
+ * rather than served wrong (a price drawn as 0). Text kinds and an unknown kind are returned as they are. Also used
+ * by the background rescrub, which writes the result.
+ */
+export function checkStructured(kind: ArtifactKind | undefined, scrubbed: string): string {
+  if (isRedactedContent(scrubbed) || !kind || TEXT_KINDS.has(kind)) return scrubbed;
+  try {
+    encodeBody(kind, { [fieldOf(kind)]: JSON.parse(scrubbed) as unknown });
+    return scrubbed;
+  } catch {
+    return REDACTED_CONTENT;
+  }
+}
+
+/**
+ * An artifact version's stored text through the secrets known now, by its kind (#53 review): `scrubContent`, and only
+ * when that changed it, `checkStructured`. Unchanged content is never parsed here (a list read stays cheap; what was
+ * stored was checked when it was written, or by the rescrub that changed it). Every write, read and fork copy.
+ */
+export function scrubStored(kind: ArtifactKind | undefined, content: string): string {
+  const scrubbed = scrubContent(content);
+  return scrubbed === content ? content : checkStructured(kind, scrubbed);
+}
+
+/** A title as given, through the secrets known now (anything else is refused by `cleanTitle`). */
+const scrubTitle = (t: unknown): unknown => (typeof t === "string" ? scrubKnown(t) : t);
+
+/**
+ * The stored text of a version written now (#53 review): the body encoded from what was given, then through
+ * `scrubContent` — the one decision every read, fork copy and the background rescrub make too. JSON is scrubbed value
+ * by value (a masked number becomes null); a secret spanning its structure makes the version unreadable
+ * (`REDACTED_CONTENT`) instead of storing JSON broken by a mask; any other text is scrubbed as text.
+ */
+export function encodeScrubbed(
+  kind: ArtifactKind,
+  body: ArtifactBody,
+): { content: string; language: string | null } {
+  const enc = encodeBody(kind, body);
+  return {
+    content: scrubStored(kind, enc.content),
+    language: enc.language === null ? null : scrubKnown(enc.language),
+  };
+}
+
 export function toArtifact(r: ArtifactRow): Artifact {
   return {
     id: r.id,
@@ -142,6 +196,8 @@ export function toVersionInfo(v: ArtifactVersionRow): ArtifactVersionInfo {
     runId: v.runId ?? null,
     revertedFrom: v.revertedFrom ?? null,
     createdAt: v.createdAt,
+    // Unreadable content (#53 review): the viewer shows a notice instead of loading it.
+    ...(isRedactedContent(v.content) ? { redacted: true as const } : {}),
   };
 }
 
@@ -181,10 +237,9 @@ export class ArtifactStore {
     raw: { kind: ArtifactKind; title: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
-    // A runtime's artifact never stores a known secret (review round 23).
-    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
-    const title = cleanTitle(input.title);
-    const { content, language } = encodeBody(input.kind, input);
+    // A runtime's artifact never stores a known secret (review round 23) — by the same decision as every read.
+    const title = cleanTitle(scrubTitle(raw.title));
+    const { content, language } = encodeScrubbed(raw.kind, raw);
     return this.db.transaction((tx) => {
       const n = tx
         .select({ n: count() })
@@ -201,7 +256,7 @@ export class ArtifactStore {
           conversationId: scope.conversationId,
           messageId: this.messageOf(scope),
           runId: scope.runId,
-          kind: input.kind,
+          kind: raw.kind,
           title,
           language,
           latestVersion: 1,
@@ -232,15 +287,14 @@ export class ArtifactStore {
     raw: { title?: unknown } & ArtifactBody,
   ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
-    const input = scrubKnownDeep(raw, { numberMask: null }); // a masked chart or table number is missing, not text
     const a = this.get(artifactId);
     if (!a || a.conversationId !== scope.conversationId || a.userId !== scope.userId)
       throw new ArtifactError("artifact_not_found");
-    const title = input.title === undefined ? a.title : cleanTitle(input.title);
-    const enc = encodeBody(a.kind, input);
+    const title = raw.title === undefined ? a.title : cleanTitle(scrubTitle(raw.title));
+    const enc = encodeScrubbed(a.kind, raw);
     const latest = this.version(a.id, a.latestVersion);
     const language =
-      a.kind === "code" && input.language === undefined ? (latest?.language ?? null) : enc.language;
+      a.kind === "code" && raw.language === undefined ? (latest?.language ?? null) : enc.language;
     return this.append(a.id, {
       title,
       content: enc.content,
@@ -250,11 +304,32 @@ export class ArtifactStore {
     });
   }
 
+  /**
+   * One version (default the latest) of an artifact of the scope's conversation, for `artifact_read` (#53): the
+   * same checks as `update` — an id from another conversation (or user) is not found. Scrubbed like every read.
+   */
+  readFor(
+    scope: ArtifactScope,
+    artifactId: string,
+    version?: number,
+  ): { artifact: ArtifactRow; version: ArtifactVersionRow } {
+    if (!this.owns(scope)) throw new ArtifactError("artifact_not_allowed");
+    const a = this.get(artifactId);
+    if (!a || a.conversationId !== scope.conversationId || a.userId !== scope.userId)
+      throw new ArtifactError("artifact_not_found");
+    const v = this.version(a.id, version ?? a.latestVersion);
+    if (!v) throw new ArtifactError("artifact_not_found");
+    if (isRedactedContent(v.content)) throw new ArtifactError("artifact_redacted");
+    return { artifact: a, version: v };
+  }
+
   /** Restores version `version` by copying it (title, content, language) as the newest version. */
   revert(artifactId: string, version: number): { artifact: ArtifactRow; version: ArtifactVersionRow } {
     const old = this.version(artifactId, version);
     const a = this.get(artifactId);
     if (!old || !a) throw new ArtifactError("artifact_not_found");
+    // An unreadable version is not made the newest by copying it (#53 review).
+    if (isRedactedContent(old.content)) throw new ArtifactError("artifact_redacted");
     return this.append(a.id, {
       title: old.title,
       content: old.content,
@@ -358,7 +433,7 @@ export class ArtifactStore {
       const clean = versions.map((v) => ({
         title: scrubKnown(v.title),
         language: v.language === null ? null : scrubKnown(v.language),
-        content: scrubContent(v.content),
+        content: scrubStored(src.kind, v.content),
       }));
       const last = clean.at(-1)!;
       const artifact = tx
@@ -466,13 +541,18 @@ export class ArtifactStore {
 
   /** Versions of one artifact, oldest first (API responses leave the content out: `toVersionInfo`). */
   versions(id: string): ArtifactVersionRow[] {
+    const kind = this.kindOf(id);
     return this.db
       .select()
       .from(artifactVersions)
       .where(eq(artifactVersions.artifactId, id))
       .orderBy(asc(artifactVersions.version))
       .all()
-      .map(scrubVersion);
+      .map((v) => scrubVersion(v, kind));
+  }
+
+  private kindOf(id: string): ArtifactKind | undefined {
+    return this.db.select({ kind: artifacts.kind }).from(artifacts).where(eq(artifacts.id, id)).get()?.kind;
   }
 
   version(id: string, version: number): ArtifactVersionRow | undefined {
@@ -481,6 +561,6 @@ export class ArtifactStore {
       .from(artifactVersions)
       .where(and(eq(artifactVersions.artifactId, id), eq(artifactVersions.version, version)))
       .get();
-    return v && scrubVersion(v);
+    return v && scrubVersion(v, this.kindOf(id));
   }
 }

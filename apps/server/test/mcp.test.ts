@@ -570,6 +570,7 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "cite",
       "artifact_create",
       "artifact_update",
+      "artifact_read",
       // Schedule proposals (#55): the confirmation card's tool.
       "schedule_create",
       "doc_create",

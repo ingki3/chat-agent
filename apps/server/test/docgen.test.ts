@@ -454,7 +454,7 @@ describe("doc_create through the run (#49, FakeRuntime)", () => {
     await send(f.cookies.owner, c.id, "그 파일 요약해줘");
     // A fresh session (the runtime lost the old one): the run manager hands it the conversation's references.
     expect(rt.contexts.at(-1)!.references?.files).toEqual([
-      { id: out.output.fileId as string, name: "제주 가족 여행 보고서.pdf" },
+      { id: out.output.fileId as string, name: "제주 가족 여행 보고서.pdf", kind: "pdf" },
     ]);
   });
 

@@ -5,7 +5,7 @@ import type { FileWriteLock } from "../backup/lock.js";
 import type { ConversationRow, ConversationStore } from "../conversations/store.js";
 import type { Db } from "../db/client.js";
 import type { FileRow, FileStore } from "../files/store.js";
-import { scrubKnown } from "../secrets/known.js";
+import { isRedactedContent, scrubKnown } from "../secrets/known.js";
 import type { SourceStore } from "../web/sources.js";
 import type { ForkSource } from "./projection.js";
 import type { ShareRow } from "./store.js";
@@ -170,7 +170,8 @@ export class ForkService {
             const kept: { n: number; title: string; language: string | null; content: string }[] = [];
             for (const v of source.versions.get(a.id) ?? []) {
               let content = v.content;
-              if (a.kind === "document") {
+              // An unreadable version (#53 review) is copied as it is: unreadable in the fork too.
+              if (a.kind === "document" && !isRedactedContent(content)) {
                 const ref = DocumentRef.safeParse(safeJson(v.content));
                 const fileId = ref.success ? ids.file.get(ref.data.fileId) : undefined;
                 if (!ref.success || !fileId) continue;

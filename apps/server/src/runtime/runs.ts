@@ -366,6 +366,11 @@ export type RunManagerOptions = {
   contextFiles?: (
     conversationId: string,
   ) => (ContextReferences["files"][number] & { messageId: string | null })[];
+  /**
+   * The conversation's sources (#53), by id: whether `cite` can check a passage against the stored text. A cited
+   * source the conversation does not have is not referenced. Without it no source is referenced.
+   */
+  contextSources?: (conversationId: string) => ReadonlyMap<string, { text: boolean }>;
 };
 
 /**
@@ -1384,11 +1389,18 @@ export class RunManager {
       files = (this.opts.contextFiles?.(conversationId) ?? [])
         .filter((f) => sentWithActive(f, (id) => active.has(id)))
         .slice(-REFERENCE_LIMIT)
-        .map((f) => ({ id: f.id, name: f.name }));
+        .map((f) => ({ id: f.id, name: f.name, kind: f.kind }));
     } catch {
       // none rather than no reply
     }
-    return { files, artifacts, sources: citedSources(context.history) };
+    let sources: ContextReferences["sources"] = [];
+    try {
+      const stored = this.opts.contextSources?.(conversationId);
+      if (stored) sources = citedSources(context.history, (id) => stored.get(id));
+    } catch {
+      // none rather than no reply
+    }
+    return { files, artifacts, sources };
   }
 
   private async openSession(

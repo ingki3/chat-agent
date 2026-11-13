@@ -16,6 +16,7 @@ import { EXPORT_FORMATS, exportDocument, exportFormats, type ExportCode, type Re
 import { artifactCsp, attachment, downloadVersion, serveVersion } from "./serve.js";
 import { ArtifactError, toArtifact, toVersionInfo, type ArtifactRow, type ArtifactStore } from "./store.js";
 import { sharedWith, viewOf } from "../shares/projection.js";
+import { isRedactedContent } from "../secrets/known.js";
 
 /** Resource kind of one artifact: its owner, and shared viewers whose projection holds a version of it (#29). */
 export const ARTIFACT_KIND = "artifact";
@@ -34,6 +35,12 @@ export const RAW_HEADERS = {
 export type AppPage = (url: string) => Promise<string | Buffer | undefined>;
 
 const VERSION = /^[1-9][0-9]{0,5}$/;
+/**
+ * A version whose content is unreadable (`REDACTED_CONTENT` — a known secret spans its JSON, #53 review): a fixed
+ * 409 on every path that would send or render the content. Never partial content, never a 500.
+ */
+const redacted = (reply: FastifyReply) =>
+  reply.code(409).header("Cache-Control", "no-store").send({ error: "artifact_redacted" });
 const notFound = (reply: FastifyReply) =>
   reply.code(404).header("Cache-Control", "no-store").send({ error: "not_found" });
 
@@ -158,6 +165,7 @@ export function registerArtifactRoutes(
         ? store.version(req.params.id, Number(req.params.version))
         : undefined;
       if (!v) return notFound(reply);
+      if (isRedactedContent(v.content)) return redacted(reply);
       return reply
         .header("Cache-Control", "no-store")
         .send({ version: v.version, kind: a.kind, content: v.content } satisfies ArtifactVersionContent);
@@ -211,6 +219,7 @@ export function registerArtifactRoutes(
       const v = VERSION.test(req.params.version)
         ? store.version(a.id, Number(req.params.version))
         : undefined;
+      if (v && isRedactedContent(v.content)) return redacted(reply);
       // In the app's frame: Escape inside the artifact reaches the panel (#28, `ESCAPE_BRIDGE`).
       const served = v && serveVersion(a.kind, v.title, v.content, { escapeBridge: true });
       if (!served) return notFound(reply);
@@ -239,6 +248,7 @@ export function registerArtifactRoutes(
       const format = req.query.format;
       if (format !== undefined && (format !== "html" || !ARTIFACT_HTML_DOWNLOAD.has(a.kind)))
         return notFound(reply);
+      if (v && isRedactedContent(v.content)) return redacted(reply);
       // `?format=html` (#28): the page the original is served as (server-drawn, no script), as a file.
       const page = v && format === "html" ? serveVersion(a.kind, v.title, v.content) : undefined;
       const file = page
@@ -269,6 +279,7 @@ export function registerArtifactRoutes(
         const v = VERSION.test(req.params.version)
           ? store.version(a.id, Number(req.params.version))
           : undefined;
+        if (v && isRedactedContent(v.content)) return redacted(reply);
         const doc =
           v && exportFormats(a.kind).includes(format)
             ? exportDocument(a.kind, v.title, v.content)

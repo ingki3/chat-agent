@@ -169,16 +169,31 @@ export function contextHistory(messages: readonly MessageRow[]): StartContext["h
   return messages.map((m) => ({ role: m.role, parts: scrubParts(publicParts(m.parts as MessagePart[])) }));
 }
 
-/** The sources the conversation's answers cited — from the server's own citation notes (#25), newest last. */
-export function citedSources(messages: readonly MessageRow[]): ContextReferences["sources"] {
+/**
+ * The sources the conversation's answers cited — from the server's own citation notes (#25), newest last — that are
+ * this conversation's sources now (`stored`: whether the source is one, and whether its page text is stored). An id
+ * the conversation does not have (any more) is left out: a runtime is never handed an id `cite` would not know.
+ */
+export function citedSources(
+  messages: readonly MessageRow[],
+  stored: (sourceId: string) => { text: boolean } | undefined,
+): ContextReferences["sources"] {
   const seen = new Map<string, ContextReferences["sources"][number]>();
   for (const m of messages)
     for (const p of m.parts as MessagePart[])
       if (p.type === "citation_note")
         for (const c of p.citations)
           if (c.sourceId && c.url) {
+            const s = stored(c.sourceId);
             seen.delete(c.sourceId);
-            seen.set(c.sourceId, { id: c.sourceId, title: c.title, site: c.site, url: c.url });
+            if (s)
+              seen.set(c.sourceId, {
+                id: c.sourceId,
+                title: c.title,
+                site: c.site,
+                url: c.url,
+                text: s.text,
+              });
           }
   return [...seen.values()].slice(-REFERENCE_LIMIT);
 }
@@ -186,11 +201,44 @@ export function citedSources(messages: readonly MessageRow[]): ContextReferences
 const ROLE_LABEL = { user: "사용자", assistant: "assistant", system: "system" } as const;
 
 /**
+ * How the references can be used (#53) — the server's own words, outside the external content block, naming only the
+ * tools this session has. Ids are the server's own (no file, page or model text).
+ */
+function referenceHints(refs: ContextReferences, tools: ReadonlySet<string>): string[] {
+  const has = (t: string) => tools.has(t);
+  const lines: string[] = [];
+  if (refs.files.length && has("file_read"))
+    lines.push(
+      `- 파일(file:…): fileId로 ${["file_read", "file_search", "file_cite"].filter(has).join("·")}를 쓴다.`,
+    );
+  if (refs.sources.length && has("cite")) {
+    lines.push("- 출처(source:…): 같은 sourceId로 cite해 다시 인용한다.");
+    const refetch = refs.sources.filter((s) => !s.text).map((s) => `source:${s.id}`);
+    if (refetch.length)
+      lines.push(
+        has("web_fetch")
+          ? `  본문이 저장되지 않은 출처(${refetch.join(", ")})는 그대로 인용하면 확인되지 않는다. 인용하려면 그 URL을 web_fetch로 다시 가져와 새 sourceId로 cite한다.`
+          : `  본문이 저장되지 않은 출처(${refetch.join(", ")})는 인용해도 확인되지 않는다.`,
+      );
+  }
+  if (refs.artifacts.length && has("artifact_read"))
+    lines.push(
+      `- 아티팩트(artifact:…): artifact_read로 지금 내용을 읽는다.${has("artifact_update") ? " 고칠 때는 그 내용을 바탕으로 artifact_update에 전체 내용을 넘겨 새 버전으로 저장한다." : ""}`,
+    );
+  return lines.length
+    ? ["위 목록의 id는 이 대화에서 그대로 쓸 수 있다. 사용자의 요청에 필요할 때만 쓴다.", ...lines]
+    : [];
+}
+
+/**
  * What a fresh session is told about the conversation before its first turn, the same for every runtime: the
  * earlier conversation (the summary first when there is one) and the references as external content (titles and
- * names are user, page or model text). Empty when there is nothing.
+ * names are user, page or model text), with how to open them with this session's tools (#53). Empty when there is
+ * nothing.
  */
-export function renderPriorContext(ctx: Pick<StartContext, "history" | "summary" | "references">): string {
+export function renderPriorContext(
+  ctx: Pick<StartContext, "history" | "summary" | "references"> & Partial<Pick<StartContext, "tools">>,
+): string {
   const lines = ctx.history.flatMap((h) => {
     const text = h.parts
       .flatMap((p) => (p.type === "text" ? [p.text] : []))
@@ -212,7 +260,9 @@ export function renderPriorContext(ctx: Pick<StartContext, "history" | "summary"
   const refs = ctx.references;
   const sections: string[] = [];
   if (refs?.files.length)
-    sections.push(["업로드한 파일:", ...refs.files.map((f) => `- ${f.name} (file:${f.id})`)].join("\n"));
+    sections.push(
+      ["업로드한 파일:", ...refs.files.map((f) => `- ${f.name} (file:${f.id}, ${f.kind})`)].join("\n"),
+    );
   if (refs?.artifacts.length)
     sections.push(
       [
@@ -229,13 +279,16 @@ export function renderPriorContext(ctx: Pick<StartContext, "history" | "summary"
         ),
       ].join("\n"),
     );
-  if (sections.length)
+  if (refs && sections.length) {
+    const hints = referenceHints(refs, new Set(ctx.tools ?? []));
     blocks.push(
       [
         "<conversation_references>",
         frameExternal({ source: "conversation-references", content: sections.join("\n\n") }),
+        ...hints,
         "</conversation_references>",
       ].join("\n"),
     );
+  }
   return blocks.join("\n\n");
 }

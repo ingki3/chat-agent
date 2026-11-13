@@ -21,7 +21,10 @@ import {
   scrubEventSequence,
   scrubKnownDeep,
   scrubParts,
+  scrubContent,
   StreamScrubber,
+  KNOWN_PLACEHOLDER,
+  REDACTED_CONTENT,
 } from "../src/secrets/known.js";
 import { TEXT_COLUMNS } from "../src/secrets/columns.js";
 import { StoredRescrub } from "../src/secrets/rescrub.js";
@@ -1693,5 +1696,106 @@ describe("round 28", () => {
     expect(history).not.toContain("[숨김]");
     const api = (await app.inject({ url: `/api/conversations/${conv.id}/messages`, headers })).body;
     expect(api).toContain('print(\\"ordinary done\\")');
+  });
+});
+
+describe("scrubContent: a secret across JSON syntax (#53 review)", () => {
+  it("is REDACTED_CONTENT when the value-by-value result still has it; an in-value secret stays a masked value", () => {
+    const cases: [string, string][] = [
+      // Across two values (round 1).
+      ['abcdef","ghijklmnop', JSON.stringify(["abcdef", "ghijklmnop"])],
+      // A string and a number (round 2).
+      ['abcdef",123456789', '{"columns":["label","value"],"rows":[["abcdef",123456789],["ordinary",42]]}'],
+      // Keys and delimiters (round 3, 1).
+      ['columns":["label"],"rows', '{"columns":["label"],"rows":[["ordinary"]]}'],
+      // Two nulls (round 3, 2).
+      ["null,null", '{"columns":["a","b","c"],"rows":[[null,null,42]]}'],
+      // Into a candle's OHLC tuple (round 3, 3).
+      [
+        "[[123456789",
+        '{"type":"candle","labels":["d"],"series":[{"name":"s","values":[123456790],"ohlc":[[123456789,123456799,123456780,123456790]]}]}',
+      ],
+      // JSON syntax only.
+      ['"],["x"]', '[["a"],["x"]]'],
+    ];
+    for (const [secret, content] of cases) {
+      const reg = new KnownSecrets();
+      reg.add(secret);
+      expect(scrubContent(content, { registry: reg }), secret).toBe(REDACTED_CONTENT);
+      // Stable: scrubbed again it stays so (the background rescrub writes it once).
+      expect(scrubContent(REDACTED_CONTENT, { registry: reg })).toBe(REDACTED_CONTENT);
+    }
+    // Inside one value: masked there, still valid JSON (as before).
+    const reg = new KnownSecrets();
+    reg.add("abcdef-ghijklmnop");
+    const out = scrubContent(JSON.stringify({ columns: ["a"], rows: [["값 abcdef-ghijklmnop"]] }), {
+      registry: reg,
+    });
+    expect(JSON.parse(out)).toEqual({ columns: ["a"], rows: [[`값 ${KNOWN_PLACEHOLDER}`]] });
+    // Not JSON: the text scrub.
+    expect(scrubContent("코드 abcdef-ghijklmnop 끝", { registry: reg })).toBe(`코드 ${KNOWN_PLACEHOLDER} 끝`);
+  });
+
+  it("the background rescrub writes the unreadable state in place of the stored content (no secret left in the DB)", async () => {
+    const db = createTestDb();
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { db, logger: false });
+    apps.push(app);
+    const f = await createFamily(app);
+    const conv = app.conversations!.create(f.users.owner.id);
+    // A short first part (value by value, below the cut-off-tail depth): only the serialized text has it.
+    const secret = 'seed",99999999';
+    const { artifact } = app.artifacts!.create(
+      { userId: f.users.owner.id, conversationId: conv.id, runId: "r0" },
+      {
+        kind: "table",
+        title: "표",
+        table: { columns: ["a", "b"], rows: [[secret.split('"')[0]!, 99999999]] },
+      },
+    );
+    knownSecrets.add(secret);
+    await app.storedRescrub!.idle();
+    knownSecrets.remove(secret);
+    const row = db.$client
+      .prepare("select content, content_hash from artifact_versions where artifact_id = ?")
+      .get(artifact.id) as { content: string; content_hash: string };
+    expect(row.content).toBe(REDACTED_CONTENT);
+    expect(row.content_hash).toBe(crypto.createHash("sha256").update(REDACTED_CONTENT, "utf8").digest("hex"));
+  });
+
+  it("stays linear: a 0.5 MB table with 50,000 matches across syntax is decided at once", () => {
+    const reg = new KnownSecrets();
+    reg.add('a",12345');
+    const row = Array.from({ length: 25 }, () => ["a", 12345]).flat();
+    const table = JSON.stringify({
+      columns: row.map((_, i) => `c${i}`),
+      rows: Array.from({ length: 2000 }, () => row),
+    });
+    expect(Buffer.byteLength(table)).toBeGreaterThan(400_000);
+    const t0 = performance.now();
+    expect(scrubContent(table, { registry: reg })).toBe(REDACTED_CONTENT);
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+});
+
+describe("scrubKnownDeep: values only — a value spelled across JSON syntax is out of scope (#53 review round 6)", () => {
+  it("structured payloads keep their shape: no container is replaced, each value is scrubbed on its own", () => {
+    // Recorded scope decision: a registered value that only appears by joining separate JSON values with JSON
+    // syntax (`","`, `":"`) is not looked for in events, parts, tool inputs and outputs or API bodies (real tokens
+    // hold no JSON syntax). Raw artifact content, served as text, is: scrubContent → REDACTED_CONTENT.
+    const r = new KnownSecrets();
+    r.add('abcdef","ordinary');
+    const part = {
+      type: "tool_call",
+      callId: "c1",
+      name: "mcp__agentlee__artifact_create",
+      input: { kind: "table", title: "표", table: { columns: ["a", "b"], rows: [["abcdef", "ordinary"]] } },
+    };
+    expect(scrubKnownDeep(part, { registry: r })).toBe(part);
+    expect(scrubContent(JSON.stringify(part.input.table), { registry: r })).toBe(REDACTED_CONTENT);
+    // An in-value secret: masked in its value, the shape the same.
+    r.add("sk-INVALUE-1234567");
+    expect(scrubKnownDeep({ a: { b: ["키 sk-INVALUE-1234567 끝", 1] } }, { registry: r })).toEqual({
+      a: { b: [`키 ${KNOWN_PLACEHOLDER} 끝`, 1] },
+    });
   });
 });
