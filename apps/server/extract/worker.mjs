@@ -8,6 +8,8 @@
 // stdout: one JSON result — `{ ok: true, sha256, units, truncated, ocr, segments }` or `{ ok: false, code }`.
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { ExtractError } from "./errors.mjs";
 import { hwp, hwpx, HWP_LIMITS } from "./hwp.mjs";
 import { imageSize } from "./image.mjs";
@@ -113,6 +115,33 @@ export async function run(job, deps = {}) {
   };
 }
 
+/**
+ * Under the worker account (#122) the launcher sets `AGENTLEE_WORKER_APP` to the root-owned program tree this file
+ * runs from: the library paths and the OCR data then come from that tree's `manifest.json` (written by
+ * `pnpm workers:bundle`), never from the job — the caller cannot pick code to import or limits to raise. A path
+ * in the manifest is relative to the tree and may not leave it. Without the variable the job is used as given.
+ */
+export function fromApp(job, app = process.env.AGENTLEE_WORKER_APP) {
+  if (!app) return job;
+  const m = JSON.parse(fs.readFileSync(path.join(app, "manifest.json"), "utf8")).extract;
+  const at = (rel) => {
+    if (typeof rel !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes(".."))
+      throw new ExtractError("extract_failed");
+    return path.join(app, rel);
+  };
+  return {
+    path: job.path,
+    kind: job.kind,
+    bytes: job.bytes,
+    modules: {
+      pdfjs: pathToFileURL(at(m.modules.pdfjs)).href,
+      tesseract: pathToFileURL(at(m.modules.tesseract)).href,
+    },
+    assets: { cmaps: at(m.assets.cmaps) + path.sep, standardFonts: at(m.assets.standardFonts) + path.sep },
+    ocr: job.ocr ? { langDir: at(m.ocrLangDir) } : null,
+  };
+}
+
 async function main() {
   // pdf.js and tesseract.js talk on the console: none of it may mix with the result on stdout.
   for (const k of ["log", "info", "warn", "debug"]) console[k] = () => {};
@@ -120,7 +149,7 @@ async function main() {
   for await (const chunk of process.stdin) input += chunk;
   let result;
   try {
-    result = await run(JSON.parse(input));
+    result = await run(fromApp(JSON.parse(input)));
   } catch (e) {
     result = { ok: false, code: e instanceof ExtractError ? e.code : "extract_failed" };
   }

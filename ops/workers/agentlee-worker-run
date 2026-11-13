@@ -1,0 +1,1014 @@
+#!/usr/bin/perl -T
+# Agent Lee sandboxed-worker launcher (#122). Root-owned, world-readable, mode 0755, installed at
+#   /usr/local/libexec/agentlee-worker-run
+# and run by the server ONLY through a narrow NOPASSWD sudoers rule that drops to the dedicated worker account:
+#   agentlee ALL=(_agentleewk) NOPASSWD: /usr/local/libexec/agentlee-worker-run
+# sudo runs this as the account (a different uid than the server, the runtimes and the python_run account) so a
+# compromised extractor, document worker or renderer cannot read the server's or a runtime's start-up environment
+# (KERN_PROCARGS2). It is the python_run launcher's design (ops/python/agentlee-python-run, #121) for fixed
+# programs: the trust checks (chains, trees, ACLs, config format), the run record by kernel identity, reap, clean
+# and verify are the same functions, byte for byte (a test compares them). Taint mode (-T) forces every argument,
+# env value and file content through an exact pattern before it can reach exec/system/a path. The launcher trusts
+# NO value from the caller except an operation, a worker kind, a job id (a UUID), a timeout and (render only) the
+# egress proxy's loopback port; node, the worker programs with their libraries, the browser and the scratch root
+# all come from a root-owned config whose whole chain and trees it re-checks. Which program runs, with which
+# arguments, environment and sandbox profile, is fixed here per kind. There is no environment or config-path
+# override: production bytes have no bypass. See docs/ops.md §41.
+#
+#   run    <kind> <jobid> <timeout_sec> [<port>]   run one job; exit 124 timeout, 125 memory
+#          extract|ocr|docgen: JSON on stdin, the worker's JSON on stdout
+#          render <port>: the browser's DevTools pipe — stdin to its fd 3, its fd 4 to stdout
+#   probe  <kind> <jobid> <sibling_pid> [<port>]  startup self-check: uid + KERN_PROCARGS2 of a sibling, from
+#                                                 inside that kind's sandbox profile
+#   reap   <jobid>                 kill the job's recorded child (kernel uid + start time verified) — stop control
+#   clean  <jobid>                 remove the job's work dir as the account (restores modes top-down)
+#   verify <account>               read-only setup report (no sudo needed): the same trust checks as run, plus
+#                                  whether <account> can traverse to and write the scratch root
+use strict;
+use warnings;
+use POSIX ();
+use Cwd ();
+use Fcntl qw(F_GETFL F_SETFL F_DUPFD O_NONBLOCK);
+use Time::HiRes ();
+
+# The whole environment is replaced, for every operation: nothing from the caller (or sudo) survives.
+%ENV = (PATH => "/usr/bin:/bin", LC_ALL => "C");
+
+# The one config path, the required owner and the memory limits. A separate *test* copy of this script (generated
+# by the project's tests, never shipped) rewrites these lines; the shipped file has no other branch.
+use constant CONF_PATH        => "/usr/local/etc/agentlee-worker.conf";
+use constant OWNER_ALLOW_SELF => 0;
+use constant MEM_EXTRACT_KB   => 786432;    # 768 MB resident (EXTRACT_LIMITS.text)
+use constant MEM_OCR_KB       => 1572864;   # 1536 MB resident (EXTRACT_LIMITS.ocr)
+use constant MEM_DOCGEN_KB    => 786432;    # 768 MB resident (DOC_WORKER_LIMITS)
+use constant MEM_RENDER_KB    => 786432;    # 768 MB resident (RENDER_LIMITS)
+
+use constant POLL_SEC     => 0.25;          # memory + wall-clock check interval
+use constant EXIT_TIMEOUT => 124;
+use constant PROBE_TIMEOUT_SEC => 8;        # the probe's own wall-clock limit (it normally takes well under 1 s)
+use constant EXIT_MEMORY  => 125;
+use constant EXIT_REFUSED => 65;            # reap: no verified process to kill
+use constant CONF_KEYS    => qw(node app browser scratch);
+use constant TREE_MAX     => 200000;
+use constant BRIDGE_MAX   => 1048576;       # render: bytes buffered per direction before reading pauses
+use constant DRAIN_SEC    => 5;             # render: how long the last replies may take to reach the server
+
+my $SAFE  = qr{\A/[A-Za-z0-9_./-]+\z};      # an absolute path of safe characters only
+my $JOBID = qr{\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z};
+my $NAME  = qr{\A[A-Za-z0-9_.+@-]+\z};      # a file name inside a trusted tree (pnpm folders carry `@` and `+`)
+# One ACL entry as `ls -le` prints it: " <n>: <qualifier> [inherited ]allow|deny <perm,...>".
+my $ACE   = qr{\A (\d+): (\S+) (?:inherited )?(allow|deny) ([a-z_]+(?:,[a-z_]+)*)\z};
+# Any of these granted by an ACL entry lets someone other than root change a trusted node.
+my %ACL_WRITE = map { $_ => 1 }
+  qw(write delete append writeattr writeextattr writesecurity chown add_file add_subdirectory delete_child);
+
+# The worker kinds: which program, which trees it needs, its limits. Nothing here comes from the caller.
+#   tree:  the config keys whose trees the kind runs from (all checked node by node before every run)
+#   max:   the longest timeout the caller may ask for (seconds); mem: the resident limit (KB)
+my %KIND = (
+  extract => { tree => [qw(node app)], max => 60,  mem => MEM_EXTRACT_KB },
+  ocr     => { tree => [qw(node app)], max => 300, mem => MEM_OCR_KB },
+  docgen  => { tree => [qw(node app)], max => 60,  mem => MEM_DOCGEN_KB },
+  render  => { tree => [qw(browser)],  max => 60,  mem => MEM_RENDER_KB },
+);
+
+sub die_err { my ($m) = @_; print STDERR "launcher: $m\n"; exit 64; }
+sub must    { my ($what, $err) = @_; die_err("$what: $err") if length $err; }
+
+# Untaint an absolute, safe, canonical-looking path (exact whole-string match; rejects newline/NUL/space/quotes,
+# `..`, `.` components, `//` and a trailing slash).
+sub safe_path {
+  my ($v, $what) = @_;
+  die_err("empty $what")         unless defined $v && length $v;
+  die_err("unsafe $what: $v")    unless $v =~ /$SAFE/;
+  die_err("dot component in $what: $v") if $v =~ m{(?:\A|/)\.\.?(?:/|\z)};
+  die_err("non-canonical $what: $v")    if $v ne "/" && ($v =~ m{//} || $v =~ m{/\z});
+  $v =~ /\A(.*)\z/s;             # taint already proven safe by the patterns above
+  return $1;
+}
+
+sub owner_ok {
+  my ($uid) = @_;
+  return 1 if $uid == 0;
+  return 1 if OWNER_ALLOW_SELF && $uid == $>;
+  return 0;
+}
+
+# Runs a fixed program (list form, never a shell) and returns (exit status, output lines without newlines).
+# A failure to start is status -1.
+sub run_lines {
+  my @cmd = @_;
+  my $pid = open(my $fh, "-|");
+  return (-1) unless defined $pid;
+  if ($pid == 0) {
+    open(STDERR, ">", "/dev/null");
+    { no warnings "exec"; exec { $cmd[0] } @cmd; }
+    POSIX::_exit(127);
+  }
+  my @lines = <$fh>;
+  close($fh);
+  my $rc = $?;
+  chomp @lines;
+  return ($rc, @lines);
+}
+
+# ACL lines (strictly parsed) → "" or why one grants a change to someone. Deny entries are fine.
+sub acl_lines_err {
+  my ($where, @acl) = @_;
+  for my $l (@acl) {
+    return "unparsed ACL line at $where" unless $l =~ /$ACE/;
+    my ($who, $kind, $perms) = ($2, $3, $4);
+    next if $kind eq "deny";
+    for my $p (split /,/, $perms) {
+      return "ACL grants $p to $who on $where" if $ACL_WRITE{$p};
+    }
+  }
+  return "";
+}
+
+# `ls -led` of one node → (err, [ACL lines]). Any ls failure or an unexpected line is an error.
+sub node_acl {
+  my ($p) = @_;
+  my ($rc, @out) = run_lines("/bin/ls", "-led", "--", $p);
+  return ("cannot list ACL: $p") if $rc != 0 || !@out;
+  my $entry = shift @out;
+  return ("unparsed ls line: $p") unless $entry =~ /\A[-dl][-rwxsStT]{9}[@+]? /;
+  for my $l (@out) { return ("unparsed ACL line at $p") unless $l =~ /$ACE/; }
+  return ("", \@out);
+}
+
+# One trusted node: lstat works, owner root (or self in a test build), not writable by group/other, no ACL entry
+# granting a change. Symlinks are refused (a chain is canonical; links inside a tree are handled by tree_err).
+my %NODE_OK;    # nodes already found trusted in this process (ancestors are shared between paths)
+sub node_err {
+  my ($p) = @_;
+  return "" if $NODE_OK{$p};
+  my @st = lstat($p);
+  return "cannot stat: $p" unless @st;
+  return "symlink on a trusted path: $p" if -l _;
+  return "not root-owned: $p" unless owner_ok($st[4]);
+  return "writable by group/other: $p" if $st[2] & 0o022;
+  my ($e, $acl) = node_acl($p);
+  return $e if length $e;
+  $e = acl_lines_err($p, @$acl);
+  $NODE_OK{$p} = 1 unless length $e;
+  return $e;
+}
+
+# A path and every ancestor up to "/": each a trusted node (no symlink anywhere on the chain).
+sub chain_err {
+  my ($p) = @_;
+  return "not absolute: $p" unless $p =~ m{\A/};
+  while (1) {
+    my $e = node_err($p);
+    return $e if length $e;
+    last if $p eq "/";
+    $p =~ s{/[^/]*\z}{};
+    $p = "/" if $p eq "";
+  }
+  return "";
+}
+
+sub file_err {
+  my ($p) = @_;
+  my $e = chain_err($p);
+  return $e if length $e;
+  return "not a regular file: $p" unless -f $p && !-l $p;
+  return "";
+}
+
+# A trusted tree: its chain, then EVERY node below it — lstat, owner, mode, and (from one strictly parsed
+# `ls -leRA`) every ACL entry. Directories and regular files must be root-owned and not group/other writable;
+# symlinks must be root-owned and are not followed. Any stat/opendir/ls failure, an unexpected line or a node
+# count that differs between the walk and ls is a refusal. What it saw is kept in %TREE_SCAN (verify evaluates the
+# account's access to every node from it).
+my %TREE_SCAN;    # root → { nodes => [[path, mode, uid, gid]], acl_dirs => {dir listing that had ACL lines => 1} }
+sub tree_err {
+  my ($root) = @_;
+  my @seen_nodes;
+  my %acl_dirs;
+  my $e = chain_err($root);
+  return $e if length $e;
+  return "not a directory: $root" unless -d $root;
+  my @stack = ($root);
+  my $nodes = 0;
+  while (@stack) {
+    my $d = pop @stack;
+    opendir(my $dh, $d) or return "cannot open: $d";
+    my @names = readdir($dh);
+    closedir($dh) or return "cannot read: $d";
+    for my $n (@names) {
+      next if $n eq "." || $n eq "..";
+      return "unsafe name in trusted tree under $d" unless $n =~ $NAME;
+      return "trusted tree too large: $root" if ++$nodes > TREE_MAX;
+      my ($c) = ("$d/$n") =~ /\A(.*)\z/s;    # untaint: a safe name under a checked dir
+      my @st = lstat($c);
+      return "cannot stat: $c" unless @st;
+      return "not root-owned: $c" unless owner_ok($st[4]);
+      next if -l _;                          # root-owned link in a root-only dir: cannot be swapped; not followed
+      return "writable by group/other: $c" if $st[2] & 0o022;
+      push @seen_nodes, [$c, $st[2], $st[4], $st[5]];
+      if (-d _) { push @stack, $c; next; }
+      return "not a regular file: $c" unless -f _;
+    }
+  }
+  my ($rc, @out) = run_lines("/bin/ls", "-leRA", "--", $root);
+  return "cannot list ACLs: $root" if $rc != 0;
+  my $seen = 0;
+  my $where = $root;
+  for my $l (@out) {
+    next if $l eq "" || $l =~ /\Atotal \d+\z/;
+    if ($l =~ /\A(\/.*):\z/) { $where = $1; next; }
+    if ($l =~ /\A[-dl][-rwxsStT]{9}[@+]? /) { $seen++; next; }
+    if ($l =~ /$ACE/) {
+      my $ae = acl_lines_err("an entry in $where", $l);
+      return $ae if length $ae;
+      $acl_dirs{$where} = 1;
+      next;
+    }
+    return "unparsed ls line in $where";
+  }
+  return "ls saw $seen nodes, walk saw $nodes: $root" if $seen != $nodes;
+  $TREE_SCAN{$root} = { nodes => \@seen_nodes, acl_dirs => \%acl_dirs };
+  return "";
+}
+
+# The config: exactly the four keys, each once, `key=value` lines and nothing else (no trimming, no comments).
+sub parse_config {
+  open(my $fh, "<", CONF_PATH) or return (undef, "cannot open " . CONF_PATH);
+  my $raw = do { local $/; <$fh> };
+  close($fh);
+  return (undef, "config is empty") unless defined $raw && length $raw;
+  return (undef, "config too large") if length($raw) > 4096;
+  my %want = map { $_ => 1 } CONF_KEYS;
+  my %c;
+  my @lines = split /\n/, $raw, -1;
+  pop @lines if @lines && $lines[-1] eq "";    # the final newline
+  for my $line (@lines) {
+    return (undef, "bad config line") unless $line =~ /\A([a-z]+)=(.*)\z/s;
+    my ($k, $v) = ($1, $2);
+    return (undef, "unknown config key: $k") unless $want{$k};
+    return (undef, "duplicate config key: $k") if exists $c{$k};
+    $c{$k} = $v;
+  }
+  for my $k (CONF_KEYS) { return (undef, "missing config key: $k") unless exists $c{$k}; }
+  return (\%c, "");
+}
+
+# A config value → an untainted safe path, or (undef, why).
+sub conf_path {
+  my ($v) = @_;
+  return (undef, "empty") unless length $v;
+  return (undef, "unsafe characters") unless $v =~ /$SAFE/;
+  return (undef, "dot component") if $v =~ m{(?:\A|/)\.\.?(?:/|\z)};
+  return (undef, "non-canonical") if $v ne "/" && ($v =~ m{//} || $v =~ m{/\z});
+  $v =~ /\A(.*)\z/s;
+  return ($1, "");
+}
+
+# The program paths under the config's trees: node's executable, the two worker entries, the browser.
+sub program_paths {
+  my ($cfg) = @_;
+  $cfg->{node_exe}       = "$cfg->{node}/bin/node";
+  $cfg->{chrome_exe}     = "$cfg->{browser}/chrome-headless-shell";
+  $cfg->{extract_entry}  = "$cfg->{app}/extract/worker.mjs";
+  $cfg->{docgen_entry}   = "$cfg->{app}/docgen/worker.mjs";
+  $cfg->{manifest}       = "$cfg->{app}/manifest.json";
+}
+
+sub exe_err {
+  my ($p) = @_;
+  my @ps = lstat($p);
+  return (@ps && -f _ && !-l $p && ($ps[2] & 0o111)) ? "" : "no executable at $p";
+}
+
+sub regular_err {
+  my ($p) = @_;
+  my @ps = lstat($p);
+  return (@ps && -f _ && !-l $p) ? "" : "no file at $p";
+}
+
+# Every trust check, in order, as [name, err] pairs — the same list for run (dies on the first failure) and for
+# verify (reports them all). $need: "" (reap/clean: the launcher's and the config's chains and the config's format
+# only — nothing is executed), a kind (its trees and program), or "all" (verify: every tree and program).
+sub config_checks {
+  my ($need) = @_;
+  my @r;
+  my %cfg;
+  my $self = $0;
+  my $se = "";
+  if ($self =~ /$SAFE/ && $self =~ /\A(.*)\z/s) { $self = $1; $se = file_err($self); }
+  else { $se = "unsafe launcher path"; }
+  push @r, ["launcher", $se];
+  push @r, ["config", file_err(CONF_PATH)];
+  return (undef, \@r) if length $r[-1][1];
+  my ($c, $pe) = parse_config();
+  push @r, ["config format", $pe];
+  return (undef, \@r) if length $pe;
+  for my $k (CONF_KEYS) {
+    my ($v, $e) = conf_path($c->{$k});
+    push @r, ["config $k path", $e];
+    return (undef, \@r) if length $e;
+    $cfg{$k} = $v;
+  }
+  program_paths(\%cfg);
+  my $all = $need eq "all";
+  my @trees = $all ? qw(node app browser) : $need ? @{ $KIND{$need}{tree} } : ();
+  for my $t (@trees) { push @r, ["$t tree", tree_err($cfg{$t})]; }
+  my %uses = map { $_ => 1 } @trees;
+  if ($uses{node}) {
+    push @r, ["node", exe_err($cfg{node_exe})];
+    push @r, ["extract worker", regular_err($cfg{extract_entry})] if $all || $need eq "extract" || $need eq "ocr";
+    push @r, ["docgen worker", regular_err($cfg{docgen_entry})] if $all || $need eq "docgen";
+    push @r, ["manifest", regular_err($cfg{manifest})];
+  }
+  push @r, ["browser", exe_err($cfg{chrome_exe})] if $uses{browser};
+  my @ss = lstat($cfg{scratch});
+  my $sc = "";
+  if (!@ss || !-d _ || -l $cfg{scratch}) { $sc = "scratch is not a directory"; }
+  else {
+    my $real = Cwd::realpath($cfg{scratch});
+    $sc = "scratch is not canonical" unless defined $real && $real eq $cfg{scratch};
+  }
+  push @r, ["scratch", $sc];
+  for my $x (@r) { return (undef, \@r) if length $x->[1]; }
+  return (\%cfg, \@r);
+}
+
+sub load_config {
+  my ($need) = @_;
+  my ($cfg, $r) = config_checks($need);
+  for my $x (@$r) { must($x->[0], $x->[1]); }
+  die_err("config not loaded") unless $cfg;
+  return $cfg;
+}
+
+# What the kind's process may touch — the same policy the server's own sandbox gives the worker today
+# (isolation/sandbox.ts `buildProfile`; a test checks the two profiles are identical for the same paths), with the
+# root-owned trees in place of the server's program folders: the program, `trusted` (read-only program trees),
+# `read` (the job's own folder — extract: its input copy), `write` (render: its profile folder), and for render the
+# egress proxy's loopback port only.
+sub kind_policy {
+  my ($cfg, $kind, $workdir) = @_;
+  return { exe => $cfg->{node_exe}, read => [$workdir], write => [], trusted => [$cfg->{app}] }
+    if $kind eq "extract" || $kind eq "ocr";
+  return { exe => $cfg->{node_exe}, read => [], write => [], trusted => [$cfg->{app}] } if $kind eq "docgen";
+  return { exe => $cfg->{chrome_exe}, read => [], write => [$workdir], trusted => [$cfg->{browser}] }
+    if $kind eq "render";
+  die_err("unknown kind");
+}
+
+# The SBPL profile of a policy, line for line what `buildProfile` (isolation/sandbox.ts) makes of the same policy.
+# $exe: the one program it may run — the kind's own, or /usr/bin/perl for the probe (same reads/writes/network).
+sub build_profile {
+  my ($pol, $exe, $port) = @_;
+  my @read = @{ $pol->{read} };
+  my @write = @{ $pol->{write} };
+  my @trusted = @{ $pol->{trusted} };
+  # Final whole-string safe check on everything interpolated into SBPL (no quotes/newlines/space can be present).
+  for my $p ($exe, @read, @write, @trusted) { die_err("unsafe path for profile: $p") unless $p =~ /$SAFE/; }
+  my @l = (
+    "(version 1)", "(deny default)", '(import "system.sb")', "(allow signal (target same-sandbox))",
+    "(allow process-exec (literal \"$exe\"))", "(allow file-read* (literal \"$exe\"))",
+  );
+  push @l, "(allow file-read* (subpath \"$_\"))" for (@read, @trusted);
+  push @l, "(allow file-read* file-write* (subpath \"$_\"))" for @write;
+  # Metadata (stat) of the folders above the allowed paths — not their contents or listings.
+  my (@parents, %seen);
+  for my $p (@read, @write, @trusted, $exe) {
+    my $d = $p;
+    while (1) {
+      $d =~ s{/[^/]*\z}{};
+      last if $d eq "";
+      push @parents, $d unless $seen{$d}++;
+    }
+  }
+  push @parents, "/" unless $seen{"/"}++;
+  push @l, "(allow file-read-metadata " . join(" ", map { "(literal \"$_\")" } @parents) . ")";
+  if (defined $port) {
+    die_err("bad port") unless $port =~ /\A[0-9]{1,5}\z/ && $port >= 1 && $port <= 65535;
+    push @l, "(allow network-outbound (remote ip \"localhost:$port\"))";
+  }
+  return join("\n", @l) . "\n";
+}
+
+# The browser's switches — `browserArgs` (artifacts/browser.ts) with the render's profile folder and the egress
+# proxy on its loopback port (a test checks the two lists are identical). Fixed here: the caller cannot add one.
+sub browser_args {
+  my ($profile, $port) = @_;
+  return (
+    "--single-process",
+    "--no-zygote",
+    "--no-sandbox",
+    "--remote-debugging-pipe",
+    "--user-data-dir=$profile",
+    "--headless",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-breakpad",
+    "--disable-crash-reporter",
+    "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection",
+    "--metrics-recording-only",
+    "--no-pings",
+    "--mute-audio",
+    "--hide-scrollbars",
+    "--disable-features=site-per-process,IsolateOrigins,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--disable-quic",
+    "--proxy-server=http://127.0.0.1:$port",
+    "--proxy-bypass-list=<-loopback>",
+    "about:blank",
+  );
+}
+
+# <scratch>/<jobid>, verified to have no symlink component and to resolve to exactly itself.
+sub job_workdir {
+  my ($cfg, $jobid) = @_;
+  my $w = "$cfg->{scratch}/$jobid";
+  die_err("work dir is a symlink") if -l $w;
+  die_err("no work dir: $w") unless -d $w;
+  my $real = Cwd::realpath($w);
+  die_err("cannot resolve work dir") unless defined $real;
+  die_err("work dir escapes scratch") unless $real eq $w;
+  return $w;
+}
+
+sub ctl_dir {
+  my ($cfg, $jobid) = @_;
+  my $c = "$cfg->{scratch}/.ctl";
+  die_err(".ctl is a symlink") if -l $c;
+  mkdir($c, 0o700) unless -d $c;              # created by the account via the scratch ACL; kept by the server sweep
+  die_err("no .ctl dir") unless -d $c && !-l $c;
+  my $d = "$c/$jobid";
+  die_err("ctl job dir is a symlink") if -l $d;
+  mkdir($d, 0o700) unless -d $d;
+  die_err("no ctl job dir") unless -d $d && !-l $d;
+  return $d;
+}
+
+# The kernel's view of a process (sysctl CTL_KERN.KERN_PROC.KERN_PROC_PID → struct kinfo_proc, 648 bytes on
+# arm64/x86_64): [uid, start seconds, start microseconds]. Unaffected by anything the process does to its argv.
+# undef when the process does not exist or the call fails; kinfo_gone() tells the two apart.
+my $KINFO_GONE = 0;
+sub kinfo_gone { return $KINFO_GONE; }
+sub kinfo {
+  my ($pid) = @_;
+  my $mib = pack("i4", 1, 14, 1, $pid);
+  my $buf = "\0" x 1024;
+  my $len = pack("Q", length $buf);
+  $KINFO_GONE = 0;
+  my $r = syscall(202, $mib, 4, $buf, $len, 0, 0);    # SYS___sysctl
+  return undef unless defined $r && $r == 0;
+  my $n = unpack("Q", $len);
+  if ($n == 0) { $KINFO_GONE = 1; return undef; }    # no such process: the kernel returns an empty answer
+  return undef unless $n == 648;
+  my ($sec, $usec) = unpack("q l", substr($buf, 0, 12));   # kp_proc.p_starttime (timeval)
+  my $ruid = unpack("L", substr($buf, 392, 4));             # kp_eproc.e_pcred.p_ruid
+  my $euid = unpack("L", substr($buf, 420, 4));             # kp_eproc.e_ucred.cr_uid
+  return undef unless $ruid == $euid;
+  return [$euid, $sec, $usec];
+}
+
+# Resident set size in KB (`ps -o rss=`), or undef when it cannot be measured.
+sub rss_kb {
+  my ($pid) = @_;
+  my ($rc, @out) = run_lines("/bin/ps", "-o", "rss=", "-p", $pid);
+  return undef if $rc != 0 || @out != 1;
+  return $out[0] =~ /\A\s*([0-9]+)\s*\z/ ? $1 + 0 : undef;
+}
+
+sub write_status {
+  my ($ctl, $what) = @_;
+  if (open(my $f, ">", "$ctl/status")) { print $f "$what\n"; close $f; }
+}
+
+sub op_run {
+  my ($kind, $jobid, $timeout, $port) = @_;
+  my $cfg = load_config($kind);
+  my $workdir = job_workdir($cfg, $jobid);
+  my $ctl = ctl_dir($cfg, $jobid);
+  my $pol = kind_policy($cfg, $kind, $workdir);
+  my $profile = build_profile($pol, $pol->{exe}, $port);
+  my $mem = $KIND{$kind}{mem};
+
+  if ($kind eq "render") {
+    # The server made the three folders (server-owned; the scratch ACL lets the account use them).
+    for my $d ("$workdir/home", "$workdir/tmp", "$workdir/profile") {
+      die_err("no render folder: $d") unless -d $d && !-l $d;
+    }
+    my @args = browser_args("$workdir/profile", $port);
+    watched($ctl, $timeout, $mem, sub {
+      chdir($workdir) or POSIX::_exit(127);
+      open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
+      open(STDOUT, ">", "/dev/null") or POSIX::_exit(127);    # our stdout carries the DevTools replies only
+      open(STDERR, ">", "/dev/null") or POSIX::_exit(127);
+      %ENV = (HOME => "$workdir/home", TMPDIR => "$workdir/tmp");
+      exec("/usr/bin/sandbox-exec", "-p", $profile, $cfg->{chrome_exe}, @args) or POSIX::_exit(127);
+    }, 1);
+  }
+
+  # Stage stdin (the job JSON) to a file: the child reads it, so a backgrounded/kept-open pipe cannot stall.
+  my $job = do { local $/; <STDIN> };
+  $job = "" unless defined $job;
+  open(my $sf, ">", "$workdir/.agentlee-stdin") or die_err("cannot stage stdin");
+  print $sf $job;
+  close($sf) or die_err("cannot stage stdin");
+
+  my ($entry, $flag, $cwd) = $kind eq "docgen"
+    ? ($cfg->{docgen_entry}, "AGENTLEE_DOC_WORKER", "$cfg->{app}/docgen")
+    : ($cfg->{extract_entry}, "AGENTLEE_EXTRACT_WORKER", "$cfg->{app}/extract");
+  watched($ctl, $timeout, $mem, sub {
+    chdir($cwd) or POSIX::_exit(127);
+    open(STDIN, "<", "$workdir/.agentlee-stdin") or POSIX::_exit(127);
+    # The worker's one flag, and where its root-owned program tree is: in this mode the worker takes its library
+    # paths from that tree's manifest and ignores any the job names (the caller cannot pick code to import).
+    %ENV = ($flag => "1", AGENTLEE_WORKER_APP => $cfg->{app});
+    exec("/usr/bin/sandbox-exec", "-p", $profile, $cfg->{node_exe}, $entry) or POSIX::_exit(127);
+  });
+}
+
+sub set_nonblock {
+  my ($fh) = @_;
+  my $fl = fcntl($fh, F_GETFL, 0);
+  die_err("fcntl failed") unless defined $fl;
+  fcntl($fh, F_SETFL, $fl | O_NONBLOCK) or die_err("fcntl failed");
+}
+
+# Forks the child that will exec the sandboxed program ($exec_child sets it up and execs; it runs only after its
+# identity is on record), records it, releases it, and watches it — wall clock and resident memory every POLL_SEC
+# — until it ends; then exits with its status (124 timeout, 125 memory). The python launcher's `watched`, with the
+# limit per kind and, for render ($bridge), the browser's DevTools pipe: the child gets two pipes as fd 3 (commands
+# in) and fd 4 (replies out), and this process relays its stdin to fd 3 and fd 4 to its stdout — sudo passes only
+# stdin/stdout/stderr, and the browser is never given the server's pipes themselves.
+sub watched {
+  my ($ctl, $timeout, $mem_kb, $exec_child, $bridge) = @_;
+  # The child waits on this pipe until its identity is on record; EOF (we died) means it never runs the program.
+  pipe(my $gate_r, my $gate_w) or die_err("pipe failed");
+  my ($cmd_r, $cmd_w, $rep_r, $rep_w);
+  if ($bridge) {
+    pipe($cmd_r, $cmd_w) or die_err("pipe failed");
+    pipe($rep_r, $rep_w) or die_err("pipe failed");
+  }
+  my $pid = fork();
+  die_err("fork failed") unless defined $pid;
+  if ($pid == 0) {
+    close($gate_w);
+    POSIX::setsid();                          # its own session/group: the program cannot leave it (a session
+                                              # leader cannot setsid/setpgid), and reap kills by the verified pid
+    my $go = "";
+    my $n = sysread($gate_r, $go, 1);
+    POSIX::_exit(127) unless defined $n && $n == 1 && $go eq "G";
+    close($gate_r);
+    if ($bridge) {
+      close($cmd_w);
+      close($rep_r);
+      # Move both ends above 4 first (no clobbering), then onto 3 and 4 (dup2 clears close-on-exec there).
+      my $a = fcntl($cmd_r, F_DUPFD, 10);
+      my $b = fcntl($rep_w, F_DUPFD, 10);
+      POSIX::_exit(127) unless defined $a && defined $b;
+      POSIX::_exit(127) unless defined POSIX::dup2($a, 3) && defined POSIX::dup2($b, 4);
+      POSIX::close($a);
+      POSIX::close($b);
+    }
+    $exec_child->();
+    POSIX::_exit(127);
+  }
+  close($gate_r);
+  if ($bridge) { close($cmd_r); close($rep_w); }
+  my $kill = sub { kill("KILL", $pid); kill("KILL", -$pid); waitpid($pid, 0); };
+
+  # Record the child's kernel identity (uid + start time to the microsecond) where the sandbox cannot write,
+  # atomically; only then release it.
+  my $id = kinfo($pid);
+  if (!$id || $id->[0] != $<) { $kill->(); die_err("cannot read the child's identity"); }
+  my $rec = "$pid $id->[0] $id->[1] $id->[2]\n";
+  my $ok = open(my $lf, ">", "$ctl/leader.tmp");
+  $ok &&= print $lf $rec;
+  $ok &&= close($lf);
+  $ok &&= rename("$ctl/leader.tmp", "$ctl/leader");
+  if (!$ok) { $kill->(); die_err("cannot record the child"); }
+  my $w = syswrite($gate_w, "G", 1);
+  close($gate_w);
+  if (!defined $w || $w != 1) { $kill->(); die_err("cannot release the child"); }
+
+  # The relay's state (render): bytes from the server for fd 3, bytes from fd 4 for the server.
+  my ($inbuf, $outbuf, $in_eof, $rep_eof) = ("", "", 0, 0);
+  if ($bridge) {
+    $SIG{PIPE} = "IGNORE";                    # the server or the browser going away is an error return, not death
+    set_nonblock(\*STDIN);
+    set_nonblock(\*STDOUT);
+    set_nonblock($cmd_w);
+    set_nonblock($rep_r);
+  }
+  my $relay = sub {
+    my ($wait) = @_;
+    my ($rin, $win) = ("", "");
+    vec($rin, fileno(STDIN), 1) = 1 if !$in_eof && length($inbuf) < BRIDGE_MAX;
+    vec($rin, fileno($rep_r), 1) = 1 if !$rep_eof && length($outbuf) < BRIDGE_MAX;
+    vec($win, fileno($cmd_w), 1) = 1 if $cmd_w && length $inbuf;
+    vec($win, fileno(STDOUT), 1) = 1 if length $outbuf;
+    my ($rout, $wout) = ($rin, $win);
+    my $n = select($rout, $wout, undef, $wait);
+    return if !defined $n || $n <= 0;
+    if (!$in_eof && vec($rout, fileno(STDIN), 1)) {
+      my $r = sysread(STDIN, $inbuf, 65536, length $inbuf);
+      $in_eof = 1 if defined $r ? $r == 0 : !$!{EAGAIN};
+    }
+    if (!$rep_eof && vec($rout, fileno($rep_r), 1)) {
+      my $r = sysread($rep_r, $outbuf, 65536, length $outbuf);
+      $rep_eof = 1 if defined $r ? $r == 0 : !$!{EAGAIN};
+    }
+    if ($cmd_w && length $inbuf && vec($wout, fileno($cmd_w), 1)) {
+      my $r = syswrite($cmd_w, $inbuf);
+      if (defined $r) { substr($inbuf, 0, $r) = ""; }
+      elsif (!$!{EAGAIN}) { $inbuf = ""; close($cmd_w); $cmd_w = undef; }    # the browser closed its end
+    }
+    if (length $outbuf && vec($wout, fileno(STDOUT), 1)) {
+      my $r = syswrite(STDOUT, $outbuf);
+      if (defined $r) { substr($outbuf, 0, $r) = ""; }
+      elsif (!$!{EAGAIN}) { $outbuf = ""; $rep_eof = 1; $in_eof = 1; }     # the server went away
+    }
+    # The server closed its end and everything it sent is through: the browser sees EOF on fd 3.
+    if ($cmd_w && $in_eof && !length $inbuf) { close($cmd_w); $cmd_w = undef; }
+  };
+
+  # Watch it: wall clock and resident memory every POLL_SEC (a child exit wakes the sleep early). Over a limit —
+  # or memory that cannot be measured while it still runs — kills it.
+  local $SIG{CHLD} = sub { };
+  my $t0 = Time::HiRes::time();
+  my $status;
+  while (1) {
+    my $g = waitpid($pid, POSIX::WNOHANG());
+    if ($g == $pid) { $status = $?; last; }
+    die_err("lost the child") if $g < 0;
+    if (Time::HiRes::time() - $t0 > $timeout) {
+      $kill->();
+      write_status($ctl, "timeout");
+      exit EXIT_TIMEOUT;
+    }
+    my $rss = rss_kb($pid);
+    if (!defined $rss || $rss > $mem_kb) {
+      $g = waitpid($pid, POSIX::WNOHANG());
+      if ($g == $pid) { $status = $?; last; }  # it simply ended between two looks
+      $kill->();
+      write_status($ctl, defined $rss ? "memory" : "memory-unmeasured");
+      exit EXIT_MEMORY;
+    }
+    if ($bridge) {
+      # Relay for one interval (several selects: data moves at once, the checks above still run every POLL_SEC).
+      my $until = Time::HiRes::time() + POLL_SEC;
+      while ((my $left = $until - Time::HiRes::time()) > 0) { $relay->($left); }
+    } else {
+      select(undef, undef, undef, POLL_SEC);
+    }
+  }
+  if ($bridge) {
+    # The browser is gone: what it wrote before it ended still reaches the server (bounded).
+    my $until = Time::HiRes::time() + DRAIN_SEC;
+    $in_eof = 1;
+    $inbuf = "";
+    while ((!$rep_eof || length $outbuf) && (my $left = $until - Time::HiRes::time()) > 0) {
+      $relay->($left < POLL_SEC ? $left : POLL_SEC);
+    }
+  }
+  exit($status >> 8) if ($status & 127) == 0;
+  exit(128 + ($status & 127));
+}
+
+sub op_probe {
+  my ($kind, $jobid, $sibling, $port) = @_;
+  die_err("bad pid") unless $sibling =~ /\A([0-9]{1,10})\z/;
+  $sibling = $1;
+  my $cfg = load_config($kind);
+  my $workdir = job_workdir($cfg, $jobid);
+  my $ctl = ctl_dir($cfg, $jobid);
+  # The kind's own profile (its reads, writes, network), with /usr/bin/perl as the one program: node has no sysctl
+  # binding, and the question — may this uid, inside this profile, read a server-uid process's KERN_PROCARGS2 — is
+  # the same whichever program asks. What a real job needs is checked by the server running one through `run`.
+  my $profile = build_profile(kind_policy($cfg, $kind, $workdir), "/usr/bin/perl", $port);
+  # One verdict line. A different uid gets EINVAL (or EPERM) from KERN_PROCARGS2 — and so does a pid that is gone,
+  # so "blocked" also needs the kernel to still show the sibling (by KERN_PROC_PID, which any uid may read), with
+  # its uid. The server checks that uid is its own and differs from ours. No module is loaded (none is readable).
+  my $code = <<'PL';
+my $sib = $ARGV[0];
+if (!defined $sib || $sib !~ /\A([0-9]{1,10})\z/) { print "uid=$> procargs=error sibling\n"; exit 0; }
+$sib = $1 + 0;
+sub procargs { my ($pid) = @_; my $mib = pack("i3", 1, 49, $pid); my $len = pack("Q", 0); $! = 0;
+  my $r = syscall(202, $mib, 3, 0, $len, 0, 0); return ($r, $! + 0, unpack("Q", $len)); }
+sub kuid { my ($pid) = @_; my $mib = pack("i4", 1, 14, 1, $pid); my $buf = "\0" x 1024;
+  my $len = pack("Q", length $buf); my $r = syscall(202, $mib, 4, $buf, $len, 0, 0);
+  return undef unless defined $r && $r == 0 && unpack("Q", $len) == 648; return unpack("L", substr($buf, 420, 4)); }
+my $me = $>;
+my ($cr, $ce, $cs) = procargs($$);
+if ($cr != 0 || !$cs) { print "uid=$me procargs=error control\n"; exit 0; }
+my $su = kuid($sib);
+if (!defined $su) { print "uid=$me procargs=error sibling\n"; exit 0; }
+my ($tr, $te, $ts) = procargs($sib);
+if ($tr == 0 && $ts) { print "uid=$me sibling=$su procargs=readable\n"; exit 0; }
+if ($te != 1 && $te != 22) { print "uid=$me procargs=error errno=$te\n"; exit 0; }
+my $again = kuid($sib);
+if (defined $again && $again == $su) { print "uid=$me sibling=$su procargs=blocked\n"; }
+else { print "uid=$me procargs=error sibling\n"; }
+PL
+  # Like run: a recorded, watched child (reap can stop it by its verified identity), and its own short wall-clock
+  # limit (exit 124) so it never outlives the server's bound by itself.
+  watched($ctl, PROBE_TIMEOUT_SEC, $KIND{$kind}{mem}, sub {
+    chdir($workdir) or POSIX::_exit(127);
+    open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
+    %ENV = (PATH => "/usr/bin:/bin", LC_ALL => "C");
+    exec("/usr/bin/sandbox-exec", "-p", $profile, "/usr/bin/perl", "-e", $code, $sibling) or POSIX::_exit(127);
+  });
+}
+
+sub refuse_reap { my ($m) = @_; print STDERR "launcher: reap refused: $m\n"; exit EXIT_REFUSED; }
+
+sub op_reap {
+  my ($jobid) = @_;
+  my $cfg = load_config(0);
+  my $ctl = "$cfg->{scratch}/.ctl/$jobid";
+  refuse_reap("ctl dir is a symlink") if -l $ctl;
+  refuse_reap("no run record") unless -d $ctl && -f "$ctl/leader" && !-l "$ctl/leader";
+  open(my $lf, "<", "$ctl/leader") or refuse_reap("run record unreadable");
+  my $rec = do { local $/; <$lf> };
+  close($lf);
+  refuse_reap("run record malformed")
+    unless defined $rec && $rec =~ /\A([0-9]{1,10}) ([0-9]{1,10}) ([0-9]{1,20}) ([0-9]{1,7})\n\z/;
+  my ($pid, $uid, $sec, $usec) = ($1 + 0, $2 + 0, $3 + 0, $4 + 0);
+  refuse_reap("pid <= 1") unless $pid > 1;
+  refuse_reap("record is not this account's") unless $uid == $<;
+  my $now = kinfo($pid);
+  if (!$now) {
+    # Gone (exit 0) is not the same as "could not look it up" (refused: nothing verified, nothing killed).
+    if (kinfo_gone()) { print STDERR "launcher: reap: not running\n"; exit 0; }
+    refuse_reap("cannot read the process's kernel identity");
+  }
+  # The same process: the kernel's uid and start time (to the microsecond) — not argv, which python can rewrite.
+  refuse_reap("pid identity changed (reused)")
+    unless $now->[0] == $uid && $now->[1] == $sec && $now->[2] == $usec;
+  kill("KILL", $pid);
+  kill("KILL", -$pid);                        # its group (pgid == the verified pid: the launcher made it a leader)
+  exit 0;
+}
+
+sub op_clean {
+  my ($jobid) = @_;
+  my $cfg = load_config(0);
+  my $w = "$cfg->{scratch}/$jobid";
+  if (!-e $w && !-l $w) { system("/bin/rm", "-rf", "--", "$cfg->{scratch}/.ctl/$jobid"); exit 0; }
+  die_err("work dir is a symlink") if -l $w;
+  my $real = Cwd::realpath($w);
+  die_err("cannot resolve work dir") unless defined $real;
+  die_err("work dir escapes scratch") unless $real eq $w;
+  # Restore permissions top-down (a dir must be rwx before its children can be listed), never following symlinks.
+  # $w is confined (under scratch, verified, no symlink entry followed); untaint child paths so chmod/rm can run
+  # under -T. Names from readdir are confined to this job dir.
+  my @stack = ($w);
+  while (@stack) {
+    my $d = pop @stack;
+    chmod(0o700, $d);
+    opendir(my $dh, $d) or next;
+    my @names = readdir($dh);
+    closedir($dh);
+    for my $n (@names) {
+      next if $n eq "." || $n eq ".." || index($n, "\0") >= 0 || index($n, "/") >= 0;
+      my ($c) = ("$d/$n") =~ /\A(.*)\z/s;    # untaint: confined to this job dir
+      next if -l $c;
+      push @stack, $c if -d $c;
+    }
+  }
+  system("/bin/rm", "-rf", "--", $w);
+  system("/bin/rm", "-rf", "--", "$cfg->{scratch}/.ctl/$jobid");
+  die_err("work dir not removed: $w") if -e $w || -l $w;
+  exit 0;
+}
+
+# ---- verify: the read-only setup report ------------------------------------------------------------------------
+
+# A uid/gid as any tool prints it (signed or unsigned 32-bit: dsmemberutil says -2 where getpwnam/id say
+# 4294967294 for nobody) → the unsigned 32-bit value, or undef when it is not an integer in range.
+sub u32 {
+  my ($v) = @_;
+  return undef unless defined $v && $v =~ /\A(-?)([0-9]{1,10})\z/;
+  my $n = $2 + 0;
+  if ($1 eq "-") { return undef if $n > 2**31; return $n == 0 ? 0 : 2**32 - $n; }
+  return undef if $n > 2**32 - 1;
+  return $n;
+}
+
+# The account: uid, group names and gids (`id -Gn` / `id -G`: directory-service and nested groups count), its
+# UUID, and a UUID resolver (`dsmemberutil getid -X`) for ACL principals `ls` printed as UUIDs. undef if unknown.
+sub account_info {
+  my ($user) = @_;
+  my @pw = getpwnam($user);
+  return undef unless @pw;
+  my ($rc, @out) = run_lines("/usr/bin/id", "-Gn", "--", $user);
+  return undef if $rc != 0 || @out != 1;
+  my %groups = map { $_ => 1 } split /\s+/, $out[0];
+  my ($rc2, @gids) = run_lines("/usr/bin/id", "-G", "--", $user);
+  return undef if $rc2 != 0 || @gids != 1;
+  my %gids;
+  for my $g (split /\s+/, $gids[0]) { my $n = u32($g); return undef unless defined $n; $gids{$n} = 1; }
+  my $uid = u32($pw[2]);
+  return undef unless defined $uid;
+  return {
+    name => $user, uid => $uid, groups => \%groups, gids => \%gids,
+    uuid_id => sub {
+      my ($u) = @_;
+      my ($r, @o) = run_lines("/usr/bin/dsmemberutil", "getid", "-X", $u);
+      return () if $r != 0 || @o != 1 || $o[0] !~ /\A(uid|gid): (-?[0-9]+)\z/;
+      my $id = u32($2);
+      return defined $id ? ($1, $id) : ();
+    },
+  };
+}
+
+my $UUID = qr{\A[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\z};
+
+# An ACL principal as `ls -le` prints it — `user:<name|uid|UUID>`, `group:<name|gid|UUID>`, or a bare UUID when
+# the name could not be looked up — → 1 (the account or one of its groups), 0 (someone else), or undef (cannot
+# tell: a diagnostic failure, never "unrelated").
+sub principal_mine {
+  my ($acct, $who) = @_;
+  my ($kind, $x) = $who =~ /\A(user|group):(.+)\z/ ? ($1, $2) : ("", $who);
+  if ($x =~ $UUID) {
+    my ($ux) = $x =~ /\A(.*)\z/s;          # untaint: exactly a UUID
+    my ($t, $raw) = $acct->{uuid_id}->($ux);
+    return undef unless defined $t;
+    my $id = u32($raw);
+    return undef unless defined $id;
+    return undef if length $kind && $t ne ($kind eq "user" ? "uid" : "gid");
+    return $t eq "uid" ? ($id == $acct->{uid} ? 1 : 0) : ($acct->{gids}{$id} ? 1 : 0);
+  }
+  return undef unless length $kind;
+  if ($x =~ /\A-?[0-9]+\z/) {
+    my $n = u32($x);
+    return undef unless defined $n;
+    return $kind eq "user" ? ($n == $acct->{uid} ? 1 : 0) : ($acct->{gids}{$n} ? 1 : 0);
+  }
+  return $kind eq "user" ? ($x eq $acct->{name} ? 1 : 0) : ($acct->{groups}{$x} ? 1 : 0);
+}
+
+# May the account do $perm (an ACL permission name) on a node of mode/uid/gid with these `ls -le` ACL lines? The
+# first ACL entry that names $perm and applies to the account decides — entries marked only_inherit apply to
+# children only and are skipped; an entry whose principal cannot be resolved is a failure — then the POSIX bit
+# ($bit: 4 = r, 2 = w, 1 = x) of the class the account falls in (owner, else group, else other). "" or why not.
+sub account_eval {
+  my ($acct, $p, $perm, $bit, $mode, $uid, $gid, @acl) = @_;
+  for my $l (@acl) {
+    $l =~ /$ACE/ or return "unparsed ACL line at $p";
+    my ($who, $kind, $perms) = ($2, $3, $4);
+    my %ps = map { $_ => 1 } split /,/, $perms;
+    next if $ps{only_inherit} || !$ps{$perm};
+    my $mine = principal_mine($acct, $who);
+    return "cannot resolve ACL principal $who at $p" unless defined $mine;
+    next unless $mine;
+    return $kind eq "allow" ? "" : "ACL denies $perm to the account at $p";
+  }
+  my ($ou, $og) = (u32($uid), u32($gid));
+  return "bad owner ids at $p" unless defined $ou && defined $og;
+  my $cls = $ou == $acct->{uid} ? 6 : $acct->{gids}{$og} ? 3 : 0;
+  return "" if ($mode >> $cls) & $bit;
+  return "the account cannot $perm $p";
+}
+
+# account_eval on a path, reading its mode and ACL now. Symlinks are refused (every checked path is canonical).
+sub account_may {
+  my ($acct, $p, $perm, $bit) = @_;
+  my @st = lstat($p);
+  return "cannot stat: $p" unless @st;
+  return "symlink on a checked path: $p" if -l _;
+  my ($e, $acl) = node_acl($p);
+  return $e if length $e;
+  return account_eval($acct, $p, $perm, $bit, $st[2], $st[4], $st[5], @$acl);
+}
+
+# Every ancestor of $p (not $p itself) must be searchable by the account.
+sub account_traverse {
+  my ($acct, $p, $done) = @_;
+  while ($p ne "/") {
+    $p =~ s{/[^/]*\z}{};
+    $p = "/" if $p eq "";
+    next if $done->{$p}++;
+    my $e = account_may($acct, $p, "search", 1);
+    return $e if length $e;
+  }
+  return "";
+}
+
+# What the launcher, running AS the account, opens: the chains of the launcher, the config and the three trees
+# (search), the launcher (read + execute), the config (read), node and the browser (read + execute), every
+# directory in the trees (search + list) and every file (read). Uses the nodes tree_err saw; a node's ACL is read
+# again only where its directory's listing had ACL lines.
+sub account_program_err {
+  my ($acct, $cfg, $self) = @_;
+  my %done;
+  for my $p ($self, CONF_PATH, $cfg->{node}, $cfg->{app}, $cfg->{browser}) {
+    my $e = account_traverse($acct, $p, \%done);
+    return $e if length $e;
+  }
+  for my $x ([$self, "read", 4], [$self, "execute", 1], [CONF_PATH, "read", 4],
+             [$cfg->{node_exe}, "read", 4], [$cfg->{node_exe}, "execute", 1],
+             [$cfg->{chrome_exe}, "read", 4], [$cfg->{chrome_exe}, "execute", 1]) {
+    my $e = account_may($acct, @$x);
+    return $e if length $e;
+  }
+  for my $root ($cfg->{node}, $cfg->{app}, $cfg->{browser}) {
+    for my $x ([$root, "search", 1], [$root, "list", 4]) {
+      my $e = account_may($acct, @$x);
+      return $e if length $e;
+    }
+    my $scan = $TREE_SCAN{$root} or return "tree not scanned: $root";
+    for my $n (@{ $scan->{nodes} }) {
+      my ($c, $mode, $uid, $gid) = @$n;
+      (my $dir = $c) =~ s{/[^/]*\z}{};
+      my @acl;
+      if ($scan->{acl_dirs}{$dir}) {
+        my ($e, $a) = node_acl($c);
+        return $e if length $e;
+        @acl = @$a;
+      }
+      my @need = POSIX::S_ISDIR($mode) ? (["search", 1], ["list", 4]) : (["read", 4]);
+      for my $q (@need) {
+        my $e = account_eval($acct, $c, $q->[0], $q->[1], $mode, $uid, $gid, @acl);
+        return $e if length $e;
+      }
+    }
+  }
+  return "";
+}
+
+sub op_verify {
+  my ($user) = @_;
+  print "advisory verify can miss ACL corner cases; pnpm workers:check (the self-check as the account) is authoritative\n";
+  my ($cfg, $r) = config_checks("all");
+  my $bad = 0;
+  for my $x (@$r) {
+    if (length $x->[1]) { $bad = 1; print "check $x->[0] fail $x->[1]\n"; }
+    else { print "check $x->[0] ok\n"; }
+  }
+  if ($cfg) {
+    print "scratch $cfg->{scratch}\n";
+    my $acct = account_info($user);
+    if (!$acct) { $bad = 1; print "check account fail unknown account: $user\n"; }
+    else {
+      print "check account ok\n";
+      my ($self) = $0 =~ /\A(.*)\z/s;           # already proven safe by config_checks
+      my $pe = account_program_err($acct, $cfg, $self);
+      if (length $pe) { $bad = 1; print "check account program access fail $pe\n"; }
+      else { print "check account program access ok\n"; }
+      my $te = account_traverse($acct, $cfg->{scratch}, {});
+      $te = account_may($acct, $cfg->{scratch}, "search", 1) unless length $te;
+      if (length $te) { $bad = 1; print "check scratch traversal fail $te\n"; }
+      else { print "check scratch traversal ok\n"; }
+      my $we = account_may($acct, $cfg->{scratch}, "add_subdirectory", 2);
+      if (length $we) { $bad = 1; print "check scratch write fail $we\n"; }
+      else { print "check scratch write ok\n"; }
+    }
+  }
+  print $bad ? "result fail\n" : "result ok\n";
+  exit($bad ? 1 : 0);
+}
+
+# ---- dispatch (tests load everything above this line as a library; nothing below is a function) -------------
+my $op = shift @ARGV // "";
+if ($op eq "run" || $op eq "probe") {
+  my $rawkind = $ARGV[0] // "";
+  die_err("bad kind") unless $rawkind =~ /\A(extract|ocr|docgen|render)\z/;
+  my $kind = $1;
+  my $want = $kind eq "render" ? 4 : 3;      # render: + the egress proxy's loopback port
+  die_err("$op $kind needs $want args") unless @ARGV == $want;
+  my ($rawjob, $rawn) = @ARGV[1, 2];
+  die_err("bad job id") unless defined $rawjob && $rawjob =~ /$JOBID/;
+  $rawjob =~ /\A(.*)\z/s; my $jobid = $1;
+  my $port;
+  if ($kind eq "render") {
+    die_err("bad port") unless $ARGV[3] =~ /\A([1-9][0-9]{0,4})\z/ && $1 <= 65535;
+    $port = $1 + 0;
+  }
+  if ($op eq "run") {
+    die_err("bad timeout") unless $rawn =~ /\A([0-9]{1,3})\z/;
+    my $to = $1 + 0;
+    die_err("timeout out of range") unless $to >= 1 && $to <= $KIND{$kind}{max};
+    op_run($kind, $jobid, $to, $port);
+  } else {
+    op_probe($kind, $jobid, $rawn, $port);
+  }
+} elsif ($op eq "reap" || $op eq "clean") {
+  die_err("$op needs 1 arg") unless @ARGV == 1;
+  die_err("bad job id") unless defined $ARGV[0] && $ARGV[0] =~ /$JOBID/;
+  $ARGV[0] =~ /\A(.*)\z/s; my $jobid = $1;
+  $op eq "reap" ? op_reap($jobid) : op_clean($jobid);
+} elsif ($op eq "verify") {
+  die_err("verify needs 1 arg") unless @ARGV == 1;
+  die_err("bad account name") unless defined $ARGV[0] && $ARGV[0] =~ /\A([a-z_][a-z0-9_-]{0,30})\z/;
+  op_verify($1);
+} else {
+  die_err("unknown operation: $op");
+}

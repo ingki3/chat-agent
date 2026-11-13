@@ -6,6 +6,9 @@
 //
 // stdin: one JSON job `{ kind, doc, images: { [fileId]: { kind: "png" | "jpg", data: base64 } }, modules, fonts }`.
 // stdout: one JSON result — `{ ok: true, data: base64, checks }` or `{ ok: false, code }`.
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { buildDocx } from "./docx.mjs";
 import { buildPdf } from "./pdf.mjs";
 import { buildPptx } from "./pptx.mjs";
@@ -31,12 +34,37 @@ export async function run(job) {
   return { buf, checks };
 }
 
+/**
+ * Under the worker account (#122) the launcher sets `AGENTLEE_WORKER_APP` to the root-owned program tree this file
+ * runs from: the library paths and the fonts then come from that tree's `manifest.json` (`pnpm workers:bundle`),
+ * never from the job — the caller cannot pick code to import. A manifest path is relative to the tree and may not
+ * leave it. Without the variable the job is used as given.
+ */
+export function fromApp(job, app = process.env.AGENTLEE_WORKER_APP) {
+  if (!app) return job;
+  const m = JSON.parse(fs.readFileSync(path.join(app, "manifest.json"), "utf8")).docgen;
+  const at = (rel) => {
+    if (typeof rel !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes(".."))
+      throw new DocError("doc_failed");
+    return path.join(app, rel);
+  };
+  return {
+    kind: job.kind,
+    doc: job.doc,
+    images: job.images,
+    modules: Object.fromEntries(
+      Object.entries(m.modules).map(([k, rel]) => [k, pathToFileURL(at(rel)).href]),
+    ),
+    fonts: { regular: at(m.fonts.regular), bold: at(m.fonts.bold) },
+  };
+}
+
 async function main() {
   const chunks = [];
   for await (const c of process.stdin) chunks.push(c);
   let out;
   try {
-    const { buf, checks } = await run(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    const { buf, checks } = await run(fromApp(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
     out = { ok: true, data: buf.toString("base64"), checks };
   } catch (e) {
     out = { ok: false, code: e instanceof DocError ? e.code : "doc_failed" };
