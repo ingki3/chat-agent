@@ -28,6 +28,7 @@ import {
   workerScratchRoot,
   type WorkerAccount,
 } from "../src/workers/account.js";
+import { bundleWorkers, installedFingerprint, workerManifest } from "../src/workers/bundle.js";
 import { docAsAccount } from "../src/workers/docgen.js";
 import { accountOrSandboxExtractor, EXTRACT_INPUT, extractAsAccount } from "../src/workers/extract.js";
 import { makeWorkerJobDir, runWorkerJob, sweepWorkerScratch, type WorkerSpawn } from "../src/workers/run.js";
@@ -809,6 +810,26 @@ describe("the worker self-check and gates (#122)", () => {
         job(dataDir, 777),
       ),
     ).toMatchObject({ ok: false, step: "probe", reason: "sudo: a password is required" });
+    // The installed bundle must be this checkout's: another fingerprint, or none readable, fails first.
+    const withBundle = (installed: string | undefined) =>
+      selfCheckWorker({
+        kind: "docgen",
+        account: ACCT,
+        dataDir,
+        serverUid: SERVER,
+        probe: probe({ uid: 777, siblingUid: SERVER, readBlocked: true }),
+        job: job(dataDir, 777),
+        clean: () => {},
+        ownerOf: () => 777,
+        bundle: { current: () => "a".repeat(64), installed: () => installed },
+      });
+    expect(await withBundle("b".repeat(64))).toMatchObject({
+      ok: false,
+      step: "bundle",
+      reason: expect.stringMatching(/other code/),
+    });
+    expect(await withBundle(undefined)).toMatchObject({ ok: false, step: "bundle" });
+    expect(await withBundle("a".repeat(64))).toEqual({ ok: true, uid: 777 });
   });
 
   it("the probe's sibling holds a synthetic secret in its environment and is gone afterwards; the job folder too", async () => {
@@ -938,7 +959,7 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
   /** One bundle per run (APFS clones), copied into each rig. */
   const bundle = async (): Promise<string> => {
     if (shared) return shared;
-    const { bundleWorkers } = await import("../src/workers/bundle.js");
+
     const out = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-wkbundle-"))), "b");
     bundleWorkers(out);
     shared = out;
@@ -1077,6 +1098,11 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
         probe: async () => ({ uid: me, siblingUid: 1, readBlocked: true }),
         clean: cleanDirect(r),
         job,
+        // The rig's bundle was made from this checkout: its fingerprint is ours (read through its config).
+        bundle: {
+          current: () => workerManifest().fingerprint,
+          installed: () => installedFingerprint(r.conf),
+        },
       });
       expect(v, kind).toEqual({ ok: true, uid: me });
     }
@@ -1167,6 +1193,55 @@ describe.skipIf(!MAC)("the worker launcher (relaxed test copy on a real bundle, 
     },
     120_000,
   );
+
+  it("every format the account path must carry: PDF text, OCR of a scanned PDF, all four document kinds", async () => {
+    const r = await rig();
+    const w = worker(r);
+    const fix = path.resolve(HERE, "../../../fixtures/extract");
+    const hooks = { spawn: direct(r), clean: cleanDirect(r) };
+    const extract = async (name: string, kind: string, ocr: boolean) => {
+      const data = fs.readFileSync(path.join(fix, name));
+      const src = path.join(tmp(), name);
+      fs.writeFileSync(src, data);
+      return extractAsAccount(
+        w,
+        r.dataDir,
+        {
+          file: {
+            kind,
+            bytes: data.length,
+            sha256: crypto.createHash("sha256").update(data).digest("hex"),
+          } as FileRow,
+          path: src,
+          signal: new AbortController().signal,
+        },
+        () => (ocr ? { available: true, langDir: "" } : { available: false, reason: "off" }),
+        hooks,
+      );
+    };
+    const pdf = await extract("report.pdf", "pdf", false);
+    expect(pdf.ok, JSON.stringify(pdf)).toBe(true);
+    if (pdf.ok) expect(pdf.units).toBe(12);
+    const scan = await extract("scanned.pdf", "pdf", true);
+    expect(scan.ok, JSON.stringify(scan)).toBe(true);
+    if (scan.ok) {
+      expect(scan.ocr).toBe("done");
+      expect(scan.segments[0]!.text).toBe("Agent Lee scan test 2026\n가족 과제 안내문 확인");
+    }
+    for (const kind of ["docx", "xlsx", "pptx", "pdf"] as const) {
+      const d = await docAsAccount(
+        w,
+        r.dataDir,
+        {
+          kind,
+          doc: { title: "검사 문서", blocks: [{ type: "paragraph", text: "본문 한 줄" }] },
+          images: {},
+        },
+        hooks,
+      );
+      expect(d.ok, `${kind} ${JSON.stringify(d)}`).toBe(true);
+    }
+  }, 180_000);
 
   it("the memory watch kills a worker over its kind's limit (125 → doc_limit)", async () => {
     const r = await rig({ DOCGEN: 20_000 });

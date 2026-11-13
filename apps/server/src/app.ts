@@ -95,6 +95,7 @@ import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
 import { accountOrSandboxExtractor } from "./workers/extract.js";
+import { installedFingerprint, workerManifest } from "./workers/bundle.js";
 import { sweepWorkerScratch } from "./workers/run.js";
 import {
   docJobCheck,
@@ -660,6 +661,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       if (opts.docs?.runner) workerGates.skip("docgen", "a custom document runner");
       const account = workerAccount;
       const renderer = ownRenderer;
+      let workerFingerprint = "";
+      try {
+        workerFingerprint = workerManifest().fingerprint;
+      } catch {
+        // a package missing here: every check fails at its bundle step (fail closed)
+      }
       void workerGates
         .start(async (kind, signal) => {
           if (kind === "render" && !renderer)
@@ -670,6 +677,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             dataDir: config.dataDir,
             serverUid: process.getuid?.() ?? -1,
             signal,
+            bundle: { current: () => workerFingerprint, installed: () => installedFingerprint() },
             job:
               kind === "extract"
                 ? extractJobCheck(config.dataDir, ocrNow)

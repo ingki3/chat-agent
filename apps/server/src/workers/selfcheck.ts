@@ -31,6 +31,7 @@ import { makeWorkerJobDir, removeWorkerJob } from "./run.js";
  * advisory). A kind is run through the account only after its check passed on this machine; until then (and when it
  * fails) it keeps the same-uid sandbox and the admin status says it is not isolated by account.
  *
+ * 0. `bundle`: the installed program bundle's fingerprint is this checkout's (same worker code, same libraries).
  * 1. `probe`: as the account, inside that kind's sandbox profile (its reads, writes and network, the program
  *    swapped for /usr/bin/perl — node has no sysctl binding), the probe's uid differs from the server's and the
  *    `KERN_PROCARGS2` of a server-uid sibling holding a synthetic secret in its environment cannot be read (the
@@ -264,9 +265,27 @@ export async function selfCheckWorker(o: {
   clean?: (account: WorkerAccount, jobId: string) => void;
   ownerOf?: (file: string) => number;
   signal?: AbortSignal | undefined;
+  /**
+   * The installed program bundle must be this server's (`workerFingerprint` vs `installedFingerprint`): the account
+   * never runs worker code or libraries other than the server's own. Omitted only by tests of the other steps.
+   */
+  bundle?: { current: () => string; installed: () => string | undefined };
 }): Promise<SelfCheckResult> {
-  let step = "probe";
+  let step = "bundle";
   try {
+    if (o.bundle) {
+      const want = o.bundle.current();
+      const got = o.bundle.installed();
+      if (got !== want)
+        return {
+          ok: false,
+          step,
+          reason: got
+            ? "the installed worker bundle was made from other code: pnpm workers:bundle and reinstall it (docs/ops.md §41.2)"
+            : "no installed worker bundle could be read",
+        };
+    }
+    step = "probe";
     const p = await probeWorker({
       account: o.account,
       kind: o.kind,

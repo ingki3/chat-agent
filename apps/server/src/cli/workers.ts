@@ -11,7 +11,7 @@ import {
   WORKER_LAUNCHER,
   workerAccountFromConfig,
 } from "../workers/account.js";
-import { bundleWorkers } from "../workers/bundle.js";
+import { bundleWorkers, installedFingerprint, workerManifest } from "../workers/bundle.js";
 import { docJobCheck, extractJobCheck, renderJobCheck, selfCheckWorker } from "../workers/selfcheck.js";
 
 /**
@@ -88,12 +88,14 @@ if (cmd === "bundle") {
   let code = 0;
   try {
     const ocr = () => ocrCapability(storagePaths(config.dataDir).ocrLang);
+    const current = workerManifest().fingerprint;
     for (const kind of WORKER_KINDS) {
       const v = await selfCheckWorker({
         kind,
         account,
         dataDir: config.dataDir,
         serverUid: process.getuid?.() ?? -1,
+        bundle: { current: () => current, installed: () => installedFingerprint() },
         job:
           kind === "extract"
             ? extractJobCheck(config.dataDir, ocr)

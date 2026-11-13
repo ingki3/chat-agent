@@ -1,7 +1,9 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findBrowser } from "../artifacts/browser.js";
+import { WORKER_CONF } from "./account.js";
 import { DOC_PACKAGES, DOC_WORKER_DIR, docLibraries } from "../docgen/runner.js";
 import {
   EXTRACT_WORKER_DIR,
@@ -28,6 +30,7 @@ import {
 
 export type WorkerManifest = {
   version: 1;
+  fingerprint: string;
   docgen: {
     modules: Record<(typeof DOC_PACKAGES)[number], string>;
     fonts: { regular: string; bold: string };
@@ -90,6 +93,64 @@ const copy = (src: string, dest: string) =>
     mode: CLONE,
   });
 
+/**
+ * What a bundle of this server's checkout holds, without making one: the manifest (library paths relative to `app/`)
+ * and its `fingerprint` — a SHA-256 over that manifest (pinned library versions are in its paths) and every worker
+ * program file. The self-check compares it with the installed bundle's (`installedFingerprint`): a bundle made from
+ * other code (a `git pull`, a lock update) is refused, so the account never runs workers older than the server's.
+ */
+export function workerManifest(): WorkerManifest {
+  const doc = docLibraries();
+  const ext = extractLibraries();
+  const rel = (p: string) => inApp(p.endsWith(path.sep) ? p.slice(0, -1) : p);
+  const body = {
+    docgen: {
+      modules: Object.fromEntries(
+        Object.entries(doc.modules).map(([k, url]) => [k, rel(fileURLToPath(url))]),
+      ) as WorkerManifest["docgen"]["modules"],
+      fonts: { regular: rel(doc.fonts.regular), bold: rel(doc.fonts.bold) },
+    },
+    extract: {
+      modules: {
+        pdfjs: rel(fileURLToPath(ext.modules.pdfjs)),
+        tesseract: rel(fileURLToPath(ext.modules.tesseract)),
+      },
+      assets: { cmaps: rel(ext.assets.cmaps), standardFonts: rel(ext.assets.standardFonts) },
+      ocrLangDir: "ocr",
+    },
+  };
+  const hash = crypto.createHash("sha256").update(JSON.stringify(body));
+  for (const [dir, name] of [
+    [EXTRACT_WORKER_DIR, "extract"],
+    [DOC_WORKER_DIR, "docgen"],
+  ] as const)
+    for (const f of fs
+      .readdirSync(dir)
+      .filter((x) => x.endsWith(".mjs"))
+      .sort())
+      hash.update(`\0${name}/${f}\0`).update(fs.readFileSync(path.join(dir, f)));
+  return { version: 1, fingerprint: hash.digest("hex"), ...body };
+}
+
+/**
+ * The installed bundle's fingerprint: the root-owned config's `app=` line → `<app>/manifest.json`. Undefined when
+ * either cannot be read or is not the expected shape (the self-check then fails at its `bundle` step).
+ */
+export function installedFingerprint(conf = WORKER_CONF): string | undefined {
+  try {
+    const app = /^app=(\/[^\n]+)$/m.exec(fs.readFileSync(conf, "utf8"))?.[1];
+    if (!app) return undefined;
+    const m = JSON.parse(fs.readFileSync(path.join(app, "manifest.json"), "utf8")) as {
+      fingerprint?: unknown;
+    };
+    return typeof m.fingerprint === "string" && /^[0-9a-f]{64}$/.test(m.fingerprint)
+      ? m.fingerprint
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function bundleWorkers(out: string, o: { browser?: string | undefined } = {}): { nodes: number } {
   const root = path.resolve(out);
   if (fs.existsSync(root)) throw new Error(`${root} exists: give a new folder`);
@@ -113,7 +174,6 @@ export function bundleWorkers(out: string, o: { browser?: string | undefined } =
 
   // Their libraries: the pnpm folders of the packages and everything they depend on, links between them kept.
   const doc = docLibraries();
-  const ext = extractLibraries();
   const folders = new Set([...packageFolders(["pdfjs-dist", "tesseract.js"]), ...doc.folders]);
   const ids = new Set<string>();
   for (const f of folders) {
@@ -128,24 +188,7 @@ export function bundleWorkers(out: string, o: { browser?: string | undefined } =
   for (const lang of OCR_LANGS)
     fs.copyFileSync(langFile(lang), path.join(app, "ocr", `${lang}.traineddata.gz`), CLONE);
 
-  const rel = (p: string) => inApp(p.endsWith(path.sep) ? p.slice(0, -1) : p);
-  const manifest: WorkerManifest = {
-    version: 1,
-    docgen: {
-      modules: Object.fromEntries(
-        Object.entries(doc.modules).map(([k, url]) => [k, rel(fileURLToPath(url))]),
-      ) as WorkerManifest["docgen"]["modules"],
-      fonts: { regular: rel(doc.fonts.regular), bold: rel(doc.fonts.bold) },
-    },
-    extract: {
-      modules: {
-        pdfjs: rel(fileURLToPath(ext.modules.pdfjs)),
-        tesseract: rel(fileURLToPath(ext.modules.tesseract)),
-      },
-      assets: { cmaps: rel(ext.assets.cmaps), standardFonts: rel(ext.assets.standardFonts) },
-      ocrLangDir: "ocr",
-    },
-  };
+  const manifest = workerManifest();
   for (const p of [
     ...Object.values(manifest.docgen.modules),
     ...Object.values(manifest.docgen.fonts),
