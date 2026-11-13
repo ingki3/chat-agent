@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import Database from "better-sqlite3";
 import dns from "node:dns/promises";
 import fs from "node:fs";
 import net from "node:net";
@@ -7,6 +8,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ExitUnconfirmedError,
   RuntimeFailure,
   SessionGoneError,
   type RuntimeEvent,
@@ -18,8 +20,11 @@ import {
   CodexAdapter,
   codexBinary,
   codexEnv,
+  RpcError,
+  threadNotFound,
   type CodexAdapterOptions,
 } from "../src/runtime/codex.js";
+import { LinkedFolderError, startedHere } from "../src/runtime/forget.js";
 import crypto from "node:crypto";
 import { codexConnectionFor } from "../src/runtime/codex-config.js";
 import { UserStore } from "../src/auth/users.js";
@@ -300,6 +305,97 @@ describe("Codex adapter (#16): event translation", () => {
         code: "runtime_policy",
       });
       expect(bad.log.kills).toBe(1);
+    }
+  });
+
+  it("a start that fails after thread/start reports its thread first (#54): its state can be forgotten", async () => {
+    const { a, root } = adapter(
+      {},
+      { replay: { atStart: [threadStarted("01a1c86a-0000-7000-8000-00000000beef")] } },
+    );
+    const reported: string[] = [];
+    const marker = "PRIOR-CONTEXT-77d";
+    await expect(
+      a.start(
+        ctx({
+          history: [{ role: "user", parts: [{ type: "text", text: marker }] }],
+          sessionStarted: (id) => void reported.push(id),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "runtime_policy" });
+    expect(reported).toHaveLength(1);
+    const meta = path.join(root, "conn-meta", `${reported[0]}.json`);
+    expect(fs.existsSync(meta) ? fs.readFileSync(meta, "utf8") : "").toContain(marker);
+    await a.forget(reported[0]!, path.join(root, "conn"));
+    expect(fs.existsSync(meta)).toBe(false);
+  });
+
+  it("a failed start reports its process too; the thread is live only until that process has exited (#54 r3)", async () => {
+    const { a } = adapter(
+      {},
+      { replay: { atStart: [threadStarted("01a1c86a-0000-7000-8000-00000000beef")], exitDelayMs: 3000 } },
+    );
+    let id = "";
+    let exited: (() => Promise<void>) | undefined;
+    const t0 = Date.now();
+    await expect(
+      a.start(
+        ctx({
+          sessionStarted: (x, done) => {
+            id = x;
+            exited = done;
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "runtime_policy" });
+    expect(Date.now() - t0).toBeLessThan(2900); // the open stopped waiting…
+    expect(startedHere(id)).toBe(true); // …but the process is still there: live
+    await exited!();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(2900);
+    await new Promise((r) => setImmediate(r));
+    expect(startedHere(id)).toBe(false); // ended: an orphan for the reconciliation now
+  }, 10_000);
+
+  it("a reconciliation find is checked again at the last moment: an owned or live thread is never deleted (#54 r4)", async () => {
+    // Found while it was opening (its rollout before the answer), then the start finishes, its row is saved, it
+    // closes, it is resumed: the stale find must not delete it — with or without the resume.
+    for (const resumeIt of [true, false]) {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const { a, log, root } = adapter({ x: cx.answer("ok") }, { replay: { initializeGate: gate } });
+      const dir = path.join(root, "conn");
+      const rows = new Set<string>();
+      const opening = a.start(ctx());
+      await new Promise((r) => setTimeout(r, 20));
+      // The reconciliation's job, queued for whatever it saw: it runs on the folder's queue, after the opening.
+      let id = "";
+      const stillOrphan = () => !rows.has(id) && !startedHere(id);
+      release();
+      const s = await opening;
+      id = s.externalSessionId;
+      rows.add(id); // saveSession
+      await s.close();
+      const resumed = resumeIt ? await a.resume(id, ctx()) : undefined;
+      if (resumed) rows.delete(id); // even without its row: live while resumed
+      await a.forget(id, dir, { stillOrphan });
+      expect(
+        log.requests.filter((r) => r.method === "thread/delete"),
+        String(resumeIt),
+      ).toEqual([]);
+      const left = fs.readdirSync(path.join(dir, "codex-home"), { recursive: true }).map(String);
+      expect(
+        left.filter((n) => n.includes(id)),
+        String(resumeIt),
+      ).toHaveLength(1);
+      expect(fs.existsSync(path.join(root, "conn-meta", `${id}.json`))).toBe(true);
+      await resumed?.close();
+      // Control: neither owned nor live any more — then it is an orphan and goes.
+      rows.delete(id);
+      await new Promise((r) => setImmediate(r));
+      expect(startedHere(id)).toBe(false);
+      await a.forget(id, dir, { stillOrphan });
+      expect(log.requests.filter((r) => r.method === "thread/delete")).toHaveLength(1);
+      expect(fs.existsSync(path.join(root, "conn-meta", `${id}.json`))).toBe(false);
     }
   });
 
@@ -698,6 +794,161 @@ describe("Codex adapter (#16): settings it hands to the app-server", () => {
     fs.rmSync(path.join(root, "conn-meta"), { recursive: true });
     await expect(a.resume(s.externalSessionId, ctx())).rejects.toBeInstanceOf(SessionGoneError);
   });
+
+  it("forget (#54): thread/delete in an app-server with no network and no credential, then the files by name", async () => {
+    const { a, log, root } = adapter({ x: cx.answer("ok") });
+    const dir = path.join(root, "conn");
+    const keep = await a.start(ctx());
+    await keep.close();
+    const s = await a.start(ctx());
+    await collect(s.turn({ text: "x", model: "gpt-6.1-sol" }).events);
+    await s.close();
+    const home = path.join(dir, "codex-home");
+    // A store app-server deleted a row from, without zeroing it (its own SQLite has no secure_delete).
+    const store = path.join(home, "state_5.sqlite");
+    {
+      const db = new Database(store);
+      db.pragma("journal_mode = WAL");
+      db.exec("create table threads (id text, first_user_message text)");
+      db.prepare("insert into threads values (?, ?)").run(s.externalSessionId, "STATE-MARKER-41");
+      db.prepare("delete from threads where id = ?").run(s.externalSessionId);
+      db.close();
+    }
+    const disk = () =>
+      ["state_5.sqlite", "state_5.sqlite-wal"]
+        .filter((n) => fs.existsSync(path.join(home, n)))
+        .some((n) => fs.readFileSync(path.join(home, n)).includes("STATE-MARKER-41"));
+    expect(disk()).toBe(true);
+    // Leftovers by name: an archived copy of the rollout.
+    fs.mkdirSync(path.join(home, "archived_sessions"), { recursive: true });
+    fs.writeFileSync(path.join(home, "archived_sessions", `rollout-x-${s.externalSessionId}.jsonl`), "{}");
+    const spawnsBefore = log.spawns.length;
+    await a.forget(s.externalSessionId, dir);
+    const spawned = log.spawns.slice(spawnsBefore);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.network).toBe("none");
+    expect(JSON.stringify(spawned[0]!.env)).not.toContain("TESTKEY");
+    expect(spawned[0]!.write).toEqual([home, path.join(dir, "tmp")]);
+    expect(log.requests.slice(-2).map((r) => r.method)).toEqual(["initialize", "thread/delete"]);
+    expect(log.requests.at(-1)!.params).toEqual({ threadId: s.externalSessionId });
+    const left = fs.readdirSync(home, { recursive: true }).map(String);
+    expect(left.filter((n) => n.includes(s.externalSessionId))).toEqual([]);
+    expect(left.filter((n) => n.includes(keep.externalSessionId))).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, "conn-meta", `${s.externalSessionId}.json`))).toBe(false);
+    expect(fs.existsSync(path.join(root, "conn-meta", `${keep.externalSessionId}.json`))).toBe(true);
+    expect(disk()).toBe(false);
+    // Again (a retried job): app-server no longer knows it — done; a bad id or a missing folder: nothing at all.
+    await a.forget(s.externalSessionId, dir);
+    await a.forget("../../etc", dir);
+    await a.forget(s.externalSessionId, path.join(root, "nowhere"));
+    expect(log.spawns.length).toBe(spawnsBefore + 2);
+  });
+
+  it("forget (#54) never follows a linked CODEX_HOME", async () => {
+    const { a, log, root } = adapter({ x: cx.answer("ok") });
+    const outside = tmp();
+    fs.writeFileSync(path.join(outside, "rollout-x-0199aaaa-0000-7000-8000-00000000abcd.jsonl"), "keep");
+    fs.mkdirSync(path.join(root, "conn"), { recursive: true });
+    fs.symlinkSync(outside, path.join(root, "conn", "codex-home"));
+    await expect(
+      a.forget("0199aaaa-0000-7000-8000-00000000abcd", path.join(root, "conn")),
+    ).rejects.toBeInstanceOf(LinkedFolderError);
+    expect(log.spawns).toHaveLength(0);
+    expect(fs.readdirSync(outside)).toHaveLength(1);
+  });
+
+  it("forget (#54, review #124) stops at a linked home, work or tmp: an outside AGENTS.md is never removed", async () => {
+    for (const part of ["home", "work", "tmp"]) {
+      const { a, log, root } = adapter({ x: cx.answer("ok") });
+      const s = await a.start(ctx());
+      await s.close();
+      const dir = path.join(root, "conn");
+      const outside = tmp();
+      fs.writeFileSync(path.join(outside, "AGENTS.md"), "OUTSIDE");
+      fs.rmSync(path.join(dir, part), { recursive: true, force: true });
+      fs.symlinkSync(outside, path.join(dir, part));
+      const spawns = log.spawns.length;
+      await expect(a.forget(s.externalSessionId, dir), part).rejects.toBeInstanceOf(LinkedFolderError);
+      expect(log.spawns.length, part).toBe(spawns);
+      expect(fs.readFileSync(path.join(outside, "AGENTS.md"), "utf8"), part).toBe("OUTSIDE");
+    }
+  });
+
+  it("forget (#54, review #124): only 'no such thread' counts as gone — an internal error is retried, rows kept", async () => {
+    const deleteFails = { left: 1 };
+    const { a, log, root } = adapter({ x: cx.answer("ok") }, { replay: { deleteFails } });
+    const dir = path.join(root, "conn");
+    const s = await a.start(ctx());
+    await s.close();
+    const rollouts = () =>
+      fs
+        .readdirSync(path.join(dir, "codex-home"), { recursive: true })
+        .map(String)
+        .filter((n) => n.includes(s.externalSessionId));
+    await expect(a.forget(s.externalSessionId, dir)).rejects.toBeInstanceOf(RpcError);
+    // Nothing removed by name either: the files stay until app-server has deleted the thread.
+    expect(rollouts()).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, "conn-meta", `${s.externalSessionId}.json`))).toBe(true);
+    await a.forget(s.externalSessionId, dir);
+    expect(rollouts()).toEqual([]);
+    expect(log.requests.filter((r) => r.method === "thread/delete")).toHaveLength(2);
+    expect(threadNotFound(new RpcError("thread/delete", -32600, "no rollout found for thread id x"))).toBe(
+      true,
+    );
+    expect(threadNotFound(new RpcError("thread/delete", -32603, "no rollout found for thread id x"))).toBe(
+      false,
+    );
+    expect(threadNotFound(new RpcError("thread/delete", -32600, "invalid thread id"))).toBe(false);
+  });
+
+  it("storedSessions (#54): the threads this folder keeps — rollouts and our notes", async () => {
+    const { a, root } = adapter({ x: cx.answer("ok") });
+    const s = await a.start(ctx());
+    await s.close();
+    const dir = path.join(root, "conn");
+    fs.writeFileSync(path.join(root, "conn-meta", "0199aaaa-0000-7000-8000-0000000000ff.json"), "{}");
+    expect(a.storedSessions(dir).sort()).toEqual(
+      [s.externalSessionId, "0199aaaa-0000-7000-8000-0000000000ff"].sort(),
+    );
+    expect(a.storedSessions(path.join(root, "nowhere"))).toEqual([]);
+  });
+
+  it("start (#54 review) refuses a linked connection folder or part: an outside AGENTS.md is never removed", async () => {
+    for (const part of ["", "home", "work", "tmp", "codex-home"]) {
+      const { a, log, root } = adapter({ x: cx.answer("ok") });
+      const dir = path.join(root, "conn");
+      const outside = tmp();
+      fs.mkdirSync(path.join(outside, "home"), { recursive: true });
+      for (const f of ["AGENTS.md", path.join("home", "AGENTS.md")])
+        fs.writeFileSync(path.join(outside, f), "OUTSIDE");
+      if (part === "") fs.symlinkSync(outside, dir);
+      else {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.symlinkSync(outside, path.join(dir, part));
+      }
+      await expect(a.start(ctx()), part || "dir").rejects.toBeInstanceOf(LinkedFolderError);
+      expect(log.spawns, part).toHaveLength(0);
+      expect(fs.readFileSync(path.join(outside, "AGENTS.md"), "utf8")).toBe("OUTSIDE");
+      expect(fs.readFileSync(path.join(outside, "home", "AGENTS.md"), "utf8")).toBe("OUTSIDE");
+    }
+  });
+
+  it("close (#54 review) that gives up waiting says so; exited() settles when the process really has", async () => {
+    const { a } = adapter({ x: cx.answer("ok") }, { replay: { exitDelayMs: 3000 } });
+    const s = await a.start(ctx());
+    const t0 = Date.now();
+    await expect(s.close()).rejects.toBeInstanceOf(ExitUnconfirmedError);
+    expect(Date.now() - t0).toBeLessThan(2800);
+    let exited = false;
+    void s.exited!().then(() => (exited = true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(exited).toBe(false);
+    await s.exited!();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(2900);
+    // A process that exits in time: close resolves.
+    const quick = await adapter({ x: cx.answer("ok") }).a.start(ctx());
+    await expect(quick.close()).resolves.toBeUndefined();
+  }, 10_000);
 
   it("closing the session kills the process", async () => {
     const { a, log } = adapter({ x: cx.answer("ok") });
@@ -1302,6 +1553,48 @@ describe.skipIf(!realBin)("Codex adapter (#16): the pinned binary in the sandbox
       await r.close();
     }
   }, 60_000);
+
+  it("forget (#54): the thread leaves CODEX_HOME — rollout, state and history — and nothing it said stays on disk", async () => {
+    const r = await realRun(() => sse.text("삭제될 답 FORGET-REPLY-7c1"));
+    try {
+      const keep = await r.a.start(r.c);
+      await collect(keep.turn({ text: "남을 질문 KEEP-PROMPT-2b9", model: "gpt-6.1-sol" }).events);
+      await keep.close();
+      const s = await r.a.start(r.c);
+      await collect(s.turn({ text: "지울 질문 FORGET-PROMPT-5e4", model: "gpt-6.1-sol" }).events);
+      await s.close();
+      const dir = path.join(r.root, "conn");
+      const hits = (marker: string) => {
+        const out: string[] = [];
+        const walk = (d: string) => {
+          for (const n of fs.readdirSync(d)) {
+            const p = path.join(d, n);
+            const st = fs.lstatSync(p);
+            if (st.isDirectory()) walk(p);
+            else if (st.isFile() && fs.readFileSync(p).includes(marker)) out.push(path.relative(r.root, p));
+          }
+        };
+        walk(r.root);
+        return out;
+      };
+      expect(hits("FORGET-PROMPT-5e4").length).toBeGreaterThan(0);
+      await r.a.forget(s.externalSessionId, dir);
+      expect(hits("FORGET-PROMPT-5e4")).toEqual([]);
+      expect(hits("FORGET-REPLY-7c1").filter((h) => h.includes(s.externalSessionId))).toEqual([]);
+      expect(hits(s.externalSessionId)).toEqual([]);
+      // The other thread of the folder is untouched and still resumes.
+      expect(hits("KEEP-PROMPT-2b9").length).toBeGreaterThan(0);
+      const again = await r.a.resume(keep.externalSessionId, r.c);
+      await again.close();
+      await expect(r.a.resume(s.externalSessionId, r.c)).rejects.toThrow(SessionGoneError);
+      // Forgetting it again (a retried job) is done at once.
+      await r.a.forget(s.externalSessionId, dir);
+      // The deleting app-server ran with no network at all.
+      expect(r.spawns.filter((sp) => sp.network === "none")).toHaveLength(2);
+    } finally {
+      await r.close();
+    }
+  }, 90_000);
 
   it("a prompt with @file, $skill, /command or !shell reaches the model as plain text, nothing expanded", async () => {
     const r = await realRun(() => sse.text("ok"));

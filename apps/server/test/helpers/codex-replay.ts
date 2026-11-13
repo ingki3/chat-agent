@@ -109,6 +109,8 @@ export function replaySpawn(
     deviceLogin?: DeviceLoginScript;
     /** `account/login/start {type:"chatgptAuthTokens"}` is refused. */
     refuseTokens?: boolean;
+    /** `thread/delete` fails with an internal error (-32603) this many times first. */
+    deleteFails?: { left: number };
   } = {},
 ): (s: SpawnIsolatedOptions) => CodexChild {
   return (s) => {
@@ -334,6 +336,28 @@ export function replaySpawn(
               reply({ thread: { id }, model: m.params?.model });
               for (const n of o.afterOpen ?? []) send(ours(n));
             } else fail();
+            break;
+          }
+          case "thread/delete": {
+            // Like the real binary (0.165.0): the thread's rollout goes; an unknown thread is refused with -32600
+            // "no rollout found for thread id …".
+            const id = String(m.params?.threadId);
+            const file = path.join(
+              codexHome,
+              "sessions",
+              "2026",
+              "11",
+              "11",
+              `rollout-2026-11-11T00-00-00-${id}.jsonl`,
+            );
+            if (o.deleteFails && o.deleteFails.left > 0) {
+              o.deleteFails.left--;
+              send({ id: m.id, error: { code: -32603, message: "internal error" } });
+            } else if (fs.existsSync(file)) {
+              fs.rmSync(file);
+              reply({});
+            } else
+              send({ id: m.id, error: { code: -32600, message: `no rollout found for thread id ${id}` } });
             break;
           }
           case "turn/start": {

@@ -524,7 +524,8 @@ export class FakeRuntime implements RuntimeAdapter {
     };
   }
 
-  forget(externalSessionId: string): void {
+  /** Its sessions live in memory only: forgetting one (a test, or a deleted conversation, #54) drops it. */
+  async forget(externalSessionId: string): Promise<void> {
     this.sessions.delete(externalSessionId);
   }
 

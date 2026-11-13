@@ -464,6 +464,14 @@ export class FileExtracts {
   private readonly cache = new Map<string, { stamp: string; rows: SegmentRow[] }>();
   private static readonly CACHE_FILES = 8;
 
+  /** Their files were deleted (#54, a conversation's delete): their text leaves memory too. */
+  evict(fileIds: readonly string[]): void {
+    for (const id of fileIds) {
+      this.cache.delete(id);
+      this.scrubbedAt.delete(id);
+    }
+  }
+
   private scrubbedFile(fileId: string): SegmentRow[] {
     const row = this.db.$client
       .prepare("SELECT updated_at AS u, extractor AS e, status AS s FROM file_extracts WHERE file_id = ?")

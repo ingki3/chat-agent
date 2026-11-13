@@ -105,6 +105,13 @@ type Live = {
   graceTimer?: NodeJS.Timeout;
   /** Set once the session is being closed, so it is closed exactly once whoever ends the run. */
   closing?: Promise<void>;
+  /** The adapter's own close, however long it takes (`closing` stops waiting after a while). */
+  closed?: Promise<void>;
+  /**
+   * When the processes of the run's other sessions (a summary's, one opened after a delete) have really exited
+   * (`RuntimeSession.exited`, #54): the conversation is quiet only then.
+   */
+  exits: Promise<void>[];
   /**
    * The run's current attempt (#44): 0 before the first one. An attempt is one session open + the turn sent on it
    * for this reply. The run manager opens one per run today; a retry or a runtime/model fallback inside the same
@@ -189,7 +196,7 @@ function closeSession(live: Live, ms = 2000): Promise<void> {
   live.closing ??= new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, ms);
     timer.unref();
-    Promise.resolve()
+    live.closed = Promise.resolve()
       .then(() => session.close())
       .catch(() => {})
       .finally(() => {
@@ -281,8 +288,23 @@ const FAILURE_TEXT: Record<string, string> = {
   context_too_large: "메시지가 너무 길어서 이 모델에 보낼 수 없어요. 나눠서 보내 주세요.",
 };
 
+/** A runtime session as its runtime keeps it on disk (#54): in the folder of its connection and user. */
+export type SessionRef = {
+  conversationId: string;
+  runtime: string;
+  connectionId: string | null;
+  userId: string;
+  externalSessionId: string;
+};
+
 export type RunManagerOptions = {
   now?: () => number;
+  /**
+   * A session closed for good whose on-disk state no conversation row remembers (#54, conversations/purge.ts): a
+   * conversation summary's one-off session, or one that finished opening after its conversation was deleted (its row
+   * could not be saved, so the delete did not see it). Its state is to be forgotten.
+   */
+  forgetSession?: (ref: SessionRef) => void;
   /** How often partial replies are written to the message row while streaming. */
   flushMs?: number;
   /** After interrupt(), how long the runtime gets to stop before the run is ended without it. */
@@ -363,6 +385,8 @@ export class RunManager {
     string,
     Set<{ abort: AbortController; work: Promise<void> }>
   >();
+  /** The same lifetimes per conversation (#54): a deleted conversation's sessions are forgotten once these are over. */
+  private readonly workByConversation = new Map<string, Set<Promise<void>>>();
   /** MCP call tokens: one per run, revoked when the run ends (#42). */
   readonly mcpTokens: McpTokens;
   /** Set by shutdown(): no new run may start after that. */
@@ -634,6 +658,7 @@ export class RunManager {
         interruptRequested: false,
         settled: false,
         attempt: 0,
+        exits: [],
         purpose: input.purpose ?? "chat",
         ...(input.skills ? { skills: [...input.skills] } : {}),
         usage: new Map(),
@@ -642,6 +667,22 @@ export class RunManager {
         ...(decided.plan ? { summaryPlan: decided.plan } : {}),
       });
       const live = this.live.get(run.id)!;
+      {
+        const set = this.workByConversation.get(run.conversationId) ?? new Set();
+        this.workByConversation.set(run.conversationId, set);
+        // Over only once every process of the run has really exited (#54) — not when a close stopped waiting for it.
+        const work = live.done
+          .then(() => closeSession(live))
+          .then(() => live.closed)
+          .then(() => Promise.all([live.session?.exited?.(), ...live.exits]))
+          .then(() => {});
+        set.add(work);
+        void work.finally(() => {
+          set.delete(work);
+          if (!set.size && this.workByConversation.get(run.conversationId) === set)
+            this.workByConversation.delete(run.conversationId);
+        });
+      }
       if (run.connectionId) {
         const set = this.sessionsByConnection.get(run.connectionId) ?? new Set();
         this.sessionsByConnection.set(run.connectionId, set);
@@ -708,6 +749,26 @@ export class RunManager {
     await Promise.all(
       mine.map((e) => Promise.race([e.work, new Promise<void>((r) => setTimeout(r, ms).unref())])),
     );
+  }
+
+  /**
+   * Whether no run of the conversation has a session opening, running or closing any more (#54: a deleted
+   * conversation's runs were dropped — their processes are being stopped). Waits up to `ms` for that; false when it
+   * is still not so then (the caller tries again later — never goes on as if it were).
+   */
+  async quiet(conversationId: string, ms = 10_000): Promise<boolean> {
+    const work = [...(this.workByConversation.get(conversationId) ?? [])];
+    if (!work.length) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const done = await Promise.race([
+      Promise.all(work).then(() => true),
+      new Promise<boolean>((r) => {
+        timer = setTimeout(() => r(false), ms);
+        timer.unref();
+      }),
+    ]);
+    clearTimeout(timer);
+    return done;
   }
 
   /**
@@ -1247,7 +1308,7 @@ export class RunManager {
       tools: [],
     });
     if (live.settled || live.interruptRequested || this.stopping) throw new RunEndedError();
-    const session = await adapter.start(ctx);
+    const session = await this.startTracked(adapter, ctx, run, live);
     let text = "";
     try {
       if (live.settled || live.interruptRequested) throw new RunEndedError();
@@ -1264,7 +1325,16 @@ export class RunManager {
       }
     } finally {
       live.turn = undefined;
+      if (session.exited) live.exits.push(session.exited());
       await session.close().catch(() => {});
+      // A one-off session (never resumed, no row): its state is forgotten now, however the summary ended (#54).
+      this.opts.forgetSession?.({
+        conversationId: run.conversationId,
+        runtime: run.runtime,
+        connectionId: run.connectionId,
+        userId: run.userId,
+        externalSessionId: session.externalSessionId,
+      });
     }
     if (live.settled || live.interruptRequested) throw new RunEndedError();
     if (!text.trim()) throw new Error("empty_summary");
@@ -1419,7 +1489,7 @@ export class RunManager {
     }
     // The run may have ended while resume() was pending (interrupt, delete, shutdown): open nothing new then.
     if (live.settled || live.interruptRequested || this.stopping) throw new RunEndedError();
-    const session = await adapter.start(rescrub(ctx));
+    const session = await this.startTracked(adapter, rescrub(ctx), run, live);
     try {
       // The history may have changed (edit, delete) while the session was opening: then this fails.
       const row = this.conversations.saveSession({
@@ -1436,7 +1506,53 @@ export class RunManager {
       });
       return { session, sessionRowId: row.id, revision: conv.revision };
     } catch (e) {
+      if (session.exited) live.exits.push(session.exited());
       await session.close().catch(() => {});
+      // No row names this session (deleted while it opened, or the row could not be written): it is never resumed
+      // and nothing would find it again — its state is forgotten here, whatever the reason (#54).
+      this.opts.forgetSession?.({
+        conversationId: run.conversationId,
+        runtime: run.runtime,
+        connectionId: run.connectionId,
+        userId: run.userId,
+        externalSessionId: session.externalSessionId,
+      });
+      throw e;
+    }
+  }
+
+  /**
+   * `adapter.start` that never loses a session's state (#54): the adapter reports the id as soon as it exists; a start
+   * that fails after that left state behind (Claude's note with the context, a Codex thread) — handed over to be
+   * forgotten. (A crash in between is found by the start-up reconciliation.)
+   */
+  private async startTracked(
+    adapter: RuntimeAdapter,
+    ctx: StartContext,
+    run: RunRow,
+    live: Live,
+  ): Promise<RuntimeSession> {
+    let id: string | undefined;
+    let exited: (() => Promise<void>) | undefined;
+    try {
+      return await adapter.start({
+        ...ctx,
+        sessionStarted: (x, done) => {
+          id = x;
+          exited = done;
+        },
+      });
+    } catch (e) {
+      // Its process (if any) counts until it has really exited: the conversation is not quiet before (#54).
+      if (exited) live.exits.push(exited());
+      if (id !== undefined)
+        this.opts.forgetSession?.({
+          conversationId: run.conversationId,
+          runtime: run.runtime,
+          connectionId: run.connectionId,
+          userId: run.userId,
+          externalSessionId: id,
+        });
       throw e;
     }
   }

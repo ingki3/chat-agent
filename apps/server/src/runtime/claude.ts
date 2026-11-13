@@ -13,8 +13,10 @@ import {
 import { renderPriorContext } from "./context.js";
 import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
+  ExitUnconfirmedError,
   RuntimeFailure,
   SessionGoneError,
+  type ForgetOptions,
   type ModelCapability,
   type RuntimeAdapter,
   type RuntimeCapabilities,
@@ -25,6 +27,20 @@ import {
   type StartContext,
 } from "./adapter.js";
 import { assertOnlyOurMcp, claudeLockdown, mcpLoopbackPort, OUR_TOOL_PREFIX } from "./lockdown.js";
+import {
+  assertNoLinks,
+  connectionChain,
+  noteEnded,
+  noteStarted,
+  idsNamed,
+  metaIds,
+  namedAfter,
+  ownName,
+  plainDir,
+  removeMeta,
+  removeNamed,
+  SESSION_ID,
+} from "./forget.js";
 
 /**
  * Claude Code runtime (#15) through the Claude Agent SDK. One SDK query per run (the run manager opens a
@@ -226,6 +242,28 @@ export class ClaudeAdapter implements RuntimeAdapter {
     return this.open(ctx, { sessionId: externalSessionId, fresh: false });
   }
 
+  /**
+   * The session's files go (#54): Claude keeps a session as `<config>/projects/<cwd>/<id>.jsonl` (with `<id>/` for its
+   * tool results and sub-agents) and a few per-session files elsewhere in the config folder (todos, file history,
+   * session environment, debug log) — all named after the id. Plus our own note (`<dir>-meta/<id>.json`: the start
+   * prompt with the history it was given). Plain files only: nothing to start.
+   */
+  async forget(externalSessionId: string, dir: string, opts: ForgetOptions = {}): Promise<void> {
+    if (!SESSION_ID.test(externalSessionId)) return;
+    if (opts.stillOrphan && !opts.stillOrphan()) return;
+    // A link anywhere on the way stops it (retried by the caller): nothing is removed through a link.
+    assertNoLinks(connectionChain(dir, [connectionPaths(dir).config]));
+    if (plainDir(dir)) removeNamed(connectionPaths(dir).config, namedAfter(externalSessionId), 3);
+    removeMeta(dir, externalSessionId);
+  }
+
+  /** Sessions with state here: transcripts under `config/projects/` and our notes (written first, at the start). */
+  storedSessions(dir: string): string[] {
+    if (!plainDir(dir) || !plainDir(connectionPaths(dir).config)) return [];
+    const projects = path.join(connectionPaths(dir).config, "projects");
+    return [...new Set([...idsNamed(projects, ownName, 1), ...metaIds(dir)])];
+  }
+
   private connectionFor(ctx: StartContext): ClaudeConnection {
     const conn = this.opts.connection(ctx);
     if (!conn) throw new RuntimeFailure("no_connection");
@@ -247,6 +285,8 @@ export class ClaudeAdapter implements RuntimeAdapter {
     cancelled();
     const conn = this.connectionFor(ctx);
     this.checkModel(ctx.model, ctx.effort);
+    // Nothing is created or written through a link (#54 review): the connection folder down to every part we use.
+    assertNoLinks(connectionChain(conn.dir, Object.values(connectionPaths(conn.dir))));
     ensureDirs(conn.dir);
     const paths = connectionPaths(conn.dir);
     const env = claudeEnv(conn);
@@ -261,30 +301,57 @@ export class ClaudeAdapter implements RuntimeAdapter {
     const meta: SessionMeta = s.fresh
       ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx), costUsd: 0 }
       : readMeta(conn.dir, s.sessionId)!;
-    if (s.fresh) writeMeta(conn.dir, s.sessionId, meta);
+    // Live in this process from now until it is closed and its processes have exited — a resumed one too (#54
+    // review round 4: the reconciliation's last check never takes a session in use for an orphan).
+    noteStarted(s.sessionId);
+    if (s.fresh) {
+      // Known before anything of it is written (#54): a failure from here on leaves state the caller forgets.
+      ctx.sessionStarted?.(s.sessionId);
+      try {
+        writeMeta(conn.dir, s.sessionId, meta);
+      } catch (e) {
+        noteEnded(s.sessionId); // never live: the caller forgets what was written
+        throw e;
+      }
+    }
     const run = this.opts.query ?? sdkQuery;
     let current: Query | undefined;
     let closed = false;
     /** CLI processes of this session: closing (or a cancel) waits until they have exited. */
     const procs = new Set<SpawnedProcess>();
-    const killAll = async () => {
+    /** Every process of the session has exited (now or later) — `exited()`. */
+    const allExited = () =>
+      Promise.all(
+        [...procs].map(
+          (p) =>
+            new Promise<void>((resolve) => {
+              if (p.exitCode !== null || p.signalCode) return resolve();
+              p.once("exit", () => resolve());
+            }),
+        ),
+      ).then(() => {});
+    /** True when every process exited; false when one had not even 2 s after its SIGKILL (not confirmed, #54). */
+    const killAll = async (): Promise<boolean> => {
       current?.close();
       const waits = [...procs].map(
         (p) =>
-          new Promise<void>((resolve) => {
-            if (p.exitCode !== null || p.signalCode) return resolve();
+          new Promise<boolean>((resolve) => {
+            if (p.exitCode !== null || p.signalCode) return resolve(true);
+            let forced: NodeJS.Timeout | undefined;
             const timer = setTimeout(() => {
               p.kill("SIGKILL"); // did not end on the SDK's close: forced
-              resolve();
+              forced = setTimeout(() => resolve(false), 2000);
+              forced.unref();
             }, 2000);
             timer.unref();
             p.once("exit", () => {
               clearTimeout(timer);
-              resolve();
+              clearTimeout(forced);
+              resolve(true);
             });
           }),
       );
-      await Promise.all(waits);
+      return (await Promise.all(waits)).every(Boolean);
     };
     const onAbort = () => {
       closed = true;
@@ -323,8 +390,11 @@ export class ClaudeAdapter implements RuntimeAdapter {
       close: async () => {
         closed = true;
         ctx.signal?.removeEventListener("abort", onAbort);
-        await killAll();
+        // Live until its processes have really exited (#54: until then the reconciliation leaves it alone).
+        void allExited().then(() => noteEnded(s.sessionId));
+        if (!(await killAll())) throw new ExitUnconfirmedError();
       },
+      exited: allExited,
       turn: (input): RuntimeTurn => {
         if (closed || ctx.signal?.aborted) throw new Error("session closed");
         this.checkModel(input.model, input.effort);

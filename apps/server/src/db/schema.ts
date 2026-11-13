@@ -1200,3 +1200,36 @@ export const forkItems = sqliteTable(
     index("fork_items_source_idx").on(t.itemType, t.sourceId),
   ],
 );
+
+/**
+ * Deletion work left after a conversation's rows are gone (#54), each retried until it is verified done
+ * (conversations/purge.ts):
+ * - `runtime_session`: what a runtime keeps of one of its sessions on disk (Claude's session files, Codex's thread in
+ *   CODEX_HOME — `RuntimeAdapter.forget`), once no process of the conversation runs any more;
+ * - `conversation_files`: the conversation's upload folder `files/<user>/<conversation>/`, until it is gone.
+ * Written in the delete transaction itself (or before a one-off session's state could be orphaned), so a crash at any
+ * point leaves either the conversation (nothing deleted yet) or these rows — resumed at the next start. Ids only, no
+ * content, no foreign keys: the conversation, the connection or even the user may be gone when a row is worked off.
+ */
+export const deletionJobs = sqliteTable(
+  "deletion_jobs",
+  {
+    id: text("id").primaryKey(),
+    kind: text("kind", { enum: ["runtime_session", "conversation_files"] }).notNull(),
+    /** The deleted conversation ("" for a session the start-up reconciliation found without one). */
+    conversationId: text("conversation_id").notNull(),
+    /** The folder owner: the conversation's owner (`runtimes/<connection>/<user>/`, `files/<user>/…`). */
+    userId: text("user_id").notNull(),
+    runtime: text("runtime"),
+    connectionId: text("connection_id"),
+    externalSessionId: text("external_session_id"),
+    attempts: integer("attempts").notNull().default(0),
+    /** Not before this time (backoff after a failed attempt). */
+    nextAt: integer("next_at").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("deletion_jobs_session_idx").on(t.runtime, t.connectionId, t.userId, t.externalSessionId),
+    index("deletion_jobs_next_idx").on(t.nextAt),
+  ],
+);

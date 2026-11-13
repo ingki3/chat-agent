@@ -140,6 +140,22 @@ export function ensureBackupDir(dir: string): void {
  */
 export const FILE_REFERENCES: ((db: Database.Database) => string[])[] = [uploadedFileReferences];
 
+/**
+ * Upload folders of deleted conversations whose removal has not been verified yet (#54: a `conversation_files`
+ * deletion job still retrying, conversations/purge.ts) — never copied into a backup, whatever is left in them.
+ */
+export function deletedFolders(db: Database.Database): string[] {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'deletion_jobs'").get())
+    return [];
+  return (
+    db
+      .prepare(
+        "SELECT user_id AS u, conversation_id AS c FROM deletion_jobs WHERE kind = 'conversation_files'",
+      )
+      .all() as { u: string; c: string }[]
+  ).map((r) => `files/${r.u}/${r.c}`);
+}
+
 const isMissing = (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOENT";
 
 /**
@@ -152,11 +168,13 @@ async function copyFileRoots(
   out: string,
   referenced: ReadonlySet<string>,
   beforeCopy?: (rel: string) => Promise<void>,
+  excluded: ReadonlySet<string> = new Set(),
 ): Promise<{ files: string[]; skipped: number }> {
   const files: string[] = [];
   let skipped = 0;
   const needed = (rel: string) => [...referenced].some((r) => r === rel || r.startsWith(`${rel}/`));
   const walk = async (rel: string) => {
+    if (excluded.has(rel)) return;
     const src = path.join(dataDir, rel);
     let st: fs.Stats;
     try {
@@ -232,8 +250,9 @@ export async function createBackup(o: CreateBackupOptions): Promise<BackupInfo> 
       const referenced = new Set(
         o.referencedFiles ? o.referencedFiles(o.sqlite) : FILE_REFERENCES.flatMap((q) => q(o.sqlite)),
       );
+      const excluded = new Set(deletedFolders(o.sqlite));
       await o.afterDbSnapshot?.();
-      return copyFileRoots(o.dataDir, tmp, referenced, o.beforeCopy);
+      return copyFileRoots(o.dataDir, tmp, referenced, o.beforeCopy, excluded);
     });
     // A standalone file: rollback journal, so a later read-only open needs no -wal/-shm next to it.
     const snap = new Database(dbFile);

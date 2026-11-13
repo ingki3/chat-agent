@@ -165,6 +165,12 @@ export const LOG_EVENTS = [
   // be (fixed code) — never the summary or the messages.
   "context.summarized",
   "context.summary_failed",
+  // Deleting a conversation (#54): runtime sessions whose on-disk state is still to go (IDs and a count only), a
+  // session forgotten late or not yet (runtime, attempt, error class) — never a path or content.
+  "conversation.deleted",
+  "conversation.session_forgotten",
+  "conversation.sessions_reconciled",
+  "conversation.forget_failed",
   "schedule.proposed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];

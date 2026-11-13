@@ -64,6 +64,13 @@ export type StartContext = {
    */
   signal?: AbortSignal;
   /**
+   * Called with the session's id as soon as it exists — before the adapter writes anything of it to disk (#54). A
+   * `start()` that fails after this left state the caller must have forgotten (RunManager hands it to the deletion
+   * jobs); one that succeeds returns the same id. `exited`, when the session already has a process: settles once
+   * that process has really exited (a failed `start()` may stop waiting for it before).
+   */
+  sessionStarted?: ((externalSessionId: string, exited?: () => Promise<void>) => void) | undefined;
+  /**
    * Prior history, public parts only (reasoning never crosses into another session — PRD FR-3.5). When the
    * conversation is long (#45) this is only what comes after `summary`.
    */
@@ -176,8 +183,32 @@ export interface RuntimeSession {
   readonly externalSessionId: string;
   turn(input: TurnInput): RuntimeTurn;
   setModel(model: string): Promise<void>;
+  /**
+   * Stops the session. Waits a bounded time for its processes to exit; when they have not (yet), it rejects with
+   * `ExitUnconfirmedError` — the caller must not take the session as gone (#54). `exited()` tells when it really is.
+   */
   close(): Promise<void>;
+  /** Settles once no process of the session runs any more (after `close`). Absent: nothing runs outside this process. */
+  exited?(): Promise<void>;
 }
+
+/** `close()` gave up waiting: the session's process had not exited yet (it may still write to its files). */
+export class ExitUnconfirmedError extends Error {
+  constructor() {
+    super("exit_unconfirmed");
+    this.name = "ExitUnconfirmedError";
+  }
+}
+
+export type ForgetOptions = {
+  /**
+   * For the start-up reconciliation's finds (review #124 round 4): asked again right before anything is removed,
+   * inside the adapter's own ordering (Codex: after any opening or resume on that folder has finished) — false when
+   * the session is no orphan after all (a row owns it now); then nothing is done. It throws when it cannot tell yet
+   * (the session is live in this process): then `forget` rejects with that error, nothing removed, and is retried.
+   */
+  stillOrphan?: () => boolean;
+};
 
 export interface RuntimeAdapter {
   readonly id: RuntimeId;
@@ -185,6 +216,20 @@ export interface RuntimeAdapter {
   start(ctx: StartContext): Promise<RuntimeSession>;
   /** Re-opens a session by id. Throws `SessionGoneError` if the runtime no longer has it. */
   resume(externalSessionId: string, ctx: StartContext): Promise<RuntimeSession>;
+  /**
+   * Removes everything the runtime keeps of one of its sessions in the connection folder `dir` (#54: its conversation
+   * was deleted) — transcripts, state, our own per-session notes. Called only once no process of that session runs
+   * any more. Idempotent: a session (or folder) already gone is done. Throws when it could not finish: the caller
+   * tries again later (conversations/purge.ts). Never follows a link; touches nothing outside `dir` and `<dir>-meta`.
+   * Runtimes that keep nothing on disk (FakeRuntime) leave it out.
+   */
+  forget?(externalSessionId: string, dir: string, opts?: ForgetOptions): Promise<void>;
+  /**
+   * Ids of every session the runtime keeps state of in the connection folder `dir` (#54: the start-up reconciliation
+   * forgets those no conversation owns — a session whose row was never saved because the server died in between).
+   * Plain folders only.
+   */
+  storedSessions?(dir: string): string[];
 }
 
 export class SessionGoneError extends Error {

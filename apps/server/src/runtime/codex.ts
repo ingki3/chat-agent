@@ -2,11 +2,14 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import Database from "better-sqlite3";
 import { renderPriorContext } from "./context.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
+  ExitUnconfirmedError,
   RuntimeFailure,
   SessionGoneError,
+  type ForgetOptions,
   type ModelCapability,
   type RuntimeAdapter,
   type RuntimeCapabilities,
@@ -26,6 +29,19 @@ import {
 } from "./lockdown.js";
 import { notificationThread } from "./codex-protocol.js";
 import { tokenExpiry } from "../connections/chatgpt.js";
+import {
+  assertNoLinks,
+  connectionChain,
+  noteEnded,
+  noteStarted,
+  idsNamed,
+  metaIds,
+  plainDir,
+  removeMeta,
+  removeNamed,
+  rolloutName,
+  SESSION_ID,
+} from "./forget.js";
 
 /**
  * Codex runtime (#16) through `codex app-server` (stdio JSON-RPC, pinned @openai/codex 0.165.0). One app-server
@@ -188,9 +204,13 @@ const INSTRUCTION_FILES = {
 } as const;
 function scrub(dir: string) {
   const p = codexPaths(dir);
-  for (const [where, names] of Object.entries(INSTRUCTION_FILES))
-    for (const n of names)
-      fs.rmSync(path.join(p[where as keyof typeof INSTRUCTION_FILES], n), { recursive: true, force: true });
+  for (const [where, names] of Object.entries(INSTRUCTION_FILES)) {
+    const base = p[where as keyof typeof INSTRUCTION_FILES];
+    // A folder that is a link is never walked into (review #124: a linked `home` must not lose an outside file).
+    const st = fs.lstatSync(base, { throwIfNoEntry: false });
+    if (st && (st.isSymbolicLink() || !st.isDirectory())) continue;
+    for (const n of names) fs.rmSync(path.join(base, n), { recursive: true, force: true });
+  }
 }
 
 /** Writes a file in one step: a session starting at the same time never reads half of it. */
@@ -262,6 +282,31 @@ function hasRollout(codexHome: string, threadId: string): boolean {
   return walk(root, 0);
 }
 
+/** app-server's SQLite stores in CODEX_HOME (`state_5.sqlite`, `thread_history_1.sqlite`, … on 0.165.0). */
+const CODEX_DB = /^[a-z][a-z_]*_\d+\.sqlite$/;
+
+/**
+ * After a `thread/delete` (#54): the deleted rows are gone from app-server's databases, but their bytes are not —
+ * the WAL still holds the pages written before, and freed cells keep their old text (no `secure_delete` there;
+ * checked on 0.165.0). Each store is rewritten from its live rows (`VACUUM`) and its WAL checkpointed into the file
+ * and emptied. Plain files only, never a link. A store another app-server is writing right now makes this throw
+ * (busy): the caller tries again later.
+ */
+function compactState(codexHome: string): void {
+  for (const e of fs.readdirSync(codexHome, { withFileTypes: true })) {
+    if (!e.isFile() || !CODEX_DB.test(e.name)) continue;
+    const db = new Database(path.join(codexHome, e.name), { fileMustExist: true });
+    try {
+      db.pragma("busy_timeout = 2000");
+      db.exec("VACUUM");
+      const r = db.pragma("wal_checkpoint(TRUNCATE)") as { busy: number }[];
+      if (r[0]?.busy) throw new Error("codex_state_busy");
+    } finally {
+      db.close();
+    }
+  }
+}
+
 /** MCP tool result content → our output value (JSON when the tool returned JSON text). */
 function toolOutput(result: unknown): unknown {
   const content = (result as { content?: unknown } | null)?.content;
@@ -288,9 +333,31 @@ export type RpcMessage = {
 
 /** The JSON-RPC failure of one request (the app-server answered with an error). Never carries its text. */
 export class RpcError extends Error {
-  constructor(readonly method: string) {
+  /**
+   * The app-server's error code and text, kept only to tell answers apart (`threadNotFound`) — never logged or shown:
+   * the text may echo what was sent.
+   */
+  constructor(
+    readonly method: string,
+    readonly rpcCode?: number,
+    readonly rpcMessage?: string,
+  ) {
     super(`codex ${method} failed`);
   }
+}
+
+/**
+ * app-server's answer to `thread/delete` for a thread it has no record of (0.165.0: code -32600, "no rollout found
+ * for thread id …") — the one refusal that means "already gone". Any other error (an internal -32603, a malformed
+ * id, a timeout) leaves the thread's rows where they are, so the delete is tried again later.
+ */
+export function threadNotFound(e: unknown): boolean {
+  return (
+    e instanceof RpcError &&
+    e.rpcCode === -32600 &&
+    typeof e.rpcMessage === "string" &&
+    e.rpcMessage.startsWith("no rollout found for thread id")
+  );
 }
 
 /**
@@ -375,8 +442,16 @@ export class Rpc {
       this.pending.set(id, {
         resolve: (m) => {
           clearTimeout(timer);
-          if (m.error || !m.result) reject(new RpcError(method));
-          else resolve(m.result);
+          if (m.error || !m.result) {
+            const err = (m.error ?? {}) as { code?: unknown; message?: unknown };
+            reject(
+              new RpcError(
+                method,
+                typeof err.code === "number" ? err.code : undefined,
+                typeof err.message === "string" ? err.message.slice(0, 200) : undefined,
+              ),
+            );
+          } else resolve(m.result);
         },
         reject: (e) => {
           clearTimeout(timer);
@@ -521,7 +596,11 @@ export class CodexAdapter implements RuntimeAdapter {
    * after another; once open they run side by side.
    */
   private async open(ctx: StartContext, resumeId: string | undefined): Promise<RuntimeSession> {
-    const dir = this.connectionFor(ctx).dir;
+    return this.serial(this.connectionFor(ctx).dir, () => this.openNow(ctx, resumeId));
+  }
+
+  /** Starts of app-servers on one connection folder, one after another (see `open`; `forget` starts one too). */
+  private async serial<T>(dir: string, fn: () => Promise<T>): Promise<T> {
     const before = this.opening.get(dir) ?? Promise.resolve();
     let release!: () => void;
     const mine = new Promise<void>((r) => (release = r));
@@ -529,10 +608,96 @@ export class CodexAdapter implements RuntimeAdapter {
     this.opening.set(dir, chain);
     await before;
     try {
-      return await this.openNow(ctx, resumeId);
+      return await fn();
     } finally {
       release();
       if (this.opening.get(dir) === chain) this.opening.delete(dir);
+    }
+  }
+
+  /**
+   * The thread goes (#54): app-server's own `thread/delete` removes it from every store it keeps in CODEX_HOME — the
+   * rollout file, and the SQLite state (thread list with the first message and preview, item history) that plain
+   * file removal would leave behind (checked on 0.165.0). It runs in the sandbox with no network at all and no
+   * credential (deleting needs neither), on the folder's start queue. Then whatever is left by name — rollout files
+   * in `sessions/` and `archived_sessions/` — and our own note go too. A thread app-server does not know (already
+   * deleted) is done; an app-server that cannot start or answer throws (the caller retries).
+   */
+  async forget(externalSessionId: string, dir: string, opts: ForgetOptions = {}): Promise<void> {
+    if (!SESSION_ID.test(externalSessionId)) return;
+    const paths = codexPaths(dir);
+    // On the folder's queue: an opening that is under way has finished (and noted its thread) before this looks.
+    await this.serial(dir, async () => {
+      if (opts.stillOrphan && !opts.stillOrphan()) return;
+      // Every part the clean-up touches is a plain folder or absent — a link anywhere stops it (and it is retried:
+      // what the thread left is not reachable through a link we would follow).
+      assertNoLinks(connectionChain(dir, Object.values(paths)));
+      if (plainDir(dir) && plainDir(paths.codexHome)) {
+        await this.deleteThread(dir, externalSessionId);
+        compactState(paths.codexHome);
+        for (const where of ["sessions", "archived_sessions"])
+          removeNamed(path.join(paths.codexHome, where), (n) => n.endsWith(`-${externalSessionId}.jsonl`), 4);
+      }
+      removeMeta(dir, externalSessionId);
+    });
+  }
+
+  /** Threads with state here: rollouts (live and archived) and our notes. */
+  storedSessions(dir: string): string[] {
+    const home = codexPaths(dir).codexHome;
+    if (!plainDir(dir) || !plainDir(home)) return [];
+    return [
+      ...new Set([
+        ...idsNamed(path.join(home, "sessions"), rolloutName, 4),
+        ...idsNamed(path.join(home, "archived_sessions"), rolloutName, 4),
+        ...metaIds(dir),
+      ]),
+    ];
+  }
+
+  private async deleteThread(dir: string, threadId: string): Promise<void> {
+    scrub(dir);
+    const paths = codexPaths(dir);
+    for (const d of [paths.tmp, paths.work])
+      if (!fs.lstatSync(d, { throwIfNoEntry: false })) fs.mkdirSync(d, { mode: 0o700 });
+    const child = (this.opts.spawn ?? spawnIsolated)({
+      command: this.executable(),
+      args: ["app-server", "--strict-config", "--listen", "stdio://"],
+      cwd: paths.work,
+      env: codexEnv({ dir }),
+      read: [dir, CA_BUNDLE],
+      write: [paths.codexHome, paths.tmp],
+      network: "none",
+      maxRssBytes: this.opts.maxRssBytes ?? 2 * 1024 ** 3,
+      onStderr: () => {},
+    });
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    const rpc = new Rpc(
+      child,
+      // Nothing it says matters here; its requests are refused (Rpc).
+      { notification: () => {}, serverRequest: () => {}, exit: () => {} },
+      this.opts.requestTimeoutMs ?? 30_000,
+    );
+    try {
+      await rpc.request("initialize", {
+        clientInfo: { name: "agentlee", title: null, version: "0.1.0" },
+        capabilities: { experimentalApi: false, requestAttestation: false },
+      });
+      rpc.notify("initialized", {});
+      try {
+        await rpc.request("thread/delete", { threadId });
+      } catch (e) {
+        // Only "no such thread" (deleted before, or never persisted) is done; anything else is tried again.
+        if (!threadNotFound(e)) throw e;
+      }
+    } finally {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+      await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 2000).unref())]);
     }
   }
 
@@ -544,6 +709,8 @@ export class CodexAdapter implements RuntimeAdapter {
     cancelled(); // also covers the wait for an earlier opening of this folder
     const conn = this.connectionFor(ctx);
     this.checkModel(ctx.model, ctx.effort);
+    // Nothing is removed, created or written through a link (#54 review): the connection folder down to every part.
+    assertNoLinks(connectionChain(conn.dir, Object.values(codexPaths(conn.dir))));
     scrub(conn.dir);
     ensureDirs(conn.dir);
     const paths = codexPaths(conn.dir);
@@ -597,6 +764,11 @@ export class CodexAdapter implements RuntimeAdapter {
     };
     /** Resolves when the process has exited (or after `ms` — it was SIGKILLed, so it is going). */
     const exitedP = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    // A resumed thread is live from its process's start until that process has exited, like a new one (#54 r4).
+    if (resumeId !== undefined) {
+      noteStarted(resumeId);
+      void exitedP.then(() => noteEnded(resumeId));
+    }
     const gone = (ms = 2000) => Promise.race([exitedP, new Promise<void>((r) => setTimeout(r, ms).unref())]);
     // A cancel while the session opens kills the process: the pending request fails, the open throws below.
     const onAbort = () => kill();
@@ -760,6 +932,13 @@ export class CodexAdapter implements RuntimeAdapter {
         if (typeof started !== "string" || !/^[0-9a-f-]{36}$/.test(started))
           throw new RuntimeFailure("runtime_error");
         threadId = started;
+        // Known before our note is written (#54): a failure from here on leaves a thread the caller forgets.
+        // Live until its app-server has exited, whether the open goes on or fails (#54).
+        const newThread = threadId;
+        noteStarted(newThread);
+        void exitedP.then(() => noteEnded(newThread));
+        // Its process is reported too: a failed open stops waiting for it after a while, the caller does not.
+        ctx.sessionStarted?.(newThread, () => exitedP);
         cancelled();
         writeMeta(conn.dir, threadId, meta);
       } else {
@@ -807,7 +986,9 @@ export class CodexAdapter implements RuntimeAdapter {
         ctx.signal?.removeEventListener("abort", onAbort);
         kill();
         await gone();
+        if (!rpc.exited) throw new ExitUnconfirmedError(); // gave up waiting: not gone yet (`exited()` tells when)
       },
+      exited: () => exitedP,
       turn: (input): RuntimeTurn => {
         if (policyBreach) throw new RuntimeFailure("runtime_policy"); // seen between turns: closed already
         if (sessionFailure) throw new RuntimeFailure(sessionFailure);
