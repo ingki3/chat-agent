@@ -275,8 +275,16 @@ function QuietHours() {
       </div>
       <p className="muted small">이 시간에는 알림함에만 쌓이고, 끝나면 모아서 한 번 보내요.</p>
       {invalid && <p className="error small">시작과 끝을 다르게 정해 주세요.</p>}
-      {prefs.isError && <p className="error small">{errorText(prefs.error)}</p>}
-      {save.isError && <p className="error small">{errorText(save.error)}</p>}
+      {prefs.isError && (
+        <p className="error small" role="alert">
+          {errorText(prefs.error)}
+        </p>
+      )}
+      {save.isError && (
+        <p className="error small" role="alert">
+          {errorText(save.error)}
+        </p>
+      )}
       {saved && (
         <p className="small" role="status">
           저장했어요.
