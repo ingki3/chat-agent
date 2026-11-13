@@ -22,6 +22,7 @@ import { contentMatches } from "../files/detect.js";
 import { cleanName, FileLimitError, type FileRow, type FileStore } from "../files/store.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 import type { DocJob, DocRunner } from "./runner.js";
+import { DocSlots } from "./slots.js";
 
 /**
  * `doc_create` (#49, PRD FR-4.4·4.7·5.6): checks the request, gathers its pictures, has the document made by the
@@ -55,6 +56,8 @@ export type DocGenOptions = {
   /** The conversation file store (#22); undefined while the app is starting (refused as unavailable). */
   files: () => FileStore | undefined;
   runner: DocRunner;
+  /** The server's document worker slots (shared with the reference export, #26); default: this service's own. */
+  slots?: DocSlots;
 };
 
 export type DocCreated = {
@@ -69,7 +72,10 @@ export type DocCreated = {
 };
 
 export class DocGenService {
-  constructor(private readonly opts: DocGenOptions) {}
+  private readonly slots: DocSlots;
+  constructor(private readonly opts: DocGenOptions) {
+    this.slots = opts.slots ?? new DocSlots(opts.runner);
+  }
 
   /** The reply message of the scope's run, if the user owns the conversation and the run is that conversation's. */
   private replyOf(scope: ToolScope): string | undefined {
@@ -177,7 +183,9 @@ export class DocGenService {
       images[b.fileId] = { kind: f.kind as "png" | "jpg", data: this.read(store, f).toString("base64") };
     }
 
-    const made = await this.opts.runner({ kind, doc, images });
+    // One of the server's worker slots (2 at once, 1 per user — `DOC_SLOTS`), else busy.
+    const made = await this.slots.run(scope.userId, { kind, doc, images });
+    if (!made) throw new DocError("doc_busy");
     if (!made.ok) {
       const code = isDocCode(made.code) ? made.code : "doc_failed";
       throw new DocError(code, code === "doc_unsupported_text" ? DOC_UNSUPPORTED_TEXT_HINT : undefined);

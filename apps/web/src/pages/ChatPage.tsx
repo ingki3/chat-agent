@@ -40,6 +40,7 @@ import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
+import { ReferencesButton } from "../citations/ReferencesExport.js";
 import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
 import { markStartedHere, useAutoOpen } from "../artifacts/ArtifactPanel.js";
 
@@ -325,6 +326,7 @@ export function ChatPage() {
     <>
       <TopBar title={conv.data?.title ?? "…"}>
         {conv.data && <ResearchToggle c={conv.data} />}
+        {conv.data && <ReferencesButton conversationId={conv.data.id} />}
         {conv.data && <ConvMenu c={conv.data} />}
       </TopBar>
       <div className="thread" data-testid="thread" ref={scroller}>
