@@ -491,12 +491,22 @@ import ctypes, os, sys, errno
 uid = os.geteuid()
 sibling = int(sys.argv[1])
 libc = ctypes.CDLL(None, use_errno=True)
+def argmax():
+    # kern.argmax: the KERN_PROCARGS2 buffer must be exactly this big (a larger one is refused with EINVAL).
+    mib = (ctypes.c_int * 2)(1, 8)
+    v = ctypes.c_int(0)
+    size = ctypes.c_size_t(4)
+    ok = libc.sysctl(mib, 2, ctypes.byref(v), ctypes.byref(size), None, 0) == 0
+    return v.value if ok and 0 < v.value <= 16777216 else 1048576
+ARGMAX = argmax()
 def procargs(pid):
+    # A REAL read into a bounded buffer: a size-only query (oldp=NULL) can succeed before the kernel's uid check.
     mib = (ctypes.c_int * 3)(1, 49, pid)
-    size = ctypes.c_size_t(0)
+    buf = ctypes.create_string_buffer(ARGMAX)
+    size = ctypes.c_size_t(ARGMAX)
     ctypes.set_errno(0)
-    r = libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0)
-    return r, ctypes.get_errno(), size.value
+    r = libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0)
+    return r, ctypes.get_errno(), (buf.raw[: min(size.value, ARGMAX)] if r == 0 else b"")
 def kuid(pid):
     # KERN_PROC_PID: any uid may read it. struct kinfo_proc is 648 bytes; cr_uid at 420 (arm64 macOS).
     mib = (ctypes.c_int * 4)(1, 14, 1, pid)
@@ -505,15 +515,16 @@ def kuid(pid):
     if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value != 648:
         return None
     return int.from_bytes(buf.raw[420:424], "little")
-cr, ce, cs = procargs(os.getpid())
-if cr != 0 or cs == 0:
+cr, ce, cd = procargs(os.getpid())
+if cr != 0 or b"\0AGENTLEE_PROBE_SELF=1\0" not in cd:
     print("uid=%d procargs=error control" % uid); sys.exit(0)
 su = kuid(sibling)
 if su is None:
     print("uid=%d procargs=error sibling" % uid); sys.exit(0)
-tr, te, ts = procargs(sibling)
-if tr == 0 and ts:
-    print("uid=%d procargs=readable" % uid)
+tr, te, td = procargs(sibling)
+if tr == 0:
+    # "readable" only when the read shows the server sibling's marker variable (#130 round 1).
+    print("uid=%d procargs=%s" % (uid, "readable" if b"\0AGENTLEE_SELFCHECK=" in td else "error marker"))
 elif te in (errno.EPERM, errno.EINVAL) and su != uid and kuid(sibling) == su:
     # A different uid gets EINVAL (size query) or EPERM — and so does a pid that is gone, so "blocked" also needs
     # the kernel to still show the sibling with the same (other) uid (#122 finding).
@@ -526,7 +537,8 @@ PY
   watched($ctl, PROBE_TIMEOUT_SEC, sub {
     chdir($workdir) or POSIX::_exit(127);
     open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
-    %ENV = (PATH => "/usr/bin:/bin", LANG => "en_US.UTF-8", LC_ALL => "en_US.UTF-8");
+    # AGENTLEE_PROBE_SELF: the positive control's own marker (the probe must read it in its own procargs).
+    %ENV = (PATH => "/usr/bin:/bin", LANG => "en_US.UTF-8", LC_ALL => "en_US.UTF-8", AGENTLEE_PROBE_SELF => "1");
     exec("/usr/bin/sandbox-exec", "-p", $profile, $cfg->{py}, "-I", "-S", "-B", "-c", $code, $sibling)
       or POSIX::_exit(127);
   });
