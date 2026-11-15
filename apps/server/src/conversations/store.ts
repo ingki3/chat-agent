@@ -12,7 +12,7 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, messages, runtimeSessions } from "../db/schema.js";
-import { scrubKnown, scrubParts } from "../secrets/known.js";
+import { PartsScrubCache, scrubKnown, scrubParts } from "../secrets/known.js";
 import { SUMMARY_SWITCH_NOTE } from "../runtime/context.js";
 
 export type ConversationRow = typeof conversations.$inferSelect;
@@ -134,6 +134,11 @@ export class ConversationStore {
   private readonly deleteHooks: DeleteHook[] = [];
   private readonly deletedHooks: DeletedHook[] = [];
   private readonly deactivateHooks: DeactivateHook[] = [];
+  /**
+   * Scrub results per parts array a caller saves again and again (the run manager's reply, at every tool event —
+   * #155): its next save scans only what changed. Gone with the array.
+   */
+  private readonly partsScrub = new WeakMap<object, PartsScrubCache>();
 
   constructor(
     private readonly db: Db,
@@ -504,7 +509,12 @@ export class ConversationStore {
       connectionId?: string | null;
     },
   ): void {
-    const parts = patch.parts ? scrubParts(MessagePart.array().parse(patch.parts)) : undefined;
+    let parts: MessagePart[] | undefined;
+    if (patch.parts) {
+      let cache = this.partsScrub.get(patch.parts);
+      if (!cache) this.partsScrub.set(patch.parts, (cache = new PartsScrubCache()));
+      parts = scrubParts(MessagePart.array().parse(patch.parts), { cache });
+    }
     this.db
       .update(messages)
       .set({
