@@ -24,6 +24,11 @@ export type VersionRow = typeof memoryVersions.$inferSelect;
 export type ItemRow = typeof memoryItems.$inferSelect;
 export type ItemSource = { messageId: string; revision: number; conversationId: string };
 export type Item = ItemRow & { sources: ItemSource[] };
+/** One decision on a list document (spec §4 형식), as the store applies it. */
+export type ItemOp =
+  | { action: "add"; text: string; sources: ItemSource[] }
+  | { action: "replace"; itemId: string; text: string; sources: ItemSource[] }
+  | { action: "delete"; itemId: string };
 
 /** The family-wide AGENT and the admin's default SOUL. */
 export const SYSTEM_AGENT_ID = "system:agent";
@@ -257,6 +262,71 @@ export class MemoryStore {
         return this.write(d, renderItems(this.itemsByIds(ids).map((i) => i.text)), ids, {
           author,
           actorId: null,
+        });
+      })
+      .immediate();
+  }
+
+  /**
+   * The current item ids of a list document after these decisions (spec §4 형식), without writing anything: an add
+   * appends, a replace takes the place of its item, a delete drops it. Undefined when a replace / delete names an item
+   * that is not in the document any more.
+   */
+  planOps(doc: DocRow, ops: readonly ItemOp[]): { ids: (string | { text: string })[] } | undefined {
+    const ids: (string | { text: string })[] = [...(this.current(doc)?.itemIds ?? [])];
+    for (const op of ops) {
+      if (op.action === "add") {
+        ids.push({ text: op.text });
+        continue;
+      }
+      const at = ids.indexOf(op.itemId);
+      if (at < 0) return undefined;
+      if (op.action === "delete") ids.splice(at, 1);
+      else ids[at] = { text: op.text };
+    }
+    return { ids };
+  }
+
+  /**
+   * Applies decisions of the conversation tool or Dreaming (#145, #146) to a list document as one new version, in the
+   * caller's transaction (or its own). `base`: refused (`DocConflict`) when the current version is another one. A new
+   * line is a new item of `itemAuthor` with the decision's sources — a replacement also keeps the replaced item's
+   * (it was written from it: deleting either source removes it, spec §10.1).
+   */
+  applyOps(input: {
+    doc: DocRow;
+    ops: readonly ItemOp[];
+    base: number;
+    author: VersionAuthor;
+    itemAuthor: ItemAuthor;
+    actorId: string | null;
+  }): VersionRow {
+    return this.db.$client
+      .transaction(() => {
+        const doc = this.byId(input.doc.id)!;
+        if (!isListKind(doc.kind)) throw new Error("not a list document");
+        if (input.base !== doc.version) throw new DocConflict();
+        const ids = [...(this.current(doc)?.itemIds ?? [])];
+        for (const op of input.ops) {
+          if (op.action === "add") {
+            ids.push(this.addItem(doc, scrubKnown(op.text), input.itemAuthor, op.sources));
+            continue;
+          }
+          const at = ids.indexOf(op.itemId);
+          if (at < 0) throw new DocConflict();
+          if (op.action === "delete") {
+            ids.splice(at, 1);
+            continue;
+          }
+          const old = this.itemsByIds([op.itemId])[0];
+          ids[at] = this.addItem(doc, scrubKnown(op.text), input.itemAuthor, [
+            ...op.sources,
+            ...(old?.sources ?? []),
+          ]);
+        }
+        return this.write(doc, renderItems(this.itemsByIds(ids).map((i) => i.text)), ids, {
+          author: input.author,
+          actorId: input.actorId,
         });
       })
       .immediate();

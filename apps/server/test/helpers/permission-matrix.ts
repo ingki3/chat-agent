@@ -447,6 +447,53 @@ APP_MATRIX.push(
   },
 );
 
+/** A `memory_propose` bundle (#145) in a conversation of `owner`, citing owner's own message: the service directly. */
+function memoryProposal(f: Family) {
+  const c = f.app.conversations!.create(f.users.owner.id);
+  const m = f.app.conversations!.append(c.id, {
+    role: "user",
+    parts: [{ type: "text", text: "기억해줘: 아침엔 커피" }],
+  });
+  const r = f.app.memoryProposals!.propose(
+    { userId: f.users.owner.id, conversationId: c.id, runId: "run-1" },
+    {
+      changes: [{ action: "add", doc: "memory", text: `아침엔 커피 ${c.id.slice(0, 8)}` }],
+      sourceMessageIds: [m.id],
+    },
+    { external: false },
+  );
+  if (!r.ok || !r.proposalId) throw new Error(`no proposal ${JSON.stringify(r)}`);
+  return r.proposalId;
+}
+
+/**
+ * The conversation tool's cards (#145, FR-16.8): the owner's memory — owner only, the admin refused like anyone else
+ * (FR-1.5). The owner's 반영 / 거절 / 되돌리기 go through (undo: nothing applied yet → 409).
+ */
+APP_MATRIX.push(
+  { route: "GET /api/memory-proposals/:id", expect: OWNER_ONLY, fixture: memoryProposal },
+  {
+    route: "POST /api/memory-proposals/:id/accept",
+    expect: OWNER_ONLY,
+    fixture: memoryProposal,
+    body: { indexes: [0] },
+    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+  {
+    route: "POST /api/memory-proposals/:id/reject",
+    expect: OWNER_ONLY,
+    fixture: memoryProposal,
+    body: { indexes: [0] },
+    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+  {
+    route: "POST /api/memory-proposals/:id/undo",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: memoryProposal,
+    errors: { owner: "undo_unavailable", admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
+  },
+);
+
 /** A 관심 종목 item of `owner` (#31): the store directly. */
 function watchItem(f: Family) {
   return f.app.watchlist!.add(f.users.owner.id, {

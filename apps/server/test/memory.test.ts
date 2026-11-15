@@ -32,6 +32,7 @@ import {
 } from "../src/memory/inject.js";
 import { holdsSecret, triesRuleChange } from "../src/memory/rules.js";
 import { MemoryDocs } from "../src/memory/service.js";
+import { MemoryProposals } from "../src/memory/proposals.js";
 import { reconcile, type Item } from "../src/memory/store.js";
 import {
   ModelCatalogError,
@@ -888,7 +889,7 @@ describe("deletion linkage with a real runtime's on-disk state: forgotten, also 
 });
 
 describe("backups and the model condition", () => {
-  it("a backup holds the documents, versions, items and their sources", async () => {
+  it("a backup holds the documents, versions, items and their sources (and #145's setting and cards)", async () => {
     const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-memory-backup-"));
     closers.push(() => fs.rmSync(root, { recursive: true, force: true }));
     const dataDir = path.join(root, "data");
@@ -913,6 +914,20 @@ describe("backups and the model condition", () => {
       ],
       "tool",
     );
+    // The conversation tool's setting and a pending card (#145) are in the backup too.
+    db.$client.prepare("INSERT INTO conversations (id, owner_id, title) VALUES ('c1', 'u1', 't')").run();
+    const m1 = db.$client.prepare(
+      "INSERT INTO messages (id, conversation_id, seq, role, parts, revision) VALUES ('m2', 'c1', 1, 'user', '[]', 0)",
+    );
+    m1.run();
+    const proposals = new MemoryProposals(db, memory.store);
+    proposals.setMode("u1", "auto");
+    const p = proposals.propose(
+      { userId: "u1", conversationId: "c1", runId: "r1" },
+      { changes: [{ action: "add", doc: "memory", text: "PROPOSED_BACKUP" }], sourceMessageIds: ["m2"] },
+      { external: true },
+    );
+    expect(p).toMatchObject({ ok: true, pending: 1 });
     const made = await createBackup({
       sqlite: db.$client,
       dataDir,
@@ -929,6 +944,11 @@ describe("backups and the model condition", () => {
       expect(n("memory_items")).toBe(2);
       expect(n("memory_item_sources")).toBe(1);
       expect(JSON.stringify(b.prepare("SELECT content FROM memory_versions").all())).toContain("BACKED_UP");
+      expect(n("memory_prefs")).toBe(1);
+      expect(n("memory_proposals")).toBe(1);
+      expect(JSON.stringify(b.prepare("SELECT text FROM memory_proposal_decisions").all())).toContain(
+        "PROPOSED_BACKUP",
+      );
     } finally {
       b.close();
     }

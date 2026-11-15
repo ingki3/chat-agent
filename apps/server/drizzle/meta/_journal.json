@@ -211,6 +211,13 @@
       "when": 1794750365803,
       "tag": "0029_my_instructions",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1794755498886,
+      "tag": "0030_memory_proposals",
+      "breakpoints": true
     }
   ]
 }

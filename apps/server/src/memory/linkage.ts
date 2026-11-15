@@ -2,6 +2,7 @@ import type { Db } from "../db/client.js";
 import type { ConversationPurge } from "../conversations/purge.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { logEvent, type EventLogger } from "../logging.js";
+import type { MemoryProposals } from "./proposals.js";
 import type { MemoryStore } from "./store.js";
 
 /**
@@ -13,16 +14,19 @@ import type { MemoryStore } from "./store.js";
  *    becomes a deletion job (`ConversationPurge.claimSessions`): forgotten with `RuntimeAdapter.forget` once its
  *    conversation's running turn has ended, and resumed at start when the server stopped in between.
  * Answers and summaries already written elsewhere stay — they are that conversation's own record (§10.6).
- * Proposals and the re-processing queue (§10.3) come with #145/#146.
+ * 3. every pending decision of a conversation-tool bundle (#145) citing one of them is dropped (§10.3) — it can never
+ *    be applied (a deleted conversation's bundles go with it). Dreaming's queue (§10.3) comes with #146.
  */
 export function linkMemoryDeletion(deps: {
   db: Db;
   conversations: ConversationStore;
   store: MemoryStore;
   purge: Pick<ConversationPurge, "claimSessions">;
+  proposals?: Pick<MemoryProposals, "dropBySources"> | undefined;
   log?: EventLogger | undefined;
 }): void {
   const run = (by: { conversationId: string } | { messageIds: readonly string[] }) => {
+    deps.proposals?.dropBySources(by);
     const r = deps.store.purgeSources(by);
     if (!r.items) return;
     const sessions = sessionsStartedWith(deps.db, r.affected);

@@ -4,6 +4,7 @@ import { MEMORY_DOC_FILE, type MemoryDocKind } from "@agentlee/shared";
 import { errorText, instructions, INSTRUCTIONS_KEY } from "../api.js";
 import { TopBar } from "../Shell.js";
 import { DocEditor } from "../instructions/DocEditor.js";
+import { MemoryModeSetting } from "../instructions/MemoryModeSetting.js";
 
 const KINDS: MemoryDocKind[] = ["agent", "soul", "user", "memory"];
 const HINT: Record<MemoryDocKind, string> = {
@@ -32,6 +33,7 @@ export function InstructionsPage() {
           <Link to="/settings">← 설정</Link> · 여기 적은 내용은 새 대화마다 Claude Code와 Codex에 똑같이
           들어가요. 관리자도 내 SOUL·USER·MEMORY는 볼 수 없어요.
         </p>
+        <MemoryModeSetting />
         <div className="tabs" role="tablist" aria-label="내 지침 문서">
           {KINDS.map((k) => (
             <button

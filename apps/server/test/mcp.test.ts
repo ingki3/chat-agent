@@ -573,6 +573,9 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "artifact_read",
       // Schedule proposals (#55): the confirmation card's tool.
       "schedule_create",
+      // 대화 중 기억해줘 (#145): the user's own memory, in their own conversations.
+      "memory_list",
+      "memory_propose",
       "doc_create",
       // File tools (#48): everyone's, on their own conversation's uploads.
       "file_list",

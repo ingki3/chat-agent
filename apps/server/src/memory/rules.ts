@@ -69,3 +69,36 @@ export function triesRuleChange(text: string): boolean {
 export function holdsSecret(text: string): boolean {
   return scrubKnown(text) !== text || looksSecret(text);
 }
+
+/**
+ * Sensitive categories (spec §4 민감 범주): health and illness, self-harm and suicide, sex, religious or political
+ * leaning, identification numbers (resident, account, card), an exact address, the private life of someone outside the
+ * family. The conversation tool never applies such a decision on its own — it always goes through the card, whatever
+ * the setting (Dreaming refuses it, #146). A keyword check (best effort; the model's own verdict is added on top):
+ * erring towards the card costs one click.
+ */
+const SENSITIVE: RegExp[] = [
+  // Health, illness, medication, mental health.
+  /(건강|질병|질환|병원|진료|진단|수술|입원|통원|처방|복용|약을\s*먹|투약|증상|통증|당뇨|고혈압|혈압|암\s|암$|암에|암이|종양|우울|공황|불안\s*장애|조울|adhd|자폐|치매|정신과|상담\s*치료|심리\s*치료|장애\s*(등급|인)|임신|난임|유산|알레르기|알러지|천식|아토피|비만|체중|몸무게|키가\s*\d|health|illness|disease|diagnos|medication|therapy|pregnan|allerg)/,
+  // Self-harm, suicide.
+  /(자해|자살|극단적\s*선택|죽고\s*싶|살기\s*싫|self[-\s]?harm|suicid)/,
+  // Sex.
+  /(성\s*관계|성생활|성적\s*(취향|지향|행위|관계)|성\s*정체성|성\s*지향|동성애|이성애|양성애|트랜스젠더|섹스|sexual|sex\b|lgbt|gay|lesbian)/,
+  // Religion, politics.
+  /(종교|신앙|교회|성당|절에\s*다|불교|기독교|천주교|개신교|이슬람|무슬림|힌두|무교|신자|정치\s*성향|지지\s*정당|지지하는\s*(정당|후보)|진보|보수\s*성향|좌파|우파|투표|민주당|국민의힘|정의당|religio|church|politic|vote[sd]?\b|democrat|republican)/,
+  // Identification numbers, by name or by shape.
+  /(주민\s*(등록)?\s*번호|외국인\s*등록\s*번호|여권\s*번호|운전\s*면허\s*번호|계좌\s*번호?|통장\s*번호|카드\s*번호|신용\s*카드|사업자\s*번호|ssn|passport\s*(no|number)|account\s*number|card\s*number)/,
+  /\b\d{6}\s*-\s*[1-8]\d{6}\b/,
+  /\b\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{3,4}\b/,
+  /\b\d{2,6}-\d{2,6}-\d{2,8}\b/,
+  // An exact address: a street or lot number, an apartment unit.
+  /(\S+(로|길)\s*\d+(-\d+)?(번길)?)|(\d+\s*동\s*\d+\s*호)|(\S+동\s*\d+-\d+)|(아파트\s*\d+)|(우편\s*번호)|(\d{5}\s*(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주))/,
+  // Someone outside the family, and their private matters.
+  /(친구|동료|직장\s*동료|상사|부하|팀장|선생님|선배|후배|이웃|지인|남자\s*친구|여자\s*친구|남친|여친|애인|전\s*남친|전\s*여친|같은\s*반)[^.\n]{0,30}(병|아프|이혼|빚|대출|연봉|월급|비밀|사생활|임신|연애|사귀|바람|수술|입원|우울|성적|주소|전화\s*번호|번호|사는\s*곳|집\s*주소)/,
+];
+
+/** True when the text touches a sensitive category (spec §4) — the decision always goes through the card. */
+export function isSensitive(text: string): boolean {
+  const t = foldForCheck(text);
+  return SENSITIVE.some((p) => p.test(t));
+}

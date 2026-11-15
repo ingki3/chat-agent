@@ -532,6 +532,9 @@ describe("per-user skills (FR-1.6, #21)", () => {
       "artifact_update",
       "artifact_read",
       "schedule_create",
+      // 대화 중 기억해줘 (#145): everyone's, in their own conversations.
+      "memory_list",
+      "memory_propose",
       "doc_create",
       // File tools (#48): everyone's, on their own conversation's uploads.
       "file_list",

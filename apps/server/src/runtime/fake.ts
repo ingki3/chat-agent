@@ -8,6 +8,7 @@ import { docScenario } from "./fake-docs.js";
 import { pythonScenario, type PythonScenario } from "./fake-python.js";
 import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import { readReferences, switchSteps, type ReadReferences } from "./fake-switch.js";
+import { memorySteps } from "./fake-memory.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -58,6 +59,8 @@ import {
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
+ *   "기억해줘: …", "나에 대해 기억해줘: …", "기억 <n>번 잊어줘", "기억 <n>번 고쳐줘: …", /memory-inject, /memory-raw <json>
+ *                     real calls of our `memory_list` / `memory_propose` (#145, `fake-memory.ts`)
  *   /ref-file-cite, /ref-cite, /ref-refetch-cite, /ref-artifact-update   after a runtime switch (#53): real calls
  *                     with the ids this session read from its start context's conversation references
  *                     (`fake-switch.ts`)
@@ -382,6 +385,8 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
   const switched = switchSteps(t);
   if (switched) return switched;
+  const remembered = memorySteps(t);
+  if (remembered) return remembered;
   const cite = citationSteps(t);
   if (cite) return cite;
   const fin = /^\/finance(\s+cited)?$/.exec(t);
