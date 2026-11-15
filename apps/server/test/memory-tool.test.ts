@@ -791,6 +791,70 @@ describe("review #154 round 2", () => {
   });
 });
 
+describe("review #154 round 3", () => {
+  const raw = (o: object) => `/memory-raw ${JSON.stringify(o)}`;
+  const full = (first?: string) =>
+    Array.from({ length: 79 }, (_, i) =>
+      i === 0 && first ? `- ${first}` : `- ${String(i).padStart(2, "0")}${"가".repeat(96)}`,
+    ).join("\n");
+
+  it("P2: the tool answers what the bundle really holds — an auto add dropped by size is not 'remembered'", async () => {
+    const t = await start();
+    await t.req("owner", "PUT", "/api/instructions/memory", {
+      content: full(`고혈압 약을 복용한다${"가".repeat(85)}`),
+    });
+    await t.setMode("auto");
+    const first = ((await t.docs()).find((d) => d.kind === "memory")!.items ?? [])[0]!.id;
+    const before = await t.items("memory");
+    const r = await t.say(
+      raw({
+        changes: [
+          { action: "delete", itemId: first },
+          { action: "add", doc: "memory", text: "나".repeat(90) },
+        ],
+      }),
+    );
+    // The delete waits (sensitive); the add alone would not fit, so it is left out — nothing was remembered.
+    expect(r.output).toMatchObject({ status: "pending", applied: 0, pending: 1, dropped: 1 });
+    expect((r.output as { note?: string }).note).not.toContain("remembered now");
+    expect((await t.card(r.output!.proposalId!)).decisions.map((d) => d.status)).toEqual([
+      "pending",
+      "dropped",
+    ]);
+    expect(await t.items("memory")).toEqual(before);
+  });
+
+  it("P3: a shorter replace still pending makes room — the add is not dropped after the delete is rejected", async () => {
+    const t = await start();
+    await t.req("owner", "PUT", "/api/instructions/memory", { content: full() });
+    const [a, b] = ((await t.docs()).find((d) => d.kind === "memory")!.items ?? []).map((i) => i.id);
+    const r = await t.say(
+      raw({
+        changes: [
+          { action: "delete", itemId: a },
+          { action: "replace", itemId: b, text: "짧게" },
+          { action: "add", doc: "memory", text: "나".repeat(90) },
+        ],
+      }),
+    );
+    const id = r.output!.proposalId!;
+    const rej = await t.req("owner", "POST", `/api/memory-proposals/${id}/reject`, { indexes: [0] });
+    expect(MemoryProposal.parse(rej.json()).decisions.map((d) => d.status)).toEqual([
+      "rejected",
+      "pending",
+      "pending",
+    ]);
+    const acc = await t.req("owner", "POST", `/api/memory-proposals/${id}/accept`, { indexes: [1, 2] });
+    expect(MemoryProposal.parse(acc.json()).decisions.map((d) => d.status)).toEqual([
+      "rejected",
+      "accepted",
+      "accepted",
+    ]);
+    const now = await t.items("memory");
+    expect([now.length, now[1], now.at(-1)]).toEqual([80, "짧게", "나".repeat(90)]);
+  });
+});
+
 /** Every row of every table, as text. */
 function dumpDb(db: Db, prefix = ""): string {
   const tables = (

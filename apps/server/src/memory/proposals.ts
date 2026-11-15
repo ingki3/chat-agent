@@ -75,6 +75,8 @@ export type ProposeOutcome =
       proposalId: string | null;
       applied: number;
       pending: number;
+      /** Kept on the card but left out on the way (size once the auto-applied part went alone). */
+      dropped?: number;
       refused: Partial<Record<MemoryRefusalKind, number>>;
     };
 
@@ -399,8 +401,18 @@ export class MemoryProposals {
         // 자동 반영: what may go at once goes now, one version per document.
         const now = final.flatMap((c, i) => (autoOk(c) ? [i] : []));
         if (now.length) this.applyIndexes(this.row(id)!, now, "applied");
-        const applied = now.length;
-        return { ok: true, proposalId: id, applied, pending: final.length - applied, refused };
+        // What the bundle really holds now (review #154 round 3): an auto-applied decision can still be dropped (its
+        // document would not fit without a decision that waits for the card).
+        const st = this.decisions(id).map((d) => d.status);
+        const count = (x: MemoryDecisionStatus) => st.filter((v) => v === x).length;
+        return {
+          ok: true,
+          proposalId: id,
+          applied: count("applied"),
+          pending: count("pending"),
+          dropped: count("dropped"),
+          refused,
+        };
       })
       .immediate();
   }
@@ -562,8 +574,9 @@ export class MemoryProposals {
 
   /**
    * After a partial 반영 or 거절 (spec §5): the bundle's pending decisions checked again — sources, content, target
-   * item — and, per document, size: a decision that no longer fits even with every remaining pending delete of its
-   * document (the only ones sure to make room) can never be applied, so it is dropped.
+   * item — and, per document, size: a decision that no longer fits even with every remaining pending decision of its
+   * document that makes room (deletes, replaces with a line no longer than the old one) can never be applied, so it is
+   * dropped.
    */
   private recheckRest(p: ProposalRow): void {
     for (const d of this.decisions(p.id))
@@ -572,11 +585,18 @@ export class MemoryProposals {
       const doc = this.store.doc(p.owner_id, k);
       if (!doc) continue;
       const rest = this.decisions(p.id).filter((d) => d.doc === k && d.status === "pending");
-      const deletes = rest.filter((d) => d.action === "delete");
-      const op = (d: DecisionRow) => ({ action: d.action, itemId: d.item_id, text: d.text });
+      // The best case: every remaining decision that makes room — deletes, and replaces with a shorter line.
+      const shrinks = (d: DecisionRow) =>
+        d.action === "delete" ||
+        (d.action === "replace" &&
+          d.before !== null &&
+          d.text !== null &&
+          docSize(d.text).chars <= docSize(d.before).chars &&
+          docSize(d.text).bytes <= docSize(d.before).bytes);
+      const room = rest.filter(shrinks);
+      const op = (x: DecisionRow) => ({ action: x.action, itemId: x.item_id, text: x.text });
       for (const d of rest)
-        if (d.action !== "delete" && !this.fits(doc, [...deletes.map(op), op(d)]))
-          this.setStatus(p, d.idx, "dropped");
+        if (!shrinks(d) && !this.fits(doc, [...room.map(op), op(d)])) this.setStatus(p, d.idx, "dropped");
     }
   }
 

@@ -1173,7 +1173,13 @@ export class McpService {
     const r = memory.propose(scope, parsed.data, { external: this.externalRuns.has(scope.runId) });
     if (!r.ok) return { ok: false, code: r.code };
     const status =
-      r.proposalId === null ? "refused" : r.pending ? (r.applied ? "partly_applied" : "pending") : "applied";
+      r.proposalId === null || (!r.applied && !r.pending)
+        ? "refused"
+        : r.pending
+          ? r.applied
+            ? "partly_applied"
+            : "pending"
+          : "applied";
     return {
       ok: true,
       output: {
@@ -1181,15 +1187,19 @@ export class McpService {
         status,
         applied: r.applied,
         pending: r.pending,
+        ...(r.dropped ? { dropped: r.dropped } : {}),
         refused: r.refused,
         note:
-          status === "refused"
+          (status === "refused"
             ? "Nothing was changed: the server refused every change (see refused). Tell the user briefly; do not retry with the same content."
             : status === "applied"
               ? "Remembered now. The user sees it under your reply with an undo button."
               : status === "partly_applied"
                 ? "Some changes were remembered now (applied); the others (pending) wait for the user's confirmation on the card under your reply. Say which is which; do not say the pending ones were saved."
-                : "Not saved yet: the user sees a card under your reply and the change is made only if they accept it there. Tell them to check the card; do not say it was saved.",
+                : "Not saved yet: the user sees a card under your reply and the change is made only if they accept it there. Tell them to check the card; do not say it was saved.") +
+          (r.dropped
+            ? " Some changes (dropped) were left out: the document would be over its size limit without the ones waiting for the card."
+            : ""),
       },
     };
   }
