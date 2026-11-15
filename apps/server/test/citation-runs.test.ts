@@ -233,6 +233,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
   it("thirty sources in one answer: every number checked, the failing one kept apart (#150)", async () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "/cite fetchmany");
     expectScenario("many", await send(f.cookies.owner, c.id, "/cite many"));
   }, 30_000); // 60 real tool calls: allow for a loaded machine
 
@@ -517,6 +518,7 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       const rest = [recap];
       for (const name of ["insufficient", "partial", "many"] as const) {
         const conv = app.conversations!.create(f.users.owner.id);
+        if (name === "many") await send(f.cookies.owner, conv.id, "/cite fetchmany", rt);
         const r = await send(f.cookies.owner, conv.id, `/cite ${name}`, rt);
         expectScenario(name, r, `${rt} ${name}`);
         rest.push(r);

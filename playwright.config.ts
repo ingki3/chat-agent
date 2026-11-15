@@ -6,6 +6,9 @@ const PORT = Number(process.env.E2E_PORT ?? 3100);
 /** Backups (#37) never go into the repository: a throwaway folder in the system temp dir, emptied per run. */
 const BACKUP_DIR = path.join(os.tmpdir(), `agentlee-e2e-backups-${PORT}`);
 
+/** Tests that load the server for seconds: run in projects of their own, after the others (see `projects`). */
+const HEAVY = /@heavy/;
+
 // Runs against the production build (pnpm build first). One port for UI + API, as in production.
 export default defineConfig({
   testDir: "e2e",
@@ -17,8 +20,23 @@ export default defineConfig({
   projects: [
     // Creates the admin through the first-run screen and the family accounts; everything else depends on it.
     { name: "setup", testMatch: /first-run\.setup\.ts/, use: { ...devices["Desktop Chrome"] } },
-    { name: "desktop", use: { ...devices["Desktop Chrome"] }, dependencies: ["setup"] },
-    { name: "mobile", use: { ...devices["Pixel 7"] }, dependencies: ["setup"] },
+    { name: "desktop", use: { ...devices["Desktop Chrome"] }, dependencies: ["setup"], grepInvert: HEAVY },
+    { name: "mobile", use: { ...devices["Pixel 7"] }, dependencies: ["setup"], grepInvert: HEAVY },
+    // Tests tagged @heavy keep the one server busy for seconds (e.g. a reply with 30 real citation calls, #150):
+    // they run after everything else, so the timing-sensitive specs (streaming, scrolling) never share the server
+    // with them.
+    {
+      name: "desktop-heavy",
+      use: { ...devices["Desktop Chrome"] },
+      dependencies: ["desktop", "mobile"],
+      grep: HEAVY,
+    },
+    {
+      name: "mobile-heavy",
+      use: { ...devices["Pixel 7"] },
+      dependencies: ["desktop", "mobile"],
+      grep: HEAVY,
+    },
   ],
   webServer: {
     // Production mode requires a master key: create a throwaway one for the e2e run.

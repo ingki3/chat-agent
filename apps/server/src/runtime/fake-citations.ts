@@ -149,16 +149,25 @@ export const CITATION_SCENARIOS = {
       "앞에서 본 기사에 따르면 메모리 가격 회복이 증가를 이끌었어요[1]. 통계가 다른 것은 집계 기준 때문이에요[2]. 지난 답변의 수치도 같아요[3].",
   },
   /**
-   * Thirty sources, cited three to a paragraph (`[1][2][3]`) — #150's compact markers and folded source list.
+   * The thirty pages of `many`, fetched in an answer of their own (CI: every tool event of a run re-scrubs the run's
+   * parts, so one run with sixty calls is slow enough to starve the other e2e runs — split, each run stays light).
+   */
+  fetchmany: {
+    calls: MANY_PAGES.map((p) => ({ tool: "web_fetch" as const, input: { url: p.url } })),
+    answer: "지표 기사 30개를 가져왔어요.",
+  },
+  /**
+   * Thirty sources, cited three to a paragraph (`[1][2][3]`) — #150's compact markers and folded source list —
+   * after `fetchmany` in the same conversation (found with sources_list, oldest first: item i is page i + 1).
    * `[7]` quotes a figure the page does not have (snippet_not_found): it must show while the list is folded.
    */
   many: {
     calls: [
-      ...MANY_PAGES.map((p) => ({ tool: "web_fetch" as const, input: { url: p.url } })),
+      { tool: "sources_list" as const, input: {} },
       ...MANY_PAGES.map((_, i) => ({
         tool: "cite" as const,
         input: {
-          sourceId: `$${i}.sourceId`,
+          sourceId: `$0.items.${i}.sourceId`,
           snippet: `통계청은 지표 ${i + 1}번이 지난달보다 ${i + 1 === MANY_BAD ? 99 : i + 1}% 늘었다고 밝혔다.`,
         },
       })),

@@ -14,12 +14,12 @@ const SNIPPET =
   "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.";
 const OK = "원문 구절 확인";
 
-async function ask(page: Page, text: string) {
+async function ask(page: Page, text: string, timeout = 15_000) {
   const before = await page.getByTestId("citation-note").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
   // The reply runs and the note is added at its end: allow for a busy machine (all specs run in parallel).
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1, { timeout: 15_000 });
+  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1, { timeout });
   return page.getByTestId("assistant").last();
 }
 
@@ -148,63 +148,69 @@ test("existing sources are reused in the same conversation; another conversation
   await ctx.close();
 });
 
-test("thirty sources (#150): one chip per marker group, the list folded, the failing source shown while folded", async ({
-  page,
-  isMobile,
-}, testInfo) => {
-  await useAccount(page, MOM);
-  const { reply } = await newChat(page, "/cite many");
-  // Ten paragraphs of `[a][b][c]`: ten chips of three numbers, each its own button.
-  const chips = reply.getByTestId("citation-chip");
-  await expect(chips).toHaveCount(10);
-  await expect(chips.nth(0).getByTestId("citation-marker")).toHaveText(["1", "2", "3"]);
-  await expect(chips.nth(0)).toHaveAttribute("aria-label", "출처 1, 2, 3");
-  await expect(chips.nth(0).getByTestId("citation-marker").nth(1)).toHaveAttribute(
-    "aria-label",
-    `출처 2: ${OK}`,
-  );
-  await expect(chips.nth(2).getByTestId("citation-marker")).toHaveText(["7⚠️", "8", "9"]);
-  await expect(reply.getByTestId("citation-marker")).toHaveCount(30);
+test(
+  "thirty sources (#150): one chip per marker group, the list folded, the failing source shown while folded",
+  { tag: "@heavy" },
+  async ({ page, isMobile }, testInfo) => {
+    test.setTimeout(90_000);
+    await useAccount(page, MOM);
+    // The thirty pages first, then the answer citing them (two light runs instead of one with sixty tool calls).
+    await newChat(page, "/cite fetchmany");
+    const reply = await ask(page, "/cite many", 45_000);
+    // Ten paragraphs of `[a][b][c]`: ten chips of three numbers, each its own button.
+    const chips = reply.getByTestId("citation-chip");
+    await expect(chips).toHaveCount(10);
+    await expect(chips.nth(0).getByTestId("citation-marker")).toHaveText(["1", "2", "3"]);
+    await expect(chips.nth(0)).toHaveAttribute("aria-label", "출처 1, 2, 3");
+    await expect(chips.nth(0).getByTestId("citation-marker").nth(1)).toHaveAttribute(
+      "aria-label",
+      `출처 2: ${OK}`,
+    );
+    await expect(chips.nth(2).getByTestId("citation-marker")).toHaveText(["7⚠️", "8", "9"]);
+    await expect(reply.getByTestId("citation-marker")).toHaveCount(30);
 
-  // Folded: the summary and the one failing row — never hidden.
-  const toggle = reply.getByTestId("citation-toggle");
-  await expect(toggle).toHaveAttribute("aria-expanded", "false");
-  await expect(reply.getByTestId("citation-summary")).toHaveText("출처 30개 · ⚠️ 확인 안 된 출처 1개");
-  const rows = reply.getByTestId("citation-source");
-  await expect(rows).toHaveCount(1);
-  await expect(rows.first()).toHaveAttribute("data-status", "snippet_not_found");
-  await expect(rows.first()).toContainText("지표 7번 동향");
-  await expect(rows.first().getByTestId("citation-status")).toHaveText("⚠️ 출처에서 이 내용을 찾지 못했어요");
-  await reply.scrollIntoViewIfNeeded();
-  await page.screenshot({ path: testInfo.outputPath("citations-folded.png"), fullPage: true });
+    // Folded: the summary and the one failing row — never hidden.
+    const toggle = reply.getByTestId("citation-toggle");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(reply.getByTestId("citation-summary")).toHaveText("출처 30개 · ⚠️ 확인 안 된 출처 1개");
+    const rows = reply.getByTestId("citation-source");
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first()).toHaveAttribute("data-status", "snippet_not_found");
+    await expect(rows.first()).toContainText("지표 7번 동향");
+    await expect(rows.first().getByTestId("citation-status")).toHaveText(
+      "⚠️ 출처에서 이 내용을 찾지 못했어요",
+    );
+    await reply.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath("citations-folded.png"), fullPage: true });
 
-  // A number in a chip opens its own preview and link while the list is folded.
-  const second = chips.nth(1).getByTestId("citation-marker").nth(2);
-  if (isMobile) await second.tap();
-  else await second.click();
-  const preview = reply.getByTestId("citation-preview");
-  await expect(preview).toBeVisible();
-  await expect(preview).toContainText("지표 6번 동향");
-  await expect(preview.getByRole("link", { name: /원문 열기/ })).toHaveAttribute(
-    "href",
-    "https://fixture.agentlee.test/news/many-6.html",
-  );
-  await page.keyboard.press("Escape");
-  await expect(preview).toHaveCount(0);
+    // A number in a chip opens its own preview and link while the list is folded.
+    const second = chips.nth(1).getByTestId("citation-marker").nth(2);
+    if (isMobile) await second.tap();
+    else await second.click();
+    const preview = reply.getByTestId("citation-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview).toContainText("지표 6번 동향");
+    await expect(preview.getByRole("link", { name: /원문 열기/ })).toHaveAttribute(
+      "href",
+      "https://fixture.agentlee.test/news/many-6.html",
+    );
+    await page.keyboard.press("Escape");
+    await expect(preview).toHaveCount(0);
 
-  // Unfolded: all thirty, in order, title·site·date only.
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("aria-expanded", "true");
-  await expect(rows).toHaveCount(30);
-  await expect(rows.nth(5).getByTestId("citation-link")).toHaveText("지표 6번 동향");
-  await expect(rows.nth(5)).toContainText("뉴스6 일보 · 2026-11-07");
-  await expect(rows.nth(5)).not.toContainText("https://");
-  await expect(reply.getByTestId("citation-status")).toHaveCount(1);
-  await page.screenshot({ path: testInfo.outputPath("citations-open.png"), fullPage: true });
-  // Folded again: the failure is still there.
-  await toggle.click();
-  await expect(rows).toHaveCount(1);
-});
+    // Unfolded: all thirty, in order, title·site·date only.
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(rows).toHaveCount(30);
+    await expect(rows.nth(5).getByTestId("citation-link")).toHaveText("지표 6번 동향");
+    await expect(rows.nth(5)).toContainText("뉴스6 일보 · 2026-11-07");
+    await expect(rows.nth(5)).not.toContainText("https://");
+    await expect(reply.getByTestId("citation-status")).toHaveCount(1);
+    await page.screenshot({ path: testInfo.outputPath("citations-open.png"), fullPage: true });
+    // Folded again: the failure is still there.
+    await toggle.click();
+    await expect(rows).toHaveCount(1);
+  },
+);
 
 test("a follow-up that reuses the previous answer's numbers shows them verified, not ⚠️ (#150)", async ({
   page,

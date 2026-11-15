@@ -875,7 +875,7 @@ PRD FR-5.1–5.5, G2, 수용 기준 3·11. 방식과 근거는 `docs/decisions/i
 - 로그에는 호출마다 `citation.finished`(도구, `ok`/`error`, `citeCode` = 상태나 거부 코드, 소요 시간, ID)만 남는다. 출처 id·구절·본문·URL은 남지 않는다.
 - 자주 보이는 코드: `cite_snippet_too_short`, `cite_not_allowed`(토큰의 사용자가 그 대화의 주인이 아님), `cite_limit`, `cite_bad_input`.
 - 시험(네트워크 없음): `citations.test.ts`(정규화·오탐 없음, 범위, 문단 규칙, 이어받기·`recheck` 범위), `citation-runs.test.ts`(FakeRuntime 시나리오 — 충돌·자료 부족·부분 누락·기존 출처 재사용·출처 30개·이어받기(다시 확인, 이어받은 노트에서 다시, 본문이 바뀌면 ⚠️, 우선순위), 다른 대화·다른 사용자, 복구·중지, 자료 조사 모드 지침, Claude·Codex 녹화 형식 재생으로 같은 시나리오), `apps/web/test/citations.test.ts`(⚠️ 표시, 칩 묶기, 접힘·실패 항상 보임), `apps/web/test/markdown.test.ts`(마크다운 속 칩), `e2e/citations.spec.ts`(데스크톱 hover·모바일 탭, 출처 30개 접힘·펼침·실패 줄·칩 번호 미리보기, 이어진 답 번호 재사용).
-- 시나리오와 가짜 페이지: `apps/server/src/runtime/fake-citations.ts`. `FAKE_RUNTIME=1`에서 `/cite conflict|insufficient|partial|reuse|many|recap`, `/cite-id <sourceId> <구절>`. 이 모드에서는 `https://fixture.agentlee.test/…` 주소와 그 검색어만 서버 안에서 답한다(다른 주소는 평소대로).
+- 시나리오와 가짜 페이지: `apps/server/src/runtime/fake-citations.ts`. `FAKE_RUNTIME=1`에서 `/cite conflict|insufficient|partial|reuse|fetchmany|many|recap`(`many`는 같은 대화의 `fetchmany` 뒤 — 실행 하나에 도구 호출 60개는 서버를 몇 초 붙잡아 같이 돌던 스트리밍 e2e가 시간 초과됐다), `/cite-id <sourceId> <구절>`. 서버를 오래 붙잡는 e2e는 `@heavy` 태그를 달면 `desktop-heavy`·`mobile-heavy` 프로젝트로 나머지가 모두 끝난 뒤 돈다(`playwright.config.ts`). 이 모드에서는 `https://fixture.agentlee.test/…` 주소와 그 검색어만 서버 안에서 답한다(다른 주소는 평소대로).
 - 실런타임 확인 체크리스트: `docs/evidence/citations/checklist.md`.
 
 ## 23. 기본값과 칩 — 대화별 런타임·모델 (#19)
