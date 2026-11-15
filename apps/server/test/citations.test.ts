@@ -1447,6 +1447,41 @@ describe("citationNote", () => {
     );
   });
 
+  it("review #153 1: a run whose cite was refused (nothing registered) carries nothing over", () => {
+    const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
+    const refused = f.run(f.c.id);
+    // `cite_snippet_too_short`: a call that registered no row.
+    expect(() => f.cites.cite(refused, { sourceId: src.id, snippet: "짧다" })).toThrow(CiteRefused);
+    expect(f.cites.forRun(refused.runId)).toEqual([]);
+    for (const name of ["mcp__agentlee__cite", "cite", "mcp__agentlee__file_cite", "file_cite"]) {
+      const parts: MessagePart[] = [
+        { type: "tool_call", id: "t1", name, input: { sourceId: src.id, snippet: "짧다" } },
+        { type: "tool_result", callId: "t1", output: { error: "cite_snippet_too_short" }, isError: true },
+        ...text("가[1]."),
+      ];
+      expect(citationNote(refused.runId, parts, f.cites, carry)!.citations[0]!.status, name).toBe(
+        "unknown_source",
+      );
+    }
+    // The same answer without the call: carried over.
+    expect(citationNote(refused.runId, text("가[1]."), f.cites, carry)!.citations[0]!.status).toBe(
+      "verified",
+    );
+  });
+
+  it("review #153 2: an answer with carried numbers is checked for paragraphs without one", () => {
+    const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
+    const t = "요약하면 수출이 늘었어요[1].\n\n반도체 가격도 두 배가 됐어요.";
+    const note = citationNote(f.run(f.c.id).runId, text(t), f.cites, carry)!;
+    expect(note.citations.map((c) => c.status)).toEqual(["verified"]);
+    expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["반도체 가격도 두 배가 됐어요."]);
+    // Nothing carried (no earlier note): the plain no-tool rule — a made-up marker, no paragraph check.
+    const none = { ...carry, previous: () => [] };
+    expect(citationNote(f.run(f.c.id).runId, text(t), f.cites, none)!.missing).toEqual([]);
+  });
+
   it("recheck (#150): the source of this conversation and user only, its stored text looked at now", () => {
     const owner = { conversationId: f.c.id, userId: scope.userId };
     expect(f.cites.recheck(owner, { sourceId: src.id, snippet: SNIP })).toMatchObject({

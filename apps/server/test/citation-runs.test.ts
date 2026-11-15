@@ -234,7 +234,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
     expectScenario("many", await send(f.cookies.owner, c.id, "/cite many"));
-  });
+  }, 30_000); // 60 real tool calls: allow for a loaded machine
 
   it("a follow-up that writes the previous answer's numbers again: carried over and checked again (#150)", async () => {
     const { app, db, f, send } = await start(fake());
@@ -273,7 +273,14 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
             { call: "web_fetch", input: { url: FIXTURE_PAGES[2]!.url } },
             { text: CITATION_SCENARIOS.recap.answer },
           ]
-        : defaultScript(input, memory);
+        : input.text === "/refused-recap"
+          ? [
+              { call: "cite", input: { sourceId: "x", snippet: "짧다" } },
+              { text: CITATION_SCENARIOS.recap.answer },
+            ]
+          : input.text === "/recap-two"
+            ? [{ text: "요약하면 수출이 늘었어요[1].\n\n반도체 가격도 두 배가 됐어요." }]
+            : defaultScript(input, memory);
     const { app, f, send } = await start(fake(recapAfterFetch));
     const c = app.conversations!.create(f.users.owner.id);
     await send(f.cookies.owner, c.id, "/cite conflict");
@@ -284,6 +291,19 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     // It fetched a page of its own (and cited nothing): its numbers may mean that page — never shown as verified.
     const fetched = await send(f.cookies.owner, c2.id, "/fetch-recap");
     expect(statuses(fetched)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
+    // Review #153 1: a cite the server refused (too short — no row) still makes the numbers this run's.
+    const c3 = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c3.id, "/cite conflict");
+    const refused = await send(f.cookies.owner, c3.id, "/refused-recap");
+    expect(refused.parts.some((p) => p.type === "tool_result" && p.isError)).toBe(true);
+    expect(statuses(refused)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
+    // Review #153 2: carried numbers make it an answer using sources — an uncited paragraph is flagged.
+    // (Right after a note with [1] verified: after the refused run, the newest note has nothing to carry.)
+    const c4 = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c4.id, "/cite conflict");
+    const twoParagraphs = await send(f.cookies.owner, c4.id, "/recap-two");
+    expect(statuses(twoParagraphs)).toEqual([[1, "verified"]]);
+    expect(missingText(twoParagraphs)).toEqual(["반도체 가격도 두 배가 됐어요."]);
   });
 
   it("a source id of another conversation or another user cited through the run's token: unknown_source", async () => {

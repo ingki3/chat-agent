@@ -88,14 +88,20 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
 
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
 
-/** Tools that bring in sources of their own (a search, a fetch, the news skill): new material for new numbers. */
-const NEW_SOURCE_TOOLS: ReadonlySet<string> = new Set([
+/**
+ * Tools whose call makes this run's numbers its own (#150): a search, a fetch or the news skill (new material for
+ * new numbers), and any `cite` or `file_cite` call — refused ones too (review #153: a refused call registers no row,
+ * yet the model may still write the number it meant).
+ */
+const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   WEB_SEARCH_TOOL.name,
   WEB_FETCH_TOOL.name,
   skillToolName(GOOGLE_NEWS_SKILL.name),
+  CITE_TOOL.name,
+  FILE_CITE_TOOL.name,
 ]);
-const bringsSources = (name: string) =>
-  NEW_SOURCE_TOOLS.has(name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name);
+const ownsNumbers = (name: string) =>
+  OWN_NUMBER_TOOLS.has(name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name);
 
 /**
  * Carrying numbers over (#150): a follow-up ("내용 요약해줘") that writes the previous answer's `[n]` again without
@@ -105,10 +111,12 @@ const bringsSources = (name: string) =>
  * still be this conversation's and this user's, the passage is looked for in its stored text).
  *
  * The rule, and its precedence: numbers are per run, so a carry-over happens only when this run registered **no**
- * citation and brought in no source of its own (no search, fetch or news skill) — then its numbers can only be the
- * earlier ones. As soon as it cites anything (or fetches something new), every number is this run's: a marker
- * without a citation of this run stays `unknown_source`, whatever an earlier answer had under that number. File
- * citations are not carried (their check waits for the extraction); they stay `unknown_source`.
+ * citation, **called** no `cite`/`file_cite` (a refused call counts — review #153) and brought in no source of its
+ * own (no search, fetch or news skill) — then its numbers can only be the earlier ones. As soon as it cites or tries
+ * to (or fetches something new), every number is this run's: a marker without a citation of this run stays
+ * `unknown_source`, whatever an earlier answer had under that number. File citations are not carried (their check
+ * waits for the extraction); they stay `unknown_source`. An answer that carries a number is an answer using
+ * sources: its paragraphs without a marker are flagged as missing (review #153).
  */
 export type CitationCarry = {
   conversationId: string;
@@ -134,9 +142,10 @@ export function citationNote(
   const byN = new Map(rows.map((r) => [r.n, r]));
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
   let earlier: Map<number, CitationEntry> | undefined;
+  let carriedAny = false;
   const carriedFrom = (n: number): CitationEntry | undefined => {
     if (!carry || !store.recheck || rows.length) return undefined;
-    if (parts.some((p) => p.type === "tool_call" && bringsSources(p.name))) return undefined;
+    if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return undefined;
     earlier ??= new Map(carry.previous().map((e) => [e.n, e]));
     const e = earlier.get(n);
     if (!e?.sourceId || e.status === "unknown_source") return undefined;
@@ -144,6 +153,7 @@ export function citationNote(
     const c = e.quote ? store.recheck(carry, { sourceId: e.sourceId, snippet: e.quote }) : undefined;
     if (!c) return undefined;
     const s = c.source;
+    carriedAny = true;
     return {
       n,
       status: c.status,
@@ -202,11 +212,13 @@ export function citationNote(
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
     };
   });
-  const missing = used
-    ? uncitedUnits(text)
-        .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
-        .slice(0, CITATION_LIMITS.missing)
-    : [];
+  // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
+  const missing =
+    used || carriedAny
+      ? uncitedUnits(text)
+          .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
+          .slice(0, CITATION_LIMITS.missing)
+      : [];
   return {
     type: "citation_note",
     citations,
