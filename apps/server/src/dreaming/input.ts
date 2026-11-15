@@ -37,6 +37,8 @@ export type PackedInput = {
   /** Queue entries of messages no longer allowed (deleted, edited away): dropped. */
   staleQueue: { messageId: string; doc: MemoryListKind }[];
   cut: boolean;
+  /** Even the first message alone does not fit the run's token cap (the run fails, nothing moves). */
+  tooLarge: boolean;
 };
 
 /** Text of a user message as Dreaming reads it: its text parts only. */
@@ -80,6 +82,8 @@ export function gatherInput(
     /** UTF-8 bytes left for messages under the run's token cap. */
     maxBytes: number;
     suspicious: (text: string) => boolean;
+    /** Entries the run's own expiry will queue (written only with its outcome, review #160 round 1). */
+    extraQueue?: readonly { messageId: string; doc: MemoryListKind }[];
   },
 ): PackedInput {
   const sql = db.$client;
@@ -92,13 +96,17 @@ export function gatherInput(
               s.seq as seq, m.parts as parts,
               (select 1 from messages m join conversations c on c.id = m.conversation_id
                  where m.id = q.message_id and ${ALLOWED}) as ok
-         from dreaming_queue q
+         from (select message_id, doc from dreaming_queue where user_id = @u
+               union
+               select json_extract(j.value, '$.messageId'), json_extract(j.value, '$.doc') from json_each(@extra) j) q
          join messages m on m.id = q.message_id
          left join memory_message_seq s on s.message_id = q.message_id
-        where q.user_id = @u
         order by s.seq, q.message_id`,
     )
-    .all({ u: input.userId }) as (Row & { ok: number | null; seq: number | null })[];
+    .all({ u: input.userId, extra: JSON.stringify(input.extraQueue ?? []) }) as (Row & {
+    ok: number | null;
+    seq: number | null;
+  })[];
   const staleQueue = queued
     .filter((q) => !q.ok || q.seq === null)
     .map((q) => ({ messageId: q.id, doc: q.doc! }));
@@ -111,9 +119,15 @@ export function gatherInput(
   let bytes = 0;
   let cut = false;
   let full = false;
+  let tooLarge = false;
   let lastNewSeq: number | null = null;
 
-  /** Puts one message in, or says it does not fit (then nothing after it goes in either). */
+  /**
+   * Puts one message in, or says it does not fit — then nothing after it goes in either, and the checkpoint stays
+   * before it (review #160 round 1: a message is never read in part, except one longer than the 60,000-character cap,
+   * which goes in as its first 60,000 characters, spec §6). A message counts with its whole entry in the request
+   * (JSON escaping, its reference and documents), so the request really stays under the run's token cap.
+   */
   const put = (r: Row, isQueued: boolean, docs: Set<MemoryListKind>): boolean => {
     const known = byId.get(r.id);
     if (known) {
@@ -123,26 +137,24 @@ export function gatherInput(
     const raw = scrubKnown(messageBody(JSON.parse(r.parts) as unknown));
     if (!raw) return true; // nothing of the user's own words (an attachment only): passed over
     const points = [...raw];
-    let text = raw;
-    let range: InputMessage["range"] = null;
-    const size = utf8Bytes(raw);
-    if (chars + points.length > maxChars || bytes + size > input.maxBytes) {
-      // Only the first message may go in cut — anything later waits for the next run (spec §6).
-      if (messages.length) return false;
-      let take = Math.min(points.length, maxChars);
-      text = points.slice(0, take).join("");
-      while (take > 0 && utf8Bytes(text) > input.maxBytes) {
-        take = Math.max(0, Math.floor(take * 0.9) - 1);
-        text = points.slice(0, take).join("");
-      }
-      if (!take) return false;
-      range = { from: 0, to: take };
-      cut = true;
+    const longer = points.length > maxChars;
+    // Over the character cap on its own: its first 60,000 characters (it counts as processed). Otherwise whole.
+    const text = longer ? points.slice(0, maxChars).join("") : raw;
+    const textChars = longer ? maxChars : points.length;
+    const ref = `msg-${messages.length + 1}`;
+    const range: InputMessage["range"] = longer ? { from: 0, to: maxChars } : null;
+    const size = entryBytes(ref, docs, text, range);
+    if (chars + textChars > maxChars || bytes + size > input.maxBytes) {
+      if (messages.length) return false; // the next run starts with it
+      // The very first one does not fit the run's token cap: nothing goes in, the run fails (`too_large`).
+      if (size > input.maxBytes) tooLarge = true;
+      return false;
     }
-    chars += [...text].length;
-    bytes += utf8Bytes(text);
+    chars += textChars;
+    bytes += size;
+    if (longer) cut = true;
     const m: InputMessage = {
-      ref: `msg-${messages.length + 1}`,
+      ref,
       source: { messageId: r.id, revision: r.revision, conversationId: r.conversationId },
       seq: r.seq,
       text,
@@ -153,7 +165,7 @@ export function gatherInput(
     };
     messages.push(m);
     byId.set(r.id, m);
-    if (range) full = true;
+    if (longer) full = true;
     return true;
   };
 
@@ -188,7 +200,26 @@ export function gatherInput(
       if (full) break;
     }
   }
-  return { messages, lastNewSeq, takenQueue, staleQueue, cut };
+  return { messages, lastNewSeq, takenQueue, staleQueue, cut, tooLarge };
+}
+
+/** The bytes one message adds to the request (`dreamingRequest`'s entry, and the comma before it). */
+export function entryBytes(
+  ref: string,
+  docs: ReadonlySet<MemoryListKind>,
+  text: string,
+  range: InputMessage["range"],
+): number {
+  return (
+    utf8Bytes(
+      JSON.stringify({
+        id: ref,
+        docs: [...docs],
+        text,
+        ...(range ? { cut: `앞 ${range.to}자만 넣었음` } : {}),
+      }),
+    ) + 1
+  );
 }
 
 /**

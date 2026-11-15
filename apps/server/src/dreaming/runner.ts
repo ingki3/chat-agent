@@ -198,6 +198,11 @@ export class DreamingRunner {
       if (!store.finishRun(runId, "skipped", "inactive", counts)) throw new Gone();
       return end("skipped", "inactive");
     }
+    // Turned off (for everyone or this user) since the round was planned: nothing runs (review #160 round 1).
+    if (!preview && !store.switchedOn(req.userId)) {
+      if (!store.finishRun(runId, "skipped", "paused", counts)) throw new Gone();
+      return end("skipped", "paused");
+    }
     // Runtime, model and connection (spec §7: the shared API key connection only — no fallback).
     const cfg = store.config();
     const adapter = cfg.runtime ? this.deps.registry.get(cfg.runtime) : undefined;
@@ -218,12 +223,15 @@ export class DreamingRunner {
     }
 
     // Before the input: bundles whose documents changed expire (their sources are queued again), and documents with a
-    // bundle still waiting for review are left out — their new input stays queued for them (spec §5).
-    if (!preview) db.$client.transaction(() => proposals.expireStaleDreaming(req.userId)).immediate();
-    const blocked = preview ? new Set<MemoryListKind>() : proposals.pendingDreamingDocs(req.userId);
+    // bundle still waiting for review are left out — their new input stays queued for them (spec §5). The expiry is
+    // only planned here: it is written with the run's outcome, so a run that fails changes nothing (review #160).
+    const stale = preview ? { ids: new Set<string>(), requeue: [] } : proposals.staleDreaming(req.userId);
+    const blocked = preview
+      ? new Set<MemoryListKind>()
+      : proposals.pendingDreamingDocs(req.userId, stale.ids);
     const editable = KINDS.filter((k) => !blocked.has(k));
     if (!editable.length) {
-      if (!store.finishRun(runId, "skipped", "pending_review", counts)) throw new Gone();
+      this.commit(req.userId, runId, () => ({ status: "skipped", code: "pending_review" }), counts);
       return end("skipped", "pending_review");
     }
     const state = store.state(req.userId);
@@ -252,7 +260,9 @@ export class DreamingRunner {
       docs: editable,
       maxBytes,
       suspicious: triesRuleChange,
+      extraQueue: stale.requeue,
     });
+    if (input.tooLarge) throw new Failed("too_large");
     counts.newMessages = input.messages.filter((m) => !m.queued).length;
     counts.queuedMessages = input.messages.filter((m) => m.queued).length;
     counts.cut = input.cut;
@@ -263,6 +273,7 @@ export class DreamingRunner {
       }
       // Nothing to do: recorded as skipped — the checkpoint passes what had no words of the user's (spec §6).
       this.commit(
+        req.userId,
         runId,
         () => {
           this.moveQueue(req.userId, input, blocked, []);
@@ -274,7 +285,9 @@ export class DreamingRunner {
       return end("skipped", "no_input");
     }
 
-    // The model, without tools.
+    // The model, without tools — the request as it will really be sent checked against the cap once more.
+    const request = dreamingRequest(docItems, input.messages);
+    if (utf8Bytes(system) + utf8Bytes(request) + OUTPUT_RESERVE > cfg.tokenCap) throw new Failed("too_large");
     const text = await this.ask(adapter.id, {
       runId,
       userId: req.userId,
@@ -282,13 +295,18 @@ export class DreamingRunner {
       model: model.id,
       effort: model.defaultEffort ?? model.efforts[0],
       system,
-      request: dreamingRequest(docItems, input.messages),
+      request,
       timeoutMs: this.deps.timeoutMs ?? 10 * 60_000,
     });
 
     const raw = parseDreamingOutput(text);
     const checked = raw
-      ? checkDecisions(raw, { docs, messages: input.messages, fits: (d, ops) => proposals.fits(d, ops) })
+      ? checkDecisions(raw, {
+          docs,
+          messages: input.messages,
+          fits: (d, ops) => proposals.fits(d, ops),
+          rejected: proposals.rejectedDreaming(req.userId),
+        })
       : ({ ok: false } as const);
     counts.decisions = raw?.length ?? 0;
     if (!checked.ok) counts.refused = { format: 1 };
@@ -309,9 +327,12 @@ export class DreamingRunner {
 
     // One transaction: re-checks, the bundle or the change, queue, checkpoint, the record (spec §5).
     const outcome = this.commit(
+      req.userId,
       runId,
       () => {
         if (!this.deps.users.byId(req.userId)?.active) return { status: "skipped", code: "inactive" };
+        // Turned off while the model was thinking: nothing is applied, proposed or moved (review #160 round 1).
+        if (!store.switchedOn(req.userId)) return { status: "skipped", code: "paused" };
         let ds = checked.ok ? checked.decisions : [];
         const late = new Set<MemoryListKind>();
         // A document changed while the model was thinking: its decisions are not applied; their sources wait in the
@@ -378,15 +399,25 @@ export class DreamingRunner {
     return end(outcome.status, outcome.code);
   }
 
-  /** Runs `fn` and records its outcome in one transaction; an attempt already over writes nothing. */
+  /**
+   * Runs `fn` and records its outcome in one transaction; an attempt already over writes nothing. The run's planned
+   * expiry (spec §5: bundles whose documents changed) is written here too, first — only with an outcome. A paused or
+   * inactive outcome writes nothing but the record.
+   */
   private commit(
+    userId: string,
     runId: string,
     fn: () => { status: DreamingRunStatus; code: string | null },
     counts: DreamingCounts,
   ): { status: DreamingRunStatus; code: string | null } {
     return this.deps.db.$client
       .transaction(() => {
+        const sp = "dreaming_outcome";
+        this.deps.db.$client.exec(`savepoint ${sp}`);
+        this.deps.proposals.expireStaleDreaming(userId);
         const r = fn();
+        if (r.code === "paused" || r.code === "inactive") this.deps.db.$client.exec(`rollback to ${sp}`);
+        this.deps.db.$client.exec(`release ${sp}`);
         if (!this.deps.store.finishRun(runId, r.status, r.code, counts)) throw new Gone();
         return r;
       })
@@ -446,6 +477,7 @@ export class DreamingRunner {
     timer.unref();
     let text = "";
     let limited = false;
+    let startedId: string | undefined;
     try {
       session = await adapter.start({
         // Not a conversation: a one-off system task (no MCP server, no tools, nothing resumed).
@@ -459,7 +491,12 @@ export class DreamingRunner {
         model: a.model,
         effort: a.effort,
         tools: [],
+        // Known as soon as it exists: a start that fails after this still left state to forget (review #160).
+        sessionStarted: (id) => {
+          startedId = id;
+        },
       });
+      startedId = session.externalSessionId;
       if (timedOut) throw new Failed("timeout");
       turn = session.turn({ text: a.request, model: a.model, effort: a.effort });
       for await (const ev of turn.events) {
@@ -487,16 +524,16 @@ export class DreamingRunner {
       throw new Failed("model_error");
     } finally {
       clearTimeout(timer);
-      if (session) {
-        await session.close().catch(() => {});
+      if (session) await session.close().catch(() => {});
+      // The one-off session's runtime state goes, however it ended — a start that failed half-way included.
+      if (startedId)
         this.deps.forgetSession?.({
           conversationId: "",
           runtime,
           connectionId: a.connectionId,
           userId: a.userId,
-          externalSessionId: session.externalSessionId,
+          externalSessionId: startedId,
         });
-      }
     }
     if (timedOut) throw new Failed("timeout");
     if (limited) throw new Failed("connection_limited");

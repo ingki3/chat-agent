@@ -177,7 +177,10 @@ export class DreamingEngine {
     store.expireBefore(today);
     const cfg = store.config();
     for (const u of this.inactiveOn()) store.markPaused(u);
-    if (!cfg.enabled) return;
+    if (!cfg.enabled) {
+      store.pauseWaiting();
+      return;
+    }
     // The chosen connection is gone: paused — the admin screen says so (spec §7), nothing fails.
     if (this.deps.runner.connectionProblem()) return;
     for (const s of this.slots(now)) {
@@ -213,6 +216,13 @@ export class DreamingEngine {
   private dispatch(d: DayRow): void {
     const { store } = this.deps;
     const now = this.now();
+    // Turned off (for everyone or this user) or deactivated since the round was planned — a retry included: paused,
+    // nothing runs and nothing moves (review #160 round 1).
+    if (!store.switchedOn(d.user_id)) {
+      store.updateDay(d.user_id, d.date, { state: "paused" }, "waiting");
+      store.markPaused(d.user_id);
+      return;
+    }
     if (this.deps.busy?.(d.user_id)) {
       if (d.deferrals < DREAMING_MAX_BUSY)
         store.updateDay(
@@ -280,7 +290,15 @@ export class DreamingEngine {
       store.updateDay(
         d.user_id,
         d.date,
-        { state: failed ? "failed" : r!.status === "skipped" ? "skipped" : "done" },
+        {
+          state: failed
+            ? "failed"
+            : r!.code === "paused"
+              ? "paused"
+              : r!.status === "skipped"
+                ? "skipped"
+                : "done",
+        },
         "running",
       );
     this.checkAlert(d.date);

@@ -196,6 +196,28 @@ export class DreamingStore {
       .run(enabled ? 1 : 0, this.now(), enabled ? 1 : 0, this.now(), userId);
   }
 
+  /**
+   * Whether the rounds run for the user right now: the admin's switch for everyone and for this user, and an active
+   * account (spec §7·§9). Asked before an attempt starts and again right before its outcome is written.
+   */
+  switchedOn(userId: string): boolean {
+    if (!this.config().enabled) return false;
+    const r = this.sql
+      .prepare(
+        `select u.active as active, coalesce(d.enabled, 1) as enabled
+           from users u left join dreaming_users d on d.user_id = u.id where u.id = ?`,
+      )
+      .get(userId) as { active: number; enabled: number } | undefined;
+    return !!r && r.active === 1 && r.enabled === 1;
+  }
+
+  /** Turned off for everyone: the day's waiting rounds (a retry, a busy wait) are paused, not run later. */
+  pauseWaiting(): number {
+    return this.sql
+      .prepare("update dreaming_days set state = 'paused', updated_at = ? where state = 'waiting'")
+      .run(this.now()).changes;
+  }
+
   /** The user's rounds stopped (deactivated, turned off): noted once, until the next run resumes them (spec §9). */
   markPaused(userId: string): void {
     this.ensureState(userId);

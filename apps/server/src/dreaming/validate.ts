@@ -1,6 +1,6 @@
 import { DREAMING_MAX_LOSS, oneLine, type DreamingRefusalKind, type MemoryListKind } from "@agentlee/shared";
 import { holdsSecret, isSensitive, triesRuleChange } from "../memory/rules.js";
-import type { OpLike } from "../memory/proposals.js";
+import { dreamingFingerprint, type OpLike } from "../memory/proposals.js";
 import type { DocRow, Item, ItemSource } from "../memory/store.js";
 import type { InputMessage } from "./input.js";
 import type { RawDecision } from "./prompt.js";
@@ -44,6 +44,8 @@ export function checkDecisions(
     messages: readonly InputMessage[];
     /** Whether the document stays within its cap with these decisions (MemoryProposals.fits). */
     fits: (doc: DocRow, ops: readonly OpLike[]) => boolean;
+    /** Changes the user already rejected (`dreamingFingerprint`): never proposed again. */
+    rejected?: ReadonlySet<string>;
   },
 ): CheckResult {
   const byKind = new Map(ctx.docs.map((d) => [d.kind, d]));
@@ -132,6 +134,19 @@ export function checkDecisions(
           kept.some((k) => k.doc === p.doc && k.action === "add" && k.text === text)))
     ) {
       refuse("unchanged");
+      continue;
+    }
+    if (
+      ctx.rejected?.has(
+        dreamingFingerprint({
+          doc: p.doc,
+          action: p.action,
+          text,
+          targets: p.mergeIds ?? (p.itemId ? [p.itemId] : []),
+        }),
+      )
+    ) {
+      refuse("rejected");
       continue;
     }
     kept.push({

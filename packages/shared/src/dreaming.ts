@@ -57,6 +57,8 @@ export const DREAMING_REFUSAL_KINDS = [
   "sensitive",
   /** the same line already there, or replaced by itself */
   "unchanged",
+  /** the user already rejected this very change (spec §5: never proposed again) */
+  "rejected",
   /** its document has a bundle waiting for review: not touched this round (its input stays queued) */
   "blocked",
 ] as const;
@@ -125,6 +127,7 @@ export const DREAMING_CODE_LABEL: Record<string, string> = {
   timeout: "시간 초과",
   interrupted: "서버가 멈춤",
   inactive: "비활성 계정",
+  paused: "꺼져 있어 멈춤",
   too_large: "입력이 토큰 상한을 넘음",
 };
 

@@ -3,7 +3,9 @@ import {
   CSRF_HEADER,
   DreamingAdmin,
   InstructionsResponse,
+  MemoryProposal,
   MyDreaming,
+  utf8Bytes,
   type DreamingConfig,
 } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
@@ -842,5 +844,165 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect(s.d.store.queueSize(s.uid("owner"))).toBe(0);
     // DREAMS.md keeps counts — never the text.
     expect(JSON.stringify((await s.mine()).runs)).not.toContain("지울 대화");
+  });
+});
+
+describe("review #160 round 1", () => {
+  it("1. switched off after a failure: the retry does not run; switched off mid-run: nothing applied or moved", async () => {
+    const s = await start();
+    s.t.fail = "error";
+    s.say("기억: 꺼진 뒤 재시도");
+    const owner = s.uid("owner");
+    const slot = s.d.engine.slots().find((x) => x.userId === owner)!.at;
+    s.t.clock = slot;
+    s.d.engine.start();
+    await s.d.engine.idle();
+    expect(s.d.store.day(owner, dreamingDate(T0))).toMatchObject({ state: "waiting", attempts: 1 });
+    expect(s.t.requests).toHaveLength(1);
+    s.t.fail = null;
+    s.d.store.setEnabled(owner, false);
+    s.t.clock = slot + DREAMING_RETRY_MS;
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(owner, dreamingDate(T0))!.state).toBe("paused");
+    expect(s.t.requests).toHaveLength(1);
+    expect(s.checkpoint()).toBe(0);
+
+    // Mid-run: the switch goes off while the model thinks.
+    s.d.store.setEnabled(owner, true);
+    await s.setMode("auto");
+    s.t.answer = s.addEach;
+    s.t.delayMs = 300;
+    const pending = s.run();
+    await new Promise((r) => setTimeout(r, 100));
+    s.d.store.setEnabled(owner, false);
+    expect(await pending).toMatchObject({ status: "skipped", code: "paused" });
+    expect(await s.items("memory")).toEqual([]);
+    expect(s.checkpoint()).toBe(0);
+    // Globally off: the same.
+    s.d.store.setEnabled(owner, true);
+    s.d.store.setConfig({ ...s.d.store.config(), enabled: false });
+    s.t.delayMs = 0;
+    expect(await s.run()).toMatchObject({ status: "skipped", code: "paused" });
+    expect(s.checkpoint()).toBe(0);
+  });
+
+  it("2. a tight token cap: a message is never read in part — it waits whole; the real request stays under the cap", async () => {
+    const s = await start({ config: { tokenCap: 25_000 } });
+    await s.setMode("auto");
+    s.t.answer = s.addEach;
+    s.say(`기억: 짧은 것 ${"a".repeat(500)}`);
+    const long = `기억: 긴 것 ${"가".repeat(10_000)}`;
+    s.say(long);
+    await s.run();
+    // The first went in whole; the second (under 60,000 characters) did not go in part — the checkpoint is before it.
+    expect(s.t.requests[0]!.messages.map((m) => head(m.text))).toEqual(["짧은"]);
+    expect(s.checkpoint()).toBe(1);
+    // On its own it does not fit the cap at all: the run fails, nothing moves (never read in part).
+    expect(await s.run()).toMatchObject({ status: "failed", code: "too_large" });
+    expect(s.checkpoint()).toBe(1);
+    expect(s.t.requests).toHaveLength(1);
+  });
+
+  it("5. quote-heavy messages: their JSON escaping counts — the request really sent stays under the cap", async () => {
+    const q = await start({ config: { tokenCap: 30_000 } });
+    for (let i = 0; i < 12; i++) q.say(`기억: 따옴표 ${i} ${'"\\'.repeat(400)}`);
+    await q.run();
+    const sent = q.fake.turnLog.at(-1)!.input;
+    expect(utf8Bytes(q.fake.systemPrompts.at(-1)!) + utf8Bytes(sent) + 16_000).toBeLessThanOrEqual(30_000);
+    expect(q.t.requests[0]!.messages.length).toBeGreaterThan(0);
+    expect(q.t.requests[0]!.messages.every((m) => m.text.endsWith('"\\'))).toBe(true);
+    expect(q.checkpoint()).toBe(q.t.requests[0]!.messages.length);
+  });
+
+  it("3. a rejected change is not proposed again when its message comes back through the queue", async () => {
+    const s = await start();
+    s.say("기억: 둘을 만드는 메시지");
+    s.t.answer = (d) =>
+      JSON.stringify({
+        decisions: [
+          { action: "add", doc: "memory", text: "A 사실", sources: [d.messages[0]!.id] },
+          { action: "add", doc: "memory", text: "B 사실", sources: [d.messages[0]!.id] },
+        ],
+      });
+    await s.run();
+    const b = (await s.mine()).proposals[0]!;
+    await s.req("owner", "POST", `/api/memory-proposals/${b.id}/reject`, { indexes: [0] });
+    // A manual edit expires B: the shared source is queued again and the model proposes both again.
+    await s.writeMemory(["손으로"]);
+    const r = await s.run();
+    expect(s.t.requests).toHaveLength(2);
+    expect(r.counts.refused).toEqual({ rejected: 1 });
+    const again = (await s.mine()).proposals.find((p) => p.decisions.some((d) => d.status === "pending"))!;
+    expect(again.decisions.map((d) => [d.text, d.status])).toEqual([["B 사실", "pending"]]);
+  });
+
+  it("4. after a partial accept, a pending add that fits only with its bundle's merge is kept", async () => {
+    const s = await start();
+    const line = (k: string) => `${k} ${"word ".repeat(389)}`.trim(); // ~1,950 characters
+    await s.writeMemory([line("one"), line("two"), line("three"), line("four")]);
+    s.say("기억: 정리");
+    s.t.answer = (d) =>
+      JSON.stringify({
+        decisions: [
+          {
+            action: "merge",
+            items: ["memory-1", "memory-2"],
+            text: "하나와 둘",
+            sources: [d.messages[0]!.id],
+          },
+          { action: "add", doc: "memory", text: `새 ${"x".repeat(400)}`, sources: [d.messages[0]!.id] },
+          { action: "add", doc: "user", text: "표 위주로", sources: [d.messages[0]!.id] },
+        ],
+      });
+    // Merging 2 of 4 items: exactly 25% — passes.
+    expect(await s.run()).toMatchObject({ status: "proposed", counts: { proposed: 3 } });
+    const b = (await s.mine()).proposals[0]!;
+    expect((await s.accept(b.id, [2])).status).toBe(200);
+    const after = MemoryProposal.parse((await s.req("owner", "GET", `/api/memory-proposals/${b.id}`)).json());
+    expect(after.decisions.map((d) => d.status)).toEqual(["pending", "pending", "accepted"]);
+    expect((await s.accept(b.id, [0, 1])).status).toBe(200);
+    expect((await s.items("memory"))[0]).toBe("하나와 둘");
+  });
+
+  it("6. a start that fails after its session exists still has that session forgotten", async () => {
+    const s = await start();
+    s.say("기억: 시작 실패");
+    const forgotten: string[] = [];
+    const orphan = s.app.purge!.orphan.bind(s.app.purge!);
+    s.app.purge!.orphan = (ref) => {
+      forgotten.push(ref.externalSessionId);
+      orphan(ref);
+    };
+    s.fake.start = async (ctx) => {
+      ctx.sessionStarted?.("fake-half-open");
+      throw new Error("boom");
+    };
+    expect(await s.run()).toMatchObject({ status: "failed", code: "model_error" });
+    expect(forgotten).toEqual(["fake-half-open"]);
+  });
+
+  it("7. a failed run commits nothing: a stale bundle stays pending and nothing is queued until a run succeeds", async () => {
+    const s = await start();
+    s.t.answer = s.addEach;
+    s.say("기억: 실패해도 그대로");
+    await s.run();
+    await s.writeMemory(["손으로"]);
+    s.t.fail = "error";
+    expect((await s.run()).status).toBe("failed");
+    expect(s.sql.prepare("select status from memory_proposal_decisions").all()).toEqual([
+      { status: "pending" },
+    ]);
+    expect(s.d.store.queueSize(s.uid("owner"))).toBe(0);
+    // The next good run expires it and takes its source up again, in one go.
+    s.t.fail = null;
+    await s.run();
+    expect(
+      s.sql.prepare("select status from memory_proposal_decisions order by updated_at").all(),
+    ).toContainEqual({
+      status: "expired",
+    });
+    expect(s.t.requests.at(-1)!.messages.map((m) => m.text)).toEqual(["기억: 실패해도 그대로"]);
+    expect(s.d.store.queueSize(s.uid("owner"))).toBe(0);
   });
 });
