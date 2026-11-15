@@ -30,7 +30,7 @@ import {
 import { ASSIGNMENT_TABLE3_ROW2, FILE_SCENARIOS, REPORT_PAGE12 } from "../src/runtime/fake-files.js";
 import { readReferences, switchScenario, type ReadReferences } from "../src/runtime/fake-switch.js";
 import type { RunRow } from "../src/runtime/runs.js";
-import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
+import { recordedPrompt, replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn, type ReplayLog as CodexLog } from "./helpers/codex-replay.js";
 import { liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
@@ -72,9 +72,11 @@ const V2 = "# 회의 메모 v2\n- 관심 종목: 삼성전자\n- 목표가: 25�
 
 /** The calls and answer of a prompt, whichever runtime gets it; `$refs.*` from the session's start context. */
 function scriptFor(
-  prompt: string,
+  sent: string,
   refs: ReadReferences,
 ): { calls: { tool: string; input: unknown }[]; answer: string } {
+  // The typed prompt: a message sent with files carries their marker lines after it (#149).
+  const prompt = recordedPrompt(sent);
   if (prompt === "/file-compare") return FILE_SCENARIOS.compare;
   if (prompt === "/cite partial") return CITATION_SCENARIOS.partial;
   const art = /^\/artifact markdown (.+)\n([\s\S]+)$/.exec(prompt);

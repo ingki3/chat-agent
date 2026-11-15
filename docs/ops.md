@@ -447,7 +447,7 @@ rm ~/.agentlee/probe-headers.txt
 | `research` | 대화의 자료 조사 모드(`conversations.research_mode`)가 켜졌을 때. 여러 출처 비교, 부족하면 "출처가 충분하지 않아요", 사실 문장마다 검증된 `[n]`, 충돌은 출처별로 나란히(#25) |
 
 - 마지막에 오늘 날짜(Asia/Seoul)를 붙인다. 이름·이메일 같은 사용자 정보는 넣지 않는다.
-- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@3,youth@2`). #25에서 `common@2`·`research@2`로, 리뷰 #97 22차에서 `common@3`(숫자가 든 구절은 절째로 인용)으로 올렸다.
+- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@4,youth@2`). #25에서 `common@2`·`research@2`로, 리뷰 #97 22차에서 `common@3`(숫자가 든 구절은 절째로 인용)으로, #149에서 `common@4`(첨부가 있으면 그 파일부터 읽기)로 올렸다.
 - 런타임 세션은 시작할 때의 지침을 그대로 쓰므로, `runtime_sessions.instructions_hash`가 지금 조립한 지침과 같을 때만 이어 쓴다. 날짜가 바뀌거나, 모드·계정 표시·템플릿이 바뀌면 다음 실행은 새 세션으로 시작한다(대화 기록은 서버가 다시 넘긴다).
 
 ### 14.2 계정·모드 설정
@@ -457,7 +457,7 @@ rm ~/.agentlee/probe-headers.txt
 ### 14.3 지침 바꾸기
 1. 해당 `.md`의 본문을 고친다.
 2. 머리글의 `version:`을 1 올린다(내용이 바뀌면 항상). 머리글 형식(`---` / `id: <파일 이름>` / `version: <n>` / `---`)이 틀리면 서버가 시작하지 않는다.
-3. `pnpm -s vitest run apps/server/test/instructions.test.ts -u`로 스냅샷을 갱신하고, 바뀐 스냅샷과 버전 기대값(`common@3` 등 — `instructions.test.ts`, `citation-runs.test.ts`)을 PR에서 함께 검토한다.
+3. `pnpm -s vitest run apps/server/test/instructions.test.ts -u`로 스냅샷을 갱신하고, 바뀐 스냅샷과 버전 기대값(`common@4` 등 — `instructions.test.ts`, `citation-runs.test.ts`)을 PR에서 함께 검토한다.
 4. 금융·청소년 문구를 바꾸면 아래 평가(14.4, `docs/acceptance.md` §4·§5)를 다시 돌린다.
 
 ### 14.4 프롬프트 주입 평가 (`docs/acceptance.md` §4)
@@ -930,6 +930,8 @@ PRD FR-4.1·4.2·4.6. 방식과 근거는 `docs/decisions/isolation.md` "파일 
 - **지우기**: 대화를 지우면 그 대화의 행(외래 키 cascade)과 파일·빈 폴더가 함께 지워진다. 사용자 행이 지워지면(앱에는 사용자 삭제가 없다 — 비활성화만) 행은 cascade로 가고, 파일은 다음 시작의 정리가 지운다. 입력창 칩의 ✕는 아직 보내지 않은 파일을 서버에서도 지운다(올리는 중에 빼면 끝나는 즉시 지운다). 보내지 않은 파일은 새로고침해도 칩으로 다시 보인다. 보낸 메시지를 고쳐 다시 보내도 첨부는 그대로 따라간다.
 - **링크**: `files/` 아래의 사용자·대화 폴더가 심볼릭 링크면 서버는 그 안을 읽지도, 쓰지도, 지우지도 않는다(읽기 404, 업로드 500). 저장소 폴더를 다른 디스크로 옮기려면 링크가 아니라 `DATA_DIR` 전체를 옮긴다.
 - **시작할 때 정리**: 서버가 시작하면(열린 DB 파일이 데이터 폴더의 `agentlee.db` 그 자체일 때만 — 다른 DB로 가는 링크면 `file.sweep_skipped`를 남기고 건너뜀) 잠금 안에서 `uploads-tmp/`를 비우고, 행이 없는 저장소 파일을 지운다. 지우는 것은 서버가 붙이는 이름(`<사용자>/<대화>/<UUID>`)뿐이고 그 밖의 파일은 건드리지 않는다. 지운 수는 `file.swept`(개수만).
+
+- **런타임에게 첨부 알리기(#149)**: 사용자 메시지의 첨부(`file_ref`)는 이번 턴 입력과 대화 기록(새 세션의 `<earlier_conversation>`) 모두에서 글 뒤에 한 줄씩 `[첨부 파일: <이름> (file:<파일 id>)]`로 런타임에 간다 — 두 런타임 같은 꼴(`runtime/context.ts` `attachmentLines`). 이어 쓰는 세션은 새 세션 시작 맥락의 파일 목록을 받지 못하므로 이 줄이 없으면 "내용 요약해줘."가 앞 답을 요약했다. 이름은 데이터로만: 줄바꿈·제어·서식 문자는 공백, `[` `]` `<` `>`는 비슷한 전각 문자로 바꾸고, 120자에서 자르고, 알려진 비밀은 가린다. id는 서버 id 꼴일 때만 넣는다(파일 도구의 `fileId`). 답변이 만든 파일 칩(#49)은 첨부가 아니라 넣지 않는다. 맥락 토큰 추정(요약 판단)에도 들어간다 — 보낼 때(`begin`)는 아직 메시지가 없어 글만 세고, 실행이 진짜 입력으로 다시 판단한다. 공통 지침(`common@4`): 첨부가 있으면 대상을 말하지 않은 요청은 그 파일에 대한 것으로 보고 파일 도구로 먼저 읽는다. 시험: `context.test.ts`·`context-replay.test.ts`(두 런타임 녹화 재생, 이어 쓰는 세션 입력에 표시).
 
 ### 24.3 내려주기
 - `GET /api/files/:id/content` — 올린 사람만(관리자도 403, 로그인 전 401, 권한 행렬). 항상 `Content-Disposition: attachment`(ASCII 대체 이름 + RFC 5987 `filename*`, 아티팩트 내려받기와 같은 이름 정리), `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox; default-src 'none'; …`, `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`. MIME은 서버가 판별한 형식의 것이다(브라우저가 보낸 값은 쓰지 않음).

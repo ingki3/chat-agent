@@ -252,6 +252,23 @@ describe("context hand-over with both real runtimes' recorded protocols (#45)", 
       expect(t.check(r)).toMatchObject({ fresh: false, sessionId: a.sessionId, model: other });
     });
 
+    it(`${rt}: a resumed session is told of this message's files; a fresh one sees them in its history (#149)`, async () => {
+      const t = await start();
+      t.connect(rt);
+      const c = await t.newConversation();
+      if (rt === "codex") await t.chip(c, { runtime: "codex" });
+      const a = t.check(await t.send(c, "최근 뉴스 정리해줘"));
+      const fileId = await t.upload(c, "AI대학원 강의.pdf");
+      const marker = `[첨부 파일: AI대학원 강의.pdf (file:${fileId})]`;
+      const b = t.check(await t.send(c, "내용 요약해줘.", { fileIds: [fileId] }));
+      expect(b).toMatchObject({ fresh: false, sessionId: a.sessionId, input: `내용 요약해줘.\n\n${marker}` });
+      // A regenerate starts a fresh session: the message with the file is in its history, marker and all.
+      const r = await t.send(c, "이어서");
+      const g = t.check(await t.regenerate(c, r.assistantMessageId));
+      expect(g.fresh).toBe(true);
+      expect(g.before.map((e) => e.text)).toContain(`내용 요약해줘.\n\n${marker}`);
+    });
+
     it(`${rt}: resume after a summary — written with the cheap model, then the same session goes on`, async () => {
       const opts = { summaryRatio: 0.7, recentMessages: 2, reserveTokens: 0 };
       const t = await start({ window: 600, context: opts });
