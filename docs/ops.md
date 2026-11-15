@@ -85,7 +85,7 @@ pnpm build && pnpm start
 
 확인할 때마다 날짜와 결과를 적는다. 값(토큰·쿠키)은 적지 않는다.
 
-- [ ] 재부팅 후 사용자 로그인 전에 LaunchDaemon 서비스가 마스터 키를 읽고 시작하는지 — 5.4절 절차. (Access 설정 뒤 앱 데몬을 설치하고 확인)
+- [ ] 재부팅 후 사용자 로그인 전에 LaunchDaemon 서비스가 마스터 키를 읽고 시작하는지 — 5.4절 절차. (43.4절 이전 때 앱 데몬을 설치한 뒤 확인)
 - [ ] `cloudflared` 데몬이 재부팅 후 사용자 로그인 없이 연결되는지
 - [ ] `lsof -nP -iTCP:3000 -sTCP:LISTEN`이 `127.0.0.1:3000`만 표시하는지
 - [ ] 실제 도메인 SSE 3분 측정 통과 — 8절, 결과 JSON을 #8에 첨부
@@ -108,7 +108,7 @@ pmset -g | grep -E ' sleep|disksleep|autorestart'
 
 ### 5.2 앱 데몬 설치
 
-**Access 애플리케이션이 `chat.2prostream.com`을 보호하기 전에는 설치하지 않는다.** 설치하는 순간 앱이 터널을 통해 인터넷에 열린다. 그 전에는 배포 스크립트가 띄운 서버(`pnpm -s release restart`, 임시 접속 코드 7.1절 뒤)로만 쓴다.
+**전제: Access 애플리케이션이 `chat.2prostream.com`을 보호하고 있어야 한다**(설치하는 순간 앱이 터널을 통해 인터넷에 열린다). 2026-11-15에 Access를 켰고 `TEMP_GATE_CODE`는 운영 `.env`에서 지웠다 — 이 전제는 충족됐고, 운영 서버는 LaunchDaemon으로 자동 시작한다(사용자 승인).
 
 데몬은 **설치된 배포본에서** 설치한다(43절). 먼저 `pnpm -s release install`로 배포본이 있어야 한다.
 
@@ -162,9 +162,9 @@ pnpm -s release status
 - 데몬 로그: `/Library/Logs/com.cloudflare.cloudflared.err.log`.
 - 관리자 화면 시스템 상태의 터널 칸은 `cloudflared` 자체 메트릭 서버를 읽는다(20.5절). 설정하지 않으면 "미설정"이다.
 
-## 7. Cloudflare Access (마지막 단계 — 관리자)
+## 7. Cloudflare Access (관리자)
 
-앱 데몬 설치(5.2) 전에 반드시 한다.
+앱 데몬 설치(5.2)의 전제. **2026-11-15에 켰다**(`TEMP_GATE_CODE`는 운영 `.env`에서 지움). 아래는 다시 설정하거나 확인할 때의 절차다.
 
 1. Zero Trust → Access controls → Applications → Add an application → Self-hosted. 도메인 `chat.2prostream.com`(경로 비움 = 전체).
 2. 로그인 방식: **One-time PIN**(이메일 코드).
@@ -179,7 +179,7 @@ pnpm -s release status
 
 ### 7.1 임시 접속 코드 (Access 전 테스트용)
 
-Access를 설정하기 전에 실제 도메인으로 시험해야 할 때만 쓴다.
+Access를 설정하기 전에 실제 도메인으로 시험해야 할 때만 쓴다. **지금은 쓰지 않는다**(Access 켬, 2026-11-15) — 기록으로 남긴다.
 
 - `.env`에 `TEMP_GATE_CODE=<8자 이상>`을 넣으면 공개 도메인으로 온 모든 페이지·정적 파일·API가 `/gate` 코드 입력 화면 뒤로 간다(집 안 `localhost` 접속은 코드 없이 앱 로그인만). 코드는 `.env`에만 두고 저장소·메신저에 남기지 않는다.
 - 맞는 코드를 넣으면 7일짜리 서명 쿠키(HttpOnly, SameSite=Lax, https면 Secure)를 준다. 서버를 재시작하거나 코드를 바꾸면 모두 다시 입력해야 한다.
@@ -1943,14 +1943,14 @@ pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchD
    mkdir -p -m 700 ~/.chat-agent/shared
    mv <serve worktree>/.env ~/.chat-agent/shared/.env && chmod 600 ~/.chat-agent/shared/.env
    ```
-   편집기로 `DATA_DIR=/Users/<계정>/.chat-agent/data`, `BACKUP_DIR=/Users/<계정>/.chat-agent/backups`(둘 다 절대 경로)로 바꾸고, 개발용 값(`FAKE_RUNTIME` 등)이 있으면 지운다. `NODE_ENV`는 스크립트·데몬이 `production`으로 준다. Access 전이면 `TEMP_GATE_CODE`는 그대로(7.1절).
+   편집기로 `DATA_DIR=/Users/<계정>/.chat-agent/data`, `BACKUP_DIR=/Users/<계정>/.chat-agent/backups`(둘 다 절대 경로)로 바꾸고, 개발용 값(`FAKE_RUNTIME` 등)이 있으면 지운다. `NODE_ENV`는 스크립트·데몬이 `production`으로 준다. Access 값(`CF_ACCESS_TEAM_DOMAIN`·`CF_ACCESS_AUD`)은 그대로 두고, `TEMP_GATE_CODE`는 없어야 한다(Access를 켜면서 지움, 7.1절).
 3. **설치만** (DB가 아직 없으므로): 개발 체크아웃(최신 `main`)에서 `pnpm -s release install --no-start`. 사전 검사(설정·키)가 여기서 통과해야 한다.
 4. **데이터 복사**: `pnpm -s release migrate-data --from /Users/<계정>/Dev/chat-agent/data`
    - 서버가 멈춰 있어야 한다(두 폴더의 데이터 잠금을 복사 내내 잡는다 — 서버·복원이 잡고 있으면 `server_running`). 대상(`DATA_DIR`)이 비어 있지 않으면 거부, 옆에 끊긴 복원 일지가 있으면 거부.
    - `DATA_DIR` 옆 임시 폴더로 복사(macOS `ditto` — 모드·그룹·ACL 보존)하고, 원본과 항목마다(종류·모드·크기·링크 대상) 같은지, 복사본 DB의 `PRAGMA integrity_check`가 `ok`인지 확인한 뒤에야 제자리로 이름을 바꾼다. **원본은 건드리지 않는다.**
    - 복사본에서 런타임 세션을 모두 무효로 표시한다(43.5절) — 다음 턴은 서버 기록으로 새 세션을 시작한다.
-5. **시작·확인**: `pnpm -s release restart` → `healthy`. 로그인 → 대화·첨부·아티팩트가 보이는지, 설정 → 내 런타임 연결 → 테스트. 스킬: `cd ~/.chat-agent/current && pnpm skills:install`.
-6. **자동 시작**: Access 설정(7절) 뒤 `pnpm -s release stop` → `cd ~/.chat-agent/current && pnpm -s launchd install`(5.2절), 가동률 점검은 `pnpm -s launchd install-uptime`. 이후 업데이트는 `pnpm -s release install`(데몬이면 kickstart).
+5. **시작·확인** (데몬 설치 전 잠깐): `pnpm -s release restart` → `healthy`. 로그인 → 대화·첨부·아티팩트가 보이는지, 설정 → 내 런타임 연결 → 테스트. 스킬: `cd ~/.chat-agent/current && pnpm skills:install`.
+6. **자동 시작 (바로 이어서)**: 5의 확인이 끝나면 `pnpm -s release stop` → `cd ~/.chat-agent/current && pnpm -s launchd install`(5.2절 — Access 보호를 묻는 질문에 y; 전제는 충족됨) → `pnpm -s launchd status`, `pnpm -s release status`(service: LaunchDaemon, health ok). 가동률 점검은 `pnpm -s launchd install-uptime`(9.3절). 이후 업데이트는 `pnpm -s release install`(sudo 암호 — kickstart). 재부팅 확인은 5.4절.
 7. **정리**: 며칠 문제가 없으면 serve worktree를 지우고(`git worktree remove .claude/worktrees/serve`), 옛 데이터 폴더(`<repo>/data`)와 그 옆 잠금(`<repo>/.data.lock.*`)을 지운다. 옛 `BACKUP_DIR`(예 `~/agentlee-backups`)의 백업은 경로로도 복원할 수 있으니(`pnpm -s restore check <폴더>`) 7일 지나면 지우거나 새 `backups/`로 옮긴다.
 - 전용 계정(python·작업자)을 설치했다면 `/usr/local/etc/agentlee-python.conf`·`agentlee-worker.conf`의 `scratch=`를 새 `DATA_DIR` 기준 실제 경로로 고치고(sudo), scratch 폴더의 그룹·ACL(35.2절 5·6, 41.2절 7·8)과 `~/.chat-agent`의 search 항목을 확인한다. (2026-11-15 기준 이 Mac에는 설치돼 있지 않다.)
 
