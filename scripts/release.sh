@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Production releases of Agent Lee from git (#143). See docs/ops.md §43.
 #
-#   pnpm -s release install [--ref main] [--no-start] [--fresh] [--force]
+#   pnpm -s release install [--ref <branch|tag|sha|refs/…>] [--no-start] [--fresh] [--force]   (default refs/heads/main)
 #   pnpm -s release status
 #   pnpm -s release rollback [--to <release>]
 #   pnpm -s release prune [--keep 3]
@@ -11,7 +11,7 @@
 # Layout: $AGENTLEE_HOME (default ~/.chat-agent, 700) — src.git (mirror), releases/<UTC date>-<sha>/ (never changed
 # after install), current -> releases/…, shared/.env (600, linked into every release), data/, backups/, logs/, run/.
 # Overrides: AGENTLEE_HOME, AGENTLEE_SOURCE (git URL or path), AGENTLEE_NODE, AGENTLEE_HEALTH_TIMEOUT (seconds),
-# AGENTLEE_LAUNCHD_PLIST (the installed daemon; launchd mode when it exists).
+# AGENTLEE_LAUNCHD_PLIST (the installed daemon; launchd mode when it exists), AGENTLEE_LAUNCHCTL (tests).
 # Never prints .env contents, cookies or headers; never writes or changes any .env file.
 set -euo pipefail
 umask 077
@@ -138,7 +138,10 @@ new_migrations() {
   ' "$1" "$2"
 }
 
+LAUNCHCTL="${AGENTLEE_LAUNCHCTL:-launchctl}"   # tests: a stand-in for the read-only `print`
 launchd_mode() { [ -f "$PLIST" ]; }
+# Registered with launchd right now (`launchctl bootout` leaves the plist on disk). The data lock stays the final guard.
+daemon_loaded() { "$LAUNCHCTL" print "system/$LABEL" >/dev/null 2>&1; }
 
 port_open() {
   "$NODE" -e '
@@ -206,8 +209,13 @@ start_detached() {
 
 restart_server() {
   if launchd_mode; then
-    note "restarting the LaunchDaemon (sudo)"
-    sudo launchctl kickstart -k "system/$LABEL" || return 1
+    if daemon_loaded; then
+      note "restarting the LaunchDaemon (sudo)"
+      sudo launchctl kickstart -k "system/$LABEL" || return 1
+    else
+      note "starting the LaunchDaemon (sudo; it was not loaded)"
+      sudo launchctl bootstrap system "$PLIST" || return 1
+    fi
   else
     stop_ours || return 1
     start_detached
@@ -225,20 +233,44 @@ verify_live() {
   "$NODE" "$VERIFY" "${args[@]}"
 }
 
+# The backup that brings the data back to <to>'s schema: the pre-deploy backup taken when the first release after
+# <to> on <from>'s install chain was installed over it (<from>'s own backup has the schema of the release before
+# <from> — after A→B→C with migrations in B and C, C's backup has B's schema and A refuses it as schema_newer).
+# Checked with <to>'s own code (`restore check`) before it is suggested.
+restore_backup_for() { # restore_backup_for <from> <to> → prints "<release> <backup id>"
+  local r="$1" p hops=0
+  while [ -n "$r" ] && [ "$hops" -lt 100 ]; do
+    p="$(info_get "$ROOT/releases/$r" previous)"
+    if [ "$p" = "$2" ]; then echo "$r $(info_get "$ROOT/releases/$r" predeploy_backup)"; return 0; fi
+    [ -d "$ROOT/releases/$p" ] || return 0
+    r="$p"; hops=$((hops + 1))
+  done
+}
+
 warn_restore() { # warn_restore <from release> <to release>
-  local tags backup
+  local tags found over backup why
   tags="$(new_migrations "$ROOT/releases/$1" "$ROOT/releases/$2")"
   [ -n "$tags" ] || return 0
-  backup="$(info_get "$ROOT/releases/$1" predeploy_backup)"
   echo "release: WARNING — $1 added database migrations that $2 does not have:" >&2
   echo "$tags" | sed 's/^/release:   /' >&2
-  echo "release: if it started, the database has the newer schema. To return the data to the state before $1 was" >&2
-  echo "release: installed, restore the pre-deploy backup (docs/ops.md §21.4, §43.3) — writes since then are lost:" >&2
+  echo "release: if it started, the database has the newer schema. To return the data to $2's schema, restore the" >&2
+  echo "release: pre-deploy backup taken when $2 was last replaced (docs/ops.md §21.4, §43.3) — writes since then are lost." >&2
+  found="$(restore_backup_for "$1" "$2")"
+  over="${found%% *}"; backup="${found#* }"
+  [ "$backup" != "$found" ] || backup=""
   if [ -n "$backup" ]; then
-    echo "release:   stop the server, then: cd $ROOT/current && pnpm -s restore check $backup && pnpm -s restore apply $backup --yes" >&2
+    if why="$(app_node "$ROOT/releases/$2" apps/server/dist/cli/release.js check-backup "$backup" 2>&1 >/dev/null)"; then
+      echo "release:   backup $backup (taken before $over was installed over $2; $2 can restore it — checked)" >&2
+      echo "release:   stop the server, then: cd $ROOT/releases/$2 && pnpm -s restore check $backup && pnpm -s restore apply $backup --yes" >&2
+      return 0
+    fi
+    echo "release:   backup $backup (taken before $over was installed over $2) does not pass $2's restore check:" >&2
+    echo "$why" | sed 's/^/release:     /' >&2
   else
-    echo "release:   (no pre-deploy backup recorded for $1 — use the newest backup before its install time)" >&2
+    echo "release:   no pre-deploy backup found on $1's install chain back to $2 (pruned, or $2 was never replaced directly)." >&2
   fi
+  echo "release:   use a backup made while $2 (or an older release) was running; check it first:" >&2
+  echo "release:   cd $ROOT/releases/$2 && pnpm -s restore list && pnpm -s restore check <id>" >&2
 }
 
 prune_releases() { # prune_releases <keep>
@@ -252,10 +284,29 @@ prune_releases() { # prune_releases <keep>
   done
 }
 
+# A ref → a full ref name (or a commit id). Default: the branch refs/heads/main — never a tag that happens to be called
+# `main`. A bare name that is both a branch and a tag is refused (say refs/heads/… or refs/tags/…).
+resolve_ref() {
+  local ref="$1" g=(git -C "$ROOT/src.git") b t
+  if [ -z "$ref" ]; then echo refs/heads/main; return 0; fi
+  case "$ref" in refs/heads/*|refs/tags/*) echo "$ref"; return 0 ;; esac
+  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then echo "$ref"; return 0; fi
+  b=0; t=0
+  "${g[@]}" show-ref --verify --quiet "refs/heads/$ref" && b=1
+  "${g[@]}" show-ref --verify --quiet "refs/tags/$ref" && t=1
+  if [ "$b" = 1 ] && [ "$t" = 1 ]; then
+    echo "release: ref $ref is both a branch and a tag — say refs/heads/$ref or refs/tags/$ref" >&2; return 1
+  fi
+  if [ "$b" = 1 ]; then echo "refs/heads/$ref"; return 0; fi
+  if [ "$t" = 1 ]; then echo "refs/tags/$ref"; return 0; fi
+  if [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then echo "$ref"; return 0; fi
+  echo "release: unknown ref: $ref" >&2; return 1
+}
+
 # ---- commands ----
 
 cmd_install() {
-  local ref=main start=1 fresh=0 force=0
+  local ref="" start=1 fresh=0 force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --ref) [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
@@ -265,7 +316,8 @@ cmd_install() {
       *) die "unknown option: $1" ;;
     esac
   done
-  [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid ref"
+  [ -z "$ref" ] || [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid ref"
+  case "$ref" in *..*|*//*|*/) die "invalid ref" ;; esac
   ensure_root
   take_lock
   check_env_file
@@ -280,6 +332,7 @@ cmd_install() {
   git -C "$ROOT/src.git" fetch --quiet --prune "$SOURCE" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' \
     || die "could not fetch the source"
   local sha
+  ref="$(resolve_ref "$ref")" || exit 1
   sha="$(git -C "$ROOT/src.git" rev-parse --verify --quiet "$ref^{commit}")" || die "unknown ref: $ref"
   local prev; prev="$(current_name)"
   if [ -n "$prev" ] && [ "$(info_get "$ROOT/releases/$prev" sha)" = "$sha" ] && [ "$force" = 0 ]; then
@@ -367,7 +420,10 @@ cmd_install() {
     warn_restore "$name" "$prev"
     exit 1
   fi
-  die "rollback to $prev failed its checks too — the server needs attention (logs: $ROOT/logs/)"
+  echo "release: rollback to $prev failed its checks too — the server needs attention (logs: $ROOT/logs/)" >&2
+  # The data may already have the failed release's schema: say how to get back, whatever else went wrong.
+  warn_restore "$name" "$prev"
+  exit 1
 }
 
 post_install_notes() {
@@ -493,7 +549,7 @@ cmd_migrate_data() {
   check_env_file
   [ -n "$(current_name)" ] || die "no current release — run: install --no-start (docs/ops.md §43.4)"
   read_config "$ROOT/current" || die "configuration check failed"
-  if launchd_mode; then die "stop the LaunchDaemon first: sudo launchctl bootout system/$LABEL"; fi
+  if launchd_mode && daemon_loaded; then die "stop the LaunchDaemon first: sudo launchctl bootout system/$LABEL"; fi
   [ -z "$(server_pid)" ] || die "the server is running — stop it first: pnpm -s release stop"
   local out
   out="$(app_node "$ROOT/current" apps/server/dist/cli/release.js migrate-data --from "$from")" || die "data move failed — the original is untouched"

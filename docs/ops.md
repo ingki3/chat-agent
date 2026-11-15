@@ -1897,18 +1897,18 @@ TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.t
 
 ### 43.2 설치·업데이트 (`install`)
 ```bash
-pnpm -s release install                 # main 최신 커밋
-pnpm -s release install --ref <태그|커밋>  # 특정 커밋 (예: 되돌림 대신 고친 커밋)
+pnpm -s release install                 # 브랜치 main 최신 커밋 (refs/heads/main — 이름이 main인 태그가 아님)
+pnpm -s release install --ref <브랜치|태그|커밋|refs/…>   # 브랜치와 태그가 같은 이름이면 거부 → refs/heads/… 또는 refs/tags/…
 ```
 순서 — 하나라도 실패하면 그 자리에서 멈추고(새 폴더는 지움) `current`는 그대로다:
 1. 잠금 → `shared/.env` 확인(있음·일반 파일·내 소유·600). LaunchDaemon이 설치돼 있으면 plist가 `~/.chat-agent/current`를 돌리는지 확인(아니면 5.2절대로 다시 설치하라고 멈춤).
-2. 미러 fetch → `--ref`(기본 `main`)를 커밋으로 확인. 이미 `current`가 같은 커밋이면 끝(`--force`로 다시 설치).
+2. 미러 fetch → `--ref`(기본 `refs/heads/main`)를 전체 ref 이름으로 정해(같은 이름의 브랜치·태그가 둘 다 있으면 거부) 커밋으로 확인. 이미 `current`가 같은 커밋이면 끝(`--force`로 다시 설치).
 3. `releases/<UTC 날짜>-<sha>/`에 `git archive`를 풀고 `.release-info`(sha·ref·시각·직전 배포본)를 적는다.
 4. `pnpm install --frozen-lockfile --prefer-offline`(lock 그대로, 저장소에 있는 패키지 먼저) → `pnpm build`. 빌드 결과(`apps/server/dist`, `apps/web/dist/index.html`, 릴리스 도구)가 있는지 확인.
 5. `.env` 링크(`../../shared/.env`)를 만든다.
 6. **운영 설정 사전 검사** — LaunchDaemon 설치의 검사(`launchd-helper.mjs check`: 설정 로드 + 마스터 키 존재·32바이트·600·링크 아님·안전한 부모)를 데몬과 같은 환경(`env -i`, `NODE_ENV=production`, 서비스 계정)으로 새 배포본에서 돌리고, 이어 `DATA_DIR`·`BACKUP_DIR`이 `shared/.env`에 **절대 경로로** 있고 `releases/` 밖인지 본다(`dist/cli/release.js config`).
 7. DB가 없으면 시작하지 않는다(`--no-start`로 설치만, 또는 `--fresh`로 빈 DB에서 시작) — 이전(43.4절)을 빼먹고 빈 데이터로 뜨는 것을 막는다.
-8. **배포 직전 백업 + 무결성** — 서버가 도는 중에도 안전하다: 운영 DB를 **읽기 전용**으로 열어 `VACUUM INTO`(한 읽기 트랜잭션 = 한 시점)로 스냅샷하고 파일 저장소를 복사한 21절 형식의 백업을 `BACKUP_DIR` 안 비공개 임시 폴더에서 만든 뒤 이름을 바꿔 넣는다. 이어 `pnpm -s restore check`와 같은 검사(키·해시·`integrity_check`·스키마·모든 암호문 복호화)를 **새 배포본의 마이그레이션 목록**으로 한다 — DB가 새 배포본보다 새 스키마면(`schema_newer`, 옛 커밋을 설치하려는 경우) 멈춘다. id를 `.release-info`의 `predeploy_backup=`에 적는다.
+8. **배포 직전 백업 + 무결성** — 서버가 도는 중에도 안전하다: 운영 DB를 **읽기 전용**으로 열어 `VACUUM INTO`(한 읽기 트랜잭션 = 한 시점)로 먼저 비공개 스냅샷을 만들고, **그 스냅샷에서** 복사할 파일 목록(`FILE_REFERENCES`)과 뺄 폴더(삭제 작업)를 읽어 파일 저장소를 복사한 21절 형식의 백업을 — 운영 DB에서 읽으면 그 사이 서버가 지운 첨부가 빠진 채 통과할 수 있다(스냅샷이 가리키는 파일이 없으면 실패) — `BACKUP_DIR` 안 비공개 임시 폴더에서 만든 뒤 이름을 바꿔 넣는다. 이어 `pnpm -s restore check`와 같은 검사(키·해시·`integrity_check`·스키마·모든 암호문 복호화)를 **새 배포본의 마이그레이션 목록**으로 한다 — DB가 새 배포본보다 새 스키마면(`schema_newer`, 옛 커밋을 설치하려는 경우) 멈춘다. id를 `.release-info`의 `predeploy_backup=`에 적는다.
 9. 새 배포본에 직전 배포본에 없던 마이그레이션(drizzle `_journal.json`의 태그)이 있으면 알린다 — 서버가 시작할 때 적용된다.
 10. (LaunchDaemon이 아니면) 포트에 **이 설치의 서버가 아닌** 프로세스가 있으면 멈춘다 — 다른 서버를 죽이지 않는다.
 11. `current`를 원자적으로 바꾼다(새 링크를 만들어 `rename`).
@@ -1925,10 +1925,11 @@ pnpm -s release rollback --to <배포본>
 pnpm -s release prune [--keep 3]        # current + 최신 정상 배포본 (keep-1)개만 남김, 실패·미완성은 지움
 pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchDaemon이면 stop 대신 launchctl bootout)
 ```
-- 되돌림은 코드만 바꾼다. **떠나는 배포본이 마이그레이션을 더했으면** 경고한다: DB는 이미 새 스키마일 수 있고(옛 코드도 대개 뜨지만 보장하지 않는다), 그 배포본 설치 직전 상태로 데이터를 돌리려면 배포 직전 백업을 복원해야 한다 — 그 뒤에 쓴 내용은 잃는다. 경고가 찍는 명령:
+- 되돌림은 코드만 바꾼다. **떠나는 배포본이 마이그레이션을 더했으면** 경고한다(자동 복귀가 실패해도 찍는다): DB는 이미 새 스키마일 수 있고(옛 코드도 대개 뜨지만 보장하지 않는다), 대상 배포본의 스키마로 데이터를 돌리려면 배포 직전 백업을 복원해야 한다 — 그 뒤에 쓴 내용은 잃는다.
+- **어느 백업인가**: 떠나는 배포본에서 `previous`를 따라가 대상 바로 다음에 설치된 배포본의 배포 직전 백업(대상이 돌던 때의 데이터)이다. A→B→C(B·C 모두 마이그레이션)에서 C→A로 가면 C의 백업은 B 스키마라 A가 `schema_newer`로 거부하므로 B의 백업을 고른다. 고른 백업은 **대상 배포본의 코드로** `restore check`와 같은 검사(`release.js check-backup`)를 통과해야 제안된다. 못 찾거나 통과하지 않으면 그렇다고 쓰고 `restore list`·`check`로 대상이 돌던 때의 백업을 고르라고 안내한다. 경고가 찍는 명령:
   ```bash
   sudo launchctl bootout system/com.agentlee.server     # 또는: pnpm -s release stop
-  cd ~/.chat-agent/current
+  cd ~/.chat-agent/releases/<대상 배포본>          # 되돌린 뒤라면 = current
   pnpm -s restore check <predeploy id>
   pnpm -s restore apply <predeploy id> --yes            # 기존 데이터는 <DATA_DIR>.before-restore-*로 옮겨 둠 (21.4절)
   sudo launchctl bootstrap system /Library/LaunchDaemons/com.agentlee.server.plist   # 또는: pnpm -s release restart
@@ -1946,7 +1947,7 @@ pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchD
    편집기로 `DATA_DIR=/Users/<계정>/.chat-agent/data`, `BACKUP_DIR=/Users/<계정>/.chat-agent/backups`(둘 다 절대 경로)로 바꾸고, 개발용 값(`FAKE_RUNTIME` 등)이 있으면 지운다. `NODE_ENV`는 스크립트·데몬이 `production`으로 준다. Access 값(`CF_ACCESS_TEAM_DOMAIN`·`CF_ACCESS_AUD`)은 그대로 두고, `TEMP_GATE_CODE`는 없어야 한다(Access를 켜면서 지움, 7.1절).
 3. **설치만** (DB가 아직 없으므로): 개발 체크아웃(최신 `main`)에서 `pnpm -s release install --no-start`. 사전 검사(설정·키)가 여기서 통과해야 한다.
 4. **데이터 복사**: `pnpm -s release migrate-data --from /Users/<계정>/Dev/chat-agent/data`
-   - 서버가 멈춰 있어야 한다(두 폴더의 데이터 잠금을 복사 내내 잡는다 — 서버·복원이 잡고 있으면 `server_running`). 대상(`DATA_DIR`)이 비어 있지 않으면 거부, 옆에 끊긴 복원 일지가 있으면 거부.
+   - 서버가 멈춰 있어야 한다(두 폴더의 데이터 잠금을 복사 내내 잡는다 — 서버·복원이 잡고 있으면 `server_running`). LaunchDaemon은 plist가 있어도 `launchctl print`로 **등록돼 있을 때만** 거부한다(`bootout` 뒤에는 진행 — 최종 판단은 데이터 잠금). `agentlee.db`(와 `-wal`·`-shm`·`-journal`)가 심볼릭 링크면 거부한다(복사본을 쓰기로 열 때 원본을 바꾸지 않게). 대상(`DATA_DIR`)이 비어 있지 않으면 거부, 옆에 끊긴 복원 일지가 있으면 거부.
    - `DATA_DIR` 옆 임시 폴더로 복사(macOS `ditto` — 모드·그룹·ACL 보존)하고, 원본과 항목마다(종류·모드·크기·링크 대상) 같은지, 복사본 DB의 `PRAGMA integrity_check`가 `ok`인지 확인한 뒤에야 제자리로 이름을 바꾼다. **원본은 건드리지 않는다.**
    - 복사본에서 런타임 세션을 모두 무효로 표시한다(43.5절) — 다음 턴은 서버 기록으로 새 세션을 시작한다.
 5. **시작·확인** (데몬 설치 전 잠깐): `pnpm -s release restart` → `healthy`. 로그인 → 대화·첨부·아티팩트가 보이는지, 설정 → 내 런타임 연결 → 테스트. 스킬: `cd ~/.chat-agent/current && pnpm skills:install`.
@@ -1970,4 +1971,5 @@ pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchD
 ### 43.7 시험
 - `scripts/test/release.test.ts` — 임시 `AGENTLEE_HOME`, 로컬 bare 저장소를 소스로, 빈 포트, launchd 없음(`AGENTLEE_LAUNCHD_PLIST`가 없는 파일). 작은 고정 앱(HTTP 서버·릴리스 도구·사전 검사의 대역)으로 스크립트 자체의 모든 경로를 실제로 돈다: 설치(링크·REPO_ROOT가 실제 배포본·health·자산 형식), 같은 커밋 재설치 생략, 업데이트(작업 폴더의 미커밋 변경 무시), health 실패와 **자산이 text/html로 오는 경우**의 자동 복귀, 수동 되돌림·`--to`, 마이그레이션이 든 배포의 되돌림 경고(배포 직전 백업 id·복원 명령), prune, 잠금(다른 명령이 잡고 있으면 거부), `shared/.env` 미변경(모드·mtime·해시)과 비밀 값 미출력, 느슨한 권한·없는 `.env` 거부, 빈 데이터 시작 거부 → `--no-start` → `migrate-data` → `restart`, 남의 포트 리스너를 죽이지 않음. Linux CI에서도 돈다(macOS 전용인 `ditto`·`launchctl`은 이 시험에 들어가지 않는다).
 - `apps/server/test/release.test.ts` — 실제 도구: 설정 검사(없음·상대 경로·`releases/` 안·`.env` 링크 없음 거부), 배포 직전 백업(서버 잠금과 열린 쓰기 트랜잭션이 있는 DB에서 커밋된 내용만, 운영 DB 파일 무변경, `restore check` 통과, 임시 폴더 안 남김, 새 스키마 DB는 `schema_newer`), 데이터 이전(모드·링크 보존, 원본 그대로, 세션 무효화, 잠금·비지 않은 대상·상대 경로·서로 포함 거부).
+- 리뷰 #148 1차 회귀 시험: 스냅샷 뒤 서버가 첨부 행·파일을 지워도 백업이 스냅샷 기준(행만 지움 → 파일 포함, 행·파일 지움 → `backup_failed`), 링크인 DB·`-wal`은 이전 거부(원본 바이트 그대로), 자동 복귀까지 실패해도 복원 안내, A→B→C에서 A로 되돌릴 때 B의 백업(검사 통과)을 제안, 같은 이름 태그 `main`이 있어도 브랜치 배포·모호한 `--ref` 거부, plist가 있어도 데몬이 내려가 있으면 이전 진행.
 - 실제 앱으로 한 번(개발 Mac, 2026-11-15): 임시 HOME·로컬 bare 저장소·포트 3917·`FAKE_RUNTIME`으로 `install --no-start` → `migrate-data` → `restart` → `install --force`(서버가 도는 중 배포 직전 백업, `restore check` ok) → `rollback` → `prune` → `stop`. 결과는 #143 PR에 있다.

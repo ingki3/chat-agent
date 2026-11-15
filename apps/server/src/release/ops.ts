@@ -92,15 +92,29 @@ export async function predeployBackup(o: {
   backupDir: string;
   masterKey: Buffer;
   now?: () => number;
+  /** Tests: runs right after the live database was snapshotted (the server may write or purge meanwhile). */
+  afterSnapshot?: () => void;
 }): Promise<PredeployResult | undefined> {
   const dbFile = storagePaths(o.dataDir).db;
   if (!fs.existsSync(dbFile)) return undefined;
   ensureBackupDir(o.backupDir);
   const staging = path.join(o.backupDir, `.predeploy-${crypto.randomBytes(4).toString("hex")}`);
+  let live: Database.Database | undefined;
   let sqlite: Database.Database | undefined;
   try {
-    sqlite = new Database(dbFile, { readonly: true, fileMustExist: true });
-    sqlite.pragma("busy_timeout = 5000");
+    // First a private snapshot of the live database (one read transaction), then the backup is made from THAT
+    // snapshot: the files it must contain and the deleted folders it must leave out are read from the same moment
+    // as the rows. Reading them from the live database (another process — our FileWriteLock does not stop the
+    // server) could miss a file whose row the snapshot still has, if the server purged it in between (#148 review).
+    fs.mkdirSync(staging, { mode: 0o700 });
+    const snapFile = path.join(staging, "live-snapshot.db");
+    live = new Database(dbFile, { readonly: true, fileMustExist: true });
+    live.pragma("busy_timeout = 5000");
+    live.prepare("VACUUM INTO ?").run(snapFile);
+    live.close();
+    live = undefined;
+    o.afterSnapshot?.();
+    sqlite = new Database(snapFile, { readonly: true, fileMustExist: true });
     const info = await createBackup({
       sqlite,
       dataDir: o.dataDir,
@@ -119,8 +133,25 @@ export async function predeployBackup(o: {
     if (e instanceof BackupError) throw new ReleaseError(e.code, `pre-deploy backup failed: ${e.code}`);
     throw new ReleaseError("backup_failed", "pre-deploy backup failed: backup_failed");
   } finally {
+    live?.close();
     sqlite?.close();
     fs.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+const lstatOrUndefined = (f: string) => fs.lstatSync(f, { throwIfNoEntry: false });
+
+/**
+ * Whether backup `id` in BACKUP_DIR can be restored by THIS release (`pnpm -s restore check`: key, hashes,
+ * integrity, schema not newer than this release's migrations, secrets). The rollback hint picks its backup with it.
+ */
+export function checkBackup(backupDir: string, id: string, masterKey: Buffer): { pending: number } {
+  if (!/^[0-9A-Za-z-]{1,64}$/.test(id)) throw new ReleaseError("usage", "invalid backup id");
+  try {
+    return { pending: verifyBackup(path.join(backupDir, id), masterKey).pending };
+  } catch (e) {
+    if (e instanceof RestoreError) throw new ReleaseError(e.code, `backup ${id}: ${e.code}`);
+    throw e;
   }
 }
 
@@ -174,6 +205,16 @@ export function migrateData(o: { from: string; to: string }): MigrateResult {
     throw new ReleaseError("target_unsafe", "DATA_DIR and --from must not contain each other");
   if (!fs.existsSync(storagePaths(from).db))
     throw new ReleaseError("from_not_found", "--from has no agentlee.db — not a data folder");
+  // The copy's database is opened read-write (session invalidation): a link would be kept as a link and write
+  // through to the original (#148 review). The database and its side files must be plain files.
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    const f = lstatOrUndefined(storagePaths(from).db + suffix);
+    if (f && !f.isFile())
+      throw new ReleaseError(
+        "db_not_plain",
+        `agentlee.db${suffix} in --from is not a plain file (a link?) — nothing copied`,
+      );
+  }
   if (fs.existsSync(restoreJournalPath(from)))
     throw new ReleaseError(
       "restore_pending",
@@ -227,6 +268,10 @@ function copyData(from: string, to: string, targetExists: boolean): MigrateResul
     }
     if (b.size !== a.size) throw new ReleaseError("copy_mismatch", "copy has entries the original does not");
 
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      const f = lstatOrUndefined(storagePaths(staging).db + suffix);
+      if (f && !f.isFile()) throw new ReleaseError("db_not_plain", "the copied database is not a plain file");
+    }
     const db = new Database(storagePaths(staging).db, { fileMustExist: true });
     let sessionsInvalidated = 0;
     try {

@@ -1,7 +1,7 @@
 import "../env.js";
 import { loadConfig, REPO_ROOT } from "../config.js";
 import { loadMasterKey } from "../crypto/secrets.js";
-import { migrateData, predeployBackup, ReleaseError, releaseSummary } from "../release/ops.js";
+import { checkBackup, migrateData, predeployBackup, ReleaseError, releaseSummary } from "../release/ops.js";
 
 /**
  * Release helper (#143, docs/ops.md §43), run by `scripts/release.sh` from an installed release
@@ -11,6 +11,7 @@ import { migrateData, predeployBackup, ReleaseError, releaseSummary } from "../r
  *
  *   config                     what the production configuration resolves to (port, DATA_DIR, BACKUP_DIR, …)
  *   backup                     the pre-deploy backup (server may run): `backup_id=` or `database=absent`
+ *   check-backup <id>          whether this release can restore that backup (`compatible=ok`, else exit 1)
  *   migrate-data --from <dir>  one-time copy of an old data folder to DATA_DIR (server stopped)
  */
 function fail(e: unknown): never {
@@ -51,6 +52,9 @@ try {
           "integrity=ok",
         ].join("\n"),
       );
+  } else if (command === "check-backup" && rest[0] && rest.length === 1) {
+    const r = checkBackup(summary.backupDir, rest[0], loadMasterKey(config.masterKeyPath));
+    console.log([`backup_id=${rest[0]}`, `pending_migrations=${r.pending}`, "compatible=ok"].join("\n"));
   } else if (command === "migrate-data" && rest[0] === "--from" && rest[1] && rest.length === 2) {
     const r = migrateData({ from: rest[1], to: summary.dataDir });
     console.log(
@@ -64,7 +68,7 @@ try {
       ].join("\n"),
     );
   } else {
-    console.error("usage: release.js config | backup | migrate-data --from <dir>");
+    console.error("usage: release.js config | backup | check-backup <id> | migrate-data --from <dir>");
     process.exit(2);
   }
 } catch (e) {

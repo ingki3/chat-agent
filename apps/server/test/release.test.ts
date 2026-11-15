@@ -4,12 +4,19 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { listBackups } from "../src/backup/backup.js";
+import { createBackup, listBackups } from "../src/backup/backup.js";
+import { FileWriteLock } from "../src/backup/lock.js";
 import { verifyBackup } from "../src/backup/restore.js";
 import { loadConfig } from "../src/config.js";
 import { createMasterKey } from "../src/crypto/secrets.js";
 import { openDb, runMigrations } from "../src/db/client.js";
-import { migrateData, predeployBackup, ReleaseError, releaseSummary } from "../src/release/ops.js";
+import {
+  checkBackup,
+  migrateData,
+  predeployBackup,
+  ReleaseError,
+  releaseSummary,
+} from "../src/release/ops.js";
 import { acquireDataLock } from "../src/storage/data-lock.js";
 import { ensureLayout } from "../src/storage/paths.js";
 
@@ -28,6 +35,19 @@ function tmp(): string {
 
 const sha = (f: string) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 
+/** A row with only the required columns (placeholder values; foreign keys off) plus `fixed`. */
+function insertRow(sqlite: Database.Database, table: string, fixed: Record<string, string | number>) {
+  const cols = sqlite
+    .prepare(`SELECT name, "notnull" AS nn, dflt_value AS d FROM pragma_table_info('${table}')`)
+    .all() as { name: string; nn: number; d: string | null }[];
+  const names = [
+    ...new Set([...cols.filter((c) => c.nn && c.d === null).map((c) => c.name), ...Object.keys(fixed)]),
+  ];
+  sqlite
+    .prepare(`INSERT INTO ${table} (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`)
+    .run(...names.map((n) => fixed[n] ?? `x-${n}`));
+}
+
 /** A data folder with a migrated database, one upload file and two runtime sessions. */
 function dataFolder(root: string) {
   const dataDir = path.join(root, "data");
@@ -36,22 +56,7 @@ function dataFolder(root: string) {
   runMigrations(db);
   const sqlite = db.$client;
   sqlite.pragma("foreign_keys = OFF");
-  const cols = sqlite
-    .prepare("SELECT name, \"notnull\" AS nn, dflt_value AS d FROM pragma_table_info('runtime_sessions')")
-    .all() as {
-    name: string;
-    nn: number;
-    d: string | null;
-  }[];
-  const required = cols.filter((c) => c.nn && c.d === null);
-  for (const id of ["s1", "s2"]) {
-    const values = required.map((c) => (c.name === "id" ? id : `x-${c.name}`));
-    sqlite
-      .prepare(
-        `INSERT INTO runtime_sessions (${required.map((c) => c.name).join(",")}) VALUES (${required.map(() => "?").join(",")})`,
-      )
-      .run(...values);
-  }
+  for (const id of ["s1", "s2"]) insertRow(sqlite, "runtime_sessions", { id });
   sqlite.prepare("CREATE TABLE IF NOT EXISTS release_probe (v TEXT)").run();
   sqlite.prepare("INSERT INTO release_probe VALUES ('committed')").run();
   return { dataDir, paths, db };
@@ -133,6 +138,77 @@ describe("predeployBackup", () => {
     db.$client.close();
   });
 
+  it("takes the files to copy from the snapshot, not the live database (#148 review P1)", async () => {
+    const root = tmp();
+    const { dataDir, paths, db } = dataFolder(root);
+    const key = createMasterKey(path.join(root, "key", "master.key"));
+    const backupDir = path.join(root, "backups");
+    const upload = (id: string) => {
+      insertRow(db.$client, "files", { id, user_id: "u1", conversation_id: "c1" });
+      fs.mkdirSync(path.join(paths.files, "u1", "c1"), { recursive: true });
+      fs.writeFileSync(path.join(paths.files, "u1", "c1", id), `body ${id}`);
+    };
+    upload("f1");
+    // The server deletes the row right after the snapshot (file still there): the backup still carries the file
+    // its database references.
+    const r = await predeployBackup({
+      dataDir,
+      backupDir,
+      masterKey: key,
+      afterSnapshot: () => db.$client.prepare("DELETE FROM files WHERE id = 'f1'").run(),
+    });
+    expect(fs.readFileSync(path.join(r!.dir, "files", "u1", "c1", "f1"), "utf8")).toBe("body f1");
+    const snap = new Database(path.join(r!.dir, "agentlee.db"), { readonly: true });
+    expect(snap.prepare("SELECT id FROM files").all()).toEqual([{ id: "f1" }]);
+    snap.close();
+
+    // Purged in between (row and file gone): a backup whose database references a missing file is refused, never
+    // saved as a valid one.
+    upload("f2");
+    const err = await predeployBackup({
+      dataDir,
+      backupDir,
+      masterKey: key,
+      afterSnapshot: () => {
+        db.$client.prepare("DELETE FROM files WHERE id = 'f2'").run();
+        fs.rmSync(path.join(paths.files, "u1", "c1", "f2"));
+      },
+    }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "backup_failed" });
+    expect(listBackups(backupDir).map((b) => b.id)).toEqual([r!.id]);
+    expect(fs.readdirSync(backupDir).filter((n) => n.startsWith("."))).toEqual([]);
+    db.$client.close();
+  });
+
+  it("checks whether a release can restore a backup (rollback hint, #148 review P2)", async () => {
+    const root = tmp();
+    const { dataDir, db } = dataFolder(root);
+    const key = createMasterKey(path.join(root, "key", "master.key"));
+    const backupDir = path.join(root, "backups");
+    const ok = await predeployBackup({ dataDir, backupDir, masterKey: key });
+    expect(checkBackup(backupDir, ok!.id, key)).toEqual({ pending: 0 });
+    db.$client
+      .prepare("INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('future', ?)")
+      .run(Date.now() + 1e9);
+    // A backup with a migration this code does not know — what the target of a multi-step rollback refuses.
+    const newer = await createBackup({
+      sqlite: db.$client,
+      dataDir,
+      backupDir,
+      masterKey: key,
+      lock: new FileWriteLock(),
+      now: () => Date.now() + 2000,
+    });
+    db.$client.close();
+    expect(() => checkBackup(backupDir, newer.id, key)).toThrow(
+      expect.objectContaining({ code: "schema_newer" }),
+    );
+    expect(() => checkBackup(backupDir, "../x", key)).toThrow(expect.objectContaining({ code: "usage" }));
+    expect(() => checkBackup(backupDir, "20261115-000000Z-000000", key)).toThrow(
+      expect.objectContaining({ code: "backup_not_found" }),
+    );
+  });
+
   it("is a no-op without a database and stops on a database newer than the release", async () => {
     const root = tmp();
     const key = createMasterKey(path.join(root, "key", "master.key"));
@@ -209,6 +285,25 @@ describe("migrateData", () => {
     expect(db.prepare("SELECT v FROM release_probe").all()).toEqual([{ v: "committed" }]);
     db.close();
     expect(fs.readdirSync(path.dirname(to)).filter((n) => n.includes("migrating"))).toEqual([]);
+  });
+
+  it("refuses a database that is a link, leaving the original byte for byte (#148 review P2)", () => {
+    const root = tmp();
+    const from = oldData(root);
+    const elsewhere = path.join(root, "elsewhere");
+    fs.mkdirSync(elsewhere);
+    fs.renameSync(path.join(from, "agentlee.db"), path.join(elsewhere, "agentlee.db"));
+    fs.symlinkSync(path.join(elsewhere, "agentlee.db"), path.join(from, "agentlee.db"));
+    const before = sha(path.join(elsewhere, "agentlee.db"));
+    const to = path.join(root, "home", "data");
+    expect(() => migrateData({ from, to })).toThrow(expect.objectContaining({ code: "db_not_plain" }));
+    expect(sha(path.join(elsewhere, "agentlee.db"))).toBe(before);
+    expect(fs.existsSync(to)).toBe(false);
+    // A link as a side file too.
+    fs.rmSync(path.join(from, "agentlee.db"));
+    fs.renameSync(path.join(elsewhere, "agentlee.db"), path.join(from, "agentlee.db"));
+    fs.symlinkSync(path.join(elsewhere, "x"), path.join(from, "agentlee.db-wal"));
+    expect(() => migrateData({ from, to })).toThrow(expect.objectContaining({ code: "db_not_plain" }));
   });
 
   it("refuses while a server holds the old folder, into a non-empty target, or a relative path", () => {

@@ -91,9 +91,14 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 const e = {}; for (const l of fs.readFileSync(path.join(rootDir, ".env"), "utf8").split("\\n")) { const i = l.indexOf("="); if (i > 0) e[l.slice(0, i)] = l.slice(i + 1); }
 const mode = fs.readFileSync(path.join(rootDir, "mode.txt"), "utf8").trim();
 const web = path.join(rootDir, "apps/web/dist");
+// "Migrations": the database keeps the highest journal length any release started on it (like drizzle's table).
+const tags = JSON.parse(fs.readFileSync(path.join(rootDir, "apps/server/drizzle/meta/_journal.json"), "utf8")).entries.length;
+const schemaFile = path.join(e.DATA_DIR, "schema.txt");
+const had = fs.existsSync(schemaFile) ? Number(fs.readFileSync(schemaFile, "utf8")) : 0;
+fs.writeFileSync(schemaFile, String(Math.max(had, tags)));
 http.createServer((req, res) => {
   if (req.url === "/api/health") {
-    if (mode === "health-fail") { res.writeHead(503); return res.end("{}"); }
+    if (mode === "health-fail" || fs.existsSync(path.join(e.DATA_DIR, "fail-health"))) { res.writeHead(503); return res.end("{}"); }
     res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ status: "ok", root: rootDir }));
   }
   const f = req.url.startsWith("/assets/") ? path.join(web, req.url) : path.join(web, "index.html");
@@ -117,7 +122,16 @@ if (cmd === "config") {
   const id = "20261115-000000Z-" + crypto.randomBytes(3).toString("hex");
   fs.mkdirSync(path.join(e.BACKUP_DIR, id), { recursive: true });
   fs.copyFileSync(db, path.join(e.BACKUP_DIR, id, "agentlee.db"));
+  const sf = path.join(e.DATA_DIR, "schema.txt");
+  fs.writeFileSync(path.join(e.BACKUP_DIR, id, "schema.txt"), fs.existsSync(sf) ? fs.readFileSync(sf) : "0");
   console.log("backup_id=" + id + "\\npending_migrations=0\\nintegrity=ok");
+} else if (cmd === "check-backup") {
+  const id = process.argv[3];
+  const sf = path.join(e.BACKUP_DIR, id, "schema.txt");
+  if (!fs.existsSync(sf)) { console.error("release: backup_not_found"); process.exit(1); }
+  const own = JSON.parse(fs.readFileSync(path.join(rootDir, "apps/server/drizzle/meta/_journal.json"), "utf8")).entries.length;
+  if (Number(fs.readFileSync(sf, "utf8")) > own) { console.error("release: schema_newer — backup " + id + ": schema_newer"); process.exit(1); }
+  console.log("compatible=ok");
 } else if (cmd === "migrate-data") {
   execFileSync("cp", ["-R", from, e.DATA_DIR]);
   console.log("from=" + from + "\\nto=" + e.DATA_DIR + "\\nintegrity=ok");
@@ -191,7 +205,8 @@ async function fixture() {
   fs.writeFileSync(path.join(dataDir, "agentlee.db"), "fixture db");
 
   const outputs: string[] = [];
-  const run = (...args: string[]) => {
+  const run = (...args: string[]) => runWith({}, ...args);
+  const runWith = (extra: Record<string, string>, ...args: string[]) => {
     const r = spawnSync("bash", [script, ...args], {
       env: {
         ...process.env,
@@ -202,6 +217,7 @@ async function fixture() {
         AGENTLEE_NODE: process.execPath,
         AGENTLEE_LAUNCHD_PLIST: path.join(base, "no-such-daemon.plist"),
         AGENTLEE_HEALTH_TIMEOUT: "6",
+        ...extra,
       },
       encoding: "utf8",
       timeout: 120_000,
@@ -238,7 +254,9 @@ async function fixture() {
     dataDir,
     envFile,
     commit,
+    git,
     run,
+    runWith,
     envState,
     current,
     releases,
@@ -385,6 +403,105 @@ describe.skipIf(process.platform === "win32")("release.sh", () => {
     ok(fx.run("prune", "--keep", "1"));
     expect(fx.releases()).toEqual([v2]);
     expect(fx.run("prune", "--keep", "0").stderr).toMatch(/--keep must be 1 or more/);
+  }, 120_000);
+
+  it("prints the restore hint even when the switch back fails too (#148 review P2)", async () => {
+    const fx = await fixture();
+    ok(fx.run("install"));
+    const v1 = fx.current();
+    fx.commit(
+      {
+        "version.txt": "v2\n",
+        "apps/server/drizzle/meta/_journal.json": JSON.stringify({
+          entries: [{ tag: "0000_init" }, { tag: "0001_new" }],
+        }),
+      },
+      "v2 with a migration",
+    );
+    fs.writeFileSync(path.join(fx.dataDir, "fail-health"), ""); // every release now fails its health check
+    const r = fx.run("install");
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`rollback to ${v1} failed its checks too`);
+    const v2 = fx.releases().find((n) => n !== v1)!;
+    const backup = /^predeploy_backup=(.+)$/m.exec(
+      fs.readFileSync(path.join(fx.agentHome, "releases", v2, ".release-info"), "utf8"),
+    )![1]!;
+    expect(r.stderr).toContain(`WARNING — ${v2} added database migrations that ${v1} does not have`);
+    expect(r.stderr).toContain(`pnpm -s restore apply ${backup} --yes`);
+    expect(fx.current()).toBe(v1);
+  }, 120_000);
+
+  it("suggests the backup the target can restore after several migrating releases (#148 review P2)", async () => {
+    const fx = await fixture();
+    const journal = (n: number) =>
+      JSON.stringify({ entries: Array.from({ length: n }, (_, i) => ({ tag: `000${i}_m` })) });
+    ok(fx.run("install"));
+    const a = fx.current();
+    const backupOf = (rel: string) =>
+      /^predeploy_backup=(.+)$/m.exec(
+        fs.readFileSync(path.join(fx.agentHome, "releases", rel, ".release-info"), "utf8"),
+      )![1]!;
+    fx.commit({ "version.txt": "B\n", "apps/server/drizzle/meta/_journal.json": journal(2) }, "B");
+    ok(fx.run("install"));
+    const b = fx.current();
+    fx.commit({ "version.txt": "C\n", "apps/server/drizzle/meta/_journal.json": journal(3) }, "C");
+    ok(fx.run("install"));
+    const c = fx.current();
+    const r = fx.run("rollback", "--to", a);
+    ok(r);
+    // C's own backup has B's schema (A would refuse it); B's backup was taken while A ran.
+    expect(r.stderr).toContain(
+      `backup ${backupOf(b)} (taken before ${b} was installed over ${a}; ${a} can restore it — checked)`,
+    );
+    expect(r.stderr).toContain(`pnpm -s restore apply ${backupOf(b)} --yes`);
+    expect(r.stderr).not.toContain(`restore apply ${backupOf(c)}`);
+  }, 120_000);
+
+  it("deploys the branch main, not a tag of that name, and refuses an ambiguous --ref (#148 review P2)", async () => {
+    const fx = await fixture();
+    fx.git(fx.work, "tag", "main");
+    fx.git(fx.work, "push", "--quiet", fx.src, "refs/tags/main");
+    fx.commit({ "version.txt": "v2\n" }, "v2 on the branch");
+    ok(fx.run("install"));
+    expect(await fx.served()).toBe("v2");
+    expect(
+      fs.readFileSync(path.join(fx.agentHome, "releases", fx.current(), ".release-info"), "utf8"),
+    ).toContain("ref=refs/heads/main");
+    const amb = fx.run("install", "--force", "--ref", "main");
+    expect(amb.status).toBe(1);
+    expect(amb.stderr).toMatch(/both a branch and a tag — say refs\/heads\/main or refs\/tags\/main/);
+    ok(fx.run("install", "--ref", "refs/tags/main"));
+    expect(await fx.served()).toBe("v1");
+  }, 120_000);
+
+  it("moves data with a LaunchDaemon plist on disk once the daemon is unloaded (#148 review P2)", async () => {
+    const fx = await fixture();
+    const old = path.join(fx.base, "old-data");
+    fs.renameSync(fx.dataDir, old);
+    ok(fx.run("install", "--no-start"));
+    const plist = path.join(fx.base, "com.agentlee.server.plist");
+    fs.writeFileSync(plist, "<plist/>");
+    const fake = (name: string, rc: number) => {
+      const f = path.join(fx.base, name);
+      fs.writeFileSync(f, `#!/bin/sh\n[ "$1" = print ] || exit 99\nexit ${rc}\n`, { mode: 0o755 });
+      return f;
+    };
+    const loaded = fx.runWith(
+      { AGENTLEE_LAUNCHD_PLIST: plist, AGENTLEE_LAUNCHCTL: fake("loaded", 0) },
+      "migrate-data",
+      "--from",
+      old,
+    );
+    expect(loaded.status).toBe(1);
+    expect(loaded.stderr).toMatch(/stop the LaunchDaemon first/);
+    const unloaded = fx.runWith(
+      { AGENTLEE_LAUNCHD_PLIST: plist, AGENTLEE_LAUNCHCTL: fake("unloaded", 113) },
+      "migrate-data",
+      "--from",
+      old,
+    );
+    ok(unloaded);
+    expect(fs.existsSync(path.join(fx.dataDir, "agentlee.db"))).toBe(true);
   }, 120_000);
 
   it("runs one release command at a time", async () => {
