@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
-import { SON, newConversation, useAccount } from "./helpers.js";
+import { SON, newConversation, sourceStatuses, useAccount } from "./helpers.js";
 
 /**
  * File extraction and file citations (#48, PRD FR-4.3·4.5, 수용 기준 2·11): the son uploads a 12-page PDF and
@@ -12,7 +12,6 @@ import { SON, newConversation, useAccount } from "./helpers.js";
  */
 
 const REPORT = fs.readFileSync(path.join(import.meta.dirname, "../fixtures/extract/report.pdf"));
-const OK = "원문 구절 확인";
 
 test.use({ serviceWorkers: "block" });
 
@@ -38,8 +37,9 @@ test("이 PDF 12쪽 요약: both citations say report.pdf · 12쪽 and are verif
   await page.getByLabel("메시지 입력").press("Enter");
   await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 30_000 });
   const reply = page.getByTestId("assistant").last();
-  await expect(reply.getByTestId("citation-marker")).toHaveText(["[1]", "[2]"]);
-  await expect(reply.getByTestId("citation-status")).toHaveText([OK, OK]);
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1", "2"]);
+  await expect(reply.getByTestId("citation-summary")).toHaveText("출처 2개 · 모두 확인됨");
+  await expect.poll(() => sourceStatuses(reply)).toEqual(["verified", "verified"]);
   const rows = reply.getByTestId("citation-source");
   await expect(rows).toHaveCount(2);
   for (const i of [0, 1]) {
@@ -75,6 +75,7 @@ test("a passage the file does not have is shown with ⚠️, never as normal", a
   await page.getByLabel("메시지 입력").press("Enter");
   await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 30_000 });
   const reply = page.getByTestId("assistant").last();
-  await expect(reply.getByTestId("citation-marker")).toHaveText(["[1⚠️]"]);
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1⚠️"]);
+  // Not folded away: the failed row is listed with its warning (#150).
   await expect(reply.getByTestId("citation-status")).toHaveText(["⚠️ 출처에서 이 내용을 찾지 못했어요"]);
 });

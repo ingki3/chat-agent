@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
-import { csrf, newMember, signIn } from "./helpers.js";
+import { csrf, newMember, signIn, sourceStatuses } from "./helpers.js";
 
 /**
  * Runtime switch with files, sources and artifacts (#53, PRD FR-3.5, 수용 기준 8·11). The e2e server runs the
@@ -14,7 +14,6 @@ import { csrf, newMember, signIn } from "./helpers.js";
 
 test.use({ serviceWorkers: "block" });
 
-const OK = "원문 구절 확인";
 const SNIPPET = "메모리 가격 회복이 증가를 이끌었다";
 const V1 = "# 회의 메모 v1\n- 관심 종목: 삼성전자";
 const V2 = "# 회의 메모 v2\n- 관심 종목: 삼성전자\n- 목표가: 25만원";
@@ -100,7 +99,7 @@ for (const [from, to] of DIRECTIONS) {
     await switchTo(page, to);
     const reply = await ask(page, `/ref-cite 0 ${SNIPPET}`);
     await expect(page.getByTestId("divider").last()).toHaveText(new RegExp(`여기부터\\s*${LABEL[to]}`));
-    await expect(reply.getByTestId("citation-status")).toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(reply)).toEqual(["verified"]);
     const again = await lastReply(page);
     expect(again.runtime).toBe(to);
     expect(noteOf(again).map((c) => [c.status, c.sourceId])).toEqual([["verified", first.sourceId]]);
@@ -146,7 +145,7 @@ for (const [from, to] of DIRECTIONS) {
     await expect(page.getByTestId("attachment")).toHaveCount(2);
     const compared = await ask(page, "/file-compare");
     await page.waitForURL(/\/c\/[^/]+$/);
-    await expect(compared.getByTestId("citation-status")).toHaveText([OK, OK], { timeout: 30_000 });
+    await expect.poll(() => sourceStatuses(compared), { timeout: 30_000 }).toEqual(["verified", "verified"]);
 
     await switchTo(page, to);
     // Where each file is in the references: the conversation's file list order (the same store order).
@@ -158,14 +157,14 @@ for (const [from, to] of DIRECTIONS) {
     const hwpAt = files.items.findIndex((f) => f.name === "assignment.hwp");
     const pdfAt = files.items.findIndex((f) => f.name === "report.pdf");
     const hwp = await ask(page, `/ref-file-cite ${hwpAt} ${HWP_ROW}`);
-    await expect(hwp.getByTestId("citation-status")).toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(hwp)).toEqual(["verified"]);
     await expect(hwp.getByTestId("citation-source")).toContainText("assignment.hwp");
     await expect(hwp.getByTestId("citation-source")).toContainText("3번째 표");
     const pdf = await ask(
       page,
       `/ref-file-cite ${pdfAt} Summary: the river clean-up removed 340 kg of waste.`,
     );
-    await expect(pdf.getByTestId("citation-status")).toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(pdf)).toEqual(["verified"]);
     await expect(pdf.getByTestId("citation-source")).toContainText("report.pdf");
     await expect(pdf.getByTestId("citation-source")).toContainText("12쪽");
     expect((await lastReply(page)).runtime).toBe(to);
@@ -203,11 +202,11 @@ for (const [from, to] of DIRECTIONS) {
 
     // The copied source has no page text: cited as it is, it is not shown as verified.
     const asIs = await ask(vpage, `/ref-cite 0 ${SNIPPET}`);
-    await expect(asIs.getByTestId("citation-status")).not.toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(asIs)).not.toEqual(["verified"]);
     expect((await lastReply(vpage)).runtime).toBe(to);
     // Fetched again by its URL, then cited: verified.
     const refetched = await ask(vpage, `/ref-refetch-cite 0 ${SNIPPET}`);
-    await expect(refetched.getByTestId("citation-status")).toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(refetched)).toEqual(["verified"]);
     const newSource = noteOf(await lastReply(vpage))[0]!.sourceId!;
     expect(newSource).not.toBe(orig.sourceId);
 
@@ -222,7 +221,7 @@ for (const [from, to] of DIRECTIONS) {
     // Switched back: the fresh session is told the new source too, and cites it verified.
     await switchTo(vpage, from);
     const back = await ask(vpage, `/ref-cite 1 ${SNIPPET}`);
-    await expect(back.getByTestId("citation-status")).toHaveText([OK]);
+    await expect.poll(() => sourceStatuses(back)).toEqual(["verified"]);
     const last = await lastReply(vpage);
     expect(last.runtime).toBe(from);
     expect(noteOf(last)[0]!.sourceId).toBe(newSource);

@@ -7,6 +7,7 @@ import {
   MEMORY_TRIMMED_TEXT,
   redactSecrets,
   utf8Bytes,
+  type CitationEntry,
   type CitationNotePart,
   type FinanceNotePart,
   StreamEvent,
@@ -970,12 +971,33 @@ export class RunManager {
     }
     if (!parts.some((p) => p.type === "citation_note")) {
       try {
-        const note = citationNote(row.id, parts, this.citations);
+        const note = citationNote(row.id, parts, this.citations, {
+          conversationId: row.conversationId,
+          userId: row.userId,
+          previous: () => this.previousCitations(row),
+        });
         if (note) this.pushNote(row, parts, note);
       } catch {
         // no note rather than no reply
       }
     }
+  }
+
+  /**
+   * The citations of the newest earlier answer of the conversation with a citation note (#150, numbers carried
+   * over — `citationNote`): active messages before this reply, the server's own notes only.
+   */
+  private previousCitations(row: RunRow): CitationEntry[] {
+    const self = this.conversations.messageById(row.assistantMessageId);
+    if (!self) return [];
+    const earlier = this.conversations
+      .messages(row.conversationId, { limit: 10_000 })
+      .filter((m) => m.role === "assistant" && m.seq < self.seq);
+    for (const m of earlier.reverse()) {
+      const note = (m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+      if (note && note.citations.length) return note.citations;
+    }
+    return [];
   }
 
   /**

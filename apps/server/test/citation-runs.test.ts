@@ -24,6 +24,8 @@ import {
   CITATION_SCENARIOS,
   FIXTURE_PAGES,
   fixtureWebWorker,
+  MANY_BAD,
+  MANY_PAGES,
   type CitationScenarioName,
 } from "../src/runtime/fake-citations.js";
 import { RunManager } from "../src/runtime/runs.js";
@@ -178,6 +180,31 @@ function expectScenario(name: CitationScenarioName | "reuse-fresh", r: Result, l
         label,
       ).toEqual([FIXTURE_PAGES[0]!.url, FIXTURE_PAGES[1]!.url, null]);
       break;
+    case "many":
+      // Thirty sources, [7] quoting a figure its page does not have.
+      expect(statuses(r), label).toEqual(
+        MANY_PAGES.map((_, i) => [i + 1, i + 1 === MANY_BAD ? "snippet_not_found" : "verified"]),
+      );
+      expect(r.note!.markers, label).toHaveLength(30);
+      expect(r.note!.missing, label).toEqual([]);
+      break;
+    case "recap":
+      // After `conflict`: its numbers carried over and checked again; [9] was never one of them (#150).
+      expect(statuses(r), label).toEqual([
+        [1, "verified"],
+        [2, "verified"],
+        [3, "verified"],
+        [9, "unknown_source"],
+      ]);
+      expect(
+        r.note!.citations.map((c) => c.url),
+        label,
+      ).toEqual([FIXTURE_PAGES[0]!.url, FIXTURE_PAGES[1]!.url, FIXTURE_PAGES[1]!.url, null]);
+      expect(r.note!.citations[0]!.quote, label).toBe(
+        "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.",
+      );
+      expect(r.note!.missing, label).toEqual([]);
+      break;
     case "reuse-fresh":
       // No earlier sources in this conversation: nothing to reuse, nothing passes as normal.
       expect(statuses(r), label).toEqual([
@@ -201,6 +228,62 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     }
     const fresh = app.conversations!.create(f.users.owner.id);
     expectScenario("reuse-fresh", await send(f.cookies.owner, fresh.id, "/cite reuse"));
+  });
+
+  it("thirty sources in one answer: every number checked, the failing one kept apart (#150)", async () => {
+    const { app, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    expectScenario("many", await send(f.cookies.owner, c.id, "/cite many"));
+  });
+
+  it("a follow-up that writes the previous answer's numbers again: carried over and checked again (#150)", async () => {
+    const { app, db, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c.id, "/cite conflict"));
+    expectScenario("recap", await send(f.cookies.owner, c.id, "/cite recap"));
+    // From a carried note too: the newest earlier answer with a note is the recap itself.
+    expectScenario("recap", await send(f.cookies.owner, c.id, "/cite recap"), "recap of a recap");
+    // An answer without markers in between does not hide the earlier note.
+    await send(f.cookies.owner, c.id, "고마워요");
+    expectScenario("recap", await send(f.cookies.owner, c.id, "/cite recap"), "after a plain answer");
+    // Checked again, not copied: a page whose stored text no longer has the passage is a warning now.
+    db.$client
+      .prepare("update sources set body = ? where conversation_id = ? and url = ?")
+      .run("바뀐 본문만 남았다.", c.id, FIXTURE_PAGES[1]!.url);
+    const changed = await send(f.cookies.owner, c.id, "/cite recap");
+    expect(statuses(changed)).toEqual([
+      [1, "verified"],
+      [2, "snippet_not_found"],
+      [3, "snippet_not_found"],
+      [9, "unknown_source"],
+    ]);
+    // What it meant to quote, never a passage the page does not have.
+    expect(changed.note!.citations[1]!.quote).toBe("10월 반도체 수출 증가율은 28%로");
+    // A conversation without an earlier note: nothing to carry.
+    const fresh = app.conversations!.create(f.users.owner.id);
+    expect(statuses(await send(f.cookies.owner, fresh.id, "/cite recap"))).toEqual(
+      [1, 2, 3, 9].map((n) => [n, "unknown_source"]),
+    );
+  });
+
+  it("precedence (#150): once a run cites or fetches anything, every number is its own — nothing is carried", async () => {
+    const recapAfterFetch: FakeScript = (input, memory) =>
+      input.text === "/fetch-recap"
+        ? [
+            { call: "web_fetch", input: { url: FIXTURE_PAGES[2]!.url } },
+            { text: CITATION_SCENARIOS.recap.answer },
+          ]
+        : defaultScript(input, memory);
+    const { app, f, send } = await start(fake(recapAfterFetch));
+    const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "/cite conflict");
+    // It cited two passages itself: its [3] is not the earlier answer's [3].
+    expectScenario("reuse", await send(f.cookies.owner, c.id, "/cite reuse"));
+    const c2 = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c2.id, "/cite conflict");
+    // It fetched a page of its own (and cited nothing): its numbers may mean that page — never shown as verified.
+    const fetched = await send(f.cookies.owner, c2.id, "/fetch-recap");
+    expect(statuses(fetched)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
   });
 
   it("a source id of another conversation or another user cited through the run's token: unknown_source", async () => {
@@ -247,7 +330,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
       "common@4",
-      "research@2",
+      "research@3",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
     expect(prompt).toContain("# 자료 조사 모드");
@@ -406,8 +489,13 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       expectScenario("conflict", conflict, `${rt} conflict`);
       const reuse = await send(f.cookies.owner, c.id, "/cite reuse", rt);
       expectScenario("reuse", reuse, `${rt} reuse`);
-      const rest = [];
-      for (const name of ["insufficient", "partial"] as const) {
+      // A follow-up that cites nothing (#150): the conflict answer's numbers carried over.
+      const recapConv = app.conversations!.create(f.users.owner.id);
+      await send(f.cookies.owner, recapConv.id, "/cite conflict", rt);
+      const recap = await send(f.cookies.owner, recapConv.id, "/cite recap", rt);
+      expectScenario("recap", recap, `${rt} recap`);
+      const rest = [recap];
+      for (const name of ["insufficient", "partial", "many"] as const) {
         const conv = app.conversations!.create(f.users.owner.id);
         const r = await send(f.cookies.owner, conv.id, `/cite ${name}`, rt);
         expectScenario(name, r, `${rt} ${name}`);
@@ -419,5 +507,5 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
-  });
+  }, 60_000);
 });

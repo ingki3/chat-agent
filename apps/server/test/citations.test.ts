@@ -1402,6 +1402,71 @@ describe("citationNote", () => {
       expect(CITATION_STATUS_TEXT[s].startsWith("⚠️ ")).toBe(true);
   });
 
+  it("carry-over (#150): only for a run without citations of its own, checked again, never a file or another scope", () => {
+    const later = f.run(f.c.id);
+    const earlier = citationNote(scope.runId, text("가[1]. 나[2]. 다[3]."), f.cites)!.citations;
+    const fileEntry = {
+      n: 5,
+      status: "verified" as const,
+      sourceId: null,
+      title: "보고서.pdf",
+      site: "12쪽",
+      url: null,
+      publishedAt: null,
+      quote: "파일의 구절이에요 열두 쪽",
+    };
+    const carry = { conversationId: f.c.id, userId: later.userId, previous: () => [...earlier, fileEntry] };
+    const note = citationNote(later.runId, text("가[1]. 나[2]. 다[3]. 라[5]. 마[6]."), f.cites, carry)!;
+    expect(note.citations.map((c) => [c.n, c.status, c.sourceId])).toEqual([
+      [1, "verified", src.id],
+      [2, "snippet_not_found", src.id],
+      [3, "unknown_source", null],
+      [5, "unknown_source", null],
+      [6, "unknown_source", null],
+    ]);
+    expect(note.citations[0]).toEqual(earlier[0]);
+    expect(CitationNotePart.parse(note)).toEqual(note);
+    // Another user's scope (the run's token user, not the conversation's owner): nothing carried.
+    const stranger = { ...carry, userId: crypto.randomUUID() };
+    expect(
+      citationNote(later.runId, text("가[1]."), f.cites, stranger)!.citations.map((c) => c.status),
+    ).toEqual(["unknown_source"]);
+    // A run that cited something itself: its numbers are its own.
+    const own = f.run(f.c.id);
+    f.cites.cite(own, { sourceId: src.id, snippet: "메모리 가격 회복이 증가를 이끌었다" });
+    expect(
+      citationNote(own.runId, text("가[1]. 나[2]."), f.cites, carry)!.citations.map((c) => c.status),
+    ).toEqual(["verified", "unknown_source"]);
+    // One that searched or fetched (a tool that brings sources of its own), even without citing.
+    const fetched: MessagePart[] = [
+      { type: "tool_call", id: "t1", name: "mcp__agentlee__web_fetch", input: {} },
+      ...text("가[1]."),
+    ];
+    expect(citationNote(f.run(f.c.id).runId, fetched, f.cites, carry)!.citations[0]!.status).toBe(
+      "unknown_source",
+    );
+  });
+
+  it("recheck (#150): the source of this conversation and user only, its stored text looked at now", () => {
+    const owner = { conversationId: f.c.id, userId: scope.userId };
+    expect(f.cites.recheck(owner, { sourceId: src.id, snippet: SNIP })).toMatchObject({
+      status: "verified",
+      quote: SNIP,
+      source: { id: src.id },
+    });
+    expect(f.cites.recheck(owner, { sourceId: src.id, snippet: "없는 구절을 인용했어요" })?.status).toBe(
+      "snippet_not_found",
+    );
+    expect(f.cites.recheck(owner, { sourceId: src.id, snippet: "짧다" })?.status).toBe("snippet_not_found");
+    expect(f.cites.recheck(owner, { sourceId: "made-up", snippet: SNIP })).toBeUndefined();
+    expect(
+      f.cites.recheck({ ...owner, userId: crypto.randomUUID() }, { sourceId: src.id, snippet: SNIP }),
+    ).toBe(undefined);
+    expect(
+      f.cites.recheck({ ...owner, conversationId: crypto.randomUUID() }, { sourceId: src.id, snippet: SNIP }),
+    ).toBe(undefined);
+  });
+
   it("fits the shared schema even with long titles and quotes of characters outside the BMP", () => {
     const s2 = f.run(f.c.id);
     const emoji = "😀".repeat(400);

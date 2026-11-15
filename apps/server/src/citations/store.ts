@@ -78,15 +78,7 @@ export class CitationStore {
     const existing = this.existing(scope.runId, key, sourceId);
     if (existing?.status === "verified") return result(existing.n, existing.status, existing.sourceId);
     if (!existing && this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
-    let status: CitationStatus;
-    let quote: string | null = null;
-    if (!mine) status = "unknown_source";
-    else if (mine.kind !== "page" || !mine.body) status = "fetch_failed";
-    else {
-      const m = findSnippet(mine.body, snippet, mine.bodyHash ?? undefined);
-      status = m.found ? "verified" : "snippet_not_found";
-      if (m.found) quote = scrubKnown(m.quote);
-    }
+    const { status, quote } = checkAgainst(mine, snippet);
     // The transaction holds the numbering only (checked again inside it).
     return this.db.transaction(
       () => {
@@ -120,6 +112,34 @@ export class CitationStore {
       },
       { behavior: "immediate" },
     );
+  }
+
+  /**
+   * An earlier answer's web citation checked again for a later answer that reuses its number (#150): the source
+   * must still be a source of *this* conversation and *this* user (and the conversation that user's), and the
+   * passage is looked for in its stored text now — the same check as `cite`. Undefined when the source is not one
+   * (any more): the marker stays `unknown_source`. Registers nothing (the later answer's own numbering is untouched).
+   */
+  recheck(
+    scope: { conversationId: string; userId: string },
+    input: { sourceId: string; snippet: string },
+  ): { status: CitationStatus; quote: string | null; source: typeof sources.$inferSelect } | undefined {
+    const owner = this.db
+      .select({ ownerId: conversations.ownerId })
+      .from(conversations)
+      .where(eq(conversations.id, scope.conversationId))
+      .get();
+    if (owner?.ownerId !== scope.userId) return undefined;
+    const src = this.db
+      .select()
+      .from(sources)
+      .where(and(eq(sources.id, input.sourceId), eq(sources.conversationId, scope.conversationId)))
+      .get();
+    if (!src || src.userId !== scope.userId) return undefined;
+    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
+      return { status: "snippet_not_found", quote: null, source: src };
+    return { ...checkAgainst(src, snippet), source: src };
   }
 
   /**
@@ -263,6 +283,19 @@ export class CitationStore {
         : undefined,
     }));
   }
+}
+
+/** `cite`'s check of a snippet against a source's stored page text (none: `unknown_source`). */
+function checkAgainst(
+  src: typeof sources.$inferSelect | undefined,
+  snippet: string,
+): { status: CitationStatus; quote: string | null } {
+  if (!src) return { status: "unknown_source", quote: null };
+  if (src.kind !== "page" || !src.body) return { status: "fetch_failed", quote: null };
+  const m = findSnippet(src.body, snippet, src.bodyHash ?? undefined);
+  return m.found
+    ? { status: "verified", quote: scrubKnown(m.quote) }
+    : { status: "snippet_not_found", quote: null };
 }
 
 const result = (n: number, status: CitationStatus, sourceId: string | null): CiteResult => ({

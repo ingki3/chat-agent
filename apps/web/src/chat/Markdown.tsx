@@ -107,7 +107,7 @@ const rehypePlugins: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
  * Citation markers of a finished answer (#25): which `[n]` are citations, and how one is drawn. Without it the
  * text renders exactly as before.
  */
-export type MarkdownCite = { numbers: ReadonlySet<number>; render: (n: number) => ReactNode };
+export type MarkdownCite = { numbers: ReadonlySet<number>; render: (ns: number[]) => ReactNode };
 
 /** One block; memoised on its text, so finished blocks are not parsed again while the reply streams. */
 export const MarkdownBlock = memo(function MarkdownBlock({
@@ -127,7 +127,12 @@ export const MarkdownBlock = memo(function MarkdownBlock({
               sup: ({ node, children }: { node?: unknown; children?: ReactNode }) => {
                 const n = (node as { properties?: { dataCiteN?: unknown } } | undefined)?.properties
                   ?.dataCiteN;
-                return typeof n === "string" ? cite.render(Number(n)) : <sup>{children}</sup>;
+                // One chip for markers side by side (#150): "1,3".
+                return typeof n === "string" && /^\d+(,\d+)*$/.test(n) ? (
+                  cite.render(n.split(",").map(Number))
+                ) : (
+                  <sup>{children}</sup>
+                );
               },
             } as Components,
           }

@@ -39,6 +39,20 @@ export const FIXTURE_PAGES: readonly FixturePage[] = [
   },
 ];
 
+/** Thirty news pages (#150: an answer with many sources — the compact display). */
+export const MANY_PAGES: readonly FixturePage[] = Array.from({ length: 30 }, (_, i) => {
+  const k = i + 1;
+  return {
+    url: u(`/news/many-${k}.html`),
+    title: `지표 ${k}번 동향`,
+    site: `뉴스${k} 일보`,
+    publishedAt: `2026-11-${String((k % 28) + 1).padStart(2, "0")}T09:00:00+09:00`,
+    text: `통계청은 지표 ${k}번이 지난달보다 ${k}% 늘었다고 밝혔다.\n전문가들은 증가세가 이어질 것으로 본다.`,
+  };
+});
+/** The one citation of `many` that does not verify. */
+export const MANY_BAD = 7;
+
 /** Search results by query: links only (no page text), as a search provider returns them. */
 export const FIXTURE_SEARCH: Readonly<
   Record<string, { url: string; title: string; site: string; snippet: string }[]>
@@ -134,6 +148,38 @@ export const CITATION_SCENARIOS = {
     answer:
       "앞에서 본 기사에 따르면 메모리 가격 회복이 증가를 이끌었어요[1]. 통계가 다른 것은 집계 기준 때문이에요[2]. 지난 답변의 수치도 같아요[3].",
   },
+  /**
+   * Thirty sources, cited three to a paragraph (`[1][2][3]`) — #150's compact markers and folded source list.
+   * `[7]` quotes a figure the page does not have (snippet_not_found): it must show while the list is folded.
+   */
+  many: {
+    calls: [
+      ...MANY_PAGES.map((p) => ({ tool: "web_fetch" as const, input: { url: p.url } })),
+      ...MANY_PAGES.map((_, i) => ({
+        tool: "cite" as const,
+        input: {
+          sourceId: `$${i}.sourceId`,
+          snippet: `통계청은 지표 ${i + 1}번이 지난달보다 ${i + 1 === MANY_BAD ? 99 : i + 1}% 늘었다고 밝혔다.`,
+        },
+      })),
+    ],
+    answer: [
+      "## 이번 달 지표",
+      ...Array.from(
+        { length: 10 },
+        (_, j) => `${j + 1}번째 묶음의 지표가 모두 늘었어요[${3 * j + 1}][${3 * j + 2}][${3 * j + 3}].`,
+      ),
+    ].join("\n\n"),
+  },
+  /**
+   * A follow-up that cites nothing ("내용 요약해줘" after `conflict`): the previous answer's numbers written again
+   * (#150) — carried over and checked again; `[9]` was never a number of that answer.
+   */
+  recap: {
+    calls: [],
+    answer:
+      "앞 답을 요약하면 가나다 신문은 32% 증가로 보도했어요[1][3]. 라마바 통계는 28%로 집계했어요[2]. 다른 자료도 있어요[9].",
+  },
 } satisfies Record<string, CitationScenario>;
 export type CitationScenarioName = keyof typeof CITATION_SCENARIOS;
 
@@ -160,7 +206,7 @@ export function resolveRefs(input: unknown, outputs: (id: string) => unknown): u
  * fails as unreachable). Only for the FakeRuntime mode and tests.
  */
 export function fixtureWebWorker(fallback?: WebWorker): WebWorker {
-  const pages = new Map(FIXTURE_PAGES.map((p) => [p.url, p]));
+  const pages = new Map([...FIXTURE_PAGES, ...MANY_PAGES].map((p) => [p.url, p]));
   return async (job, proxy) => {
     if (job.op === "fetch") {
       const p = pages.get(job.url);

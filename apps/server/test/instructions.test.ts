@@ -88,6 +88,14 @@ describe("templates", () => {
     // #149: a request sent with files is about them first.
     expect(common).toContain("`[첨부 파일: 이름 (file:…)]`");
     expect(common).toContain("먼저 파일 도구(`file_read`·`file_search`)로");
+    // #150: key claims, at most two per paragraph, the same number for the same source; research keeps every fact.
+    expect(common).toContain("**핵심 주장**에 `cite`");
+    expect(common).not.toContain("사실 주장마다");
+    expect(common).toContain("**최대 2개**");
+    expect(common).toContain("같은 `sourceId`로 다시 `cite`한다");
+    const research = defaultTemplates().research;
+    expect(research.version).toBe(3);
+    expect(research.body).toContain("사실을 말하는 문장마다 `cite`");
   });
 
   it("the youth section names the crisis lines from the fixtures (109, 1388)", () => {
@@ -144,7 +152,7 @@ describe("assembly", () => {
             "common@4",
             ...(kind === "finance" ? ["finance@3"] : []),
             ...(user.youth ? ["youth@2"] : []),
-            ...(mode === "research" ? ["research@2"] : []),
+            ...(mode === "research" ? ["research@3"] : []),
           ]);
           expect(r.text).toMatchSnapshot();
           // Every combination: external content is data, and the date is Seoul's.
@@ -586,7 +594,7 @@ describe("run manager assembles per run", () => {
     expect(res.json<{ researchMode: boolean }>().researchMode).toBe(true);
 
     const { run } = await reply(f.users.owner.id, conversationId);
-    expect(run.instructions).toBe("common@4,research@2");
+    expect(run.instructions).toBe("common@4,research@3");
     expect(claude.systemPrompts).toHaveLength(2); // not resumed with the old prompt
     expect(claude.systemPrompts[1]).toContain(RESEARCH_HEADING);
   });
