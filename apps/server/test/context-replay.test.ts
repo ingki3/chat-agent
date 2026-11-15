@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { CSRF_HEADER } from "@agentlee/shared";
+import { knownSecrets } from "../src/secrets/known.js";
 import { RuntimeRegistry, type ModelCapability } from "../src/runtime/adapter.js";
 import { CLAUDE_MODELS, ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
@@ -105,11 +107,13 @@ function codexTurns(log: CodexLog): Turn[] {
 const windowed = (models: ModelCapability[], w?: number) =>
   w ? models.map((m) => ({ ...m, contextWindow: w })) : models;
 
-async function start(o: { window?: number; context?: Partial<ContextOptions> } = {}) {
+async function start(
+  o: { window?: number; context?: Partial<ContextOptions>; rescrubDelayMs?: number } = {},
+) {
   const root = tmp();
   const claudeLog: ReplayLog = { options: [], prompts: [], interrupts: 0, closes: 0 };
   const codexLog = newLog();
-  const runtimes = new RuntimeRegistry();
+  const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
   // Each connection has its own folder, as in production (`DATA_DIR/runtimes/<id>/…`).
   runtimes.register(
     new ClaudeAdapter({
@@ -152,7 +156,11 @@ async function start(o: { window?: number; context?: Partial<ContextOptions> } =
       executable: "/nonexistent/codex",
     }),
   );
-  const h = await startContextApp(runtimes, { closers, ...(o.context ? { context: o.context } : {}) });
+  const h = await startContextApp(runtimes, {
+    closers,
+    ...(o.context ? { context: o.context } : {}),
+    ...(o.rescrubDelayMs !== undefined ? { rescrubDelayMs: o.rescrubDelayMs } : {}),
+  });
   const turnsOf = (runtime: string) => (runtime === "codex" ? codexTurns(codexLog) : claudeTurns(claudeLog));
   /** The run's turn as the runtime saw it equals the server's original; returns the turn. */
   const check = (run: RunRow) => {
@@ -283,4 +291,84 @@ describe("context hand-over with both real runtimes' recorded protocols (#45)", 
       expect(t.summaries(c)).toHaveLength(1);
     });
   }
+});
+
+describe("내 지침 with both real runtimes' recorded protocols (#144, AC-14 step 1)", () => {
+  /** The start prompt of the last fresh session of a runtime: Claude's system prompt, Codex's base instructions. */
+  const startPrompt = (t: Awaited<ReturnType<typeof start>>, rt: string) =>
+    rt === "codex"
+      ? String(t.codexLog.requests.findLast((r) => r.method === "thread/start")!.params.baseInstructions)
+      : String(t.claudeLog.options.findLast((o) => o.sessionId !== undefined)!.systemPrompt);
+
+  it("a USER.md preference reaches a new conversation on Claude, and stays after switching to Codex", async () => {
+    const t = await start();
+    t.connect("claude-code");
+    t.connect("codex");
+    const saved = await t.app.inject({
+      method: "PUT",
+      url: "/api/instructions/user",
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+      payload: { content: "- 답은 표 위주로" },
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    const c = await t.newConversation();
+    t.check(await t.send(c, "삼성전자와 SK하이닉스를 비교해줘"));
+    const claude = startPrompt(t, "claude-code");
+    expect(claude).toContain("<user_material>");
+    expect(claude).toContain("- 답은 표 위주로");
+    // The documents come before the earlier conversation, inside the start prompt.
+    await t.chip(c, { runtime: "codex" });
+    const r = t.check(await t.send(c, "이번엔 Codex로, 같은 비교"));
+    expect(r.fresh).toBe(true);
+    const codex = startPrompt(t, "codex");
+    expect(codex).toContain("- 답은 표 위주로");
+    // Both runtimes were told exactly the same documents.
+    const box = (p: string) => p.slice(p.indexOf("<user_material>"), p.indexOf("</user_material>"));
+    expect(box(codex)).toBe(box(claude));
+    // A new conversation on Codex has it too.
+    const d = await t.newConversation();
+    await t.chip(d, { runtime: "codex" });
+    t.check(await t.send(d, "새 대화"));
+    expect(startPrompt(t, "codex")).toContain("- 답은 표 위주로");
+  });
+});
+
+describe("내 지침 and a secret registered after the session started (#144 review 1, P1)", () => {
+  it("Claude: the next turn is a new session whose prompt never holds the raw value; the old one is not resumed", async () => {
+    // The background rescrub waits: what goes to the runtime must be safe without it.
+    const t = await start({ rescrubDelayMs: 60_000 });
+    t.connect("claude-code");
+    const value = `현관문구${crypto.randomBytes(6).toString("hex")}`;
+    const saved = await t.app.inject({
+      method: "PUT",
+      url: "/api/instructions/user",
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+      payload: { content: `- 현관 문구는 ${value}` },
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    const c = await t.newConversation();
+    await t.send(c, "첫 질문");
+    expect(String(t.claudeLog.options.at(-1)!.systemPrompt)).toContain(value);
+    const before = t.claudeLog.options.length;
+    knownSecrets.add(value);
+    closers.push(() => knownSecrets.remove(value));
+    await t.send(c, "둘째 질문");
+    const next = t.claudeLog.options.slice(before);
+    expect(next).toHaveLength(1);
+    // A fresh session (not `resume`), and nothing sent since holds the raw value.
+    expect(next[0]!.sessionId).toBeDefined();
+    expect(next[0]!.resume).toBeUndefined();
+    expect(JSON.stringify(next)).not.toContain(value);
+    expect(JSON.stringify(t.claudeLog.prompts.slice(1))).not.toContain(value);
+  });
 });

@@ -61,7 +61,7 @@ async function start(
     needsConnection: true,
     ...(o.script ? { script: o.script } : {}),
   });
-  const runtimes = new RuntimeRegistry();
+  const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
   runtimes.register(claude);
   runtimes.register(codex);
   const h = await startContextApp(runtimes, { closers, ...(o.context ? { context: o.context } : {}) });
@@ -191,7 +191,7 @@ describe("resume condition (#45): same runtime, same connection, and the session
     // Runtimes without connections (the development FakeRuntime): both runs have connection null.
     const claude = new FakeRuntime({ models: CLAUDE_MODELS });
     const codex = new FakeRuntime({ id: "codex", models: CODEX_MODELS });
-    const runtimes = new RuntimeRegistry();
+    const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
     runtimes.register(claude);
     runtimes.register(codex);
     const t = await startContextApp(runtimes, { closers });
@@ -648,7 +648,7 @@ describe("automatic summary (#45, FR-3.6)", () => {
 describe("review #106: the turn's message, cut contexts, cut files, unfinished dividers", () => {
   it("a huge message is counted: with the production window it brings the summary the history alone would not", async () => {
     const claude = new FakeRuntime({ models: CLAUDE_MODELS, needsConnection: true });
-    const runtimes = new RuntimeRegistry();
+    const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
     runtimes.register(claude);
     const t = await startContextApp(runtimes, { closers });
     t.connect("claude-code");
@@ -783,7 +783,7 @@ describe("review #106: the turn's message, cut contexts, cut files, unfinished d
     const failing: FakeScript = (input) =>
       input.text.startsWith(SUMMARY_MARKER) ? [{ fail: "summary failed" }] : [{ text: "ok" }];
     const claude = new FakeRuntime({ models: CLAUDE_MODELS, needsConnection: true, script: failing });
-    const runtimes = new RuntimeRegistry();
+    const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
     runtimes.register(claude);
     const prod = { summaryRatio: 0.3, recentMessages: 6, reserveTokens: 8000 };
     const t = await startContextApp(runtimes, { closers, context: prod });
@@ -821,7 +821,7 @@ describe("review #106: the turn's message, cut contexts, cut files, unfinished d
       contextWindow: m.id === "claude-sonnet-5-5" ? 5000 : 1000,
     }));
     const claude = new FakeRuntime({ models, needsConnection: true, script: failing });
-    const runtimes = new RuntimeRegistry();
+    const runtimes = new RuntimeRegistry({ minContextWindow: 0 });
     runtimes.register(claude);
     const t = await startContextApp(runtimes, { closers, context: OPTS });
     t.connect("claude-code");
@@ -913,7 +913,12 @@ describe("review #106: the turn's message, cut contexts, cut files, unfinished d
         "insert into runs (id, conversation_id, user_id, user_message_id, assistant_message_id, status, runtime, model, summary_divider_id, created_at) values (?, ?, ?, ?, ?, 'running', 'claude-code', 'claude-opus-5-5', ?, ?)",
       )
       .run(stale, c2, t.f.users.owner.id, user.id, assistant.id, divider.id, Date.now());
-    const manager = new RunManager(t.db, t.app.conversations!, new RuntimeRegistry(), t.app.appEvents);
+    const manager = new RunManager(
+      t.db,
+      t.app.conversations!,
+      new RuntimeRegistry({ minContextWindow: 0 }),
+      t.app.appEvents,
+    );
     expect(manager.recover()).toBe(1);
     expect(t.app.conversations!.messageById(divider.id)!.active).toBe(false);
   });

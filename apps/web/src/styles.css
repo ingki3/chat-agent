@@ -1673,3 +1673,75 @@ a.btnlink:focus-visible,
   display: grid;
   gap: 12px;
 }
+
+/* 내 지침 (#144): the document editor, its counter, preview, versions and diff. */
+.doc-editor {
+  display: grid;
+  gap: 8px;
+}
+.doc-text {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 240px;
+  resize: vertical;
+  line-height: 1.5;
+}
+.doc-preview {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  max-height: 480px;
+  overflow: auto;
+}
+.doc-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.doc-bar .spacer {
+  flex: 1;
+}
+.doc-versions summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.version-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.version-list li.on {
+  font-weight: 600;
+}
+.version-list button.link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+}
+.version-diff pre.diff {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  max-height: 360px;
+  overflow: auto;
+  font-size: 13px;
+}
+.diff-add {
+  color: #1a7f37;
+}
+.diff-del {
+  color: #cf222e;
+  text-decoration: line-through;
+}
+.admin-instructions {
+  display: grid;
+  gap: 16px;
+}

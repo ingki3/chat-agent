@@ -13,6 +13,7 @@ import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
 import { SharedViewPage, SharesPage } from "./pages/SharesPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
+import { InstructionsPage } from "./pages/InstructionsPage.js";
 import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
 import { FileViewerPage } from "./files/FileViewer.js";
@@ -93,6 +94,7 @@ function AuthGate() {
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
           <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />
+          <Route path="settings/instructions" element={<InstructionsPage />} />
           <Route
             path="admin"
             element={isAdmin ? <AdminPage selfId={data.user.id} /> : <Navigate to="/" replace />}
