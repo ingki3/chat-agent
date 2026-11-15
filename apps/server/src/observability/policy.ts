@@ -9,6 +9,7 @@ import {
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
   SCHEDULE_RUN_CODES,
+  MEMORY_TOOL_CODES,
 } from "@agentlee/shared";
 import { USAGE_PURPOSES } from "../usage/store.js";
 
@@ -296,6 +297,8 @@ export const SCHEDULE_CODES = set([
   ...SCHEDULE_PROPOSAL_CODES,
 ]);
 export const isScheduleCode = member(SCHEDULE_CODES);
+/** 대화 중 기억해줘 (#145): the memory tools' outcome codes. */
+export const isMemoryCode = member(set(MEMORY_TOOL_CODES));
 export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
 export const isScheduleStatus = member(set(["succeeded", "failed", "skipped", "retrying"]));
 export const isScheduleStep = member(set(["save", "notify", "engine", "warn"]));

@@ -371,4 +371,27 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "memory_versions.actor_id": ID,
   "memory_versions.content": { write: "MemoryStore (every new version, scrubKnown)", rescrub: "text" },
   "memory_versions.item_ids": { exempt: "item ids (JSON array of server-generated ids)" },
+  // 대화 중 기억해줘 (#145): the card's lines are runtime text (the model wrote them from the user's message). A known
+  // secret is refused before a decision is stored; every write is scrubbed as well (MemoryProposals).
+  "memory_prefs.user_id": ID,
+  "memory_prefs.apply_mode": ENUM,
+  "memory_proposals.id": ID,
+  "memory_proposals.owner_id": ID,
+  "memory_proposals.conversation_id": ID,
+  "memory_proposals.run_id": ID,
+  "memory_proposals.mode": ENUM,
+  "memory_proposals.forced": ENUM,
+  "memory_proposals.base": { exempt: "document kinds and version numbers (JSON)" },
+  "memory_proposals.applied": { exempt: "document kinds and version numbers (JSON)" },
+  "memory_proposal_decisions.proposal_id": ID,
+  "memory_proposal_decisions.doc": ENUM,
+  "memory_proposal_decisions.action": ENUM,
+  "memory_proposal_decisions.item_id": ID,
+  "memory_proposal_decisions.text": { write: "MemoryProposals.create (scrubKnown)", rescrub: "text" },
+  "memory_proposal_decisions.before": { write: "MemoryProposals.create (scrubKnown)", rescrub: "text" },
+  "memory_proposal_decisions.sources": { exempt: "message ids, revisions and conversation ids (JSON)" },
+  "memory_proposal_decisions.target_sources": {
+    exempt: "message ids, revisions and conversation ids (JSON)",
+  },
+  "memory_proposal_decisions.status": ENUM,
 };

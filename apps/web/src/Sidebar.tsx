@@ -12,6 +12,7 @@ import {
   SHARES_KEY,
   usage,
   USAGE_KEY,
+  MEMORY_PROPOSALS_KEY,
 } from "./api.js";
 import { ShareDialog, when } from "./shares/ShareDialog.js";
 import { unsubscribeOnSignOut } from "./push.js";
@@ -257,10 +258,12 @@ export function ConvMenu({ c }: { c: Conversation }) {
         if (window.location.pathname === `/c/${c.id}`) navigate("/", { replace: true });
       }
     },
-    onSettled: async () => {
+    onSettled: async (_r, _e, kind) => {
       setOpen(false);
       await refresh();
       await qc.invalidateQueries({ queryKey: ["conversation", c.id] });
+      // Cards elsewhere may have lost their source (spec §10.3): read again (a gone one says so).
+      if (kind === "delete") await qc.invalidateQueries({ queryKey: MEMORY_PROPOSALS_KEY });
     },
     onError: (e) => alert(errorText(e)),
   });

@@ -48,6 +48,11 @@
       "types": "./src/python.ts",
       "development": "./src/python.ts",
       "default": "./dist/python.js"
+    },
+    "./memory": {
+      "types": "./src/memory.ts",
+      "development": "./src/memory.ts",
+      "default": "./dist/memory.js"
     }
   },
   "scripts": {

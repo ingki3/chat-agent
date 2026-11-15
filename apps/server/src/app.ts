@@ -135,6 +135,8 @@ import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
 import { MemoryDocs } from "./memory/service.js";
 import { claimIfStale, linkMemoryDeletion, reclaimStaleSessions } from "./memory/linkage.js";
 import { registerMemoryRoutes } from "./memory/routes.js";
+import { MemoryProposals } from "./memory/proposals.js";
+import { registerMemoryProposalRoutes } from "./memory/proposal-routes.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -206,6 +208,8 @@ declare module "fastify" {
     purge: ConversationPurge | undefined;
     /** 내 지침 (#144); undefined without a database. */
     memory: MemoryDocs | undefined;
+    /** 대화 중 기억해줘 (#145): the tool's bundles (cards) and the setting; undefined without a database. */
+    memoryProposals: MemoryProposals | undefined;
   }
 }
 
@@ -732,6 +736,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Citations (#25): `cite` checks against the stored page text; the run's note reads them back. `file_cite`
     // (#48) numbers file citations in the same sequence.
     const citations = new CitationStore(opts.db!);
+    // 내 지침 (#144): AGENT, SOUL, USER, MEMORY — read for every new session, edited from the settings screens; the
+    // conversation tool's bundles (#145) change USER and MEMORY through the same store.
+    const memory = new MemoryDocs(
+      opts.db!,
+      opts.runs?.instructions ? { templates: opts.runs.instructions } : {},
+    );
+    const memoryProposals = new MemoryProposals(opts.db!, memory.store);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
       files: { tools: new FileTools(fileStore, fileExtracts, app.conversations!), citations },
@@ -745,6 +756,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       },
       artifacts,
       scheduleProposals,
+      memory: memoryProposals,
       docs,
       // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
@@ -779,11 +791,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Deleting a conversation (#54) — set right below; one-off sessions (summaries) and a session that finished
     // opening after its conversation went are handed to it by the run manager once closed.
     const later: { purge?: ConversationPurge } = {};
-    // 내 지침 (#144): AGENT, SOUL, USER, MEMORY — read for every new session, edited from the settings screens.
-    const memory = new MemoryDocs(
-      opts.db!,
-      opts.runs?.instructions ? { templates: opts.runs.instructions } : {},
-    );
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       memory,
       // A session still opening while the 내 지침 deletion linkage ran is caught when its row is saved (#144).
@@ -841,15 +848,18 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       conversations: app.conversations!,
       store: memory.store,
       purge: deletion,
+      proposals: memoryProposals,
       log: app.log,
     });
     app.decorate("memory", memory);
+    app.decorate("memoryProposals", memoryProposals);
     // Sessions left valid although a version they started with lost items (#144 review 2): claimed before serving.
     {
       const count = reclaimStaleSessions(opts.db!, deletion);
       if (count) logEvent(app.log, "info", "memory.sessions_reclaimed", { count });
     }
     registerMemoryRoutes(app, memory, users!);
+    registerMemoryProposalRoutes(app, memoryProposals);
     // Sessions of conversations deleted before a crash (or waiting for a retry) are forgotten once serving.
     app.addHook("onReady", async () => deletion.resume());
     app.addHook("onClose", async () => deletion.close());
@@ -1141,6 +1151,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("sharing", undefined);
     app.decorate("purge", undefined);
     app.decorate("memory", undefined);
+    app.decorate("memoryProposals", undefined);
   }
 
   app.get(

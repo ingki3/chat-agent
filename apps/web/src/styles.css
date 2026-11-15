@@ -1647,6 +1647,56 @@ a.btnlink:focus-visible,
   }
 }
 
+/* 대화 중 기억해줘 (#145): the card under the reply. */
+.mem-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px 14px;
+  margin: 8px 0;
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+  min-width: 0;
+}
+.mem-decisions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.mem-decision {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.mem-diff {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 14px;
+}
+.mem-card button {
+  min-height: 36px;
+}
+.memory-mode fieldset {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: grid;
+  gap: 6px;
+}
+.memory-mode label {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
 /* Family sharing (#29): the minimal share screens (#52 replaces them). */
 .card-like {
   display: grid;

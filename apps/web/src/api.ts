@@ -85,6 +85,10 @@ import {
   DocVersionsResponse,
   InstructionDoc,
   InstructionsResponse,
+  MEMORY_PROPOSAL_ERRORS,
+  MemoryPrefs,
+  MemoryProposal,
+  type MemoryApplyMode,
 } from "@agentlee/shared";
 
 const enc = encodeURIComponent;
@@ -536,6 +540,7 @@ const MESSAGES: Record<string, string> = {
   ...REFERENCE_ERRORS,
   // 내 지침 (#144)
   ...DOC_ERRORS,
+  ...MEMORY_PROPOSAL_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -744,4 +749,27 @@ export const ADMIN_INSTRUCTIONS_KEY = ["admin", "instructions"] as const;
 export const adminInstructions = {
   get: async () => AdminInstructionsResponse.parse(await call("GET", "/api/admin/instructions")),
   doc: (ref: string) => docApi(`/api/admin/instructions/${enc(ref)}`),
+};
+
+/**
+ * 대화 중 기억해줘 (#145, FR-16.4·16.7): the card under a reply (owner only) and the setting "기억 반영 방식".
+ * 409 `proposal_expired` / `proposal_closed` / `undo_unavailable` carry the card as it is now (`ApiError.body`).
+ */
+/** Every card's query (invalidated when a conversation or a message goes — a card may lose its source, §10.3). */
+export const MEMORY_PROPOSALS_KEY = ["memory-proposal"] as const;
+export const memoryProposalKey = (id: string) => [...MEMORY_PROPOSALS_KEY, id] as const;
+export const MEMORY_PREFS_KEY = ["memory-prefs"] as const;
+export const memoryProposals = {
+  get: async (id: string) => MemoryProposal.parse(await call("GET", `/api/memory-proposals/${enc(id)}`)),
+  accept: async (id: string, indexes: number[]) =>
+    MemoryProposal.parse(await call("POST", `/api/memory-proposals/${enc(id)}/accept`, { indexes })),
+  reject: async (id: string, indexes: number[]) =>
+    MemoryProposal.parse(await call("POST", `/api/memory-proposals/${enc(id)}/reject`, { indexes })),
+  undo: async (id: string) =>
+    MemoryProposal.parse(await call("POST", `/api/memory-proposals/${enc(id)}/undo`, {})),
+};
+export const memoryPrefs = {
+  get: async () => MemoryPrefs.parse(await call("GET", "/api/memory-prefs")),
+  set: async (applyMode: MemoryApplyMode) =>
+    MemoryPrefs.parse(await call("PUT", "/api/memory-prefs", { applyMode })),
 };
