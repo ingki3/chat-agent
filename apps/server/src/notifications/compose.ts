@@ -51,14 +51,29 @@ export type PublishInput =
   /** Admin only (#32, FR-9.5): today's cost passed the admin's threshold. */
   | { kind: "daily_cost"; amountUsd: number; thresholdUsd: number; url?: string }
   /** "테스트 알림" button in settings. */
-  | { kind: "test" };
+  | { kind: "test" }
+  /** 기억 정리 (#146, spec §8): N proposals wait for the user's review. A count only — never an item's text. */
+  | { kind: "memory_proposal"; count: number }
+  /** 기억 정리 applied N changes on its own (자동 반영). A count only. */
+  | { kind: "memory_applied"; count: number }
+  /** Admin only (#146): the day's last attempt failed for N users. No names, no content. */
+  | {
+      kind: "dreaming_failed";
+      users: number;
+      /** Of them, how many failed because even one message is over the token cap (not a connection problem). */
+      tooLarge?: number;
+    };
 
 export type ResourceRefInput = { kind: string; id: string };
 
 export type Composed = { kind: NotificationKind; title: string; body: string; url: string };
 
 /** Kinds only an admin may receive. */
-export const ADMIN_KINDS: ReadonlySet<NotificationKind> = new Set(["system_warning", "daily_cost"]);
+export const ADMIN_KINDS: ReadonlySet<NotificationKind> = new Set([
+  "system_warning",
+  "daily_cost",
+  "dreaming_failed",
+]);
 
 /** Body shown when the recipient sees the item only through a share: nothing of its content. */
 export const SHARED_BODY = "공유받은 대화에 새 결과가 있어요. 눌러서 확인하세요.";
@@ -211,8 +226,41 @@ export function compose(input: PublishInput): Composed {
         body: "알림이 잘 와요. 누르면 설정 화면이 열려요.",
         url: "/settings",
       };
+    case "memory_proposal":
+      return {
+        kind: input.kind,
+        title: "기억 정리",
+        body: `기억 정리 제안 ${count(input.count)}개가 있어요`,
+        url: "/settings/instructions?doc=dreams",
+      };
+    case "memory_applied":
+      return {
+        kind: input.kind,
+        title: "기억 정리",
+        body: `기억 ${count(input.count)}개를 정리했어요`,
+        url: "/settings/instructions?doc=dreams",
+      };
+    case "dreaming_failed":
+      return {
+        kind: input.kind,
+        title: "기억 정리 실패",
+        body: twoLines(
+          dreamingFailedBody(count(input.users), Math.min(count(input.tooLarge ?? 0), count(input.users))),
+        ),
+        url: "/admin?tab=dreaming",
+      };
   }
 }
+
+/** Fixed texts only (spec §8: no names, no content). */
+function dreamingFailedBody(users: number, tooLarge: number): string {
+  const big = `기억 정리 입력이 상한보다 커요 (사용자 ${tooLarge}명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요`;
+  if (tooLarge === users) return big;
+  const other = `기억 정리가 실패했어요 (사용자 ${users - tooLarge}명, 연결 확인 필요)`;
+  return tooLarge ? `${other}\n${big}` : other;
+}
+
+const count = (n: number) => (Number.isInteger(n) && n >= 0 ? Math.min(n, 9999) : 0);
 
 /** One push for everything held during quiet hours (FR-13.4): a count and the first titles, never bodies. */
 export function bundle(titles: string[]): { title: string; body: string; url: string } {

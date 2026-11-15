@@ -406,15 +406,37 @@ export class NotificationService {
   prefs(userId: string): NotificationPrefs {
     const row = this.db.select().from(notificationPrefs).where(eq(notificationPrefs.userId, userId)).get();
     return row
-      ? { quietStart: row.quietStart, quietEnd: row.quietEnd, timeZone: row.timeZone }
-      : { quietStart: null, quietEnd: null, timeZone: DEFAULT_TIME_ZONE };
+      ? {
+          quietStart: row.quietStart,
+          quietEnd: row.quietEnd,
+          timeZone: row.timeZone,
+          memoryProposals: row.memoryProposals,
+          memoryApplied: row.memoryApplied,
+        }
+      : {
+          quietStart: null,
+          quietEnd: null,
+          timeZone: DEFAULT_TIME_ZONE,
+          memoryProposals: true,
+          memoryApplied: true,
+        };
+  }
+
+  /** Whether the user wants this 기억 정리 notification (spec §8: the two user kinds can be turned off). */
+  wants(userId: string, kind: "memory_proposal" | "memory_applied"): boolean {
+    const p = this.prefs(userId);
+    return kind === "memory_proposal" ? p.memoryProposals !== false : p.memoryApplied !== false;
   }
 
   setPrefs(userId: string, p: NotificationPrefs): NotificationPrefs {
+    const before = this.prefs(userId);
     const value = {
       quietStart: p.quietStart,
       quietEnd: p.quietEnd,
       timeZone: isTimeZone(p.timeZone) ? p.timeZone : DEFAULT_TIME_ZONE,
+      // Left out (an older page): kept as they were.
+      memoryProposals: p.memoryProposals ?? before.memoryProposals ?? true,
+      memoryApplied: p.memoryApplied ?? before.memoryApplied ?? true,
       updatedAt: this.now(),
     };
     this.db

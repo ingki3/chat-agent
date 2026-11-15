@@ -395,6 +395,9 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   quietStart: text("quiet_start"),
   quietEnd: text("quiet_end"),
   timeZone: text("time_zone").notNull().default("Asia/Seoul"),
+  /** 기억 정리 (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" notifications — the user may turn each off. */
+  memoryProposals: integer("memory_proposals", { mode: "boolean" }).notNull().default(true),
+  memoryApplied: integer("memory_applied", { mode: "boolean" }).notNull().default(true),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -543,7 +546,7 @@ export const usageRecords = sqliteTable(
     model: text("model").notNull(),
     connectionId: text("connection_id"),
     purpose: text("purpose", {
-      enum: ["chat", "schedule", "title", "summary", "connection_test"],
+      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming"],
     }).notNull(),
     /** All input tokens, cached ones included (as the adapter contract reports them). */
     inputTokens: integer("input_tokens"),
@@ -1354,13 +1357,20 @@ export const memoryProposals = sqliteTable(
     ownerId: text("owner_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    conversationId: text("conversation_id")
-      .notNull()
-      .references(() => conversations.id, { onDelete: "cascade" }),
+    /** The conversation of a `memory_propose` card; null for a Dreaming bundle (#146 — it has none). */
+    conversationId: text("conversation_id").references(() => conversations.id, { onDelete: "cascade" }),
+    /** The run that made it: the conversation run (`runs.id`), or the Dreaming run (`dreaming_runs.id`). */
     runId: text("run_id").notNull(),
+    /** Who proposed it (#146): the conversation tool's card, or a Dreaming run's bundle (설정 → 내 지침 → 제안). */
+    origin: text("origin", { enum: ["tool", "dreaming"] })
+      .notNull()
+      .default("tool"),
     mode: text("mode", { enum: ["review", "auto"] }).notNull(),
-    /** Why decisions wait for the card in auto mode: a sensitive category, or the run had read outside content. */
-    forced: text("forced", { enum: ["sensitive", "external"] }),
+    /**
+     * Why decisions wait for the card in auto mode: a sensitive category, the run had read outside content, or
+     * (Dreaming) a source message that itself reads like an instruction to the assistant (pasted text, spec §3.5).
+     */
+    forced: text("forced", { enum: ["sensitive", "external", "suspicious"] }),
     /** `{ user?: n, memory?: n }` — the pinned base version per document kind. */
     base: text("base", { mode: "json" }).$type<Partial<Record<"user" | "memory", number>>>().notNull(),
     /** `{ user?: { before, after }, memory?: … }` — what this bundle applied, for 되돌리기. */
@@ -1389,8 +1399,11 @@ export const memoryProposalDecisions = sqliteTable(
       .references(() => memoryProposals.id, { onDelete: "cascade" }),
     idx: integer("idx").notNull(),
     doc: text("doc", { enum: ["user", "memory"] }).notNull(),
-    action: text("action", { enum: ["add", "replace", "delete"] }).notNull(),
+    /** `merge` is Dreaming's only (#146): the items of `merge_ids` become the one line `text`. */
+    action: text("action", { enum: ["add", "replace", "delete", "merge"] }).notNull(),
     itemId: text("item_id"),
+    /** A merge's items (JSON array of item ids, in document order); null otherwise. */
+    mergeIds: text("merge_ids", { mode: "json" }).$type<string[]>(),
     text: text("text"),
     before: text("before"),
     /** JSON `[{ messageId, revision, conversationId }]`. */
@@ -1413,3 +1426,145 @@ export const memoryProposalDecisions = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.proposalId, t.idx] })],
 );
+
+/**
+ * 기억 정리 processing sequence (#146, docs/memory-spec.md §6): every user message gets, when its revision becomes
+ * part of the active history (it is inserted active — an edit inserts a new revision), the next number of its
+ * conversation owner's own counter — one line across all of the user's conversations, distinct even at the same
+ * instant. Written by the `messages_memory_seq` trigger (migration 0031), so no save path can forget it; goes with
+ * the message.
+ */
+export const memoryMessageSeq = sqliteTable(
+  "memory_message_seq",
+  {
+    messageId: text("message_id")
+      .primaryKey()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    seq: integer("seq").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [uniqueIndex("memory_message_seq_user_idx").on(t.userId, t.seq)],
+);
+
+/** The last processing sequence number given per user (never reused, even when its message is deleted). */
+export const memorySeqCounters = sqliteTable("memory_seq_counters", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  last: integer("last").notNull(),
+});
+
+/**
+ * 기억 정리 per user (#146, spec §6·§9): the admin's on/off for this user (no row = on), the checkpoint (the processing
+ * sequence of the last **new** message a run included — it never decreases), and since when the user's rounds were
+ * paused (deactivated, turned off): when they resume, a checkpoint older than 7 days moves to 7 days ago.
+ */
+export const dreamingUsers = sqliteTable("dreaming_users", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  checkpoint: integer("checkpoint").notNull().default(0),
+  /** When the checkpoint last moved (null: never — a first run counts like a resume). */
+  checkpointAt: integer("checkpoint_at"),
+  pausedAt: integer("paused_at"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * One user's 기억 정리 round of one day (Asia/Seoul date, spec §6): when it is due (`next_at`), how often it waited for
+ * a running answer (at most 6 × 10 minutes) and how many attempts it started (a failure is tried once more 30 minutes
+ * later). `state`: waiting → running → done / failed / skipped; `missed` = its time passed while the round could not
+ * start (turned on later that day). Past midnight a waiting round is dropped (`expired`).
+ */
+export const dreamingDays = sqliteTable(
+  "dreaming_days",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    date: text("date").notNull(),
+    state: text("state", {
+      enum: ["waiting", "running", "done", "failed", "skipped", "missed", "expired", "paused"],
+    }).notNull(),
+    trigger: text("trigger", { enum: ["regular", "catchup", "manual"] }).notNull(),
+    scheduledAt: integer("scheduled_at").notNull(),
+    nextAt: integer("next_at").notNull(),
+    deferrals: integer("deferrals").notNull().default(0),
+    attempts: integer("attempts").notNull().default(0),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.date] }), index("dreaming_days_next_idx").on(t.state, t.nextAt)],
+);
+
+/**
+ * Every 기억 정리 attempt (#146) — what the user's `DREAMS.md` lists and the admin's status shows: **counts, times and
+ * the result only**, never an item's or a message's text (spec §10.4). `idem_key` = `dreaming:<user>:<date>:<attempt>`
+ * (unique: a restart never runs or applies an attempt twice). A preview (미리 실행) is recorded too (`trigger`
+ * `preview`) but changes nothing.
+ */
+export const dreamingRuns = sqliteTable(
+  "dreaming_runs",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    date: text("date").notNull(),
+    attempt: integer("attempt").notNull(),
+    idemKey: text("idem_key").notNull(),
+    trigger: text("trigger", { enum: ["regular", "catchup", "retry", "manual", "preview"] }).notNull(),
+    status: text("status", {
+      enum: ["running", "applied", "proposed", "refused", "unchanged", "skipped", "failed"],
+    }).notNull(),
+    /** Why it was skipped or failed (fixed codes), null otherwise. */
+    code: text("code"),
+    /** `DreamingCounts` (@agentlee/shared): numbers only. */
+    counts: text("counts", { mode: "json" }).$type<Record<string, unknown>>().notNull(),
+    runtime: text("runtime"),
+    model: text("model"),
+    connectionId: text("connection_id"),
+    promptVersion: integer("prompt_version"),
+    startedAt: integer("started_at").notNull(),
+    finishedAt: integer("finished_at"),
+  },
+  (t) => [
+    uniqueIndex("dreaming_runs_idem_idx").on(t.idemKey),
+    index("dreaming_runs_user_idx").on(t.userId, t.startedAt),
+  ],
+);
+
+/**
+ * The re-processing queue (#146, spec §5·§6): source messages of an expired Dreaming bundle (and the input a run could
+ * not give a document that had a bundle waiting for review), for that document. Taken first by the next run; never
+ * moves the checkpoint. Goes with the message (and is dropped when it leaves the active history, spec §10.3).
+ */
+export const dreamingQueue = sqliteTable(
+  "dreaming_queue",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    messageId: text("message_id")
+      .notNull()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    doc: text("doc", { enum: ["user", "memory"] }).notNull(),
+    addedAt: integer("added_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.messageId, t.doc] })],
+);
+
+/**
+ * The admin's cleanup prompt (#146, FR-16.6): the editable part only — the output format, the forbidden rules and the
+ * validation are fixed in code. One row per saved version; the newest is the one in use (a restore saves a new one).
+ */
+export const dreamingPrompts = sqliteTable("dreaming_prompts", {
+  version: integer("version").primaryKey(),
+  content: text("content").notNull(),
+  authorId: text("author_id"),
+  restoredFrom: integer("restored_from"),
+  createdAt: integer("created_at").notNull(),
+});

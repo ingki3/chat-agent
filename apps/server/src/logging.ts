@@ -43,6 +43,9 @@ import {
   isUsagePurpose,
   isScheduleCode,
   isMemoryCode,
+  isDreamingTrigger,
+  isDreamingStatus,
+  isDreamingCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -183,6 +186,11 @@ export const LOG_EVENTS = [
   "memory.sessions_reclaimed",
   // 대화 중 기억해줘 (#145): tool name and fixed `memory_*` outcome code, duration and IDs — never an item or a message.
   "memory.proposed",
+  // 기억 정리 (#146): a run's start and end (IDs, attempt, trigger, fixed status and code, counts) and the admins'
+  // failure alert (how many users) — never an item, a message or a prompt.
+  "dreaming.run_started",
+  "dreaming.run_finished",
+  "dreaming.alert_sent",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -307,6 +315,10 @@ const FIELDS = new Map<string, Check>([
   ["lateMs", isNum],
   /** 대화 중 기억해줘 (#145): the tool's fixed outcome code. */
   ["memoryCode", isMemoryCode],
+  /** 기억 정리 (#146): why the run started, its fixed status and code. */
+  ["dreamingTrigger", isDreamingTrigger],
+  ["dreamingStatus", isDreamingStatus],
+  ["dreamingCode", isDreamingCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -584,6 +596,9 @@ export type LogFields = {
   scheduleStep?: string;
   lateMs?: number;
   memoryCode?: string;
+  dreamingTrigger?: string;
+  dreamingStatus?: string;
+  dreamingCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

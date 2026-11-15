@@ -14,6 +14,7 @@ const PURPOSE: Record<UsageRecordView["purpose"], string> = {
   title: "제목",
   summary: "요약",
   connection_test: "연결 테스트",
+  dreaming: "기억 정리",
 };
 
 function GroupTable({ groups, label }: { groups: UsageGroup[]; label: string }) {

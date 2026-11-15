@@ -10,6 +10,9 @@ import {
   SCHEDULE_PROPOSAL_CODES,
   SCHEDULE_RUN_CODES,
   MEMORY_TOOL_CODES,
+  DREAMING_CODE_LABEL,
+  DreamingRunStatus,
+  DreamingTrigger,
 } from "@agentlee/shared";
 import { USAGE_PURPOSES } from "../usage/store.js";
 
@@ -300,6 +303,10 @@ export const isScheduleCode = member(SCHEDULE_CODES);
 /** 대화 중 기억해줘 (#145): the memory tools' outcome codes. */
 export const isMemoryCode = member(set(MEMORY_TOOL_CODES));
 export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
+/** 기억 정리 (#146): fixed triggers, statuses and codes (shared `DREAMING_*`). */
+export const isDreamingTrigger = member(set(DreamingTrigger.options));
+export const isDreamingStatus = member(set(DreamingRunStatus.options));
+export const isDreamingCode = member(set(Object.keys(DREAMING_CODE_LABEL)));
 export const isScheduleStatus = member(set(["succeeded", "failed", "skipped", "retrying"]));
 export const isScheduleStep = member(set(["save", "notify", "engine", "warn"]));
 export const isRestoreRecovery = member(set(["completed", "rolled_back"]));

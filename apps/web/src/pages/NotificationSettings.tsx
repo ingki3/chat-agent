@@ -196,6 +196,7 @@ export function NotificationSettings() {
         </div>
       )}
       <QuietHours />
+      <MemoryNotifications />
     </section>
   );
 }
@@ -291,5 +292,48 @@ function QuietHours() {
         </p>
       )}
     </form>
+  );
+}
+
+/** 기억 정리 notifications (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" — each can be turned off. */
+function MemoryNotifications() {
+  const qc = useQueryClient();
+  const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
+  const save = useMutation({
+    mutationFn: (patch: Pick<NotificationPrefs, "memoryProposals" | "memoryApplied">) =>
+      notifications.setPrefs({ ...prefs.data!, ...patch }),
+    onSuccess: (p) => qc.setQueryData(PREFS_KEY, p),
+  });
+  const loading = !prefs.data || save.isPending;
+  return (
+    <fieldset className="quiet" data-testid="memory-notifications">
+      <legend>
+        <h3>기억 정리 알림</h3>
+      </legend>
+      <label className="row">
+        <input
+          type="checkbox"
+          checked={prefs.data?.memoryProposals !== false}
+          disabled={loading}
+          onChange={(e) => save.mutate({ memoryProposals: e.target.checked })}
+        />{" "}
+        기억 정리 제안이 기다릴 때
+      </label>
+      <label className="row">
+        <input
+          type="checkbox"
+          checked={prefs.data?.memoryApplied !== false}
+          disabled={loading}
+          onChange={(e) => save.mutate({ memoryApplied: e.target.checked })}
+        />{" "}
+        기억 정리가 자동으로 반영했을 때
+      </label>
+      <p className="muted small">알림에는 개수만 적혀요. 내용은 설정 → 내 지침에서 봐요.</p>
+      {save.isError && (
+        <p className="error small" role="alert">
+          {errorText(save.error)}
+        </p>
+      )}
+    </fieldset>
   );
 }

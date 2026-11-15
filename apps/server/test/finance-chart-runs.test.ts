@@ -1259,6 +1259,8 @@ describe("the one-time compaction is done only when the file is clean (review #1
 
   it("a real SQLITE_FULL (page limit) at start-up: the server starts, and the in-process retry compacts once the limit is lifted", async () => {
     const l = legacy();
+    // No free pages left for a write to reuse (a migration that rebuilds a table, 0031, leaves some behind).
+    l.db.$client.exec("VACUUM");
     const pages = l.db.$client.pragma("page_count", { simple: true }) as number;
     l.db.$client.pragma(`max_page_count = ${pages}`);
     const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {

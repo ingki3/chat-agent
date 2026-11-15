@@ -9,6 +9,7 @@ import { pythonScenario, type PythonScenario } from "./fake-python.js";
 import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import { readReferences, switchSteps, type ReadReferences } from "./fake-switch.js";
 import { memorySteps } from "./fake-memory.js";
+import { dreamingSteps } from "./fake-dreaming.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -65,6 +66,7 @@ import {
  *                     with the ids this session read from its start context's conversation references
  *                     (`fake-switch.ts`)
  *
+ * A 기억 정리 request (#146, `DREAMING_MARKER`) is answered by `fake-dreaming.ts` (from "기억: …" / "나: …" lines).
  * The run manager's summary request (`SUMMARY_REQUEST`, #45) is answered with `fakeSummary` of what the session
  * was given — deterministic, so tests can tell which messages a summary covers.
  */
@@ -383,6 +385,8 @@ export const defaultScript: FakeScript = (input, memory) => {
       { usage: { inputTokens: 20 * memory.length, outputTokens: 30, costUsd: 0.0001 } },
     ];
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
+  const dreaming = dreamingSteps(t);
+  if (dreaming) return dreaming;
   const switched = switchSteps(t);
   if (switched) return switched;
   const remembered = memorySteps(t);
