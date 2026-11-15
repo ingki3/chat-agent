@@ -108,7 +108,7 @@ pmset -g | grep -E ' sleep|disksleep|autorestart'
 
 ### 5.2 앱 데몬 설치
 
-**전제: Access 애플리케이션이 `chat.2prostream.com`을 보호하고 있어야 한다**(설치하는 순간 앱이 터널을 통해 인터넷에 열린다). 2026-11-15에 Access를 켰고 `TEMP_GATE_CODE`는 운영 `.env`에서 지웠다 — 이 전제는 충족됐고, 운영 서버는 LaunchDaemon으로 자동 시작한다(사용자 승인).
+**전제: Access 애플리케이션이 `chat.2prostream.com`을 보호하고 있어야 한다**(설치하는 순간 앱이 터널을 통해 인터넷에 열린다). 2026-11-15에 Access를 켰고 `TEMP_GATE_CODE`는 운영 `.env`에서 지웠다 — 이 전제는 충족됐다. LaunchDaemon 자동 시작은 승인됐고(사용자), 43.4절 이전 때 설치한다 — 그 전까지 운영 서버는 지금처럼 serve worktree에서 수동(nohup)으로 돈다.
 
 데몬은 **설치된 배포본에서** 설치한다(43절). 먼저 `pnpm -s release install`로 배포본이 있어야 한다.
 
@@ -1898,7 +1898,7 @@ TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.t
 ### 43.2 설치·업데이트 (`install`)
 ```bash
 pnpm -s release install                 # 브랜치 main 최신 커밋 (refs/heads/main — 이름이 main인 태그가 아님)
-pnpm -s release install --ref <브랜치|태그|커밋|refs/…>   # 브랜치와 태그가 같은 이름이면 거부 → refs/heads/… 또는 refs/tags/…
+pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이름이 겹치면(브랜치·태그, 커밋 id) 거부 → refs/heads/… 또는 refs/tags/…, 커밋은 40자 전체만
 ```
 순서 — 하나라도 실패하면 그 자리에서 멈추고(새 폴더는 지움) `current`는 그대로다:
 1. 잠금 → `shared/.env` 확인(있음·일반 파일·내 소유·600). LaunchDaemon이 설치돼 있으면 plist가 `~/.chat-agent/current`를 돌리는지 확인(아니면 5.2절대로 다시 설치하라고 멈춤).

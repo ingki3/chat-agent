@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Production releases of Agent Lee from git (#143). See docs/ops.md §43.
 #
-#   pnpm -s release install [--ref <branch|tag|sha|refs/…>] [--no-start] [--fresh] [--force]   (default refs/heads/main)
+#   pnpm -s release install [--ref <branch|tag|full sha|refs/…>] [--no-start] [--fresh] [--force]   (default refs/heads/main)
 #   pnpm -s release status
 #   pnpm -s release rollback [--to <release>]
 #   pnpm -s release prune [--keep 3]
@@ -284,22 +284,30 @@ prune_releases() { # prune_releases <keep>
   done
 }
 
-# A ref → a full ref name (or a commit id). Default: the branch refs/heads/main — never a tag that happens to be called
-# `main`. A bare name that is both a branch and a tag is refused (say refs/heads/… or refs/tags/…).
+# A ref → a full ref name or a full commit id. Default: the branch refs/heads/main — never a tag that happens to be
+# called `main`. A bare name that is both a branch and a tag is refused (say refs/heads/… or refs/tags/…). Commits only
+# as the full 40-character id: a short prefix can also be a branch or tag name (#148 review round 2).
 resolve_ref() {
   local ref="$1" g=(git -C "$ROOT/src.git") b t
   if [ -z "$ref" ]; then echo refs/heads/main; return 0; fi
   case "$ref" in refs/heads/*|refs/tags/*) echo "$ref"; return 0 ;; esac
-  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then echo "$ref"; return 0; fi
   b=0; t=0
   "${g[@]}" show-ref --verify --quiet "refs/heads/$ref" && b=1
   "${g[@]}" show-ref --verify --quiet "refs/tags/$ref" && t=1
   if [ "$b" = 1 ] && [ "$t" = 1 ]; then
     echo "release: ref $ref is both a branch and a tag — say refs/heads/$ref or refs/tags/$ref" >&2; return 1
   fi
+  # A name that looks like a commit id (or a prefix of one) and is also a branch or tag: which one is meant?
+  if [[ "$ref" =~ ^[0-9a-f]{4,40}$ ]] && { [ "$b" = 1 ] || [ "$t" = 1 ]; }; then
+    echo "release: $ref looks like a commit id and is also a branch or tag name — ambiguous; say refs/heads/$ref or refs/tags/$ref" >&2
+    return 1
+  fi
+  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then echo "$ref"; return 0; fi
   if [ "$b" = 1 ]; then echo "refs/heads/$ref"; return 0; fi
   if [ "$t" = 1 ]; then echo "refs/tags/$ref"; return 0; fi
-  if [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then echo "$ref"; return 0; fi
+  if [[ "$ref" =~ ^[0-9a-f]{4,39}$ ]]; then
+    echo "release: unknown ref: $ref — give a commit as its full 40-character id" >&2; return 1
+  fi
   echo "release: unknown ref: $ref" >&2; return 1
 }
 

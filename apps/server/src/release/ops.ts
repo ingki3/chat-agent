@@ -98,6 +98,11 @@ export async function predeployBackup(o: {
   const dbFile = storagePaths(o.dataDir).db;
   if (!fs.existsSync(dbFile)) return undefined;
   ensureBackupDir(o.backupDir);
+  // Staging folders left by a killed run (never listed as backups, but they hold a copy of the database): removed
+  // before a new one starts. Pre-deploy backups run one at a time — release.sh holds its lock around this helper.
+  for (const name of fs.readdirSync(o.backupDir))
+    if (name.startsWith(".predeploy-"))
+      fs.rmSync(path.join(o.backupDir, name), { recursive: true, force: true });
   const staging = path.join(o.backupDir, `.predeploy-${crypto.randomBytes(4).toString("hex")}`);
   let live: Database.Database | undefined;
   let sqlite: Database.Database | undefined;
@@ -107,10 +112,14 @@ export async function predeployBackup(o: {
     // as the rows. Reading them from the live database (another process — our FileWriteLock does not stop the
     // server) could miss a file whose row the snapshot still has, if the server purged it in between (#148 review).
     fs.mkdirSync(staging, { mode: 0o700 });
+    fs.chmodSync(staging, 0o700); // whatever the caller's umask
     const snapFile = path.join(staging, "live-snapshot.db");
+    fs.writeFileSync(snapFile, "", { mode: 0o600, flag: "wx" }); // owner-only before any data is written
+    fs.chmodSync(snapFile, 0o600);
     live = new Database(dbFile, { readonly: true, fileMustExist: true });
     live.pragma("busy_timeout = 5000");
     live.prepare("VACUUM INTO ?").run(snapFile);
+    fs.chmodSync(snapFile, 0o600);
     live.close();
     live = undefined;
     o.afterSnapshot?.();

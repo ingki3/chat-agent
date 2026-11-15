@@ -472,6 +472,22 @@ describe.skipIf(process.platform === "win32")("release.sh", () => {
     expect(amb.stderr).toMatch(/both a branch and a tag — say refs\/heads\/main or refs\/tags\/main/);
     ok(fx.run("install", "--ref", "refs/tags/main"));
     expect(await fx.served()).toBe("v1");
+
+    // A short commit id that is also a branch name (pointing elsewhere): refused, not resolved to either (round 2).
+    const v3 = fx.commit({ "version.txt": "v3\n" }, "v3");
+    const prefix = v3.slice(0, 8);
+    fx.git(fx.work, "push", "--quiet", fx.src, `HEAD~2:refs/heads/${prefix}`);
+    const before = fx.current();
+    const short = fx.run("install", "--ref", prefix);
+    expect(short.status).toBe(1);
+    expect(short.stderr).toMatch(/looks like a commit id and is also a branch or tag name — ambiguous/);
+    expect(fx.current()).toBe(before);
+    // A short id alone is not accepted either; the full id is.
+    const alone = fx.run("install", "--ref", v3.slice(0, 10));
+    expect(alone.status).toBe(1);
+    expect(alone.stderr).toMatch(/full 40-character id/);
+    ok(fx.run("install", "--ref", v3));
+    expect(await fx.served()).toBe("v3");
   }, 120_000);
 
   it("moves data with a LaunchDaemon plist on disk once the daemon is unloaded (#148 review P2)", async () => {

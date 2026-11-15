@@ -180,6 +180,40 @@ describe("predeployBackup", () => {
     db.$client.close();
   });
 
+  it("clears staging left by a killed run and keeps the snapshot owner-only under any umask (round 2)", async () => {
+    const root = tmp();
+    const { dataDir, db } = dataFolder(root);
+    db.$client.close();
+    const key = createMasterKey(path.join(root, "key", "master.key"));
+    const backupDir = path.join(root, "backups");
+    fs.mkdirSync(path.join(backupDir, ".predeploy-deadbeef"), { recursive: true });
+    fs.writeFileSync(path.join(backupDir, ".predeploy-deadbeef", "live-snapshot.db"), "stale copy");
+    const modes: string[] = [];
+    const old = process.umask(0o022);
+    try {
+      const r = await predeployBackup({
+        dataDir,
+        backupDir,
+        masterKey: key,
+        afterSnapshot: () => {
+          for (const n of fs.readdirSync(backupDir).filter((x) => x.startsWith(".predeploy-"))) {
+            const dir = path.join(backupDir, n);
+            modes.push(
+              `${n === ".predeploy-deadbeef" ? "stale" : "staging"} ${(fs.statSync(dir).mode & 0o777).toString(8)}`,
+            );
+            modes.push(
+              `snapshot ${(fs.statSync(path.join(dir, "live-snapshot.db")).mode & 0o777).toString(8)}`,
+            );
+          }
+        },
+      });
+      expect(modes).toEqual(["staging 700", "snapshot 600"]);
+      expect(fs.readdirSync(backupDir)).toEqual([r!.id]);
+    } finally {
+      process.umask(old);
+    }
+  });
+
   it("checks whether a release can restore a backup (rollback hint, #148 review P2)", async () => {
     const root = tmp();
     const { dataDir, db } = dataFolder(root);
