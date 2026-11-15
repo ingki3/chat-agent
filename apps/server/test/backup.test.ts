@@ -762,12 +762,21 @@ describe("schedule and admin routes (#37)", () => {
   it("the scheduler runs the backup at its time, and a missed one soon after start; close stops it", async () => {
     const L = layout();
     createMasterKey(L.keyPath);
-    const realStart = Date.now();
-    // 500 ms before 03:30 Seoul — room for the start itself (migrations, routes), which takes about 50 ms.
+    // 500 ms before 03:30 Seoul. The clock stands still until the server is ready, then runs: however long the start
+    // takes (migrations, routes — slower on CI), the next run is still today's 03:30 (review #160: a slow start once
+    // put it a day later).
     const base = Date.UTC(2026, 10, 11, 18, 30) - 500;
+    let readyAt: number | null = null;
     const one = await start({
       ...L,
-      backup: { schedule: true, now: () => base + (Date.now() - realStart), catchUpMs: 24 * 3600_000 },
+      backup: {
+        schedule: true,
+        now: () => base + (readyAt === null ? 0 : Date.now() - readyAt),
+        catchUpMs: 24 * 3600_000,
+      },
+    });
+    one.app.addHook("onReady", async () => {
+      readyAt = Date.now();
     });
     await one.app.ready();
     expect(one.app.backups!.status().nextRunAt).toBe(Date.UTC(2026, 10, 11, 18, 30));

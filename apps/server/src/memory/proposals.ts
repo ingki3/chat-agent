@@ -40,10 +40,12 @@ import { DocConflict, type DocRow, type ItemOp, type ItemSource, type MemoryStor
 type ProposalRow = {
   id: string;
   owner_id: string;
-  conversation_id: string;
+  /** Null for a Dreaming bundle (#146): each source names its own conversation. */
+  conversation_id: string | null;
   run_id: string;
+  origin: "tool" | "dreaming";
   mode: MemoryApplyMode;
-  forced: "sensitive" | "external" | null;
+  forced: "sensitive" | "external" | "suspicious" | null;
   base: string;
   applied: string;
   created_at: number;
@@ -53,8 +55,10 @@ type DecisionRow = {
   proposal_id: string;
   idx: number;
   doc: MemoryListKind;
-  action: "add" | "replace" | "delete";
+  action: "add" | "replace" | "delete" | "merge";
   item_id: string | null;
+  /** A merge's items (JSON array), null otherwise. */
+  merge_ids: string | null;
   text: string | null;
   before: string | null;
   sources: string;
@@ -418,23 +422,26 @@ export class MemoryProposals {
   }
 
   /** Whether the document stays within its cap with these decisions (spec §4 크기). */
-  private fits(doc: DocRow, ops: readonly { action: string; itemId: string | null; text: string | null }[]) {
+  fits(doc: DocRow, ops: readonly OpLike[]) {
+    const z = this.sizeWith(doc, ops);
+    if (!z) return false;
+    const l = LIMIT[doc.kind as MemoryListKind];
+    return z.chars <= l.chars && z.bytes <= l.bytes;
+  }
+
+  /** The document's size with these decisions applied (the store's planner), or undefined when they cannot be. */
+  private sizeWith(doc: DocRow, ops: readonly OpLike[]): { chars: number; bytes: number } | undefined {
     const plan = this.store.planOps(
       doc,
       ops.map((o) => toOp(o)),
     );
-    if (!plan) return false;
+    if (!plan) return undefined;
     const texts = new Map(
       this.store
         .itemsByIds(plan.ids.filter((x): x is string => typeof x === "string"))
         .map((i) => [i.id, i.text]),
     );
-    const rendered = renderItems(
-      plan.ids.map((x) => (typeof x === "string" ? (texts.get(x) ?? "") : x.text)),
-    );
-    const z = docSize(rendered);
-    const l = LIMIT[doc.kind as MemoryListKind];
-    return z.chars <= l.chars && z.bytes <= l.bytes;
+    return docSize(renderItems(plan.ids.map((x) => (typeof x === "string" ? (texts.get(x) ?? "") : x.text))));
   }
 
   // ---- the card ----
@@ -477,6 +484,7 @@ export class MemoryProposals {
     return {
       id: p.id,
       conversationId: p.conversation_id,
+      origin: p.origin,
       mode: p.mode,
       forced: p.forced,
       decisions: ds.map((d): MemoryDecision => ({
@@ -505,12 +513,21 @@ export class MemoryProposals {
   private stillValid(p: ProposalRow, d: DecisionRow): boolean {
     const srcs = JSON.parse(d.sources) as ItemSource[];
     if (!srcs.length) return false;
+    // A Dreaming bundle's sources are in the user's own conversations, each its own (#146).
     for (const s of srcs)
-      if (!this.source(p.owner_id, p.conversation_id, s.messageId, s.revision)) return false;
+      if (!this.source(p.owner_id, p.conversation_id ?? s.conversationId, s.messageId, s.revision))
+        return false;
     if (d.text !== null && (holdsSecret(d.text) || triesRuleChange(d.text))) return false;
+    // A Dreaming decision never applies a sensitive category (spec §4), however it got here.
+    if (p.origin === "dreaming" && ((d.text !== null && isSensitive(d.text)) || d.sensitive === 1))
+      return false;
     const doc = this.store.doc(p.owner_id, d.doc);
+    const current = doc ? (this.store.current(doc)?.itemIds ?? []) : [];
     // Size is not judged per decision: only on the document with every decision applied together (spec §4 크기).
-    return !(d.item_id !== null && !(doc && (this.store.current(doc)?.itemIds ?? []).includes(d.item_id)));
+    if (d.item_id !== null && !current.includes(d.item_id)) return false;
+    return !(
+      d.merge_ids !== null && !(JSON.parse(d.merge_ids) as string[]).every((i) => current.includes(i))
+    );
   }
 
   /**
@@ -538,12 +555,7 @@ export class MemoryProposals {
       for (const d of mine)
         if (d.status === "pending" && !ok.includes(d)) this.setStatus(p, d.idx, "dropped");
       if (!ok.length) continue;
-      if (
-        !this.fits(
-          doc,
-          ok.map((d) => ({ action: d.action, itemId: d.item_id, text: d.text })),
-        )
-      ) {
+      if (!this.fits(doc, ok.map(opOf))) {
         for (const d of ok) this.setStatus(p, d.idx, "dropped");
         continue;
       }
@@ -551,10 +563,10 @@ export class MemoryProposals {
       try {
         v = this.store.applyOps({
           doc,
-          ops: ok.map((d) => toOp({ ...d, itemId: d.item_id }, JSON.parse(d.sources) as ItemSource[])),
+          ops: ok.map((d) => toOp(opOf(d), JSON.parse(d.sources) as ItemSource[])),
           base: doc.version,
-          author: "tool",
-          itemAuthor: "tool",
+          author: p.origin === "dreaming" ? "dreaming" : "tool",
+          itemAuthor: p.origin === "dreaming" ? "dreaming" : "tool",
           actorId: p.owner_id,
         });
       } catch (e) {
@@ -585,18 +597,16 @@ export class MemoryProposals {
       const doc = this.store.doc(p.owner_id, k);
       if (!doc) continue;
       const rest = this.decisions(p.id).filter((d) => d.doc === k && d.status === "pending");
-      // The best case: every remaining decision that makes room — deletes, and replaces with a shorter line.
-      const shrinks = (d: DecisionRow) =>
-        d.action === "delete" ||
-        (d.action === "replace" &&
-          d.before !== null &&
-          d.text !== null &&
-          docSize(d.text).chars <= docSize(d.before).chars &&
-          docSize(d.text).bytes <= docSize(d.before).bytes);
+      // The best case: every remaining decision that makes room — whatever the planner says leaves the document no
+      // larger: deletes, shorter replaces, and merges (their lines become one, review #160 round 1).
+      const now = this.sizeWith(doc, []);
+      const shrinks = (d: DecisionRow) => {
+        const after = this.sizeWith(doc, [opOf(d)]);
+        return !!now && !!after && after.chars <= now.chars && after.bytes <= now.bytes;
+      };
       const room = rest.filter(shrinks);
-      const op = (x: DecisionRow) => ({ action: x.action, itemId: x.item_id, text: x.text });
       for (const d of rest)
-        if (!shrinks(d) && !this.fits(doc, [...room.map(op), op(d)])) this.setStatus(p, d.idx, "dropped");
+        if (!shrinks(d) && !this.fits(doc, [...room.map(opOf), opOf(d)])) this.setStatus(p, d.idx, "dropped");
     }
   }
 
@@ -615,7 +625,9 @@ export class MemoryProposals {
           return "ok" as const;
         } catch (e) {
           if (!(e instanceof Expired)) throw e;
-          // Thrown before anything was written: every pending decision of the bundle expires.
+          // Thrown before anything was written: every pending decision of the bundle expires — a Dreaming bundle's
+          // sources go to the re-processing queue for the next run (spec §5 "다시 정리할게요").
+          this.requeue(p);
           this.sql
             .prepare(
               `update memory_proposal_decisions set status = 'expired', updated_at = ?
@@ -690,6 +702,190 @@ export class MemoryProposals {
     return this.view(id, userId);
   }
 
+  // ---- 기억 정리 bundles (#146, spec §5) ----
+
+  /**
+   * A Dreaming bundle that expired: the sources of its decisions still pending go to the re-processing queue, each for
+   * its decision's document (spec §5) — only messages still in the active history (a deleted one has nothing to give,
+   * §10.3). Rejected decisions are never queued (the same proposal must not come back). In the caller's transaction.
+   */
+  private requeue(p: ProposalRow): void {
+    if (p.origin !== "dreaming") return;
+    const ins = this.sql.prepare(
+      `insert or ignore into dreaming_queue (user_id, message_id, doc, added_at)
+         select ?, m.id, ?, ? from messages m where m.id = ? and m.active = 1`,
+    );
+    for (const d of this.decisions(p.id))
+      if (d.status === "pending")
+        for (const src of JSON.parse(d.sources) as ItemSource[])
+          ins.run(p.owner_id, d.doc, this.now(), src.messageId);
+  }
+
+  /**
+   * Stores a Dreaming run's bundle (#146) in the caller's transaction and applies at once the decisions `auto` names
+   * (자동 반영: one version per document, author 기억 정리). Decisions are already checked (spec §4) — this is the same
+   * card model as the conversation tool's, so 반영 / 거절 / 만료 / 되돌리기 behave the same. Returns the bundle's id
+   * and how many decisions are applied and pending now.
+   */
+  createDreamingBundle(input: {
+    ownerId: string;
+    runId: string;
+    mode: MemoryApplyMode;
+    forced: ProposalRow["forced"];
+    base: Base;
+    decisions: {
+      doc: MemoryListKind;
+      action: "add" | "replace" | "delete" | "merge";
+      itemId: string | null;
+      mergeIds: string[] | null;
+      text: string | null;
+      before: string | null;
+      sources: ItemSource[];
+      targetSources: ItemSource[];
+      auto: boolean;
+    }[];
+  }): { id: string; applied: number; pending: number; dropped: number } {
+    const at = this.now();
+    const id = crypto.randomUUID();
+    this.sql
+      .prepare(
+        `insert into memory_proposals (id, owner_id, conversation_id, run_id, origin, mode, forced, base, applied,
+           created_at, updated_at) values (?, ?, null, ?, 'dreaming', ?, ?, ?, '{}', ?, ?)`,
+      )
+      .run(id, input.ownerId, input.runId, input.mode, input.forced, JSON.stringify(input.base), at, at);
+    const ins = this.sql.prepare(
+      `insert into memory_proposal_decisions (proposal_id, idx, doc, action, item_id, merge_ids, text, before, sources,
+         target_sources, sensitive, status, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?)`,
+    );
+    input.decisions.forEach((d, i) =>
+      ins.run(
+        id,
+        i,
+        d.doc,
+        d.action,
+        d.itemId,
+        d.mergeIds === null ? null : JSON.stringify(d.mergeIds),
+        d.text === null ? null : scrubKnown(d.text),
+        d.before === null ? null : scrubKnown(d.before),
+        JSON.stringify(d.sources),
+        JSON.stringify(d.targetSources),
+        at,
+      ),
+    );
+    const now = input.decisions.flatMap((d, i) => (d.auto ? [i] : []));
+    if (now.length) this.applyIndexes(this.row(id)!, now, "applied");
+    const st = this.decisions(id).map((d) => d.status);
+    const count = (x: MemoryDecisionStatus) => st.filter((v) => v === x).length;
+    return { id, applied: count("applied"), pending: count("pending"), dropped: count("dropped") };
+  }
+
+  /**
+   * The list documents of the user that have a Dreaming decision waiting for review (spec §5: not touched) — leaving
+   * out the bundles in `except` (those about to expire).
+   */
+  pendingDreamingDocs(userId: string, except: ReadonlySet<string> = new Set()): Set<MemoryListKind> {
+    const rows = this.sql
+      .prepare(
+        `select distinct d.doc as doc, p.id as id from memory_proposal_decisions d
+           join memory_proposals p on p.id = d.proposal_id
+          where p.owner_id = ? and p.origin = 'dreaming' and d.status = 'pending'`,
+      )
+      .all(userId) as { doc: MemoryListKind; id: string }[];
+    return new Set(rows.filter((r) => !except.has(r.id)).map((r) => r.doc));
+  }
+
+  /**
+   * What the user already rejected from 기억 정리 (spec §5: never proposed again), as fingerprints — the document,
+   * the action, the folded new line and the items it targets (`dreamingFingerprint`). A message queued again for
+   * another reason (an expired sibling decision) therefore cannot bring a rejected change back (review #160).
+   */
+  rejectedDreaming(userId: string): Set<string> {
+    const rows = this.sql
+      .prepare(
+        `select d.* from memory_proposal_decisions d join memory_proposals p on p.id = d.proposal_id
+          where p.owner_id = ? and p.origin = 'dreaming' and d.status = 'rejected'`,
+      )
+      .all(userId) as DecisionRow[];
+    return new Set(
+      rows.map((d) =>
+        dreamingFingerprint({
+          doc: d.doc,
+          action: d.action,
+          text: d.text,
+          targets: d.merge_ids ? (JSON.parse(d.merge_ids) as string[]) : d.item_id ? [d.item_id] : [],
+        }),
+      ),
+    );
+  }
+
+  /** Dreaming bundles with decisions pending whose pinned documents changed since (they expire at the next run). */
+  private staleRows(userId: string): ProposalRow[] {
+    const rows = this.sql
+      .prepare(
+        `select * from memory_proposals p where p.owner_id = ? and p.origin = 'dreaming' and exists (
+           select 1 from memory_proposal_decisions d where d.proposal_id = p.id and d.status = 'pending')`,
+      )
+      .all(userId) as ProposalRow[];
+    return rows.filter((p) => {
+      const base = JSON.parse(p.base) as Base;
+      return KINDS.some(
+        (k) => base[k] !== undefined && (this.store.doc(p.owner_id, k)?.version ?? 0) !== base[k],
+      );
+    });
+  }
+
+  /**
+   * What `expireStaleDreaming` would do, without writing (review #160 round 1: a run that then fails must change
+   * nothing): the bundles, and the sources their pending decisions would queue again, per document.
+   */
+  staleDreaming(userId: string): { ids: Set<string>; requeue: { messageId: string; doc: MemoryListKind }[] } {
+    const rows = this.staleRows(userId);
+    const requeue: { messageId: string; doc: MemoryListKind }[] = [];
+    for (const p of rows)
+      for (const d of this.decisions(p.id))
+        if (d.status === "pending")
+          for (const src of JSON.parse(d.sources) as ItemSource[])
+            requeue.push({ messageId: src.messageId, doc: d.doc });
+    return { ids: new Set(rows.map((p) => p.id)), requeue };
+  }
+
+  /**
+   * Before a run (spec §5): every Dreaming bundle of the user with decisions still pending whose documents changed
+   * since (a user edit, the conversation tool, a restore, the deletion linkage) expires now — its pending sources go to
+   * the queue, so the run takes them up again instead of the document staying blocked. Returns how many expired.
+   */
+  expireStaleDreaming(userId: string): number {
+    let n = 0;
+    for (const p of this.staleRows(userId)) {
+      this.requeue(p);
+      this.sql
+        .prepare(
+          `update memory_proposal_decisions set status = 'expired', updated_at = ?
+            where proposal_id = ? and status = 'pending'`,
+        )
+        .run(this.now(), p.id);
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * The user's Dreaming bundles for 설정 → 내 지침 → 제안 (owner only): those with something to decide, and those of
+   * the last 7 days (an automatic change can still be undone there). Newest first.
+   */
+  listDreaming(userId: string, limit = 20): MemoryProposal[] {
+    const since = this.now() - 7 * 86_400_000;
+    const rows = this.sql
+      .prepare(
+        `select * from memory_proposals p where p.owner_id = ? and p.origin = 'dreaming'
+           and (p.created_at >= ? or exists (select 1 from memory_proposal_decisions d
+                                              where d.proposal_id = p.id and d.status = 'pending'))
+         order by p.created_at desc limit ?`,
+      )
+      .all(userId, since, limit) as ProposalRow[];
+    return rows.map((p) => this.viewOf(p));
+  }
+
   // ---- deletion linkage (spec §10.3) ----
 
   /**
@@ -724,11 +920,42 @@ export class MemoryProposals {
 
 class Expired extends Error {}
 
-function toOp(
-  d: { action: string; itemId: string | null; text: string | null },
-  sources: ItemSource[] = [],
-): ItemOp {
+/** One change, as rejection memory compares it (the line folded like the checks read it). */
+export function dreamingFingerprint(d: {
+  doc: string;
+  action: string;
+  text: string | null;
+  targets: readonly string[];
+}): string {
+  // Identity, not a security check: case and everything else kept — only whitespace runs and Unicode composition
+  // are made the same (review #160 round 2: "/Work/Alpha" rejected must not reject "/work/alpha").
+  return JSON.stringify([
+    d.doc,
+    d.action,
+    d.text === null ? null : oneLine(d.text).normalize("NFC"),
+    [...d.targets].sort(),
+  ]);
+}
+
+/** What the store's planner needs of a decision. */
+export type OpLike = {
+  action: string;
+  itemId: string | null;
+  mergeIds?: string[] | null;
+  text: string | null;
+};
+
+const opOf = (d: DecisionRow): OpLike => ({
+  action: d.action,
+  itemId: d.item_id,
+  mergeIds: d.merge_ids === null ? null : (JSON.parse(d.merge_ids) as string[]),
+  text: d.text,
+});
+
+export function toOp(d: OpLike, sources: ItemSource[] = []): ItemOp {
   if (d.action === "add") return { action: "add", text: d.text ?? "", sources };
+  if (d.action === "merge")
+    return { action: "merge", itemIds: d.mergeIds ?? [], text: d.text ?? "", sources };
   if (d.action === "replace") return { action: "replace", itemId: d.itemId!, text: d.text ?? "", sources };
   return { action: "delete", itemId: d.itemId! };
 }

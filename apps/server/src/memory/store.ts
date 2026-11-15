@@ -28,7 +28,9 @@ export type Item = ItemRow & { sources: ItemSource[] };
 export type ItemOp =
   | { action: "add"; text: string; sources: ItemSource[] }
   | { action: "replace"; itemId: string; text: string; sources: ItemSource[] }
-  | { action: "delete"; itemId: string };
+  | { action: "delete"; itemId: string }
+  /** Dreaming only (#146, spec §4): the items become one line, in the place of the first of them. */
+  | { action: "merge"; itemIds: string[]; text: string; sources: ItemSource[] };
 
 /** The family-wide AGENT and the admin's default SOUL. */
 export const SYSTEM_AGENT_ID = "system:agent";
@@ -279,6 +281,17 @@ export class MemoryStore {
         ids.push({ text: op.text });
         continue;
       }
+      if (op.action === "merge") {
+        const at = mergeAt(ids, op.itemIds);
+        if (at === undefined) return undefined;
+        const first = ids[at];
+        for (const id of op.itemIds) {
+          const i = ids.indexOf(id);
+          if (id === first) ids[i] = { text: op.text };
+          else ids.splice(i, 1);
+        }
+        continue;
+      }
       const at = ids.indexOf(op.itemId);
       if (at < 0) return undefined;
       if (op.action === "delete") ids.splice(at, 1);
@@ -310,6 +323,22 @@ export class MemoryStore {
         for (const op of input.ops) {
           if (op.action === "add") {
             ids.push(this.addItem(doc, scrubKnown(op.text), input.itemAuthor, op.sources));
+            continue;
+          }
+          if (op.action === "merge") {
+            const at = mergeAt(ids, op.itemIds);
+            if (at === undefined) throw new DocConflict();
+            const first = ids[at]!;
+            // The merged line came from every merged item: deleting any of their sources removes it (spec §10.1).
+            const merged = this.addItem(doc, scrubKnown(op.text), input.itemAuthor, [
+              ...op.sources,
+              ...this.itemsByIds(op.itemIds).flatMap((i) => i.sources),
+            ]);
+            for (const id of op.itemIds) {
+              const i = ids.indexOf(id);
+              if (id === first) ids[i] = merged;
+              else ids.splice(i, 1);
+            }
             continue;
           }
           const at = ids.indexOf(op.itemId);
@@ -453,6 +482,20 @@ export class MemoryStore {
     this.db.delete(memoryItems).where(inArray(memoryItems.id, ids)).run();
     return { items: ids.length, affected };
   }
+}
+
+/**
+ * Where a merge's line goes: the place of the first of its items in the document (undefined when one of them is not
+ * there, or an item is named twice).
+ */
+function mergeAt(
+  ids: readonly (string | { text: string })[],
+  itemIds: readonly string[],
+): number | undefined {
+  if (itemIds.length < 2 || new Set(itemIds).size !== itemIds.length) return undefined;
+  const at = itemIds.map((id) => ids.indexOf(id));
+  if (at.some((i) => i < 0)) return undefined;
+  return Math.min(...at);
 }
 
 const sameIds = (a: readonly string[], b: readonly string[]) =>

@@ -76,10 +76,11 @@ export type MemoryDecisionStatus = z.infer<typeof MemoryDecisionStatus>;
 export const MemoryDecision = z.object({
   index: z.number().int().nonnegative(),
   doc: MemoryListKind,
-  action: z.enum(["add", "replace", "delete"]),
-  /** The new line (add, replace). */
+  /** `merge` comes from 기억 정리 only (#146): several items become one line. */
+  action: z.enum(["add", "replace", "delete", "merge"]),
+  /** The new line (add, replace, merge). */
   text: z.string().nullable(),
-  /** The line it replaces or deletes, as it was when proposed. */
+  /** The line it replaces or deletes, as it was when proposed — a merge's lines, one per line. */
   before: z.string().nullable(),
   /** A sensitive category (spec §4): always confirmed on the card. */
   sensitive: z.boolean(),
@@ -90,11 +91,17 @@ export type MemoryDecision = z.infer<typeof MemoryDecision>;
 /** `GET /api/memory-proposals/:id`: the card (the owner's only — anyone else 403). */
 export const MemoryProposal = z.object({
   id: z.string(),
-  conversationId: z.string(),
+  /** The conversation of a `memory_propose` card; null for a 기억 정리 bundle (#146). */
+  conversationId: z.string().nullable(),
+  /** Who proposed it: the conversation tool (the card under the reply) or 기억 정리 (설정 → 내 지침 → 제안). */
+  origin: z.enum(["tool", "dreaming"]),
   /** The setting when it was made. */
   mode: MemoryApplyMode,
-  /** Why some decisions wait for the card in 자동 반영 (sensitive category, or the answer read outside content). */
-  forced: z.enum(["sensitive", "external"]).nullable(),
+  /**
+   * Why some decisions wait for the card in 자동 반영: a sensitive category, the answer read outside content, or (기억
+   * 정리) a source message that itself reads like an instruction to the assistant (pasted text, spec §3.5).
+   */
+  forced: z.enum(["sensitive", "external", "suspicious"]).nullable(),
   decisions: z.array(MemoryDecision),
   /** 되돌리기 is possible: what this card applied is still the current document. */
   canUndo: z.boolean(),
@@ -103,7 +110,7 @@ export const MemoryProposal = z.object({
 export type MemoryProposal = z.infer<typeof MemoryProposal>;
 
 export const MemoryDecisionsRequest = z
-  .object({ indexes: z.array(z.number().int().nonnegative()).min(1).max(10) })
+  .object({ indexes: z.array(z.number().int().nonnegative()).min(1).max(50) })
   .strict();
 export type MemoryDecisionsRequest = z.infer<typeof MemoryDecisionsRequest>;
 

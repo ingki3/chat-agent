@@ -42,7 +42,7 @@ export const STATUS_BADGE: Record<MemoryDecisionStatus, string> = {
   dropped: "gray",
   undone: "gray",
 };
-const ACTION_LABEL = { add: "추가", replace: "고침", delete: "지움" } as const;
+const ACTION_LABEL = { add: "추가", replace: "고침", delete: "지움", merge: "합침" } as const;
 
 /** "MEMORY.md · 추가" */
 export const decisionTitle = (d: Pick<MemoryDecision, "doc" | "action">) =>
@@ -53,7 +53,10 @@ export function decisionDiff(
   d: Pick<MemoryDecision, "action" | "text" | "before">,
 ): { op: "add" | "del"; text: string }[] {
   return [
-    ...(d.action !== "add" && d.before !== null ? [{ op: "del" as const, text: d.before }] : []),
+    // A merge's lines (one per line) all go.
+    ...(d.action !== "add" && d.before !== null
+      ? d.before.split("\n").map((text) => ({ op: "del" as const, text }))
+      : []),
     ...(d.action !== "delete" && d.text !== null ? [{ op: "add" as const, text: d.text }] : []),
   ];
 }
@@ -72,9 +75,16 @@ export function cardFromError(body: unknown): MemoryProposal | undefined {
 }
 
 /** What the card says on top, from its decisions. */
-export function cardSummary(p: Pick<MemoryProposal, "decisions" | "mode" | "forced">): string | null {
+export function cardSummary(
+  p: Pick<MemoryProposal, "decisions" | "mode" | "forced"> & { origin?: MemoryProposal["origin"] },
+): string | null {
   const ds = p.decisions;
-  if (ds.some((d) => d.status === "expired")) return "문서가 바뀌어 반영하지 않았어요. 다시 요청해 주세요.";
+  if (ds.some((d) => d.status === "expired"))
+    return p.origin === "dreaming"
+      ? "문서가 바뀌어 다시 정리할게요. 다음 기억 정리에서 이어 가요."
+      : "문서가 바뀌어 반영하지 않았어요. 다시 요청해 주세요.";
+  if (ds.some((d) => d.status === "pending") && p.forced === "suspicious")
+    return "지시처럼 보이는 글이 든 메시지에서 나온 내용이라 자동 반영 대신 확인을 받아요.";
   if (ds.some((d) => d.status === "pending") && p.forced === "sensitive")
     return "민감한 내용이 있어 자동 반영 대신 확인을 받아요.";
   if (ds.some((d) => d.status === "pending") && p.forced === "external")

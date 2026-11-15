@@ -10,16 +10,20 @@ import { ClaudeAdapter, type ClaudeConnection } from "./claude.js";
  * Folders are per connection *and* user: `data/runtimes/<connection id>/<user id>/` (review #80).
  */
 export function claudeConnectionFor(
-  store: Pick<ConnectionStore, "resolve">,
+  store: Pick<ConnectionStore, "resolve" | "resolveSystem">,
   users: Pick<UserStore, "byId">,
   ctx: ConnectionRequest,
 ): ClaudeConnection | undefined {
   const user = users.byId(ctx.userId);
-  const r = store.resolve(ctx.connectionId, user, "claude-code", {
-    test: ctx.connectionTest === true,
-    version: ctx.connectionVersion,
-  });
+  const r =
+    ctx.systemTask === "dreaming"
+      ? store.resolveSystem(ctx.connectionId, user, "claude-code")
+      : store.resolve(ctx.connectionId, user, "claude-code", {
+          test: ctx.connectionTest === true,
+          version: ctx.connectionVersion,
+        });
   if (!r) return undefined;
+  if (ctx.systemTask === "dreaming" && r.authType !== "api_key") return undefined;
   if (r.authType === "subscription")
     return user?.role === "admin"
       ? { id: r.id, dir: r.dir, auth: { kind: "oauth_token", token: r.secret } }

@@ -6,7 +6,15 @@ import { z } from "zod";
  * shown as "미제공". There is no budget limit in v1: nothing here can stop a run.
  */
 
-export const USAGE_PURPOSES = ["chat", "schedule", "title", "summary", "connection_test"] as const;
+export const USAGE_PURPOSES = [
+  "chat",
+  "schedule",
+  "title",
+  "summary",
+  "connection_test",
+  /** 기억 정리 (#146, FR-16.6): per target user, on the admin's shared connection. */
+  "dreaming",
+] as const;
 export const UsagePurpose = z.enum(USAGE_PURPOSES);
 export type UsagePurpose = z.infer<typeof UsagePurpose>;
 

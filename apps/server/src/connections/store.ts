@@ -605,6 +605,30 @@ export class ConnectionStore {
     };
   }
 
+  /**
+   * The credential and folder for a system task (#146 기억 정리, spec §7): the admin's shared API key connection, run
+   * for `user`'s own folder (`runtimes/<connection>/<user>/`) whatever that user's own allow-list says — the result
+   * goes to that user's documents only. Shared, API key, passed, connected, this runtime, an active user — nothing
+   * else (no personal connection, no subscription, no fallback).
+   */
+  resolveSystem(
+    connectionId: string | undefined,
+    user: Pick<UserRow, "id" | "active"> | undefined,
+    runtime: RuntimeId,
+  ): ResolvedConnection | undefined {
+    if (!connectionId || !user?.active || !SAFE_ID.test(connectionId) || !SAFE_ID.test(user.id))
+      return undefined;
+    const c = this.get(connectionId);
+    if (!c?.secret || !systemUsable(c, runtime)) return undefined;
+    return {
+      id: c.id,
+      dir: path.join(this.dataDir, "runtimes", c.id, user.id),
+      authType: c.authType,
+      secret: decrypt(c.secret, this.masterKey, aad(c)),
+      version: c.credentialVersion,
+    };
+  }
+
   /** Active admins (recipients of shared-connection warnings). */
   admins(): string[] {
     return this.db
@@ -614,4 +638,16 @@ export class ConnectionStore {
       .all()
       .map((u) => u.id);
   }
+}
+
+/** A connection 기억 정리 may run on (#146, spec §7): shared, API key, tested and passed, still connected. */
+export function systemUsable(c: ConnectionRow, runtime?: string): boolean {
+  return (
+    c.scope === "shared" &&
+    c.authType === "api_key" &&
+    c.status === "passed" &&
+    c.disconnectedAt === null &&
+    c.secret !== null &&
+    (runtime === undefined || c.runtime === runtime)
+  );
 }

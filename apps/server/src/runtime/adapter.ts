@@ -58,6 +58,12 @@ export type StartContext = {
   /** A connection test (#17): the connection may still be untested or failed. Set by the server only. */
   connectionTest?: boolean;
   /**
+   * A system task on the admin's shared API key connection (#146 기억 정리, docs/memory-spec.md §7): resolved for the
+   * target user's folder without that user's runtime / connection allow-list — a shared, passed API key connection
+   * only (never a personal one or a subscription). Set by the server only.
+   */
+  systemTask?: "dreaming";
+  /**
    * Cancels opening the session (a connection test that is cancelled by a disconnect or a new key, #17). Once it
    * fires, the adapter must not create anything more in the connection folder, must kill a process it started, and
    * must settle `start()` / `resume()` (with an error) only after that process has exited.
@@ -112,7 +118,7 @@ export type ContextReferences = {
 /** What an adapter's connection resolver is asked: whose run, which connection, and whether it is a test. */
 export type ConnectionRequest = Pick<
   StartContext,
-  "userId" | "connectionId" | "connectionVersion" | "connectionTest"
+  "userId" | "connectionId" | "connectionVersion" | "connectionTest" | "systemTask"
 >;
 
 /**
