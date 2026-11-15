@@ -1,0 +1,49 @@
+{
+  "tool": "us_screener",
+  "input": {
+    "screen": "day_gainers",
+    "count": 2
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=2&crumb={crumb}",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "finance": {
+          "result": [
+            {
+              "title": "Day Gainers",
+              "quotes": [
+                {
+                  "symbol": "AAON",
+                  "shortName": "AAON, Inc.",
+                  "regularMarketPrice": 75.01,
+                  "regularMarketChangePercent": 19.3097,
+                  "regularMarketTime": 1794603600,
+                  "exchangeDataDelayedBy": 15,
+                  "marketCap": 6100000000,
+                  "currency": "USD"
+                },
+                {
+                  "symbol": "XYZ",
+                  "shortName": "Block, Inc.",
+                  "regularMarketPrice": 88.4,
+                  "regularMarketChangePercent": 12.01,
+                  "regularMarketTime": 1794603600,
+                  "exchangeDataDelayedBy": 0,
+                  "marketCap": 54000000000,
+                  "currency": "USD"
+                }
+              ]
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

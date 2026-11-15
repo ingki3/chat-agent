@@ -1,0 +1,105 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_quote",
+  "market": "US",
+  "symbol": "AAPL",
+  "name": "Apple Inc.",
+  "exchange": "NasdaqGS",
+  "currency": "USD",
+  "price": {
+   "value": 350.4,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "previousClose": {
+   "value": 351.2,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "change": {
+   "value": -0.8,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "changePercent": {
+   "value": -0.228,
+   "unit": "%",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "dayHigh": {
+   "value": 352.5,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "dayLow": {
+   "value": 347.2,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "volume": {
+   "value": 44703800,
+   "unit": "shares",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "fiftyTwoWeekHigh": {
+   "value": 355.38,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "fiftyTwoWeekLow": {
+   "value": 243.42,
+   "unit": "USD",
+   "source": "Yahoo Finance",
+   "asOf": "2026-11-13T11:14:30-05:00",
+   "timeZone": "America/New_York",
+   "delayed": true,
+   "kind": "intraday"
+  },
+  "tradingDay": "2026-11-13",
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T11:14:30-05:00",
+    "timeZone": "America/New_York",
+    "delayed": true,
+    "kind": "intraday",
+    "label": "Yahoo Finance · 2026-11-13 11:14 ET 장중 (지연)"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

@@ -1,0 +1,64 @@
+{
+  "tool": "us_quote",
+  "input": {
+    "symbol": "AAPL"
+  },
+  "now": "2026-11-28T09:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=1d&includePrePost=false",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "chart": {
+          "result": [
+            {
+              "meta": {
+                "currency": "USD",
+                "symbol": "AAPL",
+                "exchangeName": "NMS",
+                "fullExchangeName": "NasdaqGS",
+                "instrumentType": "EQUITY",
+                "regularMarketTime": 1795802400,
+                "gmtoffset": -18000,
+                "timezone": "EST",
+                "exchangeTimezoneName": "America/New_York",
+                "regularMarketPrice": 352.1,
+                "fiftyTwoWeekHigh": 355.38,
+                "fiftyTwoWeekLow": 243.42,
+                "regularMarketDayHigh": 354.2,
+                "regularMarketDayLow": 348.9,
+                "regularMarketVolume": 44703800,
+                "chartPreviousClose": 331.9,
+                "dataGranularity": "1d",
+                "range": "5d",
+                "longName": "Apple Inc.",
+                "shortName": "Apple Inc."
+              },
+              "timestamp": [1795444200, 1795530600, 1795617000, 1795789800],
+              "indicators": {
+                "quote": [
+                  {
+                    "open": [345.5, 348.0, 348.75, 350.6],
+                    "high": [349.1, 351.6, 352.35, 354.2],
+                    "low": [343.8, 346.3, 347.05, 348.9],
+                    "close": [347.0, 349.5, 350.25, 352.1],
+                    "volume": [40000000, 41000000, 42000000, 43000000]
+                  }
+                ],
+                "adjclose": [
+                  {
+                    "adjclose": [347.0, 349.5, 350.25, 352.1]
+                  }
+                ]
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

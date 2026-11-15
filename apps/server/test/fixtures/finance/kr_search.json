@@ -1,0 +1,44 @@
+{
+  "tool": "kr_search",
+  "input": {
+    "query": "삼성"
+  },
+  "now": "2026-11-14T11:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://ac.stock.naver.com/ac?q=%EC%82%BC%EC%84%B1&target=stock",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "query": "삼성",
+        "items": [
+          {
+            "code": "005930",
+            "name": "삼성전자",
+            "typeCode": "KOSPI",
+            "typeName": "코스피",
+            "nationCode": "KOR",
+            "category": "stock"
+          },
+          {
+            "code": "005935",
+            "name": "삼성전자우",
+            "typeCode": "KOSPI",
+            "typeName": "코스피",
+            "nationCode": "KOR",
+            "category": "stock"
+          },
+          {
+            "code": "SSNLF",
+            "name": "Samsung (OTC)",
+            "typeCode": "OTC",
+            "nationCode": "USA",
+            "category": "stock"
+          }
+        ]
+      }
+    }
+  ]
+}

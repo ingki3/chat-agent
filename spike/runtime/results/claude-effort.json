@@ -1,0 +1,34 @@
+{
+  "claude-opus-5-5:low": {
+    "text": "OK.",
+    "answeredBy": [
+      "claude-opus-5-5"
+    ],
+    "subtype": "success",
+    "errors": []
+  },
+  "claude-opus-5-5:max": {
+    "text": "OK.",
+    "answeredBy": [
+      "claude-opus-5-5"
+    ],
+    "subtype": "success",
+    "errors": []
+  },
+  "claude-haiku-5-5:low": {
+    "text": "OK",
+    "answeredBy": [
+      "claude-haiku-5-5"
+    ],
+    "subtype": "success",
+    "errors": []
+  },
+  "claude-haiku-5-5:max": {
+    "text": "OK",
+    "answeredBy": [
+      "claude-haiku-5-5"
+    ],
+    "subtype": "success",
+    "errors": []
+  }
+}

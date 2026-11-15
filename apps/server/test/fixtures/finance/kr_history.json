@@ -1,0 +1,58 @@
+{
+  "tool": "kr_history",
+  "input": {
+    "code": "005930",
+    "days": 3
+  },
+  "now": "2026-11-14T11:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://m.stock.naver.com/api/stock/005930/price?pageSize=3&page=1",
+      "status": 200,
+      "contentType": "application/json",
+      "body": [
+        {
+          "localTradedAt": "2026-11-13",
+          "closePrice": "206,000",
+          "compareToPreviousClosePrice": "7,100",
+          "compareToPreviousPrice": {
+            "name": "RISING"
+          },
+          "fluctuationsRatio": "3.57",
+          "openPrice": "195,500",
+          "highPrice": "206,500",
+          "lowPrice": "194,400",
+          "accumulatedTradingVolume": 22733252
+        },
+        {
+          "localTradedAt": "2026-11-12",
+          "closePrice": "198,900",
+          "compareToPreviousClosePrice": "-800",
+          "compareToPreviousPrice": {
+            "name": "FALLING"
+          },
+          "fluctuationsRatio": "-0.40",
+          "openPrice": "199,400",
+          "highPrice": "201,500",
+          "lowPrice": "196,400",
+          "accumulatedTradingVolume": 15289184
+        },
+        {
+          "localTradedAt": "2026-11-11",
+          "closePrice": "199,700",
+          "compareToPreviousClosePrice": "12,700",
+          "compareToPreviousPrice": {
+            "name": "RISING"
+          },
+          "fluctuationsRatio": "6.79",
+          "openPrice": "187,200",
+          "highPrice": "200,400",
+          "lowPrice": "183,800",
+          "accumulatedTradingVolume": 19855892
+        }
+      ]
+    }
+  ]
+}

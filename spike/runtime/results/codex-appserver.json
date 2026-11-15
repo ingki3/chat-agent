@@ -1,0 +1,82 @@
+{
+  "initialize": "ok",
+  "models": [
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6.1-terra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna"
+  ],
+  "rateLimitsRead": {
+    "keys": [
+      "ordinaryUsageAllowed",
+      "rateLimits",
+      "rateLimitsByLimitId",
+      "rateLimitResetCredits",
+      "accountId",
+      "rateLimitUpsell"
+    ],
+    "hasPrimary": true
+  },
+  "threadStart": {
+    "model": "gpt-6.1-sol",
+    "effort": "low"
+  },
+  "turn1_mcp_and_lockdown": {
+    "deltas": 48,
+    "items": [
+      "userMessage",
+      "agentMessage",
+      "mcpToolCall:echo/echo_time:completed",
+      "reasoning",
+      "agentMessage"
+    ],
+    "text": "I’ll call echo_time with tag `a1`, then check whether `~/.zshrc` can be read without displaying its contents.Reading `~/.zshrc` did not work. Tag used: `a1`.",
+    "completed": {
+      "status": "completed",
+      "error": null,
+      "atMs": 9489
+    },
+    "firstDeltaMs": 2745,
+    "interrupt": null
+  },
+  "turn2_model_switch": {
+    "requestedModel": "gpt-6-astra",
+    "deltas": 2,
+    "items": [
+      "userMessage",
+      "agentMessage"
+    ],
+    "text": "a1",
+    "completed": {
+      "status": "completed",
+      "error": null,
+      "atMs": 2925
+    },
+    "firstDeltaMs": 2808,
+    "interrupt": null
+  },
+  "threadResumeModel": "gpt-6-astra",
+  "turn3_interrupt": {
+    "deltas": 26,
+    "items": [
+      "userMessage"
+    ],
+    "text": "The history of the printing press is the history of how ideas became reproducible on a scale that transformed society. Before printing, books",
+    "completed": {
+      "status": "interrupted",
+      "error": null,
+      "atMs": 2922
+    },
+    "firstDeltaMs": 2907,
+    "interrupt": {
+      "requestedAtMs": 2913,
+      "ack": "ok",
+      "stopLatencyMs": 9
+    }
+  },
+  "serverRequests": []
+}

@@ -1,0 +1,79 @@
+{
+  "note": "AC-12 시험용. 가격은 시험용 가상 가격표(test-v1)이며 실제 요금이 아니다. 실제 가격표는 #32에서 관리한다.",
+  "priceTable": {
+    "version": "test-v1",
+    "usdPerMTok": {
+      "claude-opus-5-5": {
+        "input": 10,
+        "output": 50,
+        "cacheRead": 1,
+        "cacheWrite": 12.5
+      },
+      "gpt-6.1-sol": {
+        "input": 5,
+        "output": 20,
+        "cacheRead": 0.5,
+        "cacheWrite": 0
+      }
+    }
+  },
+  "records": [
+    {
+      "user": "dad",
+      "runtime": "claude-code",
+      "model": "claude-opus-5-5",
+      "connection": "shared-anthropic-key",
+      "auth": "api_key",
+      "input": 100000,
+      "output": 20000,
+      "cacheRead": 50000,
+      "cacheWrite": 0
+    },
+    {
+      "user": "wife",
+      "runtime": "claude-code",
+      "model": "claude-opus-5-5",
+      "connection": "shared-anthropic-key",
+      "auth": "api_key",
+      "input": 200000,
+      "output": 10000,
+      "cacheRead": 0,
+      "cacheWrite": 40000
+    },
+    {
+      "user": "son",
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "connection": "son-chatgpt",
+      "auth": "subscription",
+      "input": 300000,
+      "output": 30000,
+      "cacheRead": 100000,
+      "cacheWrite": 0
+    },
+    {
+      "user": "wife",
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "connection": "shared-openai-key",
+      "auth": "api_key",
+      "input": 100000,
+      "output": 50000,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    }
+  ],
+  "expected": {
+    "costUsdByRecord": [2.05, 3.0, null, 1.5],
+    "totalCostUsd": 6.55,
+    "byUserCostUsd": {
+      "dad": 2.05,
+      "wife": 4.5,
+      "son": 0
+    },
+    "subscriptionTokensByUser": {
+      "son": 430000
+    },
+    "note": "구독 기록은 비용이 아니라 토큰·횟수로만 집계한다(null). 토큰 합계 = input + output + cacheRead + cacheWrite (input은 캐시 읽기·쓰기 제외)."
+  }
+}

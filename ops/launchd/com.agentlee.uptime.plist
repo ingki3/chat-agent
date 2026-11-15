@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Agent Lee uptime check (#46): every 5 minutes, one health check locally and one through Cloudflare (Access
+  service token), appended to uptime.jsonl. Template — rendered by scripts/install-launchd.sh. No secrets here:
+  the service token lives in ~/.agentlee/uptime-token (mode 600), docs/ops.md §9.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentlee.uptime</string>
+  <key>UserName</key>
+  <string>__USER__</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__REPO__/node_modules/tsx/dist/cli.mjs</string>
+    <string>__REPO__/scripts/uptime.ts</string>
+    <string>check</string>
+    <string>--file</string>
+    <string>__LOGDIR__/uptime.jsonl</string>
+    <string>--token-file</string>
+    <string>__HOME__/.agentlee/uptime-token</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/uptime.err.log</string>
+</dict>
+</plist>

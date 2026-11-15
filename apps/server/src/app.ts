@@ -1,0 +1,1182 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import fastifyStatic from "@fastify/static";
+import type { JWTVerifyGetKey } from "jose";
+import type { HealthResponse } from "@agentlee/shared";
+import { createAccessVerifier } from "./auth/access-jwt.js";
+import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
+import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
+import { UserStore } from "./auth/users.js";
+import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
+import { registerAccountSettings, registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
+import { DefaultsService } from "./users/defaults.js";
+import { registerAdminSystemRoutes, type SystemRouteOptions } from "./admin/routes.js";
+import { BackupService, type BackupServiceOptions } from "./backup/backup.js";
+import { FileWriteLock } from "./backup/lock.js";
+import { registerBackupRoutes } from "./backup/routes.js";
+import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
+import { RuntimeScheduleHandler, scheduleUsable, ScheduleWarnings } from "./schedules/handler.js";
+import { registerScheduleRoutes } from "./schedules/routes.js";
+import { registerWatchlistRoutes } from "./watchlist/routes.js";
+import { compactOnce } from "./secrets/compact.js";
+import { WatchlistStore } from "./watchlist/store.js";
+import { fixtureFinanceWorker } from "./runtime/fake-finance.js";
+import { ScheduleStore } from "./schedules/store.js";
+import { ScheduleProposalStore } from "./schedules/proposals.js";
+import { SkillSwitches } from "./mcp/switches.js";
+import { registerConversationRoutes } from "./conversations/routes.js";
+import { ConversationStore } from "./conversations/store.js";
+import { RuntimeRegistry } from "./runtime/adapter.js";
+import { FakeRuntime } from "./runtime/fake.js";
+import { claudeFromStore } from "./runtime/claude-config.js";
+import { codexFromStore } from "./runtime/codex-config.js";
+import { importEnvConnections, pendingImportTests } from "./connections/import.js";
+import { ChatgptTokenService, type TokenPost } from "./connections/chatgpt.js";
+import { SubscriptionLoginService, type DeviceLoginProvider } from "./connections/login.js";
+import { cleanupLeftoverLogins, CodexDeviceLogin, type ProcessIdentity } from "./runtime/codex-login.js";
+import { registerConnectionRoutes } from "./connections/routes.js";
+import { ConnectionService } from "./connections/service.js";
+import { ConnectionStore } from "./connections/store.js";
+import { ConnectionTester } from "./connections/tester.js";
+import { UsageStore } from "./usage/store.js";
+import { registerUsageRoutes } from "./usage/routes.js";
+import { UsageService, type UsageServiceOptions } from "./usage/service.js";
+import { DEFAULT_TIME_ZONE } from "./notifications/quiet.js";
+import {
+  CLAUDE_EGRESS_HOSTS,
+  CODEX_CHATGPT_EGRESS_HOSTS,
+  CODEX_EGRESS_HOSTS,
+  CODEX_LOGIN_EGRESS_HOSTS,
+  EgressService,
+} from "./isolation/egress.js";
+import { registerRunRoutes } from "./runtime/routes.js";
+import { RunManager, type RunManagerOptions } from "./runtime/runs.js";
+import { McpTokens } from "./isolation/tokens.js";
+import { McpService, type McpServiceOptions } from "./mcp/service.js";
+import { mcpOptionsFromConfig, registerSkillRoutes } from "./mcp/routes.js";
+import { SourceStore } from "./web/sources.js";
+import { CitationStore } from "./citations/store.js";
+import { fixtureWebWorker } from "./runtime/fake-citations.js";
+import { sandboxedWorker } from "./web/service.js";
+import { ArtifactStore } from "./artifacts/store.js";
+import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
+import { findBrowser } from "./artifacts/browser.js";
+import { Renderer } from "./artifacts/export.js";
+import { registerSourceRoutes } from "./web/routes.js";
+import { registerReferenceRoutes } from "./references/routes.js";
+import { FileStore, type FileStoreOptions } from "./files/store.js";
+import { registerFileRoutes } from "./files/routes.js";
+import { SharePolicy } from "./shares/projection.js";
+import { registerShareRoutes } from "./shares/routes.js";
+import { ShareStore } from "./shares/store.js";
+import { ForkService } from "./shares/fork.js";
+import { notifyResultSubscribers } from "./shares/notify.js";
+import { DocGenService } from "./docgen/service.js";
+import { DocSlots } from "./docgen/slots.js";
+import { docRunnerKind, inProcessDocRunner, sandboxedDocRunner, type DocRunner } from "./docgen/runner.js";
+import {
+  extractorKind,
+  FileExtracts,
+  inProcessExtractor,
+  ocrCapability,
+  sandboxedExtractor,
+  type ExtractRunner,
+  type FileExtractsOptions,
+  type OcrCapability,
+} from "./files/extract.js";
+import { FileTools } from "./files/text.js";
+import { pythonRuntimeEnv, scratchpadState, type ScratchpadState } from "./python/packages.js";
+import { sandboxedPythonRunner, type PythonRunner } from "./python/runner.js";
+import { PythonScratchpad } from "./python/service.js";
+import { accountFromConfig, type ProbeRunner } from "./python/account.js";
+import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
+import { accountOrSandboxDocRunner } from "./workers/docgen.js";
+import { accountOrSandboxExtractor } from "./workers/extract.js";
+import {
+  computeFingerprints,
+  defaultFingerprintSources,
+  installedFingerprints,
+  kindFingerprint,
+  type WorkerFingerprints,
+} from "./workers/bundle.js";
+import { sweepWorkerScratch } from "./workers/run.js";
+import {
+  docJobCheck,
+  extractJobCheck,
+  renderJobCheck,
+  selfCheckWorker,
+  WorkerGates,
+} from "./workers/selfcheck.js";
+import { AccountSelfCheckGate, selfCheckAccount, type SelfCheckResult } from "./python/selfcheck.js";
+import { storagePaths } from "./storage/paths.js";
+import { isInside } from "./fs-safety.js";
+import type { Db } from "./db/client.js";
+import { SettingsStore } from "./db/settings-store.js";
+import { KEY_LEN } from "./crypto/secrets.js";
+import { registerNotificationRoutes } from "./notifications/routes.js";
+import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
+import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
+import { AppEvents } from "./events.js";
+import { isApiPath, isArtifactPath } from "./paths.js";
+import type { Config } from "./config.js";
+import { registerDiag, type DiagOptions } from "./diag.js";
+import { isGatePath, registerGate, type GateOptions } from "./gate.js";
+import { BASE_HEADERS } from "./headers.js";
+import { logEvent, loggerOptions, rotatingFile } from "./logging.js";
+import { ErrorLog } from "./observability/errors.js";
+import { registerRoutePattern } from "./observability/policy.js";
+import { registerErrorHandling, registerErrorRoutes } from "./observability/routes.js";
+import { registerResponseScrub } from "./secrets/http.js";
+import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
+import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
+import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
+
+const VERSION = "0.0.0";
+const here = path.dirname(fileURLToPath(import.meta.url));
+/** Built SPA (apps/web/dist), resolved from apps/server/{src,dist}. */
+export const DEFAULT_WEB_DIST = path.resolve(here, "../../web/dist");
+const WEB_ROOT = path.resolve(here, "../../web");
+
+/** Content-Security-Policy for app pages in production. Dev mode skips it because Vite HMR needs inline scripts. */
+export const APP_CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "connect-src 'self'",
+  "frame-ancestors 'self'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "object-src 'none'",
+].join("; ");
+
+export { isApiPath };
+
+declare module "fastify" {
+  interface FastifyInstance {
+    /** Accounts and sessions; undefined when the app is built without a database (some tests). */
+    users: UserStore | undefined;
+    appEvents: AppEvents;
+    conversations: ConversationStore | undefined;
+    runs: RunManager | undefined;
+    mcp: McpService | undefined;
+    /** Recent errors (admin, #46); undefined without a database. */
+    errors: ErrorLog | undefined;
+    /** Inbox, quiet hours and web push (#34); undefined without a database. Publishing points call `publish`. */
+    notifications: NotificationService | undefined;
+    /** Runtime connections (#17); undefined without a database. */
+    connections: ConnectionService | undefined;
+    /** Artifacts (#27); undefined without a database. */
+    artifacts: ArtifactStore | undefined;
+    /** Usage records (#44) and their price tables (#32); undefined without a database. */
+    usageStore: UsageStore | undefined;
+    /** Usage screens and the daily cost check (#32); undefined without a database. */
+    usage: UsageService | undefined;
+    /**
+     * The data folder's file-write lock (#37): every writer of files under `files/`, `artifacts/` or `sources/`
+     * writes inside `fileWrites.write()`, so a backup's snapshot of rows and files is from one moment.
+     */
+    fileWrites: FileWriteLock;
+    /** Uploaded files (#22); undefined without a database. */
+    files: FileStore | undefined;
+    /** Text extraction of uploads (#48); undefined without a database. */
+    fileExtracts: FileExtracts | undefined;
+    /** Daily backups (#37); undefined without BACKUP_DIR or with an in-memory database. */
+    backups: BackupService | undefined;
+    /** Background rescrub of stored rows when a secret is registered (round 25); undefined without a database. */
+    storedRescrub: StoredRescrub | undefined;
+    /**
+     * Schedules (#33): the store, the engine (#56: the real handler unless a test brings its own) and the connection
+     * warnings (FR-11.8). undefined without a database.
+     */
+    schedules:
+      | { store: ScheduleStore; engine: ScheduleEngine | undefined; warnings: ScheduleWarnings | undefined }
+      | undefined;
+    /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
+    scheduleProposals: ScheduleProposalStore | undefined;
+    /** 관심 종목 (#31); undefined without a database. */
+    watchlist: WatchlistStore | undefined;
+    /** What deleting a conversation does beyond its rows (#54): runtime session state, notifications, the WAL. */
+    purge: ConversationPurge | undefined;
+  }
+}
+
+export type BuildOptions = {
+  /** Directory of the built SPA. Defaults to apps/web/dist. */
+  webDist?: string;
+  /** Attach Vite in middleware mode (one port for UI + API in development). */
+  vite?: boolean;
+  logger?: boolean;
+  /** Log destination (tests capture it). Implies logging on; otherwise LOG_FILE, else stdout. */
+  logStream?: NodeJS.WritableStream;
+  /** Timing overrides for the diagnostic stream (tests). The route exists only when config.diagStream is set. */
+  diag?: DiagOptions;
+  /** Rate-limit/clock overrides for the temporary gate (tests). Active only when config.tempGateCode is set. */
+  gate?: Omit<GateOptions, "code">;
+  /** Database for accounts and sessions. Without it nobody can sign in and private routes answer 401. */
+  db?: Db;
+  /** Access JWT key source override (tests sign with a local JWKS). */
+  accessKeys?: JWTVerifyGetKey;
+  /** Login rate-limit/clock overrides (tests). */
+  auth?: AuthRouteOptions;
+  events?: AppEvents;
+  /**
+   * PNG/PDF export (#51). Default: the sandboxed browser found by `findBrowser` (none in the test environment —
+   * tests bring their own renderer).
+   */
+  renderer?: Pick<Renderer, "render">;
+  /** Runtime adapters (tests pass FakeRuntime instances). Default: real adapters (#15/#16), FakeRuntime if FAKE_RUNTIME=1. */
+  runtimes?: RuntimeRegistry;
+  runs?: RunManagerOptions;
+  /** MCP server overrides (tests: skill runner, clock). */
+  mcp?: McpServiceOptions;
+  /**
+   * Web tool overrides (tests: an in-process worker, stub proxies and providers), merged into the web options
+   * that hold the app's own source and citation stores.
+   */
+  web?: Partial<Omit<NonNullable<McpServiceOptions["web"]>, "sources" | "citations">>;
+  /** SSE timing overrides (tests). */
+  sse?: { heartbeatMs?: number };
+  /** User-admin overrides (tests). */
+  userAdmin?: UserAdminOptions;
+  /**
+   * Master key for stored secrets (VAPID private key, push subscriptions). index.ts passes the real one; without
+   * it (tests) an ephemeral key is used, which production refuses.
+   */
+  masterKey?: Buffer;
+  /** Push transport / clock overrides (tests). */
+  notifications?: NotificationServiceOptions;
+  /** Connection test overrides (tests: a short timeout). */
+  connectionTest?: { timeoutMs?: number };
+  /**
+   * Codex ChatGPT login (#18). `device`: how a device-code login is started (default: the pinned app-server in its
+   * sandbox; tests script it); `tokenPost`: the token endpoint for refreshes (tests: a fake).
+   */
+  subscription?: {
+    device?: DeviceLoginProvider;
+    tokenPost?: TokenPost;
+    /** Tests: how a left-over login process is identified (default: `ps`). */
+    identify?: (pid: number) => ProcessIdentity | undefined;
+    maxActiveLogins?: number;
+  };
+  /** Usage screens (#32): time zone and clock overrides (tests). */
+  usage?: UsageServiceOptions;
+  /** Dev-mode HMR WebSocket port (loopback only, separate from the app port). */
+  hmrPort?: number;
+  /** System status overrides (tests: the tunnel probe). */
+  system?: Pick<SystemRouteOptions, "tunnel">;
+  /**
+   * Backups (#37): clock and test hooks. The daily schedule runs outside tests; `schedule: true` turns it on in a
+   * test.
+   */
+  backup?: BackupServiceOptions & { schedule?: boolean };
+  /** Uploads (#22): clock and test hooks. */
+  files?: FileStoreOptions;
+  /**
+   * Document generation (#49): how the worker runs. Default: sandboxed (`sandboxedDocRunner`); in-process only with
+   * the test switch `ISOLATION_IN_PROCESS_FOR_TESTS=1` outside production (`docRunnerKind`) or a test's own runner.
+   */
+  docs?: { runner?: DocRunner };
+  /**
+   * `python_run` (#47): how the code runs (default: the sandboxed interpreter, `sandboxedPythonRunner` — there is no
+   * other way outside a test's own runner) and what this server can run (default: `scratchpadState` from SKILL_PYTHON
+   * and the installed packages; in tests nothing, unless given).
+   */
+  python?: {
+    runner?: PythonRunner;
+    state?: () => ScratchpadState;
+    probe?: ProbeRunner;
+    /** Tests: the account gate to use (to watch it), and a self-check to run in its place (runs even in tests). */
+    gate?: AccountSelfCheckGate;
+    selfCheck?: (signal: AbortSignal) => Promise<SelfCheckResult>;
+  };
+  /**
+   * The sandboxed workers' account (#122). Tests: the gates to use (to watch or pre-verify them), and a self-check
+   * to run in place of the real one (runs even in tests).
+   */
+  workers?: {
+    gates?: WorkerGates;
+    selfCheck?: (kind: WorkerKind, signal: AbortSignal) => Promise<SelfCheckResult>;
+  };
+  /**
+   * Schedules (#33): the run handler (default: the real one, #56 — a turn in the schedule's result conversation),
+   * engine timing overrides, and `start: true` to run the engine in a test (it runs by itself only in a server that
+   * holds the data folder lock, `dataLock`).
+   */
+  schedules?: {
+    handler?: ScheduleHandler;
+    start?: boolean;
+    engine?: ScheduleEngineOptions;
+    now?: () => number;
+    /** The real handler's test limits (#56): an attempt's conversation run timeout. */
+    runtime?: { runTimeoutMs?: number };
+  };
+  /**
+   * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
+   * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
+   */
+  dataLock?: { held: () => boolean };
+  /** Tests: the deletion jobs' retry timings and clock (#54). */
+  purge?: Pick<PurgeOptions, "retryMs" | "maxRetryMs" | "now">;
+  /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
+  rescrub?: Pick<RescrubOptions, "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs">;
+  /**
+   * Extraction (#48): the runner (default: the sandboxed worker), OCR (default: tesseract.js with the pinned
+   * language data, `ocrCapability`) and a clock.
+   */
+  extract?: FileExtractsOptions & { runner?: ExtractRunner; ocr?: () => OcrCapability };
+};
+
+/**
+ * The database is DATA_DIR's own `agentlee.db`: the opened file itself, links resolved (review #102 — an
+ * `agentlee.db` that is a link to another database is not this folder's), is the real `<DATA_DIR>/agentlee.db`.
+ * "memory" for an in-memory database, "other" for any other file.
+ */
+function databaseOf(db: Db, dataDir: string): "own" | "memory" | "other" {
+  if (db.$client.memory) return "memory";
+  try {
+    const opened = fs.realpathSync.native(db.$client.name);
+    // The folder resolved, the file name not: a link named agentlee.db resolves to somewhere else than this.
+    const own = path.join(fs.realpathSync.native(dataDir), path.basename(storagePaths(dataDir).db));
+    return opened === own && isInside(opened, dataDir) ? "own" : "other";
+  } catch {
+    return "other";
+  }
+}
+
+/** Tests without a master key: one throwaway key per database, so rebuilding the app on it still decrypts. */
+const ephemeralKeys = new WeakMap<Db, Buffer>();
+function ephemeralKey(db: Db): Buffer {
+  let key = ephemeralKeys.get(db);
+  if (!key) ephemeralKeys.set(db, (key = crypto.randomBytes(KEY_LEN)));
+  return key;
+}
+
+export async function buildApp(config: Config, opts: BuildOptions = {}): Promise<FastifyInstance> {
+  // Review round 23: every secret this server holds is known before anything can produce output.
+  registerConfigSecrets(config);
+  const logOn = opts.logStream !== undefined || (opts.logger ?? config.env !== "test");
+  const logDest = opts.logStream ?? (config.logFile ? rotatingFile(config.logFile) : undefined);
+  const app = Fastify({
+    logger: logOn ? loggerOptions(logDest) : false,
+    // Errors Fastify raises before routing (bad percent-encoding, …) skip the error handler and every hook, and
+    // their default body repeats the raw URL. Answer them with a fixed body and the usual security headers.
+    frameworkErrors: (err, req, res) => {
+      const reply = res as unknown as FastifyReply;
+      logEvent(req.log, "info", "request.error", { err, errorCode: "bad_request", category: "client" });
+      reply.headers(BASE_HEADERS).header("Cache-Control", "no-store");
+      if (config.env === "production") reply.header("Content-Security-Policy", APP_CSP);
+      return reply.code(400).send({ error: "invalid_request" });
+    },
+  });
+  const startedAt = Date.now();
+  /** The SPA's index.html for app routes the server answers itself (`/a/:id`); set once the UI is attached. */
+  let appPage: AppPage = async () => undefined;
+
+  // First, before any route exists: every route that could address a resource must declare its permission.
+  installRouteRules(app);
+  // Route patterns are what logs and the error list may name (observability/policy.ts).
+  app.addHook("onRoute", (route) => registerRoutePattern(route.url));
+  // Every JSON and text response is scrubbed of known secrets, whichever route made it (round 25).
+  registerResponseScrub(app);
+
+  app.addHook("onSend", async (_req, reply, payload) => {
+    reply.headers(BASE_HEADERS);
+    // A route that sets its own CSP keeps it (artifact originals, #27: a stricter, sandboxing one).
+    if (config.env === "production" && !reply.hasHeader("Content-Security-Policy"))
+      reply.header("Content-Security-Policy", APP_CSP);
+    return payload;
+  });
+
+  const events = opts.events ?? new AppEvents();
+  app.decorate("fileWrites", new FileWriteLock());
+  const users = opts.db ? new UserStore(opts.db, events) : undefined;
+  app.decorate("appEvents", events);
+  app.decorate("users", users);
+  app.decorate("conversations", opts.db ? new ConversationStore(opts.db) : undefined);
+  const errors = opts.db ? new ErrorLog(opts.db) : undefined;
+  app.decorate("errors", errors);
+  if (errors) {
+    // Retention must not depend on new errors arriving.
+    const prune = setInterval(() => errors.prune(), 3600_000);
+    prune.unref();
+    app.addHook("onClose", async () => clearInterval(prune));
+  }
+  // Before any route or plugin, so every one inherits it: sanitised error bodies, logs and recent-error entries.
+  registerErrorHandling(app, errors);
+  const verifier = config.access
+    ? createAccessVerifier({ ...config.access, ...(opts.accessKeys ? { keys: opts.accessKeys } : {}) })
+    : undefined;
+
+  // Hook order matters — all of these run before every route, static file and Vite middleware:
+  // trust boundary (Host / Access JWT) → temporary code gate (edge only) → CSRF → session → route rules.
+  registerTrustBoundary(app, { config, verifier });
+  if (config.tempGateCode) registerGate(app, { ...opts.gate, code: config.tempGateCode });
+  registerCsrf(app, config);
+  registerSession(app, users);
+  // After the login check: resource load + policy (404 / 403).
+  registerResourceCheck(app);
+  if (users) {
+    registerAuthRoutes(app, { config, users, ...opts.auth });
+    registerUserAdmin(app, users, opts.userAdmin);
+    if (!opts.masterKey && config.env === "production") throw new Error("buildApp: master key required");
+    const masterKey = opts.masterKey ?? ephemeralKey(opts.db!);
+    // Stored rows are scrubbed again whenever a secret that may already be stored is registered (round 25) —
+    // and once now, for everything registered at startup.
+    // Old free space from before `secure_delete` (#111): compacted once, before anything is served or backed up.
+    compactOnce(opts.db!, app.log);
+    const storedRescrub = new StoredRescrub(opts.db!, { log: app.log, ...opts.rescrub });
+    app.decorate("storedRescrub", storedRescrub);
+    app.addHook("onClose", async () => {
+      storedRescrub.close();
+      await storedRescrub.idle();
+    });
+    primeStoredSecrets(opts.db!, masterKey);
+    storedRescrub.schedule({ all: true });
+    const settingsStore = new SettingsStore(opts.db!, masterKey);
+    // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
+    const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
+    // ChatGPT logins (#18): tokens refreshed by the server, never by a runtime process.
+    const chatgptTokens = new ChatgptTokenService(connectionStore, {
+      log: app.log,
+      ...(opts.subscription?.tokenPost ? { post: opts.subscription.tokenPost } : {}),
+    });
+    const egressFor = (allow: readonly string[]) => {
+      const egress = new EgressService({ allow });
+      app.addHook("onClose", async () => egress.close());
+      return egress;
+    };
+    const runtimes = opts.runtimes ?? new RuntimeRegistry();
+    // FAKE_RUNTIME=1 (e2e, manual testing): the scripted runtime as "Claude Code", with the service default model
+    // (Opus 5.5, D3) next to the fake ones so a user with nothing set starts where a real one would (#19).
+    if (!opts.runtimes && config.fakeRuntime) {
+      runtimes.register(
+        new FakeRuntime({
+          runTools: true,
+          models: [
+            {
+              id: "fake-large",
+              label: "Fake Large",
+              efforts: ["low", "medium", "high"],
+              defaultEffort: "medium",
+            },
+            { id: "fake-small", label: "Fake Small", efforts: [] },
+            {
+              id: "claude-opus-5-5",
+              label: "Opus 5.5",
+              efforts: ["low", "medium", "high"],
+              defaultEffort: "high",
+            },
+          ],
+        }),
+      );
+      // FAKE_RUNTIME_CODEX=1 too: the same scripted runtime as "Codex" (#53: a runtime switch end to end).
+      if (config.fakeCodex)
+        runtimes.register(
+          new FakeRuntime({
+            id: "codex",
+            runTools: true,
+            models: [{ id: "fake-codex", label: "Fake Codex", efforts: [] }],
+          }),
+        );
+    } else if (!opts.runtimes) {
+      // Runtime CLIs reach the internet only through an egress proxy (allow-listed API hosts, no private
+      // addresses) — one per runtime and way of signing in, so each reaches only its own provider's hosts.
+      // Both real runtimes are always there; whether a user can run one depends on their connections (#17).
+      // Tests bring their own runtimes (opts.runtimes) and never start a real CLI.
+      if (config.env !== "test") {
+        runtimes.register(claudeFromStore(connectionStore, users, egressFor(CLAUDE_EGRESS_HOSTS)));
+        runtimes.register(
+          codexFromStore(connectionStore, users, egressFor(CODEX_EGRESS_HOSTS), {
+            tokens: chatgptTokens,
+            egress: egressFor(CODEX_CHATGPT_EGRESS_HOSTS),
+          }),
+        );
+      }
+    }
+    // Our MCP server (#43): its own loopback port, started on the first run of a runtime that uses tools.
+    const mcpTokens = new McpTokens();
+    // Usage records (#44): replies and connection tests write here, keyed on run and attempt. Each write is costed
+    // from the current price table (#32) and then checked against the daily cost threshold (notify only).
+    // The daily cost notification goes to every active admin (the inbox re-checks the role before sending).
+    const usageService = new UsageService(
+      opts.db!,
+      settingsStore,
+      (amountUsd, thresholdUsd) => {
+        for (const admin of connectionStore.admins())
+          notifications.publish(admin, { kind: "daily_cost", amountUsd, thresholdUsd, url: "/admin" });
+      },
+      app.log,
+      { timeZone: DEFAULT_TIME_ZONE, ...opts.usage },
+    );
+    const usage = new UsageStore(opts.db!, opts.usage?.now ?? Date.now, {
+      onRecorded: (at) => usageService.checkDailyCost(at),
+    });
+    app.decorate("usageStore", usage);
+    // Web search and fetch (#50): results are stored as sources of the run's conversation.
+    const sources = new SourceStore(opts.db!);
+    // Artifacts (#27): made by the artifact tools, scoped to the run's conversation.
+    const artifacts = new ArtifactStore(opts.db!);
+    app.decorate("artifacts", artifacts);
+    // Schedule proposals (#55): `schedule_create` stores them; the owner confirms the card (schedule routes).
+    const scheduleProposals = new ScheduleProposalStore(opts.db!);
+    app.decorate("scheduleProposals", scheduleProposals);
+    // The sandboxed workers (#122): the extractor, the document worker and the export browser run as the dedicated
+    // worker account (WORKER_RUN_USER, a different uid — a worker exploit then cannot read a runtime's start-up
+    // environment) once that kind's self-check passed on this machine; until then, or without the account, each
+    // keeps the same-uid sandbox and the admin status (`workers`) says it is not isolated by account. The checks run
+    // in the background once the server is ready (after the worker-scratch sweep), one kind after another.
+    const workerAccount = workerAccountFromConfig(config.workerRunUser);
+    const workerGates = opts.workers?.gates ?? new WorkerGates(workerAccount);
+    // The first time a kind runs in the same-uid sandbox (no account, or its check has not passed yet), say so in
+    // the log — once per kind and process (review #130 round 1: not only after the checks finish).
+    const fellBack = new Set<WorkerKind>();
+    const sameUidUse = (kind: WorkerKind) => {
+      if (fellBack.has(kind)) return;
+      fellBack.add(kind);
+      logEvent(app.log, "warn", "worker.same_uid", { workerKinds: kind });
+    };
+    // Documents (#49): made by `doc_create`, stored with the conversation's files (the store is decorated below).
+    const docRunner =
+      opts.docs?.runner ??
+      (docRunnerKind(config) === "in-process"
+        ? inProcessDocRunner()
+        : accountOrSandboxDocRunner(
+            () => workerGates.verified("docgen"),
+            sandboxedDocRunner(),
+            config.dataDir,
+            () => sameUidUse("docgen"),
+          ));
+    // Every document worker run (doc_create and the reference export) takes one of the same slots.
+    const docSlots = new DocSlots(docRunner);
+    const docs = new DocGenService({
+      db: opts.db!,
+      files: () => app.files,
+      runner: docRunner,
+      slots: docSlots,
+    });
+    // 관심 종목 (#31): the screen's list and `watchlist_get`.
+    const watchlist = new WatchlistStore(opts.db!);
+    app.decorate("watchlist", watchlist);
+    // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
+    const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
+    app.decorate("files", fileStore);
+    // Their text (#48): extracted in the background by the sandboxed worker, read by the file tools.
+    let ocr: OcrCapability | undefined;
+    const ocrNow = opts.extract?.ocr ?? (() => (ocr ??= ocrCapability(storagePaths(config.dataDir).ocrLang)));
+    const fileExtracts = new FileExtracts(
+      opts.db!,
+      fileStore,
+      opts.extract?.runner ??
+        // A test machine without `sandbox-exec` (the Linux CI's e2e), explicitly: the worker in this process.
+        // Never in production — a real server always extracts in the sandbox.
+        (extractorKind(config) === "in-process"
+          ? inProcessExtractor(ocrNow)
+          : accountOrSandboxExtractor(
+              () => workerGates.verified("extract"),
+              sandboxedExtractor(ocrNow),
+              config.dataDir,
+              ocrNow,
+              () => sameUidUse("extract"),
+            )),
+      { log: app.log, onReplaced: () => storedRescrub.cleanup(), ...opts.extract },
+    );
+    app.decorate("fileExtracts", fileExtracts);
+    app.addHook("onReady", async () => {
+      const count = fileExtracts.resume();
+      if (count) logEvent(app.log, "info", "file.extract_resumed", { count });
+    });
+    // preClose: a running extractor is stopped before the database goes (its file stays pending).
+    app.addHook("preClose", async () => {
+      fileExtracts.close();
+      // Bounded: a runner that ignores the stop does not hold the shutdown (its result is not stored anyway).
+      await Promise.race([fileExtracts.idle(), new Promise((r) => setTimeout(r, 5000).unref())]);
+    });
+    // python_run (#47): the sandboxed interpreter runs as a dedicated, unprivileged account (round 2). It is offered
+    // only when PYTHON_RUN=1, the interpreter and packages are present, the account is configured, AND the startup
+    // self-check proves (on this machine) a different uid and that KERN_PROCARGS2 of a server-uid process is blocked.
+    // The self-check starts in the background once the server is ready (#121 round 9: it may take up to the job
+    // limit, longer than a startup hook may) and its result is memoised; until it passes, and if it fails or throws,
+    // the tool is absent (needs_account, "checking: …" while it runs).
+    const pythonAccount = accountFromConfig(config.pythonRunUser);
+    const gate = opts.python?.gate ?? new AccountSelfCheckGate(pythonAccount);
+    const pythonState = (): ScratchpadState =>
+      scratchpadState(config.skillPython, config.dataDir, {
+        pythonRun: config.pythonRun,
+        ...(gate.verified ? { account: gate.verified } : {}),
+        accountReason: gate.reason,
+      });
+    const scratchpad = new PythonScratchpad({
+      db: opts.db!,
+      dataDir: config.dataDir,
+      files: () => app.files,
+      runner: opts.python?.runner ?? sandboxedPythonRunner(),
+      // Tests inject their own state; otherwise the gated state above (a test never reads SKILL_PYTHON/account).
+      state: opts.python?.state ?? (config.env === "test" ? () => pythonState() : pythonState),
+    });
+    app.addHook("preClose", async () => scratchpad.close());
+    // The one-time account self-check runs in the sweep hook below (#47 round 3: after the sweep, under the same
+    // conditions as a real job — the sweep keeps the scratch root and its ACL).
+    // Never awaited by a startup hook, never throws (the gate catches everything).
+    const startSelfCheck = (): void => {
+      const log = (ok: boolean) =>
+        ok
+          ? logEvent(app.log, "info", "python.self_check_ok")
+          : // Fail closed: the tool stays off (needs_account). The self-check is authoritative — a passing advisory
+            // `verify` (pnpm python:setup-check) does not turn it on.
+            logEvent(app.log, "warn", "python.self_check_failed");
+      if (opts.python?.selfCheck) {
+        void gate.start(opts.python.selfCheck, log);
+        return;
+      }
+      if (opts.python?.state || !config.pythonRun || !pythonAccount || config.env === "test") return;
+      const env = pythonRuntimeEnv(config.skillPython, config.dataDir);
+      if (!env.ok) {
+        gate.skip(env.reason);
+        return;
+      }
+      const account = pythonAccount;
+      // The authoritative self-check: the procargs probe, then a real job through the normal path (#121 round 8).
+      void gate.start(
+        (signal) =>
+          selfCheckAccount({
+            signal,
+            account,
+            env: env.env,
+            dataDir: config.dataDir,
+            serverUid: process.getuid?.() ?? -1,
+            onCleanupError: () => logEvent(app.log, "warn", "python.self_check_cleanup_failed"),
+            ...(opts.python?.probe ? { probe: opts.python.probe } : {}),
+          }),
+        log,
+      );
+    };
+    // Shutdown stops a running check (its probe/job are aborted — the runner reaps the launcher job — and no new
+    // step starts) and waits, bounded, for its cleanup: production exits right after close (#121 round 10).
+    app.addHook("preClose", async () => gate.stop(10_000));
+    // The workers' checks (#122): the renderer is made further down (`ownRenderer`); the checks start once ready.
+    let ownRenderer: Renderer | undefined;
+    const startWorkerChecks = (): void => {
+      const log = (kind: WorkerKind, ok: boolean, step: string) =>
+        ok
+          ? logEvent(app.log, "info", "worker.self_check_ok", { workerKind: kind })
+          : logEvent(app.log, "warn", "worker.self_check_failed", { workerKind: kind, workerStep: step });
+      const sameUid = () => {
+        const kinds = workerGates
+          .status()
+          .filter((w) => w.isolation === "same_uid")
+          .map((w) => w.kind);
+        // Loud on purpose: these workers are then isolated by the sandbox only, not by account (docs/ops.md §41).
+        if (kinds.length) logEvent(app.log, "warn", "worker.same_uid", { workerKinds: kinds.join(",") });
+      };
+      if (opts.workers?.selfCheck) {
+        void workerGates.start(opts.workers.selfCheck, log).then(sameUid);
+        return;
+      }
+      if (config.env === "test") return;
+      // At check start every kind is still on the same-uid sandbox: say so now (and again for those left after).
+      sameUid();
+      if (!workerAccount) return;
+      if (extractorKind(config) === "in-process")
+        workerGates.skip("extract", "in-process extraction (tests only)");
+      if (docRunnerKind(config) === "in-process")
+        workerGates.skip("docgen", "in-process documents (tests only)");
+      if (opts.extract?.runner) workerGates.skip("extract", "a custom extractor");
+      if (opts.docs?.runner) workerGates.skip("docgen", "a custom document runner");
+      const account = workerAccount;
+      const renderer = ownRenderer;
+      // This checkout's fingerprints, hashed once (node and the browser are large; asynchronously, off the loop).
+      let current: Promise<WorkerFingerprints> | undefined;
+      const currentFor = async (kind: WorkerKind) =>
+        kindFingerprint(
+          await (current ??= computeFingerprints(defaultFingerprintSources(config.exportBrowser))),
+          kind,
+        );
+      const installedFor = (kind: WorkerKind) => {
+        const f = installedFingerprints();
+        return f ? kindFingerprint(f, kind) : undefined;
+      };
+      void workerGates
+        .start(async (kind, signal) => {
+          if (kind === "render" && !renderer)
+            return { ok: false, step: "run", reason: "no renderer of this server's own" };
+          return selfCheckWorker({
+            kind,
+            account,
+            dataDir: config.dataDir,
+            serverUid: process.getuid?.() ?? -1,
+            signal,
+            bundle: { current: () => currentFor(kind), installed: () => installedFor(kind) },
+            job:
+              kind === "extract"
+                ? extractJobCheck(config.dataDir, ocrNow)
+                : kind === "docgen"
+                  ? docJobCheck(config.dataDir)
+                  : renderJobCheck(renderer!),
+          });
+        }, log)
+        .then(sameUid);
+    };
+    app.addHook("preClose", async () => workerGates.stop(10_000));
+    // Citations (#25): `cite` checks against the stored page text; the run's note reads them back. `file_cite`
+    // (#48) numbers file citations in the same sequence.
+    const citations = new CitationStore(opts.db!);
+    const mcp = new McpService(mcpTokens, users, {
+      log: app.log,
+      files: { tools: new FileTools(fileStore, fileExtracts, app.conversations!), citations },
+      web: {
+        sources,
+        citations,
+        providers: config.webSearchProviders,
+        // The FakeRuntime mode (e2e, local tries) answers the citation fixture pages in-process (no network).
+        ...(config.fakeRuntime ? { worker: fixtureWebWorker(sandboxedWorker()) } : {}),
+        ...opts.web,
+      },
+      artifacts,
+      scheduleProposals,
+      docs,
+      // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
+      ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
+      // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
+      finance: {
+        secrets: config.skillSecrets,
+        // The FakeRuntime mode (e2e, local tries): synthetic histories in-process, never the network (#31).
+        ...(config.fakeRuntime ? { worker: fixtureFinanceWorker() } : {}),
+      },
+      watchlist,
+      // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
+      switches: new SkillSwitches(settingsStore),
+      ...(errors ? { errors } : {}),
+      ...mcpOptionsFromConfig(config),
+      ...opts.mcp,
+    });
+    const connections = new ConnectionService(
+      connectionStore,
+      users,
+      new ConnectionTester(runtimes, mcp, mcpTokens, { usage, log: app.log, ...opts.connectionTest }),
+      runtimes,
+      app.log,
+    );
+    app.decorate("connections", connections);
+    // Defaults and the per-conversation settings (#35, #19): one service for the settings screen, new
+    // conversations (FR-12.6 fallback) and the chip — all through the run check itself.
+    const defaults = new DefaultsService(connections.access, runtimes);
+    const startSettings = (userId: string) => {
+      const u = users.byId(userId);
+      return u ? defaults.start(u) : null;
+    };
+    // Deleting a conversation (#54) — set right below; one-off sessions (summaries) and a session that finished
+    // opening after its conversation went are handed to it by the run manager once closed.
+    const later: { purge?: ConversationPurge } = {};
+    const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
+      forgetSession: (ref) => later.purge?.orphan(ref),
+      startSettings,
+      mcp,
+      usage,
+      mcpTokens,
+      connections: {
+        resolve: (input) => connections.access.resolve(input),
+        runFailed: (run, code, info) => connections.runFailed(run, code, info),
+        runSucceeded: (run) => connections.runSucceeded(run),
+      },
+      log: app.log,
+      ...(errors ? { errors } : {}),
+      context: config.context,
+      // Uploaded files of the conversation for a fresh session's context (#45): the run manager keeps those of the
+      // history's messages (an upload not sent yet, or sent with a message an edit cut, is not) — the same files the
+      // file tools serve that run (#53).
+      // Files the run made (#49): a download chip under the reply.
+      generatedFiles: (conversationId, messageId) =>
+        (app.files?.generatedOf(conversationId, messageId) ?? []).map((f) => ({ id: f.id, name: f.name })),
+      contextFiles: (conversationId) =>
+        (app.files?.list(conversationId) ?? []).map((f) => ({
+          id: f.id,
+          name: f.name,
+          kind: f.kind,
+          messageId: f.messageId,
+        })),
+      // The conversation's sources for the cited-source references (#53): only ids `cite` knows, with whether their
+      // text is stored.
+      contextSources: (conversationId) => sources.citable(conversationId),
+      ...opts.runs,
+    });
+    const deletion = new ConversationPurge(opts.db!, app.conversations!, {
+      dataDir: config.dataDir,
+      runtimes,
+      runs: runManager,
+      removeFiles: (userId, conversationId) =>
+        app.fileWrites.write(() => fileStore.removeConversationFiles(userId, conversationId)),
+      cleanup: () => storedRescrub.cleanup(),
+      evictFiles: (ids) => fileExtracts.evict(ids),
+      log: app.log,
+      ...opts.purge,
+    });
+    later.purge = deletion;
+    app.decorate("purge", deletion);
+    // Sessions of conversations deleted before a crash (or waiting for a retry) are forgotten once serving.
+    app.addHook("onReady", async () => deletion.resume());
+    app.addHook("onClose", async () => deletion.close());
+    // Runs left running by a previous process cannot be continued: mark them failed before serving.
+    runManager.recover();
+    const purge = setInterval(() => runManager.purgeEvents(), 10 * 60_000);
+    purge.unref();
+    app.addHook("onClose", async () => clearInterval(purge));
+    // preClose: before Fastify waits for open connections, end the event streams that would otherwise hold it.
+    app.addHook("preClose", async () => runManager.shutdown());
+    app.addHook("onClose", async () => mcp.close());
+    app.decorate("mcp", mcp);
+    app.decorate("runs", runManager);
+    // Left-overs of the last run (cut-off uploads, files whose row never came) — only on the data folder's own
+    // database: an app on another database (tests on the default folder) must not judge this folder's files.
+    const which = databaseOf(opts.db!, config.dataDir);
+    // Session state no conversation owns (a crash between a runtime writing it and its row, #54): found now, before
+    // anything can open a session, and forgotten by the jobs — only on this folder's own database, like the sweep.
+    if (which === "own") deletion.reconcile();
+    if (which === "own")
+      app.addHook("onReady", async () => {
+        const count = await app.fileWrites.write(() => fileStore.sweep());
+        if (count) logEvent(app.log, "info", "file.swept", { count });
+        // python_run job folders of the last process (#47): nothing runs yet, so all are left-overs. Keep the
+        // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
+        if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
+        startSelfCheck();
+        // Worker job folders of the last process (#122), then the worker account's checks.
+        if (!sweepWorkerScratch(config.dataDir, workerAccount))
+          logEvent(app.log, "warn", "worker.sweep_failed");
+        startWorkerChecks();
+      });
+    else {
+      if (which === "other")
+        app.addHook("onReady", async () => logEvent(app.log, "warn", "file.sweep_skipped"));
+      // No sweep here: the self-check (tests that inject one) still starts in the background once ready.
+      app.addHook("onReady", async () => {
+        startSelfCheck();
+        startWorkerChecks();
+      });
+    }
+    // Family sharing (#29): the one projection every shared read goes through (shares/projection.ts). Before the
+    // routes whose resource checks ask it who a resource is shared with.
+    const sharing = new SharePolicy(
+      opts.db!,
+      new ShareStore(opts.db!),
+      users,
+      app.conversations!,
+      artifacts,
+      fileStore,
+      sources,
+    );
+    app.decorate("sharing", sharing);
+    // An owner deactivated (or otherwise changed): their shares reach no one now — open shared streams re-check.
+    events.on("user-access-changed", (e) => {
+      for (const s of sharing.store.activeOwnedBy(e.userId))
+        events.emit("resource-access-changed", { kind: "share", id: s.id, scope: s.conversationId });
+    });
+    // A deleted conversation takes its shares with it (foreign key): its open shared streams close now.
+    app.conversations!.onDeleted((c) =>
+      events.emit("resource-access-changed", { kind: "conversation", id: c.id, scope: c.id }),
+    );
+    registerConversationRoutes(app, app.conversations!, runManager, { defaults, users }, fileStore);
+    registerFileRoutes(app, app.conversations!, fileStore, fileExtracts);
+    // Cancel records of uploads that never came expire after 6 hours (review #102 7차): at start and every 10 min.
+    app.addHook("onReady", async () => void fileStore.expireCancels());
+    const expireCancels = setInterval(() => fileStore.expireCancels(), 10 * 60_000);
+    expireCancels.unref();
+    app.addHook("onClose", async () => clearInterval(expireCancels));
+    registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
+    registerErrorRoutes(app, errors!);
+    registerSkillRoutes(app, mcp);
+    // Codex ChatGPT device-code logins (#18): the pinned app-server, sandboxed, behind its own egress proxy.
+    // Tests script it (opts.subscription.device) and never start a real process; neither does the development
+    // FakeRuntime mode (no real Codex there to use the login with).
+    const device =
+      opts.subscription?.device ??
+      (config.env === "test" || config.fakeRuntime
+        ? undefined
+        : new CodexDeviceLogin({ egress: egressFor(CODEX_LOGIN_EGRESS_HOSTS) }));
+    // A server that died during a login left its folder (maybe with the tokens file) and maybe its process: both
+    // go before anything else runs (#18 review).
+    cleanupLeftoverLogins(config.dataDir, {
+      ...(opts.subscription?.identify ? { identify: opts.subscription.identify } : {}),
+      report: (outcome) =>
+        logEvent(
+          app.log,
+          outcome === "leftover_process_kept" ? "warn" : "info",
+          "connection.login_leftover",
+          {
+            loginCode: outcome,
+          },
+        ),
+    });
+    const logins = new SubscriptionLoginService(connectionStore, users, device, config.dataDir, {
+      replaced: (id) => connections.replaced(id),
+      log: app.log,
+      ...(opts.subscription?.maxActiveLogins ? { maxActive: opts.subscription.maxActiveLogins } : {}),
+    });
+    app.addHook("onClose", async () => logins.close());
+    registerConnectionRoutes(app, connections, users, runtimes, logins);
+    // Admin screen (#35): accounts, defaults, skills, runtimes and system status.
+    registerAccountSettings(app, users, {
+      defaults,
+      mcp,
+    });
+    registerAdminSystemRoutes(
+      app,
+      { registry: runtimes, connections: connectionStore, errors: errors! },
+      {
+        version: VERSION,
+        startedAt,
+        dataDir: config.dataDir,
+        databaseFile: opts.db!.$client.memory ? null : opts.db!.$client.name,
+        tunnelMetrics: config.tunnelMetrics,
+        workers: () => workerGates.status(),
+        ...opts.system,
+      },
+    );
+    // Backups (#37): a file database and a backup folder (config.ts keeps it outside DATA_DIR and the repository).
+    const backups =
+      config.backupDir && !opts.db!.$client.memory
+        ? new BackupService(
+            {
+              sqlite: opts.db!.$client,
+              dataDir: config.dataDir,
+              backupDir: config.backupDir,
+              masterKey,
+              lock: app.fileWrites,
+              log: app.log,
+              // Every failure, and an empty backup folder, reach the admins (#34 inbox and push).
+              notifyAdmins: (message) => {
+                for (const admin of connectionStore.admins())
+                  notifications.publish(admin, { kind: "system_warning", message, url: "/admin?tab=backup" });
+              },
+            },
+            opts.backup,
+          )
+        : undefined;
+    app.decorate("backups", backups);
+    registerBackupRoutes(app, backups, config.dataDir);
+    if (backups && (config.env !== "test" || opts.backup?.schedule))
+      app.addHook("onReady", async () => backups.start());
+    // Before the database closes (index.ts closes it in onClose): a backup in progress finishes first.
+    if (backups) app.addHook("preClose", async () => backups.stop());
+    // Schedules (#33): persistent occurrences and runs; the engine runs only where the data folder is ours. The
+    // handler (#56) runs each one as a turn of the schedule's result conversation (FAKE_RUNTIME=1: on the FakeRuntime).
+    const scheduleStore = new ScheduleStore(opts.db!);
+    const scheduleNow = opts.schedules?.now ?? opts.schedules?.engine?.now ?? Date.now;
+    const scheduleHandler =
+      opts.schedules?.handler ??
+      new RuntimeScheduleHandler({
+        store: scheduleStore,
+        conversations: app.conversations!,
+        runs: runManager,
+        notifications: () => app.notifications,
+        sharedResult: (r) => notifyResultSubscribers(sharing, app.notifications, r),
+        now: scheduleNow,
+        log: app.log,
+        ...opts.schedules?.runtime,
+      });
+    const dataLock = opts.dataLock;
+    const owned = dataLock ? { owned: () => dataLock.held() } : {};
+    const scheduleEngine = new ScheduleEngine(scheduleStore, scheduleHandler, {
+      log: app.log,
+      ...owned,
+      ...(opts.schedules?.now ? { now: opts.schedules.now } : {}),
+      ...opts.schedules?.engine,
+    });
+    // FR-11.8: a schedule whose connection is gone is said before its next run (an hour ahead, once per occurrence).
+    const scheduleWarnings = new ScheduleWarnings({
+      store: scheduleStore,
+      usable: (row) => scheduleUsable(row, { registry: runtimes, access: connections.access }),
+      notifications: () => app.notifications,
+      now: scheduleNow,
+      log: app.log,
+      ...owned,
+    });
+    app.decorate("schedules", { store: scheduleStore, engine: scheduleEngine, warnings: scheduleWarnings });
+    registerScheduleRoutes(app, {
+      store: scheduleStore,
+      proposals: scheduleProposals,
+      engine: scheduleEngine,
+      defaults,
+      users,
+      mcp,
+      now: scheduleNow,
+    });
+    if (opts.schedules?.start || (config.env !== "test" && dataLock))
+      app.addHook("onReady", async () => {
+        scheduleEngine.start();
+        scheduleWarnings.start();
+      });
+    // Before the database closes: runs in progress are aborted and waited for (the rest recover at the next start).
+    app.addHook("preClose", async () => {
+      scheduleWarnings.stop();
+      await scheduleEngine.stop();
+    });
+    registerSourceRoutes(app, app.conversations!, sources);
+    registerWatchlistRoutes(app, { store: watchlist, mcp });
+    // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
+    registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
+    // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
+    let renderer = opts.renderer;
+    if (!renderer) {
+      const own = new Renderer({
+        browser: config.env === "test" ? undefined : findBrowser(config.exportBrowser),
+        // Through the worker account once its render check passed (#122).
+        account: {
+          verified: () => workerGates.verified("render"),
+          dataDir: config.dataDir,
+          onFallback: () => sameUidUse("render"),
+        },
+      });
+      ownRenderer = own;
+      app.addHook("onClose", async () => own.close());
+      renderer = own;
+    }
+    registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
+    registerShareRoutes(app, sharing, users, {
+      ...(opts.sse ?? {}),
+      // "이어서 대화하기" (#52): the projection copied into the forker's own conversation, on their own defaults.
+      fork: new ForkService({
+        db: opts.db!,
+        lock: app.fileWrites,
+        conversations: app.conversations!,
+        files: fileStore,
+        artifacts,
+        sources,
+        extract: (id) => fileExtracts.enqueue(id),
+      }),
+      start: (userId) => startSettings(userId),
+    });
+
+    const vapid = loadOrCreateVapidKeys(settingsStore);
+    const notifications = new NotificationService(
+      opts.db!,
+      masterKey,
+      users,
+      app.resources,
+      vapid,
+      `https://${config.publicHost}`,
+      app.log,
+      opts.notifications,
+    );
+    app.decorate("notifications", notifications);
+    registerNotificationRoutes(app, notifications);
+    app.decorate("usage", usageService);
+    registerUsageRoutes(app, usageService, usage.prices);
+    connections.attach({
+      runs: runManager,
+      notify: (userId, input) => void notifications.publish(userId, input),
+    });
+    // `.env` credentials from before #17, imported once and tested so they keep working (docs/ops.md §11).
+    // A value that cannot be imported is logged and shown to the admin; the server still starts (fix, restart).
+    connections.importFailures = importEnvConnections(
+      config,
+      connectionStore,
+      users,
+      settingsStore,
+      app.log,
+    ).failed;
+    // Every start: imported connections still waiting for their first test are tested (also after a crash).
+    const pending = pendingImportTests(connectionStore, settingsStore);
+    if (pending.length)
+      app.addHook("onReady", async () => {
+        const tester = connectionStore.admins()[0];
+        if (!tester) return; // no admin yet: tested on a later start, or by the admin in the app
+        void (async () => {
+          for (const c of pending) await connections.test(c, c.ownerId ?? tester).catch(() => undefined);
+        })();
+      });
+    // Pushes held for quiet hours (or cut off by the last shutdown) are sent once their time has come.
+    app.addHook("onReady", async () => notifications.start());
+    app.addHook("onClose", async () => notifications.stop());
+  } else {
+    app.decorate("notifications", undefined);
+    app.decorate("connections", undefined);
+    app.decorate("artifacts", undefined);
+    app.decorate("usageStore", undefined);
+    app.decorate("usage", undefined);
+    app.decorate("backups", undefined);
+    app.decorate("storedRescrub", undefined);
+    app.decorate("files", undefined);
+    app.decorate("schedules", undefined);
+    app.decorate("scheduleProposals", undefined);
+    app.decorate("watchlist", undefined);
+    app.decorate("fileExtracts", undefined);
+    app.decorate("sharing", undefined);
+    app.decorate("purge", undefined);
+  }
+
+  app.get(
+    "/api/health",
+    { config: { auth: "public", noResource: "service status" } },
+    async (): Promise<HealthResponse> => ({
+      status: "ok",
+      service: "agent-lee",
+      version: VERSION,
+      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+    }),
+  );
+
+  if (config.diagStream) registerDiag(app, opts.diag);
+
+  // Unknown API routes are JSON 404s, never the SPA page.
+  const apiNotFound = async (
+    _req: unknown,
+    reply: { code: (n: number) => { send: (b: unknown) => unknown } },
+  ) => reply.code(404).send({ error: "not_found" });
+  const notFound = { auth: "public" as const, noResource: "catch-all 404 for unknown API paths" };
+  app.all("/api", { config: notFound }, apiNotFound);
+  app.all("/api/*", { config: notFound }, apiNotFound);
+
+  if (opts.vite) {
+    const { default: middie } = await import("@fastify/middie");
+    const { createServer } = await import("vite");
+    await app.register(middie);
+    const vite = await createServer({
+      root: WEB_ROOT,
+      // A WebSocket upgrade on the app port would bypass every Fastify hook (trust boundary, gate, session), so
+      // HMR never shares the app server: it gets its own loopback-only port, which the tunnel does not reach,
+      // and is switched off entirely while the code gate is on.
+      // Host is already checked by the trust boundary; let Vite serve the public host too.
+      server: config.tempGateCode
+        ? { middlewareMode: true, hmr: false, ws: false, allowedHosts: [config.publicHost] }
+        : {
+            middlewareMode: true,
+            hmr: { host: "127.0.0.1", port: opts.hmrPort ?? 24678 },
+            allowedHosts: [config.publicHost],
+          },
+      appType: "spa",
+    });
+    // API routes must reach Fastify; Vite's SPA fallback would otherwise answer /api/* with index.html.
+    // Vite ends responses itself (onSend never runs), so set the base headers before handing over.
+    // App pages answered by Fastify routes (`/a/...`, #27) get Vite's index.html from there.
+    const indexFile = path.join(WEB_ROOT, "index.html");
+    appPage = (url) => vite.transformIndexHtml(url, fs.readFileSync(indexFile, "utf8"));
+    app.use((req, res, next) => {
+      if (isApiPath(req.url) || isGatePath(req.url) || isArtifactPath(req.url)) return next();
+      for (const [k, v] of Object.entries(BASE_HEADERS)) res.setHeader(k, v);
+      return vite.middlewares(req, res, next);
+    });
+    app.addHook("onClose", async () => vite.close());
+  } else {
+    const webDist = opts.webDist ?? DEFAULT_WEB_DIST;
+    if (fs.existsSync(path.join(webDist, "index.html"))) {
+      const indexHtml = fs.readFileSync(path.join(webDist, "index.html"));
+      appPage = async () => indexHtml;
+      await app.register(fastifyStatic, { root: webDist, index: ["index.html"], wildcard: false });
+      // SPA fallback: client-side routes (e.g. /c/123) get index.html.
+      app.setNotFoundHandler((req, reply) => {
+        if ((req.method !== "GET" && req.method !== "HEAD") || isApiPath(req.url))
+          return reply.code(404).send({ error: "not_found" });
+        return reply.type("text/html; charset=utf-8").header("Cache-Control", "no-cache").send(indexHtml);
+      });
+    } else {
+      // The path is not logged (log policy): the default is apps/web/dist — run "pnpm build" first.
+      logEvent(app.log, "warn", "web.build_missing");
+    }
+  }
+
+  return app;
+}

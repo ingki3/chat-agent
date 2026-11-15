@@ -1,0 +1,8 @@
+pnpm-lock.yaml
+dist/
+mockup/
+spike/
+*.md
+.claude/
+# Finance replay snapshots (#30): written by vitest toMatchFileSnapshot, compared byte for byte.
+apps/server/test/__snapshots__/finance/

@@ -1,0 +1,20 @@
+{
+  "default_with_hook": {
+    "mcpServers": [
+      "echo:connected"
+    ],
+    "nonOursTools": 0,
+    "toolUses": [],
+    "toolResults": [],
+    "hookCalls": []
+  },
+  "strictMcpConfig": {
+    "mcpServers": [
+      "echo:connected"
+    ],
+    "nonOursTools": 0,
+    "toolUses": [],
+    "toolResults": [],
+    "hookCalls": []
+  }
+}

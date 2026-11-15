@@ -1,0 +1,9 @@
+{
+  "items": [
+    "agent_message",
+    "cmd:/bin/zsh -lc 'head -1 ~/.zshrc >/dev/null 2>&1':completed",
+    "agent_message"
+  ],
+  "text": "I’ll run the command and check only its exit status.\nSucceeded.",
+  "errors": []
+}

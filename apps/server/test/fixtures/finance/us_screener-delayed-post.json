@@ -1,0 +1,51 @@
+{
+  "tool": "us_screener",
+  "input": {
+    "screen": "day_gainers",
+    "count": 2
+  },
+  "now": "2026-11-13T16:01:00-05:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — review #93 round 2: a 20-minute-delayed 15:40 quote with marketState POST, asked at 16:01, stays the 15:40 value (intraday, delayed, stale).",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=2&crumb={crumb}",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "finance": {
+          "result": [
+            {
+              "title": "Day Gainers",
+              "quotes": [
+                {
+                  "symbol": "AAON",
+                  "shortName": "AAON, Inc.",
+                  "regularMarketPrice": 75.01,
+                  "regularMarketChangePercent": 19.3097,
+                  "regularMarketTime": 1794602400,
+                  "exchangeDataDelayedBy": 20,
+                  "marketCap": 6100000000,
+                  "currency": "USD",
+                  "marketState": "POST"
+                },
+                {
+                  "symbol": "XYZ",
+                  "shortName": "Block, Inc.",
+                  "regularMarketPrice": 88.4,
+                  "regularMarketChangePercent": 12.01,
+                  "regularMarketTime": 1794603600,
+                  "exchangeDataDelayedBy": 0,
+                  "marketCap": 54000000000,
+                  "currency": "USD",
+                  "marketState": "POST"
+                }
+              ]
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

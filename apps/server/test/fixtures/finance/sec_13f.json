@@ -1,0 +1,34 @@
+{
+  "tool": "sec_13f",
+  "input": {
+    "cik": "1067983",
+    "count": 1
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://data.sec.gov/submissions/CIK0001067983.json",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "cik": "0001067983",
+        "name": "BERKSHIRE HATHAWAY INC",
+        "tickers": ["BRK-B", "BRK-A"],
+        "filings": {
+          "recent": {
+            "accessionNumber": ["0000950123-26-011223", "0000950123-26-008123"],
+            "filingDate": ["2026-11-13", "2026-08-14"],
+            "reportDate": ["2026-09-30", "2026-06-30"],
+            "acceptanceDateTime": ["2026-11-13T16:05:11.000Z", "2026-08-14T16:02:01.000Z"],
+            "form": ["13F-HR", "13F-HR"],
+            "items": ["", ""],
+            "primaryDocument": ["xslForm13F_X02/primary_doc.xml", "xslForm13F_X02/primary_doc.xml"],
+            "primaryDocDescription": ["13F-HR", "13F-HR"]
+          }
+        }
+      }
+    }
+  ]
+}

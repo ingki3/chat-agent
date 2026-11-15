@@ -1,0 +1,44 @@
+{
+  "tool": "kr_etf",
+  "input": {
+    "code": "069500"
+  },
+  "now": "2026-11-14T11:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://m.stock.naver.com/api/stock/069500/basic",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "stockEndType": "etf",
+        "itemCode": "069500",
+        "reutersCode": "069500",
+        "stockName": "KODEX 200",
+        "closePrice": "84,540",
+        "compareToPreviousClosePrice": "2,540",
+        "compareToPreviousPrice": {
+          "code": "2",
+          "text": "상승",
+          "name": "RISING"
+        },
+        "fluctuationsRatio": "3.10",
+        "marketStatus": "CLOSE",
+        "localTradedAt": "2026-11-13T15:58:17+09:00",
+        "stockExchangeType": {
+          "code": "KS",
+          "zoneId": "Asia/Seoul",
+          "nationType": "KOR",
+          "delayTime": 0,
+          "startTime": "0900",
+          "endTime": "1530",
+          "nameKor": "코스피",
+          "nameEng": "KOSPI",
+          "name": "KOSPI"
+        },
+        "stockExchangeName": "KOSPI"
+      }
+    }
+  ]
+}

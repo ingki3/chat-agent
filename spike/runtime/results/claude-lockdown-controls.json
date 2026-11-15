@@ -1,0 +1,20 @@
+{
+  "gatedByCallback": {
+    "toolUses": [
+      "Bash"
+    ],
+    "callbacks": [],
+    "toolResults": [
+      "\"agentlee-probe\""
+    ]
+  },
+  "allowedToolsBypass": {
+    "toolUses": [
+      "Bash"
+    ],
+    "callbacks": [],
+    "toolResults": [
+      "\"agentlee-probe\""
+    ]
+  }
+}

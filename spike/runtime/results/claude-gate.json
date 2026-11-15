@@ -1,0 +1,52 @@
+{
+  "callback_readonly_cmd": {
+    "toolUses": [
+      "Bash"
+    ],
+    "toolResults": [
+      "\"agentlee-probe\""
+    ],
+    "callbacks": [],
+    "hookCalls": []
+  },
+  "callback_writing_cmd": {
+    "toolUses": [
+      "Bash",
+      "Bash"
+    ],
+    "toolResults": [
+      "\"blocked by policy\"",
+      "\"blocked by policy\""
+    ],
+    "callbacks": [
+      "Bash",
+      "Bash"
+    ],
+    "hookCalls": []
+  },
+  "wroteFile": false,
+  "hook_readonly_cmd": {
+    "toolUses": [
+      "Bash"
+    ],
+    "toolResults": [
+      "\"PreToolUse:Bash hook error: blocked by Agent Lee\""
+    ],
+    "callbacks": [],
+    "hookCalls": [
+      "Bash"
+    ]
+  },
+  "disallowed_readonly_cmd": {
+    "toolUses": [],
+    "toolResults": [],
+    "callbacks": [],
+    "hookCalls": []
+  },
+  "empty_tools": {
+    "toolUses": [],
+    "toolResults": [],
+    "callbacks": [],
+    "hookCalls": []
+  }
+}

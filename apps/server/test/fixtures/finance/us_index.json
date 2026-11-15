@@ -1,0 +1,64 @@
+{
+  "tool": "us_index",
+  "input": {
+    "index": "SP500"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=5d&interval=1d&includePrePost=false",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "chart": {
+          "result": [
+            {
+              "meta": {
+                "currency": "USD",
+                "symbol": "^GSPC",
+                "exchangeName": "NMS",
+                "fullExchangeName": "SNP",
+                "instrumentType": "EQUITY",
+                "regularMarketTime": 1794603600,
+                "gmtoffset": -18000,
+                "timezone": "EST",
+                "exchangeTimezoneName": "America/New_York",
+                "regularMarketPrice": 7123.45,
+                "fiftyTwoWeekHigh": 355.38,
+                "fiftyTwoWeekLow": 243.42,
+                "regularMarketDayHigh": 7125.55,
+                "regularMarketDayLow": 7120.25,
+                "regularMarketVolume": 44703800,
+                "chartPreviousClose": 331.9,
+                "dataGranularity": "1d",
+                "range": "5d",
+                "longName": "S&P 500",
+                "shortName": "S&P 500"
+              },
+              "timestamp": [1794234600, 1794321000, 1794407400, 1794493800, 1794580200],
+              "indicators": {
+                "quote": [
+                  {
+                    "open": [7048.6, 7086.9, 7100.4, 7138.7, 7121.95],
+                    "high": [7052.2, 7090.5, 7104.0, 7142.3, 7125.55],
+                    "low": [7046.9, 7085.2, 7098.7, 7137.0, 7120.25],
+                    "close": [7050.1, 7088.4, 7101.9, 7140.2, 7123.45],
+                    "volume": [40000000, 41000000, 42000000, 43000000, 44000000]
+                  }
+                ],
+                "adjclose": [
+                  {
+                    "adjclose": [7050.1, 7088.4, 7101.9, 7140.2, 7123.45]
+                  }
+                ]
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

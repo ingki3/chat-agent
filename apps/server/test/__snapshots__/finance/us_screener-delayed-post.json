@@ -1,0 +1,57 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "us_screener",
+  "screen": "day_gainers",
+  "title": "Day Gainers",
+  "rows": [
+   {
+    "symbol": "AAON",
+    "name": "AAON, Inc.",
+    "price": 75.01,
+    "changePercent": 19.31,
+    "marketCap": 6100000000,
+    "currency": "USD",
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T15:40:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": true,
+    "kind": "intraday",
+    "stale": true
+   },
+   {
+    "symbol": "XYZ",
+    "name": "Block, Inc.",
+    "price": 88.4,
+    "changePercent": 12.01,
+    "marketCap": 54000000000,
+    "currency": "USD",
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "close"
+   }
+  ],
+  "sources": [
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T15:40:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": true,
+    "kind": "intraday",
+    "label": "Yahoo Finance · 2026-11-13 15:40 ET 장중 (지연)"
+   },
+   {
+    "source": "Yahoo Finance",
+    "asOf": "2026-11-13T16:00:00-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "close",
+    "label": "Yahoo Finance · 2026-11-13 16:00 ET 종가"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

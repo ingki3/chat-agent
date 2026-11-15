@@ -1,0 +1,23 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "kr_search",
+  "items": [
+   {
+    "code": "005930",
+    "name": "삼성전자",
+    "market": "KOSPI",
+    "category": "stock"
+   },
+   {
+    "code": "005935",
+    "name": "삼성전자우",
+    "market": "KOSPI",
+    "category": "stock"
+   }
+  ],
+  "sources": [],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

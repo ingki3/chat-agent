@@ -1,0 +1,66 @@
+{
+  "tool": "us_history",
+  "input": {
+    "symbol": "AAPL",
+    "range": "1mo",
+    "interval": "1d"
+  },
+  "now": "2026-11-14T10:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=1mo&interval=1d&includePrePost=false",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "chart": {
+          "result": [
+            {
+              "meta": {
+                "currency": "USD",
+                "symbol": "AAPL",
+                "exchangeName": "NMS",
+                "fullExchangeName": "NasdaqGS",
+                "instrumentType": "EQUITY",
+                "regularMarketTime": 1794603600,
+                "gmtoffset": -18000,
+                "timezone": "EST",
+                "exchangeTimezoneName": "America/New_York",
+                "regularMarketPrice": 349.8,
+                "fiftyTwoWeekHigh": 355.38,
+                "fiftyTwoWeekLow": 243.42,
+                "regularMarketDayHigh": 351.9,
+                "regularMarketDayLow": 346.6,
+                "regularMarketVolume": 44703800,
+                "chartPreviousClose": 331.9,
+                "dataGranularity": "1d",
+                "range": "5d",
+                "longName": "Apple Inc.",
+                "shortName": "Apple Inc."
+              },
+              "timestamp": [1794234600, 1794321000, 1794407400, 1794493800, 1794580200],
+              "indicators": {
+                "quote": [
+                  {
+                    "open": [340.87, 349.19, 347.01, 349.7, 348.3],
+                    "high": [344.47, 352.79, 350.61, 353.3, 351.9],
+                    "low": [339.17, 347.49, 345.31, 348.0, 346.6],
+                    "close": [342.37, 350.69, 348.51, 351.2, 349.8],
+                    "volume": [40000000, 41000000, 42000000, 43000000, 44000000]
+                  }
+                ],
+                "adjclose": [
+                  {
+                    "adjclose": [342.37, 350.69, 348.51, 351.2, 349.8]
+                  }
+                ]
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

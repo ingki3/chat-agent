@@ -1,0 +1,62 @@
+{
+  "tool": "fx_usdkrw",
+  "input": {},
+  "now": "2026-11-14T11:00:00+09:00",
+  "synthetic": true,
+  "note": "SYNTHETIC — hand-made in the shape of the live API (checked 2026-11-11); replace with a recording: docs/ops.md §19.5",
+  "exchanges": [
+    {
+      "url": "https://query1.finance.yahoo.com/v8/finance/chart/KRW%3DX?range=5d&interval=1d&includePrePost=false",
+      "status": 200,
+      "contentType": "application/json",
+      "body": {
+        "chart": {
+          "result": [
+            {
+              "meta": {
+                "currency": "KRW",
+                "symbol": "KRW=X",
+                "exchangeName": "NMS",
+                "fullExchangeName": "CCY",
+                "instrumentType": "EQUITY",
+                "regularMarketTime": 1794607140,
+                "gmtoffset": -18000,
+                "timezone": "EST",
+                "exchangeTimezoneName": "Europe/London",
+                "regularMarketPrice": 1462.35,
+                "fiftyTwoWeekHigh": 355.38,
+                "fiftyTwoWeekLow": 243.42,
+                "regularMarketDayHigh": 1464.45,
+                "regularMarketDayLow": 1459.15,
+                "regularMarketVolume": 44703800,
+                "chartPreviousClose": 331.9,
+                "dataGranularity": "1d",
+                "range": "5d",
+                "longName": "USD/KRW",
+                "shortName": "USD/KRW"
+              },
+              "timestamp": [1794182400, 1794268800, 1794355200, 1794441600, 1794528000],
+              "indicators": {
+                "quote": [
+                  {
+                    "open": [1453.6, 1456.7, 1458.5, 1457.9, 1460.85],
+                    "high": [1457.2, 1460.3, 1462.1, 1461.5, 1464.45],
+                    "low": [1451.9, 1455.0, 1456.8, 1456.2, 1459.15],
+                    "close": [1455.1, 1458.2, 1460.0, 1459.4, 1462.35],
+                    "volume": [40000000, 41000000, 42000000, 43000000, 44000000]
+                  }
+                ],
+                "adjclose": [
+                  {
+                    "adjclose": [1455.1, 1458.2, 1460.0, 1459.4, 1462.35]
+                  }
+                ]
+              }
+            }
+          ],
+          "error": null
+        }
+      }
+    }
+  ]
+}

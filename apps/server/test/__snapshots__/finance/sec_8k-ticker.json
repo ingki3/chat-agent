@@ -1,0 +1,62 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "sec_8k",
+  "cik": "320193",
+  "company": "Apple Inc.",
+  "tickers": [
+   "AAPL"
+  ],
+  "items": [
+   {
+    "n": 1,
+    "form": "8-K",
+    "accessionNumber": "0001140361-26-042798",
+    "filingDate": "2026-11-09",
+    "reportDate": "2026-11-05",
+    "items": "8.01,9.01",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000114036126042798/ef20085077_8k.htm",
+    "source": "SEC EDGAR",
+    "asOf": "2026-11-09T16:30:40-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing"
+   },
+   {
+    "n": 2,
+    "form": "8-K",
+    "accessionNumber": "0000320193-26-000105",
+    "filingDate": "2026-10-30",
+    "reportDate": "2026-10-30",
+    "items": "2.02,9.01",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000105/aapl-20261030.htm",
+    "source": "SEC EDGAR",
+    "asOf": "2026-10-30T16:31:02-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing"
+   }
+  ],
+  "content": "<external_content source=\"sec:submissions\">\n[1] 8-K · 2026-11-09 · items 8.01,9.01 · 8-K\n[2] 8-K · 2026-10-30 · items 2.02,9.01 · 8-K\n</external_content>",
+  "sources": [
+   {
+    "source": "SEC EDGAR",
+    "asOf": "2026-11-09T16:30:40-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing",
+    "label": "SEC EDGAR · 2026-11-09 16:30 ET 공시"
+   },
+   {
+    "source": "SEC EDGAR",
+    "asOf": "2026-10-30T16:31:02-04:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing",
+    "label": "SEC EDGAR · 2026-10-30 16:31 ET 공시"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

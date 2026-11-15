@@ -1,0 +1,39 @@
+{
+ "ok": true,
+ "output": {
+  "tool": "sec_form4",
+  "cik": "320193",
+  "company": "Apple Inc.",
+  "tickers": [
+   "AAPL"
+  ],
+  "items": [
+   {
+    "n": 1,
+    "form": "4",
+    "accessionNumber": "0001140361-26-042149",
+    "filingDate": "2026-11-05",
+    "reportDate": "2026-11-03",
+    "url": "https://www.sec.gov/Archives/edgar/data/320193/000114036126042149/xslF345X06/form4.xml",
+    "source": "SEC EDGAR",
+    "asOf": "2026-11-05T18:30:13-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing"
+   }
+  ],
+  "content": "<external_content source=\"sec:submissions\">\n[1] 4 · 2026-11-05 · FORM 4\n</external_content>",
+  "sources": [
+   {
+    "source": "SEC EDGAR",
+    "asOf": "2026-11-05T18:30:13-05:00",
+    "timeZone": "America/New_York",
+    "delayed": false,
+    "kind": "filing",
+    "label": "SEC EDGAR · 2026-11-05 18:30 ET 공시"
+   }
+  ],
+  "warnings": [],
+  "disclaimer": "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다."
+ }
+}

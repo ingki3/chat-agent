@@ -1,0 +1,17 @@
+{
+  "code_mode_on": {
+    "items": [
+      "agent_message",
+      "agent_message"
+    ],
+    "text": "It did not work: `functions.exec` is available, but its runtime has no filesystem or shell access, and no file-reading tool is exposed. No file contents were printed.\n\nAvailable tool names:\n\n```text\nfunctions.exec\nfunctions.wait\nfunctions.request_user_input\nfunctions.request_user_input_async\nclock.sleep\ncollaboration.followup_task\ncollaboration.interrupt_agent\ncollaboration.list_agents\ncollaboration.send_message\ncollaboration.spawn_agent\ncollaboration.wait_agent\n```\n\nTools callable through `func"
+  },
+  "code_mode_off": {
+    "items": [
+      "error",
+      "agent_message",
+      "agent_message"
+    ],
+    "text": "It did not work: `functions.exec` returned “code-mode host is disabled,” so I could not read the first line. No file contents were printed.\n\nMy listed tools are:\n\n- `functions.exec`\n- `functions.wait`\n- `functions.request_user_input`\n- `functions.request_user_input_async`\n- `clock.sleep`\n- `collaboration.spawn_agent`\n- `collaboration.followup_task`\n- `collaboration.interrupt_agent`\n- `collaboration.list_agents`\n- `collaboration.send_message`\n- `collaboration.wait_agent`"
+  }
+}

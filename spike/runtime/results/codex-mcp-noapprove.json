@@ -1,0 +1,8 @@
+{
+  "items": [
+    "agent_message",
+    "mcp:echo/echo_time:failed",
+    "agent_message"
+  ],
+  "text": "I’ll call the echo_time tool with tag `n1`.The tool returned: `MCP tool call requires approval, but approval policy is never`\n\nThe `echo_time` call with tag `n1` was blocked, so no server time was returned."
+}

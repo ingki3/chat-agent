@@ -1,0 +1,874 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Writable } from "node:stream";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
+import { afterEach, describe, expect, it } from "vitest";
+import { CSRF_HEADER, RecentErrorsResponse, type Run, type StartRunResponse } from "@agentlee/shared";
+import { buildApp } from "../src/app.js";
+import { loadConfig } from "../src/config.js";
+import { createTestDb } from "../src/db/client.js";
+import { rotatingFile, sanitizeRecord } from "../src/logging.js";
+import { classifyError, ErrorLog, runFailureCategory } from "../src/observability/errors.js";
+import { registerToolNames } from "../src/observability/policy.js";
+import {
+  RuntimeRegistry,
+  type RuntimeAdapter,
+  type RuntimeEvent,
+  type RuntimeSession,
+} from "../src/runtime/adapter.js";
+import { createFamily } from "./helpers/permission-matrix.js";
+
+// The MCP server (#42) registers the tools it exposes; only registered or built-in names are logged.
+registerToolNames(["mcp__agentlee__stocks"]);
+
+type App = Awaited<ReturnType<typeof buildApp>>;
+const apps: App[] = [];
+afterEach(async () => {
+  while (apps.length) await apps.pop()!.close();
+});
+
+/**
+ * Leak fixtures (#46): every one of these is pushed through requests, errors, runs and tools below, and none may
+ * ever appear in the captured log output or the admin error list.
+ */
+const SECRETS = {
+  prompt: "우리 아들 성적표 비밀 문장 PROMPT-LEAK-7f3a",
+  output: "모델 답변 원문 OUTPUT-LEAK-91c2",
+  reasoning: "속생각 REASONING-LEAK-55e1",
+  toolInput: "TOOLINPUT-LEAK-3b8d",
+  toolOutput: "TOOLOUTPUT-LEAK-c40f",
+  sdkError: "SDK raw error with prompt SDKERR-LEAK-e912",
+  stderr: "stderr: Traceback STDERR-LEAK-0aa1",
+  apiKey: "sk-ant-api03-KEYLEAK0123456789abcdefghijklmnopqrstuvwxyz",
+  openaiKey: "sk-proj-OPENAILEAK0123456789abcdefghij",
+  password: "Wrong-Password-LEAK-77",
+  cookie: "COOKIE-LEAK-5d2c",
+  bearer: "BEARER-LEAK-a1b2",
+  jwt: "eyJhbGciOiJSUzI1NiJ9.JWTLEAK.c2lnbmF0dXJl",
+  idempotency: "IDEMPOTENCY-LEAK-8e8e",
+  query: "QUERY-LEAK-1234",
+  gateCode: "GATECODELEAK99",
+  email: "leak.person@example.org",
+  routeError: "THROWN-ROUTE-LEAK-6c6c",
+  title: "대화 제목 TITLE-LEAK-4f4f",
+};
+/**
+ * Secrets made only of characters an ID, code or tool name may contain — a shape check alone lets these through,
+ * so the policy compares against what the server itself produced instead.
+ */
+const ALLOWED_CHAR_SECRETS = {
+  gateCode: "abcdgate1234zz",
+  apiKey: "sk-proj-AAAAallowedchars0123456789",
+  jwt: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLWxlYWs",
+  idLike: "sk-ant-api03-ABCDEFGHIJ_klmnopq",
+  snake: "secret_code_leak_42",
+};
+/** Generic patterns: API-key shapes, JWTs, e-mail addresses. */
+const PATTERNS = [/sk-(ant|proj)-/, /eyJ[A-Za-z0-9_-]{5,}\./, /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}/];
+
+function assertNoLeak(text: string) {
+  for (const [name, secret] of Object.entries({ ...SECRETS, ...ALLOWED_CHAR_SECRETS }))
+    expect(text, `leaked ${name}`).not.toContain(secret);
+  for (const re of PATTERNS) expect(text, `matches ${re}`).not.toMatch(re);
+}
+
+function capture() {
+  const lines: string[] = [];
+  const stream = new Writable({ write: (c, _e, cb) => (lines.push(String(c)), cb()) });
+  const records = () =>
+    lines
+      .join("")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  return { stream, text: () => lines.join(""), records };
+}
+
+/** A runtime whose every event carries a secret; "FAIL" in the prompt makes it throw an SDK-like error. */
+class LeakyRuntime implements RuntimeAdapter {
+  readonly id = "claude-code" as const;
+  capabilities() {
+    return {
+      models: [{ id: "m1", label: "M1", efforts: [] }],
+      canSwitchModelInSession: true,
+      canResume: false,
+    };
+  }
+  async resume(): Promise<RuntimeSession> {
+    throw new Error("no resume");
+  }
+  async start(): Promise<RuntimeSession> {
+    return {
+      externalSessionId: "leaky-1",
+      setModel: async () => {},
+      close: async () => {},
+      turn: (input) => {
+        async function* events(): AsyncGenerator<RuntimeEvent> {
+          yield { type: "reasoning_delta", text: SECRETS.reasoning };
+          yield { type: "text_delta", text: SECRETS.output };
+          yield { type: "tool_start", callId: "c1", name: "web_search", input: { q: SECRETS.toolInput } };
+          await new Promise((r) => setTimeout(r, 5));
+          yield { type: "tool_end", callId: "c1", output: { text: SECRETS.toolOutput } };
+          yield { type: "tool_start", callId: "c2", name: "mcp__agentlee__stocks", input: SECRETS.apiKey };
+          yield { type: "tool_end", callId: "c2", output: SECRETS.stderr, isError: true };
+          // A runtime may report any string as a tool name: an unknown (secret-looking) one is logged as "other".
+          yield { type: "tool_start", callId: "c3", name: ALLOWED_CHAR_SECRETS.jwt, input: null };
+          yield { type: "tool_end", callId: "c3", output: null, isError: true };
+          yield { type: "usage", inputTokens: 120, outputTokens: 30, costUsd: 0.0125 };
+          if (input.text.includes("RESET"))
+            throw Object.assign(new Error(`${SECRETS.sdkError} socket hang up`), { code: "ECONNRESET" });
+          if (input.text.includes("FAIL")) {
+            const err = new Error(`${SECRETS.sdkError} ${input.text} ${SECRETS.apiKey}`) as Error & {
+              stderr?: string;
+              code?: string;
+            };
+            err.stderr = SECRETS.stderr;
+            throw err;
+          }
+        }
+        return { events: events(), interrupt: async () => {} };
+      },
+    };
+  }
+}
+
+async function start(env: Record<string, string> = {}) {
+  const log = capture();
+  const runtimes = new RuntimeRegistry();
+  runtimes.register(new LeakyRuntime());
+  const app = await buildApp(loadConfig({ NODE_ENV: "test", ...env }), {
+    db: createTestDb(),
+    logStream: log.stream,
+    runtimes,
+    runs: { flushMs: 0 },
+  });
+  app.get("/api/test/boom", { config: { auth: "public", noResource: "test" } }, async () => {
+    throw new Error(`${SECRETS.routeError} ${SECRETS.prompt}`);
+  });
+  app.get("/api/test/coded", { config: { auth: "public", noResource: "test" } }, async () => {
+    throw Object.assign(new Error(SECRETS.prompt), {
+      code: ALLOWED_CHAR_SECRETS.apiKey,
+      name: ALLOWED_CHAR_SECRETS.snake,
+    });
+  });
+  app.get("/api/test/client", { config: { auth: "public", noResource: "test" } }, async () => {
+    throw Object.assign(new Error(`${SECRETS.prompt} ${SECRETS.apiKey}`), {
+      statusCode: 422,
+      code: ALLOWED_CHAR_SECRETS.snake,
+    });
+  });
+  app.get("/api/test/bindings", { config: { auth: "public", noResource: "test" } }, async (req) => {
+    req.log
+      .child({
+        constructor: { prompt: SECRETS.prompt, cookie: SECRETS.cookie },
+        toString: SECRETS.apiKey,
+        hasOwnProperty: SECRETS.password,
+        valueOf: { x: SECRETS.title },
+        userId: ALLOWED_CHAR_SECRETS.gateCode,
+        runId: ALLOWED_CHAR_SECRETS.idLike,
+        tool: ALLOWED_CHAR_SECRETS.jwt,
+        status: ALLOWED_CHAR_SECRETS.snake,
+        errorCode: ALLOWED_CHAR_SECRETS.snake,
+        category: ALLOWED_CHAR_SECRETS.gateCode,
+        runtime: ALLOWED_CHAR_SECRETS.gateCode,
+        hostname: ALLOWED_CHAR_SECRETS.gateCode,
+      })
+      .info(
+        { err: { name: ALLOWED_CHAR_SECRETS.snake, code: ALLOWED_CHAR_SECRETS.apiKey } },
+        "tool.finished",
+      );
+    return { ok: true };
+  });
+  apps.push(app);
+  const f = await createFamily(app);
+  const headers = (cookie: string, extra: Record<string, string> = {}) => ({
+    host: "localhost:3000",
+    cookie,
+    origin: "http://localhost:3000",
+    [CSRF_HEADER]: "1",
+    ...extra,
+  });
+  const waitRun = async (id: string) => {
+    for (let i = 0; i < 400; i++) {
+      const r = (await app.inject({ url: `/api/runs/${id}`, headers: headers(f.cookies.owner) })).json<Run>();
+      if (r.endedAt !== null) return r;
+      await new Promise((res) => setTimeout(res, 10));
+    }
+    throw new Error("run did not finish");
+  };
+  return { app, f, log, headers, waitRun };
+}
+
+describe("log record policy", () => {
+  it("drops fields that are not allow-listed and values that fail their check", () => {
+    const out = sanitizeRecord({
+      level: 30,
+      time: 1,
+      msg: "run.finished",
+      runId: "0d9f6f4e-3c2a-4b7e-9a51-2f8e6c1d7b30",
+      userId: SECRETS.email,
+      conversationId: SECRETS.prompt,
+      status: SECRETS.prompt,
+      tool: `web_search ${SECRETS.toolInput}`,
+      errorCode: "runtime_error",
+      costUsd: "0.1",
+      durationMs: 12,
+      prompt: SECRETS.prompt,
+      headers: { cookie: SECRETS.cookie },
+      err: {
+        type: "Error",
+        message: SECRETS.sdkError,
+        stack: SECRETS.stderr,
+        code: "E1",
+        cause: SECRETS.prompt,
+      },
+      req: {
+        method: "GET",
+        url: `/api/x?token=${SECRETS.query}`,
+        headers: { authorization: SECRETS.bearer },
+      },
+    });
+    expect(out).toEqual({
+      level: 30,
+      time: 1,
+      msg: "run.finished",
+      runId: "0d9f6f4e-3c2a-4b7e-9a51-2f8e6c1d7b30",
+      errorCode: "runtime_error",
+      durationMs: 12,
+      err: { type: "Error" },
+      req: { method: "GET" },
+    });
+  });
+
+  it("keeps only known messages", () => {
+    expect(sanitizeRecord({ msg: SECRETS.prompt }).msg).toBe("redacted");
+    expect(sanitizeRecord({ msg: SECRETS.sdkError, err: {} }).msg).toBe("error");
+    expect(sanitizeRecord({ msg: "request completed" }).msg).toBe("request completed");
+    expect(sanitizeRecord({ msg: "Server listening at http://127.0.0.1:3000" }).msg).toBe(
+      "Server listening at http://127.0.0.1:3000",
+    );
+    expect(sanitizeRecord({ msg: "Server listening at http://evil.example:80/?x=1" }).msg).toBe("redacted");
+    expect(sanitizeRecord({ msg: `Route GET:/x?token=${SECRETS.query} not found` }).msg).toBe(
+      "route not found",
+    );
+  });
+
+  it("classifies errors by class name and code only", () => {
+    expect(classifyError(new Error(SECRETS.sdkError))).toEqual({ code: "internal_error", category: "app" });
+    expect(classifyError(Object.assign(new Error("x"), { code: "SQLITE_BUSY" })).code).toBe("db_busy");
+    expect(classifyError(Object.assign(new Error("x"), { code: "ECONNRESET" })).code).toBe("network_error");
+    expect(classifyError(new DOMException("x", "TimeoutError")).code).toBe("timeout");
+    expect(classifyError("a string").code).toBe("internal_error");
+  });
+});
+
+describe("leak fixtures end to end", () => {
+  it("never writes secrets from requests, headers, errors, runs or tools to the log", async () => {
+    const { app, f, log, headers, waitRun } = await start();
+    const conv = app.conversations!.create(f.users.owner.id, { title: SECRETS.title });
+
+    // A run that succeeds (text, reasoning, tool input/output, a failing tool, usage)…
+    const ok = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages?token=${SECRETS.query}`,
+      headers: headers(f.cookies.owner, {
+        "idempotency-key": SECRETS.idempotency,
+        authorization: `Bearer ${SECRETS.bearer}`,
+        "content-type": "application/json",
+      }),
+      payload: { text: SECRETS.prompt },
+    });
+    expect(ok.statusCode).toBe(201);
+    const okRun = await waitRun(ok.json<StartRunResponse>().run.id);
+    expect(okRun.status).toBe("done");
+
+    // …and one that fails with an SDK error carrying the prompt, a key and stderr.
+    const conv2 = app.conversations!.create(f.users.owner.id);
+    const bad = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv2.id}/messages`,
+      headers: headers(f.cookies.owner, { "content-type": "application/json" }),
+      payload: { text: `FAIL ${SECRETS.prompt}` },
+    });
+    const badRun = await waitRun(bad.json<StartRunResponse>().run.id);
+    expect(badRun.status).toBe("failed");
+    expect(badRun.errorCode).toBe("runtime_error");
+
+    // Failed login (password + e-mail), forged Cloudflare header on a local host, a throwing route, a 404 with a query.
+    await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      headers: { host: "localhost:3000", origin: "http://localhost:3000", [CSRF_HEADER]: "1" },
+      payload: { email: SECRETS.email, password: SECRETS.password },
+    });
+    await app.inject({
+      url: "/api/auth/me",
+      headers: {
+        host: "localhost:3000",
+        "cf-access-jwt-assertion": SECRETS.jwt,
+        cookie: `al_session=${SECRETS.cookie}`,
+      },
+    });
+    for (const url of ["/api/test/coded", "/api/test/bindings"])
+      await app.inject({ url, headers: { host: "localhost:3000" } });
+    const client = await app.inject({ url: "/api/test/client", headers: { host: "localhost:3000" } });
+    expect(client.statusCode).toBe(422);
+    expect(client.json()).toEqual({ error: "bad_request" });
+    const boom = await app.inject({ url: "/api/test/boom", headers: { host: "localhost:3000" } });
+    expect(boom.statusCode).toBe(500);
+    expect(boom.json()).toEqual({ error: "internal_error" });
+    assertNoLeak(boom.body);
+    await app.inject({
+      url: `/api/nope/${SECRETS.query}?k=${SECRETS.apiKey}`,
+      headers: { host: "localhost:3000" },
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/conversations",
+      headers: headers(f.cookies.owner, { "content-type": "application/json" }),
+      payload: `{"title": "${SECRETS.title}"`, // malformed JSON → 400 from Fastify
+    });
+
+    const text = log.text();
+    assertNoLeak(text);
+
+    // What *is* logged: IDs, durations, codes and cost.
+    const recs = log.records();
+    const runRecs = recs.filter((r) => r.msg === "run.finished");
+    expect(runRecs).toHaveLength(2);
+    expect(runRecs.find((r) => r.runId === okRun.id)).toMatchObject({
+      userId: f.users.owner.id,
+      conversationId: conv.id,
+      runtime: "claude-code",
+      status: "done",
+      costUsd: 0.0125,
+      inputTokens: 120,
+      outputTokens: 30,
+    });
+    expect(runRecs.find((r) => r.runId === badRun.id)).toMatchObject({
+      status: "failed",
+      errorCode: "runtime_error",
+      category: "runtime",
+      err: { type: "Error" },
+    });
+    const tools = recs.filter((r) => r.msg === "tool.finished" && r.runId === okRun.id);
+    expect(tools.map((t) => [t.tool, t.status])).toEqual([
+      ["web_search", "ok"],
+      ["mcp__agentlee__stocks", "error"],
+      ["other", "error"],
+    ]);
+    expect(typeof tools[0]!.durationMs).toBe("number");
+    expect(
+      recs.some((r) => r.msg === "request.error" && (r.err as { type?: string })?.type === "Error"),
+    ).toBe(true);
+    // Requests appear by route pattern, never by raw URL.
+    const urls = recs.flatMap((r) =>
+      (r.req as { url?: string })?.url ? [(r.req as { url: string }).url] : [],
+    );
+    expect(urls).toContain("/api/conversations/:id/messages");
+    expect(urls.every((u) => !u.includes("?"))).toBe(true);
+    // Every key that reaches the destination is allow-listed.
+    const { LOG_ALLOWED_FIELDS } = await import("../src/logging.js");
+    for (const r of recs) for (const k of Object.keys(r)) expect(LOG_ALLOWED_FIELDS.has(k), k).toBe(true);
+
+    // The admin "최근 오류" list: same policy, admin only.
+    const list = await app.inject({ url: "/api/admin/errors", headers: headers(f.cookies.admin) });
+    expect(list.statusCode).toBe(200);
+    assertNoLeak(list.body);
+    const { errors } = RecentErrorsResponse.parse(list.json());
+    expect(errors.map((e) => [e.source, e.code])).toEqual(
+      expect.arrayContaining([
+        ["run", "runtime_error"],
+        ["tool", "tool_error"],
+        ["http", "internal_error"],
+      ]),
+    );
+    expect(errors.find((e) => e.source === "http")).toMatchObject({
+      route: "GET /api/test/boom",
+      statusCode: 500,
+    });
+    expect(errors.filter((e) => e.source === "tool").map((e) => e.tool)).toEqual(
+      expect.arrayContaining(["mcp__agentlee__stocks", "other"]),
+    );
+    const onlyRuns = await app.inject({
+      url: "/api/admin/errors?source=run&limit=5",
+      headers: headers(f.cookies.admin),
+    });
+    expect(RecentErrorsResponse.parse(onlyRuns.json()).errors.every((e) => e.source === "run")).toBe(true);
+    expect(
+      (await app.inject({ url: "/api/admin/errors?limit=0", headers: headers(f.cookies.admin) })).statusCode,
+    ).toBe(400);
+    expect(
+      (await app.inject({ url: "/api/admin/errors", headers: headers(f.cookies.owner) })).statusCode,
+    ).toBe(403);
+    expect(
+      (await app.inject({ url: "/api/admin/errors", headers: { host: "localhost:3000" } })).statusCode,
+    ).toBe(401);
+  });
+
+  it("never logs the temporary gate code or edge headers", async () => {
+    const { app, log } = await start({ TEMP_GATE_CODE: SECRETS.gateCode });
+    const edge = { host: "chat.2prostream.com", "cf-connecting-ip": "203.0.113.9" };
+    for (const code of [SECRETS.gateCode, `${SECRETS.gateCode}x`])
+      await app.inject({
+        method: "POST",
+        url: "/gate",
+        headers: { ...edge, "content-type": "application/x-www-form-urlencoded" },
+        payload: new URLSearchParams({ code, next: `/c/1?t=${SECRETS.query}` }).toString(),
+      });
+    await app.inject({
+      url: `/?code=${SECRETS.gateCode}`,
+      headers: { ...edge, cookie: `al_gate=${SECRETS.cookie}`, "cf-access-jwt-assertion": SECRETS.jwt },
+    });
+    expect(log.records().length).toBeGreaterThan(0);
+    assertNoLeak(log.text());
+  });
+});
+
+describe("review round 1 regressions", () => {
+  it("does not treat inherited keys (constructor, toString, __proto__) as allowed fields", () => {
+    const raw = JSON.stringify({
+      level: 30,
+      msg: "run.finished",
+      constructor: { prompt: SECRETS.prompt, cookie: SECRETS.cookie },
+      toString: SECRETS.apiKey,
+      hasOwnProperty: SECRETS.password,
+      valueOf: SECRETS.title,
+      req: { method: "GET", constructor: SECRETS.query, toString: SECRETS.bearer },
+      err: { constructor: SECRETS.sdkError },
+    }).replace('"toString"', '"__proto__":{"x":"' + SECRETS.stderr + '"},"toString"');
+    const out = sanitizeRecord(JSON.parse(raw) as Record<string, unknown>);
+    assertNoLeak(JSON.stringify(out));
+    expect(Object.keys(out).sort()).toEqual(["err", "level", "msg", "req"]);
+  });
+
+  it("drops secrets made only of allowed characters", () => {
+    const S = ALLOWED_CHAR_SECRETS;
+    const out = sanitizeRecord({
+      msg: "tool.finished",
+      userId: S.gateCode,
+      conversationId: S.idLike,
+      runId: S.apiKey,
+      tool: S.jwt,
+      status: S.snake,
+      errorCode: S.snake,
+      category: S.gateCode,
+      runtime: S.gateCode,
+      hostname: S.gateCode,
+      reqId: `req-${S.gateCode}`,
+      err: { type: S.snake, code: S.apiKey, statusCode: 99999 },
+      req: { method: S.gateCode.toUpperCase(), url: `/api/${S.apiKey}` },
+    });
+    assertNoLeak(JSON.stringify(out));
+    expect(out).toEqual({ msg: "tool.finished", err: {}, req: {} });
+
+    const store = new ErrorLog(createTestDb());
+    store.record({
+      source: "tool",
+      code: S.snake,
+      category: S.gateCode,
+      userId: S.gateCode,
+      conversationId: S.idLike,
+      runId: S.apiKey,
+      runtime: S.gateCode,
+      tool: S.apiKey,
+      route: `GET /api/${S.jwt}`,
+      statusCode: 12345,
+    });
+    const [row] = store.recent();
+    assertNoLeak(JSON.stringify(row));
+    expect(row).toMatchObject({
+      code: "unknown",
+      category: "app",
+      tool: null,
+      route: null,
+      statusCode: null,
+    });
+  });
+
+  it("answers framework errors (bad encoding, over-long paths) with a fixed body and the security headers", async () => {
+    const { app, log } = await start();
+    const bad = await app.inject({
+      url: `/api/private/${SECRETS.query}/%ZZ?token=${SECRETS.apiKey}`,
+      headers: { host: "localhost:3000" },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toEqual({ error: "invalid_request" });
+    expect(bad.headers["x-content-type-options"]).toBe("nosniff");
+    assertNoLeak(bad.body);
+    const long = await app.inject({
+      url: `/api/conversations/${SECRETS.query}${"A".repeat(5000)}?token=${SECRETS.apiKey}`,
+      headers: { host: "localhost:3000", cookie: "al_session=x" },
+    });
+    expect(long.statusCode).toBeGreaterThanOrEqual(400);
+    assertNoLeak(long.body);
+    assertNoLeak(log.text());
+  });
+});
+
+describe("error categories", () => {
+  it("files a code under the same category everywhere", () => {
+    for (const e of [
+      Object.assign(new Error("x"), { code: "ECONNRESET" }),
+      Object.assign(new Error("x"), { code: "SQLITE_BUSY" }),
+      Object.assign(new Error("x"), { code: "SQLITE_IOERR" }),
+      Object.assign(new Error("x"), { code: "ENOSPC" }),
+      new DOMException("x", "TimeoutError"),
+    ]) {
+      const c = classifyError(e);
+      expect(runFailureCategory(c.code), c.code).toBe(c.category);
+    }
+  });
+
+  it("records a run that failed on a reset connection as network_error / network", async () => {
+    const { app, f, log, headers, waitRun } = await start();
+    const conv = app.conversations!.create(f.users.owner.id);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: headers(f.cookies.owner, { "content-type": "application/json" }),
+      payload: { text: "RESET" },
+    });
+    const run = await waitRun(res.json<StartRunResponse>().run.id);
+    expect(run.errorCode).toBe("network_error");
+    expect(log.records().find((r) => r.msg === "run.finished")).toMatchObject({
+      errorCode: "network_error",
+      category: "network",
+    });
+    const list = await app.inject({ url: "/api/admin/errors?source=run", headers: headers(f.cookies.admin) });
+    expect(RecentErrorsResponse.parse(list.json()).errors[0]).toMatchObject({
+      code: "network_error",
+      category: "network",
+    });
+    assertNoLeak(log.text());
+  });
+});
+
+describe("recent error store", () => {
+  it("forgets entries older than 30 days even when no new error arrives", () => {
+    let t = Date.UTC(2026, 0, 1);
+    const db = createTestDb();
+    const store = new ErrorLog(db, { now: () => t });
+    store.record({ source: "http", code: "internal_error", category: "app" });
+    t += 31 * 24 * 3600_000;
+    expect(store.recent()).toEqual([]);
+    expect(store.prune()).toBe(1);
+    expect(db.$client.prepare("select count(*) as n from error_log").get()).toEqual({ n: 0 });
+  });
+
+  it("re-checks fields on the way in and keeps only the newest rows", () => {
+    let t = 1000;
+    const store = new ErrorLog(createTestDb(), { now: () => t, maxRows: 3 });
+    store.record({
+      source: "run",
+      code: SECRETS.sdkError,
+      category: "runtime",
+      userId: SECRETS.email,
+      tool: `x ${SECRETS.toolInput}`,
+      route: `GET /x?${SECRETS.query}`,
+    });
+    const [first] = store.recent();
+    expect(first).toMatchObject({ code: "unknown", userId: null, tool: null, route: null });
+    for (let i = 0; i < 5; i++) {
+      t += 1;
+      store.record({ source: "http", code: "internal_error", category: "app", statusCode: 500 });
+    }
+    expect(store.recent()).toHaveLength(3);
+    expect(store.recent({ limit: 1 })[0]!.at).toBe(t);
+  });
+});
+
+describe("rotating log file", () => {
+  it("rotates by size and keeps the configured number of files", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const file = path.join(dir, "server.log");
+    const s = rotatingFile(file, { maxBytes: 100, keep: 2 });
+    const line = JSON.stringify({ level: 30, msg: "x".repeat(40) }) + "\n";
+    for (let i = 0; i < 10; i++) await new Promise<void>((r) => s.write(line, () => r()));
+    await new Promise<void>((r) => s.end(r));
+    expect(fs.readdirSync(dir).sort()).toEqual(["server.log", "server.log.1", "server.log.2"]);
+    for (const f of fs.readdirSync(dir)) expect(fs.statSync(path.join(dir, f)).size).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("log file failures", () => {
+  const enospc = () => Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+
+  it("drops and counts lines it cannot write, never erroring the stream, and reports the loss later", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const file = path.join(dir, "server.log");
+    let failWrites = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off?: number, len?: number) => {
+        if (failWrites > 0) {
+          failWrites--;
+          throw enospc();
+        }
+        return fs.writeSync(fd, buf, off, len);
+      }) as typeof fs.writeSync,
+    };
+    const s = rotatingFile(file, { io });
+    const errors: unknown[] = [];
+    s.on("error", (e) => errors.push(e));
+    const write = (line: string) => new Promise<void>((r) => s.write(line + "\n", () => r()));
+    await write('{"msg":"a"}');
+    failWrites = 3;
+    for (let i = 0; i < 3; i++) await write('{"msg":"lost"}');
+    expect(s.dropped).toBe(3);
+    await write('{"msg":"b"}');
+    await new Promise<void>((r) => s.end(r));
+    expect(errors).toEqual([]);
+    const lines = fs
+      .readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as object);
+    expect(lines).toEqual([
+      { msg: "a" },
+      expect.objectContaining({ msg: "log.line_dropped", dropped: 3 }),
+      { msg: "b" },
+    ]);
+  });
+
+  const tmpLog = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-")), "server.log");
+  const parseAll = (file: string) =>
+    fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { msg?: string; dropped?: number });
+  const writeTo = (s: Writable, line: string) => new Promise<void>((r) => s.write(line + "\n", () => r()));
+
+  it("starts even when the log file cannot be opened, and writes once it can", async () => {
+    const file = tmpLog();
+    let failOpens = 1;
+    const io = {
+      ...fs,
+      openSync: ((...a: Parameters<typeof fs.openSync>) => {
+        if (failOpens > 0) {
+          failOpens--;
+          throw enospc();
+        }
+        return fs.openSync(...a);
+      }) as typeof fs.openSync,
+    };
+    const dest = rotatingFile(file, { io });
+    const errors: unknown[] = [];
+    dest.on("error", (e) => errors.push(e));
+    failOpens = 3; // the first writes cannot open it either
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { logStream: dest });
+    apps.push(app);
+    const health = () => app.inject({ url: "/api/health", headers: { host: "localhost:3000" } });
+    expect((await health()).statusCode).toBe(200);
+    expect(dest.dropped).toBeGreaterThan(0);
+    failOpens = 0;
+    expect((await health()).statusCode).toBe(200);
+    const recs = parseAll(file);
+    expect(recs.some((r) => r.msg === "log.line_dropped" && (r.dropped ?? 0) > 0)).toBe(true);
+    expect(recs.some((r) => r.msg === "request completed")).toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  it("starts when LOG_FILE points somewhere that cannot be created", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    fs.writeFileSync(path.join(dir, "not-a-dir"), "");
+    const app = await buildApp(
+      loadConfig({ NODE_ENV: "test", LOG_FILE: path.join(dir, "not-a-dir", "server.log") }),
+      { logger: true },
+    );
+    apps.push(app);
+    expect((await app.inject({ url: "/api/health", headers: { host: "localhost:3000" } })).statusCode).toBe(
+      200,
+    );
+  });
+
+  it("writes every byte of a line despite short writes", async () => {
+    const file = tmpLog();
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) =>
+        fs.writeSync(fd, buf, off, Math.min(8, len))) as typeof fs.writeSync,
+    };
+    const s = rotatingFile(file, { io });
+    for (let i = 0; i < 5; i++) await writeTo(s, JSON.stringify({ msg: "run.finished", n: i }));
+    await new Promise<void>((r) => s.end(r));
+    expect(s.dropped).toBe(0);
+    expect(parseAll(file)).toHaveLength(5);
+  });
+
+  for (const truncateFails of [false, true])
+    it(`never leaves a torn line when a write fails partway (truncate ${truncateFails ? "deferred" : "at once"})`, async () => {
+      const file = tmpLog();
+      let plan: ("short" | "fail")[] = [];
+      let failTruncates = truncateFails ? 1 : 0;
+      const io = {
+        ...fs,
+        writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+          const step = plan.shift();
+          if (step === "fail") throw enospc();
+          return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+        }) as typeof fs.writeSync,
+        ftruncateSync: ((fd: number, n?: number) => {
+          if (failTruncates > 0) {
+            failTruncates--;
+            throw enospc();
+          }
+          return fs.ftruncateSync(fd, n);
+        }) as typeof fs.ftruncateSync,
+      };
+      const s = rotatingFile(file, { io });
+      await writeTo(s, '{"msg":"a"}');
+      plan = ["short", "fail"]; // 8 bytes out, then the disk fills up
+      await writeTo(s, '{"msg":"torn-line-that-is-long"}');
+      expect(s.dropped).toBe(1);
+      await writeTo(s, '{"msg":"b"}');
+      await new Promise<void>((r) => s.end(r));
+      const recs = parseAll(file); // throws if any line is not complete JSON
+      expect(recs.map((r) => r.msg)).toEqual(["a", "log.line_dropped", "b"]);
+      expect(recs[1]!.dropped).toBe(1);
+    });
+
+  it("finishes a pending truncate before rotating, so no archive ends in a torn line", async () => {
+    const file = tmpLog();
+    let plan: ("short" | "fail")[] = [];
+    let failTruncates = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+        const step = plan.shift();
+        if (step === "fail") throw enospc();
+        return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+      }) as typeof fs.writeSync,
+      ftruncateSync: ((fd: number, n?: number) => {
+        if (failTruncates > 0) {
+          failTruncates--;
+          throw enospc();
+        }
+        return fs.ftruncateSync(fd, n);
+      }) as typeof fs.ftruncateSync,
+    };
+    const s = rotatingFile(file, { io, maxBytes: 130, keep: 5 });
+    const line = (n: number, pad = "") => JSON.stringify({ level: 30, msg: "run.finished", n, pad });
+    await writeTo(s, line(1)); // ~50 bytes
+    // Torn write; the immediate truncate fails, so the partial line is still in the file.
+    plan = ["short", "fail"];
+    failTruncates = 1;
+    await writeTo(s, line(2));
+    // The next line is long enough to rotate (size + line > maxBytes) while the truncate is still pending.
+    await writeTo(s, line(3, "x".repeat(80)));
+    await writeTo(s, line(4));
+    await new Promise<void>((r) => s.end(r));
+    const files = fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith("server.log"));
+    expect(files.length).toBeGreaterThan(1); // rotation did happen
+    const all = files.flatMap((f) => parseAll(path.join(path.dirname(file), f))); // every line of every file parses
+    const ns = all.flatMap((r) => ("n" in r ? [(r as { n: number }).n] : []));
+    expect(ns.sort((a, b) => a - b)).toEqual([1, 3, 4]);
+    expect(s.dropped).toBe(1);
+  });
+
+  it("drops the line and does not rotate while the pending truncate keeps failing", async () => {
+    const file = tmpLog();
+    let plan: ("short" | "fail")[] = [];
+    let failTruncates = 0;
+    const io = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, off = 0, len = buf.length) => {
+        const step = plan.shift();
+        if (step === "fail") throw enospc();
+        return fs.writeSync(fd, buf, off, step === "short" ? Math.min(8, len) : len);
+      }) as typeof fs.writeSync,
+      ftruncateSync: ((fd: number, n?: number) => {
+        if (failTruncates > 0) {
+          failTruncates--;
+          throw enospc();
+        }
+        return fs.ftruncateSync(fd, n);
+      }) as typeof fs.ftruncateSync,
+    };
+    const s = rotatingFile(file, { io, maxBytes: 130, keep: 5 });
+    const line = (n: number, pad = "") => JSON.stringify({ level: 30, msg: "run.finished", n, pad });
+    await writeTo(s, line(1));
+    plan = ["short", "fail"];
+    failTruncates = 2; // the immediate truncate and the one before the rotation both fail
+    await writeTo(s, line(2));
+    await writeTo(s, line(3, "x".repeat(80)));
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["server.log"]); // not archived while torn
+    await writeTo(s, line(4, "y".repeat(80)));
+    await new Promise<void>((r) => s.end(r));
+    const files = fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith("server.log"));
+    const all = files.flatMap((f) => parseAll(path.join(path.dirname(file), f)));
+    expect(all.flatMap((r) => ("n" in r ? [(r as { n: number }).n] : [])).sort()).toEqual([1, 4]);
+    expect(s.dropped).toBe(2);
+  });
+
+  it("keeps writing to the current file when rotation fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const file = path.join(dir, "server.log");
+    const io = {
+      ...fs,
+      renameSync: (() => {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }) as typeof fs.renameSync,
+    };
+    const s = rotatingFile(file, { maxBytes: 50, io });
+    const errors: unknown[] = [];
+    s.on("error", (e) => errors.push(e));
+    for (let i = 0; i < 5; i++)
+      await new Promise<void>((r) => s.write('{"msg":"xxxxxxxxxxxxxxxxxxxx"}\n', () => r()));
+    await new Promise<void>((r) => s.end(r));
+    expect(errors).toEqual([]);
+    expect(s.dropped).toBe(0);
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(5);
+  });
+
+  it("keeps the server serving while the log disk is full", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-log-"));
+    const io = {
+      ...fs,
+      writeSync: (() => {
+        throw enospc();
+      }) as typeof fs.writeSync,
+    };
+    const dest = rotatingFile(path.join(dir, "server.log"), { io });
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { logStream: dest });
+    apps.push(app);
+    for (let i = 0; i < 3; i++) {
+      const res = await app.inject({ url: "/api/health", headers: { host: "localhost:3000" } });
+      expect(res.statusCode).toBe(200);
+    }
+    expect(dest.dropped).toBeGreaterThan(0);
+  });
+});
+
+describe("Access service token (uptime check)", () => {
+  it("reaches /api/health and nothing else", async () => {
+    const TEAM = "family.cloudflareaccess.com";
+    const AUD = "b".repeat(64);
+    const kp = await generateKeyPair("RS256");
+    const jwk: JWK = { ...(await exportJWK(kp.publicKey)), kid: "k1", alg: "RS256" };
+    const app = await buildApp(
+      loadConfig({ NODE_ENV: "test", CF_ACCESS_TEAM_DOMAIN: TEAM, CF_ACCESS_AUD: AUD }),
+      {
+        db: createTestDb(),
+        accessKeys: createLocalJWKSet({ keys: [jwk] }),
+        logger: false,
+      },
+    );
+    apps.push(app);
+    const token = await new SignJWT({ common_name: "abc123.access" })
+      .setProtectedHeader({ alg: "RS256", kid: "k1" })
+      .setIssuer(`https://${TEAM}`)
+      .setAudience(AUD)
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(kp.privateKey);
+    const h = { host: "chat.2prostream.com", "cf-access-jwt-assertion": token };
+    expect((await app.inject({ url: "/api/health", headers: h })).statusCode).toBe(200);
+    expect((await app.inject({ url: "/api/health?x=1", headers: h })).statusCode).toBe(200);
+    for (const url of ["/", "/api/auth/me", "/api/admin/errors", "/api/%68ealth/../conversations"])
+      expect((await app.inject({ url, headers: h })).statusCode, url).toBe(403);
+    expect((await app.inject({ method: "POST", url: "/api/health", headers: h })).statusCode).toBe(403);
+  });
+});
