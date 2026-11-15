@@ -6,6 +6,7 @@ import { RuntimesAdmin } from "../admin/RuntimesAdmin.js";
 import { SkillsAdmin } from "../admin/SkillsAdmin.js";
 import { SystemAdmin } from "../admin/SystemAdmin.js";
 import { BackupAdmin } from "../admin/BackupAdmin.js";
+import { InstructionsAdmin } from "../admin/InstructionsAdmin.js";
 import { UsageAdmin } from "./Usage.js";
 
 const TABS = [
@@ -13,6 +14,7 @@ const TABS = [
   ["permissions", "권한"],
   ["runtimes", "런타임"],
   ["skills", "스킬"],
+  ["instructions", "지침"],
   ["system", "시스템 상태"],
   ["backup", "백업"],
   ["usage", "사용량"],
@@ -51,6 +53,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
           {tab === "permissions" && <PermissionsAdmin />}
           {tab === "runtimes" && <RuntimesAdmin />}
           {tab === "skills" && <SkillsAdmin />}
+          {tab === "instructions" && <InstructionsAdmin />}
           {tab === "system" && <SystemAdmin />}
           {tab === "backup" && <BackupAdmin />}
           {tab === "usage" && <UsageAdmin />}

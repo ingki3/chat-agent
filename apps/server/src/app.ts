@@ -132,6 +132,9 @@ import { registerErrorHandling, registerErrorRoutes } from "./observability/rout
 import { registerResponseScrub } from "./secrets/http.js";
 import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
 import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
+import { MemoryDocs } from "./memory/service.js";
+import { linkMemoryDeletion } from "./memory/linkage.js";
+import { registerMemoryRoutes } from "./memory/routes.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -201,6 +204,8 @@ declare module "fastify" {
     watchlist: WatchlistStore | undefined;
     /** What deleting a conversation does beyond its rows (#54): runtime session state, notifications, the WAL. */
     purge: ConversationPurge | undefined;
+    /** 내 지침 (#144); undefined without a database. */
+    memory: MemoryDocs | undefined;
   }
 }
 
@@ -771,7 +776,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     // Deleting a conversation (#54) — set right below; one-off sessions (summaries) and a session that finished
     // opening after its conversation went are handed to it by the run manager once closed.
     const later: { purge?: ConversationPurge } = {};
+    // 내 지침 (#144): AGENT, SOUL, USER, MEMORY — read for every new session, edited from the settings screens.
+    const memory = new MemoryDocs(
+      opts.db!,
+      opts.runs?.instructions ? { templates: opts.runs.instructions } : {},
+    );
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
+      memory,
       forgetSession: (ref) => later.purge?.orphan(ref),
       startSettings,
       mcp,
@@ -816,6 +827,17 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     later.purge = deletion;
     app.decorate("purge", deletion);
+    // Deleting a conversation or cutting messages from a history takes the 내 지침 items citing them with it, from every
+    // version, and forgets the sessions that were started with those versions (#144, docs/memory-spec.md §10).
+    linkMemoryDeletion({
+      db: opts.db!,
+      conversations: app.conversations!,
+      store: memory.store,
+      purge: deletion,
+      log: app.log,
+    });
+    app.decorate("memory", memory);
+    registerMemoryRoutes(app, memory, users!);
     // Sessions of conversations deleted before a crash (or waiting for a retry) are forgotten once serving.
     app.addHook("onReady", async () => deletion.resume());
     app.addHook("onClose", async () => deletion.close());
@@ -1106,6 +1128,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("fileExtracts", undefined);
     app.decorate("sharing", undefined);
     app.decorate("purge", undefined);
+    app.decorate("memory", undefined);
   }
 
   app.get(

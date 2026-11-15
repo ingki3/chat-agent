@@ -186,6 +186,12 @@ export const runtimeSessions = sqliteTable(
      */
     trimmed: integer("trimmed", { mode: "boolean" }).notNull().default(false),
     invalidated: integer("invalidated", { mode: "boolean" }).notNull().default(false),
+    /**
+     * The 내 지침 document versions the session was started with (#144, docs/memory-spec.md §2): JSON
+     * `{ "<document id>": <version> }`, canonical (keys sorted). Resumed only with the same versions; the deletion
+     * linkage (§10.5) finds the sessions started with a version that held a removed item by it. Null before #144.
+     */
+    docVersions: text("doc_versions"),
     createdAt: integer("created_at").notNull().default(now),
     updatedAt: integer("updated_at").notNull().default(now),
   },
@@ -1232,4 +1238,87 @@ export const deletionJobs = sqliteTable(
     uniqueIndex("deletion_jobs_session_idx").on(t.runtime, t.connectionId, t.userId, t.externalSessionId),
     index("deletion_jobs_next_idx").on(t.nextAt),
   ],
+);
+
+/**
+ * 내 지침 (#144, PRD FR-16, docs/memory-spec.md §1): one row per document. A user's own documents (`owner_id` = the
+ * user: per-account `agent` the admin writes, `soul` / `user` / `memory` the user writes) and the system ones
+ * (`owner_id` null, fixed ids `system:agent` — the family-wide AGENT — and `system:soul` — the default SOUL). The
+ * content lives in the versions; `version` is the current one (0 = none saved yet).
+ */
+export const memoryDocuments = sqliteTable(
+  "memory_documents",
+  {
+    id: text("id").primaryKey(),
+    ownerId: text("owner_id").references(() => users.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: ["agent", "soul", "user", "memory"] }).notNull(),
+    version: integer("version").notNull().default(0),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [uniqueIndex("memory_documents_owner_kind_idx").on(t.ownerId, t.kind)],
+);
+
+/**
+ * Items of `USER.md` / `MEMORY.md` (spec §1): one line each, with a server-chosen id that stays the same while the
+ * line does. An item's text never changes (an edited line is a new item that replaces it); it is kept while a version
+ * names it, and removed — from every version too — by the deletion linkage (§10).
+ */
+export const memoryItems = sqliteTable(
+  "memory_items",
+  {
+    id: text("id").primaryKey(),
+    documentId: text("document_id")
+      .notNull()
+      .references(() => memoryDocuments.id, { onDelete: "cascade" }),
+    text: text("text").notNull(),
+    author: text("author", { enum: ["user", "tool", "dreaming"] }).notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [index("memory_items_document_idx").on(t.documentId)],
+);
+
+/**
+ * Where an item came from (spec §3): a user message and its revision. Items the user wrote have none. The deletion
+ * linkage looks items up by message and by conversation.
+ */
+export const memoryItemSources = sqliteTable(
+  "memory_item_sources",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => memoryItems.id, { onDelete: "cascade" }),
+    messageId: text("message_id").notNull(),
+    revision: integer("revision").notNull(),
+    conversationId: text("conversation_id").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.itemId, t.messageId] }),
+    index("memory_item_sources_message_idx").on(t.messageId),
+    index("memory_item_sources_conversation_idx").on(t.conversationId),
+  ],
+);
+
+/**
+ * Every saved version of a document (spec §1, FR-16.3): its full content, and for a list document the ids of its items
+ * in order (their sources are the items'). A restore makes a new version from an old one. The deletion linkage edits
+ * old versions in place (number kept, the removed items' lines gone) so a restore never brings them back.
+ */
+export const memoryVersions = sqliteTable(
+  "memory_versions",
+  {
+    documentId: text("document_id")
+      .notNull()
+      .references(() => memoryDocuments.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    author: text("author", { enum: ["user", "admin", "tool", "dreaming", "deletion"] }).notNull(),
+    /** Who saved it (user or admin id); null for the server's own (deletion linkage). */
+    actorId: text("actor_id"),
+    prevVersion: integer("prev_version"),
+    restoredFrom: integer("restored_from"),
+    content: text("content").notNull(),
+    /** List documents: JSON array of item ids, in order. Null for free text. */
+    itemIds: text("item_ids", { mode: "json" }).$type<string[]>(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.documentId, t.version] })],
 );

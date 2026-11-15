@@ -503,6 +503,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/connections",
   // #37: backups (list, "지금 백업").
   "/api/admin/backups",
+  // #144: the family-wide AGENT and the default SOUL.
+  "/api/admin/instructions",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -539,6 +541,12 @@ export const ADMIN_MATRIX: AdminRow[] = [
   // `backup_unavailable`); a real backup as the admin is in backup.test.ts.
   { route: "GET /api/admin/backups", expect: ADMIN_ONLY },
   { route: "POST /api/admin/backups", expect: { ...ADMIN_ONLY, admin: 409 } },
+  // #144: 내 지침 of the admin (the placeholder ref is no document: 404 for the admin).
+  { route: "GET /api/admin/instructions", expect: ADMIN_ONLY },
+  { route: "PUT /api/admin/instructions/:ref", expect: ADMIN_BY_ID, body: { content: "가족 규칙" } },
+  { route: "GET /api/admin/instructions/:ref/versions", expect: ADMIN_BY_ID },
+  { route: "GET /api/admin/instructions/:ref/versions/:version", expect: ADMIN_BY_ID },
+  { route: "POST /api/admin/instructions/:ref/versions/:version/restore", expect: ADMIN_BY_ID },
 ];
 
 /**
@@ -612,6 +620,17 @@ export const ADMIN_USER_MATRIX: AdminUserRow[] = [
     route: "POST /api/admin/users/:id/connections/:connectionId/test",
     expect: ADMIN_ONLY,
     params: (f, target) => ({ connectionId: targetConnection(f, target) }),
+  },
+  // #144: an account's AGENT (any other document of the user is 403 for the admin too — memory.test.ts).
+  {
+    route: "GET /api/admin/users/:id/instructions/:kind",
+    expect: ADMIN_ONLY,
+    params: () => ({ kind: "agent" }),
+  },
+  {
+    route: "GET /api/admin/users/:id/instructions/:kind/versions",
+    expect: ADMIN_ONLY,
+    params: () => ({ kind: "agent" }),
   },
   { route: "POST /api/admin/users/:id/reset-password", expect: ADMIN_ONLY },
   { route: "POST /api/admin/users/:id/deactivate", expect: ADMIN_ONLY },

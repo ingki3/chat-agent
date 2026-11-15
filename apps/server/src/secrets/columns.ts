@@ -81,6 +81,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "a model id from the runtime's catalogue (the run's model, checked by RunAccess)",
   },
   "runtime_sessions.summary_id": ID,
+  "runtime_sessions.doc_versions": { exempt: "document ids and version numbers (JSON, built by the server)" },
   "conversation_summaries.id": ID,
   "conversation_summaries.conversation_id": ID,
   "conversation_summaries.through_message_id": ID,
@@ -352,4 +353,22 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "deletion_jobs.connection_id": ID,
   "deletion_jobs.user_id": ID,
   "deletion_jobs.external_session_id": { exempt: "the runtime's own session id (a UUID it generated)" },
+  // 내 지침 (#144): the documents' text is the user's or the admin's own writing. A direct edit holding a known secret
+  // is refused (400 doc_secret) before anything is written; every write is scrubbed as well (MemoryStore), and the
+  // background rescrub covers what was stored before a secret was registered.
+  "memory_documents.id": ID,
+  "memory_documents.owner_id": ID,
+  "memory_documents.kind": ENUM,
+  "memory_items.id": ID,
+  "memory_items.document_id": ID,
+  "memory_items.text": { write: "MemoryStore (saveDoc / addItems, scrubKnown)", rescrub: "text" },
+  "memory_items.author": ENUM,
+  "memory_item_sources.item_id": ID,
+  "memory_item_sources.message_id": ID,
+  "memory_item_sources.conversation_id": ID,
+  "memory_versions.document_id": ID,
+  "memory_versions.author": ENUM,
+  "memory_versions.actor_id": ID,
+  "memory_versions.content": { write: "MemoryStore (every new version, scrubKnown)", rescrub: "text" },
+  "memory_versions.item_ids": { exempt: "item ids (JSON array of server-generated ids)" },
 };

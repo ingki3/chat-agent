@@ -24,6 +24,11 @@ export const DEFAULT_TITLE = "새 대화";
 /** Called inside the delete transaction, before rows go — files, artifacts and shares hook in here (#54). */
 export type DeleteHook = (conversationId: string) => void;
 /**
+ * Called inside the transaction that takes messages out of the active history (edit / regenerate), with their ids —
+ * the 내 지침 deletion linkage hooks in here (#144, docs/memory-spec.md §10).
+ */
+export type DeactivateHook = (conversationId: string, messageIds: string[]) => void;
+/**
  * Called right after the delete transaction committed, with the row that went — files on disk go here (#22). The
  * caller of `delete` holds the file-write lock (`app.fileWrites`), so a backup never sees half of it.
  */
@@ -128,6 +133,7 @@ const likeEscape = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
 export class ConversationStore {
   private readonly deleteHooks: DeleteHook[] = [];
   private readonly deletedHooks: DeletedHook[] = [];
+  private readonly deactivateHooks: DeactivateHook[] = [];
 
   constructor(
     private readonly db: Db,
@@ -140,6 +146,10 @@ export class ConversationStore {
 
   onDeleted(hook: DeletedHook): void {
     this.deletedHooks.push(hook);
+  }
+
+  onDeactivate(hook: DeactivateHook): void {
+    this.deactivateHooks.push(hook);
   }
 
   get(id: string): ConversationRow | undefined {
@@ -589,13 +599,16 @@ export class ConversationStore {
         ),
       )
       .run();
-    this.db
+    const leaving = this.db
       .update(messages)
       .set({ active: false, archivedAtRevision: revision })
       .where(
         and(eq(messages.conversationId, conv.id), eq(messages.active, true), gte(messages.seq, target.seq)),
       )
-      .run();
+      .returning({ id: messages.id })
+      .all()
+      .map((m) => m.id);
+    for (const hook of this.deactivateHooks) hook(conv.id, leaving);
     this.db
       .update(conversations)
       .set({ revision, updatedAt: this.now() })
@@ -671,6 +684,8 @@ export class ConversationStore {
     conversationRevision: number;
     /** Fingerprint of the instructions the session started with (#20). */
     instructionsHash?: string | null;
+    /** The 내 지침 versions it started with (#144, `docVersionsKey`). */
+    docVersions?: string | null;
     /** The model it answers with (#45). */
     model?: string | null;
     /** The summary its context started from (#45). */
@@ -696,6 +711,7 @@ export class ConversationStore {
       summaryId: s.summaryId ?? null,
       trimmed: s.trimmed ?? false,
       invalidated: false,
+      docVersions: s.docVersions ?? null,
       createdAt: t,
       updatedAt: t,
     };

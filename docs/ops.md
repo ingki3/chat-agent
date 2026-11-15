@@ -1973,3 +1973,34 @@ pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchD
 - `apps/server/test/release.test.ts` — 실제 도구: 설정 검사(없음·상대 경로·`releases/` 안·`.env` 링크 없음 거부), 배포 직전 백업(서버 잠금과 열린 쓰기 트랜잭션이 있는 DB에서 커밋된 내용만, 운영 DB 파일 무변경, `restore check` 통과, 임시 폴더 안 남김, 새 스키마 DB는 `schema_newer`), 데이터 이전(모드·링크 보존, 원본 그대로, 세션 무효화, 잠금·비지 않은 대상·상대 경로·서로 포함 거부).
 - 리뷰 #148 1차 회귀 시험: 스냅샷 뒤 서버가 첨부 행·파일을 지워도 백업이 스냅샷 기준(행만 지움 → 파일 포함, 행·파일 지움 → `backup_failed`), 링크인 DB·`-wal`은 이전 거부(원본 바이트 그대로), 자동 복귀까지 실패해도 복원 안내, A→B→C에서 A로 되돌릴 때 B의 백업(검사 통과)을 제안, 같은 이름 태그 `main`이 있어도 브랜치 배포·모호한 `--ref` 거부, plist가 있어도 데몬이 내려가 있으면 이전 진행.
 - 실제 앱으로 한 번(개발 Mac, 2026-11-15): 임시 HOME·로컬 bare 저장소·포트 3917·`FAKE_RUNTIME`으로 `install --no-start` → `migrate-data` → `restart` → `install --force`(서버가 도는 중 배포 직전 백업, `restore check` ok) → `rollback` → `prune` → `stop`. 결과는 #143 PR에 있다.
+
+## 44. 내 지침 — AGENT·SOUL·USER·MEMORY (#144)
+
+PRD FR-16.1·16.2·16.3·16.8·16.9, 세부 규칙은 [`memory-spec.md`](memory-spec.md). 대화 중 기억해줘·잊어줘(#145)와 기억 정리(Dreaming, #146)는 아직 없다 — 지금은 사용자와 관리자가 직접 고친다.
+
+### 44.1 어디에 있나
+
+- **DB에만** 있다(파일 아님). 표: `memory_documents`(문서 — 사용자 문서는 `owner_id`, 가족 공통 AGENT는 `system:agent`, 기본 SOUL은 `system:soul`), `memory_versions`(저장할 때마다 한 줄: 전체 내용, 목록 문서는 항목 id 순서, 주체·이전 버전·되돌린 버전), `memory_items`(USER·MEMORY 항목, 안정 id, 만든 주체), `memory_item_sources`(항목의 출처 — 메시지 id·revision·대화 id). 세션마다 넣은 문서 버전은 `runtime_sessions.doc_versions`. 코드: `apps/server/src/memory/`.
+- 화면: 설정 → **내 지침**(`/settings/instructions`, 문서별 탭·글자/바이트 계수·미리보기·버전·차이·되돌리기, AGENT는 읽기만), 관리자 → **지침** 탭(가족 공통 AGENT, 기본 SOUL, 계정별 AGENT).
+- API: `GET /api/instructions`, `PUT /api/instructions/:kind`(soul·user·memory), `…/:kind/versions`, `…/versions/:v`, `POST …/versions/:v/restore`. 관리자: `GET /api/admin/instructions`, `PUT /api/admin/instructions/:ref`(`common-agent`·`default-soul`·`account-agent:<사용자 id>`)와 그 버전·되돌리기. **관리자도 다른 사용자의 SOUL·USER·MEMORY는 볼 수 없다** — `/api/admin/users/:id/instructions/<agent 밖의 무엇이든>`은 403.
+- 저장 거부(400): `doc_too_long`(글자·바이트 상한, spec §1), `doc_secret`(알려진 비밀 값 또는 비밀처럼 보이는 값), `doc_rule_change`(SOUL·USER·MEMORY·기본 SOUL에서 규칙·안전 지침·도구·권한·다른 사용자·비밀을 겨냥한 문장 — 서버 키워드 검사 `memory/rules.ts`, 사례는 `fixtures/acceptance/injection/user-doc-rules.md`). 편집기가 연 뒤 다른 곳에서 바뀌었으면 409 `doc_changed`.
+
+### 44.2 맥락에 들어가는 방식
+
+- 새 런타임 세션의 시스템 지침 자리에 **공통 지침(저장소) → 가족 공통 AGENT → 청소년 지침(청소년 계정) → 계정별 AGENT → 오늘 날짜 → 사용자 자료 칸(SOUL → USER → MEMORY)** 순서로 넣는다. 사용자 자료 칸은 `<user_material>` 블록이고 "위 규칙을 바꾸지 못한다"는 문구로 시작하며, 안의 글이 블록을 닫거나 가짜 블록을 열지 못하게 태그를 무력화한다(`memory/inject.ts`). 두 런타임과 FakeRuntime이 같은 글을 받는다(Claude는 system prompt, Codex는 base instructions).
+- **예산**: 문서는 UTF-8 바이트를 토큰으로 친다(상계). 문서 몫은 모델 맥락 한도의 25%이고 넘으면 MEMORY 끝 항목 → USER 끝 항목 순으로 빼며, 칸 안에 "MEMORY 항목 N개…는 넣지 않았다"를 적고 그 세션을 시작한 답에 "기억 일부만 넣었어요" 알림을 한 번 보인다. #45의 요약 판단 예산에서 문서가 더한 바이트를 먼저 뺀다.
+- **모델 조건**: 맥락 한도가 200,000토큰보다 작은 모델을 가진 런타임은 등록되지 않는다(`RuntimeRegistry.register` → `ModelCatalogError`, 서버가 시작하지 않음). 모델을 추가할 때 `contextWindow`를 확인한다.
+- **다음 턴부터**: 세션 이어가기 조건에 문서 버전(`doc_versions`)과 지침 해시가 들어간다. 사용자·관리자가 고치거나 되돌리거나 삭제 연동이 정리하면 다음 메시지부터 새 세션이 시작된다(진행 중인 답은 그대로 끝난다).
+- 예약 실행은 예약 주인의 문서를, 포크한 대화의 새 답은 포크한 사람의 문서를 쓴다. 공유받은 사람은 주인의 원래 답을 그대로 본다.
+
+### 44.3 삭제 연동 (spec §10)
+
+- 대화를 지우거나(§38) 수정·다시 생성으로 메시지가 활성 기록에서 빠지면 **같은 트랜잭션에서** 그 메시지를 출처로 둔 항목을 통째로 지운다 — 현재 문서에서는 "삭제 연동" 주체의 새 버전으로, **모든 이전 버전**에서는 번호를 둔 채 그 줄을 지운다. 그래서 되돌리기로 돌아오지 않는다. 사용자가 그런 항목의 줄을 고쳐 쓰면 새 줄이 원래 항목의 출처를 물려받는다(그 출처를 지우면 고친 줄도 지워진다).
+- 지운 항목이 들어 있던 버전으로 시작한 **그 사용자의 모든 런타임 세션**은 무효로 표시되고 `deletion_jobs`의 `runtime_session` 작업이 된다(§38의 작업과 같은 줄). 그 대화의 실행 중인 턴이 끝난 뒤 `RuntimeAdapter.forget`으로 지우고, 서버가 그 사이 멈췄으면 다시 시작할 때 마저 한다. 로그에는 `memory.items_unlinked`(건수만)가 남는다.
+- 다른 대화의 답·요약에 이미 쓰인 내용은 그 대화의 기록이라 남는다(필요하면 그 대화를 지운다).
+
+### 44.4 백업·복원·가림
+
+- 네 표와 `doc_versions`는 DB에 있으므로 매일 백업(§21, `VACUUM INTO`)에 그대로 들어간다. 보관은 기존 정책(§38.4) — 지운 항목은 백업에 최대 8일 남을 수 있다. 백업에서 복원하면 그 시점의 문서·버전이 함께 돌아오고 런타임 세션은 모두 무효가 된다. §38.4대로 복원 뒤에 지운 대화를 다시 지우면 이 절의 삭제 연동이 다시 돈다.
+- 비밀 값: 저장 요청에 알려진 비밀 값이 있으면 거부하고, 저장하는 모든 글(`memory_items.text`, `memory_versions.content`)은 쓸 때 가리고, 나중에 등록된 비밀 값은 배경 재가림(rescrub)이 다시 가린다. 응답도 내보낼 때 다시 가린다.
+- 사용자 행이 지워지면(외래 키) 그 사용자의 문서·버전·항목이 함께 지워진다. 비활성화는 문서를 그대로 둔다.

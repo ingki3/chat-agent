@@ -177,6 +177,8 @@ export const LOG_EVENTS = [
   "conversation.sessions_reconciled",
   "conversation.forget_failed",
   "schedule.proposed",
+  // 내 지침 deletion linkage (#144): how many items went and how many sessions are to be forgotten — never the text.
+  "memory.items_unlinked",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

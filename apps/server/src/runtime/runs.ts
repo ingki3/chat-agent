@@ -3,7 +3,10 @@ import { sentWithActive } from "../files/store.js";
 import { EventEmitter } from "node:events";
 import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
+  MEMORY_TRIMMED_CODE,
+  MEMORY_TRIMMED_TEXT,
   redactSecrets,
+  utf8Bytes,
   type CitationNotePart,
   type FinanceNotePart,
   StreamEvent,
@@ -45,7 +48,13 @@ import {
 import { classifyError, runFailureCategory, type ErrorLog } from "../observability/errors.js";
 import { registerToolNames, toolLabel } from "../observability/policy.js";
 import { OUR_TOOL_PREFIX } from "./lockdown.js";
-import { assembleInstructions, defaultTemplates, type Templates } from "../instructions/assemble.js";
+import {
+  assembleInstructions,
+  defaultTemplates,
+  type AssembledInstructions,
+  type Templates,
+} from "../instructions/assemble.js";
+import { docBudgetBytes, docVersionsKey, EMPTY_DOCS, fitMaterial, type DocSet } from "../memory/inject.js";
 import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/checker.js";
 import { FinanceResultStore } from "../finance/results.js";
 import { citationNote } from "../citations/checker.js";
@@ -235,6 +244,8 @@ function usageTotals(live: Live): { inputTokens: number; outputTokens: number; c
 }
 
 export const EVENT_RETENTION_MS = 3600_000;
+/** `docVersionsKey` of no documents: what a session from before #144 (no recorded versions) counts as. */
+const NO_DOCS = "{}";
 export const DEFAULT_RUNTIME: RuntimeId = "claude-code";
 
 export class ShuttingDownError extends Error {
@@ -371,6 +382,24 @@ export type RunManagerOptions = {
    * source the conversation does not have is not referenced. Without it no source is referenced.
    */
   contextSources?: (conversationId: string) => ReadonlyMap<string, { text: boolean }>;
+  /**
+   * 내 지침 (#144, docs/memory-spec.md §2): the documents a new session of this user gets — AGENT in the system
+   * instructions, SOUL / USER / MEMORY in the user material box. Without it no documents go in.
+   */
+  memory?: { docSet(userId: string): DocSet };
+};
+
+/** What a run's fresh session is told before its first turn (#20, #144), built once per run. */
+type RunInstructions = {
+  tools: string[];
+  mcp: RunManagerOptions["mcp"];
+  instructions: AssembledInstructions;
+  /** The 내 지침 versions it was built from (`docVersionsKey`): recorded with the session, part of its resume check. */
+  docsKey: string;
+  /** Items left out to stay within the documents' budget (spec §2). */
+  dropped: { user: number; memory: number };
+  /** Tokens (UTF-8 bytes, an upper bound) the documents add — taken off #45's summary budget first. */
+  docTokens: number;
 };
 
 /**
@@ -595,7 +624,12 @@ export class RunManager {
         const { user, assistant } = input.prepare(() => {
           if (!adapter || !model) return;
           // "앞부분을 요약했어요" where a new summary is due (#45, FR-3.6): decided here, written by `execute`.
-          const due = this.summaryDue(input.conversationId, adapter, model.id, input.inputText);
+          const due = this.summaryDue(
+            { conversationId: input.conversationId, userId: input.userId, skills: input.skills },
+            adapter,
+            model.id,
+            input.inputText,
+          );
           const plan: NonNullable<Live["summaryPlan"]> = { summarize: due.summarize };
           decided.plan = plan;
           if (due.summarize)
@@ -1169,20 +1203,84 @@ export class RunManager {
    * user message active, so a trailing user message is the input and left out).
    */
   private summaryDue(
-    conversationId: string,
+    run: { conversationId: string; userId: string; skills?: readonly string[] | undefined },
     adapter: RuntimeAdapter,
     model: string,
     inputText: string | undefined,
   ): { summarize: boolean; inUse: boolean } {
+    const conversationId = run.conversationId;
     const active = this.conversations.messages(conversationId, { limit: 10_000 });
     const trailingUser = active.at(-1)?.role === "user" ? active.at(-1) : undefined;
     const history = trailingUser ? active.slice(0, -1) : active;
     const input = inputText ?? (trailingUser ? messageText(trailingUser.parts as MessagePart[]) : "");
     const current = this.summaries.current(conversationId, history);
+    // The documents the session would get come off the budget first (#144, spec §2).
+    const opts = this.withDocs(this.instructionsFor({ ...run, runtime: adapter.id, model }).docTokens);
     const summarize =
-      needsSummary(history, current, this.windowOf(adapter, model), this.contextOpts, input) &&
-      messagesToFold(history, current, this.contextOpts).length > 0;
+      needsSummary(history, current, this.windowOf(adapter, model), opts, input) &&
+      messagesToFold(history, current, opts).length > 0;
     return { summarize, inUse: summarize || current !== null };
+  }
+
+  /** #45's options with the documents' tokens reserved on top (spec §2 #45와의 관계). */
+  private withDocs(docTokens: number): ContextOptions {
+    return { ...this.contextOpts, reserveTokens: this.contextOpts.reserveTokens + docTokens };
+  }
+
+  /**
+   * The system instructions of a fresh session (#20) with 내 지침 (#144, spec §2): AGENT (family-wide → youth →
+   * account), then SOUL / USER / MEMORY in the user material box. The documents' share is `DOC_BUDGET_RATIO` of the
+   * model's window, counted in UTF-8 bytes with everything around them; over it, MEMORY's last items go first, then
+   * USER's. Built from the user, the conversation and the tools, the same for every runtime.
+   */
+  private instructionsFor(run: {
+    conversationId: string;
+    userId: string;
+    runtime: string;
+    model: string;
+    skills?: readonly string[] | undefined;
+  }): RunInstructions {
+    const adapter = this.registry.get(run.runtime as RuntimeId)!;
+    const caps = adapter.capabilities();
+    const mcp = caps.usesTools || caps.runTools ? this.opts.mcp : undefined;
+    // Per user: a skill the user may not use is not even offered (and the MCP server refuses it anyway).
+    const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId, run.skills)) : [];
+    const conv = this.conversations.get(run.conversationId)!;
+    const user = this.db.select({ youth: users.youth }).from(users).where(eq(users.id, run.userId)).get();
+    let docs: DocSet = EMPTY_DOCS;
+    try {
+      docs = this.opts.memory?.docSet(run.userId) ?? EMPTY_DOCS;
+    } catch {
+      // the documents could not be read: the session starts without them rather than not at all
+    }
+    const base = {
+      user: { youth: user?.youth === true },
+      mode: conv.researchMode ? ("research" as const) : ("normal" as const),
+      tools,
+      now: new Date(this.now()),
+      templates: this.templates,
+    };
+    const plain = assembleInstructions(base);
+    const agent = {
+      agentCommon: docs.agentCommon?.text ?? null,
+      agentAccount: docs.agentAccount?.text ?? null,
+    };
+    const withAgent = assembleInstructions({ ...base, docs: agent });
+    const fitted = fitMaterial(
+      docs,
+      docBudgetBytes(this.windowOf(adapter, run.model)) - utf8Bytes(withAgent.text) - 2,
+    );
+    const instructions = fitted.text
+      ? assembleInstructions({ ...base, docs: { ...agent, material: fitted.text } })
+      : withAgent;
+    return {
+      tools,
+      mcp,
+      instructions,
+      docsKey: docVersionsKey(docs),
+      dropped: fitted.dropped,
+      docTokens: Math.max(0, utf8Bytes(instructions.text) - utf8Bytes(plain.text)),
+    };
   }
 
   /**
@@ -1196,10 +1294,11 @@ export class RunManager {
     live: Live,
     history: MessageRow[],
     input: { text: string; messageId: string | null },
+    docTokens = 0,
   ): Promise<RunContext> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const window = this.windowOf(adapter, run.model);
-    const opts = this.contextOpts;
+    const opts = this.withDocs(docTokens);
     // The user's message is never cut: when it alone (with the reserve) does not fit the window, the run fails before
     // anything is sent or summarised (review #106 round 2).
     if (overflows([], null, window, opts, input.text)) throw new RuntimeFailure("context_too_large");
@@ -1407,22 +1506,12 @@ export class RunManager {
     run: RunRow,
     context: RunContext,
     live: Live,
+    prepared: RunInstructions,
   ): Promise<{ session: RuntimeSession; sessionRowId: string; revision: number }> {
     const adapter = this.registry.get(run.runtime as RuntimeId)!;
     const conv = this.conversations.get(run.conversationId)!;
     const caps = adapter.capabilities();
-    const mcp = caps.usesTools || caps.runTools ? this.opts.mcp : undefined;
-    // Per user: a skill the user may not use is not even offered (and the MCP server refuses it anyway).
-    const tools = mcp ? trustOurTools(mcp.toolNamesFor(run.userId, live.skills)) : [];
-    // The same instructions for every runtime (#20): built per run from the user, the conversation and the tools.
-    const user = this.db.select({ youth: users.youth }).from(users).where(eq(users.id, run.userId)).get();
-    const instructions = assembleInstructions({
-      user: { youth: user?.youth === true },
-      mode: conv.researchMode ? "research" : "normal",
-      tools,
-      now: new Date(this.now()),
-      templates: this.templates,
-    });
+    const { mcp, tools, instructions, docsKey } = prepared;
     this.db
       .update(runs)
       .set({ instructions: instructions.versions.join(",") })
@@ -1468,19 +1557,19 @@ export class RunManager {
     const lastSeen = context.history.findLast((m) => m.role !== "system")?.id ?? null;
     const prev = !caps.canResume
       ? undefined
-      : this.conversations
-          .sessions(run.conversationId)
-          .find(
-            (s) =>
-              s.runtime === run.runtime &&
-              (s.connectionId ?? null) === (run.connectionId ?? null) &&
-              s.conversationRevision === conv.revision &&
-              s.lastMessageId === lastSeen &&
-              s.instructionsHash === instructions.hash &&
-              (s.summaryId ?? null) === (summary?.id ?? null) &&
-              !s.trimmed &&
-              (s.model === null || s.model === run.model || caps.canSwitchModelInSession),
-          );
+      : this.conversations.sessions(run.conversationId).find(
+          (s) =>
+            s.runtime === run.runtime &&
+            (s.connectionId ?? null) === (run.connectionId ?? null) &&
+            s.conversationRevision === conv.revision &&
+            s.lastMessageId === lastSeen &&
+            s.instructionsHash === instructions.hash &&
+            // The 내 지침 versions it started with (#144, spec §2): any change applies from the next turn on.
+            (s.docVersions ?? NO_DOCS) === docsKey &&
+            (s.summaryId ?? null) === (summary?.id ?? null) &&
+            !s.trimmed &&
+            (s.model === null || s.model === run.model || caps.canSwitchModelInSession),
+        );
     // A cut context goes to a fresh session only; the session that holds the whole history is not used again.
     if (prev && context.trimmed) this.conversations.invalidateSession(prev.id);
     else if (prev) {
@@ -1512,10 +1601,19 @@ export class RunManager {
         lastMessageId: lastSeen,
         conversationRevision: conv.revision,
         instructionsHash: instructions.hash,
+        docVersions: docsKey,
         model: run.model,
         summaryId: summary?.id ?? null,
         trimmed: context.trimmed,
       });
+      // Items were left out of the documents (spec §2): said once, when the session that lacks them starts.
+      if (prepared.dropped.user + prepared.dropped.memory > 0)
+        this.emit(run.id, {
+          type: "notice",
+          level: "info",
+          code: MEMORY_TRIMMED_CODE,
+          message: MEMORY_TRIMMED_TEXT,
+        });
       return { session, sessionRowId: row.id, revision: conv.revision };
     } catch (e) {
       if (session.exited) live.exits.push(session.exited());
@@ -1601,17 +1699,20 @@ export class RunManager {
       code: null,
     };
     try {
+      // The instructions and documents a fresh session gets (#20, #144): their size comes off #45's budget.
+      const prepared = this.instructionsFor({ ...run, skills: live.skills });
       // The context of a fresh session (#45): a summary may be written first (an attempt of its own).
       const context = await this.contextFor(
         run,
         live,
         before.filter((m) => m !== lastUser),
         { text: inputText ?? "", messageId: lastUser?.id ?? null },
+        prepared.docTokens,
       );
       if (live.settled) return;
       // One attempt = this session open + the turn below (#44).
       const attempt = nextAttempt(live);
-      const { session, sessionRowId, revision } = await this.openSession(run, context, live);
+      const { session, sessionRowId, revision } = await this.openSession(run, context, live, prepared);
       live.session = session;
       // Interrupted or deleted while the session was opening.
       if (live.settled) return void closeSession(live);

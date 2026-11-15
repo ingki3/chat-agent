@@ -243,10 +243,44 @@ export class SessionGoneError extends Error {
   }
 }
 
-/** Adapters by runtime id. Production registers the real ones (#15, #16); FAKE_RUNTIME=1 adds FakeRuntime. */
+/**
+ * The smallest context window a model may have to be offered at all (#144, docs/memory-spec.md §2 모델 조건): the
+ * documents' share is 25% of it, and AGENT + SOUL + the youth guideline (at most 43,000 bytes) must always fit in it.
+ * A model without a known window counts as `DEFAULT_CONTEXT_WINDOW` (200,000, context.ts).
+ */
+export const MIN_CONTEXT_WINDOW = 200_000;
+
+/** A model whose context window is below the minimum was offered (the runtime is not registered). */
+export class ModelCatalogError extends Error {
+  constructor(readonly modelId: string) {
+    super(`model ${modelId} has a context window below ${MIN_CONTEXT_WINDOW} tokens`);
+    this.name = "ModelCatalogError";
+  }
+}
+
+/** The first model of the catalogue whose window is known and below `min`, if any. */
+export function tooSmallModel(
+  models: readonly ModelCapability[],
+  min = MIN_CONTEXT_WINDOW,
+): string | undefined {
+  return models.find((m) => m.contextWindow !== undefined && m.contextWindow > 0 && m.contextWindow < min)
+    ?.id;
+}
+
+/**
+ * Adapters by runtime id. Production registers the real ones (#15, #16); FAKE_RUNTIME=1 adds FakeRuntime. A runtime
+ * whose model list holds a model below `MIN_CONTEXT_WINDOW` is refused (`ModelCatalogError`) — it would never reach
+ * the admin's model list. `minContextWindow` lowers the bar for tests of #45's summaries with tiny windows only.
+ */
 export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, RuntimeAdapter>();
+  private readonly minContextWindow: number;
+  constructor(opts: { minContextWindow?: number } = {}) {
+    this.minContextWindow = opts.minContextWindow ?? MIN_CONTEXT_WINDOW;
+  }
   register(a: RuntimeAdapter): void {
+    const small = tooSmallModel(a.capabilities().models, this.minContextWindow);
+    if (small !== undefined) throw new ModelCatalogError(small);
     this.adapters.set(a.id, a);
   }
   get(id: RuntimeId): RuntimeAdapter | undefined {
