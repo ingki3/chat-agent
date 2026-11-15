@@ -30,7 +30,8 @@
     "workers:check": "pnpm --filter @agentlee/server workers check",
     "sse-probe": "tsx scripts/sse-probe.ts",
     "uptime": "tsx scripts/uptime.ts",
-    "launchd": "bash scripts/install-launchd.sh"
+    "launchd": "bash scripts/install-launchd.sh",
+    "release": "bash scripts/release.sh"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
