@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
-import { csrf, newConversation, newMember, signIn } from "./helpers.js";
+import { csrf, newConversation, newMember, openSources, signIn, sourceStatuses } from "./helpers.js";
 
 /**
  * The file viewer (#24, PRD FR-4.5, 수용 기준 2): a file citation opens the file at its place and highlights it —
@@ -66,7 +66,7 @@ test("PDF + HWP 비교: 12쪽 인용 → 12쪽의 그 문장, HWP 인용 → 3�
     ],
     "/file-compare",
   );
-  await expect(reply.getByTestId("citation-status")).toHaveText(["원문 구절 확인", "원문 구절 확인"]);
+  await expect.poll(() => sourceStatuses(reply)).toEqual(["verified", "verified"]);
   const links = reply.getByTestId("citation-file-link");
   await expect(links).toHaveText(["report.pdf · 12쪽", "과제안내.hwp · 3번째 표 · 2행 · 2열"]);
 
@@ -88,6 +88,7 @@ test("PDF + HWP 비교: 12쪽 인용 → 12쪽의 그 문장, HWP 인용 → 3�
   // [2] from the source list: the HWP row.
   await page.getByTestId("file-view-back").click();
   await expect(page).toHaveURL(new RegExp(`/c/${c.id}$`));
+  await openSources(page.getByTestId("assistant").last());
   await page.getByTestId("assistant").last().getByTestId("citation-file-link").nth(1).click();
   await expect(page.getByTestId("file-view-status")).toHaveAttribute("data-status", "exact");
   const row = page.getByTestId("file-view-unit");
@@ -109,6 +110,9 @@ test("PDF + HWP 비교: 12쪽 인용 → 12쪽의 그 문장, HWP 인용 → 3�
   const fpage = await fctx.newPage();
   await signIn(fpage, baseURL!, family);
   await fpage.goto(`/shared/${shareId}`);
+  // The shared screen folds the list the same way (#150).
+  await expect(fpage.getByTestId("citation-summary")).toHaveText("출처 2개 · 모두 확인됨");
+  await openSources(fpage.locator("body"));
   await fpage.getByTestId("citation-file-link").nth(1).click();
   await expect(fpage.getByTestId("file-view-status")).toHaveAttribute("data-status", "exact");
   await expect(fpage.getByTestId("file-view-hit")).toHaveText(ROW2);
@@ -146,7 +150,7 @@ test("스캔 PDF 인용 → 그 쪽의 글자 상자 강조", async ({ page, bro
     [{ name: "scanned.pdf", mimeType: "application/pdf", buffer: SCANNED }],
     "/file-scan",
   );
-  await expect(reply.getByTestId("citation-status")).toHaveText(["원문 구절 확인"]);
+  await expect.poll(() => sourceStatuses(reply)).toEqual(["verified"]);
   await reply.getByTestId("citation-file-link").click();
   await expect(page.getByTestId("file-view-status")).toHaveAttribute("data-status", "exact");
   const unit = page.getByTestId("file-view-unit");

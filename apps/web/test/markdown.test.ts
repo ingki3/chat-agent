@@ -166,3 +166,19 @@ describe("Markdown", () => {
     expect(render("<b>굵게</b>")).toContain("&lt;b&gt;굵게&lt;/b&gt;");
   });
 });
+
+describe("citation markers in the markdown view (#25, #150)", () => {
+  const cited = (text: string, numbers: number[]) =>
+    renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        cite: { numbers: new Set(numbers), render: (ns) => createElement("b", { "data-ns": ns.join(",") }) },
+      }),
+    );
+  it("markers side by side are one chip; others, unlisted numbers and code stay apart", () => {
+    const out = cited("가는 늘었다[1][3]. 나는[2] [4]. 배열 `a[1]`, 목록[9][2].", [1, 2, 3, 4]);
+    expect([...out.matchAll(/data-ns="([^"]+)"/g)].map((m) => m[1])).toEqual(["1,3", "2,4", "2"]);
+    expect(out).toContain("<code>a[1]</code>");
+    expect(out).toContain("목록[9]");
+  });
+});

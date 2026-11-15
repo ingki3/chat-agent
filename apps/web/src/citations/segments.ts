@@ -80,8 +80,17 @@ export function citationView(n: number, entry: CitationEntry | undefined): Citat
   };
 }
 
+/**
+ * `markers`: one or more `[n]` side by side in the answer (`[1][3]`, also with spaces between) — drawn as one
+ * compact chip (#150), each number still its own button.
+ */
 export type Segment =
-  { kind: "text"; text: string } | { kind: "marker"; view: CitationView } | { kind: "missing"; text: string };
+  | { kind: "text"; text: string }
+  | { kind: "markers"; views: CitationView[] }
+  | { kind: "missing"; text: string };
+
+/** Markers this close together are one chip (#150): nothing, or only spaces and tabs, between them. */
+export const ADJACENT = /^[ \t]*$/;
 
 /**
  * The answer text cut into plain text, markers (with their citation) and missing-citation paragraphs (ranges
@@ -101,15 +110,21 @@ export function segments(text: string, note: CitationNotePart): Segment[] {
         cuts.push({
           start: m.start,
           end: m.end,
-          seg: { kind: "marker", view: citationView(m.n, byN.get(m.n)) },
+          seg: { kind: "markers", views: [citationView(m.n, byN.get(m.n))] },
         });
   cuts.sort((a, b) => a.start - b.start);
   const out: Segment[] = [];
   let pos = 0;
   for (const c of cuts) {
     if (c.start < pos) continue;
-    if (c.start > pos) out.push({ kind: "text", text: text.slice(pos, c.start) });
-    out.push(c.seg);
+    const last = out.at(-1);
+    // Side by side with the chip before it: one chip.
+    if (c.seg.kind === "markers" && last?.kind === "markers" && ADJACENT.test(text.slice(pos, c.start)))
+      last.views.push(...c.seg.views);
+    else {
+      if (c.start > pos) out.push({ kind: "text", text: text.slice(pos, c.start) });
+      out.push(c.seg);
+    }
     pos = c.end;
   }
   if (pos < text.length) out.push({ kind: "text", text: text.slice(pos) });
@@ -119,4 +134,30 @@ export function segments(text: string, note: CitationNotePart): Segment[] {
 /** The source list under the answer: every citation of the note, by number. */
 export function sourceViews(note: CitationNotePart): CitationView[] {
   return [...note.citations].sort((a, b) => a.n - b.n).map((c) => citationView(c.n, c));
+}
+
+/** The folded source list's summary (#150): how many sources, and how many of them are not verified. */
+export function sourceSummary(views: readonly CitationView[]): {
+  total: number;
+  failed: number;
+  text: string;
+} {
+  const failed = views.filter((v) => !v.ok).length;
+  return {
+    total: views.length,
+    failed,
+    text: `출처 ${views.length}개 · ${failed ? `⚠️ 확인 안 된 출처 ${failed}개` : "모두 확인됨"}`,
+  };
+}
+
+/** What a source row's link reads (#150: never the URL itself): the title, else the site, else the host. */
+export function sourceLinkText(v: CitationView): string | null {
+  if (v.title) return v.title;
+  if (v.site) return v.site;
+  if (!v.href) return null;
+  try {
+    return new URL(v.href).hostname;
+  } catch {
+    return null;
+  }
 }

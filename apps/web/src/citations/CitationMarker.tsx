@@ -1,11 +1,37 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { CitationView } from "./segments.js";
 import { useFileViewHref } from "../files/context.js";
 import "./citations.css";
 
 /**
- * One `[n]` at the end of a sentence (#25, PRD FR-5.1·5.3). Desktop: hovering shows the preview; a click pins
+ * Markers side by side (`[1][3]`) as one small superscript chip, `1·3` (#150) — each number its own button with
+ * its own preview, a failed one with ⚠️. A single marker is a chip of one.
+ */
+export function CitationMarkers({ views }: { views: readonly CitationView[] }) {
+  return (
+    <span
+      className={`cite-group${views.every((v) => v.ok) ? "" : " warn"}`}
+      role="group"
+      aria-label={`출처 ${views.map((v) => v.n).join(", ")}`}
+      data-testid="citation-chip"
+    >
+      {views.map((v, i) => (
+        <Fragment key={`${v.n}-${i}`}>
+          {i > 0 && (
+            <span className="cite-sep" aria-hidden="true">
+              ·
+            </span>
+          )}
+          <CitationMarker view={v} />
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * One `[n]` at the end of a sentence (#25, PRD FR-5.1·5.3), drawn as its number inside the chip. Desktop: hovering shows the preview; a click pins
  * it. Mobile: a tap opens it, another tap (or a tap elsewhere, or Esc) closes it. The preview shows the quoted
  * passage and "원문 열기". A citation that is not verified carries ⚠️ in the marker itself and in the preview.
  *
@@ -52,8 +78,8 @@ export function CitationMarker({ view }: { view: CitationView }) {
         aria-label={`출처 ${view.n}: ${view.label}`}
         onClick={() => setPinned((p) => !p)}
       >
-        [{view.n}
-        {view.ok ? "" : "⚠️"}]
+        {view.n}
+        {view.ok ? "" : "⚠️"}
       </button>
       {open && <CitationPreview id={id} view={view} />}
     </span>

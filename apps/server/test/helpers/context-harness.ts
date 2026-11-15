@@ -23,12 +23,22 @@ export type Entry = { role: string; text: string };
 export const CLAUDE_KEY = `sk-ant-CONTEXTTESTFAKE${"c".repeat(24)}`;
 export const CODEX_KEY = `sk-CONTEXTTESTFAKE${"x".repeat(24)}`;
 
-/** A message's text as a runtime must get it: its text parts, nothing else (no reasoning, no tool data). */
-export const textOf = (m: Pick<MessageRow, "parts">) =>
-  (m.parts as MessagePart[])
+/**
+ * A message's text as a runtime must get it: its text parts, nothing else (no reasoning, no tool data) — and for a
+ * user message one `[첨부 파일: <name> (file:<id>)]` line per attached file after it (#149; names here are plain).
+ */
+export const textOf = (m: Pick<MessageRow, "parts"> & Partial<Pick<MessageRow, "role">>) => {
+  const parts = m.parts as MessagePart[];
+  const text = parts
     .flatMap((p) => (p.type === "text" ? [p.text] : []))
     .join("\n")
     .trim();
+  const files =
+    m.role === "user"
+      ? parts.flatMap((p) => (p.type === "file_ref" ? [`[첨부 파일: ${p.name} (file:${p.fileId})]`] : []))
+      : [];
+  return files.length ? [text, ...(text ? [""] : []), ...files].join("\n") : text;
+};
 
 export async function startContextApp(
   runtimes: RuntimeRegistry,
@@ -106,6 +116,22 @@ export async function startContextApp(
     const r = await req("PUT", `/api/conversations/${cid}/settings`, body);
     expect(r.statusCode, r.body).toBe(200);
   };
+  /** An uploaded (unsent) text file of the conversation, stored the way an upload stores it (#149). */
+  const upload = async (cid: string, name: string, text = "첨부 파일 본문") => {
+    const tmp = app.files!.tempFile();
+    fs.writeFileSync(tmp, text);
+    const row = await app.files!.add({
+      userId: f.users.owner.id,
+      conversationId: cid,
+      uploadId: crypto.randomUUID(),
+      name,
+      kind: "txt",
+      bytes: Buffer.byteLength(text),
+      sha256: crypto.createHash("sha256").update(text).digest("hex"),
+      tmp,
+    });
+    return row.id;
+  };
   const messages = async (cid: string) =>
     Message.array().parse(
       (await req("GET", `/api/conversations/${cid}/messages`)).json<{ items: unknown }>().items,
@@ -176,6 +202,7 @@ export async function startContextApp(
     edit,
     regenerate,
     chip,
+    upload,
     messages,
     original,
     sessions,

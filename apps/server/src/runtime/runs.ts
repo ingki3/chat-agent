@@ -7,6 +7,7 @@ import {
   MEMORY_TRIMMED_TEXT,
   redactSecrets,
   utf8Bytes,
+  type CitationEntry,
   type CitationNotePart,
   type FinanceNotePart,
   StreamEvent,
@@ -68,6 +69,7 @@ import { ArtifactStore } from "../artifacts/store.js";
 import { FINANCE_CHART_TOOL } from "@agentlee/mcp-tools/finance";
 import { SummaryStore } from "../conversations/summaries.js";
 import {
+  attachmentLines,
   citedSources,
   contextHistory,
   contextWindowOf,
@@ -969,12 +971,33 @@ export class RunManager {
     }
     if (!parts.some((p) => p.type === "citation_note")) {
       try {
-        const note = citationNote(row.id, parts, this.citations);
+        const note = citationNote(row.id, parts, this.citations, {
+          conversationId: row.conversationId,
+          userId: row.userId,
+          previous: () => this.previousCitations(row),
+        });
         if (note) this.pushNote(row, parts, note);
       } catch {
         // no note rather than no reply
       }
     }
+  }
+
+  /**
+   * The citations of the newest earlier answer of the conversation with a citation note (#150, numbers carried
+   * over — `citationNote`): active messages before this reply, the server's own notes only.
+   */
+  private previousCitations(row: RunRow): CitationEntry[] {
+    const self = this.conversations.messageById(row.assistantMessageId);
+    if (!self) return [];
+    const earlier = this.conversations
+      .messages(row.conversationId, { limit: 10_000 })
+      .filter((m) => m.role === "assistant" && m.seq < self.seq);
+    for (const m of earlier.reverse()) {
+      const note = (m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+      if (note && note.citations.length) return note.citations;
+    }
+    return [];
   }
 
   /**
@@ -1225,7 +1248,9 @@ export class RunManager {
     const active = this.conversations.messages(conversationId, { limit: 10_000 });
     const trailingUser = active.at(-1)?.role === "user" ? active.at(-1) : undefined;
     const history = trailingUser ? active.slice(0, -1) : active;
-    const input = inputText ?? (trailingUser ? messageText(trailingUser.parts as MessagePart[]) : "");
+    const input =
+      inputText ??
+      (trailingUser ? messageText(trailingUser.parts as MessagePart[], { attachments: true }) : "");
     const current = this.summaries.current(conversationId, history);
     // The documents the session would get come off the budget first (#144, spec §2).
     const opts = this.withDocs(this.instructionsFor({ ...run, runtime: adapter.id, model }).docTokens);
@@ -1702,9 +1727,15 @@ export class RunManager {
     const lastUser = [...before].reverse().find((m) => m.role === "user");
     const self = all.find((m) => m.id === messageId);
     live.financeCarry = this.financeResults.context(run.conversationId, self?.seq ?? Number.MAX_SAFE_INTEGER);
-    const inputText = (lastUser?.parts as MessagePart[] | undefined)
-      ?.flatMap((p) => (p.type === "text" ? [scrubKnown(p.text)] : []))
-      .join("\n");
+    // The turn's message: its text, then its attachment markers (#149) — a resumed session learns of the files only
+    // here (the file list is in a fresh session's start context only).
+    const userParts = lastUser?.parts as MessagePart[] | undefined;
+    const attached = userParts ? attachmentLines(userParts) : [];
+    const typed = userParts?.flatMap((p) => (p.type === "text" ? [scrubKnown(p.text)] : [])).join("\n");
+    const inputText =
+      typed !== undefined && attached.length
+        ? [typed, attached.join("\n")].filter(Boolean).join("\n\n")
+        : typed;
 
     const parts = live.parts;
     let lastFlush = this.now();

@@ -106,33 +106,103 @@ describe("rendering", () => {
       m[2],
     ]);
     expect(markers).toEqual([
-      ["verified", "[1]"],
-      ["snippet_not_found", "[2⚠️]"],
-      ["fetch_failed", "[3⚠️]"],
-      ["unknown_source", "[4⚠️]"],
-      ["unknown_source", "[5⚠️]"],
+      ["verified", "1"],
+      ["snippet_not_found", "2⚠️"],
+      ["fetch_failed", "3⚠️"],
+      ["unknown_source", "4⚠️"],
+      ["unknown_source", "5⚠️"],
     ]);
     expect(out.match(/class="cite-marker warn"/g)).toHaveLength(4);
+    // Each marker is a chip of its own here (text between them).
+    expect(out.match(/data-testid="citation-chip"/g)).toHaveLength(5);
   });
 
-  it("source list: title, site, date, URL and status; every failure row ⚠️ and never the verified words", () => {
-    const n = note([entry(1, "verified"), ...FAILURES.map((s, i) => entry(i + 2, s))]);
-    const out = html(createElement(CitationSources, { note: n }));
-    const rows = out.split("<li").slice(1);
-    expect(rows).toHaveLength(1 + FAILURES.length);
-    expect(rows[0]).toContain(OK);
-    expect(rows[0]).toContain("제목 1");
+  it("markers side by side are one chip, 1·3 — each number its own button and label (#150)", () => {
+    const TEXT = "가는 늘었다[1][3]. 나는 줄었다[2] [4]. 다는 그대로다[5],[6].";
+    const n = note(
+      [entry(1, "verified"), entry(2, "verified"), entry(3, "verified"), entry(4, "fetch_failed")],
+      [],
+      TEXT,
+    );
+    const segs = segments(TEXT, n);
+    expect(segs.flatMap((s) => (s.kind === "markers" ? [s.views.map((v) => v.n)] : []))).toEqual([
+      [1, 3],
+      [2, 4],
+      [5],
+      [6],
+    ]);
+    const out = html(createElement(CitedText, { text: TEXT, note: n }));
+    const chips = out.split('data-testid="citation-chip"').slice(1);
+    expect(chips).toHaveLength(4);
+    expect(out).toContain('role="group" aria-label="출처 1, 3"');
+    expect(chips[0]).toContain('aria-label="출처 1: 원문 구절 확인"');
+    expect(chips[0]).toContain('aria-label="출처 3: 원문 구절 확인"');
+    expect(chips[0]).toMatch(/>1<\/button>.*·.*>3<\/button>/);
+    // A chip with a failure is a warning chip; the failed number carries ⚠️.
+    expect(out).toContain('class="cite-group warn"');
+    expect(chips[1]).toContain(">4⚠️</button>");
+  });
+
+  it("source list (#150): folded behind a summary; unfolded rows show title (link), site and date — no URL text, no OK label", () => {
+    const all = note(Array.from({ length: 30 }, (_, i) => entry(i + 1, "verified")));
+    const folded = html(createElement(CitationSources, { note: all }));
+    expect(folded).toContain('data-testid="citation-summary">출처 30개 · 모두 확인됨<');
+    expect(folded).toContain('aria-expanded="false"');
+    expect(folded).toContain("▸");
+    expect(folded).not.toContain('data-testid="citation-source"');
+    const open = html(createElement(CitationSources, { note: all, defaultExpanded: true }));
+    expect(open).toContain('aria-expanded="true"');
+    const rows = open.split("<li").slice(1);
+    expect(rows).toHaveLength(30);
+    expect(rows[0]).toMatch(
+      /<a class="cite-title" href="https:\/\/news.example\/1" target="_blank" rel="noopener noreferrer nofollow"[^>]*>제목 1<\/a>/,
+    );
     expect(rows[0]).toContain("가나다 신문 · 2026-11-10");
-    expect(rows[0]).toContain('href="https://news.example/1"');
-    for (const row of rows.slice(1)) {
+    // The URL is the link's target only, never shown as text; no "원문 구절 확인" in the list.
+    expect(rows[0]).not.toContain(">https://news.example/1<");
+    expect(open).not.toContain(OK);
+    expect(open).not.toContain('data-testid="citation-status"');
+  });
+
+  it("failures are never folded away: the summary counts them and their rows stay listed (FR-5.2, 수용 기준 3)", () => {
+    const n = note([entry(1, "verified"), ...FAILURES.map((s, i) => entry(i + 2, s)), entry(30, "verified")]);
+    const folded = html(createElement(CitationSources, { note: n }));
+    expect(folded).toContain(`출처 ${FAILURES.length + 2}개 · ⚠️ 확인 안 된 출처 ${FAILURES.length}개`);
+    expect(folded).toContain('class="cite-summary warn"');
+    const rows = folded.split("<li").slice(1);
+    expect(rows).toHaveLength(FAILURES.length);
+    for (const row of rows) {
       expect(row).toContain("⚠️");
       expect(row).not.toContain(OK);
       expect(row).toContain('class="warn"');
+      expect(row).toContain('data-testid="citation-status"');
     }
+    expect(folded).not.toContain("제목 1<");
+    // Unfolded: every row, in order.
+    const open = html(createElement(CitationSources, { note: n, defaultExpanded: true }));
+    expect(open.split("<li").slice(1)).toHaveLength(FAILURES.length + 2);
+    // Every source failed: nothing to fold, no toggle, all listed.
+    const bad = html(
+      createElement(CitationSources, { note: note([entry(1, "fetch_failed"), entry(2, "unknown_source")]) }),
+    );
+    expect(bad).not.toContain("citation-toggle");
+    expect(bad).toContain("출처 2개 · ⚠️ 확인 안 된 출처 2개");
+    expect(bad.split("<li").slice(1)).toHaveLength(2);
     // An unknown source shows nothing of a source (no title, no link).
     const unknown = html(createElement(CitationSources, { note: note([entry(1, "unknown_source")]) }));
     expect(unknown).not.toContain("제목 1");
     expect(unknown).not.toContain("href");
+  });
+
+  it("a row without a title reads as its site or host, never the URL", () => {
+    const n = note([
+      entry(1, "verified", { title: null }),
+      entry(2, "verified", { title: null, site: null, url: "https://www.example.org/a/b?c=1" }),
+    ]);
+    const open = html(createElement(CitationSources, { note: n, defaultExpanded: true }));
+    expect(open).toContain(">가나다 신문</a>");
+    expect(open).toContain(">www.example.org</a>");
+    expect(open).not.toContain(">https://");
   });
 
   it("preview: the quote and 원문 열기; a failure is labelled as what it meant to quote", () => {
@@ -170,7 +240,7 @@ describe("rendering", () => {
     const text = "가[1].\n\n나는 출처가 없어요.";
     const start = text.indexOf("나");
     const n = note([entry(1, "verified")], [{ start, end: text.length }], text);
-    expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "marker", "text", "missing"]);
+    expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "markers", "text", "missing"]);
     const body = html(createElement(CitedText, { text, note: n }));
     expect(body).toMatch(
       /<span class="cite-missing" data-testid="citation-missing">나는 출처가 없어요\.<span[^>]*>⚠️<\/span><\/span>/,
@@ -196,7 +266,7 @@ describe("rendering", () => {
         { n: 1, start: 90, end: 93 }, // outside the text
       ],
     };
-    expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "marker", "text"]);
+    expect(segments(text, n).map((s) => s.kind)).toEqual(["text", "markers", "text"]);
     expect(segments(text, n)[0]).toEqual({ kind: "text", text: "a[1] 은 배열이고, 수출은 늘었다" });
   });
 
