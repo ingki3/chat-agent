@@ -16,16 +16,20 @@ const OK = "원문 구절 확인";
 
 async function ask(page: Page, text: string, timeout = 15_000) {
   const before = await page.getByTestId("citation-note").count();
+  const replies = await page.getByTestId("assistant").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
-  // The reply runs and the note is added at its end: allow for a busy machine (all specs run in parallel).
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1, { timeout });
-  return page.getByTestId("assistant").last();
+  // The reply runs to its end (allow for a busy machine: all specs run in parallel), then the note is there.
+  await expect(page.getByTestId("assistant")).toHaveCount(replies + 1, { timeout });
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout });
+  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1);
+  return reply;
 }
 
-async function newChat(page: Page, text: string) {
+async function newChat(page: Page, text: string, timeout?: number) {
   await page.goto("/");
-  const reply = await ask(page, text);
+  const reply = await ask(page, text, timeout);
   await page.waitForURL(/\/c\/[^/]+$/);
   return { reply, id: page.url().split("/c/")[1]! };
 }
@@ -155,8 +159,9 @@ test(
     test.setTimeout(90_000);
     await useAccount(page, MOM);
     // The thirty pages first, then the answer citing them (two light runs instead of one with sixty tool calls).
-    await newChat(page, "/cite fetchmany");
-    const reply = await ask(page, "/cite many", 45_000);
+    // Each step waits for its run to finish, whatever the machine (the test budget is 90 s).
+    await newChat(page, "/cite fetchmany", 40_000);
+    const reply = await ask(page, "/cite many", 40_000);
     // Ten paragraphs of `[a][b][c]`: ten chips of three numbers, each its own button.
     const chips = reply.getByTestId("citation-chip");
     await expect(chips).toHaveCount(10);
