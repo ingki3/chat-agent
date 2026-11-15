@@ -19,7 +19,8 @@ if (cmd === "render") {
   const values = {
     USER: process.env.AL_USER,
     HOME: process.env.AL_HOME,
-    REPO: repo,
+    // The folder the daemon runs: `<AGENTLEE_HOME>/current` for an installed release (install-launchd.sh decides).
+    REPO: process.env.AL_APP || repo,
     NODE: process.env.AL_NODE,
     NODE_DIR: process.env.AL_NODE ? path.dirname(process.env.AL_NODE) : undefined,
     LOGDIR: process.env.AL_LOGDIR,
