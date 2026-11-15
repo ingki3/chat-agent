@@ -60,6 +60,43 @@ describe("install-launchd.sh print", () => {
     }
   });
 
+  it("points an installed release's daemon at <AGENTLEE_HOME>/current, and refuses to install from a checkout (#143)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-home-")));
+    const release = path.join(home, "releases", "20261115-000000-abcdefabcdef");
+    for (const f of [
+      "scripts/install-launchd.sh",
+      "scripts/launchd-helper.mjs",
+      "ops/launchd/com.agentlee.server.plist",
+      "ops/launchd/com.agentlee.uptime.plist",
+    ]) {
+      fs.mkdirSync(path.dirname(path.join(release, f)), { recursive: true });
+      fs.copyFileSync(path.join(root, f), path.join(release, f));
+    }
+    fs.symlinkSync("releases/20261115-000000-abcdefabcdef", path.join(home, "current"));
+    const r = spawnSync("bash", [path.join(home, "current", "scripts/install-launchd.sh"), "print"], {
+      env: {
+        ...process.env,
+        AGENTLEE_NODE: process.execPath,
+        AGENTLEE_HOME: home,
+        AGENTLEE_LOG_DIR: "/Library/Logs/agentlee",
+      },
+      encoding: "utf8",
+    });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toMatch(new RegExp(`<key>WorkingDirectory</key>\\s*<string>${home}/current</string>`));
+    expect(r.stdout).toContain(`<string>${home}/current/apps/server/dist/index.js</string>`);
+    expect(r.stdout).not.toContain("releases/");
+    // A development checkout: print works (above), install refuses before sudo or any check.
+    const i = spawnSync("bash", [script, "install"], {
+      env: { ...process.env, AGENTLEE_NODE: process.execPath, AGENTLEE_HOME: home, SUDO_USER: "" },
+      encoding: "utf8",
+      input: "",
+    });
+    expect(i.status).not.toBe(0);
+    expect(i.stderr).toMatch(/run this from the installed release/);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
   it("refuses a node binary that lives in a per-shell temporary path", () => {
     const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-")), "fnm_multishells", "1", "bin");
     fs.mkdirSync(dir, { recursive: true });

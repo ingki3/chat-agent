@@ -13,10 +13,10 @@ describe("traceability (real documents)", () => {
 
   it("parses the PRD without structural problems", () => {
     expect(problems).toEqual([]);
-    expect(keys.filter((k) => k.startsWith("FR-"))).toHaveLength(100);
+    expect(keys.filter((k) => k.startsWith("FR-"))).toHaveLength(109);
     expect(keys.filter((k) => /^D\d+$/.test(k))).toHaveLength(8);
     expect(keys.filter((k) => k.startsWith("NFR "))).toHaveLength(11);
-    expect(keys.filter((k) => k.startsWith("AC-"))).toHaveLength(13);
+    expect(keys.filter((k) => k.startsWith("AC-"))).toHaveLength(14);
   });
 
   it("maps every PRD item to an issue in the 담당 이슈 column", () => {

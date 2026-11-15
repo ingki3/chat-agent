@@ -7,7 +7,9 @@
 #   pnpm -s launchd status
 #   pnpm -s launchd print-uptime | install-uptime | uninstall-uptime   # 5-minute uptime check (#46, §9)
 #
-# Overrides: AGENTLEE_USER (service account, default: you), AGENTLEE_NODE (node binary), AGENTLEE_LOG_DIR.
+# Run from the installed release (~/.chat-agent/current, docs/ops.md §43): the plist then points at that link.
+# Overrides: AGENTLEE_USER (service account, default: you), AGENTLEE_NODE (node binary), AGENTLEE_LOG_DIR,
+# AGENTLEE_HOME (release root, default <service home>/.chat-agent), AGENTLEE_ALLOW_CHECKOUT=1 (daemon from a checkout).
 set -euo pipefail
 
 LABEL=com.agentlee.server
@@ -44,7 +46,23 @@ resolve_node() {
 }
 NODE="$(resolve_node)"
 
-render() { AL_USER="$RUN_USER" AL_HOME="$RUN_HOME" AL_NODE="$NODE" AL_LOGDIR="$LOGDIR" "$NODE" "$HELPER" render "${1:-server}"; }
+# What the daemon runs (#143): from an installed release (`<AGENTLEE_HOME>/releases/<…>`, the release script's
+# layout) the stable `<AGENTLEE_HOME>/current` link, so a release switch + kickstart runs the new code without
+# reinstalling the plist. Node resolves the main module through the link: REPO_ROOT (and .env → shared/.env) is the
+# real release folder. From a development checkout: the checkout itself (print only — install refuses below).
+AL_HOME_DIR="${AGENTLEE_HOME:-$RUN_HOME/.chat-agent}"
+APP="$REPO"
+if [ -L "$AL_HOME_DIR/current" ] && [ "$(cd "$AL_HOME_DIR/current" 2>/dev/null && pwd -P)" = "$REPO" ]; then
+  APP="$AL_HOME_DIR/current"
+fi
+
+render() { AL_USER="$RUN_USER" AL_HOME="$RUN_HOME" AL_NODE="$NODE" AL_LOGDIR="$LOGDIR" AL_APP="$APP" "$NODE" "$HELPER" render "${1:-server}"; }
+
+# The daemon runs an installed release only, never a development checkout (docs/ops.md §43).
+require_release() {
+  [ "$APP" != "$REPO" ] || [ "${AGENTLEE_ALLOW_CHECKOUT:-}" = 1 ] \
+    || die "run this from the installed release: cd $AL_HOME_DIR/current && pnpm -s launchd ${1:-install} (docs/ops.md §43)"
+}
 
 preflight() {
   [ -f "$REPO/apps/server/dist/index.js" ] || die "server not built — run: pnpm build"
@@ -57,9 +75,10 @@ preflight() {
 case "${1:-}" in
   print) render ;;
   install)
+    require_release install   # before sudo: a checkout is refused without asking for a password
     if [ "$(id -u)" != 0 ]; then
       exec sudo /usr/bin/env AGENTLEE_USER="$RUN_USER" AGENTLEE_NODE="$NODE" AGENTLEE_LOG_DIR="$LOGDIR" \
-        bash "$0" install "${@:2}"
+        AGENTLEE_HOME="$AL_HOME_DIR" AGENTLEE_ALLOW_CHECKOUT="${AGENTLEE_ALLOW_CHECKOUT:-}" bash "$0" install "${@:2}"
     fi
     preflight
     if [ "${2:-}" != "--yes" ]; then
@@ -83,9 +102,10 @@ case "${1:-}" in
     ;;
   print-uptime) render uptime ;;
   install-uptime)
+    require_release install-uptime   # before sudo: a checkout is refused without asking for a password
     if [ "$(id -u)" != 0 ]; then
       exec sudo /usr/bin/env AGENTLEE_USER="$RUN_USER" AGENTLEE_NODE="$NODE" AGENTLEE_LOG_DIR="$LOGDIR" \
-        bash "$0" install-uptime
+        AGENTLEE_HOME="$AL_HOME_DIR" AGENTLEE_ALLOW_CHECKOUT="${AGENTLEE_ALLOW_CHECKOUT:-}" bash "$0" install-uptime
     fi
     [ -f "$REPO/node_modules/tsx/dist/cli.mjs" ] || die "tsx not installed — run: pnpm install"
     tok="$RUN_HOME/.agentlee/uptime-token"
@@ -106,5 +126,5 @@ case "${1:-}" in
   status)
     launchctl print "system/$LABEL" 2>/dev/null | grep -E "state =|pid =|last exit code" || echo "$LABEL not loaded"
     ;;
-  *) sed -n '2,10p' "$0"; exit 2 ;;
+  *) sed -n '2,13p' "$0"; exit 2 ;;
 esac

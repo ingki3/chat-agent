@@ -3,7 +3,8 @@
 <!--
   Agent Lee server as a LaunchDaemon: starts at boot before any user logs in, restarts on crash.
   Template — rendered by scripts/install-launchd.sh (placeholders __LIKE_THIS__). No secrets belong here:
-  settings come from <repo>/.env and the master key file (docs/ops.md).
+  settings come from <release>/.env (→ ~/.chat-agent/shared/.env) and the master key file (docs/ops.md §5, §43).
+  __REPO__ is ~/.chat-agent/current for an installed release: a release switch + kickstart runs the new code.
 -->
 <plist version="1.0">
 <dict>

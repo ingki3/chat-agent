@@ -6,14 +6,27 @@
 
 ## 1. 데이터와 키의 위치
 
+운영(가족이 쓰는 서버)은 개발 저장소와 분리된 `~/.chat-agent`에 설치한다(#143, 43절). 개발 체크아웃은 시험용 서버만 띄운다.
+
+| 대상 | 운영 위치 (43절) | 설정 |
+|---|---|---|
+| 배포 루트 | `~/.chat-agent/` (700) | `AGENTLEE_HOME`(배포 스크립트) |
+| 배포본 | `~/.chat-agent/releases/<UTC 날짜>-<sha 12자>/` — GitHub `main`의 `git archive`, 설치 후 바꾸지 않음, 최근 3개 보관 | `pnpm -s release` |
+| 실행 중인 배포본 | `~/.chat-agent/current` → `releases/…` (심볼릭 링크, 원자 전환) | — |
+| 설정 파일 | `~/.chat-agent/shared/.env` (600) — 배포본마다 `<배포본>/.env`가 이 파일을 가리키는 링크 | 관리자가 직접 편집(스크립트는 쓰지 않음) |
+| 데이터 디렉토리 | `~/.chat-agent/data/` | `DATA_DIR`(절대 경로) |
+| 백업 | `~/.chat-agent/backups/` — 매일 백업과 배포 직전 백업 | `BACKUP_DIR`(절대 경로) |
+| 서버 출력·pid (LaunchDaemon이 아닐 때) | `~/.chat-agent/logs/server.out.log`, `~/.chat-agent/run/server.pid` | — |
+| 마스터 키 | `~/.agentlee/master.key` (그대로) | `MASTER_KEY_PATH` |
+
 | 대상 | 기본 위치 | 설정 | 백업 |
 |---|---|---|---|
-| 데이터 디렉토리 (DB, 파일, 아티팩트, 런타임 홈) | `<repo>/data` | `DATA_DIR` | 아래 행별로 (#37, 21절) |
+| 데이터 디렉토리 (DB, 파일, 아티팩트, 런타임 홈) | `<repo>/data` (개발 기본값 — 운영은 `~/.chat-agent/data`) | `DATA_DIR` | 아래 행별로 (#37, 21절) |
 | SQLite DB | `<DATA_DIR>/agentlee.db` (WAL) | — | 포함(`VACUUM INTO` 스냅샷) |
 | 업로드 파일 (#22) | `<DATA_DIR>/files/<사용자 id>/<대화 id>/<파일 id>` — 이름은 서버가 만든 id뿐(사용자 파일 이름은 DB `files.name`에만), 폴더 700·파일 600. 받는 중인 파일은 `<DATA_DIR>/uploads-tmp/` | 24절 | `files/` 포함(DB와 같은 시점, 21.2절) · `uploads-tmp/` 제외 |
 | 그 밖의 파일 저장소 | `<DATA_DIR>/artifacts/`, `sources/` (지금은 아티팩트·출처가 DB에 있어 비어 있음) | — | 포함(DB와 같은 시점, 21.2절) |
 | 런타임 폴더 (#15–#18) | `<DATA_DIR>/runtimes/` — CLI 세션·캐시, 로그인 중 폴더, 격리 폴더 `.quarantine` | — | **포함하지 않음** — 21.1절 |
-| 백업 | `~/agentlee-backups/<id>/` | `BACKUP_DIR` | — (21절) |
+| 백업 | `~/agentlee-backups/<id>/` (개발 기본값 — 운영은 `~/.chat-agent/backups`) | `BACKUP_DIR` | — (21절) |
 | 암호화 마스터 키 | `~/.agentlee/master.key` | `MASTER_KEY_PATH` | **포함하지 않음** — 아래 3절 |
 | 서버 전용 스킬 폴더 (#21) | `<DATA_DIR>/skills/<스킬>/` (허용 목록 스킬의 복사본, 읽기 전용) | `pnpm skills:install` — 15절 | **포함하지 않음** — 복원 뒤 다시 설치(21.1절) |
 | 스킬 비밀 (#21, #30) | `.env`의 `ALPHAVANTAGE_API_KEY`·`OPENDART_API_KEY`·`GEMINI_API_KEY`·`SEC_USER_AGENT` | 15.3절, 19.1절 | `.env`와 같다 |
@@ -24,7 +37,8 @@
 | 금융 결과 (#30) | DB `finance_results` 표: 금융 도구를 쓴 답변마다 출처·기준 시각·숫자·식별자(후속 답변 검사용) | — 19.3절 | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
-- `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트 기준이다.
+- `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트(배포본에서는 그 배포본 폴더) 기준이다. **운영의 `shared/.env`에는 절대 경로만 쓴다** — 상대 경로면 데이터가 배포본 안에 생겨 정리(prune) 때 함께 지워진다. 배포 스크립트는 `DATA_DIR`·`BACKUP_DIR`이 비었거나 상대 경로이거나 `releases/` 안이면 설치를 거부한다(43.2절).
+- `.env`는 서버가 `REPO_ROOT/.env`에서 읽는다. `REPO_ROOT`는 `apps/server/dist`에서 계산하고, node는 시작 파일을 심볼릭 링크를 풀어 연다 — `~/.chat-agent/current/...`로 띄워도 `REPO_ROOT`는 실제 배포본 폴더이고, 그 안의 `.env` 링크를 따라 `shared/.env`를 읽는다.
 - 서버는 `MASTER_KEY_PATH`가 `DATA_DIR` 안에 있으면 시작을 거부한다.
 - `BACKUP_DIR`이 `DATA_DIR` 안(또는 `DATA_DIR`을 품는 곳), 레포 안이거나 마스터 키를 품으면 시작을 거부한다(21절).
 - **알려진 비밀 값 가림 (#14 리뷰 23~27차)**: 서버가 아는 비밀 값(연결 키·토큰, `.env` 비밀, 게이트 코드, 세션·MCP 토큰, 암호화되는 모든 값)은 저장·응답·스트림·런타임 전달 전에 가려진다. 스키마의 텍스트 열마다 쓰기 가림 또는 제외 이유가 `apps/server/src/secrets/columns.ts`에 있다. **받아들인 한계**: `users.email`과 `connections.account_email`은 식별자(관리자가 정하거나 공급자가 발급)라 저장값을 가리지 않는다 — 가리면 로그인이, 해시하면 관리자 화면과 Access 동기화(#36)가 깨진다. 이 값을 보여 주는 응답은 그래도 가려진다. 멱등 키(`runs.idempotency_key`)는 SHA-256으로만 저장한다.
@@ -40,6 +54,8 @@
   - 가리지 않는 것(시험): 인접 문자열과 `:`가 나오는 평범한 글 — 조건문·셸 줄·YAML·JSON·Python 문자열 값·템플릿·f-string·셸 brace 확장·함수 블록·산문(리뷰 #134 1~3차 사례 전부), 평범한 키가 되는 결합(`'user' 'name'`), 비밀 이름이 아닌 `$'a\x3db'`, 문자열 값 속 괄호, URL이 든 줄 주석 뒤 평범한 키, 아포스트로피·괄호가 섞인 산문.
 
 ## 2. 처음 설치
+
+**운영 서버는 43절(배포 스크립트)로 설치한다.** 아래는 개발 체크아웃에서 시험용 서버를 띄우는 순서다(운영 데이터·운영 `.env`를 쓰지 않는다).
 
 ```bash
 pnpm install
@@ -69,7 +85,7 @@ pnpm build && pnpm start
 
 확인할 때마다 날짜와 결과를 적는다. 값(토큰·쿠키)은 적지 않는다.
 
-- [ ] 재부팅 후 사용자 로그인 전에 LaunchDaemon 서비스가 마스터 키를 읽고 시작하는지 — 5.4절 절차. (Access 설정 뒤 앱 데몬을 설치하고 확인)
+- [ ] 재부팅 후 사용자 로그인 전에 LaunchDaemon 서비스가 마스터 키를 읽고 시작하는지 — 5.4절 절차. (43.4절 이전 때 앱 데몬을 설치한 뒤 확인)
 - [ ] `cloudflared` 데몬이 재부팅 후 사용자 로그인 없이 연결되는지
 - [ ] `lsof -nP -iTCP:3000 -sTCP:LISTEN`이 `127.0.0.1:3000`만 표시하는지
 - [ ] 실제 도메인 SSE 3분 측정 통과 — 8절, 결과 JSON을 #8에 첨부
@@ -92,17 +108,22 @@ pmset -g | grep -E ' sleep|disksleep|autorestart'
 
 ### 5.2 앱 데몬 설치
 
-**Access 애플리케이션이 `chat.2prostream.com`을 보호하기 전에는 설치하지 않는다.** 설치하는 순간 앱이 터널을 통해 인터넷에 열린다. 그 전에는 개발 모드(`pnpm dev`)로 필요할 때만 띄운다.
+**전제: Access 애플리케이션이 `chat.2prostream.com`을 보호하고 있어야 한다**(설치하는 순간 앱이 터널을 통해 인터넷에 열린다). 2026-11-15에 Access를 켰고 `TEMP_GATE_CODE`는 운영 `.env`에서 지웠다 — 이 전제는 충족됐다. LaunchDaemon 자동 시작은 승인됐고(사용자), 43.4절 이전 때 설치한다 — 그 전까지 운영 서버는 지금처럼 serve worktree에서 수동(nohup)으로 돈다.
+
+데몬은 **설치된 배포본에서** 설치한다(43절). 먼저 `pnpm -s release install`로 배포본이 있어야 한다.
 
 ```bash
-pnpm install && pnpm build
-pnpm keygen                      # 처음 한 번 (3절)
-pnpm -s launchd print            # 설치될 plist 확인 (변경 없음)
+pnpm keygen                      # 처음 한 번 (3절) — 키가 이미 있으면 거부
+cd ~/.chat-agent/current
+pnpm -s launchd print            # 설치될 plist 확인 (변경 없음) — 경로가 ~/.chat-agent/current인지 본다
+pnpm -s release stop             # 스크립트가 띄운 서버가 있으면 먼저 멈춘다(포트 3000을 비움)
 pnpm -s launchd install          # sudo · Access 보호 여부를 묻는다
 pnpm -s launchd status
 ```
 
 - 템플릿: `ops/launchd/com.agentlee.server.plist` → `/Library/LaunchDaemons/com.agentlee.server.plist` (root:wheel 644).
+- **plist는 `~/.chat-agent/current`를 가리킨다**(`WorkingDirectory`, `.../current/apps/server/dist/index.js`). 배포 스크립트가 `current`를 바꾸고 `kickstart -k`로 재시작하면 plist를 다시 설치하지 않아도 새 배포본이 돈다. 스크립트가 배포본 폴더(`~/.chat-agent/releases/…`)에서 실행되면 이 링크 경로를 쓰고, 개발 체크아웃에서는 `print`만 되고 `install`은 거부한다(데몬이 개발 폴더를 돌리지 않게. 꼭 필요하면 `AGENTLEE_ALLOW_CHECKOUT=1`). 배포 루트를 옮겼다면 `AGENTLEE_HOME=<루트>`.
+- 예전에 개발 체크아웃 경로로 설치한 plist가 있으면 배포 스크립트가 설치를 거부한다(`does not run …/current`) — 위 순서로 다시 설치한다.
 - 서비스는 설치한 사용자 계정으로 실행된다(`UserName`). `HOME`을 지정하므로 마스터 키 기본 위치 `~/.agentlee/master.key`가 그대로 쓰인다.
 - `node`는 실제 설치 경로로 고정한다. 버전 관리자(fnm 등)가 셸마다 만드는 임시 경로는 재부팅 뒤 사라지므로 스크립트가 거부한다. 필요하면 `AGENTLEE_NODE=/path/to/node`.
 - 설치 전에 빌드 결과를 확인하고, **서비스 계정으로** 서버와 같은 로더를 실행해 설정(`.env`)과 마스터 키(존재·32바이트·권한 600·심볼릭 링크 아님·안전한 부모 디렉토리)를 검사한다. 하나라도 틀리면 설치하지 않는다.
@@ -111,10 +132,14 @@ pnpm -s launchd status
 
 ### 5.3 업데이트 반영
 
+배포 스크립트로 한다(43.2절) — `main`을 받아 새 배포본을 만들고 검사한 뒤 `current`를 바꾸고 `kickstart -k`로 재시작, 확인에 실패하면 직전 배포본으로 돌아간다.
+
 ```bash
-git pull && pnpm install && pnpm build
-sudo launchctl kickstart -k system/com.agentlee.server
+pnpm -s release install           # GitHub main 최신 커밋 (sudo 암호를 물을 수 있음 — kickstart)
+pnpm -s release status
 ```
+
+개발 체크아웃의 `git pull && pnpm build`로 운영을 바꾸지 않는다.
 
 ### 5.4 재부팅 확인 절차
 
@@ -137,15 +162,15 @@ sudo launchctl kickstart -k system/com.agentlee.server
 - 데몬 로그: `/Library/Logs/com.cloudflare.cloudflared.err.log`.
 - 관리자 화면 시스템 상태의 터널 칸은 `cloudflared` 자체 메트릭 서버를 읽는다(20.5절). 설정하지 않으면 "미설정"이다.
 
-## 7. Cloudflare Access (마지막 단계 — 관리자)
+## 7. Cloudflare Access (관리자)
 
-앱 데몬 설치(5.2) 전에 반드시 한다.
+앱 데몬 설치(5.2)의 전제. **2026-11-15에 켰다**(`TEMP_GATE_CODE`는 운영 `.env`에서 지움). 아래는 다시 설정하거나 확인할 때의 절차다.
 
-1. Zero Trust → Access → Applications → Add → Self-hosted. 도메인 `chat.2prostream.com`(경로 비움 = 전체).
+1. Zero Trust → Access controls → Applications → Add an application → Self-hosted. 도메인 `chat.2prostream.com`(경로 비움 = 전체).
 2. 로그인 방식: **One-time PIN**(이메일 코드).
 3. 정책: Allow · Include · Emails → `ingki3@gmail.com`만. 가족은 계정을 만든 뒤 10절 절차로 추가.
 4. 세션 기간은 기본값(24시간)으로 둔다.
-5. 애플리케이션 개요의 **AUD 태그**를 `.env`의 `CF_ACCESS_AUD`에, 팀 도메인(`<team>.cloudflareaccess.com`, Zero Trust → Settings → Custom Pages에 표시)을 `CF_ACCESS_TEAM_DOMAIN`에 넣고 재시작한다. 저장소에는 넣지 않는다.
+5. **AUD 태그**: Zero Trust → Access controls → Applications → 그 앱의 **Edit** → **Additional settings** → **Application Audience (AUD) Tag**(64자)를 `~/.chat-agent/shared/.env`의 `CF_ACCESS_AUD`에 넣는다. **팀 도메인**: Zero Trust → **Settings**에 보이는 팀 이름(Team name)으로 `<팀 이름>.cloudflareaccess.com`을 `CF_ACCESS_TEAM_DOMAIN`에 넣는다. 그다음 `pnpm -s release restart`(데몬이면 `sudo launchctl kickstart -k system/com.agentlee.server`). 저장소·메신저에는 넣지 않는다.
    - 서버는 `chat.2prostream.com`으로 온 모든 요청(페이지·정적 파일·API)에서 `Cf-Access-Jwt-Assertion`을 검증한다(서명·`iss`·`aud`·만료, 키는 팀 JWKS에서 받아 캐시). 실패하면 403.
    - 두 값이 없으면 공개 도메인 요청은 모두 403(`access_not_configured`)이다. 7.1의 임시 접속 코드를 켠 경우만 예외.
    - Access로 들어온 이메일과 다른 앱 계정으로는 로그인할 수 없고, 기존 세션도 거부된다.
@@ -154,7 +179,7 @@ sudo launchctl kickstart -k system/com.agentlee.server
 
 ### 7.1 임시 접속 코드 (Access 전 테스트용)
 
-Access를 설정하기 전에 실제 도메인으로 시험해야 할 때만 쓴다.
+Access를 설정하기 전에 실제 도메인으로 시험해야 할 때만 쓴다. **지금은 쓰지 않는다**(Access 켬, 2026-11-15) — 기록으로 남긴다.
 
 - `.env`에 `TEMP_GATE_CODE=<8자 이상>`을 넣으면 공개 도메인으로 온 모든 페이지·정적 파일·API가 `/gate` 코드 입력 화면 뒤로 간다(집 안 `localhost` 접속은 코드 없이 앱 로그인만). 코드는 `.env`에만 두고 저장소·메신저에 남기지 않는다.
 - 맞는 코드를 넣으면 7일짜리 서명 쿠키(HttpOnly, SameSite=Lax, https면 Secure)를 준다. 서버를 재시작하거나 코드를 바꾸면 모두 다시 입력해야 한다.
@@ -215,7 +240,7 @@ rm ~/.agentlee/probe-headers.txt
 **Access를 켠 뒤(7절)에만 시작한다.** 임시 접속 코드 단계에서는 외부 체크가 코드 화면에 막혀 의미가 없다.
 
 1. Zero Trust → Access → Service Auth → **Service Tokens → Create**(이름 `agentlee-uptime`, 기간 1년). Client ID·Secret은 이때 한 번만 보인다.
-2. Access → Applications → Agent Lee → 정책 추가: Action **Service Auth**, Include **Service Token = agentlee-uptime**. 서버는 서비스 토큰(이메일 없는 Access JWT)을 **`GET /api/health`에만** 허용하고 그 밖의 경로는 403이다.
+2. Access controls → Applications → Agent Lee → Edit → Policies → 정책 추가: Action **Service Auth**, Include **Service Token = agentlee-uptime**. 서버는 서비스 토큰(이메일 없는 Access JWT)을 **`GET /api/health`에만** 허용하고 그 밖의 경로는 403이다.
 3. 토큰 파일(권한 600, 편집기로 넣는다 — 셸 기록에 남지 않게):
    ```bash
    install -m 600 /dev/null ~/.agentlee/uptime-token && open -e ~/.agentlee/uptime-token
@@ -237,7 +262,7 @@ rm ~/.agentlee/probe-headers.txt
 ## 10. 가족 이메일 추가 (수동, 자동 동기화 #36 전까지)
 
 1. 앱 관리자 화면에서 가족 계정을 만든다(#41).
-2. Zero Trust → Access → Applications → Agent Lee → 정책 → Include Emails에 그 가족 이메일을 추가하고 저장한다.
+2. Zero Trust → Access controls → Applications → Agent Lee → Edit → Policies → Include Emails에 그 가족 이메일을 추가하고 저장한다.
 3. 가족에게 임시 비밀번호를 직접 전달하고, 휴대폰에서 Access 코드 로그인 → 앱 로그인이 되는지 함께 확인한다.
 4. 가족을 비활성화하면 같은 정책에서 이메일을 지운다. **관리자 이메일(`ingki3@gmail.com`)은 지우지 않는다.**
 
@@ -750,6 +775,7 @@ DB와 파일을 같은 시점으로 매일 백업하고, 서버를 멈춘 상태
 
 - 백업 폴더 `BACKUP_DIR`(기본 `~/agentlee-backups`)은 `DATA_DIR` 밖이어야 한다(복원이 `DATA_DIR`을 통째로 바꾸므로), 레포 밖이어야 한다(실수로 커밋되지 않게), 마스터 키를 품으면 안 된다 — 어기면 시작을 거부한다. 폴더는 700, 백업 폴더도 700, 파일은 모두 600이다(느슨하면 백업할 때 다시 조인다).
 - 디스크 고장에 대비하려면 `BACKUP_DIR`을 Time Machine이나 외장 디스크에 함께 복사한다. 키는 같은 곳에 두지 않는다(3절).
+- **배포 직전 백업 (#143, 43.2절)**: `pnpm -s release install`이 새 배포본으로 바꾸기 전에 같은 형식의 백업을 `BACKUP_DIR`에 하나 더 만든다(id는 같은 모양, 배포본의 `.release-info`에 `predeploy_backup=<id>`로 남는다). 보관 규칙은 매일 백업과 같다(7일). 운영에서 `pnpm -s restore …`는 `~/.chat-agent/current`에서 실행한다(그 배포본의 `.env` → `shared/.env`).
 
 ### 21.2 같은 시점 (일관 기준점)
 - DB는 `VACUUM INTO`로 복사한다: 한 문장·한 읽기 트랜잭션이라 그 순간의 DB 그대로다(다른 연결이 쓰는 중이어도). 새로 쓰는 파일이라 지운 행이 빈 페이지에 남지 않는다 — 지운 대화가 이후 백업에 남지 않는 이유(온라인 백업 API는 페이지를 그대로 복사해 지운 내용이 남을 수 있어 쓰지 않았다).
@@ -1357,6 +1383,8 @@ PRD §7 `python-scratchpad`, NFR 격리. 방식과 근거는 `docs/decisions/iso
 ### 35.2 설치 (한 번 — 관리자, `sudo` 필요)
 런처는 호출자(서버)가 준 경로를 믿지 않는다. 작업(run/probe/reap/clean/verify)과 **작업 id(UUID)**만 받고, 인터프리터·runner.py·패키지·scratch는 **루트 소유 설정 파일**에서 읽는다. 그래서 런처·설정·runner·인터프리터 트리·패키지 트리는 모두 **루트 소유, 비(非)루트 변경 불가**여야 한다. 런처는 실행마다 (1) 각 경로의 **조상 전체**(`/`까지 — 루트 소유, 그룹·기타 쓰기 없음, 심볼릭 링크 없음, 쓰기 계열 ACL 허용 항목 없음)와 (2) 두 트리의 **모든 노드**(lstat로 소유자·모드, 트리마다 한 번 엄격 파싱한 `ls -leRA`로 모든 ACL 항목 — 노드 수까지 대조)를 확인하고, 하나라도 아니거나 stat·opendir·ls가 실패하면 거부한다. 거부되는 ACL 허용 권한: `write`·`delete`·`append`·`writeattr`·`writeextattr`·`writesecurity`·`chown`·`add_file`·`add_subdirectory`·`delete_child`(누구에게든). `deny` 항목은 괜찮다(예: 홈의 `group:everyone deny delete`). 홈 아래 uv 경로는 전용 계정이 통과하지 못하므로, 프로그램 일체를 루트 소유 위치로 복사한다.
 
+**운영 배포본과의 관계 (#143, 43.6절)**: 런처가 믿는 경로(런처·설정·interpreter·runner·packages)는 모두 루트 소유 고정 위치(`/usr/local/…`)에 **복사본**으로 있고, `~/.chat-agent/current`(심볼릭 링크)나 배포본 폴더를 가리키지 않는다 — 신뢰 경로에 링크가 없다. 아래 `pnpm`·`cp` 명령은 `~/.chat-agent/current`에서 실행한다(복사 원본일 뿐). `scratch=`는 `DATA_DIR`(`~/.chat-agent/data`)의 **실제 경로**를 적고, `~/.chat-agent`(700)도 막힌 조상이므로 6)의 search 항목을 더한다. 배포로 `apps/server/scratchpad/runner.py`가 바뀌면 다시 복사한다(배포 스크립트가 `python_run`이 켜져 있으면 알려 준다).
+
 먼저 인터프리터와 패키지(서버용, `pnpm python:install`), 그 다음 루트 소유 복사:
 ```
 uv python install 3.12
@@ -1770,6 +1798,8 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 
 ### 41.2 설치 (한 번 — 관리자, `sudo` 필요. 서버는 sudo를 쓰지 않는다)
 서버 계정을 `agentlee`, 데이터 폴더를 `<DATA_DIR>`(절대 실제 경로)로 가정한다.
+
+**운영 배포본과의 관계 (#143, 43.6절)**: 번들은 `/usr/local/lib/agentlee-workers`에 루트 소유 **복사본**으로 설치되고 런처·설정도 `/usr/local/…`에 있어, 신뢰 경로에 `~/.chat-agent/current` 링크나 배포본 폴더가 들어가지 않는다. 1)은 `~/.chat-agent/current`에서 실행한다. `scratch=`는 `~/.chat-agent/data/worker-scratch`의 실제 경로이고, 8)의 search 항목은 `~/.chat-agent`(700)에도 필요하다. 시작 자가 검사의 `bundle` 단계는 설치된 번들의 지문을 **지금 도는 배포본**과 비교하므로, 새 배포본을 설치할 때마다 1)·2)를 다시 한다(배포 스크립트가 `WORKER_RUN_USER`가 설정돼 있으면 알려 준다).
 ```
 # 0) 헤드리스 셸(내보내기와 같은 것)이 있어야 번들이 만들어진다
 pnpm exec playwright install --only-shell chromium
@@ -1835,7 +1865,7 @@ pnpm workers:check         # 권위 있는 검사: 서버 시작 때와 같은 �
 TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.ts
 ```
 - `pnpm workers:check`가 `extract: ok (uid <계정 uid>, KERN_PROCARGS2 blocked; …)`·`docgen: ok …`·`render: ok …`를 찍어야 한다. 그 뒤 **서버를 다시 시작**한다(검사는 시작 때 한 번 돌고 결과를 기억). 관리자 → 시스템 상태 → 샌드박스 작업자 격리의 세 줄이 모두 `전용 계정으로 격리`여야 한다.
-- **업데이트 때마다(작업자 코드·lock·node 변경 — 사실상 `git pull`마다) 1)·2)를 다시** 한다. 안 하면 `bundle` 단계가 실패해 그 종류들은 같은 UID 샌드박스로 돌아가고 상태가 `자가 검사 실패 (bundle)`로 바뀐다(옛 작업자 코드를 계정으로 돌리지 않는다).
+- **업데이트 때마다(작업자 코드·lock·node 변경 — 사실상 `pnpm -s release install`마다) 1)·2)를 다시** 한다. 안 하면 `bundle` 단계가 실패해 그 종류들은 같은 UID 샌드박스로 돌아가고 상태가 `자가 검사 실패 (bundle)`로 바뀐다(옛 작업자 코드를 계정으로 돌리지 않는다).
 - 되돌리기: `.env`에서 `WORKER_RUN_USER`를 지우고 재시작하면 세 작업자 모두 같은 UID 샌드박스(상태: 미설정)로 돈다.
 
 ### 41.3 확인 방법
@@ -1843,3 +1873,103 @@ TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.t
 - macOS(자동): 운영 파일에서 상수 줄만 바꾼 **완화 사본**(자기 계정)을 실제 번들(APFS 복제)에 붙여 — verify 통과, 추출(텍스트·PDF·스캔 PDF OCR)과 문서 4형식, 호출자가 넣은 모듈 경로 무시, 자가 검사의 run·identity 단계와 bundle 지문, probe(같은 UID는 readable, 루트 프로세스는 blocked, 사라진 pid는 error), 중계 파이프로 PNG 렌더, 렌더 시간 초과 124와 `status=timeout`, reap로 실행 중 브라우저 종료, 메모리 한도 125 → `doc_limit`, 잘못된 인자·트리의 그룹 쓰기 파일 거부(64), 다른 작업 폴더 읽기 실패, verify가 모드 `000` 트리 파일의 `allow read,only_inherit`를 읽기 불가로 판정하고 플래그 없는 `allow read`는 통과(#125).
 - 실계정(`TEST_WORKER_RUN_USER`): 세 종류 자가 검사가 다른 UID·`KERN_PROCARGS2` 차단으로 통과. 이 환경(개발 기계)에서는 계정·sudo가 없어 미실행 — 설치 후 위 명령으로 확인한다.
 - e2e(`e2e/admin.spec.ts`): 계정 미설정에서 시스템 상태의 세 작업자가 `계정 격리 안 됨`과 41절 안내를 보인다.
+
+## 43. 운영 배포 — `~/.chat-agent` 설치·업데이트·되돌림·데이터 이전 (#143)
+개발 환경과 운영 환경을 나눈다. 운영 배포본은 GitHub `main`에서 받아 `~/.chat-agent`에 설치하고, 업데이트·되돌림도 같은 스크립트(`scripts/release.sh`, `pnpm -s release …`)로 한다. 운영 데이터는 개발 저장소 밖(`~/.chat-agent/data`)에 둔다.
+
+### 43.1 구조와 원칙
+```
+~/.chat-agent/              (700)
+  src.git                   GitHub 저장소 미러(bare) — 배포 소스
+  releases/<UTC 날짜>-<sha 12자>/   배포본. 설치 후 바꾸지 않음, 최근 3개 보관(prune)
+  current -> releases/…     실행 중인 배포본 (LaunchDaemon·스크립트가 이 경로로 띄움)
+  shared/.env               (600) 관리자가 직접 편집. 배포본마다 <배포본>/.env → ../../shared/.env 링크
+  data/                     DATA_DIR
+  backups/                  BACKUP_DIR (매일 백업 + 배포 직전 백업)
+  logs/ run/                스크립트가 띄운 서버의 출력·pid (LaunchDaemon이면 /Library/Logs/agentlee)
+  .release.lock             동시 실행 막는 잠금(flock)
+```
+- 소스는 미러의 커밋을 `git archive`로 푼 것뿐이다 — 개발 폴더의 미커밋 변경·빌드 결과와 무관하다.
+- 스크립트는 서비스 계정(서버를 돌리는 계정)으로 실행한다(root 거부). sudo는 LaunchDaemon 재시작(`kickstart`)에만 쓴다.
+- **`.env`를 쓰거나 고치지 않는다**(권한도 바꾸지 않는다). `shared/.env`가 없거나, 링크이거나, 600이 아니면 멈추고 할 일을 알려 준다. 값은 어디에도 찍지 않는다 — 출력은 경로·id·개수·상태 코드뿐이다(쿠키·헤더도 없음).
+- 배포본 폴더 안의 파일은 pnpm 저장소와 하드 링크로 이어져 있을 수 있다 — 손으로 고치지 않는다(고칠 일이 있으면 새 커밋으로 배포).
+- 바꿀 수 있는 값(시험·특수 상황): `AGENTLEE_HOME`(루트), `AGENTLEE_SOURCE`(git 주소·경로, 기본 `https://github.com/ingki3/chat-agent.git`), `AGENTLEE_NODE`, `AGENTLEE_HEALTH_TIMEOUT`(초, 기본 90), `AGENTLEE_LAUNCHD_PLIST`(이 파일이 있으면 LaunchDaemon 모드).
+
+### 43.2 설치·업데이트 (`install`)
+```bash
+pnpm -s release install                 # 브랜치 main 최신 커밋 (refs/heads/main — 이름이 main인 태그가 아님)
+pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이름이 겹치면(브랜치·태그, 커밋 id) 거부 → refs/heads/… 또는 refs/tags/…, 커밋은 40자 전체만(대소문자 무관, 소문자로 기록 — 커밋 id처럼 보이는 이름이 어떤 대소문자로든 브랜치·태그면 거부)
+```
+순서 — 하나라도 실패하면 그 자리에서 멈추고(새 폴더는 지움) `current`는 그대로다:
+1. 잠금 → `shared/.env` 확인(있음·일반 파일·내 소유·600). LaunchDaemon이 설치돼 있으면 plist가 `~/.chat-agent/current`를 돌리는지 확인(아니면 5.2절대로 다시 설치하라고 멈춤).
+2. 미러 fetch → `--ref`(기본 `refs/heads/main`)를 전체 ref 이름으로 정해(같은 이름의 브랜치·태그가 둘 다 있으면 거부) 커밋으로 확인. 이미 `current`가 같은 커밋이면 끝(`--force`로 다시 설치).
+3. `releases/<UTC 날짜>-<sha>/`에 `git archive`를 풀고 `.release-info`(sha·ref·시각·직전 배포본)를 적는다.
+4. `pnpm install --frozen-lockfile --prefer-offline`(lock 그대로, 저장소에 있는 패키지 먼저) → `pnpm build`. 빌드 결과(`apps/server/dist`, `apps/web/dist/index.html`, 릴리스 도구)가 있는지 확인.
+5. `.env` 링크(`../../shared/.env`)를 만든다.
+6. **운영 설정 사전 검사** — LaunchDaemon 설치의 검사(`launchd-helper.mjs check`: 설정 로드 + 마스터 키 존재·32바이트·600·링크 아님·안전한 부모)를 데몬과 같은 환경(`env -i`, `NODE_ENV=production`, 서비스 계정)으로 새 배포본에서 돌리고, 이어 `DATA_DIR`·`BACKUP_DIR`이 `shared/.env`에 **절대 경로로** 있고 `releases/` 밖인지 본다(`dist/cli/release.js config`).
+7. DB가 없으면 시작하지 않는다(`--no-start`로 설치만, 또는 `--fresh`로 빈 DB에서 시작) — 이전(43.4절)을 빼먹고 빈 데이터로 뜨는 것을 막는다.
+8. **배포 직전 백업 + 무결성** — 서버가 도는 중에도 안전하다: 운영 DB를 **읽기 전용**으로 열어 `VACUUM INTO`(한 읽기 트랜잭션 = 한 시점)로 먼저 비공개 스냅샷을 만들고, **그 스냅샷에서** 복사할 파일 목록(`FILE_REFERENCES`)과 뺄 폴더(삭제 작업)를 읽어 파일 저장소를 복사한 21절 형식의 백업을 — 운영 DB에서 읽으면 그 사이 서버가 지운 첨부가 빠진 채 통과할 수 있다(스냅샷이 가리키는 파일이 없으면 실패) — `BACKUP_DIR` 안 비공개 임시 폴더에서 만든 뒤 이름을 바꿔 넣는다. 이어 `pnpm -s restore check`와 같은 검사(키·해시·`integrity_check`·스키마·모든 암호문 복호화)를 **새 배포본의 마이그레이션 목록**으로 한다 — DB가 새 배포본보다 새 스키마면(`schema_newer`, 옛 커밋을 설치하려는 경우) 멈춘다. id를 `.release-info`의 `predeploy_backup=`에 적는다. 배포 직전 백업은 `BACKUP_DIR`마다 한 번에 하나만 돈다(`BACKUP_DIR/.predeploy.lock.db` 커널 잠금 — 두 배포 루트가 `BACKUP_DIR`을 같이 써도, 도구를 직접 불러도). 잠금을 잡은 뒤에만 죽은 실행이 남긴 `.predeploy-*`를 지우고, 이미 돌고 있으면 `backup_running`으로 거부한다. 서버의 매일 백업(`.tmp-*`)과는 겹치지 않는다.
+9. 새 배포본에 직전 배포본에 없던 마이그레이션(drizzle `_journal.json`의 태그)이 있으면 알린다 — 서버가 시작할 때 적용된다.
+10. (LaunchDaemon이 아니면) 포트에 **이 설치의 서버가 아닌** 프로세스가 있으면 멈춘다 — 다른 서버를 죽이지 않는다.
+11. `current`를 원자적으로 바꾼다(새 링크를 만들어 `rename`).
+12. 재시작: LaunchDaemon이면 `sudo launchctl kickstart -k system/com.agentlee.server`. 아니면 `run/server.pid`의 프로세스(또는 포트의 리스너)가 **이 설치의 서버일 때만**(명령줄이 `~/.chat-agent/current|releases/…/apps/server/dist/index.js`) SIGTERM(30초 뒤 SIGKILL)으로 멈추고, `nohup env -i … node …/current/apps/server/dist/index.js < /dev/null &`로 띄운다(출력 `logs/server.out.log`).
+13. **확인** (`scripts/release-verify.mjs`, 최대 `AGENTLEE_HEALTH_TIMEOUT`초): `GET /api/health`가 200 `{"status":"ok"}`, `/`가 **이 배포본의** `index.html`과 같은 자산 목록을 내고, 그 JS·CSS가 각각 200 + `text/javascript`·`text/css`로 온다. 옛 서버가 남아 새 `dist`를 서비스하면 자산 경로가 SPA 페이지(`text/html`)로 와서 실패한다(실제로 겪은 경우). 상태 코드·형식·경로만 찍는다.
+14. 성공이면 오래된 배포본 정리(`prune --keep 3`). **실패면** 그 배포본에 `.failed`를 남기고 직전 배포본으로 `current`를 되돌려 재시작·확인한다. 되돌린 뒤 실패한 배포본이 마이그레이션을 더했으면 43.3절의 DB 복원 안내를 찍는다. 종료 코드 1.
+15. 알림: `WORKER_RUN_USER`가 설정돼 있으면 작업자 번들을 다시 설치하라고(41.2절 1·2), `python_run`이 켜져 있으면 `runner.py` 복사를 확인하라고(35.2절) 찍는다.
+
+### 43.3 상태·되돌림·정리
+```bash
+pnpm -s release status                  # current·배포본 목록(failed/incomplete 표시)·서비스·health·잠금
+pnpm -s release rollback                # 직전 배포본으로 (current의 .release-info previous, 없으면 그 앞의 정상 배포본)
+pnpm -s release rollback --to <배포본>
+pnpm -s release prune [--keep 3]        # current + 최신 정상 배포본 (keep-1)개만 남김, 실패·미완성은 지움
+pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchDaemon이면 stop 대신 launchctl bootout)
+```
+- 되돌림은 코드만 바꾼다. **떠나는 배포본이 마이그레이션을 더했으면** 경고한다(자동 복귀가 실패해도 찍는다): DB는 이미 새 스키마일 수 있고(옛 코드도 대개 뜨지만 보장하지 않는다), 대상 배포본의 스키마로 데이터를 돌리려면 배포 직전 백업을 복원해야 한다 — 그 뒤에 쓴 내용은 잃는다.
+- **어느 백업인가**: 떠나는 배포본에서 `previous`를 따라가 대상 바로 다음에 설치된 배포본의 배포 직전 백업(대상이 돌던 때의 데이터)이다. A→B→C(B·C 모두 마이그레이션)에서 C→A로 가면 C의 백업은 B 스키마라 A가 `schema_newer`로 거부하므로 B의 백업을 고른다. 고른 백업은 **대상 배포본의 코드로** `restore check`와 같은 검사(`release.js check-backup`)를 통과해야 제안된다. 못 찾거나 통과하지 않으면 그렇다고 쓰고 `restore list`·`check`로 대상이 돌던 때의 백업을 고르라고 안내한다. 경고가 찍는 명령:
+  ```bash
+  sudo launchctl bootout system/com.agentlee.server     # 또는: pnpm -s release stop
+  cd ~/.chat-agent/releases/<대상 배포본>          # 되돌린 뒤라면 = current
+  pnpm -s restore check <predeploy id>
+  pnpm -s restore apply <predeploy id> --yes            # 기존 데이터는 <DATA_DIR>.before-restore-*로 옮겨 둠 (21.4절)
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.agentlee.server.plist   # 또는: pnpm -s release restart
+  ```
+- 실패한 배포본(`.failed`)과 미완성(`.incomplete`)은 되돌림 대상이 되지 않는다. `prune`은 `current`를 지우지 않는다.
+
+### 43.4 1회 이전 절차 (개발 저장소 → `~/.chat-agent`)
+지금: dev 체크아웃 worktree(`.claude/worktrees/serve`)에서 수동 nohup, `DATA_DIR`이 `<repo>/data`. 이 PR이 `main`에 들어간 뒤 한 번 한다.
+1. **서버 정지** — `lsof -nP -iTCP:3000 -sTCP:LISTEN`으로 pid를 보고 `kill <pid>`. 포트가 비었는지 다시 본다.
+2. **`.env` 이전(관리자가 직접)** — 스크립트는 `.env`를 쓰지 않는다.
+   ```bash
+   mkdir -p -m 700 ~/.chat-agent/shared
+   mv <serve worktree>/.env ~/.chat-agent/shared/.env && chmod 600 ~/.chat-agent/shared/.env
+   ```
+   편집기로 `DATA_DIR=/Users/<계정>/.chat-agent/data`, `BACKUP_DIR=/Users/<계정>/.chat-agent/backups`(둘 다 절대 경로)로 바꾸고, 개발용 값(`FAKE_RUNTIME` 등)이 있으면 지운다. `NODE_ENV`는 스크립트·데몬이 `production`으로 준다. Access 값(`CF_ACCESS_TEAM_DOMAIN`·`CF_ACCESS_AUD`)은 그대로 두고, `TEMP_GATE_CODE`는 없어야 한다(Access를 켜면서 지움, 7.1절).
+3. **설치만** (DB가 아직 없으므로): 개발 체크아웃(최신 `main`)에서 `pnpm -s release install --no-start`. 사전 검사(설정·키)가 여기서 통과해야 한다.
+4. **데이터 복사**: `pnpm -s release migrate-data --from /Users/<계정>/Dev/chat-agent/data`
+   - 서버가 멈춰 있어야 한다(두 폴더의 데이터 잠금을 복사 내내 잡는다 — 서버·복원이 잡고 있으면 `server_running`). LaunchDaemon은 plist가 있어도 `launchctl print`로 **등록돼 있을 때만** 거부한다(`bootout` 뒤에는 진행 — 최종 판단은 데이터 잠금). `agentlee.db`(와 `-wal`·`-shm`·`-journal`)가 심볼릭 링크면 거부한다(복사본을 쓰기로 열 때 원본을 바꾸지 않게). 대상(`DATA_DIR`)이 비어 있지 않으면 거부, 옆에 끊긴 복원 일지가 있으면 거부.
+   - `DATA_DIR` 옆 임시 폴더로 복사(macOS `ditto` — 모드·그룹·ACL 보존)하고, 원본과 항목마다(종류·모드·크기·링크 대상) 같은지, 복사본 DB의 `PRAGMA integrity_check`가 `ok`인지 확인한 뒤에야 제자리로 이름을 바꾼다. **원본은 건드리지 않는다.**
+   - 복사본에서 런타임 세션을 모두 무효로 표시한다(43.5절) — 다음 턴은 서버 기록으로 새 세션을 시작한다.
+5. **시작·확인** (데몬 설치 전 잠깐): `pnpm -s release restart` → `healthy`. 로그인 → 대화·첨부·아티팩트가 보이는지, 설정 → 내 런타임 연결 → 테스트. 스킬: `cd ~/.chat-agent/current && pnpm skills:install`.
+6. **자동 시작 (바로 이어서)**: 5의 확인이 끝나면 `pnpm -s release stop` → `cd ~/.chat-agent/current && pnpm -s launchd install`(5.2절 — Access 보호를 묻는 질문에 y; 전제는 충족됨) → `pnpm -s launchd status`, `pnpm -s release status`(service: LaunchDaemon, health ok). 가동률 점검은 `pnpm -s launchd install-uptime`(9.3절). 이후 업데이트는 `pnpm -s release install`(sudo 암호 — kickstart). 재부팅 확인은 5.4절.
+7. **정리**: 며칠 문제가 없으면 serve worktree를 지우고(`git worktree remove .claude/worktrees/serve`), 옛 데이터 폴더(`<repo>/data`)와 그 옆 잠금(`<repo>/.data.lock.*`)을 지운다. 옛 `BACKUP_DIR`(예 `~/agentlee-backups`)의 백업은 경로로도 복원할 수 있으니(`pnpm -s restore check <폴더>`) 7일 지나면 지우거나 새 `backups/`로 옮긴다.
+- 전용 계정(python·작업자)을 설치했다면 `/usr/local/etc/agentlee-python.conf`·`agentlee-worker.conf`의 `scratch=`를 새 `DATA_DIR` 기준 실제 경로로 고치고(sudo), scratch 폴더의 그룹·ACL(35.2절 5·6, 41.2절 7·8)과 `~/.chat-agent`의 search 항목을 확인한다. (2026-11-15 기준 이 Mac에는 설치돼 있지 않다.)
+
+### 43.5 절대 경로 조사 (데이터를 옮겨도 되는가)
+2026-11-15 운영 데이터를 읽기만 해서 확인했다(DB는 `immutable=1`로 열어 열마다 개수만 셈).
+- **DB**: 모든 표·열에서 `/Users/`·`chat-agent`·`/private/`·`/tmp/`를 담은 값 0개. 파일 경로는 `DATA_DIR` 기준 상대 경로(`files/<사용자>/<대화>/<id>`)로만 다루고, 연결 폴더(`runtimes/<연결>/<사용자>`)도 실행할 때 `DATA_DIR`에서 계산한다 — 옮겨도 그대로 맞다.
+- **`runtimes/`의 Claude 세션**: Claude는 대화 기록을 `config/projects/<작업 폴더의 절대 경로를 '-'로 바꾼 이름>/<세션 id>.jsonl`에 두고, 작업 폴더(`runtimes/…/work`)는 `DATA_DIR` 안이다. 옮기면 같은 세션을 이어갈 때 CLI가 새 경로 이름의 폴더를 찾다 실패한다(실제 데이터에 `-Users-…-Dev-chat-agent-data-runtimes-…-work` 폴더 1개, 그 아래 jsonl과 `home/Library/Caches/claude-cli-nodejs/<같은 이름>/mcp-logs-*`에 옛 절대 경로).
+- **Codex**: `CODEX_HOME`의 `config.toml`은 시작마다 다시 쓰지만, 스레드 기록(rollout)과 상태 DB에 작업 폴더·파일 경로가 절대 경로로 남는다(지금은 Codex 연결 없음).
+- **대응**: `migrate-data`가 복사본 DB에서 `runtime_sessions`를 모두 `invalidated = 1`로 한다(복원 21.4절과 같은 방식). 다음 턴은 새 CLI 세션으로 시작하고 맥락 빌더(27절)가 서버 기록으로 이어 준다 — 대화 기록·연결·로그인 토큰(DB 암호문)은 그대로다. 옛 세션 파일은 남지만 쓰이지 않고 세션 정리(#54, 38절)가 지운다.
+- 그 밖의 절대 경로: 전용 계정 설정 파일의 `scratch=`(43.4절 끝), python 패키지 폴더(`python-packages/` — 문제가 보이면 `pnpm python:install` 재실행). 데이터 폴더 잠금(`.data.lock.db`)은 데이터 폴더 옆이라 새 위치에서 새로 생긴다.
+
+### 43.6 전용 계정(python·작업자)의 신뢰 경로
+- 런처(`/usr/local/libexec/agentlee-python-run`, `agentlee-worker-run`)는 신뢰하는 경로의 조상 전체에 심볼릭 링크가 없고 루트 소유인지 확인한다. 그 경로들 — 런처·설정(`/usr/local/etc/…`)·interpreter·runner·packages(`/usr/local/lib/agentlee-python`)·작업자 번들(`/usr/local/lib/agentlee-workers`) — 은 모두 **루트 소유 고정 위치의 복사본**이고, `~/.chat-agent/current` 링크나 배포본 폴더를 가리키지 않는다. 그래서 링크로 전환하는 배포 구조와 충돌하지 않는다.
+- 런처가 받는 경로 중 사용자 쪽은 `scratch`(`<DATA_DIR>/scratch`, `<DATA_DIR>/worker-scratch`)뿐이다. `DATA_DIR`은 링크가 아닌 실제 폴더(`~/.chat-agent/data`)이고 `current` 아래가 아니다 — 설정에는 실제(정규) 경로를 적는다. `~/.chat-agent`가 700이므로 그 계정이 scratch까지 지나가려면 `~/.chat-agent`에도 그룹 search ACL을 더한다(35.2절 6, 41.2절 8 — `setup-check`의 "scratch traversal"이 알려 준다).
+- 서버 쪽: 자가 검사의 `bundle` 지문은 지금 도는 배포본과 비교한다 → 배포할 때마다 번들을 다시 설치한다(41.2절). `runner.py`는 배포본의 `apps/server/scratchpad/runner.py`가 바뀌었을 때 다시 복사한다.
+
+### 43.7 시험
+- `scripts/test/release.test.ts` — 임시 `AGENTLEE_HOME`, 로컬 bare 저장소를 소스로, 빈 포트, launchd 없음(`AGENTLEE_LAUNCHD_PLIST`가 없는 파일). 작은 고정 앱(HTTP 서버·릴리스 도구·사전 검사의 대역)으로 스크립트 자체의 모든 경로를 실제로 돈다: 설치(링크·REPO_ROOT가 실제 배포본·health·자산 형식), 같은 커밋 재설치 생략, 업데이트(작업 폴더의 미커밋 변경 무시), health 실패와 **자산이 text/html로 오는 경우**의 자동 복귀, 수동 되돌림·`--to`, 마이그레이션이 든 배포의 되돌림 경고(배포 직전 백업 id·복원 명령), prune, 잠금(다른 명령이 잡고 있으면 거부), `shared/.env` 미변경(모드·mtime·해시)과 비밀 값 미출력, 느슨한 권한·없는 `.env` 거부, 빈 데이터 시작 거부 → `--no-start` → `migrate-data` → `restart`, 남의 포트 리스너를 죽이지 않음. Linux CI에서도 돈다(macOS 전용인 `ditto`·`launchctl`은 이 시험에 들어가지 않는다).
+- `apps/server/test/release.test.ts` — 실제 도구: 설정 검사(없음·상대 경로·`releases/` 안·`.env` 링크 없음 거부), 배포 직전 백업(서버 잠금과 열린 쓰기 트랜잭션이 있는 DB에서 커밋된 내용만, 운영 DB 파일 무변경, `restore check` 통과, 임시 폴더 안 남김, 새 스키마 DB는 `schema_newer`), 데이터 이전(모드·링크 보존, 원본 그대로, 세션 무효화, 잠금·비지 않은 대상·상대 경로·서로 포함 거부).
+- 리뷰 #148 1차 회귀 시험: 스냅샷 뒤 서버가 첨부 행·파일을 지워도 백업이 스냅샷 기준(행만 지움 → 파일 포함, 행·파일 지움 → `backup_failed`), 링크인 DB·`-wal`은 이전 거부(원본 바이트 그대로), 자동 복귀까지 실패해도 복원 안내, A→B→C에서 A로 되돌릴 때 B의 백업(검사 통과)을 제안, 같은 이름 태그 `main`이 있어도 브랜치 배포·모호한 `--ref` 거부, plist가 있어도 데몬이 내려가 있으면 이전 진행.
+- 실제 앱으로 한 번(개발 Mac, 2026-11-15): 임시 HOME·로컬 bare 저장소·포트 3917·`FAKE_RUNTIME`으로 `install --no-start` → `migrate-data` → `restart` → `install --force`(서버가 도는 중 배포 직전 백업, `restore check` ok) → `rollback` → `prune` → `stop`. 결과는 #143 PR에 있다.

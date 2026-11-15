@@ -17,7 +17,8 @@ import { canonicalPath } from "../fs-safety.js";
  *
  * The folder is named by its real path (symlinks resolved): `alias → data` and `data` share one lock.
  */
-export type DataLockKind = "server" | "restore" | "migrate";
+/** `predeploy`: the release script's pre-deploy backup, on a lock named after BACKUP_DIR (not a data folder, #143). */
+export type DataLockKind = "server" | "restore" | "migrate" | "predeploy";
 
 export class DataLockHeld extends Error {
   constructor(readonly holder: DataLockKind | "unknown") {
@@ -136,7 +137,7 @@ const isBusy = (e: unknown) =>
 function holderKind(dataDir: string): DataLockKind | "unknown" {
   try {
     const k = (JSON.parse(fs.readFileSync(infoPath(dataDir), "utf8")) as { kind?: unknown }).kind;
-    return k === "server" || k === "restore" || k === "migrate" ? k : "unknown";
+    return k === "server" || k === "restore" || k === "migrate" || k === "predeploy" ? k : "unknown";
   } catch {
     return "unknown";
   }
