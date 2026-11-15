@@ -495,6 +495,17 @@ describe.skipIf(process.platform === "win32")("release.sh", () => {
     expect(fx.run("install", "--ref", v3).stderr).toMatch(/ambiguous/); // lower case: the same name, other case
     expect(fx.current()).toBe(before);
     fx.git(fx.work, "push", "--quiet", fx.src, `:refs/heads/${upper}`);
+    // Mixed case, and a packed ref (no loose file a case-insensitive disk could match) — round 4.
+    const mixed = [...v3].map((ch, i) => (i % 2 ? ch.toUpperCase() : ch)).join("");
+    fx.git(fx.work, "push", "--quiet", fx.src, `HEAD~2:refs/tags/${mixed}`);
+    fx.git(fx.src, "pack-refs", "--all");
+    for (const asked of [v3, upper]) {
+      const r = fx.run("install", "--ref", asked);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/looks like a commit id and is also a branch or tag name — ambiguous/);
+    }
+    expect(fx.current()).toBe(before);
+    fx.git(fx.work, "push", "--quiet", fx.src, `:refs/tags/${mixed}`);
     // Without the clash an upper-case full id installs that commit, recorded in lower case.
     ok(fx.run("install", "--ref", upper));
     expect(await fx.served()).toBe("v3");

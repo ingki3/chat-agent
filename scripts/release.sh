@@ -288,17 +288,25 @@ prune_releases() { # prune_releases <keep>
 # called `main`. A bare name that is both a branch and a tag is refused (say refs/heads/… or refs/tags/…). Commits only
 # as the full 40-character id: a short prefix can also be a branch or tag name (#148 review round 2).
 resolve_ref() {
-  local ref="$1" g=(git -C "$ROOT/src.git") b=0 t=0 hex=0 lower upper n
+  local ref="$1" g=(git -C "$ROOT/src.git") b=0 t=0 hex=0 lower n
   if [ -z "$ref" ]; then echo refs/heads/main; return 0; fi
   case "$ref" in refs/heads/*|refs/tags/*) echo "$ref"; return 0 ;; esac
   # Looks like a commit id (or a prefix of one), in any letter case — git reads upper-case ids too.
   [[ "$ref" =~ ^[0-9a-fA-F]{4,40}$ ]] && hex=1
   lower="$(printf '%s' "$ref" | tr 'A-F' 'a-f')"
-  upper="$(printf '%s' "$ref" | tr 'a-f' 'A-F')"
-  for n in "$ref" $([ "$hex" = 1 ] && echo "$lower $upper"); do
-    "${g[@]}" show-ref --verify --quiet "refs/heads/$n" && b=1
-    "${g[@]}" show-ref --verify --quiet "refs/tags/$n" && t=1
-  done
+  "${g[@]}" show-ref --verify --quiet "refs/heads/$ref" && b=1
+  "${g[@]}" show-ref --verify --quiet "refs/tags/$ref" && t=1
+  if [ "$hex" = 1 ]; then
+    # Every branch and tag name, compared without letter case (mixed-case packed refs included).
+    local names
+    names="$("${g[@]}" for-each-ref --format='%(refname)' refs/heads refs/tags)" || return 1
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      case "$(printf '%s' "${n#refs/*/}" | tr 'A-F' 'a-f')" in
+        "$lower") case "$n" in refs/heads/*) b=1 ;; *) t=1 ;; esac ;;
+      esac
+    done <<< "$names"
+  fi
   if [ "$b" = 1 ] && [ "$t" = 1 ] && [ "$hex" = 0 ]; then
     echo "release: ref $ref is both a branch and a tag — say refs/heads/$ref or refs/tags/$ref" >&2; return 1
   fi
