@@ -9,9 +9,12 @@ import {
   KNOWN_PLACEHOLDER,
   KnownSecrets,
   PartsScrubCache,
+  knownMasks,
+  knownMasksFrom,
   knownSecrets,
   scanStats,
   scrubParts,
+  type ScanState,
 } from "../src/secrets/known.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -91,6 +94,43 @@ describe("PartsScrubCache: the same result as a full scrub, save after save", ()
     }
   });
 
+  it("values JSON cannot tell apart are never cached: Infinity, then null (#159 round 1)", () => {
+    const reg = new KnownSecrets();
+    reg.add("Infinity"); // a number is compared by its text: Infinity is masked, null is not
+    const cache = new PartsScrubCache();
+    const parts: MessagePart[] = [{ type: "tool_result", callId: "c", output: Infinity }];
+    expect(scrubParts(parts, { registry: reg, cache })).toEqual(scrubParts(parts, { registry: reg }));
+    parts[0] = { type: "tool_result", callId: "c", output: null }; // JSON.stringify: `null` both times
+    expect(scrubParts(parts, { registry: reg, cache })).toEqual([
+      { type: "tool_result", callId: "c", output: null },
+    ]);
+    // And the other way round, and the other values JSON loses (NaN, -0, undefined, a Date, a sparse array).
+    const sparse: unknown[] = [1];
+    sparse[2] = 2;
+    const odd: unknown[] = [
+      null,
+      Infinity,
+      -Infinity,
+      NaN,
+      -0,
+      0,
+      undefined,
+      new Date(0),
+      sparse,
+      { a: undefined },
+    ];
+    for (const a of odd)
+      for (const b of odd) {
+        const c = new PartsScrubCache();
+        const ps: MessagePart[] = [{ type: "tool_result", callId: "c", output: { v: a } }];
+        expect(scrubParts(ps, { registry: reg, cache: c })).toEqual(scrubParts(ps, { registry: reg }));
+        ps[0] = { type: "tool_result", callId: "c", output: { v: b } };
+        expect(scrubParts(ps, { registry: reg, cache: c }), `${String(a)} → ${String(b)}`).toEqual(
+          scrubParts(ps, { registry: reg }),
+        );
+      }
+  });
+
   it("nothing handed out is shared with the next save (a caller may change what it got)", () => {
     const reg = new KnownSecrets();
     reg.add("SYNTH-SHARED-155-xyz");
@@ -103,6 +143,137 @@ describe("PartsScrubCache: the same result as a full scrub, save after save", ()
     expect(scrubParts(parts, { registry: reg, cache })).toEqual([
       { type: "tool_result", callId: "c", output: { a: KNOWN_PLACEHOLDER } },
     ]);
+  });
+});
+
+describe("knownMasksFrom: a text grown at its end, scanned from just before where it grew", () => {
+  const secrets = [
+    "SYNTH-KEY-155-alpha",
+    "sk-synthetic-155-BETA",
+    "토큰-합성-155-감마값",
+    "SYNTH KEY 155 with spaces",
+    "a\\b%c-SYNTH-155-zz",
+    "😀-SYNTH-155-astral",
+  ];
+  const forms = (v: string) => [
+    v,
+    encodeURIComponent(v),
+    encodeURIComponent(v).replace(/%20/g, "+"),
+    encodeURIComponent(encodeURIComponent(v)),
+    Buffer.from(v).toString("base64"),
+    Buffer.from(v)
+      .toString("base64")
+      .replace(/(.{8})/g, "$1\n"), // wrapped
+    Buffer.from(v)
+      .toString("base64")
+      .replace(/(.{6})/g, "$1\\n"), // a stringified PEM
+    Buffer.from(v).toString("base64url"),
+    Buffer.from(v).toString("hex").toUpperCase(),
+    JSON.stringify(v),
+    JSON.stringify(JSON.stringify(v)),
+    [...v].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join(""),
+    [...v].map((c) => "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0")).join(""),
+    [...Buffer.from(v)].map((b) => "\\" + b.toString(8)).join(""),
+  ];
+  const filler = [
+    " ",
+    "  ",
+    "\n",
+    "\t",
+    "평범한 글 ",
+    "ordinary ",
+    "\\",
+    "\\\\",
+    "%",
+    "%2",
+    "+",
+    "=",
+    "abc",
+    "QUJD",
+    "0a1b",
+  ];
+
+  it("the same masks as a full scan, at every growth, tail or not (random, cut anywhere)", () => {
+    // Growths that took the short way (scanned less than the whole text), so the check is not of full scans only.
+    let short = 0;
+    let calls = 0;
+    let incremental = 0;
+    let full = 0;
+    for (let seed = 1; seed <= 160; seed++) {
+      const r = rng(seed * 7919);
+      const reg = new KnownSecrets();
+      for (const v of secrets) if (r(3)) reg.add(v);
+      // The text is built from pieces cut at random places, so encodings straddle the growth points; sparse or
+      // dense in secrets (a text with something found is scanned whole after that).
+      const density = seed % 2 ? 3 : 12;
+      let source = "";
+      for (let k = 0; k < 60; k++) {
+        if (r(density) === 0) {
+          const f = forms(secrets[r(secrets.length)]!);
+          source += f[r(f.length)]!;
+        } else source += filler[r(filler.length)]!;
+      }
+      for (const tail of [true, false]) {
+        let text = "";
+        let state: ScanState | undefined;
+        while (text.length < source.length) {
+          text = source.slice(0, text.length + 1 + r(40));
+          const before = scanStats.chars;
+          const got = knownMasksFrom(text, state, reg, tail);
+          const inc = scanStats.chars - before;
+          const b2 = scanStats.chars;
+          const want = knownMasks(text, { registry: reg, tail });
+          const fl = scanStats.chars - b2;
+          expect(got.masks, `seed ${seed} tail ${tail} at ${text.length}: ${JSON.stringify(text)}`).toEqual(
+            want,
+          );
+          calls++;
+          if (inc < fl) short++;
+          incremental += inc;
+          full += fl;
+          state = got.state;
+        }
+      }
+    }
+    // Once something is found the text is scanned whole (by design): the short way is taken up to the first
+    // secret, and the growth into it — the case this checks — is one of those (about 900 of 10 500 here).
+    expect(short, `${short} of ${calls} growths scanned short`).toBeGreaterThan(500);
+    expect(incremental).toBeLessThan(full);
+  }, 60_000);
+
+  it("a clean text that keeps growing is scanned in proportion to its growth", () => {
+    const reg = new KnownSecrets();
+    for (const v of secrets) reg.add(v);
+    const r = rng(155);
+    let source = "";
+    while (source.length < 200_000) source += filler[r(filler.length)]!;
+    let text = "";
+    let state: ScanState | undefined;
+    const before = scanStats.chars;
+    while (text.length < source.length) {
+      text = source.slice(0, text.length + 500);
+      state = knownMasksFrom(text, state, reg, true).state;
+    }
+    const scanned = scanStats.chars - before;
+    // 400 growths of 500 characters: a full scan each time would be ~40 M characters.
+    expect(scanned, `${scanned} characters for a 200 kB text grown 400 times`).toBeLessThan(
+      2 * source.length,
+    );
+    expect(knownMasksFrom(text, undefined, reg, true).masks).toEqual(knownMasks(text, { registry: reg }));
+  });
+
+  it("a scan that ran out of work is never continued: the whole text again (an adversarial repeated prefix)", () => {
+    const reg = new KnownSecrets();
+    reg.add("a".repeat(16_384));
+    const source = ("a".repeat(500) + "\\x").repeat(40) + " ordinary prose " + "a".repeat(3000);
+    let text = "";
+    let state: ScanState | undefined;
+    while (text.length < source.length) {
+      text = source.slice(0, text.length + 997);
+      const got = knownMasksFrom(text, state, reg, true);
+      expect(got.masks).toEqual(knownMasks(text, { registry: reg }));
+      state = got.state;
+    }
   });
 });
 
@@ -174,6 +345,22 @@ describe("ConversationStore.updateMessage: a message saved again and again", () 
     expect(stored).toContain("뒤 글");
   });
 
+  it("an output that changes from Infinity to null is stored as null (JSON cannot tell them apart: #159 round 1)", async () => {
+    const { app, f, rawParts } = await start();
+    const store = app.conversations!;
+    const conv = store.create(f.users.owner.id);
+    const msg = store.append(conv.id, { role: "assistant", parts: [], status: "streaming" });
+    register("Infinity");
+    const parts: MessagePart[] = [{ type: "tool_result", callId: "c1", output: Infinity }];
+    store.updateMessage(msg.id, { parts });
+    expect(JSON.parse(rawParts(msg.id))).toEqual([
+      { type: "tool_result", callId: "c1", output: KNOWN_PLACEHOLDER },
+    ]);
+    parts[0] = { type: "tool_result", callId: "c1", output: null };
+    store.updateMessage(msg.id, { parts });
+    expect(JSON.parse(rawParts(msg.id))).toEqual([{ type: "tool_result", callId: "c1", output: null }]);
+  });
+
   it("a secret split across two text parts (around a tool call) is masked once its second half is saved", async () => {
     const { app, f, rawParts } = await start();
     const store = app.conversations!;
@@ -199,6 +386,12 @@ describe("ConversationStore.updateMessage: a message saved again and again", () 
 });
 
 describe("a run's saves scan in proportion to what it produced (#155 budget)", () => {
+  // Closed before the next run: a live app's background rescrub would pass over its rows when the next app's
+  // logins register their session tokens — work of its own, counted in the next run otherwise.
+  const close = async (app: App) => {
+    apps.splice(apps.indexOf(app), 1);
+    await app.close();
+  };
   const items = Array.from({ length: 30 }, (_, i) => ({
     sourceId: `src_${i}_abcdefghijklmnop`,
     title: `통계청 지표 ${i + 1}번 기사`,
@@ -212,6 +405,8 @@ describe("a run's saves scan in proportion to what it produced (#155 budget)", (
       { text: "끝났어요." },
     ];
     const { send, waitRun, app } = await start(steps);
+    // The startup rescrub of stored rows (its own matcher) is not a save: done before counting.
+    await app.storedRescrub!.idle();
     const before = scanStats.chars;
     const r = await send("go");
     const done = await waitRun(r.id);
@@ -219,8 +414,43 @@ describe("a run's saves scan in proportion to what it produced (#155 budget)", (
     expect(done.status).toBe("done");
     const msg = app.conversations!.messageById(r.assistantMessageId)!;
     expect((msg.parts as MessagePart[]).filter((p) => p.type === "tool_result")).toHaveLength(n);
+    await close(app);
     return scanned;
   };
+
+  const alternating = async (n: number) => {
+    // Text between every two tool calls (#159 round 1: 840 characters each), so the joined text grows at every save.
+    const para = (k: number) =>
+      `${k}번째 확인: ` + "검색 결과를 정리하면 지표가 늘었어요. ".repeat(40).slice(0, 820) + "\n\n";
+    const steps = (): FakeStep[] => [
+      ...Array.from({ length: n }, (_, k): FakeStep[] => [
+        { text: para(k) },
+        { tool: "sources_list", ms: 0, input: {}, output: { items } },
+      ]).flat(),
+      { text: "끝났어요." },
+    ];
+    const { send, waitRun, app } = await start(steps);
+    // The startup rescrub of stored rows (its own matcher) is not a save: done before counting.
+    await app.storedRescrub!.idle();
+    const before = scanStats.chars;
+    const r = await send("go");
+    const done = await waitRun(r.id);
+    const scanned = scanStats.chars - before;
+    expect(done.status).toBe("done");
+    const msg = app.conversations!.messageById(r.assistantMessageId)!;
+    expect((msg.parts as MessagePart[]).filter((p) => p.type === "tool_result")).toHaveLength(n);
+    expect((msg.parts as MessagePart[]).filter((p) => p.type === "text")).toHaveLength(n + 1);
+    await close(app);
+    return scanned;
+  };
+
+  it("text between every tool call: still about 4× for 4× the calls (the joined text is scanned where it grew)", async () => {
+    register("SYNTH-BUDGET-155-never-in-output");
+    const small = await alternating(50);
+    const large = await alternating(200);
+    expect(small).toBeGreaterThan(0);
+    expect(large / small, `${small} → ${large} characters scanned`).toBeLessThan(5);
+  }, 120_000);
 
   it("200 tool calls scan about 4× what 50 do (it was about 16×: every save rescanned every part)", async () => {
     register("SYNTH-BUDGET-155-never-in-output");
@@ -228,7 +458,7 @@ describe("a run's saves scan in proportion to what it produced (#155 budget)", (
     const large = await run(200);
     // Characters handed to the matcher, not wall time: the same on a loaded CI runner. Linear ≈ 4×, quadratic ≈ 16×.
     expect(small).toBeGreaterThan(0);
-    expect(large / small, `${small} → ${large} characters scanned`).toBeLessThan(6);
+    expect(large / small, `${small} → ${large} characters scanned`).toBeLessThan(5);
   }, 120_000);
 
   it("a value registered mid-run is masked everywhere in the stored reply and in the replayed stream", async () => {

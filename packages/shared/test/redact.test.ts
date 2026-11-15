@@ -17,7 +17,7 @@ import {
 const ABS_MS = process.env.CI ? 6000 : 3000;
 
 /**
- * Linear, not quadratic (#103, #155): the old check — 8× the input, best of three, under 20× the time — failed
+ * Catches a quadratic regression (#103, #155) — not a proof of linearity: n^1.5 passes either stage. The old check — 8× the input, best of three, under 20× the time — failed
  * on CI and on a loaded machine for linear code (`[{`: 22.3×). Even unloaded, the worst units take 11–15× for
  * 8× the input: a 128 kB input stays in cache and its strings in the young generation, a 1 MB one does not, so
  * the step from 128 kB costs more than the size alone. Two stages, so a quadratic matcher still fails and a linear
@@ -29,7 +29,8 @@ const ABS_MS = process.env.CI ? 6000 : 3000;
  *    size alike, never only the large ones). Measured with every unit forced through this stage, on a machine
  *    busy with other test runs: 0.95–1.38 for every pattern unit and nesting level here; a synthetic quadratic
  *    loop: 1.99. Bound 1.6: at least 0.2 from both, so a quadratic pattern fails every time and load does not
- *    fail a linear one (min over runs only ever removes added time).
+ *    fail a linear one (min over runs only ever removes added time). The stages are checked themselves with a
+ *    virtual clock ("expectLinear itself" below).
  *
  * Then the absolute cap (`ABS_MS`) on the large input's best time — retried up to three more times when over it,
  * since a full test run on the same machine slows every run for a while (best of all: still the same cap).
@@ -40,13 +41,14 @@ function expectLinear(
   small: number,
   large: number,
   what: string,
+  now: () => number = () => performance.now(),
 ): void {
   const time = (input: string, enough = 0) => {
     let best = Infinity;
     for (let k = 0; k < 3 && best >= enough; k++) {
-      const t0 = performance.now();
+      const t0 = now();
       run(input);
-      best = Math.min(best, performance.now() - t0);
+      best = Math.min(best, now() - t0);
     }
     return best;
   };
@@ -61,9 +63,9 @@ function expectLinear(
   const best = sizes.map(() => Infinity);
   for (let r = 0; r < 3; r++)
     inputs.forEach((x, i) => {
-      const t0 = performance.now();
+      const t0 = now();
       run(x);
-      best[i] = Math.min(best[i]!, performance.now() - t0);
+      best[i] = Math.min(best[i]!, now() - t0);
     });
   const xs = sizes.map(Math.log);
   const ys = best.map((t) => Math.log(Math.max(t, 1)));
@@ -83,6 +85,59 @@ function expectUnderCap(best: number, again: () => number, what: string): void {
   for (let k = 0; k < 3 && best >= ABS_MS; k++) best = Math.min(best, again());
   expect(best, `${what}: ${Math.round(best)} ms`).toBeLessThan(ABS_MS);
 }
+
+describe("expectLinear itself (a virtual clock: each run advances it by a cost of the input's length)", () => {
+  const MB = 1 << 20;
+  const check = (cost: (n: number) => number) => {
+    let clock = 0;
+    let runs = 0;
+    expectLinear(
+      (n) => "a".repeat(n),
+      (x) => {
+        runs++;
+        clock += cost(x.length);
+      },
+      MB / 8,
+      MB,
+      "virtual",
+      () => clock,
+    );
+    return runs;
+  };
+
+  it("linear passes at the first stage", () => {
+    expect(check((n) => n / 10_000)).toBeLessThan(8); // no stage-two runs
+  });
+
+  it("linear with a cache step (25× for 8×: what failed CI) passes at the second stage", () => {
+    // Up to 128 kB in cache; above, three times the cost per character — the fitted exponent above it is 1.
+    expect(check((n) => (n <= MB / 8 ? n : 3 * n) / 10_000)).toBeGreaterThan(8);
+  });
+
+  it("noise only ever adds time: a slow first run of each size changes nothing", () => {
+    const seen = new Set<number>();
+    expect(() =>
+      check((n) => {
+        const first = !seen.has(n);
+        seen.add(n);
+        return ((n <= MB / 8 ? n : 3 * n) / 10_000) * (first ? 5 : 1);
+      }),
+    ).not.toThrow();
+  });
+
+  it("quadratic fails, and so does n^1.8 (128 kB in 20 ms, as the real units: the 10 ms floor is not hiding it)", () => {
+    const k = MB / 8;
+    expect(() => check((n) => 20 * (n / k) ** 2)).toThrow(/exponent 2\.00/);
+    expect(() => check((n) => 20 * (n / k) ** 1.8)).toThrow(/exponent 1\.80/);
+    // n^1.5 is not caught: the old check failed it (8^1.5 = 22.6×) but failed linear code too (22.3× on CI) — it
+    // could not tell them apart. What this catches is a quadratic regression.
+    expect(() => check((n) => 20 * (n / k) ** 1.5)).not.toThrow();
+  });
+
+  it("over the absolute cap fails even when linear", () => {
+    expect(() => check((n) => n / 100)).toThrow(/than 3000|than 6000/);
+  });
+});
 
 describe("redactSecrets", () => {
   it("hides secret fields at any depth, by exact name or a known secret suffix", () => {

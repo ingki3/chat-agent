@@ -627,12 +627,43 @@ type ScanMode = "stream" | "tail" | "plain";
  * decoded — percent-encoding, or JSON/JS string escapes — mapped back (`%5Cu0073…`, `%5C163…`, `%2573…`). An
  * escape the text ends inside (`%5`, `\\u00`) is held like any partial match: the next chunk may complete it.
  */
-function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
+/** One number per pass of `scan`: the text itself, its percent-decoded view, its escape-decoded view. */
+type Passes = { raw: number; pct: number; esc: number };
+
+/**
+ * Control and accounting of one `scan` (#155, the incremental scan of a text that only grows): the work each pass
+ * may take (default: 64 per character + 65 536, as without it), views to build even when this text has none of
+ * their characters (the whole text has), and, out, the work each pass took, each view's length, and whether any
+ * pass ran out of work (then its outcome depended on its budget).
+ */
+type ScanCtl = {
+  budget?: Partial<Passes>;
+  views?: { pct: boolean; esc: boolean };
+  used: Passes;
+  vlen: { pct: number; esc: number };
+  renewed: boolean;
+};
+
+const newCtl = (): ScanCtl => ({
+  used: { raw: 0, pct: 0, esc: 0 },
+  vlen: { pct: 0, esc: 0 },
+  renewed: false,
+});
+
+function scan(text: string, m: Compiled, mode: ScanMode = "plain", ctl?: ScanCtl): Scan {
   scanStats.chars += text.length;
-  const out = scanCore(text, m, mode);
-  const views: View[] = [];
-  if (text.includes("%")) views.push(percentDecoded(text));
-  if (text.includes("\\")) views.push(escapeDecoded(text));
+  const core = (t: string, pass: keyof Passes): Scan => {
+    if (!ctl) return scanCore(t, m, mode);
+    const acc = { used: 0, renewed: false };
+    const r = scanCore(t, m, mode, { budget: ctl.budget?.[pass], acc });
+    ctl.used[pass] += acc.used;
+    if (acc.renewed) ctl.renewed = true;
+    return r;
+  };
+  const out = core(text, "raw");
+  const views: [View, "pct" | "esc"][] = [];
+  if (ctl?.views?.pct || text.includes("%")) views.push([percentDecoded(text), "pct"]);
+  if (ctl?.views?.esc || text.includes("\\")) views.push([escapeDecoded(text), "esc"]);
   if (!views.length) return out;
   const found = [...out.ranges];
   let { partialAt, partialDepth, deepPartialAt } = out;
@@ -643,9 +674,10 @@ function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
     } else if (i === partialAt) partialDepth = Math.max(partialDepth, depth);
     if (depth >= TAIL_MIN && i < deepPartialAt) deepPartialAt = i;
   };
-  for (const view of views) {
-    const sub = scanCore(view.v, m, mode);
+  for (const [view, pass] of views) {
+    const sub = core(view.v, pass);
     const vn = view.v.length;
+    if (ctl) ctl.vlen[pass] = vn;
     const at = (k: number) => (k < vn ? view.start[k]! : (view.incompleteAt ?? text.length));
     for (const [a, b] of sub.ranges) found.push([at(a), b > 0 && b <= vn ? view.end[b - 1]! : text.length]);
     if (sub.partialAt !== Infinity) partial(at(sub.partialAt), sub.partialDepth);
@@ -670,7 +702,12 @@ function merge(found: [number, number][]): [number, number][] {
 }
 
 /** Every encoding on one text (no transport layer decoded): the character search, raw matches, base64 and hex. */
-function scanCore(text: string, m: Compiled, mode: ScanMode): Scan {
+function scanCore(
+  text: string,
+  m: Compiled,
+  mode: ScanMode,
+  ctl?: { budget?: number | undefined; acc: { used: number; renewed: boolean } },
+): Scan {
   let deepPartialAt = Infinity;
   const found: [number, number][] = [];
   let partialAt = Infinity;
@@ -678,7 +715,8 @@ function scanCore(text: string, m: Compiled, mode: ScanMode): Scan {
   const n = text.length;
   // Total work: linear in the text. Running out never lets a match through: what the search was in the middle of
   // is masked (if it already held enough of a secret), the budget is renewed once; a second time, the rest goes.
-  const work: Work = { left: 64 * n + 65_536 };
+  const budget = ctl?.budget ?? 64 * n + 65_536;
+  const work: Work = { left: budget };
   let renewed = false;
   // Per secret: no start before `skipUntil` can match (inside a complete match, after a partial one that is held
   // or masked, or skipped by a KMP shift); `resume*` continues a KMP shift's match at its start.
@@ -730,7 +768,7 @@ function scanCore(text: string, m: Compiled, mode: ScanMode): Scan {
           break outer;
         }
         renewed = true;
-        work.left = 64 * n + 65_536;
+        work.left = budget;
         continue;
       }
       if (r.end >= 0) {
@@ -815,6 +853,10 @@ function scanCore(text: string, m: Compiled, mode: ScanMode): Scan {
     };
     m.literals.forEach((l, k) => find(view.v, l, m.literalFail[k]!, 3 / 4));
     m.hexes.forEach((h, k) => find(lower, h, m.hexFail[k]!, 1 / 2));
+  }
+  if (ctl) {
+    ctl.acc.used = (renewed ? budget : 0) + budget - work.left;
+    ctl.acc.renewed = renewed;
   }
   return { ranges: merge(found), partialAt, partialDepth, deepPartialAt };
 }
@@ -1017,26 +1059,162 @@ export function knownMasks(
   const m = (opts.registry ?? knownSecrets).matcher();
   if (!m || !text) return [];
   const tail = opts.tail ?? true;
-  const s = scan(text, m, tail ? "tail" : "plain");
+  return masksOf(scan(text, m, tail ? "tail" : "plain"), tail, text.length);
+}
+
+function masksOf(s: Scan, tail: boolean, n: number): [number, number][] {
   if (!s.ranges.length && s.partialAt === Infinity) return [];
   if (tail && s.deepPartialAt !== Infinity) {
     // Everything from the earliest cut-off secret that holds enough of it goes (a complete match it overlaps too).
     let from = s.deepPartialAt;
     for (const [a, b] of s.ranges) if (a < from && b > from) from = a;
-    return [...s.ranges.filter(([, b]) => b <= from), [from, text.length]];
+    return [...s.ranges.filter(([, b]) => b <= from), [from, n]];
   }
   return s.ranges;
 }
 
 /**
- * Texts that are read one after another (the text parts of a message, around its tool calls) scrubbed as one
- * text (round 26): a secret split across them is found, and masked in each piece it touches — the marker goes
- * where it starts.
+ * What an incremental scan keeps of a text it scanned (#155): enough to scan the same text grown at its end by
+ * looking only at the new part and a little before it. Only kept for a text where nothing was found (`clean`).
  */
-export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } = {}): string[] {
-  if (texts.length < 2) return texts.map((t) => scrubKnown(t, opts));
-  const joined = texts.join("");
-  const masks = knownMasks(joined, opts);
+export type ScanState = {
+  registry: KnownSecrets;
+  gen: number;
+  tail: boolean;
+  text: string;
+  /** Nothing to mask, and no pass ran out of work. */
+  clean: boolean;
+  /** Earliest start of a match the text ends inside (Infinity: none) — any pass, any encoding. */
+  partialAt: number;
+  /** Work each pass took over the whole text (an upper bound once grown incrementally). */
+  work: Passes;
+  /** Length of each view of the whole text (a lower bound once grown incrementally); views it has. */
+  vlen: { pct: number; esc: number };
+  views: { pct: boolean; esc: boolean };
+};
+
+/** How far back from a held match the scan of a grown text may look for its starting point (else: full scan). */
+const RESCAN_BACK = 4096;
+const isSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
+
+/**
+ * `knownMasks(text)` for a text that may be `prev.text` grown at its end — the same result, scanning only the new
+ * part and what lies just before it (#155: a run's reply grows between saves; scanning it whole at each save is
+ * quadratic). Exact, by these facts of the matcher, for a previous text where nothing was found (`clean`):
+ *
+ * - every search is forward from its start: a start whose search touched the end of the previous text reported a
+ *   match the text ends inside, so every start before `partialAt` failed on characters of the previous text, and
+ *   fails the same way now (raw, encoded, base64/hex in the stripped view, either decoded view, KMP shifts);
+ * - the rescan starts right after a whitespace character at or before `partialAt` (or at the start): no escape,
+ *   percent sequence or `\n` strip spans whitespace, and a base64 match's edge never crosses it, so every view of
+ *   the rest is the same as that part of the whole text's view;
+ * - the work budget: the rescan gets what the whole scan would have left after the earlier starts (at most the
+ *   previous text's work), and must not run out of it — else, and whenever anything above does not hold, the
+ *   whole text is scanned as before.
+ */
+export function knownMasksFrom(
+  text: string,
+  prev: ScanState | undefined,
+  registry: KnownSecrets,
+  tail: boolean,
+): { masks: [number, number][]; state: ScanState | undefined } {
+  const m = registry.matcher();
+  if (!m || !text) return { masks: [], state: undefined };
+  const mode: ScanMode = tail ? "tail" : "plain";
+  const n = text.length;
+  const state = (r: Scan, ctl: ScanCtl, masks: [number, number][], extra: Partial<ScanState>): ScanState => ({
+    registry,
+    gen: registry.generation,
+    tail,
+    text,
+    clean: !masks.length && !r.ranges.length && !ctl.renewed,
+    partialAt: r.partialAt,
+    work: ctl.used,
+    vlen: ctl.vlen,
+    views: { pct: text.includes("%"), esc: text.includes("\\") },
+    ...extra,
+  });
+  if (
+    prev &&
+    prev.clean &&
+    prev.registry === registry &&
+    prev.gen === registry.generation &&
+    prev.tail === tail &&
+    n >= prev.text.length &&
+    text.startsWith(prev.text)
+  ) {
+    const old = prev.text.length;
+    // The same text: the same (empty) result.
+    if (n === old) return { masks: [], state: prev };
+    const held = Math.min(prev.partialAt, old);
+    // Right after the last whitespace before the earliest held match (or the very start).
+    let w0 = -1;
+    for (let k = held - 1; k >= Math.max(0, held - RESCAN_BACK); k--)
+      if (isSpace(text.charCodeAt(k))) {
+        w0 = k + 1;
+        break;
+      }
+    if (w0 < 0 && held <= RESCAN_BACK) w0 = 0;
+    if (w0 >= 0) {
+      const sub = text.slice(w0);
+      const delta = text.slice(old);
+      const views = {
+        pct: prev.views.pct || delta.includes("%"),
+        esc: prev.views.esc || delta.includes("\\"),
+      };
+      // A view the previous text did not have is its text unchanged there (its work: the raw pass's).
+      const before = (pass: "pct" | "esc") =>
+        prev.views[pass]
+          ? { work: prev.work[pass], len: prev.vlen[pass] }
+          : { work: prev.work.raw, len: old };
+      // What the whole scan of each pass would have left for the starts from w0 on (a lower bound).
+      const left = (pass: "pct" | "esc", subLen: number) => {
+        const b = before(pass);
+        return 64 * (Math.max(0, b.len - (old - w0)) + subLen) + 65_536 - b.work;
+      };
+      // View lengths are not known before the views are built: the budget uses the rest's own length (each view
+      // character stands for at least one character, so a view is never longer than its text).
+      const pctView = views.pct ? percentDecoded(sub).v.length : 0;
+      const escView = views.esc ? escapeDecoded(sub).v.length : 0;
+      const budget = {
+        raw: 64 * n + 65_536 - prev.work.raw,
+        pct: left("pct", pctView),
+        esc: left("esc", escView),
+      };
+      if (budget.raw > 0 && (!views.pct || budget.pct > 0) && (!views.esc || budget.esc > 0)) {
+        const ctl: ScanCtl = { ...newCtl(), budget, views };
+        const r = scan(sub, m, mode, ctl);
+        if (!ctl.renewed) {
+          const masks = masksOf(r, tail, sub.length).map(([a, b]): [number, number] => [a + w0, b + w0]);
+          const grow = (pass: "pct" | "esc") => {
+            const b = before(pass);
+            return Math.max(0, b.len - (old - w0)) + ctl.vlen[pass];
+          };
+          return {
+            masks,
+            state: state(r, ctl, masks, {
+              partialAt: r.partialAt === Infinity ? Infinity : r.partialAt + w0,
+              work: {
+                raw: prev.work.raw + ctl.used.raw,
+                pct: (views.pct ? before("pct").work : 0) + ctl.used.pct,
+                esc: (views.esc ? before("esc").work : 0) + ctl.used.esc,
+              },
+              vlen: { pct: views.pct ? grow("pct") : 0, esc: views.esc ? grow("esc") : 0 },
+              views,
+            }),
+          };
+        }
+      }
+    }
+  }
+  const ctl = newCtl();
+  const r = scan(text, m, mode, ctl);
+  const masks = masksOf(r, tail, n);
+  return { masks, state: state(r, ctl, masks, {}) };
+}
+
+/** Each text's piece of `joined` with `masks` applied: the marker where a mask starts, in the piece it starts in. */
+function piecesOf(texts: string[], joined: string, masks: [number, number][]): string[] {
   if (!masks.length) return texts;
   const out: string[] = [];
   let o = 0;
@@ -1056,23 +1234,54 @@ export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } =
   return out;
 }
 
-/** JSON text of a value, or undefined when it has none (a bigint, a cycle): such a value is never cached. */
-function jsonOf(v: unknown): string | undefined {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return undefined;
-  }
+/**
+ * Texts that are read one after another (the text parts of a message, around its tool calls) scrubbed as one
+ * text (round 26): a secret split across them is found, and masked in each piece it touches — the marker goes
+ * where it starts.
+ */
+export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } = {}): string[] {
+  if (texts.length < 2) return texts.map((t) => scrubKnown(t, opts));
+  const joined = texts.join("");
+  return piecesOf(texts, joined, knownMasks(joined, opts));
+}
+
+/**
+ * JSON text of a value whose JSON says all a scrub looks at — or undefined (never cached): numbers that are not
+ * finite or are -0 (`Infinity` and `null` are both `null`: round 1 of #159), `undefined`, functions, symbols,
+ * bigints, objects that are not plain (a `Date`, a class), sparse arrays, cycles and very deep values.
+ */
+function losslessJson(v: unknown): string | undefined {
+  const ok = (x: unknown, depth: number): boolean => {
+    if (x === null || typeof x === "string" || typeof x === "boolean") return true;
+    if (typeof x === "number") return Number.isFinite(x) && !Object.is(x, -0);
+    if (typeof x !== "object" || depth > 64) return false;
+    if (Array.isArray(x)) {
+      for (let k = 0; k < x.length; k++) if (!(k in x) || !ok(x[k], depth + 1)) return false;
+      return Object.keys(x).length === x.length;
+    }
+    const proto = Object.getPrototypeOf(x) as unknown;
+    if (proto !== Object.prototype && proto !== null) return false;
+    if (Object.getOwnPropertySymbols(x).length) return false;
+    for (const k of Object.keys(x)) if (!ok((x as Record<string, unknown>)[k], depth + 1)) return false;
+    return true;
+  };
+  return ok(v, 0) ? JSON.stringify(v) : undefined;
 }
 
 /**
  * What `scrubParts` found for the parts of one message being written again and again (#155: a run saves its reply
- * at every tool event — scrubbing all of it each time made a run with n tool calls cost n² scans). Keyed by content
- * (each part's JSON text, and each joined text list), never by object identity — the run manager appends to its
- * last text part in place — and valid for one registry generation only: once a value is registered or removed,
- * the next save scrubs everything again, as without a cache. Results are exactly what `scrubParts` gives without
- * it: a part's scrub depends only on its content (`scrubKnownDeep` walks what JSON holds), the joined pass only on
- * the list of texts. Only what the latest save used is kept (memory: about one copy of the message).
+ * at every tool event — scrubbing all of it each time made a run with n tool calls cost n² scans). Results are
+ * exactly what `scrubParts` gives without it (a random test compares them save after save):
+ *
+ * - a part whose content was scrubbed before is not scanned again — keyed by its JSON text, only when that text
+ *   says everything the scrub looks at (`losslessJson`), never by object identity (the run manager appends to its
+ *   last text part in place);
+ * - a text or reasoning part that grew at its end, and the joined text of those parts, are scanned only from a
+ *   little before where they grew (`knownMasksFrom`);
+ * - all of it valid for one registry generation only: once a value is registered or removed, the next save scrubs
+ *   everything again, as without a cache.
+ *
+ * Only what the latest save used is kept (memory: about one copy of the message).
  */
 export class PartsScrubCache {
   private registry: KnownSecrets | undefined;
@@ -1080,8 +1289,10 @@ export class PartsScrubCache {
   /** Part JSON → null (scrubbing leaves it as it is) or the scrubbed part's JSON. */
   private parts = new Map<string, string | null>();
   private nextParts = new Map<string, string | null>();
-  /** Per part type: the joined pass's input (texts as JSON) and output. */
-  private joined = new Map<string, { key: string; out: string[] }>();
+  /** Per part index: the scan state of its text (text and reasoning parts). */
+  private textScans = new Map<number, ScanState>();
+  /** Per part type: the joined pass's texts, their joined text, and its scan state. */
+  private joined = new Map<string, { texts: string[]; joined: string; scan: ScanState | undefined }>();
 
   /** Starts one `scrubParts` call: everything is forgotten when the registry changed since the last one. */
   begin(registry: KnownSecrets): void {
@@ -1089,6 +1300,7 @@ export class PartsScrubCache {
       this.registry = registry;
       this.gen = registry.generation;
       this.parts.clear();
+      this.textScans.clear();
       this.joined.clear();
     }
     this.nextParts = new Map();
@@ -1099,9 +1311,12 @@ export class PartsScrubCache {
     this.nextParts = new Map();
   }
 
-  part<P>(p: P, scrub: (p: P) => P): P {
-    const key = jsonOf(p);
-    if (key === undefined) return scrub(p);
+  part<P>(p: P, k: number, scrub: (p: P) => P): P {
+    const key = losslessJson(p);
+    if (key === undefined) {
+      this.textScans.delete(k);
+      return scrub(p);
+    }
     // (null is a hit too: `has`, not `??`)
     const hit = this.parts.has(key) ? this.parts.get(key) : this.nextParts.get(key);
     if (hit !== undefined) {
@@ -1109,19 +1324,46 @@ export class PartsScrubCache {
       // A fresh object each time: nothing handed out is shared with a later save.
       return hit === null ? p : (JSON.parse(hit) as P);
     }
-    const r = scrub(p);
-    const out = r === p ? null : jsonOf(r);
+    const q = p as { type?: unknown; text?: unknown };
+    let r: P;
+    if ((q.type === "text" || q.type === "reasoning") && typeof q.text === "string") {
+      const { text, ...rest } = q;
+      const restOut = scrubKnownDeep(rest, { registry: this.registry! });
+      const { masks, state } = knownMasksFrom(text, this.textScans.get(k), this.registry!, false);
+      if (state) this.textScans.set(k, state);
+      else this.textScans.delete(k);
+      const textOut = masks.length ? apply(text, masks, text.length) : text;
+      r = restOut === rest && textOut === text ? p : ({ ...restOut, text: textOut } as P);
+    } else {
+      this.textScans.delete(k);
+      r = scrub(p);
+    }
+    const out = r === p ? null : losslessJson(r);
     if (out !== undefined) this.nextParts.set(key, out);
     return r;
   }
 
-  texts(type: string, texts: string[], scrub: (texts: string[]) => string[]): string[] {
-    const key = JSON.stringify(texts);
-    const hit = this.joined.get(type);
-    if (hit && hit.key === key) return [...hit.out];
-    const out = scrub(texts);
-    this.joined.set(type, { key, out: [...out] });
-    return out;
+  texts(type: string, texts: string[]): string[] {
+    const registry = this.registry!;
+    const prev = this.joined.get(type);
+    // Grown at its end only (earlier texts the same, the last one longer, more after it): the joined text too.
+    let joined: string | undefined;
+    if (prev && texts.length >= prev.texts.length && prev.texts.length) {
+      const last = prev.texts.length - 1;
+      let same = texts[last]!.startsWith(prev.texts[last]!);
+      for (let j = 0; same && j < last; j++) same = texts[j] === prev.texts[j];
+      if (same)
+        joined = prev.joined + texts[last]!.slice(prev.texts[last]!.length) + texts.slice(last + 1).join("");
+    }
+    joined ??= texts.join("");
+    const { masks, state } = knownMasksFrom(
+      joined,
+      joined.length >= (prev?.joined.length ?? 0) ? prev?.scan : undefined,
+      registry,
+      true,
+    );
+    this.joined.set(type, { texts: [...texts], joined, scan: state });
+    return piecesOf(texts, joined, masks);
   }
 }
 
@@ -1145,6 +1387,7 @@ export function scrubParts<P>(
 }
 
 function scrubPartsWith<P>(parts: P[], opts: { registry?: KnownSecrets }, cache?: PartsScrubCache): P[] {
+  if (!(opts.registry ?? knownSecrets).matcher()) return parts;
   // Every value on its own — but a text or reasoning part's text only for complete matches: whether its end is a
   // cut-off secret is judged on the joined text (round 27: a part ending in a secret's first letters stays).
   let changedAny = false;
@@ -1158,8 +1401,8 @@ function scrubPartsWith<P>(parts: P[], opts: { registry?: KnownSecrets }, cache?
     }
     return scrubKnownDeep(p, opts);
   };
-  const deep = parts.map((p) => {
-    const r = cache ? cache.part(p, one) : one(p);
+  const deep = parts.map((p, k) => {
+    const r = cache ? cache.part(p, k, one) : one(p);
     if (r !== p) changedAny = true;
     return r;
   });
@@ -1173,7 +1416,7 @@ function scrubPartsWith<P>(parts: P[], opts: { registry?: KnownSecrets }, cache?
     );
     if (!idx.length) continue;
     const texts = idx.map((k) => (out[k] as { text: string }).text);
-    const next = cache ? cache.texts(type, texts, (t) => scrubJoined(t, opts)) : scrubJoined(texts, opts);
+    const next = cache ? cache.texts(type, texts) : scrubJoined(texts, opts);
     if (next.every((t, j) => t === texts[j])) continue;
     out = out === parts || out === deep ? [...out] : out;
     idx.forEach((k, j) => (out[k] = { ...(out[k] as object), text: next[j] } as P));
