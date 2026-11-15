@@ -79,6 +79,12 @@ import {
   ReferencesResponse,
   type ReferenceFormat,
   type ReferenceStyle,
+  AdminInstructionsResponse,
+  DOC_ERRORS,
+  DocVersionDetail,
+  DocVersionsResponse,
+  InstructionDoc,
+  InstructionsResponse,
 } from "@agentlee/shared";
 
 const enc = encodeURIComponent;
@@ -528,6 +534,8 @@ const MESSAGES: Record<string, string> = {
     "그사이 기본 런타임·모델(또는 허용 범위)이 바뀌었어요. 바뀐 내용을 확인하고 다시 눌러 주세요.",
   // Reference export (#26)
   ...REFERENCE_ERRORS,
+  // 내 지침 (#144)
+  ...DOC_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -707,4 +715,33 @@ export const shares = {
   view: async (id: string) => SharedView.parse(await call("GET", `/api/shares/${enc(id)}/view`)),
   /** SSE that stays open while the share reaches me; a `revoked` event (or a refused reconnect) means it is gone. */
   eventsUrl: (id: string) => `/api/shares/${enc(id)}/events`,
+};
+
+/**
+ * 내 지침 (#144, FR-16.1·16.3): one document's API, the user's own (`/api/instructions/:kind`) or the admin's
+ * (`/api/admin/instructions/:ref` — `common-agent`, `default-soul`, `account-agent:<user id>`).
+ */
+export type DocApi = {
+  save: (content: string, baseVersion: number) => Promise<InstructionDoc>;
+  versions: () => Promise<DocVersionsResponse["versions"]>;
+  version: (v: number) => Promise<DocVersionDetail>;
+  restore: (v: number, baseVersion: number) => Promise<InstructionDoc>;
+};
+const docApi = (base: string): DocApi => ({
+  save: async (content, baseVersion) =>
+    InstructionDoc.parse(await call("PUT", base, { content, baseVersion })),
+  versions: async () => DocVersionsResponse.parse(await call("GET", `${base}/versions`)).versions,
+  version: async (v) => DocVersionDetail.parse(await call("GET", `${base}/versions/${v}`)),
+  restore: async (v, baseVersion) =>
+    InstructionDoc.parse(await call("POST", `${base}/versions/${v}/restore`, { baseVersion })),
+});
+export const INSTRUCTIONS_KEY = ["instructions"] as const;
+export const instructions = {
+  list: async () => InstructionsResponse.parse(await call("GET", "/api/instructions")).docs,
+  doc: (kind: string) => docApi(`/api/instructions/${enc(kind)}`),
+};
+export const ADMIN_INSTRUCTIONS_KEY = ["admin", "instructions"] as const;
+export const adminInstructions = {
+  get: async () => AdminInstructionsResponse.parse(await call("GET", "/api/admin/instructions")),
+  doc: (ref: string) => docApi(`/api/admin/instructions/${enc(ref)}`),
 };

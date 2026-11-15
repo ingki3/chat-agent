@@ -104,7 +104,8 @@ export function seoulDate(now: Date): string {
  * - finance: only when the run's tools include a finance tool
  * - youth: only for a youth account (the son)
  * - research: only in 자료 조사 모드
- * followed by today's date. Nothing else about the user (name, email) goes in.
+ * followed by today's date. With 내 지침 (#144) the admin's AGENT.md parts go around the youth section and the user's
+ * own material box (SOUL, USER, MEMORY) last. Nothing else about the user (name, email) goes in.
  */
 export function assembleInstructions(input: {
   user: InstructionUser;
@@ -112,15 +113,29 @@ export function assembleInstructions(input: {
   tools: readonly string[];
   now: Date;
   templates?: Templates;
+  /**
+   * 내 지침 (#144, docs/memory-spec.md §2): the admin's `AGENT.md` — the family-wide part after the common rules, the
+   * per-account part after the youth guideline (가족 공통 → 청소년 지침 → 계정별) — and the user's material box (SOUL,
+   * USER, MEMORY, already wrapped — memory/inject.ts) last.
+   */
+  docs?: { agentCommon?: string | null; agentAccount?: string | null; material?: string | null };
 }): AssembledInstructions {
   const t = input.templates ?? defaultTemplates();
-  const sections: Template[] = [t.common];
-  if (input.tools.some(isFinanceTool)) sections.push(t.finance);
-  if (input.user.youth === true) sections.push(t.youth);
-  if (input.mode === "research") sections.push(t.research);
+  const family: Template[] = [t.common];
+  if (input.tools.some(isFinanceTool)) family.push(t.finance);
+  const after: Template[] = [];
+  if (input.user.youth === true) after.push(t.youth);
+  if (input.mode === "research") after.push(t.research);
+  const sections = [...family, ...after];
+  const admin = (title: string, body: string | null | undefined) =>
+    body?.trim() ? [`## ${title}\n${body.trim()}`] : [];
   const text = [
-    ...sections.map((s) => s.body),
+    ...family.map((s) => s.body),
+    ...admin("가족 공통 운영 규칙 (AGENT.md, 관리자)", input.docs?.agentCommon),
+    ...after.map((s) => s.body),
+    ...admin("이 계정의 운영 규칙 (AGENT.md, 관리자)", input.docs?.agentAccount),
     `## 오늘\n- 오늘 날짜는 ${seoulDate(input.now)} (Asia/Seoul)이다.`,
+    ...(input.docs?.material ? [input.docs.material] : []),
   ].join("\n\n");
   return {
     text,

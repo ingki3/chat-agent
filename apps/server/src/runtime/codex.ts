@@ -4,6 +4,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import Database from "better-sqlite3";
 import { renderPriorContext } from "./context.js";
+import { scrubKnown } from "../secrets/known.js";
 import { runIsolated, spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
   ExitUnconfirmedError,
@@ -942,7 +943,13 @@ export class CodexAdapter implements RuntimeAdapter {
         cancelled();
         writeMeta(conn.dir, threadId, meta);
       } else {
-        meta = readMeta(conn.dir, resumeId)!;
+        // Every secret known by now masked: a stored prompt is never sent raw again (#144).
+        const stored = readMeta(conn.dir, resumeId)!;
+        meta = {
+          ...stored,
+          instructions: scrubKnown(stored.instructions),
+          history: scrubKnown(stored.history),
+        };
         try {
           await rpc.request("thread/resume", {
             threadId: resumeId,

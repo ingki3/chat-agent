@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, type APIRequestContext, type Browser, type Page } from "@playwright/test";
+import { expect, type APIRequestContext, type Browser, type Locator, type Page } from "@playwright/test";
 
 export const ADMIN = { email: "ingki3@gmail.com", password: "e2e-admin-password", name: "관리자" };
 export const MOM = { email: "mom@example.com", password: "e2e-mom-password", name: "엄마" };
@@ -54,4 +54,25 @@ export async function signIn(page: Page, baseURL: string, who: { email: string; 
     data: { currentPassword: who.temporaryPassword, newPassword: "admin-e2e-password-1" },
     headers: csrf(baseURL),
   });
+}
+
+/**
+ * Unfolds an answer's source list (#150: folded behind its summary by default — only unverified rows show). A
+ * list with nothing to fold (every source failed) has no toggle and is left as it is.
+ */
+export async function openSources(reply: Locator) {
+  const toggle = reply.getByTestId("citation-toggle");
+  if ((await toggle.count()) && (await toggle.getAttribute("aria-expanded")) === "false") {
+    // By keyboard: a mouse click leaves a mouse pointer on the page, which mixes with a later tap on mobile.
+    await toggle.press("Enter");
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  }
+}
+
+/** The `data-status` of each source row of an answer, unfolded first. */
+export async function sourceStatuses(reply: Locator) {
+  await openSources(reply);
+  return reply
+    .getByTestId("citation-source")
+    .evaluateAll((rows) => rows.map((r) => r.getAttribute("data-status")));
 }

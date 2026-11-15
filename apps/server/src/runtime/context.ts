@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { frameExternal, publicParts, type MessagePart } from "@agentlee/shared";
 import type { MessageRow } from "../conversations/store.js";
-import { scrubParts } from "../secrets/known.js";
+import { scrubKnown, scrubParts } from "../secrets/known.js";
 import type { ContextReferences, ModelCapability, StartContext } from "./adapter.js";
 
 /**
@@ -55,14 +55,46 @@ export const REFERENCE_LIMIT = 30;
  */
 export const estimateTokens = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 
-/** What a message contributes to a runtime's context: its public text parts (never reasoning). */
-export function messageText(parts: readonly MessagePart[]): string {
-  return publicParts(parts)
+/** Characters of a file name an attachment marker keeps (#149). */
+export const ATTACHMENT_NAME_MAX = 120;
+
+/**
+ * The attachment markers of a user message (#149): one line per `file_ref`, `[첨부 파일: <name> (file:<id>)]`, so a
+ * runtime — a resumed session too — knows the message came with files and which `fileId` the file tools take. The
+ * name is the user's data, never markup: line breaks and other control or format characters become spaces, the
+ * brackets that frame the marker (and `<>`) are swapped for look-alikes, it is cut to `ATTACHMENT_NAME_MAX`, and
+ * known secrets are masked. An id that is not a plain server id is left out.
+ */
+export function attachmentLines(parts: readonly MessagePart[]): string[] {
+  return publicParts(parts).flatMap((p) => {
+    if (p.type !== "file_ref") return [];
+    const clean = (p.name ?? "")
+      .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+      .replace(/[[\]<>]/g, (c) => ({ "[": "［", "]": "］", "<": "‹", ">": "›" })[c]!)
+      .replace(/\s+/g, " ")
+      .trim();
+    const chars = Array.from(clean);
+    const name =
+      (chars.length > ATTACHMENT_NAME_MAX ? `${chars.slice(0, ATTACHMENT_NAME_MAX).join("")}…` : clean) ||
+      "이름 없는 파일";
+    const id = /^[A-Za-z0-9_-]{1,64}$/.test(p.fileId) ? ` (file:${p.fileId})` : "";
+    return [scrubKnown(`[첨부 파일: ${name}${id}]`)];
+  });
+}
+
+/**
+ * What a message contributes to a runtime's context: its public text parts (never reasoning) and — for a user
+ * message (`attachments`) — its attachment markers after the text (#149).
+ */
+export function messageText(parts: readonly MessagePart[], o: { attachments?: boolean } = {}): string {
+  const text = publicParts(parts)
     .flatMap((p) => (p.type === "text" ? [p.text] : []))
     .join("\n")
     .trim();
+  const files = o.attachments ? attachmentLines(parts) : [];
+  return files.length ? [text, files.join("\n")].filter(Boolean).join("\n\n") : text;
 }
-const textOf = (m: MessageRow) => messageText(m.parts as MessagePart[]);
+const textOf = (m: MessageRow) => messageText(m.parts as MessagePart[], { attachments: m.role === "user" });
 /** A message the runtime gets text from (dividers, tool-only and empty replies carry none). */
 export const speaks = (m: MessageRow): boolean => textOf(m) !== "";
 /** Per-message overhead of the rendering (role line, separators). */
@@ -240,10 +272,7 @@ export function renderPriorContext(
   ctx: Pick<StartContext, "history" | "summary" | "references"> & Partial<Pick<StartContext, "tools">>,
 ): string {
   const lines = ctx.history.flatMap((h) => {
-    const text = h.parts
-      .flatMap((p) => (p.type === "text" ? [p.text] : []))
-      .join("\n")
-      .trim();
+    const text = messageText(h.parts, { attachments: h.role === "user" });
     return text ? [`[${ROLE_LABEL[h.role]}]\n${text}`] : [];
   });
   const blocks: string[] = [];

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router";
 import type { AuthState } from "@agentlee/shared";
 import { ChangePassword } from "../auth-screens.js";
 import { TopBar } from "../Shell.js";
@@ -46,6 +47,15 @@ export function SettingsPage({
               </label>
             ))}
           </div>
+        </section>
+        <section className="panel" aria-labelledby="instructions-h">
+          <h2 id="instructions-h">내 지침</h2>
+          <p className="muted small">
+            말투(SOUL), 나에 대한 정보(USER), 오래 기억할 것(MEMORY)을 적어 두면 새 대화마다 들어가요.
+          </p>
+          <Link to="/settings/instructions" className="btnlink" data-testid="open-instructions">
+            내 지침 열기
+          </Link>
         </section>
         <DefaultsPanel />
         <RuntimeConnections isAdmin={isAdmin} />

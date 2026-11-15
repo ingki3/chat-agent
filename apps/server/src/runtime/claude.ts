@@ -11,6 +11,7 @@ import {
   type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { renderPriorContext } from "./context.js";
+import { scrubKnown } from "../secrets/known.js";
 import { spawnIsolated, type SpawnIsolatedOptions } from "../isolation/sandbox.js";
 import {
   ExitUnconfirmedError,
@@ -126,6 +127,8 @@ function readMeta(dir: string, id: string): SessionMeta | undefined {
     return undefined;
   }
 }
+/** A resumed session's stored prompt, with every secret known by now masked: it is never sent raw again (#144). */
+const scrubbedMeta = (m: SessionMeta): SessionMeta => ({ ...m, systemPrompt: scrubKnown(m.systemPrompt) });
 function writeMeta(dir: string, id: string, m: SessionMeta) {
   fs.mkdirSync(metaDir(dir), { recursive: true, mode: 0o700 });
   const f = metaFile(dir, id);
@@ -300,7 +303,7 @@ export class ClaudeAdapter implements RuntimeAdapter {
     // The system prompt is fixed when the session starts (with the history it was given) and reused on resume.
     const meta: SessionMeta = s.fresh
       ? { systemPrompt: ctx.systemPrompt + historyPrompt(ctx), costUsd: 0 }
-      : readMeta(conn.dir, s.sessionId)!;
+      : scrubbedMeta(readMeta(conn.dir, s.sessionId)!);
     // Live in this process from now until it is closed and its processes have exited — a resumed one too (#54
     // review round 4: the reconciliation's last check never takes a session in use for an orphan).
     noteStarted(s.sessionId);

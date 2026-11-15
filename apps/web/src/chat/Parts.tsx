@@ -5,7 +5,7 @@ import { files } from "../api.js";
 import { useFileViewHref } from "../files/context.js";
 import { RichText } from "./RichText.js";
 import type { MarkdownCite } from "./Markdown.js";
-import { CitationMarker } from "../citations/CitationMarker.js";
+import { CitationMarkers } from "../citations/CitationMarker.js";
 import { CitationSources } from "../citations/CitationNote.js";
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
@@ -293,7 +293,7 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
     const byN = new Map(note.citations.map((c) => [c.n, c]));
     return {
       numbers: markerNumbers(note),
-      render: (n) => <CitationMarker view={citationView(n, byN.get(n))} />,
+      render: (ns) => <CitationMarkers views={ns.map((n) => citationView(n, byN.get(n)))} />,
     };
   }, [note]);
   // The answer text as the server joined it (the note's ranges point into it).

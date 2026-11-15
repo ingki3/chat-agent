@@ -3,7 +3,7 @@ import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.j
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
 import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
-import { renderPriorContext, SUMMARY_MARKER } from "./context.js";
+import { messageText, renderPriorContext, SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
 import { pythonScenario, type PythonScenario } from "./fake-python.js";
 import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
@@ -369,6 +369,9 @@ export function scheduleSteps(t: string): FakeStep[] | undefined {
   ];
 }
 
+/** The turn's text without the server's attachment marker lines (#149): scripts match the typed text. */
+const typedText = (text: string) => text.replace(/(?:\n*\[첨부 파일: [^\n]*\])+\s*$/u, "");
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(SUMMARY_MARKER))
@@ -558,10 +561,8 @@ export class FakeRuntime implements RuntimeAdapter {
     this.transcripts.set(id, [
       ...(ctx.summary ? [{ role: "summary", text: ctx.summary.text.trim() }] : []),
       ...ctx.history.flatMap((h) => {
-        const text = h.parts
-          .flatMap((p) => (p.type === "text" ? [p.text] : []))
-          .join("\n")
-          .trim();
+        // As `renderPriorContext` hands it to a real runtime: a user message with its attachment markers (#149).
+        const text = messageText(h.parts, { attachments: h.role === "user" });
         return text ? [{ role: h.role, text }] : [];
       }),
     ]);
@@ -605,7 +606,11 @@ export class FakeRuntime implements RuntimeAdapter {
         transcript.push(reply);
         state.memory.push(input.text);
         const ctrl = new AbortController();
-        const steps = script({ ...input, model: input.model || state.model }, state.memory);
+        // Scripts match the typed text (their commands); `turnLog` keeps what the server really sent (#149).
+        const steps = script(
+          { ...input, text: typedText(input.text), model: input.model || state.model },
+          state.memory,
+        );
         async function* events(): AsyncGenerator<RuntimeEvent> {
           let seq = 0;
           const outputs: unknown[] = [];

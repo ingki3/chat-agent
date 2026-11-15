@@ -5,6 +5,7 @@ import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { SpawnIsolatedOptions } from "../../src/isolation/sandbox.js";
 import type { CodexChild } from "../../src/runtime/codex.js";
+import { recordedPrompt } from "./claude-replay.js";
 import { callOurTool, isLiveCall, liveArgs } from "./live-mcp.js";
 
 /**
@@ -362,7 +363,7 @@ export function replaySpawn(
           }
           case "turn/start": {
             const text = String((m.params?.input as { text?: string }[] | undefined)?.[0]?.text ?? "");
-            const recorded = rec[text];
+            const recorded = rec[text] ?? rec[recordedPrompt(text)];
             if (!recorded) {
               log.errors.push(`no recording for prompt: ${text.slice(0, 40)}`);
               fail();

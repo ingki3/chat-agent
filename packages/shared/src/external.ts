@@ -32,3 +32,15 @@ export function frameExternal(input: { source: string; content: string }): strin
   const content = defuseExternal(input.content);
   return `<${EXTERNAL_TAG} source="${source}">\n${content}\n</${EXTERNAL_TAG}>`;
 }
+
+/**
+ * Defuses every tag named `tag` in `content` (same lookalike and invisible-character rules as `defuseExternal`): the
+ * 내 지침 box (#144) uses it so a user's document cannot close the box or open a fake section.
+ */
+export function defuseTag(content: string, tag: string): string {
+  const re = new RegExp(
+    `${LT}${INVISIBLE}(${SLASH}?)${INVISIBLE}${[...tag].map(letter).join(INVISIBLE)}`,
+    "g",
+  );
+  return content.replace(re, (_m, slash: string) => `&lt;${slash ? "/" : ""}${tag}`);
+}

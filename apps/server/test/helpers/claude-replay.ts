@@ -19,6 +19,12 @@ export type RecordedTurn = {
 export type Recording = Record<string, RecordedTurn | SDKMessage[]>;
 const turnOf = (t: RecordedTurn | SDKMessage[]): RecordedTurn => (Array.isArray(t) ? { messages: t } : t);
 
+/**
+ * The prompt a recording is keyed by: the turn's text without the server's attachment marker lines (#149) — the
+ * recordings were made from the typed prompt; the log keeps what was really sent.
+ */
+export const recordedPrompt = (text: string) => text.replace(/(?:\n*\[첨부 파일: [^\n]*\])+\s*$/u, "");
+
 /** Also records what the adapter asked for, so tests can check the options it passed. */
 export type ReplayLog = { options: Options[]; prompts: string[]; interrupts: number; closes: number };
 
@@ -47,7 +53,7 @@ export function replayQuery(rec: Recording, log: ReplayLog, delayMs = 5): typeof
     async function* gen(): AsyncGenerator<SDKMessage> {
       const text = await firstText(params.prompt as AsyncIterable<SDKUserMessage>);
       log.prompts.push(text);
-      const recorded = rec[text];
+      const recorded = rec[text] ?? rec[recordedPrompt(text)];
       if (!recorded) throw new Error(`no recording for prompt: ${text.slice(0, 40)}`);
       const turn = turnOf(recorded);
       // Like the CLI: a session gets its transcript file in the config folder.

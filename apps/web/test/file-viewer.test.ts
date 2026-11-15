@@ -115,7 +115,8 @@ describe("links to the viewer", () => {
   });
 
   it("a verified file citation links to its place — in the source list and the preview; a failed one does not", () => {
-    const list = inRouter(CitationSources, { note });
+    // Unfolded (#150: a verified row is folded away until the summary is opened).
+    const list = inRouter(CitationSources, { note, defaultExpanded: true });
     const href = fileViewPath("c1", "f1", locator).replace(/&/g, "&amp;");
     expect(list).toContain(`href="${href}"`);
     expect(list.match(/data-testid="citation-file-link"/g)).toHaveLength(1);
@@ -126,9 +127,9 @@ describe("links to the viewer", () => {
       "citation-open-file",
     );
     // Without a conversation (an artifact share): no link at all — and no router needed.
-    expect(renderToStaticMarkup(createElement(CitationSources, { note }))).not.toContain(
-      "citation-file-link",
-    );
+    expect(
+      renderToStaticMarkup(createElement(CitationSources, { note, defaultExpanded: true })),
+    ).not.toContain("citation-file-link");
   });
 
   it("a file chip keeps its download and adds 보기", () => {

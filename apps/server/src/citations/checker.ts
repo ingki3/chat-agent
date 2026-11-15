@@ -88,11 +88,48 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
 
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
 
+/**
+ * Tools whose call makes this run's numbers its own (#150): a search, a fetch or the news skill (new material for
+ * new numbers), and any `cite` or `file_cite` call — refused ones too (review #153: a refused call registers no row,
+ * yet the model may still write the number it meant).
+ */
+const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
+  WEB_SEARCH_TOOL.name,
+  WEB_FETCH_TOOL.name,
+  skillToolName(GOOGLE_NEWS_SKILL.name),
+  CITE_TOOL.name,
+  FILE_CITE_TOOL.name,
+]);
+const ownsNumbers = (name: string) =>
+  OWN_NUMBER_TOOLS.has(name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name);
+
+/**
+ * Carrying numbers over (#150): a follow-up ("내용 요약해줘") that writes the previous answer's `[n]` again without
+ * citing anything itself. `previous` gives the citations of the newest earlier answer of the conversation that has
+ * a citation note (the server's own note — a runtime cannot write one); a marker this run has no citation for takes
+ * that answer's citation with the same number, **checked again now** (`CitationStore.recheck`: the source must
+ * still be this conversation's and this user's, the passage is looked for in its stored text).
+ *
+ * The rule, and its precedence: numbers are per run, so a carry-over happens only when this run registered **no**
+ * citation, **called** no `cite`/`file_cite` (a refused call counts — review #153) and brought in no source of its
+ * own (no search, fetch or news skill) — then its numbers can only be the earlier ones. As soon as it cites or tries
+ * to (or fetches something new), every number is this run's: a marker without a citation of this run stays
+ * `unknown_source`, whatever an earlier answer had under that number. File citations are not carried (their check
+ * waits for the extraction); they stay `unknown_source`. An answer that carries a number is an answer using
+ * sources: its paragraphs without a marker are flagged as missing (review #153).
+ */
+export type CitationCarry = {
+  conversationId: string;
+  userId: string;
+  previous: () => readonly CitationEntry[];
+};
+
 /** The note for one run's answer, or undefined when the check does not apply (or there is nothing to say). */
 export function citationNote(
   runId: string,
   parts: readonly MessagePart[],
-  store: Pick<CitationStore, "forRun">,
+  store: Pick<CitationStore, "forRun"> & Partial<Pick<CitationStore, "recheck">>,
+  carry?: CitationCarry,
 ): CitationNotePart | undefined {
   const rows = store.forRun(runId);
   const used = rows.length > 0 || parts.some((p) => p.type === "tool_call" && isWebTool(p.name));
@@ -104,8 +141,36 @@ export function citationNote(
   if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
+  let earlier: Map<number, CitationEntry> | undefined;
+  let carriedAny = false;
+  const carriedFrom = (n: number): CitationEntry | undefined => {
+    if (!carry || !store.recheck || rows.length) return undefined;
+    if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return undefined;
+    earlier ??= new Map(carry.previous().map((e) => [e.n, e]));
+    const e = earlier.get(n);
+    if (!e?.sourceId || e.status === "unknown_source") return undefined;
+    // What the earlier answer quoted (verified: the passage itself; otherwise the snippet it sent).
+    const c = e.quote ? store.recheck(carry, { sourceId: e.sourceId, snippet: e.quote }) : undefined;
+    if (!c) return undefined;
+    const s = c.source;
+    carriedAny = true;
+    return {
+      n,
+      status: c.status,
+      sourceId: s.id,
+      title: bound(s.title, CITATION_LIMITS.title),
+      site: bound(s.site, CITATION_LIMITS.site),
+      url: bound(s.finalUrl ?? s.url, CITATION_LIMITS.url),
+      publishedAt: s.publishedAt ?? null,
+      quote: bound(c.status === "verified" ? c.quote : e.quote, CITATION_LIMITS.snippet),
+    };
+  };
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
     const r = byN.get(n);
+    if (!r) {
+      const carried = carriedFrom(n);
+      if (carried) return carried;
+    }
     // A file citation (#48): the file's name and the place; the locator only for a verified passage.
     if (r?.fileId && r.file && r.status !== "unknown_source") {
       const parsed =
@@ -147,11 +212,13 @@ export function citationNote(
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
     };
   });
-  const missing = used
-    ? uncitedUnits(text)
-        .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
-        .slice(0, CITATION_LIMITS.missing)
-    : [];
+  // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
+  const missing =
+    used || carriedAny
+      ? uncitedUnits(text)
+          .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
+          .slice(0, CITATION_LIMITS.missing)
+      : [];
   return {
     type: "citation_note",
     citations,

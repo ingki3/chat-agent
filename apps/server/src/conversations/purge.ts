@@ -223,6 +223,46 @@ export class ConversationPurge {
   }
 
   /**
+   * Runtime sessions of live conversations to be forgotten (#144, docs/memory-spec.md §10.5: started with a 내 지침
+   * version that held an item the deletion linkage removed). Called inside the caller's transaction: each session is
+   * invalidated (never resumed again) and becomes a job of its conversation — run once that conversation's runs have
+   * stopped (a running turn ends first, `quiet`), resumed at start like every job when the server stopped in between.
+   */
+  claimSessions(
+    sessions: {
+      id: string;
+      conversationId: string;
+      userId: string;
+      runtime: string;
+      connectionId: string | null;
+      externalSessionId: string;
+    }[],
+  ): void {
+    if (!sessions.length) return;
+    const sql = this.db.$client;
+    const t = this.now();
+    const insert = sql.prepare(CLAIM_JOB);
+    const invalidate = sql.prepare(
+      "UPDATE runtime_sessions SET invalidated = 1, updated_at = ? WHERE id = ?",
+    );
+    for (const s of sessions) {
+      invalidate.run(t, s.id);
+      insert.run(
+        crypto.randomUUID(),
+        "runtime_session",
+        s.conversationId,
+        s.userId,
+        s.runtime,
+        s.connectionId,
+        s.externalSessionId,
+        t,
+        t,
+      );
+    }
+    this.schedule(0);
+  }
+
+  /**
    * Start-up reconciliation (only on the data folder's own database, before anything runs): every session a runtime
    * keeps state of in `runtimes/<connection>/<user>/` (`RuntimeAdapter.storedSessions`) that no `runtime_sessions` row
    * of that connection names becomes a job. That is a session whose row was never saved — the server died between the
