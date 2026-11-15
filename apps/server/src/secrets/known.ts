@@ -1093,6 +1093,18 @@ export type ScanState = {
   views: { pct: boolean; esc: boolean };
 };
 
+/**
+ * How far back from its end a text must hold no backslash and no percent sequence for a scan of it grown to start
+ * late: further than any decision of a view looks ahead (a percent-encoded 4-byte character is 12 characters,
+ * `\uXXXX` 6, a `\n` strip one past its backslash run). A "%" not followed by two hex digits is decided (it stays
+ * a "%"), unless the text ends before they could come.
+ */
+const UNSTABLE_TAIL = 16;
+function stableTail(text: string): boolean {
+  const t = text.slice(-UNSTABLE_TAIL);
+  return !t.includes("\\") && !/%[0-9A-Fa-f]{2}/.test(t) && !/%[0-9A-Fa-f]?$/.test(t);
+}
+
 /** How far back from a held match the scan of a grown text may look for its starting point (else: full scan). */
 const RESCAN_BACK = 4096;
 const isSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
@@ -1100,11 +1112,17 @@ const isSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
 /**
  * `knownMasks(text)` for a text that may be `prev.text` grown at its end — the same result, scanning only the new
  * part and what lies just before it (#155: a run's reply grows between saves; scanning it whole at each save is
- * quadratic). Exact, by these facts of the matcher, for a previous text where nothing was found (`clean`):
+ * quadratic). Exact, by these facts of the matcher, for a previous text where nothing was found (`clean`) and whose
+ * end is stable (`stableTail`):
  *
- * - every search is forward from its start: a start whose search touched the end of the previous text reported a
- *   match the text ends inside, so every start before `partialAt` failed on characters of the previous text, and
- *   fails the same way now (raw, encoded, base64/hex in the stripped view, either decoded view, KMP shifts);
+ * - every view of the previous text (percent- and escape-decoded, and the stripped view base64 and hex are found
+ *   in, of the text and of each decoded view) is the start of the same view of the grown text. Only a decision
+ *   that looks past the end could change: a backslash run (a `\n` strip, an escape), a `%` sequence, an escape
+ *   decoding to a backslash — none is within `UNSTABLE_TAIL` characters of a stable end (#159 review 2: a trailing
+ *   "\\\\" became a `\n` strip once "n" came, and a base64 match from before the held point went through it);
+ * - every search is forward from its start, in the text and in each view: a start whose search touched the end
+ *   reported a match the text ends inside, so every start before `partialAt` failed on what was already there, and
+ *   fails the same way now (raw, encoded, base64/hex, KMP shifts);
  * - the rescan starts right after a whitespace character at or before `partialAt` (or at the start): no escape,
  *   percent sequence or `\n` strip spans whitespace, and a base64 match's edge never crosses it, so every view of
  *   the rest is the same as that part of the whole text's view;
@@ -1146,15 +1164,18 @@ export function knownMasksFrom(
     const old = prev.text.length;
     // The same text: the same (empty) result.
     if (n === old) return { masks: [], state: prev };
-    const held = Math.min(prev.partialAt, old);
+    // A stable end only (#159 review 2): no backslash or percent sequence near it (`stableTail`) — else what comes
+    // next may still change how the end reads (a backslash run that becomes a `\n` strip, `%5`, `\u00`, a percent
+    // sequence decoding to a backslash), and so a view of the earlier text: the whole text is scanned.
+    const held = stableTail(prev.text) ? Math.min(prev.partialAt, old) : -1;
     // Right after the last whitespace before the earliest held match (or the very start).
     let w0 = -1;
-    for (let k = held - 1; k >= Math.max(0, held - RESCAN_BACK); k--)
+    for (let k = held - 1; held >= 0 && k >= Math.max(0, held - RESCAN_BACK); k--)
       if (isSpace(text.charCodeAt(k))) {
         w0 = k + 1;
         break;
       }
-    if (w0 < 0 && held <= RESCAN_BACK) w0 = 0;
+    if (w0 < 0 && held >= 0 && held <= RESCAN_BACK) w0 = 0;
     if (w0 >= 0) {
       const sub = text.slice(w0);
       const delta = text.slice(old);

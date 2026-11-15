@@ -236,8 +236,9 @@ describe("knownMasksFrom: a text grown at its end, scanned from just before wher
       }
     }
     // Once something is found the text is scanned whole (by design): the short way is taken up to the first
-    // secret, and the growth into it — the case this checks — is one of those (about 900 of 10 500 here).
-    expect(short, `${short} of ${calls} growths scanned short`).toBeGreaterThan(500);
+    // secret, and the growth into it — the case this checks — is one of those; so is an end with a backslash or a
+    // percent sequence near it (#159 review 2). About 240 of 10 500 here, with backslashes and "%" everywhere.
+    expect(short, `${short} of ${calls} growths scanned short`).toBeGreaterThan(150);
     expect(incremental).toBeLessThan(full);
   }, 60_000);
 
@@ -245,8 +246,25 @@ describe("knownMasksFrom: a text grown at its end, scanned from just before wher
     const reg = new KnownSecrets();
     for (const v of secrets) reg.add(v);
     const r = rng(155);
+    // Prose ("%" after a figure is decided: it stays a "%"); a backslash or a percent sequence near the end would
+    // make that growth a full scan.
+    const prose = [
+      " ",
+      "  ",
+      "\n",
+      "\t",
+      "평범한 글 ",
+      "ordinary ",
+      "3.2% ",
+      "+",
+      "=",
+      "abc",
+      "QUJD",
+      "0a1b",
+      '"',
+    ];
     let source = "";
-    while (source.length < 200_000) source += filler[r(filler.length)]!;
+    while (source.length < 200_000) source += prose[r(prose.length)]!;
     let text = "";
     let state: ScanState | undefined;
     const before = scanStats.chars;
@@ -255,12 +273,75 @@ describe("knownMasksFrom: a text grown at its end, scanned from just before wher
       state = knownMasksFrom(text, state, reg, true).state;
     }
     const scanned = scanStats.chars - before;
-    // 400 growths of 500 characters: a full scan each time would be ~40 M characters.
+    // 400 growths of 500 characters: a full scan each time would be ~40 M characters (200 × the text). A growth
+    // that ends right after a "%" (it may still become `%5C`) scans the whole text: a few of the 400.
     expect(scanned, `${scanned} characters for a 200 kB text grown 400 times`).toBeLessThan(
-      2 * source.length,
+      10 * source.length,
     );
     expect(knownMasksFrom(text, undefined, reg, true).masks).toEqual(knownMasks(text, { registry: reg }));
   });
+
+  it("#159 review 2: a backslash run at the end that the next character turns into a `\\n` strip", () => {
+    // The base64 view takes `\n` escapes out: "\\" + "n" is one, so the end of the first text read differently
+    // once it grew — a match starting before the held point (none was held: the backslashes stopped it).
+    const reg = new KnownSecrets();
+    reg.add("abcdefghijklmno");
+    const first = "YWJj ZGVm" + "\\".repeat(2);
+    const next = first + "nZ2hpamtsbW5v";
+    const prev = knownMasksFrom(first, undefined, reg, true);
+    expect(knownMasks(next, { registry: reg })).toEqual([[0, 24]]);
+    expect(knownMasksFrom(next, prev.state, reg, true).masks).toEqual([[0, 24]]);
+  });
+
+  it("boundary fuzz: transform-sensitive characters at the end of a text and at the start of what follows", () => {
+    // Every encoding of two secrets, cut in the middle; between the halves, the last 4 characters of the first text
+    // and the first 4 of what is appended — exhaustive over the characters that change how a view reads (escapes,
+    // percent, hex digits, the `\n` strip, whitespace kinds, quotes), on one side at a time, then random on both.
+    const reg = new KnownSecrets();
+    const a = "abcdefghijklmno";
+    const b = 'a/b+c d%e\\f"155';
+    reg.add(a);
+    reg.add(b);
+    const encodings = [
+      Buffer.from(a).toString("base64"),
+      Buffer.from(a).toString("hex"),
+      encodeURIComponent(b),
+      JSON.stringify(JSON.stringify(b)).slice(1, -1),
+      [...b].map((c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")).join(""),
+    ];
+    const sensitive = ["\\", "%", "5", "C", "u", "x", "0", "n", "r", "t", " ", "\t", "\r", "\n", '"', "a"];
+    const core = ["\\", "%", "5", "C", "u", "n", " ", "\r", '"', "a"];
+    const fixedTails = ["", "\\", "\\\\", "%5", "%5C", "\\u00", "\\x5", " \\", "% ", "3%", "%2 ", "%E3%8"];
+    const fixedHeads = ["", "n", "\\n", "5C", "C", "u005c", "x5c", " "];
+    const words = (alphabet: string[], k: number): string[] =>
+      k === 0 ? [""] : words(alphabet, k - 1).flatMap((w) => alphabet.map((c) => w + c));
+    let cases = 0;
+    let short = 0;
+    const check = (e: string, tail: string, head: string, mode: boolean) => {
+      const c = e.length >> 1;
+      const first = "x " + e.slice(0, c) + tail;
+      const next = first + head + e.slice(c) + " y";
+      const prev = knownMasksFrom(first, undefined, reg, mode);
+      const before = scanStats.chars;
+      const got = knownMasksFrom(next, prev.state, reg, mode).masks;
+      if (scanStats.chars - before < next.length) short++;
+      cases++;
+      const want = knownMasks(next, { registry: reg, tail: mode });
+      if (JSON.stringify(got) !== JSON.stringify(want))
+        expect(got, JSON.stringify({ first, next, mode })).toEqual(want);
+    };
+    const four = words(core, 4);
+    let k = 0;
+    for (const e of encodings) {
+      for (const t of four) for (const h of fixedHeads) check(e, t, h, k++ % 2 === 0);
+      for (const h of four) for (const t of fixedTails) check(e, t, h, k++ % 2 === 0);
+    }
+    const r = rng(1592);
+    const pick = () => Array.from({ length: 4 }, () => sensitive[r(sensitive.length)]).join("");
+    for (let j = 0; j < 40_000; j++) check(encodings[r(encodings.length)]!, pick(), pick(), j % 2 === 0);
+    // Not only full scans: the short way was taken where the end was stable.
+    expect(short, `${short} of ${cases} took the short way`).toBeGreaterThan(cases / 10);
+  }, 300_000);
 
   it("a scan that ran out of work is never continued: the whole text again (an adversarial repeated prefix)", () => {
     const reg = new KnownSecrets();
@@ -359,6 +440,31 @@ describe("ConversationStore.updateMessage: a message saved again and again", () 
     parts[0] = { type: "tool_result", callId: "c1", output: null };
     store.updateMessage(msg.id, { parts });
     expect(JSON.parse(rawParts(msg.id))).toEqual([{ type: "tool_result", callId: "c1", output: null }]);
+  });
+
+  it("#159 review 2: a base64 secret completed by a `\\n` strip is masked in the stored row (text, reasoning; one part or split)", async () => {
+    const { app, f, rawParts } = await start();
+    const store = app.conversations!;
+    register("abcdefghijklmno");
+    const first = "YWJj ZGVm" + "\\".repeat(2);
+    const second = "nZ2hpamtsbW5v";
+    for (const type of ["text", "reasoning"] as const)
+      for (const split of [false, true]) {
+        const conv = store.create(f.users.owner.id);
+        const msg = store.append(conv.id, { role: "assistant", parts: [], status: "streaming" });
+        const parts: MessagePart[] = [{ type, text: first }];
+        store.updateMessage(msg.id, { parts });
+        if (split)
+          parts.push(
+            { type: "tool_call", id: "c", name: "sources_list", input: {} },
+            { type: "tool_result", callId: "c", output: {} },
+            { type, text: second },
+          );
+        else (parts[0] as { text: string }).text += second;
+        store.updateMessage(msg.id, { parts });
+        expect(JSON.parse(rawParts(msg.id)), `${type} split ${split}`).toEqual(scrubParts(parts));
+        expect(rawParts(msg.id)).not.toContain("ZGVm");
+      }
   });
 
   it("a secret split across two text parts (around a tool call) is masked once its second half is saved", async () => {
