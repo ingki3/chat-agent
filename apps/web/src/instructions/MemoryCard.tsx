@@ -2,7 +2,14 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import type { MemoryProposal } from "@agentlee/shared";
-import { ApiError, errorText, INSTRUCTIONS_KEY, memoryProposalKey, memoryProposals } from "../api.js";
+import {
+  ApiError,
+  DREAMING_KEY,
+  errorText,
+  INSTRUCTIONS_KEY,
+  memoryProposalKey,
+  memoryProposals,
+} from "../api.js";
 import {
   cardFromError,
   cardGone,
@@ -31,6 +38,7 @@ export function MemoryCard({ id }: { id: string }) {
   const settle = (p: MemoryProposal) => {
     qc.setQueryData(memoryProposalKey(id), p);
     void qc.invalidateQueries({ queryKey: INSTRUCTIONS_KEY });
+    if (p.origin === "dreaming") void qc.invalidateQueries({ queryKey: DREAMING_KEY });
   };
   const act = useMutation({
     mutationFn: (a: { kind: "accept" | "reject"; indexes: number[] } | { kind: "undo" }) =>
@@ -83,7 +91,13 @@ export function MemoryCard({ id }: { id: string }) {
       <div className="row">
         <span aria-hidden>🧠</span>
         <b id={headId} className="grow">
-          {applied ? "기억했어요" : "기억 변경 제안"}
+          {p.origin === "dreaming"
+            ? applied
+              ? "기억 정리가 반영했어요"
+              : "기억 정리 제안"
+            : applied
+              ? "기억했어요"
+              : "기억 변경 제안"}
         </b>
         {pending.length > 0 && <span className="badge">확인 필요</span>}
       </div>

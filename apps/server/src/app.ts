@@ -137,6 +137,10 @@ import { claimIfStale, linkMemoryDeletion, reclaimStaleSessions } from "./memory
 import { registerMemoryRoutes } from "./memory/routes.js";
 import { MemoryProposals } from "./memory/proposals.js";
 import { registerMemoryProposalRoutes } from "./memory/proposal-routes.js";
+import { DreamingStore } from "./dreaming/store.js";
+import { DreamingRunner } from "./dreaming/runner.js";
+import { DreamingEngine } from "./dreaming/engine.js";
+import { registerDreamingRoutes } from "./dreaming/routes.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -210,6 +214,8 @@ declare module "fastify" {
     memory: MemoryDocs | undefined;
     /** 대화 중 기억해줘 (#145): the tool's bundles (cards) and the setting; undefined without a database. */
     memoryProposals: MemoryProposals | undefined;
+    /** 기억 정리 (#146); undefined without a database. */
+    dreaming: { store: DreamingStore; engine: DreamingEngine; runner: DreamingRunner } | undefined;
   }
 }
 
@@ -323,6 +329,11 @@ export type BuildOptions = {
     /** The real handler's test limits (#56): an attempt's conversation run timeout. */
     runtime?: { runTimeoutMs?: number };
   };
+  /**
+   * 기억 정리 (#146): a clock, the model call's time limit, and `start: true` to run the schedule in a test (it runs by
+   * itself only in a server that holds the data folder lock).
+   */
+  dreaming?: { now?: () => number; timeoutMs?: number; start?: boolean; maxSleepMs?: number };
   /**
    * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
    * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
@@ -843,12 +854,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("purge", deletion);
     // Deleting a conversation or cutting messages from a history takes the 내 지침 items citing them with it, from every
     // version, and forgets the sessions that were started with those versions (#144, docs/memory-spec.md §10).
+    // 기억 정리 (#146): its store first — the deletion linkage drops queue entries of messages that leave the history.
+    const dreamingStore = new DreamingStore(opts.db!, settingsStore, opts.dreaming?.now ?? Date.now);
     linkMemoryDeletion({
       db: opts.db!,
       conversations: app.conversations!,
       store: memory.store,
       purge: deletion,
       proposals: memoryProposals,
+      dreaming: dreamingStore,
       log: app.log,
     });
     app.decorate("memory", memory);
@@ -1058,6 +1072,66 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       scheduleWarnings.stop();
       await scheduleEngine.stop();
     });
+    // 기억 정리 (#146, FR-16.5·16.6): the admin's shared API key connection, once a day per user, without tools.
+    const dreamingNow = opts.dreaming?.now ?? Date.now;
+    const dreamingRunner = new DreamingRunner({
+      db: opts.db!,
+      store: dreamingStore,
+      memory: memory.store,
+      proposals: memoryProposals,
+      registry: runtimes,
+      connections: connectionStore,
+      users: users!,
+      usage,
+      forgetSession: (ref) => deletion.orphan(ref),
+      notify: (userId, kind, count, runId) => {
+        const n = app.notifications;
+        if (!n?.wants(userId, kind)) return;
+        n.publish(userId, { kind, count }, { dedupeKey: `dreaming:${runId}:${kind}` });
+      },
+      now: dreamingNow,
+      log: app.log,
+      ...(opts.dreaming?.timeoutMs ? { timeoutMs: opts.dreaming.timeoutMs } : {}),
+    });
+    const dreamingEngine = new DreamingEngine({
+      db: opts.db!,
+      store: dreamingStore,
+      runner: dreamingRunner,
+      busy: (userId) =>
+        !!opts
+          .db!.$client.prepare(
+            "select 1 from runs where user_id = ? and status in ('queued', 'running') limit 1",
+          )
+          .get(userId),
+      alert: (date, count) => {
+        for (const admin of connectionStore.admins())
+          app.notifications?.publish(
+            admin,
+            { kind: "dreaming_failed", users: count },
+            { dedupeKey: `dreaming_failed:${date}:${admin}` },
+          );
+        logEvent(app.log, "warn", "dreaming.alert_sent", { count });
+      },
+      now: dreamingNow,
+      log: app.log,
+      ...owned,
+      ...(opts.dreaming?.maxSleepMs ? { maxSleepMs: opts.dreaming.maxSleepMs } : {}),
+    });
+    app.decorate("dreaming", { store: dreamingStore, engine: dreamingEngine, runner: dreamingRunner });
+    registerDreamingRoutes(app, {
+      store: dreamingStore,
+      engine: dreamingEngine,
+      runner: dreamingRunner,
+      proposals: memoryProposals,
+      users: users!,
+      registry: runtimes,
+      connections: connectionStore,
+      manualRuns: config.fakeRuntime,
+      now: dreamingNow,
+    });
+    if (opts.dreaming?.start || (config.env !== "test" && dataLock))
+      app.addHook("onReady", async () => dreamingEngine.start());
+    app.addHook("preClose", async () => dreamingEngine.stop());
     registerSourceRoutes(app, app.conversations!, sources);
     registerWatchlistRoutes(app, { store: watchlist, mcp });
     // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
@@ -1138,6 +1212,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
   } else {
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
+    app.decorate("dreaming", undefined);
     app.decorate("artifacts", undefined);
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);

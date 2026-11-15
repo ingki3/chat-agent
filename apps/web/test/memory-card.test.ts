@@ -65,9 +65,17 @@ describe("memory card (#145)", () => {
       "외부 자료",
     );
     expect(cardSummary({ mode: "review", forced: null, decisions: [d("pending")] })).toBeNull();
+    // 기억 정리 (#146): an expired bundle is taken up again by the next run; a suspicious source waits for review.
+    expect(
+      cardSummary({ origin: "dreaming", mode: "review", forced: null, decisions: [d("expired")] }),
+    ).toContain("다시 정리할게요");
+    expect(cardSummary({ mode: "auto", forced: "suspicious", decisions: [d("pending")] })).toContain(
+      "지시처럼 보이는",
+    );
     const card: MemoryProposal = {
       id,
       conversationId: "c",
+      origin: "tool",
       mode: "review",
       forced: null,
       decisions: [d("expired")],

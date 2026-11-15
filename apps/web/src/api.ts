@@ -86,6 +86,14 @@ import {
   InstructionDoc,
   InstructionsResponse,
   MEMORY_PROPOSAL_ERRORS,
+  DREAMING_ERRORS,
+  DreamingAdmin,
+  DreamingPreview,
+  DreamingPromptVersions,
+  DreamingPromptView,
+  DreamingUserStatus,
+  MyDreaming,
+  type DreamingConfig,
   MemoryPrefs,
   MemoryProposal,
   type MemoryApplyMode,
@@ -541,6 +549,8 @@ const MESSAGES: Record<string, string> = {
   // 내 지침 (#144)
   ...DOC_ERRORS,
   ...MEMORY_PROPOSAL_ERRORS,
+  // 기억 정리 (#146)
+  ...DREAMING_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -772,4 +782,35 @@ export const memoryPrefs = {
   get: async () => MemoryPrefs.parse(await call("GET", "/api/memory-prefs")),
   set: async (applyMode: MemoryApplyMode) =>
     MemoryPrefs.parse(await call("PUT", "/api/memory-prefs", { applyMode })),
+};
+
+/**
+ * 기억 정리 (#146, FR-16.5·16.6·16.8). The user's own: whether it runs, the prompt in use, DREAMS.md and the bundles
+ * (decided with `memoryProposals`). The admin's: settings, prompt versions, 미리 실행 (own data), status counts.
+ */
+export const DREAMING_KEY = ["dreaming"] as const;
+export const ADMIN_DREAMING_KEY = ["admin", "dreaming"] as const;
+export const dreaming = {
+  mine: async () => MyDreaming.parse(await call("GET", "/api/dreaming")),
+};
+export const adminDreaming = {
+  get: async () => DreamingAdmin.parse(await call("GET", "/api/admin/dreaming")),
+  save: async (c: DreamingConfig) => DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
+  setUser: async (id: string, enabled: boolean) =>
+    DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, { enabled })),
+  savePrompt: async (content: string, baseVersion: number) =>
+    DreamingPromptView.parse(await call("PUT", "/api/admin/dreaming/prompt", { content, baseVersion })),
+  versions: async () =>
+    DreamingPromptVersions.parse(await call("GET", "/api/admin/dreaming/prompt/versions")).versions,
+  restore: async (v: number, baseVersion: number) =>
+    DreamingPromptView.parse(
+      await call("POST", `/api/admin/dreaming/prompt/versions/${v}/restore`, { baseVersion }),
+    ),
+  preview: async (content?: string) =>
+    DreamingPreview.parse(
+      await call("POST", "/api/admin/dreaming/preview", content === undefined ? {} : { content }),
+    ),
+  /** "지금 실행" — the FakeRuntime server only (development, e2e). */
+  runNow: async (id: string) =>
+    DreamingUserStatus.parse(await call("POST", `/api/admin/dreaming/users/${enc(id)}/run`, {})),
 };

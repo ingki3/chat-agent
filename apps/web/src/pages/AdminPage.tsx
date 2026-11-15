@@ -7,6 +7,7 @@ import { SkillsAdmin } from "../admin/SkillsAdmin.js";
 import { SystemAdmin } from "../admin/SystemAdmin.js";
 import { BackupAdmin } from "../admin/BackupAdmin.js";
 import { InstructionsAdmin } from "../admin/InstructionsAdmin.js";
+import { DreamingAdmin } from "../admin/DreamingAdmin.js";
 import { UsageAdmin } from "./Usage.js";
 
 const TABS = [
@@ -15,6 +16,7 @@ const TABS = [
   ["runtimes", "런타임"],
   ["skills", "스킬"],
   ["instructions", "지침"],
+  ["dreaming", "기억 정리"],
   ["system", "시스템 상태"],
   ["backup", "백업"],
   ["usage", "사용량"],
@@ -22,8 +24,8 @@ const TABS = [
 type Tab = (typeof TABS)[number][0];
 
 /**
- * Admin screen (#35, PRD FR-10): users (#41 + edit), per-user permissions, runtimes and connections, skills, system
- * status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
+ * Admin screen (#35, PRD FR-10): users (#41 + edit), per-user permissions, runtimes and connections, skills, 지침 (#144),
+ * 기억 정리 (#146), system status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
  */
 export function AdminPage({ selfId }: { selfId: string }) {
   const [params, setParams] = useSearchParams();
@@ -54,6 +56,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
           {tab === "runtimes" && <RuntimesAdmin />}
           {tab === "skills" && <SkillsAdmin />}
           {tab === "instructions" && <InstructionsAdmin />}
+          {tab === "dreaming" && <DreamingAdmin />}
           {tab === "system" && <SystemAdmin />}
           {tab === "backup" && <BackupAdmin />}
           {tab === "usage" && <UsageAdmin />}

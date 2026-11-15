@@ -14,16 +14,20 @@ type Egress = { endpoint(): Promise<{ port: number; url: string }> };
  * `data/runtimes/<connection id>/<user id>/` (review #80).
  */
 export function codexConnectionFor(
-  store: Pick<ConnectionStore, "resolve">,
+  store: Pick<ConnectionStore, "resolve" | "resolveSystem">,
   users: Pick<UserStore, "byId">,
   ctx: ConnectionRequest,
   tokens?: Pick<ChatgptTokenService, "refresh">,
 ): CodexConnection | undefined {
-  const r = store.resolve(ctx.connectionId, users.byId(ctx.userId), "codex", {
-    test: ctx.connectionTest === true,
-    version: ctx.connectionVersion,
-  });
+  const r =
+    ctx.systemTask === "dreaming"
+      ? store.resolveSystem(ctx.connectionId, users.byId(ctx.userId), "codex")
+      : store.resolve(ctx.connectionId, users.byId(ctx.userId), "codex", {
+          test: ctx.connectionTest === true,
+          version: ctx.connectionVersion,
+        });
   if (!r) return undefined;
+  if (ctx.systemTask === "dreaming" && r.authType !== "api_key") return undefined;
   if (r.authType === "api_key") return { id: r.id, dir: r.dir, auth: { kind: "api_key", apiKey: r.secret } };
   const cred = parseCredential(r.secret);
   if (!cred || !tokens) return undefined;

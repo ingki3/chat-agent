@@ -5,8 +5,13 @@ import { errorText, instructions, INSTRUCTIONS_KEY } from "../api.js";
 import { TopBar } from "../Shell.js";
 import { DocEditor } from "../instructions/DocEditor.js";
 import { MemoryModeSetting } from "../instructions/MemoryModeSetting.js";
+import { DreamingPanel } from "../instructions/DreamingPanel.js";
 
 const KINDS: MemoryDocKind[] = ["agent", "soul", "user", "memory"];
+/** The tabs: the four documents, then 기억 정리 (#146: its proposals, DREAMS.md and the prompt in use). */
+type Tab = MemoryDocKind | "dreams";
+const TABS: Tab[] = [...KINDS, "dreams"];
+const TAB_LABEL = (t: Tab) => (t === "dreams" ? "기억 정리" : MEMORY_DOC_FILE[t]);
 const HINT: Record<MemoryDocKind, string> = {
   agent: "관리자가 정한 운영 규칙이에요(가족 공통 → 청소년 지침 → 이 계정). 읽기만 할 수 있어요.",
   soul: '답하는 말투·성격이에요. 예: "반말로 짧게". 규칙·안전 지침을 바꾸는 문장은 저장되지 않아요.',
@@ -20,9 +25,7 @@ const HINT: Record<MemoryDocKind, string> = {
  */
 export function InstructionsPage() {
   const [params, setParams] = useSearchParams();
-  const kind: MemoryDocKind = KINDS.includes(params.get("doc") as MemoryDocKind)
-    ? (params.get("doc") as MemoryDocKind)
-    : "soul";
+  const kind: Tab = TABS.includes(params.get("doc") as Tab) ? (params.get("doc") as Tab) : "soul";
   const docs = useQuery({ queryKey: INSTRUCTIONS_KEY, queryFn: instructions.list });
   const doc = docs.data?.find((d) => d.kind === kind);
   return (
@@ -35,7 +38,7 @@ export function InstructionsPage() {
         </p>
         <MemoryModeSetting />
         <div className="tabs" role="tablist" aria-label="내 지침 문서">
-          {KINDS.map((k) => (
+          {TABS.map((k) => (
             <button
               key={k}
               type="button"
@@ -46,7 +49,7 @@ export function InstructionsPage() {
               className={kind === k ? "on" : ""}
               onClick={() => setParams(k === "soul" ? {} : { doc: k }, { replace: true })}
             >
-              {MEMORY_DOC_FILE[k]}
+              {TAB_LABEL(k)}
             </button>
           ))}
         </div>
@@ -56,14 +59,15 @@ export function InstructionsPage() {
           id={`doc-panel-${kind}`}
           aria-labelledby={`doc-tab-${kind}`}
         >
-          {docs.isError && <p className="error">{errorText(docs.error)}</p>}
-          {doc && (
+          {kind === "dreams" && <DreamingPanel />}
+          {kind !== "dreams" && docs.isError && <p className="error">{errorText(docs.error)}</p>}
+          {kind !== "dreams" && doc && (
             <DocEditor
               key={kind}
               doc={doc}
               api={instructions.doc(kind)}
               queryKey={INSTRUCTIONS_KEY}
-              hint={HINT[kind]}
+              hint={HINT[doc.kind]}
             />
           )}
         </section>

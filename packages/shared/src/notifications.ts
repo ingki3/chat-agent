@@ -17,6 +17,12 @@ export const NotificationKind = z.enum([
   "system_warning",
   "daily_cost",
   "test",
+  /** 기억 정리 (#146, spec §8): proposals wait for the user's review — the count only. */
+  "memory_proposal",
+  /** 기억 정리 applied changes on its own (자동 반영) — the count only. */
+  "memory_applied",
+  /** Admin only: the day's last 기억 정리 attempt failed for some users — how many, no names, no content. */
+  "dreaming_failed",
 ]);
 export type NotificationKind = z.infer<typeof NotificationKind>;
 
@@ -46,6 +52,9 @@ export const NotificationPrefs = z
     quietEnd: ClockTime.nullable(),
     /** IANA time zone the clock times are in. */
     timeZone: z.string().min(1).max(64),
+    /** 기억 정리 notifications (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" — on unless turned off. */
+    memoryProposals: z.boolean().optional(),
+    memoryApplied: z.boolean().optional(),
   })
   .refine((p) => (p.quietStart === null) === (p.quietEnd === null), { message: "set both or neither" })
   .refine((p) => p.quietStart === null || p.quietStart !== p.quietEnd, { message: "start and end differ" });

@@ -552,6 +552,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/backups",
   // #144: the family-wide AGENT and the default SOUL.
   "/api/admin/instructions",
+  // #146: 기억 정리 settings, prompt, 미리 실행 (the admin's own data), status counts.
+  "/api/admin/dreaming",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -594,6 +596,23 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "GET /api/admin/instructions/:ref/versions", expect: ADMIN_BY_ID },
   { route: "GET /api/admin/instructions/:ref/versions/:version", expect: ADMIN_BY_ID },
   { route: "POST /api/admin/instructions/:ref/versions/:version/restore", expect: ADMIN_BY_ID },
+  // #146: 기억 정리 — counts and settings only (no runtime configured in the matrix app: the preview is a recorded
+  // failure, 200); the placeholder user / version is none (404).
+  { route: "GET /api/admin/dreaming", expect: ADMIN_ONLY },
+  {
+    route: "PUT /api/admin/dreaming",
+    expect: ADMIN_ONLY,
+    body: { enabled: false, time: "03:00", connectionId: null, runtime: null, model: null, tokenCap: 300000 },
+  },
+  { route: "PUT /api/admin/dreaming/users/:id", expect: ADMIN_BY_ID, body: { enabled: false } },
+  {
+    route: "PUT /api/admin/dreaming/prompt",
+    expect: ADMIN_ONLY,
+    body: { content: "정리 규칙", baseVersion: 0 },
+  },
+  { route: "GET /api/admin/dreaming/prompt/versions", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/dreaming/prompt/versions/:version/restore", expect: ADMIN_BY_ID },
+  { route: "POST /api/admin/dreaming/preview", expect: ADMIN_ONLY, body: {} },
 ];
 
 /**

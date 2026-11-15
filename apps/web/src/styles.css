@@ -1697,6 +1697,39 @@ a.btnlink:focus-visible,
   align-items: flex-start;
 }
 
+/* 기억 정리 (#146): the user's proposals / DREAMS.md and the admin's settings. */
+.dreaming-panel,
+.admin-dreaming {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.dreams-md,
+.dream-rules,
+.dreaming-panel pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0;
+  font-size: 13px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.admin-dreaming textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+.admin-dreaming .usage-table {
+  max-width: 100%;
+}
+.dream-preview {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
 /* Family sharing (#29): the minimal share screens (#52 replaces them). */
 .card-like {
   display: grid;
