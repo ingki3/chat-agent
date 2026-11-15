@@ -12,6 +12,8 @@ import { citationNoteOf, citationView } from "../citations/segments.js";
 import { ArtifactCard } from "../artifacts/ArtifactPanel.js";
 import { ScheduleCard } from "../schedules/ScheduleCard.js";
 import { proposalIds } from "../schedules/format.js";
+import { MemoryCard } from "../instructions/MemoryCard.js";
+import { memoryProposalIds } from "../instructions/memory-card.js";
 
 type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
@@ -310,6 +312,13 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
               ...s.calls.flatMap((c) => (s.results.has(c.id) ? [s.results.get(c.id)!] : [])),
             ]).map((id) => (
               <ScheduleCard key={id} id={id} />
+            ))}
+            {/* `memory_propose` (#145): its bundle's card — the owner's only. */}
+            {memoryProposalIds([
+              ...s.calls,
+              ...s.calls.flatMap((c) => (s.results.has(c.id) ? [s.results.get(c.id)!] : [])),
+            ]).map((id) => (
+              <MemoryCard key={id} id={id} />
             ))}
           </Fragment>
         ) : (

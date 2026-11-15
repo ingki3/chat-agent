@@ -1327,3 +1327,89 @@ export const memoryVersions = sqliteTable(
   },
   (t) => [primaryKey({ columns: [t.documentId, t.version] })],
 );
+
+/**
+ * The user setting "기억 반영 방식" (#145, PRD FR-16.7, docs/memory-spec.md §5): one per user, for the conversation tool
+ * and Dreaming (#146) alike. No row = the default, `review` (검토 후 반영).
+ */
+export const memoryPrefs = sqliteTable("memory_prefs", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  applyMode: text("apply_mode", { enum: ["review", "auto"] })
+    .notNull()
+    .default("review"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+/**
+ * A `memory_propose` call (#145, spec §5): one bundle of decisions — the in-chat card. `base` holds, per list document
+ * kind, the version the bundle is pinned to (a change by anyone else expires it); `applied` the versions before and
+ * after what the bundle itself applied (되돌리기). Owned by the conversation's owner; goes with the conversation.
+ */
+export const memoryProposals = sqliteTable(
+  "memory_proposals",
+  {
+    id: text("id").primaryKey(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    runId: text("run_id").notNull(),
+    mode: text("mode", { enum: ["review", "auto"] }).notNull(),
+    /** Why decisions wait for the card in auto mode: a sensitive category, or the run had read outside content. */
+    forced: text("forced", { enum: ["sensitive", "external"] }),
+    /** `{ user?: n, memory?: n }` — the pinned base version per document kind. */
+    base: text("base", { mode: "json" }).$type<Partial<Record<"user" | "memory", number>>>().notNull(),
+    /** `{ user?: { before, after }, memory?: … }` — what this bundle applied, for 되돌리기. */
+    applied: text("applied", { mode: "json" })
+      .$type<Partial<Record<"user" | "memory", { before: number; after: number }>>>()
+      .notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [
+    index("memory_proposals_conversation_idx").on(t.conversationId),
+    index("memory_proposals_owner_idx").on(t.ownerId),
+  ],
+);
+
+/**
+ * One decision of a bundle (spec §4 형식): add a line, or replace / delete an item. `text` and `before` are the new and
+ * the old line (scrubbed); `sources` the user messages it came from (spec §3) — checked when made and again right
+ * before it is applied. When a source or a target source leaves the active history, the row is deleted (§10.3).
+ */
+export const memoryProposalDecisions = sqliteTable(
+  "memory_proposal_decisions",
+  {
+    proposalId: text("proposal_id")
+      .notNull()
+      .references(() => memoryProposals.id, { onDelete: "cascade" }),
+    idx: integer("idx").notNull(),
+    doc: text("doc", { enum: ["user", "memory"] }).notNull(),
+    action: text("action", { enum: ["add", "replace", "delete"] }).notNull(),
+    itemId: text("item_id"),
+    text: text("text"),
+    before: text("before"),
+    /** JSON `[{ messageId, revision, conversationId }]`. */
+    sources: text("sources", { mode: "json" })
+      .$type<{ messageId: string; revision: number; conversationId: string }[]>()
+      .notNull(),
+    /**
+     * The sources of the item a replace / delete targets, as they were when proposed: `before` is that item's text,
+     * so deleting one of them takes the decision with it (spec §10.3), whichever conversation the card is in.
+     */
+    targetSources: text("target_sources", { mode: "json" })
+      .$type<{ messageId: string; revision: number; conversationId: string }[]>()
+      .notNull()
+      .default([]),
+    sensitive: integer("sensitive", { mode: "boolean" }).notNull().default(false),
+    status: text("status", {
+      enum: ["pending", "accepted", "applied", "rejected", "expired", "dropped", "undone"],
+    }).notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.proposalId, t.idx] })],
+);

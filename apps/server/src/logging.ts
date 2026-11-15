@@ -42,6 +42,7 @@ import {
   UNMATCHED,
   isUsagePurpose,
   isScheduleCode,
+  isMemoryCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -180,6 +181,8 @@ export const LOG_EVENTS = [
   // 내 지침 deletion linkage (#144): how many items went and how many sessions are to be forgotten — never the text.
   "memory.items_unlinked",
   "memory.sessions_reclaimed",
+  // 대화 중 기억해줘 (#145): tool name and fixed `memory_*` outcome code, duration and IDs — never an item or a message.
+  "memory.proposed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -302,6 +305,8 @@ const FIELDS = new Map<string, Check>([
   ["scheduleStatus", isScheduleStatus],
   ["scheduleStep", isScheduleStep],
   ["lateMs", isNum],
+  /** 대화 중 기억해줘 (#145): the tool's fixed outcome code. */
+  ["memoryCode", isMemoryCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -578,6 +583,7 @@ export type LogFields = {
   scheduleStatus?: string;
   scheduleStep?: string;
   lateMs?: number;
+  memoryCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

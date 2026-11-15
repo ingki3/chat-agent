@@ -38,6 +38,9 @@ import {
   ARTIFACT_UPDATE_TOOL,
 } from "@agentlee/mcp-tools/artifacts";
 import { SCHEDULE_CREATE_TOOL } from "@agentlee/mcp-tools/schedules";
+import { MEMORY_LIST_TOOL, MEMORY_PROPOSE_TOOL, MEMORY_TOOLS } from "@agentlee/mcp-tools/memory";
+import { MemoryProposeInput } from "@agentlee/shared";
+import type { MemoryProposals } from "../memory/proposals.js";
 import type { ScheduleProposalStore } from "../schedules/proposals.js";
 import { firstRunAfter, ScheduleInputError } from "../schedules/store.js";
 import {
@@ -554,6 +557,11 @@ export type McpServiceOptions = {
   watchlist?: WatchlistStore;
   /** Schedule proposals (#55): `schedule_create` stores what it proposes. Without it the tool is not offered. */
   scheduleProposals?: ScheduleProposalStore;
+  /**
+   * 대화 중 기억해줘 (#145): `memory_list` and `memory_propose`. Without it they are not offered; with it, only in the
+   * user's own non-schedule conversations and never in a run with a skill scope (a scheduled run, #56).
+   */
+  memory?: MemoryProposals;
   /** The server allow-list switches (#35). Without it every skill is on. */
   switches?: SkillSwitches;
   /** Recent errors (#46): failed skill calls are recorded (tool name and code only) for the admin screen. */
@@ -649,6 +657,7 @@ export class McpService {
         : []),
       ...(opts.artifacts ? ARTIFACT_TOOLS : []),
       ...(opts.scheduleProposals ? [SCHEDULE_CREATE_TOOL] : []),
+      ...(opts.memory ? MEMORY_TOOLS : []),
       ...(opts.docs ? DOC_TOOLS : []),
       ...(opts.files
         ? FILE_TOOLS.filter((t) => t.name !== FILE_CITE_TOOL.name || opts.files?.citations)
@@ -739,6 +748,27 @@ export class McpService {
   }
 
   /**
+   * Whether the memory tools (#145) are for this run: never with a skill scope (a scheduled run, spec §2), and — when
+   * the conversation is known — only in the user's own conversation that is not a schedule's.
+   */
+  private memoryFor(scope?: Partial<Pick<ToolScope, "userId" | "conversationId" | "skills">>): boolean {
+    if (!this.opts.memory || scope?.skills) return false;
+    if (scope?.userId && scope.conversationId)
+      return this.opts.memory.allowedIn({ userId: scope.userId, conversationId: scope.conversationId });
+    return true;
+  }
+
+  /** Runs that called a tool reading outside content (web, files, skills…) — `memory_propose` then never auto-applies. */
+  private readonly externalRuns = new Map<string, number>();
+  private markExternal(runId: string): void {
+    const t = Date.now();
+    this.externalRuns.set(runId, t);
+    // Bounded: entries older than a run can live (the token's lifetime) go.
+    if (this.externalRuns.size > 500)
+      for (const [id, at] of this.externalRuns) if (t - at > 6 * 3600_000) this.externalRuns.delete(id);
+  }
+
+  /**
    * Whether a call of this run may use `skill` (#56): the user may (`allows`), and the run's skill scope — a
    * schedule's selection — names it (no scope: any). Checked for the tool list and again at every call.
    */
@@ -772,10 +802,14 @@ export class McpService {
     return ALWAYS_ON_SKILLS.has(skill) || (this.opts.switches?.enabled(skill) ?? true);
   }
 
-  private toolsFor(userId: string, scope?: Pick<ToolScope, "skills">): ServerToolInfo[] {
+  private toolsFor(
+    userId: string,
+    scope?: Partial<Pick<ToolScope, "skills" | "conversationId">>,
+  ): ServerToolInfo[] {
     const s = { userId, skills: scope?.skills };
+    const memory = this.memoryFor({ userId, ...scope });
     return [
-      ...this.tools,
+      ...this.tools.filter((t) => memory || !MEMORY_TOOLS.includes(t)),
       ...(this.pythonAvailable() ? this.pythonTools.filter((t) => this.mayUse(s, t.skill)) : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
@@ -851,6 +885,7 @@ export class McpService {
       skills: this.skills,
       skillsFor: (userId, scope) => this.skillsFor(userId, scope),
       runSkill: async (name, input, scope) => {
+        this.markExternal(scope.runId);
         const t0 = now();
         const r = await this.call(byName.get(name), input, scope, runSkill);
         // The guard's refusal is told to the model as an ordinary failure (no oracle for which value is a secret,
@@ -886,6 +921,21 @@ export class McpService {
       toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
+        if (name === MEMORY_LIST_TOOL.name || name === MEMORY_PROPOSE_TOOL.name) {
+          const r = this.callMemoryTool(name, input, scope);
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "memory.proposed", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            memoryCode: r.ok ? "memory_ok" : r.code,
+          });
+          return r;
+        }
+        // Anything else may bring outside content into the run (web pages, files, tool output).
+        this.markExternal(scope.runId);
         const composed = composedByName.get(name);
         if (composed) {
           const r =
@@ -1106,6 +1156,52 @@ export class McpService {
       if (e instanceof ArtifactError) return { ok: false, code: e.code };
       throw e;
     }
+  }
+
+  /**
+   * `memory_list` / `memory_propose` (#145, PRD FR-16.4): active user, the run's own conversation (theirs, not a
+   * schedule's), no skill scope — then the proposals service, which checks every decision (docs/memory-spec.md §3–§4)
+   * and applies it per the user's setting (§5). A run that already read outside content never auto-applies.
+   */
+  private callMemoryTool(name: string, input: Record<string, unknown>, scope: ToolScope): SkillResult {
+    const memory = this.opts.memory;
+    if (!memory || !this.users.byId(scope.userId)?.active || !this.memoryFor(scope))
+      return { ok: false, code: "memory_not_allowed" };
+    if (name === MEMORY_LIST_TOOL.name) return { ok: true, output: memory.list(scope) };
+    const parsed = MemoryProposeInput.safeParse(input);
+    if (!parsed.success) return { ok: false, code: "memory_bad_input" };
+    const r = memory.propose(scope, parsed.data, { external: this.externalRuns.has(scope.runId) });
+    if (!r.ok) return { ok: false, code: r.code };
+    const status =
+      r.proposalId === null || (!r.applied && !r.pending)
+        ? "refused"
+        : r.pending
+          ? r.applied
+            ? "partly_applied"
+            : "pending"
+          : "applied";
+    return {
+      ok: true,
+      output: {
+        proposalId: r.proposalId,
+        status,
+        applied: r.applied,
+        pending: r.pending,
+        ...(r.dropped ? { dropped: r.dropped } : {}),
+        refused: r.refused,
+        note:
+          (status === "refused"
+            ? "Nothing was changed: the server refused every change (see refused). Tell the user briefly; do not retry with the same content."
+            : status === "applied"
+              ? "Remembered now. The user sees it under your reply with an undo button."
+              : status === "partly_applied"
+                ? "Some changes were remembered now (applied); the others (pending) wait for the user's confirmation on the card under your reply. Say which is which; do not say the pending ones were saved."
+                : "Not saved yet: the user sees a card under your reply and the change is made only if they accept it there. Tell them to check the card; do not say it was saved.") +
+          (r.dropped
+            ? " Some changes (dropped) were left out: the document would be over its size limit without the ones waiting for the card."
+            : ""),
+      },
+    };
   }
 
   /**

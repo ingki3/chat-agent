@@ -29,6 +29,7 @@ import {
   files as filesApi,
   runs,
   settings as settingsApi,
+  MEMORY_PROPOSALS_KEY,
 } from "../api.js";
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
@@ -178,6 +179,8 @@ export function ChatPage() {
         await qc.cancelQueries({ queryKey: ["active-run", id] });
         qc.setQueryData(["active-run", id], r.run);
         await qc.invalidateQueries({ queryKey: ["messages", id] });
+        // An edit or a regenerate may take a card's source out of the history (spec §10.3).
+        void qc.invalidateQueries({ queryKey: MEMORY_PROPOSALS_KEY });
         toBottom();
       } finally {
         setStarting(false);
