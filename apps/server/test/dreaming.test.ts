@@ -14,6 +14,8 @@ import { createTestDb } from "../src/db/client.js";
 import { DREAMING_MARKER } from "../src/dreaming/prompt.js";
 import { DREAMING_RETRY_MS, dreamingDate } from "../src/dreaming/engine.js";
 import { lossRate } from "../src/dreaming/validate.js";
+import { entryBytes, gatherInput } from "../src/dreaming/input.js";
+import { compose } from "../src/notifications/compose.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { defaultScript, FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
 import { knownSecrets } from "../src/secrets/known.js";
@@ -1004,5 +1006,95 @@ describe("review #160 round 1", () => {
     });
     expect(s.t.requests.at(-1)!.messages.map((m) => m.text)).toEqual(["기억: 실패해도 그대로"]);
     expect(s.d.store.queueSize(s.uid("owner"))).toBe(0);
+  });
+});
+
+describe("review #160 round 2", () => {
+  it("1. a message queued for both documents counts with both — what no longer fits waits for the next round", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    const a = s.say(`기억: 대기열 ${"가".repeat(3000)}`);
+    s.say(`기억: 새 것 ${"나".repeat(3000)}`);
+    s.d.store.advance(owner, s.seqOf(a.messageId), false);
+    s.d.store.enqueue(owner, a.messageId, "user");
+    s.d.store.enqueue(owner, a.messageId, "memory");
+    const both = new Set<"user" | "memory">(["user", "memory"]);
+    const textA = `기억: 대기열 ${"가".repeat(3000)}`;
+    const textB = `기억: 새 것 ${"나".repeat(3000)}`;
+    // Room for A with both documents and B — less one byte.
+    const maxBytes = entryBytes("msg-1", both, textA, null) + entryBytes("msg-2", both, textB, null) - 1;
+    const r = gatherInput(s.db, {
+      userId: owner,
+      checkpoint: s.checkpoint(),
+      docs: ["user", "memory"],
+      maxBytes,
+      suspicious: () => false,
+    });
+    expect(r.tooLarge).toBe(false);
+    expect(r.messages.map((m) => [m.source.messageId, [...m.docs].sort()])).toEqual([
+      [a.messageId, ["memory", "user"]],
+    ]);
+    expect(r.lastNewSeq).toBeNull();
+    const used = r.messages.reduce((n, m) => n + entryBytes(m.ref, m.docs, m.text, m.range), 0);
+    expect(used).toBeLessThanOrEqual(maxBytes);
+    // B (new) did not go in: the checkpoint stays before it and the next round takes it.
+  });
+
+  it("2. rejection memory keeps case: rejecting /Work/Alpha does not reject /work/alpha", async () => {
+    const s = await start();
+    s.say("기억: 폴더");
+    s.t.answer = (d) =>
+      JSON.stringify({
+        decisions: [
+          { action: "add", doc: "memory", text: "작업 폴더는 /Work/Alpha", sources: [d.messages[0]!.id] },
+        ],
+      });
+    await s.run();
+    const b = (await s.mine()).proposals[0]!;
+    await s.req("owner", "POST", `/api/memory-proposals/${b.id}/reject`, { indexes: [0] });
+    s.say("기억: 다른 폴더");
+    s.t.answer = (d) =>
+      JSON.stringify({
+        decisions: [
+          { action: "add", doc: "memory", text: "작업 폴더는 /work/alpha", sources: [d.messages[0]!.id] },
+          { action: "add", doc: "memory", text: "작업  폴더는 /Work/Alpha", sources: [d.messages[0]!.id] },
+        ],
+      });
+    const r = await s.run();
+    expect(r.counts.refused).toEqual({ rejected: 1 });
+    expect(r.counts.proposed).toBe(1);
+  });
+
+  it("4. the admins' alert says when the input is over the token cap — not a connection problem", () => {
+    expect(compose({ kind: "dreaming_failed", users: 2, tooLarge: 2 }).body).toBe(
+      "기억 정리 입력이 상한보다 커요 (사용자 2명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+    );
+    expect(compose({ kind: "dreaming_failed", users: 3, tooLarge: 1 }).body).toBe(
+      "기억 정리가 실패했어요 (사용자 2명, 연결 확인 필요)\n기억 정리 입력이 상한보다 커요 (사용자 1명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+    );
+    expect(compose({ kind: "dreaming_failed", users: 1 }).body).toBe(
+      "기억 정리가 실패했어요 (사용자 1명, 연결 확인 필요)",
+    );
+  });
+
+  it("4. end to end: a run failing too_large twice → the alert names the cap", async () => {
+    const s = await start({ config: { tokenCap: 25_000 } });
+    s.say(`기억: ${"가".repeat(10_000)}`);
+    s.d.engine.start();
+    for (const x of s.d.engine.slots()) {
+      s.t.clock = x.at;
+      s.d.engine.tick();
+      await s.d.engine.idle();
+    }
+    for (const x of s.d.engine.slots()) {
+      s.t.clock = x.at + DREAMING_RETRY_MS;
+      s.d.engine.tick();
+      await s.d.engine.idle();
+    }
+    expect(s.sql.prepare("select body from notifications where kind = 'dreaming_failed'").all()).toEqual([
+      {
+        body: "기억 정리 입력이 상한보다 커요 (사용자 1명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+      },
+    ]);
   });
 });

@@ -57,7 +57,12 @@ export type PublishInput =
   /** 기억 정리 applied N changes on its own (자동 반영). A count only. */
   | { kind: "memory_applied"; count: number }
   /** Admin only (#146): the day's last attempt failed for N users. No names, no content. */
-  | { kind: "dreaming_failed"; users: number };
+  | {
+      kind: "dreaming_failed";
+      users: number;
+      /** Of them, how many failed because even one message is over the token cap (not a connection problem). */
+      tooLarge?: number;
+    };
 
 export type ResourceRefInput = { kind: string; id: string };
 
@@ -239,10 +244,20 @@ export function compose(input: PublishInput): Composed {
       return {
         kind: input.kind,
         title: "기억 정리 실패",
-        body: `기억 정리가 실패했어요 (사용자 ${count(input.users)}명, 연결 확인 필요)`,
+        body: twoLines(
+          dreamingFailedBody(count(input.users), Math.min(count(input.tooLarge ?? 0), count(input.users))),
+        ),
         url: "/admin?tab=dreaming",
       };
   }
+}
+
+/** Fixed texts only (spec §8: no names, no content). */
+function dreamingFailedBody(users: number, tooLarge: number): string {
+  const big = `기억 정리 입력이 상한보다 커요 (사용자 ${tooLarge}명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요`;
+  if (tooLarge === users) return big;
+  const other = `기억 정리가 실패했어요 (사용자 ${users - tooLarge}명, 연결 확인 필요)`;
+  return tooLarge ? `${other}\n${big}` : other;
 }
 
 const count = (n: number) => (Number.isInteger(n) && n >= 0 ? Math.min(n, 9999) : 0);

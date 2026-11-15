@@ -14,7 +14,7 @@ import {
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { scrubKnown } from "../secrets/known.js";
-import { foldForCheck, holdsSecret, isSensitive, triesRuleChange } from "./rules.js";
+import { holdsSecret, isSensitive, triesRuleChange } from "./rules.js";
 import { DocConflict, type DocRow, type ItemOp, type ItemSource, type MemoryStore } from "./store.js";
 
 /**
@@ -927,10 +927,12 @@ export function dreamingFingerprint(d: {
   text: string | null;
   targets: readonly string[];
 }): string {
+  // Identity, not a security check: case and everything else kept — only whitespace runs and Unicode composition
+  // are made the same (review #160 round 2: "/Work/Alpha" rejected must not reject "/work/alpha").
   return JSON.stringify([
     d.doc,
     d.action,
-    d.text === null ? null : foldForCheck(oneLine(d.text)),
+    d.text === null ? null : oneLine(d.text).normalize("NFC"),
     [...d.targets].sort(),
   ]);
 }

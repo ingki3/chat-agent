@@ -372,6 +372,15 @@ export class DreamingStore {
       .get(userId) as RunRow | undefined;
   }
 
+  /** The user's last attempt of `date` (not a preview). */
+  lastRunOn(userId: string, date: string): RunRow | undefined {
+    return this.sql
+      .prepare(
+        "select * from dreaming_runs where user_id = ? and date = ? and trigger != 'preview' order by started_at desc, attempt desc limit 1",
+      )
+      .get(userId, date) as RunRow | undefined;
+  }
+
   /** How many manual runs the user had on `date` (their idempotency keys count on). */
   manualCount(userId: string, date: string): number {
     return (

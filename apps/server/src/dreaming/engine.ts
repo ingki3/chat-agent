@@ -37,7 +37,7 @@ export type DreamingEngineDeps = {
   /** Whether the user has an answer running (any of their conversations). */
   busy?: (userId: string) => boolean;
   /** The day's last attempt failed for `users` users: tell the admins (once per date — the caller dedupes). */
-  alert?: (date: string, users: number) => void;
+  alert?: (date: string, users: number, tooLarge: number) => void;
   now?: () => number;
   log?: EventLogger | undefined;
   /** Whether this process still holds the data folder (#37): false → no new round. */
@@ -318,7 +318,10 @@ export class DreamingEngine {
       if (this.slots().some((s) => !have.has(s.userId))) return;
     }
     const n = days.filter((d) => d.state === "failed").length;
-    this.deps.alert(date, n);
+    const tooLarge = days.filter(
+      (d) => d.state === "failed" && this.deps.store.lastRunOn(d.user_id, date)?.code === "too_large",
+    ).length;
+    this.deps.alert(date, n, tooLarge);
   }
 
   /** Today's round state and start time of each user (the admin's status table). */

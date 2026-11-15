@@ -1103,11 +1103,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             "select 1 from runs where user_id = ? and status in ('queued', 'running') limit 1",
           )
           .get(userId),
-      alert: (date, count) => {
+      alert: (date, count, tooLarge) => {
         for (const admin of connectionStore.admins())
           app.notifications?.publish(
             admin,
-            { kind: "dreaming_failed", users: count },
+            { kind: "dreaming_failed", users: count, tooLarge },
             { dedupeKey: `dreaming_failed:${date}:${admin}` },
           );
         logEvent(app.log, "warn", "dreaming.alert_sent", { count });

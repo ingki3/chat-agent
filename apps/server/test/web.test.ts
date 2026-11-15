@@ -679,32 +679,37 @@ describe("web tools on our MCP server", () => {
       snippet: "<external_content>".repeat(33),
     }),
   };
-  it("web_search cap holds at every boundary: URL lengths swept so the cap falls on each result in turn", async () => {
-    for (const [name, make] of Object.entries(NASTY))
-      for (let pad = 0; pad <= 1800; pad += 60) {
-        const f = family();
-        const provider: SearchProvider = {
-          name: "sweep",
-          search: async () => ({
-            ok: true,
-            hits: Array.from({ length: 10 }, (_, i) => ({
-              url: `https://n.test/${i}/${"p".repeat(pad)}`,
-              ...make(i),
-            })),
-          }),
-        };
-        const web = new WebService({
-          sources: f.sources,
-          providers: [provider],
-          worker: fx.worker,
-          fetchProxy: { endpoint: async () => fx.proxy, close: async () => {} },
-        });
-        const r = await web.search({ query: "q", maxResults: 10 }, f.scope);
-        const out = (r as { output: { results: { sourceId: string }[] } }).output;
-        expect(JSON.stringify(out).length, `${name} pad ${pad}`).toBeLessThanOrEqual(SEARCH_OUTPUT_CHARS);
-        expect(out.results.map((x) => x.sourceId)).toEqual(f.sources.list(f.c.id).map((x) => x.id));
-      }
-  });
+  // A long sweep (31 lengths × every nasty shape): load-sensitive, so it gets its own time limit (#103, review #160).
+  it(
+    "web_search cap holds at every boundary: URL lengths swept so the cap falls on each result in turn",
+    { timeout: 30_000 },
+    async () => {
+      for (const [name, make] of Object.entries(NASTY))
+        for (let pad = 0; pad <= 1800; pad += 60) {
+          const f = family();
+          const provider: SearchProvider = {
+            name: "sweep",
+            search: async () => ({
+              ok: true,
+              hits: Array.from({ length: 10 }, (_, i) => ({
+                url: `https://n.test/${i}/${"p".repeat(pad)}`,
+                ...make(i),
+              })),
+            }),
+          };
+          const web = new WebService({
+            sources: f.sources,
+            providers: [provider],
+            worker: fx.worker,
+            fetchProxy: { endpoint: async () => fx.proxy, close: async () => {} },
+          });
+          const r = await web.search({ query: "q", maxResults: 10 }, f.scope);
+          const out = (r as { output: { results: { sourceId: string }[] } }).output;
+          expect(JSON.stringify(out).length, `${name} pad ${pad}`).toBeLessThanOrEqual(SEARCH_OUTPUT_CHARS);
+          expect(out.results.map((x) => x.sourceId)).toEqual(f.sources.list(f.c.id).map((x) => x.id));
+        }
+    },
+  );
   for (const [name, make] of Object.entries(NASTY))
     it(`web_search cap holds on the real MCP text: ${name}; shown = stored`, async () => {
       const f = family();

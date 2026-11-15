@@ -131,6 +131,15 @@ export function gatherInput(
   const put = (r: Row, isQueued: boolean, docs: Set<MemoryListKind>): boolean => {
     const known = byId.get(r.id);
     if (known) {
+      // Already in (from the queue for the other document): its entry grows by the documents it adds — counted, and
+      // when that no longer fits this entry waits for the next run like any other (review #160 round 2).
+      const more = new Set([...known.docs, ...docs]);
+      if (more.size === known.docs.size) return true;
+      const delta =
+        entryBytes(known.ref, more, known.text, known.range) -
+        entryBytes(known.ref, known.docs, known.text, known.range);
+      if (bytes + delta > input.maxBytes) return false;
+      bytes += delta;
       for (const d of docs) known.docs.add(d);
       return true;
     }
