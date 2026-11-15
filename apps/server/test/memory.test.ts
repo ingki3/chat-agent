@@ -331,13 +331,27 @@ describe("documents, versions and restore (FR-16.1·16.3)", () => {
     const moved = reconcile(cur, ["셋", "하나", "둘"]);
     expect(moved.next.map((n) => ("keep" in n ? n.keep.id : null))).toEqual(["c", "a", "b"]);
     expect(moved.removed).toEqual([]);
-    // Duplicates, deterministically: the first one keeps the item, a second one is new.
+    // Duplicates, deterministically: both items kept (matched in place by the common subsequence), the extra one new.
     const dup = reconcile(
       [item("x", "같은 줄", 1), item("y", "같은 줄")],
       ["같은 줄", "다른 줄", "같은 줄", "같은 줄"],
     );
-    expect(dup.next.map((n) => ("keep" in n ? n.keep.id : n.text))).toEqual(["x", "다른 줄", "y", "같은 줄"]);
+    expect(dup.next.map((n) => ("keep" in n ? n.keep.id : n.text))).toEqual(["x", "다른 줄", "같은 줄", "y"]);
+    expect(
+      reconcile(
+        [item("x", "같은 줄", 1), item("y", "같은 줄")],
+        ["같은 줄", "다른 줄", "같은 줄", "같은 줄"],
+      ),
+    ).toEqual(dup);
     expect(dup.removed).toEqual([]);
+    // An unchanged line keeps its own item even when an equal line elsewhere changed (review 2, P2).
+    const own = item("own", "A");
+    const fixed = item("fixed", "고정");
+    const src = item("src", "A", 1);
+    const anchored = reconcile([own, fixed, src], ["B", "고정", "A"]);
+    expect(anchored.next.map((n) => ("keep" in n ? n.keep.id : n.text))).toEqual(["B", "fixed", "src"]);
+    expect((anchored.next[0] as { sources: unknown[] }).sources).toEqual([]);
+    expect(anchored.removed.map((i) => i.id)).toEqual(["own"]);
     expect(lineDiff(["a", "b"], ["a", "c", "b"])).toEqual([
       { op: "same", text: "a" },
       { op: "add", text: "c" },
@@ -730,6 +744,30 @@ describe("deletion linkage (spec §10, FR-16.9)", () => {
     }
   });
 
+  it("an equal line elsewhere does not take an unchanged line's source (review 2, P2)", async () => {
+    const t = await start();
+    t.connect("claude-code");
+    const a = await t.newConversation();
+    await t.send(a, "기억해줘");
+    await t.save("owner", "memory", "- SAME_LINE\n- 고정");
+    await sourced(t, a, "SAME_LINE");
+    expect((await t.doc("owner", "memory")).content).toBe("- SAME_LINE\n- 고정\n- SAME_LINE");
+    // Only the first (own) line changes.
+    await t.save("owner", "memory", "- 바꾼 줄\n- 고정\n- SAME_LINE");
+    const del = await t.app.inject({
+      method: "DELETE",
+      url: `/api/conversations/${a}`,
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+    });
+    expect(del.statusCode).toBe(200);
+    expect((await t.doc("owner", "memory")).content).toBe("- 바꾼 줄\n- 고정");
+  });
+
   it("an edit that takes the source message out of the active history removes the item too", async () => {
     const t = await start();
     t.connect("claude-code");
@@ -927,7 +965,11 @@ describe("backups and the model condition", () => {
 
 describe("a session still opening while the deletion linkage runs (#144 review 1, P1)", () => {
   /** The real Claude adapter (recorded SDK) in `runtimes/<connection>/<user>/`, its start held until released. */
-  async function world(dataDir: string, db: ReturnType<typeof openDb>) {
+  async function world(
+    dataDir: string,
+    db: ReturnType<typeof openDb>,
+    runs: Partial<NonNullable<Parameters<typeof buildApp>[1]>["runs"]> = {},
+  ) {
     const log: ReplayLog = { options: [], prompts: [], interrupts: 0, closes: 0 };
     const answers = new Proxy({} as Record<string, ReturnType<typeof sdk.answer>>, {
       get: (_t, k) => (typeof k === "string" ? sdk.answer(crypto.randomUUID(), "네") : undefined),
@@ -965,15 +1007,20 @@ describe("a session still opening while the deletion linkage runs (#144 review 1
       db,
       logger: false,
       runtimes,
-      runs: { flushMs: 0 },
+      runs: { flushMs: 0, ...runs },
       purge: { retryMs: 20, maxRetryMs: 40 },
     });
     await app.ready();
     return { app, log, hold };
   }
-  const waitRun = async (app: Awaited<ReturnType<typeof buildApp>>, id: string) => {
+  const waitRun = async (
+    app: Awaited<ReturnType<typeof buildApp>>,
+    id: string,
+    status: string | null = "done",
+  ) => {
     for (let i = 0; i < 1000 && !app.runs!.get(id)?.endedAt; i++) await new Promise((r) => setTimeout(r, 5));
-    expect(app.runs!.get(id)?.status).toBe("done");
+    expect(app.runs!.get(id)?.endedAt).toBeTruthy();
+    if (status) expect(app.runs!.get(id)?.status).toBe(status);
   };
   const metaHolds = (dataDir: string, text: string) => {
     const found: string[] = [];
@@ -1073,4 +1120,138 @@ describe("a session still opening while the deletion linkage runs (#144 review 1
       const third = await post(`/api/conversations/${b}/messages`, { text: "다시?" });
       expect(third.statusCode).toBe(201);
     });
+
+  /** A Claude-layout session on disk holding `text` (its jsonl and our meta note). */
+  const plantSession = (dataDir: string, connectionId: string, userId: string, text: string) => {
+    const id = crypto.randomUUID();
+    const dir = path.join(dataDir, "runtimes", connectionId, userId);
+    const project = path.join(dir, "config", "projects", "-work");
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${id}.jsonl`), JSON.stringify({ message: text }));
+    fs.mkdirSync(`${dir}-meta`, { recursive: true });
+    fs.writeFileSync(
+      path.join(`${dir}-meta`, `${id}.json`),
+      JSON.stringify({ systemPrompt: text, costUsd: 0 }),
+    );
+    return id;
+  };
+
+  it("the stale check is part of saving the row (review 2, P1): dying at it leaves no row behind — the session is forgotten", async () => {
+    const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-memory-crash-"));
+    closers.push(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const db = openDb(path.join(dataDir, DB_FILE));
+    runMigrations(db);
+    closers.push(() => db.$client.close());
+    // The process "dies" at the check: it throws where the old code had already committed the row.
+    const w = await world(dataDir, db, {
+      sessionSaved: () => {
+        throw new Error("process died here");
+      },
+    });
+    let app = w.app;
+    closers.push(() => app.close());
+    const f = await createFamily(app);
+    const conn = app.connections!.store.create({
+      runtime: "claude-code",
+      authType: "api_key",
+      scope: "personal",
+      owner: f.users.owner,
+      createdBy: f.users.admin.id,
+      secret: `sk-ant-HOLDTEST${"h".repeat(24)}`,
+    });
+    app.connections!.store.setTestResult(conn.id, "passed", "ok", 1);
+    const headers = {
+      host: "localhost:3000",
+      cookie: f.cookies.owner,
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+    };
+    const post = (url: string, payload: object = {}) => app.inject({ method: "POST", url, headers, payload });
+    const fact = `CRASH_FACT_${crypto.randomBytes(4).toString("hex")}`;
+    const a = (await post("/api/conversations")).json<{ id: string }>().id;
+    app.conversations!.append(a, { role: "user", parts: [{ type: "text", text: "기억해줘" }] });
+    const m = app.conversations!.messages(a, { limit: 10 })[0]!;
+    app.memory!.store.addItems(
+      app.memory!.store.ensure(f.users.owner.id, "memory"),
+      [
+        {
+          text: fact,
+          author: "tool",
+          sources: [{ messageId: m.id, revision: m.revision, conversationId: a }],
+        },
+      ],
+      "tool",
+    );
+    const entered = new Promise<void>((r) => (w.hold.entered = r));
+    let release!: () => void;
+    w.hold.release = new Promise<void>((r) => (release = r));
+    const b = (await post("/api/conversations")).json<{ id: string }>().id;
+    const sent = await post(`/api/conversations/${b}/messages`, { text: "내 관심 종목?" });
+    await entered;
+    expect((await app.inject({ method: "DELETE", url: `/api/conversations/${a}`, headers })).statusCode).toBe(
+      200,
+    );
+    release();
+    await waitRun(app, sent.json<{ run: { id: string } }>().run.id, null);
+    await app.close();
+    const again = await world(dataDir, db);
+    app = again.app;
+    for (let i = 0; i < 300 && metaHolds(dataDir, fact).length; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    await app.purge!.idle();
+    expect(metaHolds(dataDir, fact)).toEqual([]);
+    expect(
+      db.$client
+        .prepare("SELECT count(*) AS n FROM runtime_sessions WHERE conversation_id = ? AND invalidated = 0")
+        .get(b),
+    ).toEqual({ n: 0 });
+  });
+
+  it("at start, a session started with an unlinked version that is still valid becomes a job (review 2, P1)", async () => {
+    const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-memory-start-"));
+    closers.push(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const db = openDb(path.join(dataDir, DB_FILE));
+    runMigrations(db);
+    closers.push(() => db.$client.close());
+    const first = await world(dataDir, db);
+    const owner = first.app.users!.create({
+      email: "o@x.test",
+      name: "o",
+      role: "member",
+      passwordHash: "x",
+    });
+    const c = first.app.conversations!.create(owner.id);
+    const doc = first.app.memory!.store.ensure(owner.id, "memory");
+    const v = first.app.memory!.store.addItems(
+      doc,
+      [{ text: "다른 것", author: "user", sources: [] }],
+      "user",
+    );
+    await first.app.close();
+    // What a crash in an older build could leave: the row of a session started with a version the linkage edited.
+    const fact = `START_FACT_${crypto.randomBytes(4).toString("hex")}`;
+    const ext = plantSession(dataDir, "conn-1", owner.id, fact);
+    db.$client
+      .prepare("UPDATE memory_versions SET unlinked_at = 1 WHERE document_id = ? AND version = ?")
+      .run(doc.id, v.version);
+    db.$client
+      .prepare(
+        `INSERT INTO runtime_sessions (id, conversation_id, runtime, connection_id, external_session_id, conversation_revision, doc_versions)
+         VALUES (?, ?, 'claude-code', 'conn-1', ?, 0, ?)`,
+      )
+      .run(crypto.randomUUID(), c.id, ext, JSON.stringify({ [doc.id]: v.version }));
+    const again = await world(dataDir, db);
+    closers.push(() => again.app.close());
+    for (let i = 0; i < 300 && metaHolds(dataDir, fact).length; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    await again.app.purge!.idle();
+    expect(metaHolds(dataDir, fact)).toEqual([]);
+    expect(
+      db.$client
+        .prepare("SELECT invalidated AS i FROM runtime_sessions WHERE external_session_id = ?")
+        .get(ext),
+    ).toEqual({
+      i: 1,
+    });
+  });
 });

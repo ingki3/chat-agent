@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
 import {
+  lineDiff,
   normalizeDoc,
   parseItemLines,
   renderItems,
@@ -41,28 +42,47 @@ export type Reconciled = {
 };
 
 /**
- * Matches the edited lines to the current items (spec §1), in two passes:
- * 1. **The same line is the same item, wherever it moved**: each line takes the first unused current item with the
- *    same text (duplicates in order, so the result never depends on anything but the two texts). A moved line keeps
- *    its id and sources — the deletion linkage (§10) still finds it.
- * 2. The lines left over are changed or new, the items left over changed or gone: they are paired in order — a
- *    changed line replaces the item it stands in for and **inherits its sources** (the new text was written from it,
- *    so deleting the source message still removes it); extra lines are new items without sources; extra items go.
+ * Matches the edited lines to the current items (spec §1), in three passes:
+ * 1. **In place**: the longest common subsequence of the old and new lines — an unchanged line keeps its own item,
+ *    anchored by its unchanged neighbours, even when an equal line elsewhere was changed.
+ * 2. **Moved**: a line still unmatched takes the first unmatched item with the same text (in order — deterministic),
+ *    so a line that moved keeps its id and sources and the deletion linkage (§10) still finds it.
+ * 3. **Changed / new / gone**: the lines left over and the items left over are paired in order — a changed line
+ *    replaces the item it stands in for and **inherits its sources** (it was written from it, so deleting the source
+ *    message still removes it); extra lines are new items without sources; extra items go.
  */
 export function reconcile(current: readonly Item[], lines: readonly string[]): Reconciled {
+  const kept: (Item | undefined)[] = [];
+  const leftover: Item[] = [];
+  let oi = 0;
+  for (const op of lineDiff(
+    current.map((i) => i.text),
+    lines,
+  )) {
+    if (op.op === "same") kept.push(current[oi++]!);
+    else if (op.op === "del") leftover.push(current[oi++]!);
+    else kept.push(undefined);
+  }
   const pool = new Map<string, Item[]>();
-  for (const i of current) pool.set(i.text, [...(pool.get(i.text) ?? []), i]);
-  const kept = lines.map((text) => pool.get(text)?.shift());
-  const used = new Set(kept.flatMap((k) => (k ? [k.id] : [])));
-  const leftover = current.filter((i) => !used.has(i.id));
+  for (const i of leftover) pool.set(i.text, [...(pool.get(i.text) ?? []), i]);
+  const moved = new Set<string>();
+  lines.forEach((text, j) => {
+    if (kept[j]) return;
+    const m = pool.get(text)?.shift();
+    if (m) {
+      kept[j] = m;
+      moved.add(m.id);
+    }
+  });
+  const rest = leftover.filter((i) => !moved.has(i.id));
   let k = 0;
   const next: Reconciled["next"] = lines.map((text, j) => {
     const keep = kept[j];
     if (keep) return { keep };
-    const replaced = leftover[k++];
+    const replaced = rest[k++];
     return { text, sources: replaced ? replaced.sources : [] };
   });
-  return { next, removed: leftover };
+  return { next, removed: rest };
 }
 
 export class MemoryStore {

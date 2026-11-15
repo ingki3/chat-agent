@@ -692,7 +692,20 @@ export class ConversationStore {
     summaryId?: string | null;
     /** Its context was cut to fit (#45): never resumed. */
     trimmed?: boolean;
+    /**
+     * Runs inside the same transaction, right after the row is written (#144: the 내 지침 stale check). A throw rolls
+     * the row back: no row is ever left without its check.
+     */
+    inTransaction?: (row: SessionRow) => void;
   }): SessionRow {
+    return this.db.$client.transaction(() => {
+      const row = this.insertSession(s);
+      s.inTransaction?.(row);
+      return row;
+    })();
+  }
+
+  private insertSession(s: Parameters<ConversationStore["saveSession"]>[0]): SessionRow {
     const conv = this.get(s.conversationId);
     if (!conv) throw new Error("conversation not found");
     if (s.conversationRevision !== conv.revision) throw new Error("session reflects an older revision");

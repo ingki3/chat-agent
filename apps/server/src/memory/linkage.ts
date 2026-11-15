@@ -108,3 +108,31 @@ export function claimIfStale(
   purge.claimSessions([{ ...session, userId: owner.o }]);
   return true;
 }
+
+/**
+ * Start-up check (#144 review 2): every still-valid session whose row names a document version the deletion linkage
+ * has edited (`unlinked_at`) is claimed now — whatever left it so (an older build, a check that could not run). Its
+ * runs were all ended by the restart, so the jobs run once serving. Returns how many were claimed.
+ */
+export function reclaimStaleSessions(db: Db, purge: Pick<ConversationPurge, "claimSessions">): number {
+  const rows = db.$client
+    .prepare(
+      `SELECT DISTINCT s.id AS id, s.conversation_id AS conversationId, c.owner_id AS userId, s.runtime AS runtime,
+              s.connection_id AS connectionId, s.external_session_id AS externalSessionId
+         FROM runtime_sessions s
+         JOIN conversations c ON c.id = s.conversation_id,
+              json_each(s.doc_versions) j
+         JOIN memory_versions v ON v.document_id = j.key AND v.version = j.value
+        WHERE s.invalidated = 0 AND s.doc_versions IS NOT NULL AND v.unlinked_at IS NOT NULL`,
+    )
+    .all() as {
+    id: string;
+    conversationId: string;
+    userId: string;
+    runtime: string;
+    connectionId: string | null;
+    externalSessionId: string;
+  }[];
+  if (rows.length) db.$client.transaction(() => purge.claimSessions(rows))();
+  return rows.length;
+}

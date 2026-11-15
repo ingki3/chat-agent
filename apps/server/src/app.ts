@@ -133,7 +133,7 @@ import { registerResponseScrub } from "./secrets/http.js";
 import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
 import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
 import { MemoryDocs } from "./memory/service.js";
-import { claimIfStale, linkMemoryDeletion } from "./memory/linkage.js";
+import { claimIfStale, linkMemoryDeletion, reclaimStaleSessions } from "./memory/linkage.js";
 import { registerMemoryRoutes } from "./memory/routes.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
@@ -844,6 +844,11 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       log: app.log,
     });
     app.decorate("memory", memory);
+    // Sessions left valid although a version they started with lost items (#144 review 2): claimed before serving.
+    {
+      const count = reclaimStaleSessions(opts.db!, deletion);
+      if (count) logEvent(app.log, "info", "memory.sessions_reclaimed", { count });
+    }
     registerMemoryRoutes(app, memory, users!);
     // Sessions of conversations deleted before a crash (or waiting for a retry) are forgotten once serving.
     app.addHook("onReady", async () => deletion.resume());

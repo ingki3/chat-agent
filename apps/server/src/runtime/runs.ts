@@ -395,8 +395,9 @@ export type RunManagerOptions = {
    */
   memory?: { docSet(userId: string): DocSet };
   /**
-   * A fresh session's row was just saved (#144): the deletion linkage checks whether a document version it started
-   * with has lost items since it was read (the session was still opening) — then it is forgotten after the turn.
+   * A fresh session's row is being saved (#144), inside its transaction: the deletion linkage checks whether a document
+   * version it started with has lost items since it was read (the session was still opening) — then it is forgotten
+   * after the turn. A throw rolls the row back (the session is then forgotten as an orphan).
    */
   sessionSaved?: (row: SessionRow) => void;
 };
@@ -1621,17 +1622,10 @@ export class RunManager {
         model: run.model,
         summaryId: summary?.id ?? null,
         trimmed: context.trimmed,
+        // The 내 지침 stale check in the row's own transaction (#144 review 2): a check that fails takes the row with
+        // it — the session is then forgotten as one no row names (below), never left valid and unchecked.
+        inTransaction: (saved) => this.opts.sessionSaved?.(saved),
       });
-      try {
-        this.opts.sessionSaved?.(row);
-      } catch (e) {
-        logEvent(this.opts.log, "warn", "memory.session_check_failed", {
-          userId: run.userId,
-          conversationId: run.conversationId,
-          runId: run.id,
-          err: e,
-        });
-      }
       // Items were left out of the documents (spec §2): said once, when the session that lacks them starts.
       if (prepared.dropped.user + prepared.dropped.memory > 0)
         this.emit(run.id, {
