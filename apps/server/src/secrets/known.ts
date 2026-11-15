@@ -346,6 +346,13 @@ function encodedLiterals(v: string): string[] {
 
 // ---- matching ----
 
+/**
+ * Characters handed to the matcher since the process started (every `scan`, views not counted again): what the
+ * save budget test (#155) measures — a run's saves must scan in proportion to what the run produced, not to the
+ * number of its tool calls times its size.
+ */
+export const scanStats = { chars: 0 };
+
 const PARTIAL = -2;
 const FAIL = -1;
 
@@ -621,6 +628,7 @@ type ScanMode = "stream" | "tail" | "plain";
  * escape the text ends inside (`%5`, `\\u00`) is held like any partial match: the next chunk may complete it.
  */
 function scan(text: string, m: Compiled, mode: ScanMode = "plain"): Scan {
+  scanStats.chars += text.length;
   const out = scanCore(text, m, mode);
   const views: View[] = [];
   if (text.includes("%")) views.push(percentDecoded(text));
@@ -1048,23 +1056,110 @@ export function scrubJoined(texts: string[], opts: { registry?: KnownSecrets } =
   return out;
 }
 
+/** JSON text of a value, or undefined when it has none (a bigint, a cycle): such a value is never cached. */
+function jsonOf(v: unknown): string | undefined {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What `scrubParts` found for the parts of one message being written again and again (#155: a run saves its reply
+ * at every tool event — scrubbing all of it each time made a run with n tool calls cost n² scans). Keyed by content
+ * (each part's JSON text, and each joined text list), never by object identity — the run manager appends to its
+ * last text part in place — and valid for one registry generation only: once a value is registered or removed,
+ * the next save scrubs everything again, as without a cache. Results are exactly what `scrubParts` gives without
+ * it: a part's scrub depends only on its content (`scrubKnownDeep` walks what JSON holds), the joined pass only on
+ * the list of texts. Only what the latest save used is kept (memory: about one copy of the message).
+ */
+export class PartsScrubCache {
+  private registry: KnownSecrets | undefined;
+  private gen = -1;
+  /** Part JSON → null (scrubbing leaves it as it is) or the scrubbed part's JSON. */
+  private parts = new Map<string, string | null>();
+  private nextParts = new Map<string, string | null>();
+  /** Per part type: the joined pass's input (texts as JSON) and output. */
+  private joined = new Map<string, { key: string; out: string[] }>();
+
+  /** Starts one `scrubParts` call: everything is forgotten when the registry changed since the last one. */
+  begin(registry: KnownSecrets): void {
+    if (registry !== this.registry || registry.generation !== this.gen) {
+      this.registry = registry;
+      this.gen = registry.generation;
+      this.parts.clear();
+      this.joined.clear();
+    }
+    this.nextParts = new Map();
+  }
+
+  end(): void {
+    this.parts = this.nextParts;
+    this.nextParts = new Map();
+  }
+
+  part<P>(p: P, scrub: (p: P) => P): P {
+    const key = jsonOf(p);
+    if (key === undefined) return scrub(p);
+    // (null is a hit too: `has`, not `??`)
+    const hit = this.parts.has(key) ? this.parts.get(key) : this.nextParts.get(key);
+    if (hit !== undefined) {
+      this.nextParts.set(key, hit);
+      // A fresh object each time: nothing handed out is shared with a later save.
+      return hit === null ? p : (JSON.parse(hit) as P);
+    }
+    const r = scrub(p);
+    const out = r === p ? null : jsonOf(r);
+    if (out !== undefined) this.nextParts.set(key, out);
+    return r;
+  }
+
+  texts(type: string, texts: string[], scrub: (texts: string[]) => string[]): string[] {
+    const key = JSON.stringify(texts);
+    const hit = this.joined.get(type);
+    if (hit && hit.key === key) return [...hit.out];
+    const out = scrub(texts);
+    this.joined.set(type, { key, out: [...out] });
+    return out;
+  }
+}
+
 /**
  * A message's parts: every value scrubbed on its own, then the text parts — and, separately, the reasoning parts —
- * as one text each (`scrubJoined`).
+ * as one text each (`scrubJoined`). With `cache` (a message saved again and again, #155): only what changed since
+ * its last save under the same registry generation is scanned.
  */
-export function scrubParts<P>(parts: P[], opts: { registry?: KnownSecrets } = {}): P[] {
+export function scrubParts<P>(
+  parts: P[],
+  opts: { registry?: KnownSecrets; cache?: PartsScrubCache } = {},
+): P[] {
+  const { cache, ...rest } = opts;
+  if (!cache) return scrubPartsWith(parts, rest);
+  cache.begin(rest.registry ?? knownSecrets);
+  try {
+    return scrubPartsWith(parts, rest, cache);
+  } finally {
+    cache.end();
+  }
+}
+
+function scrubPartsWith<P>(parts: P[], opts: { registry?: KnownSecrets }, cache?: PartsScrubCache): P[] {
   // Every value on its own — but a text or reasoning part's text only for complete matches: whether its end is a
   // cut-off secret is judged on the joined text (round 27: a part ending in a secret's first letters stays).
   let changedAny = false;
-  const deep = parts.map((p) => {
+  const one = (p: P): P => {
     const q = p as { type?: unknown; text?: unknown };
-    let r: P;
     if ((q.type === "text" || q.type === "reasoning") && typeof q.text === "string") {
       const { text, ...rest } = q;
       const restOut = scrubKnownDeep(rest, opts);
       const textOut = scrubKnown(text, { ...opts, tail: false });
-      r = restOut === rest && textOut === text ? p : ({ ...restOut, text: textOut } as P);
-    } else r = scrubKnownDeep(p, opts);
+      return restOut === rest && textOut === text ? p : ({ ...restOut, text: textOut } as P);
+    }
+    return scrubKnownDeep(p, opts);
+  };
+  const deep = parts.map((p) => {
+    const r = cache ? cache.part(p, one) : one(p);
     if (r !== p) changedAny = true;
     return r;
   });
@@ -1078,7 +1173,7 @@ export function scrubParts<P>(parts: P[], opts: { registry?: KnownSecrets } = {}
     );
     if (!idx.length) continue;
     const texts = idx.map((k) => (out[k] as { text: string }).text);
-    const next = scrubJoined(texts, opts);
+    const next = cache ? cache.texts(type, texts, (t) => scrubJoined(t, opts)) : scrubJoined(texts, opts);
     if (next.every((t, j) => t === texts[j])) continue;
     out = out === parts || out === deep ? [...out] : out;
     idx.forEach((k, j) => (out[k] = { ...(out[k] as object), text: next[j] } as P));

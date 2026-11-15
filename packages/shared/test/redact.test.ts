@@ -10,9 +10,79 @@ import {
   redactString,
 } from "../src/redact.js";
 
-// The linearity checks are the ratios; the absolute cap guards the production Mac (1.5 s for 1 MB).
-// Shared CI runners are several times slower, so there the cap only catches gross regressions.
-const ABS_MS = process.env.CI ? 6000 : 1500;
+// The linearity checks are the ratios (`expectLinear`); the absolute cap only catches gross regressions — the old
+// quadratic patterns took minutes. The production Mac does 1 MB in at most 1.5 s when idle, but `pnpm test` runs
+// every file at once and a dev machine often has other work too (#155: load 20 on 12 cores, 1.7–2.3 s for the
+// slowest units), so locally 3 s; shared CI runners are several times slower still: 6 s.
+const ABS_MS = process.env.CI ? 6000 : 3000;
+
+/**
+ * Linear, not quadratic (#103, #155): the old check — 8× the input, best of three, under 20× the time — failed
+ * on CI and on a loaded machine for linear code (`[{`: 22.3×). Even unloaded, the worst units take 11–15× for
+ * 8× the input: a 128 kB input stays in cache and its strings in the young generation, a 1 MB one does not, so
+ * the step from 128 kB costs more than the size alone. Two stages, so a quadratic matcher still fails and a linear
+ * one does not depend on luck:
+ *
+ * 1. the old ratio, as it was (cheap; almost every unit ends here);
+ * 2. only when that is over 20×: the growth exponent, fitted (least squares on log time vs log size) over four
+ *    sizes from `large / 4` to `2 × large`, each the best of three runs taken interleaved (a load spike hits every
+ *    size alike, never only the large ones). Measured with every unit forced through this stage, on a machine
+ *    busy with other test runs: 0.95–1.38 for every pattern unit and nesting level here; a synthetic quadratic
+ *    loop: 1.99. Bound 1.6: at least 0.2 from both, so a quadratic pattern fails every time and load does not
+ *    fail a linear one (min over runs only ever removes added time).
+ *
+ * Then the absolute cap (`ABS_MS`) on the large input's best time — retried up to three more times when over it,
+ * since a full test run on the same machine slows every run for a while (best of all: still the same cap).
+ */
+function expectLinear(
+  make: (size: number) => string,
+  run: (input: string) => void,
+  small: number,
+  large: number,
+  what: string,
+): void {
+  const time = (input: string, enough = 0) => {
+    let best = Infinity;
+    for (let k = 0; k < 3 && best >= enough; k++) {
+      const t0 = performance.now();
+      run(input);
+      best = Math.min(best, performance.now() - t0);
+    }
+    return best;
+  };
+  time(make(small / 2), Infinity); // warm up: once
+  const a = time(make(small));
+  // A measurement already under the bound needs no retry (on CI the retries made this take 150–260 s of 240 s).
+  const b = time(make(large), Math.min(20 * Math.max(a, 10), ABS_MS));
+  // Linear: 8× the input takes about 8× the time; quadratic would be 64×. Small times are noisy: 10 ms floor.
+  if (b / Math.max(a, 10) < 20) return expectUnderCap(b, () => time(make(large), ABS_MS), what);
+  const sizes = [large / 4, large / 2, large, 2 * large];
+  const inputs = sizes.map(make);
+  const best = sizes.map(() => Infinity);
+  for (let r = 0; r < 3; r++)
+    inputs.forEach((x, i) => {
+      const t0 = performance.now();
+      run(x);
+      best[i] = Math.min(best[i]!, performance.now() - t0);
+    });
+  const xs = sizes.map(Math.log);
+  const ys = best.map((t) => Math.log(Math.max(t, 1)));
+  const mx = xs.reduce((p, q) => p + q, 0) / xs.length;
+  const my = ys.reduce((p, q) => p + q, 0) / ys.length;
+  const slope =
+    xs.reduce((p, x, i) => p + (x - mx) * (ys[i]! - my), 0) / xs.reduce((p, x) => p + (x - mx) ** 2, 0);
+  expect(
+    slope,
+    `${what}: ${Math.round(a)} ms → ${Math.round(b)} ms (${(b / Math.max(a, 10)).toFixed(1)}×), then ` +
+      `${best.map((t) => Math.round(t)).join(" / ")} ms for ×¼ ×½ ×1 ×2: exponent ${slope.toFixed(2)}`,
+  ).toBeLessThan(1.6);
+  expectUnderCap(Math.min(b, best[2]!), () => time(inputs[2]!, ABS_MS), what);
+}
+
+function expectUnderCap(best: number, again: () => number, what: string): void {
+  for (let k = 0; k < 3 && best >= ABS_MS; k++) best = Math.min(best, again());
+  expect(best, `${what}: ${Math.round(best)} ms`).toBeLessThan(ABS_MS);
+}
 
 describe("redactSecrets", () => {
   it("hides secret fields at any depth, by exact name or a known secret suffix", () => {
@@ -1153,20 +1223,7 @@ describe("redactSecrets", () => {
   it("unclosed \\N{ repeated over 1 MB stays linear (round 18)", () => {
     const MB = 1 << 20;
     const make = (size: number) => (BS + "N{").repeat(Math.ceil(size / 3));
-    const time = (input: string) => {
-      let best = Infinity;
-      for (let k = 0; k < 3; k++) {
-        const t0 = performance.now();
-        redactString(input);
-        best = Math.min(best, performance.now() - t0);
-      }
-      return best;
-    };
-    time(make(MB / 16));
-    const small = time(make(MB / 8));
-    const large = time(make(MB));
-    expect(large / Math.max(small, 10), `${Math.round(small)} ms → ${Math.round(large)} ms`).toBeLessThan(20);
-    expect(large).toBeLessThan(ABS_MS);
+    expectLinear(make, (x) => redactString(x), MB / 8, MB, "unclosed \\N{");
   }, 60_000);
 
   it("an N-escape name of exactly the window length is read; one character more is fail-closed (round 19)", () => {
@@ -1454,27 +1511,20 @@ describe("redactSecrets", () => {
       "{\n[a]\n}\n",
       ",'a' 'b': ",
     ];
-    // Best of up to three: garbage collection and JIT pauses only ever add time. A measurement already under the
-    // bound needs no retry (the check is the same; on CI the retries made this take 150–260 s of a 240 s budget).
-    const time = (input: string, enough = 0) => {
-      let best = Infinity;
-      for (let k = 0; k < 3 && best >= enough; k++) {
-        const t0 = performance.now();
-        redactString(input);
-        redactString(`{${input}}`);
-        best = Math.min(best, performance.now() - t0);
-      }
-      return best;
-    };
+    // Best of up to three (`expectLinear`): garbage collection and JIT pauses only ever add time.
     for (const unit of inputs) {
-      time(fill(unit, MB / 16), Infinity); // warm up: once
-      const eighth = time(fill(unit, MB / 8));
-      const full = time(fill(unit), Math.min(20 * Math.max(eighth, 10), ABS_MS));
-      const what = `pattern unit ${JSON.stringify(unit)}: ${Math.round(eighth)} ms for 128 kB, ${Math.round(full)} ms for 1 MB`;
-      // Linear: 8× the input takes about 8× the time; quadratic would be 64× (a review measured 15.3× for 4×).
-      // The wide gap keeps this stable on a loaded machine. Small times are noisy: 10 ms floor.
-      expect(full / Math.max(eighth, 10), what).toBeLessThan(20);
-      expect(full, what).toBeLessThan(ABS_MS); // ~20–500 ms here; the old quadratic patterns took minutes
+      const what = `pattern unit ${JSON.stringify(unit)}`;
+      // ~20–500 ms each here; the old quadratic patterns took minutes.
+      expectLinear(
+        (size) => fill(unit, size),
+        (x) => {
+          redactString(x);
+          redactString(`{${x}}`);
+        },
+        MB / 8,
+        MB,
+        what,
+      );
     }
   }, 240_000); // many 1 MB inputs, best of three, on a loaded machine: a time budget, not the check itself
 
@@ -1483,16 +1533,6 @@ describe("redactSecrets", () => {
     const wrap = (x: string, levels: number) => {
       for (let k = 0; k < levels; k++) x = JSON.stringify(x);
       return x;
-    };
-    // Best of up to three, as above: no retry once under the bound.
-    const time = (input: string, enough = 0) => {
-      let best = Infinity;
-      for (let k = 0; k < 3 && best >= enough; k++) {
-        const t0 = performance.now();
-        redactString(input);
-        best = Math.min(best, performance.now() - t0);
-      }
-      return best;
     };
     const units = [
       '"{a',
@@ -1510,13 +1550,9 @@ describe("redactSecrets", () => {
       for (let levels = 0; levels <= 4; levels++) {
         const make = (n: number) =>
           "stdout: " + wrap("prefix " + unit.repeat(Math.ceil(n / unit.length)), levels);
-        time(make(16 << 10), Infinity); // warm up: once
-        const small = time(make(32 << 10));
-        const large = time(make(256 << 10), Math.min(20 * Math.max(small, 10), ABS_MS));
-        const what = `${JSON.stringify(unit)} at ${levels} levels: ${Math.round(small)} ms → ${Math.round(large)} ms`;
-        // 8× the input: linear ≈ 8×, quadratic ≈ 64×.
-        expect(large / Math.max(small, 10), what).toBeLessThan(20);
-        expect(large, what).toBeLessThan(ABS_MS);
+        // 8× the input: linear ≈ 8×, quadratic ≈ 64× (`expectLinear`).
+        const what = `${JSON.stringify(unit)} at ${levels} levels`;
+        expectLinear(make, (x) => redactString(x), 32 << 10, 256 << 10, what);
       }
   }, 120_000);
 });
