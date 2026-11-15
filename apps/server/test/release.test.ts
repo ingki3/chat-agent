@@ -128,7 +128,7 @@ describe("predeployBackup", () => {
     db.$client.exec("ROLLBACK");
     expect(r).toBeDefined();
     expect(listBackups(backupDir).map((b) => b.id)).toEqual([r!.id]);
-    expect(fs.readdirSync(backupDir)).toEqual([r!.id]); // no staging left behind
+    expect(fs.readdirSync(backupDir).filter((n) => !n.startsWith(".predeploy.lock"))).toEqual([r!.id]); // no staging left behind
     expect(verifyBackup(r!.dir, key).pending).toBe(0);
     const snap = new Database(path.join(r!.dir, "agentlee.db"), { readonly: true });
     expect(snap.prepare("SELECT v FROM release_probe").all()).toEqual([{ v: "committed" }]);
@@ -176,8 +176,39 @@ describe("predeployBackup", () => {
     }).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "backup_failed" });
     expect(listBackups(backupDir).map((b) => b.id)).toEqual([r!.id]);
-    expect(fs.readdirSync(backupDir).filter((n) => n.startsWith("."))).toEqual([]);
+    expect(
+      fs.readdirSync(backupDir).filter((n) => n.startsWith(".") && !n.startsWith(".predeploy.lock")),
+    ).toEqual([]);
     db.$client.close();
+  });
+
+  it("runs one pre-deploy backup per BACKUP_DIR: a second one refuses and never removes the first's staging (round 3)", async () => {
+    const root = tmp();
+    const { dataDir, db } = dataFolder(root);
+    db.$client.close();
+    const key = createMasterKey(path.join(root, "key", "master.key"));
+    const backupDir = path.join(root, "backups");
+    let second: Promise<unknown> | undefined;
+    let stagingSeen: string[] = [];
+    const first = await predeployBackup({
+      dataDir,
+      backupDir,
+      masterKey: key,
+      afterSnapshot: () => {
+        // Another run on the same BACKUP_DIR (another release root, a direct CLI call) while this one is mid-way.
+        second = predeployBackup({ dataDir, backupDir, masterKey: key }).catch((e: unknown) => e);
+        stagingSeen = fs.readdirSync(backupDir).filter((n) => n.startsWith(".predeploy-"));
+      },
+    });
+    expect(await second).toMatchObject({ code: "backup_running" });
+    expect(stagingSeen).toHaveLength(1); // the first run's staging survived the second one's start
+    expect(verifyBackup(first!.dir, key).pending).toBe(0);
+    const later = await predeployBackup({ dataDir, backupDir, masterKey: key, now: () => Date.now() + 2000 });
+    expect(
+      listBackups(backupDir)
+        .map((b) => b.id)
+        .sort(),
+    ).toEqual([first!.id, later!.id].sort());
   });
 
   it("clears staging left by a killed run and keeps the snapshot owner-only under any umask (round 2)", async () => {
@@ -208,7 +239,7 @@ describe("predeployBackup", () => {
         },
       });
       expect(modes).toEqual(["staging 700", "snapshot 600"]);
-      expect(fs.readdirSync(backupDir)).toEqual([r!.id]);
+      expect(fs.readdirSync(backupDir).filter((n) => !n.startsWith(".predeploy.lock"))).toEqual([r!.id]);
     } finally {
       process.umask(old);
     }

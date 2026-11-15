@@ -288,24 +288,29 @@ prune_releases() { # prune_releases <keep>
 # called `main`. A bare name that is both a branch and a tag is refused (say refs/heads/… or refs/tags/…). Commits only
 # as the full 40-character id: a short prefix can also be a branch or tag name (#148 review round 2).
 resolve_ref() {
-  local ref="$1" g=(git -C "$ROOT/src.git") b t
+  local ref="$1" g=(git -C "$ROOT/src.git") b=0 t=0 hex=0 lower upper n
   if [ -z "$ref" ]; then echo refs/heads/main; return 0; fi
   case "$ref" in refs/heads/*|refs/tags/*) echo "$ref"; return 0 ;; esac
-  b=0; t=0
-  "${g[@]}" show-ref --verify --quiet "refs/heads/$ref" && b=1
-  "${g[@]}" show-ref --verify --quiet "refs/tags/$ref" && t=1
-  if [ "$b" = 1 ] && [ "$t" = 1 ]; then
+  # Looks like a commit id (or a prefix of one), in any letter case — git reads upper-case ids too.
+  [[ "$ref" =~ ^[0-9a-fA-F]{4,40}$ ]] && hex=1
+  lower="$(printf '%s' "$ref" | tr 'A-F' 'a-f')"
+  upper="$(printf '%s' "$ref" | tr 'a-f' 'A-F')"
+  for n in "$ref" $([ "$hex" = 1 ] && echo "$lower $upper"); do
+    "${g[@]}" show-ref --verify --quiet "refs/heads/$n" && b=1
+    "${g[@]}" show-ref --verify --quiet "refs/tags/$n" && t=1
+  done
+  if [ "$b" = 1 ] && [ "$t" = 1 ] && [ "$hex" = 0 ]; then
     echo "release: ref $ref is both a branch and a tag — say refs/heads/$ref or refs/tags/$ref" >&2; return 1
   fi
-  # A name that looks like a commit id (or a prefix of one) and is also a branch or tag: which one is meant?
-  if [[ "$ref" =~ ^[0-9a-f]{4,40}$ ]] && { [ "$b" = 1 ] || [ "$t" = 1 ]; }; then
-    echo "release: $ref looks like a commit id and is also a branch or tag name — ambiguous; say refs/heads/$ref or refs/tags/$ref" >&2
+  # A commit-id-like name that is also a branch or tag (in any letter case): which one is meant?
+  if [ "$hex" = 1 ] && { [ "$b" = 1 ] || [ "$t" = 1 ]; }; then
+    echo "release: $ref looks like a commit id and is also a branch or tag name — ambiguous; say refs/heads/… or refs/tags/…" >&2
     return 1
   fi
-  if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then echo "$ref"; return 0; fi
+  if [ "$hex" = 1 ] && [ "${#ref}" = 40 ]; then echo "$lower"; return 0; fi
   if [ "$b" = 1 ]; then echo "refs/heads/$ref"; return 0; fi
   if [ "$t" = 1 ]; then echo "refs/tags/$ref"; return 0; fi
-  if [[ "$ref" =~ ^[0-9a-f]{4,39}$ ]]; then
+  if [ "$hex" = 1 ]; then
     echo "release: unknown ref: $ref — give a commit as its full 40-character id" >&2; return 1
   fi
   echo "release: unknown ref: $ref" >&2; return 1

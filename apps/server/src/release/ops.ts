@@ -98,8 +98,31 @@ export async function predeployBackup(o: {
   const dbFile = storagePaths(o.dataDir).db;
   if (!fs.existsSync(dbFile)) return undefined;
   ensureBackupDir(o.backupDir);
-  // Staging folders left by a killed run (never listed as backups, but they hold a copy of the database): removed
-  // before a new one starts. Pre-deploy backups run one at a time — release.sh holds its lock around this helper.
+  // One pre-deploy backup per BACKUP_DIR at a time, whatever started it (two release roots can share a BACKUP_DIR,
+  // and release.sh's own lock is per root): a kernel lock next to the staging folders, `<BACKUP_DIR>/.predeploy.lock.db`
+  // (the data lock's mechanism — dropped by the system if the process dies), held from the clean-up below until the
+  // backup is complete. The server's daily backups use `.tmp-*` and never touch `.predeploy-*`.
+  let lock: DataLock;
+  try {
+    lock = acquireDataLock(path.join(o.backupDir, "predeploy"), "predeploy");
+  } catch (e) {
+    if (e instanceof DataLockHeld)
+      throw new ReleaseError("backup_running", "another pre-deploy backup is using BACKUP_DIR — try again");
+    throw e;
+  }
+  try {
+    return await predeployLocked(o, dbFile);
+  } finally {
+    lock.release();
+  }
+}
+
+async function predeployLocked(
+  o: Parameters<typeof predeployBackup>[0],
+  dbFile: string,
+): Promise<PredeployResult> {
+  // Staging folders left by a killed run (never listed as backups, but they hold a copy of the database). Safe to
+  // remove: we hold the lock, so no other pre-deploy backup is writing one.
   for (const name of fs.readdirSync(o.backupDir))
     if (name.startsWith(".predeploy-"))
       fs.rmSync(path.join(o.backupDir, name), { recursive: true, force: true });

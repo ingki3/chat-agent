@@ -486,8 +486,21 @@ describe.skipIf(process.platform === "win32")("release.sh", () => {
     const alone = fx.run("install", "--ref", v3.slice(0, 10));
     expect(alone.status).toBe(1);
     expect(alone.stderr).toMatch(/full 40-character id/);
-    ok(fx.run("install", "--ref", v3));
+    // The same with an upper-case full id (git reads it): a branch of that name on v1 makes it ambiguous (round 3).
+    const upper = v3.toUpperCase();
+    fx.git(fx.work, "push", "--quiet", fx.src, `HEAD~2:refs/heads/${upper}`);
+    const up = fx.run("install", "--ref", upper);
+    expect(up.status).toBe(1);
+    expect(up.stderr).toMatch(/looks like a commit id and is also a branch or tag name — ambiguous/);
+    expect(fx.run("install", "--ref", v3).stderr).toMatch(/ambiguous/); // lower case: the same name, other case
+    expect(fx.current()).toBe(before);
+    fx.git(fx.work, "push", "--quiet", fx.src, `:refs/heads/${upper}`);
+    // Without the clash an upper-case full id installs that commit, recorded in lower case.
+    ok(fx.run("install", "--ref", upper));
     expect(await fx.served()).toBe("v3");
+    expect(
+      fs.readFileSync(path.join(fx.agentHome, "releases", fx.current(), ".release-info"), "utf8"),
+    ).toContain(`sha=${v3}\nref=${v3}\n`);
   }, 120_000);
 
   it("moves data with a LaunchDaemon plist on disk once the daemon is unloaded (#148 review P2)", async () => {

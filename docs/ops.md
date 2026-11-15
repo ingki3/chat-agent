@@ -1898,7 +1898,7 @@ TEST_WORKER_RUN_USER=_agentleewk pnpm vitest run apps/server/test/workers.test.t
 ### 43.2 설치·업데이트 (`install`)
 ```bash
 pnpm -s release install                 # 브랜치 main 최신 커밋 (refs/heads/main — 이름이 main인 태그가 아님)
-pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이름이 겹치면(브랜치·태그, 커밋 id) 거부 → refs/heads/… 또는 refs/tags/…, 커밋은 40자 전체만
+pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이름이 겹치면(브랜치·태그, 커밋 id) 거부 → refs/heads/… 또는 refs/tags/…, 커밋은 40자 전체만(대소문자 무관, 소문자로 기록 — 커밋 id처럼 보이는 이름이 어떤 대소문자로든 브랜치·태그면 거부)
 ```
 순서 — 하나라도 실패하면 그 자리에서 멈추고(새 폴더는 지움) `current`는 그대로다:
 1. 잠금 → `shared/.env` 확인(있음·일반 파일·내 소유·600). LaunchDaemon이 설치돼 있으면 plist가 `~/.chat-agent/current`를 돌리는지 확인(아니면 5.2절대로 다시 설치하라고 멈춤).
@@ -1908,7 +1908,7 @@ pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이�
 5. `.env` 링크(`../../shared/.env`)를 만든다.
 6. **운영 설정 사전 검사** — LaunchDaemon 설치의 검사(`launchd-helper.mjs check`: 설정 로드 + 마스터 키 존재·32바이트·600·링크 아님·안전한 부모)를 데몬과 같은 환경(`env -i`, `NODE_ENV=production`, 서비스 계정)으로 새 배포본에서 돌리고, 이어 `DATA_DIR`·`BACKUP_DIR`이 `shared/.env`에 **절대 경로로** 있고 `releases/` 밖인지 본다(`dist/cli/release.js config`).
 7. DB가 없으면 시작하지 않는다(`--no-start`로 설치만, 또는 `--fresh`로 빈 DB에서 시작) — 이전(43.4절)을 빼먹고 빈 데이터로 뜨는 것을 막는다.
-8. **배포 직전 백업 + 무결성** — 서버가 도는 중에도 안전하다: 운영 DB를 **읽기 전용**으로 열어 `VACUUM INTO`(한 읽기 트랜잭션 = 한 시점)로 먼저 비공개 스냅샷을 만들고, **그 스냅샷에서** 복사할 파일 목록(`FILE_REFERENCES`)과 뺄 폴더(삭제 작업)를 읽어 파일 저장소를 복사한 21절 형식의 백업을 — 운영 DB에서 읽으면 그 사이 서버가 지운 첨부가 빠진 채 통과할 수 있다(스냅샷이 가리키는 파일이 없으면 실패) — `BACKUP_DIR` 안 비공개 임시 폴더에서 만든 뒤 이름을 바꿔 넣는다. 이어 `pnpm -s restore check`와 같은 검사(키·해시·`integrity_check`·스키마·모든 암호문 복호화)를 **새 배포본의 마이그레이션 목록**으로 한다 — DB가 새 배포본보다 새 스키마면(`schema_newer`, 옛 커밋을 설치하려는 경우) 멈춘다. id를 `.release-info`의 `predeploy_backup=`에 적는다.
+8. **배포 직전 백업 + 무결성** — 서버가 도는 중에도 안전하다: 운영 DB를 **읽기 전용**으로 열어 `VACUUM INTO`(한 읽기 트랜잭션 = 한 시점)로 먼저 비공개 스냅샷을 만들고, **그 스냅샷에서** 복사할 파일 목록(`FILE_REFERENCES`)과 뺄 폴더(삭제 작업)를 읽어 파일 저장소를 복사한 21절 형식의 백업을 — 운영 DB에서 읽으면 그 사이 서버가 지운 첨부가 빠진 채 통과할 수 있다(스냅샷이 가리키는 파일이 없으면 실패) — `BACKUP_DIR` 안 비공개 임시 폴더에서 만든 뒤 이름을 바꿔 넣는다. 이어 `pnpm -s restore check`와 같은 검사(키·해시·`integrity_check`·스키마·모든 암호문 복호화)를 **새 배포본의 마이그레이션 목록**으로 한다 — DB가 새 배포본보다 새 스키마면(`schema_newer`, 옛 커밋을 설치하려는 경우) 멈춘다. id를 `.release-info`의 `predeploy_backup=`에 적는다. 배포 직전 백업은 `BACKUP_DIR`마다 한 번에 하나만 돈다(`BACKUP_DIR/.predeploy.lock.db` 커널 잠금 — 두 배포 루트가 `BACKUP_DIR`을 같이 써도, 도구를 직접 불러도). 잠금을 잡은 뒤에만 죽은 실행이 남긴 `.predeploy-*`를 지우고, 이미 돌고 있으면 `backup_running`으로 거부한다. 서버의 매일 백업(`.tmp-*`)과는 겹치지 않는다.
 9. 새 배포본에 직전 배포본에 없던 마이그레이션(drizzle `_journal.json`의 태그)이 있으면 알린다 — 서버가 시작할 때 적용된다.
 10. (LaunchDaemon이 아니면) 포트에 **이 설치의 서버가 아닌** 프로세스가 있으면 멈춘다 — 다른 서버를 죽이지 않는다.
 11. `current`를 원자적으로 바꾼다(새 링크를 만들어 `rename`).
