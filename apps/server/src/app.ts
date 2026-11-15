@@ -133,7 +133,7 @@ import { registerResponseScrub } from "./secrets/http.js";
 import { StoredRescrub, type RescrubOptions } from "./secrets/rescrub.js";
 import { ConversationPurge, type PurgeOptions } from "./conversations/purge.js";
 import { MemoryDocs } from "./memory/service.js";
-import { linkMemoryDeletion } from "./memory/linkage.js";
+import { claimIfStale, linkMemoryDeletion } from "./memory/linkage.js";
 import { registerMemoryRoutes } from "./memory/routes.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
@@ -327,7 +327,10 @@ export type BuildOptions = {
   /** Tests: the deletion jobs' retry timings and clock (#54). */
   purge?: Pick<PurgeOptions, "retryMs" | "maxRetryMs" | "now">;
   /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
-  rescrub?: Pick<RescrubOptions, "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs">;
+  rescrub?: Pick<
+    RescrubOptions,
+    "retryMs" | "maxRetryMs" | "compactRetryMs" | "maxCompactRetryMs" | "delayMs"
+  >;
   /**
    * Extraction (#48): the runner (default: the sandboxed worker), OCR (default: tesseract.js with the pinned
    * language data, `ocrCapability`) and a clock.
@@ -783,6 +786,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     );
     const runManager = new RunManager(opts.db!, app.conversations!, runtimes, events, {
       memory,
+      // A session still opening while the 내 지침 deletion linkage ran is caught when its row is saved (#144).
+      sessionSaved: (row) => {
+        if (later.purge) claimIfStale(opts.db!, later.purge, row);
+      },
       forgetSession: (ref) => later.purge?.orphan(ref),
       startSettings,
       mcp,

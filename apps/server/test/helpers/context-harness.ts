@@ -32,7 +32,12 @@ export const textOf = (m: Pick<MessageRow, "parts">) =>
 
 export async function startContextApp(
   runtimes: RuntimeRegistry,
-  o: { context?: Partial<ContextOptions>; closers: (() => Promise<unknown> | unknown)[] },
+  o: {
+    context?: Partial<ContextOptions>;
+    closers: (() => Promise<unknown> | unknown)[];
+    /** The background rescrub's start delay (tests that must see what is sent before it runs). */
+    rescrubDelayMs?: number;
+  },
 ) {
   const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-context-"));
   o.closers.push(() => fs.rmSync(dataDir, { recursive: true, force: true }));
@@ -42,6 +47,7 @@ export async function startContextApp(
     logger: false,
     runtimes,
     runs: { flushMs: 0, ...(o.context ? { context: o.context } : {}) },
+    ...(o.rescrubDelayMs !== undefined ? { rescrub: { delayMs: o.rescrubDelayMs } } : {}),
   });
   o.closers.push(() => app.close());
   const f = await createFamily(app);

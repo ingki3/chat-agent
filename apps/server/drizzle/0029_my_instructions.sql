@@ -38,6 +38,7 @@ CREATE TABLE `memory_versions` (
 	`restored_from` integer,
 	`content` text NOT NULL,
 	`item_ids` text,
+	`unlinked_at` integer,
 	`created_at` integer NOT NULL,
 	PRIMARY KEY(`document_id`, `version`),
 	FOREIGN KEY (`document_id`) REFERENCES `memory_documents`(`id`) ON UPDATE no action ON DELETE cascade

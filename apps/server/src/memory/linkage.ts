@@ -72,3 +72,39 @@ export function sessionsStartedWith(
   }
   return [...out.values()];
 }
+
+/**
+ * A session registered after the deletion linkage ran (#144 review 1): its documents were read before, while it was
+ * still opening, so the linkage did not find it (no row yet). Checked right after its row is saved — a version it
+ * started with that the linkage has edited since (`unlinked_at`) held a removed item: the session is invalidated and
+ * queued to be forgotten like the others (after its turn). Saved before the linkage ran, the linkage finds the row
+ * itself — together the two never miss one. True when it was claimed.
+ */
+export function claimIfStale(
+  db: Db,
+  purge: Pick<ConversationPurge, "claimSessions">,
+  session: {
+    id: string;
+    conversationId: string;
+    runtime: string;
+    connectionId: string | null;
+    externalSessionId: string;
+    docVersions: string | null;
+  },
+): boolean {
+  if (!session.docVersions || session.docVersions === "{}") return false;
+  const sql = db.$client;
+  const stale = sql
+    .prepare(
+      `SELECT 1 FROM memory_versions v, json_each(?) j
+        WHERE v.document_id = j.key AND v.version = j.value AND v.unlinked_at IS NOT NULL LIMIT 1`,
+    )
+    .get(session.docVersions);
+  if (!stale) return false;
+  const owner = sql
+    .prepare("SELECT owner_id AS o FROM conversations WHERE id = ?")
+    .get(session.conversationId) as { o: string } | undefined;
+  if (!owner) return false; // its conversation is gone: the delete's own jobs (or the orphan path) forget it
+  purge.claimSessions([{ ...session, userId: owner.o }]);
+  return true;
+}

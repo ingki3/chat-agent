@@ -179,6 +179,7 @@ export const LOG_EVENTS = [
   "schedule.proposed",
   // 내 지침 deletion linkage (#144): how many items went and how many sessions are to be forgotten — never the text.
   "memory.items_unlinked",
+  "memory.session_check_failed",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 

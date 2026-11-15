@@ -18,7 +18,12 @@ import {
 } from "@agentlee/shared";
 import type { RunSettings, RunSettingsInput } from "../connections/access.js";
 import { RUNTIME_LABEL } from "../connections/store.js";
-import { settingsOf, type ConversationStore, type MessageRow } from "../conversations/store.js";
+import {
+  settingsOf,
+  type ConversationStore,
+  type MessageRow,
+  type SessionRow,
+} from "../conversations/store.js";
 import type { StartSettings } from "../users/defaults.js";
 import type { Db } from "../db/client.js";
 import { runEvents, runs, users } from "../db/schema.js";
@@ -169,6 +174,8 @@ type RunContext = {
   /** The turn's own user message (its attachments are the conversation's too). */
   inputMessageId: string | null;
 };
+
+const sha256 = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 
 /** What `runs.idempotency_key` holds: the client's key hashed (it is only ever compared). */
 export const idempotencyHash = (key: string) =>
@@ -387,6 +394,11 @@ export type RunManagerOptions = {
    * instructions, SOUL / USER / MEMORY in the user material box. Without it no documents go in.
    */
   memory?: { docSet(userId: string): DocSet };
+  /**
+   * A fresh session's row was just saved (#144): the deletion linkage checks whether a document version it started
+   * with has lost items since it was read (the session was still opening) — then it is forgotten after the turn.
+   */
+  sessionSaved?: (row: SessionRow) => void;
 };
 
 /** What a run's fresh session is told before its first turn (#20, #144), built once per run. */
@@ -1555,6 +1567,7 @@ export class RunManager {
     // The checkpoint is the last message a runtime gets anything from: the server's own dividers (a switch, a
     // summary) written since are not part of what it knows, so they do not make a session stale.
     const lastSeen = context.history.findLast((m) => m.role !== "system")?.id ?? null;
+    const sentHash = sha256(scrubKnown(instructions.text));
     const prev = !caps.canResume
       ? undefined
       : this.conversations.sessions(run.conversationId).find(
@@ -1563,7 +1576,9 @@ export class RunManager {
             (s.connectionId ?? null) === (run.connectionId ?? null) &&
             s.conversationRevision === conv.revision &&
             s.lastMessageId === lastSeen &&
-            s.instructionsHash === instructions.hash &&
+            // Compared on the instructions as they would be sent now (#144 review 1): a value that became a known
+            // secret since the session started changes them — that session (holding the raw value) is not resumed.
+            s.instructionsHash === sentHash &&
             // The 내 지침 versions it started with (#144, spec §2): any change applies from the next turn on.
             (s.docVersions ?? NO_DOCS) === docsKey &&
             (s.summaryId ?? null) === (summary?.id ?? null) &&
@@ -1600,12 +1615,23 @@ export class RunManager {
         externalSessionId: session.externalSessionId,
         lastMessageId: lastSeen,
         conversationRevision: conv.revision,
-        instructionsHash: instructions.hash,
+        // The fingerprint of what this session really got (`rescrub` scrubbed it right before the start).
+        instructionsHash: sha256(ctx.systemPrompt),
         docVersions: docsKey,
         model: run.model,
         summaryId: summary?.id ?? null,
         trimmed: context.trimmed,
       });
+      try {
+        this.opts.sessionSaved?.(row);
+      } catch (e) {
+        logEvent(this.opts.log, "warn", "memory.session_check_failed", {
+          userId: run.userId,
+          conversationId: run.conversationId,
+          runId: run.id,
+          err: e,
+        });
+      }
       // Items were left out of the documents (spec §2): said once, when the session that lacks them starts.
       if (prepared.dropped.user + prepared.dropped.memory > 0)
         this.emit(run.id, {

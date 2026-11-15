@@ -1318,6 +1318,11 @@ export const memoryVersions = sqliteTable(
     content: text("content").notNull(),
     /** List documents: JSON array of item ids, in order. Null for free text. */
     itemIds: text("item_ids", { mode: "json" }).$type<string[]>(),
+    /**
+     * When the deletion linkage last took items out of this version (§10.2), null if never. A session found to have
+     * started with such a version — one still opening while the linkage ran — is forgotten too (§10.5).
+     */
+    unlinkedAt: integer("unlinked_at"),
     createdAt: integer("created_at").notNull(),
   },
   (t) => [primaryKey({ columns: [t.documentId, t.version] })],

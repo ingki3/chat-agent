@@ -38,7 +38,10 @@ import {
   MIN_CONTEXT_WINDOW,
   RuntimeRegistry,
   type ModelCapability,
+  type RuntimeAdapter,
 } from "../src/runtime/adapter.js";
+import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
+import { createFamily } from "./helpers/permission-matrix.js";
 import { CLAUDE_MODELS, ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { FakeRuntime } from "../src/runtime/fake.js";
@@ -324,6 +327,17 @@ describe("documents, versions and restore (FR-16.1·16.3)", () => {
     expect((r.next[2] as { sources: unknown[] }).sources).toEqual([]);
     expect(r.removed.map((i) => i.id)).toEqual(["b"]);
     expect(reconcile(cur, ["셋"]).removed.map((i) => i.id)).toEqual(["a", "b"]);
+    // Moved lines keep their items (review 1, P1): any order, ids and sources unchanged.
+    const moved = reconcile(cur, ["셋", "하나", "둘"]);
+    expect(moved.next.map((n) => ("keep" in n ? n.keep.id : null))).toEqual(["c", "a", "b"]);
+    expect(moved.removed).toEqual([]);
+    // Duplicates, deterministically: the first one keeps the item, a second one is new.
+    const dup = reconcile(
+      [item("x", "같은 줄", 1), item("y", "같은 줄")],
+      ["같은 줄", "다른 줄", "같은 줄", "같은 줄"],
+    );
+    expect(dup.next.map((n) => ("keep" in n ? n.keep.id : n.text))).toEqual(["x", "다른 줄", "y", "같은 줄"]);
+    expect(dup.removed).toEqual([]);
     expect(lineDiff(["a", "b"], ["a", "c", "b"])).toEqual([
       { op: "same", text: "a" },
       { op: "add", text: "c" },
@@ -682,6 +696,40 @@ describe("deletion linkage (spec §10, FR-16.9)", () => {
     expect(lastPrompt(t.claude)).not.toContain("AAPL_SECRET_FACT");
   });
 
+  it("reordering the lines keeps each item (id and sources): deleting the source still removes it everywhere (review 1, P1)", async () => {
+    const t = await start();
+    t.connect("claude-code");
+    const a = await t.newConversation();
+    await t.send(a, "관심 종목은 AAPL, 기억해줘");
+    const { doc } = await sourced(t, a, "MOVED_FACT 관심 종목은 AAPL");
+    const own = await t.save("owner", "memory", "- MOVED_FACT 관심 종목은 AAPL\n- 내가 쓴 항목");
+    expect(own.statusCode).toBe(200);
+    const sourcedId = t.memory.store.items(t.memory.store.byId(doc.id)!)[0]!.id;
+    // The user moves the line down.
+    await t.save("owner", "memory", "- 내가 쓴 항목\n- MOVED_FACT 관심 종목은 AAPL");
+    const items = t.memory.store.items(t.memory.store.byId(doc.id)!);
+    expect(items.map((i) => i.text)).toEqual(["내가 쓴 항목", "MOVED_FACT 관심 종목은 AAPL"]);
+    expect(items[1]!.id).toBe(sourcedId);
+    expect(items[1]!.sources).toHaveLength(1);
+    const del = await t.app.inject({
+      method: "DELETE",
+      url: `/api/conversations/${a}`,
+      headers: {
+        host: "localhost:3000",
+        cookie: t.f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      },
+    });
+    expect(del.statusCode).toBe(200);
+    for (const v of t.memory.store.versions(doc.id))
+      expect(v.content, `v${v.version}`).not.toContain("MOVED_FACT");
+    for (const v of t.memory.store.versions(doc.id)) {
+      const r = await t.as("owner").post(`/api/instructions/memory/versions/${v.version}/restore`);
+      expect(r.json<InstructionDoc>().content).not.toContain("MOVED_FACT");
+    }
+  });
+
   it("an edit that takes the source message out of the active history removes the item too", async () => {
     const t = await start();
     t.connect("claude-code");
@@ -875,4 +923,154 @@ describe("backups and the model condition", () => {
     // The test database helper still works for an in-memory app.
     expect(createTestDb()).toBeDefined();
   });
+});
+
+describe("a session still opening while the deletion linkage runs (#144 review 1, P1)", () => {
+  /** The real Claude adapter (recorded SDK) in `runtimes/<connection>/<user>/`, its start held until released. */
+  async function world(dataDir: string, db: ReturnType<typeof openDb>) {
+    const log: ReplayLog = { options: [], prompts: [], interrupts: 0, closes: 0 };
+    const answers = new Proxy({} as Record<string, ReturnType<typeof sdk.answer>>, {
+      get: (_t, k) => (typeof k === "string" ? sdk.answer(crypto.randomUUID(), "네") : undefined),
+      has: () => true,
+    });
+    const claude = new ClaudeAdapter({
+      connection: (req) => ({
+        id: req.connectionId!,
+        dir: path.join(dataDir, "runtimes", req.connectionId!, req.userId),
+        auth: { kind: "api_key", apiKey: `sk-ant-HOLDTEST${"h".repeat(24)}` },
+      }),
+      query: replayQuery(answers, log, 1),
+      spawn: () => {
+        throw new Error("not spawned in replay");
+      },
+    });
+    const hold: { entered?: () => void; release?: Promise<void> } = {};
+    const held: RuntimeAdapter = {
+      id: claude.id,
+      capabilities: () => claude.capabilities(),
+      start: async (ctx) => {
+        if (hold.release) {
+          hold.entered?.();
+          await hold.release;
+        }
+        return claude.start(ctx);
+      },
+      resume: (id, ctx) => claude.resume(id, ctx),
+      forget: (id, dir, opts) => claude.forget(id, dir, opts),
+      storedSessions: (dir) => claude.storedSessions(dir),
+    };
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(held);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+      purge: { retryMs: 20, maxRetryMs: 40 },
+    });
+    await app.ready();
+    return { app, log, hold };
+  }
+  const waitRun = async (app: Awaited<ReturnType<typeof buildApp>>, id: string) => {
+    for (let i = 0; i < 1000 && !app.runs!.get(id)?.endedAt; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(app.runs!.get(id)?.status).toBe("done");
+  };
+  const metaHolds = (dataDir: string, text: string) => {
+    const found: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (fs.readFileSync(p, "utf8").includes(text)) found.push(p);
+      }
+    };
+    if (fs.existsSync(path.join(dataDir, "runtimes"))) walk(path.join(dataDir, "runtimes"));
+    return found;
+  };
+
+  for (const restart of [false, true])
+    it(`the session registered after the deletion is invalidated and forgotten after its turn${restart ? " — also across a restart" : ""}`, async () => {
+      const dataDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "agentlee-memory-hold-"));
+      closers.push(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+      const db = openDb(path.join(dataDir, DB_FILE));
+      runMigrations(db);
+      closers.push(() => db.$client.close());
+      const w = await world(dataDir, db);
+      let app = w.app;
+      closers.push(() => app.close());
+      const f = await createFamily(app);
+      const conn = app.connections!.store.create({
+        runtime: "claude-code",
+        authType: "api_key",
+        scope: "personal",
+        owner: f.users.owner,
+        createdBy: f.users.admin.id,
+        secret: `sk-ant-HOLDTEST${"h".repeat(24)}`,
+      });
+      app.connections!.store.setTestResult(conn.id, "passed", "ok", 1);
+      const headers = {
+        host: "localhost:3000",
+        cookie: f.cookies.owner,
+        origin: "http://localhost:3000",
+        [CSRF_HEADER]: "1",
+      };
+      const post = (url: string, payload: object = {}) =>
+        app.inject({ method: "POST", url, headers, payload });
+      // A: the source of an item of MEMORY.md.
+      const a = (await post("/api/conversations")).json<{ id: string }>().id;
+      const first = await post(`/api/conversations/${a}/messages`, { text: "관심 종목은 AAPL, 기억해줘" });
+      await waitRun(app, first.json<{ run: { id: string } }>().run.id);
+      const m = app.conversations!.messages(a, { limit: 10 }).find((x) => x.role === "user")!;
+      const fact = `HELD_FACT_${crypto.randomBytes(4).toString("hex")}`;
+      app.memory!.store.addItems(
+        app.memory!.store.ensure(f.users.owner.id, "memory"),
+        [
+          {
+            text: fact,
+            author: "tool",
+            sources: [{ messageId: m.id, revision: m.revision, conversationId: a }],
+          },
+        ],
+        "tool",
+      );
+      // B: its session reads the documents, then its start is held …
+      const entered = new Promise<void>((r) => (w.hold.entered = r));
+      let release!: () => void;
+      w.hold.release = new Promise<void>((r) => (release = r));
+      const b = (await post("/api/conversations")).json<{ id: string }>().id;
+      const second = await post(`/api/conversations/${b}/messages`, { text: "내 관심 종목?" });
+      await entered;
+      // … while the source conversation is deleted (no session row of B exists yet).
+      const del = await app.inject({ method: "DELETE", url: `/api/conversations/${a}`, headers });
+      expect(del.statusCode).toBe(200);
+      if (restart) app.purge!.close(); // the jobs are written but never run in this process
+      release();
+      await waitRun(app, second.json<{ run: { id: string } }>().run.id);
+      const row = db.$client
+        .prepare(
+          "SELECT invalidated AS i, external_session_id AS s FROM runtime_sessions WHERE conversation_id = ?",
+        )
+        .get(b) as { i: number; s: string };
+      expect(row.i).toBe(1);
+      // Its state held the deleted fact (the prompt was built before the deletion).
+      expect(w.log.options.at(-1)!.sessionId).toBe(row.s);
+      if (restart) {
+        expect(metaHolds(dataDir, fact).length).toBeGreaterThan(0);
+        await app.close();
+        const again = await world(dataDir, db);
+        app = again.app;
+      }
+      for (let i = 0; i < 300 && metaHolds(dataDir, fact).length; i++)
+        await new Promise((r) => setTimeout(r, 10));
+      await app.purge!.idle();
+      expect(metaHolds(dataDir, fact)).toEqual([]);
+      expect(
+        db.$client.prepare("SELECT count(*) AS n FROM deletion_jobs WHERE kind = 'runtime_session'").get(),
+      ).toEqual({
+        n: 0,
+      });
+      // The next turn in B is a new session without it.
+      const third = await post(`/api/conversations/${b}/messages`, { text: "다시?" });
+      expect(third.statusCode).toBe(201);
+    });
 });

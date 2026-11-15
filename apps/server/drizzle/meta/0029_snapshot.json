@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "b8bbc185-5f5f-4a57-a7ec-6969a3ff71af",
+  "id": "071633f6-4f70-44d2-8a9a-758d5402f679",
   "prevId": "f9c9737d-b6c9-44fe-b117-1aec9e29b4d0",
   "tables": {
     "artifact_versions": {
@@ -1825,6 +1825,13 @@
         "item_ids": {
           "name": "item_ids",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "unlinked_at": {
+          "name": "unlinked_at",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
