@@ -11,20 +11,33 @@ const box = (page: Page) => page.getByLabel("메시지 입력");
 const reply = (page: Page) => page.getByTestId("assistant").last();
 const queued = (page: Page) => page.getByTestId("queued-send");
 
-/** Opens a fresh conversation; `hold()` makes every later `active-run` read wait until `release()`. */
+/**
+ * Opens a fresh conversation; `hold()` makes every later `active-run` read wait until `release()`; `fail(true)` makes
+ * them answer 500 (counted in `failures`) until `fail(false)`.
+ */
 async function openHeld(page: Page, baseURL: string, title: string) {
   await useAccount(page, SON);
   const c = await newConversation(page.request, baseURL, `${title} ${Date.now()}`);
   let holding = false;
+  let failing = false;
+  let failures = 0;
   const held: Route[] = [];
   await page.route(`**/api/conversations/${c.id}/active-run`, (route) => {
-    if (holding) held.push(route);
+    if (failing) {
+      failures++;
+      void route.fulfill({ status: 500, json: { error: "internal", message: "시험용 실패" } });
+    } else if (holding) held.push(route);
     else void route.continue();
   });
   const sends: string[] = [];
+  /** The file ids each send carried. */
+  const sentFiles: string[][] = [];
   page.on("request", (r) => {
-    if (r.method() === "POST" && r.url().endsWith(`/api/conversations/${c.id}/messages`))
-      sends.push(String((r.postDataJSON() as { text?: string }).text));
+    if (r.method() === "POST" && r.url().endsWith(`/api/conversations/${c.id}/messages`)) {
+      const body = r.postDataJSON() as { text?: string; fileIds?: string[] };
+      sends.push(String(body.text));
+      sentFiles.push(body.fileIds ?? []);
+    }
   });
   const first = page.waitForResponse((r) => r.url().endsWith(`/api/conversations/${c.id}/active-run`));
   await page.goto(`/c/${c.id}`);
@@ -32,7 +45,10 @@ async function openHeld(page: Page, baseURL: string, title: string) {
   await expect(page.locator(".topbar .title")).toHaveText(c.title);
   return {
     sends,
+    sentFiles,
     held,
+    failures: () => failures,
+    fail: (on: boolean) => (failing = on),
     hold: () => (holding = true),
     release: async () => {
       holding = false;
@@ -152,4 +168,109 @@ test("Enter while the reply is still being written shows a hint and sends nothin
   await expect(box(page)).toHaveValue("기다릴 수 없는 글");
   await expect(page.getByTestId("user-message")).toHaveCount(1);
   expect(h.sends).toEqual(["첫 질문"]);
+});
+
+const chips = (page: Page) => page.getByTestId("attachment");
+const pick = (page: Page, name: string) =>
+  page
+    .getByTestId("file-input")
+    .setInputFiles([{ name, mimeType: "text/plain", buffer: Buffer.from(`시험 내용 ${name}`) }]);
+
+test("adding a file while an Enter is queued drops it: nothing goes, during or after the upload (#141)", async ({
+  page,
+  baseURL,
+}) => {
+  const h = await openHeld(page, baseURL!, "대기 중 파일 추가");
+  await answeredButHeld(page, h, "첫 질문");
+
+  await box(page).fill("파일 없이 보낼 글");
+  await box(page).press("Enter");
+  await expect(queued(page)).toBeVisible();
+  await pick(page, "추가.txt");
+  await expect(queued(page)).toHaveCount(0);
+  await expect(chips(page).first()).toHaveAttribute("data-status", "done"); // after the upload, too
+  await h.release();
+  await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
+  await expect(box(page)).toHaveValue("파일 없이 보낼 글");
+  expect(h.sends).toEqual(["첫 질문"]);
+
+  // Sent on purpose now: with the file.
+  await box(page).press("Enter");
+  await expect(box(page)).toHaveValue("");
+  await expect.poll(() => h.sentFiles.length).toBe(2);
+  expect(h.sentFiles[1]).toHaveLength(1);
+});
+
+test("removing a file while an Enter is queued drops it (#141)", async ({ page, baseURL }) => {
+  const h = await openHeld(page, baseURL!, "대기 중 파일 빼기");
+  await answeredButHeld(page, h, "첫 질문");
+
+  await pick(page, "뺄.txt");
+  await expect(chips(page).first()).toHaveAttribute("data-status", "done");
+  await box(page).fill("파일과 보낼 글");
+  await box(page).press("Enter");
+  await expect(queued(page)).toBeVisible();
+  await page.getByRole("button", { name: "뺄.txt 빼기" }).click();
+  await expect(queued(page)).toHaveCount(0);
+  await h.release();
+  await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
+  await expect(box(page)).toHaveValue("파일과 보낼 글");
+  expect(h.sends).toEqual(["첫 질문"]);
+});
+
+test("Enter while a file is still uploading says so, in the window too, and sends nothing later (#141)", async ({
+  page,
+  baseURL,
+}) => {
+  const h = await openHeld(page, baseURL!, "올리는 중 Enter");
+  await answeredButHeld(page, h, "첫 질문");
+  // The upload is held: it stays "올리는 중" for as long as the test needs.
+  const uploads: Route[] = [];
+  await page.route("**/api/conversations/*/files", (route) =>
+    route.request().method() === "POST" ? void uploads.push(route) : void route.continue(),
+  );
+  await pick(page, "느린.txt");
+  await expect.poll(() => uploads.length).toBe(1);
+  await expect(chips(page).first()).toHaveAttribute("data-status", "uploading");
+
+  await box(page).fill("올린 뒤 보낼 글");
+  await box(page).press("Enter");
+  await expect(page.getByTestId("upload-hint")).toHaveText("파일을 다 올린 뒤에 보낼 수 있어요.");
+  await expect(page.getByTestId("upload-hint")).toHaveAttribute("role", "status");
+  await expect(queued(page)).toHaveCount(0);
+
+  await page.unroute("**/api/conversations/*/files");
+  await uploads[0]!.continue();
+  await expect(chips(page).first()).toHaveAttribute("data-status", "done");
+  await expect(page.getByTestId("upload-hint")).toHaveCount(0);
+  await h.release();
+  await expect(page.getByRole("button", { name: "보내기" })).toBeEnabled();
+  await expect(box(page)).toHaveValue("올린 뒤 보낼 글");
+  expect(h.sends).toEqual(["첫 질문"]);
+});
+
+test("a failing end-of-run read is tried again while finishing: the queued Enter goes once one succeeds (#141)", async ({
+  page,
+  baseURL,
+}) => {
+  const h = await openHeld(page, baseURL!, "종료 확인 실패");
+  h.fail(true);
+  await box(page).fill("첫 질문");
+  await box(page).press("Enter");
+  await expect(box(page)).toHaveValue("");
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  // The read after `done` and its one retry fail; only the check kept up while finishing asks a third time.
+  await expect.poll(() => h.failures(), { timeout: 15_000 }).toBeGreaterThanOrEqual(3);
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible(); // still busy: never cleared on a guess
+
+  await box(page).fill("실패 뒤 보낼 글");
+  await box(page).press("Enter");
+  await expect(queued(page)).toBeVisible();
+  expect(h.sends).toEqual(["첫 질문"]);
+
+  h.fail(false);
+  await expect(box(page)).toHaveValue("", { timeout: 10_000 });
+  await expect(queued(page)).toHaveCount(0);
+  await expect(reply(page)).toContainText("실패 뒤 보낼 글");
+  expect(h.sends).toEqual(["첫 질문", "실패 뒤 보낼 글"]);
 });
