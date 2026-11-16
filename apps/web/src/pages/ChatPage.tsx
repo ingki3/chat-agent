@@ -34,6 +34,7 @@ import {
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
+import { IDLE, enter, free, type Deferred } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
@@ -163,6 +164,8 @@ export function ChatPage() {
   }, [lost]);
   // A lost stream does not keep the conversation busy: edit, regenerate and send are available again.
   const busy = (!!live && !lost) || starting;
+  // The reply has its `done` but the run is not read as ended yet (#141): an Enter now is sent once it is.
+  const finishing = !!live && !lost && live.status !== undefined;
 
   const { scroller, content, away, toBottom } = useStickToBottom();
 
@@ -410,6 +413,7 @@ export function ChatPage() {
       <Composer
         key={id}
         busy={busy}
+        finishing={finishing}
         onSend={send}
         onStop={lost ? undefined : stop}
         chip={
@@ -753,6 +757,8 @@ const AssistantMessage = memo(function AssistantMessage({
 
 function Composer(props: {
   busy: boolean;
+  /** Busy only until the ended run is confirmed (#141): an Enter is queued instead of ignored. */
+  finishing?: boolean;
   onSend: (text: string, fileIds: string[]) => Promise<unknown>;
   onStop?: (() => void) | undefined;
   autoFocus?: boolean;
@@ -768,9 +774,18 @@ function Composer(props: {
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const attach = useAttachments(props.conversation, props.existingFiles);
+  const [deferred, setDeferred] = useState<Deferred>(IDLE);
   const submit = async () => {
     const t = text.trim();
-    if (!t || sending || props.busy || attach.uploading) return;
+    const step = enter(deferred, {
+      text,
+      sending,
+      uploading: attach.uploading,
+      busy: props.busy,
+      finishing: !!props.finishing,
+    });
+    setDeferred(step.next);
+    if (!step.send) return;
     setSending(true);
     setError(null);
     try {
@@ -787,6 +802,25 @@ function Composer(props: {
       setSending(false);
     }
   };
+  // Free again (the run confirmed ended): a queued Enter goes now, with the text as it was (an edit drops the queue).
+  const ready = !props.busy && !sending && !attach.uploading;
+  const onReady = useEffectEvent(() => {
+    const step = free(deferred);
+    setDeferred(step.next);
+    if (step.send) void submit();
+  });
+  useEffect(() => {
+    if (!ready || deferred === IDLE) return;
+    // A task of its own, not this effect: an edit, a stop or leaving the conversation before it cancels it.
+    const t = setTimeout(onReady, 0);
+    return () => clearTimeout(t);
+  }, [ready, deferred]);
+  const stop = props.onStop
+    ? () => {
+        setDeferred(IDLE);
+        props.onStop?.();
+      }
+    : undefined;
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
@@ -825,7 +859,10 @@ function Composer(props: {
           aria-label="메시지 입력"
           placeholder="메시지를 입력하세요 (Shift+Enter 줄바꿈)"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            setDeferred(IDLE);
+          }}
           onKeyDown={onKey}
           rows={2}
           autoFocus={props.autoFocus}
@@ -837,10 +874,23 @@ function Composer(props: {
               {error}
             </span>
           )}
+          {deferred.queued && (
+            <span className="muted small" role="status" data-testid="queued-send">
+              답변을 마무리하는 중이에요. 끝나면 바로 보낼게요.{" "}
+              <button type="button" className="ghost small" onClick={() => setDeferred(IDLE)}>
+                취소
+              </button>
+            </span>
+          )}
+          {deferred.hint && (
+            <span className="muted small" role="status" data-testid="busy-hint">
+              답변이 끝난 뒤에 보낼 수 있어요.
+            </span>
+          )}
           <span className="grow" />
           {props.chip}
-          {props.onStop ? (
-            <button type="button" onClick={props.onStop}>
+          {stop ? (
+            <button type="button" onClick={stop}>
               ■ 중지
             </button>
           ) : (
