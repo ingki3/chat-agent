@@ -1,0 +1,146 @@
+import { describe, expect, it } from "vitest";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import type { Run } from "@agentlee/shared";
+import { confirmRunEnded } from "../src/chat/confirm-end.js";
+
+const run = (id: string, endedAt: number | null = null): Run => ({
+  id,
+  conversationId: "c1",
+  assistantMessageId: `m-${id}`,
+  status: endedAt === null ? "running" : "done",
+  errorCode: null,
+  runtime: "claude-code",
+  model: "fake",
+  effort: null,
+  connectionId: null,
+  createdAt: 1,
+  endedAt,
+});
+
+/** A read held until `answer()` — like a slow `active-run` response. */
+function heldRead() {
+  let answer!: (r: Run | null) => void;
+  let asked = 0;
+  const read = () => {
+    asked++;
+    return new Promise<Run | null>((resolve) => (answer = resolve));
+  };
+  return { read, answer: (r: Run | null) => answer(r), asked: () => asked };
+}
+
+function setup() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  qc.setQueryData(["active-run", "c1"], run("r1"));
+  let around = 0;
+  return { qc, around: () => around++, arounds: () => around };
+}
+
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+describe("confirmRunEnded (#141)", () => {
+  it("applies the answer while the cache still holds the run it checks", async () => {
+    const { qc, around, arounds } = setup();
+    const ac = new AbortController();
+    const ok = await confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: ac.signal,
+      read: async () => null,
+      around,
+    });
+    expect(ok).toBe(true);
+    expect(qc.getQueryData(["active-run", "c1"])).toBeNull();
+    expect(arounds()).toBe(1);
+  });
+
+  it("a late `null` never wipes the next run started since the read began", async () => {
+    const { qc, around, arounds } = setup();
+    const h = heldRead();
+    const ac = new AbortController();
+    const p = confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: ac.signal,
+      read: h.read,
+      around,
+    });
+    await flush();
+    // The normal path confirmed r1 ended, then the next send stored r2.
+    qc.setQueryData(["active-run", "c1"], null);
+    qc.setQueryData(["active-run", "c1"], run("r2"));
+    h.answer(null);
+    expect(await p).toBe(false);
+    expect(qc.getQueryData<Run>(["active-run", "c1"])?.id).toBe("r2");
+    expect(arounds()).toBe(0); // no follow-up refresh for a stale answer
+  });
+
+  it("an aborted check (finishing ended, conversation left) is never applied", async () => {
+    const { qc, around, arounds } = setup();
+    const h = heldRead();
+    const ac = new AbortController();
+    const p = confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: ac.signal,
+      read: h.read,
+      around,
+    });
+    await flush();
+    ac.abort();
+    h.answer(null);
+    expect(await p).toBe(false);
+    expect(qc.getQueryData<Run>(["active-run", "c1"])?.id).toBe("r1");
+    expect(arounds()).toBe(0);
+  });
+
+  it("a run started while the messages are read again is not overwritten either", async () => {
+    const { qc, around } = setup();
+    const ac = new AbortController();
+    // The messages query exists and is being read again when the new run arrives.
+    let release!: () => void;
+    const messages = new Promise<void>((r) => (release = r));
+    let reads = 0;
+    const unsubscribe = new QueryObserver(qc, {
+      queryKey: ["messages", "c1"],
+      queryFn: async () => {
+        if (reads++ > 0) await messages; // the first read (on subscribe) answers at once
+        return [];
+      },
+    }).subscribe(() => {});
+    await flush();
+    const p = confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: ac.signal,
+      read: async () => null,
+      around,
+    });
+    await flush();
+    qc.setQueryData(["active-run", "c1"], run("r2"));
+    release();
+    expect(await p).toBe(false);
+    expect(reads).toBe(2);
+    expect(qc.getQueryData<Run>(["active-run", "c1"])?.id).toBe("r2");
+    unsubscribe();
+  });
+
+  it("the cache already let the run go (the normal path won): nothing to apply", async () => {
+    const { qc, around, arounds } = setup();
+    qc.setQueryData(["active-run", "c1"], null);
+    const ok = await confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: new AbortController().signal,
+      read: async () => run("r1", 5),
+      around,
+    });
+    expect(ok).toBe(false);
+    expect(qc.getQueryData(["active-run", "c1"])).toBeNull();
+    expect(arounds()).toBe(0);
+  });
+});

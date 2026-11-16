@@ -34,6 +34,8 @@ import {
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
+import { confirmRunEnded } from "../chat/confirm-end.js";
+import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
@@ -127,17 +129,19 @@ export function ChatPage() {
   const [starting, setStarting] = useState(false);
   const online = useOnline();
 
-  const refresh = async () => {
-    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text).
-    await qc.invalidateQueries({ queryKey: ["messages", id] });
-    await Promise.all([
-      qc.invalidateQueries({ queryKey: ["active-run", id] }),
+  /** What a run may have changed besides its messages and its state. */
+  const refreshAround = () =>
+    Promise.all([
       qc.invalidateQueries({ queryKey: ["conversation", id] }),
       qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY }),
       // A run may have made a new version of an open artifact (#28): the panel and the cards show it.
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
+  const refresh = async () => {
+    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text).
+    await qc.invalidateQueries({ queryKey: ["messages", id] });
+    await Promise.all([qc.invalidateQueries({ queryKey: ["active-run", id] }), refreshAround()]);
   };
   const { live, reconnect } = useRunStream(
     active.data,
@@ -155,14 +159,45 @@ export function ChatPage() {
   useAutoOpen(live);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
   const lost = !!live?.lost;
+  // A lost stream does not keep the conversation busy: edit, regenerate and send are available again.
+  const busy = (!!live && !lost) || starting;
+  // The reply has its `done` but the run is not read as ended yet (#141): an Enter now is sent once it is.
+  const finishing = !!live && !lost && live.status !== undefined;
   const recheck = useEffectEvent(() => void refresh());
   useEffect(() => {
     if (!lost) return;
     const t = setInterval(recheck, 5000);
     return () => clearInterval(t);
   }, [lost]);
-  // A lost stream does not keep the conversation busy: edit, regenerate and send are available again.
-  const busy = (!!live && !lost) || starting;
+  // While finishing, the end of the run is read again now and then (#141): the read after `done` may have failed
+  // (its retry too, or a retry left waiting) — busy stays until a read says the run ended, never cleared on a guess.
+  // One read at a time (a slow one is never cut short by the next); a read is dropped once the reply stops finishing
+  // or the conversation is left, and never applied over another run (see confirmRunEnded).
+  const finishingRun = finishing ? live.runId : null;
+  const around = useEffectEvent(() => refreshAround());
+  useEffect(() => {
+    if (!finishingRun) return;
+    const ac = new AbortController();
+    let checking = false;
+    const t = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void confirmRunEnded({
+        qc,
+        conversationId: id,
+        runId: finishingRun,
+        signal: ac.signal,
+        read: conversations.activeRun,
+        around,
+      })
+        .catch(() => false) // tried again on the next tick
+        .finally(() => (checking = false));
+    }, 2000);
+    return () => {
+      clearInterval(t);
+      ac.abort();
+    };
+  }, [finishingRun, id, qc]);
 
   const { scroller, content, away, toBottom } = useStickToBottom();
 
@@ -410,6 +445,7 @@ export function ChatPage() {
       <Composer
         key={id}
         busy={busy}
+        finishing={finishing}
         onSend={send}
         onStop={lost ? undefined : stop}
         chip={
@@ -753,6 +789,8 @@ const AssistantMessage = memo(function AssistantMessage({
 
 function Composer(props: {
   busy: boolean;
+  /** Busy only until the ended run is confirmed (#141): an Enter is queued instead of ignored. */
+  finishing?: boolean;
   onSend: (text: string, fileIds: string[]) => Promise<unknown>;
   onStop?: (() => void) | undefined;
   autoFocus?: boolean;
@@ -768,14 +806,14 @@ function Composer(props: {
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const attach = useAttachments(props.conversation, props.existingFiles);
-  const submit = async () => {
-    const t = text.trim();
-    if (!t || sending || props.busy || attach.uploading) return;
+  const [deferred, setDeferred] = useState<Deferred>(IDLE);
+  /** Sends exactly `q` — the text and files of this Enter, or of the queued one (#141). */
+  const deliver = async (q: Queued) => {
     setSending(true);
     setError(null);
+    const fileIds = [...q.fileIds];
     try {
-      const fileIds = attach.ready;
-      await props.onSend(t, fileIds);
+      await props.onSend(q.text.trim(), fileIds);
       setText("");
       attach.sent(fileIds);
     } catch (e) {
@@ -787,6 +825,46 @@ function Composer(props: {
       setSending(false);
     }
   };
+  const submit = async () => {
+    const step = enter(deferred, {
+      text,
+      fileIds: attach.ready,
+      sending,
+      uploading: attach.uploading,
+      busy: props.busy,
+      finishing: !!props.finishing,
+    });
+    setDeferred(step.next);
+    if (step.send) await deliver(step.send);
+  };
+  // Free again (the run confirmed ended): a queued Enter goes now, as it was — only if the composer still holds it.
+  const ready = !props.busy && !sending && !attach.uploading;
+  const onReady = useEffectEvent(() => {
+    const step = free(deferred, { text, fileIds: attach.ready });
+    setDeferred(step.next);
+    if (step.send) void deliver(step.send);
+  });
+  useEffect(() => {
+    if (!ready || deferred === IDLE) return;
+    // A task of its own, not this effect: an edit, a stop or leaving the conversation before it cancels it.
+    const t = setTimeout(onReady, 0);
+    return () => clearTimeout(t);
+  }, [ready, deferred]);
+  // Another file in or out changes what would be sent: a queued Enter is dropped (#141).
+  const addFiles = (picked: Iterable<File>) => {
+    setDeferred(IDLE);
+    attach.add(picked);
+  };
+  const removeFile = (key: string) => {
+    setDeferred(IDLE);
+    attach.remove(key);
+  };
+  const stop = props.onStop
+    ? () => {
+        setDeferred(IDLE);
+        props.onStop?.();
+      }
+    : undefined;
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
@@ -797,13 +875,13 @@ function Composer(props: {
     if (!e.dataTransfer.types.includes("Files")) return;
     e.preventDefault();
     setDragging(false);
-    attach.add(e.dataTransfer.files);
+    addFiles(e.dataTransfer.files);
   };
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     // Pasted files (a screenshot, files copied in Finder) are attached; pasted text stays text.
     if (!e.clipboardData.files.length) return;
     e.preventDefault();
-    attach.add(e.clipboardData.files);
+    addFiles(e.clipboardData.files);
   };
   return (
     <div className="composer">
@@ -818,29 +896,50 @@ function Composer(props: {
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
       >
-        <AttachmentChips items={attach.items} onRemove={attach.remove} />
+        <AttachmentChips items={attach.items} onRemove={removeFile} />
         <textarea
           onPaste={onPaste}
           id={COMPOSER_INPUT}
           aria-label="메시지 입력"
           placeholder="메시지를 입력하세요 (Shift+Enter 줄바꿈)"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            setDeferred(IDLE);
+          }}
           onKeyDown={onKey}
           rows={2}
           autoFocus={props.autoFocus}
         />
         <div className="bar">
-          <AttachButton onPick={attach.add} />
+          <AttachButton onPick={addFiles} />
           {error && (
             <span className="error small" role="alert">
               {error}
             </span>
           )}
+          {deferred.queued && (
+            <span className="muted small" role="status" data-testid="queued-send">
+              답변을 마무리하는 중이에요. 끝나면 바로 보낼게요.{" "}
+              <button type="button" className="ghost small" onClick={() => setDeferred(IDLE)}>
+                취소
+              </button>
+            </span>
+          )}
+          {deferred.hint === "busy" && props.busy && (
+            <span className="muted small" role="status" data-testid="busy-hint">
+              답변이 끝난 뒤에 보낼 수 있어요.
+            </span>
+          )}
+          {deferred.hint === "uploading" && attach.uploading && (
+            <span className="muted small" role="status" data-testid="upload-hint">
+              파일을 다 올린 뒤에 보낼 수 있어요.
+            </span>
+          )}
           <span className="grow" />
           {props.chip}
-          {props.onStop ? (
-            <button type="button" onClick={props.onStop}>
+          {stop ? (
+            <button type="button" onClick={stop}>
               ■ 중지
             </button>
           ) : (

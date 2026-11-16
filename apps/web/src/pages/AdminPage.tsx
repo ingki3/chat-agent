@@ -9,9 +9,11 @@ import { BackupAdmin } from "../admin/BackupAdmin.js";
 import { InstructionsAdmin } from "../admin/InstructionsAdmin.js";
 import { DreamingAdmin } from "../admin/DreamingAdmin.js";
 import { UsageAdmin } from "./Usage.js";
+import { AccessAdmin } from "../admin/AccessAdmin.js";
 
 const TABS = [
   ["users", "사용자"],
+  ["access", "Access"],
   ["permissions", "권한"],
   ["runtimes", "런타임"],
   ["skills", "스킬"],
@@ -24,7 +26,7 @@ const TABS = [
 type Tab = (typeof TABS)[number][0];
 
 /**
- * Admin screen (#35, PRD FR-10): users (#41 + edit), per-user permissions, runtimes and connections, skills, 지침 (#144),
+ * Admin screen (#35, PRD FR-10): users (#41 + edit), Cloudflare Access (#36), per-user permissions, runtimes and connections, skills, 지침 (#144),
  * 기억 정리 (#146), system status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
  */
 export function AdminPage({ selfId }: { selfId: string }) {
@@ -52,6 +54,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
         </div>
         <div role="tabpanel" id={`admin-panel-${tab}`} aria-labelledby={`admin-tab-${tab}`}>
           {tab === "users" && <UserAdmin selfId={selfId} />}
+          {tab === "access" && <AccessAdmin />}
           {tab === "permissions" && <PermissionsAdmin />}
           {tab === "runtimes" && <RuntimesAdmin />}
           {tab === "skills" && <SkillsAdmin />}
