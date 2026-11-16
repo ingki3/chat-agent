@@ -1123,14 +1123,14 @@ describe("known secrets never leave in an export", () => {
         .insert(notificationPrefs)
         .values({ userId: t.f.users.owner.id, timeZone: "Pacific/Kiritimati", updatedAt: Date.now() })
         .run();
+      const day = () =>
+        new Intl.DateTimeFormat("en-CA", { timeZone: "Pacific/Kiritimati" }).format(new Date());
+      // The day there before and after the request (issue #103: a run across midnight there sees either).
+      const before = day();
       const r = await t.get("owner", `/api/conversations/${c.id}/references/download?format=txt`);
+      const after = day();
       const { full } = names(String(r.headers["content-disposition"]));
-      const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Pacific/Kiritimati" }).format(new Date());
-      // (A run right at midnight there may see the next day: allow it.)
-      const next = new Intl.DateTimeFormat("en-CA", { timeZone: "Pacific/Kiritimati" }).format(
-        new Date(Date.now() + 60_000),
-      );
-      expect([`참고문헌-APA-${day}.txt`, `참고문헌-APA-${next}.txt`]).toContain(full);
+      expect([`참고문헌-APA-${before}.txt`, `참고문헌-APA-${after}.txt`]).toContain(full);
     });
   });
 });

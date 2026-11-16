@@ -22,6 +22,13 @@ async function openChat(page: Page, baseURL: string, who: { email: string }, tit
 
 const chips = (page: Page) => page.getByTestId("attachment");
 
+/**
+ * A send (or a held one, once let go) still has the server's answer, the conversation list refetch and then the move to
+ * /c/… ahead of it: on a busy runner that is more than the default 5 s (#103: in a stress run the send's answer
+ * alone took 5 s and the move came after the default timeout — the order itself held).
+ */
+const MOVE_TIMEOUT = 15_000;
+
 // Several tests hold requests with page.route. Once the app's service worker controls the page, Chromium sends the
 // page's requests through it and page.route no longer sees them (flaky). No test here needs the worker.
 test.use({ serviceWorkers: "block" });
@@ -363,7 +370,7 @@ test("new chat: a file still uploading when the first send moves to the conversa
       r.request().method() === "GET" && /\/api\/conversations\/[^/]+\/files$/.test(new URL(r.url()).pathname),
   );
   sendHeld.open();
-  await expect(page).toHaveURL(/\/c\//);
+  await expect(page).toHaveURL(/\/c\//, { timeout: MOVE_TIMEOUT });
   await listed;
   await expect(page.getByTestId("user-message").first().getByTestId("file-ref")).toHaveText([/A\.txt/]);
   // The conversation page has its file list (A, sent) before B arrives.
@@ -517,7 +524,7 @@ async function cancelledDuringMove(page: Page, baseURL: string, bFirst: boolean)
     await bAnswered;
   }
   sendHeld.open();
-  await expect(page).toHaveURL(/\/c\//);
+  await expect(page).toHaveURL(/\/c\//, { timeout: MOVE_TIMEOUT });
   // The new page asked for its list.
   await listSeen.p;
   if (!bFirst) {
@@ -640,7 +647,7 @@ test("review order 6: B stored, its answer held, the new page lists it, the next
   await cancelSeen.p;
   const listed = page.waitForResponse((r) => r.request().method() === "GET" && isFiles(r.url()));
   sendHeld.open();
-  await expect(page).toHaveURL(/\/c\//);
+  await expect(page).toHaveURL(/\/c\//, { timeout: MOVE_TIMEOUT });
   await listed;
   // The new page's list has B (stored, cancel not through yet) — no chip for it.
   expect(lists.at(-1)).toBe(1);
@@ -693,7 +700,7 @@ test("a file removed while the new chat's conversation is being made is never up
   createHeld.open();
   await page.getByLabel("메시지 입력").fill("파일 없이");
   await page.getByRole("button", { name: "보내기" }).click();
-  await expect(page).toHaveURL(/\/c\//);
+  await expect(page).toHaveURL(/\/c\//, { timeout: MOVE_TIMEOUT });
   await expect(page.getByTestId("user-message").filter({ hasText: "파일 없이" })).toHaveCount(1);
   await page.waitForTimeout(300);
   expect(uploads).toBe(0);

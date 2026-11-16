@@ -58,6 +58,60 @@ function logCapture() {
   return { lines, stream };
 }
 
+/**
+ * Records the descriptors opened on paths under `dir` (sync and callback opens: a write stream opens with `fs.open`)
+ * and their closes. `stillOpen()`: the ones never closed — independent of anything else the process has open.
+ */
+function trackFds(dir: string) {
+  const opened: { fd: number; file: string }[] = [];
+  const open = new Map<number, string>();
+  const under = (p: unknown) => typeof p === "string" && (p === dir || p.startsWith(dir + path.sep));
+  const realOpenSync = fs.openSync;
+  const realOpen = fs.open;
+  const realCloseSync = fs.closeSync;
+  const realClose = fs.close;
+  const note = (fd: number, file: string) => {
+    opened.push({ fd, file });
+    open.set(fd, file);
+  };
+  const spies = [
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: never[]) => {
+      const fd = (realOpenSync as (...a: unknown[]) => number)(file, ...rest);
+      if (under(file)) note(fd, String(file));
+      return fd;
+    }) as typeof fs.openSync),
+    vi.spyOn(fs, "open").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      const cb = rest.pop() as (err: NodeJS.ErrnoException | null, fd?: number) => void;
+      (realOpen as (...a: unknown[]) => void)(
+        file,
+        ...rest,
+        (err: NodeJS.ErrnoException | null, fd?: number) => {
+          if (!err && fd !== undefined && under(file)) note(fd, String(file));
+          cb(err, fd);
+        },
+      );
+    }) as typeof fs.open),
+    vi.spyOn(fs, "closeSync").mockImplementation(((fd: number) => {
+      realCloseSync(fd);
+      open.delete(fd);
+    }) as typeof fs.closeSync),
+    vi.spyOn(fs, "close").mockImplementation(((
+      fd: number,
+      cb?: (err: NodeJS.ErrnoException | null) => void,
+    ) => {
+      realClose(fd, (err) => {
+        if (!err) open.delete(fd);
+        cb?.(err);
+      });
+    }) as typeof fs.close),
+  ];
+  return {
+    opened,
+    stillOpen: () => [...open.values()],
+    restore: () => spies.forEach((s) => s.mockRestore()),
+  };
+}
+
 /** An app on its own data folder; `file`: a file database there (like the real server), else in memory. */
 async function newApp(o: { file?: boolean; dataDir?: string; extra?: Partial<BuildOptions> } = {}) {
   const dataDir = o.dataDir ?? path.join(tmp(), "data");
@@ -878,12 +932,10 @@ describe("review #102: links, the database check, a failing fsync, detection gap
   it("fsync fails (ENOSPC): the upload fails, no descriptor stays open, no temp file is left", async () => {
     const { app, f, dataDir } = await newApp();
     const conv = app.conversations!.create(f.users.owner.id);
-    const openFds = () => fs.readdirSync("/dev/fd").length;
-    // Warm up (first upload opens what stays open anyway: folders, lazy modules).
-    await upload(app, f.cookies.owner, conv.id, "warm.txt", "warm");
-    // Its text extraction (#48) runs a process with pipes of its own: done before counting.
-    await app.fileExtracts!.idle();
-    const before = openFds();
+    // Only the descriptors this upload opens on its temp file are tracked (issue #103: counting every open
+    // descriptor of the process raced the background jobs' own files).
+    const tracked = trackFds(path.join(dataDir, "uploads-tmp"));
+    closers.push(tracked.restore);
     const spy = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
       throw Object.assign(new Error("no space"), { code: "ENOSPC" });
     });
@@ -891,9 +943,11 @@ describe("review #102: links, the database check, a failing fsync, detection gap
     const r = await upload(app, f.cookies.owner, conv.id, "a.txt", "will not fit");
     expect(spy).toHaveBeenCalled();
     expect(r.statusCode).toBeGreaterThanOrEqual(500);
-    expect(app.files!.count(conv.id)).toBe(1);
+    expect(app.files!.count(conv.id)).toBe(0);
     expect(fs.readdirSync(path.join(dataDir, "uploads-tmp"))).toEqual([]);
-    expect(openFds()).toBe(before);
+    // Both the write stream's descriptor and fsync's were seen (the tracking is not vacuous) and both closed.
+    expect(tracked.opened.length).toBeGreaterThanOrEqual(2);
+    expect(tracked.stillOpen()).toEqual([]);
   });
 
   it("detection: long blanks or a leading comment do not hide markup; %PDF- must be at the start", () => {
