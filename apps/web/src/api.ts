@@ -374,8 +374,10 @@ export const conversations = {
         "Idempotency-Key": newKey(),
       }),
     ),
-  activeRun: async (id: string) => {
-    const r = (await call("GET", `/api/conversations/${enc(id)}/active-run`)) as { run: unknown };
+  activeRun: async (id: string, signal?: AbortSignal) => {
+    const r = (await call("GET", `/api/conversations/${enc(id)}/active-run`, undefined, {}, signal)) as {
+      run: unknown;
+    };
     return r.run === null ? null : Run.parse(r.run);
   },
 };

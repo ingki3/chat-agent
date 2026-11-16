@@ -274,3 +274,62 @@ test("a failing end-of-run read is tried again while finishing: the queued Enter
   await expect(reply(page)).toContainText("실패 뒤 보낼 글");
   expect(h.sends).toEqual(["첫 질문", "실패 뒤 보낼 글"]);
 });
+
+test("a late end-of-run check never wipes the next run: its stream and ■ 중지 stay (#141)", async ({
+  page,
+  baseURL,
+}) => {
+  const h = await openHeld(page, baseURL!, "늦은 종료 확인");
+  const url = `**/api/conversations/*/active-run`;
+  // After `done`: the normal read (1st) is held; the check kept up while finishing (2nd) is answered by the server at
+  // once — the run has ended, `null` — but that answer reaches the page only when the test says so.
+  let n = 0;
+  let normal: Route | undefined;
+  let late: { route: Route; response: Awaited<ReturnType<Route["fetch"]>> } | undefined;
+  let lateSettled: Promise<unknown> | undefined;
+  await page.route(url, async (route) => {
+    n++;
+    if (n === 1) normal = route;
+    else if (n === 2) {
+      const req = route.request();
+      lateSettled = Promise.race([
+        page.waitForEvent("requestfinished", { predicate: (r) => r === req, timeout: 0 }),
+        page.waitForEvent("requestfailed", { predicate: (r) => r === req, timeout: 0 }),
+      ]);
+      late = { route, response: await route.fetch() };
+    } else await route.continue();
+  });
+
+  await box(page).fill("첫 질문");
+  await box(page).press("Enter");
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  await expect.poll(() => late !== undefined, { timeout: 10_000 }).toBe(true);
+  expect(await late!.response.json()).toEqual({ run: null });
+
+  // The normal path confirms the end: free again.
+  await normal!.continue();
+  await expect(page.getByRole("button", { name: "보내기" })).toBeVisible();
+
+  // The next run, its stream held so it keeps going for as long as the test needs.
+  const streams: Route[] = [];
+  await page.route("**/api/runs/*/events*", (route) => void streams.push(route));
+  await box(page).fill("다음 질문");
+  await box(page).press("Enter");
+  await expect(box(page)).toHaveValue("");
+  await expect.poll(() => streams.length).toBeGreaterThan(0);
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
+
+  // The stale `null` arrives now (or was dropped already, its request aborted when finishing ended).
+  await late!.route.fulfill({ response: late!.response }).catch(() => undefined);
+  await lateSettled;
+  await page.evaluate(() => new Promise((r) => setTimeout(r, 100))); // its handling, if any, has run
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "보내기" })).toHaveCount(0);
+  await expect(reply(page)).not.toHaveAttribute("data-status", "complete");
+
+  await page.unroute("**/api/runs/*/events*");
+  for (const r of streams.splice(0)) await r.continue();
+  await expect(reply(page)).toContainText("다음 질문");
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  expect(h.sends).toEqual(["첫 질문", "다음 질문"]);
+});

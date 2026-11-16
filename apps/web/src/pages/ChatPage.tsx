@@ -34,6 +34,7 @@ import {
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
+import { confirmRunEnded } from "../chat/confirm-end.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -170,29 +171,33 @@ export function ChatPage() {
   }, [lost]);
   // While finishing, the end of the run is read again now and then (#141): the read after `done` may have failed
   // (its retry too, or a retry left waiting) — busy stays until a read says the run ended, never cleared on a guess.
-  // A read of its own, one at a time: a slow one is never cut short by the next.
-  const checking = useRef(false);
-  const confirmEnd = useEffectEvent(async () => {
-    if (checking.current) return;
-    checking.current = true;
-    try {
-      const r = await conversations.activeRun(id);
-      // Messages first, as in `refresh`.
-      await qc.invalidateQueries({ queryKey: ["messages", id] });
-      await qc.cancelQueries({ queryKey: ["active-run", id] });
-      qc.setQueryData(["active-run", id], r);
-      void refreshAround();
-    } catch {
-      // tried again on the next tick
-    } finally {
-      checking.current = false;
-    }
-  });
+  // One read at a time (a slow one is never cut short by the next); a read is dropped once the reply stops finishing
+  // or the conversation is left, and never applied over another run (see confirmRunEnded).
+  const finishingRun = finishing ? live.runId : null;
+  const around = useEffectEvent(() => refreshAround());
   useEffect(() => {
-    if (!finishing) return;
-    const t = setInterval(() => void confirmEnd(), 2000);
-    return () => clearInterval(t);
-  }, [finishing]);
+    if (!finishingRun) return;
+    const ac = new AbortController();
+    let checking = false;
+    const t = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void confirmRunEnded({
+        qc,
+        conversationId: id,
+        runId: finishingRun,
+        signal: ac.signal,
+        read: conversations.activeRun,
+        around,
+      })
+        .catch(() => false) // tried again on the next tick
+        .finally(() => (checking = false));
+    }, 2000);
+    return () => {
+      clearInterval(t);
+      ac.abort();
+    };
+  }, [finishingRun, id, qc]);
 
   const { scroller, content, away, toBottom } = useStickToBottom();
 
