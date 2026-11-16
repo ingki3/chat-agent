@@ -979,4 +979,63 @@ describe("review round 1 (#167)", () => {
     expect(m.count("PUT", /policies/)).toBe(3);
     expect(m.emails()).toContain(MOM);
   });
+
+  for (const op of ["unregister", "manual-done", "register"] as const)
+    for (const revoke of ["logout", "demote"] as const)
+      it(`round 5: a queued ${op} whose caller was ${revoke === "logout" ? "logged out" : "demoted"} while waiting saves nothing (403)`, async () => {
+        const { m, b, admin, hash } = await family();
+        const a = as(b, admin);
+        const adminB = await secondAdmin(b, hash);
+        const bId = b.app.users!.byEmail("admin2@example.com")!.id;
+        const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+        await a.post("/api/admin/users", { name: "엄마", email: MOM });
+        // A's write is in flight…
+        const gate = m.pause("PUT", /policies/);
+        const write = a.apply({ revision: p.revision, final: p.final });
+        await gate.started;
+        // …and A queues a token removal so a manual completion would be possible after it.
+        const aUnreg =
+          op === "manual-done"
+            ? b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: admin })
+            : undefined;
+        const queued =
+          op === "unregister"
+            ? b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: adminB })
+            : op === "manual-done"
+              ? b.inject({
+                  method: "POST",
+                  url: "/api/admin/access/manual-done",
+                  cookie: adminB,
+                  body: { final: p.final },
+                })
+              : b.inject({
+                  method: "PUT",
+                  url: "/api/admin/access/registration",
+                  cookie: adminB,
+                  body: {
+                    token: `${TOKEN.slice(0, -4)}NEW1`,
+                    accountId: m.accountId,
+                    appId: m.appId,
+                    policyId: m.policyId,
+                  },
+                });
+        await wait(30);
+        if (revoke === "logout") await b.inject({ method: "POST", url: "/api/auth/logout", cookie: adminB });
+        else
+          await b.inject({
+            method: "PATCH",
+            url: `/api/admin/users/${bId}`,
+            cookie: admin,
+            body: { role: "member" },
+          });
+        gate.release();
+        expect(sync((await write).body).status).toBe("applied");
+        if (aUnreg) expect((await aUnreg).statusCode).toBe(200);
+        const r = await queued;
+        expect([r.statusCode, r.json()]).toEqual([403, { error: "forbidden" }]);
+        const o = await as(b, admin).overview();
+        if (op === "unregister") expect(o.mode).toBe("auto");
+        if (op === "register") expect(o.registration?.tokenMasked).toBe("••••Z9k3");
+        if (op === "manual-done") expect(o.lastApplied?.mode).toBe("auto");
+      });
 });

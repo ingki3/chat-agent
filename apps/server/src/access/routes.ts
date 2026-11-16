@@ -67,9 +67,13 @@ export function registerAccessRoutes(
     }
   });
 
-  app.delete("/api/admin/access/registration", { config: admin }, async (_req, reply) => {
-    await access.unregister();
-    return send(reply, access.overview());
+  app.delete("/api/admin/access/registration", { config: admin }, async (req, reply) => {
+    try {
+      await access.unregister(() => stillAdmin(users, req));
+      return send(reply, access.overview());
+    } catch (e) {
+      return refuse(reply, e);
+    }
   });
 
   app.post("/api/admin/access/preview", { config: admin }, async (req, reply) => {
@@ -106,7 +110,7 @@ export function registerAccessRoutes(
     const r = AccessManualDoneRequest.safeParse(req.body);
     if (!r.success) return deny(reply, 400, "invalid_request");
     try {
-      return send(reply, { sync: await access.manualDone(r.data.final) });
+      return send(reply, { sync: await access.manualDone(r.data.final, () => stillAdmin(users, req)) });
     } catch (e) {
       return refuse(reply, e);
     }

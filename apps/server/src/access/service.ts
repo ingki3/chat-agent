@@ -141,7 +141,11 @@ export class AccessSyncService {
    * it — then stored: the token encrypted (only its last 4 characters are ever shown), the ids in plain settings.
    */
   register(input: AccessRegisterRequest, authorize: () => boolean = () => true): Promise<AccessRegistration> {
-    return this.exclusive(() => this.registerNow(input, authorize));
+    return this.exclusive(() => {
+      // Checked when the queued job starts (it may have waited behind a write) and again before the save.
+      if (!authorize()) throw new AccessSyncError(403, "forbidden");
+      return this.registerNow(input, authorize);
+    });
   }
 
   private async registerNow(
@@ -182,8 +186,10 @@ export class AccessSyncService {
   }
 
   /** Back to manual mode: the token is deleted (the ids too). */
-  unregister(): Promise<void> {
+  unregister(authorize: () => boolean = () => true): Promise<void> {
     return this.exclusive(async () => {
+      // The job may have waited behind a write: the caller is checked when it runs.
+      if (!authorize()) throw new AccessSyncError(403, "forbidden");
       this.db.$client.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(CONFIG_KEY, TOKEN_KEY);
     });
   }
@@ -703,8 +709,12 @@ export class AccessSyncService {
   }
 
   /** Manual mode (FR-15.4): the admin changed the dashboard by hand to `final` — recorded as applied. */
-  manualDone(final: string[]): Promise<AccessSync> {
-    return this.exclusive(async () => this.manualDoneNow(final));
+  manualDone(final: string[], authorize: () => boolean = () => true): Promise<AccessSync> {
+    return this.exclusive(async () => {
+      // The job may have waited behind a write: the caller is checked when it runs, with nothing awaited before the save.
+      if (!authorize()) throw new AccessSyncError(403, "forbidden");
+      return this.manualDoneNow(final);
+    });
   }
 
   private manualDoneNow(final: string[]): AccessSync {
