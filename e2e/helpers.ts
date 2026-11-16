@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { expect, type APIRequestContext, type Browser, type Locator, type Page } from "@playwright/test";
@@ -31,7 +32,9 @@ export async function newMember(browser: Browser, baseURL: string, label: string
   const adminPage = await ctx.newPage();
   await useAccount(adminPage, ADMIN);
   const email = `${label}-${Date.now()}-${Math.round(Math.random() * 1e6)}@example.com`;
-  const name = `${label}${Math.round(Math.random() * 1e4)}`;
+  // Unique and of a fixed length (#103): a 4-digit random suffix collided between the parallel projects (two
+  // "narrow-viewer3767" in one picker), and a shorter number was a prefix of a longer one for a non-exact label match.
+  const name = `${label}-${crypto.randomBytes(4).toString("hex")}`;
   const created = await adminPage.request.post("/api/admin/users", {
     data: { name, email, youth },
     headers: csrf(baseURL),
