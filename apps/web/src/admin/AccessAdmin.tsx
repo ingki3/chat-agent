@@ -5,6 +5,14 @@ import { access, ApiError, errorText } from "../api.js";
 
 export const ACCESS_KEY = ["admin", "access"] as const;
 
+/** Failures a retry cannot fix: the list, the policy or the registration moved — preview again. */
+const NEEDS_PREVIEW = new Set([
+  "access_revision_changed",
+  "access_preview_stale",
+  "access_registration_changed",
+  "admin_email_protected",
+]);
+
 const time = (ms: number) =>
   new Date(ms).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -87,7 +95,7 @@ function SyncState({ s, onRetry, busy }: { s: AccessSync; onRetry?: () => void; 
             {s.retryAt && ` (${time(s.retryAt)}에 자동으로 다시 시도)`}
           </p>
           {onRetry &&
-            (s.errorCode === "access_revision_changed" || s.errorCode === "access_preview_stale" ? (
+            (NEEDS_PREVIEW.has(s.errorCode ?? "") ? (
               <p className="muted small">아래 “비교하기”로 다시 미리보기를 열어 반영하세요.</p>
             ) : (
               <button type="button" onClick={onRetry} disabled={busy}>

@@ -66,6 +66,18 @@ export class CloudflareMock {
     };
   }
 
+  private gate: { method: string; re: RegExp; started: () => void; release: Promise<void> } | undefined;
+
+  /** Holds the next matching request before it is answered (for races): `started` resolves when it arrives. */
+  pause(method: string, re: RegExp = /./): { started: Promise<void>; release: () => void } {
+    let started!: () => void;
+    let release!: () => void;
+    const s = new Promise<void>((r) => (started = r));
+    const r = new Promise<void>((x) => (release = x));
+    this.gate = { method, re, started, release: r };
+    return { started: s, release };
+  }
+
   count(method: string, re: RegExp): number {
     return this.calls.filter((c) => c.method === method && re.test(c.path)).length;
   }
@@ -100,6 +112,12 @@ export class CloudflareMock {
         headers,
       );
     if (!authorized) return error(403);
+    const g = this.gate;
+    if (g && g.method === method && g.re.test(path)) {
+      this.gate = undefined;
+      g.started();
+      await g.release;
+    }
     const i = this.failures.findIndex((f) => !f.method || f.method === method);
     const failure = i >= 0 ? this.failures.splice(i, 1)[0] : undefined;
     if (failure && !failure.applyFirst)

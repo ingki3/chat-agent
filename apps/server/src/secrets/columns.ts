@@ -435,6 +435,7 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "access_syncs.added": { exempt: "accepted limitation (as users.email): emails; responses are scrubbed" },
   "access_syncs.removed": { exempt: "accepted limitation (as users.email): emails; responses are scrubbed" },
   "access_syncs.error_code": ENUM,
+  "access_syncs.confirmed_by": ID,
   "access_syncs.revokes": {
     exempt: "accepted limitation (as users.email): emails with a fixed result code; responses are scrubbed",
   },

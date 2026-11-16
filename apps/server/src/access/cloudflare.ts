@@ -171,13 +171,7 @@ export class CloudflareAccessClient {
       await res.body?.cancel().catch(() => {});
       throw new CloudflareError("cf_unavailable", res.status);
     }
-    let text: string;
-    try {
-      text = await res.text();
-    } catch {
-      throw new CloudflareError("cf_unavailable", res.status);
-    }
-    if (text.length > MAX_BODY) throw new CloudflareError("cf_bad_response", res.status);
+    const text = await readLimited(res);
     let json: { success?: unknown; result?: unknown };
     try {
       json = JSON.parse(text) as typeof json;
@@ -267,6 +261,38 @@ export class CloudflareAccessClient {
       return "failed";
     }
   }
+}
+
+/**
+ * The answer's body as text, at most `MAX_BODY` bytes: counted while it streams, and the stream is cancelled as soon
+ * as it goes over (an oversized answer is never read to its end). Over the limit → `cf_bad_response`.
+ */
+async function readLimited(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > MAX_BODY) {
+    await res.body.cancel().catch(() => {});
+    throw new CloudflareError("cf_bad_response", res.status);
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY) {
+        await reader.cancel().catch(() => {});
+        throw new CloudflareError("cf_bad_response", res.status);
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (e instanceof CloudflareError) throw e;
+    throw new CloudflareError("cf_unavailable", res.status);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /** `Retry-After` in ms (seconds or an HTTP date), bounded to [1 s, 5 min]; 30 s when absent or unreadable. */

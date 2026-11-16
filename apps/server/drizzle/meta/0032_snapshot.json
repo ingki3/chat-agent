@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1db18ec0-3732-4f4c-aa07-029e19247092",
+  "id": "d6c65735-a2e6-41d3-b372-99f79abaa3b5",
   "prevId": "57b021f1-68f3-4bf7-a95e-1f712727f5b1",
   "tables": {
     "access_syncs": {
@@ -84,6 +84,21 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "confirmed_by": {
+          "name": "confirmed_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "write_sent": {
+          "name": "write_sent",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         },
         "revokes": {
           "name": "revokes",

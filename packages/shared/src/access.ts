@@ -179,5 +179,7 @@ export const ACCESS_ERRORS: Record<string, string> = {
   cf_rate_limited: "Cloudflare 요청 한도에 걸렸어요. 잠시 뒤 자동으로 다시 시도해요.",
   cf_unavailable: "Cloudflare에 연결하지 못했어요. 잠시 뒤 다시 시도하세요.",
   cf_bad_response: "Cloudflare 응답을 이해하지 못했어요. 잠시 뒤 다시 시도하세요.",
+  access_registration_changed:
+    "반영하는 사이 Cloudflare 등록(토큰·정책)이 바뀌었어요. 다시 미리보기를 확인하세요.",
   interrupted: "반영 중에 서버가 다시 시작됐어요. 다시 시도하면 실제 목록을 먼저 확인해요.",
 };

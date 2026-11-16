@@ -1596,6 +1596,13 @@ export const accessSyncs = sqliteTable(
     errorCode: text("error_code"),
     attempts: integer("attempts").notNull().default(0),
     retryAt: integer("retry_at"),
+    /** The admin who confirmed the write: a retry (the automatic one too) writes only while they still are one. */
+    confirmedBy: text("confirmed_by"),
+    /**
+     * A write of this sync was sent to Cloudflare (set just before the PUT). Only then may a retry accept a live list
+     * that already equals `final` at another revision as its own landed write.
+     */
+    writeSent: integer("write_sent", { mode: "boolean" }).notNull().default(false),
     /** Access-session revocation of each removed email: `revoked` / `unavailable` / `failed`. */
     revokes: text("revokes", { mode: "json" }).$type<{ email: string; result: string }[]>(),
     createdAt: integer("created_at").notNull(),

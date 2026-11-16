@@ -595,3 +595,212 @@ describe("manual mode (FR-15.4)", () => {
     expect((await a.overview()).adminEmailChange?.state).toBe("added");
   });
 });
+
+describe("review round 1 (#167)", () => {
+  /** A second active admin with a session. */
+  async function secondAdmin(b: Booted, hash: string, email = "admin2@example.com") {
+    b.app.users!.create({ email, name: "둘째 관리자", role: "admin", passwordHash: hash });
+    return b.login(email);
+  }
+
+  it("P1: an account added while the write reads the policy is not removed by the stale list (no PUT, 409)", async () => {
+    const STRAY = "stray@example.com";
+    const { m, b, admin } = await family({ emails: [ADMIN, STRAY] });
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview()).body);
+    expect(p.remove).toEqual([STRAY]);
+    const gate = m.pause("GET", /policies/);
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    // Meanwhile another tab makes that address an admin account.
+    expect((await a.post("/api/admin/users", { name: "엄마", email: STRAY, role: "admin" })).statusCode).toBe(
+      201,
+    );
+    gate.release();
+    const r = await pending;
+    expect([r.status, r.body.error]).toEqual([409, "access_preview_stale"]);
+    expect(m.count("PUT", /policies/)).toBe(0);
+    expect(m.emails()).toContain(STRAY);
+    const o = await a.overview();
+    expect(o.open?.status).toBe("pending");
+    expect(o.open?.reasons).toContain("user_created");
+  });
+
+  it("P1: a change saved during the PUT stays pending on its own, not marked applied", async () => {
+    const { m, b, admin } = await family();
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    const gate = m.pause("PUT", /policies/);
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    await a.post("/api/admin/users", { name: "아들", email: SON });
+    gate.release();
+    expect(sync((await pending).body)).toMatchObject({ status: "applied", added: [MOM] });
+    const o = await a.overview();
+    expect(o.open).toMatchObject({ status: "pending", reasons: ["user_created"] });
+    expect(o.dirty).toBe(true);
+    expect(m.emails()).not.toContain(SON);
+  });
+
+  it("P1: registration saves nothing when the caller's session ends while Cloudflare is checked", async () => {
+    const { m, b, admin } = await family({ register: false });
+    const gate = m.pause("GET", /\/apps\/[^/]+$/);
+    const pending = b.inject({
+      method: "PUT",
+      url: "/api/admin/access/registration",
+      cookie: admin,
+      body: { token: TOKEN, accountId: m.accountId, appId: m.appId, policyId: m.policyId },
+    });
+    await gate.started;
+    await b.inject({ method: "POST", url: "/api/auth/logout", cookie: admin });
+    gate.release();
+    expect((await pending).statusCode).toBe(403);
+    expect(b.app.accessSync!.registration()).toBeNull();
+    const keys = b.db.$client.prepare("SELECT key FROM settings WHERE key LIKE 'access.%'").all();
+    expect(keys).toEqual([]);
+  });
+
+  it("P1: apply writes nothing when the caller stops being admin during the read; the automatic retry needs its confirmer", async () => {
+    const { m, b, admin, hash } = await family();
+    const a = as(b, admin);
+    const admin2 = await secondAdmin(b, hash);
+    let p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    // Demoted by the other admin while the policy is read.
+    const adminId = b.app.users!.byEmail(ADMIN)!.id;
+    const gate = m.pause("GET", /policies/);
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    await b.inject({
+      method: "PATCH",
+      url: `/api/admin/users/${adminId}`,
+      cookie: admin2,
+      body: { role: "member" },
+    });
+    gate.release();
+    expect((await pending).status).toBe(403);
+    expect(m.count("PUT", /policies/)).toBe(0);
+    // The other admin confirms; a 429 schedules the automatic retry; they are deactivated before it runs.
+    const a2 = as(b, admin2);
+    p = AccessPreview.parse((await a2.preview()).body);
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    expect(sync((await a2.apply({ revision: p.revision, final: p.final })).body).errorCode).toBe(
+      "cf_rate_limited",
+    );
+    await b.inject({
+      method: "PATCH",
+      url: `/api/admin/users/${adminId}`,
+      cookie: admin2,
+      body: { role: "admin" },
+    });
+    const admin1again = await b.login(ADMIN);
+    const admin2Id = b.app.users!.byEmail("admin2@example.com")!.id;
+    await b.inject({ method: "POST", url: `/api/admin/users/${admin2Id}/deactivate`, cookie: admin1again });
+    for (let i = 0; i < 50 && (await as(b, admin1again).overview()).open?.errorCode !== "forbidden"; i++)
+      await wait(20);
+    expect((await as(b, admin1again).overview()).open?.errorCode).toBe("forbidden");
+    expect(m.count("PUT", /policies/)).toBe(1);
+    expect(m.emails()).not.toContain(MOM);
+  });
+
+  it("P2: a confirm always checks the revision, even when the email list is unchanged", async () => {
+    const { m, b, admin } = await family();
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview()).body);
+    m.policy = { ...m.policy, session_duration: "12h" };
+    const r = await a.apply({ revision: p.revision, final: p.final });
+    expect([r.status, r.body.error]).toEqual([409, "access_revision_changed"]);
+    // A retry accepts "already landed" only for its own sent write: a failed read (nothing sent) does not count.
+    const p2 = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    m.failures.push({ method: "GET", status: 503 });
+    expect(sync((await a.apply({ revision: p2.revision, final: p2.final })).body).errorCode).toBe(
+      "cf_unavailable",
+    );
+    m.dashboardEdit([ADMIN, MOM]);
+    expect(sync((await a.post("/api/admin/access/retry")).json())).toMatchObject({
+      status: "failed",
+      errorCode: "access_revision_changed",
+    });
+  });
+
+  it("P2: deactivating or demoting an admin ends their unswitched email change; the other admin can go on", async () => {
+    const { b, admin, hash } = await family({ register: false });
+    const admin2 = await secondAdmin(b, hash);
+    const a = as(b, admin);
+    const a2 = as(b, admin2);
+    const adminId = b.app.users!.byEmail(ADMIN)!.id;
+    await a.post("/api/admin/access/admin-email", { email: NEW_ADMIN });
+    await a.post("/api/admin/access/manual-done", {
+      final: AccessPreview.parse((await a.preview()).body).final,
+    });
+    expect((await a2.overview()).adminEmailChange?.state).toBe("added");
+    await a2.post(`/api/admin/users/${adminId}/deactivate`);
+    let o = await a2.overview();
+    expect(o.adminEmailChange?.state).toBe("cancelled");
+    expect(o.appEmails.map((e) => e.email)).not.toContain(NEW_ADMIN);
+    expect(
+      AdminEmailChange.parse(
+        (await a2.post("/api/admin/access/admin-email", { email: "a2.new@example.com" })).json().change,
+      ).state,
+    ).toBe("pending");
+    await a2.post("/api/admin/access/admin-email/cancel");
+    // Demotion does the same.
+    const admin3 = await secondAdmin(b, hash, "admin3@example.com");
+    const admin3Id = b.app.users!.byEmail("admin3@example.com")!.id;
+    await as(b, admin3).post("/api/admin/access/admin-email", { email: "a3.new@example.com" });
+    await b.inject({
+      method: "PATCH",
+      url: `/api/admin/users/${admin3Id}`,
+      cookie: admin2,
+      body: { role: "member" },
+    });
+    o = await a2.overview();
+    expect(o.adminEmailChange?.state).toBe("cancelled");
+    // A change left behind by an account that is no longer admin (changed outside the app) can be cancelled or replaced.
+    const admin4 = await secondAdmin(b, hash, "admin4@example.com");
+    await as(b, admin4).post("/api/admin/access/admin-email", { email: "a4.new@example.com" });
+    b.db.$client.prepare("UPDATE users SET active = 0 WHERE email = 'admin4@example.com'").run();
+    expect(
+      AdminEmailChange.parse((await a2.post("/api/admin/access/admin-email/cancel")).json().change).state,
+    ).toBe("cancelled");
+    await as(b, await secondAdmin(b, hash, "admin5@example.com")).post("/api/admin/access/admin-email", {
+      email: "a5.new@example.com",
+    });
+    b.db.$client.prepare("UPDATE users SET role = 'member' WHERE email = 'admin5@example.com'").run();
+    expect(
+      AdminEmailChange.parse(
+        (await a2.post("/api/admin/access/admin-email", { email: "a2.new@example.com" })).json().change,
+      ).state,
+    ).toBe("pending");
+  });
+
+  it("P2: an oversized answer is cut off while it streams, not read to its end", async () => {
+    let delivered = 0;
+    const big = (headers: Record<string, string> = {}) =>
+      new CloudflareAccessClient(TOKEN, {
+        base: "http://127.0.0.1:9",
+        fetch: async () =>
+          new Response(
+            new ReadableStream({
+              pull(c) {
+                if (delivered < 8) {
+                  c.enqueue(new Uint8Array(300_000).fill(32));
+                  delivered++;
+                } else c.close();
+              },
+            }),
+            { headers },
+          ),
+      });
+    const t = { accountId: "acc1", appId: "app1", policyId: "pol1", scope: "app" as const };
+    await expect(big().policy(t)).rejects.toMatchObject({ code: "cf_bad_response" });
+    expect(delivered).toBeLessThanOrEqual(5);
+    delivered = 0;
+    await expect(big({ "content-length": "2400000" }).policy(t)).rejects.toMatchObject({
+      code: "cf_bad_response",
+    });
+    expect(delivered).toBeLessThanOrEqual(1);
+  });
+});

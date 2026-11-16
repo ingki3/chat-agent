@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, gt, inArray } from "drizzle-orm";
 import type {
   AccessOverview,
   AccessPreview,
@@ -85,7 +85,15 @@ export class AccessSyncService {
     private readonly opts: AccessSyncOptions & { aud?: string | undefined } = {},
   ) {
     this.now = opts.now ?? Date.now;
+    // An admin deactivated or demoted while their own email change is not switched yet: the change ends with it
+    // (its new email leaves the wanted list, and the remaining admins are free to start their own).
+    this.onAccessChanged = ({ userId, reason }) => {
+      if (reason === "deactivated" || reason === "role_changed") this.dropChangeOf(userId);
+    };
+    events.on("user-access-changed", this.onAccessChanged);
   }
+
+  private readonly onAccessChanged: (e: { userId: string; reason: string }) => void;
 
   // ---------------------------------------------------------------- registration
 
@@ -129,7 +137,10 @@ export class AccessSyncService {
    * the application exists (and its AUD is this server's `CF_ACCESS_AUD`, when set), the policy is an Allow policy of
    * it — then stored: the token encrypted (only its last 4 characters are ever shown), the ids in plain settings.
    */
-  async register(input: AccessRegisterRequest): Promise<AccessRegistration> {
+  async register(
+    input: AccessRegisterRequest,
+    authorize: () => boolean = () => true,
+  ): Promise<AccessRegistration> {
     const token = input.token ?? this.settings.get(TOKEN_KEY);
     if (!token) throw new AccessSyncError(400, "access_token_required");
     const client = this.client(token);
@@ -151,6 +162,9 @@ export class AccessSyncService {
         registeredAt: this.now(),
         tokenLast4: token.slice(-4),
       };
+      // The caller is checked again after the Cloudflare calls, with nothing awaited between the check and the save:
+      // a session ended (or an admin demoted) meanwhile saves nothing.
+      if (!authorize()) throw new AccessSyncError(403, "forbidden");
       this.settings.setSecret(TOKEN_KEY, token);
       this.settings.set(CONFIG_KEY, JSON.stringify(stored));
       return this.registration()!;
@@ -297,11 +311,12 @@ export class AccessSyncService {
    */
   changed(reason: string): void {
     const open = this.openRow();
-    if (open) {
+    if (open && open.status !== "applying") {
       if (!open.reasons.includes(reason)) this.update(open.id, { reasons: [...open.reasons, reason] });
       return;
     }
-    const t = this.now();
+    // A write under way does not take this change in: it gets a pending sync of its own (created after it).
+    const t = open ? Math.max(this.now(), open.createdAt + 1) : this.now();
     this.db
       .insert(accessSyncs)
       .values({
@@ -389,47 +404,84 @@ export class AccessSyncService {
     };
   }
 
+  /** The stored registration as one string (token included): a write goes ahead only if it did not change meanwhile. */
+  private registrationKey(): string {
+    return JSON.stringify([this.settings.get(CONFIG_KEY) ?? null, this.settings.get(TOKEN_KEY) ?? null]);
+  }
+
+  /** Whether `userId` is (still) an active admin — the automatic retry's permission check. */
+  private isActiveAdmin(userId: string | null | undefined): boolean {
+    const u = userId ? this.userStore.byId(userId) : undefined;
+    return !!u && u.active && u.role === "admin";
+  }
+
   /**
-   * The admin confirmed a preview: written only if the policy is still at `revision` and the app's list is still
-   * `final` (else 409 — preview again; nothing is written and the open sync stays as it was). A Cloudflare failure
-   * leaves the app's change saved and the sync `failed` ("Access에 반영 안 됨 — 다시 시도").
+   * The admin confirmed a preview: written only if the policy is still at `revision` — always checked on a confirm,
+   * whatever the email list — and the app's list is still `final` (else 409 — preview again; nothing is written and the
+   * open sync stays as it was). `authorize` re-checks the caller right before the write. A Cloudflare failure leaves the
+   * app's change saved and the sync `failed` ("Access에 반영 안 됨 — 다시 시도").
    */
-  apply(input: { revision: string; final: string[] }): Promise<AccessSync> {
+  apply(
+    input: { revision: string; final: string[] },
+    caller: { userId: string; authorize: () => boolean } = { userId: "", authorize: () => true },
+  ): Promise<AccessSync> {
     return this.exclusive(async () => {
+      if (!caller.authorize()) throw new AccessSyncError(403, "forbidden");
       const conn = this.connection();
       if (!conn) throw new AccessSyncError(409, "access_not_registered");
       const wanted = this.wanted();
       if (!sameSet(wanted, input.final)) throw new AccessSyncError(409, "access_preview_stale");
       this.protect(wanted);
       const row = this.ensureOpen("manual_sync");
-      return this.toSync(await this.attempt(conn, row, wanted, input.revision, "confirm"));
+      return this.toSync(
+        await this.attempt(conn, row, wanted, input.revision, "confirm", {
+          authorize: caller.authorize,
+          confirmedBy: caller.userId || null,
+        }),
+      );
     });
   }
 
-  /** "다시 시도" (and the automatic retry of a rate-limited write): the open sync, on the revision it was confirmed on. */
-  retry(auto = false): Promise<AccessSync> {
+  /**
+   * "다시 시도" (and the automatic retry of a rate-limited write): the open sync, on the revision it was confirmed on.
+   * A manual retry checks its caller (`authorize`); the automatic one writes only while the admin who confirmed the
+   * sync is still an active admin.
+   */
+  retry(auto = false, caller?: { userId: string; authorize: () => boolean }): Promise<AccessSync> {
     return this.exclusive(async () => {
+      if (caller && !caller.authorize()) throw new AccessSyncError(403, "forbidden");
       const conn = this.connection();
       if (!conn) throw new AccessSyncError(409, "access_not_registered");
       const row = this.openRow();
       if (!row || row.status === "pending" || !row.baseRevision || !row.finalEmails)
         throw new AccessSyncError(409, "access_nothing_to_retry");
       if (auto && (row.errorCode !== "cf_rate_limited" || row.status !== "failed")) return this.toSync(row);
+      const confirmedBy = caller?.userId ?? row.confirmedBy ?? null;
+      const authorize = caller?.authorize ?? (() => this.isActiveAdmin(row.confirmedBy));
+      if (!authorize())
+        return this.toSync(this.update(row.id, { status: "failed", errorCode: "forbidden", retryAt: null }));
       const wanted = this.wanted();
       if (!sameSet(wanted, row.finalEmails))
         return this.toSync(
           this.update(row.id, { status: "failed", errorCode: "access_preview_stale", retryAt: null }),
         );
       this.protect(wanted);
-      return this.toSync(await this.attempt(conn, row, wanted, row.baseRevision, auto ? "auto" : "retry"));
+      return this.toSync(
+        await this.attempt(conn, row, wanted, row.baseRevision, auto ? "auto" : "retry", {
+          authorize,
+          confirmedBy,
+        }),
+      );
     });
   }
 
   /**
-   * One write. Reads the live policy first: already equal to `final` → applied without writing (an earlier attempt
-   * that landed — its answer lost, or the process stopped right after — is recognised, never repeated); moved from
-   * `revision` → a confirm is refused (409), a retry fails `access_revision_changed`; otherwise the policy is
-   * written with only its email rules replaced.
+   * One write. Reads the live policy first, then — with nothing awaited before the PUT — checks again that the
+   * caller may write, the registration is the same, the app's list is still `final` and holds every current admin:
+   * the read can take seconds, and an account added meanwhile (an admin's, say) must not be removed by a stale list.
+   * Revision: a confirm needs the live policy at the previewed `revision`; a retry also accepts a live list already
+   * equal to `final` when this sync's write was sent before (its answer lost, or the process stopped right after) —
+   * recognised, never repeated. Otherwise the policy is written with only its email rules replaced.
    */
   private async attempt(
     conn: { client: CloudflareAccessClient; target: AccessTarget },
@@ -437,7 +489,9 @@ export class AccessSyncService {
     final: string[],
     revision: string,
     trigger: "confirm" | "retry" | "auto",
+    who: { authorize: () => boolean; confirmedBy: string | null },
   ): Promise<SyncRow> {
+    const regKey = this.registrationKey();
     const fail = (code: string, retryAfterMs: number | null = null) => {
       const attempts = row.attempts + 1;
       const retryAt =
@@ -451,34 +505,61 @@ export class AccessSyncService {
         retryAt,
         mode: "auto",
       });
+      this.absorbNewer(failed);
       if (retryAt !== null) this.armRetry(failed);
       return failed;
     };
+    // A new confirm starts afresh: no earlier write of this row counts for it.
+    if (trigger === "confirm")
+      row = this.update(row.id, {
+        baseRevision: revision,
+        finalEmails: final,
+        confirmedBy: who.confirmedBy,
+        writeSent: false,
+        added: null,
+        removed: null,
+      });
     let live: PolicySnapshot;
     try {
       live = await conn.client.policy(conn.target);
     } catch (e) {
-      if (e instanceof CloudflareError) {
-        // A confirm that could not even read the policy: the change is saved, the sync waits for a retry with the
-        // revision the admin confirmed.
-        this.update(row.id, { baseRevision: revision, finalEmails: final });
-        return fail(e.code, e.retryAfterMs);
-      }
+      if (e instanceof CloudflareError) return fail(e.code, e.retryAfterMs);
       throw e;
     }
+    // ---- from here to the PUT nothing is awaited: these checks hold for the write itself.
+    if (!who.authorize()) {
+      if (trigger === "confirm") throw new AccessSyncError(403, "forbidden");
+      return fail("forbidden");
+    }
+    if (this.registrationKey() !== regKey) {
+      if (trigger === "confirm") throw new AccessSyncError(409, "access_registration_changed");
+      return fail("access_registration_changed");
+    }
+    if (!sameSet(this.wanted(), final)) {
+      if (trigger === "confirm") throw new AccessSyncError(409, "access_preview_stale");
+      return fail("access_preview_stale");
+    }
+    try {
+      this.protect(final);
+    } catch (e) {
+      if (trigger === "confirm") throw e;
+      return fail("admin_email_protected");
+    }
     const landed = sameSet(live.emails, final);
-    if (!landed && live.revision !== revision) {
+    const ownWrite = landed && trigger !== "confirm" && row.writeSent;
+    if (live.revision !== revision && !ownWrite) {
       if (trigger === "confirm") throw new AccessSyncError(409, "access_revision_changed");
-      return this.update(row.id, {
-        status: "failed",
-        errorCode: "access_revision_changed",
-        attempts: row.attempts + 1,
-        retryAt: null,
-      });
+      return fail("access_revision_changed");
     }
     // The delta of this sync is fixed by its first real look at the live list.
-    const added = landed && row.added ? row.added : minus(final, live.emails);
-    const removed = landed && row.removed ? row.removed : minus(live.emails, final);
+    const added = ownWrite && row.added ? row.added : minus(final, live.emails);
+    const removed = ownWrite && row.removed ? row.removed : minus(live.emails, final);
+    // Kept emails keep their place; new ones go after them. The guard runs on exactly what is sent.
+    const order = [
+      ...live.emails.filter((e) => final.includes(e)),
+      ...final.filter((e) => !live.emails.includes(e)),
+    ];
+    this.protect(order);
     row = this.update(row.id, {
       status: "applying",
       mode: "auto",
@@ -488,14 +569,10 @@ export class AccessSyncService {
       removed,
       errorCode: null,
       retryAt: null,
+      ...(landed ? {} : { writeSent: true }),
     });
     if (!landed) {
       try {
-        // Kept emails keep their place; new ones go after them.
-        const order = [
-          ...live.emails.filter((e) => final.includes(e)),
-          ...final.filter((e) => !live.emails.includes(e)),
-        ];
         const written = await conn.client.putPolicy(conn.target, withEmails(live, order));
         if (!sameSet(written.emails, final)) return fail("cf_bad_response");
       } catch (e) {
@@ -517,6 +594,23 @@ export class AccessSyncService {
     });
     this.afterApplied(final);
     return applied;
+  }
+
+  /**
+   * Changes saved while a write was under way open their own pending sync (they are not part of what was written). If
+   * that write then failed, the failed sync stays the open one and takes the newer reasons over — its retry sees the
+   * changed list (`access_preview_stale`) and asks for a new preview.
+   */
+  private absorbNewer(row: SyncRow): void {
+    const newer = this.db
+      .select()
+      .from(accessSyncs)
+      .where(and(eq(accessSyncs.status, "pending"), gt(accessSyncs.createdAt, row.createdAt)))
+      .all();
+    if (!newer.length) return;
+    const reasons = [...new Set([...row.reasons, ...newer.flatMap((r) => r.reasons)])];
+    for (const r of newer) this.db.delete(accessSyncs).where(eq(accessSyncs.id, r.id)).run();
+    this.update(row.id, { reasons });
   }
 
   /** Manual mode (FR-15.4): the admin changed the dashboard by hand to `final` — recorded as applied. */
@@ -570,7 +664,7 @@ export class AccessSyncService {
    */
   start(): void {
     for (const r of this.db.select().from(accessSyncs).where(eq(accessSyncs.status, "applying")).all())
-      this.update(r.id, { status: "failed", errorCode: "interrupted", retryAt: null });
+      this.absorbNewer(this.update(r.id, { status: "failed", errorCode: "interrupted", retryAt: null }));
     const open = this.openRow();
     if (open?.status === "failed" && open.retryAt) this.armRetry(open);
   }
@@ -578,6 +672,7 @@ export class AccessSyncService {
   close(): void {
     this.closed = true;
     clearTimeout(this.retryTimer);
+    this.events.off("user-access-changed", this.onAccessChanged);
   }
 
   // ---------------------------------------------------------------- admin email change (FR-15.7)
@@ -612,7 +707,13 @@ export class AccessSyncService {
     const newEmail = normalizeEmail(email);
     return this.db.$client
       .transaction(() => {
-        if (this.openChange()) throw new AccessSyncError(409, "admin_email_change_open");
+        const left = this.openChange();
+        // A change left by an account that is no longer an active admin does not block the others: not switched yet →
+        // cancelled; switched → nothing of it is protected any more (its old email is an ordinary sync).
+        if (left && !this.isActiveAdmin(left.userId)) {
+          this.setChange(left.id, left.state === "switched" ? "done" : "cancelled");
+          if (left.state !== "switched") this.changed("admin_email_cancelled");
+        } else if (left) throw new AccessSyncError(409, "admin_email_change_open");
         const u = this.userStore.byId(admin.id);
         if (!u || !u.active || u.role !== "admin") throw new AccessSyncError(403, "forbidden");
         if (newEmail === u.email) throw new AccessSyncError(400, "admin_email_same");
@@ -634,12 +735,27 @@ export class AccessSyncService {
       .immediate();
   }
 
+  /**
+   * The owner of an open change is no longer an active admin (deactivated or demoted): a change not switched yet is
+   * cancelled — its new email leaves the wanted list (the next sync removes it from Access).
+   */
+  private dropChangeOf(userId: string): void {
+    const ch = this.openChange();
+    if (!ch || ch.userId !== userId || this.isActiveAdmin(userId)) return;
+    if (ch.state !== "pending" && ch.state !== "added") return;
+    this.setChange(ch.id, "cancelled");
+    this.changed("admin_email_cancelled");
+  }
+
   /** Cancel before the switch: the new email leaves the wanted list again (the next sync removes it). */
   cancelAdminEmail(admin: UserRow): AdminEmailChange {
     return this.db.$client
       .transaction(() => {
         const ch = this.openChange();
-        if (!ch || ch.userId !== admin.id) throw new AccessSyncError(409, "admin_email_no_change");
+        // Another admin may cancel a change whose owner is no longer an active admin (left behind by a deactivation
+        // or demotion that did not clean it up, e.g. from before this rule).
+        if (!ch || (ch.userId !== admin.id && this.isActiveAdmin(ch.userId)))
+          throw new AccessSyncError(409, "admin_email_no_change");
         if (ch.state !== "pending" && ch.state !== "added")
           throw new AccessSyncError(409, "admin_email_step");
         this.setChange(ch.id, "cancelled");

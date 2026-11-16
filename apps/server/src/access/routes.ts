@@ -48,6 +48,11 @@ export function registerAccessRoutes(
 ): void {
   const { users, access, config } = deps;
   const admin = { auth: "admin" as const, noResource: "admin-only Cloudflare Access sync" };
+  /** The caller, re-checked by the service when its queued write starts and again right before the PUT. */
+  const caller = (req: FastifyRequest) => ({
+    userId: req.ctx.user!.id,
+    authorize: () => stillAdmin(users, req),
+  });
 
   app.get("/api/admin/access", { config: admin }, async (_req, reply) => send(reply, access.overview()));
 
@@ -55,9 +60,8 @@ export function registerAccessRoutes(
     const r = AccessRegisterRequest.safeParse(req.body);
     if (!r.success) return deny(reply, 400, "invalid_request");
     try {
-      const reg = await access.register(r.data);
-      if (!stillAdmin(users, req)) return deny(reply, 403, "forbidden");
-      return send(reply, { registration: reg });
+      // The caller is re-checked inside, after Cloudflare answered and right before anything is saved.
+      return send(reply, { registration: await access.register(r.data, () => stillAdmin(users, req)) });
     } catch (e) {
       return refuse(reply, e);
     }
@@ -83,7 +87,7 @@ export function registerAccessRoutes(
     if (!r.success) return deny(reply, 400, "invalid_request");
     if (!stillAdmin(users, req)) return deny(reply, 403, "forbidden");
     try {
-      return send(reply, { sync: await access.apply(r.data) });
+      return send(reply, { sync: await access.apply(r.data, caller(req)) });
     } catch (e) {
       return refuse(reply, e);
     }
@@ -92,7 +96,7 @@ export function registerAccessRoutes(
   app.post("/api/admin/access/retry", { config: admin }, async (req, reply) => {
     if (!stillAdmin(users, req)) return deny(reply, 403, "forbidden");
     try {
-      return send(reply, { sync: await access.retry() });
+      return send(reply, { sync: await access.retry(false, caller(req)) });
     } catch (e) {
       return refuse(reply, e);
     }
