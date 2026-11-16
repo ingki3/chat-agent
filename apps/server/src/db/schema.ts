@@ -1568,3 +1568,76 @@ export const dreamingPrompts = sqliteTable("dreaming_prompts", {
   restoredFrom: integer("restored_from"),
   createdAt: integer("created_at").notNull(),
 });
+
+/**
+ * Cloudflare Access sync (#36, PRD FR-15.2): one row per sync of the managed policy's include-email list. `pending` =
+ * the app's users changed and Access has not been brought in line yet; `applying` = a write to Cloudflare is under way
+ * (a start-up finding one means the process stopped mid-write: it becomes `failed` / `interrupted`, and the retry
+ * checks the live list first — an earlier write that did land is recognised, never repeated); `applied`; `failed`
+ * (with a fixed code; `retry_at` = when a rate-limited write is tried again by itself). At most one row is open
+ * (pending, applying or failed) at a time. Emails only — never a token or a header.
+ */
+export const accessSyncs = sqliteTable(
+  "access_syncs",
+  {
+    id: text("id").primaryKey(),
+    status: text("status", { enum: ["pending", "applying", "applied", "failed"] }).notNull(),
+    /** Why the sync was needed (fixed codes: user_created, email_changed, deactivated, …). */
+    reasons: text("reasons", { mode: "json" }).$type<string[]>().notNull(),
+    /** `auto` = written through the Cloudflare API; `manual` = the admin said they changed it in the dashboard. */
+    mode: text("mode", { enum: ["auto", "manual"] }),
+    /** The policy revision the admin confirmed in the preview (a write happens only on that revision). */
+    baseRevision: text("base_revision"),
+    /** The email list being written (sorted), and what it adds and removes against the live list. */
+    finalEmails: text("final_emails", { mode: "json" }).$type<string[]>(),
+    added: text("added", { mode: "json" }).$type<string[]>(),
+    removed: text("removed", { mode: "json" }).$type<string[]>(),
+    /** Fixed failure code (`cf_rate_limited`, `cf_unavailable`, `access_revision_changed`, `interrupted`, …). */
+    errorCode: text("error_code"),
+    attempts: integer("attempts").notNull().default(0),
+    retryAt: integer("retry_at"),
+    /** The admin who confirmed the write: a retry (the automatic one too) writes only while they still are one. */
+    confirmedBy: text("confirmed_by"),
+    /**
+     * A write of this sync was sent to Cloudflare (set just before the PUT). Only then may a retry accept a live list
+     * that already equals `final` at another revision as its own landed write.
+     */
+    writeSent: integer("write_sent", { mode: "boolean" }).notNull().default(false),
+    /**
+     * Bumped by every change of the row. A write that awaited Cloudflare saves its outcome only if the row is still the
+     * generation it started from (compare-and-set) — a row another request completed or replaced is never overwritten,
+     * and an automatic-retry timer runs only for the generation it was armed for.
+     */
+    generation: integer("generation").notNull().default(0),
+    /** Access-session revocation of each removed email: `revoked` / `unavailable` / `failed`. */
+    revokes: text("revokes", { mode: "json" }).$type<{ email: string; result: string }[]>(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    appliedAt: integer("applied_at"),
+  },
+  (t) => [index("access_syncs_status_idx").on(t.status, t.updatedAt)],
+);
+
+/**
+ * The admin's own email change (#36, PRD FR-15.7), one step at a time: `pending` (requested — the new email is part of
+ * the wanted Access list) → `added` (an applied sync holds it) → verified from the admin's existing session through
+ * Access with the new email, which switches the account in one transaction → `switched` → `done` once an applied sync
+ * no longer holds the old one. `cancelled` from pending/added. Until `switched` the account keeps the old email, so a
+ * failure or a restart at any step leaves the admin signing in as before.
+ */
+export const adminEmailChanges = sqliteTable(
+  "admin_email_changes",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    oldEmail: text("old_email").notNull(),
+    newEmail: text("new_email").notNull(),
+    state: text("state", { enum: ["pending", "added", "switched", "done", "cancelled"] }).notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    switchedAt: integer("switched_at"),
+  },
+  (t) => [index("admin_email_changes_state_idx").on(t.state)],
+);

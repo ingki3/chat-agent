@@ -2,8 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes, useNavigate, useParams } from "react-router";
 import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
-import { auth, setUnauthenticatedHandler } from "./api.js";
-import { Card, ChangePassword, Login, Setup } from "./auth-screens.js";
+import { access, auth, setUnauthenticatedHandler } from "./api.js";
+import { AdminEmailConfirm, Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ArtifactsPage } from "./pages/ArtifactsPage.js";
@@ -73,7 +73,8 @@ function AuthGate() {
   if (isError) return <Card title={SERVICE_NAME}>서버에 연결하지 못했어요.</Card>;
   if (!data) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
   if (data.setupRequired) return <Setup state={data} onDone={set} />;
-  if (!data.user) return <Login state={data} onDone={set} />;
+  if (!data.user)
+    return data.accessEmail ? <OuterLogin state={data} onDone={set} /> : <Login state={data} onDone={set} />;
   if (data.user.mustChangePassword) return <ChangePassword onDone={set} temporary />;
   const isAdmin = data.user.role === "admin";
   return (
@@ -104,6 +105,22 @@ function AuthGate() {
       </Routes>
     </AccountData>
   );
+}
+
+/**
+ * Signed out through Access: the login screen — unless this browser is the admin's confirming a pending email change
+ * (FR-15.7, #36): the old session with an Access login of the new email.
+ */
+function OuterLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
+  const q = useQuery({
+    queryKey: ["admin-email-confirm", state.accessEmail],
+    queryFn: access.confirmState,
+    retry: 0,
+  });
+  if (q.isPending) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
+  if (q.data?.ready && q.data.oldEmail && q.data.newEmail)
+    return <AdminEmailConfirm oldEmail={q.data.oldEmail} newEmail={q.data.newEmail} onDone={onDone} />;
+  return <Login state={state} onDone={onDone} />;
 }
 
 function AccountData({ children }: { children: ReactNode }) {

@@ -79,6 +79,8 @@ describe("database", () => {
       .all()
       .map((r) => (r as { name: string }).name);
     expect(tables).toEqual([
+      "access_syncs",
+      "admin_email_changes",
       "artifact_versions",
       "artifacts",
       "citations",

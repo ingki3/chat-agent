@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { PASSWORD_MIN, SERVICE_NAME, type AuthState } from "@agentlee/shared";
-import { auth, errorText } from "./api.js";
+import { access, auth, errorText } from "./api.js";
 
 /** Auth screens (#9): first-run admin, login, forced password change. */
 export function Card({ title, children }: { title: string; children: ReactNode }) {
@@ -188,5 +188,43 @@ export function ChangePassword({
         <button disabled={busy}>변경</button>
       </form>
     </Wrap>
+  );
+}
+
+/**
+ * FR-15.7 steps 3–4 (#36): this browser holds the admin's existing session and passed Access with the pending new
+ * email. Confirming switches the account and its sessions to the new email; before that the old one stays in use.
+ */
+export function AdminEmailConfirm({
+  oldEmail,
+  newEmail,
+  onDone,
+}: {
+  oldEmail: string;
+  newEmail: string;
+  onDone: (s: AuthState) => void;
+}) {
+  const { busy, error, onSubmit } = useSubmit(async () => onDone(await access.confirm()));
+  return (
+    <Card title="관리자 이메일 전환">
+      <form onSubmit={onSubmit} data-testid="admin-email-confirm">
+        <p>
+          Cloudflare Access를 새 이메일 <b>{newEmail}</b>(으)로 통과했어요. 관리자 계정 이메일을{" "}
+          <code>{oldEmail}</code>에서 <code>{newEmail}</code>(으)로 바꿀까요?
+        </p>
+        <p className="hint">
+          전환하면 이전 이메일의 앱 로그인이 모두 끊기고, 이 브라우저는 새 이메일로 로그인된 채로 남아요. 이전
+          이메일은 그다음 관리자 → Access에서 허용 목록에서 빼요.
+        </p>
+        {error && (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="primary" disabled={busy}>
+          새 이메일로 전환
+        </button>
+      </form>
+    </Card>
   );
 }

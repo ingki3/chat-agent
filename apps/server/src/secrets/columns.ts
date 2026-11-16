@@ -423,4 +423,29 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "dreaming_queue.doc": ENUM,
   "dreaming_prompts.content": { write: "DreamingStore.savePrompt (scrubKnown)", rescrub: "text" },
   "dreaming_prompts.author_id": ID,
+  // #36: the Access sync — emails (the same accepted limitation as `users.email`), codes and Cloudflare revisions.
+  "access_syncs.id": ID,
+  "access_syncs.status": ENUM,
+  "access_syncs.reasons": { exempt: "fixed reason codes (JSON array)" },
+  "access_syncs.mode": ENUM,
+  "access_syncs.base_revision": HASH,
+  "access_syncs.final_emails": {
+    exempt: "accepted limitation (as users.email): the Access allow-list emails; responses are scrubbed",
+  },
+  "access_syncs.added": { exempt: "accepted limitation (as users.email): emails; responses are scrubbed" },
+  "access_syncs.removed": { exempt: "accepted limitation (as users.email): emails; responses are scrubbed" },
+  "access_syncs.error_code": ENUM,
+  "access_syncs.confirmed_by": ID,
+  "access_syncs.revokes": {
+    exempt: "accepted limitation (as users.email): emails with a fixed result code; responses are scrubbed",
+  },
+  "admin_email_changes.id": ID,
+  "admin_email_changes.user_id": ID,
+  "admin_email_changes.old_email": {
+    exempt: "accepted limitation (as users.email): the admin's sign-in email; responses are scrubbed",
+  },
+  "admin_email_changes.new_email": {
+    exempt: "accepted limitation (as users.email): the admin's sign-in email; responses are scrubbed",
+  },
+  "admin_email_changes.state": ENUM,
 };

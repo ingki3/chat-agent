@@ -11,7 +11,7 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 |---|---|---|---|---|
 | FR-1.1 | 가족 계정 생성, 첫 실행 관리자, 임시 비밀번호 | #9, #41, #35 | I, E | 🟨 (#35 관리자 화면 사용자 탭: 추가(청소년 표시 포함)·임시 비밀번호·초기화·비활성화 — `e2e/admin.spec.ts`) |
 | FR-1.2 | 비밀번호 로그인, 세션 쿠키 속성 | #9 | U, I | ✅ |
-| FR-1.3 | 외부 두 겹 인증, 로컬 예외, Access·앱 이메일 일치 | #8, #9, #36 | I, M | 🟨 |
+| FR-1.3 | 외부 두 겹 인증, 로컬 예외, Access·앱 이메일 일치 | #8, #9, #36 | I, M | 🟨 (#36 Access 정책 = 앱 활성 사용자 이메일(자동 반영·수동 모드), 관리자 이메일 변경 확인은 기존 세션 + 새 이메일 Access 조합에서만(그 외 경로는 `access_email_mismatch`) — `access-sync.test.ts`. 실계정은 AC-13) |
 | FR-1.4 | Access JWT 검증 | #9 | U, I | 🟨 |
 | FR-1.5 | 역할, 본인·공유만 열람, 관리자도 내용 불가 | #10, #29 | I | 🟨 |
 | FR-1.6 | 사용자별 런타임·모델·스킬 허용 | #17, #21, #35 | I, E | 🟨 (#17 런타임·모델·추론 강도·연결 허용 정책과 공통 검사 함수 — 보내기·고치기·다시 생성에 403. #21 스킬: `users.permissions.skills`·`PUT /api/admin/users/:id/skills`, 사용자별 도구 목록·호출 거부 — `skills.test.ts`. #30 청소년 계정은 `"all"`이어도 금융 스킬·도구 숨김 — `finance.test.ts`. #35 관리자 화면 권한 탭(런타임·모델·추론 강도·개인/공용 연결 허용·스킬·처음 기본값), 스킬 한 개씩 켜기 `PUT /api/admin/users/:id/skills/:name`(청소년 금융 숨김 유지), 서버 허용 목록 `PUT /api/admin/skills/:name`. 아들 Haiku 해제 → `/api/runtimes`·설정 선택기에서 빠지고 실행·기본값 저장 403 — `admin.test.ts`·`e2e/admin.spec.ts`. 칩(#19)은 그중 지금 답할 수 있는 것만 `/api/runtimes/usable`) |
@@ -102,13 +102,13 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-14.5 | 가족 공유 묶음, 공유 알림 | #52, #34 | E | 🟨 (#34 `share_received` 발행 API — 내용 없이 누가·무엇만, 연결은 #29/#52) |
 | FR-14.6 | 공유한 사람·시각, 열람 확인 | #52 | E | 🟨 (#52 `share_views`, `Share.views`, 대화상자의 열람 확인 — `e2e/share-screens.spec.ts`) |
 | FR-14.7 | 가족 계정끼리만 | #29 | I | ⬜ |
-| FR-15.1 | 이름·이메일·역할 관리 | #35 | E | 🟨 (#35 사용자 탭 수정, 이메일 변경 시 세션 종료, 관리자 이메일은 #36 절차로만(409 `admin_email_change`) — `admin.test.ts`·`e2e/admin.spec.ts`. Access 자동 반영은 #36) |
-| FR-15.2 | Access 자동 반영, 미리보기, 실패 재시도, 현재 관리자 이메일 보호 | #36 | I, M | ⬜ |
-| FR-15.3 | 동기화 상태 비교 | #36 | I | ⬜ |
-| FR-15.4 | 토큰 없이 수동 모드 | #36 | E | ⬜ |
-| FR-15.5 | 비활성화 시 Access 제거·세션 종료 | #41, #36 | I | ⬜ |
-| FR-15.6 | Cloudflare 토큰 암호화 | #7, #36 | U | 🟨 (#7 암호화 모듈) |
-| FR-15.7 | 관리자 이메일 변경 절차 | #36 | I, M | ⬜ |
+| FR-15.1 | 이름·이메일·역할 관리 | #35 | E | 🟨 (#35 사용자 탭 수정, 이메일 변경 시 세션 종료, 관리자 이메일은 #36 절차로만(409 `admin_email_change`) — `admin.test.ts`·`e2e/admin.spec.ts`. #36 추가·이메일 수정·비활성화 저장 전 Access 미리보기 — `e2e/access.spec.ts`) |
+| FR-15.2 | Access 자동 반영, 미리보기, 실패 재시도, 현재 관리자 이메일 보호 | #36 | I, M | 🟨 (#36 토큰·앱·정책 등록(정책 1개의 include 이메일만), 미리보기(revision·최종 목록·이번 변경·기존 불일치) → 같은 revision일 때만 반영(409 `access_revision_changed`·`access_preview_stale`), `access_syncs` pending/applying/applied/failed, 멱등 재시도·429 자동 재시도·재시작 시 `interrupted`, 실패해도 앱 변경 저장, 현재 관리자 이메일 제거 거부 `admin_email_protected` — `access-sync.test.ts`(Cloudflare 목 서버). 실계정 M은 AC-13) |
+| FR-15.3 | 동기화 상태 비교 | #36 | I | 🟨 (#36 Access 탭 비교하기: 앱 목록·Access 목록 나란히, 차이 경고, "앱 사용자 목록을 Access에 반영" — `access-sync.test.ts`. 머지 후 ✅) |
+| FR-15.4 | 토큰 없이 수동 모드 | #36 | E | 🟨 (#36 최종 이메일 목록 + 단계 안내 + "대시보드에 반영했어요"(앱 목록이 바뀌었으면 409) — `e2e/access.spec.ts`·`access-sync.test.ts`. 머지 후 ✅) |
+| FR-15.5 | 비활성화 시 Access 제거·세션 종료 | #41, #36 | I | 🟨 (#41 앱 세션 즉시 종료. #36 미리보기 → Access 목록에서 제거 + Access 세션 철회 요청(`revoke_user`, 권한 없으면 "권한 없음"·만료까지 지연 표시) — `access-sync.test.ts`. 머지 후 ✅) |
+| FR-15.6 | Cloudflare 토큰 암호화 | #7, #36 | U | 🟨 (#7 암호화 모듈. #36 토큰은 `settings` 암호문(`access.sync.token`), 화면은 끝 4자리, 응답·DB 평문에 없음 — `access-sync.test.ts`. 머지 후 ✅) |
+| FR-15.7 | 관리자 이메일 변경 절차 | #36 | I, M | 🟨 (#36 `admin_email_changes` pending → added(새 이메일이 든 목록 반영) → 기존 세션 + 새 이메일 Access로 확인 → 한 트랜잭션으로 이메일·세션 전환(switched) → 이전 이메일 뺀 목록 반영(done), 취소. 각 단계 실패·재시작에도 전환 전에는 이전 이메일 유지 — `access-sync.test.ts`. 실계정 M은 ops.md 45.6) |
 | FR-16.1 | 문서 4종, 설정 → 내 지침 | #144 | I, E | 🟨 (#144 DB 문서 4종(`memory_documents`·`memory_versions`·`memory_items`·`memory_item_sources`, 0029), 상한 글자·바이트 둘 다(4바이트 이모지 경계)·비밀 값·규칙 바꾸기 → 400, AGENT 읽기만, 기본 SOUL, 줄 단위 항목 맞추기 — `memory.test.ts`. 설정 → 내 지침·관리자 → 지침 화면 — `e2e/instructions.spec.ts`) |
 | FR-16.2 | 넣는 순서·우선순위·예산, 두 런타임 동일, 다음 턴 적용·예약 읽기 | #144 | I, M | 🟨 (#144 AGENT(공통 → 청소년 → 계정별) → `<user_material>` 칸(SOUL → USER → MEMORY), 바이트 상계 25% 예산·MEMORY → USER 끝 항목 빼기·"기억 일부만 넣었어요" 1회, #45 예산에서 문서 바이트 먼저 빼기, 이어가기 조건에 문서 버전(`runtime_sessions.doc_versions`), 예약 실행은 주인 문서, 200,000토큰 미만 모델 등록 거부 — `memory.test.ts`. 두 런타임 녹화 재생: USER 선호가 새 대화·런타임 전환 뒤에도 같은 글로 — `context-replay.test.ts`. 주입 평가 INJ-5(청소년 USER.md 속 지시) — `instructions.test.ts`. 바이트 상계와 실제 입력 토큰 비교(실제 연결)는 M 남음) |
 | FR-16.3 | 버전·차이·되돌리기 | #144 | I, E | 🟨 (#144 저장마다 버전(주체·이전 버전·되돌린 버전), 문서 단위 되돌리기 = 새 버전, 기준 버전 다르면 409 — `memory.test.ts`. 차이 보기·되돌리기 화면 — `e2e/instructions.spec.ts`) |
@@ -164,5 +164,5 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | AC-10 | #17, #55 | I | — | 🟨 (#17 메시지 보내기·고치기·다시 생성 403. #19 대화 설정 변경·새 대화 선택도 403(허용 안 된 추론 강도 포함) — `chat-settings.test.ts`. 예약은 #55) |
 | AC-11 | #38 | S | 예 | ⬜ |
 | AC-12 | #44, #32 | U, I | — | 🟨 (fixture 기록별 비용·총 $6.55·엄마 $4.50·아들 구독 43만 토큰·분류 합계 동일·예산 차단 없음 — `test/usage-screen.test.ts` "AC-12". 화면 스크린샷·구독 한도 안내(2)는 양식 B 기록 대기) |
-| AC-13 | #36 | I, M | — | ⬜ |
+| AC-13 | #36 | I, M | — | 🟨 (#36 자동 부분: 미리보기 = 실제 반영 최종 목록, 비활성화 시 목록 제거·세션 철회 결과·지연 표시 — `access-sync.test.ts`(목 서버). 실계정 수동 확인(M) 대기 — 절차 `docs/acceptance.md` AC-13·ops.md 45절) |
 | AC-14 | #144, #145, #146 | I, E, M | 예 | 🟨 (USER 선호가 두 런타임 새 대화에 — #144 `context-replay.test.ts`, 기억해줘 — #145 `memory-tool-runtimes.test.ts`, 기억 정리를 켜면 정해진 시각(±1분)에 제안·검토 후 반영·자동 반영·되돌리기 — #146 `dreaming.test.ts`·`dreaming-runtimes.test.ts`·`e2e/dreaming.spec.ts`, 청소년 안전 지침은 사용자 문서로 안 바뀜 — `instructions.test.ts`, 관리자 403 — `memory.test.ts`·`dreaming.test.ts`. 실제 연결로 하루 한 번 운영 확인은 M 남음) |

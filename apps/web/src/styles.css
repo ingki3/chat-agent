@@ -694,6 +694,49 @@ a.chip.fileref:hover {
   user-select: all;
 }
 
+/* ---- 관리자 → Access (#36) ---- */
+.access-admin section {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.access-compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.access-compare ul,
+.access-preview .delta {
+  margin: 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+.access-compare li.diff {
+  color: var(--danger, #c0392b);
+  font-weight: 600;
+}
+.access-preview .delta .add {
+  color: var(--ok, #1e8449);
+}
+.access-preview .delta .remove {
+  color: var(--danger, #c0392b);
+}
+.access-preview code,
+.access-admin code {
+  overflow-wrap: anywhere;
+}
+.access-admin .steps li.done {
+  color: var(--muted, #777);
+}
+.access-admin .steps li.current {
+  font-weight: 600;
+}
+.access-admin li.emails code {
+  display: block;
+  white-space: pre-wrap;
+  user-select: all;
+}
+
 /* ---- narrow screens: sidebar becomes a drawer ---- */
 @media (max-width: 900px) {
   .side {

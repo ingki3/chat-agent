@@ -169,7 +169,7 @@ pnpm -s release status
 
 1. Zero Trust → Access controls → Applications → Add an application → Self-hosted. 도메인 `chat.2prostream.com`(경로 비움 = 전체).
 2. 로그인 방식: **One-time PIN**(이메일 코드).
-3. 정책: Allow · Include · Emails → `ingki3@gmail.com`만. 가족은 계정을 만든 뒤 10절 절차로 추가.
+3. 정책: Allow · Include · Emails → `ingki3@gmail.com`만. 가족은 계정을 만들 때 앱이 반영한다(10절, 45절).
 4. 세션 기간은 기본값(24시간)으로 둔다.
 5. **AUD 태그**: Zero Trust → Access controls → Applications → 그 앱의 **Edit** → **Additional settings** → **Application Audience (AUD) Tag**(64자)를 `~/.chat-agent/shared/.env`의 `CF_ACCESS_AUD`에 넣는다. **팀 도메인**: Zero Trust → **Settings**에 보이는 팀 이름(Team name)으로 `<팀 이름>.cloudflareaccess.com`을 `CF_ACCESS_TEAM_DOMAIN`에 넣는다. 그다음 `pnpm -s release restart`(데몬이면 `sudo launchctl kickstart -k system/com.agentlee.server`). 저장소·메신저에는 넣지 않는다.
    - 서버는 `chat.2prostream.com`으로 온 모든 요청(페이지·정적 파일·API)에서 `Cf-Access-Jwt-Assertion`을 검증한다(서명·`iss`·`aud`·만료, 키는 팀 JWKS에서 받아 캐시). 실패하면 403.
@@ -260,12 +260,12 @@ rm ~/.agentlee/probe-headers.txt
    ```
 7. 판정: `pnpm -s uptime report --file /Library/Logs/agentlee/uptime.jsonl`(최근 7일, `--json`이면 상세). 출력: 가동률·분모(예정 체크 약 2016 − 계획 정지 − 외부 미측정)·성공/앱/터널/기록 없음 수·`합격`/`불합격`/`판정 불가`. 종료 코드 0 = 합격, 1 = 불합격, 3 = 판정 불가(7일 미만 기록, 또는 토큰 없이 외부 경로를 못 잰 체크가 있음). 결과를 4절과 #46에 남긴다.
 
-## 10. 가족 이메일 추가 (수동, 자동 동기화 #36 전까지)
+## 10. 가족 이메일 추가
 
-1. 앱 관리자 화면에서 가족 계정을 만든다(#41).
-2. Zero Trust → Access controls → Applications → Agent Lee → Edit → Policies → Include Emails에 그 가족 이메일을 추가하고 저장한다.
+1. 앱 관리자 화면 사용자 탭에서 가족 계정을 만든다(#41). 저장 전에 Access 허용 목록 미리보기가 뜬다.
+2. 토큰을 등록했으면(45.1) **확인하고 저장·반영**으로 Access까지 바로 반영된다. 토큰이 없으면(수동 모드, 45.5) Access 탭의 목록과 단계대로 Zero Trust → Access controls → Applications → Agent Lee → Edit → Policies → Include Emails를 고치고 "대시보드에 반영했어요"를 누른다.
 3. 가족에게 임시 비밀번호를 직접 전달하고, 휴대폰에서 Access 코드 로그인 → 앱 로그인이 되는지 함께 확인한다.
-4. 가족을 비활성화하면 같은 정책에서 이메일을 지운다. **관리자 이메일(`ingki3@gmail.com`)은 지우지 않는다.**
+4. 가족을 비활성화해도 같은 미리보기·반영으로 Access에서 빠진다(45.4). **관리자 이메일은 지울 수 없다** — 바꿀 때는 45.6 절차.
 
 ## 11. 런타임 연결 (#17, 구독 #18)
 연결은 앱 안에서 만든다. 하나의 연결은 **런타임 × 인증 방식 × 범위**다(PRD D2, FR-11).
@@ -729,8 +729,8 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 
 ### 20.1 사용자
 - 추가(이름·이메일·역할·청소년 표시), 임시 비밀번호(한 번만 보임), 비밀번호 초기화, 비활성화는 #41 그대로다.
-- **수정**: 이름·이메일·역할(`PATCH /api/admin/users/<id>`). 이메일을 바꾸면 그 사람의 로그인이 모두 끊기고 새 이메일로 다시 로그인한다. Access 허용 목록은 10절대로 직접 고친다(자동 반영은 #36).
-- **관리자 이메일**은 여기서 바꾸지 않는다(409 `admin_email_change`) — Access 확인 절차(PRD FR-15.7)는 #36이다.
+- **수정**: 이름·이메일·역할(`PATCH /api/admin/users/<id>`). 이메일을 바꾸면 그 사람의 로그인이 모두 끊기고 새 이메일로 다시 로그인한다. 이메일을 바꿀 때는 저장 전에 Access 미리보기가 뜨고 확인하면 함께 반영한다(45.2).
+- **관리자 이메일**은 여기서 바꾸지 않는다(409 `admin_email_change`) — Access 탭의 관리자 이메일 변경 절차(45.6, PRD FR-15.7)로만.
 - **관리자가 한 명도 안 남게는 못 한다**: 마지막 활성 관리자를 가족으로 바꾸거나(본인 포함) 비활성화하면 409 `last_admin`. 본인 비활성화는 늘 400. 확인과 변경은 한 트랜잭션이라 두 관리자가 동시에 서로를 강등해도 한쪽만 된다. 다른 관리자를 먼저 지정하면 본인은 가족으로 내려갈 수 있다.
 
 ### 20.2 권한 (사용자별)
@@ -2044,3 +2044,67 @@ PRD FR-16.5·16.6·16.7·16.8, spec §3–§10. 코드: `apps/server/src/dreamin
 - **로그**: `dreaming.run_started`·`dreaming.run_finished`(사용자·실행 id·시도·`dreamingTrigger`·`dreamingStatus`·`dreamingCode`·건수), `dreaming.alert_sent`(사용자 수) — 항목·메시지·프롬프트 글 없음.
 - **백업**: 새 표는 모두 DB 안이라 매일 백업(§21)에 그대로 들어간다. 글이 있는 칸은 `dreaming_prompts.content`뿐이고 `secrets/columns.ts`에 등록(쓸 때 가림 + 배경 재가림).
 
+
+## 45. Cloudflare Access 동기화 — 미리보기·재시도·관리자 이메일 변경 (#36)
+
+PRD FR-15.2~15.7, FR-1.3, 수용 기준 13. 관리자 → **Access** 탭(`/admin?tab=access`). 앱의 활성 사용자 이메일(관리자 이메일 변경 중이면 새 이메일 포함)을 **등록한 Access 정책 1개의 include 이메일 규칙**과 똑같이 맞춘다. 그 정책의 다른 include 규칙(그룹·도메인 등)과 exclude·require·세션 기간 같은 나머지 설정은 읽은 그대로 다시 쓴다. 다른 정책·다른 애플리케이션은 건드리지 않는다. 코드: `apps/server/src/access/`.
+
+### 45.1 토큰과 애플리케이션 등록 (1회)
+
+1. Cloudflare 대시보드 → My Profile → API Tokens → Create Token → Custom token.
+   - 권한: **Account → Access: Apps and Policies → Edit** 하나만. 계정 범위(Account Resources)는 이 계정 하나만.
+   - (선택) 비활성화할 때 기존 Access 세션까지 끊으려면 **Account → Access: Organizations, Identity Providers, and Groups → Edit**도 준다(45.4). 주지 않으면 세션 철회는 "권한 없음"으로 표시되고 세션은 만료까지 남는다.
+   - 만료일·IP 제한은 원하면 건다. 토큰 값은 복사해 바로 앱에 붙여 넣고 다른 곳에 남기지 않는다.
+2. ID 찾기: **계정 ID**는 대시보드 오른쪽 아래(Account ID). **애플리케이션 ID**와 **정책 ID**는 Zero Trust → Access controls → Applications → Agent Lee → Edit의 주소창(`…/applications/<앱 ID>/…`), Policies 탭에서 그 정책을 열었을 때 주소창(`…/policies/<정책 ID>`)에 보인다.
+3. 관리자 → Access → **토큰 등록** → 토큰·계정 ID·애플리케이션 ID·정책 ID → **확인하고 저장**. 서버가 먼저 Cloudflare에 확인한다: 애플리케이션이 있고(`CF_ACCESS_AUD`가 설정돼 있으면 그 앱의 AUD와 같아야 함, 다르면 `access_app_mismatch`), 정책이 그 앱에 붙은 **Allow** 정책인지. 정책이 재사용 정책(reusable)인지 앱 정책인지도 이때 정해 저장한다.
+4. 저장: 토큰은 마스터 키로 암호화해 `settings`(`access.sync.token`)에, ID는 평문 설정(`access.sync.config`)에. 화면에는 토큰 끝 4자리만 보인다(FR-15.6). **토큰 교체**는 같은 버튼(토큰 칸을 비우면 지금 토큰 유지, ID만 교체). **토큰 지우기**를 누르면 수동 모드로 돌아간다.
+- 서버는 `https://api.cloudflare.com/client/v4`에만 요청한다(고정 — 설정으로 바꿀 수 없음, 리다이렉트 따르지 않음, 요청마다 10초 제한, 응답은 1MB까지 — 받는 중에 세어 넘으면 바로 끊는다). 토큰은 `Authorization` 헤더에만 실리고 로그·오류·응답에 나오지 않는다(알려진 비밀로 등록되어 응답에서도 가려진다).
+
+### 45.2 미리보기와 반영 (FR-15.2·15.3)
+
+- **사용자 탭**에서 계정 추가·이메일 수정·비활성화를 누르면 저장 **전에** "Access 허용 목록이 이렇게 바뀝니다" 미리보기가 뜬다: 지금 Access 목록(정책 revision과 함께 읽음) → 최종 목록, 실제로 더해지고 빠지는 이메일. **이번 변경과 상관없는 기존 불일치**(대시보드에서 직접 바꾼 것, 앞서 반영 안 된 것)도 따로 표시하고 함께 맞춘다.
+- **확인하고 저장·반영** → 앱 변경 저장 → 미리보기한 revision·최종 목록으로 반영. 반영 직전에 정책을 다시 읽어 **revision이 미리보기 때와 다르면 쓰지 않고** 409 `access_revision_changed`("다시 미리보기")다 — 이메일이 아닌 설정(세션 기간 등)이 바뀐 것도 포함. 미리보기 뒤에 앱 사용자 목록이 바뀌었으면 409 `access_preview_stale`. Cloudflare에는 조건부 쓰기가 없어서 "다시 읽기 → 쓰기" 사이 아주 짧은 틈은 남는다(받아들인 한계).
+- **Access 탭 → 비교하기**: 앱 목록과 Access 목록을 나란히 보여주고 다르면 ⚠️ 경고. **앱 사용자 목록을 Access에 반영**으로 같은 미리보기·확인을 거쳐 맞춘다.
+- **현재 관리자 이메일 보호**: 활성 관리자의 이메일이 빠지는 최종 목록은 거부(409 `admin_email_protected`). 관리자 이메일을 바꾸는 변경·마지막 관리자 비활성화 미리보기도 같은 코드로 거부한다. 대시보드에서 누가 관리자 이메일을 지웠으면 비교 화면에 불일치로 나오고 반영하면 다시 들어간다.
+
+### 45.3 반영 상태·재시도 (`access_syncs`)
+
+- 사용자 변경이 저장되면 `pending`("Access에 반영 안 됨"), 반영 중 `applying`, 끝나면 `applied`, 실패하면 `failed` + 코드(`cf_unavailable`·`cf_rate_limited`·`cf_unauthorized`·`cf_not_found`·`cf_bad_response`·`access_revision_changed`·`access_preview_stale`·`interrupted`). 열린 반영은 한 번에 하나다. 실패해도 **앱 쪽 변경은 저장된 그대로**이고 화면에 "Access에 반영 안 됨 — 다시 시도"가 남는다.
+- **다시 시도**는 확인했던 revision·최종 목록으로 다시 한다. **멱등**: 먼저 실제 목록을 읽어 이미 최종 목록과 같으면(앞선 쓰기가 실제로는 들어갔는데 응답을 잃었거나 그 직후 서버가 멈춘 경우) 다시 쓰지 않고 `applied`로 끝낸다. 그사이 대시보드에서 정책이 바뀌었으면 `access_revision_changed`로 실패 — 비교하기로 다시 미리보기.
+- **읽기와 쓰기 사이 재확인**: 정책을 읽는 데 시간이 걸리므로, 읽은 뒤 PUT 직전에(사이에 기다리는 것 없이) 다시 확인한다 — 호출한 사람이 아직 같은 세션의 활성 관리자인지, 등록(토큰·정책)이 그대로인지, 앱 목록이 아직 최종 목록과 같은지, 실제로 보낼 목록에 현재 관리자 이메일이 모두 있는지. 하나라도 어긋나면 쓰지 않는다(확인 요청이면 409·403, 재시도면 `failed`). 쓰는 도중에 저장된 사용자 변경은 그 반영에 섞이지 않고 **따로 `pending`**으로 남는다.
+- **확인(첫 반영)은 항상 revision을 비교**한다 — 이메일 목록이 같아도 다른 설정이 바뀌었으면 409. "이미 들어간 쓰기"로 받아들이는 것은 이 반영이 실제로 PUT을 보낸 적이 있는(`write_sent`) 재시도뿐이다.
+- 토큰 등록도 Cloudflare 확인이 끝난 뒤, 저장 직전에 호출한 사람을 다시 확인한다(그사이 세션이 끝났으면 아무것도 저장하지 않고 403).
+- **자동 재시도**는 그 반영을 마지막으로 확인하거나 직접 다시 시도한 관리자가 아직 활성 관리자일 때만 쓴다(아니면 `failed`/`forbidden` — 다른 관리자가 다시 시도하면 그 사람이 권한 주체가 된다). 재확인에서 거부된 확인(403)은 열린 반영의 목록·revision·권한 주체를 바꾸지 않는다 — 기다리던 자동 재시도는 원래 값으로만 돈다.
+- **한 번에 하나**: Access를 바꾸는 작업(토큰 등록·교체·지우기, 반영 확인, 다시 시도, 자동 재시도, "대시보드에 반영했어요")은 서버 안에서 한 줄로 차례대로 실행한다. 쓰기가 Cloudflare를 기다리는 동안 토큰을 지우거나 수동 완료를 누르면 그 쓰기가 끝난 뒤에 실행된다(그때의 앱 목록으로 다시 검사). 사용자 추가·수정·비활성화는 기다리지 않고 저장되며 진행 중인 쓰기와 별도인 `pending`이 된다. 줄에서 기다린 작업은 실행될 때 호출한 사람이 아직 같은 세션의 활성 관리자인지 다시 확인한다(기다리는 사이 로그아웃·강등되면 403, 아무것도 저장하지 않음).
+- **비교 후 교체(세대 번호)**: 반영 줄은 상태가 바뀔 때마다 `generation`이 올라간다. Cloudflare를 기다린 뒤의 저장(실패·`applying`·`applied`)은 시작할 때의 세대 그대로일 때만 하고(한 문장 조건부 UPDATE), 실패 저장은 등록도 그대로일 때만 한다. 그사이 다른 요청이 끝내거나 바꾼 줄(예: 토큰을 지우고 수동으로 반영 완료)은 덮어쓰지 않는다(확인 요청이면 409). 자동 재시도 타이머는 건 줄·세대를 기억하고, 그 사이 새 타이머로 바뀌었으면 늦게 실행돼도 아무것도 하지 않는다. `applying`인 줄이 하나라도 남아 있으면(다른 프로세스 등) "대시보드에 반영했어요"는 409 `access_busy`다. 등록이 줄 밖에서 바뀐 뒤 실패한 쓰기는 `failed`/`access_registration_changed`로 끝나고 자동 재시도는 걸지 않는다.
+- **429**: `Retry-After`(없으면 30초, 1초~5분)만큼 기다렸다가 서버가 스스로 다시 시도한다(최대 3번, 그다음은 화면의 다시 시도).
+- **재시작**: 시작할 때 `applying`으로 남은 줄은 `failed`/`interrupted`가 된다(다시 시도 = 위 멱등 규칙). 자동 재시도를 기다리던 429 줄은 타이머를 다시 건다.
+- 로그·DB에는 이메일과 고정 코드만 있다(토큰·헤더·Cloudflare 오류 문장 없음). 이메일은 `users.email`과 같은 받아들인 한계로 `secrets/columns.ts`에 등록돼 있다.
+
+### 45.4 비활성화와 Access 세션 (FR-15.5)
+
+- 비활성화하면 앱은 바로 막힌다(#41: 세션 삭제·열린 스트림 종료). 미리보기 확인 뒤 반영하면 Access 목록에서 빠지고, 서버가 그 이메일의 기존 Access 세션 철회(`POST /accounts/<계정>/access/organizations/revoke_user`)를 요청한다.
+- 결과는 이메일마다 화면에 남는다: **철회 요청함**(Cloudflare 반영까지 몇 분), **권한 없음**(45.1의 선택 권한이 없는 토큰 — 기존 Access 세션은 세션 기간, 기본 24시간이 끝날 때까지 남을 수 있음), **실패**. 권한이 없으면 대시보드 Zero Trust → My Team → Users → 그 사람 → **Revoke session**으로 직접 끊을 수 있다. 어느 경우든 앱 로그인은 이미 막혀 있다.
+
+### 45.5 수동 모드 (토큰 없음, FR-15.4)
+
+- 토큰을 등록하지 않으면 Access 탭이 수동 모드다: **비교하기**가 넣어야 할 최종 이메일 목록과 단계(대시보드 경로, Include → Emails를 똑같이 맞추기, 뺀 사람 Revoke session)를 보여준다. 대시보드를 고친 뒤 **대시보드에 반영했어요**를 누르면 그 목록이 `applied`(수동)로 기록된다 — 그사이 앱 목록이 바뀌었으면 409로 다시 보여준다.
+- 사용자 탭의 추가·수정·비활성화도 미리보기를 보여주고, 저장 뒤 "Access 탭의 목록대로 대시보드를 고치세요"를 안내한다.
+
+### 45.6 관리자 이메일 변경 (FR-15.7)
+
+관리자 본인만, Access 탭 아래 **관리자 이메일 변경**에서. 단계가 화면에 표시되고, **전환 전까지는 어느 단계에서 실패하거나 서버가 다시 시작돼도 이전 이메일로 그대로 로그인**한다(상태는 `admin_email_changes`에 남아 이어서 할 수 있다).
+
+1. **변경 요청** → `pending`. 새 이메일은 다른 계정에 쓸 수 없게 잡아 둔다.
+2. **새 이메일 Access 추가**: 비교하기 → 반영(수동 모드면 대시보드에 추가하고 "대시보드에 반영했어요"). 새 이메일이 든 목록이 반영되면 `added`. 이 사이 다른 반영도 이전·새 이메일을 둘 다 유지한다.
+3. **확인**: 같은 브라우저에서 `https://chat.2prostream.com/cdn-cgi/access/logout`으로 Access에서만 로그아웃 → `https://chat.2prostream.com`에 **새 이메일**로 Access 로그인. 앱 세션 쿠키는 그대로라 앱이 "관리자 이메일 전환" 화면을 보여준다(이 조합은 다른 모든 API에서 `access_email_mismatch`로 거부된다). 외부 주소로만 된다(로컬 `localhost`는 `admin_email_verify_edge`).
+4. **새 이메일로 전환**: 계정 이메일 변경·기존 세션 전부 삭제·단계 기록이 한 트랜잭션이고, 이 브라우저에 새 세션을 준다 → `switched`.
+5. **이전 이메일 제거**: 비교하기 → 반영. 이전 이메일이 빠진 목록이 반영되면 `done`. 실패해도 `switched`로 남아 다시 시도한다.
+- `pending`·`added`에서는 **변경 취소** 가능(새 이메일은 다음 반영에서 빠진다).
+- 변경을 진행하던 관리자가 전환 전에 **비활성화되거나 가족으로 바뀌면** 그 변경은 자동으로 취소되고 새 이메일은 원하는 목록에서 빠진다. 남은 관리자는 자기 변경을 새로 시작할 수 있고, 주인이 더 이상 활성 관리자가 아닌 변경은 다른 관리자가 취소할 수 있다.
+- 끝나면 운영 `.env`의 `ADMIN_EMAIL`도 새 주소로 고친다(첫 실행 화면과 `.env` 구독 토큰 가져오기만 이 값을 쓴다).
+
+### 45.7 시험
+
+- 자동: `apps/server/test/access-sync.test.ts` — Cloudflare API **목 서버**(`test/helpers/cloudflare-mock.ts`, 루프백, 합성 토큰·ID·이메일)로 등록·미리보기(기존 불일치 포함)·반영·revision 충돌·오래된 미리보기·실패 후 저장 유지·멱등 재시도(응답 잃은 쓰기를 반복하지 않음)·429 자동 재시도·`applying` 중 재시작·비활성화 세션 철회·관리자 이메일 보호·관리자 이메일 변경 각 단계 실패·재시작·취소·수동 모드. 화면은 `e2e/access.spec.ts`(e2e 서버는 토큰 없음 = 수동 모드). **실제 Cloudflare API는 시험에서 부르지 않는다.**
+- 수동(실계정): 수용 기준 13 절차(`docs/acceptance.md` AC-13)를 기록 양식 B로 남긴다.
