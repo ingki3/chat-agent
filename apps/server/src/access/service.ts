@@ -492,13 +492,26 @@ export class AccessSyncService {
     who: { authorize: () => boolean; confirmedBy: string | null },
   ): Promise<SyncRow> {
     const regKey = this.registrationKey();
-    const fail = (code: string, retryAfterMs: number | null = null) => {
+    /**
+     * What this attempt makes the sync's retry input and authority: a confirm's revision and list (no earlier write of
+     * the row counts for it), and the caller who passed the permission check (a manual retry's too, so the automatic
+     * retry after it runs on that caller's authority). Written only once the caller was re-checked — before that the
+     * row keeps its old values, so a refused confirm can never feed the automatic retry.
+     */
+    let staged: Partial<SyncRow> = {
+      confirmedBy: who.confirmedBy,
+      ...(trigger === "confirm"
+        ? { baseRevision: revision, finalEmails: final, writeSent: false, added: null, removed: null }
+        : {}),
+    };
+    const fail = (code: string, retryAfterMs: number | null = null, commit = false) => {
       const attempts = row.attempts + 1;
       const retryAt =
         code === "cf_rate_limited" && retryAfterMs !== null && attempts <= AUTO_RETRIES
           ? this.now() + (this.opts.retryDelay ?? ((ms: number) => ms))(retryAfterMs)
           : null;
       const failed = this.update(row.id, {
+        ...(commit ? staged : {}),
         status: "failed",
         errorCode: code,
         attempts,
@@ -509,27 +522,23 @@ export class AccessSyncService {
       if (retryAt !== null) this.armRetry(failed);
       return failed;
     };
-    // A new confirm starts afresh: no earlier write of this row counts for it.
-    if (trigger === "confirm")
-      row = this.update(row.id, {
-        baseRevision: revision,
-        finalEmails: final,
-        confirmedBy: who.confirmedBy,
-        writeSent: false,
-        added: null,
-        removed: null,
-      });
     let live: PolicySnapshot;
     try {
       live = await conn.client.policy(conn.target);
     } catch (e) {
-      if (e instanceof CloudflareError) return fail(e.code, e.retryAfterMs);
-      throw e;
+      if (!(e instanceof CloudflareError)) throw e;
+      // The read failed: the new values become the retry's input only if the caller may still write.
+      if (!who.authorize()) {
+        if (trigger === "auto") return fail("forbidden");
+        throw new AccessSyncError(403, "forbidden");
+      }
+      return fail(e.code, e.retryAfterMs, true);
     }
     // ---- from here to the PUT nothing is awaited: these checks hold for the write itself.
     if (!who.authorize()) {
-      if (trigger === "confirm") throw new AccessSyncError(403, "forbidden");
-      return fail("forbidden");
+      if (trigger === "auto") return fail("forbidden");
+      // A refused confirm or manual retry changes nothing: the open sync (and any automatic retry) keep what they had.
+      throw new AccessSyncError(403, "forbidden");
     }
     if (this.registrationKey() !== regKey) {
       if (trigger === "confirm") throw new AccessSyncError(409, "access_registration_changed");
@@ -561,6 +570,7 @@ export class AccessSyncService {
     ];
     this.protect(order);
     row = this.update(row.id, {
+      ...staged,
       status: "applying",
       mode: "auto",
       baseRevision: revision,
@@ -571,12 +581,13 @@ export class AccessSyncService {
       retryAt: null,
       ...(landed ? {} : { writeSent: true }),
     });
+    staged = {}; // committed with the row above
     if (!landed) {
       try {
         const written = await conn.client.putPolicy(conn.target, withEmails(live, order));
-        if (!sameSet(written.emails, final)) return fail("cf_bad_response");
+        if (!sameSet(written.emails, final)) return fail("cf_bad_response", null, true);
       } catch (e) {
-        if (e instanceof CloudflareError) return fail(e.code, e.retryAfterMs);
+        if (e instanceof CloudflareError) return fail(e.code, e.retryAfterMs, true);
         throw e;
       }
     }

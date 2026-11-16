@@ -64,14 +64,14 @@ async function mock(emails: string[] = [ADMIN]) {
 const bodies: string[] = [];
 
 /** The real app on `db` (a second call on the same db = a restart), with the mock as the Cloudflare API. */
-async function boot(db: Db, m: CloudflareMock | undefined) {
+async function boot(db: Db, m: CloudflareMock | undefined, retryMs = 30) {
   const app = await buildApp(
     loadConfig({ NODE_ENV: "test", CF_ACCESS_TEAM_DOMAIN: TEAM, CF_ACCESS_AUD: AUD }),
     {
       db,
       logger: false,
       accessKeys: jwks,
-      accessSync: { ...(m ? { apiBase: m.url } : {}), retryDelay: () => 30 },
+      accessSync: { ...(m ? { apiBase: m.url } : {}), retryDelay: () => retryMs },
     },
   );
   let open = true;
@@ -81,7 +81,7 @@ async function boot(db: Db, m: CloudflareMock | undefined) {
   const restart = async () => {
     open = false;
     await app.close();
-    return boot(db, m);
+    return boot(db, m, retryMs);
   };
   const inject = async (o: {
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -124,10 +124,10 @@ async function boot(db: Db, m: CloudflareMock | undefined) {
 
 type Booted = Awaited<ReturnType<typeof boot>>;
 
-async function family(o: { emails?: string[]; register?: boolean } = {}) {
+async function family(o: { emails?: string[]; register?: boolean; retryMs?: number } = {}) {
   const m = await mock(o.emails);
   const db = createTestDb();
-  const b = await boot(db, m);
+  const b = await boot(db, m, o.retryMs);
   const hash = await hashPassword(PW);
   b.app.users!.create({ email: ADMIN, name: "아빠", role: "admin", passwordHash: hash });
   const admin = await b.login(ADMIN);
@@ -802,5 +802,61 @@ describe("review round 1 (#167)", () => {
       code: "cf_bad_response",
     });
     expect(delivered).toBeLessThanOrEqual(1);
+  });
+
+  it("round 2 P1: a confirm refused with 403 never becomes the pending automatic retry's input", async () => {
+    const { m, b, admin } = await family({ retryMs: 400 });
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    expect(sync((await a.apply({ revision: p.revision, final: p.final })).body).errorCode).toBe(
+      "cf_rate_limited",
+    );
+    // Another change, confirmed again — the caller's session ends while the policy is read.
+    await a.post("/api/admin/users", { name: "아들", email: SON });
+    const p2 = AccessPreview.parse((await a.preview()).body);
+    const gate = m.pause("GET", /policies/);
+    const pending = a.apply({ revision: p2.revision, final: p2.final });
+    await gate.started;
+    await b.inject({ method: "POST", url: "/api/auth/logout", cookie: admin });
+    gate.release();
+    expect((await pending).status).toBe(403);
+    const row = () =>
+      b.db.$client.prepare("SELECT final_emails, error_code, base_revision FROM access_syncs").get() as {
+        final_emails: string;
+        error_code: string;
+        base_revision: string;
+      };
+    expect(JSON.parse(row().final_emails)).toEqual([ADMIN, MOM].sort());
+    expect(row().base_revision).toBe(p.revision);
+    // The automatic retry runs on what was there before (the old list — now stale), so it writes nothing new.
+    for (let i = 0; i < 60 && row().error_code === "cf_rate_limited"; i++) await wait(25);
+    expect(row().error_code).toBe("access_preview_stale");
+    expect(m.count("PUT", /policies/)).toBe(1);
+    expect(m.emails()).not.toContain(SON);
+  });
+
+  it("round 2 P2: a manual retry by another admin becomes the automatic retry's authority", async () => {
+    const { m, b, admin, hash } = await family();
+    const a = as(b, admin);
+    const admin2 = await secondAdmin(b, hash);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    m.failures.push({ method: "PUT", status: 500 });
+    expect(sync((await a.apply({ revision: p.revision, final: p.final })).body).status).toBe("failed");
+    const adminId = b.app.users!.byEmail(ADMIN)!.id;
+    await b.inject({
+      method: "PATCH",
+      url: `/api/admin/users/${adminId}`,
+      cookie: admin2,
+      body: { role: "member" },
+    });
+    const a2 = as(b, admin2);
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    expect(sync((await a2.post("/api/admin/access/retry")).json()).errorCode).toBe("cf_rate_limited");
+    for (let i = 0; i < 60 && (await a2.overview()).open; i++) await wait(20);
+    expect((await a2.overview()).lastApplied?.added).toContain(MOM);
+    expect(m.emails()).toContain(MOM);
   });
 });
