@@ -860,7 +860,7 @@ describe("review round 1 (#167)", () => {
     expect(m.emails()).toContain(MOM);
   });
 
-  it("round 3: a late failure never overwrites a sync another request completed meanwhile", async () => {
+  it("round 3/4: unregistering and a manual completion wait for a write in flight; it is never overwritten", async () => {
     const { m, b, admin } = await family();
     const a = as(b, admin);
     const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
@@ -869,20 +869,86 @@ describe("review round 1 (#167)", () => {
     m.failures.push({ method: "GET", status: 429, retryAfter: "1" });
     const pending = a.apply({ revision: p.revision, final: p.final });
     await gate.started;
-    // Meanwhile: back to manual mode, the dashboard is changed by hand, marked done.
-    await b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: admin });
+    // Removing the token while the read is held: queued behind the write, not interleaved with it.
+    const unreg = b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: admin });
+    gate.release();
+    expect(sync((await pending).body)).toMatchObject({ status: "failed", errorCode: "cf_rate_limited" });
+    await unreg;
+    expect((await a.overview()).mode).toBe("manual");
+    // Done by hand in the dashboard; the rate-limited row's timer finds no registration and changes nothing.
     const manual = AccessPreview.parse((await a.preview()).body);
     expect(sync((await a.post("/api/admin/access/manual-done", { final: manual.final })).json()).status).toBe(
       "applied",
     );
-    gate.release();
-    expect((await pending).body.error).toBe("access_registration_changed");
+    await wait(100);
     const o = await a.overview();
     expect(o.open).toBeNull();
     expect(o.lastApplied).toMatchObject({ status: "applied", mode: "manual" });
-    // The row itself: still the manual completion, no retry deadline from the old read.
-    const row = b.db.$client.prepare("SELECT status, mode, retry_at FROM access_syncs").get();
-    expect(row).toEqual({ status: "applied", mode: "manual", retry_at: null });
+  });
+
+  it("round 4: a PUT failing after the registration changed out of band ends its row failed, without a retry", async () => {
+    const { m, b, admin } = await family();
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    const gate = m.pause("PUT", /policies/);
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    // Not through the queue (a restore, a second process): the guard of the write itself.
+    b.db.$client.prepare("DELETE FROM settings WHERE key LIKE 'access.sync.%'").run();
+    gate.release();
+    expect((await pending).body.error).toBe("access_registration_changed");
+    const row = () =>
+      b.db.$client.prepare("SELECT status, error_code, retry_at FROM access_syncs").get() as Record<
+        string,
+        unknown
+      >;
+    expect(row()).toEqual({ status: "failed", error_code: "access_registration_changed", retry_at: null });
+    // Not stuck: manual mode completes it.
+    const manual = AccessPreview.parse((await a.preview()).body);
+    expect(sync((await a.post("/api/admin/access/manual-done", { final: manual.final })).json()).status).toBe(
+      "applied",
+    );
+  });
+
+  it("round 4: a manual completion queued behind a write in flight runs after it, with the list as it is then", async () => {
+    const { m, b, admin } = await family();
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    const gate = m.pause("PUT", /policies/);
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    const unreg = b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: admin });
+    await a.post("/api/admin/users", { name: "아들", email: SON });
+    const done = a.post("/api/admin/access/manual-done", { final: [ADMIN, MOM, SON] });
+    await wait(50);
+    // Nothing of the queue has run yet: the write is still in flight.
+    expect(
+      b.db.$client.prepare("SELECT count(*) AS n FROM access_syncs WHERE status = 'applying'").get(),
+    ).toEqual({ n: 1 });
+    gate.release();
+    const first = sync((await pending).body);
+    expect(first).toMatchObject({ status: "applied", added: [MOM] });
+    await unreg;
+    const second = sync((await done).json());
+    expect(second).toMatchObject({ status: "applied", mode: "manual" });
+    expect(second.appliedAt!).toBeGreaterThanOrEqual(first.appliedAt!);
+    expect((await a.overview()).lastApplied?.id).toBe(second.id);
+  });
+
+  it("round 4: manual completion refuses while any row is applying, whatever row is open", async () => {
+    const { b, admin } = await family({ register: false });
+    const a = as(b, admin);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    // A write left applying under a newer pending row (e.g. by another process).
+    b.db.$client.prepare("UPDATE access_syncs SET status = 'applying', created_at = created_at - 10").run();
+    await a.post("/api/admin/users", { name: "아들", email: SON });
+    const p = AccessPreview.parse((await a.preview()).body);
+    expect((await a.post("/api/admin/access/manual-done", { final: p.final })).json()).toEqual({
+      error: "access_busy",
+    });
   });
 
   it("round 3: a replaced automatic-retry timer's queued job does nothing", async () => {

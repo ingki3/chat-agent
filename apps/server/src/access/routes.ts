@@ -68,7 +68,7 @@ export function registerAccessRoutes(
   });
 
   app.delete("/api/admin/access/registration", { config: admin }, async (_req, reply) => {
-    access.unregister();
+    await access.unregister();
     return send(reply, access.overview());
   });
 
@@ -106,7 +106,7 @@ export function registerAccessRoutes(
     const r = AccessManualDoneRequest.safeParse(req.body);
     if (!r.success) return deny(reply, 400, "invalid_request");
     try {
-      return send(reply, { sync: access.manualDone(r.data.final) });
+      return send(reply, { sync: await access.manualDone(r.data.final) });
     } catch (e) {
       return refuse(reply, e);
     }

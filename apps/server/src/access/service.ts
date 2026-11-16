@@ -140,9 +140,13 @@ export class AccessSyncService {
    * the application exists (and its AUD is this server's `CF_ACCESS_AUD`, when set), the policy is an Allow policy of
    * it — then stored: the token encrypted (only its last 4 characters are ever shown), the ids in plain settings.
    */
-  async register(
+  register(input: AccessRegisterRequest, authorize: () => boolean = () => true): Promise<AccessRegistration> {
+    return this.exclusive(() => this.registerNow(input, authorize));
+  }
+
+  private async registerNow(
     input: AccessRegisterRequest,
-    authorize: () => boolean = () => true,
+    authorize: () => boolean,
   ): Promise<AccessRegistration> {
     const token = input.token ?? this.settings.get(TOKEN_KEY);
     if (!token) throw new AccessSyncError(400, "access_token_required");
@@ -178,8 +182,10 @@ export class AccessSyncService {
   }
 
   /** Back to manual mode: the token is deleted (the ids too). */
-  unregister(): void {
-    this.db.$client.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(CONFIG_KEY, TOKEN_KEY);
+  unregister(): Promise<void> {
+    return this.exclusive(async () => {
+      this.db.$client.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(CONFIG_KEY, TOKEN_KEY);
+    });
   }
 
   // ---------------------------------------------------------------- the wanted list
@@ -378,7 +384,12 @@ export class AccessSyncService {
 
   // ---------------------------------------------------------------- preview / apply / retry
 
-  /** One Cloudflare write at a time (apply, retry, the automatic retry). */
+  /**
+   * One Access-changing operation at a time: register (token replacement included), unregister, apply, manual and
+   * automatic retry, manual completion. None of them can start while another awaits Cloudflare, so they cannot
+   * interleave (the compare-and-set on each sync row stays as a second line of defence). User changes are not queued:
+   * they are synchronous and open a pending sync of their own while a write is under way.
+   */
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.chain.then(fn, fn);
     this.chain = run.catch(() => {});
@@ -568,19 +579,23 @@ export class AccessSyncService {
         code === "cf_rate_limited" && retryAfterMs !== null && attempts <= AUTO_RETRIES
           ? this.now() + (this.opts.retryDelay ?? ((ms: number) => ms))(retryAfterMs)
           : null;
-      // A failure of an attempt on a registration that was replaced or removed meanwhile is not this sync's any more.
-      if (this.registrationKey() !== regKey) {
-        if (trigger === "confirm") throw new AccessSyncError(409, "access_registration_changed");
-        throw new Superseded();
-      }
+      // The registration was replaced or removed meanwhile (cannot happen while operations are queued; kept as a
+      // guard): the row this attempt owns still ends — `failed` / `access_registration_changed`, never left
+      // `applying`, and no automatic retry against the old registration.
+      const regChanged = this.registrationKey() !== regKey;
       const failed = this.updateIf(row, {
-        ...(commit ? staged : {}),
+        ...(commit && !regChanged ? staged : {}),
         status: "failed",
-        errorCode: code,
+        errorCode: regChanged ? "access_registration_changed" : code,
         attempts,
-        retryAt,
+        retryAt: regChanged ? null : retryAt,
         mode: "auto",
       });
+      if (regChanged) {
+        this.absorbNewer(failed);
+        if (trigger === "confirm") throw new AccessSyncError(409, "access_registration_changed");
+        return failed;
+      }
       const latest = this.absorbNewer(failed);
       if (retryAt !== null) this.armRetry(latest);
       return latest;
@@ -688,16 +703,21 @@ export class AccessSyncService {
   }
 
   /** Manual mode (FR-15.4): the admin changed the dashboard by hand to `final` — recorded as applied. */
-  manualDone(final: string[]): AccessSync {
+  manualDone(final: string[]): Promise<AccessSync> {
+    return this.exclusive(async () => this.manualDoneNow(final));
+  }
+
+  private manualDoneNow(final: string[]): AccessSync {
     if (this.connection()) throw new AccessSyncError(409, "access_manual_mode");
     const wanted = this.wanted();
     if (!sameSet(wanted, final)) throw new AccessSyncError(409, "access_preview_stale");
     this.protect(wanted);
     const last = this.lastApplied();
     const before = last?.finalEmails ?? [];
+    // Any write still under way (not only the open row: a newer pending one may sit on top of it) settles first.
+    if (this.db.select().from(accessSyncs).where(eq(accessSyncs.status, "applying")).get())
+      throw new AccessSyncError(409, "access_busy");
     const row = this.ensureOpen("manual_sync");
-    // A write of the API mode still under way (registration removed meanwhile): it settles first.
-    if (row.status === "applying") throw new AccessSyncError(409, "access_busy");
     const applied = this.update(row.id, {
       status: "applied",
       mode: "manual",
