@@ -20,8 +20,8 @@ import type { DefaultsService } from "./defaults.js";
 
 /**
  * Minimal user management (#41, PRD FR-1.1): the admin adds family accounts with a one-time temporary password,
- * deactivates them (sessions and open streams end at once) and resets passwords. Access allow-list changes are
- * manual until #36 (docs/ops.md §10). The full admin screen is #35.
+ * deactivates them (sessions and open streams end at once) and resets passwords. Every change the Cloudflare Access
+ * list must follow is recorded with the Access sync (#36: `accessSync.changed`), which the admin previews and applies.
  */
 export type UserAdminOptions = {
   /** Password hashing override (tests hold it open to race other requests against it). */
@@ -54,7 +54,9 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
   app.post("/api/admin/users", { config: admin }, async (req, reply) => {
     const r = CreateUserRequest.safeParse(req.body);
     if (!r.success) return deny(reply, 400, "invalid_request");
-    if (users.byEmail(r.data.email)) return deny(reply, 409, "email_taken");
+    // An email held by the admin's pending email change (#36) is taken too.
+    if (users.byEmail(r.data.email) || req.server.accessSync?.reserved(r.data.email))
+      return deny(reply, 409, "email_taken");
     const password = temporaryPassword();
     const passwordHash = await hash(password);
     if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
@@ -74,6 +76,7 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
       if (isUniqueViolation(e)) return deny(reply, 409, "email_taken");
       throw e;
     }
+    req.server.accessSync?.changed("user_created");
     return reply
       .code(201)
       .header("Cache-Control", "no-store")
@@ -90,6 +93,8 @@ export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: 
       if (target.id === req.ctx.user!.id) return deny(reply, 400, "cannot_change_self");
       if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
       if (!users.deactivateUnlessLastAdmin(target.id)) return deny(reply, 409, "last_admin");
+      // The app blocks at once (#41); the Access list and Access sessions follow with the sync (#36, FR-15.5).
+      if (target.active) req.server.accessSync?.changed("deactivated");
       return reply.header("Cache-Control", "no-store").send({ user: toAdminUser(users.byId(target.id)!) });
     },
   );
@@ -189,14 +194,22 @@ export function registerAccountSettings(
     reply.header("Cache-Control", "no-store").send(body);
   const catalogue = new Set(CATALOGUE);
 
-  // Name, email, role (FR-15.1). The Access allow-list follows by hand until #36 (docs/ops.md §10).
+  // Name, email, role (FR-15.1). A new email is recorded with the Access sync (#36).
   app.patch<{ Params: { id: string } }>("/api/admin/users/:id", { config: admin }, async (req, reply) => {
     const r = UpdateUserRequest.safeParse(req.body);
     if (!r.success) return deny(reply, 400, "invalid_request");
-    if (!users.byId(req.params.id)) return deny(reply, 404, "not_found");
+    const before = users.byId(req.params.id);
+    if (!before) return deny(reply, 404, "not_found");
     if (!stillAdmin(req)) return deny(reply, 403, "forbidden");
+    if (
+      r.data.email !== undefined &&
+      r.data.email !== before.email &&
+      req.server.accessSync?.reserved(r.data.email)
+    )
+      return deny(reply, 409, "email_taken");
     const out = users.update(req.params.id, r.data);
     if (!out.ok) return deny(reply, out.code === "not_found" ? 404 : 409, out.code);
+    if (out.user.email !== before.email && out.user.active) req.server.accessSync?.changed("email_changed");
     return send(reply, { user: toAdminUser(out.user) });
   });
 

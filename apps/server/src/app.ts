@@ -14,6 +14,8 @@ import { installRouteRules, registerResourceCheck } from "./authz/resources.js";
 import { registerAccountSettings, registerUserAdmin, type UserAdminOptions } from "./users/routes.js";
 import { DefaultsService } from "./users/defaults.js";
 import { registerAdminSystemRoutes, type SystemRouteOptions } from "./admin/routes.js";
+import { AccessSyncService, type AccessSyncOptions } from "./access/service.js";
+import { registerAccessRoutes } from "./access/routes.js";
 import { BackupService, type BackupServiceOptions } from "./backup/backup.js";
 import { FileWriteLock } from "./backup/lock.js";
 import { registerBackupRoutes } from "./backup/routes.js";
@@ -257,6 +259,8 @@ export type BuildOptions = {
   sse?: { heartbeatMs?: number };
   /** User-admin overrides (tests). */
   userAdmin?: UserAdminOptions;
+  /** Cloudflare Access sync (#36): the API base (tests: a loopback mock server), fetch, clock, retry wait. */
+  accessSync?: AccessSyncOptions;
   /**
    * Master key for stored secrets (VAPID private key, push subscriptions). index.ts passes the real one; without
    * it (tests) an ephemeral key is used, which production refuses.
@@ -460,6 +464,15 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     primeStoredSecrets(opts.db!, masterKey);
     storedRescrub.schedule({ all: true });
     const settingsStore = new SettingsStore(opts.db!, masterKey);
+    // Cloudflare Access sync (#36): the user routes record what the Access list must follow.
+    const accessSync = new AccessSyncService(opts.db!, users, settingsStore, events, {
+      ...opts.accessSync,
+      aud: config.access?.aud,
+    });
+    app.decorate("accessSync", accessSync);
+    accessSync.start();
+    app.addHook("onClose", async () => accessSync.close());
+    registerAccessRoutes(app, { users, access: accessSync, config });
     // Runtime connections (#17): credentials encrypted with the master key, resolved per run by the adapters.
     const connectionStore = new ConnectionStore(opts.db!, masterKey, config.dataDir);
     // ChatGPT logins (#18): tokens refreshed by the server, never by a runtime process.
@@ -1210,6 +1223,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.addHook("onReady", async () => notifications.start());
     app.addHook("onClose", async () => notifications.stop());
   } else {
+    app.decorate("accessSync", undefined);
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
     app.decorate("dreaming", undefined);

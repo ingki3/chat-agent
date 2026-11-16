@@ -554,6 +554,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/instructions",
   // #146: 기억 정리 settings, prompt, 미리 실행 (the admin's own data), status counts.
   "/api/admin/dreaming",
+  // #36: Cloudflare Access sync.
+  "/api/admin/access",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -613,6 +615,26 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "GET /api/admin/dreaming/prompt/versions", expect: ADMIN_ONLY },
   { route: "POST /api/admin/dreaming/prompt/versions/:version/restore", expect: ADMIN_BY_ID },
   { route: "POST /api/admin/dreaming/preview", expect: ADMIN_ONLY, body: {} },
+  // #36: the matrix app has no Cloudflare token (manual mode) — nothing here reaches Cloudflare. Registration with an
+  // empty body is refused before any call (400); apply/retry need a token (409); the manual "done" with a list that is
+  // not the app's is stale (409). The admin's email change is requested and cancelled (their own, 200).
+  { route: "GET /api/admin/access", expect: ADMIN_ONLY },
+  { route: "PUT /api/admin/access/registration", expect: { ...ADMIN_ONLY, admin: 400 }, body: {} },
+  { route: "DELETE /api/admin/access/registration", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/access/preview", expect: ADMIN_ONLY, body: {} },
+  {
+    route: "POST /api/admin/access/apply",
+    expect: { ...ADMIN_ONLY, admin: 409 },
+    body: { revision: "matrix", final: [] },
+  },
+  { route: "POST /api/admin/access/retry", expect: { ...ADMIN_ONLY, admin: 409 } },
+  { route: "POST /api/admin/access/manual-done", expect: { ...ADMIN_ONLY, admin: 409 }, body: { final: [] } },
+  {
+    route: "POST /api/admin/access/admin-email",
+    expect: ADMIN_ONLY,
+    body: { email: "matrix-admin-new@matrix.test" },
+  },
+  { route: "POST /api/admin/access/admin-email/cancel", expect: ADMIN_ONLY },
 ];
 
 /**

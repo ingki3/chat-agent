@@ -97,6 +97,15 @@ import {
   MemoryPrefs,
   MemoryProposal,
   type MemoryApplyMode,
+  ACCESS_ERRORS,
+  AccessOverview,
+  AccessPreview,
+  AccessRegistration,
+  AccessSync,
+  AdminEmailChange,
+  AdminEmailConfirmState,
+  type AccessPreviewChange,
+  type AccessRegisterRequest,
 } from "@agentlee/shared";
 
 const enc = encodeURIComponent;
@@ -285,6 +294,38 @@ export const admin = {
     ),
   removeUserConnection: async (id: string, connectionId: string) =>
     call("DELETE", `/api/admin/users/${enc(id)}/connections/${enc(connectionId)}`),
+};
+
+/** 관리자 → Access (#36, FR-15): registration, comparison/preview, apply, retry, manual mode, admin email change. */
+export const access = {
+  overview: async () => AccessOverview.parse(await call("GET", "/api/admin/access")),
+  register: async (body: AccessRegisterRequest) =>
+    AccessRegistration.parse(
+      ((await call("PUT", "/api/admin/access/registration", body)) as { registration: unknown }).registration,
+    ),
+  unregister: async () => AccessOverview.parse(await call("DELETE", "/api/admin/access/registration")),
+  preview: async (change?: AccessPreviewChange) =>
+    AccessPreview.parse(await call("POST", "/api/admin/access/preview", change ? { change } : {})),
+  apply: async (p: { revision: string; final: string[] }) =>
+    AccessSync.parse(((await call("POST", "/api/admin/access/apply", p)) as { sync: unknown }).sync),
+  retry: async () =>
+    AccessSync.parse(((await call("POST", "/api/admin/access/retry", {})) as { sync: unknown }).sync),
+  manualDone: async (final: string[]) =>
+    AccessSync.parse(
+      ((await call("POST", "/api/admin/access/manual-done", { final })) as { sync: unknown }).sync,
+    ),
+  requestAdminEmail: async (email: string) =>
+    AdminEmailChange.parse(
+      ((await call("POST", "/api/admin/access/admin-email", { email })) as { change: unknown }).change,
+    ),
+  cancelAdminEmail: async () =>
+    AdminEmailChange.parse(
+      ((await call("POST", "/api/admin/access/admin-email/cancel", {})) as { change: unknown }).change,
+    ),
+  /** FR-15.7 step 3, from the admin's existing session through Access with the new email. */
+  confirmState: async () =>
+    AdminEmailConfirmState.parse(await call("GET", "/api/access/admin-email/confirm")),
+  confirm: async () => AuthState.parse(await call("POST", "/api/access/admin-email/confirm", {})),
 };
 
 /** 설정 → 기본 런타임·모델 (FR-12.1, #35): what the picker may show and the saved defaults. */
@@ -553,6 +594,8 @@ const MESSAGES: Record<string, string> = {
   ...MEMORY_PROPOSAL_ERRORS,
   // 기억 정리 (#146)
   ...DREAMING_ERRORS,
+  // Cloudflare Access 동기화 (#36)
+  ...ACCESS_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
