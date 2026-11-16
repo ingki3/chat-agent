@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "d6c65735-a2e6-41d3-b372-99f79abaa3b5",
+  "id": "dfb80d1b-1d93-4fd4-883f-3baf887db7c1",
   "prevId": "57b021f1-68f3-4bf7-a95e-1f712727f5b1",
   "tables": {
     "access_syncs": {
@@ -99,6 +99,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "generation": {
+          "name": "generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         },
         "revokes": {
           "name": "revokes",

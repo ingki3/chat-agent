@@ -1603,6 +1603,12 @@ export const accessSyncs = sqliteTable(
      * that already equals `final` at another revision as its own landed write.
      */
     writeSent: integer("write_sent", { mode: "boolean" }).notNull().default(false),
+    /**
+     * Bumped by every change of the row. A write that awaited Cloudflare saves its outcome only if the row is still the
+     * generation it started from (compare-and-set) — a row another request completed or replaced is never overwritten,
+     * and an automatic-retry timer runs only for the generation it was armed for.
+     */
+    generation: integer("generation").notNull().default(0),
     /** Access-session revocation of each removed email: `revoked` / `unavailable` / `failed`. */
     revokes: text("revokes", { mode: "json" }).$type<{ email: string; result: string }[]>(),
     createdAt: integer("created_at").notNull(),

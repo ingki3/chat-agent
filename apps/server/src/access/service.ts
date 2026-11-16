@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, desc, eq, gt, inArray } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type {
   AccessOverview,
   AccessPreview,
@@ -35,6 +35,9 @@ const AUTO_RETRIES = 3;
 type SyncRow = typeof accessSyncs.$inferSelect;
 type ChangeRow = typeof adminEmailChanges.$inferSelect;
 type StoredConfig = Omit<AccessRegistration, "tokenMasked"> & { tokenLast4: string };
+
+/** The sync row was completed or replaced by another request while a write awaited Cloudflare. */
+class Superseded extends Error {}
 
 /** A refusal with its HTTP status and fixed code (ACCESS_ERRORS). */
 export class AccessSyncError extends Error {
@@ -295,13 +298,35 @@ export class AccessSyncService {
       .get();
   }
 
-  private update(id: string, patch: Partial<SyncRow>): SyncRow {
+  /**
+   * Changes a sync row. Every change of its state bumps `generation`; `bump: false` is for bookkeeping that changes
+   * nothing a write depends on (the reasons list).
+   */
+  private update(id: string, patch: Partial<SyncRow>, bump = true): SyncRow {
     this.db
       .update(accessSyncs)
-      .set({ ...patch, updatedAt: this.now() })
+      .set({
+        ...patch,
+        updatedAt: this.now(),
+        ...(bump ? { generation: sql`${accessSyncs.generation} + 1` } : {}),
+      })
       .where(eq(accessSyncs.id, id))
       .run();
     return this.db.select().from(accessSyncs).where(eq(accessSyncs.id, id)).get()!;
+  }
+
+  /**
+   * Compare-and-set: changes the row only if it is still at `generation` (one statement). A write that awaited
+   * Cloudflare saves through this, so a row another request completed or replaced meanwhile is never overwritten.
+   */
+  private updateIf(row: SyncRow, patch: Partial<SyncRow>): SyncRow {
+    const r = this.db
+      .update(accessSyncs)
+      .set({ ...patch, updatedAt: this.now(), generation: row.generation + 1 })
+      .where(and(eq(accessSyncs.id, row.id), eq(accessSyncs.generation, row.generation)))
+      .run();
+    if (r.changes !== 1) throw new Superseded();
+    return this.db.select().from(accessSyncs).where(eq(accessSyncs.id, row.id)).get()!;
   }
 
   /**
@@ -312,7 +337,7 @@ export class AccessSyncService {
   changed(reason: string): void {
     const open = this.openRow();
     if (open && open.status !== "applying") {
-      if (!open.reasons.includes(reason)) this.update(open.id, { reasons: [...open.reasons, reason] });
+      if (!open.reasons.includes(reason)) this.update(open.id, { reasons: [...open.reasons, reason] }, false);
       return;
     }
     // A write under way does not take this change in: it gets a pending sync of its own (created after it).
@@ -447,7 +472,12 @@ export class AccessSyncService {
    * A manual retry checks its caller (`authorize`); the automatic one writes only while the admin who confirmed the
    * sync is still an active admin.
    */
-  retry(auto = false, caller?: { userId: string; authorize: () => boolean }): Promise<AccessSync> {
+  retry(
+    auto = false,
+    caller?: { userId: string; authorize: () => boolean },
+    /** The automatic retry: the row and generation its timer was armed for — a replaced timer's job does nothing. */
+    armed?: { id: string; generation: number },
+  ): Promise<AccessSync> {
     return this.exclusive(async () => {
       if (caller && !caller.authorize()) throw new AccessSyncError(403, "forbidden");
       const conn = this.connection();
@@ -455,7 +485,13 @@ export class AccessSyncService {
       const row = this.openRow();
       if (!row || row.status === "pending" || !row.baseRevision || !row.finalEmails)
         throw new AccessSyncError(409, "access_nothing_to_retry");
-      if (auto && (row.errorCode !== "cf_rate_limited" || row.status !== "failed")) return this.toSync(row);
+      if (
+        auto &&
+        (row.errorCode !== "cf_rate_limited" ||
+          row.status !== "failed" ||
+          (armed && (armed.id !== row.id || armed.generation !== row.generation)))
+      )
+        return this.toSync(row);
       const confirmedBy = caller?.userId ?? row.confirmedBy ?? null;
       const authorize = caller?.authorize ?? (() => this.isActiveAdmin(row.confirmedBy));
       if (!authorize())
@@ -491,6 +527,28 @@ export class AccessSyncService {
     trigger: "confirm" | "retry" | "auto",
     who: { authorize: () => boolean; confirmedBy: string | null },
   ): Promise<SyncRow> {
+    try {
+      return await this.attemptOnce(conn, row, final, revision, trigger, who);
+    } catch (e) {
+      if (!(e instanceof Superseded)) throw e;
+      // Another request completed or replaced the row meanwhile: nothing of this attempt is saved.
+      if (trigger === "confirm") throw new AccessSyncError(409, "access_superseded");
+      return this.db.select().from(accessSyncs).where(eq(accessSyncs.id, row.id)).get() ?? row;
+    }
+  }
+
+  /**
+   * `attempt`'s body. Every save after an await is a compare-and-set on the row's generation (`updateIf`), and a
+   * failure is saved only while the registration is the one the attempt started with — otherwise `Superseded`.
+   */
+  private async attemptOnce(
+    conn: { client: CloudflareAccessClient; target: AccessTarget },
+    row: SyncRow,
+    final: string[],
+    revision: string,
+    trigger: "confirm" | "retry" | "auto",
+    who: { authorize: () => boolean; confirmedBy: string | null },
+  ): Promise<SyncRow> {
     const regKey = this.registrationKey();
     /**
      * What this attempt makes the sync's retry input and authority: a confirm's revision and list (no earlier write of
@@ -510,7 +568,12 @@ export class AccessSyncService {
         code === "cf_rate_limited" && retryAfterMs !== null && attempts <= AUTO_RETRIES
           ? this.now() + (this.opts.retryDelay ?? ((ms: number) => ms))(retryAfterMs)
           : null;
-      const failed = this.update(row.id, {
+      // A failure of an attempt on a registration that was replaced or removed meanwhile is not this sync's any more.
+      if (this.registrationKey() !== regKey) {
+        if (trigger === "confirm") throw new AccessSyncError(409, "access_registration_changed");
+        throw new Superseded();
+      }
+      const failed = this.updateIf(row, {
         ...(commit ? staged : {}),
         status: "failed",
         errorCode: code,
@@ -518,9 +581,9 @@ export class AccessSyncService {
         retryAt,
         mode: "auto",
       });
-      this.absorbNewer(failed);
-      if (retryAt !== null) this.armRetry(failed);
-      return failed;
+      const latest = this.absorbNewer(failed);
+      if (retryAt !== null) this.armRetry(latest);
+      return latest;
     };
     let live: PolicySnapshot;
     try {
@@ -569,7 +632,7 @@ export class AccessSyncService {
       ...final.filter((e) => !live.emails.includes(e)),
     ];
     this.protect(order);
-    row = this.update(row.id, {
+    row = this.updateIf(row, {
       ...staged,
       status: "applying",
       mode: "auto",
@@ -597,7 +660,7 @@ export class AccessSyncService {
       if (results.get(email) !== "revoked")
         results.set(email, await conn.client.revokeUser(conn.target, email));
     const revokes = [...results].map(([email, result]) => ({ email, result }));
-    const applied = this.update(row.id, {
+    const applied = this.updateIf(row, {
       status: "applied",
       attempts: row.attempts + 1,
       revokes,
@@ -612,16 +675,16 @@ export class AccessSyncService {
    * that write then failed, the failed sync stays the open one and takes the newer reasons over — its retry sees the
    * changed list (`access_preview_stale`) and asks for a new preview.
    */
-  private absorbNewer(row: SyncRow): void {
+  private absorbNewer(row: SyncRow): SyncRow {
     const newer = this.db
       .select()
       .from(accessSyncs)
       .where(and(eq(accessSyncs.status, "pending"), gt(accessSyncs.createdAt, row.createdAt)))
       .all();
-    if (!newer.length) return;
+    if (!newer.length) return row;
     const reasons = [...new Set([...row.reasons, ...newer.flatMap((r) => r.reasons)])];
     for (const r of newer) this.db.delete(accessSyncs).where(eq(accessSyncs.id, r.id)).run();
-    this.update(row.id, { reasons });
+    return this.update(row.id, { reasons }, false);
   }
 
   /** Manual mode (FR-15.4): the admin changed the dashboard by hand to `final` — recorded as applied. */
@@ -633,6 +696,8 @@ export class AccessSyncService {
     const last = this.lastApplied();
     const before = last?.finalEmails ?? [];
     const row = this.ensureOpen("manual_sync");
+    // A write of the API mode still under way (registration removed meanwhile): it settles first.
+    if (row.status === "applying") throw new AccessSyncError(409, "access_busy");
     const applied = this.update(row.id, {
       status: "applied",
       mode: "manual",
@@ -662,7 +727,7 @@ export class AccessSyncService {
     this.retryTimer = setTimeout(
       () => {
         this.retryTimer = undefined;
-        void this.retry(true).catch(() => {});
+        void this.retry(true, undefined, { id: row.id, generation: row.generation }).catch(() => {});
       },
       Math.max(0, row.retryAt - this.now()),
     );

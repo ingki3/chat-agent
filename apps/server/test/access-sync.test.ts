@@ -71,7 +71,7 @@ async function boot(db: Db, m: CloudflareMock | undefined, retryMs = 30) {
       db,
       logger: false,
       accessKeys: jwks,
-      accessSync: { ...(m ? { apiBase: m.url } : {}), retryDelay: () => retryMs },
+      accessSync: { ...(m ? { apiBase: m.url } : {}), retryDelay: (ms) => (retryMs * ms) / 1000 },
     },
   );
   let open = true;
@@ -857,6 +857,60 @@ describe("review round 1 (#167)", () => {
     expect(sync((await a2.post("/api/admin/access/retry")).json()).errorCode).toBe("cf_rate_limited");
     for (let i = 0; i < 60 && (await a2.overview()).open; i++) await wait(20);
     expect((await a2.overview()).lastApplied?.added).toContain(MOM);
+    expect(m.emails()).toContain(MOM);
+  });
+
+  it("round 3: a late failure never overwrites a sync another request completed meanwhile", async () => {
+    const { m, b, admin } = await family();
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    const gate = m.pause("GET", /policies/);
+    m.failures.push({ method: "GET", status: 429, retryAfter: "1" });
+    const pending = a.apply({ revision: p.revision, final: p.final });
+    await gate.started;
+    // Meanwhile: back to manual mode, the dashboard is changed by hand, marked done.
+    await b.inject({ method: "DELETE", url: "/api/admin/access/registration", cookie: admin });
+    const manual = AccessPreview.parse((await a.preview()).body);
+    expect(sync((await a.post("/api/admin/access/manual-done", { final: manual.final })).json()).status).toBe(
+      "applied",
+    );
+    gate.release();
+    expect((await pending).body.error).toBe("access_registration_changed");
+    const o = await a.overview();
+    expect(o.open).toBeNull();
+    expect(o.lastApplied).toMatchObject({ status: "applied", mode: "manual" });
+    // The row itself: still the manual completion, no retry deadline from the old read.
+    const row = b.db.$client.prepare("SELECT status, mode, retry_at FROM access_syncs").get();
+    expect(row).toEqual({ status: "applied", mode: "manual", retry_at: null });
+  });
+
+  it("round 3: a replaced automatic-retry timer's queued job does nothing", async () => {
+    const { m, b, admin } = await family({ retryMs: 150 });
+    const a = as(b, admin);
+    const p = AccessPreview.parse((await a.preview({ kind: "create", email: MOM })).body);
+    await a.post("/api/admin/users", { name: "엄마", email: MOM });
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    expect(sync((await a.apply({ revision: p.revision, final: p.final })).body).errorCode).toBe(
+      "cf_rate_limited",
+    );
+    // A new confirm whose read outlasts the old timer: that timer's job queues behind it.
+    const p2 = AccessPreview.parse((await a.preview()).body);
+    const gate = m.pause("GET", /policies/);
+    const pending = a.apply({ revision: p2.revision, final: p2.final });
+    await gate.started;
+    await wait(300);
+    // Its PUT is rate-limited too, with a much later retry time (1.5 s).
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "10" });
+    gate.release();
+    const s2 = sync((await pending).body);
+    expect(s2.errorCode).toBe("cf_rate_limited");
+    expect(m.count("PUT", /policies/)).toBe(2);
+    await wait(400);
+    // The old job ran after the confirm and found its timer replaced: no third PUT before the new time.
+    expect(m.count("PUT", /policies/)).toBe(2);
+    for (let i = 0; i < 80 && (await a.overview()).open; i++) await wait(25);
+    expect(m.count("PUT", /policies/)).toBe(3);
     expect(m.emails()).toContain(MOM);
   });
 });

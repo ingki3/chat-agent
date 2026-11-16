@@ -12,6 +12,7 @@ CREATE TABLE `access_syncs` (
 	`retry_at` integer,
 	`confirmed_by` text,
 	`write_sent` integer DEFAULT false NOT NULL,
+	`generation` integer DEFAULT 0 NOT NULL,
 	`revokes` text,
 	`created_at` integer NOT NULL,
 	`updated_at` integer NOT NULL,
