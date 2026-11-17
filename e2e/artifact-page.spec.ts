@@ -317,6 +317,47 @@ test("back in the conversation while the run still streams: it does not move to 
   await expect(page).toHaveURL(new RegExp(`/c/${conv.id}$`));
 });
 
+test("the run goes on after moving to the page: a later v2 shows there, and the chat is up to date on return", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `이어짐 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  await send(page, `/artifact-twice markdown 이어짐 ${tag}\n# 첫 버전 ${tag}\n===\n# 둘째 버전 ${tag}`);
+  await expect(page).toHaveURL(/\/a\/[^/?]+$/);
+  const heading = page.getByTestId("artifact-text").getByRole("heading", { level: 1 });
+  await expect(heading).toHaveText(`첫 버전 ${tag}`);
+  // The same run stores v2 2.5 s later: this page follows it (the chat's stream is gone).
+  await expect(heading).toHaveText(`둘째 버전 ${tag}`, { timeout: 10_000 });
+  await expect(page.getByTestId("artifact-version")).toHaveValue("2");
+  // The run ends while the user is still here.
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (await page.request.get(`/api/conversations/${conv.id}/active-run`)).json()) as {
+            run: unknown;
+          }
+        ).run,
+      { timeout: 10_000 },
+    )
+    .toBeNull();
+  await page.waitForTimeout(500);
+  await backToChat(page);
+  // The chat shows the finished reply with its v2 card, and is not left busy: the next message goes out.
+  const reply = lastAssistant(page);
+  await expect(reply).toHaveAttribute("data-status", "complete");
+  await expect(reply).toContainText("다 고쳤어요.");
+  // One card per artifact a run touched, at the version it stored last.
+  await expect(reply.getByTestId("artifact-card")).toHaveAttribute("data-version", "2");
+  await send(page, "안녕");
+  await expect(page.getByTestId("assistant")).toHaveCount(2);
+  await expect(lastAssistant(page)).toHaveAttribute("data-status", "complete");
+  await expect(page).toHaveURL(new RegExp(`/c/${conv.id}$`));
+});
+
 test("the frame's Escape message goes back only from the frame on screen and only in its exact shape", async ({
   page,
   baseURL,

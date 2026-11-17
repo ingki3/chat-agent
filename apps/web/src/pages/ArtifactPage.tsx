@@ -4,6 +4,7 @@ import { ARTIFACT_ESCAPE_MESSAGE } from "@agentlee/shared";
 import { TopBar } from "../Shell.js";
 import { KIND_ICON, KIND_LABEL, ViewerBody, useArtifactViewer } from "../artifacts/viewer.js";
 import { VERSION_PARAM, fromOf, returningFrom } from "../artifacts/ArtifactCard.js";
+import { useFollowRun } from "../artifacts/follow-run.js";
 
 /**
  * `/a/:id` (#27): one artifact on its own page — the artifact menu, where the chat sends the user when a reply makes
@@ -33,6 +34,8 @@ export function ArtifactPage({ id }: { id: string }) {
   });
   const from = fromOf(location.state);
   const { data } = v;
+  // The reply that is still running in its conversation (it may store more versions): followed here (review #175).
+  useFollowRun(data?.conversationId, id, !v.revoked && v.owner);
   const back = from
     ? { to: from, label: from.startsWith("/shared/") ? "공유 화면으로 돌아가기" : "대화로 돌아가기" }
     : data && v.owner

@@ -403,8 +403,22 @@ function DocumentBody({ id, version }: { id: string; version: number }) {
 }
 
 /** Backticks enough to fence `text` (one more than its longest run, at least three). */
-const fenceFor = (text: string) =>
-  "`".repeat(Math.max(3, ...[...text.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+export function fenceFor(text: string): string {
+  // A loop, not Math.max(...runs): a long text has more runs than a call can take arguments (review #175).
+  let longest = 0;
+  let run = 0;
+  for (let i = 0; i < text.length; i++) {
+    run = text.charCodeAt(i) === 96 ? run + 1 : 0;
+    if (run > longest) longest = run;
+  }
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/** Code as one fenced block (the fence computed once). */
+export const fenced = (content: string, lang: string) => {
+  const fence = fenceFor(content);
+  return `${fence}${lang}\n${content}\n${fence}`;
+};
 
 /**
  * A markdown or code artifact (#172), rendered by the app with the chat's markdown renderer — the same policy as a
@@ -438,8 +452,7 @@ function TextBody({
   if (!query.data) return <div className="empty muted">불러오는 중…</div>;
   const content = query.data.content;
   const lang = language && /^[a-z0-9+#._-]+$/.test(language) ? language : "";
-  const text =
-    kind === "markdown" ? content : `${fenceFor(content)}${lang}\n${content}\n${fenceFor(content)}`;
+  const text = kind === "markdown" ? content : fenced(content, lang);
   return (
     <div className="artifact-doc" data-testid="artifact-text" data-kind={kind} data-version={version}>
       <RichText text={text} />

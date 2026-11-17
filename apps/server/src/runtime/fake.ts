@@ -32,6 +32,8 @@ import {
  *   /long <n>         n words, slowly (to try the stop button)
  *   /artifact <kind> <title>          (next lines: the content; JSON for chart, table, document)
  *   /artifact-slow <kind> <title>     the same, then 4 s more of reply after the artifact is stored
+ *   /artifact-twice <kind> <title>    (next lines: v1, a line "===", v2) creates v1, 2.5 s later stores v2 of it,
+ *                     then 1.5 s more of reply (#172 review: the artifact page follows a run that goes on)
  *   /artifact-update <id> <field>     (next lines: the new content of that field — content, chart, table, document)
  *                     real calls of our MCP tools `artifact_create` / `artifact_update` with the run's token
  *                     (needs `runTools`, as the FAKE_RUNTIME=1 server registers it; #27)
@@ -123,6 +125,19 @@ function artifactSteps(t: string): FakeStep[] | undefined {
       return s;
     }
   };
+  const twice = /^\/artifact-twice\s+(\w+)\s+(.+)$/.exec(head);
+  if (twice) {
+    const [v1 = "", v2 = ""] = body.split("\n===\n");
+    return [
+      { text: "아티팩트를 만들게요. " },
+      { call: "artifact_create", input: { kind: twice[1]!, title: twice[2]!, content: v1 } },
+      { delayMs: 2500 },
+      { text: "조금 더 고칠게요. " },
+      { call: "artifact_update", input: { artifactId: "$0.artifactId", content: v2 } },
+      { delayMs: 1500 },
+      { text: "다 고쳤어요." },
+    ];
+  }
   const created = /^\/artifact(-slow)?\s+(\w+)\s+(.+)$/.exec(head);
   if (created) {
     const slow = !!created[1];

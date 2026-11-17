@@ -4,7 +4,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import { ARTIFACT_REDACTED_NOTICE } from "@agentlee/shared";
 import { ApiError } from "../src/api.js";
-import { ViewerBody, artifactErrorText, artifactKey, type ArtifactViewer } from "../src/artifacts/viewer.js";
+import {
+  ViewerBody,
+  artifactErrorText,
+  artifactKey,
+  fenceFor,
+  fenced,
+  type ArtifactViewer,
+} from "../src/artifacts/viewer.js";
+import { splitBlocks } from "../src/chat/blocks.js";
+import { afterOf, keepAfter } from "../src/chat/after-run.js";
 import { artifactLink, fromOf, legacyPanelTarget } from "../src/artifacts/ArtifactCard.js";
 
 const viewer = (v: Partial<ArtifactViewer>) =>
@@ -166,5 +175,74 @@ describe("artifact page addresses (#172)", () => {
       expect(fromOf({ from: bad })).toBeUndefined();
     expect(fromOf(null)).toBeUndefined();
     expect(fromOf({ from: 1 })).toBeUndefined();
+  });
+});
+
+describe("code artifacts as one fenced block (review #175)", () => {
+  it("the fence is longer than any backtick run, at least three", () => {
+    expect(fenceFor("print(1)")).toBe("```");
+    expect(fenceFor("a ```` b ` c")).toBe("`````");
+    expect(fenced("x", "python")).toBe("```python\nx\n```");
+  });
+
+  it("a very large text with many backtick runs does not throw (no spread of every run into one call)", () => {
+    const content = "` ".repeat(200_000); // 400,000 bytes: within the artifact limit
+    expect(fenceFor(content)).toBe("```");
+    const many = "`".repeat(5000) + "x";
+    expect(fenceFor(many)).toHaveLength(5001);
+    const text = fenced(content, "");
+    expect(text.startsWith("```\n")).toBe(true);
+    // One block for the renderer: the fence holds the whole text.
+    expect(splitBlocks(text)).toHaveLength(1);
+  });
+
+  it("the page renders such a code artifact", () => {
+    const content = "` ".repeat(200_000);
+    const qc = new QueryClient();
+    qc.setQueryData([...artifactKey("c1"), "v", 1], { version: 1, kind: "code", content });
+    const html = render(
+      {
+        data: {
+          id: "c1",
+          conversationId: "c",
+          messageId: null,
+          runId: null,
+          kind: "code",
+          title: "코드",
+          language: null,
+          latestVersion: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          versions: [
+            {
+              version: 1,
+              contentHash: "h",
+              bytes: 400_000,
+              title: "코드",
+              language: null,
+              runId: null,
+              revertedFrom: null,
+              createdAt: 1,
+            },
+          ],
+        },
+        version: 1,
+        title: "코드",
+        owner: true,
+        revert: { isPending: false, isError: false },
+      } as never,
+      qc,
+    );
+    expect(html).toContain('data-kind="code"');
+  });
+});
+
+describe("what a run left behind while the chat was not on screen (review #175)", () => {
+  it("is kept per conversation and message for the chat screen", () => {
+    keepAfter("conv-a", "m1", { notices: [{ level: "info", code: "x", message: "알림" }] });
+    keepAfter("conv-a", "m2", { notices: [], error: { code: "e", message: "오류" } });
+    expect(Object.keys(afterOf("conv-a"))).toEqual(["m1", "m2"]);
+    expect(afterOf("conv-a").m2?.error?.code).toBe("e");
+    expect(afterOf("conv-b")).toEqual({});
   });
 });

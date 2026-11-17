@@ -39,7 +39,8 @@ import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
-import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
+import { useRunStream, type LiveReply } from "../chat/stream.js";
+import { afterOf, type AfterRun } from "../chat/after-run.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
@@ -52,9 +53,6 @@ import { FileViewContext } from "../files/context.js";
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
  * reply, edit a message and send again; follows the bottom unless the user scrolls up; connection notices.
  */
-
-/** What a finished run leaves behind for its message: notices and errors are not stored with the message. */
-type AfterRun = { notices: Notice[]; error?: { code: string; message: string } };
 
 /** Errors after which the conversation can carry on with another runtime (FR-11.8; the switch itself is #19). */
 const SWITCHABLE = new Set([
@@ -124,7 +122,8 @@ export function ChatPage() {
     },
   });
   const usable = useUsableRuntimes();
-  const [after, setAfter] = useState<Record<string, AfterRun>>({});
+  // Runs that ended while the user was on an artifact page they moved to (#172) left their notices there.
+  const [after, setAfter] = useState<Record<string, AfterRun>>(() => afterOf(id));
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const online = useOnline();
