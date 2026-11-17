@@ -17,6 +17,7 @@ import { AFTER_RUN_LIMITS, afterSize, clearAfter, keepAfter, takeAfter } from ".
 import { recoverLost, retryUntil } from "../src/artifacts/follow-run.js";
 import {
   ArtifactCard,
+  resolveCardVersion,
   artifactLink,
   fromOf,
   legacyPanelTarget,
@@ -514,13 +515,24 @@ describe("a card is a link to where it opens (review #175 5차)", () => {
     );
   };
 
-  it("an old version pins ?v=; the newest, or one not known yet, follows the newest", () => {
-    expect(card(1, 2)).toContain('href="/a/a1?v=1"');
-    expect(card(2, 2)).toContain('href="/a/a1"');
+  it("the href carries the card's own version as an intent, the same whether its details are known or not", () => {
+    expect(card(1, 2)).toContain('href="/a/a1?cv=1"');
+    expect(card(1)).toContain('href="/a/a1?cv=1"'); // still loading: the same address
+    expect(card(2, 2)).toContain('href="/a/a1?cv=2"');
     expect(card(undefined, 2)).toContain('href="/a/a1"');
-    const loading = card(1);
-    expect(loading).toContain('href="/a/a1"');
-    expect(loading).toContain('aria-busy="true"'); // a plain click waits for the details (does nothing yet)
-    expect(card(1, 2)).not.toContain("aria-busy");
+    expect(card(1)).not.toContain("aria-busy");
+  });
+
+  it("the page resolves the intent: an older version is pinned; the newest, a missing one or no answer follow the newest", () => {
+    const d = detail(2);
+    expect(resolveCardVersion("1", d)).toBe(1);
+    expect(resolveCardVersion("2", d)).toBeUndefined();
+    expect(resolveCardVersion("7", d)).toBeUndefined();
+    expect(resolveCardVersion("x", d)).toBeUndefined();
+    expect(resolveCardVersion("1", undefined)).toBeUndefined(); // the read failed
+    // A shared viewer sees only some versions: one not shown to them is not pinned.
+    expect(
+      resolveCardVersion("1", { latestVersion: 3, versions: [{ version: 2 }, { version: 3 }] }),
+    ).toBeUndefined();
   });
 });

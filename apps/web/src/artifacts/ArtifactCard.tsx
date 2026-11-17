@@ -19,11 +19,31 @@ export const artifactLink = (id: string, version?: number) =>
   version === undefined ? artifactPath(id) : `${artifactPath(id)}?${VERSION_PARAM}=${version}`;
 
 /**
- * The version a card opens: only one that really is older than the newest pins `?v=` — the newest (or not known
- * yet) opens following the newest, so a later version shows there (review #175 4차).
+ * A card's own version as an intent (review #175 6차): `/a/:id?cv=<n>`, kept apart from a real pin (`?v=`). The
+ * artifact page resolves it once it knows the versions (`resolveCardVersion`) and replaces the address.
+ */
+export const CARD_VERSION_PARAM = "cv";
+
+/** A card's link: its own version as an intent, or (no version) the page following the newest. */
+export const cardLink = (id: string, version: number | undefined) =>
+  version === undefined ? artifactPath(id) : `${artifactPath(id)}?${CARD_VERSION_PARAM}=${version}`;
+
+/**
+ * The version a card's intent pins: only one that exists and really is older than the newest — the newest opens
+ * following the newest (a later version then shows there, review #175 4차); unknown or not there: the newest.
  */
 export const pinnedVersion = (version: number | undefined, latest: number | undefined) =>
   version !== undefined && latest !== undefined && version < latest ? version : undefined;
+
+/** `?cv=` read against the versions the page was given: the version to pin, or undefined (follow the newest). */
+export function resolveCardVersion(
+  cv: string | null,
+  detail: { latestVersion: number; versions: readonly { version: number }[] } | undefined,
+): number | undefined {
+  const n = Number(cv);
+  if (!detail || !Number.isInteger(n) || !detail.versions.some((x) => x.version === n)) return undefined;
+  return pinnedVersion(n, detail.latestVersion);
+}
 
 /** Where the artifact page was opened from (navigation state): the page it goes back to. */
 export type ArtifactFrom = { from?: string };
@@ -88,18 +108,16 @@ export function useAutoShow(
   }, [live, conversationId, navigate]);
 }
 
-/** A plain left click (no modifier): the only one the card may handle itself; others get the link's own behaviour. */
+/** A plain left click (no modifier): opened in this tab, so the card is where the focus returns. */
 const plainClick = (e: React.MouseEvent) =>
   e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
 
 /**
  * A card in the conversation for an artifact the reply made or changed (`artifact_ref`, set by the server from
- * what our tools stored for that run). A link to the artifact page (review #175 5차: new tab, middle click, copy
- * address work): at the card's version when that is known to be older than the newest, else following the newest.
- * Until the card knows the newest version, a plain click does nothing (review #175 5차): opening it later, once the
- * answer came, could fire after the user had moved on — even back to this same conversation, where a navigation
- * that was never committed (a React transition) leaves the card mounted and the address as it was. A modifier or
- * middle click still opens the link (following the newest).
+ * what our tools stored for that run). A plain link to the artifact page (review #175 5·6차): its href carries the
+ * card's own version as an intent (`?cv=`), which the page resolves — older than the newest: that version; the
+ * newest: following the newest. Every way of opening it (click, Enter, new tab, middle click, a copied address)
+ * goes to the same place, and nothing is intercepted or deferred.
  */
 export function ArtifactCard({ id, version }: { id: string; version: number | undefined }) {
   const { data, error } = useQuery({
@@ -130,15 +148,10 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
       className="art-card"
       data-testid="artifact-card"
       data-version={shown}
-      // Known: exactly where a click goes. Not known yet: following the newest.
-      to={artifactLink(id, pinnedVersion(version, data?.latestVersion))}
+      to={cardLink(id, version)}
       state={state}
-      aria-busy={data ? undefined : true}
       onClick={(e) => {
-        if (!plainClick(e)) return; // new tab or window: the link as it is
-        // Its own version may be older than the newest, which is not known yet: not opened until it is.
-        if (!data && version !== undefined) return e.preventDefault();
-        opener = { id, version };
+        if (plainClick(e)) opener = { id, version };
       }}
     >
       <span className="art-icon" aria-hidden>
