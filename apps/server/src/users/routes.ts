@@ -12,7 +12,7 @@ import {
 } from "@agentlee/shared";
 import { SKILL_CATALOGUE } from "@agentlee/mcp-tools/skills";
 import { hashPassword } from "../auth/passwords.js";
-import { deny } from "../auth/plugin.js";
+import { deny, passwordChangePending } from "../auth/plugin.js";
 import { temporaryPassword, toAdminUser, type UserRow, type UserStore } from "../auth/users.js";
 import { RunAccessDenied } from "../connections/access.js";
 import { isFinanceSkill, skillPermitted, type McpService } from "../mcp/service.js";
@@ -36,7 +36,7 @@ export type UserAdminOptions = {
 function isStillAdmin(users: UserStore, req: FastifyRequest): boolean {
   const token = req.ctx.sessionToken;
   const u = token ? users.sessionUser(token) : undefined;
-  return !!u && u.id === req.ctx.user?.id && u.role === "admin" && !u.mustChangePassword;
+  return !!u && u.id === req.ctx.user?.id && u.role === "admin" && !passwordChangePending(req, u);
 }
 
 export function registerUserAdmin(app: FastifyInstance, users: UserStore, opts: UserAdminOptions = {}): void {

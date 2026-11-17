@@ -77,6 +77,9 @@ type Obj = Record<string, unknown>;
 /** Event names the application writes (the `msg` of a record). Add new events here — free text is rejected. */
 export const LOG_EVENTS = [
   "error",
+  // A session started from a verified Cloudflare Access login (#178): the user id only — never the JWT, a cookie,
+  // a header or the email.
+  "auth.access_login",
   "request.error",
   "run.finished",
   "tool.finished",

@@ -1,12 +1,12 @@
 import net from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { CSRF_HEADER, type AuthError } from "@agentlee/shared";
+import { CSRF_HEADER, type AuthError, type AuthUser } from "@agentlee/shared";
 import type { Config } from "../config.js";
 import { isApiRequest, routerPath } from "../paths.js";
 import { knownSecrets } from "../secrets/known.js";
 import type { AccessVerifier } from "./access-jwt.js";
 import "./context.js";
-import type { UserStore } from "./users.js";
+import { toAuthUser, type UserRow, type UserStore } from "./users.js";
 
 export const SESSION_COOKIE = "al_session";
 const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/;
@@ -153,11 +153,26 @@ export function registerSession(app: FastifyInstance, users: UserStore | undefin
     if (req.ctx.emailMismatch) return deny(reply, 403, "access_email_mismatch");
     const user = req.ctx.user;
     if (!user) return deny(reply, 401, "unauthenticated");
-    if (user.mustChangePassword && !cfg.allowPendingPassword)
+    if (passwordChangePending(req, user) && !cfg.allowPendingPassword)
       return deny(reply, 403, "password_change_required");
     if (rule === "admin" && user.role !== "admin") return deny(reply, 403, "forbidden");
   });
 }
+
+/**
+ * A temporary password must be replaced before the app can be used (FR-1.5) — but only where the password is what
+ * signed the user in. Through Cloudflare Access (#178) every request carries a verified Access login whose email is
+ * the session's own (`registerSession` refuses any other pairing), so the password plays no part there: the flag
+ * stays for the next local login and is not enforced on Access requests.
+ */
+export const passwordChangePending = (req: FastifyRequest, user: Pick<UserRow, "mustChangePassword">) =>
+  user.mustChangePassword && req.ctx.accessEmail === undefined;
+
+/** The signed-in user as the client sees it: the password-change flag as it applies to this request. */
+export const authUserFor = (req: FastifyRequest, user: UserRow): AuthUser => ({
+  ...toAuthUser(user),
+  mustChangePassword: passwordChangePending(req, user),
+});
 
 export function sessionCookie(req: FastifyRequest, token: string, maxAgeSec: number): string {
   return [

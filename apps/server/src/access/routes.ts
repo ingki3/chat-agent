@@ -9,8 +9,15 @@ import {
   type AdminEmailConfirmState,
 } from "@agentlee/shared";
 import type { Config } from "../config.js";
-import { deny, readCookie, SESSION_COOKIE, sessionCookie } from "../auth/plugin.js";
-import { SESSION_TTL_MS, toAuthUser, type UserStore } from "../auth/users.js";
+import {
+  authUserFor,
+  deny,
+  passwordChangePending,
+  readCookie,
+  SESSION_COOKIE,
+  sessionCookie,
+} from "../auth/plugin.js";
+import { SESSION_TTL_MS, type UserStore } from "../auth/users.js";
 import { AccessSyncError, type AccessSyncService } from "./service.js";
 
 declare module "fastify" {
@@ -33,7 +40,7 @@ const refuse = (reply: FastifyReply, e: unknown) => {
 function stillAdmin(users: UserStore, req: FastifyRequest): boolean {
   const token = req.ctx.sessionToken;
   const u = token ? users.sessionUser(token) : undefined;
-  return !!u && u.id === req.ctx.user?.id && u.role === "admin" && !u.mustChangePassword;
+  return !!u && u.id === req.ctx.user?.id && u.role === "admin" && !passwordChangePending(req, u);
 }
 
 /**
@@ -158,7 +165,7 @@ export function registerAccessRoutes(
         reply,
         AuthState.parse({
           setupRequired: false,
-          user: toAuthUser(user),
+          user: authUserFor(req, user),
           accessEmail: req.ctx.accessEmail ?? null,
           adminEmail: config.adminEmail,
         }),
