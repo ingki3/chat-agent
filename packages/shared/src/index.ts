@@ -239,6 +239,8 @@ export type AuthError =
   | "access_denied"
   | "access_not_configured"
   | "access_email_mismatch"
+  /** Passed Access, but no active app account has that email (#178): no session, the blocked screen. */
+  | "access_no_account"
   | "csrf"
   | "unauthenticated"
   | "forbidden"

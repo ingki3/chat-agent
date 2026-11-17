@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tan
 import { BrowserRouter, Navigate, Route, Routes, useNavigate, useParams } from "react-router";
 import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
 import { access, auth, setUnauthenticatedHandler } from "./api.js";
-import { AdminEmailConfirm, Card, ChangePassword, Login, Setup } from "./auth-screens.js";
+import { AccessLogin, AdminEmailConfirm, Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ArtifactsPage } from "./pages/ArtifactsPage.js";
@@ -108,8 +108,8 @@ function AuthGate() {
 }
 
 /**
- * Signed out through Access: the login screen — unless this browser is the admin's confirming a pending email change
- * (FR-15.7, #36): the old session with an Access login of the new email.
+ * Signed out through Access: single sign-on with the Access email (#178) — unless this browser is the admin's
+ * confirming a pending email change (FR-15.7, #36): the old session with an Access login of the new email.
  */
 function OuterLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
   const q = useQuery({
@@ -120,7 +120,7 @@ function OuterLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState
   if (q.isPending) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
   if (q.data?.ready && q.data.oldEmail && q.data.newEmail)
     return <AdminEmailConfirm oldEmail={q.data.oldEmail} newEmail={q.data.newEmail} onDone={onDone} />;
-  return <Login state={state} onDone={onDone} />;
+  return <AccessLogin state={state} onDone={onDone} />;
 }
 
 function AccountData({ children }: { children: ReactNode }) {

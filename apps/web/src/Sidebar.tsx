@@ -13,6 +13,7 @@ import {
   usage,
   USAGE_KEY,
   MEMORY_PROPOSALS_KEY,
+  signOutOfAccess,
 } from "./api.js";
 import { ShareDialog, when } from "./shares/ShareDialog.js";
 import { unsubscribeOnSignOut } from "./push.js";
@@ -60,7 +61,11 @@ export function Sidebar({
   const signOut = async () => {
     // This browser stops getting this account's pushes (the server drops the device with the session too).
     await unsubscribeOnSignOut();
-    props.onSignedOut(await auth.logout());
+    const signedOut = await auth.logout();
+    // Through Cloudflare Access (#178) the app session alone is not enough: Access would sign the user straight
+    // back in. End the Access session too (Cloudflare's logout page).
+    if (signedOut.accessEmail) return signOutOfAccess();
+    props.onSignedOut(signedOut);
   };
 
   return (
