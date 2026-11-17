@@ -148,6 +148,36 @@ describe("skillSendGate: the Serper key in its header only (#171)", () => {
     expect(approves([head({ length: 0, key: "not-the-key" })])).toEqual([true]);
   });
 
+  it("review #174 round 2: folded lines and malformed field names are refused — the key never hides in a fold", () => {
+    const raw = (fields: string) =>
+      JSON.stringify({
+        host: HOST,
+        data: `POST /search HTTP/1.1\r\nHost: ${HOST}\r\n${fields}Content-Length: 0\r\n\r\n`,
+      });
+    const refused: [string, string][] = [
+      // obs-fold: the key is part of X-Debug's value to any parser, not a header of its own.
+      ["space fold", `X-Debug: prefix\r\n X-API-KEY: ${KEY}\r\n`],
+      ["tab fold", `X-Debug: prefix\r\n\tX-API-KEY: ${KEY}\r\n`],
+      ["fold beside the real header", `X-API-KEY: ${KEY}\r\nX-Debug: prefix\r\n X-API-KEY: ${KEY}\r\n`],
+      ["a fold without any secret", `X-Debug: prefix\r\n more\r\n`],
+      ["space before the colon", `X-API-KEY : ${KEY}\r\n`],
+      ["tab before the colon", `X-API-KEY\t: ${KEY}\r\n`],
+      ["leading space in the name", ` X-API-KEY: ${KEY}\r\n`],
+      ["space inside the name", `X API-KEY: ${KEY}\r\n`],
+      ["separator in the name", `X-API(KEY): ${KEY}\r\n`],
+      ["non-ASCII in the name", `X-API-KEYé: ${KEY}\r\n`],
+      ["empty name", `: ${KEY}\r\n`],
+      ["no colon", `X-API-KEY ${KEY}\r\n`],
+      ["bare CR inside a line", `X-Debug: a\rX-API-KEY: ${KEY}\r\n`],
+      ["bare LF inside a line", `X-Debug: a\nX-API-KEY: ${KEY}\r\n`],
+      ["space before the colon of Content-Length", `Content-Length : 5\r\n`],
+    ];
+    for (const [why, fields] of refused) expect(approves([raw(fields)]), why).toEqual([false]);
+    // Controls: the plain header line, and OWS around the value.
+    expect(approves([raw(`X-API-KEY: ${KEY}\r\n`)])).toEqual([true]);
+    expect(approves([raw(`x-api-key:\t${KEY} \r\n`)])).toEqual([true]);
+  });
+
   it("other secrets in the body are refused — also a non-ASCII one python writes as \\uXXXX escapes", () => {
     expect(approves(search({ q: `뉴스 ${TOKEN}` })).at(-1)).toBe(false);
     expect(approves(search({ q: TOKEN.slice(5, 21) })).at(-1)).toBe(false); // a 16-character window
@@ -689,11 +719,16 @@ async function connectProxy(port: () => number) {
 const TUNNEL_PROBE = `
 import http.client, json, os, sys
 proxy_port, q = int(sys.argv[1]), sys.argv[2]
+mode = sys.argv[3] if len(sys.argv) > 3 else ""
+key = os.environ["SERPER_API_KEY"]
+headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+if mode in ("fold", "tabfold"):
+    # http.client accepts an obs-fold in a value (CRLF + SP/HTAB): the key rides in X-Debug's value.
+    headers = {"X-Debug": "prefix\\r\\n" + (" " if mode == "fold" else "\\t") + "X-API-KEY: " + key, "Content-Type": "application/json"}
 conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
 conn.set_tunnel("google.serper.dev", 443)
 try:
-    conn.request("POST", "/search", body=json.dumps({"q": q}).encode(),
-        headers={"X-API-KEY": os.environ["SERPER_API_KEY"], "Content-Type": "application/json"})
+    conn.request("POST", "/search", body=json.dumps({"q": q}).encode(), headers=headers)
     r = conn.getresponse()
     print(json.dumps({"ok": True, "status": r.status, "body": r.read().decode()}))
 except OSError as e:
@@ -767,6 +802,18 @@ describe.skipIf(!PYTHON)("through a CONNECT proxy, as in production (#174 review
     expect(g2.denied).toBe(true);
     expect(bad.code).toBe(1);
     expect(got).toEqual([]);
+    // Review #174 round 2 repro: the key folded into another header's value, as http.client really sends it.
+    for (const mode of ["fold", "tabfold"]) {
+      const g3 = skillSendGate(declared, {}, ENV);
+      const folded = await run([path.join(dir, "probe.py"), String(proxy.port), "ok", mode], {}, g3);
+      expect(order(folded.asked), mode).toEqual(["CONNECT", "head"]);
+      expect(folded.asked[1]!.data, mode).toContain(
+        `X-Debug: prefix\r\n${mode === "fold" ? " " : "\t"}X-API-KEY: ${KEY}\r\n`,
+      );
+      expect(g3.denied, mode).toBe(true);
+      expect(folded.code, mode).toBe(1);
+      expect(got, mode).toEqual([]);
+    }
   });
 
   /** A CA and a google.serper.dev certificate it signed (openssl), so the unmodified script's TLS verifies. */

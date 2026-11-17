@@ -236,6 +236,9 @@ export const SKILL_SENDS_MAX = 16;
 /** One request the network boot is about to send: the connection's host and the exact bytes (Latin-1 text). */
 const SendRequest = z.strictObject({ host: z.string().min(1).max(253), data: z.string() });
 
+/** One header line: a token field name (RFC 9110 `tchar`s), the colon right after it, the value (no line folding). */
+const HEADER_FIELD = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):([^\r\n]*)$/;
+
 /** A request body one networked skill call may send at most (bytes; Serper `/resolve` posts a whole result page). */
 export const SKILL_BODY_MAX = 192 * 1024;
 
@@ -302,11 +305,21 @@ export function skillSendGate(
     const lines = head.split("\r\n");
     const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(lines[0]!);
     if (!m) return false;
+    // Every header line must be one field (RFC 9110): a token name, the colon right after it (no whitespace before
+    // it), no folded continuation line (obs-fold, a line starting with SP or HTAB — review #174 round 2: a fold
+    // `X-Debug: x\r\n X-API-KEY: <key>` is the value of X-Debug to a parser, not a header of its own). Names are
+    // compared as they are, without any trimming.
     let headers = lines.slice(1);
+    const fields: { name: string; value: string }[] = [];
+    for (const h of headers) {
+      const f = HEADER_FIELD.exec(h);
+      if (!f) return false;
+      fields.push({ name: f[1]!.toLowerCase(), value: f[2]!.replace(/^[ \t]+|[ \t]+$/g, "") });
+    }
     // The body: exactly what Content-Length says, part of it (or all) possibly in this send already.
-    const lengths = headers.filter((h) => /^content-length\s*:/i.test(h));
-    if (headers.some((h) => /^transfer-encoding\s*:/i.test(h)) || lengths.length > 1) return false;
-    const length = lengths.length ? /^content-length\s*:\s*(\d{1,9})\s*$/i.exec(lengths[0]!)?.[1] : "0";
+    const lengths = fields.filter((f) => f.name === "content-length");
+    if (fields.some((f) => f.name === "transfer-encoding") || lengths.length > 1) return false;
+    const length = lengths.length ? /^(\d{1,9})$/.exec(lengths[0]!.value)?.[1] : "0";
     if (length === undefined) return false;
     const announced = Number(length);
     if (announced > SKILL_BODY_MAX || inline.length > announced) return false;
@@ -318,14 +331,10 @@ export function skillSendGate(
       } else {
         // The exception is for the one header of that name only: two of them (whatever their values) are refused.
         const name = p.header.toLowerCase();
-        const named = headers.flatMap((h, j) => {
-          const c = h.indexOf(":");
-          return c > 0 && h.slice(0, c).trim().toLowerCase() === name ? [j] : [];
-        });
+        const named = fields.flatMap((f, j) => (f.name === name ? [j] : []));
         if (named.length > 1) return false;
         const i = named[0];
-        if (i !== undefined && headers[i]!.slice(headers[i]!.indexOf(":") + 1).trim() === p.value)
-          headers = headers.filter((_, j) => j !== i);
+        if (i !== undefined && fields[i]!.value === p.value) headers = headers.filter((_, j) => j !== i);
       }
     }
     data = [`${m[1]} ${target} ${m[3]}`, ...headers].join("\r\n") + (eoh < 0 ? "" : "\r\n\r\n");
