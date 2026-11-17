@@ -16,7 +16,7 @@ import {
 import type { Db } from "../db/client.js";
 import type { SettingsStore } from "../db/settings-store.js";
 import { conversations, messages, runs } from "../db/schema.js";
-import { FileLimitError, type FileRow, type FileStore } from "../files/store.js";
+import { FileAddCancelledError, FileLimitError, type FileRow, type FileStore } from "../files/store.js";
 import { removeTree, writeInputCopy } from "../python/service.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { storagePaths } from "../storage/paths.js";
@@ -78,6 +78,8 @@ export type AudioServiceOptions = {
   };
   /** How often a running call checks the run, the switch and its folder (tests lower it). */
   watchMs?: number;
+  /** Tests only: replaces the working-folder measurement. */
+  measure?: typeof folderUsage;
   /** Reads the stored transcript's text in the background (#48), so `file_read` has it at once. */
   extract?: (fileId: string) => void;
   slots?: { total: number; perUser: number };
@@ -260,22 +262,35 @@ export class AudioTranscriber {
     this.stop.signal.addEventListener("abort", onShutdown, { once: true });
     o.signal?.addEventListener("abort", onCaller, { once: true });
     let fallbackOn: (() => boolean) | undefined;
-    const watch = setInterval(() => {
-      // Never throws out of the timer: any failure to check stops this call only.
+    // The working folder: over its size or entry budget — or not measurable at all (a folder made unreadable) —
+    // stops the call. Fail closed: what cannot be measured cannot be bounded.
+    const measure = this.opts.measure ?? folderUsage;
+    const folderOk = () => {
+      if (!workdir) return true;
+      try {
+        const u = measure(workdir, AUDIO_LIMITS.workBytes, AUDIO_LIMITS.workEntries);
+        return !u.blocked && u.bytes <= AUDIO_LIMITS.workBytes && u.entries <= AUDIO_LIMITS.workEntries;
+      } catch {
+        return false;
+      }
+    };
+    const look = () => {
+      if (why) return;
       try {
         if (!alive()) return halt("audio_cancelled");
         if (fallbackOn && !fallbackOn()) return halt("audio_failed");
-        if (workdir && folderUsage(workdir, AUDIO_LIMITS.workBytes, 100_000).bytes > AUDIO_LIMITS.workBytes)
-          return halt("audio_disk_limit");
       } catch {
-        halt("audio_cancelled");
+        return halt("audio_cancelled");
       }
-    }, this.opts.watchMs ?? WATCH_MS);
+      if (!folderOk()) halt("audio_disk_limit");
+    };
+    // Never throws out of the timer: any failure to check stops this call only.
+    const watch = setInterval(look, this.opts.watchMs ?? WATCH_MS);
     const ctx: CallContext = {
       signal: stop.signal,
+      // After every step too: a folder that went over between two looks is still over.
       check: () => {
-        if (!why && !alive()) halt("audio_cancelled");
-        if (!why && fallbackOn && !fallbackOn()) halt("audio_failed");
+        look();
         if (why) throw new AudioError(why);
       },
       fallbackPhase: (on) => (fallbackOn = on),
@@ -363,6 +378,8 @@ export class AudioTranscriber {
       // From here on the switch is watched too: turned off, the request in flight is aborted.
       ctx.fallbackPhase(() => sw.enabled() && (this.opts.fallback.allowed?.(scope) ?? true));
       words = await this.viaOpenRouter(client, job, ctx);
+      // Every piece is back: the switch no longer matters for storing what was already received.
+      ctx.fallbackPhase(() => true);
       stt = "openrouter";
     }
 
@@ -394,12 +411,20 @@ export class AudioTranscriber {
     };
     // Last look before anything is stored: the run may have ended meanwhile.
     ctx.check();
-    const file = await this.store(store, scope, messageId, f, segments, {
-      durationSeconds: converted.seconds,
-      speakers: merged.speakers,
-      external,
-      notice: AUDIO_EXTERNAL_NOTICE,
-    });
+    const file = await this.store(
+      store,
+      scope,
+      messageId,
+      f,
+      segments,
+      {
+        durationSeconds: converted.seconds,
+        speakers: merged.speakers,
+        external,
+        notice: AUDIO_EXTERNAL_NOTICE,
+      },
+      ctx,
+    );
     if (file) {
       out.transcriptTruncated = file.truncated;
       out.transcriptFile = { fileId: file.fileId, name: file.name, bytes: file.bytes, url: file.url };
@@ -456,6 +481,7 @@ export class AudioTranscriber {
     f: FileRow,
     segments: readonly TranscriptSegment[],
     meta: { durationSeconds: number; speakers: number; external: boolean; notice: string },
+    ctx: CallContext,
   ): Promise<(AudioFileOut & { truncated: boolean }) | undefined> {
     const base = f.name.replace(/\.[^.]*$/, "") || "audio";
     let text = transcriptMarkdown(base, segments, meta);
@@ -483,6 +509,16 @@ export class AudioTranscriber {
         bytes: data.length,
         sha256: crypto.createHash("sha256").update(data).digest("hex"),
         tmp,
+        // Inside the file-write lock (it may have waited behind a backup): the run must still be open, the user
+        // still allowed — otherwise nothing is stored.
+        guard: () => {
+          try {
+            ctx.check();
+            return true;
+          } catch {
+            return false;
+          }
+        },
       });
       this.opts.extract?.(row.id);
       return {
@@ -494,6 +530,7 @@ export class AudioTranscriber {
       };
     } catch (e) {
       if (e instanceof FileLimitError) return undefined;
+      if (e instanceof FileAddCancelledError) throw new AudioError("audio_cancelled");
       if ((e as { code?: unknown }).code === "SQLITE_CONSTRAINT_FOREIGNKEY")
         throw new AudioError("audio_not_allowed");
       throw e;

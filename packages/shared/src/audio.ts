@@ -31,6 +31,8 @@ export const AUDIO_LIMITS = {
    * python's temp files) — measured while it runs; over it, the call stops (`audio_disk_limit`).
    */
   workBytes: 1024 * 1024 * 1024,
+  /** Entries (files and folders) that working folder may hold. */
+  workEntries: 10_000,
   /** Free space the data volume must have before a call starts. */
   minFreeBytes: 2 * 1024 * 1024 * 1024,
   /** Speakers the diarizer can tell apart (Nemotron-3-Diarization). */

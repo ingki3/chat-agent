@@ -47,7 +47,12 @@ import {
   type Segment,
   type SpeakerTurn,
 } from "../src/audio/runner.js";
-import { AudioFallbackSwitch, AudioTranscriber, makeAudioWorkdir } from "../src/audio/service.js";
+import {
+  AudioFallbackSwitch,
+  AudioTranscriber,
+  makeAudioWorkdir,
+  type AudioServiceOptions,
+} from "../src/audio/service.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
 import { buildProfile } from "../src/isolation/sandbox.js";
@@ -627,10 +632,135 @@ describe("audio_transcribe: a call (#173)", () => {
     expect(out).toMatchObject({ segmentsTruncated: false, transcriptTruncated: false });
     const segs = segmentsOf(out);
     expect(segs.length).toBeGreaterThan(1);
-    expect(segs.map((x) => x.text).join(" ")).toBe(words);
+    // Exact slices: joined with nothing between them they are the original text.
+    expect(segs.map((x) => x.text).join("")).toBe(words);
     const tf = out.transcriptFile as { fileId: string };
     const stored = fs.readFileSync(t.app.files!.pathOf(t.app.files!.get(tf.fileId)!), "utf8");
     expect(stored).toContain("w699");
+  });
+
+  it("a working folder that cannot be measured, or holds too many entries, stops the call (review 2)", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    const mk = (measure: AudioServiceOptions["measure"], watchMs: number, runner: AudioRunner) =>
+      new AudioTranscriber({
+        db: t.db,
+        dataDir: t.dataDir,
+        files: () => t.app.files,
+        runner,
+        state: AVAILABLE,
+        fallback: { switch: new AudioFallbackSwitch(memorySettings()) },
+        watchMs,
+        ...(measure ? { measure } : {}),
+      });
+    // An EACCES while listing (folderUsage reports `blocked`), during a running step: the watch stops it.
+    const h1 = scripted({ words: "hang" });
+    expect(
+      await mk(() => ({ bytes: 0, entries: 1, blocked: h1.calls.transcribe > 0 }), 10, h1.runner).run(scope, {
+        fileId: file.id,
+      }),
+    ).toEqual({ ok: false, code: "audio_disk_limit" });
+    expect(h1.calls.aborted).toBe(1);
+    // Too many entries.
+    const h2 = scripted({ words: "hang" });
+    expect(
+      await mk(
+        () => ({ bytes: 0, entries: AUDIO_LIMITS.workEntries + 1, blocked: false }),
+        10,
+        h2.runner,
+      ).run(scope, {
+        fileId: file.id,
+      }),
+    ).toEqual({ ok: false, code: "audio_disk_limit" });
+    // The measurement itself throws.
+    const h3 = scripted({ words: "hang" });
+    expect(
+      await mk(
+        () => {
+          throw new Error("EACCES");
+        },
+        10,
+        h3.runner,
+      ).run(scope, { fileId: file.id }),
+    ).toEqual({ ok: false, code: "audio_disk_limit" });
+    // No watch tick at all (a long interval): the measurement at the end of a step still catches it, and nothing
+    // is stored.
+    let overAfterConvert = false;
+    const s = scripted();
+    const runner: AudioRunner = {
+      ...s.runner,
+      convert: async (job, signal) => {
+        const r = await s.runner.convert(job, signal);
+        overAfterConvert = true;
+        return r;
+      },
+    };
+    const before = t.app.files!.list(c.id).length;
+    expect(
+      await mk(
+        () => ({ bytes: overAfterConvert ? AUDIO_LIMITS.workBytes + 1 : 0, entries: 1, blocked: false }),
+        1_000_000,
+        runner,
+      ).run(scope, { fileId: file.id }),
+    ).toEqual({ ok: false, code: "audio_disk_limit" });
+    expect(s.calls.transcribe).toBe(0);
+    expect(t.app.files!.list(c.id)).toHaveLength(before);
+    // And for real: an unreadable folder inside the working folder (folderUsage → blocked).
+    const h5 = scripted({ words: "hang" });
+    const real: AudioRunner = {
+      ...h5.runner,
+      transcribe: async (job, signal) => {
+        const locked = path.join(job.workdir, "out", "locked");
+        fs.mkdirSync(locked);
+        fs.chmodSync(locked, 0o000);
+        return h5.runner.transcribe(job, signal);
+      },
+    };
+    expect(await mk(undefined, 10, real).run(scope, { fileId: file.id })).toEqual({
+      ok: false,
+      code: "audio_disk_limit",
+    });
+    expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
+  });
+
+  it("an interrupt while the transcript waits for the file-write lock (a backup): nothing is stored (review 2)", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    const before = t.app.files!.list(c.id).length;
+    let release!: () => void;
+    let held!: () => void;
+    const holding = new Promise<void>((r) => (held = r));
+    // A backup holds the lock.
+    const backup = t.app.fileWrites.exclusive(async () => {
+      held();
+      await new Promise<void>((r) => (release = r));
+    });
+    await holding;
+    // The watch is slow here: only the guard inside the lock can catch the run ending.
+    const svc = new AudioTranscriber({
+      db: t.db,
+      dataDir: t.dataDir,
+      files: () => t.app.files,
+      runner: scripted().runner,
+      state: AVAILABLE,
+      fallback: { switch: new AudioFallbackSwitch(memorySettings()) },
+      watchMs: 1_000_000,
+    });
+    const p = svc.run(scope, { fileId: file.id });
+    // Everything up to the store is instant; the call is now waiting for the lock.
+    await new Promise((r) => setTimeout(r, 200));
+    t.db.$client.prepare("UPDATE runs SET ended_at = 1 WHERE id = ?").run(scope.runId);
+    release();
+    await backup;
+    expect(await p).toEqual({ ok: false, code: "audio_cancelled" });
+    expect(t.app.files!.list(c.id)).toHaveLength(before);
+    // No temp file left behind either.
+    expect(fs.readdirSync(path.join(t.dataDir, "uploads-tmp"))).toEqual([]);
+    expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
   });
 
   it("the working folder over its budget stops the call (audio_disk_limit)", async () => {
@@ -1037,13 +1167,51 @@ describe("audio_transcribe: merging speaker turns and words (#173)", () => {
     const parts = splitLong([{ speaker: "speaker_1", start: 0, end: 60, text: words }], 40);
     expect(parts.length).toBeGreaterThan(1);
     for (const p of parts) expect(Array.from(p.text).length).toBeLessThanOrEqual(40);
-    expect(parts.map((p) => p.text).join(" ")).toBe(words);
+    expect(parts.map((p) => p.text).join("")).toBe(words);
     expect(parts[0]!.start).toBe(0);
     expect(parts.at(-1)!.end).toBe(60);
     for (let i = 1; i < parts.length; i++) expect(parts[i]!.start).toBeCloseTo(parts[i - 1]!.end, 0);
     // No space at all: hard split by characters, still whole.
     const solid = splitLong([{ speaker: null, start: 0, end: 1, text: "가".repeat(10) }], 4);
     expect(solid.map((p) => p.text)).toEqual(["가가가가", "가가가가", "가가"]);
+  });
+
+  it("splitLong keeps every whitespace character — a full-width space, repeated spaces at the boundary (review 2)", () => {
+    const max = AUDIO_LIMITS.segmentChars;
+    for (const text of [
+      `${"가".repeat(max - 1)}\u3000${"나".repeat(10)}`,
+      `${"가".repeat(max - 2)}   ${"나".repeat(10)}`,
+      `  ${"가".repeat(max + 5)}  `,
+      `${"가 ".repeat(max)}\t\n끝`,
+    ]) {
+      const parts = splitLong([{ speaker: null, start: 0, end: 10, text }], max);
+      expect(parts.map((p) => p.text).join("")).toBe(text);
+      for (const p of parts) expect(Array.from(p.text).length).toBeLessThanOrEqual(max);
+    }
+    // The full-width space ends the first piece (it is a separator), and stays with it.
+    const fw = splitLong(
+      [{ speaker: null, start: 0, end: 10, text: `${"가".repeat(max - 1)}\u3000${"나".repeat(10)}` }],
+      max,
+    );
+    expect(fw.map((p) => Array.from(p.text).length)).toEqual([max, 10]);
+    expect(fw[0]!.text.endsWith("\u3000")).toBe(true);
+  });
+
+  it("splitLong is linear: 4× the text without spaces takes ~4× the time, not 16× (review 2)", () => {
+    const time = (n: number) => {
+      const seg = [{ speaker: null, start: 0, end: 1, text: "가".repeat(n) }];
+      splitLong(seg, AUDIO_LIMITS.segmentChars); // warm
+      const t0 = performance.now();
+      const parts = splitLong(seg, AUDIO_LIMITS.segmentChars);
+      const ms = performance.now() - t0;
+      expect(parts.length).toBe(Math.ceil(n / AUDIO_LIMITS.segmentChars));
+      return ms;
+    };
+    const small = Math.max(time(500_000), 1);
+    const big = time(2_000_000);
+    // Quadratic was 206 ms → 3,427 ms (16.6×) here; linear is about 4×. Generous for a loaded machine.
+    expect(big / small).toBeLessThan(10);
+    expect(big).toBeLessThan(2_000);
   });
 
   it("maxSpeakers folds the rarest voices into the nearest kept speaker", () => {

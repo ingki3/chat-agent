@@ -95,12 +95,15 @@ export function mergeTranscript(
 }
 
 /**
- * Every segment longer than `maxChars` (code points) split into consecutive pieces of the same speaker — at the
- * last space before the limit when there is one — with times shared out by position in the text. No character is
- * lost: the pieces joined back with their spaces are the original text.
+ * Every segment longer than `maxChars` (code points) split into consecutive pieces of the same speaker, with times
+ * shared out by position in the text. A piece ends right after the last whitespace character (any — a full-width
+ * space too) inside its own window when there is one, else at the limit. Pieces are exact slices: joined with no
+ * separator they are the original text, character for character (whitespace included — nothing is trimmed). The
+ * search looks only inside the current window, so the work is linear in the text's length.
  */
 export function splitLong(segments: readonly TranscriptSegment[], maxChars: number): TranscriptSegment[] {
   const out: TranscriptSegment[] = [];
+  const blank = /\s/u;
   for (const s of segments) {
     const cps = Array.from(s.text);
     if (cps.length <= maxChars) {
@@ -111,20 +114,19 @@ export function splitLong(segments: readonly TranscriptSegment[], maxChars: numb
     let at = 0;
     while (at < cps.length) {
       let end = Math.min(cps.length, at + maxChars);
-      if (end < cps.length) {
-        const space = cps.lastIndexOf(" ", end);
-        if (space > at) end = space;
-      }
-      const text = cps.slice(at, end).join("").trim();
-      if (text)
-        out.push({
-          speaker: s.speaker,
-          start: s.start + (span * at) / cps.length,
-          end: s.start + (span * end) / cps.length,
-          text,
-        });
+      if (end < cps.length)
+        for (let i = end - 1; i > at; i--)
+          if (blank.test(cps[i]!)) {
+            end = i + 1;
+            break;
+          }
+      out.push({
+        speaker: s.speaker,
+        start: s.start + (span * at) / cps.length,
+        end: s.start + (span * end) / cps.length,
+        text: cps.slice(at, end).join(""),
+      });
       at = end;
-      while (at < cps.length && cps[at] === " ") at++;
     }
   }
   return out;
