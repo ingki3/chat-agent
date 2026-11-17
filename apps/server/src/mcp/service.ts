@@ -13,6 +13,7 @@ import {
 import {
   ALWAYS_ON_SKILLS,
   GOOGLE_NEWS_SKILL,
+  SEARCH_GOOGLE_SKILL,
   SELFTEST_SKILL,
   SKILL_CATALOGUE,
   type BundledSkill,
@@ -235,15 +236,23 @@ export const SKILL_SENDS_MAX = 16;
 /** One request the network boot is about to send: the connection's host and the exact bytes (Latin-1 text). */
 const SendRequest = z.strictObject({ host: z.string().min(1).max(253), data: z.string() });
 
+/** A request body one networked skill call may send at most (bytes; Serper `/resolve` posts a whole result page). */
+export const SKILL_BODY_MAX = 192 * 1024;
+
 /**
  * The per-send approval of one networked skill call (#129, the finance raw approach for skills): the network boot
  * hands over every request exactly as it goes on the wire — after the script composed and urllib encoded it, the
  * request line, every header, the body; and the proxy CONNECT — and sends it only on `true`.
  * - the connection's host must be one of the skill's hosts;
- * - the skill's own declared secret is allowed at its declared place only: the first exact `param=<value>` pair of
- *   the request target, on its declared host (Alpha Vantage `apikey=`) — once, like finance's DART exception;
+ * - the skill's own declared secret is allowed at its declared place only, on its declared host, once: the first
+ *   exact `param=<value>` pair of the request target (Alpha Vantage `apikey=`), or the first header line
+ *   `<header>: <value>` of the request head, name in any case (Serper `X-API-KEY`, #171);
  * - everything else is checked by the one egress predicate (`carriesSecret`, incl. the UTF-8 view of the bytes)
  *   against the registry and every `.env` skill secret.
+ * - a body (#171: http.client sends it with a send of its own after the head) must be announced by the head's one
+ *   `Content-Length` (no `Transfer-Encoding`) and come whole in the very next send, on the same host, at most
+ *   `SKILL_BODY_MAX` bytes. It is checked as it goes out and, when it is JSON, as its decoded strings and keys too
+ *   (python's `json.dumps` writes non-ASCII as `\uXXXX`). The declared secret is never allowed in a body.
  * A refusal is final for the call (`denied`): every later send is refused too. `deny()` records a failure of the
  * gate itself (an over-long request line, an fd 3 error — `serveGate`) as the same refusal (#135).
  */
@@ -256,10 +265,23 @@ export function skillSendGate(
   const config = Object.values(secrets ?? {});
   const places = skill.secrets.flatMap((s) => {
     const v = secrets?.[s.env];
-    return s.place && v && (!s.when || s.when(input)) ? [{ ...s.place, value: v }] : [];
+    return s.place && v && (!s.when || s.when(input))
+      ? [{ ...s.place, host: s.place.host.toLowerCase(), value: v }]
+      : [];
   });
   let denied = false;
   let sends = 0;
+  /** The body the last approved head announced, still to come in the next send. */
+  let pending: { host: string; length: number } | undefined;
+  const bodyOk = (body: string): boolean => {
+    const texts = [body];
+    try {
+      texts.push(...jsonStrings(JSON.parse(body)));
+    } catch {
+      // not JSON: the bytes as they are
+    }
+    return !carriesSecret(texts, { config });
+  };
   const check = (line: string): boolean => {
     if (++sends > SKILL_SENDS_MAX) return false;
     const req = SendRequest.safeParse(JSON.parse(line));
@@ -267,17 +289,47 @@ export function skillSendGate(
     const host = req.data.host.toLowerCase();
     if (!hosts.has(host)) return false;
     let data = req.data.data;
-    const eol = data.indexOf("\r\n");
-    const first = eol < 0 ? data : data.slice(0, eol);
-    const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(first);
+    if (pending) {
+      // The body of the head just approved: whole, in this one send, to the same host.
+      const body = pending;
+      pending = undefined;
+      return host === body.host && data.length === body.length && bodyOk(data);
+    }
+    const eoh = data.indexOf("\r\n\r\n");
+    const head = eoh < 0 ? data : data.slice(0, eoh);
+    const inline = eoh < 0 ? "" : data.slice(eoh + 4);
+    const lines = head.split("\r\n");
+    const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(lines[0]!);
     if (!m) return false;
+    let headers = lines.slice(1);
+    // The body: exactly what Content-Length says, part of it (or all) possibly in this send already.
+    const lengths = headers.filter((h) => /^content-length\s*:/i.test(h));
+    if (headers.some((h) => /^transfer-encoding\s*:/i.test(h)) || lengths.length > 1) return false;
+    const length = lengths.length ? /^content-length\s*:\s*(\d{1,9})\s*$/i.exec(lengths[0]!)?.[1] : "0";
+    if (length === undefined) return false;
+    const announced = Number(length);
+    if (announced > SKILL_BODY_MAX || inline.length > announced) return false;
     let target = m[2]!;
     for (const p of places.filter((x) => x.host === host)) {
-      const removed = withoutParam(target, p.param, p.value);
-      target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
+      if ("param" in p) {
+        const removed = withoutParam(target, p.param, p.value);
+        target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
+      } else {
+        const name = p.header.toLowerCase();
+        const i = headers.findIndex((h) => {
+          const c = h.indexOf(":");
+          return c > 0 && h.slice(0, c).toLowerCase() === name && h.slice(c + 1).trim() === p.value;
+        });
+        if (i >= 0) headers = headers.filter((_, j) => j !== i);
+      }
     }
-    data = `${m[1]} ${target} ${m[3]}${eol < 0 ? "" : data.slice(eol)}`;
-    return !carriesSecret([data], { config });
+    data = [`${m[1]} ${target} ${m[3]}`, ...headers].join("\r\n") + (eoh < 0 ? "" : "\r\n\r\n");
+    if (carriesSecret([data], { config })) return false;
+    if (inline.length === announced) return !inline || bodyOk(inline);
+    // Part of a body here and the rest later: not how http.client sends one — refused.
+    if (inline) return false;
+    pending = { host, length: announced };
+    return true;
   };
   return {
     approve(line) {
@@ -301,6 +353,18 @@ export function skillSendGate(
       return sends;
     },
   };
+}
+
+/** Every string value and object key of a parsed JSON value, at any depth. */
+function jsonStrings(v: unknown, out: string[] = []): string[] {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) jsonStrings(x, out);
+  else if (v && typeof v === "object")
+    for (const [k, x] of Object.entries(v)) {
+      out.push(k);
+      jsonStrings(x, out);
+    }
+  return out;
 }
 
 /** A value as python's `urlencode` (quote_plus) writes it: `encodeURIComponent` plus `!'()*` escaped. */
@@ -572,13 +636,23 @@ export type WebOptions = {
   sources: SourceStore;
   /** Citations (#25): with it, `cite` is offered (checked against `sources`). */
   citations?: CitationStore;
-  /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default duckduckgo, then google-news. */
+  /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default google, duckduckgo, then google-news. */
   providers?: readonly SearchProviderName[];
   /** Tests: the worker (in-process), the page proxy, and ready-made providers instead of `providers`. */
   worker?: WebWorker;
   fetchProxy?: Proxy;
   searchProviders?: readonly SearchProvider[];
 };
+
+/**
+ * `web_search` providers when `WEB_SEARCH_PROVIDERS` is not set (#171): Google through Serper first (skipped unless
+ * search-google is installed and SERPER_API_KEY is set), then DuckDuckGo, then Google News RSS.
+ */
+export const DEFAULT_SEARCH_PROVIDERS: readonly SearchProviderName[] = [
+  "google",
+  "duckduckgo",
+  "google-news",
+];
 
 /** A skill in the admin's list (FR-10.3): the PRD §7 catalogue plus where each one stands on this server. */
 export type SkillStatus =
@@ -684,8 +758,11 @@ export class McpService {
   }
 
   /**
-   * Search providers in the configured order. `google-news` runs the installed google-news-search-skill (news
-   * only; leads, not evidence); `duckduckgo` reads its HTML results page through a proxy for that host only.
+   * Search providers in the configured order. `google` runs the installed search-google skill (Serper, #171) —
+   * only when its key is configured, and per call only for a user who may use that skill (server switch, their
+   * permissions, the run's skill scope) and while the run has calls left (`maxCallsPerRun`); otherwise it is
+   * skipped and the next provider answers. `google-news` runs the installed google-news-search-skill (news only;
+   * leads, not evidence); `duckduckgo` reads its HTML results page through a proxy for that host only.
    */
   private buildWeb(o: WebOptions): WebService {
     const worker = o.worker ?? sandboxedWorker();
@@ -693,9 +770,31 @@ export class McpService {
     // (`skillPolicy`, #113 review round 3, #129). A refused redirect is a failed search (`web_search_unavailable`):
     // the next provider is tried.
     const news = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
+    const google = this.skills.find((s) => s.name === SEARCH_GOOGLE_SKILL.name);
+    const googleKey = !!google && google.secrets.every((s) => !!this.opts.secrets?.[s.env]);
     const providers =
       o.searchProviders ??
-      (o.providers ?? ["duckduckgo", "google-news"]).flatMap((name): SearchProvider[] => {
+      (o.providers ?? DEFAULT_SEARCH_PROVIDERS).flatMap((name): SearchProvider[] => {
+        if (name === "google" && google && googleKey)
+          return [
+            {
+              name: "google",
+              search: async (query, max, scope) => {
+                if (!this.mayUse(scope, google.name) || !this.takeCall(scope.runId, google))
+                  return { ok: false, code: "web_search_unavailable" };
+                const r = await this.runner(
+                  google,
+                  { query, type: "search", num: Math.min(Math.max(max, 1), 10) },
+                  scope,
+                );
+                // A request the send gate refused (#129): no other provider gets this query either.
+                if (!r.ok && r.code === SKILL_SECRET_BLOCKED)
+                  return { ok: false, code: "web_secret_blocked" };
+                if (!r.ok) return { ok: false, code: "web_search_unavailable" };
+                return { ok: true, hits: (google.searchHits?.(r.output) ?? []).map((h) => h.hit) };
+              },
+            },
+          ];
         if (name === "duckduckgo") {
           const proxy = {
             endpoint: () => this.proxyFor("web:duckduckgo", DUCKDUCKGO_HOSTS),
@@ -766,6 +865,22 @@ export class McpService {
     // Bounded: entries older than a run can live (the token's lifetime) go.
     if (this.externalRuns.size > 500)
       for (const [id, at] of this.externalRuns) if (t - at > 6 * 3600_000) this.externalRuns.delete(id);
+  }
+
+  /** Calls of capped skills per run (`maxCallsPerRun`, #171): `<runId>\n<skill>` → count and last call time. */
+  private readonly callsByRun = new Map<string, { n: number; at: number }>();
+  /** Takes one call of a capped skill for this run; false when the run has none left (nothing is counted then). */
+  private takeCall(runId: string, skill: Pick<BundledSkill, "name" | "maxCallsPerRun">): boolean {
+    if (skill.maxCallsPerRun === undefined) return true;
+    const key = `${runId}\n${skill.name}`;
+    const t = Date.now();
+    const used = this.callsByRun.get(key)?.n ?? 0;
+    if (used >= skill.maxCallsPerRun) return false;
+    this.callsByRun.set(key, { n: used + 1, at: t });
+    // Bounded like `externalRuns`: entries older than a run can live (the token's lifetime) go.
+    if (this.callsByRun.size > 500)
+      for (const [k, v] of this.callsByRun) if (t - v.at > 6 * 3600_000) this.callsByRun.delete(k);
+    return true;
   }
 
   /**
@@ -1615,8 +1730,11 @@ export class McpService {
     if (!parsed.success || !skill.args(parsed.data as Record<string, unknown>))
       return { ok: false, code: "skill_bad_input" };
     // Each call is a process: cap them so one batch or one runtime cannot exhaust the machine.
+    // A paid skill's calls per run are capped (#171); a call counts once it has a slot.
     const r = await this.withSlot(scope, () =>
-      runSkill(skill, parsed.data as Record<string, unknown>, scope),
+      this.takeCall(scope.runId, skill)
+        ? runSkill(skill, parsed.data as Record<string, unknown>, scope)
+        : Promise.resolve<SkillResult>({ ok: false, code: "skill_quota" }),
     );
     if (!r) return { ok: false, code: "skill_busy" };
     if (r.ok && skill.searchHits && this.web) this.registerHits(skill, r.output, scope);

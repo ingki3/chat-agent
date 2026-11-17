@@ -488,16 +488,17 @@ rm ~/.agentlee/probe-headers.txt
 
 ### 15.2 설치·확인
 ```
-pnpm skills:install                       # 허용 목록 스킬 모두 (google-news-search-skill, kr-stock-skill)
+pnpm skills:install                       # 허용 목록 스킬 모두 (google-news-search-skill, kr-stock-skill, search-google)
 pnpm skills:install kr-stock-skill        # 하나만
 pnpm skills:status                        # 설치 상태·python·설정된 비밀 이름(값은 안 보임)
 ```
 - 설치나 원본 갱신 뒤에는 서비스를 다시 시작한다(서버는 시작할 때 스킬 폴더를 검사한다).
 - 원본 파일이 심볼릭 링크·하드링크이거나 경로에 심볼릭 링크가 있으면 설치를 거부한다.
+  - **예외는 원본 폴더 바로 아래의 스킬 폴더 하나뿐이다**(관리자 배치: `~/.claude/skills/search-google` → `~/Dev/skills/search-google`). `findSource`가 그 링크를 실제 경로로 바꾼 뒤, 그 **실제 폴더 아래**의 파일은 위 규칙 그대로 본다(파일·중간 폴더가 링크면 거부, 끊긴 링크는 "not found"). 복사본에는 링크가 남지 않는다(#171, `skills.test.ts`).
 - 관리자 API: `GET /api/admin/skills`는 §7 목록과 상태를 돌려준다(`available`·`not_installed`·`broken`·`needs_python`·`planned`·`document`).
 
 ### 15.3 비밀
-- `.env`에 이름 그대로 넣는다. 예: `ALPHAVANTAGE_API_KEY=…`(선택, `kr-stock-skill`의 `alpha-quote`만 쓴다).
+- `.env`에 이름 그대로 넣는다. 예: `ALPHAVANTAGE_API_KEY=…`(선택, `kr-stock-skill`의 `alpha-quote`만 쓴다), `SERPER_API_KEY=…`(`search-google`, #171 — 원본 스킬은 `~/.zshrc`의 값을 읽지만 서버는 `.env`의 값만 쓴다).
 - 서버는 `SKILL_SECRET_NAMES`에 있는 이름만 읽는다. 그 값은 그 비밀을 선언한 스킬 프로세스의 환경 변수로만 넘긴다. 인자·로그·결과에는 남지 않는다.
 - 원본 스킬 폴더의 `config.json`·`.env`에 있는 키는 서버가 쓰지 않는다(복사하지 않는다). 쓰려면 `.env`로 옮긴다.
 - 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
@@ -514,7 +515,8 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 
 ### 15.5 스킬 추가
 1. 원본 스킬을 읽고 `docs/skills.md`에 적는다: 진입점, 입출력, 의존성, 비밀, 호스트.
-   - 표준 라이브러리 python 또는 node여야 한다. **네트워크(`hosts`)가 있으면 python이고 요청은 urllib(또는 http.client)**여야 한다 — §42의 부트가 그 `send`에서 요청마다 서버 승인을 받는다. 소켓을 직접 쓰는 스킬(`socket`·`ssl.wrap_socket`·asyncio), 부트의 패치(`http.client.HTTPConnection.send`)나 fd 3을 건드리는 스킬은 승인을 지나지 않으므로 받지 않는다(§42.3의 받아들인 한계는 이 검토로 관리한다). 네트워크 node 스킬은 `skill_unavailable`로 거부된다. 선언한 비밀을 URL에 싣는 스킬은 `secrets`에 `place`(호스트·매개변수)를 적는다.
+   - 표준 라이브러리 python 또는 node여야 한다. **네트워크(`hosts`)가 있으면 python이고 요청은 urllib(또는 http.client)**여야 한다 — §42의 부트가 그 `send`에서 요청마다 서버 승인을 받는다. 소켓을 직접 쓰는 스킬(`socket`·`ssl.wrap_socket`·asyncio), 부트의 패치(`http.client.HTTPConnection.send`)나 fd 3을 건드리는 스킬은 승인을 지나지 않으므로 받지 않는다(§42.3의 받아들인 한계는 이 검토로 관리한다). 네트워크 node 스킬은 `skill_unavailable`로 거부된다. 선언한 비밀을 URL에 싣는 스킬은 `secrets`에 `place`(호스트·매개변수 `{host, param}`)를, 헤더에 싣는 스킬은 `place`(호스트·헤더 `{host, header}`, #171)를 적는다. 본문(POST)은 `Content-Length` 하나로 알리고 다음 send 한 번에 통째로 보내야 승인된다(urllib·http.client의 bytes 본문이 그렇다, §42.2). 선언한 비밀은 본문에 싣지 못한다.
+   - **유료 API**(호출마다 비용)면 `maxCallsPerRun`(실행당 호출 상한)을 적는다. 넘으면 도구는 `skill_quota`, `web_search` 제공자는 건너뛴다.
    - 자식 프로세스가 필요하면 샌드박스를 풀지 말고 서버 함수로 만든다.
 2. `skills.ts`에 `SkillSpec`을 추가하고 `SKILL_SPECS`·`SKILL_CATALOGUE`(상태 `implemented`)에 넣는다.
    - **인자는 입력 필드마다 `--flag=값` 하나로만** 만든다.
@@ -525,7 +527,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
    ```
    SKILLS_LIVE=1 pnpm vitest run apps/server/test/skills.test.ts
    ```
-   `TEST_SKILL_PYTHON` 또는 uv가 필요하다.
+   `TEST_SKILL_PYTHON` 또는 uv가 필요하다. 키가 필요한 호출은 그 키가 이 셸 환경에 있을 때만 실제로 부른다(`ALPHAVANTAGE_API_KEY`, `SERPER_API_KEY` — search-google은 Serper 1 크레딧). 없으면 `skill_unconfigured`를 확인하고 넘어간다. 평소 시험(`pnpm test`)은 실제 API를 부르지 않는다(목 서버·합성 키).
 5. `pnpm skills:install <이름>` 후 재시작한다.
 
 ## 16. 사용량 기록 (#44)과 화면·비용 (#32)
@@ -590,9 +592,11 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - `web_fetch`는 모든 활성 사용자의 run에 항상 있다. 따로 설치할 것이 없다. macOS가 아니면 `web_unavailable`로 거부한다(샌드박스 없음).
 - `web_search`는 검색 제공자가 하나라도 있을 때만 있다. `.env`(없으면 기본값):
   ```
-  WEB_SEARCH_PROVIDERS=duckduckgo,google-news   # 기본. 순서대로 시도
-  WEB_SEARCH_PROVIDERS=google-news              # DuckDuckGo 약관이 걱정될 때(뉴스만, 원문 링크 아님)
+  WEB_SEARCH_PROVIDERS=google,duckduckgo,google-news   # 기본. 순서대로 시도
+  WEB_SEARCH_PROVIDERS=duckduckgo,google-news          # Serper 크레딧을 web_search에 쓰지 않을 때
+  WEB_SEARCH_PROVIDERS=google-news                     # DuckDuckGo 약관이 걱정될 때(뉴스만, 원문 링크 아님)
   ```
+  - `google`(#171): 설치된 `search-google` 스킬(Serper의 Google 웹 검색)을 같은 샌드박스 경로로 `{ query, type: "search", num: maxResults }`로 부른다. **`search-google`이 설치돼 있고 `SKILL_PYTHON`과 `.env`의 `SERPER_API_KEY`가 있을 때만** 생긴다(없으면 이 제공자는 없고 다음 제공자가 답한다 — 기존 대체 순서 그대로). 생겨도 호출마다 그 사용자가 `search-google`을 쓸 수 있을 때만 쓴다: 서버 허용 스위치, 사용자별 스킬 목록(목록 방식 사용자는 켜야 한다, §15.4), 예약 실행의 스킬 선택. 아니면 건너뛴다. 한 실행에서 스킬 도구와 합쳐 5번까지(`maxCallsPerRun`), 그다음은 건너뛴다. 실패(시간 초과·HTTP 오류)는 다음 제공자로 넘어가고, 송신 가드가 막은 요청(§42)은 다음 제공자로 넘기지 않는다. 링크는 Serper `/resolve`로 바꾼 실제 주소이고, 바뀌지 않은 Google 중계 링크(`google.com/goto?url=…`)는 결과·출처에서 뺀다.
   - `duckduckgo`: 키 없음. 공식 API가 아니어서 약관상 회색 지대이고, 연달아 쓰면 봇 확인 페이지가 온다(`web_search_blocked` → 다음 제공자).
   - `google-news`: `google-news-search-skill`이 설치돼 있고 `SKILL_PYTHON`이 있어야 한다(§15). 링크가 Google 중계 주소라 `web_fetch`로 원문이 열리지 않는다.
   - 바꾼 뒤에는 서비스를 다시 시작한다.
@@ -1755,17 +1759,19 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
   - `http.client.HTTPConnection.send`를 감싼다: 소켓에 쓰기 직전, **바로 그 바이트**(스크립트가 합치고 urllib이 인코딩한 요청 줄·모든 헤더·본문, 프록시 CONNECT 포함 — TLS 전 평문)를 연결 호스트와 함께 JSON 한 줄로 **fd 3**에 쓰고 답을 읽는다. `1`이면 보내고, 그 밖(거부, fd 3이 없음, 읽기 실패)이면 `ConnectionError` — urllib에서는 `URLError`라 스크립트가 보통 네트워크 실패로 알린다. 원래 `send`는 클로저 안에만 있다.
 - **서버의 승인(`skillSendGate`):** 실행기가 fd 3 소켓을 받아(`runIsolated`의 `gate`, 샌드박스 안에서도 상속 소켓이라 동작 — macOS 시험) 줄마다
   - 연결 호스트가 그 스킬의 `hosts`인지,
-  - 스킬이 **선언한 자기 비밀은 선언한 자리 하나만** 빼고(`SkillSecret.place`: `kr-stock-skill` Alpha Vantage 키는 `www.alphavantage.co` 요청 대상의 첫 `apikey=<키>` 한 쌍 — 금융 DART 예외와 같은 규칙, 그 호출이 키를 받을 때(`when`)만),
+  - 스킬이 **선언한 자기 비밀은 선언한 자리 하나만** 빼고(`SkillSecret.place`: `kr-stock-skill` Alpha Vantage 키는 `www.alphavantage.co` 요청 대상의 첫 `apikey=<키>` 한 쌍 — 금융 DART 예외와 같은 규칙, 그 호출이 키를 받을 때(`when`)만. `search-google` Serper 키(#171)는 `google.serper.dev` 요청 머리의 첫 `X-API-KEY: <키>` 헤더 줄 하나 — 이름은 대소문자 무관(urllib은 `X-api-key`로 쓴다), 값은 정확히 그 키),
   - 나머지 전체를 `carriesSecret`(UTF-8 바이트 뷰 포함, 등록부 + `.env`의 모든 스킬 비밀)으로 본다.
+  - **본문(#171):** http.client는 POST 본문을 머리와 **따로** send한다. 그래서 승인은 머리의 `Content-Length` 하나가 알린 길이만큼의 본문이 **바로 다음 send 한 번에, 같은 호스트로** 오는 것만 받는다(짧거나 길거나 둘로 나뉘거나, 다른 호스트, `Transfer-Encoding`, `Content-Length` 둘, `SKILL_BODY_MAX` 192KB 초과는 거부). 본문은 그대로의 바이트와 함께, JSON이면 **풀어낸 문자열·키**로도 본다 — python `json.dumps`는 한글을 `\uXXXX`로 쓰므로 바이트만 보면 한글 비밀을 놓친다. 선언한 비밀은 본문에서는 예외가 없다(거부).
   한 번 거부하면 그 호출의 이후 요청도 모두 거부하고, 한 호출의 요청은 16개까지(`SKILL_SENDS_MAX`), 한 줄은 256KB까지다(`GATE_LINE_MAX`). **길이를 먼저 본다**(#135): 넘는 줄은 개행이 같이 왔어도 승인에 넘기지 않고 거부하며 프로세스를 멈춘다. fd 3 소켓 오류(멈추거나 끝난 뒤의 정리 오류는 제외)와 줄 초과도 **거부와 같다**(`skillSendGate.deny()`) — 그 뒤로는 아무것도 읽거나 승인하지 않는다.
 - **순서(#135):** 실행기는 프록시 없이 할 수 있는 검사를 먼저 한다 — 고정 사본 확인(`skill_changed`), 정책의 거부(`skillPrecheck`: 인자·없는 비밀·네트워크 node 스킬·python 없음), 송신 승인 준비 — 그다음에야 그 스킬의 송신 프록시(로컬 포트)를 준비한다. 그래서 이런 이유로 거부되는 호출은 프록시를 만들지 않는다. 고정 사본은 프록시 준비 뒤 실행 직전에 **한 번 더** 확인한다(리뷰 #138) — 그 사이 바뀐 사본은 `skill_changed`로 돌지 않는다. 요청 내용의 승인은 스크립트가 보내려는 순간에만 할 수 있으므로 프록시 준비 뒤다(프록시는 CONNECT 전에는 아무 데도 연결하지 않는다).
 - 거부(줄 초과·fd 3 오류 포함)가 있었으면 스크립트가 무엇을 출력했든 결과는 `skill_secret_blocked`다. **모델에게는 보통 실패**(`{"error":"skill_failed"}`, 스크립트가 비정상 종료했을 때와 같은 코드 — §40.2처럼 어떤 값이 비밀인지 답으로 가려내지 못하게). 로그 `skill.finished`의 `skillCode`와 관리자 화면 "스킬 실행 실패"에만 `skill_secret_blocked`. 요청 내용·비밀은 남지 않는다. 남는 차이(받아들인 한계, §40.2와 같음): 막힌 호출은 요청 시간만큼 빨리 끝난다.
 - **네트워크 node 스킬은 거부**(`skill_unavailable`): 부트가 없다. 지금은 없다(`selftest`는 네트워크 없음). 네트워크가 없는 스킬에는 부트도 승인도 없다(밖으로 나갈 곳이 없고, 결과는 §15.3대로 가려진다).
-- `web_search`의 Google News 제공자도 같은 실행기를 지난다. `WebService.search`가 먼저 검색어를 보고 미끼로 바꾸며(§40.2), 합친 `q`가 걸리면 `web_search_unavailable`(다음 제공자).
+- `web_search`의 Google(`search-google`, #171)·Google News 제공자도 같은 실행기를 지난다. `WebService.search`가 먼저 검색어를 보고 미끼로 바꾸며(§40.2), 합친 `q`가 걸리면 `web_search_unavailable`(다음 제공자).
 
 ### 42.3 남는 경로 (범위 밖 — 이유)
 - **http.client 밖의 송신 (받아들인 한계, P3 — #135에서 유지):** 스크립트가 소켓을 직접 쓰거나(`socket`·`ssl.wrap_socket`·asyncio·`sendfile`), 부트의 패치를 되돌리거나(원래 `send`는 클로저에만 있지만 `inspect.getclosurevars`·GC 탐색으로 닿는다 — python 안에서 완전히 숨길 수는 없다), fd 3을 닫고 자기 socketpair로 바꾸면(리뷰 #132 2차 재현) 승인을 지나지 않는다. 지금 두 스크립트는 urllib만 쓰고, 실행되는 것은 검사·고정된 사본뿐이다(바뀌면 `skill_changed`). 스킬을 추가·갱신할 때 §15.5의 조건을 확인한다. 핀 검사는 내용이 그대로인지를 볼 뿐, HTTP 구현이 안전한지를 보증하지는 않는다.
-- **선언한 비밀의 원래 자리:** Alpha Vantage 키는 `www.alphavantage.co`의 `apikey=`로 나간다(목적). 다른 허용 호스트(`m.stock.naver.com`)·다른 매개변수·헤더·두 번째 쌍으로는 승인되지 않는다.
+- **선언한 비밀의 원래 자리:** Alpha Vantage 키는 `www.alphavantage.co`의 `apikey=`로 나간다(목적). 다른 허용 호스트(`m.stock.naver.com`)·다른 매개변수·헤더·두 번째 쌍으로는 승인되지 않는다. Serper 키는 `google.serper.dev`의 `X-API-KEY` 헤더로 나간다(목적). URL·본문(base64 등 인코딩 포함)·다른 헤더·두 번째 `X-API-KEY`·키를 포함한 더 긴 값·다른 호스트로는 승인되지 않는다.
+- **거부된 본문 앞의 머리(#171):** 본문이 거부되면 그 앞의 머리(선언한 자리의 키 포함)는 이미 나갔다. 요청은 본문 없이 끊기므로 Serper는 그 요청을 처리하지 않는다. 머리에는 모델 입력이 없다(경로 `/search` 등 고정값, 키는 자기 자리).
 - **여러 요청에 걸친 재조립·마지막 검사 뒤 등록된 값·UTF-8이 아닌 멀티바이트 인코딩:** §40.1과 같은 결정으로 범위 밖.
 - **렌더러 CDN(§18.4, #51):** 같은 판정기에 넣지 않는다. 브라우저의 요청 가로채기가 **정확한 `CDN_ALLOW_LIST` URL**(상수)과 서버가 넣는 문서 한 번만 내보낸다 — 모델이나 문서가 바꿀 수 있는 URL·쿼리가 없다. 헤더는 Chromium 자신의 것이고 쿠키·저장소 없는 새 프로필이다. 실을 재료가 없으니 검사할 것이 없다.
 - **연결 갱신(ChatGPT 토큰 갱신, `connections/chatgpt.ts`):** 같은 판정기에 넣지 않는다. 고정 URL(`auth.openai.com/oauth/token`)에 **갱신 토큰을 보내는 것이 목적**이다 — 판정기는 정의상 이 요청을 막는다. 본문은 고정 모양(`client_id`·`grant_type`·`refresh_token`·`scope`)이고 모델 입력이 없다.
@@ -1781,6 +1787,7 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
   - 실제 python(부트 + fd 3): 합친 질의는 보내기 전에 거부되어 사이트가 받은 요청 0개, 승인이 본 것은 urllib이 인코딩한 요청 줄 그대로. 보통 요청은 승인된 그대로 1개. 선언 키는 자리에서만, 같은 키를 기호에도 넣으면 0개. 리다이렉트는 요청 1개 뒤 `HTTPError 302`. fd 3이 없으면 아무것도 보내지 않음.
   - macOS + `TEST_SKILL_PYTHON`(독립 실행형 python): `sandboxedSkillRunner`가 샌드박스 안에서 승인 소켓을 쓰고, 거부는 `skill_secret_blocked`(요청 0개), 보통 호출은 결과가 나옴.
   - MCP로 부르면 모델에는 `{"error":"skill_failed"}`, 로그에만 `skill_secret_blocked`(내용 없음).
+- `test/search-google.test.ts`(#171): Serper 키는 `X-API-KEY` 헤더(이름 대소문자 무관)에서만 통과, URL·본문(그대로·base64)·다른 헤더·두 번째 헤더·더 긴 값·다른 허용 호스트·다른 호스트에서는 거부. 본문의 다른 비밀(전체·16자 구간·`\uXXXX`로 쓴 한글 비밀·JSON 키) 거부, 보통 검색어 통과. 본문 길이·나뉨·다른 호스트·chunked·`Content-Length` 둘·192KB 초과 거부. 실제 python(부트 + fd 3)과 목 서버로 머리·본문 두 번의 send가 승인되고 키는 헤더로 도착, 키나 한글 비밀이 검색어에 있으면 서버가 받은 요청 0개. 이 Mac에 원본 `serper_search.py`가 있으면 그 사본(주소만 목 서버로 바꿈)으로 `/search` → `/resolve`와 출처 선택까지 확인.
 - `test/web-egress.test.ts`: 제공자와 스킬 도구가 같은 정책으로 실행됨, 실제 python으로 부트가 `urlopen`·`build_opener().open`의 302를 따라가지 않음(대조: 부트 없이는 비밀 URL까지 따라감).
 - `test/skills.test.ts`: 정책 인자에 부트, 실제 샌드박스 탐침 스킬이 부트 아래에서도 같은 결과.
 - 실제 Google News 스크립트(설치 원본, TLS 직접 연결)로 부트 아래 요청 1개가 그대로 승인되어 나감을 손으로 확인했다(2026-11-14).

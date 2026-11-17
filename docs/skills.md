@@ -20,6 +20,7 @@ PRD §7의 스킬을 하나씩 살펴 실제 진입점, 입출력, 의존성, �
 | `dart-investment-monitor` | 예 | **금융 도구** #30 (`dart_disclosures`) | (스킬 실행 안 함) OpenDART `list.json` | 없음 | `OPENDART_API_KEY` | `opendart.fss.or.kr` |
 | `news-search-skill` | 아니오 | 예정 (#50에서 미룸) | `scripts/news_search.py` | 스킬 venv(google-genai, PyYAML) | `GEMINI_API_KEY` | Gemini API |
 | `google-news-search-skill` | 아니오 | **구현** (#50: 결과를 출처로 등록, `web_search` 제공자) | `scripts/google_news_search.py` | python 표준 라이브러리 | 없음 | `news.google.com` |
+| `search-google` (§7 밖, #171) | 아니오 | **구현** (#171: 결과를 출처로 등록, `web_search` 1순위 제공자 `google`) | `scripts/serper_search.py` | python 표준 라이브러리(urllib) | `SERPER_API_KEY`(`X-API-KEY` 헤더로만) | `google.serper.dev` |
 | `realtime-lookup-skill` | 아니오 | 예정 (#50에서 미룸 — 뉴스 경로는 `web_search`+`web_fetch`로 대체) | `realtime_lookup_skill.py` → `simpleclaw.skills.realtime_lookup` | 스킬 폴더 밖 패키지(`simpleclaw`, 설치 안 됨) | 확인 필요 | Google News RSS, 기사 원문, Naver Sports |
 | `summarize` | 아니오 | 예정 (#50: URL은 `web_fetch`로 대체, 유튜브는 미룸) | Homebrew `summarize` CLI 0.10.0(node) | 외부 CLI, LLM 제공자 | `OPENAI_API_KEY`·`GEMINI_API_KEY` 등 중 하나, 선택 `FIRECRAWL_API_KEY` | URL·유튜브·LLM API |
 | `pdf` | 아니오 | 문서형 #48·#49 | (안내 문서 + 보조 스크립트) | pypdf·pdfplumber 등 | 없음 | 없음 |
@@ -52,6 +53,31 @@ v1 제외(PRD §7): `gmail-skill`, `google-calendar-skill`, `google-contacts-ski
 - **확인:** 실제 스킬로 샌드박스 + 프록시 경유 실행 성공(`SKILLS_LIVE=1`, 2026-11-11).
 - **출처(#50):** 성공한 결과의 `items`마다 `kind = "search"` 출처를 만들고 항목에 `sourceId`를 넣는다(링크·제목이 없는 항목은 `sourceId` 없음). 정의의 `searchHits`가 항목을 고른다.
 - **`web_search` 제공자(#50):** `WEB_SEARCH_PROVIDERS`에 `google-news`가 있으면 `web_search`가 이 스킬을 `{ query, maxResults, lookbackDays: 30, sort: "relevance" }`로 부른다. 링크는 Google 중계 주소라 `web_fetch`로 원문이 열리지 않는다(실측 `web_no_text`). 그래서 기본 순서에서 DuckDuckGo 다음이다. `docs/decisions/isolation.md` "웹 검색·가져오기 (#50)".
+
+### `search-google` (일반, #171)
+PRD §7 목록에는 없고 관리자 요청으로 더했다(관리자 스킬 폴더 `~/Dev/skills/search-google`, `~/.claude/skills/search-google`은 그 폴더로 가는 심볼릭 링크 — 설치는 그 링크를 실제 경로로 바꿔 읽는다, `docs/ops.md` §15.2).
+- **진입점:** `scripts/serper_search.py`(이 파일 하나만 복사. `SKILL.md`는 복사하지 않는다). python 표준 라이브러리(urllib)만 쓴다. Serper(`https://google.serper.dev/<search|news|videos>`)에 POST JSON, 키는 `X-API-KEY` 헤더. 링크에 `google.com/goto?url=`이 남아 있으면 `/resolve`(같은 호스트, 0 크레딧)로 한 번(필요하면 `retryAfter`만큼 기다려 한 번 더) 실제 주소로 바꾼다.
+- **입력**(도구 스키마, 정의에 없는 키는 거부):
+
+  | 필드 | 형식 | 인자 |
+  |---|---|---|
+  | `query` | 1–300자, `SAFE_TEXT` | `--q=<값>` |
+  | `type` | `search`(웹, 기본) · `news` · `videos` | `--type=<값>` |
+  | `gl` | 소문자 두 글자 국가 코드 (기본 `kr`) | `--gl=<값>` |
+  | `hl` | 소문자 언어 코드 `xx` 또는 `xx-yy` (기본 `ko`) | `--hl=<값>` |
+  | `tbs` | `h` · `d` · `w` · `m` · `y` (지난 1시간·일·주·월·년) | `--tbs=<값>` |
+  | `page` | 정수 1–5 | `--page=<n>` |
+  | `num` | 정수 1–10 (10 넘으면 크레딧이 더 든다) | `--num=<n>` |
+
+  항상 `--raw`를 붙인다: 스크립트의 기본 출력은 읽기용 요약 **글**이라 JSON이 아니고, `--raw`가 Serper 응답 JSON(해결된 링크)을 그대로 낸다. `--no-resolve`는 열지 않았다(중계 링크가 남는다). 키 없음·HTTP 오류는 종료 코드 1 + `{error, body}`이고 결과로 넘기지 않는다(`skill_failed`).
+- **출력:** Serper JSON — `search`는 `organic[]`(`title, link, snippet, position, date?`)과 `knowledgeGraph`·`peopleAlsoAsk`·`relatedSearches`(있을 때), `news`는 `news[]`(`title, link, snippet, date, source`), `videos`는 `videos[]`(`title, link, snippet, duration, source, channel, date`). `searchParameters`·`credits`도 들어 있다.
+- **출처:** `organic`·`news`·`videos`의 항목마다 `kind = "search"` 출처를 만들고 `sourceId`를 넣는다(최대 30개). **`/resolve` 뒤에도 Google 중계 주소(`google.com/goto?…`, `google.*/url?…`)로 남은 링크는 출처로 만들지 않는다**(`isGoogleRedirect`) — 어디로 가는지 확인되지 않은 주소다. 그 항목에는 `sourceId`가 없다. `date`는 `"5시간 전"` 같은 상대 표현일 수 있어, 날짜로 읽히는 것만 게시일로 저장한다.
+- **비밀:** `SERPER_API_KEY` — `.env`에서, 이 스킬 프로세스 환경에만. 송신 승인(`docs/ops.md` §42)이 `google.serper.dev`의 `X-API-KEY` 헤더 한 줄에서만 허용한다. 없으면 `skill_unconfigured`이고 `web_search` 제공자 `google`도 생기지 않는다.
+- **네트워크:** `google.serper.dev:443`만(이 스킬 전용 송신 프록시).
+- **비용:** 검색 한 번 = 1 크레딧(`/resolve`는 무료). 한 실행(답변 하나)에서 도구·`web_search` 제공자를 합쳐 **5번까지**(`maxCallsPerRun`). 넘으면 도구는 `skill_quota`, 제공자는 건너뛴다. 시간 한도 60초(`/resolve`의 `retryAfter` 대기 포함).
+- **`web_search` 제공자 `google`:** 기본 순서의 맨 앞(`google,duckduckgo,google-news`). 스킬이 설치되고 키가 있을 때만 있고, 그 사용자가 이 스킬을 쓸 수 있을 때만(서버 스위치·사용자 목록·예약 선택) 부른다. 아니면 다음 제공자. `docs/ops.md` §17.1.
+- **사용자별:** 다른 스킬과 같다. `"all"`이면 켜져 있고(금융 아님 — 청소년 계정도), 목록 방식 사용자는 목록에 `search-google`을 넣어야 한다(§15.4).
+- **확인:** 시험은 목 서버와 합성 키만 쓴다(`apps/server/test/search-google.test.ts` — 이 Mac에 원본 스크립트가 있으면 그 사본을 목 서버로 돌린다). 실호출은 키를 넣은 뒤 `SKILLS_LIVE=1`(`docs/ops.md` §15.5).
 
 ### `kr-stock-skill` (금융)
 - **진입점:** `scripts/kr_stock.py`(이 파일만 복사. 같은 폴더의 `config.json`에는 Alpha Vantage 키가 들어 있어 복사하지 않는다).
