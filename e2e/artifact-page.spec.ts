@@ -1,6 +1,16 @@
 import crypto from "node:crypto";
 import { expect, test, type Frame, type Page } from "@playwright/test";
-import { MOM, SON, backToChat, csrf, newConversation, sendMessage as send, useAccount } from "./helpers.js";
+import {
+  MOM,
+  SON,
+  backToChat,
+  csrf,
+  newConversation,
+  newMember,
+  sendMessage as send,
+  signIn,
+  useAccount,
+} from "./helpers.js";
 
 /**
  * Artifacts from the chat (#28, #172, PRD FR-6.1·6.2·6.6): a reply that makes an artifact moves to the artifact page
@@ -26,6 +36,7 @@ const artifactUrl = (id: string, v?: number) => new RegExp(`/a/${id}${v ? `\\?v=
 test("made in a reply → the artifact page (no split); back, edit → v2, view v1, revert; cards and Escape lead back", async ({
   page,
   baseURL,
+  isMobile,
 }) => {
   await useAccount(page, MOM);
   const tag = crypto.randomUUID().slice(0, 8);
@@ -83,6 +94,18 @@ test("made in a reply → the artifact page (no split); back, edit → v2, view 
   const card2 = page.getByTestId("assistant").nth(1).getByTestId("artifact-card");
   await expect(card2).toContainText("v2 새 버전");
 
+  // Cards are links (review #175 5차): the address is where a click goes — an old version pinned, else the newest.
+  await expect(card1).toHaveAttribute("href", `/a/${id}?v=1`);
+  await expect(card2).toHaveAttribute("href", `/a/${id}?v=2`);
+  if (!isMobile) {
+    // A modifier click opens it in a new tab; this tab stays on the conversation.
+    const opened = page.context().waitForEvent("page");
+    await card1.click({ modifiers: ["ControlOrMeta"] });
+    const tab = await opened;
+    await expect(tab).toHaveURL(artifactUrl(id, 1));
+    await tab.close();
+    expect(new URL(page.url()).pathname).toBe(`/c/${conv.id}`);
+  }
   // The v1 card opens v1 (the card's own version) on the artifact page — not beside the chat.
   await card1.click();
   await expect(page).toHaveURL(artifactUrl(id, 1));
@@ -393,7 +416,7 @@ test("a page whose run stream gave up while the run goes on recovers and shows t
   await expect(page.getByTestId("artifact-version")).toHaveValue("2");
 });
 
-test("a card clicked before it knows the newest version opens following the newest, not pinned (review #175)", async ({
+test("a card never pins the newest version: not opened before its details, then following the newest (review #175)", async ({
   page,
   baseURL,
 }) => {
@@ -433,6 +456,14 @@ test("a card clicked before it knows the newest version opens following the newe
   const card = page.getByTestId("artifact-card");
   await expect(card).toHaveAttribute("data-version", "1");
   await expect(card).not.toContainText("마크다운 아티팩트");
+  await expect(card).toHaveAttribute("href", `/a/${id}`); // never pinned while not known
+  // A plain click before the details: nothing yet (it never opens later on its own).
+  await card.click();
+  await page.waitForTimeout(300);
+  expect(new URL(page.url()).pathname).toBe(`/c/${conv.id}`);
+  // Known now: v1 is the newest, so the card follows the newest.
+  await expect(card).toContainText("마크다운 아티팩트 · v1");
+  await expect(card).toHaveAttribute("href", `/a/${id}`);
   await card.click();
   await expect(page).toHaveURL(new RegExp(`/a/${id}$`)); // not ?v=1
   await page.unroute(detail);
@@ -443,6 +474,65 @@ test("a card clicked before it knows the newest version opens following the newe
   await page.reload();
   await expect(heading).toHaveText(`둘째 버전 ${tag}`);
   await expect(page.getByTestId("artifact-version")).toHaveValue("2");
+});
+
+test("a card clicked while its details load never navigates later: page left and back, or signed out (review #175)", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  // Its own account: this test signs out (the shared accounts' saved sessions stay valid for the other tests).
+  await signIn(page, baseURL!, await newMember(browser, baseURL!, "card-late"));
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `늦은 카드 ${tag}`);
+  const r = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+    data: { text: `/artifact markdown 늦은 카드 ${tag}\n# 늦은` },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": `e2e-${tag}` },
+  });
+  expect(r.status()).toBe(201);
+  let id = "";
+  await expect
+    .poll(async () => {
+      const list = (await (await page.request.get(`/api/conversations/${conv.id}/artifacts`)).json()) as {
+        items: { id: string }[];
+      };
+      id = list.items[0]?.id ?? "";
+      return id;
+    })
+    .not.toBe("");
+  // The card's details answer only after 3 s.
+  await page.route(`**/api/artifacts/${id}`, async (route) => {
+    await new Promise((res) => setTimeout(res, 3000));
+    await route.continue().catch(() => undefined);
+  });
+  const here = new RegExp(`/c/${conv.id}$`);
+  const card = page.getByTestId("artifact-card");
+  const menu = async () => {
+    if (isMobile) await page.getByRole("button", { name: "메뉴 열기" }).click();
+  };
+
+  // 1. Clicked, then elsewhere and back to the same conversation before the answer: no late navigation.
+  await page.goto(`/c/${conv.id}`);
+  await expect(card).not.toContainText("마크다운 아티팩트");
+  await card.click();
+  await expect(page).toHaveURL(here); // not opened before the newest version is known
+  await menu();
+  await page.locator("aside").getByRole("link", { name: "🧩 아티팩트", exact: true }).click();
+  await expect(page).toHaveURL(/\/artifacts$/);
+  await page.goBack();
+  await expect(page).toHaveURL(here);
+  await page.waitForTimeout(4000);
+  await expect(page).toHaveURL(here);
+
+  // 2. Clicked, then signed out before the answer: no navigation (the login screen stays at this address).
+  await page.reload();
+  await expect(card).not.toContainText("마크다운 아티팩트");
+  await card.click();
+  await menu();
+  await page.locator("aside").getByRole("button", { name: "로그아웃" }).click();
+  await page.waitForTimeout(4000);
+  await expect(page).toHaveURL(here);
 });
 
 test("the frame's Escape message goes back only from the frame on screen and only in its exact shape", async ({

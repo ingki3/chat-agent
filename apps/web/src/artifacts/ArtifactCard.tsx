@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useLocation, useNavigate } from "react-router";
+import { useQuery } from "@tanstack/react-query";
+import { Link, useLocation, useNavigate } from "react-router";
 import { artifactPath, type PublicPart } from "@agentlee/shared";
 import { artifacts } from "../api.js";
 import { KIND_ICON, KIND_LABEL, artifactErrorText, artifactKey } from "./viewer.js";
@@ -88,9 +88,18 @@ export function useAutoShow(
   }, [live, conversationId, navigate]);
 }
 
+/** A plain left click (no modifier): the only one the card may handle itself; others get the link's own behaviour. */
+const plainClick = (e: React.MouseEvent) =>
+  e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+
 /**
  * A card in the conversation for an artifact the reply made or changed (`artifact_ref`, set by the server from
- * what our tools stored for that run). Opens the artifact page at the card's version (the newest: following it).
+ * what our tools stored for that run). A link to the artifact page (review #175 5차: new tab, middle click, copy
+ * address work): at the card's version when that is known to be older than the newest, else following the newest.
+ * Until the card knows the newest version, a plain click does nothing (review #175 5차): opening it later, once the
+ * answer came, could fire after the user had moved on — even back to this same conversation, where a navigation
+ * that was never committed (a React transition) leaves the card mounted and the address as it was. A modifier or
+ * middle click still opens the link (following the newest).
  */
 export function ArtifactCard({ id, version }: { id: string; version: number | undefined }) {
   const { data, error } = useQuery({
@@ -98,17 +107,15 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
     queryFn: () => artifacts.get(id),
     retry: false,
   });
-  const navigate = useNavigate();
-  const qc = useQueryClient();
   const { pathname } = useLocation();
   const shown = version ?? data?.latestVersion;
   const info = data?.versions.find((x) => x.version === shown);
-  const button = useRef<HTMLButtonElement>(null);
+  const link = useRef<HTMLAnchorElement>(null);
   // Back from the artifact page this card opened: the focus is where the user left it.
   useEffect(() => {
     if (!restore || restore.id !== id || restore.version !== version) return;
     restore = null;
-    button.current?.focus();
+    link.current?.focus();
   }, [id, version, data]);
   if (error)
     return (
@@ -116,29 +123,22 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
         🧩 <span className="muted small">{artifactErrorText(error)}</span>
       </div>
     );
+  const state = { from: pathname } satisfies ArtifactFrom;
   return (
-    <button
-      ref={button}
-      type="button"
+    <Link
+      ref={link}
       className="art-card"
       data-testid="artifact-card"
       data-version={shown}
-      onClick={() => {
+      // Known: exactly where a click goes. Not known yet: following the newest.
+      to={artifactLink(id, pinnedVersion(version, data?.latestVersion))}
+      state={state}
+      aria-busy={data ? undefined : true}
+      onClick={(e) => {
+        if (!plainClick(e)) return; // new tab or window: the link as it is
+        // Its own version may be older than the newest, which is not known yet: not opened until it is.
+        if (!data && version !== undefined) return e.preventDefault();
         opener = { id, version };
-        // Clicked before the card knows the newest version: it is read first (the card's own query, shared), so the
-        // newest is never pinned. Unknown after all (an error): the page opens following the newest.
-        const go = (latest: number | undefined) => {
-          // Not if the user has moved on while it was read.
-          if (window.location.pathname !== pathname) return;
-          void navigate(artifactLink(id, pinnedVersion(version, latest)), {
-            state: { from: pathname } satisfies ArtifactFrom,
-          });
-        };
-        if (data) return go(data.latestVersion);
-        void qc
-          .fetchQuery({ queryKey: artifactKey(id), queryFn: () => artifacts.get(id), retry: false })
-          .then((d) => go(d.latestVersion))
-          .catch(() => go(undefined));
       }}
     >
       <span className="art-icon" aria-hidden>
@@ -152,6 +152,6 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
         </span>
       </span>
       <span className="chip">열기</span>
-    </button>
+    </Link>
   );
 }

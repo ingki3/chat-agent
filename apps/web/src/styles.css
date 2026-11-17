@@ -918,6 +918,8 @@ a.chip.fileref:hover {
 
 /* ---- artifact cards and list (#28) ---- */
 .art-card {
+  box-sizing: border-box;
+  text-decoration: none;
   display: flex;
   align-items: center;
   gap: 10px;

@@ -15,7 +15,14 @@ import {
 import { splitBlocks } from "../src/chat/blocks.js";
 import { AFTER_RUN_LIMITS, afterSize, clearAfter, keepAfter, takeAfter } from "../src/chat/after-run.js";
 import { recoverLost, retryUntil } from "../src/artifacts/follow-run.js";
-import { artifactLink, fromOf, legacyPanelTarget, pinnedVersion } from "../src/artifacts/ArtifactCard.js";
+import {
+  ArtifactCard,
+  artifactLink,
+  fromOf,
+  legacyPanelTarget,
+  pinnedVersion,
+} from "../src/artifacts/ArtifactCard.js";
+import { MemoryRouter } from "react-router";
 
 const viewer = (v: Partial<ArtifactViewer>) =>
   ({ revoked: false, data: undefined, error: null, ...v }) as ArtifactViewer;
@@ -465,5 +472,55 @@ describe("a lost run stream on the artifact page recovers (review #175 2·3·4�
     expect(refresh).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(refresh).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("a card is a link to where it opens (review #175 5차)", () => {
+  const detail = (latest: number) => ({
+    id: "a1",
+    conversationId: "c1",
+    messageId: null,
+    runId: null,
+    kind: "markdown" as const,
+    title: "메모",
+    language: null,
+    latestVersion: latest,
+    createdAt: 1,
+    updatedAt: 1,
+    versions: Array.from({ length: latest }, (_, i) => ({
+      version: i + 1,
+      contentHash: "h",
+      bytes: 1,
+      title: "메모",
+      language: null,
+      runId: null,
+      revertedFrom: null,
+      createdAt: 1,
+    })),
+  });
+  const card = (version: number | undefined, latest?: number) => {
+    const qc = new QueryClient();
+    if (latest) qc.setQueryData(artifactKey("a1"), detail(latest));
+    return renderToStaticMarkup(
+      createElement(
+        QueryClientProvider,
+        { client: qc },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/c/c1"] },
+          createElement(ArtifactCard, { id: "a1", version }),
+        ),
+      ),
+    );
+  };
+
+  it("an old version pins ?v=; the newest, or one not known yet, follows the newest", () => {
+    expect(card(1, 2)).toContain('href="/a/a1?v=1"');
+    expect(card(2, 2)).toContain('href="/a/a1"');
+    expect(card(undefined, 2)).toContain('href="/a/a1"');
+    const loading = card(1);
+    expect(loading).toContain('href="/a/a1"');
+    expect(loading).toContain('aria-busy="true"'); // a plain click waits for the details (does nothing yet)
+    expect(card(1, 2)).not.toContain("aria-busy");
   });
 });
