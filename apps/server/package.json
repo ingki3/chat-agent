@@ -14,7 +14,8 @@
     "restore": "tsx --conditions=development src/cli/restore.ts",
     "injection-eval": "tsx --conditions=development src/cli/injection-eval.ts",
     "skills": "tsx --conditions=development src/cli/skills.ts",
-    "workers": "tsx --conditions=development src/cli/workers.ts"
+    "workers": "tsx --conditions=development src/cli/workers.ts",
+    "audio": "tsx --conditions=development src/cli/audio.ts"
   },
   "dependencies": {
     "@agentlee/mcp-tools": "workspace:*",
@@ -35,6 +36,9 @@
     "fastify": "5.12.8",
     "jose": "6.2.16",
     "jszip": "3.10.2",
+    "micromark": "4.0.3",
+    "micromark-extension-gfm": "3.0.0",
+    "micromark-extension-math": "3.1.0",
     "pdfkit": "0.20.2",
     "pptxgenjs": "4.0.1",
     "saxes": "5.0.1",

@@ -22,6 +22,7 @@ export * from "./docgen.js";
 export * from "./references.js";
 export * from "./shares.js";
 export * from "./python.js";
+export * from "./audio.js";
 export * from "./instructions.js";
 export * from "./memory-proposals.js";
 export * from "./dreaming.js";
@@ -189,8 +190,8 @@ export const AdminSkill = z.object({
   /**
    * available: offered · not_installed: `pnpm skills:install` not run · broken: the installed copy changed ·
    * needs_python: SKILL_PYTHON missing or unusable · disabled: PYTHON_RUN off (#47) · needs_account: the python_run
-   * account is missing or its self-check failed (#47) · planned: comes with a later issue · document: becomes a
-   * server function (file tools).
+   * account is missing or its self-check failed (#47) · needs_ffmpeg: no usable ffmpeg (#173) · unavailable: not
+   * macOS (#173) · planned: comes with a later issue · document: becomes a server function (file tools).
    */
   status: z.enum([
     "available",
@@ -199,6 +200,8 @@ export const AdminSkill = z.object({
     "needs_python",
     "disabled",
     "needs_account",
+    "needs_ffmpeg",
+    "unavailable",
     "planned",
     "document",
   ]),
@@ -236,6 +239,8 @@ export type AuthError =
   | "access_denied"
   | "access_not_configured"
   | "access_email_mismatch"
+  /** Passed Access, but no active app account has that email (#178): no session, the blocked screen. */
+  | "access_no_account"
   | "csrf"
   | "unauthenticated"
   | "forbidden"

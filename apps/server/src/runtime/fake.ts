@@ -32,6 +32,9 @@ import {
  *   /long <n>         n words, slowly (to try the stop button)
  *   /artifact <kind> <title>          (next lines: the content; JSON for chart, table, document)
  *   /artifact-slow <kind> <title>     the same, then 4 s more of reply after the artifact is stored
+ *   /artifact-twice <kind> <title>    (next lines: v1, a line "===", v2) creates v1, 2.5 s later stores v2 of it,
+ *                     then 1.5 s more of reply (#172 review: the artifact page follows a run that goes on);
+ *                     `/artifact-twice-slow`: v2 after 14 s (a page whose stream gave up meanwhile recovers)
  *   /artifact-update <id> <field>     (next lines: the new content of that field — content, chart, table, document)
  *                     real calls of our MCP tools `artifact_create` / `artifact_update` with the run's token
  *                     (needs `runTools`, as the FAKE_RUNTIME=1 server registers it; #27)
@@ -57,6 +60,7 @@ import {
  *                     artifact of that file); kind docx|xlsx|pptx|pdf, or hwp for the refusal
  *   /python <scenario> [<fileId>]   a real call of our `python_run` (#47) with the fixed code of `fake-python.ts`
  *                     (sum — of the given CSV, writing 합계.csv —, loop, net) and a short answer
+ *   /audio <fileId> [nodiarize]   a real call of our `audio_transcribe` (#173) on that audio file, and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -122,6 +126,19 @@ function artifactSteps(t: string): FakeStep[] | undefined {
       return s;
     }
   };
+  const twice = /^\/artifact-twice(-slow)?\s+(\w+)\s+(.+)$/.exec(head);
+  if (twice) {
+    const [v1 = "", v2 = ""] = body.split("\n===\n");
+    return [
+      { text: "아티팩트를 만들게요. " },
+      { call: "artifact_create", input: { kind: twice[2]!, title: twice[3]!, content: v1 } },
+      { delayMs: twice[1] ? 14_000 : 2500 },
+      { text: "조금 더 고칠게요. " },
+      { call: "artifact_update", input: { artifactId: "$0.artifactId", content: v2 } },
+      { delayMs: 1500 },
+      { text: "다 고쳤어요." },
+    ];
+  }
   const created = /^\/artifact(-slow)?\s+(\w+)\s+(.+)$/.exec(head);
   if (created) {
     const slow = !!created[1];
@@ -413,6 +430,13 @@ export const defaultScript: FakeScript = (input, memory) => {
     const sc = pythonScenario(py[1] as PythonScenario, py[2]);
     return [{ text: "계산해 볼게요. " }, { call: "python_run", input: sc.input }, { text: sc.answer }];
   }
+  const audio = /^\/audio\s+(\S+)(\s+nodiarize)?$/.exec(t);
+  if (audio)
+    return [
+      { text: "녹음을 화자별로 정리할게요. " },
+      { call: "audio_transcribe", input: { fileId: audio[1]!, ...(audio[2] ? { diarize: false } : {}) } },
+      { text: "대본을 만들었어요." },
+    ];
   const chart = financeChartSteps(t);
   if (chart) return chart;
   if (t === "/watchlist" || t === "내 관심 종목")

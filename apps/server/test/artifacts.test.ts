@@ -947,9 +947,13 @@ describe("artifact routes (#27)", () => {
     const s = await raw(svg);
     expect(s.headers["content-type"]).toBe("image/svg+xml; charset=utf-8");
     expect(s.headers["content-security-policy"]).toBe(artifactCsp([])); // SVG scripts never allowed
+    // Markdown (#172): a page rendered by the server — its raw HTML as text, no script but the Escape bridge.
     const m = await raw(md);
-    expect(m.headers["content-type"]).toBe("text/plain; charset=utf-8");
-    expect(m.body).toBe("# <script>x()</script>");
+    expect(m.headers["content-type"]).toBe("text/html; charset=utf-8");
+    expect(m.headers["content-security-policy"]).toBe(artifactCsp([ESCAPE_BRIDGE_HASH]));
+    expect(m.body).toContain("<h1>&lt;script&gt;x()&lt;/script&gt;</h1>");
+    expect(m.body.split("<script").length).toBe(2);
+    expect(m.body.endsWith(ESCAPE_BRIDGE)).toBe(true);
     const ch = await raw(chart);
     expect(ch.body).toContain("<svg");
     // In the app's frame the server-drawn page allows exactly one script: the Escape bridge (#28).
@@ -1306,7 +1310,12 @@ describe("artifact panel, cards and list (#28)", () => {
     }).artifact.id;
     expect((await get(app, `/a/${svg}/v/1/raw`, f.cookies.owner)).body).not.toContain("postMessage");
     const md = app.artifacts!.create(scope, { kind: "markdown", title: "m", content: "# m" }).artifact.id;
-    expect((await get(app, `/a/${md}/v/1/raw`, f.cookies.owner)).body).toBe("# m");
+    // Markdown (#172): the server-rendered page, with the bridge and only it; the download stays the .md text.
+    const mdRaw = (await get(app, `/a/${md}/v/1/raw`, f.cookies.owner)).body;
+    expect(mdRaw).toContain('<article class="md"><h1>m</h1></article>');
+    expect(mdRaw.endsWith(ESCAPE_BRIDGE)).toBe(true);
+    expect(mdRaw.split("<script").length).toBe(2);
+    expect((await get(app, `/a/${md}/v/1/download`, f.cookies.owner)).body).toBe("# m");
     // Chart and table pages: the bridge and only it; their HTML download stays script-free.
     const table = app.artifacts!.create(scope, {
       kind: "table",

@@ -6,6 +6,7 @@ import {
   type ChartSpec,
   type TableData,
 } from "@agentlee/shared";
+import { MARKDOWN_STYLE, markdownHtml } from "./markdown.js";
 
 /**
  * How an artifact version is served (#27, PRD FR-6.5, docs/decisions/isolation.md "아티팩트 서빙").
@@ -527,9 +528,16 @@ export const ESCAPE_BRIDGE = `<script>${ESCAPE_SCRIPT}</script>`;
 /** The bridge's `script-src` source. */
 export const ESCAPE_BRIDGE_HASH = hashOf(ESCAPE_SCRIPT);
 
+const PRE_STYLE =
+  "pre{white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,monospace}";
+
 /**
  * What `/a/:id/v/:ver/raw` sends for one version: HTML with its scripts allowed by hash, SVG as an image document
- * (scripts never allowed), chart and table drawn by the server (no script), markdown and code as plain text.
+ * (scripts never allowed), chart, table, markdown and code as pages made by the server (no script; markdown
+ * rendered by `markdown.ts`, code escaped in a `<pre>`). The app shows markdown and code itself (#172) — these
+ * pages are for opening the original directly and for the PDF export. Before #172 markdown and code were sent as
+ * text/plain: the browser's plain-text view follows the system's dark mode (light text, transparent background),
+ * which on the frame's white background was a blank page.
  * `document` has no original yet (#49/#22): undefined.
  */
 export function serveVersion(
@@ -547,17 +555,26 @@ export function serveVersion(
     }
     case "svg":
       return { type: "image/svg+xml; charset=utf-8", body: content, csp: none };
-    case "markdown":
-    case "code":
-      return { type: "text/plain; charset=utf-8", body: content, csp: none };
     // Server-drawn pages (everything in them escaped, so the bridge at the end always runs): no script, or in the
     // app's frame exactly the bridge.
+    case "markdown":
+    case "code":
     case "chart":
     case "table": {
       const body =
         kind === "chart"
           ? page(title, chartPage(title, JSON.parse(content) as ChartSpec))
-          : page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`);
+          : kind === "table"
+            ? page(title, `<h1>${escapeHtml(title)}</h1>${tableHtml(JSON.parse(content) as TableData)}`)
+            : kind === "markdown"
+              ? page(
+                  title,
+                  `<style>${MARKDOWN_STYLE}</style><article class="md">${markdownHtml(content)}</article>`,
+                )
+              : page(
+                  title,
+                  `<style>${PRE_STYLE}</style><h1>${escapeHtml(title)}</h1><pre>${escapeHtml(content)}</pre>`,
+                );
       return opts.escapeBridge
         ? {
             type: "text/html; charset=utf-8",

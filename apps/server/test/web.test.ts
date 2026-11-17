@@ -851,8 +851,15 @@ describe("web tools on our MCP server", () => {
 });
 
 describe("search providers", () => {
-  it("WEB_SEARCH_PROVIDERS: default duckduckgo then google-news; a custom order; unknown names refused", () => {
-    expect(loadConfig({ NODE_ENV: "test" }).webSearchProviders).toEqual(["duckduckgo", "google-news"]);
+  it("WEB_SEARCH_PROVIDERS: default google, duckduckgo, then google-news; a custom order; unknown names refused", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).webSearchProviders).toEqual([
+      "google",
+      "duckduckgo",
+      "google-news",
+    ]);
+    expect(
+      loadConfig({ NODE_ENV: "test", WEB_SEARCH_PROVIDERS: "duckduckgo,google" }).webSearchProviders,
+    ).toEqual(["duckduckgo", "google"]);
     expect(loadConfig({ NODE_ENV: "test", WEB_SEARCH_PROVIDERS: "google-news" }).webSearchProviders).toEqual([
       "google-news",
     ]);

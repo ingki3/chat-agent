@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { deny } from "../auth/plugin.js";
+import { deny, passwordChangePending } from "../auth/plugin.js";
 import type { UserStore } from "../auth/users.js";
 import { isApiPath } from "../paths.js";
 import { can, type Action, type ResourceRef } from "./policy.js";
@@ -138,7 +138,7 @@ export function registerResourceCheck(app: FastifyInstance): void {
     if (req.ctx.emailMismatch) return refuse(403, "access_email_mismatch");
     const user = req.ctx.user;
     if (!user) return refuse(401, "unauthenticated");
-    if (user.mustChangePassword) return refuse(403, "password_change_required");
+    if (passwordChangePending(req, user)) return refuse(403, "password_change_required");
     const resource = app.resources.load(rule.kind, resourceId(req, rule));
     if (!resource) {
       reply.header("Cache-Control", "no-store");
@@ -171,7 +171,7 @@ export function watchAccess(
   // change), the account is active and needs no password change, the route's role rule, then the resource.
   const stillAllowed = () => {
     const user = token ? users?.sessionUser(token) : undefined;
-    if (!user || user.id !== userId || !user.active || user.mustChangePassword) return false;
+    if (!user || user.id !== userId || !user.active || passwordChangePending(req, user)) return false;
     if (cfg.auth === "admin" && user.role !== "admin") return false;
     if (!rule || !ref) return true;
     const fresh = app.resources.load(ref.kind, ref.id);

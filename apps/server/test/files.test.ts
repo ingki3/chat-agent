@@ -219,6 +219,16 @@ const PNG = Buffer.concat([
 ]);
 const JPG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 2)]);
 const PDF = Buffer.from("%PDF-1.7\n1 0 obj <<>> endobj\n%%EOF\n");
+/** ISO base media with a brand; an ID3-tagged MP3; a RIFF/WAVE header (#173). */
+const isoBmff = (brand: string) =>
+  Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from(`ftyp${brand}`, "latin1"), Buffer.alloc(64, 0)]);
+const MP3 = Buffer.concat([Buffer.from("ID3\x04\x00\x00", "latin1"), Buffer.alloc(64, 0)]);
+const WAV = Buffer.concat([
+  Buffer.from("RIFF", "latin1"),
+  Buffer.from([36, 0, 0, 0]),
+  Buffer.from("WAVEfmt ", "latin1"),
+  Buffer.alloc(64, 0),
+]);
 
 const SAMPLES: Record<FileKind, { name: string; body: Buffer }> = {
   pdf: { name: "보고서.pdf", body: PDF },
@@ -235,12 +245,33 @@ const SAMPLES: Record<FileKind, { name: string; body: Buffer }> = {
   md: { name: "정리.md", body: Buffer.from("# 제목\n\n본문 <b>굵게</b>\n") },
   png: { name: "사진.png", body: PNG },
   jpg: { name: "사진.JPEG", body: JPG },
+  m4a: { name: "회의.m4a", body: isoBmff("M4A ") },
+  mp3: { name: "회의.mp3", body: MP3 },
+  wav: { name: "회의.wav", body: WAV },
+  mp4: { name: "회의.mp4", body: isoBmff("isom") },
 };
 
 describe("supported formats (FR-4.2) and type detection — extension and content", () => {
   it("the allowed list is the PRD's formats, nothing active or executable", () => {
     expect(Object.keys(FILE_KINDS).sort()).toEqual(
-      ["csv", "docx", "hwp", "hwpx", "jpg", "md", "pdf", "png", "pptx", "txt", "xlsx"].sort(),
+      [
+        "csv",
+        "docx",
+        "hwp",
+        "hwpx",
+        "jpg",
+        "md",
+        "pdf",
+        "png",
+        "pptx",
+        "txt",
+        "xlsx",
+        // #173: audio and video for audio_transcribe (no text extraction).
+        "m4a",
+        "mp3",
+        "wav",
+        "mp4",
+      ].sort(),
     );
     for (const ext of ["svg", "html", "htm", "xml", "xhtml", "js", "exe", "zip", "gif", "doc", "webp", ""])
       expect(fileKindOf(`a.${ext}`), ext).toBeUndefined();
@@ -262,7 +293,9 @@ describe("supported formats (FR-4.2) and type detection — extension and conten
       for (const claimed of Object.keys(SAMPLES) as FileKind[]) {
         // Plain-text formats are the same thing under three names.
         const text = (k: FileKind) => ["txt", "md", "csv"].includes(k);
-        const want = claimed === kind || (text(claimed) && text(kind));
+        // So are M4A and MP4 (one ISO base media container; ffmpeg reads the audio track of either).
+        const iso = (k: FileKind) => ["m4a", "mp4"].includes(k);
+        const want = claimed === kind || (text(claimed) && text(kind)) || (iso(claimed) && iso(kind));
         if (contentMatches(file, claimed) !== want) failures.push(`${kind} as ${claimed}: expected ${want}`);
       }
     }

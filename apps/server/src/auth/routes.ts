@@ -9,9 +9,10 @@ import {
 import type { z } from "zod";
 import type { Config } from "../config.js";
 import { dummyHash, hashPassword, verifyPassword } from "./passwords.js";
-import { deny, SESSION_COOKIE, sessionCookie } from "./plugin.js";
+import { logEvent } from "../logging.js";
+import { authUserFor, deny, SESSION_COOKIE, sessionCookie } from "./plugin.js";
 import { FailureLimiter } from "./rate-limit.js";
-import { SESSION_TTL_MS, toAuthUser, type UserRow, type UserStore } from "./users.js";
+import { SESSION_TTL_MS, type UserRow, type UserStore } from "./users.js";
 
 export type AuthRouteOptions = {
   /** Failed logins allowed per account / per client IP within `windowMs`. */
@@ -49,7 +50,7 @@ export function registerAuthRoutes(
   const state = (req: FastifyRequest, user: UserRow | null): AuthStateT =>
     AuthState.parse({
       setupRequired: users.count() === 0,
-      user: user ? toAuthUser(user) : null,
+      user: user ? authUserFor(req, user) : null,
       accessEmail: req.ctx.accessEmail ?? null,
       adminEmail: config.adminEmail,
     });
@@ -115,6 +116,38 @@ export function registerAuthRoutes(
       if (req.ctx.sessionToken) users.deleteSession(req.ctx.sessionToken);
       startSession(req, reply, fresh.id);
       return reply.header("Cache-Control", "no-store").send(state(req, fresh));
+    },
+  );
+
+  /**
+   * Single sign-on through Cloudflare Access (#178, PRD FR-15.8). The trust boundary has already verified the
+   * request's Access JWT (signature, AUD, issuer, exp/nbf) and set `accessEmail`; this turns that login into an app
+   * session for the one active account with exactly that email, so the public host needs no app password.
+   *
+   * An explicit call (the web app makes it on boot when it is signed out through Access), not a side effect of any
+   * request: as a POST to an API route it passes the CSRF check (own Origin + custom header), so no other site can
+   * trigger it — and a session is only ever started here, in one place, with a fresh token.
+   * Refused: not an Access request; a session of another account (`access_email_mismatch`, kept so the #36 admin
+   * email switch still works); no active account with the email (`access_no_account` — deactivated, deleted, never
+   * added, or a pending admin email change's new address).
+   */
+  app.post(
+    "/api/auth/access-login",
+    { config: { auth: "public", noResource: "session endpoint" } },
+    async (req, reply) => {
+      const email = req.ctx.accessEmail;
+      if (req.ctx.origin !== "edge" || email === undefined) return deny(reply, 403, "access_denied");
+      if (req.ctx.emailMismatch) return deny(reply, 403, "access_email_mismatch");
+      // Already signed in as this account: nothing to do (a second tab booting at the same time).
+      if (req.ctx.user) return reply.header("Cache-Control", "no-store").send(state(req, req.ctx.user));
+      const user = users.byEmail(email);
+      if (!user?.active || user.email !== email) return deny(reply, 403, "access_no_account");
+      // Never adopt a token the browser brought (session fixation): whatever cookie it sent resolved to no usable
+      // session (else `ctx.user` or the mismatch above), and the new session always gets a new random token that
+      // replaces it.
+      startSession(req, reply, user.id);
+      logEvent(req.log, "info", "auth.access_login", { userId: user.id });
+      return reply.header("Cache-Control", "no-store").send(state(req, user));
     },
   );
 

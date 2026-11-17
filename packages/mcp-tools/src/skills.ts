@@ -21,11 +21,16 @@ export type SkillSecret = {
   env: string;
   when?: (input: Record<string, unknown>) => boolean;
   /**
-   * Where the skill sends it (#129): the query parameter `param` of a request to `host`. The host's per-send check
-   * allows the value there only (its first exact pair); anywhere else a request carrying it is refused.
+   * Where the skill sends it (#129): the query parameter `param` of a request to `host` (Alpha Vantage `apikey=`),
+   * or the request header `header` of a request to `host` (Serper `X-API-KEY`, #171). The host's per-send check
+   * allows the value there only (its first exact pair or header line); anywhere else — another parameter, another
+   * header, the body, another host — a request carrying it is refused.
    */
-  place?: { host: string; param: string };
+  place?: SecretPlace;
 };
+
+/** Where a declared secret may go out (`SkillSecret.place`): a query parameter or a request header of one host. */
+export type SecretPlace = { host: string; param: string } | { host: string; header: string };
 
 /** One search result a skill returned, to register as a source (#50). Untrusted text: bounded by the host. */
 export type SearchHit = { url: string; title: string; site?: string; publishedAt?: string; snippet?: string };
@@ -51,6 +56,11 @@ export type SkillSpec = SkillInfo & {
   /** Exit codes whose stdout is a result (default: 0 only). */
   okExitCodes?: readonly number[];
   timeoutMs?: number;
+  /**
+   * Calls one run may make at most (#171: a paid API — each call costs credits). Counted per run across the skill
+   * tool and its web_search provider; beyond it the tool answers `skill_quota` and the provider is skipped.
+   */
+  maxCallsPerRun?: number;
   /**
    * The search results in a successful output (#50): each becomes a source of the conversation, and the host
    * writes its id into the item as `sourceId` (the item is an object of the parsed output).
@@ -197,8 +207,114 @@ export const KR_STOCK_SKILL: SkillSpec = {
   timeoutMs: 40_000,
 };
 
+/** Serper's API host (#171): the search, news and video endpoints and `/resolve`. */
+export const SERPER_HOST = "google.serper.dev";
+
+/**
+ * A Google redirect link (`https://www.google.com/goto?url=…`, `/url?q=…`) that Serper's `/resolve` did not turn
+ * into the real address (#171): never registered as a source — where it leads was never checked. Anything that is
+ * not an absolute URL counts as one too (not usable as a source either).
+ */
+export function isGoogleRedirect(raw: string): boolean {
+  if (raw.toLowerCase().includes("google.com/goto?")) return true;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return true;
+  }
+  const host = u.hostname.toLowerCase();
+  return /(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$/.test(host) && /^\/(goto|url)\/?$/i.test(u.pathname);
+}
+
+/** Results one search-google output registers as sources at most (a page of each kind is ~10). */
+const SERPER_HITS_MAX = 30;
+
+/**
+ * `search-google` — Google web, news and video search through the Serper API (#171). `scripts/serper_search.py`
+ * (standard library urllib): POST JSON to `google.serper.dev/<search|news|videos>` with the key in the `X-API-KEY`
+ * header, then `/resolve` (free, same host) when a link is still a Google redirect. `--raw` prints Serper's JSON
+ * response (its default output is a text summary, not JSON). Each search costs a credit: capped per run.
+ */
+export const SEARCH_GOOGLE_SKILL: SkillSpec = {
+  name: "search-google",
+  description:
+    "Google web, news and video search (Serper API). Returns Serper's JSON: organic (web), news or videos results with title, link, snippet and date when known; each usable result gets a sourceId. Results are leads, not evidence: read a page with web_fetch before stating or citing what it says. Each call costs API credits (at most 5 per answer): prefer one good query.",
+  input: {
+    query: text(300).describe("Search words (Google operators such as site: or quotes are allowed)."),
+    type: z.enum(["search", "news", "videos"]).optional().describe("search = web (default), news, videos."),
+    gl: z
+      .string()
+      .regex(/^[a-z]{2}$/)
+      .optional()
+      .describe("Country code (default kr)."),
+    hl: z
+      .string()
+      .regex(/^[a-z]{2}(-[a-z]{2})?$/)
+      .optional()
+      .describe("Language code (default ko)."),
+    tbs: z
+      .enum(["h", "d", "w", "m", "y"])
+      .optional()
+      .describe("Time range: past hour, day, week, month or year."),
+    page: z.number().int().min(1).max(5).optional().describe("Result page (default 1)."),
+    num: z.number().int().min(1).max(10).optional().describe("Results per page (default ~10)."),
+  },
+  finance: false,
+  kind: "python",
+  files: ["scripts/serper_search.py"],
+  args: (i) => [
+    `--type=${String(i.type ?? "search")}`,
+    `--q=${String(i.query)}`,
+    `--gl=${String(i.gl ?? "kr")}`,
+    `--hl=${String(i.hl ?? "ko")}`,
+    ...(i.tbs ? [`--tbs=${String(i.tbs)}`] : []),
+    ...(i.page !== undefined ? [`--page=${Number(i.page)}`] : []),
+    ...(i.num !== undefined ? [`--num=${Number(i.num)}`] : []),
+    "--raw",
+  ],
+  hosts: [SERPER_HOST],
+  secrets: [{ env: "SERPER_API_KEY", place: { host: SERPER_HOST, header: "X-API-KEY" } }],
+  // A search right after another can wait for /resolve (the script sleeps up to 35 s once for `retryAfter`).
+  timeoutMs: 60_000,
+  maxCallsPerRun: 5,
+  // { organic | news | videos: [{ title, link, snippet, date?, source?, ... }], searchParameters, credits }
+  searchHits: (output) => {
+    if (!output || typeof output !== "object" || Array.isArray(output)) return [];
+    const o = output as Record<string, unknown>;
+    return (["organic", "news", "videos"] as const)
+      .flatMap((k) => {
+        const list = o[k];
+        if (!Array.isArray(list)) return [];
+        return list.flatMap((item: unknown) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+          const x = item as Record<string, unknown>;
+          const url = str(x.link);
+          const title = str(x.title);
+          if (!url || !title || isGoogleRedirect(url)) return [];
+          const site = str(x.source);
+          const publishedAt = str(x.date);
+          const snippet = str(x.snippet);
+          return [
+            {
+              item: x,
+              hit: {
+                url,
+                title,
+                ...(site ? { site } : {}),
+                ...(publishedAt ? { publishedAt } : {}),
+                ...(snippet ? { snippet } : {}),
+              },
+            },
+          ];
+        });
+      })
+      .slice(0, SERPER_HITS_MAX);
+  },
+};
+
 /** Skills wrapped so far, installed from the admin's skill folders into the server's own (`pnpm skills:install`). */
-export const SKILL_SPECS: readonly SkillSpec[] = [GOOGLE_NEWS_SKILL, KR_STOCK_SKILL];
+export const SKILL_SPECS: readonly SkillSpec[] = [GOOGLE_NEWS_SKILL, KR_STOCK_SKILL, SEARCH_GOOGLE_SKILL];
 
 /** Where each PRD §7 skill stands (docs/skills.md has the details). */
 export type CatalogueStatus =
@@ -251,6 +367,8 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
     secrets: ["GEMINI_API_KEY"],
   }),
   entry("google-news-search-skill", "implemented"),
+  // Not in PRD §7: added on request (#171). Serper API key in `.env`; also the first web_search provider.
+  entry("search-google", "implemented", { secrets: ["SERPER_API_KEY"] }),
   // Imports a package outside its folder (simpleclaw, not installed); its news path is web_search + web_fetch now.
   entry("realtime-lookup-skill", "planned", { issue: "#50 후속 (스포츠·날씨 구조화 조회)" }),
   // URL summaries: web_fetch + the runtime's own model. YouTube transcripts: not yet.
@@ -261,6 +379,8 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   entry("pptx", "document", { issue: "#48, #49" }),
   // python_run (#47): a server tool — the sandboxed interpreter with pinned numpy/pandas in a working folder per call.
   entry("python-scratchpad", "tools", { issue: "#47" }),
+  // audio_transcribe (#173): a server tool — local Whisper + Nemotron diarization; OpenRouter only as the fallback.
+  entry("audio-transcription", "tools", { issue: "#173", secrets: ["OPENROUTER_API_KEY"] }),
 ];
 
 /** Every secret env name any skill may get (the server reads exactly these from its environment). */

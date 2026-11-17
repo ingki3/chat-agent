@@ -488,16 +488,17 @@ rm ~/.agentlee/probe-headers.txt
 
 ### 15.2 설치·확인
 ```
-pnpm skills:install                       # 허용 목록 스킬 모두 (google-news-search-skill, kr-stock-skill)
+pnpm skills:install                       # 허용 목록 스킬 모두 (google-news-search-skill, kr-stock-skill, search-google)
 pnpm skills:install kr-stock-skill        # 하나만
 pnpm skills:status                        # 설치 상태·python·설정된 비밀 이름(값은 안 보임)
 ```
 - 설치나 원본 갱신 뒤에는 서비스를 다시 시작한다(서버는 시작할 때 스킬 폴더를 검사한다).
 - 원본 파일이 심볼릭 링크·하드링크이거나 경로에 심볼릭 링크가 있으면 설치를 거부한다.
+  - **예외는 원본 폴더 바로 아래의 스킬 폴더 하나뿐이다**(관리자 배치: `~/.claude/skills/search-google` → `~/Dev/skills/search-google`). `findSource`가 그 링크를 실제 경로로 바꾼 뒤, 그 **실제 폴더 아래**의 파일은 위 규칙 그대로 본다(파일·중간 폴더가 링크면 거부, 끊긴 링크는 "not found"). 복사본에는 링크가 남지 않는다(#171, `skills.test.ts`).
 - 관리자 API: `GET /api/admin/skills`는 §7 목록과 상태를 돌려준다(`available`·`not_installed`·`broken`·`needs_python`·`planned`·`document`).
 
 ### 15.3 비밀
-- `.env`에 이름 그대로 넣는다. 예: `ALPHAVANTAGE_API_KEY=…`(선택, `kr-stock-skill`의 `alpha-quote`만 쓴다).
+- `.env`에 이름 그대로 넣는다. 예: `ALPHAVANTAGE_API_KEY=…`(선택, `kr-stock-skill`의 `alpha-quote`만 쓴다), `SERPER_API_KEY=…`(`search-google`, #171 — 원본 스킬은 `~/.zshrc`의 값을 읽지만 서버는 `.env`의 값만 쓴다).
 - 서버는 `SKILL_SECRET_NAMES`에 있는 이름만 읽는다. 그 값은 그 비밀을 선언한 스킬 프로세스의 환경 변수로만 넘긴다. 인자·로그·결과에는 남지 않는다.
 - 원본 스킬 폴더의 `config.json`·`.env`에 있는 키는 서버가 쓰지 않는다(복사하지 않는다). 쓰려면 `.env`로 옮긴다.
 - 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
@@ -514,7 +515,8 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 
 ### 15.5 스킬 추가
 1. 원본 스킬을 읽고 `docs/skills.md`에 적는다: 진입점, 입출력, 의존성, 비밀, 호스트.
-   - 표준 라이브러리 python 또는 node여야 한다. **네트워크(`hosts`)가 있으면 python이고 요청은 urllib(또는 http.client)**여야 한다 — §42의 부트가 그 `send`에서 요청마다 서버 승인을 받는다. 소켓을 직접 쓰는 스킬(`socket`·`ssl.wrap_socket`·asyncio), 부트의 패치(`http.client.HTTPConnection.send`)나 fd 3을 건드리는 스킬은 승인을 지나지 않으므로 받지 않는다(§42.3의 받아들인 한계는 이 검토로 관리한다). 네트워크 node 스킬은 `skill_unavailable`로 거부된다. 선언한 비밀을 URL에 싣는 스킬은 `secrets`에 `place`(호스트·매개변수)를 적는다.
+   - 표준 라이브러리 python 또는 node여야 한다. **네트워크(`hosts`)가 있으면 python이고 요청은 urllib(또는 http.client)**여야 한다 — §42의 부트가 그 `send`에서 요청마다 서버 승인을 받는다. 소켓을 직접 쓰는 스킬(`socket`·`ssl.wrap_socket`·asyncio), 부트의 패치(`http.client.HTTPConnection.send`)나 fd 3을 건드리는 스킬은 승인을 지나지 않으므로 받지 않는다(§42.3의 받아들인 한계는 이 검토로 관리한다). 네트워크 node 스킬은 `skill_unavailable`로 거부된다. 선언한 비밀을 URL에 싣는 스킬은 `secrets`에 `place`(호스트·매개변수 `{host, param}`)를, 헤더에 싣는 스킬은 `place`(호스트·헤더 `{host, header}`, #171)를 적는다. 본문(POST)은 `Content-Length` 하나로 알리고 다음 send 한 번에 통째로 보내야 승인된다(urllib·http.client의 bytes 본문이 그렇다, §42.2). 선언한 비밀은 본문에 싣지 못한다.
+   - **유료 API**(호출마다 비용)면 `maxCallsPerRun`(실행당 호출 상한)을 적는다. 넘으면 도구는 `skill_quota`, `web_search` 제공자는 건너뛴다.
    - 자식 프로세스가 필요하면 샌드박스를 풀지 말고 서버 함수로 만든다.
 2. `skills.ts`에 `SkillSpec`을 추가하고 `SKILL_SPECS`·`SKILL_CATALOGUE`(상태 `implemented`)에 넣는다.
    - **인자는 입력 필드마다 `--flag=값` 하나로만** 만든다.
@@ -525,7 +527,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
    ```
    SKILLS_LIVE=1 pnpm vitest run apps/server/test/skills.test.ts
    ```
-   `TEST_SKILL_PYTHON` 또는 uv가 필요하다.
+   `TEST_SKILL_PYTHON` 또는 uv가 필요하다. 키가 필요한 호출은 그 키가 이 셸 환경에 있을 때만 실제로 부른다(`ALPHAVANTAGE_API_KEY`, `SERPER_API_KEY` — search-google은 Serper 1 크레딧). 없으면 `skill_unconfigured`를 확인하고 넘어간다. 평소 시험(`pnpm test`)은 실제 API를 부르지 않는다(목 서버·합성 키).
 5. `pnpm skills:install <이름>` 후 재시작한다.
 
 ## 16. 사용량 기록 (#44)과 화면·비용 (#32)
@@ -590,9 +592,11 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - `web_fetch`는 모든 활성 사용자의 run에 항상 있다. 따로 설치할 것이 없다. macOS가 아니면 `web_unavailable`로 거부한다(샌드박스 없음).
 - `web_search`는 검색 제공자가 하나라도 있을 때만 있다. `.env`(없으면 기본값):
   ```
-  WEB_SEARCH_PROVIDERS=duckduckgo,google-news   # 기본. 순서대로 시도
-  WEB_SEARCH_PROVIDERS=google-news              # DuckDuckGo 약관이 걱정될 때(뉴스만, 원문 링크 아님)
+  WEB_SEARCH_PROVIDERS=google,duckduckgo,google-news   # 기본. 순서대로 시도
+  WEB_SEARCH_PROVIDERS=duckduckgo,google-news          # Serper 크레딧을 web_search에 쓰지 않을 때
+  WEB_SEARCH_PROVIDERS=google-news                     # DuckDuckGo 약관이 걱정될 때(뉴스만, 원문 링크 아님)
   ```
+  - `google`(#171): 설치된 `search-google` 스킬(Serper의 Google 웹 검색)을 같은 샌드박스 경로로 `{ query, type: "search", num: maxResults }`로 부른다. **`search-google`이 설치돼 있고 `SKILL_PYTHON`과 `.env`의 `SERPER_API_KEY`가 있을 때만** 생긴다(없으면 이 제공자는 없고 다음 제공자가 답한다 — 기존 대체 순서 그대로). 생겨도 호출마다 그 사용자가 `search-google`을 쓸 수 있을 때만 쓴다: 서버 허용 스위치, 사용자별 스킬 목록(목록 방식 사용자는 켜야 한다, §15.4), 예약 실행의 스킬 선택. 아니면 건너뛴다. 한 실행에서 스킬 도구와 합쳐 5번까지(`maxCallsPerRun`), 그다음은 건너뛴다. 실패(시간 초과·HTTP 오류)는 다음 제공자로 넘어가고, 송신 가드가 막은 요청(§42)은 다음 제공자로 넘기지 않는다. 링크는 Serper `/resolve`로 바꾼 실제 주소이고, 바뀌지 않은 Google 중계 링크(`google.com/goto?url=…`)는 결과·출처에서 뺀다.
   - `duckduckgo`: 키 없음. 공식 API가 아니어서 약관상 회색 지대이고, 연달아 쓰면 봇 확인 페이지가 온다(`web_search_blocked` → 다음 제공자).
   - `google-news`: `google-news-search-skill`이 설치돼 있고 `SKILL_PYTHON`이 있어야 한다(§15). 링크가 Google 중계 주소라 `web_fetch`로 원문이 열리지 않는다.
   - 바꾼 뒤에는 서비스를 다시 시작한다.
@@ -1752,20 +1756,24 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 ### 42.2 동작
 - **네트워크 부트(`SKILL_NET_BOOT`):** 네트워크 python 스킬은 도구로 부르든 `web_search` 제공자로 부르든 `python -I -S -B -c <부트> <스크립트> …`로 돈다. 부트는 스크립트보다 먼저
   - urllib 리다이렉트를 거부한다(`redirect_request` → `HTTPError`, §40.1의 그 방식).
-  - `http.client.HTTPConnection.send`를 감싼다: 소켓에 쓰기 직전, **바로 그 바이트**(스크립트가 합치고 urllib이 인코딩한 요청 줄·모든 헤더·본문, 프록시 CONNECT 포함 — TLS 전 평문)를 연결 호스트와 함께 JSON 한 줄로 **fd 3**에 쓰고 답을 읽는다. `1`이면 보내고, 그 밖(거부, fd 3이 없음, 읽기 실패)이면 `ConnectionError` — urllib에서는 `URLError`라 스크립트가 보통 네트워크 실패로 알린다. 원래 `send`는 클로저 안에만 있다.
+  - `http.client.HTTPConnection.send`를 감싼다: 연결이 아직 없으면 **먼저 연결한다**(http.client는 첫 send 안에서 늦게 연결한다 — 그래서 프록시 CONNECT가 요청 머리보다 먼저 승인·전송되고, 머리와 본문 사이에 끼지 않는다. 리뷰 #174 1차 P1). 그다음 소켓에 쓰기 직전, **바로 그 바이트**(스크립트가 합치고 urllib이 인코딩한 요청 줄·모든 헤더·본문, 프록시 CONNECT 포함 — TLS 전 평문)를 연결 호스트와 함께 JSON 한 줄로 **fd 3**에 쓰고 답을 읽는다. `1`이면 보내고, 그 밖(거부, fd 3이 없음, 읽기 실패)이면 `ConnectionError` — urllib에서는 `URLError`라 스크립트가 보통 네트워크 실패로 알린다. 원래 `send`는 클로저 안에만 있다.
 - **서버의 승인(`skillSendGate`):** 실행기가 fd 3 소켓을 받아(`runIsolated`의 `gate`, 샌드박스 안에서도 상속 소켓이라 동작 — macOS 시험) 줄마다
   - 연결 호스트가 그 스킬의 `hosts`인지,
-  - 스킬이 **선언한 자기 비밀은 선언한 자리 하나만** 빼고(`SkillSecret.place`: `kr-stock-skill` Alpha Vantage 키는 `www.alphavantage.co` 요청 대상의 첫 `apikey=<키>` 한 쌍 — 금융 DART 예외와 같은 규칙, 그 호출이 키를 받을 때(`when`)만),
+  - 스킬이 **선언한 자기 비밀은 선언한 자리 하나만** 빼고(`SkillSecret.place`: `kr-stock-skill` Alpha Vantage 키는 `www.alphavantage.co` 요청 대상의 첫 `apikey=<키>` 한 쌍 — 금융 DART 예외와 같은 규칙, 그 호출이 키를 받을 때(`when`)만. `search-google` Serper 키(#171)는 `google.serper.dev` 요청 머리의 첫 `X-API-KEY: <키>` 헤더 줄 하나 — 이름은 대소문자 무관(urllib은 `X-api-key`로 쓴다), 값은 정확히 그 키. 그 이름의 헤더가 둘 이상이면 값과 상관없이 거부 — 리뷰 #174 1차 P2),
+  - **머리의 모든 헤더 줄은 필드 하나여야 한다**(리뷰 #174 2차): RFC 9110 토큰 이름, 이름 바로 뒤 콜론(앞에 공백 없음), 접힌 줄(obs-fold, SP·HTAB로 시작하는 줄) 없음, 줄 안의 CR·LF 없음. 하나라도 어기면 요청 전체를 거부한다 — `X-Debug: x␍␊ X-API-KEY: <키>`는 파서에게 X-Debug의 값이지 키 헤더가 아니다. 이름은 공백을 깎지 않고 그대로(대소문자만 무시) 센다.
   - 나머지 전체를 `carriesSecret`(UTF-8 바이트 뷰 포함, 등록부 + `.env`의 모든 스킬 비밀)으로 본다.
+  - **본문(#171):** http.client는 POST 본문을 머리와 **따로** send한다. 그래서 승인은 머리의 `Content-Length` 하나가 알린 길이만큼의 본문이 **바로 다음 send 한 번에, 같은 호스트로** 오는 것만 받는다(짧거나 길거나 둘로 나뉘거나, 다른 호스트, `Transfer-Encoding`, `Content-Length` 둘, `SKILL_BODY_MAX` 192KB 초과는 거부). 본문은 그대로의 바이트와 함께, JSON이면 **풀어낸 문자열·키**로도 본다 — python `json.dumps`는 한글을 `\uXXXX`로 쓰므로 바이트만 보면 한글 비밀을 놓친다. 선언한 비밀은 본문에서는 예외가 없다(거부).
   한 번 거부하면 그 호출의 이후 요청도 모두 거부하고, 한 호출의 요청은 16개까지(`SKILL_SENDS_MAX`), 한 줄은 256KB까지다(`GATE_LINE_MAX`). **길이를 먼저 본다**(#135): 넘는 줄은 개행이 같이 왔어도 승인에 넘기지 않고 거부하며 프로세스를 멈춘다. fd 3 소켓 오류(멈추거나 끝난 뒤의 정리 오류는 제외)와 줄 초과도 **거부와 같다**(`skillSendGate.deny()`) — 그 뒤로는 아무것도 읽거나 승인하지 않는다.
 - **순서(#135):** 실행기는 프록시 없이 할 수 있는 검사를 먼저 한다 — 고정 사본 확인(`skill_changed`), 정책의 거부(`skillPrecheck`: 인자·없는 비밀·네트워크 node 스킬·python 없음), 송신 승인 준비 — 그다음에야 그 스킬의 송신 프록시(로컬 포트)를 준비한다. 그래서 이런 이유로 거부되는 호출은 프록시를 만들지 않는다. 고정 사본은 프록시 준비 뒤 실행 직전에 **한 번 더** 확인한다(리뷰 #138) — 그 사이 바뀐 사본은 `skill_changed`로 돌지 않는다. 요청 내용의 승인은 스크립트가 보내려는 순간에만 할 수 있으므로 프록시 준비 뒤다(프록시는 CONNECT 전에는 아무 데도 연결하지 않는다).
 - 거부(줄 초과·fd 3 오류 포함)가 있었으면 스크립트가 무엇을 출력했든 결과는 `skill_secret_blocked`다. **모델에게는 보통 실패**(`{"error":"skill_failed"}`, 스크립트가 비정상 종료했을 때와 같은 코드 — §40.2처럼 어떤 값이 비밀인지 답으로 가려내지 못하게). 로그 `skill.finished`의 `skillCode`와 관리자 화면 "스킬 실행 실패"에만 `skill_secret_blocked`. 요청 내용·비밀은 남지 않는다. 남는 차이(받아들인 한계, §40.2와 같음): 막힌 호출은 요청 시간만큼 빨리 끝난다.
 - **네트워크 node 스킬은 거부**(`skill_unavailable`): 부트가 없다. 지금은 없다(`selftest`는 네트워크 없음). 네트워크가 없는 스킬에는 부트도 승인도 없다(밖으로 나갈 곳이 없고, 결과는 §15.3대로 가려진다).
-- `web_search`의 Google News 제공자도 같은 실행기를 지난다. `WebService.search`가 먼저 검색어를 보고 미끼로 바꾸며(§40.2), 합친 `q`가 걸리면 `web_search_unavailable`(다음 제공자).
+- `web_search`의 Google(`search-google`, #171)·Google News 제공자도 같은 실행기를 지난다. `WebService.search`가 먼저 검색어를 보고 미끼로 바꾸며(§40.2), 합친 `q`가 걸리면 `web_search_unavailable`(다음 제공자). 실행이 실패하면(시간 초과·HTTP 오류·`skill_failed`) 다음 제공자로 넘어가지만, Google 제공자의 송신이 승인 게이트에서 거부되면(`skill_secret_blocked`) 다음 제공자로 넘기지 않고 그 검색을 끝낸다 — 그 검색어를 다른 제공자로 보내지 않기 위해서다.
 
 ### 42.3 남는 경로 (범위 밖 — 이유)
 - **http.client 밖의 송신 (받아들인 한계, P3 — #135에서 유지):** 스크립트가 소켓을 직접 쓰거나(`socket`·`ssl.wrap_socket`·asyncio·`sendfile`), 부트의 패치를 되돌리거나(원래 `send`는 클로저에만 있지만 `inspect.getclosurevars`·GC 탐색으로 닿는다 — python 안에서 완전히 숨길 수는 없다), fd 3을 닫고 자기 socketpair로 바꾸면(리뷰 #132 2차 재현) 승인을 지나지 않는다. 지금 두 스크립트는 urllib만 쓰고, 실행되는 것은 검사·고정된 사본뿐이다(바뀌면 `skill_changed`). 스킬을 추가·갱신할 때 §15.5의 조건을 확인한다. 핀 검사는 내용이 그대로인지를 볼 뿐, HTTP 구현이 안전한지를 보증하지는 않는다.
-- **선언한 비밀의 원래 자리:** Alpha Vantage 키는 `www.alphavantage.co`의 `apikey=`로 나간다(목적). 다른 허용 호스트(`m.stock.naver.com`)·다른 매개변수·헤더·두 번째 쌍으로는 승인되지 않는다.
+- **선언한 비밀의 원래 자리:** Alpha Vantage 키는 `www.alphavantage.co`의 `apikey=`로 나간다(목적). 다른 허용 호스트(`m.stock.naver.com`)·다른 매개변수·헤더·두 번째 쌍으로는 승인되지 않는다. Serper 키는 `google.serper.dev`의 `X-API-KEY` 헤더로 나간다(목적). URL·본문(base64 등 인코딩 포함)·다른 헤더·두 번째 `X-API-KEY`·키를 포함한 더 긴 값·다른 호스트로는 승인되지 않는다.
+- **먼저 연결하기의 남는 흔적(리뷰 #174 1차·2차):** 부트는 승인을 묻기 전에 연결을 연다. 운영에서는 그 연결이 스킬 전용 송신 프록시(로컬 포트)라서, 허용 호스트로의 DNS·TCP는 CONNECT가 승인된 뒤에만 일어난다. CONNECT 승인 뒤에는 TLS 핸드셰이크(SNI = 허용 호스트)까지 머리 승인 전에 끝난다. 그래서 머리가 거부되어도 허용 호스트와의 TLS 연결은 이미 있었을 수 있다. 요청 바이트는 하나도 나가지 않고, 연결에는 모델 입력이 없다(호스트는 정의의 고정값).
+- **거부된 본문 앞의 머리(#171):** 본문이 거부되면 그 앞의 머리(선언한 자리의 키 포함)는 이미 나갔다. 요청은 본문 없이 끊기므로 Serper는 그 요청을 처리하지 않는다. 머리에는 모델 입력이 없다(경로 `/search` 등 고정값, 키는 자기 자리).
 - **여러 요청에 걸친 재조립·마지막 검사 뒤 등록된 값·UTF-8이 아닌 멀티바이트 인코딩:** §40.1과 같은 결정으로 범위 밖.
 - **렌더러 CDN(§18.4, #51):** 같은 판정기에 넣지 않는다. 브라우저의 요청 가로채기가 **정확한 `CDN_ALLOW_LIST` URL**(상수)과 서버가 넣는 문서 한 번만 내보낸다 — 모델이나 문서가 바꿀 수 있는 URL·쿼리가 없다. 헤더는 Chromium 자신의 것이고 쿠키·저장소 없는 새 프로필이다. 실을 재료가 없으니 검사할 것이 없다.
 - **연결 갱신(ChatGPT 토큰 갱신, `connections/chatgpt.ts`):** 같은 판정기에 넣지 않는다. 고정 URL(`auth.openai.com/oauth/token`)에 **갱신 토큰을 보내는 것이 목적**이다 — 판정기는 정의상 이 요청을 막는다. 본문은 고정 모양(`client_id`·`grant_type`·`refresh_token`·`scope`)이고 모델 입력이 없다.
@@ -1781,6 +1789,7 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
   - 실제 python(부트 + fd 3): 합친 질의는 보내기 전에 거부되어 사이트가 받은 요청 0개, 승인이 본 것은 urllib이 인코딩한 요청 줄 그대로. 보통 요청은 승인된 그대로 1개. 선언 키는 자리에서만, 같은 키를 기호에도 넣으면 0개. 리다이렉트는 요청 1개 뒤 `HTTPError 302`. fd 3이 없으면 아무것도 보내지 않음.
   - macOS + `TEST_SKILL_PYTHON`(독립 실행형 python): `sandboxedSkillRunner`가 샌드박스 안에서 승인 소켓을 쓰고, 거부는 `skill_secret_blocked`(요청 0개), 보통 호출은 결과가 나옴.
   - MCP로 부르면 모델에는 `{"error":"skill_failed"}`, 로그에만 `skill_secret_blocked`(내용 없음).
+- `test/search-google.test.ts`(#171): Serper 키는 `X-API-KEY` 헤더(이름 대소문자 무관)에서만 통과, URL·본문(그대로·base64)·다른 헤더·두 번째 헤더·더 긴 값·다른 허용 호스트·다른 호스트에서는 거부. 본문의 다른 비밀(전체·16자 구간·`\uXXXX`로 쓴 한글 비밀·JSON 키) 거부, 보통 검색어 통과. 본문 길이·나뉨·다른 호스트·chunked·`Content-Length` 둘·192KB 초과 거부. 실제 python(부트 + fd 3)과 목 서버로 머리·본문 두 번의 send가 승인되고 키는 헤더로 도착, 키나 한글 비밀이 검색어에 있으면 서버가 받은 요청 0개. 이 Mac에 원본 `serper_search.py`가 있으면 그 사본(주소만 목 서버로 바꿈)으로 `/search` → `/resolve`와 출처 선택까지 확인. **프록시 경유(리뷰 #174 1차 P1):** CONNECT 프록시를 거치는 http.client 터널(CI에서도)과, 이 Mac에 원본이 있으면 **고치지 않은** 원본 스크립트를 `HTTPS_PROXY` → CONNECT → TLS(시험용 CA가 서명한 `google.serper.dev` 인증서, `SSL_CERT_FILE`)로 돌려, 승인 순서가 늘 CONNECT → 머리 → 본문이고 키는 헤더로만 도착함을 확인(부트의 먼저 연결하기를 빼면 두 시험 모두 실패). 첫 헤더는 다른 값·두 번째 같은 이름 헤더에 키인 경우와 같은 이름 헤더 둘은 거부. **접힌 줄(리뷰 #174 2차):** 공백·탭 접기(실제 http.client가 보낸 바이트로도 — 터널 시험), 콜론 앞 공백·탭, 이름 앞 공백·이름 안 공백·구분자·비ASCII, 빈 이름, 콜론 없음, 줄 안 CR·LF는 거부. 값 둘레의 공백·탭은 통과.
 - `test/web-egress.test.ts`: 제공자와 스킬 도구가 같은 정책으로 실행됨, 실제 python으로 부트가 `urlopen`·`build_opener().open`의 302를 따라가지 않음(대조: 부트 없이는 비밀 URL까지 따라감).
 - `test/skills.test.ts`: 정책 인자에 부트, 실제 샌드박스 탐침 스킬이 부트 아래에서도 같은 결과.
 - 실제 Google News 스크립트(설치 원본, TLS 직접 연결)로 부트 아래 요청 1개가 그대로 승인되어 나감을 손으로 확인했다(2026-11-14).
@@ -2045,9 +2054,9 @@ PRD FR-16.5·16.6·16.7·16.8, spec §3–§10. 코드: `apps/server/src/dreamin
 - **백업**: 새 표는 모두 DB 안이라 매일 백업(§21)에 그대로 들어간다. 글이 있는 칸은 `dreaming_prompts.content`뿐이고 `secrets/columns.ts`에 등록(쓸 때 가림 + 배경 재가림).
 
 
-## 45. Cloudflare Access 동기화 — 미리보기·재시도·관리자 이메일 변경 (#36)
+## 45. Cloudflare Access 동기화 — 미리보기·재시도·관리자 이메일 변경 (#36)·자동 로그인 (#178)
 
-PRD FR-15.2~15.7, FR-1.3, 수용 기준 13. 관리자 → **Access** 탭(`/admin?tab=access`). 앱의 활성 사용자 이메일(관리자 이메일 변경 중이면 새 이메일 포함)을 **등록한 Access 정책 1개의 include 이메일 규칙**과 똑같이 맞춘다. 그 정책의 다른 include 규칙(그룹·도메인 등)과 exclude·require·세션 기간 같은 나머지 설정은 읽은 그대로 다시 쓴다. 다른 정책·다른 애플리케이션은 건드리지 않는다. 코드: `apps/server/src/access/`.
+PRD FR-15.2~15.8, FR-1.3, 수용 기준 13. 관리자 → **Access** 탭(`/admin?tab=access`). 앱의 활성 사용자 이메일(관리자 이메일 변경 중이면 새 이메일 포함)을 **등록한 Access 정책 1개의 include 이메일 규칙**과 똑같이 맞춘다. 그 정책의 다른 include 규칙(그룹·도메인 등)과 exclude·require·세션 기간 같은 나머지 설정은 읽은 그대로 다시 쓴다. 다른 정책·다른 애플리케이션은 건드리지 않는다. 코드: `apps/server/src/access/`.
 
 ### 45.1 토큰과 애플리케이션 등록 (1회)
 
@@ -2106,5 +2115,73 @@ PRD FR-15.2~15.7, FR-1.3, 수용 기준 13. 관리자 → **Access** 탭(`/admin
 
 ### 45.7 시험
 
+- 자동(#178 화면): `e2e/access-sso.spec.ts` — e2e 서버 앞에는 Access가 없어서 Access 층을 라우트 목으로 흉내낸다(성공 뒤는 실제 세션). 부팅 1회 호출, 비밀번호 칸 없음, 성공·계정 없음·mismatch 화면, #36 전환 우선, 로그아웃 → Cloudflare 로그아웃, 여러 탭 동시 부팅, 응답 없는 요청·잠금을 놓지 않는 탭의 시간 제한과 다시 시도. 목 응답은 공용 `AuthState`·`AdminEmailConfirmState` 스키마로 검사하고, 성공 뒤 상태에도 Access 이메일을 유지한다.
+- 자동(#178 자동 로그인): `apps/server/test/access-login.test.ts` — 로컬 JWKS·합성 JWT로 45.8의 발급 조건·거부 경우 전부(계정 없음·비활성·변경 대기 새 이메일, 서명·AUD·발급자·만료·nbf 오류, 서비스 토큰, 로컬, CSRF, 다른 계정 세션), 세션 고정 방지(가져온 쿠키 값을 쓰지 않음), 감사 로그에 id만(이메일·JWT·쿠키 없음).
 - 자동: `apps/server/test/access-sync.test.ts` — Cloudflare API **목 서버**(`test/helpers/cloudflare-mock.ts`, 루프백, 합성 토큰·ID·이메일)로 등록·미리보기(기존 불일치 포함)·반영·revision 충돌·오래된 미리보기·실패 후 저장 유지·멱등 재시도(응답 잃은 쓰기를 반복하지 않음)·429 자동 재시도·`applying` 중 재시작·비활성화 세션 철회·관리자 이메일 보호·관리자 이메일 변경 각 단계 실패·재시작·취소·수동 모드. 화면은 `e2e/access.spec.ts`(e2e 서버는 토큰 없음 = 수동 모드). **실제 Cloudflare API는 시험에서 부르지 않는다.**
 - 수동(실계정): 수용 기준 13 절차(`docs/acceptance.md` AC-13)를 기록 양식 B로 남긴다.
+
+### 45.8 Access 통과 = 앱 로그인 (#178, FR-15.8)
+
+`CF_ACCESS_TEAM_DOMAIN`·`CF_ACCESS_AUD`가 설정된 서버에서, 외부 주소(`PUBLIC_HOST`)로 들어온 사람은 **Access 이메일 인증만으로** 앱에 들어간다. 앱 비밀번호 화면은 나오지 않는다.
+
+- **발급 조건**: 신뢰 경계가 검증한 Access JWT(서명·`aud`·`iss`=팀 도메인·`exp`/`nbf` — §7, FR-1.4)의 이메일이 **활성 사용자 한 명**의 이메일과 대소문자 무시하고 정확히 같고, 이 브라우저에 쓸 수 있는 앱 세션이 없을 때. 웹 앱이 시작할 때(로그인 안 된 상태) `POST /api/auth/access-login`을 한 번 부르고, 서버가 **새 세션 id**(브라우저가 보낸 쿠키 값은 절대 다시 쓰지 않음)로 세션을 만든다. TTL(30일)·쿠키 속성(`HttpOnly; Secure; SameSite=Lax; Path=/`)은 비밀번호 로그인과 같다. 같은 계정의 세션이 이미 있으면 그대로 둔다(새 탭).
+- **여러 탭·동시 요청에서 보장되는 것**: 한 페이지 안에서는 호출이 하나로 합쳐지고, 같은 브라우저의 탭들은 Web Locks(`agentlee-access-login`)로 차례대로 하며 각 탭이 먼저 로그인 상태를 다시 본다 — 먼저 끝난 탭의 쿠키를 나머지가 그대로 쓰므로 세션은 1개다. 서버 자체는 쿠키 없는 동시 요청 두 개(Web Locks가 없는 브라우저, 직접 만든 요청)에 세션을 하나씩 준다. 둘 다 그 Access 이메일의 본인 세션이다. 남는 세션의 토큰이 있는 곳:
+  - **브라우저**: 마지막 `Set-Cookie`만 쿠키로 남으므로 다른 하나의 토큰은 쿠키에 없다(그 응답이 도착한 페이지·네트워크 경로에는 지나갔다).
+  - **DB**: 토큰 원문은 없고 SHA-256 해시(`sessions.id`)만, 만료(30일)까지.
+  - **서버 메모리**: 발급할 때 원문이 `knownSecrets`(응답·로그에서 가리기 위한 목록)에 등록되고, 프로세스가 끝날 때까지 남는다. 인증에 쓰이는 저장소는 아니다.
+  - **원문이 새어 나갔다면 쓸 수 있는 경우**: 외부 주소에서는 같은 이메일의 검증된 Access JWT가 함께 있어야 한다(다른 이메일이면 `access_email_mismatch`). `localhost` 직접 접속에서는 원문 토큰만으로 만료까지 쓸 수 있다(집 안 네트워크에서 서버 Mac에 닿을 수 있어야 함).
+  - **끊는 법**: 로그아웃은 이 브라우저의 세션만 끝낸다. 그 사용자의 모든 세션은 비밀번호 변경(그 요청의 세션만 남김)이나 관리자의 비활성화(전부), 이메일 변경으로 끊긴다.
+- **시간 제한**: 탭 간 잠금을 기다리는 것과 잠금 안의 요청(상태 다시 보기 GET, `access-login` POST)마다 8초(`ACCESS_LOGIN_TIMEOUT_MS`). 요청마다 따로 AbortController로 끊으므로 응답 없는 요청이 잠금을 쥔 채 남지 않고, 잠금을 놓지 않는 탭이 있어도 다른 탭은 기다림을 그만둔다. 헤더는 왔는데 본문이 멈춘 응답도 같다(본문 읽기도 그 요청의 제한 안). 시간이 다 되면 "로그인 응답이 늦어요" + **다시 시도** 화면.
+- **왜 미들웨어가 아니라 명시적 호출인가**: 세션은 이 한 곳에서만 생긴다. 상태를 바꾸는 API POST라 CSRF 검사(자기 `Origin` + `X-Agent-Lee` 헤더)를 거치므로 다른 사이트의 링크·이미지·폼으로는 발급을 일으킬 수 없다. 모든 페이지·API 요청에서 몰래 세션을 만드는 방식은 GET에 부수 효과가 생기고, 동시에 나가는 첫 요청들마다 세션이 여러 개 생긴다.
+- **거부(세션 없음)**: 그 이메일의 계정이 없음·비활성·삭제 또는 관리자 이메일 변경 대기 중인 새 이메일 → 403 `access_no_account`(화면: "쓸 수 있는 계정이 없어요" + Cloudflare 로그아웃 링크, 비밀번호 칸 없음). JWT 없음·위조·AUD·발급자·만료 → 신뢰 경계의 403 `access_denied`(Access 재인증). 비밀번호 로그인으로도 못 들어간다 — 외부의 비밀번호 로그인은 원래 Access 이메일과 같은 **활성** 계정만 받는다.
+- **다른 계정의 앱 세션이 남아 있으면**: 지금처럼 `access_email_mismatch`. 그 세션을 바꾸거나 쓰지 않는다. 화면은 "앱 로그인 지우고 다시 들어가기"(앱 세션 쿠키만 지운 뒤 Access 이메일로 자동 로그인)와 Cloudflare 로그아웃 링크를 준다. 관리자 이메일 변경 확인(45.6 3단계)은 이 조합에서 "관리자 이메일 전환" 화면이 먼저 뜨므로 그대로 된다.
+- **임시 비밀번호**: 외부 주소에서는 첫 로그인 비밀번호 변경을 강제하지 않는다(비밀번호가 로그인 수단이 아니다). 표시는 남아서 집 안 `localhost` 로그인 때는 여전히 바꿔야 한다. 비밀번호는 설정 화면에서 바꿀 수 있다.
+- **로그아웃**: 외부 주소에서 사이드바 **로그아웃**은 앱 세션을 끝낸 뒤 `/cdn-cgi/access/logout`(Cloudflare가 처리)으로 보낸다. Access 세션까지 끝내지 않으면 다음 요청에서 곧바로 다시 자동 로그인되기 때문이다. 다른 탭은 다음 요청 때 Access 로그인으로 넘어간다.
+- **로컬·게이트**: `localhost`/`127.0.0.1` 직접 접속(Access 없음, `Cf-*` 헤더가 있으면 거부)과 임시 코드 게이트(`TEMP_GATE_CODE`, Access 설정 전 — Access 이메일이 없으므로 자동 로그인 없음)는 지금처럼 비밀번호 로그인. 첫 실행(관리자 만들기)도 비밀번호를 정한다.
+- **감사 로그**: `auth.access_login` + `userId`만. JWT·쿠키·헤더 값·이메일은 남기지 않는다(로그 정책이 허용 필드만 쓴다).
+- **확인 순서(실계정)**: (1) 외부 주소를 새 브라우저(시크릿 창)로 열어 Access 이메일 코드 → 앱 비밀번호 없이 대화 목록. (2) 로그아웃 → Cloudflare 로그아웃 화면 → 다시 열면 Access 로그인부터. (3) Access 허용 목록에는 있고 앱 계정이 없는(또는 비활성) 이메일 → 막힘 화면, 비밀번호 칸 없음. (4) `localhost:3000`은 비밀번호 로그인. 기록에 쿠키·JWT·헤더 값을 넣지 않는다.
+
+## 46. 음성·영상 화자별 전사 — `audio_transcribe` (#173)
+대화에 올린 음성(M4A·MP3·WAV)·영상(MP4·MOV)을 **화자별 대본**으로 만든다. 이 Mac에서 ffmpeg로 16kHz mono WAV를 만들고, `mlx-community/Nemotron-3-Diarization`으로 화자 구간을, MLX Whisper(`mlx-community/whisper-large-v3-turbo-asr-fp16`)로 시간이 붙은 글자를 얻어 시간으로 합친다. 실행 중에는 네트워크가 없다. 코드: `apps/server/src/audio/`(`service.ts` 검사·병합·저장, `runner.ts` 샌드박스 실행, `packages.ts` 설치·상태, `openrouter.ts` 대체, `merge.ts`), interpreter 쪽 `apps/server/audio/transcribe.py`, 고정 목록 `apps/server/audio/requirements.lock`·`models.json`. 근거는 `docs/decisions/isolation.md` "음성 전사 (#173)".
+
+### 46.1 설치 (한 번 — 관리자)
+```bash
+# 1) SKILL_PYTHON: 독립 실행형 CPython 3.12 (§35와 같은 것) — 이미 있으면 건너뜀
+uv python install 3.12 && uv python find 3.12     # .env의 SKILL_PYTHON=<출력 경로>
+# 2) ffmpeg (기본 /opt/homebrew/bin/ffmpeg — 다른 곳이면 .env의 AUDIO_FFMPEG=<절대 경로>)
+brew install ffmpeg
+# 3) 고정 패키지 + 모델 (이 명령만 네트워크를 쓴다: PyPI, huggingface.co)
+pnpm audio:install     # <DATA_DIR>/audio-packages/<lock 해시>-py3.12/ (~570MB), <DATA_DIR>/audio-models/<목록 해시>/ (~1.8GB)
+pnpm audio:status      # audio_transcribe: available, OPENROUTER_API_KEY: set/not set
+pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisper, 샌드박스 + Metal)를 한 번씩 — 단계별 ok와 시간만 출력
+# 4) 서버 재시작
+```
+- 운영(`~/.chat-agent`)에서는 그 폴더에서 `DATA_DIR`이 운영 데이터 폴더를 가리키게 해서 같은 명령을 돌린다(§43). 패키지·모델은 파생 데이터라 백업에 들어가지 않는다 — 복원 뒤 다시 `pnpm audio:install`.
+- pip는 서버 환경을 물려받지 않는다(리뷰 1차): 고정 환경(`PATH`·`LANG`·`HOME`/`TMPDIR`는 `<DATA_DIR>/audio-packages/.home-*` — 끝나면 삭제, `PIP_CONFIG_FILE=/dev/null`, `PIP_NO_INPUT=1`, `PIP_NO_CACHE_DIR=1`)과 `pip --isolated install --no-cache-dir`. 관리자의 pip 설정·캐시·키링·프록시 변수·`.env` 비밀이 닿지 않는다. 모델 받기는 서버 프로세스 안의 `fetch`라 자식 환경이 없고 자격 증명을 보내지 않는다(공개 저장소).
+- 패키지: `mlx-audio==0.6.4`와 그 의존성 전부를 정확한 버전·휠 해시로 고정(`pip --no-deps --require-hashes --only-binary=:all: --target`), 모든 파일이 2026-11-17 기준 2주 넘게 지난 배포(`uv pip compile --exclude-newer 2026-11-03`). 모델: 저장소·커밋·파일마다 크기와 SHA-256을 `models.json`에 고정하고 받은 뒤 확인한다(다르면 아무것도 설치하지 않음). 관리자의 venv나 `~/.cache/huggingface`는 쓰지 않는다. 설치 폴더는 읽기 전용(0555/0444).
+- lock·모델 목록이 바뀌면 해시가 바뀌어 `not_installed`가 되므로 `pnpm audio:install`을 다시 돌린다.
+
+### 46.2 켜고 끄기
+- **서버 허용 목록**: 관리자 → 스킬 → `audio-transcription` "허용"(기본 켜짐 — 설치 전에는 `설치 안 됨`으로 보이고 제공되지 않음). **사용자별**: 같은 탭 아래(청소년 계정도 `"all"`이면 켜짐 — 금융 스킬이 아님).
+- **외부 대체(OpenRouter)**: 관리자 → 스킬 → **음성 전사 외부 대체 → OpenRouter 대체 허용**(기본 꺼짐) + `.env`의 `OPENROUTER_API_KEY`. 둘 다 있어야 하고, **로컬 Whisper가 실패했을 때만**(오류·비정상 종료·시간·메모리 한도) 쓴다. 쓰면 결과에 `stt: "openrouter"`·`externalTranscription: true`·`notice: "외부 전사 사용 (OpenRouter openai/whisper-large-v3)"`이 붙고 대본 파일 머리에도 적힌다. 화자 구분은 항상 이 Mac에서 한다.
+- 대체 요청: 고정 URL `https://openrouter.ai/api/v1/audio/transcriptions`, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, 폼은 고정(`model`·`language`·`response_format=verbose_json`·`temperature=0`·고정 파일 이름)과 오디오 바이트. 오디오는 WAV를 64kbps mono MP3 10분 조각(< 24MB, 공급자 25MB 한도 안)으로 다시 만들어 조각마다 한 번 보내고 시간을 이어 붙인다. 한 조각이라도 실패하면 `audio_fallback_failed`(일부만 된 대본을 전체인 척 돌려주지 않음).
+
+### 46.3 동작과 한도 (`AUDIO_LIMITS`, `packages/shared/src/audio.ts`)
+- 입력은 그 대화에 메시지와 함께 보낸 파일 id뿐(경로·URL 없음) — python_run과 같은 범위 규칙. 저장 해시로 확인한 사본을 호출마다 새 작업 폴더 `<DATA_DIR>/audio-scratch/<uuid>/`에 넣고 끝나면 지운다(서버 시작 때 남은 것도).
+- 업로드 한도는 파일 업로드와 같다(50MB). 길이 2시간까지(`audio_too_long`). 단계마다 벽시계·상주 메모리 한도: 변환 5분·1GB, 화자 구분과 전사 각 25분·8GB, 호출 전체 60분(`audio_timeout`). 넘으면 그 프로세스 그룹을 SIGKILL한다. 서버 전체에서 한 번에 하나(`audio_busy`) — GPU와 수 GB 메모리.
+- Codex는 MCP 도구 호출에 기본 60초를 준다. `audio_transcribe`가 있는 실행에만 `tool_timeout_sec = 3660`을 준다(`runtime/lockdown.ts`). Codex 0.165.0에는 도구별 시간 한도가 없어(도구별 설정은 승인 방식·출력 한도뿐) 그 실행의 **우리 MCP 서버 도구 전체**에 적용된다 — 다른 도구는 각자 자기 한도(수십 초)로 먼저 끝난다. Claude Agent SDK의 MCP 도구 시간 한도는 기본값이 이보다 길다.
+- **실행과 함께 멈춘다(리뷰 1차):** 호출은 250ms마다 실행이 아직 진행 중인지(실행 토큰이 살아 있고 `runs.ended_at`이 비어 있음)와 사용자가 아직 허용되는지를 본다. 중단 **요청이 받아들여지는 순간** 실행 관리자가 그 실행의 MCP 토큰을 철회하므로(런타임이 멈추고 실행이 끝나기를 기다리지 않음 — 리뷰 3차, `runtime/runs.ts` `interrupt`), 그다음 송신·저장 확인은 바로 거부된다. 중단·토큰 철회·권한 해제면 진행 중인 단계의 프로세스 그룹을 죽이고, 작업 폴더를 지운 뒤에야 슬롯을 놓는다(`audio_cancelled`). 외부로 보내기 직전(조각마다)과 대본 저장 직전에도 다시 확인하고, 저장은 파일 쓰기 잠금(백업)을 잡은 **뒤** 이름 바꾸기·DB 넣기 바로 전에 한 번 더 확인한다(`addGenerated`의 `guard` — 백업을 기다리는 사이 중단된 실행의 대본은 저장되지 않음, 리뷰 2차). 대체 단계에서는 관리자 스위치와 권한도 조각마다 보고, 꺼지면 보내는 중인 요청을 끊는다(`audio_failed`).
+- **디스크:** 시작 전 데이터 볼륨 여유 2GB, 작업 폴더 전체 1GB·항목 1만 개(250ms마다, 그리고 단계가 끝날 때마다 측정 — 넘거나 **잴 수 없으면**(못 읽는 폴더 등) 멈춤, `audio_disk_limit`), 파일 하나는 `RLIMIT_FSIZE`.
+- **비밀·자르기(리뷰 1차):** 알려진 비밀은 원래 글 전체에서 먼저 가리고, 그다음에 합치고 나눈다. 2,000자를 넘는 구간은 자르지 않고 **나눈다**: 조각은 원문의 정확한 부분 문자열이고(공백·전각 공백·연속 공백도 그대로 — 다듬지 않음), 창 안의 마지막 공백 문자 바로 뒤에서, 없으면 한도에서 끊는다. 조각을 구분자 없이 이으면 원문과 글자 하나까지 같다. 찾기는 현재 창 안에서만 해 길이에 선형이다(리뷰 2차). 시간은 글자 위치로 나눈다. 대본 파일이 5MB를 넘으면 끝의 구간을 통째로 빼고 파일에 적으며 `transcriptTruncated: true`, JSON 400개 제한은 `segmentsTruncated`로 따로 알린다.
+- 결과의 글자는 올린 녹음에서 왔다: `<external_content>` 블록 안 JSON으로 돌려주고, 알려진 비밀은 전부 가린다(반환·대본 파일 모두). 대본 파일 `<원래 이름>-대본.md`는 답 메시지에 연결된 대화 파일이라 `file_read`로 나머지를 읽고, 모델이 이름을 추정해 마크다운 아티팩트로 정리한다.
+- 음성·영상 파일은 글자 추출을 하지 않는다(`extract_unsupported` — "아직 이 형식의 글자는 읽을 수 없어요"). 전사는 이 도구로만.
+
+### 46.4 로그와 확인
+- 로그는 `audio.finished` 하나: 도구 이름, 고정 코드(`audioCode` — `audio_ok` 또는 `AUDIO_CODES`), `audioStt`(`local`/`openrouter`), `audioDiarization`(`local`/`off`/`failed`), 시간, ID. 파일 id·이름·글자·화자는 남지 않는다. 실패는 관리자 "스킬 실행 실패"에 도구 이름과 코드로.
+- 시험: `pnpm vitest run apps/server/test/audio.test.ts` — 가짜 ffmpeg·가짜 diarizer·가짜 STT로 범위·형식·한도·병합·저장·비밀 가림·로그, OpenRouter는 **목**(합성 키, 네트워크 없음)으로 기본 꺼짐·로컬 성공 시 미전송·로컬 실패 시 조각·시간 이동·외부 표시·키는 헤더에만, 샌드박스 프로필, 설치 해시 검사. macOS + ffmpeg가 있으면 실제 ffmpeg를 샌드박스에서 돌려 변환·조각과 `in/` 밖 읽기 거부를 확인한다.
+- 실모델 수동 시험(CI 아님): `pnpm audio:install`을 돌린 데이터 폴더로
+  ```bash
+  AUDIO_LIVE=1 AUDIO_LIVE_DATA_DIR=<DATA_DIR> SKILL_PYTHON=<독립 실행형 3.12> pnpm vitest run apps/server/test/audio.test.ts
+  ```
+  `say`로 만든 두 목소리 대화(한국어)가 화자 2명·`speaker_1, speaker_2, speaker_1` 순서·각자의 글로 나오는지 본다(2026-11-17 M4 Pro: 변환 0.1초, 화자 구분 ~5초, 전사 ~4초 — 대부분 모델 적재).
+- 수용 기준 수동 확인: 실제 m4a를 올리고 "화자별로 정리해줘" → 화자 라벨이 붙은 대본(기록 양식 B).

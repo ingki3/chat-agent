@@ -1,6 +1,6 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { PASSWORD_MIN, SERVICE_NAME, type AuthState } from "@agentlee/shared";
-import { access, auth, errorText } from "./api.js";
+import { access, ACCESS_LOGOUT_PATH, ApiError, auth, errorText, isLeavingAccess } from "./api.js";
 
 /** Auth screens (#9): first-run admin, login, forced password change. */
 export function Card({ title, children }: { title: string; children: ReactNode }) {
@@ -225,6 +225,79 @@ export function AdminEmailConfirm({
           새 이메일로 전환
         </button>
       </form>
+    </Card>
+  );
+}
+
+/**
+ * Signed out on the public host, through Cloudflare Access (#178, FR-15.8): no app password here — Access already
+ * proved the email, and the server turns that into a session for the one active account with it. When it cannot
+ * (no such account, or this browser still holds another account's session), this screen says so; the password
+ * form is not offered as a way around it.
+ */
+export function AccessLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
+  const [failure, setFailure] = useState<unknown>(null);
+  const [attempt, setAttempt] = useState(0);
+  const leaving = isLeavingAccess();
+  const retry = () => {
+    setFailure(null);
+    setAttempt((n) => n + 1);
+  };
+  useEffect(() => {
+    if (leaving) return;
+    let live = true;
+    auth.accessLogin().then(
+      (s) => live && onDone(s),
+      (e: unknown) => live && setFailure(e),
+    );
+    return () => {
+      live = false;
+    };
+    // onDone changes identity every render; one attempt per mount or retry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attempt, leaving]);
+
+  const accessLogout = (
+    <a className="btnlink" href={ACCESS_LOGOUT_PATH} data-testid="access-logout">
+      Cloudflare에서 로그아웃(다른 이메일로 로그인)
+    </a>
+  );
+  if (leaving) return <Card title={SERVICE_NAME}>로그아웃하는 중…</Card>;
+  if (!failure) return <Card title={SERVICE_NAME}>로그인하는 중…</Card>;
+  const code = failure instanceof ApiError ? failure.code : null;
+  if (code === "access_email_mismatch")
+    return (
+      <Card title={SERVICE_NAME}>
+        <div data-testid="access-mismatch">
+          <p>
+            Cloudflare에는 <b>{state.accessEmail}</b>(으)로 로그인했는데, 이 브라우저에는 다른 계정의 앱
+            로그인이 남아 있어요.
+          </p>
+          <p className="hint">앱 로그인을 지우면 {state.accessEmail} 계정으로 들어가요.</p>
+          <button className="primary" onClick={() => void auth.logout().then(retry, setFailure)}>
+            앱 로그인 지우고 다시 들어가기
+          </button>
+          {accessLogout}
+        </div>
+      </Card>
+    );
+  if (code === "access_no_account")
+    return (
+      <Card title={SERVICE_NAME}>
+        <div data-testid="access-no-account">
+          <p>
+            <b>{state.accessEmail}</b>(으)로 쓸 수 있는 계정이 없어요. 꺼진 계정이거나 아직 등록되지 않은
+            이메일이에요.
+          </p>
+          <p className="hint">관리자에게 문의하세요.</p>
+          {accessLogout}
+        </div>
+      </Card>
+    );
+  return (
+    <Card title={SERVICE_NAME}>
+      <ErrorText text={errorText(failure)} />
+      <button onClick={retry}>다시 시도</button>
     </Card>
   );
 }

@@ -13,10 +13,12 @@ import {
   usage,
   USAGE_KEY,
   MEMORY_PROPOSALS_KEY,
+  signOutOfAccess,
 } from "./api.js";
 import { ShareDialog, when } from "./shares/ShareDialog.js";
 import { unsubscribeOnSignOut } from "./push.js";
 import { usageLine } from "./usage-format.js";
+import { takeAfter } from "./chat/after-run.js";
 
 export const CONVERSATIONS_KEY = ["conversations"] as const;
 
@@ -60,7 +62,11 @@ export function Sidebar({
   const signOut = async () => {
     // This browser stops getting this account's pushes (the server drops the device with the session too).
     await unsubscribeOnSignOut();
-    props.onSignedOut(await auth.logout());
+    const signedOut = await auth.logout();
+    // Through Cloudflare Access (#178) the app session alone is not enough: Access would sign the user straight
+    // back in. End the Access session too (Cloudflare's logout page).
+    if (signedOut.accessEmail) return signOutOfAccess();
+    props.onSignedOut(signedOut);
   };
 
   return (
@@ -254,6 +260,7 @@ export function ConvMenu({ c }: { c: Conversation }) {
         )
       ) {
         await conversations.remove(c.id);
+        takeAfter(c.id); // what its runs left for the chat screen goes with it
         // Leave only if this conversation is still the one on screen (the user may have moved on meanwhile).
         if (window.location.pathname === `/c/${c.id}`) navigate("/", { replace: true });
       }

@@ -239,7 +239,7 @@ export type SearchProvider = {
 export type Proxy = Pick<EgressService, "endpoint" | "close">;
 
 /** Provider names `WEB_SEARCH_PROVIDERS` may list (docs/decisions/isolation.md "웹 검색·가져오기 (#50)"). */
-export const SEARCH_PROVIDER_NAMES = ["google-news", "duckduckgo"] as const;
+export const SEARCH_PROVIDER_NAMES = ["google", "google-news", "duckduckgo"] as const;
 export type SearchProviderName = (typeof SEARCH_PROVIDER_NAMES)[number];
 export const DUCKDUCKGO_HOSTS = ["html.duckduckgo.com"] as const;
 const DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/";

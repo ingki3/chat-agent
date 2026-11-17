@@ -1,9 +1,9 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BrowserRouter, Navigate, Route, Routes, useNavigate, useParams } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router";
 import { SERVICE_NAME, type AuthState } from "@agentlee/shared";
 import { access, auth, setUnauthenticatedHandler } from "./api.js";
-import { AdminEmailConfirm, Card, ChangePassword, Login, Setup } from "./auth-screens.js";
+import { AccessLogin, AdminEmailConfirm, Card, ChangePassword, Login, Setup } from "./auth-screens.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ArtifactsPage } from "./pages/ArtifactsPage.js";
@@ -17,6 +17,8 @@ import { InstructionsPage } from "./pages/InstructionsPage.js";
 import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
 import { FileViewerPage } from "./files/FileViewer.js";
+import { legacyPanelTarget, type ArtifactFrom } from "./artifacts/ArtifactCard.js";
+import { clearAfter } from "./chat/after-run.js";
 
 /** Only the login state lives here. Everything an account sees lives in a per-account client (AccountData). */
 const authClient = new QueryClient({
@@ -108,8 +110,8 @@ function AuthGate() {
 }
 
 /**
- * Signed out through Access: the login screen — unless this browser is the admin's confirming a pending email change
- * (FR-15.7, #36): the old session with an Access login of the new email.
+ * Signed out through Access: single sign-on with the Access email (#178) — unless this browser is the admin's
+ * confirming a pending email change (FR-15.7, #36): the old session with an Access login of the new email.
  */
 function OuterLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState) => void }) {
   const q = useQuery({
@@ -120,7 +122,7 @@ function OuterLogin({ state, onDone }: { state: AuthState; onDone: (s: AuthState
   if (q.isPending) return <Card title={SERVICE_NAME}>불러오는 중…</Card>;
   if (q.data?.ready && q.data.oldEmail && q.data.newEmail)
     return <AdminEmailConfirm oldEmail={q.data.oldEmail} newEmail={q.data.newEmail} onDone={onDone} />;
-  return <Login state={state} onDone={onDone} />;
+  return <AccessLogin state={state} onDone={onDone} />;
 }
 
 function AccountData({ children }: { children: ReactNode }) {
@@ -130,7 +132,14 @@ function AccountData({ children }: { children: ReactNode }) {
         defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true, staleTime: 5_000 } },
       }),
   );
-  useEffect(() => () => client.clear(), [client]);
+  useEffect(
+    () => () => {
+      client.clear();
+      // Notices kept for the chat screens of this account (#172 review) go with it too.
+      clearAfter();
+    },
+    [client],
+  );
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
@@ -146,9 +155,18 @@ function FileViewRoute() {
   return <FileViewerPage key={`${id}/${fileId}`} conversationId={id} fileId={fileId} />;
 }
 
-/** One chat screen instance per conversation: no state (e.g. a half-streamed reply) carries over. */
+/**
+ * One chat screen instance per conversation: no state (e.g. a half-streamed reply) carries over. An old link to the
+ * split artifact panel (`?artifact=`, before #172) goes to the artifact page instead, coming from this conversation.
+ */
 function ChatRoute() {
   const { id = "" } = useParams();
+  const { search } = useLocation();
+  const legacy = legacyPanelTarget(search);
+  if (legacy)
+    return (
+      <Navigate to={legacy} replace state={{ from: `/c/${encodeURIComponent(id)}` } satisfies ArtifactFrom} />
+    );
   return <ChatPage key={id} />;
 }
 

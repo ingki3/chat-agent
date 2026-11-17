@@ -7,6 +7,7 @@ import {
   BackupItem,
   BackupsResponse,
   AdminSkillsResponse,
+  AudioAdmin,
   DefaultsResponse,
   RuntimeOption,
   RuntimePolicy,
@@ -183,11 +184,20 @@ async function call(
       ...(signal ? { signal } : {}),
     });
   } catch (e) {
-    void checkOuterRedirect();
+    // A request this app gave up on (its deadline) says nothing about the outer login.
+    if (!signal?.aborted) void checkOuterRedirect();
     throw e;
   }
   const isJson = (res.headers.get("content-type") ?? "").includes("application/json");
-  const json = (isJson ? await res.json().catch(() => ({})) : {}) as { error?: string };
+  const json = (
+    isJson
+      ? await res.json().catch((e: unknown) => {
+          // A body cut off by our own deadline is that deadline, not a malformed answer (#178 round 3).
+          if (signal?.aborted) throw e;
+          return {};
+        })
+      : {}
+  ) as { error?: string };
   if (!res.ok) {
     // Our server always answers JSON; a 401/403 page that is not JSON comes from Access in front of it.
     if ((json.error && OUTER_AUTH.has(json.error)) || ((res.status === 401 || res.status === 403) && !isJson))
@@ -198,8 +208,92 @@ async function call(
   return json as unknown;
 }
 
+/** Cloudflare's own logout page for the Access application (served by Cloudflare in front of the app, #178). */
+export const ACCESS_LOGOUT_PATH = "/cdn-cgi/access/logout";
+let leavingAccess = false;
+/**
+ * Signing out on the public host (#178): the app session is already gone; Access must end too, or the next page
+ * load would sign the user straight back in. From here on this page never starts an Access sign-in again.
+ */
+export function signOutOfAccess(): void {
+  leavingAccess = true;
+  window.location.assign(ACCESS_LOGOUT_PATH);
+}
+export const isLeavingAccess = () => leavingAccess;
+
+let accessLoginInFlight: Promise<AuthState> | null = null;
+
+/** How long a sign-in waits for the cross-tab lock, and for each of its requests, before giving up (#178 round 2). */
+export const ACCESS_LOGIN_TIMEOUT_MS = 8_000;
+const accessLoginTimeout = () => new ApiError(0, "access_login_timeout");
+
+/** `run` with its own AbortController that fires after `ms`; an abort surfaces as `access_login_timeout`. */
+async function withDeadline<T>(ms: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await run(ctl.signal);
+  } catch (e) {
+    throw ctl.signal.aborted ? accessLoginTimeout() : e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Tabs of this browser booting together (#178 round 1): one at a time across tabs (Web Locks), and each looks at
+ * the login state first — a tab that waited finds the session the first one started (the cookie jar is shared)
+ * and starts none of its own. Without Web Locks it still works, at worst with one spare session per extra tab.
+ * Waiting for the lock is abortable (a tab stuck holding it never blocks the others for good), and every request
+ * inside it has its own deadline — aborting the lock wait alone would not stop work already running under it, and
+ * an aborted request is what lets the holder go and release the lock.
+ */
+async function acrossTabs<T>(fn: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator === "undefined" ? undefined : navigator.locks;
+  if (!locks) return fn();
+  const wait = new AbortController();
+  const timer = setTimeout(() => wait.abort(), ACCESS_LOGIN_TIMEOUT_MS);
+  let acquired = false;
+  try {
+    return await locks.request("agentlee-access-login", { signal: wait.signal }, () => {
+      // Got the lock: from here the requests' own deadlines apply, not the wait's.
+      acquired = true;
+      clearTimeout(timer);
+      return fn();
+    });
+  } catch (e) {
+    if (!acquired && wait.signal.aborted) throw accessLoginTimeout();
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const accessLoginOnce = () =>
+  acrossTabs(async () => {
+    const now = AuthState.parse(
+      await withDeadline(ACCESS_LOGIN_TIMEOUT_MS, (signal) =>
+        call("GET", "/api/auth/state", undefined, {}, signal),
+      ),
+    );
+    if (now.user) return now;
+    return AuthState.parse(
+      await withDeadline(ACCESS_LOGIN_TIMEOUT_MS, (signal) =>
+        call("POST", "/api/auth/access-login", {}, {}, signal),
+      ),
+    );
+  });
+
 export const auth = {
   state: async () => AuthState.parse(await call("GET", "/api/auth/state")),
+  /**
+   * Single sign-on through Cloudflare Access (#178): one call at a time in this page however many screens ask,
+   * and one at a time across this browser's tabs.
+   */
+  accessLogin: (): Promise<AuthState> =>
+    (accessLoginInFlight ??= accessLoginOnce().finally(() => {
+      accessLoginInFlight = null;
+    })),
   setup: async (name: string, password: string) =>
     AuthState.parse(await call("POST", "/api/auth/setup", { name, password })),
   login: async (email: string, password: string) =>
@@ -249,6 +343,10 @@ export const admin = {
   skills: async () => AdminSkillsResponse.parse(await call("GET", "/api/admin/skills")).skills,
   setServerSkill: async (name: string, enabled: boolean) =>
     AdminSkillsResponse.parse(await call("PUT", `/api/admin/skills/${enc(name)}`, { enabled })).skills,
+  /** 음성 전사 (#173): the OpenRouter fallback switch. */
+  audio: async () => AudioAdmin.parse(await call("GET", "/api/admin/audio")),
+  setAudioFallback: async (fallback: boolean) =>
+    AudioAdmin.parse(await call("PUT", "/api/admin/audio", { fallback })),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
   /** Backups (#37): list and "지금 백업". Restore is the CLI only. */
@@ -536,6 +634,8 @@ const MESSAGES: Record<string, string> = {
   invalid_credentials: "이메일 또는 비밀번호가 맞지 않아요.",
   too_many_attempts: "시도가 너무 많아요. 15분 뒤에 다시 시도하세요.",
   access_email_mismatch: "Cloudflare로 로그인한 이메일과 같은 계정으로만 들어올 수 있어요.",
+  access_no_account: "이 이메일로 쓸 수 있는 계정이 없어요. 관리자에게 문의하세요.",
+  access_login_timeout: "로그인 응답이 늦어요. 잠시 뒤 다시 시도하세요.",
   already_set_up: "관리자 계정이 이미 있어요. 로그인하세요.",
   invalid_request: "입력값을 확인하세요.",
   csrf: "요청이 거부됐어요. 페이지를 새로 고친 뒤 다시 시도하세요.",

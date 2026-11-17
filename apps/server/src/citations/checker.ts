@@ -1,5 +1,5 @@
 import { skillToolName } from "@agentlee/mcp-tools";
-import { GOOGLE_NEWS_SKILL } from "@agentlee/mcp-tools/skills";
+import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
 import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
 import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import {
@@ -37,6 +37,7 @@ const WEB_TOOL_NAMES: ReadonlySet<string> = new Set([
   SOURCES_LIST_TOOL.name,
   CITE_TOOL.name,
   skillToolName(GOOGLE_NEWS_SKILL.name),
+  skillToolName(SEARCH_GOOGLE_SKILL.name),
   // Reading an uploaded file's text (#48) is using a source too: the same check applies to that answer.
   FILE_READ_TOOL.name,
   FILE_SEARCH_TOOL.name,
@@ -89,7 +90,7 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
 
 /**
- * Tools whose call makes this run's numbers its own (#150): a search, a fetch or the news skill (new material for
+ * Tools whose call makes this run's numbers its own (#150): a search, a fetch or a search skill (new material for
  * new numbers), and any `cite` or `file_cite` call — refused ones too (review #153: a refused call registers no row,
  * yet the model may still write the number it meant).
  */
@@ -97,6 +98,7 @@ const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   WEB_SEARCH_TOOL.name,
   WEB_FETCH_TOOL.name,
   skillToolName(GOOGLE_NEWS_SKILL.name),
+  skillToolName(SEARCH_GOOGLE_SKILL.name),
   CITE_TOOL.name,
   FILE_CITE_TOOL.name,
 ]);

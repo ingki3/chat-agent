@@ -1,0 +1,2 @@
+# audio_transcribe (#173): the one direct dependency; requirements.lock pins it and everything it needs.
+mlx-audio==0.6.4

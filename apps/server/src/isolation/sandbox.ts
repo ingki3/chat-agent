@@ -33,6 +33,12 @@ export type SandboxPolicy = {
    * and the server could then not remove the folder. Mode changes (`chmod`) stay allowed.
    */
   noFlagChanges?: boolean;
+  /**
+   * The Apple GPU through Metal (#173: MLX models). Opens exactly the two IOKit user clients Metal needs to create a
+   * device and its shared events (`AGXDeviceUserClient`, `IOSurfaceRootUserClient`) — no other IOKit client, no
+   * extra mach service, no file. Checked on macOS 27 (docs/decisions/isolation.md "음성 전사 (#173)").
+   */
+  gpu?: boolean;
 };
 
 export type RunIsolatedOptions = SandboxPolicy & {
@@ -111,6 +117,10 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
       lines.push(`(allow network-outbound (remote ip "localhost:${port}"))`);
     }
   }
+  if (policy.gpu)
+    lines.push(
+      '(allow iokit-open (iokit-user-client-class "AGXDeviceUserClient") (iokit-user-client-class "IOSurfaceRootUserClient"))',
+    );
   // Later rules win: this takes back the flag changes `file-write*` allowed above.
   if (policy.noFlagChanges) lines.push("(deny file-write-flags)");
   return lines.join("\n") + "\n";

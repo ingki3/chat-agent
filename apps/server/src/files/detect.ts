@@ -33,6 +33,19 @@ const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const JPG = [0xff, 0xd8, 0xff];
 const OLE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const ZIP = [0x50, 0x4b, 0x03, 0x04];
+/** ISO base media (M4A, MP4, MOV): the first box is `ftyp`; older QuickTime files may start with another top box. */
+const FTYP = ascii("ftyp");
+const QT_BOXES = ["moov", "mdat", "wide", "free"].map(ascii);
+const RIFF = ascii("RIFF");
+const WAVE = ascii("WAVE");
+const ID3 = ascii("ID3");
+/** An MPEG audio frame header: 11 sync bits, a version that is not "reserved" and a layer that is not "reserved". */
+const isMpegFrame = (b: Buffer) =>
+  b.length >= 4 &&
+  b[0] === 0xff &&
+  (b[1]! & 0xe0) === 0xe0 &&
+  (b[1]! & 0x18) !== 0x08 &&
+  (b[1]! & 0x06) !== 0;
 /** Signatures a text file must not start with: every binary format above, and common archives and programs. */
 const BINARY = [
   PNG,
@@ -227,6 +240,15 @@ export function contentMatches(file: string, claimed: FileKind): boolean {
       case "md":
       case "csv":
         return isText(fd, size, head);
+      // Audio and video (#173): only ffmpeg reads them, inside its own sandbox (apps/server/src/audio).
+      case "m4a":
+        return startsWith(head, FTYP, 4);
+      case "mp4":
+        return startsWith(head, FTYP, 4) || QT_BOXES.some((b) => startsWith(head, b, 4));
+      case "wav":
+        return startsWith(head, RIFF) && startsWith(head, WAVE, 8);
+      case "mp3":
+        return startsWith(head, ID3) || isMpegFrame(head);
     }
   } finally {
     fs.closeSync(fd);

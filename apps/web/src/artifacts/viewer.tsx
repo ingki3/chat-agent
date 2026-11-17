@@ -14,10 +14,12 @@ import {
 } from "@agentlee/shared";
 import { ApiError, artifacts, files } from "../api.js";
 import { ShareButton } from "../shares/ShareDialog.js";
+import { RichText } from "../chat/RichText.js";
 
 /**
- * The artifact viewer shared by the `/a/:id` page (#27) and the panel next to the chat (#28): the sandboxed frame,
- * the version picker, revert, downloads and PNG/PDF export (#51). The frame is defined here only.
+ * The artifact viewer of the `/a/:id` page (#27, #172): the sandboxed frame — or, for markdown and code, the chat's
+ * safe markdown renderer (#172) — the version picker, revert, downloads and PNG/PDF export (#51). The frame is
+ * defined here only.
  */
 
 /**
@@ -143,7 +145,7 @@ async function serverExport(id: string, version: number, format: ArtifactExportF
 
 export type ArtifactViewer = ReturnType<typeof useArtifactViewer>;
 
-/** Who holds the chosen version: the panel keeps it in the address; undefined = the newest. */
+/** Who holds the chosen version: the artifact page keeps it in the address (`?v=`); undefined = the newest. */
 export type VersionControl = { version: number | undefined; setVersion: (v: number | undefined) => void };
 
 /**
@@ -400,6 +402,64 @@ function DocumentBody({ id, version }: { id: string; version: number }) {
   );
 }
 
+/** Backticks enough to fence `text` (one more than its longest run, at least three). */
+export function fenceFor(text: string): string {
+  // A loop, not Math.max(...runs): a long text has more runs than a call can take arguments (review #175).
+  let longest = 0;
+  let run = 0;
+  for (let i = 0; i < text.length; i++) {
+    run = text.charCodeAt(i) === 96 ? run + 1 : 0;
+    if (run > longest) longest = run;
+  }
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/** Code as one fenced block (the fence computed once). */
+export const fenced = (content: string, lang: string) => {
+  const fence = fenceFor(content);
+  return `${fence}${lang}\n${content}\n${fence}`;
+};
+
+/**
+ * A markdown or code artifact (#172), rendered by the app with the chat's markdown renderer — the same policy as a
+ * reply (FR-3.2): raw HTML is text, links only http(s)/mailto/in-page and open in a new tab, images are links (no
+ * request), KaTeX without `trust`. Nothing of it runs: no frame needed. Code is one fenced block, highlighted. The
+ * text comes from the version's JSON (`GET /api/artifacts/:id/versions/:v`), cached under the artifact's key: a lost
+ * share (#29) drops it with the rest.
+ */
+function TextBody({
+  id,
+  version,
+  kind,
+  language,
+}: {
+  id: string;
+  version: number;
+  kind: "markdown" | "code";
+  language: string | null;
+}) {
+  const query = useQuery({
+    queryKey: [...artifactKey(id), "v", version],
+    queryFn: () => artifacts.version(id, version),
+    retry: false,
+  });
+  if (query.isError)
+    return (
+      <div className="empty" role="alert">
+        <p>{artifactErrorText(query.error)}</p>
+      </div>
+    );
+  if (!query.data) return <div className="empty muted">불러오는 중…</div>;
+  const content = query.data.content;
+  const lang = language && /^[a-z0-9+#._-]+$/.test(language) ? language : "";
+  const text = kind === "markdown" ? content : fenced(content, lang);
+  return (
+    <div className="artifact-doc" data-testid="artifact-text" data-kind={kind} data-version={version}>
+      <RichText text={text} />
+    </div>
+  );
+}
+
 const parseJson = (t: string): unknown => {
   try {
     return JSON.parse(t);
@@ -412,13 +472,26 @@ const parseJson = (t: string): unknown => {
 const isRedactedVersion = (v: Pick<ArtifactViewer, "data" | "version">) =>
   !!v.data?.versions.find((x) => x.version === v.version)?.redacted;
 
-/** The chosen version: the sandboxed frame, or the document's download — or the notice of a redacted version. */
+/**
+ * The chosen version: markdown and code rendered by the app, the sandboxed frame for the rest, or the document's
+ * download — or the notice of a redacted version (nothing of it is requested).
+ */
 export function ArtifactBody({ v }: { v: ArtifactViewer }) {
   const { data, version } = v;
   if (v.revoked) return <ArtifactRevoked />;
   if (!data || version === undefined) return null;
   if (isRedactedVersion(v)) return <ArtifactRedacted />;
   if (data.kind === "document") return <DocumentBody id={data.id} version={version} />;
+  if (data.kind === "markdown" || data.kind === "code")
+    return (
+      <TextBody
+        key={`${data.id}:${version}`}
+        id={data.id}
+        version={version}
+        kind={data.kind}
+        language={data.versions.find((x) => x.version === version)?.language ?? data.language}
+      />
+    );
   return (
     <iframe
       // A new frame per version: nothing of one version's document carries over to the next.
@@ -431,6 +504,27 @@ export function ArtifactBody({ v }: { v: ArtifactViewer }) {
       data-testid="artifact-frame"
       data-version={version}
     />
+  );
+}
+
+/**
+ * The page's body under its top bar. A lost share comes first (#29, review #117): the viewer has no data then, which
+ * must not read as "loading".
+ */
+export function ViewerBody({ v }: { v: ArtifactViewer }) {
+  if (v.revoked) return <ArtifactRevoked />;
+  if (v.error)
+    return (
+      <div className="empty" role="alert">
+        <p>{artifactErrorText(v.error)}</p>
+      </div>
+    );
+  if (!v.data) return <div className="empty muted">불러오는 중…</div>;
+  return (
+    <>
+      <ArtifactToolbar v={v} />
+      <ArtifactBody v={v} />
+    </>
   );
 }
 

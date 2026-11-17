@@ -94,6 +94,11 @@ const ConfigSchema = z.object({
    */
   SKILL_PYTHON: optional(z.string()),
   /**
+   * audio_transcribe (#173): the ffmpeg that converts uploads to 16 kHz mono WAV (an absolute path; default
+   * Homebrew's `/opt/homebrew/bin/ffmpeg`). See audio/packages.ts.
+   */
+  AUDIO_FFMPEG: optional(z.string()),
+  /**
    * python_run (#47): off unless "1". The macOS sandbox cannot keep code from reading the start-up environment of
    * other processes of the same user (KERN_PROCARGS2 — review #121 round 1, docs/ops.md §35.3), and runtime CLIs
    * hold their keys there; turn it on only once that is solved.
@@ -116,14 +121,16 @@ const ConfigSchema = z.object({
   /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
   SKILL_SOURCES: optional(z.string()),
   /**
-   * Web search providers tried in order (#50), comma-separated: `duckduckgo` (its HTML results page — real
-   * article links, but not an official API and sometimes answered with a bot check; see
-   * docs/decisions/isolation.md "웹 검색·가져오기 (#50)") and `google-news` (the installed google-news-search-skill
-   * — news only, and its links are Google redirect pages web_fetch cannot read). Default: both, in that order.
+   * Web search providers tried in order (#50), comma-separated: `google` (the installed search-google skill —
+   * Google results through the Serper API, #171; needs SERPER_API_KEY, each search costs a credit, skipped while
+   * not installed or without the key), `duckduckgo` (its HTML results page — real article links, but not an
+   * official API and sometimes answered with a bot check; see docs/decisions/isolation.md "웹 검색·가져오기 (#50)")
+   * and `google-news` (the installed google-news-search-skill — news only, and its links are Google redirect pages
+   * web_fetch cannot read). Default: all three, in that order.
    */
   WEB_SEARCH_PROVIDERS: optional(
-    z.string().regex(/^(google-news|duckduckgo)(,(google-news|duckduckgo))*$/, {
-      message: "WEB_SEARCH_PROVIDERS must list google-news and/or duckduckgo, comma-separated",
+    z.string().regex(/^(google|google-news|duckduckgo)(,(google|google-news|duckduckgo))*$/, {
+      message: "WEB_SEARCH_PROVIDERS must list google, google-news and/or duckduckgo, comma-separated",
     }),
   ),
   /**
@@ -156,6 +163,9 @@ const ConfigSchema = z.object({
   ),
 });
 
+/** A `WEB_SEARCH_PROVIDERS` name (web/service.ts `SEARCH_PROVIDER_NAMES`). */
+type WebSearchProvider = "google" | "google-news" | "duckduckgo";
+
 export type Config = {
   env: "development" | "production" | "test";
   host: string;
@@ -183,6 +193,8 @@ export type Config = {
   codex?: { apiKey: string } | undefined;
   /** Interpreter for python skills (validated when the MCP service starts). */
   skillPython?: string | undefined;
+  /** ffmpeg for `audio_transcribe` (#173); undefined = Homebrew's default path. */
+  audioFfmpeg?: string | undefined;
   /** `python_run` is offered (#47, `PYTHON_RUN=1`). */
   pythonRun: boolean;
   /** The dedicated account `python_run` runs as (#47 round 2); undefined = not configured. */
@@ -199,7 +211,7 @@ export type Config = {
   /** Browser executable for PNG/PDF export (#51); undefined = look in Playwright's cache. */
   exportBrowser?: string | undefined;
   /** Web search providers in the order they are tried (#50). */
-  webSearchProviders: ("google-news" | "duckduckgo")[];
+  webSearchProviders: WebSearchProvider[];
   /** `cloudflared`'s loopback metrics server (#35); undefined = not configured. */
   tunnelMetrics?: MetricsAddress | undefined;
   /** Context builder limits (#45) that were set; the rest keep their defaults (runtime/context.ts). */
@@ -298,6 +310,7 @@ export function loadConfig(
         : undefined,
     codex: c.CODEX_API_KEY ? { apiKey: c.CODEX_API_KEY } : undefined,
     skillPython: c.SKILL_PYTHON,
+    audioFfmpeg: c.AUDIO_FFMPEG,
     pythonRun: c.PYTHON_RUN === "1",
     pythonRunUser: c.PYTHON_RUN_USER,
     workerRunUser: c.WORKER_RUN_USER,
@@ -317,7 +330,7 @@ export function loadConfig(
     },
     webSearchProviders: [
       ...new Set(
-        (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],
+        (c.WEB_SEARCH_PROVIDERS ?? "google,duckduckgo,google-news").split(",") as WebSearchProvider[],
       ),
     ],
   };

@@ -4,6 +4,7 @@ import type { Db } from "../db/client.js";
 import { errorLog } from "../db/schema.js";
 import {
   isCategory,
+  isAudioCode,
   isErrorCode,
   isHttpStatus,
   isId,
@@ -73,8 +74,11 @@ export class ErrorLog {
           source: e.source,
           // Skill, finance and python_run (#47) tool outcomes too (#35: the admin's skill failure list), all fixed codes.
           code:
-            keep((c) => isErrorCode(c) || isSkillCode(c) || isFinanceCode(c) || isPythonCode(c), e.code) ??
-            "unknown",
+            keep(
+              (c) =>
+                isErrorCode(c) || isSkillCode(c) || isFinanceCode(c) || isPythonCode(c) || isAudioCode(c),
+              e.code,
+            ) ?? "unknown",
           category: keep(isCategory, e.category) ?? "app",
           userId: keep(isId, e.userId),
           conversationId: keep(isId, e.conversationId),

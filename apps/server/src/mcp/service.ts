@@ -13,6 +13,7 @@ import {
 import {
   ALWAYS_ON_SKILLS,
   GOOGLE_NEWS_SKILL,
+  SEARCH_GOOGLE_SKILL,
   SELFTEST_SKILL,
   SKILL_CATALOGUE,
   type BundledSkill,
@@ -55,6 +56,9 @@ import type { DocGenService } from "../docgen/service.js";
 import { PYTHON_RUN_TOOL, PYTHON_TOOLS, type PythonToolInfo } from "@agentlee/mcp-tools/python";
 import { PYTHON_SKILL } from "@agentlee/shared";
 import type { PythonScratchpad } from "../python/service.js";
+import { AUDIO_TOOLS, AUDIO_TRANSCRIBE_TOOL, type AudioToolInfo } from "@agentlee/mcp-tools/audio";
+import { AUDIO_SKILL } from "@agentlee/shared";
+import type { AudioTranscriber } from "../audio/service.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -235,15 +239,27 @@ export const SKILL_SENDS_MAX = 16;
 /** One request the network boot is about to send: the connection's host and the exact bytes (Latin-1 text). */
 const SendRequest = z.strictObject({ host: z.string().min(1).max(253), data: z.string() });
 
+/** One header line: a token field name (RFC 9110 `tchar`s), the colon right after it, the value (no line folding). */
+const HEADER_FIELD = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):([^\r\n]*)$/;
+
+/** A request body one networked skill call may send at most (bytes; Serper `/resolve` posts a whole result page). */
+export const SKILL_BODY_MAX = 192 * 1024;
+
 /**
  * The per-send approval of one networked skill call (#129, the finance raw approach for skills): the network boot
  * hands over every request exactly as it goes on the wire — after the script composed and urllib encoded it, the
  * request line, every header, the body; and the proxy CONNECT — and sends it only on `true`.
  * - the connection's host must be one of the skill's hosts;
- * - the skill's own declared secret is allowed at its declared place only: the first exact `param=<value>` pair of
- *   the request target, on its declared host (Alpha Vantage `apikey=`) — once, like finance's DART exception;
+ * - the skill's own declared secret is allowed at its declared place only, on its declared host, once: the first
+ *   exact `param=<value>` pair of the request target (Alpha Vantage `apikey=`), or the header line
+ *   `<header>: <value>` of the request head when it is the only header of that name, name in any case (Serper
+ *   `X-API-KEY`, #171; a second header of that name is refused, whatever the values);
  * - everything else is checked by the one egress predicate (`carriesSecret`, incl. the UTF-8 view of the bytes)
  *   against the registry and every `.env` skill secret.
+ * - a body (#171: http.client sends it with a send of its own after the head) must be announced by the head's one
+ *   `Content-Length` (no `Transfer-Encoding`) and come whole in the very next send, on the same host, at most
+ *   `SKILL_BODY_MAX` bytes. It is checked as it goes out and, when it is JSON, as its decoded strings and keys too
+ *   (python's `json.dumps` writes non-ASCII as `\uXXXX`). The declared secret is never allowed in a body.
  * A refusal is final for the call (`denied`): every later send is refused too. `deny()` records a failure of the
  * gate itself (an over-long request line, an fd 3 error — `serveGate`) as the same refusal (#135).
  */
@@ -256,10 +272,23 @@ export function skillSendGate(
   const config = Object.values(secrets ?? {});
   const places = skill.secrets.flatMap((s) => {
     const v = secrets?.[s.env];
-    return s.place && v && (!s.when || s.when(input)) ? [{ ...s.place, value: v }] : [];
+    return s.place && v && (!s.when || s.when(input))
+      ? [{ ...s.place, host: s.place.host.toLowerCase(), value: v }]
+      : [];
   });
   let denied = false;
   let sends = 0;
+  /** The body the last approved head announced, still to come in the next send. */
+  let pending: { host: string; length: number } | undefined;
+  const bodyOk = (body: string): boolean => {
+    const texts = [body];
+    try {
+      texts.push(...jsonStrings(JSON.parse(body)));
+    } catch {
+      // not JSON: the bytes as they are
+    }
+    return !carriesSecret(texts, { config });
+  };
   const check = (line: string): boolean => {
     if (++sends > SKILL_SENDS_MAX) return false;
     const req = SendRequest.safeParse(JSON.parse(line));
@@ -267,17 +296,57 @@ export function skillSendGate(
     const host = req.data.host.toLowerCase();
     if (!hosts.has(host)) return false;
     let data = req.data.data;
-    const eol = data.indexOf("\r\n");
-    const first = eol < 0 ? data : data.slice(0, eol);
-    const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(first);
+    if (pending) {
+      // The body of the head just approved: whole, in this one send, to the same host.
+      const body = pending;
+      pending = undefined;
+      return host === body.host && data.length === body.length && bodyOk(data);
+    }
+    const eoh = data.indexOf("\r\n\r\n");
+    const head = eoh < 0 ? data : data.slice(0, eoh);
+    const inline = eoh < 0 ? "" : data.slice(eoh + 4);
+    const lines = head.split("\r\n");
+    const m = /^([A-Z]+) (\S+) (HTTP\/1\.[01])$/.exec(lines[0]!);
     if (!m) return false;
+    // Every header line must be one field (RFC 9110): a token name, the colon right after it (no whitespace before
+    // it), no folded continuation line (obs-fold, a line starting with SP or HTAB — review #174 round 2: a fold
+    // `X-Debug: x\r\n X-API-KEY: <key>` is the value of X-Debug to a parser, not a header of its own). Names are
+    // compared as they are, without any trimming.
+    let headers = lines.slice(1);
+    const fields: { name: string; value: string }[] = [];
+    for (const h of headers) {
+      const f = HEADER_FIELD.exec(h);
+      if (!f) return false;
+      fields.push({ name: f[1]!.toLowerCase(), value: f[2]!.replace(/^[ \t]+|[ \t]+$/g, "") });
+    }
+    // The body: exactly what Content-Length says, part of it (or all) possibly in this send already.
+    const lengths = fields.filter((f) => f.name === "content-length");
+    if (fields.some((f) => f.name === "transfer-encoding") || lengths.length > 1) return false;
+    const length = lengths.length ? /^(\d{1,9})$/.exec(lengths[0]!.value)?.[1] : "0";
+    if (length === undefined) return false;
+    const announced = Number(length);
+    if (announced > SKILL_BODY_MAX || inline.length > announced) return false;
     let target = m[2]!;
     for (const p of places.filter((x) => x.host === host)) {
-      const removed = withoutParam(target, p.param, p.value);
-      target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
+      if ("param" in p) {
+        const removed = withoutParam(target, p.param, p.value);
+        target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
+      } else {
+        // The exception is for the one header of that name only: two of them (whatever their values) are refused.
+        const name = p.header.toLowerCase();
+        const named = fields.flatMap((f, j) => (f.name === name ? [j] : []));
+        if (named.length > 1) return false;
+        const i = named[0];
+        if (i !== undefined && fields[i]!.value === p.value) headers = headers.filter((_, j) => j !== i);
+      }
     }
-    data = `${m[1]} ${target} ${m[3]}${eol < 0 ? "" : data.slice(eol)}`;
-    return !carriesSecret([data], { config });
+    data = [`${m[1]} ${target} ${m[3]}`, ...headers].join("\r\n") + (eoh < 0 ? "" : "\r\n\r\n");
+    if (carriesSecret([data], { config })) return false;
+    if (inline.length === announced) return !inline || bodyOk(inline);
+    // Part of a body here and the rest later: not how http.client sends one — refused.
+    if (inline) return false;
+    pending = { host, length: announced };
+    return true;
   };
   return {
     approve(line) {
@@ -303,6 +372,18 @@ export function skillSendGate(
   };
 }
 
+/** Every string value and object key of a parsed JSON value, at any depth. */
+function jsonStrings(v: unknown, out: string[] = []): string[] {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) jsonStrings(x, out);
+  else if (v && typeof v === "object")
+    for (const [k, x] of Object.entries(v)) {
+      out.push(k);
+      jsonStrings(x, out);
+    }
+  return out;
+}
+
 /** A value as python's `urlencode` (quote_plus) writes it: `encodeURIComponent` plus `!'()*` escaped. */
 function pythonQuote(v: string): string {
   return encodeURIComponent(v)
@@ -315,8 +396,10 @@ function pythonQuote(v: string): string {
  * - urllib's redirects are refused: the redirect handler's `redirect_request` — which every opener, the default
  *   one and any the script builds, goes through — raises an `HTTPError` instead of building the next request;
  * - every request is approved before it is sent: `http.client.HTTPConnection.send` (urllib's and any direct
- *   http.client use, the proxy CONNECT included) first writes `{"host", "data"}` — the bytes about to go out — as
- *   one JSON line to fd 3 and reads the verdict; anything but `1` (or a missing fd 3) raises `ConnectionError`,
+ *   http.client use, the proxy CONNECT included) first opens the connection when it is not open yet (http.client
+ *   connects lazily in its first send — so the proxy CONNECT, itself a gated send, comes before the request's head and
+ *   never between a head and its body, #171 review round 1), then writes `{"host", "data"}` — the bytes about to go
+ *   out — as one JSON line to fd 3 and reads the verdict; anything but `1` (or a missing fd 3) raises `ConnectionError`,
  *   which urllib reports as a `URLError` the script handles like any network failure.
  * Installed before the script runs; the original `send` is reachable only through the closure. Nothing else
  * changes: same flags, same `__main__`, same exit code.
@@ -341,6 +424,10 @@ export const SKILL_NET_BOOT = [
   "    def guarded(self, data):",
   "        if not isinstance(data, (bytes, bytearray)):",
   "            raise ConnectionError('send refused')",
+  // http.client connects lazily inside the first send (urllib never calls connect itself): connect first, so a
+  // proxy CONNECT is asked for (and sent) before the request it carries — never between a head and its body.
+  "        if self.sock is None and self.auto_open:",
+  "            self.connect()",
   "        host = getattr(self, '_tunnel_host', None) or self.host",
   "        line = (json.dumps({'host': host, 'data': bytes(data).decode('latin-1')}) + '\\n').encode()",
   "        try:",
@@ -546,6 +633,8 @@ export type McpServiceOptions = {
    * `python_run` (#47). Without it the tool is not offered. Per user: the `python-scratchpad` skill permission.
    */
   scratchpad?: PythonScratchpad;
+  /** `audio_transcribe` (#173). Without it the tool is not offered. Per user: the `audio-transcription` skill. */
+  audio?: AudioTranscriber;
   /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
@@ -572,13 +661,23 @@ export type WebOptions = {
   sources: SourceStore;
   /** Citations (#25): with it, `cite` is offered (checked against `sources`). */
   citations?: CitationStore;
-  /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default duckduckgo, then google-news. */
+  /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default google, duckduckgo, then google-news. */
   providers?: readonly SearchProviderName[];
   /** Tests: the worker (in-process), the page proxy, and ready-made providers instead of `providers`. */
   worker?: WebWorker;
   fetchProxy?: Proxy;
   searchProviders?: readonly SearchProvider[];
 };
+
+/**
+ * `web_search` providers when `WEB_SEARCH_PROVIDERS` is not set (#171): Google through Serper first (skipped unless
+ * search-google is installed and SERPER_API_KEY is set), then DuckDuckGo, then Google News RSS.
+ */
+export const DEFAULT_SEARCH_PROVIDERS: readonly SearchProviderName[] = [
+  "google",
+  "duckduckgo",
+  "google-news",
+];
 
 /** A skill in the admin's list (FR-10.3): the PRD §7 catalogue plus where each one stands on this server. */
 export type SkillStatus =
@@ -589,7 +688,10 @@ export type SkillStatus =
   | "needs_python"
   // python_run (#47 round 2): off by default, or the dedicated account is missing / its self-check failed.
   | "disabled"
-  | "needs_account";
+  | "needs_account"
+  // audio_transcribe (#173): no ffmpeg, or not macOS.
+  | "needs_ffmpeg"
+  | "unavailable";
 export type SkillOverview = {
   name: string;
   tool: string;
@@ -630,6 +732,8 @@ export class McpService {
   private readonly pythonTools: readonly PythonToolInfo[];
   /** Whether the tool is usable now (PYTHON_RUN on, interpreter, packages, account, self-check — gated state). */
   private readonly pythonAvailable: () => boolean;
+  /** `audio_transcribe` (#173), when configured: offered to a user who may use `audio-transcription`. */
+  private readonly audioTools: readonly AudioToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -675,6 +779,7 @@ export class McpService {
     this.pythonTools = opts.scratchpad ? PYTHON_TOOLS : [];
     // Whether python_run is offered right now (gated state); cheap, re-checked at each tool list and call.
     this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
+    this.audioTools = opts.audio ? AUDIO_TOOLS : [];
     this.composedTools = [
       ...(this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : []),
       ...(opts.watchlist ? [WATCHLIST_GET_TOOL] : []),
@@ -684,8 +789,11 @@ export class McpService {
   }
 
   /**
-   * Search providers in the configured order. `google-news` runs the installed google-news-search-skill (news
-   * only; leads, not evidence); `duckduckgo` reads its HTML results page through a proxy for that host only.
+   * Search providers in the configured order. `google` runs the installed search-google skill (Serper, #171) —
+   * only when its key is configured, and per call only for a user who may use that skill (server switch, their
+   * permissions, the run's skill scope) and while the run has calls left (`maxCallsPerRun`); otherwise it is
+   * skipped and the next provider answers. `google-news` runs the installed google-news-search-skill (news only;
+   * leads, not evidence); `duckduckgo` reads its HTML results page through a proxy for that host only.
    */
   private buildWeb(o: WebOptions): WebService {
     const worker = o.worker ?? sandboxedWorker();
@@ -693,9 +801,31 @@ export class McpService {
     // (`skillPolicy`, #113 review round 3, #129). A refused redirect is a failed search (`web_search_unavailable`):
     // the next provider is tried.
     const news = this.skills.find((s) => s.name === GOOGLE_NEWS_SKILL.name);
+    const google = this.skills.find((s) => s.name === SEARCH_GOOGLE_SKILL.name);
+    const googleKey = !!google && google.secrets.every((s) => !!this.opts.secrets?.[s.env]);
     const providers =
       o.searchProviders ??
-      (o.providers ?? ["duckduckgo", "google-news"]).flatMap((name): SearchProvider[] => {
+      (o.providers ?? DEFAULT_SEARCH_PROVIDERS).flatMap((name): SearchProvider[] => {
+        if (name === "google" && google && googleKey)
+          return [
+            {
+              name: "google",
+              search: async (query, max, scope) => {
+                if (!this.mayUse(scope, google.name) || !this.takeCall(scope.runId, google))
+                  return { ok: false, code: "web_search_unavailable" };
+                const r = await this.runner(
+                  google,
+                  { query, type: "search", num: Math.min(Math.max(max, 1), 10) },
+                  scope,
+                );
+                // A request the send gate refused (#129): no other provider gets this query either.
+                if (!r.ok && r.code === SKILL_SECRET_BLOCKED)
+                  return { ok: false, code: "web_secret_blocked" };
+                if (!r.ok) return { ok: false, code: "web_search_unavailable" };
+                return { ok: true, hits: (google.searchHits?.(r.output) ?? []).map((h) => h.hit) };
+              },
+            },
+          ];
         if (name === "duckduckgo") {
           const proxy = {
             endpoint: () => this.proxyFor("web:duckduckgo", DUCKDUCKGO_HOSTS),
@@ -734,7 +864,13 @@ export class McpService {
   toolNames(): string[] {
     return toolNames({
       skills: this.skills,
-      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
+      tools: [
+        ...this.tools,
+        ...this.pythonTools,
+        ...this.audioTools,
+        ...this.financeTools,
+        ...this.composedTools,
+      ],
     });
   }
 
@@ -766,6 +902,22 @@ export class McpService {
     // Bounded: entries older than a run can live (the token's lifetime) go.
     if (this.externalRuns.size > 500)
       for (const [id, at] of this.externalRuns) if (t - at > 6 * 3600_000) this.externalRuns.delete(id);
+  }
+
+  /** Calls of capped skills per run (`maxCallsPerRun`, #171): `<runId>\n<skill>` → count and last call time. */
+  private readonly callsByRun = new Map<string, { n: number; at: number }>();
+  /** Takes one call of a capped skill for this run; false when the run has none left (nothing is counted then). */
+  private takeCall(runId: string, skill: Pick<BundledSkill, "name" | "maxCallsPerRun">): boolean {
+    if (skill.maxCallsPerRun === undefined) return true;
+    const key = `${runId}\n${skill.name}`;
+    const t = Date.now();
+    const used = this.callsByRun.get(key)?.n ?? 0;
+    if (used >= skill.maxCallsPerRun) return false;
+    this.callsByRun.set(key, { n: used + 1, at: t });
+    // Bounded like `externalRuns`: entries older than a run can live (the token's lifetime) go.
+    if (this.callsByRun.size > 500)
+      for (const [k, v] of this.callsByRun) if (t - v.at > 6 * 3600_000) this.callsByRun.delete(k);
+    return true;
   }
 
   /**
@@ -811,6 +963,9 @@ export class McpService {
     return [
       ...this.tools.filter((t) => memory || !MEMORY_TOOLS.includes(t)),
       ...(this.pythonAvailable() ? this.pythonTools.filter((t) => this.mayUse(s, t.skill)) : []),
+      ...(this.opts.audio?.state() === "available"
+        ? this.audioTools.filter((t) => this.mayUse(s, t.skill))
+        : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
@@ -834,7 +989,8 @@ export class McpService {
       else if (e.name === PYTHON_SKILL && this.opts.scratchpad) {
         const st = this.opts.scratchpad.state();
         status = st === "available" ? "available" : st;
-      } else if (e.status === "tools") status = "planned";
+      } else if (e.name === AUDIO_SKILL && this.opts.audio) status = this.opts.audio.state();
+      else if (e.status === "tools") status = "planned";
       else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
         status = offered.has(e.name) ? "available" : st === "installed" ? "needs_python" : st;
@@ -917,7 +1073,13 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
-      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
+      tools: [
+        ...this.tools,
+        ...this.pythonTools,
+        ...this.audioTools,
+        ...this.financeTools,
+        ...this.composedTools,
+      ],
       toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
@@ -1061,6 +1223,33 @@ export class McpService {
             durationMs: now() - t0,
             // The fixed outcome only: never the code, its output, the file ids or names.
             pythonCode: r.ok ? (status === "ok" ? "python_ok" : "python_error") : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return r;
+        }
+        if (name === AUDIO_TRANSCRIBE_TOOL.name) {
+          const r = await this.callAudioTool(input, scope);
+          const out = r.ok ? (r.output as { stt?: unknown; diarization?: unknown }) : undefined;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "audio.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // Fixed values only: never the file, its name, the words or the speakers.
+            audioCode: r.ok ? "audio_ok" : r.code,
+            ...(out && typeof out.stt === "string" ? { audioStt: out.stt } : {}),
+            ...(out && typeof out.diarization === "string" ? { audioDiarization: out.diarization } : {}),
           });
           if (!r.ok)
             this.opts.errors?.record({
@@ -1258,6 +1447,21 @@ export class McpService {
     const pad = this.opts.scratchpad;
     if (!pad || !this.mayUse(scope, PYTHON_SKILL)) return { ok: false, code: "python_not_allowed" };
     return (await this.withSlot(scope, () => pad.run(scope, input))) ?? { ok: false, code: "python_busy" };
+  }
+
+  /**
+   * `audio_transcribe` (#173): active user who may use `audio-transcription` (checked again here), then the service —
+   * its own slot (one transcription at a time), the token's own conversation's file only. Never logged: the file,
+   * its name, the words.
+   */
+  private async callAudioTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const audio = this.opts.audio;
+    if (!audio || !this.mayUse(scope, AUDIO_SKILL)) return { ok: false, code: "audio_not_allowed" };
+    // While it runs (minutes): the run's token still alive (revoked when the run ends or is interrupted) and the
+    // user still allowed — otherwise the service stops every step and sends or stores nothing more.
+    return audio.run(scope, input, {
+      alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, AUDIO_SKILL),
+    });
   }
 
   /**
@@ -1615,8 +1819,11 @@ export class McpService {
     if (!parsed.success || !skill.args(parsed.data as Record<string, unknown>))
       return { ok: false, code: "skill_bad_input" };
     // Each call is a process: cap them so one batch or one runtime cannot exhaust the machine.
+    // A paid skill's calls per run are capped (#171); a call counts once it has a slot.
     const r = await this.withSlot(scope, () =>
-      runSkill(skill, parsed.data as Record<string, unknown>, scope),
+      this.takeCall(scope.runId, skill)
+        ? runSkill(skill, parsed.data as Record<string, unknown>, scope)
+        : Promise.resolve<SkillResult>({ ok: false, code: "skill_quota" }),
     );
     if (!r) return { ok: false, code: "skill_busy" };
     if (r.ok && skill.searchHits && this.web) this.registerHits(skill, r.output, scope);
