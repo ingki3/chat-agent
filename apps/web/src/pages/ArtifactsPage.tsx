@@ -4,7 +4,6 @@ import { artifactPath } from "@agentlee/shared";
 import { artifacts, errorText } from "../api.js";
 import { TopBar } from "../Shell.js";
 import { KIND_ICON, KIND_LABEL, MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
-import { panelLink } from "../artifacts/ArtifactPanel.js";
 
 const TABS = [
   ["mine", "내가 만든 것"],
@@ -20,8 +19,8 @@ const when = new Intl.DateTimeFormat("ko-KR", {
 });
 
 /**
- * `/artifacts` (#28, PRD FR-6.6): the artifacts I made, across conversations, newest change first — each opens in
- * its conversation's panel. "공유받은 것" is filled by family sharing (#52). The tab is in the address (`?tab=`).
+ * `/artifacts` (#28, PRD FR-6.6): the artifacts I made, across conversations, newest change first — each opens on
+ * its own page (#172), with its conversation one link away. "공유받은 것" is filled by family sharing (#52). The tab is in the address (`?tab=`).
  */
 export function ArtifactsPage() {
   const [params, setParams] = useSearchParams();
@@ -88,7 +87,7 @@ function Mine() {
       <ul className="art-grid" data-testid="artifact-list">
         {items.map((a) => (
           <li key={a.id} className="art-tile" data-testid="artifact-item">
-            <Link className="art-open" to={panelLink(a.conversationId, a.id)}>
+            <Link className="art-open" to={artifactPath(a.id)}>
               <span className="art-thumb" aria-hidden>
                 {KIND_ICON[a.kind]}
               </span>
@@ -97,9 +96,8 @@ function Mine() {
             <span className="small muted">
               {KIND_LABEL[a.kind]} · v{a.latestVersion} · {when.format(a.updatedAt)}
             </span>
-            <span className="small muted ellipsis">💬 {a.conversationTitle}</span>
-            <Link className="small" to={artifactPath(a.id)}>
-              ↗ 따로 열기
+            <Link className="small muted ellipsis" to={`/c/${encodeURIComponent(a.conversationId)}`}>
+              💬 {a.conversationTitle}
             </Link>
           </li>
         ))}

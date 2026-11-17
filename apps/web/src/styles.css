@@ -876,7 +876,7 @@ a.chip.fileref:hover {
   margin-top: 12px;
 }
 
-/* ---- artifact viewer (#27; shared with the panel, #28) ---- */
+/* ---- artifact viewer (#27; the artifact page, #172) ---- */
 .artifact-view {
   flex: 1;
   display: flex;
@@ -901,58 +901,25 @@ a.chip.fileref:hover {
   background: #fff;
 }
 
-/* ---- artifact panel, cards and list (#28) ---- */
-.art-panel {
-  width: 44%;
-  max-width: 680px;
-  min-width: 320px;
-  flex: none;
-  border-left: 1px solid var(--line);
-  background: var(--panel);
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.art-panel.full {
-  position: fixed;
-  inset: 0;
-  width: auto;
-  max-width: none;
-  min-width: 0;
-  z-index: 45;
-  border-left: 0;
-}
-.art-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--line);
-}
-.art-head h2 {
-  margin: 0;
-  font-size: 15px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
-}
-.art-head h2:focus {
-  outline: none;
-}
-.art-body {
+/* Markdown and code artifacts (#172): rendered by the app, in a scrolling document of their own. */
+.artifact-doc {
   flex: 1;
-  display: flex;
-  flex-direction: column;
   min-height: 0;
   overflow: auto;
-  padding: 12px;
-  gap: 10px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
 }
-.art-body .artifact-frame {
-  min-height: 320px;
+.artifact-doc .md {
+  max-width: 860px;
+  margin: 0 auto;
 }
+
+/* ---- artifact cards and list (#28) ---- */
 .art-card {
+  box-sizing: border-box;
+  text-decoration: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -967,8 +934,7 @@ a.chip.fileref:hover {
   font: inherit;
   cursor: pointer;
 }
-.art-card:hover,
-.art-card.on {
+.art-card:hover {
   border-color: var(--accent);
 }
 .art-card.off {

@@ -318,7 +318,7 @@ export function ShareDialog({ item, onClose }: { item: ShareItem; onClose: () =>
       aria-labelledby={titleId}
       onClose={onClose}
       // Keys stay in the dialog (Esc closes the dialog only — the browser's own cancel — never the drawer or the
-      // panel around it; Tab is the modal's own, not the drawer's focus loop).
+      // page around it; Tab is the modal's own, not the drawer's focus loop).
       onKeyDown={(e) => e.stopPropagation()}
       onClick={(e) => {
         if (e.target === dialog.current) dialog.current.close();

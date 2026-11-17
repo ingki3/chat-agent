@@ -5,12 +5,6 @@ import type { AuthState, AuthUser } from "@agentlee/shared";
 import { NOTIFICATIONS_KEY } from "./api.js";
 import { PUSH_DEVICES_KEY, syncPush } from "./push.js";
 import { CONVERSATIONS_KEY, Sidebar } from "./Sidebar.js";
-import {
-  ArtifactPanel,
-  PANEL_FULL_SCREEN,
-  useMediaQuery,
-  useOpenArtifact,
-} from "./artifacts/ArtifactPanel.js";
 
 type ShellCtx = { openDrawer: (trigger: HTMLElement) => void };
 const Ctx = createContext<ShellCtx>({ openDrawer: () => {} });
@@ -19,17 +13,14 @@ export const useShell = () => useContext(Ctx);
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /**
- * Three-column app frame (claude.ai-like, mockup v2): sidebar · main · artifact panel (#28, only while an artifact
- * is open on a chat screen). At 900px and below the sidebar becomes a modal drawer opened with ☰ from every screen:
- * focus moves into it and stays there, the rest of the page is inert, and closing returns focus to ☰. Any
- * navigation closes it. There the artifact panel covers the screen too, and the page under it is inert.
+ * App frame (claude.ai-like, mockup v2): sidebar · main. Artifacts open on their own page (#172), never in a column
+ * beside the chat. At 900px and below the sidebar becomes a modal drawer opened with ☰ from every screen: focus
+ * moves into it and stays there, the rest of the page is inert, and closing returns focus to ☰. Any navigation
+ * closes it.
  */
 export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: AuthState) => void }) {
   const [drawer, setDrawer] = useState(false);
   usePushMessages();
-  const artifact = useOpenArtifact();
-  const narrow = useMediaQuery(PANEL_FULL_SCREEN);
-  const panelCovers = !!artifact && narrow;
   // The drawer exists only at 900px and below: widening the window closes it (and with it the modal state).
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
@@ -105,13 +96,9 @@ export function Shell({ user, onSignedOut }: { user: AuthUser; onSignedOut: (s: 
           onNavigate={() => setDrawer(false)}
         />
         {drawer && <div className="scrim" data-testid="scrim" onClick={close} />}
-        <main className="main" inert={drawer || panelCovers || undefined}>
+        <main className="main" inert={drawer || undefined}>
           <Outlet />
         </main>
-        {artifact && (
-          // Keyed by artifact: another one starts fresh (its focus, export state).
-          <ArtifactPanel key={artifact.id} id={artifact.id} version={artifact.version} fullScreen={narrow} />
-        )}
       </div>
     </Ctx.Provider>
   );

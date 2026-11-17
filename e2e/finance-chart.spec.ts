@@ -1,6 +1,14 @@
 import crypto from "node:crypto";
 import { expect, test, type Frame, type Page } from "@playwright/test";
-import { MOM, newConversation, newMember, signIn, useAccount } from "./helpers.js";
+import {
+  MOM,
+  backToChat,
+  newConversation,
+  newMember,
+  sendMessage as send,
+  signIn,
+  useAccount,
+} from "./helpers.js";
 
 /**
  * Finance table and chart artifacts and 관심 종목 (#31, PRD FR-7.5·7.7, 수용 기준 4, M4 completion criterion).
@@ -9,15 +17,8 @@ import { MOM, newConversation, newMember, signIn, useAccount } from "./helpers.j
  * and zoom switches and the note are the real ones. Desktop and mobile.
  */
 
-async function send(page: Page, text: string) {
-  const box = page.getByLabel("메시지 입력");
-  await box.fill(text);
-  await box.press("Enter");
-  await expect(box).toHaveValue("");
-}
-
 async function frameOf(page: Page): Promise<Frame> {
-  const el = page.getByTestId("artifact-panel").getByTestId("artifact-frame");
+  const el = page.getByTestId("artifact-page").getByTestId("artifact-frame");
   await expect(el).toHaveAttribute("sandbox", "allow-scripts");
   const frame = await (await el.elementHandle())!.contentFrame();
   expect(frame).not.toBeNull();
@@ -32,13 +33,11 @@ test('"AAPL, 005930 6개월 비교 차트": table part, table and chart artifact
   const conv = await newConversation(page.request, baseURL!, `금융 차트 ${crypto.randomUUID().slice(0, 6)}`);
   await page.goto(`/c/${conv.id}`);
   await send(page, "AAPL, 005930 6개월 비교 차트");
+  // The reply's artifact is shown on its page by itself (#28, #172): back to the conversation to read the reply.
+  await expect(page.getByTestId("artifact-page")).toBeVisible({ timeout: 20_000 });
+  await backToChat(page);
   const reply = page.getByTestId("assistant").last();
   await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 20_000 });
-  // The reply's artifact opens the panel by itself (#28); on a phone it covers the chat — close it to read the reply.
-  const panel = page.getByTestId("artifact-panel");
-  await expect(panel).toBeVisible();
-  await page.getByTestId("artifact-panel-close").click();
-  await expect(panel).toHaveCount(0);
 
   // Two artifact cards: the table and the chart.
   const cards = reply.getByTestId("artifact-card");
@@ -64,7 +63,7 @@ test('"AAPL, 005930 6개월 비교 차트": table part, table and chart artifact
   await expect(note).toContainText(/네이버 증권 · \d{4}-\d{2}-\d{2} 15:30 KST 종가/);
   await expect(note).toContainText("투자 권유가 아닙니다");
 
-  // The chart in the panel: basis and zoom switches (no script), sources and the exchange rate under it.
+  // The chart on its page: basis and zoom switches (no script), sources and the exchange rate under it.
   await cards.filter({ hasText: "수익률 비교" }).click();
   const frame = await frameOf(page);
   await expect(frame.locator(".src li")).toHaveCount(2);

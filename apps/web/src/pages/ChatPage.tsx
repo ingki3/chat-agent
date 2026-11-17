@@ -39,22 +39,20 @@ import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
-import { useRunStream, type LiveReply, type Notice } from "../chat/stream.js";
+import { useRunStream, type LiveReply } from "../chat/stream.js";
+import { takeAfter, type AfterRun } from "../chat/after-run.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
 import { ReferencesButton } from "../citations/ReferencesExport.js";
 import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
-import { markStartedHere, useAutoOpen } from "../artifacts/ArtifactPanel.js";
+import { markStartedHere, useAutoShow } from "../artifacts/ArtifactCard.js";
 import { FileViewContext } from "../files/context.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
  * reply, edit a message and send again; follows the bottom unless the user scrolls up; connection notices.
  */
-
-/** What a finished run leaves behind for its message: notices and errors are not stored with the message. */
-type AfterRun = { notices: Notice[]; error?: { code: string; message: string } };
 
 /** Errors after which the conversation can carry on with another runtime (FR-11.8; the switch itself is #19). */
 const SWITCHABLE = new Set([
@@ -124,7 +122,9 @@ export function ChatPage() {
     },
   });
   const usable = useUsableRuntimes();
-  const [after, setAfter] = useState<Record<string, AfterRun>>({});
+  // Runs that ended while the user was on an artifact page they moved to (#172) left their notices there; taken
+  // once (the store forgets them) — this screen keeps them from here on.
+  const [after, setAfter] = useState<Record<string, AfterRun>>(() => takeAfter(id));
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const online = useOnline();
@@ -134,7 +134,7 @@ export function ChatPage() {
     Promise.all([
       qc.invalidateQueries({ queryKey: ["conversation", id] }),
       qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY }),
-      // A run may have made a new version of an open artifact (#28): the panel and the cards show it.
+      // A run may have made a new version of an artifact (#28): the cards and its page show it.
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
@@ -155,8 +155,8 @@ export function ChatPage() {
     },
     () => void refresh(),
   );
-  // A new artifact of a run started here opens in the panel by itself (#28, FR-6.1).
-  useAutoOpen(live);
+  // A new artifact of a run started here is shown on its page by itself (#28, FR-6.1, #172).
+  useAutoShow(live, id);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
   const lost = !!live?.lost;
   // A lost stream does not keep the conversation busy: edit, regenerate and send are available again.
