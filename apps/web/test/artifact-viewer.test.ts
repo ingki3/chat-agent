@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ARTIFACT_REDACTED_NOTICE } from "@agentlee/shared";
 import { ApiError } from "../src/api.js";
 import {
@@ -13,7 +13,8 @@ import {
   type ArtifactViewer,
 } from "../src/artifacts/viewer.js";
 import { splitBlocks } from "../src/chat/blocks.js";
-import { afterOf, keepAfter } from "../src/chat/after-run.js";
+import { AFTER_RUN_LIMITS, afterSize, clearAfter, keepAfter, takeAfter } from "../src/chat/after-run.js";
+import { recoverLost } from "../src/artifacts/follow-run.js";
 import { artifactLink, fromOf, legacyPanelTarget } from "../src/artifacts/ArtifactCard.js";
 
 const viewer = (v: Partial<ArtifactViewer>) =>
@@ -238,11 +239,75 @@ describe("code artifacts as one fenced block (review #175)", () => {
 });
 
 describe("what a run left behind while the chat was not on screen (review #175)", () => {
-  it("is kept per conversation and message for the chat screen", () => {
-    keepAfter("conv-a", "m1", { notices: [{ level: "info", code: "x", message: "알림" }] });
+  afterEach(() => clearAfter());
+  const note = (message: string) => ({ notices: [{ level: "info" as const, code: "x", message }] });
+
+  it("is kept per conversation and message, and taken once by the chat screen", () => {
+    keepAfter("conv-a", "m1", note("알림"));
     keepAfter("conv-a", "m2", { notices: [], error: { code: "e", message: "오류" } });
-    expect(Object.keys(afterOf("conv-a"))).toEqual(["m1", "m2"]);
-    expect(afterOf("conv-a").m2?.error?.code).toBe("e");
-    expect(afterOf("conv-b")).toEqual({});
+    const got = takeAfter("conv-a");
+    expect(Object.keys(got)).toEqual(["m1", "m2"]);
+    expect(got.m2?.error?.code).toBe("e");
+    expect(takeAfter("conv-a")).toEqual({}); // consumed (also how a deleted conversation's entry goes)
+    expect(takeAfter("conv-b")).toEqual({});
+  });
+
+  it("is bounded: the oldest conversations go past the cap, entries expire, sign-out empties it", () => {
+    for (let i = 0; i < AFTER_RUN_LIMITS.conversations + 5; i++)
+      keepAfter(`c${i}`, "m", note(`${i}`), 1000 + i);
+    expect(afterSize()).toBe(AFTER_RUN_LIMITS.conversations);
+    expect(takeAfter("c0", 2000)).toEqual({});
+    expect(takeAfter(`c${AFTER_RUN_LIMITS.conversations + 4}`, 2000).m).toBeDefined();
+    keepAfter("old", "m", note("old"), 0);
+    expect(takeAfter("old", AFTER_RUN_LIMITS.ttlMs + 1)).toEqual({});
+    keepAfter("x", "m", note("x"));
+    clearAfter();
+    expect(afterSize()).toBe(0);
+  });
+});
+
+describe("a lost run stream on the artifact page recovers (review #175 2차)", () => {
+  afterEach(() => vi.useRealTimers());
+  const run = (id: string, endedAt: number | null) => ({ id, endedAt }) as never;
+
+  it("still running: subscribes again; a failed read waits for the next tick", async () => {
+    vi.useFakeTimers();
+    const reconnect = vi.fn();
+    const ended = vi.fn();
+    const read = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(run("r1", null));
+    const stop = recoverLost({ runId: "r1", read, reconnect, ended, everyMs: 1000 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(reconnect).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    expect(ended).not.toHaveBeenCalled();
+    // Done: no more reads.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(read).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  it("ended, gone or another run: refresh what it changed", async () => {
+    vi.useFakeTimers();
+    for (const answer of [run("r1", 5), null, run("r2", null)]) {
+      const reconnect = vi.fn();
+      const ended = vi.fn();
+      recoverLost({ runId: "r1", read: async () => answer, reconnect, ended, everyMs: 1000 });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(ended).toHaveBeenCalledTimes(1);
+      expect(reconnect).not.toHaveBeenCalled();
+    }
+  });
+
+  it("stopped (the page left or the stream came back): nothing more happens", async () => {
+    vi.useFakeTimers();
+    const read = vi.fn().mockResolvedValue(run("r1", null));
+    const reconnect = vi.fn();
+    const stop = recoverLost({ runId: "r1", read, reconnect, ended: vi.fn(), everyMs: 1000 });
+    stop();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(read).not.toHaveBeenCalled();
+    expect(reconnect).not.toHaveBeenCalled();
   });
 });

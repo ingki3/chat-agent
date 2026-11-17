@@ -358,6 +358,41 @@ test("the run goes on after moving to the page: a later v2 shows there, and the 
   await expect(page).toHaveURL(new RegExp(`/c/${conv.id}$`));
 });
 
+test("a page whose run stream gave up while the run goes on recovers and shows the later v2", async ({
+  page,
+  baseURL,
+}) => {
+  test.setTimeout(60_000);
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `복구 ${tag}`);
+  const r = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+    data: { text: `/artifact-twice-slow markdown 복구 ${tag}\n# 첫 버전 ${tag}\n===\n# 둘째 버전 ${tag}` },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": `e2e-${tag}` },
+  });
+  expect(r.status()).toBe(201);
+  let id = "";
+  await expect
+    .poll(async () => {
+      const list = (await (await page.request.get(`/api/conversations/${conv.id}/artifacts`)).json()) as {
+        items: { id: string }[];
+      };
+      id = list.items[0]?.id ?? "";
+      return id;
+    })
+    .not.toBe("");
+  // The run's event stream fails for a while: the page's subscription spends its retries and gives up (lost).
+  await page.route("**/api/runs/*/events*", (route) => route.fulfill({ status: 503, body: "" }));
+  await page.goto(`/a/${id}`);
+  const heading = page.getByTestId("artifact-text").getByRole("heading", { level: 1 });
+  await expect(heading).toHaveText(`첫 버전 ${tag}`);
+  await page.waitForTimeout(11_000);
+  await page.unroute("**/api/runs/*/events*");
+  // Back: the page reads the run again, subscribes again while it runs, and v2 (stored at 14 s) shows.
+  await expect(heading).toHaveText(`둘째 버전 ${tag}`, { timeout: 20_000 });
+  await expect(page.getByTestId("artifact-version")).toHaveValue("2");
+});
+
 test("the frame's Escape message goes back only from the frame on screen and only in its exact shape", async ({
   page,
   baseURL,

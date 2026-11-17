@@ -18,6 +18,7 @@ import { ScheduleDetailPage, SchedulesPage } from "./pages/SchedulesPage.js";
 import { Shell } from "./Shell.js";
 import { FileViewerPage } from "./files/FileViewer.js";
 import { legacyPanelTarget, type ArtifactFrom } from "./artifacts/ArtifactCard.js";
+import { clearAfter } from "./chat/after-run.js";
 
 /** Only the login state lives here. Everything an account sees lives in a per-account client (AccountData). */
 const authClient = new QueryClient({
@@ -131,7 +132,14 @@ function AccountData({ children }: { children: ReactNode }) {
         defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true, staleTime: 5_000 } },
       }),
   );
-  useEffect(() => () => client.clear(), [client]);
+  useEffect(
+    () => () => {
+      client.clear();
+      // Notices kept for the chat screens of this account (#172 review) go with it too.
+      clearAfter();
+    },
+    [client],
+  );
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 

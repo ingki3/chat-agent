@@ -18,6 +18,7 @@ import {
 import { ShareDialog, when } from "./shares/ShareDialog.js";
 import { unsubscribeOnSignOut } from "./push.js";
 import { usageLine } from "./usage-format.js";
+import { takeAfter } from "./chat/after-run.js";
 
 export const CONVERSATIONS_KEY = ["conversations"] as const;
 
@@ -259,6 +260,7 @@ export function ConvMenu({ c }: { c: Conversation }) {
         )
       ) {
         await conversations.remove(c.id);
+        takeAfter(c.id); // what its runs left for the chat screen goes with it
         // Leave only if this conversation is still the one on screen (the user may have moved on meanwhile).
         if (window.location.pathname === `/c/${c.id}`) navigate("/", { replace: true });
       }

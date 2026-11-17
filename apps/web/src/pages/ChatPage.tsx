@@ -40,7 +40,7 @@ import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Part
 import { RuntimeChip } from "../chat/RuntimeChip.js";
 import { useStickToBottom } from "../chat/scroll.js";
 import { useRunStream, type LiveReply } from "../chat/stream.js";
-import { afterOf, type AfterRun } from "../chat/after-run.js";
+import { takeAfter, type AfterRun } from "../chat/after-run.js";
 import { TopBar } from "../Shell.js";
 import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
@@ -122,8 +122,9 @@ export function ChatPage() {
     },
   });
   const usable = useUsableRuntimes();
-  // Runs that ended while the user was on an artifact page they moved to (#172) left their notices there.
-  const [after, setAfter] = useState<Record<string, AfterRun>>(() => afterOf(id));
+  // Runs that ended while the user was on an artifact page they moved to (#172) left their notices there; taken
+  // once (the store forgets them) — this screen keeps them from here on.
+  const [after, setAfter] = useState<Record<string, AfterRun>>(() => takeAfter(id));
   const [actionError, setActionError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const online = useOnline();
