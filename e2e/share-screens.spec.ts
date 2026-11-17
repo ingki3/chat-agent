@@ -181,7 +181,10 @@ test("an artifact shared from its own page is copied by the viewer to change it 
   // Owner, on the artifact page opened from the chat's card (#172): Esc closes the share dialog only — the page
   // stays, it does not go back to the conversation (review #119).
   await page.goto(`/c/${conv.id}`);
-  await page.getByTestId("assistant").last().getByTestId("artifact-card").first().click();
+  const card = page.getByTestId("assistant").last().getByTestId("artifact-card").first();
+  // Its details loaded (kind and version known): the newest opens "following the newest", without ?v=.
+  await expect(card).toContainText("HTML 아티팩트 · v1");
+  await card.click();
   const panel = page.getByTestId("artifact-page");
   await expect(panel.getByTestId("artifact-frame")).toBeVisible();
   await panel.getByTestId("share-open").click();
