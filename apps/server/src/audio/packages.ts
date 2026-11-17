@@ -247,7 +247,8 @@ export function installAudioPackages(
         "-r",
         AUDIO_LOCK,
       ],
-      { stdio: ["ignore", "inherit", "inherit"], env: pipEnv(home) },
+      // cwd too: a child (or a shell wrapper) would otherwise see the admin's current folder (PWD) — CI review.
+      { stdio: ["ignore", "inherit", "inherit"], env: pipEnv(home), cwd: home },
     );
     if (r.error) throw r.error;
     if (r.status !== 0) throw new Error(`pip exited with ${r.status ?? r.signal}`);

@@ -1284,21 +1284,24 @@ describe("audio_transcribe: merging speaker turns and words (#173)", () => {
     expect(fw[0]!.text.endsWith("\u3000")).toBe(true);
   });
 
-  it("splitLong is linear: 4× the text without spaces takes ~4× the time, not 16× (review 2)", () => {
+  it("splitLong is linear: 8× the text without spaces takes ~8× the time, not 64× (review 2)", () => {
+    // Best of three each (a loaded machine only ever makes a run slower), and 8× apart so linear (8×) and
+    // quadratic (64×) are far from the line at 24×.
     const time = (n: number) => {
       const seg = [{ speaker: null, start: 0, end: 1, text: "가".repeat(n) }];
-      splitLong(seg, AUDIO_LIMITS.segmentChars); // warm
-      const t0 = performance.now();
-      const parts = splitLong(seg, AUDIO_LIMITS.segmentChars);
-      const ms = performance.now() - t0;
-      expect(parts.length).toBe(Math.ceil(n / AUDIO_LIMITS.segmentChars));
-      return ms;
+      let best = Infinity;
+      for (let k = 0; k < 3; k++) {
+        const t0 = performance.now();
+        const parts = splitLong(seg, AUDIO_LIMITS.segmentChars);
+        best = Math.min(best, performance.now() - t0);
+        expect(parts.length).toBe(Math.ceil(n / AUDIO_LIMITS.segmentChars));
+      }
+      return best;
     };
-    const small = Math.max(time(500_000), 1);
+    const small = Math.max(time(250_000), 1);
     const big = time(2_000_000);
-    // Quadratic was 206 ms → 3,427 ms (16.6×) here; linear is about 4×. Generous for a loaded machine.
-    expect(big / small).toBeLessThan(10);
-    expect(big).toBeLessThan(2_000);
+    // Quadratic was 206 ms (0.5M) → 3,427 ms (2M) on the dev Mac.
+    expect(big / small).toBeLessThan(24);
   });
 
   it("maxSpeakers folds the rarest voices into the nearest kept speaker", () => {
@@ -1567,6 +1570,12 @@ exit 3
       { mode: 0o755 },
     );
     const saved = { ...process.env };
+    // Started from a folder under the home folder (as on a CI runner, where the checkout is under $HOME): the
+    // install must not let that path through (a shell's PWD).
+    const here = process.cwd();
+    const homeCwd = fs.realpathSync(fs.mkdtempSync(path.join(os.homedir(), ".agentlee-audio-cwd-")));
+    closers.push(() => fs.rmSync(homeCwd, { recursive: true, force: true }));
+    process.chdir(homeCwd);
     process.env.OPENROUTER_API_KEY = SYNTHETIC_KEY;
     process.env.PIP_CONFIG_FILE = "/Users/admin/.config/pip/pip.conf";
     process.env.PIP_INDEX_URL = "https://evil.example/simple";
@@ -1574,8 +1583,20 @@ exit 3
       expect(() => installAudioPackages({ exe, root }, data)).toThrow(/pip exited with 3/);
     } finally {
       process.env = saved;
+      process.chdir(here);
     }
     const env = fs.readFileSync(`${dump}.env`, "utf8");
+    // Exactly the fixed variables, plus what /bin/sh itself sets (PWD, SHLVL, `_`, OLDPWD). Names only in messages.
+    const names = env
+      .split("\n")
+      .filter((l) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(l))
+      .map((l) => l.slice(0, l.indexOf("=")))
+      .sort();
+    const shell = new Set(["PWD", "SHLVL", "_", "OLDPWD"]);
+    expect(names.filter((n) => !shell.has(n))).toEqual(Object.keys(pipEnv("/h")).sort());
+    const pwd = /^PWD=(.*)$/m.exec(env)?.[1];
+    if (pwd !== undefined) expect(pwd.startsWith(path.join(data, "audio-packages", ".home-"))).toBe(true);
+    expect(env).not.toContain(homeCwd);
     expect(env).not.toContain(SYNTHETIC_KEY);
     expect(env).not.toContain("PIP_INDEX_URL");
     expect(env).not.toContain(os.homedir());
