@@ -768,6 +768,11 @@ export class RunManager {
     const live = this.live.get(id);
     if (live && !live.settled) {
       live.interruptRequested = true;
+      // From this moment the runtime may not use our tools any more (#173 review 3): a long tool call in progress
+      // (a transcription) sees its token gone and stops — it sends nothing more outside and stores nothing — without
+      // waiting for the runtime to stop and the run to settle. A result that comes back later is dropped as after
+      // any run's end.
+      this.mcpTokens.revokeRun(id);
       live.graceTimer ??= setTimeout(
         () => this.settle(id, "interrupted", null),
         this.opts.interruptGraceMs ?? 3000,

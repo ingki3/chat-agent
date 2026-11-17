@@ -830,6 +830,93 @@ describe("audio_transcribe: a call stops with its run (#173 review 1)", () => {
     expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
   });
 
+  /** Sends `/audio <id>` without waiting for the run; returns its id. */
+  const startAudio = async (t: Awaited<ReturnType<typeof start>>, cid: string, fileId: string) => {
+    const res = await t.api(t.f.cookies.owner, "POST", `/api/conversations/${cid}/messages`, {
+      text: `/audio ${fileId}`,
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    return (res.json() as { run: Run }).run.id;
+  };
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 1000 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(cond()).toBe(true);
+  };
+
+  it("interrupt while the transcript waits for the store lock (after the last external answer): nothing stored (review 3)", async () => {
+    for (let round = 0; round < 3; round++) {
+      const or = mockOpenRouter();
+      const failing = scripted({ words: "fail", chunkCount: 2 });
+      const t = await start({ runner: failing.runner, fallback: or.fetchImpl });
+      expect((await t.api(t.f.cookies.admin, "PUT", "/api/admin/audio", { fallback: true })).statusCode).toBe(
+        200,
+      );
+      const c = t.app.conversations!.create(t.f.users.owner.id);
+      const file = await t.sentFile(t.f.cookies.owner, c.id);
+      const before = t.app.files!.list(c.id).length;
+      // A backup holds the file-write lock: the call gets through every external answer, then waits to store.
+      let release!: () => void;
+      let held!: () => void;
+      const holding = new Promise<void>((r) => (held = r));
+      const backup = t.app.fileWrites.exclusive(async () => {
+        held();
+        await new Promise<void>((r) => (release = r));
+      });
+      await holding;
+      const runId = await startAudio(t, c.id, file.id);
+      await until(() => or.requests.length === 2);
+      await new Promise((r) => setTimeout(r, 50));
+      const stop = await t.api(t.f.cookies.owner, "POST", `/api/runs/${runId}/interrupt`);
+      expect(stop.statusCode, stop.body).toBe(200);
+      await new Promise((r) => setTimeout(r, 100));
+      release();
+      await backup;
+      await until(() => t.log.some((l) => l.msg === "audio.finished"));
+      expect(t.log.find((l) => l.msg === "audio.finished")).toMatchObject({ audioCode: "audio_cancelled" });
+      expect(t.app.files!.list(c.id)).toHaveLength(before);
+      await waitRun(t.app, runId);
+      expect(t.app.runs!.get(runId)!.status).toBe("interrupted");
+      expect(t.app.files!.list(c.id)).toHaveLength(before);
+    }
+  });
+
+  it("interrupt during the local step, the step then returns on its own: no external send, nothing stored (review 3)", async () => {
+    const or = mockOpenRouter();
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => (finish = r));
+    const s = scripted({ words: "fail", chunkCount: 2 });
+    let started = false;
+    // A local step that ignores its signal and fails only when the test lets it (as if the process exited by itself).
+    const runner: AudioRunner = {
+      ...s.runner,
+      transcribe: async (job, signal) => {
+        started = true;
+        await gate;
+        return s.runner.transcribe(job, signal);
+      },
+    };
+    const t = await start({ runner, fallback: or.fetchImpl });
+    expect((await t.api(t.f.cookies.admin, "PUT", "/api/admin/audio", { fallback: true })).statusCode).toBe(
+      200,
+    );
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const before = t.app.files!.list(c.id).length;
+    const runId = await startAudio(t, c.id, file.id);
+    await until(() => started);
+    const stop = await t.api(t.f.cookies.owner, "POST", `/api/runs/${runId}/interrupt`);
+    expect(stop.statusCode, stop.body).toBe(200);
+    // At once — before any watch tick could notice.
+    finish();
+    await until(() => t.log.some((l) => l.msg === "audio.finished"));
+    expect(t.log.find((l) => l.msg === "audio.finished")).toMatchObject({ audioCode: "audio_cancelled" });
+    expect(or.requests).toHaveLength(0);
+    expect(s.calls.chunks).toBe(0);
+    expect(t.app.files!.list(c.id)).toHaveLength(before);
+    await waitRun(t.app, runId);
+    expect(t.app.runs!.get(runId)!.status).toBe("interrupted");
+  });
+
   it("the run ending, the caller's signal, a lost permission: each stops the step (audio_cancelled), slot freed", async () => {
     const t = await start();
     const c = t.app.conversations!.create(t.f.users.owner.id);
