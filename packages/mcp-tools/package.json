@@ -49,6 +49,11 @@
       "development": "./src/python.ts",
       "default": "./dist/python.js"
     },
+    "./audio": {
+      "types": "./src/audio.ts",
+      "development": "./src/audio.ts",
+      "default": "./dist/audio.js"
+    },
     "./memory": {
       "types": "./src/memory.ts",
       "development": "./src/memory.ts",

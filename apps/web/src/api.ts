@@ -7,6 +7,7 @@ import {
   BackupItem,
   BackupsResponse,
   AdminSkillsResponse,
+  AudioAdmin,
   DefaultsResponse,
   RuntimeOption,
   RuntimePolicy,
@@ -249,6 +250,10 @@ export const admin = {
   skills: async () => AdminSkillsResponse.parse(await call("GET", "/api/admin/skills")).skills,
   setServerSkill: async (name: string, enabled: boolean) =>
     AdminSkillsResponse.parse(await call("PUT", `/api/admin/skills/${enc(name)}`, { enabled })).skills,
+  /** 음성 전사 (#173): the OpenRouter fallback switch. */
+  audio: async () => AudioAdmin.parse(await call("GET", "/api/admin/audio")),
+  setAudioFallback: async (fallback: boolean) =>
+    AudioAdmin.parse(await call("PUT", "/api/admin/audio", { fallback })),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,
   system: async () => SystemStatus.parse(await call("GET", "/api/admin/system")),
   /** Backups (#37): list and "지금 백업". Restore is the CLI only. */

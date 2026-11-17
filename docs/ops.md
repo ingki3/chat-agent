@@ -2117,3 +2117,44 @@ PRD FR-15.2~15.7, FR-1.3, 수용 기준 13. 관리자 → **Access** 탭(`/admin
 
 - 자동: `apps/server/test/access-sync.test.ts` — Cloudflare API **목 서버**(`test/helpers/cloudflare-mock.ts`, 루프백, 합성 토큰·ID·이메일)로 등록·미리보기(기존 불일치 포함)·반영·revision 충돌·오래된 미리보기·실패 후 저장 유지·멱등 재시도(응답 잃은 쓰기를 반복하지 않음)·429 자동 재시도·`applying` 중 재시작·비활성화 세션 철회·관리자 이메일 보호·관리자 이메일 변경 각 단계 실패·재시작·취소·수동 모드. 화면은 `e2e/access.spec.ts`(e2e 서버는 토큰 없음 = 수동 모드). **실제 Cloudflare API는 시험에서 부르지 않는다.**
 - 수동(실계정): 수용 기준 13 절차(`docs/acceptance.md` AC-13)를 기록 양식 B로 남긴다.
+
+## 46. 음성·영상 화자별 전사 — `audio_transcribe` (#173)
+대화에 올린 음성(M4A·MP3·WAV)·영상(MP4·MOV)을 **화자별 대본**으로 만든다. 이 Mac에서 ffmpeg로 16kHz mono WAV를 만들고, `mlx-community/Nemotron-3-Diarization`으로 화자 구간을, MLX Whisper(`mlx-community/whisper-large-v3-turbo-asr-fp16`)로 시간이 붙은 글자를 얻어 시간으로 합친다. 실행 중에는 네트워크가 없다. 코드: `apps/server/src/audio/`(`service.ts` 검사·병합·저장, `runner.ts` 샌드박스 실행, `packages.ts` 설치·상태, `openrouter.ts` 대체, `merge.ts`), interpreter 쪽 `apps/server/audio/transcribe.py`, 고정 목록 `apps/server/audio/requirements.lock`·`models.json`. 근거는 `docs/decisions/isolation.md` "음성 전사 (#173)".
+
+### 46.1 설치 (한 번 — 관리자)
+```bash
+# 1) SKILL_PYTHON: 독립 실행형 CPython 3.12 (§35와 같은 것) — 이미 있으면 건너뜀
+uv python install 3.12 && uv python find 3.12     # .env의 SKILL_PYTHON=<출력 경로>
+# 2) ffmpeg (기본 /opt/homebrew/bin/ffmpeg — 다른 곳이면 .env의 AUDIO_FFMPEG=<절대 경로>)
+brew install ffmpeg
+# 3) 고정 패키지 + 모델 (이 명령만 네트워크를 쓴다: PyPI, huggingface.co)
+pnpm audio:install     # <DATA_DIR>/audio-packages/<lock 해시>-py3.12/ (~570MB), <DATA_DIR>/audio-models/<목록 해시>/ (~1.8GB)
+pnpm audio:status      # audio_transcribe: available, OPENROUTER_API_KEY: set/not set
+pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisper, 샌드박스 + Metal)를 한 번씩 — 단계별 ok와 시간만 출력
+# 4) 서버 재시작
+```
+- 운영(`~/.chat-agent`)에서는 그 폴더에서 `DATA_DIR`이 운영 데이터 폴더를 가리키게 해서 같은 명령을 돌린다(§43). 패키지·모델은 파생 데이터라 백업에 들어가지 않는다 — 복원 뒤 다시 `pnpm audio:install`.
+- 패키지: `mlx-audio==0.6.4`와 그 의존성 전부를 정확한 버전·휠 해시로 고정(`pip --no-deps --require-hashes --only-binary=:all: --target`), 모든 파일이 2026-11-17 기준 2주 넘게 지난 배포(`uv pip compile --exclude-newer 2026-11-03`). 모델: 저장소·커밋·파일마다 크기와 SHA-256을 `models.json`에 고정하고 받은 뒤 확인한다(다르면 아무것도 설치하지 않음). 관리자의 venv나 `~/.cache/huggingface`는 쓰지 않는다. 설치 폴더는 읽기 전용(0555/0444).
+- lock·모델 목록이 바뀌면 해시가 바뀌어 `not_installed`가 되므로 `pnpm audio:install`을 다시 돌린다.
+
+### 46.2 켜고 끄기
+- **서버 허용 목록**: 관리자 → 스킬 → `audio-transcription` "허용"(기본 켜짐 — 설치 전에는 `설치 안 됨`으로 보이고 제공되지 않음). **사용자별**: 같은 탭 아래(청소년 계정도 `"all"`이면 켜짐 — 금융 스킬이 아님).
+- **외부 대체(OpenRouter)**: 관리자 → 스킬 → **음성 전사 외부 대체 → OpenRouter 대체 허용**(기본 꺼짐) + `.env`의 `OPENROUTER_API_KEY`. 둘 다 있어야 하고, **로컬 Whisper가 실패했을 때만**(오류·비정상 종료·시간·메모리 한도) 쓴다. 쓰면 결과에 `stt: "openrouter"`·`externalTranscription: true`·`notice: "외부 전사 사용 (OpenRouter openai/whisper-large-v3)"`이 붙고 대본 파일 머리에도 적힌다. 화자 구분은 항상 이 Mac에서 한다.
+- 대체 요청: 고정 URL `https://openrouter.ai/api/v1/audio/transcriptions`, 리다이렉트 거부, 키는 `Authorization: Bearer` 헤더에만, 폼은 고정(`model`·`language`·`response_format=verbose_json`·`temperature=0`·고정 파일 이름)과 오디오 바이트. 오디오는 WAV를 64kbps mono MP3 10분 조각(< 24MB, 공급자 25MB 한도 안)으로 다시 만들어 조각마다 한 번 보내고 시간을 이어 붙인다. 한 조각이라도 실패하면 `audio_fallback_failed`(일부만 된 대본을 전체인 척 돌려주지 않음).
+
+### 46.3 동작과 한도 (`AUDIO_LIMITS`, `packages/shared/src/audio.ts`)
+- 입력은 그 대화에 메시지와 함께 보낸 파일 id뿐(경로·URL 없음) — python_run과 같은 범위 규칙. 저장 해시로 확인한 사본을 호출마다 새 작업 폴더 `<DATA_DIR>/audio-scratch/<uuid>/`에 넣고 끝나면 지운다(서버 시작 때 남은 것도).
+- 업로드 한도는 파일 업로드와 같다(50MB). 길이 2시간까지(`audio_too_long`). 단계마다 벽시계·상주 메모리 한도: 변환 5분·1GB, 화자 구분과 전사 각 25분·8GB, 호출 전체 60분(`audio_timeout`). 넘으면 그 프로세스 그룹을 SIGKILL한다. 서버 전체에서 한 번에 하나(`audio_busy`) — GPU와 수 GB 메모리.
+- Codex는 MCP 도구 호출에 기본 60초를 준다. `audio_transcribe`가 있는 실행에만 `tool_timeout_sec = 3660`을 준다(`runtime/lockdown.ts`). Claude Agent SDK의 MCP 도구 시간 한도는 기본값이 이보다 길다.
+- 결과의 글자는 올린 녹음에서 왔다: `<external_content>` 블록 안 JSON으로 돌려주고, 알려진 비밀은 전부 가린다(반환·대본 파일 모두). 대본 파일 `<원래 이름>-대본.md`는 답 메시지에 연결된 대화 파일이라 `file_read`로 나머지를 읽고, 모델이 이름을 추정해 마크다운 아티팩트로 정리한다.
+- 음성·영상 파일은 글자 추출을 하지 않는다(`extract_unsupported` — "아직 이 형식의 글자는 읽을 수 없어요"). 전사는 이 도구로만.
+
+### 46.4 로그와 확인
+- 로그는 `audio.finished` 하나: 도구 이름, 고정 코드(`audioCode` — `audio_ok` 또는 `AUDIO_CODES`), `audioStt`(`local`/`openrouter`), `audioDiarization`(`local`/`off`/`failed`), 시간, ID. 파일 id·이름·글자·화자는 남지 않는다. 실패는 관리자 "스킬 실행 실패"에 도구 이름과 코드로.
+- 시험: `pnpm vitest run apps/server/test/audio.test.ts` — 가짜 ffmpeg·가짜 diarizer·가짜 STT로 범위·형식·한도·병합·저장·비밀 가림·로그, OpenRouter는 **목**(합성 키, 네트워크 없음)으로 기본 꺼짐·로컬 성공 시 미전송·로컬 실패 시 조각·시간 이동·외부 표시·키는 헤더에만, 샌드박스 프로필, 설치 해시 검사. macOS + ffmpeg가 있으면 실제 ffmpeg를 샌드박스에서 돌려 변환·조각과 `in/` 밖 읽기 거부를 확인한다.
+- 실모델 수동 시험(CI 아님): `pnpm audio:install`을 돌린 데이터 폴더로
+  ```bash
+  AUDIO_LIVE=1 AUDIO_LIVE_DATA_DIR=<DATA_DIR> SKILL_PYTHON=<독립 실행형 3.12> pnpm vitest run apps/server/test/audio.test.ts
+  ```
+  `say`로 만든 두 목소리 대화(한국어)가 화자 2명·`speaker_1, speaker_2, speaker_1` 순서·각자의 글로 나오는지 본다(2026-11-17 M4 Pro: 변환 0.1초, 화자 구분 ~5초, 전사 ~4초 — 대부분 모델 적재).
+- 수용 기준 수동 확인: 실제 m4a를 올리고 "화자별로 정리해줘" → 화자 라벨이 붙은 대본(기록 양식 B).

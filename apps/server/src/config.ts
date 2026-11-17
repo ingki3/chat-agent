@@ -94,6 +94,11 @@ const ConfigSchema = z.object({
    */
   SKILL_PYTHON: optional(z.string()),
   /**
+   * audio_transcribe (#173): the ffmpeg that converts uploads to 16 kHz mono WAV (an absolute path; default
+   * Homebrew's `/opt/homebrew/bin/ffmpeg`). See audio/packages.ts.
+   */
+  AUDIO_FFMPEG: optional(z.string()),
+  /**
    * python_run (#47): off unless "1". The macOS sandbox cannot keep code from reading the start-up environment of
    * other processes of the same user (KERN_PROCARGS2 — review #121 round 1, docs/ops.md §35.3), and runtime CLIs
    * hold their keys there; turn it on only once that is solved.
@@ -188,6 +193,8 @@ export type Config = {
   codex?: { apiKey: string } | undefined;
   /** Interpreter for python skills (validated when the MCP service starts). */
   skillPython?: string | undefined;
+  /** ffmpeg for `audio_transcribe` (#173); undefined = Homebrew's default path. */
+  audioFfmpeg?: string | undefined;
   /** `python_run` is offered (#47, `PYTHON_RUN=1`). */
   pythonRun: boolean;
   /** The dedicated account `python_run` runs as (#47 round 2); undefined = not configured. */
@@ -303,6 +310,7 @@ export function loadConfig(
         : undefined,
     codex: c.CODEX_API_KEY ? { apiKey: c.CODEX_API_KEY } : undefined,
     skillPython: c.SKILL_PYTHON,
+    audioFfmpeg: c.AUDIO_FFMPEG,
     pythonRun: c.PYTHON_RUN === "1",
     pythonRunUser: c.PYTHON_RUN_USER,
     workerRunUser: c.WORKER_RUN_USER,

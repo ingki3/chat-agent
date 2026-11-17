@@ -56,6 +56,9 @@ import type { DocGenService } from "../docgen/service.js";
 import { PYTHON_RUN_TOOL, PYTHON_TOOLS, type PythonToolInfo } from "@agentlee/mcp-tools/python";
 import { PYTHON_SKILL } from "@agentlee/shared";
 import type { PythonScratchpad } from "../python/service.js";
+import { AUDIO_TOOLS, AUDIO_TRANSCRIBE_TOOL, type AudioToolInfo } from "@agentlee/mcp-tools/audio";
+import { AUDIO_SKILL } from "@agentlee/shared";
+import type { AudioTranscriber } from "../audio/service.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -630,6 +633,8 @@ export type McpServiceOptions = {
    * `python_run` (#47). Without it the tool is not offered. Per user: the `python-scratchpad` skill permission.
    */
   scratchpad?: PythonScratchpad;
+  /** `audio_transcribe` (#173). Without it the tool is not offered. Per user: the `audio-transcription` skill. */
+  audio?: AudioTranscriber;
   /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
@@ -683,7 +688,10 @@ export type SkillStatus =
   | "needs_python"
   // python_run (#47 round 2): off by default, or the dedicated account is missing / its self-check failed.
   | "disabled"
-  | "needs_account";
+  | "needs_account"
+  // audio_transcribe (#173): no ffmpeg, or not macOS.
+  | "needs_ffmpeg"
+  | "unavailable";
 export type SkillOverview = {
   name: string;
   tool: string;
@@ -724,6 +732,8 @@ export class McpService {
   private readonly pythonTools: readonly PythonToolInfo[];
   /** Whether the tool is usable now (PYTHON_RUN on, interpreter, packages, account, self-check — gated state). */
   private readonly pythonAvailable: () => boolean;
+  /** `audio_transcribe` (#173), when configured: offered to a user who may use `audio-transcription`. */
+  private readonly audioTools: readonly AudioToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -769,6 +779,7 @@ export class McpService {
     this.pythonTools = opts.scratchpad ? PYTHON_TOOLS : [];
     // Whether python_run is offered right now (gated state); cheap, re-checked at each tool list and call.
     this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
+    this.audioTools = opts.audio ? AUDIO_TOOLS : [];
     this.composedTools = [
       ...(this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : []),
       ...(opts.watchlist ? [WATCHLIST_GET_TOOL] : []),
@@ -853,7 +864,13 @@ export class McpService {
   toolNames(): string[] {
     return toolNames({
       skills: this.skills,
-      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
+      tools: [
+        ...this.tools,
+        ...this.pythonTools,
+        ...this.audioTools,
+        ...this.financeTools,
+        ...this.composedTools,
+      ],
     });
   }
 
@@ -946,6 +963,9 @@ export class McpService {
     return [
       ...this.tools.filter((t) => memory || !MEMORY_TOOLS.includes(t)),
       ...(this.pythonAvailable() ? this.pythonTools.filter((t) => this.mayUse(s, t.skill)) : []),
+      ...(this.opts.audio?.state() === "available"
+        ? this.audioTools.filter((t) => this.mayUse(s, t.skill))
+        : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
@@ -969,7 +989,8 @@ export class McpService {
       else if (e.name === PYTHON_SKILL && this.opts.scratchpad) {
         const st = this.opts.scratchpad.state();
         status = st === "available" ? "available" : st;
-      } else if (e.status === "tools") status = "planned";
+      } else if (e.name === AUDIO_SKILL && this.opts.audio) status = this.opts.audio.state();
+      else if (e.status === "tools") status = "planned";
       else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
         status = offered.has(e.name) ? "available" : st === "installed" ? "needs_python" : st;
@@ -1052,7 +1073,13 @@ export class McpService {
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },
-      tools: [...this.tools, ...this.pythonTools, ...this.financeTools, ...this.composedTools],
+      tools: [
+        ...this.tools,
+        ...this.pythonTools,
+        ...this.audioTools,
+        ...this.financeTools,
+        ...this.composedTools,
+      ],
       toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
@@ -1196,6 +1223,33 @@ export class McpService {
             durationMs: now() - t0,
             // The fixed outcome only: never the code, its output, the file ids or names.
             pythonCode: r.ok ? (status === "ok" ? "python_ok" : "python_error") : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return r;
+        }
+        if (name === AUDIO_TRANSCRIBE_TOOL.name) {
+          const r = await this.callAudioTool(input, scope);
+          const out = r.ok ? (r.output as { stt?: unknown; diarization?: unknown }) : undefined;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "audio.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // Fixed values only: never the file, its name, the words or the speakers.
+            audioCode: r.ok ? "audio_ok" : r.code,
+            ...(out && typeof out.stt === "string" ? { audioStt: out.stt } : {}),
+            ...(out && typeof out.diarization === "string" ? { audioDiarization: out.diarization } : {}),
           });
           if (!r.ok)
             this.opts.errors?.record({
@@ -1393,6 +1447,17 @@ export class McpService {
     const pad = this.opts.scratchpad;
     if (!pad || !this.mayUse(scope, PYTHON_SKILL)) return { ok: false, code: "python_not_allowed" };
     return (await this.withSlot(scope, () => pad.run(scope, input))) ?? { ok: false, code: "python_busy" };
+  }
+
+  /**
+   * `audio_transcribe` (#173): active user who may use `audio-transcription` (checked again here), then the service —
+   * its own slot (one transcription at a time), the token's own conversation's file only. Never logged: the file,
+   * its name, the words.
+   */
+  private async callAudioTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const audio = this.opts.audio;
+    if (!audio || !this.mayUse(scope, AUDIO_SKILL)) return { ok: false, code: "audio_not_allowed" };
+    return audio.run(scope, input);
   }
 
   /**
