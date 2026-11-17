@@ -169,7 +169,7 @@
 ## 공통 MCP 스킬 실행기 (#21)
 목록과 스킬별 사실은 `docs/skills.md`에 있다. 여기서는 실행 방식만 적는다.
 
-- **허용 목록 = 코드의 정의:** `packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`(지금 `google-news-search-skill`·`kr-stock-skill`)와 내장 `selftest`만 도구가 된다.
+- **허용 목록 = 코드의 정의:** `packages/mcp-tools/src/skills.ts`의 `SKILL_SPECS`(지금 `google-news-search-skill`·`kr-stock-skill`·`search-google`)와 내장 `selftest`만 도구가 된다.
   - 정의에는 복사할 파일, 입력 스키마, 인자 빌더, 접속 호스트, 비밀이 들어 있다.
   - 정의가 없는 스킬(PRD 제외 스킬 포함)은 설치도, 사용자별 허용도 할 수 없다.
 - **서버 전용 스킬 폴더 `<DATA_DIR>/skills/<이름>/`:** `pnpm skills:install`이 관리자 스킬 폴더(`SKILL_SOURCES`, 기본 `~/.agents/skills:~/.claude/skills`)에서 정의에 적힌 파일만 **복사**한다.
@@ -270,12 +270,13 @@ MCP 도구 `web_search(query)`·`web_fetch(url)`이다(`packages/mcp-tools/src/w
 - **오류 코드(`WEB_CODES`):** `web_bad_url`, `web_blocked`, `web_unreachable`, `web_timeout`, `web_tls`, `web_too_large`, `web_too_many_redirects`, `web_unsupported_type`, `web_http_error`, `web_bad_content`, `web_no_text`, `web_search_blocked`, `web_search_unavailable`, `web_unavailable`(샌드박스 없음 — macOS가 아니면 이것으로 거부), `web_limit`, `web_failed`, `web_busy`, `web_not_allowed`, `web_bad_input`.
 - **로그(#46):** 호출마다 `web.finished` 하나. 필드는 도구 이름, `ok`/`error`, `webCode`, 소요 시간, ID뿐이다. **URL·호스트·검색어·본문은 남기지 않는다.** 호스트도 뺀 이유: 이름은 모델(또는 모델이 읽은 페이지)이 고르므로 하위 도메인 라벨에 무엇이든(비밀 포함) 실을 수 있다. 정해진 코드만 남긴다.
 - **검색 제공자(`WEB_SEARCH_PROVIDERS`, 순서대로 시도):**
-  - `duckduckgo`(기본 1순위): `html.duckduckgo.com/html/` 결과 페이지를 작업자가 읽는다. 그 호스트만 허용하는 **별도** 송신 프록시를 쓴다(검색 작업자는 다른 사이트에 닿지 못한다). 키가 없고 기사 원문 링크를 준다.
+  - `google`(#171, 기본 1순위 — 있을 때만): 설치된 `search-google` 스킬(Serper API, Google 웹 검색)을 같은 샌드박스 경로로 부른다. 공식 유료 API라 약관 문제가 없고 실제 기사 링크를 준다(`/resolve`로 Google 중계 링크를 바꾼 뒤). 키(`SERPER_API_KEY`)가 없거나 스킬이 설치되지 않았으면 이 제공자는 없다. 호출마다 1 크레딧이라 한 실행에 5번까지(스킬 도구와 합쳐)이고, 그 사용자가 `search-google`을 쓸 수 없으면(서버 스위치·사용자 목록·예약 선택) 건너뛴다. 바뀌지 않은 중계 링크는 출처로 저장하지 않는다. 운영은 `docs/ops.md` §17.1.
+  - `duckduckgo`(그다음): `html.duckduckgo.com/html/` 결과 페이지를 작업자가 읽는다. 그 호스트만 허용하는 **별도** 송신 프록시를 쓴다(검색 작업자는 다른 사이트에 닿지 못한다). 키가 없고 기사 원문 링크를 준다.
     - **이용 약관 주의:** 공식 API가 아니다. 자동화된 사용은 DuckDuckGo가 허용하는 용도가 아닐 수 있다. 가족 몇 명의 적은 호출을 전제로 했다. 같은 Mac에서 연달아 부르면 봇 확인 페이지가 온다(2026-11-11 실측: 두 번째 질의에서 확인 페이지, 세 번째는 정상). 그 페이지는 `web_search_blocked`로 바꾸고 다음 제공자로 넘어간다. 약관이 걱정되면 `.env`에 `WEB_SEARCH_PROVIDERS=google-news`로 끈다.
-  - `google-news`(2순위): 설치된 `google-news-search-skill`(RSS, 지난 30일, 관련도순)을 같은 샌드박스 경로로 부른다. RSS는 피드 리더용 공개 채널이다. **단점:** 뉴스만 나오고, 링크가 `news.google.com/rss/articles/…` 중계 주소라 `web_fetch`로 열면 원문이 아니라 빈 Google 페이지가 온다(실측: `web_no_text`). 그래서 1순위가 아니다. 스킬이 설치되지 않았거나 python이 없으면 이 제공자는 빠진다.
-  - 키가 필요한 공식 API(Brave Search 등)는 넣지 않았다. 키로 실호출을 확인할 수 없었기 때문이다. `SearchProvider` 하나(검색어 → 결과 목록)를 더하면 된다: 호스트 전용 프록시 + 키는 그 작업자 환경 변수로만(스킬 비밀과 같은 방식).
+  - `google-news`(3순위 — `google`이 없으면 2순위): 설치된 `google-news-search-skill`(RSS, 지난 30일, 관련도순)을 같은 샌드박스 경로로 부른다. RSS는 피드 리더용 공개 채널이다. **단점:** 뉴스만 나오고, 링크가 `news.google.com/rss/articles/…` 중계 주소라 `web_fetch`로 열면 원문이 아니라 빈 Google 페이지가 온다(실측: `web_no_text`). 그래서 맨 앞이 아니다. 스킬이 설치되지 않았거나 python이 없으면 이 제공자는 빠진다.
+  - 다른 키 필요 API(Brave Search 등)는 넣지 않았다. `SearchProvider` 하나(검색어 → 결과 목록)를 더하면 된다: 호스트 전용 프록시 + 키는 그 작업자 환경 변수로만(스킬 비밀과 같은 방식). Serper(#171)는 관리자가 이미 쓰는 스킬이 있어 스킬로 붙였다.
   - 제공자가 하나도 없으면 `web_search`는 도구 목록에 없다. `web_fetch`는 항상 있다.
-- **검색 결과도 출처다:** `web_search` 결과와 `google-news-search-skill` 결과(스킬로 직접 부른 것 포함)는 `kind = "search"` 출처로 저장하고 결과마다 `sourceId`를 붙인다. 본문이 없으므로 인용 검증의 근거가 아니다. 인용하려면 그 링크를 `web_fetch`해서 `page` 출처를 만든다.
+- **검색 결과도 출처다:** `web_search` 결과와 `google-news-search-skill`·`search-google` 결과(스킬로 직접 부른 것 포함)는 `kind = "search"` 출처로 저장하고 결과마다 `sourceId`를 붙인다. 본문이 없으므로 인용 검증의 근거가 아니다. 인용하려면 그 링크를 `web_fetch`해서 `page` 출처를 만든다.
 - **API:** `GET /api/conversations/:id/sources` — 대화 주인만(공유와 상관없이: 자원 종류 `conversation-sources`의 공유 목록은 늘 비어 있다. 공유본의 출처는 #29의 고정 목록으로 따로 보인다). 본문은 주지 않는다(글자 수만).
 - **남은 것:** 두 런타임의 실제 녹화(자격 증명 필요, #21과 같음), 실 런타임이 이 도구로 프롬프트 주입 평가(`docs/ops.md` §14.4)를 도는 것.
 

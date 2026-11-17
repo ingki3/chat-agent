@@ -116,14 +116,16 @@ const ConfigSchema = z.object({
   /** Where `pnpm skills:install` looks for the admin's skills (PRD D5), `:`-separated. */
   SKILL_SOURCES: optional(z.string()),
   /**
-   * Web search providers tried in order (#50), comma-separated: `duckduckgo` (its HTML results page — real
-   * article links, but not an official API and sometimes answered with a bot check; see
-   * docs/decisions/isolation.md "웹 검색·가져오기 (#50)") and `google-news` (the installed google-news-search-skill
-   * — news only, and its links are Google redirect pages web_fetch cannot read). Default: both, in that order.
+   * Web search providers tried in order (#50), comma-separated: `google` (the installed search-google skill —
+   * Google results through the Serper API, #171; needs SERPER_API_KEY, each search costs a credit, skipped while
+   * not installed or without the key), `duckduckgo` (its HTML results page — real article links, but not an
+   * official API and sometimes answered with a bot check; see docs/decisions/isolation.md "웹 검색·가져오기 (#50)")
+   * and `google-news` (the installed google-news-search-skill — news only, and its links are Google redirect pages
+   * web_fetch cannot read). Default: all three, in that order.
    */
   WEB_SEARCH_PROVIDERS: optional(
-    z.string().regex(/^(google-news|duckduckgo)(,(google-news|duckduckgo))*$/, {
-      message: "WEB_SEARCH_PROVIDERS must list google-news and/or duckduckgo, comma-separated",
+    z.string().regex(/^(google|google-news|duckduckgo)(,(google|google-news|duckduckgo))*$/, {
+      message: "WEB_SEARCH_PROVIDERS must list google, google-news and/or duckduckgo, comma-separated",
     }),
   ),
   /**
@@ -155,6 +157,9 @@ const ConfigSchema = z.object({
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
   ),
 });
+
+/** A `WEB_SEARCH_PROVIDERS` name (web/service.ts `SEARCH_PROVIDER_NAMES`). */
+type WebSearchProvider = "google" | "google-news" | "duckduckgo";
 
 export type Config = {
   env: "development" | "production" | "test";
@@ -199,7 +204,7 @@ export type Config = {
   /** Browser executable for PNG/PDF export (#51); undefined = look in Playwright's cache. */
   exportBrowser?: string | undefined;
   /** Web search providers in the order they are tried (#50). */
-  webSearchProviders: ("google-news" | "duckduckgo")[];
+  webSearchProviders: WebSearchProvider[];
   /** `cloudflared`'s loopback metrics server (#35); undefined = not configured. */
   tunnelMetrics?: MetricsAddress | undefined;
   /** Context builder limits (#45) that were set; the rest keep their defaults (runtime/context.ts). */
@@ -317,7 +322,7 @@ export function loadConfig(
     },
     webSearchProviders: [
       ...new Set(
-        (c.WEB_SEARCH_PROVIDERS ?? "duckduckgo,google-news").split(",") as ("google-news" | "duckduckgo")[],
+        (c.WEB_SEARCH_PROVIDERS ?? "google,duckduckgo,google-news").split(",") as WebSearchProvider[],
       ),
     ],
   };

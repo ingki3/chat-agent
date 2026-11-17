@@ -118,6 +118,8 @@ export const SKILL_CODES = set([
   "skill_failed",
   "skill_bad_output",
   "skill_changed",
+  // A paid skill's calls per run are used up (#171, `maxCallsPerRun`).
+  "skill_quota",
   // The egress guard refused a networked skill call (#129); the model saw `skill_failed`.
   "skill_secret_blocked",
 ]);
