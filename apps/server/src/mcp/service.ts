@@ -1457,7 +1457,11 @@ export class McpService {
   private async callAudioTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
     const audio = this.opts.audio;
     if (!audio || !this.mayUse(scope, AUDIO_SKILL)) return { ok: false, code: "audio_not_allowed" };
-    return audio.run(scope, input);
+    // While it runs (minutes): the run's token still alive (revoked when the run ends or is interrupted) and the
+    // user still allowed — otherwise the service stops every step and sends or stores nothing more.
+    return audio.run(scope, input, {
+      alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, AUDIO_SKILL),
+    });
   }
 
   /**

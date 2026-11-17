@@ -18,7 +18,7 @@ import {
 import { AUDIO_TRANSCRIBE_TOOL } from "@agentlee/mcp-tools/audio";
 import { SKILL_CATALOGUE, SKILL_SECRET_NAMES } from "@agentlee/mcp-tools/skills";
 import { buildApp } from "../src/app.js";
-import { capSpeakers, clock, mergeTranscript, transcriptMarkdown } from "../src/audio/merge.js";
+import { capSpeakers, clock, mergeTranscript, splitLong, transcriptMarkdown } from "../src/audio/merge.js";
 import { OPENROUTER_TRANSCRIBE_URL, openRouterClient, requestTexts } from "../src/audio/openrouter.js";
 import {
   AUDIO_DIR,
@@ -26,6 +26,8 @@ import {
   audioState,
   ffmpegOf,
   installAudioModels,
+  installAudioPackages,
+  pipEnv,
   modelFileUrl,
   modelManifest,
   modelsDir,
@@ -123,20 +125,29 @@ const WORDS: Segment[] = [
   { start: 13.3, end: 16, text: "그렇군요. 우산을 챙겨야겠네요." },
 ];
 
-type Calls = { convert: number; diarize: number; transcribe: number; chunks: number; inputs: string[] };
+type Calls = {
+  convert: number;
+  diarize: number;
+  transcribe: number;
+  chunks: number;
+  inputs: string[];
+  /** A step that saw its signal aborted (its process group would have been killed). */
+  aborted: number;
+};
 
 /** A scripted runner: fake ffmpeg, fake diarizer, fake STT. */
 function scripted(
   o: {
     seconds?: number;
     turns?: SpeakerTurn[] | "fail";
-    words?: Segment[] | "fail" | "timeout";
+    /** "hang": a step that runs until its signal is aborted, then answers as a killed process. */
+    words?: Segment[] | "fail" | "timeout" | "hang";
     convert?: "decode_failed";
     chunkCount?: number;
     block?: Promise<void>;
   } = {},
 ) {
-  const calls: Calls = { convert: 0, diarize: 0, transcribe: 0, chunks: 0, inputs: [] };
+  const calls: Calls = { convert: 0, diarize: 0, transcribe: 0, chunks: 0, inputs: [], aborted: 0 };
   const runner: AudioRunner = {
     async convert(job) {
       calls.convert++;
@@ -152,8 +163,16 @@ function scripted(
       calls.diarize++;
       return o.turns === "fail" ? { ok: false, code: "audio_failed" } : { ok: true, turns: o.turns ?? TURNS };
     },
-    async transcribe() {
+    async transcribe(_job, signal) {
       calls.transcribe++;
+      if (o.words === "hang") {
+        await new Promise<void>((r) => {
+          if (signal?.aborted) return r();
+          signal?.addEventListener("abort", () => r(), { once: true });
+        });
+        calls.aborted++;
+        return { ok: false, code: "audio_failed" };
+      }
       if (o.words === "fail") return { ok: false, code: "audio_failed" };
       if (o.words === "timeout") return { ok: false, code: "audio_timeout" };
       return { ok: true, segments: o.words ?? WORDS };
@@ -251,15 +270,23 @@ async function start(
   };
   const scopeOf = async (conversationId: string, userId = f.users.owner.id, cookie = f.cookies.owner) => {
     const r = await send(cookie, conversationId, "안녕");
+    // The service only works for a run that is still going: this one is made "still running" again.
+    db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(r.run.id);
     return { userId, conversationId, runId: r.run.id };
   };
   const svc = (
     runner: AudioRunner,
-    opts: { client?: Parameters<typeof openRouterClient>[0]["fetchImpl"]; on?: boolean } = {},
+    opts: {
+      client?: Parameters<typeof openRouterClient>[0]["fetchImpl"];
+      on?: boolean;
+      sw?: AudioFallbackSwitch;
+      allowed?: () => boolean;
+    } = {},
   ) => {
-    const sw = new AudioFallbackSwitch(memorySettings());
+    const sw = opts.sw ?? new AudioFallbackSwitch(memorySettings());
     if (opts.on) sw.set(true);
     return new AudioTranscriber({
+      watchMs: 10,
       db,
       dataDir,
       files: () => app.files,
@@ -268,6 +295,7 @@ async function start(
       fallback: {
         switch: sw,
         client: opts.client ? openRouterClient({ apiKey: SYNTHETIC_KEY, fetchImpl: opts.client }) : undefined,
+        ...(opts.allowed ? { allowed: opts.allowed } : {}),
       },
     });
   };
@@ -421,6 +449,7 @@ describe("audio_transcribe: a call (#173)", () => {
       speakers: 2,
       segmentCount: 3,
       segmentsTruncated: false,
+      transcriptTruncated: false,
     });
     expect(out.notice).toBeUndefined();
     expect(String(out.segments)).toMatch(/^<external_content source="audio_transcribe">/);
@@ -565,6 +594,70 @@ describe("audio_transcribe: a call (#173)", () => {
     expect(stored).toContain("제 비밀번호는");
   });
 
+  it("a secret on the 2,000-character boundary is taken out whole (scrubbed before splitting) — review 1", async () => {
+    const secret = "sk-or-v1-BOUNDARYsynthetic0000secret0000173zz";
+    knownSecrets.add(secret);
+    // The secret starts 20 characters before the old cut.
+    const text = `${"가".repeat(AUDIO_LIMITS.segmentChars - 20)}${secret} 끝말`;
+    const s = scripted({ words: [{ start: 0, end: 30, text }] });
+    const t = await start({ runner: s.runner });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    const r = await t.svc(s.runner).run(scope, { fileId: file.id });
+    expect(r.ok).toBe(true);
+    const out = (r as { output: Record<string, unknown> }).output;
+    const head = secret.slice(0, 16);
+    expect(JSON.stringify(out)).not.toContain(head);
+    const tf = out.transcriptFile as { fileId: string };
+    const stored = fs.readFileSync(t.app.files!.pathOf(t.app.files!.get(tf.fileId)!), "utf8");
+    expect(stored).not.toContain(head);
+    expect(stored).toContain("끝말");
+  });
+
+  it("a long segment is split, never cut: every word is in the segments and the transcript (review 1)", async () => {
+    const words = Array.from({ length: 700 }, (_, i) => `w${i}`).join(" "); // ~3,400 characters
+    const s = scripted({ words: [{ start: 0, end: 600, text: words }] });
+    const t = await start({ runner: s.runner });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    const r = await t.svc(s.runner).run(scope, { fileId: file.id, diarize: false });
+    const out = (r as { output: Record<string, unknown> }).output;
+    expect(out).toMatchObject({ segmentsTruncated: false, transcriptTruncated: false });
+    const segs = segmentsOf(out);
+    expect(segs.length).toBeGreaterThan(1);
+    expect(segs.map((x) => x.text).join(" ")).toBe(words);
+    const tf = out.transcriptFile as { fileId: string };
+    const stored = fs.readFileSync(t.app.files!.pathOf(t.app.files!.get(tf.fileId)!), "utf8");
+    expect(stored).toContain("w699");
+  });
+
+  it("the working folder over its budget stops the call (audio_disk_limit)", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    t.db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(scope.runId);
+    const s = scripted({ words: "hang" });
+    const runner: AudioRunner = {
+      ...s.runner,
+      transcribe: async (job, signal) => {
+        // A sparse file reported at its full length: over the budget at once.
+        const fd = fs.openSync(path.join(job.workdir, "out", "big.bin"), "w");
+        fs.ftruncateSync(fd, AUDIO_LIMITS.workBytes + 1);
+        fs.closeSync(fd);
+        return s.runner.transcribe(job, signal);
+      },
+    };
+    expect(await t.svc(runner).run(scope, { fileId: file.id })).toEqual({
+      ok: false,
+      code: "audio_disk_limit",
+    });
+    expect(s.calls.aborted).toBe(1);
+    expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
+  });
+
   it("the sweep removes working folders left by an earlier process", async () => {
     const t = await start();
     const left = makeAudioWorkdir(t.dataDir);
@@ -572,6 +665,167 @@ describe("audio_transcribe: a call (#173)", () => {
     fs.chmodSync(path.join(left, "in"), 0o500);
     expect(t.svc(scripted().runner).sweep()).toBe(true);
     expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
+  });
+});
+
+// ---- stopping a call -------------------------------------------------------------------------------------------
+
+describe("audio_transcribe: a call stops with its run (#173 review 1)", () => {
+  it("interrupting the run kills the step, sends nothing outside, stores nothing, frees the slot", async () => {
+    const or = mockOpenRouter();
+    const hang = scripted({ words: "hang" });
+    const t = await start({ runner: hang.runner, fallback: or.fetchImpl });
+    // The fallback is on: before the fix the killed local step went on to OpenRouter and stored a transcript.
+    expect((await t.api(t.f.cookies.admin, "PUT", "/api/admin/audio", { fallback: true })).statusCode).toBe(
+      200,
+    );
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const filesBefore = t.app.files!.list(c.id).length;
+    const res = await t.api(t.f.cookies.owner, "POST", `/api/conversations/${c.id}/messages`, {
+      text: `/audio ${file.id}`,
+    });
+    const runId = (res.json() as { run: Run }).run.id;
+    for (let i = 0; i < 500 && hang.calls.transcribe === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(hang.calls.transcribe).toBe(1);
+    const stop = await t.api(t.f.cookies.owner, "POST", `/api/runs/${runId}/interrupt`);
+    expect(stop.statusCode, stop.body).toBe(200);
+    for (let i = 0; i < 500 && !t.log.some((l) => l.msg === "audio.finished"); i++)
+      await new Promise((r) => setTimeout(r, 10));
+    expect(hang.calls.aborted).toBe(1);
+    expect(t.log.find((l) => l.msg === "audio.finished")).toMatchObject({ audioCode: "audio_cancelled" });
+    expect(or.requests).toHaveLength(0);
+    expect(hang.calls.chunks).toBe(0);
+    expect(t.app.files!.list(c.id)).toHaveLength(filesBefore);
+    expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
+  });
+
+  it("the run ending, the caller's signal, a lost permission: each stops the step (audio_cancelled), slot freed", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    // A run that is still open (its row has no end time).
+    const scope = await t.scopeOf(c.id);
+    const reopen = () =>
+      t.db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(scope.runId);
+    const end = () => t.db.$client.prepare("UPDATE runs SET ended_at = 1 WHERE id = ?").run(scope.runId);
+    reopen();
+    const waitCalled = async (h: ReturnType<typeof scripted>) => {
+      for (let i = 0; i < 500 && h.calls.transcribe === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    };
+    // 1) The run ends while Whisper runs.
+    const h1 = scripted({ words: "hang" });
+    const svc1 = t.svc(h1.runner);
+    const p1 = svc1.run(scope, { fileId: file.id });
+    await waitCalled(h1);
+    end();
+    expect(await p1).toEqual({ ok: false, code: "audio_cancelled" });
+    expect(h1.calls.aborted).toBe(1);
+    reopen();
+    // 2) The caller aborts.
+    const h2 = scripted({ words: "hang" });
+    const ac = new AbortController();
+    const p2 = t.svc(h2.runner).run(scope, { fileId: file.id }, { signal: ac.signal });
+    await waitCalled(h2);
+    ac.abort();
+    expect(await p2).toEqual({ ok: false, code: "audio_cancelled" });
+    // 3) The permission goes (the MCP service's alive check).
+    let allowed = true;
+    const h3 = scripted({ words: "hang" });
+    const fine = scripted();
+    // Hangs the first time only (the second call shows the slot was freed).
+    const svc3 = t.svc({
+      ...h3.runner,
+      transcribe: (job, signal) =>
+        (h3.calls.transcribe === 0 ? h3.runner : fine.runner).transcribe(job, signal),
+    });
+    const p3 = svc3.run(scope, { fileId: file.id }, { alive: () => allowed });
+    await waitCalled(h3);
+    allowed = false;
+    expect(await p3).toEqual({ ok: false, code: "audio_cancelled" });
+    // The slot is free again, the folders are gone.
+    expect((await svc3.run(scope, { fileId: file.id })).ok).toBe(true);
+    expect(fs.readdirSync(path.join(t.dataDir, "audio-scratch"))).toEqual([]);
+    // A run that already ended: refused before anything runs.
+    end();
+    const h4 = scripted();
+    expect(await t.svc(h4.runner).run(scope, { fileId: file.id })).toEqual({
+      ok: false,
+      code: "audio_cancelled",
+    });
+    expect(h4.calls.convert).toBe(0);
+  });
+
+  it("the run ending after the words came, before storing: nothing is stored", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    t.db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(scope.runId);
+    const s = scripted();
+    let open = true;
+    const runner: AudioRunner = {
+      ...s.runner,
+      transcribe: async (job, signal) => {
+        const r = await s.runner.transcribe(job, signal);
+        open = false;
+        return r;
+      },
+    };
+    const before = t.app.files!.list(c.id).length;
+    expect(await t.svc(runner).run(scope, { fileId: file.id }, { alive: () => open })).toEqual({
+      ok: false,
+      code: "audio_cancelled",
+    });
+    expect(t.app.files!.list(c.id)).toHaveLength(before);
+  });
+
+  it("the fallback: switch off (or permission gone) before the next piece → no more sends; mid-request → aborted", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const file = await t.sentFile(t.f.cookies.owner, c.id);
+    const scope = await t.scopeOf(c.id);
+    t.db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(scope.runId);
+    // Off after the first piece: the second is never sent.
+    const sw = new AudioFallbackSwitch(memorySettings());
+    const or = mockOpenRouter((i) => {
+      if (i === 0) sw.set(false);
+      return verbose(i);
+    });
+    const r = await t
+      .svc(scripted({ words: "fail", chunkCount: 3 }).runner, { client: or.fetchImpl, on: true, sw })
+      .run(scope, { fileId: file.id });
+    expect(r).toEqual({ ok: false, code: "audio_failed" });
+    expect(or.requests).toHaveLength(1);
+    // The user's permission goes after the first piece.
+    let allowed = true;
+    const or2 = mockOpenRouter((i) => {
+      if (i === 0) allowed = false;
+      return verbose(i);
+    });
+    const r2 = await t
+      .svc(scripted({ words: "fail", chunkCount: 3 }).runner, {
+        client: or2.fetchImpl,
+        on: true,
+        allowed: () => allowed,
+      })
+      .run(scope, { fileId: file.id });
+    expect(r2).toEqual({ ok: false, code: "audio_failed" });
+    expect(or2.requests).toHaveLength(1);
+    // Off while a request is in flight: that request's signal is aborted.
+    const sw3 = new AudioFallbackSwitch(memorySettings());
+    let sawAbort = false;
+    const slow = (async (_u: string | URL | Request, init?: RequestInit) => {
+      sw3.set(false);
+      await new Promise<void>((res) => init!.signal!.addEventListener("abort", () => res(), { once: true }));
+      sawAbort = true;
+      throw new DOMException("aborted", "AbortError");
+    }) as typeof fetch;
+    const r3 = await t
+      .svc(scripted({ words: "fail", chunkCount: 2 }).runner, { client: slow, on: true, sw: sw3 })
+      .run(scope, { fileId: file.id });
+    expect(r3).toEqual({ ok: false, code: "audio_failed" });
+    expect(sawAbort).toBe(true);
   });
 });
 
@@ -770,9 +1024,26 @@ describe("audio_transcribe: merging speaker turns and words (#173)", () => {
       { speaker: "speaker_2", start: 9, end: 14, text: "다" },
       { speaker: "speaker_2", start: 25, end: 27, text: "라" },
     ]);
-    // Without diarization every speaker is null; join still happens; a long text is cut to maxChars.
+    // Without diarization every speaker is null; a long text is never cut here (splitLong splits it later).
     const plain = mergeTranscript([{ start: 0, end: 1, text: "가".repeat(10) }], undefined, { maxChars: 4 });
-    expect(plain).toEqual({ speakers: 0, segments: [{ speaker: null, start: 0, end: 1, text: "가가가가" }] });
+    expect(plain).toEqual({
+      speakers: 0,
+      segments: [{ speaker: null, start: 0, end: 1, text: "가".repeat(10) }],
+    });
+  });
+
+  it("splitLong splits long segments at spaces with shared-out times — no character lost", () => {
+    const words = Array.from({ length: 30 }, (_, i) => `단어${i}`).join(" ");
+    const parts = splitLong([{ speaker: "speaker_1", start: 0, end: 60, text: words }], 40);
+    expect(parts.length).toBeGreaterThan(1);
+    for (const p of parts) expect(Array.from(p.text).length).toBeLessThanOrEqual(40);
+    expect(parts.map((p) => p.text).join(" ")).toBe(words);
+    expect(parts[0]!.start).toBe(0);
+    expect(parts.at(-1)!.end).toBe(60);
+    for (let i = 1; i < parts.length; i++) expect(parts[i]!.start).toBeCloseTo(parts[i - 1]!.end, 0);
+    // No space at all: hard split by characters, still whole.
+    const solid = splitLong([{ speaker: null, start: 0, end: 1, text: "가".repeat(10) }], 4);
+    expect(solid.map((p) => p.text)).toEqual(["가가가가", "가가가가", "가가"]);
   });
 
   it("maxSpeakers folds the rarest voices into the nearest kept speaker", () => {
@@ -996,8 +1267,10 @@ describe("audio_transcribe: sandbox profiles and the install (#173)", () => {
     };
     const urls: string[] = [];
     const serve = (bodies: Record<string, Buffer | string>) =>
-      (async (u: string | URL | Request) => {
+      (async (u: string | URL | Request, init?: RequestInit) => {
         urls.push(String(u));
+        // No credential goes with a model download (public repos).
+        expect(JSON.stringify(init?.headers ?? {})).not.toMatch(/authorization|token/i);
         const name = String(u).split("/").pop()!;
         return new Response(bodies[name] as BodyInit);
       }) as typeof fetch;
@@ -1019,6 +1292,59 @@ describe("audio_transcribe: sandbox profiles and the install (#173)", () => {
     expect(urls[0]).toMatch(/^https:\/\/huggingface\.co\/a\/b\/resolve\/0{40}\/w\.safetensors$/);
     fs.chmodSync(dir, 0o755);
     for (const k of ["stt", "diarizer"]) fs.chmodSync(path.join(dir, k), 0o755);
+  });
+
+  it("the pip install sees only a fixed environment: no secret, no admin HOME or pip config, no cache (review 1)", () => {
+    const data = tmp();
+    const root = path.join(tmp(), "py");
+    const exe = path.join(root, "bin", "python3.12");
+    fs.mkdirSync(path.dirname(exe), { recursive: true });
+    fs.mkdirSync(path.join(root, "lib", "python3.12"), { recursive: true });
+    const dump = path.join(tmp(), "env.json");
+    // A fake interpreter: records its environment and arguments, then fails (nothing installed).
+    fs.writeFileSync(
+      exe,
+      `#!/bin/sh
+/usr/bin/env > "${dump}.env"
+echo "$@" > "${dump}.args"
+exit 3
+`,
+      { mode: 0o755 },
+    );
+    const saved = { ...process.env };
+    process.env.OPENROUTER_API_KEY = SYNTHETIC_KEY;
+    process.env.PIP_CONFIG_FILE = "/Users/admin/.config/pip/pip.conf";
+    process.env.PIP_INDEX_URL = "https://evil.example/simple";
+    try {
+      expect(() => installAudioPackages({ exe, root }, data)).toThrow(/pip exited with 3/);
+    } finally {
+      process.env = saved;
+    }
+    const env = fs.readFileSync(`${dump}.env`, "utf8");
+    expect(env).not.toContain(SYNTHETIC_KEY);
+    expect(env).not.toContain("PIP_INDEX_URL");
+    expect(env).not.toContain(os.homedir());
+    expect(env).toContain("PIP_CONFIG_FILE=/dev/null");
+    expect(env).toContain("PIP_NO_INPUT=1");
+    const home = /^HOME=(.*)$/m.exec(env)![1]!;
+    expect(home.startsWith(path.join(data, "audio-packages"))).toBe(true);
+    expect(/^TMPDIR=(.*)$/m.exec(env)![1]!.startsWith(home)).toBe(true);
+    const args = fs.readFileSync(`${dump}.args`, "utf8");
+    for (const a of ["--isolated", "--no-cache-dir", "--require-hashes", "--no-deps", "--only-binary=:all:"])
+      expect(args).toContain(a);
+    // Nothing is left: no half install, no install home.
+    expect(fs.readdirSync(path.join(data, "audio-packages"))).toEqual([]);
+    expect(pipEnv("/h")).toEqual({
+      PATH: "/usr/bin:/bin",
+      LANG: "en_US.UTF-8",
+      HOME: "/h",
+      TMPDIR: "/h/tmp",
+      PIP_CONFIG_FILE: "/dev/null",
+      PIP_NO_INPUT: "1",
+      PIP_NO_CACHE_DIR: "1",
+      PIP_DISABLE_PIP_VERSION_CHECK: "1",
+      PYTHONNOUSERSITE: "1",
+    });
   });
 
   it("ffmpeg's program folders: Homebrew's Cellar and opt; refuses a relative path and a folder holding DATA_DIR", () => {

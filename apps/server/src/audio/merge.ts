@@ -57,8 +57,9 @@ function speakerOf(s: Segment, turns: readonly SpeakerTurn[]): number | undefine
 /**
  * The transcript: Whisper's timed text, each piece given the speaker of the diarizer's turns it overlaps most,
  * speakers renamed `speaker_1`, `speaker_2`… in order of first appearance, and consecutive pieces of one speaker
- * joined (a pause under two seconds, the joined text under `maxChars`). `turns` undefined: no diarization — every
- * speaker is null.
+ * joined (a pause under two seconds, the joined text under `maxChars`). Nothing is cut: a piece longer than
+ * `maxChars` stays whole here (the caller takes known secrets out of the whole text, then `splitLong` splits it).
+ * `turns` undefined: no diarization — every speaker is null.
  */
 export function mergeTranscript(
   stt: readonly Segment[],
@@ -88,14 +89,45 @@ export function mergeTranscript(
       last.end = Math.max(last.end, s.end);
       continue;
     }
-    out.push({
-      speaker,
-      start: s.start,
-      end: s.end,
-      text: Array.from(text).slice(0, o.maxChars).join(""),
-    });
+    out.push({ speaker, start: s.start, end: s.end, text });
   }
   return { segments: out, speakers: names.size };
+}
+
+/**
+ * Every segment longer than `maxChars` (code points) split into consecutive pieces of the same speaker — at the
+ * last space before the limit when there is one — with times shared out by position in the text. No character is
+ * lost: the pieces joined back with their spaces are the original text.
+ */
+export function splitLong(segments: readonly TranscriptSegment[], maxChars: number): TranscriptSegment[] {
+  const out: TranscriptSegment[] = [];
+  for (const s of segments) {
+    const cps = Array.from(s.text);
+    if (cps.length <= maxChars) {
+      out.push({ ...s });
+      continue;
+    }
+    const span = s.end - s.start;
+    let at = 0;
+    while (at < cps.length) {
+      let end = Math.min(cps.length, at + maxChars);
+      if (end < cps.length) {
+        const space = cps.lastIndexOf(" ", end);
+        if (space > at) end = space;
+      }
+      const text = cps.slice(at, end).join("").trim();
+      if (text)
+        out.push({
+          speaker: s.speaker,
+          start: s.start + (span * at) / cps.length,
+          end: s.start + (span * end) / cps.length,
+          text,
+        });
+      at = end;
+      while (at < cps.length && cps[at] === " ") at++;
+    }
+  }
+  return out;
 }
 
 /** `[hh:mm:ss]` of a time in seconds. */

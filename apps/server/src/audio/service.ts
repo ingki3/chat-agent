@@ -20,7 +20,8 @@ import { FileLimitError, type FileRow, type FileStore } from "../files/store.js"
 import { removeTree, writeInputCopy } from "../python/service.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { storagePaths } from "../storage/paths.js";
-import { mergeTranscript, transcriptMarkdown, type TranscriptSegment } from "./merge.js";
+import { mergeTranscript, splitLong, transcriptMarkdown, type TranscriptSegment } from "./merge.js";
+import { folderUsage } from "../python/runner.js";
 import type { FallbackClient } from "./openrouter.js";
 import type { AudioState } from "./packages.js";
 import { workFolders, type AudioRunner, type Segment, type SpeakerTurn } from "./runner.js";
@@ -69,7 +70,14 @@ export type AudioServiceOptions = {
   runner: AudioRunner;
   state: () => AudioState;
   /** The fallback: the admin's switch, and the client when `OPENROUTER_API_KEY` is set. */
-  fallback: { switch: AudioFallbackSwitch; client?: FallbackClient | undefined };
+  fallback: {
+    switch: AudioFallbackSwitch;
+    client?: FallbackClient | undefined;
+    /** Whether this user may still use the skill (checked before every piece is sent). */
+    allowed?: ((scope: ToolScope) => boolean) | undefined;
+  };
+  /** How often a running call checks the run, the switch and its folder (tests lower it). */
+  watchMs?: number;
   /** Reads the stored transcript's text in the background (#48), so `file_read` has it at once. */
   extract?: (fileId: string) => void;
   slots?: { total: number; perUser: number };
@@ -89,11 +97,36 @@ export type AudioTranscribeOutput = {
   /** A JSON array of `{speaker, start, end, text}` inside an `<external_content>` block (the first ones). */
   segments: string;
   segmentCount: number;
+  /** `segments` holds only the first `AUDIO_LIMITS.segments` of `segmentCount`. */
   segmentsTruncated: boolean;
+  /** The stored transcript left whole segments off its end (over `AUDIO_LIMITS.transcriptBytes`). */
+  transcriptTruncated: boolean;
   transcriptFile?: AudioFileOut;
 };
 
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const WATCH_MS = 250;
+
+type CallContext = {
+  /** Aborted when the call must stop: the steps kill their process group, a request in flight is aborted. */
+  signal: AbortSignal;
+  /** Throws the reason when the call must stop (checks the run and the fallback switch once more). */
+  check: () => void;
+  /** Starts watching the fallback's own conditions (the switch and the user's permission). */
+  fallbackPhase: (on: () => boolean) => void;
+};
+
+/** Free bytes of the volume holding DATA_DIR (its nearest existing folder). */
+function freeBytes(dataDir: string): number {
+  let dir = path.resolve(dataDir);
+  while (!fs.existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  try {
+    const st = fs.statfsSync(dir);
+    return st.bavail * st.bsize;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
 const KINDS: ReadonlySet<string> = new Set(AUDIO_FILE_KINDS);
 const round = (n: number) => Math.round(n * 100) / 100;
 
@@ -147,16 +180,36 @@ export class AudioTranscriber {
     return r && r.ownerId === scope.userId ? r.messageId : undefined;
   }
 
-  async run(scope: ToolScope, input: Record<string, unknown>): Promise<SkillResult> {
+  /**
+   * One call. `o.signal`: the caller's own stop (the MCP service aborts it when the run ends). `o.alive`: whether the
+   * run may still have this result — checked every `WATCH_MS` (a false stops every step: the process group is
+   * killed and the working folder removed before this returns), and again right before anything is sent outside
+   * and before anything is stored. Default: the run has not ended.
+   */
+  async run(
+    scope: ToolScope,
+    input: Record<string, unknown>,
+    o: { signal?: AbortSignal | undefined; alive?: (() => boolean) | undefined } = {},
+  ): Promise<SkillResult> {
     try {
-      return { ok: true, output: await this.execute(scope, input) };
+      return { ok: true, output: await this.execute(scope, input, o) };
     } catch (e) {
       if (e instanceof AudioError) return { ok: false, code: e.code };
       throw e;
     }
   }
 
-  private async execute(scope: ToolScope, raw: Record<string, unknown>): Promise<AudioTranscribeOutput> {
+  /** The run has not ended (finished, interrupted, failed). */
+  private runOpen(scope: ToolScope): boolean {
+    const r = this.opts.db.select({ endedAt: runs.endedAt }).from(runs).where(eq(runs.id, scope.runId)).get();
+    return !!r && r.endedAt === null;
+  }
+
+  private async execute(
+    scope: ToolScope,
+    raw: Record<string, unknown>,
+    o: { signal?: AbortSignal | undefined; alive?: (() => boolean) | undefined },
+  ): Promise<AudioTranscribeOutput> {
     const parsed = z.strictObject(AUDIO_TRANSCRIBE_TOOL.input).safeParse(raw);
     if (!parsed.success) throw new AudioError("audio_bad_input");
     const req = parsed.data as {
@@ -184,6 +237,9 @@ export class AudioTranscriber {
     )
       throw new AudioError("audio_file_not_found");
     if (!KINDS.has(f.kind)) throw new AudioError("audio_unsupported_kind");
+    const alive = () => this.runOpen(scope) && (o.alive?.() ?? true);
+    if (!alive() || o.signal?.aborted) throw new AudioError("audio_cancelled");
+    if (freeBytes(this.opts.dataDir) < AUDIO_LIMITS.minFreeBytes) throw new AudioError("audio_disk_limit");
 
     const mine = this.byUser.get(scope.userId) ?? 0;
     const limits = this.opts.slots ?? AUDIO_SLOTS;
@@ -191,16 +247,58 @@ export class AudioTranscriber {
     this.running++;
     this.byUser.set(scope.userId, mine + 1);
     let workdir: string | undefined;
+    // Why this call was stopped (the first reason wins); the steps see one signal.
+    const stop = new AbortController();
+    let why: AudioCode | undefined;
+    const halt = (code: AudioCode) => {
+      why ??= code;
+      stop.abort();
+    };
+    const budget = setTimeout(() => halt("audio_timeout"), AUDIO_LIMITS.callTimeoutMs);
+    const onShutdown = () => halt("audio_unavailable");
+    const onCaller = () => halt("audio_cancelled");
+    this.stop.signal.addEventListener("abort", onShutdown, { once: true });
+    o.signal?.addEventListener("abort", onCaller, { once: true });
+    let fallbackOn: (() => boolean) | undefined;
+    const watch = setInterval(() => {
+      // Never throws out of the timer: any failure to check stops this call only.
+      try {
+        if (!alive()) return halt("audio_cancelled");
+        if (fallbackOn && !fallbackOn()) return halt("audio_failed");
+        if (workdir && folderUsage(workdir, AUDIO_LIMITS.workBytes, 100_000).bytes > AUDIO_LIMITS.workBytes)
+          return halt("audio_disk_limit");
+      } catch {
+        halt("audio_cancelled");
+      }
+    }, this.opts.watchMs ?? WATCH_MS);
+    const ctx: CallContext = {
+      signal: stop.signal,
+      check: () => {
+        if (!why && !alive()) halt("audio_cancelled");
+        if (!why && fallbackOn && !fallbackOn()) halt("audio_failed");
+        if (why) throw new AudioError(why);
+      },
+      fallbackPhase: (on) => (fallbackOn = on),
+    };
     try {
       workdir = makeAudioWorkdir(this.opts.dataDir);
       const input = this.copyInput(store, f, workdir);
-      return await this.transcribe(store, scope, messageId, f, req, ready.env, workdir, input);
+      return await this.transcribe(store, scope, messageId, f, req, ready.env, workdir, input, ctx);
+    } catch (e) {
+      // A step that failed because it was stopped answers with why it was stopped.
+      if (why) throw new AudioError(why);
+      throw e;
     } finally {
+      clearInterval(watch);
+      clearTimeout(budget);
+      this.stop.signal.removeEventListener("abort", onShutdown);
+      o.signal?.removeEventListener("abort", onCaller);
+      // The steps have returned: their process groups are gone. The folder goes before the slot is free.
+      if (workdir) removeTree(workdir);
       this.running--;
       const left = (this.byUser.get(scope.userId) ?? 1) - 1;
       if (left > 0) this.byUser.set(scope.userId, left);
       else this.byUser.delete(scope.userId);
-      if (workdir) removeTree(workdir);
     }
   }
 
@@ -226,14 +324,12 @@ export class AudioTranscriber {
     env: Extract<AudioState, { state: "available" }>["env"],
     workdir: string,
     input: string,
+    ctx: CallContext,
   ): Promise<AudioTranscribeOutput> {
-    // The server shutting down, or the whole call over its budget.
-    const budget = AbortSignal.timeout(AUDIO_LIMITS.callTimeoutMs);
-    const signal = AbortSignal.any([this.stop.signal, budget]);
-    const over = () => new AudioError(budget.aborted ? "audio_timeout" : "audio_unavailable");
+    const { signal } = ctx;
     const runner = this.opts.runner;
     const converted = await runner.convert({ env, workdir, input }, signal);
-    if (signal.aborted) throw over();
+    ctx.check();
     if (!converted.ok) throw new AudioError(converted.code);
     if (converted.seconds > AUDIO_LIMITS.maxSeconds) throw new AudioError("audio_too_long");
     if (converted.seconds < 0.1) throw new AudioError("audio_empty");
@@ -250,7 +346,7 @@ export class AudioTranscriber {
     let diarization: AudioTranscribeOutput["diarization"] = "off";
     if (req.diarize !== false) {
       const d = await runner.diarize(job, signal);
-      if (signal.aborted) throw over();
+      ctx.check();
       diarization = d.ok ? "local" : "failed";
       if (d.ok) turns = d.turns;
     }
@@ -258,28 +354,29 @@ export class AudioTranscriber {
     let stt: AudioSttEngine = "local";
     let words: Segment[];
     const local = await runner.transcribe(job, signal);
-    if (signal.aborted) throw over();
+    ctx.check();
     if (local.ok) words = local.segments;
     else {
       const client = this.opts.fallback.client;
-      if (!client || !this.opts.fallback.switch.enabled()) throw new AudioError(local.code);
-      words = await this.viaOpenRouter(client, job, signal);
-      if (signal.aborted) throw over();
+      const sw = this.opts.fallback.switch;
+      if (!client || !sw.enabled()) throw new AudioError(local.code);
+      // From here on the switch is watched too: turned off, the request in flight is aborted.
+      ctx.fallbackPhase(() => sw.enabled() && (this.opts.fallback.allowed?.(scope) ?? true));
+      words = await this.viaOpenRouter(client, job, ctx);
       stt = "openrouter";
     }
 
     const external = stt === "openrouter";
-    const merged = mergeTranscript(words, turns, {
+    // Known secrets out of every whole text first — before anything joins, splits or shortens it.
+    const clean = words.map((w) => ({ ...w, text: scrubKnown(w.text, { tail: false }) }));
+    const merged = mergeTranscript(clean, turns, {
       ...(req.maxSpeakers ? { maxSpeakers: req.maxSpeakers } : {}),
       maxChars: AUDIO_LIMITS.segmentChars,
     });
-    // Known secrets out of every word before anything is stored or handed back.
-    const segments: TranscriptSegment[] = merged.segments.map((s) => ({
-      speaker: s.speaker,
-      start: round(s.start),
-      end: round(s.end),
-      text: scrubKnown(s.text, { tail: false }),
-    }));
+    const segments: TranscriptSegment[] = splitLong(
+      merged.segments.map((s) => ({ ...s, text: scrubKnown(s.text, { tail: false }) })),
+      AUDIO_LIMITS.segmentChars,
+    ).map((s) => ({ ...s, start: round(s.start), end: round(s.end) }));
     const shown = segments.slice(0, AUDIO_LIMITS.segments);
     const out: AudioTranscribeOutput = {
       status: "ok",
@@ -293,18 +390,28 @@ export class AudioTranscriber {
       segments: frameExternal({ source: "audio_transcribe", content: JSON.stringify(shown) }),
       segmentCount: segments.length,
       segmentsTruncated: shown.length < segments.length,
+      transcriptTruncated: false,
     };
+    // Last look before anything is stored: the run may have ended meanwhile.
+    ctx.check();
     const file = await this.store(store, scope, messageId, f, segments, {
       durationSeconds: converted.seconds,
       speakers: merged.speakers,
       external,
       notice: AUDIO_EXTERNAL_NOTICE,
     });
-    if (file) out.transcriptFile = file;
+    if (file) {
+      out.transcriptTruncated = file.truncated;
+      out.transcriptFile = { fileId: file.fileId, name: file.name, bytes: file.bytes, url: file.url };
+    }
     return scrubKnownDeep(out, { tail: false });
   }
 
-  /** The words through OpenRouter: the WAV in MP3 pieces, one request each, times shifted to the whole recording. */
+  /**
+   * The words through OpenRouter: the WAV in MP3 pieces, one request each, times shifted to the whole recording.
+   * Before every piece: the run still open, the user still allowed, the switch still on (`ctx.check`); a change while
+   * a piece is in flight aborts that request (the watch).
+   */
   private async viaOpenRouter(
     client: FallbackClient,
     job: {
@@ -313,13 +420,14 @@ export class AudioTranscriber {
       wav: string;
       language: string;
     },
-    signal: AbortSignal,
+    ctx: CallContext,
   ): Promise<Segment[]> {
-    const pieces = await this.opts.runner.chunks(job, signal);
+    const pieces = await this.opts.runner.chunks(job, ctx.signal);
+    ctx.check();
     if (!pieces.ok) throw new AudioError("audio_fallback_failed");
     const words: Segment[] = [];
     for (const [i, c] of pieces.chunks.entries()) {
-      if (signal.aborted) throw new AudioError("audio_timeout");
+      ctx.check();
       let data: Buffer;
       try {
         const st = fs.lstatSync(c.file);
@@ -330,7 +438,9 @@ export class AudioTranscriber {
         if (e instanceof AudioError) throw e;
         throw new AudioError("audio_fallback_failed");
       }
-      const r = await client({ data, index: i }, { language: job.language, signal });
+      ctx.check();
+      const r = await client({ data, index: i }, { language: job.language, signal: ctx.signal });
+      ctx.check();
       if (!r.ok) throw new AudioError("audio_fallback_failed");
       for (const s of r.segments)
         words.push({ start: s.start + c.start, end: s.end + c.start, text: s.text });
@@ -346,13 +456,18 @@ export class AudioTranscriber {
     f: FileRow,
     segments: readonly TranscriptSegment[],
     meta: { durationSeconds: number; speakers: number; external: boolean; notice: string },
-  ): Promise<AudioFileOut | undefined> {
+  ): Promise<(AudioFileOut & { truncated: boolean }) | undefined> {
     const base = f.name.replace(/\.[^.]*$/, "") || "audio";
     let text = transcriptMarkdown(base, segments, meta);
-    // Over the size (a very long recording): cut whole characters off the end. The words are already scrubbed.
-    while (Buffer.byteLength(text) > AUDIO_LIMITS.transcriptBytes) {
-      const cps = Array.from(text);
-      text = cps.slice(0, Math.floor(cps.length * 0.9)).join("");
+    // Over the size (a very long recording): whole segments are left off the end, and the file says so. The words
+    // were scrubbed whole before this.
+    let kept = segments.length;
+    let truncated = false;
+    while (Buffer.byteLength(text) > AUDIO_LIMITS.transcriptBytes && kept > 0) {
+      kept = Math.floor(kept * 0.9);
+      truncated = true;
+      text = transcriptMarkdown(base, segments.slice(0, kept), meta);
+      text += `\n_(대본이 너무 길어 ${kept}/${segments.length} 구간까지만 담았어요)_\n`;
     }
     text = scrubKnown(text, { tail: false });
     const data = Buffer.from(text, "utf8");
@@ -370,7 +485,13 @@ export class AudioTranscriber {
         tmp,
       });
       this.opts.extract?.(row.id);
-      return { fileId: row.id, name: row.name, bytes: row.bytes, url: `/api/files/${row.id}/content` };
+      return {
+        fileId: row.id,
+        name: row.name,
+        bytes: row.bytes,
+        url: `/api/files/${row.id}/content`,
+        truncated,
+      };
     } catch (e) {
       if (e instanceof FileLimitError) return undefined;
       if ((e as { code?: unknown }).code === "SQLITE_CONSTRAINT_FOREIGNKEY")

@@ -272,7 +272,10 @@ export function codexRunConfig(o: {
   const out = [`model=${toml(o.model)}`];
   if (o.mcp) {
     mcpLoopbackPort(o.mcp);
-    // Codex gives an MCP call 60 s by default; a long recording's transcription (#173) needs its own budget.
+    // Codex gives an MCP call 60 s by default; a long recording's transcription (#173) needs its own budget. Codex has
+    // no per-tool timeout (its per-tool config is approval mode and output limit only — checked in 0.165.0), so this
+    // applies to every tool of our server, and only in runs that have audio_transcribe. The other tools keep their
+    // own limits (each one stops its own work long before this).
     const slow = o.tools.includes(AUDIO_TRANSCRIBE_TOOL.name)
       ? `, tool_timeout_sec = ${Math.ceil(AUDIO_LIMITS.callTimeoutMs / 1000) + 60}`
       : "";

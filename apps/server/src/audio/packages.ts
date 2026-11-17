@@ -221,14 +221,20 @@ export function installAudioPackages(
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const dir = packagesDir(dataDir);
   const tmp = path.join(root, `.tmp-${crypto.randomUUID()}`);
+  // pip's own home and temp folder, under DATA_DIR and removed afterwards: nothing of the admin's (no ~/.config/pip,
+  // no cache, no keyring), and none of the server's environment — no secret, no PIP_* or proxy variable.
+  const home = path.join(root, `.home-${crypto.randomUUID()}`);
   try {
+    fs.mkdirSync(path.join(home, "tmp"), { recursive: true, mode: 0o700 });
     const r = spawnSync(
       runtime.exe,
       [
         "-I",
         "-m",
         "pip",
+        "--isolated",
         "install",
+        "--no-cache-dir",
         "--disable-pip-version-check",
         "--no-input",
         "--no-deps",
@@ -241,7 +247,7 @@ export function installAudioPackages(
         "-r",
         AUDIO_LOCK,
       ],
-      { stdio: ["ignore", "inherit", "inherit"] },
+      { stdio: ["ignore", "inherit", "inherit"], env: pipEnv(home) },
     );
     if (r.error) throw r.error;
     if (r.status !== 0) throw new Error(`pip exited with ${r.status ?? r.signal}`);
@@ -256,7 +262,23 @@ export function installAudioPackages(
     return dir;
   } finally {
     cleanup(tmp);
+    fs.rmSync(home, { recursive: true, force: true });
   }
+}
+
+/** The whole environment of the pip install: fixed values only (exported for the test). */
+export function pipEnv(home: string): Record<string, string> {
+  return {
+    PATH: "/usr/bin:/bin",
+    LANG: "en_US.UTF-8",
+    HOME: home,
+    TMPDIR: path.join(home, "tmp"),
+    PIP_CONFIG_FILE: "/dev/null",
+    PIP_NO_INPUT: "1",
+    PIP_NO_CACHE_DIR: "1",
+    PIP_DISABLE_PIP_VERSION_CHECK: "1",
+    PYTHONNOUSERSITE: "1",
+  };
 }
 
 /** A Hugging Face file URL at a fixed commit. */
@@ -266,7 +288,9 @@ export const modelFileUrl = (repo: string, revision: string, name: string) =>
 /**
  * `pnpm audio:install`, models: every file of the manifest at its pinned commit, streamed to a temporary folder,
  * its size and SHA-256 checked (a mismatch fails the whole install), then made read-only and moved into place.
- * `fetchImpl` is replaceable in tests (no network there).
+ * `fetchImpl` is replaceable in tests (no network there). The download runs in this process (no child, so no
+ * inherited environment): no credential is sent (no `Authorization`, no HF token — the repos are public), and the
+ * temporary folder is under DATA_DIR.
  */
 export async function installAudioModels(
   dataDir: string,
@@ -283,7 +307,10 @@ export async function installAudioModels(
       const into = path.join(tmp, m.key);
       fs.mkdirSync(into, { recursive: true, mode: 0o700 });
       for (const f of m.files) {
-        const res = await doFetch(modelFileUrl(m.repo, m.revision, f.name), { redirect: "follow" });
+        const res = await doFetch(modelFileUrl(m.repo, m.revision, f.name), {
+          redirect: "follow",
+          headers: { "User-Agent": "agentlee-audio-install" },
+        });
         if (!res.ok || !res.body) throw new Error(`${m.repo}/${f.name}: HTTP ${res.status}`);
         const hash = crypto.createHash("sha256");
         let bytes = 0;

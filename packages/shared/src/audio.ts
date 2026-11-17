@@ -26,6 +26,13 @@ export const AUDIO_LIMITS = {
    * The whole call, fallback included (the runtimes' MCP tool timeout is set above it — Codex `tool_timeout_sec`).
    */
   callTimeoutMs: 60 * 60_000,
+  /**
+   * What one call's working folder may hold (input copy, the WAV of the longest recording ~230 MB, MP3 pieces,
+   * python's temp files) — measured while it runs; over it, the call stops (`audio_disk_limit`).
+   */
+  workBytes: 1024 * 1024 * 1024,
+  /** Free space the data volume must have before a call starts. */
+  minFreeBytes: 2 * 1024 * 1024 * 1024,
   /** Speakers the diarizer can tell apart (Nemotron-3-Diarization). */
   maxSpeakers: 8,
   /** Diarization activity threshold: allowed range and default (tuned on Korean panel recordings). */
@@ -35,7 +42,7 @@ export const AUDIO_LIMITS = {
   mergeGapSeconds: 0.5,
   /** Segments handed back to the model (the start); the whole transcript is also stored as a file. */
   segments: 400,
-  /** Characters of one segment's text. */
+  /** Characters of one segment's text: a longer segment is split into several (never cut). */
   segmentChars: 2_000,
   /** The stored markdown transcript. */
   transcriptBytes: 5 * 1024 * 1024,
@@ -57,6 +64,10 @@ export const AUDIO_CODES = [
   "audio_too_long",
   "audio_empty",
   "audio_busy",
+  /** The run ended (stopped, interrupted, its token revoked) or the user lost the permission meanwhile. */
+  "audio_cancelled",
+  /** The working folder went over `workBytes`, or the data volume has less than `minFreeBytes` free. */
+  "audio_disk_limit",
   "audio_timeout",
   "audio_memory_limit",
   /** The local transcription failed and the external fallback is off (or has no key). */

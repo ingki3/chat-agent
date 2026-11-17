@@ -10,7 +10,8 @@ import type { Segment } from "./runner.js";
  * server's own check here, before the request exists:
  *
  * - the URL is a constant (`https://openrouter.ai/api/v1/audio/transcriptions`), redirects are refused;
- * - the key goes **only** in the `Authorization` header of that host (#171's header placement, done here directly);
+ * - the key goes **only** in the `Authorization` header of that host (the server builds the request itself; #171's
+ *   `SkillSecret.place` judges what a sandboxed skill sends, so it is not needed here);
  * - the form is fixed: `model` (constant), `language` (2–3 lower-case letters), `response_format`, `temperature`,
  *   a fixed file name, and the audio bytes. Every text part (URL, fields, file name) is checked with the one egress
  *   predicate (`carriesSecret`) — the audio is the user's own recording, the point of the request;

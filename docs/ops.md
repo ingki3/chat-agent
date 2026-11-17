@@ -2134,6 +2134,7 @@ pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisp
 # 4) 서버 재시작
 ```
 - 운영(`~/.chat-agent`)에서는 그 폴더에서 `DATA_DIR`이 운영 데이터 폴더를 가리키게 해서 같은 명령을 돌린다(§43). 패키지·모델은 파생 데이터라 백업에 들어가지 않는다 — 복원 뒤 다시 `pnpm audio:install`.
+- pip는 서버 환경을 물려받지 않는다(리뷰 1차): 고정 환경(`PATH`·`LANG`·`HOME`/`TMPDIR`는 `<DATA_DIR>/audio-packages/.home-*` — 끝나면 삭제, `PIP_CONFIG_FILE=/dev/null`, `PIP_NO_INPUT=1`, `PIP_NO_CACHE_DIR=1`)과 `pip --isolated install --no-cache-dir`. 관리자의 pip 설정·캐시·키링·프록시 변수·`.env` 비밀이 닿지 않는다. 모델 받기는 서버 프로세스 안의 `fetch`라 자식 환경이 없고 자격 증명을 보내지 않는다(공개 저장소).
 - 패키지: `mlx-audio==0.6.4`와 그 의존성 전부를 정확한 버전·휠 해시로 고정(`pip --no-deps --require-hashes --only-binary=:all: --target`), 모든 파일이 2026-11-17 기준 2주 넘게 지난 배포(`uv pip compile --exclude-newer 2026-11-03`). 모델: 저장소·커밋·파일마다 크기와 SHA-256을 `models.json`에 고정하고 받은 뒤 확인한다(다르면 아무것도 설치하지 않음). 관리자의 venv나 `~/.cache/huggingface`는 쓰지 않는다. 설치 폴더는 읽기 전용(0555/0444).
 - lock·모델 목록이 바뀌면 해시가 바뀌어 `not_installed`가 되므로 `pnpm audio:install`을 다시 돌린다.
 
@@ -2145,7 +2146,10 @@ pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisp
 ### 46.3 동작과 한도 (`AUDIO_LIMITS`, `packages/shared/src/audio.ts`)
 - 입력은 그 대화에 메시지와 함께 보낸 파일 id뿐(경로·URL 없음) — python_run과 같은 범위 규칙. 저장 해시로 확인한 사본을 호출마다 새 작업 폴더 `<DATA_DIR>/audio-scratch/<uuid>/`에 넣고 끝나면 지운다(서버 시작 때 남은 것도).
 - 업로드 한도는 파일 업로드와 같다(50MB). 길이 2시간까지(`audio_too_long`). 단계마다 벽시계·상주 메모리 한도: 변환 5분·1GB, 화자 구분과 전사 각 25분·8GB, 호출 전체 60분(`audio_timeout`). 넘으면 그 프로세스 그룹을 SIGKILL한다. 서버 전체에서 한 번에 하나(`audio_busy`) — GPU와 수 GB 메모리.
-- Codex는 MCP 도구 호출에 기본 60초를 준다. `audio_transcribe`가 있는 실행에만 `tool_timeout_sec = 3660`을 준다(`runtime/lockdown.ts`). Claude Agent SDK의 MCP 도구 시간 한도는 기본값이 이보다 길다.
+- Codex는 MCP 도구 호출에 기본 60초를 준다. `audio_transcribe`가 있는 실행에만 `tool_timeout_sec = 3660`을 준다(`runtime/lockdown.ts`). Codex 0.165.0에는 도구별 시간 한도가 없어(도구별 설정은 승인 방식·출력 한도뿐) 그 실행의 **우리 MCP 서버 도구 전체**에 적용된다 — 다른 도구는 각자 자기 한도(수십 초)로 먼저 끝난다. Claude Agent SDK의 MCP 도구 시간 한도는 기본값이 이보다 길다.
+- **실행과 함께 멈춘다(리뷰 1차):** 호출은 250ms마다 실행이 아직 진행 중인지(실행 토큰이 살아 있고 `runs.ended_at`이 비어 있음)와 사용자가 아직 허용되는지를 본다. 중단·토큰 철회·권한 해제면 진행 중인 단계의 프로세스 그룹을 죽이고, 작업 폴더를 지운 뒤에야 슬롯을 놓는다(`audio_cancelled`). 외부로 보내기 직전(조각마다)과 대본 저장 직전에도 다시 확인한다. 대체 단계에서는 관리자 스위치와 권한도 조각마다 보고, 꺼지면 보내는 중인 요청을 끊는다(`audio_failed`).
+- **디스크:** 시작 전 데이터 볼륨 여유 2GB, 작업 폴더 전체 1GB(250ms마다 측정, 넘으면 멈춤 — `audio_disk_limit`), 파일 하나는 `RLIMIT_FSIZE`.
+- **비밀·자르기(리뷰 1차):** 알려진 비밀은 원래 글 전체에서 먼저 가리고, 그다음에 합치고 나눈다. 2,000자를 넘는 구간은 자르지 않고 공백에서 **나눈다**(시간은 글자 위치로 나눔) — 글자는 하나도 사라지지 않는다. 대본 파일이 5MB를 넘으면 끝의 구간을 통째로 빼고 파일에 적으며 `transcriptTruncated: true`, JSON 400개 제한은 `segmentsTruncated`로 따로 알린다.
 - 결과의 글자는 올린 녹음에서 왔다: `<external_content>` 블록 안 JSON으로 돌려주고, 알려진 비밀은 전부 가린다(반환·대본 파일 모두). 대본 파일 `<원래 이름>-대본.md`는 답 메시지에 연결된 대화 파일이라 `file_read`로 나머지를 읽고, 모델이 이름을 추정해 마크다운 아티팩트로 정리한다.
 - 음성·영상 파일은 글자 추출을 하지 않는다(`extract_unsupported` — "아직 이 형식의 글자는 읽을 수 없어요"). 전사는 이 도구로만.
 
