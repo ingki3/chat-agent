@@ -245,8 +245,9 @@ export const SKILL_BODY_MAX = 192 * 1024;
  * request line, every header, the body; and the proxy CONNECT — and sends it only on `true`.
  * - the connection's host must be one of the skill's hosts;
  * - the skill's own declared secret is allowed at its declared place only, on its declared host, once: the first
- *   exact `param=<value>` pair of the request target (Alpha Vantage `apikey=`), or the first header line
- *   `<header>: <value>` of the request head, name in any case (Serper `X-API-KEY`, #171);
+ *   exact `param=<value>` pair of the request target (Alpha Vantage `apikey=`), or the header line
+ *   `<header>: <value>` of the request head when it is the only header of that name, name in any case (Serper
+ *   `X-API-KEY`, #171; a second header of that name is refused, whatever the values);
  * - everything else is checked by the one egress predicate (`carriesSecret`, incl. the UTF-8 view of the bytes)
  *   against the registry and every `.env` skill secret.
  * - a body (#171: http.client sends it with a send of its own after the head) must be announced by the head's one
@@ -315,12 +316,16 @@ export function skillSendGate(
         const removed = withoutParam(target, p.param, p.value);
         target = removed !== target ? removed : withoutParam(target, p.param, pythonQuote(p.value));
       } else {
+        // The exception is for the one header of that name only: two of them (whatever their values) are refused.
         const name = p.header.toLowerCase();
-        const i = headers.findIndex((h) => {
+        const named = headers.flatMap((h, j) => {
           const c = h.indexOf(":");
-          return c > 0 && h.slice(0, c).toLowerCase() === name && h.slice(c + 1).trim() === p.value;
+          return c > 0 && h.slice(0, c).trim().toLowerCase() === name ? [j] : [];
         });
-        if (i >= 0) headers = headers.filter((_, j) => j !== i);
+        if (named.length > 1) return false;
+        const i = named[0];
+        if (i !== undefined && headers[i]!.slice(headers[i]!.indexOf(":") + 1).trim() === p.value)
+          headers = headers.filter((_, j) => j !== i);
       }
     }
     data = [`${m[1]} ${target} ${m[3]}`, ...headers].join("\r\n") + (eoh < 0 ? "" : "\r\n\r\n");
@@ -379,8 +384,10 @@ function pythonQuote(v: string): string {
  * - urllib's redirects are refused: the redirect handler's `redirect_request` — which every opener, the default
  *   one and any the script builds, goes through — raises an `HTTPError` instead of building the next request;
  * - every request is approved before it is sent: `http.client.HTTPConnection.send` (urllib's and any direct
- *   http.client use, the proxy CONNECT included) first writes `{"host", "data"}` — the bytes about to go out — as
- *   one JSON line to fd 3 and reads the verdict; anything but `1` (or a missing fd 3) raises `ConnectionError`,
+ *   http.client use, the proxy CONNECT included) first opens the connection when it is not open yet (http.client
+ *   connects lazily in its first send — so the proxy CONNECT, itself a gated send, comes before the request's head and
+ *   never between a head and its body, #171 review round 1), then writes `{"host", "data"}` — the bytes about to go
+ *   out — as one JSON line to fd 3 and reads the verdict; anything but `1` (or a missing fd 3) raises `ConnectionError`,
  *   which urllib reports as a `URLError` the script handles like any network failure.
  * Installed before the script runs; the original `send` is reachable only through the closure. Nothing else
  * changes: same flags, same `__main__`, same exit code.
@@ -405,6 +412,10 @@ export const SKILL_NET_BOOT = [
   "    def guarded(self, data):",
   "        if not isinstance(data, (bytes, bytearray)):",
   "            raise ConnectionError('send refused')",
+  // http.client connects lazily inside the first send (urllib never calls connect itself): connect first, so a
+  // proxy CONNECT is asked for (and sent) before the request it carries — never between a head and its body.
+  "        if self.sock is None and self.auto_open:",
+  "            self.connect()",
   "        host = getattr(self, '_tunnel_host', None) or self.host",
   "        line = (json.dumps({'host': host, 'data': bytes(data).decode('latin-1')}) + '\\n').encode()",
   "        try:",

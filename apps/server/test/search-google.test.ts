@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import type net from "node:net";
+import https from "node:https";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
@@ -131,12 +132,20 @@ describe("skillSendGate: the Serper key in its header only (#171)", () => {
       ["in another header", [head({ length: 0, key: null, headers: { Authorization: `Bearer ${KEY}` } })]],
       ["in another header, beside its own", [head({ length: 0, headers: { "X-Debug": KEY } })]],
       ["in a second X-API-KEY", [head({ length: 0, headers: { "X-API-KEY": KEY } })]],
+      // Review #174 round 1 P2: the first header of that name carries something else, the second the key.
+      [
+        "in the second X-API-KEY, the first another value",
+        [head({ length: 0, key: "other", headers: { "x-api-key": KEY } })],
+      ],
       ["inside a longer X-API-KEY value", [head({ length: 0, key: `${KEY}x` })]],
       ["on another allowed host", [head({ host: "other.example", length: 0 })], twoHosts],
       ["on a host the skill does not have", [head({ host: "evil.example", length: 0 })]],
       ["CONNECT to another host", [connect("evil.example")]],
     ];
     for (const [why, lines, skill] of refused) expect(approves(lines, skill).at(-1), why).toBe(false);
+    // Two headers of the declared name are refused whatever they carry; one without the key is ordinary.
+    expect(approves([head({ length: 0, key: "a", headers: { "X-API-KEY": "b" } })])).toEqual([false]);
+    expect(approves([head({ length: 0, key: "not-the-key" })])).toEqual([true]);
   });
 
   it("other secrets in the body are refused — also a non-ASCII one python writes as \\uXXXX escapes", () => {
@@ -631,5 +640,258 @@ describe.skipIf(!PYTHON)("the real boot: a Serper-style POST through the gate (l
         expect(seen).toEqual([]);
       });
     },
+  );
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * A CONNECT proxy as the skill's egress proxy is (#174 review round 1 P1): it answers every CONNECT and pipes the
+ * tunnel to the local mock (whatever host was asked for), recording the CONNECT lines.
+ */
+async function connectProxy(port: () => number) {
+  const connects: string[] = [];
+  const sockets = new Set<net.Socket>();
+  const srv = net.createServer((c) => {
+    sockets.add(c);
+    let buf = Buffer.alloc(0);
+    const onData = (d: Buffer) => {
+      buf = Buffer.concat([buf, d]);
+      const end = buf.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      c.off("data", onData);
+      connects.push(buf.subarray(0, buf.indexOf("\r\n")).toString());
+      const up = net.connect(port(), "127.0.0.1", () => {
+        c.write("HTTP/1.1 200 Connection established\r\n\r\n");
+        const rest = buf.subarray(end + 4);
+        if (rest.length) up.write(rest);
+        c.pipe(up);
+        up.pipe(c);
+      });
+      sockets.add(up);
+      up.on("error", () => c.destroy());
+    };
+    c.on("data", onData);
+    c.on("error", () => {});
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+  return {
+    connects,
+    port: (srv.address() as net.AddressInfo).port,
+    close: () => {
+      for (const s of sockets) s.destroy();
+      srv.close();
+    },
+  };
+}
+
+/** http.client through a proxy tunnel, as urllib drives it for HTTPS_PROXY (lazy connect inside the first send). */
+const TUNNEL_PROBE = `
+import http.client, json, os, sys
+proxy_port, q = int(sys.argv[1]), sys.argv[2]
+conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
+conn.set_tunnel("google.serper.dev", 443)
+try:
+    conn.request("POST", "/search", body=json.dumps({"q": q}).encode(),
+        headers={"X-API-KEY": os.environ["SERPER_API_KEY"], "Content-Type": "application/json"})
+    r = conn.getresponse()
+    print(json.dumps({"ok": True, "status": r.status, "body": r.read().decode()}))
+except OSError as e:
+    print(json.dumps({"ok": False, "error": type(e).__name__})); sys.exit(1)
+`;
+
+describe.skipIf(!PYTHON)("through a CONNECT proxy, as in production (#174 review round 1 P1)", () => {
+  const closers: (() => unknown)[] = [];
+  afterEach(() => {
+    while (closers.length) closers.pop()!();
+  });
+  const declared = {
+    hosts: [HOST],
+    secrets: [{ env: "SERPER_API_KEY", place: { host: HOST, header: "X-API-KEY" } }],
+  };
+  /** Runs a script under the boot with the gate on fd 3, recording every line the gate is asked. */
+  const run = (args: string[], env: Record<string, string>, gate: ReturnType<typeof skillSendGate>) =>
+    new Promise<{ code: number | null; out: string; asked: { host: string; data: string }[] }>(
+      (resolve, reject) => {
+        const asked: { host: string; data: string }[] = [];
+        const child = spawn(PYTHON!, ["-I", "-S", "-B", "-c", SKILL_NET_BOOT, ...args], {
+          env: { SERPER_API_KEY: KEY, ...env },
+          stdio: ["pipe", "pipe", "pipe", "pipe"],
+        });
+        serveGate(
+          child.stdio[3] as Duplex,
+          (l) => (asked.push(JSON.parse(l) as { host: string; data: string }), gate.approve(l)),
+          () => child.kill("SIGKILL"),
+        );
+        let out = "";
+        child.stdout!.on("data", (d: Buffer) => (out += d.toString()));
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, out, asked }));
+        child.stdin!.end();
+      },
+    );
+  /** The order the gate saw: CONNECT, then each request's head, then its body. */
+  const order = (asked: { data: string }[]) =>
+    asked.map((a) => (/^CONNECT /.test(a.data) ? "CONNECT" : /^POST /.test(a.data) ? "head" : "body"));
+
+  it("the CONNECT is asked for before the head, never between the head and its body", async () => {
+    const got: { host?: string; key?: string; body: string }[] = [];
+    const mock = http.createServer((req, res) => {
+      let b = "";
+      req.on("data", (d: Buffer) => (b += d.toString()));
+      req.on("end", () => {
+        got.push({ host: req.headers.host, key: req.headers["x-api-key"] as string, body: b });
+        res.writeHead(200).end('{"organic": []}');
+      });
+    });
+    await new Promise<void>((r) => mock.listen(0, "127.0.0.1", () => r()));
+    closers.push(() => mock.close());
+    const proxy = await connectProxy(() => (mock.address() as net.AddressInfo).port);
+    closers.push(proxy.close);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "serper-tunnel-"));
+    closers.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(dir, "probe.py"), TUNNEL_PROBE);
+    const g = skillSendGate(declared, {}, ENV);
+    const r = await run([path.join(dir, "probe.py"), String(proxy.port), "반도체"], {}, g);
+    expect(order(r.asked)).toEqual(["CONNECT", "head", "body"]);
+    expect(r.asked.every((a) => a.host === HOST)).toBe(true);
+    expect(g.denied).toBe(false);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: true, status: 200 });
+    expect(proxy.connects).toEqual([`CONNECT ${HOST}:443 HTTP/1.1`]);
+    expect(got).toEqual([{ host: `${HOST}:443`, key: KEY, body: '{"q": "\\ubc18\\ub3c4\\uccb4"}' }]);
+    // The body check still holds through the tunnel: the key in the query never arrives.
+    got.length = 0;
+    const g2 = skillSendGate(declared, {}, ENV);
+    const bad = await run([path.join(dir, "probe.py"), String(proxy.port), KEY], {}, g2);
+    expect(order(bad.asked)).toEqual(["CONNECT", "head", "body"]);
+    expect(g2.denied).toBe(true);
+    expect(bad.code).toBe(1);
+    expect(got).toEqual([]);
+  });
+
+  /** A CA and a google.serper.dev certificate it signed (openssl), so the unmodified script's TLS verifies. */
+  const OPENSSL = (() => {
+    try {
+      execFileSync("openssl", ["version"], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  it.skipIf(!REAL_SCRIPT || !OPENSSL)(
+    "the admin's serper_search.py, unmodified: HTTPS_PROXY → CONNECT → TLS to google.serper.dev → /search and /resolve",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "serper-tls-"));
+      closers.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const o = (...a: string[]) => execFileSync("openssl", a, { cwd: dir, stdio: "ignore" });
+      fs.writeFileSync(
+        path.join(dir, "ca.cnf"),
+        "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=agentlee test CA\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n",
+      );
+      fs.writeFileSync(
+        path.join(dir, "leaf.ext"),
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:google.serper.dev\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+      );
+      o(
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        "ca.key",
+        "-out",
+        "ca.pem",
+        "-days",
+        "1",
+        "-config",
+        "ca.cnf",
+      );
+      o(
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        "leaf.key",
+        "-out",
+        "leaf.csr",
+        "-subj",
+        "/CN=google.serper.dev",
+      );
+      o(
+        "x509",
+        "-req",
+        "-in",
+        "leaf.csr",
+        "-CA",
+        "ca.pem",
+        "-CAkey",
+        "ca.key",
+        "-CAcreateserial",
+        "-out",
+        "leaf.pem",
+        "-days",
+        "1",
+        "-extfile",
+        "leaf.ext",
+      );
+      const got: { url?: string; key?: string; body: string }[] = [];
+      const mock = https.createServer(
+        {
+          key: fs.readFileSync(path.join(dir, "leaf.key")),
+          cert: fs.readFileSync(path.join(dir, "leaf.pem")),
+        },
+        (req, res) => {
+          let b = "";
+          req.on("data", (d: Buffer) => (b += d.toString()));
+          req.on("end", () => {
+            got.push({ url: req.url, key: req.headers["x-api-key"] as string, body: b });
+            const parsed = JSON.parse(b || "{}") as Record<string, unknown>;
+            const answer =
+              req.url === "/resolve"
+                ? { ...parsed, organic: [{ title: "B", link: "https://b.example/2" }] }
+                : {
+                    searchParameters: { q: parsed.q },
+                    organic: [
+                      { title: "B", link: "https://www.google.com/goto?url=https%3A%2F%2Fb.example%2F2" },
+                    ],
+                    credits: 1,
+                  };
+            res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(answer));
+          });
+        },
+      );
+      await new Promise<void>((r) => mock.listen(0, "127.0.0.1", () => r()));
+      closers.push(() => mock.close());
+      const proxy = await connectProxy(() => (mock.address() as net.AddressInfo).port);
+      closers.push(proxy.close);
+      const g = skillSendGate(SEARCH_GOOGLE_SKILL, { query: "반도체" }, ENV);
+      // As skillPolicy runs it (minus the sandbox): the pinned script, its arguments, HTTPS_PROXY, a CA file.
+      const r = await run(
+        [REAL_SCRIPT!, ...SEARCH_GOOGLE_SKILL.args({ query: "반도체" })!],
+        {
+          HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`,
+          https_proxy: `http://127.0.0.1:${proxy.port}`,
+          SSL_CERT_FILE: path.join(dir, "ca.pem"),
+          LANG: "en_US.UTF-8",
+          LC_ALL: "en_US.UTF-8",
+        },
+        g,
+      );
+      expect(g.denied).toBe(false);
+      expect(r.code).toBe(0);
+      expect(order(r.asked)).toEqual(["CONNECT", "head", "body", "CONNECT", "head", "body"]);
+      expect(proxy.connects).toEqual([`CONNECT ${HOST}:443 HTTP/1.1`, `CONNECT ${HOST}:443 HTTP/1.1`]);
+      expect(got.map((x) => [x.url, x.key])).toEqual([
+        ["/search", KEY],
+        ["/resolve", KEY],
+      ]);
+      expect(SEARCH_GOOGLE_SKILL.searchHits!(JSON.parse(r.out)).map((h) => h.hit.url)).toEqual([
+        "https://b.example/2",
+      ]);
+    },
+    30_000,
   );
 });

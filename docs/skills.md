@@ -74,7 +74,7 @@ PRD §7 목록에는 없고 관리자 요청으로 더했다(관리자 스킬 �
 - **출처:** `organic`·`news`·`videos`의 항목마다 `kind = "search"` 출처를 만들고 `sourceId`를 넣는다(최대 30개). **`/resolve` 뒤에도 Google 중계 주소(`google.com/goto?…`, `google.*/url?…`)로 남은 링크는 출처로 만들지 않는다**(`isGoogleRedirect`) — 어디로 가는지 확인되지 않은 주소다. 그 항목에는 `sourceId`가 없다. `date`는 `"5시간 전"` 같은 상대 표현일 수 있어, 날짜로 읽히는 것만 게시일로 저장한다.
 - **비밀:** `SERPER_API_KEY` — `.env`에서, 이 스킬 프로세스 환경에만. 송신 승인(`docs/ops.md` §42)이 `google.serper.dev`의 `X-API-KEY` 헤더 한 줄에서만 허용한다. 없으면 `skill_unconfigured`이고 `web_search` 제공자 `google`도 생기지 않는다.
 - **네트워크:** `google.serper.dev:443`만(이 스킬 전용 송신 프록시).
-- **비용:** 검색 한 번 = 1 크레딧(`/resolve`는 무료). 한 실행(답변 하나)에서 도구·`web_search` 제공자를 합쳐 **5번까지**(`maxCallsPerRun`). 넘으면 도구는 `skill_quota`, 제공자는 건너뛴다. 시간 한도 60초(`/resolve`의 `retryAfter` 대기 포함).
+- **비용:** 검색 한 번 = 1 크레딧(`/resolve`는 무료). 한 실행(답변 하나)에서 도구·`web_search` 제공자를 합쳐 **5번까지**(`maxCallsPerRun`). 넘으면 도구는 `skill_quota`, 제공자는 건너뛴다. 시간 한도 60초(`/resolve`의 `retryAfter` 대기 포함). 한 호출의 송신은 많아야 9번(CONNECT·머리·본문 × 검색 1 + `/resolve` 2)이고, 송신 승인의 공용 한도 `SKILL_SENDS_MAX`(16) 안이다.
 - **`web_search` 제공자 `google`:** 기본 순서의 맨 앞(`google,duckduckgo,google-news`). 스킬이 설치되고 키가 있을 때만 있고, 그 사용자가 이 스킬을 쓸 수 있을 때만(서버 스위치·사용자 목록·예약 선택) 부른다. 아니면 다음 제공자. `docs/ops.md` §17.1.
 - **사용자별:** 다른 스킬과 같다. `"all"`이면 켜져 있고(금융 아님 — 청소년 계정도), 목록 방식 사용자는 목록에 `search-google`을 넣어야 한다(§15.4).
 - **확인:** 시험은 목 서버와 합성 키만 쓴다(`apps/server/test/search-google.test.ts` — 이 Mac에 원본 스크립트가 있으면 그 사본을 목 서버로 돌린다). 실호출은 키를 넣은 뒤 `SKILLS_LIVE=1`(`docs/ops.md` §15.5).
