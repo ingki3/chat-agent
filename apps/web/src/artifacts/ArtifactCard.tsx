@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router";
 import { artifactPath, type PublicPart } from "@agentlee/shared";
 import { artifacts } from "../api.js";
@@ -17,6 +17,13 @@ export const VERSION_PARAM = "v";
 /** The artifact page at `version` (undefined: the newest). */
 export const artifactLink = (id: string, version?: number) =>
   version === undefined ? artifactPath(id) : `${artifactPath(id)}?${VERSION_PARAM}=${version}`;
+
+/**
+ * The version a card opens: only one that really is older than the newest pins `?v=` — the newest (or not known
+ * yet) opens following the newest, so a later version shows there (review #175 4차).
+ */
+export const pinnedVersion = (version: number | undefined, latest: number | undefined) =>
+  version !== undefined && latest !== undefined && version < latest ? version : undefined;
 
 /** Where the artifact page was opened from (navigation state): the page it goes back to. */
 export type ArtifactFrom = { from?: string };
@@ -92,6 +99,7 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
     retry: false,
   });
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const { pathname } = useLocation();
   const shown = version ?? data?.latestVersion;
   const info = data?.versions.find((x) => x.version === shown);
@@ -117,9 +125,20 @@ export function ArtifactCard({ id, version }: { id: string; version: number | un
       data-version={shown}
       onClick={() => {
         opener = { id, version };
-        void navigate(artifactLink(id, shown === data?.latestVersion ? undefined : shown), {
-          state: { from: pathname } satisfies ArtifactFrom,
-        });
+        // Clicked before the card knows the newest version: it is read first (the card's own query, shared), so the
+        // newest is never pinned. Unknown after all (an error): the page opens following the newest.
+        const go = (latest: number | undefined) => {
+          // Not if the user has moved on while it was read.
+          if (window.location.pathname !== pathname) return;
+          void navigate(artifactLink(id, pinnedVersion(version, latest)), {
+            state: { from: pathname } satisfies ArtifactFrom,
+          });
+        };
+        if (data) return go(data.latestVersion);
+        void qc
+          .fetchQuery({ queryKey: artifactKey(id), queryFn: () => artifacts.get(id), retry: false })
+          .then((d) => go(d.latestVersion))
+          .catch(() => go(undefined));
       }}
     >
       <span className="art-icon" aria-hidden>

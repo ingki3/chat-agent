@@ -15,7 +15,7 @@ import {
 import { splitBlocks } from "../src/chat/blocks.js";
 import { AFTER_RUN_LIMITS, afterSize, clearAfter, keepAfter, takeAfter } from "../src/chat/after-run.js";
 import { recoverLost, retryUntil } from "../src/artifacts/follow-run.js";
-import { artifactLink, fromOf, legacyPanelTarget } from "../src/artifacts/ArtifactCard.js";
+import { artifactLink, fromOf, legacyPanelTarget, pinnedVersion } from "../src/artifacts/ArtifactCard.js";
 
 const viewer = (v: Partial<ArtifactViewer>) =>
   ({ revoked: false, data: undefined, error: null, ...v }) as ArtifactViewer;
@@ -161,6 +161,13 @@ describe("artifact page addresses (#172)", () => {
     expect(artifactLink("a1", 3)).toBe("/a/a1?v=3");
   });
 
+  it("a card pins ?v= only for a version that really is older than the newest (review #175 4차)", () => {
+    expect(pinnedVersion(1, 1)).toBeUndefined(); // the newest: follows the newest
+    expect(pinnedVersion(1, undefined)).toBeUndefined(); // newest not known (yet): follows the newest
+    expect(pinnedVersion(undefined, 3)).toBeUndefined();
+    expect(pinnedVersion(1, 2)).toBe(1);
+  });
+
   it("an old split-panel link goes to the artifact page", () => {
     expect(legacyPanelTarget("?artifact=a1")).toBe("/a/a1");
     expect(legacyPanelTarget("?artifact=a1&v=2")).toBe("/a/a1?v=2");
@@ -276,7 +283,7 @@ describe("what a run left behind while the chat was not on screen (review #175)"
   });
 });
 
-describe("a lost run stream on the artifact page recovers (review #175 2·3차)", () => {
+describe("a lost run stream on the artifact page recovers (review #175 2·3·4차)", () => {
   afterEach(() => vi.useRealTimers());
   const run = (id: string, endedAt: number | null) => ({ id, endedAt }) as never;
   /** A page whose visibility the test sets. */
@@ -298,7 +305,7 @@ describe("a lost run stream on the artifact page recovers (review #175 2·3차)"
       runId: "r1",
       read: vi.fn().mockResolvedValue(run("r1", null)),
       reconnect: vi.fn(),
-      refresh: vi.fn().mockResolvedValue(undefined),
+      ended: vi.fn(),
       gone: vi.fn(),
       everyMs: 1000,
       maxMs: 4000,
@@ -318,35 +325,72 @@ describe("a lost run stream on the artifact page recovers (review #175 2·3차)"
     expect(read).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(o.reconnect).toHaveBeenCalledTimes(1);
-    expect(o.refresh).not.toHaveBeenCalled();
+    expect(o.ended).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(read).toHaveBeenCalledTimes(2); // done: no more reads
     stop();
   });
 
-  it("ended, none or another run: refreshes, and keeps refreshing until that succeeds", async () => {
+  it("ended, none or another run: hands over to the final refresh, which lives on after the recovery stops", async () => {
     vi.useFakeTimers();
     for (const answer of [run("r1", 5), null, run("r2", null)]) {
       const { o } = base({ read: vi.fn().mockResolvedValue(answer) });
       await vi.advanceTimersByTimeAsync(1000);
-      expect(o.refresh).toHaveBeenCalledTimes(1);
+      expect(o.ended).toHaveBeenCalledTimes(1);
       expect(o.reconnect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(o.read).toHaveBeenCalledTimes(1);
     }
+    // Review #175 4차, the exact sequence: the run is confirmed ended; the final refresh's active-run read succeeds
+    // (null — the end shows, `lostRun` goes and the recovery is stopped) but the artifact read fails (500). The
+    // final refresh (`settle`, owned by the page) still goes on until it succeeds.
+    let settleStop: (() => void) | undefined;
     const refresh = vi
       .fn()
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new ApiError(500, "server"))
+      .mockRejectedValueOnce(new ApiError(500, "server"))
       .mockResolvedValue(undefined);
-    const { o } = base({ read: vi.fn().mockResolvedValue(null), refresh });
-    await vi.advanceTimersByTimeAsync(1000); // read → ended → refresh fails
-    expect(refresh).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(2000); // fails again
-    expect(refresh).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(4000); // backed off to the cap, succeeds
-    expect(refresh).toHaveBeenCalledTimes(3);
-    expect(o.read).toHaveBeenCalledTimes(1); // the run is not read again once it is known to have ended
+    const ended = vi.fn(() => {
+      settleStop = retryUntil(refresh, { firstMs: 0, everyMs: 1000, maxMs: 4000, doc: undefined });
+    });
+    const recoveryStop = base({ read: vi.fn().mockResolvedValue(null), ended }).stop;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); // the final refresh starts at once (a 0 ms timer)
+    expect(refresh).toHaveBeenCalledTimes(1); // failed
+    recoveryStop(); // the end showed: the recovery effect is cleaned up
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(refresh).toHaveBeenCalledTimes(2); // failed again, still retrying
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(refresh).toHaveBeenCalledTimes(3); // succeeded
     await vi.advanceTimersByTimeAsync(60_000);
     expect(refresh).toHaveBeenCalledTimes(3);
+    settleStop?.();
+  });
+
+  it("stopped while the read is in flight: the read is aborted and neither reconnect nor the refresh follows", async () => {
+    vi.useFakeTimers();
+    for (const answer of [run("r1", null), null]) {
+      let signal: AbortSignal | undefined;
+      let answerRead: (r: unknown) => void = () => {};
+      const read = vi.fn(
+        (s: AbortSignal) =>
+          new Promise((resolve) => {
+            signal = s;
+            answerRead = resolve; // a read that answers even after the abort (as a cached or late response could)
+          }),
+      );
+      const { o, stop } = base({ read: read as never });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(read).toHaveBeenCalledTimes(1);
+      stop();
+      expect(signal?.aborted).toBe(true);
+      answerRead(answer);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(o.reconnect).not.toHaveBeenCalled();
+      expect(o.ended).not.toHaveBeenCalled();
+      expect(o.gone).not.toHaveBeenCalled();
+    }
   });
 
   it("403/404 (no access, conversation gone): stops at once and forgets", async () => {
@@ -357,17 +401,16 @@ describe("a lost run stream on the artifact page recovers (review #175 2·3차)"
       expect(o.gone).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(o.read).toHaveBeenCalledTimes(1);
-      expect(o.refresh).not.toHaveBeenCalled();
+      expect(o.ended).not.toHaveBeenCalled();
     }
-    // A failing final refresh with 404 ends too.
-    const { o } = base({
-      read: vi.fn().mockResolvedValue(null),
-      refresh: vi.fn().mockRejectedValue(new ApiError(404, "x")),
-    });
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(o.gone).toHaveBeenCalledTimes(1);
+    // A final refresh failing with 404 ends too.
+    const refresh = vi.fn().mockRejectedValue(new ApiError(404, "x"));
+    const onGone = vi.fn();
+    retryUntil(refresh, { firstMs: 0, everyMs: 1000, doc: undefined, onGone });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onGone).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(o.refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 
   it("long transient errors back off to the cap", async () => {

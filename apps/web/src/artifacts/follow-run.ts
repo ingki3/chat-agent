@@ -16,7 +16,8 @@ import { MY_ARTIFACTS_KEY, artifactKey } from "./viewer.js";
  *   so the chat is not left busy —, the conversation, the sidebar list, the artifacts), and its notices and error
  *   are kept for the chat screen to show when the user goes back (`after-run.ts`).
  * - a stream that gave up (`lost`, its retries spent) is not left lost (review #175 2차): `recoverLost` reads the run
- *   again — still running: subscribe again; ended (or another run): refresh as above;
+ *   again — still running: subscribe again; ended (or another run): the final refresh as above (`settle`, owned by
+ *   the page: the recovery stopping as the end shows never cancels it);
  * - the refresh after the end is tried again, backing off, until it has succeeded; 403/404 (no access any more,
  *   conversation gone) ends it and forgets the run; nothing is tried while the tab is hidden (review #175 3차).
  * Owner only: someone a share shows it to cannot read the conversation's run (403, nothing followed).
@@ -67,15 +68,17 @@ export function useFollowRun(conversationId: string | undefined, artifactId: str
   );
   const lostRun = live?.lost ? live.runId : null;
   const onReconnect = useEffectEvent(() => reconnect());
-  const onRefresh = useEffectEvent(() => refreshAll());
+  // Confirmed ended: the final refresh is `settle`'s — owned by the page, not by this recovery, so the end showing
+  // (`lostRun` → null, which stops the recovery) never cancels its retries (review #175 4차).
+  const onEnded = useEffectEvent(() => settle());
   const onGone = useEffectEvent(() => forget());
   useEffect(() => {
     if (!lostRun || !cid) return;
     return recoverLost({
       runId: lostRun,
-      read: () => conversations.activeRun(cid),
+      read: (signal) => conversations.activeRun(cid, signal),
       reconnect: onReconnect,
-      refresh: onRefresh,
+      ended: onEnded,
       gone: onGone,
     });
   }, [lostRun, cid]);
@@ -113,11 +116,16 @@ const isGone = (e: unknown) => e instanceof ApiError && (e.status === 403 || e.s
  * `maxMs`) — except 403/404, which ends it (`onGone`). Nothing is tried while the page is hidden: the due try runs
  * when it shows again. Returns the stop function.
  */
-export function retryUntil(attempt: () => Promise<unknown>, opts: RetryOptions = {}): () => void {
+export function retryUntil(
+  attempt: (signal: AbortSignal) => Promise<unknown>,
+  opts: RetryOptions = {},
+): () => void {
   const every = opts.everyMs ?? RECOVER_EVERY_MS;
   const max = opts.maxMs ?? RECOVER_MAX_MS;
   const doc = "doc" in opts ? opts.doc : typeof document === "undefined" ? undefined : document;
   let stopped = false;
+  /** Aborted by `stop`: a try in flight (its request, and anything it would do after) is dropped. */
+  const ac = new AbortController();
   let failures = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const onVisible = () => {
@@ -134,13 +142,14 @@ export function retryUntil(attempt: () => Promise<unknown>, opts: RetryOptions =
   };
   const stop = () => {
     stopped = true;
+    ac.abort();
     clearTimeout(timer);
     doc?.removeEventListener("visibilitychange", onVisible);
   };
   const run = async () => {
     if (stopped) return;
     try {
-      await attempt();
+      await attempt(ac.signal);
       stop();
     } catch (e) {
       if (stopped) return;
@@ -160,26 +169,24 @@ export function retryUntil(attempt: () => Promise<unknown>, opts: RetryOptions =
 /**
  * Recovery of a run stream that gave up (`retryUntil`, first try after `everyMs`): the conversation's active run is
  * read. Still this run, running → `reconnect` (a new subscription; lost again → a new recovery). Ended, none or
- * another run → `refresh`, tried again until it has succeeded. 403/404 → `gone`.
+ * another run → `ended` (the caller's final refresh, which lives on after this recovery stops). 403/404 → `gone`.
+ * Stopped while the read is in flight: the read is aborted and nothing follows it.
  */
 export function recoverLost(
   opts: {
     runId: string;
-    read: () => Promise<Run | null>;
+    read: (signal: AbortSignal) => Promise<Run | null>;
     reconnect: () => void;
-    refresh: () => Promise<unknown>;
+    ended: () => void;
     gone: () => void;
   } & Omit<RetryOptions, "onGone" | "firstMs">,
 ): () => void {
-  let phase: "check" | "refresh" = "check";
   return retryUntil(
-    async () => {
-      if (phase === "check") {
-        const run = await opts.read();
-        if (run && run.id === opts.runId && run.endedAt === null) return opts.reconnect();
-        phase = "refresh";
-      }
-      await opts.refresh();
+    async (signal) => {
+      const run = await opts.read(signal);
+      if (signal.aborted) return;
+      if (run && run.id === opts.runId && run.endedAt === null) opts.reconnect();
+      else opts.ended();
     },
     { ...opts, onGone: opts.gone },
   );

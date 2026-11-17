@@ -393,6 +393,58 @@ test("a page whose run stream gave up while the run goes on recovers and shows t
   await expect(page.getByTestId("artifact-version")).toHaveValue("2");
 });
 
+test("a card clicked before it knows the newest version opens following the newest, not pinned (review #175)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `이른 클릭 ${tag}`);
+  /** A message as an API run (not started by this page: no move), waited for until its run ends. */
+  const say = async (text: string, key: string) => {
+    const r = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+      data: { text },
+      headers: { ...csrf(baseURL!), "Idempotency-Key": `e2e-${tag}-${key}` },
+    });
+    expect(r.status()).toBe(201);
+    await expect
+      .poll(
+        async () =>
+          (
+            (await (await page.request.get(`/api/conversations/${conv.id}/active-run`)).json()) as {
+              run: unknown;
+            }
+          ).run,
+      )
+      .toBeNull();
+  };
+  await say(`/artifact markdown 이른 ${tag}\n# 첫 버전 ${tag}`, "1");
+  const list = (await (await page.request.get(`/api/conversations/${conv.id}/artifacts`)).json()) as {
+    items: { id: string }[];
+  };
+  const id = list.items[0]!.id;
+  // The card's details come late: it is clicked before it knows that its v1 is the newest.
+  const detail = `**/api/artifacts/${id}`;
+  await page.route(detail, async (route) => {
+    await new Promise((r) => setTimeout(r, 1500));
+    await route.continue();
+  });
+  await page.goto(`/c/${conv.id}`);
+  const card = page.getByTestId("artifact-card");
+  await expect(card).toHaveAttribute("data-version", "1");
+  await expect(card).not.toContainText("마크다운 아티팩트");
+  await card.click();
+  await expect(page).toHaveURL(new RegExp(`/a/${id}$`)); // not ?v=1
+  await page.unroute(detail);
+  const heading = page.getByTestId("artifact-text").getByRole("heading", { level: 1 });
+  await expect(heading).toHaveText(`첫 버전 ${tag}`);
+  // A later version: the page (following the newest) shows it.
+  await say(`/artifact-update ${id} content\n# 둘째 버전 ${tag}`, "2");
+  await page.reload();
+  await expect(heading).toHaveText(`둘째 버전 ${tag}`);
+  await expect(page.getByTestId("artifact-version")).toHaveValue("2");
+});
+
 test("the frame's Escape message goes back only from the frame on screen and only in its exact shape", async ({
   page,
   baseURL,
