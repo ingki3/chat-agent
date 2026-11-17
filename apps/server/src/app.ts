@@ -93,6 +93,11 @@ import { FileTools } from "./files/text.js";
 import { pythonRuntimeEnv, scratchpadState, type ScratchpadState } from "./python/packages.js";
 import { sandboxedPythonRunner, type PythonRunner } from "./python/runner.js";
 import { PythonScratchpad } from "./python/service.js";
+import { audioState, type AudioState } from "./audio/packages.js";
+import { sandboxedAudioRunner, type AudioRunner } from "./audio/runner.js";
+import { AudioFallbackSwitch, AudioTranscriber } from "./audio/service.js";
+import { openRouterClient, type FallbackClient } from "./audio/openrouter.js";
+import { registerAudioRoutes } from "./audio/routes.js";
 import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
@@ -304,6 +309,16 @@ export type BuildOptions = {
    * other way outside a test's own runner) and what this server can run (default: `scratchpadState` from SKILL_PYTHON
    * and the installed packages; in tests nothing, unless given).
    */
+  /**
+   * `audio_transcribe` (#173): how the steps run (default: the sandboxed ffmpeg and python, `sandboxedAudioRunner`),
+   * what this server can run (default: `audioState` from SKILL_PYTHON, ffmpeg and `pnpm audio:install`; in tests
+   * nothing, unless given) and the OpenRouter client (default: from OPENROUTER_API_KEY; tests mock it).
+   */
+  audio?: {
+    runner?: AudioRunner;
+    state?: () => AudioState;
+    fallback?: FallbackClient;
+  };
   python?: {
     runner?: PythonRunner;
     state?: () => ScratchpadState;
@@ -654,6 +669,27 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       state: opts.python?.state ?? (config.env === "test" ? () => pythonState() : pythonState),
     });
     app.addHook("preClose", async () => scratchpad.close());
+    // audio_transcribe (#173): offered once `pnpm audio:install` ran (packages + models), with ffmpeg and
+    // SKILL_PYTHON; the OpenRouter fallback only when the admin switch is on and OPENROUTER_API_KEY is set.
+    const openRouterKey = config.skillSecrets.OPENROUTER_API_KEY;
+    const audio = new AudioTranscriber({
+      db: opts.db!,
+      dataDir: config.dataDir,
+      files: () => app.files,
+      runner: opts.audio?.runner ?? sandboxedAudioRunner(),
+      state:
+        opts.audio?.state ??
+        (config.env === "test"
+          ? () => ({ state: "not_installed", reason: "tests" })
+          : () => audioState(config.skillPython, config.dataDir, config.audioFfmpeg)),
+      fallback: {
+        switch: new AudioFallbackSwitch(settingsStore),
+        client:
+          opts.audio?.fallback ?? (openRouterKey ? openRouterClient({ apiKey: openRouterKey }) : undefined),
+      },
+      extract: (id) => fileExtracts.enqueue(id),
+    });
+    app.addHook("preClose", async () => audio.close());
     // The one-time account self-check runs in the sweep hook below (#47 round 3: after the sweep, under the same
     // conditions as a real job — the sweep keeps the scratch root and its ACL).
     // Never awaited by a startup hook, never throws (the gate catches everything).
@@ -784,6 +820,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       docs,
       // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
+      audio,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,
@@ -913,6 +950,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         // python_run job folders of the last process (#47): nothing runs yet, so all are left-overs. Keep the
         // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
+        if (!audio.sweep()) logEvent(app.log, "warn", "audio.sweep_failed");
         startSelfCheck();
         // Worker job folders of the last process (#122), then the worker account's checks.
         if (!sweepWorkerScratch(config.dataDir, workerAccount))
@@ -959,6 +997,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     registerRunRoutes(app, runManager, app.conversations!, opts.sse ?? {});
     registerErrorRoutes(app, errors!);
     registerSkillRoutes(app, mcp);
+    registerAudioRoutes(app, audio, users);
     // Codex ChatGPT device-code logins (#18): the pinned app-server, sandboxed, behind its own egress proxy.
     // Tests script it (opts.subscription.device) and never start a real process; neither does the development
     // FakeRuntime mode (no real Codex there to use the login with).

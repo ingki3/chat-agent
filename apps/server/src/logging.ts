@@ -34,6 +34,9 @@ import {
   isDocCode,
   isDocKind,
   isPythonCode,
+  isAudioCode,
+  isAudioStt,
+  isAudioDiarization,
   isBackupCode,
   isBackupTrigger,
   isRestoreRecovery,
@@ -86,6 +89,11 @@ export const LOG_EVENTS = [
   "doc.finished",
   // python_run (#47): fixed outcome code, duration and IDs — never the code, its output, file ids or names.
   "python.finished",
+  // audio_transcribe (#173): fixed outcome code, the STT engine and diarization mode, duration and IDs — never the
+  // file, its name, the words or the speakers.
+  "audio.finished",
+  // audio_transcribe working folders left from the last process could not all be removed at start (#173).
+  "audio.sweep_failed",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.
@@ -267,6 +275,10 @@ const FIELDS = new Map<string, Check>([
   ["docKind", isDocKind],
   /** `python_run` (#47): `python_ok`, `python_error` (the code raised) or one of the fixed `python_*` codes. */
   ["pythonCode", isPythonCode],
+  /** `audio_transcribe` (#173): one of the fixed `audio_*` codes, `local`/`openrouter`, `local`/`off`/`failed`. */
+  ["audioCode", isAudioCode],
+  ["audioStt", isAudioStt],
+  ["audioDiarization", isAudioDiarization],
   /** A `cite` call (#25): the citation status or why it registered nothing. */
   ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
@@ -562,6 +574,9 @@ export type LogFields = {
   docCode?: string;
   docKind?: string;
   pythonCode?: string;
+  audioCode?: string;
+  audioStt?: string;
+  audioDiarization?: string;
   citeCode?: string;
   exportFormat?: string;
   exportCode?: string;

@@ -57,6 +57,7 @@ import {
  *                     artifact of that file); kind docx|xlsx|pptx|pdf, or hwp for the refusal
  *   /python <scenario> [<fileId>]   a real call of our `python_run` (#47) with the fixed code of `fake-python.ts`
  *                     (sum — of the given CSV, writing 합계.csv —, loop, net) and a short answer
+ *   /audio <fileId> [nodiarize]   a real call of our `audio_transcribe` (#173) on that audio file, and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -413,6 +414,13 @@ export const defaultScript: FakeScript = (input, memory) => {
     const sc = pythonScenario(py[1] as PythonScenario, py[2]);
     return [{ text: "계산해 볼게요. " }, { call: "python_run", input: sc.input }, { text: sc.answer }];
   }
+  const audio = /^\/audio\s+(\S+)(\s+nodiarize)?$/.exec(t);
+  if (audio)
+    return [
+      { text: "녹음을 화자별로 정리할게요. " },
+      { call: "audio_transcribe", input: { fileId: audio[1]!, ...(audio[2] ? { diarize: false } : {}) } },
+      { text: "대본을 만들었어요." },
+    ];
   const chart = financeChartSteps(t);
   if (chart) return chart;
   if (t === "/watchlist" || t === "내 관심 종목")

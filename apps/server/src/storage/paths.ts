@@ -45,6 +45,14 @@ export function storagePaths(dataDir: string) {
     workerScratch: path.join(root, "worker-scratch"),
     /** `python_run` packages (#47): `python-packages/<lock hash>/`, made by `pnpm python:install`. Derived data. */
     pythonPackages: path.join(root, "python-packages"),
+    /**
+     * `audio_transcribe` (#173): the pinned packages (`audio-packages/<lock hash>-py3.12/`) and model weights
+     * (`audio-models/<manifest hash>/`), both made by `pnpm audio:install` and read-only. Derived data.
+     */
+    audioPackages: path.join(root, "audio-packages"),
+    audioModels: path.join(root, "audio-models"),
+    /** `audio_transcribe` working folders (#173): `audio-scratch/<job id>`, removed when the call ends and at start. */
+    audioScratch: path.join(root, "audio-scratch"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>

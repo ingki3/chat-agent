@@ -50,6 +50,14 @@ export const CANCEL_SQL = {
 /** Client upload ids: UUIDs (any version), lower case. */
 export const UPLOAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/** `addGenerated`'s `guard` said no once the file-write lock was held: nothing was stored. */
+export class FileAddCancelledError extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "FileAddCancelledError";
+  }
+}
+
 export class FileLimitError extends Error {
   constructor() {
     super("too_many_files");
@@ -339,7 +347,9 @@ export class FileStore {
    * never a composer file (cannot be attached to another message or removed with ✕) and it reaches a later
    * session's context while that reply is in the history (#45). It takes one of the conversation's
    * `FILE_LIMITS.perConversation` places, checked in the same statement as the insert (`FileLimitError`).
-   * `tmp` is gone afterwards either way.
+   * `tmp` is gone afterwards either way. `guard`: asked inside the file-write lock, right before the rename and the
+   * insert — false (or a throw) stores nothing (`FileAddCancelledError`). A writer that waited behind a backup
+   * re-checks there whether it may still store (#173 review 2: an interrupted run).
    */
   async addGenerated(input: {
     userId: string;
@@ -350,6 +360,7 @@ export class FileStore {
     bytes: number;
     sha256: string;
     tmp: string;
+    guard?: () => boolean;
   }): Promise<FileRow> {
     const row: FileRow = {
       id: crypto.randomUUID(),
@@ -365,6 +376,16 @@ export class FileStore {
       createdAt: this.now(),
     };
     return this.lock.write(() => {
+      let allowed: boolean;
+      try {
+        allowed = input.guard?.() ?? true;
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        fs.rmSync(input.tmp, { force: true });
+        throw new FileAddCancelledError();
+      }
       const dir = this.storeDir(row.userId, row.conversationId, true);
       if (!dir) {
         fs.rmSync(input.tmp, { force: true });

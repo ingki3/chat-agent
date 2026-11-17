@@ -67,6 +67,13 @@ export class McpTokens {
       }
   }
 
+  /** Whether any live token of this run is left (false once the run ended or was revoked). */
+  hasRun(runId: string): boolean {
+    const t = this.now();
+    for (const s of this.byHash.values()) if (s.runId === runId && s.expiresAt > t) return true;
+    return false;
+  }
+
   size(): number {
     return this.byHash.size;
   }

@@ -169,6 +169,8 @@ describe("skill catalogue (#21, PRD §7)", () => {
       "ALPHAVANTAGE_API_KEY",
       "GEMINI_API_KEY",
       "OPENDART_API_KEY",
+      // #173: the audio transcription fallback (OpenRouter), used by the server itself — never handed to a skill.
+      "OPENROUTER_API_KEY",
       "SEC_USER_AGENT",
       "SERPER_API_KEY",
     ]);

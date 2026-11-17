@@ -10,6 +10,8 @@ const STATUS: Record<AdminSkill["status"], string> = {
   needs_python: "python 필요 (SKILL_PYTHON)",
   disabled: "꺼짐 (PYTHON_RUN)",
   needs_account: "전용 계정 필요 (python_run)",
+  needs_ffmpeg: "ffmpeg 필요 (AUDIO_FFMPEG)",
+  unavailable: "이 서버에서는 못 씀 (macOS 전용)",
   planned: "준비 중",
   document: "파일 도구로 제공 예정",
 };
@@ -70,6 +72,47 @@ export function UserSkillToggles({ user }: { user: Pick<AdminUser, "id" | "name"
   );
 }
 
+/**
+ * 음성 전사의 외부 대체 (#173): OpenRouter `openai/whisper-large-v3`, used only when the local Whisper fails. Off by
+ * default; needs `OPENROUTER_API_KEY` in `.env`.
+ */
+function AudioFallbackToggle() {
+  const qc = useQueryClient();
+  const audio = useQuery({ queryKey: ["admin", "audio"], queryFn: admin.audio });
+  const set = useMutation({
+    mutationFn: (on: boolean) => admin.setAudioFallback(on),
+    onSuccess: (r) => qc.setQueryData(["admin", "audio"], r),
+  });
+  const a = audio.data;
+  return (
+    <>
+      <h2>음성 전사 외부 대체</h2>
+      <p className="muted small">
+        이 Mac의 Whisper가 실패했을 때만 녹음을 OpenRouter(openai/whisper-large-v3)로 보내 전사해요. 답변에
+        &quot;외부 전사 사용&quot;이 표시돼요. 화자 구분은 항상 이 Mac에서 해요(운영 문서 46절).
+      </p>
+      {audio.isError && <p className="error small">{errorText(audio.error)}</p>}
+      {set.isError && <p className="error small">{errorText(set.error)}</p>}
+      {a && (
+        <label className="inline">
+          <input
+            type="checkbox"
+            checked={a.fallback}
+            disabled={set.isPending}
+            onChange={(e) => set.mutate(e.target.checked)}
+            aria-label="음성 전사 외부 대체 허용"
+          />
+          OpenRouter 대체 허용
+          <span className="muted small">
+            {" "}
+            {a.keyConfigured ? "· 키 설정됨" : "· OPENROUTER_API_KEY 없음 — 켜도 쓰이지 않아요"}
+          </span>
+        </label>
+      )}
+    </>
+  );
+}
+
 /** 관리자 → 스킬 (#35, FR-10.3, D5): the server allow-list and each user's switches. */
 export function SkillsAdmin() {
   const qc = useQueryClient();
@@ -124,6 +167,7 @@ export function SkillsAdmin() {
           ))}
         </tbody>
       </table>
+      <AudioFallbackToggle />
       <h2>사용자별 켜기</h2>
       <label className="field">
         <span>가족</span>

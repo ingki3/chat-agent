@@ -379,6 +379,8 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   entry("pptx", "document", { issue: "#48, #49" }),
   // python_run (#47): a server tool — the sandboxed interpreter with pinned numpy/pandas in a working folder per call.
   entry("python-scratchpad", "tools", { issue: "#47" }),
+  // audio_transcribe (#173): a server tool — local Whisper + Nemotron diarization; OpenRouter only as the fallback.
+  entry("audio-transcription", "tools", { issue: "#173", secrets: ["OPENROUTER_API_KEY"] }),
 ];
 
 /** Every secret env name any skill may get (the server reads exactly these from its environment). */

@@ -28,6 +28,7 @@ PRD §7의 스킬을 하나씩 살펴 실제 진입점, 입출력, 의존성, �
 | `xlsx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `recalc.py`) | openpyxl, LibreOffice | 없음 | 없음 |
 | `pptx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `scripts/*`) | python-pptx, pptxgenjs, LibreOffice | 없음 | 없음 |
 | `python-scratchpad` | 아니오 | **서버 도구** #47 (`python_run`) | (스킬 실행 안 함) 우리 `apps/server/scratchpad/runner.py` | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(numpy·pandas, `pnpm python:install`) | 없음 | 없음(샌드박스가 막음) |
+| `audio-transcription` | 아니오 | **서버 도구** #173 (`audio_transcribe`) | (스킬 실행 안 함) 우리 `apps/server/audio/transcribe.py` — 원본 `audio-transcription`·`nemotron-speaker-diarization` 절차와 조정값을 따름 | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(mlx-audio) + 고정 모델(Whisper large-v3 turbo, Nemotron-3-Diarization), `pnpm audio:install`; ffmpeg | 선택 `OPENROUTER_API_KEY`(대체 전사만) | 없음(로컬). 대체를 켜면 `openrouter.ai`만 |
 | HWP 추출기(신규) | 아니오 | #23 | 공통 MCP 서버의 파일 도구로 새로 만든다 | — | — | — |
 
 v1 제외(PRD §7): `gmail-skill`, `google-calendar-skill`, `google-contacts-skill`, `google-docs-skill`, `agent-browser`, `computer-use`, `orca-cli`, `implementation-skill`. 정의가 없으므로 설치도, 사용자별 허용도 할 수 없다(`unknown_skill`).
@@ -125,6 +126,12 @@ PRD §7 목록에는 없고 관리자 요청으로 더했다(관리자 스킬 �
 `python-scratchpad`는 스킬 스크립트를 돌리지 않고 우리 MCP 서버의 서버 도구 `python_run {code, files?}`로 만들었다(`skill_` 접두사 없음). 사용자별 허용은 스킬 이름 `python-scratchpad`로 한다(금융 스킬이 아니므로 `"all"`이면 청소년 계정도 쓴다). 정의는 `packages/mcp-tools/src/python.ts`, 실행은 `apps/server/src/python/`, 운영은 `docs/ops.md` §35, 근거는 `docs/decisions/isolation.md` "계산 도구 python_run (#47)".
 - 원래 스킬의 `scripts/python_scratchpad.py`(자체 AST 검사)는 쓰지 않는다. 막는 것은 AST 검사가 아니라 샌드박스다(네트워크·자식 프로세스·작업 폴더 밖 읽기/쓰기 금지, 시간·메모리·디스크 한도).
 - 호출마다 새 작업 폴더(`<DATA_DIR>/scratch/<사용자>/<대화>/<호출>`). 넘긴 대화 파일을 복사해 넣고, 코드가 쓴 `.csv`·`.txt`·`.md`를 대화 파일로 저장한다(답에 연결 — 내려받기 칩). 호출 사이에 남는 것은 없다.
+
+## 화자별 전사 `audio_transcribe` (#173, 스킬이 아님)
+PRD §7에 없던 기능이라 카탈로그에 `audio-transcription`을 더했다(서버 허용 목록·사용자별 허용·청소년 계정 규칙은 다른 스킬과 같다 — 금융 스킬이 아니므로 `"all"`이면 청소년 계정도 쓴다). 우리 MCP 서버의 서버 도구 `audio_transcribe {fileId, language?, diarize?, maxSpeakers?, threshold?}`다. 정의는 `packages/mcp-tools/src/audio.ts`, 실행은 `apps/server/src/audio/`, 운영은 `docs/ops.md` §46, 근거는 `docs/decisions/isolation.md` "음성 전사 (#173)".
+- 원본 스킬 두 개(`~/Dev/skills/audio-transcription`, `nemotron-speaker-diarization`)의 스크립트·venv는 쓰지 않는다. 절차(16kHz mono WAV, `threshold≈0.85`·`min_duration 0.3`·`merge_gap 0.5`, 25MB 업로드 한도 → 64kbps 재인코딩·분할, 언어 명시)와 이름 추정 규칙(소개 문구·자기소개·호칭 → 이름, 없으면 역할, 불확실하면 `OO(추정)`)은 도구 설명과 구현에 옮겼다.
+- 원본과 달리 **전사도 로컬 우선**이다(사용자 결정 2026-11-17): MLX Whisper가 실패했을 때만, 관리자가 켜 두었고 `OPENROUTER_API_KEY`가 있으면 OpenRouter `openai/whisper-large-v3`로 대체한다. 화자 구분은 항상 로컬이다(Scribe v2 경로는 쓰지 않음 — 원본 문서의 실측대로 화자를 합칠 위험).
+- 결과: `segments`(외부 내용 블록 안의 JSON 배열 `{speaker, start, end, text}`, 앞 400개), 화자 수·길이·전사 엔진, 대본 마크다운 파일(대화 파일, 답에 연결). 모델이 이름을 추정해 마크다운 아티팩트로 정리한다.
 
 ## 문서형 스킬
 `pdf`·`docx`·`xlsx`·`pptx`는 "이 라이브러리를 이렇게 써라"라는 안내다. 보조 스크립트도 런타임이 셸로 실행하라는 전제다. 우리 런타임에는 셸이 없다(PRD NFR 격리). 그래서 공통 MCP 서버의 파일 도구(서버 함수)로 만든다.

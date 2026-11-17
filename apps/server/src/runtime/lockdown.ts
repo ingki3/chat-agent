@@ -2,6 +2,8 @@
  * Built-in tool lockdown for both runtimes — the first line of defence (#42, spike #39). Process isolation
  * (isolation/sandbox.ts) is the second. The adapters (#15, #16) pass these settings unchanged.
  */
+import { AUDIO_TRANSCRIBE_TOOL } from "@agentlee/mcp-tools/audio";
+import { AUDIO_LIMITS } from "@agentlee/shared";
 
 export const AGENTLEE_MCP = "agentlee";
 /** Prefix of tool names coming from our MCP server, as the Claude Agent SDK names them. */
@@ -270,9 +272,16 @@ export function codexRunConfig(o: {
   const out = [`model=${toml(o.model)}`];
   if (o.mcp) {
     mcpLoopbackPort(o.mcp);
+    // Codex gives an MCP call 60 s by default; a long recording's transcription (#173) needs its own budget. Codex has
+    // no per-tool timeout (its per-tool config is approval mode and output limit only — checked in 0.165.0), so this
+    // applies to every tool of our server, and only in runs that have audio_transcribe. The other tools keep their
+    // own limits (each one stops its own work long before this).
+    const slow = o.tools.includes(AUDIO_TRANSCRIBE_TOOL.name)
+      ? `, tool_timeout_sec = ${Math.ceil(AUDIO_LIMITS.callTimeoutMs / 1000) + 60}`
+      : "";
     out.push(
       `mcp_servers.${AGENTLEE_MCP}={ url = ${toml(o.mcp.url)}, bearer_token_env_var = ${toml(CODEX_MCP_TOKEN_ENV)}, ` +
-        `default_tools_approval_mode = "approve", enabled_tools = [${o.tools.map(toml).join(", ")}], required = true }`,
+        `default_tools_approval_mode = "approve", enabled_tools = [${o.tools.map(toml).join(", ")}], required = true${slow} }`,
     );
   }
   return out;

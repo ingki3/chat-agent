@@ -556,6 +556,8 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/dreaming",
   // #36: Cloudflare Access sync.
   "/api/admin/access",
+  // #173: the audio transcription fallback switch.
+  "/api/admin/audio",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
@@ -578,6 +580,9 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "GET /api/admin/system", expect: ADMIN_ONLY },
   { route: "GET /api/admin/skills", expect: ADMIN_ONLY },
   { route: "PUT /api/admin/skills/:name", expect: ADMIN_BY_ID, body: { enabled: true } },
+  // #173
+  { route: "GET /api/admin/audio", expect: ADMIN_ONLY },
+  { route: "PUT /api/admin/audio", expect: ADMIN_ONLY, body: { fallback: false } },
   { route: "GET /api/admin/errors", expect: ADMIN_ONLY },
   { route: "GET /api/admin/connections", expect: ADMIN_ONLY },
   {
