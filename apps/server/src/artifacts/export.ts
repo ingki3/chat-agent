@@ -28,7 +28,7 @@ import {
   type Launched,
   type Launcher,
 } from "./browser.js";
-import { CDN_ALLOW_LIST, escapeHtml, page, serveVersion, type Served } from "./serve.js";
+import { CDN_ALLOW_LIST, serveVersion, type Served } from "./serve.js";
 
 /**
  * PNG and PDF export of artifacts (#51, PRD FR-6.4; docs/decisions/isolation.md "아티팩트 내보내기 (#51)").
@@ -72,25 +72,11 @@ export type ExportCode = (typeof EXPORT_CODES)[number];
 
 export const exportFormats = (kind: ArtifactKind): readonly ExportFormat[] => ARTIFACT_EXPORTS[kind];
 
-const PRE_STYLE =
-  "pre{white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,monospace}";
-
 /**
- * The document a version is exported from: the served original (same body, same CSP), except markdown and code,
- * which are served as text/plain and are printed as a page with the text (escaped, no script).
+ * The document a version is exported from: the served original (same body, same CSP) — for markdown the page the
+ * server renders (#172: headings, lists, tables, code and math, no script), for code its text in a `<pre>`.
  */
 export function exportDocument(kind: ArtifactKind, title: string, content: string): Served | undefined {
-  if (kind === "markdown" || kind === "code") {
-    const served = serveVersion(kind, title, content)!;
-    return {
-      type: "text/html; charset=utf-8",
-      body: page(
-        title,
-        `<style>${PRE_STYLE}</style><h1>${escapeHtml(title)}</h1><pre>${escapeHtml(content)}</pre>`,
-      ),
-      csp: served.csp,
-    };
-  }
   return serveVersion(kind, title, content);
 }
 

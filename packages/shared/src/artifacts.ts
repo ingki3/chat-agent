@@ -192,7 +192,10 @@ export const MyArtifactsResponse = z.object({
 });
 export type MyArtifactsResponse = z.infer<typeof MyArtifactsResponse>;
 
-/** One version's stored content as text (JSON text for chart, table and document). Never rendered by the app. */
+/**
+ * One version's stored content as text (JSON text for chart, table and document). The app renders only markdown
+ * and code from it, with the chat's safe markdown renderer (#172); everything else is shown in the sandboxed frame.
+ */
 export const ArtifactVersionContent = z.object({
   version: z.number().int().positive(),
   kind: ArtifactKind,
@@ -204,7 +207,8 @@ export const RevertArtifactRequest = z.strictObject({ version: z.number().int().
 export type RevertArtifactRequest = z.infer<typeof RevertArtifactRequest>;
 
 /**
- * The only message the app accepts from an artifact's frame (#28): Escape was pressed inside it — the panel closes.
+ * The only message the app accepts from an artifact's frame (#28): Escape was pressed inside it — the artifact page
+ * goes back to its conversation (#172; before, the panel next to the chat closed).
  * Exactly `{ type: ARTIFACT_ESCAPE_MESSAGE }`, from the frame on screen.
  */
 export const ARTIFACT_ESCAPE_MESSAGE = "agentlee:escape";

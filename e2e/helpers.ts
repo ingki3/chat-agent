@@ -79,3 +79,30 @@ export async function sourceStatuses(reply: Locator) {
     .getByTestId("citation-source")
     .evaluateAll((rows) => rows.map((r) => r.getAttribute("data-status")));
 }
+
+/** Whether the page shows an artifact page (`/a/:id`, #172). */
+const onArtifactPage = (page: Page) => /^\/a\/[^/]+$/.test(new URL(page.url()).pathname);
+
+/**
+ * Sends a message from the composer. A reply that makes an artifact moves the page to the artifact page by itself
+ * (#172) — possibly before the emptied composer is seen — so either counts as sent.
+ */
+export async function sendMessage(page: Page, text: string) {
+  const box = page.getByLabel("메시지 입력");
+  await box.fill(text);
+  // Right after the previous reply's `done` the composer may still be busy: the Enter is queued and sent once the
+  // run is read as ended (#141), so the box empties either way.
+  await box.press("Enter");
+  await expect
+    .poll(
+      async () => onArtifactPage(page) || (await box.inputValue({ timeout: 500 }).catch(() => null)) === "",
+    )
+    .toBe(true);
+}
+
+/** On the artifact page a reply moved to (#172): back to the conversation with its "대화로 돌아가기" link. */
+export async function backToChat(page: Page) {
+  await expect(page).toHaveURL(/\/a\/[^/?]+(\?v=\d+)?$/);
+  await page.getByTestId("artifact-back").click();
+  await expect(page).toHaveURL(/\/c\/[^/?]+$/);
+}

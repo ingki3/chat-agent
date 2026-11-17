@@ -45,7 +45,7 @@ import { CONVERSATIONS_KEY, ConvMenu } from "../Sidebar.js";
 import { ResearchToggle } from "../citations/ResearchToggle.js";
 import { ReferencesButton } from "../citations/ReferencesExport.js";
 import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
-import { markStartedHere, useAutoOpen } from "../artifacts/ArtifactPanel.js";
+import { markStartedHere, useAutoShow } from "../artifacts/ArtifactCard.js";
 import { FileViewContext } from "../files/context.js";
 
 /**
@@ -134,7 +134,7 @@ export function ChatPage() {
     Promise.all([
       qc.invalidateQueries({ queryKey: ["conversation", id] }),
       qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY }),
-      // A run may have made a new version of an open artifact (#28): the panel and the cards show it.
+      // A run may have made a new version of an artifact (#28): the cards and its page show it.
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
@@ -155,8 +155,8 @@ export function ChatPage() {
     },
     () => void refresh(),
   );
-  // A new artifact of a run started here opens in the panel by itself (#28, FR-6.1).
-  useAutoOpen(live);
+  // A new artifact of a run started here is shown on its page by itself (#28, FR-6.1, #172).
+  useAutoShow(live, id);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
   const lost = !!live?.lost;
   // A lost stream does not keep the conversation busy: edit, regenerate and send are available again.

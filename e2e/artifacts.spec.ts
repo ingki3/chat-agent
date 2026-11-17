@@ -217,15 +217,19 @@ test("another family member gets 403 on the page and the original; the owner can
     conv.conversationId,
     `/artifact-update ${id} content\n# 고친 메모`,
   );
+  // Markdown is rendered by the app (#172): each version's own heading, the version in the address.
   await page.goto(`/a/${id}`);
-  const frame = await artifactFrame(page);
-  await expect(frame.locator("body")).toHaveText("# 고친 메모");
+  const text = page.getByTestId("artifact-text");
+  await expect(text.getByRole("heading", { level: 1 })).toHaveText("고친 메모");
   await page.getByTestId("artifact-version").selectOption("1");
-  await expect((await artifactFrame(page)).locator("body")).toHaveText("# 비밀 메모");
+  await expect(page).toHaveURL(new RegExp(`/a/${id}\\?v=1$`));
+  await expect(text).toHaveAttribute("data-version", "1");
+  await expect(text.getByRole("heading", { level: 1 })).toHaveText("비밀 메모");
   await page.getByRole("button", { name: "이 버전으로 되돌리기" }).click();
   await expect(page.getByTestId("artifact-version")).toHaveValue("3");
   await expect(page.getByTestId("artifact-version").locator("option").first()).toHaveText(/v3 \(v1 복원\)/);
-  await expect((await artifactFrame(page)).locator("body")).toHaveText("# 비밀 메모");
+  await expect(text).toHaveAttribute("data-version", "3");
+  await expect(text.getByRole("heading", { level: 1 })).toHaveText("비밀 메모");
 });
 
 test("an external script carrying an allowed inline script's hash as its integrity does not run", async ({

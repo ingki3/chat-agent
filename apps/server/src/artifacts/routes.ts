@@ -50,7 +50,7 @@ const notFound = (reply: FastifyReply) =>
  * - `GET /api/artifacts` — the caller's own artifacts across conversations (#28 "내가 만든 것"; no id: only the
  *   session's user, never anyone else's)
  * - `GET /api/artifacts/:id` — one artifact with its versions; `GET /api/artifacts/:id/versions/:version` — one
- *   version's stored text as JSON (never rendered by the app)
+ *   version's stored text as JSON (the app renders markdown and code from it with its own safe renderer, #172)
  * - `POST /api/artifacts/:id/revert` `{ version }` — copy an earlier version as the newest
  * - `GET /a/:id` — the app page (viewer); `GET /a/:id/v/:version/raw` — the sandboxed original;
  *   `GET /a/:id/v/:version/download` — the file (`?format=html`: a chart's or table's page as HTML, #28)

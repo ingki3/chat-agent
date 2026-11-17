@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import { readDocx, readPdf } from "../apps/server/test/helpers/doc-parse.js";
-import { newConversation, newMember, signIn } from "./helpers.js";
+import { backToChat, newConversation, newMember, sendMessage as send, signIn } from "./helpers.js";
 
 /**
  * Document generation (#49, PRD FR-4.4·4.7): "이 내용을 DOCX 보고서로" in the chat — the FakeRuntime calls our real
@@ -19,13 +19,6 @@ test.skip(
   process.platform !== "darwin",
   "document generation needs the macOS sandbox in a production server",
 );
-
-async function send(page: Page, text: string) {
-  const box = page.getByLabel("메시지 입력");
-  await box.fill(text);
-  await box.press("Enter");
-  await expect(box).toHaveValue("");
-}
 
 const lastAssistant = (page: Page) => page.getByTestId("assistant").last();
 const TITLE = "제주 가족 여행 보고서";
@@ -48,20 +41,16 @@ test("'이 내용을 DOCX 보고서로' → the reply's download chip → the fi
 }) => {
   await openChat(page, browser, baseURL!);
   await send(page, "/doc docx");
+  // The document artifact made in the reply is shown on its page (#172) with a download of the file.
+  const link = page.getByTestId("artifact-page").getByTestId("document-download");
+  await expect(link).toContainText(`${TITLE}.docx`);
+  const href = await link.getAttribute("href");
+  await backToChat(page);
   const reply = lastAssistant(page);
   await expect(reply).toHaveAttribute("data-status", "complete");
   const chip = reply.getByTestId("file-ref");
   await expect(chip).toHaveText(new RegExp(`${TITLE}\\.docx`));
-
-  // The document artifact made in the same reply opens in the panel with a download of the same file.
-  const panel = page.getByTestId("artifact-panel");
-  await expect(panel).toBeVisible();
-  const link = panel.getByTestId("document-download");
-  await expect(link).toContainText(`${TITLE}.docx`);
-  expect(await link.getAttribute("href")).toBe(await chip.getAttribute("href"));
-  // On a phone the panel covers the chat: closed to reach the reply's chip.
-  await page.getByTestId("artifact-panel-close").click();
-  await expect(panel).toHaveCount(0);
+  expect(await chip.getAttribute("href")).toBe(href);
 
   // A real download through the browser (#22's original-file route).
   const [download] = await Promise.all([page.waitForEvent("download"), chip.click()]);
@@ -79,6 +68,8 @@ test("PDF: Korean text is in the file (embedded font) and HWP is refused with a 
 }) => {
   const conv = await openChat(page, browser, baseURL!);
   await send(page, "/doc pdf");
+  // Its document artifact is shown on its page (#172): back to the conversation.
+  await backToChat(page);
   const reply = lastAssistant(page);
   await expect(reply).toHaveAttribute("data-status", "complete");
   const href = await reply.getByTestId("file-ref").getAttribute("href");
@@ -88,9 +79,6 @@ test("PDF: Korean text is in the file (embedded font) and HWP is refused with a 
   expect(r.headers()["content-disposition"]).toMatch(/^attachment; /);
   const pdf = await readPdf(Buffer.from(await r.body()));
   expect(pdf.text.replace(/\s+/g, "")).toContain(TITLE.replace(/\s+/g, ""));
-  // The document artifact's panel opened with the reply (full screen on a phone): closed to type again.
-  await page.getByTestId("artifact-panel-close").click();
-
   await send(page, "/doc hwp");
   const refused = lastAssistant(page);
   await expect(refused).toHaveAttribute("data-status", "complete");

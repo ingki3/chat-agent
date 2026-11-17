@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
-import { csrf, newMember, signIn, sourceStatuses } from "./helpers.js";
+import { backToChat, csrf, newMember, signIn, sourceStatuses } from "./helpers.js";
 
 /**
  * Runtime switch with files, sources and artifacts (#53, PRD FR-3.5, 수용 기준 8·11). The e2e server runs the
@@ -27,12 +27,16 @@ const DIRECTIONS: [Rt, Rt][] = [
   ["codex", "claude-code"],
 ];
 
-/** Sends a message from the composer and waits for its reply to finish. */
-async function ask(page: Page, text: string) {
+/**
+ * Sends a message from the composer and waits for its reply to finish. `artifact`: the reply makes or changes an
+ * artifact, which the app shows on its page by itself (#172) — back to the conversation first.
+ */
+async function ask(page: Page, text: string, opts: { artifact?: boolean } = {}) {
   const replies = page.getByTestId("assistant");
   const before = await replies.count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
+  if (opts.artifact) await backToChat(page);
   await expect(replies).toHaveCount(before + 1, { timeout: 15_000 });
   const reply = replies.last();
   await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 30_000 });
@@ -41,9 +45,6 @@ async function ask(page: Page, text: string) {
 
 /** The chip: this conversation's runtime from the next message on. */
 async function switchTo(page: Page, rt: Rt) {
-  // A new artifact opens in its panel — on a phone a dialog over the chat: close it first.
-  const close = page.getByTestId("artifact-panel-close");
-  if (await close.isVisible()) await close.click();
   await page.locator("#runtime-chip").click();
   const pop = page.getByRole("dialog", { name: "런타임·모델 선택" });
   await pop.getByRole("radio", { name: LABEL[rt] }).click();
@@ -74,7 +75,7 @@ async function firstPart(page: Page, from: Rt) {
   const cited = await lastReply(page);
   expect(cited.runtime).toBe(from);
   const sourceId = noteOf(cited)[0]!.sourceId!;
-  await ask(page, `/artifact markdown 회의 메모\n${V1}`);
+  await ask(page, `/artifact markdown 회의 메모\n${V1}`, { artifact: true });
   const made = await lastReply(page);
   const artifactId = made.parts.find((p) => p.type === "artifact_ref")!.artifactId!;
   return { sourceId, artifactId };
@@ -104,7 +105,7 @@ for (const [from, to] of DIRECTIONS) {
     expect(again.runtime).toBe(to);
     expect(noteOf(again).map((c) => [c.status, c.sourceId])).toEqual([["verified", first.sourceId]]);
 
-    await ask(page, `/ref-artifact-update 0\n${V2}`);
+    await ask(page, `/ref-artifact-update 0\n${V2}`, { artifact: true });
     const edited = await lastReply(page);
     expect(edited.runtime).toBe(to);
     expect(edited.parts).toContainEqual(
@@ -211,7 +212,7 @@ for (const [from, to] of DIRECTIONS) {
     expect(newSource).not.toBe(orig.sourceId);
 
     // The artifact copy: read and changed; the original stays at v1.
-    await ask(vpage, `/ref-artifact-update 0\n${V2}`);
+    await ask(vpage, `/ref-artifact-update 0\n${V2}`, { artifact: true });
     const edited = await lastReply(vpage);
     const copyId = edited.parts.find((p) => p.type === "artifact_ref")!.artifactId!;
     expect(copyId).not.toBe(orig.artifactId);

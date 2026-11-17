@@ -178,16 +178,18 @@ test("an artifact shared from its own page is copied by the viewer to change it 
   expect(arts.items[0]!.id).not.toBe(artifactId);
   expect((await vpage.request.get(`/a/${arts.items[0]!.id}/v/1/raw`)).status()).toBe(200);
 
-  // Owner, in the chat's artifact panel: Esc closes the share dialog only — the panel stays (review #119).
+  // Owner, on the artifact page opened from the chat's card (#172): Esc closes the share dialog only — the page
+  // stays, it does not go back to the conversation (review #119).
   await page.goto(`/c/${conv.id}`);
   await page.getByTestId("assistant").last().getByTestId("artifact-card").first().click();
-  const panel = page.getByTestId("artifact-panel");
+  const panel = page.getByTestId("artifact-page");
   await expect(panel.getByTestId("artifact-frame")).toBeVisible();
   await panel.getByTestId("share-open").click();
   await expect(page.getByTestId("share-dialog")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("share-dialog")).toHaveCount(0);
   await expect(panel.getByTestId("artifact-frame")).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/a/${artifactId}$`));
 
   // The viewer has the shared screen open; the owner turns the share off from the dialog: it goes at once.
   await vpage.goto(sharedUrl);

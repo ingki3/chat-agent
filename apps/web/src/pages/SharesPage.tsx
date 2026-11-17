@@ -14,7 +14,6 @@ import {
   type TargetDraft,
 } from "../shares/ShareDialog.js";
 import { Parts } from "../chat/Parts.js";
-import { ArtifactOpenContext } from "../artifacts/ArtifactPanel.js";
 import { TopBar } from "../Shell.js";
 import { FileViewContext } from "../files/context.js";
 
@@ -238,7 +237,6 @@ function NotifyToggle({ id, on }: { id: string; on: boolean }) {
  */
 export function SharedViewPage({ id }: { id: string }) {
   const qc = useQueryClient();
-  const navigate = useNavigate();
   const [gone, setGone] = useState(false);
   const view = useQuery({
     queryKey: [...SHARES_KEY, "view", id],
@@ -288,21 +286,17 @@ export function SharedViewPage({ id }: { id: string }) {
         </p>
         {!d.own && <ForkBar id={id} d={d} />}
         {d.viewer && <NotifyToggle id={id} on={d.viewer.notifyResults} />}
-        {/* Artifact cards open the shared artifact's own page (there is no panel here). */}
-        <ArtifactOpenContext.Provider
-          value={(artifactId) => void navigate(`/a/${encodeURIComponent(artifactId)}`)}
-        >
-          {/* File citations open the viewer (#24) — what it serves is this projection's only (#29). */}
-          <FileViewContext.Provider value={d.conversation?.id ?? null}>
-            <ol className="shared-messages">
-              {d.messages.map((m) => (
-                <li key={m.id} className={`msg ${m.role}`} data-testid="shared-message">
-                  <Parts parts={m.parts as PublicPart[]} />
-                </li>
-              ))}
-            </ol>
-          </FileViewContext.Provider>
-        </ArtifactOpenContext.Provider>
+        {/* Artifact cards open the shared artifact's own page (#172: as in the chat), which leads back here. */}
+        {/* File citations open the viewer (#24) — what it serves is this projection's only (#29). */}
+        <FileViewContext.Provider value={d.conversation?.id ?? null}>
+          <ol className="shared-messages">
+            {d.messages.map((m) => (
+              <li key={m.id} className={`msg ${m.role}`} data-testid="shared-message">
+                <Parts parts={m.parts as PublicPart[]} />
+              </li>
+            ))}
+          </ol>
+        </FileViewContext.Provider>
         {d.files.length > 0 && (
           <section aria-label="파일">
             <h2>파일</h2>

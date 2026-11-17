@@ -44,7 +44,7 @@ const body = {
 export const ARTIFACT_CREATE_TOOL: ServerToolInfo = {
   name: "artifact_create",
   description:
-    "Creates an artifact shown in the user's artifact panel and at /a/<id> (only the user can open it). kind: html | svg | markdown | code | chart | table | document; give exactly the matching field (content, chart, table or document). Returns artifactId, version and url.",
+    "Creates an artifact; the app then shows it on its artifact page /a/<id> (only the user can open it). kind: html | svg | markdown | code | chart | table | document; give exactly the matching field (content, chart, table or document). For a written document (report, summary, notes, plan, guide) use markdown by default — it is rendered with headings, lists, tables, code and math. Use html only when the user asks for HTML, a web page or something interactive. Returns artifactId, version and url.",
   input: { kind: ArtifactKind, title, ...body },
 };
 

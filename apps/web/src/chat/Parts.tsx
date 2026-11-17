@@ -9,7 +9,7 @@ import { CitationMarkers } from "../citations/CitationMarker.js";
 import { CitationSources } from "../citations/CitationNote.js";
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
-import { ArtifactCard } from "../artifacts/ArtifactPanel.js";
+import { ArtifactCard } from "../artifacts/ArtifactCard.js";
 import { ScheduleCard } from "../schedules/ScheduleCard.js";
 import { proposalIds } from "../schedules/format.js";
 import { MemoryCard } from "../instructions/MemoryCard.js";
@@ -249,7 +249,7 @@ const PartView = memo(function PartView({
       return <DividerView d={part} />;
     case "finance_note":
       return <FinanceNote note={part} />;
-    // An artifact the reply made or changed (#28): a card that opens the panel.
+    // An artifact the reply made or changed (#28): a card that opens the artifact page (#172).
     case "artifact_ref":
       return <ArtifactCard id={part.artifactId} version={part.version} />;
     // Citation refs and files (#22) get their real views later; until then a plain chip.

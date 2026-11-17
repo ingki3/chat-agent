@@ -147,10 +147,11 @@ test("a shared artifact opened from /shared closes on /a/:id when the share is t
 }) => {
   const w = await withArtifact(page, browser, baseURL!, "art-open");
   await w.vpage.goto(`/shared/${w.shareId}`);
-  // The artifact card in the shared message opens the artifact's own page (there is no panel here).
+  // The artifact card in the shared message opens the artifact's own page, which leads back to the shared view.
   await w.vpage.getByTestId("shared-view").getByTestId("artifact-card").first().click();
   await expect(w.vpage).toHaveURL(new RegExp(`/a/${w.artifactId}$`));
   await expect(w.vpage.getByTestId("artifact-frame")).toBeVisible();
+  await expect(w.vpage.getByTestId("artifact-back")).toHaveText("← 공유 화면으로 돌아가기");
   await w.revoke();
   await expect(w.vpage.getByTestId("artifact-revoked")).toBeVisible({ timeout: 10_000 });
   await expect(w.vpage.getByTestId("artifact-revoked")).toContainText("이미 내려받은 파일");

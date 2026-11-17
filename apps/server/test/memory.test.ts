@@ -509,8 +509,8 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
   });
 
   it("over the budget in a session: items left out, marked in the box, and '기억 일부만 넣었어요' once", async () => {
-    // A small window (test registry only): 25% of 24,000 tokens = 6,000 bytes for everything.
-    const t = await start({ window: 24_000 });
+    // A small window (test registry only): 25% of 26,000 tokens = 6,500 bytes for everything.
+    const t = await start({ window: 26_000 });
     t.connect("claude-code");
     const items = Array.from(
       { length: 200 },
