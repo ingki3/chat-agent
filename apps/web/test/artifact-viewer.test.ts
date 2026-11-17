@@ -14,7 +14,7 @@ import {
 } from "../src/artifacts/viewer.js";
 import { splitBlocks } from "../src/chat/blocks.js";
 import { AFTER_RUN_LIMITS, afterSize, clearAfter, keepAfter, takeAfter } from "../src/chat/after-run.js";
-import { recoverLost } from "../src/artifacts/follow-run.js";
+import { recoverLost, retryUntil } from "../src/artifacts/follow-run.js";
 import { artifactLink, fromOf, legacyPanelTarget } from "../src/artifacts/ArtifactCard.js";
 
 const viewer = (v: Partial<ArtifactViewer>) =>
@@ -252,6 +252,16 @@ describe("what a run left behind while the chat was not on screen (review #175)"
     expect(takeAfter("conv-b")).toEqual({});
   });
 
+  it("an expired notice does not come back with a newer one of the same conversation", () => {
+    keepAfter("conv-t", "old", note("old"), 0);
+    keepAfter("conv-t", "new", note("new"), AFTER_RUN_LIMITS.ttlMs + 1);
+    expect(Object.keys(takeAfter("conv-t", AFTER_RUN_LIMITS.ttlMs + 2))).toEqual(["new"]);
+    // Each message by its own time: one still fresh stays while an older one in the same conversation expires.
+    keepAfter("conv-u", "a", note("a"), 0);
+    keepAfter("conv-u", "b", note("b"), AFTER_RUN_LIMITS.ttlMs / 2);
+    expect(Object.keys(takeAfter("conv-u", AFTER_RUN_LIMITS.ttlMs + 1))).toEqual(["b"]);
+  });
+
   it("is bounded: the oldest conversations go past the cap, entries expire, sign-out empties it", () => {
     for (let i = 0; i < AFTER_RUN_LIMITS.conversations + 5; i++)
       keepAfter(`c${i}`, "m", note(`${i}`), 1000 + i);
@@ -266,48 +276,151 @@ describe("what a run left behind while the chat was not on screen (review #175)"
   });
 });
 
-describe("a lost run stream on the artifact page recovers (review #175 2차)", () => {
+describe("a lost run stream on the artifact page recovers (review #175 2·3차)", () => {
   afterEach(() => vi.useRealTimers());
   const run = (id: string, endedAt: number | null) => ({ id, endedAt }) as never;
+  /** A page whose visibility the test sets. */
+  const visibility = () => {
+    const listeners = new Set<() => void>();
+    return {
+      hidden: false,
+      addEventListener: (_: string, f: () => void) => void listeners.add(f),
+      removeEventListener: (_: string, f: () => void) => void listeners.delete(f),
+      show(this: { hidden: boolean }) {
+        this.hidden = false;
+        for (const f of [...listeners]) f();
+      },
+      listeners,
+    };
+  };
+  const base = (over: Partial<Parameters<typeof recoverLost>[0]> = {}) => {
+    const o = {
+      runId: "r1",
+      read: vi.fn().mockResolvedValue(run("r1", null)),
+      reconnect: vi.fn(),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      gone: vi.fn(),
+      everyMs: 1000,
+      maxMs: 4000,
+      doc: undefined,
+      ...over,
+    };
+    return { o, stop: recoverLost(o) };
+  };
 
-  it("still running: subscribes again; a failed read waits for the next tick", async () => {
+  it("still running: subscribes again; a failed read is tried again later (backing off)", async () => {
     vi.useFakeTimers();
-    const reconnect = vi.fn();
-    const ended = vi.fn();
     const read = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(run("r1", null));
-    const stop = recoverLost({ runId: "r1", read, reconnect, ended, everyMs: 1000 });
+    const { o, stop } = base({ read });
     await vi.advanceTimersByTimeAsync(1000);
     expect(read).toHaveBeenCalledTimes(1);
-    expect(reconnect).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(reconnect).toHaveBeenCalledTimes(1);
-    expect(ended).not.toHaveBeenCalled();
-    // Done: no more reads.
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(read).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1999); // after one failure: 2 s
+    expect(read).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(o.reconnect).toHaveBeenCalledTimes(1);
+    expect(o.refresh).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(read).toHaveBeenCalledTimes(2); // done: no more reads
     stop();
   });
 
-  it("ended, gone or another run: refresh what it changed", async () => {
+  it("ended, none or another run: refreshes, and keeps refreshing until that succeeds", async () => {
     vi.useFakeTimers();
     for (const answer of [run("r1", 5), null, run("r2", null)]) {
-      const reconnect = vi.fn();
-      const ended = vi.fn();
-      recoverLost({ runId: "r1", read: async () => answer, reconnect, ended, everyMs: 1000 });
+      const { o } = base({ read: vi.fn().mockResolvedValue(answer) });
       await vi.advanceTimersByTimeAsync(1000);
-      expect(ended).toHaveBeenCalledTimes(1);
-      expect(reconnect).not.toHaveBeenCalled();
+      expect(o.refresh).toHaveBeenCalledTimes(1);
+      expect(o.reconnect).not.toHaveBeenCalled();
     }
+    const refresh = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue(undefined);
+    const { o } = base({ read: vi.fn().mockResolvedValue(null), refresh });
+    await vi.advanceTimersByTimeAsync(1000); // read → ended → refresh fails
+    expect(refresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2000); // fails again
+    expect(refresh).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(4000); // backed off to the cap, succeeds
+    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(o.read).toHaveBeenCalledTimes(1); // the run is not read again once it is known to have ended
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refresh).toHaveBeenCalledTimes(3);
+  });
+
+  it("403/404 (no access, conversation gone): stops at once and forgets", async () => {
+    vi.useFakeTimers();
+    for (const status of [403, 404]) {
+      const { o } = base({ read: vi.fn().mockRejectedValue(new ApiError(status, "x")) });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(o.gone).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(o.read).toHaveBeenCalledTimes(1);
+      expect(o.refresh).not.toHaveBeenCalled();
+    }
+    // A failing final refresh with 404 ends too.
+    const { o } = base({
+      read: vi.fn().mockResolvedValue(null),
+      refresh: vi.fn().mockRejectedValue(new ApiError(404, "x")),
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(o.gone).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(o.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("long transient errors back off to the cap", async () => {
+    vi.useFakeTimers();
+    const read = vi.fn().mockRejectedValue(new Error("down"));
+    const { stop } = base({ read });
+    const at: number[] = [];
+    read.mockImplementation(() => {
+      at.push(Date.now());
+      return Promise.reject(new Error("down"));
+    });
+    const t0 = Date.now();
+    await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000 + 4000 + 4000);
+    expect(at.map((t) => t - t0)).toEqual([1000, 3000, 7000, 11000, 15000]);
+    stop();
+  });
+
+  it("nothing is tried while the page is hidden; the due try runs as it shows", async () => {
+    vi.useFakeTimers();
+    const doc = visibility();
+    doc.hidden = true;
+    const { o } = base({ doc: doc as unknown as Document });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(o.read).not.toHaveBeenCalled();
+    doc.show();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(o.read).toHaveBeenCalledTimes(1);
+    expect(o.reconnect).toHaveBeenCalledTimes(1);
+    expect(doc.listeners.size).toBe(0);
   });
 
   it("stopped (the page left or the stream came back): nothing more happens", async () => {
     vi.useFakeTimers();
-    const read = vi.fn().mockResolvedValue(run("r1", null));
-    const reconnect = vi.fn();
-    const stop = recoverLost({ runId: "r1", read, reconnect, ended: vi.fn(), everyMs: 1000 });
+    const doc = visibility();
+    doc.hidden = true;
+    const { o, stop } = base({ doc: doc as unknown as Document });
+    await vi.advanceTimersByTimeAsync(1000);
     stop();
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(read).not.toHaveBeenCalled();
-    expect(reconnect).not.toHaveBeenCalled();
+    doc.show();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(o.read).not.toHaveBeenCalled();
+    expect(doc.listeners.size).toBe(0);
+  });
+
+  it("the refresh after a run's end (retryUntil) goes on until it succeeds", async () => {
+    vi.useFakeTimers();
+    const refresh = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(undefined);
+    retryUntil(refresh, { firstMs: 0, everyMs: 1000, doc: undefined });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refresh).toHaveBeenCalledTimes(2);
   });
 });
