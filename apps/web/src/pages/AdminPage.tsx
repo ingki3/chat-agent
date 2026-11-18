@@ -27,7 +27,7 @@ type Tab = (typeof TABS)[number][0];
 
 /**
  * Admin screen (#35, PRD FR-10): users (#41 + edit), Cloudflare Access (#36), per-user permissions, runtimes and connections, skills, 지침 (#144),
- * 기억 정리 (#146), system status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
+ * 기억 정리 (#146 — since #188 only the server-wide switch, token cap, allowed connections, youth settings and status), system status, backups (#37) and usage (#32). The tab is in the address (`?tab=`), so a notification can open the right one.
  */
 export function AdminPage({ selfId }: { selfId: string }) {
   const [params, setParams] = useSearchParams();

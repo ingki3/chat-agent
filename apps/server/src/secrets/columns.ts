@@ -402,6 +402,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "memory_message_seq.user_id": ID,
   "memory_seq_counters.user_id": ID,
   "dreaming_users.user_id": ID,
+  "dreaming_users.time": { exempt: "HH:MM, validated" },
+  "dreaming_users.runtime": ENUM,
+  "dreaming_users.connection_id": ID,
+  "dreaming_users.model": {
+    exempt:
+      "a model id of an allowed connection·model pair (checked against the admin's list before it is stored)",
+  },
+  "dreaming_users.prompt": { write: "DreamingStore.setPrompt (scrubKnown)", rescrub: "text" },
   "dreaming_days.user_id": ID,
   "dreaming_days.date": { exempt: "a calendar date (YYYY-MM-DD) the server computes" },
   "dreaming_days.state": ENUM,
@@ -422,7 +430,10 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "dreaming_queue.user_id": ID,
   "dreaming_queue.message_id": ID,
   "dreaming_queue.doc": ENUM,
-  "dreaming_prompts.content": { write: "DreamingStore.savePrompt (scrubKnown)", rescrub: "text" },
+  "dreaming_prompts.content": {
+    write: "DreamingStore.savePrompt of #146 (scrubKnown; no new versions since #188)",
+    rescrub: "text",
+  },
   "dreaming_prompts.author_id": ID,
   // #36: the Access sync — emails (the same accepted limitation as `users.email`), codes and Cloudflare revisions.
   "access_syncs.id": ID,

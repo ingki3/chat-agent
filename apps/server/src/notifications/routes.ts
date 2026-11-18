@@ -1,5 +1,10 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { NotificationPrefs, PushCheckRequest, PushSubscriptionRequest } from "@agentlee/shared";
+import {
+  NotificationPrefs,
+  PushCheckRequest,
+  PushSubscriptionRequest,
+  SaveNotificationPrefsRequest,
+} from "@agentlee/shared";
 import { z } from "zod";
 import { deny } from "../auth/plugin.js";
 import { SubscriptionError, toNotification, type NotificationService } from "./service.js";
@@ -94,9 +99,12 @@ export function registerNotificationRoutes(app: FastifyInstance, service: Notifi
     "/api/notifications/prefs",
     { config: { noResource: "the caller's own notification settings" } },
     async (req, reply) => {
-      const body = parse(NotificationPrefs, req.body, reply);
+      // Only the fields sent change (#188 review 5); the merged result must still be valid settings.
+      const body = parse(SaveNotificationPrefsRequest, req.body, reply);
       if (!body) return reply;
-      return noStore(reply).send(service.setPrefs(req.ctx.user!.id, body));
+      const merged = NotificationPrefs.safeParse({ ...service.prefs(req.ctx.user!.id), ...body });
+      if (!merged.success) return deny(reply, 400, "invalid_request");
+      return noStore(reply).send(service.setPrefs(req.ctx.user!.id, merged.data));
     },
   );
 

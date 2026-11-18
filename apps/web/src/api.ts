@@ -86,11 +86,12 @@ import {
   DREAMING_ERRORS,
   DreamingAdmin,
   DreamingPreview,
-  DreamingPromptVersions,
-  DreamingPromptView,
   DreamingUserStatus,
   MyDreaming,
-  type DreamingConfig,
+  type SaveDreamingConfigRequest,
+  type SaveDreamingSettingsRequest,
+  type SaveNotificationPrefsRequest,
+  type SaveYouthDreamingRequest,
   MemoryPrefs,
   MemoryProposal,
   type MemoryApplyMode,
@@ -529,7 +530,8 @@ export const notifications = {
   readAll: async () => UnreadCount.parse(await call("POST", "/api/notifications/read-all", {})).unread,
   test: async () => call("POST", "/api/notifications/test", {}),
   prefs: async () => NotificationPrefs.parse(await call("GET", "/api/notifications/prefs")),
-  setPrefs: async (p: NotificationPrefs) =>
+  /** Only the changed fields (the server merges them; quiet hours as a pair). */
+  setPrefs: async (p: SaveNotificationPrefsRequest) =>
     NotificationPrefs.parse(await call("PUT", "/api/notifications/prefs", p)),
 };
 
@@ -907,31 +909,32 @@ export const memoryPrefs = {
 };
 
 /**
- * 기억 정리 (#146, FR-16.5·16.6·16.8). The user's own: whether it runs, the prompt in use, DREAMS.md and the bundles
- * (decided with `memoryProposals`). The admin's: settings, prompt versions, 미리 실행 (own data), status counts.
+ * 기억 정리 (#146, #188, FR-16.5·16.6·16.8). The user's own: settings (switch, time, connection·model), the prompt
+ * (기본값으로 되돌리기 = null), 미리 실행 on their own data, DREAMS.md and the bundles (decided with `memoryProposals`).
+ * The admin's: the server-wide switch, the token cap, the allowed pairs, a youth account's settings, status counts.
  */
 export const DREAMING_KEY = ["dreaming"] as const;
 export const ADMIN_DREAMING_KEY = ["admin", "dreaming"] as const;
 export const dreaming = {
   mine: async () => MyDreaming.parse(await call("GET", "/api/dreaming")),
+  /** Only the changed fields (the server merges them). */
+  save: async (s: SaveDreamingSettingsRequest) =>
+    MyDreaming.parse(await call("PUT", "/api/dreaming/settings", s)),
+  savePrompt: async (content: string | null) =>
+    MyDreaming.parse(await call("PUT", "/api/dreaming/prompt", { content })),
+  preview: async (content?: string) =>
+    DreamingPreview.parse(
+      await call("POST", "/api/dreaming/preview", content === undefined ? {} : { content }),
+    ),
 };
 export const adminDreaming = {
   get: async () => DreamingAdmin.parse(await call("GET", "/api/admin/dreaming")),
-  save: async (c: DreamingConfig) => DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
-  setUser: async (id: string, enabled: boolean) =>
-    DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, { enabled })),
-  savePrompt: async (content: string, baseVersion: number) =>
-    DreamingPromptView.parse(await call("PUT", "/api/admin/dreaming/prompt", { content, baseVersion })),
-  versions: async () =>
-    DreamingPromptVersions.parse(await call("GET", "/api/admin/dreaming/prompt/versions")).versions,
-  restore: async (v: number, baseVersion: number) =>
-    DreamingPromptView.parse(
-      await call("POST", `/api/admin/dreaming/prompt/versions/${v}/restore`, { baseVersion }),
-    ),
-  preview: async (content?: string) =>
-    DreamingPreview.parse(
-      await call("POST", "/api/admin/dreaming/preview", content === undefined ? {} : { content }),
-    ),
+  /** Only the changed fields (the server merges them). */
+  save: async (c: SaveDreamingConfigRequest) =>
+    DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
+  /** A youth account's settings, 반영 방식 and (write-only) prompt — the admin's to set. */
+  setUser: async (id: string, s: SaveYouthDreamingRequest) =>
+    DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, s)),
   /** "지금 실행" — the FakeRuntime server only (development, e2e). */
   runNow: async (id: string) =>
     DreamingUserStatus.parse(await call("POST", `/api/admin/dreaming/users/${enc(id)}/run`, {})),

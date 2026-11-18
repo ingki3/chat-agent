@@ -123,11 +123,19 @@ export class MemoryProposals {
     return r?.m ?? "review";
   }
 
+  /** The setting's revision (#188 review 9): +1 on every write; 0 before the first. */
+  modeRev(userId: string): number {
+    const r = this.sql.prepare("select rev from memory_prefs where user_id = ?").get(userId) as
+      { rev: number } | undefined;
+    return r?.rev ?? 0;
+  }
+
   setMode(userId: string, mode: MemoryApplyMode): void {
     this.sql
       .prepare(
-        `insert into memory_prefs (user_id, apply_mode, updated_at) values (?, ?, ?)
-         on conflict(user_id) do update set apply_mode = excluded.apply_mode, updated_at = excluded.updated_at`,
+        `insert into memory_prefs (user_id, apply_mode, rev, updated_at) values (?, ?, 1, ?)
+         on conflict(user_id) do update set apply_mode = excluded.apply_mode, rev = memory_prefs.rev + 1,
+           updated_at = excluded.updated_at`,
       )
       .run(userId, mode, this.now());
   }

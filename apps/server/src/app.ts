@@ -1152,7 +1152,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       scheduleWarnings.stop();
       await scheduleEngine.stop();
     });
-    // 기억 정리 (#146, FR-16.5·16.6): the admin's shared API key connection, once a day per user, without tools.
+    // 기억 정리 (#146, #188, FR-16.5·16.6): each user's chosen shared API key connection, once a day, without tools.
     const dreamingNow = opts.dreaming?.now ?? Date.now;
     const dreamingRunner = new DreamingRunner({
       db: opts.db!,
@@ -1183,11 +1183,18 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             "select 1 from runs where user_id = ? and status in ('queued', 'running') limit 1",
           )
           .get(userId),
-      alert: (date, count, tooLarge) => {
+      // The user's own round failed at its last attempt (#188): told themself, unless turned off (설정 → 알림).
+      failed: (userId, date, code) => {
+        const n = app.notifications;
+        if (!n?.wants(userId, "memory_failed")) return;
+        n.publish(userId, { kind: "memory_failed", code }, { dedupeKey: `memory_failed:${date}:${userId}` });
+      },
+      // The server's setup is broken (an allowed shared connection gone): the admins, once a day.
+      alert: (date, count) => {
         for (const admin of connectionStore.admins())
           app.notifications?.publish(
             admin,
-            { kind: "dreaming_failed", users: count, tooLarge },
+            { kind: "dreaming_failed", users: count },
             { dedupeKey: `dreaming_failed:${date}:${admin}` },
           );
         logEvent(app.log, "warn", "dreaming.alert_sent", { count });

@@ -55,6 +55,17 @@ const markPending = (sql: Db["$client"]) =>
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
 const DERIVED: Record<string, Pick<Table, "immutable" | "derived">> = {
+  // A row with a revision (#188 review 11): a scrub is a write of it, so its revision goes up with it — a page then
+  // takes the scrubbed answer over an older one of the same settings (apps/web/src/instructions/rev.ts).
+  dreaming_users: {
+    derived: (r, sql) => ({
+      rev:
+        ((
+          sql.prepare("select rev from dreaming_users where rowid = ?").get(r._rowid) as
+            { rev: number } | undefined
+        )?.rev ?? 0) + 1,
+    }),
+  },
   sources: { derived: (r) => (typeof r.body === "string" ? { body_hash: sha256(r.body) } : {}) },
   // The duplicate key (a hash) follows the scrubbed snippet (#25).
   citations: {

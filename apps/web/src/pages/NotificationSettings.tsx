@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { NotificationPrefs, PushDevice } from "@agentlee/shared";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import type { NotificationPrefs, PushDevice, SaveNotificationPrefsRequest } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
+import { afterSave } from "../instructions/draft.js";
+import { applySaved, prefsFromGet, prefsFromPut, sharing, type Prefs } from "../instructions/rev.js";
+
+const keepPrefs = sharing(prefsFromGet);
+/** A save's answer into the cache, unless a newer revision is there (rev.ts). */
+const applyPrefs = (qc: QueryClient, v: NotificationPrefs) =>
+  applySaved<Prefs>(qc, PREFS_KEY, (old) => prefsFromPut(old, { ...v, rev: v.rev ?? 0 }));
 import {
   browserState,
   disablePush,
@@ -203,7 +210,8 @@ export function NotificationSettings() {
 
 function QuietHours() {
   const qc = useQueryClient();
-  const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
+  // The newest revision wins (rev.ts): a GET older than a save's answer never replaces it.
+  const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs, structuralSharing: keepPrefs });
   const [draft, setDraft] = useState<{ on: boolean; start: string; end: string }>();
   const [saved, setSaved] = useState(false);
   const value = draft ?? {
@@ -212,16 +220,20 @@ function QuietHours() {
     end: prefs.data?.quietEnd ?? "07:00",
   };
   const save = useMutation({
-    mutationFn: () => {
+    // `sent`: the draft as it was when saved — what the form compares against afterwards.
+    mutationFn: async (sent: typeof value) => {
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Seoul";
-      const p: NotificationPrefs = value.on
-        ? { quietStart: value.start, quietEnd: value.end, timeZone }
+      // Only the quiet hours (and the zone they are in): the server keeps the rest as stored (#188 review 5).
+      const p: SaveNotificationPrefsRequest = sent.on
+        ? { quietStart: sent.start, quietEnd: sent.end, timeZone }
         : { quietStart: null, quietEnd: null, timeZone };
       return notifications.setPrefs(p);
     },
-    onSuccess: (p) => {
-      qc.setQueryData(PREFS_KEY, p);
-      setDraft(undefined);
+    // The answer (the stored preferences + revision) into the cache unless newer is there; the draft goes only if it
+    // is still what was sent (review #195 6, 9).
+    onSuccess: (v, sent) => {
+      applyPrefs(qc, v);
+      setDraft((cur) => (cur === undefined ? cur : afterSave(cur, sent, undefined)));
       setSaved(true);
     },
   });
@@ -232,14 +244,15 @@ function QuietHours() {
   const invalid = value.on && value.start === value.end;
   // Not editable before the saved value is here (#103): an edit made on the defaults would be the draft, and the
   // save would overwrite what was stored (and a tick could land just as the stored "on" arrives, undoing itself).
-  const loading = !prefs.data;
+  // Locked while saving too (review #195 6): nothing typed meanwhile can be lost, no second submit.
+  const loading = !prefs.data || save.isPending;
 
   return (
     <form
       className="quiet"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!invalid) save.mutate();
+        if (!invalid && !save.isPending) save.mutate(value);
       }}
     >
       <h3>방해 금지 시간</h3>
@@ -295,14 +308,23 @@ function QuietHours() {
   );
 }
 
-/** 기억 정리 notifications (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" — each can be turned off. */
+/** 기억 정리 notifications (#146, #188, spec §8): 제안 대기, 자동 반영, 실패 — each can be turned off. */
 function MemoryNotifications() {
   const qc = useQueryClient();
-  const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
+  // The newest revision wins (rev.ts): a GET older than a save's answer never replaces it.
+  const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs, structuralSharing: keepPrefs });
+  type Toggle = "memoryProposals" | "memoryApplied" | "memoryFailed";
+  // A choice shows at once while it is being saved; then the cache — the newest revision seen, which holds the save's
+  // answer (or, refused, the newest stored value) — shows again (rev.ts, review #195 9).
+  const [picked, setPicked] = useState<Partial<Record<Toggle, boolean>>>({});
+  const shown = (f: Toggle) => picked[f] ?? prefs.data?.[f] !== false;
   const save = useMutation({
-    mutationFn: (patch: Pick<NotificationPrefs, "memoryProposals" | "memoryApplied">) =>
-      notifications.setPrefs({ ...prefs.data!, ...patch }),
-    onSuccess: (p) => qc.setQueryData(PREFS_KEY, p),
+    // Only the toggled field (#188 review 5): never the whole object, which would overwrite quiet hours saved meanwhile.
+    mutationFn: (a: { field: Toggle; value: boolean }) => notifications.setPrefs({ [a.field]: a.value }),
+    onMutate: (a) => setPicked((p) => ({ ...p, [a.field]: a.value })),
+    onSuccess: (v) => applyPrefs(qc, v),
+    onSettled: (_v, _e, a) =>
+      setPicked((p) => Object.fromEntries(Object.entries(p).filter(([k]) => k !== a.field))),
   });
   const loading = !prefs.data || save.isPending;
   return (
@@ -313,22 +335,33 @@ function MemoryNotifications() {
       <label className="row">
         <input
           type="checkbox"
-          checked={prefs.data?.memoryProposals !== false}
+          checked={shown("memoryProposals")}
           disabled={loading}
-          onChange={(e) => save.mutate({ memoryProposals: e.target.checked })}
+          onChange={(e) => save.mutate({ field: "memoryProposals", value: e.target.checked })}
         />{" "}
         기억 정리 제안이 기다릴 때
       </label>
       <label className="row">
         <input
           type="checkbox"
-          checked={prefs.data?.memoryApplied !== false}
+          checked={shown("memoryApplied")}
           disabled={loading}
-          onChange={(e) => save.mutate({ memoryApplied: e.target.checked })}
+          onChange={(e) => save.mutate({ field: "memoryApplied", value: e.target.checked })}
         />{" "}
         기억 정리가 자동으로 반영했을 때
       </label>
-      <p className="muted small">알림에는 개수만 적혀요. 내용은 설정 → 내 지침에서 봐요.</p>
+      <label className="row">
+        <input
+          type="checkbox"
+          checked={shown("memoryFailed")}
+          disabled={loading}
+          onChange={(e) => save.mutate({ field: "memoryFailed", value: e.target.checked })}
+        />{" "}
+        내 기억 정리가 실패했을 때
+      </label>
+      <p className="muted small">
+        알림에는 개수·이유만 적혀요. 내용과 기억 정리 설정은 설정 → 내 지침에서 봐요.
+      </p>
       {save.isError && (
         <p className="error small" role="alert">
           {errorText(save.error)}
