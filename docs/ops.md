@@ -2212,7 +2212,7 @@ YouTube 영상 하나의 음성을 **대화 파일(M4A)** 로 저장한다. 대�
 # 2) 고정 yt-dlp + yt-dlp-ejs + deno (이 명령만 네트워크를 쓴다: PyPI)
 pnpm youtube:install   # <DATA_DIR>/youtube-packages/<lock 해시>-py3.12/ (~90MB, 대부분 deno 바이너리)
 pnpm youtube:status    # youtube_audio_fetch: available
-pnpm youtube:check     # 샌드박스 안에서 yt-dlp import + deno 시작·작은 스크립트 풀기 (네트워크 없음) — 버전 출력
+pnpm youtube:check     # 샌드박스 안에서 yt-dlp import + deno를 yt-dlp 옵션(+모든 권한 거부)으로 시작, 작은 스크립트 풀기·프로세스 실행 거부 확인 (네트워크 없음) — 버전 출력
 # 3) 서버 재시작
 ```
 - 고정 버전(2026-11-18): **yt-dlp 2026.10.26**(PyPI 배포 2026-10-26), **yt-dlp-ejs 0.8.0**(2026-03-17, YouTube JS 문제 풀이 스크립트), **deno 2.9.8**(2026-10-21, JS 런타임 — 휠에 바이너리가 들어 있음). 휠 해시 고정, `pip --isolated --no-deps --require-hashes --only-binary=:all: --target`, 고정 환경, 설치 폴더 읽기 전용(§46과 같은 설치기 `installPinnedPackages`). `bin/deno`만 남기고 다른 콘솔 스크립트(`yt-dlp` 등)는 지운다.
@@ -2244,11 +2244,10 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 | 증상 | 확인 |
 | --- | --- |
 | 관리자 화면 `설치 안 됨` | `pnpm youtube:status` → `pnpm youtube:install`(lock이 바뀐 뒤에는 다시). `needs_python`이면 §35/§46의 `SKILL_PYTHON`, `needs_ffmpeg`면 `AUDIO_FFMPEG` |
-| `youtube:check`가 실패 | 설치 폴더가 지워졌거나 바뀜 → `pnpm youtube:install`. deno가 시작하지 않으면(`youtube_failed`) macOS·아키텍처에 맞는 deno 휠인지(lock에 arm64·x86_64 해시) |
+| `youtube:check`가 실패 | 설치 폴더가 지워졌거나 바뀜 → `pnpm youtube:install`. deno가 시작하지 않으면(`youtube_failed`) macOS·아키텍처에 맞는 deno 휠인지(lock에 arm64·x86_64 해시). yt-dlp를 올린 뒤 실패하면 yt-dlp가 deno 옵션의 자리(`DenoJCP._DENO_BASE_OPTIONS`)를 바꿨거나 `--allow-*`를 넣은 것 — `fetch.py`가 일부러 거부한다(`lock_deno`). 새 yt-dlp 코드를 확인하고 `fetch.py`를 맞춘 뒤 올린다 |
 | `youtube_bot_check`가 자주 | YouTube가 이 IP를 의심함. 잠시 뒤 다시. 계속되면 yt-dlp가 낡았을 수 있음 → §48.2로 새 정식 버전(3일 이상). 쿠키는 쓰지 않는다(결정) — 그 영상은 사용자가 음성 파일을 직접 올리게 안내 |
 | `youtube_failed`·`youtube_no_audio`가 갑자기 많아짐 | 대개 YouTube 변경 → §48.2. 서버 로그에는 고정 코드만 있다(`youtube.finished`의 `youtubeCode`). 원인을 보려면 관리자 Mac에서 같은 고정 yt-dlp를 샌드박스 밖에서 직접 돌려 본다(가족 대화와 무관한 공개 영상으로) |
 | 새로 필요한 호스트 | yt-dlp가 다른 호스트를 쓰기 시작하면 프록시가 403으로 막아 `youtube_failed`. `YOUTUBE_EGRESS_HOSTS`에 그 호스트만 더하는 코드 변경 + isolation.md 기록(와일드카드는 `*.<접미사>`, 라벨 둘 이상) |
-| `youtube_paused`("안전 점검 때문에 … 잠시 멈췄어요") | 앞선 실행에서 yt-dlp 쪽 프로세스가 프로세스 그룹을 떠났고(`youtube_escaped`, 스킬 실행 실패 목록) 죽였는데도 살아 있음 — 정상 경로에서는 일어나지 않는다. 그 프로세스가 끝나면 저절로 풀리고, 아니면 서버 재시작. 반복되면 yt-dlp·deno 버전을 의심하고 이슈로 |
 | `youtube_too_large` | 음성 전체 300MB 초과(대략 128kbps로 5시간 넘음). 구간을 줘도 전체를 받으므로 받을 수 없다 |
 
 ### 48.6 로그와 확인

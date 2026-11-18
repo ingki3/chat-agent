@@ -26,6 +26,34 @@ import sys
 FSIZE_MARGIN = 2 * 1024 * 1024
 
 
+# What yt-dlp's deno gets besides yt-dlp's own options (`--no-remote --no-npm --cached-only …`): an explicit denial
+# of every permission. deno already grants none by default (no `--allow-*` is passed); this keeps it so even if a
+# later yt-dlp starts passing one — and makes the player JS unable to start a process, load a library, read the
+# environment or the system, touch files or the network, or import anything (#191 review 3).
+DENO_LOCKDOWN = (
+    "--deny-run",
+    "--deny-ffi",
+    "--deny-sys",
+    "--deny-env",
+    "--deny-net",
+    "--deny-read",
+    "--deny-write",
+    "--deny-import",
+)
+
+
+def lock_deno():
+    """Appends DENO_LOCKDOWN to the options yt-dlp starts deno with; refuses (raises) if those options are not where
+    this pinned yt-dlp keeps them, or already allow something — fail closed on a yt-dlp that changed."""
+    from yt_dlp.extractor.youtube.jsc._builtin import deno as jcp
+
+    base = list(jcp.DenoJCP._DENO_BASE_OPTIONS)
+    if any(o.startswith("--allow") or o == "-A" for o in base):
+        raise RuntimeError("deno options allow a permission")
+    jcp.DenoJCP._DENO_BASE_OPTIONS = [o for o in base if o not in DENO_LOCKDOWN] + list(DENO_LOCKDOWN)
+    return list(jcp.DenoJCP._DENO_BASE_OPTIONS)
+
+
 class TooLarge(BaseException):
     """Raised from the progress hook: a BaseException, so no `except Exception` inside yt-dlp swallows it or
     retries the download with the page's address."""
@@ -205,6 +233,7 @@ def main():
 
     mode = job["mode"]
     log = Log()
+    deno_args = lock_deno()
     if mode == "check":
         import subprocess
 
@@ -214,16 +243,22 @@ def main():
         rt = DenoJsRuntime(job["deno"]).info
         if not rt or not rt.supported:
             return {"ok": False, "error": "deno"}
+        # deno as yt-dlp starts it for the installed (minified) challenge scripts: its options, locked down, then
+        # `--no-npm --cached-only`. The script also checks that starting a process is refused.
+        probe_js = (
+            "let ran = true; try { new Deno.Command('/bin/echo').outputSync(); } catch { ran = false; }"
+            " console.log(JSON.stringify({ sum: 20 + 22, ran }))"
+        )
         r = subprocess.run(
-            [job["deno"], "run", "--ext=js", "--no-code-cache", "--no-prompt", "--no-remote", "--no-lock"]
-            + ["--node-modules-dir=none", "--no-config", "--no-npm", "--cached-only", "-"],
-            input="console.log(JSON.stringify({ sum: 20 + 22 }))",
+            [job["deno"], "run", *deno_args, "--no-npm", "--cached-only", "-"],
+            input=probe_js,
             capture_output=True,
             text=True,
             timeout=60,
         )
-        solved = r.returncode == 0 and json.loads(r.stdout or "{}").get("sum") == 42
-        return {"ok": solved, "ytdlp": yt_dlp.version.__version__, "deno": rt.version}
+        got = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+        solved = got.get("sum") == 42 and got.get("ran") is False
+        return {"ok": solved, "ytdlp": yt_dlp.version.__version__, "deno": rt.version, "denoArgs": deno_args}
     if mode == "probe":
         opts = options(job, log)
         # Metadata only: no format is required to exist (the server decides from the audio formats listed).

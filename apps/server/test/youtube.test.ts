@@ -37,7 +37,6 @@ import {
   convertOptions,
   sandboxedYoutubeRunner,
   scriptReport,
-  stillAlive,
   youtubeFolders,
   ytdlpEnv,
   ytdlpOptions,
@@ -1091,6 +1090,28 @@ const realFfmpeg =
   process.platform === "darwin" ? ffmpegOf(process.env.TEST_AUDIO_FFMPEG, "/nonexistent-data") : undefined;
 const sandboxIt = realPy?.ok && realFfmpeg?.ok ? it : it.skip;
 
+/** yt-dlp 2026.10.26's `DenoJCP._DENO_BASE_OPTIONS` (the pinned list; no `--allow-*`). */
+const YTDLP_DENO_BASE = [
+  "--ext=js",
+  "--no-code-cache",
+  "--no-prompt",
+  "--no-remote",
+  "--no-lock",
+  "--node-modules-dir=none",
+  "--no-config",
+];
+/** What `fetch.py` adds (`DENO_LOCKDOWN`). */
+const DENO_LOCKDOWN = [
+  "--deny-run",
+  "--deny-ffi",
+  "--deny-sys",
+  "--deny-env",
+  "--deny-net",
+  "--deny-read",
+  "--deny-write",
+  "--deny-import",
+];
+
 /**
  * A stub of yt-dlp's API as `fetch.py` uses it — the video id picks the scenario. It records what it was given and
  * tries what the sandbox must refuse (reading a file outside, a port that is not the proxy's), and starts its "JS
@@ -1139,6 +1160,16 @@ class YoutubeDL:
         deno = o["js_runtimes"]["deno"]["path"]
         child = subprocess.run([deno, "-I", "-S", "-c", "import json,sys; sys.path.insert(0, %r); from yt_dlp import _probe_outside; print(json.dumps(_probe_outside(%r, %d)))" % (os.path.dirname(here), open(os.path.join(here, "outside.txt")).read().strip(), int(open(os.path.join(here, "port.txt")).read()))], capture_output=True, text=True)
         rec["child"] = json.loads(child.stdout or "{}")
+        # The options fetch.py left for yt-dlp's deno, and what the sandbox lets python start besides itself and deno.
+        from .extractor.youtube.jsc._builtin.deno import DenoJCP
+        rec["deno_args"] = list(DenoJCP._DENO_BASE_OPTIONS)
+        rec["exec"] = {}
+        for prog in (["/bin/sh", "-c", "true"], ["/usr/bin/true"], ["/usr/bin/env"]):
+            try:
+                subprocess.run(prog, capture_output=True, timeout=5)
+                rec["exec"][prog[0]] = "ran"
+            except OSError as e:
+                rec["exec"][prog[0]] = type(e).__name__
         with open(os.path.join(os.getcwd(), "stub-record.json"), "w") as f:
             json.dump(rec, f)
         return {"id": vid, "_type": "video", "extractor_key": "Youtube", "title": "stub", "duration": 20.0,
@@ -1182,6 +1213,28 @@ describe("youtube_audio_fetch: the real fetch.py and ffmpeg in their sandbox (ma
       fs.mkdirSync(stub);
       fs.writeFileSync(path.join(stub, "__init__.py"), STUB);
       fs.writeFileSync(path.join(stub, "version.py"), "__version__ = 'stub'\n");
+      // yt-dlp 2026.10.26's place for deno's options (`DenoJCP._DENO_BASE_OPTIONS`, the pinned list); with
+      // `allow.txt` present it also allows a permission — fetch.py must refuse to run then.
+      const jcp = path.join(stub, "extractor", "youtube", "jsc", "_builtin");
+      fs.mkdirSync(jcp, { recursive: true });
+      for (const d of [
+        "extractor",
+        "extractor/youtube",
+        "extractor/youtube/jsc",
+        "extractor/youtube/jsc/_builtin",
+      ])
+        fs.writeFileSync(path.join(stub, d, "__init__.py"), "");
+      fs.writeFileSync(
+        path.join(jcp, "deno.py"),
+        [
+          "import os",
+          "class DenoJCP:",
+          `    _DENO_BASE_OPTIONS = ${JSON.stringify(YTDLP_DENO_BASE)}`,
+          "    if os.path.exists(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'allow.txt')):",
+          "        _DENO_BASE_OPTIONS = _DENO_BASE_OPTIONS + ['--allow-run']",
+          "",
+        ].join("\n"),
+      );
       // The "deno" place: python itself (the profile allows exactly that one program besides the command).
       fs.symlinkSync(py.exe, path.join(pk, "bin", "deno"));
       // A 20-second AAC tone (test preparation, outside any sandbox).
@@ -1229,6 +1282,14 @@ describe("youtube_audio_fetch: the real fetch.py and ffmpeg in their sandbox (ma
         other_port: false,
         // The child (yt-dlp's JS runtime) ran — inside the same profile.
         child: { read_outside: false, other_port: false },
+        // deno: yt-dlp's own options, then every permission denied explicitly (no --allow-* anywhere).
+        deno_args: [...YTDLP_DENO_BASE, ...DENO_LOCKDOWN],
+        // Nothing but python itself and the pinned deno may be started.
+        exec: {
+          "/bin/sh": "PermissionError",
+          "/usr/bin/true": "PermissionError",
+          "/usr/bin/env": "PermissionError",
+        },
       });
       const d = await runner.download({ env, workdir, formatId: "140", proxy });
       expect(d, JSON.stringify(d)).toMatchObject({ ok: true });
@@ -1271,6 +1332,13 @@ describe("youtube_audio_fetch: the real fetch.py and ffmpeg in their sandbox (ma
           code,
         });
       }
+      // A yt-dlp whose deno options allow a permission: fetch.py refuses to run at all.
+      fs.writeFileSync(path.join(stub, "allow.txt"), "x");
+      expect(await runner.probe({ env, workdir: makeYoutubeWorkdir(data), url: URL_OK, proxy })).toEqual({
+        ok: false,
+        code: "youtube_failed",
+      });
+      fs.rmSync(path.join(stub, "allow.txt"));
       // The download limit holds while the bytes come in — no length, a wrong one, one big write (RLIMIT_FSIZE): stopped,
       // youtube_too_large, never a file over the limit (review round 1).
       for (const formatId of ["nolen", "wronglen", "oneshot"]) {
@@ -1303,6 +1371,35 @@ describe("youtube_audio_fetch: the real fetch.py and ffmpeg in their sandbox (ma
  */
 const ytdlpPackages = process.env.TEST_YTDLP_PACKAGES;
 const ytdlpIt = ytdlpPackages && realPy?.ok && realFfmpeg?.ok ? it : it.skip;
+describe("youtube_audio_fetch: the real yt-dlp's deno lockdown (TEST_YTDLP_PACKAGES, #191 review 3)", () => {
+  ytdlpIt(
+    "the pinned yt-dlp starts deno with its own options plus every permission denied; deno cannot run a process",
+    async () => {
+      const { runIsolated } = await import("../src/isolation/sandbox.js");
+      const pk = fs.realpathSync(ytdlpPackages!);
+      const env: YoutubeEnv = {
+        runtime: (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime,
+        packages: pk,
+        deno: path.join(pk, "bin", "deno"),
+        ffmpeg: (realFfmpeg as { ok: true; ffmpeg: YoutubeEnv["ffmpeg"] }).ffmpeg,
+      };
+      const workdir = makeYoutubeWorkdir(path.join(tmp(), "data"));
+      const f = youtubeFolders(workdir);
+      for (const d of [f.yt, f.home, path.join(f.home, "tmp")]) fs.mkdirSync(d, { recursive: true });
+      const r = await runIsolated(
+        ytdlpOptions(
+          { env, workdir, proxy: { url: "http://127.0.0.1:9", port: 9 } },
+          { mode: "check" },
+          120_000,
+        ),
+      );
+      const rep = scriptReport(r) as { ok: boolean; denoArgs?: string[] };
+      expect(rep, r.stderr).toMatchObject({ ok: true, denoArgs: [...YTDLP_DENO_BASE, ...DENO_LOCKDOWN] });
+      expect(rep.denoArgs!.some((a) => a.startsWith("--allow") || a === "-A")).toBe(false);
+    },
+  );
+});
+
 describe("youtube_audio_fetch: the real yt-dlp's download limit (TEST_YTDLP_PACKAGES, #191 review 1)", () => {
   ytdlpIt(
     "no Content-Length, or a wrong size in the metadata: stopped at the limit, youtube_too_large",
@@ -1372,142 +1469,67 @@ describe("youtube_audio_fetch: the real yt-dlp's download limit (TEST_YTDLP_PACK
 
 // ---- a child that leaves the process group (fork) -----------------------------------------------------------
 
-describe("runIsolated with fork: a child that leaves the group (#191 review 1, 2)", () => {
+describe("runIsolated with fork: a child outside the group cannot keep the call open (#191 review 1)", () => {
   const pyIt = realPy?.ok ? it : it.skip;
-  /**
-   * python: fork a child that waits `argv[2]` seconds, makes its own session (`setsid`) and sleeps holding
-   * stdout/stderr; the parent writes the child's pid and then waits `argv[1]` seconds.
-   */
+  /** python: fork a child that makes its own session and sleeps holding stdout/stderr; the parent then `rest`s. */
   const ESCAPE = String.raw`
 import os, sys, time
 pid = os.fork()
 if pid == 0:
-    time.sleep(float(sys.argv[2]))
     os.setsid()
     time.sleep(30)
     os._exit(0)
 open("child.pid", "w").write(str(pid))
 time.sleep(float(sys.argv[1]))
 `;
-  const isAlive = (pid: number) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const run = async (
-    parent: string,
-    child: string,
-    extra: { timeoutMs?: number; signal?: AbortSignal } = {},
-  ) => {
-    const { runIsolated } = await import("../src/isolation/sandbox.js");
-    const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
-    const cwd = tmp();
-    const t0 = Date.now();
-    const r = await runIsolated({
-      command: py.exe,
-      args: ["-I", "-S", "-B", "-c", ESCAPE, parent, child],
-      cwd,
-      env: { HOME: cwd },
-      read: [],
-      write: [cwd],
-      trusted: [py.root],
-      fork: true,
-      timeoutMs: extra.timeoutMs ?? 20_000,
-      maxOutputBytes: 1024,
-      ...(extra.signal ? { signal: extra.signal } : {}),
-    });
-    const ms = Date.now() - t0;
-    const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
-    closers.push(() => {
-      if (isAlive(childPid)) process.kill(childPid, "SIGKILL");
-    });
-    return { r, ms, childPid };
-  };
-
   pyIt(
-    "a child seen in the tree, then gone to its own session: killed with the job, the run marked escaped",
+    "exit, time limit, stop: each ends the call within the drain deadline; the escaped child is reported",
     async () => {
-      // Seen while still in the group (the monitor looks every 250 ms), then setsid; the parent exits later.
-      const a = await run("1.5", "0.6");
-      expect(a.r.escaped).toBe(true);
-      expect(a.r.survivors).toEqual([]);
-      expect(isAlive(a.childPid)).toBe(false);
-      // Out of its session at once, while its parent still runs: found by parent, killed at the time limit.
-      const b = await run("30", "0", { timeoutMs: 800 });
-      expect(b.r.killed).toBe("timeout");
-      expect(b.r.escaped).toBe(true);
-      expect(b.r.survivors).toEqual([]);
-      expect(isAlive(b.childPid)).toBe(false);
-      // The same with a stop.
-      const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 800);
-      const c = await run("30", "0", { signal: ctrl.signal });
-      expect(c.r.killed).toBe("aborted");
-      expect(isAlive(c.childPid)).toBe(false);
-    },
-  );
-
-  pyIt(
-    "a child that escapes before it is ever seen still cannot keep the call open (the drain deadline)",
-    async () => {
-      const { FORK_DRAIN_MS } = await import("../src/isolation/sandbox.js");
-      // The parent exits at once: its child may never be seen (the uncovered case) — the call still ends, failed.
-      const a = await run("0", "0");
+      const { FORK_DRAIN_MS, runIsolated } = await import("../src/isolation/sandbox.js");
+      const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
+      const run = async (rest: string, extra: { timeoutMs?: number; signal?: AbortSignal } = {}) => {
+        const cwd = tmp();
+        const t0 = Date.now();
+        const r = await runIsolated({
+          command: py.exe,
+          args: ["-I", "-S", "-B", "-c", ESCAPE, rest],
+          cwd,
+          env: { HOME: cwd },
+          read: [],
+          write: [cwd],
+          trusted: [py.root],
+          fork: true,
+          timeoutMs: extra.timeoutMs ?? 20_000,
+          maxOutputBytes: 1024,
+          ...(extra.signal ? { signal: extra.signal } : {}),
+        });
+        const ms = Date.now() - t0;
+        const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
+        closers.push(() => {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {
+            // gone
+          }
+        });
+        return { r, ms };
+      };
+      // The command exits at once; the escaped child holds the pipes: cut after the drain deadline.
+      const a = await run("0");
+      expect(a.r.killed).toBe("escaped");
       expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
-      expect(a.r.killed === "escaped" || a.r.escaped === true).toBe(true);
+      // The time limit: the command is killed with its group, the escaped child still holds the pipes — still ends.
+      const b = await run("30", { timeoutMs: 500 });
+      expect(b.r.killed).toBe("timeout");
+      expect(b.ms).toBeLessThan(500 + FORK_DRAIN_MS + 3000);
+      // A stop after the command exited (during the drain): ends at once.
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 300);
+      const c = await run("0", { signal: ctrl.signal });
+      expect(c.r.killed).toBe("aborted");
+      expect(c.ms).toBeLessThan(FORK_DRAIN_MS);
     },
   );
-
-  it("the circuit breaker: a survivor pauses new runs until it is gone; an escaped run fails closed", async () => {
-    const survivor = { pid: 424242, ppid: 1, pgid: 424242, rss: 1, start: "Wed Nov 18 12:00:00 2026" };
-    let alive = [survivor];
-    const runner = sandboxedYoutubeRunner({
-      run: async () => ({
-        code: 0,
-        signal: null,
-        stdout: '{"ok":true,"info":{}}',
-        stderr: "",
-        killed: null,
-        escaped: true,
-        survivors: [survivor],
-      }),
-      alive: (procs) => procs.filter((p) => alive.some((a) => a.pid === p.pid)),
-    });
-    expect(runner.paused!()).toBe(false);
-    const workdir = makeYoutubeWorkdir(path.join(tmp(), "data"));
-    expect(
-      await runner.probe({
-        env: FAKE_ENV,
-        workdir,
-        url: URL_OK,
-        proxy: { url: "http://127.0.0.1:1", port: 1 },
-      }),
-    ).toEqual({ ok: false, code: "youtube_escaped" });
-    expect(runner.paused!()).toBe(true);
-    // The service refuses at once, with a hint — nothing runs.
-    const t = await start({ runner });
-    const c = t.app.conversations!.create(t.f.users.owner.id);
-    expect(await t.svc(runner).run(await t.scopeOf(c.id), { url: URL_OK })).toEqual({
-      ok: false,
-      code: "youtube_paused",
-      hint: YOUTUBE_HINTS.youtube_paused,
-    });
-    alive = [];
-    expect(runner.paused!()).toBe(false);
-  });
-
-  const darwinIt = process.platform === "darwin" ? it : it.skip;
-  darwinIt("stillAlive: the same pid and start time only (a reused pid is not the process)", async () => {
-    const { processTable } = await import("../src/isolation/sandbox.js");
-    const me = (await processTable()).find((p) => p.pid === process.pid)!;
-    expect(me.start).toMatch(/\d{4}$/);
-    expect(stillAlive([me])).toEqual([me]);
-    expect(stillAlive([{ ...me, start: "Thu Jan  1 00:00:00 1970" }])).toEqual([]);
-    expect(stillAlive([{ ...me, pid: 999_999 }])).toEqual([]);
-  });
 });
 
 // ---- the pinned install (a fake wheel, offline) ------------------------------------------------------------------

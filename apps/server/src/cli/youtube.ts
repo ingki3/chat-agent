@@ -66,10 +66,10 @@ if (cmd === "install") {
       ),
     );
     const rep = scriptReport(r);
-    const v = rep.ok ? (rep as { ytdlp?: unknown; deno?: unknown }) : undefined;
+    const v = rep.ok ? (rep as { ytdlp?: unknown; deno?: unknown; denoArgs?: unknown }) : undefined;
     ok = rep.ok;
     console.log(
-      `check (yt-dlp + deno, sandbox): ${rep.ok ? `ok — yt-dlp ${String(v?.ytdlp)}, deno ${String(v?.deno)}` : rep.code} — ${Date.now() - t} ms`,
+      `check (yt-dlp + deno, sandbox): ${rep.ok ? `ok — yt-dlp ${String(v?.ytdlp)}, deno ${String(v?.deno)} ${JSON.stringify(v?.denoArgs)}` : rep.code} — ${Date.now() - t} ms`,
     );
   } finally {
     removeTree(workdir);
