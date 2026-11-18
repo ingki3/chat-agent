@@ -221,10 +221,21 @@ export class DreamingStore {
     };
   }
 
-  /** Saves the user's settings (validated by the caller); turned off → paused like before (spec §9). */
+  /**
+   * Saves the user's settings (validated by the caller); turned off → paused like before (spec §9). A new time drops
+   * the user's round that has not started yet (waiting, no attempt, never deferred) so the schedule plans it again at
+   * the new time (#188 review 1); a round that ran, runs or waits for a retry or a busy answer stays — nothing twice.
+   */
   setSettings(userId: string, s: DreamingSettings): void {
     this.ensureState(userId);
+    const before = this.state(userId).time;
     this.sql.transaction(() => {
+      if (before !== s.time)
+        this.sql
+          .prepare(
+            "delete from dreaming_days where user_id = ? and state = 'waiting' and attempts = 0 and deferrals = 0",
+          )
+          .run(userId);
       this.setEnabled(userId, s.enabled);
       this.sql
         .prepare(

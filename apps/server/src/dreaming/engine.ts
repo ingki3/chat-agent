@@ -35,7 +35,8 @@ export const DREAMING_LATE_MS = 60_000;
 export type DreamingEngineDeps = {
   db: Db;
   store: DreamingStore;
-  runner: Pick<DreamingRunner, "run" | "problemOf" | "choiceProblem">;
+  runner: Pick<DreamingRunner, "run" | "problemOf" | "choiceProblem" | "canStart"> &
+    Partial<Pick<DreamingRunner, "onRelease">>;
   /** Whether the user has an answer running (any of their conversations). */
   busy?: (userId: string) => boolean;
   /** The user's round of `date` failed at its last attempt (`code`): tell them (once — the caller dedupes too). */
@@ -67,6 +68,8 @@ export class DreamingEngine {
 
   constructor(private readonly deps: DreamingEngineDeps) {
     this.now = deps.now ?? Date.now;
+    // A slot freed by any run (미리 실행, 지금 실행 included): look again at the rounds waiting for one.
+    deps.runner.onRelease?.(() => this.kick());
   }
 
   get running(): boolean {
@@ -209,10 +212,12 @@ export class DreamingEngine {
           next_at: s.at,
         });
     }
-    // Due rounds in order (due time, then user id), at most DREAMING_CONCURRENCY at once; the rest wait their turn.
+    // Due rounds in order (due time, then user id), in the runner's slots shared with 미리 실행 and 지금 실행 (at
+    // most DREAMING_CONCURRENCY at once, one per user); the rest wait their turn.
     for (const d of store.dueDays(now)) {
       if (this.active.size >= DREAMING_CONCURRENCY) break;
       if (d.date !== today || this.active.has(d.user_id)) continue;
+      if (!this.deps.runner.canStart(d.user_id)) continue;
       if (this.deps.runner.problemOf(d.user_id)) continue;
       this.dispatch(d);
     }

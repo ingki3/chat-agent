@@ -3,6 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   DREAMING_CODE_LABEL,
   DREAMING_PROBLEM_LABEL,
+  DREAMING_PROMPT_MAX,
+  MEMORY_APPLY_MODE_LABEL,
+  MemoryApplyMode,
   DREAMING_STATUS_LABEL,
   DREAMING_TOKEN_CAP,
   DREAMING_TRIGGER_LABEL,
@@ -11,6 +14,8 @@ import {
   type DreamingConfig,
   type DreamingConnectionChoice,
   type DreamingSettings,
+  type DreamingUserStatus,
+  type SaveYouthDreamingRequest,
 } from "@agentlee/shared";
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
@@ -188,7 +193,7 @@ function Status({ view }: { view: View }) {
   const qc = useQueryClient();
   const refresh = () => void qc.invalidateQueries({ queryKey: ADMIN_DREAMING_KEY });
   const setYouth = useMutation({
-    mutationFn: (a: { id: string; settings: DreamingSettings }) => adminDreaming.setUser(a.id, a.settings),
+    mutationFn: (a: { id: string; body: SaveYouthDreamingRequest }) => adminDreaming.setUser(a.id, a.body),
     onSuccess: refresh,
   });
   const runNow = useMutation({ mutationFn: (id: string) => adminDreaming.runNow(id), onSuccess: refresh });
@@ -222,13 +227,20 @@ function Status({ view }: { view: View }) {
                     choices={choices}
                     disabled={false}
                     pending={setYouth.isPending}
-                    onSave={(settings) => setYouth.mutate({ id: u.userId, settings })}
+                    onSave={(settings) => setYouth.mutate({ id: u.userId, body: settings })}
                   />
                 ) : (
                   <>
                     {u.enabled ? `켜짐 · ${u.settings.time}` : "꺼짐"} · {choiceLabel(view, u.settings)}
                     {u.customPrompt && " · 프롬프트 직접 씀"}
                   </>
+                )}
+                {u.youth && (
+                  <YouthExtras
+                    user={u}
+                    pending={setYouth.isPending}
+                    save={(extra) => setYouth.mutate({ id: u.userId, body: extra })}
+                  />
                 )}
                 {u.problem && (
                   <>
@@ -274,5 +286,71 @@ function Status({ view }: { view: View }) {
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * A youth account's 반영 방식 and cleanup prompt (#188 review 1) — the admin sets them. The prompt is write-only: its
+ * current text is the account's and is never sent here, only whether it is the default.
+ */
+function YouthExtras({
+  user,
+  pending,
+  save,
+}: {
+  user: DreamingUserStatus;
+  pending: boolean;
+  save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+  return (
+    <div className="dream-youth-extras">
+      <label className="inline">
+        반영 방식
+        <select
+          aria-label={`${user.name} 반영 방식`}
+          value={user.applyMode ?? "review"}
+          disabled={pending}
+          onChange={(e) => save({ applyMode: e.target.value as MemoryApplyMode })}
+        >
+          {MemoryApplyMode.options.map((m) => (
+            <option key={m} value={m}>
+              {MEMORY_APPLY_MODE_LABEL[m]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="muted small">
+        정리 프롬프트: {user.customPrompt ? "관리자가 새로 씀" : "기본값"} (지금 내용은 여기서 보이지 않아요)
+      </p>
+      <textarea
+        aria-label={`${user.name} 정리 프롬프트 새로 쓰기`}
+        rows={3}
+        maxLength={DREAMING_PROMPT_MAX}
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+      />
+      <div className="row wrap">
+        <button
+          type="button"
+          className="small"
+          disabled={pending || !prompt.trim()}
+          onClick={() => {
+            save({ prompt });
+            setPrompt("");
+          }}
+        >
+          프롬프트 저장
+        </button>
+        <button
+          type="button"
+          className="small"
+          disabled={pending || !user.customPrompt}
+          onClick={() => save({ prompt: null })}
+        >
+          기본값으로 되돌리기
+        </button>
+      </div>
+    </div>
   );
 }

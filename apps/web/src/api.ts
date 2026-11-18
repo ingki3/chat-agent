@@ -90,6 +90,7 @@ import {
   MyDreaming,
   type DreamingConfig,
   type DreamingSettings,
+  type SaveYouthDreamingRequest,
   MemoryPrefs,
   MemoryProposal,
   type MemoryApplyMode,
@@ -925,8 +926,8 @@ export const dreaming = {
 export const adminDreaming = {
   get: async () => DreamingAdmin.parse(await call("GET", "/api/admin/dreaming")),
   save: async (c: DreamingConfig) => DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
-  /** A youth account's settings (the admin's to set). */
-  setUser: async (id: string, s: DreamingSettings) =>
+  /** A youth account's settings, 반영 방식 and (write-only) prompt — the admin's to set. */
+  setUser: async (id: string, s: SaveYouthDreamingRequest) =>
     DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, s)),
   /** "지금 실행" — the FakeRuntime server only (development, e2e). */
   runNow: async (id: string) =>

@@ -5,6 +5,7 @@ import {
   SaveDreamingConfigRequest,
   SaveDreamingPromptRequest,
   SaveDreamingSettingsRequest,
+  SaveYouthDreamingRequest,
   type DreamingAdmin,
   type DreamingCandidate,
   type DreamingConnectionChoice,
@@ -167,6 +168,9 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
     if (r.data.content !== undefined && holdsSecret(r.data.content))
       return send(reply, { error: "dreaming_secret" }, 400);
+    // The server-wide switch applies to 미리 실행 too (the user's own switch does not); the runner checks again.
+    if (!store.config().enabled) return send(reply, { error: "dreaming_server_off" }, 409);
+    // In a run slot shared with the schedule (at most 2 at once, one per user): none free → 409, nothing ran.
     const out = await runner.run({
       userId: user.id,
       date: dreamingDate(now()),
@@ -203,6 +207,7 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
       enabled: settings.enabled,
       settings,
       customPrompt: store.promptOf(u.id).custom,
+      applyMode: u.youth ? proposals.mode(u.id) : null,
       problem: problemOf(u.id, settings),
       time: st.time,
       today: st.today,
@@ -260,19 +265,32 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     return send(reply, adminView());
   });
 
-  /** A youth account's settings — the admin's to set (#188); everyone else sets their own. */
+  /**
+   * A youth account's settings — the admin's to set (#188); everyone else sets their own. Also its 반영 방식 and its
+   * prompt (write-only: the response says only whether it is the default).
+   */
   app.put<{ Params: { id: string } }>(
     "/api/admin/dreaming/users/:id",
     { config: ADMIN },
     async (req, reply) => {
-      const r = SaveDreamingSettingsRequest.safeParse(req.body);
+      const r = SaveYouthDreamingRequest.safeParse(req.body);
       if (!r.success) return send(reply, { error: "invalid_request" }, 400);
       const u = users.byId(req.params.id);
       if (!u) return send(reply, { error: "not_found" }, 404);
       if (!u.youth) return send(reply, { error: "dreaming_not_youth" }, 403);
-      const bad = checkSettings(u.id, r.data);
+      const { applyMode, prompt, ...given } = r.data;
+      // Only what was sent changes (a 반영 방식 or a prompt alone keeps the settings as stored).
+      const settings: DreamingSettings = {
+        ...store.settingsOf(u.id),
+        ...Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined)),
+      };
+      const bad = Object.keys(given).length ? checkSettings(u.id, settings) : null;
       if (bad) return send(reply, { error: bad }, 400);
-      store.setSettings(u.id, r.data);
+      if (prompt !== undefined && prompt !== null && holdsSecret(prompt))
+        return send(reply, { error: "dreaming_secret" }, 400);
+      store.setSettings(u.id, settings);
+      if (prompt !== undefined) store.setPrompt(u.id, prompt);
+      if (applyMode) proposals.setMode(u.id, applyMode);
       engine.kick();
       return send(reply, statusOf(u));
     },

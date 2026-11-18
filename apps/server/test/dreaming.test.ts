@@ -991,6 +991,140 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect((await s.mine()).problem).toBe("unavailable");
   });
 
+  it("youth (review 1): 반영 방식 locked too; the admin sets its 반영 방식 and prompt (write-only)", async () => {
+    const s = await start();
+    const son = s.uid("owner");
+    s.app.users!.setYouth(son, true);
+    expect((await s.req("owner", "GET", "/api/memory-prefs")).json()).toEqual({
+      applyMode: "review",
+      locked: true,
+    });
+    const put = await s.req("owner", "PUT", "/api/memory-prefs", { applyMode: "auto" });
+    expect(put.statusCode).toBe(403);
+    expect(put.json()).toEqual({ error: "dreaming_youth_locked" });
+    expect(s.app.memoryProposals!.mode(son)).toBe("review");
+    // Members are not locked.
+    expect((await s.req("shared", "GET", "/api/memory-prefs")).json()).toEqual({ applyMode: "review" });
+    // The admin: 반영 방식 and a prompt for the youth account — the response never carries the prompt's text.
+    const body = {
+      ...s.d.store.settingsOf(son),
+      applyMode: "auto",
+      prompt: "학교 이야기만 골라 주세요 마커-9182",
+    };
+    const r = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, body);
+    expect(r.statusCode, r.body).toBe(200);
+    expect(r.body).not.toContain("마커-9182");
+    expect(r.json()).toMatchObject({ applyMode: "auto", customPrompt: true });
+    expect(s.app.memoryProposals!.mode(son)).toBe("auto");
+    expect((await s.mine()).prompt).toMatchObject({
+      custom: true,
+      content: "학교 이야기만 골라 주세요 마커-9182",
+    });
+    const view = await s.req("admin", "GET", "/api/admin/dreaming");
+    expect(view.body).not.toContain("마커-9182");
+    const secret = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, {
+      ...s.d.store.settingsOf(son),
+      prompt: `sk-ant-api03-${"y".repeat(40)}`,
+    });
+    expect(secret.json()).toEqual({ error: "dreaming_secret" });
+    // A prompt alone: the settings stay as stored.
+    s.d.store.setSettings(son, { ...s.d.store.settingsOf(son), time: "05:10" });
+    const reset = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, { prompt: null });
+    expect(s.d.store.settingsOf(son).time).toBe("05:10");
+    expect(reset.json()).toMatchObject({ customPrompt: false, applyMode: "auto" });
+    // Others' rows show no 반영 방식 (their own setting).
+    expect(
+      DreamingAdmin.parse(view.json()).users.find((u) => u.userId === s.uid("shared"))!.applyMode,
+    ).toBeNull();
+  });
+
+  it("미리 실행 (review 1): the server-wide switch applies; slots are shared with the schedule, one per user", async () => {
+    const s = await start();
+    s.t.answer = s.addEach;
+    for (const who of ["owner", "shared", "admin"] as const) s.say(`기억: ${who} 것`, { who });
+    // Server-wide off: refused, and the runner refuses too (recorded, no model call).
+    s.d.store.setConfig({ ...s.d.store.config(), enabled: false });
+    const off = await s.req("shared", "POST", "/api/dreaming/preview", {});
+    expect(off.statusCode).toBe(409);
+    expect(off.json()).toEqual({ error: "dreaming_server_off" });
+    const direct = await s.d.runner.run({
+      userId: s.uid("shared"),
+      date: dreamingDate(s.t.clock),
+      attempt: 0,
+      trigger: "preview",
+      idemKey: "preview-off",
+      preview: {},
+    });
+    expect(direct).toMatchObject({ status: "skipped", code: "paused" });
+    expect(s.t.requests).toHaveLength(0);
+    s.d.store.setConfig({ ...s.d.store.config(), enabled: true });
+    // The same user four times at once: one runs, the others are refused (nothing ran for them).
+    s.t.delayMs = 150;
+    const four = await Promise.all(
+      [1, 2, 3, 4].map(() => s.req("shared", "POST", "/api/dreaming/preview", {})),
+    );
+    expect(four.map((r) => r.statusCode).sort()).toEqual([200, 409, 409, 409]);
+    expect(s.t.requests).toHaveLength(1);
+    // Two previews hold both slots: the owner's round at its time waits; a new time re-plans it (it never started).
+    s.alone("owner");
+    s.t.clock = T0 - MIN; // before the owner's time
+    s.d.engine.start();
+    s.t.clock = T0 + 10_000;
+    s.t.delayMs = 400;
+    const held = [
+      s.req("shared", "POST", "/api/dreaming/preview", {}),
+      s.req("admin", "POST", "/api/dreaming/preview", {}),
+    ];
+    // Both previews are with the model (it takes a while to answer).
+    await expect.poll(() => s.t.requests.length).toBe(3);
+    s.d.engine.tick();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toMatchObject({ state: "waiting", attempts: 0 });
+    const moved = await s.req("owner", "PUT", "/api/dreaming/settings", {
+      ...s.d.store.settingsOf(s.uid("owner")),
+      time: "04:00",
+    });
+    expect(moved.statusCode, moved.body).toBe(200);
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toBeUndefined();
+    expect((await Promise.all(held)).map((r) => r.statusCode)).toEqual([200, 200]);
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toBeUndefined();
+    // At 04:00 it runs — once, as the regular round of the new time.
+    s.t.delayMs = 0;
+    s.t.clock = T0 + 60 * MIN + 5000;
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toMatchObject({
+      state: "done",
+      trigger: "regular",
+      scheduled_at: T0 + 60 * MIN,
+    });
+    expect(s.d.store.runsOf(s.uid("owner")).filter((r) => r.trigger === "regular")).toHaveLength(1);
+  });
+
+  it("a slot freed by 미리 실행 starts the round that waited for it", async () => {
+    const s = await start();
+    for (const who of ["owner", "shared", "admin"] as const) s.say(`기억: ${who} 것`, { who });
+    s.alone("owner");
+    s.t.clock = T0 - MIN; // before the owner's time
+    s.d.engine.start();
+    s.t.delayMs = 300;
+    const held = [
+      s.req("shared", "POST", "/api/dreaming/preview", {}),
+      s.req("admin", "POST", "/api/dreaming/preview", {}),
+    ];
+    await expect.poll(() => s.t.requests.length).toBe(2);
+    s.t.clock = T0 + 10_000;
+    s.d.engine.tick();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))!.state).toBe("waiting");
+    await Promise.all(held);
+    // The release kicked the schedule (no tick by hand): the round starts as soon as a slot is free.
+    await expect
+      .poll(() => s.d.store.day(s.uid("owner"), dreamingDate(T0))!.state, { timeout: 3000 })
+      .toBe("done");
+    expect(s.d.store.lastRun(s.uid("owner"))!.trigger).toBe("regular");
+  });
+
   it("youth: reads its settings but cannot change them; the admin sets them; members only their own", async () => {
     const s = await start();
     const son = s.uid("owner");

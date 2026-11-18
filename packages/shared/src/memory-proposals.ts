@@ -16,7 +16,8 @@ export const MEMORY_APPLY_MODE_LABEL: Record<MemoryApplyMode, string> = {
   review: "검토 후 반영",
   auto: "자동 반영 + 알림",
 };
-export const MemoryPrefs = z.object({ applyMode: MemoryApplyMode });
+/** `locked`: a youth account — only the admin changes it (#188, sent only when true). */
+export const MemoryPrefs = z.object({ applyMode: MemoryApplyMode, locked: z.literal(true).optional() });
 export type MemoryPrefs = z.infer<typeof MemoryPrefs>;
 export const SaveMemoryPrefsRequest = z.object({ applyMode: MemoryApplyMode }).strict();
 

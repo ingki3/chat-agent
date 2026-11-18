@@ -128,6 +128,24 @@ describe("migration 0033 (기억 정리 per user)", () => {
          values ('r1', 'u1', '2026-11-17', 1, 'dreaming:u1:2026-11-17:1', 'regular', 'unchanged', null, '{}', 'codex', 'm', 'c9', 1, 1, 2)`,
       )
       .run();
+    // A queue entry and the day's rounds (a waiting retry, a finished one) of before.
+    sql.prepare("insert into conversations (id, owner_id, title) values ('c1', 'u1', 't')").run();
+    sql
+      .prepare(
+        "insert into messages (id, conversation_id, seq, role, parts, revision, created_at) values ('m1', 'c1', 1, 'user', '[]', 1, 5)",
+      )
+      .run();
+    sql
+      .prepare(
+        "insert into dreaming_queue (user_id, message_id, doc, added_at) values ('u1', 'm1', 'memory', 6)",
+      )
+      .run();
+    sql
+      .prepare(
+        `insert into dreaming_days (user_id, date, state, trigger, scheduled_at, next_at, deferrals, attempts, updated_at)
+         values ('u1', '2026-11-17', 'waiting', 'regular', 10, 20, 0, 1, 1), ('u2', '2026-11-17', 'done', 'regular', 10, 10, 2, 1, 1)`,
+      )
+      .run();
     migrate(db, { migrationsFolder: MIGRATIONS_DIR });
     return sql;
   };
@@ -161,7 +179,18 @@ describe("migration 0033 (기억 정리 per user)", () => {
       tokenCap: 123_000,
       allowed: [{ runtime: "codex", connectionId: "c9", model: "m" }],
     });
-    // Unchanged: the run record, the prompt versions; new notification preference on by default.
+    // Unchanged: the queue, the day's rounds, the run record, the prompt versions; a new notification preference.
+    expect(sql.prepare("select user_id, message_id, doc, added_at from dreaming_queue").all()).toEqual([
+      { user_id: "u1", message_id: "m1", doc: "memory", added_at: 6 },
+    ]);
+    expect(
+      sql
+        .prepare("select user_id, state, next_at, deferrals, attempts from dreaming_days order by user_id")
+        .all(),
+    ).toEqual([
+      { user_id: "u1", state: "waiting", next_at: 20, deferrals: 0, attempts: 1 },
+      { user_id: "u2", state: "done", next_at: 10, deferrals: 2, attempts: 1 },
+    ]);
     expect(sql.prepare("select id, prompt_version, connection_id from dreaming_runs").all()).toEqual([
       { id: "r1", prompt_version: 1, connection_id: "c9" },
     ]);

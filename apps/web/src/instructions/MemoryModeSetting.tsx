@@ -26,8 +26,13 @@ export function MemoryModeSetting() {
   const mode = picked ?? q.data?.applyMode;
   return (
     <section className="panel memory-mode" data-testid="memory-mode">
-      <fieldset disabled={!q.data} aria-busy={save.isPending}>
+      <fieldset disabled={!q.data || q.data.locked} aria-busy={save.isPending}>
         <legend>기억 반영 방식</legend>
+        {q.data?.locked && (
+          <p className="small muted" data-testid="memory-mode-locked">
+            청소년 계정은 관리자만 바꿀 수 있어요.
+          </p>
+        )}
         {MemoryApplyMode.options.map((m) => (
           <label key={m}>
             <input

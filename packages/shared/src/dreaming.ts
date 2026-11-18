@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MemoryListKind, MemoryProposal } from "./memory-proposals.js";
+import { MemoryApplyMode, MemoryListKind, MemoryProposal } from "./memory-proposals.js";
 import { ClockTime } from "./notifications.js";
 import { RuntimeId } from "./runtime.js";
 
@@ -60,6 +60,17 @@ export const DreamingSettings = z.object({
 });
 export type DreamingSettings = z.infer<typeof DreamingSettings>;
 export const SaveDreamingSettingsRequest = DreamingSettings.strict();
+/**
+ * The admin's for a youth account (#188): any of its settings (the rest stay as stored), its 반영 방식 and its prompt —
+ * write-only (null = the default; the admin's view never returns a prompt's text).
+ */
+export const SaveYouthDreamingRequest = DreamingSettings.partial()
+  .extend({
+    applyMode: MemoryApplyMode.optional(),
+    prompt: z.string().max(DREAMING_PROMPT_MAX).nullable().optional(),
+  })
+  .strict();
+export type SaveYouthDreamingRequest = z.infer<typeof SaveYouthDreamingRequest>;
 
 /** The user's own cleanup prompt; `null` = 기본값으로 되돌리기 (the default prompt). */
 export const SaveDreamingPromptRequest = z
@@ -231,6 +242,8 @@ export const DreamingUserStatus = z.object({
   settings: DreamingSettings,
   /** The user wrote their own prompt (its text is theirs — not shown). */
   customPrompt: z.boolean(),
+  /** A youth account's 반영 방식 (the admin sets it); null for everyone else (their own setting). */
+  applyMode: MemoryApplyMode.nullable(),
   problem: DreamingProblem.nullable(),
   /** Start time of the user's round (HH:MM) when it runs. */
   time: z.string().nullable(),
@@ -295,5 +308,6 @@ export const DREAMING_ERRORS = {
   dreaming_youth_locked: "청소년 계정의 기억 정리 설정은 관리자만 바꿀 수 있어요.",
   dreaming_not_youth: "이 사용자의 기억 정리 설정은 본인이 정해요(관리자는 청소년 계정만 바꿀 수 있어요).",
   dreaming_secret: "비밀 값(키·비밀번호 같은 것)은 프롬프트에 적을 수 없어요.",
-  dreaming_busy: "기억 정리가 이미 실행 중이에요.",
+  dreaming_busy: "기억 정리가 이미 실행 중이거나 실행할 자리가 없어요. 잠시 뒤 다시 해 주세요.",
+  dreaming_server_off: "관리자가 서버 전체에서 기억 정리를 꺼 두었어요.",
 } as const;

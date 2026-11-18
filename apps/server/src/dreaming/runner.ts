@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import {
+  DREAMING_CONCURRENCY,
   utf8Bytes,
   type DreamingChoice,
   type DreamingCounts,
@@ -106,6 +107,12 @@ class Gone extends Error {}
 
 export class DreamingRunner {
   private readonly now: () => number;
+  /**
+   * The run slots (#188 review 1): every attempt that may ask the model — a scheduled round, 지금 실행, 미리 실행 —
+   * takes one, at most `DREAMING_CONCURRENCY` at once and one per user; released however it ends.
+   */
+  private readonly inFlight = new Set<string>();
+  private readonly released: (() => void)[] = [];
 
   constructor(private readonly deps: DreamingRunnerDeps) {
     this.now = deps.now ?? Date.now;
@@ -139,7 +146,34 @@ export class DreamingRunner {
     return null;
   }
 
+  /** Whether an attempt of this user can start now (a free slot, none of theirs running). */
+  canStart(userId: string): boolean {
+    return this.inFlight.size < DREAMING_CONCURRENCY && !this.inFlight.has(userId);
+  }
+
+  /** Called whenever a slot is released (the schedule looks again at what waits for one). */
+  onRelease(fn: () => void): void {
+    this.released.push(fn);
+  }
+
+  /**
+   * One attempt, in a run slot: undefined when none is free (or the user has one running), or when the attempt's
+   * idempotency key was used already — nothing ran. A skip (`req.skip`) asks no model and takes no slot.
+   */
   async run(req: RunRequest): Promise<RunResult | undefined> {
+    if (req.skip) return this.runInSlot(req);
+    // Taken synchronously (before any await): a check and a start never interleave with another caller's.
+    if (!this.canStart(req.userId)) return undefined;
+    this.inFlight.add(req.userId);
+    try {
+      return await this.runInSlot(req);
+    } finally {
+      this.inFlight.delete(req.userId);
+      for (const f of this.released) f();
+    }
+  }
+
+  private async runInSlot(req: RunRequest): Promise<RunResult | undefined> {
     const { store } = this.deps;
     const cfg = store.settingsOf(req.userId);
     const runId = crypto.randomUUID();
@@ -212,6 +246,11 @@ export class DreamingRunner {
     if (!user?.active) {
       if (!store.finishRun(runId, "skipped", "inactive", counts)) throw new Gone();
       return end("skipped", "inactive");
+    }
+    // The server-wide switch applies to 미리 실행 too (#188 review 1); the user's own switch does not.
+    if (preview && !store.config().enabled) {
+      if (!store.finishRun(runId, "skipped", "paused", counts)) throw new Gone();
+      return end("skipped", "paused");
     }
     // Turned off (for everyone or this user) since the round was planned: nothing runs (review #160 round 1).
     if (!preview && !store.switchedOn(req.userId)) {

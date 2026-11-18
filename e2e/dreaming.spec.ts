@@ -191,6 +191,9 @@ test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결�
   await expect(page.getByTestId("dreaming-locked")).toBeVisible();
   await expect(settings.getByRole("checkbox", { name: "기억 정리 켜기" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "프롬프트 저장" })).toHaveCount(0);
+  // 반영 방식 too: read-only.
+  await expect(page.getByTestId("memory-mode-locked")).toBeVisible();
+  await expect(page.getByRole("radio", { name: /자동 반영/ })).toBeDisabled();
   const time = laterToday();
   await asAdmin(browser, baseURL!, async (admin) => {
     await admin.goto("/admin?tab=dreaming");
@@ -203,8 +206,20 @@ test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결�
     await row.getByRole("button", { name: "저장", exact: true }).click();
     await expect(row.getByRole("checkbox", { name: `${son.name} 기억 정리 켜기` })).toBeChecked();
     await expect(row).not.toContainText("연결·모델을 골라야");
+    // 반영 방식 and a prompt for the son (write-only).
+    await row.getByRole("combobox", { name: `${son.name} 반영 방식` }).selectOption("auto");
+    await expect(row.getByRole("combobox", { name: `${son.name} 반영 방식` })).toHaveValue("auto");
+    await row
+      .getByRole("textbox", { name: `${son.name} 정리 프롬프트 새로 쓰기` })
+      .fill("학교 이야기만 골라 주세요");
+    await row.getByRole("button", { name: "프롬프트 저장" }).click();
+    await expect(row).toContainText("정리 프롬프트: 관리자가 새로 씀");
+    await expect(row).not.toContainText("학교 이야기만 골라 주세요");
   });
   await page.reload();
   await expect(page.getByTestId("dreaming-state")).toContainText(`기억 정리가 매일 ${time}`);
   await expect(settings.getByRole("checkbox", { name: "기억 정리 켜기" })).toBeChecked();
+  await expect(page.getByRole("radio", { name: /자동 반영/ })).toBeChecked();
+  await page.getByText(/지금 쓰는 정리 프롬프트/).click();
+  await expect(page.getByTestId("dreaming-prompt")).toHaveValue("학교 이야기만 골라 주세요");
 });
