@@ -667,5 +667,7 @@ describe("#186 review 6차: the link's citation, sheets by number", () => {
     expect(viewProblem(1, null, "c2", "c1")).toBe("refused");
     expect(viewProblem(1, null, "c1", "c1")).toBeNull();
     expect(viewProblem(0, null, undefined, "c1")).toBeNull();
+    // A `loc` given but not a locator (8차): a broken link.
+    expect(viewProblem(0, null, undefined, "c1", true)).toBe("invalid");
   });
 });

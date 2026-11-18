@@ -60,8 +60,10 @@ export function viewProblem(
   error: unknown,
   fileConversationId: string | undefined,
   conversationId: string,
+  /** A `loc` was given but is not a locator (review #186 8차): a broken link too. */
+  badLoc = false,
 ): "invalid" | "refused" | null {
-  if (cites > 1 || (error instanceof ApiError && error.status === 400)) return "invalid";
+  if (badLoc || cites > 1 || (error instanceof ApiError && error.status === 400)) return "invalid";
   if (error instanceof ApiError && [403, 404].includes(error.status)) return "refused";
   return fileConversationId !== undefined && fileConversationId !== conversationId ? "refused" : null;
 }
@@ -92,7 +94,13 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
     else void navigate(`/c/${encodeURIComponent(conversationId)}`);
   };
   const first = view.data;
-  const problem = viewProblem(cites.length, view.error, first?.file.conversationId, conversationId);
+  const problem = viewProblem(
+    cites.length,
+    view.error,
+    first?.file.conversationId,
+    conversationId,
+    params.get("loc") !== null && !loc,
+  );
   const bar = (title: ReactNode, file?: UploadedFile) => (
     <TopBar title={title}>
       <button type="button" className="small ghost" onClick={back} data-testid="file-view-back">

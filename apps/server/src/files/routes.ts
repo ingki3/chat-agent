@@ -383,8 +383,9 @@ export function registerFileRoutes(
         const cited =
           cite === undefined
             ? []
-            : store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
-                if (c.id !== cite || (p && !p.citations.has(c.id))) return [];
+            : store.verifiedCitations(f.conversationId, f.id, cite).flatMap((c) => {
+                // A shared viewer: only a citation of their projection.
+                if (p && !p.citations.has(c.id)) return [];
                 try {
                   const raw = JSON.parse(c.locator) as {
                     textHash?: unknown;

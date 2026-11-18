@@ -4237,4 +4237,39 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     // An id the caller has no such citation for: a unit, never exact.
     expect(((await at("&cite=nope")).json() as { target: { status: string } }).target.status).toBe("unit");
   }, 30_000);
+
+  it("[P3 8차] the viewer reads the link's own row only, and a line citation whose stored passage is no longer found in the unit is not exact", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.line8 = "여덟째 검토의 한 줄 문장입니다";
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "line8.txt",
+      Buffer.from("여덟째 검토의 한 줄 문장입니다.\n다음 줄.\n"),
+    );
+    await app.fileExtracts!.idle();
+    const a = (await send(f.cookies.owner, c.id, `/cite ${file.id} line8`, undefined, [file.id])).note!
+      .citations[0]!;
+    const b = (await send(f.cookies.owner, c.id, `/cite ${file.id} line8`)).note!.citations[0]!;
+    expect(a.citationId).not.toBe(b.citationId);
+    // Only the asked row comes back from the store.
+    expect(app.files!.verifiedCitations(c.id, file.id, a.citationId!).map((r) => r.id)).toEqual([
+      a.citationId,
+    ]);
+    expect(app.files!.verifiedCitations(c.id, file.id, "nope")).toEqual([]);
+    expect((await viewAt(app, f.cookies.owner, file.id, a.locator!, a.citationId)).target?.status).toBe(
+      "exact",
+    );
+    // The row's stored passage masked since (the unit itself unchanged): not found there any more — not exact.
+    db.$client
+      .prepare("UPDATE citations SET snippet = ? WHERE id = ?")
+      .run("여덟째 검토의 [숨김] 문장입니다", a.citationId);
+    const t = (await viewAt(app, f.cookies.owner, file.id, a.locator!, a.citationId)).target!;
+    expect([t.status, t.start]).toEqual(["unit", undefined]);
+    // The other row (untouched) still is.
+    expect((await viewAt(app, f.cookies.owner, file.id, b.locator!, b.citationId)).target?.status).toBe(
+      "exact",
+    );
+  }, 30_000);
 });

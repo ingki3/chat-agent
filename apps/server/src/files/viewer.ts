@@ -236,15 +236,15 @@ export function resolveTarget(
     // hash (older rows). A link naming no citation is never exact.
     const holds = (c: CitedPassage) =>
       c.unitHash ? c.unitHash === now : c.quote === at && c.textHash === before;
-    if (!mine || key(mine.locator) !== k || !holds(mine)) {
+    // A line citation with a unit hash: its whole passage found in the (unchanged) unit again shows whether it goes on
+    // past the line it is placed on (#186 review 6·7차 — no stored flag); not found (e.g. the stored passage masked
+    // since) → not claimed (8차).
+    const found =
+      mine?.unitHash && loc.kind === "line" ? findSnippetAt(only!.text, mine.snippet ?? "") : undefined;
+    if (!mine || key(mine.locator) !== k || !holds(mine) || (found && !found.found)) {
       reasons.add("unverified");
       range = undefined;
-    } else if (mine.snippet) {
-      // The unit is byte for byte the one verified: the passage found in it again shows whether it goes on past the
-      // line it is placed on (#186 review 6·7차 — no stored flag).
-      const m = loc.kind === "line" ? findSnippetAt(only!.text, mine.snippet) : undefined;
-      if (m?.found && only!.text.slice(m.start, m.end).includes("\n")) start = true;
-    }
+    } else if (found?.found && only!.text.slice(found.start, found.end).includes("\n")) start = true;
   }
   if (range && only) {
     const over = only.marks.filter(
