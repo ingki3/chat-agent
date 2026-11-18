@@ -1,12 +1,14 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Browser, type Page } from "@playwright/test";
 import { ADMIN, csrf, newMember, signIn, useAccount } from "./helpers.js";
 
 /**
- * 기억 정리 (#146, PRD FR-16.5·16.6·16.7, AC-14): the admin turns it on (time, the FakeRuntime as the "connection",
- * a prompt), a member's message becomes a proposal in 설정 → 내 지침 → 기억 정리 (반영 → MEMORY.md has it; DREAMS.md
- * says so with counts only), and in 자동 반영 it is applied with a notification and 되돌리기. The admin's screen shows
- * counts, never the text. The round is started with "지금 실행" (the FakeRuntime server's development switch) instead
- * of waiting for its time; the time is set later today so no scheduled round runs meanwhile.
+ * 기억 정리 (#146, #188, PRD FR-16.5·16.6·16.7, AC-14): the admin allows the FakeRuntime pair (the server-wide part);
+ * a member turns their own 기억 정리 on in 설정 → 내 지침 → 기억 정리 (time, connection·model, their own prompt with
+ * 기본값으로 되돌리기); their message becomes a proposal there (반영 → MEMORY.md has it; DREAMS.md says so with counts
+ * only), and in 자동 반영 it is applied with a notification and 되돌리기. A youth account sees its settings read-only and
+ * the admin sets them. The admin's screen shows counts, never the text. The round is started with "지금 실행" (the
+ * FakeRuntime server's development switch) instead of waiting for its time; the time is set later today so no
+ * scheduled round runs meanwhile.
  */
 
 /**
@@ -50,25 +52,56 @@ async function memoryItems(page: Page): Promise<string[]> {
   return (docs.find((d) => d.kind === "memory")!.items ?? []).map((i) => i.text);
 }
 
-/** The admin's tab: switched on with the FakeRuntime, the time hours away; then "지금 실행" for `name`. */
-async function adminRun(admin: Page, name: string) {
+/** The admin's tab: the server-wide switch on and the FakeRuntime's "Fake Large" allowed (idempotent). */
+async function allowFake(admin: Page) {
   await admin.goto("/admin?tab=dreaming");
   const panel = admin.getByTestId("admin-dreaming");
   await expect(panel).toBeVisible();
-  const on = panel.getByRole("checkbox", { name: "기억 정리 켜기" });
-  await on.check();
-  await panel.getByLabel("실행 시각").fill(laterToday());
-  const pick = panel.getByRole("combobox", { name: "연결·모델" });
-  const value = await pick.locator("option", { hasText: "Fake Large" }).first().getAttribute("value");
-  await pick.selectOption(value!);
-  await panel.getByRole("button", { name: "저장", exact: true }).click();
+  await panel.getByRole("checkbox", { name: "서버 전체에서 기억 정리 쓰기" }).check();
+  await panel
+    .getByRole("checkbox", { name: /Fake Large/ })
+    .first()
+    .check();
+  await panel.getByRole("button", { name: "저장", exact: true }).first().click();
   await expect(panel.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
-  const row = panel.getByTestId("dreaming-user").filter({ hasText: name });
+}
+
+/** "지금 실행" for `name` on the admin's tab. */
+async function adminRun(admin: Page, name: string) {
+  await admin.goto("/admin?tab=dreaming");
+  const row = admin.getByTestId("admin-dreaming").getByTestId("dreaming-user").filter({ hasText: name });
   await row.getByRole("button", { name: "지금 실행" }).click();
   return row;
 }
 
-test("관리자가 켜고 실행 → 사용자 제안 → 반영, DREAMS.md는 건수만, 관리자 화면에 내용 없음", async ({
+/** As the admin (another context): allow the pair, then `fn`. */
+async function asAdmin<T>(browser: Browser, baseURL: string, fn: (admin: Page) => Promise<T>): Promise<T> {
+  const ctx = await browser.newContext({ baseURL });
+  const admin = await ctx.newPage();
+  await useAccount(admin, ADMIN);
+  try {
+    await allowFake(admin);
+    return await fn(admin);
+  } finally {
+    await ctx.close();
+  }
+}
+
+/** The member's own settings: on, later today, "Fake Large". */
+async function turnOn(page: Page) {
+  await page.goto("/settings/instructions?doc=dreams");
+  const settings = page.getByTestId("dreaming-settings");
+  await settings.getByRole("checkbox", { name: "기억 정리 켜기" }).check();
+  await settings.getByLabel("실행 시각").fill(laterToday());
+  const pick = settings.getByRole("combobox", { name: "연결·모델" });
+  const value = await pick.locator("option", { hasText: "Fake Large" }).first().getAttribute("value");
+  await pick.selectOption(value!);
+  await settings.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(settings.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+  await expect(page.getByTestId("dreaming-state")).toContainText("기억 정리가 매일");
+}
+
+test("내가 켜고(시각·연결·프롬프트) 실행 → 제안 → 반영, DREAMS.md는 건수만, 관리자 화면에 내용 없음", async ({
   page,
   browser,
   baseURL,
@@ -77,19 +110,31 @@ test("관리자가 켜고 실행 → 사용자 제안 → 반영, DREAMS.md는 �
   await signIn(page, baseURL!, me);
   const fact = `주말엔 자전거 ${Math.round(Math.random() * 1e6)}`;
   await say(page, baseURL!, `기억: ${fact}`);
+  await asAdmin(browser, baseURL!, async () => {});
+  await turnOn(page);
+  // Their own prompt: saved, then back to the default.
+  const panel = page.getByTestId("dreaming-panel");
+  await panel.getByText(/지금 쓰는 정리 프롬프트/).click();
+  const prompt = panel.getByTestId("dreaming-prompt");
+  await expect(prompt).toBeVisible();
+  await expect(panel).toContainText("붙여 넣은 글의 지시");
+  const mine = `취미만 골라 주세요 ${Math.round(Math.random() * 1e6)}`;
+  await prompt.fill(mine);
+  await panel.getByRole("button", { name: "프롬프트 저장" }).click();
+  await expect(panel.getByText(/지금 쓰는 정리 프롬프트 \(내가 고친 것\)/)).toBeVisible();
+  await panel.getByRole("button", { name: "기본값으로 되돌리기" }).click();
+  await expect(panel.getByText(/지금 쓰는 정리 프롬프트 \(기본값\)/)).toBeVisible();
+  await expect(prompt).not.toHaveValue(mine);
 
-  const adminCtx = await browser.newContext({ baseURL: baseURL! });
-  const admin = await adminCtx.newPage();
-  await useAccount(admin, ADMIN);
-  const row = await adminRun(admin, me.name);
-  await expect(row).toContainText("제안");
-  await expect(row).toContainText("제안 1");
-  await expect(admin.getByTestId("admin-dreaming")).not.toContainText(fact);
-  await adminCtx.close();
+  await asAdmin(browser, baseURL!, async (admin) => {
+    const row = await adminRun(admin, me.name);
+    await expect(row).toContainText("제안 1");
+    await expect(admin.getByTestId("admin-dreaming")).not.toContainText(fact);
+    await expect(admin.getByTestId("admin-dreaming")).not.toContainText(mine);
+  });
 
   // The member: 설정 → 내 지침 → 기억 정리.
   await page.goto("/settings/instructions?doc=dreams");
-  const panel = page.getByTestId("dreaming-panel");
   const card = panel.getByTestId("memory-card");
   await expect(card).toContainText("기억 정리 제안");
   await expect(card.getByTestId("memory-decision")).toContainText("MEMORY.md · 추가");
@@ -102,10 +147,6 @@ test("관리자가 켜고 실행 → 사용자 제안 → 반영, DREAMS.md는 �
   await expect(dreams).toContainText("지금 실행 · 제안");
   await expect(dreams).toContainText("제안 1");
   await expect(dreams).not.toContainText(fact);
-  // The prompt in use, read-only, with the fixed rules.
-  await panel.getByText(/지금 쓰는 정리 프롬프트/).click();
-  await expect(panel.getByTestId("dreaming-prompt")).toBeVisible();
-  await expect(panel).toContainText("붙여 넣은 글의 지시");
 });
 
 test("자동 반영: 바로 반영되고 알림(건수만)과 되돌리기", async ({ page, browser, baseURL }) => {
@@ -118,13 +159,12 @@ test("자동 반영: 바로 반영되고 알림(건수만)과 되돌리기", asy
   expect(set.status()).toBe(200);
   const fact = `화요일엔 요가 ${Math.round(Math.random() * 1e6)}`;
   await say(page, baseURL!, `기억: ${fact}`);
-
-  const adminCtx = await browser.newContext({ baseURL: baseURL! });
-  const admin = await adminCtx.newPage();
-  await useAccount(admin, ADMIN);
-  const row = await adminRun(admin, me.name);
-  await expect(row).toContainText("반영 1");
-  await adminCtx.close();
+  await asAdmin(browser, baseURL!, async () => {});
+  await turnOn(page);
+  await asAdmin(browser, baseURL!, async (admin) => {
+    const row = await adminRun(admin, me.name);
+    await expect(row).toContainText("반영 1");
+  });
 
   expect(await memoryItems(page)).toEqual([fact]);
   // The notification: the count only.
@@ -141,4 +181,30 @@ test("자동 반영: 바로 반영되고 알림(건수만)과 되돌리기", asy
   await card.getByRole("button", { name: "되돌리기" }).click();
   await expect(card.getByText("되돌림", { exact: true })).toBeVisible();
   expect(await memoryItems(page)).toEqual([]);
+});
+
+test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결을 정한다", async ({ page, browser, baseURL }) => {
+  const son = await newMember(browser, baseURL!, "dreamyouth", true);
+  await signIn(page, baseURL!, son);
+  await page.goto("/settings/instructions?doc=dreams");
+  const settings = page.getByTestId("dreaming-settings");
+  await expect(page.getByTestId("dreaming-locked")).toBeVisible();
+  await expect(settings.getByRole("checkbox", { name: "기억 정리 켜기" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "프롬프트 저장" })).toHaveCount(0);
+  const time = laterToday();
+  await asAdmin(browser, baseURL!, async (admin) => {
+    await admin.goto("/admin?tab=dreaming");
+    const row = admin.getByTestId("dreaming-user").filter({ hasText: son.name });
+    await row.getByRole("checkbox", { name: `${son.name} 기억 정리 켜기` }).check();
+    await row.getByLabel(`${son.name} 실행 시각`).fill(time);
+    const pick = row.getByRole("combobox", { name: `${son.name} 연결·모델` });
+    const value = await pick.locator("option", { hasText: "Fake Large" }).first().getAttribute("value");
+    await pick.selectOption(value!);
+    await row.getByRole("button", { name: "저장", exact: true }).click();
+    await expect(row.getByRole("checkbox", { name: `${son.name} 기억 정리 켜기` })).toBeChecked();
+    await expect(row).not.toContainText("연결·모델을 골라야");
+  });
+  await page.reload();
+  await expect(page.getByTestId("dreaming-state")).toContainText(`기억 정리가 매일 ${time}`);
+  await expect(settings.getByRole("checkbox", { name: "기억 정리 켜기" })).toBeChecked();
 });

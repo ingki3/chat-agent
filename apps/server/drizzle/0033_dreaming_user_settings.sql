@@ -1,0 +1,10 @@
+ALTER TABLE `dreaming_users` ADD `time` text DEFAULT '03:00' NOT NULL;--> statement-breakpoint
+ALTER TABLE `dreaming_users` ADD `runtime` text;--> statement-breakpoint
+ALTER TABLE `dreaming_users` ADD `connection_id` text;--> statement-breakpoint
+ALTER TABLE `dreaming_users` ADD `model` text;--> statement-breakpoint
+ALTER TABLE `dreaming_users` ADD `prompt` text;--> statement-breakpoint
+ALTER TABLE `dreaming_users` ADD `prompt_updated_at` integer;--> statement-breakpoint
+ALTER TABLE `notification_prefs` ADD `memory_failed` integer DEFAULT true NOT NULL;--> statement-breakpoint
+INSERT OR IGNORE INTO `dreaming_users` (`user_id`, `enabled`, `checkpoint`, `updated_at`) SELECT `id`, 1, 0, CAST(strftime('%s', 'now') AS INTEGER) * 1000 FROM `users`;--> statement-breakpoint
+UPDATE `dreaming_users` SET `enabled` = CASE WHEN `enabled` = 1 AND coalesce((SELECT json_extract(`value`, '$.enabled') FROM `settings` WHERE `key` = 'dreaming.config' AND `encrypted` = 0), 0) = 1 THEN 1 ELSE 0 END, `time` = coalesce((SELECT json_extract(`value`, '$.time') FROM `settings` WHERE `key` = 'dreaming.config' AND `encrypted` = 0), '03:00'), `runtime` = (SELECT json_extract(`value`, '$.runtime') FROM `settings` WHERE `key` = 'dreaming.config' AND `encrypted` = 0), `connection_id` = (SELECT json_extract(`value`, '$.connectionId') FROM `settings` WHERE `key` = 'dreaming.config' AND `encrypted` = 0), `model` = (SELECT json_extract(`value`, '$.model') FROM `settings` WHERE `key` = 'dreaming.config' AND `encrypted` = 0);--> statement-breakpoint
+UPDATE `settings` SET `value` = json_object('enabled', json('true'), 'tokenCap', coalesce(json_extract(`value`, '$.tokenCap'), 300000), 'allowed', CASE WHEN json_extract(`value`, '$.runtime') IS NOT NULL AND json_extract(`value`, '$.model') IS NOT NULL THEN json_array(json_object('runtime', json_extract(`value`, '$.runtime'), 'connectionId', json_extract(`value`, '$.connectionId'), 'model', json_extract(`value`, '$.model'))) ELSE json('[]') END) WHERE `key` = 'dreaming.config' AND `encrypted` = 0;

@@ -726,13 +726,14 @@ describe("quiet hours (FR-13.4)", () => {
       quietEnd: "06:00",
       timeZone: "Nowhere/City",
     });
-    // 기억 정리 notifications (#146): on unless turned off, kept when a page leaves them out.
+    // 기억 정리 notifications (#146, #188): on unless turned off, kept when a page leaves them out.
     expect(ok.json()).toEqual({
       quietStart: "22:30",
       quietEnd: "06:00",
       timeZone: "Asia/Seoul",
       memoryProposals: true,
       memoryApplied: true,
+      memoryFailed: true,
     });
     expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toEqual(ok.json());
   });

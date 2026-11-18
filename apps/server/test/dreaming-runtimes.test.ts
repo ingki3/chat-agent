@@ -140,11 +140,15 @@ async function start() {
   const round = async (runtime: RuntimeId, model: string, text: string) => {
     app.dreaming!.store.setConfig({
       enabled: true,
+      tokenCap: 300_000,
+      allowed: [{ runtime, connectionId: null, model }],
+    });
+    app.dreaming!.store.setSettings(f.users.owner.id, {
+      enabled: true,
       time: "03:00",
       runtime,
-      model,
       connectionId: null,
-      tokenCap: 300_000,
+      model,
     });
     const c = app.conversations!.create(f.users.owner.id, {}).id;
     app.conversations!.append(c, { role: "user", parts: [{ type: "text", text }] });

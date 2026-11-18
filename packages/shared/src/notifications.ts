@@ -21,7 +21,12 @@ export const NotificationKind = z.enum([
   "memory_proposal",
   /** 기억 정리 applied changes on its own (자동 반영) — the count only. */
   "memory_applied",
-  /** Admin only: the day's last 기억 정리 attempt failed for some users — how many, no names, no content. */
+  /** 기억 정리 (#188): the day's last attempt of the user's own round failed — a fixed reason, no content. */
+  "memory_failed",
+  /**
+   * Admin only (#188): the server-wide 기억 정리 setup is broken — an allowed shared connection was deleted or
+   * disconnected and users who chose it are paused. How many, no names, no content.
+   */
   "dreaming_failed",
 ]);
 export type NotificationKind = z.infer<typeof NotificationKind>;
@@ -52,9 +57,10 @@ export const NotificationPrefs = z
     quietEnd: ClockTime.nullable(),
     /** IANA time zone the clock times are in. */
     timeZone: z.string().min(1).max(64),
-    /** 기억 정리 notifications (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" — on unless turned off. */
+    /** 기억 정리 notifications (#146, spec §8): "기억 제안 대기", "기억 자동 반영", "기억 정리 실패" — on unless off. */
     memoryProposals: z.boolean().optional(),
     memoryApplied: z.boolean().optional(),
+    memoryFailed: z.boolean().optional(),
   })
   .refine((p) => (p.quietStart === null) === (p.quietEnd === null), { message: "set both or neither" })
   .refine((p) => p.quietStart === null || p.quietStart !== p.quietEnd, { message: "start and end differ" });

@@ -412,6 +412,7 @@ export class NotificationService {
           timeZone: row.timeZone,
           memoryProposals: row.memoryProposals,
           memoryApplied: row.memoryApplied,
+          memoryFailed: row.memoryFailed,
         }
       : {
           quietStart: null,
@@ -419,13 +420,16 @@ export class NotificationService {
           timeZone: DEFAULT_TIME_ZONE,
           memoryProposals: true,
           memoryApplied: true,
+          memoryFailed: true,
         };
   }
 
-  /** Whether the user wants this 기억 정리 notification (spec §8: the two user kinds can be turned off). */
-  wants(userId: string, kind: "memory_proposal" | "memory_applied"): boolean {
+  /** Whether the user wants this 기억 정리 notification (spec §8: the three user kinds can be turned off). */
+  wants(userId: string, kind: "memory_proposal" | "memory_applied" | "memory_failed"): boolean {
     const p = this.prefs(userId);
-    return kind === "memory_proposal" ? p.memoryProposals !== false : p.memoryApplied !== false;
+    if (kind === "memory_proposal") return p.memoryProposals !== false;
+    if (kind === "memory_applied") return p.memoryApplied !== false;
+    return p.memoryFailed !== false;
   }
 
   setPrefs(userId: string, p: NotificationPrefs): NotificationPrefs {
@@ -437,6 +441,7 @@ export class NotificationService {
       // Left out (an older page): kept as they were.
       memoryProposals: p.memoryProposals ?? before.memoryProposals ?? true,
       memoryApplied: p.memoryApplied ?? before.memoryApplied ?? true,
+      memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
       updatedAt: this.now(),
     };
     this.db

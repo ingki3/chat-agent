@@ -1,6 +1,9 @@
 import {
+  DREAMING_DEFAULT_TIME,
   DREAMING_TOKEN_CAP,
   DreamingConfig,
+  RuntimeId,
+  type DreamingSettings,
   type DreamingCounts,
   type DreamingRunStatus,
   type DreamingTrigger,
@@ -12,23 +15,22 @@ import type { SettingsStore } from "../db/settings-store.js";
 import { scrubKnown } from "../secrets/known.js";
 
 /**
- * 기억 정리 storage (#146, docs/memory-spec.md §5–§10): the admin's settings and prompt versions, each user's switch,
- * checkpoint and pause, the day's rounds, the run records (`DREAMS.md` — counts only) and the re-processing queue.
+ * 기억 정리 storage (#146, #188, docs/memory-spec.md §5–§10): the admin's server-wide settings (switch, token cap,
+ * allowed connections·models), the default prompt (the admin's last version of #146), each user's own settings
+ * (switch, time, connection·model, prompt), checkpoint and pause, the day's rounds, the run records (`DREAMS.md` —
+ * counts only) and the re-processing queue.
  */
 
 export const CONFIG_KEY = "dreaming.config";
 export const DEFAULT_CONFIG: DreamingConfig = {
-  enabled: false,
-  time: "03:00",
-  connectionId: null,
-  runtime: null,
-  model: null,
+  enabled: true,
   tokenCap: DREAMING_TOKEN_CAP.default,
+  allowed: [],
 };
 
 /**
- * The editable part's first version (the admin may rewrite it; the fixed rules around it are in prompt.ts). Kept
- * short: what to pick and how to write it.
+ * The editable part's built-in version (the default until an admin saved one under #146; each user may write their
+ * own since #188 — the fixed rules around it are in prompt.ts). Kept short: what to pick and how to write it.
  */
 export const DEFAULT_PROMPT = [
   "오늘 사용자가 한 말에서 다음 대화에도 도움이 될 것만 골라 정리하세요.",
@@ -42,6 +44,12 @@ export const DEFAULT_PROMPT = [
 export type UserState = {
   user_id: string;
   enabled: number;
+  time: string;
+  runtime: string | null;
+  connection_id: string | null;
+  model: string | null;
+  prompt: string | null;
+  prompt_updated_at: number | null;
   checkpoint: number;
   checkpoint_at: number | null;
   paused_at: number | null;
@@ -121,7 +129,14 @@ export class DreamingStore {
         .run(this.now(), this.now());
   }
 
-  // ---- the prompt's versions (FR-16.6) ----
+  /** Whether a connection·model pair is one the admin allows. */
+  allows(c: { runtime: string | null; connectionId: string | null; model: string | null }): boolean {
+    return this.config().allowed.some(
+      (a) => a.runtime === c.runtime && a.connectionId === c.connectionId && a.model === c.model,
+    );
+  }
+
+  // ---- the default prompt: the admin's last version of #146 (FR-16.6), or the built-in one ----
 
   prompt(): { version: number; content: string; createdAt: number | null } {
     const r = this.sql
@@ -134,31 +149,32 @@ export class DreamingStore {
       : { version: 0, content: DEFAULT_PROMPT, createdAt: null };
   }
 
-  promptVersions(): { version: number; content: string; restoredFrom: number | null; createdAt: number }[] {
-    return (
-      this.sql
-        .prepare(
-          "select version, content, restored_from as restoredFrom, created_at as createdAt from dreaming_prompts order by version desc",
-        )
-        .all() as { version: number; content: string; restoredFrom: number | null; createdAt: number }[]
-    ).map((v) => ({ ...v, content: scrubKnown(v.content) }));
+  /**
+   * The prompt a user's run uses: their own, or the default (`version` = the default's — null for their own, so a run
+   * record says which one it was).
+   */
+  promptOf(userId: string): {
+    content: string;
+    custom: boolean;
+    version: number | null;
+    updatedAt: number | null;
+  } {
+    const st = this.state(userId);
+    if (st.prompt !== null)
+      return { content: scrubKnown(st.prompt), custom: true, version: null, updatedAt: st.prompt_updated_at };
+    const d = this.prompt();
+    return { content: d.content, custom: false, version: d.version, updatedAt: d.createdAt };
   }
 
-  /** Saves a new version on top of `base` (refused — false — when another one was saved meanwhile). */
-  savePrompt(content: string, base: number, authorId: string, restoredFrom: number | null = null): boolean {
-    return this.sql
-      .transaction(() => {
-        const cur = this.prompt().version;
-        if (cur !== base) return false;
-        if (cur > 0 && this.prompt().content === content) return true;
-        this.sql
-          .prepare(
-            "insert into dreaming_prompts (version, content, author_id, restored_from, created_at) values (?, ?, ?, ?, ?)",
-          )
-          .run(cur + 1, scrubKnown(content), authorId, restoredFrom, this.now());
-        return true;
-      })
-      .immediate();
+  /** The user's own prompt; null (or the default's very text) goes back to the default. */
+  setPrompt(userId: string, content: string | null): void {
+    this.ensureState(userId);
+    const v = content === null || content.trim() === this.prompt().content.trim() ? null : content.trim();
+    this.sql
+      .prepare(
+        "update dreaming_users set prompt = ?, prompt_updated_at = ?, updated_at = ? where user_id = ?",
+      )
+      .run(v === null ? null : scrubKnown(v), v === null ? null : this.now(), this.now(), userId);
   }
 
   // ---- per user ----
@@ -169,7 +185,13 @@ export class DreamingStore {
     return (
       r ?? {
         user_id: userId,
-        enabled: 1,
+        enabled: 0,
+        time: DREAMING_DEFAULT_TIME,
+        runtime: null,
+        connection_id: null,
+        model: null,
+        prompt: null,
+        prompt_updated_at: null,
         checkpoint: 0,
         checkpoint_at: null,
         paused_at: null,
@@ -181,9 +203,35 @@ export class DreamingStore {
   private ensureState(userId: string): void {
     this.sql
       .prepare(
-        "insert or ignore into dreaming_users (user_id, enabled, checkpoint, updated_at) values (?, 1, 0, ?)",
+        "insert or ignore into dreaming_users (user_id, enabled, time, checkpoint, updated_at) values (?, 0, ?, 0, ?)",
       )
-      .run(userId, this.now());
+      .run(userId, DREAMING_DEFAULT_TIME, this.now());
+  }
+
+  /** The user's own settings (no row: off, the default time, nothing chosen). */
+  settingsOf(userId: string): DreamingSettings {
+    const st = this.state(userId);
+    const runtime = RuntimeId.safeParse(st.runtime);
+    return {
+      enabled: st.enabled === 1,
+      time: st.time,
+      runtime: runtime.success ? runtime.data : null,
+      connectionId: st.connection_id,
+      model: st.model,
+    };
+  }
+
+  /** Saves the user's settings (validated by the caller); turned off → paused like before (spec §9). */
+  setSettings(userId: string, s: DreamingSettings): void {
+    this.ensureState(userId);
+    this.sql.transaction(() => {
+      this.setEnabled(userId, s.enabled);
+      this.sql
+        .prepare(
+          "update dreaming_users set time = ?, runtime = ?, connection_id = ?, model = ?, updated_at = ? where user_id = ?",
+        )
+        .run(s.time, s.runtime, s.connectionId, s.model, this.now(), userId);
+    })();
   }
 
   setEnabled(userId: string, enabled: boolean): void {
@@ -197,14 +245,14 @@ export class DreamingStore {
   }
 
   /**
-   * Whether the rounds run for the user right now: the admin's switch for everyone and for this user, and an active
-   * account (spec §7·§9). Asked before an attempt starts and again right before its outcome is written.
+   * Whether the rounds run for the user right now: the admin's server-wide switch, the user's own switch, and an
+   * active account (spec §7·§9). Asked before an attempt starts and again right before its outcome is written.
    */
   switchedOn(userId: string): boolean {
     if (!this.config().enabled) return false;
     const r = this.sql
       .prepare(
-        `select u.active as active, coalesce(d.enabled, 1) as enabled
+        `select u.active as active, coalesce(d.enabled, 0) as enabled
            from users u left join dreaming_users d on d.user_id = u.id where u.id = ?`,
       )
       .get(userId) as { active: number; enabled: number } | undefined;
@@ -290,12 +338,11 @@ export class DreamingStore {
       .all(now) as DayRow[];
   }
 
-  nextWaiting(): number | null {
+  /** The earliest waiting round due after `after` (one already due but not started is not a reason to wake). */
+  nextWaiting(after: number): number | null {
     const r = this.sql
-      .prepare("select min(next_at) as t from dreaming_days where state = 'waiting'")
-      .get() as {
-      t: number | null;
-    };
+      .prepare("select min(next_at) as t from dreaming_days where state = 'waiting' and next_at > ?")
+      .get(after) as { t: number | null };
     return r.t;
   }
 

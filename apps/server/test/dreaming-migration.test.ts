@@ -87,3 +87,117 @@ describe("migration 0031 (기억 정리)", () => {
     });
   });
 });
+
+/**
+ * Migration 0033 (#188): the admin's former system-wide settings become each user's own — the switch (on only where
+ * both the old global and the old per-user switch were on), the time, the connection·model; the old single pair
+ * becomes the one allowed pair; the server-wide switch stays on (the old global moved into each user's switch).
+ * Checkpoints, the queue, the run records and the prompt versions are untouched; the newest version is the default.
+ */
+describe("migration 0033 (기억 정리 per user)", () => {
+  const before = (config: object | null) => {
+    const db = openDb(":memory:");
+    closers.push(() => db.$client.close());
+    migrate(db, { migrationsFolder: migrationsUpTo(32) });
+    const sql = db.$client;
+    for (const u of ["u1", "u2", "u3"])
+      sql
+        .prepare("insert into users (id, email, name, role) values (?, ?, ?, 'member')")
+        .run(u, `${u}@x.test`, u);
+    if (config)
+      sql
+        .prepare(
+          "insert into settings (key, value, encrypted, updated_at) values ('dreaming.config', ?, 0, 1)",
+        )
+        .run(JSON.stringify(config));
+    // u1: a checkpoint of before; u2: turned off by the admin; u3: no row (= on, in #146).
+    sql
+      .prepare(
+        "insert into dreaming_users (user_id, enabled, checkpoint, checkpoint_at, paused_at, updated_at) values ('u1', 1, 5, 100, null, 1), ('u2', 0, 0, null, 50, 1)",
+      )
+      .run();
+    sql
+      .prepare(
+        "insert into dreaming_prompts (version, content, author_id, restored_from, created_at) values (1, '관리자 프롬프트', 'u1', null, 7)",
+      )
+      .run();
+    sql
+      .prepare(
+        `insert into dreaming_runs (id, user_id, date, attempt, idem_key, trigger, status, code, counts, runtime, model,
+           connection_id, prompt_version, started_at, finished_at)
+         values ('r1', 'u1', '2026-11-17', 1, 'dreaming:u1:2026-11-17:1', 'regular', 'unchanged', null, '{}', 'codex', 'm', 'c9', 1, 1, 2)`,
+      )
+      .run();
+    migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+    return sql;
+  };
+  const users = (sql: ReturnType<typeof before>) =>
+    sql
+      .prepare(
+        "select user_id, enabled, time, runtime, connection_id, model, prompt, checkpoint, paused_at from dreaming_users order by user_id",
+      )
+      .all();
+
+  it("moves the switch, time, connection and model into each user's settings; the pair becomes the allowed one", () => {
+    const sql = before({
+      enabled: true,
+      time: "04:30",
+      connectionId: "c9",
+      runtime: "codex",
+      model: "m",
+      tokenCap: 123_000,
+    });
+    const row = { time: "04:30", runtime: "codex", connection_id: "c9", model: "m", prompt: null };
+    expect(users(sql)).toEqual([
+      { user_id: "u1", enabled: 1, ...row, checkpoint: 5, paused_at: null },
+      { user_id: "u2", enabled: 0, ...row, checkpoint: 0, paused_at: 50 },
+      { user_id: "u3", enabled: 1, ...row, checkpoint: 0, paused_at: null },
+    ]);
+    const cfg = sql.prepare("select value from settings where key = 'dreaming.config'").get() as {
+      value: string;
+    };
+    expect(JSON.parse(cfg.value)).toEqual({
+      enabled: true,
+      tokenCap: 123_000,
+      allowed: [{ runtime: "codex", connectionId: "c9", model: "m" }],
+    });
+    // Unchanged: the run record, the prompt versions; new notification preference on by default.
+    expect(sql.prepare("select id, prompt_version, connection_id from dreaming_runs").all()).toEqual([
+      { id: "r1", prompt_version: 1, connection_id: "c9" },
+    ]);
+    expect(sql.prepare("select version, content from dreaming_prompts").all()).toEqual([
+      { version: 1, content: "관리자 프롬프트" },
+    ]);
+    sql
+      .prepare(
+        "insert into notification_prefs (user_id, time_zone, updated_at) values ('u1', 'Asia/Seoul', 1)",
+      )
+      .run();
+    expect(sql.prepare("select memory_failed from notification_prefs").get()).toEqual({ memory_failed: 1 });
+  });
+
+  it("globally off (or never set up) → everyone off, nothing allowed, the server-wide switch on", () => {
+    const off = before({
+      enabled: false,
+      time: "03:00",
+      connectionId: null,
+      runtime: null,
+      model: null,
+      tokenCap: 300_000,
+    });
+    expect((users(off) as { enabled: number }[]).map((u) => u.enabled)).toEqual([0, 0, 0]);
+    const cfg = off.prepare("select value from settings where key = 'dreaming.config'").get() as {
+      value: string;
+    };
+    expect(JSON.parse(cfg.value)).toEqual({ enabled: true, tokenCap: 300_000, allowed: [] });
+    const none = before(null);
+    expect(users(none)).toEqual(
+      ["u1", "u2", "u3"].map((u) =>
+        expect.objectContaining({ user_id: u, enabled: 0, time: "03:00", runtime: null, model: null }),
+      ),
+    );
+    expect(none.prepare("select count(*) as n from settings where key = 'dreaming.config'").get()).toEqual({
+      n: 0,
+    });
+  });
+});

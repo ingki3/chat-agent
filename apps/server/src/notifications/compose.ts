@@ -56,13 +56,10 @@ export type PublishInput =
   | { kind: "memory_proposal"; count: number }
   /** 기억 정리 applied N changes on its own (자동 반영). A count only. */
   | { kind: "memory_applied"; count: number }
-  /** Admin only (#146): the day's last attempt failed for N users. No names, no content. */
-  | {
-      kind: "dreaming_failed";
-      users: number;
-      /** Of them, how many failed because even one message is over the token cap (not a connection problem). */
-      tooLarge?: number;
-    };
+  /** 기억 정리 (#188): the user's own round failed at its last attempt — a fixed reason code, never content. */
+  | { kind: "memory_failed"; code: string | null }
+  /** Admin only (#188): allowed shared connections are gone while N users chose them. No names, no content. */
+  | { kind: "dreaming_failed"; users: number };
 
 export type ResourceRefInput = { kind: string; id: string };
 
@@ -240,24 +237,32 @@ export function compose(input: PublishInput): Composed {
         body: `기억 ${count(input.count)}개를 정리했어요`,
         url: "/settings/instructions?doc=dreams",
       };
-    case "dreaming_failed":
+    case "memory_failed":
       return {
         kind: input.kind,
         title: "기억 정리 실패",
+        body: twoLines(memoryFailedBody(input.code)),
+        url: "/settings/instructions?doc=dreams",
+      };
+    case "dreaming_failed":
+      return {
+        kind: input.kind,
+        title: "기억 정리 설정 확인",
         body: twoLines(
-          dreamingFailedBody(count(input.users), Math.min(count(input.tooLarge ?? 0), count(input.users))),
+          `기억 정리에 쓰는 공용 연결을 쓸 수 없어 멈췄어요 (사용자 ${count(input.users)}명)\n관리자 → 기억 정리에서 확인해 주세요`,
         ),
         url: "/admin?tab=dreaming",
       };
   }
 }
 
-/** Fixed texts only (spec §8: no names, no content). */
-function dreamingFailedBody(users: number, tooLarge: number): string {
-  const big = `기억 정리 입력이 상한보다 커요 (사용자 ${tooLarge}명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요`;
-  if (tooLarge === users) return big;
-  const other = `기억 정리가 실패했어요 (사용자 ${users - tooLarge}명, 연결 확인 필요)`;
-  return tooLarge ? `${other}\n${big}` : other;
+/** Fixed texts only (spec §8: no content) — the reason by its code. */
+function memoryFailedBody(code: string | null): string {
+  if (code === "too_large")
+    return "오늘 기억 정리가 실패했어요 — 메시지가 1회 토큰 상한보다 커요\n관리자에게 상한을 올려 달라고 하세요";
+  if (code === "runtime_auth" || code === "no_connection" || code === "connection_limited")
+    return "오늘 기억 정리가 실패했어요 — 연결을 쓸 수 없었어요. 내일 다시 해요";
+  return "오늘 기억 정리가 실패했어요. 내일 다시 해요";
 }
 
 const count = (n: number) => (Number.isInteger(n) && n >= 0 ? Math.min(n, 9999) : 0);

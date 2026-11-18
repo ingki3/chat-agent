@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import {
   utf8Bytes,
+  type DreamingChoice,
   type DreamingCounts,
+  type DreamingProblem,
   type DreamingRunStatus,
   type DreamingTrigger,
   type MemoryListKind,
@@ -35,7 +37,7 @@ import { checkDecisions, itemRef, type Checked, type DocCtx } from "./validate.j
  * 1. claim the attempt (idempotency key `dreaming:<user>:<date>:<attempt>` — never twice, even across a restart);
  * 2. expire bundles whose documents changed (their sources go to the queue), leave out documents that have a bundle
  *    waiting for review, and gather the input (queue first, then new messages after the checkpoint, ≤ 60,000 chars);
- * 3. ask the admin's shared API key connection's model, **without tools**, in a one-off session of the target user's
+ * 3. ask the model of the user's chosen shared API key connection (one the admin allowed), **without tools**, in a one-off session of the target user's
  *    folder — forgotten right after (`RuntimeAdapter.forget` through the deletion jobs), usage recorded as `dreaming`;
  * 4. check the decisions (spec §4) and, in **one transaction**: re-check the sources and the documents, make the
  *    bundle (검토 후 반영) or apply it (자동 반영 — not from a source that reads like an instruction), move the queue
@@ -60,7 +62,7 @@ export type RunRequest = {
   attempt: number;
   trigger: DreamingTrigger;
   idemKey: string;
-  /** 미리 실행 (the admin's own data): this prompt instead of the saved one, and nothing is applied or moved. */
+  /** 미리 실행 (the caller's own data): this prompt instead of the saved one, and nothing is applied or moved. */
   preview?: { content?: string | undefined };
   /** Not run, only recorded as skipped with this code (the day's answers kept it busy, spec §6). */
   skip?: "busy";
@@ -71,7 +73,7 @@ export type RunResult = {
   status: DreamingRunStatus;
   code: string | null;
   counts: DreamingCounts;
-  /** 미리 실행: the decisions that passed the checks (the admin's own content). */
+  /** 미리 실행: the decisions that passed the checks (the caller's own content). */
   decisions?: Checked[];
 };
 
@@ -109,10 +111,23 @@ export class DreamingRunner {
     this.now = deps.now ?? Date.now;
   }
 
-  /** Whether the configured connection can be used at all (the engine pauses when it cannot — spec §7). */
-  connectionProblem(): "missing" | "not_allowed" | null {
-    const c = this.deps.store.config();
-    if (!c.runtime || !c.model) return "missing";
+  /**
+   * Why the user's rounds cannot run now although their switch may be on (the engine pauses them — spec §7): the
+   * server-wide switch is off, nothing chosen, or the chosen pair is no longer allowed or its connection is gone.
+   */
+  problemOf(userId: string): DreamingProblem | null {
+    const { store } = this.deps;
+    if (!store.config().enabled) return "server_off";
+    const s = store.settingsOf(userId);
+    if (!s.runtime || !s.model) return "no_choice";
+    if (!store.allows(s)) return "unavailable";
+    return this.choiceProblem({ runtime: s.runtime, connectionId: s.connectionId, model: s.model })
+      ? "unavailable"
+      : null;
+  }
+
+  /** Whether a connection·model pair can be used at all: its connection deleted / disconnected, or not shared API key. */
+  choiceProblem(c: DreamingChoice): "missing" | "not_allowed" | null {
     const adapter = this.deps.registry.get(c.runtime);
     if (!adapter) return "missing";
     if (!adapter.capabilities().needsConnection) return null; // the FakeRuntime (development, e2e)
@@ -126,9 +141,9 @@ export class DreamingRunner {
 
   async run(req: RunRequest): Promise<RunResult | undefined> {
     const { store } = this.deps;
-    const cfg = store.config();
+    const cfg = store.settingsOf(req.userId);
     const runId = crypto.randomUUID();
-    const prompt = store.prompt();
+    const prompt = store.promptOf(req.userId);
     const claimed = store.claimRun({
       id: runId,
       user_id: req.userId,
@@ -203,8 +218,11 @@ export class DreamingRunner {
       if (!store.finishRun(runId, "skipped", "paused", counts)) throw new Gone();
       return end("skipped", "paused");
     }
-    // Runtime, model and connection (spec §7: the shared API key connection only — no fallback).
-    const cfg = store.config();
+    // Runtime, model and connection (spec §7: the user's choice among the admin's allowed shared API key connections
+    // only — no fallback).
+    const cfg = store.settingsOf(req.userId);
+    const tokenCap = store.config().tokenCap;
+    if (!store.allows(cfg)) throw new Failed("no_connection");
     const adapter = cfg.runtime ? this.deps.registry.get(cfg.runtime) : undefined;
     if (!adapter || !cfg.model) throw new Failed("no_connection");
     const caps = adapter.capabilities();
@@ -252,7 +270,7 @@ export class DreamingRunner {
     }));
     const system = dreamingSystemPrompt(req.preview?.content ?? savedPrompt);
     const skeleton = dreamingRequest(docItems, []);
-    const maxBytes = cfg.tokenCap - utf8Bytes(system) - utf8Bytes(skeleton) - OUTPUT_RESERVE;
+    const maxBytes = tokenCap - utf8Bytes(system) - utf8Bytes(skeleton) - OUTPUT_RESERVE;
     if (maxBytes < 1000) throw new Failed("too_large");
     const input: PackedInput = gatherInput(db, {
       userId: req.userId,
@@ -287,7 +305,7 @@ export class DreamingRunner {
 
     // The model, without tools — the request as it will really be sent checked against the cap once more.
     const request = dreamingRequest(docItems, input.messages);
-    if (utf8Bytes(system) + utf8Bytes(request) + OUTPUT_RESERVE > cfg.tokenCap) throw new Failed("too_large");
+    if (utf8Bytes(system) + utf8Bytes(request) + OUTPUT_RESERVE > tokenCap) throw new Failed("too_large");
     const text = await this.ask(adapter.id, {
       runId,
       userId: req.userId,
