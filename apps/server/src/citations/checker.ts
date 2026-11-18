@@ -9,8 +9,11 @@ import {
   locatorLabel,
   citationMarkers,
   sentenceEndMarkers,
+  citationUnits,
   uncitedUnits,
   unitSentences,
+  type CitationUnit,
+  type CitationMarker,
   type TextRange,
   type CitationEntry,
   type CitationStatus,
@@ -62,6 +65,18 @@ export function toolCallsAt(parts: readonly MessagePart[]): number[] {
   return out;
 }
 
+/** Where each text part starts in the answer text: the screen renders each part on its own (#202 review 3차). */
+export function textPartStarts(parts: readonly MessagePart[]): number[] {
+  const out: number[] = [];
+  let at = 0;
+  for (const p of parts)
+    if (p.type === "text") {
+      out.push(at);
+      at += p.text.length;
+    }
+  return out;
+}
+
 /** Where in the answer text the first tool call came (the length of the text written before it). */
 export function firstToolAt(parts: readonly MessagePart[]): number {
   return toolCallsAt(parts)[0] ?? Number.POSITIVE_INFINITY;
@@ -87,28 +102,50 @@ const WORK_PREDICATE = new RegExp(
 );
 /** Adverbs a work note may have ("이제", "다", "같이" …) — words, not subjects. */
 const WORK_ADVERBS = new Set(
-  "이제 지금 먼저 우선 다음으로 다시 다 모두 전부 같이 함께 한번 한 번 좀 마저 계속 차례로 더 꼼꼼히 자세히 하나씩".split(
+  "이제 지금 먼저 우선 다음으로 다시 다 모두 전부 같이 함께 한번 좀 마저 계속 차례로 더 꼼꼼히 자세히 하나씩 하나하나".split(
     " ",
   ),
 );
 /** The assistant as the subject: the only subject a work note may name. */
-const AGENT = /^(?:제가|저는|저도)$/u;
-/** The last syllable of a word that carries a subject, topic or other particle ("교육부도", "대학 측에선", "자료가"). */
-const PARTICLE_END = /[이가은는도서선께만과와랑에로고며면지데니라나측]$/u;
+const AGENT = /^(?:제가|저는)$/u;
+/** Determiners and numbers in front of the material ("두 파일을", "첫 기사를", "다음 시트를"). */
+const DETERMINERS = new Set(
+  "두 세 네 다섯 여섯 일곱 여덟 아홉 열 여러 몇 모든 각 첫 다음 나머지 남은 이 그 해당 새".split(" "),
+);
+const HANGUL_WORD = /^[가-힣A-Za-z0-9]+$/u;
 
 /**
- * A sentence that only says the assistant works on the material: a predicate of `WORK_PREDICATE`, and before it
- * nothing but the assistant as subject ("제가/저는"), the listed adverbs, objects ("…을/를", "…의") and bare nouns.
- * Any other word with a particle — a subject that is not the assistant ("교육부도 지원서를 검토하고 있어요", "대학
- * 측에선 …", "경쟁률이 …") — and the sentence states something: checked.
+ * A sentence that only says the assistant works on the material (review 3차 — positive only): the predicate is one
+ * of `WORK_PREDICATE`, and every word before it is one of
+ * - the assistant as the subject: "제가", "저는" (or no subject at all);
+ * - a listed adverb (`WORK_ADVERBS`);
+ * - the material, as an object noun phrase: determiners or numbers (`DETERMINERS`), "…의" modifiers, then one noun
+ *   ending in "을/를" ("두 파일을", "첨부 파일의 시트를" — no: "첨부" is a bare noun; "파일의 시트를" yes).
+ * Any other word — "교육부조차", "입학처마저", "대학 측에선", "경쟁률이", a bare noun of unknown role — and it is checked.
  */
 function isWorkNote(sentence: string): boolean {
   const m = WORK_PREDICATE.exec(sentence);
   if (!m) return false;
   const words = sentence.slice(0, m.index).split(/\s+/u).filter(Boolean);
-  return words.every(
-    (w) => AGENT.test(w) || WORK_ADVERBS.has(w) || /[을를의]$/u.test(w) || !PARTICLE_END.test(w),
-  );
+  if (!words.every((w) => HANGUL_WORD.test(w))) return false;
+  let k = 0;
+  if (k < words.length && AGENT.test(words[k]!)) k++;
+  while (k < words.length) {
+    const w = words[k]!;
+    if (WORK_ADVERBS.has(w)) {
+      k++;
+      continue;
+    }
+    // An object noun phrase: [determiners | X의]* Y을/를.
+    let j = k;
+    while (j < words.length && (DETERMINERS.has(words[j]!) || /.의$/u.test(words[j]!))) j++;
+    if (j < words.length && /.[을를]$/u.test(words[j]!)) {
+      k = j + 1;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 /** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
@@ -184,21 +221,26 @@ export function isClosingOffer(text: string, u: TextRange, lastToolAt: number): 
  * The paragraphs the note flags (#25, #202): body units without a marker (`uncitedUnits` — tables as one unit,
  * opinions said so excluded), less progress notes and, at the end of the answer, closing offers and questions.
  */
-export function missingUnits(text: string, parts: readonly MessagePart[]): TextRange[] {
+export function missingUnits(
+  text: string,
+  parts: readonly MessagePart[],
+  units: readonly CitationUnit[] = citationUnits(text, textPartStarts(parts)),
+  markers: readonly CitationMarker[] = citationMarkers(text, units),
+): TextRange[] {
   const at = toolCallsAt(parts);
   const first = at[0] ?? Number.POSITIVE_INFINITY;
   const last = at.at(-1) ?? Number.NEGATIVE_INFINITY;
-  const units = uncitedUnits(text).filter((u) => !isProgressNote(text, u, first, last));
+  const uncited = uncitedUnits(text, units, markers).filter((u) => !isProgressNote(text, u, first, last));
   // Only at the very end: an offer is how an answer ends — nothing else (cited or not) may come after it.
-  let end = units.length;
+  let end = uncited.length;
   let tail = text.length;
   while (end > 0) {
-    const u = units[end - 1]!;
+    const u = uncited[end - 1]!;
     if (text.slice(u.end, tail).trim() || !isClosingOffer(text, u, last)) break;
     tail = u.start;
     end--;
   }
-  return units.slice(0, end);
+  return uncited.slice(0, end);
 }
 
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
@@ -312,7 +354,12 @@ export function citationNote(
   if (!text.trim()) return undefined;
   // No source tool and no citation: only sentence-end `[n]` can be numbers carried over (a[1], code and links are
   // text). Whether there is a note at all is decided below — by the carry-over, not by the markers.
-  const markers = (used ? citationMarkers(text) : sentenceEndMarkers(text)).slice(0, CITATION_LIMITS.markers);
+  // No source and nothing that looks like a marker: nothing to parse (review 3차 — the common no-tool answer).
+  if (!used && !/\[\d{1,3}\](?!\()/.test(text)) return undefined;
+  // One parse of the answer, as the screen renders it part by part, for the markers and the missing paragraphs.
+  const units = citationUnits(text, textPartStarts(parts));
+  const allMarkers = used ? citationMarkers(text, units) : sentenceEndMarkers(text, units);
+  const markers = allMarkers.slice(0, CITATION_LIMITS.markers);
   if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
@@ -429,7 +476,13 @@ export function citationNote(
       unbacked: true,
     };
   // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
-  const missing = used || carriedAny ? missingUnits(text, parts).slice(0, CITATION_LIMITS.missing) : [];
+  const missing =
+    used || carriedAny
+      ? missingUnits(text, parts, units, used ? allMarkers : citationMarkers(text, units)).slice(
+          0,
+          CITATION_LIMITS.missing,
+        )
+      : [];
   return {
     type: "citation_note",
     citations,

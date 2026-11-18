@@ -1605,6 +1605,17 @@ describe("citationNote", () => {
       citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, userId: crypto.randomUUID() })!
         .citations[0]!.status,
     ).toBe("unknown_source");
+    // #202 review 3차: a part that ends with a closed math block does not take in the next part (the screen renders
+    // each part on its own) — the next part's [1] is a marker and is carried, checked again once.
+    const askedBefore = asked.length;
+    const twoParts: MessagePart[] = [
+      { type: "text", text: "$$\na=b\n$$" },
+      { type: "text", text: "모집은 마감됐어요[1].\n\n다른 사실이에요." },
+    ];
+    const split = citationNote(f.run(f.c.id).runId, twoParts, store, carry)!;
+    expect(split.citations.map((c) => [c.n, c.status])).toEqual([[1, "verified"]]);
+    expect(asked.length).toBe(askedBefore + 1);
+    expect(split.missing).toHaveLength(1);
     // Without a recheck the file citation is not carried.
     const { recheckFile: _r, ...bare } = carry;
     void _r;
@@ -1792,7 +1803,7 @@ describe("citationNote", () => {
     const parts: MessagePart[] = [
       ...text("첨부하신 입결 파일을 읽어 볼게요.\n\n"),
       ...read("r1"),
-      ...text("엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.\n\n"),
+      ...text("두 파일을 다 읽었어요. 이제 다음 시트를 확인하고 있어요.\n\n"),
       ...read("r2"),
       ...text(ANSWER),
     ];
@@ -1864,7 +1875,7 @@ describe("citationNote", () => {
         "시트가 업데이트되고 있어요.",
       ])
         expect(between(note), note).toEqual([note]);
-      expect(between("이제 학과별 입결 시트를 확인하고 있어요.")).toEqual([]);
+      expect(between("이제 시트를 하나씩 확인하고 있어요.")).toEqual([]);
       expect(between("두 파일을 다 읽었어요. 제가 지금 비교하는 중이에요.")).toEqual([]);
       // A sentence without the framing, bold or glued to the one before; a lone mark.
       for (const p of [
@@ -1921,7 +1932,7 @@ describe("citationNote", () => {
         "제가 두 자료를 같이 비교하고 있어요.",
         "저는 이제 시행계획을 확인해 볼게요.",
         "자료를 다시 찾아 볼게요.",
-        "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.",
+        "두 파일을 다 읽었어요. 이제 다음 시트를 확인하고 있어요.",
       ])
         expect(between(note), note).toEqual([]);
       // A sentence glued after punctuation is a sentence, a digit or a letter next.
@@ -1958,6 +1969,73 @@ describe("citationNote", () => {
       expect(
         missingOf([...read("a"), ...text(`${lead}| a |\n|---|\n| 1 |\n<div>추가 합격자는 없습니다.</div>`)]),
       ).toEqual(["<div>추가 합격자는 없습니다.</div>"]);
+    });
+
+    it("review 3차: each text part is parsed on its own, as the screen renders it — in every branch", () => {
+      const math = "가[1].\n\n$$\na=b\n$$";
+      const after = "모집은 마감됐어요[1].\n\n다른 사실이에요.";
+      const fetch: MessagePart[] = [
+        { type: "tool_call", id: "w", name: "mcp__agentlee__web_fetch", input: {} },
+        { type: "tool_result", callId: "w", output: {}, isError: false },
+      ];
+      const offsetOfSecond = math.length + after.indexOf("[1]");
+      // No tool (#185): the second part's [1] is a marker — an unbacked note flags it.
+      const none = citationNote(crypto.randomUUID(), [...text(math), ...text(after)], f.cites)!;
+      expect(none.unbacked).toBe(true);
+      expect(none.markers.map((m) => m.start)).toContain(offsetOfSecond);
+      // A file read and a web fetch between the parts: the marker found, the next paragraph flagged.
+      for (const tool of [read("r"), fetch]) {
+        const ps = [...text(math), ...tool, ...text(after)];
+        const t = math + after;
+        const note = citationNote(crypto.randomUUID(), ps, f.cites)!;
+        expect(note.markers.map((m) => m.start)).toContain(offsetOfSecond);
+        expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["다른 사실이에요."]);
+      }
+      // A table that ends a part does not take in the next part's paragraph.
+      expect(missingOf([...text("| a |\n|---|\n| 1[1] |"), ...read("r"), ...text("새 사실이에요.")])).toEqual(
+        ["새 사실이에요."],
+      );
+      // A paragraph a tool call cuts in the middle stays one unit (as before): its marker after the call covers it.
+      expect(missingOf([...text("앞 문장이고 "), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual([]);
+      expect(missingOf([...text("앞 문장이에요.\n"), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual(
+        [],
+      );
+    });
+
+    it("review 3차: positive-only progress grammar, full-width stop, footnotes", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      for (const note of [
+        "교육부조차 지원서를 다시 검토하고 있어요.",
+        "입학처마저 지원서를 검토하고 있어요.",
+        "학과별 입결 시트를 확인하고 있어요.",
+        "올해도 자료를 확인하고 있어요.",
+      ])
+        expect(between(note), note).toEqual([note]);
+      for (const note of [
+        "두 파일을 다 읽었어요.",
+        "제가 첨부 파일의 시트를 확인하고 있어요.".replace("첨부 ", ""),
+        "이제 다음 시트를 하나씩 확인해 볼게요.",
+      ])
+        expect(between(note), note).toEqual([]);
+      // `．` (U+FF0E) ends a sentence: an opinion with a fact after it, and the sentence right before a table.
+      const p = "제 판단으로는 학종이 유리해요．2027년 모집은 끝났습니다.";
+      expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)])).toEqual([p]);
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`지원자가 늘었어요[1]．기준은 다음과 같아요.\n\n${table}`)]),
+      ).toEqual([table]);
+      // A footnote nothing refers to is not shown: no unit, and its [1] covers no table after it.
+      const hidden = "[^unused]: 다른 자료라고 합니다[1].";
+      const shown = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      expect(missingOf([...read("a"), ...text(`## 입결\n\n${hidden}\n\n${shown}`)])).toEqual([shown]);
+      expect(missingOf([...read("a"), ...text(`가[2].\n\n[^unused]: 출처 없는 각주예요.`)])).toEqual([]);
+      // A shown footnote is checked, but its text does not cover a body table (nor the reverse).
+      const withRef = `가[2].[^1]\n\n[^1]: 각주의 사실이에요[1].\n\n${shown}`;
+      expect(missingOf([...read("a"), ...text(withRef)])).toEqual([shown]);
+      expect(missingOf([...read("a"), ...text(`가[2].[^1]\n\n[^1]: 각주의 사실이에요.`)])).toEqual([
+        "각주의 사실이에요.",
+      ]);
     });
 
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {

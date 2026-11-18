@@ -176,7 +176,7 @@ test("#202 production shape: progress notes, a cited table, an opinion said so a
   // Not flagged: the progress notes, the table, the opinion, the offer.
   for (const t of [
     "자료를 찾아 볼게요.",
-    "이제 통계 자료를 확인하고 있어요.",
+    "이제 다음 자료를 확인하고 있어요.",
     "제 판단으로는",
     "원하시면 품목별로",
   ])

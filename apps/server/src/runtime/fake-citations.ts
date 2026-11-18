@@ -150,7 +150,7 @@ export const CITATION_SCENARIOS = {
       {
         tool: "web_fetch",
         input: { url: B.url },
-        before: "첫 기사를 다 읽었어요. 이제 통계 자료를 확인하고 있어요.\n\n",
+        before: "첫 기사를 다 읽었어요. 이제 다음 자료를 확인하고 있어요.\n\n",
       },
       { tool: "cite", input: { sourceId: "$0.sourceId", snippet: "메모리 가격 회복이 증가를 이끌었다" } },
       // Each figure of the table backed in its own row (review 1차): 32% by the newspaper, 28% by the statistics.

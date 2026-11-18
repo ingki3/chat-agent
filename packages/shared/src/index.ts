@@ -16,6 +16,7 @@ export * from "./usage.js";
 export * from "./finance.js";
 export * from "./admin.js";
 export * from "./redact.js";
+export * from "./blocks.js";
 export * from "./citations.js";
 export * from "./schedules.js";
 export * from "./docgen.js";

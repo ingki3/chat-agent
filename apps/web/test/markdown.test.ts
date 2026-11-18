@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { splitBlocks } from "../src/chat/blocks.js";
 import Markdown, { MarkdownBlock, safeUrl } from "../src/chat/Markdown.js";
-import { uncitedUnits } from "@agentlee/shared";
+import { citationUnits, uncitedUnits } from "@agentlee/shared";
 
 const render = (text: string) => renderToStaticMarkup(createElement(Markdown, { text }));
 
@@ -265,6 +265,13 @@ describe("paragraphs without a citation, marked in the answer (#202)", () => {
   });
 });
 
+/** The ranges the server stores for an answer of these text parts (each part parsed on its own, review 3차). */
+const rangesOf = (parts: string[]) => {
+  const all = parts.join("");
+  const starts = parts.map((_, k) => parts.slice(0, k).join("").length);
+  return uncitedUnits(all, citationUnits(all, starts));
+};
+
 describe("one focus target per range, whatever the shape (#202 review 1차)", () => {
   /** An answer as text parts (a tool call between them), its ranges as the server computes them. */
   const CORPUS: string[][] = [
@@ -302,7 +309,7 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
   };
   it("the summary's count is the number of places it moves to", () => {
     for (const parts of CORPUS) {
-      const ranges = uncitedUnits(parts.join(""));
+      const ranges = rangesOf(parts);
       expect(ranges.length, parts.join("|")).toBeGreaterThan(0);
       const html = renderParts(parts, ranges);
       expect(html.split('data-cite-missing="m1"').length - 1, parts.join("|")).toBe(ranges.length);
@@ -326,9 +333,15 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
       .split('data-cite-missing="m1"')
       .slice(1)
       .map((rest) => {
-        const seg = rest.slice(0, rest.indexOf("⚠️"));
+        // A table's ⚠️ comes first (above it): its text is the table's.
+        const badgeFirst = /^[^>]*>\s*<span class="cite-missing-badge"/.test(rest);
+        const seg = badgeFirst
+          ? rest.slice(rest.indexOf("⚠️") + 2, rest.indexOf("</table>"))
+          : rest.slice(0, rest.indexOf("⚠️"));
         const ann = /<annotation[^>]*>([^<]*)<\/annotation>/.exec(seg);
-        const t = ann ? ann[1]! : seg.replace(/^[^>]*>/, "").replace(/<[^>]+>/g, "");
+        const t = ann
+          ? ann[1]!
+          : (badgeFirst ? seg : seg.replace(/^[^>]*>/, "")).replace(/<[^>]*$/, "").replace(/<[^>]+>/g, "");
         // A code block's header ("code", "⧉ 복사") is not its text.
         return t
           .replace(/^code⧉ 복사/, "")
@@ -355,9 +368,64 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
     expect(html).toMatch(/cite-missing-wrap"[^>]*><div class="codeblk">/);
   });
 
+  it("ranges an older server stored inside one rendered block: the row or the very lines, in order (review 3차)", () => {
+    // What the line-based check before #202 stored: a table without outer pipes as three ranges (header line,
+    // delimiter line, data lines), and `•` lines of one paragraph one range each.
+    const table = "전형 | 인원\n|---|---|\n학종 | 30\n교과 | 20";
+    const lines = (t: string) => {
+      const out: { start: number; end: number }[] = [];
+      let at = 0;
+      for (const l of t.split("\n")) {
+        out.push({ start: at, end: at + l.length });
+        at += l.length + 1;
+      }
+      return out;
+    };
+    const [h, d, r1, r2] = lines(table);
+    const t1 = renderParts([table], [h!, d!, { start: r1!.start, end: r2!.end }]);
+    // The table (its text up to the next target), then each data row.
+    expect(targets(t1)).toEqual(["전형인원", "학종30", "교과20"]);
+    const bullets = "• 첫 사실[1].\n• 둘째 사실.\n• 셋째 사실.";
+    const [, b2, b3] = lines(bullets);
+    const t2 = renderParts([bullets], [b2!, b3!]);
+    expect(targets(t2)).toEqual(["• 둘째 사실.", "• 셋째 사실."]);
+    // No empty target, never the same one twice.
+    for (const html of [t1, t2]) expect(targets(html).every(Boolean)).toBe(true);
+  });
+
+  it("[n] in KaTeX's output is never a citation; only the server's marker positions are (review 3차)", () => {
+    const text = "기준이에요[1].\n\n$$\nf[1]=2\n$$";
+    const html = renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: text.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(html.split('data-chip="1"')).toHaveLength(2);
+    expect(html).toContain("f[1]=2</annotation>");
+    // A [1] the server did not list at that position stays text.
+    const two = "가[1]. 나[1].";
+    const only = renderToStaticMarkup(
+      createElement(Markdown, {
+        text: two,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: 1, n: 1 }],
+        },
+      }),
+    );
+    expect(only.split('data-chip="1"')).toHaveLength(2);
+    expect(only).toContain("나[1].");
+  });
+
   it("a paragraph cut by a tool call: one target where it starts, the bar on the rest", () => {
     const parts = CORPUS[2]!;
-    const cut = renderParts(parts, uncitedUnits(parts.join("")));
+    const cut = renderParts(parts, rangesOf(parts));
     expect(targets(cut)).toEqual(["앞 문장이고"]);
     expect(cut).toMatch(/<p class="cite-missing-block">뒤 문장이에요\./);
   });

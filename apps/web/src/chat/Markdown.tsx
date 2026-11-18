@@ -172,6 +172,8 @@ export type MarkdownCite = {
   render: (ns: number[]) => ReactNode;
   missing?: readonly TextRange[];
   markId?: string;
+  /** The server's marker positions in the answer text (#202 review 3차): only these `[n]` become chips. */
+  markers?: readonly { start: number; n: number }[];
 };
 
 /** One block; memoised on its text, so finished blocks are not parsed again while the reply streams. */
@@ -195,7 +197,10 @@ export const MarkdownBlock = memo(function MarkdownBlock({
                 ? [rehypeMissingMarks(cite.missing, offset, offset + text.length, cite.markId)]
                 : []),
               ...(rehypePlugins ?? []),
-              rehypeCitationMarkers(cite.numbers),
+              rehypeCitationMarkers(
+                cite.numbers,
+                cite.markers ? { offset, markers: cite.markers } : undefined,
+              ),
             ],
             components: {
               ...components,

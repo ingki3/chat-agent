@@ -194,6 +194,22 @@ a.cite-title:hover {
   padding-left: 10px;
   scroll-margin: 80px 0;
 }
+/* Older ranges inside one block (#202 review 3차): a table row, or the very text of a line. */
+.md tr.cite-missing-block > :first-child {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+.md tr.cite-missing-block {
+  box-shadow: none;
+}
+.md .cite-missing-inline {
+  background: var(--warn-weak);
+  border-radius: 3px;
+  scroll-margin: 80px 0;
+}
+.md .cite-missing-inline:focus {
+  outline: 2px solid var(--warn);
+  outline-offset: 1px;
+}
 .md li.cite-missing-block::marker {
   color: var(--warn);
 }

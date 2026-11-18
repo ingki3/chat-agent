@@ -279,6 +279,7 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
     const byN = new Map(note.citations.map((c) => [c.n, c]));
     return {
       numbers: markerNumbers(note),
+      markers: note.markers,
       render: (ns) => <CitationMarkers views={ns.map((n) => citationView(n, byN.get(n)))} />,
       ...(note.unbacked || !note.missing.length ? {} : { missing: note.missing, markId }),
     };
