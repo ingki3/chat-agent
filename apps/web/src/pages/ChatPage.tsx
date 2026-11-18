@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -48,6 +49,7 @@ import { ReferencesButton } from "../citations/ReferencesExport.js";
 import { MY_ARTIFACTS_KEY } from "../artifacts/viewer.js";
 import { markStartedHere, useAutoShow } from "../artifacts/ArtifactCard.js";
 import { FileViewContext } from "../files/context.js";
+import { DiagramFixContext, type DiagramFix } from "../chat/diagram-fix.js";
 
 /**
  * Chat screen (#14): streamed replies with markdown, code, math and tool status; stop, regenerate the last
@@ -227,6 +229,19 @@ export function ChatPage() {
     start(() => conversations.send(id, text, {}, fileIds)).then(() =>
       qc.invalidateQueries({ queryKey: ["files", id] }),
     );
+  // "다이어그램 고치기" (#182): the fix request goes as a new message of this conversation, like the composer's
+  // send — only while no run is in progress.
+  const fixDiagram = useMemo<DiagramFix>(
+    () => ({
+      send: busy
+        ? null
+        : (text: string) =>
+            void start(() => conversations.send(id, text, {}, [])).catch((e: unknown) =>
+              setActionError(errorText(e)),
+            ),
+    }),
+    [busy, id, start],
+  );
   // How many files the conversation already has (the 20-per-conversation limit counts sent ones too).
   const fileList = useQuery({ queryKey: ["files", id], queryFn: () => filesApi.list(id) });
   const conversationId = useCallback(async () => id, [id]);
@@ -372,49 +387,51 @@ export function ChatPage() {
       <div className="thread" data-testid="thread" ref={scroller}>
         {/* File citations and file chips open this conversation's file viewer (#24). */}
         <FileViewContext.Provider value={id}>
-          <div className="col" ref={content}>
-            {conv.data?.kind === "fork" && (
-              <p className="notice info small" data-testid="fork-notice">
-                가족이 공유한 내용을 복사한 내 대화예요. 여기서 이어가도 원래 대화는 바뀌지 않아요.
-              </p>
-            )}
-            {messages.hasNextPage && (
-              <button
-                type="button"
-                className="ghost small older"
-                disabled={messages.isFetchingNextPage}
-                onClick={() => void messages.fetchNextPage()}
-              >
-                {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
-              </button>
-            )}
-            {messages.isError && (
-              <div className="notice err" role="alert">
-                메시지를 불러오지 못했어요. {errorText(messages.error)}{" "}
-                <button type="button" className="small" onClick={() => void messages.refetch()}>
-                  다시 시도
+          <DiagramFixContext.Provider value={fixDiagram}>
+            <div className="col" ref={content}>
+              {conv.data?.kind === "fork" && (
+                <p className="notice info small" data-testid="fork-notice">
+                  가족이 공유한 내용을 복사한 내 대화예요. 여기서 이어가도 원래 대화는 바뀌지 않아요.
+                </p>
+              )}
+              {messages.hasNextPage && (
+                <button
+                  type="button"
+                  className="ghost small older"
+                  disabled={messages.isFetchingNextPage}
+                  onClick={() => void messages.fetchNextPage()}
+                >
+                  {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
                 </button>
-              </div>
-            )}
-            {list?.map((m) =>
-              m.role === "user" ? (
-                <UserMessage key={m.id} m={m} canEdit={!busy} onEdit={edit} />
-              ) : m.role === "system" ? (
-                <SystemMessage key={m.id} m={m} />
-              ) : m.role === "assistant" ? (
-                <AssistantMessage
-                  key={m.id}
-                  m={m}
-                  live={live && m.id === live.messageId ? live : null}
-                  after={after[m.id]}
-                  canRegenerate={!busy && m.id === lastAssistant?.id}
-                  onRegenerate={regenerate}
-                  onReconnect={reconnect}
-                  onStop={stop}
-                />
-              ) : null,
-            )}
-          </div>
+              )}
+              {messages.isError && (
+                <div className="notice err" role="alert">
+                  메시지를 불러오지 못했어요. {errorText(messages.error)}{" "}
+                  <button type="button" className="small" onClick={() => void messages.refetch()}>
+                    다시 시도
+                  </button>
+                </div>
+              )}
+              {list?.map((m) =>
+                m.role === "user" ? (
+                  <UserMessage key={m.id} m={m} canEdit={!busy} onEdit={edit} />
+                ) : m.role === "system" ? (
+                  <SystemMessage key={m.id} m={m} />
+                ) : m.role === "assistant" ? (
+                  <AssistantMessage
+                    key={m.id}
+                    m={m}
+                    live={live && m.id === live.messageId ? live : null}
+                    after={after[m.id]}
+                    canRegenerate={!busy && m.id === lastAssistant?.id}
+                    onRegenerate={regenerate}
+                    onReconnect={reconnect}
+                    onStop={stop}
+                  />
+                ) : null,
+              )}
+            </div>
+          </DiagramFixContext.Provider>
         </FileViewContext.Provider>
       </div>
       {away && (

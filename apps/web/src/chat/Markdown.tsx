@@ -1,4 +1,4 @@
-import { memo, useMemo, type ComponentProps, type ReactNode } from "react";
+import { createContext, memo, useContext, useMemo, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
@@ -6,6 +6,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { splitBlocks } from "./blocks.js";
 import { CopyButton } from "./CopyButton.js";
+import { fenceClosed } from "./mermaid.js";
+import { MermaidBlock } from "./MermaidBlock.js";
 import { rehypeCitationMarkers } from "../citations/markdown.js";
 import "katex/dist/katex.min.css";
 
@@ -16,7 +18,16 @@ import "katex/dist/katex.min.css";
  * runs with `trust: false` (no \href / \url / \htmlClass …).
  */
 
-type HastNode = { type: string; value?: string; children?: HastNode[]; tagName?: string };
+type HastNode = {
+  type: string;
+  value?: string;
+  children?: HastNode[];
+  tagName?: string;
+  position?: { start: { offset?: number }; end: { offset?: number } };
+};
+
+/** The markdown of the block being rendered: a code block reads its own source (fences included) from it. */
+const BlockText = createContext("");
 type MdNode = { type: string; value?: string; children?: MdNode[] };
 
 /** remark plugin: raw HTML nodes become plain text, so `<img onerror=…>` is shown, not parsed. */
@@ -57,6 +68,16 @@ function CodeBlock({ children, node }: { children?: ReactNode; node: HastNode | 
     .find((c) => c.startsWith("language-"))
     ?.slice("language-".length);
   const text = hastText(code).replace(/\n$/, "");
+  const block = useContext(BlockText);
+  if (lang === "mermaid") {
+    // Drawn only once the closing fence has arrived (a streaming reply shows the code until then, #182).
+    const at = node?.position;
+    const md =
+      at?.start.offset !== undefined && at.end.offset !== undefined
+        ? block.slice(at.start.offset, at.end.offset)
+        : "";
+    return <MermaidBlock source={text} closed={fenceClosed(md, text)} code={children} />;
+  }
   return (
     <div className="codeblk">
       <div className="ch">
@@ -140,15 +161,17 @@ export const MarkdownBlock = memo(function MarkdownBlock({
     [cite],
   );
   return (
-    <ReactMarkdown
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={withCite?.rehype ?? rehypePlugins}
-      components={withCite?.components ?? components}
-      urlTransform={safeUrl}
-      skipHtml={false}
-    >
-      {text}
-    </ReactMarkdown>
+    <BlockText.Provider value={text}>
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={withCite?.rehype ?? rehypePlugins}
+        components={withCite?.components ?? components}
+        urlTransform={safeUrl}
+        skipHtml={false}
+      >
+        {text}
+      </ReactMarkdown>
+    </BlockText.Provider>
   );
 });
 

@@ -127,7 +127,8 @@ import { registerNotificationRoutes } from "./notifications/routes.js";
 import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
 import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
 import { AppEvents } from "./events.js";
-import { isApiPath, isArtifactPath } from "./paths.js";
+import { isApiPath, isArtifactPath, routerPath } from "./paths.js";
+import { MERMAID_FRAME_PATH, registerMermaidFrame } from "./mermaid-frame.js";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
 import { isGatePath, registerGate, type GateOptions } from "./gate.js";
@@ -1293,6 +1294,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     }),
   );
 
+  // The diagram frame (#182): its own sandboxing CSP, no data.
+  registerMermaidFrame(app);
+
   if (config.diagStream) registerDiag(app, opts.diag);
 
   // Unknown API routes are JSON 404s, never the SPA page.
@@ -1329,7 +1333,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     const indexFile = path.join(WEB_ROOT, "index.html");
     appPage = (url) => vite.transformIndexHtml(url, fs.readFileSync(indexFile, "utf8"));
     app.use((req, res, next) => {
-      if (isApiPath(req.url) || isGatePath(req.url) || isArtifactPath(req.url)) return next();
+      if (
+        isApiPath(req.url) ||
+        isGatePath(req.url) ||
+        isArtifactPath(req.url) ||
+        routerPath(req.url) === MERMAID_FRAME_PATH
+      )
+        return next();
       for (const [k, v] of Object.entries(BASE_HEADERS)) res.setHeader(k, v);
       return vite.middlewares(req, res, next);
     });
