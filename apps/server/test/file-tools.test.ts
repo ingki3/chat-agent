@@ -4138,6 +4138,17 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect(
       (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
     ).toBe("exact");
+    // A link naming no citation cannot tell the two sheets apart: the file opens, nothing is underlined (7차).
+    const blind = await app.inject({
+      method: "GET",
+      url: `/api/files/${file.id}/view?loc=${encodeURIComponent(JSON.stringify(first.locator))}`,
+      headers: { ...LOCAL, cookie: f.cookies.owner },
+    });
+    expect((blind.json() as { target: unknown }).target).toEqual({
+      status: "unit",
+      reasons: ["ambiguous"],
+      seqs: [],
+    });
     const units = unitWith(db, file.id, "두 시트에");
     expect(units).toHaveLength(2);
     expect(units[0]!.text).toBe(units[1]!.text);

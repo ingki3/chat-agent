@@ -9,6 +9,7 @@ import {
   type ViewSegment,
   type ViewTarget,
 } from "@agentlee/shared";
+import { findSnippetAt } from "../citations/verify.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { SegmentRow } from "./extract.js";
 import { parseMarks, type Mark } from "./scrub.js";
@@ -43,8 +44,8 @@ export type CitedPassage = {
   unitHash?: string | null | undefined;
   /** The cited XLSX row's sheet number (stored with the citation): the sheet's address when names are masked alike. */
   sheetNo?: number | undefined;
-  /** The passage went on past the line it is placed on (recorded when it was found, #186 review 6차). */
-  spans?: boolean | undefined;
+  /** The row's whole cited passage (server-side only): whether it goes on past the line it is placed on. */
+  snippet?: string | undefined;
 };
 
 /** What the viewer knows of each unit now, by `seq`: its `unitHashOf` and its sheet's number (#186 review 4·5차). */
@@ -187,6 +188,10 @@ export function resolveTarget(
     if (run) hits = [run];
   }
   if (!hits.length) return none("not_found", "unit_missing");
+  // Rows of more than one sheet (names masked alike, a link naming no citation to tell them apart): which one the
+  // link means cannot be told — the file opens, nothing is underlined (review #186 7차).
+  if (place.kind === "cell_range" && new Set(hits.map((s) => units.get(s.seq)?.sheetNo)).size > 1)
+    return { status: "unit", reasons: ["ambiguous"], seqs: [] };
 
   const seqs = hits.map((s) => s.seq);
   const reasons = new Set<LocateReason>();
@@ -234,7 +239,12 @@ export function resolveTarget(
     if (!mine || key(mine.locator) !== k || !holds(mine)) {
       reasons.add("unverified");
       range = undefined;
-    } else if (mine.spans) start = true;
+    } else if (mine.snippet) {
+      // The unit is byte for byte the one verified: the passage found in it again shows whether it goes on past the
+      // line it is placed on (#186 review 6·7차 — no stored flag).
+      const m = loc.kind === "line" ? findSnippetAt(only!.text, mine.snippet) : undefined;
+      if (m?.found && only!.text.slice(m.start, m.end).includes("\n")) start = true;
+    }
   }
   if (range && only) {
     const over = only.marks.filter(

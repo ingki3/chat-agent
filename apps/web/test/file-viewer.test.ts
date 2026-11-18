@@ -17,7 +17,8 @@ import { CitationSources } from "../src/citations/CitationNote.js";
 import { CitationPreview } from "../src/citations/CitationMarker.js";
 import { citationView } from "../src/citations/segments.js";
 import { FileViewContext } from "../src/files/context.js";
-import { FileBody } from "../src/files/FileViewer.js";
+import { FileBody, viewProblem } from "../src/files/FileViewer.js";
+import { ApiError } from "../src/api.js";
 import {
   combine,
   hasMore,
@@ -656,5 +657,15 @@ describe("#186 review 6차: the link's citation, sheets by number", () => {
     expect(
       b.filter((x) => x.kind === "sheet").map((x) => (x.kind === "sheet" ? x.rows.map((r) => r.row) : [])),
     ).toEqual([[1, 2], [1]]);
+  });
+
+  it("a broken citation link (cite twice, or refused as malformed) is not a deleted or unshared file", () => {
+    expect(viewProblem(2, null, "c1", "c1")).toBe("invalid");
+    expect(viewProblem(1, new ApiError(400, "invalid_request"), undefined, "c1")).toBe("invalid");
+    expect(viewProblem(1, new ApiError(403, "forbidden"), undefined, "c1")).toBe("refused");
+    expect(viewProblem(0, new ApiError(404, "not_found"), undefined, "c1")).toBe("refused");
+    expect(viewProblem(1, null, "c2", "c1")).toBe("refused");
+    expect(viewProblem(1, null, "c1", "c1")).toBeNull();
+    expect(viewProblem(0, null, undefined, "c1")).toBeNull();
   });
 });

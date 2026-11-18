@@ -51,13 +51,30 @@ import "./files.css";
  * response the download uses); PDF pages are never rendered from the original. Every request goes through the
  * share projection on the server (#29).
  */
+/**
+ * Why the viewer shows no file (#186 review 7차): a broken citation link (`cite` given twice, or refused as malformed —
+ * 400) is not a deleted or unshared file (403, 404, or a file of another conversation).
+ */
+export function viewProblem(
+  cites: number,
+  error: unknown,
+  fileConversationId: string | undefined,
+  conversationId: string,
+): "invalid" | "refused" | null {
+  if (cites > 1 || (error instanceof ApiError && error.status === 400)) return "invalid";
+  if (error instanceof ApiError && [403, 404].includes(error.status)) return "refused";
+  return fileConversationId !== undefined && fileConversationId !== conversationId ? "refused" : null;
+}
+
 export function FileViewerPage({ conversationId, fileId }: { conversationId: string; fileId: string }) {
   const { search } = useLocation();
   const params = new URLSearchParams(search);
   const loc = parseLocParam(params.get("loc"));
-  // The citation the link opens (#186 review 5·6차): the server judges the range by it alone. Only a missing one is
-  // "none" — any value given (even empty) goes to the server as it is, which refuses a malformed one.
-  const cite = params.get("cite") ?? undefined;
+  // The citation the link opens (#186 review 5–7차): the server judges the range by it alone. Only a missing one is
+  // "none" — a value given (even empty) goes to the server as it is, which refuses a malformed one; two are a broken
+  // link here already.
+  const cites = params.getAll("cite");
+  const cite = cites.length > 1 ? "" : cites[0];
   const navigate = useNavigate();
   const fetch: ViewFetch = (o, signal) => files.view(fileId, { ...o, cite }, signal);
   // This visit: no query of an earlier one (a request still on its way included) is ever read here.
@@ -75,10 +92,7 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
     else void navigate(`/c/${encodeURIComponent(conversationId)}`);
   };
   const first = view.data;
-  const refused =
-    view.error instanceof ApiError && [400, 403, 404].includes(view.error.status)
-      ? true
-      : !!first && first.file.conversationId !== conversationId;
+  const problem = viewProblem(cites.length, view.error, first?.file.conversationId, conversationId);
   const bar = (title: ReactNode, file?: UploadedFile) => (
     <TopBar title={title}>
       <button type="button" className="small ghost" onClick={back} data-testid="file-view-back">
@@ -91,7 +105,17 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
       )}
     </TopBar>
   );
-  if (refused)
+  if (problem === "invalid")
+    return (
+      <>
+        {bar("📄 파일")}
+        <div className="empty" role="alert" data-testid="file-view-invalid">
+          <p>인용 링크가 올바르지 않아요.</p>
+          <p className="muted small">대화의 출처 목록에서 그 인용을 다시 눌러 열어 주세요.</p>
+        </div>
+      </>
+    );
+  if (problem === "refused")
     return (
       <>
         {bar("📄 파일")}

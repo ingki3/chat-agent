@@ -389,7 +389,6 @@ export function registerFileRoutes(
                   const raw = JSON.parse(c.locator) as {
                     textHash?: unknown;
                     sheetNo?: unknown;
-                    spans?: unknown;
                   };
                   const l = FileLocator.safeParse(raw);
                   const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
@@ -402,7 +401,7 @@ export function registerFileRoutes(
                           textHash,
                           unitHash: c.unitHash,
                           sheetNo,
-                          spans: raw.spans === true,
+                          snippet: c.snippet,
                         },
                       ]
                     : [];
