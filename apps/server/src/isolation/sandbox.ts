@@ -396,6 +396,8 @@ export type SpawnIsolatedOptions = SandboxPolicy & {
    * render watchdog, #170, which starts the sandboxed program as its child and kills it when the server is gone).
    */
   wrap?: string[];
+  /** Descriptors of this process handed to the child after the extra pipes (fd 3 + extraPipes, …) — e.g. a lock. */
+  inheritFds?: number[];
 };
 
 /**
@@ -416,7 +418,7 @@ export function spawnIsolated(o: SpawnIsolatedOptions): ChildProcessWithoutNullS
     cwd: o.cwd,
     env: o.env,
     detached: true,
-    stdio: Array<"pipe">(3 + (o.extraPipes ?? 0)).fill("pipe"),
+    stdio: [...Array<"pipe">(3 + (o.extraPipes ?? 0)).fill("pipe"), ...(o.inheritFds ?? [])],
   }) as ChildProcessWithoutNullStreams & { isolationKill?: "memory" | "monitor" };
   const pid = child.pid;
   let exited = false;

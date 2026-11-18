@@ -685,7 +685,7 @@ const FAKE_JS = path.join(FIXTURES, "fake-browser.mjs");
 const FAKE = () => [FAKE_JS, "orphan"];
 const freshRenderDir = () => {
   const d = makeRenderDir(os.tmpdir());
-  closers.push(async () => removeRenderDir(d.workDir, d.lock));
+  closers.push(async () => removeRenderDir(d));
   return d;
 };
 /** The watchdog straight from the unsandboxed launcher, on a fresh folder (or one given). */
@@ -699,7 +699,7 @@ function watchdog(
     args,
     env: o.env ?? {},
     workDir: d.workDir,
-    lock: d.lock,
+    lockFd: d.lockFd,
     proxyPort: 1,
     deadlineSec: o.deadlineSec ?? 30,
   });
@@ -854,6 +854,64 @@ describe("the browser never outlives its owner (#170)", () => {
     for (let i = 0; i < 5; i++) await rightAfterSpawn((l) => process.kill(l.child.pid!, "SIGKILL"));
   }, 60_000);
 
+  it("the group is signalled at most once per render: shutdown right after the spawn, or the time limit", async () => {
+    const kill = vi.spyOn(process, "kill");
+    try {
+      const signals = (pgid: number) =>
+        kill.mock.calls.filter(([p, sig]) => p === -pgid && sig === "SIGKILL").length;
+      // Shut down right after the spawn: `killLiveRenders`, then the render's own failure path — one signal.
+      let first: Launched | undefined;
+      const r1 = new Renderer({
+        browser: process.execPath,
+        launcher: (sp) => {
+          first = track(unsandboxedLauncher(sp));
+          closeRenderers();
+          return first;
+        },
+        egress: spyEgress().egress,
+        test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+      });
+      closers.push(() => r1.close());
+      expect((await r1.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+      expect(await gone(first!.child.pid!, 3000)).toBe(true);
+      expect(signals(first!.child.pid!)).toBe(1);
+      // The time limit: its kill, then the failed render's kill — one signal.
+      let second: Launched | undefined;
+      const r2 = new Renderer({
+        browser: process.execPath,
+        launcher: (sp) => (second = track(unsandboxedLauncher(sp))),
+        egress: spyEgress().egress,
+        limits: { timeoutMs: 500 },
+        test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+      });
+      closers.push(() => r2.close());
+      expect(await r2.render(job("markdown", "x", "pdf"))).toEqual({ ok: false, code: "export_timeout" });
+      expect(await gone(second!.child.pid!, 3000)).toBe(true);
+      await new Promise((done) => setTimeout(done, 200));
+      expect(signals(second!.child.pid!)).toBe(1);
+    } finally {
+      kill.mockRestore();
+    }
+  }, 30_000);
+
+  it("TERM to the watchdog: it stops the browser (still running: killed and reaped) and cleans up", async () => {
+    const w = watchdog(FAKE());
+    const pgid = w.l.child.pid!;
+    let seen: number[] = [];
+    expect(
+      await within(10_000, () => {
+        void members(pgid).then((m) => (seen = m));
+        return seen.length >= 2;
+      }),
+    ).toBe(true);
+    process.kill(pgid, "SIGTERM");
+    expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+    expect(await gone(pgid, 2000)).toBe(true);
+    for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
+    expect(fs.existsSync(w.workDir)).toBe(false);
+    expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
+  }, 30_000);
+
   it("the watchdog's own cap (monotonic clock) stops a browser the (living) owner never stops, and cleans up", async () => {
     const started = Date.now();
     const w = watchdog(FAKE(), { deadlineSec: 1 });
@@ -889,6 +947,7 @@ describe("the browser never outlives its owner (#170)", () => {
       /** A render folder holding an immutable file (macOS `uchg`): nothing — not even its owner — removes it. */
       const undeletable = () => {
         const d = makeRenderDir(root);
+        closers.push(async () => removeRenderDir(d)); // closes the server's descriptor
         const f = path.join(d.workDir, "stuck");
         fs.writeFileSync(f, "synthetic");
         expect(flags(f, true)).toBe(0);
@@ -896,7 +955,7 @@ describe("the browser never outlives its owner (#170)", () => {
         return d;
       };
       const server = undeletable();
-      removeRenderDir(server.workDir, server.lock);
+      removeRenderDir(server);
       expect(fs.existsSync(server.workDir)).toBe(true);
       expect(fs.existsSync(renderLockPath(server.workDir))).toBe(true);
       const wd = undeletable();
@@ -905,6 +964,10 @@ describe("the browser never outlives its owner (#170)", () => {
       w.l.input.end();
       expect(await w.exited).toBe(WATCHDOG_EXIT.done);
       expect(fs.existsSync(wd.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(wd.workDir))).toBe(true);
+      // The server's own clean-up after it (its `finally`) fails the same way, and closes its descriptor: the lock is
+      // free only now (flock belongs to the open file, which the server shares with the watchdog and the browser).
+      removeRenderDir(wd);
       expect(fs.existsSync(renderLockPath(wd.workDir))).toBe(true);
       // Once removable, the sweep (the locks are free) takes both.
       for (const f of stuck) flags(f, false);
@@ -926,41 +989,54 @@ describe("the browser never outlives its owner (#170)", () => {
     }
   }, 30_000);
 
-  it("the lock: only the very file the server created — another file or a FIFO in its place is not started on (and does not hang)", async () => {
-    const run = (d: RenderDir) => {
-      const l = unsandboxedLauncher({
+  it("the lock: the watchdog locks the server's own descriptor — a file put at the path is neither locked nor unlinked", async () => {
+    /** Whether `file` can be flocked right now (a separate process, without waiting). */
+    const lockable = (file: string) =>
+      spawnSync("/usr/bin/perl", [
+        "-e",
+        'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, 6) ? exit 0 : exit 1',
+        file,
+      ]).status === 0;
+    const d = freshRenderDir();
+    const lockPath = renderLockPath(d.workDir);
+    // The server's file moves away (kept, so its inode cannot be reused); another file takes the path.
+    fs.renameSync(lockPath, `${lockPath}.orig`);
+    closers.push(async () => fs.rmSync(`${lockPath}.orig`, { force: true }));
+    fs.writeFileSync(lockPath, "");
+    closers.push(async () => fs.rmSync(lockPath, { force: true }));
+    expect(fs.statSync(lockPath).ino).not.toBe(fs.statSync(`${lockPath}.orig`).ino);
+    const w = watchdog([FAKE_JS, "ok"], { dir: d });
+    expect(await within(5000, () => !lockable(`${lockPath}.orig`))).toBe(true); // the server's file: held
+    expect(lockable(lockPath)).toBe(true); // the stand-in at the path: not
+    w.l.input.end();
+    expect(await w.exited).toBe(WATCHDOG_EXIT.done);
+    expect(fs.existsSync(d.workDir)).toBe(false);
+    expect(fs.existsSync(lockPath)).toBe(true); // not the file it locked: left alone
+    expect(fs.existsSync(`${lockPath}.orig`)).toBe(true);
+  }, 30_000);
+
+  it("the lock: no descriptor 5, or one that is not a regular file, and the watchdog does not start", async () => {
+    const d = freshRenderDir();
+    const start = (fd5: "ignore" | "pipe") => {
+      const [command, ...args] = watchdogPrefix({
         browser: process.execPath,
         args: FAKE(),
         env: {},
         workDir: d.workDir,
-        lock: d.lock,
+        lockFd: d.lockFd,
         proxyPort: 1,
         deadlineSec: 30,
       });
-      track(l);
-      return new Promise<number | null>((r) => l.child.once("exit", (code) => r(code)));
+      const child = spawn(command!, [...args, process.execPath, ...FAKE()], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore", "pipe", "pipe", fd5],
+      });
+      startedGroups.add(child.pid!);
+      return new Promise<number | null>((r) => child.once("exit", (code) => r(code)));
     };
-    // Same path, another regular file. (The stand-ins at the lock paths are removed whatever happens.)
-    const a = freshRenderDir();
-    const b = freshRenderDir();
-    closers.push(async () => {
-      for (const d of [a, b]) fs.rmSync(renderLockPath(d.workDir), { force: true });
-    });
-    fs.unlinkSync(renderLockPath(a.workDir));
-    fs.writeFileSync(renderLockPath(a.workDir), "");
-    expect(await run(a)).toBe(WATCHDOG_EXIT.notStarted);
-    expect(fs.existsSync(renderLockPath(a.workDir))).toBe(true); // not ours: left alone
-    // A FIFO: opened without blocking, refused at once.
-    fs.unlinkSync(renderLockPath(b.workDir));
-    expect(spawnSync("/usr/bin/mkfifo", [renderLockPath(b.workDir)]).status).toBe(0);
-    const started = Date.now();
-    expect(await run(b)).toBe(WATCHDOG_EXIT.notStarted);
-    expect(Date.now() - started).toBeLessThan(2000);
-    // The right file, a wrong identity passed in.
-    const c = freshRenderDir();
-    expect(await run({ workDir: c.workDir, lock: { dev: c.lock.dev, ino: c.lock.ino + 1 } })).toBe(
-      WATCHDOG_EXIT.notStarted,
-    );
+    expect(await start("ignore")).toBe(WATCHDOG_EXIT.notStarted);
+    expect(await start("pipe")).toBe(WATCHDOG_EXIT.notStarted);
+    expect(fs.existsSync(renderLockPath(d.workDir))).toBe(true);
   }, 30_000);
 
   it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end kills its group", async () => {
@@ -1197,7 +1273,7 @@ describe("the production launcher's sandbox policy (checked on every platform)",
       browserDir,
       workDir,
       proxyPort: 41234,
-      lock: { dev: 1, ino: 2 },
+      lockFd: 7,
       deadlineSec: 30,
       env: { HOME: path.join(workDir, "home"), TMPDIR: path.join(workDir, "tmp") },
       args: browserArgs(path.join(workDir, "profile"), "http://127.0.0.1:41234"),
@@ -1219,9 +1295,11 @@ describe("the production launcher's sandbox policy (checked on every platform)",
       extraPipes: 2,
       // The watchdog (#170) in front of sandbox-exec, outside the sandbox: owner = this process, the cap, the folder.
       wrap: watchdogPrefix(s),
+      // The server's descriptor of the lock, as the watchdog's fd 5.
+      inheritFds: [7],
     });
     expect(o.wrap!.slice(0, 2)).toEqual(["/usr/bin/perl", "-e"]);
-    expect(o.wrap!.slice(3)).toEqual([String(process.pid), "30", s.workDir, "1", "2"]);
+    expect(o.wrap!.slice(3)).toEqual([String(process.pid), "30", s.workDir]);
   });
 
   it("the generated profile: deny by default, no fork, no other network, no other writes", () => {
@@ -1394,7 +1472,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
       env: {},
       workDir,
       proxyPort,
-      lock: { dev: 0, ino: 0 },
+      lockFd: -1,
       deadlineSec: 30,
     });
     const r = await runIsolated({

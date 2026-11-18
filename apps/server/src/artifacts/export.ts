@@ -32,7 +32,7 @@ import {
   trackRender,
   WATCHDOG_EXIT,
   WATCHDOG_MAX_SEC,
-  type LockId,
+  type RenderDir,
   type Launched,
   type Launcher,
 } from "./browser.js";
@@ -313,7 +313,7 @@ export class Renderer {
     const dataDir = this.o.account?.dataDir;
     let made: { jobId: string; dir: string } | undefined;
     let workDir: string;
-    let lock: LockId | undefined;
+    let render: RenderDir | undefined;
     try {
       if (worker) {
         if (!dataDir) return { ok: false, code: "export_unavailable" };
@@ -321,9 +321,8 @@ export class Renderer {
         workDir = made.dir;
       } else {
         // The folder and its lock file beside it, both new (#170).
-        const d = makeRenderDir(this.o.tmpDir ?? os.tmpdir());
-        workDir = d.workDir;
-        lock = d.lock;
+        render = makeRenderDir(this.o.tmpDir ?? os.tmpdir());
+        workDir = render.workDir;
       }
     } catch {
       return { ok: false, code: "export_unavailable" };
@@ -336,7 +335,7 @@ export class Renderer {
           // the self-check's look never decides the clean-up
         }
         removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
-      } else removeRenderDir(workDir, lock);
+      } else if (render) removeRenderDir(render);
     };
     const home = path.join(workDir, "home");
     const tmp = path.join(workDir, "tmp");
@@ -362,7 +361,7 @@ export class Renderer {
               args,
               env,
               workDir,
-              lock: lock!,
+              lockFd: render!.lockFd,
               proxyPort: proxy.port,
               // The watchdog's own cap (#170): a backstop a little past ours, enforced outside this process.
               deadlineSec: Math.min(WATCHDOG_MAX_SEC, Math.ceil(L.timeoutMs / 1000) + 10),
@@ -379,13 +378,20 @@ export class Renderer {
     // interrupted) may leave the browser behind in the group: the server signals the group at that moment — the first
     // it learns of the end, never after seeing the group gone — unless it already killed it itself (its own limits,
     // or `killLiveRenders`). Then it forgets it. The folder goes in this render's `finally`.
+    // The group is signalled at most once per render: by its limits here, by `killLiveRenders`, or on the watchdog's
+    // abnormal end — whichever comes first.
     let groupKilled = false;
+    let tracked = () => false;
     if (!worker && pid) {
-      const t = trackRender(pid, { workDir, lock: lock! });
+      const t = trackRender(pid, render!);
+      tracked = t.tracked;
       child.once("exit", (code) => {
         const X = WATCHDOG_EXIT;
         const clean = code === X.done || code === X.stopped || code === X.notStarted || code === X.execFailed;
-        if (!clean && !groupKilled && t.tracked()) killRenderGroup(pid);
+        if (!clean && !groupKilled && t.tracked()) {
+          groupKilled = true;
+          killRenderGroup(pid);
+        }
         t.untrack();
       });
     }
@@ -424,6 +430,7 @@ export class Renderer {
         return;
       }
       killed ??= why;
+      if (groupKilled || !tracked()) return;
       groupKilled = true;
       killRenderGroup(pid!);
     };

@@ -658,15 +658,20 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
   - **sweep:** 서버 시작 때와 10분마다, 10분 넘은 `agentlee-render-`+영숫자 6자 폴더 중 **옆의 잠금 파일이 있고 풀려 있는 것만** 지운다(한 번에 45초까지, 다음 번에 이어 감). 서버 종료 때 돌던 sweep도 함께 끝난다. 프로세스는 죽이지 않는다.
   - **잠금 파일이 없는 폴더는 자동으로 지우지 않는다**(감시자 이전 버전의 렌더, 잠금을 만들기 전에 죽은 서버). 로그에 `artifact.render_dirs_kept`(개수만)가 보이면 서비스 계정으로 직접 지운다. 먼저 렌더가 돌고 있지 않은지(아래 점검) 확인하고 후보를 **목록으로만** 본다 — sweep과 같은 이름 규칙(ASCII 영숫자 6자), 우리 소유, 옆 잠금 없음, 하루 넘은 것:
     ```bash
-    T="$(getconf DARWIN_USER_TEMP_DIR)"   # 서비스 계정의 임시 폴더(서버의 os.tmpdir())
+    T="$(getconf DARWIN_USER_TEMP_DIR)"; T="${T%/}"   # 서비스 계정의 임시 폴더(서버의 os.tmpdir())
     LC_ALL=C find -E "$T" -maxdepth 1 -type d -regex '.*/agentlee-render-[A-Za-z0-9]{6}' -user "$(id -un)" -mtime +1 \
       -exec sh -c '[ -e "$1.lock" ] || [ -L "$1.lock" ] || echo "$1"' _ {} \;
     ```
-    목록에서 지울 것을 **골라 그 경로만** 적는다(다시 검색해서 지우지 않는다 — 검토한 목록과 지우는 대상이 달라질 수 있다). 각 경로는 지우기 직전에 종류·소유자·옆 잠금 없음을 다시 확인한다:
+    목록에서 지울 것을 **골라 그 경로만** 적는다(다시 검색해서 지우지 않는다 — 검토한 목록과 지우는 대상이 달라질 수 있다). 각 경로는 지우기 직전에 다시 확인한다: `$T`의 바로 아래인지, 이름이 정확히 렌더 이름인지, 진짜 폴더(링크 아님)인지, 우리 소유인지, 하루가 넘었는지, 옆 잠금이 없는지:
     ```bash
+    T="$(getconf DARWIN_USER_TEMP_DIR)"; T="${T%/}"
     for d in '/…/agentlee-render-AbC123' '/…/agentlee-render-xYz789'; do   # 고른 경로들
-      [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -f %u "$d")" = "$(id -u)" ] \
-        && [ ! -e "$d.lock" ] && [ ! -L "$d.lock" ] && rm -rf -- "$d" && echo "removed $d"
+      [ "$(dirname "$d")" = "$T" ] \
+        && printf '%s\n' "$(basename "$d")" | LC_ALL=C grep -Eqx 'agentlee-render-[A-Za-z0-9]{6}' \
+        && [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -f %u "$d")" = "$(id -u)" ] \
+        && [ -n "$(find "$d" -maxdepth 0 -mtime +1)" ] \
+        && [ ! -e "$d.lock" ] && [ ! -L "$d.lock" ] \
+        && rm -rf -- "$d" && echo "removed $d" || echo "kept $d"
     done
     ```
   - 점검: `pgrep -fl chrome-headless-shell`로 보이는 것 중 `--user-data-dir=…/agentlee-render-` 인 것이 렌더가 없을 때 남아 있으면 이슈다. 직접 끌 때는 이름 패턴(`pkill`)이 아니라 그 pid의 **프로세스 그룹**을 확인하고(`ps -o pid,pgid,ppid,command -p <pid>`) 그 그룹만 끈다(`kill -KILL -<pgid>`) — 다른 도구의 헤드리스 셸도 같은 이름이다. 그 뒤 잠금이 풀리므로 다음 sweep이 폴더를 지운다.
