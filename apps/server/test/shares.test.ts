@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CitationNotePart,
+  type MessagePart,
   CreateConversationShareRequest,
   CSRF_HEADER,
   SharedView,
@@ -30,6 +31,8 @@ import { CitationStore } from "../src/citations/store.js";
 import { projectEvent, projectPart } from "../src/shares/projection.js";
 import { notifyResultSubscribers } from "../src/shares/notify.js";
 import { remapParts } from "../src/shares/fork.js";
+import { snippetKey } from "../src/citations/store.js";
+import { citationNote } from "../src/citations/checker.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -209,25 +212,9 @@ async function snapshotWorld(o: { runner?: DocRunner } = {}) {
 
 /** Each turn's answer cites its page (the note the run's end would write): S1 in turn 1, S2 in turn 2. */
 function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
-  // Each note entry stands for a citation row of the original (#186 review 2차: the whole passage is kept there).
-  const row = (sourceId: string) => {
-    const id = crypto.randomUUID();
-    w.db.$client
-      .prepare(
-        `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote)
-         values (?, ?, ?, ?, 1, ?, 'verified', ?, ?, '인용')`,
-      )
-      .run(
-        id,
-        crypto.randomUUID(),
-        w.c.id,
-        w.f.users.owner.id,
-        sourceId,
-        `원문 구절 전체 ${sourceId}`,
-        `k-${id}`,
-      );
-    return id;
-  };
+  // Each note entry stands for the citation row its run registered (#186 review 2차: the whole passage is there).
+  const row = (sourceId: string) =>
+    (w.db.$client.prepare("select id from citations where source_id = ?").get(sourceId) as { id: string }).id;
   const note = (n: number, sourceId: string, url: string) => ({
     type: "citation_note",
     missing: [],
@@ -1104,7 +1091,7 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
         id: rowId,
         user_id: w.f.users.shared.id,
         source_id: srcs[0]!.id,
-        snippet: `원문 구절 전체 ${w.s1}`,
+        snippet: "사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다.",
         n: 1,
       }),
     ]);
@@ -1156,6 +1143,60 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
     expect((await w.viewer.get(`/api/conversations/${fork.id}/messages`)).statusCode).toBe(200);
   });
 
+  it("#186 review 3차: fork → share → fork keeps the citation row (and its source); a follow-up [1] there is checked against it", async () => {
+    const w = await snapshotWorld();
+    citeInNotes(w);
+    const first = (await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).json<Fork>().conversation;
+    // The forker shares the copy on; the owner forks that.
+    const again = await w.viewer.send("POST", `/api/conversations/${first.id}/shares`, {
+      target: { audience: "family" },
+      mode: "live",
+    });
+    expect(again.statusCode, again.body).toBe(201);
+    const second = (await w.owner.send("POST", `/api/shares/${again.json<Share>().id}/fork`)).json<Fork>()
+      .conversation;
+    const rows = (id: string) =>
+      w.db.$client
+        .prepare(
+          "select id, run_id as r, source_id as s, snippet, complete from citations where conversation_id = ?",
+        )
+        .all(id) as { id: string; r: string; s: string; snippet: string; complete: number }[];
+    const [r1] = rows(first.id);
+    const [r2] = rows(second.id);
+    expect(r1?.r.startsWith("fork:")).toBe(true);
+    // The first copy's row (a run of no `runs` row) went into the re-share and on into the second copy.
+    expect(r2).toMatchObject({
+      snippet: "사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다.",
+      complete: 1,
+    });
+    expect(r2!.id).not.toBe(r1!.id);
+    const srcs = w.db.$client.prepare("select id from sources where conversation_id = ?").all(second.id) as {
+      id: string;
+    }[];
+    expect(srcs.map((x) => x.id)).toEqual([r2!.s]);
+    const msgs = w.app.conversations!.messages(second.id, { limit: 100 });
+    const note = msgs.flatMap((m) => m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+    expect(note?.type === "citation_note" && note.citations[0]!.citationId).toBe(r2!.id);
+    // A follow-up in the second copy writing [1] again: carried by that row, checked against the copy's source.
+    // (A fork copies no page text — fetch_failed; with the text there, the whole passage verifies.)
+    const store = new CitationStore(w.db);
+    const carry = {
+      conversationId: second.id,
+      userId: w.f.users.owner.id,
+      previous: () => (note?.type === "citation_note" ? note.citations : []),
+    };
+    const follow = (runId: string) =>
+      citationNote(runId, [{ type: "text", text: "앞서 말했듯이 그래요[1]." }], store, carry)!.citations[0]!;
+    expect([follow(crypto.randomUUID()).status, follow(crypto.randomUUID()).sourceId]).toEqual([
+      "fetch_failed",
+      r2!.s,
+    ]);
+    w.db.$client
+      .prepare("update sources set kind = 'page', body = ?, body_hash = null where id = ?")
+      .run("본문 앞. 사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다. 그리고 끝.", r2!.s);
+    expect(follow(crypto.randomUUID()).status).toBe("verified");
+  });
+
   it("keeps a secret registered after the original was stored out of the copy (#78)", async () => {
     const w = await start();
     const late = `sk-ant-forklate${crypto.randomUUID().replaceAll("-", "")}`;
@@ -1166,14 +1207,79 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
       title: `문서 ${late}`,
       content: `# 본문 ${late}`,
     });
-    w.cite(c.id, t.run.id, `https://late.example/${late}`, `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`);
+    const lateSrc = w.cite(
+      c.id,
+      t.run.id,
+      `https://late.example/${late}`,
+      `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`,
+    );
+    // A citation row holding the value in full (#186 review 3차), named by the answer's note: copied, masked now.
+    const rowId = crypto.randomUUID();
+    const lateSnippet = `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`;
+    w.db.$client
+      .prepare(
+        `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote,
+           complete) values (?, ?, ?, ?, 2, ?, 'verified', ?, ?, ?, 1)`,
+      )
+      .run(
+        rowId,
+        t.run.id,
+        c.id,
+        w.f.users.owner.id,
+        lateSrc,
+        lateSnippet,
+        snippetKey(lateSnippet),
+        lateSnippet,
+      );
+    const reply = w.app.conversations!.messageById(t.run.assistantMessageId)!;
+    w.db
+      .update(messages)
+      .set({
+        parts: [
+          ...(reply.parts as object[]),
+          {
+            type: "citation_note",
+            missing: [],
+            markers: [],
+            citations: [
+              {
+                n: 2,
+                status: "verified",
+                sourceId: lateSrc,
+                title: "t",
+                site: "example.com",
+                url: "https://late.example/x",
+                publishedAt: null,
+                quote: "인용",
+                citationId: rowId,
+              },
+            ],
+          },
+        ] as Message["parts"],
+      })
+      .where(eq(messages.id, reply.id))
+      .run();
     const share = await w.share(c.id, { target: { audience: "family" }, mode: "live" });
     knownSecrets.add(late);
     try {
       const r = await w.viewer.send("POST", `/api/shares/${share.id}/fork`);
       expect(r.statusCode).toBe(201);
       const id = r.json<Fork>().conversation.id;
-      for (const table of ["conversations", "messages", "artifacts", "artifact_versions", "sources"]) {
+      const copied = w.db.$client
+        .prepare("select snippet, snippet_key as k, quote from citations where conversation_id = ?")
+        .all(id) as { snippet: string; k: string; quote: string }[];
+      expect(copied).toHaveLength(1);
+      expect(copied[0]!.snippet).toContain("[숨김]");
+      // The key is the masked snippet's (never the value's).
+      expect(copied[0]!.k).toBe(snippetKey(copied[0]!.snippet));
+      for (const table of [
+        "conversations",
+        "messages",
+        "artifacts",
+        "artifact_versions",
+        "sources",
+        "citations",
+      ]) {
         const col =
           table === "artifact_versions"
             ? "artifact_id"

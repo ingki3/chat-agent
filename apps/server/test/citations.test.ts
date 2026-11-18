@@ -1424,7 +1424,7 @@ describe("citationNote", () => {
     const carry = {
       conversationId: f.c.id,
       userId: later.userId,
-      previous: () => ({ citations: [...earlier, fileEntry] }),
+      previous: () => [...earlier, fileEntry],
     };
     const note = citationNote(later.runId, text("가[1]. 나[2]. 다[3]. 라[5]. 마[6]."), f.cites, carry)!;
     expect(note.citations.map((c) => [c.n, c.status, c.sourceId])).toEqual([
@@ -1466,7 +1466,7 @@ describe("citationNote", () => {
 
   it("review #153 1: a run whose cite was refused (nothing registered) carries nothing over", () => {
     const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
-    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => ({ citations: earlier }) };
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
     const refused = f.run(f.c.id);
     // `cite_snippet_too_short`: a call that registered no row.
     expect(() => f.cites.cite(refused, { sourceId: src.id, snippet: "짧다" })).toThrow(CiteRefused);
@@ -1489,13 +1489,13 @@ describe("citationNote", () => {
 
   it("review #153 2: an answer with carried numbers is checked for paragraphs without one", () => {
     const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
-    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => ({ citations: earlier }) };
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
     const t = "요약하면 수출이 늘었어요[1].\n\n반도체 가격도 두 배가 됐어요.";
     const note = citationNote(f.run(f.c.id).runId, text(t), f.cites, carry)!;
     expect(note.citations.map((c) => c.status)).toEqual(["verified"]);
     expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["반도체 가격도 두 배가 됐어요."]);
     // Nothing carried (no earlier note) and no source tool: the marker is flagged, no paragraph check, no sources.
-    const none = { ...carry, previous: () => ({ citations: [] }) };
+    const none = { ...carry, previous: () => [] };
     expect(citationNote(f.run(f.c.id).runId, text(t), f.cites, none)).toMatchObject({
       citations: [expect.objectContaining({ n: 1, status: "unknown_source" })],
       missing: [],
@@ -1560,7 +1560,7 @@ describe("citationNote", () => {
     };
     // An entry no row stands for (made up, or stored before ids without a run to look in): not carried.
     const orphan: CitationEntry = { ...earlier[0]!, n: 3, citationId: undefined };
-    const previous = () => ({ citations: [...earlier, orphan] });
+    const previous = () => [...earlier, orphan];
     const carry = { conversationId: f.c.id, userId: scope.userId, previous, recheckFile };
     const t = "요약하면 쓰레기를 치웠어요[1]. 학교도 함께했어요[2]. 다른 말이에요[3].";
     const note = citationNote(f.run(f.c.id).runId, text(t), store, carry)!;
@@ -1609,17 +1609,11 @@ describe("citationNote", () => {
     expect(citationNote(f.run(f.c.id).runId, text("가[1]."), store, bare)!.citations[0]!.status).toBe(
       "unknown_source",
     );
-    // An entry stored before ids: found by its answer's run and number.
+    // An entry stored before ids (review 3차): never carried, whatever rows its answer had.
     const legacy = earlier.map(({ citationId: _id, ...e }) => (void _id, e));
-    const byRun = { ...carry, previous: () => ({ citations: legacy, runId: first.runId }) };
     expect(
-      citationNote(f.run(f.c.id).runId, text("가[1]."), store, byRun)!.citations.map((c) => c.status),
-    ).toEqual(["verified"]);
-    expect(
-      citationNote(f.run(f.c.id).runId, text("가[1]."), store, {
-        ...byRun,
-        previous: () => ({ citations: legacy }),
-      })!.citations[0]!.status,
+      citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, previous: () => legacy })!
+        .citations[0]!.status,
     ).toBe("unknown_source");
     // A run that read, searched, listed or cited (its own numbers): no carry.
     for (const name of ["mcp__agentlee__file_search", "file_read", "file_list", "mcp__agentlee__file_cite"]) {
@@ -1644,26 +1638,30 @@ describe("citationNote", () => {
     ).toThrow("cite_snippet_too_long");
     expect(f.cites.forRun(run.runId)).toEqual([]);
     // The tool schemas count the same units.
-    for (const tool of [CITE_TOOL, FILE_CITE_TOOL]) {
+    // The tool schemas count the same units: 500 passes, 501 does not (one id per tool — the schemas are strict).
+    const ok = "가".repeat(CITATION_LIMITS.snippet);
+    for (const [tool, input] of [
+      [CITE_TOOL, { sourceId: "s" }],
+      [FILE_CITE_TOOL, { fileId: "f" }],
+    ] as const) {
       const schema = z.strictObject(tool.input);
-      expect(schema.safeParse({ sourceId: "s", fileId: "f", snippet: long }).success, tool.name).toBe(false);
+      expect(schema.safeParse({ ...input, snippet: ok }).success, tool.name).toBe(true);
+      expect(schema.safeParse({ ...input, snippet: `${ok}😀` }).success, tool.name).toBe(false);
+      expect(schema.safeParse({ ...input, snippet: long }).success, tool.name).toBe(false);
+      expect(tool.description, tool.name).toContain("at most 500 UTF-16 units");
     }
-    // A row stored before (cut at the old limit — 500 units, or 499 before a pair): its passage may be a prefix.
+    // A row stored before (review 3차: not marked complete — its snippet may have been cut, then masked to any
+    // length): never carried, whatever its length.
     const old = f.run(f.c.id);
     f.cites.cite(old, { sourceId: src.id, snippet: SNIP });
     const row = f.cites.forRun(old.runId)[0]!;
-    f.db
-      .update(citations)
-      .set({ snippet: `${SNIP} ${"나".repeat(499 - SNIP.length - 1)}` })
-      .where(eq(citations.id, row.id))
-      .run();
-    expect(
-      f.cites.rowFor({ conversationId: f.c.id, userId: old.userId }, { citationId: row.id, n: 1 }),
-    ).toMatchObject({
-      whole: false,
-    });
+    expect(row.complete).toBe(true);
+    const scopeOf = { conversationId: f.c.id, userId: old.userId };
+    expect(f.cites.rowFor(scopeOf, row.id)?.id).toBe(row.id);
+    f.db.update(citations).set({ complete: false }).where(eq(citations.id, row.id)).run();
+    expect(f.cites.rowFor(scopeOf, row.id)).toBeUndefined();
     const earlier = citationNote(old.runId, text("가[1]."), f.cites)!.citations;
-    const carry = { conversationId: f.c.id, userId: old.userId, previous: () => ({ citations: earlier }) };
+    const carry = { conversationId: f.c.id, userId: old.userId, previous: () => earlier };
     expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)).toMatchObject({
       citations: [{ status: "unknown_source" }],
       unbacked: true,
@@ -1672,7 +1670,7 @@ describe("citationNote", () => {
 
   it("review #186 1차: a run that called file_list or sources_list carries nothing — list item [1] is not the earlier [1]", () => {
     const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
-    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => ({ citations: earlier }) };
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
     expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)!.citations[0]!.status).toBe(
       "verified",
     );

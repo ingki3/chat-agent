@@ -5,7 +5,8 @@ import type { FileWriteLock } from "../backup/lock.js";
 import type { ConversationRow, ConversationStore } from "../conversations/store.js";
 import type { Db } from "../db/client.js";
 import type { FileRow, FileStore } from "../files/store.js";
-import { isRedactedContent, scrubKnown } from "../secrets/known.js";
+import { isRedactedContent, scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import { snippetKey } from "../citations/store.js";
 import type { SourceStore } from "../web/sources.js";
 import type { ForkSource } from "./projection.js";
 import type { ShareRow } from "./store.js";
@@ -199,7 +200,7 @@ export class ForkService {
             if (a.messageId) artifactMessage.set(copy.id, a.messageId);
           }
           for (const s of b.sources) ids.source.set(s.id, sources.copyInto({ ...to, forkId }, s).id);
-          copyCitationRows(db, share.conversationId, b.messages, ids, to);
+          copyCitationRows(db, share.conversationId, b.messages, source.citations, ids, to);
           // Messages, in history order, finished ones only — their parts moved to the copies' ids.
           let last: string | undefined;
           for (const m of b.messages) {
@@ -296,26 +297,30 @@ function safeJson(s: string): unknown {
 }
 
 /**
- * The citation rows the copied messages' notes stand for (#186 review 2차): each copied into the fork — its source
- * and file moved to the copies (a row whose source or file the copy lacks is not copied: that entry carries nothing
- * there), the forker's own, a run of its own (`fork:<id>`, no run is copied). What a follow-up in the copy checks a
- * carried number against: the whole passage, kept server-side, never in a message part.
+ * The citation rows the copied messages' notes stand for (#186 review 2·3차), when the share lets the viewer see them
+ * (`allowed`, the projection's citations): each copied into the fork — through the secrets known now (snippet,
+ * quote, locator; the key recomputed from the masked snippet), its source and file moved to the copies (a row whose
+ * source or file the copy lacks is not copied: that entry carries nothing there), the forker's own, a run of its own
+ * (`fork:<id>`, no run is copied), `complete` as it was. What a follow-up in the copy checks a carried number
+ * against: the whole passage, kept server-side. Entries without a row id (stored before) are not copied.
  */
 function copyCitationRows(
   db: Db,
   fromConversation: string,
   messages: readonly { parts: unknown }[],
+  allowed: ReadonlySet<string>,
   ids: IdMap,
   to: { userId: string; conversationId: string },
 ): void {
   const want = new Set<string>();
   for (const m of messages)
     for (const p of (m.parts as MessagePart[] | null) ?? [])
-      if (p?.type === "citation_note") for (const c of p.citations) if (c.citationId) want.add(c.citationId);
+      if (p?.type === "citation_note")
+        for (const c of p.citations) if (c.citationId && allowed.has(c.citationId)) want.add(c.citationId);
   const read = db.$client.prepare("select * from citations where id = ? and conversation_id = ?");
   const insert = db.$client.prepare(
     `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote,
-       file_id, locator) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       file_id, locator, complete) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const id of want) {
     const r = read.get(id, fromConversation) as
@@ -325,20 +330,22 @@ function copyCitationRows(
           file_id: string | null;
           status: string;
           snippet: string;
-          snippet_key: string;
           quote: string | null;
           locator: string | null;
+          complete: number;
         }
       | undefined;
     if (!r) continue;
     const sourceId = r.source_id ? ids.source.get(r.source_id) : null;
     const fileId = r.file_id ? ids.file.get(r.file_id) : null;
     if (sourceId === undefined || fileId === undefined) continue;
-    let locator = r.locator;
-    if (locator && fileId) {
-      const parsed = safeJson(locator) as Record<string, unknown> | null;
-      locator = parsed && typeof parsed === "object" ? JSON.stringify({ ...parsed, fileId }) : null;
+    let locator: string | null = null;
+    if (r.locator && fileId) {
+      const parsed = safeJson(r.locator);
+      if (parsed && typeof parsed === "object")
+        locator = JSON.stringify(scrubKnownDeep({ ...(parsed as Record<string, unknown>), fileId }));
     }
+    const snippet = scrubKnown(r.snippet);
     const copy = crypto.randomUUID();
     insert.run(
       copy,
@@ -348,11 +355,12 @@ function copyCitationRows(
       r.n,
       sourceId,
       r.status,
-      r.snippet,
-      r.snippet_key,
-      r.quote,
+      snippet,
+      snippetKey(snippet),
+      r.quote === null ? null : scrubKnown(r.quote),
       fileId,
       locator,
+      r.complete,
     );
     ids.citation!.set(id, copy);
   }

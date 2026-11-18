@@ -150,28 +150,31 @@ export const ownsNumbers = (name: string) =>
  * own (no search, fetch, news skill, `file_read`, `file_search`, `file_list` or `sources_list`) — then its numbers can only be the earlier ones.
  * As soon as it cites or tries to (or fetches or reads something new), every number is this run's: a marker without
  * a citation of this run stays `unknown_source`, whatever an earlier answer had under that number.
- * What is checked again is the earlier entry's **citation row** (review #186 2차, `CitationStore.rowFor`): by the
- * entry's `citationId`, or — an entry stored before ids were kept — by the earlier answer's run and the number; this
- * conversation's and user's only. Its `snippet` is the whole passage cited (the entry's `quote` is for display and
- * may be cut). No row, or one whose snippet may have been cut when stored (`whole` false) → not carried — never
- * verified from a cut prefix. A web row is checked again against the source's stored text; a file row (#186) by
- * `recheckFile`: the file must still be one this conversation's runs may read, and the passage is looked for in its
- * extracted text as it is now, at the earlier place first (being extracted again → `fetch_failed`, no longer there →
- * `snippet_not_found`, a deleted file → not carried, `unknown_source`). Never matched by the sentence's text — only
+ * What is checked again is the earlier entry's **citation row** (review #186 2·3차, `CitationStore.rowFor`): by the
+ * entry's `citationId`, this conversation's and user's only, and only a `complete` row (its snippet the model's whole
+ * input, compared uncut). An entry without an id (stored before) or a row that is not complete → not carried —
+ * never verified from a possibly cut passage. A web row is checked again against the source's stored text; a file
+ * row (#186) by `recheckFile` — **still at the same place**: the file must still be one this conversation's runs may
+ * read, and the passage must still be at the row's place (the same unit, line or cell and range, the unit's text up
+ * to it unchanged — what the viewer highlights); moved or changed → `snippet_not_found`, being extracted again →
+ * `fetch_failed`, a deleted file → not carried (`unknown_source`). Never matched by the sentence's text — only
  * the number the earlier answer gave. An answer that carries a number is an answer using
  * sources: its paragraphs without a marker are flagged as missing (review #153). An answer that used no source tool
  * and carries no number (nothing earlier under it, or the recheck failed) has no sources: its markers get an
  * `unbacked` note only (#185, review #190 1차).
  */
+/** A cited file place as the citation row keeps it: the locator and the hash of its unit's text up to the end. */
+export type CitedPlace = FileLocator & { textHash?: string | undefined; sheetNo?: number | undefined };
+
 export type CitationCarry = {
   conversationId: string;
   userId: string;
-  /** The newest earlier answer with numbers to carry (`previousCitations`): its entries and its run (if known). */
-  previous: () => { citations: readonly CitationEntry[]; runId?: string | undefined };
+  /** The citations of the newest earlier answer with numbers to carry (`previousCitations`). */
+  previous: () => readonly CitationEntry[];
   /** An earlier file citation checked again now (#186, `FileTools.recheck`); without it no file citation carries. */
   recheckFile?: (
     scope: { conversationId: string; userId: string },
-    input: { fileId: string; snippet: string; locator?: FileLocator | undefined },
+    input: { fileId: string; snippet: string; locator: CitedPlace | undefined },
   ) =>
     | { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: { name: string } }
     | undefined;
@@ -195,22 +198,20 @@ export function citationNote(
   if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
-  let earlier: { byN: Map<number, CitationEntry>; runId: string | undefined } | undefined;
+  let earlier: Map<number, CitationEntry> | undefined;
   let carriedAny = false;
   const carriedFrom = (n: number): CitationEntry | undefined => {
     if (!carry || rows.length || !store.rowFor) return undefined;
     if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return undefined;
-    if (!earlier) {
-      const prev = carry.previous();
-      earlier = { byN: new Map(prev.citations.map((e) => [e.n, e])), runId: prev.runId };
-    }
-    const e = earlier.byN.get(n);
-    if (!e || e.status === "unknown_source") return undefined;
+    earlier ??= new Map(carry.previous().map((e) => [e.n, e]));
+    const e = earlier.get(n);
+    // Only an entry that names its row (review 3차: entries from before are never carried).
+    if (!e?.citationId || e.status === "unknown_source") return undefined;
     // The earlier entry's own row: the whole passage it cited (never the display quote, which may be cut).
-    const row = store.rowFor(carry, { citationId: e.citationId, runId: earlier.runId, n });
-    if (!row || !row.whole || row.status === "unknown_source") return undefined;
+    const row = store.rowFor(carry, e.citationId);
+    if (!row || row.status === "unknown_source") return undefined;
     if (row.sourceId) return row.sourceId === e.sourceId ? carriedWeb(n, e, row) : undefined;
-    if (row.fileId && !e.sourceId && (e.fileId ?? row.fileId) === row.fileId) return carriedFile(n, e, row);
+    if (row.fileId && !e.sourceId && e.fileId === row.fileId) return carriedFile(n, e, row);
     return undefined;
   };
   type Row = NonNullable<ReturnType<NonNullable<typeof store.rowFor>>>;
@@ -231,12 +232,12 @@ export function citationNote(
       citationId: row.id,
     };
   };
-  // A file citation of the earlier answer: its whole passage looked for again in the file's text now, at the
-  // earlier place first (#186; a passage repeated in the file keeps its place, review 1차·2차).
+  // A file citation of the earlier answer: its whole passage looked for again at its own place in the file's text
+  // now (#186, review 3차: still there, or not verified — the place shown is the row's, the one the viewer opens).
   const carriedFile = (n: number, e: CitationEntry, row: Row): CitationEntry | undefined => {
     if (!carry?.recheckFile) return undefined;
-    const stored = row.locator ? FileLocator.safeParse(JSON.parse(row.locator)) : undefined;
-    const locator = e.locator ?? (stored?.success ? stored.data : undefined);
+    // The place exactly as the row keeps it (with its text hash): the recheck looks there and only there.
+    const locator = row.locator ? (JSON.parse(row.locator) as CitedPlace) : undefined;
     const c = carry.recheckFile(carry, { fileId: row.fileId!, snippet: row.snippet, locator });
     if (!c) return undefined;
     carriedAny = true;

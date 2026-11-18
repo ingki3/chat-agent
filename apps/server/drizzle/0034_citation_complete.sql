@@ -1,0 +1,1 @@
+ALTER TABLE `citations` ADD `complete` integer DEFAULT false NOT NULL;

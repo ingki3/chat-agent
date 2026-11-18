@@ -461,23 +461,20 @@ export function findSnippetAt(
 }
 
 /**
- * Every occurrence `findSnippetAt` would accept, in order (at most `max`) — a recheck (#186) compares their places
- * with the earlier one (a passage repeated inside one unit). The first form (as sent, quotes and all) that has any.
+ * Every occurrence `findSnippetAt` would accept, in either form (as sent, quotes and all, and without them), in
+ * order — a recheck (#186) compares each one's place with the earlier one (a passage repeated inside one unit).
  */
 export function findSnippetMatches(
   body: string,
   snippet: string,
-  max = 50,
 ): { quote: string; start: number; end: number }[] {
   const forms = snippetForms(snippet);
   if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet) return [];
   const page = pageOf(body, undefined);
-  for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const all: { quote: string; start: number; end: number }[] = [];
-    matchIn(body, page.n, page.d, want, all, max);
-    if (all.length) return all;
-  }
-  return [];
+  const all: { quote: string; start: number; end: number }[] = [];
+  for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped])
+    matchIn(body, page.n, page.d, want, all);
+  return all.sort((x, y) => x.start - y.start);
 }
 
 const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
@@ -485,7 +482,7 @@ const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
 /**
  * The first occurrence of `want` in the page that respects every boundary rule: the original passage and range.
- * With `all`: every such occurrence (up to `max`) goes there instead, and the result is undefined.
+ * With `all`: every such occurrence goes there instead, and the result is undefined.
  */
 function matchIn(
   body: string,
@@ -493,7 +490,6 @@ function matchIn(
   dec: Decoded,
   want: string,
   all?: { quote: string; start: number; end: number }[],
-  max = Number.POSITIVE_INFINITY,
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -531,7 +527,6 @@ function matchIn(
     };
     if (!all) return m;
     all.push(m);
-    if (all.length >= max) break;
   }
   return undefined;
 }

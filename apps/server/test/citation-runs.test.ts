@@ -29,6 +29,8 @@ import {
   type CitationScenarioName,
 } from "../src/runtime/fake-citations.js";
 import { RunManager } from "../src/runtime/runs.js";
+import { knownSecrets } from "../src/secrets/known.js";
+import { projectPart } from "../src/shares/projection.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { liveCall } from "./helpers/live-mcp.js";
@@ -280,6 +282,34 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(past.run.status).toBe("done");
     expect(past.note?.unbacked).toBeUndefined();
     expect(statuses(past)?.[0]).toEqual([1, "verified"]);
+  });
+
+  it("review #186 3차: a cite input's passage is masked as it is stored, streamed and shown to a shared viewer", async () => {
+    const secret = `sk-ant-citein${crypto.randomUUID().replaceAll("-", "")}`;
+    knownSecrets.add(secret);
+    try {
+      const script: FakeScript = (input, memory) =>
+        input.text === "/cite-secret"
+          ? [
+              {
+                call: "cite",
+                input: { sourceId: "made-up", snippet: `인용한 구절에 ${secret} 이 들어 있다.` },
+              },
+              { text: "그렇다고 해요[1]." },
+            ]
+          : defaultScript(input, memory);
+      const { app, f, send } = await start(fake(script));
+      const c = app.conversations!.create(f.users.owner.id);
+      const r = await send(f.cookies.owner, c.id, "/cite-secret");
+      const call = r.parts.find((p) => p.type === "tool_call" && p.name.endsWith("cite"));
+      expect(JSON.stringify(call)).toContain("인용한 구절에");
+      // Stored, streamed (tool_start), and as a shared viewer gets it (the same stored part, projected).
+      expect(JSON.stringify(r.parts)).not.toContain(secret);
+      expect(JSON.stringify(r.events)).not.toContain(secret);
+      expect(JSON.stringify(projectPart(call!))).not.toContain(secret);
+    } finally {
+      knownSecrets.remove(secret);
+    }
   });
 
   it("review #186 2차: an answer that numbered a list of its own ends the search — a later [1] never brings back an older source", async () => {

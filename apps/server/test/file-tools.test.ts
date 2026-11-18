@@ -3875,67 +3875,86 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     ]);
   });
 
-  it("[P2] a passage the file has in two places keeps the place it was cited at; elsewhere only once it is gone there", async () => {
-    const { app, db, f, upload, send } = await start(fake(script));
-    const c = app.conversations!.create(f.users.owner.id);
-    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
-    const file = await upload(f.cookies.owner, c.id, "dup.txt", Buffer.from(lines.join("\n") + "\n"));
-    await app.fileExtracts!.idle();
-    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
-    expect(first.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 60]]);
-    // Line 5 now has the same sentence (earlier in the file).
-    db.$client
-      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ?")
-      .run("줄 5 내용입니다.", ONLY_HERE, file.id);
-    touch(db, file.id);
-    const again = await send(f.cookies.owner, c.id, "/again1");
-    expect(again.note!.citations.map((x) => [x.status, x.locator?.line, x.site])).toEqual([
-      ["verified", 60, "60번째 줄"],
-    ]);
-    // Gone from line 60: found again where it is now (line 5).
-    db.$client
-      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ? AND text LIKE ?")
-      .run(ONLY_HERE, "줄 60 내용입니다.", file.id, "%줄 41 내용%");
-    touch(db, file.id);
-    const moved = await send(f.cookies.owner, c.id, "/again1");
-    expect(moved.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 5]]);
-  });
-
-  it("[P2 2차] the earlier line itself first: still there (moved inside its line), with copies on line 5 and on line 55 of the same stored run — line 60 stays", async () => {
-    const { app, db, f, upload, send } = await start(fake(script));
-    const c = app.conversations!.create(f.users.owner.id);
-    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
-    const file = await upload(f.cookies.owner, c.id, "dup2.txt", Buffer.from(lines.join("\n") + "\n"));
-    await app.fileExtracts!.idle();
-    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
-    expect(first.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 60]]);
-    // Lines 41–80 are one stored run: line 55 (before 60 in it) and line 5 get the sentence; line 60 gets a lead-in
-    // (its range moves). Marks follow the text: rewritten for the changed run.
+  /** Rewrites one stored unit's lines (its marks follow), and bumps the extraction so the cache sees it. */
+  const editRun = (
+    db: { $client: import("better-sqlite3").Database },
+    fileId: string,
+    has: string,
+    edit: (line: number, text: string) => string,
+  ) => {
     const seg = db.$client
       .prepare("SELECT seq, text, marks FROM file_segments WHERE file_id = ? AND text LIKE ?")
-      .get(file.id, `%${ONLY_HERE}%`) as { seq: number; text: string; marks: string };
-    const runLines = seg.text.split("\n");
+      .get(fileId, `%${has}%`) as { seq: number; text: string; marks: string };
     const marks = JSON.parse(seg.marks) as [number, number, { line: number }][];
-    const first41 = marks[0]![2].line;
-    const edited = runLines.map((l, i) =>
-      i + first41 === 55 ? ONLY_HERE : i + first41 === 60 ? `설명: ${ONLY_HERE}` : l,
-    );
+    const lines = seg.text.split("\n").map((l, i) => edit(marks[i]![2].line, l));
     let at = 0;
-    const newMarks = edited.map((l, i) => {
+    const next = lines.map((l, i) => {
       const m = [at, at + l.length, { ...marks[i]![2] }];
       at += l.length + 1;
       return m;
     });
     db.$client
       .prepare("UPDATE file_segments SET text = ?, marks = ? WHERE file_id = ? AND seq = ?")
-      .run(edited.join("\n"), JSON.stringify(newMarks), file.id, seg.seq);
-    db.$client
-      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ? AND seq <> ?")
-      .run("줄 5 내용입니다.", ONLY_HERE, file.id, seg.seq);
-    touch(db, file.id);
+      .run(lines.join("\n"), JSON.stringify(next), fileId, seg.seq);
+    touch(db, fileId);
+  };
+  const viewAt = async (
+    app: Awaited<ReturnType<typeof start>>["app"],
+    cookie: string,
+    fileId: string,
+    loc: FileLocator,
+  ) =>
+    (
+      await app.inject({
+        method: "GET",
+        url: `/api/files/${fileId}/view?loc=${encodeURIComponent(JSON.stringify(loc))}`,
+        headers: { ...LOCAL, cookie },
+      })
+    ).json() as { target: { status: string } | null };
+
+  it("[P2 3차] still at the same place, or not verified: copies elsewhere (50 before it, a quoted one) never move it; moved → ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
+    const file = await upload(f.cookies.owner, c.id, "dup.txt", Buffer.from(lines.join("\n") + "\n"));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
+    const cited = first.note!.citations[0]!;
+    expect([cited.status, cited.locator?.line]).toEqual(["verified", 60]);
+    expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status).toBe("exact");
+    // Line 5 has the sentence, line 65 (the same stored run as 60) has it 50 times and quoted: line 60 stays.
+    editRun(db, file.id, "줄 5 내용", (n, l) => (n === 5 ? ONLY_HERE : l));
+    editRun(db, file.id, "줄 41 내용", (n, l) =>
+      n === 65 ? `${`${ONLY_HERE} `.repeat(50)}“${ONLY_HERE}”` : l,
+    );
+    expect(
+      (
+        db.$client
+          .prepare("SELECT text FROM file_segments WHERE file_id = ? AND text LIKE ?")
+          .get(file.id, "%줄 41 내용%") as { text: string }
+      ).text.split(ONLY_HERE).length,
+    ).toBe(53);
     const again = await send(f.cookies.owner, c.id, "/again1");
-    expect(again.note!.citations.map((x) => [x.status, x.locator?.line, x.locator?.charRange])).toEqual([
-      ["verified", 60, ["설명: ".length, "설명: ".length + ONLY_HERE.length]],
+    const kept = again.note!.citations[0]!;
+    expect([kept.status, kept.locator]).toEqual(["verified", cited.locator]);
+    // What the note says verified is what the viewer highlights.
+    expect((await viewAt(app, f.cookies.owner, file.id, kept.locator!)).target?.status).toBe("exact");
+    // The unit's text before it changed (line 55): the viewer can no longer claim the range — nor can the note.
+    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 55 ? `${l} 덧붙임.` : l));
+    const before = await send(f.cookies.owner, c.id, "/again1");
+    expect(before.note!.citations.map((x) => x.status)).toEqual(["snippet_not_found"]);
+    expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status).not.toBe("exact");
+    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 55 ? "줄 55 내용입니다." : l));
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe("verified");
+    // Moved inside its own line (a lead-in before it): not where it was verified — ⚠️, never "found elsewhere".
+    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 60 ? `설명: ${l}` : l));
+    const moved = await send(f.cookies.owner, c.id, "/again1");
+    expect(moved.note!.citations.map((x) => [x.status, x.locator])).toEqual([
+      ["snippet_not_found", undefined],
     ]);
+    // Gone from line 60 (still on 5 and 55): not looked for there either.
+    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 60 ? "줄 60 내용입니다." : l));
+    const gone = await send(f.cookies.owner, c.id, "/again1");
+    expect(gone.note!.citations.map((x) => x.status)).toEqual(["snippet_not_found"]);
   });
 });

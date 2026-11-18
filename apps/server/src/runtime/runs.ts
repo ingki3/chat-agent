@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { sentWithActive } from "../files/store.js";
 import { EventEmitter } from "node:events";
-import { and, asc, desc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import {
   MEMORY_TRIMMED_CODE,
   MEMORY_TRIMMED_TEXT,
@@ -981,33 +981,24 @@ export class RunManager {
 
   /**
    * The citations of the newest earlier answer of the conversation with a citation note (#150, numbers carried
-   * over — `citationNote`): active messages before this reply, the server's own notes only, with that answer's run
-   * (its citation rows by number, for entries stored before rows were named). The search stops at an answer that
-   * numbered things of its own (review #186 2차: a list, a search, a fetch, a read, a citation — `ownsNumbers`)
-   * without a note to carry: a number after it may mean its item, never an older answer's source. A plain answer
-   * (no such tool) with only flagged markers (`unbacked`, #185) is looked past.
+   * over — `citationNote`): active messages before this reply, the server's own notes only. The search stops at an
+   * answer that numbered things of its own (review #186 2차: a list, a search, a fetch, a read, a citation —
+   * `ownsNumbers`) without a note to carry: a number after it may mean its item, never an older answer's source. A
+   * plain answer (no such tool) with only flagged markers (`unbacked`, #185) is looked past.
    */
-  private previousCitations(row: RunRow): { citations: CitationEntry[]; runId?: string } {
+  private previousCitations(row: RunRow): CitationEntry[] {
     const self = this.conversations.messageById(row.assistantMessageId);
-    if (!self) return { citations: [] };
+    if (!self) return [];
     const earlier = this.conversations
       .messages(row.conversationId, { limit: 10_000 })
       .filter((m) => m.role === "assistant" && m.seq < self.seq);
     for (const m of earlier.reverse()) {
       const parts = m.parts as MessagePart[];
       const note = parts.find((p) => p.type === "citation_note");
-      if (note && !note.unbacked && note.citations.length) {
-        const run = this.db
-          .select({ id: runs.id })
-          .from(runs)
-          .where(and(eq(runs.conversationId, row.conversationId), eq(runs.assistantMessageId, m.id)))
-          .orderBy(desc(runs.createdAt))
-          .get();
-        return { citations: note.citations, ...(run ? { runId: run.id } : {}) };
-      }
-      if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return { citations: [] };
+      if (note && !note.unbacked && note.citations.length) return note.citations;
+      if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return [];
     }
-    return { citations: [] };
+    return [];
   }
 
   /**

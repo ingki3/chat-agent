@@ -761,6 +761,11 @@ export const citations = sqliteTable(
     fileId: text("file_id"),
     /** A verified file citation: where the passage is (`FileLocator` JSON). */
     locator: text("locator"),
+    /**
+     * The snippet is the model's whole input, compared and kept uncut (#186 review 3차) — only such a row's number is
+     * carried over to a later answer. Rows from before (cut at the old limit before masking) are false: never carried.
+     */
+    complete: integer("complete", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at").notNull().default(now),
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],

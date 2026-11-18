@@ -54,7 +54,7 @@ export const FILE_SEARCH_TOOL: ServerToolInfo = {
 export const FILE_CITE_TOOL: ServerToolInfo = {
   name: "file_cite",
   description:
-    'Registers a citation of an uploaded file for the sentence you are about to write — the same numbering as cite. snippet: a passage copied exactly from the file text that file_read or file_search returned (one or two sentences, at least 8 characters; do not join pieces, do not paraphrase); page (optional): where you read it, to look there first. Returns {n, marker, status, label, locator}: put the marker (e.g. "[1]") at the end of the sentence it supports; the user sees the file name and the place (e.g. "보고서.pdf · 12쪽"). status "verified" = the passage is in the file; any other status is shown with a warning.',
+    'Registers a citation of an uploaded file for the sentence you are about to write — the same numbering as cite. snippet: a passage copied exactly from the file text that file_read or file_search returned (one or two sentences, at least 8 characters and at most 500 UTF-16 units — if it is longer, cite a shorter contiguous passage; do not join pieces, do not paraphrase); page (optional): where you read it, to look there first. Returns {n, marker, status, label, locator}: put the marker (e.g. "[1]") at the end of the sentence it supports; the user sees the file name and the place (e.g. "보고서.pdf · 12쪽"). status "verified" = the passage is in the file; any other status is shown with a warning.',
   input: {
     fileId,
     snippet: citeSnippet("The exact passage from the file text."),

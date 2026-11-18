@@ -84,7 +84,11 @@ export class CitationStore {
           // The same passage again: it keeps its number. A retry that now verifies upgrades the entry; one that
           // still fails leaves it as it was.
           if (again.status !== "verified" && status === "verified")
-            this.db.update(citations).set({ status, quote, snippet }).where(eq(citations.id, again.id)).run();
+            this.db
+              .update(citations)
+              .set({ status, quote, snippet, complete: true })
+              .where(eq(citations.id, again.id))
+              .run();
           return result(again.n, again.status === "verified" ? again.status : status, again.sourceId);
         }
         const count = this.count(scope.runId);
@@ -103,6 +107,7 @@ export class CitationStore {
             snippet,
             snippetKey: key,
             quote,
+            complete: true,
           })
           .run();
         return result(n, status, sourceId);
@@ -182,14 +187,14 @@ export class CitationStore {
           if (found.status === "verified") {
             this.db
               .update(citations)
-              .set({ status: found.status, quote, snippet, locator })
+              .set({ status: found.status, quote, snippet, locator, complete: true })
               .where(eq(citations.id, again.id))
               .run();
             return { ...result(again.n, "verified", null), locator: found.locator };
           }
           this.db
             .update(citations)
-            .set({ status: found.status, quote: null, snippet, locator: null })
+            .set({ status: found.status, quote: null, snippet, locator: null, complete: true })
             .where(eq(citations.id, again.id))
             .run();
           return { ...result(again.n, found.status, null), locator: null };
@@ -212,6 +217,7 @@ export class CitationStore {
             snippetKey: key,
             quote,
             locator,
+            complete: true,
           })
           .run();
         return { ...result(n, found.status, null), locator: found.locator };
@@ -221,30 +227,24 @@ export class CitationStore {
   }
 
   /**
-   * The citation row an earlier answer's entry stands for (#186 review 2차) — by its id, or (an entry stored before
-   * ids were kept) by the earlier answer's run and number — within this conversation and user only. Its `snippet`
-   * is the whole passage cited (what a carried number is checked again with); `whole` is false for a row whose
-   * snippet may have been cut when it was stored (before longer input was refused: one at the old cut length).
+   * The citation row an earlier answer's entry stands for (#186 review 2·3차), by its `citationId`, within this
+   * conversation and user only — and only a `complete` one (its snippet is the model's whole input, compared and
+   * kept uncut): what a carried number is checked again with. Undefined otherwise (rows from before are never
+   * carried — their snippet may have been cut).
    */
-  rowFor(
-    scope: { conversationId: string; userId: string },
-    ref: { citationId?: string | undefined; runId?: string | undefined; n: number },
-  ): (CitationRow & { whole: boolean }) | undefined {
-    const where = ref.citationId
-      ? eq(citations.id, ref.citationId)
-      : ref.runId
-        ? and(eq(citations.runId, ref.runId), eq(citations.n, ref.n))
-        : undefined;
-    if (!where) return undefined;
-    const row = this.db
+  rowFor(scope: { conversationId: string; userId: string }, citationId: string): CitationRow | undefined {
+    return this.db
       .select()
       .from(citations)
       .where(
-        and(where, eq(citations.conversationId, scope.conversationId), eq(citations.userId, scope.userId)),
+        and(
+          eq(citations.id, citationId),
+          eq(citations.conversationId, scope.conversationId),
+          eq(citations.userId, scope.userId),
+          eq(citations.complete, true),
+        ),
       )
       .get();
-    // `boundText` stopped at 500 units, or 499 before a surrogate pair: such a row cannot be told from a cut one.
-    return row ? { ...row, whole: row.snippet.length < CITATION_LIMITS.snippet - 1 } : undefined;
   }
 
   private existing(
