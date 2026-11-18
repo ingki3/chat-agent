@@ -994,6 +994,27 @@ export const scheduleProposals = sqliteTable(
 );
 
 /**
+ * 관심 종목 (#31) — **removed in #187; the table is retained for rollback compatibility only.** No code reads or
+ * writes it (no route, store or tool). It stays so that rolling the code back to a pre-#187 release (by hand or the
+ * release script's automatic rollback) finds the table that release reads and rescrubs. To be dropped by a migration
+ * in a later release, once a rollback to pre-#187 code is no longer needed (docs/ops.md §30.3).
+ */
+export const watchlistItems = sqliteTable(
+  "watchlist_items",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    market: text("market", { enum: ["KR", "US"] }).notNull(),
+    symbol: text("symbol").notNull(),
+    name: text("name"),
+    createdAt: integer("created_at").notNull().default(now),
+  },
+  (t) => [uniqueIndex("watchlist_items_user_symbol_idx").on(t.userId, t.market, t.symbol)],
+);
+
+/**
  * Text extraction of an upload (#48): one row per file, `pending` until the sandboxed extractor ran. Rows and
  * segments go with their file (cascade). Written by `FileExtracts` only.
  */

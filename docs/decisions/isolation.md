@@ -316,7 +316,7 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **변이 시험(2026-11-11):** 22개 변이를 하나씩 넣어 모두 시험이 잡았다 — 기록 검사 끔·시간대 없는 asOf 허용·tool_meta 표시 제거, 답변의 출처·기준 시각 검사 끔, 면책 비움·실행 관리자 첨부 제거·후속 답변 검사 제거, 아들 숨김 제거·사용자별 도구 거름 제거·호출 시 재확인 제거, 모든 금융 도구가 프록시 하나를 공유·계획 호스트 검사 제거·접미 일치 허용·호스트 목록 확장·호스트 목록 틀림, KRX 성탄절 누락·미국 조기 폐장 누락·주말을 거래일로·휴장 중 값에 원래 시각·오늘이면 무조건 장중.
 
 ## 금융 표·차트 (#31)
-`finance_chart`(`packages/mcp-tools/src/finance.ts` `FINANCE_COMPOSED_TOOLS`, 서버 `apps/server/src/finance/chart.ts`). 운영은 `docs/ops.md` §30. 관심 종목(`watchlist_get`·`/api/watchlist*`·`watchlist_items`)은 #187에서 제거했다 — 아래 "관심 종목" 항목은 그때까지의 기록이다.
+`finance_chart`(`packages/mcp-tools/src/finance.ts` `FINANCE_COMPOSED_TOOLS`, 서버 `apps/server/src/finance/chart.ts`). 운영은 `docs/ops.md` §30. 관심 종목(`watchlist_get`·`/api/watchlist*`)은 #187에서 제거했다 — 아래 "관심 종목" 항목은 그때까지의 기록이다. **결정(#187, 리뷰 #194 1차):** `watchlist_items` 표는 바로 지우지 않고 두 단계로 없앤다 — 이번에는 코드 경로만 없애고(표는 읽지도 쓰지도 않음, 재가림 규칙만 남김), 표를 지우는 마이그레이션은 #187 이전 코드로 되돌릴 일이 없어진 뒤의 릴리스에서. 표를 먼저 지우면 코드만 되돌렸을 때 옛 코드의 목록 조회와 재가림 전체가 `no such table`로 멈추기 때문이다(#190 `finance_results`와 같은 이유).
 
 - **새 송신 경로 없음:** `finance_chart`는 데이터를 기존 금융 도구(`kr_history`·`us_history`·`fx_usdkrw`·`us_financials`)의 `FinanceService.run`으로만 읽는다 — 도구마다 위 표의 자기 프록시·호스트 그대로. 부분마다 권한을 다시 본다(한국 종목 `kr-stock-skill`, 미국 `us-stock-skill`, 환율 `kr-stock-skill`). 한 호출이 처리 칸 하나(`withSlot`)를 쓴다.
 - **아티팩트는 서버가 만든 데이터:** 표는 `TableData`, 차트는 `ChartSpec`(검증 후 정규 JSON)로 저장되고, 보일 때 서버가 HTML·SVG로 그린다(#27과 같은 경로, 같은 CSP — `sandbox allow-scripts`, `script-src`는 비었거나 Esc 다리 해시 하나). **차트의 기준 전환·확대는 라디오 버튼과 CSS뿐**이고 툴팁은 SVG `<title>`이다 — 새 스크립트·새 CDN·새 의존성이 없다. 그래서 스크립트가 꺼진 내보내기(#51)에서도 첫 기준·전체 기간 그림이 그대로 나온다.

@@ -35,6 +35,7 @@
 | 웹 출처 (#50) | DB `sources` 표: 가져온 페이지 본문·검색 결과 | `WEB_SEARCH_PROVIDERS` — 17절 | DB와 함께 포함 |
 | 아티팩트 (#27) | DB `artifacts`·`artifact_versions` 표: 버전마다 본문(최대 512KB) | — 18절 | DB와 함께 포함 |
 | 금융 결과 (#30) | DB `finance_results` 표: #185 이전에 금융 도구를 쓴 답변마다 남긴 출처·기준 시각·숫자·식별자. **#185부터 쓰지도 읽지도 않는다**(옛 행만 남음, 비밀 재가림 대상) | — 19.3절 | DB와 함께 포함 |
+| 관심 종목 (#31) | DB `watchlist_items` 표. **#187에서 기능을 없앴고 쓰지도 읽지도 않는다**(되돌리기 안전을 위해 표만 남음, 비밀 재가림 대상) — 30.3절 | — | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트(배포본에서는 그 배포본 폴더) 기준이다. **운영의 `shared/.env`에는 절대 경로만 쓴다** — 상대 경로면 데이터가 배포본 안에 생겨 정리(prune) 때 함께 지워진다. 배포 스크립트는 `DATA_DIR`·`BACKUP_DIR`이 비었거나 상대 경로이거나 `releases/` 안이면 설치를 거부한다(43.2절).
@@ -1191,7 +1192,8 @@ PRD FR-7.3·7.5·7.6, 수용 기준 4·11, M4 완료 기준. 금융 도구 자�
 - 한·미가 섞이지 않고 통화도 요청하지 않으면 환율을 부르지 않는다(기준 전환도 없음).
 
 ### 30.3 관심 종목 — 제거됨 (#187), 재가림·송신 가드
-- **관심 종목은 #187에서 제거했다**(사용자 결정 2026-11-18: 기본은 일반 채팅 에이전트). 사이드바 바로가기·화면·`/api/watchlist*`·MCP 도구 `watchlist_get`·금융 지침의 관심 종목 줄(`finance@5`)이 없다. 예전 주소 `/watchlist`는 홈(`/`)으로 넘어간다. 마이그레이션 **0033**(`0033_drop_watchlist`)이 `watchlist_items`(0023)를 지운다 — 운영 DB는 0행이었고(2026-11-18 읽기 전용 확인), 배포 직전 백업에 옛 테이블이 남는다. 재가림 대상 목록(`secrets/columns.ts`)에서도 빠졌고, 그 테이블만 쓰던 재가림의 "행 지우기"(`removeOn`)도 없앴다. 종목은 대화에서 이름·코드로 말하면 금융 도구가 조회한다.
+- **관심 종목은 #187에서 제거했다**(사용자 결정 2026-11-18: 기본은 일반 채팅 에이전트). 사이드바 바로가기·화면·`/api/watchlist*`·MCP 도구 `watchlist_get`·금융 지침의 관심 종목 줄(`finance@5`)이 없다. 예전 주소 `/watchlist`는 홈(`/`)으로 넘어간다. 종목은 대화에서 이름·코드로 말하면 금융 도구가 조회한다.
+- **`watchlist_items` 표(0023)는 되돌리기 안전을 위해 남겨 둔다**(두 단계 제거, #190의 `finance_results`와 같은 방식). 이번 릴리스의 코드는 이 표를 읽지도 쓰지도 않는다(라우트·저장소·도구 없음 — 스키마 정의와 비밀 재가림 규칙만 이름을 안다). 지우는 마이그레이션을 이번에 넣지 않은 이유: 0033으로 표를 지운 뒤 코드만 #187 이전으로 되돌리면(손으로든 릴리스 스크립트의 자동 복귀든) 그 코드의 관심 종목 목록 조회와 `StoredRescrub.pass`가 `no such table: watchlist_items`로 실패하고, 재가림의 뒤 단계(기억·기억 정리 표, 파일·실행 이벤트)까지 멈춘다(리뷰 #194 1차에서 재현). 옛 행(운영은 0행, 2026-11-18 읽기 전용 확인)은 사용자와 함께 지워지고, 나중에 비밀로 등록된 값은 재가림이 **그 자리에서 가린다**(`secrets/columns.ts` — 행을 지우던 `removeOn`은 이 표만 썼으므로 없앴다). 표를 지우는 마이그레이션은 #187 이전 릴리스로 되돌릴 일이 없어진 뒤의 릴리스에서 따로 한다(후속 이슈).
 - **재가림과 파일의 흔적(리뷰 #111, #78 공통):** DB 연결은 늘 `secure_delete = ON`이다(지우거나 덮어쓴 칸을 0으로). 재가림이 행을 가리거나 지우면 **같은 트랜잭션에서** `settings`에 `secrets.file_cleanup_pending` 표시를 남기고, 끝에 (`auto_vacuum = INCREMENTAL`이면 `incremental_vacuum` 뒤) `wal_checkpoint(TRUNCATE)`로 옛 값이 남은 WAL 프레임을 비우고 DB 파일의 그 쪽을 새 내용으로 덮는다. 성공한 뒤에만 표시를 지운다. 다른 연결(예: `sqlite3` 셸)이 옛 스냅샷을 읽고 있으면 기다리지 않고(바쁨 대기 0 — 서버가 멈추거나 백업·복원의 데이터 잠금과 엉키지 않게) 로그 `secrets.rescrub_checkpoint_busy`를 남기고 백오프로 다시 시도하며, 그동안 `idle()`은 끝나지 않는다. **서버가 그 사이 다시 켜져도** 표시가 남아 있으면 시작할 때 이어서 한다.
 - **한 번의 압축(리뷰 #111 3–5차):** `secure_delete` 전에 쓴 내용이 남긴 빈 공간(짧게 고친 긴 제목, 지운 행)은 위 설정만으로는 지워지지 않아 한 번 `VACUUM`(살아 있는 행만으로 파일을 다시 씀)하고 파일을 `auto_vacuum = INCREMENTAL`로 바꾼다. 상태는 `settings`의 `storage.secure_delete_compacted`에 남는다:
   - 없음·`needed` — `VACUUM`을 해야 한다(아직 안 함, 실패, 도중에 죽음). `VACUUM` 직전에 `needed`와 `secrets.file_cleanup_pending`을 함께 남긴다.
@@ -1207,7 +1209,7 @@ PRD FR-7.3·7.5·7.6, 수용 기준 4·11, M4 완료 기준. 금융 도구 자�
 - 호출할 때 부분마다 다시 검사한다: 한국 종목 → `kr-stock-skill`, 미국 종목 → `us-stock-skill`, 환율 → `kr-stock-skill`.
 
 ### 30.5 확인 방법
-- `pnpm vitest run apps/server/test/finance-chart.test.ts`(한 데이터 → 표·차트, 차트 끝점 = 표 값(두 기준·가격·캔들·재무), 행마다 출처·기준 시각, 환율 날짜 규칙, 기준 전환·확대·툴팁, 이스케이프), `apps/server/test/finance-chart-runs.test.ts`(**M4 완료 기준**: "AAPL, 005930 6개월 비교 차트"를 Claude Code·Codex 녹화 프로토콜 재생(#25/#48 방식, 실제 `finance_chart` 호출)과 FakeRuntime으로 — 표·차트 아티팩트, 표 부분, 출처·기준 시각, 면책; 숨김 계정·허용 목록·부분 권한), `apps/server/test/watchlist-removal.test.ts`(0033이 `watchlist_items`를 지움, 도구 목록·API에 관심 종목 없음).
+- `pnpm vitest run apps/server/test/finance-chart.test.ts`(한 데이터 → 표·차트, 차트 끝점 = 표 값(두 기준·가격·캔들·재무), 행마다 출처·기준 시각, 환율 날짜 규칙, 기준 전환·확대·툴팁, 이스케이프), `apps/server/test/finance-chart-runs.test.ts`(**M4 완료 기준**: "AAPL, 005930 6개월 비교 차트"를 Claude Code·Codex 녹화 프로토콜 재생(#25/#48 방식, 실제 `finance_chart` 호출)과 FakeRuntime으로 — 표·차트 아티팩트, 표 부분, 출처·기준 시각, 면책; 숨김 계정·허용 목록·부분 권한), `apps/server/test/watchlist-removal.test.ts`(`watchlist_items`는 남음·지우는 마이그레이션 없음, 서버 코드는 스키마·재가림 규칙 말고는 이 표를 모름, 옛 행의 재가림, 옛 API 경로 404).
 - `E2E_PORT=3118 pnpm e2e e2e/finance-chart.spec.ts`(데스크톱·모바일: 표 부분 정렬, 카드 2개, 메모, 패널의 차트 기준·확대 전환과 툴팁, 사이드바에 관심 종목 없음·예전 주소 `/watchlist` → 홈).
 - **합성 데이터:** 실제 녹화는 사용자의 `OPENDART_API_KEY`·`SEC_USER_AGENT`와 네트워크 실행(19.5)을 기다린다. 그때까지 시험과 `FAKE_RUNTIME=1` 서버는 `apps/server/src/runtime/fake-finance.ts`의 **합성 일별 시세**(AAPL·NVDA·MSFT·005930·000660·KRW=X, 고정 시드 랜덤 워크)로 금융 도구의 URL에 답한다. `FAKE_RUNTIME=1`에서는 이 URL 말고는 금융 요청이 모두 `finance_unreachable`이다(합성 숫자가 실제 숫자와 섞이지 않고 네트워크로 나가지 않는다). 운영 서버(`FAKE_RUNTIME` 없음)는 이 파일을 쓰지 않는다.
 - 실데이터 확인(운영 Mac, 네트워크): 실제 런타임으로 "AAPL, 005930 6개월 비교 차트"를 보내고 표·차트의 마지막 종가가 네이버 증권·Yahoo Finance 화면의 그날 종가와 같은지, 표의 환율 열이 Yahoo `KRW=X` 일별 종가와 같은지 본다. 네이버 가격 API를 60행씩 여러 쪽으로 부르는 부분(6개월 = 3쪽)은 실제 응답으로 아직 확인하지 않았다 — 처음 실행 때 행 수(약 120)를 확인한다.
