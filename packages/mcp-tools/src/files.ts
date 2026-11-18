@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ServerToolInfo } from "./index.js";
+import { citeSnippet, type ServerToolInfo } from "./index.js";
 
 /**
  * File tools of the common MCP server (#48, PRD FR-4.3·4.5): the uploaded files of the run's conversation, read
@@ -43,7 +43,7 @@ export const FILE_READ_TOOL: ServerToolInfo = {
 export const FILE_SEARCH_TOOL: ServerToolInfo = {
   name: "file_search",
   description:
-    "Searches the text of this conversation's uploaded files (or one file) for words. Every word must appear in a part; returns the matching sentences with their locator (page, line, cell, slide …) and label, best first. Use the locator to read around it with file_read, and file_cite to cite a passage.",
+    'Searches the text of this conversation\'s uploaded files (or one file) for words. Every word must appear in a part; returns the matching sentences with their locator (page, line, cell, slide …) and label, best first. Use the locator to read around it with file_read, and file_cite to cite a passage. The result numbers ("(결과 1)") only order the hits: they are not citation markers — write only the marker file_cite returns.',
   input: {
     query: z.string().min(1).max(200).describe("Words to look for (all must appear)."),
     fileId: fileId.optional(),
@@ -54,10 +54,10 @@ export const FILE_SEARCH_TOOL: ServerToolInfo = {
 export const FILE_CITE_TOOL: ServerToolInfo = {
   name: "file_cite",
   description:
-    'Registers a citation of an uploaded file for the sentence you are about to write — the same numbering as cite. snippet: a passage copied exactly from the file text that file_read or file_search returned (one or two sentences, at least 8 characters; do not join pieces, do not paraphrase); page (optional): where you read it, to look there first. Returns {n, marker, status, label, locator}: put the marker (e.g. "[1]") at the end of the sentence it supports; the user sees the file name and the place (e.g. "보고서.pdf · 12쪽"). status "verified" = the passage is in the file; any other status is shown with a warning.',
+    'Registers a citation of an uploaded file for the sentence you are about to write — the same numbering as cite. snippet: a passage copied exactly from the file text that file_read or file_search returned (one or two sentences, at least 8 characters and at most 500 UTF-16 units — if it is longer, cite a shorter contiguous passage; do not join pieces, do not paraphrase); page (optional): where you read it, to look there first. Returns {n, marker, status, label, locator}: put the marker (e.g. "[1]") at the end of the sentence it supports; the user sees the file name and the place (e.g. "보고서.pdf · 12쪽"). status "verified" = the passage is in the file; any other status is shown with a warning.',
   input: {
     fileId,
-    snippet: z.string().min(1).max(500).describe("The exact passage from the file text."),
+    snippet: citeSnippet("The exact passage from the file text."),
     page: z
       .number()
       .int()

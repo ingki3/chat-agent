@@ -92,7 +92,14 @@ describe("templates", () => {
     expect(common).toContain("**핵심 주장**에 `cite`");
     expect(common).not.toContain("사실 주장마다");
     expect(common).toContain("**최대 2개**");
-    expect(common).toContain("같은 `sourceId`로 다시 `cite`한다");
+    expect(common).toContain("같은 `sourceId`로 다시 `cite`하거나 같은 `fileId`로 다시 `file_cite`한다");
+    // #186: an attachment is cited with file_cite; result numbers and the document's own [n] are not markers; reading
+    // or searching a file makes this answer's numbers its own.
+    expect(common).toContain("`file_cite` 도구로 인용을 남긴다");
+    expect(common).toContain("`file_cite`가 돌려준 표시(예: `[1]`)만");
+    expect(common).toContain("`file_search` 결과의 번호(`(결과 1)`)");
+    expect(common).toContain("인용 표시가 아니다");
+    expect(common).toContain("파일 읽기(`file_read`·`file_search`)를 하지 않는다면");
     // #185: the general source rules are common — cite what you used, the as-of time of time-sensitive data, and
     // re-query (or cite the number) to state earlier data as current. The finance section is finance tool usage only.
     expect(common).toContain("**이번 답변이 실제로 쓴 근거**");
@@ -108,8 +115,9 @@ describe("templates", () => {
     expect(finance.body).not.toContain("관심 종목");
     expect(finance.body).toContain("`finance_chart`");
     const research = defaultTemplates().research;
-    expect(research.version).toBe(3);
-    expect(research.body).toContain("사실을 말하는 문장마다 `cite`");
+    expect(research.version).toBe(4);
+    expect(research.body).toContain("사실을 말하는 문장마다 `cite`(첨부 파일은 `file_cite`)");
+    expect(defaultTemplates().common.version).toBe(10);
   });
 
   it("the youth section names the crisis lines from the fixtures (109, 1388)", () => {
@@ -163,10 +171,10 @@ describe("assembly", () => {
         it(`snapshot: ${who} × ${mode} × ${kind} tools`, () => {
           const r = assembleInstructions({ user, mode, tools, now: NOW });
           expect(r.versions).toEqual([
-            "common@9",
+            "common@10",
             ...(kind === "finance" ? ["finance@5"] : []),
             ...(user.youth ? ["youth@2"] : []),
-            ...(mode === "research" ? ["research@3"] : []),
+            ...(mode === "research" ? ["research@4"] : []),
           ]);
           expect(r.text).toMatchSnapshot();
           // Every combination: external content is data, and the date is Seoul's.
@@ -276,7 +284,7 @@ describe("injection evaluation harness (#40 fixtures)", () => {
       isolation: TEST_ISOLATION,
     });
     expect(report.summary).toEqual({ runs: 12, pass: 12, fail: 0, error: 0, pending: 0, violations: 0 });
-    expect(report.instructions).toEqual(["common@9", "youth@2"]);
+    expect(report.instructions).toEqual(["common@10", "youth@2"]);
     expect(new Set(report.results.map((r) => r.runtime))).toEqual(new Set(["claude-code", "codex"]));
     expect(report.results.find((r) => r.case === "INJ-1")!.calls).toEqual([
       { tool: "web_fetch", target: "http://fixtures.agentlee.test/injection/page-exfil.html" },
@@ -559,10 +567,10 @@ describe("run manager assembles per run", () => {
     const adults = [f.users.owner, f.users.shared, f.users.admin, f.users.stranger];
     for (const u of adults) {
       const { run } = await reply(u.id);
-      expect(run.instructions).toBe("common@9");
+      expect(run.instructions).toBe("common@10");
     }
     const { run } = await reply(son.id);
-    expect(run.instructions).toBe("common@9,youth@2");
+    expect(run.instructions).toBe("common@10,youth@2");
     expect(claude.systemPrompts).toHaveLength(adults.length + 1);
     expect(claude.systemPrompts.slice(0, adults.length).some((p) => p.includes(YOUTH_HEADING))).toBe(false);
     expect(claude.systemPrompts.at(-1)).toContain(YOUTH_HEADING);
@@ -574,10 +582,10 @@ describe("run manager assembles per run", () => {
   it("the finance section follows the run's tools", async () => {
     const { f, claude, reply } = await family({ tools: ["echo_time", FAKE_FINANCE_TOOL] });
     const { run } = await reply(f.users.owner.id);
-    expect(run.instructions).toBe("common@9,finance@5");
+    expect(run.instructions).toBe("common@10,finance@5");
     expect(claude.systemPrompts[0]).toContain(FINANCE_HEADING);
     const plain = await family({ tools: ["echo_time"] });
-    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@9");
+    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@10");
   });
 
   it("both runtimes get the same text for the same user and conversation", async () => {
@@ -610,7 +618,7 @@ describe("run manager assembles per run", () => {
     expect(res.json<{ researchMode: boolean }>().researchMode).toBe(true);
 
     const { run } = await reply(f.users.owner.id, conversationId);
-    expect(run.instructions).toBe("common@9,research@3");
+    expect(run.instructions).toBe("common@10,research@4");
     expect(claude.systemPrompts).toHaveLength(2); // not resumed with the old prompt
     expect(claude.systemPrompts[1]).toContain(RESEARCH_HEADING);
   });
@@ -620,7 +628,7 @@ describe("run manager assembles per run", () => {
     const { conversationId } = await reply(f.users.stranger.id);
     app.users!.setYouth(f.users.stranger.id, true);
     const { run } = await reply(f.users.stranger.id, conversationId);
-    expect(run.instructions).toBe("common@9,youth@2");
+    expect(run.instructions).toBe("common@10,youth@2");
     expect(claude.systemPrompts).toHaveLength(2);
     expect(claude.systemPrompts[1]).toContain(YOUTH_HEADING);
   });

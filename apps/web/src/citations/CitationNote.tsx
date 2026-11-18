@@ -41,7 +41,7 @@ export function CitedText({ text, note }: { text: string; note: CitationNotePart
 /** One source row: number, title (the link to the original, or the file viewer at the place), site · date. */
 function SourceRow({ v }: { v: CitationView }) {
   const fileHref = useFileViewHref();
-  const open = v.locator ? fileHref(v.locator.fileId, v.locator) : null;
+  const open = v.locator ? fileHref(v.locator.fileId, v.locator, v.citationId) : null;
   const name = sourceLinkText(v);
   return (
     <li className={v.ok ? "" : "warn"} data-testid="citation-source" data-status={v.status}>

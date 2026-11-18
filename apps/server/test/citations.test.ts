@@ -11,11 +11,15 @@ import {
   FINANCE_DISCLAIMER,
   sentenceEndMarkers,
   uncitedUnits,
+  type CitationEntry,
   type MessagePart,
 } from "@agentlee/shared";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
+import { CITE_TOOL } from "@agentlee/mcp-tools/web";
+import { FILE_CITE_TOOL } from "@agentlee/mcp-tools/files";
+import { z } from "zod";
 import { UserStore } from "../src/auth/users.js";
-import { citationNote } from "../src/citations/checker.js";
+import { citationNote, type CitationCarry } from "../src/citations/checker.js";
 import { CitationStore, CiteRefused, snippetKey } from "../src/citations/store.js";
 import { findSnippet, normalizeSnippet, normalizeWithMap, verifyStats } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
@@ -1366,6 +1370,8 @@ describe("citationNote", () => {
         url: FIXTURE_PAGES[0]!.url,
         publishedAt: FIXTURE_PAGES[0]!.publishedAt,
         quote: SNIP,
+        // The citation row it stands for (#186 review 2차): the whole passage stays there, server-side.
+        citationId: f.cites.forRun(scope.runId)[0]!.id,
       },
       expect.objectContaining({
         n: 2,
@@ -1415,7 +1421,11 @@ describe("citationNote", () => {
       publishedAt: null,
       quote: "파일의 구절이에요 열두 쪽",
     };
-    const carry = { conversationId: f.c.id, userId: later.userId, previous: () => [...earlier, fileEntry] };
+    const carry = {
+      conversationId: f.c.id,
+      userId: later.userId,
+      previous: () => [...earlier, fileEntry],
+    };
     const note = citationNote(later.runId, text("가[1]. 나[2]. 다[3]. 라[5]. 마[6]."), f.cites, carry)!;
     expect(note.citations.map((c) => [c.n, c.status, c.sourceId])).toEqual([
       [1, "verified", src.id],
@@ -1511,6 +1521,172 @@ describe("citationNote", () => {
     expect(
       f.cites.recheck({ ...owner, conversationId: crypto.randomUUID() }, { sourceId: src.id, snippet: SNIP }),
     ).toBe(undefined);
+  });
+
+  it("carry-over of a file citation (#186): by the earlier entry's citation row, checked again now — never by the text", () => {
+    const rev = "b".repeat(64);
+    const loc = { fileId: "file-1", fileRevision: rev, kind: "page" as const, page: 12 };
+    const first = f.run(f.c.id);
+    const A = "파일의 구절이에요 열두 쪽";
+    const B = "모델이 보낸 구절이에요";
+    f.cites.citeFile(first, { fileId: "file-1", snippet: A }, () => ({
+      status: "verified",
+      quote: A,
+      locator: loc,
+      unitHash: "unit-hash-1",
+    }));
+    f.cites.citeFile(first, { fileId: "file-1", snippet: B }, () => ({
+      status: "snippet_not_found",
+      quote: null,
+      locator: null,
+    }));
+    const forRun = (runId: string) =>
+      f.cites.forRun(runId).map((r) => ({ ...r, file: { id: "file-1", name: "보고서.pdf" } }));
+    const store = { forRun, recheck: f.cites.recheck.bind(f.cites), rowFor: f.cites.rowFor.bind(f.cites) };
+    const earlier = citationNote(first.runId, text("가[1]. 나[2]."), store)!.citations;
+    expect(earlier.map((c) => [c.n, c.status, c.fileId, typeof c.citationId])).toEqual([
+      [1, "verified", "file-1", "string"],
+      [2, "snippet_not_found", "file-1", "string"],
+    ]);
+    expect(JSON.stringify(earlier)).not.toContain('"snippet"');
+    const asked: { fileId: string; snippet: string; locator?: unknown }[] = [];
+    let now: "verified" | "snippet_not_found" | "fetch_failed" | "gone" = "verified";
+    const recheckFile: NonNullable<CitationCarry["recheckFile"]> = (sc, input) => {
+      expect(sc).toMatchObject({ conversationId: f.c.id, userId: scope.userId });
+      asked.push(input);
+      if (now === "gone") return undefined;
+      return now === "verified"
+        ? { status: "verified", quote: input.snippet, locator: loc, file: { name: "보고서.pdf" } }
+        : { status: now, quote: null, locator: null, file: { name: "보고서.pdf" } };
+    };
+    // An entry no row stands for (made up, or stored before ids without a run to look in): not carried.
+    const orphan: CitationEntry = { ...earlier[0]!, n: 3, citationId: undefined };
+    const previous = () => [...earlier, orphan];
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous, recheckFile };
+    const t = "요약하면 쓰레기를 치웠어요[1]. 학교도 함께했어요[2]. 다른 말이에요[3].";
+    const note = citationNote(f.run(f.c.id).runId, text(t), store, carry)!;
+    expect(CitationNotePart.parse(note)).toEqual(note);
+    expect(note.unbacked).toBeUndefined();
+    expect(note.citations.map((c) => [c.n, c.status, c.fileId, c.site, c.locator?.page])).toEqual([
+      [1, "verified", "file-1", "12쪽", 12],
+      [2, "verified", "file-1", "12쪽", 12],
+      [3, "unknown_source", undefined, null, undefined],
+    ]);
+    // Carried entries name the row they were carried from (a later answer carries them on).
+    expect(note.citations.slice(0, 2).map((c) => c.citationId)).toEqual(earlier.map((c) => c.citationId));
+    // The passage checked is the row's own (never a guess from the sentence), the earlier place first.
+    expect(asked).toEqual([
+      // With the unit's hash of a verified row (#186 review 4차: what the file recheck compares).
+      { fileId: "file-1", snippet: A, locator: loc, unitHash: "unit-hash-1" },
+      { fileId: "file-1", snippet: B, locator: undefined, unitHash: null },
+    ]);
+    // The file's text changed / being extracted again: carried, with ⚠️ — no place claimed, the quote kept.
+    for (const status of ["snippet_not_found", "fetch_failed"] as const) {
+      now = status;
+      const c = citationNote(f.run(f.c.id).runId, text("가[1]."), store, carry)!.citations[0]!;
+      expect([c.status, c.fileId, c.site, c.locator, c.quote]).toEqual([
+        status,
+        "file-1",
+        null,
+        undefined,
+        A,
+      ]);
+      expect(citationVerified(c.status)).toBe(false);
+    }
+    // The file is gone (or not this conversation's/user's any more): not carried — no sources, the marker flagged.
+    now = "gone";
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), store, carry)).toMatchObject({
+      citations: [{ n: 1, status: "unknown_source", sourceId: null }],
+      unbacked: true,
+    });
+    now = "verified";
+    // Another user's scope: the row is not theirs — not carried.
+    expect(
+      citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, userId: crypto.randomUUID() })!
+        .citations[0]!.status,
+    ).toBe("unknown_source");
+    // Without a recheck the file citation is not carried.
+    const { recheckFile: _r, ...bare } = carry;
+    void _r;
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), store, bare)!.citations[0]!.status).toBe(
+      "unknown_source",
+    );
+    // An entry stored before ids (review 3차): never carried, whatever rows its answer had.
+    const legacy = earlier.map(({ citationId: _id, ...e }) => (void _id, e));
+    expect(
+      citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, previous: () => legacy })!
+        .citations[0]!.status,
+    ).toBe("unknown_source");
+    // A run that read, searched, listed or cited (its own numbers): no carry.
+    for (const name of ["mcp__agentlee__file_search", "file_read", "file_list", "mcp__agentlee__file_cite"]) {
+      const parts: MessagePart[] = [{ type: "tool_call", id: "t1", name, input: {} }, ...text("가[1].")];
+      asked.length = 0;
+      const c = citationNote(f.run(f.c.id).runId, parts, store, carry)!.citations[0]!;
+      expect([c.status, c.fileId], name).toEqual(["unknown_source", undefined]);
+      expect(asked, name).toEqual([]);
+    }
+  });
+
+  it("review #186 2차: a passage that cannot be kept whole is refused before it is compared; a row that may be cut is never carried", () => {
+    const run = f.run(f.c.id);
+    // 481 code points, 511 UTF-16 units (zod's max counts code points): refused, never cut and compared.
+    const long = `${"😀".repeat(30)}${"가".repeat(451)}`;
+    expect(long.length).toBeGreaterThan(CITATION_LIMITS.snippet);
+    expect(() => f.cites.cite(run, { sourceId: src.id, snippet: long })).toThrow("cite_snippet_too_long");
+    expect(() =>
+      f.cites.citeFile(run, { fileId: "file-1", snippet: long }, () => {
+        throw new Error("never compared");
+      }),
+    ).toThrow("cite_snippet_too_long");
+    expect(f.cites.forRun(run.runId)).toEqual([]);
+    // The tool schemas count the same units.
+    // The tool schemas count the same units: 500 passes, 501 does not (one id per tool — the schemas are strict).
+    const ok = "가".repeat(CITATION_LIMITS.snippet);
+    for (const [tool, input] of [
+      [CITE_TOOL, { sourceId: "s" }],
+      [FILE_CITE_TOOL, { fileId: "f" }],
+    ] as const) {
+      const schema = z.strictObject(tool.input);
+      expect(schema.safeParse({ ...input, snippet: ok }).success, tool.name).toBe(true);
+      expect(schema.safeParse({ ...input, snippet: `${ok}😀` }).success, tool.name).toBe(false);
+      expect(schema.safeParse({ ...input, snippet: long }).success, tool.name).toBe(false);
+      expect(tool.description, tool.name).toContain("at most 500 UTF-16 units");
+    }
+    // A row stored before (review 3차: not marked complete — its snippet may have been cut, then masked to any
+    // length): never carried, whatever its length.
+    const old = f.run(f.c.id);
+    f.cites.cite(old, { sourceId: src.id, snippet: SNIP });
+    const row = f.cites.forRun(old.runId)[0]!;
+    expect(row.complete).toBe(true);
+    const scopeOf = { conversationId: f.c.id, userId: old.userId };
+    expect(f.cites.rowFor(scopeOf, row.id)?.id).toBe(row.id);
+    f.db.update(citations).set({ complete: false }).where(eq(citations.id, row.id)).run();
+    expect(f.cites.rowFor(scopeOf, row.id)).toBeUndefined();
+    const earlier = citationNote(old.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: old.userId, previous: () => earlier };
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)).toMatchObject({
+      citations: [{ status: "unknown_source" }],
+      unbacked: true,
+    });
+  });
+
+  it("review #186 1차: a run that called file_list or sources_list carries nothing — list item [1] is not the earlier [1]", () => {
+    const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)!.citations[0]!.status).toBe(
+      "verified",
+    );
+    for (const name of [
+      "mcp__agentlee__file_list",
+      "file_list",
+      "mcp__agentlee__sources_list",
+      "sources_list",
+    ]) {
+      const parts: MessagePart[] = [{ type: "tool_call", id: "t1", name, input: {} }, ...text("가[1].")];
+      expect(citationNote(f.run(f.c.id).runId, parts, f.cites, carry)!.citations[0]!.status, name).toBe(
+        "unknown_source",
+      );
+    }
   });
 
   it("fits the shared schema even with long titles and quotes of characters outside the BMP", () => {

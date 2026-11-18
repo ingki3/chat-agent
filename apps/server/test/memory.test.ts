@@ -566,8 +566,10 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
       })),
       "user",
     );
-    // Two long messages (≈ 18,000 estimated tokens) + the reserve stay under 28,000; with the documents they do not.
-    const long = "다".repeat(9000); // 27,000 bytes ≈ 9,000 tokens each
+    // Two long messages (≈ 19,000 estimated tokens) + the reserve stay under 28,000; with the documents they do not.
+    // (9,000 each left the documents too little room once common@10's file citation rules were added — the
+    // documents' budget includes the system instructions.)
+    const long = "다".repeat(9500); // 28,500 bytes ≈ 9,500 tokens each
     for (const t of [a, b]) {
       const c = await t.newConversation();
       await t.send(c, long);

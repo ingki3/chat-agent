@@ -830,9 +830,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       opts.runs?.instructions ? { templates: opts.runs.instructions } : {},
     );
     const memoryProposals = new MemoryProposals(opts.db!, memory.store);
+    const fileTools = new FileTools(fileStore, fileExtracts, app.conversations!);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
-      files: { tools: new FileTools(fileStore, fileExtracts, app.conversations!), citations },
+      files: { tools: fileTools, citations },
       web: {
         sources,
         citations,
@@ -914,6 +915,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       // The conversation's sources for the cited-source references (#53): only ids `cite` knows, with whether their
       // text is stored.
       contextSources: (conversationId) => sources.citable(conversationId),
+      // A follow-up writing an earlier answer's file citation number again (#186): checked against the file now.
+      fileRecheck: (scope, input) => fileTools.recheck(scope, input),
       ...opts.runs,
     });
     const deletion = new ConversationPurge(opts.db!, app.conversations!, {
