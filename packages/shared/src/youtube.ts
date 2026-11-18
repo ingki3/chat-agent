@@ -92,6 +92,16 @@ export const YOUTUBE_CODES = [
    * the model is told `youtube_failed` (no oracle for which value is a secret).
    */
   "youtube_secret_blocked",
+  /**
+   * A process of yt-dlp's tree left its process group during the run (`RunResult.escaped`): the run failed closed
+   * and every recorded process was killed.
+   */
+  "youtube_escaped",
+  /**
+   * New downloads are paused: a process of an earlier run left its group and could not be confirmed dead. Lifts
+   * itself once it is gone (or the server restarts).
+   */
+  "youtube_paused",
   /** No sandbox here (not macOS), a spawn failure, the egress proxy could not start. */
   "youtube_server_unavailable",
   "youtube_not_installed",
@@ -120,6 +130,8 @@ export const YOUTUBE_HINTS: Partial<Record<YoutubeCode, string>> = {
   youtube_file_limit: "이 대화의 파일이 너무 많아 저장하지 못했어요. 새 대화에서 해 주세요.",
   youtube_timeout: "시간 안에 받지 못했어요. 더 짧은 구간으로 다시 해 보세요.",
   youtube_not_installed: "서버에 유튜브 음성 받기가 설치되어 있지 않아요(관리자: pnpm youtube:install).",
+  youtube_paused:
+    "안전 점검 때문에 유튜브 음성 받기를 잠시 멈췄어요. 관리자에게 알려 주세요(서버 재시작 또는 남은 프로세스 정리).",
 };
 
 /** The M4A the tool saves: a format `audio_transcribe` takes (`AUDIO_FILE_KINDS`). */

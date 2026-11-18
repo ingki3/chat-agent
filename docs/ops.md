@@ -2248,6 +2248,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 | `youtube_bot_check`가 자주 | YouTube가 이 IP를 의심함. 잠시 뒤 다시. 계속되면 yt-dlp가 낡았을 수 있음 → §48.2로 새 정식 버전(3일 이상). 쿠키는 쓰지 않는다(결정) — 그 영상은 사용자가 음성 파일을 직접 올리게 안내 |
 | `youtube_failed`·`youtube_no_audio`가 갑자기 많아짐 | 대개 YouTube 변경 → §48.2. 서버 로그에는 고정 코드만 있다(`youtube.finished`의 `youtubeCode`). 원인을 보려면 관리자 Mac에서 같은 고정 yt-dlp를 샌드박스 밖에서 직접 돌려 본다(가족 대화와 무관한 공개 영상으로) |
 | 새로 필요한 호스트 | yt-dlp가 다른 호스트를 쓰기 시작하면 프록시가 403으로 막아 `youtube_failed`. `YOUTUBE_EGRESS_HOSTS`에 그 호스트만 더하는 코드 변경 + isolation.md 기록(와일드카드는 `*.<접미사>`, 라벨 둘 이상) |
+| `youtube_paused`("안전 점검 때문에 … 잠시 멈췄어요") | 앞선 실행에서 yt-dlp 쪽 프로세스가 프로세스 그룹을 떠났고(`youtube_escaped`, 스킬 실행 실패 목록) 죽였는데도 살아 있음 — 정상 경로에서는 일어나지 않는다. 그 프로세스가 끝나면 저절로 풀리고, 아니면 서버 재시작. 반복되면 yt-dlp·deno 버전을 의심하고 이슈로 |
 | `youtube_too_large` | 음성 전체 300MB 초과(대략 128kbps로 5시간 넘음). 구간을 줘도 전체를 받으므로 받을 수 없다 |
 
 ### 48.6 로그와 확인

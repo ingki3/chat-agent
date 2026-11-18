@@ -288,6 +288,8 @@ export class YoutubeAudioFetcher {
 
     const ready = this.opts.state();
     if (ready.state !== "available") throw new YoutubeError("youtube_not_installed");
+    // The circuit breaker: a process of an earlier run left its group and is still alive — nothing new starts.
+    if (this.opts.runner.paused?.()) throw new YoutubeError("youtube_paused");
     const store = this.opts.files();
     if (!store) throw new YoutubeError("youtube_server_unavailable");
     const messageId = this.replyOf(scope);

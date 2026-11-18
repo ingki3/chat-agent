@@ -1,8 +1,9 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { YOUTUBE_LIMITS, type YoutubeCode } from "@agentlee/shared";
-import { runIsolated, type RunIsolatedOptions, type RunResult } from "../isolation/sandbox.js";
+import { runIsolated, type RunIsolatedOptions, type RunResult, type TreeProc } from "../isolation/sandbox.js";
 import { SYSTEM_CA_BUNDLE } from "../mcp/service.js";
 import { YOUTUBE_DIR, YOUTUBE_ENTRY, type YoutubeEnv } from "./packages.js";
 
@@ -88,6 +89,11 @@ export type ConvertJob = {
 };
 
 export type YoutubeRunner = {
+  /**
+   * The circuit breaker (#191 review 2): true while a process of an earlier run that left its group is still alive
+   * (or could not be confirmed dead) — no new run starts then. Optional: scripted runners have none.
+   */
+  paused?(): boolean;
   probe(job: ProbeJob, signal?: AbortSignal): Promise<{ ok: true; info: ProbeInfo } | Fail>;
   download(job: DownloadJob, signal?: AbortSignal): Promise<{ ok: true; file: string; bytes: number } | Fail>;
   /** The download → `out/audio.m4a`. */
@@ -257,16 +263,46 @@ function plainFile(file: string): number | undefined {
   return st.size;
 }
 
+/**
+ * Which of these processes are still alive with the same start time (`ps -p`, C locale) — a reused pid is not them.
+ * Fail closed: when ps cannot answer, all of them count as alive.
+ */
+export function stillAlive(procs: readonly TreeProc[]): TreeProc[] {
+  if (!procs.length) return [];
+  const r = spawnSync("/bin/ps", ["-o", "pid=,lstart=", "-p", procs.map((p) => p.pid).join(",")], {
+    env: { LC_ALL: "C" },
+    encoding: "utf8",
+    timeout: 2000,
+  });
+  if (r.error || r.signal) return [...procs];
+  const now = new Map<number, string>();
+  for (const l of r.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(\S.*\S)\s*$/.exec(l);
+    if (m) now.set(Number(m[1]), m[2]!);
+  }
+  return procs.filter((p) => now.get(p.pid) === p.start);
+}
+
 /** The runner the app uses: every step under `runIsolated` (macOS only). */
-export function sandboxedYoutubeRunner(o: { run?: typeof runIsolated } = {}): YoutubeRunner {
+export function sandboxedYoutubeRunner(
+  o: { run?: typeof runIsolated; alive?: typeof stillAlive } = {},
+): YoutubeRunner {
   const run = o.run ?? runIsolated;
+  const alive = o.alive ?? stillAlive;
+  // Processes of earlier runs that left their group and survived the kill: while any is alive, nothing new runs.
+  let survivors: TreeProc[] = [];
   const attempt = async (opts: RunIsolatedOptions, signal?: AbortSignal): Promise<RunResult | Fail> => {
+    let r: RunResult;
     try {
-      return await run({ ...opts, ...(signal ? { signal } : {}) });
+      r = await run({ ...opts, ...(signal ? { signal } : {}) });
     } catch {
       // No sandbox here (not macOS), a hard link in an allowed folder, a spawn failure: nothing ran.
       return { ok: false, code: "youtube_server_unavailable" };
     }
+    if (r.survivors?.length) survivors = [...survivors, ...r.survivors];
+    // A process left the group: whatever the run printed, it failed (its processes were killed).
+    if (r.escaped || r.killed === "escaped") return { ok: false, code: "youtube_escaped" };
+    return r;
   };
   const isFail = (r: RunResult | Fail): r is Fail => "ok" in r;
   const prepare = (workdir: string) => {
@@ -276,6 +312,10 @@ export function sandboxedYoutubeRunner(o: { run?: typeof runIsolated } = {}): Yo
     return f;
   };
   return {
+    paused() {
+      if (survivors.length) survivors = alive(survivors);
+      return survivors.length > 0;
+    },
     async probe(job, signal) {
       const f = prepare(job.workdir);
       const r = await attempt(

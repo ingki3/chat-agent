@@ -42,8 +42,9 @@ export type SandboxPolicy = {
   /**
    * Child processes (#191: yt-dlp starts its JS runtime, deno, for YouTube's challenge). Adds `process-fork`; what a
    * child may run is still only `exec` (literal paths), and every child inherits this same profile. `runIsolated`
-   * then measures the memory of the whole process group and kills the group (leftovers included) once the command
-   * exits. Off for everything else: no runtime, skill or tool needs to fork.
+   * then records the job's process tree (pid + start time) every 250 ms, measures its memory as a whole, and once
+   * the command exits kills the group and every recorded process still alive (a child that left the group after it
+   * was seen) — see `RunResult.escaped` / `survivors`. Off for everything else: no runtime, skill or tool needs to fork.
    */
   fork?: boolean;
 };
@@ -87,7 +88,66 @@ export type RunResult = {
    * still held its output pipes after `FORK_DRAIN_MS`: the pipes are cut and the run counts as failed.
    */
   killed: null | "timeout" | "output" | "memory" | "monitor" | "aborted" | "escaped";
+  /**
+   * `fork` only: a process of the job's tree was seen outside its process group (it made its own session or group) —
+   * the run is not to be trusted, whatever it printed. Such processes are killed at the end like every recorded one.
+   */
+  escaped?: boolean;
+  /**
+   * `fork` only: recorded processes of the job (pid + start time) still alive after the final SIGKILL, or that could
+   * not be confirmed gone. Empty when everything is gone.
+   */
+  survivors?: TreeProc[];
 };
+
+/** One process of the table: pid, parent, group, resident KiB and its start time (`ps` `lstart`, C locale). */
+export type TreeProc = { pid: number; ppid: number; pgid: number; rss: number; start: string };
+
+/** The whole process table (`ps -A`). Rejects when ps fails or times out. */
+export function processTable(timeoutMs = 2000): Promise<TreeProc[]> {
+  return new Promise((resolve, reject) => {
+    const ps = spawn("/bin/ps", ["-A", "-o", "pid=,ppid=,pgid=,rss=,lstart="], { env: { LC_ALL: "C" } });
+    let out = "";
+    const timer = setTimeout(() => {
+      ps.kill("SIGKILL");
+      reject(new Error("ps timed out"));
+    }, timeoutMs);
+    ps.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    ps.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    ps.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`ps exited ${code}`));
+      resolve(
+        out.split("\n").flatMap((l) => {
+          const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S.*\S)\s*$/.exec(l);
+          return m ? [{ pid: +m[1]!, ppid: +m[2]!, pgid: +m[3]!, rss: +m[4]!, start: m[5]! }] : [];
+        }),
+      );
+    });
+  });
+}
+
+/** The job's processes in a table: the root, everything below it by parent, and every member of its group. */
+export function jobTree(table: readonly TreeProc[], root: number): TreeProc[] {
+  const kids = new Map<number, TreeProc[]>();
+  for (const p of table) {
+    const list = kids.get(p.ppid) ?? [];
+    list.push(p);
+    kids.set(p.ppid, list);
+  }
+  const found = new Map<number, TreeProc>();
+  const stack = table.filter((p) => p.pid === root || p.pgid === root);
+  while (stack.length) {
+    const p = stack.pop()!;
+    if (found.has(p.pid)) continue;
+    found.set(p.pid, p);
+    for (const k of kids.get(p.pid) ?? []) stack.push(k);
+  }
+  return [...found.values()];
+}
 
 /**
  * With `fork`: how long the output pipes may stay open after the command exited (and its group was killed) before
@@ -152,15 +212,10 @@ export class SandboxUnavailableError extends Error {
 
 export type Proc = { pid: number; rss: number };
 
-/**
- * Resident memory (KiB) of one process via `ps` — or, with `group`, of every process of the process group it leads
- * (#191: `fork`; the caller adds them up). Rejects when ps fails, times out or prints nothing usable.
- */
-export function snapshot(pid: number, timeoutMs = 2000, group = false): Promise<Proc[]> {
+/** Resident memory (KiB) of one process via `ps`. Rejects when ps fails, times out or prints nothing usable. */
+export function snapshot(pid: number, timeoutMs = 2000): Promise<Proc[]> {
   return new Promise((resolve, reject) => {
-    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", ...(group ? ["-g", String(pid)] : ["-p", String(pid)])], {
-      env: {},
-    });
+    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", "-p", String(pid)], { env: {} });
     let out = "";
     const timer = setTimeout(() => {
       ps.kill("SIGKILL");
@@ -224,6 +279,36 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
     let exited = false;
     let settled = false;
     let drain: NodeJS.Timeout | undefined;
+    // `fork`: every process of the job seen while it ran (pid → start time), whether one left the group, and the
+    // processes still alive after the final kill.
+    const seen = new Map<number, TreeProc>();
+    let escaped = false;
+    /**
+     * Kills every recorded process still alive with the same start time (a reused pid is never touched), then looks
+     * again. What is still there — or everything, when the table cannot be read — is a survivor.
+     */
+    const reap = async (): Promise<TreeProc[]> => {
+      if (!o.fork || !seen.size) return [];
+      const alive = (t: readonly TreeProc[]) => t.filter((p) => seen.get(p.pid)?.start === p.start);
+      try {
+        const now = alive(await processTable());
+        if (!now.length) return [];
+        for (const p of now) {
+          if (p.pgid !== pid) escaped = true;
+          try {
+            process.kill(p.pid, "SIGKILL");
+          } catch {
+            // gone meanwhile
+          }
+        }
+        await new Promise((r) => setTimeout(r, 100));
+        return alive(await processTable());
+      } catch {
+        return [...seen.values()].filter((p) => p.pid !== pid);
+      }
+    };
+    let reaping: Promise<TreeProc[]> | undefined;
+    const reapOnce = () => (reaping ??= reap());
     const done = () => {
       clearTimeout(timer);
       clearTimeout(drain);
@@ -234,7 +319,13 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       if (settled) return;
       settled = true;
       done();
-      resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed });
+      const stdout = out + outDec.end();
+      const stderr = err + errDec.end();
+      if (!o.fork) return resolve({ code, signal, stdout, stderr, killed });
+      // The recorded processes go before the answer (a child that left the group, seen while the job ran).
+      void reapOnce().then((survivors) =>
+        resolve({ code, signal, stdout, stderr, killed, escaped, survivors }),
+      );
     };
     // `fork` only: the command is gone but its pipes are not closed — cut them and answer now (the time limit, a stop
     // and the drain deadline all end the call, whatever still holds the other end).
@@ -275,24 +366,34 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
     else o.signal?.addEventListener("abort", onAbort, { once: true });
 
     let sampling = false;
+    /** `fork`: the job's tree from the process table — recorded, checked for a process outside the group. */
+    const tree = async (): Promise<Proc[]> => {
+      const t = jobTree(await processTable(), pid);
+      for (const p of t) {
+        if (!seen.has(p.pid)) seen.set(p.pid, p);
+        if (p.pgid !== pid) escaped = true;
+      }
+      return t;
+    };
     const sample = async () => {
       if (sampling || killed || exited) return;
       sampling = true;
       try {
-        const procs = await (o.probe ?? ((p: number) => snapshot(p, 2000, !!o.fork)))(pid);
+        const procs = await (o.probe ?? ((p: number) => (o.fork ? tree() : snapshot(p))))(pid);
         const me = procs.find((p) => p.pid === pid);
-        // With children (`fork`): the whole group counts — yt-dlp and the deno it started together.
+        // With children (`fork`): the whole tree counts — yt-dlp and the deno it started together.
         const rss = o.fork ? procs.reduce((a, p) => a + p.rss, 0) : (me?.rss ?? 0);
         if (!me) {
           if (!exited) kill("monitor"); // running but not measurable → cannot enforce → stop
-        } else if (rss * 1024 > o.maxRssBytes!) kill("memory");
+        } else if (o.maxRssBytes && rss * 1024 > o.maxRssBytes) kill("memory");
       } catch {
         kill("monitor");
       } finally {
         sampling = false;
       }
     };
-    const monitor = o.maxRssBytes ? setInterval(() => void sample(), 250) : undefined;
+    // With `fork` the monitor also records the job's tree, memory limit or not.
+    const monitor = o.maxRssBytes || o.fork ? setInterval(() => void sample(), 250) : undefined;
 
     child.on("exit", () => {
       exited = true;
@@ -306,6 +407,9 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       } catch {
         // the group is already gone
       }
+      // And every recorded process outside it (a child that left the group after it was seen): killed now, so its
+      // pipes close too.
+      void reapOnce();
       drain = setTimeout(() => cut("escaped"), FORK_DRAIN_MS);
     });
     child.on("error", (e) => {

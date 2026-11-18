@@ -37,6 +37,7 @@ import {
   convertOptions,
   sandboxedYoutubeRunner,
   scriptReport,
+  stillAlive,
   youtubeFolders,
   ytdlpEnv,
   ytdlpOptions,
@@ -728,6 +729,43 @@ describe("youtube_audio_fetch: a call (#191)", () => {
     expect(await yt.run(await t.scopeOf(c.id), { url: URL_OK })).toMatchObject({ ok: true });
   });
 
+  it("through the MCP tool itself (no runtime scrubbing): the model sees youtube_failed, the log and admin errors the guard", async () => {
+    const REG = "sEcReT19101";
+    knownSecrets.add(REG);
+    const s = scripted();
+    const t = await start({ runner: s.runner });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const scope = await t.scopeOf(c.id);
+    const { url } = await t.app.mcp!.endpoint();
+    const token = t.app.runs!.mcpTokens.issue(scope);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "youtube_audio_fetch", arguments: { url: `https://youtu.be/${REG}` } },
+      }),
+    });
+    const j = (await res.json()) as { result: { content: { text: string }[]; isError?: boolean } };
+    expect(j.result.isError).toBe(true);
+    expect(JSON.parse(j.result.content[0]!.text)).toEqual({ error: "youtube_failed" });
+    expect(s.calls.probe).toEqual([]);
+    expect(t.proxies).toEqual([]);
+    expect(t.log.find((l) => l.msg === "youtube.finished")).toMatchObject({
+      youtubeCode: "youtube_secret_blocked",
+    });
+    const errs = await t.api(t.f.cookies.admin, "GET", "/api/admin/errors");
+    expect(errs.statusCode, errs.body).toBe(200);
+    expect(errs.body).toContain("youtube_secret_blocked");
+    expect(errs.body).not.toContain(REG);
+  });
+
   it("at most 3 calls per answer; one download per user at a time (youtube_busy)", async () => {
     const t = await start();
     const c = t.app.conversations!.create(t.f.users.owner.id);
@@ -1334,67 +1372,142 @@ describe("youtube_audio_fetch: the real yt-dlp's download limit (TEST_YTDLP_PACK
 
 // ---- a child that leaves the process group (fork) -----------------------------------------------------------
 
-describe("runIsolated with fork: a child outside the group cannot keep the call open (#191 review 1)", () => {
+describe("runIsolated with fork: a child that leaves the group (#191 review 1, 2)", () => {
   const pyIt = realPy?.ok ? it : it.skip;
-  /** python: fork a child that makes its own session and sleeps holding stdout/stderr; the parent then `rest`s. */
+  /**
+   * python: fork a child that waits `argv[2]` seconds, makes its own session (`setsid`) and sleeps holding
+   * stdout/stderr; the parent writes the child's pid and then waits `argv[1]` seconds.
+   */
   const ESCAPE = String.raw`
 import os, sys, time
 pid = os.fork()
 if pid == 0:
+    time.sleep(float(sys.argv[2]))
     os.setsid()
     time.sleep(30)
     os._exit(0)
 open("child.pid", "w").write(str(pid))
 time.sleep(float(sys.argv[1]))
 `;
+  const isAlive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const run = async (
+    parent: string,
+    child: string,
+    extra: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ) => {
+    const { runIsolated } = await import("../src/isolation/sandbox.js");
+    const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
+    const cwd = tmp();
+    const t0 = Date.now();
+    const r = await runIsolated({
+      command: py.exe,
+      args: ["-I", "-S", "-B", "-c", ESCAPE, parent, child],
+      cwd,
+      env: { HOME: cwd },
+      read: [],
+      write: [cwd],
+      trusted: [py.root],
+      fork: true,
+      timeoutMs: extra.timeoutMs ?? 20_000,
+      maxOutputBytes: 1024,
+      ...(extra.signal ? { signal: extra.signal } : {}),
+    });
+    const ms = Date.now() - t0;
+    const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
+    closers.push(() => {
+      if (isAlive(childPid)) process.kill(childPid, "SIGKILL");
+    });
+    return { r, ms, childPid };
+  };
+
   pyIt(
-    "exit, time limit, stop: each ends the call within the drain deadline; the escaped child is reported",
+    "a child seen in the tree, then gone to its own session: killed with the job, the run marked escaped",
     async () => {
-      const { FORK_DRAIN_MS, runIsolated } = await import("../src/isolation/sandbox.js");
-      const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
-      const run = async (rest: string, extra: { timeoutMs?: number; signal?: AbortSignal } = {}) => {
-        const cwd = tmp();
-        const t0 = Date.now();
-        const r = await runIsolated({
-          command: py.exe,
-          args: ["-I", "-S", "-B", "-c", ESCAPE, rest],
-          cwd,
-          env: { HOME: cwd },
-          read: [],
-          write: [cwd],
-          trusted: [py.root],
-          fork: true,
-          timeoutMs: extra.timeoutMs ?? 20_000,
-          maxOutputBytes: 1024,
-          ...(extra.signal ? { signal: extra.signal } : {}),
-        });
-        const ms = Date.now() - t0;
-        const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
-        closers.push(() => {
-          try {
-            process.kill(childPid, "SIGKILL");
-          } catch {
-            // gone
-          }
-        });
-        return { r, ms };
-      };
-      // The command exits at once; the escaped child holds the pipes: cut after the drain deadline.
-      const a = await run("0");
-      expect(a.r.killed).toBe("escaped");
-      expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
-      // The time limit: the command is killed with its group, the escaped child still holds the pipes — still ends.
-      const b = await run("30", { timeoutMs: 500 });
+      // Seen while still in the group (the monitor looks every 250 ms), then setsid; the parent exits later.
+      const a = await run("1.5", "0.6");
+      expect(a.r.escaped).toBe(true);
+      expect(a.r.survivors).toEqual([]);
+      expect(isAlive(a.childPid)).toBe(false);
+      // Out of its session at once, while its parent still runs: found by parent, killed at the time limit.
+      const b = await run("30", "0", { timeoutMs: 800 });
       expect(b.r.killed).toBe("timeout");
-      expect(b.ms).toBeLessThan(500 + FORK_DRAIN_MS + 3000);
-      // A stop after the command exited (during the drain): ends at once.
+      expect(b.r.escaped).toBe(true);
+      expect(b.r.survivors).toEqual([]);
+      expect(isAlive(b.childPid)).toBe(false);
+      // The same with a stop.
       const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 300);
-      const c = await run("0", { signal: ctrl.signal });
+      setTimeout(() => ctrl.abort(), 800);
+      const c = await run("30", "0", { signal: ctrl.signal });
       expect(c.r.killed).toBe("aborted");
-      expect(c.ms).toBeLessThan(FORK_DRAIN_MS);
+      expect(isAlive(c.childPid)).toBe(false);
     },
   );
+
+  pyIt(
+    "a child that escapes before it is ever seen still cannot keep the call open (the drain deadline)",
+    async () => {
+      const { FORK_DRAIN_MS } = await import("../src/isolation/sandbox.js");
+      // The parent exits at once: its child may never be seen (the uncovered case) — the call still ends, failed.
+      const a = await run("0", "0");
+      expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
+      expect(a.r.killed === "escaped" || a.r.escaped === true).toBe(true);
+    },
+  );
+
+  it("the circuit breaker: a survivor pauses new runs until it is gone; an escaped run fails closed", async () => {
+    const survivor = { pid: 424242, ppid: 1, pgid: 424242, rss: 1, start: "Wed Nov 18 12:00:00 2026" };
+    let alive = [survivor];
+    const runner = sandboxedYoutubeRunner({
+      run: async () => ({
+        code: 0,
+        signal: null,
+        stdout: '{"ok":true,"info":{}}',
+        stderr: "",
+        killed: null,
+        escaped: true,
+        survivors: [survivor],
+      }),
+      alive: (procs) => procs.filter((p) => alive.some((a) => a.pid === p.pid)),
+    });
+    expect(runner.paused!()).toBe(false);
+    const workdir = makeYoutubeWorkdir(path.join(tmp(), "data"));
+    expect(
+      await runner.probe({
+        env: FAKE_ENV,
+        workdir,
+        url: URL_OK,
+        proxy: { url: "http://127.0.0.1:1", port: 1 },
+      }),
+    ).toEqual({ ok: false, code: "youtube_escaped" });
+    expect(runner.paused!()).toBe(true);
+    // The service refuses at once, with a hint — nothing runs.
+    const t = await start({ runner });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    expect(await t.svc(runner).run(await t.scopeOf(c.id), { url: URL_OK })).toEqual({
+      ok: false,
+      code: "youtube_paused",
+      hint: YOUTUBE_HINTS.youtube_paused,
+    });
+    alive = [];
+    expect(runner.paused!()).toBe(false);
+  });
+
+  const darwinIt = process.platform === "darwin" ? it : it.skip;
+  darwinIt("stillAlive: the same pid and start time only (a reused pid is not the process)", async () => {
+    const { processTable } = await import("../src/isolation/sandbox.js");
+    const me = (await processTable()).find((p) => p.pid === process.pid)!;
+    expect(me.start).toMatch(/\d{4}$/);
+    expect(stillAlive([me])).toEqual([me]);
+    expect(stillAlive([{ ...me, start: "Thu Jan  1 00:00:00 1970" }])).toEqual([]);
+    expect(stillAlive([{ ...me, pid: 999_999 }])).toEqual([]);
+  });
 });
 
 // ---- the pinned install (a fake wheel, offline) ------------------------------------------------------------------
