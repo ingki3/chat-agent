@@ -726,15 +726,48 @@ describe("quiet hours (FR-13.4)", () => {
       quietEnd: "06:00",
       timeZone: "Nowhere/City",
     });
-    // 기억 정리 notifications (#146): on unless turned off, kept when a page leaves them out.
+    // 기억 정리 notifications (#146, #188): on unless turned off, kept when a page leaves them out.
     expect(ok.json()).toEqual({
       quietStart: "22:30",
       quietEnd: "06:00",
       timeZone: "Asia/Seoul",
       memoryProposals: true,
       memoryApplied: true,
+      memoryFailed: true,
+      rev: 1,
     });
     expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toEqual(ok.json());
+  });
+
+  it("saves only the fields sent: two pages changing different fields keep both (#188 review 5)", async () => {
+    const { member, api } = await setup();
+    const mom = member("mom");
+    // Page 1 saves quiet hours; page 2 (loaded before) toggles 기억 정리 실패 — quiet hours stay.
+    await api(mom, "PUT", "/api/notifications/prefs", {
+      quietStart: "23:00",
+      quietEnd: "07:00",
+      timeZone: "Asia/Seoul",
+    });
+    await api(mom, "PUT", "/api/notifications/prefs", { memoryFailed: false });
+    expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toMatchObject({
+      quietStart: "23:00",
+      quietEnd: "07:00",
+      memoryFailed: false,
+      memoryApplied: true,
+    });
+    // And the other way round: switching quiet hours off keeps the toggle.
+    await api(mom, "PUT", "/api/notifications/prefs", {
+      quietStart: null,
+      quietEnd: null,
+      timeZone: "Asia/Seoul",
+    });
+    expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toMatchObject({
+      quietStart: null,
+      memoryFailed: false,
+    });
+    // Quiet hours go as a pair; an unknown field is refused.
+    expect((await api(mom, "PUT", "/api/notifications/prefs", { quietStart: "22:00" })).statusCode).toBe(400);
+    expect((await api(mom, "PUT", "/api/notifications/prefs", { nope: true })).statusCode).toBe(400);
   });
 });
 

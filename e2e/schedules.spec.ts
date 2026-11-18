@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { ADMIN, csrf, newMember, signIn, useAccount } from "./helpers.js";
 
 /**
- * Schedules (#55, PRD FR-8.1·8.2·8.5): "매일 아침 8시 관심 종목 브리핑" in a conversation → the confirmation card →
+ * Schedules (#55, PRD FR-8.1·8.2·8.5): "매일 아침 8시 시장 브리핑" in a conversation → the confirmation card →
  * 예약 만들기 → the schedule is on the 예약 screen with the creator's defaults; the screen's own form, pause and
  * "바로 실행" (the FAKE_RUNTIME=1 server's fake handler runs it) with its history. Each test has its own account.
  */
@@ -12,11 +12,11 @@ test("대화에서 예약 만들기: 확인 카드 → 만들기 → 예약 화�
   await signIn(page, baseURL!, me);
   await page.goto("/");
   const box = page.getByRole("textbox", { name: /메시지/ });
-  await box.fill("매일 아침 8시 관심 종목 브리핑");
+  await box.fill("매일 아침 8시 시장 브리핑");
   await box.press("Enter");
   const card = page.getByTestId("schedule-card");
   await expect(card).toBeVisible();
-  await expect(card.getByText("아침 관심 종목 브리핑")).toBeVisible();
+  await expect(card.getByText("아침 시장 브리핑")).toBeVisible();
   await expect(card.getByTestId("schedule-card-timing")).toContainText("매일 08:00");
   await expect(card.getByTestId("schedule-card-next")).toContainText("8:00");
   await expect(card).toContainText("내 기본값");
@@ -26,7 +26,7 @@ test("대화에서 예약 만들기: 확인 카드 → 만들기 → 예약 화�
   await card.getByRole("button", { name: "예약 만들기" }).click();
   await expect(card.getByText("만들었어요", { exact: true })).toBeVisible();
   await card.getByRole("link", { name: "예약 화면에서 보기" }).click();
-  await expect(page.getByRole("heading", { name: "아침 관심 종목 브리핑" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "아침 시장 브리핑" })).toBeVisible();
   await expect(page.getByTestId("schedule-settings")).toContainText("Claude Code");
   await page.goto("/schedules");
   await expect(page.getByTestId("schedule-item")).toHaveCount(1);
@@ -147,7 +147,7 @@ test("확인 카드: 그사이 기본값이 바뀌면 새로 고친 카드를 �
   await signIn(page, baseURL!, me);
   await page.goto("/");
   const box = page.getByRole("textbox", { name: /메시지/ });
-  await box.fill("매일 아침 8시 관심 종목 브리핑");
+  await box.fill("매일 아침 8시 시장 브리핑");
   await box.press("Enter");
   const card = page.getByTestId("schedule-card");
   await expect(card.getByRole("button", { name: "예약 만들기" })).toBeVisible();

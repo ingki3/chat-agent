@@ -7,7 +7,6 @@ import { AccessLogin, AdminEmailConfirm, Card, ChangePassword, Login, Setup } fr
 import { AdminPage } from "./pages/AdminPage.js";
 import { ArtifactPage } from "./pages/ArtifactPage.js";
 import { ArtifactsPage } from "./pages/ArtifactsPage.js";
-import { WatchlistPage } from "./pages/WatchlistPage.js";
 import { ChatPage, NewChatPage } from "./pages/ChatPage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { PlaceholderPage } from "./pages/PlaceholderPage.js";
@@ -93,7 +92,8 @@ function AuthGate() {
           <Route path="schedules/new" element={<SchedulesPage creating />} />
           <Route path="schedules/:id" element={<ScheduleRoute />} />
           <Route path="artifacts" element={<ArtifactsPage />} />
-          <Route path="watchlist" element={<WatchlistPage />} />
+          {/* 관심 종목 was removed (#187): its old address goes home. */}
+          <Route path="watchlist" element={<Navigate to="/" replace />} />
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
           <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />

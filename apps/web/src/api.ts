@@ -1,8 +1,4 @@
 import {
-  WatchlistItem,
-  WatchlistResponse,
-  WatchlistSearchResponse,
-  type WatchMarket,
   AdminRuntimesResponse,
   BackupItem,
   BackupsResponse,
@@ -90,11 +86,12 @@ import {
   DREAMING_ERRORS,
   DreamingAdmin,
   DreamingPreview,
-  DreamingPromptVersions,
-  DreamingPromptView,
   DreamingUserStatus,
   MyDreaming,
-  type DreamingConfig,
+  type SaveDreamingConfigRequest,
+  type SaveDreamingSettingsRequest,
+  type SaveNotificationPrefsRequest,
+  type SaveYouthDreamingRequest,
   MemoryPrefs,
   MemoryProposal,
   type MemoryApplyMode,
@@ -533,7 +530,8 @@ export const notifications = {
   readAll: async () => UnreadCount.parse(await call("POST", "/api/notifications/read-all", {})).unread,
   test: async () => call("POST", "/api/notifications/test", {}),
   prefs: async () => NotificationPrefs.parse(await call("GET", "/api/notifications/prefs")),
-  setPrefs: async (p: NotificationPrefs) =>
+  /** Only the changed fields (the server merges them; quiet hours as a pair). */
+  setPrefs: async (p: SaveNotificationPrefsRequest) =>
     NotificationPrefs.parse(await call("PUT", "/api/notifications/prefs", p)),
 };
 
@@ -679,12 +677,6 @@ const MESSAGES: Record<string, string> = {
   proposal_dismissed: "취소한 예약 제안이에요.",
   proposal_gone: "이 제안으로 만든 예약이 지워졌어요.",
   proposal_confirmed: "이미 만든 예약이에요.",
-  watchlist_duplicate: "이미 관심 종목에 있어요.",
-  watchlist_bad_symbol: "담을 수 없는 종목 코드예요.",
-  watchlist_full: "관심 종목은 50개까지 담을 수 있어요.",
-  finance_not_allowed: "이 계정은 금융 기능을 쓸 수 없어요.",
-  finance_unreachable: "종목 검색 서버에 연결하지 못했어요. 잠시 뒤 다시 해 보세요.",
-  finance_busy: "지금 요청이 많아요. 잠시 뒤 다시 해 보세요.",
   proposal_changed:
     "그사이 기본 런타임·모델(또는 허용 범위)이 바뀌었어요. 바뀐 내용을 확인하고 다시 눌러 주세요.",
   // Reference export (#26)
@@ -785,19 +777,6 @@ export const schedules = {
     ),
   dismiss: async (id: string) =>
     ScheduleProposal.parse(await call("POST", `/api/schedule-proposals/${enc(id)}/dismiss`, {})),
-};
-
-/** 관심 종목 (#31, FR-7.7): the caller's own list (owner only), the search and add / remove. */
-export const WATCHLIST_KEY = ["watchlist"] as const;
-export const watchlist = {
-  list: async () => WatchlistResponse.parse(await call("GET", "/api/watchlist")),
-  search: async (q: string, signal?: AbortSignal) =>
-    WatchlistSearchResponse.parse(
-      await call("GET", `/api/watchlist/search?q=${encodeURIComponent(q)}`, undefined, {}, signal),
-    ).items,
-  add: async (market: WatchMarket, symbol: string, name?: string | null) =>
-    WatchlistItem.parse(await call("POST", "/api/watchlist", { market, symbol, ...(name ? { name } : {}) })),
-  remove: async (id: string) => call("DELETE", `/api/watchlist/${enc(id)}`),
 };
 
 /** 참고문헌 내보내기 (#26): the list in one style, and a download (`.txt` / `.docx`) as a file the page saves. */
@@ -930,31 +909,32 @@ export const memoryPrefs = {
 };
 
 /**
- * 기억 정리 (#146, FR-16.5·16.6·16.8). The user's own: whether it runs, the prompt in use, DREAMS.md and the bundles
- * (decided with `memoryProposals`). The admin's: settings, prompt versions, 미리 실행 (own data), status counts.
+ * 기억 정리 (#146, #188, FR-16.5·16.6·16.8). The user's own: settings (switch, time, connection·model), the prompt
+ * (기본값으로 되돌리기 = null), 미리 실행 on their own data, DREAMS.md and the bundles (decided with `memoryProposals`).
+ * The admin's: the server-wide switch, the token cap, the allowed pairs, a youth account's settings, status counts.
  */
 export const DREAMING_KEY = ["dreaming"] as const;
 export const ADMIN_DREAMING_KEY = ["admin", "dreaming"] as const;
 export const dreaming = {
   mine: async () => MyDreaming.parse(await call("GET", "/api/dreaming")),
+  /** Only the changed fields (the server merges them). */
+  save: async (s: SaveDreamingSettingsRequest) =>
+    MyDreaming.parse(await call("PUT", "/api/dreaming/settings", s)),
+  savePrompt: async (content: string | null) =>
+    MyDreaming.parse(await call("PUT", "/api/dreaming/prompt", { content })),
+  preview: async (content?: string) =>
+    DreamingPreview.parse(
+      await call("POST", "/api/dreaming/preview", content === undefined ? {} : { content }),
+    ),
 };
 export const adminDreaming = {
   get: async () => DreamingAdmin.parse(await call("GET", "/api/admin/dreaming")),
-  save: async (c: DreamingConfig) => DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
-  setUser: async (id: string, enabled: boolean) =>
-    DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, { enabled })),
-  savePrompt: async (content: string, baseVersion: number) =>
-    DreamingPromptView.parse(await call("PUT", "/api/admin/dreaming/prompt", { content, baseVersion })),
-  versions: async () =>
-    DreamingPromptVersions.parse(await call("GET", "/api/admin/dreaming/prompt/versions")).versions,
-  restore: async (v: number, baseVersion: number) =>
-    DreamingPromptView.parse(
-      await call("POST", `/api/admin/dreaming/prompt/versions/${v}/restore`, { baseVersion }),
-    ),
-  preview: async (content?: string) =>
-    DreamingPreview.parse(
-      await call("POST", "/api/admin/dreaming/preview", content === undefined ? {} : { content }),
-    ),
+  /** Only the changed fields (the server merges them). */
+  save: async (c: SaveDreamingConfigRequest) =>
+    DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
+  /** A youth account's settings, 반영 방식 and (write-only) prompt — the admin's to set. */
+  setUser: async (id: string, s: SaveYouthDreamingRequest) =>
+    DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, s)),
   /** "지금 실행" — the FakeRuntime server only (development, e2e). */
   runNow: async (id: string) =>
     DreamingUserStatus.parse(await call("POST", `/api/admin/dreaming/users/${enc(id)}/run`, {})),

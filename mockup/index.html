@@ -217,7 +217,6 @@ section[data-screen].on{display:block}
 .login-wrap{min-height:calc(100vh - 34px);display:grid;place-items:center;padding:20px}
 .cf{background:#fff;color:#222;border-radius:12px;padding:22px;width:320px;box-shadow:var(--shadow);border-top:4px solid #f38020}
 .empty{max-width:560px;margin:0 auto;text-align:center;padding:30px 18px}
-.wl td{padding:5px 6px}
 
 @media (max-width: 900px){
   .side{display:none}
@@ -256,6 +255,7 @@ section[data-screen].on{display:block}
 </style>
 </head>
 <body>
+<!-- 관심 종목(FR-7.7)은 #187에서 제거했다: 이 목업의 관심 종목 칩·검색·저장·제거 시연은 지웠다. 예약·브리핑 예시 이름에 남은 "관심 종목"은 예시 문장일 뿐 기능이 아니다. -->
 
 <!-- ========= 목업 탐색 바 (리뷰용 — 실제 앱 UI 아님) ========= -->
 <nav id="mocknav">
@@ -599,9 +599,9 @@ plt.show()</pre>
           <div class="meta"><span class="dot claude"></span>Claude Code · Opus 5.5 · 오전 9:03</div>
           <div class="actions"><button>⧉ 복사</button><button>↻ 다시 생성</button><button>⏰ 이걸 매일 받기</button></div>
         </div>
-        <div class="msg user"><div class="bubble">내 관심 종목 지난주 공시 있어?</div><div class="meta">오전 9:05</div></div>
+        <div class="msg user"><div class="bubble">삼성전자·SK하이닉스·KODEX 200·NVIDIA·Apple 지난주 공시 있어?</div><div class="meta">오전 9:05</div></div>
         <div class="msg">
-          <p>관심 종목 5개 중 2개에 지난주(11-02 ~ 11-06) 공시가 있어요. <span class="ref">FR-7.4 · FR-7.7</span></p>
+          <p>5개 종목 중 2개에 지난주(11-02 ~ 11-06) 공시가 있어요. <span class="ref">FR-7.4</span></p>
           <table><tr><th>종목</th><th>공시</th><th>요약</th><th>공시 시각 · 출처</th></tr>
             <tr><td>삼성전자</td><td>DART · 주요사항보고서</td><td>자기주식 취득 결정</td><td class="small muted">DART · 2026-11-05 (목) 16:12 KST · <a href="#" data-noop>dart.fss.or.kr ↗</a></td></tr>
             <tr><td>NVIDIA</td><td>SEC · Form 4</td><td>임원 주식 매도 신고</td><td class="small muted">SEC EDGAR · 2026-11-04 (수) 17:30 ET 접수 · <a href="#" data-noop>sec.gov ↗</a></td></tr></table>
@@ -612,27 +612,6 @@ plt.show()</pre>
       </div></div>
       <div class="composer"><div class="box"><textarea placeholder="메시지를 입력하세요…"></textarea>
         <div class="bar"><button class="ghost">📎</button>
-          <span class="rtchip" data-popwrap>⭐ <span class="hide-sm">관심 종목</span> <span data-wlcount>5</span> ▾
-            <div class="pop left">
-              <div class="sheet-handle"></div>
-              <div class="row sp"><b>⭐ 내 관심 종목</b><span class="ref">FR-7.7</span></div>
-              <div class="small muted" style="margin:2px 0 8px">한국·미국 종목을 함께 저장해요. 대화에서 “내 관심 종목”이라고 하면 이 목록을 써요.</div>
-              <input value="현대" placeholder="종목명·코드·티커 검색 (한국·미국)">
-              <table class="wl" style="margin:4px 0 8px" data-wlsearch>
-                <tr><td><span class="badge gray">KR</span> 현대차 <span class="muted small">005380 · KOSPI</span></td><td style="text-align:right"><button class="small" data-wladd>+ 추가</button></td></tr>
-                <tr><td><span class="badge gray">KR</span> 현대모비스 <span class="muted small">012330 · KOSPI</span></td><td style="text-align:right"><button class="small" data-wladd>+ 추가</button></td></tr>
-                <tr><td><span class="badge gray">US</span> Hyundai Motor GDR <span class="muted small">미지원 — 한국·미국 상장 주식만</span></td><td></td></tr>
-              </table>
-              <div class="small muted">저장된 종목</div>
-              <table class="wl" data-wllist>
-                <tr><td><span class="badge gray">KR</span> 삼성전자 <span class="muted small">005930 · KOSPI</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
-                <tr><td><span class="badge gray">KR</span> SK하이닉스 <span class="muted small">000660 · KOSPI</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
-                <tr><td><span class="badge gray">KR</span> KODEX 200 <span class="muted small">069500 · ETF</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
-                <tr><td><span class="badge gray">US</span> NVIDIA <span class="muted small">NVDA · NASDAQ</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
-                <tr><td><span class="badge gray">US</span> Apple <span class="muted small">AAPL · NASDAQ</span></td><td style="text-align:right"><button class="small ghost" data-wldel title="제거">✕</button></td></tr>
-              </table>
-            </div>
-          </span>
           <span class="grow hide-sm"></span><span class="rtchip" data-rtchip data-rt="claude" data-model="claude-opus-5-5"></span><button class="primary">↑</button></div></div></div>
     </main>
     <aside class="art closed" data-art>
@@ -780,7 +759,7 @@ plt.show()</pre>
       <div class="topbar mob"><button class="ghost hamb" data-hamb>☰</button><div class="title">⏰ 예약</div></div>
       <div class="page">
         <div class="row sp"><h1>⏰ 예약 <span class="ref">FR-8</span></h1><button class="primary" data-open="schedModal">+ 새 예약</button></div>
-        <div class="small muted">대화에서 “매일 아침 8시에 관심 종목 브리핑해줘”라고 말해도 만들어져요. <span class="ref">FR-8.1</span> · 오늘: 2026-11-09 (월)</div>
+        <div class="small muted">대화에서 “매일 아침 8시에 시장 브리핑해줘”라고 말해도 만들어져요. <span class="ref">FR-8.1</span> · 오늘: 2026-11-09 (월)</div>
         <div class="card" style="margin-top:12px;padding:0 4px">
         <table>
           <tr><th>이름</th><th>일정</th><th>런타임 · 모델</th><th>최근 실행</th><th>알림</th><th></th></tr>
@@ -1328,7 +1307,7 @@ plt.show()</pre>
 <div class="modal-bg" id="schedModal"><div class="modal" data-sproot>
   <div class="row sp"><h2>+ 새 예약 <span class="ref">FR-8.2</span></h2><button class="ghost" data-close>✕</button></div>
   <label>이름</label><input value="아침 시장 브리핑">
-  <label>실행할 프롬프트</label><textarea rows="3">내 관심 종목 시세와 전일 대비, 오늘 나온 공시를 표로 정리해줘.</textarea>
+  <label>실행할 프롬프트</label><textarea rows="3">삼성전자·NVIDIA 시세와 전일 대비, 오늘 나온 공시를 표로 정리해줘.</textarea>
   <label>일정</label><div class="seg"><span data-sp="once">한 번</span><span data-sp="daily">매일</span><span class="on" data-sp="weekday">평일</span><span data-sp="weekly">매주</span><span data-sp="cron">cron</span></div>
   <div data-spane="once"><div class="grid2"><div><label>날짜</label><input type="date" value="2026-11-10"></div><div><label>시각</label><input value="08:00"></div></div>
     <div class="notice info small">다음 실행: 2026-11-10 (화) 08:00 KST · 한 번만</div></div>
@@ -1692,10 +1671,9 @@ plt.show()</pre>
     if(q.drawer){ const sd=sec.querySelector('.side'); if(sd){ sd.classList.add('drawer-open'); sec.querySelector('.app').classList.add('drawer-on'); } }
     if(q.pop){ const c=sec.querySelector('[data-rtchip] [data-pop]'); c&&c.classList.add('open'); }
     if(q.art){ const a=sec.querySelector('[data-art]'); a&&a.classList.remove('closed'); }
-    // 리뷰·스크린샷용 바로가기: ?tab= ?mst= ?sp=a,b ?wl=1 ?menu=1 ?modal=ID&arg=
+    // 리뷰·스크린샷용 바로가기: ?tab= ?mst= ?sp=a,b ?menu=1 ?modal=ID&arg=
     if(q.tab){ const tb=sec.querySelector(`[data-tab="${q.tab}"]`); tb&&selectTab(tb); }
     if(q.mst){ const m=sec.querySelector(`.tabpane.on [data-mst="${q.mst}"],[data-mst="${q.mst}"]`); m&&setMst(m.closest('[data-mstroot]'),q.mst); }
-    if(q.wl){ const w=sec.querySelector('[data-popwrap] .pop'); w&&w.classList.add('open'); }
     if(q.menu){ const m=sec.querySelector('.menu'); m&&m.classList.add('open'); }
     if(q.modal&&document.getElementById(q.modal)){ R[q.modal]&&R[q.modal](q.arg); if(q.modal==='shareModal'&&q.sm){ ss.mode=q.sm; if(q.sm==='some') ss.rec=[Object.keys(FAM).filter(k=>k!==SH[ss.id].owner)[0]]; if(q.scope) ss.scope=q.scope; renderShare(); } if(q.modal==='connModal'&&q.rt){ cs.rt=q.rt; if(q.auth) cs.auth=q.auth; renderConn(); } document.getElementById(q.modal).classList.add('open'); }
     if(q.sp) q.sp.split(',').forEach(k=>{ const s=(q.modal?document.getElementById(q.modal):sec).querySelector(`[data-sp="${k}"]`); s&&s.click(); });
@@ -1749,16 +1727,13 @@ plt.show()</pre>
     if(mb){ mb.nextElementSibling.classList.toggle('open'); return; }
     if(t.closest('[data-rename]')){ const bar=t.closest('.topbar'); bar.classList.add('renaming'); t.closest('.menu').classList.remove('open'); bar.querySelector('.rename input').focus(); return; }
     if(t.closest('[data-rename-done]')){ const bar=t.closest('.topbar'); if(t.classList.contains('primary')) bar.querySelector('[data-ctitle]').textContent=bar.querySelector('.rename input').value; bar.classList.remove('renaming'); return; }
-    // 팝오버 (런타임 칩 · 관심 종목)
-    const wrap=t.closest('[data-rtchip],[data-popwrap]');
+    // 팝오버 (런타임 칩)
+    const wrap=t.closest('[data-rtchip]');
     $$('.pop.open').forEach(p=>{ if(!wrap||!wrap.contains(p)) p.classList.remove('open'); });
     if(wrap && !t.closest('.pop')){ wrap.querySelector('.pop').classList.toggle('open'); return; }
     const rt=t.closest('[data-rt]'); if(rt && rt.classList.contains('opt')){
       const chip=rt.closest('[data-rtchip]'), w=who(chip); chip.dataset.rt=rt.dataset.rt; chip.dataset.model=defModel(w,rt.dataset.rt);
       paintChip(chip); chip.querySelector('[data-pop]').classList.add('open'); return; }
-    // 관심 종목 추가·제거
-    if(t.closest('[data-wldel]')){ const pop=t.closest('.pop'); t.closest('tr').remove(); pop.closest('[data-popwrap]').querySelector('[data-wlcount]').textContent=pop.querySelectorAll('[data-wllist] tr').length; return; }
-    if(t.closest('[data-wladd]')){ const pop=t.closest('.pop'), tr=t.closest('tr'); t.outerHTML='<button class="small ghost" data-wldel title="제거">✕</button>'; pop.querySelector('[data-wllist]').appendChild(tr); pop.closest('[data-popwrap]').querySelector('[data-wlcount]').textContent=pop.querySelectorAll('[data-wllist] tr').length; return; }
     // 코드 복사
     if(t.closest('[data-copy]')){ const b=t.closest('[data-copy]'); b.textContent='✓ 복사됨'; setTimeout(()=>b.textContent='⧉ 복사',1500); return; }
     // 세그먼트(+연결된 패널) · 토글

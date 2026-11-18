@@ -37,6 +37,7 @@ import {
   isAudioCode,
   isAudioStt,
   isAudioDiarization,
+  isYoutubeCode,
   isBackupCode,
   isBackupTrigger,
   isRestoreRecovery,
@@ -97,6 +98,10 @@ export const LOG_EVENTS = [
   "audio.finished",
   // audio_transcribe working folders left from the last process could not all be removed at start (#173).
   "audio.sweep_failed",
+  // youtube_audio_fetch (#191): fixed outcome code, duration and IDs — never the address, the video or the file.
+  "youtube.finished",
+  // youtube_audio_fetch working folders left from the last process could not all be removed at start (#191).
+  "youtube.sweep_failed",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.
@@ -282,6 +287,8 @@ const FIELDS = new Map<string, Check>([
   ["audioCode", isAudioCode],
   ["audioStt", isAudioStt],
   ["audioDiarization", isAudioDiarization],
+  /** `youtube_audio_fetch` (#191): `youtube_ok` or one of the fixed `youtube_*` codes. */
+  ["youtubeCode", isYoutubeCode],
   /** A `cite` call (#25): the citation status or why it registered nothing. */
   ["citeCode", isCiteCode],
   /** PNG/PDF export (#51): the format and one of the fixed `export_*` codes. */
@@ -580,6 +587,7 @@ export type LogFields = {
   audioCode?: string;
   audioStt?: string;
   audioDiarization?: string;
+  youtubeCode?: string;
   citeCode?: string;
   exportFormat?: string;
   exportCode?: string;

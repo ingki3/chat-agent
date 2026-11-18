@@ -6,7 +6,7 @@ import {
   MemoryProposal,
   MyDreaming,
   utf8Bytes,
-  type DreamingConfig,
+  type RuntimeId,
 } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
@@ -18,7 +18,8 @@ import { entryBytes, gatherInput } from "../src/dreaming/input.js";
 import { compose } from "../src/notifications/compose.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { defaultScript, FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
-import { knownSecrets } from "../src/secrets/known.js";
+import { KnownSecrets, knownSecrets } from "../src/secrets/known.js";
+import { StoredRescrub } from "../src/secrets/rescrub.js";
 import { createFamily, type Family } from "./helpers/permission-matrix.js";
 
 /**
@@ -45,7 +46,18 @@ const MIN = 60_000;
 /** "기억: A 가가가…" → "A". */
 const head = (t: string) => t.split(" ")[1];
 
-async function start(o: { config?: Partial<DreamingConfig> } = {}) {
+/**
+ * `config`: the server-wide switch (`enabled`) and token cap, and every family member's own settings (on, `time`, the
+ * FakeRuntime's `fake-large` — or `runtime` / `connectionId` instead). The FakeRuntime pair is allowed by the admin.
+ */
+type StartConfig = {
+  enabled: boolean;
+  tokenCap: number;
+  time: string;
+  runtime: RuntimeId;
+  connectionId: string | null;
+};
+async function start(o: { config?: Partial<StartConfig> } = {}) {
   const t = {
     clock: T0,
     /** What the fake model answers to a 기억 정리 request (default: nothing to change). */
@@ -70,6 +82,8 @@ async function start(o: { config?: Partial<DreamingConfig> } = {}) {
   const fake = new FakeRuntime({ script });
   const runtimes = new RuntimeRegistry();
   runtimes.register(fake);
+  // A runtime that needs a connection (the shared API key connection of D2) — the FakeRuntime acting like Codex.
+  runtimes.register(new FakeRuntime({ id: "codex", script, needsConnection: true }));
   const db = createTestDb();
   const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
     db,
@@ -83,15 +97,20 @@ async function start(o: { config?: Partial<DreamingConfig> } = {}) {
   await app.ready();
   const f = await createFamily(app);
   const d = app.dreaming!;
+  const FAKE = { runtime: "claude-code" as const, connectionId: null, model: "fake-large" };
   d.store.setConfig({
-    enabled: true,
-    time: "03:00",
-    connectionId: null,
-    runtime: "claude-code",
-    model: "fake-large",
-    tokenCap: 300_000,
-    ...o.config,
+    enabled: o.config?.enabled ?? true,
+    tokenCap: o.config?.tokenCap ?? 300_000,
+    allowed: [FAKE],
   });
+  for (const u of Object.values(f.users))
+    d.store.setSettings(u.id, {
+      enabled: true,
+      time: o.config?.time ?? "03:00",
+      runtime: o.config?.runtime ?? FAKE.runtime,
+      connectionId: o.config?.connectionId ?? null,
+      model: FAKE.model,
+    });
   const req = (who: Who, method: "GET" | "POST" | "PUT" | "DELETE", url: string, body?: object) =>
     app.inject({
       method,
@@ -161,7 +180,13 @@ async function start(o: { config?: Partial<DreamingConfig> } = {}) {
           : [];
       }),
     });
+  /** Only `who`'s rounds are on (the others turned theirs off) — the concurrency cap never delays theirs. */
+  const alone = (who: Who = "owner") => {
+    for (const u of Object.values(f.users))
+      if (u.id !== uid(who)) d.store.setSettings(u.id, { ...d.store.settingsOf(u.id), enabled: false });
+  };
   return {
+    alone,
     t,
     app,
     db,
@@ -186,37 +211,83 @@ async function start(o: { config?: Partial<DreamingConfig> } = {}) {
 }
 
 describe("schedule (spec §6, AC-14)", () => {
-  it("a regular round starts within a minute of its time, users 5 minutes apart in user id order", async () => {
+  it("a regular round starts within a minute of each user's own time; the same time → 2 at once, the rest in turn", async () => {
     const s = await start();
-    s.say("기억: 정규 회차");
-    const order = s.d.engine.slots().map((x) => x.userId);
-    expect(order).toEqual([...order].sort());
-    expect(s.d.engine.slots().map((x) => x.time)).toEqual(["03:00", "03:05", "03:10", "03:15"]);
+    const order = Object.values(s.f.users)
+      .map((u) => u.id)
+      .sort();
+    // Everyone has something to do (a model call), and the model takes a moment: the rounds overlap.
+    for (const who of ["owner", "shared", "admin", "stranger"] as const) s.say(`기억: ${who}`, { who });
+    // The last user picks a later time of their own.
+    const late = order[3]!;
+    s.d.store.setSettings(late, { ...s.d.store.settingsOf(late), time: "03:20" });
+    expect(s.d.engine.slots().map((x) => [x.userId, x.time])).toEqual([
+      [order[0], "03:00"],
+      [order[1], "03:00"],
+      [order[2], "03:00"],
+      [late, "03:20"],
+    ]);
     // A minute before: nothing.
     s.t.clock = T0 - MIN;
     s.d.engine.start();
     await s.d.engine.idle();
     expect(s.d.store.days(dreamingDate(s.t.clock))).toEqual([]);
-    // At 03:00:40: the first user's round, regular, started 40 s after its time.
+    // At 03:00:40: three rounds are due, two start (user id order), the third waits its turn.
+    s.t.delayMs = 50;
     s.t.clock = T0 + 40_000;
     s.d.engine.tick();
+    const state = (u: string) => s.d.store.day(u, dreamingDate(T0))?.state;
+    expect([state(order[0]!), state(order[1]!), state(order[2]!), state(late)]).toEqual([
+      "running",
+      "running",
+      "waiting",
+      undefined,
+    ]);
     await s.d.engine.idle();
-    const first = s.d.store.day(order[0]!, dreamingDate(T0))!;
-    expect(first).toMatchObject({ trigger: "regular", attempts: 1, scheduled_at: T0 });
-    const run = s.d.store.lastRun(order[0]!)!;
-    expect(run.trigger).toBe("regular");
-    expect(Math.abs(run.started_at - T0)).toBeLessThanOrEqual(MIN);
-    expect(s.d.store.day(order[1]!, dreamingDate(T0))).toBeUndefined();
-    // The second at 03:05.
-    s.t.clock = T0 + 5 * MIN + 1000;
+    for (const u of order.slice(0, 2)) {
+      const run = s.d.store.lastRun(u)!;
+      expect(run.trigger).toBe("regular");
+      expect(Math.abs(run.started_at - T0)).toBeLessThanOrEqual(MIN);
+    }
+    // A run ended: the next one starts — still the regular round of its time.
+    s.t.clock = T0 + 2 * MIN;
     s.d.engine.tick();
     await s.d.engine.idle();
-    expect(s.d.store.day(order[1]!, dreamingDate(T0))).toMatchObject({ trigger: "regular" });
+    expect(s.d.store.day(order[2]!, dreamingDate(T0))).toMatchObject({
+      trigger: "regular",
+      scheduled_at: T0,
+      state: "done",
+    });
+    expect(s.d.store.lastRun(order[2]!)!.trigger).toBe("regular");
+    expect(state(late)).toBeUndefined();
+    // The later user at their own time.
+    s.t.clock = T0 + 20 * MIN + 1000;
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(late, dreamingDate(T0))).toMatchObject({ trigger: "regular", state: "done" });
     // The same day again: never a second round.
-    s.t.clock = T0 + 6 * MIN;
+    s.t.clock = T0 + 30 * MIN;
     s.d.engine.tick();
     await s.d.engine.idle();
     expect(s.d.store.runsOf(order[0]!).filter((r) => r.trigger !== "manual")).toHaveLength(1);
+  });
+
+  it("a user whose switch is off, or who chose nothing, has no round; no row = off", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    s.d.store.setSettings(owner, { ...s.d.store.settingsOf(owner), enabled: false });
+    const shared = s.uid("shared");
+    s.d.store.setSettings(shared, {
+      enabled: true,
+      time: "03:00",
+      runtime: null,
+      connectionId: null,
+      model: null,
+    });
+    s.sql.prepare("delete from dreaming_users where user_id = ?").run(s.uid("stranger"));
+    expect(s.d.engine.slots().map((x) => x.userId)).toEqual([s.uid("admin")]);
+    expect((await s.mine("shared")).problem).toBe("no_choice");
+    expect((await s.mine("stranger")).settings.enabled).toBe(false);
   });
 
   it("server off at the time → one catch-up round after the start, the same day; turned on later → none", async () => {
@@ -259,6 +330,7 @@ describe("schedule (spec §6, AC-14)", () => {
          values ('busy-run', ?, ?, ?, 'running', 'claude-code', 'fake-large')`,
       )
       .run(c, s.uid("owner"), m.id);
+    s.alone();
     s.d.engine.start();
     const owner = s.uid("owner");
     s.t.clock = s.d.engine.slots().find((x) => x.userId === owner)!.at;
@@ -282,7 +354,7 @@ describe("schedule (spec §6, AC-14)", () => {
     expect(s.t.requests).toHaveLength(0);
   });
 
-  it("a failure is tried again 30 minutes later once; the admins are told once, after the day's last attempt", async () => {
+  it("a failure is tried again 30 minutes later once; the user is told once, after the day's last attempt", async () => {
     const s = await start();
     s.t.fail = "error";
     s.say("기억: 실패");
@@ -301,10 +373,11 @@ describe("schedule (spec §6, AC-14)", () => {
     // Checkpoint unmoved after a failure.
     expect(s.checkpoint()).toBe(0);
     const alerts = () =>
-      s.sql.prepare("select user_id, body from notifications where kind = 'dreaming_failed'").all() as {
-        user_id: string;
-        body: string;
-      }[];
+      s.sql
+        .prepare(
+          "select user_id, kind, body from notifications where kind in ('memory_failed', 'dreaming_failed')",
+        )
+        .all() as { user_id: string; kind: string; body: string }[];
     expect(alerts()).toEqual([]);
     // The retries: the last attempt of each fails too.
     for (const x of s.d.engine.slots()) {
@@ -314,11 +387,11 @@ describe("schedule (spec §6, AC-14)", () => {
     }
     expect(s.d.store.day(owner, dreamingDate(T0))).toMatchObject({ state: "failed", attempts: 2 });
     expect(s.d.store.runsOf(owner).map((r) => r.trigger)).toEqual(["retry", "regular"]);
-    // One alert for the admin — how many users, no names, no content.
+    // One notice for the user themself — a fixed reason, no content; none for the admin (not the server's setup).
     expect(alerts()).toEqual([
-      { user_id: s.uid("admin"), body: "기억 정리가 실패했어요 (사용자 1명, 연결 확인 필요)" },
+      { user_id: owner, kind: "memory_failed", body: "오늘 기억 정리가 실패했어요. 내일 다시 해요" },
     ]);
-    // No second alert that day: another look finds the same — the alert is deduped per date and admin.
+    // No second notice that day: another look finds the same — deduped per user and date.
     s.d.engine.tick();
     await s.d.engine.idle();
     expect(alerts()).toHaveLength(1);
@@ -328,6 +401,7 @@ describe("schedule (spec §6, AC-14)", () => {
     const s = await start({ config: { time: "23:30" } });
     s.t.fail = "error";
     s.say("기억: 자정");
+    s.alone();
     const owner = s.uid("owner");
     const slot = s.d.engine.slots(T0).find((x) => x.userId === owner)!.at;
     s.t.clock = slot;
@@ -701,8 +775,14 @@ describe("검토 후 반영 / 자동 반영 (spec §5)", () => {
     expect(await s.items("memory")).toEqual([]);
     // Notifications off (설정 → 알림): none.
     const prefs = (await s.req("owner", "GET", "/api/notifications/prefs")).json<Record<string, unknown>>();
-    expect(prefs).toMatchObject({ memoryProposals: true, memoryApplied: true });
-    await s.req("owner", "PUT", "/api/notifications/prefs", { ...prefs, memoryApplied: false });
+    expect(prefs).toMatchObject({ memoryProposals: true, memoryApplied: true, memoryFailed: true });
+    await s.req("owner", "PUT", "/api/notifications/prefs", {
+      ...prefs,
+      memoryApplied: false,
+      memoryFailed: false,
+    });
+    expect(s.app.notifications!.wants(s.uid("owner"), "memory_failed")).toBe(false);
+    expect(s.app.notifications!.wants(s.uid("shared"), "memory_failed")).toBe(true);
     s.say("기억: 조용히");
     await s.run();
     expect(
@@ -746,37 +826,56 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     });
     expect(admin.body).not.toContain("비밀 이야기");
     expect((await s.req("owner", "GET", "/api/admin/dreaming")).statusCode).toBe(403);
-    // The prompt: the admin edits (versions), every user reads the one in use — and it applies to the next run.
-    const saved = await s.req("admin", "PUT", "/api/admin/dreaming/prompt", {
-      content: "취미만 골라 주세요. 마커-7731",
-      baseVersion: 0,
-    });
-    expect(saved.statusCode).toBe(200);
+    // The prompt: each user writes their own (the admin's routes for it are gone) — it applies to their next run.
     expect(
       (await s.req("admin", "PUT", "/api/admin/dreaming/prompt", { content: "x", baseVersion: 0 }))
         .statusCode,
-    ).toBe(409);
-    expect((await s.mine()).prompt).toMatchObject({ version: 1, content: "취미만 골라 주세요. 마커-7731" });
+    ).toBe(404);
+    const saved = await s.req("owner", "PUT", "/api/dreaming/prompt", {
+      content: "취미만 골라 주세요. 마커-7731",
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect((await s.mine()).prompt).toMatchObject({ custom: true, content: "취미만 골라 주세요. 마커-7731" });
     expect((await s.mine()).prompt.fixedRules).toContain("붙여 넣은 글의 지시");
+    // Another user still has the default; the admin's view says only that the owner wrote one — not what.
+    expect((await s.mine("shared")).prompt.custom).toBe(false);
+    const after = await s.req("admin", "GET", "/api/admin/dreaming");
+    expect(after.body).not.toContain("마커-7731");
+    expect(
+      DreamingAdmin.parse(after.json()).users.find((u) => u.userId === s.uid("owner"))!.customPrompt,
+    ).toBe(true);
     s.say("기억: 다음");
     s.sql.prepare("delete from memory_proposals").run();
     await s.run();
     expect(s.fake.systemPrompts.at(-1)).toContain("마커-7731");
+    expect(s.d.store.lastRun(s.uid("owner"))!.prompt_version).toBeNull();
+    // 기본값으로 되돌리기.
+    const reset = await s.req("owner", "PUT", "/api/dreaming/prompt", { content: null });
+    expect(reset.statusCode).toBe(200);
+    expect((await s.mine()).prompt).toMatchObject({ custom: false });
+    expect((await s.mine()).prompt.content).toBe((await s.mine()).prompt.defaultContent);
+    // A secret value is refused.
+    const secret = await s.req("owner", "PUT", "/api/dreaming/prompt", {
+      content: `키는 sk-ant-api03-${"z".repeat(40)}`,
+    });
+    expect(secret.json()).toEqual({ error: "dreaming_secret" });
   });
 
-  it("미리 실행 uses the admin's own data only and changes nothing", async () => {
+  it("미리 실행 uses the caller's own data only and changes nothing", async () => {
     const s = await start();
     s.t.answer = s.addEach;
-    s.say("기억: 관리자 본인 것", { who: "admin" });
+    s.say("기억: 아내 본인 것", { who: "shared" });
     s.say("기억: 아들 것");
-    const r = await s.req("admin", "POST", "/api/admin/dreaming/preview", { content: "미리 보기 프롬프트" });
+    const r = await s.req("shared", "POST", "/api/dreaming/preview", { content: "미리 보기 프롬프트" });
     expect(r.statusCode, r.body).toBe(200);
     expect(r.json()).toMatchObject({
       status: "proposed",
-      decisions: [{ doc: "memory", text: "관리자 본인 것" }],
+      decisions: [{ doc: "memory", text: "아내 본인 것" }],
     });
     expect(JSON.stringify(s.t.requests)).not.toContain("아들 것");
-    expect(s.d.store.state(s.uid("admin")).checkpoint).toBe(0);
+    expect(s.fake.systemPrompts.at(-1)).toContain("미리 보기 프롬프트");
+    expect(s.d.store.state(s.uid("shared")).checkpoint).toBe(0);
+    expect((await s.req("admin", "POST", "/api/admin/dreaming/preview", {})).statusCode).toBe(404);
     expect(s.sql.prepare("select count(*) as n from memory_proposals").get()).toEqual({ n: 0 });
   });
 
@@ -812,21 +911,377 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect(s.d.store.state(s.uid("owner")).paused_at).toBeNull();
   });
 
-  it('the chosen connection gone → paused ("연결을 다시 고르세요"), no failure; no connection at run time → failure', async () => {
-    const s = await start({ config: { runtime: "codex" } });
-    const admin = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json());
-    expect(admin.connectionProblem).toBe("missing");
-    s.d.engine.start();
-    await s.d.engine.idle();
-    expect(s.d.store.days(dreamingDate(T0))).toEqual([]);
-    // Only a shared API key connection's model may be chosen.
+  it('an allowed shared connection gone → its users paused ("다시 고르세요"), the admins told once; not allowed → refused', async () => {
+    const s = await start();
+    const conns = s.app.connections!.store;
+    const shared = conns.create({
+      runtime: "codex",
+      authType: "api_key",
+      scope: "shared",
+      owner: null,
+      createdBy: s.uid("admin"),
+      secret: `sk-proj-DREAMSHARED${"q".repeat(40)}`,
+    });
+    s.sql.prepare("update connections set status = 'passed' where id = ?").run(shared.id);
+    const pair = { runtime: "codex" as const, connectionId: shared.id, model: "fake-large" };
+    // Only a candidate (a shared API key connection that passed, a model of ≥ 200,000 tokens) may be allowed.
     const bad = await s.req("admin", "PUT", "/api/admin/dreaming", {
       ...s.d.store.config(),
-      runtime: "claude-code",
-      connectionId: "not-a-connection",
+      allowed: [{ runtime: "codex", connectionId: "not-a-connection", model: "fake-large" }],
     });
     expect(bad.json()).toEqual({ error: "dreaming_connection_not_allowed" });
+    const ok = await s.req("admin", "PUT", "/api/admin/dreaming", {
+      ...s.d.store.config(),
+      allowed: [...s.d.store.config().allowed, pair],
+    });
+    expect(ok.statusCode, ok.body).toBe(200);
+    // The user picks it; a pair the admin did not allow is refused.
+    const notAllowed = await s.req("owner", "PUT", "/api/dreaming/settings", {
+      enabled: true,
+      time: "03:00",
+      runtime: "codex",
+      connectionId: shared.id,
+      model: "fake-small",
+    });
+    expect(notAllowed.json()).toEqual({ error: "dreaming_choice_not_allowed" });
+    const picked = await s.req("owner", "PUT", "/api/dreaming/settings", {
+      enabled: true,
+      time: "03:00",
+      ...pair,
+    });
+    expect(picked.statusCode, picked.body).toBe(200);
+    expect(MyDreaming.parse(picked.json())).toMatchObject({ enabled: true, problem: null });
+    // The connection is disconnected: the owner is paused (no round, nothing failed), the admins are told once.
+    s.sql.prepare("update connections set disconnected_at = 1 where id = ?").run(shared.id);
+    expect((await s.mine()).problem).toBe("unavailable");
+    const admin = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json());
+    expect(admin.unavailable).toEqual([pair]);
+    s.d.engine.start();
+    s.t.clock = T0 + 10_000;
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toBeUndefined();
+    expect(s.d.store.day(s.uid("shared"), dreamingDate(T0))).toBeDefined();
+    s.d.engine.tick();
+    expect(
+      s.sql.prepare("select user_id, kind, body from notifications where kind = 'dreaming_failed'").all(),
+    ).toEqual([
+      {
+        user_id: s.uid("admin"),
+        kind: "dreaming_failed",
+        body: "기억 정리에 쓰는 공용 연결을 쓸 수 없어 멈췄어요 (사용자 1명)\n관리자 → 기억 정리에서 확인해 주세요",
+      },
+    ]);
+    // A run started anyway (by hand) fails: no connection.
     expect((await s.run()).code).toBe("no_connection");
+    // Turned off, the stale choice may stay; turned back on, it must be chosen again.
+    expect(
+      (await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: false, time: "03:00", ...pair }))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: true, time: "03:00", ...pair })
+      ).json(),
+    ).toEqual({ error: "dreaming_choice_not_allowed" });
+    // The admin takes the pair off the list: the user's choice is not allowed any more (paused, not an admin alert).
+    s.sql.prepare("update connections set disconnected_at = null where id = ?").run(shared.id);
+    s.d.store.setSettings(s.uid("owner"), { enabled: true, time: "03:00", ...pair });
+    expect((await s.mine()).problem).toBeNull();
+    s.d.store.setConfig({ ...s.d.store.config(), allowed: s.d.store.config().allowed.slice(0, 1) });
+    expect((await s.mine()).problem).toBe("unavailable");
+  });
+
+  it("saves are partial (review 5): two writers changing different fields keep both; the merged result is checked", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    // A user's settings from two tabs: one moves the time, the other (loaded before) turns it off.
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { time: "04:10" })).statusCode).toBe(200);
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: false })).statusCode).toBe(200);
+    expect(s.d.store.settingsOf(owner)).toMatchObject({ time: "04:10", enabled: false, model: "fake-large" });
+    // A field alone that makes the whole invalid is refused (a model that is not an allowed pair).
+    const bad = await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: true, model: "fake-small" });
+    expect(bad.json()).toEqual({ error: "dreaming_choice_not_allowed" });
+    expect(s.d.store.settingsOf(owner)).toMatchObject({ enabled: false, model: "fake-large" });
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { nope: 1 })).statusCode).toBe(400);
+    // The admin's server settings: one admin page turns the server off, a stale one saves the token cap only.
+    expect((await s.req("admin", "PUT", "/api/admin/dreaming", { enabled: false })).statusCode).toBe(200);
+    expect((await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 250_000 })).statusCode).toBe(200);
+    expect(s.d.store.config()).toMatchObject({ enabled: false, tokenCap: 250_000 });
+    expect(s.d.store.config().allowed).toHaveLength(1);
+    // The same field from two places: the later write wins.
+    await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 260_000 });
+    await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 270_000 });
+    expect(s.d.store.config().tokenCap).toBe(270_000);
+  });
+
+  it("revisions (review 9): +1 on every write path, per resource; every response carries the current one", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    const rev = async (who: Who = "owner") =>
+      MyDreaming.parse((await s.req(who, "GET", "/api/dreaming")).json()).rev;
+    const r0 = await rev();
+    // Settings, the prompt, its reset: each a new revision, returned by the PUT itself.
+    const a = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/settings", { time: "04:20" })).json(),
+    );
+    expect(a.rev).toBe(r0 + 1); // one save, one revision
+    const b = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/prompt", { content: "취미만" })).json(),
+    );
+    expect(b.rev).toBeGreaterThan(a.rev);
+    const c = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/prompt", { content: null })).json(),
+    );
+    expect(c.rev).toBeGreaterThan(b.rev);
+    expect(await rev()).toBe(c.rev);
+    // Per resource: another user's save moves only theirs.
+    const other = await rev("shared");
+    await s.req("shared", "PUT", "/api/dreaming/settings", { time: "05:00" });
+    expect(await rev()).toBe(c.rev);
+    expect(await rev("shared")).toBeGreaterThan(other);
+    // 반영 방식 (its own resource).
+    const m0 = (await s.req("owner", "GET", "/api/memory-prefs")).json<{ rev: number }>().rev;
+    const m1 = (await s.req("owner", "PUT", "/api/memory-prefs", { applyMode: "auto" })).json<{
+      rev: number;
+    }>().rev;
+    expect(m1).toBe(m0 + 1);
+    expect((await s.req("owner", "GET", "/api/memory-prefs")).json<{ rev: number }>().rev).toBe(m1);
+    // The admin's config, and a youth account's settings / 반영 방식 / prompt.
+    const v0 = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json()).configRev;
+    const v1 = DreamingAdmin.parse(
+      (await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 280_000 })).json(),
+    );
+    expect(v1.configRev).toBe(v0 + 1);
+    s.app.users!.setYouth(owner, true);
+    type Row = { rev: number; applyModeRev: number };
+    const y0 = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json()).users.find(
+      (u) => u.userId === owner,
+    )!;
+    const y1 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { time: "06:00" })
+    ).json<Row>();
+    expect(y1.rev).toBeGreaterThan(y0.rev);
+    const y2 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { applyMode: "review" })
+    ).json<Row>();
+    expect(y2.applyModeRev).toBeGreaterThan(y1.applyModeRev);
+    const y3 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { prompt: "학교만" })
+    ).json<Row>();
+    expect(y3.rev).toBeGreaterThan(y2.rev);
+    // Notification preferences.
+    const n0 = (await s.req("owner", "GET", "/api/notifications/prefs")).json<{ rev: number }>().rev;
+    const n1 = (await s.req("owner", "PUT", "/api/notifications/prefs", { memoryFailed: false })).json<{
+      rev: number;
+    }>().rev;
+    expect(n1).toBe(n0 + 1);
+    const n2 = (
+      await s.req("owner", "PUT", "/api/notifications/prefs", {
+        quietStart: null,
+        quietEnd: null,
+        timeZone: "Asia/Seoul",
+      })
+    ).json<{ rev: number }>().rev;
+    expect(n2).toBe(n1 + 1);
+  });
+
+  it("revisions (review 11): a background rescrub of the stored prompt is a write — its revision goes up", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    const secret = `late-dream-${"q".repeat(8)}${Date.now()}`;
+    // Stored before anyone knew it was a secret (written raw).
+    await s.req("owner", "PUT", "/api/dreaming/prompt", { content: "취미만" });
+    s.sql.prepare("update dreaming_users set prompt = ? where user_id = ?").run(`취미만 ${secret}`, owner);
+    const before = s.d.store.state(owner).rev;
+    const reg = new KnownSecrets();
+    const r = new StoredRescrub(s.db, { registry: reg, delayMs: 1 });
+    reg.add(secret);
+    await r.idle();
+    r.close();
+    const after = s.d.store.state(owner);
+    expect(after.prompt).not.toContain(secret);
+    expect(after.rev).toBe(before + 1);
+    // Rows the scrub did not change keep their revision.
+    const other = s.d.store.state(s.uid("shared")).rev;
+    expect(s.d.store.state(s.uid("shared")).rev).toBe(other);
+  });
+
+  it("youth (review 1): 반영 방식 locked too; the admin sets its 반영 방식 and prompt (write-only)", async () => {
+    const s = await start();
+    const son = s.uid("owner");
+    s.app.users!.setYouth(son, true);
+    expect((await s.req("owner", "GET", "/api/memory-prefs")).json()).toEqual({
+      applyMode: "review",
+      rev: 0,
+      locked: true,
+    });
+    const put = await s.req("owner", "PUT", "/api/memory-prefs", { applyMode: "auto" });
+    expect(put.statusCode).toBe(403);
+    expect(put.json()).toEqual({ error: "dreaming_youth_locked" });
+    expect(s.app.memoryProposals!.mode(son)).toBe("review");
+    // Members are not locked.
+    expect((await s.req("shared", "GET", "/api/memory-prefs")).json()).toEqual({
+      applyMode: "review",
+      rev: 0,
+    });
+    // The admin: 반영 방식 and a prompt for the youth account — the response never carries the prompt's text.
+    const body = {
+      ...s.d.store.settingsOf(son),
+      applyMode: "auto",
+      prompt: "학교 이야기만 골라 주세요 마커-9182",
+    };
+    const r = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, body);
+    expect(r.statusCode, r.body).toBe(200);
+    expect(r.body).not.toContain("마커-9182");
+    expect(r.json()).toMatchObject({ applyMode: "auto", customPrompt: true });
+    expect(s.app.memoryProposals!.mode(son)).toBe("auto");
+    expect((await s.mine()).prompt).toMatchObject({
+      custom: true,
+      content: "학교 이야기만 골라 주세요 마커-9182",
+    });
+    const view = await s.req("admin", "GET", "/api/admin/dreaming");
+    expect(view.body).not.toContain("마커-9182");
+    const secret = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, {
+      ...s.d.store.settingsOf(son),
+      prompt: `sk-ant-api03-${"y".repeat(40)}`,
+    });
+    expect(secret.json()).toEqual({ error: "dreaming_secret" });
+    // A prompt alone: the settings stay as stored.
+    s.d.store.setSettings(son, { ...s.d.store.settingsOf(son), time: "05:10" });
+    const reset = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, { prompt: null });
+    expect(s.d.store.settingsOf(son).time).toBe("05:10");
+    expect(reset.json()).toMatchObject({ customPrompt: false, applyMode: "auto" });
+    // Others' rows show no 반영 방식 (their own setting).
+    expect(
+      DreamingAdmin.parse(view.json()).users.find((u) => u.userId === s.uid("shared"))!.applyMode,
+    ).toBeNull();
+  });
+
+  it("미리 실행 (review 1): the server-wide switch applies; slots are shared with the schedule, one per user", async () => {
+    const s = await start();
+    s.t.answer = s.addEach;
+    for (const who of ["owner", "shared", "admin"] as const) s.say(`기억: ${who} 것`, { who });
+    // Server-wide off: refused, and the runner refuses too (recorded, no model call).
+    s.d.store.setConfig({ ...s.d.store.config(), enabled: false });
+    const off = await s.req("shared", "POST", "/api/dreaming/preview", {});
+    expect(off.statusCode).toBe(409);
+    expect(off.json()).toEqual({ error: "dreaming_server_off" });
+    const direct = await s.d.runner.run({
+      userId: s.uid("shared"),
+      date: dreamingDate(s.t.clock),
+      attempt: 0,
+      trigger: "preview",
+      idemKey: "preview-off",
+      preview: {},
+    });
+    expect(direct).toMatchObject({ status: "skipped", code: "paused" });
+    expect(s.t.requests).toHaveLength(0);
+    s.d.store.setConfig({ ...s.d.store.config(), enabled: true });
+    // The same user four times at once: one runs, the others are refused (nothing ran for them).
+    s.t.delayMs = 150;
+    const four = await Promise.all(
+      [1, 2, 3, 4].map(() => s.req("shared", "POST", "/api/dreaming/preview", {})),
+    );
+    expect(four.map((r) => r.statusCode).sort()).toEqual([200, 409, 409, 409]);
+    expect(s.t.requests).toHaveLength(1);
+    // Two previews hold both slots: the owner's round at its time waits; a new time re-plans it (it never started).
+    s.alone("owner");
+    s.t.clock = T0 - MIN; // before the owner's time
+    s.d.engine.start();
+    s.t.clock = T0 + 10_000;
+    s.t.delayMs = 400;
+    const held = [
+      s.req("shared", "POST", "/api/dreaming/preview", {}),
+      s.req("admin", "POST", "/api/dreaming/preview", {}),
+    ];
+    // Both previews are with the model (it takes a while to answer).
+    await expect.poll(() => s.t.requests.length).toBe(3);
+    s.d.engine.tick();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toMatchObject({ state: "waiting", attempts: 0 });
+    const moved = await s.req("owner", "PUT", "/api/dreaming/settings", {
+      ...s.d.store.settingsOf(s.uid("owner")),
+      time: "04:00",
+    });
+    expect(moved.statusCode, moved.body).toBe(200);
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toBeUndefined();
+    expect((await Promise.all(held)).map((r) => r.statusCode)).toEqual([200, 200]);
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toBeUndefined();
+    // At 04:00 it runs — once, as the regular round of the new time.
+    s.t.delayMs = 0;
+    s.t.clock = T0 + 60 * MIN + 5000;
+    s.d.engine.tick();
+    await s.d.engine.idle();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))).toMatchObject({
+      state: "done",
+      trigger: "regular",
+      scheduled_at: T0 + 60 * MIN,
+    });
+    expect(s.d.store.runsOf(s.uid("owner")).filter((r) => r.trigger === "regular")).toHaveLength(1);
+  });
+
+  it("a slot freed by 미리 실행 starts the round that waited for it", async () => {
+    const s = await start();
+    for (const who of ["owner", "shared", "admin"] as const) s.say(`기억: ${who} 것`, { who });
+    s.alone("owner");
+    s.t.clock = T0 - MIN; // before the owner's time
+    s.d.engine.start();
+    s.t.delayMs = 300;
+    const held = [
+      s.req("shared", "POST", "/api/dreaming/preview", {}),
+      s.req("admin", "POST", "/api/dreaming/preview", {}),
+    ];
+    await expect.poll(() => s.t.requests.length).toBe(2);
+    s.t.clock = T0 + 10_000;
+    s.d.engine.tick();
+    expect(s.d.store.day(s.uid("owner"), dreamingDate(T0))!.state).toBe("waiting");
+    await Promise.all(held);
+    // The release kicked the schedule (no tick by hand): the round starts as soon as a slot is free.
+    await expect
+      .poll(() => s.d.store.day(s.uid("owner"), dreamingDate(T0))!.state, { timeout: 3000 })
+      .toBe("done");
+    expect(s.d.store.lastRun(s.uid("owner"))!.trigger).toBe("regular");
+  });
+
+  it("youth: reads its settings but cannot change them; the admin sets them; members only their own", async () => {
+    const s = await start();
+    const son = s.uid("owner");
+    s.app.users!.setYouth(son, true);
+    const mine = await s.mine();
+    expect(mine).toMatchObject({ canEdit: false, settings: { enabled: true, time: "03:00" } });
+    const body = {
+      enabled: false,
+      time: "04:00",
+      runtime: "claude-code",
+      connectionId: null,
+      model: "fake-large",
+    };
+    for (const [m, url, b] of [
+      ["PUT", "/api/dreaming/settings", body],
+      ["PUT", "/api/dreaming/prompt", { content: "내 마음대로" }],
+      ["POST", "/api/dreaming/preview", {}],
+    ] as const) {
+      const r = await s.req("owner", m, url, b);
+      expect(r.statusCode, url).toBe(403);
+      expect(r.json()).toEqual({ error: "dreaming_youth_locked" });
+    }
+    expect(s.d.store.settingsOf(son)).toMatchObject({ enabled: true, time: "03:00" });
+    // The admin sets them (the youth account only).
+    const set = await s.req("admin", "PUT", `/api/admin/dreaming/users/${son}`, body);
+    expect(set.statusCode, set.body).toBe(200);
+    expect(s.d.store.settingsOf(son)).toMatchObject({ enabled: false, time: "04:00" });
+    expect((await s.mine()).settings).toMatchObject({ enabled: false, time: "04:00" });
+    const wife = await s.req("admin", "PUT", `/api/admin/dreaming/users/${s.uid("shared")}`, body);
+    expect(wife.statusCode).toBe(403);
+    expect(wife.json()).toEqual({ error: "dreaming_not_youth" });
+    // A member's settings route is their own only — and a member is never the admin.
+    const own = await s.req("shared", "PUT", "/api/dreaming/settings", { ...body, time: "05:30" });
+    expect(own.statusCode, own.body).toBe(200);
+    expect(s.d.store.settingsOf(s.uid("shared")).time).toBe("05:30");
+    expect(s.d.store.settingsOf(son).time).toBe("04:00");
+    expect((await s.req("shared", "PUT", `/api/admin/dreaming/users/${son}`, body)).statusCode).toBe(403);
   });
 
   it("deleting the source conversation drops its pending decisions and queue entries; an edit drops queue entries", async () => {
@@ -854,6 +1309,7 @@ describe("review #160 round 1", () => {
     const s = await start();
     s.t.fail = "error";
     s.say("기억: 꺼진 뒤 재시도");
+    s.alone();
     const owner = s.uid("owner");
     const slot = s.d.engine.slots().find((x) => x.userId === owner)!.at;
     s.t.clock = slot;
@@ -1065,19 +1521,21 @@ describe("review #160 round 2", () => {
     expect(r.counts.proposed).toBe(1);
   });
 
-  it("4. the admins' alert says when the input is over the token cap — not a connection problem", () => {
-    expect(compose({ kind: "dreaming_failed", users: 2, tooLarge: 2 }).body).toBe(
-      "기억 정리 입력이 상한보다 커요 (사용자 2명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+  it("4. the user's notice says when the input is over the token cap — not a connection problem", () => {
+    expect(compose({ kind: "memory_failed", code: "too_large" }).body).toBe(
+      "오늘 기억 정리가 실패했어요 — 메시지가 1회 토큰 상한보다 커요\n관리자에게 상한을 올려 달라고 하세요",
     );
-    expect(compose({ kind: "dreaming_failed", users: 3, tooLarge: 1 }).body).toBe(
-      "기억 정리가 실패했어요 (사용자 2명, 연결 확인 필요)\n기억 정리 입력이 상한보다 커요 (사용자 1명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+    expect(compose({ kind: "memory_failed", code: "runtime_auth" }).body).toBe(
+      "오늘 기억 정리가 실패했어요 — 연결을 쓸 수 없었어요. 내일 다시 해요",
     );
-    expect(compose({ kind: "dreaming_failed", users: 1 }).body).toBe(
-      "기억 정리가 실패했어요 (사용자 1명, 연결 확인 필요)",
-    );
+    expect(compose({ kind: "memory_failed", code: "model_error" })).toMatchObject({
+      title: "기억 정리 실패",
+      body: "오늘 기억 정리가 실패했어요. 내일 다시 해요",
+      url: "/settings/instructions?doc=dreams",
+    });
   });
 
-  it("4. end to end: a run failing too_large twice → the alert names the cap", async () => {
+  it("4. end to end: a run failing too_large twice → the user's notice names the cap", async () => {
     const s = await start({ config: { tokenCap: 25_000 } });
     s.say(`기억: ${"가".repeat(10_000)}`);
     s.d.engine.start();
@@ -1091,10 +1549,18 @@ describe("review #160 round 2", () => {
       s.d.engine.tick();
       await s.d.engine.idle();
     }
-    expect(s.sql.prepare("select body from notifications where kind = 'dreaming_failed'").all()).toEqual([
+    expect(
+      s.sql.prepare("select user_id, body from notifications where kind = 'memory_failed'").all(),
+    ).toEqual([
       {
-        body: "기억 정리 입력이 상한보다 커요 (사용자 1명) — 관리자 → 기억 정리에서 토큰 상한을 올려 주세요",
+        user_id: s.uid("owner"),
+        body: "오늘 기억 정리가 실패했어요 — 메시지가 1회 토큰 상한보다 커요\n관리자에게 상한을 올려 달라고 하세요",
       },
     ]);
+    expect(
+      s.sql.prepare("select count(*) as n from notifications where kind = 'dreaming_failed'").get(),
+    ).toEqual({
+      n: 0,
+    });
   });
 });

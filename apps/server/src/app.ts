@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { JWTVerifyGetKey } from "jose";
-import type { HealthResponse } from "@agentlee/shared";
+import { YOUTUBE_EGRESS_HOSTS, type HealthResponse } from "@agentlee/shared";
 import { createAccessVerifier } from "./auth/access-jwt.js";
 import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
@@ -22,9 +22,7 @@ import { registerBackupRoutes } from "./backup/routes.js";
 import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
 import { RuntimeScheduleHandler, scheduleUsable, ScheduleWarnings } from "./schedules/handler.js";
 import { registerScheduleRoutes } from "./schedules/routes.js";
-import { registerWatchlistRoutes } from "./watchlist/routes.js";
 import { compactOnce } from "./secrets/compact.js";
-import { WatchlistStore } from "./watchlist/store.js";
 import { fixtureFinanceWorker } from "./runtime/fake-finance.js";
 import { ScheduleStore } from "./schedules/store.js";
 import { ScheduleProposalStore } from "./schedules/proposals.js";
@@ -98,6 +96,9 @@ import { sandboxedAudioRunner, type AudioRunner } from "./audio/runner.js";
 import { AudioFallbackSwitch, AudioTranscriber } from "./audio/service.js";
 import { openRouterClient, type FallbackClient } from "./audio/openrouter.js";
 import { registerAudioRoutes } from "./audio/routes.js";
+import { youtubeState, type YoutubeState } from "./youtube/packages.js";
+import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
+import { YoutubeAudioFetcher } from "./youtube/service.js";
 import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
@@ -214,8 +215,6 @@ declare module "fastify" {
       | undefined;
     /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
     scheduleProposals: ScheduleProposalStore | undefined;
-    /** 관심 종목 (#31); undefined without a database. */
-    watchlist: WatchlistStore | undefined;
     /** What deleting a conversation does beyond its rows (#54): runtime session state, notifications, the WAL. */
     purge: ConversationPurge | undefined;
     /** 내 지침 (#144); undefined without a database. */
@@ -315,6 +314,16 @@ export type BuildOptions = {
    * what this server can run (default: `audioState` from SKILL_PYTHON, ffmpeg and `pnpm audio:install`; in tests
    * nothing, unless given) and the OpenRouter client (default: from OPENROUTER_API_KEY; tests mock it).
    */
+  /**
+   * `youtube_audio_fetch` (#191): how the steps run (default: the sandboxed yt-dlp and ffmpeg), what this server can
+   * run (default: `youtubeState` from SKILL_PYTHON, ffmpeg and `pnpm youtube:install`; in tests nothing, unless
+   * given) and its egress proxy (default: one for `YOUTUBE_EGRESS_HOSTS`; tests give a fake one).
+   */
+  youtube?: {
+    runner?: YoutubeRunner;
+    state?: () => YoutubeState;
+    proxy?: () => Promise<{ url: string; port: number }>;
+  };
   audio?: {
     runner?: AudioRunner;
     state?: () => AudioState;
@@ -610,9 +619,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       runner: docRunner,
       slots: docSlots,
     });
-    // 관심 종목 (#31): the screen's list and `watchlist_get`.
-    const watchlist = new WatchlistStore(opts.db!);
-    app.decorate("watchlist", watchlist);
     // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
     const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
     app.decorate("files", fileStore);
@@ -691,6 +697,26 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       extract: (id) => fileExtracts.enqueue(id),
     });
     app.addHook("preClose", async () => audio.close());
+    // youtube_audio_fetch (#191): offered once `pnpm youtube:install` ran, with ffmpeg and SKILL_PYTHON. Its only
+    // way out is this proxy (YouTube's hosts, HTTPS), started on first use.
+    const youtubeEgress = new EgressService({ allow: YOUTUBE_EGRESS_HOSTS });
+    const youtube = new YoutubeAudioFetcher({
+      db: opts.db!,
+      dataDir: config.dataDir,
+      files: () => app.files,
+      runner: opts.youtube?.runner ?? sandboxedYoutubeRunner(),
+      state:
+        opts.youtube?.state ??
+        (config.env === "test"
+          ? () => ({ state: "not_installed", reason: "tests" })
+          : () => youtubeState(config.skillPython, config.dataDir, config.audioFfmpeg)),
+      proxy: opts.youtube?.proxy ?? (() => youtubeEgress.endpoint()),
+      secrets: config.skillSecrets,
+    });
+    app.addHook("preClose", async () => {
+      youtube.close();
+      await youtubeEgress.close();
+    });
     // The one-time account self-check runs in the sweep hook below (#47 round 3: after the sweep, under the same
     // conditions as a real job — the sweep keeps the scratch root and its ACL).
     // Never awaited by a startup hook, never throws (the gate catches everything).
@@ -822,13 +848,13 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
       audio,
+      youtube,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,
         // The FakeRuntime mode (e2e, local tries): synthetic histories in-process, never the network (#31).
         ...(config.fakeRuntime ? { worker: fixtureFinanceWorker() } : {}),
       },
-      watchlist,
       // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
       switches: new SkillSwitches(settingsStore),
       ...(errors ? { errors } : {}),
@@ -952,6 +978,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
         if (!audio.sweep()) logEvent(app.log, "warn", "audio.sweep_failed");
+        if (!youtube.sweep()) logEvent(app.log, "warn", "youtube.sweep_failed");
         startSelfCheck();
         // Worker job folders of the last process (#122), then the worker account's checks.
         if (!sweepWorkerScratch(config.dataDir, workerAccount))
@@ -1125,7 +1152,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       scheduleWarnings.stop();
       await scheduleEngine.stop();
     });
-    // 기억 정리 (#146, FR-16.5·16.6): the admin's shared API key connection, once a day per user, without tools.
+    // 기억 정리 (#146, #188, FR-16.5·16.6): each user's chosen shared API key connection, once a day, without tools.
     const dreamingNow = opts.dreaming?.now ?? Date.now;
     const dreamingRunner = new DreamingRunner({
       db: opts.db!,
@@ -1156,11 +1183,18 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
             "select 1 from runs where user_id = ? and status in ('queued', 'running') limit 1",
           )
           .get(userId),
-      alert: (date, count, tooLarge) => {
+      // The user's own round failed at its last attempt (#188): told themself, unless turned off (설정 → 알림).
+      failed: (userId, date, code) => {
+        const n = app.notifications;
+        if (!n?.wants(userId, "memory_failed")) return;
+        n.publish(userId, { kind: "memory_failed", code }, { dedupeKey: `memory_failed:${date}:${userId}` });
+      },
+      // The server's setup is broken (an allowed shared connection gone): the admins, once a day.
+      alert: (date, count) => {
         for (const admin of connectionStore.admins())
           app.notifications?.publish(
             admin,
-            { kind: "dreaming_failed", users: count, tooLarge },
+            { kind: "dreaming_failed", users: count },
             { dedupeKey: `dreaming_failed:${date}:${admin}` },
           );
         logEvent(app.log, "warn", "dreaming.alert_sent", { count });
@@ -1186,7 +1220,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => dreamingEngine.start());
     app.addHook("preClose", async () => dreamingEngine.stop());
     registerSourceRoutes(app, app.conversations!, sources);
-    registerWatchlistRoutes(app, { store: watchlist, mcp });
     // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
     registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
@@ -1275,7 +1308,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("files", undefined);
     app.decorate("schedules", undefined);
     app.decorate("scheduleProposals", undefined);
-    app.decorate("watchlist", undefined);
     app.decorate("fileExtracts", undefined);
     app.decorate("sharing", undefined);
     app.decorate("purge", undefined);

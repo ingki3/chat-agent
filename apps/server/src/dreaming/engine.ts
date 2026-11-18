@@ -1,4 +1,4 @@
-import { DREAMING_STAGGER_MIN, DREAMING_TIME_ZONE } from "@agentlee/shared";
+import { DREAMING_CONCURRENCY, DREAMING_TIME_ZONE, type DreamingChoice } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { logEvent, type EventLogger } from "../logging.js";
 import { localDay, resolveLocal } from "../schedules/time.js";
@@ -6,21 +6,23 @@ import type { DreamingRunner, RunResult } from "./runner.js";
 import type { DayRow, DreamingStore } from "./store.js";
 
 /**
- * The 기억 정리 schedule (#146, docs/memory-spec.md §6·§9): one in-process timer over persistent rounds.
+ * The 기억 정리 schedule (#146, #188, docs/memory-spec.md §6·§9): one in-process timer over persistent rounds.
  *
- * - **When**: the admin's HH:MM in Asia/Seoul, each user (in user id order among those it runs for) 5 minutes after
- *   the one before. A regular round starts within a minute of its time (AC-14) — the timer wakes for it.
+ * - **When**: each user's own HH:MM in Asia/Seoul. A regular round is due at its time — the timer wakes for it — and
+ *   starts within a minute (AC-14) while fewer than `DREAMING_CONCURRENCY` rounds run; users sharing a time beyond
+ *   that start one after another as the running ones end (due time, then user id order), still as regular rounds.
  * - **Not now**: an answer of that user still running → again in 10 minutes, at most 6 times (then the day is
  *   skipped). The server was off at the time → one catch-up round after the start, the same day. Past midnight that
  *   day has no round any more. Turned on after its time that day → none that day.
  * - **Failure** (no connection, expired, limit, model error, time-out): nothing moves; tried once more 30 minutes
- *   later, then the next day. The admins are told once, only when the day's last attempt of every user is over and
- *   some failed — how many users, no names or content.
+ *   later, then the next day. The user is told once when the day's last attempt failed (a fixed reason, no content).
  * - **Once**: a round per user and day (`dreaming_days`) and an attempt per key (`dreaming:<user>:<date>:<attempt>`);
  *   a restart fails what was running (no double apply — the run's outcome is written in the same transaction as its
  *   changes, only while it is still running) and waits for the retry.
- * - **Pause** (spec §7·§9): turned off, the user deactivated, or the chosen connection gone (the admin screen says
- *   "연결을 다시 고르세요") — no round, nothing failed; on resume a backlog older than 7 days is passed over.
+ * - **Pause** (spec §7·§9): turned off (server-wide or by the user), the user deactivated, or the user's chosen pair
+ *   no longer usable (deleted, disconnected, not allowed any more — "다시 고르세요") — no round, nothing failed; on
+ *   resume a backlog older than 7 days is passed over. An allowed shared connection deleted or disconnected while
+ *   users chose it is the server's setup broken: the admins are told once a day (how many users, no names).
  */
 
 export const DREAMING_RETRY_MS = 30 * 60_000;
@@ -33,11 +35,14 @@ export const DREAMING_LATE_MS = 60_000;
 export type DreamingEngineDeps = {
   db: Db;
   store: DreamingStore;
-  runner: Pick<DreamingRunner, "run" | "connectionProblem">;
+  runner: Pick<DreamingRunner, "run" | "problemOf" | "choiceProblem" | "canStart"> &
+    Partial<Pick<DreamingRunner, "onRelease">>;
   /** Whether the user has an answer running (any of their conversations). */
   busy?: (userId: string) => boolean;
-  /** The day's last attempt failed for `users` users: tell the admins (once per date — the caller dedupes). */
-  alert?: (date: string, users: number, tooLarge: number) => void;
+  /** The user's round of `date` failed at its last attempt (`code`): tell them (once — the caller dedupes too). */
+  failed?: (userId: string, date: string, code: string | null) => void;
+  /** Allowed shared connections are gone while `users` users chose them: tell the admins (once per date). */
+  alert?: (date: string, users: number) => void;
   now?: () => number;
   log?: EventLogger | undefined;
   /** Whether this process still holds the data folder (#37): false → no new round. */
@@ -49,10 +54,6 @@ const DAY = 86_400_000;
 export const dateOfDay = (day: number) => new Date(day * DAY).toISOString().slice(0, 10);
 export const dreamingDate = (at: number) => dateOfDay(localDay(at, DREAMING_TIME_ZONE));
 const minuteOf = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
-const hhmm = (minute: number) => {
-  const m = ((minute % 1440) + 1440) % 1440;
-  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
-};
 
 export class DreamingEngine {
   private timer: NodeJS.Timeout | undefined;
@@ -61,10 +62,14 @@ export class DreamingEngine {
   /** When this process started the schedule: a time passed before it was missed while the server was off. */
   private startedAt = 0;
   private readonly active = new Map<string, Promise<void>>();
+  /** Failure notices and admin alerts already handed to the caller by this process (`<user>:<date>`, `<date>`). */
+  private readonly told = new Set<string>();
   private readonly now: () => number;
 
   constructor(private readonly deps: DreamingEngineDeps) {
     this.now = deps.now ?? Date.now;
+    // A slot freed by any run (미리 실행, 지금 실행 included): look again at the rounds waiting for one.
+    deps.runner.onRelease?.(() => this.kick());
   }
 
   get running(): boolean {
@@ -102,25 +107,24 @@ export class DreamingEngine {
 
   /** Users the rounds are for, in user id order, with their start time today (Asia/Seoul). */
   slots(at = this.now()): { userId: string; at: number; time: string }[] {
-    const cfg = this.deps.store.config();
     const day = localDay(at, DREAMING_TIME_ZONE);
-    const base = minuteOf(cfg.time);
-    return this.eligible().map((userId, i) => {
-      const minute = base + DREAMING_STAGGER_MIN * i;
-      return { userId, at: resolveLocal(day, minute, DREAMING_TIME_ZONE), time: hhmm(minute) };
-    });
+    return this.eligible()
+      .filter((u) => this.deps.runner.problemOf(u.id) === null)
+      .map((u) => ({
+        userId: u.id,
+        at: resolveLocal(day, minuteOf(u.time), DREAMING_TIME_ZONE),
+        time: u.time,
+      }));
   }
 
-  /** Active users whose switch is on, in user id order. */
-  private eligible(): string[] {
-    return (
-      this.deps.db.$client
-        .prepare(
-          `select u.id as id from users u left join dreaming_users d on d.user_id = u.id
-            where u.active = 1 and coalesce(d.enabled, 1) = 1 order by u.id`,
-        )
-        .all() as { id: string }[]
-    ).map((r) => r.id);
+  /** Active users whose own switch is on (no row = off), in user id order. */
+  private eligible(): { id: string; time: string }[] {
+    return this.deps.db.$client
+      .prepare(
+        `select u.id as id, d.time as time from users u join dreaming_users d on d.user_id = u.id
+          where u.active = 1 and d.enabled = 1 order by u.id`,
+      )
+      .all() as { id: string; time: string }[];
   }
 
   /** Users whose rounds are switched on but who are not active (paused, spec §9). */
@@ -128,8 +132,8 @@ export class DreamingEngine {
     return (
       this.deps.db.$client
         .prepare(
-          `select u.id as id from users u left join dreaming_users d on d.user_id = u.id
-            where u.active = 0 and coalesce(d.enabled, 1) = 1`,
+          `select u.id as id from users u join dreaming_users d on d.user_id = u.id
+            where u.active = 0 and d.enabled = 1`,
         )
         .all() as { id: string }[]
     ).map((r) => r.id);
@@ -139,7 +143,9 @@ export class DreamingEngine {
     if (!this.running) return;
     clearTimeout(this.timer);
     const now = this.now();
-    let wake: number | null = this.deps.store.nextWaiting();
+    // A round due but not started (all slots busy, its pair unusable) is looked at again when a run ends (arm(0)),
+    // when settings change (kick) or at the longest sleep — never in a tight loop.
+    let wake: number | null = this.deps.store.nextWaiting(now);
     const cfg = this.deps.store.config();
     if (cfg.enabled) {
       const today = dreamingDate(now);
@@ -181,8 +187,8 @@ export class DreamingEngine {
       store.pauseWaiting();
       return;
     }
-    // The chosen connection is gone: paused — the admin screen says so (spec §7), nothing fails.
-    if (this.deps.runner.connectionProblem()) return;
+    this.checkSetup(today, cfg.allowed);
+    // A user whose chosen pair is unusable has no slot: paused — their screen says "다시 고르세요", nothing fails.
     for (const s of this.slots(now)) {
       if (now < s.at || store.day(s.userId, today)) continue;
       const late = now - s.at;
@@ -206,11 +212,16 @@ export class DreamingEngine {
           next_at: s.at,
         });
     }
+    // Due rounds in order (due time, then user id), in the runner's slots shared with 미리 실행 and 지금 실행 (at
+    // most DREAMING_CONCURRENCY at once, one per user); the rest wait their turn.
     for (const d of store.dueDays(now)) {
+      if (this.active.size >= DREAMING_CONCURRENCY) break;
       if (d.date !== today || this.active.has(d.user_id)) continue;
+      if (!this.deps.runner.canStart(d.user_id)) continue;
+      if (this.deps.runner.problemOf(d.user_id)) continue;
       this.dispatch(d);
     }
-    this.checkAlert(today);
+    this.notifyFailed(today);
   }
 
   private dispatch(d: DayRow): void {
@@ -301,30 +312,39 @@ export class DreamingEngine {
         },
         "running",
       );
-    this.checkAlert(d.date);
+    this.notifyFailed(d.date);
+  }
+
+  /** The user's notice (spec §8): their round of `date` ended failed — once per user and date. */
+  private notifyFailed(date: string): void {
+    if (!this.deps.failed) return;
+    for (const d of this.deps.store.days(date)) {
+      if (d.state !== "failed" || this.told.has(`${d.user_id}:${date}`)) continue;
+      this.told.add(`${d.user_id}:${date}`);
+      this.deps.failed(d.user_id, date, this.deps.store.lastRunOn(d.user_id, date)?.code ?? null);
+    }
   }
 
   /**
-   * The admins' alert (spec §6·§8): once the day's round of every user it runs for is over (no slot to come, nothing
-   * waiting or running) and some ended failed. The caller dedupes per date, so a restart never sends it twice.
+   * The admins' alert (spec §7·§8): an allowed shared connection was deleted or disconnected while users who are on
+   * chose it — the server's setup is broken (not the user's to fix). Once a day; the caller dedupes too.
    */
-  private checkAlert(date: string): void {
-    if (!this.deps.alert) return;
-    const days = this.deps.store.days(date);
-    if (!days.some((d) => d.state === "failed")) return;
-    if (days.some((d) => d.state === "waiting" || d.state === "running")) return;
-    if (date === dreamingDate(this.now())) {
-      const have = new Set(days.map((d) => d.user_id));
-      if (this.slots().some((s) => !have.has(s.userId))) return;
-    }
-    const n = days.filter((d) => d.state === "failed").length;
-    const tooLarge = days.filter(
-      (d) => d.state === "failed" && this.deps.store.lastRunOn(d.user_id, date)?.code === "too_large",
-    ).length;
-    this.deps.alert(date, n, tooLarge);
+  private checkSetup(date: string, allowed: readonly DreamingChoice[]): void {
+    if (!this.deps.alert || this.told.has(date)) return;
+    const gone = allowed.filter((a) => this.deps.runner.choiceProblem(a) === "missing");
+    if (!gone.length) return;
+    const users = this.eligible().filter((u) => {
+      const s = this.deps.store.settingsOf(u.id);
+      return gone.some(
+        (g) => g.runtime === s.runtime && g.connectionId === s.connectionId && g.model === s.model,
+      );
+    }).length;
+    if (!users) return;
+    this.told.add(date);
+    this.deps.alert(date, users);
   }
 
-  /** Today's round state and start time of each user (the admin's status table). */
+  /** Today's round state and start time of a user (their screen, the admin's status table). */
   status(userId: string): { time: string | null; today: string | null } {
     const s = this.slots().find((x) => x.userId === userId);
     const day = this.deps.store.day(userId, dreamingDate(this.now()));

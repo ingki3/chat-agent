@@ -15,7 +15,7 @@ import { hashPassword } from "../auth/passwords.js";
 import { deny, passwordChangePending } from "../auth/plugin.js";
 import { temporaryPassword, toAdminUser, type UserRow, type UserStore } from "../auth/users.js";
 import { RunAccessDenied } from "../connections/access.js";
-import { isFinanceSkill, skillPermitted, type McpService } from "../mcp/service.js";
+import { isYouthHiddenSkill, skillPermitted, type McpService } from "../mcp/service.js";
 import type { DefaultsService } from "./defaults.js";
 
 /**
@@ -166,14 +166,14 @@ export function userSkills(u: UserRow, mcp: Pick<McpService, "serverEnabled">): 
 
 /**
  * The new skill permissions after turning one skill on or off for a user: from what is allowed *now* — so a youth
- * account's hidden finance skills stay hidden when another skill is switched (#30) — back to "all" when the result
+ * account's hidden skills (finance, #30; YouTube, #191) stay hidden when another skill is switched (#30) — back to "all" when the result
  * is exactly what "all" gives that account.
  */
 export function toggledSkills(u: UserRow, skill: string, enabled: boolean): "all" | string[] {
   const next = new Set(CATALOGUE.filter((s) => skillPermitted(u, s)));
   if (enabled) next.add(skill);
   else next.delete(skill);
-  const all = CATALOGUE.filter((s) => !(u.youth && isFinanceSkill(s)));
+  const all = CATALOGUE.filter((s) => !(u.youth && isYouthHiddenSkill(s)));
   if (next.size === all.length && all.every((s) => next.has(s))) return "all";
   return CATALOGUE.filter((s) => next.has(s));
 }

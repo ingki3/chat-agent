@@ -412,6 +412,8 @@ export class NotificationService {
           timeZone: row.timeZone,
           memoryProposals: row.memoryProposals,
           memoryApplied: row.memoryApplied,
+          memoryFailed: row.memoryFailed,
+          rev: row.rev,
         }
       : {
           quietStart: null,
@@ -419,13 +421,17 @@ export class NotificationService {
           timeZone: DEFAULT_TIME_ZONE,
           memoryProposals: true,
           memoryApplied: true,
+          memoryFailed: true,
+          rev: 0,
         };
   }
 
-  /** Whether the user wants this 기억 정리 notification (spec §8: the two user kinds can be turned off). */
-  wants(userId: string, kind: "memory_proposal" | "memory_applied"): boolean {
+  /** Whether the user wants this 기억 정리 notification (spec §8: the three user kinds can be turned off). */
+  wants(userId: string, kind: "memory_proposal" | "memory_applied" | "memory_failed"): boolean {
     const p = this.prefs(userId);
-    return kind === "memory_proposal" ? p.memoryProposals !== false : p.memoryApplied !== false;
+    if (kind === "memory_proposal") return p.memoryProposals !== false;
+    if (kind === "memory_applied") return p.memoryApplied !== false;
+    return p.memoryFailed !== false;
   }
 
   setPrefs(userId: string, p: NotificationPrefs): NotificationPrefs {
@@ -437,12 +443,17 @@ export class NotificationService {
       // Left out (an older page): kept as they were.
       memoryProposals: p.memoryProposals ?? before.memoryProposals ?? true,
       memoryApplied: p.memoryApplied ?? before.memoryApplied ?? true,
+      memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
       updatedAt: this.now(),
     };
+    // The revision goes up with every write, in the same statement (#188 review 9).
     this.db
       .insert(notificationPrefs)
-      .values({ userId, ...value })
-      .onConflictDoUpdate({ target: notificationPrefs.userId, set: value })
+      .values({ userId, ...value, rev: 1 })
+      .onConflictDoUpdate({
+        target: notificationPrefs.userId,
+        set: { ...value, rev: sql`${notificationPrefs.rev} + 1` },
+      })
       .run();
     // Quiet hours may just have been switched off or moved: send what is no longer held.
     this.track(this.deliver(userId));

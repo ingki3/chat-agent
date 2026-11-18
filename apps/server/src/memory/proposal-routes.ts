@@ -23,14 +23,20 @@ export function registerMemoryProposalRoutes(app: FastifyInstance, proposals: Me
   const rule = (action: "read" | "write") => ({ resource: { kind: MEMORY_PROPOSAL_KIND, action } });
   const OWN = { noResource: "the caller's own 기억 반영 방식 setting" };
 
-  app.get("/api/memory-prefs", { config: OWN }, async (req, reply) =>
-    send(reply, { applyMode: proposals.mode(req.ctx.user!.id) } satisfies MemoryPrefs),
-  );
+  // A youth account's 반영 방식 is the admin's to set (#188, with its 기억 정리 settings): read-only here.
+  const prefs = (u: { id: string; youth: boolean }): MemoryPrefs => ({
+    applyMode: proposals.mode(u.id),
+    rev: proposals.modeRev(u.id),
+    ...(u.youth ? { locked: true as const } : {}),
+  });
+  app.get("/api/memory-prefs", { config: OWN }, async (req, reply) => send(reply, prefs(req.ctx.user!)));
   app.put("/api/memory-prefs", { config: OWN }, async (req, reply) => {
+    const user = req.ctx.user!;
+    if (user.youth) return send(reply, { error: "dreaming_youth_locked" }, 403);
     const r = SaveMemoryPrefsRequest.safeParse(req.body);
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-    proposals.setMode(req.ctx.user!.id, r.data.applyMode);
-    return send(reply, { applyMode: proposals.mode(req.ctx.user!.id) } satisfies MemoryPrefs);
+    proposals.setMode(user.id, r.data.applyMode);
+    return send(reply, prefs(user));
   });
 
   const acting = (reply: FastifyReply, id: string, userId: string, fn: () => unknown) => {

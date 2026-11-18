@@ -29,6 +29,7 @@ PRD §7의 스킬을 하나씩 살펴 실제 진입점, 입출력, 의존성, �
 | `pptx` | 아니오 | 문서형 #48·#49 | (안내 문서 + `scripts/*`) | python-pptx, pptxgenjs, LibreOffice | 없음 | 없음 |
 | `python-scratchpad` | 아니오 | **서버 도구** #47 (`python_run`) | (스킬 실행 안 함) 우리 `apps/server/scratchpad/runner.py` | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(numpy·pandas, `pnpm python:install`) | 없음 | 없음(샌드박스가 막음) |
 | `audio-transcription` | 아니오 | **서버 도구** #173 (`audio_transcribe`) | (스킬 실행 안 함) 우리 `apps/server/audio/transcribe.py` — 원본 `audio-transcription`·`nemotron-speaker-diarization` 절차와 조정값을 따름 | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(mlx-audio) + 고정 모델(Whisper large-v3 turbo, Nemotron-3-Diarization), `pnpm audio:install`; ffmpeg | 선택 `OPENROUTER_API_KEY`(대체 전사만) | 없음(로컬). 대체를 켜면 `openrouter.ai`만 |
+| `youtube-audio-download` (§7 밖, #191) | 아니오 (청소년 기본 꺼짐) | **서버 도구** #191 (`youtube_audio_fetch`) | (스킬 실행 안 함) 우리 `apps/server/youtube/fetch.py` — 원본 `scripts/download_audio.py`(Homebrew yt-dlp·ffmpeg)는 쓰지 않음 | 독립 실행형 CPython 3.12 + 고정 패키지 폴더(yt-dlp 2026.10.26, yt-dlp-ejs 0.8.0, deno 2.9.8 — `pnpm youtube:install`); ffmpeg(§46) | 없음(쿠키·로그인 안 씀) | egress 프록시로 `www.youtube.com`·`m.youtube.com`·`youtube.com`·`youtu.be`·`*.googlevideo.com`만 |
 | HWP 추출기(신규) | 아니오 | #23 | 공통 MCP 서버의 파일 도구로 새로 만든다 | — | — | — |
 
 v1 제외(PRD §7): `gmail-skill`, `google-calendar-skill`, `google-contacts-skill`, `google-docs-skill`, `agent-browser`, `computer-use`, `orca-cli`, `implementation-skill`. 정의가 없으므로 설치도, 사용자별 허용도 할 수 없다(`unknown_skill`).
@@ -105,7 +106,7 @@ PRD §7 목록에는 없고 관리자 요청으로 더했다(관리자 스킬 �
 - 스킬을 프로세스로 돌리지 않는다. `us-stock-skill`은 venv(yfinance)가 필요하고, 두 공시 스킬은 SQLite·LLM 워커·Telegram을 쓰는 상태 있는 모니터라서 #21 실행기로 못 돌린다. 스킬이 읽는 같은 원천을 샌드박스 작업자가 도구 전용 프록시로 읽는다.
 - 모든 숫자에 `{source, asOf, timeZone, delayed, kind}`가 붙고, 답변에는 서버가 출처·기준 시각·면책을 붙인다.
 - 청소년 계정은 권한이 `"all"`이어도 네 금융 스킬과 그 도구가 숨겨진다. 이름을 적은 목록으로만 켠다.
-- 스킬의 모니터 기능(관심 종목 공시 감시, Telegram 알림, LLM 요약)은 옮기지 않았다. 관심 종목은 #31, 예약 브리핑은 #33에서 이 도구들로 만든다.
+- 스킬의 모니터 기능(관심 종목 공시 감시, Telegram 알림, LLM 요약)은 옮기지 않았다. 예약 브리핑은 #33에서 이 도구들로 만든다(#31의 관심 종목은 #187에서 제거).
 - `kr-stock-skill`의 #21 python 래퍼(`skill_kr-stock-skill`)는 Alpha Vantage 대체용으로 남겼다. 출처 표시가 없어 출력기가 `tool_meta`로 표시한다.
 
 ## 웹 도구 (#50, 스킬이 아님)
@@ -132,6 +133,12 @@ PRD §7에 없던 기능이라 카탈로그에 `audio-transcription`을 더했�
 - 원본 스킬 두 개(`~/Dev/skills/audio-transcription`, `nemotron-speaker-diarization`)의 스크립트·venv는 쓰지 않는다. 절차(16kHz mono WAV, `threshold≈0.85`·`min_duration 0.3`·`merge_gap 0.5`, 25MB 업로드 한도 → 64kbps 재인코딩·분할, 언어 명시)와 이름 추정 규칙(소개 문구·자기소개·호칭 → 이름, 없으면 역할, 불확실하면 `OO(추정)`)은 도구 설명과 구현에 옮겼다.
 - 원본과 달리 **전사도 로컬 우선**이다(사용자 결정 2026-11-17): MLX Whisper가 실패했을 때만, 관리자가 켜 두었고 `OPENROUTER_API_KEY`가 있으면 OpenRouter `openai/whisper-large-v3`로 대체한다. 화자 구분은 항상 로컬이다(Scribe v2 경로는 쓰지 않음 — 원본 문서의 실측대로 화자를 합칠 위험).
 - 결과: `segments`(외부 내용 블록 안의 JSON 배열 `{speaker, start, end, text}`, 앞 400개), 화자 수·길이·전사 엔진, 대본 마크다운 파일(대화 파일, 답에 연결). 모델이 이름을 추정해 마크다운 아티팩트로 정리한다.
+
+## 유튜브 음성 받기 `youtube_audio_fetch` (#191, 스킬이 아님)
+사용자가 만든 스킬 `youtube-audio-download`(`~/Dev/skills/youtube-audio-download`)를 카탈로그에 더했다(PRD §7 밖). 우리 MCP 서버의 서버 도구 `youtube_audio_fetch {url, start?, end?}`이고, 결과의 `fileId`를 `audio_transcribe`에 넘기면 화자별 대본이 된다. 정의는 `packages/mcp-tools/src/youtube.ts`, 실행은 `apps/server/src/youtube/`, 운영은 `docs/ops.md` §48, 근거는 `docs/decisions/isolation.md` "유튜브 음성 받기 (#191)".
+- 원본 스킬과 다른 점(사용자 결정 2026-11-18): **YouTube만**(다른 yt-dlp 지원 사이트 없음), `--cookies-from-browser` 없음, 재생목록·라이브·로그인 필요 영상 거절, 형식은 서버가 정함(M4A — `audio_transcribe`가 받는 형식), PATH·Homebrew의 yt-dlp 대신 고정 설치본. yt-dlp(와 yt-dlp-ejs·deno)만 "배포 3일 이상" 버전 규칙.
+- 권한: 서버 허용 목록·사용자별 허용은 다른 스킬과 같고, **청소년 계정은 `"all"`이어도 기본 숨김**(금융 스킬과 같은 방식 — 관리자가 이름으로 켬, 카탈로그의 `youthHidden`).
+- 한도: 2시간(넘으면 `start`·`end`로 구간), 음성 300MB, 답변당 3번, 호출 30분.
 
 ## 문서형 스킬
 `pdf`·`docx`·`xlsx`·`pptx`는 "이 라이브러리를 이렇게 써라"라는 안내다. 보조 스크립트도 런타임이 셸로 실행하라는 전제다. 우리 런타임에는 셸이 없다(PRD NFR 격리). 그래서 공통 MCP 서버의 파일 도구(서버 함수)로 만든다.

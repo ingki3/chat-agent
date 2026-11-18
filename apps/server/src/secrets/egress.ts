@@ -99,8 +99,8 @@ export function withoutParam(raw: string, name: string, value: string): string {
 }
 
 /**
- * The query sent in place of one that carries a known secret (watchlist search, review #111 round 3; web_search,
- * #113): fixed, never the user's text, harmless, and its hits are never shown.
+ * The query sent in place of one that carries a known secret (web_search, #113; first made for the 관심 종목 search
+ * of review #111, removed in #187): fixed, never the user's text, harmless, and its hits are never shown.
  */
 export const SEARCH_DECOY = "agentlee decoy no match";
 

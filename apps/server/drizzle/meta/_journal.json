@@ -232,6 +232,13 @@
       "when": 1794805484819,
       "tag": "0032_access_sync",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1794981214013,
+      "tag": "0033_dreaming_user_settings",
+      "breakpoints": true
     }
   ]
 }

@@ -34,7 +34,7 @@ export const AUDIO_ENTRY = path.join(AUDIO_DIR, "transcribe.py");
 export const AUDIO_LOCK = path.join(AUDIO_DIR, "requirements.lock");
 export const AUDIO_MODELS = path.join(AUDIO_DIR, "models.json");
 export const PYTHON_VERSION = "3.12";
-const MANIFEST = ".agentlee-audio.json";
+export const MANIFEST = ".agentlee-audio.json";
 /** Where ffmpeg is looked for when `AUDIO_FFMPEG` is not set. */
 export const DEFAULT_FFMPEG = "/opt/homebrew/bin/ffmpeg";
 
@@ -61,7 +61,7 @@ export function modelManifest(): ModelManifest {
   return ModelManifest.parse(JSON.parse(fs.readFileSync(AUDIO_MODELS, "utf8")));
 }
 
-const sha256File = (p: string) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+export const sha256File = (p: string) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 
 export function lockHash(): string {
   return sha256File(AUDIO_LOCK);
@@ -130,7 +130,7 @@ export function ffmpegOf(
 
 type Installed = { lock?: string; manifest?: string; python?: string };
 
-function readManifest(dir: string): Installed | undefined {
+export function readManifest(dir: string): Installed | undefined {
   const st = fs.lstatSync(dir, { throwIfNoEntry: false });
   if (!st?.isDirectory() || st.isSymbolicLink()) return undefined;
   try {
@@ -189,9 +189,10 @@ export function chmodTree(dir: string, dirMode: number, fileMode: number): void 
   if (!opening) fs.chmodSync(dir, dirMode);
 }
 
-/** Moves a finished temporary folder into place (read-only), replacing an older copy. */
-function publish(tmp: string, dir: string): void {
+/** Moves a finished temporary folder into place (read-only, `executables` 0555), replacing an older copy. */
+function publish(tmp: string, dir: string, executables: readonly string[] = []): void {
   chmodTree(tmp, 0o555, 0o444);
+  for (const e of executables) fs.chmodSync(path.join(tmp, e), 0o555);
   if (fs.existsSync(dir)) {
     chmodTree(dir, 0o755, 0o644);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -215,11 +216,35 @@ export function installAudioPackages(
   dataDir: string,
   o: { log?: (line: string) => void } = {},
 ): string {
+  return installPinnedPackages(runtime, {
+    root: storagePaths(dataDir).audioPackages,
+    dir: packagesDir(dataDir),
+    lock: AUDIO_LOCK,
+    log: o.log,
+  });
+}
+
+/**
+ * One pinned lock installed with pip into `dir` (below `root`) — the rules of `pnpm audio:install` (#173), shared with
+ * `pnpm youtube:install` (#191): pip `--no-deps --require-hashes --only-binary=:all: --target` into a temporary
+ * folder under `root`, with pip's own HOME/TMPDIR there and a fixed environment (`pipEnv`), then a manifest (the
+ * lock's hash and the python version), everything read-only (0555/0444) and moved into place. Console scripts in
+ * `bin/` are removed unless listed in `executables` (kept, 0555 — #191's pinned deno binary).
+ */
+export function installPinnedPackages(
+  runtime: PythonRuntime,
+  o: {
+    root: string;
+    dir: string;
+    lock: string;
+    executables?: readonly string[];
+    log?: ((line: string) => void) | undefined;
+  },
+): string {
   const v = pythonVersionOf(runtime);
   if (v !== PYTHON_VERSION) throw new Error(`python ${PYTHON_VERSION} required, SKILL_PYTHON is ${v ?? "?"}`);
-  const root = storagePaths(dataDir).audioPackages;
+  const { root, dir } = o;
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const dir = packagesDir(dataDir);
   const tmp = path.join(root, `.tmp-${crypto.randomUUID()}`);
   // pip's own home and temp folder, under DATA_DIR and removed afterwards: nothing of the admin's (no ~/.config/pip,
   // no cache, no keyring), and none of the server's environment — no secret, no PIP_* or proxy variable.
@@ -245,20 +270,33 @@ export function installAudioPackages(
         "--target",
         tmp,
         "-r",
-        AUDIO_LOCK,
+        o.lock,
       ],
       // cwd too: a child (or a shell wrapper) would otherwise see the admin's current folder (PWD) — CI review.
       { stdio: ["ignore", "inherit", "inherit"], env: pipEnv(home), cwd: home },
     );
     if (r.error) throw r.error;
     if (r.status !== 0) throw new Error(`pip exited with ${r.status ?? r.signal}`);
-    // Console scripts (mlx_audio.*, hf, tqdm…) are not needed: nothing is started from this folder.
-    fs.rmSync(path.join(tmp, "bin"), { recursive: true, force: true });
+    const keep = new Set(o.executables ?? []);
+    for (const k of keep) {
+      const st = fs.lstatSync(path.join(tmp, k), { throwIfNoEntry: false });
+      if (!st?.isFile()) throw new Error(`${k} missing after the install`);
+    }
+    // Console scripts (mlx_audio.*, hf, yt-dlp…) are not needed: nothing is started from this folder but `keep`.
+    const bin = path.join(tmp, "bin");
+    if (fs.existsSync(bin))
+      for (const n of fs.readdirSync(bin))
+        if (!keep.has(`bin/${n}`)) fs.rmSync(path.join(bin, n), { recursive: true, force: true });
+    if (fs.existsSync(bin) && !fs.readdirSync(bin).length) fs.rmdirSync(bin);
     fs.writeFileSync(
       path.join(tmp, MANIFEST),
-      JSON.stringify({ lock: lockHash(), python: PYTHON_VERSION, installedAt: new Date().toISOString() }),
+      JSON.stringify({
+        lock: sha256File(o.lock),
+        python: PYTHON_VERSION,
+        installedAt: new Date().toISOString(),
+      }),
     );
-    publish(tmp, dir);
+    publish(tmp, dir, [...keep]);
     o.log?.(`packages installed into ${dir}`);
     return dir;
   } finally {

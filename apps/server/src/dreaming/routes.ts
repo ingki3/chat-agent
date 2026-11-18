@@ -2,17 +2,21 @@ import crypto from "node:crypto";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import {
   DreamingPreviewRequest,
-  DreamingUserSwitchRequest,
   SaveDreamingConfigRequest,
   SaveDreamingPromptRequest,
+  SaveDreamingSettingsRequest,
+  SaveYouthDreamingRequest,
   type DreamingAdmin,
+  type DreamingCandidate,
+  type DreamingConfig,
   type DreamingConnectionChoice,
   type DreamingPreview,
-  type DreamingPromptVersions,
+  type DreamingPromptView,
+  type DreamingSettings,
   type DreamingUserStatus,
   type MyDreaming,
 } from "@agentlee/shared";
-import type { UserStore } from "../auth/users.js";
+import type { UserRow, UserStore } from "../auth/users.js";
 import { systemUsable, type ConnectionStore } from "../connections/store.js";
 import type { MemoryProposals } from "../memory/proposals.js";
 import { holdsSecret } from "../memory/rules.js";
@@ -24,17 +28,18 @@ import type { DreamingRunner } from "./runner.js";
 import { recordOf, type DreamingStore } from "./store.js";
 
 /**
- * 기억 정리 routes (#146, PRD FR-16.5·16.6·16.8).
+ * 기억 정리 routes (#146, #188, PRD FR-16.5·16.6·16.8).
  *
- * The user's own (`GET /api/dreaming`): whether it runs for them, the prompt in use (read-only, with the fixed rules),
- * `DREAMS.md` (counts, times, results) and their bundles — decided with the card routes (`/api/memory-proposals/:id`,
- * owner only). The admin's (`/api/admin/dreaming…`): the switches, the time, the shared API key connection and model,
- * the token cap, the prompt and its versions, 미리 실행 on the admin's own data, and a status table of ran / skipped /
- * failed with counts — never an item, a message or a proposal of anyone (FR-1.5: those routes are the owner's, 403
- * for the admin).
+ * The user's own (`/api/dreaming…`, the caller only — never anyone else's): whether it runs for them, their settings
+ * (switch, time, connection·model among the pairs the admin allowed), their cleanup prompt (기본값으로 되돌리기) and
+ * 미리 실행 on their own data, `DREAMS.md` (counts, times, results) and their bundles — decided with the card routes
+ * (`/api/memory-proposals/:id`, owner only). A youth account reads its settings but cannot change them (403
+ * `dreaming_youth_locked`): the admin does, here. The admin's (`/api/admin/dreaming…`): the server-wide switch, the
+ * token cap, the allowed connections·models, a youth account's settings, and a status table of settings, ran /
+ * skipped / failed with counts — never an item, a message, a proposal or a prompt of anyone (FR-1.5).
  */
 
-const OWN = { noResource: "the caller's own 기억 정리 (prompt, DREAMS.md, bundles)" };
+const OWN = { noResource: "the caller's own 기억 정리 (settings, prompt, DREAMS.md, bundles)" };
 const ADMIN = { auth: "admin" as const, noResource: "admin-only 기억 정리 settings and counts (no content)" };
 
 const send = (reply: FastifyReply, body: unknown, status = 200) =>
@@ -57,44 +62,20 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
   const { store, engine, runner, proposals, users } = deps;
   const now = deps.now ?? Date.now;
 
-  const promptView = () => {
-    const p = store.prompt();
+  const promptView = (userId: string): DreamingPromptView => {
+    const p = store.promptOf(userId);
     return {
-      version: p.version,
       content: p.content,
+      custom: p.custom,
+      defaultContent: store.prompt().content,
       fixedRules: DREAMING_FIXED_RULES,
-      updatedAt: p.createdAt,
+      updatedAt: p.updatedAt,
     };
   };
 
-  /** Whether the rounds run for this user now (the admin's switches, the account, a usable connection). */
-  const runsFor = (userId: string) => {
-    const cfg = store.config();
-    const u = users.byId(userId);
-    return (
-      cfg.enabled && !!u?.active && store.state(userId).enabled === 1 && runner.connectionProblem() === null
-    );
-  };
-
-  // ---- the user's own ----
-
-  app.get("/api/dreaming", { config: OWN }, async (req, reply) => {
-    const userId = req.ctx.user!.id;
-    const on = runsFor(userId);
-    return send(reply, {
-      enabled: on,
-      time: on ? engine.status(userId).time : null,
-      prompt: promptView(),
-      runs: store.runsOf(userId),
-      proposals: proposals.listDreaming(userId),
-    } satisfies MyDreaming);
-  });
-
-  // ---- the admin's ----
-
   /** Shared API key connections that passed, of a registered runtime, with their models of ≥ 200,000 tokens. */
-  const choices = (): DreamingConnectionChoice[] => {
-    const out: DreamingConnectionChoice[] = [];
+  const candidates = (): DreamingCandidate[] => {
+    const out: DreamingCandidate[] = [];
     for (const runtime of deps.registry.ids()) {
       const caps = deps.registry.get(runtime)!.capabilities();
       const models = caps.models
@@ -111,109 +92,103 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     return out;
   };
 
-  const statusOf = (u: { id: string; name: string; active: boolean }): DreamingUserStatus => {
-    const last = store.lastRun(u.id);
-    const st = engine.status(u.id);
+  /** The allowed pairs a user may pick now: allowed by the admin and still a candidate (its connection usable). */
+  const choices = (): DreamingConnectionChoice[] => {
+    const cands = candidates();
+    return store.config().allowed.flatMap((a) => {
+      const c = cands.find((x) => x.runtime === a.runtime && x.id === a.connectionId);
+      const m = c?.models.find((x) => x.id === a.model);
+      return c && m ? [{ ...a, label: `${c.label} · ${m.label}` }] : [];
+    });
+  };
+
+  /**
+   * Settings as sent: on needs a choice, one of the pairs the user may pick now (D2). Turned off, the stored choice
+   * may stay as it is even if it is no longer usable (to be chosen again before turning it back on).
+   */
+  const checkSettings = (userId: string, s: DreamingSettings): string | null => {
+    const same = (c: { runtime: string | null; connectionId: string | null; model: string | null }) =>
+      c.runtime === s.runtime && c.connectionId === s.connectionId && c.model === s.model;
+    if (choices().some(same)) return null;
+    const none = s.runtime === null && s.connectionId === null && s.model === null;
+    if (!s.enabled && (none || same(store.settingsOf(userId)))) return null;
+    return "dreaming_choice_not_allowed";
+  };
+
+  /** The stored settings with the fields sent on top (#188 review 5: partial saves, the later write wins). */
+  const mergeSettings = (userId: string, given: SaveDreamingSettingsRequest): DreamingSettings => ({
+    ...store.settingsOf(userId),
+    ...(Object.fromEntries(
+      Object.entries(given).filter(([, v]) => v !== undefined),
+    ) as Partial<DreamingSettings>),
+  });
+
+  const problemOf = (userId: string, settings: DreamingSettings) =>
+    settings.enabled ? runner.problemOf(userId) : null;
+
+  // ---- the user's own ----
+
+  const mine = (user: UserRow): MyDreaming => {
+    const settings = store.settingsOf(user.id);
+    const on = store.switchedOn(user.id) && runner.problemOf(user.id) === null;
     return {
-      userId: u.id,
-      name: scrubKnown(u.name),
-      active: u.active,
-      enabled: store.state(u.id).enabled === 1,
-      time: st.time,
-      today: st.today,
-      last: last
-        ? {
-            status: last.status,
-            code: last.code,
-            trigger: last.trigger,
-            startedAt: last.started_at,
-            counts: recordOf(last).counts,
-          }
-        : null,
+      rev: store.state(user.id).rev,
+      enabled: on,
+      time: on ? engine.status(user.id).time : null,
+      settings,
+      canEdit: !user.youth,
+      problem: problemOf(user.id, settings),
+      choices: choices(),
+      prompt: promptView(user.id),
+      runs: store.runsOf(user.id),
+      proposals: proposals.listDreaming(user.id),
     };
   };
 
-  const adminView = (): DreamingAdmin => ({
-    config: store.config(),
-    connectionProblem: runner.connectionProblem(),
-    connections: choices(),
-    prompt: promptView(),
-    users: users.list().map(statusOf),
-    manualRuns: deps.manualRuns,
-  });
+  app.get("/api/dreaming", { config: OWN }, async (req, reply) => send(reply, mine(req.ctx.user!)));
 
-  app.get("/api/admin/dreaming", { config: ADMIN }, async (_req, reply) => send(reply, adminView()));
-
-  app.put("/api/admin/dreaming", { config: ADMIN }, async (req, reply) => {
-    const r = SaveDreamingConfigRequest.safeParse(req.body);
+  app.put("/api/dreaming/settings", { config: OWN }, async (req, reply) => {
+    const user = req.ctx.user!;
+    if (user.youth) return send(reply, { error: "dreaming_youth_locked" }, 403);
+    const r = SaveDreamingSettingsRequest.safeParse(req.body);
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-    const c = r.data;
-    // Only a shared API key connection and one of its models (spec §7, D2) — or the FakeRuntime without one.
-    if (c.runtime !== null || c.connectionId !== null || c.model !== null) {
-      const ok = choices().some(
-        (x) => x.runtime === c.runtime && x.id === c.connectionId && x.models.some((m) => m.id === c.model),
-      );
-      if (!ok) return send(reply, { error: "dreaming_connection_not_allowed" }, 400);
-    }
-    store.setConfig(c);
+    // Only the fields sent change (#188 review 5): merged into what is stored, then checked as a whole.
+    const merged = mergeSettings(user.id, r.data);
+    const bad = checkSettings(user.id, merged);
+    if (bad) return send(reply, { error: bad }, 400);
+    store.setSettings(user.id, merged);
     engine.kick();
-    return send(reply, adminView());
+    return send(reply, mine(user));
   });
 
-  app.put<{ Params: { id: string } }>(
-    "/api/admin/dreaming/users/:id",
-    { config: ADMIN },
-    async (req, reply) => {
-      const r = DreamingUserSwitchRequest.safeParse(req.body);
-      if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-      const u = users.byId(req.params.id);
-      if (!u) return send(reply, { error: "not_found" }, 404);
-      store.setEnabled(u.id, r.data.enabled);
-      engine.kick();
-      return send(reply, statusOf(u));
-    },
-  );
-
-  app.put("/api/admin/dreaming/prompt", { config: ADMIN }, async (req, reply) => {
+  app.put("/api/dreaming/prompt", { config: OWN }, async (req, reply) => {
+    const user = req.ctx.user!;
+    if (user.youth) return send(reply, { error: "dreaming_youth_locked" }, 403);
     const r = SaveDreamingPromptRequest.safeParse(req.body);
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-    if (holdsSecret(r.data.content)) return send(reply, { error: "dreaming_secret" }, 400);
-    if (!store.savePrompt(r.data.content.trim(), r.data.baseVersion, req.ctx.user!.id))
-      return send(reply, { error: "dreaming_prompt_changed" }, 409);
-    return send(reply, promptView());
+    if (r.data.content !== null && holdsSecret(r.data.content))
+      return send(reply, { error: "dreaming_secret" }, 400);
+    store.setPrompt(user.id, r.data.content);
+    return send(reply, mine(user));
   });
 
-  app.get("/api/admin/dreaming/prompt/versions", { config: ADMIN }, async (_req, reply) =>
-    send(reply, { versions: store.promptVersions() } satisfies DreamingPromptVersions),
-  );
-
-  app.post<{ Params: { version: string } }>(
-    "/api/admin/dreaming/prompt/versions/:version/restore",
-    { config: ADMIN },
-    async (req, reply) => {
-      const v = store.promptVersions().find((x) => String(x.version) === req.params.version);
-      if (!v) return send(reply, { error: "not_found" }, 404);
-      const base = (req.body as { baseVersion?: unknown } | undefined)?.baseVersion;
-      const at = typeof base === "number" ? base : store.prompt().version;
-      if (!store.savePrompt(v.content, at, req.ctx.user!.id, v.version))
-        return send(reply, { error: "dreaming_prompt_changed" }, 409);
-      return send(reply, promptView());
-    },
-  );
-
-  /** 미리 실행: a run on the admin's **own** data only — nothing is applied, queued or moved. */
-  app.post("/api/admin/dreaming/preview", { config: ADMIN }, async (req, reply) => {
+  /** 미리 실행: a run on the caller's **own** data only — nothing is applied, queued or moved. */
+  app.post("/api/dreaming/preview", { config: OWN }, async (req, reply) => {
+    const user = req.ctx.user!;
+    if (user.youth) return send(reply, { error: "dreaming_youth_locked" }, 403);
     const r = DreamingPreviewRequest.safeParse(req.body ?? {});
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
     if (r.data.content !== undefined && holdsSecret(r.data.content))
       return send(reply, { error: "dreaming_secret" }, 400);
-    const self = req.ctx.user!.id;
+    // The server-wide switch applies to 미리 실행 too (the user's own switch does not); the runner checks again.
+    if (!store.config().enabled) return send(reply, { error: "dreaming_server_off" }, 409);
+    // In a run slot shared with the schedule (at most 2 at once, one per user): none free → 409, nothing ran.
     const out = await runner.run({
-      userId: self,
+      userId: user.id,
       date: dreamingDate(now()),
       attempt: 0,
       trigger: "preview",
-      idemKey: `dreaming-preview:${self}:${crypto.randomUUID()}`,
+      idemKey: `dreaming-preview:${user.id}:${crypto.randomUUID()}`,
       preview: { content: r.data.content },
     });
     if (!out) return send(reply, { error: "dreaming_busy" }, 409);
@@ -229,6 +204,115 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
       })),
     } satisfies DreamingPreview);
   });
+
+  // ---- the admin's ----
+
+  const statusOf = (u: UserRow): DreamingUserStatus => {
+    const last = store.lastRun(u.id);
+    const st = engine.status(u.id);
+    const settings = store.settingsOf(u.id);
+    return {
+      userId: u.id,
+      rev: store.state(u.id).rev,
+      applyModeRev: proposals.modeRev(u.id),
+      name: scrubKnown(u.name),
+      active: u.active,
+      youth: u.youth,
+      enabled: settings.enabled,
+      settings,
+      customPrompt: store.promptOf(u.id).custom,
+      applyMode: u.youth ? proposals.mode(u.id) : null,
+      problem: problemOf(u.id, settings),
+      time: st.time,
+      today: st.today,
+      last: last
+        ? {
+            status: last.status,
+            code: last.code,
+            trigger: last.trigger,
+            startedAt: last.started_at,
+            counts: recordOf(last).counts,
+          }
+        : null,
+    };
+  };
+
+  const adminView = (): DreamingAdmin => {
+    const config = store.config();
+    return {
+      config,
+      configRev: store.configRev(),
+      unavailable: config.allowed.filter((a) => runner.choiceProblem(a) !== null),
+      candidates: candidates(),
+      users: users.list().map(statusOf),
+      manualRuns: deps.manualRuns,
+    };
+  };
+
+  app.get("/api/admin/dreaming", { config: ADMIN }, async (_req, reply) => send(reply, adminView()));
+
+  app.put("/api/admin/dreaming", { config: ADMIN }, async (req, reply) => {
+    const r = SaveDreamingConfigRequest.safeParse(req.body);
+    if (!r.success) return send(reply, { error: "invalid_request" }, 400);
+    // Only the fields sent change (#188 review 5): a stale page saving the token cap never turns the server back on.
+    const c: DreamingConfig = {
+      ...store.config(),
+      ...(Object.fromEntries(
+        Object.entries(r.data).filter(([, v]) => v !== undefined),
+      ) as Partial<DreamingConfig>),
+    };
+    // Only shared API key connections and their models (spec §7, D2) — or the FakeRuntime without one. A pair already
+    // allowed whose connection went away may stay (its users are paused; the admin sees it as unavailable).
+    const cands = candidates();
+    const before = store.config().allowed;
+    for (const a of c.allowed) {
+      const ok = cands.some(
+        (x) => x.runtime === a.runtime && x.id === a.connectionId && x.models.some((m) => m.id === a.model),
+      );
+      const kept = before.some(
+        (b) => b.runtime === a.runtime && b.connectionId === a.connectionId && b.model === a.model,
+      );
+      if (!ok && !kept) return send(reply, { error: "dreaming_connection_not_allowed" }, 400);
+    }
+    const seen = new Set<string>();
+    store.setConfig({
+      ...c,
+      allowed: c.allowed.filter((a) => {
+        const k = `${a.runtime}|${a.connectionId ?? ""}|${a.model}`;
+        return seen.has(k) ? false : (seen.add(k), true);
+      }),
+    });
+    engine.kick();
+    return send(reply, adminView());
+  });
+
+  /**
+   * A youth account's settings — the admin's to set (#188); everyone else sets their own. Also its 반영 방식 and its
+   * prompt (write-only: the response says only whether it is the default).
+   */
+  app.put<{ Params: { id: string } }>(
+    "/api/admin/dreaming/users/:id",
+    { config: ADMIN },
+    async (req, reply) => {
+      const r = SaveYouthDreamingRequest.safeParse(req.body);
+      if (!r.success) return send(reply, { error: "invalid_request" }, 400);
+      const u = users.byId(req.params.id);
+      if (!u) return send(reply, { error: "not_found" }, 404);
+      if (!u.youth) return send(reply, { error: "dreaming_not_youth" }, 403);
+      const { applyMode, prompt, ...given } = r.data;
+      // Only what was sent changes (a 반영 방식 or a prompt alone keeps the settings as stored).
+      const settings = mergeSettings(u.id, given);
+      const bad = Object.keys(given).length ? checkSettings(u.id, settings) : null;
+      if (bad) return send(reply, { error: bad }, 400);
+      if (prompt !== undefined && prompt !== null && holdsSecret(prompt))
+        return send(reply, { error: "dreaming_secret" }, 400);
+      store.setSettings(u.id, settings);
+      if (prompt !== undefined) store.setPrompt(u.id, prompt);
+      if (applyMode) proposals.setMode(u.id, applyMode);
+      engine.kick();
+      return send(reply, statusOf(u));
+    },
+  );
 
   if (deps.manualRuns)
     app.post<{ Params: { id: string } }>(

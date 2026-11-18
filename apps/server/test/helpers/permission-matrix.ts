@@ -494,37 +494,6 @@ APP_MATRIX.push(
   },
 );
 
-/** A 관심 종목 item of `owner` (#31): the store directly. */
-function watchItem(f: Family) {
-  return f.app.watchlist!.add(f.users.owner.id, {
-    market: "US",
-    symbol: `T${crypto
-      .randomUUID()
-      .slice(0, 6)
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, "X")}`,
-  }).id;
-}
-
-/**
- * 관심 종목 (#31, FR-7.7): what a person invests in is theirs — owner only, the admin refused like anyone else (the
- * same principle as schedules).
- */
-APP_MATRIX.push(
-  {
-    route: "GET /api/watchlist/:id",
-    expect: OWNER_ONLY,
-    fixture: watchItem,
-    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
-  },
-  {
-    route: "DELETE /api/watchlist/:id",
-    expect: { ...OWNER_ONLY, owner: 204 },
-    fixture: watchItem,
-    errors: { admin: "forbidden", shared: "forbidden", stranger: "forbidden" },
-  },
-);
-
 /** Admin-only data: every member — the son's account included — 403, the admin 200, before login 401. */
 export const ADMIN_ONLY: Record<Who, number> = {
   owner: 403,
@@ -552,7 +521,7 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/backups",
   // #144: the family-wide AGENT and the default SOUL.
   "/api/admin/instructions",
-  // #146: 기억 정리 settings, prompt, 미리 실행 (the admin's own data), status counts.
+  // #146, #188: 기억 정리 server-wide settings, allowed pairs, youth settings, status counts.
   "/api/admin/dreaming",
   // #36: Cloudflare Access sync.
   "/api/admin/access",
@@ -603,23 +572,20 @@ export const ADMIN_MATRIX: AdminRow[] = [
   { route: "GET /api/admin/instructions/:ref/versions", expect: ADMIN_BY_ID },
   { route: "GET /api/admin/instructions/:ref/versions/:version", expect: ADMIN_BY_ID },
   { route: "POST /api/admin/instructions/:ref/versions/:version/restore", expect: ADMIN_BY_ID },
-  // #146: 기억 정리 — counts and settings only (no runtime configured in the matrix app: the preview is a recorded
-  // failure, 200); the placeholder user / version is none (404).
+  // #146, #188: 기억 정리 — the server-wide switch, token cap, allowed pairs; a youth account's settings; counts only.
+  // The placeholder user is none (404). The users' own settings, prompt and 미리 실행 are `/api/dreaming…` (the
+  // caller's own only — no id in the path; youth 403, `dreaming.test.ts`).
   { route: "GET /api/admin/dreaming", expect: ADMIN_ONLY },
   {
     route: "PUT /api/admin/dreaming",
     expect: ADMIN_ONLY,
-    body: { enabled: false, time: "03:00", connectionId: null, runtime: null, model: null, tokenCap: 300000 },
+    body: { enabled: true, tokenCap: 300000, allowed: [] },
   },
-  { route: "PUT /api/admin/dreaming/users/:id", expect: ADMIN_BY_ID, body: { enabled: false } },
   {
-    route: "PUT /api/admin/dreaming/prompt",
-    expect: ADMIN_ONLY,
-    body: { content: "정리 규칙", baseVersion: 0 },
+    route: "PUT /api/admin/dreaming/users/:id",
+    expect: ADMIN_BY_ID,
+    body: { enabled: false, time: "03:00", runtime: null, connectionId: null, model: null },
   },
-  { route: "GET /api/admin/dreaming/prompt/versions", expect: ADMIN_ONLY },
-  { route: "POST /api/admin/dreaming/prompt/versions/:version/restore", expect: ADMIN_BY_ID },
-  { route: "POST /api/admin/dreaming/preview", expect: ADMIN_ONLY, body: {} },
   // #36: the matrix app has no Cloudflare token (manual mode) — nothing here reaches Cloudflare. Registration with an
   // empty body is refused before any call (400); apply/retry need a token (409); the manual "done" with a list that is
   // not the app's is stale (409). The admin's email change is requested and cancelled (their own, 200).

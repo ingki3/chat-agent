@@ -90,28 +90,6 @@ export class FinanceService {
   ) {}
 
   /**
-   * Whether a call with this input would be refused by the egress guard before anything leaves — the same decision
-   * `run` makes on its first round (the plan's exact URLs and headers through `carriesKnownSecret`). The watchlist
-   * search uses it to choose the decoy (review #111 round 4: one predicate, so no answer can tell them apart).
-   */
-  refuses(tool: FinanceToolInfo, input: Record<string, unknown>): boolean {
-    const impl = TOOL_IMPLS[tool.name];
-    if (!impl) return false;
-    const secrets = this.opts.secrets ?? {};
-    try {
-      const plan = impl.plan(input, { now: (this.opts.now ?? Date.now)(), secrets });
-      return "steps" in plan && plan.steps.some((s) => carriesKnownSecret(s, tool.name, secrets));
-    } catch {
-      return false;
-    }
-  }
-
-  /** The configured secrets' egress check on a text that is not a request (e.g. a typed ticker shown back). */
-  refusesText(text: string): boolean {
-    return carriesKnownSecret({ url: text }, "", this.opts.secrets ?? {});
-  }
-
-  /**
    * One worker job, every request approved here (#113, review #127 round 2). The worker never sends a request the
    * server has not seen in its exact wire form (worker.mjs `wireRequest`: the parsed URL, the request target, every
    * header — the cookies of the jar and captured values included): it stops before each send (`pause`, reason

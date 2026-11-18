@@ -5,6 +5,7 @@ import { errorLog } from "../db/schema.js";
 import {
   isCategory,
   isAudioCode,
+  isYoutubeCode,
   isErrorCode,
   isHttpStatus,
   isId,
@@ -76,7 +77,12 @@ export class ErrorLog {
           code:
             keep(
               (c) =>
-                isErrorCode(c) || isSkillCode(c) || isFinanceCode(c) || isPythonCode(c) || isAudioCode(c),
+                isErrorCode(c) ||
+                isSkillCode(c) ||
+                isFinanceCode(c) ||
+                isPythonCode(c) ||
+                isAudioCode(c) ||
+                isYoutubeCode(c),
               e.code,
             ) ?? "unknown",
           category: keep(isCategory, e.category) ?? "app",

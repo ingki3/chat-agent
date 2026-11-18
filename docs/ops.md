@@ -35,6 +35,7 @@
 | 웹 출처 (#50) | DB `sources` 표: 가져온 페이지 본문·검색 결과 | `WEB_SEARCH_PROVIDERS` — 17절 | DB와 함께 포함 |
 | 아티팩트 (#27) | DB `artifacts`·`artifact_versions` 표: 버전마다 본문(최대 512KB) | — 18절 | DB와 함께 포함 |
 | 금융 결과 (#30) | DB `finance_results` 표: #185 이전에 금융 도구를 쓴 답변마다 남긴 출처·기준 시각·숫자·식별자. **#185부터 쓰지도 읽지도 않는다**(옛 행만 남음, 비밀 재가림 대상) | — 19.3절 | DB와 함께 포함 |
+| 관심 종목 (#31) | DB `watchlist_items` 표. **#187에서 기능을 없앴고 쓰지도 읽지도 않는다**(되돌리기 안전을 위해 표만 남음, 비밀 재가림 대상) — 30.3절 | — | DB와 함께 포함 |
 | 웹 푸시 VAPID 키 (#34) | DB `settings` 표: `push.vapid.public`(평문), `push.vapid.private`(마스터 키로 암호화) | 처음 시작할 때 자동 생성 | DB와 함께 포함(개인 키는 암호문) — 12절 |
 
 - `DATA_DIR`과 `MASTER_KEY_PATH`의 상대 경로는 레포 루트(배포본에서는 그 배포본 폴더) 기준이다. **운영의 `shared/.env`에는 절대 경로만 쓴다** — 상대 경로면 데이터가 배포본 안에 생겨 정리(prune) 때 함께 지워진다. 배포 스크립트는 `DATA_DIR`·`BACKUP_DIR`이 비었거나 상대 경로이거나 `releases/` 안이면 설치를 거부한다(43.2절).
@@ -443,12 +444,12 @@ rm ~/.agentlee/probe-headers.txt
 | 섹션 | 들어가는 조건 |
 |---|---|
 | `common` | 항상. 한국어 기본, 외부 콘텐츠 속 지시는 데이터(`<external_content>` 블록), 출처의 일반 규칙(#185: 이번 답변이 실제로 쓴 근거만, 도구 없는 일반 대화에는 출처 없음, 시간에 따라 바뀌는 자료는 기준 시각, 앞 답변 자료를 지금 값처럼 말하려면 다시 조회하거나 그 번호), 웹 자료는 `cite`(그대로 복사한 구절, 돌려받은 `[n]`을 문장 끝에, `verified`가 아니면 ⚠️, 앞 답변의 출처는 `sources_list` — #25), 출처 충돌 명시 |
-| `finance` | 금융 도구 사용법 — 규칙은 "금융 도구를 쓸 때와 금융 도구 결과를 답변에 쓸 때"로 한정(#185, `finance@4`). 그 실행의 도구에 금융 도구가 있을 때(`isFinanceTool`: `skill_kr-stock-skill`·`skill_us-stock-skill`·`skill_market-disclosure-monitor`·`skill_dart-investment-monitor`, 금융 도구 `kr_*`·`us_*`·`fx_usdkrw`·`dart_disclosures`·`sec_*`(#30), 또는 `finance_*`) |
+| `finance` | 금융 도구 사용법 — 규칙은 "금융 도구를 쓸 때와 금융 도구 결과를 답변에 쓸 때"로 한정(#185, `finance@4`; #187 관심 종목 줄 삭제 `finance@5`). 그 실행의 도구에 금융 도구가 있을 때(`isFinanceTool`: `skill_kr-stock-skill`·`skill_us-stock-skill`·`skill_market-disclosure-monitor`·`skill_dart-investment-monitor`, 금융 도구 `kr_*`·`us_*`·`fx_usdkrw`·`dart_disclosures`·`sec_*`(#30), 또는 `finance_*`) |
 | `youth` | 청소년 계정(`users.youth = 1`, 아들)일 때만 |
 | `research` | 대화의 자료 조사 모드(`conversations.research_mode`)가 켜졌을 때. 여러 출처 비교, 부족하면 "출처가 충분하지 않아요", 사실 문장마다 검증된 `[n]`, 충돌은 출처별로 나란히(#25) |
 
 - 마지막에 오늘 날짜(Asia/Seoul)를 붙인다. 이름·이메일 같은 사용자 정보는 넣지 않는다.
-- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@5,youth@2`). #25에서 `common@2`·`research@2`로, 리뷰 #97 22차에서 `common@3`(숫자가 든 구절은 절째로 인용)으로, #149·#150에서 `common@4`(첨부가 있으면 그 파일부터 읽기, 인용 밀도 — 핵심 주장, 문단당 최대 2개, 같은 출처는 같은 번호, 앞 답 번호 이어 쓰기 규칙)와 `research@3`(문장마다 인용이 공통 지침의 밀도 규칙보다 앞섬)으로, #145에서 `common@5`(기억해줘·잊어줘 — 사용자가 직접 요청할 때만 `memory_propose`)로 올렸다. #185에서 `common@7`(출처의 일반 규칙 — 쓴 근거만, 기준 시각, 앞 자료는 다시 조회 또는 번호)과 `finance@4`(금융 도구 결과를 쓸 때로 한정, "모든 숫자에 출처" 전역 규칙 삭제)로 올렸다. #182에서 `common@8`(다이어그램 — 흐름·순서·구조·일정·관계는 글과 함께 mermaid, 지원 종류 9가지, 노드 15개 이하·짧은 라벨, 한글 라벨은 `["…"]`, 예약어 id 금지, init·click·색·HTML 라벨 금지)로 올렸다.
+- 실행 기록 `runs.instructions`에 쓴 템플릿 버전이 남는다(예: `common@5,youth@2`). #25에서 `common@2`·`research@2`로, 리뷰 #97 22차에서 `common@3`(숫자가 든 구절은 절째로 인용)으로, #149·#150에서 `common@4`(첨부가 있으면 그 파일부터 읽기, 인용 밀도 — 핵심 주장, 문단당 최대 2개, 같은 출처는 같은 번호, 앞 답 번호 이어 쓰기 규칙)와 `research@3`(문장마다 인용이 공통 지침의 밀도 규칙보다 앞섬)으로, #145에서 `common@5`(기억해줘·잊어줘 — 사용자가 직접 요청할 때만 `memory_propose`)로 올렸다. #185에서 `common@7`(출처의 일반 규칙 — 쓴 근거만, 기준 시각, 앞 자료는 다시 조회 또는 번호)과 `finance@4`(금융 도구 결과를 쓸 때로 한정, "모든 숫자에 출처" 전역 규칙 삭제)로 올렸다. #187에서 `finance@5`(관심 종목 `watchlist_get` 줄 삭제)로 올렸다. #182에서 `common@8`(다이어그램 — 흐름·순서·구조·일정·관계는 글과 함께 mermaid, 지원 종류 9가지, 노드 15개 이하·짧은 라벨, 한글 라벨은 `["…"]`, 예약어 id 금지, init·click·색·HTML 라벨 금지)로 올렸다.
 - 런타임 세션은 시작할 때의 지침을 그대로 쓰므로, `runtime_sessions.instructions_hash`가 지금 조립한 지침과 같을 때만 이어 쓴다. 날짜가 바뀌거나, 모드·계정 표시·템플릿이 바뀌면 다음 실행은 새 세션으로 시작한다(대화 기록은 서버가 다시 넘긴다).
 
 ### 14.2 계정·모드 설정
@@ -504,7 +505,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
 
 ### 15.4 사용자별 스킬 (FR-1.6)
-- 기본은 모든 스킬(`"all"`)이다. 청소년 계정은 `"all"`이어도 금융 스킬이 숨겨진다(#30, 19.4절). 어른 계정에서 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
+- 기본은 모든 스킬(`"all"`)이다. 청소년 계정은 `"all"`이어도 금융 스킬과 `youtube-audio-download`(#191, §48)가 숨겨진다(#30, 19.4절) — 관리자가 그 계정에서 이름으로 켜야 제공된다. 어른 계정에서 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
   ```
   PUT /api/admin/users/<id>/skills   {"skills": ["google-news-search-skill"]}
   PUT /api/admin/users/<id>/skills   {"skills": "all"}
@@ -1103,7 +1104,7 @@ PRD FR-8.1·8.2·8.5, FR-12.2. 엔진은 25절, 실제 실행(전용 대화에 �
 - 카드(`GET`)에는 `version` — 제안 내용과 그때 정해지는 런타임·모델·추론 강도의 해시 — 이 있다. 확인은 그 `version`을 보내고(`{version}`, 없으면 400), 서버가 지금 다시 계산한 것과 다르면(그사이 기본값을 바꿨거나 관리자가 허용 범위를 좁혀 대체가 달라짐) **409 `proposal_changed` + 지금의 카드**를 돌려주고 아무것도 만들지 않는다. 화면은 카드를 새 내용으로 바꾸고 “바뀌어 새로 고쳤어요 — 확인하고 다시 눌러 주세요”를 보인다. 같으면 카드에 보인 설정 그대로 만든다(review #108).
 - **예약 만들기** = 주인 본인 세션의 요청(`POST /api/schedule-proposals/:id/confirm`)이 `POST /api/schedules`와 같은 검사(스킬, 그때의 기본값 — 쓸 수 있는 런타임이 없으면 409 `no_usable_runtime`, 제안은 그대로)로 예약을 만든다. 한 트랜잭션에서 `proposed`→`confirmed`와 예약 id를 적으므로 두 번(탭 두 개·새로 고침) 눌러도 예약은 하나다(두 번째는 200, 같은 예약). **취소** = `dismissed`(그 뒤 확인은 409 `proposal_dismissed`, 만든 뒤 취소는 409 `proposal_confirmed`).
 - 권한: 제안은 주인만 보고 확인·취소한다(관리자·공유받은 사람·남 = 403, 권한 행렬). 공유된 대화에서 남이 보면 카드는 “불러오지 못했어요”만 보인다.
-- `FAKE_RUNTIME=1`의 FakeRuntime은 “매일/평일 (아침·저녁…) N시 (M분) … 브리핑·예약·알려·정리”를 이 도구의 실제 호출로 바꾼다(e2e “매일 아침 8시 관심 종목 브리핑”).
+- `FAKE_RUNTIME=1`의 FakeRuntime은 “매일/평일 (아침·저녁…) N시 (M분) … 브리핑·예약·알려·정리”를 이 도구의 실제 호출로 바꾼다(e2e “매일 아침 8시 시장 브리핑”).
 
 ### 28.4 확인 방법
 - 자동: `apps/server/test/schedule-ui.test.ts`(기본값, 허용 안 된 모델 만들기·수정 403, 수정 모든 칸·일정 검사·가림, 미리보기, 옵션, 비용, 도구 → 카드 → 주인 확인만 생성·한 번만, 취소, 확인 때의 기본값, 도구 거절), `apps/server/test/helpers/permission-matrix.ts`(제안 경로 주인만), `apps/web/test/schedules.test.ts`, `e2e/schedules.spec.ts`(대화 → 카드 → 만들기 → 예약 화면, 폼 미리보기·일시정지·바로 실행 이력·수정·삭제, 403).
@@ -1173,8 +1174,8 @@ PRD FR-4.4(HWP 대신 DOCX·PDF)·FR-4.7(에이전트가 만든 파일 내려받
 - e2e(Playwright)는 production 빌드라 macOS에서는 실제 샌드박스로 만들고, 샌드박스가 없는 Linux CI에서는 `e2e/docgen.spec.ts`를 건너뛴다(그 시나리오는 단위 시험이 모든 플랫폼에서 FakeRuntime·두 런타임 재생으로 덮는다).
 - 실런타임 확인: 실제 Claude·Codex 연결에서 "이 내용을 DOCX 보고서로"를 보내 칩으로 내려받아 Word·한글·미리보기에서 열리는지 본다(자동 시험은 녹화 재생).
 
-## 30. 금융 표·차트 아티팩트·관심 종목 (#31)
-PRD FR-7.3·7.5·7.6·7.7, 수용 기준 4·11, M4 완료 기준. 금융 도구 자체는 19절, 아티팩트 서빙·패널은 18절. 방식과 근거는 `docs/decisions/isolation.md` "금융 표·차트 (#31)".
+## 30. 금융 표·차트 아티팩트 (#31)
+PRD FR-7.3·7.5·7.6, 수용 기준 4·11, M4 완료 기준. 금융 도구 자체는 19절, 아티팩트 서빙·패널은 18절. 방식과 근거는 `docs/decisions/isolation.md` "금융 표·차트 (#31)".
 
 ### 30.1 `finance_chart` — 같은 데이터로 표와 차트
 - 우리 MCP 서버의 도구 `finance_chart`(두 런타임 모두). 입력: `symbols`(한·미 섞어 1–5개, `005930`·`AAPL`), `chart`(`compare` 수익률 % — 여러 종목 기본, `line` 가격 — 한 종목 기본, `candle` 한 종목 OHLC, `financials` 미국 재무 막대), `range`(`1mo`·`3mo`·`6mo`·`1y`, 기본 6개월), `currency`(한·미를 섞을 때 먼저 보일 기준, 기본 원화), `metric`·`period`(재무), `title`.
@@ -1190,11 +1191,9 @@ PRD FR-7.3·7.5·7.6·7.7, 수용 기준 4·11, M4 완료 기준. 금융 도구 
 - 환산 규칙: 각 종가를 **그 종가의 현지 날짜 이하의 가장 최근 USD/KRW 일별 종가**로 환산한다(원화는 원 단위 반올림, 달러는 센트). 그날 이전 환율이 없으면 빈 칸(추정하지 않는다). 쓰인 환율과 그 기준 시각("Yahoo Finance · 2026-11-13 17:00 ET 종가")은 행마다 표에, 최근 환율은 차트 아래에 적힌다. Yahoo의 FX 일봉은 UTC 날짜라, 끝난 날의 종가는 그날 17:00 ET(FX 하루의 끝)로, 마지막 봉은 시세의 시각(19.2 규칙)으로 표시한다.
 - 한·미가 섞이지 않고 통화도 요청하지 않으면 환율을 부르지 않는다(기준 전환도 없음).
 
-### 30.3 관심 종목 (`/watchlist`)
-- 사이드바 "⭐ 관심 종목". 내 목록만(한·미 함께, 50개까지). 한국 종목은 이름·코드로 찾고(`kr_search`, 네이버 증권), 미국 종목은 티커를 그대로 넣는다(미국 이름 검색 도구는 없다). 추가·제거.
-- API: `GET /api/watchlist`(내 목록 + 쓸 수 있는 시장 `markets`), `POST /api/watchlist {market, symbol, name?}`(중복 409 `watchlist_duplicate`, 50개 넘으면 409 `watchlist_full`, 시장·형식이 안 맞거나 알려진 비밀이면 400 `watchlist_bad_symbol`), `GET /api/watchlist/search?q=`, `GET`·`DELETE /api/watchlist/:id`. **주인만** — 관리자도 남의 항목은 403(예약과 같은 원칙, 권한 행렬).
-- DB: `watchlist_items`(0023 마이그레이션; 사용자를 지우면 함께 지워짐). `name`은 검색에서 고른 표시 이름(제3자 글)이라 저장할 때 알려진 비밀을 가리고 재가림 대상이다(`secrets/columns.ts`).
-- **종목 코드와 알려진 비밀(리뷰 #111):** 종목 코드는 가리면 코드가 아니게 되므로 그대로 저장한다. 그래서 저장 전 검사가 하나다: 시장 형식(한국 6자리, 미국 티커 **7자 이하** — 시장 규칙이 아니라 관심 종목만의 의도적인 상한으로, 알려진 비밀의 최소 길이 8보다 짧게 잡았다. Nasdaq은 8자 기호도 허용하므로 드문 8자 종목은 관심 종목에 담을 수 없다(금융 도구로는 조회된다))과 알려진 비밀(그대로든 공통 인코딩이든 — 공통 판정기 `scrubKnown`)을 **둘 다 늘 검사**하고, 어느 쪽이 걸려도 같은 **400 `watchlist_bad_symbol`**이다(응답 본문·경로 같음 — 로그인한 가족이 비밀 후보를 넣어 보고 알아낼 수 없게). 검색도 같은 검사를 통과한 티커만 결과로 돌려준다. 저장한 뒤에 비밀로 등록된 코드(다른 경로로 들어온 행 등)는 백그라운드 재가림이 **그 행을 지운다**(`rescrub.ts` `removeOn`). 이름 칸은 지금처럼 가린다.
+### 30.3 관심 종목 — 제거됨 (#187), 재가림·송신 가드
+- **관심 종목은 #187에서 제거했다**(사용자 결정 2026-11-18: 기본은 일반 채팅 에이전트). 사이드바 바로가기·화면·`/api/watchlist*`·MCP 도구 `watchlist_get`·금융 지침의 관심 종목 줄(`finance@5`)이 없다. 예전 주소 `/watchlist`는 홈(`/`)으로 넘어간다. 종목은 대화에서 이름·코드로 말하면 금융 도구가 조회한다.
+- **`watchlist_items` 표(0023)는 되돌리기 안전을 위해 남겨 둔다**(두 단계 제거, #190의 `finance_results`와 같은 방식). 이번 릴리스의 코드는 이 표를 읽지도 쓰지도 않는다(라우트·저장소·도구 없음 — 스키마 정의와 비밀 재가림 규칙만 이름을 안다). 지우는 마이그레이션을 이번에 넣지 않은 이유: 0033으로 표를 지운 뒤 코드만 #187 이전으로 되돌리면(손으로든 릴리스 스크립트의 자동 복귀든) 그 코드의 관심 종목 목록 조회와 `StoredRescrub.pass`가 `no such table: watchlist_items`로 실패하고, 재가림의 뒤 단계(기억·기억 정리 표, 파일·실행 이벤트)까지 멈춘다(리뷰 #194 1차에서 재현). 옛 행(운영은 0행, 2026-11-18 읽기 전용 확인)은 사용자와 함께 지워지고, 나중에 비밀로 등록된 값은 재가림이 **그 자리에서 가린다**(`secrets/columns.ts` — 행을 지우던 `removeOn`은 이 표만 썼으므로 없앴다). 표를 지우는 마이그레이션은 #187 이전 릴리스로 되돌릴 일이 없어진 뒤의 릴리스에서 따로 한다(후속 이슈).
 - **재가림과 파일의 흔적(리뷰 #111, #78 공통):** DB 연결은 늘 `secure_delete = ON`이다(지우거나 덮어쓴 칸을 0으로). 재가림이 행을 가리거나 지우면 **같은 트랜잭션에서** `settings`에 `secrets.file_cleanup_pending` 표시를 남기고, 끝에 (`auto_vacuum = INCREMENTAL`이면 `incremental_vacuum` 뒤) `wal_checkpoint(TRUNCATE)`로 옛 값이 남은 WAL 프레임을 비우고 DB 파일의 그 쪽을 새 내용으로 덮는다. 성공한 뒤에만 표시를 지운다. 다른 연결(예: `sqlite3` 셸)이 옛 스냅샷을 읽고 있으면 기다리지 않고(바쁨 대기 0 — 서버가 멈추거나 백업·복원의 데이터 잠금과 엉키지 않게) 로그 `secrets.rescrub_checkpoint_busy`를 남기고 백오프로 다시 시도하며, 그동안 `idle()`은 끝나지 않는다. **서버가 그 사이 다시 켜져도** 표시가 남아 있으면 시작할 때 이어서 한다.
 - **한 번의 압축(리뷰 #111 3–5차):** `secure_delete` 전에 쓴 내용이 남긴 빈 공간(짧게 고친 긴 제목, 지운 행)은 위 설정만으로는 지워지지 않아 한 번 `VACUUM`(살아 있는 행만으로 파일을 다시 씀)하고 파일을 `auto_vacuum = INCREMENTAL`로 바꾼다. 상태는 `settings`의 `storage.secure_delete_compacted`에 남는다:
   - 없음·`needed` — `VACUUM`을 해야 한다(아직 안 함, 실패, 도중에 죽음). `VACUUM` 직전에 `needed`와 `secrets.file_cleanup_pending`을 함께 남긴다.
@@ -1203,16 +1202,15 @@ PRD FR-7.3·7.5·7.6·7.7, 수용 기준 4·11, M4 완료 기준. 금융 도구 
   - 서버가 시작할 때(데이터 폴더 잠금을 잡은 채, `buildApp` 안에서, 요청·백업 전 — 백업의 `VACUUM INTO`와 같은 연결이라 겹치지 않음) 먼저 해 본다. checkpoint가 다른 연결 때문에 바쁘거나 `VACUUM`이 실패하면 **실행 중인 서버의 재가림 고리**가 이어서 한다: checkpoint는 재가림의 백오프로, `VACUUM`은 1분부터 두 배씩 최대 1시간 간격으로 다시 한다. 그동안 `idle()`은 끝나지 않고, 다시 시작해도 상태가 남아 있어 이어진다. 로그 `storage.compacted`(걸린 시간, `done`/`running`).
   - 100MB 시험 DB에서 약 0.5초, 499MB에서 약 2.1초(리뷰 측정). 그 뒤 재가림은 전체 `VACUUM` 없이 `incremental_vacuum`으로 빈 쪽만 돌려준다(그 공간은 이미 0).
   - **빈 디스크 공간:** `VACUUM`은 DB 파일 크기의 **최대 약 2배**의 여유 공간이 필요하다(임시 사본 + WAL). 모자라면(`SQLITE_FULL`·`ENOSPC`) 서버는 **그대로 켜지고**, 시도마다 한 번 `storage.compact_failed`(오류 종류만)를 남기며, 상태는 `needed`로 남아 위 간격으로 다시 한다 — 공간을 비우면 다음 시도에서 끝난다(서버를 다시 시작하지 않아도 됨). 끝날 때까지는 옛 빈 공간에 예전 값이 남아 있을 수 있다.
-- **금융 송신 가드(리뷰 #111 2·3차):** 금융 도구의 모든 송신 단계(URL·헤더)를 보내기 전에 공통 판정기(#113부터 `secrets/egress.ts` `carriesSecret` — 웹 도구와 같은 함수, §40)로 본다 — 알려진 비밀이 그대로·인코딩으로·끝이 잘린 채 들어 있으면 작업을 만들지 않고 `finance_bad_input`. 설정 비밀은 **제자리에서만** 허용한다: OpenDART 키는 `dart_disclosures`가 OpenDART 호스트로 보내는 `crtfc_key` 매개변수로만, SEC 연락처는 `sec_*` 도구가 SEC 호스트로 보내는 `user-agent` 헤더로만. 다른 도구·호스트·칸에 나오면 거절한다 — 16자 이상 일부라도, 그대로든 URL 인코딩이든, 그리고 URL 구성 요소·헤더 값의 base64·base64url·hex·퍼센트 토큰을 한 번 풀어 본 글(전송 이스케이프 한 겹 포함, 공통 판정기와 같은 인코딩 범위)에서도(리뷰 #111 5차: 키를 반으로 나눠 base64로 보내는 경우). **가드의 범위(리뷰 #111 6차, 결정):** **한 요청 안에서** (1) 알려진 비밀 전체가 공통 인코딩 중 하나로 들어 있거나 (2) 설정 비밀의 16자 이상 연속 구간이 그대로·풀어 본 글에 들어 있으면 거절한다. 여러 요청에 16자보다 짧은 조각으로 나눠 보내 바깥에서 다시 합치는 것은 **범위 밖**이다 — 그렇게 하려면 보내는 쪽이 이미 그 값을 알아야 하는데 모델은 알려진 비밀을 받지 않으므로(결과·맥락에서 지워짐) 보호된 곳에서 보호되지 않은 곳으로 옮겨지는 것이 없고, 조각은 1자까지 줄일 수 있어 막을 경계도 없다. 관심 종목 검색어에 비밀이 들어 있으면 **보통 검색과 똑같은 길**(같은 처리 칸, 같은 작업자 호출과 오류 처리)로 고정된 미끼 검색어(`agentlee decoy no match`)를 보내고 결과는 버린다 — 바쁨(429)·연결 실패(502)까지 같은 모양의 다른 검색어와 응답이 같다.
-- 대화에서 "내 관심 종목" → `watchlist_get`(토큰 사용자의 목록만, 이름은 `<external_content>` 블록). 금융 지침(`finance@4`)이 이 도구와 `finance_chart`를 쓰라고 한다.
+- **금융 송신 가드(리뷰 #111 2·3차):** 금융 도구의 모든 송신 단계(URL·헤더)를 보내기 전에 공통 판정기(#113부터 `secrets/egress.ts` `carriesSecret` — 웹 도구와 같은 함수, §40)로 본다 — 알려진 비밀이 그대로·인코딩으로·끝이 잘린 채 들어 있으면 작업을 만들지 않고 `finance_bad_input`. 설정 비밀은 **제자리에서만** 허용한다: OpenDART 키는 `dart_disclosures`가 OpenDART 호스트로 보내는 `crtfc_key` 매개변수로만, SEC 연락처는 `sec_*` 도구가 SEC 호스트로 보내는 `user-agent` 헤더로만. 다른 도구·호스트·칸에 나오면 거절한다 — 16자 이상 일부라도, 그대로든 URL 인코딩이든, 그리고 URL 구성 요소·헤더 값의 base64·base64url·hex·퍼센트 토큰을 한 번 풀어 본 글(전송 이스케이프 한 겹 포함, 공통 판정기와 같은 인코딩 범위)에서도(리뷰 #111 5차: 키를 반으로 나눠 base64로 보내는 경우). **가드의 범위(리뷰 #111 6차, 결정):** **한 요청 안에서** (1) 알려진 비밀 전체가 공통 인코딩 중 하나로 들어 있거나 (2) 설정 비밀의 16자 이상 연속 구간이 그대로·풀어 본 글에 들어 있으면 거절한다. 여러 요청에 16자보다 짧은 조각으로 나눠 보내 바깥에서 다시 합치는 것은 **범위 밖**이다 — 그렇게 하려면 보내는 쪽이 이미 그 값을 알아야 하는데 모델은 알려진 비밀을 받지 않으므로(결과·맥락에서 지워짐) 보호된 곳에서 보호되지 않은 곳으로 옮겨지는 것이 없고, 조각은 1자까지 줄일 수 있어 막을 경계도 없다. (예전 관심 종목 검색의 미끼 검색어 경로는 #187에서 함께 지웠다. 같은 미끼 `SEARCH_DECOY`는 `web_search`가 쓴다 — §40.)
 
 ### 30.4 누가 쓰나 (19.4와 같은 규칙)
-- `finance_chart`·`watchlist_get`은 `kr-stock-skill`이나 `us-stock-skill` 중 하나라도 쓸 수 있는 사용자에게만 보인다. 청소년 계정(금융 숨김, 19.4)·서버 허용 목록(#35)에서 둘 다 꺼진 경우에는 목록에도 없고 불러도 `finance_not_allowed`.
-- 호출할 때 부분마다 다시 검사한다: 한국 종목 → `kr-stock-skill`, 미국 종목 → `us-stock-skill`, 환율 → `kr-stock-skill`. `watchlist_get`은 쓸 수 있는 시장의 종목만 준다. 관심 종목 화면도 같은 검사(`markets`가 비면 "이 계정은 금융 기능을 쓸 수 없어요").
+- `finance_chart`는 `kr-stock-skill`이나 `us-stock-skill` 중 하나라도 쓸 수 있는 사용자에게만 보인다. 청소년 계정(금융 숨김, 19.4)·서버 허용 목록(#35)에서 둘 다 꺼진 경우에는 목록에도 없고 불러도 `finance_not_allowed`.
+- 호출할 때 부분마다 다시 검사한다: 한국 종목 → `kr-stock-skill`, 미국 종목 → `us-stock-skill`, 환율 → `kr-stock-skill`.
 
 ### 30.5 확인 방법
-- `pnpm vitest run apps/server/test/finance-chart.test.ts`(한 데이터 → 표·차트, 차트 끝점 = 표 값(두 기준·가격·캔들·재무), 행마다 출처·기준 시각, 환율 날짜 규칙, 기준 전환·확대·툴팁, 이스케이프), `apps/server/test/finance-chart-runs.test.ts`(**M4 완료 기준**: "AAPL, 005930 6개월 비교 차트"를 Claude Code·Codex 녹화 프로토콜 재생(#25/#48 방식, 실제 `finance_chart` 호출)과 FakeRuntime으로 — 표·차트 아티팩트, 표 부분, 출처·기준 시각, 면책; 숨김 계정·허용 목록·부분 권한; 관심 종목 API).
-- `E2E_PORT=3118 pnpm e2e e2e/finance-chart.spec.ts`(데스크톱·모바일: 표 부분 정렬, 카드 2개, 메모, 패널의 차트 기준·확대 전환과 툴팁, 관심 종목 검색·추가·제거, 청소년 계정 안내).
+- `pnpm vitest run apps/server/test/finance-chart.test.ts`(한 데이터 → 표·차트, 차트 끝점 = 표 값(두 기준·가격·캔들·재무), 행마다 출처·기준 시각, 환율 날짜 규칙, 기준 전환·확대·툴팁, 이스케이프), `apps/server/test/finance-chart-runs.test.ts`(**M4 완료 기준**: "AAPL, 005930 6개월 비교 차트"를 Claude Code·Codex 녹화 프로토콜 재생(#25/#48 방식, 실제 `finance_chart` 호출)과 FakeRuntime으로 — 표·차트 아티팩트, 표 부분, 출처·기준 시각, 면책; 숨김 계정·허용 목록·부분 권한), `apps/server/test/watchlist-removal.test.ts`(`watchlist_items`는 남음·지우는 마이그레이션 없음, 서버 코드는 스키마·재가림 규칙 말고는 이 표를 모름, 옛 행의 재가림, 옛 API 경로 404).
+- `E2E_PORT=3118 pnpm e2e e2e/finance-chart.spec.ts`(데스크톱·모바일: 표 부분 정렬, 카드 2개, 메모, 패널의 차트 기준·확대 전환과 툴팁, 사이드바에 관심 종목 없음·예전 주소 `/watchlist` → 홈).
 - **합성 데이터:** 실제 녹화는 사용자의 `OPENDART_API_KEY`·`SEC_USER_AGENT`와 네트워크 실행(19.5)을 기다린다. 그때까지 시험과 `FAKE_RUNTIME=1` 서버는 `apps/server/src/runtime/fake-finance.ts`의 **합성 일별 시세**(AAPL·NVDA·MSFT·005930·000660·KRW=X, 고정 시드 랜덤 워크)로 금융 도구의 URL에 답한다. `FAKE_RUNTIME=1`에서는 이 URL 말고는 금융 요청이 모두 `finance_unreachable`이다(합성 숫자가 실제 숫자와 섞이지 않고 네트워크로 나가지 않는다). 운영 서버(`FAKE_RUNTIME` 없음)는 이 파일을 쓰지 않는다.
 - 실데이터 확인(운영 Mac, 네트워크): 실제 런타임으로 "AAPL, 005930 6개월 비교 차트"를 보내고 표·차트의 마지막 종가가 네이버 증권·Yahoo Finance 화면의 그날 종가와 같은지, 표의 환율 열이 Yahoo `KRW=X` 일별 종가와 같은지 본다. 네이버 가격 API를 60행씩 여러 쪽으로 부르는 부분(6개월 = 3쪽)은 실제 응답으로 아직 확인하지 않았다 — 처음 실행 때 행 수(약 120)를 확인한다.
 
@@ -1742,7 +1740,7 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 ### 40.2 막히면
 - **모델에게는 보통 답처럼 보인다**(리뷰 #127 1차: 어떤 값이 비밀인지 답으로 가려낼 수 없게).
   - `web_fetch`: 다른 정책 거부와 같은 `web_blocked`. 외부 요청·이름 해석·작업자 프로세스는 생기지 않는다(리다이렉트 홉이면 그 앞 홉까지만 나갔다).
-  - `web_search`: 관심 종목 검색(§30)과 같은 미끼 방식 — 검색어 대신 고정 미끼(`agentlee decoy no match`, `SEARCH_DECOY`)가 **보통 검색과 같은 길**(같은 제공자 순서·대체·오류)로 나가고, 결과는 버린 채 모델의 검색어로 "결과 없음" 답을 준다. 제공자가 모두 실패하면 보통 검색과 같은 오류 코드다. 출처는 저장하지 않는다.
+  - `web_search`: 미끼 방식(처음엔 관심 종목 검색용, #111 — 그 검색은 #187에서 제거) — 검색어 대신 고정 미끼(`agentlee decoy no match`, `SEARCH_DECOY`)가 **보통 검색과 같은 길**(같은 제공자 순서·대체·오류)로 나가고, 결과는 버린 채 모델의 검색어로 "결과 없음" 답을 준다. 제공자가 모두 실패하면 보통 검색과 같은 오류 코드다. 출처는 저장하지 않는다.
   - **남는 차이(받아들인 한계):** `web_fetch`는 요청을 보내지 않으므로 보통 가져오기보다 빨리 끝난다. 한 글자 바꾼 URL은 실제로 가져와지므로 둘을 비교하면 막혔다는 것은 알 수 있다 — 막는 장치라면 피할 수 없는 차이다. 그래도 알 수 있는 것은 "보낸 글이 등록된 값(또는 그 16자)을 담고 있다"뿐이고, 그 값을 미리 알아야 한다(모델은 알려진 비밀을 받지 않는다).
 - 로그: 호출마다 `web.finished`(도구 이름, `webCode: web_secret_blocked`, 소요 시간, ID) — 이유는 로그에서만 보인다. URL·호스트·검색어·비밀은 남지 않는다(§17.3).
 - 정상 사용에서 보이면: 대화에 비밀(게이트 코드, API 키 조각)을 붙여 넣고 그것으로 검색·가져오기를 시킨 경우다. 비밀을 바꾸거나(§3), 그 글을 빼고 다시 묻는다.
@@ -2040,25 +2038,26 @@ PRD FR-16.4·16.7, spec §3–§5·§10.3.
 - **로그**: `memory.proposed`(도구 이름·`memoryCode`·소요 시간·ID — 항목·메시지 글 없음).
 - **FakeRuntime 명령**(e2e·수동 확인): `기억해줘: …`(MEMORY), `나에 대해 기억해줘: …`(USER), `기억 <n>번 잊어줘`, `기억 <n>번 고쳐줘: …`, `/memory-inject`(주입 페이지를 읽고 그 지시대로 제안 — 서버가 막는지 확인), `/memory-raw <json>`(`runtime/fake-memory.ts`).
 
-### 44.6 기억 정리 — Dreaming (#146)
+### 44.6 기억 정리 — Dreaming (#146, 사용자별 설정 #188)
 
 PRD FR-16.5·16.6·16.7·16.8, spec §3–§10. 코드: `apps/server/src/dreaming/`(`store.ts` 표, `input.ts` 입력·커서, `prompt.ts` 고정 규칙·출력 형식, `validate.ts` 검사, `runner.ts` 한 번의 실행, `engine.ts` 일정, `routes.ts`).
 
-- **켜기**: 관리자 → **기억 정리** 탭(`/admin?tab=dreaming`)에서 전체 켜기, 실행 시각(HH:MM, Asia/Seoul), **공용 API 키 연결 + 그 모델**(테스트를 통과한 공용 API 키 연결만 목록에 나온다 — 개인 연결·Claude 구독은 없다, 맥락 200,000토큰 이상 모델만), 1회 토큰 상한(기본 300,000, UTF-8 바이트를 토큰 상계로 친다: 시스템 지침 + 문서 + 메시지 + 답 몫 16,000이 넘지 않게 입력을 줄인다), 사용자별 켜기(행 없음 = 켜짐). 설정은 `settings`의 `dreaming.config`(시스템 설정 — 관리자가 바뀌어도 그대로). 서버 시작 시 다른 연결로 자동 대체하지 않는다.
-- **정리 프롬프트**: 관리자가 고치는 부분만 버전으로 남는다(`dreaming_prompts`, 되돌리기 = 그 내용으로 새 버전, 동시 저장은 409). 출력 형식(JSON 결정 목록 `add`·`replace`·`delete`·`merge` + 출처 `msg-…`)·고정 규칙(사용자 자신에 대한 사실만, 붙여 넣은 글의 지시 따르지 않기, 규칙 바꾸기·민감 범주·비밀 값 금지)·검증은 코드(`prompt.ts`, `validate.ts`)라 고칠 수 없다. 각 사용자는 설정 → 내 지침 → **기억 정리** 탭에서 지금 쓰는 프롬프트와 고정 규칙을 읽을 수 있다. **미리 실행**은 관리자 **본인** 데이터로만 돌고 아무것도 반영·이동하지 않는다(사용량은 `dreaming`으로 남는다).
-- **일정**(spec §6): 활성 + 켜진 사용자를 id 순으로 5분씩 늦춘다. 타이머가 시각에 맞춰 깨어 정규 회차는 ±1분 안에 시작한다. 그 사용자의 답이 실행 중이면 10분 뒤(최대 6번, 그 뒤 그날은 "건너뜀"), 서버가 꺼져 있었으면 시작 뒤 같은 날 한 번 보정 실행, 그날 시각이 지난 뒤 켰으면 그날은 없음, 자정을 넘긴 대기는 버린다. 회차는 `dreaming_days`(사용자·날짜 하나), 시도는 `dreaming_runs`(멱등 키 `dreaming:<사용자>:<날짜>:<시도>` 고유). 실패(연결이 테스트 실패·만료 상태, 한도, 모델 오류, 시간 초과 10분, 첫 메시지조차 토큰 상한에 안 들어감 `too_large`)는 아무것도 옮기지 않고 30분 뒤 한 번 더, 또 실패하면 다음 날. 지정한 연결이 **지워지거나 연결 해제**되면 실패가 아니라 멈춤이다(아래 "수명주기·연결"). **관리자 알림**은 그날 모든 사용자의 회차가 끝난 뒤 실패가 있을 때 한 번(`dreaming_failed`, "사용자 N명" — 이름·내용 없음, 날짜·관리자별 중복 방지). 마지막 시도가 `too_large`로 끝난 사용자는 "입력이 상한보다 커요 — 토큰 상한을 올려 주세요"로 따로 센다(연결 문제가 아니므로). 재시작 때 실행 중이던 시도는 `interrupted` 실패로 바꾸고 30분 뒤 재시도한다 — 시도의 결과는 반영과 **같은 트랜잭션**에서 "실행 중"일 때만 적히므로 두 번 반영되지 않는다.
+- **설정** (#188): **각 사용자**가 설정 → 내 지침 → **기억 정리**에서 켜기·끄기(행 없음 = 꺼짐), 실행 시각(HH:MM, Asia/Seoul), **연결·모델**(관리자가 허용한 것 중에서만), 정리 프롬프트를 정한다(`dreaming_users`의 `enabled`·`time`·`runtime`·`connection_id`·`model`·`prompt`). **청소년 계정**은 읽기만 하고(기억 반영 방식 포함 — `PUT /api/memory-prefs`도 403, `GET`은 `locked: true`) 관리자가 관리자 → 기억 정리 탭의 사용자별 상태 표에서 켜기·시각·연결·모델·반영 방식·정리 프롬프트(쓰기 전용)를 바꾼다. 관리자 → **기억 정리** 탭(`/admin?tab=dreaming`)에는 **서버 전체 스위치**(끄면 아무도 돌지 않음, 각자 설정은 그대로), **사용자가 고를 수 있는 공용 API 키 연결·모델**(테스트를 통과한 공용 API 키 연결만 후보로 나온다 — 개인 연결·Claude 구독은 없다, 맥락 200,000토큰 이상 모델만), 1회 토큰 상한(기본 300,000, UTF-8 바이트를 토큰 상계로 친다: 시스템 지침 + 문서 + 메시지 + 답 몫 16,000이 넘지 않게 입력을 줄인다)과 사용자별 상태만 남았다 — 시스템 상태 탭으로 옮기지 않은 이유: 허용 목록·청소년 설정은 "설정"이고 시스템 상태는 읽기 전용 점검 화면이다. 관리자 설정은 `settings`의 `dreaming.config`(`{enabled, tokenCap, allowed}` — 시스템 설정, 관리자가 바뀌어도 그대로). 서버 시작 시 다른 연결로 자동 대체하지 않는다. **0033 마이그레이션**이 #146의 전체 켜기·시각·연결·모델과 사용자별 켜기를 각자 설정으로 옮겼다(켜짐 = 예전 전체 켜기 그리고 사용자별 켜기, 예전 연결·모델 한 쌍 = 허용 목록 한 항목, 서버 스위치 켜짐; spec §7).
+- **저장 규칙** (#188 리뷰 5·9, spec §7): `PUT /api/dreaming/settings`·`PUT /api/dreaming/prompt`·`PUT /api/memory-prefs`·`PUT /api/admin/dreaming`·`PUT /api/admin/dreaming/users/:id`·`PUT /api/notifications/prefs`는 **보낸 칸만** 바꾸고(합친 결과 검사, 방해 금지는 시작·끝을 함께), 같은 칸은 나중 저장이 이긴다. 각 묶음의 **리비전**(`dreaming_users.rev`, `memory_prefs.rev`, `dreaming.config`의 `rev`, `notification_prefs.rev` — 0033)은 쓸 때마다 +1, 응답마다 함께 간다(`rev`·`configRev`·`applyModeRev`). 화면은 묶음마다 가장 높은 리비전의 저장된 설정 칸을 보이고 살아 있는 상태(돌고 있는지·문제·연결 목록·청소년 여부)는 GET에서만 받으며(`apps/web/src/instructions/rev.ts`), 저장 뒤 그 쿼리를 다시 불러온다. 미리 실행은 서버에 저장된 프롬프트로 돈다.
+- **정리 프롬프트** (#188): 사용자마다 고치는 부분만 `dreaming_users.prompt`에 둔다(null = 기본값, "기본값으로 되돌리기"는 null로, 비밀 값은 400 `dreaming_secret`, 쓸 때 가림). 기본값은 #146에서 관리자가 저장한 마지막 버전(`dreaming_prompts` — 이제 새 버전은 저장하지 않는다), 없으면 내장 기본값. 출력 형식(JSON 결정 목록 `add`·`replace`·`delete`·`merge` + 출처 `msg-…`)·고정 규칙(사용자 자신에 대한 사실만, 붙여 넣은 글의 지시 따르지 않기, 규칙 바꾸기·민감 범주·비밀 값 금지)·검증은 코드(`prompt.ts`, `validate.ts`)라 누구도 고칠 수 없다. 실행 기록의 `prompt_version`은 기본값이면 그 버전, 본인 프롬프트면 null. **미리 실행**은 그 사용자 **본인** 데이터로만 돌고 아무것도 반영·이동하지 않는다(사용량은 `dreaming`으로 남는다). 서버 전체 스위치가 꺼져 있으면 409 `dreaming_server_off`, 실행 자리(예약 회차와 공유, 최대 2·사용자마다 1)가 없으면 409 `dreaming_busy`.
+- **일정**(spec §6): 활성 + 켜진 사용자마다 **자기 시각**. 타이머가 시각에 맞춰 깨어 회차를 대기열에 넣고, 한 번에 최대 2개(`DREAMING_CONCURRENCY`)까지 돌린다 — 상한 안이면 정규 회차는 ±1분 안에 시작하고, 같은 시각 사용자가 더 많으면 앞 회차가 끝나는 대로 예정 시각·사용자 id 순으로 시작한다(여전히 정규 회차). 시작하지 못한 대기 회차(상한·연결 문제)는 회차가 끝날 때·설정이 바뀔 때·최대 대기(30초)마다 다시 본다(빈 반복 없음). 그 사용자의 답이 실행 중이면 10분 뒤(최대 6번, 그 뒤 그날은 "건너뜀"), 서버가 꺼져 있었으면 시작 뒤 같은 날 한 번 보정 실행, 그날 시각이 지난 뒤 켰으면 그날은 없음, 자정을 넘긴 대기는 버린다. 회차는 `dreaming_days`(사용자·날짜 하나), 시도는 `dreaming_runs`(멱등 키 `dreaming:<사용자>:<날짜>:<시도>` 고유). 실패(연결이 테스트 실패·만료 상태, 한도, 모델 오류, 시간 초과 10분, 첫 메시지조차 토큰 상한에 안 들어감 `too_large`)는 아무것도 옮기지 않고 30분 뒤 한 번 더, 또 실패하면 다음 날. 지정한 연결이 **지워지거나 연결 해제**되면 실패가 아니라 멈춤이다(아래 "수명주기·연결"). **실패 알림**(#188)은 그날 마지막 시도가 실패한 **그 사용자 본인**에게 한 번(`memory_failed`, 고정 이유 — `too_large`면 "관리자에게 상한을 올려 달라고 하세요", 연결 문제, 그 밖; 사용자·날짜별 중복 방지, 설정 → 알림에서 끌 수 있음 `notification_prefs.memory_failed`). 관리자에게는 허용한 공용 연결이 지워지거나 끊겨 그것을 고른 켜진 사용자가 있을 때만 하루 한 번(`dreaming_failed`, "사용자 N명" — 이름·내용 없음, 날짜·관리자별 중복 방지). 재시작 때 실행 중이던 시도는 `interrupted` 실패로 바꾸고 30분 뒤 재시도한다 — 시도의 결과는 반영과 **같은 트랜잭션**에서 "실행 중"일 때만 적히므로 두 번 반영되지 않는다.
 - **입력**(spec §3·§6): 처리 순번 `memory_message_seq`(사용자 메시지가 활성 기록에 들어갈 때 — 수정은 새 revision 삽입 — 트리거 `messages_memory_seq`가 사용자별 카운터 `memory_seq_counters`에서 번호를 준다. 번호는 다시 쓰지 않는다. 0031이 기존 메시지에 시각 순으로 번호를 매겼다). 사용자 본인 대화(예약 대화·포크 사본 제외)의 활성 사용자 메시지 **본문 글만**(첨부·추출 글·도구 결과·답변 없음), 알려진 비밀 값은 다시 가림. 다시 처리 대기열(`dreaming_queue`, 문서별)을 먼저, 그다음 체크포인트(`dreaming_users.checkpoint`) 뒤 신규를 순번대로 60,000자까지. 메시지 하나가 60,000자를 넘으면 앞 60,000자만(처리된 것으로 본다, 실행 기록 `cut`). 그 밖에는 잘라 넣지 않는다 — 메시지는 요청에 들어갈 JSON 항목 그대로의 바이트로 세고, 다음 메시지가 통째로 들어가지 않으면 거기서 멈추며(체크포인트는 그 앞), 첫 메시지조차 토큰 상한에 안 들어가면 `too_large` 실패(체크포인트 그대로). 보내기 직전에 실제 요청 바이트를 한 번 더 확인한다. 체크포인트는 **실제로 넣은 마지막 신규 메시지**로만, 앞으로만 간다. 멈췄다(비활성화·끔) 다시 돌 때와 첫 실행에는 7일보다 오래된 메시지를 건너뛴다(`skippedOld`). 대상이 없으면 모델을 부르지 않고 "건너뜀".
 - **세션**: 대상 사용자의 폴더(`runtimes/<연결>/<사용자>/`)에서 **도구·MCP 없이** 일회용 세션 하나(`StartContext.systemTask = "dreaming"` — 어댑터의 연결 해석기가 `ConnectionStore.resolveSystem`으로 공용·API 키·통과·연결됨만 본다, 그 사용자의 런타임 허용 목록과 무관). 끝나면 성공·실패 모두(세션이 생긴 뒤 `start()`가 실패한 경우도 — `sessionStarted`로 id를 받아 둔다) `deletion_jobs`의 고아 세션 작업으로 `RuntimeAdapter.forget`. 사용량은 시도마다 대상 사용자·공용 연결의 `dreaming`(`conversation_id` 없음).
 - **검증**(spec §4, 고정): 형식(읽을 수 없음·모르는 동작·없는 항목 id·같은 항목 두 번·문서를 넘는 합치기·결정 50개 초과) → **실행 전체** 거부. 출처(입력에 없는 `msg-…`, 그 문서에 쓸 수 없는 대기열 메시지)·비밀 값·규칙 바꾸기(서버 키워드 + 모델 `flags: rule_change`)·민감 범주(키워드 + `flags: sensitive`, 지우거나 고칠 옛 줄도 본다)·변화 없음 → **그 결정**. 손실률(25% 통과, 초과 거부)·크기 → **그 문서의 결정 전체**. 거부 건수는 종류별로 실행 기록에(글 없음).
 - **반영**(spec §5): 결정 묶음은 #145와 같은 `memory_proposals`(`origin = 'dreaming'`, 대화 없음) + `memory_proposal_decisions`(`merge`는 `merge_ids`). 검토 후 반영이면 설정 → 내 지침 → 기억 정리의 카드에서 결정별 반영·거절·모두 반영, 자동 반영이면 바로 반영(문서마다 버전 하나, 주체 **기억 정리**) + 되돌리기. 자동 반영이라도 출처 메시지 자체가 규칙 바꾸기 문장을 담고 있으면(붙여 넣은 글의 지시, spec §3.5) 그 결정은 카드로 남는다(`forced = 'suspicious'`). 반영 직전에 출처(삭제·수정)와 문서 버전을 다시 본다 — 모델이 생각하는 사이 문서가 바뀌었으면 그 문서 결정은 버리고 그 입력을 그 문서의 대기열로. 묶음은 만들 때 문서 버전에 고정되고, 다른 변경 뒤 반영하면 만료(409) + 남은 결정의 출처를 대기열로. 다음 실행은 문서가 바뀐 대기 묶음을 만료시키고 그 출처를 입력에 넣는다 — 만료·대기열 변경은 실행 결과와 **같은 트랜잭션**에서만 적히므로 실패한 실행은 아무것도 바꾸지 않는다. 사용자가 거절한 변경(문서·동작·새 줄·대상 항목의 지문)은 그 메시지가 다른 이유로 다시 처리돼도 다시 제안하지 않는다(거부 종류 `rejected`). **대기 중인 기억 정리 제안이 있는 문서는 다음 실행이 건드리지 않는다** — 그 문서는 `editable: false`로 보내고, 넣은 신규 메시지는 그 문서용 대기열에 남긴다. 거절한 결정의 출처는 대기열에 넣지 않는다. 묶음·문서·버전·대기열·체크포인트·실행 기록은 한 트랜잭션.
-- **알림**(spec §8): "기억 정리 제안 N개가 있어요"(`memory_proposal`), "기억 N개를 정리했어요"(`memory_applied`) — 사용자는 설정 → 알림 → 기억 정리 알림에서 끌 수 있다(`notification_prefs.memory_proposals`·`memory_applied`). 누르면 설정 → 내 지침 → 기억 정리.
-- **열람 범위**: 관리자 화면은 사용자별 오늘 상태·마지막 결과·건수만(`GET /api/admin/dreaming`). 제안 카드(`/api/memory-proposals/:id`)는 주인만 — 관리자 403. `DREAMS.md`(설정 → 내 지침 → 기억 정리)는 그 사용자의 실행 기록(시각·결과·건수)이고 항목 글은 없다.
-- **수명주기·연결**: 실행 직전(재시도 포함)과 반영 직전에 전체·사용자별 켜기와 활성 상태를 다시 본다 — 꺼졌으면 그날 회차는 멈춤(`paused`), 실행 중 꺼졌으면 아무것도 반영·이동하지 않는다. 비활성화된 사용자는 회차가 없고(멈춤 표시) 대기 제안은 그대로, 다시 활성화하면 위 7일 규칙으로 재개한다. 지정한 연결이 없거나 끊기면(연결 해제) 기억 정리는 멈추고 관리자 화면에 "연결을 다시 고르세요"를 보인다(실패·알림 아님). 연결이 있지만 만료·한도·모델 오류면 실행 실패(재시도·알림).
+- **알림**(spec §8): "기억 정리 제안 N개가 있어요"(`memory_proposal`), "기억 N개를 정리했어요"(`memory_applied`), "오늘 기억 정리가 실패했어요…"(`memory_failed`, #188) — 사용자는 설정 → 알림 → 기억 정리 알림에서 각각 끌 수 있다(`notification_prefs.memory_proposals`·`memory_applied`·`memory_failed`). 누르면 설정 → 내 지침 → 기억 정리.
+- **열람 범위**: 관리자 화면은 사용자별 설정(켜짐·시각·연결·모델, 프롬프트를 직접 썼는지 여부만 — 글은 없음)·오늘 상태·마지막 결과·건수만(`GET /api/admin/dreaming`). 기억 정리 설정·프롬프트는 본인 것만 읽고 쓴다(`/api/dreaming…`, 경로에 사용자 id 없음). 제안 카드(`/api/memory-proposals/:id`)는 주인만 — 관리자 403. `DREAMS.md`(설정 → 내 지침 → 기억 정리)는 그 사용자의 실행 기록(시각·결과·건수)이고 항목 글은 없다.
+- **수명주기·연결**: 실행 직전(재시도 포함)과 반영 직전에 서버 전체 스위치·그 사용자의 켜기와 활성 상태를 다시 본다 — 꺼졌으면 그날 회차는 멈춤(`paused`), 실행 중 꺼졌으면 아무것도 반영·이동하지 않는다. 비활성화된 사용자는 회차가 없고(멈춤 표시) 대기 제안은 그대로, 다시 활성화하면 위 7일 규칙으로 재개한다. 사용자가 고른 연결이 없거나 끊기거나(연결 해제) 허용 목록에서 빠지면 그 사용자의 기억 정리는 멈추고 그 사람 화면(과 관리자 상태 표)에 "다시 고르세요"를 보인다(실패 아님 — 허용한 공용 연결이 지워지거나 끊긴 경우만 관리자 알림). 연결이 있지만 만료·한도·모델 오류면 실행 실패(재시도·그 사용자에게 알림).
 - **삭제 연동**(spec §10): 대화 삭제·메시지가 활성 기록에서 빠지면 그 메시지를 출처(또는 고칠 대상 항목의 출처)로 둔 결정을 상태와 무관하게 지우고(#145와 같은 `dropBySources`), 대기열 항목도 지운다(대화 삭제는 외래 키로). 처리 순번 행은 메시지와 함께 지워진다.
-- **API**: 사용자 `GET /api/dreaming`(켜짐·시각·프롬프트·DREAMS.md·묶음). 관리자 `GET/PUT /api/admin/dreaming`, `PUT /api/admin/dreaming/users/:id`, `PUT /api/admin/dreaming/prompt`, `GET …/prompt/versions`, `POST …/prompt/versions/:v/restore`, `POST /api/admin/dreaming/preview`. `FAKE_RUNTIME=1` 서버만 `POST /api/admin/dreaming/users/:id/run`(지금 실행 — 개발·e2e용, 결과는 건수만).
+- **API**: 사용자(본인 것만) `GET /api/dreaming`(설정·켜짐·시각·고를 수 있는 연결·문제·프롬프트·DREAMS.md·묶음), `PUT /api/dreaming/settings`, `PUT /api/dreaming/prompt`(`content: null` = 기본값으로), `POST /api/dreaming/preview` — 청소년 계정은 셋 다 403 `dreaming_youth_locked`. 관리자 `GET/PUT /api/admin/dreaming`(`{enabled, tokenCap, allowed}`), `PUT /api/admin/dreaming/users/:id`(청소년 계정만 — 설정 + 선택 `applyMode`·`prompt`(쓰기 전용, null = 기본값), 그 밖 403 `dreaming_not_youth`). #146의 `PUT /api/admin/dreaming/prompt`, `…/prompt/versions`, `…/restore`, `POST /api/admin/dreaming/preview`는 없어졌다. `FAKE_RUNTIME=1` 서버만 `POST /api/admin/dreaming/users/:id/run`(지금 실행 — 개발·e2e용, 결과는 건수만).
 - **FakeRuntime**: 기억 정리 요청(`[기억 정리 요청]`)에 메시지의 "기억: …"(MEMORY)·"나: …"(USER) 줄로 결정을, "/dreaming-raw <json>"이면 그 JSON을 답한다(`runtime/fake-dreaming.ts`).
-- **로그**: `dreaming.run_started`·`dreaming.run_finished`(사용자·실행 id·시도·`dreamingTrigger`·`dreamingStatus`·`dreamingCode`·건수), `dreaming.alert_sent`(사용자 수) — 항목·메시지·프롬프트 글 없음.
-- **백업**: 새 표는 모두 DB 안이라 매일 백업(§21)에 그대로 들어간다. 글이 있는 칸은 `dreaming_prompts.content`뿐이고 `secrets/columns.ts`에 등록(쓸 때 가림 + 배경 재가림).
+- **로그**: `dreaming.run_started`·`dreaming.run_finished`(사용자·실행 id·시도·`dreamingTrigger`·`dreamingStatus`·`dreamingCode`·건수), `dreaming.alert_sent`(허용한 공용 연결이 끊겨 멈춘 사용자 수) — 항목·메시지·프롬프트 글 없음.
+- **백업**: 새 표는 모두 DB 안이라 매일 백업(§21)에 그대로 들어간다. 글이 있는 칸은 `dreaming_prompts.content`와 `dreaming_users.prompt`(#188)이고 `secrets/columns.ts`에 등록(쓸 때 가림 + 배경 재가림).
 
 
 ## 45. Cloudflare Access 동기화 — 미리보기·재시도·관리자 이메일 변경 (#36)·자동 로그인 (#178)
@@ -2204,3 +2203,61 @@ pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisp
 - **지침:** `common@8`의 "다이어그램" 절(§14).
 - **의존성:** `mermaid` 12.3.0 + `pnpm.overrides`(`dompurify` 3.4.17, `cytoscape` 3.34.4, `es-toolkit` 1.53.1, `commander@15` 15.0.0) — 올릴 때는 새 lockfile 항목마다 배포 2주 이상인지 다시 확인한다.
 - **시험:** `apps/web/test/mermaid.test.ts`(블록 인식·파서 기준 펜스 닫힘·init/머리말 제거(NBSP·`\v` 포함)·한도·프레임 프로토콜·큐·시간 초과/취소 때 프레임 폐기·악성 입력은 img 하나·고치기 메시지·빌드 검사), `apps/server/test/app.test.ts`(프레임 페이지 CSP 두 정책·부트 스크립트 해시), `e2e/mermaid.spec.ts`(FakeRuntime `/mdecho` — 받은 마크다운을 그대로, `@@pause@@` 줄에서 1.5초 멈춤; 앱 문서에 mermaid 노드가 들어가지 않음, PNG·SVG·복사·blob 해제).
+
+## 48. 유튜브 영상 음성 받기 — `youtube_audio_fetch` (#191)
+YouTube 영상 하나의 음성을 **대화 파일(M4A)** 로 저장한다. 대표 흐름: "이 유튜브 영상 화자별로 정리해줘" → `youtube_audio_fetch` → 받은 `fileId`로 `audio_transcribe`(§46) → 화자별 대본. 사용자 스킬 `youtube-audio-download`를 서버 도구로 옮긴 것이지만 원본 스킬(Homebrew `yt-dlp`·`ffmpeg`)은 쓰지 않는다. 코드: `apps/server/src/youtube/`(`service.ts` 주소·검사·저장, `runner.ts` 샌드박스 실행, `packages.ts` 설치·상태), interpreter 쪽 `apps/server/youtube/fetch.py`, 고정 목록 `apps/server/youtube/requirements.lock`. 근거는 `docs/decisions/isolation.md` "유튜브 음성 받기 (#191)".
+
+### 48.1 설치 (한 번 — 관리자)
+```bash
+# 1) SKILL_PYTHON(독립 실행형 CPython 3.12)과 ffmpeg(AUDIO_FFMPEG, 기본 /opt/homebrew/bin/ffmpeg) — §46과 같은 것
+# 2) 고정 yt-dlp + yt-dlp-ejs + deno (이 명령만 네트워크를 쓴다: PyPI)
+pnpm youtube:install   # <DATA_DIR>/youtube-packages/<lock 해시>-py3.12/ (~90MB, 대부분 deno 바이너리)
+pnpm youtube:status    # youtube_audio_fetch: available
+pnpm youtube:check     # 샌드박스 안에서 yt-dlp의 deno 제공자로 deno 시작(yt-dlp 옵션 + 권한 거부), 풀이 스크립트 싣기, deno 자신의 실행 거부(NotCapable) 확인 (네트워크 없음) — 버전·명령줄 출력
+# 3) 서버 재시작
+```
+- 고정 버전(2026-11-18): **yt-dlp 2026.10.26**(PyPI 배포 2026-10-26), **yt-dlp-ejs 0.8.0**(2026-03-17, YouTube JS 문제 풀이 스크립트), **deno 2.9.8**(2026-10-21, JS 런타임 — 휠에 바이너리가 들어 있음). 휠 해시 고정, `pip --isolated --no-deps --require-hashes --only-binary=:all: --target`, 고정 환경, 설치 폴더 읽기 전용(§46과 같은 설치기 `installPinnedPackages`). `bin/deno`만 남기고 다른 콘솔 스크립트(`yt-dlp` 등)는 지운다.
+- 운영(`~/.chat-agent`)에서는 그 폴더에서 `DATA_DIR`이 운영 데이터 폴더를 가리키게 해서 같은 명령을 돌린다(§43). 패키지는 파생 데이터라 백업에 들어가지 않는다 — 복원 뒤 다시 `pnpm youtube:install`.
+
+### 48.2 yt-dlp 업데이트 (관리자)
+YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·서명 오류가 늘어남). 그래서 **yt-dlp와 동반 패키지(yt-dlp-ejs, deno)만 "배포 3일 이상"** 규칙이다(다른 의존성은 2주 — isolation.md의 예외 기록). 서버는 스스로 업데이트하지 않는다.
+1. PyPI에서 새 **정식** 버전(`.devN` nightly 아님)이 배포 3일 이상인지 본다: `https://pypi.org/pypi/yt-dlp/json`의 `upload_time`. 그 버전이 요구하는 `yt-dlp-ejs`(정확한 버전, `requires_dist`의 `extra == "default"`)와 `deno` 최소 버전도 확인한다.
+2. `apps/server/youtube/requirements.in`·`requirements.lock`의 버전과 `--hash=sha256:`(PyPI의 `digests.sha256` — deno는 macOS arm64·x86_64 휠 둘)을 바꾸고, lock 머리의 배포일 주석을 고친다.
+3. 시험(`pnpm vitest run apps/server/test/youtube.test.ts` — lock 고정값 시험의 버전도 같이 고침) → PR → 배포(§43) → 운영 폴더에서 `pnpm youtube:install` → `pnpm youtube:check` → 서버 재시작.
+- lock이 바뀌면 해시가 바뀌어 설치 전까지 `not_installed`(도구가 제공되지 않음)가 되므로 3번의 설치를 빠뜨리지 않는다.
+
+### 48.3 켜고 끄기
+- **서버 허용 목록**: 관리자 → 스킬 → `youtube-audio-download` "허용"(기본 켜짐 — 설치 전에는 `설치 안 됨`으로 보이고 제공되지 않음).
+- **사용자별**: 같은 탭 아래. **청소년 계정은 기본 꺼짐**(`"all"`이어도 숨김, 사유 `청소년 기본 숨김`) — 관리자가 그 계정에서 켜면 이름으로 목록에 들어가 제공된다.
+- `audio_transcribe`와 묶어 쓰려면 그 사용자에게 `audio-transcription`도 켜져 있어야 한다.
+
+### 48.4 동작과 한도 (`YOUTUBE_LIMITS`, `packages/shared/src/youtube.ts`)
+- **YouTube만.** 주소에서 11자 영상 id만 꺼내 `https://www.youtube.com/watch?v=<id>`로 바꿔 yt-dlp에 준다. `watch?v=`·`youtu.be/`·`/shorts/`·`/embed/`·`/live/`(지난 방송)·`/v/`. `watch?v=…&list=…`는 그 영상 하나만 받는다(목록은 무시 — 의도). 순수 재생목록(`/playlist?list=`, `v=` 없는 `list=` — `youtube_playlist`), 다른 사이트·채널·검색(`youtube_bad_url`)은 아무것도 실행하지 않고 거절한다. 만든 주소에 알려진 비밀이 들어 있으면(송신 비밀 가드) 역시 아무것도 실행하지 않는다(로그 `youtube_secret_blocked`, 모델에는 `youtube_failed`).
+- **먼저 메타데이터:** 내려받기 전에 길이·라이브 여부·로그인 필요 여부·음성 형식·크기를 본다. 2시간 넘으면 `youtube_too_long`(구간 `start`·`end` — 초나 `H:MM:SS` — 로 2시간 이하를 지정하라는 안내). 라이브·예정·방송 직후 `youtube_live`, 연령 제한·비공개·회원 전용 `youtube_login_required`, 음성 300MB 초과 `youtube_too_large`. 구간을 주면 음성 전체를 받은 뒤 ffmpeg로 자르므로, 긴 영상도 **음성 전체가 300MB 이하**여야 한다.
+- **쿠키·로그인 없음**(`--cookies-from-browser` 안 씀). 봇 확인(`youtube_bot_check` — "로봇 확인을 요구해서 받지 못했어요")이나 로그인 필요 영상은 받지 못한다는 한국어 안내(`hint`)를 모델이 그대로 전한다.
+- **네트워크:** yt-dlp 프로세스는 서버의 egress 프록시(루프백 포트 하나)로만 나가고, 프록시는 `www.youtube.com`·`m.youtube.com`·`youtube.com`·`youtu.be`·`*.googlevideo.com`의 443만 연다(`YOUTUBE_EGRESS_HOSTS`). JS 문제는 고정 deno가 샌드박스 안에서 권한 없이 푼다(GitHub·npm에서 받는 것 없음).
+- **저장:** `youtube-<영상 id>[-<구간>].m4a`(AAC — 원본이 AAC면 그대로 복사, Opus면 AAC 128k로 변환, 메타데이터 제거)를 답 메시지에 연결된 대화 파일로 저장한다(업로드와 같은 저장소·쓰기 잠금·백업, 대화를 지우면 함께 지워짐, 대화당 파일 수 한도 — 넘으면 `youtube_file_limit`). 결과: `fileId`·`file`·`durationSeconds`·`videoId`·`sourceUrl`·`metadata`(제목·채널·업로드 날짜·설명 — `<external_content>` 안 JSON, 영상 올린 사람의 글이라 데이터).
+- **한도:** 음성 300MB는 받는 동안에도 지킨다(진행 보고마다 받은 바이트·파일 크기, `RLIMIT_FSIZE` — 응답에 길이가 없거나 메타데이터 크기가 틀려도 `youtube_too_large`). 메타데이터 2분, 내려받기 20분(yt-dlp + deno 그룹 2GB, 그룹을 떠난 자식이 파이프를 쥐어도 2초 뒤 끊고 실패), 변환 5분·1GB, 호출 전체 30분(`youtube_timeout`), 작업 폴더 700MB·1만 항목(`youtube_disk_limit`), 시작 전 볼륨 여유 1GB, 서버 전체 동시 2개·사용자당 1개(`youtube_busy`), **답변당 3번**(`youtube_quota`). Codex는 이 도구가 있는 실행에 `tool_timeout_sec`를 가장 긴 느린 도구의 한도 + 60초로 준다(이 도구만이면 1860, `audio_transcribe`와 같이면 3660 — `runtime/lockdown.ts`).
+- **실행과 함께 멈춘다(§46과 같음):** 250ms마다 실행·토큰·권한·작업 폴더를 보고, 중단 요청이 받아들여지는 순간(토큰 철회) 진행 중인 단계의 프로세스 그룹(yt-dlp와 deno)을 죽이고 작업 폴더 `<DATA_DIR>/youtube-scratch/<uuid>/`를 지운 뒤 슬롯을 놓는다(`youtube_cancelled`). 저장은 쓰기 잠금 안에서 한 번 더 확인한다. 서버 시작 때 남은 작업 폴더도 지운다.
+- **안내문(`common@9`):** 본인 영상이거나 이용 권한이 있는 영상만(전사·요약·개인 보관), 음악·앨범 추출·재배포 금지, 화자별 정리는 `audio_transcribe`로.
+
+### 48.5 문제 해결
+| 증상 | 확인 |
+| --- | --- |
+| 관리자 화면 `설치 안 됨` | `pnpm youtube:status` → `pnpm youtube:install`(lock이 바뀐 뒤에는 다시). `needs_python`이면 §35/§46의 `SKILL_PYTHON`, `needs_ffmpeg`면 `AUDIO_FFMPEG` |
+| `youtube:check`가 실패 | 설치 폴더가 지워졌거나 바뀜 → `pnpm youtube:install`. deno가 시작하지 않으면(`youtube_failed`) macOS·아키텍처에 맞는 deno 휠인지(lock에 arm64·x86_64 해시). yt-dlp를 올린 뒤 실패하면 yt-dlp가 deno 옵션의 자리(`DenoJCP._DENO_BASE_OPTIONS`)를 바꿨거나 `--allow-*`를 넣은 것 — `fetch.py`가 일부러 거부한다(`lock_deno`). 새 yt-dlp 코드를 확인하고 `fetch.py`를 맞춘 뒤 올린다 |
+| `youtube_bot_check`가 자주 | YouTube가 이 IP를 의심함. 잠시 뒤 다시. 계속되면 yt-dlp가 낡았을 수 있음 → §48.2로 새 정식 버전(3일 이상). 쿠키는 쓰지 않는다(결정) — 그 영상은 사용자가 음성 파일을 직접 올리게 안내 |
+| `youtube_failed`·`youtube_no_audio`가 갑자기 많아짐 | 대개 YouTube 변경 → §48.2. 서버 로그에는 고정 코드만 있다(`youtube.finished`의 `youtubeCode`). 원인을 보려면 관리자 Mac에서 같은 고정 yt-dlp를 샌드박스 밖에서 직접 돌려 본다(가족 대화와 무관한 공개 영상으로) |
+| 새로 필요한 호스트 | yt-dlp가 다른 호스트를 쓰기 시작하면 프록시가 403으로 막아 `youtube_failed`. `YOUTUBE_EGRESS_HOSTS`에 그 호스트만 더하는 코드 변경 + isolation.md 기록(와일드카드는 `*.<접미사>`, 라벨 둘 이상) |
+| `youtube_too_large` | 음성 전체 300MB 초과(대략 128kbps로 5시간 넘음). 구간을 줘도 전체를 받으므로 받을 수 없다 |
+
+### 48.6 로그와 확인
+- 로그는 `youtube.finished` 하나: 도구 이름, 고정 코드(`youtubeCode` — `youtube_ok` 또는 `YOUTUBE_CODES`), 시간, ID. 주소·영상 id·제목·파일 id는 남지 않는다. 실패는 관리자 "스킬 실행 실패"에 도구 이름과 코드로.
+- 시험: `pnpm vitest run apps/server/test/youtube.test.ts` — **가짜 yt-dlp만**(네트워크 없음): 성공·저장·`audio_transcribe` 연결, 봇 확인·로그인·없음·시간 초과, 길이 초과·구간, 라이브·재생목록, 허용 외 호스트(실제 프록시 CONNECT), 중단(토큰 철회)·실행 종료·권한 해제·디스크, 답변당 상한, 청소년 기본 숨김, 프로필. macOS + 독립 실행형 python + ffmpeg에서는 가짜 `yt_dlp` 패키지를 실제 `fetch.py`·샌드박스·ffmpeg로 돌린다(자식 프로세스 포함 바깥 읽기·다른 포트 거부).
+- 고정 yt-dlp 실물의 크기 상한(네트워크 없음 — 로컬 가짜 프록시): `TEST_YTDLP_PACKAGES=<lock을 설치한 폴더> pnpm vitest run apps/server/test/youtube.test.ts -t "real yt-dlp"`.
+- 실제 YouTube 수동 시험(CI 아님, 관리자가 받아도 되는 영상으로):
+  ```bash
+  YTDLP_LIVE=1 YTDLP_LIVE_DATA_DIR=<pnpm youtube:install을 돌린 DATA_DIR> SKILL_PYTHON=<독립 실행형 3.12> \
+    YTDLP_LIVE_URL='https://www.youtube.com/watch?v=<id>' pnpm vitest run apps/server/test/youtube.test.ts -t live
+  ```
+- 수용 기준 수동 확인: "이 유튜브 영상 화자별로 정리해줘" → 음성 파일이 대화 파일로 저장되고 화자별 대본(기록 양식 B).

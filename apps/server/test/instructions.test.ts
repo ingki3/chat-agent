@@ -100,9 +100,13 @@ describe("templates", () => {
     expect(common).toContain("시간에 따라 바뀌는 자료(시세·환율, 뉴스·최신 사실)에는 기준 시각(날짜");
     expect(common).toContain("다시 조회하거나 앞 답변의 출처 번호를 붙인다");
     const finance = defaultTemplates().finance;
-    expect(finance.version).toBe(4);
+    expect(finance.version).toBe(5);
     expect(finance.body).toContain("**금융 도구 결과를 답변에 쓸 때**");
     expect(finance.body).not.toContain("모든 숫자");
+    // #187: 관심 종목 was removed — no watchlist line, and the finance tools stay.
+    expect(finance.body).not.toContain("watchlist_get");
+    expect(finance.body).not.toContain("관심 종목");
+    expect(finance.body).toContain("`finance_chart`");
     const research = defaultTemplates().research;
     expect(research.version).toBe(3);
     expect(research.body).toContain("사실을 말하는 문장마다 `cite`");
@@ -159,8 +163,8 @@ describe("assembly", () => {
         it(`snapshot: ${who} × ${mode} × ${kind} tools`, () => {
           const r = assembleInstructions({ user, mode, tools, now: NOW });
           expect(r.versions).toEqual([
-            "common@8",
-            ...(kind === "finance" ? ["finance@4"] : []),
+            "common@9",
+            ...(kind === "finance" ? ["finance@5"] : []),
             ...(user.youth ? ["youth@2"] : []),
             ...(mode === "research" ? ["research@3"] : []),
           ]);
@@ -272,7 +276,7 @@ describe("injection evaluation harness (#40 fixtures)", () => {
       isolation: TEST_ISOLATION,
     });
     expect(report.summary).toEqual({ runs: 12, pass: 12, fail: 0, error: 0, pending: 0, violations: 0 });
-    expect(report.instructions).toEqual(["common@8", "youth@2"]);
+    expect(report.instructions).toEqual(["common@9", "youth@2"]);
     expect(new Set(report.results.map((r) => r.runtime))).toEqual(new Set(["claude-code", "codex"]));
     expect(report.results.find((r) => r.case === "INJ-1")!.calls).toEqual([
       { tool: "web_fetch", target: "http://fixtures.agentlee.test/injection/page-exfil.html" },
@@ -555,10 +559,10 @@ describe("run manager assembles per run", () => {
     const adults = [f.users.owner, f.users.shared, f.users.admin, f.users.stranger];
     for (const u of adults) {
       const { run } = await reply(u.id);
-      expect(run.instructions).toBe("common@8");
+      expect(run.instructions).toBe("common@9");
     }
     const { run } = await reply(son.id);
-    expect(run.instructions).toBe("common@8,youth@2");
+    expect(run.instructions).toBe("common@9,youth@2");
     expect(claude.systemPrompts).toHaveLength(adults.length + 1);
     expect(claude.systemPrompts.slice(0, adults.length).some((p) => p.includes(YOUTH_HEADING))).toBe(false);
     expect(claude.systemPrompts.at(-1)).toContain(YOUTH_HEADING);
@@ -570,10 +574,10 @@ describe("run manager assembles per run", () => {
   it("the finance section follows the run's tools", async () => {
     const { f, claude, reply } = await family({ tools: ["echo_time", FAKE_FINANCE_TOOL] });
     const { run } = await reply(f.users.owner.id);
-    expect(run.instructions).toBe("common@8,finance@4");
+    expect(run.instructions).toBe("common@9,finance@5");
     expect(claude.systemPrompts[0]).toContain(FINANCE_HEADING);
     const plain = await family({ tools: ["echo_time"] });
-    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@8");
+    expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@9");
   });
 
   it("both runtimes get the same text for the same user and conversation", async () => {
@@ -606,7 +610,7 @@ describe("run manager assembles per run", () => {
     expect(res.json<{ researchMode: boolean }>().researchMode).toBe(true);
 
     const { run } = await reply(f.users.owner.id, conversationId);
-    expect(run.instructions).toBe("common@8,research@3");
+    expect(run.instructions).toBe("common@9,research@3");
     expect(claude.systemPrompts).toHaveLength(2); // not resumed with the old prompt
     expect(claude.systemPrompts[1]).toContain(RESEARCH_HEADING);
   });
@@ -616,7 +620,7 @@ describe("run manager assembles per run", () => {
     const { conversationId } = await reply(f.users.stranger.id);
     app.users!.setYouth(f.users.stranger.id, true);
     const { run } = await reply(f.users.stranger.id, conversationId);
-    expect(run.instructions).toBe("common@8,youth@2");
+    expect(run.instructions).toBe("common@9,youth@2");
     expect(claude.systemPrompts).toHaveLength(2);
     expect(claude.systemPrompts[1]).toContain(YOUTH_HEADING);
   });

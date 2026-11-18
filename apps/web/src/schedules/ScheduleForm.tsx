@@ -183,7 +183,7 @@ export function ScheduleForm(props: {
           required
           maxLength={100}
           value={d.name}
-          placeholder="예: 아침 관심 종목 브리핑"
+          placeholder="예: 아침 시장 브리핑"
           onChange={(e) => set("name", e.target.value)}
         />
       </div>
@@ -195,7 +195,7 @@ export function ScheduleForm(props: {
           rows={3}
           maxLength={8000}
           value={d.prompt}
-          placeholder="예: 내 관심 종목을 브리핑해줘"
+          placeholder="예: 오늘 시장 동향을 브리핑해줘"
           onChange={(e) => set("prompt", e.target.value)}
         />
       </div>

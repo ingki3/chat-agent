@@ -7,6 +7,7 @@ import {
   PYTHON_CODES,
   AUDIO_CODES,
   AUDIO_STT_ENGINES,
+  YOUTUBE_CODES,
   NotificationKind,
   RuntimeId,
   SCHEDULE_PROPOSAL_CODES,
@@ -238,6 +239,10 @@ export const isAudioCode = member(AUDIO_CODE_VALUES);
 /** Where the words came from, and how the speakers were found (fixed values). */
 export const isAudioStt = member(set(AUDIO_STT_ENGINES));
 export const isAudioDiarization = member(set(["local", "off", "failed"]));
+
+/** Outcome codes of `youtube_audio_fetch` (#191, shared `YOUTUBE_CODES` plus a finished call's `youtube_ok`). */
+export const YOUTUBE_CODE_VALUES = set(["youtube_ok", ...YOUTUBE_CODES]);
+export const isYoutubeCode = member(YOUTUBE_CODE_VALUES);
 
 /** Outcome codes of the finance tools (#30, finance/service.ts `FINANCE_CODES` — a test keeps the two equal). */
 export const FINANCE_CODES = set([

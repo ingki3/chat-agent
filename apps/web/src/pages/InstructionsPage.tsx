@@ -8,7 +8,7 @@ import { MemoryModeSetting } from "../instructions/MemoryModeSetting.js";
 import { DreamingPanel } from "../instructions/DreamingPanel.js";
 
 const KINDS: MemoryDocKind[] = ["agent", "soul", "user", "memory"];
-/** The tabs: the four documents, then 기억 정리 (#146: its proposals, DREAMS.md and the prompt in use). */
+/** The tabs: the four documents, then 기억 정리 (#146, #188: its settings, prompt, proposals and DREAMS.md). */
 type Tab = MemoryDocKind | "dreams";
 const TABS: Tab[] = [...KINDS, "dreams"];
 const TAB_LABEL = (t: Tab) => (t === "dreams" ? "기억 정리" : MEMORY_DOC_FILE[t]);

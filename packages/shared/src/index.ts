@@ -23,6 +23,7 @@ export * from "./references.js";
 export * from "./shares.js";
 export * from "./python.js";
 export * from "./audio.js";
+export * from "./youtube.js";
 export * from "./instructions.js";
 export * from "./memory-proposals.js";
 export * from "./dreaming.js";

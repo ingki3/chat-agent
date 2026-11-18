@@ -1,4 +1,4 @@
-import { carriesSecret, SEARCH_DECOY, withoutParam } from "../secrets/egress.js";
+import { carriesSecret, withoutParam } from "../secrets/egress.js";
 import fs from "node:fs";
 import { z } from "zod";
 import {
@@ -23,14 +23,12 @@ import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@
 import {
   FINANCE_CHART_TOOL,
   FINANCE_TOOLS,
-  WATCHLIST_GET_TOOL,
   type FinanceComposedToolInfo,
   type FinanceToolInfo,
 } from "@agentlee/mcp-tools/finance";
 import { FinanceService, type FinanceOptions } from "../finance/service.js";
 import { buildFinanceArtifacts, fetchDataset, type ChartInput } from "../finance/chart.js";
 import { finalize } from "../finance/records.js";
-import { watchSymbolOk, type WatchlistStore } from "../watchlist/store.js";
 import {
   ARTIFACT_CREATE_TOOL,
   ARTIFACT_READ_CHARS,
@@ -59,6 +57,9 @@ import type { PythonScratchpad } from "../python/service.js";
 import { AUDIO_TOOLS, AUDIO_TRANSCRIBE_TOOL, type AudioToolInfo } from "@agentlee/mcp-tools/audio";
 import { AUDIO_SKILL } from "@agentlee/shared";
 import type { AudioTranscriber } from "../audio/service.js";
+import { YOUTUBE_AUDIO_TOOL, YOUTUBE_TOOLS, type YoutubeToolInfo } from "@agentlee/mcp-tools/youtube";
+import { YOUTUBE_SKILL } from "@agentlee/shared";
+import type { YoutubeAudioFetcher } from "../youtube/service.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -101,14 +102,22 @@ const FINANCE_SKILLS: ReadonlySet<string> = new Set(
 
 export const isFinanceSkill = (skill: string) => FINANCE_SKILLS.has(skill);
 
+/** Skills a youth account does not get under "all" (`youthHidden`): the finance skills (#30) and #191's YouTube one. */
+const YOUTH_HIDDEN_SKILLS: ReadonlySet<string> = new Set(
+  SKILL_CATALOGUE.filter((e) => e.youthHidden).map((e) => e.name),
+);
+
+export const isYouthHiddenSkill = (skill: string) => YOUTH_HIDDEN_SKILLS.has(skill);
+
 /**
  * Whether a user's own permissions allow `skill` (FR-1.6) — not whether it is offered now (`McpService.allows`
- * adds the account being active and the server allow-list). "all" = every skill except the finance skills for a
- * youth account (the son, #30): hidden by default; only an explicit list that names them turns them on.
+ * adds the account being active and the server allow-list). "all" = every skill except the youth-hidden ones for a
+ * youth account (the son: the finance skills, #30, and `youtube-audio-download`, #191): hidden by default; only an
+ * explicit list that names them turns them on.
  */
 export function skillPermitted(user: { permissions?: unknown; youth?: unknown }, skill: string): boolean {
   const p = (user as { permissions?: { skills?: unknown } }).permissions?.skills;
-  if (p === "all") return !(user.youth === true && FINANCE_SKILLS.has(skill));
+  if (p === "all") return !(user.youth === true && YOUTH_HIDDEN_SKILLS.has(skill));
   return Array.isArray(p) && p.includes(skill);
 }
 
@@ -572,9 +581,6 @@ function containsSecret(v: unknown, secrets: readonly string[]): boolean {
   return false;
 }
 
-/** The decoy query (one constant for the watchlist search and web_search — secrets/egress.ts). */
-export { SEARCH_DECOY };
-
 /** Sources `sources_list` returns at most (the newest). */
 const SOURCES_LIST_MAX = 100;
 
@@ -635,6 +641,8 @@ export type McpServiceOptions = {
   scratchpad?: PythonScratchpad;
   /** `audio_transcribe` (#173). Without it the tool is not offered. Per user: the `audio-transcription` skill. */
   audio?: AudioTranscriber;
+  /** `youtube_audio_fetch` (#191). Without it the tool is not offered. Per user: the `youtube-audio-download` skill. */
+  youtube?: YoutubeAudioFetcher;
   /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
@@ -642,8 +650,6 @@ export type McpServiceOptions = {
   files?: { tools: FileTools; citations?: CitationStore };
   /** Finance tools (#30). Without it they are not offered. Per user: the owning skill's permission. */
   finance?: FinanceOptions;
-  /** 관심 종목 (#31): `watchlist_get` reads the run's user's list. Without it the tool is not offered. */
-  watchlist?: WatchlistStore;
   /** Schedule proposals (#55): `schedule_create` stores what it proposes. Without it the tool is not offered. */
   scheduleProposals?: ScheduleProposalStore;
   /**
@@ -726,7 +732,7 @@ export class McpService {
   /** Finance tools (#30), when configured: each user gets those of the finance skills they may use. */
   readonly finance: FinanceService | undefined;
   private readonly financeTools: readonly FinanceToolInfo[];
-  /** `finance_chart` and `watchlist_get` (#31): offered to a user who may use one of their finance skills. */
+  /** `finance_chart` (#31): offered to a user who may use one of their finance skills. */
   private readonly composedTools: readonly FinanceComposedToolInfo[];
   /** `python_run` (#47), when configured: offered to a user who may use `python-scratchpad`. */
   private readonly pythonTools: readonly PythonToolInfo[];
@@ -734,6 +740,8 @@ export class McpService {
   private readonly pythonAvailable: () => boolean;
   /** `audio_transcribe` (#173), when configured: offered to a user who may use `audio-transcription`. */
   private readonly audioTools: readonly AudioToolInfo[];
+  /** `youtube_audio_fetch` (#191), when configured: offered to a user who may use `youtube-audio-download`. */
+  private readonly youtubeTools: readonly YoutubeToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -780,10 +788,8 @@ export class McpService {
     // Whether python_run is offered right now (gated state); cheap, re-checked at each tool list and call.
     this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
     this.audioTools = opts.audio ? AUDIO_TOOLS : [];
-    this.composedTools = [
-      ...(this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : []),
-      ...(opts.watchlist ? [WATCHLIST_GET_TOOL] : []),
-    ];
+    this.youtubeTools = opts.youtube ? YOUTUBE_TOOLS : [];
+    this.composedTools = this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : [];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
   }
@@ -868,6 +874,7 @@ export class McpService {
         ...this.tools,
         ...this.pythonTools,
         ...this.audioTools,
+        ...this.youtubeTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -966,6 +973,9 @@ export class McpService {
       ...(this.opts.audio?.state() === "available"
         ? this.audioTools.filter((t) => this.mayUse(s, t.skill))
         : []),
+      ...(this.opts.youtube?.state() === "available"
+        ? this.youtubeTools.filter((t) => this.mayUse(s, t.skill))
+        : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
@@ -990,6 +1000,7 @@ export class McpService {
         const st = this.opts.scratchpad.state();
         status = st === "available" ? "available" : st;
       } else if (e.name === AUDIO_SKILL && this.opts.audio) status = this.opts.audio.state();
+      else if (e.name === YOUTUBE_SKILL && this.opts.youtube) status = this.opts.youtube.state();
       else if (e.status === "tools") status = "planned";
       else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
@@ -1077,6 +1088,7 @@ export class McpService {
         ...this.tools,
         ...this.pythonTools,
         ...this.audioTools,
+        ...this.youtubeTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -1100,10 +1112,7 @@ export class McpService {
         this.markExternal(scope.runId);
         const composed = composedByName.get(name);
         if (composed) {
-          const r =
-            composed.name === FINANCE_CHART_TOOL.name
-              ? await this.callFinanceChart(input, scope)
-              : this.callWatchlist(input, scope);
+          const r = await this.callFinanceChart(input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "finance.finished", {
             userId: scope.userId,
             conversationId: scope.conversationId,
@@ -1262,6 +1271,33 @@ export class McpService {
               runId: scope.runId,
             });
           return r;
+        }
+        if (name === YOUTUBE_AUDIO_TOOL.name) {
+          const r = await this.callYoutubeTool(input, scope);
+          // The guard's refusal is told to the model as an ordinary failure; the log and the error list keep why.
+          const shown: SkillResult =
+            !r.ok && r.code === "youtube_secret_blocked" ? { ok: false, code: "youtube_failed" } : r;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "youtube.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // A fixed code only: never the address, the video id, the title or the file.
+            youtubeCode: r.ok ? "youtube_ok" : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return shown;
         }
         if (name === DOC_CREATE_TOOL.name) {
           const r = await this.callDocTool(input, scope);
@@ -1461,6 +1497,20 @@ export class McpService {
     // user still allowed — otherwise the service stops every step and sends or stores nothing more.
     return audio.run(scope, input, {
       alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, AUDIO_SKILL),
+    });
+  }
+
+  /**
+   * `youtube_audio_fetch` (#191): active user who may use `youtube-audio-download` (checked again here), then the
+   * service — its own slots and per-run cap, the token's own conversation only. While it runs: the run's token still
+   * alive (revoked at once by an interrupt) and the user still allowed — otherwise every step stops and nothing is
+   * stored. Never logged: the address, the video, the file.
+   */
+  private async callYoutubeTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const yt = this.opts.youtube;
+    if (!yt || !this.mayUse(scope, YOUTUBE_SKILL)) return { ok: false, code: "youtube_not_allowed" };
+    return yt.run(scope, input, {
+      alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, YOUTUBE_SKILL),
     });
   }
 
@@ -1669,103 +1719,6 @@ export class McpService {
       if (e instanceof ArtifactError) return { ok: false, code: e.code };
       throw e;
     }
-  }
-
-  /**
-   * `watchlist_get` (#31, FR-7.7): the token's user's own list, only of the markets whose finance skill they may use
-   * now. Names are third-party text (the search), framed as external content.
-   */
-  private callWatchlist(input: Record<string, unknown>, scope: ToolScope): SkillResult {
-    const store = this.opts.watchlist;
-    if (!store || !this.mayUseAny(scope, WATCHLIST_GET_TOOL.skills))
-      return { ok: false, code: "finance_not_allowed" };
-    if (!z.strictObject(WATCHLIST_GET_TOOL.input).safeParse(input).success)
-      return { ok: false, code: "finance_bad_input" };
-    const markets = this.watchMarkets(scope.userId).filter((m) =>
-      this.mayUse(scope, m === "KR" ? "kr-stock-skill" : "us-stock-skill"),
-    );
-    const items = store.list(scope.userId).filter((i) => markets.includes(i.market));
-    return {
-      ok: true,
-      output: scrubKnownDeep({
-        tool: WATCHLIST_GET_TOOL.name,
-        items: items.map((i) => ({ market: i.market, symbol: i.symbol })),
-        names: frameExternal({
-          source: "watchlist",
-          content: items.map((i) => `${i.symbol}: ${i.name ?? ""}`).join("\n") || "(empty)",
-        }),
-        count: items.length,
-        ...(items.length
-          ? {}
-          : { hint: "The list is empty: the user adds symbols on the 관심 종목 screen." }),
-      }),
-    };
-  }
-
-  /** Markets this user may use now: KR with kr-stock-skill, US with us-stock-skill (#31). */
-  watchMarkets(userId: string): ("KR" | "US")[] {
-    return [
-      ...(this.allows(userId, "kr-stock-skill") ? (["KR"] as const) : []),
-      ...(this.allows(userId, "us-stock-skill") ? (["US"] as const) : []),
-    ];
-  }
-
-  /**
-   * The 관심 종목 search (#31): Korean names and codes through `kr_search` (Naver 증권, its own egress) when the user
-   * may use kr-stock-skill; a typed US ticker is offered as it is (there is no US name search). Never throws.
-   */
-  async searchSymbols(
-    userId: string,
-    q: string,
-  ): Promise<
-    | {
-        ok: true;
-        items: { market: "KR" | "US"; symbol: string; name: string | null; exchange: string | null }[];
-      }
-    | { ok: false; code: string }
-  > {
-    const markets = this.watchMarkets(userId);
-    if (!markets.length) return { ok: false, code: "finance_not_allowed" };
-    const items: { market: "KR" | "US"; symbol: string; name: string | null; exchange: string | null }[] = [];
-    // A query that carries a known secret (raw, encoded, cut off) never leaves — and its answer must not tell it
-    // apart from any other query (review #111 rounds 2–3): it takes exactly the ordinary path — the same checks, the
-    // same process slot, the same worker call and error handling (busy, unreachable, timeout) — with a fixed decoy
-    // query in its place, whose hits are dropped. FinanceService checks every outgoing URL again.
-    const upper = q.trim().toUpperCase();
-    const search = FINANCE_TOOLS.find((t) => t.name === "kr_search");
-    // One predicate (review #111 round 4): the egress guard's own decision on the request this query would make
-    // (shared matcher + the configured secrets' windows), and on the typed ticker that would be shown back.
-    const fin = this.finance;
-    const secret =
-      scrubKnown(q) !== q ||
-      scrubKnown(upper) !== upper ||
-      (!!fin && !!search && (fin.refuses(search, { query: q.trim() }) || fin.refusesText(upper)));
-    // A typed ticker is offered only when it may be stored (the same single check as adding, review #111).
-    if (!secret && markets.includes("US") && watchSymbolOk("US", upper))
-      items.push({ market: "US", symbol: upper, name: null, exchange: null });
-    if (markets.includes("KR") && this.finance && search) {
-      const parsed = z.strictObject(search.input).safeParse({ query: q.trim() });
-      if (parsed.success) {
-        const scope = { userId, conversationId: "watchlist", runId: `watchlist:${userId}` };
-        const input = secret ? { query: SEARCH_DECOY } : parsed.data;
-        const r = await this.withSlot(scope, () => this.finance!.run(search, input));
-        if (!r) return { ok: false, code: "finance_busy" };
-        if (r.ok) {
-          const found = secret ? [] : (r.output as { items?: unknown }).items;
-          for (const x of Array.isArray(found) ? found : []) {
-            const o = x as { code?: unknown; name?: unknown; market?: unknown };
-            if (typeof o.code === "string" && /^\d{6}$/.test(o.code))
-              items.push({
-                market: "KR",
-                symbol: o.code,
-                name: typeof o.name === "string" ? o.name : null,
-                exchange: typeof o.market === "string" ? o.market : null,
-              });
-          }
-        } else if (!items.length) return { ok: false, code: r.code };
-      }
-    }
-    return { ok: true, items: items.slice(0, 11) };
   }
 
   /** A web tool call: active user, strict input, a process slot like a skill, then the web service. */

@@ -398,6 +398,10 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   /** 기억 정리 (#146, spec §8): "기억 제안 대기" and "기억 자동 반영" notifications — the user may turn each off. */
   memoryProposals: integer("memory_proposals", { mode: "boolean" }).notNull().default(true),
   memoryApplied: integer("memory_applied", { mode: "boolean" }).notNull().default(true),
+  /** 기억 정리 실패 (#188): the user's own round failed at its last attempt. */
+  memoryFailed: integer("memory_failed", { mode: "boolean" }).notNull().default(true),
+  /** Revision (#188 review 9): +1 on every write; every response carries it. */
+  rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -994,8 +998,10 @@ export const scheduleProposals = sqliteTable(
 );
 
 /**
- * 관심 종목 (#31, FR-7.7): one person's list of Korean and US symbols, owner only (the admin cannot read it either,
- * FR-1.5). `name` is the display name picked from the search (third-party text, scrubbed on write).
+ * 관심 종목 (#31) — **removed in #187; the table is retained for rollback compatibility only.** No code reads or
+ * writes it (no route, store or tool). It stays so that rolling the code back to a pre-#187 release (by hand or the
+ * release script's automatic rollback) finds the table that release reads and rescrubs. To be dropped by a migration
+ * in a later release, once a rollback to pre-#187 code is no longer needed (docs/ops.md §30.3).
  */
 export const watchlistItems = sqliteTable(
   "watchlist_items",
@@ -1359,6 +1365,8 @@ export const memoryPrefs = sqliteTable("memory_prefs", {
   applyMode: text("apply_mode", { enum: ["review", "auto"] })
     .notNull()
     .default("review"),
+  /** Revision (#188 review 9): +1 on every write; every response carries it. */
+  rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -1475,15 +1483,30 @@ export const memorySeqCounters = sqliteTable("memory_seq_counters", {
 });
 
 /**
- * 기억 정리 per user (#146, spec §6·§9): the admin's on/off for this user (no row = on), the checkpoint (the processing
- * sequence of the last **new** message a run included — it never decreases), and since when the user's rounds were
- * paused (deactivated, turned off): when they resume, a checkpoint older than 7 days moves to 7 days ago.
+ * 기억 정리 per user (#146, #188, spec §6·§7·§9): the user's own settings — on/off (no row = off; the server writes
+ * `enabled` explicitly, the column default is from #146), the time (HH:MM, Asia/Seoul), the connection·model (one the
+ * admin allowed) and the cleanup prompt (null = the default) — plus the checkpoint (the processing sequence of the last
+ * **new** message a run included — it never decreases), and since when the user's rounds were paused (deactivated,
+ * turned off): when they resume, a checkpoint older than 7 days moves to 7 days ago. 0033 moved the admin's former
+ * system-wide time, connection and model here.
  */
 export const dreamingUsers = sqliteTable("dreaming_users", {
   userId: text("user_id")
     .primaryKey()
     .references(() => users.id, { onDelete: "cascade" }),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  time: text("time").notNull().default("03:00"),
+  runtime: text("runtime"),
+  connectionId: text("connection_id"),
+  model: text("model"),
+  /** The user's own editable part of the prompt (null: the default — the last admin version, or the built-in one). */
+  prompt: text("prompt"),
+  promptUpdatedAt: integer("prompt_updated_at"),
+  /**
+   * The settings' revision (#188 review 9): +1 on every write of the switch, time, connection·model or prompt, in the
+   * same statement. Every response carries it, so a page keeps the newest it has seen (no client clocks).
+   */
+  rev: integer("rev").notNull().default(0),
   checkpoint: integer("checkpoint").notNull().default(0),
   /** When the checkpoint last moved (null: never — a first run counts like a resume). */
   checkpointAt: integer("checkpoint_at"),
@@ -1575,8 +1598,9 @@ export const dreamingQueue = sqliteTable(
 );
 
 /**
- * The admin's cleanup prompt (#146, FR-16.6): the editable part only — the output format, the forbidden rules and the
- * validation are fixed in code. One row per saved version; the newest is the one in use (a restore saves a new one).
+ * The admin's cleanup prompt of #146 (FR-16.6): the editable part only — the output format, the forbidden rules and
+ * the validation are fixed in code. One row per saved version. Since #188 no one saves new versions: the newest is the
+ * **default** prompt of every user who has not written their own (`dreaming_users.prompt`).
  */
 export const dreamingPrompts = sqliteTable("dreaming_prompts", {
   version: integer("version").primaryKey(),

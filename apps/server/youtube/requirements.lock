@@ -1,0 +1,14 @@
+# youtube_audio_fetch (#191) packages for CPython 3.12 on macOS — installed by `pnpm youtube:install` with
+# pip --no-deps --require-hashes --only-binary=:all: --target <DATA_DIR>/youtube-packages/<lock hash>-py3.12/.
+# yt-dlp needs nothing else for YouTube over urllib (its optional extras are not installed); the JS challenge is
+# solved by yt-dlp-ejs's scripts in deno (the wheel holds the binary: bin/deno), offline — no npm, no GitHub.
+# Upload dates (PyPI): yt-dlp 2026.10.26 → 2026-10-26, yt-dlp-ejs 0.8.0 → 2026-03-17, deno 2.9.8 → 2026-10-21
+# (all ≥ 3 days before 2026-11-18; the usual two weeks hold too). Hashes: PyPI's sha256 of each wheel (the three
+# installed on macOS arm64 also checked against the downloaded files). deno: the macOS arm64 and x86_64 wheels only.
+yt-dlp==2026.10.26 \
+    --hash=sha256:a05c5b5d8562f7e8a62f5334348b406af4930d56d3a65f8021d14af0e22339ae
+yt-dlp-ejs==0.8.0 \
+    --hash=sha256:79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4
+deno==2.9.8 \
+    --hash=sha256:b82eac91d3e3f6fe37d94a12f833550e05029274cb9020b1e3f0f61e1678dc24 \
+    --hash=sha256:338245af268724ae55ebebdb81270a0553b665affde8bdd80b01b8f1c07c7163
