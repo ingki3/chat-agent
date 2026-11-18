@@ -268,9 +268,16 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(lone.text).toContain("[9]");
     expect(lone.note?.unbacked).toBe(true);
     expect(statuses(lone)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
-    // A carried-over note is still found past an `unbacked` one: the newest note *with sources* is carried.
-    await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].");
+    // A carried-over note is still found past an `unbacked` one: the newest note *with sources* is carried. The
+    // middle answer's only marker, [9], was never a real citation — nothing carries, so its note is `unbacked`.
+    const middle = await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[9].");
+    expect(middle.run.status).toBe("done");
+    expect(middle.text).toContain("최신 수출은 32% 증가했다[9].");
+    expect(middle.note?.unbacked).toBe(true);
+    expect(statuses(middle)).toEqual([[9, "unknown_source"]]);
+    // Without the skip, [1] would look in the middle note (no [1] there) and stay unknown.
     const past = await send(f.cookies.owner, c.id, "/cite recap");
+    expect(past.run.status).toBe("done");
     expect(past.note?.unbacked).toBeUndefined();
     expect(statuses(past)?.[0]).toEqual([1, "verified"]);
   });

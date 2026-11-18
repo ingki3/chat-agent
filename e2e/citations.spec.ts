@@ -267,7 +267,7 @@ test("an answer that used no source: no source box, its made-up [n] flagged ⚠�
   await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
   await expect(reply).toContainText("최신 수출은 32% 증가했다");
   await expect(reply.getByTestId("source-note")).toHaveCount(0);
-  await expect(reply.getByTestId("citation-unbacked")).toContainText("확인되지 않은 출처 표시");
+  await expect(reply.getByTestId("citation-unbacked")).toContainText("근거에 연결되지 않은 출처 표시");
   await expect(reply.getByTestId("citation-marker")).toHaveText(["1⚠️"]);
   await expect(reply).toContainText("a[2]");
   await expect(reply).not.toContainText(OK);

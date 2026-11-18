@@ -31,8 +31,11 @@ export const CITATION_STATUS_TEXT: Record<CitationStatus, string> = {
   unknown_source: "⚠️ 출처를 가져오지 못했어요",
 };
 
-/** Shown under an answer whose `[n]` markers cite nothing (an `unbacked` note — the answer used no source). */
-export const CITATION_UNBACKED_TEXT = "⚠️ 확인되지 않은 출처 표시가 있어요 — 이 답변은 출처를 쓰지 않았어요.";
+/**
+ * Shown for an `unbacked` note: the answer has `[n]` markers that cite nothing. About the markers only — the same
+ * box may list the answer's finance sources (review #190 2차).
+ */
+export const CITATION_UNBACKED_TEXT = "⚠️ 근거에 연결되지 않은 출처 표시가 있어요.";
 
 /** Shown above an answer with paragraphs that state something without a citation marker. */
 export const CITATION_MISSING_TEXT = "⚠️ 일부 내용에 출처 표시 없음";
