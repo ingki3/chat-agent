@@ -260,9 +260,19 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     ]);
     // What it meant to quote, never a passage the page does not have.
     expect(changed.note!.citations[1]!.quote).toBe("10월 반도체 수출 증가율은 28%로");
-    // A conversation without an earlier note: nothing to carry — and no source tool used, so no note (#185).
+    // A conversation without an earlier note: nothing to carry — no source, so no source note; the markers are
+    // flagged unverified (`unbacked`, #185, review #190 1차).
     const fresh = app.conversations!.create(f.users.owner.id);
-    expect((await send(f.cookies.owner, fresh.id, "/cite recap")).note).toBeUndefined();
+    const lone = await send(f.cookies.owner, fresh.id, "/cite recap");
+    expect(lone.run.status).toBe("done");
+    expect(lone.text).toContain("[9]");
+    expect(lone.note?.unbacked).toBe(true);
+    expect(statuses(lone)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
+    // A carried-over note is still found past an `unbacked` one: the newest note *with sources* is carried.
+    await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].");
+    const past = await send(f.cookies.owner, c.id, "/cite recap");
+    expect(past.note?.unbacked).toBeUndefined();
+    expect(statuses(past)?.[0]).toEqual([1, "verified"]);
   });
 
   it("precedence (#150): once a run cites or fetches anything, every number is its own — nothing is carried", async () => {
@@ -326,12 +336,20 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(statuses(own)).toEqual([[1, "verified"]]);
   });
 
-  it("no source tool and nothing carried over: no note — whatever the text looks like (#185)", async () => {
+  it("no source tool and nothing carried over: no source note; a made-up marker is flagged (#185, review #190)", async () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
-    // The fake echoes the message: array indexing, a sentence-end [n] with nothing earlier under it.
-    expect((await send(f.cookies.owner, c.id, "배열 a[1] 은 두 번째 값")).note).toBeUndefined();
-    expect((await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].")).note).toBeUndefined();
+    // The fake echoes the message: array indexing is text — no note at all.
+    const array = await send(f.cookies.owner, c.id, "배열 a[1] 은 두 번째 값");
+    expect(array.run.status).toBe("done");
+    expect(array.text).toContain("배열 a[1] 은 두 번째 값");
+    expect(array.note).toBeUndefined();
+    // A sentence-end [n] with nothing earlier under it: no sources, the marker unverified.
+    const made = await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].");
+    expect(made.run.status).toBe("done");
+    expect(made.text).toContain("최신 수출은 32% 증가했다[1].");
+    expect(made.note).toMatchObject({ unbacked: true, missing: [] });
+    expect(statuses(made)).toEqual([[1, "unknown_source"]]);
   });
 
   it("research mode feeds the instructions of the next run (and cite's rules are in them)", async () => {

@@ -985,7 +985,8 @@ export class RunManager {
       .filter((m) => m.role === "assistant" && m.seq < self.seq);
     for (const m of earlier.reverse()) {
       const note = (m.parts as MessagePart[]).find((p) => p.type === "citation_note");
-      if (note && note.citations.length) return note.citations;
+      // A note without sources (`unbacked`, #185) has nothing to carry: the answer before it is looked at.
+      if (note && !note.unbacked && note.citations.length) return note.citations;
     }
     return [];
   }

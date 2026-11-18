@@ -1426,10 +1426,18 @@ describe("citationNote", () => {
     ]);
     expect(note.citations[0]).toEqual(earlier[0]);
     expect(CitationNotePart.parse(note)).toEqual(note);
-    // Another user's scope (the run's token user, not the conversation's owner): nothing carried — and with no
-    // source tool used, no note at all (#185).
+    // The valid carry-over is a note with sources (not `unbacked`).
+    expect(note.unbacked).toBeUndefined();
+    // Another user's scope (the run's token user, not the conversation's owner): the carry-over fails — no source,
+    // so no source note, only the marker flagged (`unbacked`, #185, review #190 1차).
     const stranger = { ...carry, userId: crypto.randomUUID() };
-    expect(citationNote(later.runId, text("가[1]."), f.cites, stranger)).toBeUndefined();
+    expect(citationNote(later.runId, text("가[1]."), f.cites, stranger)).toEqual({
+      type: "citation_note",
+      citations: [expect.objectContaining({ n: 1, status: "unknown_source", sourceId: null, title: null })],
+      missing: [],
+      markers: [{ n: 1, start: 1, end: 4 }],
+      unbacked: true,
+    });
     // A run that cited something itself: its numbers are its own.
     const own = f.run(f.c.id);
     f.cites.cite(own, { sourceId: src.id, snippet: "메모리 가격 회복이 증가를 이끌었다" });
@@ -1476,9 +1484,13 @@ describe("citationNote", () => {
     const note = citationNote(f.run(f.c.id).runId, text(t), f.cites, carry)!;
     expect(note.citations.map((c) => c.status)).toEqual(["verified"]);
     expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["반도체 가격도 두 배가 됐어요."]);
-    // Nothing carried (no earlier note) and no source tool: no note at all (#185).
+    // Nothing carried (no earlier note) and no source tool: the marker is flagged, no paragraph check, no sources.
     const none = { ...carry, previous: () => [] };
-    expect(citationNote(f.run(f.c.id).runId, text(t), f.cites, none)).toBeUndefined();
+    expect(citationNote(f.run(f.c.id).runId, text(t), f.cites, none)).toMatchObject({
+      citations: [expect.objectContaining({ n: 1, status: "unknown_source" })],
+      missing: [],
+      unbacked: true,
+    });
   });
 
   it("recheck (#150): the source of this conversation and user only, its stored text looked at now", () => {
@@ -1561,7 +1573,7 @@ describe("citationNote", () => {
 
   it("applies when the run used a web or file source tool, cited, or carried numbers — never by the text (#185)", () => {
     const fresh = crypto.randomUUID();
-    // No source tool, no citation, nothing carried: no note — sentence-end [n] (the #186 attachment answer) too.
+    // No source tool, no citation, nothing carried, no [n] where a citation stands: no note.
     for (const t of [
       "그냥 답이에요.",
       "배열 a[1] 은 두 번째 값",
@@ -1569,10 +1581,30 @@ describe("citationNote", () => {
       "x = a[1]\n",
       "`b[2]`.",
       "[1](http://x).",
-      "최신 수출은 32% 증가했다[1].\n\n출처 없는 다른 문단.",
-      "회의는 두 시간이었어요[1][3]. 참석자는 세 명이에요[7].",
     ])
       expect(citationNote(fresh, text(t), f.cites), t).toBeUndefined();
+    // Sentence-end [n] in such an answer cite nothing (made up, or the #186 attachment answer): no sources and no
+    // paragraph check, but every marker flagged unverified (`unbacked`, review #190 1차).
+    const made = citationNote(fresh, text("최신 수출은 32% 증가했다[1].\n\n출처 없는 다른 문단."), f.cites)!;
+    expect(made).toEqual({
+      type: "citation_note",
+      citations: [expect.objectContaining({ n: 1, status: "unknown_source", sourceId: null })],
+      missing: [],
+      markers: [{ n: 1, start: 15, end: 18 }],
+      unbacked: true,
+    });
+    expect(CitationNotePart.parse(made)).toEqual(made);
+    const many = citationNote(
+      fresh,
+      text("회의는 두 시간이었어요[1][3]. 참석자는 세 명이에요[7]."),
+      f.cites,
+    )!;
+    expect(many.citations.map((c) => [c.n, c.status])).toEqual([
+      [1, "unknown_source"],
+      [3, "unknown_source"],
+      [7, "unknown_source"],
+    ]);
+    expect(many.unbacked).toBe(true);
     // A finance tool is a source of another kind: it does not make this a citation answer.
     const finance: MessagePart[] = [
       { type: "tool_call", id: "q", name: "mcp__agentlee__us_quote", input: {} },

@@ -254,3 +254,21 @@ test("research mode is a per-conversation toggle kept by the server", async ({ p
   await newChat(page, "/cite partial");
   await expect(page.getByTestId("research-toggle")).toHaveAttribute("aria-pressed", "false");
 });
+
+test("an answer that used no source: no source box, its made-up [n] flagged ⚠️ with a notice (#185, review #190)", async ({
+  page,
+}) => {
+  await useAccount(page, MOM);
+  await page.goto("/");
+  // The fake echoes the message: no tool, a sentence-end [1] and an array index.
+  await page.getByLabel("메시지 입력").fill("최신 수출은 32% 증가했다[1]. 배열 a[2] 은 그대로예요");
+  await page.getByRole("button", { name: "보내기" }).click();
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  await expect(reply).toContainText("최신 수출은 32% 증가했다");
+  await expect(reply.getByTestId("source-note")).toHaveCount(0);
+  await expect(reply.getByTestId("citation-unbacked")).toContainText("확인되지 않은 출처 표시");
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1⚠️"]);
+  await expect(reply).toContainText("a[2]");
+  await expect(reply).not.toContainText(OK);
+});

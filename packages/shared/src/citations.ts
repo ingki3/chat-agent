@@ -31,6 +31,9 @@ export const CITATION_STATUS_TEXT: Record<CitationStatus, string> = {
   unknown_source: "⚠️ 출처를 가져오지 못했어요",
 };
 
+/** Shown under an answer whose `[n]` markers cite nothing (an `unbacked` note — the answer used no source). */
+export const CITATION_UNBACKED_TEXT = "⚠️ 확인되지 않은 출처 표시가 있어요 — 이 답변은 출처를 쓰지 않았어요.";
+
 /** Shown above an answer with paragraphs that state something without a citation marker. */
 export const CITATION_MISSING_TEXT = "⚠️ 일부 내용에 출처 표시 없음";
 
@@ -110,6 +113,12 @@ export const CitationNotePart = z.object({
    * an `[n]` elsewhere (array indexing, code) stays text.
    */
   markers: z.array(TextRange.extend({ n: z.number().int().positive() })).max(CITATION_LIMITS.markers),
+  /**
+   * The answer used no source and carried no number (#185, review #190 1차): its sentence-end `[n]` cite nothing.
+   * Every citation is `unknown_source`; the screen flags the markers in the text and shows a short notice, never a
+   * source box. Not an earlier answer's note for carrying numbers over. Absent on every other note.
+   */
+  unbacked: z.literal(true).optional(),
 });
 export type CitationNotePart = z.infer<typeof CitationNotePart>;
 

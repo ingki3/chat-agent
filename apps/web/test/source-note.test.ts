@@ -2,6 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
+  CITATION_UNBACKED_TEXT,
   FINANCE_DISCLAIMER,
   financeLabel,
   type CitationNotePart,
@@ -10,6 +11,8 @@ import {
   type PublicPart,
 } from "@agentlee/shared";
 import { Parts } from "../src/chat/Parts.js";
+import { markerNumbers } from "../src/citations/markdown.js";
+import { citationView } from "../src/citations/segments.js";
 import { dataSourceViews, sourceNoteOf } from "../src/citations/source-note.js";
 
 /**
@@ -104,6 +107,42 @@ describe("the answer's source note (#185)", () => {
     expect(count(html, "source-note")).toBe(1);
     expect(html).toContain("Yahoo Finance");
     expect(html).toContain(FINANCE_DISCLAIMER);
+  });
+
+  it("an answer whose [n] cite nothing (unbacked): the marker flagged in the text, a notice, no source box", () => {
+    const text = "최신 수출은 32% 증가했다[1].";
+    const unbacked: CitationNotePart = {
+      type: "citation_note",
+      citations: [
+        {
+          n: 1,
+          status: "unknown_source",
+          sourceId: null,
+          title: null,
+          site: null,
+          url: null,
+          publishedAt: null,
+          quote: null,
+        },
+      ],
+      missing: [],
+      markers: [{ n: 1, start: 15, end: 18 }],
+      unbacked: true,
+    };
+    const html = render([{ type: "text", text }, unbacked]);
+    expect(count(html, "source-note")).toBe(0);
+    expect(count(html, "citation-summary")).toBe(0);
+    expect(html).toContain(`data-testid="citation-unbacked">${CITATION_UNBACKED_TEXT}<`);
+    // The marker is still a citation marker of the answer (drawn as a button once the markdown chunk is there —
+    // e2e), and it reads as a failure: ⚠️, never "원문 구절 확인".
+    expect([...markerNumbers(unbacked)]).toEqual([1]);
+    expect(citationView(1, unbacked.citations[0])).toMatchObject({ ok: false, status: "unknown_source" });
+    // With a finance part (a finance tool, made-up [n]): the finance box, with the notice in it, no citation rows.
+    const both = render([{ type: "text", text }, finance(), unbacked]);
+    expect(count(both, "source-note")).toBe(1);
+    expect(count(both, "citation-unbacked")).toBe(1);
+    expect(count(both, "citation-source")).toBe(0);
+    expect(both).toContain('data-testid="citation-summary">출처 2개<');
   });
 
   it("no note part: no box", () => {

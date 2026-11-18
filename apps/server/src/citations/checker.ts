@@ -26,6 +26,9 @@ import type { CitationStore } from "./store.js";
  * used a web or file source tool (search, fetch, the source list, a search skill, reading an uploaded file #48),
  * registered a citation, or carries numbers of the answer before that the server checked again (#150). An `[n]` in
  * an answer that did none of these is text, not a citation: no note (#185 — the note is never decided from the text).
+ * Marker validation is separate from that (review #190 1차): a no-tool answer whose sentence-end `[n]` carry nothing
+ * gets an `unbacked` note — no sources, every such marker `unknown_source` — so the screen flags the marker in the
+ * text and shows no source box. Arrays (`a[1]`), code and links are never markers.
  * When it applies:
  * - every `[n]` of the answer, with the status the server gave that citation when the model registered it —
  *   a marker no `cite` produced is `unknown_source`;
@@ -111,7 +114,8 @@ const ownsNumbers = (name: string) =>
  * `unknown_source`, whatever an earlier answer had under that number. File citations are not carried (their check
  * waits for the extraction); they stay `unknown_source`. An answer that carries a number is an answer using
  * sources: its paragraphs without a marker are flagged as missing (review #153). An answer that used no source tool
- * and carries no number (nothing earlier under it, or the recheck failed) gets no note at all (#185).
+ * and carries no number (nothing earlier under it, or the recheck failed) has no sources: its markers get an
+ * `unbacked` note only (#185, review #190 1차).
  */
 export type CitationCarry = {
   conversationId: string;
@@ -208,8 +212,17 @@ export function citationNote(
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
     };
   });
-  // Provenance only (#185): an answer that used no source tool gets a note only for numbers it really carried over.
-  if (!used && !carriedAny) return undefined;
+  // Provenance only (#185): an answer that used no source tool and carried no number has no sources — it gets no
+  // source note. Its sentence-end markers still stand where citations stand, so they are not left to read as real
+  // ones: a note *without sources* (`unbacked`) marks each of them unverified in the text (review #190 1차).
+  if (!used && !carriedAny)
+    return {
+      type: "citation_note",
+      citations,
+      missing: [],
+      markers: markers.map(({ n, start, end }) => ({ n, start, end })),
+      unbacked: true,
+    };
   // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
   const missing =
     used || carriedAny

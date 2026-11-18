@@ -1,6 +1,11 @@
 import { useId, useState } from "react";
 import { Link } from "react-router";
-import { CITATION_MISSING_TEXT, type CitationNotePart, type FinanceNotePart } from "@agentlee/shared";
+import {
+  CITATION_MISSING_TEXT,
+  CITATION_UNBACKED_TEXT,
+  type CitationNotePart,
+  type FinanceNotePart,
+} from "@agentlee/shared";
 import { useFileViewHref } from "../files/context.js";
 import { CitationMarkers } from "./CitationMarker.js";
 import { segments, sourceLinkText, sourceSummary, sourceViews, type CitationView } from "./segments.js";
@@ -104,6 +109,10 @@ function DataSourceRow({ d }: { d: DataSourceView }) {
  *   that is not verified is never folded away ("⚠️ 확인 안 된 출처 N개", PRD FR-5.2, 수용 기준 3), and a data source
  *   stays listed with its as-of time (FR-7.6: the time is part of the figure).
  * Nothing when there is nothing to show (no source, no warning, no disclaimer).
+ *
+ * A citation note without sources (`unbacked`, #185 — the answer used no source, its `[n]` cite nothing) is no
+ * source: its markers are flagged ⚠️ in the text, and here it is one short notice, never a source box (unless the
+ * answer has a finance part, whose box then carries the notice).
  */
 export function SourceNote({
   citation,
@@ -117,11 +126,18 @@ export function SourceNote({
   /** Starts unfolded (tests; the chat screen starts folded). */
   defaultExpanded?: boolean;
 }) {
-  const views = citation ? sourceViews(citation) : [];
+  const unbacked = citation?.unbacked === true;
+  const views = citation && !unbacked ? sourceViews(citation) : [];
   const data = dataSourceViews(finance);
+  const unbackedNotice = unbacked && (
+    <div className="notice warn" data-testid="citation-unbacked">
+      {CITATION_UNBACKED_TEXT}
+    </div>
+  );
   const [expanded, setExpanded] = useState(defaultExpanded);
   const listId = useId();
-  const missingRanges = citation?.missing ?? [];
+  if (unbacked && !finance) return unbackedNotice;
+  const missingRanges = unbacked ? [] : (citation?.missing ?? []);
   const financeMissing = financeWarning(finance);
   const disclaimer = finance?.disclaimer;
   if (!views.length && !data.length && !missingRanges.length && !financeMissing && !disclaimer) return null;
@@ -142,6 +158,7 @@ export function SourceNote({
   const shown = expanded || !foldable ? views : views.filter((v) => !v.ok);
   return (
     <div className="cite-note source-note" data-testid="source-note">
+      {unbackedNotice}
       {missingRanges.length > 0 && (
         <div className="notice warn">
           <span data-testid="citation-missing-warning">{CITATION_MISSING_TEXT}</span>
