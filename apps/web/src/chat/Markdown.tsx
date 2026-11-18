@@ -8,7 +8,9 @@ import { splitBlocks } from "./blocks.js";
 import { CopyButton } from "./CopyButton.js";
 import { fenceClosed } from "./mermaid.js";
 import { MermaidBlock } from "./MermaidBlock.js";
-import { rehypeCitationMarkers } from "../citations/markdown.js";
+import type { TextRange } from "@agentlee/shared";
+import { CITATION_MISSING_MARK } from "@agentlee/shared";
+import { rehypeCitationMarkers, rehypeMissingMarks } from "../citations/markdown.js";
 import "katex/dist/katex.min.css";
 
 /**
@@ -107,11 +109,34 @@ const components: Components = {
       <span className="badlink">🖼 {alt || "그림"}</span>
     ),
   pre: ({ node, children }) => <CodeBlock node={node as HastNode | undefined}>{children}</CodeBlock>,
-  table: ({ children }) => (
-    <div className="tablewrap">
-      <table>{children}</table>
-    </div>
-  ),
+  table: ({ children, ...props }) => {
+    // A table without a citation (#202, `rehypeMissingMarks`): marked as a whole, the ⚠️ above it.
+    const mark = (props as Record<string, unknown>)["data-cite-missing"];
+    return typeof mark === "string" ? (
+      <div
+        className="cite-missing-block cite-missing-table"
+        data-cite-missing={mark}
+        data-testid="citation-missing"
+        tabIndex={-1}
+      >
+        <span
+          className="cite-missing-badge"
+          role="img"
+          aria-label={CITATION_MISSING_MARK}
+          title={CITATION_MISSING_MARK}
+        >
+          ⚠️
+        </span>
+        <div className="tablewrap">
+          <table>{children}</table>
+        </div>
+      </div>
+    ) : (
+      <div className="tablewrap">
+        <table>{children}</table>
+      </div>
+    );
+  },
 };
 
 const remarkPlugins: ComponentProps<typeof ReactMarkdown>["remarkPlugins"] = [
@@ -126,23 +151,38 @@ const rehypePlugins: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
 
 /**
  * Citation markers of a finished answer (#25): which `[n]` are citations, and how one is drawn. Without it the
- * text renders exactly as before.
+ * text renders exactly as before. `missing` (#202): the note's ranges of paragraphs without a citation (in the
+ * answer text), marked in place with the answer's `markId`.
  */
-export type MarkdownCite = { numbers: ReadonlySet<number>; render: (ns: number[]) => ReactNode };
+export type MarkdownCite = {
+  numbers: ReadonlySet<number>;
+  render: (ns: number[]) => ReactNode;
+  missing?: readonly TextRange[];
+  markId?: string;
+};
 
 /** One block; memoised on its text, so finished blocks are not parsed again while the reply streams. */
 export const MarkdownBlock = memo(function MarkdownBlock({
   text,
   cite,
+  offset = 0,
 }: {
   text: string;
   cite?: MarkdownCite;
+  /** Where this block starts in the answer text (the note's ranges point into it). */
+  offset?: number;
 }) {
   const withCite = useMemo(
     () =>
       cite
         ? {
-            rehype: [...(rehypePlugins ?? []), rehypeCitationMarkers(cite.numbers)],
+            rehype: [
+              ...(rehypePlugins ?? []),
+              rehypeCitationMarkers(cite.numbers),
+              ...(cite.missing?.length && cite.markId
+                ? [rehypeMissingMarks(cite.missing, offset, cite.markId)]
+                : []),
+            ],
             components: {
               ...components,
               sup: ({ node, children }: { node?: unknown; children?: ReactNode }) => {
@@ -158,7 +198,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
             } as Components,
           }
         : undefined,
-    [cite],
+    [cite, offset],
   );
   return (
     <BlockText.Provider value={text}>
@@ -175,11 +215,25 @@ export const MarkdownBlock = memo(function MarkdownBlock({
   );
 });
 
-const Markdown = memo(function Markdown({ text, cite }: { text: string; cite?: MarkdownCite }) {
+const Markdown = memo(function Markdown({
+  text,
+  cite,
+  offset = 0,
+}: {
+  text: string;
+  cite?: MarkdownCite;
+  /** Where this text starts in the answer text (text parts joined, #202). */
+  offset?: number;
+}) {
+  const blocks = splitBlocks(text);
+  const starts = blocks.reduce<number[]>(
+    (acc, b, i) => [...acc, i ? acc[i - 1]! + blocks[i - 1]!.length : offset],
+    [],
+  );
   return (
     <div className="md">
-      {splitBlocks(text).map((b, i) => (
-        <MarkdownBlock key={i} text={b} {...(cite ? { cite } : {})} />
+      {blocks.map((b, i) => (
+        <MarkdownBlock key={i} text={b} offset={starts[i]!} {...(cite ? { cite } : {})} />
       ))}
     </div>
   );

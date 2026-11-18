@@ -170,6 +170,17 @@ function expectScenario(name: CitationScenarioName | "reuse-fresh", r: Result, l
         "- 미국 수출 비중이 가장 컸어요",
       ]);
       break;
+    case "advice":
+      // #202: progress notes, the cited table, the opinion said so and the closing offer are not flagged.
+      expect(statuses(r), label).toEqual([
+        [1, "verified"],
+        [2, "verified"],
+      ]);
+      expect(missingText(r), label).toEqual([
+        "- **전망:** 업계는 내년에도 두 자릿수 증가를 예상해요",
+        "미국 수출 비중이 가장 컸어요.",
+      ]);
+      break;
     case "reuse":
       // Pages of the earlier answer, checked again; [3] was never cited in this answer.
       expect(statuses(r), label).toEqual([
@@ -224,7 +235,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     expectScenario("conflict", await send(f.cookies.owner, c.id, "/cite conflict"));
     expectScenario("reuse", await send(f.cookies.owner, c.id, "/cite reuse"));
-    for (const name of ["insufficient", "partial"] as const) {
+    for (const name of ["insufficient", "partial", "advice"] as const) {
       const conv = app.conversations!.create(f.users.owner.id);
       expectScenario(name, await send(f.cookies.owner, conv.id, `/cite ${name}`));
     }
@@ -428,11 +439,11 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     // The owner has the finance tools too (finance@5): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@10"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@11"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
-      "common@10",
+      "common@11",
       "research@4",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
@@ -440,7 +451,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(prompt).toContain("`cite`(첨부 파일은 `file_cite`)로 검증한 표시");
     expect(prompt).toContain("`sources_list`");
     await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: false });
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@10"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@11"]);
     expect(rt.systemPrompts.at(-1)).not.toContain("# 자료 조사 모드");
   });
 
@@ -598,7 +609,7 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       const recap = await send(f.cookies.owner, recapConv.id, "/cite recap", rt);
       expectScenario("recap", recap, `${rt} recap`);
       const rest = [recap];
-      for (const name of ["insufficient", "partial", "many"] as const) {
+      for (const name of ["insufficient", "partial", "advice", "many"] as const) {
         const conv = app.conversations!.create(f.users.owner.id);
         if (name === "many") await send(f.cookies.owner, conv.id, "/cite fetchmany", rt);
         const r = await send(f.cookies.owner, conv.id, `/cite ${name}`, rt);

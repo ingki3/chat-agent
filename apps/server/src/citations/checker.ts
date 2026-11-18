@@ -10,6 +10,7 @@ import {
   citationMarkers,
   sentenceEndMarkers,
   uncitedUnits,
+  unitSentences,
   type TextRange,
   type CitationEntry,
   type CitationStatus,
@@ -33,8 +34,9 @@ import type { CitationStore } from "./store.js";
  * When it applies:
  * - every `[n]` of the answer, with the status the server gave that citation when the model registered it —
  *   a marker no `cite` produced is `unknown_source`;
- * - the body paragraphs without any marker (headings, list lead-ins, disclaimers excluded) — "일부 내용에 출처
- *   표시 없음".
+ * - the body paragraphs without any marker (headings, list lead-ins, disclaimers excluded; a table is one unit, and
+ *   progress notes, closing offers and opinions said so are not flagged — #202, `missingUnits`) — marked in the
+ *   answer on the screen, with one line "출처 표시 없는 문단 N개".
  * The note is the server's, after the runtime's text. It is built from the server's own citation rows, not from
  * the tool results a runtime reports.
  */
@@ -49,19 +51,32 @@ export function isWebTool(name: string): boolean {
 export const answerText = (parts: readonly MessagePart[]) =>
   parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
 
-/** Where in the answer text the first tool call came (the length of the text written before it). */
-export function firstToolAt(parts: readonly MessagePart[]): number {
+/** Where in the answer text each tool call came (the length of the text written before it), in order. */
+export function toolCallsAt(parts: readonly MessagePart[]): number[] {
+  const out: number[] = [];
   let at = 0;
   for (const p of parts) {
-    if (p.type === "tool_call") return at;
+    if (p.type === "tool_call") out.push(at);
     if (p.type === "text") at += p.text.length;
   }
-  return Number.POSITIVE_INFINITY;
+  return out;
+}
+
+/** Where in the answer text the first tool call came (the length of the text written before it). */
+export function firstToolAt(parts: readonly MessagePart[]): number {
+  return toolCallsAt(parts)[0] ?? Number.POSITIVE_INFINITY;
 }
 
 /** "자료를 찾아 비교해 볼게요." — what the model says it is about to do, not something it states. */
 const PROGRESS =
   /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
+
+/** "…확인하고 있어요." — what the model is doing right now (#202). */
+const ONGOING = /(?:고\s*있(?:어요|습니다)|(?:하는|보는|읽는|찾는)\s*중(?:이에요|입니다))[.!…~]*$/u;
+
+/** "파일을 다 읽었어요." — a step of reading the material done (#202): reading, finding, checking, opening. */
+const STEP_DONE =
+  /(?:읽었|확인했|살펴봤|살펴보았|찾았|찾아봤|열어봤|열었|훑어봤|검토했|가져왔)(?:어요|습니다)[.!…~]*$/u;
 
 /** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
 const CONNECTIVE =
@@ -69,18 +84,88 @@ const CONNECTIVE =
 
 /** A complement clause that carries a fact ("양산이 확정됐음을 알려드리겠습니다", "…다는", "…라는"). */
 const COMPLEMENT = /(?:음을|함을|임을|다는|라는|냐는|다고|라고)\s/u;
+/** "…늘어난 것을 확인했어요" — what was found, said as the object of the step (#202): a statement. */
+const FOUND = /(?:것을|걸|점을|사실을|내용을)\s/u;
 
 /**
  * A short progress note before the first tool call: one sentence, no figure, no marker, saying what comes next.
  * Paragraphs that state something before a tool call are still checked.
+ *
+ * Between tool calls (#202 — the model narrating its work: "파일을 다 읽었어요. 이제 입결 시트를 확인하고 있어요."):
+ * a short paragraph before a later tool call, no figure, up to three sentences, each one saying what it will do,
+ * is doing or has just read / checked — never one that states something (a joined clause, "…다는", "…것을").
  */
-export function isProgressNote(text: string, u: TextRange, toolAt: number): boolean {
-  if (u.end > toolAt) return false;
+export function isProgressNote(
+  text: string,
+  u: TextRange,
+  toolAt: number,
+  lastToolAt: number = toolAt,
+): boolean {
   const t = text.slice(u.start, u.end).trim();
-  if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
-  // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
-  if (CONNECTIVE.test(t) || COMPLEMENT.test(t)) return false;
-  return PROGRESS.test(t);
+  if (u.end <= toolAt) {
+    if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
+    // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
+    if (CONNECTIVE.test(t) || COMPLEMENT.test(t)) return false;
+    return PROGRESS.test(t);
+  }
+  if (u.end > lastToolAt || t.length > 160 || /\d/.test(t) || t.includes("\n")) return false;
+  const sentences = unitSentences(t);
+  return (
+    sentences.length <= 3 &&
+    sentences.every((s) => {
+      // "확인하고 있어요": the auxiliary is not a joined clause.
+      const bare = s.replace(/고\s*있(?:어요|습니다)([.!…~]*)$/u, "$1");
+      if (CONNECTIVE.test(bare) || COMPLEMENT.test(s) || FOUND.test(s)) return false;
+      return PROGRESS.test(s) || ONGOING.test(s) || STEP_DONE.test(s);
+    })
+  );
+}
+
+/** A closing offer or question (#202): "원하시면 학과별로 비교해 드릴게요.", "어느 전형이 더 궁금하세요?" */
+const OFFER_END =
+  /(?:드릴까요|할까요|볼까요|드릴게요|드리겠습니다|해\s*드릴게요|말씀해\s*주세요|말씀해주세요|알려\s*주세요|알려주세요|물어보세요|물어봐\s*주세요|궁금하세요|궁금하신가요|원하세요|원하시나요|필요하세요|필요하신가요|있으세요|있으신가요|괜찮으세요|어떠세요|어떨까요)[.!?？…~]*$/u;
+/** The conditional an offer starts with ("원하시면", "필요하시면", "더 궁금한 점이 있으면"). */
+const OFFER_IF =
+  /^(?:혹시\s*)?(?:더\s*)?(?:원하시면|필요하시면|궁금하시면|괜찮으시면|말씀해\s*주시면|알려\s*주시면|궁금한\s*점이\s*있으면|필요한\s*게\s*있으면)\s*,?\s*/u;
+
+/**
+ * A closing offer or question after the last tool call (#202): short, no figure, every sentence an offer or a question
+ * to the user — nothing stated in it (no joined clause, no "…다는").
+ */
+export function isClosingOffer(text: string, u: TextRange, lastToolAt: number): boolean {
+  if (u.start < lastToolAt) return false;
+  const t = text.slice(u.start, u.end).trim();
+  if (t.length > 200 || /\d/.test(t)) return false;
+  const sentences = unitSentences(t).map((s) => s.replace(/^\s*(?:[-*+•·])\s+/u, ""));
+  return (
+    sentences.length > 0 &&
+    sentences.length <= 3 &&
+    sentences.every((s) => {
+      const bare = s.replace(OFFER_IF, "");
+      return OFFER_END.test(bare) && !CONNECTIVE.test(bare) && !COMPLEMENT.test(bare) && !FOUND.test(bare);
+    })
+  );
+}
+
+/**
+ * The paragraphs the note flags (#25, #202): body units without a marker (`uncitedUnits` — tables as one unit,
+ * opinions said so excluded), less progress notes and, at the end of the answer, closing offers and questions.
+ */
+export function missingUnits(text: string, parts: readonly MessagePart[]): TextRange[] {
+  const at = toolCallsAt(parts);
+  const first = at[0] ?? Number.POSITIVE_INFINITY;
+  const last = at.at(-1) ?? Number.NEGATIVE_INFINITY;
+  const units = uncitedUnits(text).filter((u) => !isProgressNote(text, u, first, last));
+  // Only at the very end: an offer is how an answer ends — nothing else (cited or not) may come after it.
+  let end = units.length;
+  let tail = text.length;
+  while (end > 0) {
+    const u = units[end - 1]!;
+    if (text.slice(u.end, tail).trim() || !isClosingOffer(text, u, last)) break;
+    tail = u.start;
+    end--;
+  }
+  return units.slice(0, end);
 }
 
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
@@ -311,12 +396,7 @@ export function citationNote(
       unbacked: true,
     };
   // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
-  const missing =
-    used || carriedAny
-      ? uncitedUnits(text)
-          .filter((u) => !isProgressNote(text, u, firstToolAt(parts)))
-          .slice(0, CITATION_LIMITS.missing)
-      : [];
+  const missing = used || carriedAny ? missingUnits(text, parts).slice(0, CITATION_LIMITS.missing) : [];
   return {
     type: "citation_note",
     citations,

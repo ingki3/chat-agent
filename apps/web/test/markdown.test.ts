@@ -182,3 +182,86 @@ describe("citation markers in the markdown view (#25, #150)", () => {
     expect(out).toContain("목록[9]");
   });
 });
+
+describe("paragraphs without a citation, marked in the answer (#202)", () => {
+  const ANSWER = [
+    "## 요약",
+    "",
+    "메모리 가격 회복이 증가를 이끌었어요[1].",
+    "",
+    "미국 수출 비중이 가장 컸어요.",
+    "",
+    "- **배경:** 메모리 가격이에요[1]",
+    "- **전망:** 증가를 예상해요",
+    "  - 하위 항목도 있어요",
+    "",
+    "| 자료 | 증가율 |",
+    "|---|---|",
+    "| 가 | 32% |",
+    "",
+    "> 인용문이에요.",
+  ].join("\n");
+  const range = (full: string, s: string) => {
+    const start = full.indexOf(s);
+    return { start, end: start + s.length };
+  };
+  const marked = (text: string, missing: { start: number; end: number }[], offset = 0) =>
+    renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        offset,
+        cite: { numbers: new Set([1]), render: () => createElement("b", null, "1"), missing, markId: "m1" },
+      }),
+    );
+  const marks = (html: string) =>
+    [...html.matchAll(/<(\w+)[^>]*data-cite-missing="m1"[^>]*>/g)].map((m) => m[1]);
+
+  it("each range marks its paragraph, list item, table or quote in place — with a ⚠️, the text not repeated", () => {
+    const missing = [
+      range(ANSWER, "미국 수출 비중이 가장 컸어요."),
+      range(ANSWER, "- **전망:** 증가를 예상해요"),
+      range(ANSWER, "  - 하위 항목도 있어요"),
+      range(ANSWER, "| 자료 | 증가율 |\n|---|---|\n| 가 | 32% |"),
+      range(ANSWER, "> 인용문이에요."),
+    ];
+    const out = marked(ANSWER, missing);
+    expect(marks(out)).toEqual(["p", "li", "li", "div", "blockquote"]);
+    // The ⚠️ at the end of the paragraph's own text; the nested item has its own.
+    expect(out).toMatch(
+      /미국 수출 비중이 가장 컸어요\.<span class="cite-missing-badge" role="img" aria-label="출처 표시 없음"[^>]*>⚠️<\/span><\/p>/,
+    );
+    expect(out).toMatch(/증가를 예상해요\n?<span class="cite-missing-badge"[^>]*>⚠️<\/span>\n?<ul>/);
+    expect(out.split("⚠️")).toHaveLength(6);
+    // Every paragraph once: nothing is repeated.
+    expect(out.split("미국 수출 비중이 가장 컸어요.")).toHaveLength(2);
+    // Cited ones, the heading and the first item are not marked.
+    expect(out).toMatch(/<p>메모리 가격 회복이 증가를 이끌었어요<b>1<\/b>\.<\/p>/);
+    expect(out).toMatch(/<h2>요약<\/h2>/);
+  });
+
+  it("ranges point into the answer text: a later text part and later blocks use their offset", () => {
+    const first = "앞 부분이에요[1].\n\n";
+    const second = "뒷 문단이에요.\n\n또 다른 문단이에요[1].";
+    const all = first + second;
+    const out = marked(second, [range(all, "뒷 문단이에요.")], first.length);
+    expect(marks(out)).toEqual(["p"]);
+    expect(out).toMatch(/뒷 문단이에요\.<span class="cite-missing-badge"/);
+    // Without the offset the same range points elsewhere: nothing is marked by mistake.
+    expect(marks(marked(second, [range(all, "뒷 문단이에요.")]))).toEqual([]);
+  });
+
+  it("an old note's ranges (stored before #202: tables, progress notes) still mark their paragraphs", () => {
+    const text = "자료를 찾아 볼게요.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n원하시면 더 정리해 드릴게요.";
+    const out = marked(text, [
+      range(text, "자료를 찾아 볼게요."),
+      range(text, "| a | b |\n|---|---|\n| 1 | 2 |"),
+      range(text, "원하시면 더 정리해 드릴게요."),
+    ]);
+    expect(marks(out)).toEqual(["p", "div", "p"]);
+  });
+
+  it("no ranges, or no note: nothing is marked", () => {
+    expect(marks(marked(ANSWER, []))).toEqual([]);
+    expect(render(ANSWER)).not.toContain("data-cite-missing");
+  });
+});

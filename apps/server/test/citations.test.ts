@@ -1747,6 +1747,125 @@ describe("citationNote", () => {
     expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);
   });
 
+  describe("#202: the production shape — an attachment answer with a table, a list, progress notes, opinions, an offer", () => {
+    const read = (id: string): MessagePart[] => [
+      { type: "tool_call", id, name: "mcp__agentlee__file_read", input: { fileId: "f1" } },
+      { type: "tool_result", callId: id, output: {}, isError: false },
+    ];
+    const ANSWER = [
+      "## 지원 전략 요약",
+      "",
+      "2025학년도 학종 경쟁률은 12.3대 1이었어요[1].",
+      "",
+      "아래는 전형별 입결이에요[2]:",
+      "",
+      "| 전형 | 모집단위 | 70%컷 |",
+      "|---|---|---|",
+      "| 학종 | 경영학과 | 2.1 |",
+      "| 교과 | 경영학과 | 1.8 |",
+      "",
+      "- **학종:** 서류 비중이 커요[3]",
+      "- **교과:** 최저 기준이 있어요",
+      "",
+      "| 구분 | 2025 | 2026 |",
+      "| --- | --- | --- |",
+      "| 모집인원 | 30 | 28 |",
+      "",
+      "출처: 2026 시행계획[4]",
+      "",
+      "정시 모집인원은 2026학년도에 5명 줄었어요.",
+      "",
+      "학과별 경쟁률은 다음과 같아요.",
+      "",
+      "학과 | 경쟁률",
+      "--- | ---",
+      "경영 | 10",
+      "",
+      "제 판단으로는 학종이 가장 현실적인 선택이에요. 내신 2.0이면 안정권이라는 게 제 추정이에요.",
+      "",
+      "- **추천:** 제 생각에는 학종 위주로 준비하시는 게 좋아요.",
+      "",
+      "학종을 준비하는 게 좋아요.",
+      "",
+      "원하시면 학과별로 더 자세히 비교해 드릴게요. 어느 전형이 더 궁금하세요?",
+    ].join("\n");
+    const parts: MessagePart[] = [
+      ...text("첨부하신 입결 파일을 읽어 볼게요.\n\n"),
+      ...read("r1"),
+      ...text("엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.\n\n"),
+      ...read("r2"),
+      ...text(ANSWER),
+    ];
+    const missingOf = (ps: MessagePart[]) => {
+      const t = ps.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
+      return citationNote(crypto.randomUUID(), ps, f.cites)!.missing.map((r) => t.slice(r.start, r.end));
+    };
+
+    it("only the factual paragraphs without a marker are flagged; a table is one unit", () => {
+      expect(missingOf(parts)).toEqual([
+        "- **교과:** 최저 기준이 있어요",
+        "정시 모집인원은 2026학년도에 5명 줄었어요.",
+        "학과별 경쟁률은 다음과 같아요.",
+        // A table no marker covers: flagged once, as a whole (rows without a leading `|` too).
+        "학과 | 경쟁률\n--- | ---\n경영 | 10",
+        // Advice that does not say it is an opinion is still checked (the instructions ask to say so).
+        "학종을 준비하는 게 좋아요.",
+      ]);
+    });
+
+    it("conservative: anything stating something is still flagged", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      for (const note of [
+        "파일을 읽어 보니 경쟁률이 올랐어요.",
+        "학종 경쟁률이 오른 것을 확인했어요.",
+        "시트 2개를 다 읽었어요.",
+        "경쟁률이 올랐어요. 이제 확인하고 있어요.",
+        "경영학과가 가장 높다는 내용을 확인했어요.",
+      ])
+        expect(between(note), note).toEqual([note]);
+      // The same note after the last tool call is the answer: checked.
+      expect(missingOf([...read("a"), ...text("가[1].\n\n엑셀을 다 읽었어요.")])).toEqual([
+        "엑셀을 다 읽었어요.",
+      ]);
+      // An opinion paragraph with a sentence that does not say so, or framing in other words: checked.
+      for (const p of [
+        "제 판단으로는 학종이 나아요. 교과 최저는 수능 최저가 있어요.",
+        "학종이 유리해요. 제 추정이에요.",
+        "학종이 유리하다고 봐요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // An offer that is not the end, or one that states something.
+      expect(
+        missingOf([...read("a"), ...text("원하시면 더 비교해 드릴게요.\n\n논술 전형은 없어요.\n\n가[1].")]),
+      ).toEqual(["원하시면 더 비교해 드릴게요.", "논술 전형은 없어요."]);
+      for (const p of [
+        "A대는 논술이 없는데 괜찮으세요?",
+        "경쟁률이 열두 대 일이에요. 더 볼까요?",
+        "2명 더 뽑아요, 지원해 볼까요?",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // A table: a marker elsewhere in the paragraph before, or a short cited sentence after that is no caption.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`자료는 시행계획이에요[1]. 아래 표를 보세요.\n\n${table}`)]),
+      ).toEqual([table]);
+      expect(missingOf([...read("a"), ...text(`${table}\n\n그래서 학종이 유리해요[1].`)])).toEqual([table]);
+    });
+
+    it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      for (const t of [
+        "| a | b |\n|---|---|\n| 1[1] | 2 |",
+        `입결은 아래 표와 같아요[1].\n\n${table}`,
+        `### 2025 입결[1]\n\n${table}`,
+        `${table}\n\n*표 1. 2025 입결[1]*`,
+        `${table}\n\n(자료: 2026 시행계획[1])`,
+      ])
+        expect(missingOf([...read("a"), ...text(t)]), t).toEqual([]);
+    });
+  });
+
   it("applies when the run used a web or file source tool, cited, or carried numbers — never by the text (#185)", () => {
     const fresh = crypto.randomUUID();
     // No source tool, no citation, nothing carried, no [n] where a citation stands: no note.

@@ -77,6 +77,8 @@ export const FIXTURE_SEARCH: Readonly<
 export type CitationCall = {
   tool: "web_search" | "web_fetch" | "sources_list" | "cite";
   input: Record<string, unknown>;
+  /** Text the FakeRuntime writes before this call (the model narrating its work between calls, #202). */
+  before?: string;
 };
 export type CitationScenario = { calls: CitationCall[]; answer: string };
 
@@ -135,6 +137,44 @@ export const CITATION_SCENARIOS = {
     ],
     answer:
       "### 요약\n\n10월 반도체 수출은 메모리 가격 회복 덕에 늘었어요[1].\n\n업계는 내년에도 두 자릿수 증가를 예상해요.\n\n주요 내용:\n- 증가의 배경은 메모리 가격이에요[1]\n- 미국 수출 비중이 가장 컸어요\n\n※ 이 답변은 공개 보도를 바탕으로 했어요.",
+  },
+  /**
+   * The shape of #202's production answer: progress notes between the calls, a cited table, a list, an uncited
+   * factual paragraph, an opinion said so and a closing offer. Only the factual paragraph and the list item without
+   * a marker are flagged — marked in the answer, counted in one line under it.
+   */
+  advice: {
+    calls: [
+      { tool: "web_fetch", input: { url: A.url }, before: "자료를 찾아 볼게요.\n\n" },
+      {
+        tool: "web_fetch",
+        input: { url: B.url },
+        before: "첫 기사를 다 읽었어요. 이제 통계 자료를 확인하고 있어요.\n\n",
+      },
+      { tool: "cite", input: { sourceId: "$0.sourceId", snippet: "메모리 가격 회복이 증가를 이끌었다" } },
+      { tool: "cite", input: { sourceId: "$1.sourceId", snippet: "“10월 반도체 수출 증가율은  28%로”" } },
+    ],
+    answer: [
+      "## 10월 반도체 수출",
+      "",
+      "메모리 가격 회복이 증가를 이끌었어요[1].",
+      "",
+      "두 자료의 증가율은 이래요[2]:",
+      "",
+      "| 자료 | 증가율 |",
+      "|---|---|",
+      "| 가나다 신문 | 32% |",
+      "| 라마바 통계 | 28% |",
+      "",
+      "- **배경:** 메모리 가격 회복이에요[1]",
+      "- **전망:** 업계는 내년에도 두 자릿수 증가를 예상해요",
+      "",
+      "미국 수출 비중이 가장 컸어요.",
+      "",
+      "제 판단으로는 증가세가 당분간 이어질 거예요. 두 수치의 차이는 집계 기준 때문이라는 게 제 추정이에요.",
+      "",
+      "원하시면 품목별로 더 자세히 정리해 드릴게요.",
+    ].join("\n"),
   },
   /**
    * A follow-up that cites pages fetched in an earlier answer of the same conversation (after `conflict`): found

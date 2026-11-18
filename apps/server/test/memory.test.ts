@@ -509,10 +509,10 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
   });
 
   it("over the budget in a session: items left out, marked in the box, and '기억 일부만 넣었어요' once", async () => {
-    // A small window (test registry only): 25% of 38,000 tokens = 9,500 bytes for everything (the system
+    // A small window (test registry only): 25% of 42,000 tokens = 10,500 bytes for everything (the system
     // instructions included — 26,000 left no room for any item once #185's source rules were added, 30,000 none
-    // once common@8's diagram rules were).
-    const t = await start({ window: 38_000 });
+    // once common@8's diagram rules were, 38,000 too little once common@11's missing-citation rules were).
+    const t = await start({ window: 42_000 });
     t.connect("claude-code");
     const items = Array.from(
       { length: 200 },
@@ -567,9 +567,10 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
       "user",
     );
     // Two long messages (≈ 19,000 estimated tokens) + the reserve stay under 28,000; with the documents they do not.
-    // (9,000 each left the documents too little room once common@10's file citation rules were added — the
-    // documents' budget includes the system instructions.)
-    const long = "다".repeat(9500); // 28,500 bytes ≈ 9,500 tokens each
+    // (9,000 each left the documents too little room once common@10's file citation rules were added, 9,500 once
+    // common@11's missing-citation rules were — the documents' budget includes the system instructions; 9,700–9,900
+    // pass, 9,800 sits in the middle.)
+    const long = "다".repeat(9800); // 29,400 bytes ≈ 9,800 tokens each
     for (const t of [a, b]) {
       const c = await t.newConversation();
       await t.send(c, long);

@@ -1,4 +1,4 @@
-import { Fragment, memo, useMemo, useState } from "react";
+import { Fragment, memo, useId, useMemo, useState } from "react";
 import { redactForDisplay, type PublicPart } from "@agentlee/shared";
 import { Link } from "react-router";
 import { files } from "../api.js";
@@ -206,22 +206,25 @@ const PartView = memo(function PartView({
   part,
   cite,
   text,
+  offset,
   sources,
 }: {
   part: PublicPart;
   cite?: MarkdownCite | undefined;
   text: string;
+  /** A text part: where it starts in the answer text (the note's ranges point into it, #202). */
+  offset: number;
   /** The answer's source note parts (#185): drawn once, as one box, where the first of them is. */
   sources?: SourceNoteParts | undefined;
 }) {
   switch (part.type) {
     case "text":
-      return <RichText text={part.text} cite={cite} />;
+      return <RichText text={part.text} cite={cite} offset={offset} />;
     // The source note (#185): a citation note and a finance note of the same answer are one "출처" box.
     case "citation_note":
     case "finance_note":
       return sources ? (
-        <SourceNote citation={sources.citation} finance={sources.finance} text={text} />
+        <SourceNote citation={sources.citation} finance={sources.finance} text={text} markId={cite?.markId} />
       ) : null;
     case "table":
       return <TableView t={part} />;
@@ -268,16 +271,26 @@ export function FileRef({ part }: { part: Extract<PublicPart, { type: "file_ref"
 export function Parts({ parts, streaming = false }: { parts: readonly PublicPart[]; streaming?: boolean }) {
   // Citations (#25): once the answer is finished and carries the server's note, `[n]` become citation buttons.
   const note = streaming ? undefined : citationNoteOf(parts);
+  // The answer's paragraphs without a citation are marked in its text with this id (#202): the note's summary
+  // line moves to them.
+  const markId = useId();
   const cite = useMemo<MarkdownCite | undefined>(() => {
     if (!note) return undefined;
     const byN = new Map(note.citations.map((c) => [c.n, c]));
     return {
       numbers: markerNumbers(note),
       render: (ns) => <CitationMarkers views={ns.map((n) => citationView(n, byN.get(n)))} />,
+      ...(note.unbacked || !note.missing.length ? {} : { missing: note.missing, markId }),
     };
-  }, [note]);
-  // The answer text as the server joined it (the note's ranges point into it).
+  }, [note, markId]);
+  // The answer text as the server joined it (the note's ranges point into it), and where each text part starts.
   const answer = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
+  const offsets = new Map<number, number>();
+  parts.reduce((at, p, i) => {
+    if (p.type !== "text") return at;
+    offsets.set(i, at);
+    return at + p.text.length;
+  }, 0);
   const sources = useMemo(() => sourceNoteOf(parts), [parts]);
   return (
     <>
@@ -306,6 +319,7 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
             part={s.part}
             cite={cite}
             text={answer}
+            offset={offsets.get(s.index) ?? 0}
             sources={sources && s.index === sources.at ? sources : undefined}
           />
         ),

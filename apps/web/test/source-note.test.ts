@@ -150,3 +150,41 @@ describe("the answer's source note (#185)", () => {
     expect(render([{ type: "text", text: "349.8달러" }])).not.toContain("source-note");
   });
 });
+
+describe("paragraphs without a citation (#202): one summary line, the paragraphs marked in the answer", () => {
+  const parts = (missingOf: string[], texts: string[]): PublicPart[] => {
+    const all = texts.join("");
+    return [
+      ...texts.map((t) => ({ type: "text" as const, text: t })),
+      {
+        ...citation,
+        missing: missingOf.map((s) => ({ start: all.indexOf(s), end: all.indexOf(s) + s.length })),
+        markers: [{ n: 1, start: all.indexOf("[1]"), end: all.indexOf("[1]") + 3 }],
+      },
+    ];
+  };
+
+  it("the note says how many — a button that moves to them — and never repeats their text", () => {
+    const texts = [TEXT + "\n\n", "미국 수출 비중이 가장 컸어요.\n\n업계는 증가를 예상해요."];
+    const html = render(parts(["미국 수출 비중이 가장 컸어요.", "업계는 증가를 예상해요."], texts));
+    expect(count(html, "source-note")).toBe(1);
+    expect(html).toMatch(
+      /<button type="button" class="cite-missing-jump" data-testid="citation-missing-warning" aria-label="⚠️ 출처 표시 없는 문단 2개 — 눌러서 해당 문단으로 이동">⚠️ 출처 표시 없는 문단 2개/,
+    );
+    // Each paragraph once (in the answer), not again in the note; no excerpt list.
+    expect(html.split("미국 수출 비중이 가장 컸어요.")).toHaveLength(2);
+    expect(html).not.toContain("cite-missing-list");
+    expect(html).not.toContain("일부 내용에 출처 표시 없음");
+  });
+
+  it("an old note (ranges stored before #202, several text parts) renders: the count of the ranges that fit", () => {
+    const texts = ["자료를 찾아 볼게요.\n\n", TEXT];
+    const p = parts(["자료를 찾아 볼게요."], texts);
+    (p.at(-1) as CitationNotePart).missing.push({ start: 0, end: 9999 });
+    expect(render(p)).toContain("⚠️ 출처 표시 없는 문단 1개");
+  });
+
+  it("no ranges, or an unbacked note: no summary line", () => {
+    expect(render(parts([], [TEXT]))).not.toContain("citation-missing-warning");
+  });
+});

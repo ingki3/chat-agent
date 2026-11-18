@@ -1,4 +1,4 @@
-import type { CitationNotePart } from "@agentlee/shared";
+import { CITATION_MISSING_MARK, type CitationNotePart, type TextRange } from "@agentlee/shared";
 import { ADJACENT } from "./segments.js";
 
 /**
@@ -15,6 +15,7 @@ type Hast = {
   value?: string;
   properties?: Record<string, unknown>;
   children?: Hast[];
+  position?: { start: { offset?: number } };
 };
 
 const MARKER = /\[(\d{1,3})\]/g;
@@ -59,3 +60,64 @@ export function rehypeCitationMarkers(numbers: ReadonlySet<number>) {
 /** The marker numbers of a note. */
 export const markerNumbers = (note: CitationNotePart): ReadonlySet<number> =>
   new Set(note.markers.map((m) => m.n));
+
+/** The elements a paragraph of the answer becomes: what a missing-citation range marks (#202). */
+const MARKABLE = new Set(["p", "li", "table", "blockquote"]);
+const NESTED = new Set(["ul", "ol", "table", "blockquote", "pre", "div"]);
+
+/** The small ⚠️ at the end of a marked paragraph. */
+const badge = (): Hast => ({
+  type: "element",
+  tagName: "span",
+  properties: {
+    className: ["cite-missing-badge"],
+    role: "img",
+    ariaLabel: CITATION_MISSING_MARK,
+    title: CITATION_MISSING_MARK,
+  },
+  children: [{ type: "text", value: "⚠️" }],
+});
+
+/**
+ * Paragraphs without a citation, marked in the rendered answer (#202 — the source note no longer repeats them).
+ * `ranges` are the note's `missing` ranges in the answer text; `offset` is where this markdown block starts in it
+ * (text parts joined, then `splitBlocks`). An element whose source starts inside a range is that paragraph: a
+ * paragraph, a list item (the outermost — a loose item's own paragraph is inside it; a nested item starts its own
+ * range), a table or a quote. It gets `data-cite-missing` (the answer's mark id, which the summary line moves to),
+ * focusability for that move, and a ⚠️ at the end of its text (a table's ⚠️ is drawn by the table component).
+ * Ranges stored by an older server mark the same way: the marks come from the ranges, nothing is recomputed.
+ */
+export function rehypeMissingMarks(ranges: readonly TextRange[], offset: number, markId: string) {
+  const inRange = (at: number) => ranges.some((r) => at >= r.start && at < r.end);
+  const mark = (el: Hast) => {
+    const props = (el.properties ??= {});
+    const cls = props.className;
+    props.className = [...(Array.isArray(cls) ? (cls as unknown[]) : cls ? [cls] : []), "cite-missing-block"];
+    props.dataCiteMissing = markId;
+    props.dataTestid = "citation-missing";
+    props.tabIndex = -1;
+    if (el.tagName === "table") return;
+    const kids = (el.children ??= []);
+    // The ⚠️ goes at the end of the paragraph's own text: in a loose item or a quote, its last paragraph before
+    // any nested list; else before the nested list.
+    const nestedAt = kids.findIndex((k) => k.type === "element" && NESTED.has(k.tagName ?? ""));
+    const own = nestedAt === -1 ? kids : kids.slice(0, nestedAt);
+    const para = [...own].reverse().find((k) => k.type === "element" && k.tagName === "p");
+    if (para) (para.children ??= []).push(badge());
+    else kids.splice(nestedAt === -1 ? kids.length : nestedAt, 0, badge());
+  };
+  const walk = (node: Hast) => {
+    for (const c of node.children ?? []) {
+      if (c.type !== "element") continue;
+      const at = c.position?.start.offset;
+      if (MARKABLE.has(c.tagName ?? "") && at !== undefined && inRange(offset + at)) {
+        mark(c);
+        // A nested list's items are paragraphs of their own.
+        for (const k of c.children ?? []) if (k.tagName === "ul" || k.tagName === "ol") walk(k);
+      } else if (c.tagName !== "pre" && c.tagName !== "code") walk(c);
+    }
+  };
+  return () => (tree: Hast) => {
+    if (ranges.length) walk(tree);
+  };
+}

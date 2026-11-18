@@ -37,8 +37,13 @@ export const CITATION_STATUS_TEXT: Record<CitationStatus, string> = {
  */
 export const CITATION_UNBACKED_TEXT = "⚠️ 근거에 연결되지 않은 출처 표시가 있어요.";
 
-/** Shown above an answer with paragraphs that state something without a citation marker. */
-export const CITATION_MISSING_TEXT = "⚠️ 일부 내용에 출처 표시 없음";
+/**
+ * Shown under an answer with paragraphs that state something without a citation marker (#202): one line with the
+ * count — the paragraphs themselves are marked where they are in the answer (never repeated in the note).
+ */
+export const citationMissingText = (n: number) => `⚠️ 출처 표시 없는 문단 ${n}개`;
+/** The mark on each such paragraph in the answer (its label for screen readers and its tooltip). */
+export const CITATION_MISSING_MARK = "출처 표시 없음";
 
 /** The only status that may be shown like a normal citation. Anything else (including unknown values) is a failure. */
 export const citationVerified = (status: unknown): boolean => status === "verified";
@@ -158,6 +163,8 @@ const BOLD_LINE = /^\s*(\*\*|__)[^\n]{1,80}?\1\s*[:：]?\s*$/;
 const FENCE = /^\s{0,3}(```|~~~)/;
 const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const TABLE = /^\s*\|/;
+/** A GFM delimiter row (`|---|:--:|`, `--- | ---`): a table even when its rows have no leading `|`. */
+const DELIMITER_ROW = /^(?=[^\n]*\|)(?=[^\n]*-{3})[ \t|:-]+$/;
 const LEAD_IN = /[:：]\s*$/;
 
 const SENTENCES = /(?<=[.!?。！？])\s+/u;
@@ -261,7 +268,7 @@ export function citationUnits(text: string): CitationUnit[] {
     const next = out[i + 1];
     const beforeList =
       next?.kind === "body" &&
-      (LIST_ITEM.test(text.slice(next.start, next.end)) || TABLE.test(text.slice(next.start, next.end)));
+      (LIST_ITEM.test(text.slice(next.start, next.end)) || isTableText(text.slice(next.start, next.end)));
     const lead = LEAD_IN.test(t) && !t.includes("\n") && t.length <= 120 && beforeList;
     return { ...u, kind: lead ? "lead_in" : "body" };
   });
@@ -334,11 +341,88 @@ export function sentenceEndMarkers(text: string): CitationMarker[] {
   return out;
 }
 
-/** Body units that contain no marker: what the note marks as missing a citation. */
+/** A table unit (#202): its first line starts with `|`, or its second line is a delimiter row. */
+export function isTableText(unit: string): boolean {
+  const lines = unit.replace(/^\s*\n/, "").split("\n");
+  return TABLE.test(lines[0] ?? "") || DELIMITER_ROW.test(lines[1] ?? "");
+}
+
+/** A line right after a table that says where it is from (`출처: …`, `*표 1 …*`, `(자료: …)`, `※ …`). */
+const CAPTION = /^[\s*_(（[]*(?:출처|자료|근거|표\s*\d*|source)\s*[:：.)\]]|^\s*※/iu;
+
+/**
+ * Opinion framing (#202, `common@11`): a sentence that says itself it is the assistant's own judgement — it starts
+ * with "제 판단으로는", "제 생각에는", "제 의견으로는", "제 추정으로는", "개인적으로는" … or ends with "…제 추정이에요",
+ * "…제 판단입니다" …. Only these explicit words: a sentence is never taken for an opinion from what it says.
+ */
+const OPINION_WORD = "(?:제|저의|내)\\s*(?:판단|생각|의견|추정|추측|견해|소견)";
+const OPINION_LEAD = new RegExp(
+  `^(?:${OPINION_WORD}(?:으로는|으론|에는|엔|에|으로|은|는|이지만|이긴\\s*하지만)?|개인적으로(?:는)?)(?:[,\\s]|$)`,
+  "u",
+);
+const OPINION_TAIL = new RegExp(
+  `${OPINION_WORD}(?:이에요|이예요|예요|입니다|이다|일\\s*뿐이에요|일\\s*뿐입니다|일\\s*뿐이다)$`,
+  "u",
+);
+
+/** A list item's marker and a bold label (`- **학종:** …`), and emphasis marks — not part of the sentence. */
+const plainSentence = (s: string) =>
+  s
+    .replace(/^\s*(?:[-*+•·]|\d{1,3}[.)])\s+/u, "")
+    .replace(/^(\*\*|__)[^\n]{1,40}?\1\s*[:：]?\s*/u, "")
+    .replace(/\*\*|__/gu, "")
+    .replace(/^[\s>]+|[\s.!?。！？…~]+$/gu, "");
+
+/** The sentences of a unit (line breaks end one too). */
+export const unitSentences = (t: string) =>
+  t
+    .split(/\n+/u)
+    .flatMap((line) => line.split(SENTENCES))
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+/**
+ * A paragraph of the assistant's own opinion, said so (#202): **every** sentence carries the explicit framing above.
+ * One sentence without it (a fact next to the opinion) and the paragraph is checked like any other.
+ */
+export function isFramedOpinion(unit: string): boolean {
+  const sentences = unitSentences(unit).map(plainSentence).filter(Boolean);
+  return sentences.length > 0 && sentences.every((s) => OPINION_LEAD.test(s) || OPINION_TAIL.test(s));
+}
+
+/** The last sentence of a unit, as a range of the answer text. */
+function lastSentence(text: string, u: TextRange): TextRange {
+  const t = text.slice(u.start, u.end).replace(/\s+$/u, "");
+  let at = 0;
+  for (const m of t.matchAll(/[.!?。！？]+\s+|\n+/gu))
+    if (m.index + m[0].length < t.length) at = m.index + m[0].length;
+  return { start: u.start + at, end: u.start + t.length };
+}
+
+/**
+ * Body units that contain no marker: what the note marks as missing a citation. Not flagged (#202):
+ * - a table — one unit — with a marker in it, in its caption (a short `출처: …` line right after it) or in the
+ *   sentence right before it (the lead-in, a heading, the last sentence of the paragraph before);
+ * - a paragraph of the assistant's opinion that says so in every sentence (`isFramedOpinion`).
+ */
 export function uncitedUnits(text: string): TextRange[] {
   const units = citationUnits(text);
   const markers = citationMarkers(text, units);
+  const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
+  const tableCited = (i: number) => {
+    const prev = units[i - 1];
+    if (prev && prev.kind !== "code" && prev.kind !== "rule" && cited(lastSentence(text, prev))) return true;
+    const next = units[i + 1];
+    if (!next || next.kind === "code" || next.kind === "rule") return false;
+    const t = text.slice(next.start, next.end).trim();
+    return !t.includes("\n") && t.length <= 160 && CAPTION.test(t) && cited(next);
+  };
   return units
-    .filter((u) => u.kind === "body" && !markers.some((m) => m.start >= u.start && m.end <= u.end))
+    .filter((u, i) => {
+      if (u.kind !== "body" || cited(u)) return false;
+      const t = text.slice(u.start, u.end);
+      if (isTableText(t)) return !tableCited(i);
+      return !isFramedOpinion(t);
+    })
     .map(({ start, end }) => ({ start, end }));
 }
