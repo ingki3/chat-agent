@@ -1,14 +1,15 @@
 /**
- * Drafts of the 기억 정리 and notification forms (#188 reviews 3–5): one rule for every form.
+ * Drafts of the 기억 정리 and notification forms (#188 reviews 3–12): one rule for every form.
  *
- * - A form keeps only the fields the person **changed** (`Partial<T>`); every other field shows the server's value,
- *   so a refetch updates it.
+ * - A form keeps only the fields the person **changed** (`Partial<T>`); every other field shows the cached value, so
+ *   a refetch updates it.
  * - A save sends only those fields; the server merges them into what is stored (the same field from two places: the
- *   later write wins — no versions in a family-sized app).
- * - After a save the form refetches (the cache is never replaced by a mutation's response, which could be older than
- *   what another form saved meanwhile — `sync.ts`) and, **only if that refetch succeeded**, drops the fields it sent
- *   that still hold what was sent — anything typed after sending stays. A refetch that fails keeps the draft and says
- *   "저장했지만 최신 상태를 불러오지 못했어요"; a refused save keeps the draft and says why. Forms are locked while saving.
+ *   later write wins).
+ * - When the save succeeds, its answer (the stored settings with their revision) is merged into the cache by revision
+ *   (`rev.ts`: only if strictly newer, and only the stored part), and the sent fields that still hold what was sent
+ *   leave the draft — anything typed after sending stays. A refused save keeps the draft and says why. Live state
+ *   (whether it runs, problems, the status sentence's `liveRev`) comes from GETs only (`rev.ts`). Forms are locked
+ *   while saving.
  */
 
 /** The value a form shows: the server's, with the person's changes on top. */
