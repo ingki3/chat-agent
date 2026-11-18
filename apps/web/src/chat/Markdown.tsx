@@ -199,7 +199,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
               ...(rehypePlugins ?? []),
               rehypeCitationMarkers(
                 cite.numbers,
-                cite.markers ? { offset, markers: cite.markers } : undefined,
+                cite.markers ? { offset, markers: cite.markers, source: text } : undefined,
               ),
             ],
             components: {

@@ -147,6 +147,12 @@ export const CitationNotePart = z.object({
    * source box. Not an earlier answer's note for carrying numbers over. Absent on every other note.
    */
   unbacked: z.literal(true).optional(),
+  /**
+   * How `missing` was computed (#202 review 4차): `2` — from the blocks the screen renders (`citationUnits`), so the
+   * screen marks each range in the answer and moves to it. Absent on notes stored before: their ranges came from the
+   * old line-based split and are only counted ("출처 표시 없는 문단 N개" as text), never marked.
+   */
+  units: z.literal(2).optional(),
 });
 export type CitationNotePart = z.infer<typeof CitationNotePart>;
 
@@ -162,8 +168,18 @@ export type CiteResult = {
 
 export type CitationUnitKind = "body" | "heading" | "lead_in" | "disclaimer" | "code" | "rule";
 /** `table`: a GFM table, one unit whatever its rows look like (#202). */
-/** `table`: a GFM table, one unit whatever its rows look like; `footnote`: in a footnote the screen shows (#202). */
-export type CitationUnit = TextRange & { kind: CitationUnitKind; table?: true; footnote?: true };
+/**
+ * `table`: a GFM table, one unit whatever its rows look like; `footnote`: in a footnote the screen shows; `part`:
+ * the text part it is in (a tool call between two parts, review 4차); `inline`: inline code or math — never a
+ * marker, never a block (only `citationMarkers` reads it) (#202).
+ */
+export type CitationUnit = TextRange & {
+  kind: CitationUnitKind;
+  table?: true;
+  footnote?: true;
+  part?: number;
+  inline?: true;
+};
 
 /** A paragraph that is only bold text (a heading written as `**제목**`). */
 const BOLD_LINE = /^\s*(\*\*|__)[^\n]{1,80}?\1\s*[:：]?\s*$/;
@@ -231,13 +247,38 @@ type Unit = CitationUnit & { para?: true; footnote?: true; item?: true; leadIn?:
 function blockUnits(block: string, base: number): Unit[] {
   const out: Unit[] = [];
   const tree = parseBlock(block);
-  // Footnotes the screen shows: only definitions something refers to (GFM drops the others).
-  const referenced = new Set<string>();
-  const refs = (n: Nodes) => {
-    if (n.type === "footnoteReference") referenced.add(n.identifier);
-    if ("children" in n) for (const c of n.children) refs(c as Nodes);
+  // Footnotes the screen shows (review 4차, as mdast-util-to-hast does): the first definition of each id, and only
+  // those reached from the body — directly, or from a footnote that is itself shown.
+  const defs = new Map<string, Nodes>();
+  const bodyRefs: string[] = [];
+  const walkRefs = (n: Nodes, into: string[], skipDefs: boolean) => {
+    if (n.type === "footnoteReference") into.push(n.identifier.toUpperCase());
+    if (n.type === "footnoteDefinition") {
+      const id = n.identifier.toUpperCase();
+      if (!defs.has(id)) defs.set(id, n);
+      if (skipDefs) return;
+    }
+    if ("children" in n) for (const c of n.children) walkRefs(c as Nodes, into, skipDefs);
   };
-  refs(tree);
+  walkRefs(tree, bodyRefs, true);
+  const shown = new Set<Nodes>();
+  for (let k = 0; k < bodyRefs.length; k++) {
+    const def = defs.get(bodyRefs[k]!);
+    if (!def || shown.has(def)) continue;
+    shown.add(def);
+    if ("children" in def) for (const c of def.children) walkRefs(c as Nodes, bodyRefs, false);
+  }
+  // Inline code and math (`a[1]`, `$a[1]$`): never markers (review 4차).
+  const inline = (n: Nodes) => {
+    if (
+      (n.type === "inlineCode" || n.type === "inlineMath") &&
+      startOf(n) !== undefined &&
+      endOf(n) !== undefined
+    )
+      out.push({ start: base + startOf(n)!, end: base + endOf(n)!, kind: "code", inline: true });
+    if ("children" in n) for (const c of n.children) inline(c as Nodes);
+  };
+  inline(tree);
   const add = (
     kind: CitationUnitKind,
     start: number | undefined,
@@ -300,7 +341,7 @@ function blockUnits(block: string, base: number): Unit[] {
           return blocks(n, footnote);
         case "footnoteDefinition":
           // Shown (at the end of the answer) only when referred to; its text is not next to the body around it.
-          return referenced.has(n.identifier) ? blocks(n, true) : undefined;
+          return shown.has(n) ? blocks(n, true) : undefined;
         default:
           return; // link definitions and anything else that is not shown as a block of text
       }
@@ -335,12 +376,12 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
     let at = start;
     const units: Unit[] = [];
     for (const block of splitBlocks(part)) {
-      units.push(...blockUnits(block, at));
+      units.push(...blockUnits(block, at).map((u) => ({ ...u, part: k })));
       at += block.length;
     }
     // A paragraph cut by the tool call: the last one before it and the first one after it, no blank line between.
-    const prev = out.filter((u) => !u.footnote).at(-1);
-    const first = units.find((u) => !u.footnote);
+    const prev = out.filter((u) => !u.footnote && !u.inline).at(-1);
+    const first = units.find((u) => !u.footnote && !u.inline);
     if (
       prev?.para &&
       first?.para &&
@@ -356,25 +397,39 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
     out.push(...units);
   });
   out.sort((a, b) => a.start - b.start);
-  // A lead-in: a short line ending with a colon right before a list item or a table (of the same text).
-  return out.map((u, i) => {
+  const blocks = out.filter((u) => !u.inline);
+  // A lead-in: a short line ending with a colon right before a list item or a table (shown next to it).
+  return out.map((u) => {
     const unit: CitationUnit = {
       start: u.start,
       end: u.end,
       kind: u.kind,
       ...(u.table ? { table: true as const } : {}),
       ...(u.footnote ? { footnote: true as const } : {}),
+      ...(u.part !== undefined ? { part: u.part } : {}),
+      ...(u.inline ? { inline: true as const } : {}),
     };
-    const next = out[i + 1];
-    const lead =
-      u.leadIn &&
-      u.kind === "body" &&
-      !u.item &&
-      next &&
-      !next.footnote === !u.footnote &&
-      (next.item || next.table);
-    return lead ? { ...unit, kind: "lead_in" as const } : unit;
+    if (!u.leadIn || u.kind !== "body" || u.item) return unit;
+    const next = shownNext(blocks, blocks.indexOf(u), 1);
+    return next && ((next as Unit).item || next.table) ? { ...unit, kind: "lead_in" as const } : unit;
   });
+}
+
+/**
+ * The unit shown right before (`dir` -1) or after (+1) the block at `i`, in the screen's order (review 4차): the
+ * same text part (a tool row comes between two parts), body next to body and footnote next to footnote (a footnote
+ * is shown at the end, apart from the body around its definition). Inline code and math are not blocks.
+ */
+function shownNext<U extends CitationUnit>(blocks: readonly U[], i: number, dir: 1 | -1): U | undefined {
+  const u = blocks[i];
+  if (!u) return undefined;
+  for (let k = i + dir; k >= 0 && k < blocks.length; k += dir) {
+    const c = blocks[k]!;
+    if (c.inline) continue;
+    if (!c.footnote !== !u.footnote) continue;
+    return c.part === u.part ? c : undefined;
+  }
+  return undefined;
 }
 
 export type CitationMarker = TextRange & { n: number };
@@ -568,30 +623,29 @@ export function uncitedUnits(
   markers: readonly CitationMarker[] = citationMarkers(text, units),
 ): TextRange[] {
   const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
-  // Footnote text is shown apart from the body (at the end): it never covers a table of the body, nor the reverse.
-  const near = (a: CitationUnit, b: CitationUnit | undefined) => !!b && !a.footnote === !b.footnote;
-  const tableCited = (i: number) => {
-    const u = units[i]!;
-    const prev = units[i - 1];
+  const blocks = units.filter((u) => !u.inline);
+  const tableCited = (u: CitationUnit) => {
+    const i = blocks.indexOf(u);
+    const prev = shownNext(blocks, i, -1);
     // The sentence before: not another table's last cell (two tables in a row are two tables).
     if (
-      near(u, prev) &&
-      prev!.kind !== "code" &&
-      prev!.kind !== "rule" &&
-      !prev!.table &&
-      cited(lastSentence(text, prev!))
+      prev &&
+      prev.kind !== "code" &&
+      prev.kind !== "rule" &&
+      !prev.table &&
+      cited(lastSentence(text, prev))
     )
       return true;
-    const next = units[i + 1];
-    if (!next || !near(u, next) || next.kind === "code" || next.kind === "rule") return false;
+    const next = shownNext(blocks, i, 1);
+    if (!next || next.kind === "code" || next.kind === "rule") return false;
     const t = text.slice(next.start, next.end).trim();
     return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(next);
   };
-  return units
-    .filter((u, i) => {
+  return blocks
+    .filter((u) => {
       if (u.kind !== "body" || cited(u)) return false;
       const t = text.slice(u.start, u.end);
-      if (u.table) return !tableCited(i);
+      if (u.table) return !tableCited(u);
       return !isFramedOpinion(t);
     })
     .map(({ start, end }) => ({ start, end }));

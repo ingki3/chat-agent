@@ -1803,7 +1803,7 @@ describe("citationNote", () => {
     const parts: MessagePart[] = [
       ...text("첨부하신 입결 파일을 읽어 볼게요.\n\n"),
       ...read("r1"),
-      ...text("두 파일을 다 읽었어요. 이제 다음 시트를 확인하고 있어요.\n\n"),
+      ...text("엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.\n\n"),
       ...read("r2"),
       ...text(ANSWER),
     ];
@@ -2008,8 +2008,10 @@ describe("citationNote", () => {
       for (const note of [
         "교육부조차 지원서를 다시 검토하고 있어요.",
         "입학처마저 지원서를 검토하고 있어요.",
-        "학과별 입결 시트를 확인하고 있어요.",
         "올해도 자료를 확인하고 있어요.",
+        "입학처 지원서를 검토하고 있어요.",
+        "대학 측에선 자료를 검토하고 있어요.",
+        "교육부조차 자료를 확인하고 있어요.",
       ])
         expect(between(note), note).toEqual([note]);
       for (const note of [
@@ -2036,6 +2038,41 @@ describe("citationNote", () => {
       expect(missingOf([...read("a"), ...text(`가[2].[^1]\n\n[^1]: 각주의 사실이에요.`)])).toEqual([
         "각주의 사실이에요.",
       ]);
+    });
+
+    it("review 4차: the issue's own progress note passes; tables by the screen's order; inline math; footnotes", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      for (const note of [
+        "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.",
+        "엑셀 두 개를 다 읽었어요.",
+        "이제 학과별 입결 시트를 확인하고 있어요.",
+      ])
+        expect(between(note), note).toEqual([]);
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // A tool row between the sentence and the table: the sentence is not the one right before it on the screen.
+      expect(
+        missingOf([...read("a"), ...text("작년 선발 인원이에요[1].\n\n"), ...read("b"), ...text(table)]),
+      ).toEqual([table]);
+      // A footnote definition between them is not shown there: the body sentence is still right before the table.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`본문이에요[^1] 표는 다음과 같아요[1].\n\n[^1]: 각주예요[2].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // Inline math (and code) is never a marker: `$a[1]$` covers nothing.
+      expect(missingOf([...read("a"), ...text(`값은 $a[1]$입니다.\n\n${table}`)])).toEqual([
+        "값은 $a[1]$입니다.",
+        table,
+      ]);
+      // Footnotes: only those reached from the body, the first definition of an id.
+      const hiddenChain = "가[1].\n\n[^a]: 숨은 각주예요[^b].\n\n[^b]: 숨은 사실이에요.";
+      expect(missingOf([...read("a"), ...text(hiddenChain)])).toEqual([]);
+      const duplicate = "가[1].[^a]\n\n[^a]: 첫 정의예요[1].\n\n[^a]: 둘째 정의는 보이지 않아요.";
+      expect(missingOf([...read("a"), ...text(duplicate)])).toEqual([]);
+      const chain = "가[1].[^a]\n\n[^a]: 보이는 각주예요[1][^b].\n\n[^b]: 이어서 보이는 사실이에요.";
+      expect(missingOf([...read("a"), ...text(chain)])).toEqual(["이어서 보이는 사실이에요."]);
     });
 
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {

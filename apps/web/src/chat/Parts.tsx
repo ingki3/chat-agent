@@ -1,5 +1,5 @@
 import { Fragment, memo, useId, useMemo, useState } from "react";
-import { redactForDisplay, type PublicPart } from "@agentlee/shared";
+import { redactForDisplay, type CitationNotePart, type PublicPart } from "@agentlee/shared";
 import { Link } from "react-router";
 import { files } from "../api.js";
 import { useFileViewHref } from "../files/context.js";
@@ -268,6 +268,15 @@ export function FileRef({ part }: { part: Extract<PublicPart, { type: "file_ref"
   );
 }
 
+/**
+ * The ranges of a note the answer marks in place (#202): only a note whose ranges are the screen's own blocks
+ * (`units: 2`, review 4차). An older note's ranges came from a line split the screen does not draw — they are only
+ * counted ("출처 표시 없는 문단 N개" as text), never marked.
+ */
+export function markedRanges(note: CitationNotePart): CitationNotePart["missing"] | undefined {
+  return note.units === 2 && !note.unbacked && note.missing.length ? note.missing : undefined;
+}
+
 export function Parts({ parts, streaming = false }: { parts: readonly PublicPart[]; streaming?: boolean }) {
   // Citations (#25): once the answer is finished and carries the server's note, `[n]` become citation buttons.
   const note = streaming ? undefined : citationNoteOf(parts);
@@ -281,7 +290,7 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
       numbers: markerNumbers(note),
       markers: note.markers,
       render: (ns) => <CitationMarkers views={ns.map((n) => citationView(n, byN.get(n)))} />,
-      ...(note.unbacked || !note.missing.length ? {} : { missing: note.missing, markId }),
+      ...(markedRanges(note) ? { missing: markedRanges(note)!, markId } : {}),
     };
   }, [note, markId]);
   // The answer text as the server joined it (the note's ranges point into it), and where each text part starts.

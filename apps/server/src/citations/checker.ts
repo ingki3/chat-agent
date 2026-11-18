@@ -113,15 +113,53 @@ const DETERMINERS = new Set(
   "두 세 네 다섯 여섯 일곱 여덟 아홉 열 여러 몇 모든 각 첫 다음 나머지 남은 이 그 해당 새".split(" "),
 );
 const HANGUL_WORD = /^[가-힣A-Za-z0-9]+$/u;
+/**
+ * Head nouns that name the material (review 4차): a phrase with bare noun modifiers ("학과별 입결 시트를") is the
+ * material only when its head is one of these — "입학처 지원서를" is not (the bare "입학처" may be a subject).
+ */
+const MATERIAL = new Set(
+  "엑셀 파일 시트 자료 표 문서 PDF pdf 페이지 쪽 기사 결과 데이터 내용 입결 원문 보고서 목록 첨부 첨부파일 시행계획 계획 출처 링크 문단 항목 셀 행 열 탭 슬라이드 본문 통계 수치".split(
+    " ",
+  ),
+);
+/** Counters of the material ("엑셀 두 개를", "세 장을"). */
+const COUNTERS = new Set("개 장 쪽 건 편 개의 부".split(" "));
+/** A bare modifier that ends with a particle is no modifier ("교육부조차", "입학처마저", "대학 측에선"). */
+const PARTICLE_END = /(?:조차|마저|까지|부터|에서|에선|께서|측|도|은|는|이|가|만|와|과|랑|로|에)$/u;
 
 /**
- * A sentence that only says the assistant works on the material (review 3차 — positive only): the predicate is one
- * of `WORK_PREDICATE`, and every word before it is one of
+ * The material as one object phrase, ending in "을/를" (review 3·4차): determiners or numbers, "…의" modifiers, and
+ * bare noun modifiers only when the head names the material (`MATERIAL`, or a counter after a material noun:
+ * "엑셀 두 개를"). Returns the index after the phrase, or -1.
+ */
+function objectPhrase(words: readonly string[], k: number): number {
+  let j = k;
+  const bare: string[] = [];
+  while (j < words.length && !/.[을를]$/u.test(words[j]!)) {
+    const w = words[j]!;
+    if (DETERMINERS.has(w) || /.의$/u.test(w)) j++;
+    else if (!WORK_ADVERBS.has(w) && !PARTICLE_END.test(w)) {
+      bare.push(w);
+      j++;
+    } else return -1;
+  }
+  if (j >= words.length) return -1;
+  const head = words[j]!.slice(0, -1);
+  if (bare.length) {
+    const material = MATERIAL.has(head) || (COUNTERS.has(head) && bare.some((w) => MATERIAL.has(w)));
+    if (!material) return -1;
+  }
+  return j + 1;
+}
+
+/**
+ * A sentence that only says the assistant works on the material (review 3·4차 — positive only): the predicate is
+ * one of `WORK_PREDICATE`, and every word before it is one of
  * - the assistant as the subject: "제가", "저는" (or no subject at all);
  * - a listed adverb (`WORK_ADVERBS`);
- * - the material, as an object noun phrase: determiners or numbers (`DETERMINERS`), "…의" modifiers, then one noun
- *   ending in "을/를" ("두 파일을", "첨부 파일의 시트를" — no: "첨부" is a bare noun; "파일의 시트를" yes).
- * Any other word — "교육부조차", "입학처마저", "대학 측에선", "경쟁률이", a bare noun of unknown role — and it is checked.
+ * - the material, as an object phrase (`objectPhrase`): "두 파일을", "파일의 시트를", "학과별 입결 시트를",
+ *   "엑셀 두 개를".
+ * Any other word — "교육부조차", "입학처마저", "대학 측에선", "경쟁률이", "입학처 지원서를" — and it is checked.
  */
 function isWorkNote(sentence: string): boolean {
   const m = WORK_PREDICATE.exec(sentence);
@@ -131,19 +169,13 @@ function isWorkNote(sentence: string): boolean {
   let k = 0;
   if (k < words.length && AGENT.test(words[k]!)) k++;
   while (k < words.length) {
-    const w = words[k]!;
-    if (WORK_ADVERBS.has(w)) {
+    if (WORK_ADVERBS.has(words[k]!)) {
       k++;
       continue;
     }
-    // An object noun phrase: [determiners | X의]* Y을/를.
-    let j = k;
-    while (j < words.length && (DETERMINERS.has(words[j]!) || /.의$/u.test(words[j]!))) j++;
-    if (j < words.length && /.[을를]$/u.test(words[j]!)) {
-      k = j + 1;
-      continue;
-    }
-    return false;
+    const next = objectPhrase(words, k);
+    if (next === -1) return false;
+    k = next;
   }
   return true;
 }
@@ -488,5 +520,7 @@ export function citationNote(
     citations,
     missing,
     markers: markers.map(({ n, start, end }) => ({ n, start, end })),
+    // The ranges are the screen's blocks: it marks them in the answer (review 4차; older notes are only counted).
+    units: 2,
   };
 }

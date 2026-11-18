@@ -10,7 +10,7 @@ import {
   type FinanceNotePart,
   type PublicPart,
 } from "@agentlee/shared";
-import { Parts } from "../src/chat/Parts.js";
+import { markedRanges, Parts } from "../src/chat/Parts.js";
 import { markEffect, marksReady, subscribeMarks } from "../src/citations/marks.js";
 import { markerNumbers } from "../src/citations/markdown.js";
 import { citationView } from "../src/citations/segments.js";
@@ -215,5 +215,20 @@ describe("the summary line follows its marks (#202 review 2차)", () => {
     } finally {
       g.document = before;
     }
+  });
+});
+
+describe("older notes are counted, not marked (#202 review 4차)", () => {
+  it("only a note whose ranges are the screen's blocks (units: 2) is marked in place", () => {
+    const missing = [{ start: 0, end: 3 }];
+    const base = { ...citation, missing };
+    expect(markedRanges({ ...base, units: 2 })).toEqual(missing);
+    // Stored before: the old line split — counted ("출처 표시 없는 문단 N개" as text), never marked.
+    expect(markedRanges(base)).toBeUndefined();
+    expect(markedRanges({ ...base, units: 2, missing: [] })).toBeUndefined();
+    expect(markedRanges({ ...base, units: 2, unbacked: true })).toBeUndefined();
+    const html = render([{ type: "text", text: "가나다 라" }, base]);
+    expect(html).toContain('<span data-testid="citation-missing-warning">⚠️ 출처 표시 없는 문단 1개</span>');
+    expect(html).not.toContain("cite-missing-jump");
   });
 });

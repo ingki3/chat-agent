@@ -249,7 +249,7 @@ describe("paragraphs without a citation, marked in the answer (#202)", () => {
     expect(out).toMatch(/뒷 문단이에요\.<span class="cite-missing-badge"/);
   });
 
-  it("an old note's ranges (stored before #202: tables, progress notes) still mark their paragraphs", () => {
+  it("whole-block ranges mark their block: a paragraph, a table", () => {
     const text = "자료를 찾아 볼게요.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n원하시면 더 정리해 드릴게요.";
     const out = marked(text, [
       range(text, "자료를 찾아 볼게요."),
@@ -350,47 +350,13 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
           .trim();
       });
 
-  it("old ranges over blocks without a paragraph element: the block at that source position, in order", () => {
-    // Ranges as an older server stored them (math and code were body then). `[x]: …` keeps the answer one block,
-    // so both formulas go through KaTeX in the same tree (review 2차: the second must not point at the first).
+  it("math and code are not ranges; raw HTML is — its top-level text wrapped as the target, in order", () => {
+    // `[x]: …` keeps the answer one block, so both formulas go through KaTeX in the same tree.
     const text =
-      "가[1].\n\n$$\na = b\n$$\n\n$$\nx = y\n$$\n\n    들여쓴 코드 줄\n\n<div>원시 HTML</div>\n\n[x]: https://e.example";
-    const at = (s: string) => ({ start: text.indexOf(s), end: text.indexOf(s) + s.length });
-    const ranges = [
-      at("$$\na = b\n$$"),
-      at("$$\nx = y\n$$"),
-      at("    들여쓴 코드 줄"),
-      at("<div>원시 HTML</div>"),
-    ];
-    const html = renderParts([text], ranges);
-    expect(targets(html)).toEqual(["a = b", "x = y", "들여쓴 코드 줄", "<div>원시 HTML</div>"]);
-    expect(html).toMatch(/cite-missing-wrap"[^>]*><span class="katex-display">/);
-    expect(html).toMatch(/cite-missing-wrap"[^>]*><div class="codeblk">/);
-  });
-
-  it("ranges an older server stored inside one rendered block: the row or the very lines, in order (review 3차)", () => {
-    // What the line-based check before #202 stored: a table without outer pipes as three ranges (header line,
-    // delimiter line, data lines), and `•` lines of one paragraph one range each.
-    const table = "전형 | 인원\n|---|---|\n학종 | 30\n교과 | 20";
-    const lines = (t: string) => {
-      const out: { start: number; end: number }[] = [];
-      let at = 0;
-      for (const l of t.split("\n")) {
-        out.push({ start: at, end: at + l.length });
-        at += l.length + 1;
-      }
-      return out;
-    };
-    const [h, d, r1, r2] = lines(table);
-    const t1 = renderParts([table], [h!, d!, { start: r1!.start, end: r2!.end }]);
-    // The table (its text up to the next target), then each data row.
-    expect(targets(t1)).toEqual(["전형인원", "학종30", "교과20"]);
-    const bullets = "• 첫 사실[1].\n• 둘째 사실.\n• 셋째 사실.";
-    const [, b2, b3] = lines(bullets);
-    const t2 = renderParts([bullets], [b2!, b3!]);
-    expect(targets(t2)).toEqual(["• 둘째 사실.", "• 셋째 사실."]);
-    // No empty target, never the same one twice.
-    for (const html of [t1, t2]) expect(targets(html).every(Boolean)).toBe(true);
+      "가[1].\n\n$$\na = b\n$$\n\n$$\nx = y\n$$\n\n    들여쓴 코드 줄\n\n<div>원시 HTML</div>\n\n나예요.\n\n[x]: https://e.example";
+    const html = renderParts([text], rangesOf([text]));
+    expect(targets(html)).toEqual(["<div>원시 HTML</div>", "나예요."]);
+    expect(html).toContain('<span class="katex-display">');
   });
 
   it("[n] in KaTeX's output is never a citation; only the server's marker positions are (review 3차)", () => {
@@ -421,6 +387,35 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
     );
     expect(only.split('data-chip="1"')).toHaveLength(2);
     expect(only).toContain("나[1].");
+  });
+
+  it("chips only where the server's marker maps through the source; an entity elsewhere moves nothing (review 4차)", () => {
+    const text = "결론이에요[1]. A &amp; B의 x = a[1].length";
+    const html = renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: text.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(html.split('data-chip="1"')).toHaveLength(2);
+    expect(html).toContain("a[1].length");
+    // A later block's offset: the marker of the second block is found there, not in the first.
+    const two = "가는 없어요.\n\n나는 있어요[1].";
+    const b = renderToStaticMarkup(
+      createElement(Markdown, {
+        text: two,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: two.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(b.split('data-chip="1"')).toHaveLength(2);
   });
 
   it("a paragraph cut by a tool call: one target where it starts, the bar on the rest", () => {
