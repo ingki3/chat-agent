@@ -17,7 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
-import { resync, SAVED_STALE } from "./sync.js";
+import { behind, SAVED_STALE, saveAndSync, stamped } from "./sync.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -28,7 +28,9 @@ import { MemoryCard } from "./MemoryCard.js";
  * admin sets them. Only the user sees this — the admin's screen has counts only.
  */
 export function DreamingPanel() {
-  const q = useQuery({ queryKey: DREAMING_KEY, queryFn: dreaming.mine });
+  const q = useQuery({ queryKey: DREAMING_KEY, queryFn: stamped(DREAMING_KEY, dreaming.mine) });
+  // Read so the panel re-renders when a refetch lands (the "저장했지만…" notices follow it — sync.ts).
+  void q.dataUpdatedAt;
   const d = q.data;
   // A failed refetch keeps the form (and its drafts) on the data we have, with the error above it (review #195 5).
   if (!d)
@@ -189,10 +191,7 @@ function Settings({ view }: { view: MyDreaming }) {
   // The answer is not put in the cache (it could be older than another form's save): saved, then refetched
   // (sync.ts) — `data` says whether the screen caught up.
   const save = useMutation({
-    mutationFn: async (s: SaveDreamingSettingsRequest) => {
-      await dreaming.save(s);
-      return resync(qc, DREAMING_KEY);
-    },
+    mutationFn: (s: SaveDreamingSettingsRequest) => saveAndSync(qc, DREAMING_KEY, () => dreaming.save(s)),
   });
   return (
     <section className="dream-section" aria-labelledby="dream-my-settings-h" data-testid="dreaming-settings">
@@ -207,11 +206,11 @@ function Settings({ view }: { view: MyDreaming }) {
         choices={view.choices}
         disabled={!view.canEdit}
         pending={save.isPending}
-        onSave={(s) => save.mutateAsync(s)}
+        onSave={(s) => save.mutateAsync(s).then((r) => r.synced)}
       />
       {save.isSuccess && (
         <p className="small" role="status">
-          {save.data ? "저장했어요." : SAVED_STALE}
+          {behind(DREAMING_KEY, save.data.savedAt) ? SAVED_STALE : "저장했어요."}
         </p>
       )}
       {save.isError && (
@@ -230,13 +229,11 @@ function Prompt({ view }: { view: MyDreaming }) {
   const content = text ?? view.prompt.content;
   // `typed`: the editor's draft when the save was sent — cleared on success only if it is still the same.
   const save = useMutation({
-    mutationFn: async (a: { content: string | null; typed: string | undefined }) => {
-      await dreaming.savePrompt(a.content);
-      return resync(qc, DREAMING_KEY);
-    },
+    mutationFn: (a: { content: string | null; typed: string | undefined }) =>
+      saveAndSync(qc, DREAMING_KEY, () => dreaming.savePrompt(a.content)),
     // Only once the fresh prompt is on screen; a failed refetch keeps the text (and says so).
-    onSuccess: (synced, a) => {
-      if (synced) setText((cur) => afterSave(cur, a.typed, undefined));
+    onSuccess: (r, a) => {
+      if (r.synced) setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });
   // 미리 실행 runs the prompt **saved on the server** (it sends none — review #195 5): what the next run would use.
@@ -290,7 +287,7 @@ function Prompt({ view }: { view: MyDreaming }) {
           미리 실행은 저장된 프롬프트로 돌아요. 고친 내용은 저장한 뒤 미리 실행해 보세요.
         </p>
       )}
-      {save.isSuccess && !save.data && (
+      {save.isSuccess && behind(DREAMING_KEY, save.data.savedAt) && (
         <p className="small" role="status">
           {SAVED_STALE}
         </p>

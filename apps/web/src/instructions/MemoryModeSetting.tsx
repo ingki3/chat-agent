@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MEMORY_APPLY_MODE_LABEL, MemoryApplyMode } from "@agentlee/shared";
 import { errorText, MEMORY_PREFS_KEY, memoryPrefs } from "../api.js";
-import { resync, SAVED_STALE, useInstant } from "./sync.js";
+import { saveAndSync, SAVED_STALE, stamped, useInstant } from "./sync.js";
 
 const HELP: Record<MemoryApplyMode, string> = {
   review: '대화 중 "기억해줘·잊어줘"는 답 아래 카드에서 반영을 눌러야 바뀌어요.',
@@ -14,17 +14,14 @@ const HELP: Record<MemoryApplyMode, string> = {
  */
 export function MemoryModeSetting() {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: MEMORY_PREFS_KEY, queryFn: memoryPrefs.get });
+  const q = useQuery({ queryKey: MEMORY_PREFS_KEY, queryFn: stamped(MEMORY_PREFS_KEY, memoryPrefs.get) });
   // An instant-save control (sync.ts `useInstant`): the choice shows at once; a save whose refetch failed keeps showing
   // what was stored (and says so); a refused save goes back to the last value known to be stored.
-  const ui = useInstant<MemoryApplyMode | undefined>(q.data?.applyMode, q.dataUpdatedAt);
+  const ui = useInstant<MemoryApplyMode | undefined>(q.data?.applyMode, MEMORY_PREFS_KEY, q.dataUpdatedAt);
   const save = useMutation({
-    mutationFn: async (m: MemoryApplyMode) => {
-      await memoryPrefs.set(m);
-      return resync(qc, MEMORY_PREFS_KEY);
-    },
+    mutationFn: (m: MemoryApplyMode) => saveAndSync(qc, MEMORY_PREFS_KEY, () => memoryPrefs.set(m)),
     onMutate: (m) => ui.pick(m),
-    onSuccess: (synced, m) => ui.saved(m, synced),
+    onSuccess: (r, m) => ui.saved(m, r),
     onError: () => ui.failed(),
   });
   const mode = ui.shown;
