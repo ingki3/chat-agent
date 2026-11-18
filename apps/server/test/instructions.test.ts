@@ -100,9 +100,13 @@ describe("templates", () => {
     expect(common).toContain("시간에 따라 바뀌는 자료(시세·환율, 뉴스·최신 사실)에는 기준 시각(날짜");
     expect(common).toContain("다시 조회하거나 앞 답변의 출처 번호를 붙인다");
     const finance = defaultTemplates().finance;
-    expect(finance.version).toBe(4);
+    expect(finance.version).toBe(5);
     expect(finance.body).toContain("**금융 도구 결과를 답변에 쓸 때**");
     expect(finance.body).not.toContain("모든 숫자");
+    // #187: 관심 종목 was removed — no watchlist line, and the finance tools stay.
+    expect(finance.body).not.toContain("watchlist_get");
+    expect(finance.body).not.toContain("관심 종목");
+    expect(finance.body).toContain("`finance_chart`");
     const research = defaultTemplates().research;
     expect(research.version).toBe(3);
     expect(research.body).toContain("사실을 말하는 문장마다 `cite`");
@@ -160,7 +164,7 @@ describe("assembly", () => {
           const r = assembleInstructions({ user, mode, tools, now: NOW });
           expect(r.versions).toEqual([
             "common@8",
-            ...(kind === "finance" ? ["finance@4"] : []),
+            ...(kind === "finance" ? ["finance@5"] : []),
             ...(user.youth ? ["youth@2"] : []),
             ...(mode === "research" ? ["research@3"] : []),
           ]);
@@ -570,7 +574,7 @@ describe("run manager assembles per run", () => {
   it("the finance section follows the run's tools", async () => {
     const { f, claude, reply } = await family({ tools: ["echo_time", FAKE_FINANCE_TOOL] });
     const { run } = await reply(f.users.owner.id);
-    expect(run.instructions).toBe("common@8,finance@4");
+    expect(run.instructions).toBe("common@8,finance@5");
     expect(claude.systemPrompts[0]).toContain(FINANCE_HEADING);
     const plain = await family({ tools: ["echo_time"] });
     expect((await plain.reply(plain.f.users.owner.id)).run.instructions).toBe("common@8");

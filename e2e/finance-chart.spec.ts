@@ -1,17 +1,10 @@
 import crypto from "node:crypto";
 import { expect, test, type Frame, type Page } from "@playwright/test";
-import {
-  MOM,
-  backToChat,
-  newConversation,
-  newMember,
-  sendMessage as send,
-  signIn,
-  useAccount,
-} from "./helpers.js";
+import { MOM, backToChat, newConversation, sendMessage as send, useAccount } from "./helpers.js";
 
 /**
- * Finance table and chart artifacts and 관심 종목 (#31, PRD FR-7.5·7.7, 수용 기준 4, M4 completion criterion).
+ * Finance table and chart artifacts (#31, PRD FR-7.5, 수용 기준 4, M4 completion criterion); 관심 종목 (FR-7.7) was removed
+ * in #187.
  * "AAPL, 005930 6개월 비교 차트" goes through the FakeRuntime to our real `finance_chart` (FAKE_RUNTIME=1 answers the
  * finance URLs with synthetic histories — no network); the table part, the two artifacts, the chart page's basis
  * and zoom switches and the note are the real ones. Desktop and mobile.
@@ -86,42 +79,16 @@ test('"AAPL, 005930 6개월 비교 차트": table part, table and chart artifact
   await expect(frame.locator(".v1.z2 rect.hit title").first()).toHaveText(/AAPL: .* %\n005930: .* %/);
 });
 
-test("관심 종목: search, add, remove — and an account without finance sees why it cannot", async ({
-  page,
-  browser,
-  baseURL,
-}) => {
-  const me = await newMember(browser, baseURL!, "watch");
-  await signIn(page, baseURL!, me);
+test("관심 종목 is gone (#187): no sidebar shortcut, and the old address goes home", async ({ page }) => {
+  await useAccount(page, MOM);
+  await page.goto("/");
+  // The sidebar's links (in the DOM on desktop and, closed, on mobile): the shortcuts are there, 관심 종목 is not.
+  await expect(page.locator('a[href="/schedules"]')).toHaveCount(1);
+  await expect(page.locator('a[href="/watchlist"]')).toHaveCount(0);
+  await expect(page.getByText("관심 종목")).toHaveCount(0);
   await page.goto("/watchlist");
-  await expect(page.getByTestId("watchlist-page")).toBeVisible();
-  await page.getByLabel("종목 검색").fill("삼성전자");
-  await page.getByRole("button", { name: "검색" }).click();
-  const results = page.getByTestId("watch-results");
-  await expect(results).toContainText("005930");
-  await results.getByRole("button", { name: "삼성전자 추가", exact: true }).click();
-  const items = page.getByTestId("watch-item");
-  await expect(items).toHaveCount(1);
-  await expect(items.first()).toContainText("삼성전자");
-  await expect(results.getByRole("button", { name: "삼성전자 추가", exact: true })).toHaveText("담김");
-  // A US ticker as typed.
-  await page.getByLabel("종목 검색").fill("aapl");
-  await page.getByRole("button", { name: "검색" }).click();
-  await results.getByRole("button", { name: "AAPL 추가" }).click();
-  await expect(items).toHaveCount(2);
-  await page.reload();
-  await expect(items).toHaveCount(2);
-  await items.first().getByRole("button", { name: /제거/ }).click();
-  await expect(items).toHaveCount(1);
-  await expect(items.first()).toContainText("AAPL");
-
-  // A youth account (finance hidden by default, #30): no markets, nothing to search.
-  const ctx = await browser.newContext({ baseURL: baseURL! });
-  const sonPage = await ctx.newPage();
-  const son = await newMember(browser, baseURL!, "teen", true);
-  await signIn(sonPage, baseURL!, son);
-  await sonPage.goto("/watchlist");
-  await expect(sonPage.getByTestId("watchlist-no-finance")).toBeVisible();
-  await expect(sonPage.getByLabel("종목 검색")).toHaveCount(0);
-  await ctx.close();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByText("찾을 수 없는 페이지")).toHaveCount(0);
+  const api = await page.request.get("/api/watchlist");
+  expect(api.status()).toBe(404);
 });

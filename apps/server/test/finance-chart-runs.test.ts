@@ -9,9 +9,6 @@ import {
   CSRF_HEADER,
   FINANCE_DISCLAIMER,
   TableData,
-  WatchlistResponse,
-  WATCH_SYMBOL_MAX,
-  symbolOk,
   type FinanceNotePart,
   type MessagePart,
   type Run,
@@ -21,7 +18,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import Database from "better-sqlite3";
 import { createTestDb, openDb, runMigrations, type Db } from "../src/db/client.js";
-import { KnownSecrets, knownSecrets, MIN_KNOWN_LENGTH, scrubKnown } from "../src/secrets/known.js";
+import { KnownSecrets, knownSecrets, scrubKnown } from "../src/secrets/known.js";
 import { carriesKnownSecret, decodedViews, FinanceService } from "../src/finance/service.js";
 import { z } from "zod";
 import { CLEANUP_PENDING_KEY, StoredRescrub } from "../src/secrets/rescrub.js";
@@ -29,7 +26,6 @@ import { COMPACTED_KEY, compactOnce } from "../src/secrets/compact.js";
 import { readKey, setKey } from "../src/secrets/markers.js";
 import { fetchDataset } from "../src/finance/chart.js";
 import { FINANCE_TOOLS } from "@agentlee/mcp-tools/finance";
-import { SEARCH_DECOY } from "../src/mcp/service.js";
 import { RuntimeRegistry, type RuntimeAdapter } from "../src/runtime/adapter.js";
 import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
@@ -290,8 +286,8 @@ describe('"AAPL, 005930 6개월 비교 차트" — M4 completion criterion (#31)
 
 // ---- who may use them ---------------------------------------------------------------------------------------
 
-describe("finance chart and 관심 종목 tools follow the finance skills (#31, #30, #35)", () => {
-  const COMPOSED = ["finance_chart", "watchlist_get"];
+describe("the finance chart tool follows the finance skills (#31, #30, #35)", () => {
+  const COMPOSED = ["finance_chart"];
   const composed = (names: string[]) => names.filter((n) => COMPOSED.includes(n));
 
   it("the son (youth, finance hidden) gets neither tool: not listed, refused when called", async () => {
@@ -312,13 +308,7 @@ describe("finance chart and 관심 종목 tools follow the finance skills (#31, 
       conversationId: c.id,
       runId: crypto.randomUUID(),
     });
-    for (const [tool, args] of [
-      ["finance_chart", CALL.args],
-      ["watchlist_get", {}],
-    ] as const) {
-      const r = await callOurTool(url, token, tool, args);
-      expect(r.isError, tool).toBe(true);
-    }
+    expect((await callOurTool(url, token, "finance_chart", CALL.args)).isError).toBe(true);
     expect(app.artifacts!.list(c.id)).toEqual([]);
     // A call already past the listing (the permission changed between the tool list and the call) is refused by
     // the call itself.
@@ -326,11 +316,10 @@ describe("finance chart and 관심 종목 tools follow the finance skills (#31, 
       app.mcp! as unknown as { host(): { runTool(n: string, i: unknown, s: unknown): Promise<unknown> } }
     ).host();
     const scope = { userId: son.id, conversationId: c.id, runId: crypto.randomUUID() };
-    for (const [tool, args] of [
-      ["finance_chart", CALL.args],
-      ["watchlist_get", {}],
-    ] as const)
-      expect(await host.runTool(tool, args, scope), tool).toEqual({ ok: false, code: "finance_not_allowed" });
+    expect(await host.runTool("finance_chart", CALL.args, scope)).toEqual({
+      ok: false,
+      code: "finance_not_allowed",
+    });
   });
 
   it("the server allow-list off for both stock skills hides them for everyone (#35)", async () => {
@@ -342,7 +331,7 @@ describe("finance chart and 관심 종목 tools follow the finance skills (#31, 
     expect(composed(app.mcp!.toolNamesFor(f.users.owner.id))).toEqual(COMPOSED);
   });
 
-  it("kr-stock-skill only: KR charts work, a US symbol is refused, watchlist_get lists only KR", async () => {
+  it("kr-stock-skill only: KR charts work, a US symbol is refused", async () => {
     const { app } = await start(new RuntimeRegistry());
     const son = app.users!.create({
       email: "son2@example.com",
@@ -353,8 +342,6 @@ describe("finance chart and 관심 종목 tools follow the finance skills (#31, 
     });
     app.users!.setSkills(son.id, ["kr-stock-skill"]);
     expect(composed(app.mcp!.toolNamesFor(son.id))).toEqual(COMPOSED);
-    app.watchlist!.add(son.id, { market: "KR", symbol: "005930", name: "삼성전자" });
-    app.watchlist!.add(son.id, { market: "US", symbol: "AAPL" });
     const { url } = await app.mcp!.endpoint();
     const c = app.conversations!.create(son.id);
     const token = app.runs!.mcpTokens.issue({
@@ -365,121 +352,6 @@ describe("finance chart and 관심 종목 tools follow the finance skills (#31, 
     expect((await callOurTool(url, token, "finance_chart", CALL.args)).isError).toBe(true);
     const kr = await callOurTool(url, token, "finance_chart", { symbols: ["005930"], range: "1mo" });
     expect(kr.isError).toBe(false);
-    const w = JSON.parse((await callOurTool(url, token, "watchlist_get", {})).content[0]!.text!) as {
-      items: unknown[];
-      names: string;
-    };
-    expect(w.items).toEqual([{ market: "KR", symbol: "005930" }]);
-    expect(w.names).toContain("<external_content");
-  });
-
-  it("watchlist_get reads only the token's own user's list", async () => {
-    const { app, f } = await start(new RuntimeRegistry());
-    app.watchlist!.add(f.users.owner.id, { market: "US", symbol: "AAPL", name: "Apple" });
-    app.watchlist!.add(f.users.stranger.id, { market: "US", symbol: "NVDA", name: "Nvidia" });
-    const { url } = await app.mcp!.endpoint();
-    const c = app.conversations!.create(f.users.owner.id);
-    const token = app.runs!.mcpTokens.issue({
-      userId: f.users.owner.id,
-      conversationId: c.id,
-      runId: crypto.randomUUID(),
-    });
-    const out = JSON.parse((await callOurTool(url, token, "watchlist_get", {})).content[0]!.text!) as {
-      items: { symbol: string }[];
-    };
-    expect(out.items.map((i) => i.symbol)).toEqual(["AAPL"]);
-  });
-});
-
-// ---- 관심 종목 API --------------------------------------------------------------------------------------------
-
-describe("관심 종목 API (#31, FR-7.7)", () => {
-  it("add, list, duplicates, remove — each person's own list; the admin cannot see or remove another's", async () => {
-    const { app, f, headers } = await start(new RuntimeRegistry());
-    const req = (
-      who: keyof typeof f.cookies,
-      method: "GET" | "POST" | "DELETE",
-      url: string,
-      payload?: unknown,
-    ) =>
-      app.inject({
-        method,
-        url,
-        headers: payload
-          ? headers(f.cookies[who])
-          : { ...headers(f.cookies[who]), "content-type": undefined as unknown as string },
-        ...(payload ? { payload } : {}),
-      });
-    const a = await req("owner", "POST", "/api/watchlist", {
-      market: "KR",
-      symbol: "005930",
-      name: "삼성전자",
-    });
-    expect(a.statusCode, a.body).toBe(201);
-    expect((await req("owner", "POST", "/api/watchlist", { market: "US", symbol: "AAPL" })).statusCode).toBe(
-      201,
-    );
-    const dup = await req("owner", "POST", "/api/watchlist", { market: "KR", symbol: "005930" });
-    expect([dup.statusCode, dup.json()]).toEqual([409, { error: "watchlist_duplicate" }]);
-    expect((await req("owner", "POST", "/api/watchlist", { market: "KR", symbol: "AAPL" })).statusCode).toBe(
-      400,
-    );
-    expect((await req("owner", "POST", "/api/watchlist", { market: "US", symbol: "aapl" })).statusCode).toBe(
-      400,
-    );
-    const mine = WatchlistResponse.parse((await req("owner", "GET", "/api/watchlist")).json());
-    expect(mine.items.map((i) => [i.market, i.symbol, i.name])).toEqual([
-      ["KR", "005930", "삼성전자"],
-      ["US", "AAPL", null],
-    ]);
-    expect(mine.markets).toEqual(["KR", "US"]);
-    // The admin's own list is empty; another's item is refused (owner only, like schedules).
-    expect(WatchlistResponse.parse((await req("admin", "GET", "/api/watchlist")).json()).items).toEqual([]);
-    const id = mine.items[0]!.id;
-    expect((await req("admin", "GET", `/api/watchlist/${id}`)).statusCode).toBe(403);
-    expect((await req("admin", "DELETE", `/api/watchlist/${id}`)).statusCode).toBe(403);
-    expect((await req("owner", "DELETE", `/api/watchlist/${id}`)).statusCode).toBe(204);
-    expect(WatchlistResponse.parse((await req("owner", "GET", "/api/watchlist")).json()).items).toHaveLength(
-      1,
-    );
-  });
-
-  it("an account with finance hidden gets no markets, cannot add or search", async () => {
-    const { app } = await start(new RuntimeRegistry());
-    const son = app.users!.create({
-      email: "son@example.com",
-      name: "아들",
-      role: "member",
-      passwordHash: "x",
-      youth: true,
-    });
-    expect(app.mcp!.watchMarkets(son.id)).toEqual([]);
-    expect(await app.mcp!.searchSymbols(son.id, "삼성")).toEqual({ ok: false, code: "finance_not_allowed" });
-  });
-
-  it("search: Korean names through kr_search (Naver 증권), a typed US ticker as it is", async () => {
-    const { app, f, headers } = await start(new RuntimeRegistry());
-    const res = await app.inject({
-      url: `/api/watchlist/search?q=${encodeURIComponent("삼성")}`,
-      headers: headers(f.cookies.owner),
-    });
-    expect(res.statusCode, res.body).toBe(200);
-    expect(res.json().items.map((i: { symbol: string }) => i.symbol)).toEqual(["005930", "005935"]);
-    const us = await app.inject({ url: "/api/watchlist/search?q=nvda", headers: headers(f.cookies.owner) });
-    expect(us.json().items[0]).toEqual({ market: "US", symbol: "NVDA", name: null, exchange: null });
-  });
-
-  it("a stored name never keeps a known secret, and the list holds at most 50", async () => {
-    const { app, f } = await start(new RuntimeRegistry());
-    const secret = `wl-secret-${crypto.randomUUID()}`;
-    knownSecrets.add(secret);
-    const row = app.watchlist!.add(f.users.owner.id, { market: "KR", symbol: "000660", name: `x ${secret}` });
-    expect(row.name).not.toContain(secret);
-    app.watchlist!.remove(row.id);
-    for (let i = 0; i < 50; i++) app.watchlist!.add(f.users.owner.id, { market: "US", symbol: `A${i}` });
-    expect(() => app.watchlist!.add(f.users.owner.id, { market: "US", symbol: "ZZ" })).toThrow(
-      "watchlist_full",
-    );
   });
 });
 
@@ -502,54 +374,6 @@ function fileDb() {
   return { db, file, bytes, has, inWal, inDb };
 }
 
-describe("관심 종목 symbols never keep a known secret (review #111, #78)", () => {
-  // Synthetic, test-only values (never a real gate code or credential).
-  const GATE = "GATEAB1234";
-
-  it("a symbol that is a known secret is refused at write — exactly like any bad symbol; no row, no plaintext bytes", async () => {
-    const { db, bytes } = fileDb();
-    const { app, f, headers } = await start(new RuntimeRegistry(), { db, env: { TEMP_GATE_CODE: GATE } });
-    const post = (symbol: string) =>
-      app.inject({
-        method: "POST",
-        url: "/api/watchlist",
-        headers: headers(f.cookies.owner),
-        payload: { market: "US", symbol },
-      });
-    const answer = (r: Awaited<ReturnType<typeof post>>) => ({
-      status: r.statusCode,
-      body: r.body,
-      type: r.headers["content-type"],
-      cache: r.headers["cache-control"],
-    });
-    // The secret, an ordinary invalid symbol of the same shape and length, a lower-case one, a too-long one.
-    const secret = answer(await post(GATE));
-    expect(secret).toMatchObject({ status: 400, body: JSON.stringify({ error: "watchlist_bad_symbol" }) });
-    for (const other of ["ABCDEFGH12", "gateab1234", "ABCDEFGHIJKLMNOPQRST"])
-      expect(answer(await post(other)), other).toEqual(secret);
-    // The same through the store, a cut-off one too.
-    for (const s of [GATE, GATE.slice(0, 9), "ABCDEFGH12"])
-      expect(() => app.watchlist!.add(f.users.owner.id, { market: "US", symbol: s })).toThrow(
-        "watchlist_bad_symbol",
-      );
-    // The search answers a secret exactly as it answers another value of that shape: no typed-ticker hit.
-    const search = async (q: string) =>
-      (await app.inject({ url: `/api/watchlist/search?q=${q}`, headers: headers(f.cookies.owner) })).body;
-    expect(await search(GATE)).toBe(await search("ABCDEFGH12"));
-    expect(JSON.parse(await search(GATE))).toEqual({ items: [] });
-    await app.storedRescrub!.idle();
-    expect(db.$client.prepare("select count(*) as n from watchlist_items").get()).toEqual({ n: 0 });
-    expect(bytes().some((b) => b.includes(Buffer.from(GATE)))).toBe(false);
-  });
-
-  it("no symbol the watchlist accepts is long enough to be a known secret", () => {
-    expect(WATCH_SYMBOL_MAX).toBeLessThan(MIN_KNOWN_LENGTH);
-    expect(symbolOk("US", "BRK-B")).toBe(true);
-    expect(symbolOk("US", "A".repeat(WATCH_SYMBOL_MAX))).toBe(true);
-    expect(symbolOk("US", "A".repeat(WATCH_SYMBOL_MAX + 1))).toBe(false);
-  });
-});
-
 describe("the rescrub leaves no old value in the files (review #111 round 2, #78)", () => {
   const synthetic = (p: string) => `${p}${crypto.randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase()}`;
   type Setup = Awaited<ReturnType<typeof setup>>;
@@ -559,13 +383,6 @@ describe("the rescrub leaves no old value in the files (review #111 round 2, #78
     await s.app.storedRescrub!.idle();
     return { ...f, ...s };
   }
-  /** A row whose watchlist symbol is a later secret (written directly: the API takes 7 characters at most). */
-  const watchRow = (t: Setup, late: string) => {
-    t.db.$client
-      .prepare("insert into watchlist_items (id, user_id, market, symbol, name) values (?, ?, 'US', ?, ?)")
-      .run(crypto.randomUUID(), t.f.users.owner.id, late, "곧 비밀");
-    t.app.watchlist!.add(t.f.users.owner.id, { market: "KR", symbol: "005930", name: "삼성전자" });
-  };
   /** An ordinary masked column (#78): a conversation title. */
   const titleRow = (t: Setup, late: string) => {
     const c = t.app.conversations!.create(t.f.users.owner.id);
@@ -574,27 +391,22 @@ describe("the rescrub leaves no old value in the files (review #111 round 2, #78
   };
 
   for (const where of ["wal", "db"] as const)
-    for (const kind of ["watchlist delete", "masked title"] as const)
-      it(`${kind}: old value in the ${where === "wal" ? "WAL (not checkpointed yet)" : "database page (checkpointed)"} → clean files right after idle()`, async () => {
-        const t = await setup();
-        const late = synthetic("LATE");
-        const id = kind === "watchlist delete" ? watchRow(t, late) : titleRow(t, late);
-        if (where === "db") t.db.$client.pragma("wal_checkpoint(TRUNCATE)");
-        // The residue really is where this case says (the control: otherwise the case proves nothing).
-        expect(where === "wal" ? t.inWal(late) : t.inDb(late) && !t.inWal(late)).toBe(true);
-        knownSecrets.add(late);
-        try {
-          await t.app.storedRescrub!.idle();
-          expect(t.has(late)).toBe(false);
-          if (kind === "watchlist delete")
-            expect(t.db.$client.prepare("select market, symbol from watchlist_items").all()).toEqual([
-              { market: "KR", symbol: "005930" },
-            ]);
-          else expect(t.app.conversations!.get(id as string)!.title).not.toContain(late);
-        } finally {
-          knownSecrets.remove(late);
-        }
-      });
+    it(`masked title: old value in the ${where === "wal" ? "WAL (not checkpointed yet)" : "database page (checkpointed)"} → clean files right after idle()`, async () => {
+      const t = await setup();
+      const late = synthetic("LATE");
+      const id = titleRow(t, late);
+      if (where === "db") t.db.$client.pragma("wal_checkpoint(TRUNCATE)");
+      // The residue really is where this case says (the control: otherwise the case proves nothing).
+      expect(where === "wal" ? t.inWal(late) : t.inDb(late) && !t.inWal(late)).toBe(true);
+      knownSecrets.add(late);
+      try {
+        await t.app.storedRescrub!.idle();
+        expect(t.has(late)).toBe(false);
+        expect(t.app.conversations!.get(id)!.title).not.toContain(late);
+      } finally {
+        knownSecrets.remove(late);
+      }
+    });
 
   it("a reader on an old snapshot blocks the checkpoint: no wait, retried, idle() only once the files are clean", async () => {
     const t = await setup();
@@ -724,51 +536,6 @@ describe("finance egress guard: no known secret in any outgoing request (review 
     };
     return { jobs, worker, leaked };
   }
-
-  it("watchlist search: a query carrying the secret (raw, base64, hex, URL-encoded, cut off) sends only the decoy and answers like no hits", async () => {
-    const cap = capture();
-    const db = createTestDb();
-    const app = await buildApp(loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: GATE }), {
-      db,
-      logger: false,
-      runtimes: new RuntimeRegistry(),
-      mcp: {
-        skills: [SELFTEST_SKILL],
-        egress: () => ({
-          endpoint: async () => ({ port: 9, url: "http://127.0.0.1:9", close: async () => {} }),
-          close: async () => {},
-        }),
-        finance: { worker: cap.worker, now: () => SATURDAY },
-      },
-    });
-    closers.push(() => app.close());
-    const f = await createFamily(app);
-    const headers = { host: "localhost:3000", cookie: f.cookies.owner };
-    const search = async (q: string) =>
-      app.inject({ url: `/api/watchlist/search?q=${encodeURIComponent(q)}`, headers });
-    // An ordinary query of the same shape that finds nothing: a job goes out, no hits.
-    const ordinary = await search("QZXWVUTS99");
-    expect(cap.jobs).toHaveLength(1);
-    cap.jobs.length = 0;
-    for (const q of [
-      GATE,
-      `x ${GATE} y`,
-      Buffer.from(GATE).toString("base64"),
-      Buffer.from(GATE).toString("hex"),
-      "%" + Buffer.from(GATE).toString("hex").match(/../g)!.join("%"),
-      `abc ${GATE.slice(0, 9)}`,
-    ]) {
-      const r = await search(q);
-      expect([r.statusCode, r.body], q).toEqual([ordinary.statusCode, ordinary.body]);
-    }
-    // Each made the same one job as an ordinary query — with the fixed decoy, never the user's text.
-    expect(cap.jobs).toHaveLength(6);
-    for (const j of cap.jobs as { steps: { url: string }[] }[])
-      expect(j.steps.map((x) => x.url)).toEqual([
-        `https://ac.stock.naver.com/ac?q=${encodeURIComponent(SEARCH_DECOY)}&target=stock`,
-      ]);
-    expect(cap.leaked()).toBe(false);
-  });
 
   it("every finance tool: an input carrying the secret is refused before any job; the tool's own configured secret still goes", async () => {
     const own = "dart-synthetic-key-0123456789";
@@ -1007,79 +774,6 @@ describe("old free space and an interrupted clean-up (review #111 round 3)", () 
   });
 });
 
-describe("a secret search query is answered like any other, also busy or failing (review #111 round 3)", () => {
-  it("same status and body as a same-shape ordinary query — normal, all slots taken, worker down — and no job carries it", async () => {
-    const GATE = "GATEAB1234"; // synthetic TEMP_GATE_CODE
-    let mode: "ok" | "error" | "hold" = "ok";
-    let release: () => void = () => {};
-    let hold = new Promise<void>((r) => (release = r));
-    let entered = 0;
-    const jobs: unknown[] = [];
-    const app = await buildApp(loadConfig({ NODE_ENV: "test", TEMP_GATE_CODE: GATE }), {
-      db: createTestDb(),
-      logger: false,
-      runtimes: new RuntimeRegistry(),
-      mcp: {
-        skills: [SELFTEST_SKILL],
-        egress: () => ({
-          endpoint: async () => ({ port: 9, url: "http://127.0.0.1:9", close: async () => {} }),
-          close: async () => {},
-        }),
-        finance: {
-          now: () => SATURDAY,
-          worker: async (job) => {
-            jobs.push(job);
-            if (mode === "hold") {
-              entered++;
-              await hold;
-            }
-            if (mode === "error") return { ok: false, code: "web_unreachable" };
-            return {
-              ok: true,
-              responses: job.steps.map(() => ({
-                status: 200,
-                body: '{"items":[]}',
-                contentType: "application/json",
-              })),
-            };
-          },
-        },
-      },
-    });
-    closers.push(() => app.close());
-    const f = await createFamily(app);
-    const headers = { host: "localhost:3000", cookie: f.cookies.owner };
-    const answer = async (q: string) => {
-      const r = await app.inject({ url: `/api/watchlist/search?q=${encodeURIComponent(q)}`, headers });
-      return { status: r.statusCode, body: r.body };
-    };
-    const ORDINARY = "QZXWVUTS99";
-    for (const m of ["ok", "error"] as const) {
-      mode = m;
-      const secret = await answer(GATE);
-      expect(secret, m).toEqual(await answer(ORDINARY));
-      expect(secret.status, m).toBe(m === "ok" ? 200 : 502);
-    }
-    // All of this user's search slots taken by two ordinary searches in flight.
-    mode = "hold";
-    hold = new Promise<void>((r) => (release = r));
-    const inFlight = [answer("NORMALHOLD1"), answer("NORMALHOLD2")];
-    try {
-      for (let i = 0; i < 200 && entered < 2; i++) await new Promise((r) => setTimeout(r, 5));
-      expect(entered).toBe(2);
-      const secret = await answer(GATE);
-      expect(secret).toEqual(await answer(ORDINARY));
-      expect(secret.status).toBe(429);
-    } finally {
-      release();
-      await Promise.all(inFlight);
-    }
-    const all = JSON.stringify(jobs);
-    expect(all).not.toContain(GATE);
-    expect(scrubKnown(all)).toBe(all);
-  });
-});
-
 // ---- review #111 round 4 ----------------------------------------------------------------------------------
 
 describe("the one-time compaction is done only when the file is clean (review #111 round 4)", () => {
@@ -1310,45 +1004,26 @@ describe("the one-time compaction is done only when the file is clean (review #1
   });
 });
 
-describe("the search's decoy uses the egress guard's own decision (review #111 round 4)", () => {
+describe("a fragment of a configured secret never leaves in a search query (review #111 round 4)", () => {
   const KEY = "0123456789abcdefFEDCBA987654321001234567"; // synthetic DART key
-  it("whole key, mid, prefix and encoded fragments answer exactly like same-shape ordinary queries; no job carries any", async () => {
+  it("whole key, mid, prefix and encoded fragments as a kr_search query are refused before any job; same-shape ordinary queries go", async () => {
     const jobs: { steps: { url: string }[] }[] = [];
-    const app = await buildApp(loadConfig({ NODE_ENV: "test", OPENDART_API_KEY: KEY }), {
-      db: createTestDb(),
-      logger: false,
-      runtimes: new RuntimeRegistry(),
-      mcp: {
-        skills: [SELFTEST_SKILL],
-        egress: () => ({
-          endpoint: async () => ({ port: 9, url: "http://127.0.0.1:9", close: async () => {} }),
-          close: async () => {},
-        }),
-        finance: {
-          now: () => SATURDAY,
-          secrets: { OPENDART_API_KEY: KEY },
-          worker: async (job) => {
-            jobs.push(job as never);
-            return {
-              ok: true,
-              responses: job.steps.map(() => ({
-                status: 200,
-                body: '{"items":[]}',
-                contentType: "application/json",
-              })),
-            };
-          },
-        },
+    const svc = new FinanceService(
+      async (job) => {
+        jobs.push(job as never);
+        return {
+          ok: true,
+          responses: job.steps.map(() => ({
+            status: 200,
+            body: '{"items":[]}',
+            contentType: "application/json",
+          })),
+        };
       },
-    });
-    closers.push(() => app.close());
-    const f = await createFamily(app);
-    const headers = { host: "localhost:3000", cookie: f.cookies.owner };
-    const answer = async (q: string) => {
-      const before = jobs.length;
-      const r = await app.inject({ url: `/api/watchlist/search?q=${encodeURIComponent(q)}`, headers });
-      return { status: r.statusCode, body: r.body, jobs: jobs.length - before };
-    };
+      async () => ({ url: "http://127.0.0.1:9", port: 9 }),
+      { now: () => SATURDAY, secrets: { OPENDART_API_KEY: KEY } },
+    );
+    const search = FINANCE_TOOLS.find((t) => t.name === "kr_search")!;
     const same = (x: string) => x.replace(/[0-9A-Za-z+/=]/g, "Q");
     const fragments = [
       KEY,
@@ -1357,12 +1032,13 @@ describe("the search's decoy uses the egress guard's own decision (review #111 r
       Buffer.from(KEY.slice(0, 24)).toString("base64"), // an encoded fragment within the 40-character cap
     ];
     for (const q of fragments) {
-      expect(q.length, q).toBeLessThanOrEqual(40); // a valid search input: the row really reaches the decoy choice
+      expect(z.strictObject(search.input).safeParse({ query: q }).success, q).toBe(true);
       const fragment = q.startsWith("find ") ? q.slice(5, -7) : q;
-      const ordinary = q.replace(fragment, same(fragment));
-      const a = await answer(q);
-      expect(a, q).toEqual(await answer(ordinary));
-      expect(a.jobs, q).toBe(1); // the decoy's one job, as the ordinary query's one
+      const before = jobs.length;
+      expect(await svc.run(search, { query: q }), q).toEqual({ ok: false, code: "finance_bad_input" });
+      expect(jobs.length, q).toBe(before);
+      expect((await svc.run(search, { query: q.replace(fragment, same(fragment)) })).ok, q).toBe(true);
+      expect(jobs.length, q).toBe(before + 1);
     }
     const sent = decodeURIComponent(jobs.flatMap((j) => j.steps.map((x) => x.url)).join(" "));
     for (let i = 0; i + 16 <= KEY.length; i++) expect(sent).not.toContain(KEY.slice(i, i + 16));
@@ -1383,43 +1059,23 @@ describe("configured-secret windows are found in decoded views too (review #111 
     "percent-encoded base64": (x) => encodeURIComponent(Buffer.from(x).toString("base64") + "="),
   };
 
-  it("each encoded half answers like a same-shape ordinary query, only the decoy goes out, and no join of the sent queries rebuilds a window", async () => {
+  it("each encoded half as a kr_search query is refused before any job, a same-shape ordinary one goes, and no join of the sent queries rebuilds a window", async () => {
     const jobs: { steps: { url: string }[] }[] = [];
-    const app = await buildApp(loadConfig({ NODE_ENV: "test", OPENDART_API_KEY: KEY }), {
-      db: createTestDb(),
-      logger: false,
-      runtimes: new RuntimeRegistry(),
-      mcp: {
-        skills: [SELFTEST_SKILL],
-        egress: () => ({
-          endpoint: async () => ({ port: 9, url: "http://127.0.0.1:9", close: async () => {} }),
-          close: async () => {},
-        }),
-        finance: {
-          now: () => SATURDAY,
-          secrets: { OPENDART_API_KEY: KEY },
-          worker: async (job) => {
-            jobs.push(job as never);
-            return {
-              ok: true,
-              responses: job.steps.map(() => ({
-                status: 200,
-                body: '{"items":[]}',
-                contentType: "application/json",
-              })),
-            };
-          },
-        },
+    const svc = new FinanceService(
+      async (job) => {
+        jobs.push(job as never);
+        return {
+          ok: true,
+          responses: job.steps.map(() => ({
+            status: 200,
+            body: '{"items":[]}',
+            contentType: "application/json",
+          })),
+        };
       },
-    });
-    closers.push(() => app.close());
-    const f = await createFamily(app);
-    const headers = { host: "localhost:3000", cookie: f.cookies.owner };
-    const answer = async (q: string) => {
-      const before = jobs.length;
-      const r = await app.inject({ url: `/api/watchlist/search?q=${encodeURIComponent(q)}`, headers });
-      return { status: r.statusCode, body: r.body, jobs: jobs.length - before, sent: jobs.slice(before) };
-    };
+      async () => ({ url: "http://127.0.0.1:9", port: 9 }),
+      { now: () => SATURDAY, secrets: { OPENDART_API_KEY: KEY } },
+    );
     const search = FINANCE_TOOLS.find((t) => t.name === "kr_search")!;
     for (const [name, enc] of Object.entries(encodings))
       for (const [i, half] of halves.entries()) {
@@ -1429,17 +1085,14 @@ describe("configured-secret windows are found in decoded views too (review #111 
         expect(z.strictObject(search.input).safeParse({ query: q }).success, `${name} is a valid input`).toBe(
           true,
         );
-        const a = await answer(q);
-        const b = await answer(ordinary);
-        expect({ status: a.status, body: a.body, jobs: a.jobs }, `${name} ${i}`).toEqual({
-          status: b.status,
-          body: b.body,
-          jobs: b.jobs,
+        const before = jobs.length;
+        expect(await svc.run(search, { query: q }), `${name} ${i}`).toEqual({
+          ok: false,
+          code: "finance_bad_input",
         });
-        expect(a.jobs).toBe(1);
-        expect(a.sent[0]!.steps[0]!.url).toBe(
-          `https://ac.stock.naver.com/ac?q=${encodeURIComponent(SEARCH_DECOY)}&target=stock`,
-        );
+        expect(jobs.length, `${name} ${i}`).toBe(before);
+        expect((await svc.run(search, { query: ordinary })).ok, `${name} ${i} ordinary`).toBe(true);
+        expect(jobs.length, `${name} ${i} ordinary`).toBe(before + 1);
       }
     // Every sent query, decoded every way we know, joined: never a 16-character window of the key.
     const queries = jobs.flatMap((j) => j.steps.map((x) => new URL(x.url).searchParams.get("q") ?? ""));

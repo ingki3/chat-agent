@@ -306,14 +306,14 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "schedule_proposals.skills": { exempt: "skill names from the catalogue (validated)" },
   "schedule_proposals.status": ENUM,
   "schedule_proposals.schedule_id": ID,
-  // 관심 종목 (#31).
+  // 관심 종목 (#31): removed in #187, the table retained for rollback compatibility only (db/schema.ts). Nothing
+  // writes it any more; any row left from before is still rescrubbed in place (masked), so a value registered as a
+  // secret later does not stay in it. Goes with the table in a later release.
   "watchlist_items.id": ID,
   "watchlist_items.user_id": ID,
   "watchlist_items.market": ENUM,
-  // A symbol that becomes a known secret later: its row is removed (a masked ticker would be no symbol at all) —
-  // `rescrub.ts` `removeOn`. New ones are refused at write (`watchlist_bad_symbol`, the same as any bad symbol).
-  "watchlist_items.symbol": { write: "WatchlistStore.add (refused)", rescrub: "text" },
-  "watchlist_items.name": { write: "WatchlistStore.add", rescrub: "text" },
+  "watchlist_items.symbol": { write: "none since #187 (retained table)", rescrub: "text" },
+  "watchlist_items.name": { write: "none since #187 (retained table)", rescrub: "text" },
   // Family shares (#29): ids, closed sets and hashes only — no shared text is copied into these tables (the
   // projection reads the original rows, which stay scrubbed by their own rules).
   "shares.id": ID,

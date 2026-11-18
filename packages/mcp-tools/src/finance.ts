@@ -270,15 +270,4 @@ export const FINANCE_CHART_TOOL: FinanceComposedToolInfo = {
   },
 };
 
-export const WATCHLIST_GET_TOOL: FinanceComposedToolInfo = {
-  name: "watchlist_get",
-  skills: ["kr-stock-skill", "us-stock-skill"],
-  description:
-    "The user's own watchlist (관심 종목, Korean and US stocks): market (KR/US), symbol and name. Use it when the user says 내 관심 종목 / my watchlist, then look the symbols up with the finance tools. Names only, no numbers. The user edits the list on the 관심 종목 screen.",
-  input: {},
-};
-
-export const FINANCE_COMPOSED_TOOLS: readonly FinanceComposedToolInfo[] = [
-  FINANCE_CHART_TOOL,
-  WATCHLIST_GET_TOOL,
-];
+export const FINANCE_COMPOSED_TOOLS: readonly FinanceComposedToolInfo[] = [FINANCE_CHART_TOOL];

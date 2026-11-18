@@ -41,11 +41,6 @@ type Table = {
   immutable?: string;
   /** Columns recomputed from the scrubbed ones (content hashes, sizes). */
   derived?: (row: Record<string, unknown>, sql: Db["$client"]) => Record<string, unknown>;
-  /**
-   * Columns that cannot hold a mask (an identifier the row is about, e.g. a watchlist symbol): a row with a hit in
-   * one of them is deleted instead — with `secure_delete`, so the freed cell is zeroed, not left in the page.
-   */
-  removeOn?: readonly string[];
 };
 
 // The persisted clean-up state (markers.ts): re-exported for callers and tests.
@@ -59,9 +54,7 @@ const markPending = (sql: Db["$client"]) =>
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
-const DERIVED: Record<string, Pick<Table, "immutable" | "derived" | "removeOn">> = {
-  // 관심 종목 (#31, review #111): a masked symbol is no symbol — the row goes.
-  watchlist_items: { removeOn: ["symbol"] },
+const DERIVED: Record<string, Pick<Table, "immutable" | "derived">> = {
   sources: { derived: (r) => (typeof r.body === "string" ? { body_hash: sha256(r.body) } : {}) },
   // The duplicate key (a hash) follows the scrubbed snippet (#25).
   citations: {
@@ -434,7 +427,6 @@ export class StoredRescrub {
           .all(after, CHUNK) as Record<string, unknown>[];
         if (!rows.length) break;
         const changes: { rowid: number; set: Record<string, unknown> }[] = [];
-        const removals: number[] = [];
         for (const row of rows) {
           const set: Record<string, unknown> = {};
           for (const c of t.columns) {
@@ -445,20 +437,11 @@ export class StoredRescrub {
             const next = rescrubValue(v, c.kind, this.registry);
             if (next !== v) set[c.name] = next;
           }
-          if (t.removeOn?.some((c) => c in set)) removals.push(row._rowid as number);
-          else if (Object.keys(set).length)
+          if (Object.keys(set).length)
             changes.push({
               rowid: row._rowid as number,
               set: { ...set, ...(t.derived?.({ ...row, ...set }, sql) ?? {}) },
             });
-        }
-        if (removals.length) {
-          // The connection runs with `secure_delete` (db/client.ts): the freed cells are zeroed.
-          sql.transaction(() => {
-            for (const rowid of removals) sql.prepare(`delete from "${t.table}" where rowid = ?`).run(rowid);
-            markPending(sql);
-          })();
-          this.dirty = true;
         }
         if (changes.length) this.dirty = true;
         if (changes.length)

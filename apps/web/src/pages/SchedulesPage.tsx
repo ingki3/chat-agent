@@ -62,7 +62,7 @@ export function SchedulesPage({ creating = false }: { creating?: boolean }) {
             <div className="empty" data-testid="schedules-empty">
               <p>아직 예약이 없어요.</p>
               <p className="muted small">
-                “+ 새 예약”을 누르거나, 대화에서 “매일 아침 8시에 내 관심 종목 브리핑해줘”라고 해 보세요.
+                “+ 새 예약”을 누르거나, 대화에서 “매일 아침 8시에 시장 브리핑해줘”라고 해 보세요.
               </p>
             </div>
           )
