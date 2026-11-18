@@ -484,3 +484,55 @@ test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그�
     await expect(admin.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
   });
 });
+
+/** GETs of `url` fail (503); PUTs too once `putsFail.on` is set. */
+async function failing(page: Page, url: string) {
+  const putsFail = { on: false };
+  const unavailable = { status: 503, contentType: "application/json", body: '{"error":"unavailable"}' };
+  await page.route(url, (route) => {
+    const m = route.request().method();
+    if (m === "GET" || (m === "PUT" && putsFail.on)) return route.fulfill(unavailable);
+    return route.fallback();
+  });
+  return putsFail;
+}
+
+test("저장 성공 + 불러오기 실패 뒤 다음 저장이 실패해도 저장된 값으로 돌아간다 (리뷰 #195 7차)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "dreamseq");
+  await signIn(page, baseURL!, me);
+  const api = async <T>(url: string) => (await (await page.request.get(url)).json()) as T;
+
+  // 기억 반영 방식: 자동 반영 saved (its refetch fails), then 검토 후 반영 refused → back to 자동 반영 (what is stored).
+  await page.goto("/settings/instructions?doc=dreams");
+  const auto = page.getByRole("radio", { name: /자동 반영/ });
+  const review = page.getByRole("radio", { name: /검토 후 반영/ });
+  await expect(review).toBeChecked();
+  const modePuts = await failing(page, "**/api/memory-prefs");
+  await auto.check();
+  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
+  modePuts.on = true;
+  await review.check();
+  await expect(page.getByTestId("memory-mode").getByRole("alert")).toBeVisible();
+  await expect(auto).toBeChecked();
+  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
+  expect((await api<{ applyMode: string }>("/api/memory-prefs")).applyMode).toBe("auto");
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+
+  // A notification toggle: off saved (refetch fails), then on refused → stays off (what is stored).
+  await page.goto("/settings");
+  const failed = page.getByRole("checkbox", { name: "내 기억 정리가 실패했을 때" });
+  await expect(failed).toBeChecked();
+  const prefPuts = await failing(page, "**/api/notifications/prefs");
+  await failed.uncheck();
+  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
+  prefPuts.on = true;
+  await failed.check();
+  await expect(failed).not.toBeChecked();
+  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
+  expect((await api<{ memoryFailed: boolean }>("/api/notifications/prefs")).memoryFailed).toBe(false);
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});

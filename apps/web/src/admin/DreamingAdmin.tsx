@@ -20,7 +20,7 @@ import {
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
 import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
-import { resync, SAVED_STALE } from "../instructions/sync.js";
+import { resync, SAVED_STALE, useInstant } from "../instructions/sync.js";
 
 /**
  * 관리자 → 기억 정리 (#146, #188, PRD FR-16.6·16.8): what stays the admin's once each user sets their own 기억 정리
@@ -325,24 +325,27 @@ function YouthExtras({
   save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => Promise<boolean>;
 }) {
   const [prompt, setPrompt] = useState("");
-  // The 반영 방식 just picked, until the refetch shows it (a refusal goes back to the stored one).
-  const [mode, setMode] = useState<MemoryApplyMode>();
+  // 반영 방식 is an instant-save control (sync.ts `useInstant`, review #195 7): a refused save goes back to the last
+  // value known to be stored, not to a stale cache.
+  const qc = useQueryClient();
+  const mode = useInstant<MemoryApplyMode>(
+    user.applyMode ?? "review",
+    qc.getQueryState(ADMIN_DREAMING_KEY)?.dataUpdatedAt ?? 0,
+  );
   return (
     <div className="dream-youth-extras">
       <label className="inline">
         반영 방식
         <select
           aria-label={`${user.name} 반영 방식`}
-          value={mode ?? user.applyMode ?? "review"}
+          value={mode.shown}
           disabled={pending}
           onChange={(e) => {
             const picked = e.target.value as MemoryApplyMode;
-            setMode(picked);
+            mode.pick(picked);
             void save({ applyMode: picked }).then(
-              (synced) => {
-                if (synced) setMode((cur) => afterSave(cur, picked, undefined));
-              },
-              () => setMode(undefined),
+              (synced) => mode.saved(picked, synced),
+              () => mode.failed(),
             );
           }}
         >
@@ -353,6 +356,11 @@ function YouthExtras({
           ))}
         </select>
       </label>
+      {mode.stale && (
+        <p className="small" role="status" data-testid="dreaming-youth-mode-stale">
+          {SAVED_STALE}
+        </p>
+      )}
       <p className="muted small">
         정리 프롬프트: {user.customPrompt ? "관리자가 새로 씀" : "기본값"} (지금 내용은 여기서 보이지 않아요)
       </p>

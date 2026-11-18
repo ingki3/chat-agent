@@ -1,8 +1,7 @@
-import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MEMORY_APPLY_MODE_LABEL, MemoryApplyMode } from "@agentlee/shared";
 import { errorText, MEMORY_PREFS_KEY, memoryPrefs } from "../api.js";
-import { resync, SAVED_STALE } from "./sync.js";
+import { resync, SAVED_STALE, useInstant } from "./sync.js";
 
 const HELP: Record<MemoryApplyMode, string> = {
   review: '대화 중 "기억해줘·잊어줘"는 답 아래 카드에서 반영을 눌러야 바뀌어요.',
@@ -16,20 +15,19 @@ const HELP: Record<MemoryApplyMode, string> = {
 export function MemoryModeSetting() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: MEMORY_PREFS_KEY, queryFn: memoryPrefs.get });
-  // The choice shows at once (a controlled radio would snap back until the save answers); a refused save shows the
-  // stored one again; a save whose refetch failed keeps showing the choice (and says so — sync.ts).
-  const [picked, setPicked] = useState<MemoryApplyMode | null>(null);
+  // An instant-save control (sync.ts `useInstant`): the choice shows at once; a save whose refetch failed keeps showing
+  // what was stored (and says so); a refused save goes back to the last value known to be stored.
+  const ui = useInstant<MemoryApplyMode | undefined>(q.data?.applyMode, q.dataUpdatedAt);
   const save = useMutation({
     mutationFn: async (m: MemoryApplyMode) => {
       await memoryPrefs.set(m);
       return resync(qc, MEMORY_PREFS_KEY);
     },
-    onSuccess: (synced) => {
-      if (synced) setPicked(null);
-    },
-    onError: () => setPicked(null),
+    onMutate: (m) => ui.pick(m),
+    onSuccess: (synced, m) => ui.saved(m, synced),
+    onError: () => ui.failed(),
   });
-  const mode = picked ?? q.data?.applyMode;
+  const mode = ui.shown;
   return (
     <section className="panel memory-mode" data-testid="memory-mode">
       {/* Locked while a choice is being saved (no second choice racing the first, review #195 round 4). */}
@@ -47,10 +45,7 @@ export function MemoryModeSetting() {
               name="memory-apply-mode"
               value={m}
               checked={mode === m}
-              onChange={() => {
-                setPicked(m);
-                save.mutate(m);
-              }}
+              onChange={() => save.mutate(m)}
               aria-describedby={`memory-mode-help-${m}`}
             />
             <span>
@@ -63,7 +58,7 @@ export function MemoryModeSetting() {
           </label>
         ))}
       </fieldset>
-      {save.isSuccess && !save.data && (
+      {ui.stale && (
         <p className="small" role="status">
           {SAVED_STALE}
         </p>

@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PushDevice, SaveNotificationPrefsRequest } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
-import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
-import { resync, SAVED_STALE } from "../instructions/sync.js";
+import { afterSave } from "../instructions/draft.js";
+import { resync, SAVED_STALE, useInstant } from "../instructions/sync.js";
 import {
   browserState,
   disablePush,
@@ -306,29 +306,30 @@ function QuietHours() {
 function MemoryNotifications() {
   const qc = useQueryClient();
   const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
-  type Toggles = { memoryProposals: boolean; memoryApplied: boolean; memoryFailed: boolean };
-  // The toggles as stored, with a choice on top until the refetch shows it (draft.ts / sync.ts, review #195 6).
-  const [draft, setDraft] = useState<Partial<Toggles>>();
-  const shown = withDraft<Toggles>(
-    {
-      memoryProposals: prefs.data?.memoryProposals !== false,
-      memoryApplied: prefs.data?.memoryApplied !== false,
-      memoryFailed: prefs.data?.memoryFailed !== false,
-    },
-    draft,
-  );
+  type Toggle = "memoryProposals" | "memoryApplied" | "memoryFailed";
+  // Instant-save controls (sync.ts `useInstant`, review #195 7): each shows its choice at once; a save whose refetch
+  // failed keeps what was stored (and says so); a refused save goes back to the last value known to be stored.
+  const at = prefs.dataUpdatedAt;
+  const ui: Record<Toggle, ReturnType<typeof useInstant<boolean>>> = {
+    memoryProposals: useInstant(prefs.data?.memoryProposals !== false, at),
+    memoryApplied: useInstant(prefs.data?.memoryApplied !== false, at),
+    memoryFailed: useInstant(prefs.data?.memoryFailed !== false, at),
+  };
+  const shown = {
+    memoryProposals: ui.memoryProposals.shown,
+    memoryApplied: ui.memoryApplied.shown,
+    memoryFailed: ui.memoryFailed.shown,
+  };
+  const stale = Object.values(ui).some((x) => x.stale);
   const save = useMutation({
     // Only the toggled field (#188 review 5): never the whole object, which would overwrite quiet hours saved meanwhile.
-    mutationFn: async (patch: Partial<Toggles>) => {
-      await notifications.setPrefs(patch);
+    mutationFn: async (a: { field: Toggle; value: boolean }) => {
+      await notifications.setPrefs({ [a.field]: a.value });
       return resync(qc, PREFS_KEY);
     },
-    onMutate: (patch) => setDraft((d) => ({ ...d, ...patch })),
-    onSuccess: (synced, patch) => {
-      if (synced) setDraft((cur) => settleDraft(cur, patch));
-    },
-    // Refused: back to what is stored.
-    onError: (_e, patch) => setDraft((cur) => settleDraft(cur, patch)),
+    onMutate: (a) => ui[a.field].pick(a.value),
+    onSuccess: (synced, a) => ui[a.field].saved(a.value, synced),
+    onError: (_e, a) => ui[a.field].failed(),
   });
   const loading = !prefs.data || save.isPending;
   return (
@@ -341,7 +342,7 @@ function MemoryNotifications() {
           type="checkbox"
           checked={shown.memoryProposals}
           disabled={loading}
-          onChange={(e) => save.mutate({ memoryProposals: e.target.checked })}
+          onChange={(e) => save.mutate({ field: "memoryProposals", value: e.target.checked })}
         />{" "}
         기억 정리 제안이 기다릴 때
       </label>
@@ -350,7 +351,7 @@ function MemoryNotifications() {
           type="checkbox"
           checked={shown.memoryApplied}
           disabled={loading}
-          onChange={(e) => save.mutate({ memoryApplied: e.target.checked })}
+          onChange={(e) => save.mutate({ field: "memoryApplied", value: e.target.checked })}
         />{" "}
         기억 정리가 자동으로 반영했을 때
       </label>
@@ -359,14 +360,14 @@ function MemoryNotifications() {
           type="checkbox"
           checked={shown.memoryFailed}
           disabled={loading}
-          onChange={(e) => save.mutate({ memoryFailed: e.target.checked })}
+          onChange={(e) => save.mutate({ field: "memoryFailed", value: e.target.checked })}
         />{" "}
         내 기억 정리가 실패했을 때
       </label>
       <p className="muted small">
         알림에는 개수·이유만 적혀요. 내용과 기억 정리 설정은 설정 → 내 지침에서 봐요.
       </p>
-      {save.isSuccess && !save.data && (
+      {stale && (
         <p className="small" role="status" data-testid="memory-notifications-stale">
           {SAVED_STALE}
         </p>
