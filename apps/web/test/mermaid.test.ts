@@ -1,13 +1,15 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { firstLoadProblems } from "../build/entry-check.js";
 import { DiagramFixContext, type DiagramFix } from "../src/chat/diagram-fix.js";
 import Markdown from "../src/chat/Markdown.js";
 import {
+  CONFIG_REFUSED,
   errorText,
   fenceClosed,
   fixRequest,
+  FrameHost,
   MAX_FIX_ERROR,
   MAX_SOURCE,
   MAX_SVG,
@@ -15,63 +17,79 @@ import {
   prepareSource,
   renderDiagram,
   RENDER_TIMEOUT_MS,
-  setMermaidLoaderForTest,
+  setFrameHostForTest,
   svgForImage,
-  type MermaidApi,
+  type FrameEnv,
 } from "../src/chat/mermaid.js";
+import {
+  FRAME_BOOT,
+  FRAME_CODE,
+  FRAME_READY,
+  FRAME_RENDER,
+  FRAME_RESULT,
+} from "../src/chat/mermaid-config.js";
 
 /**
- * Mermaid diagrams (#182): source cleaning, fence detection, the SVG → image step, the render queue with a fake
- * mermaid (the real one needs a browser — e2e/mermaid.spec.ts draws real diagrams), and what the block renders.
+ * Mermaid diagrams (#182): source cleaning, fence detection, the SVG → image step, the frame host's protocol and
+ * its queue with a fake frame (the real frame needs a browser — e2e/mermaid.spec.ts draws real diagrams in it and
+ * checks that nothing of mermaid ever enters the app's document), and what the block renders.
  */
 
-// The render queue makes an offscreen element: a minimal document is enough here (no DOM in these tests).
-const hosts: { removed: boolean }[] = [];
-beforeEach(() => {
-  hosts.length = 0;
-  vi.stubGlobal("document", {
-    createElement: () => {
-      const h = { removed: false, style: {}, setAttribute() {}, remove: () => (h.removed = true) };
-      hosts.push(h);
-      return h;
-    },
-    body: { append() {} },
-    getElementById: () => null,
-  });
-});
 afterEach(() => {
-  vi.unstubAllGlobals();
   vi.useRealTimers();
-  setMermaidLoaderForTest(null);
+  setFrameHostForTest(null);
 });
 
 const SVG = (body = "<g/>") =>
   `<svg id="x" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 120.5px;" viewBox="0 0 120.5 80">${body}</svg>`;
 
-/** A fake mermaid: records calls, at most one drawing at a time is checked. */
-function fake(opts: { svg?: string; fail?: unknown; hang?: boolean; delayMs?: number } = {}) {
-  const calls: { text: string; config: Record<string, unknown> }[] = [];
-  let config: Record<string, unknown> = {};
-  let active = 0;
-  let maxActive = 0;
-  const api: MermaidApi = {
-    initialize: (c) => void (config = c),
-    render: async (_id, text) => {
-      calls.push({ text, config });
-      active++;
-      maxActive = Math.max(maxActive, active);
-      try {
-        if (opts.hang) await new Promise(() => {});
-        if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
-        if (opts.fail !== undefined) throw opts.fail;
-        return { svg: opts.svg ?? SVG() };
-      } finally {
-        active--;
-      }
+type Draw = (text: string, dark: boolean) => Promise<{ svg: string } | { error: string }>;
+
+/**
+ * A fake frame: boots, takes the code, answers renders with `draw` (a never-settling promise hangs it). Records the
+ * frames made and removed, what was posted into them, and how many drawings ran at once.
+ */
+function fakeFrames(draw: Draw = async () => ({ svg: SVG() }), opts: { code?: () => Promise<string> } = {}) {
+  const frames: { removed: boolean; posts: unknown[]; running: number }[] = [];
+  let maxRunning = 0;
+  const texts: { text: string; dark: boolean }[] = [];
+  const env: FrameEnv = {
+    loadCode: opts.code ?? (async () => "/* bundle */"),
+    create(onMessage) {
+      const f = { removed: false, posts: [] as unknown[], running: 0 };
+      frames.push(f);
+      const send = (m: unknown) => queueMicrotask(() => !f.removed && onMessage(m));
+      send({ type: FRAME_BOOT });
+      return {
+        post(m) {
+          f.posts.push(m);
+          const d = m as { type: string; id: number; text: string; dark: boolean; code: string };
+          if (d.type === FRAME_CODE) send({ type: FRAME_READY });
+          if (d.type === FRAME_RENDER) {
+            texts.push({ text: d.text, dark: d.dark });
+            f.running++;
+            maxRunning = Math.max(
+              maxRunning,
+              frames.reduce((n, x) => n + (x.removed ? 0 : x.running), 0),
+            );
+            void draw(d.text, d.dark).then((r) => {
+              f.running--;
+              send({ type: FRAME_RESULT, id: d.id, ...r });
+            });
+          }
+        },
+        remove() {
+          f.removed = true;
+          f.running = 0;
+        },
+      };
     },
   };
-  return { api, calls, maxActive: () => maxActive };
+  const host = new FrameHost(env, { render: RENDER_TIMEOUT_MS, start: 5000 });
+  setFrameHostForTest(host);
+  return { host, frames, texts, maxRunning: () => maxRunning };
 }
+const never = () => new Promise<never>(() => {});
 
 describe("prepareSource", () => {
   it("removes %%{init}%% directives, closed or not, anywhere", () => {
@@ -97,6 +115,25 @@ describe("prepareSource", () => {
       text: 'pie\n  "a": 1',
     });
   });
+  // Review #189: mermaid takes any whitespace but a line break around the fences (NBSP, \v, \f, U+2003 …) and
+  // runs to the last closing fence.
+  it.each([
+    ["NBSP after the opening", "---\u00a0\nconfig:\n  fontSize: 777\n---\ngraph TD\nA-->B"],
+    ["\\v after the opening", "---\v\nconfig:\n  fontSize: 777\n---\ngraph TD\nA-->B"],
+    [
+      "NBSP and \\f before the opening",
+      "\u00a0\f---\nconfig:\n  fontSize: 777\n\u00a0\f---\ngraph TD\nA-->B",
+    ],
+    ["an em space after the closing", "---\nconfig:\n  fontSize: 777\n---\u2003\ngraph TD\nA-->B"],
+    ["indented fences", "  ---\n  config:\n    fontSize: 777\n  ---\ngraph TD\nA-->B"],
+  ])("front matter with odd whitespace (%s) is removed", (_n, src) => {
+    const r = prepareSource(src);
+    expect(r).toEqual({ ok: true, text: "graph TD\nA-->B" });
+  });
+  it("front matter runs to the last closing fence, as mermaid reads it: nothing of it is left", () => {
+    const r = prepareSource("---\ntitle: a\n---\nconfig:\n  fontSize: 777\n---\ngraph TD\nA-->B");
+    expect(r).toEqual({ ok: true, text: "graph TD\nA-->B" });
+  });
   it("keeps --- inside the diagram (not front matter)", () => {
     expect(prepareSource("graph TD\nA---B")).toEqual({ ok: true, text: "graph TD\nA---B" });
   });
@@ -110,18 +147,18 @@ describe("prepareSource", () => {
   });
 });
 
-describe("fenceClosed", () => {
+describe("fenceClosed (with the parser's code value)", () => {
   it.each([
-    ["```mermaid\ngraph TD\nA-->B\n```", true],
-    ["~~~mermaid\ngraph TD\n~~~", true],
-    ["````mermaid\ngraph TD\n```\n````", true],
-    ["```mermaid\ngraph TD\nA-->B", false],
-    ["```mermaid\ngraph TD\nA-->B\n``", false],
-    ["````mermaid\ngraph TD\n```", false],
-    ["```mermaid", false],
-    ["> ```mermaid\n> graph TD\n> ```", true],
-    ["", false],
-  ])("%j → %s", (md, closed) => expect(fenceClosed(md)).toBe(closed));
+    ["```mermaid\ngraph TD\nA-->B\n```", "graph TD\nA-->B", true],
+    ["~~~mermaid\ngraph TD\n~~~", "graph TD", true],
+    ["````mermaid\ngraph TD\n```\n````", "graph TD\n```", true],
+    ["```mermaid\n```", "", true],
+    ["```mermaid\ngraph TD\nA-->B", "graph TD\nA-->B", false],
+    ["```mermaid\ngraph TD\nA-->B\n``", "graph TD\nA-->B\n``", false],
+    ["````mermaid\ngraph TD\n```", "graph TD\n```", false],
+    ["```mermaid", "", false],
+    ["> ```mermaid\n> graph TD\n> ```", "graph TD", true],
+  ])("%j → %s", (md, value, closed) => expect(fenceClosed(md, value)).toBe(closed));
 });
 
 describe("svgForImage", () => {
@@ -184,67 +221,140 @@ describe("mermaidConfig", () => {
   });
 });
 
-describe("renderDiagram", () => {
-  it("draws with the app's config and gives an image-ready SVG; the offscreen element is removed", async () => {
-    const f = fake();
-    setMermaidLoaderForTest(async () => f.api);
+describe("FrameHost and the queue", () => {
+  it("starts the frame on the first drawing (boot → code → ready), then draws with the prepared text and theme", async () => {
+    const f = fakeFrames();
     const r = await renderDiagram("graph TD\nA-->B", true);
     expect(r).toMatchObject({ kind: "ok", width: 121, height: 80 });
-    expect(f.calls[0]!.config).toMatchObject({ securityLevel: "strict", theme: "dark", htmlLabels: false });
-    expect(hosts.length).toBe(1);
-    expect(hosts.every((h) => h.removed)).toBe(true);
+    expect(f.frames).toHaveLength(1);
+    expect(f.frames[0]!.posts[0]).toEqual({ type: FRAME_CODE, code: "/* bundle */" });
+    expect(f.texts).toEqual([{ text: "graph TD\nA-->B", dark: true }]);
+    await renderDiagram("graph TD\nC", false);
+    expect(f.frames).toHaveLength(1); // the same frame
   });
   it("one drawing at a time, in order; a finished one is not drawn again (cache)", async () => {
-    const f = fake({ delayMs: 5 });
-    setMermaidLoaderForTest(async () => f.api);
+    const f = fakeFrames(async () => (await new Promise((r) => setTimeout(r, 5)), { svg: SVG() }));
     const rs = await Promise.all(["a", "b", "c"].map((t) => renderDiagram(`graph TD\n${t}`, false)));
     expect(rs.every((r) => r.kind === "ok")).toBe(true);
-    expect(f.maxActive()).toBe(1);
-    expect(f.calls.map((c) => c.text)).toEqual(["graph TD\na", "graph TD\nb", "graph TD\nc"]);
+    expect(f.maxRunning()).toBe(1);
+    expect(f.texts.map((t) => t.text)).toEqual(["graph TD\na", "graph TD\nb", "graph TD\nc"]);
     await renderDiagram("graph TD\na", false);
-    expect(f.calls).toHaveLength(3);
+    expect(f.texts).toHaveLength(3);
     await renderDiagram("graph TD\na", true); // another theme: drawn again
-    expect(f.calls).toHaveLength(4);
+    expect(f.texts).toHaveLength(4);
   });
-  it("a syntax error is a result with mermaid's message, never a rejection", async () => {
-    setMermaidLoaderForTest(async () => fake({ fail: new Error("Parse error on line 1") }).api);
+  it("a syntax error is a result with the frame's message, never a rejection", async () => {
+    fakeFrames(async () => ({ error: "Parse error on line 1" }));
     expect(await renderDiagram("graph TD\nA-->", false)).toEqual({
       kind: "error",
       message: "Parse error on line 1",
     });
-    expect(hosts.every((h) => h.removed)).toBe(true);
   });
-  it("a too-large SVG is refused", async () => {
-    setMermaidLoaderForTest(async () => fake({ svg: SVG("x".repeat(MAX_SVG)) }).api);
+  it("the frame's refusal of a config it still found is an error the fix button can use", async () => {
+    fakeFrames(async () => ({ error: CONFIG_REFUSED }));
+    expect(await renderDiagram("graph TD\nA", false)).toEqual({ kind: "error", message: CONFIG_REFUSED });
+  });
+  it("a too-large SVG is refused; an answer that is not a sized SVG is an error", async () => {
+    fakeFrames(async () => ({ svg: SVG("x".repeat(MAX_SVG)) }));
     expect(await renderDiagram("graph TD\nA", false)).toMatchObject({ kind: "too-big" });
+    fakeFrames(async () => ({ svg: "<div>no</div>" }));
+    expect(await renderDiagram("graph TD\nB", false)).toMatchObject({ kind: "error" });
   });
-  it("a drawing that hangs times out, and the queue goes on", async () => {
+  it("a drawing that hangs times out: its frame is taken down (the work stops), the next drawing gets a new frame", async () => {
     vi.useFakeTimers();
     let n = 0;
-    const hang = fake({ hang: true });
-    const ok = fake();
-    setMermaidLoaderForTest(async () => ({
-      initialize: (c) => (n === 0 ? hang : ok).api.initialize(c),
-      render: (...a) => (n++ === 0 ? hang : ok).api.render(...a),
-    }));
+    const f = fakeFrames(() => (n++ === 0 ? never() : Promise.resolve({ svg: SVG() })));
     const first = renderDiagram("graph TD\nslow", false);
     const second = renderDiagram("graph TD\nnext", false);
     await vi.advanceTimersByTimeAsync(RENDER_TIMEOUT_MS + 1);
     expect(await first).toEqual({ kind: "timeout" });
+    expect(f.frames[0]!.removed).toBe(true);
     expect(await second).toMatchObject({ kind: "ok" });
+    expect(f.frames).toHaveLength(2);
+    expect(f.frames[1]!.removed).toBe(false);
+    expect(f.maxRunning()).toBe(1); // the hung one never ran alongside the next
   });
-  it("skips a drawing aborted before its turn; a failed load is a result and is tried again", async () => {
+  it("aborted while it draws (unmount, theme switch): the frame is taken down, the next drawing works", async () => {
+    let n = 0;
+    const f = fakeFrames(() => (n++ === 0 ? never() : Promise.resolve({ svg: SVG() })));
+    const ac = new AbortController();
+    const first = renderDiagram("graph TD\nA", false, ac.signal);
+    await vi.waitFor(() => expect(f.texts).toHaveLength(1));
+    ac.abort();
+    expect(await first).toEqual({ kind: "aborted" });
+    expect(f.frames[0]!.removed).toBe(true);
+    expect(f.host.alive).toBe(false);
+    expect(await renderDiagram("graph TD\nA", true)).toMatchObject({ kind: "ok" });
+    expect(f.frames).toHaveLength(2);
+  });
+  it("skips a drawing aborted before its turn — no frame is even made", async () => {
+    const f = fakeFrames();
     const ac = new AbortController();
     ac.abort();
-    const f = fake();
-    let loads = 0;
-    setMermaidLoaderForTest(async () => {
-      if (loads++ === 0) throw new Error("chunk gone");
-      return f.api;
-    });
     expect(await renderDiagram("graph TD\nA", false, ac.signal)).toEqual({ kind: "aborted" });
+    expect(f.frames).toHaveLength(0);
+  });
+  it("a bundle that cannot be fetched is a result; the next drawing tries again", async () => {
+    let loads = 0;
+    const f = fakeFrames(undefined, {
+      code: async () => {
+        if (loads++ === 0) throw new Error("offline");
+        return "/* bundle */";
+      },
+    });
     expect(await renderDiagram("graph TD\nA", false)).toEqual({ kind: "load-failed" });
+    expect(f.frames[0]!.removed).toBe(true);
     expect(await renderDiagram("graph TD\nA", false)).toMatchObject({ kind: "ok" });
+  });
+  it("a frame that never gets ready ends in load-failed after the start limit, and is taken down", async () => {
+    vi.useFakeTimers();
+    const frames: { removed: boolean }[] = [];
+    const host = new FrameHost(
+      {
+        loadCode: async () => "",
+        create: () => {
+          const f = { removed: false };
+          frames.push(f);
+          return { post: () => {}, remove: () => void (f.removed = true) };
+        },
+      },
+      { render: 1000, start: 2000 },
+    );
+    setFrameHostForTest(host);
+    const r = renderDiagram("graph TD\nA", false);
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(await r).toEqual({ kind: "load-failed" });
+    expect(frames[0]!.removed).toBe(true);
+  });
+  it("ignores answers for unknown ids and malformed messages", async () => {
+    let onMessage: (d: unknown) => void = () => {};
+    const host = new FrameHost(
+      {
+        loadCode: async () => "",
+        create: (m) => {
+          onMessage = m;
+          queueMicrotask(() => m({ type: FRAME_BOOT }));
+          return {
+            post: (msg) => {
+              const d = msg as { type: string; id: number };
+              if (d.type === FRAME_CODE) queueMicrotask(() => onMessage({ type: FRAME_READY }));
+              if (d.type === FRAME_RENDER)
+                queueMicrotask(() => {
+                  onMessage(null);
+                  onMessage("x");
+                  onMessage({ type: FRAME_RESULT, id: d.id + 99, svg: SVG() });
+                  onMessage({ type: FRAME_RESULT, id: String(d.id), svg: SVG() });
+                  onMessage({ type: FRAME_RESULT, id: d.id, svg: 42 });
+                  onMessage({ type: FRAME_RESULT, id: d.id, error: "real" });
+                });
+            },
+            remove: () => {},
+          };
+        },
+      },
+      { render: 1000, start: 1000 },
+    );
+    expect(await host.render("graph TD\nA", false)).toEqual({ kind: "error", message: "real" });
   });
 });
 
@@ -261,6 +371,24 @@ describe("Markdown mermaid blocks", () => {
     expect(html).toContain('data-state="source"');
     expect(html).not.toContain("<img");
     expect(html).toContain("graph TD");
+  });
+  // Review #189: lines that look like a closing fence but are code content to the parser.
+  it.each([
+    ["indented four spaces", "```mermaid\ngraph TD\n  A-->B\n    ```"],
+    ["in a block quote marker at top level", "```mermaid\ngraph TD\n  A-->B\n> ```"],
+    ["shorter than the opening", "````mermaid\ngraph TD\n  A-->B\n```"],
+    ["unfinished, blank lines after", "```mermaid\ngraph TD\n  A-->B\n\n"],
+  ])("a fence-looking last line that is code (%s) keeps it unfinished", (_n, md) => {
+    expect(render(md)).toContain('data-state="source"');
+  });
+  it.each([
+    ["at the top", "```mermaid\ngraph TD\n  A-->B\n```"],
+    ["indented up to three spaces", "```mermaid\ngraph TD\n  A-->B\n   ```"],
+    ["in a block quote", "> ```mermaid\n> graph TD\n> ```"],
+    ["in a list item", "- 목록\n\n  ```mermaid\n  graph TD\n  ```"],
+    ["with blank lines after", "```mermaid\ngraph TD\n```\n\n"],
+  ])("a real closing fence (%s) finishes the block", (_n, md) => {
+    expect(render(md)).toContain('data-state="pending"');
   });
   it("a finished block waits for its drawing with the code shown", () => {
     const html = render("```mermaid\ngraph TD\n  A-->B\n```");
@@ -281,7 +409,7 @@ describe("Markdown mermaid blocks", () => {
     const hostile = SVG(
       `<script>alert(1)</script><a href="javascript:alert(1)"><text>x</text></a><image href="x" onerror="alert(1)"/><foreignObject><img src=x onerror=alert(1)></foreignObject>`,
     );
-    setMermaidLoaderForTest(async () => fake({ svg: hostile }).api);
+    fakeFrames(async () => ({ svg: hostile }));
     const prepared = prepareSource(src);
     expect(prepared.ok).toBe(true);
     await renderDiagram(prepared.ok ? prepared.text : "", false);
@@ -294,7 +422,7 @@ describe("Markdown mermaid blocks", () => {
   });
 
   it("a syntax error: the code, the notice and 다이어그램 고치기 (only in a conversation, off while a run goes on)", async () => {
-    setMermaidLoaderForTest(async () => fake({ fail: new Error("Parse error on line 2") }).api);
+    fakeFrames(async () => ({ error: "Parse error on line 2" }));
     const src = "graph TD\n  A-->";
     await renderDiagram(src, false);
     const md = `\`\`\`mermaid\n${src}\n\`\`\``;

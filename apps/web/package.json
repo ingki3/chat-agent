@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "vite build -c vite.frame.config.ts && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:frame": "vite build -c vite.frame.config.ts"
   },
   "dependencies": {
     "@agentlee/shared": "workspace:*",

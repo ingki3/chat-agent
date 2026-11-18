@@ -34,6 +34,8 @@ self.addEventListener("fetch", (event) => {
   // Artifact originals and downloads (#27): always from the server, with their sandboxing headers — never the
   // cached app shell in their place.
   if (/^\/a\/[^/]+\/v\//.test(url.pathname)) return;
+  // The diagram frame (#182): always from the server, with its own sandboxing CSP.
+  if (url.pathname === "/mermaid-frame") return;
   // Pages: network first (always the latest app), the cached shell when offline.
   if (req.mode === "navigate") {
     event.respondWith(fetch(req).catch(() => caches.match("/")));

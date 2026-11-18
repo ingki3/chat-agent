@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-frame/
 data/
 # Data folder lock and restore journal (#37), next to DATA_DIR.
 .data.lock.db

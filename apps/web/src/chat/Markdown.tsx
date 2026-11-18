@@ -76,7 +76,7 @@ function CodeBlock({ children, node }: { children?: ReactNode; node: HastNode | 
       at?.start.offset !== undefined && at.end.offset !== undefined
         ? block.slice(at.start.offset, at.end.offset)
         : "";
-    return <MermaidBlock source={text} closed={fenceClosed(md)} code={children} />;
+    return <MermaidBlock source={text} closed={fenceClosed(md, text)} code={children} />;
   }
   return (
     <div className="codeblk">

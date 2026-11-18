@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 import { MOM, newConversation, sendMessage as send, useAccount } from "./helpers.js";
 
@@ -94,7 +95,9 @@ test("a diagram in an answer: drawn once finished (no flicker), one img, source 
   expect(await page.locator(".md svg").count()).toBe(0);
   await expect(block).toHaveAttribute("data-theme", "light");
   // The chunk came only now.
-  expect(requested.some((p) => /mermaid\.core/.test(p))).toBe(true);
+  // The frame page and its bundle came only now.
+  expect(requested).toContain("/mermaid-frame");
+  expect(requested.some((p) => /^\/assets\/mermaid-frame-.*\.js$/.test(p))).toBe(true);
 
   // Source and back.
   await block.getByTestId("mermaid-toggle").click();
@@ -111,10 +114,28 @@ test("a diagram in an answer: drawn once finished (no flicker), one img, source 
   await page.keyboard.press("Escape");
   await expect(zoom).toHaveCount(0);
 
-  // SVG download.
+  // SVG and PNG downloads: the files are what they say.
   const dl = page.waitForEvent("download");
   await block.getByTestId("mermaid-save-svg").click();
-  expect((await dl).suggestedFilename()).toBe("diagram.svg");
+  const svgFile = await dl;
+  expect(svgFile.suggestedFilename()).toBe("diagram.svg");
+  const svgText = fs.readFileSync((await svgFile.path())!, "utf8");
+  expect(svgText).toMatch(/^<svg width="\d+" height="\d+"/);
+  expect(svgText).toContain("질문");
+  const dlPng = page.waitForEvent("download");
+  await block.getByTestId("mermaid-save-png").click();
+  const pngFile = await dlPng;
+  expect(pngFile.suggestedFilename()).toBe("diagram.png");
+  const png = fs.readFileSync((await pngFile.path())!);
+  expect(png.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  expect(png.readUInt32BE(16)).toBeGreaterThan(100); // width (twice the diagram's)
+  await expect(block.getByTestId("mermaid-save-png")).toHaveText("PNG 저장");
+
+  // Copy: the source as written.
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await block.getByRole("button", { name: "코드 복사" }).click();
+  await expect(block.getByRole("button", { name: "코드 복사" })).toHaveText("✓ 복사됨");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(src);
 
   // Dark mode: drawn again with the dark theme (another picture).
   const lightSrc = await img.getAttribute("src");
@@ -278,4 +299,85 @@ test("every diagram type the instructions name draws (one image each)", async ({
     await expect(blocks.nth(i).locator("img")).toHaveCount(1);
   }
   expect(problems).toEqual([]);
+});
+
+test("mermaid never touches the app's document: drawing happens in the sandboxed frame, only one img comes back", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, MOM);
+  const problems = watchPage(page, { inertHandlers: true });
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `격리 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  // Every element added to the app's document while the diagram is drawn.
+  await page.evaluate(() => {
+    const w = window as unknown as { __added: string[] };
+    w.__added = [];
+    new MutationObserver((ms) => {
+      for (const m of ms)
+        for (const n of m.addedNodes) {
+          if (!(n instanceof Element)) continue;
+          for (const e of [n, ...n.querySelectorAll("*")]) {
+            const svgish = e.namespaceURI === "http://www.w3.org/2000/svg" || /^mmd-|^dmmd-/.test(e.id);
+            const handler = [...e.attributes].some((a) => /^on/i.test(a.name));
+            if (svgish || handler) w.__added.push(e.outerHTML.slice(0, 120));
+          }
+        }
+    }).observe(document, { subtree: true, childList: true });
+  });
+  const hostile = [
+    "flowchart TD",
+    '  A["<img src=x onerror=window.__pwned=1>"] --> B["<svg onload=window.__pwned=2><circle/></svg>"]',
+    '  B --> C["<b onmouseover=window.__pwned=3>굵게</b>"]',
+    "  click A call alert()",
+    '  click C "javascript:window.__pwned=4"',
+  ].join("\n");
+  await send(page, `/mdecho\n${fence(hostile)}`);
+  const block = lastAssistant(page).getByTestId("mermaid");
+  await expect(block).toHaveAttribute("data-state", "diagram", { timeout: 15_000 });
+  await expect(block.locator("img")).toHaveCount(1);
+  // The frame: sandboxed without same-origin (an opaque origin), its page under its own no-network CSP.
+  const frame = page.locator("iframe[data-mermaid-frame]");
+  await expect(frame).toHaveCount(1);
+  await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+  const res = await page.request.get("/mermaid-frame");
+  const csp = res.headers()["content-security-policy"]!;
+  expect(csp).toContain("sandbox allow-scripts");
+  expect(csp).toContain("connect-src 'none'");
+  expect(csp).toContain("default-src 'none'");
+  // The app's own CSP is unchanged.
+  const app = await page.request.get(`/c/${conv.id}`);
+  expect(app.headers()["content-security-policy"]).toContain("script-src 'self';");
+  expect(app.headers()["content-security-policy"]).not.toContain("sandbox");
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => (window as unknown as { __added: string[] }).__added)).toEqual([]);
+  expect(await page.evaluate(() => (window as { __pwned?: number }).__pwned)).toBeUndefined();
+  expect(problems).toEqual([]);
+});
+
+test("blob URLs are released when the diagram goes away", async ({ page, baseURL }) => {
+  await useAccount(page, MOM);
+  await page.addInitScript(() => {
+    const w = window as unknown as { __revoked: string[] };
+    w.__revoked = [];
+    const revoke = URL.revokeObjectURL.bind(URL);
+    URL.revokeObjectURL = (u: string) => (w.__revoked.push(u), revoke(u));
+  });
+  const tag = crypto.randomUUID().slice(0, 8);
+  const conv = await newConversation(page.request, baseURL!, `해제 ${tag}`);
+  await page.goto(`/c/${conv.id}`);
+  await send(page, `/mdecho\n${fence("flowchart LR\n  A --> B")}`);
+  const img = lastAssistant(page).getByTestId("mermaid-img");
+  await expect(img).toHaveAttribute("src", /^blob:/);
+  const src = (await img.getAttribute("src"))!;
+  // Another page of the app (no reload): the block unmounts, its URL is released.
+  await page.evaluate(() => {
+    history.pushState(null, "", "/settings");
+    dispatchEvent(new PopStateEvent("popstate"));
+  });
+  await expect(page).toHaveURL(/\/settings/);
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __revoked: string[] }).__revoked))
+    .toContain(src);
 });

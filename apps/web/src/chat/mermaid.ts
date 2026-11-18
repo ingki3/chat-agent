@@ -1,63 +1,58 @@
+import {
+  FRAME_BOOT,
+  FRAME_CODE,
+  FRAME_READY,
+  FRAME_RENDER,
+  FRAME_RESULT,
+  MAX_FIX_ERROR,
+  MAX_SOURCE,
+  MAX_SVG,
+  type FrameRender,
+} from "./mermaid-config.js";
+
+export {
+  CONFIG_REFUSED,
+  DIAGRAM_FONT,
+  errorText,
+  MAX_FIX_ERROR,
+  MAX_SOURCE,
+  MAX_SVG,
+  mermaidConfig,
+  prepareSource,
+  type Prepared,
+} from "./mermaid-config.js";
+
 /**
- * Mermaid diagrams in answers and artifact pages (#182). Model output is untrusted, so:
+ * Mermaid diagrams in answers and artifact pages (#182). Model output is untrusted, so mermaid never runs in the
+ * app's document:
  *
- * - the source is cleaned before drawing: `%%{init …}%%` directives and a leading `---` config front matter are
- *   removed — theme and security are the app's, never the diagram's;
- * - mermaid runs with `securityLevel: "strict"`, no HTML labels, no start on load, no error diagram in the page;
- * - the SVG it makes never enters the page DOM: it is shown as `<img src="blob:…">` (MermaidBlock), where scripts,
- *   links and event handlers inside it cannot run;
- * - limits: source length, SVG size, one drawing at a time (a queue) and a time limit per drawing.
- *
- * mermaid itself is loaded with `import()` the first time a diagram is drawn: a chunk of its own, never in the
- * app's first load.
+ * - it runs in a **diagram frame**: `<iframe sandbox="allow-scripts" src="/mermaid-frame">` — an opaque origin
+ *   (no cookies, storage or DOM of the app), served with its own CSP (no network at all: `connect-src`,
+ *   `img-src` data/blob only, `font-src 'none'`, no frames, no forms). The app fetches the frame bundle itself
+ *   (same origin, its cookies and service worker) and posts it in; the frame runs it as a blob script. Measuring
+ *   and drawing happen in the frame's DOM; only the SVG *text* comes back;
+ * - the app never puts that SVG into its DOM: it is shown as `<img src="blob:…">` (MermaidBlock);
+ * - the source is cleaned before drawing (front matter, `%%{init}%%` directives) and the frame refuses any config
+ *   mermaid's own parser still finds; mermaid runs with `securityLevel: "strict"`, no HTML labels;
+ * - one drawing at a time, each with a time limit; a drawing that times out or is aborted while it runs takes the
+ *   frame down with it (the work stops) and the next one starts a fresh frame.
  */
 
-/** Longest source drawn (characters); a longer one stays a code block with a notice. */
-export const MAX_SOURCE = 20_000;
-/** Largest SVG shown (characters); a larger one stays a code block with a notice. */
-export const MAX_SVG = 2_000_000;
 /** How long one drawing may take. */
 export const RENDER_TIMEOUT_MS = 10_000;
-/** Error text sent with "다이어그램 고치기" is cut to this. */
-export const MAX_FIX_ERROR = 500;
-
-/** Korean-friendly fonts (the system ones — an SVG shown as an image cannot use the page's web fonts). */
-export const DIAGRAM_FONT =
-  '-apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif';
-
-export type Prepared = { ok: true; text: string } | { ok: false; reason: "too-long"; length: number };
+/** How long starting the frame (fetching the bundle, running it) may take. */
+export const START_TIMEOUT_MS = 30_000;
 
 /**
- * The source as it is drawn: line endings normalised, every `%%{ … }%%` directive (closed or not — mermaid also
- * reads an unclosed one to the end) and any leading `---` front matter removed. Over the limit: not drawn.
+ * Whether a fenced code block is finished, judged with the markdown parser's own result: `markdown` is the code
+ * node's source span (fence lines and any container prefixes included), `value` the code it holds. Without a
+ * closing fence the span is the opening line plus the code's lines; with one, one line more. An indented
+ * "```" or a "> ```" outside a block quote stays code content, so it never counts as closing.
  */
-export function prepareSource(source: string): Prepared {
-  if (source.length > MAX_SOURCE) return { ok: false, reason: "too-long", length: source.length };
-  let t = source.replace(/\r\n?/g, "\n");
-  for (;;) {
-    const before = t;
-    // Front matter (config, theme, title …) at the start, after any blank lines.
-    t = t.replace(/^\s*---[ \t]*\n[\s\S]*?\n[ \t]*---[ \t]*(?:\n|$)/, "");
-    // Directives: closed ones whole, an unclosed one to the end of its line. Repeated until none is left, so a
-    // removal that joins `%%` and `{` into a new one is removed too.
-    t = t.replace(/%%\{[\s\S]*?\}%%/g, "").replace(/%%\{[^\n]*/g, "");
-    if (t === before) break;
-  }
-  return { ok: true, text: t.trim() };
-}
-
-/** Whether a fenced code block's source (its markdown, fence lines included) has its closing fence yet. */
-export function fenceClosed(markdown: string): boolean {
-  // Lines of a fence inside a block quote or list carry its markers: judge without them.
-  const lines = markdown
-    .replace(/\s+$/, "")
-    .split("\n")
-    .map((l) => l.replace(/^[\s>]*/, ""));
-  if (lines.length < 2) return false;
-  const open = /^(`{3,}|~{3,})/.exec(lines[0]!)?.[1];
-  if (!open) return false;
-  const last = lines[lines.length - 1]!.trimEnd();
-  return last.length >= open.length && [...last].every((c) => c === open[0]);
+export function fenceClosed(markdown: string, value: string): boolean {
+  const span = markdown.replace(/\n$/, "").split("\n").length;
+  const code = value === "" ? 0 : value.split("\n").length;
+  return span === code + 2;
 }
 
 export type SvgImage = { svg: string; width: number; height: number };
@@ -87,20 +82,10 @@ export function svgForImage(svg: string): SvgImage | null {
 }
 
 /** The longest run of backticks in `s` (a fence around it must be longer). */
-const longestTicks = (s: string) => Math.max(0, ...(s.match(/`+/g) ?? []).map((m) => m.length));
-
-/** mermaid's error as one short text. */
-export function errorText(e: unknown): string {
-  const raw =
-    e instanceof Error
-      ? e.message
-      : typeof e === "object" && e && "message" in e
-        ? String((e as { message: unknown }).message)
-        : typeof e === "object" && e && "str" in e
-          ? String((e as { str: unknown }).str)
-          : String(e);
-  const t = raw.replace(/\r\n?/g, "\n").trim() || "알 수 없는 오류";
-  return t.length > MAX_FIX_ERROR ? `${t.slice(0, MAX_FIX_ERROR)}…` : t;
+function longestTicks(s: string): number {
+  let best = 0;
+  for (const m of s.matchAll(/`+/g)) best = Math.max(best, m[0].length);
+  return best;
 }
 
 /** The follow-up message of "다이어그램 고치기": the real error (cut) and the source, asking for a fixed diagram. */
@@ -131,61 +116,198 @@ export type RenderResult =
   | { kind: "load-failed" }
   | { kind: "aborted" };
 
-/** The part of mermaid this module uses (a fake in unit tests). */
-export type MermaidApi = {
-  initialize: (config: Record<string, unknown>) => void;
-  render: (id: string, text: string, container?: Element) => Promise<{ svg: string }>;
+// ---- the diagram frame ----
+
+/** One frame as the host sees it (a real iframe in the app, a fake in unit tests). */
+export type FrameHandle = {
+  /** Sends a message into the frame. */
+  post: (message: unknown) => void;
+  /** Takes the frame out of the page: whatever runs in it stops. */
+  remove: () => void;
+};
+export type FrameEnv = {
+  /** Makes a frame; `onMessage` gets the data of messages that really come from it. */
+  create: (onMessage: (data: unknown) => void) => FrameHandle;
+  /** The frame bundle's code (fetched by the app). */
+  loadCode: () => Promise<string>;
 };
 
-/** The config every drawing uses: the app decides theme and security, never the diagram. */
-export function mermaidConfig(dark: boolean): Record<string, unknown> {
+type Pending = (r: RenderResult) => void;
+
+/** Draws in the diagram frame: starts it when needed, one drawing at a time, takes it down on a timeout or abort. */
+export class FrameHost {
+  private frame: FrameHandle | null = null;
+  private started: Promise<void> | null = null;
+  private pending = new Map<number, Pending>();
+  private seq = 0;
+  private code: Promise<string> | null = null;
+  /** Ends a start still in progress (the frame was taken down meanwhile). */
+  private abortStart: ((e: unknown) => void) | null = null;
+  /** Frames made so far (tests). */
+  created = 0;
+
+  constructor(
+    private readonly env: FrameEnv,
+    private readonly timeouts = { render: RENDER_TIMEOUT_MS, start: START_TIMEOUT_MS },
+  ) {}
+
+  private loadCode(): Promise<string> {
+    if (!this.code)
+      this.code = this.env.loadCode().catch((e: unknown) => ((this.code = null), Promise.reject(e)));
+    return this.code;
+  }
+
+  private start(): Promise<void> {
+    if (this.started) return this.started;
+    const started = new Promise<void>((resolve, reject) => {
+      const fail = (e: unknown) => {
+        clearTimeout(timer);
+        if (this.started === started) this.destroy();
+        reject(e);
+      };
+      this.abortStart = (e) => {
+        clearTimeout(timer);
+        reject(e);
+      };
+      const timer = setTimeout(() => fail(new Error("frame_start_timeout")), this.timeouts.start);
+      let booted = false;
+      this.created++;
+      const frame = this.env.create((data) => {
+        if (this.frame !== frame || typeof data !== "object" || data === null) return;
+        const d = data as { type?: unknown; id?: unknown; svg?: unknown; error?: unknown };
+        if (d.type === FRAME_BOOT && !booted) {
+          booted = true;
+          this.loadCode().then((code) => {
+            if (this.frame === frame) frame.post({ type: FRAME_CODE, code });
+          }, fail);
+        } else if (d.type === FRAME_READY) {
+          clearTimeout(timer);
+          this.abortStart = null;
+          resolve();
+        } else if (d.type === FRAME_RESULT && typeof d.id === "number") {
+          const done = this.pending.get(d.id);
+          if (!done) return;
+          if (typeof d.svg === "string") {
+            if (d.svg.length > MAX_SVG) return done({ kind: "too-big", size: d.svg.length });
+            const img = svgForImage(d.svg);
+            done(img ? { kind: "ok", ...img } : { kind: "error", message: "그림을 만들지 못했어요." });
+          } else if (typeof d.error === "string") {
+            done({ kind: "error", message: d.error.slice(0, MAX_FIX_ERROR + 1) });
+          }
+        }
+      });
+      this.frame = frame;
+    });
+    this.started = started;
+    return started;
+  }
+
+  /** Takes the frame down; a drawing still waiting on it ends as aborted. */
+  destroy() {
+    const frame = this.frame;
+    this.frame = null;
+    this.started = null;
+    frame?.remove();
+    const abortStart = this.abortStart;
+    this.abortStart = null;
+    abortStart?.(new Error("frame_gone"));
+    const waiting = [...this.pending.values()];
+    this.pending.clear();
+    for (const done of waiting) done({ kind: "aborted" });
+  }
+
+  /** Whether a frame is up (tests). */
+  get alive() {
+    return this.frame !== null;
+  }
+
+  async render(text: string, dark: boolean, signal?: AbortSignal): Promise<RenderResult> {
+    if (signal?.aborted) return { kind: "aborted" };
+    if (text.length > MAX_SOURCE) return { kind: "error", message: "too long" };
+    // An abort while the frame starts ends this drawing; the frame goes on starting for the next one.
+    const aborted = new Promise<"aborted">((resolve) =>
+      signal?.addEventListener("abort", () => resolve("aborted"), { once: true }),
+    );
+    const started = await Promise.race([
+      this.start().then(
+        () => "ok" as const,
+        () => "failed" as const,
+      ),
+      aborted,
+    ]);
+    if (started === "failed") return { kind: "load-failed" };
+    if (started === "aborted" || signal?.aborted || !this.frame) return { kind: "aborted" };
+    const frame = this.frame!;
+    const id = ++this.seq;
+    return new Promise<RenderResult>((resolve) => {
+      const done = (r: RenderResult) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        this.pending.delete(id);
+        resolve(r);
+      };
+      // Stopping a drawing means stopping the frame: mermaid's work cannot be cancelled otherwise.
+      const timer = setTimeout(() => {
+        done({ kind: "timeout" });
+        this.destroy();
+      }, this.timeouts.render);
+      const onAbort = () => {
+        done({ kind: "aborted" });
+        this.destroy();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.pending.set(id, done);
+      const msg: FrameRender = { type: FRAME_RENDER, id, text, dark };
+      frame.post(msg);
+    });
+  }
+}
+
+/** The real frame: a sandboxed iframe off screen (it lays out — mermaid measures text — but is never seen). */
+export function iframeEnv(src = "/mermaid-frame"): FrameEnv {
   return {
-    startOnLoad: false,
-    securityLevel: "strict",
-    htmlLabels: false,
-    flowchart: { htmlLabels: false },
-    suppressErrorRendering: true,
-    maxTextSize: MAX_SOURCE,
-    maxEdges: 500,
-    logLevel: "fatal",
-    theme: dark ? "dark" : "default",
-    darkMode: dark,
-    fontFamily: DIAGRAM_FONT,
-    themeVariables: { fontFamily: DIAGRAM_FONT, darkMode: dark },
-    // Keys a directive could never change, even if one slipped past prepareSource.
-    secure: [
-      "secure",
-      "securityLevel",
-      "startOnLoad",
-      "maxTextSize",
-      "maxEdges",
-      "suppressErrorRendering",
-      "htmlLabels",
-      "flowchart",
-      "theme",
-      "themeVariables",
-      "themeCSS",
-      "darkMode",
-      "fontFamily",
-      "dompurifyConfig",
-    ],
+    create(onMessage) {
+      const iframe = document.createElement("iframe");
+      iframe.setAttribute("sandbox", "allow-scripts");
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.setAttribute("tabindex", "-1");
+      iframe.setAttribute("title", "다이어그램 그리기");
+      iframe.dataset.mermaidFrame = "";
+      iframe.style.cssText =
+        "position:fixed;left:-10000px;top:0;width:1200px;height:800px;border:0;visibility:hidden;pointer-events:none";
+      const listen = (e: MessageEvent) => {
+        // Only the frame itself (an opaque origin, "null"), never another window or frame of the page.
+        if (e.source !== iframe.contentWindow || e.origin !== "null") return;
+        onMessage(e.data);
+      };
+      window.addEventListener("message", listen);
+      iframe.src = src;
+      document.body.append(iframe);
+      return {
+        // The frame's origin is opaque, so it cannot be named: "*" (the message holds only the diagram and code).
+        post: (m) => iframe.contentWindow?.postMessage(m, "*"),
+        remove: () => {
+          window.removeEventListener("message", listen);
+          iframe.remove();
+        },
+      };
+    },
+    loadCode: async () => {
+      const { default: url } = await import("./mermaid-frame-url.js");
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) throw new Error(`frame bundle ${res.status}`);
+      return res.text();
+    },
   };
 }
 
-const loadMermaid = (): Promise<MermaidApi> =>
-  import("mermaid").then((m) => m.default as unknown as MermaidApi);
-let loader: () => Promise<MermaidApi> = loadMermaid;
-let loaded: Promise<MermaidApi> | null = null;
-/** mermaid, loaded once; a failed load is tried again next time. */
-function getMermaid(): Promise<MermaidApi> {
-  if (!loaded) loaded = loader().catch((e: unknown) => ((loaded = null), Promise.reject(e)));
-  return loaded;
-}
+let host: FrameHost | null = null;
+const getHost = () => (host ??= new FrameHost(iframeEnv()));
 
-/** Tests: draw with a fake mermaid, and start with an empty queue and cache. */
-export function setMermaidLoaderForTest(l: (() => Promise<MermaidApi>) | null) {
-  loader = l ?? loadMermaid;
-  loaded = null;
+/** Tests: draw with another host (a fake frame), and start with an empty queue and cache. */
+export function setFrameHostForTest(h: FrameHost | null) {
+  host?.destroy();
+  host = h;
   tail = Promise.resolve();
   cache.clear();
 }
@@ -205,11 +327,10 @@ function remember(key: string, r: RenderResult) {
 }
 
 let tail: Promise<unknown> = Promise.resolve();
-let seq = 0;
 
 /**
- * Draws one diagram (the prepared text) — queued: one drawing at a time, each with a time limit. A drawing whose
- * `signal` is aborted before its turn is skipped. Errors are results, never rejections.
+ * Draws one diagram (the prepared text) — queued: one drawing at a time. A drawing whose `signal` is aborted
+ * before its turn is skipped; aborted while it runs, the frame is taken down. Errors are results, never rejections.
  */
 export function renderDiagram(text: string, dark: boolean, signal?: AbortSignal): Promise<RenderResult> {
   const key = cacheKey(text, dark);
@@ -217,48 +338,10 @@ export function renderDiagram(text: string, dark: boolean, signal?: AbortSignal)
     if (signal?.aborted) return { kind: "aborted" };
     const hit = cache.get(key);
     if (hit) return hit;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<RenderResult>((resolve) => {
-      timer = setTimeout(() => resolve({ kind: "timeout" }), RENDER_TIMEOUT_MS);
-    });
-    try {
-      const r = await Promise.race([draw(text, dark), timeout]);
-      if (r.kind === "ok" || r.kind === "error" || r.kind === "too-big") remember(key, r);
-      return r;
-    } finally {
-      clearTimeout(timer);
-    }
+    const r = await getHost().render(text, dark, signal);
+    if (r.kind === "ok" || r.kind === "error" || r.kind === "too-big") remember(key, r);
+    return r;
   });
   tail = run.catch(() => undefined);
   return run;
-}
-
-async function draw(text: string, dark: boolean): Promise<RenderResult> {
-  let m: MermaidApi;
-  try {
-    m = await getMermaid();
-  } catch {
-    return { kind: "load-failed" };
-  }
-  const id = `mmd-${++seq}`;
-  // mermaid measures text in a real element: an offscreen one of ours, removed right after (the result is only
-  // ever shown as an image).
-  const host = document.createElement("div");
-  host.setAttribute("aria-hidden", "true");
-  host.style.cssText =
-    "position:fixed;left:-10000px;top:0;width:1200px;visibility:hidden;pointer-events:none;contain:layout";
-  document.body.append(host);
-  try {
-    m.initialize(mermaidConfig(dark));
-    const { svg } = await m.render(id, text, host);
-    if (svg.length > MAX_SVG) return { kind: "too-big", size: svg.length };
-    const img = svgForImage(svg);
-    return img ? { kind: "ok", ...img } : { kind: "error", message: "그림을 만들지 못했어요." };
-  } catch (e) {
-    return { kind: "error", message: errorText(e) };
-  } finally {
-    host.remove();
-    // Without a container mermaid would have used one of its own on <body>: never left behind.
-    document.getElementById(`d${id}`)?.remove();
-  }
 }

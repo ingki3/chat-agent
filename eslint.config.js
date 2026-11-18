@@ -7,6 +7,7 @@ export default tseslint.config(
   {
     ignores: [
       "**/dist/**",
+      "**/dist-frame/**",
       "**/node_modules/**",
       "mockup/**",
       "spike/**",
