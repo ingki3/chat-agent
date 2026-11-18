@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CitationNotePart,
   CreateConversationShareRequest,
   CSRF_HEADER,
   SharedView,
@@ -1387,5 +1388,52 @@ describe("fork — remapParts (#52)", () => {
     expect(out).toContainEqual({ type: "table", columns: [], rows: [] });
     const note = out.find((p) => p.type === "citation_note")!;
     expect(note.type === "citation_note" && note.citations.map((c) => c.sourceId)).toEqual(["S1", null]);
+  });
+
+  it("#186: a file citation's fileId moves to the copy's file (also inside the locator); a file not copied is cut", () => {
+    const ids = {
+      message: new Map<string, string>(),
+      file: new Map([["f1", "F1"]]),
+      artifact: new Map<string, { id: string; versions: Map<number, number> }>(),
+      source: new Map<string, string>(),
+    };
+    const rev = "a".repeat(64);
+    const entry = (n: number, fileId: string | undefined, locator?: boolean) => ({
+      n,
+      status: (locator ? "verified" : "snippet_not_found") as "verified" | "snippet_not_found",
+      sourceId: null,
+      title: "보고서.pdf",
+      site: locator ? "12쪽" : null,
+      url: null,
+      publishedAt: null,
+      quote: "파일의 구절이에요 열두 쪽",
+      ...(locator && fileId
+        ? { locator: { fileId, fileRevision: rev, kind: "page" as const, page: 12 } }
+        : {}),
+      ...(fileId ? { fileId } : {}),
+    });
+    const out = remapParts(
+      [
+        {
+          type: "citation_note",
+          missing: [],
+          markers: [],
+          // Verified (id in the locator too), not verified (id only), a file the copy lacks, an entry from before #186.
+          citations: [entry(1, "f1", true), entry(2, "f1"), entry(3, "f2", true), entry(4, undefined)],
+        },
+      ],
+      ids,
+    );
+    const note = out[0]!;
+    expect(note.type).toBe("citation_note");
+    const cites = note.type === "citation_note" ? note.citations : [];
+    expect(cites.map((c) => [c.n, c.fileId, c.locator?.fileId])).toEqual([
+      [1, "F1", "F1"],
+      [2, "F1", undefined],
+      [3, undefined, undefined],
+      [4, undefined, undefined],
+    ]);
+    expect(JSON.stringify(out)).not.toMatch(/"f[12]"/);
+    expect(CitationNotePart.parse(note)).toEqual(note);
   });
 });

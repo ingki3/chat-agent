@@ -43,7 +43,7 @@ export const FILE_READ_TOOL: ServerToolInfo = {
 export const FILE_SEARCH_TOOL: ServerToolInfo = {
   name: "file_search",
   description:
-    "Searches the text of this conversation's uploaded files (or one file) for words. Every word must appear in a part; returns the matching sentences with their locator (page, line, cell, slide …) and label, best first. Use the locator to read around it with file_read, and file_cite to cite a passage.",
+    'Searches the text of this conversation\'s uploaded files (or one file) for words. Every word must appear in a part; returns the matching sentences with their locator (page, line, cell, slide …) and label, best first. Use the locator to read around it with file_read, and file_cite to cite a passage. The result numbers ("(결과 1)") only order the hits: they are not citation markers — write only the marker file_cite returns.',
   input: {
     query: z.string().min(1).max(200).describe("Words to look for (all must appear)."),
     fileId: fileId.optional(),

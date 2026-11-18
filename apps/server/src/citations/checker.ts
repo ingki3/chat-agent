@@ -1,7 +1,7 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
 import { CITE_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
-import { FILE_CITE_TOOL } from "@agentlee/mcp-tools/files";
+import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import {
   boundText,
   CITATION_LIMITS,
@@ -12,6 +12,7 @@ import {
   uncitedUnits,
   type TextRange,
   type CitationEntry,
+  type CitationStatus,
   type CitationNotePart,
   type MessagePart,
 } from "@agentlee/shared";
@@ -85,9 +86,39 @@ export function isProgressNote(text: string, u: TextRange, toolAt: number): bool
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);
 
 /**
+ * A file citation's entry (#48): the file's name and the place — the locator only for a verified passage — and the
+ * file's id (#186: what a later answer carries over).
+ */
+function fileEntry(
+  n: number,
+  c: {
+    status: CitationStatus;
+    fileId: string;
+    name: string;
+    quote: string | null;
+    locator: FileLocator | null;
+  },
+): CitationEntry {
+  const locator = c.status === "verified" ? c.locator : null;
+  return {
+    n,
+    status: c.status,
+    sourceId: null,
+    title: bound(c.name, CITATION_LIMITS.title),
+    site: locator ? bound(locatorLabel(locator), CITATION_LIMITS.site) : null,
+    url: null,
+    publishedAt: null,
+    quote: bound(c.quote, CITATION_LIMITS.snippet),
+    ...(locator ? { locator } : {}),
+    fileId: c.fileId,
+  };
+}
+
+/**
  * Tools whose call makes this run's numbers its own (#150): a search, a fetch or a search skill (new material for
- * new numbers), and any `cite` or `file_cite` call — refused ones too (review #153: a refused call registers no row,
- * yet the model may still write the number it meant).
+ * new numbers), reading or searching an uploaded file (#186 — `file_search` numbers its hits too: a number written
+ * after one is never an earlier answer's), and any `cite` or `file_cite` call — refused ones too (review #153: a
+ * refused call registers no row, yet the model may still write the number it meant).
  */
 const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   WEB_SEARCH_TOOL.name,
@@ -95,6 +126,8 @@ const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   skillToolName(GOOGLE_NEWS_SKILL.name),
   skillToolName(SEARCH_GOOGLE_SKILL.name),
   CITE_TOOL.name,
+  FILE_READ_TOOL.name,
+  FILE_SEARCH_TOOL.name,
   FILE_CITE_TOOL.name,
 ]);
 const ownsNumbers = (name: string) =>
@@ -109,10 +142,14 @@ const ownsNumbers = (name: string) =>
  *
  * The rule, and its precedence: numbers are per run, so a carry-over happens only when this run registered **no**
  * citation, **called** no `cite`/`file_cite` (a refused call counts — review #153) and brought in no source of its
- * own (no search, fetch or news skill) — then its numbers can only be the earlier ones. As soon as it cites or tries
- * to (or fetches something new), every number is this run's: a marker without a citation of this run stays
- * `unknown_source`, whatever an earlier answer had under that number. File citations are not carried (their check
- * waits for the extraction); they stay `unknown_source`. An answer that carries a number is an answer using
+ * own (no search, fetch, news skill, `file_read` or `file_search`) — then its numbers can only be the earlier ones.
+ * As soon as it cites or tries to (or fetches or reads something new), every number is this run's: a marker without
+ * a citation of this run stays `unknown_source`, whatever an earlier answer had under that number.
+ * A file citation (#186) carries over by the file id its entry keeps (`fileId`), checked again by `recheckFile`: the
+ * file must still be one this conversation's runs may read, and the passage is looked for in its extracted text as
+ * it is now (being extracted again → `fetch_failed`, no longer there → `snippet_not_found`, a deleted file → not
+ * carried, `unknown_source`). An entry stored before #186 has no `fileId`: not carried. Never matched by the
+ * sentence's text — only the number the earlier answer gave. An answer that carries a number is an answer using
  * sources: its paragraphs without a marker are flagged as missing (review #153). An answer that used no source tool
  * and carries no number (nothing earlier under it, or the recheck failed) has no sources: its markers get an
  * `unbacked` note only (#185, review #190 1차).
@@ -121,6 +158,13 @@ export type CitationCarry = {
   conversationId: string;
   userId: string;
   previous: () => readonly CitationEntry[];
+  /** An earlier file citation checked again now (#186, `FileTools.recheck`); without it no file citation carries. */
+  recheckFile?: (
+    scope: { conversationId: string; userId: string },
+    input: { fileId: string; snippet: string },
+  ) =>
+    | { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: { name: string } }
+    | undefined;
 };
 
 /** The note for one run's answer, or undefined when the check does not apply (or there is nothing to say). */
@@ -144,11 +188,13 @@ export function citationNote(
   let earlier: Map<number, CitationEntry> | undefined;
   let carriedAny = false;
   const carriedFrom = (n: number): CitationEntry | undefined => {
-    if (!carry || !store.recheck || rows.length) return undefined;
+    if (!carry || rows.length) return undefined;
     if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return undefined;
     earlier ??= new Map(carry.previous().map((e) => [e.n, e]));
     const e = earlier.get(n);
-    if (!e?.sourceId || e.status === "unknown_source") return undefined;
+    if (!e || e.status === "unknown_source") return undefined;
+    if (e.fileId && !e.sourceId) return carriedFile(n, e, e.fileId);
+    if (!e.sourceId || !store.recheck) return undefined;
     // What the earlier answer quoted (verified: the passage itself; otherwise the snippet it sent).
     const c = e.quote ? store.recheck(carry, { sourceId: e.sourceId, snippet: e.quote }) : undefined;
     if (!c) return undefined;
@@ -165,6 +211,21 @@ export function citationNote(
       quote: bound(c.status === "verified" ? c.quote : e.quote, CITATION_LIMITS.snippet),
     };
   };
+  // A file citation of the earlier answer, its passage (verified: as the file had it; otherwise the snippet sent)
+  // looked for again in the file's text now (#186).
+  const carriedFile = (n: number, e: CitationEntry, fileId: string): CitationEntry | undefined => {
+    if (!carry?.recheckFile || !e.quote) return undefined;
+    const c = carry.recheckFile(carry, { fileId, snippet: e.quote });
+    if (!c) return undefined;
+    carriedAny = true;
+    return fileEntry(n, {
+      status: c.status,
+      fileId,
+      name: c.file.name,
+      quote: c.status === "verified" ? c.quote : e.quote,
+      locator: c.status === "verified" ? c.locator : null,
+    });
+  };
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
     const r = byN.get(n);
     if (!r) {
@@ -175,18 +236,13 @@ export function citationNote(
     if (r?.fileId && r.file && r.status !== "unknown_source") {
       const parsed =
         r.status === "verified" && r.locator ? FileLocator.safeParse(JSON.parse(r.locator)) : undefined;
-      const locator = parsed?.success ? parsed.data : undefined;
-      return {
-        n,
+      return fileEntry(n, {
         status: r.status,
-        sourceId: null,
-        title: bound(r.file.name, CITATION_LIMITS.title),
-        site: locator ? bound(locatorLabel(locator), CITATION_LIMITS.site) : null,
-        url: null,
-        publishedAt: null,
-        quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
-        ...(locator ? { locator } : {}),
-      };
+        fileId: r.fileId,
+        name: r.file.name,
+        quote: r.status === "verified" ? r.quote : r.snippet,
+        locator: parsed?.success ? parsed.data : null,
+      });
     }
     // A marker without a citation of this run (made up, or a number of another answer): never shown as normal.
     if (!r || r.status === "unknown_source" || !r.source)

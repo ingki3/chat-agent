@@ -2,7 +2,7 @@
 
 - 날짜: 2026-11-18
 - 작성: Dev agent (Claude Opus 5.5)
-- 관련 이슈: #185 (이 기록), #30 (금융 주석), #25·#150 (인용 주석·번호 이어받기), #48 (파일 인용), #186 (첨부 파일 근거 — 후속)
+- 관련 이슈: #185 (이 기록), #30 (금융 주석), #25·#150 (인용 주석·번호 이어받기), #48 (파일 인용), #186 (첨부 파일 근거 — 6절)
 - 관련 문서: PRD FR-5(출처 제공 원칙)·5.1·7.6·7.8, `docs/ops.md` 19.3·22.1·22.2, `docs/traceability.md`
 
 ## 1. 문제
@@ -93,3 +93,23 @@
 - 다시 조회한 답 → 출처·기준 시각·면책 — `finance-runs.test.ts`, `e2e/finance.spec.ts`.
 - 도구 없는 답의 지어낸 문장 끝 `[n]` → 출처 상자 없음, `unbacked` 주석으로 표시 ⚠️·안내; 정상 이어받기 → 출처 있는 주석; 실패한 이어받기 → `unbacked`; `unbacked` 주석 너머의 이어받기 — `citations.test.ts`, `citation-runs.test.ts`, `apps/web/test/source-note.test.ts`, `e2e/citations.spec.ts`. 이어받기·우선순위·문단 검사, 웹 인용 e2e는 그대로.
 - 판정 한 곳 — `sources.test.ts`. 예전 파트 렌더·한 상자 — `apps/web/test/source-note.test.ts`.
+
+## 6. 첨부 파일 근거 (#186, 2026-11-18)
+
+### 6.1 원인
+
+운영의 첨부 파일 답 `[1][3][7]…`이 모두 "출처 확인 안 됨"이었던 이유: 첨부 내용은 프롬프트에 들어가지 않고(사용자 메시지 끝의 `[첨부 파일: 이름 (file:…)]` 표시와 새 세션의 파일 목록뿐) `file_read`·`file_search`로만 읽히며, 파일 인용은 `file_cite`로 등록한 것만 확인된다. 그런데 공통 지침(`common@9`)은 웹 `cite`만 설명했다 — 모델은 등록 없이 `[n]`을 썼다(앞 턴 `file_search` 결과의 `[1]`… 번호, 또는 문서 자체의 참고 번호를 옮긴 것으로 추정). 또 파일 인용 항목은 `sourceId`가 없어 후속 답이 번호를 이어받지 못했다.
+
+### 6.2 결정
+
+1. **지침 `common@10`**(`research@4`): 첨부 근거는 `file_cite`로 파일 본문에서 그대로 복사한 구절을 등록하고 받은 표시만 문장 끝에 붙인다. `file_search` 결과 번호, 파일 목록 번호, 문서 안의 `[n]`은 인용 표시가 아니다. 이어받기 규칙에 `file_cite`·파일 읽기를 넣었다(아래 3).
+2. **`file_search` 결과 번호는 `(결과 1)`**: 인용 표시(`[n]`)와 같은 모양이 아니다. 도구 설명에도 "결과 번호는 인용 표시가 아님"을 적었다. JSON의 `hits[].n`은 그대로.
+3. **파일 인용 이어받기(#150 확장)**: `citation_note`의 파일 항목은 `fileId`(새 선택 필드)를 가진다 — 상태가 `unknown_source`가 아니면 확인됨이 아니어도(위치 `locator`는 확인된 구절에만 있어서 따로 둔다). 후속 답이 같은 번호를 다시 쓰고, 그 답이 인용·인용 시도·검색·가져오기·**파일 읽기·파일 검색**을 하지 않았으면(`file_search`도 번호를 매긴다 — 그 뒤의 번호는 앞 답의 것이 아니다) 그 번호의 파일 인용을 이어받되 **지금 다시 확인한다**(`FileTools.recheck`, RunManager `fileRecheck`): 파일이 여전히 이 대화·이 사용자의 것이고 활성 메시지와 함께 보낸 것이어야 하며(`fileFor` — 지워졌거나 편집으로 잘린 파일이면 이어받지 않음 → `unknown_source`, 이어받은 것이 없으면 `unbacked`), 앞 답이 인용한 구절(확인됨: 파일 원문 구절, 그 밖: 모델이 보냈던 구절)을 **지금의 추출 본문**에서 찾는다 — 기다리지 않는다: 다시 추출 중·실패면 `fetch_failed`, 본문에 없으면 `snippet_not_found`(위치 없음, ⚠️). 확인되면 지금 찾은 위치로 다시 적는다. 아무것도 등록하지 않는다.
+4. **서버는 문장 글자로 구절을 추측하지 않는다**(#185 원칙 그대로): 이어받기는 번호와 앞 답이 등록한 구절로만 한다. `file_cite`가 없는 답의 `[n]`은 전처럼 `unknown_source`(⚠️)다.
+5. **예전 항목**: `fileId`가 없는 파일 항목(#186 전 저장)은 그대로 그려지고(선택 필드), 이어받지 않는다(`locator.fileId`로 추측하지 않는다). 참고문헌 내보내기는 `fileId`를 먼저, 없으면 `locator.fileId`를 쓴다.
+6. **공유 사본(포크)**: `fileId`도 사본의 파일 id로 바꾼다(`shares/fork.ts` `remapParts`). 사본에 없는 파일이면 뺀다 — 사본의 후속 답은 사본 파일의 추출 본문으로 다시 확인한다.
+
+### 6.3 시험
+
+- 운영 사례(파일을 읽고 `file_cite` 없이 `[n]` → `unknown_source` ⚠️, 그 뒤 도구 없는 답의 같은 번호 → `unbacked`), `file_cite` → 확인됨 + `fileId`, 후속 답의 같은 번호 → 다시 확인해 확인됨(위치·구절 포함, 등록 행 없음), `file_search` 결과 번호 재사용 → ⚠️, 본문이 바뀜 → `snippet_not_found`, 다시 추출 중 → `fetch_failed`, 파일 삭제 → 이어받지 않음 — `apps/server/test/file-tools.test.ts`("#186").
+- 이어받기 규칙(앞 답이 등록한 구절만 다시 확인, 예전 항목·`fileRecheck` 없음 → 이어받지 않음, `file_read`·`file_search`·`file_cite` 호출 → 이어받지 않음) — `apps/server/test/citations.test.ts`. 포크 id 바꾸기 — `apps/server/test/shares.test.ts`. 지침 — `instructions.test.ts`.

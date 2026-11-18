@@ -90,6 +90,12 @@ export const CitationEntry = z.object({
    * the place ("12쪽", `locatorLabel`), `url` null and `sourceId` null. Absent for web citations.
    */
   locator: FileLocator.optional(),
+  /**
+   * A citation of an uploaded file (#186): the file's id, whatever the status but `unknown_source` — what a later
+   * answer that writes this number again carries over, checked again against the file's current text (the locator
+   * has the id for verified passages only). Absent for web citations and on entries stored before #186.
+   */
+  fileId: z.string().min(1).max(64).optional(),
 });
 export type CitationEntry = z.infer<typeof CitationEntry>;
 

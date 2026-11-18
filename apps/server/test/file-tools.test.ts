@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
+  CITATION_STATUS_TEXT,
   CSRF_HEADER,
   CitationNotePart,
   FileLocator,
@@ -3675,4 +3676,126 @@ describe("HWPX switch/default around a subList (review #120 5차): in its real p
     ]);
     expect(JSON.stringify(Object.values(reads))).not.toContain("UNREAD");
   }, 60_000); // several HWPX extractions and a re-extraction: slower than 5 s on CI runners
+});
+
+describe("#186: an attachment is cited with file_cite only; a follow-up's numbers are carried over and checked again", () => {
+  /** The follow-up "요약해줘" that writes the earlier answer's numbers again, without any tool. */
+  const AGAIN = "요약하면 강 정화 활동으로 쓰레기 340kg을 치웠어요[1]. 학교 자원봉사자들도 함께했어요[2].";
+  const script: FakeScript = (input, memory) => {
+    const id = /^\/(\S+) (\S+)$/.exec(input.text);
+    if (input.text === "/again") return [{ text: AGAIN }];
+    // The production case: the file was read or searched, the answer writes [n] without file_cite.
+    if (id?.[1] === "read-no-cite")
+      return [
+        { call: "file_read", input: { fileId: id[2]!, from: 12, to: 12 } },
+        { text: "보고서에 따르면 쓰레기 340kg을 치웠어요[1]. 학교 12곳이 함께했어요[2]." },
+      ];
+    // A file_search hit number written as if it were a citation.
+    if (input.text === "/search-reuse")
+      return [{ call: "file_search", input: { query: "340 kg" } }, { text: "쓰레기 340kg을 치웠어요[1]." }];
+    return defaultScript(input, memory);
+  };
+  const unverified = (c: { status: string }) => {
+    expect(c.status).not.toBe("verified");
+    expect(CITATION_STATUS_TEXT[c.status as keyof typeof CITATION_STATUS_TEXT].startsWith("⚠️ ")).toBe(true);
+  };
+
+  it("the production case: [n] after file_read without file_cite is ⚠️ (unknown_source), never verified", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    const r = await send(f.cookies.owner, c.id, `/read-no-cite ${file.id}`, undefined, [file.id]);
+    expect(r.run.status).toBe("done");
+    expect(CitationNotePart.parse(r.note)).toEqual(r.note);
+    expect(r.note!.unbacked).toBeUndefined();
+    expect(r.note!.citations.map((x) => [x.n, x.status, x.title, x.fileId])).toEqual([
+      [1, "unknown_source", null, undefined],
+      [2, "unknown_source", null, undefined],
+    ]);
+    r.note!.citations.forEach(unverified);
+    // A follow-up writing those numbers again carries nothing (there was nothing to carry): flagged, no sources.
+    const again = await send(f.cookies.owner, c.id, "/again");
+    expect(again.note).toMatchObject({ unbacked: true, missing: [] });
+    again.note!.citations.forEach(unverified);
+  });
+
+  it("file_cite → verified with the file's id; the follow-up's same numbers are carried and verified again; a file_search hit number is ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    const first = await send(f.cookies.owner, c.id, "/file-page12", undefined, [file.id]);
+    expectPage12(first, file.id, "first");
+    expect(first.note!.citations.map((x) => x.fileId)).toEqual([file.id, file.id]);
+
+    const again = await send(f.cookies.owner, c.id, "/again");
+    expect(again.results).toEqual([]);
+    expect(CitationNotePart.parse(again.note)).toEqual(again.note);
+    expect(again.note!.unbacked).toBeUndefined();
+    expect(
+      again.note!.citations.map((x) => [
+        x.n,
+        x.status,
+        x.title,
+        x.site,
+        x.fileId,
+        x.locator?.fileId,
+        x.quote,
+      ]),
+    ).toEqual([
+      [1, "verified", "report.pdf", "12쪽", file.id, file.id, REPORT_PAGE12.summary],
+      [2, "verified", "report.pdf", "12쪽", file.id, file.id, REPORT_PAGE12.volunteers],
+    ]);
+    expect(again.note!.missing).toEqual([]);
+    // Nothing was registered for the follow-up: its run has no citation rows of its own.
+    expect(
+      db.$client.prepare("SELECT count(*) AS n FROM citations WHERE run_id = ?").get(again.run.id),
+    ).toEqual({
+      n: 0,
+    });
+
+    // A file_search result number written as a citation: this run's numbers are its own — ⚠️, nothing carried.
+    const reuse = await send(f.cookies.owner, c.id, "/search-reuse");
+    const [search] = outputs(reuse);
+    expect(search!.content).toContain(`(결과 1) report.pdf · 12쪽\n${REPORT_PAGE12.summary}`);
+    expect(search!.content).not.toMatch(/\[\d+\] report\.pdf/);
+    expect(reuse.note!.citations.map((x) => [x.n, x.status, x.fileId])).toEqual([
+      [1, "unknown_source", undefined],
+    ]);
+    reuse.note!.citations.forEach(unverified);
+  });
+
+  it("the file's text changed, being extracted again, deleted: the carried number is not verified", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    expectPage12(await send(f.cookies.owner, c.id, "/file-page12", undefined, [file.id]), file.id, "first");
+    const sql = db.$client;
+    // The extraction now has another text on page 12 (a new extraction: its row's time moves on).
+    sql
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND unit = 12")
+      .run("Report page 12\nNothing about the river here.", file.id);
+    sql.prepare("UPDATE file_extracts SET updated_at = updated_at + 1 WHERE file_id = ?").run(file.id);
+    const changed = await send(f.cookies.owner, c.id, "/again");
+    expect(changed.note!.citations.map((x) => [x.status, x.fileId, x.site, x.locator, x.quote])).toEqual([
+      ["snippet_not_found", file.id, null, undefined, REPORT_PAGE12.summary],
+      ["snippet_not_found", file.id, null, undefined, REPORT_PAGE12.volunteers],
+    ]);
+    changed.note!.citations.forEach(unverified);
+    // Being extracted again: not readable now — ⚠️ (never the earlier verification).
+    sql.prepare("UPDATE file_extracts SET status = 'pending' WHERE file_id = ?").run(file.id);
+    const pending = await send(f.cookies.owner, c.id, "/again");
+    expect(pending.note!.citations.map((x) => [x.status, x.fileId])).toEqual([
+      ["fetch_failed", file.id],
+      ["fetch_failed", file.id],
+    ]);
+    pending.note!.citations.forEach(unverified);
+    // Deleted: nothing to check against — not carried, the markers flagged, no sources.
+    sql.prepare("DELETE FROM files WHERE id = ?").run(file.id);
+    const gone = await send(f.cookies.owner, c.id, "/again");
+    expect(gone.note).toMatchObject({ unbacked: true });
+    expect(gone.note!.citations.map((x) => [x.status, x.fileId, x.title])).toEqual([
+      ["unknown_source", undefined, null],
+      ["unknown_source", undefined, null],
+    ]);
+  });
 });

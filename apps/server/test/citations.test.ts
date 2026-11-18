@@ -11,11 +11,12 @@ import {
   FINANCE_DISCLAIMER,
   sentenceEndMarkers,
   uncitedUnits,
+  type CitationEntry,
   type MessagePart,
 } from "@agentlee/shared";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
-import { citationNote } from "../src/citations/checker.js";
+import { citationNote, type CitationCarry } from "../src/citations/checker.js";
 import { CitationStore, CiteRefused, snippetKey } from "../src/citations/store.js";
 import { findSnippet, normalizeSnippet, normalizeWithMap, verifyStats } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
@@ -1511,6 +1512,97 @@ describe("citationNote", () => {
     expect(
       f.cites.recheck({ ...owner, conversationId: crypto.randomUUID() }, { sourceId: src.id, snippet: SNIP }),
     ).toBe(undefined);
+  });
+
+  it("carry-over of a file citation (#186): by the entry's fileId only, checked again now — never by the text", () => {
+    const rev = "b".repeat(64);
+    const loc = { fileId: "file-1", fileRevision: rev, kind: "page" as const, page: 12 };
+    const fileEntry = (n: number, extra: Partial<CitationEntry> = {}): CitationEntry => ({
+      n,
+      status: "verified",
+      sourceId: null,
+      title: "보고서.pdf",
+      site: "12쪽",
+      url: null,
+      publishedAt: null,
+      quote: "파일의 구절이에요 열두 쪽",
+      locator: loc,
+      fileId: "file-1",
+      ...extra,
+    });
+    const asked: { fileId: string; snippet: string }[] = [];
+    let now: "verified" | "snippet_not_found" | "fetch_failed" | "gone" = "verified";
+    const recheckFile: NonNullable<CitationCarry["recheckFile"]> = (sc, input) => {
+      expect(sc).toMatchObject({ conversationId: f.c.id, userId: scope.userId });
+      asked.push(input);
+      if (now === "gone") return undefined;
+      return now === "verified"
+        ? { status: "verified", quote: input.snippet, locator: loc, file: { name: "보고서.pdf" } }
+        : { status: now, quote: null, locator: null, file: { name: "보고서.pdf" } };
+    };
+    // Old entry (stored before #186, no fileId): not carried, even with a locator naming the file.
+    const { fileId: _drop, ...old } = fileEntry(3);
+    void _drop;
+    const previous = () => [
+      fileEntry(1),
+      fileEntry(2, {
+        status: "snippet_not_found",
+        site: null,
+        quote: "모델이 보낸 구절이에요",
+        locator: undefined,
+      }),
+      old,
+    ];
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous, recheckFile };
+    const t = "요약하면 쓰레기를 치웠어요[1]. 학교도 함께했어요[2]. 다른 말이에요[3].";
+    const note = citationNote(f.run(f.c.id).runId, text(t), f.cites, carry)!;
+    expect(CitationNotePart.parse(note)).toEqual(note);
+    expect(note.unbacked).toBeUndefined();
+    expect(note.citations.map((c) => [c.n, c.status, c.fileId, c.site, c.locator?.page])).toEqual([
+      [1, "verified", "file-1", "12쪽", 12],
+      [2, "verified", "file-1", "12쪽", 12],
+      [3, "unknown_source", undefined, null, undefined],
+    ]);
+    // The passage checked is the earlier answer's own (verified quote, or the snippet the model sent): never a guess
+    // from the sentence ("요약하면 쓰레기를 치웠어요").
+    expect(asked).toEqual([
+      { fileId: "file-1", snippet: "파일의 구절이에요 열두 쪽" },
+      { fileId: "file-1", snippet: "모델이 보낸 구절이에요" },
+    ]);
+    // The file's text changed / being extracted again: carried, with ⚠️ — no place claimed, the quote kept.
+    for (const status of ["snippet_not_found", "fetch_failed"] as const) {
+      now = status;
+      const c = citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)!.citations[0]!;
+      expect([c.status, c.fileId, c.site, c.locator, c.quote]).toEqual([
+        status,
+        "file-1",
+        null,
+        undefined,
+        "파일의 구절이에요 열두 쪽",
+      ]);
+      expect(citationVerified(c.status)).toBe(false);
+    }
+    // The file is gone (or not this conversation's/user's any more): not carried — no sources, the marker flagged.
+    now = "gone";
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)).toMatchObject({
+      citations: [{ n: 1, status: "unknown_source", sourceId: null }],
+      unbacked: true,
+    });
+    // Without a recheck the file citation is not carried.
+    now = "verified";
+    const { recheckFile: _r, ...bare } = carry;
+    void _r;
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, bare)!.citations[0]!.status).toBe(
+      "unknown_source",
+    );
+    // A run that read or searched the file (its own numbers: a file_search hit number is not a citation): no carry.
+    for (const name of ["mcp__agentlee__file_search", "file_read", "mcp__agentlee__file_cite"]) {
+      const parts: MessagePart[] = [{ type: "tool_call", id: "t1", name, input: {} }, ...text("가[1].")];
+      asked.length = 0;
+      const c = citationNote(f.run(f.c.id).runId, parts, f.cites, carry)!.citations[0]!;
+      expect([c.status, c.fileId], name).toEqual(["unknown_source", undefined]);
+      expect(asked, name).toEqual([]);
+    }
   });
 
   it("fits the shared schema even with long titles and quotes of characters outside the BMP", () => {

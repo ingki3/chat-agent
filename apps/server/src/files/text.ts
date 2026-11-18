@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import {
+  boundText,
+  CITATION_LIMITS,
   EXTRACT_CODE_TEXT,
   FileLocator,
   frameExternal,
@@ -9,7 +11,7 @@ import {
   type UnitLocator,
 } from "@agentlee/shared";
 import type { ToolScope } from "@agentlee/mcp-tools";
-import { findSnippetAt } from "../citations/verify.js";
+import { findSnippetAt, normalizeSnippet } from "../citations/verify.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { toFileExtract, type FileExtracts, type SegmentRow } from "./extract.js";
@@ -215,7 +217,7 @@ export class FileTools {
    * Whether a run of `scope` may read file `f` — the one rule of every file tool (see the file comment): the
    * token user's conversation, the user's file in it, sent with a message that is still active.
    */
-  private inScope(scope: ToolScope, f: FileRow): boolean {
+  private inScope(scope: Pick<ToolScope, "conversationId" | "userId">, f: FileRow): boolean {
     return (
       f.conversationId === scope.conversationId &&
       f.userId === scope.userId &&
@@ -223,13 +225,13 @@ export class FileTools {
     );
   }
 
-  private ownConversation(scope: ToolScope): boolean {
+  private ownConversation(scope: Pick<ToolScope, "conversationId" | "userId">): boolean {
     const c = this.conversations.get(scope.conversationId);
     return !!c && c.ownerId === scope.userId;
   }
 
   /** The file when the run may read it, or undefined. */
-  fileFor(scope: ToolScope, fileId: string): FileRow | undefined {
+  fileFor(scope: Pick<ToolScope, "conversationId" | "userId">, fileId: string): FileRow | undefined {
     if (!this.ownConversation(scope)) return undefined;
     const f = this.store.get(fileId);
     return f && this.inScope(scope, f) ? f : undefined;
@@ -484,7 +486,9 @@ export class FileTools {
           source: "file_search",
           content:
             top
-              .map((h, i) => `[${i + 1}] ${scrubKnown(h.file.name, { tail: false })} · ${h.own}\n${h.text}`)
+              .map(
+                (h, i) => `(결과 ${i + 1}) ${scrubKnown(h.file.name, { tail: false })} · ${h.own}\n${h.text}`,
+              )
               .join("\n\n") || "(no matches)",
         }),
       },
@@ -512,7 +516,45 @@ export class FileTools {
     snippet: string,
     page: number | undefined,
   ): Promise<{ status: CitationStatus; quote: string | null; locator: CitedLocator | null }> {
-    const extract = await this.ready(f);
+    return this.match(f, await this.ready(f), snippet, page);
+  }
+
+  /**
+   * An earlier answer's file citation checked again for a later answer that writes its number again (#186, the
+   * file side of #150's carry-over): the file must still be one a run of `scope` may read (`fileFor` — this
+   * conversation's and this user's, sent with an active message; a deleted file or one an edit cut off is not), and
+   * the passage is looked for in the file's extracted text **as it is now** — without waiting: a file being
+   * extracted again (or failed) is `fetch_failed`, a passage its current text no longer has `snippet_not_found`.
+   * Undefined when the file is not one (any more): the marker stays `unknown_source`. Registers nothing.
+   */
+  recheck(
+    scope: Pick<ToolScope, "conversationId" | "userId">,
+    input: { fileId: string; snippet: string },
+  ):
+    { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: FileRow } | undefined {
+    const file = this.fileFor(scope, input.fileId);
+    if (!file) return undefined;
+    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
+      return { status: "snippet_not_found", quote: null, locator: null, file };
+    const found = this.match(file, toFileExtract(file, this.extracts.get(file.id)), snippet, undefined);
+    if (found.status !== "verified") return { status: found.status, quote: null, locator: null, file };
+    const loc = found.locator ? FileLocator.safeParse(scrubKnownDeep(found.locator)) : undefined;
+    return {
+      status: "verified",
+      quote: found.quote === null ? null : scrubKnown(found.quote),
+      locator: loc?.success ? loc.data : null,
+      file,
+    };
+  }
+
+  /** `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`). */
+  private match(
+    f: FileRow,
+    extract: FileExtract,
+    snippet: string,
+    page: number | undefined,
+  ): { status: CitationStatus; quote: string | null; locator: CitedLocator | null } {
     if (extract.status !== "ok" || !extract.segments)
       return { status: "fetch_failed", quote: null, locator: null };
     const segs = this.extracts.segments(f.id);

@@ -367,19 +367,19 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     // The owner has the finance tools too (finance@5): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@9"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@10"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
-      "common@9",
-      "research@3",
+      "common@10",
+      "research@4",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
     expect(prompt).toContain("# 자료 조사 모드");
-    expect(prompt).toContain("`cite`로 검증한 표시");
+    expect(prompt).toContain("`cite`(첨부 파일은 `file_cite`)로 검증한 표시");
     expect(prompt).toContain("`sources_list`");
     await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: false });
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@9"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@10"]);
     expect(rt.systemPrompts.at(-1)).not.toContain("# 자료 조사 모드");
   });
 

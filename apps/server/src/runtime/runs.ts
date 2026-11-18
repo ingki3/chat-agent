@@ -62,7 +62,7 @@ import {
 } from "../instructions/assemble.js";
 import { docBudgetBytes, docVersionsKey, EMPTY_DOCS, fitMaterial, type DocSet } from "../memory/inject.js";
 import { financeNote } from "../finance/checker.js";
-import { citationNote } from "../citations/checker.js";
+import { citationNote, type CitationCarry } from "../citations/checker.js";
 import { CitationStore } from "../citations/store.js";
 import { ArtifactStore } from "../artifacts/store.js";
 import { FINANCE_CHART_TOOL } from "@agentlee/mcp-tools/finance";
@@ -388,6 +388,11 @@ export type RunManagerOptions = {
    * source the conversation does not have is not referenced. Without it no source is referenced.
    */
   contextSources?: (conversationId: string) => ReadonlyMap<string, { text: boolean }>;
+  /**
+   * An earlier answer's file citation checked again for a follow-up that writes its number again (#186,
+   * `FileTools.recheck`). Without it file citations are not carried over (they stay `unknown_source`).
+   */
+  fileRecheck?: CitationCarry["recheckFile"];
   /**
    * 내 지침 (#144, docs/memory-spec.md §2): the documents a new session of this user gets — AGENT in the system
    * instructions, SOUL / USER / MEMORY in the user material box. Without it no documents go in.
@@ -965,6 +970,7 @@ export class RunManager {
           conversationId: row.conversationId,
           userId: row.userId,
           previous: () => this.previousCitations(row),
+          ...(this.opts.fileRecheck ? { recheckFile: this.opts.fileRecheck } : {}),
         });
         if (note) this.pushNote(row, parts, note);
       } catch {

@@ -75,12 +75,15 @@ export function remapParts(parts: readonly MessagePart[], ids: IdMap): MessagePa
           {
             ...p,
             citations: p.citations.map((c) => {
-              const { locator, ...rest } = c;
+              const { locator, fileId: cited, ...rest } = c;
               const fileId = locator ? ids.file.get(locator.fileId) : undefined;
+              // The cited file's copy (#186: what a follow-up in the copy carries over); none in the copy → cut.
+              const copy = cited ? ids.file.get(cited) : undefined;
               return {
                 ...rest,
                 sourceId: c.sourceId ? (ids.source.get(c.sourceId) ?? null) : null,
                 ...(locator && fileId ? { locator: { ...locator, fileId } } : {}),
+                ...(copy ? { fileId: copy } : {}),
               };
             }),
           },

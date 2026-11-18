@@ -187,8 +187,8 @@ function citedEntries(db: Db, conversationId: string, view?: ReferencesView): Ci
       for (const raw of list) {
         const e = CitationEntry.safeParse(raw);
         if (!e.success) continue;
-        // #107 stores the file's id inside the locator, and only for a verified passage.
-        out.push({ entry: e.data, fileId: e.data.locator?.fileId ?? null });
+        // #107 stores the file's id inside the locator, and only for a verified passage; #186 on every file entry.
+        out.push({ entry: e.data, fileId: e.data.fileId ?? e.data.locator?.fileId ?? null });
       }
     }
   return out;
