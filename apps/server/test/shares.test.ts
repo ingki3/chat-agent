@@ -1197,6 +1197,21 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
     expect(follow(crypto.randomUUID()).status).toBe("verified");
   });
 
+  it("#186 review 4차: a row that is not complete (stored before) is not copied into a fork", async () => {
+    const w = await snapshotWorld();
+    citeInNotes(w);
+    w.db.$client.prepare("update citations set complete = 0 where source_id = ?").run(w.s1);
+    const fork = (await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).json<Fork>().conversation;
+    expect(
+      w.db.$client.prepare("select count(*) as n from citations where conversation_id = ?").get(fork.id),
+    ).toEqual({
+      n: 0,
+    });
+    const msgs = w.app.conversations!.messages(fork.id, { limit: 100 });
+    const note = msgs.flatMap((m) => m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+    expect(note?.type === "citation_note" && note.citations[0]!.citationId).toBeUndefined();
+  });
+
   it("keeps a secret registered after the original was stored out of the copy (#78)", async () => {
     const w = await start();
     const late = `sk-ant-forklate${crypto.randomUUID().replaceAll("-", "")}`;

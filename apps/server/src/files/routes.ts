@@ -22,7 +22,7 @@ import type { ConversationStore } from "../conversations/store.js";
 import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
 import { toFileExtract, type FileExtracts } from "./extract.js";
-import { segmentLocator } from "./text.js";
+import { segmentLocator, unitHashOf } from "./text.js";
 import { resolveTarget, VIEW_LIMIT, VIEW_MAX, viewSegment, viewWindow } from "./viewer.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 import { sharedWith, viewOf } from "../shares/projection.js";
@@ -379,12 +379,19 @@ export function registerFileRoutes(
             const raw = JSON.parse(c.locator) as { textHash?: unknown };
             const l = FileLocator.safeParse(raw);
             const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
-            return l.success ? [{ locator: l.data, quote: c.quote, textHash }] : [];
+            return l.success ? [{ locator: l.data, quote: c.quote, textHash, unitHash: c.unitHash }] : [];
           } catch {
             return [];
           }
         });
-        target = resolveTarget(f, extract, items, loc, cited);
+        target = resolveTarget(
+          f,
+          extract,
+          items,
+          loc,
+          cited,
+          new Map(all.map((s) => [s.seq, unitHashOf(s)])),
+        );
       }
       const toRaw = req.query.to === undefined ? undefined : Number.parseInt(req.query.to, 10);
       const to = toRaw === undefined || !Number.isFinite(toRaw) ? undefined : Math.max(0, toRaw);

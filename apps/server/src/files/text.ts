@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import {
-  CITATION_LIMITS,
   EXTRACT_CODE_TEXT,
   FileLocator,
   frameExternal,
@@ -10,7 +9,7 @@ import {
   type UnitLocator,
 } from "@agentlee/shared";
 import type { ToolScope } from "@agentlee/mcp-tools";
-import { findSnippetAt, findSnippetMatches, normalizeSnippet } from "../citations/verify.js";
+import { findSnippetAt } from "../citations/verify.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { toFileExtract, type FileExtracts, type SegmentRow } from "./extract.js";
@@ -510,87 +509,56 @@ export class FileTools {
    * a web citation (`findSnippetAt`), the unit named by `page` first. A verified passage gets its exact locator —
    * or none when its place was lost to a secret's removal (never a wrong one, review #107).
    */
-  async check(
-    f: FileRow,
-    snippet: string,
-    page: number | undefined,
-  ): Promise<{ status: CitationStatus; quote: string | null; locator: CitedLocator | null }> {
+  async check(f: FileRow, snippet: string, page: number | undefined): Promise<CheckResult> {
     return this.match(f, await this.ready(f), snippet, page);
   }
 
   /**
    * An earlier answer's file citation checked again for a later answer that writes its number again (#186, the
-   * file side of #150's carry-over) — **still at the same place** (review 3차): the file must still be one a run of
-   * `scope` may read (`fileFor` — this conversation's and this user's, sent with an active message; a deleted file or
-   * one an edit cut off is not), and the row's whole passage must still be at the row's own place in the file's
-   * extracted text as it is now — without waiting (being extracted again or failed → `fetch_failed`):
-   * - with a range and its text hash (what the viewer highlights): the unit's text up to the passage's end is the
-   *   text it was verified in, and the passage is that range (either quote form);
-   * - a place without a range (a split piece, an approximate unit): the passage somewhere in that unit, line or cell.
-   * Anything else — moved, changed, no place kept — is `snippet_not_found`: never looked for elsewhere in the file.
-   * The place shown is the row's own (the one the viewer opens). Undefined when the file is not one (any more): the
-   * marker stays `unknown_source`. Registers nothing.
+   * file side of #150's carry-over) — **the cited unit is unchanged at the same place** (review 4차): the file must
+   * still be one a run of `scope` may read (`fileFor` — this conversation's and this user's, sent with an active
+   * message; a deleted file or one an edit cut off is not), its extraction ready (being extracted again or failed →
+   * `fetch_failed`, never waited for), a unit at the row's place whose whole text and marks hash to the row's
+   * `unitHash` (`unitHashOf` — computed from the text now, so an identical re-extraction still matches; a changed
+   * text, a newly masked secret or moved cells do not), and the row's whole passage found in it again (the usual
+   * rules, in the unit's full text — the unit being the same, so is the place). Anything else is `snippet_not_found`: never looked
+   * for elsewhere. The place shown is the row's own — the one the viewer opens and, on the same condition, claims
+   * exact. Undefined when the file is not one (any more): the marker stays `unknown_source`. Registers nothing.
    */
   recheck(
     scope: Pick<ToolScope, "conversationId" | "userId">,
-    input: { fileId: string; snippet: string; locator: CitedLocator | undefined },
+    input: { fileId: string; snippet: string; locator: CitedLocator | undefined; unitHash: string | null },
   ):
     { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: FileRow } | undefined {
     const file = this.fileFor(scope, input.fileId);
     if (!file) return undefined;
     const no = { status: "snippet_not_found" as const, quote: null, locator: null, file };
-    // The row's whole passage (as stored, already scrubbed — again with the secrets known now); never cut.
-    const snippet = scrubKnown(input.snippet);
-    if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet) return no;
     const extract = toFileExtract(file, this.extracts.get(file.id));
     if (extract.status !== "ok" || !extract.segments)
       return { status: "fetch_failed", quote: null, locator: null, file };
     const at = input.locator;
-    if (!at || at.fileId !== file.id || at.fileRevision !== file.sha256) return no;
-    const quote = this.atPlace(file, snippet, at);
-    const loc = FileLocator.safeParse(scrubKnownDeep(at));
-    if (quote === undefined || !loc.success) return no;
-    return { status: "verified", quote: scrubKnown(quote), locator: loc.data, file };
-  }
-
-  /** The passage at place `at` exactly (see `recheck`): its quote there, or undefined. */
-  private atPlace(f: FileRow, snippet: string, at: CitedLocator): string | undefined {
-    for (const seg of this.extracts.segments(f.id)) {
-      if (!mayBePlace(f, seg, at)) continue;
-      if (at.charRange) {
-        if (!at.textHash || seg.approximate) continue;
-        // Within the named line for a run of lines (as the viewer reads it), else the unit's text.
-        const line = at.kind === "line" ? marksOf(seg).find((m) => m[2].line === at.line) : undefined;
-        if (at.kind === "line" && !line) continue;
-        const base = line ? line[0] : 0;
-        const [a, b] = at.charRange;
-        const start = base + a;
-        const end = base + b;
-        if (a >= b || end > seg.text.length || prefixHash(seg.text, end) !== at.textHash) continue;
-        const m = findSnippetAt(seg.text.slice(start, end), snippet);
-        if (m.found) return m.quote;
-        continue;
-      }
-      for (const m of findSnippetMatches(seg.text, snippet)) {
-        const where = locate(f, seg, m.start, m.end);
-        if (where && samePlace(where, at)) return m.quote;
-      }
+    if (!at || !input.unitHash || at.fileId !== file.id || at.fileRevision !== file.sha256) return no;
+    // The row's whole passage (as stored, already scrubbed — again with the secrets known now); never cut.
+    const snippet = scrubKnown(input.snippet);
+    for (const seg of this.extracts.segments(file.id)) {
+      if (!mayBePlace(file, seg, at) || unitHashOf(seg) !== input.unitHash) continue;
+      // The unit is byte for byte (text and marks) the one verified: the passage found in it is at the row's place.
+      const m = findSnippetAt(seg.text, snippet);
+      if (!m.found) continue;
+      const loc = FileLocator.safeParse(scrubKnownDeep(at));
+      if (!loc.success) return no;
+      return { status: "verified", quote: scrubKnown(m.quote), locator: loc.data, file };
     }
-    return undefined;
+    return no;
   }
 
   /**
    * `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`): the first
    * unit that has the passage, the unit named by `page` first.
    */
-  private match(
-    f: FileRow,
-    extract: FileExtract,
-    snippet: string,
-    page: number | undefined,
-  ): { status: CitationStatus; quote: string | null; locator: CitedLocator | null } {
+  private match(f: FileRow, extract: FileExtract, snippet: string, page: number | undefined): CheckResult {
     if (extract.status !== "ok" || !extract.segments)
-      return { status: "fetch_failed", quote: null, locator: null };
+      return { status: "fetch_failed", quote: null, locator: null, unitHash: null };
     const segs = this.extracts.segments(f.id);
     const ordered =
       page === undefined
@@ -600,11 +568,31 @@ export class FileTools {
       const m = findSnippetAt(seg.text, snippet);
       if (m.found) return verifiedAt(seg, m, locate(f, seg, m.start, m.end));
     }
-    return { status: "snippet_not_found", quote: null, locator: null };
+    return { status: "snippet_not_found", quote: null, locator: null, unitHash: null };
   }
 }
 
-type VerifiedMatch = { status: "verified"; quote: string; locator: CitedLocator | null };
+/** What `check` finds: a verified passage's quote, place and its unit's hash (`unitHashOf`), or why not. */
+export type CheckResult = {
+  status: CitationStatus;
+  quote: string | null;
+  locator: CitedLocator | null;
+  unitHash: string | null;
+};
+
+/**
+ * A unit as it is (#186 review 4차): SHA-256 of its whole text and its marks (lines, cells, boxes) — what a carried
+ * citation of it is verified against, and what lets the viewer claim the cited range exact.
+ */
+export const unitHashOf = (seg: Pick<SegmentRow, "text" | "marks">) =>
+  crypto
+    .createHash("sha256")
+    .update(seg.text, "utf8")
+    .update("\u0000")
+    .update(seg.marks ?? "", "utf8")
+    .digest("hex");
+
+type VerifiedMatch = CheckResult & { status: "verified"; quote: string };
 
 /** A verified passage at `[m.start, m.end)` of `seg`, with its exact place (`where`) when it has one. */
 function verifiedAt(
@@ -625,6 +613,7 @@ function verifiedAt(
           ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
         }
       : null,
+    unitHash: unitHashOf(seg),
   };
 }
 
@@ -633,32 +622,11 @@ const UNIT_FIELDS = ["page", "slide", "paragraph", "table", "row", "sheet", "foo
 
 /**
  * Whether unit `seg` can hold place `p` — cheap, no text compared: the same kind and unit, and for a line the run
- * has that line. Only a filter: the place of each match is checked after (`samePlace`).
+ * has that line. The unit's hash decides the rest.
  */
 function mayBePlace(f: FileRow, seg: SegmentRow, p: FileLocator): boolean {
   const own = segmentLocator(f, seg);
   if (own.kind !== p.kind) return false;
   if (UNIT_FIELDS.some((k) => own[k] !== undefined && p[k] !== undefined && own[k] !== p[k])) return false;
   return p.line === undefined || marksOf(seg).some((m) => m[2].line === p.line);
-}
-
-/** The fields that name a place (not the box or the range inside it). */
-const PLACE_FIELDS = [
-  "kind",
-  "page",
-  "line",
-  "paragraph",
-  "table",
-  "row",
-  "col",
-  "sheet",
-  "range",
-  "slide",
-  "footnote",
-  "endnote",
-] as const satisfies readonly (keyof FileLocator)[];
-
-/** Whether a found place is the earlier one (the same unit, line, cell — not the range inside it). */
-function samePlace(a: FileLocator, b: FileLocator): boolean {
-  return PLACE_FIELDS.every((k) => a[k] === b[k]);
 }

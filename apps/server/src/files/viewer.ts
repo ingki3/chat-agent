@@ -35,6 +35,12 @@ export type CitedPassage = {
   quote: string;
   /** `prefixHash` of the unit's text up to the passage's end when it was checked (files/text.ts); absent: older. */
   textHash: string | undefined;
+  /**
+   * `unitHashOf` the whole unit (text and marks) when it was checked (#186 review 4차); null: older. When there is
+   * one, it alone decides: the range is exact while the unit is still exactly that — the same condition a later
+   * answer's carried number is verified on.
+   */
+  unitHash?: string | null | undefined;
 };
 
 type StoredLoc = { split?: unknown };
@@ -156,6 +162,8 @@ export function resolveTarget(
   items: readonly ViewSegment[],
   loc: FileLocator,
   cited: readonly CitedPassage[],
+  /** `unitHashOf` each unit now, by `seq` (#186 review 4차). */
+  unitHashes: ReadonlyMap<number, string> = new Map(),
 ): ViewTarget {
   const none = (status: ViewTarget["status"], reason: LocateReason): ViewTarget => ({
     status,
@@ -210,7 +218,16 @@ export function resolveTarget(
     const before = prefixHash(only!.text, range.end);
     // A citation the caller may see gave this locator, and the unit's text up to the passage's end is still the text
     // it was checked in (review #123: the same quote elsewhere after a shift is not the cited place).
-    if (!cited.some((c) => key(c.locator) === k && c.quote === at && c.textHash === before)) {
+    const now = unitHashes.get(only!.seq);
+    if (
+      !cited.some((c) =>
+        key(c.locator) !== k
+          ? false
+          : c.unitHash
+            ? c.unitHash === now
+            : c.quote === at && c.textHash === before,
+      )
+    ) {
       reasons.add("unverified");
       range = undefined;
     }

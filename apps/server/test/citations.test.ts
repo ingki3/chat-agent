@@ -1533,6 +1533,7 @@ describe("citationNote", () => {
       status: "verified",
       quote: A,
       locator: loc,
+      unitHash: "unit-hash-1",
     }));
     f.cites.citeFile(first, { fileId: "file-1", snippet: B }, () => ({
       status: "snippet_not_found",
@@ -1575,8 +1576,9 @@ describe("citationNote", () => {
     expect(note.citations.slice(0, 2).map((c) => c.citationId)).toEqual(earlier.map((c) => c.citationId));
     // The passage checked is the row's own (never a guess from the sentence), the earlier place first.
     expect(asked).toEqual([
-      { fileId: "file-1", snippet: A, locator: loc },
-      { fileId: "file-1", snippet: B, locator: undefined },
+      // With the unit's hash of a verified row (#186 review 4차: what the file recheck compares).
+      { fileId: "file-1", snippet: A, locator: loc, unitHash: "unit-hash-1" },
+      { fileId: "file-1", snippet: B, locator: undefined, unitHash: null },
     ]);
     // The file's text changed / being extracted again: carried, with ⚠️ — no place claimed, the quote kept.
     for (const status of ["snippet_not_found", "fetch_failed"] as const) {

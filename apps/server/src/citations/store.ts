@@ -157,6 +157,8 @@ export class CitationStore {
       status: CitationStatus;
       quote: string | null;
       locator: (FileLocator & { sheetNo?: number | undefined }) | null;
+      /** The verified unit's hash (`unitHashOf`): what a carried number is verified against (#186 review 4차). */
+      unitHash?: string | null | undefined;
     },
   ): CiteResult & { locator: (FileLocator & { sheetNo?: number | undefined }) | null } {
     const snippet = scrubKnown(wholeSnippet(input.snippet));
@@ -174,7 +176,10 @@ export class CitationStore {
     if (!existing && this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
     // The file's state now comes before anything this run registered (review #107 7차): a file being extracted
     // again (a new secret) or one that failed is `fetch_failed`, whatever an earlier call verified.
-    const found = fileId ? check(snippet) : { status: "unknown_source" as const, quote: null, locator: null };
+    const found = fileId
+      ? check(snippet)
+      : { status: "unknown_source" as const, quote: null, locator: null, unitHash: null };
+    const unitHash = found.status === "verified" ? (found.unitHash ?? null) : null;
     const quote = found.quote === null ? null : scrubKnown(found.quote);
     const locator = found.locator ? JSON.stringify(scrubKnownDeep(found.locator)) : null;
     return this.db.transaction(
@@ -187,14 +192,21 @@ export class CitationStore {
           if (found.status === "verified") {
             this.db
               .update(citations)
-              .set({ status: found.status, quote, snippet, locator, complete: true })
+              .set({ status: found.status, quote, snippet, locator, unitHash, complete: true })
               .where(eq(citations.id, again.id))
               .run();
             return { ...result(again.n, "verified", null), locator: found.locator };
           }
           this.db
             .update(citations)
-            .set({ status: found.status, quote: null, snippet, locator: null, complete: true })
+            .set({
+              status: found.status,
+              quote: null,
+              snippet,
+              locator: null,
+              unitHash: null,
+              complete: true,
+            })
             .where(eq(citations.id, again.id))
             .run();
           return { ...result(again.n, found.status, null), locator: null };
@@ -217,6 +229,7 @@ export class CitationStore {
             snippetKey: key,
             quote,
             locator,
+            unitHash,
             complete: true,
           })
           .run();

@@ -301,7 +301,8 @@ function safeJson(s: string): unknown {
  * (`allowed`, the projection's citations): each copied into the fork — through the secrets known now (snippet,
  * quote, locator; the key recomputed from the masked snippet), its source and file moved to the copies (a row whose
  * source or file the copy lacks is not copied: that entry carries nothing there), the forker's own, a run of its own
- * (`fork:<id>`, no run is copied), `complete` as it was. What a follow-up in the copy checks a carried number
+ * (`fork:<id>`, no run is copied), its unit hash as it was (the copy is extracted from the same bytes). Complete rows
+ * only. What a follow-up in the copy checks a carried number
  * against: the whole passage, kept server-side. Entries without a row id (stored before) are not copied.
  */
 function copyCitationRows(
@@ -317,10 +318,13 @@ function copyCitationRows(
     for (const p of (m.parts as MessagePart[] | null) ?? [])
       if (p?.type === "citation_note")
         for (const c of p.citations) if (c.citationId && allowed.has(c.citationId)) want.add(c.citationId);
-  const read = db.$client.prepare("select * from citations where id = ? and conversation_id = ?");
+  // Complete rows only (review #186 4차): a row that may hold a cut passage carries nothing anywhere.
+  const read = db.$client.prepare(
+    "select * from citations where id = ? and conversation_id = ? and complete = 1",
+  );
   const insert = db.$client.prepare(
     `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote,
-       file_id, locator, complete) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       file_id, locator, unit_hash, complete) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const id of want) {
     const r = read.get(id, fromConversation) as
@@ -332,6 +336,7 @@ function copyCitationRows(
           snippet: string;
           quote: string | null;
           locator: string | null;
+          unit_hash: string | null;
           complete: number;
         }
       | undefined;
@@ -360,6 +365,7 @@ function copyCitationRows(
       r.quote === null ? null : scrubKnown(r.quote),
       fileId,
       locator,
+      r.unit_hash,
       r.complete,
     );
     ids.citation!.set(id, copy);

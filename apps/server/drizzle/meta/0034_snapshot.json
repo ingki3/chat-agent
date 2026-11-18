@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "5160f527-c9f8-4d2c-8c9e-db65b4cd4c48",
+  "id": "0c998ac0-6e10-4838-8838-5cafee8910ed",
   "prevId": "2d008645-bb60-487b-8292-a08d2fd81f5a",
   "tables": {
     "access_syncs": {
@@ -541,6 +541,13 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "unit_hash": {
+          "name": "unit_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         },
         "created_at": {
           "name": "created_at",

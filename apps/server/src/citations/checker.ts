@@ -174,7 +174,7 @@ export type CitationCarry = {
   /** An earlier file citation checked again now (#186, `FileTools.recheck`); without it no file citation carries. */
   recheckFile?: (
     scope: { conversationId: string; userId: string },
-    input: { fileId: string; snippet: string; locator: CitedPlace | undefined },
+    input: { fileId: string; snippet: string; locator: CitedPlace | undefined; unitHash: string | null },
   ) =>
     | { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: { name: string } }
     | undefined;
@@ -238,7 +238,12 @@ export function citationNote(
     if (!carry?.recheckFile) return undefined;
     // The place exactly as the row keeps it (with its text hash): the recheck looks there and only there.
     const locator = row.locator ? (JSON.parse(row.locator) as CitedPlace) : undefined;
-    const c = carry.recheckFile(carry, { fileId: row.fileId!, snippet: row.snippet, locator });
+    const c = carry.recheckFile(carry, {
+      fileId: row.fileId!,
+      snippet: row.snippet,
+      locator,
+      unitHash: row.unitHash,
+    });
     if (!c) return undefined;
     carriedAny = true;
     return fileEntry(n, {

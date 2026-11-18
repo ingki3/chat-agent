@@ -3912,7 +3912,7 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
       })
     ).json() as { target: { status: string } | null };
 
-  it("[P2 3차] still at the same place, or not verified: copies elsewhere (50 before it, a quoted one) never move it; moved → ⚠️", async () => {
+  it("[P2 3·4차] the cited unit unchanged at the same place, or not verified: copies in another unit never move it; any change in the unit → ⚠️ (note and viewer alike)", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
     const c = app.conversations!.create(f.users.owner.id);
     const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
@@ -3922,39 +3922,132 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     const cited = first.note!.citations[0]!;
     expect([cited.status, cited.locator?.line]).toEqual(["verified", 60]);
     expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status).toBe("exact");
-    // Line 5 has the sentence, line 65 (the same stored run as 60) has it 50 times and quoted: line 60 stays.
-    editRun(db, file.id, "줄 5 내용", (n, l) => (n === 5 ? ONLY_HERE : l));
-    editRun(db, file.id, "줄 41 내용", (n, l) =>
-      n === 65 ? `${`${ONLY_HERE} `.repeat(50)}“${ONLY_HERE}”` : l,
+    // Line 5 (another stored unit) gets the sentence, 50 times and quoted: line 60 stays, and the viewer agrees.
+    editRun(db, file.id, "줄 5 내용", (n, l) =>
+      n === 5 ? `${`${ONLY_HERE} `.repeat(50)}“${ONLY_HERE}”` : l,
     );
-    expect(
-      (
-        db.$client
-          .prepare("SELECT text FROM file_segments WHERE file_id = ? AND text LIKE ?")
-          .get(file.id, "%줄 41 내용%") as { text: string }
-      ).text.split(ONLY_HERE).length,
-    ).toBe(53);
     const again = await send(f.cookies.owner, c.id, "/again1");
     const kept = again.note!.citations[0]!;
     expect([kept.status, kept.locator]).toEqual(["verified", cited.locator]);
-    // What the note says verified is what the viewer highlights.
     expect((await viewAt(app, f.cookies.owner, file.id, kept.locator!)).target?.status).toBe("exact");
-    // The unit's text before it changed (line 55): the viewer can no longer claim the range — nor can the note.
-    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 55 ? `${l} 덧붙임.` : l));
-    const before = await send(f.cookies.owner, c.id, "/again1");
-    expect(before.note!.citations.map((x) => x.status)).toEqual(["snippet_not_found"]);
-    expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status).not.toBe("exact");
-    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 55 ? "줄 55 내용입니다." : l));
-    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe("verified");
-    // Moved inside its own line (a lead-in before it): not where it was verified — ⚠️, never "found elsewhere".
+    // Any change in the cited unit (another line of the same stored run — before or after it): not verified, and the
+    // viewer no longer claims the range either.
+    for (const n of [55, 65]) {
+      editRun(db, file.id, "줄 41 내용", (k, l) => (k === n ? `${l} 덧붙임.` : l));
+      expect(
+        (await send(f.cookies.owner, c.id, "/again1")).note!.citations.map((x) => x.status),
+        `${n}`,
+      ).toEqual(["snippet_not_found"]);
+      expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status, `${n}`).not.toBe(
+        "exact",
+      );
+      editRun(db, file.id, "줄 41 내용", (k, l) => (k === n ? `줄 ${n} 내용입니다.` : l));
+      expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status, `${n}`).toBe(
+        "verified",
+      );
+    }
+    // Moved inside its own line, or gone: ⚠️ — never looked for elsewhere (line 5 has it).
     editRun(db, file.id, "줄 41 내용", (n, l) => (n === 60 ? `설명: ${l}` : l));
     const moved = await send(f.cookies.owner, c.id, "/again1");
     expect(moved.note!.citations.map((x) => [x.status, x.locator])).toEqual([
       ["snippet_not_found", undefined],
     ]);
-    // Gone from line 60 (still on 5 and 55): not looked for there either.
-    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 60 ? "줄 60 내용입니다." : l));
-    const gone = await send(f.cookies.owner, c.id, "/again1");
-    expect(gone.note!.citations.map((x) => x.status)).toEqual(["snippet_not_found"]);
+  });
+
+  it("[P2 4차] Codex's repros: a number changed at the range end, a two-line passage, a moved cell, an identical re-extraction, a newly masked value", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // 100 → 1000 right after the cited range's end ("… USD 100" cited, the period not).
+    SNIPPETS.amount = "Approved amount is USD 100";
+    const amount = await upload(
+      f.cookies.owner,
+      c.id,
+      "amount.txt",
+      Buffer.from("Approved amount is USD 100.\n"),
+    );
+    await app.fileExtracts!.idle();
+    expect(
+      (await send(f.cookies.owner, c.id, `/cite ${amount.id} amount`, undefined, [amount.id])).note!
+        .citations[0]!.status,
+    ).toBe("verified");
+    editRun(db, amount.id, "Approved", () => "Approved amount is USD 1000.");
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+
+    // A passage over two lines of a TXT: verified when cited, on carry, and exact in the viewer.
+    SNIPPETS.two = "The committee approved the final amount.";
+    const late = `sk-ant-late${crypto.randomUUID().replaceAll("-", "")}`;
+    const two = await upload(
+      f.cookies.owner,
+      c.id,
+      "two.txt",
+      Buffer.from(`Intro ${late} here.\nThe committee approved\nthe final amount.\nOutro.\n`),
+    );
+    await app.fileExtracts!.idle();
+    const t1 = (await send(f.cookies.owner, c.id, `/cite ${two.id} two`, undefined, [two.id])).note!
+      .citations[0]!;
+    expect([t1.status, t1.locator?.line]).toEqual(["verified", 2]);
+    const t2 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect([t2.status, t2.locator]).toEqual(["verified", t1.locator]);
+    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!)).target?.status).toBe("exact");
+
+    // An identical re-extraction (as for a new extractor version — the rows' prefix hashes are cleared): still
+    // verified, still exact.
+    (app.fileExtracts as unknown as { reextract(id: string): void }).reextract(two.id);
+    await app.fileExtracts!.settled(two.id, 10_000);
+    await app.fileExtracts!.idle();
+    const row = db.$client
+      .prepare("SELECT locator FROM citations WHERE file_id = ? AND locator IS NOT NULL")
+      .get(two.id) as { locator: string };
+    expect(JSON.parse(row.locator).textHash).toBeUndefined();
+    const t3 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect([t3.status, t3.locator]).toEqual(["verified", t1.locator]);
+    expect((await viewAt(app, f.cookies.owner, two.id, t3.locator!)).target?.status).toBe("exact");
+
+    // A value of the cited unit masked now (registered later, on another line): the unit is not the one verified.
+    knownSecrets.add(late);
+    closers.push(() => knownSecrets.remove(late));
+    const masked = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect(masked.status).not.toBe("verified");
+    expect((await viewAt(app, f.cookies.owner, two.id, t1.locator!)).target?.status).not.toBe("exact");
+  });
+
+  it("[P2 4차] a cell moved (the same row text, its cell now B1 instead of A1): not verified", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.cell = "첫째 칸에만 있는 문장입니다";
+    const csv = await upload(
+      f.cookies.owner,
+      c.id,
+      "cells.csv",
+      Buffer.from("첫째 칸에만 있는 문장입니다,둘째\n"),
+    );
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${csv.id} cell`, undefined, [csv.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.range]).toEqual(["verified", "A1"]);
+    const seg = db.$client.prepare("SELECT seq, marks FROM file_segments WHERE file_id = ?").get(csv.id) as {
+      seq: number;
+      marks: string;
+    };
+    const marks = JSON.parse(seg.marks) as [number, number, Record<string, unknown>][];
+    // The same text, its first cell now said to be B1 (and the second C1).
+    const moved = marks.map(([a, b, m]) => [
+      a,
+      b,
+      {
+        ...m,
+        ...(m.range === "A1" ? { range: "B1", col: 2 } : m.range === "B1" ? { range: "C1", col: 3 } : {}),
+      },
+    ]);
+    expect(JSON.stringify(moved)).not.toBe(seg.marks);
+    db.$client
+      .prepare("UPDATE file_segments SET marks = ? WHERE file_id = ? AND seq = ?")
+      .run(JSON.stringify(moved), csv.id, seg.seq);
+    touch(db, csv.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
   });
 });

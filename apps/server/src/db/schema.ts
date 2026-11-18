@@ -766,6 +766,12 @@ export const citations = sqliteTable(
      * carried over to a later answer. Rows from before (cut at the old limit before masking) are false: never carried.
      */
     complete: integer("complete", { mode: "boolean" }).notNull().default(false),
+    /**
+     * A verified file citation (#186 review 4차): SHA-256 of the cited unit as it was verified — its whole text and
+     * its marks (`unitHashOf`). A later answer's carried number is verified only while the unit at that place is
+     * still exactly this; the viewer claims the range exact on the same condition.
+     */
+    unitHash: text("unit_hash"),
     createdAt: integer("created_at").notNull().default(now),
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],

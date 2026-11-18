@@ -460,36 +460,15 @@ export function findSnippetAt(
   return { found: false, reason: "not_found" };
 }
 
-/**
- * Every occurrence `findSnippetAt` would accept, in either form (as sent, quotes and all, and without them), in
- * order — a recheck (#186) compares each one's place with the earlier one (a passage repeated inside one unit).
- */
-export function findSnippetMatches(
-  body: string,
-  snippet: string,
-): { quote: string; start: number; end: number }[] {
-  const forms = snippetForms(snippet);
-  if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet) return [];
-  const page = pageOf(body, undefined);
-  const all: { quote: string; start: number; end: number }[] = [];
-  for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped])
-    matchIn(body, page.n, page.d, want, all);
-  return all.sort((x, y) => x.start - y.start);
-}
-
 const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
 const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
-/**
- * The first occurrence of `want` in the page that respects every boundary rule: the original passage and range.
- * With `all`: every such occurrence goes there instead, and the result is undefined.
- */
+/** The first occurrence of `want` in the page that respects every boundary rule: the original passage and range. */
 function matchIn(
   body: string,
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
-  all?: { quote: string; start: number; end: number }[],
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -520,13 +499,11 @@ function matchIn(
       // list that itself ends at a token boundary (`수출이`, `반도체였다`).
       if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     }
-    const m = {
+    return {
       quote: boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet),
       start,
       end,
     };
-    if (!all) return m;
-    all.push(m);
   }
   return undefined;
 }
