@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { onlineManager, QueryClient, QueryObserver } from "@tanstack/react-query";
+import {
+  InfiniteQueryObserver,
+  onlineManager,
+  QueryClient,
+  QueryObserver,
+  type InfiniteData,
+} from "@tanstack/react-query";
 import type { Run } from "@agentlee/shared";
 import { rereadQuery } from "../src/chat/reread.js";
 import {
   forgetReadsAfterEnd,
-  READ_TIMEOUT_MS,
+  nextEnding,
+  pageSignal,
   readMessagesAfterEnd,
   settleEnd,
   type Ending,
@@ -39,23 +46,28 @@ const flush = async (n = 3) => {
  * A messages query on screen: the first read answers at once (`first`); each later one waits for `answer`/`fail`
  * (in order), with the request's signal recorded.
  */
-function screen(first: Pages, cached: Run | null = run("r1")) {
+function screen(first: Pages, cached: Run | null = run("r1"), pageMs?: number) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   qc.setQueryData(["active-run", "c1"], cached);
   const held: { answer: (v: Pages) => void; fail: (e: unknown) => void; signal: AbortSignal }[] = [];
   let reads = 0;
   const observer = new QueryObserver(qc, {
     queryKey: ["messages", "c1"],
-    queryFn: ({ signal }) => {
+    queryFn: ({ signal: own }) => {
+      const signal = pageMs === undefined ? own : pageSignal(own, pageMs);
       if (reads++ === 0) return Promise.resolve(first);
-      return new Promise<Pages>((answer, fail) => held.push({ answer, fail, signal }));
+      return new Promise<Pages>((answer, fail) => {
+        held.push({ answer, fail, signal });
+        // Like fetch: an aborted request rejects.
+        signal.addEventListener("abort", () => fail(signal.reason), { once: true });
+      });
     },
   });
   const unsubscribe = observer.subscribe(() => {});
   let arounds = 0;
   const settle = (
     ending: Ending,
-    readActiveRun = async (): Promise<Run | null> => null,
+    readActiveRun: (c: string, signal: AbortSignal) => Promise<Run | null> = async () => null,
     signal?: AbortSignal,
   ) =>
     settleEnd({
@@ -193,6 +205,28 @@ describe("settling a reply's end (#103 review): one way for every sign of an end
     s.unsubscribe();
   });
 
+  it("the run's state read hangs: given up by its own time limit and the leave signal (tried again), the live reply kept", async () => {
+    const s = screen(pages(["m-r1", "streaming"]));
+    await flush();
+    let seen: AbortSignal | undefined;
+    const hung = (_c: string, signal: AbortSignal) =>
+      new Promise<Run | null>((_, reject) => {
+        seen = signal;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    const ac = new AbortController();
+    const p = s.settle(ofRun1, hung, ac.signal);
+    await flush();
+    s.held[0]!.answer(pages(["m-r1", "complete"]));
+    await flush();
+    expect(seen?.aborted).toBe(false);
+    ac.abort(); // the conversation left: the read goes with it (a hang ends the same way, by its time limit)
+    expect(await p.catch(() => "rejected")).toBe("rejected");
+    expect(seen?.aborted).toBe(true);
+    expect(s.active()?.id).toBe("r1");
+    s.unsubscribe();
+  });
+
   it("the conversation gone (404): nothing to wait for — let go", async () => {
     const s = screen(pages(["m-r1", "streaming"]));
     await flush();
@@ -276,21 +310,52 @@ describe("the read after an end: a real new read, never one that cannot answer (
     unsubscribe();
   });
 
-  it("a hung read is given up after the time limit (the shared read does not stay pinned): the next try reads again", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const s = screen(pages(["m-r1", "streaming"]));
-    await vi.advanceTimersByTimeAsync(0);
+  it("a hung page request fails by its own time limit (the shared read does not stay pinned): the next try reads again", async () => {
+    const s = screen(pages(["m-r1", "streaming"]), run("r1"), 50);
+    await flush();
     const p = readMessagesAfterEnd(s.qc, "c1", "m-r1");
-    const rejected = expect(p).rejects.toThrow(/timeout/);
-    await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS);
-    await rejected;
+    await expect(p).rejects.toBeDefined();
     const again = readMessagesAfterEnd(s.qc, "c1", "m-r1");
     expect(again).not.toBe(p);
-    await vi.advanceTimersByTimeAsync(0);
+    await flush();
     expect(s.reads()).toBe(3);
     s.held[1]!.answer(pages(["m-r1", "complete"]));
     await again;
     s.unsubscribe();
+  });
+
+  it("a long conversation read page by page is not cut short as a whole: each page has its own limit", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    type Page = { items: { id: string; role: string; status: string }[]; nextBefore: number | null };
+    const page = (n: number): Page => ({
+      items: [{ id: `m${n}`, role: "assistant", status: "complete" }],
+      nextBefore: n > 1 ? n - 1 : null,
+    });
+    let slow = false;
+    let reads = 0;
+    const observer = new InfiniteQueryObserver<Page, Error, InfiniteData<Page>, string[], number>(qc, {
+      queryKey: ["messages", "c1"],
+      // A page answers in 60 ms once slow; the limit is 100 ms a page — the 5 pages take 300 ms in all.
+      queryFn: ({ pageParam, signal }) => {
+        reads++;
+        const s = pageSignal(signal, 100);
+        return new Promise<Page>((resolve, reject) => {
+          const t = setTimeout(() => resolve(page(pageParam)), slow ? 60 : 0);
+          s.addEventListener("abort", () => (clearTimeout(t), reject(s.reason)), { once: true });
+        });
+      },
+      initialPageParam: 5,
+      getNextPageParam: (last) => last.nextBefore ?? undefined,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 20));
+    for (let i = 0; i < 4; i++) await observer.fetchNextPage();
+    expect(qc.getQueryData<InfiniteData<Page>>(["messages", "c1"])?.pages).toHaveLength(5);
+    slow = true;
+    reads = 0;
+    await readMessagesAfterEnd(qc, "c1", "m5");
+    expect(reads).toBe(5);
+    unsubscribe();
   });
 
   it("the screen gone while the read is on its way: the request is cancelled (its signal), the read rejects and is forgotten", async () => {
@@ -312,17 +377,38 @@ describe("the read after an end: a real new read, never one that cannot answer (
     expect(readMessagesAfterEnd(s.qc, "c1", "m-r1")).not.toBe(p);
   });
 
-  it("offline (the read paused): never taken as read — it waits, then gives up; the cache still shows the old reply", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  it("offline (the read paused): never taken as read — given up at once (tried again later); the cache still shows the old reply", async () => {
     const s = screen(pages(["m-r1", "streaming"]));
-    await vi.advanceTimersByTimeAsync(0);
+    await flush();
     onlineManager.setOnline(false);
-    const p = readMessagesAfterEnd(s.qc, "c1", "m-r1");
-    const rejected = expect(p).rejects.toThrow();
-    await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS);
-    await rejected;
+    await expect(readMessagesAfterEnd(s.qc, "c1", "m-r1")).rejects.toThrow(/paused/);
     expect(s.reads()).toBe(1); // no read was sent
     expect(s.qc.getQueryData<Pages>(["messages", "c1"])?.pages[0]!.items[0]!.status).toBe("streaming");
     s.unsubscribe();
+  });
+});
+
+describe("which end to settle (#103 review): keyed by run", () => {
+  const e = (runId: string | null, messageId = `m-${runId}`): Ending => ({
+    conversationId: "c1",
+    messageId,
+    runId,
+  });
+  it("a late sign of a run no longer followed (an earlier run's stop answer) is ignored", () => {
+    expect(nextEnding(e("B"), e("A"), "B")).toEqual(e("B"));
+    expect(nextEnding(null, e("A"), "B")).toBeNull();
+  });
+  it("the followed run's own end replaces an older attempt", () => {
+    expect(nextEnding(e("A"), e("B"), "B")).toEqual(e("B"));
+  });
+  it("signs of the same end are one; a sign without a run never replaces one in progress", () => {
+    const cur = e("B");
+    expect(nextEnding(cur, e("B"), "B")).toBe(cur);
+    expect(nextEnding(cur, e(null, "m-x"), "B")).toBe(cur);
+    expect(nextEnding(null, e(null, "m-x"), null)).toEqual(e(null, "m-x"));
+  });
+  it("another conversation's attempt is replaced (that conversation was left)", () => {
+    const other = { conversationId: "c0", messageId: "m", runId: "Z" };
+    expect(nextEnding(other, e("B"), "B")).toEqual(e("B"));
   });
 });

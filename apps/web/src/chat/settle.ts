@@ -21,8 +21,31 @@ export type Ending = { conversationId: string; messageId: string; runId: string 
  */
 export type SettleResult = "final" | "running" | "unfinished";
 
-/** A messages read that never answers (a hung request) is given up after this, so the next try can read again. */
+/** One request (a messages page, the run's state) that never answers is given up after this; the next try reads again. */
 export const READ_TIMEOUT_MS = 10_000;
+/** The settle loop's wait after an unsettled try, doubling up to the cap. */
+export const SETTLE_FIRST_RETRY_MS = 2000;
+export const SETTLE_MAX_RETRY_MS = 30_000;
+
+/** A request's signal with its own time limit added (each messages page; the run's state read here). */
+export function pageSignal(signal: AbortSignal | undefined, ms = READ_TIMEOUT_MS): AbortSignal {
+  const timeout = AbortSignal.timeout(ms);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/**
+ * The ending to settle after a new sign `e`, with `followed` the run in progress the screen follows (or none):
+ * - a sign about a run that is not the one followed (a late stop answer of an earlier run) is ignored;
+ * - one about the followed run replaces an older attempt (its own end is what matters now);
+ * - signs of the same end are one; a sign without a run never replaces one in progress.
+ */
+export function nextEnding(cur: Ending | null, e: Ending, followed: string | null): Ending | null {
+  if (e.runId !== null && followed !== null && e.runId !== followed) return cur;
+  if (!cur || cur.conversationId !== e.conversationId) return e;
+  if (cur.runId === e.runId) return cur;
+  if (e.runId !== null && e.runId === followed) return e;
+  return cur;
+}
 
 const UNFINISHED = new Set<Message["status"]>(["pending", "streaming"]);
 type Pages = InfiniteData<{ items: Message[]; nextBefore: number | null }>;
@@ -56,17 +79,14 @@ export function readMessagesAfterEnd(
     if (!query) return;
     await qc.cancelQueries({ queryKey: key, exact: true });
     const before = query.state.dataUpdateCount;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        qc.refetchQueries({ queryKey: key, exact: true }, { throwOnError: true }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("messages_read_timeout")), READ_TIMEOUT_MS);
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
+    // Each page request has its own time limit (the query's `pageSignal`): a long conversation's pages, read one after
+    // another, are never cut short as a whole. Offline the read is paused and would wait: not read now.
+    const read = qc.refetchQueries({ queryKey: key, exact: true }, { throwOnError: true });
+    if (query.state.fetchStatus === "paused") {
+      void read.catch(() => {});
+      throw new Error("messages_read_paused");
     }
+    await read;
     if (query.state.dataUpdateCount <= before || query.state.status !== "success")
       throw new Error("messages_not_read");
   })().finally(() => {
@@ -154,7 +174,8 @@ export async function settleEnd(o: {
   const final = status === undefined || !UNFINISHED.has(status);
   // The run's state, read after the end too: the composer stays busy until the run is read as ended (the server
   // refuses a send while it is active, #141) — a failed read throws (tried again), the live reply kept.
-  const r = await o.readActiveRun(conversationId, signal);
+  // Bounded like a page, and dropped when the conversation is left: a hung answer fails this try (tried again).
+  const r = await o.readActiveRun(conversationId, pageSignal(signal));
   if (!holds()) return notOurs();
   const running = r !== null && r.endedAt === null;
   if (running && r.id === runId) return final ? "unfinished" : "running"; // saved, still finishing / still going

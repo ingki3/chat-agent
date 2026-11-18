@@ -36,7 +36,16 @@ import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachmen
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { rereadQuery } from "../chat/reread.js";
-import { forgetReadsAfterEnd, settleEnd, type Ending, type SettleResult } from "../chat/settle.js";
+import {
+  forgetReadsAfterEnd,
+  nextEnding,
+  pageSignal,
+  SETTLE_FIRST_RETRY_MS,
+  SETTLE_MAX_RETRY_MS,
+  settleEnd,
+  type Ending,
+  type SettleResult,
+} from "../chat/settle.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -105,8 +114,9 @@ export function ChatPage() {
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
-    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it.
-    queryFn: ({ pageParam, signal }) => conversations.messages(id, pageParam, signal),
+    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it; and each page
+    // has its own time limit (a hung request fails, the read after an end tries again — never the whole list's).
+    queryFn: ({ pageParam, signal }) => conversations.messages(id, pageParam, pageSignal(signal)),
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
@@ -115,11 +125,15 @@ export function ChatPage() {
   // refetch still in flight, `null`) never replaces it — the stream would close and the reply never come.
   const startedHere = useRef<{ id: string; runId: string; at: number } | null>(null);
   // A reply whose end is being settled (#103): every sign of an end marks it, one settle loop handles them all (see
-  // chat/settle.ts). One at a time per conversation; another sign while it settles is the same end or comes back.
+  // chat/settle.ts). Keyed by run (`nextEnding`): a sign about a run no longer followed is ignored; one about the
+  // run followed now replaces an older attempt; signs of the same end are one.
   const [ending, setEnding] = useState<Ending | null>(null);
   const beginEnding = useCallback(
-    (e: Ending) => setEnding((cur) => (cur && cur.conversationId === e.conversationId ? cur : e)),
-    [],
+    (e: Ending) => {
+      const followed = qc.getQueryData<Run | null>(["active-run", e.conversationId]) ?? null;
+      setEnding((cur) => nextEnding(cur, e, followed?.endedAt === null ? followed.id : null));
+    },
+    [qc],
   );
   const active = useQuery({
     queryKey: ["active-run", id],
@@ -178,19 +192,30 @@ export function ChatPage() {
     noRun && (lastAssistant?.status === "pending" || lastAssistant?.status === "streaming")
       ? lastAssistant.id
       : null;
+  // Recorded once (while rendering, as derived state): its attempt then runs to its end — a status that changes
+  // meanwhile (the read after it) never cancels the attempt that found a run (another tab's) before applying it.
+  const [seenUnfinished, setSeenUnfinished] = useState<string | null>(null);
+  const unfinishedKey = unfinishedId ? `${id}\n${unfinishedId}` : null;
+  // (Only while nothing else settles here: that end, once settled, lets this be seen afresh.)
+  if (unfinishedKey && unfinishedKey !== seenUnfinished && ending?.conversationId !== id) {
+    setSeenUnfinished(unfinishedKey);
+    beginEnding({ conversationId: id, messageId: unfinishedId!, runId: null });
+  }
 
-  // The settle loop: a try now, then every 2 s until settled (one at a time); stopped when the conversation is left.
+  // The settle loop: a try now, then again after 2 s, doubling up to 30 s while it stays unsettled (a server that keeps
+  // a reply unfinished with no run is not asked every 2 s forever); one at a time; stopped when the conversation is left.
   const around = useEffectEvent(() => refreshAround());
   const followAgain = useEffectEvent(() => reconnect());
   const marked = ending?.conversationId === id ? ending : null;
   // What is being settled, as plain values (the loop restarts only for another reply or run).
-  const settleMessage = marked ? marked.messageId : unfinishedId;
+  const settleMessage = marked ? marked.messageId : null;
   const settleRun = marked ? marked.runId : null;
   useEffect(() => {
     if (!settleMessage) return;
     const settling: Ending = { conversationId: id, messageId: settleMessage, runId: settleRun };
     const ac = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let wait = SETTLE_FIRST_RETRY_MS;
     const attempt = async () => {
       let r: SettleResult = "unfinished";
       try {
@@ -206,7 +231,8 @@ export function ChatPage() {
       }
       if (ac.signal.aborted) return;
       if (r === "unfinished") {
-        timer = setTimeout(() => void attempt(), 2000);
+        timer = setTimeout(() => void attempt(), wait);
+        wait = Math.min(wait * 2, SETTLE_MAX_RETRY_MS);
         return;
       }
       if (r === "running" && settling.runId !== null && closedRun.current === settling.runId) followAgain();

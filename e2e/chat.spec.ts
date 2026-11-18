@@ -474,6 +474,61 @@ test("opening a conversation as its run ends: messages read before the end, the 
   expect(messageReads).toBeGreaterThan(1);
 });
 
+test("a reply sent from another tab is found and followed even when the read after it still shows the previous reply (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `다른 탭 ${Date.now()}`);
+  const post = (text: string) =>
+    page.request.post(`/api/conversations/${c.id}/messages`, {
+      data: { text },
+      headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+    });
+  // A finished first reply, then "another tab" sends — its run waits at a gate.
+  const first = await post("첫 질문");
+  const firstRun = ((await first.json()) as { run: { id: string } }).run.id;
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${firstRun}`)).json()) as { endedAt: unknown }).endedAt,
+    )
+    .not.toBeNull();
+  const gate = crypto.randomUUID();
+  expect((await post(`/gate ${gate}`)).ok()).toBe(true);
+  // The page reads the new reply as pending but the run as none (its read was answered before the send); the read
+  // after that shows only the previous, finished reply (the new one not in it yet).
+  let messageReads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    if (++messageReads !== 2) return route.continue();
+    const res = await route.fetch();
+    const body = (await res.json()) as { items: { role: string; status: string }[] };
+    // Without the other tab's message and its unfinished reply.
+    const isNew = (m: { role: string; status: string }) =>
+      m.role === "assistant" ? m.status !== "complete" : JSON.stringify(m).includes(`/gate ${gate}`);
+    const items = body.items.filter((m) => !isNew(m));
+    await route.fulfill({ response: res, json: { ...body, items } });
+  });
+  let activeReads = 0;
+  await page.route("**/api/conversations/*/active-run", (route) =>
+    ++activeReads === 1 ? route.fulfill({ json: { run: null } }) : route.continue(),
+  );
+  const streams: string[] = [];
+  page.on("request", (r) => {
+    if (/\/api\/runs\/[^/]+\/events/.test(r.url())) streams.push(r.url());
+  });
+  await page.goto(`/c/${c.id}`);
+  // The run is found by the settle's own read and followed: its stream is opened, ■ 중지 shows.
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible({ timeout: 15_000 });
+  expect(messageReads).toBeGreaterThanOrEqual(2);
+  // (The stream is opened by the effect after that render: its request may come a moment later.)
+  await expect.poll(() => streams.length).toBeGreaterThan(0);
+  await releaseGate(page, baseURL!, gate);
+  await expect(reply(page)).toContainText("끝났어요");
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+});
+
 test.describe("markdown chunk", () => {
   // The service worker serves cached assets itself; block it so the failed request is really the network's.
   test.use({ serviceWorkers: "block" });

@@ -518,25 +518,42 @@ export const defaultScript: FakeScript = (input, memory) => {
   ];
 };
 
-/** Gates of `/gate` runs: waiting ones (resolve) and ones released before anyone waited. */
-const gates = new Map<string, { open: boolean; waiters: (() => void)[] }>();
-const gateOf = (name: string) => {
-  let g = gates.get(name);
-  if (!g) gates.set(name, (g = { open: false, waiters: [] }));
-  return g;
-};
-function releaseGate(name: string): void {
-  const g = gateOf(name);
-  g.open = true;
-  for (const w of g.waiters.splice(0)) w();
+/**
+ * Gates of `/gate` runs: the waiting replies of each name, or a release that came first (then the next wait takes it).
+ * Nothing is kept once used: a release frees its waiters and forgets the name, a stopped reply leaves its gate.
+ */
+const gates = new Map<string, { open: boolean; waiters: Set<() => void> }>();
+export function releaseGate(name: string): void {
+  const g = gates.get(name);
+  if (!g || !g.waiters.size) return void gates.set(name, { open: true, waiters: new Set() });
+  gates.delete(name);
+  for (const w of g.waiters) w();
 }
-const waitGate = (name: string, signal: AbortSignal) =>
+export const waitGate = (name: string, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
-    const g = gateOf(name);
-    if (g.open || signal.aborted) return resolve();
-    g.waiters.push(resolve);
-    signal.addEventListener("abort", () => resolve(), { once: true });
+    const g = gates.get(name);
+    if (g?.open) {
+      gates.delete(name);
+      return resolve();
+    }
+    if (signal.aborted) return resolve();
+    const entry = g ?? { open: false, waiters: new Set<() => void>() };
+    gates.set(name, entry);
+    const done = () => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    };
+    const stop = () => {
+      entry.waiters.delete(done);
+      if (!entry.waiters.size && gates.get(name) === entry) gates.delete(name);
+      resolve();
+    };
+    entry.waiters.add(done);
+    signal.addEventListener("abort", stop, { once: true });
   });
+
+/** How many gate names are held (tests). */
+export const fakeGateCount = () => gates.size;
 
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
