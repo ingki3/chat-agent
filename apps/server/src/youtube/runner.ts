@@ -73,6 +73,8 @@ export type DownloadJob = {
   workdir: string;
   formatId: string;
   proxy: { url: string; port: number };
+  /** Tests only: a lower download limit (default `YOUTUBE_LIMITS.maxBytes`). */
+  maxBytes?: number;
 };
 export type ConvertJob = {
   env: YoutubeEnv;
@@ -296,7 +298,7 @@ export function sandboxedYoutubeRunner(o: { run?: typeof runIsolated } = {}): Yo
             info: f.info,
             out: f.dl,
             formatId: job.formatId,
-            maxBytes: YOUTUBE_LIMITS.maxBytes,
+            maxBytes: job.maxBytes ?? YOUTUBE_LIMITS.maxBytes,
           },
           YOUTUBE_LIMITS.downloadTimeoutMs,
         ),
@@ -310,7 +312,7 @@ export function sandboxedYoutubeRunner(o: { run?: typeof runIsolated } = {}): Yo
       const file = path.join(f.dl, name);
       const bytes = plainFile(file);
       if (bytes === undefined) return { ok: false, code: "youtube_failed" };
-      if (bytes > YOUTUBE_LIMITS.maxBytes) return { ok: false, code: "youtube_too_large" };
+      if (bytes > (job.maxBytes ?? YOUTUBE_LIMITS.maxBytes)) return { ok: false, code: "youtube_too_large" };
       return { ok: true, file, bytes };
     },
     async convert(job, signal) {

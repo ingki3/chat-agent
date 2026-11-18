@@ -19,6 +19,7 @@ import { FileAddCancelledError, FileLimitError, type FileStore } from "../files/
 import { freeBytes } from "../audio/service.js";
 import { folderUsage } from "../python/runner.js";
 import { removeTree } from "../python/service.js";
+import { carriesSecret, urlTexts } from "../secrets/egress.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { storagePaths } from "../storage/paths.js";
 import type { YoutubeState } from "./packages.js";
@@ -61,6 +62,8 @@ export type YoutubeServiceOptions = {
   /** Tests only: replaces the working-folder measurement. */
   measure?: typeof folderUsage;
   slots?: { total: number; perUser: number };
+  /** The `.env` skill secrets (by env name): checked with the registry before the address goes out. */
+  secrets?: Readonly<Record<string, string>>;
 };
 
 export type YoutubeFileOut = { fileId: string; name: string; bytes: number; url: string; kind: "m4a" };
@@ -266,6 +269,12 @@ export class YoutubeAudioFetcher {
     const req = parsed.data as { url: string; start?: number | string; end?: number | string };
     const target = parseYoutubeUrl(req.url);
     if (!target.ok) throw new YoutubeError(target.code);
+    // The one text of the model's that leaves this server: the address built from the id. The egress guard first
+    // (every known secret, the `.env` ones too) — before anything starts (no probe, no proxy, no call counted).
+    if (
+      carriesSecret([...urlTexts(target.url), target.id], { config: Object.values(this.opts.secrets ?? {}) })
+    )
+      throw new YoutubeError("youtube_secret_blocked");
     const start = parsePoint(req.start);
     const end = parsePoint(req.end);
     if (

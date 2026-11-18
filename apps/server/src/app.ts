@@ -711,6 +711,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
           ? () => ({ state: "not_installed", reason: "tests" })
           : () => youtubeState(config.skillPython, config.dataDir, config.audioFfmpeg)),
       proxy: opts.youtube?.proxy ?? (() => youtubeEgress.endpoint()),
+      secrets: config.skillSecrets,
     });
     app.addHook("preClose", async () => {
       youtube.close();

@@ -683,6 +683,51 @@ describe("youtube_audio_fetch: a call (#191)", () => {
     });
   });
 
+  it("a known secret in the video id never goes out: refused before anything runs (review 1)", async () => {
+    // An 11-character secret that is a valid video id (registered like `.env` secrets) — and one only in `.env`.
+    const REG = "sEcReT19100";
+    knownSecrets.add(REG);
+    const s = scripted();
+    const t = await start({ runner: s.runner });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    // Through a run: the secret never reaches yt-dlp (the runtime's tool input is already scrubbed of it).
+    const res = (await t.send(t.f.cookies.owner, c.id, `/youtube https://youtu.be/${REG}`)).results[0]!;
+    expect(res.isError).toBe(true);
+    expect(s.calls.probe).toEqual([]);
+    expect(t.proxies).toEqual([]);
+    expect(JSON.stringify(t.log)).not.toContain(REG);
+    // The service itself refuses it before anything starts — even when it arrives unscrubbed.
+    const direct = scripted();
+    expect(await t.svc(direct.runner).run(await t.scopeOf(c.id), { url: `https://youtu.be/${REG}` })).toEqual(
+      {
+        ok: false,
+        code: "youtube_secret_blocked",
+      },
+    );
+    expect(direct.calls.probe).toEqual([]);
+    const ENV_ONLY = "EnvOnly1910";
+    const s2 = scripted();
+    const yt = new YoutubeAudioFetcher({
+      watchMs: 10,
+      db: t.db,
+      dataDir: t.dataDir,
+      files: () => t.app.files,
+      runner: s2.runner,
+      state: AVAILABLE,
+      proxy: async () => ({ url: "http://127.0.0.1:65000", port: 65000 }),
+      secrets: { SOME_API_KEY: ENV_ONLY },
+    });
+    expect(
+      await yt.run(await t.scopeOf(c.id), { url: `https://www.youtube.com/watch?v=${ENV_ONLY}` }),
+    ).toEqual({
+      ok: false,
+      code: "youtube_secret_blocked",
+    });
+    expect(s2.calls.probe).toEqual([]);
+    // An ordinary id still goes through the same instance.
+    expect(await yt.run(await t.scopeOf(c.id), { url: URL_OK })).toMatchObject({ ok: true });
+  });
+
   it("at most 3 calls per answer; one download per user at a time (youtube_busy)", async () => {
     const t = await start();
     const c = t.app.conversations!.create(t.f.users.owner.id);
@@ -1062,8 +1107,26 @@ class YoutubeDL:
                 "live_status": "not_live", "formats": [{"format_id": "140", "ext": "m4a", "acodec": "mp4a.40.2", "vcodec": "none", "abr": 128, "filesize": os.path.getsize(os.path.join(here, "tone.m4a")), "protocol": "https"}]}
     def download_with_info_file(self, path):
         info = json.load(open(path))
-        assert self.opts["format"] == "140"
         out = self.opts["outtmpl"]["default"].replace("%(ext)s", "m4a")
+        fmt = self.opts["format"]
+        if fmt in ("nolen", "wronglen"):
+            # A response with no length (or a wrong one): 12 MiB in 256 KiB blocks, a progress report after each.
+            part = out + ".part"
+            with open(part, "wb") as f:
+                for i in range(48):
+                    f.write(b"x" * 262144)
+                    f.flush()
+                    for hook in self.opts.get("progress_hooks", []):
+                        hook({"status": "downloading", "downloaded_bytes": (i + 1) * 262144, "tmpfilename": part,
+                              "total_bytes": None if fmt == "nolen" else 1000})
+            os.rename(part, out)
+            return 0
+        if fmt == "oneshot":
+            # One write past the limit with no progress report in between: the kernel's RLIMIT_FSIZE refuses it.
+            with open(out, "wb") as f:
+                f.write(b"x" * (8 * 1048576))
+            return 0
+        assert fmt == "140"
         shutil.copyfile(os.path.join(os.path.dirname(__file__), "tone.m4a"), out)
         return 0
 `;
@@ -1170,11 +1233,166 @@ describe("youtube_audio_fetch: the real fetch.py and ffmpeg in their sandbox (ma
           code,
         });
       }
+      // The download limit holds while the bytes come in — no length, a wrong one, one big write (RLIMIT_FSIZE): stopped,
+      // youtube_too_large, never a file over the limit (review round 1).
+      for (const formatId of ["nolen", "wronglen", "oneshot"]) {
+        const w = makeYoutubeWorkdir(data);
+        await runner.probe({ env, workdir: w, url: URL_OK, proxy });
+        const r = await runner.download({ env, workdir: w, formatId, proxy, maxBytes: 1024 * 1024 });
+        expect(r, formatId).toEqual({ ok: false, code: "youtube_too_large" });
+        const dl = path.join(w, "yt", "dl");
+        for (const n of fs.readdirSync(dl))
+          // The progress check stops within one block of the limit; the one big write is cut by RLIMIT_FSIZE.
+          expect(fs.statSync(path.join(dl, n)).size, `${formatId} ${n}`).toBeLessThanOrEqual(
+            formatId === "oneshot" ? 3 * 1024 * 1024 : 1024 * 1024 + 262144,
+          );
+      }
       // ffmpeg cannot read outside the download folder.
       const w2 = makeYoutubeWorkdir(data);
       expect(
         await runner.convert({ env, workdir: w2, input: path.join(stub, "tone.m4a"), copy: true }),
       ).toEqual({ ok: false, code: "youtube_convert_failed" });
+    },
+  );
+});
+
+// ---- the real pinned yt-dlp against a local fake proxy (TEST_YTDLP_PACKAGES — no network) ------------------------
+
+/**
+ * `TEST_YTDLP_PACKAGES=<a folder where the lock was installed>`: the real yt-dlp downloads from a loopback server that
+ * plays the egress proxy (plain-HTTP media URLs, so it answers the request itself) — a body with no Content-Length,
+ * and metadata whose size is wrong. Before review round 1 the first saved 3 MiB under a 1 MiB limit.
+ */
+const ytdlpPackages = process.env.TEST_YTDLP_PACKAGES;
+const ytdlpIt = ytdlpPackages && realPy?.ok && realFfmpeg?.ok ? it : it.skip;
+describe("youtube_audio_fetch: the real yt-dlp's download limit (TEST_YTDLP_PACKAGES, #191 review 1)", () => {
+  ytdlpIt(
+    "no Content-Length, or a wrong size in the metadata: stopped at the limit, youtube_too_large",
+    async () => {
+      const http = await import("node:http");
+      const pk = fs.realpathSync(ytdlpPackages!);
+      const env: YoutubeEnv = {
+        runtime: (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime,
+        packages: pk,
+        deno: path.join(pk, "bin", "deno"),
+        ffmpeg: (realFfmpeg as { ok: true; ffmpeg: YoutubeEnv["ffmpeg"] }).ffmpeg,
+      };
+      const body = Buffer.alloc(3 * 1024 * 1024, 7);
+      const srv = http.createServer((req, res) => {
+        if (req.url!.includes("nolen")) {
+          res.writeHead(200, { "content-type": "audio/mp4", connection: "close" });
+          res.end(body);
+          return;
+        }
+        res.writeHead(200, { "content-type": "audio/mp4", "content-length": body.length });
+        res.end(body);
+      });
+      await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+      closers.push(() => new Promise((r) => srv.close(r)));
+      const port = (srv.address() as net.AddressInfo).port;
+      const data = path.join(tmp(), "data");
+      const runner = sandboxedYoutubeRunner();
+      for (const kind of ["nolen", "wrongsize"]) {
+        const workdir = makeYoutubeWorkdir(data);
+        const f = youtubeFolders(workdir);
+        for (const d of [f.yt, f.home, path.join(f.home, "tmp"), f.dl]) fs.mkdirSync(d, { recursive: true });
+        fs.writeFileSync(
+          f.info,
+          JSON.stringify({
+            id: VIDEO,
+            title: "t",
+            extractor: "youtube",
+            extractor_key: "Youtube",
+            _type: "video",
+            formats: [
+              {
+                format_id: "140",
+                url: `http://media.test/${kind}.m4a`,
+                ext: "m4a",
+                protocol: "http",
+                vcodec: "none",
+                acodec: "mp4a.40.2",
+                filesize: 100_000,
+              },
+            ],
+          }),
+        );
+        const r = await runner.download({
+          env,
+          workdir,
+          formatId: "140",
+          proxy: { url: `http://127.0.0.1:${port}`, port },
+          maxBytes: 1024 * 1024,
+        });
+        expect(r, kind).toEqual({ ok: false, code: "youtube_too_large" });
+        for (const n of fs.readdirSync(f.dl))
+          expect(fs.statSync(path.join(f.dl, n)).size, `${kind} ${n}`).toBeLessThan(body.length);
+      }
+    },
+  );
+});
+
+// ---- a child that leaves the process group (fork) -----------------------------------------------------------
+
+describe("runIsolated with fork: a child outside the group cannot keep the call open (#191 review 1)", () => {
+  const pyIt = realPy?.ok ? it : it.skip;
+  /** python: fork a child that makes its own session and sleeps holding stdout/stderr; the parent then `rest`s. */
+  const ESCAPE = String.raw`
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    time.sleep(30)
+    os._exit(0)
+open("child.pid", "w").write(str(pid))
+time.sleep(float(sys.argv[1]))
+`;
+  pyIt(
+    "exit, time limit, stop: each ends the call within the drain deadline; the escaped child is reported",
+    async () => {
+      const { FORK_DRAIN_MS, runIsolated } = await import("../src/isolation/sandbox.js");
+      const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
+      const run = async (rest: string, extra: { timeoutMs?: number; signal?: AbortSignal } = {}) => {
+        const cwd = tmp();
+        const t0 = Date.now();
+        const r = await runIsolated({
+          command: py.exe,
+          args: ["-I", "-S", "-B", "-c", ESCAPE, rest],
+          cwd,
+          env: { HOME: cwd },
+          read: [],
+          write: [cwd],
+          trusted: [py.root],
+          fork: true,
+          timeoutMs: extra.timeoutMs ?? 20_000,
+          maxOutputBytes: 1024,
+          ...(extra.signal ? { signal: extra.signal } : {}),
+        });
+        const ms = Date.now() - t0;
+        const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
+        closers.push(() => {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {
+            // gone
+          }
+        });
+        return { r, ms };
+      };
+      // The command exits at once; the escaped child holds the pipes: cut after the drain deadline.
+      const a = await run("0");
+      expect(a.r.killed).toBe("escaped");
+      expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
+      // The time limit: the command is killed with its group, the escaped child still holds the pipes — still ends.
+      const b = await run("30", { timeoutMs: 500 });
+      expect(b.r.killed).toBe("timeout");
+      expect(b.ms).toBeLessThan(500 + FORK_DRAIN_MS + 3000);
+      // A stop after the command exited (during the drain): ends at once.
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 300);
+      const c = await run("0", { signal: ctrl.signal });
+      expect(c.r.killed).toBe("aborted");
+      expect(c.ms).toBeLessThan(FORK_DRAIN_MS);
     },
   );
 });

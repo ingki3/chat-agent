@@ -87,6 +87,11 @@ export const YOUTUBE_CODES = [
   "youtube_memory_limit",
   "youtube_convert_failed",
   "youtube_failed",
+  /**
+   * The address about to go out carries a known secret (the egress guard, #113/#129): nothing runs. Logged as is;
+   * the model is told `youtube_failed` (no oracle for which value is a secret).
+   */
+  "youtube_secret_blocked",
   /** No sandbox here (not macOS), a spawn failure, the egress proxy could not start. */
   "youtube_server_unavailable",
   "youtube_not_installed",

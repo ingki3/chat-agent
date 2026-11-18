@@ -1274,6 +1274,9 @@ export class McpService {
         }
         if (name === YOUTUBE_AUDIO_TOOL.name) {
           const r = await this.callYoutubeTool(input, scope);
+          // The guard's refusal is told to the model as an ordinary failure; the log and the error list keep why.
+          const shown: SkillResult =
+            !r.ok && r.code === "youtube_secret_blocked" ? { ok: false, code: "youtube_failed" } : r;
           logEvent(this.opts.log, r.ok ? "info" : "warn", "youtube.finished", {
             userId: scope.userId,
             conversationId: scope.conversationId,
@@ -1294,7 +1297,7 @@ export class McpService {
               conversationId: scope.conversationId,
               runId: scope.runId,
             });
-          return r;
+          return shown;
         }
         if (name === DOC_CREATE_TOOL.name) {
           const r = await this.callDocTool(input, scope);

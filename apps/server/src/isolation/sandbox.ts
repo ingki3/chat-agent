@@ -81,9 +81,19 @@ export type RunResult = {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
-  /** Why we killed it: a limit, or "monitor" when its memory could not be measured (fail closed). */
-  killed: null | "timeout" | "output" | "memory" | "monitor" | "aborted";
+  /**
+   * Why we killed it: a limit, "monitor" when its memory could not be measured (fail closed), or — `fork` only —
+   * "escaped" when the command exited but something outside its process group (a child that made its own session)
+   * still held its output pipes after `FORK_DRAIN_MS`: the pipes are cut and the run counts as failed.
+   */
+  killed: null | "timeout" | "output" | "memory" | "monitor" | "aborted" | "escaped";
 };
+
+/**
+ * With `fork`: how long the output pipes may stay open after the command exited (and its group was killed) before
+ * they are cut. Only a process that left the group (`setsid`) can hold them that long.
+ */
+export const FORK_DRAIN_MS = 2000;
 
 /** SBPL string literal. Paths are canonicalised first; quotes and backslashes are escaped. */
 const lit = (p: string) => `"${p.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -212,8 +222,33 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
     let bytes = 0;
     let killed: RunResult["killed"] = null;
     let exited = false;
+    let settled = false;
+    let drain: NodeJS.Timeout | undefined;
+    const done = () => {
+      clearTimeout(timer);
+      clearTimeout(drain);
+      clearInterval(monitor);
+      o.signal?.removeEventListener("abort", onAbort);
+    };
+    const settle = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
+      done();
+      resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed });
+    };
+    // `fork` only: the command is gone but its pipes are not closed — cut them and answer now (the time limit, a stop
+    // and the drain deadline all end the call, whatever still holds the other end).
+    const cut = (why: NonNullable<RunResult["killed"]>) => {
+      killed ??= why;
+      for (const st of child.stdio) (st as Duplex | null)?.destroy();
+      settle(child.exitCode, child.signalCode);
+    };
     const kill = (why: NonNullable<RunResult["killed"]>) => {
-      if (killed || exited) return;
+      if (killed || settled) return;
+      if (exited) {
+        if (o.fork) cut(why);
+        return;
+      }
       killed = why;
       try {
         process.kill(-pid, "SIGKILL");
@@ -261,25 +296,24 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
 
     child.on("exit", () => {
       exited = true;
-      clearTimeout(timer);
       clearInterval(monitor);
-      o.signal?.removeEventListener("abort", onAbort);
-      // A child left behind (`fork`) dies with its command: nothing outlives the job, and its pipes close.
-      if (o.fork)
-        try {
-          process.kill(-pid, "SIGKILL");
-        } catch {
-          // the group is already gone
-        }
+      if (!o.fork) return done();
+      // A child left behind (`fork`) dies with its command: nothing outlives the job, and its pipes close. The time
+      // limit and the stop stay armed until they do; a process that left the group cannot keep the call open longer
+      // than the drain deadline.
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // the group is already gone
+      }
+      drain = setTimeout(() => cut("escaped"), FORK_DRAIN_MS);
     });
     child.on("error", (e) => {
-      clearTimeout(timer);
-      clearInterval(monitor);
+      settled = true;
+      done();
       reject(e);
     });
-    child.on("close", (code, signal) =>
-      resolve({ code, signal, stdout: out + outDec.end(), stderr: err + errDec.end(), killed }),
-    );
+    child.on("close", (code, signal) => settle(code, signal));
     child.stdin.end(o.stdin ?? "");
   });
 }

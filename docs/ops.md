@@ -2231,12 +2231,12 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 - `audio_transcribe`와 묶어 쓰려면 그 사용자에게 `audio-transcription`도 켜져 있어야 한다.
 
 ### 48.4 동작과 한도 (`YOUTUBE_LIMITS`, `packages/shared/src/youtube.ts`)
-- **YouTube만.** 주소에서 11자 영상 id만 꺼내 `https://www.youtube.com/watch?v=<id>`로 바꿔 yt-dlp에 준다. `watch?v=`·`youtu.be/`·`/shorts/`·`/embed/`·`/live/`(지난 방송)·`/v/`. 재생목록(`youtube_playlist`), 다른 사이트·채널·검색(`youtube_bad_url`)은 아무것도 실행하지 않고 거절한다.
+- **YouTube만.** 주소에서 11자 영상 id만 꺼내 `https://www.youtube.com/watch?v=<id>`로 바꿔 yt-dlp에 준다. `watch?v=`·`youtu.be/`·`/shorts/`·`/embed/`·`/live/`(지난 방송)·`/v/`. `watch?v=…&list=…`는 그 영상 하나만 받는다(목록은 무시 — 의도). 순수 재생목록(`/playlist?list=`, `v=` 없는 `list=` — `youtube_playlist`), 다른 사이트·채널·검색(`youtube_bad_url`)은 아무것도 실행하지 않고 거절한다. 만든 주소에 알려진 비밀이 들어 있으면(송신 비밀 가드) 역시 아무것도 실행하지 않는다(로그 `youtube_secret_blocked`, 모델에는 `youtube_failed`).
 - **먼저 메타데이터:** 내려받기 전에 길이·라이브 여부·로그인 필요 여부·음성 형식·크기를 본다. 2시간 넘으면 `youtube_too_long`(구간 `start`·`end` — 초나 `H:MM:SS` — 로 2시간 이하를 지정하라는 안내). 라이브·예정·방송 직후 `youtube_live`, 연령 제한·비공개·회원 전용 `youtube_login_required`, 음성 300MB 초과 `youtube_too_large`. 구간을 주면 음성 전체를 받은 뒤 ffmpeg로 자르므로, 긴 영상도 **음성 전체가 300MB 이하**여야 한다.
 - **쿠키·로그인 없음**(`--cookies-from-browser` 안 씀). 봇 확인(`youtube_bot_check` — "로봇 확인을 요구해서 받지 못했어요")이나 로그인 필요 영상은 받지 못한다는 한국어 안내(`hint`)를 모델이 그대로 전한다.
 - **네트워크:** yt-dlp 프로세스는 서버의 egress 프록시(루프백 포트 하나)로만 나가고, 프록시는 `www.youtube.com`·`m.youtube.com`·`youtube.com`·`youtu.be`·`*.googlevideo.com`의 443만 연다(`YOUTUBE_EGRESS_HOSTS`). JS 문제는 고정 deno가 샌드박스 안에서 권한 없이 푼다(GitHub·npm에서 받는 것 없음).
 - **저장:** `youtube-<영상 id>[-<구간>].m4a`(AAC — 원본이 AAC면 그대로 복사, Opus면 AAC 128k로 변환, 메타데이터 제거)를 답 메시지에 연결된 대화 파일로 저장한다(업로드와 같은 저장소·쓰기 잠금·백업, 대화를 지우면 함께 지워짐, 대화당 파일 수 한도 — 넘으면 `youtube_file_limit`). 결과: `fileId`·`file`·`durationSeconds`·`videoId`·`sourceUrl`·`metadata`(제목·채널·업로드 날짜·설명 — `<external_content>` 안 JSON, 영상 올린 사람의 글이라 데이터).
-- **한도:** 메타데이터 2분, 내려받기 20분(yt-dlp + deno 그룹 2GB), 변환 5분·1GB, 호출 전체 30분(`youtube_timeout`), 작업 폴더 700MB·1만 항목(`youtube_disk_limit`), 시작 전 볼륨 여유 1GB, 서버 전체 동시 2개·사용자당 1개(`youtube_busy`), **답변당 3번**(`youtube_quota`). Codex는 이 도구가 있는 실행에 `tool_timeout_sec`를 가장 긴 느린 도구의 한도 + 60초로 준다(이 도구만이면 1860, `audio_transcribe`와 같이면 3660 — `runtime/lockdown.ts`).
+- **한도:** 음성 300MB는 받는 동안에도 지킨다(진행 보고마다 받은 바이트·파일 크기, `RLIMIT_FSIZE` — 응답에 길이가 없거나 메타데이터 크기가 틀려도 `youtube_too_large`). 메타데이터 2분, 내려받기 20분(yt-dlp + deno 그룹 2GB, 그룹을 떠난 자식이 파이프를 쥐어도 2초 뒤 끊고 실패), 변환 5분·1GB, 호출 전체 30분(`youtube_timeout`), 작업 폴더 700MB·1만 항목(`youtube_disk_limit`), 시작 전 볼륨 여유 1GB, 서버 전체 동시 2개·사용자당 1개(`youtube_busy`), **답변당 3번**(`youtube_quota`). Codex는 이 도구가 있는 실행에 `tool_timeout_sec`를 가장 긴 느린 도구의 한도 + 60초로 준다(이 도구만이면 1860, `audio_transcribe`와 같이면 3660 — `runtime/lockdown.ts`).
 - **실행과 함께 멈춘다(§46과 같음):** 250ms마다 실행·토큰·권한·작업 폴더를 보고, 중단 요청이 받아들여지는 순간(토큰 철회) 진행 중인 단계의 프로세스 그룹(yt-dlp와 deno)을 죽이고 작업 폴더 `<DATA_DIR>/youtube-scratch/<uuid>/`를 지운 뒤 슬롯을 놓는다(`youtube_cancelled`). 저장은 쓰기 잠금 안에서 한 번 더 확인한다. 서버 시작 때 남은 작업 폴더도 지운다.
 - **안내문(`common@9`):** 본인 영상이거나 이용 권한이 있는 영상만(전사·요약·개인 보관), 음악·앨범 추출·재배포 금지, 화자별 정리는 `audio_transcribe`로.
 
@@ -2253,6 +2253,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 ### 48.6 로그와 확인
 - 로그는 `youtube.finished` 하나: 도구 이름, 고정 코드(`youtubeCode` — `youtube_ok` 또는 `YOUTUBE_CODES`), 시간, ID. 주소·영상 id·제목·파일 id는 남지 않는다. 실패는 관리자 "스킬 실행 실패"에 도구 이름과 코드로.
 - 시험: `pnpm vitest run apps/server/test/youtube.test.ts` — **가짜 yt-dlp만**(네트워크 없음): 성공·저장·`audio_transcribe` 연결, 봇 확인·로그인·없음·시간 초과, 길이 초과·구간, 라이브·재생목록, 허용 외 호스트(실제 프록시 CONNECT), 중단(토큰 철회)·실행 종료·권한 해제·디스크, 답변당 상한, 청소년 기본 숨김, 프로필. macOS + 독립 실행형 python + ffmpeg에서는 가짜 `yt_dlp` 패키지를 실제 `fetch.py`·샌드박스·ffmpeg로 돌린다(자식 프로세스 포함 바깥 읽기·다른 포트 거부).
+- 고정 yt-dlp 실물의 크기 상한(네트워크 없음 — 로컬 가짜 프록시): `TEST_YTDLP_PACKAGES=<lock을 설치한 폴더> pnpm vitest run apps/server/test/youtube.test.ts -t "real yt-dlp"`.
 - 실제 YouTube 수동 시험(CI 아님, 관리자가 받아도 되는 영상으로):
   ```bash
   YTDLP_LIVE=1 YTDLP_LIVE_DATA_DIR=<pnpm youtube:install을 돌린 DATA_DIR> SKILL_PYTHON=<독립 실행형 3.12> \

@@ -16,9 +16,19 @@ scripts come from the pinned yt-dlp-ejs; deno gets `--no-remote --no-npm`), no p
 its own sandbox afterwards).
 """
 
+import errno
 import json
 import os
+import resource
 import sys
+
+# Room above the download limit for RLIMIT_FSIZE (a part file's last chunk; deno's cache files are small).
+FSIZE_MARGIN = 2 * 1024 * 1024
+
+
+class TooLarge(BaseException):
+    """Raised from the progress hook: a BaseException, so no `except Exception` inside yt-dlp swallows it or
+    retries the download with the page's address."""
 
 # Why yt-dlp failed, from its messages (lower case), first match wins. The bot check comes before the login
 # group: its message also says "sign in".
@@ -230,28 +240,60 @@ def main():
         return {"ok": True, "info": summary(info)}
     if mode == "download":
         out = job["out"]
+        limit = int(job["maxBytes"])
         opts = options(job, log)
+
+        def bounded(d):
+            # Every progress report, whatever the server said the size would be (none, or a wrong one): the bytes
+            # actually received, and the file on disk, never over the limit. yt-dlp's max_filesize alone only
+            # compares the announced length.
+            got = d.get("downloaded_bytes") or 0
+            for key in ("tmpfilename", "filename"):
+                name = d.get(key)
+                if name:
+                    try:
+                        got = max(got, os.path.getsize(name))
+                    except OSError:
+                        pass
+            if got > limit:
+                raise TooLarge()
+
         opts.update(
             {
                 "format": job["formatId"],
                 "outtmpl": {"default": os.path.join(out, "audio.%(ext)s")},
                 "paths": {"home": out, "temp": out},
-                "max_filesize": int(job["maxBytes"]),
+                "max_filesize": limit,
+                "progress_hooks": [bounded],
                 "overwrites": True,
                 "continuedl": False,
                 "http_chunk_size": 10 * 1024 * 1024,
             }
         )
+        # And the kernel's own bound on every file this process (and the deno it starts) writes: a write past it
+        # fails (EFBIG — python ignores SIGXFSZ), even between two progress reports.
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit + FSIZE_MARGIN, limit + FSIZE_MARGIN))
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 rc = ydl.download_with_info_file(job["info"])
+        except TooLarge:
+            return {"ok": False, "error": "youtube_too_large"}
         except Exception as e:
-            return {"ok": False, "error": classify([str(e).lower()] + log.lines[::-1])}
+            text = str(e).lower()
+            if (isinstance(e, OSError) and e.errno == errno.EFBIG) or "file too large" in text:
+                return {"ok": False, "error": "youtube_too_large"}
+            return {"ok": False, "error": classify([text] + log.lines[::-1])}
         names = sorted(n for n in os.listdir(out) if n.startswith("audio.") and not n.endswith(".part"))
         if rc != 0 or len(names) != 1:
-            # yt-dlp returns without a file (and without an error) when the file is over max_filesize.
+            # yt-dlp returns without a file (and without an error) when the file is over max_filesize; a failed
+            # write past RLIMIT_FSIZE is reported as an error message.
+            if any("file too large" in t or "errno 27" in t for t in log.lines):
+                return {"ok": False, "error": "youtube_too_large"}
             return {"ok": False, "error": classify(log.lines[::-1])}
-        return {"ok": True, "file": names[0], "bytes": os.path.getsize(os.path.join(out, names[0]))}
+        size = os.path.getsize(os.path.join(out, names[0]))
+        if size > limit:
+            return {"ok": False, "error": "youtube_too_large"}
+        return {"ok": True, "file": names[0], "bytes": size}
     return {"ok": False, "error": "youtube_bad_input"}
 
 
