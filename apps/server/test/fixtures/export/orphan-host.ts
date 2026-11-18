@@ -1,7 +1,7 @@
 /**
  * Orphan check (#170): starts one render through a real launcher (argv[2]: `fake` = the stand-in that ignores pipe
  * EOF under the unsandboxed launcher, `real` = the headless shell under the production launcher, on a document whose
- * infinite loop is started over DevTools and confirmed running), prints its process group, members and folder as one
+ * infinite loop is started over DevTools and confirmed entered by a binding event), prints its process group, members and folder as one
  * JSON line once that is so, then waits. The test (`artifact-export.test.ts`) SIGKILLs this process and checks the
  * watchdog cleans up without it.
  */
@@ -22,6 +22,8 @@ const real = process.argv[2] === "real";
 const base: Launcher = real && process.platform === "darwin" ? sandboxedLauncher : unsandboxedLauncher;
 let pgid = 0;
 let workDir = "";
+let entered: () => void = () => {};
+const spinning = new Promise<void>((r) => (entered = r));
 
 /** Reports once the group has the watchdog and the browser (polled, bounded by the test's own timeout). */
 async function report(extra: Record<string, unknown> = {}) {
@@ -53,19 +55,20 @@ const r = new Renderer({
   },
   test: real
     ? {
-        // The page has loaded and runs its script; then its loop is started and the browser is seen busy in it (a
-        // second evaluation cannot be answered while the loop runs).
+        // `spin()` first calls a DevTools binding, then loops: the host reports (and is killed) only once the
+        // binding's event has arrived — the loop has been entered, not merely scheduled.
+        events: (method, params) => {
+          if (method === "Runtime.bindingCalled" && params.name === "spinStarted") entered();
+        },
         afterLoad: async (send) => {
+          await send("Runtime.addBinding", { name: "spinStarted" });
           const ready = (await send("Runtime.evaluate", { expression: "typeof spin" })) as {
             result?: { value?: unknown };
           };
           if (ready.result?.value !== "function") throw new Error("document not running");
           await send("Runtime.evaluate", { expression: "setTimeout(spin, 0); 1" });
-          const answered = await Promise.race([
-            send("Runtime.evaluate", { expression: "2" }).then(() => true),
-            new Promise<false>((res) => setTimeout(() => res(false), 1000)),
-          ]);
-          await report({ spinning: !answered });
+          await spinning;
+          await report({ spinning: true });
           await new Promise(() => {}); // never returns: the render stays in flight
         },
       }
@@ -77,6 +80,6 @@ const r = new Renderer({
 const doc = exportDocument(
   "html",
   "t",
-  "<!doctype html><p>spin</p><script>window.spin = () => { for (;;) {} };</script>",
+  "<!doctype html><p>spin</p><script>window.spin = () => { spinStarted('in'); for (;;) {} };</script>",
 )!;
 await r.render({ format: "pdf", doc, scripts: true });

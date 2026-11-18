@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ARTIFACT_EXPORTS, type ArtifactKind } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
@@ -18,8 +18,11 @@ import {
   findBrowser,
   liveRenderCount,
   parseMessage,
+  makeRenderDir,
   removeRenderDir,
   renderLockPath,
+  SWEEP_PL,
+  startRenderSweeps,
   rendererSandbox,
   sandboxedLauncher,
   sweepRenderDirs,
@@ -671,9 +674,9 @@ afterEach(() => {
 
 const FAKE = () => [path.join(FIXTURES, "fake-browser.mjs"), "orphan"];
 const freshRenderDir = () => {
-  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-render-")));
-  closers.push(async () => removeRenderDir(d));
-  return d;
+  const d = makeRenderDir(os.tmpdir());
+  closers.push(async () => removeRenderDir(d.workDir, d.lock));
+  return d.workDir;
 };
 
 describe("the browser never outlives its owner (#170)", () => {
@@ -906,10 +909,13 @@ describe("the browser never outlives its owner (#170)", () => {
     for (const d of [heldLock, busy]) fs.utimesSync(d, old, old);
 
     // Without lsof (Linux CI) a folder with no lock is never judged unused: only the free lock goes.
-    expect(await sweepRenderDirs(root, 600)).toBe(lsof ? 2 : 1);
+    expect((await sweepRenderDirs(root, { graceSec: 600 })).removed).toBe(lsof ? 2 : 1);
     expect(fs.existsSync(freeLock)).toBe(false);
     expect(fs.existsSync(renderLockPath(freeLock))).toBe(false);
     expect(fs.existsSync(noLock)).toBe(!lsof);
+    // The lock the sweep made for a lock-less folder it kept is gone again; a held one stays the holder's.
+    expect(fs.existsSync(renderLockPath(noLock))).toBe(false);
+    expect(fs.existsSync(renderLockPath(busy))).toBe(false);
     for (const d of [heldLock, fresh, other, odd, busy, linkedLock]) expect(fs.existsSync(d), d).toBe(true);
     expect(fs.existsSync(renderLockPath(heldLock))).toBe(true);
     expect(fs.lstatSync(path.join(root, "agentlee-render-ffffff")).isSymbolicLink()).toBe(true);
@@ -921,12 +927,174 @@ describe("the browser never outlives its owner (#170)", () => {
       process.kill(-p.pid!, "SIGKILL");
       expect(await gone(p.pid!, 2000)).toBe(true);
     }
-    expect(await sweepRenderDirs(root, 600)).toBe(lsof ? 2 : 1);
+    expect((await sweepRenderDirs(root, { graceSec: 600 })).removed).toBe(lsof ? 2 : 1);
     expect(fs.existsSync(heldLock)).toBe(false);
     expect(fs.existsSync(busy)).toBe(!lsof);
     expect(fs.existsSync(linkedLock)).toBe(true);
-    expect(await sweepRenderDirs(path.join(root, "none"), 600)).toBe(0);
+    await expect(sweepRenderDirs(path.join(root, "none"), { graceSec: 600 })).resolves.toEqual({
+      removed: 0,
+    });
   }, 60_000);
+  /** A root with old lock-less render folders, and stand-in lsof programs (each logs its pid). */
+  function sweepBed(names: string[]) {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-sweep-")));
+    const bin = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-sweep-bin-")));
+    closers.push(async () => {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(bin, { recursive: true, force: true });
+    });
+    const old = new Date(Date.now() - 3600_000);
+    const dirs = names.map((n) => {
+      const d = path.join(root, `agentlee-render-${n}`);
+      fs.mkdirSync(path.join(d, "profile"), { recursive: true });
+      fs.utimesSync(d, old, old);
+      return d;
+    });
+    const log = path.join(bin, "log");
+    const tool = (name: string, body: string) => {
+      const f = path.join(bin, name);
+      fs.writeFileSync(f, `#!/bin/sh\necho $$ >> '${log}'\n${body}\n`, { mode: 0o755 });
+      return f;
+    };
+    const logged = () =>
+      fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(Number) : [];
+    const locks = () => fs.readdirSync(root).filter((n) => n.endsWith(".lock"));
+    return { root, dirs, tool, logged, locks };
+  }
+
+  it("sweep and lsof: a hung, warning or failing lsof keeps that folder (bounded) and the sweep goes on; silence removes it", async () => {
+    const bed = sweepBed(["aaaaaa", "bbbbbb"]);
+    const hang = bed.tool("hang", "exec /bin/sleep 30");
+    const started = Date.now();
+    expect(await sweepRenderDirs(bed.root, { lsof: hang, lsofSec: 1 })).toEqual({ removed: 0 });
+    expect(Date.now() - started).toBeLessThan(5000); // two candidates, one second each at most
+    expect(bed.logged()).toHaveLength(2);
+    for (const pid of bed.logged()) expect(alive(pid)).toBe(false);
+    for (const tool of [
+      bed.tool("warn", "echo 'lsof: WARNING: can not stat()'; exit 1"),
+      bed.tool("used", "echo 'COMMAND PID'; exit 0"),
+      bed.tool("denied", "exit 2"),
+    ])
+      expect(await sweepRenderDirs(bed.root, { lsof: tool })).toEqual({ removed: 0 });
+    for (const d of bed.dirs) expect(fs.existsSync(d)).toBe(true);
+    expect(bed.locks()).toEqual([]);
+    // lsof that positively finds no one (exit 1, no output): both go (this runs on Linux too).
+    expect(await sweepRenderDirs(bed.root, { lsof: bed.tool("none", "exit 1") })).toEqual({ removed: 2 });
+    expect(bed.locks()).toEqual([]);
+  }, 60_000);
+
+  it("sweep budget: past it the sweep stops between folders and the next one resumes after the last it judged", async () => {
+    const bed = sweepBed(["aaaaaa", "bbbbbb", "cccccc"]);
+    const none = bed.tool("none", "exit 1");
+    // A budget of 0: exactly one folder per sweep.
+    const r1 = await sweepRenderDirs(bed.root, { lsof: none, budgetSec: 0 });
+    expect(r1).toEqual({ removed: 1, next: "agentlee-render-aaaaaa" });
+    const r2 = await sweepRenderDirs(bed.root, { lsof: none, budgetSec: 0, after: r1.next! });
+    expect(r2).toEqual({ removed: 1, next: "agentlee-render-bbbbbb" });
+    // Resuming after "bbbbbb": "cccccc" (the only one left) is judged first, and the sweep is done.
+    expect(await sweepRenderDirs(bed.root, { lsof: none, after: r2.next! })).toEqual({ removed: 1 });
+    for (const d of bed.dirs) expect(fs.existsSync(d)).toBe(false);
+  }, 60_000);
+
+  it("sweep budget: resuming wraps around, so folders before the resume point are judged too", async () => {
+    const bed = sweepBed(["aaaaaa", "cccccc"]);
+    const none = bed.tool("none", "exit 1");
+    expect(await sweepRenderDirs(bed.root, { lsof: none, after: "agentlee-render-bbbbbb" })).toEqual({
+      removed: 2,
+    });
+  }, 30_000);
+
+  it("sweep lifetime: stopping the server's sweeps kills and awaits the running one (lsof included)", async () => {
+    const bed = sweepBed(["aaaaaa"]);
+    const hang = bed.tool("hang", "exec /bin/sleep 30");
+    const stop = startRenderSweeps(bed.root, 3600_000, { lsof: hang, lsofSec: 30 });
+    expect(await within(10_000, () => bed.logged().length === 1)).toBe(true);
+    const started = Date.now();
+    await stop();
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(await within(2000, () => !alive(bed.logged()[0]!))).toBe(true);
+    expect(fs.existsSync(bed.dirs[0]!)).toBe(true);
+    // Killed while holding the lock it made: that lock is marked as the sweep's, so the folder is still judged as
+    // lock-less next time — lsof must positively find no one (here it does not), and the mark is cleared.
+    expect(bed.locks()).toEqual(["agentlee-render-aaaaaa.lock"]);
+    expect((await sweepRenderDirs(bed.root, { lsof: bed.tool("used", "echo x; exit 0") })).removed).toBe(0);
+    expect(fs.existsSync(bed.dirs[0]!)).toBe(true);
+    expect(bed.locks()).toEqual([]);
+  }, 60_000);
+
+  it("sweep owner: when its owner's pipe closes, the sweep stops before the next folder", async () => {
+    const bed = sweepBed(["aaaaaa", "bbbbbb", "cccccc"]);
+    const slow = bed.tool("slow", "/bin/sleep 1; exit 0"); // "in use": keeps each folder
+    const perl = spawn(
+      "/usr/bin/perl",
+      ["-e", SWEEP_PL, bed.root, "600", slow, String(process.pid), "-", "45", "5"],
+      {
+        detached: true,
+        stdio: ["pipe", "pipe", "ignore"],
+      },
+    );
+    startedGroups.add(perl.pid!);
+    let out = "";
+    perl.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    const exited = new Promise<void>((r) => perl.once("exit", () => r()));
+    expect(await within(10_000, () => bed.logged().length === 1)).toBe(true);
+    perl.stdin.end(); // the owner is gone
+    await exited;
+    expect(await gone(perl.pid!, 2000)).toBe(true);
+    expect(out).toBe("0 -\n");
+    expect(bed.logged()).toHaveLength(1);
+    for (const d of bed.dirs) expect(fs.existsSync(d)).toBe(true);
+    expect(bed.locks()).toEqual([]);
+  }, 30_000);
+
+  it("render folders: the lock beside it is created exclusively, and only that very file is ever unlinked", () => {
+    const d = makeRenderDir(os.tmpdir());
+    const lockPath = renderLockPath(d.workDir);
+    closers.push(async () => {
+      removeRenderDir(d.workDir, d.lock);
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    });
+    expect(fs.lstatSync(lockPath).isFile()).toBe(true);
+    expect(fs.lstatSync(lockPath).ino).toBe(d.lock.ino);
+    // Something else now stands at the lock's path (a folder with a file): it is not removed with the render.
+    fs.unlinkSync(lockPath);
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, "keep"), "synthetic");
+    removeRenderDir(d.workDir, d.lock);
+    expect(fs.existsSync(d.workDir)).toBe(false);
+    expect(fs.readFileSync(path.join(lockPath, "keep"), "utf8")).toBe("synthetic");
+  });
+
+  it("a browser's own exit code ≥ 126 after a good render is not a watchdog failure: no kill of its group", async () => {
+    let pgid = 0;
+    const launcher: Launcher = (s) => {
+      const l = unsandboxedLauncher(s);
+      pgid = l.child.pid!;
+      startedGroups.add(pgid);
+      return l;
+    };
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher,
+      egress: spyEgress().egress,
+      limits: { settleMs: 0 },
+      test: {
+        args: () => [path.join(FIXTURES, "fake-browser.mjs"), "ok-130"],
+        probe: async () => [{ pid: 1, rss: 1 }],
+      },
+    });
+    closers.push(() => r.close());
+    const kill = vi.spyOn(process, "kill");
+    try {
+      const res = await r.render(job("markdown", "x", "pdf"));
+      expect(res.ok).toBe(true);
+      await new Promise((done) => setTimeout(done, 300)); // the watchdog's exit is handled by now
+      expect(kill.mock.calls.filter(([p]) => p === -pgid)).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(await gone(pgid, 2000)).toBe(true);
+  }, 30_000);
 });
 
 describe("the production launcher's sandbox policy (checked on every platform)", () => {

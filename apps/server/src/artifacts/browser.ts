@@ -122,14 +122,69 @@ const pipes = (child: ChildProcess): Launched => ({
 export const RENDER_DIR_PREFIX = "agentlee-render-";
 /**
  * The render's lock file: **beside** its folder (`<folder>.lock`, in the temp folder the browser cannot write — the
- * sandbox writes only the folder itself), so the browser can neither remove nor replace it. Held (flock) by the
- * watchdog and, inherited, by the browser while either lives.
+ * sandbox writes only the folder itself), so the browser can neither remove nor replace it. Created by the server
+ * (`makeRenderDir`, exclusively), held (flock) by the watchdog and, inherited, by the browser while either lives.
  */
 export const renderLockPath = (workDir: string) => `${workDir}.lock`;
+/** Device + inode of the lock file a render created: only that very file is ever unlinked. */
+export type LockId = { dev: number; ino: number };
+export type RenderDir = { workDir: string; lock: LockId };
 /** Upper bound of the watchdog's own clock (monotonic), whatever the caller asks. */
 export const WATCHDOG_MAX_SEC = 120;
+/** Watchdog exit codes after it reaped the browser and cleaned up: it ended by itself / the watchdog stopped it. */
+export const WATCHDOG_DONE = 0;
+export const WATCHDOG_STOPPED = 3;
+/** Watchdog exit code when it could not start the browser at all (bad arguments, no lock, no fork). */
+export const WATCHDOG_NOT_STARTED = 127;
 const PERL = "/usr/bin/perl";
 const LSOF = "/usr/sbin/lsof";
+
+/**
+ * A fresh render folder (`mkdtemp`, our prefix) and its lock file beside it, created with
+ * `O_CREAT | O_EXCL | O_NOFOLLOW` — never an object that was already there. On a name conflict (a lock file left
+ * from an older folder of the same name) the folder is dropped and another name is tried.
+ */
+export function makeRenderDir(parent: string): RenderDir {
+  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  for (let i = 0; i < 5; i++) {
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(parent, RENDER_DIR_PREFIX)));
+    let fd: number;
+    try {
+      fd = fs.openSync(renderLockPath(workDir), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (e) {
+      fs.rmdirSync(workDir);
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw e;
+    }
+    try {
+      const st = fs.fstatSync(fd);
+      return { workDir, lock: { dev: st.dev, ino: st.ino } };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  throw new Error("no free render folder name");
+}
+
+/**
+ * Removes a render folder, and its lock file only when it is still the regular file this render created (same device
+ * and inode) — `unlink`, never a recursive delete. Best effort: the sweep removes what is left.
+ */
+export function removeRenderDir(workDir: string, lock?: LockId) {
+  try {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+  if (!lock) return;
+  const p = renderLockPath(workDir);
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isFile() && st.dev === lock.dev && st.ino === lock.ino) fs.unlinkSync(p);
+  } catch {
+    // gone already (the watchdog removes it), or not ours to remove
+  }
+}
 
 /**
  * The render watchdog (#170) — a small Perl process **outside** the server that starts the browser as its own child
@@ -137,30 +192,35 @@ const LSOF = "/usr/sbin/lsof";
  * (`detached`); the browser is forked into that same group, gets fd 3/4 (the debugging pipe) and nothing else of
  * the watchdog. The watchdog's stdin is a pipe the server holds and never writes: the kernel closes it when the
  * server dies, however it dies (SIGKILL included), and EOF there — or a changed parent pid — means the owner is gone:
- * the browser is killed (SIGKILL, reaped), the whole group killed. A cap on the monotonic clock (`deadlineSec`, at
- * most `WATCHDOG_MAX_SEC` — a changed wall clock does not move it) kills it even while the server lives but stopped
- * doing so itself (a blocked event loop). However the browser ends — by itself (after the server has its bytes over
- * the pipe and asked it to close), killed, or orphaned — the watchdog removes the render folder (our name only, a
- * real folder) and its lock file before it exits: the server dying right after a render leaves nothing behind.
- * The flocked lock file (`renderLockPath`) is inherited by the browser: the lock is free only once both are gone —
- * the proof the sweep (`sweepRenderDirs`) needs. A watchdog killed by itself is the server's to clean up (`export.ts`:
- * an abnormal watchdog exit kills what is left of its group).
+ * the browser is killed (SIGKILL, reaped). A cap on the monotonic clock (`deadlineSec`, at most `WATCHDOG_MAX_SEC` —
+ * a changed wall clock does not move it) stops it even while the server lives but stopped doing so itself (a blocked
+ * event loop). However the browser ends — by itself (after the server has its bytes over the pipe and asked it to
+ * close), killed, or orphaned — the watchdog then kills anything else left in its group, removes the render folder
+ * (our name only, a real folder) and unlinks the lock file (only the very file it locked), and exits with its **own**
+ * status — `WATCHDOG_DONE` or `WATCHDOG_STOPPED`, never the browser's: any other end (a signal) means the watchdog
+ * itself was interrupted, and the server kills what is left of the group (`export.ts`).
+ * The lock file is the one the server created (`makeRenderDir`); the watchdog opens it without creating or following
+ * anything, checks it is a regular file of ours and flocks it; the browser inherits it, so the lock is free only once
+ * both are gone — the proof the sweep (`sweepRenderDirs`) needs.
  * argv: <owner pid> <deadline sec> <render folder> <command…>
  */
 export const WATCHDOG_PL = String.raw`use strict; use POSIX (); use Errno ();
-use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC O_WRONLY O_CREAT O_NOFOLLOW);
+use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC O_WRONLY O_NOFOLLOW);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC); use File::Path ();
 my ($owner, $max, $dir, @cmd) = @ARGV;
-POSIX::_exit(127) unless defined $dir && @cmd && $owner =~ /\A[0-9]{1,10}\z/ && $max =~ /\A[0-9]{1,4}\z/;
+my $NOT_STARTED = ${WATCHDOG_NOT_STARTED};
+POSIX::_exit($NOT_STARTED) unless defined $dir && @cmd && $owner =~ /\A[0-9]{1,10}\z/ && $max =~ /\A[0-9]{1,4}\z/;
 $max = ${WATCHDOG_MAX_SEC} if $max > ${WATCHDOG_MAX_SEC};
 my $ours = $dir =~ m{/${RENDER_DIR_PREFIX}[A-Za-z0-9]{6}\z} && -d $dir && !-l $dir;
-sysopen(my $lock, "$dir.lock", O_WRONLY | O_CREAT | O_NOFOLLOW, 0600) or POSIX::_exit(127);
-flock($lock, LOCK_EX | LOCK_NB) or POSIX::_exit(127);
+sysopen(my $lock, "$dir.lock", O_WRONLY | O_NOFOLLOW) or POSIX::_exit($NOT_STARTED);
+my @lk = stat($lock);
+POSIX::_exit($NOT_STARTED) unless @lk && -f _ && $lk[4] == $<;
+flock($lock, LOCK_EX | LOCK_NB) or POSIX::_exit($NOT_STARTED);
 my $fl = fcntl($lock, F_GETFD, 0);
-POSIX::_exit(127) unless defined $fl && fcntl($lock, F_SETFD, $fl & ~FD_CLOEXEC);
+POSIX::_exit($NOT_STARTED) unless defined $fl && fcntl($lock, F_SETFD, $fl & ~FD_CLOEXEC);
 $SIG{PIPE} = "IGNORE";
 my $pid = fork();
-POSIX::_exit(127) unless defined $pid;
+POSIX::_exit($NOT_STARTED) unless defined $pid;
 if ($pid == 0) {
   open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
   exec { $cmd[0] } @cmd;
@@ -169,18 +229,26 @@ if ($pid == 0) {
 POSIX::close(3); POSIX::close(4);
 chdir("/");    # File::Path will not remove the current folder (the browser's cwd is the render folder)
 my $t0 = clock_gettime(CLOCK_MONOTONIC);
-my $clean = sub { if ($ours && -d $dir && !-l $dir) { File::Path::remove_tree($dir); } unlink("$dir.lock"); };
-my $stop = sub {
-  kill("KILL", $pid); waitpid($pid, 0);
-  $clean->();
-  kill("KILL", -$$) if getpgrp() == $$;
-  POSIX::_exit(137);
+my $done = sub {
+  my ($code) = @_;
+  # Anything else the browser left in our group (it cannot fork in the sandbox; this is the backstop).
+  my $pp;
+  if (getpgrp() == $$ && ($pp = open(my $ps, "-|", "/bin/ps", "-o", "pid=", "-g", $$))) {
+    my @left = grep { $_ != $$ && $_ != $pp } map { /([0-9]+)/ ? $1 : () } <$ps>;
+    close($ps);
+    kill("KILL", @left) if @left;
+  }
+  File::Path::remove_tree($dir) if $ours && -d $dir && !-l $dir;
+  my @now = lstat("$dir.lock");
+  unlink("$dir.lock") if @now && -f _ && $now[0] == $lk[0] && $now[1] == $lk[1];
+  POSIX::_exit($code);
 };
+my $stop = sub { kill("KILL", $pid); waitpid($pid, 0); $done->(${WATCHDOG_STOPPED}); };
 $SIG{$_} = $stop for qw(TERM INT HUP);
 $SIG{CHLD} = sub { };
 while (1) {
   my $g = waitpid($pid, POSIX::WNOHANG());
-  if ($g == $pid) { my $st = $?; $clean->(); POSIX::_exit(($st & 127) ? 128 + ($st & 127) : $st >> 8); }
+  $done->(${WATCHDOG_DONE}) if $g == $pid;
   $stop->() if $g < 0 || getppid() != $owner;
   $stop->() if clock_gettime(CLOCK_MONOTONIC) - $t0 > $max;
   my $rin = ""; vec($rin, 0, 1) = 1;
@@ -247,28 +315,24 @@ export const unsandboxedLauncher: Launcher = (s) => {
 };
 
 /**
- * Same-uid renders still running in this process: process group (the watchdog's pid) → render folder.
+ * Same-uid renders still running in this process: process group (the watchdog's pid) → render folder and lock.
  * `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in
  * `index.ts`; the tests' `afterAll`).
  */
-const liveRenders = new Map<number, string>();
+const liveRenders = new Map<number, RenderDir>();
 
-/** Records a running render; the returned function forgets it (call it once its process has exited). */
-export function trackRender(pgid: number, workDir: string): () => void {
-  liveRenders.set(pgid, workDir);
-  return () => {
-    if (liveRenders.get(pgid) === workDir) liveRenders.delete(pgid);
+/**
+ * Records a running render. `untrack` forgets it (once its process has exited); `tracked` says whether it is still
+ * on record — false once `killLiveRenders` has killed its group (nothing more to kill then).
+ */
+export function trackRender(pgid: number, dir: RenderDir) {
+  liveRenders.set(pgid, dir);
+  return {
+    tracked: () => liveRenders.get(pgid) === dir,
+    untrack: () => {
+      if (liveRenders.get(pgid) === dir) liveRenders.delete(pgid);
+    },
   };
-}
-
-/** Removes a render folder and its lock file (best effort: the sweep removes what is left). */
-export function removeRenderDir(workDir: string) {
-  for (const p of [workDir, renderLockPath(workDir)])
-    try {
-      fs.rmSync(p, { recursive: true, force: true });
-    } catch {
-      // best effort
-    }
 }
 
 /** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
@@ -280,7 +344,7 @@ export function killLiveRenders(): number {
     } catch {
       // already gone
     }
-    removeRenderDir(dir);
+    removeRenderDir(dir.workDir, dir.lock);
   }
   liveRenders.clear();
   return n;
@@ -290,136 +354,252 @@ export function killLiveRenders(): number {
 export const liveRenderCount = () => liveRenders.size;
 
 /**
- * Folders younger than this are never swept: the moment between `mkdtemp` and the watchdog taking the lock (and far
- * past `WATCHDOG_MAX_SEC`). The server sweeps at start and again every `SWEEP_GRACE_SEC` (`startRenderSweeps`), so a
- * folder too young at one sweep is looked at again once it is old enough.
+ * Folders younger than this are never swept (far past `WATCHDOG_MAX_SEC`; the moment between `mkdtemp` and the
+ * watchdog taking the lock). The server sweeps at start and again every `SWEEP_GRACE_SEC` (`startRenderSweeps`), so
+ * a folder too young at one sweep is looked at again once it is old enough.
  */
 export const SWEEP_GRACE_SEC = 600;
+/** One sweep's time budget: past it the sweep stops and the next one resumes after the last folder it judged. */
+export const SWEEP_BUDGET_SEC = 45;
+/** One `lsof` run (one folder): past it that folder is kept and the sweep goes on. */
+export const SWEEP_LSOF_SEC = 5;
 
 /**
  * The sweep: removes `agentlee-render-XXXXXX` folders (our prefix only, real folders of our uid — no symlinks) in
  * `root`, older than `graceSec`, whose owner is provably gone. Evidence, from the kernel or from where the browser
  * cannot write:
- *  - the lock file beside the folder (`renderLockPath`): a real file of ours, the same file (device + inode) before
- *    and after it is opened (no symlink followed) and locked — a held lock keeps the folder; and
- *  - `lsof +D` (the kernel's view of every process of ours): no process has a file or its cwd under the folder.
- * A folder with a free lock is removed unless lsof shows a user. A folder **without** a lock file (a render from
+ *  - the lock file beside the folder (`renderLockPath`): a regular file of ours, the same file (device + inode)
+ *    before and after it is opened (no symlink followed) and locked — a held lock keeps the folder. A folder with no
+ *    lock file gets one: the sweep **creates** it exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`, as the server does
+ *    for a new render), marks it as its own and locks it, so no one can start using the folder under it (a sweep
+ *    that died holding one leaves a marked lock: still judged as lock-less); and
+ *  - `lsof +D` (the kernel's view of every process of ours), run **while the sweep holds the lock**: no process has
+ *    a file or its cwd under the folder.
+ * A folder with a free lock is removed unless lsof shows a user. A folder that had **no** lock file (a render from
  * before the watchdog, or a server that died between `mkdtemp` and the watchdog) only when lsof positively shows
- * none — no lsof (Linux), an lsof error or warning, or any output keeps it. Any lookup error keeps it too. The folder
- * removed is checked to be the one judged (device + inode). Lock files left without a folder are removed when free.
- * No process is killed: nothing is matched by name. Prints the count of folders removed.
+ * none — no lsof (Linux), an lsof error, warning, signal or time-out (`SWEEP_LSOF_SEC`), or any output keeps it (and
+ * the lock the sweep made is unlinked again). Any lookup error keeps it too. The folder removed is checked to be the
+ * one judged (device + inode); the lock is held until the folder is gone and only the very file locked is unlinked.
+ * Lock files left without a folder are removed when free. No process is killed: nothing is matched by name.
+ *
+ * Bounded by itself, not only by the server: a budget (`SWEEP_BUDGET_SEC`, monotonic) after which it stops between
+ * folders and prints where it got to (the next sweep resumes after it), an alarm a little past that which kills its
+ * own group (lsof included), and its owner: stdin is a pipe the server holds — EOF (the server gone or cancelling) or
+ * a changed parent pid stops it before the next folder.
+ * argv: <root> <grace sec> <lsof> <owner pid> <resume after name or -> <budget sec> <lsof sec>.
+ * Prints "<removed> <resume after, or ->".
  */
 export const SWEEP_PL = String.raw`use strict; use POSIX (); use Errno ();
-use Fcntl qw(:flock O_RDONLY O_NOFOLLOW); use File::Path ();
-my ($root, $grace, $lsof) = @ARGV;
-opendir(my $dh, $root) or do { print "0\n"; exit 0 };
+use Fcntl qw(:flock O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW); use File::Path ();
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
+my ($root, $grace, $lsof, $owner, $after, $budget, $lsofsec) = @ARGV;
+$budget = ${SWEEP_BUDGET_SEC} unless defined $budget && $budget =~ /\A[0-9]{1,4}\z/;
+$lsofsec = ${SWEEP_LSOF_SEC} unless defined $lsofsec && $lsofsec =~ /\A[1-9][0-9]{0,2}\z/;
+$SIG{ALRM} = sub { kill("KILL", -$$) if getpgrp() == $$; POSIX::_exit(124); };
+alarm($budget + 15);
+my $t0 = clock_gettime(CLOCK_MONOTONIC);
+my $n = 0;
+my $last = "-";
+my $finish = sub { print "$n $_[0]\n"; exit 0; };
+opendir(my $dh, $root) or $finish->("-");
 my @names = readdir($dh);
 closedir($dh);
 my $P = qr/${RENDER_DIR_PREFIX}[A-Za-z0-9]{6}/;
 my (%dirs, %locks);
 for (@names) { $dirs{$1} = 1 if /\A($P)\z/; $locks{$1} = 1 if /\A($P)\.lock\z/; }
 my $old = time() - $grace;
+# The owner still wants this sweep: same parent, and its pipe neither closed nor written to.
+sub wanted {
+  return 0 if defined $owner && $owner =~ /\A[0-9]+\z/ && getppid() != $owner;
+  my $rin = ""; vec($rin, 0, 1) = 1;
+  my $k = select(my $rout = $rin, undef, undef, 0);
+  return 1 unless defined $k && $k > 0;
+  return 0;
+}
 # A real folder of ours: its lstat, or nothing.
 sub real_dir { my @st = lstat($_[0]); return () unless @st && -d _ && !-l _ && $st[4] == $<; return @st; }
-# The lock: "none" (no such file), a locked handle, or undef (keep: held, not ours, not the same file, any error).
+sub same { my ($x, $y) = @_; return @$x && @$y && $x->[0] == $y->[0] && $x->[1] == $y->[1]; }
+# The lock: [handle, stat, made-by-us] locked, or undef (keep: held, not ours, not the same file, any error).
 sub take_lock {
   my ($l) = @_;
   my @st = lstat($l);
-  return $!{ENOENT} ? "none" : undef unless @st;
+  if (!@st) {
+    return undef unless $!{ENOENT};
+    sysopen(my $fh, $l, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or return undef;
+    my @f = stat($fh);
+    if (!@f || !flock($fh, LOCK_EX | LOCK_NB)) { drop([$fh, \@f, 1], $l); return undef; }
+    # Marked as the sweep's own (a render's lock is empty): should this sweep die holding it, the next one still
+    # judges the folder as lock-less.
+    syswrite($fh, "sweep\n");
+    return [$fh, \@f, 1];
+  }
   return undef unless -f _ && $st[4] == $<;
   sysopen(my $fh, $l, O_RDONLY | O_NOFOLLOW) or return undef;
   my @f = stat($fh);
-  return undef unless @f && $f[0] == $st[0] && $f[1] == $st[1];
+  return undef unless same(\@f, \@st);
   flock($fh, LOCK_EX | LOCK_NB) or return undef;
   my @again = lstat($l);
-  return undef unless @again && $again[0] == $st[0] && $again[1] == $st[1];
-  return $fh;
+  return undef unless same(\@again, \@st);
+  my $mark = "";
+  sysread($fh, $mark, 6);
+  return [$fh, \@f, $mark eq "sweep\n" ? 1 : 0];
 }
-# 0 = lsof positively shows no process using the folder; 1 = it shows one (or anything else); undef = no lsof.
+# Unlinks the lock path only while it is still the file we hold.
+sub drop { my ($lk, $l) = @_; my @now = lstat($l); unlink($l) if @now && -f _ && same(\@now, $lk->[1]); }
+# 0 = lsof positively shows no process using the folder (in time); 1 = anything else; undef = no lsof here.
 sub in_use {
   my ($p) = @_;
   return undef unless $lsof && -x $lsof;
   my $pid = open(my $fh, "-|");
   return 1 unless defined $pid;
-  if (!$pid) { open(STDERR, ">&", \*STDOUT); exec($lsof, "+D", $p); POSIX::_exit(127); }
+  if (!$pid) {
+    open(STDERR, ">&", \*STDOUT);
+    alarm($lsofsec);    # inherited by lsof: a slow look is cut off (a signal: kept)
+    exec($lsof, "+D", $p);
+    POSIX::_exit(127);
+  }
   my $out = do { local $/; <$fh> };
   close($fh);
-  return ($? >> 8) == 1 && !length($out // "") ? 0 : 1;
+  return ($? & 127) == 0 && ($? >> 8) == 1 && !length($out // "") ? 0 : 1;
 }
-my $n = 0;
-for my $e (sort keys %dirs) {
+# Names after the resume point first, then the rest: a slow folder never starves the ones behind it.
+my @all = sort keys %dirs;
+$after = "-" unless defined $after && length $after;
+my @order = $after eq "-" ? @all : ((grep { $_ gt $after } @all), (grep { $_ le $after } @all));
+my $seen = 0;
+for my $e (@order) {
+  $finish->("-") unless wanted();
+  # Out of budget (at least one folder judged per sweep, so a resumed sweep always moves on).
+  $finish->($last) if $seen && clock_gettime(CLOCK_MONOTONIC) - $t0 > $budget;
+  $last = $e;
+  $seen++;
   my $p = "$root/$e";
   my @st = real_dir($p) or next;
   next if $st[9] > $old;
-  my $lock = take_lock("$p.lock");
-  next unless defined $lock;
+  my $lk = take_lock("$p.lock");
+  next unless $lk;
   my $use = in_use($p);
-  # A free lock: gone unless lsof shows a user. No lock: only when lsof positively shows none.
-  next if ref $lock ? ($use // 0) : !defined $use || $use;
-  my @again = real_dir($p) or next;
-  next unless $again[0] == $st[0] && $again[1] == $st[1];
-  File::Path::remove_tree($p);
-  next if lstat($p);
-  unlink("$p.lock") if ref $lock;
-  $n++;
+  # A free lock: gone unless lsof shows a user. No lock (we made one): only when lsof positively shows none.
+  my $keep = $lk->[2] ? (!defined $use || $use) : ($use // 0);
+  my @again = real_dir($p);
+  $keep = 1 unless same(\@again, \@st);
+  if (!$keep) {
+    File::Path::remove_tree($p);
+    $keep = 1 if lstat($p);
+    $n++ unless $keep;
+  }
+  # The folder gone: its lock goes. Kept: a lock the sweep made goes again (it was not there before).
+  drop($lk, "$p.lock") if !$keep || $lk->[2];
 }
 for my $e (sort keys %locks) {
   my $l = "$root/$e.lock";
   next if lstat("$root/$e") || !$!{ENOENT};    # its folder is there (the loop above judged it), or unknown
   my @st = lstat($l) or next;
   next if $st[9] > $old;
-  my $fh = take_lock($l);
-  unlink($l) if ref $fh;
+  my $lk = take_lock($l);
+  drop($lk, $l) if $lk && !$lk->[2];
 }
-print "$n\n";`;
+$finish->("-");`;
 
-/** One sweep of `root` (default: the OS temp folder). Never throws; 0 when perl is missing or anything fails. */
-export function sweepRenderDirs(root = os.tmpdir(), graceSec = SWEEP_GRACE_SEC): Promise<number> {
-  return new Promise((resolve) => {
-    let out = "";
-    let child: ChildProcess;
+export type SweepResult = { removed: number; next?: string };
+/** Sweep knobs (tests: another lsof, short budgets). */
+export type SweepOptions = {
+  graceSec?: number;
+  after?: string;
+  budgetSec?: number;
+  lsof?: string;
+  lsofSec?: number;
+};
+
+/** One sweep run: its result, and a way to stop it (its whole process group, lsof included). */
+function runSweep(root: string, o: SweepOptions = {}) {
+  const budgetSec = o.budgetSec ?? SWEEP_BUDGET_SEC;
+  let child: ChildProcess | undefined;
+  const kill = () => {
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     try {
-      child = spawn(PERL, ["-e", SWEEP_PL, fs.realpathSync(root), String(graceSec), LSOF], {
-        env: {},
-        detached: true, // its own group: a timeout takes lsof with it
-        stdio: ["ignore", "pipe", "ignore"],
-      });
+      process.kill(-child.pid, "SIGKILL");
     } catch {
-      return resolve(0);
+      child.kill("SIGKILL");
     }
-    const timer = setTimeout(() => {
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    }, 60_000);
+  };
+  const done = new Promise<SweepResult>((resolve) => {
+    let out = "";
+    try {
+      child = spawn(
+        PERL,
+        [
+          "-e",
+          SWEEP_PL,
+          fs.realpathSync(root),
+          String(o.graceSec ?? SWEEP_GRACE_SEC),
+          o.lsof ?? LSOF,
+          String(process.pid),
+          o.after ?? "-",
+          String(budgetSec),
+          String(o.lsofSec ?? SWEEP_LSOF_SEC),
+        ],
+        // Its own group (a stop takes lsof with it); stdin = the owner pipe (never written).
+        { env: {}, detached: true, stdio: ["pipe", "pipe", "ignore"] },
+      );
+    } catch {
+      return resolve({ removed: 0 });
+    }
+    child.stdin!.on("error", () => {});
+    // The server's own bound, past the sweep's (it also bounds itself, should this process die first).
+    const timer = setTimeout(kill, (budgetSec + 20) * 1000);
     timer.unref();
     child.stdout!.on("data", (d: Buffer) => (out += d.toString()));
     child.on("error", () => {
       clearTimeout(timer);
-      resolve(0);
+      resolve({ removed: 0 });
     });
     child.on("close", () => {
       clearTimeout(timer);
-      const n = Number(out.trim());
-      resolve(Number.isSafeInteger(n) ? n : 0);
+      const m = /^(\d+) (\S+)\n?$/.exec(out);
+      if (!m) return resolve({ removed: 0 });
+      resolve({ removed: Number(m[1]), ...(m[2] !== "-" ? { next: m[2] } : {}) });
     });
   });
+  return { done, cancel: kill };
 }
 
-/** The server's sweeps: now, then every `everyMs` (a folder too young now is judged again later). Returns stop. */
-export function startRenderSweeps(root = os.tmpdir(), everyMs = SWEEP_GRACE_SEC * 1000): () => void {
-  let running = false;
+/** One sweep of `root` (default: the OS temp folder). Never throws; 0 when perl is missing or anything fails. */
+export function sweepRenderDirs(root = os.tmpdir(), o: SweepOptions = {}): Promise<SweepResult> {
+  return runSweep(root, o).done;
+}
+
+/**
+ * The server's sweeps: now, then every `everyMs`, each resuming where a sweep that ran out of budget stopped.
+ * Returns `stop`: no more sweeps, the running one (if any) is killed — its group — and awaited.
+ */
+export function startRenderSweeps(
+  root = os.tmpdir(),
+  everyMs = SWEEP_GRACE_SEC * 1000,
+  o: Omit<SweepOptions, "after"> = {},
+) {
+  let current: ReturnType<typeof runSweep> | undefined;
+  let after: string | undefined;
+  let stopped = false;
   const once = () => {
-    if (running) return;
-    running = true;
-    void sweepRenderDirs(root).finally(() => (running = false));
+    if (current || stopped) return;
+    const run = runSweep(root, { ...o, ...(after ? { after } : {}) });
+    current = run;
+    void run.done.then((r) => {
+      after = r.next;
+      current = undefined;
+    });
   };
   once();
   const timer = setInterval(once, everyMs);
   timer.unref();
-  return () => clearInterval(timer);
+  return async () => {
+    stopped = true;
+    clearInterval(timer);
+    const run = current;
+    run?.cancel();
+    await run?.done;
+  };
 }
 
 /**

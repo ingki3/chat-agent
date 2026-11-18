@@ -53,7 +53,8 @@ function handle(m) {
       return json({ id: m.id, result: { data: Buffer.from("%PDF-fake").toString("base64") } });
     case "Browser.close":
       json({ id: m.id, result: {} });
-      return setTimeout(() => process.exit(0), 10);
+      // `ok-130`: a good render, then an exit code ≥ 126 of the browser's own (not a watchdog failure).
+      return setTimeout(() => process.exit(mode === "ok-130" ? 130 : 0), 10);
     default:
       return json({ id: m.id, result: {} });
   }

@@ -25,10 +25,15 @@ import {
   CdpError,
   CdpPipe,
   killLiveRenders,
+  makeRenderDir,
   removeRenderDir,
   sandboxedLauncher,
   trackRender,
+  WATCHDOG_DONE,
   WATCHDOG_MAX_SEC,
+  WATCHDOG_NOT_STARTED,
+  WATCHDOG_STOPPED,
+  type LockId,
   type Launched,
   type Launcher,
 } from "./browser.js";
@@ -133,6 +138,8 @@ export type RenderTestHooks = {
   /** Requests refused by interception (counted, not logged). */
   blocked?: (url: string) => void;
   probe?: () => Promise<{ pid: number; rss: number }[]>;
+  /** Every event of the page's session (e.g. a `Runtime.bindingCalled` the test asked for). */
+  events?: (method: string, params: Record<string, unknown>) => void;
 };
 
 export type RendererOptions = {
@@ -307,15 +314,18 @@ export class Renderer {
     const dataDir = this.o.account?.dataDir;
     let made: { jobId: string; dir: string } | undefined;
     let workDir: string;
+    let lock: LockId | undefined;
     try {
       if (worker) {
         if (!dataDir) return { ok: false, code: "export_unavailable" };
         made = makeWorkerJobDir(dataDir);
         workDir = made.dir;
-      } else
-        workDir = fs.realpathSync(
-          fs.mkdtempSync(path.join(this.o.tmpDir ?? os.tmpdir(), "agentlee-render-")),
-        );
+      } else {
+        // The folder and its lock file beside it, both new (#170).
+        const d = makeRenderDir(this.o.tmpDir ?? os.tmpdir());
+        workDir = d.workDir;
+        lock = d.lock;
+      }
     } catch {
       return { ok: false, code: "export_unavailable" };
     }
@@ -327,7 +337,7 @@ export class Renderer {
           // the self-check's look never decides the clean-up
         }
         removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
-      } else removeRenderDir(workDir);
+      } else removeRenderDir(workDir, lock);
     };
     const home = path.join(workDir, "home");
     const tmp = path.join(workDir, "tmp");
@@ -363,20 +373,23 @@ export class Renderer {
     }
     const { child, input, output } = launched;
     const pid = child.pid;
-    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited. A watchdog that
-    // ended abnormally (killed by a signal — by itself, not by its own clean-up path — or failing to start) may leave
-    // the browser behind in its group: the server kills what is left of the group, then forgets it. (The group id
-    // cannot be reused while a member is alive; a watchdog that exits normally has already reaped its browser.)
+    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited. The watchdog
+    // reports its **own** end: done or stopped (it reaped the browser and cleaned up), or not started. Any other end —
+    // a signal — means the watchdog itself was interrupted and may have left the browser behind in its group: the
+    // server kills what is left (the group id cannot be reused while a member lives), unless it already killed the
+    // group itself (its own limits, or `killLiveRenders`), then forgets it.
+    let groupKilled = false;
     if (!worker && pid) {
-      const untrack = trackRender(pid, workDir);
-      child.once("exit", (code, signal) => {
-        if (signal || code === null || code >= 126)
+      const t = trackRender(pid, { workDir, lock: lock! });
+      child.once("exit", (code) => {
+        const clean = code === WATCHDOG_DONE || code === WATCHDOG_STOPPED || code === WATCHDOG_NOT_STARTED;
+        if (!clean && !groupKilled && t.tracked())
           try {
             process.kill(-pid, "SIGKILL");
           } catch {
             // nothing left
           }
-        untrack();
+        t.untrack();
       });
     }
     let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
@@ -414,6 +427,7 @@ export class Renderer {
         return;
       }
       killed ??= why;
+      groupKilled = true;
       try {
         process.kill(-pid!, "SIGKILL");
       } catch {
@@ -507,6 +521,11 @@ export class Renderer {
       await cdp.send("Target.attachToTarget", { targetId, flatten: true }),
     );
     const s: Session = { send: (m, p) => cdp.send(m, p ?? {}, sessionId) };
+    const offEvents = t.events
+      ? cdp.on((m) => {
+          if (m.sessionId === sessionId && m.method) t.events!(m.method, m.params ?? {});
+        })
+      : undefined;
 
     // Layer 1: every request of the page stops here. The document is delivered once; exact CDN URLs go on (to the
     // proxy); anything else — the app, loopback, the home network, other hosts, the document navigating itself —
@@ -596,6 +615,7 @@ export class Renderer {
       return Buffer.from(data, "base64");
     } finally {
       off();
+      offEvents?.();
     }
   }
 }
