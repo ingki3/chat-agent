@@ -28,11 +28,10 @@ import {
   makeRenderDir,
   removeRenderDir,
   sandboxedLauncher,
+  killRenderGroups,
   trackRender,
-  WATCHDOG_DONE,
+  WATCHDOG_EXIT,
   WATCHDOG_MAX_SEC,
-  WATCHDOG_NOT_STARTED,
-  WATCHDOG_STOPPED,
   type LockId,
   type Launched,
   type Launcher,
@@ -363,6 +362,7 @@ export class Renderer {
               args,
               env,
               workDir,
+              lock: lock!,
               proxyPort: proxy.port,
               // The watchdog's own cap (#170): a backstop a little past ours, enforced outside this process.
               deadlineSec: Math.min(WATCHDOG_MAX_SEC, Math.ceil(L.timeoutMs / 1000) + 10),
@@ -373,22 +373,21 @@ export class Renderer {
     }
     const { child, input, output } = launched;
     const pid = child.pid;
-    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited. The watchdog
-    // reports its **own** end: done or stopped (it reaped the browser and cleaned up), or not started. Any other end —
-    // a signal — means the watchdog itself was interrupted and may have left the browser behind in its group: the
-    // server kills what is left (the group id cannot be reused while a member lives), unless it already killed the
-    // group itself (its own limits, or `killLiveRenders`), then forgets it.
+    const launchedAt = Date.now();
+    // The browser's own process group, as the watchdog reported it (#170).
+    const browserGroup = () => launched.browserGroup?.();
+    // Same uid: the groups are ours to kill on shutdown (`killLiveRenders`) until the watchdog has exited. It reports
+    // its **own** end (`WATCHDOG_EXIT`): done or stopped (browser group gone, cleaned up), not started, exec failed —
+    // nothing left. A failed clean-up, or any other end (a signal: the watchdog itself was interrupted), may leave the
+    // browser behind: the server kills the browser's group and the watchdog's, unless it already killed them itself
+    // (its own limits, or `killLiveRenders`), then forgets them. The folder goes in this render's `finally`.
     let groupKilled = false;
     if (!worker && pid) {
-      const t = trackRender(pid, { workDir, lock: lock! });
+      const t = trackRender(pid, { workDir, lock: lock!, browserGroup });
       child.once("exit", (code) => {
-        const clean = code === WATCHDOG_DONE || code === WATCHDOG_STOPPED || code === WATCHDOG_NOT_STARTED;
-        if (!clean && !groupKilled && t.tracked())
-          try {
-            process.kill(-pid, "SIGKILL");
-          } catch {
-            // nothing left
-          }
+        const X = WATCHDOG_EXIT;
+        const clean = code === X.done || code === X.stopped || code === X.notStarted || code === X.execFailed;
+        if (!clean && !groupKilled && t.tracked()) killRenderGroups(pid, browserGroup());
         t.untrack();
       });
     }
@@ -428,11 +427,7 @@ export class Renderer {
       }
       killed ??= why;
       groupKilled = true;
-      try {
-        process.kill(-pid!, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
+      killRenderGroups(pid!, browserGroup());
     };
     const cdp = new CdpPipe(input, output, L.maxReplyBytes);
     const timer = setTimeout(() => {
@@ -446,14 +441,20 @@ export class Renderer {
     };
     if (via?.signal?.aborted) onAbort();
     else via?.signal?.addEventListener("abort", onAbort, { once: true });
-    // Memory of the render's process group (the one browser process plus its watchdog, #170); not measurable while
-    // it runs → stop (fail closed). Under the account the launcher watches it (every 250 ms, exit 125 over the
-    // limit): the server's pid is sudo's.
+    // Memory of the browser's process group (#170: its own, reported by the watchdog — or, for a launcher without a
+    // watchdog, the child's group); not measurable while it runs → stop (fail closed): no group reported within 3 s
+    // counts as unmeasurable. Under the account the launcher watches it (every 250 ms, exit 125 over the limit): the
+    // server's pid is sudo's.
     let sampling = false;
     const monitor = setInterval(() => {
       if (worker || sampling || exited || !pid) return;
+      const group = launched.browserGroup ? browserGroup() : pid;
+      if (!group) {
+        if (!t.probe && Date.now() - launchedAt > 3000) kill("monitor");
+        if (!t.probe) return;
+      }
       sampling = true;
-      (t.probe ?? (() => snapshot(pid, 2000, true)))()
+      (t.probe ?? (() => snapshot(group!, 2000, true)))()
         .then((procs) => {
           if (!procs.length) {
             if (!exited) kill("monitor");

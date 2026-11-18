@@ -1,9 +1,19 @@
 // A stand-in for the headless browser (#51 host-survival tests): speaks the DevTools pipe (fd 3 in, fd 4 out) and
 // misbehaves the way a crashed or compromised renderer could, chosen by argv[2]. `orphan` (#170): answers nothing
 // and, like the real shell, keeps running when the pipe closes.
+import { spawn } from "node:child_process";
+import fs from "node:fs";
 import net from "node:net";
 
 const mode = process.argv[2];
+// `exit127` (#170): a browser that starts and exits 127 by itself (not an exec failure).
+if (mode === "exit127") process.exit(127);
+// `fork` (#170): leaves a child in its own process group (it records its pid in $PIDFILE), then ends normally when
+// its command pipe closes — the watchdog must kill what is left in the group.
+if (mode === "fork") {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  fs.writeFileSync(process.env.PIDFILE, String(c.pid));
+}
 const input = new net.Socket({ fd: 3, readable: true, writable: false });
 const output = new net.Socket({ fd: 4, readable: false, writable: true });
 const send = (raw) => output.write(raw + "\0");
@@ -23,7 +33,7 @@ if (mode === "orphan") setInterval(() => {}, 1000);
 else input.on("end", () => process.exit(0));
 
 function handle(m) {
-  if (mode === "hang" || mode === "orphan") return;
+  if (mode === "hang" || mode === "orphan" || mode === "fork") return;
   if (first) {
     first = false;
     if (mode === "null") return send("null");
@@ -54,7 +64,11 @@ function handle(m) {
     case "Browser.close":
       json({ id: m.id, result: {} });
       // `ok-130`: a good render, then an exit code ≥ 126 of the browser's own (not a watchdog failure).
-      return setTimeout(() => process.exit(mode === "ok-130" ? 130 : 0), 10);
+      // `ok-exit`: the same with $EXIT_CODE (a stand-in watchdog reporting a status).
+      return setTimeout(
+        () => process.exit(mode === "ok-130" ? 130 : mode === "ok-exit" ? Number(process.env.EXIT_CODE) : 0),
+        10,
+      );
     default:
       return json({ id: m.id, result: {} });
   }

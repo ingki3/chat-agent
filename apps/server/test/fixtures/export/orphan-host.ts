@@ -25,23 +25,27 @@ let workDir = "";
 let entered: () => void = () => {};
 const spinning = new Promise<void>((r) => (entered = r));
 
-/** Reports once the group has the watchdog and the browser (polled, bounded by the test's own timeout). */
+/** Reports once the watchdog has told its browser's group and that group runs (polled, bounded by the test). */
 async function report(extra: Record<string, unknown> = {}) {
   for (;;) {
-    const procs = await snapshot(pgid, 2000, true);
-    if (procs.length >= 2) {
-      const members = procs.map((p) => p.pid);
-      process.stdout.write(`${JSON.stringify({ host: process.pid, pgid, members, workDir, ...extra })}\n`);
+    const browserPgid = group?.();
+    const procs = browserPgid ? await snapshot(browserPgid, 2000, true) : [];
+    if (browserPgid && procs.length) {
+      const members = [pgid, ...procs.map((p) => p.pid)];
+      const line = { host: process.pid, pgid, browserPgid, members, workDir, ...extra };
+      process.stdout.write(`${JSON.stringify(line)}\n`);
       return;
     }
     await new Promise((r) => setTimeout(r, 50));
   }
 }
 
+let group: (() => number | undefined) | undefined;
 const launcher: Launcher = (s) => {
   const l = base(s);
   pgid = l.child.pid!;
   workDir = s.workDir;
+  group = l.browserGroup;
   if (!real) void report();
   return l;
 };
