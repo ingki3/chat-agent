@@ -71,12 +71,28 @@ export function firstToolAt(parts: readonly MessagePart[]): number {
 const PROGRESS =
   /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
 
-/** "…확인하고 있어요." — what the model is doing right now (#202). */
-const ONGOING = /(?:고\s*있(?:어요|습니다)|(?:하는|보는|읽는|찾는)\s*중(?:이에요|입니다))[.!…~]*$/u;
-
-/** "파일을 다 읽었어요." — a step of reading the material done (#202): reading, finding, checking, opening. */
+/**
+ * What the assistant does to the material (#202, review 1차): reading, searching, finding, checking, comparing,
+ * sorting out, going through, calculating — only these verbs. "경쟁률이 계속 상승하고 있어요" is not one of them.
+ */
+const ACTION =
+  "(?:읽|찾|찾아보|검색하|확인하|비교하|정리하|살펴보|훑어보|검토하|계산하|분석하|열어보|조회하)";
+/** "…확인하고 있어요." — what the assistant is doing right now. */
+const ONGOING = new RegExp(`${ACTION}(?:고\\s*있(?:어요|습니다)|는\\s*중(?:이에요|입니다))$`, "u");
+/** "파일을 다 읽었어요." — a step of its work on the material done. */
 const STEP_DONE =
-  /(?:읽었|확인했|살펴봤|살펴보았|찾았|찾아봤|열어봤|열었|훑어봤|검토했|가져왔)(?:어요|습니다)[.!…~]*$/u;
+  /(?:읽었|찾았|찾아봤|검색했|확인했|비교했|정리했|살펴봤|살펴보았|훑어봤|검토했|계산했|분석했|열어봤|조회했|가져왔)(?:어요|습니다)$/u;
+/**
+ * A subject other than the assistant ("경쟁률이 …", "시트가 …", "학종은 …"): the sentence is about the world, not
+ * the assistant's work — checked. "제가"/"저는" and the verb form "…는 중" are the assistant.
+ */
+const AGENT_WORDS = /^(?:제가|저는|저도|지금은|이제는)$/u;
+const ACTION_FORM = new RegExp(`^${ACTION}는$`, "u");
+const hasOtherSubject = (s: string) =>
+  s
+    .split(/\s+/u)
+    .slice(0, -1)
+    .some((w) => /[이가은는]$/u.test(w) && !AGENT_WORDS.test(w) && !ACTION_FORM.test(w));
 
 /** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
 const CONNECTIVE =
@@ -92,8 +108,10 @@ const FOUND = /(?:것을|걸|점을|사실을|내용을)\s/u;
  * Paragraphs that state something before a tool call are still checked.
  *
  * Between tool calls (#202 — the model narrating its work: "파일을 다 읽었어요. 이제 입결 시트를 확인하고 있어요."):
- * a short paragraph before a later tool call, no figure, up to three sentences, each one saying what it will do,
- * is doing or has just read / checked — never one that states something (a joined clause, "…다는", "…것을").
+ * a short paragraph before a later tool call, no figure, up to three sentences, each one saying what the assistant
+ * will do, or is doing / has just done **to the material** (read, search, check, compare … — `ACTION`), with no
+ * other subject — never one that states something (a joined clause, "…다는", "…것을", "경쟁률이 …하고 있어요").
+ * When in doubt it is checked.
  */
 export function isProgressNote(
   text: string,
@@ -103,19 +121,21 @@ export function isProgressNote(
 ): boolean {
   const t = text.slice(u.start, u.end).trim();
   if (u.end <= toolAt) {
-    if (t.length > 80 || /\d/.test(t) || /(?<=[.!?。！？])\s+\S/u.test(t)) return false;
+    // One sentence — "수출이 늘었어요.더 찾아볼게요." is two, even without the space (review 1차).
+    if (t.length > 80 || /\d/.test(t) || unitSentences(t).length > 1) return false;
     // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
     if (CONNECTIVE.test(t) || COMPLEMENT.test(t)) return false;
     return PROGRESS.test(t);
   }
   if (u.end > lastToolAt || t.length > 160 || /\d/.test(t) || t.includes("\n")) return false;
-  const sentences = unitSentences(t);
+  const sentences = unitSentences(t).map((s) => s.replace(/[\s.!?。！？…~]+$/u, ""));
   return (
+    sentences.length > 0 &&
     sentences.length <= 3 &&
     sentences.every((s) => {
       // "확인하고 있어요": the auxiliary is not a joined clause.
-      const bare = s.replace(/고\s*있(?:어요|습니다)([.!…~]*)$/u, "$1");
-      if (CONNECTIVE.test(bare) || COMPLEMENT.test(s) || FOUND.test(s)) return false;
+      const bare = s.replace(/고\s*있(?:어요|습니다)$/u, "");
+      if (CONNECTIVE.test(bare) || COMPLEMENT.test(s) || FOUND.test(s) || hasOtherSubject(s)) return false;
       return PROGRESS.test(s) || ONGOING.test(s) || STEP_DONE.test(s);
     })
   );
@@ -136,7 +156,8 @@ export function isClosingOffer(text: string, u: TextRange, lastToolAt: number): 
   if (u.start < lastToolAt) return false;
   const t = text.slice(u.start, u.end).trim();
   if (t.length > 200 || /\d/.test(t)) return false;
-  const sentences = unitSentences(t).map((s) => s.replace(/^\s*(?:[-*+•·])\s+/u, ""));
+  // Sentences cut with or without a space: "마감되었습니다.더 볼까요?" is a statement and a question (review 1차).
+  const sentences = unitSentences(t);
   return (
     sentences.length > 0 &&
     sentences.length <= 3 &&

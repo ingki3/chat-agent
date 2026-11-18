@@ -164,13 +164,13 @@ describe("paragraphs without a citation (#202): one summary line, the paragraphs
     ];
   };
 
-  it("the note says how many — a button that moves to them — and never repeats their text", () => {
+  it("the note says how many — plain text until the marks are drawn (the button is e2e) — and never repeats their text", () => {
     const texts = [TEXT + "\n\n", "미국 수출 비중이 가장 컸어요.\n\n업계는 증가를 예상해요."];
     const html = render(parts(["미국 수출 비중이 가장 컸어요.", "업계는 증가를 예상해요."], texts));
     expect(count(html, "source-note")).toBe(1);
-    expect(html).toMatch(
-      /<button type="button" class="cite-missing-jump" data-testid="citation-missing-warning" aria-label="⚠️ 출처 표시 없는 문단 2개 — 눌러서 해당 문단으로 이동">⚠️ 출처 표시 없는 문단 2개/,
-    );
+    // Server-rendered (no marks drawn yet — the renderer loads lazily): the count as text, no dead button.
+    expect(html).toContain('<span data-testid="citation-missing-warning">⚠️ 출처 표시 없는 문단 2개</span>');
+    expect(html).not.toContain("cite-missing-jump");
     // Each paragraph once (in the answer), not again in the note; no excerpt list.
     expect(html.split("미국 수출 비중이 가장 컸어요.")).toHaveLength(2);
     expect(html).not.toContain("cite-missing-list");

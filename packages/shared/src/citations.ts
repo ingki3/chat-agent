@@ -211,7 +211,13 @@ function isDisclaimer(t: string): boolean {
 export function citationUnits(text: string): CitationUnit[] {
   const out: CitationUnit[] = [];
   type Block = { start: number; end: number; type: "para" | "item" | "table" };
-  const st: { cur: Block | null; fence: number | null } = { cur: null, fence: null };
+  // `gfm`: the current table is a GFM table (a header row, then a delimiter row): every following non-blank line
+  // that starts no other block is one of its rows, with or without a leading `|` (#202, review 1차).
+  const st: { cur: Block | null; fence: number | null; gfm: boolean } = {
+    cur: null,
+    fence: null,
+    gfm: false,
+  };
   const flush = () => {
     const c = st.cur;
     if (c) out.push({ start: c.start, end: c.end, kind: c.type === "para" ? "lead_in" : "body" });
@@ -223,6 +229,24 @@ export function citationUnits(text: string): CitationUnit[] {
     const end = nl === -1 ? text.length : nl;
     const line = text.slice(pos, end);
     const c = st.cur;
+    const nextEnd = nl === -1 ? -1 : text.indexOf("\n", nl + 1);
+    const nextLine = nl === -1 ? "" : text.slice(nl + 1, nextEnd === -1 ? text.length : nextEnd);
+    if (st.gfm && c?.type === "table") {
+      if (
+        line.trim() &&
+        !FENCE.test(line) &&
+        !HEADING.test(line) &&
+        !LIST_ITEM.test(line) &&
+        !RULE.test(line) &&
+        !/^\s{0,3}>/.test(line)
+      ) {
+        c.end = end;
+        if (nl === -1) break;
+        pos = nl + 1;
+        continue;
+      }
+      st.gfm = false;
+    }
     if (st.fence !== null) {
       if (FENCE.test(line)) {
         out.push({ start: st.fence, end, kind: "code" });
@@ -238,6 +262,11 @@ export function citationUnits(text: string): CitationUnit[] {
     } else if (RULE.test(line)) {
       flush();
       out.push({ start: pos, end, kind: "rule" });
+    } else if (line.includes("|") && DELIMITER_ROW.test(nextLine)) {
+      // A GFM table's header row: the table is one unit from here (rows without an outer `|` too).
+      flush();
+      st.cur = { start: pos, end, type: "table" };
+      st.gfm = true;
     } else if (TABLE.test(line)) {
       if (c?.type === "table") c.end = end;
       else {
@@ -347,8 +376,10 @@ export function isTableText(unit: string): boolean {
   return TABLE.test(lines[0] ?? "") || DELIMITER_ROW.test(lines[1] ?? "");
 }
 
-/** A line right after a table that says where it is from (`출처: …`, `*표 1 …*`, `(자료: …)`, `※ …`). */
-const CAPTION = /^[\s*_(（[]*(?:출처|자료|근거|표\s*\d*|source)\s*[:：.)\]]|^\s*※/iu;
+/**
+ * A line right after a table that says where it is from: `출처: …`, `(자료: …)`, `※ …`, `표 1. …`, `표 1 전형별 인원`.
+ */
+const CAPTION = /^[\s*_(（[]*(?:(?:출처|자료|근거|source|표)\s*[:：.)\]]|표\s*\d+(?=[\s:：.)\]]))|^\s*※/iu;
 
 /**
  * Opinion framing (#202, `common@11`): a sentence that says itself it is the assistant's own judgement — it starts
@@ -365,28 +396,41 @@ const OPINION_TAIL = new RegExp(
   "u",
 );
 
-/** A list item's marker and a bold label (`- **학종:** …`), and emphasis marks — not part of the sentence. */
-const plainSentence = (s: string) =>
-  s
-    .replace(/^\s*(?:[-*+•·]|\d{1,3}[.)])\s+/u, "")
-    .replace(/^(\*\*|__)[^\n]{1,40}?\1\s*[:：]?\s*/u, "")
-    .replace(/\*\*|__/gu, "")
-    .replace(/^[\s>]+|[\s.!?。！？…~]+$/gu, "");
+const LIST_MARKER = /^\s*(?:[-*+•·]|\d{1,3}[.)])\s+/u;
+/** A list item's leading label: bold text ending in a colon (`**추천:**`, `**추천**:`) — only that, never a sentence. */
+const ITEM_LABEL = /^(\*\*|__)[^*_\n]{1,20}?[:：]\1\s*|^(\*\*|__)[^*_\n]{1,20}?\2\s*[:：]\s*/u;
 
-/** The sentences of a unit (line breaks end one too). */
-export const unitSentences = (t: string) =>
-  t
+/**
+ * The sentences of a unit (#202): line by line — a list item's marker and its leading label (`- **추천:** …`) are
+ * not part of it — then at sentence punctuation, with or without a space after it (`마감됐어요.더 볼까요?` is two
+ * sentences; `2.0`, `12.3` are not cut). Emphasis marks are dropped, the words kept.
+ */
+export function unitSentences(t: string): string[] {
+  return t
     .split(/\n+/u)
-    .flatMap((line) => line.split(SENTENCES))
-    .map((s) => s.trim())
+    .flatMap((raw) => {
+      const item = LIST_MARKER.exec(raw);
+      const line = item ? raw.slice(item[0].length).replace(ITEM_LABEL, "") : raw;
+      return line.split(/(?<=[.!?。！？])(?![\d.!?。！？])\s*/u);
+    })
+    .map((s) =>
+      s
+        .replace(/\*\*|__/gu, "")
+        .replace(/^[\s>]+/u, "")
+        .trim(),
+    )
     .filter(Boolean);
+}
+
+const sentenceBody = (s: string) => s.replace(/[\s.!?。！？…~]+$/gu, "");
 
 /**
  * A paragraph of the assistant's own opinion, said so (#202): **every** sentence carries the explicit framing above.
  * One sentence without it (a fact next to the opinion) and the paragraph is checked like any other.
  */
 export function isFramedOpinion(unit: string): boolean {
-  const sentences = unitSentences(unit).map(plainSentence).filter(Boolean);
+  const sentences = unitSentences(unit).map(sentenceBody);
+  // An empty piece (a lone mark) is not framed either: every piece must say it is an opinion.
   return sentences.length > 0 && sentences.every((s) => OPINION_LEAD.test(s) || OPINION_TAIL.test(s));
 }
 
@@ -394,7 +438,8 @@ export function isFramedOpinion(unit: string): boolean {
 function lastSentence(text: string, u: TextRange): TextRange {
   const t = text.slice(u.start, u.end).replace(/\s+$/u, "");
   let at = 0;
-  for (const m of t.matchAll(/[.!?。！？]+\s+|\n+/gu))
+  // A sentence ends at its punctuation (and the markers right after it), with or without a space (#202).
+  for (const m of t.matchAll(/[.!?。！？]+(?:\[\d{1,3}\])*(?!\d)\s*|\n+/gu))
     if (m.index + m[0].length < t.length) at = m.index + m[0].length;
   return { start: u.start + at, end: u.start + t.length };
 }
@@ -411,7 +456,15 @@ export function uncitedUnits(text: string): TextRange[] {
   const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
   const tableCited = (i: number) => {
     const prev = units[i - 1];
-    if (prev && prev.kind !== "code" && prev.kind !== "rule" && cited(lastSentence(text, prev))) return true;
+    // The sentence before: not another table's last cell (two tables in a row are two tables).
+    if (
+      prev &&
+      prev.kind !== "code" &&
+      prev.kind !== "rule" &&
+      !isTableText(text.slice(prev.start, prev.end)) &&
+      cited(lastSentence(text, prev))
+    )
+      return true;
     const next = units[i + 1];
     if (!next || next.kind === "code" || next.kind === "rule") return false;
     const t = text.slice(next.start, next.end).trim();

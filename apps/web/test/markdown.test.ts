@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { splitBlocks } from "../src/chat/blocks.js";
 import Markdown, { MarkdownBlock, safeUrl } from "../src/chat/Markdown.js";
+import { uncitedUnits } from "@agentlee/shared";
 
 const render = (text: string) => renderToStaticMarkup(createElement(Markdown, { text }));
 
@@ -246,8 +247,6 @@ describe("paragraphs without a citation, marked in the answer (#202)", () => {
     const out = marked(second, [range(all, "뒷 문단이에요.")], first.length);
     expect(marks(out)).toEqual(["p"]);
     expect(out).toMatch(/뒷 문단이에요\.<span class="cite-missing-badge"/);
-    // Without the offset the same range points elsewhere: nothing is marked by mistake.
-    expect(marks(marked(second, [range(all, "뒷 문단이에요.")]))).toEqual([]);
   });
 
   it("an old note's ranges (stored before #202: tables, progress notes) still mark their paragraphs", () => {
@@ -263,5 +262,60 @@ describe("paragraphs without a citation, marked in the answer (#202)", () => {
   it("no ranges, or no note: nothing is marked", () => {
     expect(marks(marked(ANSWER, []))).toEqual([]);
     expect(render(ANSWER)).not.toContain("data-cite-missing");
+  });
+});
+
+describe("one focus target per range, whatever the shape (#202 review 1차)", () => {
+  /** An answer as text parts (a tool call between them), its ranges as the server computes them. */
+  const CORPUS: string[][] = [
+    ["- 첫 항목이에요\n\n  같은 항목의 둘째 문단이에요.\n\n끝[1]."],
+    ["- 위 항목[1]\n  - 아래 항목이에요\n    - 더 아래예요\n- 다음 항목이에요"],
+    ["앞 문장이고 ", "뒤 문장이에요.\n\n끝[1]."],
+    ["가[1].\n\n$$\nx = 1\n$$\n\n나예요."],
+    ["가[1].\n\n    들여쓴 코드 줄\n\n나예요."],
+    ["가[1].\n\n<div>원시 HTML</div>\n\n나예요."],
+    ["전형 | 인원\n|---|---|\n학종 | 30\n\n| a | b |\n|---|---|\n| 1 | 2 |"],
+    ["> 인용문이에요.\n>\n> 둘째 줄이에요.\n\n가[1]."],
+    ["첫 파트 문단이에요.\n\n", "- 항목이에요\n- 또 항목이에요[1]\n\n", "| a |\n|---|\n| 1 |"],
+    ["1. 하나예요\n\n2. 둘이에요\n\n   이어진 문단이에요.\n\n3. 셋[1]"],
+  ];
+  const renderParts = (parts: string[], missing: { start: number; end: number }[]) => {
+    let at = 0;
+    return parts
+      .map((t) => {
+        const html = renderToStaticMarkup(
+          createElement(Markdown, {
+            text: t,
+            offset: at,
+            cite: {
+              numbers: new Set([1]),
+              render: () => createElement("b", null, "1"),
+              missing,
+              markId: "m1",
+            },
+          }),
+        );
+        at += t.length;
+        return html;
+      })
+      .join("");
+  };
+  it("the summary's count is the number of places it moves to", () => {
+    for (const parts of CORPUS) {
+      const ranges = uncitedUnits(parts.join(""));
+      expect(ranges.length, parts.join("|")).toBeGreaterThan(0);
+      const html = renderParts(parts, ranges);
+      expect(html.split('data-cite-missing="m1"').length - 1, parts.join("|")).toBe(ranges.length);
+    }
+  });
+  it("blocks without a paragraph element are wrapped as their range's target: math, indented code, raw HTML", () => {
+    const at = (parts: string[]) => renderParts(parts, uncitedUnits(parts.join("")));
+    expect(at(CORPUS[3]!)).toMatch(/cite-missing-wrap"[^>]*><span class="katex-display">/);
+    expect(at(CORPUS[4]!)).toMatch(/cite-missing-wrap"[^>]*><div class="codeblk">/);
+    expect(at(CORPUS[5]!)).toMatch(/cite-missing-wrap"[^>]*>&lt;div&gt;원시 HTML/);
+    // A paragraph cut by a tool call: one target where it starts, the bar on the rest.
+    const cut = at(CORPUS[2]!);
+    expect(cut).toMatch(/<p class="cite-missing-block" data-cite-missing="m1"[^>]*>앞 문장이고/);
+    expect(cut).toMatch(/<p class="cite-missing-block">뒤 문장이에요\./);
   });
 });

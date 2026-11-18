@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from "react";
+import { useCallback, useId, useRef, useState, useSyncExternalStore } from "react";
 import { Link } from "react-router";
 import {
   CITATION_MISSING_MARK,
@@ -11,6 +11,7 @@ import { useFileViewHref } from "../files/context.js";
 import { CitationMarkers } from "./CitationMarker.js";
 import { segments, sourceLinkText, sourceSummary, sourceViews, type CitationView } from "./segments.js";
 import { dataSourceViews, financeWarning, type DataSourceView } from "./source-note.js";
+import { missingMarks, subscribeMarks } from "./marks.js";
 import "./citations.css";
 
 /**
@@ -106,27 +107,23 @@ function DataSourceRow({ d }: { d: DataSourceView }) {
   );
 }
 
-/** The paragraphs of one answer marked in its text (`rehypeMissingMarks`), in order. */
-export const missingMarks = (markId: string): HTMLElement[] =>
-  typeof document === "undefined"
-    ? []
-    : [
-        ...document.querySelectorAll<HTMLElement>(
-          `[data-cite-missing="${markId.replace(/["\\]/g, "\\$&")}"]`,
-        ),
-      ];
-
 /**
- * "⚠️ 출처 표시 없는 문단 N개" (#202): one line — the paragraphs are marked where they are in the answer. A press
- * moves to the next marked paragraph (from the first, round again after the last) and focuses it.
+ * "⚠️ 출처 표시 없는 문단 N개" (#202): one line — the paragraphs are marked where they are in the answer. Once the
+ * marks are drawn it is a button: a press moves to the next marked paragraph (from the first, round again after the
+ * last) and focuses it. Until then (the renderer still loading, or failed: plain text) it is the count as text.
  */
 function MissingSummary({ count, markId }: { count: number; markId: string | undefined }) {
   const next = useRef(0);
   const text = citationMissingText(count);
-  if (!markId)
+  const ready = useSyncExternalStore(
+    subscribeMarks,
+    useCallback(() => !!markId && missingMarks(markId).length > 0, [markId]),
+    () => false,
+  );
+  if (!markId || !ready)
     return (
-      <div className="notice warn cite-missing-summary" data-testid="citation-missing-warning">
-        {text}
+      <div className="notice warn cite-missing-summary">
+        <span data-testid="citation-missing-warning">{text}</span>
       </div>
     );
   const jump = () => {

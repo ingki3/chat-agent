@@ -141,6 +141,8 @@ test("paragraphs without a citation are marked in the answer, counted in one lin
 async function jumpThrough(reply: Locator, isMobile: boolean) {
   const marks = reply.getByTestId("citation-missing");
   const jump = reply.getByTestId("citation-missing-warning");
+  // A button once the marks are drawn (plain text before: nowhere to move to yet).
+  await expect(jump).toHaveJSProperty("tagName", "BUTTON");
   const n = await marks.count();
   for (let i = 0; i <= n; i++) {
     if (isMobile) await jump.tap();
@@ -157,7 +159,7 @@ test("#202 production shape: progress notes, a cited table, an opinion said so a
 }) => {
   await useAccount(page, MOM);
   const { reply } = await newChat(page, "/cite advice");
-  await expect(reply.getByTestId("citation-marker")).toHaveText(["1", "2", "1"]);
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1", "2", "3", "1"]);
   const marks = reply.getByTestId("citation-missing");
   await expect(marks).toHaveText([
     "전망: 업계는 내년에도 두 자릿수 증가를 예상해요⚠️",

@@ -123,6 +123,7 @@ describe("templates", () => {
     expect(common).toContain('"출처 표시 없는 문단 N개"');
     expect(common).not.toContain("일부 내용에 출처 표시 없음");
     expect(common).toContain("끝맺음 제안·질문");
+    expect(common).toContain("웹 자료나 첨부 파일을 쓴 답변에서, 자료에 없는 너의 의견");
     expect(common).toContain('그 문단의 문장마다 "제 판단으로는 …"');
     expect(defaultTemplates().common.version).toBe(11);
   });

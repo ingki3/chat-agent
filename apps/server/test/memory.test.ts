@@ -19,8 +19,9 @@ import { loadConfig } from "../src/config.js";
 import { createTestDb, openDb, runMigrations } from "../src/db/client.js";
 import { FileWriteLock } from "../src/backup/lock.js";
 import { createBackup, DB_FILE } from "../src/backup/backup.js";
-import { defaultTemplates } from "../src/instructions/assemble.js";
+import { assembleInstructions, defaultTemplates } from "../src/instructions/assemble.js";
 import {
+  DOC_BUDGET_RATIO,
   docBudgetBytes,
   fitMaterial,
   MATERIAL_HEAD,
@@ -65,6 +66,12 @@ afterEach(async () => {
 const RULES = path.resolve(import.meta.dirname, "../../../fixtures/acceptance/injection/user-doc-rules.md");
 
 type Who = keyof Family["cookies"];
+
+/** The system instructions of an adult's normal conversation without documents, in UTF-8 bytes, as assembled now. */
+const plainInstructionBytes = () =>
+  utf8Bytes(
+    assembleInstructions({ user: { youth: false }, mode: "normal", tools: [], now: new Date() }).text,
+  );
 
 async function start(
   o: {
@@ -509,10 +516,10 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
   });
 
   it("over the budget in a session: items left out, marked in the box, and '기억 일부만 넣었어요' once", async () => {
-    // A small window (test registry only): 25% of 42,000 tokens = 10,500 bytes for everything (the system
-    // instructions included — 26,000 left no room for any item once #185's source rules were added, 30,000 none
-    // once common@8's diagram rules were, 38,000 too little once common@11's missing-citation rules were).
-    const t = await start({ window: 42_000 });
+    // A small window (test registry only), derived from the system instructions as assembled now (#202, review
+    // 1차): the documents' share (25% of the window, in bytes) holds the instructions and ~3,000 bytes more — room
+    // for some of the 200 items, never all. Growing instructions need no edit here.
+    const t = await start({ window: Math.ceil((plainInstructionBytes() + 3_000) / DOC_BUDGET_RATIO) });
     t.connect("claude-code");
     const items = Array.from(
       { length: 200 },
@@ -526,7 +533,9 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
     const c = await t.newConversation();
     const run = await t.send(c, "안녕");
     const p = lastPrompt(t.claude);
+    // Partly included: some items, not none and not all.
     expect(p).toContain("MEM000");
+    expect(p).toContain("MEM005");
     expect(p).not.toContain("MEM199");
     expect(p).toMatch(/MEMORY 항목 \d+개는 넣지 않았다/);
     const notices = t.app
@@ -544,10 +553,14 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
   });
 
   it("#45: the documents come off the summary budget first — the same history is summarised once they are there", async () => {
-    // Window 40,000, ratio 0.7 (28,000), reserve 8,000, short answers, the last 2 messages kept as they are.
+    // Sizes derived from the instructions as assembled now (#202, review 1차 — growing instructions need no edit):
+    // the window gives the documents' share room for the instructions and all of b's MEMORY; the two long messages
+    // put a (no documents) half of b's document bytes under the summary threshold (ratio 0.7, reserve 8,000), so b
+    // (its documents come off the budget first, counted as tokens) is over it.
+    const window = Math.ceil((plainInstructionBytes() + 12_000) / DOC_BUDGET_RATIO);
     const make = async () => {
       const t = await start({
-        window: 40_000,
+        window,
         context: { recentMessages: 2 },
         script: { script: () => [{ text: "네" }] },
       });
@@ -556,7 +569,6 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
     };
     const a = await make();
     const b = await make();
-    // b's user has MEMORY filling the documents' budget (≈ 7,000 bytes, counted as tokens); a's has none.
     b.memory.store.addItems(
       b.memory.store.ensure(b.f.users.owner.id, "memory"),
       Array.from({ length: 40 }, (_, i) => ({
@@ -566,11 +578,11 @@ describe("context injection (spec §2): AGENT → SOUL → USER → MEMORY, the 
       })),
       "user",
     );
-    // Two long messages (≈ 19,000 estimated tokens) + the reserve stay under 28,000; with the documents they do not.
-    // (9,000 each left the documents too little room once common@10's file citation rules were added, 9,500 once
-    // common@11's missing-citation rules were — the documents' budget includes the system instructions; 9,700–9,900
-    // pass, 9,800 sits in the middle.)
-    const long = "다".repeat(9800); // 29,400 bytes ≈ 9,800 tokens each
+    const docBytes = utf8Bytes(renderMaterial(b.memory.docSet(b.f.users.owner.id)));
+    expect(docBytes).toBeGreaterThan(4_000);
+    expect(docBytes).toBeLessThan(12_000); // all of it fits the share
+    // One "다" is 3 bytes = 1 estimated token.
+    const long = "다".repeat(Math.floor((0.7 * window - 8_000 - docBytes / 2) / 2));
     for (const t of [a, b]) {
       const c = await t.newConversation();
       await t.send(c, long);

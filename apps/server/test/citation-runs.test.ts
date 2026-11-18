@@ -175,6 +175,7 @@ function expectScenario(name: CitationScenarioName | "reuse-fresh", r: Result, l
       expect(statuses(r), label).toEqual([
         [1, "verified"],
         [2, "verified"],
+        [3, "verified"],
       ]);
       expect(missingText(r), label).toEqual([
         "- **전망:** 업계는 내년에도 두 자릿수 증가를 예상해요",

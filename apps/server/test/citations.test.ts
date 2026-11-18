@@ -1853,6 +1853,59 @@ describe("citationNote", () => {
       expect(missingOf([...read("a"), ...text(`${table}\n\n그래서 학종이 유리해요[1].`)])).toEqual([table]);
     });
 
+    it("review 1차: facts in progress-like, opinion-like and offer-like shapes stay flagged", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      // The world's progress, not the assistant's work on the material.
+      for (const note of [
+        "학종 경쟁률이 계속 상승하고 있어요.",
+        "지원자가 늘고 있어요.",
+        "모집 인원은 줄어드는 중이에요.",
+        "시트가 업데이트되고 있어요.",
+      ])
+        expect(between(note), note).toEqual([note]);
+      expect(between("이제 학과별 입결 시트를 확인하고 있어요.")).toEqual([]);
+      expect(between("두 파일을 다 읽었어요. 제가 지금 비교하는 중이에요.")).toEqual([]);
+      // A sentence without the framing, bold or glued to the one before; a lone mark.
+      for (const p of [
+        "제 판단으로는 학종이 유리해요. **올해 모집은 끝났습니다.**",
+        "제 판단으로는 학종이 유리해요.올해 모집은 끝났습니다.",
+        "**제 판단으로는 학종이 유리해요.** 올해 모집은 끝났습니다.",
+        "- **올해 모집은 끝났습니다.** 제 판단으로는 학종이 유리해요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // Framed in every sentence, a numbered item or a labelled one: an opinion.
+      for (const p of [
+        "1. 제 생각에는 학종이 나아요.",
+        "- **추천:** 제 생각에는 학종이 나아요.",
+        "제 판단으로는 학종이 유리해요.교과는 어렵다는 게 제 추정이에요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([]);
+      // An offer glued to a statement.
+      expect(missingOf([...read("a"), ...text("가[1].\n\n올해 모집이 마감되었습니다.더 볼까요?")])).toEqual([
+        "올해 모집이 마감되었습니다.더 볼까요?",
+      ]);
+      // Before the first call: two sentences without a space are two.
+      expect(
+        missingOf([...text("수출이 늘었어요.더 찾아볼게요.\n\n"), ...read("a"), ...text("가[1].")]),
+      ).toEqual(["수출이 늘었어요.더 찾아볼게요."]);
+    });
+
+    it("review 1차: a GFM table is one unit (rows without an outer `|` too); a table before is not a sentence before", () => {
+      const mixed = "전형 | 인원\n|---|---|\n학종 | 30\n교과 | 20";
+      expect(missingOf([...read("a"), ...text(`입결은 아래와 같아요[1].\n\n${mixed}`)])).toEqual([]);
+      expect(missingOf([...read("a"), ...text(`${mixed}\n\n가[1].`)])).toEqual([mixed]);
+      // Two tables in a row: the first one's last cell does not cover the second.
+      const price = "| 품목 | 가격 |\n|---|---|\n| 사과 | 1000[1] |";
+      const grades = "| 과목 | 등급 |\n|---|---|\n| 국어 | 2 |";
+      expect(missingOf([...read("a"), ...text(`${price}\n\n${grades}`)])).toEqual([grades]);
+      // The sentence right before: glued sentences are two — only the last one counts.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`자료는 시행계획이에요[1].아래 표를 보세요.\n\n${table}`)]),
+      ).toEqual([table]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [
@@ -1860,6 +1913,8 @@ describe("citationNote", () => {
         `입결은 아래 표와 같아요[1].\n\n${table}`,
         `### 2025 입결[1]\n\n${table}`,
         `${table}\n\n*표 1. 2025 입결[1]*`,
+        `${table}\n\n표 1 전형별 인원[1]`,
+        `${table}\n\n표 2: 전형별 인원[1]`,
         `${table}\n\n(자료: 2026 시행계획[1])`,
       ])
         expect(missingOf([...read("a"), ...text(t)]), t).toEqual([]);

@@ -139,7 +139,8 @@ export const CITATION_SCENARIOS = {
       "### 요약\n\n10월 반도체 수출은 메모리 가격 회복 덕에 늘었어요[1].\n\n업계는 내년에도 두 자릿수 증가를 예상해요.\n\n주요 내용:\n- 증가의 배경은 메모리 가격이에요[1]\n- 미국 수출 비중이 가장 컸어요\n\n※ 이 답변은 공개 보도를 바탕으로 했어요.",
   },
   /**
-   * The shape of #202's production answer: progress notes between the calls, a cited table, a list, an uncited
+   * The shape of #202's production answer: progress notes between the calls, a table whose figures are cited in their
+   * own rows, a list, an uncited
    * factual paragraph, an opinion said so and a closing offer. Only the factual paragraph and the list item without
    * a marker are flagged — marked in the answer, counted in one line under it.
    */
@@ -152,6 +153,15 @@ export const CITATION_SCENARIOS = {
         before: "첫 기사를 다 읽었어요. 이제 통계 자료를 확인하고 있어요.\n\n",
       },
       { tool: "cite", input: { sourceId: "$0.sourceId", snippet: "메모리 가격 회복이 증가를 이끌었다" } },
+      // Each figure of the table backed in its own row (review 1차): 32% by the newspaper, 28% by the statistics.
+      {
+        tool: "cite",
+        input: {
+          sourceId: "$0.sourceId",
+          snippet:
+            "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.",
+        },
+      },
       { tool: "cite", input: { sourceId: "$1.sourceId", snippet: "“10월 반도체 수출 증가율은  28%로”" } },
     ],
     answer: [
@@ -159,12 +169,12 @@ export const CITATION_SCENARIOS = {
       "",
       "메모리 가격 회복이 증가를 이끌었어요[1].",
       "",
-      "두 자료의 증가율은 이래요[2]:",
+      "두 자료의 증가율은 이래요:",
       "",
       "| 자료 | 증가율 |",
       "|---|---|",
-      "| 가나다 신문 | 32% |",
-      "| 라마바 통계 | 28% |",
+      "| 가나다 신문 | 32%[2] |",
+      "| 라마바 통계 | 28%[3] |",
       "",
       "- **배경:** 메모리 가격 회복이에요[1]",
       "- **전망:** 업계는 내년에도 두 자릿수 증가를 예상해요",

@@ -1,4 +1,12 @@
-import { createContext, memo, useContext, useMemo, type ComponentProps, type ReactNode } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useMemo,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
@@ -11,6 +19,7 @@ import { MermaidBlock } from "./MermaidBlock.js";
 import type { TextRange } from "@agentlee/shared";
 import { CITATION_MISSING_MARK } from "@agentlee/shared";
 import { rehypeCitationMarkers, rehypeMissingMarks } from "../citations/markdown.js";
+import { marksChanged } from "../citations/marks.js";
 import "katex/dist/katex.min.css";
 
 /**
@@ -110,23 +119,27 @@ const components: Components = {
     ),
   pre: ({ node, children }) => <CodeBlock node={node as HastNode | undefined}>{children}</CodeBlock>,
   table: ({ children, ...props }) => {
-    // A table without a citation (#202, `rehypeMissingMarks`): marked as a whole, the ⚠️ above it.
-    const mark = (props as Record<string, unknown>)["data-cite-missing"];
-    return typeof mark === "string" ? (
+    // A table without a citation (#202, `rehypeMissingMarks`): marked as a whole, the ⚠️ above it when it is
+    // its range's focus target (a table continuing a range from an earlier part only gets the bar).
+    const p = props as Record<string, unknown>;
+    const target = p["data-cite-missing"];
+    return String(p.className ?? "").includes("cite-missing-block") ? (
       <div
         className="cite-missing-block cite-missing-table"
-        data-cite-missing={mark}
-        data-testid="citation-missing"
-        tabIndex={-1}
+        {...(typeof target === "string"
+          ? { "data-cite-missing": target, "data-testid": "citation-missing", tabIndex: -1 }
+          : {})}
       >
-        <span
-          className="cite-missing-badge"
-          role="img"
-          aria-label={CITATION_MISSING_MARK}
-          title={CITATION_MISSING_MARK}
-        >
-          ⚠️
-        </span>
+        {typeof target === "string" && (
+          <span
+            className="cite-missing-badge"
+            role="img"
+            aria-label={CITATION_MISSING_MARK}
+            title={CITATION_MISSING_MARK}
+          >
+            ⚠️
+          </span>
+        )}
         <div className="tablewrap">
           <table>{children}</table>
         </div>
@@ -180,7 +193,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
               ...(rehypePlugins ?? []),
               rehypeCitationMarkers(cite.numbers),
               ...(cite.missing?.length && cite.markId
-                ? [rehypeMissingMarks(cite.missing, offset, cite.markId)]
+                ? [rehypeMissingMarks(cite.missing, offset, offset + text.length, cite.markId)]
                 : []),
             ],
             components: {
@@ -198,8 +211,13 @@ export const MarkdownBlock = memo(function MarkdownBlock({
             } as Components,
           }
         : undefined,
-    [cite, offset],
+    [cite, offset, text],
   );
+  // Its marks are drawn: the answer's summary line may move to them now (#202).
+  const marked = !!(cite?.missing?.length && cite.markId);
+  useEffect(() => {
+    if (marked) marksChanged();
+  }, [marked, withCite]);
   return (
     <BlockText.Provider value={text}>
       <ReactMarkdown
@@ -226,10 +244,9 @@ const Markdown = memo(function Markdown({
   offset?: number;
 }) {
   const blocks = splitBlocks(text);
-  const starts = blocks.reduce<number[]>(
-    (acc, b, i) => [...acc, i ? acc[i - 1]! + blocks[i - 1]!.length : offset],
-    [],
-  );
+  // Where each block starts in the answer text: one pass.
+  const starts: number[] = [];
+  for (let i = 0, at = offset; i < blocks.length; at += blocks[i]!.length, i++) starts.push(at);
   return (
     <div className="md">
       {blocks.map((b, i) => (

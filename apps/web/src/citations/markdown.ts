@@ -15,7 +15,7 @@ type Hast = {
   value?: string;
   properties?: Record<string, unknown>;
   children?: Hast[];
-  position?: { start: { offset?: number } };
+  position?: { start: { offset?: number }; end?: { offset?: number } };
 };
 
 const MARKER = /\[(\d{1,3})\]/g;
@@ -78,46 +78,88 @@ const badge = (): Hast => ({
   children: [{ type: "text", value: "⚠️" }],
 });
 
+const startOf = (n: Hast) => n.position?.start.offset;
+const endOf = (n: Hast) => n.position?.end?.offset;
+
 /**
  * Paragraphs without a citation, marked in the rendered answer (#202 — the source note no longer repeats them).
- * `ranges` are the note's `missing` ranges in the answer text; `offset` is where this markdown block starts in it
- * (text parts joined, then `splitBlocks`). An element whose source starts inside a range is that paragraph: a
- * paragraph, a list item (the outermost — a loose item's own paragraph is inside it; a nested item starts its own
- * range), a table or a quote. It gets `data-cite-missing` (the answer's mark id, which the summary line moves to),
- * focusability for that move, and a ⚠️ at the end of its text (a table's ⚠️ is drawn by the table component).
+ * `ranges` are the note's `missing` ranges in the answer text; this markdown block is `[offset, end)` of it (text
+ * parts joined, then `splitBlocks`).
+ *
+ * **One focus target per range** (review 1차 — the summary line counts ranges and moves to targets, so the two
+ * always agree): the first element, in document order, whose source starts inside the range — a paragraph, a list
+ * item, a table or a quote — is the range's target: `data-cite-missing` (the answer's mark id), focusable, a ⚠️ at
+ * the end of its own text (a table's is drawn by the table component). Its children of *other* ranges (a loose
+ * item's second paragraph, a nested item) are still marked for theirs. A range that began in an earlier block or
+ * text part (a paragraph cut by a tool call) only gets the bar here: its target is where it starts. A range that
+ * starts in this block but has no such element (block math, indented code, raw HTML shown as text — ranges stored
+ * by an older server) gets the top-level node it covers wrapped as its target, or an empty target at its place.
  * Ranges stored by an older server mark the same way: the marks come from the ranges, nothing is recomputed.
  */
-export function rehypeMissingMarks(ranges: readonly TextRange[], offset: number, markId: string) {
-  const inRange = (at: number) => ranges.some((r) => at >= r.start && at < r.end);
-  const mark = (el: Hast) => {
-    const props = (el.properties ??= {});
-    const cls = props.className;
-    props.className = [...(Array.isArray(cls) ? (cls as unknown[]) : cls ? [cls] : []), "cite-missing-block"];
+export function rehypeMissingMarks(
+  ranges: readonly TextRange[],
+  offset: number,
+  end: number,
+  markId: string,
+) {
+  const rangeAt = (at: number) => ranges.findIndex((r) => at >= r.start && at < r.end);
+  const isOurs = (i: number) => ranges[i]!.start >= offset && ranges[i]!.start < end;
+  const targetProps = (props: Record<string, unknown>) => {
     props.dataCiteMissing = markId;
     props.dataTestid = "citation-missing";
     props.tabIndex = -1;
+  };
+  const mark = (el: Hast, i: number) => {
+    const props = (el.properties ??= {});
+    const cls = props.className;
+    props.className = [...(Array.isArray(cls) ? (cls as unknown[]) : cls ? [cls] : []), "cite-missing-block"];
+    if (!isOurs(i)) return; // the bar only: the range's target is where it starts
+    targetProps(props);
     if (el.tagName === "table") return;
     const kids = (el.children ??= []);
-    // The ⚠️ goes at the end of the paragraph's own text: in a loose item or a quote, its last paragraph before
-    // any nested list; else before the nested list.
+    // The ⚠️ at the end of the element's own text: the last paragraph of this range before any nested block, or
+    // right before the nested block.
     const nestedAt = kids.findIndex((k) => k.type === "element" && NESTED.has(k.tagName ?? ""));
     const own = nestedAt === -1 ? kids : kids.slice(0, nestedAt);
-    const para = [...own].reverse().find((k) => k.type === "element" && k.tagName === "p");
+    const para = [...own]
+      .reverse()
+      .find((k) => k.type === "element" && k.tagName === "p" && rangeAt(offset + (startOf(k) ?? -1)) === i);
     if (para) (para.children ??= []).push(badge());
     else kids.splice(nestedAt === -1 ? kids.length : nestedAt, 0, badge());
   };
-  const walk = (node: Hast) => {
-    for (const c of node.children ?? []) {
-      if (c.type !== "element") continue;
-      const at = c.position?.start.offset;
-      if (MARKABLE.has(c.tagName ?? "") && at !== undefined && inRange(offset + at)) {
-        mark(c);
-        // A nested list's items are paragraphs of their own.
-        for (const k of c.children ?? []) if (k.tagName === "ul" || k.tagName === "ol") walk(k);
-      } else if (c.tagName !== "pre" && c.tagName !== "code") walk(c);
-    }
-  };
   return () => (tree: Hast) => {
-    if (ranges.length) walk(tree);
+    if (!ranges.length) return;
+    const claimed = new Set<number>();
+    const walk = (node: Hast) => {
+      for (const c of node.children ?? []) {
+        if (c.type !== "element") continue;
+        const at = startOf(c);
+        const i = MARKABLE.has(c.tagName ?? "") && at !== undefined ? rangeAt(offset + at) : -1;
+        if (i !== -1 && !claimed.has(i)) {
+          claimed.add(i);
+          mark(c, i);
+        }
+        if (c.tagName !== "pre" && c.tagName !== "code") walk(c);
+      }
+    };
+    walk(tree);
+    // Ranges of this block left without a target: the top-level node they cover, wrapped; else an empty target.
+    const root = (tree.children ??= []);
+    ranges.forEach((r, i) => {
+      if (claimed.has(i) || !isOurs(i)) return;
+      let k = root.findIndex((n) => {
+        const s = startOf(n);
+        const e = endOf(n);
+        return s !== undefined && e !== undefined && offset + s < r.end && offset + e > r.start;
+      });
+      // Block math comes back from KaTeX without its source position: the element that has none.
+      if (k === -1) k = root.findIndex((n) => n.type === "element" && startOf(n) === undefined);
+      const props: Record<string, unknown> = { className: ["cite-missing-block", "cite-missing-wrap"] };
+      targetProps(props);
+      const wrap: Hast = { type: "element", tagName: "div", properties: props, children: [badge()] };
+      if (k === -1) root.push(wrap);
+      else wrap.children!.unshift(root.splice(k, 1, wrap)[0]!);
+      claimed.add(i);
+    });
   };
 }
