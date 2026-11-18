@@ -19,7 +19,7 @@ import {
 } from "@agentlee/shared";
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
-import { afterSave } from "../instructions/draft.js";
+import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
 
 /**
  * 관리자 → 기억 정리 (#146, #188, PRD FR-16.6·16.8): what stays the admin's once each user sets their own 기억 정리
@@ -53,21 +53,22 @@ const pairKey = (c: DreamingChoice) => `${c.runtime}|${c.connectionId ?? ""}|${c
 
 function Settings({ view }: { view: View }) {
   const qc = useQueryClient();
-  const [draft, setDraft] = useState<DreamingConfig>();
+  // Only the changed fields (draft.ts): a stale page saving the cap never turns the server back on (review #195 5).
+  const [draft, setDraft] = useState<Partial<DreamingConfig>>();
   const [saved, setSaved] = useState(false);
-  const c = draft ?? view.config;
-  // Locked while saving; a success drops the draft only if it is still the one sent (review #195 round 4).
+  const c = withDraft(view.config, draft);
+  // Locked while saving; refetched after (never the answer into the cache); the sent fields still as sent are dropped.
   const save = useMutation({
-    mutationFn: (sent: DreamingConfig) => adminDreaming.save(sent),
-    onSuccess: (v, sent) => {
-      qc.setQueryData(ADMIN_DREAMING_KEY, v);
-      setDraft((cur) => afterSave(cur, sent, undefined));
+    mutationFn: (sent: Partial<DreamingConfig>) => adminDreaming.save(sent),
+    onSuccess: async (_v, sent) => {
+      await qc.invalidateQueries({ queryKey: ADMIN_DREAMING_KEY });
+      setDraft((cur) => settleDraft(cur, sent));
       setSaved(true);
     },
   });
   const edit = (p: Partial<DreamingConfig>) => {
     setSaved(false);
-    setDraft({ ...c, ...p });
+    setDraft((d) => ({ ...d, ...p }));
   };
   const options = view.candidates.flatMap((x) =>
     x.models.map((m) => ({
@@ -87,7 +88,7 @@ function Settings({ view }: { view: View }) {
       aria-labelledby="dream-settings-h"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!save.isPending) save.mutate(c);
+        if (!save.isPending) save.mutate(draft ?? {});
       }}
     >
       <h2 id="dream-settings-h">기억 정리</h2>
@@ -200,7 +201,8 @@ function choiceLabel(view: View, s: DreamingSettings): string {
 
 function Status({ view }: { view: View }) {
   const qc = useQueryClient();
-  const refresh = () => void qc.invalidateQueries({ queryKey: ADMIN_DREAMING_KEY });
+  const refresh = () => qc.invalidateQueries({ queryKey: ADMIN_DREAMING_KEY });
+  // Partial bodies; resolved only once refetched, so a form drops its draft onto fresh values.
   const setYouth = useMutation({
     mutationFn: (a: { id: string; body: SaveYouthDreamingRequest }) => adminDreaming.setUser(a.id, a.body),
     onSuccess: refresh,

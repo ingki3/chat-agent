@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { NotificationPrefs, PushDevice } from "@agentlee/shared";
+import type { PushDevice, SaveNotificationPrefsRequest } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
 import {
   browserState,
@@ -214,13 +214,15 @@ function QuietHours() {
   const save = useMutation({
     mutationFn: () => {
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Seoul";
-      const p: NotificationPrefs = value.on
+      // Only the quiet hours (and the zone they are in): the server keeps the rest as stored (#188 review 5).
+      const p: SaveNotificationPrefsRequest = value.on
         ? { quietStart: value.start, quietEnd: value.end, timeZone }
         : { quietStart: null, quietEnd: null, timeZone };
       return notifications.setPrefs(p);
     },
-    onSuccess: (p) => {
-      qc.setQueryData(PREFS_KEY, p);
+    // Refetched, never the answer into the cache (it could be older than a toggle saved meanwhile).
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: PREFS_KEY });
       setDraft(undefined);
       setSaved(true);
     },
@@ -300,9 +302,11 @@ function MemoryNotifications() {
   const qc = useQueryClient();
   const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
   const save = useMutation({
-    mutationFn: (patch: Pick<NotificationPrefs, "memoryProposals" | "memoryApplied" | "memoryFailed">) =>
-      notifications.setPrefs({ ...prefs.data!, ...patch }),
-    onSuccess: (p) => qc.setQueryData(PREFS_KEY, p),
+    // Only the toggled field (#188 review 5): never the whole object, which would overwrite quiet hours saved meanwhile.
+    mutationFn: (
+      patch: Pick<SaveNotificationPrefsRequest, "memoryProposals" | "memoryApplied" | "memoryFailed">,
+    ) => notifications.setPrefs(patch),
+    onSuccess: () => qc.invalidateQueries({ queryKey: PREFS_KEY }),
   });
   const loading = !prefs.data || save.isPending;
   return (

@@ -325,3 +325,52 @@ test("저장 중에는 설정 폼이 잠기고, 저장한 값이 그대로 남�
   await expect(time).toHaveValue(at);
   await expect(page.getByTestId("dreaming-state")).toContainText(`기억 정리가 매일 ${at}`);
 });
+
+test("다른 곳에서 바꾼 값은 지키고, 새로 불러오기에 실패해도 폼과 초안이 남는다 (리뷰 #195 5차)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "dreamwriters");
+  await signIn(page, baseURL!, me);
+  await asAdmin(browser, baseURL!, async () => {});
+  await page.goto("/settings/instructions?doc=dreams");
+  const settings = page.getByTestId("dreaming-settings");
+  const time = settings.getByLabel("실행 시각");
+  await expect(time).toHaveValue("03:00");
+  // Another tab (the same account) moves the time while this page still shows 03:00.
+  const other = laterToday();
+  const put = await page.request.put("/api/dreaming/settings", {
+    data: { time: other },
+    headers: csrf(baseURL!),
+  });
+  expect(put.status()).toBe(200);
+  // This page turns it on and picks the connection — the time it did not touch stays the other tab's.
+  await settings.getByRole("checkbox", { name: "기억 정리 켜기" }).check();
+  const pick = settings.getByRole("combobox", { name: "연결·모델" });
+  const value = await pick.locator("option", { hasText: "Fake Large" }).first().getAttribute("value");
+  await pick.selectOption(value!);
+  await settings.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(settings.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+  await expect(time).toHaveValue(other);
+  const mine = (await (await page.request.get("/api/dreaming")).json()) as {
+    settings: { time: string; enabled: boolean };
+  };
+  expect(mine.settings).toMatchObject({ time: other, enabled: true });
+
+  // Refetching fails (503): the form stays on what it has, with its unsaved draft, and says so.
+  await time.fill("04:44");
+  await page.route("**/api/dreaming", (route) =>
+    route.request().method() === "GET"
+      ? route.fulfill({ status: 503, contentType: "application/json", body: '{"error":"unavailable"}' })
+      : route.continue(),
+  );
+  const panel = page.getByTestId("dreaming-panel");
+  await panel.getByText(/지금 쓰는 정리 프롬프트/).click();
+  await panel.getByTestId("dreaming-prompt").fill("취미만 골라 주세요");
+  await panel.getByRole("button", { name: "프롬프트 저장" }).click();
+  await expect(page.getByTestId("dreaming-load-error")).toBeVisible();
+  await expect(settings).toBeVisible();
+  await expect(time).toHaveValue("04:44");
+  await page.unroute("**/api/dreaming");
+});

@@ -8,6 +8,7 @@ import {
   SaveYouthDreamingRequest,
   type DreamingAdmin,
   type DreamingCandidate,
+  type DreamingConfig,
   type DreamingConnectionChoice,
   type DreamingPreview,
   type DreamingPromptView,
@@ -114,6 +115,14 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     return "dreaming_choice_not_allowed";
   };
 
+  /** The stored settings with the fields sent on top (#188 review 5: partial saves, the later write wins). */
+  const mergeSettings = (userId: string, given: SaveDreamingSettingsRequest): DreamingSettings => ({
+    ...store.settingsOf(userId),
+    ...(Object.fromEntries(
+      Object.entries(given).filter(([, v]) => v !== undefined),
+    ) as Partial<DreamingSettings>),
+  });
+
   const problemOf = (userId: string, settings: DreamingSettings) =>
     settings.enabled ? runner.problemOf(userId) : null;
 
@@ -142,9 +151,11 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     if (user.youth) return send(reply, { error: "dreaming_youth_locked" }, 403);
     const r = SaveDreamingSettingsRequest.safeParse(req.body);
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-    const bad = checkSettings(user.id, r.data);
+    // Only the fields sent change (#188 review 5): merged into what is stored, then checked as a whole.
+    const merged = mergeSettings(user.id, r.data);
+    const bad = checkSettings(user.id, merged);
     if (bad) return send(reply, { error: bad }, 400);
-    store.setSettings(user.id, r.data);
+    store.setSettings(user.id, merged);
     engine.kick();
     return send(reply, mine(user));
   });
@@ -239,7 +250,13 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
   app.put("/api/admin/dreaming", { config: ADMIN }, async (req, reply) => {
     const r = SaveDreamingConfigRequest.safeParse(req.body);
     if (!r.success) return send(reply, { error: "invalid_request" }, 400);
-    const c = r.data;
+    // Only the fields sent change (#188 review 5): a stale page saving the token cap never turns the server back on.
+    const c: DreamingConfig = {
+      ...store.config(),
+      ...(Object.fromEntries(
+        Object.entries(r.data).filter(([, v]) => v !== undefined),
+      ) as Partial<DreamingConfig>),
+    };
     // Only shared API key connections and their models (spec §7, D2) — or the FakeRuntime without one. A pair already
     // allowed whose connection went away may stay (its users are paused; the admin sees it as unavailable).
     const cands = candidates();
@@ -280,10 +297,7 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
       if (!u.youth) return send(reply, { error: "dreaming_not_youth" }, 403);
       const { applyMode, prompt, ...given } = r.data;
       // Only what was sent changes (a 반영 방식 or a prompt alone keeps the settings as stored).
-      const settings: DreamingSettings = {
-        ...store.settingsOf(u.id),
-        ...Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined)),
-      };
+      const settings = mergeSettings(u.id, given);
       const bad = Object.keys(given).length ? checkSettings(u.id, settings) : null;
       if (bad) return send(reply, { error: bad }, 400);
       if (prompt !== undefined && prompt !== null && holdsSecret(prompt))

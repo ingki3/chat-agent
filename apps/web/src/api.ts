@@ -88,8 +88,9 @@ import {
   DreamingPreview,
   DreamingUserStatus,
   MyDreaming,
-  type DreamingConfig,
-  type DreamingSettings,
+  type SaveDreamingConfigRequest,
+  type SaveDreamingSettingsRequest,
+  type SaveNotificationPrefsRequest,
   type SaveYouthDreamingRequest,
   MemoryPrefs,
   MemoryProposal,
@@ -529,7 +530,8 @@ export const notifications = {
   readAll: async () => UnreadCount.parse(await call("POST", "/api/notifications/read-all", {})).unread,
   test: async () => call("POST", "/api/notifications/test", {}),
   prefs: async () => NotificationPrefs.parse(await call("GET", "/api/notifications/prefs")),
-  setPrefs: async (p: NotificationPrefs) =>
+  /** Only the changed fields (the server merges them; quiet hours as a pair). */
+  setPrefs: async (p: SaveNotificationPrefsRequest) =>
     NotificationPrefs.parse(await call("PUT", "/api/notifications/prefs", p)),
 };
 
@@ -915,7 +917,9 @@ export const DREAMING_KEY = ["dreaming"] as const;
 export const ADMIN_DREAMING_KEY = ["admin", "dreaming"] as const;
 export const dreaming = {
   mine: async () => MyDreaming.parse(await call("GET", "/api/dreaming")),
-  save: async (s: DreamingSettings) => MyDreaming.parse(await call("PUT", "/api/dreaming/settings", s)),
+  /** Only the changed fields (the server merges them). */
+  save: async (s: SaveDreamingSettingsRequest) =>
+    MyDreaming.parse(await call("PUT", "/api/dreaming/settings", s)),
   savePrompt: async (content: string | null) =>
     MyDreaming.parse(await call("PUT", "/api/dreaming/prompt", { content })),
   preview: async (content?: string) =>
@@ -925,7 +929,9 @@ export const dreaming = {
 };
 export const adminDreaming = {
   get: async () => DreamingAdmin.parse(await call("GET", "/api/admin/dreaming")),
-  save: async (c: DreamingConfig) => DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
+  /** Only the changed fields (the server merges them). */
+  save: async (c: SaveDreamingConfigRequest) =>
+    DreamingAdmin.parse(await call("PUT", "/api/admin/dreaming", c)),
   /** A youth account's settings, 반영 방식 and (write-only) prompt — the admin's to set. */
   setUser: async (id: string, s: SaveYouthDreamingRequest) =>
     DreamingUserStatus.parse(await call("PUT", `/api/admin/dreaming/users/${enc(id)}`, s)),

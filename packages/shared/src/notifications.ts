@@ -65,6 +65,24 @@ export const NotificationPrefs = z
   .refine((p) => (p.quietStart === null) === (p.quietEnd === null), { message: "set both or neither" })
   .refine((p) => p.quietStart === null || p.quietStart !== p.quietEnd, { message: "start and end differ" });
 export type NotificationPrefs = z.infer<typeof NotificationPrefs>;
+/**
+ * `PUT /api/notifications/prefs` (#188 review 5): only the fields being changed — the server merges them into what is
+ * stored, so a page never overwrites what another page (or tab) saved meanwhile. Quiet hours go as a pair; the merged
+ * result must still be valid. The same field from two places: the later write wins.
+ */
+export const SaveNotificationPrefsRequest = z
+  .object({
+    quietStart: ClockTime.nullable(),
+    quietEnd: ClockTime.nullable(),
+    timeZone: z.string().min(1).max(64),
+    memoryProposals: z.boolean(),
+    memoryApplied: z.boolean(),
+    memoryFailed: z.boolean(),
+  })
+  .partial()
+  .strict()
+  .refine((p) => "quietStart" in p === "quietEnd" in p, { message: "quiet hours go as a pair" });
+export type SaveNotificationPrefsRequest = z.infer<typeof SaveNotificationPrefsRequest>;
 
 /** A browser's push subscription (`PushSubscription.toJSON()`), plus a short device label. */
 export const PushSubscriptionRequest = z.object({

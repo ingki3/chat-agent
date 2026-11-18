@@ -12,10 +12,11 @@ import {
   type DreamingPreview,
   type DreamingSettings,
   type DreamsRecord,
+  type SaveDreamingSettingsRequest,
   type MyDreaming,
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
-import { afterSave } from "./draft.js";
+import { afterSave, settleDraft, withDraft } from "./draft.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -28,10 +29,20 @@ import { MemoryCard } from "./MemoryCard.js";
 export function DreamingPanel() {
   const q = useQuery({ queryKey: DREAMING_KEY, queryFn: dreaming.mine });
   const d = q.data;
-  if (q.isError) return <p className="error">{errorText(q.error)}</p>;
-  if (!d) return <p className="muted small">불러오는 중…</p>;
+  // A failed refetch keeps the form (and its drafts) on the data we have, with the error above it (review #195 5).
+  if (!d)
+    return q.isError ? (
+      <p className="error">{errorText(q.error)}</p>
+    ) : (
+      <p className="muted small">불러오는 중…</p>
+    );
   return (
     <div className="dreaming-panel" data-testid="dreaming-panel">
+      {q.isError && (
+        <p className="error small" role="alert" data-testid="dreaming-load-error">
+          새로 불러오지 못했어요: {errorText(q.error)} (보이는 값은 마지막으로 불러온 것이에요)
+        </p>
+      )}
       <p className="small" data-testid="dreaming-state">
         {d.enabled
           ? `기억 정리가 매일 ${d.time ?? ""}(한국 시각)에 새 메시지를 정리해요. 반영 방식은 위의 "기억 반영 방식"을 따라요.`
@@ -88,12 +99,13 @@ export function DreamingSettingsForm({
   pending: boolean;
   /** Prefix of the accessible names (a row of the admin's table names its user). */
   label?: string;
-  /** Resolves when saved, rejects when refused (the caller shows the error). */
-  onSave: (s: DreamingSettings) => Promise<unknown>;
+  /** Saves only the changed fields; resolves once saved and refetched, rejects when refused (the caller says why). */
+  onSave: (s: SaveDreamingSettingsRequest) => Promise<unknown>;
 }) {
-  const [draft, setDraft] = useState<DreamingSettings>();
-  const s = draft ?? settings;
-  const edit = (p: Partial<DreamingSettings>) => setDraft({ ...s, ...p });
+  // Only the changed fields (draft.ts): the others follow the server.
+  const [draft, setDraft] = useState<Partial<DreamingSettings>>();
+  const s = withDraft(settings, draft);
+  const edit = (p: Partial<DreamingSettings>) => setDraft((d) => ({ ...d, ...p }));
   const current = choiceKey(s);
   const offered = choices.some((c) => choiceKey(c) === current);
   const name = (n: string) => (label ? `${label} ${n}` : n);
@@ -105,7 +117,7 @@ export function DreamingSettingsForm({
         if (pending || draft === undefined) return;
         const sent = draft;
         void onSave(sent).then(
-          () => setDraft((cur) => afterSave(cur, sent, undefined)),
+          () => setDraft((cur) => settleDraft(cur, sent)),
           () => {},
         );
       }}
@@ -169,11 +181,12 @@ export function DreamingSettingsForm({
 function Settings({ view }: { view: MyDreaming }) {
   const qc = useQueryClient();
   const [saved, setSaved] = useState(false);
+  // The answer is not put in the cache (it could be older than another form's save): refetched instead.
   const save = useMutation({
-    mutationFn: (s: DreamingSettings) => dreaming.save(s),
+    mutationFn: (s: SaveDreamingSettingsRequest) => dreaming.save(s),
     onMutate: () => setSaved(false),
-    onSuccess: (v) => {
-      qc.setQueryData(DREAMING_KEY, v);
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: DREAMING_KEY });
       setSaved(true);
     },
   });
@@ -214,13 +227,14 @@ function Prompt({ view }: { view: MyDreaming }) {
   // `typed`: the editor's draft when the save was sent — cleared on success only if it is still the same.
   const save = useMutation({
     mutationFn: (a: { content: string | null; typed: string | undefined }) => dreaming.savePrompt(a.content),
-    onSuccess: (v, a) => {
-      qc.setQueryData(DREAMING_KEY, v);
+    onSuccess: async (_v, a) => {
+      await qc.invalidateQueries({ queryKey: DREAMING_KEY });
       setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });
+  // 미리 실행 runs the prompt **saved on the server** (it sends none — review #195 5): what the next run would use.
   const run = useMutation({
-    mutationFn: () => dreaming.preview(content),
+    mutationFn: () => dreaming.preview(),
     onMutate: () => setPreview(undefined),
     onSuccess: (p) => setPreview(p),
   });
@@ -260,9 +274,14 @@ function Prompt({ view }: { view: MyDreaming }) {
             기본값으로 되돌리기
           </button>
           <button type="button" disabled={run.isPending} onClick={() => run.mutate()}>
-            {run.isPending ? "미리 실행 중…" : "미리 실행 (내 데이터)"}
+            {run.isPending ? "미리 실행 중…" : "미리 실행 (내 데이터, 저장된 프롬프트)"}
           </button>
         </div>
+      )}
+      {view.canEdit && text !== undefined && (
+        <p className="small muted">
+          미리 실행은 저장된 프롬프트로 돌아요. 고친 내용은 저장한 뒤 미리 실행해 보세요.
+        </p>
       )}
       {(save.isError || run.isError) && (
         <p className="error small" role="alert">

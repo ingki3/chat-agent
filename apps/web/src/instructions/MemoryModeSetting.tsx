@@ -20,7 +20,8 @@ export function MemoryModeSetting() {
   const [picked, setPicked] = useState<MemoryApplyMode | null>(null);
   const save = useMutation({
     mutationFn: (m: MemoryApplyMode) => memoryPrefs.set(m),
-    onSuccess: (p) => qc.setQueryData(MEMORY_PREFS_KEY, p),
+    // Refetched, never the answer into the cache (review #195 5).
+    onSuccess: () => qc.invalidateQueries({ queryKey: MEMORY_PREFS_KEY }),
     onSettled: () => setPicked(null),
   });
   const mode = picked ?? q.data?.applyMode;

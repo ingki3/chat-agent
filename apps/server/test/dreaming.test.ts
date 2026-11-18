@@ -991,6 +991,29 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect((await s.mine()).problem).toBe("unavailable");
   });
 
+  it("saves are partial (review 5): two writers changing different fields keep both; the merged result is checked", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    // A user's settings from two tabs: one moves the time, the other (loaded before) turns it off.
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { time: "04:10" })).statusCode).toBe(200);
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: false })).statusCode).toBe(200);
+    expect(s.d.store.settingsOf(owner)).toMatchObject({ time: "04:10", enabled: false, model: "fake-large" });
+    // A field alone that makes the whole invalid is refused (a model that is not an allowed pair).
+    const bad = await s.req("owner", "PUT", "/api/dreaming/settings", { enabled: true, model: "fake-small" });
+    expect(bad.json()).toEqual({ error: "dreaming_choice_not_allowed" });
+    expect(s.d.store.settingsOf(owner)).toMatchObject({ enabled: false, model: "fake-large" });
+    expect((await s.req("owner", "PUT", "/api/dreaming/settings", { nope: 1 })).statusCode).toBe(400);
+    // The admin's server settings: one admin page turns the server off, a stale one saves the token cap only.
+    expect((await s.req("admin", "PUT", "/api/admin/dreaming", { enabled: false })).statusCode).toBe(200);
+    expect((await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 250_000 })).statusCode).toBe(200);
+    expect(s.d.store.config()).toMatchObject({ enabled: false, tokenCap: 250_000 });
+    expect(s.d.store.config().allowed).toHaveLength(1);
+    // The same field from two places: the later write wins.
+    await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 260_000 });
+    await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 270_000 });
+    expect(s.d.store.config().tokenCap).toBe(270_000);
+  });
+
   it("youth (review 1): 반영 방식 locked too; the admin sets its 반영 방식 and prompt (write-only)", async () => {
     const s = await start();
     const son = s.uid("owner");

@@ -48,7 +48,13 @@ export const DreamingConfig = z.object({
   allowed: z.array(DreamingChoice).max(DREAMING_ALLOWED_MAX),
 });
 export type DreamingConfig = z.infer<typeof DreamingConfig>;
-export const SaveDreamingConfigRequest = DreamingConfig.strict();
+/**
+ * Saves send only the fields being changed (#188 review 5): the server merges them into what is stored, so a stale page
+ * never reverts what someone else changed meanwhile. The same field from two places: the later write wins (no
+ * versions — a family-sized app).
+ */
+export const SaveDreamingConfigRequest = DreamingConfig.partial().strict();
+export type SaveDreamingConfigRequest = z.infer<typeof SaveDreamingConfigRequest>;
 
 /** One user's own settings (설정 → 내 지침 → 기억 정리; a youth account's: the admin's). */
 export const DreamingSettings = z.object({
@@ -59,7 +65,9 @@ export const DreamingSettings = z.object({
   model: z.string().max(100).nullable(),
 });
 export type DreamingSettings = z.infer<typeof DreamingSettings>;
-export const SaveDreamingSettingsRequest = DreamingSettings.strict();
+/** Only the fields being changed (merged into the stored ones, like `SaveDreamingConfigRequest`). */
+export const SaveDreamingSettingsRequest = DreamingSettings.partial().strict();
+export type SaveDreamingSettingsRequest = z.infer<typeof SaveDreamingSettingsRequest>;
 /**
  * The admin's for a youth account (#188): any of its settings (the rest stay as stored), its 반영 방식 and its prompt —
  * write-only (null = the default; the admin's view never returns a prompt's text).
