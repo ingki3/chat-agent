@@ -39,6 +39,13 @@ export type SandboxPolicy = {
    * extra mach service, no file. Checked on macOS 27 (docs/decisions/isolation.md "음성 전사 (#173)").
    */
   gpu?: boolean;
+  /**
+   * Child processes (#191: yt-dlp starts its JS runtime, deno, for YouTube's challenge). Adds `process-fork`; what a
+   * child may run is still only `exec` (literal paths), and every child inherits this same profile. `runIsolated`
+   * then measures the memory of the whole process group and kills the group (leftovers included) once the command
+   * exits. Off for everything else: no runtime, skill or tool needs to fork.
+   */
+  fork?: boolean;
 };
 
 export type RunIsolatedOptions = SandboxPolicy & {
@@ -65,8 +72,8 @@ export type RunIsolatedOptions = SandboxPolicy & {
   gateFailed?: (why: GateFailure) => void;
   /** Stops the process (SIGKILL to its group) when aborted — the server shutting down (`killed: "aborted"`). */
   signal?: AbortSignal;
-  /** Tests only: replaces the `ps` measurement used by the monitor. */
-  probe?: () => Promise<{ pid: number; rss: number }[]>;
+  /** Tests only: replaces the `ps` measurement used by the monitor (given the job's pid). */
+  probe?: (pid: number) => Promise<{ pid: number; rss: number }[]>;
 };
 
 export type RunResult = {
@@ -92,8 +99,9 @@ export function buildProfile(policy: SandboxPolicy & { command: string }): strin
     '(import "system.sb")',
     // No process-fork: a sandboxed process cannot start children, so nothing can outlive it or escape its limits
     // (process groups and polling cannot guarantee that). Our MCP servers run in the server, reached over a
-    // loopback port, so runtimes do not need to fork for them.
+    // loopback port, so runtimes do not need to fork for them. (`fork`, #191, is the one exception — yt-dlp's deno.)
     "(allow signal (target same-sandbox))",
+    ...(policy.fork ? ["(allow process-fork)"] : []),
     `(allow process-exec ${exec.map((p) => `(literal ${lit(p)})`).join(" ")})`,
     ...exec.map((p) => `(allow file-read* (literal ${lit(p)}))`),
     ...[...read, ...(policy.trusted ?? []).map(canonicalPath)].map(
@@ -134,10 +142,15 @@ export class SandboxUnavailableError extends Error {
 
 export type Proc = { pid: number; rss: number };
 
-/** Resident memory (KiB) of one process via `ps`. Rejects when ps fails, times out or prints nothing usable. */
-export function snapshot(pid: number, timeoutMs = 2000): Promise<Proc[]> {
+/**
+ * Resident memory (KiB) of one process via `ps` — or, with `group`, of every process of the process group it leads
+ * (#191: `fork`; the caller adds them up). Rejects when ps fails, times out or prints nothing usable.
+ */
+export function snapshot(pid: number, timeoutMs = 2000, group = false): Promise<Proc[]> {
   return new Promise((resolve, reject) => {
-    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", "-p", String(pid)], { env: {} });
+    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", ...(group ? ["-g", String(pid)] : ["-p", String(pid)])], {
+      env: {},
+    });
     let out = "";
     const timer = setTimeout(() => {
       ps.kill("SIGKILL");
@@ -191,7 +204,8 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
         o.gateFailed?.(why);
         if (why === "overflow") kill("output");
       });
-    // sandbox-exec execs the command in place, and the profile forbids fork: this pid is the whole job.
+    // sandbox-exec execs the command in place, and the profile forbids fork: this pid is the whole job (with `fork`,
+    // the job is its process group).
     const pid = child.pid!;
     let out = "";
     let err = "";
@@ -230,11 +244,13 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       if (sampling || killed || exited) return;
       sampling = true;
       try {
-        const procs = await (o.probe ?? (() => snapshot(pid)))();
+        const procs = await (o.probe ?? ((p: number) => snapshot(p, 2000, !!o.fork)))(pid);
         const me = procs.find((p) => p.pid === pid);
+        // With children (`fork`): the whole group counts — yt-dlp and the deno it started together.
+        const rss = o.fork ? procs.reduce((a, p) => a + p.rss, 0) : (me?.rss ?? 0);
         if (!me) {
           if (!exited) kill("monitor"); // running but not measurable → cannot enforce → stop
-        } else if (me.rss * 1024 > o.maxRssBytes!) kill("memory");
+        } else if (rss * 1024 > o.maxRssBytes!) kill("memory");
       } catch {
         kill("monitor");
       } finally {
@@ -248,6 +264,13 @@ export function runIsolated(o: RunIsolatedOptions): Promise<RunResult> {
       clearTimeout(timer);
       clearInterval(monitor);
       o.signal?.removeEventListener("abort", onAbort);
+      // A child left behind (`fork`) dies with its command: nothing outlives the job, and its pipes close.
+      if (o.fork)
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // the group is already gone
+        }
     });
     child.on("error", (e) => {
       clearTimeout(timer);

@@ -324,6 +324,7 @@ Next.js를 쓰지 않는 이유: 오래 사는 에이전트 세션·인프로세
 | `summarize` | URL·유튜브·파일 요약 | 아들 | 확인 필요 |
 | `pdf` / `docx` / `xlsx` / `pptx` | 파일 읽기·만들기 | 아들 (전원) | 없음 |
 | `python-scratchpad` | 계산·데이터 가공 | 전원 | 샌드박스 필요 (§8) |
+| `youtube-audio-download` (추가, #191) | 유튜브 영상 음성을 대화 파일로 받기 → 화자별 전사(`audio_transcribe`)·요약 | 전원 (청소년 기본 꺼짐) | 없음 — YouTube만, 쿠키·로그인 없음, 고정 yt-dlp·deno (docs/ops.md §48) |
 | (신규) HWP 추출기 | HWP·HWPX 텍스트·표 추출 (FR-4.4) | 아들 | 시스템에 없음 — 공통 MCP 서버의 파일 처리 도구로 새로 만든다 |
 
 **v1에서 제외**: `gmail-skill`, `google-calendar-skill`, `google-contacts-skill`, `google-docs-skill`(아빠 개인 계정 OAuth), `agent-browser`, `computer-use`, `orca-cli`, `implementation-skill`(로컬 시스템 조작 권한이 큼).

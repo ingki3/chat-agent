@@ -1,0 +1,5 @@
+# youtube_audio_fetch (#191): yt-dlp, its JS challenge scripts and the JS runtime it needs for YouTube (deno).
+# yt-dlp and these two companions follow the ≥ 3 days rule (docs/decisions/isolation.md "유튜브 음성 받기 (#191)").
+yt-dlp==2026.10.26
+yt-dlp-ejs==0.8.0
+deno==2.9.8

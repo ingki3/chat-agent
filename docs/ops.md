@@ -505,7 +505,7 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 키가 없는데 키가 필요한 호출이 오면 그 호출만 `skill_unconfigured`로 거절한다.
 
 ### 15.4 사용자별 스킬 (FR-1.6)
-- 기본은 모든 스킬(`"all"`)이다. 청소년 계정은 `"all"`이어도 금융 스킬이 숨겨진다(#30, 19.4절). 어른 계정에서 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
+- 기본은 모든 스킬(`"all"`)이다. 청소년 계정은 `"all"`이어도 금융 스킬과 `youtube-audio-download`(#191, §48)가 숨겨진다(#30, 19.4절) — 관리자가 그 계정에서 이름으로 켜야 제공된다. 어른 계정에서 금융 스킬을 숨기려면 금융이 아닌 스킬만 적는다.
   ```
   PUT /api/admin/users/<id>/skills   {"skills": ["google-news-search-skill"]}
   PUT /api/admin/users/<id>/skills   {"skills": "all"}
@@ -2202,3 +2202,60 @@ pnpm audio:check       # 합성 음으로 실제 3단계(ffmpeg·Nemotron·Whisp
 - **지침:** `common@8`의 "다이어그램" 절(§14).
 - **의존성:** `mermaid` 12.3.0 + `pnpm.overrides`(`dompurify` 3.4.17, `cytoscape` 3.34.4, `es-toolkit` 1.53.1, `commander@15` 15.0.0) — 올릴 때는 새 lockfile 항목마다 배포 2주 이상인지 다시 확인한다.
 - **시험:** `apps/web/test/mermaid.test.ts`(블록 인식·파서 기준 펜스 닫힘·init/머리말 제거(NBSP·`\v` 포함)·한도·프레임 프로토콜·큐·시간 초과/취소 때 프레임 폐기·악성 입력은 img 하나·고치기 메시지·빌드 검사), `apps/server/test/app.test.ts`(프레임 페이지 CSP 두 정책·부트 스크립트 해시), `e2e/mermaid.spec.ts`(FakeRuntime `/mdecho` — 받은 마크다운을 그대로, `@@pause@@` 줄에서 1.5초 멈춤; 앱 문서에 mermaid 노드가 들어가지 않음, PNG·SVG·복사·blob 해제).
+
+## 48. 유튜브 영상 음성 받기 — `youtube_audio_fetch` (#191)
+YouTube 영상 하나의 음성을 **대화 파일(M4A)** 로 저장한다. 대표 흐름: "이 유튜브 영상 화자별로 정리해줘" → `youtube_audio_fetch` → 받은 `fileId`로 `audio_transcribe`(§46) → 화자별 대본. 사용자 스킬 `youtube-audio-download`를 서버 도구로 옮긴 것이지만 원본 스킬(Homebrew `yt-dlp`·`ffmpeg`)은 쓰지 않는다. 코드: `apps/server/src/youtube/`(`service.ts` 주소·검사·저장, `runner.ts` 샌드박스 실행, `packages.ts` 설치·상태), interpreter 쪽 `apps/server/youtube/fetch.py`, 고정 목록 `apps/server/youtube/requirements.lock`. 근거는 `docs/decisions/isolation.md` "유튜브 음성 받기 (#191)".
+
+### 48.1 설치 (한 번 — 관리자)
+```bash
+# 1) SKILL_PYTHON(독립 실행형 CPython 3.12)과 ffmpeg(AUDIO_FFMPEG, 기본 /opt/homebrew/bin/ffmpeg) — §46과 같은 것
+# 2) 고정 yt-dlp + yt-dlp-ejs + deno (이 명령만 네트워크를 쓴다: PyPI)
+pnpm youtube:install   # <DATA_DIR>/youtube-packages/<lock 해시>-py3.12/ (~90MB, 대부분 deno 바이너리)
+pnpm youtube:status    # youtube_audio_fetch: available
+pnpm youtube:check     # 샌드박스 안에서 yt-dlp import + deno 시작·작은 스크립트 풀기 (네트워크 없음) — 버전 출력
+# 3) 서버 재시작
+```
+- 고정 버전(2026-11-18): **yt-dlp 2026.10.26**(PyPI 배포 2026-10-26), **yt-dlp-ejs 0.8.0**(2026-03-17, YouTube JS 문제 풀이 스크립트), **deno 2.9.8**(2026-10-21, JS 런타임 — 휠에 바이너리가 들어 있음). 휠 해시 고정, `pip --isolated --no-deps --require-hashes --only-binary=:all: --target`, 고정 환경, 설치 폴더 읽기 전용(§46과 같은 설치기 `installPinnedPackages`). `bin/deno`만 남기고 다른 콘솔 스크립트(`yt-dlp` 등)는 지운다.
+- 운영(`~/.chat-agent`)에서는 그 폴더에서 `DATA_DIR`이 운영 데이터 폴더를 가리키게 해서 같은 명령을 돌린다(§43). 패키지는 파생 데이터라 백업에 들어가지 않는다 — 복원 뒤 다시 `pnpm youtube:install`.
+
+### 48.2 yt-dlp 업데이트 (관리자)
+YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·서명 오류가 늘어남). 그래서 **yt-dlp와 동반 패키지(yt-dlp-ejs, deno)만 "배포 3일 이상"** 규칙이다(다른 의존성은 2주 — isolation.md의 예외 기록). 서버는 스스로 업데이트하지 않는다.
+1. PyPI에서 새 **정식** 버전(`.devN` nightly 아님)이 배포 3일 이상인지 본다: `https://pypi.org/pypi/yt-dlp/json`의 `upload_time`. 그 버전이 요구하는 `yt-dlp-ejs`(정확한 버전, `requires_dist`의 `extra == "default"`)와 `deno` 최소 버전도 확인한다.
+2. `apps/server/youtube/requirements.in`·`requirements.lock`의 버전과 `--hash=sha256:`(PyPI의 `digests.sha256` — deno는 macOS arm64·x86_64 휠 둘)을 바꾸고, lock 머리의 배포일 주석을 고친다.
+3. 시험(`pnpm vitest run apps/server/test/youtube.test.ts` — lock 고정값 시험의 버전도 같이 고침) → PR → 배포(§43) → 운영 폴더에서 `pnpm youtube:install` → `pnpm youtube:check` → 서버 재시작.
+- lock이 바뀌면 해시가 바뀌어 설치 전까지 `not_installed`(도구가 제공되지 않음)가 되므로 3번의 설치를 빠뜨리지 않는다.
+
+### 48.3 켜고 끄기
+- **서버 허용 목록**: 관리자 → 스킬 → `youtube-audio-download` "허용"(기본 켜짐 — 설치 전에는 `설치 안 됨`으로 보이고 제공되지 않음).
+- **사용자별**: 같은 탭 아래. **청소년 계정은 기본 꺼짐**(`"all"`이어도 숨김, 사유 `청소년 기본 숨김`) — 관리자가 그 계정에서 켜면 이름으로 목록에 들어가 제공된다.
+- `audio_transcribe`와 묶어 쓰려면 그 사용자에게 `audio-transcription`도 켜져 있어야 한다.
+
+### 48.4 동작과 한도 (`YOUTUBE_LIMITS`, `packages/shared/src/youtube.ts`)
+- **YouTube만.** 주소에서 11자 영상 id만 꺼내 `https://www.youtube.com/watch?v=<id>`로 바꿔 yt-dlp에 준다. `watch?v=`·`youtu.be/`·`/shorts/`·`/embed/`·`/live/`(지난 방송)·`/v/`. 재생목록(`youtube_playlist`), 다른 사이트·채널·검색(`youtube_bad_url`)은 아무것도 실행하지 않고 거절한다.
+- **먼저 메타데이터:** 내려받기 전에 길이·라이브 여부·로그인 필요 여부·음성 형식·크기를 본다. 2시간 넘으면 `youtube_too_long`(구간 `start`·`end` — 초나 `H:MM:SS` — 로 2시간 이하를 지정하라는 안내). 라이브·예정·방송 직후 `youtube_live`, 연령 제한·비공개·회원 전용 `youtube_login_required`, 음성 300MB 초과 `youtube_too_large`. 구간을 주면 음성 전체를 받은 뒤 ffmpeg로 자르므로, 긴 영상도 **음성 전체가 300MB 이하**여야 한다.
+- **쿠키·로그인 없음**(`--cookies-from-browser` 안 씀). 봇 확인(`youtube_bot_check` — "로봇 확인을 요구해서 받지 못했어요")이나 로그인 필요 영상은 받지 못한다는 한국어 안내(`hint`)를 모델이 그대로 전한다.
+- **네트워크:** yt-dlp 프로세스는 서버의 egress 프록시(루프백 포트 하나)로만 나가고, 프록시는 `www.youtube.com`·`m.youtube.com`·`youtube.com`·`youtu.be`·`*.googlevideo.com`의 443만 연다(`YOUTUBE_EGRESS_HOSTS`). JS 문제는 고정 deno가 샌드박스 안에서 권한 없이 푼다(GitHub·npm에서 받는 것 없음).
+- **저장:** `youtube-<영상 id>[-<구간>].m4a`(AAC — 원본이 AAC면 그대로 복사, Opus면 AAC 128k로 변환, 메타데이터 제거)를 답 메시지에 연결된 대화 파일로 저장한다(업로드와 같은 저장소·쓰기 잠금·백업, 대화를 지우면 함께 지워짐, 대화당 파일 수 한도 — 넘으면 `youtube_file_limit`). 결과: `fileId`·`file`·`durationSeconds`·`videoId`·`sourceUrl`·`metadata`(제목·채널·업로드 날짜·설명 — `<external_content>` 안 JSON, 영상 올린 사람의 글이라 데이터).
+- **한도:** 메타데이터 2분, 내려받기 20분(yt-dlp + deno 그룹 2GB), 변환 5분·1GB, 호출 전체 30분(`youtube_timeout`), 작업 폴더 700MB·1만 항목(`youtube_disk_limit`), 시작 전 볼륨 여유 1GB, 서버 전체 동시 2개·사용자당 1개(`youtube_busy`), **답변당 3번**(`youtube_quota`). Codex는 이 도구가 있는 실행에 `tool_timeout_sec`를 가장 긴 느린 도구의 한도 + 60초로 준다(이 도구만이면 1860, `audio_transcribe`와 같이면 3660 — `runtime/lockdown.ts`).
+- **실행과 함께 멈춘다(§46과 같음):** 250ms마다 실행·토큰·권한·작업 폴더를 보고, 중단 요청이 받아들여지는 순간(토큰 철회) 진행 중인 단계의 프로세스 그룹(yt-dlp와 deno)을 죽이고 작업 폴더 `<DATA_DIR>/youtube-scratch/<uuid>/`를 지운 뒤 슬롯을 놓는다(`youtube_cancelled`). 저장은 쓰기 잠금 안에서 한 번 더 확인한다. 서버 시작 때 남은 작업 폴더도 지운다.
+- **안내문(`common@9`):** 본인 영상이거나 이용 권한이 있는 영상만(전사·요약·개인 보관), 음악·앨범 추출·재배포 금지, 화자별 정리는 `audio_transcribe`로.
+
+### 48.5 문제 해결
+| 증상 | 확인 |
+| --- | --- |
+| 관리자 화면 `설치 안 됨` | `pnpm youtube:status` → `pnpm youtube:install`(lock이 바뀐 뒤에는 다시). `needs_python`이면 §35/§46의 `SKILL_PYTHON`, `needs_ffmpeg`면 `AUDIO_FFMPEG` |
+| `youtube:check`가 실패 | 설치 폴더가 지워졌거나 바뀜 → `pnpm youtube:install`. deno가 시작하지 않으면(`youtube_failed`) macOS·아키텍처에 맞는 deno 휠인지(lock에 arm64·x86_64 해시) |
+| `youtube_bot_check`가 자주 | YouTube가 이 IP를 의심함. 잠시 뒤 다시. 계속되면 yt-dlp가 낡았을 수 있음 → §48.2로 새 정식 버전(3일 이상). 쿠키는 쓰지 않는다(결정) — 그 영상은 사용자가 음성 파일을 직접 올리게 안내 |
+| `youtube_failed`·`youtube_no_audio`가 갑자기 많아짐 | 대개 YouTube 변경 → §48.2. 서버 로그에는 고정 코드만 있다(`youtube.finished`의 `youtubeCode`). 원인을 보려면 관리자 Mac에서 같은 고정 yt-dlp를 샌드박스 밖에서 직접 돌려 본다(가족 대화와 무관한 공개 영상으로) |
+| 새로 필요한 호스트 | yt-dlp가 다른 호스트를 쓰기 시작하면 프록시가 403으로 막아 `youtube_failed`. `YOUTUBE_EGRESS_HOSTS`에 그 호스트만 더하는 코드 변경 + isolation.md 기록(와일드카드는 `*.<접미사>`, 라벨 둘 이상) |
+| `youtube_too_large` | 음성 전체 300MB 초과(대략 128kbps로 5시간 넘음). 구간을 줘도 전체를 받으므로 받을 수 없다 |
+
+### 48.6 로그와 확인
+- 로그는 `youtube.finished` 하나: 도구 이름, 고정 코드(`youtubeCode` — `youtube_ok` 또는 `YOUTUBE_CODES`), 시간, ID. 주소·영상 id·제목·파일 id는 남지 않는다. 실패는 관리자 "스킬 실행 실패"에 도구 이름과 코드로.
+- 시험: `pnpm vitest run apps/server/test/youtube.test.ts` — **가짜 yt-dlp만**(네트워크 없음): 성공·저장·`audio_transcribe` 연결, 봇 확인·로그인·없음·시간 초과, 길이 초과·구간, 라이브·재생목록, 허용 외 호스트(실제 프록시 CONNECT), 중단(토큰 철회)·실행 종료·권한 해제·디스크, 답변당 상한, 청소년 기본 숨김, 프로필. macOS + 독립 실행형 python + ffmpeg에서는 가짜 `yt_dlp` 패키지를 실제 `fetch.py`·샌드박스·ffmpeg로 돌린다(자식 프로세스 포함 바깥 읽기·다른 포트 거부).
+- 실제 YouTube 수동 시험(CI 아님, 관리자가 받아도 되는 영상으로):
+  ```bash
+  YTDLP_LIVE=1 YTDLP_LIVE_DATA_DIR=<pnpm youtube:install을 돌린 DATA_DIR> SKILL_PYTHON=<독립 실행형 3.12> \
+    YTDLP_LIVE_URL='https://www.youtube.com/watch?v=<id>' pnpm vitest run apps/server/test/youtube.test.ts -t live
+  ```
+- 수용 기준 수동 확인: "이 유튜브 영상 화자별로 정리해줘" → 음성 파일이 대화 파일로 저장되고 화자별 대본(기록 양식 B).

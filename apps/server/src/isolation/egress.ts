@@ -13,8 +13,10 @@ import { isBlockedAddress } from "./net.js";
  */
 export type EgressOptions = {
   /**
-   * Exact host names allowed (lower case), or `"public"`: any public name or address (web fetch, #50). In both
-   * cases the name is resolved here and every answer must be a public address — the policy is on the address.
+   * Host names allowed (lower case), or `"public"`: any public name or address (web fetch, #50). In both cases the
+   * name is resolved here and every answer must be a public address — the policy is on the address. An entry
+   * `*.example.com` allows every subdomain of `example.com` (one label or more — not `example.com` itself): YouTube's
+   * media hosts (`rr1---sn-….googlevideo.com`, #191). See `hostMatcher`.
    */
   allow: readonly string[] | "public";
   /** Ports a tunnel may go to (default 443 only; web fetch also opens 80 for plain http). */
@@ -45,6 +47,44 @@ export function isPrivateName(host: string): boolean {
   return /(^|\.)(localhost|local|internal|home\.arpa|lan|intranet|corp)$/.test(h);
 }
 
+/** One LDH label (letters, digits, hyphens inside). */
+const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * The allow-list as a predicate on a parsed CONNECT host (lower case, `parseTarget`). Exact entries match exactly. A
+ * wildcard entry `*.<suffix>` (#191) matches a name that ends in `.<suffix>` with at least one more label in front;
+ * `<suffix>` must be two LDH labels or more (no `*.com`), and `*` is allowed only as that whole first label — any
+ * other entry with a `*`, or a malformed one, throws (a typo must not open the proxy). A name that is an address
+ * never matches a wildcard.
+ */
+export function hostMatcher(allow: readonly string[]): (host: string) => boolean {
+  const exact = new Set<string>();
+  const suffixes: string[] = [];
+  for (const raw of allow) {
+    const e = raw.toLowerCase();
+    if (e.startsWith("*.")) {
+      const rest = e.slice(2).split(".");
+      if (rest.length < 2 || !rest.every((l) => LABEL.test(l))) throw new Error(`bad egress wildcard ${raw}`);
+      suffixes.push(`.${rest.join(".")}`);
+    } else if (e.includes("*")) throw new Error(`bad egress host ${raw}`);
+    else exact.add(e);
+  }
+  return (host) => {
+    const h = host.toLowerCase();
+    if (exact.has(h)) return true;
+    if (net.isIP(h)) return false;
+    return suffixes.some(
+      (s) =>
+        h.length > s.length &&
+        h.endsWith(s) &&
+        h
+          .slice(0, -s.length)
+          .split(".")
+          .every((l) => LABEL.test(l)),
+    );
+  };
+}
+
 /**
  * The CONNECT target `host:port` as (host, port), or undefined when malformed. Names are LDH labels; addresses are
  * a canonical dotted IPv4 or a bracketed IPv6. A name whose last label is numeric or hex (`2130706433`,
@@ -69,7 +109,7 @@ export function parseTarget(target: string): { host: string; port: number } | un
 const FLUSH_MS = 30_000;
 
 export async function startEgressProxy(o: EgressOptions, port = 0): Promise<RunningEgress> {
-  const allow = o.allow === "public" ? undefined : new Set(o.allow.map((h) => h.toLowerCase()));
+  const allow = o.allow === "public" ? undefined : hostMatcher(o.allow);
   const ports = new Set(o.ports ?? [443]);
   const lookup = o.lookup ?? defaultLookup;
   const connect = o.connect ?? ((ip: string, p: number) => net.connect({ host: ip, port: p }));
@@ -119,7 +159,7 @@ export async function startEgressProxy(o: EgressOptions, port = 0): Promise<Runn
     const t = parseTarget(req.url ?? "");
     if (!t || !ports.has(t.port)) return refuse(403);
     const host = t.host;
-    if (allow ? !allow.has(host) : !net.isIP(host) && isPrivateName(host)) return refuse(403);
+    if (allow ? !allow(host) : !net.isIP(host) && isPrivateName(host)) return refuse(403);
     void (async () => {
       let ips: string[];
       try {
