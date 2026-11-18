@@ -97,12 +97,12 @@ export const CitationEntry = z.object({
    */
   fileId: z.string().min(1).max(64).optional(),
   /**
-   * The whole passage the model sent with `cite` / `file_cite` (#186 review 1차), what a later answer that writes
-   * this number again checks again — `quote` is for display and may be cut at its limit (the matched page text can
-   * be longer than the snippet, e.g. decomposed Hangul). Absent on `unknown_source` and on entries stored before:
-   * those carry over only while `quote` is certainly whole (shorter than the limit).
+   * The server's citation row this entry stands for (#186 review 2차): an opaque id — what a later answer that writes
+   * this number again is checked against (the row keeps the whole passage server-side; `quote` is for display and
+   * may be cut). A carried entry names the row it was carried from. Absent on `unknown_source` and on entries stored
+   * before (those are found by their answer's run and number, or not carried).
    */
-  snippet: z.string().max(CITATION_LIMITS.snippet).optional(),
+  citationId: z.string().min(1).max(64).optional(),
 });
 export type CitationEntry = z.infer<typeof CitationEntry>;
 

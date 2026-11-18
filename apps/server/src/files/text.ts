@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import {
-  boundText,
   CITATION_LIMITS,
   EXTRACT_CODE_TEXT,
   FileLocator,
@@ -11,7 +10,7 @@ import {
   type UnitLocator,
 } from "@agentlee/shared";
 import type { ToolScope } from "@agentlee/mcp-tools";
-import { findSnippetAt, normalizeSnippet } from "../citations/verify.js";
+import { findSnippetAt, findSnippetMatches, normalizeSnippet } from "../citations/verify.js";
 import type { ConversationStore } from "../conversations/store.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import { toFileExtract, type FileExtracts, type SegmentRow } from "./extract.js";
@@ -536,7 +535,8 @@ export class FileTools {
     { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: FileRow } | undefined {
     const file = this.fileFor(scope, input.fileId);
     if (!file) return undefined;
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    // The row's whole passage (as stored, already scrubbed — again with the secrets known now); never cut.
+    const snippet = scrubKnown(input.snippet);
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       return { status: "snippet_not_found", quote: null, locator: null, file };
     const prefer = input.locator?.fileId === file.id ? input.locator : undefined;
@@ -559,8 +559,10 @@ export class FileTools {
 
   /**
    * `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`): the first
-   * unit that has the passage, the unit named by `page` first — or, with `prefer` (a recheck), the match at that
-   * same place if there is one (the same place and range best), the first match otherwise.
+   * unit that has the passage, the unit named by `page` first. With `prefer` (a recheck, review #186 2차) the
+   * earlier place is looked at first and alone — the units that can be that place, every occurrence in them (a
+   * passage repeated inside one unit, lines of one stored run) — and a match there is the answer (the same range
+   * best); only when the passage is not there is the whole file searched (its first match).
    */
   private match(
     f: FileRow,
@@ -572,37 +574,69 @@ export class FileTools {
     if (extract.status !== "ok" || !extract.segments)
       return { status: "fetch_failed", quote: null, locator: null };
     const segs = this.extracts.segments(f.id);
+    if (prefer) {
+      let best: { found: VerifiedMatch; score: number } | undefined;
+      for (const seg of segs) {
+        if (!mayBePlace(f, seg, prefer)) continue;
+        for (const m of findSnippetMatches(seg.text, snippet)) {
+          const where = locate(f, seg, m.start, m.end);
+          const score = where ? placeScore(where, prefer) : 0;
+          if (!score) continue;
+          const found = verifiedAt(seg, m, where);
+          if (score === 2) return found;
+          if (!best) best = { found, score };
+        }
+      }
+      if (best) return best.found;
+    }
     const ordered =
       page === undefined
         ? segs
         : [...segs.filter((s) => s.unit === page), ...segs.filter((s) => s.unit !== page)];
-    type Found = { status: "verified"; quote: string; locator: CitedLocator | null };
-    let best: { found: Found; score: number } | undefined;
     for (const seg of ordered) {
       const m = findSnippetAt(seg.text, snippet);
-      if (!m.found) continue;
-      const where = locate(f, seg, m.start, m.end);
-      // The verified unit's own sheet number goes with the locator (the model's sheet id comes from it).
-      const sheetNo = locOf(seg).sheetNo;
-      const found: Found = {
-        status: "verified",
-        quote: m.quote,
-        locator: where
-          ? {
-              ...where,
-              ...(sheetNo !== undefined ? { sheetNo } : {}),
-              // Only a passage with a range gets one: the text it was found in, up to its end.
-              ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
-            }
-          : null,
-      };
-      if (!prefer) return found;
-      const score = where ? placeScore(where, prefer) : 0;
-      if (score === 2) return found;
-      if (!best || score > best.score) best = { found, score };
+      if (m.found) return verifiedAt(seg, m, locate(f, seg, m.start, m.end));
     }
-    return best?.found ?? { status: "snippet_not_found", quote: null, locator: null };
+    return { status: "snippet_not_found", quote: null, locator: null };
   }
+}
+
+type VerifiedMatch = { status: "verified"; quote: string; locator: CitedLocator | null };
+
+/** A verified passage at `[m.start, m.end)` of `seg`, with its exact place (`where`) when it has one. */
+function verifiedAt(
+  seg: SegmentRow,
+  m: { quote: string; start: number; end: number },
+  where: FileLocator | undefined,
+): VerifiedMatch {
+  // The verified unit's own sheet number goes with the locator (the model's sheet id comes from it).
+  const sheetNo = locOf(seg).sheetNo;
+  return {
+    status: "verified",
+    quote: m.quote,
+    locator: where
+      ? {
+          ...where,
+          ...(sheetNo !== undefined ? { sheetNo } : {}),
+          // Only a passage with a range gets one: the text it was found in, up to its end.
+          ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
+        }
+      : null,
+  };
+}
+
+/** Unit fields a stored unit's own locator names (a run of lines names its first line: not compared). */
+const UNIT_FIELDS = ["page", "slide", "paragraph", "table", "row", "sheet", "footnote", "endnote"] as const;
+
+/**
+ * Whether unit `seg` can hold place `p` — cheap, no text compared: the same kind and unit, and for a line the run
+ * has that line. Only a filter: the place of each match is checked after (`placeScore`).
+ */
+function mayBePlace(f: FileRow, seg: SegmentRow, p: FileLocator): boolean {
+  const own = segmentLocator(f, seg);
+  if (own.kind !== p.kind) return false;
+  if (UNIT_FIELDS.some((k) => own[k] !== undefined && p[k] !== undefined && own[k] !== p[k])) return false;
+  return p.line === undefined || marksOf(seg).some((m) => m[2].line === p.line);
 }
 
 /** The fields that name a place (not the box or the range inside it). */

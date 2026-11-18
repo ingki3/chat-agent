@@ -23,6 +23,8 @@ type IdMap = {
   file: Map<string, string>;
   artifact: Map<string, { id: string; versions: Map<number, number> }>;
   source: Map<string, string>;
+  /** Citation rows the copied notes stand for (#186 review 2차), copied into the fork; absent → none. */
+  citation?: Map<string, string>;
 };
 
 /** Messages still being written are not copied: they would stay "streaming" in the copy forever. */
@@ -75,15 +77,18 @@ export function remapParts(parts: readonly MessagePart[], ids: IdMap): MessagePa
           {
             ...p,
             citations: p.citations.map((c) => {
-              const { locator, fileId: cited, ...rest } = c;
+              const { locator, fileId: cited, citationId: row, ...rest } = c;
               const fileId = locator ? ids.file.get(locator.fileId) : undefined;
               // The cited file's copy (#186: what a follow-up in the copy carries over); none in the copy → cut.
               const copy = cited ? ids.file.get(cited) : undefined;
+              // The copied citation row (the whole passage a follow-up in the copy checks again); none → cut.
+              const rowCopy = row ? ids.citation?.get(row) : undefined;
               return {
                 ...rest,
                 sourceId: c.sourceId ? (ids.source.get(c.sourceId) ?? null) : null,
                 ...(locator && fileId ? { locator: { ...locator, fileId } } : {}),
                 ...(copy ? { fileId: copy } : {}),
+                ...(rowCopy ? { citationId: rowCopy } : {}),
               };
             }),
           },
@@ -158,7 +163,13 @@ export class ForkService {
             fallback: input.start?.fallback ?? false,
             limitedUntil: input.start?.limitedUntil,
           });
-          const ids: IdMap = { message: new Map(), file: new Map(), artifact: new Map(), source: new Map() };
+          const ids: IdMap = {
+            message: new Map(),
+            file: new Map(),
+            artifact: new Map(),
+            source: new Map(),
+            citation: new Map(),
+          };
           const to = { userId: forkerId, conversationId: c.id };
           // Files first (the messages' parts name them), without a message until those exist.
           for (const f of source.files) {
@@ -188,6 +199,7 @@ export class ForkService {
             if (a.messageId) artifactMessage.set(copy.id, a.messageId);
           }
           for (const s of b.sources) ids.source.set(s.id, sources.copyInto({ ...to, forkId }, s).id);
+          copyCitationRows(db, share.conversationId, b.messages, ids, to);
           // Messages, in history order, finished ones only — their parts moved to the copies' ids.
           let last: string | undefined;
           for (const m of b.messages) {
@@ -280,5 +292,68 @@ function safeJson(s: string): unknown {
     return JSON.parse(s);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The citation rows the copied messages' notes stand for (#186 review 2차): each copied into the fork — its source
+ * and file moved to the copies (a row whose source or file the copy lacks is not copied: that entry carries nothing
+ * there), the forker's own, a run of its own (`fork:<id>`, no run is copied). What a follow-up in the copy checks a
+ * carried number against: the whole passage, kept server-side, never in a message part.
+ */
+function copyCitationRows(
+  db: Db,
+  fromConversation: string,
+  messages: readonly { parts: unknown }[],
+  ids: IdMap,
+  to: { userId: string; conversationId: string },
+): void {
+  const want = new Set<string>();
+  for (const m of messages)
+    for (const p of (m.parts as MessagePart[] | null) ?? [])
+      if (p?.type === "citation_note") for (const c of p.citations) if (c.citationId) want.add(c.citationId);
+  const read = db.$client.prepare("select * from citations where id = ? and conversation_id = ?");
+  const insert = db.$client.prepare(
+    `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote,
+       file_id, locator) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const id of want) {
+    const r = read.get(id, fromConversation) as
+      | {
+          n: number;
+          source_id: string | null;
+          file_id: string | null;
+          status: string;
+          snippet: string;
+          snippet_key: string;
+          quote: string | null;
+          locator: string | null;
+        }
+      | undefined;
+    if (!r) continue;
+    const sourceId = r.source_id ? ids.source.get(r.source_id) : null;
+    const fileId = r.file_id ? ids.file.get(r.file_id) : null;
+    if (sourceId === undefined || fileId === undefined) continue;
+    let locator = r.locator;
+    if (locator && fileId) {
+      const parsed = safeJson(locator) as Record<string, unknown> | null;
+      locator = parsed && typeof parsed === "object" ? JSON.stringify({ ...parsed, fileId }) : null;
+    }
+    const copy = crypto.randomUUID();
+    insert.run(
+      copy,
+      `fork:${copy}`,
+      to.conversationId,
+      to.userId,
+      r.n,
+      sourceId,
+      r.status,
+      r.snippet,
+      r.snippet_key,
+      r.quote,
+      fileId,
+      locator,
+    );
+    ids.citation!.set(id, copy);
   }
 }

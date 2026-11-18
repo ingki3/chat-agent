@@ -282,6 +282,37 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(statuses(past)?.[0]).toEqual([1, "verified"]);
   });
 
+  it("review #186 2차: an answer that numbered a list of its own ends the search — a later [1] never brings back an older source", async () => {
+    const script: FakeScript = (input, memory) => {
+      if (input.text === "/list")
+        return [{ call: "file_list", input: {} }, { text: "목록의 첫 번째 파일이에요[1]." }];
+      if (input.text === "/that-first") return [{ text: "그 첫 번째 파일은 회의록이에요[1]." }];
+      if (input.text === "/list-quiet")
+        return [{ call: "sources_list", input: {} }, { text: "목록을 봤어요." }];
+      return defaultScript(input, memory);
+    };
+    const { app, f, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c.id, "/cite conflict"));
+    // Turn 2: the list's item 1 — flagged, not the web source.
+    const listed = await send(f.cookies.owner, c.id, "/list");
+    expect(statuses(listed)).toEqual([[1, "unknown_source"]]);
+    // Turn 3, no tool: "그 첫 번째 파일" [1] — the search stops at turn 2; the web source of turn 1 is not brought back.
+    const after = await send(f.cookies.owner, c.id, "/that-first");
+    expect(after.note?.unbacked).toBe(true);
+    expect(statuses(after)).toEqual([[1, "unknown_source"]]);
+    // A list answer without any marker ends the search too.
+    const c2 = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c2.id, "/cite conflict"));
+    await send(f.cookies.owner, c2.id, "/list-quiet");
+    expect(statuses(await send(f.cookies.owner, c2.id, "/that-first"))).toEqual([[1, "unknown_source"]]);
+    // A plain answer in between (no tool) is still looked past (normal chat: #150 behaviour unchanged).
+    const c3 = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c3.id, "/cite conflict"));
+    await send(f.cookies.owner, c3.id, "고마워요");
+    expect(statuses(await send(f.cookies.owner, c3.id, "/that-first"))).toEqual([[1, "verified"]]);
+  });
+
   it("precedence (#150): once a run cites or fetches anything, every number is its own — nothing is carried", async () => {
     const recapAfterFetch: FakeScript = (input, memory) =>
       input.text === "/fetch-recap"
@@ -546,7 +577,11 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       }
       // Source ids differ per conversation; everything else is the same in both runtimes.
       notes[rt] = [conflict, reuse, ...rest].map((r) =>
-        JSON.parse(JSON.stringify(r.note, (k, v: unknown) => (k === "sourceId" && v ? "<id>" : v))),
+        JSON.parse(
+          JSON.stringify(r.note, (k, v: unknown) =>
+            (k === "sourceId" || k === "citationId") && v ? "<id>" : v,
+          ),
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);

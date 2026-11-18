@@ -97,7 +97,7 @@ function fileEntry(
     name: string;
     quote: string | null;
     locator: FileLocator | null;
-    snippet: string;
+    citationId: string;
   },
 ): CitationEntry {
   const locator = c.status === "verified" ? c.locator : null;
@@ -112,20 +112,8 @@ function fileEntry(
     quote: bound(c.quote, CITATION_LIMITS.snippet),
     ...(locator ? { locator } : {}),
     fileId: c.fileId,
-    snippet: boundText(c.snippet, CITATION_LIMITS.snippet),
+    citationId: c.citationId,
   };
-}
-
-/**
- * The passage a carried number is checked again with (review #186 1차): the whole snippet the model cited with —
- * never the display `quote`, which may be cut at its limit (a verified match can be longer than the snippet). An
- * entry stored before the snippet was kept: its `quote` only while it is certainly whole (shorter than the limit);
- * otherwise nothing (not carried — never verified from a cut prefix).
- */
-function recheckSnippet(e: CitationEntry): string | undefined {
-  if (e.snippet) return e.snippet;
-  if (e.quote && e.quote.length < CITATION_LIMITS.snippet) return e.quote;
-  return undefined;
 }
 
 /**
@@ -147,7 +135,7 @@ const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   FILE_SEARCH_TOOL.name,
   FILE_CITE_TOOL.name,
 ]);
-const ownsNumbers = (name: string) =>
+export const ownsNumbers = (name: string) =>
   OWN_NUMBER_TOOLS.has(name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name);
 
 /**
@@ -162,11 +150,15 @@ const ownsNumbers = (name: string) =>
  * own (no search, fetch, news skill, `file_read`, `file_search`, `file_list` or `sources_list`) — then its numbers can only be the earlier ones.
  * As soon as it cites or tries to (or fetches or reads something new), every number is this run's: a marker without
  * a citation of this run stays `unknown_source`, whatever an earlier answer had under that number.
- * A file citation (#186) carries over by the file id its entry keeps (`fileId`), checked again by `recheckFile`: the
- * file must still be one this conversation's runs may read, and the passage is looked for in its extracted text as
- * it is now (being extracted again → `fetch_failed`, no longer there → `snippet_not_found`, a deleted file → not
- * carried, `unknown_source`). An entry stored before #186 has no `fileId`: not carried. Never matched by the
- * sentence's text — only the number the earlier answer gave. An answer that carries a number is an answer using
+ * What is checked again is the earlier entry's **citation row** (review #186 2차, `CitationStore.rowFor`): by the
+ * entry's `citationId`, or — an entry stored before ids were kept — by the earlier answer's run and the number; this
+ * conversation's and user's only. Its `snippet` is the whole passage cited (the entry's `quote` is for display and
+ * may be cut). No row, or one whose snippet may have been cut when stored (`whole` false) → not carried — never
+ * verified from a cut prefix. A web row is checked again against the source's stored text; a file row (#186) by
+ * `recheckFile`: the file must still be one this conversation's runs may read, and the passage is looked for in its
+ * extracted text as it is now, at the earlier place first (being extracted again → `fetch_failed`, no longer there →
+ * `snippet_not_found`, a deleted file → not carried, `unknown_source`). Never matched by the sentence's text — only
+ * the number the earlier answer gave. An answer that carries a number is an answer using
  * sources: its paragraphs without a marker are flagged as missing (review #153). An answer that used no source tool
  * and carries no number (nothing earlier under it, or the recheck failed) has no sources: its markers get an
  * `unbacked` note only (#185, review #190 1차).
@@ -174,11 +166,12 @@ const ownsNumbers = (name: string) =>
 export type CitationCarry = {
   conversationId: string;
   userId: string;
-  previous: () => readonly CitationEntry[];
+  /** The newest earlier answer with numbers to carry (`previousCitations`): its entries and its run (if known). */
+  previous: () => { citations: readonly CitationEntry[]; runId?: string | undefined };
   /** An earlier file citation checked again now (#186, `FileTools.recheck`); without it no file citation carries. */
   recheckFile?: (
     scope: { conversationId: string; userId: string },
-    input: { fileId: string; snippet: string; locator?: FileLocator },
+    input: { fileId: string; snippet: string; locator?: FileLocator | undefined },
   ) =>
     | { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: { name: string } }
     | undefined;
@@ -188,7 +181,7 @@ export type CitationCarry = {
 export function citationNote(
   runId: string,
   parts: readonly MessagePart[],
-  store: Pick<CitationStore, "forRun"> & Partial<Pick<CitationStore, "recheck">>,
+  store: Pick<CitationStore, "forRun"> & Partial<Pick<CitationStore, "recheck" | "rowFor">>,
   carry?: CitationCarry,
 ): CitationNotePart | undefined {
   const rows = store.forRun(runId);
@@ -202,19 +195,27 @@ export function citationNote(
   if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
   const numbers = [...new Set(markers.map((m) => m.n))].sort((a, b) => a - b);
-  let earlier: Map<number, CitationEntry> | undefined;
+  let earlier: { byN: Map<number, CitationEntry>; runId: string | undefined } | undefined;
   let carriedAny = false;
   const carriedFrom = (n: number): CitationEntry | undefined => {
-    if (!carry || rows.length) return undefined;
+    if (!carry || rows.length || !store.rowFor) return undefined;
     if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return undefined;
-    earlier ??= new Map(carry.previous().map((e) => [e.n, e]));
-    const e = earlier.get(n);
+    if (!earlier) {
+      const prev = carry.previous();
+      earlier = { byN: new Map(prev.citations.map((e) => [e.n, e])), runId: prev.runId };
+    }
+    const e = earlier.byN.get(n);
     if (!e || e.status === "unknown_source") return undefined;
-    if (e.fileId && !e.sourceId) return carriedFile(n, e, e.fileId);
-    if (!e.sourceId || !store.recheck) return undefined;
-    const snippet = recheckSnippet(e);
-    if (!snippet) return undefined;
-    const c = store.recheck(carry, { sourceId: e.sourceId, snippet });
+    // The earlier entry's own row: the whole passage it cited (never the display quote, which may be cut).
+    const row = store.rowFor(carry, { citationId: e.citationId, runId: earlier.runId, n });
+    if (!row || !row.whole || row.status === "unknown_source") return undefined;
+    if (row.sourceId) return row.sourceId === e.sourceId ? carriedWeb(n, e, row) : undefined;
+    if (row.fileId && !e.sourceId && (e.fileId ?? row.fileId) === row.fileId) return carriedFile(n, e, row);
+    return undefined;
+  };
+  type Row = NonNullable<ReturnType<NonNullable<typeof store.rowFor>>>;
+  const carriedWeb = (n: number, e: CitationEntry, row: Row): CitationEntry | undefined => {
+    const c = store.recheck?.(carry!, { sourceId: row.sourceId!, snippet: row.snippet });
     if (!c) return undefined;
     const s = c.source;
     carriedAny = true;
@@ -227,25 +228,25 @@ export function citationNote(
       url: bound(s.finalUrl ?? s.url, CITATION_LIMITS.url),
       publishedAt: s.publishedAt ?? null,
       quote: bound(c.status === "verified" ? c.quote : e.quote, CITATION_LIMITS.snippet),
-      snippet,
+      citationId: row.id,
     };
   };
-  // A file citation of the earlier answer, its passage (verified: as the file had it; otherwise the snippet sent)
-  // looked for again in the file's text now (#186).
-  const carriedFile = (n: number, e: CitationEntry, fileId: string): CitationEntry | undefined => {
-    const snippet = recheckSnippet(e);
-    if (!carry?.recheckFile || !snippet) return undefined;
-    // Looked for at the earlier place first (a passage repeated in the file keeps its page, review 1차).
-    const c = carry.recheckFile(carry, { fileId, snippet, ...(e.locator ? { locator: e.locator } : {}) });
+  // A file citation of the earlier answer: its whole passage looked for again in the file's text now, at the
+  // earlier place first (#186; a passage repeated in the file keeps its place, review 1차·2차).
+  const carriedFile = (n: number, e: CitationEntry, row: Row): CitationEntry | undefined => {
+    if (!carry?.recheckFile) return undefined;
+    const stored = row.locator ? FileLocator.safeParse(JSON.parse(row.locator)) : undefined;
+    const locator = e.locator ?? (stored?.success ? stored.data : undefined);
+    const c = carry.recheckFile(carry, { fileId: row.fileId!, snippet: row.snippet, locator });
     if (!c) return undefined;
     carriedAny = true;
     return fileEntry(n, {
       status: c.status,
-      fileId,
+      fileId: row.fileId!,
       name: c.file.name,
       quote: c.status === "verified" ? c.quote : e.quote,
       locator: c.status === "verified" ? c.locator : null,
-      snippet,
+      citationId: row.id,
     });
   };
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
@@ -264,7 +265,7 @@ export function citationNote(
         name: r.file.name,
         quote: r.status === "verified" ? r.quote : r.snippet,
         locator: parsed?.success ? parsed.data : null,
-        snippet: r.snippet,
+        citationId: r.id,
       });
     }
     // A marker without a citation of this run (made up, or a number of another answer): never shown as normal.
@@ -289,7 +290,7 @@ export function citationNote(
       url: bound(s.finalUrl ?? s.url, CITATION_LIMITS.url),
       publishedAt: s.publishedAt ?? null,
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
-      snippet: boundText(r.snippet, CITATION_LIMITS.snippet),
+      citationId: r.id,
     };
   });
   // Provenance only (#185): an answer that used no source tool and carried no number has no sources — it gets no

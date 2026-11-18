@@ -1,12 +1,6 @@
 import crypto from "node:crypto";
 import { and, asc, eq, sql } from "drizzle-orm";
-import {
-  boundText,
-  CITATION_LIMITS,
-  type CitationStatus,
-  type CiteResult,
-  type FileLocator,
-} from "@agentlee/shared";
+import { CITATION_LIMITS, type CitationStatus, type CiteResult, type FileLocator } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { citations, conversations, files, sources } from "../db/schema.js";
 import type { SourceScope } from "../web/sources.js";
@@ -17,7 +11,9 @@ export type CitationRow = typeof citations.$inferSelect;
 
 /** Why a `cite` call registered nothing (the model sees the code, the log keeps it). */
 export class CiteRefused extends Error {
-  constructor(readonly code: "cite_snippet_too_short" | "cite_limit" | "cite_not_allowed") {
+  constructor(
+    readonly code: "cite_snippet_too_short" | "cite_snippet_too_long" | "cite_limit" | "cite_not_allowed",
+  ) {
     super(code);
   }
 }
@@ -56,7 +52,8 @@ export class CitationStore {
   /** Checks and registers one citation of the run; the same source and snippet twice keep their first number. */
   cite(scope: SourceScope, input: { sourceId: string; snippet: string }): CiteResult {
     // Known secrets are kept out of what is stored (the snippet is model output; the page text is scrubbed too).
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    // Never cut before it is compared (review #186 2차): longer than can be kept whole is refused.
+    const snippet = scrubKnown(wholeSnippet(input.snippet));
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       throw new CiteRefused("cite_snippet_too_short");
     const key = snippetKey(snippet);
@@ -136,7 +133,7 @@ export class CitationStore {
       .where(and(eq(sources.id, input.sourceId), eq(sources.conversationId, scope.conversationId)))
       .get();
     if (!src || src.userId !== scope.userId) return undefined;
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    const snippet = scrubKnown(input.snippet);
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       return { status: "snippet_not_found", quote: null, source: src };
     return { ...checkAgainst(src, snippet), source: src };
@@ -157,7 +154,7 @@ export class CitationStore {
       locator: (FileLocator & { sheetNo?: number | undefined }) | null;
     },
   ): CiteResult & { locator: (FileLocator & { sheetNo?: number | undefined }) | null } {
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    const snippet = scrubKnown(wholeSnippet(input.snippet));
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       throw new CiteRefused("cite_snippet_too_short");
     const key = snippetKey(snippet);
@@ -221,6 +218,33 @@ export class CitationStore {
       },
       { behavior: "immediate" },
     );
+  }
+
+  /**
+   * The citation row an earlier answer's entry stands for (#186 review 2차) — by its id, or (an entry stored before
+   * ids were kept) by the earlier answer's run and number — within this conversation and user only. Its `snippet`
+   * is the whole passage cited (what a carried number is checked again with); `whole` is false for a row whose
+   * snippet may have been cut when it was stored (before longer input was refused: one at the old cut length).
+   */
+  rowFor(
+    scope: { conversationId: string; userId: string },
+    ref: { citationId?: string | undefined; runId?: string | undefined; n: number },
+  ): (CitationRow & { whole: boolean }) | undefined {
+    const where = ref.citationId
+      ? eq(citations.id, ref.citationId)
+      : ref.runId
+        ? and(eq(citations.runId, ref.runId), eq(citations.n, ref.n))
+        : undefined;
+    if (!where) return undefined;
+    const row = this.db
+      .select()
+      .from(citations)
+      .where(
+        and(where, eq(citations.conversationId, scope.conversationId), eq(citations.userId, scope.userId)),
+      )
+      .get();
+    // `boundText` stopped at 500 units, or 499 before a surrogate pair: such a row cannot be told from a cut one.
+    return row ? { ...row, whole: row.snippet.length < CITATION_LIMITS.snippet - 1 } : undefined;
   }
 
   private existing(
@@ -304,3 +328,9 @@ const result = (n: number, status: CitationStatus, sourceId: string | null): Cit
   status,
   sourceId,
 });
+
+/** The snippet as sent, when it can be kept whole (UTF-16 units, the schema's own count); refused otherwise. */
+function wholeSnippet(snippet: string): string {
+  if (snippet.length > CITATION_LIMITS.snippet) throw new CiteRefused("cite_snippet_too_long");
+  return snippet;
+}

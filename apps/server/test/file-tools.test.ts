@@ -2746,7 +2746,9 @@ describe("이 PDF 12쪽 요약 in both runtimes (수용 기준 2·11)", () => {
       ).toEqual([false, false, false, false]);
       expectPage12(r, file.id, rt);
       notes[rt] = JSON.parse(
-        JSON.stringify(r.note, (k, v: unknown) => (k === "fileId" || k === "fileRevision" ? "<id>" : v)),
+        JSON.stringify(r.note, (k, v: unknown) =>
+          k === "fileId" || k === "fileRevision" || k === "citationId" ? "<id>" : v,
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
@@ -2785,7 +2787,9 @@ describe("수용 기준 2: PDF 1 + HWP 1 비교 요약 in both runtimes (#24)", 
         expect((res.json() as { target: { status: string } }).target.status, rt).toBe("exact");
       }
       notes[rt] = JSON.parse(
-        JSON.stringify(r.note, (k, v: unknown) => (k === "fileId" || k === "fileRevision" ? "<id>" : v)),
+        JSON.stringify(r.note, (k, v: unknown) =>
+          k === "fileId" || k === "fileRevision" || k === "citationId" ? "<id>" : v,
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
@@ -3846,7 +3850,19 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect(cited.status).toBe("verified");
     expect(LONG.length).toBeLessThan(CITATION_LIMITS.snippet);
     expect(cited.quote!.length).toBe(CITATION_LIMITS.snippet); // the display quote is cut …
-    expect(cited.snippet).toBe(LONG); // … the snippet is whole
+    // … the whole passage stays server-side, in the citation row — never in the message (shares, streams).
+    expect(cited.citationId).toBeDefined();
+    const row = db.$client.prepare("SELECT snippet FROM citations WHERE id = ?").get(cited.citationId!) as {
+      snippet: string;
+    };
+    expect(row.snippet).toBe(LONG);
+    const stored = JSON.stringify(
+      app
+        .conversations!.messageById(first.run.assistantMessageId)!
+        .parts.filter((p) => p.type === "citation_note"),
+    );
+    expect(stored).not.toContain("보류");
+    expect(stored).not.toContain("보류".normalize("NFD"));
     expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe("verified");
     // The ending (past the cut quote) changes: the whole passage is not there any more.
     db.$client
@@ -3854,8 +3870,8 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
       .run("보류".normalize("NFD"), "승인".normalize("NFD"), file.id);
     touch(db, file.id);
     const changed = await send(f.cookies.owner, c.id, "/again1");
-    expect(changed.note!.citations.map((x) => [x.status, x.fileId, x.snippet])).toEqual([
-      ["snippet_not_found", file.id, LONG],
+    expect(changed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([
+      ["snippet_not_found", file.id],
     ]);
   });
 
@@ -3883,5 +3899,43 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     touch(db, file.id);
     const moved = await send(f.cookies.owner, c.id, "/again1");
     expect(moved.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 5]]);
+  });
+
+  it("[P2 2차] the earlier line itself first: still there (moved inside its line), with copies on line 5 and on line 55 of the same stored run — line 60 stays", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
+    const file = await upload(f.cookies.owner, c.id, "dup2.txt", Buffer.from(lines.join("\n") + "\n"));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
+    expect(first.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 60]]);
+    // Lines 41–80 are one stored run: line 55 (before 60 in it) and line 5 get the sentence; line 60 gets a lead-in
+    // (its range moves). Marks follow the text: rewritten for the changed run.
+    const seg = db.$client
+      .prepare("SELECT seq, text, marks FROM file_segments WHERE file_id = ? AND text LIKE ?")
+      .get(file.id, `%${ONLY_HERE}%`) as { seq: number; text: string; marks: string };
+    const runLines = seg.text.split("\n");
+    const marks = JSON.parse(seg.marks) as [number, number, { line: number }][];
+    const first41 = marks[0]![2].line;
+    const edited = runLines.map((l, i) =>
+      i + first41 === 55 ? ONLY_HERE : i + first41 === 60 ? `설명: ${ONLY_HERE}` : l,
+    );
+    let at = 0;
+    const newMarks = edited.map((l, i) => {
+      const m = [at, at + l.length, { ...marks[i]![2] }];
+      at += l.length + 1;
+      return m;
+    });
+    db.$client
+      .prepare("UPDATE file_segments SET text = ?, marks = ? WHERE file_id = ? AND seq = ?")
+      .run(edited.join("\n"), JSON.stringify(newMarks), file.id, seg.seq);
+    db.$client
+      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ? AND seq <> ?")
+      .run("줄 5 내용입니다.", ONLY_HERE, file.id, seg.seq);
+    touch(db, file.id);
+    const again = await send(f.cookies.owner, c.id, "/again1");
+    expect(again.note!.citations.map((x) => [x.status, x.locator?.line, x.locator?.charRange])).toEqual([
+      ["verified", 60, ["설명: ".length, "설명: ".length + ONLY_HERE.length]],
+    ]);
   });
 });

@@ -209,6 +209,25 @@ async function snapshotWorld(o: { runner?: DocRunner } = {}) {
 
 /** Each turn's answer cites its page (the note the run's end would write): S1 in turn 1, S2 in turn 2. */
 function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
+  // Each note entry stands for a citation row of the original (#186 review 2차: the whole passage is kept there).
+  const row = (sourceId: string) => {
+    const id = crypto.randomUUID();
+    w.db.$client
+      .prepare(
+        `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote)
+         values (?, ?, ?, ?, 1, ?, 'verified', ?, ?, '인용')`,
+      )
+      .run(
+        id,
+        crypto.randomUUID(),
+        w.c.id,
+        w.f.users.owner.id,
+        sourceId,
+        `원문 구절 전체 ${sourceId}`,
+        `k-${id}`,
+      );
+    return id;
+  };
   const note = (n: number, sourceId: string, url: string) => ({
     type: "citation_note",
     missing: [],
@@ -223,6 +242,7 @@ function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
         url,
         publishedAt: null,
         quote: "인용",
+        citationId: row(sourceId),
       },
     ],
   });
@@ -1074,6 +1094,20 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
     expect(srcs[0]!.characters).toBe(0);
     expect(JSON.stringify(msgs[1]!.parts)).toContain(srcs[0]!.id);
     expect(JSON.stringify(msgs)).not.toContain(w.s1);
+    // The citation row the copied note stands for is copied too (#186 review 2차): the forker's, the copy's source,
+    // the whole passage kept server-side; the note names the copy. The row of the turn past the boundary is not.
+    const cited = msgs[1]!.parts.find((x) => x.type === "citation_note");
+    const rowId = cited?.type === "citation_note" ? cited.citations[0]!.citationId : undefined;
+    expect(rowId).toBeDefined();
+    expect(db.$client.prepare("select * from citations where conversation_id = ?").all(fork.id)).toEqual([
+      expect.objectContaining({
+        id: rowId,
+        user_id: w.f.users.shared.id,
+        source_id: srcs[0]!.id,
+        snippet: `원문 구절 전체 ${w.s1}`,
+        n: 1,
+      }),
+    ]);
 
     // Provenance (#54): every copied item names its original.
     const items = db.$client
@@ -1396,6 +1430,10 @@ describe("fork — remapParts (#52)", () => {
       file: new Map([["f1", "F1"]]),
       artifact: new Map<string, { id: string; versions: Map<number, number> }>(),
       source: new Map<string, string>(),
+      citation: new Map([
+        ["c1", "C1"],
+        ["c2", "C2"],
+      ]),
     };
     const rev = "a".repeat(64);
     const entry = (n: number, fileId: string | undefined, locator?: boolean) => ({
@@ -1410,7 +1448,8 @@ describe("fork — remapParts (#52)", () => {
       ...(locator && fileId
         ? { locator: { fileId, fileRevision: rev, kind: "page" as const, page: 12 } }
         : {}),
-      ...(fileId ? { fileId, snippet: "모델이 인용한 구절 전체예요" } : {}),
+      ...(fileId ? { fileId } : {}),
+      citationId: `c${n}`,
     });
     const out = remapParts(
       [
@@ -1434,13 +1473,9 @@ describe("fork — remapParts (#52)", () => {
       [4, undefined, undefined],
     ]);
     expect(JSON.stringify(out)).not.toMatch(/"f[12]"/);
-    // The whole cited snippet goes with the copy (what a follow-up there checks again, review 1차).
-    expect(cites.map((c) => c.snippet)).toEqual([
-      "모델이 인용한 구절 전체예요",
-      "모델이 인용한 구절 전체예요",
-      "모델이 인용한 구절 전체예요",
-      undefined,
-    ]);
+    // The citation rows copied into the fork (review 2차); one not copied is cut.
+    expect(cites.map((c) => c.citationId)).toEqual(["C1", "C2", undefined, undefined]);
+    expect(JSON.stringify(out)).not.toMatch(/"c[1-4]"/);
     expect(CitationNotePart.parse(note)).toEqual(note);
   });
 });

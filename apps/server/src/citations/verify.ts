@@ -460,15 +460,40 @@ export function findSnippetAt(
   return { found: false, reason: "not_found" };
 }
 
+/**
+ * Every occurrence `findSnippetAt` would accept, in order (at most `max`) — a recheck (#186) compares their places
+ * with the earlier one (a passage repeated inside one unit). The first form (as sent, quotes and all) that has any.
+ */
+export function findSnippetMatches(
+  body: string,
+  snippet: string,
+  max = 50,
+): { quote: string; start: number; end: number }[] {
+  const forms = snippetForms(snippet);
+  if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet) return [];
+  const page = pageOf(body, undefined);
+  for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
+    const all: { quote: string; start: number; end: number }[] = [];
+    matchIn(body, page.n, page.d, want, all, max);
+    if (all.length) return all;
+  }
+  return [];
+}
+
 const firstTokens = (s: string, n: number) => s.split(" ").slice(0, n).join(" ");
 const lastTokens = (s: string, n: number) => s.split(" ").slice(-n).join(" ");
 
-/** The first occurrence of `want` in the page that respects every boundary rule: the original passage and range. */
+/**
+ * The first occurrence of `want` in the page that respects every boundary rule: the original passage and range.
+ * With `all`: every such occurrence (up to `max`) goes there instead, and the result is undefined.
+ */
 function matchIn(
   body: string,
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
+  all?: { quote: string; start: number; end: number }[],
+  max = Number.POSITIVE_INFINITY,
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -499,11 +524,14 @@ function matchIn(
       // list that itself ends at a token boundary (`수출이`, `반도체였다`).
       if (TOKEN.test(after) && !PARTICLE_THEN_BOUNDARY.test(rest)) continue;
     }
-    return {
+    const m = {
       quote: boundText(body.slice(start, end).replace(/\s+/g, " ").trim(), CITATION_LIMITS.snippet),
       start,
       end,
     };
+    if (!all) return m;
+    all.push(m);
+    if (all.length >= max) break;
   }
   return undefined;
 }

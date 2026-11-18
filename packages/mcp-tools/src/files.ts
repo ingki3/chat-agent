@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ServerToolInfo } from "./index.js";
+import { citeSnippet, type ServerToolInfo } from "./index.js";
 
 /**
  * File tools of the common MCP server (#48, PRD FR-4.3·4.5): the uploaded files of the run's conversation, read
@@ -57,7 +57,7 @@ export const FILE_CITE_TOOL: ServerToolInfo = {
     'Registers a citation of an uploaded file for the sentence you are about to write — the same numbering as cite. snippet: a passage copied exactly from the file text that file_read or file_search returned (one or two sentences, at least 8 characters; do not join pieces, do not paraphrase); page (optional): where you read it, to look there first. Returns {n, marker, status, label, locator}: put the marker (e.g. "[1]") at the end of the sentence it supports; the user sees the file name and the place (e.g. "보고서.pdf · 12쪽"). status "verified" = the passage is in the file; any other status is shown with a warning.',
   input: {
     fileId,
-    snippet: z.string().min(1).max(500).describe("The exact passage from the file text."),
+    snippet: citeSnippet("The exact passage from the file text."),
     page: z
       .number()
       .int()
