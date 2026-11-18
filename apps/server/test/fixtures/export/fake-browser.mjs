@@ -9,6 +9,19 @@ const mode = process.argv[2];
 if (mode === "exit127") process.exit(127);
 // $PIDFILE (#170): the stand-in records its pid as it starts (a test can then check it never outlived its watchdog).
 if (process.env.PIDFILE) fs.writeFileSync(process.env.PIDFILE, String(process.pid));
+// $FD5FILE (#170): what it got as fd 5 — the lock's inode, and whether it can write through it (it must not).
+if (process.env.FD5FILE) {
+  let ino = null;
+  let writable = false;
+  try {
+    ino = fs.fstatSync(5).ino;
+    fs.writeSync(5, "x");
+    writable = true;
+  } catch {
+    // EBADF: not open, or not open for writing
+  }
+  fs.writeFileSync(process.env.FD5FILE, JSON.stringify({ pid: process.pid, ino, writable }));
+}
 const input = new net.Socket({ fd: 3, readable: true, writable: false });
 const output = new net.Socket({ fd: 4, readable: false, writable: true });
 const send = (raw) => output.write(raw + "\0");

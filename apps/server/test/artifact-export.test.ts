@@ -894,6 +894,79 @@ describe("the browser never outlives its owner (#170)", () => {
     }
   }, 30_000);
 
+  it("the group is signalled once even when the time limit and shutdown overlap", async () => {
+    let l: Launched | undefined;
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher: (sp) => (l = track(unsandboxedLauncher(sp))),
+      egress: spyEgress().egress,
+      limits: { timeoutMs: 500 },
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    const real = process.kill.bind(process);
+    let overlapped = false;
+    const kill = vi.spyOn(process, "kill").mockImplementation((p: number, sig?: string | number) => {
+      const res = real(p, sig);
+      // The time limit's signal: shut down right then, before the watchdog's exit is seen.
+      if (!overlapped && l && p === -l.child.pid! && sig === "SIGKILL") {
+        overlapped = true;
+        closeRenderers();
+      }
+      return res;
+    });
+    try {
+      expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+      expect(overlapped).toBe(true);
+      expect(kill.mock.calls.filter(([p, sig]) => p === -l!.child.pid! && sig === "SIGKILL")).toHaveLength(1);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(await gone(l!.child.pid!, 3000)).toBe(true);
+  }, 30_000);
+
+  it("a render that fails while its folder is prepared (e.g. a full disk) keeps no descriptor and no folder", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-prep-")));
+    closers.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const realMkdir = fs.mkdirSync.bind(fs);
+    const mkdir = vi.spyOn(fs, "mkdirSync").mockImplementation(((
+      p: fs.PathLike,
+      o?: fs.MakeDirectoryOptions,
+    ) => {
+      if (String(p).endsWith(`${path.sep}home`) && String(p).includes(`${path.sep}agentlee-render-`)) {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return realMkdir(p, o);
+    }) as typeof fs.mkdirSync);
+    const fds = () => fs.readdirSync("/dev/fd").length;
+    let launches = 0;
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher: (sp) => {
+        launches++;
+        return track(unsandboxedLauncher(sp));
+      },
+      egress: spyEgress().egress,
+      tmpDir: root,
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    try {
+      await r.render(job("markdown", "x", "pdf")); // warm up (the proxy's own descriptors)
+      const before = fds();
+      for (let i = 0; i < 8; i++)
+        expect(await r.render(job("markdown", "x", "pdf"))).toEqual({
+          ok: false,
+          code: "export_unavailable",
+        });
+      expect(fds()).toBe(before);
+      expect(fs.readdirSync(root)).toEqual([]);
+      expect(launches).toBe(0);
+    } finally {
+      mkdir.mockRestore();
+    }
+  }, 30_000);
+
   it("TERM to the watchdog: it stops the browser (still running: killed and reaped) and cleans up", async () => {
     const w = watchdog(FAKE());
     const pgid = w.l.child.pid!;
@@ -1013,6 +1086,42 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(fs.existsSync(d.workDir)).toBe(false);
     expect(fs.existsSync(lockPath)).toBe(true); // not the file it locked: left alone
     expect(fs.existsSync(`${lockPath}.orig`)).toBe(true);
+  }, 30_000);
+
+  it("the lock reaches the browser: fd 5 is the server's file, read-only, and the browser alone still holds the lock", async () => {
+    const lockable = (file: string) =>
+      spawnSync("/usr/bin/perl", [
+        "-e",
+        'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, 6) ? exit 0 : exit 1',
+        file,
+      ]).status === 0;
+    const info = path.join(fs.realpathSync(os.tmpdir()), `agentlee-fd5-${crypto.randomUUID()}`);
+    closers.push(async () => fs.rmSync(info, { force: true }));
+    const d = freshRenderDir();
+    const lockPath = renderLockPath(d.workDir);
+    closers.push(async () => fs.rmSync(lockPath, { force: true })); // the descriptor is closed by hand below
+    const serverIno = fs.fstatSync(d.lockFd).ino;
+    const w = watchdog(FAKE(), { dir: d, env: { FD5FILE: info } });
+    expect(await within(10_000, () => fs.existsSync(info) && fs.readFileSync(info, "utf8").length > 0)).toBe(
+      true,
+    );
+    const got = JSON.parse(fs.readFileSync(info, "utf8")) as {
+      pid: number;
+      ino: number | null;
+      writable: boolean;
+    };
+    expect(got.ino).toBe(serverIno);
+    expect(got.writable).toBe(false);
+    // Only the browser left: the watchdog killed alone, the server's descriptor closed.
+    process.kill(w.l.child.pid!, "SIGKILL");
+    await w.exited;
+    fs.closeSync(d.lockFd);
+    d.lockFd = -1;
+    expect(alive(got.pid)).toBe(true);
+    expect(lockable(lockPath)).toBe(false); // still held — by the browser
+    process.kill(-w.l.child.pid!, "SIGKILL"); // the group (the browser is in it)
+    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(await within(2000, () => lockable(lockPath))).toBe(true);
   }, 30_000);
 
   it("the lock: no descriptor 5, or one that is not a regular file, and the watchdog does not start", async () => {

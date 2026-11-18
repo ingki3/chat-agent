@@ -153,12 +153,13 @@ const PERL = "/usr/bin/perl";
  * from an older folder of the same name) the folder is dropped and another name is tried.
  */
 export function makeRenderDir(parent: string): RenderDir {
-  const { O_RDWR, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  const { O_RDONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
   for (let i = 0; i < 5; i++) {
     const workDir = fs.realpathSync(fs.mkdtempSync(path.join(parent, RENDER_DIR_PREFIX)));
     let fd: number;
     try {
-      fd = fs.openSync(renderLockPath(workDir), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+      // Read-only: the browser inherits it, and an open descriptor is not limited by the sandbox's path rules.
+      fd = fs.openSync(renderLockPath(workDir), O_RDONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
     } catch (e) {
       fs.rmdirSync(workDir);
       if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
@@ -233,7 +234,7 @@ export function removeRenderDir(dir: RenderDir) {
  * argv: <owner pid> <deadline sec> <render folder> <command…>; fd 5: the lock.
  */
 export const WATCHDOG_PL = String.raw`use strict; use POSIX (); use Errno ();
-use Fcntl qw(:flock);
+use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC); use File::Path ();
 my %X = (done => ${WATCHDOG_EXIT.done}, stopped => ${WATCHDOG_EXIT.stopped}, notStarted => ${WATCHDOG_EXIT.notStarted},
   execFailed => ${WATCHDOG_EXIT.execFailed});
@@ -242,10 +243,13 @@ POSIX::_exit($X{notStarted}) unless @cmd && $owner =~ /\A[0-9]{1,10}\z/ && $max 
 $max = ${WATCHDOG_MAX_SEC} if $max > ${WATCHDOG_MAX_SEC};
 my $ours = $dir =~ m{/${RENDER_DIR_PREFIX}[A-Za-z0-9]{6}\z} && -d $dir && !-l $dir;
 my $lp = "$dir.lock";
-open(my $lock, "+<&=", ${WATCHDOG_LOCK_FD}) or POSIX::_exit($X{notStarted});    # the server's descriptor (no path)
+open(my $lock, "<&=", ${WATCHDOG_LOCK_FD}) or POSIX::_exit($X{notStarted});    # the server's descriptor (no path)
 my @f = stat($lock);
 POSIX::_exit($X{notStarted}) unless @f && -f _ && $f[4] == $<;
 flock($lock, LOCK_EX | LOCK_NB) or POSIX::_exit($X{notStarted});
+# perl marks a descriptor it opens close-on-exec: fd 5 (only) must reach the browser, so it holds the lock too.
+my $fl = fcntl($lock, F_GETFD, 0);
+POSIX::_exit($X{notStarted}) unless defined $fl && fcntl($lock, F_SETFD, $fl & ~FD_CLOEXEC);
 $SIG{PIPE} = "IGNORE";
 pipe(my $sr, my $sw) or POSIX::_exit($X{notStarted});    # close-on-exec (perl's default above fd 2)
 my $pid = fork();
@@ -366,27 +370,29 @@ export const unsandboxedLauncher: Launcher = (s) => {
 
 /**
  * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
- * render's folder and lock. `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`,
- * SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ * render's folder and lock, and whether the group has been signalled. `killLiveRenders` is the last word on shutdown
+ * (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
  */
-const liveRenders = new Map<number, RenderDir>();
+const liveRenders = new Map<number, { dir: RenderDir; signalled: boolean }>();
 
-/**
- * Records a running render. `untrack` forgets it (once the watchdog has exited); `tracked` says whether it is still
- * on record — false once `killLiveRenders` has killed its group (nothing more to signal then).
- */
-export function trackRender(pgid: number, dir: RenderDir) {
-  liveRenders.set(pgid, dir);
-  return {
-    tracked: () => liveRenders.get(pgid) === dir,
-    untrack: () => {
-      if (liveRenders.get(pgid) === dir) liveRenders.delete(pgid);
-    },
+/** Records a running render; the returned function forgets it (call it once the watchdog has exited). */
+export function trackRender(pgid: number, dir: RenderDir): () => void {
+  const entry = { dir, signalled: false };
+  liveRenders.set(pgid, entry);
+  return () => {
+    if (liveRenders.get(pgid) === entry) liveRenders.delete(pgid);
   };
 }
 
-/** SIGKILLs a render's process group (the watchdog's, the browser in it). */
-export function killRenderGroup(pgid: number) {
+/**
+ * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**: the render's limits,
+ * the watchdog's abnormal end and shutdown all come here, and whichever is first sends the one signal. An untracked
+ * group (already gone, or forgotten) is never signalled.
+ */
+export function signalRender(pgid: number) {
+  const entry = liveRenders.get(pgid);
+  if (!entry || entry.signalled) return;
+  entry.signalled = true;
   try {
     process.kill(-pgid, "SIGKILL");
   } catch {
@@ -397,8 +403,8 @@ export function killRenderGroup(pgid: number) {
 /** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
 export function killLiveRenders(): number {
   const n = liveRenders.size;
-  for (const [pgid, dir] of liveRenders) {
-    killRenderGroup(pgid);
+  for (const [pgid, { dir }] of [...liveRenders]) {
+    signalRender(pgid);
     removeRenderDir(dir);
   }
   liveRenders.clear();

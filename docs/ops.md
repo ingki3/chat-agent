@@ -662,12 +662,13 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
     LC_ALL=C find -E "$T" -maxdepth 1 -type d -regex '.*/agentlee-render-[A-Za-z0-9]{6}' -user "$(id -un)" -mtime +1 \
       -exec sh -c '[ -e "$1.lock" ] || [ -L "$1.lock" ] || echo "$1"' _ {} \;
     ```
-    목록에서 지울 것을 **골라 그 경로만** 적는다(다시 검색해서 지우지 않는다 — 검토한 목록과 지우는 대상이 달라질 수 있다). 각 경로는 지우기 직전에 다시 확인한다: `$T`의 바로 아래인지, 이름이 정확히 렌더 이름인지, 진짜 폴더(링크 아님)인지, 우리 소유인지, 하루가 넘었는지, 옆 잠금이 없는지:
+    목록에서 지울 것을 **골라 그 경로만** 적는다(다시 검색해서 지우지 않는다 — 검토한 목록과 지우는 대상이 달라질 수 있다). 각 경로는 지우기 직전에 다시 확인한다: `$T`의 바로 아래인지(`${d%/*}`), 이름 **전체**가 정확히 렌더 이름인지(`${d##*/}`, `LC_ALL=C` 패턴 — 줄 단위 검사가 아니라 개행이 든 이름도 걸러진다), 진짜 폴더(링크 아님)인지, 우리 소유인지, 하루가 넘었는지, 옆 잠금이 없는지:
     ```bash
     T="$(getconf DARWIN_USER_TEMP_DIR)"; T="${T%/}"
+    export LC_ALL=C; A='[A-Za-z0-9]'
     for d in '/…/agentlee-render-AbC123' '/…/agentlee-render-xYz789'; do   # 고른 경로들
-      [ "$(dirname "$d")" = "$T" ] \
-        && printf '%s\n' "$(basename "$d")" | LC_ALL=C grep -Eqx 'agentlee-render-[A-Za-z0-9]{6}' \
+      case "${d##*/}" in agentlee-render-$A$A$A$A$A$A) name=ok ;; *) name=bad ;; esac
+      [ "${d%/*}" = "$T" ] && [ "$name" = ok ] \
         && [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -f %u "$d")" = "$(id -u)" ] \
         && [ -n "$(find "$d" -maxdepth 0 -mtime +1)" ] \
         && [ ! -e "$d.lock" ] && [ ! -L "$d.lock" ] \
