@@ -12,7 +12,7 @@ import {
 
 /**
  * The diagram frame's bundle (#182): runs inside `<iframe sandbox="allow-scripts" src="/mermaid-frame">` — an
- * opaque origin with no network (its CSP, apps/server/src/mermaid-frame.ts). The page's boot script ran this code
+ * opaque origin that cannot make requests of its own (its CSP and boot script, apps/server/src/mermaid-frame.ts). The page's boot script ran this code
  * from the app's message and noted the app's origin. Here: answer the app's render requests, one at a time, with
  * the SVG text — measured and drawn in this frame's own DOM, never the app's.
  */

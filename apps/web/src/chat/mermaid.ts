@@ -27,8 +27,8 @@ export {
  * app's document:
  *
  * - it runs in a **diagram frame**: `<iframe sandbox="allow-scripts" src="/mermaid-frame">` — an opaque origin
- *   (no cookies, storage or DOM of the app), served with its own CSP (no network at all: `connect-src`,
- *   `img-src` data/blob only, `font-src 'none'`, no frames, no forms). The app fetches the frame bundle itself
+ *   (no cookies, storage or DOM of the app), served with its own CSP (no requests of its own, no WebRTC, workers,
+ *   frames or forms — the exact limits are in apps/server/src/mermaid-frame.ts). The app fetches the frame bundle itself
  *   (same origin, its cookies and service worker) and posts it in; the frame runs it as a blob script. Measuring
  *   and drawing happen in the frame's DOM; only the SVG *text* comes back;
  * - the app never puts that SVG into its DOM: it is shown as `<img src="blob:…">` (MermaidBlock);
@@ -128,8 +128,8 @@ export type FrameHandle = {
 export type FrameEnv = {
   /** Makes a frame; `onMessage` gets the data of messages that really come from it. */
   create: (onMessage: (data: unknown) => void) => FrameHandle;
-  /** The frame bundle's code (fetched by the app). */
-  loadCode: () => Promise<string>;
+  /** The frame bundle's code (fetched by the app); `signal` aborts a fetch the host gave up on. */
+  loadCode: (signal: AbortSignal) => Promise<string>;
 };
 
 type Pending = (r: RenderResult) => void;
@@ -140,7 +140,10 @@ export class FrameHost {
   private started: Promise<void> | null = null;
   private pending = new Map<number, Pending>();
   private seq = 0;
-  private code: Promise<string> | null = null;
+  /** The bundle, once fetched (kept for every later frame). */
+  private code: string | null = null;
+  /** The fetch in progress, if any — dropped (and aborted) when the start it serves gives up. */
+  private loading: { promise: Promise<string>; ac: AbortController } | null = null;
   /** Ends a start still in progress (the frame was taken down meanwhile). */
   private abortStart: ((e: unknown) => void) | null = null;
   /** Frames made so far (tests). */
@@ -152,9 +155,35 @@ export class FrameHost {
   ) {}
 
   private loadCode(): Promise<string> {
-    if (!this.code)
-      this.code = this.env.loadCode().catch((e: unknown) => ((this.code = null), Promise.reject(e)));
-    return this.code;
+    if (this.code !== null) return Promise.resolve(this.code);
+    if (!this.loading) {
+      const ac = new AbortController();
+      const entry: { promise: Promise<string>; ac: AbortController } = {
+        ac,
+        promise: this.env.loadCode(ac.signal).then(
+          (code) => {
+            // A fetch given up on (aborted, replaced) never sets anything, even if it answers late.
+            if (this.loading !== entry || ac.signal.aborted) throw new Error("bundle_fetch_dropped");
+            this.loading = null;
+            this.code = code;
+            return code;
+          },
+          (e: unknown) => {
+            if (this.loading === entry) this.loading = null;
+            throw e;
+          },
+        ),
+      };
+      this.loading = entry;
+    }
+    return this.loading.promise;
+  }
+
+  /** Drops the bundle fetch in progress: the next start fetches afresh. */
+  private dropLoading() {
+    const l = this.loading;
+    this.loading = null;
+    l?.ac.abort();
   }
 
   private start(): Promise<void> {
@@ -204,6 +233,7 @@ export class FrameHost {
 
   /** Takes the frame down; a drawing still waiting on it ends as aborted. */
   destroy() {
+    this.dropLoading();
     const frame = this.frame;
     this.frame = null;
     this.started = null;
@@ -292,9 +322,9 @@ export function iframeEnv(src = "/mermaid-frame"): FrameEnv {
         },
       };
     },
-    loadCode: async () => {
+    loadCode: async (signal) => {
       const { default: url } = await import("./mermaid-frame-url.js");
-      const res = await fetch(url, { credentials: "same-origin" });
+      const res = await fetch(url, { credentials: "same-origin", signal });
       if (!res.ok) throw new Error(`frame bundle ${res.status}`);
       return res.text();
     },

@@ -49,7 +49,10 @@ type Draw = (text: string, dark: boolean) => Promise<{ svg: string } | { error: 
  * A fake frame: boots, takes the code, answers renders with `draw` (a never-settling promise hangs it). Records the
  * frames made and removed, what was posted into them, and how many drawings ran at once.
  */
-function fakeFrames(draw: Draw = async () => ({ svg: SVG() }), opts: { code?: () => Promise<string> } = {}) {
+function fakeFrames(
+  draw: Draw = async () => ({ svg: SVG() }),
+  opts: { code?: (signal: AbortSignal) => Promise<string> } = {},
+) {
   const frames: { removed: boolean; posts: unknown[]; running: number }[] = [];
   let maxRunning = 0;
   const texts: { text: string; dark: boolean }[] = [];
@@ -305,6 +308,37 @@ describe("FrameHost and the queue", () => {
     expect(await renderDiagram("graph TD\nA", false)).toEqual({ kind: "load-failed" });
     expect(f.frames[0]!.removed).toBe(true);
     expect(await renderDiagram("graph TD\nA", false)).toMatchObject({ kind: "ok" });
+  });
+  // Review #189 2차: a bundle fetch that hangs is dropped (aborted) with the start it served; the next start
+  // fetches afresh, and the stale fetch answering late changes nothing.
+  it("a hanging bundle fetch is aborted on the start timeout; the next drawing fetches again; a late answer is ignored", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    let releaseStale: (code: string) => void = () => {};
+    const f = fakeFrames(undefined, {
+      code: (signal) => {
+        signals.push(signal);
+        if (signals.length === 1) return new Promise<string>((resolve) => (releaseStale = resolve));
+        return Promise.resolve("/* fresh */");
+      },
+    });
+    const first = renderDiagram("graph TD\nA", false);
+    await vi.advanceTimersByTimeAsync(5001); // the start limit of fakeFrames
+    expect(await first).toEqual({ kind: "load-failed" });
+    expect(signals[0]!.aborted).toBe(true);
+    expect(f.frames[0]!.removed).toBe(true);
+    expect(await renderDiagram("graph TD\nB", false)).toMatchObject({ kind: "ok" });
+    expect(signals).toHaveLength(2);
+    expect(f.frames[1]!.posts[0]).toEqual({ type: FRAME_CODE, code: "/* fresh */" });
+    // The stale fetch answers now: the kept bundle stays the fresh one, the live frame is untouched.
+    releaseStale("/* stale */");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.frames[1]!.posts.filter((p) => (p as { type: string }).type === FRAME_CODE)).toHaveLength(1);
+    // A later frame (after a timeout took this one down) gets the kept fresh bundle, without fetching again.
+    f.host.destroy();
+    expect(await renderDiagram("graph TD\nC", false)).toMatchObject({ kind: "ok" });
+    expect(f.frames[2]!.posts[0]).toEqual({ type: FRAME_CODE, code: "/* fresh */" });
+    expect(signals).toHaveLength(2);
   });
   it("a frame that never gets ready ends in load-failed after the start limit, and is taken down", async () => {
     vi.useFakeTimers();

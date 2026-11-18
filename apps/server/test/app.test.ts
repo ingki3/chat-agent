@@ -110,8 +110,10 @@ describe("server", () => {
       "form-action 'none'",
       "base-uri 'none'",
       "frame-ancestors 'self'",
+      "webrtc 'block'",
     ])
       expect(a).toContain(d);
+    expect(res.headers["x-dns-prefetch-control"]).toBe("off");
     expect(a).not.toContain("allow-same-origin");
     // The only inline script is the boot script, admitted by its hash.
     const scripts = [...MERMAID_FRAME_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
@@ -122,6 +124,8 @@ describe("server", () => {
     expect(b).toBe("script-src 'unsafe-inline' blob:");
     // The boot script takes code only from its parent.
     expect(scripts[0]).toContain("e.source!==parent");
+    // …and takes the WebRTC constructors away before any other code runs.
+    expect(scripts[0]!.indexOf("RTC")).toBeLessThan(scripts[0]!.indexOf("addEventListener"));
     const page = await app.inject({ method: "GET", url: "/" });
     expect(page.headers["content-security-policy"]).toBe(APP_CSP);
   });

