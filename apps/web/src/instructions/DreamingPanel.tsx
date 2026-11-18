@@ -17,7 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
-import { behind, SAVED_STALE, saveAndSync, stamped } from "./sync.js";
+import { applySaved, keepNewest, newer } from "./rev.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -28,9 +28,12 @@ import { MemoryCard } from "./MemoryCard.js";
  * admin sets them. Only the user sees this — the admin's screen has counts only.
  */
 export function DreamingPanel() {
-  const q = useQuery({ queryKey: DREAMING_KEY, queryFn: stamped(DREAMING_KEY, dreaming.mine) });
-  // Read so the panel re-renders when a refetch lands (the "저장했지만…" notices follow it — sync.ts).
-  void q.dataUpdatedAt;
+  // The newest revision wins (rev.ts): a GET that read data from before a save never replaces the save's answer.
+  const q = useQuery({
+    queryKey: DREAMING_KEY,
+    queryFn: dreaming.mine,
+    structuralSharing: keepNewest<MyDreaming>(),
+  });
   const d = q.data;
   // A failed refetch keeps the form (and its drafts) on the data we have, with the error above it (review #195 5).
   if (!d)
@@ -102,11 +105,8 @@ export function DreamingSettingsForm({
   pending: boolean;
   /** Prefix of the accessible names (a row of the admin's table names its user). */
   label?: string;
-  /**
-   * Saves only the changed fields; resolves `true` once saved and refetched, `false` when saved but the refetch failed
-   * (the draft stays), rejects when refused (the caller says why).
-   */
-  onSave: (s: SaveDreamingSettingsRequest) => Promise<boolean>;
+  /** Saves only the changed fields; resolves once saved (the answer is in the cache), rejects when refused. */
+  onSave: (s: SaveDreamingSettingsRequest) => Promise<unknown>;
 }) {
   // Only the changed fields (draft.ts): the others follow the server.
   const [draft, setDraft] = useState<Partial<DreamingSettings>>();
@@ -123,9 +123,7 @@ export function DreamingSettingsForm({
         if (pending || draft === undefined) return;
         const sent = draft;
         void onSave(sent).then(
-          (synced) => {
-            if (synced) setDraft((cur) => settleDraft(cur, sent));
-          },
+          () => setDraft((cur) => settleDraft(cur, sent)),
           () => {},
         );
       }}
@@ -188,10 +186,10 @@ export function DreamingSettingsForm({
 
 function Settings({ view }: { view: MyDreaming }) {
   const qc = useQueryClient();
-  // The answer is not put in the cache (it could be older than another form's save): saved, then refetched
-  // (sync.ts) — `data` says whether the screen caught up.
+  // The answer (the stored settings and their revision) goes into the cache unless something newer is there (rev.ts).
   const save = useMutation({
-    mutationFn: (s: SaveDreamingSettingsRequest) => saveAndSync(qc, DREAMING_KEY, () => dreaming.save(s)),
+    mutationFn: (s: SaveDreamingSettingsRequest) => dreaming.save(s),
+    onSuccess: (v) => applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => newer(old, v)),
   });
   return (
     <section className="dream-section" aria-labelledby="dream-my-settings-h" data-testid="dreaming-settings">
@@ -206,11 +204,11 @@ function Settings({ view }: { view: MyDreaming }) {
         choices={view.choices}
         disabled={!view.canEdit}
         pending={save.isPending}
-        onSave={(s) => save.mutateAsync(s).then((r) => r.synced)}
+        onSave={(s) => save.mutateAsync(s)}
       />
       {save.isSuccess && (
         <p className="small" role="status">
-          {behind(DREAMING_KEY, save.data.savedAt) ? SAVED_STALE : "저장했어요."}
+          저장했어요.
         </p>
       )}
       {save.isError && (
@@ -229,11 +227,11 @@ function Prompt({ view }: { view: MyDreaming }) {
   const content = text ?? view.prompt.content;
   // `typed`: the editor's draft when the save was sent — cleared on success only if it is still the same.
   const save = useMutation({
-    mutationFn: (a: { content: string | null; typed: string | undefined }) =>
-      saveAndSync(qc, DREAMING_KEY, () => dreaming.savePrompt(a.content)),
-    // Only once the fresh prompt is on screen; a failed refetch keeps the text (and says so).
-    onSuccess: (r, a) => {
-      if (r.synced) setText((cur) => afterSave(cur, a.typed, undefined));
+    mutationFn: (a: { content: string | null; typed: string | undefined }) => dreaming.savePrompt(a.content),
+    // The answer carries the stored prompt (rev.ts); the editor's text goes only if it is still what was sent.
+    onSuccess: (v, a) => {
+      applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => newer(old, v));
+      setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });
   // 미리 실행 runs the prompt **saved on the server** (it sends none — review #195 5): what the next run would use.
@@ -285,11 +283,6 @@ function Prompt({ view }: { view: MyDreaming }) {
       {view.canEdit && text !== undefined && (
         <p className="small muted">
           미리 실행은 저장된 프롬프트로 돌아요. 고친 내용은 저장한 뒤 미리 실행해 보세요.
-        </p>
-      )}
-      {save.isSuccess && behind(DREAMING_KEY, save.data.savedAt) && (
-        <p className="small" role="status">
-          {SAVED_STALE}
         </p>
       )}
       {(save.isError || run.isError) && (

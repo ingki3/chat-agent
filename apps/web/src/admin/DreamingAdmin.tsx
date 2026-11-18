@@ -20,14 +20,7 @@ import {
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
 import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
-import {
-  behind,
-  saveAndSync,
-  SAVED_STALE,
-  stamped,
-  type SaveStamps,
-  useInstant,
-} from "../instructions/sync.js";
+import { applySaved, newerAdmin, withUser } from "../instructions/rev.js";
 
 /**
  * 관리자 → 기억 정리 (#146, #188, PRD FR-16.6·16.8): what stays the admin's once each user sets their own 기억 정리
@@ -37,12 +30,12 @@ import {
  * 시스템 상태: the allowed pairs and the youth settings are settings, and 시스템 상태 is a read-only health page.
  */
 export function DreamingAdmin() {
+  // Each part (config, each user's settings, each 반영 방식) keeps its newest revision (rev.ts).
   const q = useQuery({
     queryKey: ADMIN_DREAMING_KEY,
-    queryFn: stamped(ADMIN_DREAMING_KEY, adminDreaming.get),
+    queryFn: adminDreaming.get,
+    structuralSharing: (old, next) => newerAdmin(old as View | undefined, next as View),
   });
-  // Read so the page re-renders when a refetch lands (the "저장했지만…" notices follow it — sync.ts).
-  void q.dataUpdatedAt;
   const v = q.data;
   return (
     <div className="admin-dreaming" data-testid="admin-dreaming">
@@ -68,21 +61,20 @@ function Settings({ view }: { view: View }) {
   const qc = useQueryClient();
   // Only the changed fields (draft.ts): a stale page saving the cap never turns the server back on (review #195 5).
   const [draft, setDraft] = useState<Partial<DreamingConfig>>();
-  /** When the last save completed (its notice follows the refetches after it — sync.ts `behind`). */
-  const [saved, setSaved] = useState<number>();
+  const [saved, setSaved] = useState(false);
   const c = withDraft(view.config, draft);
-  // Locked while saving; refetched after (never the answer into the cache, sync.ts); only once the refetch worked are
-  // the sent fields still as sent dropped — otherwise the draft stays and the screen says so.
+  // Locked while saving; the answer (stored config + revision) goes into the cache unless something newer is there
+  // (rev.ts); the sent fields still as sent leave the draft.
   const save = useMutation({
-    mutationFn: (sent: Partial<DreamingConfig>) =>
-      saveAndSync(qc, ADMIN_DREAMING_KEY, () => adminDreaming.save(sent)),
-    onSuccess: (r, sent) => {
-      if (r.synced) setDraft((cur) => settleDraft(cur, sent));
-      setSaved(r.savedAt);
+    mutationFn: (sent: Partial<DreamingConfig>) => adminDreaming.save(sent),
+    onSuccess: (v, sent) => {
+      applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => newerAdmin(old, v));
+      setDraft((cur) => settleDraft(cur, sent));
+      setSaved(true);
     },
   });
   const edit = (p: Partial<DreamingConfig>) => {
-    setSaved(undefined);
+    setSaved(false);
     setDraft((d) => ({ ...d, ...p }));
   };
   const options = view.candidates.flatMap((x) =>
@@ -172,9 +164,9 @@ function Settings({ view }: { view: View }) {
         <button type="submit" className="primary" disabled={save.isPending}>
           저장
         </button>
-        {saved !== undefined && (
+        {saved && (
           <span className="small" role="status">
-            {behind(ADMIN_DREAMING_KEY, saved) ? SAVED_STALE : "저장했어요."}
+            저장했어요.
           </span>
         )}
       </div>
@@ -217,10 +209,10 @@ function choiceLabel(view: View, s: DreamingSettings): string {
 function Status({ view }: { view: View }) {
   const qc = useQueryClient();
   const refresh = () => qc.invalidateQueries({ queryKey: ADMIN_DREAMING_KEY });
-  // Partial bodies; resolves with whether the refetch worked (sync.ts) — a form drops its draft only then.
+  // Partial bodies; the answer (the row with its revisions) goes into the view unless newer is there (rev.ts).
   const setYouth = useMutation({
-    mutationFn: (a: { id: string; body: SaveYouthDreamingRequest }) =>
-      saveAndSync(qc, ADMIN_DREAMING_KEY, () => adminDreaming.setUser(a.id, a.body)),
+    mutationFn: (a: { id: string; body: SaveYouthDreamingRequest }) => adminDreaming.setUser(a.id, a.body),
+    onSuccess: (row) => applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => withUser(old, row)),
   });
   const runNow = useMutation({ mutationFn: (id: string) => adminDreaming.runNow(id), onSuccess: refresh });
   const choices = youthChoices(view);
@@ -252,9 +244,7 @@ function Status({ view }: { view: View }) {
                     choices={choices}
                     disabled={false}
                     pending={setYouth.isPending}
-                    onSave={(settings) =>
-                      setYouth.mutateAsync({ id: u.userId, body: settings }).then((r) => r.synced)
-                    }
+                    onSave={(settings) => setYouth.mutateAsync({ id: u.userId, body: settings })}
                   />
                 ) : (
                   <>
@@ -307,11 +297,6 @@ function Status({ view }: { view: View }) {
           ))}
         </tbody>
       </table>
-      {setYouth.isSuccess && behind(ADMIN_DREAMING_KEY, setYouth.data.savedAt) && (
-        <p className="small" role="status" data-testid="dreaming-youth-stale">
-          {SAVED_STALE}
-        </p>
-      )}
       {(setYouth.isError || runNow.isError) && (
         <p className="error small" role="alert">
           {errorText(setYouth.error ?? runNow.error)}
@@ -332,33 +317,26 @@ function YouthExtras({
 }: {
   user: DreamingUserStatus;
   pending: boolean;
-  /** Resolves whether saved and refetched (false: saved, screen stale); rejects on a refusal (shown under the table). */
-  save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => Promise<SaveStamps>;
+  /** Resolves once saved (the answer is in the view); rejects on a refusal (shown under the table). */
+  save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => Promise<unknown>;
 }) {
   const [prompt, setPrompt] = useState("");
-  // 반영 방식 is an instant-save control (sync.ts `useInstant`, review #195 7): a refused save goes back to the last
-  // value known to be stored, not to a stale cache.
-  const qc = useQueryClient();
-  const mode = useInstant<MemoryApplyMode>(
-    user.applyMode ?? "review",
-    ADMIN_DREAMING_KEY,
-    qc.getQueryState(ADMIN_DREAMING_KEY)?.dataUpdatedAt ?? 0,
-  );
+  // 반영 방식: the choice shows while it is being saved, then the view (the newest revision seen) again.
+  const [picked, setPicked] = useState<MemoryApplyMode>();
   return (
     <div className="dream-youth-extras">
       <label className="inline">
         반영 방식
         <select
           aria-label={`${user.name} 반영 방식`}
-          value={mode.shown}
+          value={picked ?? user.applyMode ?? "review"}
           disabled={pending}
           onChange={(e) => {
-            const picked = e.target.value as MemoryApplyMode;
-            mode.pick(picked);
-            void save({ applyMode: picked }).then(
-              (r) => mode.saved(picked, r),
-              () => mode.failed(),
-            );
+            const m = e.target.value as MemoryApplyMode;
+            setPicked(m);
+            void save({ applyMode: m })
+              .catch(() => {})
+              .finally(() => setPicked(undefined));
           }}
         >
           {MemoryApplyMode.options.map((m) => (
@@ -368,11 +346,6 @@ function YouthExtras({
           ))}
         </select>
       </label>
-      {mode.stale && (
-        <p className="small" role="status" data-testid="dreaming-youth-mode-stale">
-          {SAVED_STALE}
-        </p>
-      )}
       <p className="muted small">
         정리 프롬프트: {user.customPrompt ? "관리자가 새로 씀" : "기본값"} (지금 내용은 여기서 보이지 않아요)
       </p>
@@ -394,10 +367,7 @@ function YouthExtras({
             // so does anything typed after it was sent (round 3 — the box is locked while saving, too).
             const sent = prompt;
             void save({ prompt: sent }).then(
-              (r) => {
-                // Only once the refetch shows "관리자가 새로 씀"; otherwise the text stays (and the screen says so).
-                if (r.synced) setPrompt((cur) => afterSave(cur, sent, ""));
-              },
+              () => setPrompt((cur) => afterSave(cur, sent, "")),
               () => {},
             );
           }}

@@ -375,7 +375,8 @@ test("다른 곳에서 바꾼 값은 지키고, 새로 불러오기에 실패해
   await page.unroute("**/api/dreaming");
 });
 
-const STALE = "저장했지만 최신 상태를 불러오지 못했어요";
+/** No "saved but stale" state any more (review 9): a save's answer carries the stored data and its revision. */
+const NOT_STALE = /최신 상태를 불러오지 못했어요/;
 
 /** Makes GETs of `url` fail (503) — the save went through, the refetch after it does not. */
 async function failReads(page: Page, url: string) {
@@ -386,7 +387,7 @@ async function failReads(page: Page, url: string) {
   );
 }
 
-test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그대로 두고 알린다 (리뷰 #195 6차)", async ({
+test("저장은 됐지만 다시 불러오기에 실패해도 저장한 값이 보인다 (리뷰 #195 6·9차)", async ({
   page,
   browser,
   baseURL,
@@ -404,18 +405,18 @@ test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그�
   await failReads(page, "**/api/memory-prefs");
   await settings.getByLabel("실행 시각").fill("11:10");
   await settings.getByRole("button", { name: "저장", exact: true }).click();
-  await expect(settings.getByRole("status")).toContainText(STALE);
+  await expect(settings.getByRole("status")).toContainText("저장했어요.");
   await expect(settings.getByLabel("실행 시각")).toHaveValue("11:10");
   expect((await api<{ settings: { time: string } }>("/api/dreaming")).settings.time).toBe("11:10");
   await panel.getByText(/지금 쓰는 정리 프롬프트/).click();
   const prompt = panel.getByTestId("dreaming-prompt");
   await prompt.fill("프롬프트 B");
   await panel.getByRole("button", { name: "프롬프트 저장" }).click();
-  await expect(panel.getByRole("status").filter({ hasText: STALE }).last()).toBeVisible();
+  await expect(panel.getByText(NOT_STALE)).toHaveCount(0);
+  await expect(panel.getByText(/지금 쓰는 정리 프롬프트 \(내가 고친 것\)/)).toBeVisible();
   await expect(prompt).toHaveValue("프롬프트 B");
   expect((await api<{ prompt: { content: string } }>("/api/dreaming")).prompt.content).toBe("프롬프트 B");
   await page.getByRole("radio", { name: /자동 반영/ }).check();
-  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
   await expect(page.getByRole("radio", { name: /자동 반영/ })).toBeChecked();
   expect((await api<{ applyMode: string }>("/api/memory-prefs")).applyMode).toBe("auto");
   await page.unrouteAll({ behavior: "ignoreErrors" });
@@ -439,11 +440,10 @@ test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그�
   await page.unrouteAll({ behavior: "ignoreErrors" });
   await failReads(page, "**/api/notifications/prefs");
   await failed.uncheck();
-  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
   await expect(failed).not.toBeChecked();
   await page.getByLabel("방해 금지 시작").fill("21:00");
   await page.getByRole("button", { name: "저장", exact: true }).click();
-  await expect(page.getByText(STALE).first()).toBeVisible();
+  await expect(page.getByText("저장했어요.")).toBeVisible();
   await expect(page.getByLabel("방해 금지 시작")).toHaveValue("21:00");
   expect(await api<{ quietStart: string; memoryFailed: boolean }>("/api/notifications/prefs")).toMatchObject({
     quietStart: "21:00",
@@ -461,8 +461,8 @@ test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그�
     await expect(mode).toHaveValue("review");
     await failReads(admin, "**/api/admin/dreaming");
     await mode.selectOption("auto");
-    await expect(admin.getByTestId("dreaming-youth-stale")).toContainText(STALE);
     await expect(mode).toHaveValue("auto");
+    await expect(admin.getByText(NOT_STALE)).toHaveCount(0);
     const cap = admin.getByTestId("dreaming-config").getByLabel("1회 토큰 상한");
     const before = await cap.inputValue();
     await cap.fill("302000");
@@ -471,7 +471,7 @@ test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그�
       .getByRole("button", { name: "저장", exact: true })
       .first()
       .click();
-    await expect(admin.getByRole("status").filter({ hasText: STALE }).first()).toBeVisible();
+    await expect(admin.getByRole("status").filter({ hasText: "저장했어요." }).first()).toBeVisible();
     await expect(cap).toHaveValue("302000");
     await admin.unrouteAll({ behavior: "ignoreErrors" });
     // Back as it was (other tests share the server).
@@ -513,12 +513,11 @@ test("저장 성공 + 불러오기 실패 뒤 다음 저장이 실패해도 저�
   await expect(review).toBeChecked();
   const modePuts = await failing(page, "**/api/memory-prefs");
   await auto.check();
-  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
+  await expect(auto).toBeChecked();
   modePuts.on = true;
   await review.check();
   await expect(page.getByTestId("memory-mode").getByRole("alert")).toBeVisible();
   await expect(auto).toBeChecked();
-  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
   expect((await api<{ applyMode: string }>("/api/memory-prefs")).applyMode).toBe("auto");
   await page.unrouteAll({ behavior: "ignoreErrors" });
 
@@ -528,11 +527,11 @@ test("저장 성공 + 불러오기 실패 뒤 다음 저장이 실패해도 저�
   await expect(failed).toBeChecked();
   const prefPuts = await failing(page, "**/api/notifications/prefs");
   await failed.uncheck();
-  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
+  await expect(failed).not.toBeChecked();
   prefPuts.on = true;
   await failed.check();
   await expect(failed).not.toBeChecked();
-  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
+  await expect(page.getByTestId("memory-notifications").getByRole("alert")).toBeVisible();
   expect((await api<{ memoryFailed: boolean }>("/api/notifications/prefs")).memoryFailed).toBe(false);
   await page.unrouteAll({ behavior: "ignoreErrors" });
 });

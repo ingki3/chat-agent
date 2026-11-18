@@ -1014,12 +1014,84 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect(s.d.store.config().tokenCap).toBe(270_000);
   });
 
+  it("revisions (review 9): +1 on every write path, per resource; every response carries the current one", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    const rev = async (who: Who = "owner") =>
+      MyDreaming.parse((await s.req(who, "GET", "/api/dreaming")).json()).rev;
+    const r0 = await rev();
+    // Settings, the prompt, its reset: each a new revision, returned by the PUT itself.
+    const a = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/settings", { time: "04:20" })).json(),
+    );
+    expect(a.rev).toBeGreaterThan(r0);
+    const b = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/prompt", { content: "취미만" })).json(),
+    );
+    expect(b.rev).toBeGreaterThan(a.rev);
+    const c = MyDreaming.parse(
+      (await s.req("owner", "PUT", "/api/dreaming/prompt", { content: null })).json(),
+    );
+    expect(c.rev).toBeGreaterThan(b.rev);
+    expect(await rev()).toBe(c.rev);
+    // Per resource: another user's save moves only theirs.
+    const other = await rev("shared");
+    await s.req("shared", "PUT", "/api/dreaming/settings", { time: "05:00" });
+    expect(await rev()).toBe(c.rev);
+    expect(await rev("shared")).toBeGreaterThan(other);
+    // 반영 방식 (its own resource).
+    const m0 = (await s.req("owner", "GET", "/api/memory-prefs")).json<{ rev: number }>().rev;
+    const m1 = (await s.req("owner", "PUT", "/api/memory-prefs", { applyMode: "auto" })).json<{
+      rev: number;
+    }>().rev;
+    expect(m1).toBe(m0 + 1);
+    expect((await s.req("owner", "GET", "/api/memory-prefs")).json<{ rev: number }>().rev).toBe(m1);
+    // The admin's config, and a youth account's settings / 반영 방식 / prompt.
+    const v0 = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json()).configRev;
+    const v1 = DreamingAdmin.parse(
+      (await s.req("admin", "PUT", "/api/admin/dreaming", { tokenCap: 280_000 })).json(),
+    );
+    expect(v1.configRev).toBe(v0 + 1);
+    s.app.users!.setYouth(owner, true);
+    type Row = { rev: number; applyModeRev: number };
+    const y0 = DreamingAdmin.parse((await s.req("admin", "GET", "/api/admin/dreaming")).json()).users.find(
+      (u) => u.userId === owner,
+    )!;
+    const y1 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { time: "06:00" })
+    ).json<Row>();
+    expect(y1.rev).toBeGreaterThan(y0.rev);
+    const y2 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { applyMode: "review" })
+    ).json<Row>();
+    expect(y2.applyModeRev).toBeGreaterThan(y1.applyModeRev);
+    const y3 = (
+      await s.req("admin", "PUT", `/api/admin/dreaming/users/${owner}`, { prompt: "학교만" })
+    ).json<Row>();
+    expect(y3.rev).toBeGreaterThan(y2.rev);
+    // Notification preferences.
+    const n0 = (await s.req("owner", "GET", "/api/notifications/prefs")).json<{ rev: number }>().rev;
+    const n1 = (await s.req("owner", "PUT", "/api/notifications/prefs", { memoryFailed: false })).json<{
+      rev: number;
+    }>().rev;
+    expect(n1).toBe(n0 + 1);
+    const n2 = (
+      await s.req("owner", "PUT", "/api/notifications/prefs", {
+        quietStart: null,
+        quietEnd: null,
+        timeZone: "Asia/Seoul",
+      })
+    ).json<{ rev: number }>().rev;
+    expect(n2).toBe(n1 + 1);
+  });
+
   it("youth (review 1): 반영 방식 locked too; the admin sets its 반영 방식 and prompt (write-only)", async () => {
     const s = await start();
     const son = s.uid("owner");
     s.app.users!.setYouth(son, true);
     expect((await s.req("owner", "GET", "/api/memory-prefs")).json()).toEqual({
       applyMode: "review",
+      rev: 0,
       locked: true,
     });
     const put = await s.req("owner", "PUT", "/api/memory-prefs", { applyMode: "auto" });
@@ -1027,7 +1099,10 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     expect(put.json()).toEqual({ error: "dreaming_youth_locked" });
     expect(s.app.memoryProposals!.mode(son)).toBe("review");
     // Members are not locked.
-    expect((await s.req("shared", "GET", "/api/memory-prefs")).json()).toEqual({ applyMode: "review" });
+    expect((await s.req("shared", "GET", "/api/memory-prefs")).json()).toEqual({
+      applyMode: "review",
+      rev: 0,
+    });
     // The admin: 반영 방식 and a prompt for the youth account — the response never carries the prompt's text.
     const body = {
       ...s.d.store.settingsOf(son),

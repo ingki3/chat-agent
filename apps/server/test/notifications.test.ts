@@ -734,6 +734,7 @@ describe("quiet hours (FR-13.4)", () => {
       memoryProposals: true,
       memoryApplied: true,
       memoryFailed: true,
+      rev: 1,
     });
     expect((await api(mom, "GET", "/api/notifications/prefs")).json()).toEqual(ok.json());
   });

@@ -112,7 +112,7 @@ async function start() {
   const items = async (kind: "user" | "memory", who: Who = "owner") =>
     ((await docs(who)).find((d) => d.kind === kind)!.items ?? []).map((i) => i.text);
   const setMode = async (mode: "review" | "auto", who: Who = "owner") =>
-    expect((await req(who, "PUT", "/api/memory-prefs", { applyMode: mode })).json()).toEqual({
+    expect((await req(who, "PUT", "/api/memory-prefs", { applyMode: mode })).json()).toMatchObject({
       applyMode: mode,
     });
   return { app, db, f, req, say, card, docs, items, setMode, claude, codex, newConversation, waitRun };
@@ -121,7 +121,10 @@ async function start() {
 describe("검토 후 반영 (default): the card under the reply", () => {
   it("기억해줘 → card → 반영 → the next conversation has it, on either runtime", async () => {
     const t = await start();
-    expect((await t.req("owner", "GET", "/api/memory-prefs")).json()).toEqual({ applyMode: "review" });
+    expect((await t.req("owner", "GET", "/api/memory-prefs")).json()).toEqual({
+      applyMode: "review",
+      rev: 0,
+    });
     const r = await t.say("기억해줘: 아침에는 블랙커피를 마신다");
     expect(r.output).toMatchObject({ status: "pending", applied: 0, pending: 1 });
     const id = r.output!.proposalId!;

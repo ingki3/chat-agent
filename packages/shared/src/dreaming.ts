@@ -220,6 +220,8 @@ export type DreamingConnectionChoice = z.infer<typeof DreamingConnectionChoice>;
 
 /** `GET /api/dreaming`: the caller's own 기억 정리 — settings, whether it runs, the prompt, DREAMS.md, the bundles. */
 export const MyDreaming = z.object({
+  /** The revision of the user's settings and prompt (+1 on every write, #188 review 9) — the newest seen wins. */
+  rev: z.number().int().nonnegative(),
   /** It runs for this user (the server-wide switch, their own switch, an active account, a usable choice). */
   enabled: z.boolean(),
   /** The user's start time (HH:MM, Asia/Seoul) when it runs. */
@@ -241,6 +243,9 @@ export type MyDreaming = z.infer<typeof MyDreaming>;
 /** The admin's per-user status: settings, ran / skipped / failed and counts — no content (FR-16.8, FR-1.5). */
 export const DreamingUserStatus = z.object({
   userId: z.string(),
+  /** Revisions (#188 review 9): of the settings and prompt, and of the 반영 방식. */
+  rev: z.number().int().nonnegative(),
+  applyModeRev: z.number().int().nonnegative(),
   name: z.string(),
   active: z.boolean(),
   /** A youth account: its settings are the admin's to change (here). */
@@ -281,6 +286,8 @@ export type DreamingCandidate = z.infer<typeof DreamingCandidate>;
 /** `GET /api/admin/dreaming`. */
 export const DreamingAdmin = z.object({
   config: DreamingConfig,
+  /** The revision of `config` (+1 on every save, #188 review 9). */
+  configRev: z.number().int().nonnegative(),
   /** Allowed pairs whose connection was deleted or disconnected (users who chose them are paused). */
   unavailable: z.array(DreamingChoice),
   candidates: z.array(DreamingCandidate),

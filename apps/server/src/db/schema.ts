@@ -400,6 +400,8 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   memoryApplied: integer("memory_applied", { mode: "boolean" }).notNull().default(true),
   /** 기억 정리 실패 (#188): the user's own round failed at its last attempt. */
   memoryFailed: integer("memory_failed", { mode: "boolean" }).notNull().default(true),
+  /** Revision (#188 review 9): +1 on every write; every response carries it. */
+  rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -1363,6 +1365,8 @@ export const memoryPrefs = sqliteTable("memory_prefs", {
   applyMode: text("apply_mode", { enum: ["review", "auto"] })
     .notNull()
     .default("review"),
+  /** Revision (#188 review 9): +1 on every write; every response carries it. */
+  rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -1498,6 +1502,11 @@ export const dreamingUsers = sqliteTable("dreaming_users", {
   /** The user's own editable part of the prompt (null: the default — the last admin version, or the built-in one). */
   prompt: text("prompt"),
   promptUpdatedAt: integer("prompt_updated_at"),
+  /**
+   * The settings' revision (#188 review 9): +1 on every write of the switch, time, connection·model or prompt, in the
+   * same statement. Every response carries it, so a page keeps the newest it has seen (no client clocks).
+   */
+  rev: integer("rev").notNull().default(0),
   checkpoint: integer("checkpoint").notNull().default(0),
   /** When the checkpoint last moved (null: never — a first run counts like a resume). */
   checkpointAt: integer("checkpoint_at"),

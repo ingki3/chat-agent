@@ -50,6 +50,8 @@ export type UserState = {
   model: string | null;
   prompt: string | null;
   prompt_updated_at: number | null;
+  /** The settings' revision (+1 on every settings write). */
+  rev: number;
   checkpoint: number;
   checkpoint_at: number | null;
   paused_at: number | null;
@@ -119,9 +121,21 @@ export class DreamingStore {
     }
   }
 
+  /** The admin settings' revision (#188 review 9): +1 on every save, kept in the same setting. */
+  configRev(): number {
+    try {
+      const rev = (JSON.parse(this.settings.get(CONFIG_KEY) ?? "{}") as { rev?: unknown }).rev;
+      return typeof rev === "number" && Number.isInteger(rev) ? rev : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   setConfig(c: DreamingConfig): void {
     const before = this.config();
-    this.settings.set(CONFIG_KEY, JSON.stringify(c));
+    this.sql.transaction(() => {
+      this.settings.set(CONFIG_KEY, JSON.stringify({ ...c, rev: this.configRev() + 1 }));
+    })();
     // Turned off: every user's rounds pause (spec §6 — when they resume, a backlog older than 7 days is passed over).
     if (before.enabled && !c.enabled)
       this.sql
@@ -172,7 +186,7 @@ export class DreamingStore {
     const v = content === null || content.trim() === this.prompt().content.trim() ? null : content.trim();
     this.sql
       .prepare(
-        "update dreaming_users set prompt = ?, prompt_updated_at = ?, updated_at = ? where user_id = ?",
+        "update dreaming_users set prompt = ?, prompt_updated_at = ?, updated_at = ?, rev = rev + 1 where user_id = ?",
       )
       .run(v === null ? null : scrubKnown(v), v === null ? null : this.now(), this.now(), userId);
   }
@@ -192,6 +206,7 @@ export class DreamingStore {
         model: null,
         prompt: null,
         prompt_updated_at: null,
+        rev: 0,
         checkpoint: 0,
         checkpoint_at: null,
         paused_at: null,
@@ -239,7 +254,7 @@ export class DreamingStore {
       this.setEnabled(userId, s.enabled);
       this.sql
         .prepare(
-          "update dreaming_users set time = ?, runtime = ?, connection_id = ?, model = ?, updated_at = ? where user_id = ?",
+          "update dreaming_users set time = ?, runtime = ?, connection_id = ?, model = ?, updated_at = ?, rev = rev + 1 where user_id = ?",
         )
         .run(s.time, s.runtime, s.connectionId, s.model, this.now(), userId);
     })();
@@ -249,7 +264,7 @@ export class DreamingStore {
     this.ensureState(userId);
     this.sql
       .prepare(
-        `update dreaming_users set enabled = ?, updated_at = ?,
+        `update dreaming_users set enabled = ?, updated_at = ?, rev = rev + 1,
            paused_at = case when ? = 0 and paused_at is null then ? else paused_at end where user_id = ?`,
       )
       .run(enabled ? 1 : 0, this.now(), enabled ? 1 : 0, this.now(), userId);

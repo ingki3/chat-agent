@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "200b9cbe-10fe-430e-b904-a13131db1e04",
+  "id": "2d008645-bb60-487b-8292-a08d2fd81f5a",
   "prevId": "dfb80d1b-1d93-4fd4-883f-3baf887db7c1",
   "tables": {
     "access_syncs": {
@@ -1551,6 +1551,14 @@
           "notNull": false,
           "autoincrement": false
         },
+        "rev": {
+          "name": "rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "checkpoint": {
           "name": "checkpoint",
           "type": "integer",
@@ -2524,6 +2532,14 @@
           "autoincrement": false,
           "default": "'review'"
         },
+        "rev": {
+          "name": "rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
         "updated_at": {
           "name": "updated_at",
           "type": "integer",
@@ -3122,6 +3138,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": true
+        },
+        "rev": {
+          "name": "rev",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         },
         "updated_at": {
           "name": "updated_at",

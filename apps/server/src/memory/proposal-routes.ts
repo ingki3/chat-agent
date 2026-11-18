@@ -26,6 +26,7 @@ export function registerMemoryProposalRoutes(app: FastifyInstance, proposals: Me
   // A youth account's 반영 방식 is the admin's to set (#188, with its 기억 정리 settings): read-only here.
   const prefs = (u: { id: string; youth: boolean }): MemoryPrefs => ({
     applyMode: proposals.mode(u.id),
+    rev: proposals.modeRev(u.id),
     ...(u.youth ? { locked: true as const } : {}),
   });
   app.get("/api/memory-prefs", { config: OWN }, async (req, reply) => send(reply, prefs(req.ctx.user!)));

@@ -61,6 +61,8 @@ export const NotificationPrefs = z
     memoryProposals: z.boolean().optional(),
     memoryApplied: z.boolean().optional(),
     memoryFailed: z.boolean().optional(),
+    /** The settings' revision (+1 on every write, #188 review 9) — in responses; ignored when saving. */
+    rev: z.number().int().nonnegative().optional(),
   })
   .refine((p) => (p.quietStart === null) === (p.quietEnd === null), { message: "set both or neither" })
   .refine((p) => p.quietStart === null || p.quietStart !== p.quietEnd, { message: "start and end differ" });
@@ -78,6 +80,8 @@ export const SaveNotificationPrefsRequest = z
     memoryProposals: z.boolean(),
     memoryApplied: z.boolean(),
     memoryFailed: z.boolean(),
+    /** A page may send back the revision it read; it is ignored (the server counts). */
+    rev: z.number().int().nonnegative(),
   })
   .partial()
   .strict()

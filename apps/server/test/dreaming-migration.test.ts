@@ -171,6 +171,8 @@ describe("migration 0033 (기억 정리 per user)", () => {
       { user_id: "u2", enabled: 0, ...row, checkpoint: 0, paused_at: 50 },
       { user_id: "u3", enabled: 1, ...row, checkpoint: 0, paused_at: null },
     ]);
+    // Revisions start at 0 (review 9); every later write raises them.
+    expect(sql.prepare("select distinct rev from dreaming_users").all()).toEqual([{ rev: 0 }]);
     const cfg = sql.prepare("select value from settings where key = 'dreaming.config'").get() as {
       value: string;
     };

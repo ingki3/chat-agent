@@ -132,6 +132,7 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     const settings = store.settingsOf(user.id);
     const on = store.switchedOn(user.id) && runner.problemOf(user.id) === null;
     return {
+      rev: store.state(user.id).rev,
       enabled: on,
       time: on ? engine.status(user.id).time : null,
       settings,
@@ -212,6 +213,8 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     const settings = store.settingsOf(u.id);
     return {
       userId: u.id,
+      rev: store.state(u.id).rev,
+      applyModeRev: proposals.modeRev(u.id),
       name: scrubKnown(u.name),
       active: u.active,
       youth: u.youth,
@@ -238,6 +241,7 @@ export function registerDreamingRoutes(app: FastifyInstance, deps: DreamingRoute
     const config = store.config();
     return {
       config,
+      configRev: store.configRev(),
       unavailable: config.allowed.filter((a) => runner.choiceProblem(a) !== null),
       candidates: candidates(),
       users: users.list().map(statusOf),

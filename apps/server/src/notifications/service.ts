@@ -413,6 +413,7 @@ export class NotificationService {
           memoryProposals: row.memoryProposals,
           memoryApplied: row.memoryApplied,
           memoryFailed: row.memoryFailed,
+          rev: row.rev,
         }
       : {
           quietStart: null,
@@ -421,6 +422,7 @@ export class NotificationService {
           memoryProposals: true,
           memoryApplied: true,
           memoryFailed: true,
+          rev: 0,
         };
   }
 
@@ -444,10 +446,14 @@ export class NotificationService {
       memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
       updatedAt: this.now(),
     };
+    // The revision goes up with every write, in the same statement (#188 review 9).
     this.db
       .insert(notificationPrefs)
-      .values({ userId, ...value })
-      .onConflictDoUpdate({ target: notificationPrefs.userId, set: value })
+      .values({ userId, ...value, rev: 1 })
+      .onConflictDoUpdate({
+        target: notificationPrefs.userId,
+        set: { ...value, rev: sql`${notificationPrefs.rev} + 1` },
+      })
       .run();
     // Quiet hours may just have been switched off or moved: send what is no longer held.
     this.track(this.deliver(userId));
