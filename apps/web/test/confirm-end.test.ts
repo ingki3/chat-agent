@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import type { Run } from "@agentlee/shared";
 import { confirmRunEnded } from "../src/chat/confirm-end.js";
-import { rereadQuery } from "../src/chat/reread.js";
+import { readMessagesAfterEnd, rereadQuery } from "../src/chat/reread.js";
 
 const run = (id: string, endedAt: number | null = null): Run => ({
   id,
@@ -169,6 +169,107 @@ describe("rereadQuery (#103)", () => {
     answerFirst("streaming");
     await p;
     await joined;
+    expect(qc.getQueryData(["messages", "c1"])).toBe("complete");
+    unsubscribe();
+  });
+});
+
+/** A messages query on screen whose reads after the first are held until answered (or failed) one by one. */
+function heldMessages(qc: QueryClient) {
+  const pending: { answer: (v: string) => void; fail: (e: Error) => void }[] = [];
+  let reads = 0;
+  const unsubscribe = new QueryObserver(qc, {
+    queryKey: ["messages", "c1"],
+    queryFn: () => {
+      if (reads++ === 0) return Promise.resolve("streaming");
+      return new Promise<string>((answer, fail) => pending.push({ answer, fail }));
+    },
+  }).subscribe(() => {});
+  return { reads: () => reads, pending, unsubscribe };
+}
+
+describe("the read after the end, shared by the refresh and the check while finishing (#103 review)", () => {
+  it("the check joins the refresh's read (never cancels it) and applies nothing before it succeeded", async () => {
+    const { qc, around, arounds } = setup();
+    const m = heldMessages(qc);
+    await flush();
+    let refreshed = false;
+    // The refresh after `done`: messages, then (only then) the run's state.
+    const refresh = readMessagesAfterEnd(qc, "c1", "r1").then(() => (refreshed = true));
+    await flush();
+    expect(m.reads()).toBe(2);
+    const check = confirmRunEnded({
+      qc,
+      conversationId: "c1",
+      runId: "r1",
+      signal: new AbortController().signal,
+      read: async () => null,
+      around,
+    });
+    await flush();
+    await flush();
+    // One read in flight for both; the live reply is still held (the run is still in the cache).
+    expect(m.reads()).toBe(2);
+    expect(m.pending).toHaveLength(1);
+    expect(refreshed).toBe(false);
+    expect(qc.getQueryData<Run>(["active-run", "c1"])?.id).toBe("r1");
+    m.pending[0]!.answer("complete");
+    expect(await check).toBe(true);
+    await refresh;
+    expect(qc.getQueryData(["messages", "c1"])).toBe("complete");
+    expect(qc.getQueryData(["active-run", "c1"])).toBeNull();
+    expect(arounds()).toBe(1);
+    m.unsubscribe();
+  });
+
+  it("a failed read keeps the live reply for both; the next try reads again and then lets it go", async () => {
+    const { qc, around } = setup();
+    const m = heldMessages(qc);
+    await flush();
+    const refresh = readMessagesAfterEnd(qc, "c1", "r1");
+    const check = () =>
+      confirmRunEnded({
+        qc,
+        conversationId: "c1",
+        runId: "r1",
+        signal: new AbortController().signal,
+        read: async () => null,
+        around,
+      });
+    const first = check();
+    await flush();
+    await flush();
+    m.pending[0]!.fail(new Error("offline"));
+    await expect(refresh).rejects.toThrow();
+    await expect(first).rejects.toThrow();
+    expect(qc.getQueryData<Run>(["active-run", "c1"])?.id).toBe("r1");
+    expect(qc.getQueryData(["messages", "c1"])).toBe("streaming");
+    // The next tick: a new read, answered — applied.
+    const second = check();
+    await flush();
+    await flush();
+    expect(m.reads()).toBe(3);
+    m.pending[1]!.answer("complete");
+    expect(await second).toBe(true);
+    expect(qc.getQueryData(["active-run", "c1"])).toBeNull();
+    m.unsubscribe();
+  });
+
+  it("a first read sent before the end and still on its way is never what it waits for", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let answerFirst!: (v: string) => void;
+    let reads = 0;
+    const unsubscribe = new QueryObserver(qc, {
+      queryKey: ["messages", "c1"],
+      queryFn: () =>
+        reads++ === 0 ? new Promise<string>((r) => (answerFirst = r)) : Promise.resolve("complete"),
+    }).subscribe(() => {});
+    await flush();
+    const p = readMessagesAfterEnd(qc, "c1", "r1");
+    await flush();
+    answerFirst("streaming");
+    await p;
+    expect(reads).toBe(2);
     expect(qc.getQueryData(["messages", "c1"])).toBe("complete");
     unsubscribe();
   });

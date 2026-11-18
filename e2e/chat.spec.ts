@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { SON, newConversation, useAccount } from "./helpers.js";
+import { SON, csrf, newConversation, useAccount } from "./helpers.js";
 
 /** Chat screen (#14) against FakeRuntime: see apps/server/src/runtime/fake.ts for the `/…` commands. */
 
@@ -349,15 +349,30 @@ test("after giving up, the reply is shown once the run has ended — without 다
   await expect(reply(page).getByText("연결이 끊겨", { exact: false })).toHaveCount(0);
 });
 
+/** The latest reply's status in a messages response. */
+const replyStatus = (body: unknown) =>
+  (body as { items: { role: string; status: string }[] }).items.findLast((m) => m.role === "assistant")
+    ?.status;
+const UNFINISHED = ["pending", "streaming"];
+/** The page's `active-run` answer that says no run is in progress. */
+const noRunAnswer = (page: Page) =>
+  page.waitForResponse(
+    async (r) =>
+      r.url().endsWith("/active-run") && r.ok() && ((await r.json()) as { run: unknown }).run === null,
+    {
+      timeout: 20_000,
+    },
+  );
+
 test("a reply that ends while the new conversation's first messages read is on its way ends complete (#103)", async ({
   page,
 }) => {
-  // A new conversation opens as its run goes on; its first messages read (sent while the reply streams) is held
-  // until the screen reads the messages again after the run's `done`. That read must be a new one — not the held
-  // one joined (the reply then stayed "streaming" for good: the citations e2e flake on a loaded CI runner).
+  // A new conversation opens as its run goes on; its first messages read is answered while the reply streams and
+  // held until the screen reads the messages again after the run's `done`. That read must be a new one — not the
+  // held one joined (the reply then stayed "streaming" for good: the citations e2e flake on a loaded CI runner).
   await useAccount(page, SON);
   let held: (() => void) | undefined;
-  let heldStatus: string | undefined;
+  let first: string | undefined;
   let reads = 0;
   await page.route("**/api/conversations/*/messages*", async (route) => {
     if (route.request().method() !== "GET") return route.continue();
@@ -365,24 +380,78 @@ test("a reply that ends while the new conversation's first messages read is on i
       held?.();
       return route.continue();
     }
+    // The snapshot is taken (the reply unfinished, checked below) before anything lets the run end on screen.
     const res = await route.fetch();
-    const body = (await res.json()) as { items: { role: string; status: string }[] };
-    heldStatus = body.items.findLast((m) => m.role === "assistant")?.status;
+    const body: unknown = await res.json();
+    first = replyStatus(body);
     // Released by the next read; without one (the bug), let go late so the stale answer shows.
     await new Promise<void>((r) => {
       held = r;
-      setTimeout(r, 8000);
+      setTimeout(r, 10_000);
     });
     await route.fulfill({ response: res, json: body });
   });
+  const ended = noRunAnswer(page);
   await page.goto("/");
-  await send(page, "/tool 1");
+  await send(page, "/tool 3");
   await page.waitForURL(/\/c\/[^/]+$/);
-  await expect(reply(page)).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
-  await expect(reply(page)).toContainText("끝났어요");
-  // The held read really was from while the reply streamed (the case is real), and it was read again.
-  expect(heldStatus).not.toBe("complete");
+  await ended;
+  expect(UNFINISHED).toContain(first);
   expect(reads).toBeGreaterThan(1);
+  // After the screen read that no run is in progress: the saved reply, complete.
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  await expect(reply(page)).toContainText("끝났어요");
+});
+
+test("opening a conversation as its run ends: messages read before the end, the run after it — ends complete (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  // Not opened yet: the page loads only once the routes below are in place.
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `끝나는 순간 열기 ${Date.now()}`);
+  const started = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: "/tool 3" },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+  });
+  expect(started.ok()).toBe(true);
+  const runId = ((await started.json()) as { run: { id: string } }).run.id;
+  const runEnded = async () => {
+    await expect
+      .poll(
+        async () =>
+          ((await (await page.request.get(`/api/runs/${runId}`)).json()) as { endedAt: number | null })
+            .endedAt,
+        {
+          timeout: 15_000,
+        },
+      )
+      .not.toBeNull();
+  };
+  // The page's first messages read is answered before the end (the reply unfinished), its active-run read after it:
+  // no stream is followed, so nothing else would read the messages again.
+  let first: string | undefined;
+  let messageReads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET" || ++messageReads > 1) return route.continue();
+    const res = await route.fetch();
+    const body: unknown = await res.json();
+    first = replyStatus(body);
+    await runEnded();
+    await route.fulfill({ response: res, json: body });
+  });
+  let activeReads = 0;
+  await page.route("**/api/conversations/*/active-run", async (route) => {
+    if (++activeReads === 1) await runEnded();
+    await route.continue();
+  });
+  const ended = noRunAnswer(page);
+  await page.goto(`/c/${c.id}`);
+  await ended;
+  expect(UNFINISHED).toContain(first);
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  await expect(reply(page)).toContainText("끝났어요");
+  expect(messageReads).toBeGreaterThan(1);
 });
 
 test.describe("markdown chunk", () => {

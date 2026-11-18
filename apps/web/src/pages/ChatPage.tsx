@@ -36,7 +36,7 @@ import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachmen
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { confirmRunEnded } from "../chat/confirm-end.js";
-import { rereadQuery } from "../chat/reread.js";
+import { readMessagesAfterEnd, rereadQuery } from "../chat/reread.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -141,10 +141,13 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
-  const refresh = async () => {
+  /** After a run's end (`runId`), or any time: messages first, then the run's state and what it may have changed. */
+  const refresh = async (runId?: string) => {
     // Messages first: the saved reply must be there before the live one is let go (no flash of stale text) — read
-    // from now on, never a first read still on its way from while the reply streamed (#103).
-    await rereadQuery(qc, ["messages", id]);
+    // from now on, never a first read still on its way from while the reply streamed (#103). After an end, the one
+    // read shared with the check while finishing; until it has succeeded the live reply stays (that check retries).
+    if (runId) await readMessagesAfterEnd(qc, id, runId);
+    else await rereadQuery(qc, ["messages", id]);
     await Promise.all([qc.invalidateQueries({ queryKey: ["active-run", id] }), refreshAround()]);
   };
   const { live, reconnect } = useRunStream(
@@ -155,10 +158,28 @@ export function ChatPage() {
           ...a,
           [last.messageId]: { notices: last.notices, ...(last.error ? { error: last.error } : {}) },
         }));
-      void refresh();
+      // A failed read keeps the live reply: with its `done` the check while finishing reads again; a stream that ended
+      // without one (the run gone, its events expired) has no such check — that reply is read as before.
+      void refresh(last.runId).catch(() => (last.status === undefined ? refresh() : undefined));
     },
     () => void refresh(),
   );
+  // No run in progress, yet the latest reply reads as unfinished (#103 review): opened as its run ended, the messages
+  // were read before the end and the run after it — no stream follows, so nothing would read them again. Read once
+  // more, from now on — once per such answer about the run and reply (an unfinished reply the server keeps never
+  // loops).
+  const lastAssistant = list?.findLast((m) => m.role === "assistant");
+  const noRun = active.isSuccess && !active.isFetching && (!active.data || active.data.endedAt !== null);
+  const unfinished =
+    noRun && (lastAssistant?.status === "pending" || lastAssistant?.status === "streaming")
+      ? `${lastAssistant.id}@${active.dataUpdatedAt}`
+      : null;
+  const readUnfinished = useRef<string | null>(null);
+  useEffect(() => {
+    if (!unfinished || readUnfinished.current === unfinished) return;
+    readUnfinished.current = unfinished;
+    void rereadQuery(qc, ["messages", id]);
+  }, [unfinished, id, qc]);
   // A new artifact of a run started here is shown on its page by itself (#28, FR-6.1, #172).
   useAutoShow(live, id);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
@@ -263,11 +284,10 @@ export function ChatPage() {
     ? () =>
         void runs
           .interrupt(live.runId)
-          .then(refresh)
+          .then(() => refresh())
           .catch((e: unknown) => setActionError(errorText(e)))
     : undefined;
 
-  const lastAssistant = list?.findLast((m) => m.role === "assistant");
   const chatSettings = conv.data?.settings ?? null;
   // "기본값을 쓸 수 없어 ○○로 시작했어요" — once (FR-12.6): the server hands it to exactly one caller (another tab, a
   // reload or a failed request never shows it twice); only that page shows it, while the conversation is open.

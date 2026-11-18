@@ -664,21 +664,14 @@ describe("daylight saving on the engine (America/New_York, FR-8.7)", () => {
 });
 
 describe("start accuracy on the real clock", () => {
-  it("a minute occurrence starts within ±1 minute of its time (measured), the timer aimed at the occurrence itself", async () => {
+  it("a minute occurrence starts within ±1 minute of its time (measured)", async () => {
     const w = world();
-    // A shifted clock puts the next minute boundary 300 ms away; the timers are real.
+    // A shifted clock puts the next minute boundary 300 ms away; the timers are real. How soon a loaded machine
+    // wakes a timer is not the engine's doing (a CI runner stalled one by over a second, #103): only the requirement
+    // is checked here, on the stored times; the engine's decisions are checked on a controlled clock below.
     const real = Date.now();
     const shift = Math.ceil(real / MIN) * MIN - 300 - real;
-    // What the engine decides is recorded against the clock readings it made (#103): how late a loaded machine
-    // wakes a timer is not the engine's doing — a CI runner stalled one by over a second — so that is never a bound;
-    // the decisions are checked exactly, and the requirement (±1 minute) on the measured start.
-    let last = 0;
-    let wake: { first?: number } | null = null;
-    const now = () => {
-      last = Date.now() + shift;
-      if (wake && wake.first === undefined) wake.first = last;
-      return last;
-    };
+    const now = () => Date.now() + shift;
     const s = w.store.create(
       w.owner,
       {
@@ -693,46 +686,79 @@ describe("start accuracy on the real clock", () => {
       now(),
     );
     const occurrence = w.store.byId(s.id)!.next_run_at!;
-    const started = () => runsOf(w, s.id).some((r) => r.started_at !== null);
-    /** Where each timer set while waiting was aimed (the engine's own reading of the clock + the delay). */
-    const aims: number[] = [];
-    /** Each time the engine looked (its start, each timer): the time it read first, and whether it had started. */
-    const looks: { at: number; started: boolean }[] = [];
-    let ran!: () => void;
-    const runStarted = new Promise<void>((r) => (ran = r));
-    const look = (fn: () => void) => {
-      wake = {};
-      fn();
-      const at = wake.first;
-      wake = null;
-      if (at !== undefined) looks.push({ at, started: started() });
-      if (started()) ran();
-    };
-    const realSetTimeout = globalThis.setTimeout;
-    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
-      if (!started()) aims.push(last + (ms ?? 0));
-      return realSetTimeout(() => look(fn), ms);
-    }) as unknown as typeof setTimeout);
-    try {
-      const engine = new ScheduleEngine(w.store, new FakeScheduleHandler({ now }), { now, stopGraceMs: 0 });
-      engines.push(engine);
-      look(() => engine.start());
-      await runStarted;
-    } finally {
-      spy.mockRestore();
-    }
+    const engine = new ScheduleEngine(w.store, new FakeScheduleHandler({ now }), { now, stopGraceMs: 0 });
+    engines.push(engine);
+    engine.start();
+    // Waits for the start itself (the test's own time limit bounds it), not for a fixed time.
+    while (!runsOf(w, s.id).some((r) => r.started_at !== null)) await new Promise((r) => setTimeout(r, 20));
     const [r] = runsOf(w, s.id);
     expect(r!.scheduled_at).toBe(occurrence);
-    // Requirement (AC-5), measured on the real clock.
     const late = r!.started_at! - r!.scheduled_at;
     expect(late).toBeGreaterThanOrEqual(0);
     expect(late).toBeLessThanOrEqual(MIN);
-    // While it was not due, every timer was aimed exactly at the occurrence — not at the 1-minute look-again.
-    expect(aims.length).toBeGreaterThan(0);
-    for (const a of aims) expect(a).toBe(occurrence);
-    // The look that found it due started it there and then (no further sleep); none before its time did.
-    for (const l of looks) expect(l.started).toBe(l.at >= occurrence);
   });
+});
+
+describe("start accuracy: the engine's decisions on a controlled clock", () => {
+  // Started this long before the occurrence (negative: after it, e.g. a slow start-up).
+  it.each([
+    ["300 ms before", 300],
+    ["50 s before", 50_000],
+    ["350 ms after", -350],
+  ])(
+    "started %s: every timer aims at the occurrence itself, and the first look it is due starts it",
+    async (_, ahead) => {
+      const occurrence = at8(1);
+      fakeClock(occurrence - 2 * MIN);
+      const w = world();
+      const s = schedule(w, { type: "daily", time: "08:00" });
+      expect(w.store.byId(s.id)!.next_run_at).toBe(occurrence);
+      vi.setSystemTime(occurrence - ahead);
+      // The engine's own clock readings and the delays it asks for, and what each look (its start, each timer) did.
+      let last = 0;
+      let look: { first?: number } | null = null;
+      const now = () => {
+        last = Date.now();
+        if (look && look.first === undefined) look.first = last;
+        return last;
+      };
+      const started = () => runsOf(w, s.id).some((r) => r.started_at !== null);
+      const aims: number[] = [];
+      const looks: { at: number; started: boolean }[] = [];
+      const watch = (fn: () => void) => {
+        look = {};
+        fn();
+        const at = look.first;
+        look = null;
+        if (at !== undefined) looks.push({ at, started: started() });
+      };
+      const fakeSetTimeout = globalThis.setTimeout;
+      const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+        if (!started()) aims.push(last + (ms ?? 0));
+        return fakeSetTimeout(() => watch(fn), ms);
+      }) as unknown as typeof setTimeout);
+      try {
+        const engine = new ScheduleEngine(w.store, new FakeScheduleHandler({ now }), { now, stopGraceMs: 0 });
+        engines.push(engine);
+        watch(() => engine.start());
+        await advanceTo(occurrence + 5_000);
+      } finally {
+        spy.mockRestore();
+      }
+      const [r] = runsOf(w, s.id);
+      expect(r!.scheduled_at).toBe(occurrence);
+      // Late only by what the start itself was late (nothing added by the engine).
+      expect(r!.started_at).toBe(Math.max(occurrence, occurrence - ahead));
+      // While it was not due, every timer was aimed exactly at the occurrence (all within the engine's 1-minute sleep).
+      if (ahead > 0) {
+        expect(aims.length).toBeGreaterThan(0);
+        for (const a of aims) expect(a).toBe(occurrence);
+      } else expect(aims).toEqual([]);
+      // The look that found it due started it there and then; none before its time did.
+      expect(looks.length).toBeGreaterThan(0);
+      for (const l of looks) expect(l.started).toBe(l.at >= occurrence);
+    },
+  );
 });
 
 describe("the data folder must be ours", () => {
