@@ -118,6 +118,12 @@ test("내가 켜고(시각·연결·프롬프트) 실행 → 제안 → 반영, 
   const prompt = panel.getByTestId("dreaming-prompt");
   await expect(prompt).toBeVisible();
   await expect(panel).toContainText("붙여 넣은 글의 지시");
+  // A refused prompt (a secret value) keeps what was typed and says why.
+  const secret = `키는 sk-ant-api03-${"u".repeat(40)}`;
+  await prompt.fill(secret);
+  await panel.getByRole("button", { name: "프롬프트 저장" }).click();
+  await expect(panel.getByRole("alert").filter({ hasText: "비밀 값" })).toBeVisible();
+  await expect(prompt).toHaveValue(secret);
   const mine = `취미만 골라 주세요 ${Math.round(Math.random() * 1e6)}`;
   await prompt.fill(mine);
   await panel.getByRole("button", { name: "프롬프트 저장" }).click();
@@ -209,11 +215,20 @@ test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결�
     // 반영 방식 and a prompt for the son (write-only).
     await row.getByRole("combobox", { name: `${son.name} 반영 방식` }).selectOption("auto");
     await expect(row.getByRole("combobox", { name: `${son.name} 반영 방식` })).toHaveValue("auto");
-    await row
-      .getByRole("textbox", { name: `${son.name} 정리 프롬프트 새로 쓰기` })
-      .fill("학교 이야기만 골라 주세요");
+    // A refused prompt (a secret value) keeps the text and says why (review #195 round 2).
+    const box = row.getByRole("textbox", { name: `${son.name} 정리 프롬프트 새로 쓰기` });
+    const secret = `키는 sk-ant-api03-${"e".repeat(40)}`;
+    await box.fill(secret);
+    await row.getByRole("button", { name: "프롬프트 저장" }).click();
+    await expect(
+      admin.getByTestId("admin-dreaming").getByRole("alert").filter({ hasText: "비밀 값" }),
+    ).toBeVisible();
+    await expect(box).toHaveValue(secret);
+    await expect(row).toContainText("정리 프롬프트: 기본값");
+    await box.fill("학교 이야기만 골라 주세요");
     await row.getByRole("button", { name: "프롬프트 저장" }).click();
     await expect(row).toContainText("정리 프롬프트: 관리자가 새로 씀");
+    await expect(box).toHaveValue("");
     await expect(row).not.toContainText("학교 이야기만 골라 주세요");
   });
   await page.reload();

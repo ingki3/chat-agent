@@ -239,7 +239,7 @@ function Status({ view }: { view: View }) {
                   <YouthExtras
                     user={u}
                     pending={setYouth.isPending}
-                    save={(extra) => setYouth.mutate({ id: u.userId, body: extra })}
+                    save={(extra) => setYouth.mutateAsync({ id: u.userId, body: extra })}
                   />
                 )}
                 {u.problem && (
@@ -300,7 +300,8 @@ function YouthExtras({
 }: {
   user: DreamingUserStatus;
   pending: boolean;
-  save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => void;
+  /** Resolves when saved; rejects on a refusal (the error shows under the table). */
+  save: (extra: Pick<SaveYouthDreamingRequest, "applyMode" | "prompt">) => Promise<unknown>;
 }) {
   const [prompt, setPrompt] = useState("");
   return (
@@ -311,7 +312,7 @@ function YouthExtras({
           aria-label={`${user.name} 반영 방식`}
           value={user.applyMode ?? "review"}
           disabled={pending}
-          onChange={(e) => save({ applyMode: e.target.value as MemoryApplyMode })}
+          onChange={(e) => void save({ applyMode: e.target.value as MemoryApplyMode }).catch(() => {})}
         >
           {MemoryApplyMode.options.map((m) => (
             <option key={m} value={m}>
@@ -336,8 +337,11 @@ function YouthExtras({
           className="small"
           disabled={pending || !prompt.trim()}
           onClick={() => {
-            save({ prompt });
-            setPrompt("");
+            // Cleared only once saved: a refusal (a secret value, …) keeps what was typed (review #195 round 2).
+            void save({ prompt }).then(
+              () => setPrompt(""),
+              () => {},
+            );
           }}
         >
           프롬프트 저장
@@ -346,7 +350,7 @@ function YouthExtras({
           type="button"
           className="small"
           disabled={pending || !user.customPrompt}
-          onClick={() => save({ prompt: null })}
+          onClick={() => void save({ prompt: null }).catch(() => {})}
         >
           기본값으로 되돌리기
         </button>
