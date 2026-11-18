@@ -376,8 +376,8 @@ export class WebService {
     const max = input.maxResults ?? 8;
     // The query is what every provider sends out (a URL parameter, a skill's API request): checked once before any
     // of them runs (#113), so no provider — ours or a skill — gets it. A query that carries a secret takes exactly
-    // the ordinary path with the fixed decoy in its place (as the watchlist search does, #111): the same providers,
-    // fallbacks and errors; its hits are dropped and the answer is an ordinary empty one. Only the log says why.
+    // the ordinary path with the fixed decoy in its place: the same providers, fallbacks and errors; its hits are
+    // dropped and the answer is an ordinary empty one. Only the log says why.
     const blocked = carriesSecret([input.query]);
     let last: string = "web_search_unavailable";
     for (const p of this.providers) {

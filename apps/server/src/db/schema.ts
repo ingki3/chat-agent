@@ -994,25 +994,6 @@ export const scheduleProposals = sqliteTable(
 );
 
 /**
- * 관심 종목 (#31, FR-7.7): one person's list of Korean and US symbols, owner only (the admin cannot read it either,
- * FR-1.5). `name` is the display name picked from the search (third-party text, scrubbed on write).
- */
-export const watchlistItems = sqliteTable(
-  "watchlist_items",
-  {
-    id: text("id").primaryKey(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    market: text("market", { enum: ["KR", "US"] }).notNull(),
-    symbol: text("symbol").notNull(),
-    name: text("name"),
-    createdAt: integer("created_at").notNull().default(now),
-  },
-  (t) => [uniqueIndex("watchlist_items_user_symbol_idx").on(t.userId, t.market, t.symbol)],
-);
-
-/**
  * Text extraction of an upload (#48): one row per file, `pending` until the sandboxed extractor ran. Rows and
  * segments go with their file (cascade). Written by `FileExtracts` only.
  */

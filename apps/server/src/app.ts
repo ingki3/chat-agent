@@ -22,9 +22,7 @@ import { registerBackupRoutes } from "./backup/routes.js";
 import { ScheduleEngine, type ScheduleEngineOptions, type ScheduleHandler } from "./schedules/engine.js";
 import { RuntimeScheduleHandler, scheduleUsable, ScheduleWarnings } from "./schedules/handler.js";
 import { registerScheduleRoutes } from "./schedules/routes.js";
-import { registerWatchlistRoutes } from "./watchlist/routes.js";
 import { compactOnce } from "./secrets/compact.js";
-import { WatchlistStore } from "./watchlist/store.js";
 import { fixtureFinanceWorker } from "./runtime/fake-finance.js";
 import { ScheduleStore } from "./schedules/store.js";
 import { ScheduleProposalStore } from "./schedules/proposals.js";
@@ -214,8 +212,6 @@ declare module "fastify" {
       | undefined;
     /** Schedules proposed by `schedule_create` (#55); undefined without a database. */
     scheduleProposals: ScheduleProposalStore | undefined;
-    /** 관심 종목 (#31); undefined without a database. */
-    watchlist: WatchlistStore | undefined;
     /** What deleting a conversation does beyond its rows (#54): runtime session state, notifications, the WAL. */
     purge: ConversationPurge | undefined;
     /** 내 지침 (#144); undefined without a database. */
@@ -610,9 +606,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       runner: docRunner,
       slots: docSlots,
     });
-    // 관심 종목 (#31): the screen's list and `watchlist_get`.
-    const watchlist = new WatchlistStore(opts.db!);
-    app.decorate("watchlist", watchlist);
     // Uploads (#22): `files/<user>/<conversation>/<id>`, every change inside the file-write lock (#37).
     const fileStore = new FileStore(opts.db!, config.dataDir, app.fileWrites, app.conversations!, opts.files);
     app.decorate("files", fileStore);
@@ -828,7 +821,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         // The FakeRuntime mode (e2e, local tries): synthetic histories in-process, never the network (#31).
         ...(config.fakeRuntime ? { worker: fixtureFinanceWorker() } : {}),
       },
-      watchlist,
       // The server skill allow-list (#35) and the failed-skill list (FR-10.4).
       switches: new SkillSwitches(settingsStore),
       ...(errors ? { errors } : {}),
@@ -1186,7 +1178,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       app.addHook("onReady", async () => dreamingEngine.start());
     app.addHook("preClose", async () => dreamingEngine.stop());
     registerSourceRoutes(app, app.conversations!, sources);
-    registerWatchlistRoutes(app, { store: watchlist, mcp });
     // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
     registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
     // PNG/PDF export (#51): one fresh sandboxed browser per render, behind its own CDN-only egress proxy.
@@ -1275,7 +1266,6 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("files", undefined);
     app.decorate("schedules", undefined);
     app.decorate("scheduleProposals", undefined);
-    app.decorate("watchlist", undefined);
     app.decorate("fileExtracts", undefined);
     app.decorate("sharing", undefined);
     app.decorate("purge", undefined);

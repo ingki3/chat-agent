@@ -228,12 +228,12 @@ describe("schedule screen API (#55)", () => {
 
 describe("schedule_create → confirmation card → created only on the owner's confirm (#55, FR-8.1)", () => {
   it("the fake runtime understands the e2e request", () => {
-    const steps = scheduleSteps("매일 아침 8시 관심 종목 브리핑")!;
+    const steps = scheduleSteps("매일 아침 8시 시장 브리핑")!;
     expect(steps.find((s) => "call" in s)).toEqual({
       call: "schedule_create",
       input: {
-        name: "아침 관심 종목 브리핑",
-        prompt: "관심 종목 브리핑해줘",
+        name: "아침 시장 브리핑",
+        prompt: "시장 브리핑해줘",
         timing: { type: "daily", time: "08:00" },
         timeZone: SEOUL,
       },
@@ -247,7 +247,7 @@ describe("schedule_create → confirmation card → created only on the owner's 
 
   it("proposes without creating; only the owner sees and confirms the card; confirm makes one schedule, once", async () => {
     const t = await start();
-    const { parts } = await t.chat("매일 아침 8시 관심 종목 브리핑");
+    const { parts } = await t.chat("매일 아침 8시 시장 브리핑");
     const call = parts.find((p) => p.type === "tool_call");
     expect(call).toMatchObject({ name: "mcp__agentlee__schedule_create" });
     const { output, isError } = t.proposalOf(parts);
@@ -262,7 +262,7 @@ describe("schedule_create → confirmation card → created only on the owner's 
     );
     expect(card).toMatchObject({
       status: "proposed",
-      name: "아침 관심 종목 브리핑",
+      name: "아침 시장 브리핑",
       timing: { type: "daily", time: "08:00" },
       timeZone: SEOUL,
       notify: true,
@@ -292,8 +292,8 @@ describe("schedule_create → confirmation card → created only on the owner's 
     expect(ok.statusCode).toBe(201);
     const made = ConfirmScheduleProposalResponse.parse(ok.json());
     expect(made.schedule).toMatchObject({
-      name: "아침 관심 종목 브리핑",
-      prompt: "관심 종목 브리핑해줘",
+      name: "아침 시장 브리핑",
+      prompt: "시장 브리핑해줘",
       settings: { runtime: "claude-code", model: "fake-large" },
       notify: true,
     });
@@ -310,14 +310,14 @@ describe("schedule_create → confirmation card → created only on the owner's 
 
   it("a dismissed proposal is never created; confirm uses the defaults checked at that moment", async () => {
     const t = await start();
-    const a = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const a = t.proposalOf((await t.chat("매일 아침 8시 시장 브리핑")).parts).output.proposalId!;
     const d = await t.req("owner", "POST", `/api/schedule-proposals/${a}/dismiss`);
     expect(ScheduleProposal.parse(d.json()).status).toBe("dismissed");
     const c = await t.req("owner", "POST", `/api/schedule-proposals/${a}/confirm`, { version: "any" });
     expect([c.statusCode, c.json().error]).toEqual([409, "proposal_dismissed"]);
     expect(t.app.schedules!.store.listFor(t.f.users.owner.id)).toEqual([]);
     // Defaults that are not usable at confirm time: no schedule (409), and the proposal stays open.
-    const b = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const b = t.proposalOf((await t.chat("매일 아침 8시 시장 브리핑")).parts).output.proposalId!;
     t.app.connections!.store.setPolicy(t.f.users.owner.id, {
       runtime: "claude-code",
       allowed: false,
@@ -336,7 +336,7 @@ describe("schedule_create → confirmation card → created only on the owner's 
 
   it("confirm makes what the card showed: defaults changed since → 409 with the card as it is now (review #108)", async () => {
     const t = await start();
-    const id = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const id = t.proposalOf((await t.chat("매일 아침 8시 시장 브리핑")).parts).output.proposalId!;
     const shown = ScheduleProposal.parse(
       (await t.req("owner", "GET", `/api/schedule-proposals/${id}`)).json(),
     );
@@ -364,7 +364,7 @@ describe("schedule_create → confirmation card → created only on the owner's 
 
   it("confirm makes what the card showed: a policy narrowed since (fallback) → 409, nothing made", async () => {
     const t = await start();
-    const id = t.proposalOf((await t.chat("매일 아침 8시 관심 종목 브리핑")).parts).output.proposalId!;
+    const id = t.proposalOf((await t.chat("매일 아침 8시 시장 브리핑")).parts).output.proposalId!;
     const shown = ScheduleProposal.parse(
       (await t.req("owner", "GET", `/api/schedule-proposals/${id}`)).json(),
     );

@@ -6,7 +6,7 @@ import {
   type ChartSpec,
   type ChartView,
   type TableData,
-  type WatchMarket,
+  type StockMarket,
 } from "@agentlee/shared";
 import type { SkillResult } from "@agentlee/mcp-tools";
 import { localDate } from "./calendar.js";
@@ -49,7 +49,7 @@ export type PriceRow = {
   close: number;
   meta: Meta;
 };
-export type SymbolData = { symbol: string; market: WatchMarket; currency: string; rows: PriceRow[] };
+export type SymbolData = { symbol: string; market: StockMarket; currency: string; rows: PriceRow[] };
 export type FxRow = { date: string; close: number; meta: Meta };
 export type FinancialRow = { period: string; value: number | null; meta: Meta };
 export type FinancialData = { symbol: string; currency: string; rows: FinancialRow[] };
@@ -136,7 +136,7 @@ export async function fetchDataset(
   const symbols = [...new Set(input.symbols)];
   const markets = symbols.map((s) => marketOf(s));
   if (!symbols.length || markets.some((m) => !m)) return fail("finance_bad_input");
-  const skillOf = (m: WatchMarket) => (m === "KR" ? "kr-stock-skill" : "us-stock-skill");
+  const skillOf = (m: StockMarket) => (m === "KR" ? "kr-stock-skill" : "us-stock-skill");
   if (markets.some((m) => !allows(skillOf(m!)))) return fail("finance_not_allowed");
   const kind: ChartKind = input.chart ?? (symbols.length > 1 ? "compare" : "line");
   const get = async (tool: string, args: Record<string, unknown>) => {

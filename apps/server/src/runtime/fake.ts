@@ -44,7 +44,6 @@ import {
  *   "AAPL, 005930 6개월 비교 차트" (symbols + 차트; 비교·캔들·가격·재무, 1개월·3개월·6개월·1년)   a real call of our
  *                     `finance_chart` (#31): the table and chart artifacts, the table part and the finance note
  *                     come from the server (FAKE_RUNTIME=1 answers the finance URLs with synthetic data)
- *   /watchlist, "내 관심 종목"   a real call of our `watchlist_get` (#31)
  *   /burst <n>        n words as fast as possible, in paragraphs (rendering performance, #14)
  *   /md               markdown sample: GFM table, code blocks, KaTeX math, links (#14)
  *   /xss              hostile markup that must never run (#14)
@@ -55,7 +54,7 @@ import {
  *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
  *                     manager's citation check then adds its note (#25)
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
- *   "매일 아침 8시 관심 종목 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
+ *   "매일 아침 8시 시장 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
  *                     daily (or weekday) schedule at that hour, then a reply pointing at the confirmation card (#55)
  *   /doc <kind> [<fileId>]   "이 내용을 <kind> 보고서로" (#49): real calls of `doc_create` (the report of
  *                     `fake-docs.ts`, with the picture `fileId` when given) and `artifact_create` (a `document`
@@ -366,7 +365,7 @@ export const fakeSummary = (memory: readonly string[]): string =>
     .join(" / ")}`;
 
 /**
- * A schedule request in plain words (#55, FR-8.1): "매일 아침 8시 관심 종목 브리핑", "평일 저녁 7시에 … 알려줘". A
+ * A schedule request in plain words (#55, FR-8.1): "매일 아침 8시 시장 브리핑", "평일 저녁 7시에 … 알려줘". A
  * real `schedule_create` call (the card), or undefined for any other text.
  */
 export function scheduleSteps(t: string): FakeStep[] | undefined {
@@ -453,12 +452,6 @@ export const defaultScript: FakeScript = (input, memory) => {
     ];
   const chart = financeChartSteps(t);
   if (chart) return chart;
-  if (t === "/watchlist" || t === "내 관심 종목")
-    return [
-      { text: "관심 종목을 볼게요. " },
-      { call: "watchlist_get", input: {} },
-      { text: "관심 종목 목록을 가져왔어요." },
-    ];
   if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
   if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
   if (t.startsWith("/mdecho\n")) return mdEchoSteps(typedText(input.text).trim().slice("/mdecho\n".length));
