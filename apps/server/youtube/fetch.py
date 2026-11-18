@@ -27,9 +27,13 @@ FSIZE_MARGIN = 2 * 1024 * 1024
 
 
 # What yt-dlp's deno gets besides yt-dlp's own options (`--no-remote --no-npm --cached-only …`): an explicit denial
-# of every permission. deno already grants none by default (no `--allow-*` is passed); this keeps it so even if a
-# later yt-dlp starts passing one — and makes the player JS unable to start a process, load a library, read the
-# environment or the system, touch files or the network, or import anything (#191 review 3).
+# of deno's permissions. deno already grants none by default (no `--allow-*` is passed); this keeps it so even if a
+# later yt-dlp starts passing one. The player JS then cannot start a process, load a native library, read the
+# environment or system information, read or write files, open network connections or import from remote hosts
+# (`--deny-import` is about remote modules: a static local or `data:` import is still possible — harmless here,
+# deno reads nothing but its stdin and its own cache). This guards the trusted path (the pinned yt-dlp running
+# YouTube's JS); it is not a boundary against the python side itself — python may exec itself and deno with any
+# arguments, so for malicious code the OS sandbox is the boundary (docs/decisions/isolation.md, #191 review 3/4).
 DENO_LOCKDOWN = (
     "--deny-run",
     "--deny-ffi",
@@ -235,30 +239,54 @@ def main():
     log = Log()
     deno_args = lock_deno()
     if mode == "check":
-        import subprocess
-
         import yt_dlp_ejs.yt.solver  # noqa: F401 — the challenge scripts are installed
-        from yt_dlp.utils._jsruntime import DenoJsRuntime
+        from yt_dlp.extractor.youtube.jsc._builtin import deno as jcp
 
-        rt = DenoJsRuntime(job["deno"]).info
-        if not rt or not rt.supported:
-            return {"ok": False, "error": "deno"}
-        # deno as yt-dlp starts it for the installed (minified) challenge scripts: its options, locked down, then
-        # `--no-npm --cached-only`. The script also checks that starting a process is refused.
-        probe_js = (
-            "let ran = true; try { new Deno.Command('/bin/echo').outputSync(); } catch { ran = false; }"
-            " console.log(JSON.stringify({ sum: 20 + 22, ran }))"
+        # Through yt-dlp's own provider, as a YouTube extraction would: its runtime lookup, its script sources (the
+        # installed yt-dlp-ejs), its deno command line (recorded here) — with a probe instead of a player. The probe
+        # loads the solver scripts, then tries to start an executable the OS sandbox does allow (this deno itself):
+        # only deno's own permission check can refuse that, so the answer must be its `NotCapable`.
+        argvs = []
+
+        class Recording(jcp.Popen):
+            def __init__(self, args, *a, **k):
+                argvs.append(list(args))
+                super().__init__(args, *a, **k)
+
+        jcp.Popen = Recording
+
+        class Quiet:
+            def __getattr__(self, _name):
+                return lambda *a, **k: None
+
+        with yt_dlp.YoutubeDL(options(job, log)) as ydl:
+            provider = jcp.DenoJCP(ydl.get_info_extractor("Youtube"), Quiet(), {})
+            if not provider.is_available():
+                return {"ok": False, "error": "deno"}
+            lib, core = provider._lib_script, provider._core_script
+            probe_js = (
+                "let refused = 'ran';"
+                f" try {{ new Deno.Command({json.dumps(job['deno'])}, {{ args: ['--version'] }}).outputSync(); }}"
+                " catch (e) { refused = e.name; }"
+                " console.log(JSON.stringify({ solver: typeof jsc, refused }))"
+            )
+            out = provider._run_js_runtime(f"{lib.code}\nObject.assign(globalThis, lib);\n{core.code}\n{probe_js}")
+        got = json.loads(out or "{}")
+        run_args = [a for a in argvs if len(a) > 1 and a[1] == "run"]
+        ok = (
+            got.get("solver") == "function"
+            and got.get("refused") == "NotCapable"
+            and len(run_args) == 1
+            and not any(a.startswith("--allow") or a == "-A" for a in run_args[0])
         )
-        r = subprocess.run(
-            [job["deno"], "run", *deno_args, "--no-npm", "--cached-only", "-"],
-            input=probe_js,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        got = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
-        solved = got.get("sum") == 42 and got.get("ran") is False
-        return {"ok": solved, "ytdlp": yt_dlp.version.__version__, "deno": rt.version, "denoArgs": deno_args}
+        return {
+            "ok": ok,
+            "ytdlp": yt_dlp.version.__version__,
+            "deno": provider.runtime_info.version,
+            "denoArgs": deno_args,
+            "providerArgv": run_args[0][1:] if run_args else None,
+            "scripts": [lib.source.value, core.source.value],
+        }
     if mode == "probe":
         opts = options(job, log)
         # Metadata only: no format is required to exist (the server decides from the audio formats listed).

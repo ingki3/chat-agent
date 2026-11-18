@@ -1373,7 +1373,7 @@ const ytdlpPackages = process.env.TEST_YTDLP_PACKAGES;
 const ytdlpIt = ytdlpPackages && realPy?.ok && realFfmpeg?.ok ? it : it.skip;
 describe("youtube_audio_fetch: the real yt-dlp's deno lockdown (TEST_YTDLP_PACKAGES, #191 review 3)", () => {
   ytdlpIt(
-    "the pinned yt-dlp starts deno with its own options plus every permission denied; deno cannot run a process",
+    "through yt-dlp's deno provider: its exact command line (no --allow), the solver loads, deno itself refuses to run a process",
     async () => {
       const { runIsolated } = await import("../src/isolation/sandbox.js");
       const pk = fs.realpathSync(ytdlpPackages!);
@@ -1393,9 +1393,16 @@ describe("youtube_audio_fetch: the real yt-dlp's deno lockdown (TEST_YTDLP_PACKA
           120_000,
         ),
       );
-      const rep = scriptReport(r) as { ok: boolean; denoArgs?: string[] };
-      expect(rep, r.stderr).toMatchObject({ ok: true, denoArgs: [...YTDLP_DENO_BASE, ...DENO_LOCKDOWN] });
-      expect(rep.denoArgs!.some((a) => a.startsWith("--allow") || a === "-A")).toBe(false);
+      const rep = scriptReport(r) as { ok: boolean; providerArgv?: string[] };
+      // `ok` requires, inside fetch.py: the solver scripts loaded, and starting this deno (an executable the OS
+      // sandbox allows) refused by deno itself (`NotCapable`) — through yt-dlp's provider, with the line it built.
+      expect(rep, r.stderr).toMatchObject({
+        ok: true,
+        denoArgs: [...YTDLP_DENO_BASE, ...DENO_LOCKDOWN],
+        providerArgv: ["run", ...YTDLP_DENO_BASE, ...DENO_LOCKDOWN, "--no-npm", "--cached-only", "-"],
+        scripts: ["python package", "python package"],
+      });
+      expect(rep.providerArgv!.some((a) => a.startsWith("--allow") || a === "-A")).toBe(false);
     },
   );
 });

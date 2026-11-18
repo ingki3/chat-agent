@@ -2212,7 +2212,7 @@ YouTube 영상 하나의 음성을 **대화 파일(M4A)** 로 저장한다. 대�
 # 2) 고정 yt-dlp + yt-dlp-ejs + deno (이 명령만 네트워크를 쓴다: PyPI)
 pnpm youtube:install   # <DATA_DIR>/youtube-packages/<lock 해시>-py3.12/ (~90MB, 대부분 deno 바이너리)
 pnpm youtube:status    # youtube_audio_fetch: available
-pnpm youtube:check     # 샌드박스 안에서 yt-dlp import + deno를 yt-dlp 옵션(+모든 권한 거부)으로 시작, 작은 스크립트 풀기·프로세스 실행 거부 확인 (네트워크 없음) — 버전 출력
+pnpm youtube:check     # 샌드박스 안에서 yt-dlp의 deno 제공자로 deno 시작(yt-dlp 옵션 + 권한 거부), 풀이 스크립트 싣기, deno 자신의 실행 거부(NotCapable) 확인 (네트워크 없음) — 버전·명령줄 출력
 # 3) 서버 재시작
 ```
 - 고정 버전(2026-11-18): **yt-dlp 2026.10.26**(PyPI 배포 2026-10-26), **yt-dlp-ejs 0.8.0**(2026-03-17, YouTube JS 문제 풀이 스크립트), **deno 2.9.8**(2026-10-21, JS 런타임 — 휠에 바이너리가 들어 있음). 휠 해시 고정, `pip --isolated --no-deps --require-hashes --only-binary=:all: --target`, 고정 환경, 설치 폴더 읽기 전용(§46과 같은 설치기 `installPinnedPackages`). `bin/deno`만 남기고 다른 콘솔 스크립트(`yt-dlp` 등)는 지운다.

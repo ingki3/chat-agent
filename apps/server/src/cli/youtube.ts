@@ -15,8 +15,9 @@ import path from "node:path";
  * `<DATA_DIR>/youtube-packages/` — never the admin's Homebrew yt-dlp. The only network it uses for itself (PyPI),
  * from this command only. To update yt-dlp, the lock is changed in the repository (a new version ≥ 3 days old, its
  * hashes) and this command run again. `pnpm youtube:status` shows what the server would offer; `pnpm youtube:check`
- * runs the real sandboxed yt-dlp once without network (it imports, starts deno as it would for YouTube's challenge,
- * and deno solves a tiny script) and prints the versions. Restart the server afterwards.
+ * runs the real sandboxed yt-dlp once without network — through its own deno provider, as for YouTube's challenge:
+ * the solver scripts load and deno itself refuses to start a process — and prints the versions and deno's command
+ * line. Restart the server afterwards.
  */
 const config = loadConfig();
 const [cmd] = process.argv.slice(2);
@@ -66,10 +67,12 @@ if (cmd === "install") {
       ),
     );
     const rep = scriptReport(r);
-    const v = rep.ok ? (rep as { ytdlp?: unknown; deno?: unknown; denoArgs?: unknown }) : undefined;
+    const v = rep.ok
+      ? (rep as { ytdlp?: unknown; deno?: unknown; denoArgs?: unknown; providerArgv?: unknown })
+      : undefined;
     ok = rep.ok;
     console.log(
-      `check (yt-dlp + deno, sandbox): ${rep.ok ? `ok — yt-dlp ${String(v?.ytdlp)}, deno ${String(v?.deno)} ${JSON.stringify(v?.denoArgs)}` : rep.code} — ${Date.now() - t} ms`,
+      `check (yt-dlp + deno, sandbox): ${rep.ok ? `ok — yt-dlp ${String(v?.ytdlp)}, deno ${String(v?.deno)} ${JSON.stringify(v?.providerArgv)}` : rep.code} — ${Date.now() - t} ms`,
     );
   } finally {
     removeTree(workdir);
