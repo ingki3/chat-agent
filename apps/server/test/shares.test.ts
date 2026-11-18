@@ -1410,7 +1410,7 @@ describe("fork — remapParts (#52)", () => {
       ...(locator && fileId
         ? { locator: { fileId, fileRevision: rev, kind: "page" as const, page: 12 } }
         : {}),
-      ...(fileId ? { fileId } : {}),
+      ...(fileId ? { fileId, snippet: "모델이 인용한 구절 전체예요" } : {}),
     });
     const out = remapParts(
       [
@@ -1434,6 +1434,13 @@ describe("fork — remapParts (#52)", () => {
       [4, undefined, undefined],
     ]);
     expect(JSON.stringify(out)).not.toMatch(/"f[12]"/);
+    // The whole cited snippet goes with the copy (what a follow-up there checks again, review 1차).
+    expect(cites.map((c) => c.snippet)).toEqual([
+      "모델이 인용한 구절 전체예요",
+      "모델이 인용한 구절 전체예요",
+      "모델이 인용한 구절 전체예요",
+      undefined,
+    ]);
     expect(CitationNotePart.parse(note)).toEqual(note);
   });
 });

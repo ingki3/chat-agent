@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
+  CITATION_LIMITS,
   CITATION_STATUS_TEXT,
   CSRF_HEADER,
   CitationNotePart,
@@ -3797,5 +3798,90 @@ describe("#186: an attachment is cited with file_cite only; a follow-up's number
       ["unknown_source", undefined, null],
       ["unknown_source", undefined, null],
     ]);
+  });
+});
+
+describe("#186 review 1차: list numbers, the whole snippet, the earlier place", () => {
+  const LONG = `검토 결과 ${"한글".repeat(120)} 결론은 보류입니다.`;
+  const ONLY_HERE = "특별한 문장은 여기에만 있습니다.";
+  const B_SENTENCE = "둘째 파일에만 있는 문장입니다.";
+  const SNIPPETS: Record<string, string> = { long: LONG, only: ONLY_HERE, b: B_SENTENCE };
+  const script: FakeScript = (input, memory) => {
+    const cite = /^\/cite (\S+) (\S+)$/.exec(input.text);
+    if (cite)
+      return [
+        { call: "file_cite", input: { fileId: cite[1]!, snippet: SNIPPETS[cite[2]!]! } },
+        { text: "그 파일에는 그렇게 적혀 있어요[1]." },
+      ];
+    if (input.text === "/again1") return [{ text: "다시 말하면 그렇게 적혀 있어요[1]." }];
+    if (input.text === "/list-first")
+      return [{ call: "file_list", input: {} }, { text: "목록의 첫 파일은 회의록이에요[1]." }];
+    return defaultScript(input, memory);
+  };
+  const touch = (db: { $client: import("better-sqlite3").Database }, fileId: string) =>
+    db.$client.prepare("UPDATE file_extracts SET updated_at = updated_at + 1 WHERE file_id = ?").run(fileId);
+
+  it("[P2] a turn that called file_list: its [1] (list item 1, another file) is not the earlier answer's [1]", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const a = await upload(f.cookies.owner, c.id, "a.txt", Buffer.from("첫째 파일의 회의록입니다.\n"));
+    const b = await upload(f.cookies.owner, c.id, "b.txt", Buffer.from(`${B_SENTENCE}\n`));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${b.id} b`, undefined, [a.id, b.id]);
+    expect(first.note!.citations.map((x) => [x.status, x.fileId])).toEqual([["verified", b.id]]);
+    const listed = await send(f.cookies.owner, c.id, "/list-first");
+    const [list] = outputs(listed);
+    expect((list!.items as { fileId: string }[])[0]!.fileId).toBe(a.id);
+    expect(listed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([["unknown_source", undefined]]);
+  });
+
+  it("[P2] a passage whose page text is longer than the limit: the follow-up checks the whole snippet — a changed ending is ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // Decomposed Hangul: the snippet (NFC, < 500) matches more than 500 characters of the file's text.
+    const file = await upload(f.cookies.owner, c.id, "long.txt", Buffer.from(`${LONG.normalize("NFD")}\n`));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} long`, undefined, [file.id]);
+    const cited = first.note!.citations[0]!;
+    expect(cited.status).toBe("verified");
+    expect(LONG.length).toBeLessThan(CITATION_LIMITS.snippet);
+    expect(cited.quote!.length).toBe(CITATION_LIMITS.snippet); // the display quote is cut …
+    expect(cited.snippet).toBe(LONG); // … the snippet is whole
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe("verified");
+    // The ending (past the cut quote) changes: the whole passage is not there any more.
+    db.$client
+      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ?")
+      .run("보류".normalize("NFD"), "승인".normalize("NFD"), file.id);
+    touch(db, file.id);
+    const changed = await send(f.cookies.owner, c.id, "/again1");
+    expect(changed.note!.citations.map((x) => [x.status, x.fileId, x.snippet])).toEqual([
+      ["snippet_not_found", file.id, LONG],
+    ]);
+  });
+
+  it("[P2] a passage the file has in two places keeps the place it was cited at; elsewhere only once it is gone there", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
+    const file = await upload(f.cookies.owner, c.id, "dup.txt", Buffer.from(lines.join("\n") + "\n"));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
+    expect(first.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 60]]);
+    // Line 5 now has the same sentence (earlier in the file).
+    db.$client
+      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ?")
+      .run("줄 5 내용입니다.", ONLY_HERE, file.id);
+    touch(db, file.id);
+    const again = await send(f.cookies.owner, c.id, "/again1");
+    expect(again.note!.citations.map((x) => [x.status, x.locator?.line, x.site])).toEqual([
+      ["verified", 60, "60번째 줄"],
+    ]);
+    // Gone from line 60: found again where it is now (line 5).
+    db.$client
+      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ? AND text LIKE ?")
+      .run(ONLY_HERE, "줄 60 내용입니다.", file.id, "%줄 41 내용%");
+    touch(db, file.id);
+    const moved = await send(f.cookies.owner, c.id, "/again1");
+    expect(moved.note!.citations.map((x) => [x.status, x.locator?.line])).toEqual([["verified", 5]]);
   });
 });

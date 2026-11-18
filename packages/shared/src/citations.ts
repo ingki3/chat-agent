@@ -96,6 +96,13 @@ export const CitationEntry = z.object({
    * has the id for verified passages only). Absent for web citations and on entries stored before #186.
    */
   fileId: z.string().min(1).max(64).optional(),
+  /**
+   * The whole passage the model sent with `cite` / `file_cite` (#186 review 1차), what a later answer that writes
+   * this number again checks again — `quote` is for display and may be cut at its limit (the matched page text can
+   * be longer than the snippet, e.g. decomposed Hangul). Absent on `unknown_source` and on entries stored before:
+   * those carry over only while `quote` is certainly whole (shorter than the limit).
+   */
+  snippet: z.string().max(CITATION_LIMITS.snippet).optional(),
 });
 export type CitationEntry = z.infer<typeof CitationEntry>;
 

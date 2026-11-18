@@ -1,7 +1,7 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
-import { CITE_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
-import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
+import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { FILE_CITE_TOOL, FILE_LIST_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import {
   boundText,
   CITATION_LIMITS,
@@ -97,6 +97,7 @@ function fileEntry(
     name: string;
     quote: string | null;
     locator: FileLocator | null;
+    snippet: string;
   },
 ): CitationEntry {
   const locator = c.status === "verified" ? c.locator : null;
@@ -111,13 +112,27 @@ function fileEntry(
     quote: bound(c.quote, CITATION_LIMITS.snippet),
     ...(locator ? { locator } : {}),
     fileId: c.fileId,
+    snippet: boundText(c.snippet, CITATION_LIMITS.snippet),
   };
 }
 
 /**
+ * The passage a carried number is checked again with (review #186 1차): the whole snippet the model cited with —
+ * never the display `quote`, which may be cut at its limit (a verified match can be longer than the snippet). An
+ * entry stored before the snippet was kept: its `quote` only while it is certainly whole (shorter than the limit);
+ * otherwise nothing (not carried — never verified from a cut prefix).
+ */
+function recheckSnippet(e: CitationEntry): string | undefined {
+  if (e.snippet) return e.snippet;
+  if (e.quote && e.quote.length < CITATION_LIMITS.snippet) return e.quote;
+  return undefined;
+}
+
+/**
  * Tools whose call makes this run's numbers its own (#150): a search, a fetch or a search skill (new material for
- * new numbers), reading or searching an uploaded file (#186 — `file_search` numbers its hits too: a number written
- * after one is never an earlier answer's), and any `cite` or `file_cite` call — refused ones too (review #153: a
+ * new numbers), reading or searching an uploaded file, and the two lists (#186 — `file_search`, `file_list` and
+ * `sources_list` number their output `[1]`…: a number written after one may name a list item, never an earlier
+ * answer's citation), and any `cite` or `file_cite` call — refused ones too (review #153: a
  * refused call registers no row, yet the model may still write the number it meant).
  */
 const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
@@ -126,6 +141,8 @@ const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   skillToolName(GOOGLE_NEWS_SKILL.name),
   skillToolName(SEARCH_GOOGLE_SKILL.name),
   CITE_TOOL.name,
+  SOURCES_LIST_TOOL.name,
+  FILE_LIST_TOOL.name,
   FILE_READ_TOOL.name,
   FILE_SEARCH_TOOL.name,
   FILE_CITE_TOOL.name,
@@ -142,7 +159,7 @@ const ownsNumbers = (name: string) =>
  *
  * The rule, and its precedence: numbers are per run, so a carry-over happens only when this run registered **no**
  * citation, **called** no `cite`/`file_cite` (a refused call counts — review #153) and brought in no source of its
- * own (no search, fetch, news skill, `file_read` or `file_search`) — then its numbers can only be the earlier ones.
+ * own (no search, fetch, news skill, `file_read`, `file_search`, `file_list` or `sources_list`) — then its numbers can only be the earlier ones.
  * As soon as it cites or tries to (or fetches or reads something new), every number is this run's: a marker without
  * a citation of this run stays `unknown_source`, whatever an earlier answer had under that number.
  * A file citation (#186) carries over by the file id its entry keeps (`fileId`), checked again by `recheckFile`: the
@@ -161,7 +178,7 @@ export type CitationCarry = {
   /** An earlier file citation checked again now (#186, `FileTools.recheck`); without it no file citation carries. */
   recheckFile?: (
     scope: { conversationId: string; userId: string },
-    input: { fileId: string; snippet: string },
+    input: { fileId: string; snippet: string; locator?: FileLocator },
   ) =>
     | { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: { name: string } }
     | undefined;
@@ -195,8 +212,9 @@ export function citationNote(
     if (!e || e.status === "unknown_source") return undefined;
     if (e.fileId && !e.sourceId) return carriedFile(n, e, e.fileId);
     if (!e.sourceId || !store.recheck) return undefined;
-    // What the earlier answer quoted (verified: the passage itself; otherwise the snippet it sent).
-    const c = e.quote ? store.recheck(carry, { sourceId: e.sourceId, snippet: e.quote }) : undefined;
+    const snippet = recheckSnippet(e);
+    if (!snippet) return undefined;
+    const c = store.recheck(carry, { sourceId: e.sourceId, snippet });
     if (!c) return undefined;
     const s = c.source;
     carriedAny = true;
@@ -209,13 +227,16 @@ export function citationNote(
       url: bound(s.finalUrl ?? s.url, CITATION_LIMITS.url),
       publishedAt: s.publishedAt ?? null,
       quote: bound(c.status === "verified" ? c.quote : e.quote, CITATION_LIMITS.snippet),
+      snippet,
     };
   };
   // A file citation of the earlier answer, its passage (verified: as the file had it; otherwise the snippet sent)
   // looked for again in the file's text now (#186).
   const carriedFile = (n: number, e: CitationEntry, fileId: string): CitationEntry | undefined => {
-    if (!carry?.recheckFile || !e.quote) return undefined;
-    const c = carry.recheckFile(carry, { fileId, snippet: e.quote });
+    const snippet = recheckSnippet(e);
+    if (!carry?.recheckFile || !snippet) return undefined;
+    // Looked for at the earlier place first (a passage repeated in the file keeps its page, review 1차).
+    const c = carry.recheckFile(carry, { fileId, snippet, ...(e.locator ? { locator: e.locator } : {}) });
     if (!c) return undefined;
     carriedAny = true;
     return fileEntry(n, {
@@ -224,6 +245,7 @@ export function citationNote(
       name: c.file.name,
       quote: c.status === "verified" ? c.quote : e.quote,
       locator: c.status === "verified" ? c.locator : null,
+      snippet,
     });
   };
   const citations: CitationEntry[] = numbers.slice(0, CITATION_LIMITS.perRun * 2).map((n) => {
@@ -242,6 +264,7 @@ export function citationNote(
         name: r.file.name,
         quote: r.status === "verified" ? r.quote : r.snippet,
         locator: parsed?.success ? parsed.data : null,
+        snippet: r.snippet,
       });
     }
     // A marker without a citation of this run (made up, or a number of another answer): never shown as normal.
@@ -266,6 +289,7 @@ export function citationNote(
       url: bound(s.finalUrl ?? s.url, CITATION_LIMITS.url),
       publishedAt: s.publishedAt ?? null,
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
+      snippet: boundText(r.snippet, CITATION_LIMITS.snippet),
     };
   });
   // Provenance only (#185): an answer that used no source tool and carried no number has no sources — it gets no

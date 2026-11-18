@@ -525,11 +525,13 @@ export class FileTools {
    * conversation's and this user's, sent with an active message; a deleted file or one an edit cut off is not), and
    * the passage is looked for in the file's extracted text **as it is now** — without waiting: a file being
    * extracted again (or failed) is `fetch_failed`, a passage its current text no longer has `snippet_not_found`.
+   * `locator` (the earlier verified place): looked at first — a passage the file has in several places keeps the
+   * place it was cited at (review #186 1차); only when it is not there any more is the whole file searched.
    * Undefined when the file is not one (any more): the marker stays `unknown_source`. Registers nothing.
    */
   recheck(
     scope: Pick<ToolScope, "conversationId" | "userId">,
-    input: { fileId: string; snippet: string },
+    input: { fileId: string; snippet: string; locator?: FileLocator | undefined },
   ):
     { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: FileRow } | undefined {
     const file = this.fileFor(scope, input.fileId);
@@ -537,7 +539,14 @@ export class FileTools {
     const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       return { status: "snippet_not_found", quote: null, locator: null, file };
-    const found = this.match(file, toFileExtract(file, this.extracts.get(file.id)), snippet, undefined);
+    const prefer = input.locator?.fileId === file.id ? input.locator : undefined;
+    const found = this.match(
+      file,
+      toFileExtract(file, this.extracts.get(file.id)),
+      snippet,
+      undefined,
+      prefer,
+    );
     if (found.status !== "verified") return { status: found.status, quote: null, locator: null, file };
     const loc = found.locator ? FileLocator.safeParse(scrubKnownDeep(found.locator)) : undefined;
     return {
@@ -548,12 +557,17 @@ export class FileTools {
     };
   }
 
-  /** `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`). */
+  /**
+   * `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`): the first
+   * unit that has the passage, the unit named by `page` first — or, with `prefer` (a recheck), the match at that
+   * same place if there is one (the same place and range best), the first match otherwise.
+   */
   private match(
     f: FileRow,
     extract: FileExtract,
     snippet: string,
     page: number | undefined,
+    prefer?: FileLocator,
   ): { status: CitationStatus; quote: string | null; locator: CitedLocator | null } {
     if (extract.status !== "ok" || !extract.segments)
       return { status: "fetch_failed", quote: null, locator: null };
@@ -562,13 +576,15 @@ export class FileTools {
       page === undefined
         ? segs
         : [...segs.filter((s) => s.unit === page), ...segs.filter((s) => s.unit !== page)];
+    type Found = { status: "verified"; quote: string; locator: CitedLocator | null };
+    let best: { found: Found; score: number } | undefined;
     for (const seg of ordered) {
       const m = findSnippetAt(seg.text, snippet);
       if (!m.found) continue;
       const where = locate(f, seg, m.start, m.end);
       // The verified unit's own sheet number goes with the locator (the model's sheet id comes from it).
       const sheetNo = locOf(seg).sheetNo;
-      return {
+      const found: Found = {
         status: "verified",
         quote: m.quote,
         locator: where
@@ -580,7 +596,35 @@ export class FileTools {
             }
           : null,
       };
+      if (!prefer) return found;
+      const score = where ? placeScore(where, prefer) : 0;
+      if (score === 2) return found;
+      if (!best || score > best.score) best = { found, score };
     }
-    return { status: "snippet_not_found", quote: null, locator: null };
+    return best?.found ?? { status: "snippet_not_found", quote: null, locator: null };
   }
+}
+
+/** The fields that name a place (not the box or the range inside it). */
+const PLACE_FIELDS = [
+  "kind",
+  "page",
+  "line",
+  "paragraph",
+  "table",
+  "row",
+  "col",
+  "sheet",
+  "range",
+  "slide",
+  "footnote",
+  "endnote",
+] as const satisfies readonly (keyof FileLocator)[];
+
+/** How well a found place matches an earlier one: 2 the same place and range, 1 the same place, 0 another. */
+function placeScore(a: FileLocator, b: FileLocator): number {
+  if (!PLACE_FIELDS.every((k) => a[k] === b[k])) return 0;
+  const ra = a.charRange;
+  const rb = b.charRange;
+  return ra?.[0] === rb?.[0] && ra?.[1] === rb?.[1] ? 2 : 1;
 }
