@@ -14,6 +14,11 @@ import {
   type Prefs,
 } from "../src/instructions/rev.js";
 import { stateText } from "../src/instructions/DreamingPanel.js";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { applySaved, liveGet, sharing, type Cached } from "../src/instructions/rev.js";
+
+/** A GET's answer as the query function gives it (`liveGet`: stamped with the rev it was read at). */
+const viaGet = <T extends { rev: number }>(x: T): Cached<T> => ({ ...x, liveRev: x.rev });
 
 /** Review #195 round 9: the page keeps the newest revision of each resource — the server orders the writes. */
 type R = { rev: number; v: boolean };
@@ -268,14 +273,17 @@ describe("review 11: equal revisions, the status sentence", () => {
     const off = { enabled: false, time: "03:00", ...FAKE };
     const on4 = { enabled: true, time: "04:00", ...FAKE };
     // Off (last GET rev 2), then saved on at 04:00 (rev 3).
-    const got = mineFromGet(undefined, mine({ rev: 2, enabled: false, time: null, settings: off }));
+    const got = mineFromGet(undefined, viaGet(mine({ rev: 2, enabled: false, time: null, settings: off })));
     const saved = mineFromPut(got, mine({ rev: 3, settings: on4 }));
     expect(stateText(saved, false)).toBe("기억 정리를 매일 04:00(한국 시각)에 하도록 저장했어요 — 확인 중…");
     expect(stateText(saved, true)).toBe(
       "기억 정리를 매일 04:00(한국 시각)에 하도록 저장했어요 — 최신 상태 확인 실패",
     );
     // The GET after it (rev 3): it runs.
-    const confirmed = mineFromGet(saved, mine({ rev: 3, enabled: true, time: "04:00", settings: on4 }));
+    const confirmed = mineFromGet(
+      saved,
+      viaGet(mine({ rev: 3, enabled: true, time: "04:00", settings: on4 })),
+    );
     expect(stateText(confirmed, false)).toContain("기억 정리가 매일 04:00(한국 시각)에 새 메시지를 정리해요");
     // Turned off: says so at once.
     expect(
@@ -284,7 +292,7 @@ describe("review 11: equal revisions, the status sentence", () => {
     // The server-wide switch off (live) applies even while a save is not confirmed yet.
     const serverOff = mineFromGet(
       confirmed,
-      mine({ rev: 3, problem: "server_off", enabled: false, time: null, settings: on4 }),
+      viaGet(mine({ rev: 3, problem: "server_off", enabled: false, time: null, settings: on4 })),
     );
     const moved = mineFromPut(serverOff, mine({ rev: 5, settings: { ...on4, time: "05:00" } }));
     expect(stateText(moved, false)).toContain("관리자가 서버 전체에서 기억 정리를 꺼 두었어요");
@@ -296,4 +304,72 @@ describe("review 11: equal revisions, the status sentence", () => {
     const youth = view({ users: [user({ youth: true, applyMode: "auto", applyModeRev: 3 })] });
     expect(adminFromGet(adminFromGet(undefined, notYouth), youth).users[0]!.applyMode).toBe("auto");
   });
+});
+
+/**
+ * Review 12 (Codex's matrix): a GET that read the settings before two saves, a settings save (rev 3) and an older
+ * prompt save (rev 2), landing in every order, with the query active (an observer — saves refetch, and those refetches
+ * fail with 503) or inactive (no refetch). `liveRev` only ever comes from a GET; an ignored save writes nothing.
+ */
+describe("liveRev comes only from GETs (review 12)", () => {
+  type Ev = "get" | "settings" | "prompt";
+  const orders: Ev[][] = [
+    ["get", "settings", "prompt"],
+    ["get", "prompt", "settings"],
+    ["settings", "get", "prompt"],
+    ["settings", "prompt", "get"],
+    ["prompt", "get", "settings"],
+    ["prompt", "settings", "get"],
+  ];
+  const settings3 = { enabled: true, time: "04:30", ...FAKE };
+  for (const active of [true, false])
+    for (const order of orders)
+      it(`${active ? "active" : "inactive"}: ${order.join(" → ")}`, async () => {
+        const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        const key = ["dreaming-r12"];
+        // The server: rev 1 at first (03:00). Later GETs (the refetches after saves) fail.
+        let release!: () => void;
+        let call = 0;
+        const fn = liveGet(async () => {
+          call++;
+          if (call === 1) return mine({ rev: 1, enabled: true, time: "03:00" });
+          if (call === 2) {
+            await new Promise<void>((r) => (release = r));
+            return mine({ rev: 1, enabled: true, time: "03:00" }); // read before either save applied
+          }
+          throw new Error("503");
+        });
+        const options = { queryKey: key, queryFn: fn, structuralSharing: sharing(mineFromGet), retry: false };
+        await qc.fetchQuery(options);
+        const observer = new QueryObserver(qc, options);
+        const stop = active ? observer.subscribe(() => {}) : () => {};
+        const get = qc.fetchQuery({ ...options, staleTime: 0 }).catch(() => undefined);
+        await Promise.resolve();
+        const settingsPut = mine({ rev: 3, settings: settings3 });
+        const promptPut = mine({
+          rev: 2,
+          prompt: { content: "B", custom: true, defaultContent: "D", fixedRules: "R", updatedAt: 2 },
+        });
+        for (const ev of order) {
+          if (ev === "get") {
+            release();
+            await get;
+          } else
+            applySaved<Cached<MyDreaming>>(qc, key, (old) =>
+              mineFromPut(old, ev === "settings" ? settingsPut : promptPut),
+            );
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        await new Promise((r) => setTimeout(r, 5));
+        const v = qc.getQueryData<Cached<MyDreaming>>(key)!;
+        // The stored settings are the newest save's; no GET ever read rev 3 → not confirmed.
+        expect(v.settings.time).toBe("04:30");
+        expect(v.rev).toBe(3);
+        expect(v.liveRev).toBe(1);
+        const failed = qc.getQueryState(key)?.status === "error";
+        expect(stateText(v, failed)).toMatch(/04:30.*(확인 중…|최신 상태 확인 실패)/);
+        expect(stateText(v, failed)).not.toContain("03:00");
+        stop();
+        qc.clear();
+      });
 });

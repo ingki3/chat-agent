@@ -30,7 +30,7 @@ import type {
 type Revved = { rev: number };
 type Part = "stored" | "live";
 /** A cached answer: with the rev of the GET its live part came from. */
-export type Cached<T> = T & { liveRev?: number };
+export type Cached<T> = T & { liveRev?: number | undefined };
 
 const storedKeys = <T>(fields: Record<keyof T, Part>) =>
   (Object.keys(fields) as (keyof T)[]).filter((k) => fields[k] === "stored" && k !== "rev");
@@ -47,13 +47,24 @@ export function newer<T extends Revved>(old: T | undefined, next: T): T {
   return !old || next.rev >= old.rev ? next : old;
 }
 
-/** A GET's answer: its live part always (and its rev as `liveRev`); the stored part only if not older. */
+/**
+ * A query function that stamps its answer with `liveRev` = the rev it was read at (review 12): `liveRev` is set only
+ * here, in the GET's own path — never inferred from a cache write (a save's merge copies the cache's).
+ */
+export const liveGet =
+  <T extends Revved>(fn: () => Promise<T>) =>
+  async (): Promise<Cached<T>> => {
+    const d = await fn();
+    return { ...d, liveRev: d.rev };
+  };
+
+/** A GET's answer: its live part (and its `liveRev`) always; the stored part only if not older. */
 export function fromGet<T extends Revved>(fields: Record<keyof T, Part>) {
   const keys = storedKeys<T>(fields);
-  return (old: Cached<T> | undefined, next: T): Cached<T> => {
-    if (fromSave.has(next)) return next;
+  return (old: Cached<T> | undefined, next: Cached<T>): Cached<T> => {
+    if (fromSave.has(next) || next === old) return next;
     const merged = !old || next.rev >= old.rev ? next : { ...next, ...pick(old, keys), rev: old.rev };
-    return { ...merged, liveRev: next.rev };
+    return { ...merged, liveRev: next.liveRev ?? old?.liveRev };
   };
 }
 
@@ -62,9 +73,9 @@ export function fromPut<T extends Revved>(fields: Record<keyof T, Part>) {
   const keys = storedKeys<T>(fields);
   return (old: Cached<T> | undefined, put: T): Cached<T> =>
     !old
-      ? saved({ ...put, liveRev: put.rev })
+      ? saved({ ...put })
       : put.rev > old.rev
-        ? saved({ ...old, ...pick(put, keys), rev: put.rev })
+        ? saved({ ...old, ...pick(put, keys), rev: put.rev, liveRev: old.liveRev })
         : old;
 }
 
@@ -236,6 +247,9 @@ export function applySaved<T>(
   key: QueryKey,
   merge: (old: T | undefined) => T | undefined,
 ): void {
-  qc.setQueryData<T>(key, (old) => merge(old));
+  // An answer that changes nothing (older than the cache) is not written at all (review 12).
+  const old = qc.getQueryData<T>(key);
+  const next = merge(old);
+  if (next !== old) qc.setQueryData<T>(key, next);
   void qc.invalidateQueries({ queryKey: key });
 }

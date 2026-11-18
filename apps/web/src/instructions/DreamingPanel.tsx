@@ -17,7 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
-import { applySaved, mineFromGet, mineFromPut, sharing, type Cached } from "./rev.js";
+import { applySaved, liveGet, mineFromGet, mineFromPut, sharing, type Cached } from "./rev.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -31,7 +31,7 @@ export function DreamingPanel() {
   // The newest revision wins (rev.ts): a GET that read data from before a save never replaces the save's answer.
   const q = useQuery({
     queryKey: DREAMING_KEY,
-    queryFn: dreaming.mine,
+    queryFn: liveGet(dreaming.mine),
     structuralSharing: sharing(mineFromGet),
   });
   const d = q.data;
