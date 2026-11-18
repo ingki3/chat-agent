@@ -177,8 +177,12 @@ export type CitationUnit = TextRange & {
   kind: CitationUnitKind;
   table?: true;
   footnote?: true;
+  /** The footnote's id (with `footnote`): a footnote table takes cover only from its own footnote (review 5차). */
+  note?: string;
   part?: number;
   inline?: true;
+  /** A paragraph a tool call cut: the first fragment ends at `end`, the second (next part) starts at `start`. */
+  cut?: { end: number; start: number };
 };
 
 /** A paragraph that is only bold text (a heading written as `**제목**`). */
@@ -249,24 +253,32 @@ function blockUnits(block: string, base: number): Unit[] {
   const tree = parseBlock(block);
   // Footnotes the screen shows (review 4차, as mdast-util-to-hast does): the first definition of each id, and only
   // those reached from the body — directly, or from a footnote that is itself shown.
-  const defs = new Map<string, Nodes>();
-  const bodyRefs: string[] = [];
-  const walkRefs = (n: Nodes, into: string[], skipDefs: boolean) => {
-    if (n.type === "footnoteReference") into.push(n.identifier.toUpperCase());
+  // Every definition first, nested ones too, the first of each id in document order (review 5차).
+  const defs = new Map<string, Nodes & { type: "footnoteDefinition" }>();
+  const index = (n: Nodes) => {
     if (n.type === "footnoteDefinition") {
       const id = n.identifier.toUpperCase();
       if (!defs.has(id)) defs.set(id, n);
-      if (skipDefs) return;
     }
-    if ("children" in n) for (const c of n.children) walkRefs(c as Nodes, into, skipDefs);
+    if ("children" in n) for (const c of n.children) index(c as Nodes);
   };
-  walkRefs(tree, bodyRefs, true);
-  const shown = new Set<Nodes>();
-  for (let k = 0; k < bodyRefs.length; k++) {
-    const def = defs.get(bodyRefs[k]!);
-    if (!def || shown.has(def)) continue;
-    shown.add(def);
-    if ("children" in def) for (const c of def.children) walkRefs(c as Nodes, bodyRefs, false);
+  index(tree);
+  // References of a node's own text (a definition inside it is its own: only its references when it is shown).
+  const refsOf = (n: Nodes, into: string[]) => {
+    if (n.type === "footnoteReference") into.push(n.identifier.toUpperCase());
+    if ("children" in n)
+      for (const c of n.children) if ((c as Nodes).type !== "footnoteDefinition") refsOf(c as Nodes, into);
+  };
+  const reached: string[] = [];
+  refsOf(tree, reached);
+  // Each definition reached from the body (directly or from a shown footnote) is checked once.
+  const shown: { id: string; def: Nodes & { type: "footnoteDefinition" } }[] = [];
+  for (let k = 0; k < reached.length; k++) {
+    const id = reached[k]!;
+    const def = defs.get(id);
+    if (!def || shown.some((x) => x.def === def)) continue;
+    shown.push({ id, def });
+    for (const c of def.children) if (c.type !== "footnoteDefinition") refsOf(c as Nodes, reached);
   }
   // Inline code and math (`a[1]`, `$a[1]$`): never markers (review 4차).
   const inline = (n: Nodes) => {
@@ -283,7 +295,7 @@ function blockUnits(block: string, base: number): Unit[] {
     kind: CitationUnitKind,
     start: number | undefined,
     end: number | undefined,
-    o: { table?: boolean; para?: boolean; footnote?: boolean; item?: boolean; leadIn?: boolean } = {},
+    o: { table?: boolean; para?: boolean; note?: string | undefined; item?: boolean; leadIn?: boolean } = {},
   ) => {
     if (start === undefined || end === undefined || end <= start) return;
     out.push({
@@ -292,7 +304,7 @@ function blockUnits(block: string, base: number): Unit[] {
       kind,
       ...(o.table ? { table: true as const } : {}),
       ...(o.para ? { para: true as const } : {}),
-      ...(o.footnote ? { footnote: true as const } : {}),
+      ...(o.note !== undefined ? { footnote: true as const, note: o.note } : {}),
       ...(o.item ? { item: true as const } : {}),
       ...(o.leadIn ? { leadIn: true as const } : {}),
     });
@@ -300,7 +312,7 @@ function blockUnits(block: string, base: number): Unit[] {
   const paragraph = (
     start: number | undefined,
     end: number | undefined,
-    o: { para?: boolean; footnote?: boolean; item?: boolean },
+    o: { para?: boolean; note?: string | undefined; item?: boolean },
   ) => {
     if (start === undefined || end === undefined) return;
     const t = block.slice(start, end).trim();
@@ -309,10 +321,10 @@ function blockUnits(block: string, base: number): Unit[] {
     const leadIn = LEAD_IN.test(t) && !/[\r\n]/.test(t) && t.length <= 120;
     add("body", start, end, { ...o, leadIn });
   };
-  const blocks = (parent: Parents, footnote: boolean) => {
+  const blocks = (parent: Parents, note: string | undefined) => {
     const kids = parent.children as RootContent[];
     kids.forEach((n) => {
-      const o = { footnote };
+      const o = { note };
       switch (n.type) {
         case "paragraph":
           return paragraph(startOf(n), endOf(n), { ...o, para: parent.type === "root" });
@@ -333,21 +345,23 @@ function blockUnits(block: string, base: number): Unit[] {
             if (first?.type === "paragraph") {
               // The item's own text: from its marker, so the screen's list item starts inside it.
               paragraph(startOf(item), endOf(first), { ...o, item: true });
-              blocks({ ...item, children: rest } as Parents, footnote);
-            } else blocks(item, footnote);
+              blocks({ ...item, children: rest } as Parents, note);
+            } else blocks(item, note);
           }
           return;
         case "blockquote":
-          return blocks(n, footnote);
+          return blocks(n, note);
         case "footnoteDefinition":
-          // Shown (at the end of the answer) only when referred to; its text is not next to the body around it.
-          return shown.has(n) ? blocks(n, true) : undefined;
+          return; // checked below, once, if the screen shows it — never where it is written
+
         default:
           return; // link definitions and anything else that is not shown as a block of text
       }
     });
   };
-  blocks(tree, false);
+  blocks(tree, undefined);
+  // The footnotes the screen shows (at the end of the answer, each one apart from the rest).
+  for (const { id, def } of shown) blocks(def, id);
   return out;
 }
 
@@ -389,6 +403,8 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
       first.kind === "body" &&
       !/\r?\n[ \t]*\r?\n/.test(text.slice(prev.end, first.start))
     ) {
+      // Where it was cut: a table looks only at the fragment in its own part (review 5차).
+      prev.cut = { end: prev.end, start: first.start };
       prev.end = first.end;
       prev.kind = "body";
       delete prev.leadIn;
@@ -406,7 +422,9 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
       kind: u.kind,
       ...(u.table ? { table: true as const } : {}),
       ...(u.footnote ? { footnote: true as const } : {}),
+      ...(u.note !== undefined ? { note: u.note } : {}),
       ...(u.part !== undefined ? { part: u.part } : {}),
+      ...(u.cut ? { cut: u.cut } : {}),
       ...(u.inline ? { inline: true as const } : {}),
     };
     if (!u.leadIn || u.kind !== "body" || u.item) return unit;
@@ -427,6 +445,8 @@ function shownNext<U extends CitationUnit>(blocks: readonly U[], i: number, dir:
     const c = blocks[k]!;
     if (c.inline) continue;
     if (!c.footnote !== !u.footnote) continue;
+    // A footnote's block next to another block of the same footnote only (each footnote is shown apart).
+    if (c.note !== u.note) return undefined;
     return c.part === u.part ? c : undefined;
   }
   return undefined;
@@ -624,9 +644,19 @@ export function uncitedUnits(
 ): TextRange[] {
   const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
   const blocks = units.filter((u) => !u.inline);
+  // A table's neighbours are the fragments of its own text part (review 5차): a paragraph a tool call cut is two
+  // fragments here — one per part — though it is one unit for the check.
+  const frags = blocks.flatMap((u): CitationUnit[] => {
+    if (!u.cut) return [u];
+    const { cut, ...rest } = u;
+    return [
+      { ...rest, end: cut.end },
+      { ...rest, start: cut.start, part: (u.part ?? 0) + 1 },
+    ];
+  });
   const tableCited = (u: CitationUnit) => {
-    const i = blocks.indexOf(u);
-    const prev = shownNext(blocks, i, -1);
+    const i = frags.indexOf(u);
+    const prev = shownNext(frags, i, -1);
     // The sentence before: not another table's last cell (two tables in a row are two tables).
     if (
       prev &&
@@ -636,7 +666,7 @@ export function uncitedUnits(
       cited(lastSentence(text, prev))
     )
       return true;
-    const next = shownNext(blocks, i, 1);
+    const next = shownNext(frags, i, 1);
     if (!next || next.kind === "code" || next.kind === "rule") return false;
     const t = text.slice(next.start, next.end).trim();
     return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(next);

@@ -2075,6 +2075,37 @@ describe("citationNote", () => {
       expect(missingOf([...read("a"), ...text(chain)])).toEqual(["이어서 보이는 사실이에요."]);
     });
 
+    it("review 5차: a table's neighbours are its own part's fragments and its own footnote; nested definitions", () => {
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // Table → caption without a marker → tool row → a cited sentence joined to the caption: the table is not
+      // covered (the marker is in the next part).
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${table}\n\n출처: 전년도 자료.`),
+          ...read("b"),
+          ...text("올해 기준은 별도예요[1]."),
+        ]),
+      ).toEqual([table]);
+      // The reverse: the cited sentence is in the table's part, right before it — covered, though the paragraph
+      // it ends was cut by the tool call.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("앞 문단이고"),
+          ...read("b"),
+          ...text(` 기준은 다음과 같아요[1].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // A footnote's table takes cover only from its own footnote: [^b][^a] shows b's table before a's sentence.
+      const notes =
+        "가[1].[^b][^a]\n\n[^a]: 인용 문장이에요[1].\n\n[^b]: | x | y |\n    |---|---|\n    | 1 | 2 |";
+      expect(missingOf([...read("a"), ...text(notes)])).toEqual(["| x | y |\n    |---|---|\n    | 1 | 2 |"]);
+      // A definition nested in a definition nobody refers to, referred to by the body: shown, so checked once.
+      const nested = "가[1].[^b]\n\n[^a]: 바깥이에요.\n\n    [^b]: 독립적으로 참조한 사실이에요.";
+      expect(missingOf([...read("a"), ...text(nested)])).toEqual(["독립적으로 참조한 사실이에요."]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [

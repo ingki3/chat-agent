@@ -389,6 +389,12 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
     expect(only).toContain("나[1].");
   });
 
+  it("two raw HTML blocks in one quote are two targets, each wrapped where it is (review 5차)", () => {
+    const text = "> <div>첫 블록</div>\n>\n> <div>둘째 블록</div>\n\n가[1].";
+    const html = renderParts([text], rangesOf([text]));
+    expect(targets(html)).toEqual(["<div>첫 블록</div>", "<div>둘째 블록</div>"]);
+  });
+
   it("chips only where the server's marker maps through the source; an entity elsewhere moves nothing (review 4차)", () => {
     const text = "결론이에요[1]. A &amp; B의 x = a[1].length";
     const html = renderToStaticMarkup(

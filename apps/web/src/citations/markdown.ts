@@ -120,8 +120,8 @@ const badge = (): Hast => ({
  * the end of its own text (a table's is drawn by the table component). Its children of *other* ranges (a loose
  * item's second paragraph, a nested item) are still marked for theirs. A range that began in an earlier block or
  * text part (a paragraph cut by a tool call) only gets the bar here: its target is where it starts. A range that
- * starts in this block but has no such element (raw HTML, shown as text) gets the top-level node it starts in,
- * found by its source position, wrapped as its target. Only notes whose ranges are the screen's own blocks
+ * starts in this block but has no such element (raw HTML, shown as text) gets the text node it starts at, found by
+ * its source position at any depth, wrapped where it is as its target. Only notes whose ranges are the screen's own blocks
  * (`units: 2`) are marked (review 4차): a note stored before is only counted, never marked — `Parts` does not pass
  * its ranges here. It runs **before** KaTeX and the highlighter (review 2차): they replace elements and drop
  * source positions, so a target is always chosen by position, never by guessing.
@@ -173,22 +173,35 @@ export function rehypeMissingMarks(
       }
     };
     walk(tree);
-    // A range of this block with no such element: raw HTML, shown as text at the top level (`remarkHtmlAsText`) —
-    // the top-level node it starts in, found by its source position (this runs before KaTeX and the highlighter,
-    // which drop positions), wrapped as its target.
-    const root = (tree.children ??= []);
+    // A range of this block with no such element: raw HTML, shown as text (`remarkHtmlAsText`) — the text node it
+    // starts at, at any depth (two HTML blocks in one quote are two targets, review 5차), found by its source
+    // position (this runs before KaTeX and the highlighter, which drop positions), wrapped where it is.
+    const find = (node: Hast, at: number): { parent: Hast; k: number } | undefined => {
+      const kids = node.children ?? [];
+      for (let k = 0; k < kids.length; k++) {
+        const c = kids[k]!;
+        const s = startOf(c);
+        if (c.type === "text" && s !== undefined && offset + s === at) return { parent: node, k };
+        if (c.type === "element" && c.tagName !== "pre" && c.tagName !== "code") {
+          const hit = find(c, at);
+          if (hit) return hit;
+        }
+      }
+      return undefined;
+    };
     ranges.forEach((r, i) => {
       if (claimed.has(i) || !isOurs(i)) return;
-      const k = root.findIndex((n) => {
-        const s = startOf(n);
-        const e = endOf(n);
-        return s !== undefined && e !== undefined && offset + s <= r.start && offset + e > r.start;
-      });
-      const node = root[k];
-      if (!node || node.properties?.dataCiteMissing) return;
+      const hit = find(tree, r.start);
+      if (!hit) return;
+      const node = hit.parent.children![hit.k]!;
       const props: Record<string, unknown> = { className: ["cite-missing-block", "cite-missing-wrap"] };
       targetProps(props);
-      root.splice(k, 1, { type: "element", tagName: "div", properties: props, children: [node, badge()] });
+      hit.parent.children!.splice(hit.k, 1, {
+        type: "element",
+        tagName: "span",
+        properties: props,
+        children: [node, badge()],
+      });
       claimed.add(i);
     });
   };

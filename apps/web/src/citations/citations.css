@@ -194,6 +194,10 @@ a.cite-title:hover {
   padding-left: 10px;
   scroll-margin: 80px 0;
 }
+/* Raw HTML shown as text, marked where it is (#202 review 5차). */
+.md .cite-missing-wrap {
+  display: block;
+}
 .md li.cite-missing-block::marker {
   color: var(--warn);
 }
