@@ -3,12 +3,12 @@ import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tansta
 import type { NotificationPrefs, PushDevice, SaveNotificationPrefsRequest } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
 import { afterSave } from "../instructions/draft.js";
-import { applySaved, prefsMerge, sharing, type Prefs } from "../instructions/rev.js";
+import { applySaved, prefsFromGet, prefsFromPut, sharing, type Prefs } from "../instructions/rev.js";
 
-const keepPrefs = sharing(prefsMerge);
+const keepPrefs = sharing(prefsFromGet);
 /** A save's answer into the cache, unless a newer revision is there (rev.ts). */
 const applyPrefs = (qc: QueryClient, v: NotificationPrefs) =>
-  applySaved<Prefs>(qc, PREFS_KEY, (old) => prefsMerge(old, { ...v, rev: v.rev ?? 0 }));
+  applySaved<Prefs>(qc, PREFS_KEY, (old) => prefsFromPut(old, { ...v, rev: v.rev ?? 0 }));
 import {
   browserState,
   disablePush,

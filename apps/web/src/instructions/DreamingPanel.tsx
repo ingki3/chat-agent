@@ -17,7 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
-import { applySaved, mineFromGet, mineFromPut, sharing } from "./rev.js";
+import { applySaved, mineFromGet, mineFromPut, sharing, type Cached } from "./rev.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -50,11 +50,7 @@ export function DreamingPanel() {
         </p>
       )}
       <p className="small" data-testid="dreaming-state">
-        {d.enabled
-          ? `기억 정리가 매일 ${d.time ?? ""}(한국 시각)에 새 메시지를 정리해요. 반영 방식은 위의 "기억 반영 방식"을 따라요.`
-          : d.problem
-            ? `기억 정리가 켜져 있지만 돌지 않아요: ${DREAMING_PROBLEM_LABEL[d.problem]}`
-            : "기억 정리가 꺼져 있어요. 켜면 하루 한 번, 정한 시각에 새 메시지를 정리해요."}
+        {stateText(d, q.isError)}
       </p>
       <Settings view={d} />
       <Prompt view={d} />
@@ -77,6 +73,24 @@ export function DreamingPanel() {
       </pre>
     </div>
   );
+}
+
+/**
+ * The status sentence (review #195 11): the switch and the time from the **stored** settings (the newest revision —
+ * a save shows at once), gated by the live state of the last GET. While the stored settings are newer than that GET
+ * (`rev > liveRev`), whether it really runs is not known yet: "확인 중…", or "최신 상태 확인 실패" when the refetch
+ * failed. The server-wide switch is the admin's (not the user's settings): its live state always applies.
+ */
+export function stateText(d: Cached<MyDreaming>, refetchFailed: boolean): string {
+  const s = d.settings;
+  const pending = d.rev > (d.liveRev ?? d.rev);
+  if (!s.enabled) return "기억 정리가 꺼져 있어요. 켜면 하루 한 번, 정한 시각에 새 메시지를 정리해요.";
+  if (d.problem === "server_off")
+    return `기억 정리가 켜져 있지만 돌지 않아요: ${DREAMING_PROBLEM_LABEL.server_off}`;
+  if (pending)
+    return `기억 정리를 매일 ${s.time}(한국 시각)에 하도록 저장했어요 — ${refetchFailed ? "최신 상태 확인 실패" : "확인 중…"}`;
+  if (d.problem) return `기억 정리가 켜져 있지만 돌지 않아요: ${DREAMING_PROBLEM_LABEL[d.problem]}`;
+  return `기억 정리가 매일 ${d.time ?? s.time}(한국 시각)에 새 메시지를 정리해요. 반영 방식은 위의 "기억 반영 방식"을 따라요.`;
 }
 
 export const choiceKey = (c: {

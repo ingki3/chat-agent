@@ -18,7 +18,8 @@ import { entryBytes, gatherInput } from "../src/dreaming/input.js";
 import { compose } from "../src/notifications/compose.js";
 import { RuntimeRegistry } from "../src/runtime/adapter.js";
 import { defaultScript, FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
-import { knownSecrets } from "../src/secrets/known.js";
+import { KnownSecrets, knownSecrets } from "../src/secrets/known.js";
+import { StoredRescrub } from "../src/secrets/rescrub.js";
 import { createFamily, type Family } from "./helpers/permission-matrix.js";
 
 /**
@@ -1083,6 +1084,27 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
       })
     ).json<{ rev: number }>().rev;
     expect(n2).toBe(n1 + 1);
+  });
+
+  it("revisions (review 11): a background rescrub of the stored prompt is a write — its revision goes up", async () => {
+    const s = await start();
+    const owner = s.uid("owner");
+    const secret = `late-dream-${"q".repeat(8)}${Date.now()}`;
+    // Stored before anyone knew it was a secret (written raw).
+    await s.req("owner", "PUT", "/api/dreaming/prompt", { content: "취미만" });
+    s.sql.prepare("update dreaming_users set prompt = ? where user_id = ?").run(`취미만 ${secret}`, owner);
+    const before = s.d.store.state(owner).rev;
+    const reg = new KnownSecrets();
+    const r = new StoredRescrub(s.db, { registry: reg, delayMs: 1 });
+    reg.add(secret);
+    await r.idle();
+    r.close();
+    const after = s.d.store.state(owner);
+    expect(after.prompt).not.toContain(secret);
+    expect(after.rev).toBe(before + 1);
+    // Rows the scrub did not change keep their revision.
+    const other = s.d.store.state(s.uid("shared")).rev;
+    expect(s.d.store.state(s.uid("shared")).rev).toBe(other);
   });
 
   it("youth (review 1): 반영 방식 locked too; the admin sets its 반영 방식 and prompt (write-only)", async () => {
