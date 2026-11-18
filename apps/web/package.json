@@ -11,6 +11,7 @@
     "@agentlee/shared": "workspace:*",
     "@tanstack/react-query": "5.105.0",
     "katex": "0.16.47",
+    "mermaid": "12.3.0",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "react-markdown": "10.1.0",

@@ -48,6 +48,8 @@ import {
  *   /burst <n>        n words as fast as possible, in paragraphs (rendering performance, #14)
  *   /md               markdown sample: GFM table, code blocks, KaTeX math, links (#14)
  *   /xss              hostile markup that must never run (#14)
+ *   /mdecho           (next lines: markdown) answers exactly that markdown, a few characters at a time; a line
+ *                     `@@pause@@` is not sent but waits 1.5 s there (a diagram half-streamed, #182)
  *   /secrettool       a tool call whose input and output carry secret-looking fields (#14)
  *   /cite <scenario>   real calls of our web and citation tools on the fixture pages (`fake-citations.ts`:
  *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
@@ -394,6 +396,18 @@ export function scheduleSteps(t: string): FakeStep[] | undefined {
 /** The turn's text without the server's attachment marker lines (#149): scripts match the typed text. */
 const typedText = (text: string) => text.replace(/(?:\n*\[첨부 파일: [^\n]*\])+\s*$/u, "");
 
+/** `/mdecho`: the markdown streamed 12 characters at a time, waiting 1.5 s at each `@@pause@@` line. */
+function mdEchoSteps(body: string): FakeStep[] {
+  const steps: FakeStep[] = [];
+  body.split("\n@@pause@@\n").forEach((part, i, all) => {
+    const text = i < all.length - 1 ? `${part}\n` : part;
+    for (let at = 0; at < text.length; at += 12)
+      steps.push({ text: text.slice(at, at + 12) }, { delayMs: 10 });
+    if (i < all.length - 1) steps.push({ delayMs: 1500 });
+  });
+  return steps;
+}
+
 export const defaultScript: FakeScript = (input, memory) => {
   const t = input.text.trim();
   if (t.startsWith(SUMMARY_MARKER))
@@ -447,6 +461,7 @@ export const defaultScript: FakeScript = (input, memory) => {
     ];
   if (t === "/md") return FAKE_MARKDOWN.flatMap((text) => [{ text }, { delayMs: 15 }]);
   if (t === "/xss") return FAKE_XSS.map((text) => ({ text }));
+  if (t.startsWith("/mdecho\n")) return mdEchoSteps(typedText(input.text).trim().slice("/mdecho\n".length));
   if (t === "/secrettool")
     return [
       { text: "검색할게요. " },

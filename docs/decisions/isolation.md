@@ -452,6 +452,23 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **서버 쪽 렌더링(원본 직접 열기·PDF):** `markdown.ts` — micromark + GFM + 수식(이미 lockfile에 있던 판, 새 패키지 없음). `allowDangerousHtml`·`allowDangerousProtocol` 끔, 그림은 링크로 바꿈, 수식은 MathML(스타일시트 불필요). 페이지는 스크립트 없는 CSP 그대로다.
 - **빈 화면의 원인:** 예전 `text/plain` 서빙은 브라우저의 글자 보기 문서가 `color-scheme: light dark`라 시스템이 다크 모드일 때 흰 글자·투명 배경이 되고, 프레임의 `background: #fff` 위에서 아무것도 보이지 않았다.
 
+## mermaid 다이어그램 (#182)
+
+채팅 답변과 앱 안 아티팩트 페이지(`/a/:id`)의 ` ```mermaid ` 블록을 공식 `mermaid`로 그린다(`chat/mermaid.ts`·`MermaidBlock.tsx`, `chat/Markdown.tsx`의 `CodeBlock`에서 갈라짐). 다이어그램 원본은 모델 출력이라 믿지 않는다.
+
+- **SVG는 페이지 DOM에 넣지 않고 `<img src="blob:…">`로만 보인다.** 그림으로 불러온 SVG 문서에서는 브라우저가 스크립트·이벤트 처리기·링크 이동·외부 자원 불러오기를 하지 않는다. 그래서 mermaid의 살균(DOMPurify)이나 우리 전처리에 구멍이 있어도 그림 안의 `<script>`·`onerror`·`javascript:` 링크는 실행될 곳이 없다 — 살균은 첫 겹, 이미지 격리가 마지막 겹이다. `innerHTML`로 SVG를 넣는 방식(mermaid 기본)은 살균 하나에만 기대므로 쓰지 않았다. iframe(`securityLevel: "sandbox"`)은 높이 맞추기·다크 모드·저장이 번거롭고 CSP `frame-src`가 필요해 쓰지 않았다. blob URL은 같은 SVG를 보는 블록이 없어지면 1초 뒤 해제한다(같은 그림을 다시 보이는 재마운트는 같은 URL을 다시 씀). PNG 저장은 그 이미지를 캔버스에 그려 만든다(SVG 글자를 다시 해석하지 않음).
+- **앱 CSP는 그대로다**(`apps/server/src/app.ts`: `script-src 'self'`, `img-src 'self' data: blob:`). mermaid는 `eval`·인라인 스크립트 없이 이 CSP 안에서 돈다(e2e가 CSP 위반 보고가 없음을 확인). 한 가지: 악성 라벨(`<b onmouseover=…>`)을 DOMPurify가 비활성 `<template>` 안에서 해석할 때 Chrome이 "inline event handler" CSP 보고를 남긴다 — 실행이 아니라 해석만으로 남는 보고다(빈 `template`·`DOMParser` 문서에서도 같음을 확인). 페이지의 어떤 요소에도 `on*` 속성이 없고 아무것도 실행되지 않음을 e2e가 따로 확인한다.
+- **설정은 앱이 정한다:** `startOnLoad: false`, `securityLevel: "strict"`(click·callback 끔, 라벨 살균), `htmlLabels: false`(`flowchart.htmlLabels`도 — 라벨이 SVG 글자라 그림에서도 보이고 `foreignObject` HTML이 없다), `suppressErrorRendering: true`(오류 그림을 페이지에 넣지 않음), `maxTextSize` 2만, `maxEdges` 500, 테마(`default`/`dark`)와 한글 글꼴 목록. `secure`에 보안·테마 키를 더해 지시문이 바꾸지 못하게 한다.
+- **원본 전처리:** 그리기 전에 `%%{ … }%%` 지시문(닫히지 않은 것은 줄 끝까지 — mermaid는 닫히지 않은 것도 끝까지 읽는다)과 맨 앞의 `---` 설정 머리말을 없앤다. 지운 결과가 새 `%%{`를 만들면 남지 않을 때까지 되풀이한다. 테마·보안을 다이어그램이 바꾸는 길은 지시문·머리말 둘뿐이고 둘 다 지운다(`secure`가 두 번째 겹).
+- **측정용 요소:** mermaid는 글자 크기를 재려고 실제 요소가 필요하다. 화면 밖(`position: fixed; left: -10000px; visibility: hidden`) 우리 `div`를 넘기고 그리기가 끝나면 지운다. 그 안에 잠시 들어가는 것은 mermaid가 살균한 SVG 글자 노드뿐이다(HTML 라벨 끔).
+- **한도:** 원본 2만 자, SVG 2백만 자, 그리기 하나에 10초. 그리기는 큐로 한 번에 하나(그래서 테마 초기화가 겹치지 않음). 시간 초과는 기다림만 끝낸다 — mermaid 호출 자체는 취소할 수 없어 뒤에서 끝날 수 있고, 다음 그리기는 큐에서 바로 이어진다. 넘으면 코드 블록 + 안내.
+- **스트리밍:** 닫는 펜스가 온 블록만 그린다(블록의 마크다운 원문에서 마지막 줄이 여는 펜스와 같은 문자·같거나 긴 길이인지 — `fenceClosed`). 결과는 테마+원본으로 64개까지 기억해, 저장된 답이 흐르던 답을 대신할 때 코드가 다시 보이지 않는다.
+- **불러오기:** `import("mermaid")` — 첫 다이어그램을 그릴 때만, 별도 청크. 첫 로드 청크(입구와 그것이 정적으로 가져오는 청크)에 mermaid 모듈이 있으면 빌드가 실패한다(`apps/web/build/entry-check.ts`, vite 플러그인). 서비스 워커는 `/`만 미리 캐시하고 `/assets/`는 받아 본 것만 캐시하므로 mermaid 청크는 다이어그램을 본 브라우저에만 남는다(사전 캐시 목록 없음 — `vite-plugin-pwa` 미사용).
+- **고치기:** 문법 오류면 "다이어그램 고치기"가 오류(500자까지)와 원본을 담은 사용자 메시지를 이 대화에 보낸다 — 입력창과 같은 `conversations.send`. 진행 중인 run이 있으면 꺼진다. 대화가 아닌 곳(아티팩트 페이지)에는 없다. 모델이 다시 쓴 다이어그램도 같은 경로로 그린다.
+- **새 의존성(정확한 버전, 2주 이상 된 것):** `mermaid` 12.3.0(2026-11-03). 새로 lockfile에 들어온 전이 의존성 113개는 모두 2026-11-04 이전 배포(가장 늦은 것 `d3` 7.9.2, 2026-11-03)다. 최신이 2주가 안 된 넷은 `pnpm.overrides`로 고정: `dompurify` 3.4.17(2026-10-12, 최신 3.4.18은 11-14), `cytoscape` 3.34.4(2026-10-15, 3.35.0은 11-10), `es-toolkit` 1.53.1(2026-10-30, 1.53.2는 11-06), `commander@15` 15.0.0(2026-05-29, katex 0.18 → 15.1.0은 11-07). 3.4.18의 바뀐 점(SAFE_FOR_TEMPLATES 우회, 허용 목록 정리)은 mermaid가 쓰지 않는 설정이거나 이미지 격리 뒤의 일이라 2주를 기다린다.
+- **덤으로 고친 것:** Vite가 4KB 미만 KaTeX 글꼴을 `data:` URL로 CSS에 넣고 있었는데 CSP(`default-src 'self'`, `font-src` 없음)가 막았다(이번 e2e의 CSP 검사에서 드러남). 글꼴은 늘 파일로 내보낸다(`build.assetsInlineLimit`).
+- **남은 것:** 서버가 보내는 원본 페이지·PDF 내보내기의 다이어그램(#183 — 지금은 코드 블록).
+
 ## 인용 검증 (#25)
 `cite`·`sources_list`는 프로세스를 띄우지 않는 서버 도구다(`apps/server/src/citations/`, 도구 정의 `packages/mcp-tools/src/web.ts`). 네트워크에 나가지 않는다 — #50이 저장한 본문만 읽는다. 운영은 `docs/ops.md` §22.
 
