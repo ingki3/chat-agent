@@ -374,3 +374,113 @@ test("다른 곳에서 바꾼 값은 지키고, 새로 불러오기에 실패해
   await expect(time).toHaveValue("04:44");
   await page.unroute("**/api/dreaming");
 });
+
+const STALE = "저장했지만 최신 상태를 불러오지 못했어요";
+
+/** Makes GETs of `url` fail (503) — the save went through, the refetch after it does not. */
+async function failReads(page: Page, url: string) {
+  await page.route(url, (route) =>
+    route.request().method() === "GET"
+      ? route.fulfill({ status: 503, contentType: "application/json", body: '{"error":"unavailable"}' })
+      : route.fallback(),
+  );
+}
+
+test("저장은 됐지만 다시 불러오기에 실패하면 보낸 값을 그대로 두고 알린다 (리뷰 #195 6차)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "dreamstale");
+  await signIn(page, baseURL!, me);
+  const api = async <T>(url: string) => (await (await page.request.get(url)).json()) as T;
+
+  // 내 지침 → 기억 정리: settings, prompt, 기억 반영 방식.
+  await page.goto("/settings/instructions?doc=dreams");
+  const settings = page.getByTestId("dreaming-settings");
+  const panel = page.getByTestId("dreaming-panel");
+  await expect(settings.getByLabel("실행 시각")).toHaveValue("03:00");
+  await failReads(page, "**/api/dreaming");
+  await failReads(page, "**/api/memory-prefs");
+  await settings.getByLabel("실행 시각").fill("11:10");
+  await settings.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(settings.getByRole("status")).toContainText(STALE);
+  await expect(settings.getByLabel("실행 시각")).toHaveValue("11:10");
+  expect((await api<{ settings: { time: string } }>("/api/dreaming")).settings.time).toBe("11:10");
+  await panel.getByText(/지금 쓰는 정리 프롬프트/).click();
+  const prompt = panel.getByTestId("dreaming-prompt");
+  await prompt.fill("프롬프트 B");
+  await panel.getByRole("button", { name: "프롬프트 저장" }).click();
+  await expect(panel.getByRole("status").filter({ hasText: STALE }).last()).toBeVisible();
+  await expect(prompt).toHaveValue("프롬프트 B");
+  expect((await api<{ prompt: { content: string } }>("/api/dreaming")).prompt.content).toBe("프롬프트 B");
+  await page.getByRole("radio", { name: /자동 반영/ }).check();
+  await expect(page.getByTestId("memory-mode").getByRole("status")).toContainText(STALE);
+  await expect(page.getByRole("radio", { name: /자동 반영/ })).toBeChecked();
+  expect((await api<{ applyMode: string }>("/api/memory-prefs")).applyMode).toBe("auto");
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+
+  // 설정 → 알림: the 기억 정리 toggle and quiet hours (also: locked while a save is in flight).
+  await page.goto("/settings");
+  const failed = page.getByRole("checkbox", { name: "내 기억 정리가 실패했을 때" });
+  await expect(failed).toBeChecked();
+  const on = page.getByLabel("사용", { exact: true });
+  await expect(on).toBeEnabled();
+  const held = await holdRequests(page, "**/api/notifications/prefs");
+  await on.check();
+  await page.getByLabel("방해 금지 시작").fill("22:00");
+  await page.getByLabel("방해 금지 끝").fill("06:00");
+  await page.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(page.getByLabel("방해 금지 시작")).toBeDisabled();
+  await expect(page.getByLabel("방해 금지 시작")).toHaveValue("22:00");
+  held.release();
+  await expect(page.getByText("저장했어요.")).toBeVisible();
+  await expect(page.getByLabel("방해 금지 시작")).toHaveValue("22:00");
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await failReads(page, "**/api/notifications/prefs");
+  await failed.uncheck();
+  await expect(page.getByTestId("memory-notifications-stale")).toContainText(STALE);
+  await expect(failed).not.toBeChecked();
+  await page.getByLabel("방해 금지 시작").fill("21:00");
+  await page.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(page.getByText(STALE).first()).toBeVisible();
+  await expect(page.getByLabel("방해 금지 시작")).toHaveValue("21:00");
+  expect(await api<{ quietStart: string; memoryFailed: boolean }>("/api/notifications/prefs")).toMatchObject({
+    quietStart: "21:00",
+    quietEnd: "06:00",
+    memoryFailed: false,
+  });
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+
+  // The admin: a youth account's 반영 방식 and the server settings' token cap.
+  const son = await newMember(browser, baseURL!, "dreamstaleyouth", true);
+  await asAdmin(browser, baseURL!, async (admin) => {
+    await admin.goto("/admin?tab=dreaming");
+    const row = admin.getByTestId("dreaming-user").filter({ hasText: son.name });
+    const mode = row.getByRole("combobox", { name: `${son.name} 반영 방식` });
+    await expect(mode).toHaveValue("review");
+    await failReads(admin, "**/api/admin/dreaming");
+    await mode.selectOption("auto");
+    await expect(admin.getByTestId("dreaming-youth-stale")).toContainText(STALE);
+    await expect(mode).toHaveValue("auto");
+    const cap = admin.getByTestId("dreaming-config").getByLabel("1회 토큰 상한");
+    const before = await cap.inputValue();
+    await cap.fill("302000");
+    await admin
+      .getByTestId("admin-dreaming")
+      .getByRole("button", { name: "저장", exact: true })
+      .first()
+      .click();
+    await expect(admin.getByRole("status").filter({ hasText: STALE }).first()).toBeVisible();
+    await expect(cap).toHaveValue("302000");
+    await admin.unrouteAll({ behavior: "ignoreErrors" });
+    // Back as it was (other tests share the server).
+    await cap.fill(before);
+    await admin
+      .getByTestId("admin-dreaming")
+      .getByRole("button", { name: "저장", exact: true })
+      .first()
+      .click();
+    await expect(admin.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+  });
+});

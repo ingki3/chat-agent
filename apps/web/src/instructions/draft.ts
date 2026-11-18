@@ -6,8 +6,9 @@
  * - A save sends only those fields; the server merges them into what is stored (the same field from two places: the
  *   later write wins — no versions in a family-sized app).
  * - After a save the form refetches (the cache is never replaced by a mutation's response, which could be older than
- *   what another form saved meanwhile) and drops the fields it sent only if they still hold what was sent — anything
- *   typed after sending stays. A failed save keeps the draft. The forms are locked while saving.
+ *   what another form saved meanwhile — `sync.ts`) and, **only if that refetch succeeded**, drops the fields it sent
+ *   that still hold what was sent — anything typed after sending stays. A refetch that fails keeps the draft and says
+ *   "저장했지만 최신 상태를 불러오지 못했어요"; a refused save keeps the draft and says why. Forms are locked while saving.
  */
 
 /** The value a form shows: the server's, with the person's changes on top. */
@@ -29,7 +30,7 @@ export function settleDraft<T extends object>(
   return Object.keys(left).length ? left : undefined;
 }
 
-/** A single-value draft (a prompt box): cleared after a save only if it still holds what was sent. */
+/** A whole-value draft (a prompt box, a quiet-hours pair): cleared after a save only if it still holds what was sent. */
 export function afterSave<T>(current: T, submitted: T, cleared: T): T {
-  return current === submitted ? cleared : current;
+  return same(current, submitted) ? cleared : current;
 }

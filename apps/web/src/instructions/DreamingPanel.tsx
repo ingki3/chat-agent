@@ -17,6 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
+import { resync, SAVED_STALE } from "./sync.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -99,8 +100,11 @@ export function DreamingSettingsForm({
   pending: boolean;
   /** Prefix of the accessible names (a row of the admin's table names its user). */
   label?: string;
-  /** Saves only the changed fields; resolves once saved and refetched, rejects when refused (the caller says why). */
-  onSave: (s: SaveDreamingSettingsRequest) => Promise<unknown>;
+  /**
+   * Saves only the changed fields; resolves `true` once saved and refetched, `false` when saved but the refetch failed
+   * (the draft stays), rejects when refused (the caller says why).
+   */
+  onSave: (s: SaveDreamingSettingsRequest) => Promise<boolean>;
 }) {
   // Only the changed fields (draft.ts): the others follow the server.
   const [draft, setDraft] = useState<Partial<DreamingSettings>>();
@@ -117,7 +121,9 @@ export function DreamingSettingsForm({
         if (pending || draft === undefined) return;
         const sent = draft;
         void onSave(sent).then(
-          () => setDraft((cur) => settleDraft(cur, sent)),
+          (synced) => {
+            if (synced) setDraft((cur) => settleDraft(cur, sent));
+          },
           () => {},
         );
       }}
@@ -180,14 +186,12 @@ export function DreamingSettingsForm({
 
 function Settings({ view }: { view: MyDreaming }) {
   const qc = useQueryClient();
-  const [saved, setSaved] = useState(false);
-  // The answer is not put in the cache (it could be older than another form's save): refetched instead.
+  // The answer is not put in the cache (it could be older than another form's save): saved, then refetched
+  // (sync.ts) — `data` says whether the screen caught up.
   const save = useMutation({
-    mutationFn: (s: SaveDreamingSettingsRequest) => dreaming.save(s),
-    onMutate: () => setSaved(false),
-    onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: DREAMING_KEY });
-      setSaved(true);
+    mutationFn: async (s: SaveDreamingSettingsRequest) => {
+      await dreaming.save(s);
+      return resync(qc, DREAMING_KEY);
     },
   });
   return (
@@ -205,9 +209,9 @@ function Settings({ view }: { view: MyDreaming }) {
         pending={save.isPending}
         onSave={(s) => save.mutateAsync(s)}
       />
-      {saved && (
+      {save.isSuccess && (
         <p className="small" role="status">
-          저장했어요.
+          {save.data ? "저장했어요." : SAVED_STALE}
         </p>
       )}
       {save.isError && (
@@ -226,10 +230,13 @@ function Prompt({ view }: { view: MyDreaming }) {
   const content = text ?? view.prompt.content;
   // `typed`: the editor's draft when the save was sent — cleared on success only if it is still the same.
   const save = useMutation({
-    mutationFn: (a: { content: string | null; typed: string | undefined }) => dreaming.savePrompt(a.content),
-    onSuccess: async (_v, a) => {
-      await qc.invalidateQueries({ queryKey: DREAMING_KEY });
-      setText((cur) => afterSave(cur, a.typed, undefined));
+    mutationFn: async (a: { content: string | null; typed: string | undefined }) => {
+      await dreaming.savePrompt(a.content);
+      return resync(qc, DREAMING_KEY);
+    },
+    // Only once the fresh prompt is on screen; a failed refetch keeps the text (and says so).
+    onSuccess: (synced, a) => {
+      if (synced) setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });
   // 미리 실행 runs the prompt **saved on the server** (it sends none — review #195 5): what the next run would use.
@@ -281,6 +288,11 @@ function Prompt({ view }: { view: MyDreaming }) {
       {view.canEdit && text !== undefined && (
         <p className="small muted">
           미리 실행은 저장된 프롬프트로 돌아요. 고친 내용은 저장한 뒤 미리 실행해 보세요.
+        </p>
+      )}
+      {save.isSuccess && !save.data && (
+        <p className="small" role="status">
+          {SAVED_STALE}
         </p>
       )}
       {(save.isError || run.isError) && (

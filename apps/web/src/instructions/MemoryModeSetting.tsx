@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MEMORY_APPLY_MODE_LABEL, MemoryApplyMode } from "@agentlee/shared";
 import { errorText, MEMORY_PREFS_KEY, memoryPrefs } from "../api.js";
+import { resync, SAVED_STALE } from "./sync.js";
 
 const HELP: Record<MemoryApplyMode, string> = {
   review: '대화 중 "기억해줘·잊어줘"는 답 아래 카드에서 반영을 눌러야 바뀌어요.',
@@ -15,14 +16,18 @@ const HELP: Record<MemoryApplyMode, string> = {
 export function MemoryModeSetting() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: MEMORY_PREFS_KEY, queryFn: memoryPrefs.get });
-  // The choice shows at once (a controlled radio would snap back until the save answers); a failed save shows the
-  // stored one again.
+  // The choice shows at once (a controlled radio would snap back until the save answers); a refused save shows the
+  // stored one again; a save whose refetch failed keeps showing the choice (and says so — sync.ts).
   const [picked, setPicked] = useState<MemoryApplyMode | null>(null);
   const save = useMutation({
-    mutationFn: (m: MemoryApplyMode) => memoryPrefs.set(m),
-    // Refetched, never the answer into the cache (review #195 5).
-    onSuccess: () => qc.invalidateQueries({ queryKey: MEMORY_PREFS_KEY }),
-    onSettled: () => setPicked(null),
+    mutationFn: async (m: MemoryApplyMode) => {
+      await memoryPrefs.set(m);
+      return resync(qc, MEMORY_PREFS_KEY);
+    },
+    onSuccess: (synced) => {
+      if (synced) setPicked(null);
+    },
+    onError: () => setPicked(null),
   });
   const mode = picked ?? q.data?.applyMode;
   return (
@@ -58,6 +63,11 @@ export function MemoryModeSetting() {
           </label>
         ))}
       </fieldset>
+      {save.isSuccess && !save.data && (
+        <p className="small" role="status">
+          {SAVED_STALE}
+        </p>
+      )}
       {(q.isError || save.isError) && (
         <p className="error small" role="alert">
           {errorText(q.error ?? save.error)}

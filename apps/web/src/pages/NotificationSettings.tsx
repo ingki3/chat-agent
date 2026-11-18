@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PushDevice, SaveNotificationPrefsRequest } from "@agentlee/shared";
 import { errorText, notifications, push } from "../api.js";
+import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
+import { resync, SAVED_STALE } from "../instructions/sync.js";
 import {
   browserState,
   disablePush,
@@ -205,43 +207,46 @@ function QuietHours() {
   const qc = useQueryClient();
   const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
   const [draft, setDraft] = useState<{ on: boolean; start: string; end: string }>();
-  const [saved, setSaved] = useState(false);
+  const [saved, setSaved] = useState<"saved" | "stale">();
   const value = draft ?? {
     on: !!prefs.data?.quietStart,
     start: prefs.data?.quietStart ?? "23:00",
     end: prefs.data?.quietEnd ?? "07:00",
   };
   const save = useMutation({
-    mutationFn: () => {
+    // `sent`: the draft as it was when saved — what the form compares against afterwards.
+    mutationFn: async (sent: typeof value) => {
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Seoul";
       // Only the quiet hours (and the zone they are in): the server keeps the rest as stored (#188 review 5).
-      const p: SaveNotificationPrefsRequest = value.on
-        ? { quietStart: value.start, quietEnd: value.end, timeZone }
+      const p: SaveNotificationPrefsRequest = sent.on
+        ? { quietStart: sent.start, quietEnd: sent.end, timeZone }
         : { quietStart: null, quietEnd: null, timeZone };
-      return notifications.setPrefs(p);
+      await notifications.setPrefs(p);
+      return resync(qc, PREFS_KEY);
     },
-    // Refetched, never the answer into the cache (it could be older than a toggle saved meanwhile).
-    onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: PREFS_KEY });
-      setDraft(undefined);
-      setSaved(true);
+    // Refetched, never the answer into the cache (it could be older than a toggle saved meanwhile); the draft goes only
+    // once the refetch worked and only if it is still what was sent (review #195 6).
+    onSuccess: (synced, sent) => {
+      if (synced) setDraft((cur) => (cur === undefined ? cur : afterSave(cur, sent, undefined)));
+      setSaved(synced ? "saved" : "stale");
     },
   });
   const edit = (v: Partial<typeof value>) => {
-    setSaved(false);
+    setSaved(undefined);
     setDraft({ ...value, ...v });
   };
   const invalid = value.on && value.start === value.end;
   // Not editable before the saved value is here (#103): an edit made on the defaults would be the draft, and the
   // save would overwrite what was stored (and a tick could land just as the stored "on" arrives, undoing itself).
-  const loading = !prefs.data;
+  // Locked while saving too (review #195 6): nothing typed meanwhile can be lost, no second submit.
+  const loading = !prefs.data || save.isPending;
 
   return (
     <form
       className="quiet"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!invalid) save.mutate();
+        if (!invalid && !save.isPending) save.mutate(value);
       }}
     >
       <h3>방해 금지 시간</h3>
@@ -290,7 +295,7 @@ function QuietHours() {
       )}
       {saved && (
         <p className="small" role="status">
-          저장했어요.
+          {saved === "saved" ? "저장했어요." : SAVED_STALE}
         </p>
       )}
     </form>
@@ -301,12 +306,29 @@ function QuietHours() {
 function MemoryNotifications() {
   const qc = useQueryClient();
   const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs });
+  type Toggles = { memoryProposals: boolean; memoryApplied: boolean; memoryFailed: boolean };
+  // The toggles as stored, with a choice on top until the refetch shows it (draft.ts / sync.ts, review #195 6).
+  const [draft, setDraft] = useState<Partial<Toggles>>();
+  const shown = withDraft<Toggles>(
+    {
+      memoryProposals: prefs.data?.memoryProposals !== false,
+      memoryApplied: prefs.data?.memoryApplied !== false,
+      memoryFailed: prefs.data?.memoryFailed !== false,
+    },
+    draft,
+  );
   const save = useMutation({
     // Only the toggled field (#188 review 5): never the whole object, which would overwrite quiet hours saved meanwhile.
-    mutationFn: (
-      patch: Pick<SaveNotificationPrefsRequest, "memoryProposals" | "memoryApplied" | "memoryFailed">,
-    ) => notifications.setPrefs(patch),
-    onSuccess: () => qc.invalidateQueries({ queryKey: PREFS_KEY }),
+    mutationFn: async (patch: Partial<Toggles>) => {
+      await notifications.setPrefs(patch);
+      return resync(qc, PREFS_KEY);
+    },
+    onMutate: (patch) => setDraft((d) => ({ ...d, ...patch })),
+    onSuccess: (synced, patch) => {
+      if (synced) setDraft((cur) => settleDraft(cur, patch));
+    },
+    // Refused: back to what is stored.
+    onError: (_e, patch) => setDraft((cur) => settleDraft(cur, patch)),
   });
   const loading = !prefs.data || save.isPending;
   return (
@@ -317,7 +339,7 @@ function MemoryNotifications() {
       <label className="row">
         <input
           type="checkbox"
-          checked={prefs.data?.memoryProposals !== false}
+          checked={shown.memoryProposals}
           disabled={loading}
           onChange={(e) => save.mutate({ memoryProposals: e.target.checked })}
         />{" "}
@@ -326,7 +348,7 @@ function MemoryNotifications() {
       <label className="row">
         <input
           type="checkbox"
-          checked={prefs.data?.memoryApplied !== false}
+          checked={shown.memoryApplied}
           disabled={loading}
           onChange={(e) => save.mutate({ memoryApplied: e.target.checked })}
         />{" "}
@@ -335,7 +357,7 @@ function MemoryNotifications() {
       <label className="row">
         <input
           type="checkbox"
-          checked={prefs.data?.memoryFailed !== false}
+          checked={shown.memoryFailed}
           disabled={loading}
           onChange={(e) => save.mutate({ memoryFailed: e.target.checked })}
         />{" "}
@@ -344,6 +366,11 @@ function MemoryNotifications() {
       <p className="muted small">
         알림에는 개수·이유만 적혀요. 내용과 기억 정리 설정은 설정 → 내 지침에서 봐요.
       </p>
+      {save.isSuccess && !save.data && (
+        <p className="small" role="status" data-testid="memory-notifications-stale">
+          {SAVED_STALE}
+        </p>
+      )}
       {save.isError && (
         <p className="error small" role="alert">
           {errorText(save.error)}
