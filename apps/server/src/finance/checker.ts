@@ -8,26 +8,30 @@ import {
   type FinanceNotePart,
   type MessagePart,
 } from "@agentlee/shared";
-import { isFinanceTool } from "../instructions/assemble.js";
+import { sourceKindOf } from "../sources/provenance.js";
 
 /**
- * The common finance output check (#30, PRD FR-7.6·7.8). It runs on every answer that used a finance tool — for
- * every user, in follow-up answers anywhere later in a conversation that has finance results (finance/results.ts),
- * in scheduled runs (#33
- * starts them through the same run manager) and on partial answers recovered after a restart — whichever runtime
- * wrote it:
- * - collects the sources, as-of times and numbers the tools returned;
- * - checks the answer **figure by figure**: each figure needs its source and its as-of date (and, for an intraday
- *   value, the time with its zone) in the same sentence or in a sentence without figures of the same paragraph
- *   (a header or a footnote). A figure that equals a tool value must name *that* value's source and date;
- * - appends a `finance_note` part with the sources, what was missing, and the disclaimer.
+ * The finance part of an answer's source note (#30, #185, PRD FR-7.6·7.8). Finance results are one kind of source
+ * (`sources/provenance.ts`): the note is due **only when this answer called a finance tool** — never because the
+ * answer's text has figures or because earlier answers of the conversation used finance tools (#185: that
+ * conversation-wide carry-over put finance sources and the disclaimer under answers that used none). It runs on
+ * every such answer — any user, scheduled runs (#33), stopped answers and partial answers recovered after a restart —
+ * whichever runtime wrote it:
+ * - collects the sources (provider, as-of time and zone, delayed, kind) and the numbers this answer's finance tools
+ *   returned;
+ * - checks the answer **figure by figure** against them: each figure needs its source and its as-of date (and, for
+ *   an intraday value, the time with its zone) in the same sentence or in a sentence without figures of the same
+ *   paragraph (a header or a footnote). A figure that equals a tool value must name *that* value's source and date.
+ *   The check only says what to warn about; whether there is a note at all is decided by the tool calls alone;
+ * - returns a `finance_note` part with the sources, what was missing, and the disclaimer. The chat screen shows it
+ *   in the answer's one source note, with the citation note (`citations/checker.ts`) if there is one.
  * The note is the server's, after the runtime's text: a runtime cannot leave it out or word it away.
  */
 
 /** One number a finance tool returned, with the label of its stamp. */
 export type FinanceValue = { n: number; source: FinanceSource };
 
-/** What finance tool calls returned (one answer, or the recent conversation). */
+/** What one answer's finance tool calls returned. */
 export type FinanceEvidence = {
   /** A finance tool was called. */
   used: boolean;
@@ -104,7 +108,7 @@ export function financeEvidence(parts: readonly MessagePart[]): FinanceEvidence 
   const calls = new Map<string, string>();
   const ids = new Set<string>();
   for (const p of parts)
-    if (p.type === "tool_call" && isFinanceTool(p.name)) {
+    if (p.type === "tool_call" && sourceKindOf(p.name) === "finance") {
       calls.set(p.id, p.name);
       for (const v of Object.values(asObject(p.input) ?? {})) if (typeof v === "string") ids.add(v);
     }
@@ -397,58 +401,20 @@ export function checkAnswer(text: string, ev: AnswerEvidence): FinanceMissing[] 
 export const answerText = (parts: readonly MessagePart[]): string =>
   parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
 
-/** The evidence of several answers as one (a conversation's stored finance results, oldest first). */
-export function mergeEvidence(list: readonly AnswerEvidence[]): AnswerEvidence | undefined {
-  if (!list.length) return undefined;
-  const sources = new Map<string, FinanceSource>();
-  const ids = new Set<string>();
-  const values: FinanceValue[] = [];
-  for (const e of list) {
-    for (const x of e.sources) sources.set(x.label, x);
-    for (const i of e.identifiers) ids.add(i);
-    values.push(...e.values);
-  }
-  return { sources: [...sources.values()], values, identifiers: [...ids] };
-}
-
-/** At most this many numbers of one answer are kept for later answers' checks. */
-export const MAX_STORED_VALUES = 2000;
-
-/** What one answer's finance results leave for the rest of the conversation (stored, finance/results.ts). */
-export function storedEvidence(parts: readonly MessagePart[]): AnswerEvidence | undefined {
-  const ev = financeEvidence(parts);
-  if (!ev.used) return undefined;
-  return {
-    sources: ev.sources,
-    values: ev.values.slice(0, MAX_STORED_VALUES),
-    identifiers: ev.identifiers.slice(0, 200),
-  };
-}
-
 /**
- * The note for an answer, or undefined when none is due:
- * - the answer used a finance tool and wrote something; or
- * - finance results are anywhere earlier in the conversation (`context`) and the answer states figures.
+ * The note for an answer, or undefined when none is due: only when the answer called a finance tool (and wrote
+ * something). The figures it states are then checked against what *this* answer's finance tools returned.
  */
-export function financeNote(
-  parts: readonly MessagePart[],
-  context?: AnswerEvidence | undefined,
-): FinanceNotePart | undefined {
+export function financeNote(parts: readonly MessagePart[]): FinanceNotePart | undefined {
   const text = answerText(parts);
   if (!text.trim()) return undefined;
   const ev = financeEvidence(parts);
-  const identifiers = [...ev.identifiers, ...(context?.identifiers ?? [])];
-  if (!ev.used && !(context && figuresOf(text, identifiers).length)) return undefined;
-  const all: AnswerEvidence = {
-    sources: ev.used ? ev.sources : [...(context?.sources ?? [])],
-    values: [...ev.values, ...(context?.values ?? [])],
-    identifiers,
-  };
-  const missing = checkAnswer(text, all);
+  if (!ev.used) return undefined;
+  const missing = checkAnswer(text, ev);
   if (ev.toolMetaMissing) missing.push("tool_meta");
   return {
     type: "finance_note",
-    sources: all.sources.slice(0, FINANCE_NOTE_MAX_SOURCES),
+    sources: ev.sources.slice(0, FINANCE_NOTE_MAX_SOURCES),
     missing,
     disclaimer: FINANCE_DISCLAIMER,
   };

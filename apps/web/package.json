@@ -4,13 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "vite build -c vite.frame.config.ts && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:frame": "vite build -c vite.frame.config.ts"
   },
   "dependencies": {
     "@agentlee/shared": "workspace:*",
     "@tanstack/react-query": "5.105.0",
     "katex": "0.16.47",
+    "mermaid": "12.3.0",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "react-markdown": "10.1.0",

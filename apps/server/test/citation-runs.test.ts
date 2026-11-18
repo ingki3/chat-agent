@@ -260,11 +260,26 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     ]);
     // What it meant to quote, never a passage the page does not have.
     expect(changed.note!.citations[1]!.quote).toBe("10월 반도체 수출 증가율은 28%로");
-    // A conversation without an earlier note: nothing to carry.
+    // A conversation without an earlier note: nothing to carry — no source, so no source note; the markers are
+    // flagged unverified (`unbacked`, #185, review #190 1차).
     const fresh = app.conversations!.create(f.users.owner.id);
-    expect(statuses(await send(f.cookies.owner, fresh.id, "/cite recap"))).toEqual(
-      [1, 2, 3, 9].map((n) => [n, "unknown_source"]),
-    );
+    const lone = await send(f.cookies.owner, fresh.id, "/cite recap");
+    expect(lone.run.status).toBe("done");
+    expect(lone.text).toContain("[9]");
+    expect(lone.note?.unbacked).toBe(true);
+    expect(statuses(lone)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
+    // A carried-over note is still found past an `unbacked` one: the newest note *with sources* is carried. The
+    // middle answer's only marker, [9], was never a real citation — nothing carries, so its note is `unbacked`.
+    const middle = await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[9].");
+    expect(middle.run.status).toBe("done");
+    expect(middle.text).toContain("최신 수출은 32% 증가했다[9].");
+    expect(middle.note?.unbacked).toBe(true);
+    expect(statuses(middle)).toEqual([[9, "unknown_source"]]);
+    // Without the skip, [1] would look in the middle note (no [1] there) and stay unknown.
+    const past = await send(f.cookies.owner, c.id, "/cite recap");
+    expect(past.run.status).toBe("done");
+    expect(past.note?.unbacked).toBeUndefined();
+    expect(statuses(past)?.[0]).toEqual([1, "verified"]);
   });
 
   it("precedence (#150): once a run cites or fetches anything, every number is its own — nothing is carried", async () => {
@@ -328,14 +343,20 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(statuses(own)).toEqual([[1, "verified"]]);
   });
 
-  it("no web tool and no citation: array indexing gets no note, a made-up sentence-end [n] is unknown", async () => {
+  it("no source tool and nothing carried over: no source note; a made-up marker is flagged (#185, review #190)", async () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
-    // The fake echoes the message.
-    expect((await send(f.cookies.owner, c.id, "배열 a[1] 은 두 번째 값")).note).toBeUndefined();
+    // The fake echoes the message: array indexing is text — no note at all.
+    const array = await send(f.cookies.owner, c.id, "배열 a[1] 은 두 번째 값");
+    expect(array.run.status).toBe("done");
+    expect(array.text).toContain("배열 a[1] 은 두 번째 값");
+    expect(array.note).toBeUndefined();
+    // A sentence-end [n] with nothing earlier under it: no sources, the marker unverified.
     const made = await send(f.cookies.owner, c.id, "최신 수출은 32% 증가했다[1].");
+    expect(made.run.status).toBe("done");
+    expect(made.text).toContain("최신 수출은 32% 증가했다[1].");
+    expect(made.note).toMatchObject({ unbacked: true, missing: [] });
     expect(statuses(made)).toEqual([[1, "unknown_source"]]);
-    expect(made.note!.missing).toEqual([]);
   });
 
   it("research mode feeds the instructions of the next run (and cite's rules are in them)", async () => {
@@ -344,13 +365,13 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     runtimes.register(rt);
     const { app, f, send, api } = await start(runtimes);
     const c = app.conversations!.create(f.users.owner.id);
-    // The owner has the finance tools too (finance@3): the research section is what is looked at.
+    // The owner has the finance tools too (finance@4): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@6"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@8"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
-      "common@6",
+      "common@8",
       "research@3",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
@@ -358,7 +379,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(prompt).toContain("`cite`로 검증한 표시");
     expect(prompt).toContain("`sources_list`");
     await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: false });
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@6"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@8"]);
     expect(rt.systemPrompts.at(-1)).not.toContain("# 자료 조사 모드");
   });
 

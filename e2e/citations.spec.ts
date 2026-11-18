@@ -15,7 +15,7 @@ const SNIPPET =
 const OK = "원문 구절 확인";
 
 async function ask(page: Page, text: string, timeout = 15_000) {
-  const before = await page.getByTestId("citation-note").count();
+  const before = await page.getByTestId("source-note").count();
   const replies = await page.getByTestId("assistant").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
@@ -23,7 +23,7 @@ async function ask(page: Page, text: string, timeout = 15_000) {
   await expect(page.getByTestId("assistant")).toHaveCount(replies + 1, { timeout });
   const reply = page.getByTestId("assistant").last();
   await expect(reply).toHaveAttribute("data-status", "complete", { timeout });
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1);
+  await expect(page.getByTestId("source-note")).toHaveCount(before + 1);
   return reply;
 }
 
@@ -55,7 +55,7 @@ test("verified citations: markers, the source list and the preview with 원문 �
   await expect(title).toHaveAttribute("href", PAGE_A);
   await expect(rows.nth(0)).toContainText("가나다 신문 · 2026-11-10");
   await expect(rows.nth(0)).not.toContainText(PAGE_A);
-  await expect(reply.getByTestId("citation-note")).not.toContainText(OK);
+  await expect(reply.getByTestId("source-note")).not.toContainText(OK);
   await expect(reply.getByTestId("citation-status")).toHaveCount(0);
   await expect(reply.getByTestId("citation-missing-warning")).toHaveCount(0);
 
@@ -253,4 +253,22 @@ test("research mode is a per-conversation toggle kept by the server", async ({ p
   // Another conversation is not affected.
   await newChat(page, "/cite partial");
   await expect(page.getByTestId("research-toggle")).toHaveAttribute("aria-pressed", "false");
+});
+
+test("an answer that used no source: no source box, its made-up [n] flagged ⚠️ with a notice (#185, review #190)", async ({
+  page,
+}) => {
+  await useAccount(page, MOM);
+  await page.goto("/");
+  // The fake echoes the message: no tool, a sentence-end [1] and an array index.
+  await page.getByLabel("메시지 입력").fill("최신 수출은 32% 증가했다[1]. 배열 a[2] 은 그대로예요");
+  await page.getByRole("button", { name: "보내기" }).click();
+  const reply = page.getByTestId("assistant").last();
+  await expect(reply).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  await expect(reply).toContainText("최신 수출은 32% 증가했다");
+  await expect(reply.getByTestId("source-note")).toHaveCount(0);
+  await expect(reply.getByTestId("citation-unbacked")).toContainText("근거에 연결되지 않은 출처 표시");
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1⚠️"]);
+  await expect(reply).toContainText("a[2]");
+  await expect(reply).not.toContainText(OK);
 });

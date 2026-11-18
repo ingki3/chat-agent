@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { HealthResponse } from "@agentlee/shared";
 import { APP_CSP, buildApp, isApiPath } from "../src/app.js";
 import { loadConfig, REPO_ROOT } from "../src/config.js";
+import { MERMAID_FRAME_CSP, MERMAID_FRAME_HTML } from "../src/mermaid-frame.js";
 
 const apps: { close: () => Promise<unknown> }[] = [];
 afterEach(async () => {
@@ -84,6 +86,50 @@ describe("server", () => {
     expect(res.headers["content-security-policy"]).toBe(APP_CSP);
   });
 
+  it("serves the diagram frame (#182) with its own sandboxing, no-network CSP — two policies, the app CSP untouched", async () => {
+    const app = await buildApp(loadConfig({ NODE_ENV: "production" }), {
+      webDist: fakeWebDist(),
+      logger: false,
+    });
+    apps.push(app);
+    const res = await app.inject({ method: "GET", url: "/mermaid-frame" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/^text\/html/);
+    expect(res.body).toBe(MERMAID_FRAME_HTML);
+    const csp = res.headers["content-security-policy"];
+    expect(csp).toEqual([...MERMAID_FRAME_CSP]); // two header lines, never the app's
+    const [a, b] = MERMAID_FRAME_CSP;
+    for (const d of [
+      "sandbox allow-scripts",
+      "default-src 'none'",
+      "connect-src 'none'",
+      "font-src 'none'",
+      "frame-src 'none'",
+      "worker-src 'none'",
+      "img-src data: blob:",
+      "form-action 'none'",
+      "base-uri 'none'",
+      "frame-ancestors 'self'",
+      "webrtc 'block'",
+    ])
+      expect(a).toContain(d);
+    expect(res.headers["x-dns-prefetch-control"]).toBe("off");
+    expect(a).not.toContain("allow-same-origin");
+    // The only inline script is the boot script, admitted by its hash.
+    const scripts = [...MERMAID_FRAME_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
+    expect(scripts).toHaveLength(1);
+    const hash = crypto.createHash("sha256").update(scripts[0]!, "utf8").digest("base64");
+    expect(a).toContain(`script-src 'sha256-${hash}' blob:`);
+    // Policy B admits no external script: a hash alone would admit one whose integrity names it.
+    expect(b).toBe("script-src 'unsafe-inline' blob:");
+    // The boot script takes code only from its parent.
+    expect(scripts[0]).toContain("e.source!==parent");
+    // …and takes the WebRTC constructors away before any other code runs.
+    expect(scripts[0]!.indexOf("RTC")).toBeLessThan(scripts[0]!.indexOf("addEventListener"));
+    const page = await app.inject({ method: "GET", url: "/" });
+    expect(page.headers["content-security-policy"]).toBe(APP_CSP);
+  });
+
   it("keeps /api routes on Fastify when Vite middleware is attached (dev mode)", async () => {
     const app = await buildApp(loadConfig({ NODE_ENV: "test" }), { vite: true });
     apps.push(app);
@@ -96,6 +142,10 @@ describe("server", () => {
     expect(page.headers["referrer-policy"]).toBe("no-referrer");
     const bare = await app.inject({ method: "GET", url: "/api" });
     expect(bare.json()).toEqual({ error: "not_found" });
+    // The diagram frame is Fastify's, with its own CSP, in dev mode too (#182).
+    const frame = await app.inject({ method: "GET", url: "/mermaid-frame" });
+    expect(frame.body).toBe(MERMAID_FRAME_HTML);
+    expect(frame.headers["content-security-policy"]).toEqual([...MERMAID_FRAME_CSP]);
   });
 
   it("listens on 127.0.0.1 only", async () => {

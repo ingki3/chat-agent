@@ -60,7 +60,11 @@
       "brace-expansion@2": "2.1.7",
       "@swc/helpers": "0.5.23",
       "tslib": "2.8.1",
-      "wasm-feature-detect": "1.9.0"
+      "wasm-feature-detect": "1.9.0",
+      "commander@15": "15.0.0",
+      "cytoscape": "3.34.4",
+      "dompurify": "3.4.17",
+      "es-toolkit": "1.53.1"
     },
     "ignoredOptionalDependencies": [
       "@napi-rs/canvas"

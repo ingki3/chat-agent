@@ -59,8 +59,12 @@ export const DividerPart = z.object({
   model: z.string().optional(),
 });
 /**
- * Added by the server under an answer that used a finance tool (#30, FR-7.6·7.8): the sources and as-of times of
- * the numbers it was given, what the answer itself left out, and the disclaimer. Never written by a runtime.
+ * Added by the server under an answer that called a finance tool — only then (#30, #185, FR-7.6·7.8): the sources
+ * and as-of times of the numbers it was given, what the answer itself left out, and the disclaimer. The finance part
+ * of the answer's source note: the screen shows it in one "출처" box with the `citation_note` (numbered web and
+ * file citations), if there is one (docs/decisions/sources.md). Never written by a runtime. Messages stored before
+ * #185 may carry one under an answer that used no finance tool (the old conversation-wide carry-over); it still
+ * renders as it was stored.
  */
 export const FinanceNotePart = z.object({
   type: z.literal("finance_note"),

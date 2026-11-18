@@ -31,6 +31,12 @@ export const CITATION_STATUS_TEXT: Record<CitationStatus, string> = {
   unknown_source: "⚠️ 출처를 가져오지 못했어요",
 };
 
+/**
+ * Shown for an `unbacked` note: the answer has `[n]` markers that cite nothing. About the markers only — the same
+ * box may list the answer's finance sources (review #190 2차).
+ */
+export const CITATION_UNBACKED_TEXT = "⚠️ 근거에 연결되지 않은 출처 표시가 있어요.";
+
 /** Shown above an answer with paragraphs that state something without a citation marker. */
 export const CITATION_MISSING_TEXT = "⚠️ 일부 내용에 출처 표시 없음";
 
@@ -95,8 +101,11 @@ export const TextRange = z.object({
 export type TextRange = z.infer<typeof TextRange>;
 
 /**
- * Added by the server at the end of an answer that used web tools or cited sources (#25). `citations`: every
+ * Added by the server at the end of an answer that used web or file source tools, cited sources, or carries numbers
+ * of the answer before (#25, #150) — decided by those tool calls only, never by the text (#185). `citations`: every
  * marker the answer uses, by number. `missing`: body paragraphs without a marker (empty when every one has one).
+ * The numbered part of the answer's source note: the screen shows it in one "출처" box with the `finance_note`, if
+ * there is one.
  */
 export const CitationNotePart = z.object({
   type: z.literal("citation_note"),
@@ -107,6 +116,12 @@ export const CitationNotePart = z.object({
    * an `[n]` elsewhere (array indexing, code) stays text.
    */
   markers: z.array(TextRange.extend({ n: z.number().int().positive() })).max(CITATION_LIMITS.markers),
+  /**
+   * The answer used no source and carried no number (#185, review #190 1차): its sentence-end `[n]` cite nothing.
+   * Every citation is `unknown_source`; the screen flags the markers in the text and shows a short notice, never a
+   * source box. Not an earlier answer's note for carrying numbers over. Absent on every other note.
+   */
+  unbacked: z.literal(true).optional(),
 });
 export type CitationNotePart = z.infer<typeof CitationNotePart>;
 
