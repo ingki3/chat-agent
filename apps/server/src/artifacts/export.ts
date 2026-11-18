@@ -24,6 +24,8 @@ import {
   browserArgs,
   CdpError,
   CdpPipe,
+  killLiveRenders,
+  removeRenderDir,
   sandboxedLauncher,
   trackRender,
   WATCHDOG_MAX_SEC,
@@ -199,8 +201,22 @@ type Session = {
   send: (method: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
 };
 
+/** Renderers not yet closed: `closeRenderers` shuts them all (server exit and signals, the tests' `afterAll`). */
+const openRenderers = new Set<Renderer>();
+
+/**
+ * Shutdown (#170): every renderer stops taking renders first — queued ones are turned away, one waiting for its proxy
+ * or about to start its browser starts none — and only then is every live render group SIGKILLed and its folder
+ * removed. Synchronous (safe in an `exit` hook).
+ */
+export function closeRenderers(): number {
+  for (const r of [...openRenderers]) r.shutdown();
+  return killLiveRenders();
+}
+
 export class Renderer {
   private active = 0;
+  private closed = false;
   private readonly queue: (() => void)[] = [];
   private readonly limits: typeof RENDER_LIMITS;
   private readonly egress: EgressService;
@@ -210,6 +226,21 @@ export class Renderer {
     this.limits = { ...RENDER_LIMITS, ...o.limits };
     this.egress = new EgressService({ ...o.egress, allow: RENDER_EGRESS_HOSTS });
     this.launcher = o.launcher ?? sandboxedLauncher;
+    openRenderers.add(this);
+  }
+
+  /**
+   * No more renders: queued ones end now (`export_unavailable`), and any render that has not started its browser yet
+   * never does. Running ones are killed by the caller (`closeRenderers` → `killLiveRenders`).
+   */
+  shutdown() {
+    this.closed = true;
+    openRenderers.delete(this);
+    // Each waiter is let go as if it got a slot (its `finally` frees one), and sees `closed`.
+    for (const next of this.queue.splice(0)) {
+      this.active++;
+      next();
+    }
   }
 
   get available(): boolean {
@@ -217,6 +248,7 @@ export class Renderer {
   }
 
   close(): Promise<void> {
+    this.shutdown();
     return this.egress.close();
   }
 
@@ -226,7 +258,7 @@ export class Renderer {
    */
   async render(job: RenderJob, via?: RenderVia): Promise<RenderResult> {
     const worker = via?.worker ?? this.o.account?.verified();
-    if (!worker && !this.o.browser) return { ok: false, code: "export_unavailable" };
+    if (this.closed || (!worker && !this.o.browser)) return { ok: false, code: "export_unavailable" };
     if (!worker) this.o.account?.onFallback?.();
     if (this.active >= this.limits.concurrent) {
       // A few wait for a free slot (each render is short); beyond that the caller is told to come back.
@@ -234,6 +266,7 @@ export class Renderer {
       await new Promise<void>((resolve) => this.queue.push(resolve));
     } else this.active++;
     try {
+      if (this.closed) return { ok: false, code: "export_unavailable" };
       return await this.run(
         this.o.browser,
         job,
@@ -267,6 +300,7 @@ export class Renderer {
     } catch {
       return { ok: false, code: "export_unavailable" };
     }
+    if (this.closed) return { ok: false, code: "export_unavailable" };
     // A fresh, empty profile per render: no cookies, storage or cache of anyone, removed afterwards. Under the
     // account: a job folder of the worker scratch (the launcher finds it by the job id alone).
     const worker = via?.worker;
@@ -293,7 +327,7 @@ export class Renderer {
           // the self-check's look never decides the clean-up
         }
         removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
-      } else fs.rmSync(workDir, { recursive: true, force: true });
+      } else removeRenderDir(workDir);
     };
     const home = path.join(workDir, "home");
     const tmp = path.join(workDir, "tmp");
@@ -305,6 +339,11 @@ export class Renderer {
     t.launched?.({ args, env, workDir });
 
     let launched;
+    // Shut down while the folder was being made: no browser starts after `closeRenderers`.
+    if (this.closed) {
+      removeWorkDir();
+      return { ok: false, code: "export_unavailable" };
+    }
     try {
       launched =
         worker && made
@@ -324,8 +363,22 @@ export class Renderer {
     }
     const { child, input, output } = launched;
     const pid = child.pid;
-    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited.
-    if (!worker && pid) child.once("exit", trackRender(pid, workDir));
+    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited. A watchdog that
+    // ended abnormally (killed by a signal — by itself, not by its own clean-up path — or failing to start) may leave
+    // the browser behind in its group: the server kills what is left of the group, then forgets it. (The group id
+    // cannot be reused while a member is alive; a watchdog that exits normally has already reaped its browser.)
+    if (!worker && pid) {
+      const untrack = trackRender(pid, workDir);
+      child.once("exit", (code, signal) => {
+        if (signal || code === null || code >= 126)
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            // nothing left
+          }
+        untrack();
+      });
+    }
     let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
     let exited = false;
     let exitCode: number | null = null;

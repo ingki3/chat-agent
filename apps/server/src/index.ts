@@ -1,6 +1,6 @@
 import "./env.js";
 import { buildApp } from "./app.js";
-import { killLiveRenders } from "./artifacts/browser.js";
+import { closeRenderers } from "./artifacts/export.js";
 import { openServerStorage } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
 import { logEvent } from "./logging.js";
@@ -9,8 +9,9 @@ const config = loadConfig();
 // Refuses to start when another server, a restore or a migration holds the data folder (#37).
 const { storage, recovered, release: releaseDataDir, held } = openServerStorage(config);
 process.on("exit", releaseDataDir);
-// Export browsers still running die with the server (#170; their watchdogs would kill them anyway).
-process.on("exit", killLiveRenders);
+// Export browsers die with the server (#170; their watchdogs would kill them anyway): no new render starts, then
+// every running one is killed.
+process.on("exit", closeRenderers);
 const app = await buildApp(config, {
   vite: config.env === "development",
   db: storage.db,
@@ -33,7 +34,7 @@ try {
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
-    killLiveRenders();
+    closeRenderers();
     void app.close().then(() => process.exit(0));
   });
 }

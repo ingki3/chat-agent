@@ -63,7 +63,7 @@ import { fixtureWebWorker } from "./runtime/fake-citations.js";
 import { sandboxedWorker } from "./web/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
-import { findBrowser, sweepRenderDirs } from "./artifacts/browser.js";
+import { findBrowser, startRenderSweeps } from "./artifacts/browser.js";
 import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import { registerReferenceRoutes } from "./references/routes.js";
@@ -1236,8 +1236,12 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       });
       ownRenderer = own;
       app.addHook("onClose", async () => own.close());
-      // Render folders left by a server or test run that died (#170): only ours, only provably ownerless.
-      if (config.env !== "test") void sweepRenderDirs();
+      // Render folders left by a server or test run that died (#170): only ours, only provably ownerless — now and
+      // again later (a folder too young now is judged once it is old enough).
+      if (config.env !== "test") {
+        const stopSweeps = startRenderSweeps();
+        app.addHook("onClose", async () => stopSweeps());
+      }
       renderer = own;
     }
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
