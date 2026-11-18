@@ -349,6 +349,42 @@ test("after giving up, the reply is shown once the run has ended — without 다
   await expect(reply(page).getByText("연결이 끊겨", { exact: false })).toHaveCount(0);
 });
 
+test("a reply that ends while the new conversation's first messages read is on its way ends complete (#103)", async ({
+  page,
+}) => {
+  // A new conversation opens as its run goes on; its first messages read (sent while the reply streams) is held
+  // until the screen reads the messages again after the run's `done`. That read must be a new one — not the held
+  // one joined (the reply then stayed "streaming" for good: the citations e2e flake on a loaded CI runner).
+  await useAccount(page, SON);
+  let held: (() => void) | undefined;
+  let heldStatus: string | undefined;
+  let reads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    if (++reads > 1) {
+      held?.();
+      return route.continue();
+    }
+    const res = await route.fetch();
+    const body = (await res.json()) as { items: { role: string; status: string }[] };
+    heldStatus = body.items.findLast((m) => m.role === "assistant")?.status;
+    // Released by the next read; without one (the bug), let go late so the stale answer shows.
+    await new Promise<void>((r) => {
+      held = r;
+      setTimeout(r, 8000);
+    });
+    await route.fulfill({ response: res, json: body });
+  });
+  await page.goto("/");
+  await send(page, "/tool 1");
+  await page.waitForURL(/\/c\/[^/]+$/);
+  await expect(reply(page)).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
+  await expect(reply(page)).toContainText("끝났어요");
+  // The held read really was from while the reply streamed (the case is real), and it was read again.
+  expect(heldStatus).not.toBe("complete");
+  expect(reads).toBeGreaterThan(1);
+});
+
 test.describe("markdown chunk", () => {
   // The service worker serves cached assets itself; block it so the failed request is really the network's.
   test.use({ serviceWorkers: "block" });

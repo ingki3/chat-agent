@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type { Run } from "@agentlee/shared";
+import { rereadQuery } from "./reread.js";
 
 /**
  * One check, while a reply is finishing, of whether its run ended (#141): the read after `done` may have failed (its
@@ -23,8 +24,8 @@ export async function confirmRunEnded(o: {
   const current = () => !o.signal.aborted && o.qc.getQueryData<Run | null>(key)?.id === o.runId;
   const r = await o.read(o.conversationId, o.signal);
   if (!current()) return false;
-  // Messages first, as in a refresh: the saved reply is there before the live one is let go.
-  await o.qc.invalidateQueries({ queryKey: ["messages", o.conversationId] });
+  // Messages first, as in a refresh: the saved reply is there before the live one is let go (read from now on, #103).
+  await rereadQuery(o.qc, ["messages", o.conversationId]);
   if (!current()) return false;
   await o.qc.cancelQueries({ queryKey: key });
   if (!current()) return false;

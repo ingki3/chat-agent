@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import type { Run } from "@agentlee/shared";
 import { confirmRunEnded } from "../src/chat/confirm-end.js";
+import { rereadQuery } from "../src/chat/reread.js";
 
 const run = (id: string, endedAt: number | null = null): Run => ({
   id,
@@ -142,5 +143,33 @@ describe("confirmRunEnded (#141)", () => {
     expect(ok).toBe(false);
     expect(qc.getQueryData(["active-run", "c1"])).toBeNull();
     expect(arounds()).toBe(0);
+  });
+});
+
+describe("rereadQuery (#103)", () => {
+  it("a first read still on its way is not taken as the read after: a new one is sent and its answer kept", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // The first read (sent while the reply streamed) is held; every later one answers at once.
+    let answerFirst!: (v: string) => void;
+    let reads = 0;
+    const unsubscribe = new QueryObserver(qc, {
+      queryKey: ["messages", "c1"],
+      queryFn: () =>
+        reads++ === 0 ? new Promise<string>((r) => (answerFirst = r)) : Promise.resolve("complete"),
+    }).subscribe(() => {});
+    await flush();
+    expect(reads).toBe(1);
+    // A plain invalidate joins it (TanStack cancels an in-flight read only when there is data): the bug.
+    const joined = qc.invalidateQueries({ queryKey: ["messages", "c1"] });
+    await flush();
+    expect(reads).toBe(1);
+    const p = rereadQuery(qc, ["messages", "c1"]);
+    await flush();
+    expect(reads).toBe(2);
+    answerFirst("streaming");
+    await p;
+    await joined;
+    expect(qc.getQueryData(["messages", "c1"])).toBe("complete");
+    unsubscribe();
   });
 });

@@ -36,6 +36,7 @@ import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachmen
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { confirmRunEnded } from "../chat/confirm-end.js";
+import { rereadQuery } from "../chat/reread.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -141,8 +142,9 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
   const refresh = async () => {
-    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text).
-    await qc.invalidateQueries({ queryKey: ["messages", id] });
+    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text) — read
+    // from now on, never a first read still on its way from while the reply streamed (#103).
+    await rereadQuery(qc, ["messages", id]);
     await Promise.all([qc.invalidateQueries({ queryKey: ["active-run", id] }), refreshAround()]);
   };
   const { live, reconnect } = useRunStream(
@@ -215,7 +217,7 @@ export function ChatPage() {
         // An `active-run` read still in flight would answer from before this run: cancelled first.
         await qc.cancelQueries({ queryKey: ["active-run", id] });
         qc.setQueryData(["active-run", id], r.run);
-        await qc.invalidateQueries({ queryKey: ["messages", id] });
+        await rereadQuery(qc, ["messages", id]);
         // An edit or a regenerate may take a card's source out of the history (spec §10.3).
         void qc.invalidateQueries({ queryKey: MEMORY_PROPOSALS_KEY });
         toBottom();

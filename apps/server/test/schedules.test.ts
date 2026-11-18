@@ -664,12 +664,21 @@ describe("daylight saving on the engine (America/New_York, FR-8.7)", () => {
 });
 
 describe("start accuracy on the real clock", () => {
-  it("a minute occurrence starts within ±1 minute of its time (measured)", async () => {
+  it("a minute occurrence starts within ±1 minute of its time (measured), the timer aimed at the occurrence itself", async () => {
     const w = world();
     // A shifted clock puts the next minute boundary 300 ms away; the timers are real.
     const real = Date.now();
     const shift = Math.ceil(real / MIN) * MIN - 300 - real;
-    const now = () => Date.now() + shift;
+    // What the engine decides is recorded against the clock readings it made (#103): how late a loaded machine
+    // wakes a timer is not the engine's doing — a CI runner stalled one by over a second — so that is never a bound;
+    // the decisions are checked exactly, and the requirement (±1 minute) on the measured start.
+    let last = 0;
+    let wake: { first?: number } | null = null;
+    const now = () => {
+      last = Date.now() + shift;
+      if (wake && wake.first === undefined) wake.first = last;
+      return last;
+    };
     const s = w.store.create(
       w.owner,
       {
@@ -683,17 +692,46 @@ describe("start accuracy on the real clock", () => {
       },
       now(),
     );
-    const engine = new ScheduleEngine(w.store, new FakeScheduleHandler({ now }), { now, stopGraceMs: 0 });
-    engines.push(engine);
-    engine.start();
-    for (let i = 0; i < 100 && !runsOf(w, s.id).length; i++) await new Promise((r) => setTimeout(r, 20));
+    const occurrence = w.store.byId(s.id)!.next_run_at!;
+    const started = () => runsOf(w, s.id).some((r) => r.started_at !== null);
+    /** Where each timer set while waiting was aimed (the engine's own reading of the clock + the delay). */
+    const aims: number[] = [];
+    /** Each time the engine looked (its start, each timer): the time it read first, and whether it had started. */
+    const looks: { at: number; started: boolean }[] = [];
+    let ran!: () => void;
+    const runStarted = new Promise<void>((r) => (ran = r));
+    const look = (fn: () => void) => {
+      wake = {};
+      fn();
+      const at = wake.first;
+      wake = null;
+      if (at !== undefined) looks.push({ at, started: started() });
+      if (started()) ran();
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      if (!started()) aims.push(last + (ms ?? 0));
+      return realSetTimeout(() => look(fn), ms);
+    }) as unknown as typeof setTimeout);
+    try {
+      const engine = new ScheduleEngine(w.store, new FakeScheduleHandler({ now }), { now, stopGraceMs: 0 });
+      engines.push(engine);
+      look(() => engine.start());
+      await runStarted;
+    } finally {
+      spy.mockRestore();
+    }
     const [r] = runsOf(w, s.id);
+    expect(r!.scheduled_at).toBe(occurrence);
+    // Requirement (AC-5), measured on the real clock.
     const late = r!.started_at! - r!.scheduled_at;
     expect(late).toBeGreaterThanOrEqual(0);
     expect(late).toBeLessThanOrEqual(MIN);
-    // In practice: a few milliseconds (the timer wakes at the occurrence itself). A loaded CI runner can stall the
-    // event loop for about a second, so the practical bound is looser there; the ±1 minute requirement above holds.
-    expect(late).toBeLessThan(process.env.CI ? 10_000 : 1000);
+    // While it was not due, every timer was aimed exactly at the occurrence — not at the 1-minute look-again.
+    expect(aims.length).toBeGreaterThan(0);
+    for (const a of aims) expect(a).toBe(occurrence);
+    // The look that found it due started it there and then (no further sleep); none before its time did.
+    for (const l of looks) expect(l.started).toBe(l.at >= occurrence);
   });
 });
 
