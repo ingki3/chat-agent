@@ -16,9 +16,7 @@ import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestDb } from "../src/db/client.js";
-import { eq } from "drizzle-orm";
-import { financeResults, messages } from "../src/db/schema.js";
-import { FinanceResultStore } from "../src/finance/results.js";
+import { financeResults } from "../src/db/schema.js";
 import { finalize } from "../src/finance/records.js";
 import { RuntimeRegistry, type RuntimeAdapter } from "../src/runtime/adapter.js";
 import { ClaudeAdapter } from "../src/runtime/claude.js";
@@ -32,9 +30,10 @@ import { liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 /**
- * The common finance output check under the run manager (#30): every answer that used a finance tool — any
- * user, follow-ups, scheduled runs, either runtime — ends with the server's note (sources, as-of, what the answer
- * left out, the disclaimer). Completion criterion: "AAPL, 005930 현재가" in both runtimes → 출처·기준 시각·면책.
+ * The common finance output check under the run manager (#30, #185): every answer that called a finance tool — any
+ * user, scheduled runs, either runtime — ends with the server's note (sources, as-of, what the answer left out, the
+ * disclaimer); an answer that called none gets none, whatever came before it in the conversation (#185).
+ * Completion criterion: "AAPL, 005930 현재가" in both runtimes → 출처·기준 시각·면책.
  */
 
 type App = Awaited<ReturnType<typeof buildApp>>;
@@ -140,68 +139,42 @@ describe("finance output check under the run manager (#30)", () => {
     expect(b.note?.disclaimer).toBe(FINANCE_DISCLAIMER);
   });
 
-  it("follow-ups that state figures are checked against the answer before; other answers get no note", async () => {
+  it("#185 production case: follow-ups that call no finance tool get no note — figures or not", async () => {
+    const { app, db, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    expect((await send(f.cookies.owner, c.id, "/finance")).note).toBeDefined();
+    // Nothing is kept for later answers' checks any more (the conversation-wide carry-over is gone).
+    expect(db.select().from(financeResults).all()).toEqual([]);
+    // The fake echoes the message: answers with figures, a price equal to the earlier result, a general answer.
+    for (const text of [
+      "원화로 51만 원 정도",
+      "349.8달러입니다.",
+      "음성 전사는 최대 2시간까지 돼요. 진행자 1명, 게스트 2명이면 화자 3명으로 나눠요.",
+    ]) {
+      const r = await send(f.cookies.owner, c.id, text);
+      expect(r.run.status, text).toBe("done");
+      expect(
+        r.parts.filter((p) => p.type === "finance_note" || p.type === "citation_note"),
+        text,
+      ).toEqual([]);
+    }
+  });
+
+  it("a follow-up that queries again gets its own note: sources, as-of times and the disclaimer", async () => {
     const { app, f, send } = await start(fake());
     const c = app.conversations!.create(f.users.owner.id);
     await send(f.cookies.owner, c.id, "/finance");
-    // The fake echoes the message: a follow-up with a figure in it.
-    const follow = await send(f.cookies.owner, c.id, "원화로 51만 원 정도");
-    expect(follow.note).toMatchObject({
-      sources: [
-        expect.objectContaining({ source: "Yahoo Finance" }),
-        expect.objectContaining({ source: "네이버 증권" }),
-      ],
-      disclaimer: FINANCE_DISCLAIMER,
-    });
-    const plain = app.conversations!.create(f.users.owner.id);
-    expect((await send(f.cookies.owner, plain.id, "안녕 반가워 2번")).note).toBeUndefined();
-  });
-
-  it("an answer without figures in between does not end the finance context (four turns)", async () => {
-    const { app, f, send } = await start(fake());
-    const c = app.conversations!.create(f.users.owner.id);
-    expect((await send(f.cookies.owner, c.id, "/finance")).note).toBeDefined();
-    // An explanation without figures: nothing to check, no note.
     expect((await send(f.cookies.owner, c.id, "종가라는 뜻이야?")).note).toBeUndefined();
-    // The figures come back two answers later: still checked, with the earlier results' sources.
-    const later = await send(f.cookies.owner, c.id, "두 주 가격은 349.80달러와 206,000원");
-    expect(later.note).toMatchObject({
+    const again = await send(f.cookies.owner, c.id, "/finance cited");
+    expect(again.note).toEqual({
+      type: "finance_note",
       sources: [
-        expect.objectContaining({ source: "Yahoo Finance" }),
-        expect.objectContaining({ source: "네이버 증권" }),
+        expect.objectContaining({ label: "Yahoo Finance · 2026-11-13 16:00 ET 종가", delayed: false }),
+        expect.objectContaining({ label: "네이버 증권 · 2026-11-13 15:30 KST 종가", delayed: false }),
       ],
-      missing: ["source", "as_of"],
+      missing: [],
       disclaimer: FINANCE_DISCLAIMER,
     });
-  });
-
-  it("however long the conversation goes on: six exchanges without figures, then a price again (review #93 round 2)", async () => {
-    const { app, db, f, send } = await start(fake());
-    const c = app.conversations!.create(f.users.owner.id);
-    const first = await send(f.cookies.owner, c.id, "/finance");
-    expect(first.note).toBeDefined();
-    // The results are stored per answer and read back with one indexed query (finance/results.ts).
-    expect(
-      db
-        .select()
-        .from(financeResults)
-        .all()
-        .map((r) => r.messageId),
-    ).toEqual([first.run.assistantMessageId]);
-    for (let i = 0; i < 6; i++)
-      expect((await send(f.cookies.owner, c.id, "설명 더 해줘")).note).toBeUndefined();
-    const again = await send(f.cookies.owner, c.id, "349.8달러입니다.");
-    expect(again.note).toMatchObject({
-      sources: [
-        expect.objectContaining({ source: "Yahoo Finance" }),
-        expect.objectContaining({ source: "네이버 증권" }),
-      ],
-      missing: ["source", "as_of"],
-      disclaimer: FINANCE_DISCLAIMER,
-    });
-    // Another conversation of the same user is not about finance.
-    const other = app.conversations!.create(f.users.owner.id);
-    expect((await send(f.cookies.owner, other.id, "349.8달러입니다.")).note).toBeUndefined();
   });
 
   it("an ETF price written after the brand is checked as a figure (review #93 round 3)", async () => {
@@ -217,35 +190,18 @@ describe("finance output check under the run manager (#30)", () => {
       input.text === "KODEX 200 시세"
         ? [
             { tool: "mcp__agentlee__kr_etf", ms: 0, input: { code: "069500" }, output: etf },
-            { text: "확인했어요." },
+            { text: "KODEX 84540원입니다." },
           ]
         : defaultScript(input, memory);
     const { app, f, send } = await start(fake(script));
     const c = app.conversations!.create(f.users.owner.id);
-    await send(f.cookies.owner, c.id, "KODEX 200 시세");
-    // The follow-up states the price after the brand only: it is a figure, so the note is due and flagged.
-    const r = await send(f.cookies.owner, c.id, "KODEX 84540원입니다.");
+    // The answer states the price after the brand only: it is a figure, so it is flagged.
+    const r = await send(f.cookies.owner, c.id, "KODEX 200 시세");
     expect(r.note).toMatchObject({
       sources: [expect.objectContaining({ label: "네이버 증권 · 2026-11-13 15:30 KST 종가" })],
       missing: ["source", "as_of"],
       disclaimer: FINANCE_DISCLAIMER,
     });
-  });
-
-  it("stored results count only while their answer is in the history before the new one", async () => {
-    const { app, db, f } = await start(fake());
-    const store = new FinanceResultStore(db);
-    const c = app.conversations!.create(f.users.owner.id);
-    const m = app.conversations!.append(c.id, { role: "assistant", parts: [{ type: "text", text: "x" }] });
-    const ev = { sources: [], values: [], identifiers: ["005930"] };
-    store.save({ messageId: m.id, conversationId: c.id, runId: "r" }, ev);
-    expect(store.context(c.id, m.seq + 1)).toEqual(ev);
-    // Not before itself, not in another conversation.
-    expect(store.context(c.id, m.seq)).toBeUndefined();
-    expect(store.context(app.conversations!.create(f.users.owner.id).id, 1e9)).toBeUndefined();
-    // Taken out of the history (edit / regenerate): gone from the check.
-    db.update(messages).set({ active: false }).where(eq(messages.id, m.id)).run();
-    expect(store.context(c.id, m.seq + 1)).toBeUndefined();
   });
 
   it("a partial finance answer recovered after a restart gets the note", async () => {

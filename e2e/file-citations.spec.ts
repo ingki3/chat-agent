@@ -35,7 +35,7 @@ test("이 PDF 12쪽 요약: both citations say report.pdf · 12쪽 and are verif
   await expect(page.getByTestId("attachment").first()).toHaveAttribute("data-status", "done");
   await page.getByLabel("메시지 입력").fill("/file-page12");
   await page.getByLabel("메시지 입력").press("Enter");
-  await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 30_000 });
+  await expect(page.getByTestId("source-note")).toHaveCount(1, { timeout: 30_000 });
   const reply = page.getByTestId("assistant").last();
   await expect(reply.getByTestId("citation-marker")).toHaveText(["1", "2"]);
   await expect(reply.getByTestId("citation-summary")).toHaveText("출처 2개 · 모두 확인됨");
@@ -73,7 +73,7 @@ test("a passage the file does not have is shown with ⚠️, never as normal", a
   await expect(page.getByTestId("attachment").first()).toHaveAttribute("data-status", "done");
   await page.getByLabel("메시지 입력").fill("/file-missing");
   await page.getByLabel("메시지 입력").press("Enter");
-  await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 30_000 });
+  await expect(page.getByTestId("source-note")).toHaveCount(1, { timeout: 30_000 });
   const reply = page.getByTestId("assistant").last();
   await expect(reply.getByTestId("citation-marker")).toHaveText(["1⚠️"]);
   // Not folded away: the failed row is listed with its warning (#150).

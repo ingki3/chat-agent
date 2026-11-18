@@ -12,10 +12,10 @@ import { MOM, newMember, signIn, useAccount } from "./helpers.js";
  */
 
 async function ask(page: Page, text: string) {
-  const before = await page.getByTestId("citation-note").count();
+  const before = await page.getByTestId("source-note").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1, { timeout: 15_000 });
+  await expect(page.getByTestId("source-note")).toHaveCount(before + 1, { timeout: 15_000 });
 }
 
 test("the son exports the conversation's sources: styles, the failed-source toggle, copy, .txt and .docx", async ({

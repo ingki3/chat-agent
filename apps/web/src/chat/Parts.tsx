@@ -6,7 +6,8 @@ import { useFileViewHref } from "../files/context.js";
 import { RichText } from "./RichText.js";
 import type { MarkdownCite } from "./Markdown.js";
 import { CitationMarkers } from "../citations/CitationMarker.js";
-import { CitationSources } from "../citations/CitationNote.js";
+import { SourceNote } from "../citations/CitationNote.js";
+import { sourceNoteOf, type SourceNoteParts } from "../citations/source-note.js";
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
 import { ArtifactCard } from "../artifacts/ArtifactCard.js";
@@ -19,7 +20,6 @@ type ToolCall = Extract<PublicPart, { type: "tool_call" }>;
 type ToolResult = Extract<PublicPart, { type: "tool_result" }>;
 type TablePart = Extract<PublicPart, { type: "table" }>;
 type DividerPart = Extract<PublicPart, { type: "divider" }>;
-type FinanceNotePart = Extract<PublicPart, { type: "finance_note" }>;
 
 export const RUNTIME_LABEL: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex" };
 const runtimeClass = (r: string | null | undefined) =>
@@ -202,53 +202,31 @@ export function DividerView({ d }: { d: DividerPart }) {
   );
 }
 
-/**
- * The server's note under an answer that used a finance tool (#30, FR-7.6·7.8): where the numbers come from and
- * as of when, a warning when the answer itself left that out, and the disclaimer.
- */
-export function FinanceNote({ note }: { note: FinanceNotePart }) {
-  return (
-    <div className="finance-note" data-testid="finance-note">
-      {note.missing.length > 0 && (
-        <div className="notice warn" data-testid="finance-missing">
-          ⚠️{" "}
-          {note.missing.includes("tool_meta")
-            ? "일부 숫자는 출처·기준 시각을 확인하지 못했어요."
-            : "답변에 출처·기준 시각이 빠진 부분이 있어 아래 기준을 덧붙였어요."}
-        </div>
-      )}
-      {note.sources.length > 0 && (
-        <ul className="sources" aria-label="출처·기준 시각">
-          {note.sources.map((src) => (
-            <li key={src.label}>{src.label}</li>
-          ))}
-        </ul>
-      )}
-      <p className="disclaimer">{note.disclaimer}</p>
-    </div>
-  );
-}
-
 const PartView = memo(function PartView({
   part,
   cite,
   text,
+  sources,
 }: {
   part: PublicPart;
   cite?: MarkdownCite | undefined;
   text: string;
+  /** The answer's source note parts (#185): drawn once, as one box, where the first of them is. */
+  sources?: SourceNoteParts | undefined;
 }) {
   switch (part.type) {
     case "text":
       return <RichText text={part.text} cite={cite} />;
+    // The source note (#185): a citation note and a finance note of the same answer are one "출처" box.
     case "citation_note":
-      return <CitationSources note={part} text={text} />;
+    case "finance_note":
+      return sources ? (
+        <SourceNote citation={sources.citation} finance={sources.finance} text={text} />
+      ) : null;
     case "table":
       return <TableView t={part} />;
     case "divider":
       return <DividerView d={part} />;
-    case "finance_note":
-      return <FinanceNote note={part} />;
     // An artifact the reply made or changed (#28): a card that opens the artifact page (#172).
     case "artifact_ref":
       return <ArtifactCard id={part.artifactId} version={part.version} />;
@@ -300,6 +278,7 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
   }, [note]);
   // The answer text as the server joined it (the note's ranges point into it).
   const answer = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
+  const sources = useMemo(() => sourceNoteOf(parts), [parts]);
   return (
     <>
       {segments(parts).map((s) =>
@@ -322,7 +301,13 @@ export function Parts({ parts, streaming = false }: { parts: readonly PublicPart
             ))}
           </Fragment>
         ) : (
-          <PartView key={s.index} part={s.part} cite={cite} text={answer} />
+          <PartView
+            key={s.index}
+            part={s.part}
+            cite={cite}
+            text={answer}
+            sources={sources && s.index === sources.at ? sources : undefined}
+          />
         ),
       )}
     </>

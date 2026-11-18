@@ -209,7 +209,8 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "finance_results.message_id": ID,
   "finance_results.conversation_id": ID,
   "finance_results.run_id": ID,
-  "finance_results.evidence": { write: "FinanceResultStore.save", rescrub: "deep" },
+  // No longer written (#185); old rows are still rescrubbed.
+  "finance_results.evidence": { write: "none since #185 (was FinanceResultStore.save)", rescrub: "deep" },
   // Citations (#25): the snippet is model output about page text, the quote is page text.
   "citations.id": ID,
   "citations.run_id": ID,

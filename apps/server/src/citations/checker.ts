@@ -1,7 +1,7 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
-import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
-import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
+import { CITE_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import { FILE_CITE_TOOL } from "@agentlee/mcp-tools/files";
 import {
   boundText,
   CITATION_LIMITS,
@@ -16,13 +16,20 @@ import {
   type MessagePart,
 } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX } from "../runtime/lockdown.js";
+import { sourceKindOf, usedSourceKinds } from "../sources/provenance.js";
 import type { CitationStore } from "./store.js";
 
 /**
- * The citation check at the end of a run (#25, PRD FR-5.1·5.2, 수용 기준 3). It runs where the finance check runs
- * (RunManager `attachNoteTo`: every run end, stopped answers and answers recovered after a restart too) on every
- * answer that used a web tool (search, fetch, the source list, a search skill), read an uploaded file (#48) or
- * cited a source:
+ * The citation check at the end of a run (#25, PRD FR-5.1·5.2, 수용 기준 3) — the numbered part of an answer's source
+ * note (#185, `sources/provenance.ts`). It runs where the finance check runs (RunManager `attachNoteTo`: every run
+ * end, stopped answers and answers recovered after a restart too) and applies **only by provenance**: the answer
+ * used a web or file source tool (search, fetch, the source list, a search skill, reading an uploaded file #48),
+ * registered a citation, or carries numbers of the answer before that the server checked again (#150). An `[n]` in
+ * an answer that did none of these is text, not a citation: no note (#185 — the note is never decided from the text).
+ * Marker validation is separate from that (review #190 1차): a no-tool answer whose sentence-end `[n]` carry nothing
+ * gets an `unbacked` note — no sources, every such marker `unknown_source` — so the screen flags the marker in the
+ * text and shows no source box. Arrays (`a[1]`), code and links are never markers.
+ * When it applies:
  * - every `[n]` of the answer, with the status the server gave that citation when the model registered it —
  *   a marker no `cite` produced is `unknown_source`;
  * - the body paragraphs without any marker (headings, list lead-ins, disclaimers excluded) — "일부 내용에 출처
@@ -31,22 +38,10 @@ import type { CitationStore } from "./store.js";
  * the tool results a runtime reports.
  */
 
-const WEB_TOOL_NAMES: ReadonlySet<string> = new Set([
-  WEB_SEARCH_TOOL.name,
-  WEB_FETCH_TOOL.name,
-  SOURCES_LIST_TOOL.name,
-  CITE_TOOL.name,
-  skillToolName(GOOGLE_NEWS_SKILL.name),
-  skillToolName(SEARCH_GOOGLE_SKILL.name),
-  // Reading an uploaded file's text (#48) is using a source too: the same check applies to that answer.
-  FILE_READ_TOOL.name,
-  FILE_SEARCH_TOOL.name,
-  FILE_CITE_TOOL.name,
-]);
-
+/** A web or file source tool (#25, #48): its use makes the citation check apply. */
 export function isWebTool(name: string): boolean {
-  const bare = name.startsWith(OUR_TOOL_PREFIX) ? name.slice(OUR_TOOL_PREFIX.length) : name;
-  return WEB_TOOL_NAMES.has(bare);
+  const kind = sourceKindOf(name);
+  return kind === "web" || kind === "file";
 }
 
 /** The answer text as the screen joins it (text parts, in order, no separator). */
@@ -118,7 +113,9 @@ const ownsNumbers = (name: string) =>
  * to (or fetches something new), every number is this run's: a marker without a citation of this run stays
  * `unknown_source`, whatever an earlier answer had under that number. File citations are not carried (their check
  * waits for the extraction); they stay `unknown_source`. An answer that carries a number is an answer using
- * sources: its paragraphs without a marker are flagged as missing (review #153).
+ * sources: its paragraphs without a marker are flagged as missing (review #153). An answer that used no source tool
+ * and carries no number (nothing earlier under it, or the recheck failed) has no sources: its markers get an
+ * `unbacked` note only (#185, review #190 1차).
  */
 export type CitationCarry = {
   conversationId: string;
@@ -134,11 +131,12 @@ export function citationNote(
   carry?: CitationCarry,
 ): CitationNotePart | undefined {
   const rows = store.forRun(runId);
-  const used = rows.length > 0 || parts.some((p) => p.type === "tool_call" && isWebTool(p.name));
+  const kinds = usedSourceKinds(parts);
+  const used = rows.length > 0 || kinds.has("web") || kinds.has("file");
   const text = answerText(parts);
   if (!text.trim()) return undefined;
-  // No web tool and no citation: an answer whose sentences still end in `[n]` pretends to cite — those markers
-  // are checked (and are unknown). Other `[n]` (a[1], code, links) and the paragraphs are left alone.
+  // No source tool and no citation: only sentence-end `[n]` can be numbers carried over (a[1], code and links are
+  // text). Whether there is a note at all is decided below — by the carry-over, not by the markers.
   const markers = (used ? citationMarkers(text) : sentenceEndMarkers(text)).slice(0, CITATION_LIMITS.markers);
   if (!used && !markers.length) return undefined;
   const byN = new Map(rows.map((r) => [r.n, r]));
@@ -214,6 +212,17 @@ export function citationNote(
       quote: bound(r.status === "verified" ? r.quote : r.snippet, CITATION_LIMITS.snippet),
     };
   });
+  // Provenance only (#185): an answer that used no source tool and carried no number has no sources — it gets no
+  // source note. Its sentence-end markers still stand where citations stand, so they are not left to read as real
+  // ones: a note *without sources* (`unbacked`) marks each of them unverified in the text (review #190 1차).
+  if (!used && !carriedAny)
+    return {
+      type: "citation_note",
+      citations,
+      missing: [],
+      markers: markers.map(({ n, start, end }) => ({ n, start, end })),
+      unbacked: true,
+    };
   // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
   const missing =
     used || carriedAny
