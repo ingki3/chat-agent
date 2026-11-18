@@ -155,10 +155,14 @@ export type Proc = { pid: number; rss: number };
 /**
  * Resident memory (KiB) of one process via `ps` — or, with `group`, of every process of the process group it leads
  * (#191: `fork`; the caller adds them up). Rejects when ps fails, times out or prints nothing usable.
+ * `group` means a `detached` child (it leads both a session and a process group, and nothing in it calls setsid or
+ * setpgid — #170): that set is selected by process group on macOS (`ps -g`) and by session on Linux, where procps
+ * reads a numeric `-g` as a session id anyway (`ps -s`, said explicitly).
  */
 export function snapshot(pid: number, timeoutMs = 2000, group = false): Promise<Proc[]> {
+  const select = group ? (process.platform === "linux" ? "-s" : "-g") : "-p";
   return new Promise((resolve, reject) => {
-    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", ...(group ? ["-g", String(pid)] : ["-p", String(pid)])], {
+    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", select, String(pid)], {
       env: {},
     });
     let out = "";
@@ -387,6 +391,13 @@ export type SpawnIsolatedOptions = SandboxPolicy & {
    * writes fd 4 (#51), so the renderer is driven without a listening port.
    */
   extraPipes?: number;
+  /**
+   * A supervisor in front of `sandbox-exec`, outside the sandbox: its argv, followed by sandbox-exec's own (e.g. the
+   * render watchdog, #170, which starts the sandboxed program as its child and kills it when the server is gone).
+   */
+  wrap?: string[];
+  /** Descriptors of this process handed to the child after the extra pipes (fd 3 + extraPipes, …) — e.g. a lock. */
+  inheritFds?: number[];
 };
 
 /**
@@ -401,11 +412,13 @@ export function spawnIsolated(o: SpawnIsolatedOptions): ChildProcessWithoutNullS
   const linked = [...o.read, ...o.write].flatMap((p) => findHardLinks(canonicalPath(p)));
   if (linked.length) throw new HardLinkError(linked);
   const profile = buildProfile(o);
-  const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, o.command, ...o.args], {
+  const sandboxed = ["/usr/bin/sandbox-exec", "-p", profile, o.command, ...o.args];
+  const [command, ...args] = o.wrap?.length ? [...o.wrap, ...sandboxed] : sandboxed;
+  const child = spawn(command!, args, {
     cwd: o.cwd,
     env: o.env,
     detached: true,
-    stdio: Array<"pipe">(3 + (o.extraPipes ?? 0)).fill("pipe"),
+    stdio: [...Array<"pipe">(3 + (o.extraPipes ?? 0)).fill("pipe"), ...(o.inheritFds ?? [])],
   }) as ChildProcessWithoutNullStreams & { isolationKill?: "memory" | "monitor" };
   const pid = child.pid;
   let exited = false;
