@@ -1,6 +1,6 @@
 ---
 id: common
-version: 7
+version: 8
 ---
 # Agent Lee 공통 지침
 
