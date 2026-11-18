@@ -365,6 +365,10 @@ export function registerFileRoutes(
       const loc = req.query.loc === undefined ? undefined : parseLocParam(req.query.loc);
       if (req.query.loc !== undefined && !loc)
         return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
+      // `cite`: omitted, or one citation id — anything else (empty, too long, given twice) is refused.
+      const citeRaw: unknown = req.query.cite;
+      if (citeRaw !== undefined && (typeof citeRaw !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(citeRaw)))
+        return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
       const fromRaw = req.query.from === undefined ? undefined : Number.parseInt(req.query.from, 10);
       const from = fromRaw === undefined || !Number.isFinite(fromRaw) ? undefined : Math.max(0, fromRaw);
       const limit = Math.max(1, Math.min(VIEW_MAX, Number.parseInt(req.query.limit ?? "", 10) || VIEW_LIMIT));
@@ -373,25 +377,39 @@ export function registerFileRoutes(
       const items = all.map((seg) => viewSegment(f, seg));
       let target = null;
       if (loc) {
-        // A link that names its citation (`cite`, #186 review 5차) is judged by that citation alone (none when the
-        // caller may not see it); an older link by every citation at the place.
-        const cite =
-          typeof req.query.cite === "string" && req.query.cite.length <= 64 ? req.query.cite : undefined;
-        const cited = store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
-          if (p && !p.citations.has(c.id)) return [];
-          if (cite !== undefined && c.id !== cite) return [];
-          try {
-            const raw = JSON.parse(c.locator) as { textHash?: unknown; sheetNo?: unknown };
-            const l = FileLocator.safeParse(raw);
-            const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
-            const sheetNo = typeof raw.sheetNo === "number" ? raw.sheetNo : undefined;
-            return l.success
-              ? [{ locator: l.data, quote: c.quote, textHash, unitHash: c.unitHash, sheetNo }]
-              : [];
-          } catch {
-            return [];
-          }
-        });
+        // The citation the link opens (`cite`, #186 review 5·6차): the range is judged by that one alone — a link
+        // naming none (an older link, or a copy whose row was not copied) opens at the unit only, never exact.
+        const cite = req.query.cite;
+        const cited =
+          cite === undefined
+            ? []
+            : store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
+                if (c.id !== cite || (p && !p.citations.has(c.id))) return [];
+                try {
+                  const raw = JSON.parse(c.locator) as {
+                    textHash?: unknown;
+                    sheetNo?: unknown;
+                    spans?: unknown;
+                  };
+                  const l = FileLocator.safeParse(raw);
+                  const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
+                  const sheetNo = typeof raw.sheetNo === "number" ? raw.sheetNo : undefined;
+                  return l.success
+                    ? [
+                        {
+                          locator: l.data,
+                          quote: c.quote,
+                          textHash,
+                          unitHash: c.unitHash,
+                          sheetNo,
+                          spans: raw.spans === true,
+                        },
+                      ]
+                    : [];
+                } catch {
+                  return [];
+                }
+              });
         const units = new Map(
           all.map((s) => [s.seq, { hash: unitHashOf(s), sheetNo: unitAddressOf(f, s).sheetNo }] as const),
         );

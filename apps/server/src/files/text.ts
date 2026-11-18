@@ -58,7 +58,12 @@ type StoredLoc = UnitLocator & { sheetNo?: number; split?: boolean };
  * checked — the viewer claims the range exact only while that text is still the same (a secret registered later
  * moves offsets). Stored with the citation, never shown to the model or in a note.
  */
-export type CitedLocator = FileLocator & { sheetNo?: number | undefined; textHash?: string | undefined };
+export type CitedLocator = FileLocator & {
+  sheetNo?: number | undefined;
+  textHash?: string | undefined;
+  /** The passage went on past the line it is placed on (#186 review 6차: the viewer says it shows its start). */
+  spans?: boolean | undefined;
+};
 
 /** The `textHash` of a unit's text up to `end`. */
 export const prefixHash = (text: string, end: number) =>
@@ -499,8 +504,9 @@ export class FileTools {
    * no sheet at all.
    */
   modelLocator(loc: CitedLocator): { locator: FileLocator; label: string } {
-    const { sheetNo, textHash: _h, ...rest } = loc;
+    const { sheetNo, textHash: _h, spans: _s, ...rest } = loc;
     void _h;
+    void _s;
     return forModel(rest, sheetNo);
   }
 
@@ -611,6 +617,8 @@ function verifiedAt(
           ...(sheetNo !== undefined ? { sheetNo } : {}),
           // Only a passage with a range gets one: the text it was found in, up to its end.
           ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
+          // Placed on its first line, a passage over several lines is highlighted from its start only.
+          ...(where.kind === "line" && seg.text.slice(m.start, m.end).includes("\n") ? { spans: true } : {}),
         }
       : null,
     unitHash: unitHashOf(seg),

@@ -43,6 +43,8 @@ export type CitedPassage = {
   unitHash?: string | null | undefined;
   /** The cited XLSX row's sheet number (stored with the citation): the sheet's address when names are masked alike. */
   sheetNo?: number | undefined;
+  /** The passage went on past the line it is placed on (recorded when it was found, #186 review 6차). */
+  spans?: boolean | undefined;
 };
 
 /** What the viewer knows of each unit now, by `seq`: its `unitHashOf` and its sheet's number (#186 review 4·5차). */
@@ -88,8 +90,18 @@ export function viewSegment(file: Pick<FileRow, "id" | "sha256">, seg: SegmentRo
     approximate,
     cut: !!seg.cut,
     split: storedSplit(seg),
+    ...(sheetNoOf(seg) !== undefined ? { sheetNo: sheetNoOf(seg) } : {}),
   };
 }
+
+const sheetNoOf = (seg: SegmentRow): number | undefined => {
+  try {
+    const n = (JSON.parse(seg.locator) as { sheetNo?: unknown }).sheetNo;
+    return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 /** Sheet names are file text: compared as served (scrubbed with the secrets known now). */
 const sheetOf = (l: FileLocator) =>
@@ -165,10 +177,10 @@ export function resolveTarget(
   if (extract.status === "pending") return none("unreadable", "pending");
   if (extract.status !== "ok") return none("unreadable", "failed");
 
-  // The sheet by its number when the citations at this place agree on one (names may be masked alike).
-  const nos = new Set(cited.filter((c) => key(c.locator) === key(loc)).map((c) => c.sheetNo));
-  const no = nos.size === 1 ? [...nos][0] : undefined;
-  const place = { ...loc, ...(no !== undefined ? { sheetNo: no } : {}) };
+  // The link's own citation (the caller passes that one only — none for a link naming no citation, review #186 6차):
+  // its sheet by number (names may be masked alike).
+  const mine = cited.find((c) => key(c.locator) === key(loc));
+  const place = { ...loc, ...(mine?.sheetNo !== undefined ? { sheetNo: mine.sheetNo } : {}) };
   let hits = items.filter((s) => sameUnit(s, place, units.get(s.seq)?.sheetNo));
   if (!hits.length && loc.kind === "line" && loc.line !== undefined) {
     const run = approximateRun(items, loc.line);
@@ -215,16 +227,14 @@ export function resolveTarget(
     // A citation the caller may see gave this locator, and the unit's text up to the passage's end is still the text
     // it was checked in (review #123: the same quote elsewhere after a shift is not the cited place).
     const now = units.get(only!.seq)?.hash;
-    // The citations at this place (the caller passes only the link's own one when it names one): every one of them
-    // must stand behind the range — a unit hash when it has one, else the quote and prefix hash (older rows). When
-    // they disagree (an old citation now changed, a new one there), no range is claimed (review #186 5차).
-    const here = cited.filter((c) => key(c.locator) === k);
+    // The link's own citation must stand behind the range: a unit hash when it has one, else the quote and prefix
+    // hash (older rows). A link naming no citation is never exact.
     const holds = (c: CitedPassage) =>
       c.unitHash ? c.unitHash === now : c.quote === at && c.textHash === before;
-    if (!here.length || !here.every(holds)) {
+    if (!mine || key(mine.locator) !== k || !holds(mine)) {
       reasons.add("unverified");
       range = undefined;
-    } else if (here.some((c) => c.quote !== at)) start = true;
+    } else if (mine.spans) start = true;
   }
   if (range && only) {
     const over = only.marks.filter(

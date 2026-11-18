@@ -2782,7 +2782,7 @@ describe("수용 기준 2: PDF 1 + HWP 1 비교 요약 in both runtimes (#24)", 
       for (const x of cites) {
         const res = await get(
           f.cookies.owner,
-          `/api/files/${x.locator!.fileId}/view?loc=${encodeURIComponent(JSON.stringify(x.locator))}`,
+          `/api/files/${x.locator!.fileId}/view?loc=${encodeURIComponent(JSON.stringify(x.locator))}&cite=${x.citationId}`,
         );
         expect(res.statusCode, rt).toBe(200);
         expect((res.json() as { target: { status: string } }).target.status, rt).toBe("exact");
@@ -3930,7 +3930,9 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
     const cited = first.note!.citations[0]!;
     expect([cited.status, cited.locator?.line]).toEqual(["verified", 60]);
-    expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status).toBe("exact");
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target?.status,
+    ).toBe("exact");
     // Line 5 (another stored unit) gets the sentence, 50 times and quoted: line 60 stays, and the viewer agrees.
     editRun(db, file.id, "줄 5 내용", (n, l) =>
       n === 5 ? `${`${ONLY_HERE} `.repeat(50)}“${ONLY_HERE}”` : l,
@@ -3938,7 +3940,9 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     const again = await send(f.cookies.owner, c.id, "/again1");
     const kept = again.note!.citations[0]!;
     expect([kept.status, kept.locator]).toEqual(["verified", cited.locator]);
-    expect((await viewAt(app, f.cookies.owner, file.id, kept.locator!)).target?.status).toBe("exact");
+    expect((await viewAt(app, f.cookies.owner, file.id, kept.locator!, kept.citationId)).target?.status).toBe(
+      "exact",
+    );
     // Any change in the cited unit (another line of the same stored run — before or after it): not verified, and the
     // viewer no longer claims the range either.
     for (const n of [55, 65]) {
@@ -3947,9 +3951,10 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
         (await send(f.cookies.owner, c.id, "/again1")).note!.citations.map((x) => x.status),
         `${n}`,
       ).toEqual(["snippet_not_found"]);
-      expect((await viewAt(app, f.cookies.owner, file.id, cited.locator!)).target?.status, `${n}`).not.toBe(
-        "exact",
-      );
+      expect(
+        (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target?.status,
+        `${n}`,
+      ).not.toBe("exact");
       editRun(db, file.id, "줄 41 내용", (k, l) => (k === n ? `줄 ${n} 내용입니다.` : l));
       expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status, `${n}`).toBe(
         "verified",
@@ -3975,10 +3980,12 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
       Buffer.from("Approved amount is USD 100.\n"),
     );
     await app.fileExtracts!.idle();
-    expect(
-      (await send(f.cookies.owner, c.id, `/cite ${amount.id} amount`, undefined, [amount.id])).note!
-        .citations[0]!.status,
-    ).toBe("verified");
+    const a1 = (await send(f.cookies.owner, c.id, `/cite ${amount.id} amount`, undefined, [amount.id])).note!
+      .citations[0]!;
+    expect(a1.status).toBe("verified");
+    // One line only: exact, the whole passage (no "start only").
+    const single = (await viewAt(app, f.cookies.owner, amount.id, a1.locator!, a1.citationId)).target;
+    expect([single?.status, single?.start]).toEqual(["exact", undefined]);
     editRun(db, amount.id, "Approved", () => "Approved amount is USD 1000.");
     expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
       "snippet_not_found",
@@ -4004,9 +4011,8 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
       status: "exact",
       start: true,
     });
-    expect(
-      (await viewAt(app, f.cookies.owner, amount.id, { ...t2.locator!, fileId: amount.id })).target?.start,
-    ).toBeUndefined();
+    // A link naming no citation (an older one, or a copy without its row) opens at the unit only (review 6차).
+    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!)).target?.status).toBe("unit");
 
     // An identical re-extraction (as for a new extractor version — the rows' prefix hashes are cleared): still
     // verified, still exact.
@@ -4019,14 +4025,18 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect(JSON.parse(row.locator).textHash).toBeUndefined();
     const t3 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
     expect([t3.status, t3.locator]).toEqual(["verified", t1.locator]);
-    expect((await viewAt(app, f.cookies.owner, two.id, t3.locator!)).target?.status).toBe("exact");
+    expect((await viewAt(app, f.cookies.owner, two.id, t3.locator!, t3.citationId)).target?.status).toBe(
+      "exact",
+    );
 
     // A value of the cited unit masked now (registered later, on another line): the unit is not the one verified.
     knownSecrets.add(late);
     closers.push(() => knownSecrets.remove(late));
     const masked = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
     expect(masked.status).not.toBe("verified");
-    expect((await viewAt(app, f.cookies.owner, two.id, t1.locator!)).target?.status).not.toBe("exact");
+    expect((await viewAt(app, f.cookies.owner, two.id, t1.locator!, t1.citationId)).target?.status).not.toBe(
+      "exact",
+    );
   }, 30_000); // several runs and extractions in a row
 
   it("[P2 4차] a cell moved (the same row text, its cell now B1 instead of A1): not verified", async () => {
@@ -4177,4 +4187,43 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     ).not.toBe("exact");
     expect((await viewAt(app, f.cookies.owner, file.id, old.locator!)).target?.status).not.toBe("exact");
   }, 30_000); // several runs and extractions in a row
+
+  it("[P3 6차] a malformed cite is refused (only an omitted one is 'no citation'); a passage over two lines whose first line passes the display limit still says 'start'", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // The first line is 600 characters of "&amp; " (it reads "& …"): the passage goes on to the next line.
+    SNIPPETS.amp = `${"& ".repeat(100).trim()} 끝 문장입니다`;
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "amp.txt",
+      Buffer.from(`${"&amp; ".repeat(100).trim()}\n끝 문장입니다.\n`),
+    );
+    await app.fileExtracts!.idle();
+    const cited = (await send(f.cookies.owner, c.id, `/cite ${file.id} amp`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([cited.status, cited.locator?.line]).toEqual(["verified", 1]);
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target,
+    ).toMatchObject({
+      status: "exact",
+      start: true,
+    });
+    const at = (q: string) =>
+      app.inject({
+        method: "GET",
+        url: `/api/files/${file.id}/view?loc=${encodeURIComponent(JSON.stringify(cited.locator))}${q}`,
+        headers: { ...LOCAL, cookie: f.cookies.owner },
+      });
+    for (const q of [
+      "&cite=",
+      `&cite=${"a".repeat(65)}`,
+      `&cite=${cited.citationId}&cite=${cited.citationId}`,
+      "&cite=a%20b",
+    ])
+      expect((await at(q)).statusCode, q).toBe(400);
+    expect((await at("")).statusCode).toBe(200);
+    // An id the caller has no such citation for: a unit, never exact.
+    expect(((await at("&cite=nope")).json() as { target: { status: string } }).target.status).toBe("unit");
+  }, 30_000);
 });

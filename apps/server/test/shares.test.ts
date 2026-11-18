@@ -1567,7 +1567,16 @@ describe("fork — remapParts (#52)", () => {
       publishedAt: null,
       quote: "파일의 구절이에요 열두 쪽",
       ...(locator && fileId
-        ? { locator: { fileId, fileRevision: rev, kind: "page" as const, page: 12 } }
+        ? {
+            locator: {
+              fileId,
+              fileRevision: rev,
+              kind: "page" as const,
+              page: 12,
+              charRange: [3, 9] as [number, number],
+              bbox: [0.1, 0.1, 0.2, 0.05] as [number, number, number, number],
+            },
+          }
         : {}),
       ...(fileId ? { fileId } : {}),
       citationId: `c${n}`,
@@ -1596,6 +1605,26 @@ describe("fork — remapParts (#52)", () => {
     expect(JSON.stringify(out)).not.toMatch(/"f[12]"/);
     // The citation rows copied into the fork (review 2차); one not copied is cut.
     expect(cites.map((c) => c.citationId)).toEqual(["C1", "C2", undefined, undefined]);
+    // A note whose row was not copied keeps its place as a unit only (review #186 6차): no range, no box.
+    const legacyNote = remapParts(
+      [
+        {
+          type: "citation_note",
+          missing: [],
+          markers: [],
+          citations: [{ ...entry(5, "f1", true), citationId: "c-not-copied" }],
+        },
+      ],
+      ids,
+    )[0]!;
+    const legacy = legacyNote.type === "citation_note" ? legacyNote.citations[0]! : undefined;
+    expect([legacy?.citationId, legacy?.locator?.fileId, legacy?.locator?.page]).toEqual([
+      undefined,
+      "F1",
+      12,
+    ]);
+    expect([legacy?.locator?.charRange, legacy?.locator?.bbox]).toEqual([undefined, undefined]);
+    expect(cites[0]!.locator?.charRange).toEqual([3, 9]);
     expect(JSON.stringify(out)).not.toMatch(/"c[1-4]"/);
     expect(CitationNotePart.parse(note)).toEqual(note);
   });

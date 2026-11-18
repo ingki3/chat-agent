@@ -1,5 +1,11 @@
 import crypto from "node:crypto";
-import { DocumentRef, MessagePart, type ChatSettings, type Message } from "@agentlee/shared";
+import {
+  DocumentRef,
+  MessagePart,
+  type ChatSettings,
+  type FileLocator,
+  type Message,
+} from "@agentlee/shared";
 import type { ArtifactStore, ArtifactRow } from "../artifacts/store.js";
 import type { FileWriteLock } from "../backup/lock.js";
 import type { ConversationRow, ConversationStore } from "../conversations/store.js";
@@ -36,6 +42,14 @@ const UNFINISHED = new Set<Message["status"]>(["pending", "streaming"]);
  * sources. A reference to something the copy does not have is dropped (a card, a chip) or cut (a note's source), never
  * left pointing at the original. `citation_ref` parts point at citation rows of the original's runs: dropped.
  */
+/** A locator without its range and box: the unit it names only. */
+function unitOnly(l: FileLocator): FileLocator {
+  const { charRange: _r, bbox: _b, ...rest } = l;
+  void _r;
+  void _b;
+  return rest;
+}
+
 export function remapParts(parts: readonly MessagePart[], ids: IdMap): MessagePart[] {
   const version = (artifactId: string, v: number | undefined) => {
     const a = ids.artifact.get(artifactId);
@@ -87,7 +101,10 @@ export function remapParts(parts: readonly MessagePart[], ids: IdMap): MessagePa
               return {
                 ...rest,
                 sourceId: c.sourceId ? (ids.source.get(c.sourceId) ?? null) : null,
-                ...(locator && fileId ? { locator: { ...locator, fileId } } : {}),
+                // Without its row in the copy the place is a unit only (review #186 6차): no range to stand behind.
+                ...(locator && fileId
+                  ? { locator: rowCopy ? { ...locator, fileId } : unitOnly({ ...locator, fileId }) }
+                  : {}),
                 ...(copy ? { fileId: copy } : {}),
                 ...(rowCopy ? { citationId: rowCopy } : {}),
               };

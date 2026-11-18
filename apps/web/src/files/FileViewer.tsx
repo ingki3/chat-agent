@@ -55,15 +55,16 @@ export function FileViewerPage({ conversationId, fileId }: { conversationId: str
   const { search } = useLocation();
   const params = new URLSearchParams(search);
   const loc = parseLocParam(params.get("loc"));
-  // The citation the link opens (#186 review 5차): the server judges the range by it alone.
-  const cite = params.get("cite")?.slice(0, 64) || undefined;
+  // The citation the link opens (#186 review 5·6차): the server judges the range by it alone. Only a missing one is
+  // "none" — any value given (even empty) goes to the server as it is, which refuses a malformed one.
+  const cite = params.get("cite") ?? undefined;
   const navigate = useNavigate();
   const fetch: ViewFetch = (o, signal) => files.view(fileId, { ...o, cite }, signal);
   // This visit: no query of an earlier one (a request still on its way included) is ever read here.
   const [visit] = useState(newVisit);
   // The opening window (and the locator's resolution) is its own query; the text before and after it pages from
   // it, only when asked (review #123 2차: a refetch never loses the opening window).
-  const view = useQuery(openingQuery(visit, fileId, loc, fetch));
+  const view = useQuery(openingQuery(visit, fileId, loc, fetch, cite));
   const [askedBefore, setAskedBefore] = useState(false);
   const [askedAfter, setAskedAfter] = useState(false);
   const earlier = useInfiniteQuery(pagingQuery("before", visit, fileId, loc, view.data, fetch, askedBefore));

@@ -49,6 +49,8 @@ export const ViewSegment = z.object({
   cut: z.boolean(),
   /** One piece of a paragraph or table row split in reading order (HWP, #23): its offsets are not the unit's. */
   split: z.boolean(),
+  /** An XLSX row's sheet by its number in the workbook (#186 review 6차: names may be masked alike). */
+  sheetNo: z.number().int().positive().optional(),
 });
 export type ViewSegment = z.infer<typeof ViewSegment>;
 

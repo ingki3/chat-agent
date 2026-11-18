@@ -24,12 +24,19 @@ let visits = 0;
 /** A new visit id (one per mount of the viewer). */
 export const newVisit = () => ++visits;
 
-const baseKey = (visit: number, fileId: string, loc: FileLocator | undefined) =>
-  ["file-view", visit, fileId, loc ? JSON.stringify(loc) : null] as const;
+const baseKey = (visit: number, fileId: string, loc: FileLocator | undefined, cite?: string) =>
+  ["file-view", visit, fileId, loc ? JSON.stringify(loc) : null, cite ?? null] as const;
 
-export function openingQuery(visit: number, fileId: string, loc: FileLocator | undefined, fetch: ViewFetch) {
+export function openingQuery(
+  visit: number,
+  fileId: string,
+  loc: FileLocator | undefined,
+  fetch: ViewFetch,
+  /** The citation the link opens (#186 review 6차): another one is another target, so another query. */
+  cite?: string,
+) {
   return queryOptions({
-    queryKey: [...baseKey(visit, fileId, loc), "opening"],
+    queryKey: [...baseKey(visit, fileId, loc, cite), "opening"],
     queryFn: ({ signal }) => fetch({ loc }, signal),
     retry: false,
     staleTime: 0,

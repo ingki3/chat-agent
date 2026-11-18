@@ -726,7 +726,7 @@ export const files = {
   ) => {
     const q = new URLSearchParams();
     if (opts.loc) q.set("loc", JSON.stringify(opts.loc));
-    if (opts.loc && opts.cite) q.set("cite", opts.cite);
+    if (opts.loc && opts.cite !== undefined) q.set("cite", opts.cite);
     if (opts.from !== undefined) q.set("from", String(opts.from));
     if (opts.to !== undefined) q.set("to", String(opts.to));
     const qs = q.toString();
