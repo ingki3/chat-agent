@@ -20,14 +20,7 @@ import {
   sessionDayOf,
   CALENDAR_YEARS,
 } from "../src/finance/calendar.js";
-import {
-  checkAnswer,
-  mergeEvidence,
-  storedEvidence,
-  financeEvidence,
-  figuresOf,
-  financeNote,
-} from "../src/finance/checker.js";
+import { checkAnswer, financeEvidence, figuresOf, financeNote } from "../src/finance/checker.js";
 import { checkRecords, finalize, marketStamp } from "../src/finance/records.js";
 import { allowed, FINANCE_CODES, FinanceService } from "../src/finance/service.js";
 import { TOOL_IMPLS } from "../src/finance/providers.js";
@@ -853,23 +846,28 @@ describe("finance output check (#30)", () => {
     expect(financeNote(parts("", [usOut]))).toBeUndefined();
   });
 
-  it("follow-ups: the stored evidence of earlier answers, merged, keeps later answers checked", () => {
-    const first = storedEvidence(parts("AAPL 349.8달러, 삼성전자 206,000원", [usOut, krOut]))!;
-    expect(storedEvidence([{ type: "text", text: "네, 정규장 마감 가격이에요." }])).toBeUndefined();
-    const ctx = mergeEvidence([first])!;
-    expect(ctx.sources).toEqual([src(yahoo), src(naver)]);
-    expect(financeNote([{ type: "text", text: "349.8달러와 206,000원이에요." }], ctx)).toMatchObject({
-      sources: [src(yahoo), src(naver)],
-      missing: ["source", "as_of"],
+  it("provenance only (#185): no finance tool in this answer, no note — whatever figures its text has", () => {
+    // Figures, a finance source named, a price equal to an earlier result: none of it makes a note.
+    for (const text of [
+      "349.8달러와 206,000원이에요.",
+      "Yahoo Finance · 2026-11-13 16:00 ET 종가 349.8달러",
+      "최대 2시간, 진행자 1명과 게스트 2명이에요.",
+    ])
+      expect(financeNote([{ type: "text", text }]), text).toBeUndefined();
+    // Another source tool (a web search) is not a finance source.
+    expect(financeNote(parts("349.8달러", [{ results: [] }], "mcp__agentlee__web_search"))).toBeUndefined();
+    // A finance tool call in this answer — even one that failed — is a finance answer: the note and the disclaimer.
+    const failed: MessagePart[] = [
+      { type: "tool_call", id: "c0", name: "us_quote", input: { symbol: "AAPL" } },
+      { type: "tool_result", callId: "c0", output: { error: "finance_not_found" }, isError: true },
+      { type: "text", text: "찾지 못했어요." },
+    ];
+    expect(financeNote(failed)).toEqual({
+      type: "finance_note",
+      sources: [],
+      missing: [],
+      disclaimer: FINANCE_DISCLAIMER,
     });
-    expect(
-      financeNote(
-        [{ type: "text", text: "Yahoo 11월 13일 종가 349.8달러, 네이버 증권 11월 13일 종가 206,000원." }],
-        ctx,
-      )!.missing,
-    ).toEqual([]);
-    expect(financeNote([{ type: "text", text: "천만에요!" }], ctx)).toBeUndefined();
-    expect(mergeEvidence([])).toBeUndefined();
   });
 
   it("identifiers never take a price with them (review #93 round 2)", () => {

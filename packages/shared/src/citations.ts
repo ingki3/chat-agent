@@ -95,8 +95,11 @@ export const TextRange = z.object({
 export type TextRange = z.infer<typeof TextRange>;
 
 /**
- * Added by the server at the end of an answer that used web tools or cited sources (#25). `citations`: every
+ * Added by the server at the end of an answer that used web or file source tools, cited sources, or carries numbers
+ * of the answer before (#25, #150) — decided by those tool calls only, never by the text (#185). `citations`: every
  * marker the answer uses, by number. `missing`: body paragraphs without a marker (empty when every one has one).
+ * The numbered part of the answer's source note: the screen shows it in one "출처" box with the `finance_note`, if
+ * there is one.
  */
 export const CitationNotePart = z.object({
   type: z.literal("citation_note"),

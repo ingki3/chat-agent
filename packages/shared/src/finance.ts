@@ -26,7 +26,7 @@ export type FinanceMeta = z.infer<typeof FinanceMeta>;
 export const FinanceSource = FinanceMeta.extend({ label: z.string().min(1).max(160) });
 export type FinanceSource = z.infer<typeof FinanceSource>;
 
-/** Attached under every answer that used a finance tool (FR-7.8). */
+/** Shown in the source note of an answer that used a finance tool — and only of such an answer (FR-7.8, #185). */
 export const FINANCE_DISCLAIMER =
   "투자 판단의 참고 자료일 뿐이며 투자 권유가 아닙니다. Agent Lee는 매수·매도 같은 거래를 하지 않습니다.";
 
@@ -55,6 +55,14 @@ const ZONE_LABEL: Record<string, string> = {
 
 /** "Yahoo Finance · 2026-11-13 16:00 ET 종가", "네이버 증권 · 2026-11-13 10:12 KST 장중 (지연)". */
 export function financeLabel(m: FinanceMeta): string {
+  return `${m.source} · ${financeAsOfLabel(m)}`;
+}
+
+/**
+ * The as-of part of a finance source (#185: shown next to the source's name in the answer's source note):
+ * "2026-11-13 16:00 ET 종가", "2026-11-13 10:12 KST 장중 (지연)", "2026-09-30 보고치".
+ */
+export function financeAsOfLabel(m: FinanceMeta): string {
   const date = m.asOf.slice(0, 10);
   const time = m.asOf.slice(11, 16);
   const zone = ZONE_LABEL[m.timeZone] ?? m.timeZone;
@@ -64,7 +72,7 @@ export function financeLabel(m: FinanceMeta): string {
     m.kind === "estimate" ||
     (m.kind === "filing" && m.asOf.slice(11, 19) === "00:00:00");
   const when = dateOnly ? date : `${date} ${time} ${zone}`;
-  return `${m.source} · ${when} ${KIND_LABEL[m.kind]}${m.delayed ? " (지연)" : ""}`;
+  return `${when} ${KIND_LABEL[m.kind]}${m.delayed ? " (지연)" : ""}`;
 }
 
 // ---- 관심 종목 (#31, FR-7.7) ----------------------------------------------------------------------------------

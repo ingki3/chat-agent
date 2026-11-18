@@ -61,8 +61,7 @@ import {
   type Templates,
 } from "../instructions/assemble.js";
 import { docBudgetBytes, docVersionsKey, EMPTY_DOCS, fitMaterial, type DocSet } from "../memory/inject.js";
-import { financeNote, storedEvidence, type AnswerEvidence } from "../finance/checker.js";
-import { FinanceResultStore } from "../finance/results.js";
+import { financeNote } from "../finance/checker.js";
 import { citationNote } from "../citations/checker.js";
 import { CitationStore } from "../citations/store.js";
 import { ArtifactStore } from "../artifacts/store.js";
@@ -147,8 +146,6 @@ type Live = {
   failure?: unknown;
   /** What the provider said about a usage limit this run hit (#19). */
   limitInfo?: { resetsAt?: number; retryAfterMs?: number; modelFamily?: string };
-  /** Finance results of the recent conversation (#30): a follow-up that states figures is checked too. */
-  financeCarry?: AnswerEvidence | undefined;
   /**
    * Known-secret scrubbers of the text and reasoning streams (review round 23): what may still turn into a secret
    * with the next chunk is held back here, and goes out (scrubbed) at the next tool event or when the run ends.
@@ -443,8 +440,6 @@ export class RunManager {
   private readonly now: () => number;
   private readonly flushMs: number;
   private readonly templates: Templates;
-  /** Finance results per conversation (#30): follow-ups anywhere later are checked against them. */
-  private readonly financeResults: FinanceResultStore;
   /** Citations the `cite` tool registered (#25): the citation note at the end of a run is built from them. */
   private readonly citations: CitationStore;
   /** Artifacts (#28): a reply gets a card (`artifact_ref`) for each artifact its run made or changed. */
@@ -464,7 +459,6 @@ export class RunManager {
     this.flushMs = opts.flushMs ?? 500;
     this.mcpTokens = opts.mcpTokens ?? new McpTokens();
     this.templates = opts.instructions ?? defaultTemplates();
-    this.financeResults = new FinanceResultStore(db);
     // Rows from before keys were hashed (round 27): hashed once, in place.
     for (const r of db.$client
       .prepare(
@@ -522,13 +516,12 @@ export class RunManager {
       .where(inArray(runs.status, ["queued", "running"]))
       .all();
     for (const r of stale) {
-      // The partial answer kept from before the restart gets the common finance check (#30) and the citation
-      // check (#25) too.
+      // The partial answer kept from before the restart gets its source note (#185: finance #30, citations #25) too.
       const msg = this.conversations.messageById(r.assistantMessageId);
       if (msg) {
         // Scrubbed again: a secret registered since it was stored (updateMessage scrubs too).
         const parts = scrubParts(msg.parts as MessagePart[]);
-        this.attachNoteTo(r, parts, this.financeResults.context(r.conversationId, msg.seq));
+        this.attachNoteTo(r, parts);
         this.conversations.updateMessage(msg.id, { parts });
       }
       this.finish(r, "failed", "server_restart");
@@ -936,7 +929,7 @@ export class RunManager {
     const row = this.get(runId);
     if (!row) return this.drop(runId, live);
     this.releaseHeld(row, live);
-    this.attachNoteTo(row, live.parts, live.financeCarry);
+    this.attachNoteTo(row, live.parts);
     this.conversations.updateMessage(row.assistantMessageId, { parts: live.parts });
     this.finish(row, status, code);
     void closeSession(live);
@@ -945,30 +938,22 @@ export class RunManager {
   /**
    * The server's notes at the end of an answer, however the run ended (also when it is recovered after a
    * restart): appended to `parts` and streamed before `done`. A broken check never breaks the reply.
-   * - The common finance output check (#30): an answer that used a finance tool — or one stating figures while
-   *   finance results are in the recent conversation — gets the finance note (sources, as-of times, what the
-   *   answer left out, disclaimer).
-   * - The citation check (#25): an answer that used web tools or cited sources gets the citation note (each
-   *   `[n]` with its server-checked status, paragraphs without a citation).
+   *
+   * The source note (#185, docs/decisions/sources.md): one per answer on the screen, made of the parts below — each
+   * due **only by provenance** (the tools this answer called, `sources/provenance.ts`, or numbers it carries over
+   * from the answer before, checked again), never by what its text looks like:
+   * - finance sources (#30): an answer that called a finance tool gets the finance part (its sources with their
+   *   as-of times, what the answer left out, the disclaimer);
+   * - numbered citations (#25): an answer that used a web or file source tool, cited, or carries earlier numbers
+   *   gets the citation part (each `[n]` with its server-checked status, paragraphs without a citation).
    */
-  private attachNoteTo(row: RunRow, parts: MessagePart[], context: AnswerEvidence | undefined): void {
+  private attachNoteTo(row: RunRow, parts: MessagePart[]): void {
     this.syncArtifactRefs(row, parts);
     this.syncFileRefs(row, parts);
     this.syncFinanceTables(row, parts);
     if (!parts.some((p) => p.type === "finance_note")) {
-      // This answer's finance results stay for the rest of the conversation's checks.
       try {
-        const ev = storedEvidence(parts);
-        if (ev)
-          this.financeResults.save(
-            { messageId: row.assistantMessageId, conversationId: row.conversationId, runId: row.id },
-            ev,
-          );
-      } catch {
-        // a storage failure never breaks the reply; the note below is still attached
-      }
-      try {
-        const note = financeNote(parts, context);
+        const note = financeNote(parts);
         if (note) this.pushNote(row, parts, note);
       } catch {
         // no note rather than no reply
@@ -1730,8 +1715,6 @@ export class RunManager {
     const all = this.conversations.messages(run.conversationId, { limit: 10_000 });
     const before = all.filter((m) => m.id !== messageId);
     const lastUser = [...before].reverse().find((m) => m.role === "user");
-    const self = all.find((m) => m.id === messageId);
-    live.financeCarry = this.financeResults.context(run.conversationId, self?.seq ?? Number.MAX_SAFE_INTEGER);
     // The turn's message: its text, then its attachment markers (#149) — a resumed session learns of the files only
     // here (the file list is in a fresh session's start context only).
     const userParts = lastUser?.parts as MessagePart[] | undefined;

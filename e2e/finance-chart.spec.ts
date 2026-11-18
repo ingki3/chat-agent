@@ -57,11 +57,17 @@ test('"AAPL, 005930 6개월 비교 차트": table part, table and chart artifact
   await ret.getByRole("button").click();
   await expect(ret).toHaveAttribute("aria-sort", "descending");
 
-  // The finance note: sources and as-of, the disclaimer.
-  const note = reply.getByTestId("finance-note");
-  await expect(note).toContainText(/Yahoo Finance · \d{4}-\d{2}-\d{2} 16:00 ET 종가/);
-  await expect(note).toContainText(/네이버 증권 · \d{4}-\d{2}-\d{2} 15:30 KST 종가/);
-  await expect(note).toContainText("투자 권유가 아닙니다");
+  // The source note (#185): each source with its as-of time next to it, the disclaimer.
+  const note = reply.getByTestId("source-note");
+  // A source row whose as-of time (next to its name) reads `at` — the chart may list one source more than once.
+  const row = (source: string, at: RegExp) =>
+    note
+      .getByTestId("source-data")
+      .filter({ hasText: source })
+      .filter({ has: page.getByTestId("source-as-of").filter({ hasText: at }) });
+  await expect(row("Yahoo Finance", /^\d{4}-\d{2}-\d{2} 16:00 ET 종가$/).first()).toBeVisible();
+  await expect(row("네이버 증권", /^\d{4}-\d{2}-\d{2} 15:30 KST 종가$/).first()).toBeVisible();
+  await expect(note.getByTestId("source-disclaimer")).toContainText("투자 권유가 아닙니다");
 
   // The chart on its page: basis and zoom switches (no script), sources and the exchange rate under it.
   await cards.filter({ hasText: "수익률 비교" }).click();

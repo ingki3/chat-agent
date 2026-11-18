@@ -703,10 +703,11 @@ export const artifactVersions = sqliteTable(
 );
 
 /**
- * What the finance tools returned for one answer (#30): sources, numbers and identifiers (`AnswerEvidence`,
- * finance/checker.ts), written when the answer ends. The common finance output check reads a conversation's rows
- * in one indexed query to check follow-up answers anywhere later in the conversation — not by scanning messages.
- * Gone with the message (edit / regenerate keeps the row; the check joins on the message still being active).
+ * What the finance tools returned for one answer (#30): sources, numbers and identifiers. **No longer written or
+ * read** (#185): the finance note is due only when the answer itself called a finance tool, so the conversation-wide
+ * carry-over this table fed is gone. The table and its old rows stay (gone with their message, still rescrubbed) so
+ * that a rollback to an older release finds the table it writes to; a later migration may drop it
+ * (docs/decisions/sources.md).
  */
 export const financeResults = sqliteTable(
   "finance_results",

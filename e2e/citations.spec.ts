@@ -15,7 +15,7 @@ const SNIPPET =
 const OK = "원문 구절 확인";
 
 async function ask(page: Page, text: string, timeout = 15_000) {
-  const before = await page.getByTestId("citation-note").count();
+  const before = await page.getByTestId("source-note").count();
   const replies = await page.getByTestId("assistant").count();
   await page.getByLabel("메시지 입력").fill(text);
   await page.getByRole("button", { name: "보내기" }).click();
@@ -23,7 +23,7 @@ async function ask(page: Page, text: string, timeout = 15_000) {
   await expect(page.getByTestId("assistant")).toHaveCount(replies + 1, { timeout });
   const reply = page.getByTestId("assistant").last();
   await expect(reply).toHaveAttribute("data-status", "complete", { timeout });
-  await expect(page.getByTestId("citation-note")).toHaveCount(before + 1);
+  await expect(page.getByTestId("source-note")).toHaveCount(before + 1);
   return reply;
 }
 
@@ -55,7 +55,7 @@ test("verified citations: markers, the source list and the preview with 원문 �
   await expect(title).toHaveAttribute("href", PAGE_A);
   await expect(rows.nth(0)).toContainText("가나다 신문 · 2026-11-10");
   await expect(rows.nth(0)).not.toContainText(PAGE_A);
-  await expect(reply.getByTestId("citation-note")).not.toContainText(OK);
+  await expect(reply.getByTestId("source-note")).not.toContainText(OK);
   await expect(reply.getByTestId("citation-status")).toHaveCount(0);
   await expect(reply.getByTestId("citation-missing-warning")).toHaveCount(0);
 

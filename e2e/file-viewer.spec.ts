@@ -42,7 +42,7 @@ async function uploadAndAsk(
   }
   await page.getByLabel("메시지 입력").fill(command);
   await page.getByLabel("메시지 입력").press("Enter");
-  await expect(page.getByTestId("citation-note")).toHaveCount(1, { timeout: 60_000 });
+  await expect(page.getByTestId("source-note")).toHaveCount(1, { timeout: 60_000 });
   return page.getByTestId("assistant").last();
 }
 

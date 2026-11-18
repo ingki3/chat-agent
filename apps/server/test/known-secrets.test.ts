@@ -33,11 +33,6 @@ import { ConnectionStore } from "../src/connections/store.js";
 import { serializeCredential, type ChatgptCredential } from "../src/connections/chatgpt.js";
 import type { PushTarget } from "../src/notifications/service.js";
 import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
-import { FinanceResultStore } from "../src/finance/results.js";
-import type { AnswerEvidence } from "../src/finance/checker.js";
-
-const sql_raw = (db: ReturnType<typeof createTestDb>, q: string, ...args: string[]) =>
-  db.$client.prepare(q).run(...args);
 
 /**
  * Review round 23: a secret value the server knows never reaches a stored row, the messages API, a live
@@ -901,6 +896,19 @@ describe("round 25: every egress and every stored row", () => {
           Date.now(),
         ),
     );
+    // A finance result row from before #185 (the table is no longer written, old rows stay): rescrubbed too.
+    const msgOf185 = app.runs!.get(runId)!.assistantMessageId;
+    db.$client
+      .prepare(
+        "insert into finance_results (message_id, conversation_id, run_id, evidence, created_at) values (?, ?, ?, ?, ?)",
+      )
+      .run(
+        msgOf185,
+        conv.id,
+        runId,
+        JSON.stringify({ sources: [{ name: late }], values: [], identifiers: [] }),
+        Date.now(),
+      );
     expect(all()).toContain(late);
     expect(joinedDeltas(app.runs!.eventsAfter(splitRun, 0))).toContain(late);
     knownSecrets.add(late);
@@ -920,24 +928,6 @@ describe("round 25: every egress and every stored row", () => {
       .join("");
     expect(stored).not.toContain(late);
     expect(stored).toContain("[숨김]");
-    // A finance result saved after registration (evidence taken from parts in memory) is stored scrubbed, and
-    // `context()` returns it scrubbed.
-    const msgId = app.runs!.get(runId)!.assistantMessageId;
-    const fin = new FinanceResultStore(db);
-    fin.save({ messageId: msgId, conversationId: conv.id, runId }, {
-      sources: [{ name: late }],
-      values: [],
-      identifiers: [],
-    } as unknown as AnswerEvidence);
-    expect(JSON.stringify(db.$client.prepare("select evidence from finance_results").all())).not.toContain(
-      late,
-    );
-    sql_raw(
-      db,
-      "update finance_results set evidence = ?",
-      JSON.stringify({ sources: [{ name: late }], values: [], identifiers: [] }),
-    );
-    expect(JSON.stringify(fin.context(conv.id, Number.MAX_SAFE_INTEGER) ?? null)).not.toContain(late);
     // The artifact's hash follows its scrubbed content.
     const v = db.$client
       .prepare("select content, content_hash from artifact_versions where artifact_id = ?")
