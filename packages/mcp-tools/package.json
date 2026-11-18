@@ -54,6 +54,11 @@
       "development": "./src/audio.ts",
       "default": "./dist/audio.js"
     },
+    "./youtube": {
+      "types": "./src/youtube.ts",
+      "development": "./src/youtube.ts",
+      "default": "./dist/youtube.js"
+    },
     "./memory": {
       "types": "./src/memory.ts",
       "development": "./src/memory.ts",

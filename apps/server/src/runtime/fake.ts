@@ -62,6 +62,8 @@ import {
  *   /python <scenario> [<fileId>]   a real call of our `python_run` (#47) with the fixed code of `fake-python.ts`
  *                     (sum — of the given CSV, writing 합계.csv —, loop, net) and a short answer
  *   /audio <fileId> [nodiarize]   a real call of our `audio_transcribe` (#173) on that audio file, and a short answer
+ *   /youtube <url> [<start> <end>] [transcribe]   a real call of our `youtube_audio_fetch` (#191); with `transcribe`,
+ *                     then `audio_transcribe` on the saved file (its fileId from the first call), and a short answer
  *   /file-<scenario>   real calls of our file tools on the conversation's first upload (`fake-files.ts`: page12,
  *                     missing) and the scenario's answer with `[n]` markers (#48)
  *   /file-cite <fileId> <snippet>   one real `file_cite` of that id (e.g. another user's file) and a cited sentence
@@ -449,6 +451,17 @@ export const defaultScript: FakeScript = (input, memory) => {
       { text: "녹음을 화자별로 정리할게요. " },
       { call: "audio_transcribe", input: { fileId: audio[1]!, ...(audio[2] ? { diarize: false } : {}) } },
       { text: "대본을 만들었어요." },
+    ];
+  const yt = /^\/youtube\s+(\S+)(?:\s+(\d+)\s+(\d+))?(\s+transcribe)?$/.exec(t);
+  if (yt)
+    return [
+      { text: "영상 음성을 받을게요. " },
+      {
+        call: "youtube_audio_fetch",
+        input: { url: yt[1]!, ...(yt[2] ? { start: Number(yt[2]), end: Number(yt[3]) } : {}) },
+      },
+      ...(yt[4] ? [{ call: "audio_transcribe", input: { fileId: "$0.fileId" } }] : []),
+      { text: yt[4] ? "화자별 대본을 만들었어요." : "음성 파일을 저장했어요." },
     ];
   const chart = financeChartSteps(t);
   if (chart) return chart;

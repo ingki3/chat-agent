@@ -57,6 +57,9 @@ import type { PythonScratchpad } from "../python/service.js";
 import { AUDIO_TOOLS, AUDIO_TRANSCRIBE_TOOL, type AudioToolInfo } from "@agentlee/mcp-tools/audio";
 import { AUDIO_SKILL } from "@agentlee/shared";
 import type { AudioTranscriber } from "../audio/service.js";
+import { YOUTUBE_AUDIO_TOOL, YOUTUBE_TOOLS, type YoutubeToolInfo } from "@agentlee/mcp-tools/youtube";
+import { YOUTUBE_SKILL } from "@agentlee/shared";
+import type { YoutubeAudioFetcher } from "../youtube/service.js";
 import {
   FILE_CITE_TOOL,
   FILE_LIST_TOOL,
@@ -99,14 +102,22 @@ const FINANCE_SKILLS: ReadonlySet<string> = new Set(
 
 export const isFinanceSkill = (skill: string) => FINANCE_SKILLS.has(skill);
 
+/** Skills a youth account does not get under "all" (`youthHidden`): the finance skills (#30) and #191's YouTube one. */
+const YOUTH_HIDDEN_SKILLS: ReadonlySet<string> = new Set(
+  SKILL_CATALOGUE.filter((e) => e.youthHidden).map((e) => e.name),
+);
+
+export const isYouthHiddenSkill = (skill: string) => YOUTH_HIDDEN_SKILLS.has(skill);
+
 /**
  * Whether a user's own permissions allow `skill` (FR-1.6) — not whether it is offered now (`McpService.allows`
- * adds the account being active and the server allow-list). "all" = every skill except the finance skills for a
- * youth account (the son, #30): hidden by default; only an explicit list that names them turns them on.
+ * adds the account being active and the server allow-list). "all" = every skill except the youth-hidden ones for a
+ * youth account (the son: the finance skills, #30, and `youtube-audio-download`, #191): hidden by default; only an
+ * explicit list that names them turns them on.
  */
 export function skillPermitted(user: { permissions?: unknown; youth?: unknown }, skill: string): boolean {
   const p = (user as { permissions?: { skills?: unknown } }).permissions?.skills;
-  if (p === "all") return !(user.youth === true && FINANCE_SKILLS.has(skill));
+  if (p === "all") return !(user.youth === true && YOUTH_HIDDEN_SKILLS.has(skill));
   return Array.isArray(p) && p.includes(skill);
 }
 
@@ -630,6 +641,8 @@ export type McpServiceOptions = {
   scratchpad?: PythonScratchpad;
   /** `audio_transcribe` (#173). Without it the tool is not offered. Per user: the `audio-transcription` skill. */
   audio?: AudioTranscriber;
+  /** `youtube_audio_fetch` (#191). Without it the tool is not offered. Per user: the `youtube-audio-download` skill. */
+  youtube?: YoutubeAudioFetcher;
   /**
    * File tools (#48): the run's conversation's uploads, read through their extraction. `citations` adds
    * `file_cite`. Without it the file tools are not offered.
@@ -727,6 +740,8 @@ export class McpService {
   private readonly pythonAvailable: () => boolean;
   /** `audio_transcribe` (#173), when configured: offered to a user who may use `audio-transcription`. */
   private readonly audioTools: readonly AudioToolInfo[];
+  /** `youtube_audio_fetch` (#191), when configured: offered to a user who may use `youtube-audio-download`. */
+  private readonly youtubeTools: readonly YoutubeToolInfo[];
 
   constructor(
     private readonly tokens: McpTokens,
@@ -773,6 +788,7 @@ export class McpService {
     // Whether python_run is offered right now (gated state); cheap, re-checked at each tool list and call.
     this.pythonAvailable = () => this.opts.scratchpad?.state() === "available";
     this.audioTools = opts.audio ? AUDIO_TOOLS : [];
+    this.youtubeTools = opts.youtube ? YOUTUBE_TOOLS : [];
     this.composedTools = this.finance && opts.artifacts ? [FINANCE_CHART_TOOL] : [];
     // Our tool names are fixed in code: they may be logged (#46).
     registerToolNames(this.toolNames());
@@ -858,6 +874,7 @@ export class McpService {
         ...this.tools,
         ...this.pythonTools,
         ...this.audioTools,
+        ...this.youtubeTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -956,6 +973,9 @@ export class McpService {
       ...(this.opts.audio?.state() === "available"
         ? this.audioTools.filter((t) => this.mayUse(s, t.skill))
         : []),
+      ...(this.opts.youtube?.state() === "available"
+        ? this.youtubeTools.filter((t) => this.mayUse(s, t.skill))
+        : []),
       ...this.financeTools.filter((t) => this.mayUse(s, t.skill)),
       ...this.composedTools.filter((t) => this.mayUseAny(s, t.skills)),
     ];
@@ -980,6 +1000,7 @@ export class McpService {
         const st = this.opts.scratchpad.state();
         status = st === "available" ? "available" : st;
       } else if (e.name === AUDIO_SKILL && this.opts.audio) status = this.opts.audio.state();
+      else if (e.name === YOUTUBE_SKILL && this.opts.youtube) status = this.opts.youtube.state();
       else if (e.status === "tools") status = "planned";
       else if (e.status === "implemented") {
         const st = this.opts.installed?.[e.name] ?? "not_installed";
@@ -1067,6 +1088,7 @@ export class McpService {
         ...this.tools,
         ...this.pythonTools,
         ...this.audioTools,
+        ...this.youtubeTools,
         ...this.financeTools,
         ...this.composedTools,
       ],
@@ -1249,6 +1271,33 @@ export class McpService {
               runId: scope.runId,
             });
           return r;
+        }
+        if (name === YOUTUBE_AUDIO_TOOL.name) {
+          const r = await this.callYoutubeTool(input, scope);
+          // The guard's refusal is told to the model as an ordinary failure; the log and the error list keep why.
+          const shown: SkillResult =
+            !r.ok && r.code === "youtube_secret_blocked" ? { ok: false, code: "youtube_failed" } : r;
+          logEvent(this.opts.log, r.ok ? "info" : "warn", "youtube.finished", {
+            userId: scope.userId,
+            conversationId: scope.conversationId,
+            runId: scope.runId,
+            tool: name,
+            status: r.ok ? "ok" : "error",
+            durationMs: now() - t0,
+            // A fixed code only: never the address, the video id, the title or the file.
+            youtubeCode: r.ok ? "youtube_ok" : r.code,
+          });
+          if (!r.ok)
+            this.opts.errors?.record({
+              source: "tool",
+              code: r.code,
+              category: "tool",
+              tool: name,
+              userId: scope.userId,
+              conversationId: scope.conversationId,
+              runId: scope.runId,
+            });
+          return shown;
         }
         if (name === DOC_CREATE_TOOL.name) {
           const r = await this.callDocTool(input, scope);
@@ -1448,6 +1497,20 @@ export class McpService {
     // user still allowed — otherwise the service stops every step and sends or stores nothing more.
     return audio.run(scope, input, {
       alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, AUDIO_SKILL),
+    });
+  }
+
+  /**
+   * `youtube_audio_fetch` (#191): active user who may use `youtube-audio-download` (checked again here), then the
+   * service — its own slots and per-run cap, the token's own conversation only. While it runs: the run's token still
+   * alive (revoked at once by an interrupt) and the user still allowed — otherwise every step stops and nothing is
+   * stored. Never logged: the address, the video, the file.
+   */
+  private async callYoutubeTool(input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult> {
+    const yt = this.opts.youtube;
+    if (!yt || !this.mayUse(scope, YOUTUBE_SKILL)) return { ok: false, code: "youtube_not_allowed" };
+    return yt.run(scope, input, {
+      alive: () => this.tokens.hasRun(scope.runId) && this.mayUse(scope, YOUTUBE_SKILL),
     });
   }
 

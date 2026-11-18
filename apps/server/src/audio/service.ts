@@ -119,7 +119,7 @@ type CallContext = {
 };
 
 /** Free bytes of the volume holding DATA_DIR (its nearest existing folder). */
-function freeBytes(dataDir: string): number {
+export function freeBytes(dataDir: string): number {
   let dir = path.resolve(dataDir);
   while (!fs.existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
   try {

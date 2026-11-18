@@ -53,6 +53,10 @@ export function storagePaths(dataDir: string) {
     audioModels: path.join(root, "audio-models"),
     /** `audio_transcribe` working folders (#173): `audio-scratch/<job id>`, removed when the call ends and at start. */
     audioScratch: path.join(root, "audio-scratch"),
+    /** `youtube_audio_fetch` (#191): the pinned yt-dlp + deno (`youtube-packages/<lock hash>-py3.12/`, read-only). */
+    youtubePackages: path.join(root, "youtube-packages"),
+    /** `youtube_audio_fetch` working folders (#191): `youtube-scratch/<job id>`, removed when the call ends and at start. */
+    youtubeScratch: path.join(root, "youtube-scratch"),
     conversationFiles: (userId: string, conversationId: string) =>
       path.join(root, "files", assertSafeId("user", userId), assertSafeId("conversation", conversationId)),
     runtimeHome: (connectionId: string) =>

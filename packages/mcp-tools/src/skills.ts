@@ -338,18 +338,24 @@ export type CatalogueEntry = {
   issue?: string;
   /** Secrets it needs (env names), documented for ops. */
   secrets: readonly string[];
+  /**
+   * Hidden from youth accounts under "all" (FR-1.6): every finance skill (#30), and `youtube-audio-download` (#191,
+   * the user's decision). Only an explicit list that names it turns it on for such an account.
+   */
+  youthHidden: boolean;
 };
 
 const entry = (
   name: string,
   status: CatalogueStatus,
-  o: { finance?: boolean; issue?: string; secrets?: string[] } = {},
+  o: { finance?: boolean; issue?: string; secrets?: string[]; youthHidden?: boolean } = {},
 ): CatalogueEntry => ({
   name,
   finance: o.finance ?? false,
   status,
   ...(o.issue ? { issue: o.issue } : {}),
   secrets: o.secrets ?? [],
+  youthHidden: o.youthHidden ?? o.finance ?? false,
 });
 
 /** PRD §7, in order. Per-user permissions name these (FR-1.6); unknown names are refused. */
@@ -381,6 +387,9 @@ export const SKILL_CATALOGUE: readonly CatalogueEntry[] = [
   entry("python-scratchpad", "tools", { issue: "#47" }),
   // audio_transcribe (#173): a server tool — local Whisper + Nemotron diarization; OpenRouter only as the fallback.
   entry("audio-transcription", "tools", { issue: "#173", secrets: ["OPENROUTER_API_KEY"] }),
+  // Not in PRD §7: the user's skill (#191). youtube_audio_fetch: a server tool — pinned yt-dlp + deno behind an egress
+  // proxy for YouTube's hosts only, the audio saved as a conversation file for audio_transcribe. Youth: off by default.
+  entry("youtube-audio-download", "tools", { issue: "#191", youthHidden: true }),
 ];
 
 /** Every secret env name any skill may get (the server reads exactly these from its environment). */

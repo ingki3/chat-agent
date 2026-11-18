@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import fastifyStatic from "@fastify/static";
 import type { JWTVerifyGetKey } from "jose";
-import type { HealthResponse } from "@agentlee/shared";
+import { YOUTUBE_EGRESS_HOSTS, type HealthResponse } from "@agentlee/shared";
 import { createAccessVerifier } from "./auth/access-jwt.js";
 import { registerCsrf, registerSession, registerTrustBoundary } from "./auth/plugin.js";
 import { registerAuthRoutes, type AuthRouteOptions } from "./auth/routes.js";
@@ -96,6 +96,9 @@ import { sandboxedAudioRunner, type AudioRunner } from "./audio/runner.js";
 import { AudioFallbackSwitch, AudioTranscriber } from "./audio/service.js";
 import { openRouterClient, type FallbackClient } from "./audio/openrouter.js";
 import { registerAudioRoutes } from "./audio/routes.js";
+import { youtubeState, type YoutubeState } from "./youtube/packages.js";
+import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
+import { YoutubeAudioFetcher } from "./youtube/service.js";
 import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
@@ -311,6 +314,16 @@ export type BuildOptions = {
    * what this server can run (default: `audioState` from SKILL_PYTHON, ffmpeg and `pnpm audio:install`; in tests
    * nothing, unless given) and the OpenRouter client (default: from OPENROUTER_API_KEY; tests mock it).
    */
+  /**
+   * `youtube_audio_fetch` (#191): how the steps run (default: the sandboxed yt-dlp and ffmpeg), what this server can
+   * run (default: `youtubeState` from SKILL_PYTHON, ffmpeg and `pnpm youtube:install`; in tests nothing, unless
+   * given) and its egress proxy (default: one for `YOUTUBE_EGRESS_HOSTS`; tests give a fake one).
+   */
+  youtube?: {
+    runner?: YoutubeRunner;
+    state?: () => YoutubeState;
+    proxy?: () => Promise<{ url: string; port: number }>;
+  };
   audio?: {
     runner?: AudioRunner;
     state?: () => AudioState;
@@ -684,6 +697,26 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       extract: (id) => fileExtracts.enqueue(id),
     });
     app.addHook("preClose", async () => audio.close());
+    // youtube_audio_fetch (#191): offered once `pnpm youtube:install` ran, with ffmpeg and SKILL_PYTHON. Its only
+    // way out is this proxy (YouTube's hosts, HTTPS), started on first use.
+    const youtubeEgress = new EgressService({ allow: YOUTUBE_EGRESS_HOSTS });
+    const youtube = new YoutubeAudioFetcher({
+      db: opts.db!,
+      dataDir: config.dataDir,
+      files: () => app.files,
+      runner: opts.youtube?.runner ?? sandboxedYoutubeRunner(),
+      state:
+        opts.youtube?.state ??
+        (config.env === "test"
+          ? () => ({ state: "not_installed", reason: "tests" })
+          : () => youtubeState(config.skillPython, config.dataDir, config.audioFfmpeg)),
+      proxy: opts.youtube?.proxy ?? (() => youtubeEgress.endpoint()),
+      secrets: config.skillSecrets,
+    });
+    app.addHook("preClose", async () => {
+      youtube.close();
+      await youtubeEgress.close();
+    });
     // The one-time account self-check runs in the sweep hook below (#47 round 3: after the sweep, under the same
     // conditions as a real job — the sweep keeps the scratch root and its ACL).
     // Never awaited by a startup hook, never throws (the gate catches everything).
@@ -815,6 +848,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       // Off unless PYTHON_RUN=1 (or a test's own runner): see config.ts and docs/ops.md §35.3.
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
       audio,
+      youtube,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,
@@ -944,6 +978,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         // scratch root (ACL) and clean children; then the account self-check, under the same conditions as a job.
         if (!scratchpad.sweep(pythonAccount)) logEvent(app.log, "warn", "python.sweep_failed");
         if (!audio.sweep()) logEvent(app.log, "warn", "audio.sweep_failed");
+        if (!youtube.sweep()) logEvent(app.log, "warn", "youtube.sweep_failed");
         startSelfCheck();
         // Worker job folders of the last process (#122), then the worker account's checks.
         if (!sweepWorkerScratch(config.dataDir, workerAccount))
