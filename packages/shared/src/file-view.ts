@@ -125,6 +125,8 @@ export const ViewTarget = z.object({
   focus: SegmentRange.optional(),
   /** `exact`: the passage's box on its page or image (fractions, origin top left). */
   bbox: box.optional(),
+  /** `exact`: the range is the passage's start only — it goes on past it (over several lines, #186 review 5차). */
+  start: z.literal(true).optional(),
 });
 export type ViewTarget = z.infer<typeof ViewTarget>;
 
@@ -144,9 +146,17 @@ export const FileViewResponse = z.object({
 export type FileViewResponse = z.infer<typeof FileViewResponse>;
 
 /** The viewer's in-app address: `/c/:conversationId/files/:fileId?loc=<locator JSON>`. */
-export function fileViewPath(conversationId: string, fileId: string, locator?: FileLocator): string {
+export function fileViewPath(
+  conversationId: string,
+  fileId: string,
+  locator?: FileLocator,
+  /** The citation the link opens (#186 review 5차): the viewer judges the range by that citation only. */
+  citationId?: string,
+): string {
   const base = `/c/${encodeURIComponent(conversationId)}/files/${encodeURIComponent(fileId)}`;
-  return locator ? `${base}?loc=${encodeURIComponent(JSON.stringify(locator))}` : base;
+  if (!locator) return base;
+  const cite = citationId ? `&cite=${encodeURIComponent(citationId)}` : "";
+  return `${base}?loc=${encodeURIComponent(JSON.stringify(locator))}${cite}`;
 }
 
 /** The locator of a `loc` query value, or undefined when it is not one. */

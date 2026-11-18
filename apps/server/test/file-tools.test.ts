@@ -46,6 +46,7 @@ import {
   hlist,
   hwpDoc,
   xp,
+  xnote,
   xt,
   xskip,
   SWITCHES,
@@ -3722,7 +3723,7 @@ describe("#186: an attachment is cited with file_cite only; a follow-up's number
     const again = await send(f.cookies.owner, c.id, "/again");
     expect(again.note).toMatchObject({ unbacked: true, missing: [] });
     again.note!.citations.forEach(unverified);
-  });
+  }, 30_000); // several runs and extractions in a row
 
   it("file_cite → verified with the file's id; the follow-up's same numbers are carried and verified again; a file_search hit number is ⚠️", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -3767,7 +3768,7 @@ describe("#186: an attachment is cited with file_cite only; a follow-up's number
       [1, "unknown_source", undefined],
     ]);
     reuse.note!.citations.forEach(unverified);
-  });
+  }, 30_000); // several runs and extractions in a row
 
   it("the file's text changed, being extracted again, deleted: the carried number is not verified", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -3802,7 +3803,7 @@ describe("#186: an attachment is cited with file_cite only; a follow-up's number
       ["unknown_source", undefined, null],
       ["unknown_source", undefined, null],
     ]);
-  });
+  }, 30_000); // several runs and extractions in a row
 });
 
 describe("#186 review 1차: list numbers, the whole snippet, the earlier place", () => {
@@ -3837,7 +3838,7 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     const [list] = outputs(listed);
     expect((list!.items as { fileId: string }[])[0]!.fileId).toBe(a.id);
     expect(listed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([["unknown_source", undefined]]);
-  });
+  }, 30_000); // several runs and extractions in a row
 
   it("[P2] a passage whose page text is longer than the limit: the follow-up checks the whole snippet — a changed ending is ⚠️", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -3873,7 +3874,7 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect(changed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([
       ["snippet_not_found", file.id],
     ]);
-  });
+  }, 30_000); // several runs and extractions in a row
 
   /** Rewrites one stored unit's lines (its marks follow), and bumps the extraction so the cache sees it. */
   const editRun = (
@@ -3903,14 +3904,22 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     cookie: string,
     fileId: string,
     loc: FileLocator,
+    cite?: string,
   ) =>
     (
       await app.inject({
         method: "GET",
-        url: `/api/files/${fileId}/view?loc=${encodeURIComponent(JSON.stringify(loc))}`,
+        url: `/api/files/${fileId}/view?loc=${encodeURIComponent(JSON.stringify(loc))}${cite ? `&cite=${cite}` : ""}`,
         headers: { ...LOCAL, cookie },
       })
-    ).json() as { target: { status: string } | null };
+    ).json() as { target: { status: string; start?: true } | null };
+  /** A stored unit, by a piece of its text. */
+  const unitWith = (db: { $client: import("better-sqlite3").Database }, fileId: string, has: string) =>
+    db.$client
+      .prepare(
+        "SELECT seq, text, marks, locator FROM file_segments WHERE file_id = ? AND text LIKE ? ORDER BY seq",
+      )
+      .all(fileId, `%${has}%`) as { seq: number; text: string; marks: string | null; locator: string }[];
 
   it("[P2 3·4차] the cited unit unchanged at the same place, or not verified: copies in another unit never move it; any change in the unit → ⚠️ (note and viewer alike)", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -3952,7 +3961,7 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect(moved.note!.citations.map((x) => [x.status, x.locator])).toEqual([
       ["snippet_not_found", undefined],
     ]);
-  });
+  }, 30_000); // several runs and extractions in a row
 
   it("[P2 4차] Codex's repros: a number changed at the range end, a two-line passage, a moved cell, an identical re-extraction, a newly masked value", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -3990,7 +3999,14 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect([t1.status, t1.locator?.line]).toEqual(["verified", 2]);
     const t2 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
     expect([t2.status, t2.locator]).toEqual(["verified", t1.locator]);
-    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!)).target?.status).toBe("exact");
+    // Exact — and said to be the passage's start only (it goes on to the next line, review 5차 P3).
+    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!, t2.citationId)).target).toMatchObject({
+      status: "exact",
+      start: true,
+    });
+    expect(
+      (await viewAt(app, f.cookies.owner, amount.id, { ...t2.locator!, fileId: amount.id })).target?.start,
+    ).toBeUndefined();
 
     // An identical re-extraction (as for a new extractor version — the rows' prefix hashes are cleared): still
     // verified, still exact.
@@ -4011,7 +4027,7 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     const masked = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
     expect(masked.status).not.toBe("verified");
     expect((await viewAt(app, f.cookies.owner, two.id, t1.locator!)).target?.status).not.toBe("exact");
-  });
+  }, 30_000); // several runs and extractions in a row
 
   it("[P2 4차] a cell moved (the same row text, its cell now B1 instead of A1): not verified", async () => {
     const { app, db, f, upload, send } = await start(fake(script));
@@ -4049,5 +4065,116 @@ describe("#186 review 1차: list numbers, the whole snippet, the earlier place",
     expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
       "snippet_not_found",
     );
-  });
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] a body paragraph is not its footnote: the body changed, a footnote with the body's old unit → ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.body = "본문과 각주에 같은 문장이 있습니다";
+    const doc = await hwpxDoc(
+      xp(xt("본문과 각주에 같은 문장이 있습니다.") + xnote("각주의 다른 글입니다.", 2)),
+    );
+    const file = await upload(f.cookies.owner, c.id, "note.hwpx", doc);
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${file.id} body`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.kind, first.locator?.footnote]).toEqual([
+      "verified",
+      "paragraph",
+      undefined,
+    ]);
+    const [body] = unitWith(db, file.id, "본문과 각주에");
+    const [note] = unitWith(db, file.id, "각주의 다른 글");
+    expect(JSON.parse(note!.locator).footnote).toBe(2);
+    // The footnote now holds exactly the body's old unit (text and marks); the body itself changed.
+    db.$client
+      .prepare("UPDATE file_segments SET text = ?, marks = ? WHERE file_id = ? AND seq = ?")
+      .run(body!.text, body!.marks, file.id, note!.seq);
+    db.$client
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND seq = ?")
+      .run(`${body!.text} 덧붙임.`, file.id, body!.seq);
+    touch(db, file.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] two sheets whose names are masked alike stay two: the first sheet's row changed, the second's A1 never stands in", async () => {
+    const n1 = `sk-ant-sheetone${crypto.randomUUID().replaceAll("-", "")}`;
+    const n2 = `sk-ant-sheettwo${crypto.randomUUID().replaceAll("-", "")}`;
+    knownSecrets.add(n1);
+    knownSecrets.add(n2);
+    closers.push(() => (knownSecrets.remove(n1), knownSecrets.remove(n2)));
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.sheet = "두 시트에 같은 줄이 있습니다";
+    const row = [["두 시트에 같은 줄이 있습니다", "값"]];
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "sheets.xlsx",
+      xlsxOf([
+        [n1, row],
+        [n2, row],
+      ]),
+    );
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${file.id} sheet`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.sheet, first.locator?.range]).toEqual(["verified", "[숨김]", "A1"]);
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).toBe("exact");
+    const units = unitWith(db, file.id, "두 시트에");
+    expect(units).toHaveLength(2);
+    expect(units[0]!.text).toBe(units[1]!.text);
+    // Only the first sheet's row changes.
+    db.$client
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND seq = ?")
+      .run(`${units[0]!.text} 바뀜`, file.id, units[0]!.seq);
+    touch(db, file.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] an old link is judged by its own citation: a newer citation at the same range never makes it exact", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.witness = "OriginalWitness 문장은 여기에 있습니다";
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "witness.txt",
+      Buffer.from("OriginalWitness 문장은 여기에 있습니다.\n둘째 줄입니다.\n"),
+    );
+    await app.fileExtracts!.idle();
+    const old = (await send(f.cookies.owner, c.id, `/cite ${file.id} witness`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect((await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status).toBe(
+      "exact",
+    );
+    // The unit changes (its other line); then the same range is cited anew.
+    editRun(db, file.id, "둘째 줄", (n, l) => (n === 2 ? "둘째 줄이 바뀌었습니다." : l));
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status,
+    ).not.toBe("exact");
+    const fresh = (await send(f.cookies.owner, c.id, `/cite ${file.id} witness`)).note!.citations[0]!;
+    expect([fresh.status, fresh.locator]).toEqual(["verified", old.locator]);
+    expect(fresh.citationId).not.toBe(old.citationId);
+    // The new link is exact; the old link (its own citation) is not; a link without an id sees them disagree.
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, fresh.locator!, fresh.citationId)).target?.status,
+    ).toBe("exact");
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status,
+    ).not.toBe("exact");
+    expect((await viewAt(app, f.cookies.owner, file.id, old.locator!)).target?.status).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
 });

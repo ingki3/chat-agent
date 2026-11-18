@@ -541,7 +541,7 @@ export class FileTools {
     // The row's whole passage (as stored, already scrubbed — again with the secrets known now); never cut.
     const snippet = scrubKnown(input.snippet);
     for (const seg of this.extracts.segments(file.id)) {
-      if (!mayBePlace(file, seg, at) || unitHashOf(seg) !== input.unitHash) continue;
+      if (!sameUnitAddress(unitAddressOf(file, seg), at) || unitHashOf(seg) !== input.unitHash) continue;
       // The unit is byte for byte (text and marks) the one verified: the passage found in it is at the row's place.
       const m = findSnippetAt(seg.text, snippet);
       if (!m.found) continue;
@@ -617,16 +617,49 @@ function verifiedAt(
   };
 }
 
-/** Unit fields a stored unit's own locator names (a run of lines names its first line: not compared). */
-const UNIT_FIELDS = ["page", "slide", "paragraph", "table", "row", "sheet", "footnote", "endnote"] as const;
+/** A stored unit as an address: its own locator, its sheet's number (XLSX) and the lines of a run of lines. */
+export type UnitAddress = { locator: FileLocator; sheetNo?: number | undefined; lines: readonly number[] };
+
+/** `seg`'s address (see `sameUnitAddress`). */
+export function unitAddressOf(f: Pick<FileRow, "id" | "sha256">, seg: SegmentRow): UnitAddress {
+  return {
+    locator: segmentLocator(f, seg),
+    sheetNo: locOf(seg).sheetNo,
+    lines: marksOf(seg).flatMap((m) => (typeof m[2].line === "number" ? [m[2].line] : [])),
+  };
+}
 
 /**
- * Whether unit `seg` can hold place `p` — cheap, no text compared: the same kind and unit, and for a line the run
- * has that line. The unit's hash decides the rest.
+ * Whether unit `u` is the unit place `at` names — **the one rule** (#186 review 5차) the carry-over recheck and the
+ * viewer both use: the same kind and page, slide, paragraph or table row; a footnote's or endnote's number equal,
+ * none included (a body paragraph is not its footnote); an XLSX row by its sheet's **number** when both have one
+ * (two sheets whose names are masked alike stay two), by the served name otherwise; a line within the run's lines.
  */
-function mayBePlace(f: FileRow, seg: SegmentRow, p: FileLocator): boolean {
-  const own = segmentLocator(f, seg);
-  if (own.kind !== p.kind) return false;
-  if (UNIT_FIELDS.some((k) => own[k] !== undefined && p[k] !== undefined && own[k] !== p[k])) return false;
-  return p.line === undefined || marksOf(seg).some((m) => m[2].line === p.line);
+export function sameUnitAddress(u: UnitAddress, at: FileLocator & { sheetNo?: number | undefined }): boolean {
+  const l = u.locator;
+  if (l.kind !== at.kind) return false;
+  const note = l.footnote === at.footnote && l.endnote === at.endnote;
+  switch (at.kind) {
+    case "page":
+    case "ocr_box":
+      return l.page === at.page;
+    case "line":
+      return at.line !== undefined && u.lines.includes(at.line);
+    case "paragraph":
+      return l.paragraph === at.paragraph && note;
+    case "table":
+      return l.table === at.table && l.row === at.row && note;
+    case "cell_range": {
+      const sheet =
+        u.sheetNo !== undefined && at.sheetNo !== undefined
+          ? u.sheetNo === at.sheetNo
+          : servedSheet(l.sheet) === servedSheet(at.sheet);
+      return sheet && l.row === at.row;
+    }
+    case "slide":
+      return l.slide === at.slide;
+  }
 }
+
+/** Sheet names are file text: compared as served (scrubbed with the secrets known now). */
+const servedSheet = (s: string | undefined) => (s === undefined ? undefined : scrubKnown(s, { tail: false }));

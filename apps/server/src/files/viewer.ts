@@ -12,7 +12,7 @@ import {
 import { scrubKnown } from "../secrets/known.js";
 import type { SegmentRow } from "./extract.js";
 import { parseMarks, type Mark } from "./scrub.js";
-import { isBox, prefixHash, segmentLocator, union } from "./text.js";
+import { isBox, prefixHash, sameUnitAddress, segmentLocator, union } from "./text.js";
 import type { FileRow } from "./store.js";
 
 /**
@@ -41,7 +41,12 @@ export type CitedPassage = {
    * answer's carried number is verified on.
    */
   unitHash?: string | null | undefined;
+  /** The cited XLSX row's sheet number (stored with the citation): the sheet's address when names are masked alike. */
+  sheetNo?: number | undefined;
 };
+
+/** What the viewer knows of each unit now, by `seq`: its `unitHashOf` and its sheet's number (#186 review 4·5차). */
+export type UnitsNow = ReadonlyMap<number, { hash: string; sheetNo: number | undefined }>;
 
 type StoredLoc = { split?: unknown };
 const storedSplit = (seg: Pick<SegmentRow, "locator">): boolean => {
@@ -86,31 +91,16 @@ export function viewSegment(file: Pick<FileRow, "id" | "sha256">, seg: SegmentRo
   };
 }
 
-const sameNote = (a: FileLocator, b: FileLocator) => a.footnote === b.footnote && a.endnote === b.endnote;
 /** Sheet names are file text: compared as served (scrubbed with the secrets known now). */
 const sheetOf = (l: FileLocator) =>
   l.sheet === undefined ? undefined : scrubKnown(l.sheet, { tail: false });
 
-/** Whether segment `s` (its locator `sl`, its marks) is (a piece of) the unit `loc` names. */
-function sameUnit(sl: FileLocator, s: ViewSegment, loc: FileLocator): boolean {
-  if (sl.kind !== loc.kind) return false;
-  switch (loc.kind) {
-    case "page":
-      return sl.page === loc.page;
-    case "ocr_box":
-      return sl.page === loc.page;
-    case "line":
-      return s.marks.some((m) => m.line === loc.line);
-    case "paragraph":
-      return sl.paragraph === loc.paragraph && sameNote(sl, loc);
-    case "table":
-      return sl.table === loc.table && sl.row === loc.row && sameNote(sl, loc);
-    case "cell_range":
-      return sheetOf(sl) === sheetOf(loc) && sl.row === loc.row;
-    case "slide":
-      return sl.slide === loc.slide;
-  }
-}
+/** Whether segment `s` (its address) is (a piece of) the unit `loc` names — the recheck's own rule (#186 5차). */
+const sameUnit = (s: ViewSegment, loc: FileLocator & { sheetNo?: number | undefined }, sheetNo?: number) =>
+  sameUnitAddress(
+    { locator: s.locator, sheetNo, lines: s.marks.flatMap((m) => (m.line === undefined ? [] : [m.line])) },
+    loc,
+  );
 
 /**
  * A run of lines that lost its marks (approximate) and surely holds `line`: the run whose first line is the last at
@@ -162,8 +152,8 @@ export function resolveTarget(
   items: readonly ViewSegment[],
   loc: FileLocator,
   cited: readonly CitedPassage[],
-  /** `unitHashOf` each unit now, by `seq` (#186 review 4차). */
-  unitHashes: ReadonlyMap<number, string> = new Map(),
+  /** Each unit now (#186 review 4·5차). */
+  units: UnitsNow = new Map(),
 ): ViewTarget {
   const none = (status: ViewTarget["status"], reason: LocateReason): ViewTarget => ({
     status,
@@ -175,7 +165,11 @@ export function resolveTarget(
   if (extract.status === "pending") return none("unreadable", "pending");
   if (extract.status !== "ok") return none("unreadable", "failed");
 
-  let hits = items.filter((s) => sameUnit(s.locator, s, loc));
+  // The sheet by its number when the citations at this place agree on one (names may be masked alike).
+  const nos = new Set(cited.filter((c) => key(c.locator) === key(loc)).map((c) => c.sheetNo));
+  const no = nos.size === 1 ? [...nos][0] : undefined;
+  const place = { ...loc, ...(no !== undefined ? { sheetNo: no } : {}) };
+  let hits = items.filter((s) => sameUnit(s, place, units.get(s.seq)?.sheetNo));
   if (!hits.length && loc.kind === "line" && loc.line !== undefined) {
     const run = approximateRun(items, loc.line);
     if (run) hits = [run];
@@ -205,6 +199,8 @@ export function resolveTarget(
 
   // The passage: `charRange` is within the unit's text — within the named line for a run of lines.
   let range: SegmentRange | undefined;
+  // The range is the passage's start only (a passage over several lines is placed on its first, review #186 5차).
+  let start = false;
   if (!loc.charRange) reasons.add("no_range");
   else if (only && !only.approximate && !only.split) {
     const [a, b] = loc.charRange;
@@ -218,19 +214,17 @@ export function resolveTarget(
     const before = prefixHash(only!.text, range.end);
     // A citation the caller may see gave this locator, and the unit's text up to the passage's end is still the text
     // it was checked in (review #123: the same quote elsewhere after a shift is not the cited place).
-    const now = unitHashes.get(only!.seq);
-    if (
-      !cited.some((c) =>
-        key(c.locator) !== k
-          ? false
-          : c.unitHash
-            ? c.unitHash === now
-            : c.quote === at && c.textHash === before,
-      )
-    ) {
+    const now = units.get(only!.seq)?.hash;
+    // The citations at this place (the caller passes only the link's own one when it names one): every one of them
+    // must stand behind the range — a unit hash when it has one, else the quote and prefix hash (older rows). When
+    // they disagree (an old citation now changed, a new one there), no range is claimed (review #186 5차).
+    const here = cited.filter((c) => key(c.locator) === k);
+    const holds = (c: CitedPassage) =>
+      c.unitHash ? c.unitHash === now : c.quote === at && c.textHash === before;
+    if (!here.length || !here.every(holds)) {
       reasons.add("unverified");
       range = undefined;
-    }
+    } else if (here.some((c) => c.quote !== at)) start = true;
   }
   if (range && only) {
     const over = only.marks.filter(
@@ -247,6 +241,7 @@ export function resolveTarget(
       range,
       ...(focus ? { focus } : {}),
       ...(bbox ? { bbox } : {}),
+      ...(start ? { start: true as const } : {}),
     };
   }
   return { status: "unit", reasons: [...reasons], seqs, ...(focus ? { focus } : {}) };

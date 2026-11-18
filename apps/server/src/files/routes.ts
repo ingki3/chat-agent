@@ -22,7 +22,7 @@ import type { ConversationStore } from "../conversations/store.js";
 import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
 import { toFileExtract, type FileExtracts } from "./extract.js";
-import { segmentLocator, unitHashOf } from "./text.js";
+import { segmentLocator, unitAddressOf, unitHashOf } from "./text.js";
 import { resolveTarget, VIEW_LIMIT, VIEW_MAX, viewSegment, viewWindow } from "./viewer.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 import { sharedWith, viewOf } from "../shares/projection.js";
@@ -356,7 +356,7 @@ export function registerFileRoutes(
   if (extracts)
     app.get<{
       Params: { id: string };
-      Querystring: { loc?: string; from?: string; to?: string; limit?: string };
+      Querystring: { loc?: string; cite?: string; from?: string; to?: string; limit?: string };
     }>("/api/files/:id/view", { config: read }, async (req, reply) => {
       const f = store.get(req.params.id)!;
       const p = viewOf(app, req, { fileIn: f.conversationId });
@@ -373,25 +373,29 @@ export function registerFileRoutes(
       const items = all.map((seg) => viewSegment(f, seg));
       let target = null;
       if (loc) {
+        // A link that names its citation (`cite`, #186 review 5차) is judged by that citation alone (none when the
+        // caller may not see it); an older link by every citation at the place.
+        const cite =
+          typeof req.query.cite === "string" && req.query.cite.length <= 64 ? req.query.cite : undefined;
         const cited = store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
           if (p && !p.citations.has(c.id)) return [];
+          if (cite !== undefined && c.id !== cite) return [];
           try {
-            const raw = JSON.parse(c.locator) as { textHash?: unknown };
+            const raw = JSON.parse(c.locator) as { textHash?: unknown; sheetNo?: unknown };
             const l = FileLocator.safeParse(raw);
             const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
-            return l.success ? [{ locator: l.data, quote: c.quote, textHash, unitHash: c.unitHash }] : [];
+            const sheetNo = typeof raw.sheetNo === "number" ? raw.sheetNo : undefined;
+            return l.success
+              ? [{ locator: l.data, quote: c.quote, textHash, unitHash: c.unitHash, sheetNo }]
+              : [];
           } catch {
             return [];
           }
         });
-        target = resolveTarget(
-          f,
-          extract,
-          items,
-          loc,
-          cited,
-          new Map(all.map((s) => [s.seq, unitHashOf(s)])),
+        const units = new Map(
+          all.map((s) => [s.seq, { hash: unitHashOf(s), sheetNo: unitAddressOf(f, s).sheetNo }] as const),
         );
+        target = resolveTarget(f, extract, items, loc, cited, units);
       }
       const toRaw = req.query.to === undefined ? undefined : Number.parseInt(req.query.to, 10);
       const to = toRaw === undefined || !Number.isFinite(toRaw) ? undefined : Math.max(0, toRaw);

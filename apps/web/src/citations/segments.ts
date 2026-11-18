@@ -45,6 +45,8 @@ export type CitationView = {
    * and for anything not verified (nothing to open at a place the server did not find).
    */
   locator: FileLocator | null;
+  /** That citation's id (#186 review 5차): the viewer judges the highlighted range by it alone. */
+  citationId: string | null;
 };
 
 /** An http(s) URL as a link target, or null (anything else is never put into an href). */
@@ -77,6 +79,7 @@ export function citationView(n: number, entry: CitationEntry | undefined): Citat
     url: known ? entry.url : null,
     quote: known ? entry.quote : null,
     locator: ok && entry.locator ? entry.locator : null,
+    citationId: ok && entry.locator && entry.citationId ? entry.citationId : null,
   };
 }
 

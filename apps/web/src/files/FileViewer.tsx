@@ -53,9 +53,12 @@ import "./files.css";
  */
 export function FileViewerPage({ conversationId, fileId }: { conversationId: string; fileId: string }) {
   const { search } = useLocation();
-  const loc = parseLocParam(new URLSearchParams(search).get("loc"));
+  const params = new URLSearchParams(search);
+  const loc = parseLocParam(params.get("loc"));
+  // The citation the link opens (#186 review 5차): the server judges the range by it alone.
+  const cite = params.get("cite")?.slice(0, 64) || undefined;
   const navigate = useNavigate();
-  const fetch: ViewFetch = (o, signal) => files.view(fileId, o, signal);
+  const fetch: ViewFetch = (o, signal) => files.view(fileId, { ...o, cite }, signal);
   // This visit: no query of an earlier one (a request still on its way included) is ever read here.
   const [visit] = useState(newVisit);
   // The opening window (and the locator's resolution) is its own query; the text before and after it pages from
@@ -178,7 +181,9 @@ function TargetNotice({ loc, target }: { loc: FileLocator; target: ViewTarget | 
     >
       <strong>{place}</strong>{" "}
       {ok
-        ? "— 인용한 구절을 강조했어요."
+        ? target.start
+          ? "— 인용한 구절의 시작을 강조했어요."
+          : "— 인용한 구절을 강조했어요."
         : target.reasons.map((r) => (
             <span key={r} data-reason={r}>
               {LOCATE_REASON_TEXT[r]}{" "}

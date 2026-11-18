@@ -716,11 +716,17 @@ export const files = {
    */
   view: async (
     id: string,
-    opts: { loc?: FileLocator | undefined; from?: number | undefined; to?: number | undefined } = {},
+    opts: {
+      loc?: FileLocator | undefined;
+      cite?: string | undefined;
+      from?: number | undefined;
+      to?: number | undefined;
+    } = {},
     signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams();
     if (opts.loc) q.set("loc", JSON.stringify(opts.loc));
+    if (opts.loc && opts.cite) q.set("cite", opts.cite);
     if (opts.from !== undefined) q.set("from", String(opts.from));
     if (opts.to !== undefined) q.set("to", String(opts.to));
     const qs = q.toString();
