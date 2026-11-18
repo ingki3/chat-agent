@@ -387,6 +387,11 @@ export type SpawnIsolatedOptions = SandboxPolicy & {
    * writes fd 4 (#51), so the renderer is driven without a listening port.
    */
   extraPipes?: number;
+  /**
+   * A supervisor in front of `sandbox-exec`, outside the sandbox: its argv, followed by sandbox-exec's own (e.g. the
+   * render watchdog, #170, which starts the sandboxed program as its child and kills it when the server is gone).
+   */
+  wrap?: string[];
 };
 
 /**
@@ -401,7 +406,9 @@ export function spawnIsolated(o: SpawnIsolatedOptions): ChildProcessWithoutNullS
   const linked = [...o.read, ...o.write].flatMap((p) => findHardLinks(canonicalPath(p)));
   if (linked.length) throw new HardLinkError(linked);
   const profile = buildProfile(o);
-  const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, o.command, ...o.args], {
+  const sandboxed = ["/usr/bin/sandbox-exec", "-p", profile, o.command, ...o.args];
+  const [command, ...args] = o.wrap?.length ? [...o.wrap, ...sandboxed] : sandboxed;
+  const child = spawn(command!, args, {
     cwd: o.cwd,
     env: o.env,
     detached: true,

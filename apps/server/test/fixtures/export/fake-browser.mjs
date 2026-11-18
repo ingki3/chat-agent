@@ -1,5 +1,6 @@
 // A stand-in for the headless browser (#51 host-survival tests): speaks the DevTools pipe (fd 3 in, fd 4 out) and
-// misbehaves the way a crashed or compromised renderer could, chosen by argv[2].
+// misbehaves the way a crashed or compromised renderer could, chosen by argv[2]. `orphan` (#170): answers nothing
+// and, like the real shell, keeps running when the pipe closes.
 import net from "node:net";
 
 const mode = process.argv[2];
@@ -18,10 +19,11 @@ input.on("data", (d) => {
     handle(msg);
   }
 });
-input.on("end", () => process.exit(0));
+if (mode === "orphan") setInterval(() => {}, 1000);
+else input.on("end", () => process.exit(0));
 
 function handle(m) {
-  if (mode === "hang") return;
+  if (mode === "hang" || mode === "orphan") return;
   if (first) {
     first = false;
     if (mode === "null") return send("null");

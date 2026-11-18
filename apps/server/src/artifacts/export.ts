@@ -25,6 +25,8 @@ import {
   CdpError,
   CdpPipe,
   sandboxedLauncher,
+  trackRender,
+  WATCHDOG_MAX_SEC,
   type Launched,
   type Launcher,
 } from "./browser.js";
@@ -43,8 +45,10 @@ import { CDN_ALLOW_LIST, serveVersion, type Served } from "./serve.js";
  *  2. every connection goes to an egress proxy that allows CONNECT to the CDN host on 443 only (and, being the
  *     #42 proxy, never to loopback, private, link-local or metadata addresses);
  *  3. the macOS process sandbox: the process can reach only that proxy's loopback port.
- * Time, memory (RSS of the one process — `--single-process`, no fork) and reply size are limited; past a limit
- * the process group is killed.
+ * Time, memory (RSS of the render's group — one `--single-process` browser, no fork) and reply size are limited;
+ * past a limit the process group is killed. The same-uid browser runs under a watchdog outside the server
+ * (`browser.ts` `WATCHDOG_PL`, #170): when the server dies — however it dies — the browser is killed and its folder
+ * removed.
  *
  * Under the worker account (#122, `workers/account.ts`) — once its render self-check passed — the browser is not
  * started by the server at all: the server asks the root-owned launcher (`sudo -u <account> … run render <job>
@@ -305,13 +309,23 @@ export class Renderer {
       launched =
         worker && made
           ? this.launchAsAccount(worker.account, made.jobId, proxy.port)
-          : this.launcher({ browser: browser!, args, env, workDir, proxyPort: proxy.port });
+          : this.launcher({
+              browser: browser!,
+              args,
+              env,
+              workDir,
+              proxyPort: proxy.port,
+              // The watchdog's own cap (#170): a backstop a little past ours, enforced outside this process.
+              deadlineSec: Math.min(WATCHDOG_MAX_SEC, Math.ceil(L.timeoutMs / 1000) + 10),
+            });
     } catch {
       removeWorkDir();
       return { ok: false, code: "export_unavailable" };
     }
     const { child, input, output } = launched;
     const pid = child.pid;
+    // Same uid: the process group is ours to kill on shutdown (`killLiveRenders`) until it has exited.
+    if (!worker && pid) child.once("exit", trackRender(pid, workDir));
     let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
     let exited = false;
     let exitCode: number | null = null;
@@ -365,18 +379,18 @@ export class Renderer {
     };
     if (via?.signal?.aborted) onAbort();
     else via?.signal?.addEventListener("abort", onAbort, { once: true });
-    // Memory of the one browser process; not measurable while it runs → stop (fail closed). Under the account the
-    // launcher watches it (every 250 ms, exit 125 over the limit): the server's pid is sudo's.
+    // Memory of the render's process group (the one browser process plus its watchdog, #170); not measurable while
+    // it runs → stop (fail closed). Under the account the launcher watches it (every 250 ms, exit 125 over the
+    // limit): the server's pid is sudo's.
     let sampling = false;
     const monitor = setInterval(() => {
       if (worker || sampling || exited || !pid) return;
       sampling = true;
-      (t.probe ?? (() => snapshot(pid)))()
+      (t.probe ?? (() => snapshot(pid, 2000, true)))()
         .then((procs) => {
-          const me = procs.find((p) => p.pid === pid);
-          if (!me) {
+          if (!procs.length) {
             if (!exited) kill("monitor");
-          } else if (me.rss * 1024 > L.maxRssBytes) kill("memory");
+          } else if (procs.reduce((n, p) => n + p.rss, 0) * 1024 > L.maxRssBytes) kill("memory");
         })
         .catch(() => kill("monitor"))
         .finally(() => (sampling = false));

@@ -653,8 +653,10 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - **없으면:** 브라우저가 없거나 macOS가 아니면(샌드박스 없음) PNG·PDF는 `export_unavailable`(503)이고 화면은 "만들지 못했어요"를 보인다. 차트 PNG는 브라우저 안에서 먼저 그리므로 그래도 된다.
 - **한도:** 한 번에 20초, 메모리 768MB, 파일 32MB, 동시에 2개(4개까지 기다림 — 넘으면 `export_busy`). 로그에는 `artifact.exported`(형식 `exportFormat`, 결과 `exportCode`, 소요 시간)만 남는다.
   - 자주 보이는 코드: `export_unavailable`(브라우저 없음·macOS 아님), `export_timeout`(20초 넘는 문서 — 끝나지 않는 스크립트), `export_limit`(메모리·크기), `export_busy`(동시 요청).
+- **남은 브라우저·임시 폴더(#170):** 같은 UID 렌더의 브라우저는 서버 밖 감시자(Perl, `/usr/bin/perl`) 아래서 돈다 — 서버가 어떻게 죽어도(SIGKILL 포함) 1초 안팎에 브라우저 그룹과 `agentlee-render-*` 폴더가 사라지고, 어떤 경우에도 120초를 넘기지 않는다. 서버 종료(SIGTERM·SIGINT·exit)도 살아 있는 렌더를 모두 끈다. 서버 시작 때 10분 넘은 `agentlee-render-*` 폴더 중 주인(`owner.lock` flock)이 없는 것만 지운다(프로세스는 죽이지 않음).
+  - 점검: `pgrep -fl chrome-headless-shell`로 보이는 것 중 `--user-data-dir=…/agentlee-render-` 인 것이 렌더가 없을 때 남아 있으면 이슈다. 직접 끌 때는 이름 패턴(`pkill`)이 아니라 그 pid의 **프로세스 그룹**을 확인하고(`ps -o pid,pgid,ppid,command -p <pid>`) 그 그룹만 끈다(`kill -KILL -<pgid>`) — 다른 도구의 헤드리스 셸도 같은 이름이다.
 - **확인:**
-  - `pnpm test apps/server/test/artifact-export.test.ts`: 샘플 차트 PNG·문서 PDF, 앱(127.0.0.1)·사설 IP·메타데이터 요청 차단(겹마다 따로), 쿠키 없음, 시간·메모리 한도.
+  - `pnpm test apps/server/test/artifact-export.test.ts`: 샘플 차트 PNG·문서 PDF, 앱(127.0.0.1)·사설 IP·메타데이터 요청 차단(겹마다 따로), 쿠키 없음, 시간·메모리 한도, 주인을 SIGKILL해도 브라우저·폴더가 남지 않음(#170).
   - 운영 Mac에서 실제 CDN(Chart.js를 쓰는 HTML) 확인: 그런 아티팩트를 열고 PDF 버튼 → 차트가 그려진 PDF가 받아져야 한다. 렌더러는 `cdn.jsdelivr.net:443`에만 나간다.
 
 ### 18.5 패널·카드·목록 (#28)
