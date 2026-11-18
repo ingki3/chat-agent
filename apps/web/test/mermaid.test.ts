@@ -10,6 +10,8 @@ import {
   fenceClosed,
   fixRequest,
   FrameHost,
+  FRAME_BUNDLE_URL,
+  iframeEnv,
   MAX_FIX_ERROR,
   MAX_SOURCE,
   MAX_SVG,
@@ -339,6 +341,34 @@ describe("FrameHost and the queue", () => {
     expect(await renderDiagram("graph TD\nC", false)).toMatchObject({ kind: "ok" });
     expect(f.frames[2]!.posts[0]).toEqual({ type: FRAME_CODE, code: "/* fresh */" });
     expect(signals).toHaveLength(2);
+  });
+  // Review #189 3차: starting a frame makes exactly one request — the abortable fetch — so nothing that cannot
+  // be aborted (a module import of the bundle's address) can hang a later start.
+  it("the real bundle loader is one fetch, started at once with the host's signal, and an abort ends it", async () => {
+    const calls: { url: string; signal: AbortSignal | undefined }[] = [];
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) => {
+      calls.push({ url, signal: init?.signal ?? undefined });
+      return new Promise((_resolve, reject) =>
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))),
+      );
+    });
+    try {
+      const ac = new AbortController();
+      const load = iframeEnv().loadCode(ac.signal);
+      // No await before the request: it is made synchronously when loading starts.
+      expect(calls).toEqual([{ url: FRAME_BUNDLE_URL, signal: ac.signal }]);
+      ac.abort();
+      await expect(load).rejects.toThrow(/aborted/);
+      // A second load is a new request (nothing in flight is joined).
+      const again = new AbortController();
+      void iframeEnv()
+        .loadCode(again.signal)
+        .catch(() => {});
+      expect(calls).toHaveLength(2);
+      again.abort();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
   it("a frame that never gets ready ends in load-failed after the start limit, and is taken down", async () => {
     vi.useFakeTimers();

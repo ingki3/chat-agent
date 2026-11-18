@@ -38,6 +38,11 @@ export {
  *   frame down with it (the work stops) and the next one starts a fresh frame.
  */
 
+declare const __MERMAID_FRAME_URL__: string | undefined;
+/** The frame bundle's address, set by the app build (vite.config.ts `frameBundle`); unset in unit tests. */
+export const FRAME_BUNDLE_URL =
+  typeof __MERMAID_FRAME_URL__ === "string" ? __MERMAID_FRAME_URL__ : "/assets/mermaid-frame.js";
+
 /** How long one drawing may take. */
 export const RENDER_TIMEOUT_MS = 10_000;
 /** How long starting the frame (fetching the bundle, running it) may take. */
@@ -322,9 +327,10 @@ export function iframeEnv(src = "/mermaid-frame"): FrameEnv {
         },
       };
     },
+    // One request, the abortable fetch: the bundle's address is a build-time constant (review #189 3차 — a module
+    // import before it could hang and could not be aborted).
     loadCode: async (signal) => {
-      const { default: url } = await import("./mermaid-frame-url.js");
-      const res = await fetch(url, { credentials: "same-origin", signal });
+      const res = await fetch(FRAME_BUNDLE_URL, { credentials: "same-origin", signal });
       if (!res.ok) throw new Error(`frame bundle ${res.status}`);
       return res.text();
     },
