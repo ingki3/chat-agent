@@ -35,8 +35,8 @@ import {
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
-import { confirmRunEnded } from "../chat/confirm-end.js";
-import { readMessagesAfterEnd, rereadQuery } from "../chat/reread.js";
+import { rereadQuery } from "../chat/reread.js";
+import { forgetReadsAfterEnd, settleEnd, type Ending, type SettleResult } from "../chat/settle.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -105,7 +105,8 @@ export function ChatPage() {
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
-    queryFn: ({ pageParam }) => conversations.messages(id, pageParam),
+    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it.
+    queryFn: ({ pageParam, signal }) => conversations.messages(id, pageParam, signal),
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
@@ -113,14 +114,27 @@ export function ChatPage() {
   // The run this page just started (review #116): an answer to an `active-run` request sent before it (a background
   // refetch still in flight, `null`) never replaces it — the stream would close and the reply never come.
   const startedHere = useRef<{ id: string; runId: string; at: number } | null>(null);
+  // A reply whose end is being settled (#103): every sign of an end marks it, one settle loop handles them all (see
+  // chat/settle.ts). One at a time per conversation; another sign while it settles is the same end or comes back.
+  const [ending, setEnding] = useState<Ending | null>(null);
+  const beginEnding = useCallback(
+    (e: Ending) => setEnding((cur) => (cur && cur.conversationId === e.conversationId ? cur : e)),
+    [],
+  );
   const active = useQuery({
     queryKey: ["active-run", id],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const asked = Date.now();
-      const r = await conversations.activeRun(id);
+      const r = await conversations.activeRun(id, signal);
+      const cached = qc.getQueryData<Run | null>(["active-run", id]) ?? null;
       const mine = startedHere.current;
-      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId)
-        return qc.getQueryData<Run | null>(["active-run", id]) ?? null;
+      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId) return cached;
+      // The run followed live is over (or another took its place): it is let go only once its end is settled — a
+      // messages read after the end shows the reply final — never on this answer alone.
+      if (cached && cached.endedAt === null && !(r && r.id === cached.id && r.endedAt === null)) {
+        beginEnding({ conversationId: id, messageId: cached.assistantMessageId, runId: cached.id });
+        return cached;
+      }
       return r;
     },
   });
@@ -141,15 +155,8 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
-  /** After a run's end (`runId`), or any time: messages first, then the run's state and what it may have changed. */
-  const refresh = async (runId?: string) => {
-    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text) — read
-    // from now on, never a first read still on its way from while the reply streamed (#103). After an end, the one
-    // read shared with the check while finishing; until it has succeeded the live reply stays (that check retries).
-    if (runId) await readMessagesAfterEnd(qc, id, runId);
-    else await rereadQuery(qc, ["messages", id]);
-    await Promise.all([qc.invalidateQueries({ queryKey: ["active-run", id] }), refreshAround()]);
-  };
+  /** The run whose stream closed (with or without `done`): if it turns out to be still going, it is followed again. */
+  const closedRun = useRef<string | null>(null);
   const { live, reconnect } = useRunStream(
     active.data,
     (last) => {
@@ -158,28 +165,62 @@ export function ChatPage() {
           ...a,
           [last.messageId]: { notices: last.notices, ...(last.error ? { error: last.error } : {}) },
         }));
-      // A failed read keeps the live reply: with its `done` the check while finishing reads again; a stream that ended
-      // without one (the run gone, its events expired) has no such check — that reply is read as before.
-      void refresh(last.runId).catch(() => (last.status === undefined ? refresh() : undefined));
+      closedRun.current = last.runId;
+      beginEnding({ conversationId: id, messageId: last.messageId, runId: last.runId });
     },
-    () => void refresh(),
+    () => void qc.invalidateQueries({ queryKey: ["active-run", id] }),
   );
-  // No run in progress, yet the latest reply reads as unfinished (#103 review): opened as its run ended, the messages
-  // were read before the end and the run after it — no stream follows, so nothing would read them again. Read once
-  // more, from now on — once per such answer about the run and reply (an unfinished reply the server keeps never
-  // loops).
+  // No run in progress, yet the latest reply reads as unfinished: opened as its run ended (the messages read before
+  // the end, the run after it), or a reply sent from another tab — settled like any end (#103 review).
   const lastAssistant = list?.findLast((m) => m.role === "assistant");
   const noRun = active.isSuccess && !active.isFetching && (!active.data || active.data.endedAt !== null);
-  const unfinished =
+  const unfinishedId =
     noRun && (lastAssistant?.status === "pending" || lastAssistant?.status === "streaming")
-      ? `${lastAssistant.id}@${active.dataUpdatedAt}`
+      ? lastAssistant.id
       : null;
-  const readUnfinished = useRef<string | null>(null);
+
+  // The settle loop: a try now, then every 2 s until settled (one at a time); stopped when the conversation is left.
+  const around = useEffectEvent(() => refreshAround());
+  const followAgain = useEffectEvent(() => reconnect());
+  const marked = ending?.conversationId === id ? ending : null;
+  // What is being settled, as plain values (the loop restarts only for another reply or run).
+  const settleMessage = marked ? marked.messageId : unfinishedId;
+  const settleRun = marked ? marked.runId : null;
   useEffect(() => {
-    if (!unfinished || readUnfinished.current === unfinished) return;
-    readUnfinished.current = unfinished;
-    void rereadQuery(qc, ["messages", id]);
-  }, [unfinished, id, qc]);
+    if (!settleMessage) return;
+    const settling: Ending = { conversationId: id, messageId: settleMessage, runId: settleRun };
+    const ac = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const attempt = async () => {
+      let r: SettleResult = "unfinished";
+      try {
+        r = await settleEnd({
+          qc,
+          ending: settling,
+          signal: ac.signal,
+          readActiveRun: conversations.activeRun,
+          around,
+        });
+      } catch {
+        // a failed read: tried again
+      }
+      if (ac.signal.aborted) return;
+      if (r === "unfinished") {
+        timer = setTimeout(() => void attempt(), 2000);
+        return;
+      }
+      if (r === "running" && settling.runId !== null && closedRun.current === settling.runId) followAgain();
+      setEnding((e) =>
+        e && e.conversationId === id && e.messageId === settleMessage && e.runId === settleRun ? null : e,
+      );
+    };
+    void attempt();
+    return () => {
+      ac.abort();
+      clearTimeout(timer);
+    };
+  }, [id, settleMessage, settleRun, qc]);
+  useEffect(() => () => forgetReadsAfterEnd(qc, id), [qc, id]);
   // A new artifact of a run started here is shown on its page by itself (#28, FR-6.1, #172).
   useAutoShow(live, id);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
@@ -188,41 +229,13 @@ export function ChatPage() {
   const busy = (!!live && !lost) || starting;
   // The reply has its `done` but the run is not read as ended yet (#141): an Enter now is sent once it is.
   const finishing = !!live && !lost && live.status !== undefined;
-  const recheck = useEffectEvent(() => void refresh());
+  // A lost stream: the run is looked at now and then — an answer that it is over settles it like any end.
+  const recheck = useEffectEvent(() => void qc.invalidateQueries({ queryKey: ["active-run", id] }));
   useEffect(() => {
     if (!lost) return;
     const t = setInterval(recheck, 5000);
     return () => clearInterval(t);
   }, [lost]);
-  // While finishing, the end of the run is read again now and then (#141): the read after `done` may have failed
-  // (its retry too, or a retry left waiting) — busy stays until a read says the run ended, never cleared on a guess.
-  // One read at a time (a slow one is never cut short by the next); a read is dropped once the reply stops finishing
-  // or the conversation is left, and never applied over another run (see confirmRunEnded).
-  const finishingRun = finishing ? live.runId : null;
-  const around = useEffectEvent(() => refreshAround());
-  useEffect(() => {
-    if (!finishingRun) return;
-    const ac = new AbortController();
-    let checking = false;
-    const t = setInterval(() => {
-      if (checking) return;
-      checking = true;
-      void confirmRunEnded({
-        qc,
-        conversationId: id,
-        runId: finishingRun,
-        signal: ac.signal,
-        read: conversations.activeRun,
-        around,
-      })
-        .catch(() => false) // tried again on the next tick
-        .finally(() => (checking = false));
-    }, 2000);
-    return () => {
-      clearInterval(t);
-      ac.abort();
-    };
-  }, [finishingRun, id, qc]);
 
   const { scroller, content, away, toBottom } = useStickToBottom();
 
@@ -284,7 +297,12 @@ export function ChatPage() {
     ? () =>
         void runs
           .interrupt(live.runId)
-          .then(() => refresh())
+          // Ended already: settled like any end (with the `done` that may be on its way, the same end); still
+          // going: its stream's `done` ends it.
+          .then((run) => {
+            if (run.endedAt !== null)
+              beginEnding({ conversationId: id, messageId: run.assistantMessageId, runId: run.id });
+          })
           .catch((e: unknown) => setActionError(errorText(e)))
     : undefined;
 

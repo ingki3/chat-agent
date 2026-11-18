@@ -364,13 +364,26 @@ const noRunAnswer = (page: Page) =>
     },
   );
 
+/** Lets a `/gate <name>` reply end (FakeRuntime): `/release <name>` sent in a conversation of its own. */
+async function releaseGate(page: Page, baseURL: string, gate: string) {
+  const c = await newConversation(page.request, baseURL, `gate ${gate}`);
+  const r = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: `/release ${gate}` },
+    headers: { ...csrf(baseURL), "Idempotency-Key": crypto.randomUUID() },
+  });
+  expect(r.ok()).toBe(true);
+}
+
 test("a reply that ends while the new conversation's first messages read is on its way ends complete (#103)", async ({
   page,
+  baseURL,
 }) => {
-  // A new conversation opens as its run goes on; its first messages read is answered while the reply streams and
-  // held until the screen reads the messages again after the run's `done`. That read must be a new one — not the
-  // held one joined (the reply then stayed "streaming" for good: the citations e2e flake on a loaded CI runner).
+  // A new conversation opens as its run goes on; its first messages read is answered while the reply is certainly
+  // unfinished (the run waits at a gate until the snapshot is taken), then held until the screen reads the messages
+  // again after the run's `done`. That read must be a new one — not the held one joined (the reply then stayed
+  // "streaming" for good: the citations e2e flake on a loaded CI runner).
   await useAccount(page, SON);
+  const gate = crypto.randomUUID();
   let held: (() => void) | undefined;
   let first: string | undefined;
   let reads = 0;
@@ -380,10 +393,11 @@ test("a reply that ends while the new conversation's first messages read is on i
       held?.();
       return route.continue();
     }
-    // The snapshot is taken (the reply unfinished, checked below) before anything lets the run end on screen.
     const res = await route.fetch();
     const body: unknown = await res.json();
     first = replyStatus(body);
+    // Only now may the run end.
+    await releaseGate(page, baseURL!, gate);
     // Released by the next read; without one (the bug), let go late so the stale answer shows.
     await new Promise<void>((r) => {
       held = r;
@@ -393,7 +407,7 @@ test("a reply that ends while the new conversation's first messages read is on i
   });
   const ended = noRunAnswer(page);
   await page.goto("/");
-  await send(page, "/tool 3");
+  await send(page, `/gate ${gate}`);
   await page.waitForURL(/\/c\/[^/]+$/);
   await ended;
   expect(UNFINISHED).toContain(first);
@@ -410,8 +424,9 @@ test("opening a conversation as its run ends: messages read before the end, the 
   // Not opened yet: the page loads only once the routes below are in place.
   await useAccount(page, SON);
   const c = await newConversation(page.request, baseURL!, `끝나는 순간 열기 ${Date.now()}`);
+  const gate = crypto.randomUUID();
   const started = await page.request.post(`/api/conversations/${c.id}/messages`, {
-    data: { text: "/tool 3" },
+    data: { text: `/gate ${gate}` },
     headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
   });
   expect(started.ok()).toBe(true);
@@ -422,27 +437,32 @@ test("opening a conversation as its run ends: messages read before the end, the 
         async () =>
           ((await (await page.request.get(`/api/runs/${runId}`)).json()) as { endedAt: number | null })
             .endedAt,
-        {
-          timeout: 15_000,
-        },
+        { timeout: 15_000 },
       )
       .not.toBeNull();
   };
-  // The page's first messages read is answered before the end (the reply unfinished), its active-run read after it:
-  // no stream is followed, so nothing else would read the messages again.
+  // The page's first messages read is answered before the end (the run waits at its gate), its first active-run read
+  // after it: no stream is followed, so nothing else would read the messages again.
   let first: string | undefined;
+  let snapshot!: () => void;
+  const snapshotTaken = new Promise<void>((r) => (snapshot = r));
   let messageReads = 0;
   await page.route("**/api/conversations/*/messages*", async (route) => {
     if (route.request().method() !== "GET" || ++messageReads > 1) return route.continue();
     const res = await route.fetch();
     const body: unknown = await res.json();
     first = replyStatus(body);
+    snapshot();
+    await releaseGate(page, baseURL!, gate);
     await runEnded();
     await route.fulfill({ response: res, json: body });
   });
   let activeReads = 0;
   await page.route("**/api/conversations/*/active-run", async (route) => {
-    if (++activeReads === 1) await runEnded();
+    if (++activeReads === 1) {
+      await snapshotTaken;
+      await runEnded();
+    }
     await route.continue();
   });
   const ended = noRunAnswer(page);

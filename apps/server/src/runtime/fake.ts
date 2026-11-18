@@ -90,7 +90,10 @@ export type FakeStep =
   | { usage: UsageReport }
   | { notice: string }
   | { limit: string; resetsAt?: number; retryAfterMs?: number; modelFamily?: string }
-  | { fail: string; code?: RuntimeFailure["code"] };
+  | { fail: string; code?: RuntimeFailure["code"] }
+  /** Waits until a `release` step with the same name runs (in any run of this process) — tests order a run's end. */
+  | { gate: string }
+  | { release: string };
 
 export type FakeScript = (input: TurnInput, memory: string[]) => FakeStep[];
 
@@ -489,6 +492,11 @@ export const defaultScript: FakeScript = (input, memory) => {
     }
     return steps;
   }
+  // `/gate <name>`: the reply waits half-way until `/release <name>` is sent (from any conversation) — so a test can
+  // look at the reply while it is certainly unfinished, then let it end (#103).
+  const gate = /^\/(gate|release)\s+([a-z0-9-]{1,64})$/.exec(t);
+  if (gate?.[1] === "gate") return [{ text: "기다릴게요. " }, { gate: gate[2]! }, { text: "끝났어요." }];
+  if (gate?.[1] === "release") return [{ release: gate[2]! }, { text: "풀었어요." }];
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [
@@ -509,6 +517,26 @@ export const defaultScript: FakeScript = (input, memory) => {
     { usage: { inputTokens: 10 * memory.length, outputTokens: words.length } },
   ];
 };
+
+/** Gates of `/gate` runs: waiting ones (resolve) and ones released before anyone waited. */
+const gates = new Map<string, { open: boolean; waiters: (() => void)[] }>();
+const gateOf = (name: string) => {
+  let g = gates.get(name);
+  if (!g) gates.set(name, (g = { open: false, waiters: [] }));
+  return g;
+};
+function releaseGate(name: string): void {
+  const g = gateOf(name);
+  g.open = true;
+  for (const w of g.waiters.splice(0)) w();
+}
+const waitGate = (name: string, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const g = gateOf(name);
+    if (g.open || signal.aborted) return resolve();
+    g.waiters.push(resolve);
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -711,6 +739,8 @@ export class FakeRuntime implements RuntimeAdapter {
               };
               return;
             } else if ("fail" in step) throw step.code ? new RuntimeFailure(step.code) : new Error(step.fail);
+            else if ("gate" in step) await waitGate(step.gate, ctrl.signal);
+            else if ("release" in step) releaseGate(step.release);
           }
         }
         return { events: events(), interrupt: async () => ctrl.abort() };
