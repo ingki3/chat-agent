@@ -110,36 +110,14 @@ export type LaunchSpec = {
   deadlineSec: number;
 };
 
-/**
- * A started browser: its process (the watchdog), the two debugging pipes (fd 3 = commands in, fd 4 = replies out),
- * and — once the watchdog has reported it — the browser's own process group (`browserGroup`).
- */
-export type Launched = {
-  child: ChildProcess;
-  input: Writable;
-  output: Readable;
-  browserGroup?: () => number | undefined;
-};
+/** A started browser: its process (the watchdog) and the two debugging pipes (fd 3 = commands in, fd 4 = replies out). */
+export type Launched = { child: ChildProcess; input: Writable; output: Readable };
 export type Launcher = (spec: LaunchSpec) => Launched;
-
-/** The watchdog's one report on stdout: `pgid <n>` (the browser's group, which it leads). Nothing else is read. */
-function readBrowserGroup(stdout: Readable): () => number | undefined {
-  let group: number | undefined;
-  let buf = "";
-  stdout.on("data", (d: Buffer) => {
-    if (group !== undefined || buf.length > 64) return;
-    buf += d.toString("latin1");
-    const m = /^pgid ([1-9][0-9]{0,9})\n/.exec(buf);
-    if (m) group = Number(m[1]);
-  });
-  return () => group;
-}
 
 const pipes = (child: ChildProcess): Launched => ({
   child,
   input: child.stdio[3] as Writable,
   output: child.stdio[4] as Readable,
-  browserGroup: readBrowserGroup(child.stdout!),
 });
 
 /** Prefix of every same-uid render folder (`mkdtemp`: six more characters). Nothing else is ever removed. */
@@ -156,11 +134,12 @@ export type RenderDir = { workDir: string; lock: LockId };
 /** Upper bound of the watchdog's own clock (monotonic), whatever the caller asks. */
 export const WATCHDOG_MAX_SEC = 120;
 /**
- * The watchdog's **own** exit codes (never the browser's): it ended by itself / the watchdog stopped it — reaped,
- * its group gone, cleaned up; it was never started (arguments, lock); its exec failed; its group could not be
- * confirmed gone (the server kills it and cleans up). Any other end (a signal) means the watchdog was interrupted.
+ * The watchdog's **own** exit codes (never the browser's): the browser ended by itself / the watchdog stopped it —
+ * reaped in both cases; it was never started (arguments, lock); the watchdog's own exec of its direct child failed
+ * (in production that child is `sandbox-exec`, so a profile `sandbox-exec` itself rejects is not this code — that
+ * child then just ends). Any other end (a signal) means the watchdog itself was interrupted.
  */
-export const WATCHDOG_EXIT = { done: 0, stopped: 3, notStarted: 4, execFailed: 5, cleanupFailed: 6 } as const;
+export const WATCHDOG_EXIT = { done: 0, stopped: 3, notStarted: 4, execFailed: 5 } as const;
 const PERL = "/usr/bin/perl";
 
 /**
@@ -191,16 +170,23 @@ export function makeRenderDir(parent: string): RenderDir {
 }
 
 /**
- * Removes a render folder, and its lock file only when it is still the regular file this render created (same device
- * and inode) — `unlink`, never a recursive delete. Best effort: the sweep removes what is left.
+ * Removes a render folder, then its lock file — only once the folder is confirmed gone (`ENOENT`), and only when the
+ * lock is still the regular file this render created (same device and inode): `unlink`, never a recursive delete. A
+ * folder that could not be removed keeps its lock, so the sweep tries again later.
  */
 export function removeRenderDir(workDir: string, lock?: LockId) {
   try {
     fs.rmSync(workDir, { recursive: true, force: true });
   } catch {
-    // best effort
+    // kept: its lock stays too (below)
   }
   if (!lock) return;
+  try {
+    fs.lstatSync(workDir);
+    return; // still there
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") return;
+  }
   const p = renderLockPath(workDir);
   try {
     const st = fs.lstatSync(p);
@@ -211,29 +197,28 @@ export function removeRenderDir(workDir: string, lock?: LockId) {
 }
 
 /**
- * The render watchdog (#170) — a small Perl process **outside** the server that starts the browser as its own child
- * and makes sure it never outlives the server.
- *  - The server spawns it as the leader of a new process group (`detached`). It locks the render's lock file — the
- *    very file the server created (device + inode passed in), opened without following a link and without blocking
- *    (a FIFO cannot hang it), checked on the open file and on the path after locking; anything else: not started.
- *  - The browser is forked into **its own** process group (`setpgid` on both sides of the fork), gets fd 3/4 (the
- *    debugging pipe) and the inherited lock, and nothing else of the watchdog (stdout: /dev/null). The watchdog
- *    tells the server that group on stdout (`pgid <n>`), so a server that outlives its watchdog can kill it too.
- *  - Exec failure is told apart from a browser that exits 127 by a close-on-exec status pipe.
- *  - The watchdog's stdin is a pipe the server holds and never writes: the kernel closes it when the server dies,
- *    however it dies (SIGKILL included). EOF there, a changed parent pid, or the cap on the monotonic clock
- *    (`deadlineSec`, at most `WATCHDOG_MAX_SEC`) → SIGKILL to the browser's whole group (before it is reaped, so the
- *    id cannot have been reused), then reap.
- *  - However the browser ends, the watchdog then confirms its group is gone (SIGKILL to the group, a bounded wait),
- *    removes the render folder (our name only, a real folder), unlinks the lock (only the file it locked), and exits
- *    with its own status (`WATCHDOG_EXIT`). A group it cannot confirm gone: `cleanupFailed`, folder left to the server.
+ * The render watchdog (#170) — a small Perl process **outside** the server that starts the browser as its direct
+ * child and makes sure it never outlives the server.
+ *  - The server spawns it as the leader of a new process group and session (`detached`); the browser stays in that
+ *    group — **one** group, known to the server from the spawn on. The production sandbox forbids the browser to
+ *    fork, so the browser is that one child, and the watchdog kills and reaps it by its pid (nothing is signalled
+ *    after it is reaped).
+ *  - It locks the render's lock file — the very file the server created (device + inode passed in), opened without
+ *    following a link and without blocking (a FIFO cannot hang it), checked on the open file and on the path after
+ *    locking; anything else: not started. The browser inherits the lock and fd 3/4 (the debugging pipe).
+ *  - Its stdin is a pipe the server holds and never writes: the kernel closes it when the server dies, however it
+ *    dies (SIGKILL included). EOF there, a changed parent pid, or the cap on the monotonic clock (`deadlineSec`, at
+ *    most `WATCHDOG_MAX_SEC`) → SIGKILL to the browser, reap. A close-on-exec status pipe, watched in the same loop,
+ *    tells its own exec failing (`execFailed`) from a browser that exits 127.
+ *  - However the browser ends, the watchdog then removes the render folder (our name only, a real folder) and —
+ *    only once the folder is gone — unlinks the lock (only the file it locked), and exits with its own status.
  * argv: <owner pid> <deadline sec> <render folder> <lock dev> <lock ino> <command…>
  */
 export const WATCHDOG_PL = String.raw`use strict; use POSIX (); use Errno ();
 use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC O_RDONLY O_NOFOLLOW O_NONBLOCK);
-use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC usleep); use File::Path ();
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC); use File::Path ();
 my %X = (done => ${WATCHDOG_EXIT.done}, stopped => ${WATCHDOG_EXIT.stopped}, notStarted => ${WATCHDOG_EXIT.notStarted},
-  execFailed => ${WATCHDOG_EXIT.execFailed}, cleanupFailed => ${WATCHDOG_EXIT.cleanupFailed});
+  execFailed => ${WATCHDOG_EXIT.execFailed});
 my ($owner, $max, $dir, $ldev, $lino, @cmd) = @ARGV;
 POSIX::_exit($X{notStarted}) unless defined $lino && @cmd && $owner =~ /\A[0-9]{1,10}\z/ && $max =~ /\A[0-9]{1,4}\z/
   && $ldev =~ /\A[0-9]{1,20}\z/ && $lino =~ /\A[0-9]{1,20}\z/;
@@ -254,47 +239,50 @@ my $pid = fork();
 POSIX::_exit($X{notStarted}) unless defined $pid;
 if ($pid == 0) {
   close($sr);
-  POSIX::setpgid(0, 0);
   open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
-  open(STDOUT, ">", "/dev/null") or POSIX::_exit(127);
   exec { $cmd[0] } @cmd;
   syswrite($sw, "E");
   POSIX::_exit(127);
 }
 close($sw);
-POSIX::setpgid($pid, $pid);    # also here: no moment where the browser is in our group
 POSIX::close(3); POSIX::close(4);
 chdir("/");    # File::Path will not remove the current folder (the browser's cwd is the render folder)
 my $t0 = clock_gettime(CLOCK_MONOTONIC);
-my $execd = sysread($sr, my $e, 1);
-close($sr);
 my $finish = sub {
   my ($code) = @_;
-  # The browser's group: anything left in it is killed; it must be gone within a second.
-  kill("KILL", -$pid);
-  my $until = clock_gettime(CLOCK_MONOTONIC) + 1;
-  while (kill(0, -$pid) || !$!{ESRCH}) {
-    POSIX::_exit($X{cleanupFailed}) if clock_gettime(CLOCK_MONOTONIC) > $until;
-    usleep(20_000);
-  }
   File::Path::remove_tree($dir) if $ours && -d $dir && !-l $dir;
-  my @now = lstat($lp);
-  unlink($lp) if @now && -f _ && $now[0] == $ldev && $now[1] == $lino;
+  if (!lstat($dir) && $!{ENOENT}) {
+    my @now = lstat($lp);
+    unlink($lp) if @now && -f _ && $now[0] == $ldev && $now[1] == $lino;
+  }
   POSIX::_exit($code);
 };
-if (!defined $execd || $execd != 0) { waitpid($pid, 0); $finish->($X{execFailed}); }
-syswrite(STDOUT, "pgid $pid\n");
-my $stop = sub { kill("KILL", -$pid); waitpid($pid, 0); $finish->($X{stopped}); };
+# The exec status: undef = not known yet, 1 = exec done (pipe closed), 0 = exec failed.
+my $execd;
+my $status = sub {
+  my $r = sysread($sr, my $e, 1);
+  return if !defined $r && ($!{EINTR} || $!{EAGAIN});
+  $execd = (defined $r && $r == 0) ? 1 : 0;
+  close($sr);
+};
+my $stop = sub { kill("KILL", $pid); waitpid($pid, 0); $finish->($X{stopped}); };
 $SIG{$_} = $stop for qw(TERM INT HUP);
 $SIG{CHLD} = sub { };
 while (1) {
   my $g = waitpid($pid, POSIX::WNOHANG());
-  $finish->($X{done}) if $g == $pid;
+  if ($g == $pid) {
+    $status->() unless defined $execd;    # the child is gone: its status byte (or EOF) is there now
+    $finish->($execd ? $X{done} : $X{execFailed});
+  }
   $stop->() if $g < 0 || getppid() != $owner;
   $stop->() if clock_gettime(CLOCK_MONOTONIC) - $t0 > $max;
+  if (defined $execd && !$execd) { kill("KILL", $pid); waitpid($pid, 0); $finish->($X{execFailed}); }
   my $rin = ""; vec($rin, 0, 1) = 1;
+  vec($rin, fileno($sr), 1) = 1 unless defined $execd;
   my $n = select(my $rout = $rin, undef, undef, 0.25);
   next unless defined $n && $n > 0;
+  $status->() if !defined $execd && vec($rout, fileno($sr), 1);
+  next unless vec($rout, 0, 1);
   my $r = sysread(STDIN, my $buf, 4096);
   $stop->() if defined $r ? $r == 0 : !($!{EINTR} || $!{EAGAIN});
 }`;
@@ -340,12 +328,17 @@ export function rendererSandbox(s: LaunchSpec): SpawnIsolatedOptions {
  * proxy's loopback port — a request that slips past every check in the browser is still refused by the kernel.
  * Throws `SandboxUnavailableError` elsewhere (export is then unavailable: fail closed).
  */
-export const sandboxedLauncher: Launcher = (s) => pipes(spawnIsolated(rendererSandbox(s)));
+export const sandboxedLauncher: Launcher = (s) => {
+  const child = spawnIsolated(rendererSandbox(s));
+  // Nothing is read from stdout (stderr is drained by spawnIsolated): never let a full pipe block the browser.
+  child.stdout.resume();
+  return pipes(child);
+};
 
 /**
  * The same browser without the process sandbox — **tests only** (Linux CI has no sandbox-exec): everything in
  * the browser (switches, request interception, the egress proxy, the watchdog) is the same; the kernel layer is
- * missing. stdin is the watchdog's owner pipe (never written), stdout its report.
+ * missing. stdin is the watchdog's owner pipe (never written).
  */
 export const unsandboxedLauncher: Launcher = (s) => {
   const [command, ...pre] = watchdogPrefix(s);
@@ -353,25 +346,24 @@ export const unsandboxedLauncher: Launcher = (s) => {
     cwd: s.workDir,
     env: s.env,
     detached: true,
-    stdio: ["pipe", "pipe", "ignore", "pipe", "pipe"],
+    stdio: ["pipe", "ignore", "ignore", "pipe", "pipe"],
   });
   child.stdin!.on("error", () => {});
   return pipes(child);
 };
 
 /**
- * Same-uid renders still running in this process: the watchdog's group → the render's folder and lock, and the
- * browser's own group once known. `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`:
- * `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
+ * render's folder and lock. `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`,
+ * SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
  */
-type LiveRender = RenderDir & { browserGroup?: () => number | undefined };
-const liveRenders = new Map<number, LiveRender>();
+const liveRenders = new Map<number, RenderDir>();
 
 /**
- * Records a running render. `untrack` forgets it (once its process has exited); `tracked` says whether it is still
- * on record — false once `killLiveRenders` has killed its groups (nothing more to kill then).
+ * Records a running render. `untrack` forgets it (once the watchdog has exited); `tracked` says whether it is still
+ * on record — false once `killLiveRenders` has killed its group (nothing more to signal then).
  */
-export function trackRender(pgid: number, dir: LiveRender) {
+export function trackRender(pgid: number, dir: RenderDir) {
   liveRenders.set(pgid, dir);
   return {
     tracked: () => liveRenders.get(pgid) === dir,
@@ -381,22 +373,20 @@ export function trackRender(pgid: number, dir: LiveRender) {
   };
 }
 
-/** SIGKILLs a render's groups: the browser's (when known) and the watchdog's. */
-export function killRenderGroups(pgid: number, browserGroup?: number) {
-  for (const g of [browserGroup, pgid])
-    if (g)
-      try {
-        process.kill(-g, "SIGKILL");
-      } catch {
-        // already gone
-      }
+/** SIGKILLs a render's process group (the watchdog's, the browser in it). */
+export function killRenderGroup(pgid: number) {
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch {
+    // already gone
+  }
 }
 
-/** SIGKILLs every live render's process groups and removes its folder (synchronous: safe in an `exit` hook). */
+/** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
 export function killLiveRenders(): number {
   const n = liveRenders.size;
   for (const [pgid, dir] of liveRenders) {
-    killRenderGroups(pgid, dir.browserGroup?.());
+    killRenderGroup(pgid);
     removeRenderDir(dir.workDir, dir.lock);
   }
   liveRenders.clear();

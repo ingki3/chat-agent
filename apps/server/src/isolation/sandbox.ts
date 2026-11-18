@@ -155,10 +155,14 @@ export type Proc = { pid: number; rss: number };
 /**
  * Resident memory (KiB) of one process via `ps` — or, with `group`, of every process of the process group it leads
  * (#191: `fork`; the caller adds them up). Rejects when ps fails, times out or prints nothing usable.
+ * `group` means a `detached` child (it leads both a session and a process group, and nothing in it calls setsid or
+ * setpgid — #170): that set is selected by process group on macOS (`ps -g`) and by session on Linux, where procps
+ * reads a numeric `-g` as a session id anyway (`ps -s`, said explicitly).
  */
 export function snapshot(pid: number, timeoutMs = 2000, group = false): Promise<Proc[]> {
+  const select = group ? (process.platform === "linux" ? "-s" : "-g") : "-p";
   return new Promise((resolve, reject) => {
-    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", ...(group ? ["-g", String(pid)] : ["-p", String(pid)])], {
+    const ps = spawn("/bin/ps", ["-o", "pid=,rss=", select, String(pid)], {
       env: {},
     });
     let out = "";

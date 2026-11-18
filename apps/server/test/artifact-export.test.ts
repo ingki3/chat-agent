@@ -47,7 +47,7 @@ import {
 } from "../src/artifacts/export.js";
 import { CDN_ALLOW_LIST } from "../src/artifacts/serve.js";
 import { EXPORT_CODES as LOGGABLE_EXPORT_CODES } from "../src/observability/policy.js";
-import { buildProfile, runIsolated } from "../src/isolation/sandbox.js";
+import { buildProfile, runIsolated, snapshot } from "../src/isolation/sandbox.js";
 import { REPO_ROOT } from "../src/config.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -655,16 +655,14 @@ async function within(ms: number, done: () => boolean) {
 }
 
 /**
- * Groups this file started (hosts, watchdogs, browsers, holders) and has not yet seen gone: killed after each test.
+ * Groups this file started (hosts, watchdogs with their browsers, holders) and has not yet seen gone: killed after
+ * each test.
  * A group is taken off the list as soon as it is confirmed gone (`gone`), so a reused id is never signalled. Nothing
  * is matched by name.
  */
 const startedGroups = new Set<number>();
-/** Watchdogs this file started: their browsers lead groups of their own, killed after each test too. */
-const startedLaunches = new Set<Launched>();
 const track = (l: Launched) => {
   startedGroups.add(l.child.pid!);
-  startedLaunches.add(l);
   return l;
 };
 const gone = async (pgid: number, ms: number) => {
@@ -673,11 +671,6 @@ const gone = async (pgid: number, ms: number) => {
   return ok;
 };
 afterEach(() => {
-  for (const l of startedLaunches) {
-    const g = l.browserGroup?.();
-    if (g && groupAlive(g)) startedGroups.add(g);
-  }
-  startedLaunches.clear();
   for (const g of startedGroups) {
     try {
       process.kill(-g, "SIGKILL");
@@ -695,12 +688,12 @@ const freshRenderDir = () => {
   closers.push(async () => removeRenderDir(d.workDir, d.lock));
   return d;
 };
-/** The watchdog straight from the unsandboxed launcher, on a fresh folder; `group()` = the browser's group. */
+/** The watchdog straight from the unsandboxed launcher, on a fresh folder (or one given). */
 function watchdog(
   args: string[],
-  o: { env?: Record<string, string>; deadlineSec?: number; browser?: string } = {},
+  o: { env?: Record<string, string>; deadlineSec?: number; browser?: string; dir?: RenderDir } = {},
 ) {
-  const d = freshRenderDir();
+  const d = o.dir ?? freshRenderDir();
   const l = unsandboxedLauncher({
     browser: o.browser ?? process.execPath,
     args,
@@ -712,13 +705,15 @@ function watchdog(
   });
   track(l);
   const exited = new Promise<number | null>((r) => l.child.once("exit", (code) => r(code)));
-  const group = async () => {
-    expect(await within(10_000, () => !!l.browserGroup?.())).toBe(true);
-    const g = l.browserGroup!()!;
-    startedGroups.add(g);
-    return g;
-  };
-  return { ...d, l, exited, group };
+  return { ...d, l, exited };
+}
+/** The members of a group (`snapshot`: macOS process group, Linux session — the same set for a detached child). */
+const members = async (pgid: number) => (await snapshot(pgid, 2000, true)).map((p) => p.pid);
+/** A file a stand-in browser writes its pid to (`PIDFILE`), and that pid once written. */
+function pidFile() {
+  const f = path.join(fs.realpathSync(os.tmpdir()), `agentlee-pid-${crypto.randomUUID()}`);
+  closers.push(async () => fs.rmSync(f, { force: true }));
+  return { f, pid: () => (fs.existsSync(f) ? Number(fs.readFileSync(f, "utf8")) || undefined : undefined) };
 }
 
 describe("the browser never outlives its owner (#170)", () => {
@@ -743,28 +738,24 @@ describe("the browser never outlives its owner (#170)", () => {
     const info = JSON.parse(out.split("\n")[0]!) as {
       host: number;
       pgid: number;
-      browserPgid: number;
       members: number[];
       workDir: string;
       spinning?: boolean;
     };
     startedGroups.add(info.pgid);
-    startedGroups.add(info.browserPgid);
     expect(info.host).toBe(host.pid);
-    // The watchdog leads its group; the browser leads its own (not the watchdog's), running; the folder is locked.
-    expect(info.browserPgid).not.toBe(info.pgid);
+    // One group: the watchdog leads it, the browser is in it, running; the folder is locked.
     expect(info.members).toContain(info.pgid);
-    expect(info.members).toContain(info.browserPgid);
+    expect(info.members.length).toBeGreaterThanOrEqual(2);
     expect(path.basename(info.workDir)).toMatch(/^agentlee-render-[A-Za-z0-9]{6}$/);
     expect(fs.existsSync(renderLockPath(info.workDir))).toBe(true);
-    expect(groupAlive(info.browserPgid)).toBe(true);
+    expect(groupAlive(info.pgid)).toBe(true);
     if (mode === "real") expect(info.spinning).toBe(true);
 
     const killedAt = Date.now();
     process.kill(host.pid!, "SIGKILL");
     await exited;
     expect(await gone(host.pid!, 2000)).toBe(true);
-    expect(await gone(info.browserPgid, 5000)).toBe(true);
     expect(await gone(info.pgid, 5000)).toBe(true);
     expect(await within(2000, () => !fs.existsSync(info.workDir))).toBe(true);
     expect(fs.existsSync(renderLockPath(info.workDir))).toBe(false);
@@ -805,52 +796,122 @@ describe("the browser never outlives its owner (#170)", () => {
     return { r, launches };
   }
 
-  it("the watchdog SIGKILLed alone (the server alive): the server kills the browser's own group at once", async () => {
+  it("the watchdog SIGKILLed alone (the server alive): the server kills its group, the browser in it, at once", async () => {
     const { r, launches } = orphanRenderer();
     const before = liveRenderCount();
     const pending = r.render(job("markdown", "x", "pdf"));
-    expect(await within(10_000, () => !!launches[0]?.l.browserGroup?.())).toBe(true);
-    const { pgid, workDir, l } = launches[0]!;
-    const browserPgid = l.browserGroup!()!;
-    startedGroups.add(browserPgid);
-    expect(browserPgid).not.toBe(pgid);
-    expect(groupAlive(browserPgid)).toBe(true);
+    // Until the browser runs under the watchdog (two members of the one group).
+    let seen: number[] = [];
+    expect(
+      await within(10_000, () => {
+        if (launches[0]) void members(launches[0].pgid).then((m) => (seen = m));
+        return seen.length >= 2;
+      }),
+    ).toBe(true);
+    const { pgid, workDir } = launches[0]!;
     process.kill(pgid, "SIGKILL"); // the watchdog only
     expect(await pending).toEqual({ ok: false, code: "export_failed" });
-    expect(await gone(browserPgid, 2000)).toBe(true);
     expect(await gone(pgid, 2000)).toBe(true);
+    for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
     expect(fs.existsSync(workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(workDir))).toBe(false);
     expect(liveRenderCount()).toBe(before);
   }, 30_000);
 
+  /** A render whose stand-in browser records its pid, and something done to it right after the spawn. */
+  async function rightAfterSpawn(act: (l: Launched) => void) {
+    const p = pidFile();
+    const launches: { l: Launched; workDir: string }[] = [];
+    const launcher: Launcher = (s) => {
+      const l = track(unsandboxedLauncher({ ...s, env: { ...s.env, PIDFILE: p.f } }));
+      launches.push({ l, workDir: s.workDir });
+      act(l); // before the watchdog has even run: no readiness of any kind
+      return l;
+    };
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher,
+      egress: spyEgress().egress,
+      limits: { timeoutMs: 60_000 },
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+    const { l, workDir } = launches[0]!;
+    expect(await gone(l.child.pid!, 3000)).toBe(true);
+    // The browser either never started or is gone — and does not turn up later either.
+    await new Promise((done) => setTimeout(done, 500));
+    const pid = p.pid();
+    if (pid) expect(alive(pid), `browser ${pid}`).toBe(false);
+    expect(fs.existsSync(workDir)).toBe(false);
+  }
+
+  it("shutdown right after the spawn (before any readiness) leaves no browser", async () => {
+    for (let i = 0; i < 5; i++) await rightAfterSpawn(() => void closeRenderers());
+  }, 60_000);
+
+  it("the watchdog killed right after the spawn leaves no browser", async () => {
+    for (let i = 0; i < 5; i++) await rightAfterSpawn((l) => process.kill(l.child.pid!, "SIGKILL"));
+  }, 60_000);
+
   it("the watchdog's own cap (monotonic clock) stops a browser the (living) owner never stops, and cleans up", async () => {
-    const w = watchdog(FAKE(), { deadlineSec: 1 });
-    const g = await w.group();
     const started = Date.now();
+    const w = watchdog(FAKE(), { deadlineSec: 1 });
     expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
     expect(Date.now() - started).toBeLessThan(4000);
-    expect(await gone(g, 2000)).toBe(true);
     expect(await gone(w.l.child.pid!, 2000)).toBe(true);
     expect(fs.existsSync(w.workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
   }, 30_000);
 
-  it("a browser that ends by itself: the watchdog kills what it left in its group, removes the folder and lock, exits 0", async () => {
-    const pidFile = path.join(fs.realpathSync(os.tmpdir()), `agentlee-fork-${crypto.randomUUID()}`);
-    closers.push(async () => fs.rmSync(pidFile, { force: true }));
-    const w = watchdog([FAKE_JS, "fork"], { env: { PIDFILE: pidFile } });
-    const g = await w.group();
-    expect(await within(5000, () => fs.existsSync(pidFile))).toBe(true);
-    const left = Number(fs.readFileSync(pidFile, "utf8"));
-    expect(alive(left)).toBe(true);
+  it("a browser that ends by itself: the watchdog removes the folder and lock before it exits 0", async () => {
+    const w = watchdog([FAKE_JS, "ok"]);
+    expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
     w.l.input.end(); // the stand-in ends when its command pipe closes (as after `Browser.close`)
     expect(await w.exited).toBe(WATCHDOG_EXIT.done);
-    expect(alive(left)).toBe(false);
-    expect(await gone(g, 2000)).toBe(true);
+    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
     expect(fs.existsSync(w.workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
   }, 30_000);
+
+  it.skipIf(!darwin)(
+    "a folder that cannot be removed keeps its lock (server and watchdog alike), so the sweep tries again",
+    async () => {
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-keep-")));
+      const stuck: string[] = [];
+      const flags = (f: string, on: boolean) =>
+        spawnSync("/usr/bin/chflags", [on ? "uchg" : "nouchg", f]).status;
+      closers.push(async () => {
+        for (const f of stuck) flags(f, false);
+        fs.rmSync(root, { recursive: true, force: true });
+      });
+      /** A render folder holding an immutable file (macOS `uchg`): nothing — not even its owner — removes it. */
+      const undeletable = () => {
+        const d = makeRenderDir(root);
+        const f = path.join(d.workDir, "stuck");
+        fs.writeFileSync(f, "synthetic");
+        expect(flags(f, true)).toBe(0);
+        stuck.push(f);
+        return d;
+      };
+      const server = undeletable();
+      removeRenderDir(server.workDir, server.lock);
+      expect(fs.existsSync(server.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(server.workDir))).toBe(true);
+      const wd = undeletable();
+      const w = watchdog([FAKE_JS, "ok"], { dir: wd });
+      expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
+      w.l.input.end();
+      expect(await w.exited).toBe(WATCHDOG_EXIT.done);
+      expect(fs.existsSync(wd.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(wd.workDir))).toBe(true);
+      // Once removable, the sweep (the locks are free) takes both.
+      for (const f of stuck) flags(f, false);
+      expect(await sweepRenderDirs(root, { graceSec: 0 })).toEqual({ removed: 2, lockless: 0 });
+    },
+    30_000,
+  );
 
   it("exit status: a browser that exits 127 by itself is `done`; a browser that cannot be executed is `execFailed`", async () => {
     const own = watchdog([FAKE_JS, "exit127"]);
@@ -902,24 +963,22 @@ describe("the browser never outlives its owner (#170)", () => {
     );
   }, 30_000);
 
-  it("the server's reaction to the watchdog's status: a clean status kills nothing; a failed clean-up kills the browser's group", async () => {
-    // Stand-in watchdogs: a good render, then an exit with the given status; its "browser" a sleeping group of ours.
+  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end kills its group", async () => {
+    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" (sleep) in their group.
     const react = async (status: number) => {
-      const browser = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
-      startedGroups.add(browser.pid!);
+      const p = pidFile();
       const launcher: Launcher = () => {
-        const child = spawn(process.execPath, [FAKE_JS, "ok-exit"], {
-          env: { EXIT_CODE: String(status) },
-          detached: true,
-          stdio: ["pipe", "pipe", "ignore", "pipe", "pipe"],
-        });
+        const child = spawn(
+          "/bin/sh",
+          ["-c", `/bin/sleep 30 & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`],
+          {
+            env: { EXIT_CODE: String(status) },
+            detached: true,
+            stdio: ["pipe", "pipe", "ignore", "pipe", "pipe"],
+          },
+        );
         startedGroups.add(child.pid!);
-        return {
-          child,
-          input: child.stdio[3] as Writable,
-          output: child.stdio[4] as Readable,
-          browserGroup: () => browser.pid,
-        };
+        return { child, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable };
       };
       const r = new Renderer({
         browser: process.execPath,
@@ -930,21 +989,13 @@ describe("the browser never outlives its owner (#170)", () => {
       });
       closers.push(() => r.close());
       expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
-      return {
-        alive: await within(1000, () => !groupAlive(browser.pid!)).then((g) => !g),
-        pgid: browser.pid!,
-      };
+      const sleeper = p.pid()!;
+      return within(1000, () => !alive(sleeper)).then((dead) => !dead);
     };
-    for (const s of [
-      WATCHDOG_EXIT.done,
-      WATCHDOG_EXIT.stopped,
-      WATCHDOG_EXIT.notStarted,
-      WATCHDOG_EXIT.execFailed,
-    ])
-      expect((await react(s)).alive, `status ${s}`).toBe(true);
-    const failed = await react(WATCHDOG_EXIT.cleanupFailed);
-    expect(failed.alive).toBe(false);
-    startedGroups.delete(failed.pgid);
+    const X = WATCHDOG_EXIT;
+    for (const s of [X.done, X.stopped, X.notStarted, X.execFailed])
+      expect(await react(s), `status ${s}`).toBe(true);
+    expect(await react(1)).toBe(false);
   }, 60_000);
 
   it("shutdown: closeRenderers turns queued renders away, starts no new browser, and kills the running one", async () => {
@@ -952,11 +1003,7 @@ describe("the browser never outlives its owner (#170)", () => {
     const before = liveRenderCount();
     const first = r.render(job("markdown", "x", "pdf"));
     const queued = [r.render(job("markdown", "y", "pdf")), r.render(job("markdown", "z", "pdf"))];
-    expect(
-      await within(10_000, () => liveRenderCount() === before + 1 && !!launches[0]?.l.browserGroup?.()),
-    ).toBe(true);
-    const browserPgid = launches[0]!.l.browserGroup!()!;
-    startedGroups.add(browserPgid);
+    expect(await within(10_000, () => liveRenderCount() === before + 1)).toBe(true);
     expect(closeRenderers()).toBe(before + 1);
     expect(await first).toEqual({ ok: false, code: "export_failed" });
     expect(await Promise.all(queued)).toEqual([
@@ -966,7 +1013,6 @@ describe("the browser never outlives its owner (#170)", () => {
     // A render asked for after shutdown is refused too; only the first ever started a browser.
     expect(await r.render(job("markdown", "w", "pdf"))).toEqual({ ok: false, code: "export_unavailable" });
     expect(launches).toHaveLength(1);
-    expect(await gone(browserPgid, 2000)).toBe(true);
     expect(await gone(launches[0]!.pgid, 2000)).toBe(true);
     expect(fs.existsSync(launches[0]!.workDir)).toBe(false);
     expect(liveRenderCount()).toBe(0);
@@ -980,7 +1026,7 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(launches).toHaveLength(0);
   }, 30_000);
 
-  it("a browser's own exit code ≥ 126 after a good render is not a watchdog failure: no kill of its groups", async () => {
+  it("a browser's own exit code ≥ 126 after a good render is not a watchdog failure: no kill of its group", async () => {
     let l: Launched | undefined;
     const launcher: Launcher = (s) => {
       l = track(unsandboxedLauncher(s));
@@ -999,8 +1045,7 @@ describe("the browser never outlives its owner (#170)", () => {
       const res = await r.render(job("markdown", "x", "pdf"));
       expect(res.ok).toBe(true);
       await new Promise((done) => setTimeout(done, 300)); // the watchdog's exit is handled by now
-      const groups = [-l!.child.pid!, -(l!.browserGroup?.() ?? 0)];
-      expect(kill.mock.calls.filter(([p]) => groups.includes(p))).toEqual([]);
+      expect(kill.mock.calls.filter(([p]) => p === -l!.child.pid!)).toEqual([]);
     } finally {
       kill.mockRestore();
     }

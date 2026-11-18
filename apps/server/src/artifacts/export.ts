@@ -28,7 +28,7 @@ import {
   makeRenderDir,
   removeRenderDir,
   sandboxedLauncher,
-  killRenderGroups,
+  killRenderGroup,
   trackRender,
   WATCHDOG_EXIT,
   WATCHDOG_MAX_SEC,
@@ -373,21 +373,19 @@ export class Renderer {
     }
     const { child, input, output } = launched;
     const pid = child.pid;
-    const launchedAt = Date.now();
-    // The browser's own process group, as the watchdog reported it (#170).
-    const browserGroup = () => launched.browserGroup?.();
-    // Same uid: the groups are ours to kill on shutdown (`killLiveRenders`) until the watchdog has exited. It reports
-    // its **own** end (`WATCHDOG_EXIT`): done or stopped (browser group gone, cleaned up), not started, exec failed —
-    // nothing left. A failed clean-up, or any other end (a signal: the watchdog itself was interrupted), may leave the
-    // browser behind: the server kills the browser's group and the watchdog's, unless it already killed them itself
-    // (its own limits, or `killLiveRenders`), then forgets them. The folder goes in this render's `finally`.
+    // Same uid: the watchdog's group (the browser is in it, #170) is ours to kill on shutdown (`killLiveRenders`)
+    // until the watchdog has exited. It reports its **own** end (`WATCHDOG_EXIT`): done or stopped (it killed and
+    // reaped the browser), not started, exec failed — nothing left. Any other end (a signal: the watchdog itself was
+    // interrupted) may leave the browser behind in the group: the server signals the group at that moment — the first
+    // it learns of the end, never after seeing the group gone — unless it already killed it itself (its own limits,
+    // or `killLiveRenders`). Then it forgets it. The folder goes in this render's `finally`.
     let groupKilled = false;
     if (!worker && pid) {
-      const t = trackRender(pid, { workDir, lock: lock!, browserGroup });
+      const t = trackRender(pid, { workDir, lock: lock! });
       child.once("exit", (code) => {
         const X = WATCHDOG_EXIT;
         const clean = code === X.done || code === X.stopped || code === X.notStarted || code === X.execFailed;
-        if (!clean && !groupKilled && t.tracked()) killRenderGroups(pid, browserGroup());
+        if (!clean && !groupKilled && t.tracked()) killRenderGroup(pid);
         t.untrack();
       });
     }
@@ -427,7 +425,7 @@ export class Renderer {
       }
       killed ??= why;
       groupKilled = true;
-      killRenderGroups(pid!, browserGroup());
+      killRenderGroup(pid!);
     };
     const cdp = new CdpPipe(input, output, L.maxReplyBytes);
     const timer = setTimeout(() => {
@@ -441,20 +439,16 @@ export class Renderer {
     };
     if (via?.signal?.aborted) onAbort();
     else via?.signal?.addEventListener("abort", onAbort, { once: true });
-    // Memory of the browser's process group (#170: its own, reported by the watchdog — or, for a launcher without a
-    // watchdog, the child's group); not measurable while it runs → stop (fail closed): no group reported within 3 s
-    // counts as unmeasurable. Under the account the launcher watches it (every 250 ms, exit 125 over the limit): the
+    // Shut down between the spawn and here (`closeRenderers` found nothing of this render to kill yet): kill it now.
+    if (this.closed) onAbort();
+    // Memory of the render's group (the one browser process plus its watchdog, #170); not measurable while it runs →
+    // stop (fail closed). Under the account the launcher watches it (every 250 ms, exit 125 over the limit): the
     // server's pid is sudo's.
     let sampling = false;
     const monitor = setInterval(() => {
       if (worker || sampling || exited || !pid) return;
-      const group = launched.browserGroup ? browserGroup() : pid;
-      if (!group) {
-        if (!t.probe && Date.now() - launchedAt > 3000) kill("monitor");
-        if (!t.probe) return;
-      }
       sampling = true;
-      (t.probe ?? (() => snapshot(group!, 2000, true)))()
+      (t.probe ?? (() => snapshot(pid, 2000, true)))()
         .then((procs) => {
           if (!procs.length) {
             if (!exited) kill("monitor");
