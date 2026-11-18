@@ -29,9 +29,10 @@ FSIZE_MARGIN = 2 * 1024 * 1024
 # What yt-dlp's deno gets besides yt-dlp's own options (`--no-remote --no-npm --cached-only …`): an explicit denial
 # of deno's permissions. deno already grants none by default (no `--allow-*` is passed); this keeps it so even if a
 # later yt-dlp starts passing one. The player JS then cannot start a process, load a native library, read the
-# environment or system information, read or write files, open network connections or import from remote hosts
-# (`--deny-import` is about remote modules: a static local or `data:` import is still possible — harmless here,
-# deno reads nothing but its stdin and its own cache). This guards the trusted path (the pinned yt-dlp running
+# environment or system information, use deno's file APIs (read or write), open network connections or import from
+# remote hosts. Local module loading still works (a static or dynamic import of a local file, a `data:` import):
+# what it can reach is bounded by the OS sandbox profile — the work folder, the pinned runtime and packages,
+# apps/server/youtube, the system CA bundle and the OS files of system.sb; family data is not readable. This guards the trusted path (the pinned yt-dlp running
 # YouTube's JS); it is not a boundary against the python side itself — python may exec itself and deno with any
 # arguments, so for malicious code the OS sandbox is the boundary (docs/decisions/isolation.md, #191 review 3/4).
 DENO_LOCKDOWN = (
