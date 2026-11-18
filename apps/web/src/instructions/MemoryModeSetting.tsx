@@ -26,7 +26,8 @@ export function MemoryModeSetting() {
   const mode = picked ?? q.data?.applyMode;
   return (
     <section className="panel memory-mode" data-testid="memory-mode">
-      <fieldset disabled={!q.data || q.data.locked} aria-busy={save.isPending}>
+      {/* Locked while a choice is being saved (no second choice racing the first, review #195 round 4). */}
+      <fieldset disabled={!q.data || q.data.locked || save.isPending} aria-busy={save.isPending}>
         <legend>기억 반영 방식</legend>
         {q.data?.locked && (
           <p className="small muted" data-testid="memory-mode-locked">

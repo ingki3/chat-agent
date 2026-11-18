@@ -56,11 +56,12 @@ function Settings({ view }: { view: View }) {
   const [draft, setDraft] = useState<DreamingConfig>();
   const [saved, setSaved] = useState(false);
   const c = draft ?? view.config;
+  // Locked while saving; a success drops the draft only if it is still the one sent (review #195 round 4).
   const save = useMutation({
-    mutationFn: () => adminDreaming.save(c),
-    onSuccess: (v) => {
+    mutationFn: (sent: DreamingConfig) => adminDreaming.save(sent),
+    onSuccess: (v, sent) => {
       qc.setQueryData(ADMIN_DREAMING_KEY, v);
-      setDraft(undefined);
+      setDraft((cur) => afterSave(cur, sent, undefined));
       setSaved(true);
     },
   });
@@ -86,7 +87,7 @@ function Settings({ view }: { view: View }) {
       aria-labelledby="dream-settings-h"
       onSubmit={(e) => {
         e.preventDefault();
-        save.mutate();
+        if (!save.isPending) save.mutate(c);
       }}
     >
       <h2 id="dream-settings-h">기억 정리</h2>
@@ -101,49 +102,56 @@ function Settings({ view }: { view: View }) {
           허용 목록에서 빼 주세요.
         </p>
       )}
-      <label className="row">
-        <input type="checkbox" checked={c.enabled} onChange={(e) => edit({ enabled: e.target.checked })} />{" "}
-        서버 전체에서 기억 정리 쓰기
-      </label>
-      <p className="muted small">끄면 누구의 기억 정리도 돌지 않아요(각자의 설정은 그대로 남아요).</p>
-      <fieldset className="quiet">
-        <legend className="small">사용자가 고를 수 있는 연결·모델</legend>
-        {options.map((o) => (
-          <label key={pairKey(o.pair)} className="row">
-            <input
-              type="checkbox"
-              checked={allowed.has(pairKey(o.pair))}
-              onChange={(e) => toggle(o.pair, e.target.checked)}
-            />{" "}
-            {o.label}
-          </label>
-        ))}
-        {gone.map((a) => (
-          <label key={pairKey(a)} className="row">
-            <input type="checkbox" checked onChange={() => toggle(a, false)} />{" "}
-            <span className="muted">
-              {a.model} ({unavailable.has(pairKey(a)) ? "연결이 지워지거나 끊김" : "쓸 수 없음"})
-            </span>
-          </label>
-        ))}
-        {!options.length && (
-          <p className="muted small">
-            고를 수 있는 연결이 없어요. 런타임 탭에서 공용 API 키 연결을 등록하고 테스트를 통과시켜 주세요.
-          </p>
-        )}
+      <fieldset
+        className="quiet"
+        disabled={save.isPending}
+        aria-busy={save.isPending}
+        data-testid="dreaming-config"
+      >
+        <label className="row">
+          <input type="checkbox" checked={c.enabled} onChange={(e) => edit({ enabled: e.target.checked })} />{" "}
+          서버 전체에서 기억 정리 쓰기
+        </label>
+        <p className="muted small">끄면 누구의 기억 정리도 돌지 않아요(각자의 설정은 그대로 남아요).</p>
+        <fieldset className="quiet">
+          <legend className="small">사용자가 고를 수 있는 연결·모델</legend>
+          {options.map((o) => (
+            <label key={pairKey(o.pair)} className="row">
+              <input
+                type="checkbox"
+                checked={allowed.has(pairKey(o.pair))}
+                onChange={(e) => toggle(o.pair, e.target.checked)}
+              />{" "}
+              {o.label}
+            </label>
+          ))}
+          {gone.map((a) => (
+            <label key={pairKey(a)} className="row">
+              <input type="checkbox" checked onChange={() => toggle(a, false)} />{" "}
+              <span className="muted">
+                {a.model} ({unavailable.has(pairKey(a)) ? "연결이 지워지거나 끊김" : "쓸 수 없음"})
+              </span>
+            </label>
+          ))}
+          {!options.length && (
+            <p className="muted small">
+              고를 수 있는 연결이 없어요. 런타임 탭에서 공용 API 키 연결을 등록하고 테스트를 통과시켜 주세요.
+            </p>
+          )}
+        </fieldset>
+        <label className="inline">
+          1회 토큰 상한
+          <input
+            type="number"
+            aria-label="1회 토큰 상한"
+            min={DREAMING_TOKEN_CAP.min}
+            max={DREAMING_TOKEN_CAP.max}
+            step={1000}
+            value={c.tokenCap}
+            onChange={(e) => edit({ tokenCap: Number(e.target.value) })}
+          />
+        </label>
       </fieldset>
-      <label className="inline">
-        1회 토큰 상한
-        <input
-          type="number"
-          aria-label="1회 토큰 상한"
-          min={DREAMING_TOKEN_CAP.min}
-          max={DREAMING_TOKEN_CAP.max}
-          step={1000}
-          value={c.tokenCap}
-          onChange={(e) => edit({ tokenCap: Number(e.target.value) })}
-        />
-      </label>
       <div className="row">
         <button type="submit" className="primary" disabled={save.isPending}>
           저장
@@ -222,13 +230,12 @@ function Status({ view }: { view: View }) {
               <td className="small">
                 {u.youth ? (
                   <DreamingSettingsForm
-                    key={JSON.stringify(u.settings)}
                     label={u.name}
                     settings={u.settings}
                     choices={choices}
                     disabled={false}
                     pending={setYouth.isPending}
-                    onSave={(settings) => setYouth.mutate({ id: u.userId, body: settings })}
+                    onSave={(settings) => setYouth.mutateAsync({ id: u.userId, body: settings })}
                   />
                 ) : (
                   <>

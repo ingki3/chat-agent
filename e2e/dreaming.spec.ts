@@ -91,11 +91,11 @@ async function asAdmin<T>(browser: Browser, baseURL: string, fn: (admin: Page) =
  * Holds requests matching `url` until `release()` (a slow save, to look at the screen meanwhile); later ones pass
  * straight through.
  */
-async function holdRequests(page: Page, url: string) {
+async function holdRequests(page: Page, url: string, method = "PUT") {
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
   await page.route(url, async (route) => {
-    await gate;
+    if (route.request().method() === method) await gate;
     await route.continue();
   });
   return { release };
@@ -265,4 +265,63 @@ test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결�
   await expect(page.getByRole("radio", { name: /자동 반영/ })).toBeChecked();
   await page.getByText(/지금 쓰는 정리 프롬프트/).click();
   await expect(page.getByTestId("dreaming-prompt")).toHaveValue("학교 이야기만 골라 주세요");
+});
+
+test("저장 중에는 설정 폼이 잠기고, 저장한 값이 그대로 남는다 (리뷰 #195 4차)", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const me = await newMember(browser, baseURL!, "dreamlock");
+  await signIn(page, baseURL!, me);
+  await asAdmin(browser, baseURL!, async (admin) => {
+    // The admin's allowed pairs: locked while the save is held, then saved as sent.
+    await admin.goto("/admin?tab=dreaming");
+    const config = admin.getByTestId("dreaming-config");
+    const pair = config.getByRole("checkbox", { name: /Fake Large/ }).first();
+    const cap = config.getByLabel("1회 토큰 상한");
+    await cap.fill("301000");
+    const held = await holdRequests(admin, "**/api/admin/dreaming");
+    await admin
+      .getByTestId("admin-dreaming")
+      .getByRole("button", { name: "저장", exact: true })
+      .first()
+      .click();
+    await expect(pair).toBeDisabled();
+    await expect(cap).toBeDisabled();
+    await expect(cap).toHaveValue("301000");
+    held.release();
+    await expect(admin.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+    await expect(cap).toBeEnabled();
+    await expect(cap).toHaveValue("301000");
+    await expect(pair).toBeChecked();
+    await cap.fill("300000");
+    await admin
+      .getByTestId("admin-dreaming")
+      .getByRole("button", { name: "저장", exact: true })
+      .first()
+      .click();
+    await expect(admin.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+  });
+  // The member's own settings: locked while the save is held; what was sent stays on screen.
+  await page.goto("/settings/instructions?doc=dreams");
+  const settings = page.getByTestId("dreaming-settings");
+  const on = settings.getByRole("checkbox", { name: "기억 정리 켜기" });
+  const time = settings.getByLabel("실행 시각");
+  await on.check();
+  const at = laterToday();
+  await time.fill(at);
+  const pick = settings.getByRole("combobox", { name: "연결·모델" });
+  const value = await pick.locator("option", { hasText: "Fake Large" }).first().getAttribute("value");
+  await pick.selectOption(value!);
+  const held = await holdRequests(page, "**/api/dreaming/settings");
+  await settings.getByRole("button", { name: "저장", exact: true }).click();
+  await expect(on).toBeDisabled();
+  await expect(time).toBeDisabled();
+  await expect(time).toHaveValue(at);
+  held.release();
+  await expect(settings.getByRole("status").filter({ hasText: "저장했어요." })).toBeVisible();
+  await expect(time).toBeEnabled();
+  await expect(time).toHaveValue(at);
+  await expect(page.getByTestId("dreaming-state")).toContainText(`기억 정리가 매일 ${at}`);
 });

@@ -70,8 +70,9 @@ export const choiceKey = (c: {
 
 /**
  * On/off, time, connection·model — the form both the user (their own) and the admin (a youth account's) use. A stored
- * choice that is no longer offered shows as "쓸 수 없음" until another is picked. Keyed by the stored settings, so a
- * successful save starts a fresh draft and a failed one keeps what was typed.
+ * choice that is no longer offered shows as "쓸 수 없음" until another is picked. Locked while a save is in flight
+ * (no edit can be lost, no second submit); a success drops the draft only if it is still the one sent, a failure
+ * keeps it (review #195 round 4).
  */
 export function DreamingSettingsForm({
   settings,
@@ -87,7 +88,8 @@ export function DreamingSettingsForm({
   pending: boolean;
   /** Prefix of the accessible names (a row of the admin's table names its user). */
   label?: string;
-  onSave: (s: DreamingSettings) => void;
+  /** Resolves when saved, rejects when refused (the caller shows the error). */
+  onSave: (s: DreamingSettings) => Promise<unknown>;
 }) {
   const [draft, setDraft] = useState<DreamingSettings>();
   const s = draft ?? settings;
@@ -100,10 +102,15 @@ export function DreamingSettingsForm({
       className="dream-settings"
       onSubmit={(e) => {
         e.preventDefault();
-        onSave(s);
+        if (pending || draft === undefined) return;
+        const sent = draft;
+        void onSave(sent).then(
+          () => setDraft((cur) => afterSave(cur, sent, undefined)),
+          () => {},
+        );
       }}
     >
-      <fieldset disabled={disabled} className="quiet">
+      <fieldset disabled={disabled || pending} aria-busy={pending} className="quiet">
         <label className="row">
           <input
             type="checkbox"
@@ -179,12 +186,11 @@ function Settings({ view }: { view: MyDreaming }) {
         </p>
       )}
       <DreamingSettingsForm
-        key={JSON.stringify(view.settings)}
         settings={view.settings}
         choices={view.choices}
         disabled={!view.canEdit}
         pending={save.isPending}
-        onSave={(s) => save.mutate(s)}
+        onSave={(s) => save.mutateAsync(s)}
       />
       {saved && (
         <p className="small" role="status">
