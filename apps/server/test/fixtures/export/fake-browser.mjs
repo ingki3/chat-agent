@@ -1,8 +1,27 @@
 // A stand-in for the headless browser (#51 host-survival tests): speaks the DevTools pipe (fd 3 in, fd 4 out) and
-// misbehaves the way a crashed or compromised renderer could, chosen by argv[2].
+// misbehaves the way a crashed or compromised renderer could, chosen by argv[2]. `orphan` (#170): answers nothing
+// and, like the real shell, keeps running when the pipe closes.
+import fs from "node:fs";
 import net from "node:net";
 
 const mode = process.argv[2];
+// `exit127` (#170): a browser that starts and exits 127 by itself (not an exec failure).
+if (mode === "exit127") process.exit(127);
+// $PIDFILE (#170): the stand-in records its pid as it starts (a test can then check it never outlived its watchdog).
+if (process.env.PIDFILE) fs.writeFileSync(process.env.PIDFILE, String(process.pid));
+// $FD5FILE (#170): what it got as fd 5 — the lock's inode, and whether it can write through it (it must not).
+if (process.env.FD5FILE) {
+  let ino = null;
+  let writable = false;
+  try {
+    ino = fs.fstatSync(5).ino;
+    fs.writeSync(5, "x");
+    writable = true;
+  } catch {
+    // EBADF: not open, or not open for writing
+  }
+  fs.writeFileSync(process.env.FD5FILE, JSON.stringify({ pid: process.pid, ino, writable }));
+}
 const input = new net.Socket({ fd: 3, readable: true, writable: false });
 const output = new net.Socket({ fd: 4, readable: false, writable: true });
 const send = (raw) => output.write(raw + "\0");
@@ -18,10 +37,11 @@ input.on("data", (d) => {
     handle(msg);
   }
 });
-input.on("end", () => process.exit(0));
+if (mode === "orphan") setInterval(() => {}, 1000);
+else input.on("end", () => process.exit(0));
 
 function handle(m) {
-  if (mode === "hang") return;
+  if (mode === "hang" || mode === "orphan") return;
   if (first) {
     first = false;
     if (mode === "null") return send("null");
@@ -51,7 +71,12 @@ function handle(m) {
       return json({ id: m.id, result: { data: Buffer.from("%PDF-fake").toString("base64") } });
     case "Browser.close":
       json({ id: m.id, result: {} });
-      return setTimeout(() => process.exit(0), 10);
+      // `ok-130`: a good render, then an exit code ≥ 126 of the browser's own (not a watchdog failure).
+      // `ok-exit`: the same with $EXIT_CODE (a stand-in watchdog reporting a status).
+      return setTimeout(
+        () => process.exit(mode === "ok-130" ? 130 : mode === "ok-exit" ? Number(process.env.EXIT_CODE) : 0),
+        10,
+      );
     default:
       return json({ id: m.id, result: {} });
   }

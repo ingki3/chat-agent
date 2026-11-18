@@ -121,6 +121,8 @@ export const LOG_EVENTS = [
   "citation.finished",
   // PNG/PDF export (#51): format, fixed outcome code, duration and IDs — never the title or the content.
   "artifact.exported",
+  // Render folders the sweep keeps for want of a lock file (#170): a count only — never a path.
+  "artifact.render_dirs_kept",
   // Reference export (#26): entry count, `docx` and its fixed `doc_*` code, duration and IDs — never an entry,
   // a title or an address.
   "references.exported",

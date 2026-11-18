@@ -102,11 +102,15 @@ export type LaunchSpec = {
   env: Record<string, string>;
   /** The render's own fresh folder: the only place the browser may write. */
   workDir: string;
+  /** The server's open descriptor of the render's lock file (`makeRenderDir`): handed to the watchdog as its fd 5. */
+  lockFd: number;
   /** Loopback port of the egress proxy: the browser's only network. */
   proxyPort: number;
+  /** The watchdog's own wall-clock cap (`watchdogPrefix`): a backstop past the render's limit. */
+  deadlineSec: number;
 };
 
-/** A started browser: its process and the two debugging pipes (fd 3 = commands in, fd 4 = replies out). */
+/** A started browser: its process (the watchdog) and the two debugging pipes (fd 3 = commands in, fd 4 = replies out). */
 export type Launched = { child: ChildProcess; input: Writable; output: Readable };
 export type Launcher = (spec: LaunchSpec) => Launched;
 
@@ -116,11 +120,207 @@ const pipes = (child: ChildProcess): Launched => ({
   output: child.stdio[4] as Readable,
 });
 
+/** Prefix of every same-uid render folder (`mkdtemp`: six more characters). Nothing else is ever removed. */
+export const RENDER_DIR_PREFIX = "agentlee-render-";
+/**
+ * The render's lock file: **beside** its folder (`<folder>.lock`, in the temp folder the browser cannot write — the
+ * sandbox writes only the folder itself), so the browser can neither remove nor replace it. Created by the server
+ * (`makeRenderDir`, exclusively), held (flock) by the watchdog and, inherited, by the browser while either lives.
+ */
+export const renderLockPath = (workDir: string) => `${workDir}.lock`;
+/**
+ * A render's folder and the server's open descriptor of its lock file (`-1` once closed — `removeRenderDir` closes it
+ * exactly once). Kept open from creation to removal, it is the identity of the lock: the file it refers to cannot
+ * be replaced by one that happens to reuse its inode while it is open.
+ */
+export type RenderDir = { workDir: string; lockFd: number };
+/** The watchdog's descriptor of the lock (inherited from the server's, `lockFd`). */
+export const WATCHDOG_LOCK_FD = 5;
+/** Upper bound of the watchdog's own clock (monotonic), whatever the caller asks. */
+export const WATCHDOG_MAX_SEC = 120;
+/**
+ * The watchdog's **own** exit codes (never the browser's): the browser ended by itself / the watchdog stopped it —
+ * reaped in both cases; it was never started (arguments, lock); the watchdog's own exec of its direct child failed
+ * (in production that child is `sandbox-exec`, so a profile `sandbox-exec` itself rejects is not this code — that
+ * child then just ends). Any other end (a signal) means the watchdog itself was interrupted.
+ */
+export const WATCHDOG_EXIT = { done: 0, stopped: 3, notStarted: 4, execFailed: 5 } as const;
+const PERL = "/usr/bin/perl";
+
+/**
+ * A fresh render folder (`mkdtemp`, our prefix) and its lock file beside it, created with
+ * `O_CREAT | O_EXCL | O_NOFOLLOW` — never an object that was already there. On a name conflict (a lock file left
+ * from an older folder of the same name) the folder is dropped and another name is tried.
+ */
+export function makeRenderDir(parent: string): RenderDir {
+  const { O_RDONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  for (let i = 0; i < 5; i++) {
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(parent, RENDER_DIR_PREFIX)));
+    let fd: number;
+    try {
+      // Read-only: the browser inherits it, and an open descriptor is not limited by the sandbox's path rules.
+      fd = fs.openSync(renderLockPath(workDir), O_RDONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (e) {
+      fs.rmdirSync(workDir);
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw e;
+    }
+    return { workDir, lockFd: fd };
+  }
+  throw new Error("no free render folder name");
+}
+
+/** Whether the path is still the file the descriptor refers to (a regular file, same device and inode). */
+function sameFile(p: string, fd: number) {
+  try {
+    const a = fs.lstatSync(p);
+    const b = fs.fstatSync(fd);
+    return a.isFile() && a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes a render folder, then its lock file — only once the folder is confirmed gone (`ENOENT`), and only when the
+ * lock path is still the file of the server's descriptor: `unlink`, never a recursive delete. A folder that could
+ * not be removed keeps its lock, so the sweep tries again later. Closes the descriptor (once).
+ */
+export function removeRenderDir(dir: RenderDir) {
+  try {
+    fs.rmSync(dir.workDir, { recursive: true, force: true });
+  } catch {
+    // kept: its lock stays too (below)
+  }
+  if (dir.lockFd < 0) return;
+  let goneDir = false;
+  try {
+    fs.lstatSync(dir.workDir);
+  } catch (e) {
+    goneDir = (e as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  const p = renderLockPath(dir.workDir);
+  try {
+    if (goneDir && sameFile(p, dir.lockFd)) fs.unlinkSync(p);
+  } catch {
+    // not ours to remove, or gone already
+  }
+  try {
+    fs.closeSync(dir.lockFd);
+  } catch {
+    // already closed
+  }
+  dir.lockFd = -1;
+}
+
+/**
+ * The render watchdog (#170) — a small Perl process **outside** the server that starts the browser as its direct
+ * child and makes sure it never outlives the server.
+ *  - The server spawns it as the leader of a new process group and session (`detached`); the browser stays in that
+ *    group — **one** group, known to the server from the spawn on. The production sandbox forbids the browser to
+ *    fork, so the browser is that one child, and the watchdog kills and reaps it by its pid (nothing is signalled
+ *    after it is reaped).
+ *  - It locks the render's lock file through the descriptor the server created it with (inherited as fd 5 — no path is
+ *    opened, so nothing put at the path can be locked instead): a regular file of ours, flocked without waiting;
+ *    anything else: not started. The browser inherits the lock and fd 3/4 (the debugging pipe).
+ *  - Its stdin is a pipe the server holds and never writes: the kernel closes it when the server dies, however it
+ *    dies (SIGKILL included). EOF there, a changed parent pid, or the cap on the monotonic clock (`deadlineSec`, at
+ *    most `WATCHDOG_MAX_SEC`) → SIGKILL to the browser, reap. A close-on-exec status pipe, watched in the same loop,
+ *    tells its own exec failing (`execFailed`) from a browser that exits 127.
+ *  - TERM/INT/HUP only ask the loop to stop; the loop kills the child only while it is not yet reaped.
+ *  - However the browser ends, the watchdog then removes the render folder (our name only, a real folder) and —
+ *    only once the folder is gone — unlinks the lock path if it is still the file of fd 5, and exits with its own
+ *    status.
+ * argv: <owner pid> <deadline sec> <render folder> <command…>; fd 5: the lock.
+ */
+export const WATCHDOG_PL = String.raw`use strict; use POSIX (); use Errno ();
+use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC); use File::Path ();
+my %X = (done => ${WATCHDOG_EXIT.done}, stopped => ${WATCHDOG_EXIT.stopped}, notStarted => ${WATCHDOG_EXIT.notStarted},
+  execFailed => ${WATCHDOG_EXIT.execFailed});
+my ($owner, $max, $dir, @cmd) = @ARGV;
+POSIX::_exit($X{notStarted}) unless @cmd && $owner =~ /\A[0-9]{1,10}\z/ && $max =~ /\A[0-9]{1,4}\z/;
+$max = ${WATCHDOG_MAX_SEC} if $max > ${WATCHDOG_MAX_SEC};
+my $ours = $dir =~ m{/${RENDER_DIR_PREFIX}[A-Za-z0-9]{6}\z} && -d $dir && !-l $dir;
+my $lp = "$dir.lock";
+open(my $lock, "<&=", ${WATCHDOG_LOCK_FD}) or POSIX::_exit($X{notStarted});    # the server's descriptor (no path)
+my @f = stat($lock);
+POSIX::_exit($X{notStarted}) unless @f && -f _ && $f[4] == $<;
+flock($lock, LOCK_EX | LOCK_NB) or POSIX::_exit($X{notStarted});
+# perl marks a descriptor it opens close-on-exec: fd 5 (only) must reach the browser, so it holds the lock too.
+my $fl = fcntl($lock, F_GETFD, 0);
+POSIX::_exit($X{notStarted}) unless defined $fl && fcntl($lock, F_SETFD, $fl & ~FD_CLOEXEC);
+$SIG{PIPE} = "IGNORE";
+pipe(my $sr, my $sw) or POSIX::_exit($X{notStarted});    # close-on-exec (perl's default above fd 2)
+my $pid = fork();
+POSIX::_exit($X{notStarted}) unless defined $pid;
+if ($pid == 0) {
+  close($sr);
+  open(STDIN, "<", "/dev/null") or POSIX::_exit(127);
+  exec { $cmd[0] } @cmd;
+  syswrite($sw, "E");
+  POSIX::_exit(127);
+}
+close($sw);
+POSIX::close(3); POSIX::close(4);
+chdir("/");    # File::Path will not remove the current folder (the browser's cwd is the render folder)
+my $t0 = clock_gettime(CLOCK_MONOTONIC);
+my $finish = sub {
+  my ($code) = @_;
+  File::Path::remove_tree($dir) if $ours && -d $dir && !-l $dir;
+  if (!lstat($dir) && $!{ENOENT}) {
+    my @now = lstat($lp);
+    unlink($lp) if @now && -f _ && $now[0] == $f[0] && $now[1] == $f[1];    # fd 5 is open: its inode is not reused
+  }
+  POSIX::_exit($code);
+};
+# The exec status: undef = not known yet, 1 = exec done (pipe closed), 0 = exec failed.
+my $execd;
+my $status = sub {
+  my $r = sysread($sr, my $e, 1);
+  return if !defined $r && ($!{EINTR} || $!{EAGAIN});
+  $execd = (defined $r && $r == 0) ? 1 : 0;
+  close($sr);
+};
+# Kills the child only while it is not reaped yet (a reaped pid may already be another process's).
+my $stop = sub {
+  kill("KILL", $pid) if waitpid($pid, POSIX::WNOHANG()) == 0;
+  waitpid($pid, 0);
+  $finish->($X{stopped});
+};
+my $asked = 0;
+$SIG{$_} = sub { $asked = 1 } for qw(TERM INT HUP);
+$SIG{CHLD} = sub { };
+while (1) {
+  $stop->() if $asked;
+  my $g = waitpid($pid, POSIX::WNOHANG());
+  if ($g == $pid) {
+    $status->() unless defined $execd;    # the child is gone: its status byte (or EOF) is there now
+    $finish->($execd ? $X{done} : $X{execFailed});
+  }
+  $stop->() if $g < 0 || getppid() != $owner;
+  $stop->() if clock_gettime(CLOCK_MONOTONIC) - $t0 > $max;
+  if (defined $execd && !$execd) { waitpid($pid, 0); $finish->($X{execFailed}); }    # it exits by itself (127)
+  my $rin = ""; vec($rin, 0, 1) = 1;
+  vec($rin, fileno($sr), 1) = 1 unless defined $execd;
+  my $n = select(my $rout = $rin, undef, undef, 0.25);
+  next unless defined $n && $n > 0;
+  $status->() if !defined $execd && vec($rout, fileno($sr), 1);
+  next unless vec($rout, 0, 1);
+  my $r = sysread(STDIN, my $buf, 4096);
+  $stop->() if defined $r ? $r == 0 : !($!{EINTR} || $!{EAGAIN});
+}`;
+
+/** argv before the browser's own: the watchdog, owned by this process, with the spec's cap, folder and lock. */
+export function watchdogPrefix(s: LaunchSpec, owner = process.pid): string[] {
+  return [PERL, "-e", WATCHDOG_PL, String(owner), String(s.deadlineSec), s.workDir];
+}
+
 /**
  * What the production launcher hands `spawnIsolated` — pure, so its policy (and the profile `buildProfile` makes
  * of it) is checked on every platform, Linux CI included: network = the proxy's loopback port only, reads = the
  * browser's own folder, writes = the render's folder, the given environment only, no fork (the profile never
- * allows it), the two debugging pipes.
+ * allows it), the two debugging pipes — and the watchdog in front of `sandbox-exec` (outside the sandbox).
  */
 export function rendererSandbox(s: LaunchSpec): SpawnIsolatedOptions {
   return {
@@ -133,6 +333,8 @@ export function rendererSandbox(s: LaunchSpec): SpawnIsolatedOptions {
     write: [s.workDir],
     network: { loopbackPorts: [s.proxyPort] },
     extraPipes: 2,
+    wrap: watchdogPrefix(s),
+    inheritFds: [s.lockFd],
   };
 }
 
@@ -151,17 +353,268 @@ export const sandboxedLauncher: Launcher = (s) => {
 
 /**
  * The same browser without the process sandbox — **tests only** (Linux CI has no sandbox-exec): everything in
- * the browser (switches, request interception, the egress proxy) is the same; the kernel layer is missing.
+ * the browser (switches, request interception, the egress proxy, the watchdog) is the same; the kernel layer is
+ * missing. stdin is the watchdog's owner pipe (never written).
  */
-export const unsandboxedLauncher: Launcher = (s) =>
-  pipes(
-    spawn(s.browser, s.args, {
-      cwd: s.workDir,
-      env: s.env,
-      detached: true,
-      stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
-    }),
-  );
+export const unsandboxedLauncher: Launcher = (s) => {
+  const [command, ...pre] = watchdogPrefix(s);
+  const child = spawn(command!, [...pre, s.browser, ...s.args], {
+    cwd: s.workDir,
+    env: s.env,
+    detached: true,
+    stdio: ["pipe", "ignore", "ignore", "pipe", "pipe", s.lockFd],
+  });
+  child.stdin!.on("error", () => {});
+  return pipes(child);
+};
+
+/**
+ * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
+ * render's folder and lock, and whether the group has been signalled. `killLiveRenders` is the last word on shutdown
+ * (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ */
+const liveRenders = new Map<number, { dir: RenderDir; signalled: boolean }>();
+
+/** Records a running render; the returned function forgets it (call it once the watchdog has exited). */
+export function trackRender(pgid: number, dir: RenderDir): () => void {
+  const entry = { dir, signalled: false };
+  liveRenders.set(pgid, entry);
+  return () => {
+    if (liveRenders.get(pgid) === entry) liveRenders.delete(pgid);
+  };
+}
+
+/**
+ * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**: the render's limits,
+ * the watchdog's abnormal end and shutdown all come here, and whichever is first sends the one signal. An untracked
+ * group (already gone, or forgotten) is never signalled.
+ */
+export function signalRender(pgid: number) {
+  const entry = liveRenders.get(pgid);
+  if (!entry || entry.signalled) return;
+  entry.signalled = true;
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+}
+
+/** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
+export function killLiveRenders(): number {
+  const n = liveRenders.size;
+  for (const [pgid, { dir }] of [...liveRenders]) {
+    signalRender(pgid);
+    removeRenderDir(dir);
+  }
+  liveRenders.clear();
+  return n;
+}
+
+/** How many renders are tracked (tests). */
+export const liveRenderCount = () => liveRenders.size;
+
+/**
+ * Folders younger than this are never swept (far past `WATCHDOG_MAX_SEC`). The server sweeps at start and again every
+ * `SWEEP_GRACE_SEC` (`startRenderSweeps`), so a folder too young at one sweep is looked at again later.
+ */
+export const SWEEP_GRACE_SEC = 600;
+/** One sweep's time budget: past it the sweep stops and the next one resumes after the last name it judged. */
+export const SWEEP_BUDGET_SEC = 45;
+
+/**
+ * The sweep — deliberately small (review #201 round 3). One proof of disuse only: the render's lock file beside its
+ * folder exists, is a regular file of our uid, is the same file (device + inode) on the path and on the descriptor
+ * (opened without following a link or blocking), can be flocked without waiting, and is still the same file on the
+ * path once locked. Then — and only for our prefix, real folders of our uid (no symlinks), older than `graceSec`,
+ * the folder checked to be the one judged — the folder is removed, then the lock (still the file held). A lock file
+ * whose folder is gone is reclaimed by the same proof.
+ * A folder **without** a lock file (a render from before the watchdog, or a server that died between `mkdtemp` and
+ * its lock) is never removed — it is only counted (the server logs the count; removing them is a manual step,
+ * `docs/ops.md` §18.4). No process is killed; nothing is matched by name.
+ * Bounded by itself: a budget (monotonic) after which it stops between names and prints where it got to; an alarm a
+ * little past that; its owner — stdin is a pipe the server holds, so EOF or a changed parent pid stops it before the
+ * next name.
+ * argv: <root> <grace sec> <owner pid> <resume after name or -> <budget sec>.
+ * Prints "<removed> <kept without lock> <resume after, or ->".
+ */
+export const SWEEP_PL = String.raw`use strict; use POSIX (); use Errno ();
+use Fcntl qw(:flock O_RDONLY O_NOFOLLOW O_NONBLOCK); use File::Path ();
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
+my ($root, $grace, $owner, $after, $budget) = @ARGV;
+$budget = ${SWEEP_BUDGET_SEC} unless defined $budget && $budget =~ /\A[0-9]{1,4}\z/;
+$after = "-" unless defined $after && length $after;
+$SIG{ALRM} = sub { POSIX::_exit(124); };
+alarm($budget + 15);
+my $t0 = clock_gettime(CLOCK_MONOTONIC);
+my ($n, $lockless, $last) = (0, 0, "-");
+my $finish = sub { print "$n $lockless $_[0]\n"; exit 0; };
+opendir(my $dh, $root) or $finish->("-");
+my @names = sort grep { /\A${RENDER_DIR_PREFIX}[A-Za-z0-9]{6}(?:\.lock)?\z/ } readdir($dh);
+closedir($dh);
+my $old = time() - $grace;
+# The owner still wants this sweep: same parent, and its pipe neither closed nor written to.
+sub wanted {
+  return 0 if $owner =~ /\A[0-9]+\z/ && getppid() != $owner;
+  my $rin = ""; vec($rin, 0, 1) = 1;
+  my $k = select(my $rout = $rin, undef, undef, 0);
+  return !(defined $k && $k > 0);
+}
+sub same { my ($x, $y) = @_; return @$x && @$y && $x->[0] == $y->[0] && $x->[1] == $y->[1]; }
+# The proof: a locked handle and the lock's stat, or nothing (keep).
+sub take_lock {
+  my ($l) = @_;
+  my @st = lstat($l);
+  return () unless @st && -f _ && $st[4] == $< && $st[9] <= $old;
+  sysopen(my $fh, $l, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or return ();
+  my @f = stat($fh);
+  return () unless @f && -f _ && same(\@f, \@st);
+  flock($fh, LOCK_EX | LOCK_NB) or return ();
+  my @again = lstat($l);
+  return () unless same(\@again, \@st);
+  return ($fh, \@st);
+}
+sub drop { my ($st, $l) = @_; my @now = lstat($l); unlink($l) if @now && -f _ && same(\@now, $st); }
+# Names after the resume point first, then the rest: a slow name never starves the ones behind it.
+my @order = $after eq "-" ? @names : ((grep { $_ gt $after } @names), (grep { $_ le $after } @names));
+my $seen = 0;
+for my $e (@order) {
+  $finish->("-") unless wanted();
+  $finish->($last) if $seen++ && clock_gettime(CLOCK_MONOTONIC) - $t0 > $budget;
+  $last = $e;
+  my $p = "$root/$e";
+  if ($e =~ /\.lock\z/) {
+    # A lock left without its folder.
+    (my $d = $p) =~ s/\.lock\z//;
+    next if lstat($d) || !$!{ENOENT};
+    my ($fh, $st) = take_lock($p) or next;
+    drop($st, $p) if !lstat($d) && $!{ENOENT};
+    next;
+  }
+  my @st = lstat($p);
+  next unless @st && -d _ && !-l _ && $st[4] == $< && $st[9] <= $old;
+  if (!lstat("$p.lock")) { $lockless++ if $!{ENOENT}; next; }
+  my ($fh, $lst) = take_lock("$p.lock") or next;
+  my @again = lstat($p);
+  next unless @again && -d _ && !-l _ && same(\@again, \@st);
+  File::Path::remove_tree($p);
+  next if lstat($p) || !$!{ENOENT};    # still there, or unknown: the lock stays (next sweep)
+  drop($lst, "$p.lock");
+  $n++;
+}
+$finish->("-");`;
+
+export type SweepResult = { removed: number; lockless: number; next?: string };
+/** Sweep knobs (tests: short budgets, a resume point). */
+export type SweepOptions = { graceSec?: number; after?: string; budgetSec?: number };
+
+/** One sweep run: its result, and a way to stop it (its process group). */
+function runSweep(root: string, o: SweepOptions = {}) {
+  const budgetSec = o.budgetSec ?? SWEEP_BUDGET_SEC;
+  let child: ChildProcess | undefined;
+  const kill = () => {
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  };
+  const none: SweepResult = { removed: 0, lockless: 0 };
+  const done = new Promise<SweepResult>((resolve) => {
+    let out = "";
+    try {
+      child = spawn(
+        PERL,
+        [
+          "-e",
+          SWEEP_PL,
+          fs.realpathSync(root),
+          String(o.graceSec ?? SWEEP_GRACE_SEC),
+          String(process.pid),
+          o.after ?? "-",
+          String(budgetSec),
+        ],
+        // Its own group (a stop takes all of it); stdin = the owner pipe (never written).
+        { env: {}, detached: true, stdio: ["pipe", "pipe", "ignore"] },
+      );
+    } catch {
+      return resolve(none);
+    }
+    child.stdin!.on("error", () => {});
+    // The server's own bound, past the sweep's (it also bounds itself, should this process die first).
+    const timer = setTimeout(kill, (budgetSec + 20) * 1000);
+    timer.unref();
+    child.stdout!.on("data", (d: Buffer) => (out += d.toString()));
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(none);
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      const m = /^(\d+) (\d+) (\S+)\n?$/.exec(out);
+      if (!m) return resolve(none);
+      resolve({
+        removed: Number(m[1]),
+        lockless: Number(m[2]),
+        ...(m[3] !== "-" ? { next: m[3] } : {}),
+      });
+    });
+  });
+  return { done, cancel: kill };
+}
+
+/** One sweep of `root` (default: the OS temp folder). Never throws; zeros when perl is missing or anything fails. */
+export function sweepRenderDirs(root = os.tmpdir(), o: SweepOptions = {}): Promise<SweepResult> {
+  return runSweep(root, o).done;
+}
+
+/** How long `stop` waits for a cancelled sweep to be gone (it is SIGKILLed: normally milliseconds). */
+export const SWEEP_STOP_WAIT_MS = 2000;
+
+/**
+ * The server's sweeps: now, then every `everyMs`, each resuming where a sweep that ran out of budget stopped;
+ * `onResult` gets each result (the app logs folders kept for want of a lock). Returns `stop`: no more sweeps, the
+ * running one (if any) is killed — its group — and awaited, at most `SWEEP_STOP_WAIT_MS`.
+ */
+export function startRenderSweeps(
+  root = os.tmpdir(),
+  everyMs = SWEEP_GRACE_SEC * 1000,
+  o: Omit<SweepOptions, "after"> & { onResult?: (r: SweepResult) => void } = {},
+) {
+  let current: ReturnType<typeof runSweep> | undefined;
+  let after: string | undefined;
+  let stopped = false;
+  const once = () => {
+    if (current || stopped) return;
+    const run = runSweep(root, { ...o, ...(after ? { after } : {}) });
+    current = run;
+    void run.done.then((r) => {
+      after = r.next;
+      current = undefined;
+      if (!stopped) o.onResult?.(r);
+    });
+  };
+  once();
+  const timer = setInterval(once, everyMs);
+  timer.unref();
+  return async () => {
+    stopped = true;
+    clearInterval(timer);
+    const run = current;
+    if (!run) return;
+    run.cancel();
+    let wait: NodeJS.Timeout | undefined;
+    await Promise.race([
+      run.done,
+      new Promise<void>((r) => {
+        wait = setTimeout(r, SWEEP_STOP_WAIT_MS);
+        wait.unref();
+      }),
+    ]);
+    clearTimeout(wait);
+  };
+}
 
 /**
  * A DevTools protocol reply or event, after `parseMessage`. Everything on the pipe comes from the browser, which
