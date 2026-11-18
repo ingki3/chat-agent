@@ -653,8 +653,31 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - **없으면:** 브라우저가 없거나 macOS가 아니면(샌드박스 없음) PNG·PDF는 `export_unavailable`(503)이고 화면은 "만들지 못했어요"를 보인다. 차트 PNG는 브라우저 안에서 먼저 그리므로 그래도 된다.
 - **한도:** 한 번에 20초, 메모리 768MB, 파일 32MB, 동시에 2개(4개까지 기다림 — 넘으면 `export_busy`). 로그에는 `artifact.exported`(형식 `exportFormat`, 결과 `exportCode`, 소요 시간)만 남는다.
   - 자주 보이는 코드: `export_unavailable`(브라우저 없음·macOS 아님), `export_timeout`(20초 넘는 문서 — 끝나지 않는 스크립트), `export_limit`(메모리·크기), `export_busy`(동시 요청).
+- **남은 브라우저·임시 폴더(#170):** 같은 UID 렌더의 브라우저는 서버 밖 감시자(Perl, `/usr/bin/perl`)의 자식으로, 감시자의 프로세스 그룹 안에서 돈다 — 서버가 어떻게 죽어도(SIGKILL 포함) 1초 안팎에 그 그룹과 `agentlee-render-*` 폴더·`agentlee-render-*.lock`이 사라지고, 어떤 경우에도 120초(단조 시계)를 넘기지 않는다. 브라우저가 끝나면 감시자가 늘 폴더를 지운다(못 지우면 잠금을 남겨 sweep이 다시 시도). 서버 종료(SIGTERM·SIGINT·exit)는 새 렌더를 받지 않게 한 뒤 살아 있는 렌더를 모두 끈다.
+  - **감시자만 죽으면:** 서버가 살아 있으면 서버가 그 그룹(브라우저 포함)을 바로 끄고 폴더를 지운다. 서버도 없으면 브라우저는 감시자 없이 남을 수 있다 — 아래 점검으로 찾아 그 그룹만 끈다. 브라우저가 잠금을 쥐고 있어 sweep도 그 폴더를 두므로, 남은 폴더가 그 표시다(브라우저가 물려받은 잠금을 스스로 풀지 않는 한 — 정상 Chrome은 풀지 않는다, `docs/decisions/isolation.md` #170).
+  - **sweep:** 서버 시작 때와 10분마다, 10분 넘은 `agentlee-render-`+영숫자 6자 폴더 중 **옆의 잠금 파일이 있고 풀려 있는 것만** 지운다(한 번에 45초까지, 다음 번에 이어 감). 서버 종료 때 돌던 sweep도 함께 끝난다. 프로세스는 죽이지 않는다.
+  - **잠금 파일이 없는 폴더는 자동으로 지우지 않는다**(감시자 이전 버전의 렌더, 잠금을 만들기 전에 죽은 서버). 로그에 `artifact.render_dirs_kept`(개수만)가 보이면 서비스 계정으로 직접 지운다. 먼저 렌더가 돌고 있지 않은지(아래 점검) 확인하고 후보를 **목록으로만** 본다 — sweep과 같은 이름 규칙(ASCII 영숫자 6자), 우리 소유, 옆 잠금 없음, 하루 넘은 것:
+    ```bash
+    T="$(getconf DARWIN_USER_TEMP_DIR)"; T="${T%/}"   # 서비스 계정의 임시 폴더(서버의 os.tmpdir())
+    LC_ALL=C find -E "$T" -maxdepth 1 -type d -regex '.*/agentlee-render-[A-Za-z0-9]{6}' -user "$(id -un)" -mtime +1 \
+      -exec sh -c '[ -e "$1.lock" ] || [ -L "$1.lock" ] || echo "$1"' _ {} \;
+    ```
+    목록에서 지울 것을 **골라 그 경로만** 적는다(다시 검색해서 지우지 않는다 — 검토한 목록과 지우는 대상이 달라질 수 있다). 각 경로는 지우기 직전에 다시 확인한다: `$T`의 바로 아래인지(`${d%/*}`), 이름 **전체**가 정확히 렌더 이름인지(`${d##*/}`, `LC_ALL=C` 패턴 — 줄 단위 검사가 아니라 개행이 든 이름도 걸러진다), 진짜 폴더(링크 아님)인지, 우리 소유인지, 하루가 넘었는지, 옆 잠금이 없는지:
+    ```bash
+    T="$(getconf DARWIN_USER_TEMP_DIR)"; T="${T%/}"
+    export LC_ALL=C; A='[A-Za-z0-9]'
+    for d in '/…/agentlee-render-AbC123' '/…/agentlee-render-xYz789'; do   # 고른 경로들
+      case "${d##*/}" in agentlee-render-$A$A$A$A$A$A) name=ok ;; *) name=bad ;; esac
+      [ "${d%/*}" = "$T" ] && [ "$name" = ok ] \
+        && [ -d "$d" ] && [ ! -L "$d" ] && [ "$(stat -f %u "$d")" = "$(id -u)" ] \
+        && [ -n "$(find "$d" -maxdepth 0 -mtime +1)" ] \
+        && [ ! -e "$d.lock" ] && [ ! -L "$d.lock" ] \
+        && rm -rf -- "$d" && echo "removed $d" || echo "kept $d"
+    done
+    ```
+  - 점검: `pgrep -fl chrome-headless-shell`로 보이는 것 중 `--user-data-dir=…/agentlee-render-` 인 것이 렌더가 없을 때 남아 있으면 이슈다. 직접 끌 때는 이름 패턴(`pkill`)이 아니라 그 pid의 **프로세스 그룹**을 확인하고(`ps -o pid,pgid,ppid,command -p <pid>`) 그 그룹만 끈다(`kill -KILL -<pgid>`) — 다른 도구의 헤드리스 셸도 같은 이름이다. 그 뒤 잠금이 풀리므로 다음 sweep이 폴더를 지운다.
 - **확인:**
-  - `pnpm test apps/server/test/artifact-export.test.ts`: 샘플 차트 PNG·문서 PDF, 앱(127.0.0.1)·사설 IP·메타데이터 요청 차단(겹마다 따로), 쿠키 없음, 시간·메모리 한도.
+  - `pnpm test apps/server/test/artifact-export.test.ts`: 샘플 차트 PNG·문서 PDF, 앱(127.0.0.1)·사설 IP·메타데이터 요청 차단(겹마다 따로), 쿠키 없음, 시간·메모리 한도, 주인을 SIGKILL해도 브라우저·폴더가 남지 않음(#170).
   - 운영 Mac에서 실제 CDN(Chart.js를 쓰는 HTML) 확인: 그런 아티팩트를 열고 PDF 버튼 → 차트가 그려진 PDF가 받아져야 한다. 렌더러는 `cdn.jsdelivr.net:443`에만 나간다.
 
 ### 18.5 패널·카드·목록 (#28)

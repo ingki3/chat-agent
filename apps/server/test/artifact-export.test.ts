@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import dgram from "node:dgram";
 import fs from "node:fs";
@@ -7,8 +7,8 @@ import net from "node:net";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { Writable } from "node:stream";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { type Readable, Writable } from "node:stream";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ARTIFACT_EXPORTS, type ArtifactKind } from "@agentlee/shared";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
@@ -16,13 +16,26 @@ import { createTestDb } from "../src/db/client.js";
 import {
   browserArgs,
   findBrowser,
+  liveRenderCount,
   parseMessage,
+  makeRenderDir,
+  removeRenderDir,
+  renderLockPath,
+  SWEEP_PL,
+  SWEEP_STOP_WAIT_MS,
+  startRenderSweeps,
+  WATCHDOG_EXIT,
+  type Launched,
+  type RenderDir,
   rendererSandbox,
   sandboxedLauncher,
+  sweepRenderDirs,
   unsandboxedLauncher,
+  watchdogPrefix,
   type Launcher,
 } from "../src/artifacts/browser.js";
 import {
+  closeRenderers,
   DOCUMENT_URL,
   EXPORT_CODES,
   RENDER_EGRESS_HOSTS,
@@ -34,7 +47,7 @@ import {
 } from "../src/artifacts/export.js";
 import { CDN_ALLOW_LIST } from "../src/artifacts/serve.js";
 import { EXPORT_CODES as LOGGABLE_EXPORT_CODES } from "../src/observability/policy.js";
-import { buildProfile, runIsolated } from "../src/isolation/sandbox.js";
+import { buildProfile, runIsolated, snapshot } from "../src/isolation/sandbox.js";
 import { REPO_ROOT } from "../src/config.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -621,6 +634,739 @@ describe("the DevTools pipe is untrusted: a broken or hostile browser fails its 
   }, 90_000);
 });
 
+/** Whether any process of group `pgid` still exists. */
+function groupAlive(pgid: number) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Polls `done` every 50 ms for at most `ms`; true once it holds. */
+async function within(ms: number, done: () => boolean) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (done()) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return done();
+}
+
+/**
+ * Groups this file started (hosts, watchdogs with their browsers, holders) and has not yet seen gone: killed after
+ * each test.
+ * A group is taken off the list as soon as it is confirmed gone (`gone`), so a reused id is never signalled. Nothing
+ * is matched by name.
+ */
+const startedGroups = new Set<number>();
+const track = (l: Launched) => {
+  startedGroups.add(l.child.pid!);
+  return l;
+};
+const gone = async (pgid: number, ms: number) => {
+  const ok = await within(ms, () => !groupAlive(pgid));
+  if (ok) startedGroups.delete(pgid);
+  return ok;
+};
+afterEach(() => {
+  for (const g of startedGroups) {
+    try {
+      process.kill(-g, "SIGKILL");
+    } catch {
+      // gone
+    }
+  }
+  startedGroups.clear();
+});
+
+const FAKE_JS = path.join(FIXTURES, "fake-browser.mjs");
+const FAKE = () => [FAKE_JS, "orphan"];
+const freshRenderDir = () => {
+  const d = makeRenderDir(os.tmpdir());
+  closers.push(async () => removeRenderDir(d));
+  return d;
+};
+/** The watchdog straight from the unsandboxed launcher, on a fresh folder (or one given). */
+function watchdog(
+  args: string[],
+  o: { env?: Record<string, string>; deadlineSec?: number; browser?: string; dir?: RenderDir } = {},
+) {
+  const d = o.dir ?? freshRenderDir();
+  const l = unsandboxedLauncher({
+    browser: o.browser ?? process.execPath,
+    args,
+    env: o.env ?? {},
+    workDir: d.workDir,
+    lockFd: d.lockFd,
+    proxyPort: 1,
+    deadlineSec: o.deadlineSec ?? 30,
+  });
+  track(l);
+  const exited = new Promise<number | null>((r) => l.child.once("exit", (code) => r(code)));
+  return { ...d, l, exited };
+}
+/** The members of a group (`snapshot`: macOS process group, Linux session — the same set for a detached child). */
+const members = async (pgid: number) => (await snapshot(pgid, 2000, true)).map((p) => p.pid);
+/** A file a stand-in browser writes its pid to (`PIDFILE`), and that pid once written. */
+function pidFile() {
+  const f = path.join(fs.realpathSync(os.tmpdir()), `agentlee-pid-${crypto.randomUUID()}`);
+  closers.push(async () => fs.rmSync(f, { force: true }));
+  return { f, pid: () => (fs.existsSync(f) ? Number(fs.readFileSync(f, "utf8")) || undefined : undefined) };
+}
+
+describe("the browser never outlives its owner (#170)", () => {
+  /**
+   * A host process (`orphan-host.ts`, its own process group, bounded) starts a render that never ends; once it
+   * runs, the host is SIGKILLed — no `finally`, no exit hook, no timer of it runs again. The watchdog must kill the
+   * browser's whole process group and remove the render folder and its lock by itself, within a bounded time.
+   */
+  async function orphan(mode: "fake" | "real") {
+    const host = spawn(
+      process.execPath,
+      ["--import", "tsx", "--conditions=development", path.join(FIXTURES, "orphan-host.ts"), mode],
+      { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    startedGroups.add(host.pid!);
+    let out = "";
+    let err = "";
+    host.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    host.stderr.on("data", (d: Buffer) => (err += d.toString()));
+    const exited = new Promise<void>((r) => host.once("exit", () => r()));
+    expect(await within(30_000, () => out.includes("\n")), err).toBe(true);
+    const info = JSON.parse(out.split("\n")[0]!) as {
+      host: number;
+      pgid: number;
+      members: number[];
+      workDir: string;
+      spinning?: boolean;
+    };
+    startedGroups.add(info.pgid);
+    expect(info.host).toBe(host.pid);
+    // One group: the watchdog leads it, the browser is in it, running; the folder is locked.
+    expect(info.members).toContain(info.pgid);
+    expect(info.members.length).toBeGreaterThanOrEqual(2);
+    expect(path.basename(info.workDir)).toMatch(/^agentlee-render-[A-Za-z0-9]{6}$/);
+    expect(fs.existsSync(renderLockPath(info.workDir))).toBe(true);
+    expect(groupAlive(info.pgid)).toBe(true);
+    if (mode === "real") expect(info.spinning).toBe(true);
+
+    const killedAt = Date.now();
+    process.kill(host.pid!, "SIGKILL");
+    await exited;
+    expect(await gone(host.pid!, 2000)).toBe(true);
+    expect(await gone(info.pgid, 5000)).toBe(true);
+    expect(await within(2000, () => !fs.existsSync(info.workDir))).toBe(true);
+    expect(fs.existsSync(renderLockPath(info.workDir))).toBe(false);
+    for (const pid of info.members) expect(alive(pid), `pid ${pid}`).toBe(false);
+    return Date.now() - killedAt;
+  }
+
+  it("SIGKILL of the owner: a stand-in browser that ignores pipe EOF is killed, group and folder gone", async () => {
+    expect(await orphan("fake")).toBeLessThan(5000);
+  }, 60_000);
+
+  it.skipIf(!BROWSER)(
+    "SIGKILL of the owner mid-render: the real headless shell (production launcher, its loop confirmed entered over DevTools) is gone too",
+    async () => {
+      expect(await orphan("real")).toBeLessThan(5000);
+    },
+    60_000,
+  );
+
+  /** A renderer over the stand-in browser that never answers; `launches` lists each started watchdog. */
+  function orphanRenderer(o: Partial<RendererOptions> = {}) {
+    const launches: { pgid: number; workDir: string; l: Launched }[] = [];
+    const launcher: Launcher = (s) => {
+      const l = unsandboxedLauncher(s);
+      launches.push({ pgid: l.child.pid!, workDir: s.workDir, l });
+      track(l);
+      return l;
+    };
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher,
+      egress: spyEgress().egress,
+      limits: { timeoutMs: 60_000 },
+      ...o,
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    return { r, launches };
+  }
+
+  it("the watchdog SIGKILLed alone (the server alive): the server kills its group, the browser in it, at once", async () => {
+    const { r, launches } = orphanRenderer();
+    const before = liveRenderCount();
+    const pending = r.render(job("markdown", "x", "pdf"));
+    // Until the browser runs under the watchdog (two members of the one group).
+    let seen: number[] = [];
+    expect(
+      await within(10_000, () => {
+        if (launches[0]) void members(launches[0].pgid).then((m) => (seen = m));
+        return seen.length >= 2;
+      }),
+    ).toBe(true);
+    const { pgid, workDir } = launches[0]!;
+    process.kill(pgid, "SIGKILL"); // the watchdog only
+    expect(await pending).toEqual({ ok: false, code: "export_failed" });
+    expect(await gone(pgid, 2000)).toBe(true);
+    for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
+    expect(fs.existsSync(workDir)).toBe(false);
+    expect(fs.existsSync(renderLockPath(workDir))).toBe(false);
+    expect(liveRenderCount()).toBe(before);
+  }, 30_000);
+
+  /** A render whose stand-in browser records its pid, and something done to it right after the spawn. */
+  async function rightAfterSpawn(act: (l: Launched) => void) {
+    const p = pidFile();
+    const launches: { l: Launched; workDir: string }[] = [];
+    const launcher: Launcher = (s) => {
+      const l = track(unsandboxedLauncher({ ...s, env: { ...s.env, PIDFILE: p.f } }));
+      launches.push({ l, workDir: s.workDir });
+      act(l); // before the watchdog has even run: no readiness of any kind
+      return l;
+    };
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher,
+      egress: spyEgress().egress,
+      limits: { timeoutMs: 60_000 },
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+    const { l, workDir } = launches[0]!;
+    expect(await gone(l.child.pid!, 3000)).toBe(true);
+    // The browser either never started or is gone — and does not turn up later either.
+    await new Promise((done) => setTimeout(done, 500));
+    const pid = p.pid();
+    if (pid) expect(alive(pid), `browser ${pid}`).toBe(false);
+    expect(fs.existsSync(workDir)).toBe(false);
+  }
+
+  it("shutdown right after the spawn (before any readiness) leaves no browser", async () => {
+    for (let i = 0; i < 5; i++) await rightAfterSpawn(() => void closeRenderers());
+  }, 60_000);
+
+  it("the watchdog killed right after the spawn leaves no browser", async () => {
+    for (let i = 0; i < 5; i++) await rightAfterSpawn((l) => process.kill(l.child.pid!, "SIGKILL"));
+  }, 60_000);
+
+  it("the group is signalled at most once per render: shutdown right after the spawn, or the time limit", async () => {
+    const kill = vi.spyOn(process, "kill");
+    try {
+      const signals = (pgid: number) =>
+        kill.mock.calls.filter(([p, sig]) => p === -pgid && sig === "SIGKILL").length;
+      // Shut down right after the spawn: `killLiveRenders`, then the render's own failure path — one signal.
+      let first: Launched | undefined;
+      const r1 = new Renderer({
+        browser: process.execPath,
+        launcher: (sp) => {
+          first = track(unsandboxedLauncher(sp));
+          closeRenderers();
+          return first;
+        },
+        egress: spyEgress().egress,
+        test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+      });
+      closers.push(() => r1.close());
+      expect((await r1.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+      expect(await gone(first!.child.pid!, 3000)).toBe(true);
+      expect(signals(first!.child.pid!)).toBe(1);
+      // The time limit: its kill, then the failed render's kill — one signal.
+      let second: Launched | undefined;
+      const r2 = new Renderer({
+        browser: process.execPath,
+        launcher: (sp) => (second = track(unsandboxedLauncher(sp))),
+        egress: spyEgress().egress,
+        limits: { timeoutMs: 500 },
+        test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+      });
+      closers.push(() => r2.close());
+      expect(await r2.render(job("markdown", "x", "pdf"))).toEqual({ ok: false, code: "export_timeout" });
+      expect(await gone(second!.child.pid!, 3000)).toBe(true);
+      await new Promise((done) => setTimeout(done, 200));
+      expect(signals(second!.child.pid!)).toBe(1);
+    } finally {
+      kill.mockRestore();
+    }
+  }, 30_000);
+
+  it("the group is signalled once even when the time limit and shutdown overlap", async () => {
+    let l: Launched | undefined;
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher: (sp) => (l = track(unsandboxedLauncher(sp))),
+      egress: spyEgress().egress,
+      limits: { timeoutMs: 500 },
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    const real = process.kill.bind(process);
+    let overlapped = false;
+    const kill = vi.spyOn(process, "kill").mockImplementation((p: number, sig?: string | number) => {
+      const res = real(p, sig);
+      // The time limit's signal: shut down right then, before the watchdog's exit is seen.
+      if (!overlapped && l && p === -l.child.pid! && sig === "SIGKILL") {
+        overlapped = true;
+        closeRenderers();
+      }
+      return res;
+    });
+    try {
+      expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
+      expect(overlapped).toBe(true);
+      expect(kill.mock.calls.filter(([p, sig]) => p === -l!.child.pid! && sig === "SIGKILL")).toHaveLength(1);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(await gone(l!.child.pid!, 3000)).toBe(true);
+  }, 30_000);
+
+  it("a render that fails while its folder is prepared (e.g. a full disk) keeps no descriptor and no folder", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-prep-")));
+    closers.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const realMkdir = fs.mkdirSync.bind(fs);
+    const mkdir = vi.spyOn(fs, "mkdirSync").mockImplementation(((
+      p: fs.PathLike,
+      o?: fs.MakeDirectoryOptions,
+    ) => {
+      if (String(p).endsWith(`${path.sep}home`) && String(p).includes(`${path.sep}agentlee-render-`)) {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return realMkdir(p, o);
+    }) as typeof fs.mkdirSync);
+    const fds = () => fs.readdirSync("/dev/fd").length;
+    let launches = 0;
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher: (sp) => {
+        launches++;
+        return track(unsandboxedLauncher(sp));
+      },
+      egress: spyEgress().egress,
+      tmpDir: root,
+      test: { args: FAKE, probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    try {
+      await r.render(job("markdown", "x", "pdf")); // warm up (the proxy's own descriptors)
+      const before = fds();
+      for (let i = 0; i < 8; i++)
+        expect(await r.render(job("markdown", "x", "pdf"))).toEqual({
+          ok: false,
+          code: "export_unavailable",
+        });
+      expect(fds()).toBe(before);
+      expect(fs.readdirSync(root)).toEqual([]);
+      expect(launches).toBe(0);
+    } finally {
+      mkdir.mockRestore();
+    }
+  }, 30_000);
+
+  it("TERM to the watchdog: it stops the browser (still running: killed and reaped) and cleans up", async () => {
+    const w = watchdog(FAKE());
+    const pgid = w.l.child.pid!;
+    let seen: number[] = [];
+    expect(
+      await within(10_000, () => {
+        void members(pgid).then((m) => (seen = m));
+        return seen.length >= 2;
+      }),
+    ).toBe(true);
+    process.kill(pgid, "SIGTERM");
+    expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+    expect(await gone(pgid, 2000)).toBe(true);
+    for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
+    expect(fs.existsSync(w.workDir)).toBe(false);
+    expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
+  }, 30_000);
+
+  it("the watchdog's own cap (monotonic clock) stops a browser the (living) owner never stops, and cleans up", async () => {
+    const started = Date.now();
+    const w = watchdog(FAKE(), { deadlineSec: 1 });
+    expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(fs.existsSync(w.workDir)).toBe(false);
+    expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
+  }, 30_000);
+
+  it("a browser that ends by itself: the watchdog removes the folder and lock before it exits 0", async () => {
+    const w = watchdog([FAKE_JS, "ok"]);
+    expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
+    w.l.input.end(); // the stand-in ends when its command pipe closes (as after `Browser.close`)
+    expect(await w.exited).toBe(WATCHDOG_EXIT.done);
+    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(fs.existsSync(w.workDir)).toBe(false);
+    expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
+  }, 30_000);
+
+  it.skipIf(!darwin)(
+    "a folder that cannot be removed keeps its lock (server and watchdog alike), so the sweep tries again",
+    async () => {
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-keep-")));
+      const stuck: string[] = [];
+      const flags = (f: string, on: boolean) =>
+        spawnSync("/usr/bin/chflags", [on ? "uchg" : "nouchg", f]).status;
+      closers.push(async () => {
+        for (const f of stuck) flags(f, false);
+        fs.rmSync(root, { recursive: true, force: true });
+      });
+      /** A render folder holding an immutable file (macOS `uchg`): nothing — not even its owner — removes it. */
+      const undeletable = () => {
+        const d = makeRenderDir(root);
+        closers.push(async () => removeRenderDir(d)); // closes the server's descriptor
+        const f = path.join(d.workDir, "stuck");
+        fs.writeFileSync(f, "synthetic");
+        expect(flags(f, true)).toBe(0);
+        stuck.push(f);
+        return d;
+      };
+      const server = undeletable();
+      removeRenderDir(server);
+      expect(fs.existsSync(server.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(server.workDir))).toBe(true);
+      const wd = undeletable();
+      const w = watchdog([FAKE_JS, "ok"], { dir: wd });
+      expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
+      w.l.input.end();
+      expect(await w.exited).toBe(WATCHDOG_EXIT.done);
+      expect(fs.existsSync(wd.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(wd.workDir))).toBe(true);
+      // The server's own clean-up after it (its `finally`) fails the same way, and closes its descriptor: the lock is
+      // free only now (flock belongs to the open file, which the server shares with the watchdog and the browser).
+      removeRenderDir(wd);
+      expect(fs.existsSync(renderLockPath(wd.workDir))).toBe(true);
+      // Once removable, the sweep (the locks are free) takes both.
+      for (const f of stuck) flags(f, false);
+      expect(await sweepRenderDirs(root, { graceSec: 0 })).toEqual({ removed: 2, lockless: 0 });
+    },
+    30_000,
+  );
+
+  it("exit status: a browser that exits 127 by itself is `done`; a browser that cannot be executed is `execFailed`", async () => {
+    const own = watchdog([FAKE_JS, "exit127"]);
+    expect(await own.exited).toBe(WATCHDOG_EXIT.done);
+    const missing = watchdog([], {
+      browser: path.join(os.tmpdir(), `no-such-browser-${crypto.randomUUID()}`),
+    });
+    expect(await missing.exited).toBe(WATCHDOG_EXIT.execFailed);
+    for (const w of [own, missing]) {
+      expect(fs.existsSync(w.workDir)).toBe(false);
+      expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
+    }
+  }, 30_000);
+
+  it("the lock: the watchdog locks the server's own descriptor — a file put at the path is neither locked nor unlinked", async () => {
+    /** Whether `file` can be flocked right now (a separate process, without waiting). */
+    const lockable = (file: string) =>
+      spawnSync("/usr/bin/perl", [
+        "-e",
+        'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, 6) ? exit 0 : exit 1',
+        file,
+      ]).status === 0;
+    const d = freshRenderDir();
+    const lockPath = renderLockPath(d.workDir);
+    // The server's file moves away (kept, so its inode cannot be reused); another file takes the path.
+    fs.renameSync(lockPath, `${lockPath}.orig`);
+    closers.push(async () => fs.rmSync(`${lockPath}.orig`, { force: true }));
+    fs.writeFileSync(lockPath, "");
+    closers.push(async () => fs.rmSync(lockPath, { force: true }));
+    expect(fs.statSync(lockPath).ino).not.toBe(fs.statSync(`${lockPath}.orig`).ino);
+    const w = watchdog([FAKE_JS, "ok"], { dir: d });
+    expect(await within(5000, () => !lockable(`${lockPath}.orig`))).toBe(true); // the server's file: held
+    expect(lockable(lockPath)).toBe(true); // the stand-in at the path: not
+    w.l.input.end();
+    expect(await w.exited).toBe(WATCHDOG_EXIT.done);
+    expect(fs.existsSync(d.workDir)).toBe(false);
+    expect(fs.existsSync(lockPath)).toBe(true); // not the file it locked: left alone
+    expect(fs.existsSync(`${lockPath}.orig`)).toBe(true);
+  }, 30_000);
+
+  it("the lock reaches the browser: fd 5 is the server's file, read-only, and the browser alone still holds the lock", async () => {
+    const lockable = (file: string) =>
+      spawnSync("/usr/bin/perl", [
+        "-e",
+        'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, 6) ? exit 0 : exit 1',
+        file,
+      ]).status === 0;
+    const info = path.join(fs.realpathSync(os.tmpdir()), `agentlee-fd5-${crypto.randomUUID()}`);
+    closers.push(async () => fs.rmSync(info, { force: true }));
+    const d = freshRenderDir();
+    const lockPath = renderLockPath(d.workDir);
+    closers.push(async () => fs.rmSync(lockPath, { force: true })); // the descriptor is closed by hand below
+    const serverIno = fs.fstatSync(d.lockFd).ino;
+    const w = watchdog(FAKE(), { dir: d, env: { FD5FILE: info } });
+    expect(await within(10_000, () => fs.existsSync(info) && fs.readFileSync(info, "utf8").length > 0)).toBe(
+      true,
+    );
+    const got = JSON.parse(fs.readFileSync(info, "utf8")) as {
+      pid: number;
+      ino: number | null;
+      writable: boolean;
+    };
+    expect(got.ino).toBe(serverIno);
+    expect(got.writable).toBe(false);
+    // Only the browser left: the watchdog killed alone, the server's descriptor closed.
+    process.kill(w.l.child.pid!, "SIGKILL");
+    await w.exited;
+    fs.closeSync(d.lockFd);
+    d.lockFd = -1;
+    expect(alive(got.pid)).toBe(true);
+    expect(lockable(lockPath)).toBe(false); // still held — by the browser
+    process.kill(-w.l.child.pid!, "SIGKILL"); // the group (the browser is in it)
+    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(await within(2000, () => lockable(lockPath))).toBe(true);
+  }, 30_000);
+
+  it("the lock: no descriptor 5, or one that is not a regular file, and the watchdog does not start", async () => {
+    const d = freshRenderDir();
+    const start = (fd5: "ignore" | "pipe") => {
+      const [command, ...args] = watchdogPrefix({
+        browser: process.execPath,
+        args: FAKE(),
+        env: {},
+        workDir: d.workDir,
+        lockFd: d.lockFd,
+        proxyPort: 1,
+        deadlineSec: 30,
+      });
+      const child = spawn(command!, [...args, process.execPath, ...FAKE()], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore", "pipe", "pipe", fd5],
+      });
+      startedGroups.add(child.pid!);
+      return new Promise<number | null>((r) => child.once("exit", (code) => r(code)));
+    };
+    expect(await start("ignore")).toBe(WATCHDOG_EXIT.notStarted);
+    expect(await start("pipe")).toBe(WATCHDOG_EXIT.notStarted);
+    expect(fs.existsSync(renderLockPath(d.workDir))).toBe(true);
+  }, 30_000);
+
+  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end kills its group", async () => {
+    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" (sleep) in their group.
+    const react = async (status: number) => {
+      const p = pidFile();
+      const launcher: Launcher = () => {
+        const child = spawn(
+          "/bin/sh",
+          ["-c", `/bin/sleep 30 & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`],
+          {
+            env: { EXIT_CODE: String(status) },
+            detached: true,
+            stdio: ["pipe", "pipe", "ignore", "pipe", "pipe"],
+          },
+        );
+        startedGroups.add(child.pid!);
+        return { child, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable };
+      };
+      const r = new Renderer({
+        browser: process.execPath,
+        launcher,
+        egress: spyEgress().egress,
+        limits: { settleMs: 0 },
+        test: { probe: async () => [{ pid: 1, rss: 1 }] },
+      });
+      closers.push(() => r.close());
+      expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
+      const sleeper = p.pid()!;
+      return within(1000, () => !alive(sleeper)).then((dead) => !dead);
+    };
+    const X = WATCHDOG_EXIT;
+    for (const s of [X.done, X.stopped, X.notStarted, X.execFailed])
+      expect(await react(s), `status ${s}`).toBe(true);
+    expect(await react(1)).toBe(false);
+  }, 60_000);
+
+  it("shutdown: closeRenderers turns queued renders away, starts no new browser, and kills the running one", async () => {
+    const { r, launches } = orphanRenderer({ limits: { timeoutMs: 60_000, concurrent: 1, queue: 2 } });
+    const before = liveRenderCount();
+    const first = r.render(job("markdown", "x", "pdf"));
+    const queued = [r.render(job("markdown", "y", "pdf")), r.render(job("markdown", "z", "pdf"))];
+    expect(await within(10_000, () => liveRenderCount() === before + 1)).toBe(true);
+    expect(closeRenderers()).toBe(before + 1);
+    expect(await first).toEqual({ ok: false, code: "export_failed" });
+    expect(await Promise.all(queued)).toEqual([
+      { ok: false, code: "export_unavailable" },
+      { ok: false, code: "export_unavailable" },
+    ]);
+    // A render asked for after shutdown is refused too; only the first ever started a browser.
+    expect(await r.render(job("markdown", "w", "pdf"))).toEqual({ ok: false, code: "export_unavailable" });
+    expect(launches).toHaveLength(1);
+    expect(await gone(launches[0]!.pgid, 2000)).toBe(true);
+    expect(fs.existsSync(launches[0]!.workDir)).toBe(false);
+    expect(liveRenderCount()).toBe(0);
+  }, 30_000);
+
+  it("shutdown while a render waits for its proxy: no browser is started", async () => {
+    const { r, launches } = orphanRenderer();
+    const pending = r.render(job("markdown", "x", "pdf"));
+    r.shutdown();
+    expect(await pending).toEqual({ ok: false, code: "export_unavailable" });
+    expect(launches).toHaveLength(0);
+  }, 30_000);
+
+  it("a browser's own exit code ≥ 126 after a good render is not a watchdog failure: no kill of its group", async () => {
+    let l: Launched | undefined;
+    const launcher: Launcher = (s) => {
+      l = track(unsandboxedLauncher(s));
+      return l;
+    };
+    const r = new Renderer({
+      browser: process.execPath,
+      launcher,
+      egress: spyEgress().egress,
+      limits: { settleMs: 0 },
+      test: { args: () => [FAKE_JS, "ok-130"], probe: async () => [{ pid: 1, rss: 1 }] },
+    });
+    closers.push(() => r.close());
+    const kill = vi.spyOn(process, "kill");
+    try {
+      const res = await r.render(job("markdown", "x", "pdf"));
+      expect(res.ok).toBe(true);
+      await new Promise((done) => setTimeout(done, 300)); // the watchdog's exit is handled by now
+      expect(kill.mock.calls.filter(([p]) => p === -l!.child.pid!)).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(await gone(l!.child.pid!, 2000)).toBe(true);
+  }, 30_000);
+
+  /** A sweep root with old render folders (and their locks) and other things beside them. */
+  function sweepRoot() {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-sweep-")));
+    closers.push(async () => fs.rmSync(root, { recursive: true, force: true }));
+    const old = new Date(Date.now() - 3600_000);
+    const age = (p: string) => fs.lutimesSync(p, old, old);
+    const dir = (name: string, lock: boolean | "fifo" | "link", aged = true) => {
+      const d = path.join(root, name);
+      fs.mkdirSync(path.join(d, "profile"), { recursive: true });
+      fs.writeFileSync(path.join(d, "profile", "x"), "synthetic");
+      const l = renderLockPath(d);
+      if (lock === true) fs.writeFileSync(l, "");
+      if (lock === "fifo") expect(spawnSync("/usr/bin/mkfifo", [l]).status).toBe(0);
+      if (lock === "link") fs.symlinkSync(path.join(root, "elsewhere"), l);
+      if (lock && aged) age(l);
+      if (aged) age(d);
+      return d;
+    };
+    const holdLock = async (file: string) => {
+      const holder = spawn(
+        "/usr/bin/perl",
+        ["-e", '$|=1; open(my $f, "<", $ARGV[0]) or die; flock($f, 2) or die; print "L\\n"; sleep 30', file],
+        { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      startedGroups.add(holder.pid!);
+      let said = "";
+      holder.stdout.on("data", (d: Buffer) => (said += d.toString()));
+      expect(await within(5000, () => said.includes("L"))).toBe(true);
+      return holder;
+    };
+    return { root, age, dir, holdLock };
+  }
+
+  it("sweep: only a free lock beside an old folder of ours is proof — everything else is kept; lock-less folders are counted", async () => {
+    const t = sweepRoot();
+    const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-sweep-target-")));
+    closers.push(async () => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outside, "keep"), "synthetic");
+    const freeLock = t.dir("agentlee-render-aaaaaa", true); // its watchdog and browser are gone
+    const heldLock = t.dir("agentlee-render-bbbbbb", true); // someone still holds it
+    const noLock = t.dir("agentlee-render-cccccc", false); // pre-watchdog leftover, or died before its lock
+    const fifoLock = t.dir("agentlee-render-dddddd", "fifo"); // not a regular file: no proof (and no hang)
+    const linkLock = t.dir("agentlee-render-eeeeee", "link"); // a symlink: no proof
+    const fresh = t.dir("agentlee-render-ffffff", true, false); // too young to judge
+    const other = t.dir("agentlee-other-gggggg", false); // not ours
+    const odd = t.dir("agentlee-render-toolong1", true); // not a mkdtemp name of ours
+    fs.symlinkSync(outside, path.join(t.root, "agentlee-render-hhhhhh")); // a symlinked "folder"
+    fs.writeFileSync(path.join(t.root, "agentlee-render-hhhhhh.lock"), "");
+    t.age(path.join(t.root, "agentlee-render-hhhhhh"));
+    t.age(path.join(t.root, "agentlee-render-hhhhhh.lock"));
+    const strayFree = path.join(t.root, "agentlee-render-iiiiii.lock"); // a lock whose folder is gone
+    fs.writeFileSync(strayFree, "");
+    t.age(strayFree);
+    const strayHeld = path.join(t.root, "agentlee-render-jjjjjj.lock");
+    fs.writeFileSync(strayHeld, "");
+    t.age(strayHeld);
+    const holders = [await t.holdLock(renderLockPath(heldLock)), await t.holdLock(strayHeld)];
+
+    const started = Date.now();
+    expect(await sweepRenderDirs(t.root, { graceSec: 600 })).toEqual({ removed: 1, lockless: 1 });
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(fs.existsSync(freeLock)).toBe(false);
+    expect(fs.existsSync(renderLockPath(freeLock))).toBe(false);
+    for (const d of [heldLock, noLock, fifoLock, linkLock, fresh, other, odd])
+      expect(fs.existsSync(d), d).toBe(true);
+    expect(fs.existsSync(renderLockPath(heldLock))).toBe(true);
+    expect(fs.lstatSync(path.join(t.root, "agentlee-render-hhhhhh")).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(outside, "keep"), "utf8")).toBe("synthetic");
+    expect(fs.existsSync(strayFree)).toBe(false);
+    expect(fs.existsSync(strayHeld)).toBe(true);
+
+    // Once the holders are gone, their folder and stray lock go too; the lock-less folder is still only counted.
+    for (const h of holders) {
+      process.kill(-h.pid!, "SIGKILL");
+      expect(await gone(h.pid!, 2000)).toBe(true);
+    }
+    expect(await sweepRenderDirs(t.root, { graceSec: 600 })).toEqual({ removed: 1, lockless: 1 });
+    expect(fs.existsSync(heldLock)).toBe(false);
+    expect(fs.existsSync(strayHeld)).toBe(false);
+    expect(fs.existsSync(noLock)).toBe(true);
+    await expect(sweepRenderDirs(path.join(t.root, "none"), { graceSec: 600 })).resolves.toEqual({
+      removed: 0,
+      lockless: 0,
+    });
+  }, 60_000);
+
+  it("sweep budget: past it the sweep stops between names and the next one resumes after the last it judged (wrapping)", async () => {
+    const t = sweepRoot();
+    const ds = ["aaaaaa", "bbbbbb", "cccccc"].map((n) => t.dir(`agentlee-render-${n}`, true));
+    // A budget of 0: exactly one name per sweep (folders and their locks are separate names).
+    const r1 = await sweepRenderDirs(t.root, { budgetSec: 0 });
+    expect(r1).toEqual({ removed: 1, lockless: 0, next: "agentlee-render-aaaaaa" });
+    expect(fs.existsSync(ds[0]!)).toBe(false);
+    const r2 = await sweepRenderDirs(t.root, { budgetSec: 0, after: "agentlee-render-bbbbbb.lock" });
+    expect(r2).toEqual({ removed: 1, lockless: 0, next: "agentlee-render-cccccc" });
+    // Resuming past the end wraps around: "bbbbbb" (before the resume point) is judged too.
+    expect(await sweepRenderDirs(t.root, { after: r2.next! })).toEqual({ removed: 1, lockless: 0 });
+    for (const d of ds) expect(fs.existsSync(d)).toBe(false);
+  }, 60_000);
+
+  it("sweep owner: with its owner's pipe already closed the sweep stops before the first name", async () => {
+    const t = sweepRoot();
+    const d = t.dir("agentlee-render-aaaaaa", true);
+    const perl = spawnSync("/usr/bin/perl", ["-e", SWEEP_PL, t.root, "600", String(process.pid), "-", "45"], {
+      stdio: ["ignore", "pipe", "ignore"], // stdin: /dev/null — EOF at once
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(perl.stdout).toBe("0 0 -\n");
+    expect(fs.existsSync(d)).toBe(true);
+  }, 30_000);
+
+  it("sweep lifetime: stop() kills the running sweep, returns within its bound, and nothing is deleted after it", async () => {
+    const t = sweepRoot();
+    const big = t.dir("agentlee-render-aaaaaa", true);
+    const files = path.join(big, "profile");
+    for (let i = 0; i < 40_000; i++) fs.writeFileSync(path.join(files, `f${i}`), "");
+    t.age(big);
+    const count = () => (fs.existsSync(files) ? fs.readdirSync(files).length : 0);
+    const stop = startRenderSweeps(t.root, 3600_000, { graceSec: 600 });
+    expect(await within(20_000, () => count() < 40_000)).toBe(true); // it is deleting
+    const started = Date.now();
+    await stop();
+    expect(Date.now() - started).toBeLessThan(SWEEP_STOP_WAIT_MS + 500);
+    const left = count();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(count()).toBe(left);
+  }, 120_000);
+});
+
 describe("the production launcher's sandbox policy (checked on every platform)", () => {
   const spec = () => {
     const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-policy-")));
@@ -636,6 +1382,8 @@ describe("the production launcher's sandbox policy (checked on every platform)",
       browserDir,
       workDir,
       proxyPort: 41234,
+      lockFd: 7,
+      deadlineSec: 30,
       env: { HOME: path.join(workDir, "home"), TMPDIR: path.join(workDir, "tmp") },
       args: browserArgs(path.join(workDir, "profile"), "http://127.0.0.1:41234"),
     };
@@ -654,7 +1402,13 @@ describe("the production launcher's sandbox policy (checked on every platform)",
       write: [s.workDir],
       network: { loopbackPorts: [41234] },
       extraPipes: 2,
+      // The watchdog (#170) in front of sandbox-exec, outside the sandbox: owner = this process, the cap, the folder.
+      wrap: watchdogPrefix(s),
+      // The server's descriptor of the lock, as the watchdog's fd 5.
+      inheritFds: [7],
     });
+    expect(o.wrap!.slice(0, 2)).toEqual(["/usr/bin/perl", "-e"]);
+    expect(o.wrap!.slice(3)).toEqual([String(process.pid), "30", s.workDir]);
   });
 
   it("the generated profile: deny by default, no fork, no other network, no other writes", () => {
@@ -821,7 +1575,15 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
     closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
     const node = fs.realpathSync(process.execPath);
-    const policy = rendererSandbox({ browser: node, args: [], env: {}, workDir, proxyPort });
+    const policy = rendererSandbox({
+      browser: node,
+      args: [],
+      env: {},
+      workDir,
+      proxyPort,
+      lockFd: -1,
+      deadlineSec: 30,
+    });
     const r = await runIsolated({
       ...policy,
       command: node,
