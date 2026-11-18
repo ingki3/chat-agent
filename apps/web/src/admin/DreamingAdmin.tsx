@@ -19,6 +19,7 @@ import {
 } from "@agentlee/shared";
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
+import { afterSave } from "../instructions/draft.js";
 
 /**
  * 관리자 → 기억 정리 (#146, #188, PRD FR-16.6·16.8): what stays the admin's once each user sets their own 기억 정리
@@ -328,6 +329,7 @@ function YouthExtras({
         aria-label={`${user.name} 정리 프롬프트 새로 쓰기`}
         rows={3}
         maxLength={DREAMING_PROMPT_MAX}
+        disabled={pending}
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
       />
@@ -337,9 +339,11 @@ function YouthExtras({
           className="small"
           disabled={pending || !prompt.trim()}
           onClick={() => {
-            // Cleared only once saved: a refusal (a secret value, …) keeps what was typed (review #195 round 2).
-            void save({ prompt }).then(
-              () => setPrompt(""),
+            // Cleared only once saved: a refusal (a secret value, …) keeps what was typed (review #195 round 2), and
+            // so does anything typed after it was sent (round 3 — the box is locked while saving, too).
+            const sent = prompt;
+            void save({ prompt: sent }).then(
+              () => setPrompt((cur) => afterSave(cur, sent, "")),
               () => {},
             );
           }}

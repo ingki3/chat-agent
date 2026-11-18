@@ -87,6 +87,20 @@ async function asAdmin<T>(browser: Browser, baseURL: string, fn: (admin: Page) =
   }
 }
 
+/**
+ * Holds requests matching `url` until `release()` (a slow save, to look at the screen meanwhile); later ones pass
+ * straight through.
+ */
+async function holdRequests(page: Page, url: string) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  await page.route(url, async (route) => {
+    await gate;
+    await route.continue();
+  });
+  return { release };
+}
+
 /** The member's own settings: on, later today, "Fake Large". */
 async function turnOn(page: Page) {
   await page.goto("/settings/instructions?doc=dreams");
@@ -126,7 +140,15 @@ test("내가 켜고(시각·연결·프롬프트) 실행 → 제안 → 반영, 
   await expect(prompt).toHaveValue(secret);
   const mine = `취미만 골라 주세요 ${Math.round(Math.random() * 1e6)}`;
   await prompt.fill(mine);
+  // In flight (held here): the editor is read-only, so nothing typed meanwhile is lost (review #195 round 3).
+  const held = await holdRequests(page, "**/api/dreaming/prompt");
   await panel.getByRole("button", { name: "프롬프트 저장" }).click();
+  await expect(prompt).toHaveAttribute("readonly", "");
+  await prompt.press("End");
+  await page.keyboard.type(" 더");
+  await expect(prompt).toHaveValue(mine);
+  held.release();
+  await expect(prompt).not.toHaveAttribute("readonly", "");
   await expect(panel.getByText(/지금 쓰는 정리 프롬프트 \(내가 고친 것\)/)).toBeVisible();
   await panel.getByRole("button", { name: "기본값으로 되돌리기" }).click();
   await expect(panel.getByText(/지금 쓰는 정리 프롬프트 \(기본값\)/)).toBeVisible();
@@ -225,10 +247,16 @@ test("청소년 계정: 설정은 읽기만, 관리자가 켜고 시각·연결�
     ).toBeVisible();
     await expect(box).toHaveValue(secret);
     await expect(row).toContainText("정리 프롬프트: 기본값");
+    // While the save is in flight (held here) the box is locked: nothing typed meanwhile can be lost (round 3).
+    const held = await holdRequests(admin, "**/api/admin/dreaming/users/*");
     await box.fill("학교 이야기만 골라 주세요");
     await row.getByRole("button", { name: "프롬프트 저장" }).click();
+    await expect(box).toBeDisabled();
+    await expect(box).toHaveValue("학교 이야기만 골라 주세요");
+    held.release();
     await expect(row).toContainText("정리 프롬프트: 관리자가 새로 씀");
     await expect(box).toHaveValue("");
+    await expect(box).toBeEnabled();
     await expect(row).not.toContainText("학교 이야기만 골라 주세요");
   });
   await page.reload();

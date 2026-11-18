@@ -15,6 +15,7 @@ import {
   type MyDreaming,
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
+import { afterSave } from "./draft.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -204,11 +205,12 @@ function Prompt({ view }: { view: MyDreaming }) {
   const [text, setText] = useState<string>();
   const [preview, setPreview] = useState<DreamingPreview>();
   const content = text ?? view.prompt.content;
+  // `typed`: the editor's draft when the save was sent — cleared on success only if it is still the same.
   const save = useMutation({
-    mutationFn: (c: string | null) => dreaming.savePrompt(c),
-    onSuccess: (v) => {
+    mutationFn: (a: { content: string | null; typed: string | undefined }) => dreaming.savePrompt(a.content),
+    onSuccess: (v, a) => {
       qc.setQueryData(DREAMING_KEY, v);
-      setText(undefined);
+      setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });
   const run = useMutation({
@@ -229,7 +231,8 @@ function Prompt({ view }: { view: MyDreaming }) {
         data-testid="dreaming-prompt"
         rows={8}
         maxLength={DREAMING_PROMPT_MAX}
-        readOnly={!view.canEdit}
+        readOnly={!view.canEdit || save.isPending}
+        aria-busy={save.isPending}
         value={content}
         onChange={(e) => setText(e.target.value)}
       />
@@ -239,14 +242,14 @@ function Prompt({ view }: { view: MyDreaming }) {
             type="button"
             className="primary"
             disabled={save.isPending || text === undefined}
-            onClick={() => save.mutate(content)}
+            onClick={() => save.mutate({ content, typed: text })}
           >
             프롬프트 저장
           </button>
           <button
             type="button"
             disabled={save.isPending || (!view.prompt.custom && text === undefined)}
-            onClick={() => save.mutate(null)}
+            onClick={() => save.mutate({ content: null, typed: text })}
           >
             기본값으로 되돌리기
           </button>
