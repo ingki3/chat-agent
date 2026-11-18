@@ -515,7 +515,8 @@ test("저장 성공 + 불러오기 실패 뒤 다음 저장이 실패해도 저�
   await auto.check();
   await expect(auto).toBeChecked();
   modePuts.on = true;
-  await review.check();
+  // A refused save goes back at once: click (check() would insist the state changed — review #195 CI, mobile).
+  await review.click();
   await expect(page.getByTestId("memory-mode").getByRole("alert")).toBeVisible();
   await expect(auto).toBeChecked();
   expect((await api<{ applyMode: string }>("/api/memory-prefs")).applyMode).toBe("auto");
@@ -529,9 +530,10 @@ test("저장 성공 + 불러오기 실패 뒤 다음 저장이 실패해도 저�
   await failed.uncheck();
   await expect(failed).not.toBeChecked();
   prefPuts.on = true;
-  await failed.check();
-  await expect(failed).not.toBeChecked();
+  // Refused: it goes back at once — click, then wait for the error (check() would insist the state changed).
+  await failed.click();
   await expect(page.getByTestId("memory-notifications").getByRole("alert")).toBeVisible();
+  await expect(failed).not.toBeChecked();
   expect((await api<{ memoryFailed: boolean }>("/api/notifications/prefs")).memoryFailed).toBe(false);
   await page.unrouteAll({ behavior: "ignoreErrors" });
 });
