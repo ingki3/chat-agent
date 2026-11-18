@@ -11,6 +11,21 @@ export function marksChanged(): void {
   for (const l of [...listeners]) l();
 }
 
+/**
+ * The effect of a markdown block with marks (`useEffect(() => markEffect(marked), …)`): say they are drawn, and
+ * when they go (the block unmounts or redraws), say so again — the summary line goes back to text when its answer
+ * has no target left (review 2차).
+ */
+export function markEffect(marked: boolean): (() => void) | undefined {
+  if (!marked) return undefined;
+  marksChanged();
+  return marksChanged;
+}
+
+/** Whether an answer has any target drawn (the summary line's snapshot). */
+export const marksReady = (markId: string | undefined): boolean =>
+  !!markId && missingMarks(markId).length > 0;
+
 export function subscribeMarks(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

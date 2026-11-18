@@ -92,8 +92,10 @@ const endOf = (n: Hast) => n.position?.end?.offset;
  * the end of its own text (a table's is drawn by the table component). Its children of *other* ranges (a loose
  * item's second paragraph, a nested item) are still marked for theirs. A range that began in an earlier block or
  * text part (a paragraph cut by a tool call) only gets the bar here: its target is where it starts. A range that
- * starts in this block but has no such element (block math, indented code, raw HTML shown as text — ranges stored
- * by an older server) gets the top-level node it covers wrapped as its target, or an empty target at its place.
+ * starts in this block but has no such element (block math, code, raw HTML shown as text — ranges stored by an older
+ * server) gets the top-level node it covers, found by its source position, wrapped as its target, or an empty
+ * target where it starts. It runs **before** KaTeX and the highlighter (review 2차): they replace elements and drop
+ * source positions, so a target is always chosen by position, never by guessing.
  * Ranges stored by an older server mark the same way: the marks come from the ranges, nothing is recomputed.
  */
 export function rehypeMissingMarks(
@@ -147,18 +149,22 @@ export function rehypeMissingMarks(
     const root = (tree.children ??= []);
     ranges.forEach((r, i) => {
       if (claimed.has(i) || !isOurs(i)) return;
-      let k = root.findIndex((n) => {
+      // By source position only (this runs before KaTeX and the highlighter, which drop positions): the top-level
+      // node the range covers — not one already wrapped for another range.
+      const k = root.findIndex((n) => {
         const s = startOf(n);
         const e = endOf(n);
         return s !== undefined && e !== undefined && offset + s < r.end && offset + e > r.start;
       });
-      // Block math comes back from KaTeX without its source position: the element that has none.
-      if (k === -1) k = root.findIndex((n) => n.type === "element" && startOf(n) === undefined);
       const props: Record<string, unknown> = { className: ["cite-missing-block", "cite-missing-wrap"] };
       targetProps(props);
       const wrap: Hast = { type: "element", tagName: "div", properties: props, children: [badge()] };
-      if (k === -1) root.push(wrap);
-      else wrap.children!.unshift(root.splice(k, 1, wrap)[0]!);
+      if (k !== -1) wrap.children!.unshift(root.splice(k, 1, wrap)[0]!);
+      else {
+        // Nothing there: an empty target where the range starts.
+        const at = root.findIndex((n) => (startOf(n) ?? -1) + offset >= r.start);
+        root.splice(at === -1 ? root.length : at, 0, wrap);
+      }
       claimed.add(i);
     });
   };

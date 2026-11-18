@@ -11,6 +11,7 @@ import {
   type PublicPart,
 } from "@agentlee/shared";
 import { Parts } from "../src/chat/Parts.js";
+import { markEffect, marksReady, subscribeMarks } from "../src/citations/marks.js";
 import { markerNumbers } from "../src/citations/markdown.js";
 import { citationView } from "../src/citations/segments.js";
 import { dataSourceViews, sourceNoteOf } from "../src/citations/source-note.js";
@@ -186,5 +187,33 @@ describe("paragraphs without a citation (#202): one summary line, the paragraphs
 
   it("no ranges, or an unbacked note: no summary line", () => {
     expect(render(parts([], [TEXT]))).not.toContain("citation-missing-warning");
+  });
+});
+
+describe("the summary line follows its marks (#202 review 2차)", () => {
+  it("a block's marks drawn → notified; gone (cleanup) → notified again, and the snapshot is false with no target", () => {
+    const targets: unknown[] = [];
+    const doc = { querySelectorAll: (sel: string) => (sel.includes('"m9"') ? targets : []) };
+    const g = globalThis as { document?: unknown };
+    const before = g.document;
+    g.document = doc;
+    try {
+      const seen: boolean[] = [];
+      const off = subscribeMarks(() => seen.push(marksReady("m9")));
+      targets.push({});
+      const cleanup = markEffect(true);
+      expect(seen).toEqual([true]);
+      // The block unmounts (or falls back to plain text): its targets are gone, the cleanup says so.
+      targets.length = 0;
+      cleanup!();
+      expect(seen).toEqual([true, false]);
+      // A block without marks says nothing.
+      expect(markEffect(false)).toBeUndefined();
+      expect(seen).toHaveLength(2);
+      off();
+      expect(marksReady(undefined)).toBe(false);
+    } finally {
+      g.document = before;
+    }
   });
 });

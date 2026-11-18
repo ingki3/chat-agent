@@ -11,7 +11,7 @@ import { useFileViewHref } from "../files/context.js";
 import { CitationMarkers } from "./CitationMarker.js";
 import { segments, sourceLinkText, sourceSummary, sourceViews, type CitationView } from "./segments.js";
 import { dataSourceViews, financeWarning, type DataSourceView } from "./source-note.js";
-import { missingMarks, subscribeMarks } from "./marks.js";
+import { marksReady, missingMarks, subscribeMarks } from "./marks.js";
 import "./citations.css";
 
 /**
@@ -117,7 +117,7 @@ function MissingSummary({ count, markId }: { count: number; markId: string | und
   const text = citationMissingText(count);
   const ready = useSyncExternalStore(
     subscribeMarks,
-    useCallback(() => !!markId && missingMarks(markId).length > 0, [markId]),
+    useCallback(() => marksReady(markId), [markId]),
     () => false,
   );
   if (!markId || !ready)

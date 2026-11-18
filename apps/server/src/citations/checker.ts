@@ -72,27 +72,44 @@ const PROGRESS =
   /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
 
 /**
- * What the assistant does to the material (#202, review 1차): reading, searching, finding, checking, comparing,
- * sorting out, going through, calculating — only these verbs. "경쟁률이 계속 상승하고 있어요" is not one of them.
+ * The assistant's own work on the material (#202, review 1·2차) — a closed list of predicates: reading, searching,
+ * finding, checking, comparing, sorting out, going through, reviewing, calculating, analysing, looking up; going on
+ * ("확인하고 있어요", "비교하는 중이에요"), done ("다 읽었어요") or next ("확인해 볼게요", "찾아볼게요").
  */
-const ACTION =
-  "(?:읽|찾|찾아보|검색하|확인하|비교하|정리하|살펴보|훑어보|검토하|계산하|분석하|열어보|조회하)";
-/** "…확인하고 있어요." — what the assistant is doing right now. */
-const ONGOING = new RegExp(`${ACTION}(?:고\\s*있(?:어요|습니다)|는\\s*중(?:이에요|입니다))$`, "u");
-/** "파일을 다 읽었어요." — a step of its work on the material done. */
-const STEP_DONE =
-  /(?:읽었|찾았|찾아봤|검색했|확인했|비교했|정리했|살펴봤|살펴보았|훑어봤|검토했|계산했|분석했|열어봤|조회했|가져왔)(?:어요|습니다)$/u;
+const WORK = "(?:읽|찾|찾아보|검색하|확인하|비교하|정리하|살펴보|훑어보|검토하|계산하|분석하|열어보|조회하)";
+const WORK_DONE =
+  "(?:읽었|찾았|찾아봤|검색했|확인했|비교했|정리했|살펴봤|살펴보았|훑어봤|검토했|계산했|분석했|열어봤|조회했|가져왔)";
+const WORK_NEXT =
+  "(?:읽을|찾을|검색할|확인할|비교할|정리할|검토할|계산할|분석할|조회할|가져올|(?:읽어|찾아|살펴|훑어|열어|검색해|확인해|비교해|정리해|검토해|계산해|분석해|조회해)\\s*볼)";
+const WORK_PREDICATE = new RegExp(
+  `(?:${WORK}(?:고\\s*있(?:어요|습니다)|는\\s*중(?:이에요|입니다))|${WORK_DONE}(?:어요|습니다)|${WORK_NEXT}(?:게요|께요|겠습니다))$`,
+  "u",
+);
+/** Adverbs a work note may have ("이제", "다", "같이" …) — words, not subjects. */
+const WORK_ADVERBS = new Set(
+  "이제 지금 먼저 우선 다음으로 다시 다 모두 전부 같이 함께 한번 한 번 좀 마저 계속 차례로 더 꼼꼼히 자세히 하나씩".split(
+    " ",
+  ),
+);
+/** The assistant as the subject: the only subject a work note may name. */
+const AGENT = /^(?:제가|저는|저도)$/u;
+/** The last syllable of a word that carries a subject, topic or other particle ("교육부도", "대학 측에선", "자료가"). */
+const PARTICLE_END = /[이가은는도서선께만과와랑에로고며면지데니라나측]$/u;
+
 /**
- * A subject other than the assistant ("경쟁률이 …", "시트가 …", "학종은 …"): the sentence is about the world, not
- * the assistant's work — checked. "제가"/"저는" and the verb form "…는 중" are the assistant.
+ * A sentence that only says the assistant works on the material: a predicate of `WORK_PREDICATE`, and before it
+ * nothing but the assistant as subject ("제가/저는"), the listed adverbs, objects ("…을/를", "…의") and bare nouns.
+ * Any other word with a particle — a subject that is not the assistant ("교육부도 지원서를 검토하고 있어요", "대학
+ * 측에선 …", "경쟁률이 …") — and the sentence states something: checked.
  */
-const AGENT_WORDS = /^(?:제가|저는|저도|지금은|이제는)$/u;
-const ACTION_FORM = new RegExp(`^${ACTION}는$`, "u");
-const hasOtherSubject = (s: string) =>
-  s
-    .split(/\s+/u)
-    .slice(0, -1)
-    .some((w) => /[이가은는]$/u.test(w) && !AGENT_WORDS.test(w) && !ACTION_FORM.test(w));
+function isWorkNote(sentence: string): boolean {
+  const m = WORK_PREDICATE.exec(sentence);
+  if (!m) return false;
+  const words = sentence.slice(0, m.index).split(/\s+/u).filter(Boolean);
+  return words.every(
+    (w) => AGENT.test(w) || WORK_ADVERBS.has(w) || /[을를의]$/u.test(w) || !PARTICLE_END.test(w),
+  );
+}
 
 /** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
 const CONNECTIVE =
@@ -108,10 +125,10 @@ const FOUND = /(?:것을|걸|점을|사실을|내용을)\s/u;
  * Paragraphs that state something before a tool call are still checked.
  *
  * Between tool calls (#202 — the model narrating its work: "파일을 다 읽었어요. 이제 입결 시트를 확인하고 있어요."):
- * a short paragraph before a later tool call, no figure, up to three sentences, each one saying what the assistant
- * will do, or is doing / has just done **to the material** (read, search, check, compare … — `ACTION`), with no
- * other subject — never one that states something (a joined clause, "…다는", "…것을", "경쟁률이 …하고 있어요").
- * When in doubt it is checked.
+ * a short paragraph before a later tool call, no figure, up to three sentences, each one only saying that the
+ * assistant (subject left out, or "제가/저는") will do, is doing or has done its work on the material (`isWorkNote`)
+ * — never one that states something (another subject, a complement "…다는", "…것을", a comma). When in doubt it is
+ * checked.
  */
 export function isProgressNote(
   text: string,
@@ -132,12 +149,7 @@ export function isProgressNote(
   return (
     sentences.length > 0 &&
     sentences.length <= 3 &&
-    sentences.every((s) => {
-      // "확인하고 있어요": the auxiliary is not a joined clause.
-      const bare = s.replace(/고\s*있(?:어요|습니다)$/u, "");
-      if (CONNECTIVE.test(bare) || COMPLEMENT.test(s) || FOUND.test(s) || hasOtherSubject(s)) return false;
-      return PROGRESS.test(s) || ONGOING.test(s) || STEP_DONE.test(s);
-    })
+    sentences.every((s) => !COMPLEMENT.test(s) && !FOUND.test(s) && !/[,;:]/u.test(s) && isWorkNote(s))
   );
 }
 

@@ -1,3 +1,9 @@
+import type { Nodes, Parents, RootContent } from "mdast";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { mathFromMarkdown } from "mdast-util-math";
+import { gfm } from "micromark-extension-gfm";
+import { math } from "micromark-extension-math";
 import { z } from "zod";
 import { FINANCE_DISCLAIMER } from "./finance.js";
 import { FileLocator } from "./locators.js";
@@ -154,17 +160,11 @@ export type CiteResult = {
 // ---- the answer text: paragraphs and markers (same rules on the server and in the browser) ------------------
 
 export type CitationUnitKind = "body" | "heading" | "lead_in" | "disclaimer" | "code" | "rule";
-export type CitationUnit = TextRange & { kind: CitationUnitKind };
+/** `table`: a GFM table, one unit whatever its rows look like (#202). */
+export type CitationUnit = TextRange & { kind: CitationUnitKind; table?: true };
 
-const LIST_ITEM = /^\s{0,3}(?:[-*+•·]|\d{1,3}[.)])\s+\S/;
-const HEADING = /^\s{0,3}#{1,6}\s+\S/;
-/** A line that is only bold text (a heading written as `**제목**`). */
+/** A paragraph that is only bold text (a heading written as `**제목**`). */
 const BOLD_LINE = /^\s*(\*\*|__)[^\n]{1,80}?\1\s*[:：]?\s*$/;
-const FENCE = /^\s{0,3}(```|~~~)/;
-const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
-const TABLE = /^\s*\|/;
-/** A GFM delimiter row (`|---|:--:|`, `--- | ---`): a table even when its rows have no leading `|`. */
-const DELIMITER_ROW = /^(?=[^\n]*\|)(?=[^\n]*-{3})[ \t|:-]+$/;
 const LEAD_IN = /[:：]\s*$/;
 
 const SENTENCES = /(?<=[.!?。！？])\s+/u;
@@ -204,103 +204,86 @@ function isDisclaimer(t: string): boolean {
 }
 
 /**
- * The answer split into units the missing-citation check looks at: paragraphs (blank-line separated), list items
- * and tables are `body` — unless a paragraph is a short line ending with a colon right before a list or table
- * (`lead_in`) or a disclaimer. Headings (`#`, a bold-only line), rules and fenced code are never body.
+ * The answer as the chat screen's markdown renderer parses it (#202, review 2차): the same parser family as
+ * react-markdown with remark-gfm and remark-math (mdast-util-from-markdown + the GFM and math extensions, the same
+ * locked versions) — so tables, lists, quotes, code, math and raw HTML are the blocks the user sees, with their
+ * source positions (UTF-16 offsets of the answer text, CRLF included).
+ */
+const parseAnswer = (text: string) =>
+  fromMarkdown(text, {
+    extensions: [gfm(), math()],
+    mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
+  });
+
+const startOf = (n: Nodes) => n.position?.start.offset;
+const endOf = (n: Nodes) => n.position?.end.offset;
+
+/**
+ * The answer split into units the missing-citation check looks at, from the rendered blocks (`parseAnswer`):
+ * - a paragraph is `body` — or `lead_in` (one short line ending with a colon right before a list or table), a
+ *   `disclaimer`, or a `heading` when it is only bold text;
+ * - a list item is `body` from its marker to the end of its first paragraph; its other paragraphs are units of
+ *   their own, its nested lists are items of their own;
+ * - a table is one `body` unit (`table: true`), whatever its rows look like;
+ * - raw HTML (shown as text) is `body`; headings are `heading`, rules `rule`, code blocks (fenced or indented) and
+ *   math blocks `code`; quotes and footnotes are looked into; link definitions are nothing.
  */
 export function citationUnits(text: string): CitationUnit[] {
   const out: CitationUnit[] = [];
-  type Block = { start: number; end: number; type: "para" | "item" | "table" };
-  // `gfm`: the current table is a GFM table (a header row, then a delimiter row): every following non-blank line
-  // that starts no other block is one of its rows, with or without a leading `|` (#202, review 1차).
-  const st: { cur: Block | null; fence: number | null; gfm: boolean } = {
-    cur: null,
-    fence: null,
-    gfm: false,
+  const add = (kind: CitationUnitKind, start: number | undefined, end: number | undefined, table = false) => {
+    if (start === undefined || end === undefined || end <= start) return;
+    out.push({ start, end, kind, ...(table ? { table: true as const } : {}) });
   };
-  const flush = () => {
-    const c = st.cur;
-    if (c) out.push({ start: c.start, end: c.end, kind: c.type === "para" ? "lead_in" : "body" });
-    st.cur = null;
+  const paragraph = (start: number | undefined, end: number | undefined, next: RootContent | undefined) => {
+    if (start === undefined || end === undefined) return;
+    const t = text.slice(start, end).trim();
+    if (!t.includes("\n") && BOLD_LINE.test(t)) return add("heading", start, end);
+    if (isDisclaimer(t)) return add("disclaimer", start, end);
+    const lead =
+      LEAD_IN.test(t) &&
+      !/[\r\n]/.test(t) &&
+      t.length <= 120 &&
+      (next?.type === "list" || next?.type === "table");
+    add(lead ? "lead_in" : "body", start, end);
   };
-  let pos = 0;
-  for (;;) {
-    const nl = text.indexOf("\n", pos);
-    const end = nl === -1 ? text.length : nl;
-    const line = text.slice(pos, end);
-    const c = st.cur;
-    const nextEnd = nl === -1 ? -1 : text.indexOf("\n", nl + 1);
-    const nextLine = nl === -1 ? "" : text.slice(nl + 1, nextEnd === -1 ? text.length : nextEnd);
-    if (st.gfm && c?.type === "table") {
-      if (
-        line.trim() &&
-        !FENCE.test(line) &&
-        !HEADING.test(line) &&
-        !LIST_ITEM.test(line) &&
-        !RULE.test(line) &&
-        !/^\s{0,3}>/.test(line)
-      ) {
-        c.end = end;
-        if (nl === -1) break;
-        pos = nl + 1;
-        continue;
+  const blocks = (parent: Parents) => {
+    const kids = parent.children as RootContent[];
+    kids.forEach((n, i) => {
+      const next = kids[i + 1];
+      switch (n.type) {
+        case "paragraph":
+          return paragraph(startOf(n), endOf(n), next);
+        case "heading":
+          return add("heading", startOf(n), endOf(n));
+        case "thematicBreak":
+          return add("rule", startOf(n), endOf(n));
+        case "code":
+        case "math":
+          return add("code", startOf(n), endOf(n));
+        case "html":
+          return add("body", startOf(n), endOf(n));
+        case "table":
+          return add("body", startOf(n), endOf(n), true);
+        case "list":
+          for (const item of n.children) {
+            const [first, ...rest] = item.children;
+            if (first?.type === "paragraph") {
+              // The item's own text: from its marker, so the screen's list item starts inside it.
+              paragraph(startOf(item), endOf(first), rest[0]);
+              blocks({ ...item, children: rest } as Parents);
+            } else blocks(item);
+          }
+          return;
+        case "blockquote":
+        case "footnoteDefinition":
+          return blocks(n);
+        default:
+          return; // link definitions and anything else that is not shown as a block of text
       }
-      st.gfm = false;
-    }
-    if (st.fence !== null) {
-      if (FENCE.test(line)) {
-        out.push({ start: st.fence, end, kind: "code" });
-        st.fence = null;
-      }
-    } else if (FENCE.test(line)) {
-      flush();
-      st.fence = pos;
-    } else if (!line.trim()) flush();
-    else if (HEADING.test(line) || BOLD_LINE.test(line)) {
-      flush();
-      out.push({ start: pos, end, kind: "heading" });
-    } else if (RULE.test(line)) {
-      flush();
-      out.push({ start: pos, end, kind: "rule" });
-    } else if (line.includes("|") && DELIMITER_ROW.test(nextLine)) {
-      // A GFM table's header row: the table is one unit from here (rows without an outer `|` too).
-      flush();
-      st.cur = { start: pos, end, type: "table" };
-      st.gfm = true;
-    } else if (TABLE.test(line)) {
-      if (c?.type === "table") c.end = end;
-      else {
-        flush();
-        st.cur = { start: pos, end, type: "table" };
-      }
-    } else if (LIST_ITEM.test(line)) {
-      flush();
-      st.cur = { start: pos, end, type: "item" };
-    } else if (c && (c.type === "para" || (c.type === "item" && /^\s/.test(line)))) c.end = end;
-    else {
-      flush();
-      st.cur = { start: pos, end, type: "para" };
-    }
-    if (nl === -1) break;
-    pos = nl + 1;
-  }
-  flush();
-  if (st.fence !== null) out.push({ start: st.fence, end: text.length, kind: "code" });
-  // `flush` marked every paragraph `lead_in` provisionally: decide now that the next unit is known.
-  return out.map((u, i) => {
-    if (u.kind !== "lead_in") {
-      const t = text.slice(u.start, u.end).trim();
-      return u.kind === "body" && isDisclaimer(t) ? { ...u, kind: "disclaimer" } : u;
-    }
-    const t = text.slice(u.start, u.end).trim();
-    if (isDisclaimer(t)) return { ...u, kind: "disclaimer" };
-    const next = out[i + 1];
-    const beforeList =
-      next?.kind === "body" &&
-      (LIST_ITEM.test(text.slice(next.start, next.end)) || isTableText(text.slice(next.start, next.end)));
-    const lead = LEAD_IN.test(t) && !t.includes("\n") && t.length <= 120 && beforeList;
-    return { ...u, kind: lead ? "lead_in" : "body" };
-  });
+    });
+  };
+  blocks(parseAnswer(text));
+  return out.sort((a, b) => a.start - b.start);
 }
 
 export type CitationMarker = TextRange & { n: number };
@@ -370,12 +353,6 @@ export function sentenceEndMarkers(text: string): CitationMarker[] {
   return out;
 }
 
-/** A table unit (#202): its first line starts with `|`, or its second line is a delimiter row. */
-export function isTableText(unit: string): boolean {
-  const lines = unit.replace(/^\s*\n/, "").split("\n");
-  return TABLE.test(lines[0] ?? "") || DELIMITER_ROW.test(lines[1] ?? "");
-}
-
 /**
  * A line right after a table that says where it is from: `출처: …`, `(자료: …)`, `※ …`, `표 1. …`, `표 1 전형별 인원`.
  */
@@ -396,29 +373,74 @@ const OPINION_TAIL = new RegExp(
   "u",
 );
 
-const LIST_MARKER = /^\s*(?:[-*+•·]|\d{1,3}[.)])\s+/u;
+const LIST_MARKER = /^\s*(?:[-*+]|\d{1,9}[.)])\s+/u;
 /** A list item's leading label: bold text ending in a colon (`**추천:**`, `**추천**:`) — only that, never a sentence. */
 const ITEM_LABEL = /^(\*\*|__)[^*_\n]{1,20}?[:：]\1\s*|^(\*\*|__)[^*_\n]{1,20}?\2\s*[:：]\s*/u;
 
+const TERMINAL = /[.!?。！？]/u;
+/** What may close a sentence after its punctuation: brackets, quotes, emphasis (`…같아요[1].**`). */
+const CLOSER = /[)\]"'”’」』*_~]/u;
+const WORD = /[A-Za-z0-9]/;
+
 /**
- * The sentences of a unit (#202): line by line — a list item's marker and its leading label (`- **추천:** …`) are
- * not part of it — then at sentence punctuation, with or without a space after it (`마감됐어요.더 볼까요?` is two
- * sentences; `2.0`, `12.3` are not cut). Emphasis marks are dropped, the words kept.
+ * The one sentence boundary of the missing-citation rules (#202, review 2차) — the opinion check, the closing-offer
+ * and progress-note checks and "the sentence right before a table" all use it. A sentence ends at `.`, `!`, `?`
+ * (and their full-width forms), taking along more of them, closing brackets, quotes and emphasis marks and the
+ * citation markers right after (`…했어요.[1]`, `…같아요[1].**`) — whatever follows, a space or not
+ * (`유리해요.2027년 …`, `유리해요!30명 …` are two sentences). Not a boundary: a `.` between two ASCII letters or digits
+ * (`3.5`, `Node.js`, `example.com`). A line break is a boundary. Ranges of `t`, trimmed, never empty.
+ */
+export function sentenceSpans(t: string): TextRange[] {
+  const out: TextRange[] = [];
+  let start = 0;
+  const push = (end: number) => {
+    const s = t.slice(start, end);
+    const lead = s.length - s.trimStart().length;
+    const body = s.trim();
+    if (body) out.push({ start: start + lead, end: start + lead + body.length });
+    start = end;
+  };
+  for (let i = 0; i < t.length;) {
+    const ch = t[i]!;
+    if (ch === "\n") {
+      push(i);
+      start = ++i;
+      continue;
+    }
+    if (TERMINAL.test(ch) && !(ch === "." && WORD.test(t[i - 1] ?? "") && WORD.test(t[i + 1] ?? ""))) {
+      let j = i + 1;
+      for (;;) {
+        if (j < t.length && (TERMINAL.test(t[j]!) || CLOSER.test(t[j]!))) j++;
+        else {
+          const m = /^\[\d{1,3}\]/.exec(t.slice(j));
+          if (!m) break;
+          j += m[0].length;
+        }
+      }
+      push(j);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  push(t.length);
+  return out;
+}
+
+/**
+ * The sentences of a unit (#202): line by line — a list item's marker and its leading label (`- **추천:** …`) and a
+ * quote's `>` are not part of it — cut by `sentenceSpans`. Emphasis marks are dropped, the words kept.
  */
 export function unitSentences(t: string): string[] {
   return t
-    .split(/\n+/u)
+    .split(/\r?\n/u)
     .flatMap((raw) => {
-      const item = LIST_MARKER.exec(raw);
-      const line = item ? raw.slice(item[0].length).replace(ITEM_LABEL, "") : raw;
-      return line.split(/(?<=[.!?。！？])(?![\d.!?。！？])\s*/u);
+      const quoted = raw.replace(/^[\s>]+/u, "");
+      const item = LIST_MARKER.exec(quoted);
+      const line = item ? quoted.slice(item[0].length).replace(ITEM_LABEL, "") : quoted;
+      return sentenceSpans(line).map((r) => line.slice(r.start, r.end));
     })
-    .map((s) =>
-      s
-        .replace(/\*\*|__/gu, "")
-        .replace(/^[\s>]+/u, "")
-        .trim(),
-    )
+    .map((s) => s.replace(/\*\*|__/gu, "").trim())
     .filter(Boolean);
 }
 
@@ -434,14 +456,10 @@ export function isFramedOpinion(unit: string): boolean {
   return sentences.length > 0 && sentences.every((s) => OPINION_LEAD.test(s) || OPINION_TAIL.test(s));
 }
 
-/** The last sentence of a unit, as a range of the answer text. */
+/** The last sentence of a unit (`sentenceSpans`), as a range of the answer text. */
 function lastSentence(text: string, u: TextRange): TextRange {
-  const t = text.slice(u.start, u.end).replace(/\s+$/u, "");
-  let at = 0;
-  // A sentence ends at its punctuation (and the markers right after it), with or without a space (#202).
-  for (const m of t.matchAll(/[.!?。！？]+(?:\[\d{1,3}\])*(?!\d)\s*|\n+/gu))
-    if (m.index + m[0].length < t.length) at = m.index + m[0].length;
-  return { start: u.start + at, end: u.start + t.length };
+  const last = sentenceSpans(text.slice(u.start, u.end)).at(-1);
+  return last ? { start: u.start + last.start, end: u.start + last.end } : { start: u.end, end: u.end };
 }
 
 /**
@@ -461,20 +479,20 @@ export function uncitedUnits(text: string): TextRange[] {
       prev &&
       prev.kind !== "code" &&
       prev.kind !== "rule" &&
-      !isTableText(text.slice(prev.start, prev.end)) &&
+      !prev.table &&
       cited(lastSentence(text, prev))
     )
       return true;
     const next = units[i + 1];
     if (!next || next.kind === "code" || next.kind === "rule") return false;
     const t = text.slice(next.start, next.end).trim();
-    return !t.includes("\n") && t.length <= 160 && CAPTION.test(t) && cited(next);
+    return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(next);
   };
   return units
     .filter((u, i) => {
       if (u.kind !== "body" || cited(u)) return false;
       const t = text.slice(u.start, u.end);
-      if (isTableText(t)) return !tableCited(i);
+      if (u.table) return !tableCited(i);
       return !isFramedOpinion(t);
     })
     .map(({ start, end }) => ({ start, end }));

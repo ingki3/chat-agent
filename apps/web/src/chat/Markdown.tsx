@@ -19,7 +19,7 @@ import { MermaidBlock } from "./MermaidBlock.js";
 import type { TextRange } from "@agentlee/shared";
 import { CITATION_MISSING_MARK } from "@agentlee/shared";
 import { rehypeCitationMarkers, rehypeMissingMarks } from "../citations/markdown.js";
-import { marksChanged } from "../citations/marks.js";
+import { markEffect } from "../citations/marks.js";
 import "katex/dist/katex.min.css";
 
 /**
@@ -190,11 +190,12 @@ export const MarkdownBlock = memo(function MarkdownBlock({
       cite
         ? {
             rehype: [
-              ...(rehypePlugins ?? []),
-              rehypeCitationMarkers(cite.numbers),
+              // First, while every element still has its source position (#202 review 2차).
               ...(cite.missing?.length && cite.markId
                 ? [rehypeMissingMarks(cite.missing, offset, offset + text.length, cite.markId)]
                 : []),
+              ...(rehypePlugins ?? []),
+              rehypeCitationMarkers(cite.numbers),
             ],
             components: {
               ...components,
@@ -213,11 +214,9 @@ export const MarkdownBlock = memo(function MarkdownBlock({
         : undefined,
     [cite, offset, text],
   );
-  // Its marks are drawn: the answer's summary line may move to them now (#202).
+  // Its marks are drawn — or gone again (review 2차): the answer's summary line checks for them either way.
   const marked = !!(cite?.missing?.length && cite.markId);
-  useEffect(() => {
-    if (marked) marksChanged();
-  }, [marked, withCite]);
+  useEffect(() => markEffect(marked), [marked, withCite]);
   return (
     <BlockText.Provider value={text}>
       <ReactMarkdown

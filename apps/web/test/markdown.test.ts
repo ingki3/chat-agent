@@ -306,16 +306,59 @@ describe("one focus target per range, whatever the shape (#202 review 1차)", ()
       expect(ranges.length, parts.join("|")).toBeGreaterThan(0);
       const html = renderParts(parts, ranges);
       expect(html.split('data-cite-missing="m1"').length - 1, parts.join("|")).toBe(ranges.length);
+      // Each target is its own range's text, in the ranges' order.
+      const all = parts.join("");
+      const words = (t: string) => t.replace(/[^가-힣a-z0-9]+/gi, "");
+      targets(html).forEach((got, k) => {
+        const want = words(
+          all
+            .slice(ranges[k]!.start, ranges[k]!.end)
+            .replace(/\[\d+\]/g, "")
+            .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, ""),
+        );
+        expect(want.startsWith(words(got).slice(0, 4)), `${parts.join("|")} #${k}: ${got}`).toBe(true);
+      });
     }
   });
-  it("blocks without a paragraph element are wrapped as their range's target: math, indented code, raw HTML", () => {
-    const at = (parts: string[]) => renderParts(parts, uncitedUnits(parts.join("")));
-    expect(at(CORPUS[3]!)).toMatch(/cite-missing-wrap"[^>]*><span class="katex-display">/);
-    expect(at(CORPUS[4]!)).toMatch(/cite-missing-wrap"[^>]*><div class="codeblk">/);
-    expect(at(CORPUS[5]!)).toMatch(/cite-missing-wrap"[^>]*>&lt;div&gt;원시 HTML/);
-    // A paragraph cut by a tool call: one target where it starts, the bar on the rest.
-    const cut = at(CORPUS[2]!);
-    expect(cut).toMatch(/<p class="cite-missing-block" data-cite-missing="m1"[^>]*>앞 문장이고/);
+  /** Each target's text (tags dropped, the ⚠️ out), in document order. */
+  const targets = (html: string) =>
+    html
+      .split('data-cite-missing="m1"')
+      .slice(1)
+      .map((rest) => {
+        const seg = rest.slice(0, rest.indexOf("⚠️"));
+        const ann = /<annotation[^>]*>([^<]*)<\/annotation>/.exec(seg);
+        const t = ann ? ann[1]! : seg.replace(/^[^>]*>/, "").replace(/<[^>]+>/g, "");
+        // A code block's header ("code", "⧉ 복사") is not its text.
+        return t
+          .replace(/^code⧉ 복사/, "")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .trim();
+      });
+
+  it("old ranges over blocks without a paragraph element: the block at that source position, in order", () => {
+    // Ranges as an older server stored them (math and code were body then). `[x]: …` keeps the answer one block,
+    // so both formulas go through KaTeX in the same tree (review 2차: the second must not point at the first).
+    const text =
+      "가[1].\n\n$$\na = b\n$$\n\n$$\nx = y\n$$\n\n    들여쓴 코드 줄\n\n<div>원시 HTML</div>\n\n[x]: https://e.example";
+    const at = (s: string) => ({ start: text.indexOf(s), end: text.indexOf(s) + s.length });
+    const ranges = [
+      at("$$\na = b\n$$"),
+      at("$$\nx = y\n$$"),
+      at("    들여쓴 코드 줄"),
+      at("<div>원시 HTML</div>"),
+    ];
+    const html = renderParts([text], ranges);
+    expect(targets(html)).toEqual(["a = b", "x = y", "들여쓴 코드 줄", "<div>원시 HTML</div>"]);
+    expect(html).toMatch(/cite-missing-wrap"[^>]*><span class="katex-display">/);
+    expect(html).toMatch(/cite-missing-wrap"[^>]*><div class="codeblk">/);
+  });
+
+  it("a paragraph cut by a tool call: one target where it starts, the bar on the rest", () => {
+    const parts = CORPUS[2]!;
+    const cut = renderParts(parts, uncitedUnits(parts.join("")));
+    expect(targets(cut)).toEqual(["앞 문장이고"]);
     expect(cut).toMatch(/<p class="cite-missing-block">뒤 문장이에요\./);
   });
 });

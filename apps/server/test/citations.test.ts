@@ -1906,6 +1906,60 @@ describe("citationNote", () => {
       ).toEqual([table]);
     });
 
+    it("review 2차: only the assistant's own work is a progress note; one sentence boundary everywhere", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      for (const note of [
+        "교육부도 지원서를 검토하고 있어요.",
+        "대학 측에선 지원서를 검토하고 있어요.",
+        "교육부가 지원서를 검토하고 있어요.",
+        "입학처는 서류를 확인했어요.",
+        "자료를 읽고 경쟁률이 올랐어요.",
+      ])
+        expect(between(note), note).toEqual([note]);
+      for (const note of [
+        "제가 두 자료를 같이 비교하고 있어요.",
+        "저는 이제 시행계획을 확인해 볼게요.",
+        "자료를 다시 찾아 볼게요.",
+        "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.",
+      ])
+        expect(between(note), note).toEqual([]);
+      // A sentence glued after punctuation is a sentence, a digit or a letter next.
+      for (const p of [
+        "제 판단으로는 학종이 유리해요.2027년 모집은 끝났습니다.",
+        "제 판단으로는 학종이 유리해요!30명이 합격했습니다.",
+        "제 판단으로는 학종이 유리해요.KAIST도 같아요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // Not a boundary: a period inside a word or a number.
+      for (const p of ["제 생각에는 Node.js가 적합해요.", "제 판단으로는 3.5등급이면 충분해요."])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([]);
+      // The sentence right before a table: the last one, glued to a digit; closing emphasis belongs to it.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`지원자가 늘었어요[1].2027년 기준은 다음과 같아요.\n\n${table}`)]),
+      ).toEqual([table]);
+      expect(missingOf([...read("a"), ...text(`**입결은 다음과 같아요[1].**\n\n${table}`)])).toEqual([]);
+    });
+
+    it("review 2차: the blocks are the renderer's — table shapes, CRLF, HTML after a table", () => {
+      const lead = "입결은 아래와 같아요[1].\n\n";
+      for (const t of [
+        "| a | b |\n|-|-|\n| 1 | 2 |",
+        "a | b\n-|-\n1 | 2",
+        "| a | b |\r\n|---|---|\r\n| 1 | 2 |",
+        "모집 인원\n|---|\n30명",
+      ])
+        expect(missingOf([...read("a"), ...text(lead + t)]), JSON.stringify(t)).toEqual([]);
+      // CRLF: ranges are offsets of the text as stored.
+      const crlf = "가[1].\r\n\r\n나는 출처가 없어요.\r\n";
+      expect(missingOf([...read("a"), ...text(crlf)])).toEqual(["나는 출처가 없어요."]);
+      // Raw HTML right after a cited table is its own block (shown as text outside the table): checked.
+      expect(
+        missingOf([...read("a"), ...text(`${lead}| a |\n|---|\n| 1 |\n<div>추가 합격자는 없습니다.</div>`)]),
+      ).toEqual(["<div>추가 합격자는 없습니다.</div>"]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [
