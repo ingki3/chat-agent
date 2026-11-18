@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MEMORY_APPLY_MODE_LABEL, MemoryApplyMode, type MemoryPrefs } from "@agentlee/shared";
 import { errorText, MEMORY_PREFS_KEY, memoryPrefs } from "../api.js";
-import { applySaved, keepNewest, newer } from "./rev.js";
+import { applySaved, modeFromGet, modeFromPut, sharing } from "./rev.js";
 
 const HELP: Record<MemoryApplyMode, string> = {
   review: '대화 중 "기억해줘·잊어줘"는 답 아래 카드에서 반영을 눌러야 바뀌어요.',
@@ -19,7 +19,7 @@ export function MemoryModeSetting() {
   const q = useQuery({
     queryKey: MEMORY_PREFS_KEY,
     queryFn: memoryPrefs.get,
-    structuralSharing: keepNewest<MemoryPrefs>(),
+    structuralSharing: sharing(modeFromGet),
   });
   // The choice shows at once while it is being saved; then the cache (which holds the save's answer, or — refused —
   // the newest stored value) shows again.
@@ -27,7 +27,7 @@ export function MemoryModeSetting() {
   const save = useMutation({
     mutationFn: (m: MemoryApplyMode) => memoryPrefs.set(m),
     onMutate: (m) => setPicked(m),
-    onSuccess: (v) => applySaved<MemoryPrefs>(qc, MEMORY_PREFS_KEY, (old) => newer(old, v)),
+    onSuccess: (v) => applySaved<MemoryPrefs>(qc, MEMORY_PREFS_KEY, (old) => modeFromPut(old, v)),
     onSettled: () => setPicked(undefined),
   });
   const mode = picked ?? q.data?.applyMode;

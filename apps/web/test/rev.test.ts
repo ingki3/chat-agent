@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { DreamingAdmin, DreamingUserStatus } from "@agentlee/shared";
-import { newer, newerAdmin, newerUser, withUser } from "../src/instructions/rev.js";
+import type { DreamingAdmin, DreamingUserStatus, MemoryPrefs, MyDreaming } from "@agentlee/shared";
+import {
+  adminConfigFromPut,
+  adminFromGet,
+  mineFromGet,
+  mineFromPut,
+  modeFromGet,
+  modeFromPut,
+  newer,
+  rowFromPut,
+} from "../src/instructions/rev.js";
 
 /** Review #195 round 9: the page keeps the newest revision of each resource — the server orders the writes. */
 type R = { rev: number; v: boolean };
@@ -72,44 +81,135 @@ describe("newest revision wins", () => {
   });
 });
 
-describe("the admin view merges per resource", () => {
-  const user = (o: Partial<DreamingUserStatus>): DreamingUserStatus => ({
-    userId: "u",
-    rev: 1,
-    applyModeRev: 1,
-    name: "아들",
-    active: true,
-    youth: true,
-    enabled: false,
-    settings: { enabled: false, time: "03:00", runtime: null, connectionId: null, model: null },
-    customPrompt: false,
-    applyMode: "review",
-    problem: null,
-    time: null,
-    today: null,
-    last: null,
-    ...o,
-  });
-  const view = (o: Partial<DreamingAdmin>): DreamingAdmin => ({
-    config: { enabled: true, tokenCap: 300_000, allowed: [] },
-    configRev: 1,
-    unavailable: [],
-    candidates: [],
-    users: [user({})],
-    manualRuns: false,
-    ...o,
+const user = (o: Partial<DreamingUserStatus>): DreamingUserStatus => ({
+  userId: "u",
+  rev: 1,
+  applyModeRev: 1,
+  name: "아들",
+  active: true,
+  youth: true,
+  enabled: false,
+  settings: { enabled: false, time: "03:00", runtime: null, connectionId: null, model: null },
+  customPrompt: false,
+  applyMode: "review",
+  problem: null,
+  time: null,
+  today: null,
+  last: null,
+  ...o,
+});
+const view = (o: Partial<DreamingAdmin>): DreamingAdmin => ({
+  config: { enabled: true, tokenCap: 300_000, allowed: [] },
+  configRev: 1,
+  unavailable: [],
+  candidates: [],
+  users: [user({})],
+  manualRuns: false,
+  ...o,
+});
+const FAKE = { runtime: "claude-code" as const, connectionId: null, model: "fake-large" };
+const mine = (o: Partial<MyDreaming>): MyDreaming => ({
+  rev: 3,
+  enabled: true,
+  time: "03:00",
+  settings: { enabled: true, time: "03:00", ...FAKE },
+  canEdit: true,
+  problem: null,
+  choices: [{ ...FAKE, label: "Fake · Large" }],
+  prompt: { content: "A", custom: true, defaultContent: "D", fixedRules: "R", updatedAt: 1 },
+  runs: [],
+  proposals: [],
+  ...o,
+});
+
+describe("stored settings by revision, live state only from GETs (review 10)", () => {
+  it("server_off after a delayed prompt save: the late PUT answer (same rev) keeps the GET's live state", () => {
+    // The prompt PUT stored rev 3 and is slow to answer; the admin turns the server off; a GET (rev 3) shows it.
+    const get = mine({ enabled: false, time: null, problem: "server_off" });
+    const put = mine({
+      prompt: { content: "B", custom: true, defaultContent: "D", fixedRules: "R", updatedAt: 2 },
+    });
+    const after = mineFromPut(get, put);
+    expect(after).toMatchObject({ enabled: false, time: null, problem: "server_off", rev: 3 });
+    expect(after.prompt.content).toBe("B");
   });
 
-  it("config, a youth row's settings and its 반영 방식 each by their own revision", () => {
+  it("a connection deleted: the GET's choices and problem stay; a late settings PUT updates only the settings", () => {
+    const get = mine({ rev: 4, choices: [], problem: "unavailable", enabled: false, time: null });
+    const put = mine({ rev: 4, settings: { enabled: true, time: "05:00", ...FAKE } });
+    const after = mineFromPut(get, put);
+    expect(after).toMatchObject({ choices: [], problem: "unavailable", enabled: false });
+    expect(after.settings.time).toBe("05:00");
+    // A PUT answer older than the cache changes nothing.
+    expect(mineFromPut(get, mine({ rev: 2, settings: { enabled: false, time: "01:00", ...FAKE } }))).toBe(
+      get,
+    );
+  });
+
+  it("a GET that read pre-save settings keeps the saved settings but brings its newer live state", () => {
+    const saved = mine({ rev: 5, settings: { enabled: true, time: "06:00", ...FAKE } });
+    const staleGet = mine({
+      rev: 4,
+      settings: { enabled: true, time: "03:00", ...FAKE },
+      problem: "server_off",
+    });
+    const after = mineFromGet(saved, staleGet);
+    expect(after).toMatchObject({ rev: 5, problem: "server_off" });
+    expect(after.settings.time).toBe("06:00");
+  });
+
+  it("기억 반영 방식: `locked` is live (from GETs), the mode stored", () => {
+    const get: MemoryPrefs = { applyMode: "review", rev: 2, locked: true };
+    const latePut: MemoryPrefs = { applyMode: "auto", rev: 2 };
+    expect(modeFromPut(get, latePut)).toEqual({ applyMode: "auto", rev: 2, locked: true });
+    expect(modeFromGet({ applyMode: "auto", rev: 3 }, { applyMode: "review", rev: 2, locked: true })).toEqual(
+      {
+        applyMode: "auto",
+        rev: 3,
+        locked: true,
+      },
+    );
+  });
+
+  it("youth turned off, then a late youth-row PUT: the row keeps `youth: false` (and status/problem) from the GET", () => {
+    const get = view({ users: [user({ youth: false, problem: "no_choice", rev: 2 })] });
+    const late = user({ youth: true, problem: null, rev: 2, enabled: true });
+    const after = rowFromPut(get, late)!;
+    expect(after.users[0]).toMatchObject({ youth: false, problem: "no_choice", enabled: true, rev: 2 });
+  });
+
+  it("the admin's config save answer: only the config — users, candidates and problems stay the GET's", () => {
+    const get = view({ unavailable: [FAKE], users: [user({ problem: "unavailable" })] });
+    const put = view({
+      config: { enabled: false, tokenCap: 300_000, allowed: [] },
+      configRev: 2,
+      unavailable: [],
+    });
+    const after = adminConfigFromPut(get, put);
+    expect(after).toMatchObject({ configRev: 2, config: { enabled: false }, unavailable: [FAKE] });
+    expect(after.users[0]!.problem).toBe("unavailable");
+  });
+});
+
+describe("the admin view merges per resource", () => {
+  it("config, a row's settings and its 반영 방식 each by their own revision; live parts from the GET", () => {
     const saved = view({ config: { enabled: false, tokenCap: 300_000, allowed: [] }, configRev: 3 });
-    const staleGet = view({ users: [user({ applyMode: "auto", applyModeRev: 2 })] });
-    const merged = newerAdmin(saved, staleGet);
-    expect(merged.config.enabled).toBe(false);
-    expect(merged.configRev).toBe(3);
-    expect(merged.users[0]).toMatchObject({ applyMode: "auto", applyModeRev: 2 });
-    // A youth save's answer (settings rev 2) into the view; an older one afterwards is ignored.
-    const on = withUser(merged, user({ rev: 2, enabled: true, applyMode: "review", applyModeRev: 1 }))!;
-    expect(on.users[0]).toMatchObject({ rev: 2, enabled: true, applyMode: "auto", applyModeRev: 2 });
-    expect(newerUser(on.users[0], user({ rev: 1 }))).toMatchObject({ rev: 2, enabled: true });
+    const staleGet = view({ users: [user({ applyMode: "auto", applyModeRev: 2, today: "done" })] });
+    const merged = adminFromGet(saved, staleGet);
+    expect(merged).toMatchObject({ configRev: 3, config: { enabled: false } });
+    expect(merged.users[0]).toMatchObject({ applyMode: "auto", applyModeRev: 2, today: "done" });
+    const on = rowFromPut(merged, user({ rev: 2, enabled: true, applyMode: "review", applyModeRev: 1 }))!;
+    expect(on.users[0]).toMatchObject({
+      rev: 2,
+      enabled: true,
+      applyMode: "auto",
+      applyModeRev: 2,
+      today: "done",
+    });
+    // An older row in a later GET does not take the saved settings back.
+    expect(adminFromGet(on, view({ users: [user({ rev: 1 })] })).users[0]).toMatchObject({
+      rev: 2,
+      enabled: true,
+    });
   });
 });

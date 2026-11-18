@@ -17,7 +17,7 @@ import {
 } from "@agentlee/shared";
 import { dreaming, DREAMING_KEY, errorText } from "../api.js";
 import { afterSave, settleDraft, withDraft } from "./draft.js";
-import { applySaved, keepNewest, newer } from "./rev.js";
+import { applySaved, mineFromGet, mineFromPut, sharing } from "./rev.js";
 import { MemoryCard } from "./MemoryCard.js";
 
 /**
@@ -32,7 +32,7 @@ export function DreamingPanel() {
   const q = useQuery({
     queryKey: DREAMING_KEY,
     queryFn: dreaming.mine,
-    structuralSharing: keepNewest<MyDreaming>(),
+    structuralSharing: sharing(mineFromGet),
   });
   const d = q.data;
   // A failed refetch keeps the form (and its drafts) on the data we have, with the error above it (review #195 5).
@@ -189,7 +189,7 @@ function Settings({ view }: { view: MyDreaming }) {
   // The answer (the stored settings and their revision) goes into the cache unless something newer is there (rev.ts).
   const save = useMutation({
     mutationFn: (s: SaveDreamingSettingsRequest) => dreaming.save(s),
-    onSuccess: (v) => applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => newer(old, v)),
+    onSuccess: (v) => applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => mineFromPut(old, v)),
   });
   return (
     <section className="dream-section" aria-labelledby="dream-my-settings-h" data-testid="dreaming-settings">
@@ -230,7 +230,7 @@ function Prompt({ view }: { view: MyDreaming }) {
     mutationFn: (a: { content: string | null; typed: string | undefined }) => dreaming.savePrompt(a.content),
     // The answer carries the stored prompt (rev.ts); the editor's text goes only if it is still what was sent.
     onSuccess: (v, a) => {
-      applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => newer(old, v));
+      applySaved<MyDreaming>(qc, DREAMING_KEY, (old) => mineFromPut(old, v));
       setText((cur) => afterSave(cur, a.typed, undefined));
     },
   });

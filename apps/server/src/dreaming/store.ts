@@ -251,12 +251,24 @@ export class DreamingStore {
             "delete from dreaming_days where user_id = ? and state = 'waiting' and attempts = 0 and deferrals = 0",
           )
           .run(userId);
-      this.setEnabled(userId, s.enabled);
+      // One write, one revision (+1 per save); turned off → paused like setEnabled.
       this.sql
         .prepare(
-          "update dreaming_users set time = ?, runtime = ?, connection_id = ?, model = ?, updated_at = ?, rev = rev + 1 where user_id = ?",
+          `update dreaming_users set enabled = ?, time = ?, runtime = ?, connection_id = ?, model = ?, updated_at = ?,
+             rev = rev + 1, paused_at = case when ? = 0 and paused_at is null then ? else paused_at end
+           where user_id = ?`,
         )
-        .run(s.time, s.runtime, s.connectionId, s.model, this.now(), userId);
+        .run(
+          s.enabled ? 1 : 0,
+          s.time,
+          s.runtime,
+          s.connectionId,
+          s.model,
+          this.now(),
+          s.enabled ? 1 : 0,
+          this.now(),
+          userId,
+        );
     })();
   }
 

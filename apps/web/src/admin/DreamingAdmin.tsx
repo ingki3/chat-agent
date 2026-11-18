@@ -20,7 +20,7 @@ import {
 import { adminDreaming, ADMIN_DREAMING_KEY, errorText } from "../api.js";
 import { countsText, DreamingSettingsForm } from "../instructions/DreamingPanel.js";
 import { afterSave, settleDraft, withDraft } from "../instructions/draft.js";
-import { applySaved, newerAdmin, withUser } from "../instructions/rev.js";
+import { adminConfigFromPut, adminFromGet, applySaved, rowFromPut, sharing } from "../instructions/rev.js";
 
 /**
  * 관리자 → 기억 정리 (#146, #188, PRD FR-16.6·16.8): what stays the admin's once each user sets their own 기억 정리
@@ -34,7 +34,7 @@ export function DreamingAdmin() {
   const q = useQuery({
     queryKey: ADMIN_DREAMING_KEY,
     queryFn: adminDreaming.get,
-    structuralSharing: (old, next) => newerAdmin(old as View | undefined, next as View),
+    structuralSharing: sharing(adminFromGet),
   });
   const v = q.data;
   return (
@@ -68,7 +68,7 @@ function Settings({ view }: { view: View }) {
   const save = useMutation({
     mutationFn: (sent: Partial<DreamingConfig>) => adminDreaming.save(sent),
     onSuccess: (v, sent) => {
-      applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => newerAdmin(old, v));
+      applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => adminConfigFromPut(old, v));
       setDraft((cur) => settleDraft(cur, sent));
       setSaved(true);
     },
@@ -212,7 +212,7 @@ function Status({ view }: { view: View }) {
   // Partial bodies; the answer (the row with its revisions) goes into the view unless newer is there (rev.ts).
   const setYouth = useMutation({
     mutationFn: (a: { id: string; body: SaveYouthDreamingRequest }) => adminDreaming.setUser(a.id, a.body),
-    onSuccess: (row) => applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => withUser(old, row)),
+    onSuccess: (row) => applySaved<View>(qc, ADMIN_DREAMING_KEY, (old) => rowFromPut(old, row)),
   });
   const runNow = useMutation({ mutationFn: (id: string) => adminDreaming.runNow(id), onSuccess: refresh });
   const choices = youthChoices(view);

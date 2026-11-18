@@ -1024,7 +1024,7 @@ describe("admin, lifecycle, connection, deletion (spec §7–§10)", () => {
     const a = MyDreaming.parse(
       (await s.req("owner", "PUT", "/api/dreaming/settings", { time: "04:20" })).json(),
     );
-    expect(a.rev).toBeGreaterThan(r0);
+    expect(a.rev).toBe(r0 + 1); // one save, one revision
     const b = MyDreaming.parse(
       (await s.req("owner", "PUT", "/api/dreaming/prompt", { content: "취미만" })).json(),
     );
