@@ -95,7 +95,10 @@ export type FakeStep =
   | { usage: UsageReport }
   | { notice: string }
   | { limit: string; resetsAt?: number; retryAfterMs?: number; modelFamily?: string }
-  | { fail: string; code?: RuntimeFailure["code"] };
+  | { fail: string; code?: RuntimeFailure["code"] }
+  /** Waits until a `release` step with the same name runs (in any run of this process) — tests order a run's end. */
+  | { gate: string }
+  | { release: string };
 
 export type FakeScript = (input: TurnInput, memory: string[]) => FakeStep[];
 
@@ -500,6 +503,11 @@ export const defaultScript: FakeScript = (input, memory) => {
     }
     return steps;
   }
+  // `/gate <name>`: the reply waits half-way until `/release <name>` is sent (from any conversation) — so a test can
+  // look at the reply while it is certainly unfinished, then let it end (#103).
+  const gate = /^\/(gate|release)\s+([a-z0-9-]{1,64})$/.exec(t);
+  if (gate?.[1] === "gate") return [{ text: "기다릴게요. " }, { gate: gate[2]! }, { text: "끝났어요." }];
+  if (gate?.[1] === "release") return [{ release: gate[2]! }, { text: "풀었어요." }];
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [
@@ -520,6 +528,43 @@ export const defaultScript: FakeScript = (input, memory) => {
     { usage: { inputTokens: 10 * memory.length, outputTokens: words.length } },
   ];
 };
+
+/**
+ * Gates of `/gate` runs: the waiting replies of each name, or a release that came first (then the next wait takes it).
+ * Nothing is kept once used: a release frees its waiters and forgets the name, a stopped reply leaves its gate.
+ */
+const gates = new Map<string, { open: boolean; waiters: Set<() => void> }>();
+export function releaseGate(name: string): void {
+  const g = gates.get(name);
+  if (!g || !g.waiters.size) return void gates.set(name, { open: true, waiters: new Set() });
+  gates.delete(name);
+  for (const w of g.waiters) w();
+}
+export const waitGate = (name: string, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const g = gates.get(name);
+    if (g?.open) {
+      gates.delete(name);
+      return resolve();
+    }
+    if (signal.aborted) return resolve();
+    const entry = g ?? { open: false, waiters: new Set<() => void>() };
+    gates.set(name, entry);
+    const done = () => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    };
+    const stop = () => {
+      entry.waiters.delete(done);
+      if (!entry.waiters.size && gates.get(name) === entry) gates.delete(name);
+      resolve();
+    };
+    entry.waiters.add(done);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+
+/** How many gate names are held (tests). */
+export const fakeGateCount = () => gates.size;
 
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -722,6 +767,8 @@ export class FakeRuntime implements RuntimeAdapter {
               };
               return;
             } else if ("fail" in step) throw step.code ? new RuntimeFailure(step.code) : new Error(step.fail);
+            else if ("gate" in step) await waitGate(step.gate, ctrl.signal);
+            else if ("release" in step) releaseGate(step.release);
           }
         }
         return { events: events(), interrupt: async () => ctrl.abort() };

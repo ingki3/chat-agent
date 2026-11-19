@@ -480,10 +480,13 @@ export const conversations = {
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { researchMode })),
   remove: async (id: string) => call("DELETE", `/api/conversations/${enc(id)}`),
   /** A page of messages, oldest → newest; `before` asks for the page older than that seq. */
-  messages: async (id: string, before?: number) => {
+  messages: async (id: string, before?: number, signal?: AbortSignal) => {
     const r = (await call(
       "GET",
       `/api/conversations/${enc(id)}/messages?limit=100${before ? `&before=${before}` : ""}`,
+      undefined,
+      {},
+      signal,
     )) as { items: unknown[]; nextBefore: number | null };
     return { items: Message.array().parse(r.items), nextBefore: r.nextBefore };
   },
