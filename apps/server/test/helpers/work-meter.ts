@@ -73,10 +73,18 @@ export function meterWork(fn: () => void): number {
       });
       return it;
     };
-  const len = (x: unknown) =>
-    x != null && typeof (x as { length?: unknown }).length === "number"
-      ? (x as { length: number }).length
-      : 0;
+  // Costs never run the caller's code again (review #217 3차): a length only of a string or a real array (no
+  // getter), and a search's arguments looked at only when they are primitives — an object's `valueOf`/`toString`
+  // ran once, in the native call; then the search is charged as a miss over the whole text.
+  const len = (x: unknown) => (typeof x === "string" || Array.isArray(x) ? x.length : 0);
+  // (An index loop: the array methods are the metered ones.)
+  const plain = (args: unknown[], from = 0) => {
+    for (let i = from; i < args.length; i++) {
+      const a = args[i];
+      if (a !== undefined && typeof a !== "string" && typeof a !== "number") return false;
+    }
+    return true;
+  };
   // Where a search starts: `pos` clamped (negative counts from the end for arrays).
   const startOf = (n: number, pos: unknown, fromEnd: boolean) => {
     const p = Math.trunc(Number(pos) || 0);
@@ -87,7 +95,7 @@ export function meterWork(fn: () => void): number {
     found >= 0 ? found - at + needle : n - at;
   try {
     wrap(RegExp.prototype, "exec", (re: RegExp, args, m: RegExpExecArray | null, before) => {
-      const text = String(args[0]);
+      const text = typeof args[0] === "string" ? args[0] : "";
       const start = re.global || re.sticky ? before : 0;
       if (m) return re.sticky ? m[0].length : m.index - start + m[0].length;
       return re.sticky ? 1 : Math.max(0, text.length - start);
@@ -112,21 +120,23 @@ export function meterWork(fn: () => void): number {
     for (const name of ["split", "replace", "replaceAll", "localeCompare"])
       wrap(S, name, (s: string) => len(s));
     wrap(S, "indexOf", (s: string, args, r: number) =>
-      searched(len(s), startOf(len(s), args[1], false), r, len(String(args[0]))),
+      plain(args) ? searched(len(s), startOf(len(s), args[1], false), r, len(String(args[0]))) : len(s),
     );
     wrap(S, "includes", (s: string, args) => {
+      if (!plain(args) || typeof s !== "string") return len(s);
       const at = startOf(len(s), args[1], false);
       const needle = String(args[0]);
       return searched(len(s), at, Reflect.apply(strIndexOf, s, [needle, at]) as number, len(needle));
     });
     // Backwards from `position` (the end when there is none): to the match, or to the start on a miss.
     wrap(S, "lastIndexOf", (s: string, args, r: number) => {
+      if (!plain(args)) return len(s);
       const p = Number(args[1]);
       const start = Number.isNaN(p) ? len(s) : Math.max(0, Math.min(len(s), Math.trunc(p)));
       const needle = len(String(args[0]));
       return r >= 0 ? start - r + needle : Math.min(len(s), start + needle);
     });
-    for (const name of ["startsWith", "endsWith"]) wrap(S, name, (_s, args) => len(String(args[0])));
+    for (const name of ["startsWith", "endsWith"]) wrap(S, name, (_s, args) => len(args[0]));
     for (const name of ["charCodeAt", "codePointAt", "charAt", "at"]) wrap(S, name, () => 1);
     replace(S, Symbol.iterator, counted);
     wrap(Array, "from", (_s, _a, r: unknown[]) => len(r));
@@ -136,25 +146,22 @@ export function meterWork(fn: () => void): number {
     wrap(A, "indexOf", (self: unknown[], args, r: number) =>
       searched(len(self), startOf(len(self), args[1], true), r, 1),
     );
-    // `includes` done here, one read an element (review #217 2차: searching again with `indexOf` read each element
-    // twice — a getter ran twice — and missed `NaN` and holes): SameValueZero, a hole read as `undefined`.
-    replace(
-      A,
-      "includes",
-      () =>
-        function (this: unknown, x: unknown, pos?: unknown) {
-          const o = Object(this) as ArrayLike<unknown>;
-          const n = Math.min(Math.max(Math.trunc(Number(o.length)) || 0, 0), Number.MAX_SAFE_INTEGER);
-          work++;
-          if (n === 0) return false;
-          for (let i = startOf(n, pos, true); i < n; i++) {
-            work++;
-            const v = o[i];
-            if (v === x || (v !== v && x !== x)) return true;
-          }
-          return false;
-        },
-    );
+    // `includes`: the native call gives the answer (and its errors); the cost never reads an element again (review
+    // #217 2차/3차 — a getter would run twice). A hit in a real array is charged up to where it is, found from the
+    // element descriptors (no getter runs; one with a getter, or not a real array: the whole length).
+    wrap(A, "includes", (self: unknown[], args, found: boolean) => {
+      const n = len(self);
+      const at = plain(args, 1) ? startOf(n, args[1], true) : 0;
+      if (!found || !Array.isArray(self)) return n - at;
+      const x = args[0];
+      for (let i = at; i < n; i++) {
+        const d = Object.getOwnPropertyDescriptor(self, i);
+        if (d && !("value" in d)) return n - at;
+        const v = d?.value;
+        if (v === x || (v !== v && x !== x)) return i - at + 1;
+      }
+      return n - at;
+    });
     // The whole array (an early exit is not credited).
     for (const name of [
       "splice",

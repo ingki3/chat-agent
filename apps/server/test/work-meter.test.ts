@@ -36,6 +36,17 @@ describe("meterWork", () => {
     expect(meterWork(() => void text.lastIndexOf("a", 0))).toBeLessThanOrEqual(3);
     expect(meterWork(() => void text.lastIndexOf("a"))).toBeLessThanOrEqual(3);
     expect(meterWork(() => void text.lastIndexOf("b"))).toBeGreaterThanOrEqual(text.length);
+    // An object position is converted once — by the native call, not again for the cost.
+    let conversions = 0;
+    const pos = {
+      valueOf() {
+        if (++conversions > 1) throw new Error("converted twice");
+        return 0;
+      },
+    };
+    let at = -1;
+    meterWork(() => void (at = text.lastIndexOf("a", pos as unknown as number)));
+    expect([at, conversions]).toEqual([0, 1]);
     const loop = (n: number) => {
       const s = "a".repeat(n);
       return meterWork(() => {
@@ -57,6 +68,9 @@ describe("meterWork", () => {
     expect(found).toBe(true);
     expect(meterWork(() => void (found = [1, 2, 3].includes(2, -1)))).toBeLessThanOrEqual(3);
     expect(found).toBe(false);
+    // The native answer and errors (review #217 3차): a null receiver and a BigInt position throw as they do natively.
+    expect(() => meterWork(() => void Array.prototype.includes.call(null, 1))).toThrow(TypeError);
+    expect(() => meterWork(() => void [1].includes(1, 0n as unknown as number))).toThrow(TypeError);
     // Each element read once (a getter runs once, as without the meter).
     let reads = 0;
     const arr = [1, 2, 3];
@@ -90,13 +104,16 @@ describe("meterWork", () => {
 
   it("an iterator stays the engine's own: its helpers are there, and their steps are counted", () => {
     // Review #217 2차 (P3): a stand-in object lost `take`, `map`, `toArray`…
-    const outside = typeof [].values().take;
+    // `take` is newer than the ES2023 lib the types know: looked up through a typed view.
+    type Helpers = { take?: (n: number) => { toArray(): number[] } };
+    const helpers = (it: unknown) => it as Helpers;
+    const outside = typeof helpers([].values()).take;
     let inside = "";
     let taken: number[] = [];
     const arr = Array.from({ length: 10_000 }, (_, i) => i);
     const w = meterWork(() => {
-      inside = typeof [].values().take;
-      const it = arr.values() as unknown as { take?: (n: number) => { toArray(): number[] } };
+      inside = typeof helpers([].values()).take;
+      const it = helpers(arr.values());
       if (it.take) taken = it.take(3).toArray();
     });
     expect(inside).toBe(outside);
