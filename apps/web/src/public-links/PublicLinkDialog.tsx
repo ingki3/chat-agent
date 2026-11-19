@@ -29,7 +29,7 @@ export function checkNotices(c: PublicLinkCheck): { level: "block" | "warn" | "i
   if (c.externalHosts.length)
     out.push({
       level: "info",
-      text: `외부 리소스를 불러와요(${c.externalHosts.join(", ")}) — 방문자 정보(IP 등)가 그 사이트에 전달될 수 있어요.`,
+      text: `이 문서에 나오는 외부 주소: ${c.externalHosts.join(", ")} — 공개 페이지가 여기서 내용을 불러올 수 있고, 그러면 방문자 정보(IP 등)가 그 사이트에 전달돼요.`,
     });
   return out;
 }

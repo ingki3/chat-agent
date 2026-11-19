@@ -32,8 +32,9 @@ export type CreatePublicLinkRequest = z.input<typeof CreatePublicLinkRequest>;
 
 /**
  * What the server found in a version before it is made public (`GET /api/artifacts/:id/public-links/check`). A known
- * secret value blocks the link; email addresses and phone numbers are only warned about; external hosts the page
- * loads from are named (a visitor's browser contacts them).
+ * secret value blocks the link; email addresses and phone numbers are only warned about; every external address the
+ * version names (`https://host`, `//host` anywhere in its title or text — over-inclusive by design) is listed, since
+ * the public page may load from any of them and a visitor's browser then contacts that site.
  */
 export const PublicLinkCheck = z.object({
   version: z.number().int().positive(),

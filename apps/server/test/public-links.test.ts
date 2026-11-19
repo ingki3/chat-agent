@@ -550,7 +550,8 @@ describe("who makes one, and what is checked first", () => {
         "<link href='//fonts.example.com/x.css'><style>@font-face{src:url(https://a.example/b.woff)}</style> ![x](https://m.example/p.png)",
       ).externalHosts,
     ).toEqual(["a.example", "fonts.example.com", "m.example"]);
-    expect(c("텍스트에 쓴 https://example.com 주소").externalHosts).toEqual([]);
+    // Mentioned is listed (over-inclusive by design, review #209 round 5).
+    expect(c("텍스트에 쓴 https://example.com 주소").externalHosts).toEqual(["example.com"]);
   });
 
   it(`at most ${PUBLIC_LINK_MAX_ACTIVE} active links per account (turned off or expired ones do not count)`, async () => {
@@ -795,84 +796,88 @@ describe("review #209 round 2", () => {
   });
 });
 
-describe("review #209 round 3", () => {
-  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+describe("review #209 rounds 3–5: external addresses are those the version mentions", () => {
+  const hosts = (content: string, title = "t") => checkVersion({ version: 1, title, content }).externalHosts;
+  const CDN = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
 
-  it("the xn-- prefix of an IDN top-level domain in any case", () => {
+  it("the xn-- prefix of an IDN top-level domain in any case (emails and hosts)", () => {
     const c = (content: string) => checkVersion({ version: 1, title: "t", content }).emails;
     expect(c("reader@xn--vv4b11d.XN--3E0B707E")).toBe(1);
     expect(c("reader@Xn--vv4b11d.Xn--3e0b707e")).toBe(1);
     expect(c("READER@EXAMPLE.COM")).toBe(1);
+    expect(hosts("<img src='https://XN--VV4B11D.xn--3e0b707e/a.png'>")).toEqual(["xn--vv4b11d.xn--3e0b707e"]);
   });
 
-  it("attribute values trimmed as the URL parser does: a vertical tab or form feed in front still loads", () => {
-    const cdn = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
-    for (const lead of ["\u000b", "\u000c", "\t\n ", "\r"])
-      expect(hosts(`<script src="${lead}${cdn}${lead}"></script>`), JSON.stringify(lead)).toEqual([
-        "cdn.jsdelivr.net",
-      ]);
-    expect(hosts(`<img src="  https://images.example.org/a.png\u000b">`)).toEqual(["images.example.org"]);
-    expect(hosts(`<img src="https://ima\nges.example.org/a.png">`)).toEqual(["images.example.org"]);
+  it("every input an earlier HTML/CSS scanner missed now reports its host — nothing is parsed, so nothing is missed", () => {
+    const cases: [string, string, string][] = [
+      ["style= in body", '<p><code>style="</code></p><img src="https://img.example/p.png">', "img.example"],
+      [
+        "SVG fill url()",
+        '<svg><rect fill="url(https://paint.example/colors.svg#blue)"/></svg>',
+        "paint.example",
+      ],
+      [
+        "long <style> attribute",
+        `<style data-note="${"n".repeat(1000)}">p{background:url(https://long-style.example/p.png)}</style>`,
+        "long-style.example",
+      ],
+      [
+        "64 KiB style",
+        `<div style="${"color:red;".repeat(7000)}background:url(//big-style.example/b.png)">`,
+        "big-style.example",
+      ],
+      ["srcset bad((", '<img srcset="a.png bad((x), https://img.example/real.png 2x">', "img.example"],
+      ["2048 spaces", `<script src="${" ".repeat(2048)}${CDN}"></script>`, "cdn.jsdelivr.net"],
+      ["vertical tab prefix", `<script src="\u000b${CDN}"></script>`, "cdn.jsdelivr.net"],
+      [
+        "=https:// relative",
+        '<script src="=https://images.example.org/file.js"></script>',
+        "images.example.org",
+      ],
+      [
+        "<code>url(</code>",
+        '<p><code>url(</code> <a href="https://docs.example.org/css">문서</a></p>',
+        "docs.example.org",
+      ],
+      ["srcset comma in URL", '<img srcset="/p.png?urls=/a,//thumb.example.org/b 2x">', "thumb.example.org"],
+      ["@import", "<style>@import url( 'https://fonts.example.com/x.css' );</style>", "fonts.example.com"],
+      ["markdown image", "![그림](https://m.example/p.png)", "m.example"],
+      ["chart JSON", '{"title":"출처 https://data.example.org/x","series":[]}', "data.example.org"],
+    ];
+    for (const [name, content, host] of cases) expect(hosts(content), name).toContain(host);
+    // The title counts too.
+    expect(hosts("<p>본문</p>", "출처 //title.example.net/a")).toEqual(["title.example.net"]);
   });
 
-  it("a value is resolved, not searched: relative URLs (even ones holding a URL) are the page's own", () => {
-    expect(hosts('<script src="=https://images.example.org/file.js"></script>')).toEqual([]);
-    expect(hosts('<img src="a.png?u=https://evil.example/x">')).toEqual([]);
+  it("what is not a host: comments, relative paths, the page's own base, other schemes", () => {
+    expect(hosts("// 주석입니다\n//todo: 고치기\nconst x = 1; // end")).toEqual([]);
     expect(hosts('<img src="/x.png"><a href="#top"></a><img src="data:image/png;base64,AAAA">')).toEqual([]);
-    expect(hosts('<img src="javascript:alert(1)"><a href="mailto:a@b.co">')).toEqual([]);
-    expect(hosts('<img srcset="https://a.example/1.png 1x, //b.example/2.png 2x">')).toEqual([
-      "a.example",
-      "b.example",
-    ]);
     expect(
-      hosts(
-        "<style>@import url( 'https://fonts.example.com/x.css' ); b{background:url(//img.example/b.png)}</style>",
+      hosts('<a href="mailto:a@b.co">메일</a> <a href="https://artifact.invalid/x">자기 자신</a>'),
+    ).toEqual([]);
+    expect(hosts("https://Example.COM./path and http://a-b.example-.")).toEqual([
+      "a-b.example",
+      "example.com",
+    ]);
+    // At most 10.
+    expect(hosts(Array.from({ length: 30 }, (_, i) => `https://h${i}.example/`).join(" "))).toHaveLength(10);
+  });
+
+  it("one linear pass over the largest version (512 KiB), adversarial input too", () => {
+    const N = 512 * 1024;
+    for (const [name, content] of Object.entries({
+      slashes: "/".repeat(N),
+      pairs: "//".repeat(N / 2),
+      longHost: `//${"a".repeat(N - 2)}`,
+      dots: `//${".".repeat(N - 2)}`,
+      many: "//a.b ".repeat(N / 6),
+      html: `<img src="https://img.example/p.png"><a href="//x.example/y">링크</a>\n`.repeat(
+        Math.floor(N / 64),
       ),
-    ).toEqual(["fonts.example.com", "img.example"]);
-    // Values inside values are never rescanned (one pass), and the scan stays linear.
-    const t = performance.now();
-    hosts(`src="${"src=".repeat(128 * 1024)}"`);
-    hosts(`url(${"url(".repeat(128 * 1024)}`);
-    expect(performance.now() - t).toBeLessThan(1500);
-  });
-});
-
-describe("review #209 round 4", () => {
-  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
-  const CDN = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
-
-  it("leading whitespace and controls are trimmed before the length bound (any number of them)", () => {
-    expect(hosts(`<script src="${" ".repeat(2048)}${CDN}"></script>`)).toEqual(["cdn.jsdelivr.net"]);
-    expect(
-      hosts(`<img src="${"\u000b".repeat(5000)}https://images.example.org/a.png${" ".repeat(5000)}">`),
-    ).toEqual(["images.example.org"]);
-  });
-
-  it('url( counts as a load only inside CSS — <style> and style="" — never in body text', () => {
-    expect(hosts('<p><code>url(</code> 예시 <a href="https://docs.example.org/css">문서</a></p>')).toEqual([
-      "docs.example.org",
-    ]);
-    expect(hosts("<p>CSS의 url(https://text.example/x.png)는 이렇게 써요</p>")).toEqual([]);
-    expect(hosts("@import 'https://text.example/x.css' 라고 적은 글")).toEqual([]);
-    expect(hosts("<div style=\"background: url( '//bg.example/a.png' )\">")).toEqual(["bg.example"]);
-    expect(hosts("<STYLE media=all>p{background:url(https://in-style.example/p.png)}</STYLE>")).toEqual([
-      "in-style.example",
-    ]);
-  });
-
-  it("srcset by the HTML candidate rules: a comma inside a URL is part of it", () => {
-    expect(hosts('<img srcset="/p.png?urls=/a,//thumb.example.org/b 2x">')).toEqual([]);
-    expect(hosts('<img srcset="https://img.example/x.png?urls=/a,//thumb.example.org/b 1x">')).toEqual([
-      "img.example",
-    ]);
-    expect(hosts('<img srcset="https://a.example/1.png 1x,https://b.example/2.png 2x">')).toEqual([
-      "a.example",
-      "b.example",
-    ]);
-    expect(hosts('<img srcset="https://a.example/1.png,https://b.example/2.png">')).toEqual(["a.example"]);
-    expect(hosts('<img srcset="https://a.example/1.png, https://b.example/2.png">')).toEqual([
-      "a.example",
-      "b.example",
-    ]);
+    })) {
+      const t = performance.now();
+      checkVersion({ version: 1, title: "t", content });
+      expect(performance.now() - t, name).toBeLessThan(1500);
+    }
   });
 });
