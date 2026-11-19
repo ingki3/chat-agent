@@ -20,7 +20,7 @@ import {
   liveRenderCount,
   onRenderReapIncomplete,
   parseMessage,
-  canonArgs,
+  cmdlinePattern,
   parsePs,
   psListing,
   type PsRun,
@@ -1176,8 +1176,10 @@ describe("the browser never outlives its owner (#170)", () => {
       "fake.mjs",
     ];
     const printed = (d: string) => `/usr/bin/perl -e use strict;\\012\\011x(); 1 30 ${d} node fake.mjs`;
+    /** The browser executable these renders launched (argv[0] of their browser). */
+    const CHROME = "/opt/chrome/chrome-headless-shell";
     const reapOf = (G: number, dir: RenderDir) => {
-      const forget = trackRender(G, dir, spawned(dir.workDir));
+      const forget = trackRender(G, dir, { argv: spawned(dir.workDir), browser: CHROME });
       reapAfterWatchdog(G);
       forget();
     };
@@ -1194,7 +1196,19 @@ describe("the browser never outlives its owner (#170)", () => {
       const dir = freshRenderDir();
       const d = dir.workDir;
       const G = 2_000_000_001; // the group id the listing claims
-      const [foreign, elsewhere, prefixed, lookalike, unreadable, message, almost, watchdogChild, browser] = [
+      const [
+        foreign,
+        elsewhere,
+        prefixed,
+        lookalike,
+        logger,
+        unreadable,
+        message,
+        almost,
+        watchdogChild,
+        browser,
+      ] = [
+        sleeper(),
         sleeper(),
         sleeper(),
         sleeper(),
@@ -1207,14 +1221,15 @@ describe("the browser never outlives its owner (#170)", () => {
       ];
       let rows = [
         row(foreign, G, "/bin/sleep 30"), // the group id reused by someone else
-        row(elsewhere, 7, `chrome --user-data-dir=${d}/profile`), // ours by its arguments, not in the group
+        row(elsewhere, 7, `${CHROME} --user-data-dir=${d}/profile`), // ours by its arguments, not in the group
         row(prefixed, G, `/bin/sh -c echo /archive${d}/profile`), // the path inside another argument
-        row(lookalike, G, `chrome --user-data-dir=${d}X/profile`), // another folder
+        row(lookalike, G, `${CHROME} --user-data-dir=${d}X/profile`), // another folder
+        row(logger, G, `logger started --user-data-dir=${d}/profile`), // the switch inside a message: another program
         row(unreadable, G, "[chrome-headless-shell]"), // arguments ps could not read
         row(message, G, `logger render directory ${d} retained`), // the folder inside one argument
         row(almost, G, `/usr/bin/perl -e use strict; 1 30 ${d} node fake.mjs`), // not the command line spawned
         row(watchdogChild, G, printed(d)), // exactly the watchdog's (as a child it forked before exec)
-        row(browser, G, `chrome --single-process --user-data-dir=${d}/profile about:blank`),
+        row(browser, G, `${CHROME} --single-process --user-data-dir=${d}/profile about:blank`),
       ];
       const incomplete: number[] = [];
       onRenderReapIncomplete((n) => incomplete.push(n));
@@ -1224,15 +1239,25 @@ describe("the browser never outlives its owner (#170)", () => {
         reapOf(G, dir);
         // A new render takes the same group id while the old reap still runs: the old one must leave it alone.
         const second = freshRenderDir();
-        const forgetSecond = trackRender(G, second);
+        const forgetSecond = trackRender(G, second, { browser: CHROME });
         const newcomer = sleeper();
-        rows = [...rows, row(newcomer, G, `chrome --user-data-dir=${second.workDir}/profile`)];
+        rows = [...rows, row(newcomer, G, `${CHROME} --user-data-dir=${second.workDir}/profile`)];
         expect(await within(5000, () => !alive(watchdogChild) && !alive(browser))).toBe(true);
         rows = rows.filter((r) => r.pid !== watchdogChild && r.pid !== browser);
         // Live members it cannot attribute stay in the group: never confirmed — given up at the deadline.
         expect(await within(5000, () => incomplete.length > 0)).toBe(true);
         expect(incomplete).toEqual([1]);
-        const others = [foreign, elsewhere, prefixed, lookalike, unreadable, message, almost, newcomer];
+        const others = [
+          foreign,
+          elsewhere,
+          prefixed,
+          lookalike,
+          logger,
+          unreadable,
+          message,
+          almost,
+          newcomer,
+        ];
         for (const pid of others) expect(alive(pid), `pid ${pid}`).toBe(true);
         const signalled = kill.mock.calls.filter(([, sig]) => sig === "SIGKILL").map(([t]) => t);
         expect(signalled).not.toContain(-G); // after the watchdog's own end: no group signal
@@ -1275,7 +1300,7 @@ describe("the browser never outlives its owner (#170)", () => {
       restores.push(setRenderReapForTests({ everyMs: 10, list: () => script[Math.min(calls++, 3)] }));
       const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
       try {
-        trackRender(G, dir, spawned(d));
+        trackRender(G, dir, { argv: spawned(d) });
         signalRender(G);
         await renderReaped(dir);
         // 1: live leader (killed by pid); 2: leader a zombie — empty, but begun before its end was known; 3: empty.
@@ -1305,7 +1330,7 @@ describe("the browser never outlives its owner (#170)", () => {
             while (performance.now() < end) {
               // busy
             }
-            return [row(target, G, `chrome --user-data-dir=${dir.workDir}/profile`)];
+            return [row(target, G, `${CHROME} --user-data-dir=${dir.workDir}/profile`)];
           },
         }),
       );
@@ -1340,13 +1365,13 @@ describe("the browser never outlives its owner (#170)", () => {
             while (performance.now() < end) {
               // busy
             }
-            return [row(target, G, `x --user-data-dir=${dir.workDir}/profile`)];
+            return [row(target, G, `${CHROME} --user-data-dir=${dir.workDir}/profile`)];
           },
         }),
       );
       const incomplete: number[] = [];
       onRenderReapIncomplete((n) => incomplete.push(n));
-      trackRender(G, dir);
+      trackRender(G, dir, { browser: CHROME });
       const kill = vi.spyOn(process, "kill");
       try {
         const t0 = performance.now();
@@ -1424,11 +1449,34 @@ describe("the browser never outlives its owner (#170)", () => {
           return !!row;
         }),
       ).toBe(true);
-      expect(canonArgs(row!.args)).toBe(canonArgs(w.l.child.spawnargs.join(" ")));
+      const pattern = cmdlinePattern(w.l.child.spawnargs.join(" "));
+      expect(pattern.test(row!.args)).toBe(true);
       // One character changed is another command line.
-      expect(canonArgs(row!.args.replace(" 30 ", " 31 "))).not.toBe(canonArgs(w.l.child.spawnargs.join(" ")));
-      process.kill(w.l.child.pid!, "SIGTERM");
+      expect(pattern.test(row!.args.replace(" 30 ", " 31 "))).toBe(false);
+      // Stopped by its owner (stdin closed): a TERM could come before Perl has installed its handler.
+      w.l.child.stdin!.end();
       expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+    });
+
+    it("command lines: only control characters may be printed otherwise (`\\NNN`, `^X`, `?`); every other character must be the same", () => {
+      const p = cmdlinePattern("perl -e a\nb\t\u0085c 가.mjs /d");
+      for (const shown of [
+        "perl -e a\\012b\\011\\302\\205c 가.mjs /d", // macOS
+        "perl -e a^Jb^I\\302\\205c 가.mjs /d",
+        "perl -e a?b??c 가.mjs /d", // Linux
+      ])
+        expect(p.test(shown), shown).toBe(true);
+      for (const other of [
+        "perl -e a\\012b\\011\\302\\205c 나.mjs /d", // another printable character
+        "perl -e a?b??c ?.mjs /d", // a printable character shown as `?`: not ours to assume
+        "perl -e a b??c 가.mjs /d", // a space for a control character
+        "perl -e a?b??c 가.mjs /d extra",
+        "x perl -e a?b??c 가.mjs /d",
+      ])
+        expect(p.test(other), other).toBe(false);
+      // Regular-expression characters in the command line are literal.
+      expect(cmdlinePattern("a.b (c)+").test("axb (c)+")).toBe(false);
+      expect(cmdlinePattern("a.b (c)+").test("a.b (c)+")).toBe(true);
     });
 
     it("ps rows: pid, group, zombie state and the command line", () => {
@@ -1672,7 +1720,7 @@ describe("the browser never outlives its owner (#170)", () => {
 
   it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end reaps its processes by pid — no group signal (#215)", async () => {
     // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" in their group (a sleeper
-    // carrying the browser's identity, `--user-data-dir=<folder>/profile`).
+    // carrying the browser's identity: the browser executable launched, with `--user-data-dir=<folder>/profile`).
     let groupSignals = 0;
     const react = async (status: number) => {
       const p = pidFile();
@@ -1682,7 +1730,7 @@ describe("the browser never outlives its owner (#170)", () => {
           "/bin/sh",
           [
             "-c",
-            `/usr/bin/perl -e 'sleep 30' -- '--user-data-dir=${s.workDir}/profile' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
+            `'${process.execPath}' -e 'setTimeout(() => {}, 30000)' -- '--user-data-dir=${s.workDir}/profile' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
           ],
           {
             env: { EXIT_CODE: String(status) },

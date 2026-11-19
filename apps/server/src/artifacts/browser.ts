@@ -393,8 +393,10 @@ type RenderEntry = {
   timer?: NodeJS.Timeout;
   /** Told when the reap is over (`renderReaped`). */
   waiters: (() => void)[];
-  /** The watchdog's whole command line as launched (`canonArgs`), its identity in a listing; none when unknown. */
-  cmdline?: string;
+  /** The watchdog's whole command line as launched (`cmdlinePattern`), its identity in a listing; none when unknown. */
+  cmdline?: RegExp;
+  /** The browser executable launched (its argv[0]), part of the browser's identity; none when unknown. */
+  browser?: string;
 };
 const liveRenders = new Map<number, RenderEntry>();
 const reaping = new Set<RenderEntry>();
@@ -402,15 +404,21 @@ const reaping = new Set<RenderEntry>();
 const unconfirmed = new WeakSet<RenderDir>();
 
 /**
- * Records a running render (`argv`: the watchdog's command line as spawned, `child.spawnargs`); the returned function
- * says its watchdog has exited (call it once, on the exit). A render whose reap never started is then forgotten; one
- * being reaped stays until its reap is over (#215).
+ * Records a running render — `who`: the watchdog's command line as spawned (`child.spawnargs`) and the browser
+ * executable launched, the two identities of its processes in a listing (#215). The returned function says its
+ * watchdog has exited (call it once, on the exit). A render whose reap never started is then forgotten; one being
+ * reaped stays until its reap is over.
  */
-export function trackRender(pgid: number, dir: RenderDir, argv?: readonly string[]): () => void {
+export function trackRender(
+  pgid: number,
+  dir: RenderDir,
+  who: { argv?: readonly string[]; browser?: string } = {},
+): () => void {
   const entry: RenderEntry = {
     pgid,
     dir,
-    ...(argv?.length ? { cmdline: canonArgs(argv.join(" ")) } : {}),
+    ...(who.argv?.length ? { cmdline: cmdlinePattern(who.argv.join(" ")) } : {}),
+    ...(who.browser ? { browser: who.browser } : {}),
     signalled: false,
     leaderGone: false,
     ownsDir: false,
@@ -493,34 +501,40 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
 }
 
 /**
- * A command line made comparable between what was spawned (argv joined with spaces) and what `ps` prints of it: `ps`
- * shows a control character escaped (macOS `\\012`, `^A`) or as `?` (Linux), and other bytes as they are or as `?`.
- * Each such run on either side becomes one placeholder.
+ * What `ps` may print for a command line spawned as `spawned` (argv joined with spaces), as an exact pattern. `ps`
+ * changes control characters only (C0, DEL, C1): macOS prints them escaped (`\012`, a C1 character as its UTF-8 bytes
+ * `\302\205`, or `^A` / `^?`), Linux as `?`. Every other character — printable non-ASCII included — must be printed as
+ * it is, so `가.mjs` is not `나.mjs`.
  */
-export function canonArgs(s: string) {
-  const P = "\u2400"; // the placeholder (printable, so no control character appears in a pattern)
-  const marked = s
-    .replace(/\\[0-7]{3}/g, P)
-    .replace(/\^[@-_?]/g, P)
-    .replace(/[?]/g, P);
-  const plain = Array.from(marked, (ch) => {
+export function cmdlinePattern(spawned: string): RegExp {
+  const control = String.raw`(?:(?:\\[0-7]{3})+|\^[@-_?]|\?)`;
+  let src = "";
+  for (const ch of spawned) {
     const c = ch.codePointAt(0)!;
-    return c < 0x20 || c > 0x7e ? P : ch;
-  }).join("");
-  return plain.replace(/\u2400+/g, P);
+    src += c < 0x20 || (c >= 0x7f && c <= 0x9f) ? control : ch.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  }
+  return new RegExp(`^${src}$`, "u");
 }
 
 /**
  * Whether a process is provably this render's (#215). `ps` joins argv with spaces, so no single argument can be told
  * apart in it; two identities only:
- *  - the browser: `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`,
- *    random — what else would carry it?);
- *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned.
- * Anything else in the group is unattributed: never signalled (it keeps the reap from completing).
+ *  - the browser: its command line starts with the executable launched (argv[0]) and has
+ *    `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random);
+ *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned
+ *    (`cmdlinePattern`).
+ * Anything else in the group is unattributed: never signalled (it keeps the reap from completing). What remains
+ * indistinguishable: a process in the same group, of the same executable, with the exact switch inside one of its
+ * arguments — only something that runs the browser binary in the render's own group could be that.
  */
 function ours(e: RenderEntry, args: string) {
-  if (` ${args} `.includes(` --user-data-dir=${e.dir.workDir}/profile `)) return true;
-  return e.cmdline !== undefined && canonArgs(args) === e.cmdline;
+  if (
+    e.browser &&
+    args.startsWith(`${e.browser} `) &&
+    ` ${args} `.includes(` --user-data-dir=${e.dir.workDir}/profile `)
+  )
+    return true;
+  return e.cmdline !== undefined && e.cmdline.test(args);
 }
 
 /**

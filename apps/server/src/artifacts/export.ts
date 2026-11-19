@@ -388,7 +388,7 @@ export class Renderer {
       // as it landed survives it). A render being reaped stays tracked after the watchdog's exit until its reap is over,
       // so shutdown takes it over. The folder goes in this render's `finally` (`releaseRenderDir`), after the reap.
       if (!worker && pid) {
-        const untrack = trackRender(pid, render!, child.spawnargs);
+        const untrack = trackRender(pid, render!, { argv: child.spawnargs, browser: browser! });
         child.once("exit", (code) => {
           const X = WATCHDOG_EXIT;
           const clean =
