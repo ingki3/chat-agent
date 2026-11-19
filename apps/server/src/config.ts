@@ -157,6 +157,11 @@ const ConfigSchema = z.object({
    */
   CONTEXT_SUMMARY_RATIO: optional(z.coerce.number().min(0.3).max(0.95)),
   CONTEXT_RECENT_MESSAGES: optional(z.coerce.number().int().min(2).max(50)),
+  /**
+   * Public artifact links (#204, docs/ops.md §49): `/artifact/<token>` served without Access or an app login. Off
+   * unless explicitly "1" — and the Cloudflare Access Bypass application for `/artifact/` must exist too.
+   */
+  PUBLIC_LINKS_ENABLED: z.enum(["0", "1"]).default("0"),
   /** Temporary access code for the /gate page until Cloudflare Access is configured. Unset = no gate. */
   TEMP_GATE_CODE: optional(
     z.string().regex(/^\S{8,64}$/, { message: "TEMP_GATE_CODE must be 8–64 characters without spaces" }),
@@ -182,6 +187,8 @@ export type Config = {
   isolationInProcessForTests: boolean;
   tempGateCode?: string | undefined;
   publicHost: string;
+  /** `PUBLIC_LINKS_ENABLED=1` (#204): public artifact links are offered and served. */
+  publicLinks: boolean;
   /** Present when Cloudflare Access is configured. */
   access?: { teamDomain: string; aud: string } | undefined;
   adminEmail: string;
@@ -298,6 +305,7 @@ export function loadConfig(
     isolationInProcessForTests: c.ISOLATION_IN_PROCESS_FOR_TESTS === "1" && c.NODE_ENV !== "production",
     tempGateCode: c.TEMP_GATE_CODE,
     publicHost: c.PUBLIC_HOST,
+    publicLinks: c.PUBLIC_LINKS_ENABLED === "1",
     access:
       c.CF_ACCESS_TEAM_DOMAIN && c.CF_ACCESS_AUD
         ? { teamDomain: c.CF_ACCESS_TEAM_DOMAIN, aud: c.CF_ACCESS_AUD }

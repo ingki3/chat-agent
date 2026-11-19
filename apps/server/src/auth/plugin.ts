@@ -2,7 +2,7 @@ import net from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { CSRF_HEADER, type AuthError, type AuthUser } from "@agentlee/shared";
 import type { Config } from "../config.js";
-import { isApiRequest, routerPath } from "../paths.js";
+import { isApiRequest, isPublicLinkPath, routerPath } from "../paths.js";
 import { knownSecrets } from "../secrets/known.js";
 import type { AccessVerifier } from "./access-jwt.js";
 import "./context.js";
@@ -56,6 +56,19 @@ export const isHealthCheck = (req: FastifyRequest) =>
 export type TrustDeps = { config: Config; verifier: AccessVerifier | undefined };
 
 /**
+ * A public artifact link request (#204) — the one exemption from Access and the app login, and it is exactly this:
+ * public links switched on (`PUBLIC_LINKS_ENABLED=1`), a GET or HEAD, a path of the exact shape `/artifact/<token>`
+ * (`/raw`, `/download`) — `isPublicLinkPath` — **and** the matched route is one of the three public link routes
+ * (`config.publicLink`). Anything else under `/artifact/`, `/artifacts`, `/a/…` or `/api/…` is not.
+ * test/public-links.test.ts sends every other route of the app without an Access JWT and expects it refused.
+ */
+export const isPublicLinkRequest = (req: FastifyRequest, config: Config) =>
+  config.publicLinks &&
+  (req.method === "GET" || req.method === "HEAD") &&
+  req.routeOptions.config?.publicLink === true &&
+  isPublicLinkPath(req.url);
+
+/**
  * Trust boundary (PRD FR-1.3/1.4, issue #9). Runs before every route, static file and the temporary gate:
  * - Host = PUBLIC_HOST → a valid Access JWT is required (fail closed when Access is not configured, unless the
  *   temporary code gate is on).
@@ -65,6 +78,11 @@ export type TrustDeps = { config: Config; verifier: AccessVerifier | undefined }
 export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): void {
   const { config, verifier } = deps;
   app.decorateRequest("ctx", null as never);
+  // A public link answer (#204) never sets a cookie, whatever route code might try.
+  app.addHook("onSend", async (req, reply, payload) => {
+    if (req.ctx?.publicLink) reply.removeHeader("set-cookie");
+    return payload;
+  });
 
   app.addHook("onRequest", async (req, reply) => {
     const hosts = rawHeaderValues(req, "host");
@@ -77,12 +95,16 @@ export function registerTrustBoundary(app: FastifyInstance, deps: TrustDeps): vo
       user: undefined,
       sessionToken: undefined,
       emailMismatch: false,
+      publicLink: isPublicLinkRequest(req, config),
     } as FastifyRequest["ctx"]);
 
     if (host === config.publicHost) {
       ctx.origin = "edge";
       const ip = req.headers["cf-connecting-ip"];
       ctx.clientIp = typeof ip === "string" && net.isIP(ip) ? ip : "unknown";
+      // A public link (#204): Cloudflare lets it through without Access (the Bypass application for `/artifact/`), so
+      // no JWT is required — and one that comes along (a family member's browser) is neither verified nor used.
+      if (ctx.publicLink) return;
       if (!verifier) {
         if (!config.tempGateCode) return deny(reply, 403, "access_not_configured");
         return; // the temporary gate (gate.ts) guards edge requests until Access exists
@@ -132,7 +154,8 @@ export function registerCsrf(app: FastifyInstance, config: Config): void {
 /** Resolves the session cookie to an active user and checks it against the Access email. */
 export function registerSession(app: FastifyInstance, users: UserStore | undefined): void {
   app.addHook("onRequest", async (req) => {
-    if (!users) return;
+    // A public link (#204) reads no cookie: whoever opens it is nobody to the app.
+    if (!users || req.ctx.publicLink) return;
     const token = readCookie(req.headers.cookie, SESSION_COOKIE);
     if (!token) return;
     const user = users.sessionUser(token);

@@ -13,7 +13,7 @@ describe("traceability (real documents)", () => {
 
   it("parses the PRD without structural problems", () => {
     expect(problems).toEqual([]);
-    expect(keys.filter((k) => k.startsWith("FR-"))).toHaveLength(110);
+    expect(keys.filter((k) => k.startsWith("FR-"))).toHaveLength(111);
     expect(keys.filter((k) => /^D\d+$/.test(k))).toHaveLength(8);
     expect(keys.filter((k) => k.startsWith("NFR "))).toHaveLength(11);
     expect(keys.filter((k) => k.startsWith("AC-"))).toHaveLength(14);

@@ -14,6 +14,7 @@ import {
 } from "@agentlee/shared";
 import { ApiError, artifacts, files } from "../api.js";
 import { ShareButton } from "../shares/ShareDialog.js";
+import { PublicLinkButton } from "../public-links/PublicLinkDialog.js";
 import { RichText } from "../chat/RichText.js";
 
 /**
@@ -348,6 +349,9 @@ export function ArtifactToolbar({ v }: { v: ArtifactViewer }) {
         )}
         {v.owner && (
           <ShareButton item={{ kind: "artifact", id: data.id, title: data.title }} className="small ghost" />
+        )}
+        {v.owner && !redacted && data.kind !== "document" && (
+          <PublicLinkButton artifactId={data.id} version={version} title={v.title} className="small ghost" />
         )}
         {(redacted ? [] : ARTIFACT_EXPORTS[data.kind]).map((format) => (
           <button

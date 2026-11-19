@@ -14,6 +14,11 @@ export type RequestContext = {
   sessionToken: string | undefined;
   /** A valid session whose email differs from the Access email — every authenticated route refuses it. */
   emailMismatch: boolean;
+  /**
+   * A public artifact link request (#204, `isPublicLinkRequest`): no Access JWT is required or read, no session cookie
+   * is read, nothing signs anyone in. `accessEmail`, `user` and `sessionToken` stay undefined.
+   */
+  publicLink: boolean;
 };
 
 /** Route-level access rule (`config.auth`). API routes default to "user", other routes (SPA, static) to "public". */
@@ -27,5 +32,10 @@ declare module "fastify" {
     auth?: AuthRule;
     /** Lets a user who must change a temporary password reach this route. */
     allowPendingPassword?: boolean;
+    /**
+     * One of the three public artifact link routes (#204, `public-links/routes.ts`) — the only routes outside Access and
+     * the app login. Together with the exact path shape (`isPublicLinkPath`) and `PUBLIC_LINKS_ENABLED`.
+     */
+    publicLink?: boolean;
   }
 }

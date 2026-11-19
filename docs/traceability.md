@@ -101,7 +101,8 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-14.4 | 아티팩트 공유·포크 | #52 | E | 🟨 (#52 아티팩트 화면의 "가족에게 공유", 복사해서 고치기 — `e2e/share-screens.spec.ts`) |
 | FR-14.5 | 가족 공유 묶음, 공유 알림 | #52, #34 | E | 🟨 (#34 `share_received` 발행 API — 내용 없이 누가·무엇만, 연결은 #29/#52) |
 | FR-14.6 | 공유한 사람·시각, 열람 확인 | #52 | E | 🟨 (#52 `share_views`, `Share.views`, 대화상자의 열람 확인 — `e2e/share-screens.spec.ts`) |
-| FR-14.7 | 가족 계정끼리만 | #29 | I | ⬜ |
+| FR-14.7 | 가족 계정끼리만 (가족 밖 공개는 FR-14.8 하나, v0.7) | #29, #204 | I | ⬜ |
+| FR-14.8 | 아티팩트 공개 링크 — 주인만·버전 고정·1~365일 만료·즉시 끄기·비밀 값 차단·내려받기 (v0.7) | #204 | I, E | 🟨 (#204 `/artifact/<토큰>` — `public-links.test.ts`·`e2e/public-links.spec.ts`, Cloudflare Bypass는 ops 49.1 수동 확인) |
 | FR-15.1 | 이름·이메일·역할 관리 | #35 | E | 🟨 (#35 사용자 탭 수정, 이메일 변경 시 세션 종료, 관리자 이메일은 #36 절차로만(409 `admin_email_change`) — `admin.test.ts`·`e2e/admin.spec.ts`. #36 추가·이메일 수정·비활성화 저장 전 Access 미리보기 — `e2e/access.spec.ts`) |
 | FR-15.2 | Access 자동 반영, 미리보기, 실패 재시도, 현재 관리자 이메일 보호 | #36 | I, M | 🟨 (#36 토큰·앱·정책 등록(정책 1개의 include 이메일만), 미리보기(revision·최종 목록·이번 변경·기존 불일치) → 같은 revision일 때만 반영(409 `access_revision_changed`·`access_preview_stale`), `access_syncs` pending/applying/applied/failed, 멱등 재시도·429 자동 재시도·재시작 시 `interrupted`, 실패해도 앱 변경 저장, 현재 관리자 이메일 제거 거부 `admin_email_protected` — `access-sync.test.ts`(Cloudflare 목 서버). 실계정 M은 AC-13) |
 | FR-15.3 | 동기화 상태 비교 | #36 | I | 🟨 (#36 Access 탭 비교하기: 앱 목록·Access 목록 나란히, 차이 경고, "앱 사용자 목록을 Access에 반영" — `access-sync.test.ts`. 머지 후 ✅) |

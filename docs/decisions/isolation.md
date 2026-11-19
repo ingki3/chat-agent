@@ -470,6 +470,22 @@ MCP 도구 `kr_quote`·`kr_index`·`kr_history`·`kr_search`·`kr_etf`·`fx_usdk
 - **서버 쪽 렌더링(원본 직접 열기·PDF):** `markdown.ts` — micromark + GFM + 수식(이미 lockfile에 있던 판, 새 패키지 없음). `allowDangerousHtml`·`allowDangerousProtocol` 끔, 그림은 링크로 바꿈, 수식은 MathML(스타일시트 불필요). 페이지는 스크립트 없는 CSP 그대로다.
 - **빈 화면의 원인:** 예전 `text/plain` 서빙은 브라우저의 글자 보기 문서가 `color-scheme: light dark`라 시스템이 다크 모드일 때 흰 글자·투명 배경이 되고, 프레임의 `background: #fff` 위에서 아무것도 보이지 않았다.
 
+## 공개 링크 (#204)
+아티팩트의 한 버전을 가족 밖 사람에게 로그인 없이 보여 준다(PRD FR-14.7 v0.7 개정, 운영 절차 `docs/ops.md` 49절). 코드는 `apps/server/src/public-links/`(저장 `store.ts`, 공개 전 확인 `check.ts`, 경로 `routes.ts`), 예외 판정은 `auth/plugin.ts`의 `isPublicLinkRequest`, 경로 모양은 `paths.ts`의 `isPublicLinkPath`, 화면은 `apps/web/src/public-links/PublicLinkDialog.tsx`·`admin/PublicLinksAdmin.tsx`.
+
+- **결정(2026-11-18 사용자):** 같은 호스트 `chat.2prostream.com/artifact/<토큰>`. 이슈 본문이 권장한 별도 호스트·두 번째 리스너는 쓰지 않는다. 그 대신 경계를 서버와 Cloudflare 양쪽에서 **경로 접두 하나**로 고정한다.
+- **Access 예외는 정확히 이것뿐:** `PUBLIC_LINKS_ENABLED=1` **그리고** GET/HEAD **그리고** 경로가 `^/artifact/[A-Za-z0-9_-]{43}(/raw|/download)?$`(쿼리 제외, 라우터처럼 퍼센트 디코딩) **그리고** 맞은 라우트가 `config.publicLink`인 세 라우트 중 하나. 넷 중 하나라도 아니면 지금처럼 Access JWT가 필요하다. `/artifacts`(앱 목록), `/artifact`, `/artifact/`, 다른 접미사, 잘못된 토큰, `/a/:id`, `/api/*`는 예외가 아니다. 시험(`public-links.test.ts`)은 Fastify 경로 표의 **모든 다른 경로**를 JWT 없이 보내 403을 확인한다 — 새 경로가 실수로 예외가 될 수 없다.
+- **요구하지도 쓰지도 않는다:** 예외 요청은 Access JWT를 검증하지 않고(위조 JWT도 같은 응답, 알려진 비밀로 등록하지 않음), 세션 쿠키를 읽지 않으며(`registerSession`이 건너뜀 — `req.ctx.user`는 늘 없음), 임시 코드 게이트도 건너뛴다. 응답에는 `Set-Cookie`를 지운다(`onSend`). #178 자동 로그인은 명시적 API 호출이라 여기서 일어날 수 없다.
+- **같은 출처라서 격리가 더 중요:** 원본(`/artifact/<토큰>/raw`)은 `/a/:id/v/:ver/raw`와 같은 `serveVersion` 결과와 CSP(`sandbox allow-scripts` → 불투명 출처, `connect-src 'none'`, 인라인은 해시·외부는 허용 CDN 정확한 URL+SRI, 정책 B)로만 서빙한다. 그래서 가족이 로그인한 브라우저로 열어도 아티팩트 스크립트는 `document.cookie`·`localStorage`(SecurityError), 부모 문서, `/api`(connect-src)에 닿지 못한다(e2e). Esc 다리 스크립트는 넣지 않는다(둘러싼 앱이 없다).
+- **보기 페이지는 앱이 아니다:** 서버가 만든 최소 HTML — 제목, 내려받기 링크, `<iframe sandbox="allow-scripts">`, 바닥글. 스크립트가 하나도 없고 앱 번들·앱 셸을 싣지 않는다. CSP `default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'; script-src 'none'; connect-src 'none'; frame-ancestors 'none'; …`. 원본의 `frame-ancestors 'self'`라 이 페이지(같은 출처)만 원본을 끼울 수 있다.
+- **헤더:** `Referrer-Policy: no-referrer`(토큰이 Referer로 새지 않게, 보기 페이지에 `<meta name="referrer">`·`rel="noreferrer"`도), `X-Robots-Tag: noindex, nofollow`, `Cache-Control: private, no-store`, `nosniff`, CORP `same-origin`, `Permissions-Policy`.
+- **토큰:** 32바이트 `crypto.randomBytes`(base64url 43자, 256비트). DB에는 SHA-256(hex)만(`public_links.token_hash`, 유일 인덱스로 조회). 만들 때 응답에 한 번만 — 목록·관리자 응답·로그에는 없다. 해시 비교를 상수 시간으로 하지 않는 것은 받아들인다: 조회 키가 256비트 무작위 값의 해시라 시간 차로 얻을 것이 없다.
+- **무효(매 요청 확인, 모두 같은 404):** 꺼짐·만료(1~365일, 만료 없음 없음)·아티팩트(대화와 함께) 삭제(외래 키 cascade)·주인 비활성(조회에서 `users.active` 확인 + 비활성 이벤트로 링크를 영구히 끔)·아티팩트 주인이 링크 주인과 다름·대화 주인이 다름·버전 없음·버전 가림(`REDACTED_CONTENT`)·설정 꺼짐. 고정된 버전 외의 버전·다른 아티팩트에 닿는 매개변수는 없다(`?version=`은 무시).
+- **만들기:** 아티팩트 주인만(정책 `share` 동작 + 핸들러에서 `userId` 재확인). 공유받은 사람·관리자는 403. 청소년 허용. 한 사람당 켜진 링크 20개. 공개 전 확인은 **저장된 원문**(읽을 때의 가림 전)으로 한다: 나중에 등록된 비밀 값도 찾아 **차단**(422 `public_link_secret`), 이메일·전화번호는 개수 경고, 외부 리소스 호스트는 안내. 서빙되는 본문은 늘 읽을 때 다시 가려진다(`ArtifactStore.version`).
+- **내려받기·렌더러:** 원본·HTML·PNG·PDF. PNG·PDF는 기존 격리 렌더러(#51 — 저장된 버전만 받고 요청·쿠키·세션은 받지 않음). 렌더러 보호를 위해 링크별·전체 속도 제한(49.5절)을 앞에 둔다.
+- **관측:** `public_link.event`(고정 코드와 주인 id). 토큰·IP·UA·제목은 남기지 않는다. 조회 수와 마지막 조회 시각만 저장한다.
+- **남은 위험:** (1) Cloudflare 경로 매칭은 자동 시험이 없다 — 운영 49.1의 `curl` 수동 확인(로그인 없이 `/artifacts`·`/api/*`는 Access, `/artifact/<토큰>`만 열림)이 그 시험이다. 서버는 Bypass가 넓게 잡혀도 위 네 조건이 아니면 403을 주므로 앱 경로가 열리지는 않는다(심층 방어). (2) 아티팩트가 자기 프레임을 외부 주소로 탐색하는 것은 #27과 같이 막지 못한다 — 이때 프레임 주소(`/artifact/<토큰>/raw`)가 새어 나갈 수 있지만, 그 토큰으로 볼 수 있는 것은 이미 그 문서가 가진 내용뿐이다. (3) 속도 제한은 메모리라 재시작하면 초기화된다.
+
 ## mermaid 다이어그램 (#182)
 
 채팅 답변과 앱 안 아티팩트 페이지(`/a/:id`)의 ` ```mermaid ` 블록을 공식 `mermaid`로 그린다(앱 쪽 `chat/mermaid.ts`·`MermaidBlock.tsx`, `chat/Markdown.tsx`의 `CodeBlock`에서 갈라짐; 프레임 쪽 `src/mermaid-frame/main.ts`; 서버 `apps/server/src/mermaid-frame.ts`). 다이어그램 원본은 모델 출력이라 믿지 않는다. 경계는 두 겹이다 — **mermaid는 앱 문서에서 돌지 않고**, **결과 SVG도 앱 DOM에 들어가지 않는다.**

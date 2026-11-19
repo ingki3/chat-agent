@@ -10,6 +10,7 @@ import { InstructionsAdmin } from "../admin/InstructionsAdmin.js";
 import { DreamingAdmin } from "../admin/DreamingAdmin.js";
 import { UsageAdmin } from "./Usage.js";
 import { AccessAdmin } from "../admin/AccessAdmin.js";
+import { PublicLinksAdmin } from "../admin/PublicLinksAdmin.js";
 
 const TABS = [
   ["users", "사용자"],
@@ -22,6 +23,7 @@ const TABS = [
   ["system", "시스템 상태"],
   ["backup", "백업"],
   ["usage", "사용량"],
+  ["public-links", "공개 링크"],
 ] as const;
 type Tab = (typeof TABS)[number][0];
 
@@ -63,6 +65,7 @@ export function AdminPage({ selfId }: { selfId: string }) {
           {tab === "system" && <SystemAdmin />}
           {tab === "backup" && <BackupAdmin />}
           {tab === "usage" && <UsageAdmin />}
+          {tab === "public-links" && <PublicLinksAdmin />}
         </div>
       </div>
     </>

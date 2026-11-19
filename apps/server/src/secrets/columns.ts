@@ -463,4 +463,10 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "accepted limitation (as users.email): the admin's sign-in email; responses are scrubbed",
   },
   "admin_email_changes.state": ENUM,
+  // Public artifact links (#204): ids and the token's hash only — the token itself is never stored, and no visitor
+  // data (IP, user agent, referrer) is kept.
+  "public_links.id": ID,
+  "public_links.token_hash": HASH,
+  "public_links.owner_id": ID,
+  "public_links.artifact_id": ID,
 };

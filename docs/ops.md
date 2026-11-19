@@ -177,6 +177,7 @@ pnpm -s release status
    - 두 값이 없으면 공개 도메인 요청은 모두 403(`access_not_configured`)이다. 7.1의 임시 접속 코드를 켠 경우만 예외.
    - Access로 들어온 이메일과 다른 앱 계정으로는 로그인할 수 없고, 기존 세션도 거부된다.
    - 이메일이 없는 서비스 토큰 JWT는 `GET /api/health`(가동률 측정, 9.3절)에만 통과하고 나머지는 403이다.
+   - 유일한 예외는 공개 링크(#204, 49절): `PUBLIC_LINKS_ENABLED=1`일 때 `GET /artifact/<토큰>`(·`/raw`·`/download`) 세 경로만 JWT를 요구하지도 읽지도 않는다. Cloudflare에는 `/artifact/` 경로 전용 Bypass 애플리케이션을 따로 둔다 — 이 앱(경로 비움)은 그대로.
 6. 확인: 시크릿 창에서 접속 → Access 로그인 화면이 먼저 나와야 한다. 허용 안 된 이메일로 코드를 요청하면 코드가 오지 않고 거부된다.
 
 ### 7.1 임시 접속 코드 (Access 전 테스트용)
@@ -2284,3 +2285,54 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
     YTDLP_LIVE_URL='https://www.youtube.com/watch?v=<id>' pnpm vitest run apps/server/test/youtube.test.ts -t live
   ```
 - 수용 기준 수동 확인: "이 유튜브 영상 화자별로 정리해줘" → 음성 파일이 대화 파일로 저장되고 화자별 대본(기록 양식 B).
+
+## 49. 아티팩트 공개 링크 — `/artifact/<토큰>` (#204)
+
+아티팩트의 **한 버전**을 가족 밖 사람에게 로그인 없이 보여 주는 링크(PRD FR-14.7 v0.7 개정, 설계는 `docs/decisions/isolation.md` "공개 링크"). 주소는 앱과 **같은 호스트** `https://chat.2prostream.com/artifact/<토큰>`이다. Cloudflare Access는 `/artifact/` 경로만 건너뛰게(Bypass) 하고, 나머지 모든 경로(앱 목록 화면 `/artifacts`, `/a/:id`, `/api/*` …)는 지금 Access 정책 그대로 둔다. 기본은 **꺼짐**.
+
+### 49.1 켜기 (관리자, 한 번)
+1. **Access Bypass 애플리케이션** (Zero Trust → Access controls → Applications → Add an application → Self-hosted):
+   - 이름: `Agent Lee 공개 링크`. 도메인 `chat.2prostream.com`, **경로 `artifact/`**(끝의 `/`까지 — `artifacts`와 겹치지 않게).
+   - 정책: **Bypass** · Include · **Everyone**. 다른 규칙(이메일·국가 등)은 넣지 않는다. 세션·쿠키 설정은 기본값(Bypass는 로그인 화면도 쿠키도 만들지 않는다).
+   - 기존 앱 전체 애플리케이션(7절, 경로 비움)은 **건드리지 않는다**. Cloudflare는 더 구체적인 경로의 애플리케이션을 먼저 적용한다.
+2. `~/.chat-agent/shared/.env`에 `PUBLIC_LINKS_ENABLED=1`을 넣고 서버를 재시작한다(5절). 값을 지우거나 `0`이면 서버는 `/artifact/…`에도 Access JWT를 요구하고(=Bypass가 있어도 403), 만든 링크도 열리지 않는다(404). **비상시 끄기**: 이 값을 `0`으로 바꾸고 재시작하거나, Bypass 애플리케이션을 지운다(둘 중 하나로 충분 — 둘 다 하면 더 확실).
+3. **수동 확인 (로그인 안 된 상태 — 시크릿 창이나 새 터미널, 쿠키 없음).** 먼저 앱에서 시험용 아티팩트로 링크를 하나 만든다(아래 49.2). `<토큰>`은 그 링크의 끝부분.
+   ```bash
+   H=https://chat.2prostream.com
+   # Access가 막아야 하는 것: 모두 302(Access 로그인으로) 또는 403이어야 한다 — 200이면 즉시 Bypass 앱을 지운다.
+   for p in / /artifacts /artifacts/ /artifact /a/x /api/health /api/public-links /api/artifacts "/artifact/<토큰>/x"; do
+     printf '%-28s ' "$p"; curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "$H$p"
+   done
+   # 열려야 하는 것: 200, 그리고 헤더에 X-Robots-Tag·Referrer-Policy·Cache-Control, Set-Cookie 없음.
+   curl -s -D - -o /dev/null "$H/artifact/<토큰>" | grep -iE '^(HTTP|x-robots-tag|referrer-policy|cache-control|set-cookie|content-security-policy)'
+   curl -s -o /dev/null -w '%{http_code}\n' "$H/artifact/<토큰>/raw"
+   # 없는 토큰: 서버의 404(Access 화면이 아니라 "링크를 열 수 없어요")
+   curl -s -o /dev/null -w '%{http_code}\n' "$H/artifact/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   ```
+   기대값: 첫 묶음은 Access가 302(`…cloudflareaccess.com/…`) — `/api/*`는 403일 수 있다. `/artifact/<토큰>`·`/raw`는 200이고 `Set-Cookie`가 없다(Cloudflare가 `CF_Authorization` 쿠키를 붙이면 Bypass가 아니라 다른 애플리케이션이 잡은 것이니 경로를 다시 확인). 결과를 4절 확인 기록에 날짜와 함께 남긴다(토큰은 적지 않는다).
+4. 시험 링크는 확인 뒤 끈다(49.2).
+
+### 49.2 쓰기 (가족)
+- 아티팩트 화면 도구 막대의 **🔗 공개 링크 만들기**(주인에게만, 켜져 있을 때만 보임). 대화상자는 "링크를 아는 사람은 누구나 로그인 없이 본다" 경고, 서버의 공개 전 확인 결과, 열어 둘 기간(1~365일, 기본 7일 — "만료 없음"은 없음)을 보여 준다. 만들면 주소가 **한 번만** 보인다(복사 단추). 잃어버리면 새로 만든다.
+- 고정되는 것은 **그 버전 하나**다. 뒤에 고친 내용은 보이지 않는다(새 버전을 보이려면 새 링크).
+- 공개 전 확인(서버): 그 버전의 저장된 제목·본문에 **알려진 비밀 값**(비밀 가림 검사기와 같은 목록)이 있으면 **만들 수 없다**(`public_link_secret`). 이메일 주소·전화번호는 개수만 경고, 외부 리소스(스크립트·이미지·스타일·글꼴의 `http(s)://` 주소)는 "방문자 정보가 그 사이트에 전달될 수 있음" 안내(실제로 불러오는 것은 허용 CDN 스크립트뿐 — 나머지는 샌드박스 CSP가 막는다).
+- 내 링크 목록: **가족 공유 화면(`/shared`) → 내 공개 링크**와 대화상자 아래 목록 — 상태(열림·만료·꺼짐), 조회 수·마지막 조회 시각, 만료, **링크 끄기**(즉시 404, 되살릴 수 없음).
+- 한도: 한 사람당 켜진 링크 20개(`public_link_limit`). 청소년 계정도 쓸 수 있다(경고·비밀 값 차단은 같다). 공유받은 사람은 만들 수 없다(내 것으로 복사한 뒤 그 복사본으로).
+- 방문자가 보는 것: 제목, 종류, 샌드박스 프레임 속 그 버전, 내려받기(원본 — HTML·MD·SVG·CSV·코드, HTML 페이지, 종류에 따라 PNG·PDF), 바닥글 "Agent Lee에서 공유됨 · 만료일". 대화·첨부·다른 버전·다른 아티팩트·이메일·이름은 보이지 않는다.
+
+### 49.3 링크가 죽는 때 (모두 즉시 404, 같은 화면)
+만료 시각이 지남 · 주인이나 관리자가 끔 · 그 아티팩트의 대화(와 아티팩트)를 지움 · 주인 계정 비활성화(그 사람의 링크는 모두 꺼지고, 계정을 되살려도 꺼진 채) · `PUBLIC_LINKS_ENABLED`가 꺼짐 · 그 버전이 가려짐(비밀 값 재가림). 매 요청마다 서버가 다시 확인한다.
+
+### 49.4 관리자 화면
+관리자 → **공개 링크** 탭: 열림·만료·꺼짐 개수, 링크마다 만든 사람·상태·만든 때·만료·조회 수, **끄기**. 제목과 내용은 보이지 않는다(FR-1.5).
+
+### 49.5 속도 제한·로그·저장
+- 속도 제한(메모리, 서버 재시작 시 초기화): 보기·원본·HTML/원본 내려받기는 링크마다 1분에 120번, 전체 1분에 1200번(없는 토큰 추측도 전체에 셈). PNG·PDF(격리 브라우저 렌더러, #51)는 링크마다 10분에 10번, 전체 10분에 30번. 넘으면 429 + `Retry-After`. 렌더러 자체의 동시 2·대기 4 한도(18절)도 그대로.
+- 로그: `public_link.event` 하나 — 고정 코드(`publicLinkCode`: created·viewed·disabled·secret·rate_limited)와 만든 사람 id만. **토큰·IP·User-Agent·제목은 남지 않는다.**
+- 저장(0035 마이그레이션, `public_links`): 토큰의 SHA-256(hex)만, 아티팩트 id·버전, 주인, 만든·만료·끈 시각, 조회 수·마지막 조회 시각. IP·UA·Referer는 저장하지 않는다. 아티팩트·사용자 삭제 시 함께 지워진다(외래 키). 백업·복원에 그대로 포함된다(토큰 원문이 없으니 백업으로 링크를 열 수는 없다).
+- 헤더: `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex, nofollow`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`, CORP `same-origin`. 보기 페이지는 스크립트가 하나도 없는 최소 HTML(앱 번들 없음, CSP `script-src 'none'; frame-ancestors 'none'`), 원본은 `/a/:id/v/:ver/raw`와 같은 CSP(`sandbox allow-scripts`, `connect-src 'none'`, 해시·허용 CDN+SRI).
+
+### 49.6 시험
+- `pnpm vitest run apps/server/test/public-links.test.ts`: 앱의 **모든 다른 경로**가 공개 호스트에서 JWT 없이 403(`access_denied`)인지 경로 표 전체로 확인, `/artifacts`·`/artifact`·다른 접미사·잘못된 토큰도 403, 설정 꺼짐이면 예외 없음, 쿠키·JWT를 읽지 않음(세션 조회 0번, 위조 JWT도 같은 응답, `Set-Cookie` 없음), 임시 코드 게이트 예외, 헤더, 버전 고정, 토큰 해시·추측, 만료·끄기(주인·관리자)·대화 삭제·비활성화, 청소년 허용, 공유받은 사람·관리자 거부, 비밀 값 차단·경고, 한도 20, 관리자 응답에 제목 없음, 조회 수(IP·UA 없음), 속도 제한.
+- `e2e/public-links.spec.ts`(`PUBLIC_LINKS_ENABLED=1`): 대화상자로 만들기(경고·기본 7일·한 번 보이는 주소), 로그인한 브라우저로 열어도 아티팩트 스크립트가 쿠키·저장소·부모 창·`/api`에 닿지 못함, 로그인 안 된 방문자가 보고 내려받음, `/api`는 401, 끄면 즉시 404.
+- Cloudflare 쪽(Bypass·경로 경계)은 자동 시험이 없다 — 49.1의 3번 수동 확인으로만.
