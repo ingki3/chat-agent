@@ -36,6 +36,7 @@ import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachmen
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
 import { rereadQuery } from "../chat/reread.js";
+import { listBusy, olderStep, type OlderAsk } from "../chat/older-pages.js";
 import {
   forgetReadsAfterEnd,
   nextEnding,
@@ -357,24 +358,16 @@ export function ChatPage() {
   const target = hash.startsWith("#m-") ? hash.slice(3) : null;
   const found = !!target && !!list?.some((m) => m.id === target);
   const { hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } = messages;
-  /** Whether the messages are being read right now (the query's own state, not the last render's). */
-  const messagesLoading = useCallback(
-    () => qc.isFetching({ queryKey: ["messages", id], exact: true }) > 0,
-    [qc, id],
-  );
-  // "이전 메시지 보기" while the list is being read (a read after a reply's end, a background refetch): an older page
-  // now would cut that read short — the click is kept and done once the read is over (this conversation's only).
-  const olderAsked = useRef<string | null>(null);
+  /** Whether the messages are being read right now — the query's own state (a paused, offline read counts too). */
+  const messagesLoading = useCallback(() => listBusy(qc, ["messages", id]), [qc, id]);
+  // "이전 메시지 보기" while the list is being read: the click waits and goes once it is idle, and is kept until its page
+  // has arrived (chat/older-pages.ts; done by the effect after the schedule-result read below).
+  const olderAsked = useRef<OlderAsk | null>(null);
+  const pageCount = messages.data?.pages.length ?? 0;
   const loadOlder = () => {
-    if (messagesLoading()) olderAsked.current = id;
+    if (messagesLoading()) olderAsked.current = { conversationId: id, pages: pageCount };
     else void fetchNextPage();
   };
-  // (After every render: the read's end re-renders, whenever it came.)
-  useEffect(() => {
-    if (olderAsked.current !== id || isFetching || messagesLoading()) return;
-    olderAsked.current = null;
-    void fetchNextPage();
-  });
   const scrolledTo = useRef<string | null>(null);
   const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
   const [searchStopped, setSearchStopped] = useState<string | null>(null);
@@ -450,13 +443,30 @@ export function ChatPage() {
   const linkHolds = linkSearching || (searchStopped === linkKey && resultId === target);
   const reread = useRef(0);
   useEffect(() => {
-    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure).
-    if (!newResult || resultLoaded || linkHolds || messages.isFetching) return;
+    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure), nor while
+    // the list is being read (a page on its way would be cancelled).
+    if (!newResult || resultLoaded || linkHolds || messages.isFetching || messagesLoading()) return;
     if (reread.current === conv.dataUpdatedAt) return;
     reread.current = conv.dataUpdatedAt;
     void qc.invalidateQueries({ queryKey: ["messages", id] });
     void qc.invalidateQueries({ queryKey: ["active-run", id] });
-  }, [newResult, resultLoaded, linkHolds, messages.isFetching, conv.dataUpdatedAt, id, qc]);
+  }, [newResult, resultLoaded, linkHolds, messages.isFetching, messagesLoading, conv.dataUpdatedAt, id, qc]);
+  // The waiting older-page click — after the effect above (a schedule result's read it starts goes first: the list is
+  // then busy), after every render (the read's end re-renders, whenever it came); kept until its page arrived.
+  useEffect(() => {
+    const step = olderStep(olderAsked.current, {
+      conversationId: id,
+      pages: pageCount,
+      hasNextPage: !!hasNextPage,
+      failed: isFetchNextPageError,
+      busy: isFetching || messagesLoading(),
+    });
+    if (step === "done" || step === "none") olderAsked.current = null;
+    else if (step === "fetch") {
+      olderAsked.current = { ...olderAsked.current!, started: true };
+      void fetchNextPage();
+    }
+  });
   useEffect(() => {
     if (!newResult || !resultLoaded || !linkOk) return;
     void conversations
