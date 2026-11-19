@@ -466,6 +466,90 @@ function neighbours(text: string, units: Unit[]): void {
 
 export type CitationMarker = TextRange & { n: number };
 
+/**
+ * One line of inline markdown (a report's sentence line or heading words, #211) as the parser reads it: its shown
+ * pieces in order — each text node (and each inline code or math span, whole; an image's description) with its source
+ * range, and the top-level inline node it belongs to (a text of its own, or a link, emphasis, strong, strikethrough,
+ * image …). A link's address is never a shown piece. Undefined when the line is not one paragraph (it reads as a list, a quote …).
+ */
+export type InlineLeaf = {
+  start: number;
+  end: number;
+  top: number;
+  topType: string;
+  topStart: number;
+  topEnd: number;
+};
+export function inlineLeaves(text: string): InlineLeaf[] | undefined {
+  const root = parseBlock(text);
+  if (root.children.length !== 1 || root.children[0]!.type !== "paragraph") return undefined;
+  const out: InlineLeaf[] = [];
+  const tops = (root.children[0] as Parents).children as Nodes[];
+  for (const [i, top] of tops.entries()) {
+    const ts = startOf(top);
+    const te = endOf(top);
+    if (ts === undefined || te === undefined) return undefined;
+    const walk = (n: Nodes) => {
+      // An image shows its description (`🖼 alt` on the report page): the alt text, where it is written.
+      if (n.type === "image" || n.type === "imageReference") {
+        const s0 = startOf(n);
+        const at = s0 === undefined ? -1 : text.indexOf(n.alt ?? "", s0 + 2);
+        if (s0 !== undefined && n.alt && at === s0 + 2)
+          out.push({
+            start: at,
+            end: at + n.alt.length,
+            top: i,
+            topType: top.type,
+            topStart: ts,
+            topEnd: te,
+          });
+        return;
+      }
+      if (n.type === "text" || n.type === "inlineCode" || n.type === "inlineMath") {
+        const s0 = startOf(n);
+        const e0 = endOf(n);
+        if (s0 !== undefined && e0 !== undefined)
+          out.push({ start: s0, end: e0, top: i, topType: top.type, topStart: ts, topEnd: te });
+        return;
+      }
+      if ("children" in n) for (const c of n.children) walk(c as Nodes);
+    };
+    walk(top);
+  }
+  return out;
+}
+
+/**
+ * Where the shown text is plain text (#211 review 3): the ranges of the parser's `text` nodes (per screen block, as
+ * `citationUnits` parses them), outside every link, link reference, image and definition — so a `[n]` there is
+ * written text, not a link's label or address, an autolink (`<https://…/[1]>`) or code.
+ */
+export function plainTextRanges(text: string): TextRange[] {
+  const out: TextRange[] = [];
+  let at = 0;
+  for (const block of splitBlocks(text)) {
+    const base = at;
+    at += block.length;
+    const walk = (n: Nodes) => {
+      if (
+        n.type === "link" ||
+        n.type === "linkReference" ||
+        n.type === "image" ||
+        n.type === "imageReference" ||
+        n.type === "definition" ||
+        n.type === "inlineCode" ||
+        n.type === "code"
+      )
+        return;
+      if (n.type === "text" && startOf(n) !== undefined && endOf(n) !== undefined)
+        out.push({ start: base + startOf(n)!, end: base + endOf(n)! });
+      if ("children" in n) for (const c of n.children) walk(c as Nodes);
+    };
+    walk(parseBlock(block));
+  }
+  return out;
+}
+
 /** `[n]` markers of the answer, outside fenced code. Not `[n](link)` (a markdown link) and not `[^n]`. */
 export function citationMarkers(
   text: string,

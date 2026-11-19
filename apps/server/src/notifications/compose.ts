@@ -59,7 +59,14 @@ export type PublishInput =
   /** 기억 정리 (#188): the user's own round failed at its last attempt — a fixed reason code, never content. */
   | { kind: "memory_failed"; code: string | null }
   /** Admin only (#188): allowed shared connections are gone while N users chose them. No names, no content. */
-  | { kind: "dreaming_failed"; users: number };
+  | { kind: "dreaming_failed"; users: number }
+  /**
+   * 깊이 조사 (#211): the job's report is ready. Its title line only ("깊이 조사가 끝났어요: <주제 앞부분>") — the report's
+   * content and sources never go on a lock screen.
+   */
+  | { kind: "research_done"; topic: string; url: string; ref?: ResourceRefInput }
+  /** 깊이 조사 failed, was stopped, or found nothing verified: the topic line with a fixed reason. */
+  | { kind: "research_failed"; topic: string; reason: string; url: string; ref?: ResourceRefInput };
 
 export type ResourceRefInput = { kind: string; id: string };
 
@@ -243,6 +250,23 @@ export function compose(input: PublishInput): Composed {
         title: "기억 정리 실패",
         body: twoLines(memoryFailedBody(input.code)),
         url: "/settings/instructions?doc=dreams",
+      };
+    case "research_done":
+      return {
+        kind: input.kind,
+        title: "깊이 조사",
+        body: oneLine(`깊이 조사가 끝났어요: ${oneLine(input.topic, 30)}`, LINE_MAX),
+        url: safePath(input.url),
+      };
+    case "research_failed":
+      return {
+        kind: input.kind,
+        title: "깊이 조사",
+        body: oneLine(
+          `깊이 조사를 마치지 못했어요: ${oneLine(input.topic, 24)} — ${oneLine(input.reason, 40)}`,
+          LINE_MAX,
+        ),
+        url: safePath(input.url),
       };
     case "dreaming_failed":
       return {

@@ -28,6 +28,10 @@ export const NotificationKind = z.enum([
    * disconnected and users who chose it are paused. How many, no names, no content.
    */
   "dreaming_failed",
+  /** 깊이 조사 (#211) finished with a report — its title line only, never the report's content. */
+  "research_done",
+  /** 깊이 조사 failed, was stopped or reached the cap without anything verified — a fixed reason, no content. */
+  "research_failed",
 ]);
 export type NotificationKind = z.infer<typeof NotificationKind>;
 
@@ -61,6 +65,9 @@ export const NotificationPrefs = z
     memoryProposals: z.boolean().optional(),
     memoryApplied: z.boolean().optional(),
     memoryFailed: z.boolean().optional(),
+    /** 깊이 조사 notifications (#211): "완료" and "실패·중지" — on unless off. */
+    researchDone: z.boolean().optional(),
+    researchFailed: z.boolean().optional(),
     /** The settings' revision (+1 on every write, #188 review 9) — in responses; ignored when saving. */
     rev: z.number().int().nonnegative().optional(),
   })
@@ -80,6 +87,8 @@ export const SaveNotificationPrefsRequest = z
     memoryProposals: z.boolean(),
     memoryApplied: z.boolean(),
     memoryFailed: z.boolean(),
+    researchDone: z.boolean(),
+    researchFailed: z.boolean(),
     /** A page may send back the revision it read; it is ignored (the server counts). */
     rev: z.number().int().nonnegative(),
   })

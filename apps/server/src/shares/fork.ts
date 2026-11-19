@@ -60,6 +60,8 @@ export function remapParts(parts: readonly MessagePart[], ids: IdMap): MessagePa
   };
   return parts.flatMap((p): MessagePart[] => {
     switch (p.type) {
+      // A 깊이 조사 card (#211) is the original's job: the copy keeps its summary and report artifact, not the job.
+      case "research":
       case "reasoning":
       case "citation_ref":
         return [];

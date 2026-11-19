@@ -11,6 +11,7 @@ import { sourceNoteOf, type SourceNoteParts } from "../citations/source-note.js"
 import { markerNumbers } from "../citations/markdown.js";
 import { citationNoteOf, citationView } from "../citations/segments.js";
 import { ArtifactCard } from "../artifacts/ArtifactCard.js";
+import { ResearchCard } from "./ResearchCard.js";
 import { ScheduleCard } from "../schedules/ScheduleCard.js";
 import { proposalIds } from "../schedules/format.js";
 import { MemoryCard } from "../instructions/MemoryCard.js";
@@ -238,6 +239,9 @@ const PartView = memo(function PartView({
       return <span className="chip small">{part.label ?? "출처"}</span>;
     case "file_ref":
       return <FileRef part={part} />;
+    // A 깊이 조사 job (#211): its plan, progress and end.
+    case "research":
+      return <ResearchCard jobId={part.jobId} />;
     default:
       return null;
   }

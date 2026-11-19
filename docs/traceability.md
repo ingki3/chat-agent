@@ -91,7 +91,7 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-12.7 | 내 런타임 연결 관리 | #17, #18 | E | ✅ (#17 설정 → 내 런타임 연결: 추가·테스트·해제, `e2e/connections.spec.ts`. #18 "ChatGPT로 로그인"(코드·링크·취소·다시 로그인), 관리자만 Claude 구독 항목) |
 | FR-12.8 | 알림 설정 | #34 | E | ✅ (기기별 켜기/끄기·방해 금지 — `e2e/notifications.spec.ts`) |
 | FR-13.1 | 웹 푸시, 기기별, iOS 안내 | #34 | M | 🟨 (구현·자동 시험 완료, 실기기 확인 대기 — `docs/evidence/push/checklist.md`) |
-| FR-13.2 | 알림 종류 | #34, #57, #146, #188 | I | 🟨 (#34 종류별 발행 API·전송 직전 권한 재검사 완료, 발행 지점 연결은 #33/#56·#29/#52·#17·#32·#35. #188 기억 정리 실패는 그 사용자에게(`memory_failed`, 끌 수 있음), 관리자에게는 허용한 공용 연결이 끊긴 경우만(`dreaming_failed`) — `dreaming.test.ts`·`notifications.test.ts`) |
+| FR-13.2 | 알림 종류 | #34, #57, #146, #188, #211 | I | 🟨 (#34 종류별 발행 API·전송 직전 권한 재검사 완료, 발행 지점 연결은 #33/#56·#29/#52·#17·#32·#35. #188 기억 정리 실패는 그 사용자에게(`memory_failed`, 끌 수 있음), 관리자에게는 허용한 공용 연결이 끊긴 경우만(`dreaming_failed`) — `dreaming.test.ts`·`notifications.test.ts`. #211 깊이 조사 완료·실패(`research_done`·`research_failed`, 각각 끌 수 있음) — `research.test.ts`) |
 | FR-13.3 | 알림함, 읽음 | #34 | E | ✅ |
 | FR-13.4 | 방해 금지, 끝나면 묶어서 | #34 | U | ✅ (재시작 후 복구 포함 — `apps/server/test/notifications.test.ts`) |
 | FR-13.5 | 본문 2줄, 공유 내용 비노출 | #34 | U | ✅ |
@@ -120,6 +120,19 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | FR-16.7 | 검토 후 반영·자동 반영(대화 도구·기억 정리 공통) | #145, #146 | I, E | 🟨 (#145 사용자 설정 "기억 반영 방식"(`memory_prefs`, 기본 검토 후 반영, 설정 → 내 지침), 자동 반영 = 바로 반영(주체 "대화 도구" 버전) + 되돌리기(직전 버전, 그 뒤 다른 변경이 있으면 409), 민감 범주는 자동 반영에서도 카드, 기준 버전 고정 — 수동 편집 뒤 반영은 만료("다시 요청해 주세요"), 같은 묶음 부분 반영은 기준 버전을 옮기고 남은 결정 재검사 — `memory-tool.test.ts`, `e2e/memory-tool.spec.ts`. #146 기억 정리도 같은 설정: 검토 후 반영은 설정 → 내 지침 → 기억 정리의 카드(결정별 반영·거절·모두 반영), 부분 반영 A → B, 수동 편집 뒤 반영은 만료(409) + 출처를 대기열에 재투입, 검토 대기 문서는 다음 회차가 건드리지 않음(입력은 그 문서용 대기열), 거절은 재제안 안 됨, 자동 반영(주체 "기억 정리") + 알림(건수만, 끌 수 있음) + 되돌리기 — `dreaming.test.ts`, `e2e/dreaming.spec.ts`) |
 | FR-16.8 | 열람 범위(관리자 내용 불가), 공유·포크 | #144, #146 | I | 🟨 (#144 관리자가 다른 사용자의 SOUL·USER·MEMORY·DREAMS·제안을 API로 요청 → 403, 관리자 화면은 AGENT·기본 SOUL만, 공유받은 사람은 원래 답 그대로·포크 뒤 새 답은 포크한 사람의 문서 — `memory.test.ts`·`permissions.test.ts`. #145 기억 제안 카드도 주인만 — 관리자·공유받은 사람 403, 공유 화면의 도구 결과에는 제안 id 없음 — `memory-tool.test.ts`·`permissions.test.ts`. #146 기억 정리 제안 카드도 주인만(관리자 403), 관리자 상태표·API 응답에 내용 없음, DREAMS.md는 건수·시각·결과만, 사용자는 지금 프롬프트를 읽음 — `dreaming.test.ts`, `e2e/dreaming.spec.ts`) |
 | FR-16.9 | 대화 삭제 연동, 백업·가림 | #144, #146 | I | 🟨 (#144 대화 삭제·수정으로 빠진 메시지를 출처로 둔 항목을 현재·모든 버전에서 통째로 지움(되돌리기로 안 돌아옴), 그 버전으로 시작한 그 사용자의 세션 무효 + `deletion_jobs`로 forget(턴 뒤), 재시작 뒤 마저 정리, 백업에 네 표 포함, 비밀 값 가림 등록(`secrets/columns.ts`) — `memory.test.ts`, docs/ops.md §44. #145 대화 도구의 대기 결정은 출처가 빠지면 버리고, 대화를 지우면 제안 표도 함께 지워짐(외래 키), 새 표 가림 등록 — `memory-tool.test.ts`. #146 대화 삭제·수정 시 기억 정리 대기 결정·대기열 항목 삭제, 처리 순번 행도 함께, 비활성화 → 멈춤(대기 제안 유지) → 재활성화 시 7일 넘은 대화 건너뜀, 0031 재구성에서 기존 카드·결정 보존, 새 글 칸 가림 등록 — `dreaming.test.ts`·`dreaming-migration.test.ts`) |
+| FR-17.1 | 깊이 조사 시작, 확인 질문 1회, 계획 카드 승인·고치기·취소(승인 전 검색 없음) | #211 | I, E | 🟨 (승인 전 `sources` 0행·계획 단계 도구 없음, 확인 질문 1회, 고친 계획으로 승인, 취소 뒤 409 — `research.test.ts`. 카드 고치기·승인·취소 — `e2e/deep-research.spec.ts`(데스크톱·모바일). 실제 Claude 연결로 한 번 돌려 보기는 M 남음) |
+| FR-17.2 | 깊이 조사 시작, 확인 질문 1회, 계획 카드 승인·고치기·취소(승인 전 검색 없음) | #211 | I, E | 🟨 (승인 전 `sources` 0행·계획 단계 도구 없음, 확인 질문 1회, 고친 계획으로 승인, 취소 뒤 409 — `research.test.ts`. 카드 고치기·승인·취소 — `e2e/deep-research.spec.ts`(데스크톱·모바일). 실제 Claude 연결로 한 번 돌려 보기는 M 남음) |
+| FR-17.3 | 병렬 서브 연구자(동시 3, 도구·시간 상한), 노트 서버 대조, 보강 최대 2단계 | #211 | I | 🟨 (동시 최대 3·하위 질문 6개, 맞지 않는 노트 버림, 범위별 도구 — `research.test.ts`. 모델 출력 읽기 — `research-report.test.ts`) |
+| FR-17.4 | 병렬 서브 연구자(동시 3, 도구·시간 상한), 노트 서버 대조, 보강 최대 2단계 | #211 | I | 🟨 (동시 최대 3·하위 질문 6개, 맞지 않는 노트 버림, 범위별 도구 — `research.test.ts`. 모델 출력 읽기 — `research-report.test.ts`) |
+| FR-17.5 | 모든 사실 문장 `cite`/`file_cite`, 검증 실패 삭제·"한계"에 수, 마크다운 보고서 + 요약 | #211 | U, I, E | 🟨 (삭제 규칙·번호 다시 매김·출처 목록·이스케이프 — `research-report.test.ts`, 전 과정(삭제 2문장)·첨부 파일 `file_cite` — `research.test.ts`, 보고서 카드 — `e2e/deep-research.spec.ts`) |
+| FR-17.6 | 모든 사실 문장 `cite`/`file_cite`, 검증 실패 삭제·"한계"에 수, 마크다운 보고서 + 요약 | #211 | U, I, E | 🟨 (삭제 규칙·번호 다시 매김·출처 목록·이스케이프 — `research-report.test.ts`, 전 과정(삭제 2문장)·첨부 파일 `file_cite` — `research.test.ts`, 보고서 카드 — `e2e/deep-research.spec.ts`) |
+| FR-17.7 | 백그라운드·체크포인트·재시작 이어하기, 실시간 진행·중지, 30분 하드 상한·단계 예산 | #211 | I, E | 🟨 (수동 시계로 조사 예산 종료(강제 마무리)·작성 초과(대체 보고서, 30분 안), 중지, 재시작 이어하기·마감 지난 재시작, 대화 삭제 — `research.test.ts`. 진행 표시·중지 — `e2e/deep-research.spec.ts`) |
+| FR-17.8 | 백그라운드·체크포인트·재시작 이어하기, 실시간 진행·중지, 30분 하드 상한·단계 예산 | #211 | I, E | 🟨 (수동 시계로 조사 예산 종료(강제 마무리)·작성 초과(대체 보고서, 30분 안), 중지, 재시작 이어하기·마감 지난 재시작, 대화 삭제 — `research.test.ts`. 진행 표시·중지 — `e2e/deep-research.spec.ts`) |
+| FR-17.9 | Claude만(Codex 대화 안내), 청소년 허용, 첨부 파일, 주인만 조작·공유받은 사람 읽기 | #211 | I, E | 🟨 (Codex 대화 409·버튼 비활성 이유, 청소년 지침 포함·동시 1개, 공유받은 사람 GET만 — `research.test.ts`·`permissions.test.ts`·`e2e/deep-research.spec.ts`) |
+| FR-17.10 | Claude만(Codex 대화 안내), 청소년 허용, 첨부 파일, 주인만 조작·공유받은 사람 읽기 | #211 | I, E | 🟨 (Codex 대화 409·버튼 비활성 이유, 청소년 지침 포함·동시 1개, 공유받은 사람 GET만 — `research.test.ts`·`permissions.test.ts`·`e2e/deep-research.spec.ts`) |
+| FR-17.11 | Claude만(Codex 대화 안내), 청소년 허용, 첨부 파일, 주인만 조작·공유받은 사람 읽기 | #211 | I, E | 🟨 (Codex 대화 409·버튼 비활성 이유, 청소년 지침 포함·동시 1개, 공유받은 사람 GET만 — `research.test.ts`·`permissions.test.ts`·`e2e/deep-research.spec.ts`) |
+| FR-17.12 | 완료·실패 알림(한 줄, 방해 금지, 종류별 끄기) | #211 | U, I | 🟨 (`held`·종류별 끄기·한 줄 본문 — `research.test.ts`. 실기기 푸시는 FR-13.1과 같이 M) |
+| FR-17.13 | 외부 Deep Research 백엔드(선택형) | #211 2단계 | — | ⬜ (1단계: 인터페이스 `research/backend.ts`만, 다른 백엔드 id는 400) |
 
 ## 핵심 결정 (D)
 
@@ -168,3 +181,4 @@ PRD v0.6의 모든 항목이 어느 이슈에서 구현되고 어떻게 검증�
 | AC-12 | #44, #32 | U, I | — | 🟨 (fixture 기록별 비용·총 $6.55·엄마 $4.50·아들 구독 43만 토큰·분류 합계 동일·예산 차단 없음 — `test/usage-screen.test.ts` "AC-12". 화면 스크린샷·구독 한도 안내(2)는 양식 B 기록 대기) |
 | AC-13 | #36 | I, M | — | 🟨 (#36 자동 부분: 미리보기 = 실제 반영 최종 목록, 비활성화 시 목록 제거·세션 철회 결과·지연 표시 — `access-sync.test.ts`(목 서버). 실계정 수동 확인(M) 대기 — 절차 `docs/acceptance.md` AC-13·ops.md 45절) |
 | AC-14 | #144, #145, #146 | I, E, M | 예 | 🟨 (USER 선호가 두 런타임 새 대화에 — #144 `context-replay.test.ts`, 기억해줘 — #145 `memory-tool-runtimes.test.ts`, 기억 정리를 켜면 정해진 시각(±1분)에 제안·검토 후 반영·자동 반영·되돌리기 — #146 `dreaming.test.ts`·`dreaming-runtimes.test.ts`·`e2e/dreaming.spec.ts`, 청소년 안전 지침은 사용자 문서로 안 바뀜 — `instructions.test.ts`, 관리자 403 — `memory.test.ts`·`dreaming.test.ts`. 실제 연결로 하루 한 번 운영 확인은 M 남음) |
+| AC-15 | #211 | I, E, M | — | 🟨 (승인 전 검색 없음·30분 안 보고서·확인 안 된 문장 삭제와 수 — `research.test.ts`·`e2e/deep-research.spec.ts`. 실제 연결 확인은 M 남음) |

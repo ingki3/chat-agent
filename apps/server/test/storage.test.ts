@@ -117,6 +117,7 @@ describe("database", () => {
       "public_links",
       "push_session_state",
       "push_subscriptions",
+      "research_jobs",
       "run_events",
       "runs",
       "runtime_policies",

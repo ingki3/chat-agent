@@ -578,6 +578,11 @@ export type CheckResult = {
   quote: string | null;
   locator: CitedLocator | null;
   unitHash: string | null;
+  /**
+   * The search unit the passage was found in (`file_segments.unit` — what `file_cite`'s `page` names first; a TXT unit
+   * spans several lines, so it is not the line shown). Verified passages only.
+   */
+  unit?: number | undefined;
 };
 
 /**
@@ -614,6 +619,7 @@ function verifiedAt(
         }
       : null,
     unitHash: unitHashOf(seg),
+    unit: seg.unit,
   };
 }
 

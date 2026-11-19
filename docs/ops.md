@@ -2363,3 +2363,32 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 - `pnpm vitest run apps/server/test/public-links.test.ts`: 앱의 **모든 다른 경로**가 공개 호스트에서 JWT 없이 403(`access_denied`)인지 경로 표 전체로 확인, `/artifacts`·`/artifact`·다른 접미사·잘못된 토큰도 403, 설정 꺼짐이면 예외 없음, 쿠키·JWT를 읽지 않음(세션 조회 0번, 위조 JWT도 같은 응답, `Set-Cookie` 없음), 임시 코드 게이트 예외, 헤더, 버전 고정, 토큰 해시·추측, 만료·끄기(주인·관리자)·대화 삭제·비활성화, 청소년 허용, 공유받은 사람·관리자 거부, 비밀 값 차단·경고, 한도 20, 관리자 응답에 제목 없음, 조회 수(IP·UA 없음), 속도 제한.
 - `e2e/public-links.spec.ts`(`PUBLIC_LINKS_ENABLED=1`): 대화상자로 만들기(경고·기본 7일·한 번 보이는 주소), 로그인한 브라우저로 열어도 아티팩트 스크립트가 쿠키·저장소·부모 창·`/api`에 닿지 못함, 로그인 안 된 방문자가 보고 내려받음, `/api`는 401, 끄면 즉시 404.
 - Cloudflare 쪽(Bypass·경로 경계)은 자동 시험이 없다 — 49.1의 3번 수동 확인으로만.
+
+## 50. 깊이 조사 — Deep Research (#211)
+
+대화 입력창의 **🔬 깊이 조사**: 계획을 먼저 보여 주고 승인받은 뒤, 서버가 Claude 리드·서브 연구자로 웹·첨부 파일을 조사해 모든 사실 문장이 서버 검증된 마크다운 보고서를 만든다(PRD FR-17, 설계 `docs/decisions/deep-research.md`). 켜고 끄는 설정은 따로 없다 — Claude 런타임을 쓸 수 있는 사용자(FR-11 허용 검사 그대로)면 누구나 쓴다.
+
+### 50.1 쓰는 연결과 비용
+- 그 대화의 Claude 연결·모델·추론 강도로 돈다(개인 연결이 먼저, 없으면 공용 — 대화와 같음). Codex 대화에서는 버튼이 비활성화된다.
+- 한 작업은 리드 계획 1번 + 서브 연구자(하위 질문마다 1번, 보강 포함 최대 12번 정도) + 보강 판단(최대 2번) + 작성 1번의 **일회성 세션**이다. 사용량은 관리자 → 사용량에 `깊이 조사`(`research`) 분류로, 단계마다(`run_id = research:<작업>:<단계>`) 쌓인다. 사용자별 횟수 한도는 없고 한 사람당 동시에 하나만 돈다.
+- 비싼 모델(Opus)을 쓰는 대화에서 시작하면 그 모델로 모든 단계를 돈다. 비용이 걱정되면 대화의 모델을 바꾼 뒤 시작한다.
+
+### 50.2 시간과 재시작
+- 승인 시각부터 **30분 하드 상한**(계획에 쓴 시간은 뺀다). 조사 최대 20분(서브 연구자 하나 6분·도구 12번), 작성·검증 최대 8분, 마무리 1분. 넘으면 그때까지 확인된 것으로 보고서를 쓰고 "시간 상한으로 일부만 조사"라고 적는다.
+- 서버를 재시작해도(릴리스 설치 포함) 작업은 `research_jobs` 체크포인트에서 이어진다. 꺼져 있던 시간도 30분에 센다 — 오래 꺼져 있었으면 확인된 노트로 바로 보고서를 만들고, 노트가 없으면 "서버 재시작으로 중단됐어요"로 실패한다.
+- 대화를 지우면 그 대화의 작업도 바로 멈추고 지워진다.
+
+### 50.3 알림
+`research_done`(완료)·`research_failed`(실패·중지·근거 없음): 알림함 + 웹 푸시, 본문은 주제 앞부분 한 줄. 방해 금지 시간이면 알림함에만(끝나면 묶어서 푸시). 각자 설정 → 알림 → **깊이 조사 알림**에서 끈다.
+
+### 50.4 로그·저장
+- 로그: `research.started`·`approved`·`resumed`·`stopped`·`done`·`failed` — 작업 id(`researchId`), 사용자 id, 개수, 고정 실패 코드(`researchCode`)만. 질문·계획·노트·보고서는 남지 않는다.
+- 저장(0036 마이그레이션): `research_jobs`(질문, 계획, 체크포인트 — 노트에 페이지·파일 구절이 들어 있다, 결과 id·개수), `notification_prefs.research_done`·`research_failed`. 쓸 때마다 알려진 비밀 값을 가리고 재가림 대상이다. 대화·사용자 삭제 시 함께 지워지고 백업·복원에 그대로 포함된다(복원 뒤 진행 중이던 작업은 50.2처럼 이어지거나 끝난다).
+- 프롬프트: `apps/server/instructions/deep-research/{plan,subagent,reflect,writer}.md`(버전 머리말). 고치면 `version`을 올리고 `apps/server/test/__snapshots__/research-report.test.ts.snap`을 갱신한다(`pnpm vitest run apps/server/test/research-report.test.ts -u`, 바뀐 글을 리뷰에서 확인).
+
+### 50.5 외부 Deep Research 백엔드 (2단계 — 아직 없음)
+Gemini Deep Research·OpenAI deep research 같은 외부 백엔드는 다음 단계(#211 2단계)에 붙인다: 관리자가 키·허용 여부를 정하고(공용 연결처럼 암호화 저장), 계획 카드에서 고르며, 외부로 질문(과 고른 첨부)이 간다는 안내, 청소년 기본 끔. 지금은 백엔드 인터페이스(`apps/server/src/research/backend.ts`)만 있고 설정할 것이 없다.
+
+### 50.6 시험
+- `pnpm vitest run apps/server/test/research.test.ts apps/server/test/research-report.test.ts` — FakeRuntime·수동 시계로 전 과정(실제 검색·외부 호출 없음).
+- `E2E_PORT=3211 pnpm e2e e2e/deep-research.spec.ts`(먼저 `pnpm build`) — 계획 카드·진행·중지·Codex 대화.
