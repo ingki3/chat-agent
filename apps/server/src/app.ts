@@ -63,7 +63,7 @@ import { fixtureWebWorker } from "./runtime/fake-citations.js";
 import { sandboxedWorker } from "./web/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
-import { findBrowser, startRenderSweeps } from "./artifacts/browser.js";
+import { findBrowser, onRenderReapIncomplete, startRenderSweeps } from "./artifacts/browser.js";
 import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import { registerReferenceRoutes } from "./references/routes.js";
@@ -1245,6 +1245,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       });
       ownRenderer = own;
       app.addHook("onClose", async () => own.close());
+      // A render whose processes could not be confirmed gone (#215): its folder and lock stay; say how many.
+      onRenderReapIncomplete((count) =>
+        logEvent(app.log, "warn", "artifact.render_reap_incomplete", { count }),
+      );
       // Render folders left by a server or test run that died (#170): only ours, only provably ownerless — now and
       // again later (a folder too young now is judged once it is old enough).
       if (config.env !== "test") {

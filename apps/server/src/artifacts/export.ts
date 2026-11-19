@@ -26,7 +26,8 @@ import {
   CdpPipe,
   killLiveRenders,
   makeRenderDir,
-  removeRenderDir,
+  releaseRenderDir,
+  renderReaped,
   sandboxedLauncher,
   signalRender,
   trackRender,
@@ -337,7 +338,7 @@ export class Renderer {
           // the self-check's look never decides the clean-up
         }
         removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
-      } else if (render) removeRenderDir(render);
+      } else if (render) releaseRenderDir(render); // kept while its reap goes on, or for good if never confirmed (#215)
     };
     // From here on, the folder (and the server's lock descriptor) go in exactly one place: this `finally` (#170).
     try {
@@ -381,9 +382,11 @@ export class Renderer {
       // reaped the browser), not started, exec failed — nothing left. Any other end (a signal: the watchdog itself was
       // interrupted) may leave the browser behind in the group: the server signals the group at that moment — the first
       // it learns of the end, never after seeing the group gone — unless it already killed it itself (its own limits,
-      // or `killLiveRenders`). Then it forgets it. The folder goes in this render's `finally`.
+      // or `killLiveRenders`). The folder goes in this render's `finally` (`releaseRenderDir`).
       // The group is signalled at most once per render (`signalRender`: the state lives on the tracked entry) — by its
-      // limits here, by `killLiveRenders`, or on the watchdog's abnormal end, whichever comes first.
+      // limits here, by `killLiveRenders`, or on the watchdog's abnormal end, whichever comes first. That signal starts
+      // a reap by identity (#215: a browser forked as it landed survives it); a signalled render stays tracked after
+      // the watchdog's exit until its reap is over, so shutdown takes it over.
       if (!worker && pid) {
         const untrack = trackRender(pid, render!);
         child.once("exit", (code) => {
@@ -508,6 +511,8 @@ export class Renderer {
       cdp.close(new CdpError("closed"));
       return result;
     } finally {
+      // Same uid: once a signalled render's reap is over (#215) — its processes confirmed gone, or given up on.
+      if (render) await renderReaped(render);
       removeWorkDir();
     }
   }

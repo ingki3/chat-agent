@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -373,25 +373,168 @@ export const unsandboxedLauncher: Launcher = (s) => {
 };
 
 /**
- * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
- * render's folder and lock, and whether the group has been signalled. `killLiveRenders` is the last word on shutdown
- * (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ * Same-uid renders in this process (#170, #215). An entry is **live** from the spawn until the watchdog's exit is
+ * seen — its group id is then the watchdog's own pid, not yet reaped, so the group is ours to signal. A render whose
+ * group was signalled stays as **reaping** after that, until its processes are confirmed gone (or the bound is hit).
+ * `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in
+ * `index.ts`; the tests' `afterAll`): it takes over both kinds.
  */
-const liveRenders = new Map<number, { dir: RenderDir; signalled: boolean }>();
+type RenderEntry = {
+  pgid: number;
+  dir: RenderDir;
+  /** The one group SIGKILL has been sent. */
+  signalled: boolean;
+  /** The render's `finally` handed the folder over (`releaseRenderDir`): the reap removes it once confirmed. */
+  ownsDir: boolean;
+  /** The reap is over (confirmed, given up, or taken over by shutdown). */
+  over: boolean;
+  timer?: NodeJS.Timeout;
+  /** Told when the reap is over (`renderReaped`). */
+  waiters: (() => void)[];
+};
+const liveRenders = new Map<number, RenderEntry>();
+const reaping = new Set<RenderEntry>();
+/** Folders whose processes were never confirmed gone: kept with their lock (the sweep keeps them while held). */
+const unconfirmed = new WeakSet<RenderDir>();
 
-/** Records a running render; the returned function forgets it (call it once the watchdog has exited). */
+/**
+ * Records a running render; the returned function says its watchdog has exited (call it once, on the exit). A group
+ * never signalled is then forgotten; a signalled one stays until its reap is over (#215).
+ */
 export function trackRender(pgid: number, dir: RenderDir): () => void {
-  const entry = { dir, signalled: false };
+  const entry: RenderEntry = { pgid, dir, signalled: false, ownsDir: false, over: false, waiters: [] };
   liveRenders.set(pgid, entry);
   return () => {
-    if (liveRenders.get(pgid) === entry) liveRenders.delete(pgid);
+    if (liveRenders.get(pgid) !== entry) return;
+    liveRenders.delete(pgid);
+    if (entry.signalled && !entry.over) reaping.add(entry);
   };
 }
 
+/** A process as `ps` lists it. */
+export type RenderProcess = { pid: number; pgid: number; zombie: boolean; args: string };
+
+/** Every process (`ps`, full command lines: a control character in one is printed escaped, never as a new line). */
+const PS_ARGS = ["axww", "-o", "pid=,pgid=,stat=,args="];
+export function parsePs(out: string): RenderProcess[] {
+  const rows: RenderProcess[] = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/.exec(line);
+    if (m) rows.push({ pid: Number(m[1]), pgid: Number(m[2]), zombie: m[3]!.startsWith("Z"), args: m[4]! });
+  }
+  return rows;
+}
+const listSync = (): RenderProcess[] | undefined => {
+  const r = spawnSync("/bin/ps", PS_ARGS, { encoding: "utf8", timeout: 2000, maxBuffer: 64 << 20 });
+  return r.status === 0 ? parsePs(r.stdout) : undefined;
+};
+const listAsync = (done: (rows: RenderProcess[] | undefined) => void) => {
+  execFile("/bin/ps", PS_ARGS, { encoding: "utf8", timeout: 2000, maxBuffer: 64 << 20 }, (e, out) =>
+    done(e ? undefined : parsePs(out)),
+  );
+};
+
+/** The reap's timing (and, tests only, its process list). */
+const reap = {
+  everyMs: 50,
+  forMs: 5000,
+  shutdownMs: 1000,
+  list: undefined as (() => RenderProcess[] | undefined) | undefined,
+};
+/** Tests only: other timing or a given process list; returns the restore. */
+export function setRenderReapForTests(o: Partial<typeof reap>): () => void {
+  const before = { ...reap };
+  Object.assign(reap, o);
+  return () => void Object.assign(reap, before);
+}
+let onIncomplete: ((count: number) => void) | undefined;
+/** Told how many renders were given up on at once (never a path): the app logs it. */
+export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined) {
+  onIncomplete = fn;
+}
+
 /**
- * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**: the render's limits,
- * the watchdog's abnormal end and shutdown all come here, and whichever is first sends the one signal. An untracked
- * group (already gone, or forgotten) is never signalled.
+ * A render's processes, by **identity**: still running (not a zombie), in its group, and carrying its own folder
+ * (`agentlee-render-XXXXXX`, random) on the command line — the browser's `--user-data-dir`, the watchdog's argv and
+ * so a child it forked before exec. A process that merely reuses the group id or a pid has another command line, so
+ * it never matches.
+ */
+function membersOf(e: RenderEntry, rows: RenderProcess[]) {
+  const d = e.dir.workDir;
+  return rows.filter(
+    (r) =>
+      !r.zombie &&
+      r.pgid === e.pgid &&
+      (r.args.includes(`${d}/`) || r.args.includes(`${d} `) || r.args.endsWith(d)),
+  );
+}
+
+/** One reap step on a listing: kills what matches; true once nothing does (confirmed gone). */
+function reapStep(e: RenderEntry, rows: RenderProcess[]): boolean {
+  const left = membersOf(e, rows);
+  for (const r of left) {
+    try {
+      process.kill(r.pid, "SIGKILL");
+    } catch {
+      // gone meanwhile
+    }
+  }
+  return left.length === 0;
+}
+
+/** The reap is over: confirmed (the folder goes, if handed over) or not (folder and lock kept, counted). */
+function endReap(e: RenderEntry, confirmed: boolean) {
+  e.over = true;
+  if (e.timer) clearTimeout(e.timer);
+  reaping.delete(e);
+  if (liveRenders.get(e.pgid) === e) liveRenders.delete(e.pgid);
+  if (!confirmed) unconfirmed.add(e.dir);
+  if (e.ownsDir) releaseRenderDir(e.dir);
+  for (const w of e.waiters.splice(0)) w();
+}
+
+/**
+ * Resolves once the render of this folder has no reap going (at once when it was never signalled): the render's
+ * `finally` waits for it, so a render is over only when its processes are confirmed gone or given up on (bounded by
+ * the reap's own deadline).
+ */
+export function renderReaped(dir: RenderDir): Promise<void> {
+  const e = [...reaping, ...liveRenders.values()].find((x) => x.dir === dir && x.signalled && !x.over);
+  return e ? new Promise((r) => e.waiters.push(r)) : Promise.resolve();
+}
+
+/**
+ * The reap after the group SIGKILL (#215). On macOS that signal, landing while the watchdog is inside `fork`, kills
+ * the watchdog but can miss the child being made, which then execs the browser (PPID 1, same group). So the render's
+ * processes are listed and killed **by identity** (`membersOf`) every `everyMs` until none is left — the group id
+ * itself is never signalled again (once its leader is reaped it may be anyone's). The deadline (`forMs`) is checked
+ * before each step (the listing included); past it the reap gives up and says so (`onRenderReapIncomplete`).
+ */
+function startReap(e: RenderEntry) {
+  const deadline = performance.now() + reap.forMs;
+  const step = () => {
+    if (e.over) return;
+    if (performance.now() >= deadline) {
+      endReap(e, false);
+      onIncomplete?.(1);
+      return;
+    }
+    const go = (rows: RenderProcess[] | undefined) => {
+      if (e.over) return;
+      if (rows && performance.now() < deadline && reapStep(e, rows)) endReap(e, true);
+      else e.timer = setTimeout(step, reap.everyMs).unref();
+    };
+    if (reap.list) go(reap.list());
+    else listAsync(go);
+  };
+  e.timer = setTimeout(step, reap.everyMs).unref();
+}
+
+/**
+ * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**, and only while the
+ * watchdog's exit has not been seen (its pid, the group id, is not reaped yet). The render's limits, the watchdog's
+ * abnormal end and shutdown all come here; whichever is first sends the one signal, and starts the reap by identity
+ * that makes sure nothing of the render survives it (#215). An untracked group is never signalled.
  */
 export function signalRender(pgid: number) {
   const entry = liveRenders.get(pgid);
@@ -402,21 +545,77 @@ export function signalRender(pgid: number) {
   } catch {
     // already gone
   }
+  startReap(entry);
 }
 
-/** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
-export function killLiveRenders(): number {
-  const n = liveRenders.size;
-  for (const [pgid, { dir }] of [...liveRenders]) {
-    signalRender(pgid);
-    removeRenderDir(dir);
+/**
+ * The render's own clean-up of its folder (its `finally`): removed now — unless its reap is still going (then the
+ * reap removes it once its processes are confirmed gone), or they never were (then the folder and its lock stay for the
+ * sweep, which keeps them while the lock is held; only the server's descriptor is closed).
+ */
+export function releaseRenderDir(dir: RenderDir) {
+  const e = [...reaping].find((x) => x.dir === dir);
+  if (e && !e.over) {
+    e.ownsDir = true;
+    return;
   }
-  liveRenders.clear();
-  return n;
+  if (unconfirmed.has(dir)) {
+    try {
+      if (dir.lockFd >= 0) fs.closeSync(dir.lockFd);
+    } catch {
+      // already closed
+    }
+    dir.lockFd = -1;
+    return;
+  }
+  removeRenderDir(dir);
 }
 
-/** How many renders are tracked (tests). */
+const pause = new Int32Array(new SharedArrayBuffer(4));
+/**
+ * Shutdown (synchronous: safe in an `exit` hook, which runs no timer): SIGKILLs every live render's group, takes over
+ * every reap in progress, and reaps them all in place by identity (one listing per step, deadline `shutdownMs`
+ * checked before each). Confirmed renders lose their folders; any left past the deadline keep folder and lock and are
+ * counted (`onRenderReapIncomplete`). Returns how many renders were live.
+ */
+export function killLiveRenders(): number {
+  const live = [...liveRenders.values()];
+  for (const e of live) {
+    if (!e.signalled) {
+      e.signalled = true;
+      try {
+        process.kill(-e.pgid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
+  const all = [...live.filter((e) => !e.over), ...[...reaping].filter((e) => !e.over)];
+  for (const e of all) {
+    if (e.timer) clearTimeout(e.timer);
+    e.ownsDir = true; // shutdown removes the folders (a render's own `finally` may never run)
+  }
+  const deadline = performance.now() + reap.shutdownMs;
+  let left = all;
+  while (left.length && performance.now() < deadline) {
+    const rows = (reap.list ?? listSync)();
+    if (rows && performance.now() < deadline) {
+      const done = left.filter((e) => reapStep(e, rows));
+      for (const e of done) endReap(e, true);
+      left = left.filter((e) => !done.includes(e));
+    }
+    if (left.length) Atomics.wait(pause, 0, 0, 10);
+  }
+  for (const e of left) endReap(e, false);
+  if (left.length) onIncomplete?.(left.length);
+  liveRenders.clear();
+  return live.length;
+}
+
+/** How many renders are tracked as live (tests). */
 export const liveRenderCount = () => liveRenders.size;
+/** How many reaps are still going (tests). */
+export const reapingRenderCount = () => reaping.size;
 
 /**
  * Folders younger than this are never swept (far past `WATCHDOG_MAX_SEC`). The server sweeps at start and again every
