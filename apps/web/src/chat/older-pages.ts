@@ -13,20 +13,25 @@ export function listBusy(qc: QueryClient, queryKey: QueryKey): boolean {
   return !!s && s.fetchStatus !== "idle";
 }
 
-/** A waiting click: the conversation, how many pages the list had when it was made, and whether it was asked for. */
-export type OlderAsk = { conversationId: string; pages: number; started?: boolean };
+/**
+ * A waiting click: the conversation, how many pages the list had when it was made, and — once its page was asked for —
+ * the query's error count at that moment (`errorUpdateCount`): only an error after it is its own.
+ */
+export type OlderAsk = { conversationId: string; pages: number; errorsAtStart?: number };
 
 /**
- * What to do with a waiting click now: `done` (its page arrived, there is none, or it failed — nothing more is asked),
+ * What to do with a waiting click now: `done` (its page arrived, there is none, or its own request failed),
  * `wait` (the list is busy), or `fetch` (ask for the page now).
  */
 export function olderStep(
   ask: OlderAsk | null,
-  now: { conversationId: string; pages: number; hasNextPage: boolean; failed: boolean; busy: boolean },
+  now: { conversationId: string; pages: number; hasNextPage: boolean; errors: number; busy: boolean },
 ): "none" | "done" | "wait" | "fetch" {
   if (!ask || ask.conversationId !== now.conversationId) return "none";
-  // (A failure counts only for a fetch it made: an earlier page's error left over is not its answer.)
-  if (now.pages > ask.pages || !now.hasNextPage || (ask.started && now.failed)) return "done";
+  if (now.pages > ask.pages || !now.hasNextPage) return "done";
   if (now.busy) return "wait";
+  // Its own request failed (an error since it started, and nothing on its way): nothing more is asked. An error left
+  // over from before (a failed background read) is not its answer; a request cancelled without an error is asked again.
+  if (ask.errorsAtStart !== undefined && now.errors > ask.errorsAtStart) return "done";
   return "fetch";
 }

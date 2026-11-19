@@ -20,17 +20,18 @@ function list(answer: (page: number | undefined) => Promise<Page>) {
     },
   );
   const unsubscribe = observer.subscribe(() => {});
+  const errors = () => qc.getQueryState(["messages", "c1"])?.errorUpdateCount ?? 0;
   const now = (): Parameters<typeof olderStep>[1] => {
     const r = observer.getCurrentResult();
     return {
       conversationId: "c1",
       pages: r.data?.pages.length ?? 0,
       hasNextPage: r.hasNextPage,
-      failed: r.isFetchNextPageError,
+      errors: errors(),
       busy: listBusy(qc, ["messages", "c1"]),
     };
   };
-  return { qc, observer, unsubscribe, now };
+  return { qc, observer, unsubscribe, now, errors };
 }
 
 afterEach(() => onlineManager.setOnline(true));
@@ -64,7 +65,7 @@ describe("a waiting older-page click (#103 review)", () => {
       p === undefined ? { items: ["n"], nextBefore: 1 } : { items: ["old"], nextBefore: null },
     );
     await flush();
-    const ask: OlderAsk = { conversationId: "c1", pages: 1, started: true };
+    const ask: OlderAsk = { conversationId: "c1", pages: 1, errorsAtStart: l.errors() };
     // The click's page fetch, then another read's invalidate cancels it.
     void l.observer.fetchNextPage();
     void l.qc.invalidateQueries({ queryKey: ["messages", "c1"] });
@@ -76,10 +77,49 @@ describe("a waiting older-page click (#103 review)", () => {
     l.unsubscribe();
   });
 
-  it("an earlier page's error left over is not the click's answer; its own failure ends it", () => {
-    const base = { conversationId: "c1", pages: 1, hasNextPage: true, failed: true, busy: false };
-    expect(olderStep({ conversationId: "c1", pages: 1 }, base)).toBe("fetch");
-    expect(olderStep({ conversationId: "c1", pages: 1, started: true }, base)).toBe("done");
+  it("a background read failed before: the click's page fetch cancelled by the settle read is asked for again (not taken as failed)", async () => {
+    let failNewest = false;
+    let hold = false;
+    let release: (() => void) | undefined;
+    const l = list(async (p) => {
+      if (p !== undefined) return { items: ["old"], nextBefore: null };
+      if (failNewest) throw new Error("background read failed");
+      if (hold) await new Promise<void>((r) => (release = r)); // the settle read, held
+      return { items: ["n"], nextBefore: 1 };
+    });
+    await flush();
+    // A background read fails: an error is left over.
+    failNewest = true;
+    await l.qc.refetchQueries({ queryKey: ["messages", "c1"] }).catch(() => {});
+    expect(l.qc.getQueryState(["messages", "c1"])?.status).toBe("error");
+    failNewest = false;
+    // The queued click asks for its page …
+    const ask: OlderAsk = { conversationId: "c1", pages: 1, errorsAtStart: l.errors() };
+    void l.observer.fetchNextPage();
+    // … while that request is on its way the leftover error is not its answer.
+    expect(olderStep(ask, l.now())).toBe("wait");
+    // The settle read cancels it (no error of its own) …
+    hold = true;
+    const settle = l.qc.refetchQueries({ queryKey: ["messages", "c1"] }, { cancelRefetch: true });
+    await flush();
+    expect(olderStep(ask, l.now())).toBe("wait");
+    release?.();
+    await settle.catch(() => {});
+    await flush();
+    // … so it is asked for again, not dropped.
+    expect(l.observer.getCurrentResult().data?.pages).toHaveLength(1);
+    expect(olderStep(ask, l.now())).toBe("fetch");
+    l.unsubscribe();
+  });
+
+  it("only its own failure ends it: an error since its request started, the list idle", () => {
+    const base = { conversationId: "c1", pages: 1, hasNextPage: true, errors: 3, busy: false };
+    expect(olderStep({ conversationId: "c1", pages: 1 }, base)).toBe("fetch"); // not asked yet
+    expect(olderStep({ conversationId: "c1", pages: 1, errorsAtStart: 3 }, base)).toBe("fetch"); // an old error only
+    expect(olderStep({ conversationId: "c1", pages: 1, errorsAtStart: 2 }, base)).toBe("done");
+    expect(olderStep({ conversationId: "c1", pages: 1, errorsAtStart: 2 }, { ...base, busy: true })).toBe(
+      "wait",
+    );
     expect(olderStep({ conversationId: "c0", pages: 1 }, base)).toBe("none");
     expect(olderStep(null, base)).toBe("none");
   });

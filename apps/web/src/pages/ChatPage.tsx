@@ -458,12 +458,15 @@ export function ChatPage() {
       conversationId: id,
       pages: pageCount,
       hasNextPage: !!hasNextPage,
-      failed: isFetchNextPageError,
+      errors: qc.getQueryState(["messages", id])?.errorUpdateCount ?? 0,
       busy: isFetching || messagesLoading(),
     });
     if (step === "done" || step === "none") olderAsked.current = null;
     else if (step === "fetch") {
-      olderAsked.current = { ...olderAsked.current!, started: true };
+      olderAsked.current = {
+        ...olderAsked.current!,
+        errorsAtStart: qc.getQueryState(["messages", id])?.errorUpdateCount ?? 0,
+      };
       void fetchNextPage();
     }
   });
