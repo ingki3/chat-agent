@@ -121,6 +121,8 @@ function spyEgress() {
  */
 const TEST_RENDER_MS = 60_000;
 const TEST_SAMPLE_MS = 15_000;
+/** Tests that drive the real browser: room for a couple of renders at their own budget on a loaded machine (#207). */
+const SLOW = { timeout: 120_000 };
 
 function renderer(o: Partial<RendererOptions> = {}) {
   const spy = spyEgress();
@@ -234,7 +236,7 @@ function selfNavigation(suffix: string, also: () => boolean = () => true) {
   };
 }
 
-describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
+describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", SLOW, () => {
   it("samples: a chart PNG and a document PDF (also table, markdown and code PDFs, and an SVG PNG)", async () => {
     const { r } = renderer();
     const out = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-export-sample-"));
@@ -278,7 +280,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(connects).toEqual([]);
     // The one request CSP cannot stop — the document navigating itself to the app — was refused by the renderer.
     expect(blocked).toContain(`http://127.0.0.1:${app.port}/api/nav`);
-  }, 60_000);
+  });
 
   // Each network layer alone (the others off) stops the same document: no single mistake opens the way.
   describe("each layer alone", () => {
@@ -305,7 +307,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
       );
       // (Subresources are also held back by Chrome's own local-network rules; the navigation is not.)
       expect(hits).toContain("/api/nav");
-    }, 30_000);
+    });
 
     it("CSP alone does not stop the document navigating itself to the app (why the other layers exist)", async () => {
       const { hits } = await run(
@@ -313,7 +315,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
         { reaches: true },
       );
       expect(hits).toEqual(["/api/nav"]);
-    }, 30_000);
+    });
 
     it("request interception alone", async () => {
       const { hits, blocked } = await run({
@@ -330,7 +332,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
           "https://example.org/public.png",
         ]),
       );
-    }, 30_000);
+    });
 
     it("the egress proxy alone (loopback included: Chrome may not bypass it for 127.0.0.1 or localhost)", async () => {
       const { hits, lookups, connects } = await run({
@@ -341,7 +343,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
       // Only the CDN host may be resolved or reached; example.org, private and loopback addresses never are.
       expect(lookups.filter((h) => !RENDER_EGRESS_HOSTS.includes(h))).toEqual([]);
       expect(connects).toEqual([]);
-    }, 30_000);
+    });
 
     it.skipIf(!darwin)(
       "the macOS process sandbox alone (no CSP, no interception, no proxy switch)",
@@ -352,7 +354,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
         });
         expect(hits).toEqual([]);
       },
-      30_000,
+      SLOW.timeout,
     );
   });
 
@@ -367,7 +369,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect((await bare.r.render(job("html", html, "pdf"))).ok).toBe(true);
     expect(bare.blocked).toContain(other);
     expect(bare.blocked).not.toContain(CDN_ALLOW_LIST[0]!.url);
-  }, 30_000);
+  });
 
   it("no app cookies or session: empty fresh profile, two environment variables, nothing kept afterwards", async () => {
     const seen: { env: Record<string, string>; workDir: string; profileEntries: string[] }[] = [];
@@ -402,7 +404,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(JSON.stringify(inside[1])).toContain(DOCUMENT_URL);
     // The same sandboxing CSP as the served original: an opaque origin.
     expect(inside[2]).toMatchObject({ result: { value: "null" } });
-  }, 30_000);
+  });
 
   it("time limit: a document that never stops is killed (export_timeout), with its process", async () => {
     let pid: number | undefined;
@@ -417,7 +419,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(res).toEqual({ ok: false, code: "export_timeout" });
     expect(Date.now() - started).toBeLessThan(8000);
     expect(alive(pid!)).toBe(false);
-  }, 30_000);
+  });
 
   it("memory limit: above it the browser is killed (export_limit); unmeasurable counts as above (fail closed)", async () => {
     // An HTML document (its scripts get time to settle): the monitor samples while it renders.
@@ -428,7 +430,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(await blind.r.render(doc)).toEqual({ ok: false, code: "export_limit" });
     const fine = renderer();
     expect((await fine.r.render(job("chart", chart, "png"))).ok).toBe(true);
-  }, 60_000);
+  });
 
   it("reply and file size limits, and at most `concurrent` renders at once", async () => {
     const big = renderer({ limits: { maxReplyBytes: 2000 } });
@@ -448,7 +450,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     const results = await Promise.all([1, 2, 3].map(() => one.r.render(job("chart", chart, "png"))));
     expect(results.map((r) => (r.ok ? "ok" : r.code))).toEqual(["ok", "ok", "export_busy"]);
     expect(most).toBe(1);
-  }, 60_000);
+  });
 });
 
 function alive(pid: number) {
@@ -1595,7 +1597,7 @@ const afterStunAttempt =
   };
 const dropWebrtcPolicy = (a: string[]) => a.filter((x) => !x.startsWith("--force-webrtc-ip-handling-policy"));
 
-describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", () => {
+describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", SLOW, () => {
   it("WebRTC: no UDP leaves the renderer (control: without the policy switch and the sandbox it does)", async () => {
     const control = await udpListener();
     const c = renderer({
@@ -1622,7 +1624,7 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
     expect(browserArgs("/p", undefined).find((a) => a.startsWith("--disable-features="))).toMatch(
       /[=,]RenderDocument(,|$)/,
     );
-  }, 60_000);
+  });
 
   it("redirects: every hop is checked again — an allowed URL that redirects to the app is stopped at the hop", async () => {
     app.hits.length = 0;
@@ -1648,7 +1650,7 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
     // The allowed first hop went out (so the test does exercise a redirect); its target never did.
     expect(app.hits.map((h) => h.url)).toEqual(["/redirect-to-api"]);
     expect(blocked).toContain(`http://127.0.0.1:${app.port}/api/after-redirect`);
-  }, 30_000);
+  });
 
   it("data:, blob: and file: — a frame, a worker or a navigation from them reaches nothing, and no local file is read", async () => {
     app.hits.length = 0;
@@ -1680,10 +1682,10 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
     expect(app.hits).toEqual([]);
     expect(JSON.stringify(seen)).not.toContain("FAMILY-SECRET");
     expect(JSON.stringify(seen)).toContain(DOCUMENT_URL);
-  }, 30_000);
+  });
 });
 
-describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production launcher)", () => {
+describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production launcher)", SLOW, () => {
   it("positive control: with every browser layer off, a document still renders inside the sandbox", async () => {
     const { r } = renderer({
       launcher: sandboxedLauncher,
@@ -1691,7 +1693,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     });
     const png = ok(await r.render(job("chart", chart, "png")));
     expect(isPng(png)).toBe(true);
-  }, 30_000);
+  });
 
   it("files: the browser itself (asked over DevTools, past every web rule) cannot open a file outside its folders", async () => {
     const secretDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-secret-")));
@@ -1718,7 +1720,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     };
     expect(await read(unsandboxedLauncher)).toContain("FAMILY-SECRET"); // control
     expect(await read(sandboxedLauncher)).not.toContain("FAMILY-SECRET");
-  }, 60_000);
+  });
 
   it("WebRTC/UDP with the policy switch dropped and every browser layer off: the kernel stops the UDP", async () => {
     const l = await udpListener();
@@ -1734,7 +1736,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     });
     expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
     expect(l.got.n).toBe(0);
-  }, 60_000);
+  });
 
   it("the renderer's network policy, probed directly: no DNS, no UDP, no TCP but the proxy port", async () => {
     const l = await udpListener();
@@ -1773,5 +1775,5 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     expect(out.udpDns).toMatch(/^err:/);
     expect(out.lookup).toMatch(/^err:/);
     expect(l.got.n).toBe(0);
-  }, 30_000);
+  });
 });
