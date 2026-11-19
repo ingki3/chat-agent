@@ -395,8 +395,8 @@ type RenderEntry = {
   waiters: (() => void)[];
   /** The watchdog's whole command line as launched (`cmdlinePattern`), its identity in a listing; none when unknown. */
   cmdline?: RegExp;
-  /** The browser executable launched (its argv[0]), part of the browser's identity; none when unknown. */
-  browser?: string;
+  /** The browser's identity (`browserPattern`): the executable launched and its profile switch; none when unknown. */
+  browser?: RegExp;
 };
 const liveRenders = new Map<number, RenderEntry>();
 const reaping = new Set<RenderEntry>();
@@ -418,7 +418,7 @@ export function trackRender(
     pgid,
     dir,
     ...(who.argv?.length ? { cmdline: cmdlinePattern(who.argv.join(" ")) } : {}),
-    ...(who.browser ? { browser: who.browser } : {}),
+    ...(who.browser ? { browser: browserPattern(who.browser, dir.workDir) } : {}),
     signalled: false,
     leaderGone: false,
     ownsDir: false,
@@ -459,7 +459,8 @@ export function psListing(r: PsRun): RenderProcess[] | undefined {
     return undefined;
   return parsePs(r.stdout);
 }
-const PS_OPTS = { encoding: "utf8" as const, maxBuffer: 64 << 20 };
+/** `ps` in the C locale (#215): how it prints a byte then does not depend on the server's locale (`psPattern`). */
+const PS_OPTS = { encoding: "utf8" as const, maxBuffer: 64 << 20, env: { LC_ALL: "C", LANG: "C" } };
 const budget = (ms: number) => Math.max(1, Math.ceil(ms));
 /** The listing, within `ms` (the caller's remaining budget); undefined when it failed, was cut or ran out of time. */
 const listSync = (ms: number): RenderProcess[] | undefined => {
@@ -500,41 +501,70 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
   onIncomplete = fn;
 }
 
+const reEscape = (t: string) => t.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+const octal = (b: number) => `\\${b.toString(8).padStart(3, "0")}`;
+/** What `ps` may print for one byte that it does not print as it is (`psPattern`). */
+function byteForms(b: number): string[] {
+  const forms = [octal(b), "?"];
+  const m = b & 0x7f;
+  const caret = m === 0x7f ? "^?" : m < 0x20 ? `^${String.fromCharCode(m + 0x40)}` : undefined;
+  if (b < 0x80) {
+    if (caret) forms.push(caret);
+  } else if (caret) forms.push(`M${caret}`);
+  else if (m > 0x20) forms.push(`M-${String.fromCharCode(m)}`);
+  return forms;
+}
 /**
- * What `ps` may print for a command line spawned as `spawned` (argv joined with spaces), as an exact pattern. `ps`
- * changes control characters only (C0, DEL, C1): macOS prints them escaped (`\012`, a C1 character as its UTF-8 bytes
- * `\302\205`, or `^A` / `^?`), Linux as `?`. Every other character — printable non-ASCII included — must be printed as
- * it is, so `가.mjs` is not `나.mjs`.
+ * A regular-expression source for what `ps` prints of `text` (part of a command line). `ps` (#215) prints printable
+ * ASCII as it is and changes the rest **byte by byte**, in the C locale it is run in (`PS_OPTS`): macOS (`vis`) as an
+ * octal escape (`\012`), `^J` / `^?`, or `M-k` / `M^L` for a byte above 0x7f; Linux as `?`. Each byte may only take its
+ * own forms — `\011` is not a new line. A printable non-ASCII character may also appear as it is (a UTF-8 locale).
  */
-export function cmdlinePattern(spawned: string): RegExp {
-  const control = String.raw`(?:(?:\\[0-7]{3})+|\^[@-_?]|\?)`;
+export function psPattern(text: string): string {
   let src = "";
-  for (const ch of spawned) {
+  for (const ch of text) {
     const c = ch.codePointAt(0)!;
-    src += c < 0x20 || (c >= 0x7f && c <= 0x9f) ? control : ch.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    if (c >= 0x20 && c < 0x7f) {
+      src += reEscape(ch);
+      continue;
+    }
+    const bytes = [...Buffer.from(ch, "utf8")]
+      .map((b) => `(?:${byteForms(b).map(reEscape).join("|")})`)
+      .join("");
+    const whole = c >= 0xa0 ? [reEscape(ch)] : c >= 0x80 ? byteForms(c).map(reEscape) : []; // printable, or a C1 code point
+    src += whole.length ? `(?:${bytes}|${whole.join("|")})` : bytes;
   }
-  return new RegExp(`^${src}$`, "u");
+  return src;
+}
+/** The watchdog's identity: its whole command line exactly as spawned (`psPattern`). */
+export function cmdlinePattern(spawned: string): RegExp {
+  return new RegExp(`^${psPattern(spawned)}$`, "u");
+}
+/**
+ * The browser's identity: its command line starts with the executable launched (argv[0]) and has
+ * `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random).
+ */
+export function browserPattern(browser: string, workDir: string): RegExp {
+  return new RegExp(
+    `^${psPattern(browser)} (?:.* )?${psPattern(`--user-data-dir=${workDir}/profile`)}(?: |$)`,
+    "u",
+  );
 }
 
 /**
  * Whether a process is provably this render's (#215). `ps` joins argv with spaces, so no single argument can be told
  * apart in it; two identities only:
- *  - the browser: its command line starts with the executable launched (argv[0]) and has
+ *  - the browser (`browserPattern`): its command line starts with the executable launched (argv[0]) and has
  *    `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random);
  *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned
  *    (`cmdlinePattern`).
+ * Both are matched as `ps` prints them in the C locale (`psPattern`), never compared raw.
  * Anything else in the group is unattributed: never signalled (it keeps the reap from completing). What remains
  * indistinguishable: a process in the same group, of the same executable, with the exact switch inside one of its
  * arguments — only something that runs the browser binary in the render's own group could be that.
  */
 function ours(e: RenderEntry, args: string) {
-  if (
-    e.browser &&
-    args.startsWith(`${e.browser} `) &&
-    ` ${args} `.includes(` --user-data-dir=${e.dir.workDir}/profile `)
-  )
-    return true;
-  return e.cmdline !== undefined && e.cmdline.test(args);
+  return !!e.browser?.test(args) || !!e.cmdline?.test(args);
 }
 
 /**
