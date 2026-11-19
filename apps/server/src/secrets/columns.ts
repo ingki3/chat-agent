@@ -228,6 +228,9 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   // Its `textHash` (#24) is a hash over the cited unit's text: no value to mask, so it is dropped instead whenever
   // that file's stored text changes — the file rescrub and re-extraction (`forgetCitedTextHashes`, review #123 2차).
   "citations.locator": { write: "CitationStore.citeFile (scrubKnownDeep)", rescrub: "deep" },
+  // #186 review 4차: a hash of the cited unit's text and marks — no value to mask; a rescrub changes the unit's text,
+  // so the hash simply stops matching (the carried number and the viewer's exact range are then not claimed).
+  "citations.unit_hash": HASH,
   // Uploads (#22): the user's file name is scrubbed on write and rescrubbed. The file bytes are on disk, not in a
   // column, and are stored as they came (the user's own document — docs/ops.md §24).
   "files.id": ID,

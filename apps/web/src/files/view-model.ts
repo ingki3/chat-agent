@@ -114,6 +114,7 @@ export type Block =
       kind: "sheet";
       key: string;
       sheet: string | undefined;
+      sheetNo: number | undefined;
       rows: { row: number | undefined; seg: ViewSegment }[];
     }
   | { kind: "slide"; key: string; seg: ViewSegment };
@@ -162,12 +163,15 @@ export function blocks(items: readonly ViewSegment[]): Block[] {
       }
       case "cell_range": {
         const sh =
-          last?.kind === "sheet" && last.sheet === l.sheet
+          // The same sheet by its number when the server gives one (names may be the same, #186 review 6차).
+          last?.kind === "sheet" &&
+          (s.sheetNo !== undefined || last.sheetNo !== undefined
+            ? last.sheetNo === s.sheetNo
+            : last.sheet === l.sheet)
             ? last
-            : (out[out.push({ kind: "sheet", key, sheet: l.sheet, rows: [] }) - 1] as Extract<
-                Block,
-                { kind: "sheet" }
-              >);
+            : (out[
+                out.push({ kind: "sheet", key, sheet: l.sheet, sheetNo: s.sheetNo, rows: [] }) - 1
+              ] as Extract<Block, { kind: "sheet" }>);
         sh.rows.push({ row: l.row, seg: s });
         break;
       }

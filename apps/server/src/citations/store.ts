@@ -1,12 +1,6 @@
 import crypto from "node:crypto";
 import { and, asc, eq, sql } from "drizzle-orm";
-import {
-  boundText,
-  CITATION_LIMITS,
-  type CitationStatus,
-  type CiteResult,
-  type FileLocator,
-} from "@agentlee/shared";
+import { CITATION_LIMITS, type CitationStatus, type CiteResult, type FileLocator } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { citations, conversations, files, sources } from "../db/schema.js";
 import type { SourceScope } from "../web/sources.js";
@@ -17,7 +11,9 @@ export type CitationRow = typeof citations.$inferSelect;
 
 /** Why a `cite` call registered nothing (the model sees the code, the log keeps it). */
 export class CiteRefused extends Error {
-  constructor(readonly code: "cite_snippet_too_short" | "cite_limit" | "cite_not_allowed") {
+  constructor(
+    readonly code: "cite_snippet_too_short" | "cite_snippet_too_long" | "cite_limit" | "cite_not_allowed",
+  ) {
     super(code);
   }
 }
@@ -56,7 +52,8 @@ export class CitationStore {
   /** Checks and registers one citation of the run; the same source and snippet twice keep their first number. */
   cite(scope: SourceScope, input: { sourceId: string; snippet: string }): CiteResult {
     // Known secrets are kept out of what is stored (the snippet is model output; the page text is scrubbed too).
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    // Never cut before it is compared (review #186 2차): longer than can be kept whole is refused.
+    const snippet = scrubKnown(wholeSnippet(input.snippet));
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       throw new CiteRefused("cite_snippet_too_short");
     const key = snippetKey(snippet);
@@ -87,7 +84,11 @@ export class CitationStore {
           // The same passage again: it keeps its number. A retry that now verifies upgrades the entry; one that
           // still fails leaves it as it was.
           if (again.status !== "verified" && status === "verified")
-            this.db.update(citations).set({ status, quote, snippet }).where(eq(citations.id, again.id)).run();
+            this.db
+              .update(citations)
+              .set({ status, quote, snippet, complete: true })
+              .where(eq(citations.id, again.id))
+              .run();
           return result(again.n, again.status === "verified" ? again.status : status, again.sourceId);
         }
         const count = this.count(scope.runId);
@@ -106,6 +107,7 @@ export class CitationStore {
             snippet,
             snippetKey: key,
             quote,
+            complete: true,
           })
           .run();
         return result(n, status, sourceId);
@@ -136,7 +138,7 @@ export class CitationStore {
       .where(and(eq(sources.id, input.sourceId), eq(sources.conversationId, scope.conversationId)))
       .get();
     if (!src || src.userId !== scope.userId) return undefined;
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    const snippet = scrubKnown(input.snippet);
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       return { status: "snippet_not_found", quote: null, source: src };
     return { ...checkAgainst(src, snippet), source: src };
@@ -155,9 +157,11 @@ export class CitationStore {
       status: CitationStatus;
       quote: string | null;
       locator: (FileLocator & { sheetNo?: number | undefined }) | null;
+      /** The verified unit's hash (`unitHashOf`): what a carried number is verified against (#186 review 4차). */
+      unitHash?: string | null | undefined;
     },
   ): CiteResult & { locator: (FileLocator & { sheetNo?: number | undefined }) | null } {
-    const snippet = scrubKnown(boundText(input.snippet, CITATION_LIMITS.snippet));
+    const snippet = scrubKnown(wholeSnippet(input.snippet));
     if (Array.from(normalizeSnippet(snippet)).length < CITATION_LIMITS.minSnippet)
       throw new CiteRefused("cite_snippet_too_short");
     const key = snippetKey(snippet);
@@ -172,7 +176,10 @@ export class CitationStore {
     if (!existing && this.count(scope.runId) >= CITATION_LIMITS.perRun) throw new CiteRefused("cite_limit");
     // The file's state now comes before anything this run registered (review #107 7차): a file being extracted
     // again (a new secret) or one that failed is `fetch_failed`, whatever an earlier call verified.
-    const found = fileId ? check(snippet) : { status: "unknown_source" as const, quote: null, locator: null };
+    const found = fileId
+      ? check(snippet)
+      : { status: "unknown_source" as const, quote: null, locator: null, unitHash: null };
+    const unitHash = found.status === "verified" ? (found.unitHash ?? null) : null;
     const quote = found.quote === null ? null : scrubKnown(found.quote);
     const locator = found.locator ? JSON.stringify(scrubKnownDeep(found.locator)) : null;
     return this.db.transaction(
@@ -185,14 +192,21 @@ export class CitationStore {
           if (found.status === "verified") {
             this.db
               .update(citations)
-              .set({ status: found.status, quote, snippet, locator })
+              .set({ status: found.status, quote, snippet, locator, unitHash, complete: true })
               .where(eq(citations.id, again.id))
               .run();
             return { ...result(again.n, "verified", null), locator: found.locator };
           }
           this.db
             .update(citations)
-            .set({ status: found.status, quote: null, snippet, locator: null })
+            .set({
+              status: found.status,
+              quote: null,
+              snippet,
+              locator: null,
+              unitHash: null,
+              complete: true,
+            })
             .where(eq(citations.id, again.id))
             .run();
           return { ...result(again.n, found.status, null), locator: null };
@@ -215,12 +229,35 @@ export class CitationStore {
             snippetKey: key,
             quote,
             locator,
+            unitHash,
+            complete: true,
           })
           .run();
         return { ...result(n, found.status, null), locator: found.locator };
       },
       { behavior: "immediate" },
     );
+  }
+
+  /**
+   * The citation row an earlier answer's entry stands for (#186 review 2·3차), by its `citationId`, within this
+   * conversation and user only — and only a `complete` one (its snippet is the model's whole input, compared and
+   * kept uncut): what a carried number is checked again with. Undefined otherwise (rows from before are never
+   * carried — their snippet may have been cut).
+   */
+  rowFor(scope: { conversationId: string; userId: string }, citationId: string): CitationRow | undefined {
+    return this.db
+      .select()
+      .from(citations)
+      .where(
+        and(
+          eq(citations.id, citationId),
+          eq(citations.conversationId, scope.conversationId),
+          eq(citations.userId, scope.userId),
+          eq(citations.complete, true),
+        ),
+      )
+      .get();
   }
 
   private existing(
@@ -304,3 +341,9 @@ const result = (n: number, status: CitationStatus, sourceId: string | null): Cit
   status,
   sourceId,
 });
+
+/** The snippet as sent, when it can be kept whole (UTF-16 units, the schema's own count); refused otherwise. */
+function wholeSnippet(snippet: string): string {
+  if (snippet.length > CITATION_LIMITS.snippet) throw new CiteRefused("cite_snippet_too_long");
+  return snippet;
+}

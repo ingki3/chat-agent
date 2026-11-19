@@ -17,7 +17,8 @@ import { CitationSources } from "../src/citations/CitationNote.js";
 import { CitationPreview } from "../src/citations/CitationMarker.js";
 import { citationView } from "../src/citations/segments.js";
 import { FileViewContext } from "../src/files/context.js";
-import { FileBody } from "../src/files/FileViewer.js";
+import { FileBody, viewProblem } from "../src/files/FileViewer.js";
+import { ApiError } from "../src/api.js";
 import {
   combine,
   hasMore,
@@ -606,5 +607,67 @@ describe("rendering the file", () => {
     });
     const html = renderToStaticMarkup(createElement(FileBody, { file: img, items: [s], target: null }));
     expect(html).toContain('src="/api/files/f1/content?inline=1"');
+  });
+});
+
+describe("#186 review 6차: the link's citation, sheets by number", () => {
+  const loc: FileLocator = { ...base, kind: "line", line: 3, charRange: [0, 5] };
+
+  it("a file citation's link names its citation; only a verified one with an id carries it", () => {
+    const entry = {
+      n: 1,
+      status: "verified" as const,
+      sourceId: null,
+      title: "a.txt",
+      site: "3번째 줄",
+      url: null,
+      publishedAt: null,
+      quote: "인용",
+      locator: loc,
+      fileId: "f1",
+      citationId: "row-1",
+    };
+    expect(citationView(1, entry).citationId).toBe("row-1");
+    expect(fileViewPath("c1", "f1", loc, "row-1")).toBe(
+      `/c/c1/files/f1?loc=${encodeURIComponent(JSON.stringify(loc))}&cite=row-1`,
+    );
+    const { citationId: _id, ...legacy } = entry;
+    void _id;
+    expect(citationView(1, legacy).citationId).toBeNull();
+    expect(fileViewPath("c1", "f1", loc)).not.toContain("cite=");
+  });
+
+  it("another citation at the same place is another opening query (its own target)", () => {
+    const fetch: ViewFetch = async () => {
+      throw new Error("not called");
+    };
+    const a = openingQuery(VISIT, "f1", loc, fetch, "row-1").queryKey;
+    const b = openingQuery(VISIT, "f1", loc, fetch, "row-2").queryKey;
+    const none = openingQuery(VISIT, "f1", loc, fetch).queryKey;
+    expect(a).not.toEqual(b);
+    expect(a).not.toEqual(none);
+    // An empty value is a value (the server refuses it), not "none".
+    expect(openingQuery(VISIT, "f1", loc, fetch, "").queryKey).not.toEqual(none);
+  });
+
+  it("two sheets of the same name stay two tables (by the sheet's number)", () => {
+    const row = (seq: number, sheetNo: number, r: number) =>
+      seg(seq, { kind: "cell_range", sheet: "[숨김]", row: r, range: `A${r}` }, `값 ${seq}`, { sheetNo });
+    const b = blocks([row(0, 1, 1), row(1, 1, 2), row(2, 2, 1)]);
+    expect(
+      b.filter((x) => x.kind === "sheet").map((x) => (x.kind === "sheet" ? x.rows.map((r) => r.row) : [])),
+    ).toEqual([[1, 2], [1]]);
+  });
+
+  it("a broken citation link (cite twice, or refused as malformed) is not a deleted or unshared file", () => {
+    expect(viewProblem(2, null, "c1", "c1")).toBe("invalid");
+    expect(viewProblem(1, new ApiError(400, "invalid_request"), undefined, "c1")).toBe("invalid");
+    expect(viewProblem(1, new ApiError(403, "forbidden"), undefined, "c1")).toBe("refused");
+    expect(viewProblem(0, new ApiError(404, "not_found"), undefined, "c1")).toBe("refused");
+    expect(viewProblem(1, null, "c2", "c1")).toBe("refused");
+    expect(viewProblem(1, null, "c1", "c1")).toBeNull();
+    expect(viewProblem(0, null, undefined, "c1")).toBeNull();
+    // A `loc` given but not a locator (8차): a broken link.
+    expect(viewProblem(0, null, undefined, "c1", true)).toBe("invalid");
   });
 });

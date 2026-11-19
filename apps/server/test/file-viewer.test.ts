@@ -135,8 +135,9 @@ describe("GET /api/files/:id/view — a citation opens its place (#24)", () => {
     const file = await upload(c.id, "report.pdf");
     const r = await send(c.id, "/file-page12", [file.id]);
     const loc = r.note!.citations[0]!.locator!;
+    const citeQ = `&cite=${r.note!.citations[0]!.citationId}`;
     expect(loc).toMatchObject({ kind: "page", page: 12 });
-    const v = await view(f.cookies.owner, file.id, loc);
+    const v = await view(f.cookies.owner, file.id, loc, citeQ);
     expect(v.status).toBe(200);
     const t = v.body!.target!;
     expect(t.status).toBe("exact");
@@ -163,11 +164,11 @@ describe("GET /api/files/:id/view — a citation opens its place (#24)", () => {
     const r = await send(c.id, "/file-table3", [file.id]);
     const cite = r.note!.citations[0]!;
     expect([cite.status, cite.site]).toEqual(["verified", "3번째 표 · 2행 · 2열"]);
-    const path = fileViewPath(c.id, file.id, cite.locator!);
+    const path = fileViewPath(c.id, file.id, cite.locator!, cite.citationId);
     expect(path.startsWith(`/c/${c.id}/files/${file.id}?loc=`)).toBe(true);
     const loc = parseLocParam(new URLSearchParams(path.split("?")[1]).get("loc"))!;
     expect(loc).toEqual(cite.locator);
-    const v = await view(f.cookies.owner, file.id, loc);
+    const v = await view(f.cookies.owner, file.id, loc, `&cite=${cite.citationId}`);
     const t = v.body!.target!;
     expect(t.status).toBe("exact");
     const row = seg(v.body!.items, t.seqs[0]!);
@@ -186,8 +187,9 @@ describe("GET /api/files/:id/view — a citation opens its place (#24)", () => {
       const file = await upload(c.id, "scanned.pdf");
       const r = await send(c.id, "/file-scan", [file.id]);
       const loc = r.note!.citations[0]!.locator!;
+      const citeQ = `&cite=${r.note!.citations[0]!.citationId}`;
       expect(loc).toMatchObject({ kind: "ocr_box", page: 1 });
-      const v = (await view(f.cookies.owner, file.id, loc)).body!;
+      const v = (await view(f.cookies.owner, file.id, loc, citeQ)).body!;
       const t = v.target!;
       const page = seg(v.items, t.seqs[0]!);
       expect(page.text.slice(t.range!.start, t.range!.end)).toBe(SCANNED_LINE2);
@@ -242,11 +244,12 @@ describe("GET /api/files/:id/view — a citation opens its place (#24)", () => {
     // `/file-cite <fileId> <snippet>` (FakeRuntime): the passage, verified, line 1 with its range.
     const cited = await send(c.id, `/file-cite ${file.id} ${passage}`, [file.id]);
     const loc = cited.note!.citations[0]!.locator!;
+    const citeQ = `&cite=${cited.note!.citations[0]!.citationId}`;
     expect(loc).toMatchObject({ kind: "line", line: 1 });
-    expect((await view(f.cookies.owner, file.id, loc)).body!.target!.status).toBe("exact");
+    expect((await view(f.cookies.owner, file.id, loc, citeQ)).body!.target!.status).toBe("exact");
     knownSecrets.add(secret);
     closers.push(() => knownSecrets.remove(secret));
-    const v = await view(f.cookies.owner, file.id, loc);
+    const v = await view(f.cookies.owner, file.id, loc, citeQ);
     expect(v.raw).not.toContain(secret);
     expect(v.raw).not.toContain(secret.slice(10));
     expect(v.body!.items[0]!.text).toContain("[숨김]");
@@ -265,12 +268,13 @@ describe("the viewer and the share projection (#29)", () => {
     const file = await upload(c.id, "assignment.hwp");
     const r = await send(c.id, "/file-table3", [file.id]);
     const loc = r.note!.citations[0]!.locator!;
-    const shared = await view(f.cookies.shared, file.id, loc);
+    const citeQ = `&cite=${r.note!.citations[0]!.citationId}`;
+    const shared = await view(f.cookies.shared, file.id, loc, citeQ);
     expect(shared.status).toBe(200);
     expect(shared.body!.target!.status).toBe("exact");
     expect(shared.body!.file.uploadId).toBeNull();
     for (const who of [f.cookies.stranger, f.cookies.admin])
-      expect((await view(who, file.id, loc)).status).toBe(403);
+      expect((await view(who, file.id, loc, citeQ)).status).toBe(403);
     expect((await get(undefined, `/api/files/${file.id}/view`)).statusCode).toBe(401);
     const unsent = await upload(c.id, "sample.txt");
     expect((await view(f.cookies.owner, unsent.id)).status).toBe(200);
@@ -283,6 +287,7 @@ describe("the viewer and the share projection (#29)", () => {
     const file = await upload(c.id, "assignment.hwp");
     const r = await send(c.id, "/file-table3", [file.id]);
     const loc = r.note!.citations[0]!.locator!;
+    const citeQ = `&cite=${r.note!.citations[0]!.citationId}`;
     const userMessage = app.runs!.get(r.run.id)!.userMessageId;
     const boundary = app.conversations!.messageById(userMessage)!;
     app.sharing!.store.create({
@@ -295,11 +300,11 @@ describe("the viewer and the share projection (#29)", () => {
       boundaryMessageId: boundary.id,
       snapshot: app.sharing!.compute(c.id, { live: false, boundarySeq: boundary.seq }),
     });
-    const v = await view(f.cookies.shared, file.id, loc);
+    const v = await view(f.cookies.shared, file.id, loc, citeQ);
     expect(v.status).toBe(200);
     expect([v.body!.target!.status, v.body!.target!.reasons]).toEqual(["unit", ["unverified"]]);
     // The owner, whose conversation holds the citation: exact.
-    expect((await view(f.cookies.owner, file.id, loc)).body!.target!.status).toBe("exact");
+    expect((await view(f.cookies.owner, file.id, loc, citeQ)).body!.target!.status).toBe("exact");
   });
 });
 
@@ -314,11 +319,12 @@ describe("review #123", () => {
     const file = await upload(c.id, "dup.txt", Buffer.from(`앞 ${secret} 뒤 ${S} ${S}\n`));
     const cited = await send(c.id, `/file-cite ${file.id} ${S}`, [file.id]);
     const loc = cited.note!.citations[0]!.locator!;
-    expect((await view(f.cookies.owner, file.id, loc)).body!.target!.status).toBe("exact");
+    const citeQ = `&cite=${cited.note!.citations[0]!.citationId}`;
+    expect((await view(f.cookies.owner, file.id, loc, citeQ)).body!.target!.status).toBe("exact");
     app.storedRescrub!.close();
     knownSecrets.add(secret);
     closers.push(() => knownSecrets.remove(secret));
-    const v = (await view(f.cookies.owner, file.id, loc)).body!;
+    const v = (await view(f.cookies.owner, file.id, loc, citeQ)).body!;
     // The range really is on the second copy now (what made the old check pass) …
     const text = v.items[0]!.text;
     const [a, b] = loc.charRange!;
@@ -424,9 +430,16 @@ describe("review #123", () => {
     const hitLoc = a.note!.citations[0]!.locator!;
     const t = (await view(f.cookies.owner, hit.id, hitLoc)).body!.target!;
     expect([t.status, t.range]).toEqual(["unit", undefined]);
-    expect((await view(f.cookies.owner, clean.id, b.note!.citations[0]!.locator!)).body!.target!.status).toBe(
-      "exact",
-    );
+    expect(
+      (
+        await view(
+          f.cookies.owner,
+          clean.id,
+          b.note!.citations[0]!.locator!,
+          `&cite=${b.note!.citations[0]!.citationId}`,
+        )
+      ).body!.target!.status,
+    ).toBe("exact");
     // Extracted again (a new extractor, a capped file and a later secret): its hashes go too.
     db.$client.prepare("UPDATE file_extracts SET status = 'pending' WHERE file_id = ?").run(clean.id);
     app.fileExtracts!.enqueue(clean.id);

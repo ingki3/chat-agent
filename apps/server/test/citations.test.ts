@@ -11,11 +11,15 @@ import {
   FINANCE_DISCLAIMER,
   sentenceEndMarkers,
   uncitedUnits,
+  type CitationEntry,
   type MessagePart,
 } from "@agentlee/shared";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
+import { CITE_TOOL } from "@agentlee/mcp-tools/web";
+import { FILE_CITE_TOOL } from "@agentlee/mcp-tools/files";
+import { z } from "zod";
 import { UserStore } from "../src/auth/users.js";
-import { citationNote } from "../src/citations/checker.js";
+import { citationNote, type CitationCarry } from "../src/citations/checker.js";
 import { CitationStore, CiteRefused, snippetKey } from "../src/citations/store.js";
 import { findSnippet, normalizeSnippet, normalizeWithMap, verifyStats } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
@@ -1366,6 +1370,8 @@ describe("citationNote", () => {
         url: FIXTURE_PAGES[0]!.url,
         publishedAt: FIXTURE_PAGES[0]!.publishedAt,
         quote: SNIP,
+        // The citation row it stands for (#186 review 2차): the whole passage stays there, server-side.
+        citationId: f.cites.forRun(scope.runId)[0]!.id,
       },
       expect.objectContaining({
         n: 2,
@@ -1415,7 +1421,11 @@ describe("citationNote", () => {
       publishedAt: null,
       quote: "파일의 구절이에요 열두 쪽",
     };
-    const carry = { conversationId: f.c.id, userId: later.userId, previous: () => [...earlier, fileEntry] };
+    const carry = {
+      conversationId: f.c.id,
+      userId: later.userId,
+      previous: () => [...earlier, fileEntry],
+    };
     const note = citationNote(later.runId, text("가[1]. 나[2]. 다[3]. 라[5]. 마[6]."), f.cites, carry)!;
     expect(note.citations.map((c) => [c.n, c.status, c.sourceId])).toEqual([
       [1, "verified", src.id],
@@ -1513,6 +1523,196 @@ describe("citationNote", () => {
     ).toBe(undefined);
   });
 
+  it("carry-over of a file citation (#186): by the earlier entry's citation row, checked again now — never by the text", () => {
+    const rev = "b".repeat(64);
+    const loc = { fileId: "file-1", fileRevision: rev, kind: "page" as const, page: 12 };
+    const first = f.run(f.c.id);
+    const A = "파일의 구절이에요 열두 쪽";
+    const B = "모델이 보낸 구절이에요";
+    f.cites.citeFile(first, { fileId: "file-1", snippet: A }, () => ({
+      status: "verified",
+      quote: A,
+      locator: loc,
+      unitHash: "unit-hash-1",
+    }));
+    f.cites.citeFile(first, { fileId: "file-1", snippet: B }, () => ({
+      status: "snippet_not_found",
+      quote: null,
+      locator: null,
+    }));
+    const forRun = (runId: string) =>
+      f.cites.forRun(runId).map((r) => ({ ...r, file: { id: "file-1", name: "보고서.pdf" } }));
+    const store = { forRun, recheck: f.cites.recheck.bind(f.cites), rowFor: f.cites.rowFor.bind(f.cites) };
+    const earlier = citationNote(first.runId, text("가[1]. 나[2]."), store)!.citations;
+    expect(earlier.map((c) => [c.n, c.status, c.fileId, typeof c.citationId])).toEqual([
+      [1, "verified", "file-1", "string"],
+      [2, "snippet_not_found", "file-1", "string"],
+    ]);
+    expect(JSON.stringify(earlier)).not.toContain('"snippet"');
+    const asked: { fileId: string; snippet: string; locator?: unknown }[] = [];
+    let now: "verified" | "snippet_not_found" | "fetch_failed" | "gone" = "verified";
+    const recheckFile: NonNullable<CitationCarry["recheckFile"]> = (sc, input) => {
+      expect(sc).toMatchObject({ conversationId: f.c.id, userId: scope.userId });
+      asked.push(input);
+      if (now === "gone") return undefined;
+      return now === "verified"
+        ? { status: "verified", quote: input.snippet, locator: loc, file: { name: "보고서.pdf" } }
+        : { status: now, quote: null, locator: null, file: { name: "보고서.pdf" } };
+    };
+    // An entry no row stands for (made up, or stored before ids without a run to look in): not carried.
+    const orphan: CitationEntry = { ...earlier[0]!, n: 3, citationId: undefined };
+    const previous = () => [...earlier, orphan];
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous, recheckFile };
+    const t = "요약하면 쓰레기를 치웠어요[1]. 학교도 함께했어요[2]. 다른 말이에요[3].";
+    const note = citationNote(f.run(f.c.id).runId, text(t), store, carry)!;
+    expect(CitationNotePart.parse(note)).toEqual(note);
+    expect(note.unbacked).toBeUndefined();
+    expect(note.citations.map((c) => [c.n, c.status, c.fileId, c.site, c.locator?.page])).toEqual([
+      [1, "verified", "file-1", "12쪽", 12],
+      [2, "verified", "file-1", "12쪽", 12],
+      [3, "unknown_source", undefined, null, undefined],
+    ]);
+    // Carried entries name the row they were carried from (a later answer carries them on).
+    expect(note.citations.slice(0, 2).map((c) => c.citationId)).toEqual(earlier.map((c) => c.citationId));
+    // The passage checked is the row's own (never a guess from the sentence), the earlier place first.
+    expect(asked).toEqual([
+      // With the unit's hash of a verified row (#186 review 4차: what the file recheck compares).
+      { fileId: "file-1", snippet: A, locator: loc, unitHash: "unit-hash-1" },
+      { fileId: "file-1", snippet: B, locator: undefined, unitHash: null },
+    ]);
+    // The file's text changed / being extracted again: carried, with ⚠️ — no place claimed, the quote kept.
+    for (const status of ["snippet_not_found", "fetch_failed"] as const) {
+      now = status;
+      const c = citationNote(f.run(f.c.id).runId, text("가[1]."), store, carry)!.citations[0]!;
+      expect([c.status, c.fileId, c.site, c.locator, c.quote]).toEqual([
+        status,
+        "file-1",
+        null,
+        undefined,
+        A,
+      ]);
+      expect(citationVerified(c.status)).toBe(false);
+    }
+    // The file is gone (or not this conversation's/user's any more): not carried — no sources, the marker flagged.
+    now = "gone";
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), store, carry)).toMatchObject({
+      citations: [{ n: 1, status: "unknown_source", sourceId: null }],
+      unbacked: true,
+    });
+    now = "verified";
+    // Another user's scope: the row is not theirs — not carried.
+    expect(
+      citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, userId: crypto.randomUUID() })!
+        .citations[0]!.status,
+    ).toBe("unknown_source");
+    // #202 review 3차: a part that ends with a closed math block does not take in the next part (the screen renders
+    // each part on its own) — the next part's [1] is a marker and is carried, checked again once.
+    const askedBefore = asked.length;
+    const twoParts: MessagePart[] = [
+      { type: "text", text: "$$\na=b\n$$" },
+      { type: "text", text: "모집은 마감됐어요[1].\n\n다른 사실이에요." },
+    ];
+    const split = citationNote(f.run(f.c.id).runId, twoParts, store, carry)!;
+    expect(split.citations.map((c) => [c.n, c.status])).toEqual([[1, "verified"]]);
+    expect(asked.length).toBe(askedBefore + 1);
+    expect(split.missing).toHaveLength(1);
+    // Review 6차: in a carried answer only its markers count — `x = a[2]` (no marker) covers no table.
+    const tbl = "| a |\n|---|\n| 1 |";
+    for (const t of [
+      `결론이에요[1].\n\nx = a[2]\n\n${tbl}`,
+      `결론이에요[1].\n\n## 표\n\n${tbl}\n\n출처: x = a[2]`,
+    ]) {
+      const n = citationNote(f.run(f.c.id).runId, text(t), store, carry)!;
+      expect(n.citations.map((c) => c.n)).toEqual([1]);
+      expect(
+        n.missing.map((r) => t.slice(r.start, r.end)),
+        t,
+      ).toContain(tbl);
+    }
+    // Without a recheck the file citation is not carried.
+    const { recheckFile: _r, ...bare } = carry;
+    void _r;
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), store, bare)!.citations[0]!.status).toBe(
+      "unknown_source",
+    );
+    // An entry stored before ids (review 3차): never carried, whatever rows its answer had.
+    const legacy = earlier.map(({ citationId: _id, ...e }) => (void _id, e));
+    expect(
+      citationNote(f.run(f.c.id).runId, text("가[1]."), store, { ...carry, previous: () => legacy })!
+        .citations[0]!.status,
+    ).toBe("unknown_source");
+    // A run that read, searched, listed or cited (its own numbers): no carry.
+    for (const name of ["mcp__agentlee__file_search", "file_read", "file_list", "mcp__agentlee__file_cite"]) {
+      const parts: MessagePart[] = [{ type: "tool_call", id: "t1", name, input: {} }, ...text("가[1].")];
+      asked.length = 0;
+      const c = citationNote(f.run(f.c.id).runId, parts, store, carry)!.citations[0]!;
+      expect([c.status, c.fileId], name).toEqual(["unknown_source", undefined]);
+      expect(asked, name).toEqual([]);
+    }
+  });
+
+  it("review #186 2차: a passage that cannot be kept whole is refused before it is compared; a row that may be cut is never carried", () => {
+    const run = f.run(f.c.id);
+    // 481 code points, 511 UTF-16 units (zod's max counts code points): refused, never cut and compared.
+    const long = `${"😀".repeat(30)}${"가".repeat(451)}`;
+    expect(long.length).toBeGreaterThan(CITATION_LIMITS.snippet);
+    expect(() => f.cites.cite(run, { sourceId: src.id, snippet: long })).toThrow("cite_snippet_too_long");
+    expect(() =>
+      f.cites.citeFile(run, { fileId: "file-1", snippet: long }, () => {
+        throw new Error("never compared");
+      }),
+    ).toThrow("cite_snippet_too_long");
+    expect(f.cites.forRun(run.runId)).toEqual([]);
+    // The tool schemas count the same units.
+    // The tool schemas count the same units: 500 passes, 501 does not (one id per tool — the schemas are strict).
+    const ok = "가".repeat(CITATION_LIMITS.snippet);
+    for (const [tool, input] of [
+      [CITE_TOOL, { sourceId: "s" }],
+      [FILE_CITE_TOOL, { fileId: "f" }],
+    ] as const) {
+      const schema = z.strictObject(tool.input);
+      expect(schema.safeParse({ ...input, snippet: ok }).success, tool.name).toBe(true);
+      expect(schema.safeParse({ ...input, snippet: `${ok}😀` }).success, tool.name).toBe(false);
+      expect(schema.safeParse({ ...input, snippet: long }).success, tool.name).toBe(false);
+      expect(tool.description, tool.name).toContain("at most 500 UTF-16 units");
+    }
+    // A row stored before (review 3차: not marked complete — its snippet may have been cut, then masked to any
+    // length): never carried, whatever its length.
+    const old = f.run(f.c.id);
+    f.cites.cite(old, { sourceId: src.id, snippet: SNIP });
+    const row = f.cites.forRun(old.runId)[0]!;
+    expect(row.complete).toBe(true);
+    const scopeOf = { conversationId: f.c.id, userId: old.userId };
+    expect(f.cites.rowFor(scopeOf, row.id)?.id).toBe(row.id);
+    f.db.update(citations).set({ complete: false }).where(eq(citations.id, row.id)).run();
+    expect(f.cites.rowFor(scopeOf, row.id)).toBeUndefined();
+    const earlier = citationNote(old.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: old.userId, previous: () => earlier };
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)).toMatchObject({
+      citations: [{ status: "unknown_source" }],
+      unbacked: true,
+    });
+  });
+
+  it("review #186 1차: a run that called file_list or sources_list carries nothing — list item [1] is not the earlier [1]", () => {
+    const earlier = citationNote(scope.runId, text("가[1]."), f.cites)!.citations;
+    const carry = { conversationId: f.c.id, userId: scope.userId, previous: () => earlier };
+    expect(citationNote(f.run(f.c.id).runId, text("가[1]."), f.cites, carry)!.citations[0]!.status).toBe(
+      "verified",
+    );
+    for (const name of [
+      "mcp__agentlee__file_list",
+      "file_list",
+      "mcp__agentlee__sources_list",
+      "sources_list",
+    ]) {
+      const parts: MessagePart[] = [{ type: "tool_call", id: "t1", name, input: {} }, ...text("가[1].")];
+      expect(citationNote(f.run(f.c.id).runId, parts, f.cites, carry)!.citations[0]!.status, name).toBe(
+        "unknown_source",
+      );
+    }
+  });
+
   it("fits the shared schema even with long titles and quotes of characters outside the BMP", () => {
     const s2 = f.run(f.c.id);
     const emoji = "😀".repeat(400);
@@ -1538,7 +1738,7 @@ describe("citationNote", () => {
     expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["나는 출처가 없어요."]);
   });
 
-  it("a short progress note before the first tool call is not flagged; facts before it and notes after it are", () => {
+  it("a progress note is the short, figure-free text right before a tool call (#202: by position)", () => {
     const call: MessagePart[] = [
       { type: "tool_call", id: "t", name: "web_fetch", input: {} },
       { type: "tool_result", callId: "t", output: {}, isError: false },
@@ -1547,28 +1747,512 @@ describe("citationNote", () => {
       const t = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
       return citationNote(scope.runId, parts, f.cites)!.missing.map((r) => t.slice(r.start, r.end));
     };
-    expect(missingOf([...text("자료를 찾아 비교해 볼게요.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
-    expect(missingOf([...text("Let me search for that.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
-    // A statement before the tool call, a note with a figure, two sentences, or a note after the call: checked.
-    expect(missingOf([...text("반도체 수출은 늘었어요.\n\n"), ...call, ...text("가[1].")])).toEqual([
+    // By position (#202, user decision 2026-11-19): the text right before a tool call, short, no figure — whatever
+    // it says (a fact too: the accepted residual risk).
+    for (const note of [
+      "자료를 찾아 비교해 볼게요.",
+      "Let me search for that.",
       "반도체 수출은 늘었어요.",
-    ]);
+      "수출이 늘었어요. 더 찾아볼게요.",
+    ])
+      expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toEqual([]);
+    // A figure, a marker-like `[n]`, over 160 characters, or not right before the call: checked.
     expect(missingOf([...text("2026년 자료를 찾아볼게요.\n\n"), ...call, ...text("가[1].")])).toHaveLength(1);
     expect(
-      missingOf([...text("수출이 늘었어요. 더 찾아볼게요.\n\n"), ...call, ...text("가[1].")]),
+      missingOf([...text(`${"자료를 찾아 볼게요. ".repeat(20)}\n\n`), ...call, ...text("가[1].")]),
     ).toHaveLength(1);
-    // Round 2: a fact joined to the note.
-    for (const note of [
-      "양산이 확정됐으니 자료를 더 찾아볼게요.",
-      "양산이 확정돼서 더 찾아볼게요.",
-      "Exports rose, so let me check.",
-      // Round 3: a complement clause that carries a fact.
-      "양산이 확정됐음을 알려드리겠습니다.",
-      "양산이 확정됐다는 소식을 확인해 볼게요.",
-      "양산이 확정이라는 기사를 찾아볼게요.",
-    ])
-      expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toHaveLength(1);
+    expect(
+      missingOf([...text("반도체 수출은 늘었어요.\n\n자료를 찾아 볼게요.\n\n"), ...call, ...text("가[1].")]),
+    ).toEqual(["반도체 수출은 늘었어요."]);
     expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);
+  });
+
+  describe("#202: the production shape — an attachment answer with a table, a list, progress notes, opinions, an offer", () => {
+    const read = (id: string): MessagePart[] => [
+      { type: "tool_call", id, name: "mcp__agentlee__file_read", input: { fileId: "f1" } },
+      { type: "tool_result", callId: id, output: {}, isError: false },
+    ];
+    const ANSWER = [
+      "## 지원 전략 요약",
+      "",
+      "2025학년도 학종 경쟁률은 12.3대 1이었어요[1].",
+      "",
+      "아래는 전형별 입결이에요[2]:",
+      "",
+      "| 전형 | 모집단위 | 70%컷 |",
+      "|---|---|---|",
+      "| 학종 | 경영학과 | 2.1 |",
+      "| 교과 | 경영학과 | 1.8 |",
+      "",
+      "- **학종:** 서류 비중이 커요[3]",
+      "- **교과:** 최저 기준이 있어요",
+      "",
+      "| 구분 | 2025 | 2026 |",
+      "| --- | --- | --- |",
+      "| 모집인원 | 30 | 28 |",
+      "",
+      "출처: 2026 시행계획[4]",
+      "",
+      "정시 모집인원은 2026학년도에 5명 줄었어요.",
+      "",
+      "학과별 경쟁률은 다음과 같아요.",
+      "",
+      "학과 | 경쟁률",
+      "--- | ---",
+      "경영 | 10",
+      "",
+      "제 판단으로는 학종이 가장 현실적인 선택이에요. 내신 2.0이면 안정권이라는 게 제 추정이에요.",
+      "",
+      "- **추천:** 제 생각에는 학종 위주로 준비하시는 게 좋아요.",
+      "",
+      "학종을 준비하는 게 좋아요.",
+      "",
+      "원하시면 학과별로 더 자세히 비교해 드릴게요. 어느 전형이 더 궁금하세요?",
+    ].join("\n");
+    const parts: MessagePart[] = [
+      ...text("첨부하신 입결 파일을 읽어 볼게요.\n\n"),
+      ...read("r1"),
+      ...text("엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.\n\n"),
+      ...read("r2"),
+      ...text(ANSWER),
+    ];
+    const missingOf = (ps: MessagePart[]) => {
+      const t = ps.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
+      return citationNote(crypto.randomUUID(), ps, f.cites)!.missing.map((r) => t.slice(r.start, r.end));
+    };
+
+    it("only the factual paragraphs without a marker are flagged; a table is one unit", () => {
+      expect(missingOf(parts)).toEqual([
+        "- **교과:** 최저 기준이 있어요",
+        "정시 모집인원은 2026학년도에 5명 줄었어요.",
+        "학과별 경쟁률은 다음과 같아요.",
+        // A table no marker covers: flagged once, as a whole (rows without a leading `|` too).
+        "학과 | 경쟁률\n--- | ---\n경영 | 10",
+        // Advice that does not say it is an opinion is still checked (the instructions ask to say so).
+        "학종을 준비하는 게 좋아요.",
+      ]);
+    });
+
+    it("conservative: anything stating something is still flagged", () => {
+      // Right before a tool call, a figure makes it a statement to check.
+      expect(
+        missingOf([...read("a"), ...text("시트 2개를 다 읽었어요.\n\n"), ...read("b"), ...text("가[1].")]),
+      ).toEqual(["시트 2개를 다 읽었어요."]);
+      // The same note after the last tool call is the answer: checked.
+      expect(missingOf([...read("a"), ...text("가[1].\n\n엑셀을 다 읽었어요.")])).toEqual([
+        "엑셀을 다 읽었어요.",
+      ]);
+      // An opinion paragraph with a sentence that does not say so, or framing in other words: checked.
+      for (const p of [
+        "제 판단으로는 학종이 나아요. 교과 최저는 수능 최저가 있어요.",
+        "학종이 유리해요. 제 추정이에요.",
+        "학종이 유리하다고 봐요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // An offer that is not the end, or one that states something.
+      expect(
+        missingOf([...read("a"), ...text("원하시면 더 비교해 드릴게요.\n\n논술 전형은 없어요.\n\n가[1].")]),
+      ).toEqual(["원하시면 더 비교해 드릴게요.", "논술 전형은 없어요."]);
+      for (const p of [
+        "A대는 논술이 없는데 괜찮으세요?",
+        "경쟁률이 열두 대 일이에요. 더 볼까요?",
+        "2명 더 뽑아요, 지원해 볼까요?",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // A table: a marker elsewhere in the paragraph before, or a short cited sentence after that is no caption.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`자료는 시행계획이에요[1]. 아래 표를 보세요.\n\n${table}`)]),
+      ).toEqual([table]);
+      expect(missingOf([...read("a"), ...text(`${table}\n\n그래서 학종이 유리해요[1].`)])).toEqual([table]);
+    });
+
+    it("review 1차: facts in progress-like, opinion-like and offer-like shapes stay flagged", () => {
+      // A sentence without the framing, bold or glued to the one before; a lone mark.
+      for (const p of [
+        "제 판단으로는 학종이 유리해요. **올해 모집은 끝났습니다.**",
+        "제 판단으로는 학종이 유리해요.올해 모집은 끝났습니다.",
+        "**제 판단으로는 학종이 유리해요.** 올해 모집은 끝났습니다.",
+        "- **올해 모집은 끝났습니다.** 제 판단으로는 학종이 유리해요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // Framed in every sentence, a numbered item or a labelled one: an opinion.
+      for (const p of [
+        "1. 제 생각에는 학종이 나아요.",
+        "- **추천:** 제 생각에는 학종이 나아요.",
+        "제 판단으로는 학종이 유리해요.교과는 어렵다는 게 제 추정이에요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([]);
+      // An offer glued to a statement.
+      expect(missingOf([...read("a"), ...text("가[1].\n\n올해 모집이 마감되었습니다.더 볼까요?")])).toEqual([
+        "올해 모집이 마감되었습니다.더 볼까요?",
+      ]);
+    });
+
+    it("review 1차: a GFM table is one unit (rows without an outer `|` too); a table before is not a sentence before", () => {
+      const mixed = "전형 | 인원\n|---|---|\n학종 | 30\n교과 | 20";
+      expect(missingOf([...read("a"), ...text(`입결은 아래와 같아요[1].\n\n${mixed}`)])).toEqual([]);
+      expect(missingOf([...read("a"), ...text(`${mixed}\n\n가[1].`)])).toEqual([mixed]);
+      // Two tables in a row: the first one's last cell does not cover the second.
+      const price = "| 품목 | 가격 |\n|---|---|\n| 사과 | 1000[1] |";
+      const grades = "| 과목 | 등급 |\n|---|---|\n| 국어 | 2 |";
+      expect(missingOf([...read("a"), ...text(`${price}\n\n${grades}`)])).toEqual([grades]);
+      // The sentence right before: glued sentences are two — only the last one counts.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`자료는 시행계획이에요[1].아래 표를 보세요.\n\n${table}`)]),
+      ).toEqual([table]);
+    });
+
+    it("review 2차: one sentence boundary everywhere", () => {
+      // A sentence glued after punctuation is a sentence, a digit or a letter next.
+      for (const p of [
+        "제 판단으로는 학종이 유리해요.2027년 모집은 끝났습니다.",
+        "제 판단으로는 학종이 유리해요!30명이 합격했습니다.",
+        "제 판단으로는 학종이 유리해요.KAIST도 같아요.",
+      ])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([p]);
+      // Not a boundary: a period inside a word or a number.
+      for (const p of ["제 생각에는 Node.js가 적합해요.", "제 판단으로는 3.5등급이면 충분해요."])
+        expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)]), p).toEqual([]);
+      // The sentence right before a table: the last one, glued to a digit; closing emphasis belongs to it.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`지원자가 늘었어요[1].2027년 기준은 다음과 같아요.\n\n${table}`)]),
+      ).toEqual([table]);
+      expect(missingOf([...read("a"), ...text(`**입결은 다음과 같아요[1].**\n\n${table}`)])).toEqual([]);
+    });
+
+    it("review 2차: the blocks are the renderer's — table shapes, CRLF, HTML after a table", () => {
+      const lead = "입결은 아래와 같아요[1].\n\n";
+      for (const t of [
+        "| a | b |\n|-|-|\n| 1 | 2 |",
+        "a | b\n-|-\n1 | 2",
+        "| a | b |\r\n|---|---|\r\n| 1 | 2 |",
+        "모집 인원\n|---|\n30명",
+      ])
+        expect(missingOf([...read("a"), ...text(lead + t)]), JSON.stringify(t)).toEqual([]);
+      // CRLF: ranges are offsets of the text as stored.
+      const crlf = "가[1].\r\n\r\n나는 출처가 없어요.\r\n";
+      expect(missingOf([...read("a"), ...text(crlf)])).toEqual(["나는 출처가 없어요."]);
+      // Raw HTML right after a cited table is its own block (shown as text outside the table): checked.
+      expect(
+        missingOf([...read("a"), ...text(`${lead}| a |\n|---|\n| 1 |\n<div>추가 합격자는 없습니다.</div>`)]),
+      ).toEqual(["<div>추가 합격자는 없습니다.</div>"]);
+    });
+
+    it("review 3차: each text part is parsed on its own, as the screen renders it — in every branch", () => {
+      const math = "가[1].\n\n$$\na=b\n$$";
+      const after = "모집은 마감됐어요[1].\n\n다른 사실이에요.";
+      const fetch: MessagePart[] = [
+        { type: "tool_call", id: "w", name: "mcp__agentlee__web_fetch", input: {} },
+        { type: "tool_result", callId: "w", output: {}, isError: false },
+      ];
+      const offsetOfSecond = math.length + after.indexOf("[1]");
+      // No tool (#185): the second part's [1] is a marker — an unbacked note flags it.
+      const none = citationNote(crypto.randomUUID(), [...text(math), ...text(after)], f.cites)!;
+      expect(none.unbacked).toBe(true);
+      expect(none.markers.map((m) => m.start)).toContain(offsetOfSecond);
+      // A file read and a web fetch between the parts: the marker found, the next paragraph flagged.
+      for (const tool of [read("r"), fetch]) {
+        const ps = [...text(math), ...tool, ...text(after)];
+        const t = math + after;
+        const note = citationNote(crypto.randomUUID(), ps, f.cites)!;
+        expect(note.markers.map((m) => m.start)).toContain(offsetOfSecond);
+        expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["다른 사실이에요."]);
+      }
+      // A table that ends a part does not take in the next part's paragraph.
+      expect(missingOf([...text("| a |\n|---|\n| 1[1] |"), ...read("r"), ...text("새 사실이에요.")])).toEqual(
+        ["새 사실이에요."],
+      );
+      // A paragraph a tool call cuts mid-sentence stays one unit (as before): its marker after the call covers it.
+      expect(missingOf([...text("앞 문장이고 "), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual([]);
+      // A part that ends a sentence before the call is its own paragraph (as the screen shows it): right before the
+      // call, short and figure-free, it is a progress note; with a figure it is checked.
+      expect(missingOf([...text("앞 문장이에요.\n"), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual(
+        [],
+      );
+      expect(
+        missingOf([...text("모집은 30명이에요.\n"), ...read("r"), ...text("뒤 문장이에요[1].")]),
+      ).toEqual(["모집은 30명이에요."]);
+    });
+
+    it("review 3차: full-width stop, footnotes", () => {
+      // `．` (U+FF0E) ends a sentence: an opinion with a fact after it, and the sentence right before a table.
+      const p = "제 판단으로는 학종이 유리해요．2027년 모집은 끝났습니다.";
+      expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)])).toEqual([p]);
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      expect(
+        missingOf([...read("a"), ...text(`지원자가 늘었어요[1]．기준은 다음과 같아요.\n\n${table}`)]),
+      ).toEqual([table]);
+      // A footnote nothing refers to is not shown: no unit, and its [1] covers no table after it.
+      const hidden = "[^unused]: 다른 자료라고 합니다[1].";
+      const shown = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      expect(missingOf([...read("a"), ...text(`## 입결\n\n${hidden}\n\n${shown}`)])).toEqual([shown]);
+      expect(missingOf([...read("a"), ...text(`가[2].\n\n[^unused]: 출처 없는 각주예요.`)])).toEqual([]);
+      // A shown footnote is checked, but its text does not cover a body table (nor the reverse).
+      const withRef = `가[2].[^1]\n\n[^1]: 각주의 사실이에요[1].\n\n${shown}`;
+      expect(missingOf([...read("a"), ...text(withRef)])).toEqual([shown]);
+      expect(missingOf([...read("a"), ...text(`가[2].[^1]\n\n[^1]: 각주의 사실이에요.`)])).toEqual([
+        "각주의 사실이에요.",
+      ]);
+    });
+
+    it("review 4차 / user decision: the issue's own progress note passes; tables by the screen's order; inline math; footnotes", () => {
+      const between = (note: string) =>
+        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
+      for (const note of [
+        "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.",
+        "엑셀 두 개를 다 읽었어요.",
+        "이제 학과별 입결 시트를 확인하고 있어요.",
+        // The accepted residual risk (user decision 2026-11-19): a short, figure-free fact right before a tool call.
+        "교육부 역시 지원서를 다시 검토하고 있어요.",
+      ])
+        expect(between(note), note).toEqual([]);
+      // The same sentence anywhere else is checked: the last paragraph, or followed by more text before the call.
+      const fact = "교육부 역시 지원서를 다시 검토하고 있어요.";
+      expect(missingOf([...read("a"), ...text(`가[1].\n\n${fact}`)])).toEqual([fact]);
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${fact}\n\n자료를 더 볼게요.\n\n`),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual([fact]);
+      // With a figure: checked even right before the call.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("교육부는 2027년 지원서를 검토하고 있어요.\n\n"),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["교육부는 2027년 지원서를 검토하고 있어요."]);
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // A tool row between the sentence and the table: the sentence is not the one right before it on the screen.
+      expect(
+        missingOf([...read("a"), ...text("작년 선발 인원이에요[1].\n\n"), ...read("b"), ...text(table)]),
+      ).toEqual([table]);
+      // A footnote definition between them is not shown there: the body sentence is still right before the table.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`본문이에요[^1] 표는 다음과 같아요[1].\n\n[^1]: 각주예요[2].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // Inline math (and code) is never a marker: `$a[1]$` covers nothing.
+      expect(missingOf([...read("a"), ...text(`값은 $a[1]$입니다.\n\n${table}`)])).toEqual([
+        "값은 $a[1]$입니다.",
+        table,
+      ]);
+      // Footnotes: only those reached from the body, the first definition of an id.
+      const hiddenChain = "가[1].\n\n[^a]: 숨은 각주예요[^b].\n\n[^b]: 숨은 사실이에요.";
+      expect(missingOf([...read("a"), ...text(hiddenChain)])).toEqual([]);
+      const duplicate = "가[1].[^a]\n\n[^a]: 첫 정의예요[1].\n\n[^a]: 둘째 정의는 보이지 않아요.";
+      expect(missingOf([...read("a"), ...text(duplicate)])).toEqual([]);
+      const chain = "가[1].[^a]\n\n[^a]: 보이는 각주예요[1][^b].\n\n[^b]: 이어서 보이는 사실이에요.";
+      expect(missingOf([...read("a"), ...text(chain)])).toEqual(["이어서 보이는 사실이에요."]);
+    });
+
+    it("review 5차: a table's neighbours are its own part's fragments and its own footnote; nested definitions", () => {
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // Table → caption without a marker → tool row → a cited sentence joined to the caption: the table is not
+      // covered (the marker is in the next part).
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${table}\n\n출처: 전년도 자료.`),
+          ...read("b"),
+          ...text("올해 기준은 별도예요[1]."),
+        ]),
+      ).toEqual([table]);
+      // The reverse: the cited sentence is in the table's part, right before it — covered, though the paragraph
+      // it ends was cut by the tool call.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("앞 문단이고"),
+          ...read("b"),
+          ...text(` 기준은 다음과 같아요[1].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // A footnote's table takes cover only from its own footnote: [^b][^a] shows b's table before a's sentence.
+      const notes =
+        "가[1].[^b][^a]\n\n[^a]: 인용 문장이에요[1].\n\n[^b]: | x | y |\n    |---|---|\n    | 1 | 2 |";
+      expect(missingOf([...read("a"), ...text(notes)])).toEqual(["| x | y |\n    |---|---|\n    | 1 | 2 |"]);
+      // A definition nested in a definition nobody refers to, referred to by the body: shown, so checked once.
+      const nested = "가[1].[^b]\n\n[^a]: 바깥이에요.\n\n    [^b]: 독립적으로 참조한 사실이에요.";
+      expect(missingOf([...read("a"), ...text(nested)])).toEqual(["독립적으로 참조한 사실이에요."]);
+    });
+
+    it("review 6차: neighbours from each part's own blocks; parts as stored; any digit; one sentence end", () => {
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // Three parts: the caption below the table is the table's part's own block, whatever is joined to it after.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${table}\n\n출처: 작년`),
+          ...read("b"),
+          ...text(" 자료[1]이며"),
+          ...read("c"),
+          ...text(" 올해 기준은 별도입니다."),
+        ]),
+      ).toEqual([table]);
+      // A blank part between: the cited sentence right before the table in the last part covers it.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("앞 문장이고"),
+          ...read("b"),
+          ...text(" "),
+          ...read("c"),
+          ...text(` 기준은 다음과 같아요[1].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // A card shown between the text and the tool call: the text is not right before the call.
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("반도체 수출은 늘었어요.\n\n"),
+          card,
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["반도체 수출은 늘었어요."]);
+      // Full-width digits are digits.
+      expect(
+        missingOf([...read("a"), ...text("정원은 ３０명입니다.\n\n"), ...read("b"), ...text("가[1].")]),
+      ).toEqual(["정원은 ３０명입니다."]);
+      // A part that ends a sentence inside closing brackets is its own paragraph; `3.` then `5%` is one number.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("공고에는 「모집은 30명입니다.」"),
+          ...read("b"),
+          ...text("후속이에요[1]."),
+        ]),
+      ).toEqual(["공고에는 「모집은 30명입니다.」"]);
+      expect(missingOf([...read("a"), ...text("금리는 3."), ...read("b"), ...text("5%예요[1].")])).toEqual(
+        [],
+      );
+    });
+
+    it("review 7차: blank text after a card, parts ending in … or :, a lead-in cut mid-sentence", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("반도체 수출은 늘었어요."),
+          card,
+          ...text("\n"),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["반도체 수출은 늘었어요."]);
+      // A part that stops at … or : is its own paragraph: the earlier marker does not cover the next part's fact.
+      for (const head of ["지난해는 30명이었습니다[1]…", "출처 자료[1]:", "출처 자료[1]："])
+        expect(
+          missingOf([...read("a"), ...text(head), ...read("b"), ...text("올해는 50명입니다.")]),
+          head,
+        ).toEqual(["올해는 50명입니다."]);
+      // A lead-in cut mid-sentence joins the paragraph before it; a list or table after it is still its list.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      for (const after of [table, "- 학종이에요[1]"])
+        expect(
+          missingOf([
+            ...read("a"),
+            ...text("2027학년도 모집 "),
+            ...read("b"),
+            ...text(`인원[1]:\n\n${after}`),
+          ]),
+          after,
+        ).toEqual([]);
+    });
+
+    it("review 8차: never joined across a shown card; a colon between digits is a time", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("올해 정원은 30명"),
+          card,
+          ...text("주요 전형은 다음과 같아요[1]:\n\n- 학종 위주예요"),
+        ]),
+      ).toEqual(["올해 정원은 30명", "- 학종 위주예요"]);
+      // Across a tool row only, the same text is one paragraph cut mid-sentence (and its marker covers it).
+      expect(
+        missingOf([...read("a"), ...text("올해 정원은 30명"), ...read("b"), ...text("이에요[1].")]),
+      ).toEqual([]);
+      // `09:` then `30…` across a tool call: a time, one paragraph. A colon after a letter stops the part.
+      expect(
+        missingOf([...read("a"), ...text("회의는 09:"), ...read("b"), ...text("30에 시작해요[1].")]),
+      ).toEqual([]);
+      expect(
+        missingOf([...read("a"), ...text("회의 시간은 9시:"), ...read("b"), ...text("오전 30분이에요.")]),
+      ).toEqual(["회의 시간은 9시:", "오전 30분이에요."]);
+    });
+
+    it("review 9차: a card stays between parts across blank parts and tool rows; only H:MM is a time", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("올해 정원은 30명"),
+          card,
+          ...text(" "),
+          ...read("b"),
+          ...text("주요 전형은 다음과 같아요[1]:\n\n- 학종 위주예요"),
+        ]),
+      ).toEqual(["올해 정원은 30명", "- 학종 위주예요"]);
+      // `변경안 2:` then `2027학년도…`: not a time — a stop.
+      expect(
+        missingOf([...read("a"), ...text("변경안 2:"), ...read("b"), ...text("2027학년도부터 적용돼요[1].")]),
+      ).toEqual(["변경안 2:"]);
+      // H:MM and HH:MM are times: one paragraph.
+      for (const [a, b] of [
+        ["회의는 9:", "30에 시작해요[1]."],
+        ["회의는 09:", "30에 시작해요[1]."],
+      ] as const)
+        expect(missingOf([...read("a"), ...text(a), ...read("b"), ...text(b)]), a).toEqual([]);
+    });
+
+    it("review 10차: full-width colon and digits are a time; the hour is read within the paragraph", () => {
+      for (const a of ["회의는 ０９：", "회의는 09：", "회의는 ９:"])
+        expect(missingOf([...read("a"), ...text(a), ...read("b"), ...text("30에 시작해요[1].")]), a).toEqual(
+          [],
+        );
+      expect(
+        missingOf([...read("a"), ...text("회의는 ０９："), ...read("b"), ...text("３０에 시작해요[1].")]),
+      ).toEqual([]);
+      // A heading's digits before a card are not the hour: `## 11` → card → `2:` → tool → `30…` is 2:30.
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("## 11"),
+          card,
+          ...text("2:"),
+          ...read("b"),
+          ...text("30에 시작해요[1]."),
+        ]),
+      ).toEqual([]);
+    });
+
+    it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      for (const t of [
+        "| a | b |\n|---|---|\n| 1[1] | 2 |",
+        `입결은 아래 표와 같아요[1].\n\n${table}`,
+        `### 2025 입결[1]\n\n${table}`,
+        `${table}\n\n*표 1. 2025 입결[1]*`,
+        `${table}\n\n표 1 전형별 인원[1]`,
+        `${table}\n\n표 2: 전형별 인원[1]`,
+        `${table}\n\n(자료: 2026 시행계획[1])`,
+      ])
+        expect(missingOf([...read("a"), ...text(t)]), t).toEqual([]);
+    });
   });
 
   it("applies when the run used a web or file source tool, cited, or carried numbers — never by the text (#185)", () => {

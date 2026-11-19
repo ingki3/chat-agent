@@ -9,10 +9,11 @@ import {
   type ViewSegment,
   type ViewTarget,
 } from "@agentlee/shared";
+import { findSnippetAt } from "../citations/verify.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { SegmentRow } from "./extract.js";
 import { parseMarks, type Mark } from "./scrub.js";
-import { isBox, prefixHash, segmentLocator, union } from "./text.js";
+import { isBox, prefixHash, sameUnitAddress, segmentLocator, union } from "./text.js";
 import type { FileRow } from "./store.js";
 
 /**
@@ -35,7 +36,20 @@ export type CitedPassage = {
   quote: string;
   /** `prefixHash` of the unit's text up to the passage's end when it was checked (files/text.ts); absent: older. */
   textHash: string | undefined;
+  /**
+   * `unitHashOf` the whole unit (text and marks) when it was checked (#186 review 4차); null: older. When there is
+   * one, it alone decides: the range is exact while the unit is still exactly that — the same condition a later
+   * answer's carried number is verified on.
+   */
+  unitHash?: string | null | undefined;
+  /** The cited XLSX row's sheet number (stored with the citation): the sheet's address when names are masked alike. */
+  sheetNo?: number | undefined;
+  /** The row's whole cited passage (server-side only): whether it goes on past the line it is placed on. */
+  snippet?: string | undefined;
 };
+
+/** What the viewer knows of each unit now, by `seq`: its `unitHashOf` and its sheet's number (#186 review 4·5차). */
+export type UnitsNow = ReadonlyMap<number, { hash: string; sheetNo: number | undefined }>;
 
 type StoredLoc = { split?: unknown };
 const storedSplit = (seg: Pick<SegmentRow, "locator">): boolean => {
@@ -77,34 +91,29 @@ export function viewSegment(file: Pick<FileRow, "id" | "sha256">, seg: SegmentRo
     approximate,
     cut: !!seg.cut,
     split: storedSplit(seg),
+    ...(sheetNoOf(seg) !== undefined ? { sheetNo: sheetNoOf(seg) } : {}),
   };
 }
 
-const sameNote = (a: FileLocator, b: FileLocator) => a.footnote === b.footnote && a.endnote === b.endnote;
+const sheetNoOf = (seg: SegmentRow): number | undefined => {
+  try {
+    const n = (JSON.parse(seg.locator) as { sheetNo?: unknown }).sheetNo;
+    return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /** Sheet names are file text: compared as served (scrubbed with the secrets known now). */
 const sheetOf = (l: FileLocator) =>
   l.sheet === undefined ? undefined : scrubKnown(l.sheet, { tail: false });
 
-/** Whether segment `s` (its locator `sl`, its marks) is (a piece of) the unit `loc` names. */
-function sameUnit(sl: FileLocator, s: ViewSegment, loc: FileLocator): boolean {
-  if (sl.kind !== loc.kind) return false;
-  switch (loc.kind) {
-    case "page":
-      return sl.page === loc.page;
-    case "ocr_box":
-      return sl.page === loc.page;
-    case "line":
-      return s.marks.some((m) => m.line === loc.line);
-    case "paragraph":
-      return sl.paragraph === loc.paragraph && sameNote(sl, loc);
-    case "table":
-      return sl.table === loc.table && sl.row === loc.row && sameNote(sl, loc);
-    case "cell_range":
-      return sheetOf(sl) === sheetOf(loc) && sl.row === loc.row;
-    case "slide":
-      return sl.slide === loc.slide;
-  }
-}
+/** Whether segment `s` (its address) is (a piece of) the unit `loc` names — the recheck's own rule (#186 5차). */
+const sameUnit = (s: ViewSegment, loc: FileLocator & { sheetNo?: number | undefined }, sheetNo?: number) =>
+  sameUnitAddress(
+    { locator: s.locator, sheetNo, lines: s.marks.flatMap((m) => (m.line === undefined ? [] : [m.line])) },
+    loc,
+  );
 
 /**
  * A run of lines that lost its marks (approximate) and surely holds `line`: the run whose first line is the last at
@@ -156,6 +165,8 @@ export function resolveTarget(
   items: readonly ViewSegment[],
   loc: FileLocator,
   cited: readonly CitedPassage[],
+  /** Each unit now (#186 review 4·5차). */
+  units: UnitsNow = new Map(),
 ): ViewTarget {
   const none = (status: ViewTarget["status"], reason: LocateReason): ViewTarget => ({
     status,
@@ -167,12 +178,20 @@ export function resolveTarget(
   if (extract.status === "pending") return none("unreadable", "pending");
   if (extract.status !== "ok") return none("unreadable", "failed");
 
-  let hits = items.filter((s) => sameUnit(s.locator, s, loc));
+  // The link's own citation (the caller passes that one only — none for a link naming no citation, review #186 6차):
+  // its sheet by number (names may be masked alike).
+  const mine = cited.find((c) => key(c.locator) === key(loc));
+  const place = { ...loc, ...(mine?.sheetNo !== undefined ? { sheetNo: mine.sheetNo } : {}) };
+  let hits = items.filter((s) => sameUnit(s, place, units.get(s.seq)?.sheetNo));
   if (!hits.length && loc.kind === "line" && loc.line !== undefined) {
     const run = approximateRun(items, loc.line);
     if (run) hits = [run];
   }
   if (!hits.length) return none("not_found", "unit_missing");
+  // Rows of more than one sheet (names masked alike, a link naming no citation to tell them apart): which one the
+  // link means cannot be told — the file opens, nothing is underlined (review #186 7차).
+  if (place.kind === "cell_range" && new Set(hits.map((s) => units.get(s.seq)?.sheetNo)).size > 1)
+    return { status: "unit", reasons: ["ambiguous"], seqs: [] };
 
   const seqs = hits.map((s) => s.seq);
   const reasons = new Set<LocateReason>();
@@ -197,6 +216,8 @@ export function resolveTarget(
 
   // The passage: `charRange` is within the unit's text — within the named line for a run of lines.
   let range: SegmentRange | undefined;
+  // The range is the passage's start only (a passage over several lines is placed on its first, review #186 5차).
+  let start = false;
   if (!loc.charRange) reasons.add("no_range");
   else if (only && !only.approximate && !only.split) {
     const [a, b] = loc.charRange;
@@ -210,10 +231,20 @@ export function resolveTarget(
     const before = prefixHash(only!.text, range.end);
     // A citation the caller may see gave this locator, and the unit's text up to the passage's end is still the text
     // it was checked in (review #123: the same quote elsewhere after a shift is not the cited place).
-    if (!cited.some((c) => key(c.locator) === k && c.quote === at && c.textHash === before)) {
+    const now = units.get(only!.seq)?.hash;
+    // The link's own citation must stand behind the range: a unit hash when it has one, else the quote and prefix
+    // hash (older rows). A link naming no citation is never exact.
+    const holds = (c: CitedPassage) =>
+      c.unitHash ? c.unitHash === now : c.quote === at && c.textHash === before;
+    // A line citation with a unit hash: its whole passage found in the (unchanged) unit again shows whether it goes on
+    // past the line it is placed on (#186 review 6·7차 — no stored flag); not found (e.g. the stored passage masked
+    // since) → not claimed (8차).
+    const found =
+      mine?.unitHash && loc.kind === "line" ? findSnippetAt(only!.text, mine.snippet ?? "") : undefined;
+    if (!mine || key(mine.locator) !== k || !holds(mine) || (found && !found.found)) {
       reasons.add("unverified");
       range = undefined;
-    }
+    } else if (found?.found && only!.text.slice(found.start, found.end).includes("\n")) start = true;
   }
   if (range && only) {
     const over = only.marks.filter(
@@ -230,6 +261,7 @@ export function resolveTarget(
       range,
       ...(focus ? { focus } : {}),
       ...(bbox ? { bbox } : {}),
+      ...(start ? { start: true as const } : {}),
     };
   }
   return { status: "unit", reasons: [...reasons], seqs, ...(focus ? { focus } : {}) };

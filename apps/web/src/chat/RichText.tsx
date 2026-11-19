@@ -17,7 +17,10 @@ function retry() {
 
 const Plain = ({ text }: { text: string }) => <div className="md plain">{text}</div>;
 
-class Boundary extends Component<{ text: string; cite?: MarkdownCite | undefined }, { failed: boolean }> {
+class Boundary extends Component<
+  { text: string; cite?: MarkdownCite | undefined; offset?: number | undefined },
+  { failed: boolean }
+> {
   override state = { failed: false };
   static getDerivedStateFromError() {
     return { failed: true };
@@ -46,13 +49,28 @@ class Boundary extends Component<{ text: string; cite?: MarkdownCite | undefined
     const Md = Markdown;
     return (
       <Suspense fallback={<Plain text={text} />}>
-        <Md text={text} {...(this.props.cite ? { cite: this.props.cite } : {})} />
+        <Md
+          text={text}
+          {...(this.props.cite ? { cite: this.props.cite } : {})}
+          {...(this.props.offset ? { offset: this.props.offset } : {})}
+        />
       </Suspense>
     );
   }
 }
 
-/** `cite`: the citation markers of a finished answer (#25), drawn as citation buttons. */
-export function RichText({ text, cite }: { text: string; cite?: MarkdownCite | undefined }) {
-  return <Boundary text={text} cite={cite} />;
+/**
+ * `cite`: the citation markers of a finished answer (#25), drawn as citation buttons, and its paragraphs without a
+ * citation marked (#202). `offset`: where this text starts in the answer text (the note's ranges point into it).
+ */
+export function RichText({
+  text,
+  cite,
+  offset,
+}: {
+  text: string;
+  cite?: MarkdownCite | undefined;
+  offset?: number | undefined;
+}) {
+  return <Boundary text={text} cite={cite} offset={offset} />;
 }

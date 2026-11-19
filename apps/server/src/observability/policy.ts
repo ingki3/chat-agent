@@ -211,6 +211,7 @@ export const CITE_CODES = set([
   "cite_bad_input",
   "cite_not_allowed",
   "cite_snippet_too_short",
+  "cite_snippet_too_long",
   "cite_limit",
 ]);
 

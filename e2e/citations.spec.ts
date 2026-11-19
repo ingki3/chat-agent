@@ -1,5 +1,15 @@
-import { expect, test, type Page } from "@playwright/test";
-import { csrf, MOM, openSources, SON, sourceStatuses, useAccount } from "./helpers.js";
+import { expect, test, type Locator, type Page } from "@playwright/test";
+import {
+  csrf,
+  MOM,
+  newConversation,
+  newMember,
+  openSources,
+  signIn,
+  SON,
+  sourceStatuses,
+  useAccount,
+} from "./helpers.js";
 
 /**
  * Citations (#25, PRD FR-5.1–5.5, 수용 기준 3): `[n]` markers (side by side ones one chip, #150), the source list
@@ -113,14 +123,127 @@ test("failed citations are never shown as normal: ⚠️ in the marker, the list
   await expect(reply.getByTestId("citation-missing-warning")).toHaveCount(0);
 });
 
-test("paragraphs without a citation are marked: 일부 내용에 출처 표시 없음", async ({ page }) => {
+test("paragraphs without a citation are marked in the answer, counted in one line (#202)", async ({
+  page,
+}) => {
   await useAccount(page, MOM);
   const { reply } = await newChat(page, "/cite partial");
-  await expect(reply.getByTestId("citation-missing-warning")).toHaveText("⚠️ 일부 내용에 출처 표시 없음");
+  await expect(reply.getByTestId("citation-missing-warning")).toHaveText(/^⚠️ 출처 표시 없는 문단 2개/);
+  // Marked where they are (a paragraph, a list item) — the note does not repeat them.
   await expect(reply.getByTestId("citation-missing")).toHaveText([
-    "업계는 내년에도 두 자릿수 증가를 예상해요.",
-    "- 미국 수출 비중이 가장 컸어요",
+    "업계는 내년에도 두 자릿수 증가를 예상해요.⚠️",
+    "미국 수출 비중이 가장 컸어요⚠️",
   ]);
+  await expect(reply.getByTestId("source-note")).not.toContainText("두 자릿수");
+});
+
+/** The marked paragraphs of a reply and the summary line that moves to them (#202). */
+async function jumpThrough(reply: Locator, isMobile: boolean) {
+  const marks = reply.getByTestId("citation-missing");
+  const jump = reply.getByTestId("citation-missing-warning");
+  // A button once the marks are drawn (plain text before: nowhere to move to yet).
+  await expect(jump).toHaveJSProperty("tagName", "BUTTON");
+  const n = await marks.count();
+  for (let i = 0; i <= n; i++) {
+    if (isMobile) await jump.tap();
+    else await jump.click();
+    // From the first, round again after the last; each one brought into view.
+    await expect(marks.nth(i % n)).toBeFocused();
+    await expect(marks.nth(i % n)).toBeInViewport();
+  }
+}
+
+test("#202 production shape: progress notes, a cited table, an opinion said so and the closing offer are not flagged", async ({
+  page,
+  isMobile,
+}) => {
+  await useAccount(page, MOM);
+  const { reply } = await newChat(page, "/cite advice");
+  await expect(reply.getByTestId("citation-marker")).toHaveText(["1", "2", "3", "1"]);
+  const marks = reply.getByTestId("citation-missing");
+  await expect(marks).toHaveText([
+    "전망: 업계는 내년에도 두 자릿수 증가를 예상해요⚠️",
+    "미국 수출 비중이 가장 컸어요.⚠️",
+  ]);
+  await expect(marks.nth(0)).toHaveJSProperty("tagName", "LI");
+  await expect(marks.nth(1)).toHaveJSProperty("tagName", "P");
+  await expect(reply.getByTestId("citation-missing-warning")).toHaveText(/^⚠️ 출처 표시 없는 문단 2개/);
+  // Nothing of the answer is repeated in the note; the table is drawn as a table, never as markdown rows.
+  const note = reply.getByTestId("source-note");
+  await expect(note).not.toContainText("미국 수출");
+  await expect(reply).not.toContainText("|---|");
+  await expect(reply.locator("table")).toHaveCount(1);
+  // Not flagged: the progress notes, the table, the opinion, the offer.
+  for (const t of [
+    "자료를 찾아 볼게요.",
+    "이제 다음 자료를 확인하고 있어요.",
+    "제 판단으로는",
+    "원하시면 품목별로",
+  ])
+    await expect(reply.locator('[data-testid="citation-missing"]', { hasText: t })).toHaveCount(0);
+  await expect(reply.getByText("원하시면 품목별로 더 자세히 정리해 드릴게요.")).toBeVisible();
+  // The bar is the theme's warning colour, light and dark.
+  const bar = () => marks.nth(1).evaluate((el) => getComputedStyle(el).boxShadow);
+  await page.emulateMedia({ colorScheme: "light" });
+  const light = await bar();
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect.poll(bar).not.toBe(light);
+  expect(light).toMatch(/inset/);
+  await page.emulateMedia({ colorScheme: "light" });
+  await jumpThrough(reply, isMobile);
+});
+
+test("#202: a shared view marks the same paragraphs and its summary line moves to them", async ({
+  page,
+  browser,
+  baseURL,
+  isMobile,
+}) => {
+  const owner = await newMember(browser, baseURL!, "cite202-owner");
+  const viewer = await newMember(browser, baseURL!, "cite202-viewer");
+  await signIn(page, baseURL!, owner);
+  const conv = await newConversation(page.request, baseURL!, `출처 표시 공유 ${Date.now()}`);
+  const sent = await page.request.post(`/api/conversations/${conv.id}/messages`, {
+    data: { text: "/cite partial" },
+    headers: csrf(baseURL!),
+  });
+  expect(sent.status()).toBe(201);
+  const { run } = (await sent.json()) as { run: { id: string } };
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${run.id}`)).json()) as { endedAt: unknown }).endedAt,
+      {
+        timeout: 15_000,
+      },
+    )
+    .not.toBeNull();
+  const share = await page.request.post(`/api/conversations/${conv.id}/shares`, {
+    data: { target: { audience: "users", userIds: [viewer.id] }, mode: "live" },
+    headers: csrf(baseURL!),
+  });
+  expect(share.status()).toBe(201);
+  const { id } = (await share.json()) as { id: string };
+  // The viewer on the same device as the project (desktop, or the phone).
+  const use = test.info().project.use;
+  const ctx = await browser.newContext({
+    baseURL: baseURL!,
+    ...(use.viewport ? { viewport: use.viewport } : {}),
+    ...(use.userAgent ? { userAgent: use.userAgent } : {}),
+    isMobile: use.isMobile ?? false,
+    hasTouch: use.hasTouch ?? false,
+  });
+  const vpage = await ctx.newPage();
+  await signIn(vpage, baseURL!, viewer);
+  await vpage.goto(`/shared/${id}`);
+  const view = vpage.getByTestId("shared-view");
+  await expect(view.getByTestId("citation-missing")).toHaveText([
+    "업계는 내년에도 두 자릿수 증가를 예상해요.⚠️",
+    "미국 수출 비중이 가장 컸어요⚠️",
+  ]);
+  await expect(view.getByTestId("citation-missing-warning")).toHaveText(/^⚠️ 출처 표시 없는 문단 2개/);
+  await jumpThrough(view, isMobile);
+  await ctx.close();
 });
 
 test("existing sources are reused in the same conversation; another conversation's or user's id is unknown", async ({

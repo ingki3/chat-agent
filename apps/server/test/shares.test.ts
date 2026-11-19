@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CitationNotePart,
+  type MessagePart,
   CreateConversationShareRequest,
   CSRF_HEADER,
   SharedView,
@@ -29,6 +31,8 @@ import { CitationStore } from "../src/citations/store.js";
 import { projectEvent, projectPart } from "../src/shares/projection.js";
 import { notifyResultSubscribers } from "../src/shares/notify.js";
 import { remapParts } from "../src/shares/fork.js";
+import { snippetKey } from "../src/citations/store.js";
+import { citationNote } from "../src/citations/checker.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
@@ -208,6 +212,9 @@ async function snapshotWorld(o: { runner?: DocRunner } = {}) {
 
 /** Each turn's answer cites its page (the note the run's end would write): S1 in turn 1, S2 in turn 2. */
 function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
+  // Each note entry stands for the citation row its run registered (#186 review 2차: the whole passage is there).
+  const row = (sourceId: string) =>
+    (w.db.$client.prepare("select id from citations where source_id = ?").get(sourceId) as { id: string }).id;
   const note = (n: number, sourceId: string, url: string) => ({
     type: "citation_note",
     missing: [],
@@ -222,6 +229,7 @@ function citeInNotes(w: Awaited<ReturnType<typeof snapshotWorld>>) {
         url,
         publishedAt: null,
         quote: "인용",
+        citationId: row(sourceId),
       },
     ],
   });
@@ -1073,6 +1081,20 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
     expect(srcs[0]!.characters).toBe(0);
     expect(JSON.stringify(msgs[1]!.parts)).toContain(srcs[0]!.id);
     expect(JSON.stringify(msgs)).not.toContain(w.s1);
+    // The citation row the copied note stands for is copied too (#186 review 2차): the forker's, the copy's source,
+    // the whole passage kept server-side; the note names the copy. The row of the turn past the boundary is not.
+    const cited = msgs[1]!.parts.find((x) => x.type === "citation_note");
+    const rowId = cited?.type === "citation_note" ? cited.citations[0]!.citationId : undefined;
+    expect(rowId).toBeDefined();
+    expect(db.$client.prepare("select * from citations where conversation_id = ?").all(fork.id)).toEqual([
+      expect.objectContaining({
+        id: rowId,
+        user_id: w.f.users.shared.id,
+        source_id: srcs[0]!.id,
+        snippet: "사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다.",
+        n: 1,
+      }),
+    ]);
 
     // Provenance (#54): every copied item names its original.
     const items = db.$client
@@ -1121,6 +1143,75 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
     expect((await w.viewer.get(`/api/conversations/${fork.id}/messages`)).statusCode).toBe(200);
   });
 
+  it("#186 review 3차: fork → share → fork keeps the citation row (and its source); a follow-up [1] there is checked against it", async () => {
+    const w = await snapshotWorld();
+    citeInNotes(w);
+    const first = (await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).json<Fork>().conversation;
+    // The forker shares the copy on; the owner forks that.
+    const again = await w.viewer.send("POST", `/api/conversations/${first.id}/shares`, {
+      target: { audience: "family" },
+      mode: "live",
+    });
+    expect(again.statusCode, again.body).toBe(201);
+    const second = (await w.owner.send("POST", `/api/shares/${again.json<Share>().id}/fork`)).json<Fork>()
+      .conversation;
+    const rows = (id: string) =>
+      w.db.$client
+        .prepare(
+          "select id, run_id as r, source_id as s, snippet, complete from citations where conversation_id = ?",
+        )
+        .all(id) as { id: string; r: string; s: string; snippet: string; complete: number }[];
+    const [r1] = rows(first.id);
+    const [r2] = rows(second.id);
+    expect(r1?.r.startsWith("fork:")).toBe(true);
+    // The first copy's row (a run of no `runs` row) went into the re-share and on into the second copy.
+    expect(r2).toMatchObject({
+      snippet: "사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다.",
+      complete: 1,
+    });
+    expect(r2!.id).not.toBe(r1!.id);
+    const srcs = w.db.$client.prepare("select id from sources where conversation_id = ?").all(second.id) as {
+      id: string;
+    }[];
+    expect(srcs.map((x) => x.id)).toEqual([r2!.s]);
+    const msgs = w.app.conversations!.messages(second.id, { limit: 100 });
+    const note = msgs.flatMap((m) => m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+    expect(note?.type === "citation_note" && note.citations[0]!.citationId).toBe(r2!.id);
+    // A follow-up in the second copy writing [1] again: carried by that row, checked against the copy's source.
+    // (A fork copies no page text — fetch_failed; with the text there, the whole passage verifies.)
+    const store = new CitationStore(w.db);
+    const carry = {
+      conversationId: second.id,
+      userId: w.f.users.owner.id,
+      previous: () => (note?.type === "citation_note" ? note.citations : []),
+    };
+    const follow = (runId: string) =>
+      citationNote(runId, [{ type: "text", text: "앞서 말했듯이 그래요[1]." }], store, carry)!.citations[0]!;
+    expect([follow(crypto.randomUUID()).status, follow(crypto.randomUUID()).sourceId]).toEqual([
+      "fetch_failed",
+      r2!.s,
+    ]);
+    w.db.$client
+      .prepare("update sources set kind = 'page', body = ?, body_hash = null where id = ?")
+      .run("본문 앞. 사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다. 그리고 끝.", r2!.s);
+    expect(follow(crypto.randomUUID()).status).toBe("verified");
+  });
+
+  it("#186 review 4차: a row that is not complete (stored before) is not copied into a fork", async () => {
+    const w = await snapshotWorld();
+    citeInNotes(w);
+    w.db.$client.prepare("update citations set complete = 0 where source_id = ?").run(w.s1);
+    const fork = (await w.viewer.send("POST", `/api/shares/${w.share.id}/fork`)).json<Fork>().conversation;
+    expect(
+      w.db.$client.prepare("select count(*) as n from citations where conversation_id = ?").get(fork.id),
+    ).toEqual({
+      n: 0,
+    });
+    const msgs = w.app.conversations!.messages(fork.id, { limit: 100 });
+    const note = msgs.flatMap((m) => m.parts as MessagePart[]).find((p) => p.type === "citation_note");
+    expect(note?.type === "citation_note" && note.citations[0]!.citationId).toBeUndefined();
+  });
+
   it("keeps a secret registered after the original was stored out of the copy (#78)", async () => {
     const w = await start();
     const late = `sk-ant-forklate${crypto.randomUUID().replaceAll("-", "")}`;
@@ -1131,14 +1222,79 @@ describe("fork — 이어서 대화하기 (#52, FR-14.3)", () => {
       title: `문서 ${late}`,
       content: `# 본문 ${late}`,
     });
-    w.cite(c.id, t.run.id, `https://late.example/${late}`, `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`);
+    const lateSrc = w.cite(
+      c.id,
+      t.run.id,
+      `https://late.example/${late}`,
+      `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`,
+    );
+    // A citation row holding the value in full (#186 review 3차), named by the answer's note: copied, masked now.
+    const rowId = crypto.randomUUID();
+    const lateSnippet = `사과는 빨갛고 둥근 과일이다 ${late} 정말로.`;
+    w.db.$client
+      .prepare(
+        `insert into citations (id, run_id, conversation_id, user_id, n, source_id, status, snippet, snippet_key, quote,
+           complete) values (?, ?, ?, ?, 2, ?, 'verified', ?, ?, ?, 1)`,
+      )
+      .run(
+        rowId,
+        t.run.id,
+        c.id,
+        w.f.users.owner.id,
+        lateSrc,
+        lateSnippet,
+        snippetKey(lateSnippet),
+        lateSnippet,
+      );
+    const reply = w.app.conversations!.messageById(t.run.assistantMessageId)!;
+    w.db
+      .update(messages)
+      .set({
+        parts: [
+          ...(reply.parts as object[]),
+          {
+            type: "citation_note",
+            missing: [],
+            markers: [],
+            citations: [
+              {
+                n: 2,
+                status: "verified",
+                sourceId: lateSrc,
+                title: "t",
+                site: "example.com",
+                url: "https://late.example/x",
+                publishedAt: null,
+                quote: "인용",
+                citationId: rowId,
+              },
+            ],
+          },
+        ] as Message["parts"],
+      })
+      .where(eq(messages.id, reply.id))
+      .run();
     const share = await w.share(c.id, { target: { audience: "family" }, mode: "live" });
     knownSecrets.add(late);
     try {
       const r = await w.viewer.send("POST", `/api/shares/${share.id}/fork`);
       expect(r.statusCode).toBe(201);
       const id = r.json<Fork>().conversation.id;
-      for (const table of ["conversations", "messages", "artifacts", "artifact_versions", "sources"]) {
+      const copied = w.db.$client
+        .prepare("select snippet, snippet_key as k, quote from citations where conversation_id = ?")
+        .all(id) as { snippet: string; k: string; quote: string }[];
+      expect(copied).toHaveLength(1);
+      expect(copied[0]!.snippet).toContain("[숨김]");
+      // The key is the masked snippet's (never the value's).
+      expect(copied[0]!.k).toBe(snippetKey(copied[0]!.snippet));
+      for (const table of [
+        "conversations",
+        "messages",
+        "artifacts",
+        "artifact_versions",
+        "sources",
+        "citations",
+      ]) {
         const col =
           table === "artifact_versions"
             ? "artifact_id"
@@ -1387,5 +1543,89 @@ describe("fork — remapParts (#52)", () => {
     expect(out).toContainEqual({ type: "table", columns: [], rows: [] });
     const note = out.find((p) => p.type === "citation_note")!;
     expect(note.type === "citation_note" && note.citations.map((c) => c.sourceId)).toEqual(["S1", null]);
+  });
+
+  it("#186: a file citation's fileId moves to the copy's file (also inside the locator); a file not copied is cut", () => {
+    const ids = {
+      message: new Map<string, string>(),
+      file: new Map([["f1", "F1"]]),
+      artifact: new Map<string, { id: string; versions: Map<number, number> }>(),
+      source: new Map<string, string>(),
+      citation: new Map([
+        ["c1", "C1"],
+        ["c2", "C2"],
+      ]),
+    };
+    const rev = "a".repeat(64);
+    const entry = (n: number, fileId: string | undefined, locator?: boolean) => ({
+      n,
+      status: (locator ? "verified" : "snippet_not_found") as "verified" | "snippet_not_found",
+      sourceId: null,
+      title: "보고서.pdf",
+      site: locator ? "12쪽" : null,
+      url: null,
+      publishedAt: null,
+      quote: "파일의 구절이에요 열두 쪽",
+      ...(locator && fileId
+        ? {
+            locator: {
+              fileId,
+              fileRevision: rev,
+              kind: "page" as const,
+              page: 12,
+              charRange: [3, 9] as [number, number],
+              bbox: [0.1, 0.1, 0.2, 0.05] as [number, number, number, number],
+            },
+          }
+        : {}),
+      ...(fileId ? { fileId } : {}),
+      citationId: `c${n}`,
+    });
+    const out = remapParts(
+      [
+        {
+          type: "citation_note",
+          missing: [],
+          markers: [],
+          // Verified (id in the locator too), not verified (id only), a file the copy lacks, an entry from before #186.
+          citations: [entry(1, "f1", true), entry(2, "f1"), entry(3, "f2", true), entry(4, undefined)],
+        },
+      ],
+      ids,
+    );
+    const note = out[0]!;
+    expect(note.type).toBe("citation_note");
+    const cites = note.type === "citation_note" ? note.citations : [];
+    expect(cites.map((c) => [c.n, c.fileId, c.locator?.fileId])).toEqual([
+      [1, "F1", "F1"],
+      [2, "F1", undefined],
+      [3, undefined, undefined],
+      [4, undefined, undefined],
+    ]);
+    expect(JSON.stringify(out)).not.toMatch(/"f[12]"/);
+    // The citation rows copied into the fork (review 2차); one not copied is cut.
+    expect(cites.map((c) => c.citationId)).toEqual(["C1", "C2", undefined, undefined]);
+    // A note whose row was not copied keeps its place as a unit only (review #186 6차): no range, no box.
+    const legacyNote = remapParts(
+      [
+        {
+          type: "citation_note",
+          missing: [],
+          markers: [],
+          citations: [{ ...entry(5, "f1", true), citationId: "c-not-copied" }],
+        },
+      ],
+      ids,
+    )[0]!;
+    const legacy = legacyNote.type === "citation_note" ? legacyNote.citations[0]! : undefined;
+    expect([legacy?.citationId, legacy?.locator?.fileId, legacy?.locator?.page]).toEqual([
+      undefined,
+      "F1",
+      12,
+    ]);
+    expect([legacy?.locator?.charRange, legacy?.locator?.bbox]).toEqual([undefined, undefined]);
+    expect(cites[0]!.locator?.charRange).toEqual([3, 9]);
+    expect(JSON.stringify(out)).not.toMatch(/"c[1-4]"/);
+    expect(CitationNotePart.parse(note)).toEqual(note);
   });
 });

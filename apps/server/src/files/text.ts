@@ -215,7 +215,7 @@ export class FileTools {
    * Whether a run of `scope` may read file `f` — the one rule of every file tool (see the file comment): the
    * token user's conversation, the user's file in it, sent with a message that is still active.
    */
-  private inScope(scope: ToolScope, f: FileRow): boolean {
+  private inScope(scope: Pick<ToolScope, "conversationId" | "userId">, f: FileRow): boolean {
     return (
       f.conversationId === scope.conversationId &&
       f.userId === scope.userId &&
@@ -223,13 +223,13 @@ export class FileTools {
     );
   }
 
-  private ownConversation(scope: ToolScope): boolean {
+  private ownConversation(scope: Pick<ToolScope, "conversationId" | "userId">): boolean {
     const c = this.conversations.get(scope.conversationId);
     return !!c && c.ownerId === scope.userId;
   }
 
   /** The file when the run may read it, or undefined. */
-  fileFor(scope: ToolScope, fileId: string): FileRow | undefined {
+  fileFor(scope: Pick<ToolScope, "conversationId" | "userId">, fileId: string): FileRow | undefined {
     if (!this.ownConversation(scope)) return undefined;
     const f = this.store.get(fileId);
     return f && this.inScope(scope, f) ? f : undefined;
@@ -484,7 +484,9 @@ export class FileTools {
           source: "file_search",
           content:
             top
-              .map((h, i) => `[${i + 1}] ${scrubKnown(h.file.name, { tail: false })} · ${h.own}\n${h.text}`)
+              .map(
+                (h, i) => `(결과 ${i + 1}) ${scrubKnown(h.file.name, { tail: false })} · ${h.own}\n${h.text}`,
+              )
               .join("\n\n") || "(no matches)",
         }),
       },
@@ -507,14 +509,56 @@ export class FileTools {
    * a web citation (`findSnippetAt`), the unit named by `page` first. A verified passage gets its exact locator —
    * or none when its place was lost to a secret's removal (never a wrong one, review #107).
    */
-  async check(
-    f: FileRow,
-    snippet: string,
-    page: number | undefined,
-  ): Promise<{ status: CitationStatus; quote: string | null; locator: CitedLocator | null }> {
-    const extract = await this.ready(f);
+  async check(f: FileRow, snippet: string, page: number | undefined): Promise<CheckResult> {
+    return this.match(f, await this.ready(f), snippet, page);
+  }
+
+  /**
+   * An earlier answer's file citation checked again for a later answer that writes its number again (#186, the
+   * file side of #150's carry-over) — **the cited unit is unchanged at the same place** (review 4차): the file must
+   * still be one a run of `scope` may read (`fileFor` — this conversation's and this user's, sent with an active
+   * message; a deleted file or one an edit cut off is not), its extraction ready (being extracted again or failed →
+   * `fetch_failed`, never waited for), a unit at the row's place whose whole text and marks hash to the row's
+   * `unitHash` (`unitHashOf` — computed from the text now, so an identical re-extraction still matches; a changed
+   * text, a newly masked secret or moved cells do not), and the row's whole passage found in it again (the usual
+   * rules, in the unit's full text — the unit being the same, so is the place). Anything else is `snippet_not_found`: never looked
+   * for elsewhere. The place shown is the row's own — the one the viewer opens and, on the same condition, claims
+   * exact. Undefined when the file is not one (any more): the marker stays `unknown_source`. Registers nothing.
+   */
+  recheck(
+    scope: Pick<ToolScope, "conversationId" | "userId">,
+    input: { fileId: string; snippet: string; locator: CitedLocator | undefined; unitHash: string | null },
+  ):
+    { status: CitationStatus; quote: string | null; locator: FileLocator | null; file: FileRow } | undefined {
+    const file = this.fileFor(scope, input.fileId);
+    if (!file) return undefined;
+    const no = { status: "snippet_not_found" as const, quote: null, locator: null, file };
+    const extract = toFileExtract(file, this.extracts.get(file.id));
     if (extract.status !== "ok" || !extract.segments)
-      return { status: "fetch_failed", quote: null, locator: null };
+      return { status: "fetch_failed", quote: null, locator: null, file };
+    const at = input.locator;
+    if (!at || !input.unitHash || at.fileId !== file.id || at.fileRevision !== file.sha256) return no;
+    // The row's whole passage (as stored, already scrubbed — again with the secrets known now); never cut.
+    const snippet = scrubKnown(input.snippet);
+    for (const seg of this.extracts.segments(file.id)) {
+      if (!sameUnitAddress(unitAddressOf(file, seg), at) || unitHashOf(seg) !== input.unitHash) continue;
+      // The unit is byte for byte (text and marks) the one verified: the passage found in it is at the row's place.
+      const m = findSnippetAt(seg.text, snippet);
+      if (!m.found) continue;
+      const loc = FileLocator.safeParse(scrubKnownDeep(at));
+      if (!loc.success) return no;
+      return { status: "verified", quote: scrubKnown(m.quote), locator: loc.data, file };
+    }
+    return no;
+  }
+
+  /**
+   * `check`'s search of the extraction `extract` (its state as given: a pending one is `fetch_failed`): the first
+   * unit that has the passage, the unit named by `page` first.
+   */
+  private match(f: FileRow, extract: FileExtract, snippet: string, page: number | undefined): CheckResult {
+    if (extract.status !== "ok" || !extract.segments)
+      return { status: "fetch_failed", quote: null, locator: null, unitHash: null };
     const segs = this.extracts.segments(f.id);
     const ordered =
       page === undefined
@@ -522,23 +566,100 @@ export class FileTools {
         : [...segs.filter((s) => s.unit === page), ...segs.filter((s) => s.unit !== page)];
     for (const seg of ordered) {
       const m = findSnippetAt(seg.text, snippet);
-      if (!m.found) continue;
-      const where = locate(f, seg, m.start, m.end);
-      // The verified unit's own sheet number goes with the locator (the model's sheet id comes from it).
-      const sheetNo = locOf(seg).sheetNo;
-      return {
-        status: "verified",
-        quote: m.quote,
-        locator: where
-          ? {
-              ...where,
-              ...(sheetNo !== undefined ? { sheetNo } : {}),
-              // Only a passage with a range gets one: the text it was found in, up to its end.
-              ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
-            }
-          : null,
-      };
+      if (m.found) return verifiedAt(seg, m, locate(f, seg, m.start, m.end));
     }
-    return { status: "snippet_not_found", quote: null, locator: null };
+    return { status: "snippet_not_found", quote: null, locator: null, unitHash: null };
   }
 }
+
+/** What `check` finds: a verified passage's quote, place and its unit's hash (`unitHashOf`), or why not. */
+export type CheckResult = {
+  status: CitationStatus;
+  quote: string | null;
+  locator: CitedLocator | null;
+  unitHash: string | null;
+};
+
+/**
+ * A unit as it is (#186 review 4차): SHA-256 of its whole text and its marks (lines, cells, boxes) — what a carried
+ * citation of it is verified against, and what lets the viewer claim the cited range exact.
+ */
+export const unitHashOf = (seg: Pick<SegmentRow, "text" | "marks">) =>
+  crypto
+    .createHash("sha256")
+    .update(seg.text, "utf8")
+    .update("\u0000")
+    .update(seg.marks ?? "", "utf8")
+    .digest("hex");
+
+type VerifiedMatch = CheckResult & { status: "verified"; quote: string };
+
+/** A verified passage at `[m.start, m.end)` of `seg`, with its exact place (`where`) when it has one. */
+function verifiedAt(
+  seg: SegmentRow,
+  m: { quote: string; start: number; end: number },
+  where: FileLocator | undefined,
+): VerifiedMatch {
+  // The verified unit's own sheet number goes with the locator (the model's sheet id comes from it).
+  const sheetNo = locOf(seg).sheetNo;
+  return {
+    status: "verified",
+    quote: m.quote,
+    locator: where
+      ? {
+          ...where,
+          ...(sheetNo !== undefined ? { sheetNo } : {}),
+          // Only a passage with a range gets one: the text it was found in, up to its end.
+          ...(where.charRange ? { textHash: prefixHash(seg.text, m.end) } : {}),
+        }
+      : null,
+    unitHash: unitHashOf(seg),
+  };
+}
+
+/** A stored unit as an address: its own locator, its sheet's number (XLSX) and the lines of a run of lines. */
+export type UnitAddress = { locator: FileLocator; sheetNo?: number | undefined; lines: readonly number[] };
+
+/** `seg`'s address (see `sameUnitAddress`). */
+export function unitAddressOf(f: Pick<FileRow, "id" | "sha256">, seg: SegmentRow): UnitAddress {
+  return {
+    locator: segmentLocator(f, seg),
+    sheetNo: locOf(seg).sheetNo,
+    lines: marksOf(seg).flatMap((m) => (typeof m[2].line === "number" ? [m[2].line] : [])),
+  };
+}
+
+/**
+ * Whether unit `u` is the unit place `at` names — **the one rule** (#186 review 5차) the carry-over recheck and the
+ * viewer both use: the same kind and page, slide, paragraph or table row; a footnote's or endnote's number equal,
+ * none included (a body paragraph is not its footnote); an XLSX row by its sheet's **number** when both have one
+ * (two sheets whose names are masked alike stay two), by the served name otherwise; a line within the run's lines.
+ */
+export function sameUnitAddress(u: UnitAddress, at: FileLocator & { sheetNo?: number | undefined }): boolean {
+  const l = u.locator;
+  if (l.kind !== at.kind) return false;
+  const note = l.footnote === at.footnote && l.endnote === at.endnote;
+  switch (at.kind) {
+    case "page":
+    case "ocr_box":
+      return l.page === at.page;
+    case "line":
+      return at.line !== undefined && u.lines.includes(at.line);
+    case "paragraph":
+      return l.paragraph === at.paragraph && note;
+    case "table":
+      return l.table === at.table && l.row === at.row && note;
+    case "cell_range": {
+      const sheet =
+        u.sheetNo !== undefined && at.sheetNo !== undefined
+          ? u.sheetNo === at.sheetNo
+          : servedSheet(l.sheet) === servedSheet(at.sheet);
+      return sheet && l.row === at.row;
+    }
+    case "slide":
+      return l.slide === at.slide;
+  }
+}
+
+/** Sheet names are file text: compared as served (scrubbed with the secrets known now). */
+const servedSheet = (s: string | undefined) => (s === undefined ? undefined : scrubKnown(s, { tail: false }));
