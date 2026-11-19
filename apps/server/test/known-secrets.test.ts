@@ -33,6 +33,7 @@ import { ConnectionStore } from "../src/connections/store.js";
 import { serializeCredential, type ChatgptCredential } from "../src/connections/chatgpt.js";
 import type { PushTarget } from "../src/notifications/service.js";
 import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
+import { meterWork } from "./helpers/work-meter.js";
 
 /**
  * Review round 23: a secret value the server knows never reaches a stored row, the messages API, a live
@@ -714,15 +715,33 @@ describe("round 25: scrubber", () => {
   it("stays linear: a repeated prefix is not compared from every start", () => {
     const reg = new KnownSecrets();
     reg.add("a".repeat(16_384));
-    let t = Date.now();
     expect(scrubKnown("a".repeat(16_384), { registry: reg })).toBe("[숨김]");
-    expect(Date.now() - t).toBeLessThan(100);
     // Text that is only ever a prefix (every start a near-match): linear (KMP), and nothing is masked — no secret
     // is there (round 26: the trailing prose stays).
-    t = Date.now();
     const prose = "a".repeat(16_383) + "b ordinary prose data banana";
     expect(scrubKnown(prose, { registry: reg })).toBe(prose);
-    expect(Date.now() - t).toBeLessThan(100);
+    // Counted, not timed (#213): a secret and a text 8× as long are ~8× the work (`meterWork`: every character read,
+    // slice and search) — compared from every start, 64×.
+    for (const [what, text] of [
+      ["the secret itself", (n: number) => "a".repeat(n)],
+      ["only ever a prefix", (n: number) => "a".repeat(n - 1) + "b ordinary prose data banana"],
+    ] as const) {
+      const work = (n: number) => {
+        const r = new KnownSecrets();
+        r.add("a".repeat(n));
+        const input = text(n);
+        let out = "";
+        const w = meterWork(() => {
+          out = scrubKnown(input, { registry: r });
+        });
+        expect(out).toBe(input.length === n ? "[숨김]" : input);
+        return w;
+      };
+      const small = work(2048);
+      const big = work(16_384);
+      expect(small, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(2048);
+      expect(big / small, `${what}: ${small} → ${big}`).toBeLessThan(10);
+    }
     const ps = new StreamScrubber(reg);
     expect(
       chunks(prose, rng(26))
@@ -731,7 +750,7 @@ describe("round 25: scrubber", () => {
     ).toBe(prose);
     // The same with escapes all through it (the character search runs): bounded, and still nothing masked.
     const escaped = ("a".repeat(500) + "\\x").repeat(40) + " ordinary prose";
-    t = Date.now();
+    let t = Date.now();
     expect(scrubKnown(escaped, { registry: reg })).toBe(escaped);
     expect(Date.now() - t).toBeLessThan(1000);
     const s = new StreamScrubber(reg);

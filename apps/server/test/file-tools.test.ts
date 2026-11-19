@@ -33,11 +33,12 @@ import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { FakeRuntime, type FakeScript, defaultScript } from "../src/runtime/fake.js";
 import { FILE_SCENARIOS, REPORT_PAGE12, type FileScenarioName } from "../src/runtime/fake-files.js";
-import { knownSecrets } from "../src/secrets/known.js";
+import { knownSecrets, scanStats } from "../src/secrets/known.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { callOurTool, liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import { meterWork } from "./helpers/work-meter.js";
 import {
   MATRIX,
   matrixDoc,
@@ -1211,12 +1212,6 @@ describe("review #107 2차: sheets by id only, cited sheets by number, no place 
   });
 });
 
-/**
- * Time cap of the dense case: ~90 ms alone here, ~270 ms with the whole suite in parallel on a busy machine; the
- * quadratic distribution takes seconds. Shared CI runners are several times slower (as in redact.test.ts).
- */
-const PERF_MS = process.env.CI ? 1600 : 400;
-
 /** A file held open on our MCP server by a run that waits, so the test calls the tools with its token (raw answers). */
 async function holding(
   runtimesFor: (rt: FakeRuntime) => RuntimeRegistry = (rt) => {
@@ -1487,7 +1482,7 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
   });
 
   it("[P2] dense: 200k matches over 20k rows (1.78M characters) — distributed in linear time, then served from the cache", async () => {
-    const { scrubFile } = await import("../src/files/scrub.js");
+    const { scrubFile, scrubStats } = await import("../src/files/scrub.js");
     const { KnownSecrets } = await import("../src/secrets/known.js");
     const reg = new KnownSecrets();
     const secret = "s3cr3tXY";
@@ -1495,49 +1490,59 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
     const rowText = Array.from({ length: 10 }, (_, i) => `${secret}${i}`)
       .join(" | ")
       .padEnd(89, ".");
-    const units = Array.from({ length: 20_000 }, () => {
-      const marks: [number, number, Record<string, unknown>][] = [];
+    const rows = (n: number) =>
+      Array.from({ length: n }, () => {
+        const marks: [number, number, Record<string, unknown>][] = [];
+        let pos = 0;
+        for (let i = 0; i < 10; i++) {
+          marks.push([pos, pos + secret.length + 1, { col: i + 1 }]);
+          pos += secret.length + 1 + 3;
+        }
+        return { text: rowText, marks };
+      });
+    // A row of n cells, each holding the secret (n marks, n ranges in one unit).
+    const wide = (n: number) => {
+      const cells = Array.from({ length: n }, (_, i) => `${secret}${i % 10}`);
       let pos = 0;
-      for (let i = 0; i < 10; i++) {
-        marks.push([pos, pos + secret.length + 1, { col: i + 1 }]);
-        pos += secret.length + 1 + 3;
-      }
-      return { text: rowText, marks };
-    });
+      return {
+        text: cells.join(" | "),
+        marks: cells.map((c, i): [number, number, Record<string, unknown>] => {
+          const m: [number, number, Record<string, unknown>] = [pos, pos + c.length, { col: i + 1 }];
+          pos += c.length + 3;
+          return m;
+        }),
+      };
+    };
+    // The full size: every secret masked, every mark kept.
+    const units = rows(20_000);
     expect(units.reduce((n, u) => n + u.text.length + 1, 0)).toBeGreaterThan(1_770_000);
-    scrubFile(units.slice(0, 100), reg); // warm up
-    // The best of three: a busy machine's pauses are not the algorithm (a quadratic one takes seconds).
-    let ms = Infinity;
-    let out: ReturnType<typeof scrubFile> = [];
-    for (let i = 0; i < 3; i++) {
-      const t0 = performance.now();
-      out = scrubFile(units, reg);
-      ms = Math.min(ms, performance.now() - t0);
-    }
+    const out = scrubFile(units, reg);
     expect(out.every((u) => !u.text.includes(secret))).toBe(true);
     expect(out[0]!.marks!.length).toBe(10);
-    expect(ms, `scrubFile ${ms.toFixed(0)} ms`).toBeLessThan(PERF_MS);
-    // And inside one unit: a row of 20k cells, each holding the secret (20k marks, 20k ranges).
-    const cells = Array.from({ length: 20_000 }, (_, i) => `${secret}${i % 10}`);
-    let pos = 0;
-    const wide = {
-      text: cells.join(" | "),
-      marks: cells.map((c, i): [number, number, Record<string, unknown>] => {
-        const m: [number, number, Record<string, unknown>] = [pos, pos + c.length, { col: i + 1 }];
-        pos += c.length + 3;
-        return m;
-      }),
-    };
-    let ms1 = Infinity;
-    let one: ReturnType<typeof scrubFile>[number] | undefined;
-    for (let i = 0; i < 3; i++) {
-      const t1 = performance.now();
-      [one] = scrubFile([wide], reg);
-      ms1 = Math.min(ms1, performance.now() - t1);
-    }
+    const [one] = scrubFile([wide(20_000)], reg);
     expect(one!.marks!.length).toBe(20_000);
     expect(one!.text.includes(secret)).toBe(false);
-    expect(ms1, `one wide unit ${ms1.toFixed(0)} ms`).toBeLessThan(PERF_MS);
+    // Linear: counted, not timed (#213 — a time cap failed under a full run's load). The work of 8× the rows (and
+    // of a row 8× as wide) is ~8× — the built-ins' work (`meterWork`) and the distribution's own loops
+    // (`scrubStats`); a distribution that walks every range for each unit, or every range for each mark, is 64×.
+    const work = (units: Parameters<typeof scrubFile>[0], marks: number) => {
+      const steps = scrubStats.steps;
+      let res: ReturnType<typeof scrubFile> = [];
+      const w = meterWork(() => {
+        res = scrubFile(units, reg);
+      });
+      expect(res.reduce((n, u) => n + u.marks!.length, 0)).toBe(marks);
+      return w + scrubStats.steps - steps;
+    };
+    for (const [what, make] of [
+      ["rows", (n: number) => work(rows(n), 10 * n)],
+      ["one wide row", (n: number) => work([wide(10 * n)], 10 * n)],
+    ] as const) {
+      const small = make(1000);
+      const big = make(8000);
+      expect(small, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(10 * 1000);
+      expect(big / small, `${what}: ${small} → ${big}`).toBeLessThan(10);
+    }
   });
 
   it("[P2] reads are served from the cache until the extraction or the known secrets change", async () => {
@@ -1548,10 +1553,10 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
     const up = await h.upload(h.f.cookies.owner, c.id, "big.csv", Buffer.from(csv));
     await h.app.fileExtracts!.idle();
     const first = h.app.fileExtracts!.segments(up.id, 5, 1);
-    const t0 = performance.now();
+    // Not scrubbed again: nothing handed to the matcher (counted, not timed — #213).
+    const scanned = scanStats.chars;
     for (let i = 0; i < 20; i++) h.app.fileExtracts!.segments(up.id, 5, 1);
-    const cached = (performance.now() - t0) / 20;
-    expect(cached, `cached read ${cached.toFixed(1)} ms`).toBeLessThan(PERF_MS / 10);
+    expect(scanStats.chars - scanned).toBe(0);
     // From the cache: the very same scrubbed rows, not scrubbed again.
     expect(h.app.fileExtracts!.segments(up.id, 5, 1)[0]).toBe(first[0]);
     // A new secret — the row's text exactly as stored ("row5 | vvv… | end"): present before, gone right after.
