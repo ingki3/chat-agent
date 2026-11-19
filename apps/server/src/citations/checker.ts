@@ -82,104 +82,6 @@ export function firstToolAt(parts: readonly MessagePart[]): number {
   return toolCallsAt(parts)[0] ?? Number.POSITIVE_INFINITY;
 }
 
-/** "자료를 찾아 비교해 볼게요." — what the model says it is about to do, not something it states. */
-const PROGRESS =
-  /(?:볼게요|볼께요|볼게|보겠습니다|할게요|하겠습니다|드릴게요|드리겠습니다|올게요|오겠습니다)[.!…~]*$|^(?:let me|i'll|i will)\s+(?:search|look|check|find|fetch|read|compare)\b/iu;
-
-/**
- * The assistant's own work on the material (#202, review 1·2차) — a closed list of predicates: reading, searching,
- * finding, checking, comparing, sorting out, going through, reviewing, calculating, analysing, looking up; going on
- * ("확인하고 있어요", "비교하는 중이에요"), done ("다 읽었어요") or next ("확인해 볼게요", "찾아볼게요").
- */
-const WORK = "(?:읽|찾|찾아보|검색하|확인하|비교하|정리하|살펴보|훑어보|검토하|계산하|분석하|열어보|조회하)";
-const WORK_DONE =
-  "(?:읽었|찾았|찾아봤|검색했|확인했|비교했|정리했|살펴봤|살펴보았|훑어봤|검토했|계산했|분석했|열어봤|조회했|가져왔)";
-const WORK_NEXT =
-  "(?:읽을|찾을|검색할|확인할|비교할|정리할|검토할|계산할|분석할|조회할|가져올|(?:읽어|찾아|살펴|훑어|열어|검색해|확인해|비교해|정리해|검토해|계산해|분석해|조회해)\\s*볼)";
-const WORK_PREDICATE = new RegExp(
-  `(?:${WORK}(?:고\\s*있(?:어요|습니다)|는\\s*중(?:이에요|입니다))|${WORK_DONE}(?:어요|습니다)|${WORK_NEXT}(?:게요|께요|겠습니다))$`,
-  "u",
-);
-/** Adverbs a work note may have ("이제", "다", "같이" …) — words, not subjects. */
-const WORK_ADVERBS = new Set(
-  "이제 지금 먼저 우선 다음으로 다시 다 모두 전부 같이 함께 한번 좀 마저 계속 차례로 더 꼼꼼히 자세히 하나씩 하나하나".split(
-    " ",
-  ),
-);
-/** The assistant as the subject: the only subject a work note may name. */
-const AGENT = /^(?:제가|저는)$/u;
-/** Determiners and numbers in front of the material ("두 파일을", "첫 기사를", "다음 시트를"). */
-const DETERMINERS = new Set(
-  "두 세 네 다섯 여섯 일곱 여덟 아홉 열 여러 몇 모든 각 첫 다음 나머지 남은 이 그 해당 새".split(" "),
-);
-const HANGUL_WORD = /^[가-힣A-Za-z0-9]+$/u;
-/**
- * Head nouns that name the material (review 4차): a phrase with bare noun modifiers ("학과별 입결 시트를") is the
- * material only when its head is one of these — "입학처 지원서를" is not (the bare "입학처" may be a subject).
- */
-const MATERIAL = new Set(
-  "엑셀 파일 시트 자료 표 문서 PDF pdf 페이지 쪽 기사 결과 데이터 내용 입결 원문 보고서 목록 첨부 첨부파일 시행계획 계획 출처 링크 문단 항목 셀 행 열 탭 슬라이드 본문 통계 수치".split(
-    " ",
-  ),
-);
-/** Counters of the material ("엑셀 두 개를", "세 장을"). */
-const COUNTERS = new Set("개 장 쪽 건 편 개의 부".split(" "));
-/** A bare modifier that ends with a particle is no modifier ("교육부조차", "입학처마저", "대학 측에선"). */
-const PARTICLE_END = /(?:조차|마저|까지|부터|에서|에선|께서|측|도|은|는|이|가|만|와|과|랑|로|에)$/u;
-
-/**
- * The material as one object phrase, ending in "을/를" (review 3·4차): determiners or numbers, "…의" modifiers, and
- * bare noun modifiers only when the head names the material (`MATERIAL`, or a counter after a material noun:
- * "엑셀 두 개를"). Returns the index after the phrase, or -1.
- */
-function objectPhrase(words: readonly string[], k: number): number {
-  let j = k;
-  const bare: string[] = [];
-  while (j < words.length && !/.[을를]$/u.test(words[j]!)) {
-    const w = words[j]!;
-    if (DETERMINERS.has(w) || /.의$/u.test(w)) j++;
-    else if (!WORK_ADVERBS.has(w) && !PARTICLE_END.test(w)) {
-      bare.push(w);
-      j++;
-    } else return -1;
-  }
-  if (j >= words.length) return -1;
-  const head = words[j]!.slice(0, -1);
-  if (bare.length) {
-    const material = MATERIAL.has(head) || (COUNTERS.has(head) && bare.some((w) => MATERIAL.has(w)));
-    if (!material) return -1;
-  }
-  return j + 1;
-}
-
-/**
- * A sentence that only says the assistant works on the material (review 3·4차 — positive only): the predicate is
- * one of `WORK_PREDICATE`, and every word before it is one of
- * - the assistant as the subject: "제가", "저는" (or no subject at all);
- * - a listed adverb (`WORK_ADVERBS`);
- * - the material, as an object phrase (`objectPhrase`): "두 파일을", "파일의 시트를", "학과별 입결 시트를",
- *   "엑셀 두 개를".
- * Any other word — "교육부조차", "입학처마저", "대학 측에선", "경쟁률이", "입학처 지원서를" — and it is checked.
- */
-function isWorkNote(sentence: string): boolean {
-  const m = WORK_PREDICATE.exec(sentence);
-  if (!m) return false;
-  const words = sentence.slice(0, m.index).split(/\s+/u).filter(Boolean);
-  if (!words.every((w) => HANGUL_WORD.test(w))) return false;
-  let k = 0;
-  if (k < words.length && AGENT.test(words[k]!)) k++;
-  while (k < words.length) {
-    if (WORK_ADVERBS.has(words[k]!)) {
-      k++;
-      continue;
-    }
-    const next = objectPhrase(words, k);
-    if (next === -1) return false;
-    k = next;
-  }
-  return true;
-}
-
 /** A clause joined to another ("…니", "…서", "…고", "…지만", "…는데", "since", "and" …). */
 const CONNECTIVE =
   /(?:니까?|서|고|지만|는데|은데|던데|으며|며|면서|므로|라|나|만)[,]?\s|[,;:]|\b(?:and|because|since|so|but|as)\b/iu;
@@ -190,36 +92,18 @@ const COMPLEMENT = /(?:음을|함을|임을|다는|라는|냐는|다고|라고)\
 const FOUND = /(?:것을|걸|점을|사실을|내용을)\s/u;
 
 /**
- * A short progress note before the first tool call: one sentence, no figure, no marker, saying what comes next.
- * Paragraphs that state something before a tool call are still checked.
- *
- * Between tool calls (#202 — the model narrating its work: "파일을 다 읽었어요. 이제 입결 시트를 확인하고 있어요."):
- * a short paragraph before a later tool call, no figure, up to three sentences, each one only saying that the
- * assistant (subject left out, or "제가/저는") will do, is doing or has done its work on the material (`isWorkNote`)
- * — never one that states something (another subject, a complement "…다는", "…것을", a comma). When in doubt it is
- * checked.
+ * A progress note (#202, user decision 2026-11-19 — by position, not by wording): the text right before a tool call
+ * — a unit that ends where a tool call comes, only blank space between — of at most 160 characters, with no digit
+ * and no `[n]`. Whatever it says ("파일을 읽어 볼게요.", "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고
+ * 있어요."), it is not flagged. Accepted residual risk: a short sentence with no figure that states a fact right
+ * before a tool call is not flagged either (`docs/decisions/sources.md` 7절). The same text anywhere else — the
+ * last paragraph, or followed by more text before the call — is checked.
  */
-export function isProgressNote(
-  text: string,
-  u: TextRange,
-  toolAt: number,
-  lastToolAt: number = toolAt,
-): boolean {
+export function isProgressNote(text: string, u: CitationUnit, toolsAt: readonly number[]): boolean {
+  if (u.table) return false;
   const t = text.slice(u.start, u.end).trim();
-  if (u.end <= toolAt) {
-    // One sentence — "수출이 늘었어요.더 찾아볼게요." is two, even without the space (review 1차).
-    if (t.length > 80 || /\d/.test(t) || unitSentences(t).length > 1) return false;
-    // "양산이 확정됐으니 자료를 더 찾아볼게요." states something before saying what comes next.
-    if (CONNECTIVE.test(t) || COMPLEMENT.test(t)) return false;
-    return PROGRESS.test(t);
-  }
-  if (u.end > lastToolAt || t.length > 160 || /\d/.test(t) || t.includes("\n")) return false;
-  const sentences = unitSentences(t).map((s) => s.replace(/[\s.!?。！？…~]+$/u, ""));
-  return (
-    sentences.length > 0 &&
-    sentences.length <= 3 &&
-    sentences.every((s) => !COMPLEMENT.test(s) && !FOUND.test(s) && !/[,;:]/u.test(s) && isWorkNote(s))
-  );
+  if (t.length > 160 || /\d/.test(t) || /\[\d{1,3}\]/.test(t)) return false;
+  return toolsAt.some((at) => at >= u.end && !text.slice(u.end, at).trim());
 }
 
 /** A closing offer or question (#202): "원하시면 학과별로 비교해 드릴게요.", "어느 전형이 더 궁금하세요?" */
@@ -260,9 +144,11 @@ export function missingUnits(
   markers: readonly CitationMarker[] = citationMarkers(text, units),
 ): TextRange[] {
   const at = toolCallsAt(parts);
-  const first = at[0] ?? Number.POSITIVE_INFINITY;
   const last = at.at(-1) ?? Number.NEGATIVE_INFINITY;
-  const uncited = uncitedUnits(text, units, markers).filter((u) => !isProgressNote(text, u, first, last));
+  const flagged = new Set(uncitedUnits(text, units, markers).map((r) => `${r.start}:${r.end}`));
+  const uncited = units.filter(
+    (u) => !u.inline && flagged.has(`${u.start}:${u.end}`) && !isProgressNote(text, u, at),
+  );
   // Only at the very end: an offer is how an answer ends — nothing else (cited or not) may come after it.
   let end = uncited.length;
   let tail = text.length;
@@ -272,7 +158,7 @@ export function missingUnits(
     tail = u.start;
     end--;
   }
-  return uncited.slice(0, end);
+  return uncited.slice(0, end).map(({ start, end }) => ({ start, end }));
 }
 
 const bound = (s: string | null | undefined, n: number) => (s ? boundText(s, n) : null);

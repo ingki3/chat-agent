@@ -1725,7 +1725,7 @@ describe("citationNote", () => {
     expect(note.missing.map((r) => t.slice(r.start, r.end))).toEqual(["나는 출처가 없어요."]);
   });
 
-  it("a short progress note before the first tool call is not flagged; facts before it and notes after it are", () => {
+  it("a progress note is the short, figure-free text right before a tool call (#202: by position)", () => {
     const call: MessagePart[] = [
       { type: "tool_call", id: "t", name: "web_fetch", input: {} },
       { type: "tool_result", callId: "t", output: {}, isError: false },
@@ -1734,27 +1734,23 @@ describe("citationNote", () => {
       const t = parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
       return citationNote(scope.runId, parts, f.cites)!.missing.map((r) => t.slice(r.start, r.end));
     };
-    expect(missingOf([...text("자료를 찾아 비교해 볼게요.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
-    expect(missingOf([...text("Let me search for that.\n\n"), ...call, ...text("가[1].")])).toEqual([]);
-    // A statement before the tool call, a note with a figure, two sentences, or a note after the call: checked.
-    expect(missingOf([...text("반도체 수출은 늘었어요.\n\n"), ...call, ...text("가[1].")])).toEqual([
+    // By position (#202, user decision 2026-11-19): the text right before a tool call, short, no figure — whatever
+    // it says (a fact too: the accepted residual risk).
+    for (const note of [
+      "자료를 찾아 비교해 볼게요.",
+      "Let me search for that.",
       "반도체 수출은 늘었어요.",
-    ]);
+      "수출이 늘었어요. 더 찾아볼게요.",
+    ])
+      expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toEqual([]);
+    // A figure, a marker-like `[n]`, over 160 characters, or not right before the call: checked.
     expect(missingOf([...text("2026년 자료를 찾아볼게요.\n\n"), ...call, ...text("가[1].")])).toHaveLength(1);
     expect(
-      missingOf([...text("수출이 늘었어요. 더 찾아볼게요.\n\n"), ...call, ...text("가[1].")]),
+      missingOf([...text(`${"자료를 찾아 볼게요. ".repeat(20)}\n\n`), ...call, ...text("가[1].")]),
     ).toHaveLength(1);
-    // Round 2: a fact joined to the note.
-    for (const note of [
-      "양산이 확정됐으니 자료를 더 찾아볼게요.",
-      "양산이 확정돼서 더 찾아볼게요.",
-      "Exports rose, so let me check.",
-      // Round 3: a complement clause that carries a fact.
-      "양산이 확정됐음을 알려드리겠습니다.",
-      "양산이 확정됐다는 소식을 확인해 볼게요.",
-      "양산이 확정이라는 기사를 찾아볼게요.",
-    ])
-      expect(missingOf([...text(`${note}\n\n`), ...call, ...text("가[1].")]), note).toHaveLength(1);
+    expect(
+      missingOf([...text("반도체 수출은 늘었어요.\n\n자료를 찾아 볼게요.\n\n"), ...call, ...text("가[1].")]),
+    ).toEqual(["반도체 수출은 늘었어요."]);
     expect(missingOf([...call, ...text("가[1].\n\n더 찾아볼게요.")])).toEqual(["더 찾아볼게요."]);
   });
 
@@ -1825,16 +1821,10 @@ describe("citationNote", () => {
     });
 
     it("conservative: anything stating something is still flagged", () => {
-      const between = (note: string) =>
-        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
-      for (const note of [
-        "파일을 읽어 보니 경쟁률이 올랐어요.",
-        "학종 경쟁률이 오른 것을 확인했어요.",
-        "시트 2개를 다 읽었어요.",
-        "경쟁률이 올랐어요. 이제 확인하고 있어요.",
-        "경영학과가 가장 높다는 내용을 확인했어요.",
-      ])
-        expect(between(note), note).toEqual([note]);
+      // Right before a tool call, a figure makes it a statement to check.
+      expect(
+        missingOf([...read("a"), ...text("시트 2개를 다 읽었어요.\n\n"), ...read("b"), ...text("가[1].")]),
+      ).toEqual(["시트 2개를 다 읽었어요."]);
       // The same note after the last tool call is the answer: checked.
       expect(missingOf([...read("a"), ...text("가[1].\n\n엑셀을 다 읽었어요.")])).toEqual([
         "엑셀을 다 읽었어요.",
@@ -1865,18 +1855,6 @@ describe("citationNote", () => {
     });
 
     it("review 1차: facts in progress-like, opinion-like and offer-like shapes stay flagged", () => {
-      const between = (note: string) =>
-        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
-      // The world's progress, not the assistant's work on the material.
-      for (const note of [
-        "학종 경쟁률이 계속 상승하고 있어요.",
-        "지원자가 늘고 있어요.",
-        "모집 인원은 줄어드는 중이에요.",
-        "시트가 업데이트되고 있어요.",
-      ])
-        expect(between(note), note).toEqual([note]);
-      expect(between("이제 시트를 하나씩 확인하고 있어요.")).toEqual([]);
-      expect(between("두 파일을 다 읽었어요. 제가 지금 비교하는 중이에요.")).toEqual([]);
       // A sentence without the framing, bold or glued to the one before; a lone mark.
       for (const p of [
         "제 판단으로는 학종이 유리해요. **올해 모집은 끝났습니다.**",
@@ -1896,10 +1874,6 @@ describe("citationNote", () => {
       expect(missingOf([...read("a"), ...text("가[1].\n\n올해 모집이 마감되었습니다.더 볼까요?")])).toEqual([
         "올해 모집이 마감되었습니다.더 볼까요?",
       ]);
-      // Before the first call: two sentences without a space are two.
-      expect(
-        missingOf([...text("수출이 늘었어요.더 찾아볼게요.\n\n"), ...read("a"), ...text("가[1].")]),
-      ).toEqual(["수출이 늘었어요.더 찾아볼게요."]);
     });
 
     it("review 1차: a GFM table is one unit (rows without an outer `|` too); a table before is not a sentence before", () => {
@@ -1917,24 +1891,7 @@ describe("citationNote", () => {
       ).toEqual([table]);
     });
 
-    it("review 2차: only the assistant's own work is a progress note; one sentence boundary everywhere", () => {
-      const between = (note: string) =>
-        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
-      for (const note of [
-        "교육부도 지원서를 검토하고 있어요.",
-        "대학 측에선 지원서를 검토하고 있어요.",
-        "교육부가 지원서를 검토하고 있어요.",
-        "입학처는 서류를 확인했어요.",
-        "자료를 읽고 경쟁률이 올랐어요.",
-      ])
-        expect(between(note), note).toEqual([note]);
-      for (const note of [
-        "제가 두 자료를 같이 비교하고 있어요.",
-        "저는 이제 시행계획을 확인해 볼게요.",
-        "자료를 다시 찾아 볼게요.",
-        "두 파일을 다 읽었어요. 이제 다음 시트를 확인하고 있어요.",
-      ])
-        expect(between(note), note).toEqual([]);
+    it("review 2차: one sentence boundary everywhere", () => {
       // A sentence glued after punctuation is a sentence, a digit or a letter next.
       for (const p of [
         "제 판단으로는 학종이 유리해요.2027년 모집은 끝났습니다.",
@@ -1995,31 +1952,19 @@ describe("citationNote", () => {
       expect(missingOf([...text("| a |\n|---|\n| 1[1] |"), ...read("r"), ...text("새 사실이에요.")])).toEqual(
         ["새 사실이에요."],
       );
-      // A paragraph a tool call cuts in the middle stays one unit (as before): its marker after the call covers it.
+      // A paragraph a tool call cuts mid-sentence stays one unit (as before): its marker after the call covers it.
       expect(missingOf([...text("앞 문장이고 "), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual([]);
+      // A part that ends a sentence before the call is its own paragraph (as the screen shows it): right before the
+      // call, short and figure-free, it is a progress note; with a figure it is checked.
       expect(missingOf([...text("앞 문장이에요.\n"), ...read("r"), ...text("뒤 문장이에요[1].")])).toEqual(
         [],
       );
+      expect(
+        missingOf([...text("모집은 30명이에요.\n"), ...read("r"), ...text("뒤 문장이에요[1].")]),
+      ).toEqual(["모집은 30명이에요."]);
     });
 
-    it("review 3차: positive-only progress grammar, full-width stop, footnotes", () => {
-      const between = (note: string) =>
-        missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
-      for (const note of [
-        "교육부조차 지원서를 다시 검토하고 있어요.",
-        "입학처마저 지원서를 검토하고 있어요.",
-        "올해도 자료를 확인하고 있어요.",
-        "입학처 지원서를 검토하고 있어요.",
-        "대학 측에선 자료를 검토하고 있어요.",
-        "교육부조차 자료를 확인하고 있어요.",
-      ])
-        expect(between(note), note).toEqual([note]);
-      for (const note of [
-        "두 파일을 다 읽었어요.",
-        "제가 첨부 파일의 시트를 확인하고 있어요.".replace("첨부 ", ""),
-        "이제 다음 시트를 하나씩 확인해 볼게요.",
-      ])
-        expect(between(note), note).toEqual([]);
+    it("review 3차: full-width stop, footnotes", () => {
       // `．` (U+FF0E) ends a sentence: an opinion with a fact after it, and the sentence right before a table.
       const p = "제 판단으로는 학종이 유리해요．2027년 모집은 끝났습니다.";
       expect(missingOf([...read("a"), ...text(`가[1].\n\n${p}`)])).toEqual([p]);
@@ -2040,15 +1985,37 @@ describe("citationNote", () => {
       ]);
     });
 
-    it("review 4차: the issue's own progress note passes; tables by the screen's order; inline math; footnotes", () => {
+    it("review 4차 / user decision: the issue's own progress note passes; tables by the screen's order; inline math; footnotes", () => {
       const between = (note: string) =>
         missingOf([...read("a"), ...text(`${note}\n\n`), ...read("b"), ...text("가[1].")]);
       for (const note of [
         "엑셀 두 개를 다 읽었어요. 이제 학과별 입결 시트를 확인하고 있어요.",
         "엑셀 두 개를 다 읽었어요.",
         "이제 학과별 입결 시트를 확인하고 있어요.",
+        // The accepted residual risk (user decision 2026-11-19): a short, figure-free fact right before a tool call.
+        "교육부 역시 지원서를 다시 검토하고 있어요.",
       ])
         expect(between(note), note).toEqual([]);
+      // The same sentence anywhere else is checked: the last paragraph, or followed by more text before the call.
+      const fact = "교육부 역시 지원서를 다시 검토하고 있어요.";
+      expect(missingOf([...read("a"), ...text(`가[1].\n\n${fact}`)])).toEqual([fact]);
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${fact}\n\n자료를 더 볼게요.\n\n`),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual([fact]);
+      // With a figure: checked even right before the call.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("교육부는 2027년 지원서를 검토하고 있어요.\n\n"),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["교육부는 2027년 지원서를 검토하고 있어요."]);
       const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
       // A tool row between the sentence and the table: the sentence is not the one right before it on the screen.
       expect(

@@ -401,6 +401,9 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
       first?.para &&
       prev.kind === "body" &&
       first.kind === "body" &&
+      // Cut mid-sentence only: a part that ends a sentence before the call ("…볼게요.") is a paragraph of its own,
+      // as the screen shows it (a progress note, #202).
+      !/[.!?。！？．…:：](?:[)\]"'”’*_~]|\[\d{1,3}\])*\s*$/u.test(text.slice(prev.start, prev.end)) &&
       !/\r?\n[ \t]*\r?\n/.test(text.slice(prev.end, first.start))
     ) {
       // Where it was cut: a table looks only at the fragment in its own part (review 5차).
