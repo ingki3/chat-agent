@@ -1,3 +1,5 @@
+import { types } from "node:util";
+
 /**
  * A deterministic measure of the work a synchronous call does (#213) — for linearity checks that a busy machine
  * cannot fail: a wall-clock ratio is the algorithm times whatever else the machine was doing, a count is only the
@@ -76,7 +78,9 @@ export function meterWork(fn: () => void): number {
   // Costs never run the caller's code again (review #217 3차): a length only of a string or a real array (no
   // getter), and a search's arguments looked at only when they are primitives — an object's `valueOf`/`toString`
   // ran once, in the native call; then the search is charged as a miss over the whole text.
-  const len = (x: unknown) => (typeof x === "string" || Array.isArray(x) ? x.length : 0);
+  // A real array, not a Proxy (whose reads run its traps): its length and descriptors read nothing else.
+  const real = (x: unknown): x is unknown[] => Array.isArray(x) && !types.isProxy(x);
+  const len = (x: unknown) => (typeof x === "string" || real(x) ? x.length : 0);
   // (An index loop: the array methods are the metered ones.)
   const plain = (args: unknown[], from = 0) => {
     for (let i = from; i < args.length; i++) {
@@ -94,12 +98,24 @@ export function meterWork(fn: () => void): number {
   const searched = (n: number, at: number, found: number, needle: number) =>
     found >= 0 ? found - at + needle : n - at;
   try {
-    wrap(RegExp.prototype, "exec", (re: RegExp, args, m: RegExpExecArray | null, before) => {
-      const text = typeof args[0] === "string" ? args[0] : "";
-      const start = re.global || re.sticky ? before : 0;
-      if (m) return re.sticky ? m[0].length : m.index - start + m[0].length;
-      return re.sticky ? 1 : Math.max(0, text.length - start);
-    });
+    // `exec` converts its argument here, once (as the engine would, review #217 4차: an object that becomes a long
+    // string is charged its length), then the native call searches that string.
+    replace(
+      RegExp.prototype,
+      "exec",
+      (orig) =>
+        function (this: unknown, arg: unknown) {
+          if (!types.isRegExp(this)) return Reflect.apply(orig, this, [arg]); // its TypeError, as natively
+          const re = this as RegExp;
+          const text = typeof arg === "string" ? arg : `${arg as string}`;
+          const before = typeof re.lastIndex === "number" ? re.lastIndex : 0;
+          const m = Reflect.apply(orig, re, [text]) as RegExpExecArray | null;
+          const start = re.global || re.sticky ? Math.max(0, Math.min(text.length, Math.trunc(before))) : 0;
+          if (m) work += 1 + (re.sticky ? m[0].length : m.index - start + m[0].length);
+          else work += 1 + (re.sticky ? 1 : Math.max(0, text.length - start));
+          return m;
+        },
+    );
     const S = String.prototype;
     for (const name of [
       "slice",
@@ -149,10 +165,28 @@ export function meterWork(fn: () => void): number {
     // `includes`: the native call gives the answer (and its errors); the cost never reads an element again (review
     // #217 2차/3차 — a getter would run twice). A hit in a real array is charged up to where it is, found from the
     // element descriptors (no getter runs; one with a getter, or not a real array: the whole length).
-    wrap(A, "includes", (self: unknown[], args, found: boolean) => {
+    // Anything else — an array-like, a Proxy (review #217 4차) — is searched here by the steps of the specification,
+    // each read once as natively (`length`, the position, then each element): charged a step an element looked at.
+    const includesRead = function (this: unknown, x: unknown, pos?: unknown): boolean {
+      if (this == null) throw new TypeError("Array.prototype.includes called on null or undefined");
+      const o = Object(this) as Record<number, unknown> & { length: unknown };
+      const l = +(o.length as number);
+      const n = Number.isNaN(l) || l <= 0 ? 0 : Math.min(Math.trunc(l), Number.MAX_SAFE_INTEGER);
+      work++;
+      if (n === 0) return false;
+      const p = +(pos as number);
+      const k0 = Number.isNaN(p) ? 0 : Math.trunc(p);
+      for (let k = k0 < 0 ? Math.max(0, n + k0) : k0; k < n; k++) {
+        work++;
+        const v = o[k];
+        if (v === x || (v !== v && x !== x)) return true;
+      }
+      return false;
+    };
+    const includesCost = (self: unknown[], args: unknown[], found: boolean) => {
       const n = len(self);
       const at = plain(args, 1) ? startOf(n, args[1], true) : 0;
-      if (!found || !Array.isArray(self)) return n - at;
+      if (!found) return n - at;
       const x = args[0];
       for (let i = at; i < n; i++) {
         const d = Object.getOwnPropertyDescriptor(self, i);
@@ -161,7 +195,18 @@ export function meterWork(fn: () => void): number {
         if (v === x || (v !== v && x !== x)) return i - at + 1;
       }
       return n - at;
-    });
+    };
+    replace(
+      A,
+      "includes",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          if (!real(this)) return Reflect.apply(includesRead, this, args) as boolean;
+          const found = Reflect.apply(orig, this, args) as boolean;
+          work += 1 + includesCost(this, args, found);
+          return found;
+        },
+    );
     // The whole array (an early exit is not credited).
     for (const name of [
       "splice",

@@ -84,6 +84,72 @@ describe("meterWork", () => {
     expect(reads).toBe(1);
   });
 
+  it("a Proxy array, an array-like and an object handed to exec: read once, as natively, and a miss charged in full", () => {
+    // Review #217 4차: a Proxy runs no trap the native call would not (no descriptor reads).
+    const traps: string[] = [];
+    const target = [1, 2, 3];
+    const proxy = new Proxy(target, {
+      get(t, k, r) {
+        traps.push(`get ${String(k)}`);
+        return Reflect.get(t, k, r) as unknown;
+      },
+      getOwnPropertyDescriptor(t, k) {
+        traps.push(`gopd ${String(k)}`);
+        return Reflect.getOwnPropertyDescriptor(t, k);
+      },
+    });
+    const natively = (() => {
+      traps.length = 0;
+      const r = proxy.includes(2);
+      return { r, traps: [...traps] };
+    })();
+    traps.length = 0;
+    let r = false;
+    meterWork(() => void (r = proxy.includes(2)));
+    expect({ r, traps }).toEqual(natively);
+    // An array-like: a miss is charged every element (64 → 4096: 64×, not 1).
+    const like = (n: number) => ({
+      length: n,
+      ...Object.fromEntries(Array.from({ length: n }, (_, i) => [i, 1])),
+    });
+    const miss = (n: number) => {
+      const o = like(n);
+      return meterWork(() => void Array.prototype.includes.call(o, 2));
+    };
+    expect(miss(64)).toBeGreaterThanOrEqual(64);
+    expect(miss(4096) / miss(64)).toBeGreaterThan(32);
+    // Its length read once, as natively.
+    let lengthReads = 0;
+    const counted = {
+      get length() {
+        lengthReads++;
+        return 3;
+      },
+      0: 1,
+      1: 2,
+      2: 3,
+    };
+    expect(meterWork(() => void Array.prototype.includes.call(counted, 3))).toBeGreaterThanOrEqual(3);
+    expect(lengthReads).toBe(1);
+    // exec on an object that becomes a long string: converted once, a miss charged its length.
+    const execMiss = (n: number) => {
+      let conversions = 0;
+      const o = {
+        toString() {
+          conversions++;
+          return "a".repeat(n);
+        },
+      };
+      const w = meterWork(() => void /b/.exec(o as unknown as string));
+      expect(conversions).toBe(1);
+      return w;
+    };
+    expect(execMiss(64)).toBeGreaterThanOrEqual(64);
+    expect(execMiss(4096) / execMiss(64)).toBeGreaterThan(32);
+    // Errors as natively: not a RegExp.
+    expect(() => meterWork(() => void RegExp.prototype.exec.call({} as RegExp, "x"))).toThrow(TypeError);
+  });
+
   it("iterating a string or an array is charged a step each — spreading, for…of, Array.from", () => {
     // Review #217 (P2): `[...s]` copies the whole text as surely as `Array.from(s)` does.
     expect(meterWork(() => void [...text])).toBeGreaterThanOrEqual(text.length);
