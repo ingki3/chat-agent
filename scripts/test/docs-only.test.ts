@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +6,13 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 // #219: the CI classifier that lets a documentation-only pull request skip the test and e2e shards.
-const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../ci/docs-only.sh");
+const CI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../ci");
+const SCRIPT = path.join(CI, "docs-only.sh");
+/** The `changes` job's script, run in `cwd`: its stdout (the verdict), stderr and exit status. */
+function changes(cwd: string, env: NodeJS.ProcessEnv = process.env) {
+  const r = spawnSync("bash", [path.join(CI, "changes.sh")], { cwd, env });
+  return { status: r.status, verdict: r.stdout.toString().trim(), stderr: r.stderr.toString() };
+}
 const classify = (input: Buffer | string) => execFileSync("bash", [SCRIPT], { input }).toString().trim();
 /** NUL-separated, as `git diff -z` writes it. */
 const docsOnly = (paths: string[]) => classify(paths.map((p) => p + "\0").join(""));
@@ -32,13 +38,10 @@ function inRepo(
     change(git, repo);
     git("add", "-A");
     git("commit", "-qm", "change");
-    // The same command as the `changes` job in .github/workflows/ci.yml.
-    const diff = execFileSync(
-      "git",
-      ["-c", "core.quotepath=false", "diff", "--name-only", "--no-renames", "-z", "HEAD^1", "HEAD"],
-      { cwd: repo },
-    );
-    return { git, verdict: classify(diff) };
+    // What the `changes` job in .github/workflows/ci.yml runs.
+    const r = changes(repo);
+    expect(r.status).toBe(0);
+    return { git, verdict: r.verdict };
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
@@ -88,5 +91,20 @@ describe("docs-only classifier (#219)", () => {
       fs.writeFileSync(path.join(repo, "docs/a.md\nevil.ts"), "x\n");
     });
     expect(verdict).toBe("false");
+  });
+
+  it("a git diff that fails after printing a documentation path fails the job: no verdict at all", () => {
+    const shim = fs.mkdtempSync(path.join(os.tmpdir(), "docs-only-git-"));
+    try {
+      fs.writeFileSync(path.join(shim, "git"), "#!/usr/bin/env bash\nprintf 'docs/a.md\\0'\nexit 128\n", {
+        mode: 0o755,
+      });
+      const r = changes(shim, { ...process.env, PATH: `${shim}${path.delimiter}${process.env.PATH ?? ""}` });
+      expect(r.status).not.toBe(0);
+      expect(r.verdict).toBe("");
+      expect(r.stderr).toContain("git diff failed");
+    } finally {
+      fs.rmSync(shim, { recursive: true, force: true });
+    }
   });
 });
