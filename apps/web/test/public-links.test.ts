@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkNotices, daysOf } from "../src/public-links/PublicLinkDialog.js";
+import { checkNotices, daysOf, mergePages } from "../src/public-links/PublicLinkDialog.js";
 
 /** The "공개 링크 만들기" dialog's rules (#204): whole days 1–365 only, and what the pre-publish check says. */
 describe("public link dialog", () => {
@@ -22,5 +22,17 @@ describe("public link dialog", () => {
     expect(n.map((x) => x.level)).toEqual(["block", "warn", "info"]);
     expect(n[1]!.text).toContain("이메일 주소 2개, 전화번호 1개");
     expect(n[2]!.text).toContain("cdn.jsdelivr.net");
+  });
+});
+
+describe("public link lists", () => {
+  it("merging pages: each link once, where it first appeared, in the state of the latest page that has it", () => {
+    const l = (id: string, status: string) => ({ id, status });
+    const merged = mergePages([
+      { active: [l("old", "active"), l("b", "active")], history: [l("h1", "expired")] },
+      // Turned off in another tab before this page was read: the later state wins.
+      { active: [], history: [l("old", "disabled"), l("h2", "disabled")] },
+    ]);
+    expect(merged).toEqual([l("old", "disabled"), l("b", "active"), l("h1", "expired"), l("h2", "disabled")]);
   });
 });

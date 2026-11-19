@@ -12,7 +12,10 @@ export type Page<T> = { items: T[]; next: PageCursor | null };
 export const encodeCursor = (c: PageCursor | null) => (c ? `${c.createdAt}:${c.id}` : null);
 export function decodeCursor(v: unknown): PageCursor | undefined | "invalid" {
   if (v === undefined) return undefined;
-  const m = typeof v === "string" ? /^(\d{1,15}):([0-9a-f-]{36})$/.exec(v) : null;
+  const m =
+    typeof v === "string"
+      ? /^(\d{1,15}):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(v)
+      : null;
   return m ? { createdAt: Number(m[1]), id: m[2]! } : "invalid";
 }
 

@@ -270,6 +270,16 @@ export function PublicLinkButton({
   );
 }
 
+/**
+ * The pages of a list as one: each link once, in the place it first appeared, with the state of the **latest** page
+ * that has it (review #209 — a link turned off elsewhere between two pages shows as off, never with a stale "끄기").
+ */
+export function mergePages<T extends { id: string }>(pages: readonly { active: T[]; history: T[] }[]): T[] {
+  const byId = new Map<string, T>();
+  for (const p of pages) for (const l of [...p.active, ...p.history]) byId.set(l.id, l);
+  return [...byId.values()];
+}
+
 /** My links (of one artifact, or all): every open one on the first page, then the history page by page. */
 function useLinkPages(artifactId?: string) {
   return useInfiniteQuery({
@@ -296,7 +306,7 @@ function LinkList({
   empty?: string;
 }) {
   const pages = list.data?.pages ?? [];
-  const links = pages.flatMap((p) => [...p.active, ...p.history]);
+  const links = mergePages(pages);
   return (
     <>
       {list.isError && <p className="notice warn">{errorText(list.error)}</p>}

@@ -1,5 +1,6 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { errorText, publicLinks } from "../api.js";
+import { mergePages } from "../public-links/PublicLinkDialog.js";
 
 const KEY = ["admin", "public-links"] as const;
 const time = (ms: number) => new Date(ms).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
@@ -25,7 +26,7 @@ export function PublicLinksAdmin() {
   const first = q.data?.pages[0];
   const d = first && {
     ...first,
-    items: (q.data?.pages ?? []).flatMap((p) => [...p.active, ...p.history]),
+    items: mergePages(q.data?.pages ?? []),
   };
   return (
     <section className="admin" aria-label="공개 링크" data-testid="admin-public-links">

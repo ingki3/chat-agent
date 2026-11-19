@@ -2309,7 +2309,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
    H=https://chat.2prostream.com
    read -rs -p '토큰(링크 끝 43자): ' T; echo
    # 판정: access-login = Cloudflare Access 로그인으로 302(원본까지 오지 않음) · origin-denied = 원본 서버의 403 access_denied
-   # (Bypass가 넓게 잡혔다는 뜻 — 막히긴 했지만 Bypass 경로를 바로잡는다) · open = 200 · 그 밖은 상태 코드 그대로.
+   # (Bypass가 그 경로를 넘겼다는 뜻) · open = 200 · 그 밖은 상태 코드 그대로.
    probe() {  # probe <이름> <경로>
      local body code loc
      body=$(mktemp); code=$(curl -s -o "$body" -D "$body.hdr" -w '%{http_code}' "$H$2")
@@ -2320,18 +2320,23 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
      else v="status-$code"; fi
      printf '%-22s %s\n' "$1" "$v"; rm -f "$body" "$body.hdr"
    }
-   # 막혀야 하는 것 — 기대: 모두 access-login. /api/* 는 access-login 또는 403(Access가 API에 403을 줄 수 있음).
-   for p in / /artifacts /artifacts/ /artifact /a/x /api/health /api/public-links /api/artifacts; do probe "blocked:$p" "$p"; done
-   probe "blocked:token-suffix" "/artifact/$T/x"
+   # (1) Bypass 밖의 경로 — Cloudflare Access가 막아야 한다. 기대: 모두 access-login
+   #     (/api/* 는 Access가 302 대신 403을 줄 수 있다 — status-403도 통과, origin-denied는 Bypass가 넓다는 뜻).
+   for p in / /artifacts /artifacts/ /artifact /a/x /api/health /api/public-links /api/artifacts; do probe "outside:$p" "$p"; done
+   # (2) Bypass 안이지만 공개 라우트가 아닌 경로 — Cloudflare가 넘기고 원본 서버가 막는다. 기대: origin-denied
+   probe "inside:token-suffix" "/artifact/$T/x"; probe "inside:bad-token" "/artifact/short"
    # 열려야 하는 것 — 기대: open
    probe "open:page" "/artifact/$T"; probe "open:raw" "/artifact/$T/raw"; probe "open:download" "/artifact/$T/download"
-   # 헤더 — 기대: x-robots-tag·referrer-policy·cache-control 세 줄, set-cookie 없음(값만, 주소 없음)
-   curl -s -D - -o /dev/null "$H/artifact/$T" | grep -iE '^(x-robots-tag|referrer-policy|cache-control|set-cookie):' | tr -d '\r'
+   # 헤더 — 기대: x-robots-tag·referrer-policy·cache-control 세 줄과 "set-cookie: none". 쿠키는 있는지만 찍는다(값은 절대 출력하지 않음).
+   hdr=$(curl -s -D - -o /dev/null "$H/artifact/$T" | tr -d '\r')
+   printf '%s\n' "$hdr" | grep -iE '^(x-robots-tag|referrer-policy|cache-control):'
+   if printf '%s\n' "$hdr" | grep -qi '^set-cookie:'; then echo "set-cookie: PRESENT"; else echo "set-cookie: none"; fi
+   unset hdr
    # 없는 토큰 — 기대: status-404 (서버의 "링크를 열 수 없어요", Access 화면이 아님)
    probe "dead:unknown-token" "/artifact/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    unset T
    ```
-   기대값 한 줄 요약: `blocked:*`는 모두 `access-login`(`/api/*`는 403도 허용, 하지만 `origin-denied`가 하나라도 나오면 Bypass 경로가 넓은 것 — `artifact/` 끝의 `/`를 다시 확인), `open:*`는 `open`, 헤더에 `set-cookie` 없음(Cloudflare가 `CF_Authorization` 쿠키를 붙이면 Bypass가 아니라 다른 애플리케이션이 잡은 것), `dead:*`는 `status-404`. 결과(이름과 판정만)를 4절 확인 기록에 날짜와 함께 남긴다 — 토큰은 적지 않는다.
+   기대값 요약: `outside:*`는 모두 `access-login`(`/api/*`는 `status-403`도 허용) — 여기서 `origin-denied`나 `open`이 하나라도 나오면 Bypass 경로가 넓은 것이니 `artifact/` 끝의 `/`를 다시 확인한다. `inside:*`는 `origin-denied`가 정상이다(Bypass 안의 경로는 원본까지 오고, 공개 라우트가 아니면 서버가 거절). `open:*`는 `open`, `set-cookie: none`(`PRESENT`면 Bypass가 아니라 다른 애플리케이션이 잡은 것 — Cloudflare의 `CF_Authorization` 등), `dead:*`는 `status-404`. 결과(이름과 판정만)를 4절 확인 기록에 날짜와 함께 남긴다 — 토큰은 적지 않는다.
 4. 시험 링크는 확인 뒤 끈다(49.2).
 
 ### 49.2 쓰기 (가족)

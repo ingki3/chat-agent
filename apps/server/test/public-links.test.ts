@@ -737,5 +737,59 @@ describe("review #209", () => {
       (await s.app.inject({ method: "GET", url: "/api/public-links?cursor=bad", headers: s.local(s.mom) }))
         .statusCode,
     ).toBe(400);
+    // Only a cursor the server could have issued: a number and a UUID (review #209: 36 hyphens were let through).
+    for (const bad of [`1:${"-".repeat(36)}`, "1:not-a-uuid", `x:${crypto.randomUUID()}`])
+      for (const [url, who] of [
+        ["/api/public-links", s.mom],
+        ["/api/admin/public-links", s.admin],
+      ] as const)
+        expect(
+          (
+            await s.app.inject({
+              method: "GET",
+              url: `${url}?cursor=${encodeURIComponent(bad)}`,
+              headers: s.local(who),
+            })
+          ).statusCode,
+          `${url} ${bad}`,
+        ).toBe(400);
+    expect(
+      (
+        await s.app.inject({
+          method: "GET",
+          url: `/api/public-links?cursor=${encodeURIComponent(`1:${crypto.randomUUID()}`)}`,
+          headers: s.local(s.mom),
+        })
+      ).statusCode,
+    ).toBe(200);
+  });
+});
+
+describe("review #209 round 2", () => {
+  it("IDN emails in their ASCII form (xn-- top-level domain) are counted", () => {
+    const c = (content: string) => checkVersion({ version: 1, title: "t", content }).emails;
+    expect(c("reader@xn--vv4b11d.xn--3e0b707e")).toBe(1);
+    expect(c("a@b.xn--p1ai, c@d.com")).toBe(2);
+    expect(c("a@b.c")).toBe(0);
+    expect(c("a@b.c0m")).toBe(0);
+  });
+
+  it("external hosts after any whitespace around `=` — scripts found exactly as prepareHtml finds them", async () => {
+    const { prepareHtml } = await import("../src/artifacts/serve.js");
+    const html = `<script src=\n${" ".repeat(20)}"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<img\n  src\n  =\n  'https://images.example.org/a.png'><link href =  "//fonts.example.com/x.css">`;
+    expect(checkVersion({ version: 1, title: "t", content: html }).externalHosts).toEqual([
+      "cdn.jsdelivr.net",
+      "fonts.example.com",
+      "images.example.org",
+    ]);
+    // prepareHtml sees the same script (it adds the SRI): the two agree.
+    expect(prepareHtml(html).body).toContain('integrity="sha384-');
+    // Long runs stay linear.
+    const t = performance.now();
+    checkVersion({ version: 1, title: "t", content: `src${" ".repeat(512 * 1024)}` });
+    checkVersion({ version: 1, title: "t", content: `src=${" ".repeat(512 * 1024)}x` });
+    checkVersion({ version: 1, title: "t", content: "src ".repeat(128 * 1024) });
+    expect(performance.now() - t).toBeLessThan(1500);
   });
 });
