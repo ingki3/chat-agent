@@ -199,7 +199,8 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     };
     const del: [number, number][] = [];
     const held = new Set<number>();
-    const gone = new Map<(typeof map)[number], number>();
+    /** The parts of each shown piece a removed sentence took. */
+    const gone = new Map<(typeof map)[number], [number, number][]>();
     let any = false;
     for (const r of lineSentences(shown, markerAt)) {
       const own = pieces(r.start, r.end);
@@ -217,23 +218,40 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       removed++;
       for (const p of own) {
         del.push([p.start, p.end]);
-        gone.set(p.m, (gone.get(p.m) ?? 0) + (p.end - p.start));
+        gone.set(p.m, [...(gone.get(p.m) ?? []), [p.start, p.end]]);
       }
     }
     if (!any) return undefined;
-    // An inline node whose words all went: its whole source goes (delimiters, a link's address).
+    // An inline node (link, emphasis, image …) with nothing but spaces left to show goes whole: no `****`, no `[](…)`.
+    const left = (m: (typeof map)[number]) => {
+      let t = "";
+      for (let k = m.ss; k < m.se; k++)
+        if (!(gone.get(m) ?? []).some(([a, b]) => k >= a && k < b)) t += src[k];
+      return t;
+    };
     const tops = new Map<number, (typeof map)[number][]>();
     for (const m of map) tops.set(m.leaf.top, [...(tops.get(m.leaf.top) ?? []), m]);
     for (const ms of tops.values()) {
       const l = ms[0]!.leaf;
-      if (l.topType !== "text" && ms.every((m) => (gone.get(m) ?? 0) >= m.se - m.ss))
+      if (l.topType !== "text" && ms.some((m) => gone.has(m)) && ms.every((m) => !left(m).trim()))
         del.push([from + l.topStart, from + l.topEnd]);
     }
     del.sort((x, y) => x[0] - y[0]);
+    // Written as it is — code spans, spaces and all — except where something was removed: there, the spaces the
+    // removal left are tidied (one space at most, none before punctuation or a closing mark, none after an opening one).
     let out = "";
     let at = from;
+    let cut = false;
+    const CLOSE = /^(\*\*|__|~~|[*_\]).,!?。])/u;
+    const OPEN = /(?:^|[\s([])(\*\*|__|~~|[*_[])$/u;
     const write = (end: number) => {
-      for (let k = at; k < end;) {
+      let k = at;
+      if (cut) {
+        cut = false;
+        if (/[ \t]$/.test(out) || !out || OPEN.test(out)) while (k < end && /[ \t]/.test(src[k]!)) k++;
+        if (CLOSE.test(src.slice(k, end))) out = out.replace(/[ \t]+$/, "");
+      }
+      for (; k < end;) {
         const m = held.has(k) ? markers.find((x) => x.start === k) : undefined;
         if (m) {
           out += `\u0000${m.n}\u0000`;
@@ -243,18 +261,14 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     };
     for (const [a, b] of del) {
       if (a > at) write(a);
-      at = Math.max(at, b);
+      if (b > at) {
+        at = Math.max(at, b);
+        cut = true;
+      }
     }
     if (at < to) write(to);
-    // What a removed sentence leaves next to a delimiter: `**A. **` → `**A.**`, `** B**` → `**B**`, `[A ](…)` → `[A](…)`.
-    const text = out
-      .replace(/[ \t]+(\*\*|__|~~|[*_])(?=[\s.,!?。]|$)/gu, "$1")
-      .replace(/(^|[\s([])(\*\*|__|~~|[*_])[ \t]+/gu, "$1$2")
-      .replace(/\[[ \t]+/g, "[")
-      .replace(/[ \t]+\]/g, "]")
-      .replace(/[ \t]+([.!?。,])/gu, "$1")
-      .replace(/[ \t]{2,}/g, " ")
-      .trim();
+    if (cut) out = out.replace(/[ \t]+$/, "");
+    const text = out.trim();
     return text || undefined;
   };
   const blocks: Block[] = [];

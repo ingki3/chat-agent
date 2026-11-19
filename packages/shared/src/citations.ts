@@ -468,9 +468,9 @@ export type CitationMarker = TextRange & { n: number };
 
 /**
  * One line of inline markdown (a report's sentence line or heading words, #211) as the parser reads it: its shown
- * pieces in order — each text node (and each inline code or math span, whole) with its source range, and the top-level
- * inline node it belongs to (a text of its own, or a link, emphasis, strong, strikethrough …). A link's address and an
- * image are never shown pieces. Undefined when the line is not one paragraph (it reads as a list, a quote …).
+ * pieces in order — each text node (and each inline code or math span, whole; an image's description) with its source
+ * range, and the top-level inline node it belongs to (a text of its own, or a link, emphasis, strong, strikethrough,
+ * image …). A link's address is never a shown piece. Undefined when the line is not one paragraph (it reads as a list, a quote …).
  */
 export type InlineLeaf = {
   start: number;
@@ -490,7 +490,21 @@ export function inlineLeaves(text: string): InlineLeaf[] | undefined {
     const te = endOf(top);
     if (ts === undefined || te === undefined) return undefined;
     const walk = (n: Nodes) => {
-      if (n.type === "image" || n.type === "imageReference") return;
+      // An image shows its description (`🖼 alt` on the report page): the alt text, where it is written.
+      if (n.type === "image" || n.type === "imageReference") {
+        const s0 = startOf(n);
+        const at = s0 === undefined ? -1 : text.indexOf(n.alt ?? "", s0 + 2);
+        if (s0 !== undefined && n.alt && at === s0 + 2)
+          out.push({
+            start: at,
+            end: at + n.alt.length,
+            top: i,
+            topType: top.type,
+            topStart: ts,
+            topEnd: te,
+          });
+        return;
+      }
       if (n.type === "text" || n.type === "inlineCode" || n.type === "inlineMath") {
         const s0 = startOf(n);
         const e0 = endOf(n);

@@ -242,6 +242,27 @@ describe("cleanReport", () => {
     });
   });
 
+  it("review 8: image descriptions are checked, code spans are never touched, emptied wrappers go", () => {
+    const cites = new Map([cite(1)]);
+    // An image shows its description: an uncited one goes with the image.
+    expect(
+      cleanReport("올해 수출은 늘었다[1]. ![수입은 두 배 증가했다.](https://example.org/trend.png)", cites),
+    ).toMatchObject({ removed: 1, body: "올해 수출은 늘었다[1]." });
+    // Nothing removed: the line as written, code span and all.
+    expect(cleanReport("파일 존재 여부는 `[ -f report.md ]`로 검사한다[1].", cites)).toMatchObject({
+      removed: 0,
+      body: "파일 존재 여부는 `[ -f report.md ]`로 검사한다[1].",
+    });
+    // A wrapper whose sentences all went (a space between them left) goes whole.
+    expect(cleanReport("수출이 늘었다[1]. **수입은 줄었다. 매출도 줄었다.**", cites)).toMatchObject({
+      removed: 2,
+      body: "수출이 늘었다[1].",
+    });
+    expect(
+      cleanReport("수출이 늘었다[1]. [수입은 줄었다. 매출도 줄었다.](https://example.org/a)", cites),
+    ).toMatchObject({ removed: 2, body: "수출이 늘었다[1]." });
+  });
+
   it("finds the summary also under a cited 요약 heading", () => {
     expect(summaryOf("## 요약[1]\n\n늘었다[1].\n\n## 다음\n\n본문[2].")).toBe("늘었다.");
   });
