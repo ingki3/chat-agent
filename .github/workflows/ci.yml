@@ -35,9 +35,9 @@ jobs:
           fi
           # The checked-out commit is the PR merged into its base: its first parent is that base.
           # --no-renames: a rename lists its old path too (moving docs/traceability.md must run the tests).
-          files=$(git diff --name-only --no-renames HEAD^1 HEAD)
-          echo "changed files:"; echo "$files"
-          docs_only=$(printf '%s\n' "$files" | bash scripts/ci/docs-only.sh)
+          # core.quotepath=false and -z: Korean paths and any other bytes come through as they are, NUL-separated.
+          echo "changed files:"; git -c core.quotepath=false diff --name-only --no-renames HEAD^1 HEAD
+          docs_only=$(git -c core.quotepath=false diff --name-only --no-renames -z HEAD^1 HEAD | bash scripts/ci/docs-only.sh)
           [ "$docs_only" = true ] && echo "documentation only: the test and e2e shards are skipped"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
