@@ -2336,7 +2336,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
    probe "dead:unknown-token" "/artifact/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    unset T
    ```
-   기대값 요약: `outside:*`는 모두 `access-login`(`/api/*`는 `status-403`도 허용) — 여기서 `origin-denied`나 `open`이 하나라도 나오면 Bypass 경로가 넓은 것이니 `artifact/` 끝의 `/`를 다시 확인한다. `inside:*`는 `origin-denied`가 정상이다(Bypass 안의 경로는 원본까지 오고, 공개 라우트가 아니면 서버가 거절). `open:*`는 `open`, `set-cookie: none`(`PRESENT`면 Bypass가 아니라 다른 애플리케이션이 잡은 것 — Cloudflare의 `CF_Authorization` 등), `dead:*`는 `status-404`. 결과(이름과 판정만)를 4절 확인 기록에 날짜와 함께 남긴다 — 토큰은 적지 않는다.
+   기대값 요약: `outside:*`는 모두 `access-login`(`/api/*`는 `status-403`도 허용) — 여기서 `origin-denied`나 `open`이 하나라도 나오면 Bypass 경로가 넓은 것이니 `artifact/` 끝의 `/`를 다시 확인한다. `inside:*`는 `origin-denied`가 정상이다(Bypass 안의 경로는 원본까지 오고, 공개 라우트가 아니면 서버가 거절). `open:*`는 `open`, `set-cookie: none`(`PRESENT`는 **예상 밖의 쿠키가 붙었다**는 뜻일 뿐이다 — 원인은 따로 조사한다. 서버는 공개 링크 응답에 쿠키를 붙이지 않으므로 Cloudflare 쪽(다른 Access 애플리케이션이 그 경로를 잡았는지, 다른 Cloudflare 기능의 쿠키인지)을 대시보드에서 확인한다. 값은 기록하지 않는다), `dead:*`는 `status-404`. 결과(이름과 판정만)를 4절 확인 기록에 날짜와 함께 남긴다 — 토큰은 적지 않는다.
 4. 시험 링크는 확인 뒤 끈다(49.2).
 
 ### 49.2 쓰기 (가족)

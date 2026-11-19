@@ -793,3 +793,45 @@ describe("review #209 round 2", () => {
     expect(performance.now() - t).toBeLessThan(1500);
   });
 });
+
+describe("review #209 round 3", () => {
+  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+
+  it("the xn-- prefix of an IDN top-level domain in any case", () => {
+    const c = (content: string) => checkVersion({ version: 1, title: "t", content }).emails;
+    expect(c("reader@xn--vv4b11d.XN--3E0B707E")).toBe(1);
+    expect(c("reader@Xn--vv4b11d.Xn--3e0b707e")).toBe(1);
+    expect(c("READER@EXAMPLE.COM")).toBe(1);
+  });
+
+  it("attribute values trimmed as the URL parser does: a vertical tab or form feed in front still loads", () => {
+    const cdn = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
+    for (const lead of ["\u000b", "\u000c", "\t\n ", "\r"])
+      expect(hosts(`<script src="${lead}${cdn}${lead}"></script>`), JSON.stringify(lead)).toEqual([
+        "cdn.jsdelivr.net",
+      ]);
+    expect(hosts(`<img src="  https://images.example.org/a.png\u000b">`)).toEqual(["images.example.org"]);
+    expect(hosts(`<img src="https://ima\nges.example.org/a.png">`)).toEqual(["images.example.org"]);
+  });
+
+  it("a value is resolved, not searched: relative URLs (even ones holding a URL) are the page's own", () => {
+    expect(hosts('<script src="=https://images.example.org/file.js"></script>')).toEqual([]);
+    expect(hosts('<img src="a.png?u=https://evil.example/x">')).toEqual([]);
+    expect(hosts('<img src="/x.png"><a href="#top"></a><img src="data:image/png;base64,AAAA">')).toEqual([]);
+    expect(hosts('<img src="javascript:alert(1)"><a href="mailto:a@b.co">')).toEqual([]);
+    expect(hosts('<img srcset="https://a.example/1.png 1x, //b.example/2.png 2x">')).toEqual([
+      "a.example",
+      "b.example",
+    ]);
+    expect(
+      hosts(
+        "<style>@import url( 'https://fonts.example.com/x.css' ); b{background:url(//img.example/b.png)}</style>",
+      ),
+    ).toEqual(["fonts.example.com", "img.example"]);
+    // Values inside values are never rescanned (one pass), and the scan stays linear.
+    const t = performance.now();
+    hosts(`src="${"src=".repeat(128 * 1024)}"`);
+    hosts(`url(${"url(".repeat(128 * 1024)}`);
+    expect(performance.now() - t).toBeLessThan(1500);
+  });
+});
