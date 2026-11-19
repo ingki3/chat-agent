@@ -8,6 +8,12 @@ const BACKUP_DIR = path.join(os.tmpdir(), `agentlee-e2e-backups-${PORT}`);
 
 /** Tests that load the server for seconds: run in projects of their own, after the others (see `projects`). */
 const HEAVY = /@heavy/;
+/**
+ * CI (#219) runs the heavy projects in a job of their own, on a server of their own: they then need only the setup.
+ * Locally, and in one run, they wait for desktop and mobile instead. (A shard keeps a dependency's tests whole, so
+ * with desktop and mobile as dependencies every shard would run all of them.)
+ */
+const HEAVY_DEPS = process.env.E2E_HEAVY_ALONE === "1" ? ["setup"] : ["desktop", "mobile"];
 
 // Runs against the production build (pnpm build first). One port for UI + API, as in production.
 export default defineConfig({
@@ -28,13 +34,13 @@ export default defineConfig({
     {
       name: "desktop-heavy",
       use: { ...devices["Desktop Chrome"] },
-      dependencies: ["desktop", "mobile"],
+      dependencies: HEAVY_DEPS,
       grep: HEAVY,
     },
     {
       name: "mobile-heavy",
       use: { ...devices["Pixel 7"] },
-      dependencies: ["desktop", "mobile"],
+      dependencies: HEAVY_DEPS,
       grep: HEAVY,
     },
   ],
