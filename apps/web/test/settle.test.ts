@@ -536,3 +536,59 @@ describe("the settle loop: backoff, one try at a time, a poke checks at once (#1
     expect(tries).toBe(1);
   });
 });
+
+describe("an older page fetched during the read after an end (#103 review)", () => {
+  it("cuts that read short: not taken as read (the newest page was not read) — rejected, tried again", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    type Page = { items: { id: string; role: string; status: string }[]; nextBefore: number | null };
+    let newest: (p: Page) => void = () => {};
+    let refetching = false;
+    const observer = new InfiniteQueryObserver<Page, Error, InfiniteData<Page>, string[], number | undefined>(
+      qc,
+      {
+        queryKey: ["messages", "c1"],
+        queryFn: ({ pageParam }) => {
+          if (pageParam === undefined && refetching) return new Promise<Page>((r) => (newest = r)); // the read after the end: held
+          return Promise.resolve(
+            pageParam === undefined
+              ? { items: [{ id: "m-r1", role: "assistant", status: "streaming" }], nextBefore: 1 }
+              : { items: [{ id: "m-old", role: "assistant", status: "complete" }], nextBefore: null },
+          );
+        },
+        initialPageParam: undefined,
+        getNextPageParam: (last) => last.nextBefore ?? undefined,
+      },
+    );
+    const unsubscribe = observer.subscribe(() => {});
+    await flush();
+    refetching = true;
+    const p = readMessagesAfterEnd(qc, "c1", "m-r1");
+    await flush();
+    // The older page arrives (it cancels the refetch; the data is updated by it) …
+    await observer.fetchNextPage();
+    newest({ items: [{ id: "m-r1", role: "assistant", status: "complete" }], nextBefore: 1 });
+    // … but the newest page after the end was never read: no answer from it is taken.
+    await expect(p).rejects.toThrow(/superseded|not_read/);
+    const pagesNow = qc.getQueryData<InfiniteData<Page>>(["messages", "c1"])!.pages;
+    expect(pagesNow[0]!.items[0]!.status).toBe("streaming");
+    // The next try reads it.
+    refetching = false;
+    await readMessagesAfterEnd(qc, "c1", "m-r1");
+    unsubscribe();
+  });
+});
+
+describe("the settle loop once settled (#103 review)", () => {
+  it("is finished before its callback: a poke from it (or a late stop answer) starts nothing", async () => {
+    let tries = 0;
+    let loop: { poke: () => void; stop: () => void } | undefined = undefined;
+    loop = startSettleLoop(
+      async () => (tries++, "final" as const),
+      () => loop?.poke(),
+    );
+    await flush();
+    loop.poke();
+    await flush();
+    expect(tries).toBe(1);
+  });
+});

@@ -132,6 +132,10 @@ export function readMessagesAfterEnd(
     }
     if (query.state.dataUpdateCount <= before || query.state.status !== "success")
       throw new Error("messages_not_read");
+    // The data must be this read's — the newest page read after the end. An older page fetched meanwhile (it cancels
+    // this refetch, and its answer counts as an update too) brings no newer reply: not read; tried again.
+    if ((query.state.fetchMeta as { fetchMore?: unknown } | null)?.fetchMore)
+      throw new Error("messages_read_superseded");
   })().finally(() => {
     if (reads.get(k) === p) reads.delete(k);
   });
@@ -258,7 +262,11 @@ export function startSettleLoop(
     }
     running = false;
     if (stopped) return;
-    if (r !== "unfinished") return settled(r);
+    if (r !== "unfinished") {
+      // Finished before anyone hears of it: a poke from here on (a late stop answer) starts nothing.
+      stopped = true;
+      return settled(r);
+    }
     if (again) {
       again = false;
       return void attempt();
