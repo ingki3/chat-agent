@@ -357,6 +357,24 @@ export function ChatPage() {
   const target = hash.startsWith("#m-") ? hash.slice(3) : null;
   const found = !!target && !!list?.some((m) => m.id === target);
   const { hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } = messages;
+  /** Whether the messages are being read right now (the query's own state, not the last render's). */
+  const messagesLoading = useCallback(
+    () => qc.isFetching({ queryKey: ["messages", id], exact: true }) > 0,
+    [qc, id],
+  );
+  // "이전 메시지 보기" while the list is being read (a read after a reply's end, a background refetch): an older page
+  // now would cut that read short — the click is kept and done once the read is over (this conversation's only).
+  const olderAsked = useRef<string | null>(null);
+  const loadOlder = () => {
+    if (messagesLoading()) olderAsked.current = id;
+    else void fetchNextPage();
+  };
+  // (After every render: the read's end re-renders, whenever it came.)
+  useEffect(() => {
+    if (olderAsked.current !== id || isFetching || messagesLoading()) return;
+    olderAsked.current = null;
+    void fetchNextPage();
+  });
   const scrolledTo = useRef<string | null>(null);
   const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
   const [searchStopped, setSearchStopped] = useState<string | null>(null);
@@ -371,13 +389,23 @@ export function ChatPage() {
   const linkKey = `${linkKeyOf(id, hash)}@${linkGen.n}`;
   if (found && foundLink !== linkKey) setFoundLink(linkKey);
   const foundOnce = foundLink === linkKey;
+  /** "다시 시도" asked for this link: its next page is fetched once the list is not being read (counted then). */
+  const searchRetry = useRef<string | null>(null);
   useEffect(() => {
     if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };
     if (!target || !list || scrolledTo.current === linkKey) return;
     if (!found) {
       if (foundOnce) return;
-      // Not while the list is being read (a read after a reply's end): an older page would cut it short; resumed after.
-      if (isFetching || searchStopped === linkKey) return;
+      // Not while the list is being read (a read after a reply's end): an older page would cut it short; resumed after
+      // (this effect runs again when the read ends). Checked on the query itself, as it is now.
+      if (isFetching || messagesLoading()) return;
+      if (searchRetry.current === linkKey) {
+        searchRetry.current = null;
+        search.current.pages = 1;
+        void fetchNextPage();
+        return;
+      }
+      if (searchStopped === linkKey) return;
       // Not there at all (deleted, another version), a failed page, or the cap: stop and say so.
       if (!hasNextPage || isFetchNextPageError || search.current.pages >= SEARCH_PAGES)
         return setSearchStopped(linkKey);
@@ -400,12 +428,13 @@ export function ChatPage() {
     linkKey,
     searchStopped,
     foundOnce,
+    messagesLoading,
   ]);
   const retrySearch = () => {
-    search.current = { key: linkKey, pages: 1 };
+    // The page is asked for (and counted) by the search effect, once the list is not being read.
+    search.current = { key: linkKey, pages: 0 };
+    searchRetry.current = linkKey;
     setSearchStopped(null);
-    // Not while the list is being read (a read after a reply's end): asked again with the button once it is not.
-    if (!isFetching) void fetchNextPage();
   };
   // A schedule's result (#56, FR-8.3): when the conversation says there is one that is not shown yet, the view is read
   // again; "새 결과" goes only once that very message has loaded without error (and, for a link, was found).
@@ -469,11 +498,8 @@ export function ChatPage() {
                 <button
                   type="button"
                   className="ghost small older"
-                  // Not while the list is being read (a read after a reply's end would be cut short).
-                  disabled={messages.isFetching}
-                  onClick={() => {
-                    if (!messages.isFetching) void messages.fetchNextPage();
-                  }}
+                  disabled={messages.isFetchingNextPage}
+                  onClick={loadOlder}
                 >
                   {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
                 </button>
