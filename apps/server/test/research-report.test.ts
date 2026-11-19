@@ -101,7 +101,7 @@ describe("cleanReport", () => {
         "",
         "근거 없는 결론이다.검증된 사실이다[1].",
         "",
-        "## 수출이 50% 늘었다",
+        "## 수출이 50% 늘었다.",
         "",
         "링크 속 표시는 인용이 아니다 [1](https://example.test). 코드 속 `a[1]`도 아니다.",
         "3.5% 늘었다[2]. example.com 도 있다[2].",
@@ -111,9 +111,11 @@ describe("cleanReport", () => {
     // 근거 없는 결론, 사실을 단정한 제목, 링크 속 [1]만 있는 문장, 코드 속 [1]만 있는 문장.
     expect(r.removed).toBe(4);
     expect(r.body).toBe("## 요약\n\n검증된 사실이다[1].\n\n3.5% 늘었다[2]. example.com 도 있다[2].");
+    // A heading sentence is a fact only when it ends like a sentence (review 5: no guessing from word endings).
     expect(isTopicLabel("수출 증가의 배경")).toBe(true);
-    expect(isTopicLabel("수출이 늘었다")).toBe(false);
-    expect(isTopicLabel("2026년 10월")).toBe(false);
+    expect(isTopicLabel("2026년 10월")).toBe(true);
+    expect(isTopicLabel("수출이 늘었다.")).toBe(false);
+    expect(isTopicLabel("“수출이 줄었다.”")).toBe(false);
   });
 
   it("keeps a marker written after a space on the sentence it ends (review 2)", () => {
@@ -187,6 +189,20 @@ describe("cleanReport", () => {
       body: "**증가 원인**\n\n본문이다[1].",
     });
     expect(cleanReport("## 증가 원인 ##\n\n본문이다[1].", cites).body).toBe("## 증가 원인\n\n본문이다[1].");
+  });
+
+  it("review 5: labels ending in nouns stay, a bold label with its colon keeps its form", () => {
+    const cites = new Map([cite(1)]);
+    for (const h of ["## 전력 시장(공급과 수요)", "## 수출 동향(개요)"])
+      expect(cleanReport(`${h}\n\n본문이다[1].`, cites)).toMatchObject({
+        removed: 0,
+        body: `${h}\n\n본문이다[1].`,
+      });
+    expect(cleanReport("**증가 원인**:\n\n본문이다[1].", cites)).toMatchObject({
+      removed: 0,
+      body: "**증가 원인**:\n\n본문이다[1].",
+    });
+    expect(cleanReport("####### 일곱 개\n\n본문이다[1].", cites).body).not.toMatch(/#{7}/);
   });
 
   it("finds the summary also under a cited 요약 heading", () => {

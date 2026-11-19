@@ -47,30 +47,35 @@ const LINE_PREFIX =
   /^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?(?:(?:\*\*|__)[^*_\n]{1,20}?[:：](?:\*\*|__)[ \t]*)?/u;
 
 /**
- * A heading that only names a topic ("증가율", "수출 증가의 배경"): short, no number, no sentence ending. Anything else
- * ("수출이 50% 늘었다") states a fact and needs a verified marker like a sentence.
+ * A heading's sentence that only names something (a label: "증가 원인", "전력 시장(공급과 수요)", "2026년 통계"): it does
+ * not end with sentence punctuation — looked for through closing quotes and brackets (`“수출이 줄었다.”` ends one).
+ * Only a heading sentence that ends like a sentence states a fact and needs a verified marker. No guessing from word
+ * endings (`수요`, `개요` are nouns).
  */
 export function isTopicLabel(t: string): boolean {
-  // Through closing quotes and brackets (`“수출이 줄었다.”`, `(수출이 줄었다.)`): what ends inside them ends a sentence.
   const s = t
     .replace(/\[\d{1,3}\]/g, "")
     .replace(/\*\*|__|[*_`]/g, "")
     .trim()
-    .replace(/[\s)\]}"'”’」』〉》]+$/u, "")
-    .replace(/^[\s([{"'“‘「『〈《]+/u, "");
-  return (
-    s.length > 0 &&
-    Array.from(s).length <= 40 &&
-    !/\p{Nd}/u.test(s) &&
-    !/[.!?。！？]$/u.test(s) &&
-    !/(?:다|요|죠|니다|음|함|됨|임)$/u.test(s)
-  );
+    .replace(/[\s)\]}"'”’」』〉》]+$/u, "");
+  return s.length > 0 && !/[.!?。！？．]$/u.test(s);
 }
 
 type Block = { text: string; level: number; item: boolean };
 
-/** Where a heading unit's words are (offsets in `raw`), its level, and whether it is a bold-only paragraph. */
-function headingContent(raw: string): { start: number; end: number; level: number; bold: boolean } {
+/**
+ * Where a heading unit's words are (offsets in `raw`) and how it is written: ATX (`## …`, closing `#`s dropped), setext
+ * (a `===` / `---` line under it), a paragraph of bold text only (`**…**`, also with the colon after it — `**증가
+ * 원인**:` — as the shared parser takes it), or anything else the parser calls a heading (kept as it is written).
+ */
+type HeadingForm = {
+  start: number;
+  end: number;
+  level: number;
+  form: "atx" | "bold" | "plain";
+  colon: string;
+};
+function headingContent(raw: string): HeadingForm {
   const atx = /^[ \t]*(#{1,6})(?:[ \t]+|$)/.exec(raw);
   if (atx) {
     const close = /[ \t]+#+[ \t]*$|[ \t]*$/.exec(raw)!;
@@ -78,17 +83,19 @@ function headingContent(raw: string): { start: number; end: number; level: numbe
       start: atx[0].length,
       end: Math.max(atx[0].length, close.index),
       level: atx[1]!.length,
-      bold: false,
+      form: "atx",
+      colon: "",
     };
   }
   const setext = /\n[ \t]*(=+|-+)[ \t]*$/.exec(raw);
-  if (setext) return { start: 0, end: setext.index, level: setext[1]![0] === "=" ? 1 : 2, bold: false };
-  const bold = /^[ \t]*(\*\*|__)([\s\S]*?)\1[ \t]*$/.exec(raw);
+  if (setext)
+    return { start: 0, end: setext.index, level: setext[1]![0] === "=" ? 1 : 2, form: "atx", colon: "" };
+  const bold = /^[ \t]*(\*\*|__)([\s\S]*?)\1[ \t]*([:：]?)[ \t]*$/.exec(raw);
   if (bold) {
     const start = raw.indexOf(bold[1]!) + 2;
-    return { start, end: start + bold[2]!.length, level: 7, bold: true };
+    return { start, end: start + bold[2]!.length, level: 7, form: "bold", colon: bold[3]! };
   }
-  return { start: 0, end: raw.length, level: 7, bold: false };
+  return { start: 0, end: raw.length, level: 7, form: "plain", colon: "" };
 }
 
 /**
@@ -214,9 +221,16 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       const kept = keptSentences(u.start + h.start, u.start + h.end, true);
       if (!kept.length) continue;
       const shown = kept.join(" ");
-      // The report's own title is the server's: a level-1 heading of the writer's becomes a section.
-      const level = h.bold ? 7 : Math.max(2, h.level);
-      blocks.push({ text: h.bold ? `**${shown}**` : `${"#".repeat(level)} ${shown}`, level, item: false });
+      // The report's own title is the server's: a level-1 heading of the writer's becomes a section. A bold label keeps
+      // its form (and its colon); never more than `######`.
+      const level = h.form === "atx" ? Math.min(6, Math.max(2, h.level)) : 7;
+      const text =
+        h.form === "atx"
+          ? `${"#".repeat(level)} ${shown}`
+          : h.form === "bold"
+            ? `**${shown}**${h.colon}`
+            : shown;
+      blocks.push({ text, level, item: false });
       continue;
     }
     // Body, lead-ins, disclaimers, list items, quotes: sentence by sentence, line by line — from the start of the unit's
