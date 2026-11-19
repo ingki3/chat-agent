@@ -1,0 +1,266 @@
+{
+  "cdn + image + email/phone": {
+    "c536cf1": ["cdn.jsdelivr.net", "images.example.org"],
+    "2b025c9": ["cdn.jsdelivr.net", "images.example.org"],
+    "7e03a2f": ["cdn.jsdelivr.net", "images.example.org"],
+    "22f926c": ["cdn.jsdelivr.net", "images.example.org"],
+    "dbc308e": ["cdn.jsdelivr.net", "images.example.org"],
+    "7db8e29": ["cdn.jsdelivr.net", "images.example.org"],
+    "43208e1": ["cdn.jsdelivr.net", "images.example.org"]
+  },
+  "src= then newline and 20 spaces": {
+    "c536cf1": ["cdn.jsdelivr.net"],
+    "2b025c9": [],
+    "7e03a2f": ["cdn.jsdelivr.net"],
+    "22f926c": ["cdn.jsdelivr.net"],
+    "dbc308e": ["cdn.jsdelivr.net"],
+    "7db8e29": ["cdn.jsdelivr.net"],
+    "43208e1": ["cdn.jsdelivr.net"]
+  },
+  "spaced attributes over lines": {
+    "c536cf1": ["fonts.example.com", "images.example.org"],
+    "2b025c9": ["fonts.example.com", "images.example.org"],
+    "7e03a2f": ["fonts.example.com", "images.example.org"],
+    "22f926c": ["fonts.example.com", "images.example.org"],
+    "dbc308e": ["fonts.example.com", "images.example.org"],
+    "7db8e29": ["fonts.example.com", "images.example.org"],
+    "43208e1": ["fonts.example.com", "images.example.org"]
+  },
+  "vertical tab before the CDN": {
+    "c536cf1": ["cdn.jsdelivr.net"],
+    "2b025c9": ["cdn.jsdelivr.net"],
+    "7e03a2f": [],
+    "22f926c": ["cdn.jsdelivr.net"],
+    "dbc308e": ["cdn.jsdelivr.net"],
+    "7db8e29": ["cdn.jsdelivr.net"],
+    "43208e1": ["cdn.jsdelivr.net"]
+  },
+  "=https:// relative value": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": ["images.example.org"],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["images.example.org"],
+    "43208e1": ["images.example.org"]
+  },
+  "2048 spaces before the CDN": {
+    "c536cf1": ["cdn.jsdelivr.net"],
+    "2b025c9": [],
+    "7e03a2f": ["cdn.jsdelivr.net"],
+    "22f926c": [],
+    "dbc308e": ["cdn.jsdelivr.net"],
+    "7db8e29": ["cdn.jsdelivr.net"],
+    "43208e1": ["cdn.jsdelivr.net"]
+  },
+  "<code>url(</code> then a link": {
+    "c536cf1": ["docs.example.org"],
+    "2b025c9": ["docs.example.org"],
+    "7e03a2f": ["docs.example.org"],
+    "22f926c": [],
+    "dbc308e": ["docs.example.org"],
+    "7db8e29": ["docs.example.org"],
+    "43208e1": ["docs.example.org"]
+  },
+  "srcset with a comma in its URL": {
+    "c536cf1": ["img.example"],
+    "2b025c9": ["img.example"],
+    "7e03a2f": ["img.example"],
+    "22f926c": ["img.example", "thumb.example.org"],
+    "dbc308e": ["img.example"],
+    "7db8e29": ["img.example", "thumb.example.org"],
+    "43208e1": ["img.example", "thumb.example.org"]
+  },
+  "<code>style=\"</code> then an image": {
+    "c536cf1": ["img.example"],
+    "2b025c9": ["img.example"],
+    "7e03a2f": ["img.example"],
+    "22f926c": ["img.example"],
+    "dbc308e": [],
+    "7db8e29": ["img.example"],
+    "43208e1": ["img.example"]
+  },
+  "SVG fill url()": {
+    "c536cf1": ["paint.example"],
+    "2b025c9": ["paint.example"],
+    "7e03a2f": ["paint.example"],
+    "22f926c": ["paint.example"],
+    "dbc308e": [],
+    "7db8e29": ["paint.example"],
+    "43208e1": ["paint.example"]
+  },
+  "<style> with a 1000-character attribute": {
+    "c536cf1": ["long-style.example"],
+    "2b025c9": ["long-style.example"],
+    "7e03a2f": ["long-style.example"],
+    "22f926c": ["long-style.example"],
+    "dbc308e": [],
+    "7db8e29": ["long-style.example"],
+    "43208e1": ["long-style.example"]
+  },
+  "url() after 64 KiB of style": {
+    "c536cf1": ["big-style.example"],
+    "2b025c9": ["big-style.example"],
+    "7e03a2f": ["big-style.example"],
+    "22f926c": ["big-style.example"],
+    "dbc308e": [],
+    "7db8e29": ["big-style.example"],
+    "43208e1": ["big-style.example"]
+  },
+  "srcset bad((": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": ["img.example"],
+    "dbc308e": [],
+    "7db8e29": ["img.example"],
+    "43208e1": ["img.example"]
+  },
+  "Unicode host": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": ["xn--zb0b81k2qm.example.org"],
+    "dbc308e": ["xn--zb0b81k2qm.example.org"],
+    "7db8e29": [],
+    "43208e1": ["xn--zb0b81k2qm.example.org"]
+  },
+  "userinfo": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": [],
+    "43208e1": ["docs.example.org"]
+  },
+  "extra slash": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": [],
+    "43208e1": ["docs.example.org"]
+  },
+  "newline inside a host": {
+    "c536cf1": ["docs.exa"],
+    "2b025c9": ["docs.exa"],
+    "7e03a2f": ["docs.exa"],
+    "22f926c": ["docs.example.org"],
+    "dbc308e": ["docs.example.org"],
+    "7db8e29": ["docs.exa"],
+    "43208e1": ["docs.example.org"]
+  },
+  "port": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["docs.example.org"],
+    "43208e1": ["docs.example.org"]
+  },
+  "unquoted src, alt on the next line": {
+    "c536cf1": ["cdn.example.org"],
+    "2b025c9": ["cdn.example.org"],
+    "7e03a2f": ["cdn.example.org"],
+    "22f926c": ["cdn.example.org"],
+    "dbc308e": ["cdn.example.org"],
+    "7db8e29": ["cdn.example.org"],
+    "43208e1": []
+  },
+  "! after a bare host": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["docs.example.org"],
+    "43208e1": []
+  },
+  "&#47; for the path slash": {
+    "c536cf1": ["docs.example.org"],
+    "2b025c9": ["docs.example.org"],
+    "7e03a2f": ["docs.example.org"],
+    "22f926c": ["docs.example.org&"],
+    "dbc308e": ["docs.example.org&"],
+    "7db8e29": ["docs.example.org"],
+    "43208e1": []
+  },
+  "comma in userinfo": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": [],
+    "43208e1": []
+  },
+  "ordinary HTML": {
+    "c536cf1": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "fonts.googleapis.com",
+      "img1.example",
+      "www.example.com"
+    ],
+    "2b025c9": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "fonts.googleapis.com",
+      "img1.example",
+      "www.example.com"
+    ],
+    "7e03a2f": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "fonts.googleapis.com",
+      "img1.example",
+      "www.example.com"
+    ],
+    "22f926c": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "fonts.googleapis.com",
+      "img1.example",
+      "img2.example",
+      "www.example.com"
+    ],
+    "dbc308e": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "fonts.googleapis.com",
+      "img1.example",
+      "img2.example",
+      "www.example.com"
+    ],
+    "7db8e29": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "docs.example.org",
+      "fonts.googleapis.com",
+      "img1.example",
+      "img2.example",
+      "www.example.com"
+    ],
+    "43208e1": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "docs.example.org",
+      "fonts.googleapis.com",
+      "img1.example",
+      "img2.example",
+      "www.example.com"
+    ]
+  },
+  "ordinary markdown": {
+    "c536cf1": ["m.example"],
+    "2b025c9": ["m.example"],
+    "7e03a2f": ["m.example"],
+    "22f926c": ["m.example"],
+    "dbc308e": ["m.example"],
+    "7db8e29": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"],
+    "43208e1": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"]
+  }
+}

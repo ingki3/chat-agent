@@ -16,6 +16,8 @@ import { checkVersion } from "../src/public-links/check.js";
 import { tokenHash } from "../src/public-links/store.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { fastifyRoutes } from "./helpers/permission-matrix.js";
+import { HOSTS_CORPUS } from "./fixtures/public-links/hosts-corpus.js";
+import HOSTS_PRIOR from "./fixtures/public-links/hosts-prior.json" with { type: "json" };
 
 /**
  * Public artifact links (#204): `/artifact/<token>` opens one artifact version to anyone with the link — outside
@@ -876,7 +878,8 @@ describe("review #209 rounds 3–5: external addresses are those the version men
     expect(hosts("https://a:b@c@evil-is-not.example@docs.example.org/x")).toEqual(["docs.example.org"]);
     // Extra slashes, a tab or newline inside, a port.
     expect(hosts("https:///docs.example.org/x")).toEqual(["docs.example.org"]);
-    expect(hosts('<img src="https://docs.exa\nmple.org/p.png">')).toEqual(["docs.example.org"]);
+    // Split by a newline: the joined reading is among the candidates (the cut-off one may be too — over-inclusive).
+    expect(hosts('<img src="https://docs.exa\nmple.org/p.png">')).toContain("docs.example.org");
     expect(hosts("https://docs.example.org:8443/x and //plain.example:80")).toEqual([
       "docs.example.org",
       "plain.example",
@@ -909,5 +912,37 @@ describe("review #209 rounds 3–5: external addresses are those the version men
       checkVersion({ version: 1, title: "t", content });
       expect(performance.now() - t, name).toBeLessThan(1500);
     }
+  });
+});
+
+describe("review #209 round 7: the union of readings never reports less than before", () => {
+  it("differential: on every review reproduction and ordinary documents, ⊇ every earlier implementation and the target", () => {
+    const prior = HOSTS_PRIOR as Record<string, Record<string, string[]>>;
+    const failures: string[] = [];
+    for (const c of HOSTS_CORPUS) {
+      const got = new Set(
+        checkVersion({ version: 1, title: c.title ?? "t", content: c.content }).externalHosts,
+      );
+      const before = prior[c.name];
+      if (!before) failures.push(`${c.name}: no prior results (regenerate hosts-prior.json)`);
+      for (const [sha, hosts] of Object.entries(before ?? {}))
+        // Not host names at all (an earlier URL-based reading kept `docs.example.org&` from `&#47;`): not owed.
+        for (const h of hosts.filter((x) => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(x)))
+          if (!got.has(h)) failures.push(`${c.name}: ${h} (reported by ${sha}) missing`);
+      for (const h of c.target) if (!got.has(h)) failures.push(`${c.name}: target ${h} missing`);
+    }
+    expect(failures).toEqual([]);
+    // Every earlier implementation is in the record.
+    expect(Object.keys(Object.values(prior)[0]!).sort()).toEqual(
+      ["c536cf1", "2b025c9", "7e03a2f", "22f926c", "dbc308e", "7db8e29", "43208e1"].sort(),
+    );
+  });
+
+  it("the round-7 inputs, one by one", () => {
+    const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+    expect(hosts("<img src=https://cdn.example.org\nalt=logo>")).toContain("cdn.example.org");
+    expect(hosts("참고 https://docs.example.org!")).toEqual(["docs.example.org"]);
+    expect(hosts('<a href="https://docs.example.org&#47;help">')).toEqual(["docs.example.org"]);
+    expect(hosts("https://last,first@docs.example.org/help")).toContain("docs.example.org");
   });
 });
