@@ -360,17 +360,19 @@ describe("tokens", () => {
     const { app, mom, artifact, link, local, visit } = await start();
     const created = await link(mom, artifact(mom).id);
     expect(created.path).toMatch(TOKEN_PATH);
+    // The address to share: built by the server from PUBLIC_HOST over https — made here on localhost all the same.
+    expect(created.url).toBe(`https://${HOST}${created.path}`);
     const token = created.path.split("/").pop()!;
     expect(Buffer.from(token, "base64url")).toHaveLength(32);
     const row = app.publicLinks!.get(created.link.id)!;
     expect(row.tokenHash).toBe(tokenHash(token));
     expect(row.tokenHash).toMatch(/^[0-9a-f]{64}$/);
     // Nowhere in the table.
-    const dump = JSON.stringify(app.publicLinks!.listAll());
+    const dump = JSON.stringify([app.publicLinks!.activeAll(), app.publicLinks!.historyAll({ limit: 100 })]);
     expect(dump).not.toContain(token);
     const mine = await app.inject({ method: "GET", url: "/api/public-links", headers: local(mom) });
     expect(mine.body).not.toContain(token);
-    expect(mine.json<{ items: unknown[] }>().items).toHaveLength(1);
+    expect(mine.json<{ active: unknown[] }>().active).toHaveLength(1);
     // Guesses: random tokens, one character changed, the hash itself.
     const flipped = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
     for (const t of [crypto.randomBytes(32).toString("base64url"), flipped, row.tokenHash.slice(0, 43)])
@@ -443,7 +445,7 @@ describe("a link dies at once", () => {
     expect(r.statusCode).toBeLessThan(300);
     expect((await s.visit(p)).statusCode).toBe(404);
     // The row went with the artifact (foreign key).
-    expect(s.app.publicLinks!.listAll()).toHaveLength(0);
+    expect(s.app.publicLinks!.counts()).toEqual({ active: 0, expired: 0, disabled: 0 });
   });
 
   it("its owner deactivated — and the links stay off", async () => {
@@ -520,7 +522,7 @@ describe("who makes one, and what is checked first", () => {
       const r = await s.create(s.mom, a.id);
       expect(r.statusCode).toBe(422);
       expect(r.json()).toEqual({ error: "public_link_secret" });
-      expect(s.app.publicLinks!.listAll()).toHaveLength(0);
+      expect(s.app.publicLinks!.counts()).toEqual({ active: 0, expired: 0, disabled: 0 });
     } finally {
       knownSecrets.remove(secret);
     }
@@ -590,9 +592,9 @@ describe("who makes one, and what is checked first", () => {
       headers: s.local(s.admin),
     });
     expect(r.statusCode).toBe(200);
-    const body = r.json<{ counts: unknown; items: Record<string, unknown>[] }>();
+    const body = r.json<{ counts: unknown; active: Record<string, unknown>[] }>();
     expect(body.counts).toEqual({ active: 1, expired: 0, disabled: 0 });
-    expect(Object.keys(body.items[0]!).sort()).toEqual(
+    expect(Object.keys(body.active[0]!).sort()).toEqual(
       ["createdAt", "disabledAt", "expiresAt", "id", "ownerName", "status", "viewCount"].sort(),
     );
     expect(r.body).not.toContain("비밀 계획");
@@ -649,5 +651,91 @@ describe("views and rate limits", () => {
         404,
       );
     expect((await s.visit(p)).statusCode).toBe(429);
+  });
+});
+
+describe("review #209", () => {
+  it("names, emails and phone numbers in the title alone are warned about too", async () => {
+    const s = await start();
+    const created = await s.link(
+      s.mom,
+      s.artifact(s.mom, { title: "엄마 mom@example.com 010-1234-5678", content: "<p>내용</p>" }).id,
+    );
+    expect(created.check).toMatchObject({ emails: 1, phones: 1 });
+    expect(checkVersion({ version: 1, title: "x@y.io", content: "a@b.co" }).emails).toBe(2);
+  });
+
+  it("the checks stay linear on the largest version (512 KiB), adversarial input too", () => {
+    const N = 512 * 1024;
+    const inputs = {
+      letters: "a".repeat(N),
+      ats: "a@".repeat(N / 2),
+      dottedDomain: `a@${"b.".repeat(N / 2 - 2)}`,
+      localThenAt: `${"a.".repeat(N / 2 - 1)}@`,
+      images: "![".repeat(N / 2),
+      srcSpaces: `src${" ".repeat(N - 3)}`,
+      urls: "url(".repeat(N / 4),
+      digits: "0-".repeat(N / 2),
+      html: `<div class="x"><a href="https://example.com/p">링크 mom@example.com</a><img src="data:x"></div>\n`.repeat(
+        Math.floor(N / 90),
+      ),
+      code: `const x = { a: 1, email: "a@b.co", phone: "010-1234-5678" }; // ${"y".repeat(40)}\n`.repeat(
+        Math.floor(N / 100),
+      ),
+    };
+    for (const [name, content] of Object.entries(inputs)) {
+      const t = performance.now();
+      checkVersion({ version: 1, title: "t", content });
+      const ms = performance.now() - t;
+      // A linear pass over 512 KiB takes a few ms; a quadratic one takes minutes. Generous for a loaded CI machine.
+      expect(ms, name).toBeLessThan(1500);
+    }
+    expect(checkVersion({ version: 1, title: "t", content: inputs.ats }).emails).toBe(0);
+  });
+
+  it("downloads: the global limit counts a bad format too; the render limit is checked before the document is made", async () => {
+    const s = await start({}, { publicLinks: { limits: { global: 3, renderPerLink: 1 } } });
+    const { path: p } = await s.link(s.mom, s.artifact(s.mom).id);
+    expect((await s.visit(`${p}/download?format=docx`)).statusCode).toBe(404);
+    expect((await s.visit(`${p}/download?format=png`)).statusCode).toBe(200);
+    const exportSpy = vi.spyOn(await import("../src/artifacts/export.js"), "exportDocument");
+    expect((await s.visit(`${p}/download?format=pdf`)).statusCode).toBe(429);
+    expect(exportSpy).not.toHaveBeenCalled();
+    exportSpy.mockRestore();
+    // Three requests counted, the bad format among them: the next one is over the global window.
+    expect((await s.visit(p)).statusCode).toBe(429);
+  });
+
+  it("every open link is listed however much history there is; the history is paged", async () => {
+    const s = await start();
+    const a = s.artifact(s.mom);
+    const open = await s.link(s.mom, a.id);
+    // 120 later links, all turned off: the old open link must still be in the list (and in the admin's).
+    for (let i = 0; i < 120; i++) {
+      const l = await s.link(s.mom, a.id);
+      s.app.publicLinks!.disable(l.link.id);
+    }
+    type Page = { active: { id: string }[]; history: { id: string }[]; nextCursor: string | null };
+    const get = async (url: string, who = s.mom) =>
+      (await s.app.inject({ method: "GET", url, headers: s.local(who) })).json<Page>();
+    const first = await get("/api/public-links");
+    expect(first.active.map((l) => l.id)).toEqual([open.link.id]);
+    expect(first.history).toHaveLength(50);
+    const seen = new Set(first.history.map((l) => l.id));
+    let cursor = first.nextCursor;
+    while (cursor) {
+      const next = await get(`/api/public-links?cursor=${encodeURIComponent(cursor)}`);
+      expect(next.active).toEqual([]);
+      for (const l of next.history) seen.add(l.id);
+      cursor = next.nextCursor;
+    }
+    expect(seen.size).toBe(120);
+    const admin = await get("/api/admin/public-links", s.admin);
+    expect(admin.active.map((l) => l.id)).toEqual([open.link.id]);
+    expect(admin.nextCursor).not.toBeNull();
+    expect(
+      (await s.app.inject({ method: "GET", url: "/api/public-links?cursor=bad", headers: s.local(s.mom) }))
+        .statusCode,
+    ).toBe(400);
   });
 });

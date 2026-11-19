@@ -63,13 +63,26 @@ export const PublicLink = z.object({
 });
 export type PublicLink = z.infer<typeof PublicLink>;
 
-export const PublicLinksResponse = z.object({ items: z.array(PublicLink) });
+/**
+ * `GET /api/public-links[?artifactId=&cursor=]`: every open link (complete — never cut off, so each can be turned
+ * off), and the expired or turned-off ones a page at a time (`nextCursor`, null on the last page).
+ */
+export const PublicLinksResponse = z.object({
+  active: z.array(PublicLink),
+  history: z.array(PublicLink),
+  nextCursor: z.string().nullable(),
+});
 export type PublicLinksResponse = z.infer<typeof PublicLinksResponse>;
 
-/** The creation answer: the link, its path with the token (shown once), and what the check found. */
+/**
+ * The creation answer: the link, its path and full address with the token (shown once) — the address is built by the
+ * server from `PUBLIC_HOST` (https), so a link made at home on localhost is still the one outsiders can open — and
+ * what the check found.
+ */
 export const CreatePublicLinkResponse = z.object({
   link: PublicLink,
   path: z.string(),
+  url: z.string(),
   check: PublicLinkCheck,
 });
 export type CreatePublicLinkResponse = z.infer<typeof CreatePublicLinkResponse>;
@@ -96,10 +109,13 @@ export const AdminPublicLink = z.object({
   status: PublicLinkStatus,
 });
 export type AdminPublicLink = z.infer<typeof AdminPublicLink>;
+/** `GET /api/admin/public-links[?cursor=]`: counts, every open link, and the history a page at a time. */
 export const AdminPublicLinksResponse = z.object({
   enabled: z.boolean(),
   counts: z.object({ active: z.number(), expired: z.number(), disabled: z.number() }),
-  items: z.array(AdminPublicLink),
+  active: z.array(AdminPublicLink),
+  history: z.array(AdminPublicLink),
+  nextCursor: z.string().nullable(),
 });
 export type AdminPublicLinksResponse = z.infer<typeof AdminPublicLinksResponse>;
 

@@ -61,8 +61,12 @@ test("owner makes a link in the dialog; a logged-out visitor opens it; its scrip
   await expect(dialog.getByTestId("public-link-warning")).toContainText("누구나 로그인 없이");
   await expect(dialog.getByTestId("public-link-days")).toHaveValue("7");
   await dialog.getByTestId("public-link-create").click();
-  const url = await dialog.getByTestId("public-link-url").inputValue();
-  expect(new URL(url).pathname).toMatch(/^\/artifact\/[A-Za-z0-9_-]{43}$/);
+  const shown = new URL(await dialog.getByTestId("public-link-url").inputValue());
+  // The address to share is the public host over https (PUBLIC_HOST), even though it was made on 127.0.0.1.
+  expect(shown.origin).toBe("https://chat.2prostream.com");
+  expect(shown.pathname).toMatch(/^\/artifact\/[A-Za-z0-9_-]{43}$/);
+  // This test server is reached on its loopback address: the same path here.
+  const url = shown.pathname;
   await expect(dialog.getByTestId("public-link")).toHaveCount(1);
   await dialog.getByRole("button", { name: "닫기" }).click();
 

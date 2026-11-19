@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PUBLIC_LINK_DAYS, type PublicLink, type PublicLinkCheck } from "@agentlee/shared";
 import { errorText, publicLinks, PUBLIC_LINKS_KEY } from "../api.js";
 import "../shares/shares.css";
@@ -86,7 +86,8 @@ function NewLink({ artifactId, version }: { artifactId: string; version: number 
   });
   const notices = check.data ? checkNotices(check.data) : [];
   const blocked = !!check.data?.secret;
-  const url = create.data ? `${window.location.origin}${create.data.path}` : undefined;
+  // Built by the server from PUBLIC_HOST (https): the address outsiders open, even when made at home on localhost.
+  const url = create.data?.url;
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
     create.mutate();
@@ -186,10 +187,7 @@ export function PublicLinkDialog({
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const titleId = useId();
-  const list = useQuery({
-    queryKey: [...PUBLIC_LINKS_KEY, "of", artifactId],
-    queryFn: () => publicLinks.mine(artifactId),
-  });
+  const list = useLinkPages(artifactId);
   useEffect(() => {
     const d = dialog.current;
     if (d && !d.open) d.showModal();
@@ -223,16 +221,7 @@ export function PublicLinkDialog({
         </p>
         <NewLink artifactId={artifactId} version={version} />
         {list.isError && <p className="notice warn">{errorText(list.error)}</p>}
-        {!!list.data?.length && (
-          <>
-            <h3>이 아티팩트의 공개 링크</h3>
-            <ul className="share-list" data-testid="public-link-list">
-              {list.data.map((l) => (
-                <MyPublicLink key={l.id} l={l} />
-              ))}
-            </ul>
-          </>
-        )}
+        <LinkList list={list} title="이 아티팩트의 공개 링크" />
       </div>
     </dialog>
   );
@@ -281,11 +270,68 @@ export function PublicLinkButton({
   );
 }
 
-/** 가족 공유 → "내 공개 링크": every link of mine across artifacts. */
+/** My links (of one artifact, or all): every open one on the first page, then the history page by page. */
+function useLinkPages(artifactId?: string) {
+  return useInfiniteQuery({
+    queryKey: [...PUBLIC_LINKS_KEY, "pages", artifactId ?? "all"],
+    queryFn: ({ pageParam }) =>
+      publicLinks.mine({
+        ...(artifactId ? { artifactId } : {}),
+        ...(pageParam ? { cursor: pageParam } : {}),
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
+  });
+}
+
+function LinkList({
+  list,
+  title,
+  showTitle,
+  empty,
+}: {
+  list: ReturnType<typeof useLinkPages>;
+  title?: string;
+  showTitle?: boolean;
+  empty?: string;
+}) {
+  const pages = list.data?.pages ?? [];
+  const links = pages.flatMap((p) => [...p.active, ...p.history]);
+  return (
+    <>
+      {list.isError && <p className="notice warn">{errorText(list.error)}</p>}
+      {!links.length && empty && <p className="muted small">{empty}</p>}
+      {!!links.length && (
+        <>
+          {title && <h3>{title}</h3>}
+          <ul className="share-list" data-testid="public-link-list">
+            {links.map((l) => (
+              <MyPublicLink key={l.id} l={l} {...(showTitle ? { showTitle } : {})} />
+            ))}
+          </ul>
+        </>
+      )}
+      {list.hasNextPage && (
+        <button
+          type="button"
+          className="ghost small"
+          data-testid="public-link-more"
+          disabled={list.isFetchingNextPage}
+          onClick={() => void list.fetchNextPage()}
+        >
+          {list.isFetchingNextPage ? "불러오는 중…" : "지난 링크 더 보기"}
+        </button>
+      )}
+    </>
+  );
+}
+
+/** 가족 공유 → "내 공개 링크": every open link of mine across artifacts (never cut off), then the history. */
 export function MyPublicLinks() {
   const settings = useQuery({ queryKey: [...PUBLIC_LINKS_KEY, "settings"], queryFn: publicLinks.settings });
-  const list = useQuery({ queryKey: [...PUBLIC_LINKS_KEY, "mine"], queryFn: () => publicLinks.mine() });
-  if (!settings.data?.enabled && !list.data?.length) return null;
+  const list = useLinkPages();
+  const any = !!list.data?.pages.some((p) => p.active.length || p.history.length);
+  if (!settings.data?.enabled && !any) return null;
   return (
     <section aria-label="내 공개 링크" data-testid="my-public-links">
       <h2>내 공개 링크</h2>
@@ -293,13 +339,7 @@ export function MyPublicLinks() {
         가족 밖 사람도 로그인 없이 여는 링크예요. 켜져 있는 링크 {settings.data?.active ?? 0}/
         {settings.data?.maxActive ?? 20}개.
       </p>
-      {list.isError && <p className="notice warn">{errorText(list.error)}</p>}
-      {!list.data?.length && <p className="muted small">아직 만든 공개 링크가 없어요.</p>}
-      <ul className="share-list">
-        {list.data?.map((l) => (
-          <MyPublicLink key={l.id} l={l} showTitle />
-        ))}
-      </ul>
+      <LinkList list={list} showTitle empty="아직 만든 공개 링크가 없어요." />
     </section>
   );
 }

@@ -843,10 +843,14 @@ export const PUBLIC_LINKS_KEY = ["public-links"] as const;
  */
 export const publicLinks = {
   settings: async () => PublicLinkSettings.parse(await call("GET", "/api/public-links/settings")),
-  mine: async (artifactId?: string) =>
-    PublicLinksResponse.parse(
-      await call("GET", `/api/public-links${artifactId ? `?artifactId=${enc(artifactId)}` : ""}`),
-    ).items,
+  /** Every open link, and a page of the expired / turned-off ones (`cursor`: the previous page's `nextCursor`). */
+  mine: async (o: { artifactId?: string; cursor?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (o.artifactId) q.set("artifactId", o.artifactId);
+    if (o.cursor) q.set("cursor", o.cursor);
+    const qs = q.toString();
+    return PublicLinksResponse.parse(await call("GET", `/api/public-links${qs ? `?${qs}` : ""}`));
+  },
   check: async (artifactId: string, version: number) =>
     PublicLinkCheck.parse(
       await call("GET", `/api/artifacts/${enc(artifactId)}/public-links/check?version=${version}`),
@@ -856,7 +860,10 @@ export const publicLinks = {
       await call("POST", `/api/artifacts/${enc(artifactId)}/public-links`, { version, expiresInDays }),
     ),
   disable: async (id: string) => PublicLink.parse(await call("DELETE", `/api/public-links/${enc(id)}`)),
-  adminList: async () => AdminPublicLinksResponse.parse(await call("GET", "/api/admin/public-links")),
+  adminList: async (cursor?: string) =>
+    AdminPublicLinksResponse.parse(
+      await call("GET", `/api/admin/public-links${cursor ? `?cursor=${enc(cursor)}` : ""}`),
+    ),
   adminDisable: async (id: string) => call("POST", `/api/admin/public-links/${enc(id)}/disable`, {}),
 };
 

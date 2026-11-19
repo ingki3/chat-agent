@@ -1,10 +1,20 @@
 import crypto from "node:crypto";
-import { and, count, desc, eq, gt, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { PUBLIC_LINK_TOKEN, type PublicLinkStatus } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { artifacts, artifactVersions, conversations, publicLinks, users } from "../db/schema.js";
 
 export type PublicLinkRow = typeof publicLinks.$inferSelect;
+export type PageCursor = { createdAt: number; id: string };
+export type Page<T> = { items: T[]; next: PageCursor | null };
+
+/** `"<createdAt>:<id>"` ⇄ a cursor; anything else is no cursor. */
+export const encodeCursor = (c: PageCursor | null) => (c ? `${c.createdAt}:${c.id}` : null);
+export function decodeCursor(v: unknown): PageCursor | undefined | "invalid" {
+  if (v === undefined) return undefined;
+  const m = typeof v === "string" ? /^(\d{1,15}):([0-9a-f-]{36})$/.exec(v) : null;
+  return m ? { createdAt: Number(m[1]), id: m[2]! } : "invalid";
+}
 
 const DAY_MS = 86_400_000;
 
@@ -79,21 +89,58 @@ export class PublicLinkStore {
     );
   }
 
-  /** The owner's links, newest first, with their artifact's kind and (scrubbed by the caller) title. */
-  listByOwner(ownerId: string, artifactId?: string) {
+  /** On and not expired, at this moment. */
+  private activeWhere() {
+    return and(isNull(publicLinks.disabledAt), gt(publicLinks.expiresAt, this.now()));
+  }
+  /** Off or expired. */
+  private inactiveWhere() {
+    return or(isNotNull(publicLinks.disabledAt), lte(publicLinks.expiresAt, this.now()));
+  }
+  /** Keyset page condition: strictly after `cursor` in (createdAt desc, id desc) order. */
+  private after(cursor: PageCursor | undefined) {
+    return cursor
+      ? or(
+          lt(publicLinks.createdAt, cursor.createdAt),
+          and(eq(publicLinks.createdAt, cursor.createdAt), lt(publicLinks.id, cursor.id)),
+        )
+      : undefined;
+  }
+  private page<T extends { link: PublicLinkRow }>(rows: T[], limit: number): Page<T> {
+    const items = rows.slice(0, limit);
+    const last = rows.length > limit ? items[items.length - 1]!.link : undefined;
+    return { items, next: last ? { createdAt: last.createdAt, id: last.id } : null };
+  }
+
+  private ownerRows() {
     return this.db
       .select({ link: publicLinks, title: artifacts.title, kind: artifacts.kind })
       .from(publicLinks)
-      .innerJoin(artifacts, eq(artifacts.id, publicLinks.artifactId))
-      .where(
-        and(
-          eq(publicLinks.ownerId, ownerId),
-          artifactId !== undefined ? eq(publicLinks.artifactId, artifactId) : undefined,
-        ),
-      )
-      .orderBy(desc(publicLinks.createdAt), desc(sql`${publicLinks}.rowid`))
-      .limit(200)
+      .innerJoin(artifacts, eq(artifacts.id, publicLinks.artifactId));
+  }
+  private mine(ownerId: string, artifactId: string | undefined) {
+    return and(
+      eq(publicLinks.ownerId, ownerId),
+      artifactId !== undefined ? eq(publicLinks.artifactId, artifactId) : undefined,
+    );
+  }
+
+  /** Every open link of the owner (no cap — at most `PUBLIC_LINK_MAX_ACTIVE` exist), newest first. */
+  activeByOwner(ownerId: string, artifactId?: string) {
+    return this.ownerRows()
+      .where(and(this.mine(ownerId, artifactId), this.activeWhere()))
+      .orderBy(desc(publicLinks.createdAt), desc(publicLinks.id))
       .all();
+  }
+
+  /** The owner's expired and turned-off links, newest first, a page at a time. */
+  historyByOwner(ownerId: string, o: { artifactId?: string; cursor?: PageCursor; limit: number }) {
+    const rows = this.ownerRows()
+      .where(and(this.mine(ownerId, o.artifactId), this.inactiveWhere(), this.after(o.cursor)))
+      .orderBy(desc(publicLinks.createdAt), desc(publicLinks.id))
+      .limit(o.limit + 1)
+      .all();
+    return this.page(rows, o.limit);
   }
 
   /** One link with its artifact's kind and title (the owner's own view). */
@@ -106,15 +153,29 @@ export class PublicLinkStore {
       .get();
   }
 
-  /** Every link with its owner's name — the admin's list (no artifact title, no content: FR-1.5). */
-  listAll() {
+  private adminRows() {
     return this.db
       .select({ link: publicLinks, ownerName: users.name })
       .from(publicLinks)
-      .innerJoin(users, eq(users.id, publicLinks.ownerId))
-      .orderBy(desc(publicLinks.createdAt), desc(sql`${publicLinks}.rowid`))
-      .limit(500)
+      .innerJoin(users, eq(users.id, publicLinks.ownerId));
+  }
+
+  /** Every open link with its owner's name — the admin's list, complete (no title, no content: FR-1.5). */
+  activeAll() {
+    return this.adminRows()
+      .where(this.activeWhere())
+      .orderBy(desc(publicLinks.createdAt), desc(publicLinks.id))
       .all();
+  }
+
+  /** Every expired or turned-off link, a page at a time (the admin's history). */
+  historyAll(o: { cursor?: PageCursor; limit: number }) {
+    const rows = this.adminRows()
+      .where(and(this.inactiveWhere(), this.after(o.cursor)))
+      .orderBy(desc(publicLinks.createdAt), desc(publicLinks.id))
+      .limit(o.limit + 1)
+      .all();
+    return this.page(rows, o.limit);
   }
 
   counts(): { active: number; expired: number; disabled: number } {

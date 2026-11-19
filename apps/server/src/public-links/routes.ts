@@ -22,9 +22,18 @@ import { exportDocument, exportFormats, type Renderer } from "../artifacts/expor
 import { artifactCsp, attachment, downloadVersion, escapeHtml, serveVersion } from "../artifacts/serve.js";
 import type { ArtifactStore } from "../artifacts/store.js";
 import { checkVersion } from "./check.js";
-import { statusOf, type LiveLink, type PublicLinkRow, type PublicLinkStore } from "./store.js";
+import {
+  decodeCursor,
+  encodeCursor,
+  statusOf,
+  type LiveLink,
+  type PublicLinkRow,
+  type PublicLinkStore,
+} from "./store.js";
 
 export const PUBLIC_LINK_KIND = "public-link";
+/** Expired and turned-off links per page of a list (open links are always listed in full). */
+export const HISTORY_PAGE = 50;
 
 /**
  * Headers of every public link response (#204): never cached by anything between (and not kept by the browser), never
@@ -253,13 +262,25 @@ export function registerPublicLinkRoutes(app: FastifyInstance, o: PublicLinkRout
       } satisfies PublicLinkSettings),
   );
 
-  app.get<{ Querystring: { artifactId?: unknown } }>(
+  app.get<{ Querystring: { artifactId?: unknown; cursor?: unknown } }>(
     "/api/public-links",
     { config: { noResource: "lists only the caller's own links (no id: only the session's user)" } },
     async (req, reply) => {
       const artifactId = typeof req.query.artifactId === "string" ? req.query.artifactId : undefined;
-      const items = store.listByOwner(req.ctx.user!.id, artifactId).map(toLink);
-      return reply.header("Cache-Control", "no-store").send({ items } satisfies PublicLinksResponse);
+      const cursor = decodeCursor(req.query.cursor);
+      if (cursor === "invalid") return deny(reply, 400, "invalid_request");
+      const owner = req.ctx.user!.id;
+      const history = store.historyByOwner(owner, {
+        ...(artifactId !== undefined ? { artifactId } : {}),
+        ...(cursor ? { cursor } : {}),
+        limit: HISTORY_PAGE,
+      });
+      return reply.header("Cache-Control", "no-store").send({
+        // The first page carries every open link; later pages only more history.
+        active: cursor ? [] : store.activeByOwner(owner, artifactId).map(toLink),
+        history: history.items.map(toLink),
+        nextCursor: encodeCursor(history.next),
+      } satisfies PublicLinksResponse);
     },
   );
 
@@ -312,6 +333,8 @@ export function registerPublicLinkRoutes(app: FastifyInstance, o: PublicLinkRout
         .send({
           link: toLink({ link: row, title: v.title, kind: a.kind }),
           path: publicLinkPath(token),
+          // The address outsiders open: always the public host over https, wherever the owner made it from.
+          url: `https://${config.publicHost}${publicLinkPath(token)}`,
           check: found,
         } satisfies CreatePublicLinkResponse);
     },
@@ -329,23 +352,29 @@ export function registerPublicLinkRoutes(app: FastifyInstance, o: PublicLinkRout
   );
 
   const admin = (what: string) => ({ auth: "admin" as const, noResource: what });
-  app.get(
+  app.get<{ Querystring: { cursor?: unknown } }>(
     "/api/admin/public-links",
     { config: admin("admin-only counts and expiry of every link (no title, no content)") },
-    async (_req, reply) => {
+    async (req, reply) => {
       const at = now();
+      const cursor = decodeCursor(req.query.cursor);
+      if (cursor === "invalid") return deny(reply, 400, "invalid_request");
+      const row = (r: { link: PublicLinkRow; ownerName: string }) => ({
+        id: r.link.id,
+        ownerName: r.ownerName,
+        createdAt: r.link.createdAt,
+        expiresAt: r.link.expiresAt,
+        disabledAt: r.link.disabledAt,
+        viewCount: r.link.viewCount,
+        status: statusOf(r.link, at),
+      });
+      const history = store.historyAll({ ...(cursor ? { cursor } : {}), limit: HISTORY_PAGE });
       return reply.header("Cache-Control", "no-store").send({
         enabled: config.publicLinks,
         counts: store.counts(),
-        items: store.listAll().map((r) => ({
-          id: r.link.id,
-          ownerName: r.ownerName,
-          createdAt: r.link.createdAt,
-          expiresAt: r.link.expiresAt,
-          disabledAt: r.link.disabledAt,
-          viewCount: r.link.viewCount,
-          status: statusOf(r.link, at),
-        })),
+        active: cursor ? [] : store.activeAll().map(row),
+        history: history.items.map(row),
+        nextCursor: encodeCursor(history.next),
       } satisfies AdminPublicLinksResponse);
     },
   );
@@ -439,12 +468,14 @@ export function registerPublicLinkRoutes(app: FastifyInstance, o: PublicLinkRout
     "/artifact/:token/download",
     { config: publicRoute },
     async (req, reply) => {
-      const format = req.query.format;
-      if (format !== undefined && format !== "html" && format !== "png" && format !== "pdf")
-        return gone(reply);
+      // Order (review #209): the rate limits come first — every request counts, a malformed one too — then the
+      // format, then (PNG/PDF) the render limit, and only then is a document prepared.
       const r = resolve(req, reply);
       if (r === "limited") return reply;
       if (!r) return gone(reply);
+      const format = req.query.format;
+      if (format !== undefined && format !== "html" && format !== "png" && format !== "pdf")
+        return gone(reply);
       const kind = r.live.artifact.kind;
       const send = (type: string, body: string | Buffer, ext: string) =>
         reply
@@ -464,9 +495,9 @@ export function registerPublicLinkRoutes(app: FastifyInstance, o: PublicLinkRout
         return page ? send(page.type, page.body, "html") : gone(reply);
       }
       if (!ARTIFACT_EXPORTS[kind].includes(format)) return gone(reply);
+      if (!limits.render(r.live.link.id)) return limited(req, reply, 600);
       const doc = exportDocument(kind, r.title, r.content);
       if (!doc) return gone(reply);
-      if (!limits.render(r.live.link.id)) return limited(req, reply, 600);
       const out = o.renderer
         ? await o.renderer.render({ format, doc, scripts: kind === "html" })
         : ({ ok: false, code: "export_unavailable" } as const);

@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { errorText, publicLinks } from "../api.js";
 
 const KEY = ["admin", "public-links"] as const;
@@ -11,12 +11,22 @@ const STATUS = { active: "열림", expired: "만료됨", disabled: "꺼짐" } as
  */
 export function PublicLinksAdmin() {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: KEY, queryFn: publicLinks.adminList });
+  // The first page: counts and every open link (complete); then the history page by page.
+  const q = useInfiniteQuery({
+    queryKey: KEY,
+    queryFn: ({ pageParam }) => publicLinks.adminList(pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
+  });
   const off = useMutation({
     mutationFn: publicLinks.adminDisable,
     onSettled: () => qc.invalidateQueries({ queryKey: KEY }),
   });
-  const d = q.data;
+  const first = q.data?.pages[0];
+  const d = first && {
+    ...first,
+    items: (q.data?.pages ?? []).flatMap((p) => [...p.active, ...p.history]),
+  };
   return (
     <section className="admin" aria-label="공개 링크" data-testid="admin-public-links">
       <h2>공개 링크</h2>
@@ -70,6 +80,16 @@ export function PublicLinksAdmin() {
                 ))}
               </tbody>
             </table>
+          )}
+          {q.hasNextPage && (
+            <button
+              type="button"
+              className="ghost small"
+              disabled={q.isFetchingNextPage}
+              onClick={() => void q.fetchNextPage()}
+            >
+              {q.isFetchingNextPage ? "불러오는 중…" : "지난 링크 더 보기"}
+            </button>
           )}
           {off.isError && <p className="error small">{errorText(off.error)}</p>}
         </>
