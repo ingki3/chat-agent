@@ -1472,7 +1472,7 @@ describe("the browser never outlives its owner (#170)", () => {
       expect(mac("/opt/브라우저/chrome")).not.toBe(mac("/opt/????????????/chrome"));
       expect(mac("a\nb")).not.toBe(mac("a\tb"));
       expect(psEncode("x", "win32")).toBeUndefined(); // unknown platform: nothing attributed
-      expect(psEncode("a\n가?", "linux")).toBe("a?????"); // procps (not checked here: no Linux host)
+      expect(psEncode("a\n\t\u007f가?", "linux")).toBe("a ..????"); // procps, as the byte-by-byte real `ps` test checks
     });
 
     it("long command lines are plain string work: a 657-byte Korean path in a 15 KB command line is matched at once", () => {

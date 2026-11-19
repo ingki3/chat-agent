@@ -508,7 +508,8 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
  *    printable ASCII as it is (the backslash too); tab and new line as octal (`\011`, `\012`); any other control
  *    character as `^X`, DEL as `^?`; a byte above 0x7f as `M-x` (its low seven bits printable), `M^X` / `M^?` (a
  *    control), or `\240` (0xa0).
- *  - Linux (procps, C locale; **not checked here** — no Linux host): printable ASCII as it is, every other byte `?`.
+ *  - Linux (procps, C locale; checked byte by byte on the CI's Ubuntu): printable ASCII as it is; a new line as a
+ *    space; any other control character and DEL as `.`; a byte above 0x7f as `?`.
  */
 export function psEncode(text: string, platform: string = process.platform): string | undefined {
   return psEncodeBytes(Buffer.from(text, "utf8"), platform);
@@ -519,7 +520,7 @@ export function psEncodeBytes(bytes: Uint8Array, platform: string = process.plat
   let out = "";
   for (const b of bytes) {
     if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
-    else if (platform === "linux") out += "?";
+    else if (platform === "linux") out += b === 0x0a ? " " : b < 0x80 ? "." : "?";
     else if (b === 0x09 || b === 0x0a) out += `\\0${b.toString(8).padStart(2, "0")}`;
     else if (b < 0x20) out += `^${String.fromCharCode(b + 0x40)}`;
     else if (b === 0x7f) out += "^?";
@@ -557,7 +558,8 @@ function identities(
  * Anything else in the group is unattributed: never signalled (it keeps the reap from completing) — so is anything the
  * check fails on. What remains indistinguishable: a process in the same group, of the same executable, with the exact
  * switch inside one of its arguments — only something that runs the browser binary in the render's own group; on
- * Linux, where every other byte prints as `?`, a literal `?` where the expected text has a non-ASCII byte too.
+ * Linux, where `ps` prints lossily, a literal space, `.` or `?` where the expected text has a new line, another control
+ * character or a non-ASCII byte.
  */
 function ours(e: RenderEntry, row: RenderProcess): boolean {
   try {
