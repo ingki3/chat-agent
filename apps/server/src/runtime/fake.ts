@@ -15,6 +15,7 @@ import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import { readReferences, switchSteps, type ReadReferences } from "./fake-switch.js";
 import { memorySteps } from "./fake-memory.js";
 import { dreamingSteps } from "./fake-dreaming.js";
+import { researchSteps } from "./fake-research.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -84,6 +85,8 @@ import {
  */
 export type FakeStep =
   | { text: string }
+  /** Text with `{{$<i>.<path>}}` filled in from the i-th call's output of this turn (#211: notes with a sourceId). */
+  | { textRefs: string }
   | { reasoning: string }
   | { delayMs: number }
   | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
@@ -433,6 +436,8 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
   const dreaming = dreamingSteps(t);
   if (dreaming) return dreaming;
+  const research = researchSteps(t);
+  if (research) return research;
   const switched = switchSteps(t);
   if (switched) return switched;
   const remembered = memorySteps(t);
@@ -730,6 +735,14 @@ export class FakeRuntime implements RuntimeAdapter {
               raw += step.text;
               reply.text = raw.trim();
               if (step.text) yield { type: "text_delta", text: step.text };
+            } else if ("textRefs" in step) {
+              const text = step.textRefs.replace(/\{\{(\$[\w-]+\.[\w.]+)\}\}/g, (m, ref: string) => {
+                const v = resolveRefs(ref, (i) => outputs[Number(i)]);
+                return typeof v === "string" && v !== ref ? v : m;
+              });
+              raw += text;
+              reply.text = raw.trim();
+              if (text) yield { type: "text_delta", text };
             } else if ("reasoning" in step) yield { type: "reasoning_delta", text: step.reasoning };
             else if ("delayMs" in step) await sleep(step.delayMs, ctrl.signal);
             else if ("tool" in step) {

@@ -29,6 +29,14 @@ export type ScrubbedSegment = { text: string; marks: Mark[] | null; approximate:
  */
 type Unit = { text: string; marks?: readonly Mark[] | null | undefined; endsEarly?: boolean | undefined };
 
+/**
+ * Steps of the loops that share the ranges out to the units and move the marks, since the process started (#213),
+ * one count a loop: ranges `skipped` (ended before a unit) and `taken` (into a unit), mark ends `swept` and ranges
+ * `passed` on the way. What the linearity test counts, with the built-ins' work — their sum grows with the units,
+ * marks and ranges, never with their product (and each is there: a loop that stopped counting fails its floor).
+ */
+export const scrubStats = { skipped: 0, taken: 0, swept: 0, passed: 0 };
+
 /** What goes between two units in the text they are matched in. */
 export const UNIT_SEPARATOR = "\n";
 
@@ -71,10 +79,14 @@ function runRanges(units: readonly Unit[], endsEarly: boolean, registry?: KnownS
     const end = start + u.text.length;
     at = end + UNIT_SEPARATOR.length;
     // Ranges are sorted and apart: skip the ones that ended before this unit, take the ones that start in it.
-    while (j < ranges.length && ranges[j]![1] <= start) j++;
+    while (j < ranges.length && ranges[j]![1] <= start) {
+      scrubStats.skipped++;
+      j++;
+    }
     const local: [number, number][] = [];
     let edge = false;
     for (let k = j; k < ranges.length && ranges[k]![0] < end; k++) {
+      scrubStats.taken++;
       const [a, b] = ranges[k]!;
       if (a < start || b > end) edge = true;
       local.push([Math.max(a, start) - start, Math.min(b, end) - start]);
@@ -155,8 +167,10 @@ function applyRanges(
   let k = 0;
   let shift = 0;
   for (const pt of points) {
+    scrubStats.swept++;
     // Ranges wholly before this point move it.
     while (k < ranges.length && ranges[k]![1] <= pt.p) {
+      scrubStats.passed++;
       shift += KNOWN_PLACEHOLDER.length - (ranges[k]![1] - ranges[k]![0]);
       k++;
     }

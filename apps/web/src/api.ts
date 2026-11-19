@@ -1,4 +1,6 @@
 import {
+  ResearchJob,
+  type ResearchScope,
   AdminRuntimesResponse,
   BackupItem,
   BackupsResponse,
@@ -618,6 +620,25 @@ export const usage = {
     UsageSettings.parse(await call("PUT", "/api/admin/usage/settings", s)),
 };
 
+/** 깊이 조사 (#211): start from a conversation, then the card's actions. */
+export const research = {
+  start: async (conversationId: string, text: string, fileIds: string[]) =>
+    (await call("POST", `/api/conversations/${enc(conversationId)}/research`, {
+      text,
+      ...(fileIds.length ? { fileIds } : {}),
+    })) as { job: unknown; message: unknown; assistant: unknown },
+  get: async (id: string) => ResearchJob.parse(await call("GET", `/api/research/${enc(id)}`)),
+  eventsUrl: (id: string) => `/api/research/${enc(id)}/events`,
+  approve: async (id: string, subQuestions?: { question: string; scope: ResearchScope }[]) =>
+    ResearchJob.parse(
+      await call("POST", `/api/research/${enc(id)}/approve`, subQuestions ? { subQuestions } : {}),
+    ),
+  clarify: async (id: string, answer: string) =>
+    ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/clarify`, { answer })),
+  cancel: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/cancel`, {})),
+  stop: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/stop`, {})),
+};
+
 export const runs = {
   get: async (id: string) => Run.parse(await call("GET", `/api/runs/${enc(id)}`)),
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
@@ -698,6 +719,12 @@ const MESSAGES: Record<string, string> = {
   ...DREAMING_ERRORS,
   // Cloudflare Access 동기화 (#36)
   ...ACCESS_ERRORS,
+  // 깊이 조사 (#211)
+  research_claude_only: "깊이 조사는 Claude 대화에서만 쓸 수 있어요.",
+  research_busy: "진행 중인 깊이 조사가 있어요. 끝나거나 멈춘 뒤에 시작하세요.",
+  research_state: "이 깊이 조사는 지금 그렇게 할 수 없어요. 화면을 새로 고쳐 보세요.",
+  backend_unavailable: "이 조사 방식은 지금 쓸 수 없어요.",
+  no_runtime: "쓸 수 있는 런타임이 없어요 — 관리자에게 문의하세요.",
   // 공개 링크 (#204)
   ...PUBLIC_LINK_ERRORS,
 };

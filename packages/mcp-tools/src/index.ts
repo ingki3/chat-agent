@@ -52,6 +52,11 @@ export type McpHost = {
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
   /** Told about every answered tool call (the connection test #17 checks that our server really served them). */
   onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
+  /**
+   * Whether this run may call `tool` now (takes one call of a run's budget — #211's research steps). Absent: yes. Checked
+   * by tools this package answers itself (`echo_time`); the host checks its own tools in `runTool` / `runSkill`.
+   */
+  mayCall?(tool: string, scope: ToolScope): boolean;
   /** The host's own tools (named as they are, no prefix), and how to run one. */
   tools?: readonly ServerToolInfo[];
   /**
@@ -111,6 +116,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     async () => {
       const name = host.userName(scope.userId);
       if (!name || !stillValid()) return text({ error: "unauthorized" }, true);
+      if (host.mayCall && !host.mayCall("echo_time", scope)) return text({ error: "not_allowed" }, true);
       const now = (host.now ?? (() => new Date()))();
       const timeZone = host.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
       host.onToolCall?.("echo_time", scope, true);

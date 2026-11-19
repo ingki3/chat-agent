@@ -204,6 +204,7 @@ export function NotificationSettings() {
       )}
       <QuietHours />
       <MemoryNotifications />
+      <ResearchNotifications />
     </section>
   );
 }
@@ -308,12 +309,44 @@ function QuietHours() {
   );
 }
 
+type Toggle = "memoryProposals" | "memoryApplied" | "memoryFailed" | "researchDone" | "researchFailed";
+
 /** 기억 정리 notifications (#146, #188, spec §8): 제안 대기, 자동 반영, 실패 — each can be turned off. */
 function MemoryNotifications() {
+  return (
+    <KindToggles
+      testId="memory-notifications"
+      title="기억 정리 알림"
+      items={[
+        ["memoryProposals", "기억 정리 제안이 기다릴 때"],
+        ["memoryApplied", "기억 정리가 자동으로 반영했을 때"],
+        ["memoryFailed", "내 기억 정리가 실패했을 때"],
+      ]}
+      note="알림에는 개수·이유만 적혀요. 내용과 기억 정리 설정은 설정 → 내 지침에서 봐요."
+    />
+  );
+}
+
+/** 깊이 조사 notifications (#211): 완료, 실패·중지 — each can be turned off. */
+function ResearchNotifications() {
+  return (
+    <KindToggles
+      testId="research-notifications"
+      title="깊이 조사 알림"
+      items={[
+        ["researchDone", "깊이 조사 보고서가 완성됐을 때"],
+        ["researchFailed", "깊이 조사가 실패하거나 중지됐을 때"],
+      ]}
+      note="알림에는 주제 앞부분 한 줄만 적혀요. 보고서 내용과 출처는 눌러서 대화에서 봐요."
+    />
+  );
+}
+
+/** Per-kind switches of the notification settings (only the toggled field is saved). */
+function KindToggles(props: { testId: string; title: string; items: [Toggle, string][]; note: string }) {
   const qc = useQueryClient();
   // The newest revision wins (rev.ts): a GET older than a save's answer never replaces it.
   const prefs = useQuery({ queryKey: PREFS_KEY, queryFn: notifications.prefs, structuralSharing: keepPrefs });
-  type Toggle = "memoryProposals" | "memoryApplied" | "memoryFailed";
   // A choice shows at once while it is being saved; then the cache — the newest revision seen, which holds the save's
   // answer (or, refused, the newest stored value) — shows again (rev.ts, review #195 9).
   const [picked, setPicked] = useState<Partial<Record<Toggle, boolean>>>({});
@@ -328,40 +361,22 @@ function MemoryNotifications() {
   });
   const loading = !prefs.data || save.isPending;
   return (
-    <fieldset className="quiet" data-testid="memory-notifications">
+    <fieldset className="quiet" data-testid={props.testId}>
       <legend>
-        <h3>기억 정리 알림</h3>
+        <h3>{props.title}</h3>
       </legend>
-      <label className="row">
-        <input
-          type="checkbox"
-          checked={shown("memoryProposals")}
-          disabled={loading}
-          onChange={(e) => save.mutate({ field: "memoryProposals", value: e.target.checked })}
-        />{" "}
-        기억 정리 제안이 기다릴 때
-      </label>
-      <label className="row">
-        <input
-          type="checkbox"
-          checked={shown("memoryApplied")}
-          disabled={loading}
-          onChange={(e) => save.mutate({ field: "memoryApplied", value: e.target.checked })}
-        />{" "}
-        기억 정리가 자동으로 반영했을 때
-      </label>
-      <label className="row">
-        <input
-          type="checkbox"
-          checked={shown("memoryFailed")}
-          disabled={loading}
-          onChange={(e) => save.mutate({ field: "memoryFailed", value: e.target.checked })}
-        />{" "}
-        내 기억 정리가 실패했을 때
-      </label>
-      <p className="muted small">
-        알림에는 개수·이유만 적혀요. 내용과 기억 정리 설정은 설정 → 내 지침에서 봐요.
-      </p>
+      {props.items.map(([field, label]) => (
+        <label className="row" key={field}>
+          <input
+            type="checkbox"
+            checked={shown(field)}
+            disabled={loading}
+            onChange={(e) => save.mutate({ field, value: e.target.checked })}
+          />{" "}
+          {label}
+        </label>
+      ))}
+      <p className="muted small">{props.note}</p>
       {save.isError && (
         <p className="error small" role="alert">
           {errorText(save.error)}

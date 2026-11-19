@@ -152,6 +152,9 @@ import { DreamingStore } from "./dreaming/store.js";
 import { DreamingRunner } from "./dreaming/runner.js";
 import { DreamingEngine } from "./dreaming/engine.js";
 import { registerDreamingRoutes } from "./dreaming/routes.js";
+import { ResearchEngine, type ResearchEngineDeps } from "./research/engine.js";
+import { registerResearchRoutes } from "./research/routes.js";
+import { ResearchStore } from "./research/store.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -227,6 +230,8 @@ declare module "fastify" {
     memoryProposals: MemoryProposals | undefined;
     /** 기억 정리 (#146); undefined without a database. */
     dreaming: { store: DreamingStore; engine: DreamingEngine; runner: DreamingRunner } | undefined;
+    /** 깊이 조사 (#211); undefined without a database. */
+    research: ResearchEngine | undefined;
   }
 }
 
@@ -367,6 +372,8 @@ export type BuildOptions = {
    * itself only in a server that holds the data folder lock).
    */
   dreaming?: { now?: () => number; timeoutMs?: number; start?: boolean; maxSleepMs?: number };
+  /** 깊이 조사 (#211): tests bring a manual clock, other limits and a short SSE heartbeat. */
+  research?: Partial<Pick<ResearchEngineDeps, "clock" | "limits" | "prompts">> & { heartbeatMs?: number };
   /**
    * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
    * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
@@ -1228,6 +1235,36 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     if (opts.dreaming?.start || (config.env !== "test" && dataLock))
       app.addHook("onReady", async () => dreamingEngine.start());
     app.addHook("preClose", async () => dreamingEngine.stop());
+    // 깊이 조사 (#211): jobs on the server, independent of the page — resumed from their checkpoint at start-up.
+    const research = new ResearchEngine({
+      db: opts.db!,
+      store: new ResearchStore(opts.db!, opts.research?.clock?.now.bind(opts.research.clock)),
+      conversations: app.conversations!,
+      registry: runtimes,
+      access: { resolve: (input) => connections.access.resolve(input) },
+      users,
+      mcp,
+      mcpTokens,
+      citations,
+      sources,
+      artifacts,
+      files: fileStore,
+      fileTools,
+      memory,
+      activeRun: (conversationId) => !!runManager.active(conversationId),
+      notifications: () => app.notifications,
+      usage,
+      forgetSession: (ref) => deletion.orphan(ref),
+      log: app.log,
+      ...opts.research,
+    });
+    app.decorate("research", research);
+    registerResearchRoutes(app, research, app.conversations!, {
+      ...(opts.research?.heartbeatMs ? { heartbeatMs: opts.research.heartbeatMs } : {}),
+      ...(opts.research?.clock ? { now: () => opts.research!.clock!.now() } : {}),
+    });
+    app.addHook("onReady", async () => void research.recover());
+    app.addHook("preClose", async () => research.shutdown());
     registerSourceRoutes(app, app.conversations!, sources);
     // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
     registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
@@ -1330,6 +1367,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
     app.decorate("dreaming", undefined);
+    app.decorate("research", undefined);
     app.decorate("artifacts", undefined);
     app.decorate("publicLinks", undefined);
     app.decorate("usageStore", undefined);
