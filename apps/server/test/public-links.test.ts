@@ -546,8 +546,9 @@ describe("who makes one, and what is checked first", () => {
     expect(c("01012345678 / 02-123-4567 / +82 10-1234-5678 / 1234").phones).toBe(3);
     expect(c("2026-11-19 12:30").phones).toBe(0);
     expect(
-      c("<link href='//fonts.example.com/x.css'> url(https://a.example/b.woff) ![x](https://m.example/p.png)")
-        .externalHosts,
+      c(
+        "<link href='//fonts.example.com/x.css'><style>@font-face{src:url(https://a.example/b.woff)}</style> ![x](https://m.example/p.png)",
+      ).externalHosts,
     ).toEqual(["a.example", "fonts.example.com", "m.example"]);
     expect(c("텍스트에 쓴 https://example.com 주소").externalHosts).toEqual([]);
   });
@@ -833,5 +834,45 @@ describe("review #209 round 3", () => {
     hosts(`src="${"src=".repeat(128 * 1024)}"`);
     hosts(`url(${"url(".repeat(128 * 1024)}`);
     expect(performance.now() - t).toBeLessThan(1500);
+  });
+});
+
+describe("review #209 round 4", () => {
+  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+  const CDN = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
+
+  it("leading whitespace and controls are trimmed before the length bound (any number of them)", () => {
+    expect(hosts(`<script src="${" ".repeat(2048)}${CDN}"></script>`)).toEqual(["cdn.jsdelivr.net"]);
+    expect(
+      hosts(`<img src="${"\u000b".repeat(5000)}https://images.example.org/a.png${" ".repeat(5000)}">`),
+    ).toEqual(["images.example.org"]);
+  });
+
+  it('url( counts as a load only inside CSS — <style> and style="" — never in body text', () => {
+    expect(hosts('<p><code>url(</code> 예시 <a href="https://docs.example.org/css">문서</a></p>')).toEqual([
+      "docs.example.org",
+    ]);
+    expect(hosts("<p>CSS의 url(https://text.example/x.png)는 이렇게 써요</p>")).toEqual([]);
+    expect(hosts("@import 'https://text.example/x.css' 라고 적은 글")).toEqual([]);
+    expect(hosts("<div style=\"background: url( '//bg.example/a.png' )\">")).toEqual(["bg.example"]);
+    expect(hosts("<STYLE media=all>p{background:url(https://in-style.example/p.png)}</STYLE>")).toEqual([
+      "in-style.example",
+    ]);
+  });
+
+  it("srcset by the HTML candidate rules: a comma inside a URL is part of it", () => {
+    expect(hosts('<img srcset="/p.png?urls=/a,//thumb.example.org/b 2x">')).toEqual([]);
+    expect(hosts('<img srcset="https://img.example/x.png?urls=/a,//thumb.example.org/b 1x">')).toEqual([
+      "img.example",
+    ]);
+    expect(hosts('<img srcset="https://a.example/1.png 1x,https://b.example/2.png 2x">')).toEqual([
+      "a.example",
+      "b.example",
+    ]);
+    expect(hosts('<img srcset="https://a.example/1.png,https://b.example/2.png">')).toEqual(["a.example"]);
+    expect(hosts('<img srcset="https://a.example/1.png, https://b.example/2.png">')).toEqual([
+      "a.example",
+      "b.example",
+    ]);
   });
 });

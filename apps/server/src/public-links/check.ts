@@ -40,29 +40,39 @@ export function countEmails(text: string): number {
 const PHONE =
   /(?<![\d])(?:\+\d{1,3}[ .-]?)?(?:0\d{1,2}|\d{2,3})[ .-]\d{3,4}[ .-]\d{4}(?![\d])|(?<![\d])01[016789]\d{7,8}(?![\d])/g;
 const WS = /[\t\n\f\r ]/;
-/** Attribute names (and CSS `url(` / `@import`) whose value a browser loads; the `=` after a name may be spaced. */
-const TRIGGER =
-  /\b(?:src|href|srcset|poster|data|action|xlink:href)(?=[\t\n\f\r ]*=)|url\(|@import(?=[\t\n\f\r ])/gi;
+/** Attribute names whose value a browser loads (`style` holds CSS); the `=` after a name may be spaced. */
+const ATTR = /\b(?:src|href|srcset|poster|data|action|xlink:href|style)(?=[\t\n\f\r ]*=)/gi;
+/** CSS loads: `url(` and `@import` — looked for only inside CSS (`<style>` elements, `style=""` attributes). */
+const CSS_LOAD = /url\(|@import(?=[\t\n\f\r ])/gi;
+const STYLE_OPEN = /<style\b[^>]{0,1000}>/gi;
+const STYLE_CLOSE = /<\/style[\t\n\f\r />]/gi;
 /** Markdown images `![alt](https://…)`: the alt text bounded, so no start rescans the text. */
 const MD_IMAGE = /!\[[^\]\n]{0,300}\]\(\s{0,16}(?:https?:)?\/\/([A-Za-z0-9.-]{1,253})/gi;
 /** Longest attribute value looked at (a URL is far shorter; the bound keeps every value's work fixed). */
 const VALUE_MAX = 2048;
+/** Longest `style=""` value looked at for CSS loads. */
+const STYLE_MAX = 64 * 1024;
 
 /** Where the page's own relative URLs resolve: a host of its own, never reported (review #209 round 3). */
 export const PAGE_BASE = "https://artifact.invalid/";
+const PAGE_HOST = new URL(PAGE_BASE).host;
+
+/** A C0 control or space: what the URL parser trims from both ends of a URL. */
+const isC0 = (c: string) => c.charCodeAt(0) <= 0x20;
 
 /**
- * The host a URL attribute value loads from, as the browser resolves it: the value trimmed of leading and trailing C0
- * controls and spaces and stripped of tabs and newlines (the URL parser's own preprocessing — a vertical tab or form
- * feed in front still loads), then `new URL(value, PAGE_BASE)`. Only http(s) hosts other than the page's own.
+ * The host a URL value loads from, as the browser resolves it: leading and trailing C0 controls and spaces trimmed
+ * **first** (any number of them — review #209 round 4), then at most `VALUE_MAX` characters, tabs and newlines
+ * removed (the URL parser's own preprocessing), then `new URL(value, PAGE_BASE)`. Only http(s) hosts other than the
+ * page's own.
  */
 export function hostOfUrl(raw: string): string | undefined {
-  const value = raw
-    .slice(0, VALUE_MAX)
-    // eslint-disable-next-line no-control-regex -- the URL parser's C0 control and space trimming
-    .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "")
-    .replace(/[\t\n\r]/g, "");
-  if (!value) return undefined;
+  let a = 0;
+  let b = raw.length;
+  while (a < b && isC0(raw[a]!)) a++;
+  while (b > a && isC0(raw[b - 1]!)) b--;
+  if (a === b) return undefined;
+  const value = raw.slice(a, Math.min(b, a + VALUE_MAX)).replace(/[\t\n\r]/g, "");
   let url: URL;
   try {
     url = new URL(value, PAGE_BASE);
@@ -70,42 +80,101 @@ export function hostOfUrl(raw: string): string | undefined {
     return undefined;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
-  return url.host === new URL(PAGE_BASE).host ? undefined : url.hostname.toLowerCase();
+  return url.host === PAGE_HOST ? undefined : url.hostname.toLowerCase();
 }
 
 /**
- * The value after a trigger at `i`, and where it ends: `= "…"`, `= '…'` or an unquoted run for an attribute; up to
- * `)` for `url(`; the quoted string (or `url(…)`) after `@import`. Whitespace of any length around `=` is skipped
- * (HTML allows it); a value is at most `VALUE_MAX` characters.
+ * The value starting at `i` and where it ends: quoted (`"…"`, `'…'`) or an unquoted run up to `stop`. Leading C0
+ * controls and spaces are skipped before the `max`-character bound is counted, and the closing quote is looked for
+ * only within that bound — each character is looked at a fixed number of times.
  */
-function valueAt(text: string, i: number, kind: "attr" | "url" | "import"): { value: string; end: number } {
-  const skip = () => {
-    while (i < text.length && WS.test(text[i]!)) i++;
-  };
-  skip();
-  if (kind === "attr") {
-    if (text[i] !== "=") return { value: "", end: i };
-    i++;
-    skip();
-  }
-  if (kind === "import" && text.slice(i, i + 4).toLowerCase() === "url(") return valueAt(text, i + 4, "url");
+function quotedOrRun(text: string, i: number, stop: RegExp, max: number): { value: string; end: number } {
   const q = text[i];
   if (q === '"' || q === "'") {
-    const close = text.indexOf(q, i + 1);
-    const end = close === -1 || close - i > VALUE_MAX ? Math.min(text.length, i + 1 + VALUE_MAX) : close;
-    return { value: text.slice(i + 1, end), end };
+    let j = i + 1;
+    while (j < text.length && text[j] !== q && isC0(text[j]!)) j++;
+    const start = j;
+    while (j < text.length && text[j] !== q && j - start < max) j++;
+    return { value: text.slice(start, j), end: j };
   }
-  const start = i;
-  const stop = kind === "url" ? /[)]/ : /[\t\n\f\r >]/;
-  while (i < text.length && i - start < VALUE_MAX && !stop.test(text[i]!)) i++;
-  return { value: text.slice(start, i), end: i };
+  let j = i;
+  while (j < text.length && isC0(text[j]!) && !stop.test(text[j]!)) j++;
+  const start = j;
+  while (j < text.length && j - start < max && !stop.test(text[j]!)) j++;
+  return { value: text.slice(start, j), end: j };
+}
+
+/** An attribute's value after its name at `i`: `=` with any whitespace around it, then the value. */
+function attrValue(text: string, i: number, max: number): { value: string; end: number } | undefined {
+  while (i < text.length && WS.test(text[i]!)) i++;
+  if (text[i] !== "=") return undefined;
+  i++;
+  while (i < text.length && WS.test(text[i]!)) i++;
+  return quotedOrRun(text, i, /[\t\n\f\r >]/, max);
+}
+
+/**
+ * The URLs of a `srcset` value, by the HTML candidate rules: skip whitespace and commas; the URL runs to the next
+ * whitespace (a comma inside it is part of it — only trailing commas end it); descriptors run to the next comma
+ * outside parentheses.
+ */
+export function srcsetUrls(v: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < v.length) {
+    while (i < v.length && (WS.test(v[i]!) || v[i] === ",")) i++;
+    if (i >= v.length) break;
+    const start = i;
+    while (i < v.length && !WS.test(v[i]!)) i++;
+    const url = v.slice(start, i);
+    if (url.endsWith(",")) {
+      out.push(url.replace(/,+$/, ""));
+      continue;
+    }
+    out.push(url);
+    // Descriptors (`1x`, `200w`, …) up to the next comma outside parentheses.
+    for (let depth = 0; i < v.length; i++) {
+      const c = v[i];
+      if (c === "(") depth++;
+      else if (c === ")" && depth > 0) depth--;
+      else if (c === "," && depth === 0) {
+        i++;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** Hosts a stretch of CSS loads from: `url(…)` and `@import "…"` / `@import url(…)`. One pass. */
+function cssHosts(css: string, add: (h: string | undefined) => void): void {
+  const re = new RegExp(CSS_LOAD.source, "gi");
+  for (let m = re.exec(css); m; m = re.exec(css)) {
+    let i = m.index + m[0].length;
+    const skip = () => {
+      while (i < css.length && WS.test(css[i]!)) i++;
+    };
+    let stop = /[)]/;
+    skip();
+    if (m[0].toLowerCase() === "@import") {
+      if (css.slice(i, i + 4).toLowerCase() === "url(") {
+        i += 4;
+        skip();
+      } else stop = /[\t\n\f\r ;]/;
+    }
+    const { value, end } = quotedOrRun(css, i, stop, VALUE_MAX);
+    add(hostOfUrl(value));
+    re.lastIndex = Math.max(re.lastIndex, end);
+  }
 }
 
 /**
  * Hosts a page refers to for loading: every `<script src>` exactly as `prepareHtml` finds it (the same tokenizer —
- * `findScripts`, the parsed value used as is), and `src=`/`href=`/`srcset=`/`poster=`/`data=`/`action=` attributes,
- * CSS `url(…)` and `@import`, and markdown images — each value resolved as the browser would (`hostOfUrl`). One
- * pass: the scan resumes after each value, so no stretch of the text is looked at twice. At most 10.
+ * `findScripts`, the parsed value used as is); `src=`/`href=`/`srcset=`/`poster=`/`data=`/`action=` attributes;
+ * CSS `url(…)` and `@import` **inside CSS only** — `<style>` elements and `style=""` attributes, never body text that
+ * merely mentions `url(` (review #209 round 4); and markdown images. Each value is resolved as the browser would
+ * (`hostOfUrl`; `srcset` by its candidate rules). Every scan resumes after the value it read, so no stretch of the
+ * text is looked at twice. At most 10.
  */
 export function externalHosts(content: string): string[] {
   const hosts = new Set<string>();
@@ -116,15 +185,24 @@ export function externalHosts(content: string): string[] {
     const src = s.attrs.get("src");
     if (src !== undefined) add(hostOfUrl(src));
   }
-  const re = new RegExp(TRIGGER.source, "gi");
+  const re = new RegExp(ATTR.source, "gi");
   for (let m = re.exec(content); m && hosts.size < 10; m = re.exec(content)) {
-    const t = m[0].toLowerCase();
-    const kind = t === "url(" ? "url" : t === "@import" ? "import" : "attr";
-    const { value, end } = valueAt(content, m.index + m[0].length, kind);
-    // srcset: comma-separated "url size" candidates.
-    for (const part of t === "srcset" ? value.split(",") : [value])
-      add(hostOfUrl(t === "srcset" ? (part.trim().split(/\s+/)[0] ?? "") : part));
-    re.lastIndex = Math.max(re.lastIndex, end);
+    const name = m[0].toLowerCase();
+    const v = attrValue(content, m.index + m[0].length, name === "style" ? STYLE_MAX : VALUE_MAX);
+    if (!v) continue;
+    if (name === "style") cssHosts(v.value, add);
+    else if (name === "srcset") for (const u of srcsetUrls(v.value)) add(hostOfUrl(u));
+    else add(hostOfUrl(v.value));
+    re.lastIndex = Math.max(re.lastIndex, v.end);
+  }
+  const open = new RegExp(STYLE_OPEN.source, "gi");
+  const close = new RegExp(STYLE_CLOSE.source, "gi");
+  for (let m = open.exec(content); m && hosts.size < 10; m = open.exec(content)) {
+    close.lastIndex = m.index + m[0].length;
+    const c = close.exec(content);
+    const end = c ? c.index : content.length;
+    cssHosts(content.slice(m.index + m[0].length, end), add);
+    open.lastIndex = Math.max(open.lastIndex, end);
   }
   for (const m of content.matchAll(MD_IMAGE)) {
     if (hosts.size >= 10) break;
