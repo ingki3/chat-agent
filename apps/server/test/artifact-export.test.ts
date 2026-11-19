@@ -696,7 +696,7 @@ describe("the DevTools pipe is untrusted: a broken or hostile browser fails its 
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
     const { out, leftovers } = JSON.parse(r.stdout) as {
-      out: Record<string, { result: string; alive: boolean; signal: string | null }>;
+      out: Record<string, { result: string; alive: boolean; signal: string | null; order: string[] }>;
       leftovers: string[];
     };
     expect(leftovers).toEqual([]);
@@ -708,8 +708,13 @@ describe("the DevTools pipe is untrusted: a broken or hostile browser fails its 
     for (const m of modes) {
       expect(out[m]!.result, m).toBe(want[m] ?? "export_failed");
       expect(out[m]!.alive, m).toBe(false);
-      // A broken browser is killed at once (SIGKILL), not asked to close — asked, the stand-in would answer and exit
-      // by itself. (Checked by how it ended rather than by a time, which a loaded machine stretches: #207.)
+      // A broken browser is killed at once — its group's SIGKILL comes before any polite `Browser.close` is tried —
+      // and ends by that signal (asked to close, the stand-in would answer and exit by itself). Checked by order and
+      // signal, not by a time a loaded machine stretches (#207). A good one is asked to close first; one that ended
+      // by itself is not killed.
+      const o = out[m]!.order;
+      if (m === "ok") expect(o[0], m).toBe("close");
+      else if (m !== "close-before-navigate") expect(o[0], `${m}: ${o.join(",")}`).toBe("kill");
       if (m === "ok" || m === "close-before-navigate") expect(out[m]!.signal, m).toBeNull();
       else expect(out[m]!.signal, m).toBe("SIGKILL");
     }
@@ -1523,10 +1528,30 @@ describe("the production launcher's sandbox policy (checked on every platform)",
 });
 
 /** A UDP listener on 127.0.0.1 that counts what arrives (STUN from WebRTC, anything else). */
+/**
+ * A UDP listener on 127.0.0.1 that counts what reaches it. It answers a STUN binding request (#207 review) so that a
+ * document's STUN attempt that does get through ends at once (a server-reflexive candidate) instead of after Chrome's
+ * ~40 s STUN timeout.
+ */
 async function udpListener() {
   const sock = dgram.createSocket("udp4");
   const got = { n: 0 };
-  sock.on("message", () => got.n++);
+  const COOKIE = 0x2112a442;
+  sock.on("message", (m, from) => {
+    got.n++;
+    if (m.length < 20 || m.readUInt16BE(0) !== 0x0001 || m.readUInt32BE(4) !== COOKIE) return;
+    const res = Buffer.alloc(32);
+    res.writeUInt16BE(0x0101, 0); // binding success
+    res.writeUInt16BE(12, 2);
+    res.writeUInt32BE(COOKIE, 4);
+    m.copy(res, 8, 8, 20); // transaction id
+    res.writeUInt16BE(0x0020, 20); // XOR-MAPPED-ADDRESS
+    res.writeUInt16BE(8, 22);
+    res.writeUInt16BE(0x0001, 24); // IPv4
+    res.writeUInt16BE(from.port ^ (COOKIE >>> 16), 26);
+    res.writeUInt32BE((from.address.split(".").reduce((a, b) => a * 256 + Number(b), 0) ^ COOKIE) >>> 0, 28);
+    sock.send(res, from.port, from.address);
+  });
   await new Promise<void>((r) => sock.bind(0, "127.0.0.1", () => r()));
   closers.push(() => new Promise<void>((r) => sock.close(() => r())));
   return { port: sock.address().port, got };
@@ -1534,9 +1559,40 @@ async function udpListener() {
 
 const webrtcHtml = (udpPort: number) => `<!doctype html><p>rtc</p><script>
   const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${udpPort}" }] });
+  // The STUN attempt is over: answered (a server-reflexive candidate), failed (the socket refused or closed), or
+  // gathering finished (no UDP socket at all, as with the policy switch).
+  window.stunOver = false;
+  pc.addEventListener("icecandidate", (e) => {
+    if (!e.candidate || / typ srflx /.test(e.candidate.candidate)) window.stunOver = true;
+  });
+  pc.addEventListener("icecandidateerror", () => (window.stunOver = true));
+  pc.addEventListener("icegatheringstatechange", () => {
+    if (pc.iceGatheringState === "complete") window.stunOver = true;
+  });
   pc.createDataChannel("x");
   pc.createOffer().then((o) => pc.setLocalDescription(o));
 </script>`;
+/**
+ * After the load: waits until the document's STUN attempt is over (`stunOver`: answered, failed, or no UDP at all) and
+ * `also()` holds, so the capture never ends the browser before the document has tried its UDP (#207 review: on a
+ * loaded machine the default settle time could end it first, and "0 received" would prove nothing).
+ */
+const afterStunAttempt =
+  (also: () => boolean = () => true) =>
+  async (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => {
+    const end = Date.now() + 25_000;
+    for (;;) {
+      const r = (await send("Runtime.evaluate", {
+        expression: "window.stunOver === true",
+        returnByValue: true,
+      })) as {
+        result?: { value?: unknown };
+      };
+      if (r.result?.value === true && also()) return;
+      if (Date.now() > end) throw new Error("STUN attempt: timed out");
+      await new Promise((done) => setTimeout(done, 50));
+    }
+  };
 const dropWebrtcPolicy = (a: string[]) => a.filter((x) => !x.startsWith("--force-webrtc-ip-handling-policy"));
 
 describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", () => {
@@ -1549,16 +1605,15 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
         intercept: false,
         proxy: false,
         args: dropWebrtcPolicy,
-        // The control waits for its UDP to arrive (not for the document to send it within the settle time, #207).
-        afterLoad: async () => {
-          await until(() => control.got.n > 0);
-        },
+        // Both documents reach the same stage — their STUN attempt over — before the capture (#207); the control's
+        // UDP has arrived by then.
+        afterLoad: afterStunAttempt(() => control.got.n > 0),
       },
     });
     expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
     expect(control.got.n).toBeGreaterThan(0);
     const prod = await udpListener();
-    const p = renderer();
+    const p = renderer({ test: { afterLoad: afterStunAttempt() } });
     expect((await p.r.render(job("html", webrtcHtml(prod.port), "pdf"))).ok).toBe(true);
     expect(prod.got.n).toBe(0);
     // QUIC (HTTP/3 over UDP) is off too: everything is TCP to the proxy.
@@ -1669,11 +1724,17 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     const l = await udpListener();
     const { r } = renderer({
       launcher: sandboxedLauncher,
-      test: { csp: false, intercept: false, proxy: false, args: dropWebrtcPolicy },
+      test: {
+        csp: false,
+        intercept: false,
+        proxy: false,
+        args: dropWebrtcPolicy,
+        afterLoad: afterStunAttempt(),
+      },
     });
     expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
     expect(l.got.n).toBe(0);
-  }, 30_000);
+  }, 60_000);
 
   it("the renderer's network policy, probed directly: no DNS, no UDP, no TCP but the proxy port", async () => {
     const l = await udpListener();
