@@ -1,4 +1,10 @@
-import { citationMarkers, citationUnits, sentenceSpans, type CitationMarker } from "@agentlee/shared";
+import {
+  citationMarkers,
+  citationUnits,
+  plainTextRanges,
+  sentenceSpans,
+  type CitationMarker,
+} from "@agentlee/shared";
 
 /**
  * 깊이 조사's report (#211 decision 4): the writer's text is kept only where a server-checked citation backs it. The
@@ -60,32 +66,28 @@ export function isTopicLabel(t: string): boolean {
 
 type Block = { text: string; level: number; item: boolean };
 
-/** Where a marker stands inside a link's destination (`[참고](/자료/[1])`): never a citation. */
-function linkDestinations(src: string): { start: number; end: number }[] {
-  const out: { start: number; end: number }[] = [];
-  for (let i = src.indexOf("]("); i !== -1; i = src.indexOf("](", i + 2)) {
-    let depth = 0;
-    let j = i + 1;
-    for (; j < src.length && src[j] !== "\n"; j++) {
-      if (src[j] === "(") depth++;
-      else if (src[j] === ")" && --depth === 0) break;
-    }
-    out.push({ start: i + 2, end: j });
-  }
-  return out;
-}
-
 /**
- * The sentences of one line (`sentenceSpans`), with the markers a sentence ends with kept on it also after a space:
- * `수출이 늘었다. [1] 수입도 늘었다.` — `[1]` cites the first sentence, not the second.
+ * The sentences of `t` (`sentenceSpans`), with the citation markers a sentence ends with kept on it also after a
+ * space: `수출이 늘었다. [1] 수입도 늘었다.` — `[1]` cites the first sentence. Only real markers move (`isMarker`, at
+ * their offset in `t`): a link label opening the next sentence (`[2](https://…)에서 …`) stays where it is.
  */
-function lineSentences(t: string): { start: number; end: number }[] {
+function lineSentences(
+  t: string,
+  isMarker: (start: number, end: number) => boolean,
+): { start: number; end: number }[] {
   const spans = sentenceSpans(t).map((r) => ({ ...r }));
   for (let i = 1; i < spans.length; i++) {
-    const lead = /^(?:[ \t]*\[\d{1,3}\])+/.exec(t.slice(spans[i]!.start, spans[i]!.end));
-    if (!lead) continue;
-    spans[i - 1]!.end = spans[i]!.start + lead[0].length;
-    const rest = t.slice(spans[i]!.start + lead[0].length, spans[i]!.end);
+    let k = spans[i]!.start;
+    for (;;) {
+      const m = /^[ \t]*(\[\d{1,3}\])/.exec(t.slice(k, spans[i]!.end));
+      if (!m) break;
+      const ms = k + m[0].length - m[1]!.length;
+      if (!isMarker(ms, ms + m[1]!.length)) break;
+      k += m[0].length;
+    }
+    if (k === spans[i]!.start) continue;
+    spans[i - 1]!.end = k;
+    const rest = t.slice(k, spans[i]!.end);
     spans[i]!.start = spans[i]!.end - rest.trimStart().length;
   }
   return spans.filter((r) => t.slice(r.start, r.end).trim());
@@ -99,10 +101,12 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
   // eslint-disable-next-line no-control-regex -- NUL marks the held markers below: never one of the writer's own
   const src = text.replace(/\r\n?/g, "\n").replace(/\u0000/g, "");
   const units = citationUnits(src);
-  const links = linkDestinations(src);
-  const markers = citationMarkers(src, units).filter(
-    (m) => !links.some((l) => m.start >= l.start && m.start < l.end),
+  // Written markers only: inside the parser's plain text — never a link's label or address, an autolink, or code.
+  const plain = plainTextRanges(src);
+  const markers = citationMarkers(src, units).filter((m) =>
+    plain.some((r) => m.start >= r.start && m.end <= r.end),
   );
+  const isMarker = (start: number, end: number) => markers.some((m) => m.start === start && m.end === end);
   const ok = (m: CitationMarker) => cites.get(m.n)?.verified === true;
   const within = (start: number, end: number) => markers.filter((m) => m.start >= start && m.end <= end);
   const backed = (start: number, end: number) => within(start, end).some(ok);
@@ -126,11 +130,14 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
   };
   let removed = 0;
   /** The sentences of `[from, to)` that a verified marker backs; the others are counted as removed. */
-  const keptSentences = (from: number, to: number) => {
+  const keptSentences = (from: number, to: number, labels = false) => {
     const kept: string[] = [];
     const t = src.slice(from, to);
-    for (const r of lineSentences(t)) {
+    for (const r of lineSentences(t, (a, b) => isMarker(from + a, from + b))) {
+      // A heading's sentence that only names a topic ("증가 원인") stands without a marker; any other needs one.
+      const words = t.slice(r.start, r.end);
       if (backed(from + r.start, from + r.end)) kept.push(emit(from + r.start, from + r.end));
+      else if (labels && isTopicLabel(words)) kept.push(words.replace(/\[\d{1,3}\]/g, "").trim());
       else removed++;
     }
     return kept;
@@ -152,15 +159,10 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       const h = /^(#{1,6})[ \t]+/.exec(raw);
       const level = h ? h[1]!.length : 7;
       const at = u.start + (h?.[0].length ?? 0);
-      const words = src.slice(at, u.end);
-      // A topic label stays as it is; a heading that states something is checked sentence by sentence.
-      let shown: string;
-      if (isTopicLabel(words)) shown = words.replace(/\[\d{1,3}\]/g, "").trim();
-      else {
-        const kept = keptSentences(at, u.end);
-        if (!kept.length) continue;
-        shown = kept.join(" ");
-      }
+      // Sentence by sentence (`## 수출이 늘었다. 증가 원인`: the first states a fact, the second names a topic).
+      const kept = keptSentences(at, u.end, true);
+      if (!kept.length) continue;
+      const shown = kept.join(" ");
       // The report's own title is the server's: a level-1 heading of the writer's becomes a section.
       blocks.push({
         text: h ? `${level === 1 ? "##" : h[1]} ${shown}` : shown,

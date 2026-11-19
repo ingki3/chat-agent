@@ -466,6 +466,37 @@ function neighbours(text: string, units: Unit[]): void {
 
 export type CitationMarker = TextRange & { n: number };
 
+/**
+ * Where the shown text is plain text (#211 review 3): the ranges of the parser's `text` nodes (per screen block, as
+ * `citationUnits` parses them), outside every link, link reference, image and definition — so a `[n]` there is
+ * written text, not a link's label or address, an autolink (`<https://…/[1]>`) or code.
+ */
+export function plainTextRanges(text: string): TextRange[] {
+  const out: TextRange[] = [];
+  let at = 0;
+  for (const block of splitBlocks(text)) {
+    const base = at;
+    at += block.length;
+    const walk = (n: Nodes) => {
+      if (
+        n.type === "link" ||
+        n.type === "linkReference" ||
+        n.type === "image" ||
+        n.type === "imageReference" ||
+        n.type === "definition" ||
+        n.type === "inlineCode" ||
+        n.type === "code"
+      )
+        return;
+      if (n.type === "text" && startOf(n) !== undefined && endOf(n) !== undefined)
+        out.push({ start: base + startOf(n)!, end: base + endOf(n)! });
+      if ("children" in n) for (const c of n.children) walk(c as Nodes);
+    };
+    walk(parseBlock(block));
+  }
+  return out;
+}
+
 /** `[n]` markers of the answer, outside fenced code. Not `[n](link)` (a markdown link) and not `[^n]`. */
 export function citationMarkers(
   text: string,

@@ -74,7 +74,7 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     // The notes as the writer got them: one JSON object per line inside the notes block.
     const notes = [...t.matchAll(/^\{"note".*\}$/gm)].flatMap((m) => {
       try {
-        return [JSON.parse(m[0]) as { sourceId?: string; fileId?: string; quote: string }];
+        return [JSON.parse(m[0]) as { sourceId?: string; fileId?: string; page?: number; quote: string }];
       } catch {
         return [];
       }
@@ -82,7 +82,11 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     const steps: FakeStep[] = [];
     for (const n of notes)
       if (n.sourceId) steps.push({ call: "cite", input: { sourceId: n.sourceId, snippet: n.quote } });
-      else if (n.fileId) steps.push({ call: "file_cite", input: { fileId: n.fileId, snippet: n.quote } });
+      else if (n.fileId)
+        steps.push({
+          call: "file_cite",
+          input: { fileId: n.fileId, snippet: n.quote, ...(n.page !== undefined ? { page: n.page } : {}) },
+        });
     const first = notes.find((n) => n.sourceId)?.sourceId ?? "none";
     steps.push({ call: "cite", input: { sourceId: first, snippet: RESEARCH_FIXTURE.wrong } });
     const k = notes.length;

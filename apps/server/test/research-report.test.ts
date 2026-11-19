@@ -90,7 +90,7 @@ describe("cleanReport", () => {
       new Map([cite(1)]),
     );
     expect(r.removed).toBe(2);
-    expect(r.body).toBe("## 제목\n\n본문이다[1].");
+    expect(r.body).toBe("## 제목[1]\n\n본문이다[1].");
   });
 
   it("cuts sentences as #202 does: run-together sentences, factual headings, markers in links and code", () => {
@@ -138,6 +138,30 @@ describe("cleanReport", () => {
   it("numbers markers only once the body is final: a cited heading over an emptied section leaves no number", () => {
     const r = cleanReport("## 수출이 32% 늘었다[1]\n\n근거 없는 본문이다.", new Map([cite(1)]));
     expect(r).toEqual({ body: "", removed: 1, numbering: [] });
+  });
+
+  it("decides on parsed markdown: heading sentences, autolinks, link labels, code spans (review 3)", () => {
+    const cites = new Map([cite(1)]);
+    // A heading's first sentence states a fact (removed), its second names a topic (kept).
+    expect(cleanReport("## 수출이 늘었다. 증가 원인\n\n본문이다[1].", cites)).toMatchObject({
+      removed: 1,
+      body: "## 증가 원인\n\n본문이다[1].",
+    });
+    // An autolink's address is no marker.
+    expect(cleanReport("근거 없는 주장 <https://example.org/ref/[1]>.", cites)).toMatchObject({
+      removed: 1,
+      body: "",
+    });
+    // A numbered link label opening the next sentence is not a trailing citation.
+    expect(cleanReport("수출이 늘었다[1]. [2](https://example.org)에서 주장했다.", cites)).toMatchObject({
+      removed: 1,
+      body: "수출이 늘었다[1].",
+    });
+    // A link's syntax shown in inline code does not hide the real marker after it.
+    expect(cleanReport("링크를 설명하는 구문은 `[이름](`이다[1].", cites)).toMatchObject({
+      removed: 0,
+      body: "링크를 설명하는 구문은 `[이름](`이다[1].",
+    });
   });
 
   it("gives the writer each file note's verified place", () => {

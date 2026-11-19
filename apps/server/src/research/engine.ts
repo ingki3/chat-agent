@@ -697,6 +697,9 @@ export class ResearchEngine {
     const state = stateOf(row);
     // A checkpoint from before the approved scopes were kept: restored from the approved plan.
     state.scopes ??= approvedScopes(plan.subQuestions.map((q) => q.scope));
+    // …and every question still to ask (an old checkpoint's gap question too) is held within them.
+    for (const q of state.questions)
+      if (q.status === "waiting" || q.status === "running") q.scope = clampScope(q.scope, state.scopes);
     const files = this.files(row);
     /**
      * Every new step looks again (review 2): the conversation switched to Codex (or the connection gone) while the job
@@ -859,7 +862,8 @@ export class ResearchEngine {
               // The verified place (the check may have found it on another page than the model said), and its page
               // for the writer's `file_cite` (which looks there first).
               ...(placeOf(c.locator) ? { place: placeOf(c.locator) } : {}),
-              ...(pageOf(c.locator) !== undefined ? { page: pageOf(c.locator) } : {}),
+              // The search unit it was found in — what `file_cite`'s `page` names (a TXT unit spans lines: not the line).
+              ...(c.unit !== undefined ? { page: c.unit } : {}),
             };
         }
       } catch {
@@ -988,7 +992,8 @@ export class ResearchEngine {
       verified: true,
       kind: "file",
       title: n.title ?? "첨부 파일",
-      place: n.place ?? (n.page !== undefined ? `${n.page}쪽` : undefined),
+      // The verified place only (`page` is the search unit for `file_cite`, not a page shown to anyone).
+      place: n.place,
       quote: n.quote,
     };
   }
@@ -1178,12 +1183,4 @@ function placeOf(locator: unknown): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** A verified file passage's unit number for `file_cite`'s `page` (a page, a slide, a line …), if it has one. */
-function pageOf(locator: unknown): number | undefined {
-  if (!locator || typeof locator !== "object") return undefined;
-  const l = locator as { page?: unknown; slide?: unknown; line?: unknown };
-  const v = l.page ?? l.slide ?? l.line;
-  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }

@@ -1048,3 +1048,116 @@ describe("깊이 조사: review 1 (#212)", () => {
     expect(tokens.wasRevoked("r")).toBe(true);
   });
 });
+
+/** Uploads a text file to the owner's conversation and waits for its extraction. */
+async function uploadText(
+  t: Awaited<ReturnType<typeof start>>,
+  conversationId: string,
+  name: string,
+  text: string,
+) {
+  const up = await t.app.inject({
+    method: "POST",
+    url: `/api/conversations/${conversationId}/files`,
+    headers: {
+      host: "localhost:3000",
+      origin: "http://localhost:3000",
+      [CSRF_HEADER]: "1",
+      cookie: t.f.cookies.owner,
+      "content-type": "application/octet-stream",
+      "x-file-name": encodeURIComponent(name),
+      "x-upload-id": crypto.randomUUID(),
+    },
+    payload: Buffer.from(text),
+  });
+  expect(up.statusCode, up.body).toBe(201);
+  await t.app.fileExtracts!.idle();
+  return (up.json() as { id: string }).id;
+}
+
+const filesPlan: FakeStep[] = [
+  {
+    text: JSON.stringify({
+      title: "첨부 자료 조사",
+      estimateMinutes: 3,
+      subQuestions: [
+        { question: "첨부 자료의 매출", scope: "files" },
+        { question: "첨부 자료의 증가율", scope: "files" },
+      ],
+    }),
+  },
+];
+
+describe("깊이 조사: review 3 (#212)", () => {
+  it("gives the writer the search unit the passage was verified in, so file_cite lands on the same line", async () => {
+    const LINE = "2026년 3분기 매출은 1,234억 원으로 전년보다 12% 늘었다.";
+    const lines = ["실적 메모", LINE, ...Array.from({ length: 39 }, (_, i) => `채움 줄 ${i + 1}`), LINE];
+    const at: { unit?: number } = {};
+    const script = scripted((x) => {
+      if (x.startsWith(TURN_MARK.plan)) return filesPlan;
+      if (x.startsWith(TURN_MARK.subagent)) {
+        const fileId = /\(fileId: ([^)]+)\)/.exec(x)![1]!;
+        return [
+          { text: `NOTE ${JSON.stringify({ claim: "매출", fileId, page: at.unit, quote: LINE })}\nDONE` },
+        ];
+      }
+      return undefined;
+    });
+    const t = await start({ script, dataDir: path.join(tmp(), "data") });
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const fileId = await uploadText(t, c.id, "실적.txt", lines.join("\n") + "\n");
+    // The unit holding line 42 (a TXT unit spans several lines: its number is not 42).
+    const seg = t.app.fileExtracts!.segments(fileId).find((s) => s.text.includes(`채움 줄 39\n${LINE}`));
+    at.unit = seg!.unit;
+    const { job } = await begin(t, "첨부한 실적 메모를 조사해 줘", { fileIds: [fileId] }, c.id);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const cited = t.db.$client
+      .prepare("select locator from citations where run_id like ? and file_id = ? and status = 'verified'")
+      .all(`research:${job.id}:write%`, fileId) as { locator: string }[];
+    expect(cited.length).toBeGreaterThan(0);
+    for (const r of cited) expect((JSON.parse(r.locator) as { line?: number }).line).toBe(42);
+  });
+
+  it("keeps an old checkpoint's queued gap question within the approved files (no web tool)", async () => {
+    const db = createTestDb();
+    const dataDir = path.join(tmp(), "data");
+    const hold = scripted((x) => {
+      if (x.startsWith(TURN_MARK.plan)) return filesPlan;
+      if (x.startsWith(TURN_MARK.subagent)) return [{ gate: "old-checkpoint" }];
+      return undefined;
+    });
+    const t1 = await start({ db, script: hold, dataDir });
+    const c = t1.app.conversations!.create(t1.f.users.owner.id);
+    const fileId = await uploadText(t1, c.id, "실적.txt", "실적 메모\n매출이 늘었다는 메모다.\n");
+    const { job } = await begin(t1, "첨부한 실적 메모를 조사해 줘", { fileIds: [fileId] }, c.id);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    // As a checkpoint from before the approved scopes were kept: none recorded, a web gap question queued.
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as Record<string, unknown> & { questions: Record<string, unknown>[] };
+    delete state.scopes;
+    state.round = 1;
+    state.reflected = 0;
+    state.questions.push({
+      id: "r1q1",
+      question: "웹에서 업계 전망",
+      scope: "web",
+      round: 1,
+      status: "waiting",
+      sources: 0,
+      found: [],
+      dropped: 0,
+    });
+    db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
+    const t2 = await start({ db, family: false, dataDir });
+    await statusIs(t2.app, job.id, "done", "failed");
+    expect(t2.fake.contexts.flatMap((x) => x.tools).filter((x) => x.startsWith("web_"))).toEqual([]);
+    expect(sourcesOf(db, c.id)).toBe(0);
+  });
+});
