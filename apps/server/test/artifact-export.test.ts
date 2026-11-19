@@ -843,8 +843,18 @@ describe("the browser never outlives its owner (#170)", () => {
     let err = "";
     host.stdout.on("data", (d: Buffer) => (out += d.toString()));
     host.stderr.on("data", (d: Buffer) => (err += d.toString()));
-    const exited = new Promise<void>((r) => host.once("exit", () => r()));
-    expect(await within(30_000, () => out.includes("\n")), err).toBe(true);
+    let hostEnded = false;
+    const exited = new Promise<void>((r) =>
+      host.once("exit", () => {
+        hostEnded = true;
+        r();
+      }),
+    );
+    // Starting the host (tsx) and its browser is setup, not the property: its own budget (#207 — over 30 s on a loaded
+    // machine). The property is the time from the owner's SIGKILL to nothing left (below). A host that ends before it
+    // is ready fails the test at once, with what it said.
+    expect(await within(90_000, () => out.includes("\n") || hostEnded), err).toBe(true);
+    expect(out.includes("\n") ? "" : `host ended before it was ready: ${err}`).toBe("");
     const info = JSON.parse(out.split("\n")[0]!) as {
       host: number;
       pgid: number;
@@ -875,14 +885,14 @@ describe("the browser never outlives its owner (#170)", () => {
 
   it("SIGKILL of the owner: a stand-in browser that ignores pipe EOF is killed, group and folder gone", async () => {
     expect(await orphan("fake")).toBeLessThan(5000);
-  }, 60_000);
+  }, 150_000);
 
   it.skipIf(!BROWSER)(
     "SIGKILL of the owner mid-render: the real headless shell (production launcher, its loop confirmed entered over DevTools) is gone too",
     async () => {
       expect(await orphan("real")).toBeLessThan(5000);
     },
-    60_000,
+    150_000,
   );
 
   /** A renderer over the stand-in browser that never answers; `launches` lists each started watchdog. */
@@ -1891,10 +1901,12 @@ describe("the production launcher's sandbox policy (checked on every platform)",
  */
 async function udpListener() {
   const sock = dgram.createSocket("udp4");
-  const got = { n: 0 };
+  // `ports`: the distinct source ports (one per UDP socket of the sender).
+  const got = { n: 0, ports: new Set<number>() };
   const COOKIE = 0x2112a442;
   sock.on("message", (m, from) => {
     got.n++;
+    got.ports.add(from.port);
     if (m.length < 20 || m.readUInt16BE(0) !== 0x0001 || m.readUInt32BE(4) !== COOKIE) return;
     const res = Buffer.alloc(32);
     res.writeUInt16BE(0x0101, 0); // binding success
@@ -1915,38 +1927,36 @@ async function udpListener() {
 
 const webrtcHtml = (udpPort: number) => `<!doctype html><p>rtc</p><script>
   const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${udpPort}" }] });
-  // The STUN attempt is over: answered (a server-reflexive candidate), failed (the socket refused or closed), or
-  // gathering finished (no UDP socket at all, as with the policy switch).
-  window.stunOver = false;
+  // How far ICE gathering got: finished (the state, or the final null candidate), and how many STUN attempts failed
+  // (a UDP socket refused or closed).
+  window.ice = { complete: false, errors: 0 };
   pc.addEventListener("icecandidate", (e) => {
-    if (!e.candidate || / typ srflx /.test(e.candidate.candidate)) window.stunOver = true;
+    if (!e.candidate) window.ice.complete = true;
   });
-  pc.addEventListener("icecandidateerror", () => (window.stunOver = true));
+  pc.addEventListener("icecandidateerror", () => window.ice.errors++);
   pc.addEventListener("icegatheringstatechange", () => {
-    if (pc.iceGatheringState === "complete") window.stunOver = true;
+    if (pc.iceGatheringState === "complete") window.ice.complete = true;
   });
   pc.createDataChannel("x");
   pc.createOffer().then((o) => pc.setLocalDescription(o));
 </script>`;
+type IceState = { complete: boolean; errors: number };
 /**
- * After the load: waits until the document's STUN attempt is over (`stunOver`: answered, failed, or no UDP at all) and
- * `also()` holds, so the capture never ends the browser before the document has tried its UDP (#207 review: on a
- * loaded machine the default settle time could end it first, and "0 received" would prove nothing).
+ * After the load: waits until `done(ice)` holds for the document's ICE gathering (`window.ice`), so the capture never
+ * ends the browser before the document has tried its UDP (#207 review). Not reached within the deadline (below the
+ * render's own budget) → the render fails, and with it the test.
  */
-const afterStunAttempt =
-  (also: () => boolean = () => true) =>
+const afterIce =
+  (done: (ice: IceState) => boolean) =>
   async (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => {
-    const end = Date.now() + 25_000;
+    const end = Date.now() + 45_000;
     for (;;) {
-      const r = (await send("Runtime.evaluate", {
-        expression: "window.stunOver === true",
-        returnByValue: true,
-      })) as {
-        result?: { value?: unknown };
+      const r = (await send("Runtime.evaluate", { expression: "window.ice", returnByValue: true })) as {
+        result?: { value?: IceState };
       };
-      if (r.result?.value === true && also()) return;
-      if (Date.now() > end) throw new Error("STUN attempt: timed out");
-      await new Promise((done) => setTimeout(done, 50));
+      if (r.result?.value && done(r.result.value)) return;
+      if (Date.now() > end) throw new Error(`ICE: not reached (${JSON.stringify(r.result?.value)})`);
+      await new Promise((d) => setTimeout(d, 50));
     }
   };
 const dropWebrtcPolicy = (a: string[]) => a.filter((x) => !x.startsWith("--force-webrtc-ip-handling-policy"));
@@ -1961,15 +1971,15 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
         intercept: false,
         proxy: false,
         args: dropWebrtcPolicy,
-        // Both documents reach the same stage — their STUN attempt over — before the capture (#207); the control's
-        // UDP has arrived by then.
-        afterLoad: afterStunAttempt(() => control.got.n > 0),
+        // Gathering finished (its STUN answered by the listener) and the UDP arrived, before the capture (#207).
+        afterLoad: afterIce((ice) => ice.complete && control.got.n > 0),
       },
     });
     expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
     expect(control.got.n).toBeGreaterThan(0);
     const prod = await udpListener();
-    const p = renderer({ test: { afterLoad: afterStunAttempt() } });
+    // The same stage: gathering finished (with the policy switch there is no UDP socket to try), then nothing came.
+    const p = renderer({ test: { afterLoad: afterIce((ice) => ice.complete) } });
     expect((await p.r.render(job("html", webrtcHtml(prod.port), "pdf"))).ok).toBe(true);
     expect(prod.got.n).toBe(0);
     // QUIC (HTTP/3 over UDP) is off too: everything is TCP to the proxy.
@@ -2077,6 +2087,25 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
   });
 
   it("WebRTC/UDP with the policy switch dropped and every browser layer off: the kernel stops the UDP", async () => {
+    // How many UDP sockets the document's gathering uses on this machine: the same document, the same switches, no
+    // sandbox — each socket sends its STUN request from its own port. Gathering finishes there.
+    const control = await udpListener();
+    const c = renderer({
+      launcher: unsandboxedLauncher,
+      test: {
+        csp: false,
+        intercept: false,
+        proxy: false,
+        args: dropWebrtcPolicy,
+        afterLoad: afterIce((ice) => ice.complete && control.got.n > 0),
+      },
+    });
+    expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
+    const sockets = control.got.ports.size;
+    expect(sockets).toBeGreaterThan(0);
+    // In the sandbox the kernel refuses the send and Chrome closes each socket (a 701 candidate error each); its
+    // gathering then never reports "complete" (not within 50 s, measured — #207 review). The same stage here is
+    // every one of those sockets having tried and failed: no socket is left that could still send.
     const l = await udpListener();
     const { r } = renderer({
       launcher: sandboxedLauncher,
@@ -2085,7 +2114,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
         intercept: false,
         proxy: false,
         args: dropWebrtcPolicy,
-        afterLoad: afterStunAttempt(),
+        afterLoad: afterIce((ice) => ice.complete || ice.errors >= sockets),
       },
     });
     expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
