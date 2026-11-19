@@ -1,4 +1,5 @@
 import type { PublicLinkCheck } from "@agentlee/shared";
+import { domainToASCII } from "node:url";
 import { knownMasks, type KnownSecrets } from "../secrets/known.js";
 
 const LOCAL_CHAR = /[A-Za-z0-9._%+-]/;
@@ -38,11 +39,40 @@ export function countEmails(text: string): number {
  */
 const PHONE =
   /(?<![\d])(?:\+\d{1,3}[ .-]?)?(?:0\d{1,2}|\d{2,3})[ .-]\d{3,4}[ .-]\d{4}(?![\d])|(?<![\d])01[016789]\d{7,8}(?![\d])/g;
-const HOST_CHAR = /[A-Za-z0-9.-]/;
 /** The longest host name (RFC 1035). */
 const HOST_MAX = 253;
+/** The authority read after `//`: userinfo, host and port together, at most this long (a host alone is ≤ 253). */
+const AUTHORITY_MAX = HOST_MAX + 128;
+/**
+ * What ends an authority: the URL's own delimiters (`/ ? # \`), whitespace other than tab and newline (those the URL
+ * parser removes), and characters that close or separate a URL in HTML, CSS or prose (`" ' < > ( ) , ; [ ] { } |`
+ * and the backtick).
+ */
+/* eslint-disable no-control-regex -- control characters end a URL */
+const AUTHORITY_END =
+  /[/?#\\"'<>(),;[\]{}|`\u0000-\u0008\u000b\u000c\u000e-\u001f\u0020\u007f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/;
+/* eslint-enable no-control-regex */
 /** The page's own placeholder base (relative URLs resolve there): never an external host. */
 export const PAGE_HOST = "artifact.invalid";
+
+/**
+ * The host of the authority `span` (what follows `//`), normalised as the URL parser would: tabs and newlines
+ * removed, userinfo dropped up to the last `@`, a `:port` dropped, then `domainToASCII` — so a Unicode host
+ * (`도서관.example.org`) and its punycode form are the same host — and trailing dots trimmed. Undefined when it is not
+ * a name with a dot and a top-level label of letters or punycode (an IP address, `// comment`, `//todo`).
+ */
+function hostOf(span: string): string | undefined {
+  let a = span.replace(/[\t\r\n]/g, "");
+  const at = a.lastIndexOf("@");
+  if (at !== -1) a = a.slice(at + 1);
+  a = a.replace(/:\d*$/, "");
+  if (!a || a.length > HOST_MAX + 64) return undefined;
+  const ascii = domainToASCII(a).replace(/\.+$/, "");
+  if (!ascii || ascii.length > HOST_MAX) return undefined;
+  const labels = ascii.split(".");
+  if (labels.length < 2 || !labels.every((l) => l.length > 0 && l.length <= 63)) return undefined;
+  return TLD.test(labels[labels.length - 1]!) ? ascii : undefined;
+}
 
 /**
  * External addresses **mentioned** in a text (review #209 round 5 — a deliberate choice): every `https://host`,
@@ -52,29 +82,27 @@ export const PAGE_HOST = "artifact.invalid";
  * kept missing edge cases.) The notice says so: these are the addresses the document names, any of which the public
  * page may load from.
  *
- * One pass: anchored at each `//`, at most `HOST_MAX` characters after it; a host ends at the first non-host
- * character, so no stretch of the text is read twice. A host needs a dot and a top-level label of letters or
- * punycode (`xn--…`) — `// comment` and `//todo` are not hosts. Lower-cased; at most 10.
+ * One pass: anchored at each `//`; extra slashes after it are skipped (`https:///host`), then the authority is read
+ * up to its first delimiter (`AUTHORITY_END`) and at most `AUTHORITY_MAX` characters, and the scan resumes after it —
+ * no stretch of the text is read twice. The host is normalised by `hostOf` (Unicode and punycode alike); the page's
+ * own `artifact.invalid` is left out. At most 10, sorted.
  */
 export function mentionedHosts(...texts: string[]): string[] {
   const hosts = new Set<string>();
-  for (const text of texts)
-    for (let at = text.indexOf("//"); at !== -1 && hosts.size < 10; at = text.indexOf("//", at + 2)) {
-      let r = at + 2;
-      while (r < text.length && r - at - 2 < HOST_MAX && HOST_CHAR.test(text[r]!)) r++;
-      let end = r;
-      while (end > at + 2 && (text[end - 1] === "." || text[end - 1] === "-")) end--;
-      const host = text.slice(at + 2, end).toLowerCase();
-      const labels = host.split(".");
-      if (
-        labels.length >= 2 &&
-        labels.every((l) => l.length > 0 && l.length <= 63) &&
-        TLD.test(labels[labels.length - 1]!) &&
-        host !== PAGE_HOST
-      )
-        hosts.add(host);
-      at = Math.max(at, r - 2);
+  for (const text of texts) {
+    let from = 0;
+    while (hosts.size < 10) {
+      const at = text.indexOf("//", from);
+      if (at === -1) break;
+      let i = at + 2;
+      while (i < text.length && (text[i] === "/" || text[i] === "\\")) i++;
+      const start = i;
+      while (i < text.length && i - start < AUTHORITY_MAX && !AUTHORITY_END.test(text[i]!)) i++;
+      const host = i > start ? hostOf(text.slice(start, i)) : undefined;
+      if (host && host !== PAGE_HOST) hosts.add(host);
+      from = Math.max(i, at + 2);
     }
+  }
   return [...hosts].sort();
 }
 

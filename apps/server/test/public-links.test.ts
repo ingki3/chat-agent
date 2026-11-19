@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { domainToASCII } from "node:url";
 import { eq } from "drizzle-orm";
 import { CSRF_HEADER, PUBLIC_LINK_MAX_ACTIVE, type CreatePublicLinkResponse } from "@agentlee/shared";
 import { buildApp, type BuildOptions } from "../src/app.js";
@@ -855,12 +856,37 @@ describe("review #209 rounds 3–5: external addresses are those the version men
     expect(
       hosts('<a href="mailto:a@b.co">메일</a> <a href="https://artifact.invalid/x">자기 자신</a>'),
     ).toEqual([]);
-    expect(hosts("https://Example.COM./path and http://a-b.example-.")).toEqual([
+    expect(hosts("https://Example.COM./path and http://a-b.example.")).toEqual([
       "a-b.example",
       "example.com",
     ]);
     // At most 10.
     expect(hosts(Array.from({ length: 30 }, (_, i) => `https://h${i}.example/`).join(" "))).toHaveLength(10);
+  });
+
+  it("hosts as the URL parser reads them: Unicode, userinfo, extra slashes, tab/newline, port (review #209 round 6)", () => {
+    // A Unicode host and its punycode form are one host.
+    const LIBRARY = domainToASCII("도서관.example.org");
+    expect(LIBRARY).toMatch(/^xn--[a-z0-9]+\.example\.org$/);
+    expect(hosts("<a href='https://도서관.example.org/a'>")).toEqual([LIBRARY]);
+    expect(hosts(`https://도서관.example.org/a //${LIBRARY.toUpperCase()}/b`)).toEqual([LIBRARY]);
+    expect(hosts("<img src='https://예시.한국/p.png'>")).toEqual(["xn--vv4b11d.xn--3e0b707e"]);
+    // Userinfo up to the last @ is not the host.
+    expect(hosts("https://reader@docs.example.org/x")).toEqual(["docs.example.org"]);
+    expect(hosts("https://a:b@c@evil-is-not.example@docs.example.org/x")).toEqual(["docs.example.org"]);
+    // Extra slashes, a tab or newline inside, a port.
+    expect(hosts("https:///docs.example.org/x")).toEqual(["docs.example.org"]);
+    expect(hosts('<img src="https://docs.exa\nmple.org/p.png">')).toEqual(["docs.example.org"]);
+    expect(hosts("https://docs.example.org:8443/x and //plain.example:80")).toEqual([
+      "docs.example.org",
+      "plain.example",
+    ]);
+    // Ends where the URL ends: quotes, brackets, query, prose punctuation.
+    expect(
+      hosts("url(https://a.example) 'https://b.example' (see //c.example), https://d.example?x"),
+    ).toEqual(["a.example", "b.example", "c.example", "d.example"]);
+    // Not names: an IP address, the page itself.
+    expect(hosts("http://127.0.0.1:3000/x //artifact.invalid/y")).toEqual([]);
   });
 
   it("one linear pass over the largest version (512 KiB), adversarial input too", () => {
@@ -869,6 +895,10 @@ describe("review #209 rounds 3–5: external addresses are those the version men
       slashes: "/".repeat(N),
       pairs: "//".repeat(N / 2),
       longHost: `//${"a".repeat(N - 2)}`,
+      unicodeHost: `//${"도".repeat(N - 2)}`,
+      ats: `//${"@".repeat(N - 2)}`,
+      slashesThenHost: `//${"/".repeat(N - 20)}a.example`,
+      manyAuthorities: "//a.b@c.d:1 ".repeat(N / 12),
       dots: `//${".".repeat(N - 2)}`,
       many: "//a.b ".repeat(N / 6),
       html: `<img src="https://img.example/p.png"><a href="//x.example/y">링크</a>\n`.repeat(
