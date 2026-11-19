@@ -142,6 +142,8 @@ export const PREFS_FIELDS = {
   memoryProposals: "stored",
   memoryApplied: "stored",
   memoryFailed: "stored",
+  researchDone: "stored",
+  researchFailed: "stored",
   rev: "stored",
 } as const satisfies Record<keyof Prefs, "stored">;
 export const prefsFromGet = newer<Prefs>;

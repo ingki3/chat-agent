@@ -26,6 +26,7 @@ import {
   StreamScrubber,
   KNOWN_PLACEHOLDER,
   REDACTED_CONTENT,
+  scanStats,
 } from "../src/secrets/known.js";
 import { TEXT_COLUMNS } from "../src/secrets/columns.js";
 import { StoredRescrub } from "../src/secrets/rescrub.js";
@@ -33,6 +34,7 @@ import { ConnectionStore } from "../src/connections/store.js";
 import { serializeCredential, type ChatgptCredential } from "../src/connections/chatgpt.js";
 import type { PushTarget } from "../src/notifications/service.js";
 import { createFamily, fastifyRoutes } from "./helpers/permission-matrix.js";
+import { meterWork } from "./helpers/work-meter.js";
 
 /**
  * Review round 23: a secret value the server knows never reaches a stored row, the messages API, a live
@@ -714,15 +716,50 @@ describe("round 25: scrubber", () => {
   it("stays linear: a repeated prefix is not compared from every start", () => {
     const reg = new KnownSecrets();
     reg.add("a".repeat(16_384));
-    let t = Date.now();
     expect(scrubKnown("a".repeat(16_384), { registry: reg })).toBe("[숨김]");
-    expect(Date.now() - t).toBeLessThan(100);
     // Text that is only ever a prefix (every start a near-match): linear (KMP), and nothing is masked — no secret
     // is there (round 26: the trailing prose stays).
-    t = Date.now();
     const prose = "a".repeat(16_383) + "b ordinary prose data banana";
     expect(scrubKnown(prose, { registry: reg })).toBe(prose);
-    expect(Date.now() - t).toBeLessThan(100);
+    // Counted, not timed (#213): a secret and a text 8× as long are ~8× the work — compared from every start, 64×.
+    // Twice: the built-ins' work (`meterWork`: every character read, slice, search and iteration), and on its own
+    // the comparisons of the passes that look for a secret the text ends inside (`scanStats.tail`, raw, and
+    // `encodedTail`, base64 and hex — review #217: comparing `text[k + j]` from every start reads no built-in, and
+    // the other passes alone are linear). Each pass runs over at least the secret's length here: a count missing
+    // from one fails its floor.
+    for (const [what, text] of [
+      ["the secret itself", (n: number) => "a".repeat(n)],
+      ["only ever a prefix", (n: number) => "a".repeat(n - 1) + "b ordinary prose data banana"],
+      // The encoded passes on their own repeated prefix (review #217 2차): all of the hex or base64 but its last
+      // characters, then a mismatch — compared from every start, those passes alone are 64×.
+      ["hex, all but its end", (n: number) => Buffer.from("a".repeat(n)).toString("hex").slice(0, -5) + "!"],
+      [
+        "base64, all but its end",
+        (n: number) => Buffer.from("a".repeat(n)).toString("base64").slice(0, -5) + "!",
+      ],
+    ] as const) {
+      const work = (n: number) => {
+        const r = new KnownSecrets();
+        r.add("a".repeat(n));
+        const input = text(n);
+        let out = "";
+        const tail = scanStats.tail;
+        const encoded = scanStats.encodedTail;
+        const w = meterWork(() => {
+          out = scrubKnown(input, { registry: r });
+        });
+        expect(out).toBe(input.length === n ? "[숨김]" : input);
+        return { w, tail: scanStats.tail - tail, encoded: scanStats.encodedTail - encoded };
+      };
+      const small = work(2048);
+      const big = work(16_384);
+      expect(small.w, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(2048);
+      expect(big.w / small.w, `${what}: ${small.w} → ${big.w}`).toBeLessThan(10);
+      for (const k of ["tail", "encoded"] as const) {
+        expect(small[k], `${what}: the ${k} pass was counted`).toBeGreaterThanOrEqual(2047);
+        expect(big[k] / small[k], `${what}: ${k} ${small[k]} → ${big[k]}`).toBeLessThan(10);
+      }
+    }
     const ps = new StreamScrubber(reg);
     expect(
       chunks(prose, rng(26))
@@ -731,7 +768,7 @@ describe("round 25: scrubber", () => {
     ).toBe(prose);
     // The same with escapes all through it (the character search runs): bounded, and still nothing masked.
     const escaped = ("a".repeat(500) + "\\x").repeat(40) + " ordinary prose";
-    t = Date.now();
+    let t = Date.now();
     expect(scrubKnown(escaped, { registry: reg })).toBe(escaped);
     expect(Date.now() - t).toBeLessThan(1000);
     const s = new StreamScrubber(reg);

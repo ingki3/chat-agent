@@ -12,6 +12,8 @@ import {
   type SharedView,
   type SharesResponse,
   type ShareTargetsResponse,
+  RESEARCH_ENDED,
+  type MessagePart,
 } from "@agentlee/shared";
 import type { z } from "zod";
 import { watchAccess } from "../authz/resources.js";
@@ -171,7 +173,12 @@ export function registerShareRoutes(
             const busy = snapshot.some((i) => {
               if (i.itemType !== "message") return false;
               const m = app.conversations!.message(req.params.id, i.itemId);
-              return m?.status === "pending" || m?.status === "streaming";
+              if (m?.status === "pending" || m?.status === "streaming") return true;
+              // A 깊이 조사 card (#211) that has not ended yet changes too (its plan, progress, report): the same.
+              return (m?.parts as MessagePart[] | undefined)?.some(
+                (p) =>
+                  p.type === "research" && !RESEARCH_ENDED.has(app.research?.get(p.jobId)?.status ?? "done"),
+              );
             });
             if (busy) throw new ShareError("share_run_in_progress");
           }

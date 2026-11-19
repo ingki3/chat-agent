@@ -335,6 +335,8 @@ export type WebServiceOptions = {
   worker?: WebWorker;
   /** The egress proxy for page fetches (tests). Default: any public host, ports 80/443. */
   fetchProxy?: Proxy;
+  /** Whether the calling run may still store what it fetched (false once it was stopped). Default: always. */
+  alive?: (scope: ToolScope) => boolean;
 };
 
 export class WebService {
@@ -381,6 +383,8 @@ export class WebService {
     const blocked = carriesSecret([input.query]);
     let last: string = "web_search_unavailable";
     for (const p of this.providers) {
+      // Stopped meanwhile (a fallback after a failed provider): no further provider gets the query.
+      if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
       const r = await p.search(blocked ? SEARCH_DECOY : input.query, max, scope);
       if (!r.ok) {
         // A provider's own job refused by the guard: never tried again elsewhere.
@@ -464,6 +468,7 @@ export class WebService {
     const placeholders = () => taken.map(() => PLACEHOLDER);
     while (taken.length && JSON.stringify(assemble(taken, placeholders())).length > SEARCH_OUTPUT_CHARS)
       taken.pop();
+    if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
     const ids = taken.map((hit) => this.registerHit(provider, hit, scope)?.id ?? null);
     return assemble(taken, ids);
   }
@@ -477,7 +482,7 @@ export class WebService {
     } catch {
       return { ok: false, code: "web_unavailable" };
     }
-    const r = await this.follow(checked.url, proxy);
+    const r = await this.follow(checked.url, proxy, () => !this.opts.alive || this.opts.alive(scope));
     // A hop refused by the egress guard looks like any other refused hop to the model (`web_blocked`); the log
     // keeps `web_secret_blocked` (#113 review: no answer tells a known secret apart).
     if (!r.ok && r.code === "web_secret_blocked") return markBlocked({ ok: false, code: "web_blocked" });
@@ -488,6 +493,8 @@ export class WebService {
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
     const site = s(r.site) ?? siteOf(finalUrl);
+    // Stopped meanwhile (the worker could not be called back): nothing is stored, nothing answered.
+    if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
     const row = this.opts.sources.addPage(scope, {
       url: checked.url.toString(),
       finalUrl: finalUrl.toString(),
@@ -523,12 +530,18 @@ export class WebService {
    * redirect target — gets the server's URL check and the egress guard before it is requested. At most
    * `MAX_REDIRECTS` redirects, all hops within `FETCH_MS`.
    */
-  private async follow(first: URL, proxy: { url: string; port: number }): Promise<WorkerOutput> {
+  private async follow(
+    first: URL,
+    proxy: { url: string; port: number },
+    alive: () => boolean = () => true,
+  ): Promise<WorkerOutput> {
     const deadline = Date.now() + FETCH_MS;
     let url = first;
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       const left = deadline - Date.now();
       if (left <= 0) return { ok: false, code: "web_timeout" };
+      // Stopped meanwhile: no further hop is requested (a redirect to another host never goes out).
+      if (!alive()) return { ok: false, code: "web_not_allowed" };
       const r = await this.worker(
         { op: "fetch", url: url.toString(), redirect: "manual", timeoutMs: left },
         proxy,

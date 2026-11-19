@@ -14,6 +14,8 @@ export const USAGE_PURPOSES = [
   "connection_test",
   /** 기억 정리 (#146, FR-16.6): per target user, on the admin's shared connection. */
   "dreaming",
+  /** 깊이 조사 (#211): every step of a job (plan, sub-researchers, reflection, writer), on the owner's connection. */
+  "research",
 ] as const;
 export const UsagePurpose = z.enum(USAGE_PURPOSES);
 export type UsagePurpose = z.infer<typeof UsagePurpose>;

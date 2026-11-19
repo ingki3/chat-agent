@@ -51,6 +51,7 @@ import {
   isDreamingStatus,
   isDreamingCode,
   isPublicLinkCode,
+  isResearchCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -212,6 +213,14 @@ export const LOG_EVENTS = [
   "dreaming.run_started",
   "dreaming.run_finished",
   "dreaming.alert_sent",
+  // 깊이 조사 (#211): a job's start, approval (how many sub-questions), resume after a restart, stop, end (how many
+  // sources) and failure (a fixed code) — IDs and counts only; never the question, the plan, a note or the report.
+  "research.started",
+  "research.approved",
+  "research.resumed",
+  "research.stopped",
+  "research.done",
+  "research.failed",
   // Public artifact links (#204): created, viewed, turned off, refused (secret) or rate limited — a fixed code and the
   // owner's id only; never the token, a visitor's IP or user agent, or the title.
   "public_link.event",
@@ -350,6 +359,9 @@ const FIELDS = new Map<string, Check>([
   ["dreamingStatus", isDreamingStatus],
   ["dreamingCode", isDreamingCode],
   ["publicLinkCode", isPublicLinkCode],
+  /** 깊이 조사 (#211): the job's id and its fixed failure code. */
+  ["researchId", isId],
+  ["researchCode", isResearchCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -635,6 +647,8 @@ export type LogFields = {
   dreamingStatus?: string;
   dreamingCode?: string;
   publicLinkCode?: string;
+  researchId?: string;
+  researchCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

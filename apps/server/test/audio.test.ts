@@ -63,6 +63,7 @@ import { FakeRuntime } from "../src/runtime/fake.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { pythonRuntime } from "../src/mcp/python.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import { meterWork } from "./helpers/work-meter.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -1284,24 +1285,26 @@ describe("audio_transcribe: merging speaker turns and words (#173)", () => {
     expect(fw[0]!.text.endsWith("\u3000")).toBe(true);
   });
 
-  it("splitLong is linear: 8× the text without spaces takes ~8× the time, not 64× (review 2)", () => {
-    // Best of three each (a loaded machine only ever makes a run slower), and 8× apart so linear (8×) and
-    // quadratic (64×) are far from the line at 24×.
-    const time = (n: number) => {
+  it("splitLong is linear: 8× the text without spaces is ~8× the work, not 64× (review 2, #213)", () => {
+    // Counted, not timed (#213: a time ratio failed under a full run's load). Every regex test, slice and join is
+    // counted at its length (`meterWork`); without a space each window is searched back to its start, so this is
+    // the worst case. Linear: 8×; a search back to the text's start, or the rest copied each window: 50× and more.
+    const max = AUDIO_LIMITS.segmentChars;
+    const work = (n: number) => {
       const seg = [{ speaker: null, start: 0, end: 1, text: "가".repeat(n) }];
-      let best = Infinity;
-      for (let k = 0; k < 3; k++) {
-        const t0 = performance.now();
-        const parts = splitLong(seg, AUDIO_LIMITS.segmentChars);
-        best = Math.min(best, performance.now() - t0);
-        expect(parts.length).toBe(Math.ceil(n / AUDIO_LIMITS.segmentChars));
-      }
-      return best;
+      let parts: ReturnType<typeof splitLong> = [];
+      const w = meterWork(() => {
+        parts = splitLong(seg, max);
+      });
+      expect(parts.length).toBe(Math.ceil(n / max));
+      expect(parts.map((p) => p.text).join("")).toBe(seg[0]!.text);
+      return w;
     };
-    const small = Math.max(time(250_000), 1);
-    const big = time(2_000_000);
-    // Quadratic was 206 ms (0.5M) → 3,427 ms (2M) on the dev Mac.
-    expect(big / small).toBeLessThan(24);
+    const n = 10 * max;
+    const small = work(n);
+    const big = work(8 * n);
+    expect(small, "the meter saw the search").toBeGreaterThanOrEqual(n);
+    expect(big / small, `${small} → ${big}`).toBeLessThan(10);
   });
 
   it("maxSpeakers folds the rarest voices into the nearest kept speaker", () => {

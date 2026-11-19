@@ -469,4 +469,20 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   "public_links.token_hash": HASH,
   "public_links.owner_id": ID,
   "public_links.artifact_id": ID,
+  // 깊이 조사 (#211): the question, the plan, the checkpoint (notes quote page and file text) and the clarifying
+  // exchange are user, model or page text — scrubbed on every write (ResearchStore) and again by the rescrub.
+  "research_jobs.id": ID,
+  "research_jobs.conversation_id": ID,
+  "research_jobs.owner_id": ID,
+  "research_jobs.message_id": ID,
+  "research_jobs.status": ENUM,
+  "research_jobs.backend": ENUM,
+  "research_jobs.question": { write: "ResearchStore.create (scrubKnown)", rescrub: "text" },
+  "research_jobs.file_ids": { exempt: "file ids (JSON array, checked against the conversation's files)" },
+  "research_jobs.clarify_question": { write: "ResearchStore.update (scrubKnown)", rescrub: "text" },
+  "research_jobs.clarify_answer": { write: "ResearchStore.update (scrubKnown)", rescrub: "text" },
+  "research_jobs.plan": { write: "ResearchStore.update (scrubKnownDeep)", rescrub: "deep" },
+  "research_jobs.state": { write: "ResearchStore.update (scrubKnownDeep)", rescrub: "deep" },
+  "research_jobs.result": { exempt: "ids, counts and flags only (JSON)" },
+  "research_jobs.error_code": ENUM,
 };

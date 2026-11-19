@@ -2376,46 +2376,10 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     expect(await read(sandboxedLauncher)).not.toContain("FAMILY-SECRET");
   });
 
-  it("the kernel refuses UDP under the renderer's own profile: a probe's send fails (EPERM), nothing arrives; without the profile it does", async () => {
-    // The authoritative check of the kernel rule (#207 review): one process, one datagram, the errno — no inference
-    // from how Chrome's ICE behaves.
-    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
-    closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
-    const node = fs.realpathSync(process.execPath);
-    const probe = [path.join(FIXTURES, "net-probe.mjs"), "udp"];
-    // Control: the same probe without the profile reaches the listener.
-    const open = await udpListener();
-    const c = spawnSync(node, [...probe, String(open.port)], { encoding: "utf8", timeout: 20_000 });
-    expect(JSON.parse(c.stdout)).toEqual({ udpLocal: "sent" });
-    expect(await within(SETTLE_MS, () => open.got.n > 0)).toBe(true);
-    // Under the renderer's profile (the one its browser runs in): the send itself is refused by the kernel.
-    const shut = await udpListener();
-    const policy = rendererSandbox({
-      browser: node,
-      args: [],
-      env: {},
-      workDir,
-      proxyPort: 9,
-      lockFd: -1,
-      deadlineSec: 30,
-    });
-    const r = await runIsolated({
-      ...policy,
-      command: node,
-      args: [...probe, String(shut.port)],
-      read: [FIXTURES],
-      timeoutMs: 20_000,
-      maxOutputBytes: 100_000,
-    });
-    expect(JSON.parse(r.stdout).udpLocal).toMatch(/^err:(EPERM|EACCES)$/);
-    await new Promise((d) => setTimeout(d, 300));
-    expect(shut.got.n).toBe(0);
-  });
-
   it("smoke (not authoritative): Chrome in the sandbox with the policy switch dropped and every browser layer off sends no UDP", async () => {
     // A secondary check only: Chrome's gathering never reports "complete" here (after the kernel refuses the send it
     // closes each socket — a 701 candidate error — and stays "gathering"; measured over 50 s), so this render cannot
-    // prove that no send came late. The kernel rule itself is checked deterministically by the probe above.
+    // prove that no send came late. The kernel rule itself is checked deterministically by the probe (the next describe).
     const l = await udpListener();
     const { r } = renderer({
       launcher: sandboxedLauncher,
@@ -2468,5 +2432,44 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     expect(out.udpDns).toMatch(/^err:/);
     expect(out.lookup).toMatch(/^err:/);
     expect(l.got.n).toBe(0);
+  });
+});
+
+// No browser needed: runs on every Mac, with or without the headless shell (#207 review).
+describe.skipIf(!darwin)("the macOS kernel layer, probed without a browser", () => {
+  it("the kernel refuses UDP under the renderer's own profile: a probe's send fails (EPERM), nothing arrives; without the profile it does", async () => {
+    // The authoritative check of the kernel rule (#207 review): one process, one datagram, the errno — no inference
+    // from how Chrome's ICE behaves.
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
+    closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
+    const node = fs.realpathSync(process.execPath);
+    const probe = [path.join(FIXTURES, "net-probe.mjs"), "udp"];
+    // Control: the same probe without the profile reaches the listener.
+    const open = await udpListener();
+    const c = spawnSync(node, [...probe, String(open.port)], { encoding: "utf8", timeout: 20_000 });
+    expect(JSON.parse(c.stdout)).toEqual({ udpLocal: "sent" });
+    expect(await within(SETTLE_MS, () => open.got.n > 0)).toBe(true);
+    // Under the renderer's profile (the one its browser runs in): the send itself is refused by the kernel.
+    const shut = await udpListener();
+    const policy = rendererSandbox({
+      browser: node,
+      args: [],
+      env: {},
+      workDir,
+      proxyPort: 9,
+      lockFd: -1,
+      deadlineSec: 30,
+    });
+    const r = await runIsolated({
+      ...policy,
+      command: node,
+      args: [...probe, String(shut.port)],
+      read: [FIXTURES],
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+    });
+    expect(JSON.parse(r.stdout).udpLocal).toMatch(/^err:(EPERM|EACCES)$/);
+    await new Promise((d) => setTimeout(d, 300));
+    expect(shut.got.n).toBe(0);
   });
 });

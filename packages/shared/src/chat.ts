@@ -78,6 +78,11 @@ export type FinanceNotePart = z.infer<typeof FinanceNotePart>;
  * exports or the context handed to another runtime (see `publicParts`).
  */
 export const ReasoningPart = z.object({ type: z.literal("reasoning"), text: z.string() });
+/**
+ * A 깊이 조사 job of the conversation (#211): the card that shows its plan (승인 / 고치기 / 취소), its progress and its
+ * result. Written by the server only; the job itself is read from `GET /api/research/:id`.
+ */
+export const ResearchPart = z.object({ type: z.literal("research"), jobId: z.string() });
 
 export const MessagePart = z.discriminatedUnion("type", [
   TextPart,
@@ -90,6 +95,7 @@ export const MessagePart = z.discriminatedUnion("type", [
   DividerPart,
   FinanceNotePart,
   CitationNotePart,
+  ResearchPart,
   ReasoningPart,
 ]);
 export type MessagePart = z.infer<typeof MessagePart>;
