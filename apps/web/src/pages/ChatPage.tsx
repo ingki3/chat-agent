@@ -31,6 +31,7 @@ import {
   runs,
   settings as settingsApi,
   MEMORY_PROPOSALS_KEY,
+  research,
 } from "../api.js";
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
@@ -304,6 +305,17 @@ export function ChatPage() {
     }),
     [busy, id, start],
   );
+  // 🔬 깊이 조사 (#211): the question becomes a user message and the plan card; the job runs on the server.
+  const startResearch = useCallback(
+    async (text: string, fileIds: string[]) => {
+      await research.start(id, text, fileIds);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["messages", id] }),
+        qc.invalidateQueries({ queryKey: ["files", id] }),
+      ]);
+    },
+    [id, qc],
+  );
   // How many files the conversation already has (the 20-per-conversation limit counts sent ones too).
   const fileList = useQuery({ queryKey: ["files", id], queryFn: () => filesApi.list(id) });
   const conversationId = useCallback(async () => id, [id]);
@@ -537,7 +549,10 @@ export function ChatPage() {
                     m={m}
                     live={live && m.id === live.messageId ? live : null}
                     after={after[m.id]}
-                    canRegenerate={!busy && m.id === lastAssistant?.id}
+                    // A 깊이 조사 card (#211) is not an answer to regenerate.
+                    canRegenerate={
+                      !busy && m.id === lastAssistant?.id && !m.parts.some((p) => p.type === "research")
+                    }
                     onRegenerate={regenerate}
                     onReconnect={reconnect}
                     onStop={stop}
@@ -590,6 +605,17 @@ export function ChatPage() {
         }
         conversation={conversationId}
         existingFiles={fileList.data ?? NO_FILES}
+        research={
+          conv.data?.owned === true
+            ? {
+                start: startResearch,
+                // Claude conversations only (#211 decision 3).
+                ...((chatSettings?.runtime ?? "claude-code") !== "claude-code"
+                  ? { disabled: "깊이 조사는 Claude 대화에서만 쓸 수 있어요" }
+                  : {}),
+              }
+            : undefined
+        }
       />
     </>
   );
@@ -931,6 +957,11 @@ function Composer(props: {
   conversation: () => Promise<string>;
   /** The conversation's files on the server (unsent ones are shown as chips). */
   existingFiles: readonly UploadedFile[];
+  /**
+   * 🔬 깊이 조사 (#211): the composer's text (and files) as a research question. `disabled`: the reason it cannot be
+   * used here (a Codex conversation) — shown on the button. Absent: no button (a shared reader, the new-chat screen).
+   */
+  research?: { start: (text: string, fileIds: string[]) => Promise<unknown>; disabled?: string } | undefined;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -952,6 +983,22 @@ function Composer(props: {
       // Files that are gone (deleted elsewhere, or already sent): drop their chips so the next send works.
       if (e instanceof ApiError && e.code === "invalid_attachment")
         void attach.reconcile().catch(() => undefined);
+    } finally {
+      setSending(false);
+    }
+  };
+  /** Sends the composer's text and files as a 깊이 조사 question (never queued: a plan card comes first). */
+  const startResearch = async () => {
+    if (!props.research || !text.trim()) return;
+    setSending(true);
+    setError(null);
+    const fileIds = [...attach.ready];
+    try {
+      await props.research.start(text.trim(), fileIds);
+      setText("");
+      attach.sent(fileIds);
+    } catch (e) {
+      setError(errorText(e));
     } finally {
       setSending(false);
     }
@@ -1069,6 +1116,25 @@ function Composer(props: {
           )}
           <span className="grow" />
           {props.chip}
+          {props.research && !stop && (
+            <button
+              type="button"
+              className="small research-start"
+              data-testid="research-start"
+              disabled={
+                !!props.research.disabled || !text.trim() || sending || props.busy || attach.uploading
+              }
+              title={
+                props.research.disabled ??
+                "입력한 질문을 깊이 조사해요: 계획을 먼저 보여 드리고, 승인하면 여러 출처를 찾아 검증한 보고서를 만들어요 (최대 30분)"
+              }
+              aria-label={props.research.disabled ? `깊이 조사 — ${props.research.disabled}` : "깊이 조사"}
+              onClick={() => void startResearch()}
+            >
+              <span aria-hidden>🔬</span>
+              <span className="research-label"> 깊이 조사</span>
+            </button>
+          )}
           {stop ? (
             <button type="button" onClick={stop}>
               ■ 중지

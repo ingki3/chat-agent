@@ -28,6 +28,7 @@ export const PURPOSE_LABEL: Record<UsagePurpose, string> = {
   summary: "요약",
   connection_test: "연결 테스트",
   dreaming: "기억 정리",
+  research: "깊이 조사",
 };
 const NO_CONNECTION = "연결 없음";
 const GONE_CONNECTION = "삭제된 연결";

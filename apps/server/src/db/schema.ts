@@ -400,6 +400,9 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   memoryApplied: integer("memory_applied", { mode: "boolean" }).notNull().default(true),
   /** 기억 정리 실패 (#188): the user's own round failed at its last attempt. */
   memoryFailed: integer("memory_failed", { mode: "boolean" }).notNull().default(true),
+  /** 깊이 조사 (#211): "완료" and "실패·중지" notifications — the user may turn each off. */
+  researchDone: integer("research_done", { mode: "boolean" }).notNull().default(true),
+  researchFailed: integer("research_failed", { mode: "boolean" }).notNull().default(true),
   /** Revision (#188 review 9): +1 on every write; every response carries it. */
   rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
@@ -550,7 +553,7 @@ export const usageRecords = sqliteTable(
     model: text("model").notNull(),
     connectionId: text("connection_id"),
     purpose: text("purpose", {
-      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming"],
+      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming", "research"],
     }).notNull(),
     /** All input tokens, cached ones included (as the adapter contract reports them). */
     inputTokens: integer("input_tokens"),
@@ -1722,5 +1725,63 @@ export const publicLinks = sqliteTable(
   (t) => [
     index("public_links_owner_idx").on(t.ownerId, t.createdAt),
     index("public_links_artifact_idx").on(t.artifactId),
+  ],
+);
+
+/**
+ * 깊이 조사 jobs (#211, PRD FR-17, docs/decisions/deep-research.md): one per research card of a conversation, owned by
+ * the conversation's owner. The checkpoint is this row — the plan, the stage, each sub-question's state and its
+ * verified notes (`state`, JSON) — written after every step, so a restart resumes a job from its last finished step (or
+ * fails it when its 30-minute deadline has passed). `deadline_at` is wall-clock: time the server was down counts.
+ * `active_ms`: active time used before approval (planning), taken off the cap.
+ */
+export const researchJobs = sqliteTable(
+  "research_jobs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The assistant message holding the card (`research` part). */
+    messageId: text("message_id").notNull(),
+    status: text("status", {
+      enum: [
+        "planning",
+        "clarifying",
+        "awaiting_approval",
+        "researching",
+        "writing",
+        "done",
+        "failed",
+        "stopped",
+        "cancelled",
+      ],
+    }).notNull(),
+    backend: text("backend").notNull().default("claude"),
+    question: text("question").notNull(),
+    /** The ids of the files sent with the question (the job's attachments). JSON array. */
+    fileIds: text("file_ids").notNull().default("[]"),
+    clarifyQuestion: text("clarify_question"),
+    clarifyAnswer: text("clarify_answer"),
+    /** JSON `ResearchPlan`, once written. */
+    plan: text("plan"),
+    /** JSON checkpoint (research/store.ts `JobState`). */
+    state: text("state").notNull().default("{}"),
+    /** JSON `ResearchResult`, once done. */
+    result: text("result"),
+    errorCode: text("error_code"),
+    activeMs: integer("active_ms").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    approvedAt: integer("approved_at"),
+    deadlineAt: integer("deadline_at"),
+    endedAt: integer("ended_at"),
+  },
+  (t) => [
+    index("research_jobs_conversation_idx").on(t.conversationId, t.createdAt),
+    index("research_jobs_owner_status_idx").on(t.ownerId, t.status),
   ],
 );

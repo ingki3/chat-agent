@@ -1,0 +1,62 @@
+/* 깊이 조사 card (#211) */
+.research-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--claude);
+  border-radius: 10px;
+  background: var(--card);
+  padding: 10px 12px;
+  margin: 6px 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.research-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+.research-plan,
+.research-questions {
+  margin: 6px 0;
+  padding-left: 1.4em;
+}
+.research-questions {
+  list-style: none;
+  padding-left: 0;
+}
+.research-plan li,
+.research-questions li {
+  margin: 3px 0;
+}
+.research-plan.edit li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.research-plan.edit input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+.research-actions,
+.research-clarify {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+}
+.research-clarify input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+/* The composer's button: the icon only on a narrow screen (its accessible name stays "깊이 조사"). */
+.research-start {
+  white-space: nowrap;
+  flex: none;
+}
+@media (max-width: 640px) {
+  .research-start .research-label {
+    display: none;
+  }
+}

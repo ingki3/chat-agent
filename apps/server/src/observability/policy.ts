@@ -1,5 +1,6 @@
 import os from "node:os";
 import {
+  ResearchErrorCode,
   DOC_CODES,
   DOC_KINDS,
   DOC_REFUSED_KINDS,
@@ -324,6 +325,8 @@ export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
 export const isDreamingTrigger = member(set(DreamingTrigger.options));
 export const isDreamingStatus = member(set(DreamingRunStatus.options));
 export const isDreamingCode = member(set(Object.keys(DREAMING_CODE_LABEL)));
+/** 깊이 조사 (#211): a job's fixed failure code (or `stopped`) — never a question, a plan or a note. */
+export const isResearchCode = member(set([...ResearchErrorCode.options, "stopped"]));
 /** Public artifact links (#204): what happened, from a fixed set — never the token, an IP or a title. */
 export const PUBLIC_LINK_CODES = set([
   "public_link_created",

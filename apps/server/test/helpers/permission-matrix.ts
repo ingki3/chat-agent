@@ -231,6 +231,31 @@ function share(revoked = false) {
   };
 }
 
+/**
+ * A 깊이 조사 job (#211) of `owner`'s conversation shared with `shared` — its card message in the projection. Ended
+ * (cancelled), so the owner's actions answer 409 past the resource check and the event stream closes at once.
+ */
+function researchJob(f: Family) {
+  const fx = conversation(f);
+  const id = crypto.randomUUID();
+  const card = f.app.conversations!.append(fx.id, {
+    role: "assistant",
+    parts: [{ type: "research", jobId: id }],
+  });
+  const store = f.app.research!.store;
+  store.create({
+    id,
+    conversationId: fx.id,
+    ownerId: f.users.owner.id,
+    messageId: card.id,
+    question: "질문",
+    fileIds: [],
+    backend: "claude",
+  });
+  store.update(id, { status: "cancelled", endedAt: Date.now() });
+  return id;
+}
+
 /** A live share (#29) of `owner`'s schedule-result conversation (#56) with `shared` — "새 결과 알림 받기" (#52). */
 function scheduleShare(f: Family) {
   const store = f.app.conversations!;
@@ -283,6 +308,32 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /api/runs/:id/events", expect: READ, fixture: run },
   { route: "POST /api/runs/:id/interrupt", expect: OWNER_ONLY, fixture: run },
   { route: "GET /api/conversations/:id/active-run", expect: READ, fixture: conversation },
+  // 깊이 조사 (#211): the owner starts and acts; a shared viewer reads the card (its message is in the projection).
+  // No runtime in the matrix app: the owner's start is refused past the resource check (no_runtime); the fixture job
+  // has ended, so the owner's actions are refused by its state (research_state) — everyone else by the resource check.
+  {
+    route: "POST /api/conversations/:id/research",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: conversation,
+    body: { text: "조사해 줘" },
+    errors: { owner: "no_runtime", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "GET /api/research/:id", expect: READ, fixture: researchJob },
+  { route: "GET /api/research/:id/events", expect: READ, fixture: researchJob },
+  ...(["approve", "cancel", "stop"] as const).map((a) => ({
+    route: `POST /api/research/:id/${a}`,
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: researchJob,
+    body: {},
+    errors: { owner: "research_state", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  })),
+  {
+    route: "POST /api/research/:id/clarify",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: researchJob,
+    body: { answer: "이번 달" },
+    errors: { owner: "research_state", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
   { route: "GET /api/conversations/:id", expect: READ, fixture: conversation },
   {
     route: "PATCH /api/conversations/:id",
