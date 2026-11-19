@@ -374,14 +374,16 @@ export const unsandboxedLauncher: Launcher = (s) => {
 
 /**
  * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
- * render's folder and lock, and whether the group has been signalled. `killLiveRenders` is the last word on shutdown
- * (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ * render's folder and lock, whether the group has been signalled, and whether it is confirmed dead. `killLiveRenders`
+ * is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests'
+ * `afterAll`).
  */
-const liveRenders = new Map<number, { dir: RenderDir; signalled: boolean }>();
+type LiveRender = { dir: RenderDir; signalled: boolean; dead: boolean };
+const liveRenders = new Map<number, LiveRender>();
 
 /** Records a running render; the returned function forgets it (call it once the watchdog has exited). */
 export function trackRender(pgid: number, dir: RenderDir): () => void {
-  const entry = { dir, signalled: false };
+  const entry: LiveRender = { dir, signalled: false, dead: false };
   liveRenders.set(pgid, entry);
   return () => {
     if (liveRenders.get(pgid) === entry) liveRenders.delete(pgid);
@@ -389,30 +391,71 @@ export function trackRender(pgid: number, dir: RenderDir): () => void {
 }
 
 /**
- * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**: the render's limits,
- * the watchdog's abnormal end and shutdown all come here, and whichever is first sends the one signal. An untracked
- * group (already gone, or forgotten) is never signalled.
+ * The group kill is repeated (#215): on macOS a SIGKILL to the group that lands while the watchdog is inside `fork`
+ * kills the watchdog but can miss the child being created — that child then execs the browser and lives on (PPID 1,
+ * still in the group). So after the first SIGKILL the group is signalled again every `RESIGNAL_EVERY_MS` for as long
+ * as the previous signal still reached a process (`kill` succeeded: a member was there, so the id is still this
+ * group's — a group id is not reused while a member has it), until one is refused (confirmed dead, below) or
+ * `RESIGNAL_FOR_MS` has passed.
+ */
+export const RESIGNAL_EVERY_MS = 20;
+export const RESIGNAL_FOR_MS = 5000;
+/** Shutdown (`killLiveRenders`, synchronous: an `exit` hook runs no timer) repeats it in place for at most this long. */
+export const SHUTDOWN_CONFIRM_MS = 300;
+
+/**
+ * One SIGKILL to the group, unless it is confirmed dead. True when it reached a process; false — and confirmed dead
+ * from then on, never signalled again — once `kill` refuses: ESRCH (no process has the id), or EPERM (macOS: only
+ * zombies are left, e.g. the watchdog not yet reaped). A refused signal reached nobody.
+ */
+function killGroup(pgid: number, entry: LiveRender): boolean {
+  if (entry.dead) return false;
+  try {
+    process.kill(-pgid, "SIGKILL");
+    return true;
+  } catch {
+    entry.dead = true;
+    return false;
+  }
+}
+
+/**
+ * SIGKILLs a tracked render's process group (the watchdog's, the browser in it). The render's limits, the watchdog's
+ * abnormal end and shutdown all come here; whichever is first starts the one kill sequence (`signalled`), the others
+ * do nothing. The sequence repeats the signal while it still reaches a process (`RESIGNAL_EVERY_MS`, #215) and stops
+ * at the first refusal — a group confirmed dead is never signalled again, even after the render is forgotten. An
+ * untracked group (already gone, or forgotten) is never signalled.
  */
 export function signalRender(pgid: number) {
   const entry = liveRenders.get(pgid);
   if (!entry || entry.signalled) return;
   entry.signalled = true;
-  try {
-    process.kill(-pgid, "SIGKILL");
-  } catch {
-    // already gone
-  }
+  if (!killGroup(pgid, entry)) return;
+  const until = performance.now() + RESIGNAL_FOR_MS;
+  const again = () => {
+    if (killGroup(pgid, entry) && performance.now() < until) setTimeout(again, RESIGNAL_EVERY_MS).unref();
+  };
+  setTimeout(again, RESIGNAL_EVERY_MS).unref();
 }
 
-/** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
+const pause = new Int32Array(new SharedArrayBuffer(4));
+/**
+ * SIGKILLs every live render's process group, repeats that in place until each is confirmed dead (at most
+ * `SHUTDOWN_CONFIRM_MS`; a group still answering then keeps its timer sequence while the process lives), and removes
+ * the folders (synchronous: safe in an `exit` hook).
+ */
 export function killLiveRenders(): number {
-  const n = liveRenders.size;
-  for (const [pgid, { dir }] of [...liveRenders]) {
-    signalRender(pgid);
-    removeRenderDir(dir);
+  const all = [...liveRenders];
+  for (const [pgid] of all) signalRender(pgid);
+  const until = performance.now() + SHUTDOWN_CONFIRM_MS;
+  let left = all.filter(([, e]) => !e.dead);
+  while (left.length && performance.now() < until) {
+    Atomics.wait(pause, 0, 0, 5);
+    left = left.filter(([pgid, e]) => killGroup(pgid, e));
   }
+  for (const [, { dir }] of all) removeRenderDir(dir);
   liveRenders.clear();
-  return n;
+  return all.length;
 }
 
 /** How many renders are tracked (tests). */

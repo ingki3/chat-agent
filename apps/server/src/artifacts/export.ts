@@ -382,8 +382,9 @@ export class Renderer {
       // interrupted) may leave the browser behind in the group: the server signals the group at that moment — the first
       // it learns of the end, never after seeing the group gone — unless it already killed it itself (its own limits,
       // or `killLiveRenders`). Then it forgets it. The folder goes in this render's `finally`.
-      // The group is signalled at most once per render (`signalRender`: the state lives on the tracked entry) — by its
-      // limits here, by `killLiveRenders`, or on the watchdog's abnormal end, whichever comes first.
+      // One kill sequence per render (`signalRender`: the state lives on the tracked entry) — started by its limits
+      // here, by `killLiveRenders`, or on the watchdog's abnormal end, whichever comes first. It repeats the SIGKILL while
+      // the group still has a process (a browser forked as the first signal landed, #215) and never after it is gone.
       if (!worker && pid) {
         const untrack = trackRender(pid, render!);
         child.once("exit", (code) => {

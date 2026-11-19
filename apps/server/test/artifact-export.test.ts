@@ -804,6 +804,24 @@ function pidFile() {
   return { f, pid: () => (fs.existsSync(f) ? Number(fs.readFileSync(f, "utf8")) || undefined : undefined) };
 }
 
+/**
+ * The SIGKILLs a spied `process.kill` sent to group `pgid`, as outcomes: one kill sequence (#215) — every signal but the
+ * last reached a process (`return`), so none followed a refused one (the group confirmed dead is never signalled again).
+ * Returns how many there were (at least one).
+ */
+function oneSequence(mock: { calls: unknown[][]; results: { type: string }[] }, pgid: number) {
+  const outcomes = mock.calls
+    .map((c, i) => ({ c, type: mock.results[i]!.type }))
+    .filter(({ c }) => c[0] === -pgid && c[1] === "SIGKILL")
+    .map(({ type }) => type);
+  expect(outcomes.length).toBeGreaterThanOrEqual(1);
+  expect(
+    outcomes.slice(0, -1).every((t) => t === "return"),
+    outcomes.join(","),
+  ).toBe(true);
+  return outcomes.length;
+}
+
 describe("the browser never outlives its owner (#170)", () => {
   /**
    * A host process (`orphan-host.ts`, its own process group, bounded) starts a render that never ends; once it
@@ -942,12 +960,10 @@ describe("the browser never outlives its owner (#170)", () => {
     for (let i = 0; i < 5; i++) await rightAfterSpawn((l) => process.kill(l.child.pid!, "SIGKILL"));
   }, 60_000);
 
-  it("the group is signalled at most once per render: shutdown right after the spawn, or the time limit", async () => {
+  it("one kill sequence per render, never past its group's end: shutdown right after the spawn, or the time limit", async () => {
     const kill = vi.spyOn(process, "kill");
     try {
-      const signals = (pgid: number) =>
-        kill.mock.calls.filter(([p, sig]) => p === -pgid && sig === "SIGKILL").length;
-      // Shut down right after the spawn: `killLiveRenders`, then the render's own failure path — one signal.
+      // Shut down right after the spawn: `killLiveRenders`, then the render's own failure path — one sequence.
       let first: Launched | undefined;
       const r1 = new Renderer({
         browser: process.execPath,
@@ -962,8 +978,9 @@ describe("the browser never outlives its owner (#170)", () => {
       closers.push(() => r1.close());
       expect((await r1.render(job("markdown", "x", "pdf"))).ok).toBe(false);
       expect(await gone(first!.child.pid!)).toBe(true);
-      expect(signals(first!.child.pid!)).toBe(1);
-      // The time limit: its kill, then the failed render's kill — one signal.
+      await new Promise((done) => setTimeout(done, 200));
+      oneSequence(kill.mock, first!.child.pid!);
+      // The time limit: its kill, then the failed render's kill — one sequence.
       let second: Launched | undefined;
       const r2 = new Renderer({
         browser: process.execPath,
@@ -976,13 +993,13 @@ describe("the browser never outlives its owner (#170)", () => {
       expect(await r2.render(job("markdown", "x", "pdf"))).toEqual({ ok: false, code: "export_timeout" });
       expect(await gone(second!.child.pid!)).toBe(true);
       await new Promise((done) => setTimeout(done, 200));
-      expect(signals(second!.child.pid!)).toBe(1);
+      oneSequence(kill.mock, second!.child.pid!);
     } finally {
       kill.mockRestore();
     }
   }, 30_000);
 
-  it("the group is signalled once even when the time limit and shutdown overlap", async () => {
+  it("one kill sequence even when the time limit and shutdown overlap", async () => {
     let l: Launched | undefined;
     const r = new Renderer({
       browser: process.execPath,
@@ -1006,12 +1023,77 @@ describe("the browser never outlives its owner (#170)", () => {
     try {
       expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
       expect(overlapped).toBe(true);
-      expect(kill.mock.calls.filter(([p, sig]) => p === -l!.child.pid! && sig === "SIGKILL")).toHaveLength(1);
+      expect(await gone(l!.child.pid!)).toBe(true);
+      await new Promise((done) => setTimeout(done, 200));
+      oneSequence(kill.mock, l!.child.pid!);
     } finally {
       kill.mockRestore();
     }
-    expect(await gone(l!.child.pid!)).toBe(true);
   }, 30_000);
+
+  /**
+   * #215: on macOS a group SIGKILL that lands while the watchdog is inside `fork` kills the watchdog and can miss the
+   * child being made, which then execs the browser (PPID 1, same group). That kernel window cannot be hit on demand,
+   * so the first group signal is made to miss exactly that way — it reaches the watchdog only — once the browser runs.
+   * The repeated signal must still leave the group empty and the browser dead; nothing is signalled after that.
+   */
+  async function missedByTheFirstSignal(trigger: "shutdown" | "memory") {
+    const p = pidFile();
+    let pgid: number | undefined;
+    let browserAfterMiss: boolean | undefined;
+    const real = process.kill.bind(process);
+    const kill = vi.spyOn(process, "kill").mockImplementation((target: number, sig?: string | number) => {
+      if (browserAfterMiss === undefined && pgid && target === -pgid && sig === "SIGKILL") {
+        const res = real(pgid, "SIGKILL"); // the watchdog only: the browser is missed
+        browserAfterMiss = alive(p.pid()!);
+        return res;
+      }
+      return real(target, sig);
+    });
+    try {
+      let running = false;
+      const r = new Renderer({
+        browser: process.execPath,
+        launcher: (s) => {
+          const l = track(unsandboxedLauncher({ ...s, env: { ...s.env, PIDFILE: p.f } }));
+          pgid = l.child.pid!;
+          return l;
+        },
+        egress: spyEgress().egress,
+        limits: { timeoutMs: 60_000 },
+        test: {
+          args: FAKE,
+          // The memory limit, once the browser runs.
+          probe: async () => [{ pid: 1, rss: trigger === "memory" && running ? 1 << 30 : 1 }],
+        },
+      });
+      closers.push(() => r.close());
+      const pending = r.render(job("markdown", "x", "pdf"));
+      expect(await within(SETTLE_MS, () => !!p.pid() && alive(p.pid()!))).toBe(true);
+      running = true;
+      if (trigger === "shutdown") {
+        closeRenderers();
+        // Already repeated in place, before any timer could run (an `exit` hook runs none).
+        expect(oneSequence(kill.mock, pgid!)).toBeGreaterThanOrEqual(2);
+      }
+      expect((await pending).ok).toBe(false);
+      expect(browserAfterMiss).toBe(true);
+      expect(await within(SETTLE_MS, () => !alive(p.pid()!)), `browser ${p.pid()}`).toBe(true);
+      expect(await gone(pgid!)).toBe(true);
+      await new Promise((done) => setTimeout(done, 200));
+      expect(oneSequence(kill.mock, pgid!)).toBeGreaterThanOrEqual(2);
+    } finally {
+      kill.mockRestore();
+    }
+  }
+
+  it("a browser the group signal missed (forked as it landed, #215) is killed by the repeated signal: shutdown", async () => {
+    await missedByTheFirstSignal("shutdown");
+  }, 60_000);
+
+  it("a browser the group signal missed (forked as it landed, #215) is killed by the repeated signal: a limit", async () => {
+    await missedByTheFirstSignal("memory");
+  }, 60_000);
 
   it("a render that fails while its folder is prepared (e.g. a full disk) keeps no descriptor and no folder", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-prep-")));
