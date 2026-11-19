@@ -51,10 +51,13 @@ const LINE_PREFIX =
  * ("수출이 50% 늘었다") states a fact and needs a verified marker like a sentence.
  */
 export function isTopicLabel(t: string): boolean {
+  // Through closing quotes and brackets (`“수출이 줄었다.”`, `(수출이 줄었다.)`): what ends inside them ends a sentence.
   const s = t
     .replace(/\[\d{1,3}\]/g, "")
     .replace(/\*\*|__|[*_`]/g, "")
-    .trim();
+    .trim()
+    .replace(/[\s)\]}"'”’」』〉》]+$/u, "")
+    .replace(/^[\s([{"'“‘「『〈《]+/u, "");
   return (
     s.length > 0 &&
     Array.from(s).length <= 40 &&
@@ -65,6 +68,28 @@ export function isTopicLabel(t: string): boolean {
 }
 
 type Block = { text: string; level: number; item: boolean };
+
+/** Where a heading unit's words are (offsets in `raw`), its level, and whether it is a bold-only paragraph. */
+function headingContent(raw: string): { start: number; end: number; level: number; bold: boolean } {
+  const atx = /^[ \t]*(#{1,6})(?:[ \t]+|$)/.exec(raw);
+  if (atx) {
+    const close = /[ \t]+#+[ \t]*$|[ \t]*$/.exec(raw)!;
+    return {
+      start: atx[0].length,
+      end: Math.max(atx[0].length, close.index),
+      level: atx[1]!.length,
+      bold: false,
+    };
+  }
+  const setext = /\n[ \t]*(=+|-+)[ \t]*$/.exec(raw);
+  if (setext) return { start: 0, end: setext.index, level: setext[1]![0] === "=" ? 1 : 2, bold: false };
+  const bold = /^[ \t]*(\*\*|__)([\s\S]*?)\1[ \t]*$/.exec(raw);
+  if (bold) {
+    const start = raw.indexOf(bold[1]!) + 2;
+    return { start, end: start + bold[2]!.length, level: 7, bold: true };
+  }
+  return { start: 0, end: raw.length, level: 7, bold: false };
+}
 
 /**
  * The sentences of `t` (`sentenceSpans`), with the citation markers a sentence ends with kept on it also after a
@@ -90,7 +115,33 @@ function lineSentences(
     const rest = t.slice(k, spans[i]!.end);
     spans[i]!.start = spans[i]!.end - rest.trimStart().length;
   }
-  return spans.filter((r) => t.slice(r.start, r.end).trim());
+  // `늘었다[1].[2](https://…)에서 …`: `sentenceSpans` takes `[2]` along with the period; a `[n]` there that is no real
+  // marker (a link label) starts the next sentence instead (this path only — #202's own spans are unchanged).
+  const out: { start: number; end: number }[] = [];
+  for (let i = 0; i < spans.length; i++) {
+    const r = spans[i]!;
+    let cut: number | undefined;
+    const re = /[.!?。！？．][)\]"'”’」』*_~]*((?:\[\d{1,3}\])+)/gu;
+    for (const m of t.slice(r.start, r.end).matchAll(re)) {
+      let k = r.start + m.index + m[0].length - m[1]!.length;
+      for (const one of m[1]!.match(/\[\d{1,3}\]/g)!) {
+        if (!isMarker(k, k + one.length)) {
+          cut = k;
+          break;
+        }
+        k += one.length;
+      }
+      if (cut !== undefined) break;
+    }
+    const next = spans[i + 1];
+    if (cut === undefined || cut <= r.start) out.push(r);
+    // The label and what follows it (the link's address, the rest of the sentence) are one sentence.
+    else if (next && /^\S/.test(t.slice(r.end, next.start + 1))) {
+      out.push({ start: r.start, end: cut });
+      next.start = cut;
+    } else out.push({ start: r.start, end: cut }, { start: cut, end: r.end });
+  }
+  return out.filter((r) => t.slice(r.start, r.end).trim());
 }
 
 /** A kept marker, held as its old number until the body is final (`\u0000n\u0000`). */
@@ -156,19 +207,16 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       continue;
     }
     if (u.kind === "heading") {
-      const h = /^(#{1,6})[ \t]+/.exec(raw);
-      const level = h ? h[1]!.length : 7;
-      const at = u.start + (h?.[0].length ?? 0);
-      // Sentence by sentence (`## 수출이 늘었다. 증가 원인`: the first states a fact, the second names a topic).
-      const kept = keptSentences(at, u.end, true);
+      // The heading's own words, whatever its form — ATX (`## …`, closing `#`s dropped), setext (a `===` / `---` line
+      // under it) or a paragraph of bold text only (`**…**`) — checked sentence by sentence (`## 수출이 늘었다. 증가
+      // 원인`: the first states a fact, the second names a topic) and written again in one form.
+      const h = headingContent(raw);
+      const kept = keptSentences(u.start + h.start, u.start + h.end, true);
       if (!kept.length) continue;
       const shown = kept.join(" ");
       // The report's own title is the server's: a level-1 heading of the writer's becomes a section.
-      blocks.push({
-        text: h ? `${level === 1 ? "##" : h[1]} ${shown}` : shown,
-        level: level === 1 ? 2 : level,
-        item: false,
-      });
+      const level = h.bold ? 7 : Math.max(2, h.level);
+      blocks.push({ text: h.bold ? `**${shown}**` : `${"#".repeat(level)} ${shown}`, level, item: false });
       continue;
     }
     // Body, lead-ins, disclaimers, list items, quotes: sentence by sentence, line by line — from the start of the unit's

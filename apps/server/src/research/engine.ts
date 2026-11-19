@@ -1142,7 +1142,8 @@ export function pickNotes(s: JobState, max: number): ResearchNote[] {
 
 /** The report's "요약" section without its markers (the chat message's preview), bounded. */
 export function summaryOf(body: string): string {
-  const m = /(?:^|\n)##\s*요약\s*\n([\s\S]*?)(?=\n##\s|$)/.exec(body);
+  // The heading may keep a verified marker (`## 요약[1]`).
+  const m = /(?:^|\n)##\s*요약(?:\s*\[\d{1,3}\])*[ \t]*\n([\s\S]*?)(?=\n##\s|$)/.exec(body);
   const text = (m?.[1] ?? "").replace(/\s*\[\d{1,3}\]/g, "").trim();
   const chars = Array.from(text);
   return chars.length > 700 ? `${chars.slice(0, 699).join("")}…` : text;

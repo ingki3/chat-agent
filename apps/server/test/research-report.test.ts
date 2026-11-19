@@ -164,6 +164,35 @@ describe("cleanReport", () => {
     });
   });
 
+  it("review 4: quoted facts in headings, a link label right after a period, heading forms", () => {
+    const cites = new Map([cite(1)]);
+    // A fact inside closing quotes or brackets still ends a sentence: removed when uncited.
+    expect(cleanReport("## “수출이 줄었다.” 2026년 통계[1]\n\n본문이다[1].", cites)).toMatchObject({
+      removed: 1,
+      body: "## 2026년 통계[1]\n\n본문이다[1].",
+    });
+    expect(cleanReport("## (수출이 줄었다.) 증가 원인\n\n본문이다[1].", cites)).toMatchObject({
+      removed: 1,
+      body: "## 증가 원인\n\n본문이다[1].",
+    });
+    // A numbered link label right after the period (no space) starts the next sentence.
+    expect(cleanReport("수출이 늘었다[1].[2](https://example.org)에서 주장했다.", cites)).toMatchObject({
+      removed: 1,
+      body: "수출이 늘었다[1].",
+    });
+    // A setext heading and a bold-only heading are written again as one heading, without stray marks.
+    expect(cleanReport("증가 원인\n---\n\n본문이다[1].", cites).body).toBe("## 증가 원인\n\n본문이다[1].");
+    expect(cleanReport("**수출이 늘었다. 증가 원인**\n\n본문이다[1].", cites)).toMatchObject({
+      removed: 1,
+      body: "**증가 원인**\n\n본문이다[1].",
+    });
+    expect(cleanReport("## 증가 원인 ##\n\n본문이다[1].", cites).body).toBe("## 증가 원인\n\n본문이다[1].");
+  });
+
+  it("finds the summary also under a cited 요약 heading", () => {
+    expect(summaryOf("## 요약[1]\n\n늘었다[1].\n\n## 다음\n\n본문[2].")).toBe("늘었다.");
+  });
+
   it("gives the writer each file note's verified place", () => {
     const block = notesBlock([{ id: "n1", claim: "c", quote: "q", fileId: "f", page: 3, place: "3쪽" }]);
     expect(block).toContain('"page":3');
