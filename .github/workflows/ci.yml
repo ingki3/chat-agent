@@ -86,9 +86,10 @@ jobs:
       - id: pw
         run: |
           echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
-          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
       # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
-      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner image.
+      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner OS — not the image build, which differs
+      # between the runners of one run.
       - uses: actions/cache@v4
         with:
           path: |
@@ -165,9 +166,10 @@ jobs:
       - id: pw
         run: |
           echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
-          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
       # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
-      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner image.
+      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner OS — not the image build, which differs
+      # between the runners of one run.
       - uses: actions/cache@v4
         with:
           path: |
