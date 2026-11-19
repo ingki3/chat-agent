@@ -100,6 +100,8 @@ export const RENDER_LIMITS = {
   timeoutMs: 20_000,
   /** Resident memory of the browser process (checked every 250 ms). */
   maxRssBytes: 768 * 1024 * 1024,
+  /** One memory sample may take this long; past it the memory counts as unmeasurable (stop, fail closed). */
+  sampleTimeoutMs: 2000,
   /** One DevTools reply (the base64 PNG/PDF). */
   maxReplyBytes: 48 * 1024 * 1024,
   /** The file itself. */
@@ -450,7 +452,7 @@ export class Renderer {
       const monitor = setInterval(() => {
         if (worker || sampling || exited || !pid) return;
         sampling = true;
-        (t.probe ?? (() => snapshot(pid, 2000, true)))()
+        (t.probe ?? (() => snapshot(pid, L.sampleTimeoutMs, true)))()
           .then((procs) => {
             if (!procs.length) {
               if (!exited) kill("monitor");

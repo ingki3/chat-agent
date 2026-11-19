@@ -86,7 +86,11 @@ export function browserArgs(userDataDir: string, proxy: string | undefined): str
     "--no-pings",
     "--mute-audio",
     "--hide-scrollbars",
-    "--disable-features=site-per-process,IsolateOrigins,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
+    // RenderDocument off (#103, #207): with it, a document that navigates itself (an artifact sending itself elsewhere,
+    // its navigation then failing to an error page) could make this single-process shell end itself — "Terminating
+    // renderer for bad IPC message, reason 262" (RFH_INACTIVE_CHECK_FROM_PENDING_COMMIT_RFH) — now and then on a
+    // loaded machine: the render failed. Measured (macOS sandbox, loaded): 14 of 438 renders with it, 0 of 438 without.
+    "--disable-features=site-per-process,IsolateOrigins,RenderDocument,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-quic",
     ...(proxy ? [`--proxy-server=${proxy}`, "--proxy-bypass-list=<-loopback>"] : []),

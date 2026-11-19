@@ -477,7 +477,7 @@ sub browser_args {
     "--no-pings",
     "--mute-audio",
     "--hide-scrollbars",
-    "--disable-features=site-per-process,IsolateOrigins,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
+    "--disable-features=site-per-process,IsolateOrigins,RenderDocument,Translate,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-quic",
     "--proxy-server=http://127.0.0.1:$port",
