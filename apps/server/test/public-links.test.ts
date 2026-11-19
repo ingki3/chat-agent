@@ -942,7 +942,17 @@ describe("review #209 round 7: the union of readings never reports less than bef
     expect(failures).toEqual([]);
     // Every earlier implementation is in the record.
     expect(Object.keys(Object.values(prior)[0]!).sort()).toEqual(
-      ["c536cf1", "2b025c9", "7e03a2f", "22f926c", "dbc308e", "7db8e29", "43208e1", "89db51e"].sort(),
+      [
+        "c536cf1",
+        "2b025c9",
+        "7e03a2f",
+        "22f926c",
+        "dbc308e",
+        "7db8e29",
+        "43208e1",
+        "89db51e",
+        "16b2893",
+      ].sort(),
     );
   });
 
@@ -971,5 +981,15 @@ describe("review #209 round 8", () => {
     expect(hosts("background-image:url(https://reader@cdn.example.org),url(icon@2x.png)")).toContain(
       "cdn.example.org",
     );
+  });
+});
+
+describe("review #209 round 9", () => {
+  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+  it("a CJK sentence's ideographic dot right after a host: the host before it is among the readings", () => {
+    expect(hosts("参考文档：https://docs.python.org。请选择对应版本。")).toContain("docs.python.org");
+    expect(hosts("詳しくは https://www.example.co.jp。次へ")).toContain("www.example.co.jp");
+    // A host written with ideographic dots is still read whole.
+    expect(hosts("https://文書。example.org/a")).toContain(domainToASCII("文書.example.org"));
   });
 });

@@ -7,7 +7,8 @@
     "dbc308e": ["cdn.jsdelivr.net", "images.example.org"],
     "7db8e29": ["cdn.jsdelivr.net", "images.example.org"],
     "43208e1": ["cdn.jsdelivr.net", "images.example.org"],
-    "89db51e": ["cdn.jsdelivr.net", "images.example.org"]
+    "89db51e": ["cdn.jsdelivr.net", "images.example.org"],
+    "16b2893": ["cdn.jsdelivr.net", "images.example.org"]
   },
   "src= then newline and 20 spaces": {
     "c536cf1": ["cdn.jsdelivr.net"],
@@ -17,7 +18,8 @@
     "dbc308e": ["cdn.jsdelivr.net"],
     "7db8e29": ["cdn.jsdelivr.net"],
     "43208e1": ["cdn.jsdelivr.net"],
-    "89db51e": ["cdn.jsdelivr.net"]
+    "89db51e": ["cdn.jsdelivr.net"],
+    "16b2893": ["cdn.jsdelivr.net"]
   },
   "spaced attributes over lines": {
     "c536cf1": ["fonts.example.com", "images.example.org"],
@@ -27,7 +29,8 @@
     "dbc308e": ["fonts.example.com", "images.example.org"],
     "7db8e29": ["fonts.example.com", "images.example.org"],
     "43208e1": ["fonts.example.com", "images.example.org"],
-    "89db51e": ["fonts.example.com", "images.example.org"]
+    "89db51e": ["fonts.example.com", "images.example.org"],
+    "16b2893": ["fonts.example.com", "images.example.org"]
   },
   "vertical tab before the CDN": {
     "c536cf1": ["cdn.jsdelivr.net"],
@@ -37,7 +40,8 @@
     "dbc308e": ["cdn.jsdelivr.net"],
     "7db8e29": ["cdn.jsdelivr.net"],
     "43208e1": ["cdn.jsdelivr.net"],
-    "89db51e": ["cdn.jsdelivr.net"]
+    "89db51e": ["cdn.jsdelivr.net"],
+    "16b2893": ["cdn.jsdelivr.net"]
   },
   "=https:// relative value": {
     "c536cf1": [],
@@ -47,7 +51,8 @@
     "dbc308e": [],
     "7db8e29": ["images.example.org"],
     "43208e1": ["images.example.org"],
-    "89db51e": ["images.example.org"]
+    "89db51e": ["images.example.org"],
+    "16b2893": ["images.example.org"]
   },
   "2048 spaces before the CDN": {
     "c536cf1": ["cdn.jsdelivr.net"],
@@ -57,7 +62,8 @@
     "dbc308e": ["cdn.jsdelivr.net"],
     "7db8e29": ["cdn.jsdelivr.net"],
     "43208e1": ["cdn.jsdelivr.net"],
-    "89db51e": ["cdn.jsdelivr.net"]
+    "89db51e": ["cdn.jsdelivr.net"],
+    "16b2893": ["cdn.jsdelivr.net"]
   },
   "<code>url(</code> then a link": {
     "c536cf1": ["docs.example.org"],
@@ -67,7 +73,8 @@
     "dbc308e": ["docs.example.org"],
     "7db8e29": ["docs.example.org"],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "srcset with a comma in its URL": {
     "c536cf1": ["img.example"],
@@ -77,7 +84,8 @@
     "dbc308e": ["img.example"],
     "7db8e29": ["img.example", "thumb.example.org"],
     "43208e1": ["img.example", "thumb.example.org"],
-    "89db51e": ["img.example", "thumb.example.org"]
+    "89db51e": ["img.example", "thumb.example.org"],
+    "16b2893": ["img.example", "thumb.example.org"]
   },
   "<code>style=\"</code> then an image": {
     "c536cf1": ["img.example"],
@@ -87,7 +95,8 @@
     "dbc308e": [],
     "7db8e29": ["img.example"],
     "43208e1": ["img.example"],
-    "89db51e": ["img.example"]
+    "89db51e": ["img.example"],
+    "16b2893": ["img.example"]
   },
   "SVG fill url()": {
     "c536cf1": ["paint.example"],
@@ -97,7 +106,8 @@
     "dbc308e": [],
     "7db8e29": ["paint.example"],
     "43208e1": ["paint.example"],
-    "89db51e": ["paint.example"]
+    "89db51e": ["paint.example"],
+    "16b2893": ["paint.example"]
   },
   "<style> with a 1000-character attribute": {
     "c536cf1": ["long-style.example"],
@@ -107,7 +117,8 @@
     "dbc308e": [],
     "7db8e29": ["long-style.example"],
     "43208e1": ["long-style.example"],
-    "89db51e": ["long-style.example"]
+    "89db51e": ["long-style.example"],
+    "16b2893": ["long-style.example"]
   },
   "url() after 64 KiB of style": {
     "c536cf1": ["big-style.example"],
@@ -117,7 +128,8 @@
     "dbc308e": [],
     "7db8e29": ["big-style.example"],
     "43208e1": ["big-style.example"],
-    "89db51e": ["big-style.example"]
+    "89db51e": ["big-style.example"],
+    "16b2893": ["big-style.example"]
   },
   "srcset bad((": {
     "c536cf1": [],
@@ -127,7 +139,8 @@
     "dbc308e": [],
     "7db8e29": ["img.example"],
     "43208e1": ["img.example"],
-    "89db51e": ["img.example"]
+    "89db51e": ["img.example"],
+    "16b2893": ["img.example"]
   },
   "Unicode host": {
     "c536cf1": [],
@@ -137,7 +150,8 @@
     "dbc308e": ["xn--zb0b81k2qm.example.org"],
     "7db8e29": [],
     "43208e1": ["xn--zb0b81k2qm.example.org"],
-    "89db51e": ["xn--zb0b81k2qm.example.org"]
+    "89db51e": ["xn--zb0b81k2qm.example.org"],
+    "16b2893": ["xn--zb0b81k2qm.example.org"]
   },
   "userinfo": {
     "c536cf1": [],
@@ -147,7 +161,8 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "extra slash": {
     "c536cf1": [],
@@ -157,7 +172,8 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "newline inside a host": {
     "c536cf1": ["docs.exa"],
@@ -167,7 +183,8 @@
     "dbc308e": ["docs.example.org"],
     "7db8e29": ["docs.exa"],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.exa", "docs.example.org"]
+    "89db51e": ["docs.exa", "docs.example.org"],
+    "16b2893": ["docs.exa", "docs.example.org"]
   },
   "port": {
     "c536cf1": [],
@@ -177,7 +194,8 @@
     "dbc308e": [],
     "7db8e29": ["docs.example.org"],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "unquoted src, alt on the next line": {
     "c536cf1": ["cdn.example.org"],
@@ -187,7 +205,8 @@
     "dbc308e": ["cdn.example.org"],
     "7db8e29": ["cdn.example.org"],
     "43208e1": [],
-    "89db51e": ["cdn.example.org", "cdn.example.orgalt"]
+    "89db51e": ["cdn.example.org", "cdn.example.orgalt"],
+    "16b2893": ["cdn.example.org", "cdn.example.orgalt"]
   },
   "! after a bare host": {
     "c536cf1": [],
@@ -197,7 +216,8 @@
     "dbc308e": [],
     "7db8e29": ["docs.example.org"],
     "43208e1": [],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "&#47; for the path slash": {
     "c536cf1": ["docs.example.org"],
@@ -207,7 +227,8 @@
     "dbc308e": ["docs.example.org&"],
     "7db8e29": ["docs.example.org"],
     "43208e1": [],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "comma in userinfo": {
     "c536cf1": [],
@@ -217,7 +238,8 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": [],
-    "89db51e": ["docs.example.org"]
+    "89db51e": ["docs.example.org"],
+    "16b2893": ["docs.example.org"]
   },
   "five noisy readings, then a sixth host": {
     "c536cf1": [
@@ -280,6 +302,19 @@
       "cdn3.example.orgalt",
       "cdn4.example.org",
       "cdn4.example.orgalt"
+    ],
+    "16b2893": [
+      "cdn0.example.org",
+      "cdn0.example.orgalt",
+      "cdn1.example.org",
+      "cdn1.example.orgalt",
+      "cdn2.example.org",
+      "cdn2.example.orgalt",
+      "cdn3.example.org",
+      "cdn3.example.orgalt",
+      "cdn4.example.org",
+      "cdn4.example.orgalt",
+      "icons.example.org"
     ]
   },
   "astral host character": {
@@ -290,7 +325,8 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": ["xn--rnyn687f.example.org"],
-    "89db51e": []
+    "89db51e": [],
+    "16b2893": ["xn--rnyn687f.example.org"]
   },
   "ideographic dot": {
     "c536cf1": [],
@@ -300,7 +336,8 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": ["xn--7dvz5a.example.org"],
-    "89db51e": []
+    "89db51e": [],
+    "16b2893": ["xn--7dvz5a.example.org"]
   },
   "userinfo, then a newline in the host": {
     "c536cf1": ["reader"],
@@ -310,7 +347,8 @@
     "dbc308e": ["docs.example.org"],
     "7db8e29": [],
     "43208e1": ["docs.example.org"],
-    "89db51e": ["docs.exa"]
+    "89db51e": ["docs.exa"],
+    "16b2893": ["docs.exa", "docs.example.org"]
   },
   "@ in a later CSS value": {
     "c536cf1": ["reader"],
@@ -320,7 +358,41 @@
     "dbc308e": [],
     "7db8e29": [],
     "43208e1": ["cdn.example.org"],
-    "89db51e": ["2x.png"]
+    "89db51e": ["2x.png"],
+    "16b2893": ["2x.png", "cdn.example.org"]
+  },
+  "Chinese sentence after a bare host": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["docs.python.org"],
+    "43208e1": ["docs.python.org.xn--ceto4d98e0ofjwqbl0bo7f"],
+    "89db51e": ["docs.python.org"],
+    "16b2893": ["docs.python.org.xn--ceto4d98e0ofjwqbl0bo7f"]
+  },
+  "Japanese sentence after a bare host": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["help.example.jp", "www.example.co.jp"],
+    "43208e1": ["help.example.jp.xn--fhqru"],
+    "89db51e": ["help.example.jp", "www.example.co.jp"],
+    "16b2893": ["help.example.jp.xn--fhqru", "www.example.co.jp.xn--n8jvas7b2a1c2ixr0jvl1957cwj4c"]
+  },
+  "Japanese halfwidth dot": {
+    "c536cf1": [],
+    "2b025c9": [],
+    "7e03a2f": [],
+    "22f926c": [],
+    "dbc308e": [],
+    "7db8e29": ["shop.example.jp"],
+    "43208e1": ["shop.example.jp.xn--pckp0mua"],
+    "89db51e": ["shop.example.jp"],
+    "16b2893": ["shop.example.jp.xn--pckp0mua"]
   },
   "ordinary HTML": {
     "c536cf1": [
@@ -386,6 +458,15 @@
       "img1.example",
       "img2.example",
       "www.example.com"
+    ],
+    "16b2893": [
+      "bg.example.net",
+      "cdn.jsdelivr.net",
+      "docs.example.org",
+      "fonts.googleapis.com",
+      "img1.example",
+      "img2.example",
+      "www.example.com"
     ]
   },
   "ordinary markdown": {
@@ -396,6 +477,7 @@
     "dbc308e": ["m.example"],
     "7db8e29": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"],
     "43208e1": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"],
-    "89db51e": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"]
+    "89db51e": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"],
+    "16b2893": ["api.example.io", "docs.example.org", "m.example", "news.example.co.kr", "title.example.net"]
   }
 }

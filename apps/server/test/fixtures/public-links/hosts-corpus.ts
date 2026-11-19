@@ -131,6 +131,22 @@ export const HOSTS_CORPUS: { name: string; content: string; title?: string; targ
     content: "background-image:url(https://reader@cdn.example.org),url(icon@2x.png)",
     target: ["cdn.example.org"],
   },
+  // Round 9: CJK sentences end with an ideographic dot right after the host
+  {
+    name: "Chinese sentence after a bare host",
+    content: "参考文档：https://docs.python.org。请选择对应版本。",
+    target: ["docs.python.org"],
+  },
+  {
+    name: "Japanese sentence after a bare host",
+    content: "詳しくは https://www.example.co.jp。次のページも見てください：https://help.example.jp．以上",
+    target: ["www.example.co.jp", "help.example.jp"],
+  },
+  {
+    name: "Japanese halfwidth dot",
+    content: "ｻｲﾄ: https://shop.example.jp｡ﾖﾛｼｸ",
+    target: ["shop.example.jp"],
+  },
   // Ordinary documents
   {
     name: "ordinary HTML",

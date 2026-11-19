@@ -115,7 +115,8 @@ function asHost(candidate: string): string | undefined {
  * - (a) the run of host characters right after it — it ends at `!`, `&`, `,`, `:`, a newline, …;
  * - (b) the same run after the last `@` within the span (`last,first@docs.example.org`), and (b′) after the last `@`
  *   before the span's first `)` or `,` (a later CSS value's `@` does not hide this URL's host);
- * - (c) all of these again on the span with tabs and newlines removed (a host split by a newline).
+ * - (c) all of these again on the span with tabs and newlines removed (a host split by a newline);
+ * - (d) each of them also cut before its first `。` `．` `｡` (the dot that ends a CJK sentence).
  * Host characters are read by code point (`𠮷`), ideographic and fullwidth dots (`。` `．` `｡`) count as dots.
  * The span runs to whitespace other than tab and newline, `/ ? # \`, a quote, `<`, `>` or the backtick, at most
  * `AUTHORITY_MAX` characters; the scan resumes after it, so no stretch of the text is read twice. Each candidate goes
@@ -127,6 +128,13 @@ export function mentionedHosts(...texts: string[]): string[] {
   const add = (c: string) => {
     const h = asHost(c);
     if (h) hosts.add(h);
+    // (d) The same reading cut right before its first ideographic / fullwidth dot: in CJK prose `。` usually ends
+    // the sentence, not the host (`https://docs.python.org。请选择…`) — both readings are kept (review #209 round 9).
+    const cut = c.search(/[\u3002\uff0e\uff61]/u);
+    if (cut > 0) {
+      const short = asHost(c.slice(0, cut));
+      if (short) hosts.add(short);
+    }
   };
   for (const text of texts) {
     let from = 0;
