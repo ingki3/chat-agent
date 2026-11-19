@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { SON, newConversation, useAccount } from "./helpers.js";
+import { SON, csrf, newConversation, useAccount } from "./helpers.js";
 
 /** Chat screen (#14) against FakeRuntime: see apps/server/src/runtime/fake.ts for the `/…` commands. */
 
@@ -347,6 +347,216 @@ test("after giving up, the reply is shown once the run has ended — without 다
   await expect(reply(page)).toHaveAttribute("data-status", "complete", { timeout: 15_000 });
   await expect(reply(page)).toContainText("단어30");
   await expect(reply(page).getByText("연결이 끊겨", { exact: false })).toHaveCount(0);
+});
+
+/** The latest reply's status in a messages response. */
+const replyStatus = (body: unknown) =>
+  (body as { items: { role: string; status: string }[] }).items.findLast((m) => m.role === "assistant")
+    ?.status;
+const UNFINISHED = ["pending", "streaming"];
+/** The page's `active-run` answer that says no run is in progress. */
+const noRunAnswer = (page: Page) =>
+  page.waitForResponse(
+    async (r) =>
+      r.url().endsWith("/active-run") && r.ok() && ((await r.json()) as { run: unknown }).run === null,
+    {
+      timeout: 20_000,
+    },
+  );
+
+/** Lets a `/gate <name>` reply end (FakeRuntime): `/release <name>` sent in a conversation of its own. */
+async function releaseGate(page: Page, baseURL: string, gate: string) {
+  const c = await newConversation(page.request, baseURL, `gate ${gate}`);
+  const r = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: `/release ${gate}` },
+    headers: { ...csrf(baseURL), "Idempotency-Key": crypto.randomUUID() },
+  });
+  expect(r.ok()).toBe(true);
+}
+
+test("a reply that ends while the new conversation's first messages read is on its way ends complete (#103)", async ({
+  page,
+  baseURL,
+}) => {
+  // A new conversation opens as its run goes on; its first messages read is answered while the reply is certainly
+  // unfinished (the run waits at a gate until the snapshot is taken), then held until the screen reads the messages
+  // again after the run's `done`. That read must be a new one — not the held one joined (the reply then stayed
+  // "streaming" for good: the citations e2e flake on a loaded CI runner).
+  await useAccount(page, SON);
+  const gate = crypto.randomUUID();
+  let held: (() => void) | undefined;
+  let first: string | undefined;
+  let reads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    if (++reads > 1) {
+      held?.();
+      return route.continue();
+    }
+    const res = await route.fetch();
+    const body: unknown = await res.json();
+    first = replyStatus(body);
+    // Only now may the run end.
+    await releaseGate(page, baseURL!, gate);
+    // Released by the next read; without one (the bug), let go late so the stale answer shows.
+    await new Promise<void>((r) => {
+      held = r;
+      setTimeout(r, 10_000);
+    });
+    await route.fulfill({ response: res, json: body });
+  });
+  const ended = noRunAnswer(page);
+  await page.goto("/");
+  await send(page, `/gate ${gate}`);
+  await page.waitForURL(/\/c\/[^/]+$/);
+  await ended;
+  expect(UNFINISHED).toContain(first);
+  expect(reads).toBeGreaterThan(1);
+  // After the screen read that no run is in progress: the saved reply, complete.
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  await expect(reply(page)).toContainText("끝났어요");
+});
+
+test("opening a conversation as its run ends: messages read before the end, the run after it — ends complete (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  // Not opened yet: the page loads only once the routes below are in place.
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `끝나는 순간 열기 ${Date.now()}`);
+  const gate = crypto.randomUUID();
+  const started = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: `/gate ${gate}` },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+  });
+  expect(started.ok()).toBe(true);
+  const runId = ((await started.json()) as { run: { id: string } }).run.id;
+  const runEnded = async () => {
+    await expect
+      .poll(
+        async () =>
+          ((await (await page.request.get(`/api/runs/${runId}`)).json()) as { endedAt: number | null })
+            .endedAt,
+        { timeout: 15_000 },
+      )
+      .not.toBeNull();
+  };
+  // The page's first messages read is answered before the end (the run waits at its gate), its first active-run read
+  // after it: no stream is followed, so nothing else would read the messages again.
+  let first: string | undefined;
+  let snapshot!: () => void;
+  const snapshotTaken = new Promise<void>((r) => (snapshot = r));
+  let messageReads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET" || ++messageReads > 1) return route.continue();
+    const res = await route.fetch();
+    const body: unknown = await res.json();
+    first = replyStatus(body);
+    snapshot();
+    await releaseGate(page, baseURL!, gate);
+    await runEnded();
+    await route.fulfill({ response: res, json: body });
+  });
+  let activeReads = 0;
+  await page.route("**/api/conversations/*/active-run", async (route) => {
+    if (++activeReads === 1) {
+      await snapshotTaken;
+      await runEnded();
+    }
+    await route.continue();
+  });
+  const ended = noRunAnswer(page);
+  await page.goto(`/c/${c.id}`);
+  await ended;
+  expect(UNFINISHED).toContain(first);
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  await expect(reply(page)).toContainText("끝났어요");
+  expect(messageReads).toBeGreaterThan(1);
+});
+
+test("a reply sent from another tab is found and followed even when the read after it still shows the previous reply (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `다른 탭 ${Date.now()}`);
+  const post = (text: string) =>
+    page.request.post(`/api/conversations/${c.id}/messages`, {
+      data: { text },
+      headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+    });
+  // A finished first reply, then "another tab" sends — its run waits at a gate.
+  const first = await post("첫 질문");
+  const firstRun = ((await first.json()) as { run: { id: string } }).run.id;
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${firstRun}`)).json()) as { endedAt: unknown }).endedAt,
+    )
+    .not.toBeNull();
+  const gate = crypto.randomUUID();
+  expect((await post(`/gate ${gate}`)).ok()).toBe(true);
+  // The page reads the new reply as pending but the run as none (its read was answered before the send); the read
+  // after that shows only the previous, finished reply (the new one not in it yet).
+  let messageReads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    if (++messageReads !== 2) return route.continue();
+    const res = await route.fetch();
+    const body = (await res.json()) as { items: { role: string; status: string }[] };
+    // Without the other tab's message and its unfinished reply.
+    const isNew = (m: { role: string; status: string }) =>
+      m.role === "assistant" ? m.status !== "complete" : JSON.stringify(m).includes(`/gate ${gate}`);
+    const items = body.items.filter((m) => !isNew(m));
+    await route.fulfill({ response: res, json: { ...body, items } });
+  });
+  let activeReads = 0;
+  await page.route("**/api/conversations/*/active-run", (route) =>
+    ++activeReads === 1 ? route.fulfill({ json: { run: null } }) : route.continue(),
+  );
+  const streams: string[] = [];
+  page.on("request", (r) => {
+    if (/\/api\/runs\/[^/]+\/events/.test(r.url())) streams.push(r.url());
+  });
+  await page.goto(`/c/${c.id}`);
+  // The run is found by the settle's own read and followed: its stream is opened, ■ 중지 shows.
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible({ timeout: 15_000 });
+  expect(messageReads).toBeGreaterThanOrEqual(2);
+  // (The stream is opened by the effect after that render: its request may come a moment later.)
+  await expect.poll(() => streams.length).toBeGreaterThan(0);
+  await releaseGate(page, baseURL!, gate);
+  await expect(reply(page)).toContainText("끝났어요");
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+});
+
+test("a slow first load of the messages (10.5 s) still shows them: only the settle loop's reads have a time limit (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `느린 첫 읽기 ${Date.now()}`);
+  const sent = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: "느린 기록" },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+  });
+  const runId = ((await sent.json()) as { run: { id: string } }).run.id;
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${runId}`)).json()) as { endedAt: unknown }).endedAt,
+    )
+    .not.toBeNull();
+  let reads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET" || ++reads > 1) return route.continue();
+    const res = await route.fetch();
+    await new Promise((r) => setTimeout(r, 10_500));
+    await route.fulfill({ response: res }).catch(() => {});
+  });
+  await page.goto(`/c/${c.id}`);
+  await expect(reply(page)).toContainText("느린 기록", { timeout: 20_000 });
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  expect(reads).toBe(1); // the one read, not cancelled and sent again
 });
 
 test.describe("markdown chunk", () => {
