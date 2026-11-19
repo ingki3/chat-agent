@@ -84,18 +84,30 @@ jobs:
         with: { node-version-file: .node-version, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - id: pw
-        run: echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
+      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner image.
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}-shell
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/playwright-debs
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.image }}-${{ steps.pw.outputs.version }}-shell
       # PNG/PDF export (#51): the renderer tests drive the real Chrome Headless Shell (they fail in CI without it).
       # The runner's apt mirror is sometimes unreachable; retry, then fall back to the browser alone (the ubuntu image already has Chrome's libraries).
-      # With the browser cached this only installs the system packages; the download is skipped.
+      # With the cache restored nothing is downloaded but apt's package index.
       - name: Install Playwright browser
         run: |
+          # Cached .deb files go where apt looks first: apt-get then downloads only what is newer than them.
+          if ls ~/.cache/playwright-debs/*.deb >/dev/null 2>&1; then sudo cp ~/.cache/playwright-debs/*.deb /var/cache/apt/archives/; fi
           for i in 1 2 3; do
-            pnpm exec playwright install --with-deps --only-shell chromium && exit 0
+            if pnpm exec playwright install --with-deps --only-shell chromium; then
+              mkdir -p ~/.cache/playwright-debs
+              cp /var/cache/apt/archives/*.deb ~/.cache/playwright-debs/ 2>/dev/null || true
+              exit 0
+            fi
             echo "browser install with system packages failed (attempt $i); retrying" >&2
             sleep 20
           done
@@ -151,17 +163,29 @@ jobs:
         with: { node-version-file: .node-version, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - id: pw
-        run: echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(node -p 'require("@playwright/test/package.json").version')" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
+      # ~150 kB/s, minutes). Keyed on the Playwright version and the runner image.
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}-chromium
+          path: |
+            ~/.cache/ms-playwright
+            ~/.cache/playwright-debs
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.image }}-${{ steps.pw.outputs.version }}-chromium
       # The runner's apt mirror is sometimes unreachable; retry, then fall back to the browser alone (the ubuntu image already has Chrome's libraries).
-      # With the browser cached this only installs the system packages; the download is skipped.
+      # With the cache restored nothing is downloaded but apt's package index.
       - name: Install Playwright browser
         run: |
+          # Cached .deb files go where apt looks first: apt-get then downloads only what is newer than them.
+          if ls ~/.cache/playwright-debs/*.deb >/dev/null 2>&1; then sudo cp ~/.cache/playwright-debs/*.deb /var/cache/apt/archives/; fi
           for i in 1 2 3; do
-            pnpm exec playwright install --with-deps chromium && exit 0
+            if pnpm exec playwright install --with-deps chromium; then
+              mkdir -p ~/.cache/playwright-debs
+              cp /var/cache/apt/archives/*.deb ~/.cache/playwright-debs/ 2>/dev/null || true
+              exit 0
+            fi
             echo "browser install with system packages failed (attempt $i); retrying" >&2
             sleep 20
           done
