@@ -21,8 +21,10 @@ import {
   onRenderReapIncomplete,
   parseMessage,
   parsePs,
+  reapAfterWatchdog,
   reapingRenderCount,
   releaseRenderDir,
+  renderReaped,
   setRenderReapForTests,
   signalRender,
   trackRender,
@@ -904,7 +906,7 @@ describe("the browser never outlives its owner (#170)", () => {
     return { r, launches };
   }
 
-  it("the watchdog SIGKILLed alone (the server alive): the server kills its group, the browser in it, at once", async () => {
+  it("the watchdog SIGKILLed alone (the server alive): the server reaps the browser at once (by pid, #215)", async () => {
     const { r, launches } = orphanRenderer();
     const before = liveRenderCount();
     const pending = r.render(job("markdown", "x", "pdf"));
@@ -1116,6 +1118,7 @@ describe("the browser never outlives its owner (#170)", () => {
     const code = await new Promise<number | null>((r) => host.once("exit", (c) => r(c)));
     const info = JSON.parse(out.trim().split("\n").pop() || "{}") as {
       pgid?: number;
+      browser?: number;
       browserAfterMiss?: boolean;
       watchdogExited?: boolean;
       reaping?: number;
@@ -1126,12 +1129,15 @@ describe("the browser never outlives its owner (#170)", () => {
     // The order the bug needed: the browser outlived the one group signal, the watchdog's exit was seen (untracked
     // as live), and only then did the server exit — no reap timer of it ever ran.
     expect(info).toMatchObject({ browserAfterMiss: true, watchdogExited: true, reaping: 1, groupSignals: 1 });
-    const browser = p.pid()!;
+    // The browser really ran (a positive pid, read before the limit fired) and that very process is gone.
+    const browser = info.browser!;
+    expect(browser).toBeGreaterThan(0);
+    expect(p.pid()).toBe(browser);
     expect(await within(SETTLE_MS, () => !alive(browser)), `browser ${browser}`).toBe(true);
     expect(await gone(info.pgid!)).toBe(true);
   }, 60_000);
 
-  describe("the reap signals by identity only (#215)", () => {
+  describe("the reap signals by identity only, and completes only on an empty group (#215)", () => {
     /** Sleepers in groups of their own: stand-ins for whatever a listing shows. */
     const sleeper = () => {
       const c = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
@@ -1143,74 +1149,139 @@ describe("the browser never outlives its owner (#170)", () => {
       for (const r of restores.splice(0)) r();
       onRenderReapIncomplete(undefined);
     });
+    const row = (pid: number, pgid: number, args: string, zombie = false) => ({ pid, pgid, zombie, args });
+    /** A render being reaped after its watchdog's own end (no group signal: the group id is not ours). */
+    const reapOf = (G: number, dir: RenderDir) => {
+      const forget = trackRender(G, dir);
+      reapAfterWatchdog(G);
+      forget();
+    };
+    const keptAndCleaned = (dir: RenderDir) => {
+      releaseRenderDir(dir);
+      expect(fs.existsSync(dir.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
+      expect(dir.lockFd).toBe(-1);
+      fs.rmSync(dir.workDir, { recursive: true, force: true });
+      fs.rmSync(renderLockPath(dir.workDir), { force: true });
+    };
 
-    it("a reused group id or pid without the render's own folder is never signalled; its own processes are", async () => {
+    it("only exact arguments are ours: a reused group id, a look-alike path, another folder, a new render's process are never signalled — and keep the reap from completing", async () => {
       const dir = freshRenderDir();
-      const G = 2_000_000_001; // the group id the listing claims (never signalled itself: the render is not live)
-      const [foreign, elsewhere, own, ownSlash, lookalike] = [
-        sleeper(),
-        sleeper(),
-        sleeper(),
-        sleeper(),
-        sleeper(),
-      ];
       const d = dir.workDir;
-      let rows = [
-        { pid: foreign, pgid: G, zombie: false, args: "/bin/sleep 30" }, // the group id reused by someone else
-        { pid: elsewhere, pgid: 7, zombie: false, args: `x --user-data-dir=${d}/profile` }, // not in the group
-        { pid: own, pgid: G, zombie: false, args: `perl -e … 1 30 ${d} node fake.mjs` },
-        { pid: ownSlash, pgid: G, zombie: false, args: `chrome --user-data-dir=${d}/profile about:blank` },
-        { pid: lookalike, pgid: G, zombie: false, args: `chrome --user-data-dir=${d}X/profile` }, // another folder
+      const G = 2_000_000_001; // the group id the listing claims
+      const [foreign, elsewhere, prefixed, lookalike, unreadable, watchdogChild, browser] = [
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
       ];
-      restores.push(setRenderReapForTests({ everyMs: 10, list: () => rows }));
+      let rows = [
+        row(foreign, G, "/bin/sleep 30"), // the group id reused by someone else
+        row(elsewhere, 7, `chrome --user-data-dir=${d}/profile`), // ours by its arguments, not in the group
+        row(prefixed, G, `/bin/sh -c echo /archive${d}/profile`), // the path inside another argument
+        row(lookalike, G, `chrome --user-data-dir=${d}X/profile`), // another folder
+        row(unreadable, G, "[chrome-headless-shell]"), // arguments ps could not read
+        row(watchdogChild, G, `/usr/bin/perl -e use strict; 1 30 ${d} node fake.mjs`),
+        row(browser, G, `chrome --single-process --user-data-dir=${d}/profile about:blank`),
+      ];
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      restores.push(setRenderReapForTests({ everyMs: 10, forMs: 1500, list: () => rows }));
       const kill = vi.spyOn(process, "kill");
       try {
-        const forget = trackRender(G, dir);
-        signalRender(G); // the one group signal (refused: no such group), then the reap
-        forget(); // the watchdog's exit seen
+        reapOf(G, dir);
         // A new render takes the same group id while the old reap still runs: the old one must leave it alone.
         const second = freshRenderDir();
         const forgetSecond = trackRender(G, second);
-        rows = [
-          ...rows,
-          {
-            pid: sleeper(),
-            pgid: G,
-            zombie: false,
-            args: `chrome --user-data-dir=${second.workDir}/profile`,
-          },
-        ];
-        const newcomer = rows[rows.length - 1]!.pid;
-        expect(await within(5000, () => !alive(own) && !alive(ownSlash))).toBe(true);
-        rows = rows.filter((r) => r.pid !== own && r.pid !== ownSlash); // gone from the listing: confirmed
-        expect(await within(5000, () => reapingRenderCount() === 0)).toBe(true);
-        for (const pid of [foreign, elsewhere, lookalike, newcomer])
-          expect(alive(pid), `pid ${pid}`).toBe(true);
+        const newcomer = sleeper();
+        rows = [...rows, row(newcomer, G, `chrome --user-data-dir=${second.workDir}/profile`)];
+        expect(await within(5000, () => !alive(watchdogChild) && !alive(browser))).toBe(true);
+        rows = rows.filter((r) => r.pid !== watchdogChild && r.pid !== browser);
+        // Live members it cannot attribute stay in the group: never confirmed — given up at the deadline.
+        expect(await within(5000, () => incomplete.length > 0)).toBe(true);
+        expect(incomplete).toEqual([1]);
+        const others = [foreign, elsewhere, prefixed, lookalike, unreadable, newcomer];
+        for (const pid of others) expect(alive(pid), `pid ${pid}`).toBe(true);
         const signalled = kill.mock.calls.filter(([, sig]) => sig === "SIGKILL").map(([t]) => t);
-        expect(signalled.filter((t) => t === -G)).toHaveLength(1);
-        for (const pid of [foreign, elsewhere, lookalike, newcomer]) expect(signalled).not.toContain(pid);
+        expect(signalled).not.toContain(-G); // after the watchdog's own end: no group signal
+        for (const pid of others) expect(signalled).not.toContain(pid);
+        keptAndCleaned(dir);
         forgetSecond();
       } finally {
         kill.mockRestore();
       }
     });
 
-    it("the deadline is checked before each step: none after it; given up = folder and lock kept, counted", async () => {
+    it("an unattributable member alone (`[chrome-headless-shell]`): not signalled, never confirmed — folder and lock kept, counted", async () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_011;
+      const unreadable = sleeper();
+      restores.push(
+        setRenderReapForTests({
+          everyMs: 10,
+          forMs: 300,
+          list: () => [row(unreadable, G, "[chrome-headless-shell]")],
+        }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      reapOf(G, dir);
+      await renderReaped(dir);
+      expect(incomplete).toEqual([1]);
+      expect(alive(unreadable)).toBe(true);
+      keptAndCleaned(dir);
+    });
+
+    it("complete only on a listing begun after the watchdog could fork no more, showing no live member at all", async () => {
+      const dir = freshRenderDir();
+      const d = dir.workDir;
+      const G = 2_000_000_021;
+      // The watchdog live (signalled by pid: still listed, not reaped), then a zombie, then nothing. Not forgotten:
+      // its end is learnt from the listings alone (as under shutdown, which sees no exit event).
+      const script = [
+        [row(G, G, `/usr/bin/perl -e x 1 30 ${d} node`)],
+        [row(G, G, "<defunct>", true)],
+        [],
+        [],
+      ];
+      let calls = 0;
+      restores.push(setRenderReapForTests({ everyMs: 10, list: () => script[Math.min(calls++, 3)] }));
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        trackRender(G, dir);
+        signalRender(G);
+        await renderReaped(dir);
+        // 1: live leader (killed by pid); 2: leader a zombie — empty, but begun before its end was known; 3: empty.
+        expect(calls).toBe(3);
+        expect(kill.mock.calls.filter(([t]) => t === G)).toHaveLength(1);
+        expect(kill.mock.calls.filter(([t]) => t === -G)).toHaveLength(1); // the one group signal, while live
+      } finally {
+        kill.mockRestore();
+      }
+      // Confirmed: the reap is over, nothing tracked any more.
+      expect(reapingRenderCount()).toBe(0);
+      expect(liveRenderCount()).toBe(0);
+    });
+
+    it("the deadline bounds each step: a listing that comes back past it ends the reap — no kill, folder kept, counted", async () => {
       const dir = freshRenderDir();
       const G = 2_000_000_003;
       const target = sleeper();
-      const steps: number[] = [];
-      let start = 0;
-      // A member that never leaves the listing (as if it kept surviving): the reap can only give up.
+      const budgets: number[] = [];
       restores.push(
         setRenderReapForTests({
-          everyMs: 20,
-          forMs: 300,
-          list: () => {
-            steps.push(performance.now() - start);
-            return [
-              { pid: target, pgid: G, zombie: false, args: `chrome --user-data-dir=${dir.workDir}/profile` },
-            ];
+          everyMs: 10,
+          forMs: 150,
+          list: (ms) => {
+            budgets.push(ms);
+            const end = performance.now() + 200; // slower than the whole budget
+            while (performance.now() < end) {
+              // busy
+            }
+            return [row(target, G, `chrome --user-data-dir=${dir.workDir}/profile`)];
           },
         }),
       );
@@ -1218,45 +1289,53 @@ describe("the browser never outlives its owner (#170)", () => {
       onRenderReapIncomplete((n) => incomplete.push(n));
       const kill = vi.spyOn(process, "kill");
       try {
-        start = performance.now();
-        const forget = trackRender(G, dir);
-        signalRender(G);
-        forget();
-        expect(await within(5000, () => incomplete.length > 0)).toBe(true);
+        reapOf(G, dir);
+        await renderReaped(dir);
         expect(incomplete).toEqual([1]);
-        expect(steps.length).toBeGreaterThan(0);
-        for (const t of steps) expect(t).toBeLessThan(300);
-        const n = kill.mock.calls.length;
-        await new Promise((done) => setTimeout(done, 200));
-        expect(kill.mock.calls.length).toBe(n); // nothing after giving up
-        // The render's own clean-up keeps what was never confirmed: folder and lock stay (the sweep's to judge).
-        releaseRenderDir(dir);
-        expect(fs.existsSync(dir.workDir)).toBe(true);
-        expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
-        expect(dir.lockFd).toBe(-1);
+        expect(budgets).toHaveLength(1);
+        expect(budgets[0]!).toBeLessThanOrEqual(150); // the listing gets what is left, no more
+        expect(kill.mock.calls.some(([t]) => t === target)).toBe(false);
+        expect(alive(target)).toBe(true);
       } finally {
         kill.mockRestore();
-        fs.rmSync(dir.workDir, { recursive: true, force: true });
-        fs.rmSync(renderLockPath(dir.workDir), { force: true });
       }
+      keptAndCleaned(dir);
     });
 
-    it("shutdown's own deadline: a render still listed past it is given up — folder kept, counted", () => {
+    it("shutdown's deadline bounds it too: a slow listing → no kill after it, back within its budget, folder kept, counted", () => {
       const dir = freshRenderDir();
       const G = 2_000_000_005;
+      const target = sleeper();
+      const budgets: number[] = [];
       restores.push(
         setRenderReapForTests({
           shutdownMs: 100,
-          list: () => [{ pid: 2_000_000_007, pgid: G, zombie: false, args: `x ${dir.workDir}` }],
+          list: (ms) => {
+            budgets.push(ms);
+            const end = performance.now() + 150;
+            while (performance.now() < end) {
+              // busy
+            }
+            return [row(target, G, `x --user-data-dir=${dir.workDir}/profile`)];
+          },
         }),
       );
       const incomplete: number[] = [];
       onRenderReapIncomplete((n) => incomplete.push(n));
       trackRender(G, dir);
-      const t0 = performance.now();
-      killLiveRenders();
-      expect(performance.now() - t0).toBeLessThan(1000);
+      const kill = vi.spyOn(process, "kill");
+      try {
+        const t0 = performance.now();
+        killLiveRenders();
+        expect(performance.now() - t0).toBeLessThan(400); // one listing past the budget, then nothing more
+        expect(kill.mock.calls.some(([t]) => t === target)).toBe(false);
+      } finally {
+        kill.mockRestore();
+      }
+      expect(budgets).toHaveLength(1);
+      expect(budgets[0]!).toBeLessThanOrEqual(100);
       expect(incomplete).toEqual([1]);
+      expect(alive(target)).toBe(true);
       expect(fs.existsSync(dir.workDir)).toBe(true);
       expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
       fs.rmSync(dir.workDir, { recursive: true, force: true });
@@ -1502,14 +1581,20 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(fs.existsSync(renderLockPath(d.workDir))).toBe(true);
   }, 30_000);
 
-  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end kills its group", async () => {
-    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" (sleep) in their group.
+  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end reaps its processes by pid — no group signal (#215)", async () => {
+    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" in their group (a sleeper
+    // carrying the render's folder as an argument of its own, as the watchdog's forked child does).
+    let groupSignals = 0;
     const react = async (status: number) => {
       const p = pidFile();
-      const launcher: Launcher = () => {
+      let pgid = 0;
+      const launcher: Launcher = (s) => {
         const child = spawn(
           "/bin/sh",
-          ["-c", `/bin/sleep 30 & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`],
+          [
+            "-c",
+            `/usr/bin/perl -e 'sleep 30' '${s.workDir}' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
+          ],
           {
             env: { EXIT_CODE: String(status) },
             detached: true,
@@ -1517,6 +1602,7 @@ describe("the browser never outlives its owner (#170)", () => {
           },
         );
         startedGroups.add(child.pid!);
+        pgid = child.pid!;
         return { child, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable };
       };
       const r = new Renderer({
@@ -1527,14 +1613,23 @@ describe("the browser never outlives its owner (#170)", () => {
         test: { probe: async () => [{ pid: 1, rss: 1 }] },
       });
       closers.push(() => r.close());
-      expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
+      const kill = vi.spyOn(process, "kill");
+      try {
+        expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
+        groupSignals += kill.mock.calls.filter(([t, sig]) => t === -pgid && sig === "SIGKILL").length;
+      } finally {
+        kill.mockRestore();
+      }
       const sleeper = p.pid()!;
+      expect(sleeper).toBeGreaterThan(0);
       return within(1000, () => !alive(sleeper)).then((dead) => !dead);
     };
     const X = WATCHDOG_EXIT;
     for (const s of [X.done, X.stopped, X.notStarted, X.execFailed])
       expect(await react(s), `status ${s}`).toBe(true);
     expect(await react(1)).toBe(false);
+    // The watchdog was already reaped when its end was seen: its group id is never signalled.
+    expect(groupSignals).toBe(0);
   }, 60_000);
 
   it("shutdown: closeRenderers turns queued renders away, starts no new browser, and kills the running one", async () => {

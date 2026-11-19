@@ -32,6 +32,8 @@ const alive = (pid: number) => {
   }
 };
 let pgid = 0;
+/** The browser's pid, read from its file (positive) before the limit fires. */
+let browser = 0;
 let groupSignals = 0;
 let browserAfterMiss: boolean | undefined;
 const real = process.kill.bind(process);
@@ -40,7 +42,7 @@ process.kill = ((target: number, sig?: string | number) => {
     groupSignals++;
     if (browserAfterMiss === undefined) {
       const res = real(pgid, "SIGKILL"); // the watchdog only: the browser is missed
-      browserAfterMiss = alive(browserPid());
+      browserAfterMiss = browser > 0 && alive(browser);
       return res;
     }
   }
@@ -54,7 +56,7 @@ const launcher: Launcher = (s) => {
   l.child.once("exit", () =>
     setImmediate(() => {
       process.stdout.write(
-        `${JSON.stringify({ pgid, browserAfterMiss, watchdogExited: true, reaping: reapingRenderCount(), groupSignals })}\n`,
+        `${JSON.stringify({ pgid, browser, browserAfterMiss, watchdogExited: true, reaping: reapingRenderCount(), groupSignals })}\n`,
       );
       process.exit(0);
     }),
@@ -75,8 +77,14 @@ const r = new Renderer({
       "orphan",
       ...base.filter((a) => a.startsWith("--user-data-dir=")),
     ],
-    // The memory limit, once the browser runs.
-    probe: async () => [{ pid: 1, rss: alive(browserPid()) ? 1 << 30 : 1 }],
+    // The memory limit, once the browser runs (its positive pid read from the file first).
+    probe: async () => {
+      if (!browser) {
+        const pid = browserPid();
+        if (pid > 0 && alive(pid)) browser = pid;
+      }
+      return [{ pid: 1, rss: browser ? 1 << 30 : 1 }];
+    },
   },
 });
 setTimeout(() => process.exit(3), 30_000); // bounded
