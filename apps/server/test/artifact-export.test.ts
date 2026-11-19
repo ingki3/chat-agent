@@ -829,7 +829,9 @@ describe("the browser never outlives its owner (#170)", () => {
     host.stdout.on("data", (d: Buffer) => (out += d.toString()));
     host.stderr.on("data", (d: Buffer) => (err += d.toString()));
     const exited = new Promise<void>((r) => host.once("exit", () => r()));
-    expect(await within(30_000, () => out.includes("\n")), err).toBe(true);
+    // Starting the host (tsx) and its browser is setup, not the property: its own budget (#207 — over 30 s on a loaded
+    // machine). The property is the time from the owner's SIGKILL to nothing left (below).
+    expect(await within(90_000, () => out.includes("\n")), err).toBe(true);
     const info = JSON.parse(out.split("\n")[0]!) as {
       host: number;
       pgid: number;
@@ -860,14 +862,14 @@ describe("the browser never outlives its owner (#170)", () => {
 
   it("SIGKILL of the owner: a stand-in browser that ignores pipe EOF is killed, group and folder gone", async () => {
     expect(await orphan("fake")).toBeLessThan(5000);
-  }, 60_000);
+  }, 150_000);
 
   it.skipIf(!BROWSER)(
     "SIGKILL of the owner mid-render: the real headless shell (production launcher, its loop confirmed entered over DevTools) is gone too",
     async () => {
       expect(await orphan("real")).toBeLessThan(5000);
     },
-    60_000,
+    150_000,
   );
 
   /** A renderer over the stand-in browser that never answers; `launches` lists each started watchdog. */
