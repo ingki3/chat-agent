@@ -19,7 +19,8 @@ const MESSAGE_META = [
 ] as const;
 /** A stream frame's SSE id, and the envelope of its `data`. */
 const FRAME_META = ["id"] as const;
-const FRAME_DATA_META = ["messageId", "runId", "conversationId", "createdAt"] as const;
+// Only fields `StreamEvent` actually carries (packages/shared/src/chat.ts) — an unexpected field must stay visible (review #210 2차).
+const FRAME_DATA_META = ["messageId"] as const;
 /** A log record's ids and duration. */
 const LOG_META = ["userId", "conversationId", "runId", "durationMs"] as const;
 
