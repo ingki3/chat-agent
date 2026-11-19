@@ -26,6 +26,7 @@ import {
   StreamScrubber,
   KNOWN_PLACEHOLDER,
   REDACTED_CONTENT,
+  scanStats,
 } from "../src/secrets/known.js";
 import { TEXT_COLUMNS } from "../src/secrets/columns.js";
 import { StoredRescrub } from "../src/secrets/rescrub.js";
@@ -720,8 +721,12 @@ describe("round 25: scrubber", () => {
     // is there (round 26: the trailing prose stays).
     const prose = "a".repeat(16_383) + "b ordinary prose data banana";
     expect(scrubKnown(prose, { registry: reg })).toBe(prose);
-    // Counted, not timed (#213): a secret and a text 8× as long are ~8× the work (`meterWork`: every character read,
-    // slice and search) — compared from every start, 64×.
+    // Counted, not timed (#213): a secret and a text 8× as long are ~8× the work — compared from every start, 64×.
+    // Twice: the built-ins' work (`meterWork`: every character read, slice, search and iteration), and on its own
+    // the comparisons of the passes that look for a secret the text ends inside (`scanStats.tail`, raw, and
+    // `encodedTail`, base64 and hex — review #217: comparing `text[k + j]` from every start reads no built-in, and
+    // the other passes alone are linear). Each pass runs over at least the secret's length here: a count missing
+    // from one fails its floor.
     for (const [what, text] of [
       ["the secret itself", (n: number) => "a".repeat(n)],
       ["only ever a prefix", (n: number) => "a".repeat(n - 1) + "b ordinary prose data banana"],
@@ -731,16 +736,22 @@ describe("round 25: scrubber", () => {
         r.add("a".repeat(n));
         const input = text(n);
         let out = "";
+        const tail = scanStats.tail;
+        const encoded = scanStats.encodedTail;
         const w = meterWork(() => {
           out = scrubKnown(input, { registry: r });
         });
         expect(out).toBe(input.length === n ? "[숨김]" : input);
-        return w;
+        return { w, tail: scanStats.tail - tail, encoded: scanStats.encodedTail - encoded };
       };
       const small = work(2048);
       const big = work(16_384);
-      expect(small, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(2048);
-      expect(big / small, `${what}: ${small} → ${big}`).toBeLessThan(10);
+      expect(small.w, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(2048);
+      expect(big.w / small.w, `${what}: ${small.w} → ${big.w}`).toBeLessThan(10);
+      for (const k of ["tail", "encoded"] as const) {
+        expect(small[k], `${what}: the ${k} pass was counted`).toBeGreaterThanOrEqual(2047);
+        expect(big[k] / small[k], `${what}: ${k} ${small[k]} → ${big[k]}`).toBeLessThan(10);
+      }
     }
     const ps = new StreamScrubber(reg);
     expect(

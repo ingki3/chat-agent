@@ -1524,15 +1524,26 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
     expect(one!.text.includes(secret)).toBe(false);
     // Linear: counted, not timed (#213 — a time cap failed under a full run's load). The work of 8× the rows (and
     // of a row 8× as wide) is ~8× — the built-ins' work (`meterWork`) and the distribution's own loops
-    // (`scrubStats`); a distribution that walks every range for each unit, or every range for each mark, is 64×.
+    // (`scrubStats`, each loop); a distribution that walks every range for each unit, or every range for each mark, is 64×.
+    const loops = ["skipped", "taken", "swept", "passed"] as const;
     const work = (units: Parameters<typeof scrubFile>[0], marks: number) => {
-      const steps = scrubStats.steps;
+      const before = { ...scrubStats };
       let res: ReturnType<typeof scrubFile> = [];
       const w = meterWork(() => {
         res = scrubFile(units, reg);
       });
       expect(res.reduce((n, u) => n + u.marks!.length, 0)).toBe(marks);
-      return w + scrubStats.steps - steps;
+      // Each loop's own count is there: every range is taken, every mark's two ends swept, every range passed; and
+      // with several units, every unit's ranges skipped by the next one.
+      const d = Object.fromEntries(loops.map((k) => [k, scrubStats[k] - before[k]])) as Record<
+        (typeof loops)[number],
+        number
+      >;
+      expect(d.taken).toBeGreaterThanOrEqual(marks);
+      expect(d.swept).toBeGreaterThanOrEqual(2 * marks);
+      expect(d.passed).toBeGreaterThanOrEqual(marks);
+      if (units.length > 1) expect(d.skipped).toBeGreaterThanOrEqual(marks - 10);
+      return w + loops.reduce((n, k) => n + d[k], 0);
     };
     for (const [what, make] of [
       ["rows", (n: number) => work(rows(n), 10 * n)],
@@ -1543,6 +1554,24 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
       expect(small, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(10 * 1000);
       expect(big / small, `${what}: ${small} → ${big}`).toBeLessThan(10);
     }
+    // And the rows' own text is read a few times each, never once per row before it (review #217: summing every
+    // earlier row's length to place a row reads no built-in and passes no counted loop) — a getter counts it.
+    const reads = (n: number) => {
+      let count = 0;
+      const counted = rows(n).map(({ marks }) => ({
+        get text() {
+          count++;
+          return rowText;
+        },
+        marks,
+      }));
+      expect(scrubFile(counted, reg).reduce((k, u) => k + u.marks!.length, 0)).toBe(10 * n);
+      return count;
+    };
+    const fewRows = reads(1000);
+    const manyRows = reads(8000);
+    expect(fewRows, "the rows' text was read").toBeGreaterThanOrEqual(1000);
+    expect(manyRows / fewRows, `text reads: ${fewRows} → ${manyRows}`).toBeLessThan(10);
   });
 
   it("[P2] reads are served from the cache until the extraction or the known secrets change", async () => {
