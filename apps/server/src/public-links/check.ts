@@ -44,7 +44,11 @@ const HOST_MAX = 253;
 /** The span read after `//` for the userinfo and joined candidates (a host alone is ≤ 253). */
 const AUTHORITY_MAX = HOST_MAX + 128;
 /** A host character: a Unicode letter, digit or mark, `-` or `.` (anything else ends candidate (a)). */
-const HOST_CHAR = /[\p{L}\p{N}\p{M}.-]/u;
+const HOST_CHAR = /^[\p{L}\p{N}\p{M}.\u3002\uff0e\uff61-]$/u;
+/** Dots: ASCII and the ideographic / fullwidth / halfwidth ones `domainToASCII` maps to it. */
+const TRAILING_DOTS = /[.\u3002\uff0e\uff61-]+$/u;
+/** Hosts listed in a check answer at most; the rest are counted (`externalHostsMore`). */
+export const HOSTS_LISTED = 100;
 /**
  * What ends the span (candidates (b), (c)): whitespace other than tab and newline (those the URL parser removes), the
  * URL's own delimiters `/ ? #` and `\`, quotes, `<` `>` and the backtick.
@@ -56,11 +60,35 @@ const SPAN_END =
 /** The page's own placeholder base (relative URLs resolve there): never an external host. */
 export const PAGE_HOST = "artifact.invalid";
 
-/** The maximal run of host characters at the start of `s` (candidate (a)). */
+/**
+ * The maximal run of host characters at the start of `s` (candidate (a)), read by code point — a character outside
+ * the BMP (`𠮷`) is one host character, not two halves that each fail the test.
+ */
 function hostRun(s: string): string {
   let i = 0;
-  while (i < s.length && i < HOST_MAX + 64 && HOST_CHAR.test(s[i]!)) i++;
+  while (i < s.length && i < HOST_MAX + 64) {
+    const cp = s.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    if (!HOST_CHAR.test(ch)) break;
+    i += ch.length;
+  }
   return s.slice(0, i);
+}
+
+/**
+ * The readings of one span: (a) its leading host run; (b) the run after its last `@`; (b′) the run after the last
+ * `@` before its first `)` or `,` (`url(https://reader@cdn.example.org),url(icon@2x.png)`).
+ */
+function readings(span: string): string[] {
+  const out = [hostRun(span)];
+  const last = span.lastIndexOf("@");
+  if (last !== -1) out.push(hostRun(span.slice(last + 1)));
+  const cut = span.search(/[),]/);
+  if (cut !== -1) {
+    const before = span.lastIndexOf("@", cut);
+    if (before !== -1 && before !== last) out.push(hostRun(span.slice(before + 1)));
+  }
+  return out;
 }
 
 /**
@@ -69,7 +97,7 @@ function hostRun(s: string): string {
  * IP address, not the page's own `artifact.invalid`.
  */
 function asHost(candidate: string): string | undefined {
-  const raw = candidate.replace(/:\d*$/, "").replace(/[.-]+$/, "");
+  const raw = candidate.replace(/:\d*$/, "").replace(TRAILING_DOTS, "");
   if (!raw || raw.length > HOST_MAX + 64) return undefined;
   const ascii = domainToASCII(raw).replace(/\.+$/, "");
   if (!ascii || ascii.length > HOST_MAX || ascii === PAGE_HOST) return undefined;
@@ -85,21 +113,24 @@ function asHost(candidate: string): string | undefined {
  * reading of an address (review #209 round 7: rather than one parse that some input always defeats, the **union** of
  * a few bounded readings). For each `//` (extra `/` and `\` after it skipped):
  * - (a) the run of host characters right after it — it ends at `!`, `&`, `,`, `:`, a newline, …;
- * - (b) the same run after the last `@` within the span (`last,first@docs.example.org`);
- * - (c) the run at the start of the span with tabs and newlines removed (a host split by a newline).
+ * - (b) the same run after the last `@` within the span (`last,first@docs.example.org`), and (b′) after the last `@`
+ *   before the span's first `)` or `,` (a later CSS value's `@` does not hide this URL's host);
+ * - (c) all of these again on the span with tabs and newlines removed (a host split by a newline).
+ * Host characters are read by code point (`𠮷`), ideographic and fullwidth dots (`。` `．` `｡`) count as dots.
  * The span runs to whitespace other than tab and newline, `/ ? # \`, a quote, `<`, `>` or the backtick, at most
  * `AUTHORITY_MAX` characters; the scan resumes after it, so no stretch of the text is read twice. Each candidate goes
- * through `asHost`. At most 10, sorted.
+ * through `asHost`. Every distinct host, sorted — never cut short (review #209 round 8); the answer lists the first
+ * `HOSTS_LISTED` and counts the rest.
  */
 export function mentionedHosts(...texts: string[]): string[] {
   const hosts = new Set<string>();
   const add = (c: string) => {
     const h = asHost(c);
-    if (h && hosts.size < 10) hosts.add(h);
+    if (h) hosts.add(h);
   };
   for (const text of texts) {
     let from = 0;
-    while (hosts.size < 10) {
+    for (;;) {
       const at = text.indexOf("//", from);
       if (at === -1) break;
       let i = at + 2;
@@ -107,11 +138,10 @@ export function mentionedHosts(...texts: string[]): string[] {
       const start = i;
       while (i < text.length && i - start < AUTHORITY_MAX && !SPAN_END.test(text[i]!)) i++;
       const span = text.slice(start, i);
-      add(hostRun(span));
-      const last = span.lastIndexOf("@");
-      if (last !== -1) add(hostRun(span.slice(last + 1)));
+      for (const r of readings(span)) add(r);
+      // (c) The span with tabs and newlines removed, read the same ways.
       const joined = span.replace(/[\t\r\n]/g, "");
-      if (joined !== span) add(hostRun(joined));
+      if (joined !== span) for (const r of readings(joined)) add(r);
       from = Math.max(i, at + 2);
     }
   }
@@ -141,6 +171,12 @@ export function checkVersion(
     // The title is shown too (the page's heading, the download's file name): counted with the content.
     emails: countEmails(v.title) + countEmails(v.content),
     phones: countOf(PHONE, v.title) + countOf(PHONE, v.content),
-    externalHosts: mentionedHosts(v.title, v.content),
+    ...(() => {
+      const all = mentionedHosts(v.title, v.content);
+      return {
+        externalHosts: all.slice(0, HOSTS_LISTED),
+        externalHostsMore: Math.max(0, all.length - HOSTS_LISTED),
+      };
+    })(),
   };
 }

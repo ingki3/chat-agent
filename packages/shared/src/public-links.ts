@@ -41,7 +41,9 @@ export const PublicLinkCheck = z.object({
   secret: z.boolean(),
   emails: z.number().int().nonnegative(),
   phones: z.number().int().nonnegative(),
+  /** The first 100, sorted; `externalHostsMore` counts the rest. */
   externalHosts: z.array(z.string()),
+  externalHostsMore: z.number().int().nonnegative(),
 });
 export type PublicLinkCheck = z.infer<typeof PublicLinkCheck>;
 

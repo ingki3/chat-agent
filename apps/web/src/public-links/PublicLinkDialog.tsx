@@ -13,6 +13,12 @@ export function daysOf(raw: string): number | undefined {
   return /^\d+$/.test(raw.trim()) && n >= PUBLIC_LINK_DAYS.min && n <= PUBLIC_LINK_DAYS.max ? n : undefined;
 }
 
+/** The first 10 hosts, then "외 N개" for the rest (listed or only counted by the server). */
+export function hostList(c: Pick<PublicLinkCheck, "externalHosts" | "externalHostsMore">): string {
+  const rest = c.externalHosts.length - 10 + c.externalHostsMore;
+  return c.externalHosts.slice(0, 10).join(", ") + (rest > 0 ? ` 외 ${rest}개` : "");
+}
+
 /** What the pre-publish check found, as the dialog says it: a block, warnings and a notice. */
 export function checkNotices(c: PublicLinkCheck): { level: "block" | "warn" | "info"; text: string }[] {
   const out: { level: "block" | "warn" | "info"; text: string }[] = [];
@@ -29,7 +35,7 @@ export function checkNotices(c: PublicLinkCheck): { level: "block" | "warn" | "i
   if (c.externalHosts.length)
     out.push({
       level: "info",
-      text: `이 문서에 나오는 외부 주소: ${c.externalHosts.join(", ")} — 공개 페이지가 여기서 내용을 불러올 수 있고, 그러면 방문자 정보(IP 등)가 그 사이트에 전달돼요.`,
+      text: `이 문서에 나오는 외부 주소: ${hostList(c)} — 공개 페이지가 여기서 내용을 불러올 수 있고, 그러면 방문자 정보(IP 등)가 그 사이트에 전달돼요.`,
     });
   return out;
 }

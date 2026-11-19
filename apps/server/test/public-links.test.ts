@@ -540,6 +540,7 @@ describe("who makes one, and what is checked first", () => {
       emails: 1,
       phones: 1,
       externalHosts: ["cdn.jsdelivr.net", "images.example.org"],
+      externalHostsMore: 0,
     });
   });
 
@@ -862,8 +863,15 @@ describe("review #209 rounds 3–5: external addresses are those the version men
       "a-b.example",
       "example.com",
     ]);
-    // At most 10.
-    expect(hosts(Array.from({ length: 30 }, (_, i) => `https://h${i}.example/`).join(" "))).toHaveLength(10);
+    // Never cut short (round 8): every host is found; the answer lists 100 and counts the rest.
+    expect(hosts(Array.from({ length: 30 }, (_, i) => `https://h${i}.example/`).join(" "))).toHaveLength(30);
+    const many = checkVersion({
+      version: 1,
+      title: "t",
+      content: Array.from({ length: 150 }, (_, i) => `https://h${i}.example/`).join(" "),
+    });
+    expect(many.externalHosts).toHaveLength(100);
+    expect(many.externalHostsMore).toBe(50);
   });
 
   it("hosts as the URL parser reads them: Unicode, userinfo, extra slashes, tab/newline, port (review #209 round 6)", () => {
@@ -934,7 +942,7 @@ describe("review #209 round 7: the union of readings never reports less than bef
     expect(failures).toEqual([]);
     // Every earlier implementation is in the record.
     expect(Object.keys(Object.values(prior)[0]!).sort()).toEqual(
-      ["c536cf1", "2b025c9", "7e03a2f", "22f926c", "dbc308e", "7db8e29", "43208e1"].sort(),
+      ["c536cf1", "2b025c9", "7e03a2f", "22f926c", "dbc308e", "7db8e29", "43208e1", "89db51e"].sort(),
     );
   });
 
@@ -944,5 +952,24 @@ describe("review #209 round 7: the union of readings never reports less than bef
     expect(hosts("참고 https://docs.example.org!")).toEqual(["docs.example.org"]);
     expect(hosts('<a href="https://docs.example.org&#47;help">')).toEqual(["docs.example.org"]);
     expect(hosts("https://last,first@docs.example.org/help")).toContain("docs.example.org");
+  });
+});
+
+describe("review #209 round 8", () => {
+  const hosts = (content: string) => checkVersion({ version: 1, title: "t", content }).externalHosts;
+  it("no cap while scanning: the last real host after many noisy readings is found", () => {
+    const noisy = [0, 1, 2, 3, 4].map((i) => `<img src=https://cdn${i}.example.org\nalt=logo>`).join("\n");
+    expect(hosts(`${noisy}\n<img src="https://icons.example.org/a">`)).toContain("icons.example.org");
+  });
+  it("code points outside the BMP and ideographic / fullwidth dots", () => {
+    expect(hosts("https://𠮷田.example.org/a")).toEqual([domainToASCII("𠮷田.example.org")]);
+    expect(hosts("https://文書。example.org/a")).toEqual([domainToASCII("文書.example.org")]);
+    expect(hosts("https://文書．example．org/a")).toEqual([domainToASCII("文書.example.org")]);
+  });
+  it("after-@ readings on the newline-joined span too, and an @ in a later CSS value", () => {
+    expect(hosts('<a href="https://reader@docs.exa\nmple.org/help">')).toContain("docs.example.org");
+    expect(hosts("background-image:url(https://reader@cdn.example.org),url(icon@2x.png)")).toContain(
+      "cdn.example.org",
+    );
   });
 });

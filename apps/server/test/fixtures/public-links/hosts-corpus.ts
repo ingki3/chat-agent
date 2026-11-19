@@ -107,6 +107,30 @@ export const HOSTS_CORPUS: { name: string; content: string; title?: string; targ
     content: "https://last,first@docs.example.org/help",
     target: ["docs.example.org"],
   },
+  // Round 8
+  {
+    name: "five noisy readings, then a sixth host",
+    content:
+      [0, 1, 2, 3, 4].map((i) => `<img src=https://cdn${i}.example.org\nalt=logo>`).join("\n") +
+      '\n<img src="https://icons.example.org/a">',
+    target: ["cdn0.example.org", "cdn4.example.org", "icons.example.org"],
+  },
+  {
+    name: "astral host character",
+    content: "https://𠮷田.example.org/a",
+    target: ["xn--rnyn687f.example.org"],
+  },
+  { name: "ideographic dot", content: "https://文書。example.org/a", target: ["xn--7dvz5a.example.org"] },
+  {
+    name: "userinfo, then a newline in the host",
+    content: '<a href="https://reader@docs.exa\nmple.org/help">',
+    target: ["docs.example.org"],
+  },
+  {
+    name: "@ in a later CSS value",
+    content: "background-image:url(https://reader@cdn.example.org),url(icon@2x.png)",
+    target: ["cdn.example.org"],
+  },
   // Ordinary documents
   {
     name: "ordinary HTML",

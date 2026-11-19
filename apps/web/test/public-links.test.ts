@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkNotices, daysOf, mergePages } from "../src/public-links/PublicLinkDialog.js";
+import { checkNotices, daysOf, hostList, mergePages } from "../src/public-links/PublicLinkDialog.js";
 
 /** The "공개 링크 만들기" dialog's rules (#204): whole days 1–365 only, and what the pre-publish check says. */
 describe("public link dialog", () => {
@@ -11,13 +11,23 @@ describe("public link dialog", () => {
   });
 
   it("a secret blocks; emails and phone numbers warn; external hosts are a notice", () => {
-    expect(checkNotices({ version: 1, secret: false, emails: 0, phones: 0, externalHosts: [] })).toEqual([]);
+    expect(
+      checkNotices({
+        version: 1,
+        secret: false,
+        emails: 0,
+        phones: 0,
+        externalHosts: [],
+        externalHostsMore: 0,
+      }),
+    ).toEqual([]);
     const n = checkNotices({
       version: 1,
       secret: true,
       emails: 2,
       phones: 1,
       externalHosts: ["cdn.jsdelivr.net"],
+      externalHostsMore: 0,
     });
     expect(n.map((x) => x.level)).toEqual(["block", "warn", "info"]);
     expect(n[1]!.text).toContain("이메일 주소 2개, 전화번호 1개");
@@ -34,5 +44,17 @@ describe("public link lists", () => {
       { active: [], history: [l("old", "disabled"), l("h2", "disabled")] },
     ]);
     expect(merged).toEqual([l("old", "disabled"), l("b", "active"), l("h1", "expired"), l("h2", "disabled")]);
+  });
+});
+
+describe("external address notice", () => {
+  it("the first 10, then 외 N개 — counting the hosts the server only counted", () => {
+    const hosts = Array.from({ length: 100 }, (_, i) => `h${String(i).padStart(3, "0")}.example`);
+    expect(hostList({ externalHosts: hosts.slice(0, 3), externalHostsMore: 0 })).toBe(
+      "h000.example, h001.example, h002.example",
+    );
+    const t = hostList({ externalHosts: hosts, externalHostsMore: 50 });
+    expect(t.split(", ")).toHaveLength(10);
+    expect(t.endsWith(" 외 140개")).toBe(true);
   });
 });
