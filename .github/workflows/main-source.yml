@@ -1,0 +1,27 @@
+name: main-source
+
+# main은 dev에서 온 PR만 받는다(브랜치 규칙: feature → PR → dev → PR → main).
+# main 보호 규칙의 필수 검사 `main-source`가 이 작업이다.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+jobs:
+  main-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR 출발 브랜치가 같은 저장소의 dev인지 확인
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REPO" = "$REPO" ] && [ "$HEAD_REF" = "dev" ]; then
+            echo "ok: $HEAD_REPO:$HEAD_REF → main"
+          else
+            echo "::error::main으로는 같은 저장소의 dev 브랜치에서 온 PR만 머지할 수 있습니다 (지금: $HEAD_REPO:$HEAD_REF)."
+            exit 1
+          fi
