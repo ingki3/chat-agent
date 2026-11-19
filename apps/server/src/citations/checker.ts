@@ -128,7 +128,8 @@ export function progressNoteEnds(parts: readonly MessagePart[]): number[] {
   for (const p of parts) {
     if (p.type === "text") {
       at += p.text.length;
-      pending = at;
+      // Blank text adds nothing shown: it keeps a candidate (moved to its end), never starts one after a card.
+      if (p.text.trim() || pending !== undefined) pending = at;
     } else if (p.type === "tool_call") {
       if (pending !== undefined && out.at(-1) !== pending) out.push(pending);
     } else if (!UNSEEN.has(p.type)) pending = undefined;

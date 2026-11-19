@@ -394,20 +394,24 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
     units.sort((a, b) => a.start - b.start);
     neighbours(text, units);
     // A paragraph a tool call cut mid-sentence: the last one before it and the first one after it, no blank line
-    // between, and the part does not end a sentence (`endsSentence` — a part that does is its own paragraph, as
-    // the screen shows it: a progress note, #202).
+    // between, and the part does not end a sentence nor stop at `…`, `:`, `：` (`endsPart` — such a part is its own
+    // paragraph, as the screen shows it: a progress note, #202).
     const prev = out.filter((u) => !u.footnote && !u.inline).at(-1);
     const first = units.find((u) => !u.footnote && !u.inline);
     if (
       prev?.para &&
       first?.para &&
       (prev.kind === "body" || prev.kind === "lead_in") &&
-      first.kind === "body" &&
-      !endsSentence(text, prev.start, prev.end) &&
+      (first.kind === "body" || first.kind === "lead_in") &&
+      !endsPart(text, prev.start, prev.end) &&
       !/\r?\n[ \t]*\r?\n/.test(text.slice(prev.end, first.start))
     ) {
+      // The joined paragraph is a lead-in when its second half was one (a list or table follows it in its part)
+      // and the whole still reads as one (one short line ending with a colon) — review 7차.
+      const joined = text.slice(prev.start, first.end).trim();
+      const lead = first.kind === "lead_in" && !/[\r\n]/.test(joined) && joined.length <= 120;
       prev.end = first.end;
-      prev.kind = "body";
+      prev.kind = lead ? "lead_in" : "body";
       units.splice(units.indexOf(first), 1);
     }
     out.push(...units);
@@ -437,7 +441,9 @@ function neighbours(text: string, units: Unit[]): void {
   for (const u of units) {
     if (u.inline) continue;
     const key = u.note ?? "";
-    groups.set(key, [...(groups.get(key) ?? []), u]);
+    const g = groups.get(key);
+    if (g) g.push(u);
+    else groups.set(key, [u]);
   }
   for (const g of groups.values())
     g.forEach((u, i) => {
@@ -596,13 +602,8 @@ export function sentenceSpans(t: string): TextRange[] {
   return out;
 }
 
-/**
- * Whether `text[start, end)` ends a sentence where it stops (review 6차 — `sentenceSpans`' rule at a text part's
- * end): its last visible character, past closing brackets, quotes, emphasis and markers, is sentence punctuation —
- * not a `.` between two ASCII letters or digits, looking across the end at the character right after it (`3.` then
- * `5%` in the next part is a number).
- */
-export function endsSentence(text: string, start: number, end: number): boolean {
+/** The last visible character of `text[start, end)` past closing brackets, quotes, emphasis and markers, and its index. */
+function lastMark(text: string, start: number, end: number): number {
   let k = end;
   while (k > start && /\s/u.test(text[k - 1]!)) k--;
   for (;;) {
@@ -611,9 +612,27 @@ export function endsSentence(text: string, start: number, end: number): boolean 
     else if (k > start && CLOSER.test(text[k - 1]!)) k--;
     else break;
   }
-  const ch = text[k - 1];
+  return k - 1;
+}
+
+/**
+ * Whether `text[start, end)` ends a sentence where it stops (review 6차 — `sentenceSpans`' rule at a text part's
+ * end): its last visible character, past closing brackets, quotes, emphasis and markers, is sentence punctuation —
+ * not a `.` between two ASCII letters or digits, looking across the end at the character right after it (`3.` then
+ * `5%` in the next part is a number).
+ */
+export function endsSentence(text: string, start: number, end: number): boolean {
+  const k = lastMark(text, start, end);
+  const ch = k >= start ? text[k] : undefined;
   if (!ch || !TERMINAL.test(ch)) return false;
-  return !(ch === "." && WORD.test(text[k - 2] ?? "") && WORD.test(text[k] ?? ""));
+  return !(ch === "." && WORD.test(text[k - 1] ?? "") && WORD.test(text[k + 1] ?? ""));
+}
+
+/** A text part that stops where it ends: a sentence, or `…`, `:`, `：` (review 7차 — as before #202's last rounds). */
+function endsPart(text: string, start: number, end: number): boolean {
+  if (endsSentence(text, start, end)) return true;
+  const k = lastMark(text, start, end);
+  return k >= start && /[…:：]/u.test(text[k]!);
 }
 
 /**

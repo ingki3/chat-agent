@@ -2139,6 +2139,38 @@ describe("citationNote", () => {
       );
     });
 
+    it("review 7차: blank text after a card, parts ending in … or :, a lead-in cut mid-sentence", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("반도체 수출은 늘었어요."),
+          card,
+          ...text("\n"),
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["반도체 수출은 늘었어요."]);
+      // A part that stops at … or : is its own paragraph: the earlier marker does not cover the next part's fact.
+      for (const head of ["지난해는 30명이었습니다[1]…", "출처 자료[1]:", "출처 자료[1]："])
+        expect(
+          missingOf([...read("a"), ...text(head), ...read("b"), ...text("올해는 50명입니다.")]),
+          head,
+        ).toEqual(["올해는 50명입니다."]);
+      // A lead-in cut mid-sentence joins the paragraph before it; a list or table after it is still its list.
+      const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+      for (const after of [table, "- 학종이에요[1]"])
+        expect(
+          missingOf([
+            ...read("a"),
+            ...text("2027학년도 모집 "),
+            ...read("b"),
+            ...text(`인원[1]:\n\n${after}`),
+          ]),
+          after,
+        ).toEqual([]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [
