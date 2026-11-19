@@ -1244,6 +1244,8 @@ describe("the browser never outlives its owner (#170)", () => {
         const newcomer = sleeper();
         rows = [...rows, row(newcomer, G, `${CHROME} --user-data-dir=${second.workDir}/profile`)];
         expect(await within(5000, () => !alive(watchdogChild) && !alive(browser))).toBe(true);
+        // Confirmed gone and off the list before `afterEach` (each sleeper is a group of its own).
+        for (const pid of [watchdogChild, browser]) expect(await gone(pid)).toBe(true);
         rows = rows.filter((r) => r.pid !== watchdogChild && r.pid !== browser);
         // Live members it cannot attribute stay in the group: never confirmed — given up at the deadline.
         expect(await within(5000, () => incomplete.length > 0)).toBe(true);
@@ -1456,6 +1458,7 @@ describe("the browser never outlives its owner (#170)", () => {
       // Stopped by its owner (stdin closed): a TERM could come before Perl has installed its handler.
       w.l.child.stdin!.end();
       expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+      expect(await gone(w.l.child.pid!)).toBe(true); // off the list before `afterEach`
     });
 
     it("psEncode (macOS): exactly what `ps` prints in the C locale — controls, DEL, C1, multibyte, backslash", () => {
@@ -1540,6 +1543,38 @@ describe("the browser never outlives its owner (#170)", () => {
           { darwin: [2_000_000_100], linux: [2_000_000_100, 2_000_000_101] }[process.platform as string] ??
           [];
         expect([...signalled].sort()).toEqual(want);
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("documented residuals (ps output is flattened and lossy): same group and exact profile token still required", () => {
+      // macOS prints a non-ASCII path and the ASCII path spelling out its encoding the same way.
+      expect(psEncode("/opt/é/chrome", "darwin")).toBe(psEncode("/opt/M-CM-)/chrome", "darwin"));
+      const d = "/t/agentlee-render-ZzZ999";
+      const G = 2_000_000_071;
+      const listed = [
+        `/opt/chrome Helper --user-data-dir=${d}/profile`, // another executable whose path begins "<browser> "
+        `/opt/chrome Helper --user-data-dir=${d}/profile2`, // … without the exact token
+        `/opt/chrome --user-data-dir=/t/agentlee-render-Other1/profile`, // the browser of another folder
+      ].map((a, i) => ({ pid: 2_000_000_200 + i, pgid: G, zombie: false, args: psEncode(a)! }));
+      const other = {
+        pid: 2_000_000_210,
+        pgid: G + 1,
+        zombie: false,
+        args: psEncode(`/opt/chrome --user-data-dir=${d}/profile`)!,
+      };
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => [...listed, other] }));
+        trackRender(G, { workDir: d, lockFd: -1 }, { browser: "/opt/chrome" });
+        killLiveRenders();
+        const signalled = [...new Set(kill.mock.calls.filter(([t]) => t > 0).map(([t]) => t))];
+        // Pinned: the `chrome Helper` row with the exact token is taken for ours; nothing without the token or
+        // outside the group is.
+        expect(signalled).toEqual(
+          process.platform === "darwin" || process.platform === "linux" ? [2_000_000_200] : [],
+        );
       } finally {
         kill.mockRestore();
       }
