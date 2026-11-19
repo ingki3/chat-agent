@@ -1547,12 +1547,10 @@ describe("the production launcher's sandbox policy (checked on every platform)",
  */
 async function udpListener() {
   const sock = dgram.createSocket("udp4");
-  // `ports`: the distinct source ports (one per UDP socket of the sender).
-  const got = { n: 0, ports: new Set<number>() };
+  const got = { n: 0 };
   const COOKIE = 0x2112a442;
   sock.on("message", (m, from) => {
     got.n++;
-    got.ports.add(from.port);
     if (m.length < 20 || m.readUInt16BE(0) !== 0x0001 || m.readUInt32BE(4) !== COOKIE) return;
     const res = Buffer.alloc(32);
     res.writeUInt16BE(0x0101, 0); // binding success
@@ -1732,26 +1730,46 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     expect(await read(sandboxedLauncher)).not.toContain("FAMILY-SECRET");
   });
 
-  it("WebRTC/UDP with the policy switch dropped and every browser layer off: the kernel stops the UDP", async () => {
-    // How many UDP sockets the document's gathering uses on this machine: the same document, the same switches, no
-    // sandbox — each socket sends its STUN request from its own port. Gathering finishes there.
-    const control = await udpListener();
-    const c = renderer({
-      launcher: unsandboxedLauncher,
-      test: {
-        csp: false,
-        intercept: false,
-        proxy: false,
-        args: dropWebrtcPolicy,
-        afterLoad: afterIce((ice) => ice.complete && control.got.n > 0),
-      },
+  it("the kernel refuses UDP under the renderer's own profile: a probe's send fails (EPERM), nothing arrives; without the profile it does", async () => {
+    // The authoritative check of the kernel rule (#207 review): one process, one datagram, the errno — no inference
+    // from how Chrome's ICE behaves.
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
+    closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
+    const node = fs.realpathSync(process.execPath);
+    const probe = [path.join(FIXTURES, "net-probe.mjs"), "udp"];
+    // Control: the same probe without the profile reaches the listener.
+    const open = await udpListener();
+    const c = spawnSync(node, [...probe, String(open.port)], { encoding: "utf8", timeout: 20_000 });
+    expect(JSON.parse(c.stdout)).toEqual({ udpLocal: "sent" });
+    expect(await within(SETTLE_MS, () => open.got.n > 0)).toBe(true);
+    // Under the renderer's profile (the one its browser runs in): the send itself is refused by the kernel.
+    const shut = await udpListener();
+    const policy = rendererSandbox({
+      browser: node,
+      args: [],
+      env: {},
+      workDir,
+      proxyPort: 9,
+      lockFd: -1,
+      deadlineSec: 30,
     });
-    expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
-    const sockets = control.got.ports.size;
-    expect(sockets).toBeGreaterThan(0);
-    // In the sandbox the kernel refuses the send and Chrome closes each socket (a 701 candidate error each); its
-    // gathering then never reports "complete" (not within 50 s, measured — #207 review). The same stage here is
-    // every one of those sockets having tried and failed: no socket is left that could still send.
+    const r = await runIsolated({
+      ...policy,
+      command: node,
+      args: [...probe, String(shut.port)],
+      read: [FIXTURES],
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+    });
+    expect(JSON.parse(r.stdout).udpLocal).toMatch(/^err:(EPERM|EACCES)$/);
+    await new Promise((d) => setTimeout(d, 300));
+    expect(shut.got.n).toBe(0);
+  });
+
+  it("smoke (not authoritative): Chrome in the sandbox with the policy switch dropped and every browser layer off sends no UDP", async () => {
+    // A secondary check only: Chrome's gathering never reports "complete" here (after the kernel refuses the send it
+    // closes each socket — a 701 candidate error — and stays "gathering"; measured over 50 s), so this render cannot
+    // prove that no send came late. The kernel rule itself is checked deterministically by the probe above.
     const l = await udpListener();
     const { r } = renderer({
       launcher: sandboxedLauncher,
@@ -1760,7 +1778,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
         intercept: false,
         proxy: false,
         args: dropWebrtcPolicy,
-        afterLoad: afterIce((ice) => ice.complete || ice.errors >= sockets),
+        afterLoad: afterIce((ice) => ice.complete || ice.errors > 0),
       },
     });
     expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
