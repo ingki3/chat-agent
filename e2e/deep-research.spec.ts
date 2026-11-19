@@ -72,6 +72,23 @@ test("plan card: cancel, and 중지 while it runs", async ({ page, baseURL }) =>
   await expect(second.getByTestId("research-ended")).toHaveText("중지했어요");
 });
 
+test("a new chat can start with 깊이 조사: the conversation is made, the plan card waits", async ({
+  page,
+  baseURL,
+}) => {
+  const who = await newMember(page.context().browser()!, baseURL!, "research-new");
+  await signIn(page, baseURL!, who);
+  await page.goto("/");
+  await page.getByLabel("메시지 입력").fill("10월 반도체 수출을 깊이 조사해 줘");
+  await page.getByTestId("research-start").click();
+  await page.waitForURL(/\/c\/[^/]+$/);
+  const card = page.getByTestId("research-card");
+  await expect(card).toHaveAttribute("data-status", "awaiting_approval", { timeout: 15_000 });
+  await expect(card.getByTestId("research-plan-item")).toHaveCount(2);
+  await card.getByTestId("research-cancel").click();
+  await expect(card).toHaveAttribute("data-status", "cancelled");
+});
+
 test("Codex conversations: the button says why it cannot be used", async ({ page, baseURL }) => {
   const who = await newMember(page.context().browser()!, baseURL!, "research-codex");
   await signIn(page, baseURL!, who);

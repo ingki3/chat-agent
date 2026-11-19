@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import {
   ResearchPlan,
   ResearchResult,
@@ -28,6 +28,8 @@ export type ResearchNote = {
   /** The page or file's name (for the writer's list; page text, so it reaches the model as external content). */
   title?: string | undefined;
   page?: number | undefined;
+  /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
+  place?: string | undefined;
 };
 
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
@@ -43,6 +45,11 @@ export type JobState = {
   questions: QuestionRecord[];
   /** The cap (or the research stage's budget) ended research early. */
   timedOut: boolean;
+  /**
+   * The sources the owner approved (the union of the approved sub-questions' scopes): a gap question added by the lead
+   * stays within them — a files-only plan never searches the web.
+   */
+  scopes?: ("web" | "files")[] | undefined;
 };
 
 export const emptyState = (): JobState => ({
@@ -127,6 +134,7 @@ export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: 
     approvedAt: row.approvedAt,
     endedAt: row.endedAt,
     owned: opts.owned,
+    version: row.version,
   };
 }
 
@@ -214,7 +222,10 @@ export class ResearchStore {
    * wins) — false when nothing was written.
    */
   update(id: string, patch: JobPatch, from?: readonly ResearchStatus[]): boolean {
-    const set: Partial<ResearchJobRow> = { updatedAt: this.now() };
+    const set: Partial<Omit<ResearchJobRow, "version">> & { version?: SQL } = {
+      updatedAt: this.now(),
+      version: sql`${researchJobs.version} + 1`,
+    };
     if (patch.status !== undefined) set.status = patch.status;
     if (patch.clarifyQuestion !== undefined)
       set.clarifyQuestion = patch.clarifyQuestion === null ? null : scrubKnown(patch.clarifyQuestion);

@@ -195,6 +195,19 @@ export class SharePolicy {
           .all(conversationId, ids) as { id: string }[]
       ).map((r) => r.id),
     );
+    // 깊이 조사 cards (#211) in the list: their job's report versions (made under `research:<job>`) go with them, and
+    // its steps' citations — as a run's do with its reply.
+    for (const j of this.sql
+      .prepare(
+        `select id from research_jobs where conversation_id = ? and message_id in (select value from json_each(?))`,
+      )
+      .all(conversationId, ids) as { id: string }[]) {
+      runIds.add(`research:${j.id}`);
+      for (const c of this.sql
+        .prepare(`select distinct run_id as r from citations where conversation_id = ? and run_id like ?`)
+        .all(conversationId, `research:${j.id}:%`) as { r: string }[])
+        runIds.add(c.r);
+    }
     const sent = this.sql
       .prepare(
         `select id, sha256 from files where conversation_id = ? and message_id in (select value from json_each(?))`,

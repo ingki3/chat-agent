@@ -10,7 +10,13 @@ import {
   RESEARCH_PROMPTS_DIR,
   stepPrompt,
 } from "../src/research/prompts.js";
-import { cleanReport, mdText, renderReport, sentences, type ReportCitation } from "../src/research/report.js";
+import {
+  cleanReport,
+  isTopicLabel,
+  mdText,
+  renderReport,
+  type ReportCitation,
+} from "../src/research/report.js";
 import { pickNotes, summaryOf } from "../src/research/engine.js";
 import { emptyState } from "../src/research/store.js";
 
@@ -47,6 +53,7 @@ describe("cleanReport", () => {
       cites,
     );
     expect(r.removed).toBe(4);
+    // (근거 없는 문장, 실패한 인용만 있는 문장, 빈 섹션의 문장, 근거 없는 항목)
     expect(r.body).toBe(
       [
         "## 요약",
@@ -57,6 +64,7 @@ describe("cleanReport", () => {
         "## 목록",
         "",
         "- 목록 항목이다[2]",
+        "",
         "> 인용문이다[1].",
       ].join("\n"),
     );
@@ -81,16 +89,35 @@ describe("cleanReport", () => {
       new Map([cite(1)]),
     );
     expect(r.removed).toBe(2);
-    expect(r.body).toBe("## 제목\n본문이다[1].");
+    expect(r.body).toBe("## 제목\n\n본문이다[1].");
   });
 
-  it("splits sentences only where one ends (not inside numbers or addresses)", () => {
-    expect(sentences("3.5% 늘었다[1]. example.com 을 보라. 끝")).toEqual([
-      "3.5% 늘었다[1].",
-      "example.com 을 보라.",
-      "끝",
-    ]);
-    expect(sentences("늘었다.[2] 다음이다!")).toEqual(["늘었다.[2]", "다음이다!"]);
+  it("cuts sentences as #202 does: run-together sentences, factual headings, markers in links and code", () => {
+    const cites = new Map([cite(1), cite(2)]);
+    const r = cleanReport(
+      [
+        "## 요약",
+        "",
+        "근거 없는 결론이다.검증된 사실이다[1].",
+        "",
+        "## 수출이 50% 늘었다",
+        "",
+        "링크 속 표시는 인용이 아니다 [1](https://example.test). 코드 속 `a[1]`도 아니다.",
+        "3.5% 늘었다[2]. example.com 도 있다[2].",
+      ].join("\n"),
+      cites,
+    );
+    // 근거 없는 결론, 사실을 단정한 제목, 링크 속 [1]만 있는 문장, 코드 속 [1]만 있는 문장.
+    expect(r.removed).toBe(4);
+    expect(r.body).toBe("## 요약\n\n검증된 사실이다[1].\n\n3.5% 늘었다[2]. example.com 도 있다[2].");
+    expect(isTopicLabel("수출 증가의 배경")).toBe(true);
+    expect(isTopicLabel("수출이 늘었다")).toBe(false);
+    expect(isTopicLabel("2026년 10월")).toBe(false);
+  });
+
+  it("keeps a factual heading that has a verified marker", () => {
+    const r = cleanReport("## 수출이 32% 늘었다[1]\n\n본문이다[1].", new Map([cite(1)]));
+    expect(r).toMatchObject({ removed: 0, body: "## 수출이 32% 늘었다[1]\n\n본문이다[1]." });
   });
 
   it("renders the report with links only to http(s) pages and page text escaped", () => {

@@ -862,6 +862,8 @@ export class McpService {
       sources: o.sources,
       providers,
       worker,
+      // A call still in flight when its run was stopped (its token revoked) stores no source and answers nothing.
+      alive: (scope) => !this.tokens.wasRevoked(scope.runId),
       ...(o.fetchProxy ? { fetchProxy: o.fetchProxy } : {}),
     });
   }
@@ -1052,6 +1054,10 @@ export class McpService {
       skills: this.skills,
       skillsFor: (userId, scope) => this.skillsFor(userId, scope),
       runSkill: async (name, input, scope) => {
+        // A 깊이 조사 step's own limits (#211): its tools only, its call budget — refused before anything runs.
+        const limited = this.tokens.take(scope.runId, name);
+        if (limited)
+          return { ok: false, code: limited === "tool_quota" ? "skill_quota" : "skill_not_allowed" };
         this.markExternal(scope.runId);
         const t0 = now();
         const r = await this.call(byName.get(name), input, scope, runSkill);
@@ -1095,6 +1101,10 @@ export class McpService {
       toolsFor: (userId, scope) => this.toolsFor(userId, scope),
       runTool: async (name, input, scope) => {
         const t0 = now();
+        // A 깊이 조사 step's own limits (#211): its tools only, its call budget — refused before anything runs.
+        const limited = this.tokens.take(scope.runId, name);
+        if (limited)
+          return { ok: false, code: limited === "tool_quota" ? "skill_quota" : "skill_not_allowed" };
         if (name === MEMORY_LIST_TOOL.name || name === MEMORY_PROPOSE_TOOL.name) {
           const r = this.callMemoryTool(name, input, scope);
           logEvent(this.opts.log, r.ok ? "info" : "warn", "memory.proposed", {

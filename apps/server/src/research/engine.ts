@@ -3,9 +3,9 @@ import { EventEmitter } from "node:events";
 import {
   locatorLabel,
   RESEARCH_LIMITS,
+  ResearchBackendId,
   type FileLocator,
   type MessagePart,
-  type ResearchBackendId,
   type ResearchErrorCode,
   type ResearchPlan,
   type ResearchScope,
@@ -150,6 +150,7 @@ export const RESEARCH_FAILURE_TEXT: Record<ResearchErrorCode | "stopped", string
   server_restart: "서버 재시작으로 중단됐어요",
   conversation_gone: "대화가 삭제됐어요",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요",
+  runtime_changed: "대화가 Codex로 바뀌어 멈췄어요",
   stopped: "중지했어요",
 };
 
@@ -204,6 +205,9 @@ export class ResearchEngine {
   private readonly prompts: ResearchPrompts;
   private readonly backends: ResearchBackends;
   private stopping = false;
+  /** Progress streams to end at shutdown; sessions still closing after their step (bounded wait at shutdown). */
+  private readonly streams = new Set<() => void>();
+  private readonly cleanups = new Set<Promise<void>>();
   /** Every job execution in flight (tests and shutdown wait for them). */
   private readonly running = new Set<Promise<void>>();
 
@@ -257,20 +261,21 @@ export class ResearchEngine {
     userId: string;
     text: string;
     fileIds?: readonly string[] | undefined;
-    backend?: ResearchBackendId | undefined;
+    /** Any text: what is not an available backend is `backend_unavailable` (400). */
+    backend?: string | undefined;
   }): { row: ResearchJobRow; user: MessageRow; card: MessageRow } {
     if (this.stopping) throw new ResearchError("shutting_down", 503);
     const { conversations, store, files } = this.deps;
     const user = this.deps.users.byId(input.userId);
-    const backend = this.backends.get(input.backend ?? "claude");
+    const known = ResearchBackendId.safeParse(input.backend ?? "claude");
+    const backend = known.success ? this.backends.get(known.data) : undefined;
     // Stage 1: the built-in backend only (external ones plug in through `ResearchBackend.collect`, TODO #211 2단계).
     if (!backend || backend.id !== "claude" || !backend.available({ youth: user?.youth === true }))
       throw new ResearchError("backend_unavailable", 400);
     const conv = conversations.get(input.conversationId);
     if (!conv || conv.ownerId !== input.userId || !user?.active) throw new ResearchError("forbidden", 403);
     // Claude conversations only (#211 decision 3): a Codex conversation shows the button disabled with the reason.
-    if ((settingsOf(conv)?.runtime ?? "claude-code") !== "claude-code")
-      throw new ResearchError("research_claude_only", 409);
+    if (!onClaude(conv)) throw new ResearchError("research_claude_only", 409);
     this.runCtx(conv, input.userId); // throws RunAccessDenied (403) / no_runtime — before anything is written
     if (this.deps.activeRun?.(conv.id)) throw new ResearchError("run_in_progress", 409);
     const id = crypto.randomUUID();
@@ -315,6 +320,7 @@ export class ResearchEngine {
   clarify(id: string, userId: string, answer: string): ResearchJobRow {
     const row = this.owned(id, userId);
     if (row.status !== "clarifying") throw new ResearchError("research_state", 409);
+    this.stillClaude(row);
     if (this.busy(userId)) throw new ResearchError("research_busy", 409);
     this.save(id, { status: "planning", clarifyAnswer: answer }, ["clarifying"]);
     this.kick(id);
@@ -334,6 +340,7 @@ export class ResearchEngine {
     if (row.status !== "awaiting_approval") throw new ResearchError("research_state", 409);
     const plan = planOf(row);
     if (!plan) throw new ResearchError("research_state", 409);
+    this.stillClaude(row);
     if (this.busy(userId)) throw new ResearchError("research_busy", 409);
     const hasFiles = fileIdsOf(row).length > 0;
     const subQuestions = (edits ?? plan.subQuestions).slice(0, this.limits.maxSubQuestions).map((q, i) => ({
@@ -348,6 +355,8 @@ export class ResearchEngine {
       round: 0,
       reflected: -1,
       timedOut: false,
+      // What the owner approved: gap questions stay within it (a files-only plan never searches the web).
+      scopes: approvedScopes(subQuestions.map((q) => q.scope)),
       questions: subQuestions.map((q): QuestionRecord => ({
         ...q,
         round: 0,
@@ -420,7 +429,26 @@ export class ResearchEngine {
   async shutdown(): Promise<void> {
     this.stopping = true;
     for (const l of this.live.values()) l.abort.abort();
+    // Open progress streams end now (a card waiting for approval keeps one open): the server does not wait on them.
+    for (const close of [...this.streams]) close();
     await this.idle();
+    // Sessions still closing after their step ended: waited for a bounded time (their processes are killed by then).
+    await Promise.race([
+      Promise.all([...this.cleanups]),
+      new Promise<void>((r) => setTimeout(r, 10_000).unref()),
+    ]);
+  }
+
+  /** A progress stream (routes.ts): closed by `shutdown`. Returns the function that forgets it. */
+  addStream(close: () => void): () => void {
+    this.streams.add(close);
+    return () => void this.streams.delete(close);
+  }
+
+  /** A Claude conversation still (a switch to Codex after the plan): refused otherwise (#211 decision 3). */
+  private stillClaude(row: ResearchJobRow): void {
+    const conv = this.deps.conversations.get(row.conversationId);
+    if (!conv || !onClaude(conv)) throw new ResearchError("research_claude_only", 409);
   }
 
   // ---- internals ----
@@ -432,8 +460,12 @@ export class ResearchEngine {
     return row;
   }
 
-  /** Writes and tells the subscribers; `from`: only while the job is still in one of these states. */
-  private save(id: string, patch: JobPatch, from?: readonly ResearchStatus[]): boolean {
+  /**
+   * Writes and tells the subscribers; `from`: only while the job is still in one of these states; `live`: only while
+   * that execution is still the job's own (a late step result of an earlier one never changes the job).
+   */
+  private save(id: string, patch: JobPatch, from?: readonly ResearchStatus[], live?: Live): boolean {
+    if (live && (this.live.get(id) !== live || live.abort.signal.aborted)) return false;
     let ok: boolean;
     try {
       ok = this.deps.store.update(id, patch, from);
@@ -454,7 +486,7 @@ export class ResearchEngine {
       .then(() => this.execute(id, live, opts))
       .catch((e: unknown) => {
         logEvent(this.deps.log, "error", "research.failed", { researchId: id, err: e });
-        if (!live.abort.signal.aborted) this.fail(id, "runtime_error");
+        if (!live.abort.signal.aborted) this.fail(id, "runtime_error", live);
       })
       .finally(() => {
         live.cancelCap?.();
@@ -469,7 +501,7 @@ export class ResearchEngine {
       if (live.abort.signal.aborted) return;
       const row = this.get(id);
       if (!row) return;
-      if (!this.deps.users.byId(row.ownerId)?.active) return void this.fail(id, "not_allowed");
+      if (!this.deps.users.byId(row.ownerId)?.active) return void this.fail(id, "not_allowed", live);
       if (row.status === "planning") await this.plan(row, live);
       else if (row.status === "researching" || row.status === "writing") {
         this.armCap(row, live);
@@ -479,7 +511,7 @@ export class ResearchEngine {
       if (live.abort.signal.aborted) return;
       const after = this.get(id);
       // A stage that neither moved on nor was stopped would loop: end it.
-      if (after && after.status === row.status) return void this.fail(id, "runtime_error");
+      if (after && after.status === row.status) return void this.fail(id, "runtime_error", live);
     }
   }
 
@@ -529,6 +561,8 @@ export class ResearchEngine {
   private stepCtx(row: ResearchJobRow): RunCtx | ResearchErrorCode {
     const conv = this.deps.conversations.get(row.conversationId);
     if (!conv) return "conversation_gone";
+    // Switched to Codex after the plan (or while the server was down): the job ends, the card says why.
+    if (!onClaude(conv)) return "runtime_changed";
     try {
       const ctx = this.runCtx(conv, row.ownerId);
       if (ctx.adapter.capabilities().needsConnection && !ctx.connectionId) return "no_connection";
@@ -606,6 +640,10 @@ export class ResearchEngine {
         clock: this.clock,
         usage: this.deps.usage,
         forgetSession: this.deps.forgetSession,
+        track: (p) => {
+          this.cleanups.add(p);
+          void p.finally(() => this.cleanups.delete(p));
+        },
         log: this.deps.log,
       },
     );
@@ -615,7 +653,7 @@ export class ResearchEngine {
 
   private async plan(row: ResearchJobRow, live: Live): Promise<void> {
     const ctx = this.stepCtx(row);
-    if (typeof ctx === "string") return void this.fail(row.id, ctx);
+    if (typeof ctx === "string") return void this.fail(row.id, ctx, live);
     const t0 = this.clock.now();
     const files = this.files(row);
     const r = await this.step(row, ctx, {
@@ -635,12 +673,17 @@ export class ResearchEngine {
     });
     if (live.abort.signal.aborted) return;
     const activeMs = row.activeMs + (this.clock.now() - t0);
-    if (r.ended === "failed") return void this.fail(row.id, r.error ?? "runtime_error");
+    if (r.ended === "failed") return void this.fail(row.id, r.error ?? "runtime_error", live);
     const parsed = parsePlan(r.text, { hasFiles: files.length > 0, mayClarify: !row.clarifyQuestion });
-    if (!parsed) return void this.fail(row.id, "plan_failed");
+    if (!parsed) return void this.fail(row.id, "plan_failed", live);
     if (parsed.kind === "clarify")
-      this.save(row.id, { status: "clarifying", clarifyQuestion: parsed.question, activeMs }, ["planning"]);
-    else this.save(row.id, { status: "awaiting_approval", plan: parsed.plan, activeMs }, ["planning"]);
+      this.save(
+        row.id,
+        { status: "clarifying", clarifyQuestion: parsed.question, activeMs },
+        ["planning"],
+        live,
+      );
+    else this.save(row.id, { status: "awaiting_approval", plan: parsed.plan, activeMs }, ["planning"], live);
   }
 
   // ---- 2. research ----
@@ -648,9 +691,9 @@ export class ResearchEngine {
   private async research(row: ResearchJobRow, live: Live): Promise<void> {
     const plan = planOf(row);
     if (!plan || row.approvedAt === null || row.deadlineAt === null)
-      return void this.fail(row.id, "runtime_error");
+      return void this.fail(row.id, "runtime_error", live);
     const ctx = this.stepCtx(row);
-    if (typeof ctx === "string") return void this.fail(row.id, ctx);
+    if (typeof ctx === "string") return void this.fail(row.id, ctx, live);
     const state = stateOf(row);
     const files = this.files(row);
     const researchEnd = Math.min(
@@ -663,7 +706,7 @@ export class ResearchEngine {
     const stage = new AbortController();
     const cancel = this.clock.timer(researchEnd - this.clock.now(), () => stage.abort());
     const signal = anySignal(live.abort.signal, stage.signal, live.cap!.signal);
-    const persist = () => this.save(row.id, { state }, ["researching"]);
+    const persist = () => this.save(row.id, { state }, ["researching"], live);
     let error: ResearchErrorCode | undefined;
     try {
       for (;;) {
@@ -716,6 +759,7 @@ export class ResearchEngine {
           text: reflectTurn({
             question: row.question,
             plan,
+            scopes: state.scopes ?? ["web"],
             asked: state.questions.map((q) => q.question),
             notes: pickNotes(state, this.limits.maxNotes),
           }),
@@ -728,7 +772,9 @@ export class ResearchEngine {
         const asked = new Set(state.questions.map((q) => q.question));
         const gaps =
           r.ended === "done" && notes.length
-            ? parseGaps(r.text, files.length > 0).filter((g) => !asked.has(g.question))
+            ? parseGaps(r.text, files.length > 0)
+                .filter((g) => !asked.has(g.question))
+                .map((g) => ({ ...g, scope: clampScope(g.scope, state.scopes) }))
             : [];
         if (!gaps.length) {
           persist();
@@ -754,8 +800,8 @@ export class ResearchEngine {
     for (const q of state.questions)
       if (q.status === "waiting" || q.status === "running") q.status = "capped";
     state.stage = "write";
-    if (error && !allNotes(state).length) return void this.fail(row.id, error);
-    this.save(row.id, { status: "writing", state }, ["researching"]);
+    if (error && !allNotes(state).length) return void this.fail(row.id, error, live);
+    this.save(row.id, { status: "writing", state }, ["researching"], live);
   }
 
   /** The notes whose passage the server finds in their page (a source of the conversation) or attached file. */
@@ -790,7 +836,8 @@ export class ResearchEngine {
               quote: c.quote,
               fileId: f.id,
               title: f.name,
-              ...(n.page !== undefined ? { page: n.page } : {}),
+              // The verified place (the check may have found it on another page than the model said).
+              ...(placeOf(c.locator) ? { place: placeOf(c.locator) } : {}),
             };
         }
       } catch {
@@ -809,10 +856,10 @@ export class ResearchEngine {
 
   private async write(row: ResearchJobRow, live: Live, opts: { recovered?: boolean }): Promise<void> {
     const plan = planOf(row);
-    if (!plan || row.deadlineAt === null) return void this.fail(row.id, "runtime_error");
+    if (!plan || row.deadlineAt === null) return void this.fail(row.id, "runtime_error", live);
     const state = stateOf(row);
     const notes = pickNotes(state, this.limits.maxNotes);
-    if (!notes.length) return void this.fail(row.id, opts.recovered ? "server_restart" : "no_findings");
+    if (!notes.length) return void this.fail(row.id, opts.recovered ? "server_restart" : "no_findings", live);
     const files = this.files(row);
     const writeEnd = row.deadlineAt - this.limits.wrapUpMs;
     const left = writeEnd - this.clock.now();
@@ -822,7 +869,7 @@ export class ResearchEngine {
     let fallback = false;
     if (left >= MIN_WRITE_MS && !live.cap?.signal.aborted) {
       const ctx = this.stepCtx(row);
-      if (typeof ctx === "string") return void this.fail(row.id, ctx);
+      if (typeof ctx === "string") return void this.fail(row.id, ctx, live);
       const name = `write:${this.clock.now()}`;
       const r = await this.step(row, ctx, {
         name,
@@ -836,9 +883,10 @@ export class ResearchEngine {
       if (r.ended === "timeout" || r.ended === "aborted") state.timedOut = true;
       const cites = this.citationsOf(`research:${row.id}:${name}`);
       const cleaned = cleanReport(r.text, cites);
+      // What the writer wrote without a verified citation is counted whether its rest is kept or not.
+      removed = cleaned.removed;
       if (cleaned.numbering.length) {
         body = cleaned.body;
-        removed = cleaned.removed;
         sources = cleaned.numbering.map(({ from, to }) => ({ ...cites.get(from)!, k: to }));
       } else fallback = true;
     } else {
@@ -850,7 +898,7 @@ export class ResearchEngine {
       body = fb.body;
       sources = fb.sources;
     }
-    this.finishReport(row, plan, state, { body, removed, sources, fallback });
+    this.finishReport(row, plan, state, { body, removed, sources, fallback }, live);
   }
 
   /** The writer's citations by number, as the report shows them. */
@@ -918,7 +966,7 @@ export class ResearchEngine {
       verified: true,
       kind: "file",
       title: n.title ?? "첨부 파일",
-      place: n.page !== undefined ? `${n.page}쪽` : undefined,
+      place: n.place ?? (n.page !== undefined ? `${n.page}쪽` : undefined),
       quote: n.quote,
     };
   }
@@ -928,6 +976,7 @@ export class ResearchEngine {
     plan: ResearchPlan,
     state: JobState,
     r: { body: string; removed: number; sources: (ReportCitation & { k: number })[]; fallback: boolean },
+    live: Live,
   ): void {
     const { conversations, artifacts } = this.deps;
     const conv = conversations.get(row.conversationId);
@@ -945,39 +994,54 @@ export class ResearchEngine {
       unanswered,
       questions: state.questions.length,
     });
-    const made = artifacts.create(
-      { userId: row.ownerId, conversationId: row.conversationId, runId: `research:${row.id}` },
-      { kind: "markdown", title: plan.title, content },
-    );
-    artifacts.linkMessage(made.artifact.id, row.messageId);
     const summary = summaryOf(r.body);
     const text = [
       `**깊이 조사 보고서**를 만들었어요 — 하위 질문 ${state.questions.length}개, 확인된 출처 ${r.sources.length}개, 확인하지 못해 뺀 문장 ${r.removed}개.${state.timedOut ? " 시간 상한(30분)으로 일부만 조사했어요." : ""}`,
       ...(summary ? [`보고서 요약 (출처는 보고서에 있어요):\n\n${summary}`] : []),
     ].join("\n\n");
-    const parts: MessagePart[] = [
-      { type: "research", jobId: row.id },
-      { type: "text", text },
-      { type: "artifact_ref", artifactId: made.artifact.id, version: made.version.version },
-    ];
-    const result = {
-      artifactId: made.artifact.id,
-      version: made.version.version,
-      removed: r.removed,
-      citations: r.sources.length,
-      timedOut: state.timedOut,
-      fallback: r.fallback,
-    };
     state.stage = "end";
+    const runId = `research:${row.id}`;
+    // One transaction (review 1): the report, its link to the card, the card's message and `done` — all or nothing. A
+    // report this job made already (a crash right after an older version of this code) is used again, never doubled.
     const ok = this.deps.db.$client
       .transaction(() => {
+        if (
+          this.get(row.id)?.status !== "writing" ||
+          this.live.get(row.id) !== live ||
+          live.abort.signal.aborted
+        )
+          return false;
+        const prev = artifacts.list(row.conversationId).find((x) => x.runId === runId);
+        const made = prev
+          ? artifacts.update({ userId: row.ownerId, conversationId: row.conversationId, runId }, prev.id, {
+              title: plan.title,
+              content,
+            })
+          : artifacts.create(
+              { userId: row.ownerId, conversationId: row.conversationId, runId },
+              { kind: "markdown", title: plan.title, content },
+            );
+        artifacts.linkMessage(made.artifact.id, row.messageId);
+        const parts: MessagePart[] = [
+          { type: "research", jobId: row.id },
+          { type: "text", text },
+          { type: "artifact_ref", artifactId: made.artifact.id, version: made.version.version },
+        ];
+        const result = {
+          artifactId: made.artifact.id,
+          version: made.version.version,
+          removed: r.removed,
+          citations: r.sources.length,
+          timedOut: state.timedOut,
+          fallback: r.fallback,
+        };
+        if (conversations.messageById(row.messageId)) conversations.updateMessage(row.messageId, { parts });
         if (
           !this.deps.store.update(row.id, { status: "done", state, result, endedAt: this.clock.now() }, [
             "writing",
           ])
         )
-          return false;
-        if (conversations.messageById(row.messageId)) conversations.updateMessage(row.messageId, { parts });
+          throw new Error("research job changed while it was being finished");
         return true;
       })
       .immediate();
@@ -1002,8 +1066,9 @@ export class ResearchEngine {
       );
   }
 
-  private fail(id: string, code: ResearchErrorCode): void {
-    if (!this.save(id, { status: "failed", errorCode: code, endedAt: this.clock.now() }, ACTIVE)) return;
+  private fail(id: string, code: ResearchErrorCode, live?: Live): void {
+    if (!this.save(id, { status: "failed", errorCode: code, endedAt: this.clock.now() }, ACTIVE, live))
+      return;
     const row = this.get(id)!;
     logEvent(this.deps.log, "warn", "research.failed", {
       userId: row.ownerId,
@@ -1054,4 +1119,41 @@ export function summaryOf(body: string): string {
   const text = (m?.[1] ?? "").replace(/\s*\[\d{1,3}\]/g, "").trim();
   const chars = Array.from(text);
   return chars.length > 700 ? `${chars.slice(0, 699).join("")}…` : text;
+}
+
+/** The conversation answers with Claude (or has no settings yet: Claude is the service default). */
+function onClaude(conv: ConversationRow): boolean {
+  return (settingsOf(conv)?.runtime ?? "claude-code") === "claude-code";
+}
+
+/** The sources a set of approved scopes allows. */
+export function approvedScopes(scopes: readonly ResearchScope[]): ("web" | "files")[] {
+  const out = new Set<"web" | "files">();
+  for (const s of scopes) {
+    if (s === "web" || s === "both") out.add("web");
+    if (s === "files" || s === "both") out.add("files");
+  }
+  return [...out];
+}
+
+/** A gap question's scope, held within what the owner approved (an older checkpoint without it: as asked). */
+export function clampScope(
+  scope: ResearchScope,
+  allowed: readonly ("web" | "files")[] | undefined,
+): ResearchScope {
+  if (!allowed?.length) return scope;
+  const web = allowed.includes("web");
+  const files = allowed.includes("files");
+  if (web && files) return scope;
+  return web ? "web" : "files";
+}
+
+/** A verified file passage's place as the report shows it ("3쪽", "표 2 · B3"). */
+function placeOf(locator: unknown): string | undefined {
+  if (!locator || typeof locator !== "object" || !("kind" in locator)) return undefined;
+  try {
+    return locatorLabel(locator as FileLocator) || undefined;
+  } catch {
+    return undefined;
+  }
 }

@@ -335,6 +335,8 @@ export type WebServiceOptions = {
   worker?: WebWorker;
   /** The egress proxy for page fetches (tests). Default: any public host, ports 80/443. */
   fetchProxy?: Proxy;
+  /** Whether the calling run may still store what it fetched (false once it was stopped). Default: always. */
+  alive?: (scope: ToolScope) => boolean;
 };
 
 export class WebService {
@@ -464,6 +466,7 @@ export class WebService {
     const placeholders = () => taken.map(() => PLACEHOLDER);
     while (taken.length && JSON.stringify(assemble(taken, placeholders())).length > SEARCH_OUTPUT_CHARS)
       taken.pop();
+    if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
     const ids = taken.map((hit) => this.registerHit(provider, hit, scope)?.id ?? null);
     return assemble(taken, ids);
   }
@@ -488,6 +491,8 @@ export class WebService {
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
     const site = s(r.site) ?? siteOf(finalUrl);
+    // Stopped meanwhile (the worker could not be called back): nothing is stored, nothing answered.
+    if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
     const row = this.opts.sources.addPage(scope, {
       url: checked.url.toString(),
       finalUrl: finalUrl.toString(),

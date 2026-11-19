@@ -61,6 +61,8 @@ export type StepDeps = {
   usage?: { record(a: UsageAttempt, u: UsageReport): void } | undefined;
   forgetSession?: ((ref: SessionRef) => void) | undefined;
   log?: EventLogger | undefined;
+  /** Background work of a step after its result (closing a session that is slow to stop): shutdown waits for it. */
+  track?: ((p: Promise<void>) => void) | undefined;
 };
 
 /** Output beyond this is not read (a runaway step): it is stopped. */
@@ -75,94 +77,117 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
   let text = "";
   let toolCalls = 0;
   let limited = false;
+  // Settles the moment the step is stopped (its deadline, the job's stop, a limit): the result is what came until
+  // then. A runtime that is slow to stop, or never does, is not waited for — its session is closed in the background
+  // (`deps.track`) and whatever it sends later goes nowhere (#211 review 1).
+  let stopped!: () => void;
+  const stoppedNow = new Promise<"stopped">((r) => (stopped = () => r("stopped")));
   const stop = (why: StepEnd) => {
-    ended ??= why;
+    if (ended) return;
+    ended = why;
     // No more of our tools from this moment (a long call in progress sees its token gone).
     deps.mcpTokens.revokeRun(spec.stepId);
     abort.abort();
     try {
       void turn?.interrupt().catch(() => {});
     } catch {
-      // the adapter threw synchronously: the iterator below ends anyway
+      // the adapter threw synchronously: the step has ended anyway
     }
+    stopped();
   };
   const cancelTimer = deps.clock.timer(spec.ms, () => stop("timeout"));
   const onJobAbort = () => stop("aborted");
   if (spec.signal.aborted) onJobAbort();
   else spec.signal.addEventListener("abort", onJobAbort);
-  try {
-    if (ended) return { text, ended, toolCalls };
-    const mcp =
-      spec.tools.length && deps.mcp
-        ? {
-            url: (await deps.mcp.endpoint()).url,
-            token: deps.mcpTokens.issue(
-              { userId: spec.userId, conversationId: spec.conversationId, runId: spec.stepId },
-              spec.ms + 5 * 60_000,
-            ),
-          }
-        : undefined;
-    if (ended) return { text, ended, toolCalls };
-    session = await spec.adapter.start({
-      conversationId: spec.conversationId,
-      userId: spec.userId,
-      ...(spec.connectionId ? { connectionId: spec.connectionId } : {}),
-      ...(spec.connectionVersion !== null ? { connectionVersion: spec.connectionVersion } : {}),
-      signal: abort.signal,
-      history: [],
-      systemPrompt: spec.systemPrompt,
-      model: spec.model,
-      effort: spec.effort ?? undefined,
-      tools: mcp ? spec.tools : [],
-      ...(mcp ? { mcp } : {}),
-      sessionStarted: (id) => {
-        startedId = id;
-      },
-    });
-    startedId = session.externalSessionId;
-    if (ended) return { text, ended, toolCalls };
-    turn = session.turn({ text: spec.text, model: spec.model, effort: spec.effort ?? undefined });
-    for await (const ev of turn.events) {
-      if (ev.type === "text_delta") {
-        text += ev.text;
-        if (text.length > OUTPUT_MAX) stop("capped");
-      } else if (ev.type === "tool_start") {
-        toolCalls++;
-        spec.onTool?.();
-        if (spec.toolCalls !== undefined && toolCalls > spec.toolCalls) stop("capped");
-      } else if (ev.type === "usage") record(spec, deps, usageReport(ev));
-      else if (ev.type === "limit") limited = true;
-      if (ended) break;
-    }
-    if (limited) return { text, ended: "failed", toolCalls, error: "usage_limit" };
-    return { text, ended: ended ?? "done", toolCalls };
-  } catch (e) {
-    if (ended) return { text, ended, toolCalls };
-    if (limited) return { text, ended: "failed", toolCalls, error: "usage_limit" };
-    const error: ResearchErrorCode =
-      e instanceof RuntimeFailure
-        ? e.code === "runtime_auth"
-          ? "runtime_auth"
-          : e.code === "no_connection"
-            ? "no_connection"
-            : "runtime_error"
-        : "runtime_error";
-    return { text, ended: "failed", toolCalls, error };
-  } finally {
-    cancelTimer();
-    spec.signal.removeEventListener("abort", onJobAbort);
-    deps.mcpTokens.revokeRun(spec.stepId);
-    if (session) await session.close().catch(() => {});
-    // The one-off session's runtime state goes, however it ended (a start that failed half-way included).
-    if (startedId)
-      deps.forgetSession?.({
-        conversationId: "",
-        runtime: spec.adapter.id,
-        connectionId: spec.connectionId,
+  const snapshot = (): StepResult => ({ text, ended: ended ?? "done", toolCalls });
+  const work = (async (): Promise<StepResult> => {
+    try {
+      if (ended) return snapshot();
+      const mcp =
+        spec.tools.length && deps.mcp
+          ? {
+              url: (await deps.mcp.endpoint()).url,
+              token: deps.mcpTokens.issue(
+                { userId: spec.userId, conversationId: spec.conversationId, runId: spec.stepId },
+                spec.ms + 5 * 60_000,
+                // Enforced by our MCP server itself, call by call: only these tools, at most this many calls.
+                { tools: spec.tools, ...(spec.toolCalls !== undefined ? { maxCalls: spec.toolCalls } : {}) },
+              ),
+            }
+          : undefined;
+      if (ended) return snapshot();
+      session = await spec.adapter.start({
+        conversationId: spec.conversationId,
         userId: spec.userId,
-        externalSessionId: startedId,
+        ...(spec.connectionId ? { connectionId: spec.connectionId } : {}),
+        ...(spec.connectionVersion !== null ? { connectionVersion: spec.connectionVersion } : {}),
+        signal: abort.signal,
+        history: [],
+        systemPrompt: spec.systemPrompt,
+        model: spec.model,
+        effort: spec.effort ?? undefined,
+        tools: mcp ? spec.tools : [],
+        ...(mcp ? { mcp } : {}),
+        sessionStarted: (id) => {
+          startedId = id;
+        },
       });
-  }
+      startedId = session.externalSessionId;
+      if (ended) return snapshot();
+      turn = session.turn({ text: spec.text, model: spec.model, effort: spec.effort ?? undefined });
+      for await (const ev of turn.events) {
+        if (ended) break;
+        if (ev.type === "text_delta") {
+          text += ev.text;
+          if (text.length > OUTPUT_MAX) stop("capped");
+        } else if (ev.type === "tool_start") {
+          toolCalls++;
+          spec.onTool?.();
+          if (spec.toolCalls !== undefined && toolCalls > spec.toolCalls) stop("capped");
+        } else if (ev.type === "usage") record(spec, deps, usageReport(ev));
+        else if (ev.type === "limit") limited = true;
+      }
+      if (ended) return snapshot();
+      if (limited) return { text, ended: "failed", toolCalls, error: "usage_limit" };
+      return { text, ended: "done", toolCalls };
+    } catch (e) {
+      if (ended) return snapshot();
+      if (limited) return { text, ended: "failed", toolCalls, error: "usage_limit" };
+      const error: ResearchErrorCode =
+        e instanceof RuntimeFailure
+          ? e.code === "runtime_auth"
+            ? "runtime_auth"
+            : e.code === "no_connection"
+              ? "no_connection"
+              : "runtime_error"
+          : "runtime_error";
+      return { text, ended: "failed", toolCalls, error };
+    }
+  })();
+  // The session is closed and its state forgotten once the work is over — however long that takes after a stop.
+  const cleanup = work
+    .catch(() => undefined)
+    .then(async () => {
+      cancelTimer();
+      spec.signal.removeEventListener("abort", onJobAbort);
+      deps.mcpTokens.revokeRun(spec.stepId);
+      if (session) await session.close().catch(() => {});
+      if (startedId)
+        deps.forgetSession?.({
+          conversationId: "",
+          runtime: spec.adapter.id,
+          connectionId: spec.connectionId,
+          userId: spec.userId,
+          externalSessionId: startedId,
+        });
+    });
+  deps.track?.(cleanup);
+  const first = await Promise.race([work, stoppedNow]);
+  // Stopped: the text so far, frozen now — a late event cannot change the result any more.
+  if (first === "stopped") return { text, ended: ended!, toolCalls };
+  // Ended by itself: the session is closed before the result goes on (as before; a hanging close is bounded).
+  await Promise.race([cleanup, stoppedNow, new Promise<void>((r) => setTimeout(r, 3000).unref())]);
+  return first;
 }
 
 function record(spec: StepSpec, deps: StepDeps, report: UsageReport): void {

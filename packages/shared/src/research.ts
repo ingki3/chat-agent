@@ -20,7 +20,8 @@ export const RESEARCH_LIMITS = {
   wrapUpMs: 60_000,
   /** A round of research needs at least this much left, otherwise the job goes on to writing (forced wrap-up). */
   minRoundMs: 3 * 60_000,
-  /** Sub-questions of the plan (the owner may edit within this). */
+  /** Sub-questions of the plan, 2–6 (the lead's plan, the card's edits and the approval alike). */
+  minSubQuestions: 2,
   maxSubQuestions: 6,
   /** Sub-researchers at once (the lead's fan-out). */
   concurrency: 3,
@@ -65,7 +66,10 @@ export type ResearchSubQuestion = z.infer<typeof ResearchSubQuestion>;
 export const ResearchPlan = z.object({
   /** The report's title. */
   title: z.string().trim().min(1).max(120),
-  subQuestions: z.array(ResearchSubQuestion).min(1).max(RESEARCH_LIMITS.maxSubQuestions),
+  subQuestions: z
+    .array(ResearchSubQuestion)
+    .min(RESEARCH_LIMITS.minSubQuestions)
+    .max(RESEARCH_LIMITS.maxSubQuestions),
   /** The lead's estimate, minutes (shown on the card; the cap is the server's). */
   estimateMinutes: z.number().int().min(1).max(30),
   backend: ResearchBackendId,
@@ -123,6 +127,8 @@ export const ResearchErrorCode = z.enum([
   "server_restart",
   "conversation_gone",
   "not_allowed",
+  /** The conversation was switched to another runtime (Codex) before or while the job ran. */
+  "runtime_changed",
 ]);
 export type ResearchErrorCode = z.infer<typeof ResearchErrorCode>;
 
@@ -165,6 +171,8 @@ export const ResearchJob = z.object({
   approvedAt: z.number().int().nullable(),
   endedAt: z.number().int().nullable(),
   owned: z.boolean(),
+  /** +1 on every change: a page keeps the newest it has seen (an action's answer may be older than the stream). */
+  version: z.number().int().min(0),
 });
 export type ResearchJob = z.infer<typeof ResearchJob>;
 
@@ -173,7 +181,8 @@ export const StartResearchRequest = z
   .object({
     text: z.string().trim().min(1).max(RESEARCH_LIMITS.questionChars),
     fileIds: z.array(z.string().min(1).max(64)).max(FILE_LIMITS.perConversation).optional(),
-    backend: ResearchBackendId.optional(),
+    /** Checked by the server: anything but an available backend is `backend_unavailable` (400). */
+    backend: z.string().min(1).max(32).optional(),
   })
   .strict();
 export type StartResearchRequest = z.infer<typeof StartResearchRequest>;
@@ -199,7 +208,7 @@ export const ApproveResearchRequest = z
           })
           .strict(),
       )
-      .min(1)
+      .min(RESEARCH_LIMITS.minSubQuestions)
       .max(RESEARCH_LIMITS.maxSubQuestions)
       .optional(),
   })

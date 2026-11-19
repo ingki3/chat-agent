@@ -18,6 +18,9 @@ import "./research.css";
  */
 
 const key = (id: string) => ["research", id] as const;
+/** The job's newer state of the two (its `version` counts every change on the server). */
+export const newest = (old: ResearchJob | undefined, next: ResearchJob) =>
+  old && old.version > next.version ? old : next;
 
 const STATUS_TEXT: Record<ResearchJob["status"], string> = {
   planning: "계획을 세우는 중이에요…",
@@ -41,6 +44,7 @@ const ERROR_TEXT: Record<string, string> = {
   server_restart: "서버 재시작으로 중단됐어요.",
   conversation_gone: "대화가 삭제됐어요.",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요.",
+  runtime_changed: "대화가 Codex로 바뀌어 멈췄어요. 깊이 조사는 Claude 대화에서만 돼요.",
 };
 
 const SCOPE_TEXT: Record<ResearchScope, string> = { web: "웹", files: "첨부 파일", both: "웹 + 첨부" };
@@ -64,6 +68,9 @@ function useResearch(id: string) {
   const q = useQuery({
     queryKey: key(id),
     queryFn: () => research.get(id),
+    // A read that comes back older than what the stream already showed does not replace it.
+    structuralSharing: (old: unknown, next: unknown) =>
+      newest(old as ResearchJob | undefined, next as ResearchJob),
     refetchInterval: (query) =>
       polling && query.state.data && !RESEARCH_ENDED.has(query.state.data.status) ? 3000 : false,
   });
@@ -74,7 +81,7 @@ function useResearch(id: string) {
     const es = new EventSource(research.eventsUrl(id));
     es.addEventListener("job", (e) => {
       const parsed = ResearchJob.safeParse(JSON.parse((e as MessageEvent<string>).data));
-      if (parsed.success) qc.setQueryData(key(id), parsed.data);
+      if (parsed.success) qc.setQueryData<ResearchJob>(key(id), (old) => newest(old, parsed.data));
     });
     es.onerror = () => {
       es.close();
@@ -163,9 +170,8 @@ function useAction<A>(job: ResearchJob, fn: (a: A) => Promise<ResearchJob>) {
   return useMutation({
     mutationFn: fn,
     // The live stream may have brought newer states before this answer arrived (an approval's first progress comes
-    // at once): the answer is kept only when the card has not seen its state yet.
-    onSuccess: (next) =>
-      qc.setQueryData<ResearchJob>(key(job.id), (old) => (old && old.status === next.status ? old : next)),
+    // at once): the newest version wins.
+    onSuccess: (next) => qc.setQueryData<ResearchJob>(key(job.id), (old) => newest(old, next)),
     onError: () => void qc.invalidateQueries({ queryKey: key(job.id) }),
   });
 }
@@ -248,7 +254,8 @@ function PlanReview({ job }: { job: ResearchJob }) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const approve = useAction(job, (d: Draft | undefined) => research.approve(job.id, d));
   const scopes: ResearchScope[] = job.files ? ["web", "files", "both"] : ["web"];
-  const valid = !draft || (draft.length > 0 && draft.every((q) => q.question.trim()));
+  const valid =
+    !draft || (draft.length >= RESEARCH_LIMITS.minSubQuestions && draft.every((q) => q.question.trim()));
   return (
     <>
       <p className="small">
@@ -289,7 +296,7 @@ function PlanReview({ job }: { job: ResearchJob }) {
                 type="button"
                 className="ghost small"
                 aria-label={`하위 질문 ${i + 1} 빼기`}
-                disabled={draft.length <= 1}
+                disabled={draft.length <= RESEARCH_LIMITS.minSubQuestions}
                 onClick={() => setDraft(draft.filter((_, j) => j !== i))}
               >
                 ✕

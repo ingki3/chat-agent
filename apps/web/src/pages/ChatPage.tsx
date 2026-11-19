@@ -686,6 +686,17 @@ export function NewChatPage() {
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
     navigate(`/c/${id}`);
   };
+  /** 🔬 깊이 조사 as the first question (#211): the same conversation creation and chip choice as a send. */
+  const startResearch = async (text: string, fileIds: string[]) => {
+    const chosen = await choice.settled();
+    const made = await make();
+    const id = made.id;
+    const change = made.with !== chosen ? asRequest(chosen) : undefined;
+    if (change) qc.setQueryData(["conversation", id], await conversations.changeSettings(id, change));
+    await research.start(id, text, fileIds);
+    await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+    navigate(`/c/${id}`);
+  };
   // The server computes the choice (the same rules as the conversation is created with, limits included).
   const change = async (c: ChangeSettingsRequest) => {
     if (!start) return;
@@ -717,6 +728,13 @@ export function NewChatPage() {
         chip={<RuntimeChip settings={start} options={usable.data} onChange={change} />}
         conversation={conversation}
         existingFiles={NO_FILES}
+        research={{
+          start: startResearch,
+          // Claude conversations only (#211 decision 3): the chip's choice decides.
+          ...(start && start.runtime !== "claude-code"
+            ? { disabled: "깊이 조사는 Claude 대화에서만 쓸 수 있어요" }
+            : {}),
+        }}
       />
     </>
   );

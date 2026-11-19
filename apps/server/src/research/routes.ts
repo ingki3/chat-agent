@@ -114,6 +114,8 @@ export function registerResearchRoutes(
       };
       const off = engine.subscribe(req.params.id, push);
       stream.onClose(off);
+      // Ended at shutdown (preClose): a card waiting for approval never holds the server open.
+      stream.onClose(engine.addStream(() => stream.close()));
       push();
     },
   );

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7f1b3105-8fcc-4313-badb-264db7cd8ff8",
+  "id": "e68fd3ac-7ee5-4673-9b5c-722977d042b9",
   "prevId": "4f1da84b-4b42-4a6d-8b92-8f37a481b40f",
   "tables": {
     "access_syncs": {
@@ -3713,6 +3713,14 @@
         },
         "active_ms": {
           "name": "active_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "version": {
+          "name": "version",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,

@@ -2392,4 +2392,3 @@ Gemini Deep Research·OpenAI deep research 같은 외부 백엔드는 다음 단
 ### 50.6 시험
 - `pnpm vitest run apps/server/test/research.test.ts apps/server/test/research-report.test.ts` — FakeRuntime·수동 시계로 전 과정(실제 검색·외부 호출 없음).
 - `E2E_PORT=3211 pnpm e2e e2e/deep-research.spec.ts`(먼저 `pnpm build`) — 계획 카드·진행·중지·Codex 대화.
-

@@ -135,10 +135,19 @@ export function reflectTurn(input: {
   plan: ResearchPlan;
   asked: readonly string[];
   notes: readonly ResearchNote[];
+  /** What the owner approved: gap questions may use only these sources. */
+  scopes: readonly ("web" | "files")[];
 }): string {
+  const allowed =
+    input.scopes.includes("web") && input.scopes.includes("files")
+      ? "web, files, both"
+      : input.scopes.includes("files")
+        ? "files (첨부 파일만 — 웹 검색은 승인되지 않았다)"
+        : "web";
   return [
     TURN_MARK.reflect,
     `질문: ${input.question}`,
+    `쓸 수 있는 범위(scope): ${allowed}`,
     `이미 조사한 하위 질문:\n${input.asked.map((q) => `- ${q}`).join("\n")}`,
     `확인된 노트:\n${notesBlock(input.notes)}`,
   ].join("\n\n");
@@ -212,7 +221,8 @@ export function parsePlan(
       scope: opts.hasFiles ? sc : "web",
     });
   }
-  if (!subQuestions.length) return undefined;
+  // 2–6 (RESEARCH_LIMITS): fewer is no plan — the lead is asked for at least two.
+  if (subQuestions.length < RESEARCH_LIMITS.minSubQuestions) return undefined;
   const title = typeof v.title === "string" && v.title.trim() ? clip(v.title, 120) : "깊이 조사 보고서";
   const est = typeof v.estimateMinutes === "number" ? Math.round(v.estimateMinutes) : 15;
   return {

@@ -15,6 +15,7 @@ import { TURN_MARK } from "../src/research/prompts.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
+  type RuntimeEvent,
   type RuntimeSession,
   type StartContext,
 } from "../src/runtime/adapter.js";
@@ -22,6 +23,7 @@ import { fixtureWebWorker, FIXTURE_PAGES } from "../src/runtime/fake-citations.j
 import { RESEARCH_FIXTURE } from "../src/runtime/fake-research.js";
 import { defaultScript, FakeRuntime, type FakeScript, type FakeStep } from "../src/runtime/fake.js";
 import { createFamily, shareWithShared } from "./helpers/permission-matrix.js";
+import { McpTokens } from "../src/isolation/tokens.js";
 
 /**
  * 깊이 조사 (#211) end to end on the FakeRuntime (`fake-research.ts`): the plan card before any search, approval
@@ -383,10 +385,16 @@ describe("깊이 조사: plan → approve → research → verified report", () 
             text: JSON.stringify({
               title: "첨부 자료 조사",
               estimateMinutes: 3,
-              subQuestions: [{ question: "첨부 자료의 매출", scope: "files" }],
+              subQuestions: [
+                { question: "첨부 자료의 매출", scope: "files" },
+                { question: "첨부 자료의 증가율", scope: "files" },
+              ],
             }),
           },
         ];
+      // The lead asks for a web gap: the server keeps it within the approved sources (files only).
+      if (x.startsWith(TURN_MARK.reflect))
+        return [{ text: '{"gaps":[{"question":"웹에서 업계 매출 전망","scope":"web"}]}' }];
       if (x.startsWith(TURN_MARK.subagent)) {
         const fileId = /\(fileId: ([^)]+)\)/.exec(x)![1]!;
         return [
@@ -423,9 +431,19 @@ describe("깊이 조사: plan → approve → research → verified report", () 
     const done = await statusIs(t.app, job.id, "done", "failed");
     expect(done.status).toBe("done");
     expect(t.fake.contexts.at(-1)!.tools).toEqual(["cite", "file_cite"]);
+    // A files-only plan never searches the web — the gap question too was kept to the files.
+    expect(t.fake.contexts.flatMap((c) => c.tools).filter((x) => x.startsWith("web_"))).toEqual([]);
+    expect(sourcesOf(t.db, c.id)).toBe(0);
+    const v = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${done.id}`)).json());
+    expect(v.questions.map((q) => [q.round, q.scope])).toEqual([
+      [0, "files"],
+      [0, "files"],
+      [1, "files"],
+    ]);
     const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
     // The fake writer cites file notes with file_cite: the report lists the file with its passage.
-    expect(content).toContain("📎 실적.txt");
+    // The verified place of the passage (the check's own locator, not a page the model named).
+    expect(content).toMatch(/📎 실적\.txt · \S/);
     expect(content).toContain("1,234억");
   });
 });
@@ -677,5 +695,264 @@ describe("깊이 조사: notifications, Codex conversations and permissions", ()
     await until(() => t.counting.active === 0, "the sub-researchers to stop");
     await t.app.research!.idle();
     expect(t.app.research!.get(job.id)).toBeUndefined();
+  });
+});
+
+/** A runtime that never stops a writer's turn, nor closes its session, until `release()` (#212 review 1). */
+class Hanging extends Counting {
+  private releases: (() => void)[] = [];
+  private released = false;
+  release() {
+    this.released = true;
+    for (const r of this.releases.splice(0)) r();
+  }
+  override async start(ctx: StartContext): Promise<RuntimeSession> {
+    const s = await super.start(ctx);
+    if (!ctx.systemPrompt.includes("보고서 작성자")) return s;
+    const hang = () => new Promise<void>((r) => (this.released ? r() : this.releases.push(r)));
+    return {
+      ...s,
+      close: async () => {
+        await hang();
+        await s.close();
+      },
+      turn: (input) => {
+        this.turns.push(input.text);
+        return {
+          events: (async function* (): AsyncGenerator<RuntimeEvent> {
+            await hang();
+            yield* [];
+          })(),
+          interrupt: async () => {},
+        };
+      },
+    };
+  }
+}
+
+describe("깊이 조사: review 1 (#212)", () => {
+  it("a step that does not stop never holds the job past its cap: the writer is cut, the report is the passages", async () => {
+    const clock = new ManualClock();
+    const db = createTestDb();
+    const hanging = new Hanging(
+      new FakeRuntime({
+        runTools: true,
+        script: scripted((x) => (x.startsWith(TURN_MARK.subagent) ? slowNotes() : undefined)),
+      }),
+    );
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(hanging);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db,
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+      web: { worker: fixtureWebWorker(), fetchProxy: stubProxy as never, providers: ["duckduckgo"] },
+      mcp: { skills: [SELFTEST_SKILL], egress: () => stubProxy as never },
+      research: { clock },
+    });
+    closers.push(() => app.close());
+    closers.push(() => hanging.release());
+    await app.ready();
+    const f = await createFamily(app);
+    const api = (method: "POST" | "GET", url: string, payload?: unknown) =>
+      app.inject({
+        method,
+        url,
+        headers: {
+          host: "localhost:3000",
+          cookie: f.cookies.owner,
+          origin: "http://localhost:3000",
+          [CSRF_HEADER]: "1",
+          ...(payload === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(payload === undefined ? {} : { payload: payload as Record<string, unknown> }),
+      });
+    const c = app.conversations!.create(f.users.owner.id);
+    const r = await api("POST", `/api/conversations/${c.id}/research`, { text: "10월 반도체 수출" });
+    const id = (r.json() as { job: { id: string } }).job.id;
+    await statusIs(app, id, "awaiting_approval");
+    await api("POST", `/api/research/${id}/approve`, {});
+    const approvedAt = clock.now();
+    await statusIs(app, id, "writing");
+    await until(() => hanging.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    clock.advance(8 * MIN);
+    const done = await statusIs(app, id, "done");
+    expect(done.endedAt! - approvedAt).toBeLessThanOrEqual(30 * MIN);
+    expect(JSON.parse(done.result!)).toMatchObject({ fallback: true, timedOut: true });
+  });
+
+  it("keeps a sub-researcher to its own tools at our MCP server (a cite call is refused there)", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? [
+            { call: "web_fetch", input: { url: A.url } },
+            { call: "cite", input: { sourceId: "$0.sourceId", snippet: RESEARCH_FIXTURE.memory } },
+            {
+              textRefs: `NOTE ${JSON.stringify({ claim: "메모리", sourceId: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory })}\nDONE`,
+            },
+          ]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const sub = t.db.$client
+      .prepare("select count(*) as n from citations where run_id like ? and run_id not like ?")
+      .get(`research:${job.id}:%`, `research:${job.id}:write%`) as { n: number };
+    expect(sub.n).toBe(0);
+  });
+
+  it("refuses an approval or an answer after the conversation was switched to Codex, and ends a resumed job", async () => {
+    const t = await start();
+    const { conversationId, job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    t.app.conversations!.setSettings(conversationId, {
+      runtime: "codex",
+      model: "fake-large",
+      effort: null,
+      useShared: false,
+    });
+    const r = await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    expect(r.statusCode).toBe(409);
+    expect(r.json()).toEqual({ error: "research_claude_only" });
+
+    const db = createTestDb();
+    const hold = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ gate: "codex-hold" }] : undefined));
+    const t1 = await start({ db, script: hold });
+    const two = await begin(t1);
+    await statusIs(t1.app, two.job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${two.job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    t1.app.conversations!.setSettings(two.conversationId, {
+      runtime: "codex",
+      model: "fake-large",
+      effort: null,
+      useShared: false,
+    });
+    const t2 = await start({ db, family: false });
+    const failed = await statusIs(t2.app, two.job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_changed");
+    expect(t2.counting.turns).toHaveLength(0);
+  });
+
+  it("counts what the writer wrote without a citation also when the report falls back to the passages", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ text: "근거 없는 문장이다. 이것도 근거가 없다." }] : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    expect(JSON.parse(done.result!)).toMatchObject({ fallback: true, removed: 2 });
+  });
+
+  it("finishes once: a report this job already made is used again, not doubled", async () => {
+    const t = await start();
+    const { conversationId, job } = await begin(t);
+    t.app.artifacts!.create(
+      { userId: t.f.users.owner.id, conversationId, runId: `research:${job.id}` },
+      { kind: "markdown", title: "이전", content: "이전 내용" },
+    );
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    const mine = t.app.artifacts!.list(conversationId).filter((a) => a.runId === `research:${job.id}`);
+    expect(mine).toHaveLength(1);
+    expect(JSON.parse(done.result!)).toMatchObject({ artifactId: mine[0]!.id, version: 2 });
+  });
+
+  it("shares the report with the card: live share, snapshot (only once the job ended) and a fork read its body", async () => {
+    const t = await start();
+    const { conversationId, job } = await begin(t);
+    const share = (boundaryMessageId: string) =>
+      t.api(t.f.cookies.owner, "POST", `/api/conversations/${conversationId}/shares`, {
+        target: { audience: "users", userIds: [t.f.users.shared.id] },
+        mode: "snapshot",
+        boundaryMessageId,
+      });
+    const planned = await statusIs(t.app, job.id, "awaiting_approval");
+    // The card still changes: no snapshot of it yet.
+    const early = await share(planned.messageId);
+    expect(early.statusCode).toBe(409);
+    expect(early.json()).toEqual({ error: "share_run_in_progress" });
+    shareWithShared(t.f, conversationId);
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    const { artifactId } = JSON.parse(done.result!) as { artifactId: string };
+    const body = await t.api(t.f.cookies.shared, "GET", `/api/artifacts/${artifactId}/versions/1`);
+    expect(body.statusCode, body.body).toBe(200);
+    expect(body.body).toContain("10월 반도체 수출 조사");
+    const snap = await share(done.messageId);
+    expect(snap.statusCode, snap.body).toBe(201);
+    const fork = await t.api(
+      t.f.cookies.shared,
+      "POST",
+      `/api/shares/${(snap.json() as { id: string }).id}/fork`,
+      {},
+    );
+    expect(fork.statusCode, fork.body).toBe(201);
+    const forked = (fork.json() as { conversation: { id: string } }).conversation.id;
+    const list = (
+      await t.api(t.f.cookies.shared, "GET", `/api/conversations/${forked}/artifacts`)
+    ).json() as {
+      items: { id: string }[];
+    };
+    expect(list.items).toHaveLength(1);
+    const copy = await t.api(t.f.cookies.shared, "GET", `/api/artifacts/${list.items[0]!.id}/versions/1`);
+    expect(copy.body).toContain("## 출처");
+  });
+
+  it("ends a card's open progress stream at shutdown", async () => {
+    const t = await start();
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const address = await t.app.listen({ port: 0, host: "127.0.0.1" });
+    const res = await fetch(`${address}/api/research/${job.id}/events`, {
+      headers: { cookie: t.f.cookies.owner, host: "localhost:3000" },
+    });
+    expect(res.status).toBe(200);
+    const t0 = Date.now();
+    await t.app.close();
+    expect(Date.now() - t0).toBeLessThan(5000);
+    await res.body?.cancel().catch(() => {});
+  });
+
+  it("refuses an unknown backend and a plan of fewer than two sub-questions", async () => {
+    const t = await start();
+    const c = t.app.conversations!.create(t.f.users.owner.id);
+    const r = await t.api(t.f.cookies.owner, "POST", `/api/conversations/${c.id}/research`, {
+      text: "조사",
+      backend: "gemini",
+    });
+    expect(r.statusCode).toBe(400);
+    expect(r.json()).toEqual({ error: "backend_unavailable" });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const one = await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {
+      subQuestions: [{ question: "하나만", scope: "web" }],
+    });
+    expect(one.statusCode).toBe(400);
+  });
+
+  it("counts a step's tool calls at our MCP server: only its tools, never past its budget", () => {
+    const tokens = new McpTokens();
+    tokens.issue({ userId: "u", conversationId: "c", runId: "r" }, 60_000, {
+      tools: ["web_fetch"],
+      maxCalls: 2,
+    });
+    expect(tokens.take("r", "cite")).toBe("tool_not_allowed");
+    expect(tokens.take("r", "web_fetch")).toBeUndefined();
+    expect(tokens.take("r", "web_fetch")).toBeUndefined();
+    expect(tokens.take("r", "web_fetch")).toBe("tool_quota");
+    // A run without limits (a chat answer) always may.
+    tokens.issue({ userId: "u", conversationId: "c", runId: "chat" });
+    expect(tokens.take("chat", "anything")).toBeUndefined();
+    tokens.revokeRun("r");
+    expect(tokens.wasRevoked("r")).toBe(true);
   });
 });

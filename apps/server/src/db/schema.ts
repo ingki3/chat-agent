@@ -1774,6 +1774,8 @@ export const researchJobs = sqliteTable(
     result: text("result"),
     errorCode: text("error_code"),
     activeMs: integer("active_ms").notNull().default(0),
+    /** +1 on every write (the API's `version`: pages keep the newest state they have seen). */
+    version: integer("version").notNull().default(0),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
     approvedAt: integer("approved_at"),

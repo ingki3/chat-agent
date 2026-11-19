@@ -14,6 +14,7 @@ CREATE TABLE `research_jobs` (
 	`result` text,
 	`error_code` text,
 	`active_ms` integer DEFAULT 0 NOT NULL,
+	`version` integer DEFAULT 0 NOT NULL,
 	`created_at` integer NOT NULL,
 	`updated_at` integer NOT NULL,
 	`approved_at` integer,
