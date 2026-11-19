@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
-import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
+import {
+  CITATION_SCENARIOS,
+  resolveRefs,
+  type CitationScenario,
+  type CitationScenarioName,
+} from "./fake-citations.js";
 import { messageText, renderPriorContext, SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
 import { pythonScenario, type PythonScenario } from "./fake-python.js";
@@ -51,7 +56,7 @@ import {
  *                     `@@pause@@` is not sent but waits 1.5 s there (a diagram half-streamed, #182)
  *   /secrettool       a tool call whose input and output carry secret-looking fields (#14)
  *   /cite <scenario>   real calls of our web and citation tools on the fixture pages (`fake-citations.ts`:
- *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
+ *                     conflict, insufficient, partial, advice, reuse) and the scenario's answer with `[n]` markers: the run
  *                     manager's citation check then adds its note (#25)
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
  *   "매일 아침 8시 시장 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
@@ -333,8 +338,14 @@ export const FAKE_XSS = [
 function citationSteps(t: string): FakeStep[] | undefined {
   const named = /^\/cite\s+(\w+)$/.exec(t);
   if (named && Object.hasOwn(CITATION_SCENARIOS, named[1]!)) {
-    const sc = CITATION_SCENARIOS[named[1] as CitationScenarioName];
-    return [...sc.calls.map((c) => ({ call: c.tool, input: c.input })), { text: sc.answer }];
+    const sc: CitationScenario = CITATION_SCENARIOS[named[1] as CitationScenarioName];
+    return [
+      ...sc.calls.flatMap((c) => [
+        ...(c.before ? [{ text: c.before }] : []),
+        { call: c.tool, input: c.input },
+      ]),
+      { text: sc.answer },
+    ];
   }
   const file = /^\/file-(\w+)$/.exec(t);
   if (file && Object.hasOwn(FILE_SCENARIOS, file[1]!)) {

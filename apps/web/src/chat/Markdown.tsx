@@ -1,4 +1,12 @@
-import { createContext, memo, useContext, useMemo, type ComponentProps, type ReactNode } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useMemo,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
@@ -8,7 +16,10 @@ import { splitBlocks } from "./blocks.js";
 import { CopyButton } from "./CopyButton.js";
 import { fenceClosed } from "./mermaid.js";
 import { MermaidBlock } from "./MermaidBlock.js";
-import { rehypeCitationMarkers } from "../citations/markdown.js";
+import type { TextRange } from "@agentlee/shared";
+import { CITATION_MISSING_MARK } from "@agentlee/shared";
+import { rehypeCitationMarkers, rehypeMissingMarks } from "../citations/markdown.js";
+import { markEffect } from "../citations/marks.js";
 import "katex/dist/katex.min.css";
 
 /**
@@ -107,11 +118,38 @@ const components: Components = {
       <span className="badlink">🖼 {alt || "그림"}</span>
     ),
   pre: ({ node, children }) => <CodeBlock node={node as HastNode | undefined}>{children}</CodeBlock>,
-  table: ({ children }) => (
-    <div className="tablewrap">
-      <table>{children}</table>
-    </div>
-  ),
+  table: ({ children, ...props }) => {
+    // A table without a citation (#202, `rehypeMissingMarks`): marked as a whole, the ⚠️ above it when it is
+    // its range's focus target (a table continuing a range from an earlier part only gets the bar).
+    const p = props as Record<string, unknown>;
+    const target = p["data-cite-missing"];
+    return String(p.className ?? "").includes("cite-missing-block") ? (
+      <div
+        className="cite-missing-block cite-missing-table"
+        {...(typeof target === "string"
+          ? { "data-cite-missing": target, "data-testid": "citation-missing", tabIndex: -1 }
+          : {})}
+      >
+        {typeof target === "string" && (
+          <span
+            className="cite-missing-badge"
+            role="img"
+            aria-label={CITATION_MISSING_MARK}
+            title={CITATION_MISSING_MARK}
+          >
+            ⚠️
+          </span>
+        )}
+        <div className="tablewrap">
+          <table>{children}</table>
+        </div>
+      </div>
+    ) : (
+      <div className="tablewrap">
+        <table>{children}</table>
+      </div>
+    );
+  },
 };
 
 const remarkPlugins: ComponentProps<typeof ReactMarkdown>["remarkPlugins"] = [
@@ -126,23 +164,44 @@ const rehypePlugins: ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
 
 /**
  * Citation markers of a finished answer (#25): which `[n]` are citations, and how one is drawn. Without it the
- * text renders exactly as before.
+ * text renders exactly as before. `missing` (#202): the note's ranges of paragraphs without a citation (in the
+ * answer text), marked in place with the answer's `markId`.
  */
-export type MarkdownCite = { numbers: ReadonlySet<number>; render: (ns: number[]) => ReactNode };
+export type MarkdownCite = {
+  numbers: ReadonlySet<number>;
+  render: (ns: number[]) => ReactNode;
+  missing?: readonly TextRange[];
+  markId?: string;
+  /** The server's marker positions in the answer text (#202 review 3차): only these `[n]` become chips. */
+  markers?: readonly { start: number; n: number }[];
+};
 
 /** One block; memoised on its text, so finished blocks are not parsed again while the reply streams. */
 export const MarkdownBlock = memo(function MarkdownBlock({
   text,
   cite,
+  offset = 0,
 }: {
   text: string;
   cite?: MarkdownCite;
+  /** Where this block starts in the answer text (the note's ranges point into it). */
+  offset?: number;
 }) {
   const withCite = useMemo(
     () =>
       cite
         ? {
-            rehype: [...(rehypePlugins ?? []), rehypeCitationMarkers(cite.numbers)],
+            rehype: [
+              // First, while every element still has its source position (#202 review 2차).
+              ...(cite.missing?.length && cite.markId
+                ? [rehypeMissingMarks(cite.missing, offset, offset + text.length, cite.markId)]
+                : []),
+              ...(rehypePlugins ?? []),
+              rehypeCitationMarkers(
+                cite.numbers,
+                cite.markers ? { offset, markers: cite.markers, source: text } : undefined,
+              ),
+            ],
             components: {
               ...components,
               sup: ({ node, children }: { node?: unknown; children?: ReactNode }) => {
@@ -158,8 +217,11 @@ export const MarkdownBlock = memo(function MarkdownBlock({
             } as Components,
           }
         : undefined,
-    [cite],
+    [cite, offset, text],
   );
+  // Its marks are drawn — or gone again (review 2차): the answer's summary line checks for them either way.
+  const marked = !!(cite?.missing?.length && cite.markId);
+  useEffect(() => markEffect(marked), [marked, withCite]);
   return (
     <BlockText.Provider value={text}>
       <ReactMarkdown
@@ -175,11 +237,24 @@ export const MarkdownBlock = memo(function MarkdownBlock({
   );
 });
 
-const Markdown = memo(function Markdown({ text, cite }: { text: string; cite?: MarkdownCite }) {
+const Markdown = memo(function Markdown({
+  text,
+  cite,
+  offset = 0,
+}: {
+  text: string;
+  cite?: MarkdownCite;
+  /** Where this text starts in the answer text (text parts joined, #202). */
+  offset?: number;
+}) {
+  const blocks = splitBlocks(text);
+  // Where each block starts in the answer text: one pass.
+  const starts: number[] = [];
+  for (let i = 0, at = offset; i < blocks.length; at += blocks[i]!.length, i++) starts.push(at);
   return (
     <div className="md">
-      {splitBlocks(text).map((b, i) => (
-        <MarkdownBlock key={i} text={b} {...(cite ? { cite } : {})} />
+      {blocks.map((b, i) => (
+        <MarkdownBlock key={i} text={b} offset={starts[i]!} {...(cite ? { cite } : {})} />
       ))}
     </div>
   );

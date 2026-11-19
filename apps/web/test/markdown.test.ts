@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { splitBlocks } from "../src/chat/blocks.js";
 import Markdown, { MarkdownBlock, safeUrl } from "../src/chat/Markdown.js";
+import { citationUnits, uncitedUnits } from "@agentlee/shared";
 
 const render = (text: string) => renderToStaticMarkup(createElement(Markdown, { text }));
 
@@ -180,5 +181,253 @@ describe("citation markers in the markdown view (#25, #150)", () => {
     expect([...out.matchAll(/data-ns="([^"]+)"/g)].map((m) => m[1])).toEqual(["1,3", "2,4", "2"]);
     expect(out).toContain("<code>a[1]</code>");
     expect(out).toContain("목록[9]");
+  });
+});
+
+describe("paragraphs without a citation, marked in the answer (#202)", () => {
+  const ANSWER = [
+    "## 요약",
+    "",
+    "메모리 가격 회복이 증가를 이끌었어요[1].",
+    "",
+    "미국 수출 비중이 가장 컸어요.",
+    "",
+    "- **배경:** 메모리 가격이에요[1]",
+    "- **전망:** 증가를 예상해요",
+    "  - 하위 항목도 있어요",
+    "",
+    "| 자료 | 증가율 |",
+    "|---|---|",
+    "| 가 | 32% |",
+    "",
+    "> 인용문이에요.",
+  ].join("\n");
+  const range = (full: string, s: string) => {
+    const start = full.indexOf(s);
+    return { start, end: start + s.length };
+  };
+  const marked = (text: string, missing: { start: number; end: number }[], offset = 0) =>
+    renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        offset,
+        cite: { numbers: new Set([1]), render: () => createElement("b", null, "1"), missing, markId: "m1" },
+      }),
+    );
+  const marks = (html: string) =>
+    [...html.matchAll(/<(\w+)[^>]*data-cite-missing="m1"[^>]*>/g)].map((m) => m[1]);
+
+  it("each range marks its paragraph, list item, table or quote in place — with a ⚠️, the text not repeated", () => {
+    const missing = [
+      range(ANSWER, "미국 수출 비중이 가장 컸어요."),
+      range(ANSWER, "- **전망:** 증가를 예상해요"),
+      range(ANSWER, "  - 하위 항목도 있어요"),
+      range(ANSWER, "| 자료 | 증가율 |\n|---|---|\n| 가 | 32% |"),
+      range(ANSWER, "> 인용문이에요."),
+    ];
+    const out = marked(ANSWER, missing);
+    expect(marks(out)).toEqual(["p", "li", "li", "div", "blockquote"]);
+    // The ⚠️ at the end of the paragraph's own text; the nested item has its own.
+    expect(out).toMatch(
+      /미국 수출 비중이 가장 컸어요\.<span class="cite-missing-badge" role="img" aria-label="출처 표시 없음"[^>]*>⚠️<\/span><\/p>/,
+    );
+    expect(out).toMatch(/증가를 예상해요\n?<span class="cite-missing-badge"[^>]*>⚠️<\/span>\n?<ul>/);
+    expect(out.split("⚠️")).toHaveLength(6);
+    // Every paragraph once: nothing is repeated.
+    expect(out.split("미국 수출 비중이 가장 컸어요.")).toHaveLength(2);
+    // Cited ones, the heading and the first item are not marked.
+    expect(out).toMatch(/<p>메모리 가격 회복이 증가를 이끌었어요<b>1<\/b>\.<\/p>/);
+    expect(out).toMatch(/<h2>요약<\/h2>/);
+  });
+
+  it("ranges point into the answer text: a later text part and later blocks use their offset", () => {
+    const first = "앞 부분이에요[1].\n\n";
+    const second = "뒷 문단이에요.\n\n또 다른 문단이에요[1].";
+    const all = first + second;
+    const out = marked(second, [range(all, "뒷 문단이에요.")], first.length);
+    expect(marks(out)).toEqual(["p"]);
+    expect(out).toMatch(/뒷 문단이에요\.<span class="cite-missing-badge"/);
+  });
+
+  it("whole-block ranges mark their block: a paragraph, a table", () => {
+    const text = "자료를 찾아 볼게요.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n원하시면 더 정리해 드릴게요.";
+    const out = marked(text, [
+      range(text, "자료를 찾아 볼게요."),
+      range(text, "| a | b |\n|---|---|\n| 1 | 2 |"),
+      range(text, "원하시면 더 정리해 드릴게요."),
+    ]);
+    expect(marks(out)).toEqual(["p", "div", "p"]);
+  });
+
+  it("no ranges, or no note: nothing is marked", () => {
+    expect(marks(marked(ANSWER, []))).toEqual([]);
+    expect(render(ANSWER)).not.toContain("data-cite-missing");
+  });
+});
+
+/** The ranges the server stores for an answer of these text parts (each part parsed on its own, review 3차). */
+const rangesOf = (parts: string[]) => {
+  const all = parts.join("");
+  const starts = parts.map((_, k) => parts.slice(0, k).join("").length);
+  return uncitedUnits(all, citationUnits(all, starts));
+};
+
+describe("one focus target per range, whatever the shape (#202 review 1차)", () => {
+  /** An answer as text parts (a tool call between them), its ranges as the server computes them. */
+  const CORPUS: string[][] = [
+    ["- 첫 항목이에요\n\n  같은 항목의 둘째 문단이에요.\n\n끝[1]."],
+    ["- 위 항목[1]\n  - 아래 항목이에요\n    - 더 아래예요\n- 다음 항목이에요"],
+    ["앞 문장이고 ", "뒤 문장이에요.\n\n끝[1]."],
+    ["가[1].\n\n$$\nx = 1\n$$\n\n나예요."],
+    ["가[1].\n\n    들여쓴 코드 줄\n\n나예요."],
+    ["가[1].\n\n<div>원시 HTML</div>\n\n나예요."],
+    ["전형 | 인원\n|---|---|\n학종 | 30\n\n| a | b |\n|---|---|\n| 1 | 2 |"],
+    ["> 인용문이에요.\n>\n> 둘째 줄이에요.\n\n가[1]."],
+    ["첫 파트 문단이에요.\n\n", "- 항목이에요\n- 또 항목이에요[1]\n\n", "| a |\n|---|\n| 1 |"],
+    ["1. 하나예요\n\n2. 둘이에요\n\n   이어진 문단이에요.\n\n3. 셋[1]"],
+  ];
+  const renderParts = (parts: string[], missing: { start: number; end: number }[]) => {
+    let at = 0;
+    return parts
+      .map((t) => {
+        const html = renderToStaticMarkup(
+          createElement(Markdown, {
+            text: t,
+            offset: at,
+            cite: {
+              numbers: new Set([1]),
+              render: () => createElement("b", null, "1"),
+              missing,
+              markId: "m1",
+            },
+          }),
+        );
+        at += t.length;
+        return html;
+      })
+      .join("");
+  };
+  it("the summary's count is the number of places it moves to", () => {
+    for (const parts of CORPUS) {
+      const ranges = rangesOf(parts);
+      expect(ranges.length, parts.join("|")).toBeGreaterThan(0);
+      const html = renderParts(parts, ranges);
+      expect(html.split('data-cite-missing="m1"').length - 1, parts.join("|")).toBe(ranges.length);
+      // Each target is its own range's text, in the ranges' order.
+      const all = parts.join("");
+      const words = (t: string) => t.replace(/[^가-힣a-z0-9]+/gi, "");
+      targets(html).forEach((got, k) => {
+        const want = words(
+          all
+            .slice(ranges[k]!.start, ranges[k]!.end)
+            .replace(/\[\d+\]/g, "")
+            .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, ""),
+        );
+        expect(want.startsWith(words(got).slice(0, 4)), `${parts.join("|")} #${k}: ${got}`).toBe(true);
+      });
+    }
+  });
+  /** Each target's text (tags dropped, the ⚠️ out), in document order. */
+  const targets = (html: string) =>
+    html
+      .split('data-cite-missing="m1"')
+      .slice(1)
+      .map((rest) => {
+        // A table's ⚠️ comes first (above it): its text is the table's.
+        const badgeFirst = /^[^>]*>\s*<span class="cite-missing-badge"/.test(rest);
+        const seg = badgeFirst
+          ? rest.slice(rest.indexOf("⚠️") + 2, rest.indexOf("</table>"))
+          : rest.slice(0, rest.indexOf("⚠️"));
+        const ann = /<annotation[^>]*>([^<]*)<\/annotation>/.exec(seg);
+        const t = ann
+          ? ann[1]!
+          : (badgeFirst ? seg : seg.replace(/^[^>]*>/, "")).replace(/<[^>]*$/, "").replace(/<[^>]+>/g, "");
+        // A code block's header ("code", "⧉ 복사") is not its text.
+        return t
+          .replace(/^code⧉ 복사/, "")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .trim();
+      });
+
+  it("math and code are not ranges; raw HTML is — its top-level text wrapped as the target, in order", () => {
+    // `[x]: …` keeps the answer one block, so both formulas go through KaTeX in the same tree.
+    const text =
+      "가[1].\n\n$$\na = b\n$$\n\n$$\nx = y\n$$\n\n    들여쓴 코드 줄\n\n<div>원시 HTML</div>\n\n나예요.\n\n[x]: https://e.example";
+    const html = renderParts([text], rangesOf([text]));
+    expect(targets(html)).toEqual(["<div>원시 HTML</div>", "나예요."]);
+    expect(html).toContain('<span class="katex-display">');
+  });
+
+  it("[n] in KaTeX's output is never a citation; only the server's marker positions are (review 3차)", () => {
+    const text = "기준이에요[1].\n\n$$\nf[1]=2\n$$";
+    const html = renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: text.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(html.split('data-chip="1"')).toHaveLength(2);
+    expect(html).toContain("f[1]=2</annotation>");
+    // A [1] the server did not list at that position stays text.
+    const two = "가[1]. 나[1].";
+    const only = renderToStaticMarkup(
+      createElement(Markdown, {
+        text: two,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: 1, n: 1 }],
+        },
+      }),
+    );
+    expect(only.split('data-chip="1"')).toHaveLength(2);
+    expect(only).toContain("나[1].");
+  });
+
+  it("two raw HTML blocks in one quote are two targets, each wrapped where it is (review 5차)", () => {
+    const text = "> <div>첫 블록</div>\n>\n> <div>둘째 블록</div>\n\n가[1].";
+    const html = renderParts([text], rangesOf([text]));
+    expect(targets(html)).toEqual(["<div>첫 블록</div>", "<div>둘째 블록</div>"]);
+  });
+
+  it("chips only where the server's marker maps through the source; an entity elsewhere moves nothing (review 4차)", () => {
+    const text = "결론이에요[1]. A &amp; B의 x = a[1].length";
+    const html = renderToStaticMarkup(
+      createElement(Markdown, {
+        text,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: text.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(html.split('data-chip="1"')).toHaveLength(2);
+    expect(html).toContain("a[1].length");
+    // A later block's offset: the marker of the second block is found there, not in the first.
+    const two = "가는 없어요.\n\n나는 있어요[1].";
+    const b = renderToStaticMarkup(
+      createElement(Markdown, {
+        text: two,
+        cite: {
+          numbers: new Set([1]),
+          render: () => createElement("b", { "data-chip": "1" }, "1"),
+          markers: [{ start: two.indexOf("[1]"), n: 1 }],
+        },
+      }),
+    );
+    expect(b.split('data-chip="1"')).toHaveLength(2);
+  });
+
+  it("a paragraph cut by a tool call: one target where it starts, the bar on the rest", () => {
+    const parts = CORPUS[2]!;
+    const cut = renderParts(parts, rangesOf(parts));
+    expect(targets(cut)).toEqual(["앞 문장이고"]);
+    expect(cut).toMatch(/<p class="cite-missing-block">뒤 문장이에요\./);
   });
 });

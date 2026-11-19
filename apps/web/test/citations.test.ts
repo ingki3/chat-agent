@@ -2,8 +2,8 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
-  CITATION_MISSING_TEXT,
   CITATION_STATUS_TEXT,
+  citationMissingText,
   citationMarkers,
   type CitationEntry,
   type CitationNotePart,
@@ -245,13 +245,20 @@ describe("rendering", () => {
     expect(body).toMatch(
       /<span class="cite-missing" data-testid="citation-missing">나는 출처가 없어요\.<span[^>]*>⚠️<\/span><\/span>/,
     );
-    const list = html(createElement(CitationSources, { note: n }));
-    expect(list).toContain(CITATION_MISSING_TEXT);
-    expect(CITATION_MISSING_TEXT).toBe("⚠️ 일부 내용에 출처 표시 없음");
+    // The note counts them in one line (#202) — it never repeats the paragraphs.
+    const list = html(createElement(CitationSources, { note: n, text }));
+    expect(list).toContain(citationMissingText(1));
+    expect(citationMissingText(3)).toBe("⚠️ 출처 표시 없는 문단 3개");
+    expect(list).not.toContain("나는 출처가 없어요");
     // No missing ranges: no warning. A range that does not fit the text is ignored.
     expect(html(createElement(CitationSources, { note: note([entry(1, "verified")]) }))).not.toContain(
-      CITATION_MISSING_TEXT,
+      "출처 표시 없는",
     );
+    expect(
+      html(
+        createElement(CitationSources, { note: note([entry(1, "verified")], [{ start: 0, end: 99 }]), text }),
+      ),
+    ).not.toContain("출처 표시 없는");
     expect(segments("짧다", note([], [{ start: 0, end: 99 }])).map((s) => s.kind)).toEqual(["text"]);
   });
 

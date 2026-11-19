@@ -1,4 +1,11 @@
+import type { Nodes, Parents, RootContent } from "mdast";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { mathFromMarkdown } from "mdast-util-math";
+import { gfm } from "micromark-extension-gfm";
+import { math } from "micromark-extension-math";
 import { z } from "zod";
+import { splitBlocks } from "./blocks.js";
 import { FINANCE_DISCLAIMER } from "./finance.js";
 import { FileLocator } from "./locators.js";
 
@@ -37,8 +44,13 @@ export const CITATION_STATUS_TEXT: Record<CitationStatus, string> = {
  */
 export const CITATION_UNBACKED_TEXT = "⚠️ 근거에 연결되지 않은 출처 표시가 있어요.";
 
-/** Shown above an answer with paragraphs that state something without a citation marker. */
-export const CITATION_MISSING_TEXT = "⚠️ 일부 내용에 출처 표시 없음";
+/**
+ * Shown under an answer with paragraphs that state something without a citation marker (#202): one line with the
+ * count — the paragraphs themselves are marked where they are in the answer (never repeated in the note).
+ */
+export const citationMissingText = (n: number) => `⚠️ 출처 표시 없는 문단 ${n}개`;
+/** The mark on each such paragraph in the answer (its label for screen readers and its tooltip). */
+export const CITATION_MISSING_MARK = "출처 표시 없음";
 
 /** The only status that may be shown like a normal citation. Anything else (including unknown values) is a failure. */
 export const citationVerified = (status: unknown): boolean => status === "verified";
@@ -135,6 +147,12 @@ export const CitationNotePart = z.object({
    * source box. Not an earlier answer's note for carrying numbers over. Absent on every other note.
    */
   unbacked: z.literal(true).optional(),
+  /**
+   * How `missing` was computed (#202 review 4차): `2` — from the blocks the screen renders (`citationUnits`), so the
+   * screen marks each range in the answer and moves to it. Absent on notes stored before: their ranges came from the
+   * old line-based split and are only counted ("출처 표시 없는 문단 N개" as text), never marked.
+   */
+  units: z.literal(2).optional(),
 });
 export type CitationNotePart = z.infer<typeof CitationNotePart>;
 
@@ -149,15 +167,24 @@ export type CiteResult = {
 // ---- the answer text: paragraphs and markers (same rules on the server and in the browser) ------------------
 
 export type CitationUnitKind = "body" | "heading" | "lead_in" | "disclaimer" | "code" | "rule";
-export type CitationUnit = TextRange & { kind: CitationUnitKind };
+/** `table`: a GFM table, one unit whatever its rows look like (#202). */
+/**
+ * `table`: a GFM table, one unit whatever its rows look like, with what it is shown next to in its own text part
+ * and footnote (`before`: the last sentence of the block right before it; `after`: the block right after it);
+ * `footnote`: in a footnote the screen shows; `inline`: inline code or math — never a marker, never a block (only
+ * `citationMarkers` reads it) (#202).
+ */
+export type CitationUnit = TextRange & {
+  kind: CitationUnitKind;
+  table?: true;
+  footnote?: true;
+  inline?: true;
+  before?: TextRange;
+  after?: TextRange;
+};
 
-const LIST_ITEM = /^\s{0,3}(?:[-*+•·]|\d{1,3}[.)])\s+\S/;
-const HEADING = /^\s{0,3}#{1,6}\s+\S/;
-/** A line that is only bold text (a heading written as `**제목**`). */
+/** A paragraph that is only bold text (a heading written as `**제목**`). */
 const BOLD_LINE = /^\s*(\*\*|__)[^\n]{1,80}?\1\s*[:：]?\s*$/;
-const FENCE = /^\s{0,3}(```|~~~)/;
-const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
-const TABLE = /^\s*\|/;
 const LEAD_IN = /[:：]\s*$/;
 
 const SENTENCES = /(?<=[.!?。！？])\s+/u;
@@ -197,74 +224,244 @@ function isDisclaimer(t: string): boolean {
 }
 
 /**
- * The answer split into units the missing-citation check looks at: paragraphs (blank-line separated), list items
- * and tables are `body` — unless a paragraph is a short line ending with a colon right before a list or table
- * (`lead_in`) or a disclaimer. Headings (`#`, a bold-only line), rules and fenced code are never body.
+ * One markdown block as the chat screen's renderer parses it (#202, review 2차): the same parser family as
+ * react-markdown with remark-gfm and remark-math (mdast-util-from-markdown + the GFM and math extensions, the same
+ * locked versions) — so tables, lists, quotes, code, math and raw HTML are the blocks the user sees, with their
+ * source positions (UTF-16 offsets of the block, CRLF included).
  */
-export function citationUnits(text: string): CitationUnit[] {
-  const out: CitationUnit[] = [];
-  type Block = { start: number; end: number; type: "para" | "item" | "table" };
-  const st: { cur: Block | null; fence: number | null } = { cur: null, fence: null };
-  const flush = () => {
-    const c = st.cur;
-    if (c) out.push({ start: c.start, end: c.end, kind: c.type === "para" ? "lead_in" : "body" });
-    st.cur = null;
-  };
-  let pos = 0;
-  for (;;) {
-    const nl = text.indexOf("\n", pos);
-    const end = nl === -1 ? text.length : nl;
-    const line = text.slice(pos, end);
-    const c = st.cur;
-    if (st.fence !== null) {
-      if (FENCE.test(line)) {
-        out.push({ start: st.fence, end, kind: "code" });
-        st.fence = null;
-      }
-    } else if (FENCE.test(line)) {
-      flush();
-      st.fence = pos;
-    } else if (!line.trim()) flush();
-    else if (HEADING.test(line) || BOLD_LINE.test(line)) {
-      flush();
-      out.push({ start: pos, end, kind: "heading" });
-    } else if (RULE.test(line)) {
-      flush();
-      out.push({ start: pos, end, kind: "rule" });
-    } else if (TABLE.test(line)) {
-      if (c?.type === "table") c.end = end;
-      else {
-        flush();
-        st.cur = { start: pos, end, type: "table" };
-      }
-    } else if (LIST_ITEM.test(line)) {
-      flush();
-      st.cur = { start: pos, end, type: "item" };
-    } else if (c && (c.type === "para" || (c.type === "item" && /^\s/.test(line)))) c.end = end;
-    else {
-      flush();
-      st.cur = { start: pos, end, type: "para" };
-    }
-    if (nl === -1) break;
-    pos = nl + 1;
-  }
-  flush();
-  if (st.fence !== null) out.push({ start: st.fence, end: text.length, kind: "code" });
-  // `flush` marked every paragraph `lead_in` provisionally: decide now that the next unit is known.
-  return out.map((u, i) => {
-    if (u.kind !== "lead_in") {
-      const t = text.slice(u.start, u.end).trim();
-      return u.kind === "body" && isDisclaimer(t) ? { ...u, kind: "disclaimer" } : u;
-    }
-    const t = text.slice(u.start, u.end).trim();
-    if (isDisclaimer(t)) return { ...u, kind: "disclaimer" };
-    const next = out[i + 1];
-    const beforeList =
-      next?.kind === "body" &&
-      (LIST_ITEM.test(text.slice(next.start, next.end)) || TABLE.test(text.slice(next.start, next.end)));
-    const lead = LEAD_IN.test(t) && !t.includes("\n") && t.length <= 120 && beforeList;
-    return { ...u, kind: lead ? "lead_in" : "body" };
+const parseBlock = (text: string) =>
+  fromMarkdown(text, {
+    extensions: [gfm(), math()],
+    mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown()],
   });
+
+const startOf = (n: Nodes) => n.position?.start.offset;
+const endOf = (n: Nodes) => n.position?.end.offset;
+
+/**
+ * Internal: a plain paragraph (may join the paragraph a tool call cut), a rendered footnote's unit, a list item, and
+ * a paragraph that is a lead-in if a list or table comes next (decided once the next unit is known — the screen's
+ * blocks split a lead-in from its list at the blank line).
+ */
+type Unit = CitationUnit & { para?: true; item?: true; leadIn?: true; note?: string };
+
+/** The units of one block, at `base` in the answer text. */
+function blockUnits(block: string, base: number): Unit[] {
+  const out: Unit[] = [];
+  const tree = parseBlock(block);
+  // Footnotes the screen shows (review 4차, as mdast-util-to-hast does): the first definition of each id, and only
+  // those reached from the body — directly, or from a footnote that is itself shown.
+  // Every definition first, nested ones too, the first of each id in document order (review 5차).
+  const defs = new Map<string, Nodes & { type: "footnoteDefinition" }>();
+  const index = (n: Nodes) => {
+    if (n.type === "footnoteDefinition") {
+      const id = n.identifier.toUpperCase();
+      if (!defs.has(id)) defs.set(id, n);
+    }
+    if ("children" in n) for (const c of n.children) index(c as Nodes);
+  };
+  index(tree);
+  // References of a node's own text (a definition inside it is its own: only its references when it is shown).
+  const refsOf = (n: Nodes, into: string[]) => {
+    if (n.type === "footnoteReference") into.push(n.identifier.toUpperCase());
+    if ("children" in n)
+      for (const c of n.children) if ((c as Nodes).type !== "footnoteDefinition") refsOf(c as Nodes, into);
+  };
+  const reached: string[] = [];
+  refsOf(tree, reached);
+  // Each definition reached from the body (directly or from a shown footnote) is checked once.
+  const shown: { id: string; def: Nodes & { type: "footnoteDefinition" } }[] = [];
+  for (let k = 0; k < reached.length; k++) {
+    const id = reached[k]!;
+    const def = defs.get(id);
+    if (!def || shown.some((x) => x.def === def)) continue;
+    shown.push({ id, def });
+    for (const c of def.children) if (c.type !== "footnoteDefinition") refsOf(c as Nodes, reached);
+  }
+  // Inline code and math (`a[1]`, `$a[1]$`): never markers (review 4차).
+  const inline = (n: Nodes) => {
+    if (
+      (n.type === "inlineCode" || n.type === "inlineMath") &&
+      startOf(n) !== undefined &&
+      endOf(n) !== undefined
+    )
+      out.push({ start: base + startOf(n)!, end: base + endOf(n)!, kind: "code", inline: true });
+    if ("children" in n) for (const c of n.children) inline(c as Nodes);
+  };
+  inline(tree);
+  const add = (
+    kind: CitationUnitKind,
+    start: number | undefined,
+    end: number | undefined,
+    o: { table?: boolean; para?: boolean; note?: string | undefined; item?: boolean; leadIn?: boolean } = {},
+  ) => {
+    if (start === undefined || end === undefined || end <= start) return;
+    out.push({
+      start: base + start,
+      end: base + end,
+      kind,
+      ...(o.table ? { table: true as const } : {}),
+      ...(o.para ? { para: true as const } : {}),
+      ...(o.note !== undefined ? { footnote: true as const, note: o.note } : {}),
+      ...(o.item ? { item: true as const } : {}),
+      ...(o.leadIn ? { leadIn: true as const } : {}),
+    });
+  };
+  const paragraph = (
+    start: number | undefined,
+    end: number | undefined,
+    o: { para?: boolean; note?: string | undefined; item?: boolean },
+  ) => {
+    if (start === undefined || end === undefined) return;
+    const t = block.slice(start, end).trim();
+    if (!/[\r\n]/.test(t) && BOLD_LINE.test(t)) return add("heading", start, end, o);
+    if (isDisclaimer(t)) return add("disclaimer", start, end, o);
+    const leadIn = LEAD_IN.test(t) && !/[\r\n]/.test(t) && t.length <= 120;
+    add("body", start, end, { ...o, leadIn });
+  };
+  const blocks = (parent: Parents, note: string | undefined) => {
+    const kids = parent.children as RootContent[];
+    kids.forEach((n) => {
+      const o = { note };
+      switch (n.type) {
+        case "paragraph":
+          return paragraph(startOf(n), endOf(n), { ...o, para: parent.type === "root" });
+        case "heading":
+          return add("heading", startOf(n), endOf(n), o);
+        case "thematicBreak":
+          return add("rule", startOf(n), endOf(n), o);
+        case "code":
+        case "math":
+          return add("code", startOf(n), endOf(n), o);
+        case "html":
+          return add("body", startOf(n), endOf(n), o);
+        case "table":
+          return add("body", startOf(n), endOf(n), { ...o, table: true });
+        case "list":
+          for (const item of n.children) {
+            const [first, ...rest] = item.children;
+            if (first?.type === "paragraph") {
+              // The item's own text: from its marker, so the screen's list item starts inside it.
+              paragraph(startOf(item), endOf(first), { ...o, item: true });
+              blocks({ ...item, children: rest } as Parents, note);
+            } else blocks(item, note);
+          }
+          return;
+        case "blockquote":
+          return blocks(n, note);
+        case "footnoteDefinition":
+          return; // checked below, once, if the screen shows it — never where it is written
+
+        default:
+          return; // link definitions and anything else that is not shown as a block of text
+      }
+    });
+  };
+  blocks(tree, undefined);
+  // The footnotes the screen shows (at the end of the answer, each one apart from the rest).
+  for (const { id, def } of shown) blocks(def, id);
+  return out;
+}
+
+/**
+ * The answer split into units the missing-citation check looks at — exactly as the chat screen renders it
+ * (review 3차): each text part (`partStarts`: where each starts in the answer text; a tool call comes between two)
+ * on its own, cut into the same blocks (`splitBlocks`), each block parsed by `parseBlock`; the units are then moved
+ * to answer-text offsets. So a closed math block or table at the end of one part never takes in the next part.
+ * - a paragraph is `body` — or `lead_in` (one short line ending with a colon right before a list or table), a
+ *   `disclaimer`, or a `heading` when it is only bold text; a paragraph a tool call cut in the middle (the two
+ *   halves with no blank line between them) stays one unit, as before;
+ * - a list item is `body` from its marker to the end of its first paragraph; its other paragraphs are units of
+ *   their own, its nested lists are items of their own;
+ * - a table is one `body` unit (`table: true`), whatever its rows look like;
+ * - raw HTML (shown as text) is `body`; headings are `heading`, rules `rule`, code blocks (fenced or indented) and
+ *   math blocks `code`; quotes are looked into; footnotes only when referred to (`footnote: true`); link
+ *   definitions are nothing.
+ */
+export function citationUnits(
+  text: string,
+  partStarts: readonly number[] = [0],
+  /** Part starts with something shown before them (a card, a table, a divider): never joined to the part before. */
+  shownBetween: ReadonlySet<number> = new Set(),
+): CitationUnit[] {
+  const starts = [...new Set([0, ...partStarts.filter((n) => n > 0 && n < text.length)])].sort(
+    (a, b) => a - b,
+  );
+  const out: Unit[] = [];
+  starts.forEach((start, k) => {
+    const part = text.slice(start, starts[k + 1] ?? text.length);
+    let at = start;
+    const units: Unit[] = [];
+    for (const block of splitBlocks(part)) {
+      units.push(...blockUnits(block, at));
+      at += block.length;
+    }
+    units.sort((a, b) => a.start - b.start);
+    neighbours(text, units);
+    // A paragraph a tool call cut mid-sentence: the last one before it and the first one after it, no blank line
+    // between, and the part does not end a sentence nor stop at `…`, `:`, `：` (`endsPart` — such a part is its own
+    // paragraph, as the screen shows it: a progress note, #202).
+    const prev = out.filter((u) => !u.footnote && !u.inline).at(-1);
+    const first = units.find((u) => !u.footnote && !u.inline);
+    if (
+      !shownBetween.has(start) &&
+      prev?.para &&
+      first?.para &&
+      (prev.kind === "body" || prev.kind === "lead_in") &&
+      (first.kind === "body" || first.kind === "lead_in") &&
+      !endsPart(text, prev.start, prev.end) &&
+      !/\r?\n[ \t]*\r?\n/.test(text.slice(prev.end, first.start))
+    ) {
+      // The joined paragraph is a lead-in when its second half was one (a list or table follows it in its part)
+      // and the whole still reads as one (one short line ending with a colon) — review 7차.
+      const joined = text.slice(prev.start, first.end).trim();
+      const lead = first.kind === "lead_in" && !/[\r\n]/.test(joined) && joined.length <= 120;
+      prev.end = first.end;
+      prev.kind = lead ? "lead_in" : "body";
+      units.splice(units.indexOf(first), 1);
+    }
+    out.push(...units);
+  });
+  out.sort((a, b) => a.start - b.start);
+  return out.map((u) => ({
+    start: u.start,
+    end: u.end,
+    kind: u.kind,
+    ...(u.table ? { table: true as const } : {}),
+    ...(u.footnote ? { footnote: true as const } : {}),
+    ...(u.inline ? { inline: true as const } : {}),
+    ...(u.before ? { before: u.before } : {}),
+    ...(u.after ? { after: u.after } : {}),
+  }));
+}
+
+/**
+ * What a block is shown next to, decided on one text part's own blocks before any paragraph is joined across a
+ * tool call (review 6차) — the same part, the same footnote (each footnote is shown apart; a definition nested in
+ * it is not its text): a lead-in is a short line ending with a colon right before a list item or a table; a table
+ * records the last sentence of the block right before it (`before` — not another table, code or a rule) and the
+ * block right after it (`after`, a caption if it reads like one).
+ */
+function neighbours(text: string, units: Unit[]): void {
+  const groups = new Map<string, Unit[]>();
+  for (const u of units) {
+    if (u.inline) continue;
+    const key = u.note ?? "";
+    const g = groups.get(key);
+    if (g) g.push(u);
+    else groups.set(key, [u]);
+  }
+  for (const g of groups.values())
+    g.forEach((u, i) => {
+      const prev = g[i - 1];
+      const next = g[i + 1];
+      if (u.leadIn && u.kind === "body" && !u.item && (next?.item || next?.table)) u.kind = "lead_in";
+      if (!u.table) return;
+      if (prev && prev.kind !== "code" && prev.kind !== "rule" && !prev.table)
+        u.before = lastSentence(text, prev);
+      if (next && next.kind !== "code" && next.kind !== "rule")
+        u.after = { start: next.start, end: next.end };
+    });
 }
 
 export type CitationMarker = TextRange & { n: number };
@@ -313,8 +510,11 @@ function inExpression(text: string, start: number): boolean {
  * array indexing in an expression (`늘었다[1]`, `this year[1]`; not `x = a[1]`). Chained markers (`[1][2]`) count together. For answers that used no web tool:
  * a marker there pretends to cite, so it is checked; `a[1]` in prose is not.
  */
-export function sentenceEndMarkers(text: string): CitationMarker[] {
-  const all = citationMarkers(text);
+export function sentenceEndMarkers(
+  text: string,
+  units: readonly CitationUnit[] = citationUnits(text),
+): CitationMarker[] {
+  const all = citationMarkers(text, units);
   const out: CitationMarker[] = [];
   for (let i = 0; i < all.length;) {
     let j = i;
@@ -334,11 +534,181 @@ export function sentenceEndMarkers(text: string): CitationMarker[] {
   return out;
 }
 
-/** Body units that contain no marker: what the note marks as missing a citation. */
-export function uncitedUnits(text: string): TextRange[] {
-  const units = citationUnits(text);
-  const markers = citationMarkers(text, units);
-  return units
-    .filter((u) => u.kind === "body" && !markers.some((m) => m.start >= u.start && m.end <= u.end))
+/**
+ * A line right after a table that says where it is from: `출처: …`, `(자료: …)`, `※ …`, `표 1. …`, `표 1 전형별 인원`.
+ */
+const CAPTION = /^[\s*_(（[]*(?:(?:출처|자료|근거|source|표)\s*[:：.)\]]|표\s*\d+(?=[\s:：.)\]]))|^\s*※/iu;
+
+/**
+ * Opinion framing (#202, `common@11`): a sentence that says itself it is the assistant's own judgement — it starts
+ * with "제 판단으로는", "제 생각에는", "제 의견으로는", "제 추정으로는", "개인적으로는" … or ends with "…제 추정이에요",
+ * "…제 판단입니다" …. Only these explicit words: a sentence is never taken for an opinion from what it says.
+ */
+const OPINION_WORD = "(?:제|저의|내)\\s*(?:판단|생각|의견|추정|추측|견해|소견)";
+const OPINION_LEAD = new RegExp(
+  `^(?:${OPINION_WORD}(?:으로는|으론|에는|엔|에|으로|은|는|이지만|이긴\\s*하지만)?|개인적으로(?:는)?)(?:[,\\s]|$)`,
+  "u",
+);
+const OPINION_TAIL = new RegExp(
+  `${OPINION_WORD}(?:이에요|이예요|예요|입니다|이다|일\\s*뿐이에요|일\\s*뿐입니다|일\\s*뿐이다)$`,
+  "u",
+);
+
+const LIST_MARKER = /^\s*(?:[-*+]|\d{1,9}[.)])\s+/u;
+/** A list item's leading label: bold text ending in a colon (`**추천:**`, `**추천**:`) — only that, never a sentence. */
+const ITEM_LABEL = /^(\*\*|__)[^*_\n]{1,20}?[:：]\1\s*|^(\*\*|__)[^*_\n]{1,20}?\2\s*[:：]\s*/u;
+
+const TERMINAL = /[.!?。！？．]/u;
+/** What may close a sentence after its punctuation: brackets, quotes, emphasis (`…같아요[1].**`). */
+const CLOSER = /[)\]"'”’」』*_~]/u;
+const WORD = /[A-Za-z0-9]/;
+
+/**
+ * The one sentence boundary of the missing-citation rules (#202, review 2차) — the opinion check, the closing-offer
+ * and progress-note checks and "the sentence right before a table" all use it. A sentence ends at `.`, `!`, `?`
+ * (and their full-width forms `。！？．`), taking along more of them, closing brackets, quotes and emphasis marks and the
+ * citation markers right after (`…했어요.[1]`, `…같아요[1].**`) — whatever follows, a space or not
+ * (`유리해요.2027년 …`, `유리해요!30명 …` are two sentences). Not a boundary: a `.` between two ASCII letters or digits
+ * (`3.5`, `Node.js`, `example.com`). A line break is a boundary. Ranges of `t`, trimmed, never empty.
+ */
+export function sentenceSpans(t: string): TextRange[] {
+  const out: TextRange[] = [];
+  let start = 0;
+  const push = (end: number) => {
+    const s = t.slice(start, end);
+    const lead = s.length - s.trimStart().length;
+    const body = s.trim();
+    if (body) out.push({ start: start + lead, end: start + lead + body.length });
+    start = end;
+  };
+  for (let i = 0; i < t.length;) {
+    const ch = t[i]!;
+    if (ch === "\n") {
+      push(i);
+      start = ++i;
+      continue;
+    }
+    if (TERMINAL.test(ch) && !(ch === "." && WORD.test(t[i - 1] ?? "") && WORD.test(t[i + 1] ?? ""))) {
+      let j = i + 1;
+      for (;;) {
+        if (j < t.length && (TERMINAL.test(t[j]!) || CLOSER.test(t[j]!))) j++;
+        else {
+          const m = /^\[\d{1,3}\]/.exec(t.slice(j));
+          if (!m) break;
+          j += m[0].length;
+        }
+      }
+      push(j);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  push(t.length);
+  return out;
+}
+
+/** The last visible character of `text[start, end)` past closing brackets, quotes, emphasis and markers, and its index. */
+function lastMark(text: string, start: number, end: number): number {
+  let k = end;
+  while (k > start && /\s/u.test(text[k - 1]!)) k--;
+  for (;;) {
+    const m = /\[\d{1,3}\]$/.exec(text.slice(Math.max(start, k - 5), k));
+    if (m) k -= m[0].length;
+    else if (k > start && CLOSER.test(text[k - 1]!)) k--;
+    else break;
+  }
+  return k - 1;
+}
+
+/**
+ * Whether `text[start, end)` ends a sentence where it stops (review 6차 — `sentenceSpans`' rule at a text part's
+ * end): its last visible character, past closing brackets, quotes, emphasis and markers, is sentence punctuation —
+ * not a `.` between two ASCII letters or digits, looking across the end at the character right after it (`3.` then
+ * `5%` in the next part is a number).
+ */
+export function endsSentence(text: string, start: number, end: number): boolean {
+  const k = lastMark(text, start, end);
+  const ch = k >= start ? text[k] : undefined;
+  if (!ch || !TERMINAL.test(ch)) return false;
+  return !(ch === "." && WORD.test(text[k - 1] ?? "") && WORD.test(text[k + 1] ?? ""));
+}
+
+/** A text part that stops where it ends: a sentence, or `…`, `:`, `：` (review 7차 — as before #202's last rounds). */
+function endsPart(text: string, start: number, end: number): boolean {
+  if (endsSentence(text, start, end)) return true;
+  const k = lastMark(text, start, end);
+  if (k < start || !/[…:：]/u.test(text[k]!)) return false;
+  // `09:` then `30` in the next part is a time (review 8·9·10차) — only the strict H:MM / HH:MM form: one or two
+  // digits, the colon, exactly two digits, then no digit. `변경안 2:` then `2027학년도…` is a stop.
+  // Any decimal digits (`０９：３０` too) and either colon (review 10차); the hour is read within this paragraph only.
+  if (text[k] === "…") return true;
+  const time =
+    /(?:^|\P{Nd})\p{Nd}{1,2}$/u.test(text.slice(start, k)) &&
+    /^\p{Nd}{2}(?:\P{Nd}|$)/u.test(text.slice(k + 1, k + 9));
+  return !time;
+}
+
+/**
+ * The sentences of a unit (#202): line by line — a list item's marker and its leading label (`- **추천:** …`) and a
+ * quote's `>` are not part of it — cut by `sentenceSpans`. Emphasis marks are dropped, the words kept.
+ */
+export function unitSentences(t: string): string[] {
+  return t
+    .split(/\r?\n/u)
+    .flatMap((raw) => {
+      const quoted = raw.replace(/^[\s>]+/u, "");
+      const item = LIST_MARKER.exec(quoted);
+      const line = item ? quoted.slice(item[0].length).replace(ITEM_LABEL, "") : quoted;
+      return sentenceSpans(line).map((r) => line.slice(r.start, r.end));
+    })
+    .map((s) => s.replace(/\*\*|__/gu, "").trim())
+    .filter(Boolean);
+}
+
+const sentenceBody = (s: string) => s.replace(/[\s.!?。！？．…~]+$/gu, "");
+
+/**
+ * A paragraph of the assistant's own opinion, said so (#202): **every** sentence carries the explicit framing above.
+ * One sentence without it (a fact next to the opinion) and the paragraph is checked like any other.
+ */
+export function isFramedOpinion(unit: string): boolean {
+  const sentences = unitSentences(unit).map(sentenceBody);
+  // An empty piece (a lone mark) is not framed either: every piece must say it is an opinion.
+  return sentences.length > 0 && sentences.every((s) => OPINION_LEAD.test(s) || OPINION_TAIL.test(s));
+}
+
+/** The last sentence of a unit (`sentenceSpans`), as a range of the answer text. */
+function lastSentence(text: string, u: TextRange): TextRange {
+  const last = sentenceSpans(text.slice(u.start, u.end)).at(-1);
+  return last ? { start: u.start + last.start, end: u.start + last.end } : { start: u.end, end: u.end };
+}
+
+/**
+ * Body units that contain no marker: what the note marks as missing a citation. Not flagged (#202):
+ * - a table — one unit — with a marker in it, in its caption (a short `출처: …` line right after it) or in the
+ *   sentence right before it (the lead-in, a heading, the last sentence of the paragraph before);
+ * - a paragraph of the assistant's opinion that says so in every sentence (`isFramedOpinion`).
+ */
+export function uncitedUnits(
+  text: string,
+  units: readonly CitationUnit[] = citationUnits(text),
+  markers: readonly CitationMarker[] = citationMarkers(text, units),
+): TextRange[] {
+  const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
+  const blocks = units.filter((u) => !u.inline);
+  const tableCited = (u: CitationUnit) => {
+    if (u.before && cited(u.before)) return true;
+    if (!u.after) return false;
+    const t = text.slice(u.after.start, u.after.end).trim();
+    return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(u.after);
+  };
+  return blocks
+    .filter((u) => {
+      if (u.kind !== "body" || cited(u)) return false;
+      const t = text.slice(u.start, u.end);
+      if (u.table) return !tableCited(u);
+      return !isFramedOpinion(t);
+    })
     .map(({ start, end }) => ({ start, end }));
 }

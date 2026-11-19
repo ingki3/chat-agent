@@ -185,9 +185,45 @@ a.cite-title:hover {
   margin: 8px 0 0;
   color: var(--muted);
 }
-.cite-missing-list {
-  margin: 4px 0 0;
-  padding-left: 18px;
+/*
+ * Paragraphs without a citation, marked in the answer (#202): a thin warning bar on the left and a small ⚠️ at the
+ * end — the note under the answer only counts them. Focused when the summary line moves to one.
+ */
+.md .cite-missing-block {
+  box-shadow: inset 3px 0 0 var(--warn);
+  padding-left: 10px;
+  scroll-margin: 80px 0;
+}
+/* Raw HTML shown as text, marked where it is (#202 review 5차). */
+.md .cite-missing-wrap {
+  display: block;
+}
+.md li.cite-missing-block::marker {
+  color: var(--warn);
+}
+.md .cite-missing-block:focus {
+  outline: none;
+  background: var(--warn-weak);
+  transition: background 0.2s;
+}
+.cite-missing-table > .cite-missing-badge {
+  display: block;
+  margin: 0 0 2px;
+}
+.cite-missing-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: none;
+  padding: 2px 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cite-missing-jump:hover {
+  text-decoration: underline;
 }
 
 /* Reference export (#26): the top-bar button and its dialog. */
