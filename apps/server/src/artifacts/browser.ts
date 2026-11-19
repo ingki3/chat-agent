@@ -393,6 +393,8 @@ type RenderEntry = {
   timer?: NodeJS.Timeout;
   /** Told when the reap is over (`renderReaped`). */
   waiters: (() => void)[];
+  /** The watchdog's whole command line as launched (`canonArgs`), its identity in a listing; none when unknown. */
+  cmdline?: string;
 };
 const liveRenders = new Map<number, RenderEntry>();
 const reaping = new Set<RenderEntry>();
@@ -400,13 +402,15 @@ const reaping = new Set<RenderEntry>();
 const unconfirmed = new WeakSet<RenderDir>();
 
 /**
- * Records a running render; the returned function says its watchdog has exited (call it once, on the exit). A render
- * whose reap never started is then forgotten; one being reaped stays until its reap is over (#215).
+ * Records a running render (`argv`: the watchdog's command line as spawned, `child.spawnargs`); the returned function
+ * says its watchdog has exited (call it once, on the exit). A render whose reap never started is then forgotten; one
+ * being reaped stays until its reap is over (#215).
  */
-export function trackRender(pgid: number, dir: RenderDir): () => void {
+export function trackRender(pgid: number, dir: RenderDir, argv?: readonly string[]): () => void {
   const entry: RenderEntry = {
     pgid,
     dir,
+    ...(argv?.length ? { cmdline: canonArgs(argv.join(" ")) } : {}),
     signalled: false,
     leaderGone: false,
     ownsDir: false,
@@ -435,21 +439,35 @@ export function parsePs(out: string): RenderProcess[] {
   }
   return rows;
 }
-/** The listing, within `ms` (the caller's remaining budget); undefined when it failed or ran out of time. */
+/** A finished `ps` run, as `spawnSync` reports it. */
+export type PsRun = { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stdout: string };
+/**
+ * The rows of a `ps` run — only of a **whole** one: it exited 0, by itself (no signal), with no error (a full buffer is
+ * `ENOBUFS` with status 0 and the tail cut off), and its output ends with a complete line. Anything else is no listing
+ * (undefined): never read as "the group is empty".
+ */
+export function psListing(r: PsRun): RenderProcess[] | undefined {
+  if (r.error || r.signal || r.status !== 0 || typeof r.stdout !== "string" || !r.stdout.endsWith("\n"))
+    return undefined;
+  return parsePs(r.stdout);
+}
+const PS_OPTS = { encoding: "utf8" as const, maxBuffer: 64 << 20 };
+const budget = (ms: number) => Math.max(1, Math.ceil(ms));
+/** The listing, within `ms` (the caller's remaining budget); undefined when it failed, was cut or ran out of time. */
 const listSync = (ms: number): RenderProcess[] | undefined => {
-  const r = spawnSync("/bin/ps", PS_ARGS, {
-    encoding: "utf8",
-    timeout: Math.max(1, Math.ceil(ms)),
-    maxBuffer: 64 << 20,
+  if (reap.run) return psListing(reap.run(ms));
+  const r = spawnSync("/bin/ps", PS_ARGS, { ...PS_OPTS, timeout: budget(ms) });
+  return psListing({
+    status: r.status,
+    signal: r.signal,
+    ...(r.error ? { error: r.error } : {}),
+    stdout: r.stdout,
   });
-  return r.status === 0 ? parsePs(r.stdout) : undefined;
 };
 const listAsync = (ms: number, done: (rows: RenderProcess[] | undefined) => void) => {
-  execFile(
-    "/bin/ps",
-    PS_ARGS,
-    { encoding: "utf8", timeout: Math.max(1, Math.ceil(ms)), maxBuffer: 64 << 20 },
-    (e, out) => done(e ? undefined : parsePs(out)),
+  if (reap.run) return done(psListing(reap.run(ms)));
+  execFile("/bin/ps", PS_ARGS, { ...PS_OPTS, timeout: budget(ms) }, (e, out) =>
+    done(psListing(e ? { status: null, error: e, stdout: String(out ?? "") } : { status: 0, stdout: out })),
   );
 };
 
@@ -459,6 +477,8 @@ const reap = {
   forMs: 5000,
   shutdownMs: 1000,
   list: undefined as ((ms: number) => RenderProcess[] | undefined) | undefined,
+  /** Tests only: a given `ps` run (what `spawnSync`/`execFile` reported), judged like a real one. */
+  run: undefined as ((ms: number) => PsRun) | undefined,
 };
 /** Tests only: other timing or a given process list; returns the restore. */
 export function setRenderReapForTests(o: Partial<typeof reap>): () => void {
@@ -473,15 +493,34 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
 }
 
 /**
- * Whether a process is provably this render's — by an **exact** argument (`ps` joins argv with spaces, so both sides
- * of it must be a boundary): the browser's `--user-data-dir=<folder>/profile`, or the folder as an argument of its own
- * (the watchdog's argv, and a child it forked before exec). The folder is `agentlee-render-XXXXXX`, random; a process
- * that merely reuses the group id or a pid has another command line.
+ * A command line made comparable between what was spawned (argv joined with spaces) and what `ps` prints of it: `ps`
+ * shows a control character escaped (macOS `\\012`, `^A`) or as `?` (Linux), and other bytes as they are or as `?`.
+ * Each such run on either side becomes one placeholder.
+ */
+export function canonArgs(s: string) {
+  const P = "\u2400"; // the placeholder (printable, so no control character appears in a pattern)
+  const marked = s
+    .replace(/\\[0-7]{3}/g, P)
+    .replace(/\^[@-_?]/g, P)
+    .replace(/[?]/g, P);
+  const plain = Array.from(marked, (ch) => {
+    const c = ch.codePointAt(0)!;
+    return c < 0x20 || c > 0x7e ? P : ch;
+  }).join("");
+  return plain.replace(/\u2400+/g, P);
+}
+
+/**
+ * Whether a process is provably this render's (#215). `ps` joins argv with spaces, so no single argument can be told
+ * apart in it; two identities only:
+ *  - the browser: `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`,
+ *    random — what else would carry it?);
+ *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned.
+ * Anything else in the group is unattributed: never signalled (it keeps the reap from completing).
  */
 function ours(e: RenderEntry, args: string) {
-  const tokens = [`--user-data-dir=${e.dir.workDir}/profile`, e.dir.workDir];
-  const padded = ` ${args} `;
-  return tokens.some((t) => padded.includes(` ${t} `));
+  if (` ${args} `.includes(` --user-data-dir=${e.dir.workDir}/profile `)) return true;
+  return e.cmdline !== undefined && canonArgs(args) === e.cmdline;
 }
 
 /**

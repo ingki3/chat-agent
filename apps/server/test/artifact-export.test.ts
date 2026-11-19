@@ -20,7 +20,10 @@ import {
   liveRenderCount,
   onRenderReapIncomplete,
   parseMessage,
+  canonArgs,
   parsePs,
+  psListing,
+  type PsRun,
   reapAfterWatchdog,
   reapingRenderCount,
   releaseRenderDir,
@@ -1161,8 +1164,20 @@ describe("the browser never outlives its owner (#170)", () => {
     });
     const row = (pid: number, pgid: number, args: string, zombie = false) => ({ pid, pgid, zombie, args });
     /** A render being reaped after its watchdog's own end (no group signal: the group id is not ours). */
+    /** A watchdog command line as spawned (a script with a new line and a tab) and as macOS `ps` prints it. */
+    const spawned = (d: string) => [
+      "/usr/bin/perl",
+      "-e",
+      "use strict;\n\tx();",
+      "1",
+      "30",
+      d,
+      "node",
+      "fake.mjs",
+    ];
+    const printed = (d: string) => `/usr/bin/perl -e use strict;\\012\\011x(); 1 30 ${d} node fake.mjs`;
     const reapOf = (G: number, dir: RenderDir) => {
-      const forget = trackRender(G, dir);
+      const forget = trackRender(G, dir, spawned(dir.workDir));
       reapAfterWatchdog(G);
       forget();
     };
@@ -1179,7 +1194,9 @@ describe("the browser never outlives its owner (#170)", () => {
       const dir = freshRenderDir();
       const d = dir.workDir;
       const G = 2_000_000_001; // the group id the listing claims
-      const [foreign, elsewhere, prefixed, lookalike, unreadable, watchdogChild, browser] = [
+      const [foreign, elsewhere, prefixed, lookalike, unreadable, message, almost, watchdogChild, browser] = [
+        sleeper(),
+        sleeper(),
         sleeper(),
         sleeper(),
         sleeper(),
@@ -1194,7 +1211,9 @@ describe("the browser never outlives its owner (#170)", () => {
         row(prefixed, G, `/bin/sh -c echo /archive${d}/profile`), // the path inside another argument
         row(lookalike, G, `chrome --user-data-dir=${d}X/profile`), // another folder
         row(unreadable, G, "[chrome-headless-shell]"), // arguments ps could not read
-        row(watchdogChild, G, `/usr/bin/perl -e use strict; 1 30 ${d} node fake.mjs`),
+        row(message, G, `logger render directory ${d} retained`), // the folder inside one argument
+        row(almost, G, `/usr/bin/perl -e use strict; 1 30 ${d} node fake.mjs`), // not the command line spawned
+        row(watchdogChild, G, printed(d)), // exactly the watchdog's (as a child it forked before exec)
         row(browser, G, `chrome --single-process --user-data-dir=${d}/profile about:blank`),
       ];
       const incomplete: number[] = [];
@@ -1213,7 +1232,7 @@ describe("the browser never outlives its owner (#170)", () => {
         // Live members it cannot attribute stay in the group: never confirmed — given up at the deadline.
         expect(await within(5000, () => incomplete.length > 0)).toBe(true);
         expect(incomplete).toEqual([1]);
-        const others = [foreign, elsewhere, prefixed, lookalike, unreadable, newcomer];
+        const others = [foreign, elsewhere, prefixed, lookalike, unreadable, message, almost, newcomer];
         for (const pid of others) expect(alive(pid), `pid ${pid}`).toBe(true);
         const signalled = kill.mock.calls.filter(([, sig]) => sig === "SIGKILL").map(([t]) => t);
         expect(signalled).not.toContain(-G); // after the watchdog's own end: no group signal
@@ -1251,17 +1270,12 @@ describe("the browser never outlives its owner (#170)", () => {
       const G = 2_000_000_021;
       // The watchdog live (signalled by pid: still listed, not reaped), then a zombie, then nothing. Not forgotten:
       // its end is learnt from the listings alone (as under shutdown, which sees no exit event).
-      const script = [
-        [row(G, G, `/usr/bin/perl -e x 1 30 ${d} node`)],
-        [row(G, G, "<defunct>", true)],
-        [],
-        [],
-      ];
+      const script = [[row(G, G, printed(d))], [row(G, G, "<defunct>", true)], [], []];
       let calls = 0;
       restores.push(setRenderReapForTests({ everyMs: 10, list: () => script[Math.min(calls++, 3)] }));
       const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
       try {
-        trackRender(G, dir);
+        trackRender(G, dir, spawned(d));
         signalRender(G);
         await renderReaped(dir);
         // 1: live leader (killed by pid); 2: leader a zombie — empty, but begun before its end was known; 3: empty.
@@ -1350,6 +1364,71 @@ describe("the browser never outlives its owner (#170)", () => {
       expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
       fs.rmSync(dir.workDir, { recursive: true, force: true });
       fs.rmSync(renderLockPath(dir.workDir), { force: true });
+    });
+
+    it("a listing is only a whole `ps` run: a full buffer (ENOBUFS, status 0, tail cut), a signal or a cut last line is no listing — shutdown keeps the folder", () => {
+      const G = 2_000_000_031;
+      // What `ps` printed before its tail was cut: other processes only — the render's browser was in the lost tail.
+      const head = "    1     1 Ss   /sbin/launchd\n  500   500 S    /usr/sbin/syslogd\n";
+      const enobufs = Object.assign(new Error("spawnSync /bin/ps ENOBUFS"), { code: "ENOBUFS" });
+      const runs: [string, PsRun][] = [
+        ["ENOBUFS", { status: 0, signal: null, error: enobufs, stdout: head }],
+        ["signal", { status: null, signal: "SIGTERM", stdout: head }],
+        [
+          "cut line",
+          { status: 0, signal: null, stdout: `${head}  777   ${G} S    chrome --user-data-dir=/x` },
+        ],
+        ["failed", { status: 1, signal: null, stdout: head }],
+      ];
+      for (const [what, run] of runs) {
+        expect(psListing(run), what).toBeUndefined();
+        const dir = freshRenderDir();
+        restores.push(setRenderReapForTests({ shutdownMs: 100, run: () => run }));
+        const incomplete: number[] = [];
+        onRenderReapIncomplete((n) => incomplete.push(n));
+        trackRender(G, dir);
+        killLiveRenders();
+        expect(incomplete, what).toEqual([1]);
+        expect(fs.existsSync(dir.workDir), what).toBe(true);
+        expect(fs.existsSync(renderLockPath(dir.workDir)), what).toBe(true);
+        fs.rmSync(dir.workDir, { recursive: true, force: true });
+        fs.rmSync(renderLockPath(dir.workDir), { force: true });
+        for (const r of restores.splice(0)) r();
+      }
+      // Control: the same output, whole, is a listing — and (the group gone) confirms the render.
+      expect(psListing({ status: 0, signal: null, stdout: head })).toHaveLength(2);
+      const dir = freshRenderDir();
+      restores.push(
+        setRenderReapForTests({ shutdownMs: 500, run: () => ({ status: 0, signal: null, stdout: head }) }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      trackRender(G, dir);
+      killLiveRenders();
+      expect(incomplete).toEqual([]);
+      expect(fs.existsSync(dir.workDir)).toBe(false);
+    });
+
+    it("the watchdog's identity is its whole command line: the real `ps` row of a running watchdog matches what was spawned", async () => {
+      const w = watchdog(FAKE());
+      let row: { args: string } | undefined;
+      expect(
+        await within(10_000, () => {
+          const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
+            encoding: "utf8",
+            maxBuffer: 64 << 20,
+          });
+          row = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+            (x) => x.pid === w.l.child.pid,
+          );
+          return !!row;
+        }),
+      ).toBe(true);
+      expect(canonArgs(row!.args)).toBe(canonArgs(w.l.child.spawnargs.join(" ")));
+      // One character changed is another command line.
+      expect(canonArgs(row!.args.replace(" 30 ", " 31 "))).not.toBe(canonArgs(w.l.child.spawnargs.join(" ")));
+      process.kill(w.l.child.pid!, "SIGTERM");
+      expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
     });
 
     it("ps rows: pid, group, zombie state and the command line", () => {
@@ -1593,7 +1672,7 @@ describe("the browser never outlives its owner (#170)", () => {
 
   it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end reaps its processes by pid — no group signal (#215)", async () => {
     // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" in their group (a sleeper
-    // carrying the render's folder as an argument of its own, as the watchdog's forked child does).
+    // carrying the browser's identity, `--user-data-dir=<folder>/profile`).
     let groupSignals = 0;
     const react = async (status: number) => {
       const p = pidFile();
@@ -1603,7 +1682,7 @@ describe("the browser never outlives its owner (#170)", () => {
           "/bin/sh",
           [
             "-c",
-            `/usr/bin/perl -e 'sleep 30' '${s.workDir}' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
+            `/usr/bin/perl -e 'sleep 30' -- '--user-data-dir=${s.workDir}/profile' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
           ],
           {
             env: { EXIT_CODE: String(status) },
