@@ -349,9 +349,11 @@ function encodedLiterals(v: string): string[] {
 /**
  * Characters handed to the matcher since the process started (every `scan`, views not counted again): what the
  * save budget test (#155) measures — a run's saves must scan in proportion to what the run produced, not to the
- * number of its tool calls times its size.
+ * number of its tool calls times its size. `tail` (the raw text) and `encodedTail` (base64 and hex): character
+ * comparisons of the passes that look for a secret the text ends inside (KMP, #213 — what the linearity test
+ * counts: linear in the text, never compared from every start).
  */
-export const scanStats = { chars: 0 };
+export const scanStats = { chars: 0, tail: 0, encodedTail: 0 };
 
 const PARTIAL = -2;
 const FAIL = -1;
@@ -801,7 +803,11 @@ function scanCore(
     let q = 0;
     for (let k = Math.max(0, n - l.length + 1); k < n; k++) {
       const ch = text.charCodeAt(k);
-      while (q > 0 && l.charCodeAt(q) !== ch) q = sec.fail[q - 1]!;
+      scanStats.tail++;
+      while (q > 0 && l.charCodeAt(q) !== ch) {
+        scanStats.tail++;
+        q = sec.fail[q - 1]!;
+      }
       if (l.charCodeAt(q) === ch) q++;
       if (q === l.length) q = sec.fail[q - 1]!;
     }
@@ -838,7 +844,11 @@ function scanCore(
       let q = 0;
       for (let k = Math.max(0, vn - l.length + 1); k < vn; k++) {
         const c = hay.charCodeAt(k);
-        while (q > 0 && l.charCodeAt(q) !== c) q = fail[q - 1]!;
+        scanStats.encodedTail++;
+        while (q > 0 && l.charCodeAt(q) !== c) {
+          scanStats.encodedTail++;
+          q = fail[q - 1]!;
+        }
         if (l.charCodeAt(q) === c) q++;
         if (q === l.length) q = fail[q - 1]!; // a whole occurrence: found above
       }
