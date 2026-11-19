@@ -639,12 +639,13 @@ function endsPart(text: string, start: number, end: number): boolean {
   if (endsSentence(text, start, end)) return true;
   const k = lastMark(text, start, end);
   if (k < start || !/[…:：]/u.test(text[k]!)) return false;
-  // `09:` then `30` in the next part is a time (review 8·9차) — only the strict H:MM / HH:MM form: one or two digits,
-  // the colon, exactly two digits, then no digit. `변경안 2:` then `2027학년도…` is a stop.
-  if (text[k] !== ":") return true;
+  // `09:` then `30` in the next part is a time (review 8·9·10차) — only the strict H:MM / HH:MM form: one or two
+  // digits, the colon, exactly two digits, then no digit. `변경안 2:` then `2027학년도…` is a stop.
+  // Any decimal digits (`０９：３０` too) and either colon (review 10차); the hour is read within this paragraph only.
+  if (text[k] === "…") return true;
   const time =
-    /(?:^|[^0-9])[0-9]{1,2}$/.test(text.slice(Math.max(0, k - 3), k)) &&
-    /^[0-9]{2}(?:[^0-9]|$)/.test(text.slice(k + 1, k + 4));
+    /(?:^|\P{Nd})\p{Nd}{1,2}$/u.test(text.slice(start, k)) &&
+    /^\p{Nd}{2}(?:\P{Nd}|$)/u.test(text.slice(k + 1, k + 9));
   return !time;
 }
 

@@ -2218,6 +2218,28 @@ describe("citationNote", () => {
         expect(missingOf([...read("a"), ...text(a), ...read("b"), ...text(b)]), a).toEqual([]);
     });
 
+    it("review 10차: full-width colon and digits are a time; the hour is read within the paragraph", () => {
+      for (const a of ["회의는 ０９：", "회의는 09：", "회의는 ９:"])
+        expect(missingOf([...read("a"), ...text(a), ...read("b"), ...text("30에 시작해요[1].")]), a).toEqual(
+          [],
+        );
+      expect(
+        missingOf([...read("a"), ...text("회의는 ０９："), ...read("b"), ...text("３０에 시작해요[1].")]),
+      ).toEqual([]);
+      // A heading's digits before a card are not the hour: `## 11` → card → `2:` → tool → `30…` is 2:30.
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("## 11"),
+          card,
+          ...text("2:"),
+          ...read("b"),
+          ...text("30에 시작해요[1]."),
+        ]),
+      ).toEqual([]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [
