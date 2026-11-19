@@ -20,9 +20,8 @@ import {
   liveRenderCount,
   onRenderReapIncomplete,
   parseMessage,
-  browserPattern,
-  cmdlinePattern,
   parsePs,
+  psEncode,
   psListing,
   type PsRun,
   reapAfterWatchdog,
@@ -1160,7 +1159,7 @@ describe("the browser never outlives its owner (#170)", () => {
     };
     const restores: (() => void)[] = [];
     afterEach(() => {
-      for (const r of restores.splice(0)) r();
+      for (const r of restores.splice(0).reverse()) r(); // last first: each restores what was before it
       onRenderReapIncomplete(undefined);
     });
     const row = (pid: number, pgid: number, args: string, zombie = false) => ({ pid, pgid, zombie, args });
@@ -1176,7 +1175,8 @@ describe("the browser never outlives its owner (#170)", () => {
       "node",
       "fake.mjs",
     ];
-    const printed = (d: string) => `/usr/bin/perl -e use strict;\\012\\011x(); 1 30 ${d} node fake.mjs`;
+    /** As this platform's `ps` prints it (macOS: `\\012\\011` for the new line and tab). */
+    const printed = (d: string) => psEncode(spawned(d).join(" "))!;
     /** The browser executable these renders launched (argv[0] of their browser). */
     const CHROME = "/opt/chrome/chrome-headless-shell";
     const reapOf = (G: number, dir: RenderDir) => {
@@ -1419,7 +1419,7 @@ describe("the browser never outlives its owner (#170)", () => {
         expect(fs.existsSync(renderLockPath(dir.workDir)), what).toBe(true);
         fs.rmSync(dir.workDir, { recursive: true, force: true });
         fs.rmSync(renderLockPath(dir.workDir), { force: true });
-        for (const r of restores.splice(0)) r();
+        for (const r of restores.splice(0).reverse()) r(); // last first: each restores what was before it
       }
       // Control: the same output, whole, is a listing — and (the group gone) confirms the render.
       expect(psListing({ status: 0, signal: null, stdout: head })).toHaveLength(2);
@@ -1451,131 +1451,198 @@ describe("the browser never outlives its owner (#170)", () => {
           return !!row;
         }),
       ).toBe(true);
-      const pattern = cmdlinePattern(w.l.child.spawnargs.join(" "));
-      expect(pattern.test(row!.args)).toBe(true);
-      // One character changed is another command line.
-      expect(pattern.test(row!.args.replace(" 30 ", " 31 "))).toBe(false);
+      const expected = psEncode(w.l.child.spawnargs.join(" "));
+      expect(row!.args).toBe(expected);
       // Stopped by its owner (stdin closed): a TERM could come before Perl has installed its handler.
       w.l.child.stdin!.end();
       expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
     });
 
-    it("command lines as `ps` prints them (C locale, byte by byte): each byte only in its own forms", () => {
-      const p = cmdlinePattern("perl -e a\nb\t\u0085c 가.mjs /d");
-      for (const shown of [
-        "perl -e a\\012b\\011M-BM^Ec M-jM-0M^@.mjs /d", // macOS, C locale (as `ps` runs here)
-        "perl -e a^Jb^I\\302\\205c \\352\\260\\200.mjs /d",
-        "perl -e a\\012b\\011M^Ec 가.mjs /d", // macOS, a UTF-8 locale
-        "perl -e a?b???c ???.mjs /d", // Linux, C locale: one `?` per byte
-      ])
-        expect(p.test(shown), shown).toBe(true);
-      for (const other of [
-        "perl -e a\\012b\\011M^Ec 나.mjs /d", // another printable character
-        "perl -e a\\012b\\011M^Ec M-jM-0M^A.mjs /d", // another byte
-        "perl -e a\\011b\\011M^Ec 가.mjs /d", // a tab's escape for the new line
-        "perl -e a^Ib\\011M^Ec 가.mjs /d",
-        "perl -e a?b???c ?.mjs /d", // one `?` for a three-byte character
-        "perl -e a b???c ???.mjs /d", // a space for a control character
-        "perl -e a?b???c ???.mjs /d extra",
-        "x perl -e a?b???c ???.mjs /d",
-      ])
-        expect(p.test(other), other).toBe(false);
-      // Regular-expression characters in the command line are literal.
-      expect(cmdlinePattern("a.b (c)+ x-y").test("axb (c)+ x-y")).toBe(false);
-      expect(cmdlinePattern("a.b (c)+ x-y").test("a.b (c)+ x-y")).toBe(true);
+    it("psEncode (macOS): exactly what `ps` prints in the C locale — controls, DEL, C1, multibyte, backslash", () => {
+      const mac = (t: string) => psEncode(t, "darwin");
+      expect(mac("a\\z b\tc\nd\u0001\u007f")).toBe("a\\z b\\011c\\012d^A^?");
+      expect(mac("\u0085")).toBe("M-BM^E"); // C1: its two UTF-8 bytes
+      expect(mac("/opt/브라우저/chrome")).toBe("/opt/M-kM-8M^LM-kM^]M-<M-lM^ZM-0M-l\\240M^@/chrome"); // printed by ps
+      expect(mac("é  ")).toBe("M-CM-) M-B\\240");
+      // Different text never prints the same: a Korean path is not the ASCII path with `?` in its place.
+      expect(mac("/opt/브라우저/chrome")).not.toBe(mac("/opt/????????????/chrome"));
+      expect(mac("a\nb")).not.toBe(mac("a\tb"));
+      expect(psEncode("x", "win32")).toBeUndefined(); // unknown platform: nothing attributed
+      expect(psEncode("a\n가?", "linux")).toBe("a?????"); // procps (not checked here: no Linux host)
     });
 
-    it("the browser's identity: its executable (non-ASCII too, as `ps` prints it) and the profile switch as a token", () => {
-      const d = "/t/agentlee-render-AbC123";
-      const b = browserPattern("/opt/브라우저/chrome", d);
-      const cLocale = "/opt/M-kM-8M^LM-kM^]M-<M-lM^ZM-0M-l\\240M^@/chrome"; // what macOS `ps` printed in the C locale
-      for (const exe of [cLocale, "/opt/브라우저/chrome", `/opt/${"?".repeat(12)}/chrome`])
-        expect(b.test(`${exe} --single-process --user-data-dir=${d}/profile about:blank`), exe).toBe(true);
-      for (const other of [
-        `/opt/나우저/chrome --user-data-dir=${d}/profile`, // another executable
-        `/opt/브라우저/chrome2 --user-data-dir=${d}/profile`,
-        `/opt/브라우저/chrome --user-data-dir=${d}/profileX`, // not a token
-        `/opt/브라우저/chrome x--user-data-dir=${d}/profile`,
-        `logger /opt/브라우저/chrome --user-data-dir=${d}/profile`,
-      ])
-        expect(b.test(other), other).toBe(false);
-    });
-
-    it("real `ps` (as the reap runs it): a non-ASCII executable and command line with control characters are recognised", async () => {
-      const dir = freshRenderDir();
-      const exe = "/opt/브라우저/chrome";
-      const browser = spawn(
+    it("long command lines are plain string work: a 657-byte Korean path in a 15 KB command line is matched at once", () => {
+      const seg = "브라우저-폴더";
+      let dir = "/t";
+      while (Buffer.byteLength(dir) < 657) dir += `/${seg}`;
+      const argv = [
         "/usr/bin/perl",
-        ["-e", "sleep 30", "--", `--user-data-dir=${dir.workDir}/profile`],
-        {
-          argv0: exe,
+        "-e",
+        "x\n".repeat(7000),
+        "1",
+        "30",
+        dir,
+        "/usr/bin/sandbox-exec",
+        "-p",
+        dir,
+      ];
+      expect(Buffer.byteLength(argv.join(" "))).toBeGreaterThan(15_000);
+      const shown = psEncode(argv.join(" "))!;
+      const t0 = performance.now();
+      const G = 2_000_000_041;
+      const rd = freshRenderDir();
+      const forget = trackRender(G, rd, { argv, browser: dir });
+      // Through the reap's own check: listed with that exact command line, it is ours (killed by pid, here a fake).
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(
+          setRenderReapForTests({
+            shutdownMs: 100,
+            list: () => [{ pid: 2_000_000_043, pgid: G, zombie: false, args: shown }],
+          }),
+        );
+        killLiveRenders();
+        expect(kill.mock.calls.some(([t]) => t === 2_000_000_043)).toBe(true);
+      } finally {
+        kill.mockRestore();
+        forget();
+        fs.rmSync(rd.workDir, { recursive: true, force: true });
+        fs.rmSync(renderLockPath(rd.workDir), { force: true });
+      }
+      expect(performance.now() - t0).toBeLessThan(2000);
+    });
+
+    it("the browser's identity: its executable launched (as `ps` prints it) and the profile switch as a token", () => {
+      const d = "/t/agentlee-render-AbC123";
+      const G = 2_000_000_051;
+      const exe = "/opt/브라우저/chrome";
+      const rows = (args: string[]) =>
+        args.map((a, i) => ({ pid: 2_000_000_100 + i, pgid: G, zombie: false, args: a }));
+      const enc = (t: string) => psEncode(t)!;
+      const listed = rows([
+        enc(`${exe} --single-process --user-data-dir=${d}/profile about:blank`), // ours
+        enc(`/opt/????????????/chrome --user-data-dir=${d}/profile`), // another executable (`?` in its path)
+        enc(`/opt/나우저/chrome --user-data-dir=${d}/profile`),
+        enc(`${exe}2 --user-data-dir=${d}/profile`),
+        enc(`${exe} --user-data-dir=${d}/profileX`),
+        enc(`${exe} x--user-data-dir=${d}/profile`),
+        enc(`logger ${exe} --user-data-dir=${d}/profile`),
+      ]);
+      const dir: RenderDir = { workDir: d, lockFd: -1 };
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => listed }));
+        trackRender(G, dir, { browser: exe });
+        killLiveRenders();
+        const signalled = new Set(kill.mock.calls.filter(([t]) => t > 0).map(([t]) => t));
+        // Linux procps prints every non-ASCII byte as `?`: there the `?` path is indistinguishable (documented).
+        const want =
+          { darwin: [2_000_000_100], linux: [2_000_000_100, 2_000_000_101] }[process.platform as string] ??
+          [];
+        expect([...signalled].sort()).toEqual(want);
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("a check that throws (a malformed row) is unattributed: the reap goes on and ends, nothing escapes", async () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_061;
+      const bad = { pid: 2_000_000_063, pgid: G, zombie: false } as {
+        pid: number;
+        pgid: number;
+        zombie: boolean;
+        args: string;
+      };
+      Object.defineProperty(bad, "args", {
+        get() {
+          throw new Error("unreadable");
+        },
+      });
+      restores.push(setRenderReapForTests({ everyMs: 10, forMs: 200, list: () => [bad] }));
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      reapOf(G, dir);
+      await renderReaped(dir);
+      expect(incomplete).toEqual([1]);
+      keptAndCleaned(dir);
+      // And shutdown, synchronously.
+      const dir2 = freshRenderDir();
+      restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => [bad] }));
+      trackRender(G, dir2, { browser: CHROME });
+      expect(() => killLiveRenders()).not.toThrow();
+      expect(incomplete).toEqual([1, 1]);
+      fs.rmSync(dir2.workDir, { recursive: true, force: true });
+      fs.rmSync(renderLockPath(dir2.workDir), { force: true });
+    });
+
+    it.skipIf(process.platform !== "darwin")(
+      "real `ps` (macOS, as the reap runs it): exactly the encoding — every byte valid UTF-8 can hold",
+      async () => {
+        let text = "";
+        for (let c = 1; c < 0x100; c++) text += String.fromCodePoint(c);
+        for (let lead = 0xe1; lead <= 0xef; lead++) text += Buffer.from([lead, 0x80, 0x80]).toString("utf8");
+        text += `${String.fromCodePoint(0x10000, 0x100000)} 가나다 /opt/브라우저/chrome \\ ^A M-x ?`;
+        const c = spawn("/usr/bin/perl", ["-e", "sleep 30", "--", text, "x y"], {
+          argv0: "/opt/브라우저/chrome",
           detached: true,
           stdio: "ignore",
-        },
-      );
-      const other = spawn("/usr/bin/perl", ["-e", "sleep 30;\n#\u0001 가", "x"], {
-        detached: true,
-        stdio: "ignore",
-      });
-      for (const c of [browser, other]) startedGroups.add(c.pid!);
-      try {
-        for (const env of [
-          { LC_ALL: "C", LANG: "C" },
-          { LC_ALL: "en_US.UTF-8", LANG: "en_US.UTF-8" },
-        ]) {
-          let rows: { pid: number; args: string }[] = [];
+        });
+        startedGroups.add(c.pid!);
+        try {
+          let args: string | undefined;
           expect(
             await within(10_000, () => {
               const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
                 encoding: "utf8",
                 maxBuffer: 64 << 20,
-                env,
+                env: { LC_ALL: "C", LANG: "C" },
               });
-              rows = psListing({ status: r.status, signal: r.signal, stdout: r.stdout }) ?? [];
-              return [browser.pid, other.pid].every((pid) => rows.some((x) => x.pid === pid));
+              args = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+                (x) => x.pid === c.pid,
+              )?.args;
+              return args !== undefined && !args.startsWith("(");
             }),
           ).toBe(true);
-          const args = (pid: number) => rows.find((x) => x.pid === pid)!.args;
-          expect(
-            browserPattern(exe, dir.workDir).test(args(browser.pid!)),
-            `${env.LC_ALL}: ${args(browser.pid!)}`,
-          ).toBe(true);
-          expect(
-            cmdlinePattern(other.spawnargs.join(" ")).test(args(other.pid!)),
-            `${env.LC_ALL}: ${args(other.pid!)}`,
-          ).toBe(true);
+          expect(args).toBe(
+            psEncode(["/opt/브라우저/chrome", "-e", "sleep 30", "--", text, "x y"].join(" ")),
+          );
+        } finally {
+          c.kill("SIGKILL");
+          expect(await gone(c.pid!)).toBe(true);
         }
-      } finally {
-        for (const c of [browser, other]) c.kill("SIGKILL");
-      }
-    });
+      },
+    );
 
-    it("end to end with the real listing: a browser with a non-ASCII executable, left in its group, is reaped and confirmed", async () => {
-      const dir = freshRenderDir();
-      const exe = "/opt/브라우저/chrome";
-      const browser = spawn(
-        "/usr/bin/perl",
-        ["-e", "sleep 30", "--", `--user-data-dir=${dir.workDir}/profile`],
-        {
-          argv0: exe,
-          detached: true, // its own group: it stands for the browser left in the render's group
-          stdio: "ignore",
-        },
-      );
-      startedGroups.add(browser.pid!);
-      expect(await within(5000, () => alive(browser.pid!))).toBe(true);
-      restores.push(setRenderReapForTests({ everyMs: 20 }));
-      const incomplete: number[] = [];
-      onRenderReapIncomplete((n) => incomplete.push(n));
-      const forget = trackRender(browser.pid!, dir, { browser: exe });
-      reapAfterWatchdog(browser.pid!);
-      forget();
-      releaseRenderDir(dir); // handed to the reap
-      await renderReaped(dir);
-      expect(incomplete).toEqual([]);
-      expect(await within(5000, () => !alive(browser.pid!))).toBe(true);
-      expect(fs.existsSync(dir.workDir)).toBe(false);
-    });
+    it.skipIf(process.platform !== "darwin")(
+      "end to end with the real listing (macOS): a browser with a non-ASCII executable, left in its group, is reaped and confirmed",
+      async () => {
+        const dir = freshRenderDir();
+        const exe = "/opt/브라우저/chrome";
+        const browser = spawn(
+          "/usr/bin/perl",
+          ["-e", "sleep 30", "--", `--user-data-dir=${dir.workDir}/profile`],
+          {
+            argv0: exe,
+            detached: true, // its own group: it stands for the browser left in the render's group
+            stdio: "ignore",
+          },
+        );
+        startedGroups.add(browser.pid!);
+        expect(await within(5000, () => alive(browser.pid!))).toBe(true);
+        restores.push(setRenderReapForTests({ everyMs: 20 }));
+        const incomplete: number[] = [];
+        onRenderReapIncomplete((n) => incomplete.push(n));
+        const forget = trackRender(browser.pid!, dir, { browser: exe });
+        reapAfterWatchdog(browser.pid!);
+        forget();
+        releaseRenderDir(dir); // handed to the reap
+        await renderReaped(dir);
+        expect(incomplete).toEqual([]);
+        expect(await gone(browser.pid!)).toBe(true); // confirmed gone, and off the list before `afterEach`
+        expect(fs.existsSync(dir.workDir)).toBe(false);
+      },
+    );
 
     it("ps rows: pid, group, zombie state and the command line", () => {
       const rows = parsePs(

@@ -393,10 +393,10 @@ type RenderEntry = {
   timer?: NodeJS.Timeout;
   /** Told when the reap is over (`renderReaped`). */
   waiters: (() => void)[];
-  /** The watchdog's whole command line as launched (`cmdlinePattern`), its identity in a listing; none when unknown. */
-  cmdline?: RegExp;
-  /** The browser's identity (`browserPattern`): the executable launched and its profile switch; none when unknown. */
-  browser?: RegExp;
+  /** What `ps` prints of the watchdog's whole command line (`psEncode`); none when unknown. */
+  cmdline?: string;
+  /** What `ps` prints of the browser executable launched followed by a space, and of its profile switch. */
+  browser?: { prefix: string; token: string };
 };
 const liveRenders = new Map<number, RenderEntry>();
 const reaping = new Set<RenderEntry>();
@@ -417,8 +417,7 @@ export function trackRender(
   const entry: RenderEntry = {
     pgid,
     dir,
-    ...(who.argv?.length ? { cmdline: cmdlinePattern(who.argv.join(" ")) } : {}),
-    ...(who.browser ? { browser: browserPattern(who.browser, dir.workDir) } : {}),
+    ...identities(who, dir.workDir),
     signalled: false,
     leaderGone: false,
     ownsDir: false,
@@ -459,7 +458,7 @@ export function psListing(r: PsRun): RenderProcess[] | undefined {
     return undefined;
   return parsePs(r.stdout);
 }
-/** `ps` in the C locale (#215): how it prints a byte then does not depend on the server's locale (`psPattern`). */
+/** `ps` in the C locale (#215): how it prints a byte then does not depend on the server's locale (`psEncode`). */
 const PS_OPTS = { encoding: "utf8" as const, maxBuffer: 64 << 20, env: { LC_ALL: "C", LANG: "C" } };
 const budget = (ms: number) => Math.max(1, Math.ceil(ms));
 /** The listing, within `ms` (the caller's remaining budget); undefined when it failed, was cut or ran out of time. */
@@ -501,70 +500,70 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
   onIncomplete = fn;
 }
 
-const reEscape = (t: string) => t.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-const octal = (b: number) => `\\${b.toString(8).padStart(3, "0")}`;
-/** What `ps` may print for one byte that it does not print as it is (`psPattern`). */
-function byteForms(b: number): string[] {
-  const forms = [octal(b), "?"];
-  const m = b & 0x7f;
-  const caret = m === 0x7f ? "^?" : m < 0x20 ? `^${String.fromCharCode(m + 0x40)}` : undefined;
-  if (b < 0x80) {
-    if (caret) forms.push(caret);
-  } else if (caret) forms.push(`M${caret}`);
-  else if (m > 0x20) forms.push(`M-${String.fromCharCode(m)}`);
-  return forms;
-}
 /**
- * A regular-expression source for what `ps` prints of `text` (part of a command line). `ps` (#215) prints printable
- * ASCII as it is and changes the rest **byte by byte**, in the C locale it is run in (`PS_OPTS`): macOS (`vis`) as an
- * octal escape (`\012`), `^J` / `^?`, or `M-k` / `M^L` for a byte above 0x7f; Linux as `?`. Each byte may only take its
- * own forms — `\011` is not a new line. A printable non-ASCII character may also appear as it is (a UTF-8 locale).
+ * Exactly what this platform's `ps` prints of `text` (part of a command line) in the C locale it is run in
+ * (`PS_OPTS`) — one deterministic encoding, compared as plain strings (#215). Undefined on a platform it is not known
+ * for: nothing is then attributed (never signalled).
+ *  - macOS (`/bin/ps`, `vis` in the C locale; checked against the real output for every byte valid UTF-8 can hold):
+ *    printable ASCII as it is (the backslash too); tab and new line as octal (`\011`, `\012`); any other control
+ *    character as `^X`, DEL as `^?`; a byte above 0x7f as `M-x` (its low seven bits printable), `M^X` / `M^?` (a
+ *    control), or `\240` (0xa0).
+ *  - Linux (procps, C locale; **not checked here** — no Linux host): printable ASCII as it is, every other byte `?`.
  */
-export function psPattern(text: string): string {
-  let src = "";
-  for (const ch of text) {
-    const c = ch.codePointAt(0)!;
-    if (c >= 0x20 && c < 0x7f) {
-      src += reEscape(ch);
-      continue;
+export function psEncode(text: string, platform: string = process.platform): string | undefined {
+  if (platform !== "darwin" && platform !== "linux") return undefined;
+  let out = "";
+  for (const b of Buffer.from(text, "utf8")) {
+    if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
+    else if (platform === "linux") out += "?";
+    else if (b === 0x09 || b === 0x0a) out += `\\0${b.toString(8).padStart(2, "0")}`;
+    else if (b < 0x20) out += `^${String.fromCharCode(b + 0x40)}`;
+    else if (b === 0x7f) out += "^?";
+    else {
+      const m = b & 0x7f;
+      if (m < 0x20) out += `M^${String.fromCharCode(m + 0x40)}`;
+      else if (m === 0x7f) out += "M^?";
+      else if (m === 0x20) out += "\\240";
+      else out += `M-${String.fromCharCode(m)}`;
     }
-    const bytes = [...Buffer.from(ch, "utf8")]
-      .map((b) => `(?:${byteForms(b).map(reEscape).join("|")})`)
-      .join("");
-    const whole = c >= 0xa0 ? [reEscape(ch)] : c >= 0x80 ? byteForms(c).map(reEscape) : []; // printable, or a C1 code point
-    src += whole.length ? `(?:${bytes}|${whole.join("|")})` : bytes;
   }
-  return src;
+  return out;
 }
-/** The watchdog's identity: its whole command line exactly as spawned (`psPattern`). */
-export function cmdlinePattern(spawned: string): RegExp {
-  return new RegExp(`^${psPattern(spawned)}$`, "u");
-}
-/**
- * The browser's identity: its command line starts with the executable launched (argv[0]) and has
- * `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random).
- */
-export function browserPattern(browser: string, workDir: string): RegExp {
-  return new RegExp(
-    `^${psPattern(browser)} (?:.* )?${psPattern(`--user-data-dir=${workDir}/profile`)}(?: |$)`,
-    "u",
-  );
+
+/** A render's two identities as `ps` prints them, worked out once (`trackRender`). */
+function identities(
+  who: { argv?: readonly string[]; browser?: string },
+  workDir: string,
+): Pick<RenderEntry, "cmdline" | "browser"> {
+  const cmdline = who.argv?.length ? psEncode(who.argv.join(" ")) : undefined;
+  const exe = who.browser ? psEncode(who.browser) : undefined;
+  const token = psEncode(`--user-data-dir=${workDir}/profile`);
+  return {
+    ...(cmdline !== undefined ? { cmdline } : {}),
+    ...(exe !== undefined && token !== undefined ? { browser: { prefix: `${exe} `, token } } : {}),
+  };
 }
 
 /**
  * Whether a process is provably this render's (#215). `ps` joins argv with spaces, so no single argument can be told
- * apart in it; two identities only:
- *  - the browser (`browserPattern`): its command line starts with the executable launched (argv[0]) and has
+ * apart in it; two identities only, both as `ps` prints them (`psEncode`) and compared as plain strings:
+ *  - the browser: its command line starts with the executable launched (argv[0]) and a space, and has
  *    `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random);
- *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned
- *    (`cmdlinePattern`).
- * Both are matched as `ps` prints them in the C locale (`psPattern`), never compared raw.
- * Anything else in the group is unattributed: never signalled (it keeps the reap from completing). What remains
- * indistinguishable: a process in the same group, of the same executable, with the exact switch inside one of its
- * arguments — only something that runs the browser binary in the render's own group could be that.
+ *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned.
+ * Anything else in the group is unattributed: never signalled (it keeps the reap from completing) — so is anything the
+ * check fails on. What remains indistinguishable: a process in the same group, of the same executable, with the exact
+ * switch inside one of its arguments — only something that runs the browser binary in the render's own group; on
+ * Linux, where every other byte prints as `?`, a literal `?` where the expected text has a non-ASCII byte too.
  */
-function ours(e: RenderEntry, args: string) {
-  return !!e.browser?.test(args) || !!e.cmdline?.test(args);
+function ours(e: RenderEntry, row: RenderProcess): boolean {
+  try {
+    const args = row.args;
+    if (e.cmdline !== undefined && args === e.cmdline) return true;
+    const b = e.browser;
+    return !!b && args.startsWith(b.prefix) && ` ${args} `.includes(` ${b.token} `);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -578,7 +577,7 @@ function reapStep(e: RenderEntry, rows: RenderProcess[], leaderWasGone: boolean,
   const group = rows.filter((r) => !r.zombie && r.pgid === e.pgid);
   if (!group.some((r) => r.pid === e.pgid)) e.leaderGone = true; // a zombie or gone: no more forks
   for (const r of group) {
-    if (!ours(e, r.args)) continue;
+    if (!ours(e, r)) continue;
     if (performance.now() >= deadline) break;
     try {
       process.kill(r.pid, "SIGKILL");
