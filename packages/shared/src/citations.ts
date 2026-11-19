@@ -467,6 +467,33 @@ function neighbours(text: string, units: Unit[]): void {
 export type CitationMarker = TextRange & { n: number };
 
 /**
+ * One line of inline markdown (a heading's words, #211 review 6) as the parser reads it: its top-level inline nodes in
+ * order, each with its source range and the words it shows (`visible` — the text of a text node as written; of a link,
+ * emphasis, strong or strikethrough the text inside it, never a link's address). Undefined when the line is not one
+ * paragraph (it reads as a list, a quote …): the caller then takes the line as written.
+ */
+export function inlineSegments(
+  text: string,
+): { type: string; start: number; end: number; visible: string }[] | undefined {
+  const root = parseBlock(text);
+  if (root.children.length !== 1 || root.children[0]!.type !== "paragraph") return undefined;
+  const visible = (n: Nodes): string =>
+    n.type === "text" || n.type === "inlineCode" || n.type === "inlineMath"
+      ? n.value
+      : "children" in n
+        ? (n.children as Nodes[]).map(visible).join("")
+        : "";
+  const out: { type: string; start: number; end: number; visible: string }[] = [];
+  for (const c of (root.children[0] as Parents).children as Nodes[]) {
+    const start = startOf(c);
+    const end = endOf(c);
+    if (start === undefined || end === undefined) return undefined;
+    out.push({ type: c.type, start, end, visible: c.type === "text" ? text.slice(start, end) : visible(c) });
+  }
+  return out;
+}
+
+/**
  * Where the shown text is plain text (#211 review 3): the ranges of the parser's `text` nodes (per screen block, as
  * `citationUnits` parses them), outside every link, link reference, image and definition — so a `[n]` there is
  * written text, not a link's label or address, an autolink (`<https://…/[1]>`) or code.

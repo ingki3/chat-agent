@@ -1,6 +1,7 @@
 import {
   citationMarkers,
   citationUnits,
+  inlineSegments,
   plainTextRanges,
   sentenceSpans,
   type CitationMarker,
@@ -200,6 +201,56 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     }
     return kept;
   };
+  /**
+   * A heading's words, judged on what the parser shows (review 6): each sentence of the visible text — a link's or an
+   * emphasis' words included, never a link's address — that ends like a sentence and has no verified marker is a fact
+   * and goes; a fact inside a link, emphasis or strikethrough takes that whole node with it. The rest is written again.
+   */
+  const keptHeading = (from: number, to: number): string | undefined => {
+    const segs = inlineSegments(src.slice(from, to));
+    if (!segs) {
+      const kept = keptSentences(from, to, true);
+      return kept.length ? kept.join(" ") : undefined;
+    }
+    let shown = "";
+    const map = segs.map((g) => {
+      const m = {
+        vs: shown.length,
+        ve: shown.length + g.visible.length,
+        ss: from + g.start,
+        se: from + g.end,
+        text: g.type === "text",
+      };
+      shown += g.visible;
+      return m;
+    });
+    const drop: [number, number][] = [];
+    for (const r of sentenceSpans(shown)) {
+      if (isTopicLabel(shown.slice(r.start, r.end))) continue;
+      const ranges = map
+        .filter((m) => m.ve > r.start && m.vs < r.end)
+        .map((m): [number, number] =>
+          m.text ? [m.ss + Math.max(0, r.start - m.vs), m.ss + Math.min(m.ve, r.end) - m.vs] : [m.ss, m.se],
+        );
+      if (ranges.some(([a, b]) => backed(a, b))) continue;
+      removed++;
+      drop.push(...ranges);
+    }
+    drop.sort((a, b) => a[0] - b[0]);
+    const pieces: string[] = [];
+    let at = from;
+    for (const [a, b] of drop) {
+      if (a > at) pieces.push(emit(at, a));
+      at = Math.max(at, b);
+    }
+    if (at < to) pieces.push(emit(at, to));
+    const out = pieces
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    return out || undefined;
+  };
   const blocks: Block[] = [];
   for (const u of units) {
     if (u.inline || u.kind === "rule") continue;
@@ -218,9 +269,8 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       // under it) or a paragraph of bold text only (`**…**`) — checked sentence by sentence (`## 수출이 늘었다. 증가
       // 원인`: the first states a fact, the second names a topic) and written again in one form.
       const h = headingContent(raw);
-      const kept = keptSentences(u.start + h.start, u.start + h.end, true);
-      if (!kept.length) continue;
-      const shown = kept.join(" ");
+      const shown = keptHeading(u.start + h.start, u.start + h.end);
+      if (!shown) continue;
       // The report's own title is the server's: a level-1 heading of the writer's becomes a section. A bold label keeps
       // its form (and its colon); never more than `######`.
       const level = h.form === "atx" ? Math.min(6, Math.max(2, h.level)) : 7;

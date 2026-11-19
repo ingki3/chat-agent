@@ -205,6 +205,23 @@ describe("cleanReport", () => {
     expect(cleanReport("####### 일곱 개\n\n본문이다[1].", cites).body).not.toMatch(/#{7}/);
   });
 
+  it("review 6: judges heading sentences on the parsed words, dropping the inline node that holds a fact", () => {
+    const cites = new Map([cite(1)]);
+    const body = "\n\n본문이다[1].";
+    for (const [h, kept] of [
+      ["## ~~2026년 수출이 줄었다.~~ 증가 원인", "## 증가 원인"],
+      ["## [2026년 수출이 줄었다.](https://example.org/a) 증가 원인", "## 증가 원인"],
+      ["## *수출이 줄었다.* 원인", "## 원인"],
+      ["## **수출이 줄었다.** 원인", "## 원인"],
+    ] as const)
+      expect(cleanReport(h + body, cites), h).toMatchObject({ removed: 1, body: kept + body });
+    // A heading that is only a fact inside a link goes, with nothing of its address left.
+    expect(cleanReport("## [2026년 수출이 줄었다.](https://example.org/a)" + body, cites)).toMatchObject({
+      removed: 1,
+      body: "본문이다[1].",
+    });
+  });
+
   it("finds the summary also under a cited 요약 heading", () => {
     expect(summaryOf("## 요약[1]\n\n늘었다[1].\n\n## 다음\n\n본문[2].")).toBe("늘었다.");
   });
