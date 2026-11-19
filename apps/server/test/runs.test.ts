@@ -16,6 +16,7 @@ import {
 } from "../src/runtime/adapter.js";
 import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
 import { EVENT_RETENTION_MS, RunManager } from "../src/runtime/runs.js";
+import { contentJson } from "./helpers/content-json.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 import { runtimeContract } from "./helpers/runtime-contract.js";
 
@@ -1022,6 +1023,18 @@ describe("runs: chat screen support (#14)", () => {
     });
   });
 
+  it("the secret checks see content only: a random id or a timestamp holding the digits is not a leak (#208)", () => {
+    // The ids and the time of a real failing run: `9876` inside the message id, `…9876…` inside the epoch time.
+    const blob = contentJson({
+      messageId: "326a179a-9ec3-4922-9876-052dfbe8f0b0",
+      createdAt: 1795061987650,
+      at: "2026-11-19T12:34:56.123Z",
+      input: { pin: "[숨김]", note: "pin 9876" },
+    });
+    expect(blob).not.toMatch(/326a179a|1795061987650|2026-11-19/);
+    expect(blob).toContain('"note":"pin 9876"');
+  });
+
   it("numeric secrets and keys inside strings are removed from the stream, the API and the stored row; ordinary data stays", async () => {
     const script: FakeScript = () => [
       {
@@ -1047,7 +1060,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [contentJson(frames), contentJson(api), contentJson(stored)]) {
       expect(blob).not.toMatch(/123456|1234[^0-9]|9876|sk-proj-abcdefgh1234/);
       expect(blob).toContain("cl100k_base");
       expect(blob).toContain("ETH");
@@ -1076,7 +1089,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [contentJson(frames), contentJson(api), contentJson(stored)]) {
       expect(blob).not.toMatch(/hunter2|123456/);
       expect(blob).toContain("api.example");
       expect(blob).toContain("Basic authentication is an HTTP scheme");
@@ -1103,7 +1116,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [contentJson(frames), contentJson(api), contentJson(stored)]) {
       expect(blob).not.toMatch(/hunter2|123456/);
       expect(blob).toContain("9007199254740993");
     }
@@ -1237,7 +1250,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [contentJson(frames), contentJson(api), contentJson(stored)]) {
       expect(blob).not.toMatch(/hunter[2-9]|123456|654321|111222|333444|555666|777888|999000|tok-double-777/);
       expect(blob).toContain("kim");
     }
