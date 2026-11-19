@@ -25,13 +25,21 @@ export type OlderAsk = { conversationId: string; pages: number; errorsAtStart?: 
  */
 export function olderStep(
   ask: OlderAsk | null,
-  now: { conversationId: string; pages: number; hasNextPage: boolean; errors: number; busy: boolean },
+  now: {
+    conversationId: string;
+    pages: number;
+    hasNextPage: boolean;
+    errors: number;
+    /** The last error was a next-page fetch's (`isFetchNextPageError`), not a refetch of the list. */
+    nextPageFailed: boolean;
+    busy: boolean;
+  },
 ): "none" | "done" | "wait" | "fetch" {
   if (!ask || ask.conversationId !== now.conversationId) return "none";
   if (now.pages > ask.pages || !now.hasNextPage) return "done";
   if (now.busy) return "wait";
-  // Its own request failed (an error since it started, and nothing on its way): nothing more is asked. An error left
-  // over from before (a failed background read) is not its answer; a request cancelled without an error is asked again.
-  if (ask.errorsAtStart !== undefined && now.errors > ask.errorsAtStart) return "done";
+  // Its own request failed (a next-page error since it started, nothing on its way): nothing more is asked. An error
+  // left over from before, or a refetch of the list that failed after cancelling it, is not its answer: asked again.
+  if (ask.errorsAtStart !== undefined && now.errors > ask.errorsAtStart && now.nextPageFailed) return "done";
   return "fetch";
 }

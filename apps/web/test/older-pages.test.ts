@@ -28,6 +28,7 @@ function list(answer: (page: number | undefined) => Promise<Page>) {
       pages: r.data?.pages.length ?? 0,
       hasNextPage: r.hasNextPage,
       errors: errors(),
+      nextPageFailed: r.isFetchNextPageError,
       busy: listBusy(qc, ["messages", "c1"]),
     };
   };
@@ -112,8 +113,44 @@ describe("a waiting older-page click (#103 review)", () => {
     l.unsubscribe();
   });
 
+  it("its page fetch cancelled, then the list refetch fails: not its failure — asked again; its own page failure ends it", async () => {
+    let failNewest = false;
+    let failOlder = false;
+    const l = list(async (p) => {
+      if (p !== undefined) {
+        if (failOlder) throw new Error("older page failed");
+        return { items: ["old"], nextBefore: null };
+      }
+      if (failNewest) throw new Error("list refetch failed");
+      return { items: ["n"], nextBefore: 1 };
+    });
+    await flush();
+    const ask: OlderAsk = { conversationId: "c1", pages: 1, errorsAtStart: l.errors() };
+    // The click's page fetch, cancelled by a refetch of the list that then fails.
+    void l.observer.fetchNextPage();
+    failNewest = true;
+    await l.qc.refetchQueries({ queryKey: ["messages", "c1"] }, { cancelRefetch: true }).catch(() => {});
+    await flush();
+    expect(l.errors()).toBeGreaterThan(ask.errorsAtStart!);
+    expect(olderStep(ask, l.now())).toBe("fetch");
+    // Asked again, and this time its own page fails: done (nothing more is asked).
+    failNewest = false;
+    failOlder = true;
+    const again: OlderAsk = { ...ask, errorsAtStart: l.errors() };
+    await l.observer.fetchNextPage();
+    expect(olderStep(again, l.now())).toBe("done");
+    l.unsubscribe();
+  });
+
   it("only its own failure ends it: an error since its request started, the list idle", () => {
-    const base = { conversationId: "c1", pages: 1, hasNextPage: true, errors: 3, busy: false };
+    const base = {
+      conversationId: "c1",
+      pages: 1,
+      hasNextPage: true,
+      errors: 3,
+      nextPageFailed: true,
+      busy: false,
+    };
     expect(olderStep({ conversationId: "c1", pages: 1 }, base)).toBe("fetch"); // not asked yet
     expect(olderStep({ conversationId: "c1", pages: 1, errorsAtStart: 3 }, base)).toBe("fetch"); // an old error only
     expect(olderStep({ conversationId: "c1", pages: 1, errorsAtStart: 2 }, base)).toBe("done");
