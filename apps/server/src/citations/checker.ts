@@ -102,8 +102,38 @@ const FOUND = /(?:것을|걸|점을|사실을|내용을)\s/u;
 export function isProgressNote(text: string, u: CitationUnit, toolsAt: readonly number[]): boolean {
   if (u.table) return false;
   const t = text.slice(u.start, u.end).trim();
-  if (t.length > 160 || /\d/.test(t) || /\[\d{1,3}\]/.test(t)) return false;
+  // Any decimal digit (full-width `３０` too, review 6차) — and so any `[n]`.
+  if (t.length > 160 || /\p{Nd}/u.test(t)) return false;
   return toolsAt.some((at) => at >= u.end && !text.slice(u.end, at).trim());
+}
+
+/** Parts the screen does not show between a text and the tool call after it (the call's own row aside). */
+const UNSEEN: ReadonlySet<string> = new Set([
+  "tool_call",
+  "tool_result",
+  "reasoning",
+  "citation_note",
+  "finance_note",
+]);
+
+/**
+ * Where in the answer text a tool call comes right after the text (review 6차 — by the parts as stored): the end of
+ * a text part followed by a tool call with nothing shown in between. A card or a table between them (an artifact,
+ * a file, a structured table) is shown there: the text before it is not right before the call.
+ */
+export function progressNoteEnds(parts: readonly MessagePart[]): number[] {
+  const out: number[] = [];
+  let at = 0;
+  let pending: number | undefined;
+  for (const p of parts) {
+    if (p.type === "text") {
+      at += p.text.length;
+      pending = at;
+    } else if (p.type === "tool_call") {
+      if (pending !== undefined && out.at(-1) !== pending) out.push(pending);
+    } else if (!UNSEEN.has(p.type)) pending = undefined;
+  }
+  return out;
 }
 
 /** A closing offer or question (#202): "원하시면 학과별로 비교해 드릴게요.", "어느 전형이 더 궁금하세요?" */
@@ -143,11 +173,11 @@ export function missingUnits(
   units: readonly CitationUnit[] = citationUnits(text, textPartStarts(parts)),
   markers: readonly CitationMarker[] = citationMarkers(text, units),
 ): TextRange[] {
-  const at = toolCallsAt(parts);
-  const last = at.at(-1) ?? Number.NEGATIVE_INFINITY;
+  const last = toolCallsAt(parts).at(-1) ?? Number.NEGATIVE_INFINITY;
+  const ends = progressNoteEnds(parts);
   const flagged = new Set(uncitedUnits(text, units, markers).map((r) => `${r.start}:${r.end}`));
   const uncited = units.filter(
-    (u) => !u.inline && flagged.has(`${u.start}:${u.end}`) && !isProgressNote(text, u, at),
+    (u) => !u.inline && flagged.has(`${u.start}:${u.end}`) && !isProgressNote(text, u, ends),
   );
   // Only at the very end: an offer is how an answer ends — nothing else (cited or not) may come after it.
   let end = uncited.length;
@@ -396,10 +426,8 @@ export function citationNote(
   // Carried numbers are sources used too: the answer's paragraphs without any marker are flagged (review #153).
   const missing =
     used || carriedAny
-      ? missingUnits(text, parts, units, used ? allMarkers : citationMarkers(text, units)).slice(
-          0,
-          CITATION_LIMITS.missing,
-        )
+      ? // The markers this branch found (review 6차): a carried answer's `[n]` that is no marker covers nothing.
+        missingUnits(text, parts, units, allMarkers).slice(0, CITATION_LIMITS.missing)
       : [];
   return {
     type: "citation_note",

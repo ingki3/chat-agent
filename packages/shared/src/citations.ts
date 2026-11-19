@@ -169,20 +169,18 @@ export type CiteResult = {
 export type CitationUnitKind = "body" | "heading" | "lead_in" | "disclaimer" | "code" | "rule";
 /** `table`: a GFM table, one unit whatever its rows look like (#202). */
 /**
- * `table`: a GFM table, one unit whatever its rows look like; `footnote`: in a footnote the screen shows; `part`:
- * the text part it is in (a tool call between two parts, review 4차); `inline`: inline code or math — never a
- * marker, never a block (only `citationMarkers` reads it) (#202).
+ * `table`: a GFM table, one unit whatever its rows look like, with what it is shown next to in its own text part
+ * and footnote (`before`: the last sentence of the block right before it; `after`: the block right after it);
+ * `footnote`: in a footnote the screen shows; `inline`: inline code or math — never a marker, never a block (only
+ * `citationMarkers` reads it) (#202).
  */
 export type CitationUnit = TextRange & {
   kind: CitationUnitKind;
   table?: true;
   footnote?: true;
-  /** The footnote's id (with `footnote`): a footnote table takes cover only from its own footnote (review 5차). */
-  note?: string;
-  part?: number;
   inline?: true;
-  /** A paragraph a tool call cut: the first fragment ends at `end`, the second (next part) starts at `start`. */
-  cut?: { end: number; start: number };
+  before?: TextRange;
+  after?: TextRange;
 };
 
 /** A paragraph that is only bold text (a heading written as `**제목**`). */
@@ -245,7 +243,7 @@ const endOf = (n: Nodes) => n.position?.end.offset;
  * a paragraph that is a lead-in if a list or table comes next (decided once the next unit is known — the screen's
  * blocks split a lead-in from its list at the blank line).
  */
-type Unit = CitationUnit & { para?: true; footnote?: true; item?: true; leadIn?: true };
+type Unit = CitationUnit & { para?: true; item?: true; leadIn?: true; note?: string };
 
 /** The units of one block, at `base` in the answer text. */
 function blockUnits(block: string, base: number): Unit[] {
@@ -390,69 +388,68 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
     let at = start;
     const units: Unit[] = [];
     for (const block of splitBlocks(part)) {
-      units.push(...blockUnits(block, at).map((u) => ({ ...u, part: k })));
+      units.push(...blockUnits(block, at));
       at += block.length;
     }
-    // A paragraph cut by the tool call: the last one before it and the first one after it, no blank line between.
+    units.sort((a, b) => a.start - b.start);
+    neighbours(text, units);
+    // A paragraph a tool call cut mid-sentence: the last one before it and the first one after it, no blank line
+    // between, and the part does not end a sentence (`endsSentence` — a part that does is its own paragraph, as
+    // the screen shows it: a progress note, #202).
     const prev = out.filter((u) => !u.footnote && !u.inline).at(-1);
     const first = units.find((u) => !u.footnote && !u.inline);
     if (
       prev?.para &&
       first?.para &&
-      prev.kind === "body" &&
+      (prev.kind === "body" || prev.kind === "lead_in") &&
       first.kind === "body" &&
-      // Cut mid-sentence only: a part that ends a sentence before the call ("…볼게요.") is a paragraph of its own,
-      // as the screen shows it (a progress note, #202).
-      !/[.!?。！？．…:：](?:[)\]"'”’*_~]|\[\d{1,3}\])*\s*$/u.test(text.slice(prev.start, prev.end)) &&
+      !endsSentence(text, prev.start, prev.end) &&
       !/\r?\n[ \t]*\r?\n/.test(text.slice(prev.end, first.start))
     ) {
-      // Where it was cut: a table looks only at the fragment in its own part (review 5차).
-      prev.cut = { end: prev.end, start: first.start };
       prev.end = first.end;
       prev.kind = "body";
-      delete prev.leadIn;
       units.splice(units.indexOf(first), 1);
     }
     out.push(...units);
   });
   out.sort((a, b) => a.start - b.start);
-  const blocks = out.filter((u) => !u.inline);
-  // A lead-in: a short line ending with a colon right before a list item or a table (shown next to it).
-  return out.map((u) => {
-    const unit: CitationUnit = {
-      start: u.start,
-      end: u.end,
-      kind: u.kind,
-      ...(u.table ? { table: true as const } : {}),
-      ...(u.footnote ? { footnote: true as const } : {}),
-      ...(u.note !== undefined ? { note: u.note } : {}),
-      ...(u.part !== undefined ? { part: u.part } : {}),
-      ...(u.cut ? { cut: u.cut } : {}),
-      ...(u.inline ? { inline: true as const } : {}),
-    };
-    if (!u.leadIn || u.kind !== "body" || u.item) return unit;
-    const next = shownNext(blocks, blocks.indexOf(u), 1);
-    return next && ((next as Unit).item || next.table) ? { ...unit, kind: "lead_in" as const } : unit;
-  });
+  return out.map((u) => ({
+    start: u.start,
+    end: u.end,
+    kind: u.kind,
+    ...(u.table ? { table: true as const } : {}),
+    ...(u.footnote ? { footnote: true as const } : {}),
+    ...(u.inline ? { inline: true as const } : {}),
+    ...(u.before ? { before: u.before } : {}),
+    ...(u.after ? { after: u.after } : {}),
+  }));
 }
 
 /**
- * The unit shown right before (`dir` -1) or after (+1) the block at `i`, in the screen's order (review 4차): the
- * same text part (a tool row comes between two parts), body next to body and footnote next to footnote (a footnote
- * is shown at the end, apart from the body around its definition). Inline code and math are not blocks.
+ * What a block is shown next to, decided on one text part's own blocks before any paragraph is joined across a
+ * tool call (review 6차) — the same part, the same footnote (each footnote is shown apart; a definition nested in
+ * it is not its text): a lead-in is a short line ending with a colon right before a list item or a table; a table
+ * records the last sentence of the block right before it (`before` — not another table, code or a rule) and the
+ * block right after it (`after`, a caption if it reads like one).
  */
-function shownNext<U extends CitationUnit>(blocks: readonly U[], i: number, dir: 1 | -1): U | undefined {
-  const u = blocks[i];
-  if (!u) return undefined;
-  for (let k = i + dir; k >= 0 && k < blocks.length; k += dir) {
-    const c = blocks[k]!;
-    if (c.inline) continue;
-    if (!c.footnote !== !u.footnote) continue;
-    // A footnote's block next to another block of the same footnote only (each footnote is shown apart).
-    if (c.note !== u.note) return undefined;
-    return c.part === u.part ? c : undefined;
+function neighbours(text: string, units: Unit[]): void {
+  const groups = new Map<string, Unit[]>();
+  for (const u of units) {
+    if (u.inline) continue;
+    const key = u.note ?? "";
+    groups.set(key, [...(groups.get(key) ?? []), u]);
   }
-  return undefined;
+  for (const g of groups.values())
+    g.forEach((u, i) => {
+      const prev = g[i - 1];
+      const next = g[i + 1];
+      if (u.leadIn && u.kind === "body" && !u.item && (next?.item || next?.table)) u.kind = "lead_in";
+      if (!u.table) return;
+      if (prev && prev.kind !== "code" && prev.kind !== "rule" && !prev.table)
+        u.before = lastSentence(text, prev);
+      if (next && next.kind !== "code" && next.kind !== "rule")
+        u.after = { start: next.start, end: next.end };
+    });
 }
 
 export type CitationMarker = TextRange & { n: number };
@@ -600,6 +597,26 @@ export function sentenceSpans(t: string): TextRange[] {
 }
 
 /**
+ * Whether `text[start, end)` ends a sentence where it stops (review 6차 — `sentenceSpans`' rule at a text part's
+ * end): its last visible character, past closing brackets, quotes, emphasis and markers, is sentence punctuation —
+ * not a `.` between two ASCII letters or digits, looking across the end at the character right after it (`3.` then
+ * `5%` in the next part is a number).
+ */
+export function endsSentence(text: string, start: number, end: number): boolean {
+  let k = end;
+  while (k > start && /\s/u.test(text[k - 1]!)) k--;
+  for (;;) {
+    const m = /\[\d{1,3}\]$/.exec(text.slice(Math.max(start, k - 5), k));
+    if (m) k -= m[0].length;
+    else if (k > start && CLOSER.test(text[k - 1]!)) k--;
+    else break;
+  }
+  const ch = text[k - 1];
+  if (!ch || !TERMINAL.test(ch)) return false;
+  return !(ch === "." && WORD.test(text[k - 2] ?? "") && WORD.test(text[k] ?? ""));
+}
+
+/**
  * The sentences of a unit (#202): line by line — a list item's marker and its leading label (`- **추천:** …`) and a
  * quote's `>` are not part of it — cut by `sentenceSpans`. Emphasis marks are dropped, the words kept.
  */
@@ -647,32 +664,11 @@ export function uncitedUnits(
 ): TextRange[] {
   const cited = (r: TextRange) => markers.some((m) => m.start >= r.start && m.end <= r.end);
   const blocks = units.filter((u) => !u.inline);
-  // A table's neighbours are the fragments of its own text part (review 5차): a paragraph a tool call cut is two
-  // fragments here — one per part — though it is one unit for the check.
-  const frags = blocks.flatMap((u): CitationUnit[] => {
-    if (!u.cut) return [u];
-    const { cut, ...rest } = u;
-    return [
-      { ...rest, end: cut.end },
-      { ...rest, start: cut.start, part: (u.part ?? 0) + 1 },
-    ];
-  });
   const tableCited = (u: CitationUnit) => {
-    const i = frags.indexOf(u);
-    const prev = shownNext(frags, i, -1);
-    // The sentence before: not another table's last cell (two tables in a row are two tables).
-    if (
-      prev &&
-      prev.kind !== "code" &&
-      prev.kind !== "rule" &&
-      !prev.table &&
-      cited(lastSentence(text, prev))
-    )
-      return true;
-    const next = shownNext(frags, i, 1);
-    if (!next || next.kind === "code" || next.kind === "rule") return false;
-    const t = text.slice(next.start, next.end).trim();
-    return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(next);
+    if (u.before && cited(u.before)) return true;
+    if (!u.after) return false;
+    const t = text.slice(u.after.start, u.after.end).trim();
+    return !/[\r\n]/.test(t) && t.length <= 160 && CAPTION.test(t) && cited(u.after);
   };
   return blocks
     .filter((u) => {

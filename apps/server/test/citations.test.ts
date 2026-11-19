@@ -1616,6 +1616,19 @@ describe("citationNote", () => {
     expect(split.citations.map((c) => [c.n, c.status])).toEqual([[1, "verified"]]);
     expect(asked.length).toBe(askedBefore + 1);
     expect(split.missing).toHaveLength(1);
+    // Review 6차: in a carried answer only its markers count — `x = a[2]` (no marker) covers no table.
+    const tbl = "| a |\n|---|\n| 1 |";
+    for (const t of [
+      `결론이에요[1].\n\nx = a[2]\n\n${tbl}`,
+      `결론이에요[1].\n\n## 표\n\n${tbl}\n\n출처: x = a[2]`,
+    ]) {
+      const n = citationNote(f.run(f.c.id).runId, text(t), store, carry)!;
+      expect(n.citations.map((c) => c.n)).toEqual([1]);
+      expect(
+        n.missing.map((r) => t.slice(r.start, r.end)),
+        t,
+      ).toContain(tbl);
+    }
     // Without a recheck the file citation is not carried.
     const { recheckFile: _r, ...bare } = carry;
     void _r;
@@ -2071,6 +2084,59 @@ describe("citationNote", () => {
       // A definition nested in a definition nobody refers to, referred to by the body: shown, so checked once.
       const nested = "가[1].[^b]\n\n[^a]: 바깥이에요.\n\n    [^b]: 독립적으로 참조한 사실이에요.";
       expect(missingOf([...read("a"), ...text(nested)])).toEqual(["독립적으로 참조한 사실이에요."]);
+    });
+
+    it("review 6차: neighbours from each part's own blocks; parts as stored; any digit; one sentence end", () => {
+      const table = "| 모집 | 인원 |\n|---|---|\n| 일반 | 30명 |";
+      // Three parts: the caption below the table is the table's part's own block, whatever is joined to it after.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text(`${table}\n\n출처: 작년`),
+          ...read("b"),
+          ...text(" 자료[1]이며"),
+          ...read("c"),
+          ...text(" 올해 기준은 별도입니다."),
+        ]),
+      ).toEqual([table]);
+      // A blank part between: the cited sentence right before the table in the last part covers it.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("앞 문장이고"),
+          ...read("b"),
+          ...text(" "),
+          ...read("c"),
+          ...text(` 기준은 다음과 같아요[1].\n\n${table}`),
+        ]),
+      ).toEqual([]);
+      // A card shown between the text and the tool call: the text is not right before the call.
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("반도체 수출은 늘었어요.\n\n"),
+          card,
+          ...read("b"),
+          ...text("가[1]."),
+        ]),
+      ).toEqual(["반도체 수출은 늘었어요."]);
+      // Full-width digits are digits.
+      expect(
+        missingOf([...read("a"), ...text("정원은 ３０명입니다.\n\n"), ...read("b"), ...text("가[1].")]),
+      ).toEqual(["정원은 ３０명입니다."]);
+      // A part that ends a sentence inside closing brackets is its own paragraph; `3.` then `5%` is one number.
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("공고에는 「모집은 30명입니다.」"),
+          ...read("b"),
+          ...text("후속이에요[1]."),
+        ]),
+      ).toEqual(["공고에는 「모집은 30명입니다.」"]);
+      expect(missingOf([...read("a"), ...text("금리는 3."), ...read("b"), ...text("5%예요[1].")])).toEqual(
+        [],
+      );
     });
 
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
