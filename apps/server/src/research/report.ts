@@ -1,7 +1,7 @@
 import {
   citationMarkers,
   citationUnits,
-  inlineSegments,
+  inlineLeaves,
   plainTextRanges,
   sentenceSpans,
   type CitationMarker,
@@ -167,89 +167,95 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
   );
   const isMarker = (start: number, end: number) => markers.some((m) => m.start === start && m.end === end);
   const ok = (m: CitationMarker) => cites.get(m.n)?.verified === true;
-  const within = (start: number, end: number) => markers.filter((m) => m.start >= start && m.end <= end);
-  const backed = (start: number, end: number) => within(start, end).some(ok);
-  /** The range with its verified markers held (once each) and every other marker taken out. */
-  const emit = (start: number, end: number) => {
-    let out = "";
-    let at = start;
-    const seen = new Set<number>();
-    for (const m of within(start, end)) {
-      out += src.slice(at, m.start);
-      at = m.end;
-      if (!ok(m) || seen.has(m.n)) continue;
-      seen.add(m.n);
-      out += `\u0000${m.n}\u0000`;
+  let removed = 0;
+  /**
+   * One line's sentences cleaned — the same for a body line and a heading's words (#211 review 7). The line is read as
+   * the parser shows it (`inlineLeaves`: a link's or an emphasis' words are words, a link's address is not); its
+   * sentences (`lineSentences` — a marker after the period, also after a space, is the sentence's) each keep only what
+   * their own span holds: a sentence with a verified marker stays, its unverified markers and repeats go (each sentence
+   * apart); one without goes and is counted — except, in a heading (`labels`), one that does not end like a sentence (a
+   * label). A link, emphasis, strong or strikethrough left with nothing shown goes whole (no `[](…)`, no `****`).
+   */
+  const cleanLine = (from: number, to: number, labels: boolean): string | undefined => {
+    const leaves = inlineLeaves(src.slice(from, to)) ?? [
+      { start: 0, end: to - from, top: 0, topType: "text", topStart: 0, topEnd: to - from },
+    ];
+    let shown = "";
+    const map = leaves.map((l) => {
+      const m = { vs: shown.length, ss: from + l.start, se: from + l.end, leaf: l };
+      shown += src.slice(m.ss, m.se);
+      return m;
+    });
+    /** The source pieces of a range of the shown words. */
+    const pieces = (a: number, b: number) =>
+      map.flatMap((m) => {
+        const s0 = Math.max(a, m.vs);
+        const e0 = Math.min(b, m.vs + (m.se - m.ss));
+        return s0 < e0 ? [{ start: m.ss + s0 - m.vs, end: m.ss + e0 - m.vs, m }] : [];
+      });
+    const markerAt = (a: number, b: number) => {
+      const p = pieces(a, b);
+      return p.length === 1 && isMarker(p[0]!.start, p[0]!.end);
+    };
+    const del: [number, number][] = [];
+    const held = new Set<number>();
+    const gone = new Map<(typeof map)[number], number>();
+    let any = false;
+    for (const r of lineSentences(shown, markerAt)) {
+      const own = pieces(r.start, r.end);
+      const marks = markers.filter((m) => own.some((p) => m.start >= p.start && m.end <= p.end));
+      if (marks.some(ok) || (labels && isTopicLabel(shown.slice(r.start, r.end)))) {
+        any = true;
+        const seen = new Set<number>();
+        for (const m of marks)
+          if (ok(m) && !seen.has(m.n)) {
+            seen.add(m.n);
+            held.add(m.start);
+          } else del.push([m.start, m.end]);
+        continue;
+      }
+      removed++;
+      for (const p of own) {
+        del.push([p.start, p.end]);
+        gone.set(p.m, (gone.get(p.m) ?? 0) + (p.end - p.start));
+      }
     }
-    out += src.slice(at, end);
-    return out
+    if (!any) return undefined;
+    // An inline node whose words all went: its whole source goes (delimiters, a link's address).
+    const tops = new Map<number, (typeof map)[number][]>();
+    for (const m of map) tops.set(m.leaf.top, [...(tops.get(m.leaf.top) ?? []), m]);
+    for (const ms of tops.values()) {
+      const l = ms[0]!.leaf;
+      if (l.topType !== "text" && ms.every((m) => (gone.get(m) ?? 0) >= m.se - m.ss))
+        del.push([from + l.topStart, from + l.topEnd]);
+    }
+    del.sort((x, y) => x[0] - y[0]);
+    let out = "";
+    let at = from;
+    const write = (end: number) => {
+      for (let k = at; k < end;) {
+        const m = held.has(k) ? markers.find((x) => x.start === k) : undefined;
+        if (m) {
+          out += `\u0000${m.n}\u0000`;
+          k = m.end;
+        } else out += src[k++];
+      }
+    };
+    for (const [a, b] of del) {
+      if (a > at) write(a);
+      at = Math.max(at, b);
+    }
+    if (at < to) write(to);
+    // What a removed sentence leaves next to a delimiter: `**A. **` → `**A.**`, `** B**` → `**B**`, `[A ](…)` → `[A](…)`.
+    const text = out
+      .replace(/[ \t]+(\*\*|__|~~|[*_])(?=[\s.,!?。]|$)/gu, "$1")
+      .replace(/(^|[\s([])(\*\*|__|~~|[*_])[ \t]+/gu, "$1$2")
+      .replace(/\[[ \t]+/g, "[")
+      .replace(/[ \t]+\]/g, "]")
       .replace(/[ \t]+([.!?。,])/gu, "$1")
       .replace(/[ \t]{2,}/g, " ")
       .trim();
-  };
-  let removed = 0;
-  /** The sentences of `[from, to)` that a verified marker backs; the others are counted as removed. */
-  const keptSentences = (from: number, to: number, labels = false) => {
-    const kept: string[] = [];
-    const t = src.slice(from, to);
-    for (const r of lineSentences(t, (a, b) => isMarker(from + a, from + b))) {
-      // A heading's sentence that only names a topic ("증가 원인") stands without a marker; any other needs one.
-      const words = t.slice(r.start, r.end);
-      if (backed(from + r.start, from + r.end)) kept.push(emit(from + r.start, from + r.end));
-      else if (labels && isTopicLabel(words)) kept.push(words.replace(/\[\d{1,3}\]/g, "").trim());
-      else removed++;
-    }
-    return kept;
-  };
-  /**
-   * A heading's words, judged on what the parser shows (review 6): each sentence of the visible text — a link's or an
-   * emphasis' words included, never a link's address — that ends like a sentence and has no verified marker is a fact
-   * and goes; a fact inside a link, emphasis or strikethrough takes that whole node with it. The rest is written again.
-   */
-  const keptHeading = (from: number, to: number): string | undefined => {
-    const segs = inlineSegments(src.slice(from, to));
-    if (!segs) {
-      const kept = keptSentences(from, to, true);
-      return kept.length ? kept.join(" ") : undefined;
-    }
-    let shown = "";
-    const map = segs.map((g) => {
-      const m = {
-        vs: shown.length,
-        ve: shown.length + g.visible.length,
-        ss: from + g.start,
-        se: from + g.end,
-        text: g.type === "text",
-      };
-      shown += g.visible;
-      return m;
-    });
-    const drop: [number, number][] = [];
-    for (const r of sentenceSpans(shown)) {
-      if (isTopicLabel(shown.slice(r.start, r.end))) continue;
-      const ranges = map
-        .filter((m) => m.ve > r.start && m.vs < r.end)
-        .map((m): [number, number] =>
-          m.text ? [m.ss + Math.max(0, r.start - m.vs), m.ss + Math.min(m.ve, r.end) - m.vs] : [m.ss, m.se],
-        );
-      if (ranges.some(([a, b]) => backed(a, b))) continue;
-      removed++;
-      drop.push(...ranges);
-    }
-    drop.sort((a, b) => a[0] - b[0]);
-    const pieces: string[] = [];
-    let at = from;
-    for (const [a, b] of drop) {
-      if (a > at) pieces.push(emit(at, a));
-      at = Math.max(at, b);
-    }
-    if (at < to) pieces.push(emit(at, to));
-    const out = pieces
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    return out || undefined;
+    return text || undefined;
   };
   const blocks: Block[] = [];
   for (const u of units) {
@@ -269,7 +275,7 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       // under it) or a paragraph of bold text only (`**…**`) — checked sentence by sentence (`## 수출이 늘었다. 증가
       // 원인`: the first states a fact, the second names a topic) and written again in one form.
       const h = headingContent(raw);
-      const shown = keptHeading(u.start + h.start, u.start + h.end);
+      const shown = cleanLine(u.start + h.start, u.start + h.end, true);
       if (!shown) continue;
       // The report's own title is the server's: a level-1 heading of the writer's becomes a section. A bold label keeps
       // its form (and its colon); never more than `######`.
@@ -291,8 +297,8 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     let lineStart = from;
     for (const line of src.slice(from, u.end).split("\n")) {
       const prefix = LINE_PREFIX.exec(line)![0];
-      const kept = keptSentences(lineStart + prefix.length, lineStart + line.length);
-      if (kept.length) lines.push(prefix + kept.join(" "));
+      const kept = cleanLine(lineStart + prefix.length, lineStart + line.length, false);
+      if (kept) lines.push(prefix + kept);
       lineStart += line.length + 1;
     }
     if (lines.length)

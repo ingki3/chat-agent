@@ -467,28 +467,40 @@ function neighbours(text: string, units: Unit[]): void {
 export type CitationMarker = TextRange & { n: number };
 
 /**
- * One line of inline markdown (a heading's words, #211 review 6) as the parser reads it: its top-level inline nodes in
- * order, each with its source range and the words it shows (`visible` — the text of a text node as written; of a link,
- * emphasis, strong or strikethrough the text inside it, never a link's address). Undefined when the line is not one
- * paragraph (it reads as a list, a quote …): the caller then takes the line as written.
+ * One line of inline markdown (a report's sentence line or heading words, #211) as the parser reads it: its shown
+ * pieces in order — each text node (and each inline code or math span, whole) with its source range, and the top-level
+ * inline node it belongs to (a text of its own, or a link, emphasis, strong, strikethrough …). A link's address and an
+ * image are never shown pieces. Undefined when the line is not one paragraph (it reads as a list, a quote …).
  */
-export function inlineSegments(
-  text: string,
-): { type: string; start: number; end: number; visible: string }[] | undefined {
+export type InlineLeaf = {
+  start: number;
+  end: number;
+  top: number;
+  topType: string;
+  topStart: number;
+  topEnd: number;
+};
+export function inlineLeaves(text: string): InlineLeaf[] | undefined {
   const root = parseBlock(text);
   if (root.children.length !== 1 || root.children[0]!.type !== "paragraph") return undefined;
-  const visible = (n: Nodes): string =>
-    n.type === "text" || n.type === "inlineCode" || n.type === "inlineMath"
-      ? n.value
-      : "children" in n
-        ? (n.children as Nodes[]).map(visible).join("")
-        : "";
-  const out: { type: string; start: number; end: number; visible: string }[] = [];
-  for (const c of (root.children[0] as Parents).children as Nodes[]) {
-    const start = startOf(c);
-    const end = endOf(c);
-    if (start === undefined || end === undefined) return undefined;
-    out.push({ type: c.type, start, end, visible: c.type === "text" ? text.slice(start, end) : visible(c) });
+  const out: InlineLeaf[] = [];
+  const tops = (root.children[0] as Parents).children as Nodes[];
+  for (const [i, top] of tops.entries()) {
+    const ts = startOf(top);
+    const te = endOf(top);
+    if (ts === undefined || te === undefined) return undefined;
+    const walk = (n: Nodes) => {
+      if (n.type === "image" || n.type === "imageReference") return;
+      if (n.type === "text" || n.type === "inlineCode" || n.type === "inlineMath") {
+        const s0 = startOf(n);
+        const e0 = endOf(n);
+        if (s0 !== undefined && e0 !== undefined)
+          out.push({ start: s0, end: e0, top: i, topType: top.type, topStart: ts, topEnd: te });
+        return;
+      }
+      if ("children" in n) for (const c of n.children) walk(c as Nodes);
+    };
+    walk(top);
   }
   return out;
 }

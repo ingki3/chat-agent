@@ -222,6 +222,26 @@ describe("cleanReport", () => {
     });
   });
 
+  it("review 7: headings go through the same sentence cleaning as body lines", () => {
+    const cites = new Map([cite(1)]);
+    const body = "\n\n본문이다[1].";
+    // A marker after the period and a space is the first sentence's.
+    expect(cleanReport("## 수출이 늘었다. [1] 수입은 줄었다." + body, cites)).toMatchObject({
+      removed: 1,
+      body: "## 수출이 늘었다. [1]" + body,
+    });
+    // Two sentences in one bold node: each is checked on its own span.
+    expect(cleanReport("## **수출이 늘었다[1]. 수입은 줄었다.**" + body, cites)).toMatchObject({
+      removed: 1,
+      body: "## **수출이 늘었다[1].**" + body,
+    });
+    // The same source cited by two sentences: each keeps its marker.
+    expect(cleanReport("## 수출이 늘었다[1]. 수입은 줄었다[1]." + body, cites)).toMatchObject({
+      removed: 0,
+      body: "## 수출이 늘었다[1]. 수입은 줄었다[1]." + body,
+    });
+  });
+
   it("finds the summary also under a cited 요약 heading", () => {
     expect(summaryOf("## 요약[1]\n\n늘었다[1].\n\n## 다음\n\n본문[2].")).toBe("늘었다.");
   });
