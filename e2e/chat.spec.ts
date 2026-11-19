@@ -529,6 +529,36 @@ test("a reply sent from another tab is found and followed even when the read aft
   await expect(reply(page)).toHaveAttribute("data-status", "complete");
 });
 
+test("a slow first load of the messages (10.5 s) still shows them: only the settle loop's reads have a time limit (#103 review)", async ({
+  page,
+  baseURL,
+}) => {
+  await useAccount(page, SON);
+  const c = await newConversation(page.request, baseURL!, `느린 첫 읽기 ${Date.now()}`);
+  const sent = await page.request.post(`/api/conversations/${c.id}/messages`, {
+    data: { text: "느린 기록" },
+    headers: { ...csrf(baseURL!), "Idempotency-Key": crypto.randomUUID() },
+  });
+  const runId = ((await sent.json()) as { run: { id: string } }).run.id;
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/api/runs/${runId}`)).json()) as { endedAt: unknown }).endedAt,
+    )
+    .not.toBeNull();
+  let reads = 0;
+  await page.route("**/api/conversations/*/messages*", async (route) => {
+    if (route.request().method() !== "GET" || ++reads > 1) return route.continue();
+    const res = await route.fetch();
+    await new Promise((r) => setTimeout(r, 10_500));
+    await route.fulfill({ response: res }).catch(() => {});
+  });
+  await page.goto(`/c/${c.id}`);
+  await expect(reply(page)).toContainText("느린 기록", { timeout: 20_000 });
+  await expect(reply(page)).toHaveAttribute("data-status", "complete");
+  expect(reads).toBe(1); // the one read, not cancelled and sent again
+});
+
 test.describe("markdown chunk", () => {
   // The service worker serves cached assets itself; block it so the failed request is really the network's.
   test.use({ serviceWorkers: "block" });

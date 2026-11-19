@@ -21,16 +21,52 @@ export type Ending = { conversationId: string; messageId: string; runId: string 
  */
 export type SettleResult = "final" | "running" | "unfinished";
 
-/** One request (a messages page, the run's state) that never answers is given up after this; the next try reads again. */
+/**
+ * A request of the settle loop (a messages page, the run's state) that never answers is given up after this; the next
+ * try reads again. Only the loop's own reads: the screen's first load and older pages wait as long as it takes.
+ */
 export const READ_TIMEOUT_MS = 10_000;
 /** The settle loop's wait after an unsettled try, doubling up to the cap. */
 export const SETTLE_FIRST_RETRY_MS = 2000;
 export const SETTLE_MAX_RETRY_MS = 30_000;
 
-/** A request's signal with its own time limit added (each messages page; the run's state read here). */
-export function pageSignal(signal: AbortSignal | undefined, ms = READ_TIMEOUT_MS): AbortSignal {
-  const timeout = AbortSignal.timeout(ms);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+/**
+ * `signal` with a time limit added — with a plain AbortController (no `AbortSignal.any`/`timeout`, missing on the iOS
+ * versions the app supports). `done()` drops the timer and the listener once the request is over.
+ */
+export function limitedSignal(
+  signal: AbortSignal | undefined,
+  ms = READ_TIMEOUT_MS,
+): { signal: AbortSignal; done: () => void } {
+  const ac = new AbortController();
+  const stop = () => ac.abort(signal?.reason);
+  const timer = setTimeout(() => ac.abort(new Error("read_timeout")), ms);
+  if (signal?.aborted) stop();
+  else signal?.addEventListener("abort", stop, { once: true });
+  return {
+    signal: ac.signal,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+    },
+  };
+}
+
+/** Conversations whose messages the settle loop is reading now (per query client). */
+const settleReading = new WeakMap<QueryClient, Set<string>>();
+
+/**
+ * The signal for one messages page request: during a read of the settle loop, with its time limit
+ * ({@link READ_TIMEOUT_MS}, each page its own); otherwise TanStack's own, unchanged (cancelled when the screen goes).
+ */
+export function pageSignal(
+  qc: QueryClient,
+  conversationId: string,
+  signal: AbortSignal,
+  ms = READ_TIMEOUT_MS,
+): { signal: AbortSignal; done: () => void } {
+  if (!settleReading.get(qc)?.has(conversationId)) return { signal, done: () => {} };
+  return limitedSignal(signal, ms);
 }
 
 /**
@@ -79,14 +115,21 @@ export function readMessagesAfterEnd(
     if (!query) return;
     await qc.cancelQueries({ queryKey: key, exact: true });
     const before = query.state.dataUpdateCount;
-    // Each page request has its own time limit (the query's `pageSignal`): a long conversation's pages, read one after
+    // Each page request of this read has its own time limit (`pageSignal`): a long conversation's pages, read one after
     // another, are never cut short as a whole. Offline the read is paused and would wait: not read now.
-    const read = qc.refetchQueries({ queryKey: key, exact: true }, { throwOnError: true });
-    if (query.state.fetchStatus === "paused") {
-      void read.catch(() => {});
-      throw new Error("messages_read_paused");
+    let marks = settleReading.get(qc);
+    if (!marks) settleReading.set(qc, (marks = new Set()));
+    marks.add(conversationId);
+    try {
+      const read = qc.refetchQueries({ queryKey: key, exact: true }, { throwOnError: true });
+      if (query.state.fetchStatus === "paused") {
+        void read.catch(() => {});
+        throw new Error("messages_read_paused");
+      }
+      await read;
+    } finally {
+      marks.delete(conversationId);
     }
-    await read;
     if (query.state.dataUpdateCount <= before || query.state.status !== "success")
       throw new Error("messages_not_read");
   })().finally(() => {
@@ -175,13 +218,66 @@ export async function settleEnd(o: {
   // The run's state, read after the end too: the composer stays busy until the run is read as ended (the server
   // refuses a send while it is active, #141) — a failed read throws (tried again), the live reply kept.
   // Bounded like a page, and dropped when the conversation is left: a hung answer fails this try (tried again).
-  const r = await o.readActiveRun(conversationId, pageSignal(signal));
+  const limited = limitedSignal(signal);
+  const r = await o.readActiveRun(conversationId, limited.signal).finally(limited.done);
   if (!holds()) return notOurs();
-  const running = r !== null && r.endedAt === null;
-  if (running && r.id === runId) return final ? "unfinished" : "running"; // saved, still finishing / still going
-  if (running) return follow(r);
+  if (r && r.endedAt === null) {
+    if (r.id === runId) return final ? "unfinished" : "running"; // saved, still finishing / still going
+    return follow(r);
+  }
   if (!final) return "unfinished";
   if (!(await apply(r))) return notOurs();
   void o.around();
   return "final";
+}
+
+/**
+ * The settle loop for one ending: `tryOnce` now, then after {@link SETTLE_FIRST_RETRY_MS}, doubling up to
+ * {@link SETTLE_MAX_RETRY_MS} while it stays unsettled (a failed try counts as unsettled). One try at a time.
+ * `poke()` — a new sign of the same end (a stop answered with the ended run) — tries again at once (a try already on
+ * its way finishes first — its reads shared — and, unsettled, is followed at once); `stop()` ends the loop. `settled` gets the result that ended it.
+ */
+export function startSettleLoop(
+  tryOnce: () => Promise<SettleResult>,
+  settled: (r: Exclude<SettleResult, "unfinished">) => void,
+): { poke: () => void; stop: () => void } {
+  let stopped = false;
+  let running = false;
+  let again = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let wait = SETTLE_FIRST_RETRY_MS;
+  const attempt = async () => {
+    clearTimeout(timer);
+    timer = undefined;
+    running = true;
+    let r: SettleResult = "unfinished";
+    try {
+      r = await tryOnce();
+    } catch {
+      // a failed read: tried again
+    }
+    running = false;
+    if (stopped) return;
+    if (r !== "unfinished") return settled(r);
+    if (again) {
+      again = false;
+      return void attempt();
+    }
+    timer = setTimeout(() => void attempt(), wait);
+    wait = Math.min(wait * 2, SETTLE_MAX_RETRY_MS);
+  };
+  void attempt();
+  return {
+    poke: () => {
+      if (stopped) return;
+      wait = SETTLE_FIRST_RETRY_MS;
+      // A try on its way may have read before this sign: unless it settles, the next one follows at once.
+      if (running) again = true;
+      else void attempt();
+    },
+    stop: () => {
+      stopped = true;
+      clearTimeout(timer);
+    },
+  };
 }

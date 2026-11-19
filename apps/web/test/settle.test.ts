@@ -10,9 +10,13 @@ import type { Run } from "@agentlee/shared";
 import { rereadQuery } from "../src/chat/reread.js";
 import {
   forgetReadsAfterEnd,
+  limitedSignal,
   nextEnding,
   pageSignal,
   readMessagesAfterEnd,
+  SETTLE_FIRST_RETRY_MS,
+  SETTLE_MAX_RETRY_MS,
+  startSettleLoop,
   settleEnd,
   type Ending,
 } from "../src/chat/settle.js";
@@ -53,14 +57,15 @@ function screen(first: Pages, cached: Run | null = run("r1"), pageMs?: number) {
   let reads = 0;
   const observer = new QueryObserver(qc, {
     queryKey: ["messages", "c1"],
+    // As the chat screen's: a page read by the settle loop gets its time limit (`pageMs` here, short).
     queryFn: ({ signal: own }) => {
-      const signal = pageMs === undefined ? own : pageSignal(own, pageMs);
-      if (reads++ === 0) return Promise.resolve(first);
+      const { signal, done } = pageSignal(qc, "c1", own, pageMs);
+      if (reads++ === 0) return Promise.resolve(first).finally(done);
       return new Promise<Pages>((answer, fail) => {
         held.push({ answer, fail, signal });
         // Like fetch: an aborted request rejects.
         signal.addEventListener("abort", () => fail(signal.reason), { once: true });
-      });
+      }).finally(done);
     },
   });
   const unsubscribe = observer.subscribe(() => {});
@@ -338,11 +343,11 @@ describe("the read after an end: a real new read, never one that cannot answer (
       // A page answers in 60 ms once slow; the limit is 100 ms a page — the 5 pages take 300 ms in all.
       queryFn: ({ pageParam, signal }) => {
         reads++;
-        const s = pageSignal(signal, 100);
+        const { signal: s, done } = pageSignal(qc, "c1", signal, 100);
         return new Promise<Page>((resolve, reject) => {
           const t = setTimeout(() => resolve(page(pageParam)), slow ? 60 : 0);
           s.addEventListener("abort", () => (clearTimeout(t), reject(s.reason)), { once: true });
-        });
+        }).finally(done);
       },
       initialPageParam: 5,
       getNextPageParam: (last) => last.nextBefore ?? undefined,
@@ -410,5 +415,124 @@ describe("which end to settle (#103 review): keyed by run", () => {
   it("another conversation's attempt is replaced (that conversation was left)", () => {
     const other = { conversationId: "c0", messageId: "m", runId: "Z" };
     expect(nextEnding(other, e("B"), "B")).toEqual(e("B"));
+  });
+});
+
+describe("time limits only where the settle loop reads, and without AbortSignal.any (#103 review)", () => {
+  it("limitedSignal works with AbortSignal.any and AbortSignal.timeout missing (iOS 16.4–17.x): limit and leave", async () => {
+    const any = (AbortSignal as { any?: unknown }).any;
+    const timeout = (AbortSignal as { timeout?: unknown }).timeout;
+    delete (AbortSignal as { any?: unknown }).any;
+    delete (AbortSignal as { timeout?: unknown }).timeout;
+    try {
+      const timed = limitedSignal(undefined, 30);
+      await new Promise((r) => setTimeout(r, 60));
+      expect(timed.signal.aborted).toBe(true);
+      const leave = new AbortController();
+      const left = limitedSignal(leave.signal, 10_000);
+      expect(left.signal.aborted).toBe(false);
+      leave.abort();
+      expect(left.signal.aborted).toBe(true);
+      left.done();
+      const kept = limitedSignal(undefined, 30);
+      kept.done(); // over in time: the timer is dropped
+      await new Promise((r) => setTimeout(r, 60));
+      expect(kept.signal.aborted).toBe(false);
+    } finally {
+      (AbortSignal as { any?: unknown }).any = any;
+      (AbortSignal as { timeout?: unknown }).timeout = timeout;
+    }
+  });
+
+  it("a normal read keeps TanStack's signal as it is: a slow first page loads; the same slowness fails only in a settle read", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let seen: AbortSignal | undefined;
+    let own: AbortSignal | undefined;
+    const unsubscribe = new QueryObserver(qc, {
+      queryKey: ["messages", "c1"],
+      queryFn: ({ signal }) => {
+        own = signal;
+        const p = pageSignal(qc, "c1", signal, 50);
+        seen = p.signal;
+        return new Promise<Pages>((resolve, reject) => {
+          const t = setTimeout(() => resolve(pages(["m-r1", "complete"])), 100);
+          p.signal.addEventListener("abort", () => (clearTimeout(t), reject(p.signal.reason)), {
+            once: true,
+          });
+        }).finally(p.done);
+      },
+    }).subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 150));
+    expect(seen).toBe(own); // unchanged
+    expect(qc.getQueryState(["messages", "c1"])?.status).toBe("success");
+    await expect(readMessagesAfterEnd(qc, "c1", "m-r1")).rejects.toBeDefined();
+    expect(seen).not.toBe(own); // the settle read's own, limited
+    unsubscribe();
+  });
+});
+
+describe("the settle loop: backoff, one try at a time, a poke checks at once (#103 review)", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("waits 2 s, then doubling up to 30 s; a poke while waiting tries at once and starts the backoff over", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const at: number[] = [];
+    const t0 = Date.now();
+    let result: "unfinished" | "final" = "unfinished";
+    let ended: string | undefined;
+    const loop = startSettleLoop(
+      async () => {
+        at.push(Date.now() - t0);
+        return result;
+      },
+      (r) => (ended = r),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(SETTLE_MAX_RETRY_MS);
+    // 0, +2, +4, +8, +16, +30, +30 …
+    const gaps = at.slice(1).map((v, i) => v - at[i]!);
+    expect(gaps.slice(0, 5)).toEqual([SETTLE_FIRST_RETRY_MS, 4000, 8000, 16_000, SETTLE_MAX_RETRY_MS]);
+    const n = at.length;
+    result = "final";
+    loop.poke(); // a stop answered with the ended run: no waiting out the 30 s
+    await vi.advanceTimersByTimeAsync(0);
+    expect(at).toHaveLength(n + 1);
+    expect(ended).toBe("final");
+    loop.stop();
+  });
+
+  it("a poke during a try (it may have read before the stop) is followed by another try at once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let release!: () => void;
+    let tries = 0;
+    const loop = startSettleLoop(
+      () => {
+        tries++;
+        if (tries === 1) return new Promise<"unfinished">((r) => (release = () => r("unfinished")));
+        return Promise.resolve("final" as const);
+      },
+      () => {},
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    loop.poke();
+    expect(tries).toBe(1); // never two at once
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tries).toBe(2); // at once, not after the backoff
+    loop.stop();
+  });
+
+  it("stopped: no try after it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let tries = 0;
+    const loop = startSettleLoop(
+      async () => (tries++, "unfinished"),
+      () => {},
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    loop.stop();
+    loop.poke();
+    await vi.advanceTimersByTimeAsync(SETTLE_MAX_RETRY_MS * 3);
+    expect(tries).toBe(1);
   });
 });

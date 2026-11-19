@@ -40,11 +40,9 @@ import {
   forgetReadsAfterEnd,
   nextEnding,
   pageSignal,
-  SETTLE_FIRST_RETRY_MS,
-  SETTLE_MAX_RETRY_MS,
   settleEnd,
+  startSettleLoop,
   type Ending,
-  type SettleResult,
 } from "../chat/settle.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
@@ -114,9 +112,16 @@ export function ChatPage() {
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
-    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it; and each page
-    // has its own time limit (a hung request fails, the read after an end tries again — never the whole list's).
-    queryFn: ({ pageParam, signal }) => conversations.messages(id, pageParam, pageSignal(signal)),
+    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it. Pages read by
+    // the settle loop also get a time limit each (a hung request fails, the loop tries again); others wait.
+    queryFn: async ({ pageParam, signal }) => {
+      const page = pageSignal(qc, id, signal);
+      try {
+        return await conversations.messages(id, pageParam, page.signal);
+      } finally {
+        page.done();
+      }
+    },
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
@@ -202,48 +207,42 @@ export function ChatPage() {
     beginEnding({ conversationId: id, messageId: unfinishedId!, runId: null });
   }
 
-  // The settle loop: a try now, then again after 2 s, doubling up to 30 s while it stays unsettled (a server that keeps
-  // a reply unfinished with no run is not asked every 2 s forever); one at a time; stopped when the conversation is left.
+  // The settle loop (`startSettleLoop`): a try now, then again after 2 s, doubling up to 30 s while it stays unsettled (a
+  // server that keeps a reply unfinished with no run is not asked every 2 s forever); one at a time; stopped when the
+  // conversation is left.
   const around = useEffectEvent(() => refreshAround());
   const followAgain = useEffectEvent(() => reconnect());
   const marked = ending?.conversationId === id ? ending : null;
   // What is being settled, as plain values (the loop restarts only for another reply or run).
   const settleMessage = marked ? marked.messageId : null;
   const settleRun = marked ? marked.runId : null;
+  /** The running loop's run and its poke (a stop answered with that run ended: check now, not after the backoff). */
+  const pokeSettle = useRef<{ runId: string | null; poke: () => void } | null>(null);
   useEffect(() => {
     if (!settleMessage) return;
     const settling: Ending = { conversationId: id, messageId: settleMessage, runId: settleRun };
     const ac = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let wait = SETTLE_FIRST_RETRY_MS;
-    const attempt = async () => {
-      let r: SettleResult = "unfinished";
-      try {
-        r = await settleEnd({
+    const loop = startSettleLoop(
+      () =>
+        settleEnd({
           qc,
           ending: settling,
           signal: ac.signal,
           readActiveRun: conversations.activeRun,
           around,
-        });
-      } catch {
-        // a failed read: tried again
-      }
-      if (ac.signal.aborted) return;
-      if (r === "unfinished") {
-        timer = setTimeout(() => void attempt(), wait);
-        wait = Math.min(wait * 2, SETTLE_MAX_RETRY_MS);
-        return;
-      }
-      if (r === "running" && settling.runId !== null && closedRun.current === settling.runId) followAgain();
-      setEnding((e) =>
-        e && e.conversationId === id && e.messageId === settleMessage && e.runId === settleRun ? null : e,
-      );
-    };
-    void attempt();
+        }),
+      (r) => {
+        if (r === "running" && settling.runId !== null && closedRun.current === settling.runId) followAgain();
+        setEnding((e) =>
+          e && e.conversationId === id && e.messageId === settleMessage && e.runId === settleRun ? null : e,
+        );
+      },
+    );
+    pokeSettle.current = { runId: settleRun, poke: loop.poke };
     return () => {
       ac.abort();
-      clearTimeout(timer);
+      loop.stop();
+      pokeSettle.current = null;
     };
   }, [id, settleMessage, settleRun, qc]);
   useEffect(() => () => forgetReadsAfterEnd(qc, id), [qc, id]);
@@ -326,8 +325,10 @@ export function ChatPage() {
           // Ended already: settled like any end (with the `done` that may be on its way, the same end); still
           // going: its stream's `done` ends it.
           .then((run) => {
-            if (run.endedAt !== null)
-              beginEnding({ conversationId: id, messageId: run.assistantMessageId, runId: run.id });
+            if (run.endedAt === null) return;
+            beginEnding({ conversationId: id, messageId: run.assistantMessageId, runId: run.id });
+            // The same end already settling (its loop waiting out a backoff): checked now.
+            if (pokeSettle.current?.runId === run.id) pokeSettle.current.poke();
           })
           .catch((e: unknown) => setActionError(errorText(e)))
     : undefined;
