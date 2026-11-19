@@ -511,9 +511,13 @@ export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined
  *  - Linux (procps, C locale; **not checked here** — no Linux host): printable ASCII as it is, every other byte `?`.
  */
 export function psEncode(text: string, platform: string = process.platform): string | undefined {
+  return psEncodeBytes(Buffer.from(text, "utf8"), platform);
+}
+/** `psEncode` of raw bytes (an argv is bytes; tests check every byte value against the real `ps`). */
+export function psEncodeBytes(bytes: Uint8Array, platform: string = process.platform): string | undefined {
   if (platform !== "darwin" && platform !== "linux") return undefined;
   let out = "";
-  for (const b of Buffer.from(text, "utf8")) {
+  for (const b of bytes) {
     if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
     else if (platform === "linux") out += "?";
     else if (b === 0x09 || b === 0x0a) out += `\\0${b.toString(8).padStart(2, "0")}`;

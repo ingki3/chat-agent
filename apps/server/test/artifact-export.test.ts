@@ -22,6 +22,7 @@ import {
   parseMessage,
   parsePs,
   psEncode,
+  psEncodeBytes,
   psListing,
   type PsRun,
   reapAfterWatchdog,
@@ -1610,6 +1611,53 @@ describe("the browser never outlives its owner (#170)", () => {
       fs.rmSync(dir2.workDir, { recursive: true, force: true });
       fs.rmSync(renderLockPath(dir2.workDir), { force: true });
     });
+
+    it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+      "real `ps` (as the reap runs it), byte by byte: every byte value 0x01–0xff in an argument prints as psEncodeBytes says",
+      async () => {
+        // Perl re-execs itself with one argument per byte, `[<hex>:<byte>]` (raw bytes: not necessarily UTF-8).
+        const hex = Array.from({ length: 255 }, (_, i) => (i + 1).toString(16).padStart(2, "0"));
+        const script =
+          'my @a = map { "[" . $_ . ":" . chr(hex $_) . "]" } @ARGV; exec { "/usr/bin/perl" } "perl", "-e", "sleep 30", "--", @a;';
+        const c = spawn("/usr/bin/perl", ["-e", script, ...hex], { detached: true, stdio: "ignore" });
+        startedGroups.add(c.pid!);
+        try {
+          let args: string | undefined;
+          expect(
+            await within(10_000, () => {
+              const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
+                encoding: "latin1",
+                maxBuffer: 64 << 20,
+                env: { LC_ALL: "C", LANG: "C" },
+              });
+              args = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+                (x) => x.pid === c.pid,
+              )?.args;
+              return !!args?.includes("[ff:");
+            }),
+          ).toBe(true);
+          // `[xx:` starts each argument; what follows up to the next ` [yy:` is how that byte was printed.
+          const shown = new Map<number, string>();
+          const marks = [...args!.matchAll(/\[([0-9a-f]{2}):/g)];
+          marks.forEach((m, i) => {
+            const end = i + 1 < marks.length ? marks[i + 1]!.index! - 1 : args!.length;
+            shown.set(parseInt(m[1]!, 16), args!.slice(m.index! + 4, end).replace(/\]$/, ""));
+          });
+          const wrong: string[] = [];
+          for (let b = 1; b < 256; b++) {
+            const want = psEncodeBytes(Uint8Array.of(b));
+            if (shown.get(b) !== want)
+              wrong.push(`${b.toString(16)}: ps ${JSON.stringify(shown.get(b))} ≠ ${JSON.stringify(want)}`);
+          }
+          if (wrong.length)
+            console.log(`ps per byte (${process.platform}):`, JSON.stringify(Object.fromEntries(shown)));
+          expect(wrong).toEqual([]);
+        } finally {
+          c.kill("SIGKILL");
+          expect(await gone(c.pid!)).toBe(true);
+        }
+      },
+    );
 
     it.skipIf(process.platform !== "darwin")(
       "real `ps` (macOS, as the reap runs it): exactly the encoding — every byte valid UTF-8 can hold",
