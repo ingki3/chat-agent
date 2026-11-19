@@ -2,8 +2,10 @@ name: main-source
 
 # main은 dev에서 온 PR만 받는다(브랜치 규칙: feature → PR → dev → PR → main).
 # main 보호 규칙의 필수 검사 `main-source`가 이 작업이다.
+# pull_request_target: 검사 정의를 PR이 아니라 main(기준 브랜치)에서 읽으므로 PR이 이 검사를 고쳐 통과시킬 수 없다
+# (리뷰 #218). 코드를 체크아웃하지 않고 권한도 없으므로 PR 내용은 실행되지 않는다.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, edited]
 
