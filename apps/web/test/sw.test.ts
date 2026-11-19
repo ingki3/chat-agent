@@ -204,3 +204,28 @@ describe("service worker: renewed subscription", () => {
     expect(none.marker()).toEqual({ sessionTag: "tag-A" });
   });
 });
+
+describe("service worker: pages it never answers with the app shell", () => {
+  it("public artifact links (#204) and artifact originals go to the network untouched; app pages fall back", async () => {
+    const w = worker();
+    const handled = async (pathname: string) => {
+      let responded = false;
+      await w.fire("fetch", {
+        request: { url: `${ORIGIN}${pathname}`, method: "GET", mode: "navigate" },
+        respondWith: () => (responded = true),
+      });
+      return responded;
+    };
+    const token = "A".repeat(43);
+    for (const p of [
+      `/artifact/${token}`,
+      `/artifact/${token}/raw`,
+      `/artifact/${token}/download?format=png`,
+      "/a/x/v/1/raw",
+      "/api/public-links",
+    ])
+      expect(await handled(p), p).toBe(false);
+    // The app's own pages (the list `/artifacts` among them) keep the offline shell.
+    for (const p of ["/", "/artifacts", "/a/x", "/c/1"]) expect(await handled(p), p).toBe(true);
+  });
+});

@@ -55,6 +55,8 @@ export default defineConfig({
       FAKE_RUNTIME_CODEX: "1",
       // Production mode with the scripted runtimes is refused unless this says it is the e2e run.
       FAKE_RUNTIME_IN_PRODUCTION: "e2e",
+      // Public artifact links (#204, e2e/public-links.spec.ts).
+      PUBLIC_LINKS_ENABLED: "1",
     },
     reuseExistingServer: false,
     timeout: 30_000,

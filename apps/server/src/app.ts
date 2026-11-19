@@ -71,6 +71,8 @@ import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
 import { SharePolicy } from "./shares/projection.js";
 import { registerShareRoutes } from "./shares/routes.js";
+import { PublicLinkStore } from "./public-links/store.js";
+import { registerPublicLinkRoutes, type PublicLinkLimits } from "./public-links/routes.js";
 import { ShareStore } from "./shares/store.js";
 import { ForkService } from "./shares/fork.js";
 import { notifyResultSubscribers } from "./shares/notify.js";
@@ -128,7 +130,7 @@ import { registerNotificationRoutes } from "./notifications/routes.js";
 import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
 import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
 import { AppEvents } from "./events.js";
-import { isApiPath, isArtifactPath, routerPath } from "./paths.js";
+import { isApiPath, isArtifactPath, isPublicLinkPath, routerPath } from "./paths.js";
 import { MERMAID_FRAME_PATH, registerMermaidFrame } from "./mermaid-frame.js";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
@@ -189,6 +191,8 @@ declare module "fastify" {
     connections: ConnectionService | undefined;
     /** Artifacts (#27); undefined without a database. */
     artifacts: ArtifactStore | undefined;
+    /** Public artifact links (#204); undefined without a database. */
+    publicLinks: PublicLinkStore | undefined;
     /** Usage records (#44) and their price tables (#32); undefined without a database. */
     usageStore: UsageStore | undefined;
     /** Usage screens and the daily cost check (#32); undefined without a database. */
@@ -370,6 +374,8 @@ export type BuildOptions = {
   dataLock?: { held: () => boolean };
   /** Tests: the deletion jobs' retry timings and clock (#54). */
   purge?: Pick<PurgeOptions, "retryMs" | "maxRetryMs" | "now">;
+  /** Tests: public link rate limits and clock (#204). */
+  publicLinks?: { limits?: Partial<PublicLinkLimits>; now?: () => number };
   /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
   rescrub?: Pick<
     RescrubOptions,
@@ -1253,6 +1259,16 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       renderer = own;
     }
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
+    // Public artifact links (#204): `/artifact/<token>` outside Access and the app login (PUBLIC_LINKS_ENABLED).
+    const publicLinks = new PublicLinkStore(opts.db!, opts.publicLinks?.now);
+    app.decorate("publicLinks", publicLinks);
+    registerPublicLinkRoutes(app, {
+      config,
+      store: publicLinks,
+      artifacts,
+      renderer,
+      ...opts.publicLinks,
+    });
     registerShareRoutes(app, sharing, users, {
       ...(opts.sse ?? {}),
       // "이어서 대화하기" (#52): the projection copied into the forker's own conversation, on their own defaults.
@@ -1315,6 +1331,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("connections", undefined);
     app.decorate("dreaming", undefined);
     app.decorate("artifacts", undefined);
+    app.decorate("publicLinks", undefined);
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);
     app.decorate("backups", undefined);
@@ -1383,6 +1400,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         isApiPath(req.url) ||
         isGatePath(req.url) ||
         isArtifactPath(req.url) ||
+        isPublicLinkPath(req.url) ||
         routerPath(req.url) === MERMAID_FRAME_PATH
       )
         return next();

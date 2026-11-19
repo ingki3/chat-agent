@@ -50,6 +50,7 @@ import {
   isDreamingTrigger,
   isDreamingStatus,
   isDreamingCode,
+  isPublicLinkCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -209,6 +210,9 @@ export const LOG_EVENTS = [
   "dreaming.run_started",
   "dreaming.run_finished",
   "dreaming.alert_sent",
+  // Public artifact links (#204): created, viewed, turned off, refused (secret) or rate limited — a fixed code and the
+  // owner's id only; never the token, a visitor's IP or user agent, or the title.
+  "public_link.event",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -343,6 +347,7 @@ const FIELDS = new Map<string, Check>([
   ["dreamingTrigger", isDreamingTrigger],
   ["dreamingStatus", isDreamingStatus],
   ["dreamingCode", isDreamingCode],
+  ["publicLinkCode", isPublicLinkCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -627,6 +632,7 @@ export type LogFields = {
   dreamingTrigger?: string;
   dreamingStatus?: string;
   dreamingCode?: string;
+  publicLinkCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

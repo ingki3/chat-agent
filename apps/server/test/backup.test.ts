@@ -380,6 +380,51 @@ describe("rehearsal: restore into a separate folder with the recovered key (#37 
   });
 });
 
+describe("public links after a restore (#204, review #209)", () => {
+  it("a link turned off after the backup stays off — every restored link is off before the server opens", async () => {
+    const L = layout();
+    createMasterKey(L.keyPath);
+    const one = await start(L);
+    const f = await createFamily(one.app);
+    const owner = f.users.owner;
+    const conv = one.app.conversations!.create(owner.id, { title: "공개 링크" });
+    const { artifact } = one.app.artifacts!.create(
+      { userId: owner.id, conversationId: conv.id, runId: "r" },
+      { kind: "html", title: "공개", content: "<p>v1</p>" },
+    );
+    const links = one.app.publicLinks!;
+    const revoked = links.create({ ownerId: owner.id, artifactId: artifact.id, version: 1, days: 30 }).row;
+    const kept = links.create({ ownerId: owner.id, artifactId: artifact.id, version: 1, days: 30 }).row;
+    const id = await backupNow(one.app, f.cookies.admin);
+    // After the backup: the owner turns one off (the backup still has it on).
+    expect(links.disable(revoked.id)).toBe(true);
+    await one.close();
+
+    const target = path.join(L.root, "restored");
+    restoreBackup({
+      backup: path.join(L.backupDir, id),
+      target,
+      key: loadMasterKey(L.keyPath),
+      now: () => 42,
+    });
+    const db = new Database(path.join(target, DB_FILE), { readonly: true });
+    try {
+      const rows = db.prepare("SELECT id, disabled_at AS disabledAt FROM public_links ORDER BY id").all() as {
+        id: string;
+        disabledAt: number | null;
+      }[];
+      expect(rows.map((r) => r.id).sort()).toEqual([revoked.id, kept.id].sort());
+      // Both off: the revoked one cannot come back, and none is open before its owner makes it again.
+      expect(rows.every((r) => r.disabledAt === 42)).toBe(true);
+    } finally {
+      db.close();
+    }
+    // The restored server serves neither (same 404 as any dead link).
+    const two = await start({ dataDir: target, keyPath: L.keyPath });
+    expect(two.app.publicLinks!.counts()).toEqual({ active: 0, expired: 0, disabled: 2 });
+  });
+});
+
 describe("restore refuses clearly and changes nothing (#37)", () => {
   async function made() {
     const L = layout();

@@ -114,6 +114,7 @@ describe("database", () => {
       "notification_prefs",
       "notifications",
       "price_tables",
+      "public_links",
       "push_session_state",
       "push_subscriptions",
       "run_events",

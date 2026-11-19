@@ -1693,3 +1693,34 @@ export const adminEmailChanges = sqliteTable(
   },
   (t) => [index("admin_email_changes_state_idx").on(t.state)],
 );
+
+/**
+ * Public links to one artifact version (#204, PRD FR-14.7 v0.7): `/artifact/<token>` opens that version to anyone
+ * with the link, without Access or an app login. The token (32 random bytes, base64url) is shown once at creation;
+ * only its SHA-256 is stored (`token_hash`). The version is fixed at creation (later edits never show). A link is
+ * dead once `expires_at` passes, `disabled_at` is set (owner, admin, or the owner's deactivation), or its artifact —
+ * with its conversation or its owner — is deleted (foreign keys). Views are counted; no IP, user agent or referrer.
+ */
+export const publicLinks = sqliteTable(
+  "public_links",
+  {
+    id: text("id").primaryKey(),
+    tokenHash: text("token_hash").notNull().unique(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    artifactId: text("artifact_id")
+      .notNull()
+      .references(() => artifacts.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    disabledAt: integer("disabled_at"),
+    viewCount: integer("view_count").notNull().default(0),
+    lastViewedAt: integer("last_viewed_at"),
+  },
+  (t) => [
+    index("public_links_owner_idx").on(t.ownerId, t.createdAt),
+    index("public_links_artifact_idx").on(t.artifactId),
+  ],
+);

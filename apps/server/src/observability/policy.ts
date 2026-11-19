@@ -324,6 +324,15 @@ export const isScheduleTrigger = member(set(["regular", "missed", "manual"]));
 export const isDreamingTrigger = member(set(DreamingTrigger.options));
 export const isDreamingStatus = member(set(DreamingRunStatus.options));
 export const isDreamingCode = member(set(Object.keys(DREAMING_CODE_LABEL)));
+/** Public artifact links (#204): what happened, from a fixed set — never the token, an IP or a title. */
+export const PUBLIC_LINK_CODES = set([
+  "public_link_created",
+  "public_link_viewed",
+  "public_link_disabled",
+  "public_link_secret",
+  "public_link_rate_limited",
+]);
+export const isPublicLinkCode = member(PUBLIC_LINK_CODES);
 export const isScheduleStatus = member(set(["succeeded", "failed", "skipped", "retrying"]));
 export const isScheduleStep = member(set(["save", "notify", "engine", "warn"]));
 export const isRestoreRecovery = member(set(["completed", "rolled_back"]));

@@ -177,6 +177,7 @@ pnpm -s release status
    - 두 값이 없으면 공개 도메인 요청은 모두 403(`access_not_configured`)이다. 7.1의 임시 접속 코드를 켠 경우만 예외.
    - Access로 들어온 이메일과 다른 앱 계정으로는 로그인할 수 없고, 기존 세션도 거부된다.
    - 이메일이 없는 서비스 토큰 JWT는 `GET /api/health`(가동률 측정, 9.3절)에만 통과하고 나머지는 403이다.
+   - 유일한 예외는 공개 링크(#204, 49절): `PUBLIC_LINKS_ENABLED=1`일 때 `GET /artifact/<토큰>`(·`/raw`·`/download`) 세 경로만 JWT를 요구하지도 읽지도 않는다. Cloudflare에는 `/artifact/` 경로 전용 Bypass 애플리케이션을 따로 둔다 — 이 앱(경로 비움)은 그대로.
 6. 확인: 시크릿 창에서 접속 → Access 로그인 화면이 먼저 나와야 한다. 허용 안 된 이메일로 코드를 요청하면 코드가 오지 않고 거부된다.
 
 ### 7.1 임시 접속 코드 (Access 전 테스트용)
@@ -841,7 +842,7 @@ pnpm skills:install                                        # 6) 스킬 다시 �
 - `<id>`는 `BACKUP_DIR` 안의 이름, 또는 백업 폴더 경로(외장 디스크에서 가져온 사본 등).
 - `--key <파일>`: 다른 위치의 키(오프라인 사본에서 되살린 키). 없으면 `MASTER_KEY_PATH`. 파일은 600, 폴더는 다른 사용자 쓰기 불가여야 한다. 실제로 쓰는 키 파일(과 `MASTER_KEY_PATH`)이 대상 폴더 안에 있으면 `target_unsafe`(교체 때 키가 옆으로 치워지지 않게).
 - `--target <폴더>`: `DATA_DIR`이 아닌 곳에 복원(리허설). 그때는 `--yes`가 필요 없다. 대상이 백업 폴더·키와 겹치면 `target_unsafe`.
-- 모든 검사가 끝난 뒤에야 쓴다. 대상 옆에 새 폴더를 만들어 채우고(DB 복사 → 해시 재확인 → 이 코드의 마이그레이션 적용 → 런타임 세션 무효화) 이름 바꾸기 두 번(옛 폴더 → 옆, 새 폴더 → 제자리)으로 바꾼다. 옛 폴더는 지우지 않는다 — 확인이 끝나면 직접 지운다.
+- 모든 검사가 끝난 뒤에야 쓴다. 대상 옆에 새 폴더를 만들어 채우고(DB 복사 → 해시 재확인 → 이 코드의 마이그레이션 적용 → 런타임 세션 무효화 → **공개 링크 모두 끄기**(#204: 백업 뒤에 끈 링크가 되살아나지 않게 — 필요하면 주인이 새로 만든다, 49.3절)) 이름 바꾸기 두 번(옛 폴더 → 옆, 새 폴더 → 제자리)으로 바꾼다. 옛 폴더는 지우지 않는다 — 확인이 끝나면 직접 지운다.
 - **교체 일지**: `<부모>/.<이름>.restore-journal.json`에 단계를 적고(매번 fsync) 끝나면 지운다. 단계: `prepared`(아무것도 안 옮김) → `old_moved`(옛 폴더를 옆으로) → `swapped`(새 폴더를 제자리로) → `done`, 실패하면 무엇이든 되돌리기 **전에** `rolling_back`.
   - **양쪽 정체를 일지에 둔다(추측하지 않음)**: 옮기기 전에 옛 폴더에 임의 id 파일(`.restore-old`)을 쓰고 그 id와 옛 DB의 SHA-256을, 새 폴더(후보)에 id 파일(`.restore-candidate`)을 쓰고 그 id와 **후보 전체 목록**(DB와 `files/`·`artifacts/`·`sources/`의 파일마다 크기·SHA-256)을 일지에 적는다. 정전 대비 순서: 복사한 파일 하나하나 → 폴더(깊은 것부터) → id 파일 → 일지, 모두 fsync. id 파일은 일지를 지운 뒤에 지운다(남으면 다음 시작이 치움).
   - 옛 폴더로 인정 = id 파일과 DB 해시가 일지와 같을 때. 후보로 인정 = id 파일이 같고 파일 목록이 정확히 같을 때(빠진 것·더 있는 것·바뀐 것 없음, 0바이트 DB는 불인정).
@@ -2284,3 +2285,81 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
     YTDLP_LIVE_URL='https://www.youtube.com/watch?v=<id>' pnpm vitest run apps/server/test/youtube.test.ts -t live
   ```
 - 수용 기준 수동 확인: "이 유튜브 영상 화자별로 정리해줘" → 음성 파일이 대화 파일로 저장되고 화자별 대본(기록 양식 B).
+
+## 49. 아티팩트 공개 링크 — `/artifact/<토큰>` (#204)
+
+아티팩트의 **한 버전**을 가족 밖 사람에게 로그인 없이 보여 주는 링크(PRD FR-14.7 v0.7 개정, 설계는 `docs/decisions/isolation.md` "공개 링크"). 주소는 앱과 **같은 호스트** `https://chat.2prostream.com/artifact/<토큰>`이다. Cloudflare Access는 `/artifact/` 경로만 건너뛰게(Bypass) 하고, 나머지 모든 경로(앱 목록 화면 `/artifacts`, `/a/:id`, `/api/*` …)는 지금 Access 정책 그대로 둔다. 기본은 **꺼짐**.
+
+### 49.1 켜기 (관리자, 한 번)
+1. **Access Bypass 애플리케이션** (Zero Trust → Access controls → Applications → Add an application → Self-hosted):
+   - 이름: `Agent Lee 공개 링크`. 도메인 `chat.2prostream.com`, **경로 `artifact/`**(끝의 `/`까지 — `artifacts`와 겹치지 않게).
+   - 정책: **Bypass** · Include · **Everyone**. 다른 규칙(이메일·국가 등)은 넣지 않는다. 세션·쿠키 설정은 기본값(Bypass는 로그인 화면도 쿠키도 만들지 않는다).
+   - 기존 앱 전체 애플리케이션(7절, 경로 비움)은 **건드리지 않는다**. Cloudflare는 더 구체적인 경로의 애플리케이션을 먼저 적용한다.
+2. `~/.chat-agent/shared/.env`에 `PUBLIC_LINKS_ENABLED=1`을 넣고 서버를 재시작한다(5절). **비상시 끄기**: 이 값을 `0`으로 바꾸고 재시작하거나, Bypass 애플리케이션을 지운다(둘 중 하나로 충분 — 둘 다 하면 더 확실). 그때 `/artifact/<토큰>`의 기대값:
+
+   | 상태 | 요청 | 기대값 |
+   |---|---|---|
+   | 켬(`1`) + Bypass 있음 | 로그인 없이 | **200** (토큰이 죽었으면 서버 404 "링크를 열 수 없어요") |
+   | 끔(`0`) + Bypass 있음 | 로그인 없이 — Cloudflare가 JWT 없이 넘김 | **403**, 몸 `{"error":"access_denied"}`(원본 서버가 막음) |
+   | 끔(`0`) + Bypass 지움 | 로그인 없이 | **302** → `<팀>.cloudflareaccess.com`(Access 로그인 — 원본까지 오지 않음) |
+   | 끔(`0`) + Bypass 지움 | 가족이 Access 로그인한 브라우저 — JWT 있음 | **404**(서버는 공개 링크를 열지 않음) |
+   | 어느 경우든 localhost(집 안) | — | 켬이면 200, 끔이면 404 |
+3. **수동 확인 (로그인 안 된 상태 — 시크릿 창이나 새 터미널, 쿠키 없음).** 먼저 앱에서 시험용 아티팩트로 링크를 하나 만든다(아래 49.2). 토큰은 **화면에 찍히지 않게** 입력으로 받고, 출력에는 시험 이름과 판정만 남긴다(주소·리디렉션 URL·토큰은 출력하지 않음).
+   ```bash
+   H=https://chat.2prostream.com
+   read -rs -p '토큰(링크 끝 43자): ' T; echo
+   # 판정: access-login = Cloudflare Access 로그인으로 302(원본까지 오지 않음) · origin-denied = 원본 서버의 403 access_denied
+   # (Bypass가 그 경로를 넘겼다는 뜻) · open = 200 · 그 밖은 상태 코드 그대로.
+   probe() {  # probe <이름> <경로>
+     local body code loc
+     body=$(mktemp); code=$(curl -s -o "$body" -D "$body.hdr" -w '%{http_code}' "$H$2")
+     loc=$(grep -i '^location:' "$body.hdr")
+     if [ "$code" = 302 ] && printf '%s' "$loc" | grep -q 'cloudflareaccess\.com'; then v=access-login
+     elif [ "$code" = 403 ] && grep -q '"access_denied"' "$body"; then v=origin-denied
+     elif [ "$code" = 200 ]; then v=open
+     else v="status-$code"; fi
+     printf '%-22s %s\n' "$1" "$v"; rm -f "$body" "$body.hdr"
+   }
+   # (1) Bypass 밖의 경로 — Cloudflare Access가 막아야 한다. 기대: 모두 access-login
+   #     (/api/* 는 Access가 302 대신 403을 줄 수 있다 — status-403도 통과, origin-denied는 Bypass가 넓다는 뜻).
+   for p in / /artifacts /artifacts/ /artifact /a/x /api/health /api/public-links /api/artifacts; do probe "outside:$p" "$p"; done
+   # (2) Bypass 안이지만 공개 라우트가 아닌 경로 — Cloudflare가 넘기고 원본 서버가 막는다. 기대: origin-denied
+   probe "inside:token-suffix" "/artifact/$T/x"; probe "inside:bad-token" "/artifact/short"
+   # 열려야 하는 것 — 기대: open
+   probe "open:page" "/artifact/$T"; probe "open:raw" "/artifact/$T/raw"; probe "open:download" "/artifact/$T/download"
+   # 헤더 — 기대: x-robots-tag·referrer-policy·cache-control 세 줄과 "set-cookie: none". 쿠키는 있는지만 찍는다(값은 절대 출력하지 않음).
+   hdr=$(curl -s -D - -o /dev/null "$H/artifact/$T" | tr -d '\r')
+   printf '%s\n' "$hdr" | grep -iE '^(x-robots-tag|referrer-policy|cache-control):'
+   if printf '%s\n' "$hdr" | grep -qi '^set-cookie:'; then echo "set-cookie: PRESENT"; else echo "set-cookie: none"; fi
+   unset hdr
+   # 없는 토큰 — 기대: status-404 (서버의 "링크를 열 수 없어요", Access 화면이 아님)
+   probe "dead:unknown-token" "/artifact/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   unset T
+   ```
+   기대값 요약: `outside:*`는 모두 `access-login`(`/api/*`는 `status-403`도 허용) — 여기서 `origin-denied`나 `open`이 하나라도 나오면 Bypass 경로가 넓은 것이니 `artifact/` 끝의 `/`를 다시 확인한다. `inside:*`는 `origin-denied`가 정상이다(Bypass 안의 경로는 원본까지 오고, 공개 라우트가 아니면 서버가 거절). `open:*`는 `open`, `set-cookie: none`(`PRESENT`는 **예상 밖의 쿠키가 붙었다**는 뜻일 뿐이다 — 원인은 따로 조사한다. 서버는 공개 링크 응답에 쿠키를 붙이지 않으므로 Cloudflare 쪽(다른 Access 애플리케이션이 그 경로를 잡았는지, 다른 Cloudflare 기능의 쿠키인지)을 대시보드에서 확인한다. 값은 기록하지 않는다), `dead:*`는 `status-404`. 결과(이름과 판정만)를 4절 확인 기록에 날짜와 함께 남긴다 — 토큰은 적지 않는다.
+4. 시험 링크는 확인 뒤 끈다(49.2).
+
+### 49.2 쓰기 (가족)
+- 아티팩트 화면 도구 막대의 **🔗 공개 링크 만들기**(주인에게만, 켜져 있을 때만 보임). 대화상자는 "링크를 아는 사람은 누구나 로그인 없이 본다" 경고, 서버의 공개 전 확인 결과, 열어 둘 기간(1~365일, 기본 7일 — "만료 없음"은 없음)을 보여 준다. 만들면 주소가 **한 번만** 보인다(복사 단추). 잃어버리면 새로 만든다.
+- 고정되는 것은 **그 버전 하나**다. 뒤에 고친 내용은 보이지 않는다(새 버전을 보이려면 새 링크).
+- 공개 전 확인(서버): 그 버전의 저장된 제목·본문에 **알려진 비밀 값**(비밀 가림 검사기와 같은 목록)이 있으면 **만들 수 없다**(`public_link_secret`). 이메일 주소·전화번호는 개수만 경고, 제목·본문에 **나오는** 외부 주소(`https://호스트`·`http://`·`//호스트`, 어디에 있든 — 링크·글 속 언급까지 일부러 넓게 잡는다)는 "이 문서에 나오는 외부 주소 — 공개 페이지가 여기서 내용을 불러올 수 있음" 안내(실제로 불러오는 것은 허용 CDN 스크립트뿐 — 나머지는 샌드박스 CSP가 막는다). HTML·CSS를 해석하지 않으니 놓치는 주소가 없는 대신, 언급만 된 주소도 나온다. 대화상자에는 앞 10개와 "외 N개"가 보인다.
+- 내 링크 목록: **가족 공유 화면(`/shared`) → 내 공개 링크**와 대화상자 아래 목록 — 상태(열림·만료·꺼짐), 조회 수·마지막 조회 시각, 만료, **링크 끄기**(즉시 404, 되살릴 수 없음).
+- 한도: 한 사람당 켜진 링크 20개(`public_link_limit`). 청소년 계정도 쓸 수 있다(경고·비밀 값 차단은 같다). 공유받은 사람은 만들 수 없다(내 것으로 복사한 뒤 그 복사본으로).
+- 방문자가 보는 것: 제목, 종류, 샌드박스 프레임 속 그 버전, 내려받기(원본 — HTML·MD·SVG·CSV·코드, HTML 페이지, 종류에 따라 PNG·PDF), 바닥글 "Agent Lee에서 공유됨 · 만료일". 대화·첨부·다른 버전·다른 아티팩트·이메일·이름은 보이지 않는다.
+
+### 49.3 링크가 죽는 때 (모두 즉시 404, 같은 화면)
+만료 시각이 지남 · 주인이나 관리자가 끔 · 그 아티팩트의 대화(와 아티팩트)를 지움 · 주인 계정 비활성화(그 사람의 링크는 모두 꺼지고, 계정을 되살려도 꺼진 채) · `PUBLIC_LINKS_ENABLED`가 꺼짐 · 그 버전이 가려짐(비밀 값 재가림) · **백업 복원**(복원된 링크는 모두 꺼진 채로 돌아온다 — 백업 뒤에 끈 링크가 되살아나지 않게. 필요하면 주인이 새로 만든다, 21.4절). 매 요청마다 서버가 다시 확인한다.
+
+### 49.4 관리자 화면
+관리자 → **공개 링크** 탭: 열림·만료·꺼짐 개수, 링크마다 만든 사람·상태·만든 때·만료·조회 수, **끄기**. 열린 링크는 개수와 상관없이 **모두** 보이고, 만료·꺼진 이력은 50개씩 "지난 링크 더 보기"(내 링크 목록도 같다). 제목과 내용은 보이지 않는다(FR-1.5).
+
+### 49.5 속도 제한·로그·저장
+- 속도 제한(메모리, 서버 재시작 시 초기화): 보기·원본·HTML/원본 내려받기는 링크마다 1분에 120번, 전체 1분에 1200번(없는 토큰 추측도 전체에 셈). PNG·PDF(격리 브라우저 렌더러, #51)는 링크마다 10분에 10번, 전체 10분에 30번. 넘으면 429 + `Retry-After`. 렌더러 자체의 동시 2·대기 4 한도(18절)도 그대로.
+- 로그: `public_link.event` 하나 — 고정 코드(`publicLinkCode`: created·viewed·disabled·secret·rate_limited)와 만든 사람 id만. **토큰·IP·User-Agent·제목은 남지 않는다.**
+- 저장(0035 마이그레이션, `public_links`): 토큰의 SHA-256(hex)만, 아티팩트 id·버전, 주인, 만든·만료·끈 시각, 조회 수·마지막 조회 시각. IP·UA·Referer는 저장하지 않는다. 아티팩트·사용자 삭제 시 함께 지워진다(외래 키). 백업·복원에 그대로 포함된다(토큰 원문이 없으니 백업으로 링크를 열 수는 없다).
+- 헤더: `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex, nofollow`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`, CORP `same-origin`. 보기 페이지는 스크립트가 하나도 없는 최소 HTML(앱 번들 없음, CSP `script-src 'none'; frame-ancestors 'none'`), 원본은 `/a/:id/v/:ver/raw`와 같은 CSP(`sandbox allow-scripts`, `connect-src 'none'`, 해시·허용 CDN+SRI).
+
+### 49.6 시험
+- `pnpm vitest run apps/server/test/public-links.test.ts`: 앱의 **모든 다른 경로**가 공개 호스트에서 JWT 없이 403(`access_denied`)인지 경로 표 전체로 확인, `/artifacts`·`/artifact`·다른 접미사·잘못된 토큰도 403, 설정 꺼짐이면 예외 없음, 쿠키·JWT를 읽지 않음(세션 조회 0번, 위조 JWT도 같은 응답, `Set-Cookie` 없음), 임시 코드 게이트 예외, 헤더, 버전 고정, 토큰 해시·추측, 만료·끄기(주인·관리자)·대화 삭제·비활성화, 청소년 허용, 공유받은 사람·관리자 거부, 비밀 값 차단·경고, 한도 20, 관리자 응답에 제목 없음, 조회 수(IP·UA 없음), 속도 제한.
+- `e2e/public-links.spec.ts`(`PUBLIC_LINKS_ENABLED=1`): 대화상자로 만들기(경고·기본 7일·한 번 보이는 주소), 로그인한 브라우저로 열어도 아티팩트 스크립트가 쿠키·저장소·부모 창·`/api`에 닿지 못함, 로그인 안 된 방문자가 보고 내려받음, `/api`는 401, 끄면 즉시 404.
+- Cloudflare 쪽(Bypass·경로 경계)은 자동 시험이 없다 — 49.1의 3번 수동 확인으로만.

@@ -96,6 +96,13 @@ import {
   MemoryProposal,
   type MemoryApplyMode,
   ACCESS_ERRORS,
+  AdminPublicLinksResponse,
+  CreatePublicLinkResponse,
+  PUBLIC_LINK_ERRORS,
+  PublicLink,
+  PublicLinkCheck,
+  PublicLinkSettings,
+  PublicLinksResponse,
   AccessOverview,
   AccessPreview,
   AccessRegistration,
@@ -691,6 +698,8 @@ const MESSAGES: Record<string, string> = {
   ...DREAMING_ERRORS,
   // Cloudflare Access 동기화 (#36)
   ...ACCESS_ERRORS,
+  // 공개 링크 (#204)
+  ...PUBLIC_LINK_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -828,6 +837,37 @@ export const references = {
     }
     return { blob: await res.blob(), name };
   },
+};
+
+export const PUBLIC_LINKS_KEY = ["public-links"] as const;
+/**
+ * Public artifact links (#204): the owner's pre-publish check, a new link (its token is in this one answer only), my
+ * links, turning one off; the admin's counts and switch-off (no title, no content).
+ */
+export const publicLinks = {
+  settings: async () => PublicLinkSettings.parse(await call("GET", "/api/public-links/settings")),
+  /** Every open link, and a page of the expired / turned-off ones (`cursor`: the previous page's `nextCursor`). */
+  mine: async (o: { artifactId?: string; cursor?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (o.artifactId) q.set("artifactId", o.artifactId);
+    if (o.cursor) q.set("cursor", o.cursor);
+    const qs = q.toString();
+    return PublicLinksResponse.parse(await call("GET", `/api/public-links${qs ? `?${qs}` : ""}`));
+  },
+  check: async (artifactId: string, version: number) =>
+    PublicLinkCheck.parse(
+      await call("GET", `/api/artifacts/${enc(artifactId)}/public-links/check?version=${version}`),
+    ),
+  create: async (artifactId: string, version: number, expiresInDays: number) =>
+    CreatePublicLinkResponse.parse(
+      await call("POST", `/api/artifacts/${enc(artifactId)}/public-links`, { version, expiresInDays }),
+    ),
+  disable: async (id: string) => PublicLink.parse(await call("DELETE", `/api/public-links/${enc(id)}`)),
+  adminList: async (cursor?: string) =>
+    AdminPublicLinksResponse.parse(
+      await call("GET", `/api/admin/public-links${cursor ? `?cursor=${enc(cursor)}` : ""}`),
+    ),
+  adminDisable: async (id: string) => call("POST", `/api/admin/public-links/${enc(id)}/disable`, {}),
 };
 
 export const SHARES_KEY = ["shares"] as const;

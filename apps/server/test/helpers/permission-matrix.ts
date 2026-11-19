@@ -174,6 +174,12 @@ function artifact(f: Family) {
   return { id: a.id, params: { version: "1" } };
 }
 
+/** A public link (#204) of `owner`'s shared artifact. */
+function publicLink(f: Family) {
+  const { id } = artifact(f);
+  return f.app.publicLinks!.create({ ownerId: f.users.owner.id, artifactId: id, version: 1, days: 7 }).row.id;
+}
+
 /** An artifact of `owner` shared with no one (#29). */
 function unsharedArtifact(f: Family) {
   const c = f.app.conversations!.create(f.users.owner.id);
@@ -349,6 +355,16 @@ export const APP_MATRIX: MatrixRow[] = [
     errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
   },
   { route: "GET /api/artifacts/:id/shares", expect: OWNER_ONLY, fixture: artifact },
+  // Public links (#204): only the owner checks, makes or turns off one — the shared viewer (a recipient) never.
+  { route: "GET /api/artifacts/:id/public-links/check", expect: OWNER_ONLY, fixture: artifact },
+  {
+    route: "POST /api/artifacts/:id/public-links",
+    expect: { ...OWNER_ONLY, owner: 201 },
+    fixture: artifact,
+    body: { version: 1, expiresInDays: 7 },
+    errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "DELETE /api/public-links/:id", expect: OWNER_ONLY, fixture: publicLink },
   { route: "GET /api/shares/:id", expect: OWNER_ONLY, fixture: share() },
   {
     route: "PATCH /api/shares/:id",
@@ -527,10 +543,14 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/access",
   // #173: the audio transcription fallback switch.
   "/api/admin/audio",
+  // #204: public links — counts, expiry, turn off (no title, no content).
+  "/api/admin/public-links",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
 export const ADMIN_MATRIX: AdminRow[] = [
+  { route: "GET /api/admin/public-links", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/public-links/:id/disable", expect: ADMIN_BY_ID },
   { route: "GET /api/admin/usage", expect: ADMIN_ONLY },
   { route: "GET /api/admin/usage/prices", expect: ADMIN_ONLY },
   {
