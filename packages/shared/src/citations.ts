@@ -378,7 +378,12 @@ function blockUnits(block: string, base: number): Unit[] {
  *   math blocks `code`; quotes are looked into; footnotes only when referred to (`footnote: true`); link
  *   definitions are nothing.
  */
-export function citationUnits(text: string, partStarts: readonly number[] = [0]): CitationUnit[] {
+export function citationUnits(
+  text: string,
+  partStarts: readonly number[] = [0],
+  /** Part starts with something shown before them (a card, a table, a divider): never joined to the part before. */
+  shownBetween: ReadonlySet<number> = new Set(),
+): CitationUnit[] {
   const starts = [...new Set([0, ...partStarts.filter((n) => n > 0 && n < text.length)])].sort(
     (a, b) => a - b,
   );
@@ -399,6 +404,7 @@ export function citationUnits(text: string, partStarts: readonly number[] = [0])
     const prev = out.filter((u) => !u.footnote && !u.inline).at(-1);
     const first = units.find((u) => !u.footnote && !u.inline);
     if (
+      !shownBetween.has(start) &&
       prev?.para &&
       first?.para &&
       (prev.kind === "body" || prev.kind === "lead_in") &&
@@ -632,7 +638,9 @@ export function endsSentence(text: string, start: number, end: number): boolean 
 function endsPart(text: string, start: number, end: number): boolean {
   if (endsSentence(text, start, end)) return true;
   const k = lastMark(text, start, end);
-  return k >= start && /[…:：]/u.test(text[k]!);
+  if (k < start || !/[…:：]/u.test(text[k]!)) return false;
+  // `09:` then `30` in the next part is a time (review 8차): not a stop.
+  return !(/[:：]/u.test(text[k]!) && /\p{Nd}/u.test(text[k - 1] ?? "") && /\p{Nd}/u.test(text[k + 1] ?? ""));
 }
 
 /**

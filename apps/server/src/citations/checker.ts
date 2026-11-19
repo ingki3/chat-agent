@@ -77,6 +77,26 @@ export function textPartStarts(parts: readonly MessagePart[]): number[] {
   return out;
 }
 
+/**
+ * Text part starts with something shown between them and the text part before (a card, a structured table, a
+ * divider — review 8차): a paragraph is never joined across those, only across tool rows.
+ */
+export function shownBetweenParts(parts: readonly MessagePart[]): Set<number> {
+  const out = new Set<number>();
+  let at = 0;
+  let shown = false;
+  let seenText = false;
+  for (const p of parts) {
+    if (p.type === "text") {
+      if (seenText && shown) out.add(at);
+      at += p.text.length;
+      seenText = true;
+      shown = false;
+    } else if (!UNSEEN.has(p.type)) shown = true;
+  }
+  return out;
+}
+
 /** Where in the answer text the first tool call came (the length of the text written before it). */
 export function firstToolAt(parts: readonly MessagePart[]): number {
   return toolCallsAt(parts)[0] ?? Number.POSITIVE_INFINITY;
@@ -171,7 +191,7 @@ export function isClosingOffer(text: string, u: TextRange, lastToolAt: number): 
 export function missingUnits(
   text: string,
   parts: readonly MessagePart[],
-  units: readonly CitationUnit[] = citationUnits(text, textPartStarts(parts)),
+  units: readonly CitationUnit[] = citationUnits(text, textPartStarts(parts), shownBetweenParts(parts)),
   markers: readonly CitationMarker[] = citationMarkers(text, units),
 ): TextRange[] {
   const last = toolCallsAt(parts).at(-1) ?? Number.NEGATIVE_INFINITY;
@@ -306,7 +326,7 @@ export function citationNote(
   // No source and nothing that looks like a marker: nothing to parse (review 3차 — the common no-tool answer).
   if (!used && !/\[\d{1,3}\](?!\()/.test(text)) return undefined;
   // One parse of the answer, as the screen renders it part by part, for the markers and the missing paragraphs.
-  const units = citationUnits(text, textPartStarts(parts));
+  const units = citationUnits(text, textPartStarts(parts), shownBetweenParts(parts));
   const allMarkers = used ? citationMarkers(text, units) : sentenceEndMarkers(text, units);
   const markers = allMarkers.slice(0, CITATION_LIMITS.markers);
   if (!used && !markers.length) return undefined;

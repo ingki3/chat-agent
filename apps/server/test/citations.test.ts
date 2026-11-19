@@ -2171,6 +2171,29 @@ describe("citationNote", () => {
         ).toEqual([]);
     });
 
+    it("review 8차: never joined across a shown card; a colon between digits is a time", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("올해 정원은 30명"),
+          card,
+          ...text("주요 전형은 다음과 같아요[1]:\n\n- 학종 위주예요"),
+        ]),
+      ).toEqual(["올해 정원은 30명", "- 학종 위주예요"]);
+      // Across a tool row only, the same text is one paragraph cut mid-sentence (and its marker covers it).
+      expect(
+        missingOf([...read("a"), ...text("올해 정원은 30명"), ...read("b"), ...text("이에요[1].")]),
+      ).toEqual([]);
+      // `09:` then `30…` across a tool call: a time, one paragraph. A colon after a letter stops the part.
+      expect(
+        missingOf([...read("a"), ...text("회의는 09:"), ...read("b"), ...text("30에 시작해요[1].")]),
+      ).toEqual([]);
+      expect(
+        missingOf([...read("a"), ...text("회의 시간은 9시:"), ...read("b"), ...text("오전 30분이에요.")]),
+      ).toEqual(["회의 시간은 9시:", "오전 30분이에요."]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [
