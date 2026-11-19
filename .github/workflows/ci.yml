@@ -16,8 +16,7 @@ concurrency:
 jobs:
   # #219: a pull request that changes only documentation skips the heavy test and e2e shards; the required checks
   # `test` and `e2e` still report (success), so nothing is left pending. Pushes to dev and main always run everything.
-  # Allow-list, not a deny-list: anything not listed below (code, config, fixtures, instructions/*.md, this file) runs
-  # the full suite. PRD.md and docs/traceability.md are read by scripts/test/traceability.test.ts, so they are not docs-only.
+  # What counts as documentation: scripts/ci/docs-only.sh (an allow-list; tested in scripts/test/docs-only.test.ts).
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -35,17 +34,12 @@ jobs:
             exit 0
           fi
           # The checked-out commit is the PR merged into its base: its first parent is that base.
-          files=$(git diff --name-only HEAD^1 HEAD)
+          # --no-renames: a rename lists its old path too (moving docs/traceability.md must run the tests).
+          files=$(git diff --name-only --no-renames HEAD^1 HEAD)
           echo "changed files:"; echo "$files"
-          others=$(printf '%s\n' "$files" | grep -v '^$' \
-            | grep -vE '^docs/|^[^/]+\.md$|^mockup/.+\.md$|^\.github/pull_request_template\.md$' || true)
-          others="$others$(printf '%s\n' "$files" | grep -E '^PRD\.md$|^docs/traceability\.md$' || true)"
-          if [ -n "$files" ] && [ -z "$others" ]; then
-            echo "documentation only: the test and e2e shards are skipped"
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+          docs_only=$(printf '%s\n' "$files" | bash scripts/ci/docs-only.sh)
+          [ "$docs_only" = true ] && echo "documentation only: the test and e2e shards are skipped"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
   lint:
     runs-on: ubuntu-latest
@@ -90,7 +84,7 @@ jobs:
       # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
       # ~150 kB/s, minutes). Keyed on the Playwright version and the runner OS — not the image build, which differs
       # between the runners of one run.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cache/ms-playwright
@@ -170,7 +164,7 @@ jobs:
       # The browser and the system packages' .deb files (the fonts: 22 MB that some runners' apt mirror serves at
       # ~150 kB/s, minutes). Keyed on the Playwright version and the runner OS — not the image build, which differs
       # between the runners of one run.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cache/ms-playwright
