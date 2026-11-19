@@ -1,5 +1,280 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`cleanReport: the review corpus (#212) > cleans all 23 inputs as approved in review round 9 1`] = `
+[
+  {
+    "body": "검증된 사실이다[1].",
+    "input": "근거 없는 결론이다.검증된 사실이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "본문이다[1].",
+    "input": "## 수출이 50% 늘었다.
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "코드 속 \`a[1]\`도 아니다.",
+    "numbering": [],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "근거 없는 주장 [참고](/자료/[1])",
+    "numbering": [],
+    "removed": 1,
+  },
+  {
+    "body": "## 검증된 사실이다[1].
+
+본문이다[1].",
+    "input": "## 근거 없는 결론이다. 검증된 사실이다[1].
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "수출이 늘었다. [1]",
+    "input": "수출이 늘었다. [1] 수입도 늘었다.",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "## 수출이 32% 늘었다[1]
+
+근거 없는 본문이다.",
+    "numbering": [],
+    "removed": 1,
+  },
+  {
+    "body": "## 증가 원인
+
+본문이다[1].",
+    "input": "## 수출이 늘었다. 증가 원인
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "근거 없는 주장 <https://example.org/ref/[1]>.",
+    "numbering": [],
+    "removed": 1,
+  },
+  {
+    "body": "수출이 늘었다[1].",
+    "input": "수출이 늘었다[1]. [2](https://example.org)에서 주장했다.",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "링크를 설명하는 구문은 \`[이름](\`이다[1].",
+    "input": "링크를 설명하는 구문은 \`[이름](\`이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 0,
+  },
+  {
+    "body": "수출이 늘었다[1].",
+    "input": "수출이 늘었다[1].[2](https://example.org)에서 주장했다.",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "## 2026년 통계[1]
+
+본문이다[1].",
+    "input": "## “수출이 줄었다.” 2026년 통계[1]
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "## 증가 원인
+
+본문이다[1].",
+    "input": "## (수출이 줄었다.) 증가 원인
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "## 증가 원인
+
+본문이다[1].",
+    "input": "증가 원인
+---
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 0,
+  },
+  {
+    "body": "**증가 원인**
+
+본문이다[1].",
+    "input": "**수출이 늘었다. 증가 원인**
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "## 전력 시장(공급과 수요)
+
+본문이다[1].",
+    "input": "## 전력 시장(공급과 수요)
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 0,
+  },
+  {
+    "body": "## 수출 동향(개요)
+
+본문이다[1].",
+    "input": "## 수출 동향(개요)
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 0,
+  },
+  {
+    "body": "**증가 원인**:
+
+본문이다[1].",
+    "input": "**증가 원인**:
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 0,
+  },
+  {
+    "body": "## 증가 원인
+
+본문이다[1].",
+    "input": "## ~~2026년 수출이 줄었다.~~ 증가 원인
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "본문이다[1].",
+    "input": "## [2026년 수출이 줄었다.](https://example.org/2026)
+
+본문이다[1].",
+    "numbering": [
+      {
+        "from": 1,
+        "to": 1,
+      },
+    ],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "링크 속 표시는 인용이 아니다 [1](https://example.test).",
+    "numbering": [],
+    "removed": 1,
+  },
+  {
+    "body": "",
+    "input": "근거 없는 문장이다. 다음도 무인용이다.",
+    "numbering": [],
+    "removed": 2,
+  },
+]
+`;
+
 exports[`the step prompts (versioned like the system instructions) > has every prompt with its header, numbers filled in 1`] = `
 {
   "plan": "plan@2",

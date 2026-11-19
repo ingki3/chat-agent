@@ -399,3 +399,42 @@ describe("the step prompts (versioned like the system instructions)", () => {
     expect(stepPrompt(p, "writer")).toMatchSnapshot();
   });
 });
+
+/**
+ * The report inputs of review rounds 1–8 (#212, the corpus of Codex's 8th and 9th rounds, in their order), `[1]` and
+ * `[2]` both verified: what the cleaning makes of each today — body, removed count, numbering — kept as a snapshot,
+ * so any change of the rules shows here.
+ */
+const REVIEW_CORPUS: readonly string[] = [
+  "근거 없는 결론이다.검증된 사실이다[1].",
+  "## 수출이 50% 늘었다.\n\n본문이다[1].",
+  "코드 속 `a[1]`도 아니다.",
+  "근거 없는 주장 [참고](/자료/[1])",
+  "## 근거 없는 결론이다. 검증된 사실이다[1].\n\n본문이다[1].",
+  "수출이 늘었다. [1] 수입도 늘었다.",
+  "## 수출이 32% 늘었다[1]\n\n근거 없는 본문이다.",
+  "## 수출이 늘었다. 증가 원인\n\n본문이다[1].",
+  "근거 없는 주장 <https://example.org/ref/[1]>.",
+  "수출이 늘었다[1]. [2](https://example.org)에서 주장했다.",
+  "링크를 설명하는 구문은 `[이름](`이다[1].",
+  "수출이 늘었다[1].[2](https://example.org)에서 주장했다.",
+  "## “수출이 줄었다.” 2026년 통계[1]\n\n본문이다[1].",
+  "## (수출이 줄었다.) 증가 원인\n\n본문이다[1].",
+  "증가 원인\n---\n\n본문이다[1].",
+  "**수출이 늘었다. 증가 원인**\n\n본문이다[1].",
+  "## 전력 시장(공급과 수요)\n\n본문이다[1].",
+  "## 수출 동향(개요)\n\n본문이다[1].",
+  "**증가 원인**:\n\n본문이다[1].",
+  "## ~~2026년 수출이 줄었다.~~ 증가 원인\n\n본문이다[1].",
+  "## [2026년 수출이 줄었다.](https://example.org/2026)\n\n본문이다[1].",
+  "링크 속 표시는 인용이 아니다 [1](https://example.test).",
+  "근거 없는 문장이다. 다음도 무인용이다.",
+];
+
+describe("cleanReport: the review corpus (#212)", () => {
+  it("cleans all 23 inputs as approved in review round 9", () => {
+    const cites = new Map([cite(1), cite(2)]);
+    expect(REVIEW_CORPUS).toHaveLength(23);
+    expect(REVIEW_CORPUS.map((input) => ({ input, ...cleanReport(input, cites) }))).toMatchSnapshot();
+  });
+});
