@@ -3,6 +3,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   loadResearchPrompts,
+  notesBlock,
   parseGaps,
   parseNotes,
   parsePlan,
@@ -113,6 +114,36 @@ describe("cleanReport", () => {
     expect(isTopicLabel("수출 증가의 배경")).toBe(true);
     expect(isTopicLabel("수출이 늘었다")).toBe(false);
     expect(isTopicLabel("2026년 10월")).toBe(false);
+  });
+
+  it("keeps a marker written after a space on the sentence it ends (review 2)", () => {
+    const r = cleanReport("수출이 늘었다. [1] 수입도 늘었다.", new Map([cite(1)]));
+    expect(r).toMatchObject({ removed: 1, body: "수출이 늘었다. [1]" });
+  });
+
+  it("checks every sentence of a heading, and a marker only in a link's address is none", () => {
+    const r = cleanReport(
+      [
+        "## 근거 없는 결론이다. 검증된 사실이다[1].",
+        "",
+        "근거 없는 주장 [참고](/자료/[1]).",
+        "본문이다[1].",
+      ].join("\n"),
+      new Map([cite(1)]),
+    );
+    expect(r.removed).toBe(2);
+    expect(r.body).toBe("## 검증된 사실이다[1].\n\n본문이다[1].");
+  });
+
+  it("numbers markers only once the body is final: a cited heading over an emptied section leaves no number", () => {
+    const r = cleanReport("## 수출이 32% 늘었다[1]\n\n근거 없는 본문이다.", new Map([cite(1)]));
+    expect(r).toEqual({ body: "", removed: 1, numbering: [] });
+  });
+
+  it("gives the writer each file note's verified place", () => {
+    const block = notesBlock([{ id: "n1", claim: "c", quote: "q", fileId: "f", page: 3, place: "3쪽" }]);
+    expect(block).toContain('"page":3');
+    expect(block).toContain('"place":"3쪽"');
   });
 
   it("keeps a factual heading that has a verified marker", () => {

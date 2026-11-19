@@ -21,7 +21,13 @@ import {
 } from "../src/runtime/adapter.js";
 import { fixtureWebWorker, FIXTURE_PAGES } from "../src/runtime/fake-citations.js";
 import { RESEARCH_FIXTURE } from "../src/runtime/fake-research.js";
-import { defaultScript, FakeRuntime, type FakeScript, type FakeStep } from "../src/runtime/fake.js";
+import {
+  defaultScript,
+  FakeRuntime,
+  releaseGate,
+  type FakeScript,
+  type FakeStep,
+} from "../src/runtime/fake.js";
 import { createFamily, shareWithShared } from "./helpers/permission-matrix.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 
@@ -780,6 +786,92 @@ describe("깊이 조사: review 1 (#212)", () => {
     const done = await statusIs(app, id, "done");
     expect(done.endedAt! - approvedAt).toBeLessThanOrEqual(30 * MIN);
     expect(JSON.parse(done.result!)).toMatchObject({ fallback: true, timedOut: true });
+  });
+
+  it("closes a step's session at its timeout, also when its events wait for that close (review 2)", async () => {
+    const clock = new ManualClock();
+    let closed = 0;
+    const inner = new FakeRuntime({
+      runTools: true,
+      script: scripted((x) => (x.startsWith(TURN_MARK.subagent) ? slowNotes() : undefined)),
+    });
+    class ClosesOnly extends Counting {
+      override async start(ctx: StartContext): Promise<RuntimeSession> {
+        const s = await super.start(ctx);
+        if (!ctx.systemPrompt.includes("보고서 작성자")) return s;
+        let release!: () => void;
+        const gone = new Promise<void>((r) => (release = r));
+        return {
+          ...s,
+          close: async () => {
+            closed++;
+            release();
+          },
+          turn: (input) => {
+            this.turns.push(input.text);
+            return {
+              events: (async function* (): AsyncGenerator<RuntimeEvent> {
+                await gone;
+                yield* [];
+              })(),
+              interrupt: async () => {},
+            };
+          },
+        };
+      }
+    }
+    const adapter = new ClosesOnly(inner);
+    const runtimes = new RuntimeRegistry();
+    runtimes.register(adapter);
+    const app = await buildApp(loadConfig({ NODE_ENV: "test" }), {
+      db: createTestDb(),
+      logger: false,
+      runtimes,
+      runs: { flushMs: 0 },
+      web: { worker: fixtureWebWorker(), fetchProxy: stubProxy as never, providers: ["duckduckgo"] },
+      mcp: { skills: [SELFTEST_SKILL], egress: () => stubProxy as never },
+      research: { clock },
+    });
+    closers.push(() => app.close());
+    await app.ready();
+    const f = await createFamily(app);
+    const c = app.conversations!.create(f.users.owner.id);
+    const job = app.research!.start({
+      conversationId: c.id,
+      userId: f.users.owner.id,
+      text: "10월 반도체 수출",
+    }).row;
+    await statusIs(app, job.id, "awaiting_approval");
+    app.research!.approve(job.id, f.users.owner.id);
+    await until(() => adapter.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    clock.advance(8 * MIN);
+    await statusIs(app, job.id, "done");
+    expect(closed).toBe(1);
+  });
+
+  it("opens no further Claude step once the conversation is switched to Codex mid-run (review 2)", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) ? [{ gate: "switch-hold" }] : undefined,
+    );
+    const t = await start({ script });
+    const { conversationId, job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const subQuestions = Array.from({ length: 4 }, (_, i) => ({ question: `측면 ${i + 1}`, scope: "web" }));
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, { subQuestions });
+    await until(() => t.counting.active === 3, "three running sub-researchers");
+    t.app.conversations!.setSettings(conversationId, {
+      runtime: "codex",
+      model: "fake-large",
+      effort: null,
+      useShared: false,
+    });
+    // The running ones finish; no fourth sub-researcher, no reflection, no writer.
+    releaseGate("switch-hold");
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_changed");
+    const asked = t.counting.turns.filter((x) => !x.startsWith(TURN_MARK.plan));
+    expect(asked.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(3);
+    expect(asked.filter((x) => !x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
   });
 
   it("keeps a sub-researcher to its own tools at our MCP server (a cite call is refused there)", async () => {

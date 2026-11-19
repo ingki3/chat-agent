@@ -1087,6 +1087,8 @@ export class McpService {
           });
         return shown;
       },
+      // A 깊이 조사 step's own limits (#211) for the tools the MCP package answers itself (`echo_time`).
+      mayCall: (tool, scope) => !this.tokens.take(scope.runId, tool),
       onToolCall: (tool, scope, ok) => {
         if (ok) this.watched.get(scope.runId)?.add(tool);
       },

@@ -692,10 +692,25 @@ export class ResearchEngine {
     const plan = planOf(row);
     if (!plan || row.approvedAt === null || row.deadlineAt === null)
       return void this.fail(row.id, "runtime_error", live);
-    const ctx = this.stepCtx(row);
-    if (typeof ctx === "string") return void this.fail(row.id, ctx, live);
+    const first = this.stepCtx(row);
+    if (typeof first === "string") return void this.fail(row.id, first, live);
     const state = stateOf(row);
+    // A checkpoint from before the approved scopes were kept: restored from the approved plan.
+    state.scopes ??= approvedScopes(plan.subQuestions.map((q) => q.scope));
     const files = this.files(row);
+    /**
+     * Every new step looks again (review 2): the conversation switched to Codex (or the connection gone) while the job
+     * ran ends it — no further Claude step opens.
+     */
+    let ended: ResearchErrorCode | undefined;
+    const fresh = (): RunCtx | undefined => {
+      if (ended) return undefined;
+      const c = this.stepCtx(this.get(row.id) ?? row);
+      if (typeof c !== "string") return c;
+      ended = c;
+      stage.abort();
+      return undefined;
+    };
     const researchEnd = Math.min(
       row.approvedAt + this.limits.researchMs,
       row.deadlineAt - this.limits.writeMs - this.limits.wrapUpMs,
@@ -714,6 +729,8 @@ export class ResearchEngine {
         if (waiting.length && this.clock.now() < researchEnd && !signal.aborted)
           await pool(waiting, this.limits.concurrency, async (q) => {
             if (signal.aborted) return;
+            const ctx = fresh();
+            if (!ctx) return;
             q.status = "running";
             persist();
             const r = await this.step(row, ctx, {
@@ -742,6 +759,7 @@ export class ResearchEngine {
             if (r.ended === "failed") error ??= r.error;
             persist();
           });
+        if (ended) return void this.fail(row.id, ended, live);
         if (live.abort.signal.aborted) return;
         if (signal.aborted || this.clock.now() >= researchEnd) {
           // Cut by the cap (or the research budget): what was not finished is marked, the report says so.
@@ -753,6 +771,8 @@ export class ResearchEngine {
         // Not enough time for another round: straight to writing (the forced wrap-up).
         if (researchEnd - this.clock.now() < this.limits.minRoundMs) break;
         const notes = allNotes(state);
+        const ctx = fresh();
+        if (!ctx) return void this.fail(row.id, ended!, live);
         const r = await this.step(row, ctx, {
           name: `reflect${state.round}`,
           prompt: "reflect",
@@ -836,8 +856,10 @@ export class ResearchEngine {
               quote: c.quote,
               fileId: f.id,
               title: f.name,
-              // The verified place (the check may have found it on another page than the model said).
+              // The verified place (the check may have found it on another page than the model said), and its page
+              // for the writer's `file_cite` (which looks there first).
               ...(placeOf(c.locator) ? { place: placeOf(c.locator) } : {}),
+              ...(pageOf(c.locator) !== undefined ? { page: pageOf(c.locator) } : {}),
             };
         }
       } catch {
@@ -1156,4 +1178,12 @@ function placeOf(locator: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** A verified file passage's unit number for `file_cite`'s `page` (a page, a slide, a line …), if it has one. */
+function pageOf(locator: unknown): number | undefined {
+  if (!locator || typeof locator !== "object") return undefined;
+  const l = locator as { page?: unknown; slide?: unknown; line?: unknown };
+  const v = l.page ?? l.slide ?? l.line;
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }

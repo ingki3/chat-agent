@@ -82,6 +82,16 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
   // (`deps.track`) and whatever it sends later goes nowhere (#211 review 1).
   let stopped!: () => void;
   const stoppedNow = new Promise<"stopped">((r) => (stopped = () => r("stopped")));
+  // Closed once, by whoever comes first: the stop itself (a runtime whose events wait for the close), or the end of the
+  // work. A session that opens after the stop is closed as soon as it exists.
+  let closing: Promise<void> | undefined;
+  const closeSession = () => {
+    if (!session) return Promise.resolve();
+    closing ??= Promise.resolve()
+      .then(() => session!.close())
+      .catch(() => {});
+    return closing;
+  };
   const stop = (why: StepEnd) => {
     if (ended) return;
     ended = why;
@@ -93,6 +103,7 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
     } catch {
       // the adapter threw synchronously: the step has ended anyway
     }
+    void closeSession();
     stopped();
   };
   const cancelTimer = deps.clock.timer(spec.ms, () => stop("timeout"));
@@ -133,7 +144,10 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
         },
       });
       startedId = session.externalSessionId;
-      if (ended) return snapshot();
+      if (ended) {
+        void closeSession();
+        return snapshot();
+      }
       turn = session.turn({ text: spec.text, model: spec.model, effort: spec.effort ?? undefined });
       for await (const ev of turn.events) {
         if (ended) break;
@@ -171,7 +185,7 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
       cancelTimer();
       spec.signal.removeEventListener("abort", onJobAbort);
       deps.mcpTokens.revokeRun(spec.stepId);
-      if (session) await session.close().catch(() => {});
+      await closeSession();
       if (startedId)
         deps.forgetSession?.({
           conversationId: "",

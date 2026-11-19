@@ -124,6 +124,8 @@ export function notesBlock(notes: readonly ResearchNote[]): string {
       ...(n.sourceId ? { sourceId: n.sourceId } : {}),
       ...(n.fileId ? { fileId: n.fileId } : {}),
       ...(n.page !== undefined ? { page: n.page } : {}),
+      // The verified place of a file passage: the writer's `file_cite` looks there first (its `page`).
+      ...(n.place ? { place: n.place } : {}),
       ...(n.title ? { title: n.title } : {}),
     }),
   );

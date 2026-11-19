@@ -60,16 +60,53 @@ export function isTopicLabel(t: string): boolean {
 
 type Block = { text: string; level: number; item: boolean };
 
+/** Where a marker stands inside a link's destination (`[참고](/자료/[1])`): never a citation. */
+function linkDestinations(src: string): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  for (let i = src.indexOf("]("); i !== -1; i = src.indexOf("](", i + 2)) {
+    let depth = 0;
+    let j = i + 1;
+    for (; j < src.length && src[j] !== "\n"; j++) {
+      if (src[j] === "(") depth++;
+      else if (src[j] === ")" && --depth === 0) break;
+    }
+    out.push({ start: i + 2, end: j });
+  }
+  return out;
+}
+
+/**
+ * The sentences of one line (`sentenceSpans`), with the markers a sentence ends with kept on it also after a space:
+ * `수출이 늘었다. [1] 수입도 늘었다.` — `[1]` cites the first sentence, not the second.
+ */
+function lineSentences(t: string): { start: number; end: number }[] {
+  const spans = sentenceSpans(t).map((r) => ({ ...r }));
+  for (let i = 1; i < spans.length; i++) {
+    const lead = /^(?:[ \t]*\[\d{1,3}\])+/.exec(t.slice(spans[i]!.start, spans[i]!.end));
+    if (!lead) continue;
+    spans[i - 1]!.end = spans[i]!.start + lead[0].length;
+    const rest = t.slice(spans[i]!.start + lead[0].length, spans[i]!.end);
+    spans[i]!.start = spans[i]!.end - rest.trimStart().length;
+  }
+  return spans.filter((r) => t.slice(r.start, r.end).trim());
+}
+
+/** A kept marker, held as its old number until the body is final (`\u0000n\u0000`). */
+// eslint-disable-next-line no-control-regex -- a NUL can never be in the cleaned text (it is stripped first)
+const HELD = /\u0000(\d{1,3})\u0000/g;
+
 export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitation>): CleanResult {
-  const src = text.replace(/\r\n?/g, "\n");
+  // eslint-disable-next-line no-control-regex -- NUL marks the held markers below: never one of the writer's own
+  const src = text.replace(/\r\n?/g, "\n").replace(/\u0000/g, "");
   const units = citationUnits(src);
-  const markers = citationMarkers(src, units);
+  const links = linkDestinations(src);
+  const markers = citationMarkers(src, units).filter(
+    (m) => !links.some((l) => m.start >= l.start && m.start < l.end),
+  );
   const ok = (m: CitationMarker) => cites.get(m.n)?.verified === true;
   const within = (start: number, end: number) => markers.filter((m) => m.start >= start && m.end <= end);
   const backed = (start: number, end: number) => within(start, end).some(ok);
-  const map = new Map<number, number>();
-  const numbering: CleanResult["numbering"] = [];
-  /** The range with its verified markers numbered anew (once each) and every other marker taken out. */
+  /** The range with its verified markers held (once each) and every other marker taken out. */
   const emit = (start: number, end: number) => {
     let out = "";
     let at = start;
@@ -79,13 +116,7 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       at = m.end;
       if (!ok(m) || seen.has(m.n)) continue;
       seen.add(m.n);
-      let k = map.get(m.n);
-      if (k === undefined) {
-        k = map.size + 1;
-        map.set(m.n, k);
-        numbering.push({ from: m.n, to: k });
-      }
-      out += `[${k}]`;
+      out += `\u0000${m.n}\u0000`;
     }
     out += src.slice(at, end);
     return out
@@ -94,6 +125,16 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       .trim();
   };
   let removed = 0;
+  /** The sentences of `[from, to)` that a verified marker backs; the others are counted as removed. */
+  const keptSentences = (from: number, to: number) => {
+    const kept: string[] = [];
+    const t = src.slice(from, to);
+    for (const r of lineSentences(t)) {
+      if (backed(from + r.start, from + r.end)) kept.push(emit(from + r.start, from + r.end));
+      else removed++;
+    }
+    return kept;
+  };
   const blocks: Block[] = [];
   for (const u of units) {
     if (u.inline || u.kind === "rule") continue;
@@ -110,13 +151,16 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     if (u.kind === "heading") {
       const h = /^(#{1,6})[ \t]+/.exec(raw);
       const level = h ? h[1]!.length : 7;
-      const words = raw.slice(h?.[0].length ?? 0);
-      if (!isTopicLabel(words) && !backed(u.start, u.end)) {
-        removed++;
-        continue;
-      }
       const at = u.start + (h?.[0].length ?? 0);
-      const shown = isTopicLabel(words) ? words.replace(/\[\d{1,3}\]/g, "").trim() : emit(at, u.end);
+      const words = src.slice(at, u.end);
+      // A topic label stays as it is; a heading that states something is checked sentence by sentence.
+      let shown: string;
+      if (isTopicLabel(words)) shown = words.replace(/\[\d{1,3}\]/g, "").trim();
+      else {
+        const kept = keptSentences(at, u.end);
+        if (!kept.length) continue;
+        shown = kept.join(" ");
+      }
       // The report's own title is the server's: a level-1 heading of the writer's becomes a section.
       blocks.push({
         text: h ? `${level === 1 ? "##" : h[1]} ${shown}` : shown,
@@ -133,17 +177,7 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     let lineStart = from;
     for (const line of src.slice(from, u.end).split("\n")) {
       const prefix = LINE_PREFIX.exec(line)![0];
-      const restStart = lineStart + prefix.length;
-      const kept: string[] = [];
-      for (const r of sentenceSpans(line.slice(prefix.length))) {
-        const s0 = restStart + r.start;
-        const s1 = restStart + r.end;
-        if (!backed(s0, s1)) {
-          removed++;
-          continue;
-        }
-        kept.push(emit(s0, s1));
-      }
+      const kept = keptSentences(lineStart + prefix.length, lineStart + line.length);
       if (kept.length) lines.push(prefix + kept.join(" "));
       lineStart += line.length + 1;
     }
@@ -151,14 +185,27 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
       blocks.push({
         text: lines.join("\n"),
         level: 0,
-        item: !!/^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]/.test(lines[0]!),
+        item: /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]/.test(lines[0]!),
       });
   }
+  // The body is final first (empty sections gone); only then are its markers numbered — no number of a dropped heading.
   const shown = dropEmptySections(blocks);
-  const body = shown
+  const held = shown
     .map((b, i) => (i === 0 ? "" : b.item && shown[i - 1]!.item ? "\n" : "\n\n") + b.text)
     .join("")
     .trim();
+  const map = new Map<number, number>();
+  const numbering: CleanResult["numbering"] = [];
+  const body = held.replace(HELD, (_m, d: string) => {
+    const n = Number(d);
+    let k = map.get(n);
+    if (k === undefined) {
+      k = map.size + 1;
+      map.set(n, k);
+      numbering.push({ from: n, to: k });
+    }
+    return `[${k}]`;
+  });
   return { body, removed, numbering };
 }
 
