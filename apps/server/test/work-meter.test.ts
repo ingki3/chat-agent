@@ -31,6 +31,45 @@ describe("meterWork", () => {
     expect(loop(8_000) / loop(1_000)).toBeLessThan(10);
   });
 
+  it("lastIndexOf from a position, and an array's includes: what they passed over, each element read once", () => {
+    // Review #217 2차 (P3): from position 0 the search ends at the first character.
+    expect(meterWork(() => void text.lastIndexOf("a", 0))).toBeLessThanOrEqual(3);
+    expect(meterWork(() => void text.lastIndexOf("a"))).toBeLessThanOrEqual(3);
+    expect(meterWork(() => void text.lastIndexOf("b"))).toBeGreaterThanOrEqual(text.length);
+    const loop = (n: number) => {
+      const s = "a".repeat(n);
+      return meterWork(() => {
+        for (let i = 0; i < n; i++) s.lastIndexOf("a", 0);
+      });
+    };
+    expect(loop(8_000) / loop(1_000)).toBeLessThan(10);
+    // SameValueZero and holes, as the built-in: found at the first element, charged so.
+    const nan = [NaN, ...Array.from({ length: 10_000 }, () => 1)];
+    const holes = new Array<number>(10_000);
+    let found = false;
+    expect(meterWork(() => void (found = nan.includes(NaN)))).toBeLessThanOrEqual(3);
+    expect(found).toBe(true);
+    expect(
+      meterWork(() => void (found = holes.includes(undefined as unknown as number))),
+    ).toBeLessThanOrEqual(3);
+    expect(found).toBe(true);
+    expect(meterWork(() => void (found = [0].includes(-0)))).toBeLessThanOrEqual(3);
+    expect(found).toBe(true);
+    expect(meterWork(() => void (found = [1, 2, 3].includes(2, -1)))).toBeLessThanOrEqual(3);
+    expect(found).toBe(false);
+    // Each element read once (a getter runs once, as without the meter).
+    let reads = 0;
+    const arr = [1, 2, 3];
+    Object.defineProperty(arr, 0, {
+      get() {
+        reads++;
+        return 1;
+      },
+    });
+    meterWork(() => void arr.includes(1));
+    expect(reads).toBe(1);
+  });
+
   it("iterating a string or an array is charged a step each — spreading, for…of, Array.from", () => {
     // Review #217 (P2): `[...s]` copies the whole text as surely as `Array.from(s)` does.
     expect(meterWork(() => void [...text])).toBeGreaterThanOrEqual(text.length);
@@ -47,6 +86,24 @@ describe("meterWork", () => {
         for (const [i] of arr.entries()) void i;
       }),
     ).toBeGreaterThanOrEqual(arr.length);
+  });
+
+  it("an iterator stays the engine's own: its helpers are there, and their steps are counted", () => {
+    // Review #217 2차 (P3): a stand-in object lost `take`, `map`, `toArray`…
+    const outside = typeof [].values().take;
+    let inside = "";
+    let taken: number[] = [];
+    const arr = Array.from({ length: 10_000 }, (_, i) => i);
+    const w = meterWork(() => {
+      inside = typeof [].values().take;
+      const it = arr.values() as unknown as { take?: (n: number) => { toArray(): number[] } };
+      if (it.take) taken = it.take(3).toArray();
+    });
+    expect(inside).toBe(outside);
+    if (outside === "function") {
+      expect(taken).toEqual([0, 1, 2]);
+      expect(w).toBeLessThan(20);
+    }
   });
 
   it("puts every built-in back, also when the call throws", () => {

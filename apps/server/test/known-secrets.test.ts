@@ -730,6 +730,13 @@ describe("round 25: scrubber", () => {
     for (const [what, text] of [
       ["the secret itself", (n: number) => "a".repeat(n)],
       ["only ever a prefix", (n: number) => "a".repeat(n - 1) + "b ordinary prose data banana"],
+      // The encoded passes on their own repeated prefix (review #217 2차): all of the hex or base64 but its last
+      // characters, then a mismatch — compared from every start, those passes alone are 64×.
+      ["hex, all but its end", (n: number) => Buffer.from("a".repeat(n)).toString("hex").slice(0, -5) + "!"],
+      [
+        "base64, all but its end",
+        (n: number) => Buffer.from("a".repeat(n)).toString("base64").slice(0, -5) + "!",
+      ],
     ] as const) {
       const work = (n: number) => {
         const r = new KnownSecrets();

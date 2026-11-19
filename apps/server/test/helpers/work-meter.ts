@@ -27,7 +27,6 @@ export function meterWork(fn: () => void): number {
   let work = 0;
   const restore: (() => void)[] = [];
   const strIndexOf = String.prototype.indexOf;
-  const arrIndexOf = Array.prototype.indexOf;
   const replace = (
     owner: object,
     key: PropertyKey,
@@ -56,22 +55,23 @@ export function meterWork(fn: () => void): number {
           return result;
         },
     );
-  // An iterator whose every step is counted.
+  // The native iterator, its own `next` counting each step: still the engine's object, so everything on its
+  // prototype (`take`, `map`, `toArray`, … — review #217 2차) is there and goes through the counted `next`.
   const counted = (orig: (...a: unknown[]) => unknown) =>
     function (this: unknown) {
       const it = Reflect.apply(orig, this, []) as Iterator<unknown>;
+      const next = it.next;
       work++;
-      const step: IterableIterator<unknown> = {
-        next() {
-          const r = it.next();
+      Object.defineProperty(it, "next", {
+        configurable: true,
+        writable: true,
+        value: function (this: Iterator<unknown>) {
+          const r = Reflect.apply(next, this, []) as IteratorResult<unknown>;
           if (!r.done) work++;
           return r;
         },
-        [Symbol.iterator]() {
-          return step;
-        },
-      };
-      return step;
+      });
+      return it;
     };
   const len = (x: unknown) =>
     x != null && typeof (x as { length?: unknown }).length === "number"
@@ -119,7 +119,13 @@ export function meterWork(fn: () => void): number {
       const needle = String(args[0]);
       return searched(len(s), at, Reflect.apply(strIndexOf, s, [needle, at]) as number, len(needle));
     });
-    wrap(S, "lastIndexOf", (s: string, _a, r: number) => (r >= 0 ? len(s) - r : len(s)));
+    // Backwards from `position` (the end when there is none): to the match, or to the start on a miss.
+    wrap(S, "lastIndexOf", (s: string, args, r: number) => {
+      const p = Number(args[1]);
+      const start = Number.isNaN(p) ? len(s) : Math.max(0, Math.min(len(s), Math.trunc(p)));
+      const needle = len(String(args[0]));
+      return r >= 0 ? start - r + needle : Math.min(len(s), start + needle);
+    });
     for (const name of ["startsWith", "endsWith"]) wrap(S, name, (_s, args) => len(String(args[0])));
     for (const name of ["charCodeAt", "codePointAt", "charAt", "at"]) wrap(S, name, () => 1);
     replace(S, Symbol.iterator, counted);
@@ -130,10 +136,25 @@ export function meterWork(fn: () => void): number {
     wrap(A, "indexOf", (self: unknown[], args, r: number) =>
       searched(len(self), startOf(len(self), args[1], true), r, 1),
     );
-    wrap(A, "includes", (self: unknown[], args) => {
-      const at = startOf(len(self), args[1], true);
-      return searched(len(self), at, Reflect.apply(arrIndexOf, self, [args[0], at]) as number, 1);
-    });
+    // `includes` done here, one read an element (review #217 2차: searching again with `indexOf` read each element
+    // twice — a getter ran twice — and missed `NaN` and holes): SameValueZero, a hole read as `undefined`.
+    replace(
+      A,
+      "includes",
+      () =>
+        function (this: unknown, x: unknown, pos?: unknown) {
+          const o = Object(this) as ArrayLike<unknown>;
+          const n = Math.min(Math.max(Math.trunc(Number(o.length)) || 0, 0), Number.MAX_SAFE_INTEGER);
+          work++;
+          if (n === 0) return false;
+          for (let i = startOf(n, pos, true); i < n; i++) {
+            work++;
+            const v = o[i];
+            if (v === x || (v !== v && x !== x)) return true;
+          }
+          return false;
+        },
+    );
     // The whole array (an early exit is not credited).
     for (const name of [
       "splice",
