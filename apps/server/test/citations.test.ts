@@ -2194,6 +2194,30 @@ describe("citationNote", () => {
       ).toEqual(["회의 시간은 9시:", "오전 30분이에요."]);
     });
 
+    it("review 9차: a card stays between parts across blank parts and tool rows; only H:MM is a time", () => {
+      const card: MessagePart = { type: "artifact_ref", artifactId: "a1" };
+      expect(
+        missingOf([
+          ...read("a"),
+          ...text("올해 정원은 30명"),
+          card,
+          ...text(" "),
+          ...read("b"),
+          ...text("주요 전형은 다음과 같아요[1]:\n\n- 학종 위주예요"),
+        ]),
+      ).toEqual(["올해 정원은 30명", "- 학종 위주예요"]);
+      // `변경안 2:` then `2027학년도…`: not a time — a stop.
+      expect(
+        missingOf([...read("a"), ...text("변경안 2:"), ...read("b"), ...text("2027학년도부터 적용돼요[1].")]),
+      ).toEqual(["변경안 2:"]);
+      // H:MM and HH:MM are times: one paragraph.
+      for (const [a, b] of [
+        ["회의는 9:", "30에 시작해요[1]."],
+        ["회의는 09:", "30에 시작해요[1]."],
+      ] as const)
+        expect(missingOf([...read("a"), ...text(a), ...read("b"), ...text(b)]), a).toEqual([]);
+    });
+
     it("a table is covered by a marker in it, its caption or the sentence right before it", () => {
       const table = "| a | b |\n|---|---|\n| 1 | 2 |";
       for (const t of [

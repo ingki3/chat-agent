@@ -84,14 +84,17 @@ export function textPartStarts(parts: readonly MessagePart[]): number[] {
 export function shownBetweenParts(parts: readonly MessagePart[]): Set<number> {
   const out = new Set<number>();
   let at = 0;
+  // Something shown since the last text with words (review 9차: blank parts and tool rows after a card keep it).
   let shown = false;
   let seenText = false;
   for (const p of parts) {
     if (p.type === "text") {
-      if (seenText && shown) out.add(at);
+      if (p.text.trim()) {
+        if (seenText && shown) out.add(at);
+        seenText = true;
+        shown = false;
+      }
       at += p.text.length;
-      seenText = true;
-      shown = false;
     } else if (!UNSEEN.has(p.type)) shown = true;
   }
   return out;
