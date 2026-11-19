@@ -341,10 +341,11 @@ describe("preview and apply (FR-15.2, 15.3, acceptance 13)", () => {
     const s = sync((await a.apply({ revision: p.revision, final: p.final })).body);
     expect(s).toMatchObject({ status: "failed", errorCode: "cf_rate_limited" });
     expect(s.retryAt).not.toBeNull();
-    for (let i = 0; i < 50 && (await a.overview()).open; i++) await wait(20);
+    // Up to ~5 s for a retry due in 1 s: on a loaded CI runner the poll itself is slow (#219).
+    for (let i = 0; i < 250 && (await a.overview()).open; i++) await wait(20);
     expect((await a.overview()).lastApplied?.added).toEqual([MOM]);
     expect(m.emails()).toContain(MOM);
-  });
+  }, 15_000);
 
   it("a restart in the middle of a write: interrupted, and the retry checks the live list first", async () => {
     const { m, b, admin } = await family();
@@ -684,7 +685,9 @@ describe("review round 1 (#167)", () => {
     // The other admin confirms; a 429 schedules the automatic retry; they are deactivated before it runs.
     const a2 = as(b, admin2);
     p = AccessPreview.parse((await a2.preview()).body);
-    m.failures.push({ method: "PUT", status: 429, retryAfter: "1" });
+    // Retry-After 3 s, not 1: the re-promotion, a sign-in and the deactivation must come before the retry runs, and
+    // on a loaded CI runner they took longer than a second (#219).
+    m.failures.push({ method: "PUT", status: 429, retryAfter: "3" });
     expect(sync((await a2.apply({ revision: p.revision, final: p.final })).body).errorCode).toBe(
       "cf_rate_limited",
     );
@@ -697,12 +700,12 @@ describe("review round 1 (#167)", () => {
     const admin1again = await b.login(ADMIN);
     const admin2Id = b.app.users!.byEmail("admin2@example.com")!.id;
     await b.inject({ method: "POST", url: `/api/admin/users/${admin2Id}/deactivate`, cookie: admin1again });
-    for (let i = 0; i < 50 && (await as(b, admin1again).overview()).open?.errorCode !== "forbidden"; i++)
+    for (let i = 0; i < 350 && (await as(b, admin1again).overview()).open?.errorCode !== "forbidden"; i++)
       await wait(20);
     expect((await as(b, admin1again).overview()).open?.errorCode).toBe("forbidden");
     expect(m.count("PUT", /policies/)).toBe(1);
     expect(m.emails()).not.toContain(MOM);
-  });
+  }, 20_000);
 
   it("P2: a confirm always checks the revision, even when the email list is unchanged", async () => {
     const { m, b, admin } = await family();
