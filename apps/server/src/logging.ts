@@ -125,6 +125,8 @@ export const LOG_EVENTS = [
   "artifact.exported",
   // Render folders the sweep keeps for want of a lock file (#170): a count only — never a path.
   "artifact.render_dirs_kept",
+  // Renders whose processes were not confirmed gone within the reap's bound (#215): a count only; folder and lock kept.
+  "artifact.render_reap_incomplete",
   // Reference export (#26): entry count, `docx` and its fixed `doc_*` code, duration and IDs — never an entry,
   // a title or an address.
   "references.exported",

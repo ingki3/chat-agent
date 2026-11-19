@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -373,25 +373,283 @@ export const unsandboxedLauncher: Launcher = (s) => {
 };
 
 /**
- * Same-uid renders still running in this process: the watchdog's process group (the browser is in it) → the
- * render's folder and lock, and whether the group has been signalled. `killLiveRenders` is the last word on shutdown
- * (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in `index.ts`; the tests' `afterAll`).
+ * Same-uid renders in this process (#170, #215). An entry is **live** from the spawn until the watchdog's exit is
+ * seen — while live, its group id is the watchdog's own pid, not yet reaped, so the group is ours to signal. A render
+ * whose reap was started stays as **reaping** after that, until its processes are confirmed gone (or the bound is
+ * hit). `killLiveRenders` is the last word on shutdown (`closeRenderers` in `export.ts`: `exit`, SIGTERM/SIGINT in
+ * `index.ts`; the tests' `afterAll`): it takes over both kinds.
  */
-const liveRenders = new Map<number, { dir: RenderDir; signalled: boolean }>();
+type RenderEntry = {
+  pgid: number;
+  dir: RenderDir;
+  /** The reap has been started (with the one group SIGKILL, or — after the watchdog's own end — without). */
+  signalled: boolean;
+  /** The watchdog can fork no more: its exit was seen, or a listing showed it a zombie or gone. */
+  leaderGone: boolean;
+  /** The render's `finally` handed the folder over (`releaseRenderDir`): the reap removes it once confirmed. */
+  ownsDir: boolean;
+  /** The reap is over (confirmed, given up, or taken over by shutdown). */
+  over: boolean;
+  timer?: NodeJS.Timeout;
+  /** Told when the reap is over (`renderReaped`). */
+  waiters: (() => void)[];
+  /** What `ps` prints of the watchdog's whole command line (`psEncode`); none when unknown. */
+  cmdline?: string;
+  /** What `ps` prints of the browser executable launched followed by a space, and of its profile switch. */
+  browser?: { prefix: string; token: string };
+};
+const liveRenders = new Map<number, RenderEntry>();
+const reaping = new Set<RenderEntry>();
+/** Folders whose processes were never confirmed gone: kept with their lock (the sweep keeps them while held). */
+const unconfirmed = new WeakSet<RenderDir>();
 
-/** Records a running render; the returned function forgets it (call it once the watchdog has exited). */
-export function trackRender(pgid: number, dir: RenderDir): () => void {
-  const entry = { dir, signalled: false };
+/**
+ * Records a running render — `who`: the watchdog's command line as spawned (`child.spawnargs`) and the browser
+ * executable launched, the two identities of its processes in a listing (#215). The returned function says its
+ * watchdog has exited (call it once, on the exit). A render whose reap never started is then forgotten; one being
+ * reaped stays until its reap is over.
+ */
+export function trackRender(
+  pgid: number,
+  dir: RenderDir,
+  who: { argv?: readonly string[]; browser?: string } = {},
+): () => void {
+  const entry: RenderEntry = {
+    pgid,
+    dir,
+    ...identities(who, dir.workDir),
+    signalled: false,
+    leaderGone: false,
+    ownsDir: false,
+    over: false,
+    waiters: [],
+  };
   liveRenders.set(pgid, entry);
   return () => {
-    if (liveRenders.get(pgid) === entry) liveRenders.delete(pgid);
+    if (liveRenders.get(pgid) !== entry) return;
+    liveRenders.delete(pgid);
+    entry.leaderGone = true;
+    if (entry.signalled && !entry.over) reaping.add(entry);
+  };
+}
+
+/** A process as `ps` lists it. */
+export type RenderProcess = { pid: number; pgid: number; zombie: boolean; args: string };
+
+/** Every process (`ps`, full command lines: a control character in one is printed escaped, never as a new line). */
+const PS_ARGS = ["axww", "-o", "pid=,pgid=,stat=,args="];
+export function parsePs(out: string): RenderProcess[] {
+  const rows: RenderProcess[] = [];
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/.exec(line);
+    if (m) rows.push({ pid: Number(m[1]), pgid: Number(m[2]), zombie: m[3]!.startsWith("Z"), args: m[4]! });
+  }
+  return rows;
+}
+/** A finished `ps` run, as `spawnSync` reports it. */
+export type PsRun = { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stdout: string };
+/**
+ * The rows of a `ps` run — only of a **whole** one: it exited 0, by itself (no signal), with no error (a full buffer is
+ * `ENOBUFS` with status 0 and the tail cut off), and its output ends with a complete line. Anything else is no listing
+ * (undefined): never read as "the group is empty".
+ */
+export function psListing(r: PsRun): RenderProcess[] | undefined {
+  if (r.error || r.signal || r.status !== 0 || typeof r.stdout !== "string" || !r.stdout.endsWith("\n"))
+    return undefined;
+  return parsePs(r.stdout);
+}
+/** `ps` in the C locale (#215): how it prints a byte then does not depend on the server's locale (`psEncode`). */
+const PS_OPTS = { encoding: "utf8" as const, maxBuffer: 64 << 20, env: { LC_ALL: "C", LANG: "C" } };
+const budget = (ms: number) => Math.max(1, Math.ceil(ms));
+/** The listing, within `ms` (the caller's remaining budget); undefined when it failed, was cut or ran out of time. */
+const listSync = (ms: number): RenderProcess[] | undefined => {
+  if (reap.run) return psListing(reap.run(ms));
+  const r = spawnSync("/bin/ps", PS_ARGS, { ...PS_OPTS, timeout: budget(ms) });
+  return psListing({
+    status: r.status,
+    signal: r.signal,
+    ...(r.error ? { error: r.error } : {}),
+    stdout: r.stdout,
+  });
+};
+const listAsync = (ms: number, done: (rows: RenderProcess[] | undefined) => void) => {
+  if (reap.run) return done(psListing(reap.run(ms)));
+  execFile("/bin/ps", PS_ARGS, { ...PS_OPTS, timeout: budget(ms) }, (e, out) =>
+    done(psListing(e ? { status: null, error: e, stdout: String(out ?? "") } : { status: 0, stdout: out })),
+  );
+};
+
+/** The reap's timing (and, tests only, its process list). */
+const reap = {
+  everyMs: 50,
+  forMs: 5000,
+  shutdownMs: 1000,
+  list: undefined as ((ms: number) => RenderProcess[] | undefined) | undefined,
+  /** Tests only: a given `ps` run (what `spawnSync`/`execFile` reported), judged like a real one. */
+  run: undefined as ((ms: number) => PsRun) | undefined,
+};
+/** Tests only: other timing or a given process list; returns the restore. */
+export function setRenderReapForTests(o: Partial<typeof reap>): () => void {
+  const before = { ...reap };
+  Object.assign(reap, o);
+  return () => void Object.assign(reap, before);
+}
+let onIncomplete: ((count: number) => void) | undefined;
+/** Told how many renders were given up on at once (never a path): the app logs it. */
+export function onRenderReapIncomplete(fn: ((count: number) => void) | undefined) {
+  onIncomplete = fn;
+}
+
+/**
+ * Exactly what this platform's `ps` prints of `text` (part of a command line) in the C locale it is run in
+ * (`PS_OPTS`) — one deterministic encoding, compared as plain strings (#215). Undefined on a platform it is not known
+ * for: nothing is then attributed (never signalled).
+ *  - macOS (`/bin/ps`, `vis` in the C locale; checked against the real output for every byte valid UTF-8 can hold):
+ *    printable ASCII as it is (the backslash too); tab and new line as octal (`\011`, `\012`); any other control
+ *    character as `^X`, DEL as `^?`; a byte above 0x7f as `M-x` (its low seven bits printable), `M^X` / `M^?` (a
+ *    control), or `\240` (0xa0).
+ *  - Linux (procps, C locale; checked byte by byte on the CI's Ubuntu): printable ASCII as it is; a new line as a
+ *    space; any other control character and DEL as `.`; a byte above 0x7f as `?`.
+ */
+export function psEncode(text: string, platform: string = process.platform): string | undefined {
+  return psEncodeBytes(Buffer.from(text, "utf8"), platform);
+}
+/** `psEncode` of raw bytes (an argv is bytes; tests check every byte value against the real `ps`). */
+export function psEncodeBytes(bytes: Uint8Array, platform: string = process.platform): string | undefined {
+  if (platform !== "darwin" && platform !== "linux") return undefined;
+  let out = "";
+  for (const b of bytes) {
+    if (b >= 0x20 && b < 0x7f) out += String.fromCharCode(b);
+    else if (platform === "linux") out += b === 0x0a ? " " : b < 0x80 ? "." : "?";
+    else if (b === 0x09 || b === 0x0a) out += `\\0${b.toString(8).padStart(2, "0")}`;
+    else if (b < 0x20) out += `^${String.fromCharCode(b + 0x40)}`;
+    else if (b === 0x7f) out += "^?";
+    else {
+      const m = b & 0x7f;
+      if (m < 0x20) out += `M^${String.fromCharCode(m + 0x40)}`;
+      else if (m === 0x7f) out += "M^?";
+      else if (m === 0x20) out += "\\240";
+      else out += `M-${String.fromCharCode(m)}`;
+    }
+  }
+  return out;
+}
+
+/** A render's two identities as `ps` prints them, worked out once (`trackRender`). */
+function identities(
+  who: { argv?: readonly string[]; browser?: string },
+  workDir: string,
+): Pick<RenderEntry, "cmdline" | "browser"> {
+  const cmdline = who.argv?.length ? psEncode(who.argv.join(" ")) : undefined;
+  const exe = who.browser ? psEncode(who.browser) : undefined;
+  const token = psEncode(`--user-data-dir=${workDir}/profile`);
+  return {
+    ...(cmdline !== undefined ? { cmdline } : {}),
+    ...(exe !== undefined && token !== undefined ? { browser: { prefix: `${exe} `, token } } : {}),
   };
 }
 
 /**
- * SIGKILLs a tracked render's process group (the watchdog's, the browser in it) — **once**: the render's limits,
- * the watchdog's abnormal end and shutdown all come here, and whichever is first sends the one signal. An untracked
- * group (already gone, or forgotten) is never signalled.
+ * Whether a process is provably this render's (#215). `ps` joins argv with spaces, so no single argument can be told
+ * apart in it; two identities only, both as `ps` prints them (`psEncode`) and compared as plain strings:
+ *  - the browser: its command line starts with the executable launched (argv[0]) and a space, and has
+ *    `--user-data-dir=<folder>/profile` as a space-bounded token (the folder is `agentlee-render-XXXXXX`, random);
+ *  - the watchdog and a child it forked before exec: its **whole** command line exactly as it was spawned.
+ * Anything else in the group is unattributed: never signalled (it keeps the reap from completing) — so is anything the
+ * check fails on. What remains indistinguishable: a process in the same group, of the same executable, with the exact
+ * switch inside one of its arguments — only something that runs the browser binary in the render's own group; on
+ * Linux, where `ps` prints lossily, a literal space, `.` or `?` where the expected text has a new line, another control
+ * character or a non-ASCII byte.
+ */
+function ours(e: RenderEntry, row: RenderProcess): boolean {
+  try {
+    const args = row.args;
+    if (e.cmdline !== undefined && args === e.cmdline) return true;
+    const b = e.browser;
+    return !!b && args.startsWith(b.prefix) && ` ${args} `.includes(` ${b.token} `);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One reap step on a listing taken at `startedGoneLeader` (whether the watchdog was known unable to fork before the
+ * listing began). Kills the members that are provably ours (`ours`; the deadline checked again before each kill);
+ * a live member of the group that cannot be attributed (unreadable arguments, `[chrome-headless-shell]`, anything
+ * else) is never signalled — it only keeps the reap from completing. Complete (true) only when the watchdog could fork
+ * no more before this listing **and** the listing shows no live process of the group at all.
+ */
+function reapStep(e: RenderEntry, rows: RenderProcess[], leaderWasGone: boolean, deadline: number): boolean {
+  const group = rows.filter((r) => !r.zombie && r.pgid === e.pgid);
+  if (!group.some((r) => r.pid === e.pgid)) e.leaderGone = true; // a zombie or gone: no more forks
+  for (const r of group) {
+    if (!ours(e, r)) continue;
+    if (performance.now() >= deadline) break;
+    try {
+      process.kill(r.pid, "SIGKILL");
+    } catch {
+      // gone meanwhile
+    }
+  }
+  return leaderWasGone && group.length === 0;
+}
+
+/** The reap is over: confirmed (the folder goes, if handed over) or not (folder and lock kept, counted). */
+function endReap(e: RenderEntry, confirmed: boolean) {
+  e.over = true;
+  if (e.timer) clearTimeout(e.timer);
+  reaping.delete(e);
+  if (liveRenders.get(e.pgid) === e) liveRenders.delete(e.pgid);
+  if (!confirmed) unconfirmed.add(e.dir);
+  if (e.ownsDir) releaseRenderDir(e.dir);
+  for (const w of e.waiters.splice(0)) w();
+}
+
+/**
+ * Resolves once the render of this folder has no reap going (at once when it was never started): the render's
+ * `finally` waits for it, so a render is over only when its processes are confirmed gone or given up on (bounded by
+ * the reap's own deadline).
+ */
+export function renderReaped(dir: RenderDir): Promise<void> {
+  const e = [...reaping, ...liveRenders.values()].find((x) => x.dir === dir && x.signalled && !x.over);
+  return e ? new Promise((r) => e.waiters.push(r)) : Promise.resolve();
+}
+
+/**
+ * The reap (#215). On macOS a group SIGKILL landing while the watchdog is inside `fork` kills the watchdog but can miss
+ * the child being made, which then execs the browser (PPID 1, same group). So the render's processes are listed every
+ * `everyMs` and its own (`ours`) killed by pid, until a listing taken after the watchdog's end shows the group empty.
+ * The group id itself is never signalled here (once its leader is reaped it may be anyone's). The deadline (`forMs`)
+ * bounds each listing (its timeout is what is left) and is checked again before each kill; a listing that returns past
+ * it ends the reap as given up (`onRenderReapIncomplete`): folder and lock kept.
+ */
+function startReap(e: RenderEntry) {
+  const deadline = performance.now() + reap.forMs;
+  const giveUp = () => {
+    endReap(e, false);
+    onIncomplete?.(1);
+  };
+  const step = () => {
+    if (e.over) return;
+    const left = deadline - performance.now();
+    if (left <= 0) return giveUp();
+    const leaderWasGone = e.leaderGone;
+    const go = (rows: RenderProcess[] | undefined) => {
+      if (e.over) return;
+      if (performance.now() >= deadline) return giveUp();
+      if (rows && reapStep(e, rows, leaderWasGone, deadline)) return endReap(e, true);
+      e.timer = setTimeout(step, reap.everyMs).unref();
+    };
+    if (reap.list) go(reap.list(left));
+    else listAsync(left, go);
+  };
+  e.timer = setTimeout(step, reap.everyMs).unref();
+}
+
+/**
+ * SIGKILLs a live render's process group (the watchdog's, the browser in it) — **once**, and only while the watchdog's
+ * exit has not been seen (its pid, the group id, is not reaped yet) — and starts its reap. The render's limits and
+ * shutdown come here; whichever is first sends the one signal. An untracked group is never signalled.
  */
 export function signalRender(pgid: number) {
   const entry = liveRenders.get(pgid);
@@ -402,21 +660,95 @@ export function signalRender(pgid: number) {
   } catch {
     // already gone
   }
+  startReap(entry);
 }
 
-/** SIGKILLs every live render's process group and removes its folder (synchronous: safe in an `exit` hook). */
-export function killLiveRenders(): number {
-  const n = liveRenders.size;
-  for (const [pgid, { dir }] of [...liveRenders]) {
-    signalRender(pgid);
-    removeRenderDir(dir);
+/**
+ * The watchdog ended abnormally (a signal — its exit already seen, so it is reaped and its pid, the group id, may be
+ * anyone's): **no** group signal; the reap alone (by pid, `ours`) — unless one is already going.
+ */
+export function reapAfterWatchdog(pgid: number) {
+  const entry = liveRenders.get(pgid);
+  if (!entry || entry.signalled) return;
+  entry.signalled = true;
+  entry.leaderGone = true;
+  startReap(entry);
+}
+
+/**
+ * The render's own clean-up of its folder (its `finally`): removed now — unless its reap is still going (then the
+ * reap removes it once its processes are confirmed gone), or they never were (then the folder and its lock stay for the
+ * sweep, which keeps them while the lock is held; only the server's descriptor is closed).
+ */
+export function releaseRenderDir(dir: RenderDir) {
+  const e = [...reaping].find((x) => x.dir === dir);
+  if (e && !e.over) {
+    e.ownsDir = true;
+    return;
   }
-  liveRenders.clear();
-  return n;
+  if (unconfirmed.has(dir)) {
+    try {
+      if (dir.lockFd >= 0) fs.closeSync(dir.lockFd);
+    } catch {
+      // already closed
+    }
+    dir.lockFd = -1;
+    return;
+  }
+  removeRenderDir(dir);
 }
 
-/** How many renders are tracked (tests). */
+const pause = new Int32Array(new SharedArrayBuffer(4));
+/**
+ * Shutdown (synchronous: safe in an `exit` hook, which runs no timer): SIGKILLs the group of every live render whose
+ * reap has not started, takes over every reap in progress, and reaps them all in place (one listing per step, its
+ * timeout and each pause what is left of `shutdownMs`, the deadline checked again before each kill). Confirmed renders
+ * lose their folders; any left past the deadline keep folder and lock and are counted (`onRenderReapIncomplete`).
+ * Returns how many renders were live.
+ */
+export function killLiveRenders(): number {
+  const live = [...liveRenders.values()];
+  for (const e of live) {
+    if (!e.signalled) {
+      e.signalled = true;
+      try {
+        process.kill(-e.pgid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
+  const all = [...live.filter((e) => !e.over), ...[...reaping].filter((e) => !e.over)];
+  for (const e of all) {
+    if (e.timer) clearTimeout(e.timer);
+    e.ownsDir = true; // shutdown removes the folders (a render's own `finally` may never run)
+  }
+  const deadline = performance.now() + reap.shutdownMs;
+  let left = all;
+  for (;;) {
+    const remaining = deadline - performance.now();
+    if (!left.length || remaining <= 0) break;
+    const wasGone = new Map(left.map((e) => [e, e.leaderGone]));
+    const rows = (reap.list ?? listSync)(remaining);
+    if (performance.now() >= deadline) break;
+    if (rows) {
+      const done = left.filter((e) => reapStep(e, rows, wasGone.get(e)!, deadline));
+      for (const e of done) endReap(e, true);
+      left = left.filter((e) => !done.includes(e));
+    }
+    const pauseMs = Math.min(10, deadline - performance.now());
+    if (left.length && pauseMs > 0) Atomics.wait(pause, 0, 0, pauseMs);
+  }
+  for (const e of left) endReap(e, false);
+  if (left.length) onIncomplete?.(left.length);
+  liveRenders.clear();
+  return live.length;
+}
+
+/** How many renders are tracked as live (tests). */
 export const liveRenderCount = () => liveRenders.size;
+/** How many reaps are still going (tests). */
+export const reapingRenderCount = () => reaping.size;
 
 /**
  * Folders younger than this are never swept (far past `WATCHDOG_MAX_SEC`). The server sweeps at start and again every

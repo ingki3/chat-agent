@@ -16,8 +16,22 @@ import { createTestDb } from "../src/db/client.js";
 import {
   browserArgs,
   findBrowser,
+  killLiveRenders,
   liveRenderCount,
+  onRenderReapIncomplete,
   parseMessage,
+  parsePs,
+  psEncode,
+  psEncodeBytes,
+  psListing,
+  type PsRun,
+  reapAfterWatchdog,
+  reapingRenderCount,
+  releaseRenderDir,
+  renderReaped,
+  setRenderReapForTests,
+  signalRender,
+  trackRender,
   makeRenderDir,
   removeRenderDir,
   renderLockPath,
@@ -777,7 +791,12 @@ afterEach(() => {
 });
 
 const FAKE_JS = path.join(FIXTURES, "fake-browser.mjs");
-const FAKE = () => [FAKE_JS, "orphan"];
+/** The stand-in that never answers; it keeps the render's `--user-data-dir` (its identity for the reap, #215). */
+const FAKE = (base: string[] = []) => [
+  FAKE_JS,
+  "orphan",
+  ...base.filter((a) => a.startsWith("--user-data-dir=")),
+];
 const freshRenderDir = () => {
   const d = makeRenderDir(os.tmpdir());
   closers.push(async () => removeRenderDir(d));
@@ -901,7 +920,7 @@ describe("the browser never outlives its owner (#170)", () => {
     return { r, launches };
   }
 
-  it("the watchdog SIGKILLed alone (the server alive): the server kills its group, the browser in it, at once", async () => {
+  it("the watchdog SIGKILLed alone (the server alive): the server reaps the browser at once (by pid, #215)", async () => {
     const { r, launches } = orphanRenderer();
     const before = liveRenderCount();
     const pending = r.render(job("markdown", "x", "pdf"));
@@ -918,7 +937,8 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(await pending).toEqual({ ok: false, code: "export_failed" });
     expect(await gone(pgid)).toBe(true);
     for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
-    expect(fs.existsSync(workDir)).toBe(false);
+    // The folder goes once the reap (#215) has confirmed the render's processes gone.
+    expect(await within(SETTLE_MS, () => !fs.existsSync(workDir))).toBe(true);
     expect(fs.existsSync(renderLockPath(workDir))).toBe(false);
     expect(liveRenderCount()).toBe(before);
   }, 30_000);
@@ -1029,6 +1049,699 @@ describe("the browser never outlives its owner (#170)", () => {
     }
     expect(await gone(l!.child.pid!)).toBe(true);
   }, 30_000);
+
+  /**
+   * #215: on macOS a group SIGKILL that lands while the watchdog is inside `fork` kills the watchdog and can miss the
+   * child being made, which then execs the browser (PPID 1, same group). That kernel window cannot be hit on demand,
+   * so the first group signal is made to miss exactly that way — it reaches the watchdog only — once the browser runs.
+   * The reap by identity must still kill the browser; the group id itself is signalled once.
+   */
+  async function missedByTheFirstSignal(trigger: "shutdown" | "memory") {
+    const p = pidFile();
+    let pgid: number | undefined;
+    let browserAfterMiss: boolean | undefined;
+    const real = process.kill.bind(process);
+    const kill = vi.spyOn(process, "kill").mockImplementation((target: number, sig?: string | number) => {
+      if (browserAfterMiss === undefined && pgid && target === -pgid && sig === "SIGKILL") {
+        const res = real(pgid, "SIGKILL"); // the watchdog only: the browser is missed
+        browserAfterMiss = alive(p.pid()!);
+        return res;
+      }
+      return real(target, sig);
+    });
+    try {
+      let running = false;
+      let workDir = "";
+      const r = new Renderer({
+        browser: process.execPath,
+        launcher: (s) => {
+          const l = track(unsandboxedLauncher({ ...s, env: { ...s.env, PIDFILE: p.f } }));
+          pgid = l.child.pid!;
+          workDir = s.workDir;
+          return l;
+        },
+        egress: spyEgress().egress,
+        limits: { timeoutMs: 60_000 },
+        test: {
+          args: FAKE,
+          // The memory limit, once the browser runs.
+          probe: async () => [{ pid: 1, rss: trigger === "memory" && running ? 1 << 30 : 1 }],
+        },
+      });
+      closers.push(() => r.close());
+      const pending = r.render(job("markdown", "x", "pdf"));
+      expect(await within(SETTLE_MS, () => !!p.pid() && alive(p.pid()!))).toBe(true);
+      running = true;
+      if (trigger === "shutdown") {
+        closeRenderers();
+        // Reaped in place, before any timer could run (an `exit` hook runs none).
+        expect(kill.mock.calls.some(([t, sig]) => t === p.pid() && sig === "SIGKILL")).toBe(true);
+      }
+      expect((await pending).ok).toBe(false);
+      expect(browserAfterMiss).toBe(true);
+      expect(await within(SETTLE_MS, () => !alive(p.pid()!)), `browser ${p.pid()}`).toBe(true);
+      expect(await gone(pgid!)).toBe(true);
+      expect(await within(SETTLE_MS, () => reapingRenderCount() === 0)).toBe(true);
+      expect(fs.existsSync(workDir)).toBe(false);
+      expect(kill.mock.calls.filter(([t, sig]) => t === -pgid! && sig === "SIGKILL")).toHaveLength(1);
+    } finally {
+      kill.mockRestore();
+    }
+  }
+
+  it("a browser the group signal missed (forked as it landed, #215) is reaped by identity: shutdown", async () => {
+    await missedByTheFirstSignal("shutdown");
+  }, 60_000);
+
+  it("a browser the group signal missed (forked as it landed, #215) is reaped by identity: a limit", async () => {
+    await missedByTheFirstSignal("memory");
+  }, 60_000);
+
+  it("missed browser, the watchdog's exit already seen, then the server exits (separate host, #215): shutdown takes the reap over", async () => {
+    const p = pidFile();
+    const host = spawn(
+      process.execPath,
+      ["--import", "tsx", "--conditions=development", path.join(FIXTURES, "reap-host.ts"), p.f],
+      { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    startedGroups.add(host.pid!);
+    let out = "";
+    let err = "";
+    host.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    host.stderr.on("data", (d: Buffer) => (err += d.toString()));
+    const code = await new Promise<number | null>((r) => host.once("exit", (c) => r(c)));
+    const info = JSON.parse(out.trim().split("\n").pop() || "{}") as {
+      pgid?: number;
+      browser?: number;
+      browserAfterMiss?: boolean;
+      watchdogExited?: boolean;
+      reaping?: number;
+      groupSignals?: number;
+    };
+    expect(code, err).toBe(0);
+    if (info.pgid) startedGroups.add(info.pgid);
+    // The order the bug needed: the browser outlived the one group signal, the watchdog's exit was seen (untracked
+    // as live), and only then did the server exit — no reap timer of it ever ran.
+    expect(info).toMatchObject({ browserAfterMiss: true, watchdogExited: true, reaping: 1, groupSignals: 1 });
+    // The browser really ran (a positive pid, read before the limit fired) and that very process is gone.
+    const browser = info.browser!;
+    expect(browser).toBeGreaterThan(0);
+    expect(p.pid()).toBe(browser);
+    expect(await within(SETTLE_MS, () => !alive(browser)), `browser ${browser}`).toBe(true);
+    expect(await gone(info.pgid!)).toBe(true);
+  }, 60_000);
+
+  describe("the reap signals by identity only, and completes only on an empty group (#215)", () => {
+    /** Sleepers in groups of their own: stand-ins for whatever a listing shows. */
+    const sleeper = () => {
+      const c = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+      startedGroups.add(c.pid!);
+      return c.pid!;
+    };
+    const restores: (() => void)[] = [];
+    afterEach(() => {
+      for (const r of restores.splice(0).reverse()) r(); // last first: each restores what was before it
+      onRenderReapIncomplete(undefined);
+    });
+    const row = (pid: number, pgid: number, args: string, zombie = false) => ({ pid, pgid, zombie, args });
+    /** A render being reaped after its watchdog's own end (no group signal: the group id is not ours). */
+    /** A watchdog command line as spawned (a script with a new line and a tab) and as macOS `ps` prints it. */
+    const spawned = (d: string) => [
+      "/usr/bin/perl",
+      "-e",
+      "use strict;\n\tx();",
+      "1",
+      "30",
+      d,
+      "node",
+      "fake.mjs",
+    ];
+    /** As this platform's `ps` prints it (macOS: `\\012\\011` for the new line and tab). */
+    const printed = (d: string) => psEncode(spawned(d).join(" "))!;
+    /** The browser executable these renders launched (argv[0] of their browser). */
+    const CHROME = "/opt/chrome/chrome-headless-shell";
+    const reapOf = (G: number, dir: RenderDir) => {
+      const forget = trackRender(G, dir, { argv: spawned(dir.workDir), browser: CHROME });
+      reapAfterWatchdog(G);
+      forget();
+    };
+    const keptAndCleaned = (dir: RenderDir) => {
+      releaseRenderDir(dir);
+      expect(fs.existsSync(dir.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
+      expect(dir.lockFd).toBe(-1);
+      fs.rmSync(dir.workDir, { recursive: true, force: true });
+      fs.rmSync(renderLockPath(dir.workDir), { force: true });
+    };
+
+    it("only exact arguments are ours: a reused group id, a look-alike path, another folder, a new render's process are never signalled — and keep the reap from completing", async () => {
+      const dir = freshRenderDir();
+      const d = dir.workDir;
+      const G = 2_000_000_001; // the group id the listing claims
+      const [
+        foreign,
+        elsewhere,
+        prefixed,
+        lookalike,
+        logger,
+        unreadable,
+        message,
+        almost,
+        watchdogChild,
+        browser,
+      ] = [
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+        sleeper(),
+      ];
+      let rows = [
+        row(foreign, G, "/bin/sleep 30"), // the group id reused by someone else
+        row(elsewhere, 7, `${CHROME} --user-data-dir=${d}/profile`), // ours by its arguments, not in the group
+        row(prefixed, G, `/bin/sh -c echo /archive${d}/profile`), // the path inside another argument
+        row(lookalike, G, `${CHROME} --user-data-dir=${d}X/profile`), // another folder
+        row(logger, G, `logger started --user-data-dir=${d}/profile`), // the switch inside a message: another program
+        row(unreadable, G, "[chrome-headless-shell]"), // arguments ps could not read
+        row(message, G, `logger render directory ${d} retained`), // the folder inside one argument
+        row(almost, G, `/usr/bin/perl -e use strict; 1 30 ${d} node fake.mjs`), // not the command line spawned
+        row(watchdogChild, G, printed(d)), // exactly the watchdog's (as a child it forked before exec)
+        row(browser, G, `${CHROME} --single-process --user-data-dir=${d}/profile about:blank`),
+      ];
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      restores.push(setRenderReapForTests({ everyMs: 10, forMs: 1500, list: () => rows }));
+      const kill = vi.spyOn(process, "kill");
+      try {
+        reapOf(G, dir);
+        // A new render takes the same group id while the old reap still runs: the old one must leave it alone.
+        const second = freshRenderDir();
+        const forgetSecond = trackRender(G, second, { browser: CHROME });
+        const newcomer = sleeper();
+        rows = [...rows, row(newcomer, G, `${CHROME} --user-data-dir=${second.workDir}/profile`)];
+        expect(await within(5000, () => !alive(watchdogChild) && !alive(browser))).toBe(true);
+        // Confirmed gone and off the list before `afterEach` (each sleeper is a group of its own).
+        for (const pid of [watchdogChild, browser]) expect(await gone(pid)).toBe(true);
+        rows = rows.filter((r) => r.pid !== watchdogChild && r.pid !== browser);
+        // Live members it cannot attribute stay in the group: never confirmed — given up at the deadline.
+        expect(await within(5000, () => incomplete.length > 0)).toBe(true);
+        expect(incomplete).toEqual([1]);
+        const others = [
+          foreign,
+          elsewhere,
+          prefixed,
+          lookalike,
+          logger,
+          unreadable,
+          message,
+          almost,
+          newcomer,
+        ];
+        for (const pid of others) expect(alive(pid), `pid ${pid}`).toBe(true);
+        const signalled = kill.mock.calls.filter(([, sig]) => sig === "SIGKILL").map(([t]) => t);
+        expect(signalled).not.toContain(-G); // after the watchdog's own end: no group signal
+        for (const pid of others) expect(signalled).not.toContain(pid);
+        keptAndCleaned(dir);
+        forgetSecond();
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("an unattributable member alone (`[chrome-headless-shell]`): not signalled, never confirmed — folder and lock kept, counted", async () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_011;
+      const unreadable = sleeper();
+      restores.push(
+        setRenderReapForTests({
+          everyMs: 10,
+          forMs: 300,
+          list: () => [row(unreadable, G, "[chrome-headless-shell]")],
+        }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      reapOf(G, dir);
+      await renderReaped(dir);
+      expect(incomplete).toEqual([1]);
+      expect(alive(unreadable)).toBe(true);
+      keptAndCleaned(dir);
+    });
+
+    it("complete only on a listing begun after the watchdog could fork no more, showing no live member at all", async () => {
+      const dir = freshRenderDir();
+      const d = dir.workDir;
+      const G = 2_000_000_021;
+      // The watchdog live (signalled by pid: still listed, not reaped), then a zombie, then nothing. Not forgotten:
+      // its end is learnt from the listings alone (as under shutdown, which sees no exit event).
+      const script = [[row(G, G, printed(d))], [row(G, G, "<defunct>", true)], [], []];
+      let calls = 0;
+      restores.push(setRenderReapForTests({ everyMs: 10, list: () => script[Math.min(calls++, 3)] }));
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        trackRender(G, dir, { argv: spawned(d) });
+        signalRender(G);
+        await renderReaped(dir);
+        // 1: live leader (killed by pid); 2: leader a zombie — empty, but begun before its end was known; 3: empty.
+        expect(calls).toBe(3);
+        expect(kill.mock.calls.filter(([t]) => t === G)).toHaveLength(1);
+        expect(kill.mock.calls.filter(([t]) => t === -G)).toHaveLength(1); // the one group signal, while live
+      } finally {
+        kill.mockRestore();
+      }
+      // Confirmed: the reap is over, nothing tracked any more.
+      expect(reapingRenderCount()).toBe(0);
+      expect(liveRenderCount()).toBe(0);
+    });
+
+    it("the deadline bounds each step: a listing that comes back past it ends the reap — no kill, folder kept, counted", async () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_003;
+      const target = sleeper();
+      const budgets: number[] = [];
+      restores.push(
+        setRenderReapForTests({
+          everyMs: 10,
+          forMs: 150,
+          list: (ms) => {
+            budgets.push(ms);
+            const end = performance.now() + 200; // slower than the whole budget
+            while (performance.now() < end) {
+              // busy
+            }
+            return [row(target, G, `${CHROME} --user-data-dir=${dir.workDir}/profile`)];
+          },
+        }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      const kill = vi.spyOn(process, "kill");
+      try {
+        reapOf(G, dir);
+        await renderReaped(dir);
+        expect(incomplete).toEqual([1]);
+        expect(budgets).toHaveLength(1);
+        expect(budgets[0]!).toBeLessThanOrEqual(150); // the listing gets what is left, no more
+        expect(kill.mock.calls.some(([t]) => t === target)).toBe(false);
+        expect(alive(target)).toBe(true);
+      } finally {
+        kill.mockRestore();
+      }
+      keptAndCleaned(dir);
+    });
+
+    it("shutdown's deadline bounds it too: a slow listing → no kill after it, back within its budget, folder kept, counted", () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_005;
+      const target = sleeper();
+      const budgets: number[] = [];
+      restores.push(
+        setRenderReapForTests({
+          shutdownMs: 100,
+          list: (ms) => {
+            budgets.push(ms);
+            const end = performance.now() + 150;
+            while (performance.now() < end) {
+              // busy
+            }
+            return [row(target, G, `${CHROME} --user-data-dir=${dir.workDir}/profile`)];
+          },
+        }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      trackRender(G, dir, { browser: CHROME });
+      const kill = vi.spyOn(process, "kill");
+      try {
+        const t0 = performance.now();
+        killLiveRenders();
+        expect(performance.now() - t0).toBeLessThan(400); // one listing past the budget, then nothing more
+        expect(kill.mock.calls.some(([t]) => t === target)).toBe(false);
+      } finally {
+        kill.mockRestore();
+      }
+      expect(budgets).toHaveLength(1);
+      expect(budgets[0]!).toBeLessThanOrEqual(100);
+      expect(incomplete).toEqual([1]);
+      expect(alive(target)).toBe(true);
+      expect(fs.existsSync(dir.workDir)).toBe(true);
+      expect(fs.existsSync(renderLockPath(dir.workDir))).toBe(true);
+      fs.rmSync(dir.workDir, { recursive: true, force: true });
+      fs.rmSync(renderLockPath(dir.workDir), { force: true });
+    });
+
+    it("a listing is only a whole `ps` run: a full buffer (ENOBUFS, status 0, tail cut), a signal or a cut last line is no listing — shutdown keeps the folder", () => {
+      const G = 2_000_000_031;
+      // What `ps` printed before its tail was cut: other processes only — the render's browser was in the lost tail.
+      const head = "    1     1 Ss   /sbin/launchd\n  500   500 S    /usr/sbin/syslogd\n";
+      const enobufs = Object.assign(new Error("spawnSync /bin/ps ENOBUFS"), { code: "ENOBUFS" });
+      const runs: [string, PsRun][] = [
+        ["ENOBUFS", { status: 0, signal: null, error: enobufs, stdout: head }],
+        ["signal", { status: null, signal: "SIGTERM", stdout: head }],
+        [
+          "cut line",
+          { status: 0, signal: null, stdout: `${head}  777   ${G} S    chrome --user-data-dir=/x` },
+        ],
+        ["failed", { status: 1, signal: null, stdout: head }],
+      ];
+      for (const [what, run] of runs) {
+        expect(psListing(run), what).toBeUndefined();
+        const dir = freshRenderDir();
+        restores.push(setRenderReapForTests({ shutdownMs: 100, run: () => run }));
+        const incomplete: number[] = [];
+        onRenderReapIncomplete((n) => incomplete.push(n));
+        trackRender(G, dir);
+        killLiveRenders();
+        expect(incomplete, what).toEqual([1]);
+        expect(fs.existsSync(dir.workDir), what).toBe(true);
+        expect(fs.existsSync(renderLockPath(dir.workDir)), what).toBe(true);
+        fs.rmSync(dir.workDir, { recursive: true, force: true });
+        fs.rmSync(renderLockPath(dir.workDir), { force: true });
+        for (const r of restores.splice(0).reverse()) r(); // last first: each restores what was before it
+      }
+      // Control: the same output, whole, is a listing — and (the group gone) confirms the render.
+      expect(psListing({ status: 0, signal: null, stdout: head })).toHaveLength(2);
+      const dir = freshRenderDir();
+      restores.push(
+        setRenderReapForTests({ shutdownMs: 500, run: () => ({ status: 0, signal: null, stdout: head }) }),
+      );
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      trackRender(G, dir);
+      killLiveRenders();
+      expect(incomplete).toEqual([]);
+      expect(fs.existsSync(dir.workDir)).toBe(false);
+    });
+
+    it("the watchdog's identity is its whole command line: the real `ps` row of a running watchdog matches what was spawned", async () => {
+      const w = watchdog(FAKE());
+      let row: { args: string } | undefined;
+      expect(
+        await within(10_000, () => {
+          const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
+            encoding: "utf8",
+            maxBuffer: 64 << 20,
+            env: { LC_ALL: "C", LANG: "C" }, // as the reap runs it
+          });
+          row = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+            (x) => x.pid === w.l.child.pid,
+          );
+          return !!row;
+        }),
+      ).toBe(true);
+      const expected = psEncode(w.l.child.spawnargs.join(" "));
+      expect(row!.args).toBe(expected);
+      // Stopped by its owner (stdin closed): a TERM could come before Perl has installed its handler.
+      w.l.child.stdin!.end();
+      expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
+      expect(await gone(w.l.child.pid!)).toBe(true); // off the list before `afterEach`
+    });
+
+    it("psEncode (macOS): exactly what `ps` prints in the C locale — controls, DEL, C1, multibyte, backslash", () => {
+      const mac = (t: string) => psEncode(t, "darwin");
+      expect(mac("a\\z b\tc\nd\u0001\u007f")).toBe("a\\z b\\011c\\012d^A^?");
+      expect(mac("\u0085")).toBe("M-BM^E"); // C1: its two UTF-8 bytes
+      expect(mac("/opt/브라우저/chrome")).toBe("/opt/M-kM-8M^LM-kM^]M-<M-lM^ZM-0M-l\\240M^@/chrome"); // printed by ps
+      expect(mac("é  ")).toBe("M-CM-) M-B\\240");
+      // Different text never prints the same: a Korean path is not the ASCII path with `?` in its place.
+      expect(mac("/opt/브라우저/chrome")).not.toBe(mac("/opt/????????????/chrome"));
+      expect(mac("a\nb")).not.toBe(mac("a\tb"));
+      expect(psEncode("x", "win32")).toBeUndefined(); // unknown platform: nothing attributed
+      expect(psEncode("a\n\t\u007f가?", "linux")).toBe("a ..????"); // procps, as the byte-by-byte real `ps` test checks
+    });
+
+    it("long command lines are plain string work: a 657-byte Korean path in a 15 KB command line is matched at once", () => {
+      const seg = "브라우저-폴더";
+      let dir = "/t";
+      while (Buffer.byteLength(dir) < 657) dir += `/${seg}`;
+      const argv = [
+        "/usr/bin/perl",
+        "-e",
+        "x\n".repeat(7000),
+        "1",
+        "30",
+        dir,
+        "/usr/bin/sandbox-exec",
+        "-p",
+        dir,
+      ];
+      expect(Buffer.byteLength(argv.join(" "))).toBeGreaterThan(15_000);
+      const shown = psEncode(argv.join(" "))!;
+      const t0 = performance.now();
+      const G = 2_000_000_041;
+      const rd = freshRenderDir();
+      const forget = trackRender(G, rd, { argv, browser: dir });
+      // Through the reap's own check: listed with that exact command line, it is ours (killed by pid, here a fake).
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(
+          setRenderReapForTests({
+            shutdownMs: 100,
+            list: () => [{ pid: 2_000_000_043, pgid: G, zombie: false, args: shown }],
+          }),
+        );
+        killLiveRenders();
+        expect(kill.mock.calls.some(([t]) => t === 2_000_000_043)).toBe(true);
+      } finally {
+        kill.mockRestore();
+        forget();
+        fs.rmSync(rd.workDir, { recursive: true, force: true });
+        fs.rmSync(renderLockPath(rd.workDir), { force: true });
+      }
+      expect(performance.now() - t0).toBeLessThan(2000);
+    });
+
+    it("the browser's identity: its executable launched (as `ps` prints it) and the profile switch as a token", () => {
+      const d = "/t/agentlee-render-AbC123";
+      const G = 2_000_000_051;
+      const exe = "/opt/브라우저/chrome";
+      const rows = (args: string[]) =>
+        args.map((a, i) => ({ pid: 2_000_000_100 + i, pgid: G, zombie: false, args: a }));
+      const enc = (t: string) => psEncode(t)!;
+      const listed = rows([
+        enc(`${exe} --single-process --user-data-dir=${d}/profile about:blank`), // ours
+        enc(`/opt/????????????/chrome --user-data-dir=${d}/profile`), // another executable (`?` in its path)
+        enc(`/opt/나우저/chrome --user-data-dir=${d}/profile`),
+        enc(`${exe}2 --user-data-dir=${d}/profile`),
+        enc(`${exe} --user-data-dir=${d}/profileX`),
+        enc(`${exe} x--user-data-dir=${d}/profile`),
+        enc(`logger ${exe} --user-data-dir=${d}/profile`),
+      ]);
+      const dir: RenderDir = { workDir: d, lockFd: -1 };
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => listed }));
+        trackRender(G, dir, { browser: exe });
+        killLiveRenders();
+        const signalled = new Set(kill.mock.calls.filter(([t]) => t > 0).map(([t]) => t));
+        // Linux procps prints every non-ASCII byte as `?`: there the `?` path is indistinguishable (documented).
+        const want =
+          { darwin: [2_000_000_100], linux: [2_000_000_100, 2_000_000_101] }[process.platform as string] ??
+          [];
+        expect([...signalled].sort()).toEqual(want);
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("documented residuals (ps output is flattened and lossy): same group and exact profile token still required", () => {
+      // macOS prints a non-ASCII path and the ASCII path spelling out its encoding the same way.
+      expect(psEncode("/opt/é/chrome", "darwin")).toBe(psEncode("/opt/M-CM-)/chrome", "darwin"));
+      const d = "/t/agentlee-render-ZzZ999";
+      const G = 2_000_000_071;
+      const listed = [
+        `/opt/chrome Helper --user-data-dir=${d}/profile`, // another executable whose path begins "<browser> "
+        `/opt/chrome Helper --user-data-dir=${d}/profile2`, // … without the exact token
+        `/opt/chrome --user-data-dir=/t/agentlee-render-Other1/profile`, // the browser of another folder
+      ].map((a, i) => ({ pid: 2_000_000_200 + i, pgid: G, zombie: false, args: psEncode(a)! }));
+      const other = {
+        pid: 2_000_000_210,
+        pgid: G + 1,
+        zombie: false,
+        args: psEncode(`/opt/chrome --user-data-dir=${d}/profile`)!,
+      };
+      const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+      try {
+        restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => [...listed, other] }));
+        trackRender(G, { workDir: d, lockFd: -1 }, { browser: "/opt/chrome" });
+        killLiveRenders();
+        const signalled = [...new Set(kill.mock.calls.filter(([t]) => t > 0).map(([t]) => t))];
+        // Pinned: the `chrome Helper` row with the exact token is taken for ours; nothing without the token or
+        // outside the group is.
+        expect(signalled).toEqual(
+          process.platform === "darwin" || process.platform === "linux" ? [2_000_000_200] : [],
+        );
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it("a check that throws (a malformed row) is unattributed: the reap goes on and ends, nothing escapes", async () => {
+      const dir = freshRenderDir();
+      const G = 2_000_000_061;
+      const bad = { pid: 2_000_000_063, pgid: G, zombie: false } as {
+        pid: number;
+        pgid: number;
+        zombie: boolean;
+        args: string;
+      };
+      Object.defineProperty(bad, "args", {
+        get() {
+          throw new Error("unreadable");
+        },
+      });
+      restores.push(setRenderReapForTests({ everyMs: 10, forMs: 200, list: () => [bad] }));
+      const incomplete: number[] = [];
+      onRenderReapIncomplete((n) => incomplete.push(n));
+      reapOf(G, dir);
+      await renderReaped(dir);
+      expect(incomplete).toEqual([1]);
+      keptAndCleaned(dir);
+      // And shutdown, synchronously.
+      const dir2 = freshRenderDir();
+      restores.push(setRenderReapForTests({ shutdownMs: 50, list: () => [bad] }));
+      trackRender(G, dir2, { browser: CHROME });
+      expect(() => killLiveRenders()).not.toThrow();
+      expect(incomplete).toEqual([1, 1]);
+      fs.rmSync(dir2.workDir, { recursive: true, force: true });
+      fs.rmSync(renderLockPath(dir2.workDir), { force: true });
+    });
+
+    it.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
+      "real `ps` (as the reap runs it), byte by byte: every byte value 0x01–0xff in an argument prints as psEncodeBytes says",
+      async () => {
+        // Perl re-execs itself with one argument per byte, `[<hex>:<byte>]` (raw bytes: not necessarily UTF-8).
+        const hex = Array.from({ length: 255 }, (_, i) => (i + 1).toString(16).padStart(2, "0"));
+        const script =
+          'my @a = map { "[" . $_ . ":" . chr(hex $_) . "]" } @ARGV; exec { "/usr/bin/perl" } "perl", "-e", "sleep 30", "--", @a;';
+        const c = spawn("/usr/bin/perl", ["-e", script, ...hex], { detached: true, stdio: "ignore" });
+        startedGroups.add(c.pid!);
+        try {
+          let args: string | undefined;
+          expect(
+            await within(10_000, () => {
+              const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
+                encoding: "latin1",
+                maxBuffer: 64 << 20,
+                env: { LC_ALL: "C", LANG: "C" },
+              });
+              args = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+                (x) => x.pid === c.pid,
+              )?.args;
+              return !!args?.includes("[ff:");
+            }),
+          ).toBe(true);
+          // `[xx:` starts each argument; what follows up to the next ` [yy:` is how that byte was printed.
+          const shown = new Map<number, string>();
+          const marks = [...args!.matchAll(/\[([0-9a-f]{2}):/g)];
+          marks.forEach((m, i) => {
+            const end = i + 1 < marks.length ? marks[i + 1]!.index! - 1 : args!.length;
+            shown.set(parseInt(m[1]!, 16), args!.slice(m.index! + 4, end).replace(/\]$/, ""));
+          });
+          const wrong: string[] = [];
+          for (let b = 1; b < 256; b++) {
+            const want = psEncodeBytes(Uint8Array.of(b));
+            if (shown.get(b) !== want)
+              wrong.push(`${b.toString(16)}: ps ${JSON.stringify(shown.get(b))} ≠ ${JSON.stringify(want)}`);
+          }
+          if (wrong.length)
+            console.log(`ps per byte (${process.platform}):`, JSON.stringify(Object.fromEntries(shown)));
+          expect(wrong).toEqual([]);
+        } finally {
+          c.kill("SIGKILL");
+          expect(await gone(c.pid!)).toBe(true);
+        }
+      },
+    );
+
+    it.skipIf(process.platform !== "darwin")(
+      "real `ps` (macOS, as the reap runs it): exactly the encoding — every byte valid UTF-8 can hold",
+      async () => {
+        let text = "";
+        for (let c = 1; c < 0x100; c++) text += String.fromCodePoint(c);
+        for (let lead = 0xe1; lead <= 0xef; lead++) text += Buffer.from([lead, 0x80, 0x80]).toString("utf8");
+        text += `${String.fromCodePoint(0x10000, 0x100000)} 가나다 /opt/브라우저/chrome \\ ^A M-x ?`;
+        const c = spawn("/usr/bin/perl", ["-e", "sleep 30", "--", text, "x y"], {
+          argv0: "/opt/브라우저/chrome",
+          detached: true,
+          stdio: "ignore",
+        });
+        startedGroups.add(c.pid!);
+        try {
+          let args: string | undefined;
+          expect(
+            await within(10_000, () => {
+              const r = spawnSync("/bin/ps", ["axww", "-o", "pid=,pgid=,stat=,args="], {
+                encoding: "utf8",
+                maxBuffer: 64 << 20,
+                env: { LC_ALL: "C", LANG: "C" },
+              });
+              args = psListing({ status: r.status, signal: r.signal, stdout: r.stdout })?.find(
+                (x) => x.pid === c.pid,
+              )?.args;
+              return args !== undefined && !args.startsWith("(");
+            }),
+          ).toBe(true);
+          expect(args).toBe(
+            psEncode(["/opt/브라우저/chrome", "-e", "sleep 30", "--", text, "x y"].join(" ")),
+          );
+        } finally {
+          c.kill("SIGKILL");
+          expect(await gone(c.pid!)).toBe(true);
+        }
+      },
+    );
+
+    it.skipIf(process.platform !== "darwin")(
+      "end to end with the real listing (macOS): a browser with a non-ASCII executable, left in its group, is reaped and confirmed",
+      async () => {
+        const dir = freshRenderDir();
+        const exe = "/opt/브라우저/chrome";
+        const browser = spawn(
+          "/usr/bin/perl",
+          ["-e", "sleep 30", "--", `--user-data-dir=${dir.workDir}/profile`],
+          {
+            argv0: exe,
+            detached: true, // its own group: it stands for the browser left in the render's group
+            stdio: "ignore",
+          },
+        );
+        startedGroups.add(browser.pid!);
+        expect(await within(5000, () => alive(browser.pid!))).toBe(true);
+        restores.push(setRenderReapForTests({ everyMs: 20 }));
+        const incomplete: number[] = [];
+        onRenderReapIncomplete((n) => incomplete.push(n));
+        const forget = trackRender(browser.pid!, dir, { browser: exe });
+        reapAfterWatchdog(browser.pid!);
+        forget();
+        releaseRenderDir(dir); // handed to the reap
+        await renderReaped(dir);
+        expect(incomplete).toEqual([]);
+        expect(await gone(browser.pid!)).toBe(true); // confirmed gone, and off the list before `afterEach`
+        expect(fs.existsSync(dir.workDir)).toBe(false);
+      },
+    );
+
+    it("ps rows: pid, group, zombie state and the command line", () => {
+      const rows = parsePs(
+        "  12   12 Ss   /usr/bin/perl -e use strict; 1 30 /t/agentlee-render-abcDEF\n 13 12 Z <defunct>\nnoise\n",
+      );
+      expect(rows).toEqual([
+        {
+          pid: 12,
+          pgid: 12,
+          zombie: false,
+          args: "/usr/bin/perl -e use strict; 1 30 /t/agentlee-render-abcDEF",
+        },
+        { pid: 13, pgid: 12, zombie: true, args: "<defunct>" },
+      ]);
+    });
+  });
 
   it("a render that fails while its folder is prepared (e.g. a full disk) keeps no descriptor and no folder", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-prep-")));
@@ -1253,14 +1966,20 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(fs.existsSync(renderLockPath(d.workDir))).toBe(true);
   }, 30_000);
 
-  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end kills its group", async () => {
-    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" (sleep) in their group.
+  it("the server's reaction to the watchdog's status: its own codes kill nothing; any other end reaps its processes by pid — no group signal (#215)", async () => {
+    // Stand-in watchdogs: a good render, then an exit with the given status; a "browser" in their group (a sleeper
+    // carrying the browser's identity: the browser executable launched, with `--user-data-dir=<folder>/profile`).
+    let groupSignals = 0;
     const react = async (status: number) => {
       const p = pidFile();
-      const launcher: Launcher = () => {
+      let pgid = 0;
+      const launcher: Launcher = (s) => {
         const child = spawn(
           "/bin/sh",
-          ["-c", `/bin/sleep 30 & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`],
+          [
+            "-c",
+            `'${process.execPath}' -e 'setTimeout(() => {}, 30000)' -- '--user-data-dir=${s.workDir}/profile' & echo $! > '${p.f}'; exec '${process.execPath}' '${FAKE_JS}' ok-exit`,
+          ],
           {
             env: { EXIT_CODE: String(status) },
             detached: true,
@@ -1268,6 +1987,7 @@ describe("the browser never outlives its owner (#170)", () => {
           },
         );
         startedGroups.add(child.pid!);
+        pgid = child.pid!;
         return { child, input: child.stdio[3] as Writable, output: child.stdio[4] as Readable };
       };
       const r = new Renderer({
@@ -1278,14 +1998,23 @@ describe("the browser never outlives its owner (#170)", () => {
         test: { probe: async () => [{ pid: 1, rss: 1 }] },
       });
       closers.push(() => r.close());
-      expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
+      const kill = vi.spyOn(process, "kill");
+      try {
+        expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(true);
+        groupSignals += kill.mock.calls.filter(([t, sig]) => t === -pgid && sig === "SIGKILL").length;
+      } finally {
+        kill.mockRestore();
+      }
       const sleeper = p.pid()!;
+      expect(sleeper).toBeGreaterThan(0);
       return within(1000, () => !alive(sleeper)).then((dead) => !dead);
     };
     const X = WATCHDOG_EXIT;
     for (const s of [X.done, X.stopped, X.notStarted, X.execFailed])
       expect(await react(s), `status ${s}`).toBe(true);
     expect(await react(1)).toBe(false);
+    // The watchdog was already reaped when its end was seen: its group id is never signalled.
+    expect(groupSignals).toBe(0);
   }, 60_000);
 
   it("shutdown: closeRenderers turns queued renders away, starts no new browser, and kills the running one", async () => {
