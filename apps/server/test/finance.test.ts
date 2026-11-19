@@ -31,7 +31,7 @@ import { McpService } from "../src/mcp/service.js";
 import { FINANCE_CODES as LOGGABLE_FINANCE_CODES } from "../src/observability/policy.js";
 import { sanitizeRecord } from "../src/logging.js";
 import { loadFixtures, replayWorker, storedUrl, type Exchange } from "./helpers/finance-replay.js";
-import { contentJson } from "./helpers/content-json.js";
+import { logsJson } from "./helpers/content-json.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 // The worker itself (plain JS), run in-process here.
 import { run as runWorker, scrubBody } from "../../../packages/mcp-tools/web/worker.mjs";
@@ -706,7 +706,7 @@ describe("who gets the finance tools (#30, FR-1.6)", () => {
       ["kr_quote", "ok", undefined],
       ["kr_quote", "error", "finance_not_allowed"],
     ]);
-    expect(contentJson(fin)).not.toMatch(/005930|206000/);
+    expect(logsJson(fin)).not.toMatch(/005930|206000/);
   });
 
   it("finance codes are loggable, and the finance instructions see the new tools", () => {

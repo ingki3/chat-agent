@@ -1570,7 +1570,6 @@ time.sleep(float(sys.argv[1]))
       // The command exits at once; the escaped child holds the pipes: cut after the drain deadline.
       const a = await run("0");
       expect(a.r.killed).toBe("escaped");
-      expect(a.ms).toBeGreaterThanOrEqual(FORK_DRAIN_MS);
       expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
       // The time limit: the command is killed with its group, the escaped child still holds the pipes — still ends.
       // (The limit leaves room for the command to start and fork under load: the child must exist before it fires.)
@@ -1589,6 +1588,7 @@ time.sleep(float(sys.argv[1]))
       });
       expect(c.r.killed).toBe("aborted");
       expect(c.sinceMark).toBeLessThan(FORK_DRAIN_MS);
+      // (Exactly when each of these ends, relative to the exit, is pinned with a fake clock in sandbox-drain.test.ts.)
     },
   );
 });

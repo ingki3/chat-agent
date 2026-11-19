@@ -57,7 +57,7 @@ import {
   type RuntimeSession,
   type StartContext,
 } from "../src/runtime/adapter.js";
-import { contentJson } from "./helpers/content-json.js";
+import { logsJson } from "./helpers/content-json.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 
 const isMac = process.platform === "darwin";
@@ -405,7 +405,7 @@ describe("skill call log (#46 policy)", () => {
         skillCode: "skill_bad_input",
       },
     ]);
-    expect(contentJson(recs)).not.toMatch(/005930|KOSPI|SECRET-OUTPUT/);
+    expect(logsJson(recs)).not.toMatch(/005930|KOSPI|SECRET-OUTPUT/);
   });
 });
 
