@@ -1841,7 +1841,7 @@ PRD FR-3.5("넘어가는 것: 대화 기록, 업로드 파일 목록, 이 대화
 ### 41.2 설치 (한 번 — 관리자, `sudo` 필요. 서버는 sudo를 쓰지 않는다)
 서버 계정을 `agentlee`, 데이터 폴더를 `<DATA_DIR>`(절대 실제 경로)로 가정한다.
 
-**운영 배포본과의 관계 (#143, 43.6절)**: 번들은 `/usr/local/lib/agentlee-workers`에 루트 소유 **복사본**으로 설치되고 런처·설정도 `/usr/local/…`에 있어, 신뢰 경로에 `~/.chat-agent/current` 링크나 배포본 폴더가 들어가지 않는다. 1)은 `~/.chat-agent/current`에서 실행한다. `scratch=`는 `~/.chat-agent/data/worker-scratch`의 실제 경로이고, 8)의 search 항목은 `~/.chat-agent`(700)에도 필요하다. 시작 자가 검사의 `bundle` 단계는 설치된 번들의 지문을 **지금 도는 배포본**과 비교하므로, 새 배포본을 설치할 때마다 1)·2)를 다시 한다(배포 스크립트가 `WORKER_RUN_USER`가 설정돼 있으면 알려 준다).
+**운영 배포본과의 관계 (#143, 43.6절)**: 번들은 `/usr/local/lib/agentlee-workers`에 루트 소유 **복사본**으로 설치되고 런처·설정도 `/usr/local/…`에 있어, 신뢰 경로에 `~/.chat-agent/current` 링크나 배포본 폴더가 들어가지 않는다. 1)은 `~/.chat-agent/current`에서 실행한다. `scratch=`는 `~/.chat-agent/data/worker-scratch`의 실제 경로이고, 8)의 search 항목은 `~/.chat-agent`(700)에도 필요하다. 시작 자가 검사의 `bundle` 단계는 설치된 번들의 지문을 **지금 도는 배포본**과 비교하므로, 새 배포본을 설치할 때마다 1)·2)를 다시 한다(배포 스크립트가 `WORKER_RUN_USER`가 설정돼 있으면 알려 준다). **런처(`ops/workers/agentlee-worker-run`)가 바뀐 배포본이면 4)도 다시 한다** — 루트 소유 복사본이라 다시 설치하기 전에는 전용 계정이 옛 런처(예: 옛 브라우저 인자, #207)로 계속 돈다. 배포 스크립트는 배포본의 런처가 설치된 것과 다르면 알려 준다.
 ```
 # 0) 헤드리스 셸(내보내기와 같은 것)이 있어야 번들이 만들어진다
 pnpm exec playwright install --only-shell chromium
@@ -1957,7 +1957,7 @@ pnpm -s release install --ref <브랜치|태그|커밋 40자|refs/…>   # 이�
 12. 재시작: LaunchDaemon이면 `sudo launchctl kickstart -k system/com.agentlee.server`. 아니면 `run/server.pid`의 프로세스(또는 포트의 리스너)가 **이 설치의 서버일 때만**(명령줄이 `~/.chat-agent/current|releases/…/apps/server/dist/index.js`) SIGTERM(30초 뒤 SIGKILL)으로 멈추고, `nohup env -i … node …/current/apps/server/dist/index.js < /dev/null &`로 띄운다(출력 `logs/server.out.log`).
 13. **확인** (`scripts/release-verify.mjs`, 최대 `AGENTLEE_HEALTH_TIMEOUT`초): `GET /api/health`가 200 `{"status":"ok"}`, `/`가 **이 배포본의** `index.html`과 같은 자산 목록을 내고, 그 JS·CSS가 각각 200 + `text/javascript`·`text/css`로 온다. 옛 서버가 남아 새 `dist`를 서비스하면 자산 경로가 SPA 페이지(`text/html`)로 와서 실패한다(실제로 겪은 경우). 상태 코드·형식·경로만 찍는다.
 14. 성공이면 오래된 배포본 정리(`prune --keep 3`). **실패면** 그 배포본에 `.failed`를 남기고 직전 배포본으로 `current`를 되돌려 재시작·확인한다. 되돌린 뒤 실패한 배포본이 마이그레이션을 더했으면 43.3절의 DB 복원 안내를 찍는다. 종료 코드 1.
-15. 알림: `WORKER_RUN_USER`가 설정돼 있으면 작업자 번들을 다시 설치하라고(41.2절 1·2), `python_run`이 켜져 있으면 `runner.py` 복사를 확인하라고(35.2절) 찍는다.
+15. 알림: `WORKER_RUN_USER`가 설정돼 있으면 작업자 번들을 다시 설치하라고(41.2절 1·2), 배포본의 런처가 설치된 `/usr/local/libexec/agentlee-worker-run`과 다르면 런처도 다시 설치하라고(41.2절 4), `python_run`이 켜져 있으면 `runner.py` 복사를 확인하라고(35.2절) 찍는다.
 
 ### 43.3 상태·되돌림·정리
 ```bash
@@ -2008,7 +2008,7 @@ pnpm -s release restart | stop          # 스크립트가 띄운 서버 (LaunchD
 ### 43.6 전용 계정(python·작업자)의 신뢰 경로
 - 런처(`/usr/local/libexec/agentlee-python-run`, `agentlee-worker-run`)는 신뢰하는 경로의 조상 전체에 심볼릭 링크가 없고 루트 소유인지 확인한다. 그 경로들 — 런처·설정(`/usr/local/etc/…`)·interpreter·runner·packages(`/usr/local/lib/agentlee-python`)·작업자 번들(`/usr/local/lib/agentlee-workers`) — 은 모두 **루트 소유 고정 위치의 복사본**이고, `~/.chat-agent/current` 링크나 배포본 폴더를 가리키지 않는다. 그래서 링크로 전환하는 배포 구조와 충돌하지 않는다.
 - 런처가 받는 경로 중 사용자 쪽은 `scratch`(`<DATA_DIR>/scratch`, `<DATA_DIR>/worker-scratch`)뿐이다. `DATA_DIR`은 링크가 아닌 실제 폴더(`~/.chat-agent/data`)이고 `current` 아래가 아니다 — 설정에는 실제(정규) 경로를 적는다. `~/.chat-agent`가 700이므로 그 계정이 scratch까지 지나가려면 `~/.chat-agent`에도 그룹 search ACL을 더한다(35.2절 6, 41.2절 8 — `setup-check`의 "scratch traversal"이 알려 준다).
-- 서버 쪽: 자가 검사의 `bundle` 지문은 지금 도는 배포본과 비교한다 → 배포할 때마다 번들을 다시 설치한다(41.2절). `runner.py`는 배포본의 `apps/server/scratchpad/runner.py`가 바뀌었을 때 다시 복사한다.
+- 서버 쪽: 자가 검사의 `bundle` 지문은 지금 도는 배포본과 비교한다 → 배포할 때마다 번들을 다시 설치한다(41.2절). 런처가 바뀐 배포본이면 런처도 다시 설치한다(41.2절 4). `runner.py`는 배포본의 `apps/server/scratchpad/runner.py`가 바뀌었을 때 다시 복사한다.
 
 ### 43.7 시험
 - `scripts/test/release.test.ts` — 임시 `AGENTLEE_HOME`, 로컬 bare 저장소를 소스로, 빈 포트, launchd 없음(`AGENTLEE_LAUNCHD_PLIST`가 없는 파일). 작은 고정 앱(HTTP 서버·릴리스 도구·사전 검사의 대역)으로 스크립트 자체의 모든 경로를 실제로 돈다: 설치(링크·REPO_ROOT가 실제 배포본·health·자산 형식), 같은 커밋 재설치 생략, 업데이트(작업 폴더의 미커밋 변경 무시), health 실패와 **자산이 text/html로 오는 경우**의 자동 복귀, 수동 되돌림·`--to`, 마이그레이션이 든 배포의 되돌림 경고(배포 직전 백업 id·복원 명령), prune, 잠금(다른 명령이 잡고 있으면 거부), `shared/.env` 미변경(모드·mtime·해시)과 비밀 값 미출력, 느슨한 권한·없는 `.env` 거부, 빈 데이터 시작 거부 → `--no-start` → `migrate-data` → `restart`, 남의 포트 리스너를 죽이지 않음. Linux CI에서도 돈다(macOS 전용인 `ditto`·`launchctl`은 이 시험에 들어가지 않는다).

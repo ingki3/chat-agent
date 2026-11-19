@@ -449,6 +449,11 @@ cmd_install() {
 
 post_install_notes() {
   [ "$CFG_WORKER" != set ] || note "WORKER_RUN_USER is set: rebuild and reinstall the worker bundle from $ROOT/current (docs/ops.md §41.2 1–2)"
+  # The root-owned launcher is a copy too (#207): a release that changes it needs §41.2 4) again, or the account keeps
+  # running the old one (e.g. the old browser switches).
+  if [ "$CFG_WORKER" = set ] && ! cmp -s "$ROOT/current/ops/workers/agentlee-worker-run" /usr/local/libexec/agentlee-worker-run; then
+    note "WORKER_RUN_USER is set and this release's ops/workers/agentlee-worker-run differs from the installed launcher: reinstall it from $ROOT/current (docs/ops.md §41.2 4)"
+  fi
   [ "$CFG_PYTHON" != on ] || note "python_run is on: if apps/server/scratchpad/runner.py changed, copy it again (docs/ops.md §35.2)"
   return 0
 }

@@ -64,9 +64,11 @@ if (!BROWSER && process.env.CI) throw new Error("CI must install the headless sh
 const PROD_LAUNCHER: Launcher = darwin ? sandboxedLauncher : unsandboxedLauncher;
 
 const closers: (() => Promise<unknown>)[] = [];
+// The cleanup has its own budget (#207): on a loaded machine removing a test's folders (one holds 40 000 files) took
+// longer than the default 10 s.
 afterEach(async () => {
   while (closers.length) await closers.pop()!();
-});
+}, 60_000);
 
 /** "The app": a local server on 127.0.0.1 that records every request it gets (path and cookie header). */
 const app = {
@@ -109,6 +111,19 @@ function spyEgress() {
   };
 }
 
+/**
+ * The tests' own budgets (#207), apart from the product's limits (`RENDER_LIMITS`): on a loaded CI runner one render
+ * took longer than the product's 20 s cap, and one `ps` sample longer than its 2 s, so renders whose test is about
+ * something else failed (`export_timeout` / `export_limit` where `ok` was asserted, or a navigation that never came).
+ * Here a render is bounded by its test's own time limit instead; the limits themselves are tested with their own
+ * values (the time limit, the watchdog's cap, the memory limit and its fail-closed rule). A test that sets a limit
+ * keeps it.
+ */
+const TEST_RENDER_MS = 60_000;
+const TEST_SAMPLE_MS = 15_000;
+/** Tests that drive the real browser: room for a couple of renders at their own budget on a loaded machine (#207). */
+const SLOW = { timeout: 120_000 };
+
 function renderer(o: Partial<RendererOptions> = {}) {
   const spy = spyEgress();
   const blocked: string[] = [];
@@ -117,6 +132,7 @@ function renderer(o: Partial<RendererOptions> = {}) {
     launcher: PROD_LAUNCHER,
     egress: spy.egress,
     ...o,
+    limits: { timeoutMs: TEST_RENDER_MS, sampleTimeoutMs: TEST_SAMPLE_MS, ...o.limits },
     test: { blocked: (u) => blocked.push(u), ...o.test },
   });
   closers.push(() => r.close());
@@ -146,29 +162,81 @@ const ok = (r: RenderResult) => {
   return r.body;
 };
 
-/** Every way a document can ask for the app (loopback), the home network, metadata or another host. */
-function attackHtml(port: number) {
+/**
+ * Every way a document can ask for the app (loopback), the home network, metadata or another host. `outside: false`
+ * (the control with every layer off) leaves out the addresses beyond this machine: with nothing in the way those
+ * really go out, and an address that does not answer holds the page's load back (#207) — the control is about the
+ * navigation to the app.
+ */
+function attackHtml(port: number, { outside = true } = {}) {
   const app = `http://127.0.0.1:${port}`;
+  const far = (html: string) => (outside ? html : "");
   return `<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="${app}/api/css">
 <link rel="prefetch" href="${app}/api/prefetch">
 <script src="${app}/api/script.js"></script>
 </head><body><h1>공격 문서</h1>
-<img src="${app}/api/img"><img src="http://10.0.0.1/x.png"><img src="http://192.168.1.1/x.png">
-<img src="http://169.254.169.254/latest/meta-data/"><img src="http://localhost:${port}/api/localhost">
-<img src="http://[::1]:${port}/api/v6"><img src="https://example.org/public.png">
+<img src="${app}/api/img">${far(`<img src="http://10.0.0.1/x.png"><img src="http://192.168.1.1/x.png">
+<img src="http://169.254.169.254/latest/meta-data/">`)}<img src="http://localhost:${port}/api/localhost">
+<img src="http://[::1]:${port}/api/v6">${far(`<img src="https://example.org/public.png">`)}
 <iframe src="${app}/api/frame"></iframe>
 <script>
   fetch("${app}/api/conversations", { credentials: "include" }).catch(() => {});
-  fetch("http://10.0.0.1/api/x").catch(() => {});
+  ${far(`fetch("http://10.0.0.1/api/x").catch(() => {});`)}
   navigator.sendBeacon && navigator.sendBeacon("${app}/api/beacon", "x");
   try { new WebSocket("ws://127.0.0.1:${port}/api/ws"); } catch (e) {}
-  // CSP does not stop a document from navigating itself: the renderer must.
-  setTimeout(() => { location.href = "${app}/api/nav"; }, 50);
+  // CSP does not stop a document from navigating itself: the renderer must. (Its own code, called once the page has
+  // loaded, see selfNavigation — not on a timer of its own.)
+  window.go = () => setTimeout(() => { location.href = "${app}/api/nav"; });
 </script></body></html>`;
 }
 
-describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
+/**
+ * Polls until `cond()` holds; throws past `ms` (below the tests' render budget, so a wait that never ends fails the
+ * render — `export_failed` — instead of leaving it, and the test, hanging).
+ */
+async function until(cond: () => boolean, ms = 25_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("until: timed out");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/**
+ * A document that navigates itself (its `go()`), started by the test after the load, then waited for (#207). With
+ * the document's own timer (e.g. 50 ms) the navigation raced the renderer: on a loaded machine it could land while the
+ * renderer still waited for the fonts — "Inspected target navigated or closed", `export_failed` where `ok` was
+ * asserted — or only after the capture, so the navigation the test was about never happened. Here the test calls
+ * `go()` once the page is loaded and waits until the page asked for a URL ending in `suffix` (the renderer saw the
+ * request: refused or let through), the main frame then showed another page (the error page, or the app when every
+ * layer is off) and loaded it, and `also()` holds. The capture then takes a page that no longer changes.
+ */
+function selfNavigation(suffix: string, also: () => boolean = () => true) {
+  let requested = false;
+  let navigated = false;
+  let loaded = false;
+  return {
+    events: (method: string, params: Record<string, unknown>) => {
+      if (method === "Fetch.requestPaused") {
+        const url = (params.request as { url?: unknown } | undefined)?.url;
+        if (typeof url === "string" && url.endsWith(suffix)) requested = true;
+      } else if (method === "Page.frameNavigated") {
+        const frame = params.frame as { parentId?: unknown; url?: unknown } | undefined;
+        if (frame && frame.parentId === undefined && frame.url !== DOCUMENT_URL) navigated = true;
+      } else if (method === "Page.loadEventFired" && navigated) loaded = true;
+    },
+    afterLoad: async (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => {
+      // Per render (one renderer may render the document more than once).
+      requested = navigated = loaded = false;
+      // `go()` navigates in a task of its own, after this reply.
+      await send("Runtime.evaluate", { expression: "go()" });
+      await until(() => requested && loaded && also());
+    },
+  };
+}
+
+describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", SLOW, () => {
   it("samples: a chart PNG and a document PDF (also table, markdown and code PDFs, and an SVG PNG)", async () => {
     const { r } = renderer();
     const out = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-export-sample-"));
@@ -197,45 +265,57 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#2f6fb0"/></svg>`;
     expect(isPng(ok(await r.render(job("svg", svg, "png"))))).toBe(true);
     expect(fs.readdirSync(out).sort()).toEqual(["chart.png", "document.pdf"]);
-  }, 60_000);
+  }, 180_000); // six real renders: their own budget on a loaded machine (#207)
 
   it("an artifact asking for the app (127.0.0.1:<port>/api/…), private IPs, metadata or other hosts gets nothing", async () => {
     app.hits.length = 0;
-    const { r, blocked, lookups, connects } = renderer();
+    const { r, blocked, lookups, connects } = renderer({ test: selfNavigation("/api/nav") });
     for (const format of ["pdf", "png"] as const) {
       const res = await r.render(job("html", attackHtml(app.port), format));
       // The render itself still finishes — it just never reached anything.
-      expect(res.ok).toBe(true);
+      expect(res).toMatchObject({ ok: true });
     }
     expect(app.hits).toEqual([]);
     expect(lookups).toEqual([]);
     expect(connects).toEqual([]);
     // The one request CSP cannot stop — the document navigating itself to the app — was refused by the renderer.
     expect(blocked).toContain(`http://127.0.0.1:${app.port}/api/nav`);
-  }, 60_000);
+  });
 
   // Each network layer alone (the others off) stops the same document: no single mistake opens the way.
   describe("each layer alone", () => {
-    const run = async (o: Partial<RendererOptions>) => {
+    /**
+     * `reaches`: the navigation is expected to reach the app — the render waits for it to land. `outside`: see
+     * `attackHtml`.
+     */
+    const run = async (o: Partial<RendererOptions>, { reaches = false, outside = true } = {}) => {
       app.hits.length = 0;
-      const t = renderer(o);
-      await t.r.render(job("html", attackHtml(app.port), "pdf"));
+      const wait = selfNavigation("/api/nav", () => !reaches || app.hits.some((h) => h.url === "/api/nav"));
+      const t = renderer({ ...o, test: { ...wait, ...o.test } });
+      const html = attackHtml(app.port, { outside });
+      expect(await t.r.render(job("html", html, "pdf"))).toMatchObject({ ok: true });
       return { hits: app.hits.map((h) => h.url).sort(), ...t };
     };
 
     it("control: with every layer off and no sandbox, the document does reach the app (the probe works)", async () => {
-      const { hits } = await run({
-        launcher: unsandboxedLauncher,
-        test: { csp: false, intercept: false, proxy: false },
-      });
+      const { hits } = await run(
+        {
+          launcher: unsandboxedLauncher,
+          test: { csp: false, intercept: false, proxy: false },
+        },
+        { reaches: true, outside: false },
+      );
       // (Subresources are also held back by Chrome's own local-network rules; the navigation is not.)
       expect(hits).toContain("/api/nav");
-    }, 30_000);
+    });
 
     it("CSP alone does not stop the document navigating itself to the app (why the other layers exist)", async () => {
-      const { hits } = await run({ launcher: unsandboxedLauncher, test: { intercept: false, proxy: false } });
+      const { hits } = await run(
+        { launcher: unsandboxedLauncher, test: { intercept: false, proxy: false } },
+        { reaches: true },
+      );
       expect(hits).toEqual(["/api/nav"]);
-    }, 30_000);
+    });
 
     it("request interception alone", async () => {
       const { hits, blocked } = await run({
@@ -252,7 +332,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
           "https://example.org/public.png",
         ]),
       );
-    }, 30_000);
+    });
 
     it("the egress proxy alone (loopback included: Chrome may not bypass it for 127.0.0.1 or localhost)", async () => {
       const { hits, lookups, connects } = await run({
@@ -263,7 +343,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
       // Only the CDN host may be resolved or reached; example.org, private and loopback addresses never are.
       expect(lookups.filter((h) => !RENDER_EGRESS_HOSTS.includes(h))).toEqual([]);
       expect(connects).toEqual([]);
-    }, 30_000);
+    });
 
     it.skipIf(!darwin)(
       "the macOS process sandbox alone (no CSP, no interception, no proxy switch)",
@@ -274,7 +354,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
         });
         expect(hits).toEqual([]);
       },
-      30_000,
+      SLOW.timeout,
     );
   });
 
@@ -289,7 +369,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect((await bare.r.render(job("html", html, "pdf"))).ok).toBe(true);
     expect(bare.blocked).toContain(other);
     expect(bare.blocked).not.toContain(CDN_ALLOW_LIST[0]!.url);
-  }, 30_000);
+  });
 
   it("no app cookies or session: empty fresh profile, two environment variables, nothing kept afterwards", async () => {
     const seen: { env: Record<string, string>; workDir: string; profileEntries: string[] }[] = [];
@@ -324,7 +404,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(JSON.stringify(inside[1])).toContain(DOCUMENT_URL);
     // The same sandboxing CSP as the served original: an opaque origin.
     expect(inside[2]).toMatchObject({ result: { value: "null" } });
-  }, 30_000);
+  });
 
   it("time limit: a document that never stops is killed (export_timeout), with its process", async () => {
     let pid: number | undefined;
@@ -339,7 +419,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(res).toEqual({ ok: false, code: "export_timeout" });
     expect(Date.now() - started).toBeLessThan(8000);
     expect(alive(pid!)).toBe(false);
-  }, 30_000);
+  });
 
   it("memory limit: above it the browser is killed (export_limit); unmeasurable counts as above (fail closed)", async () => {
     // An HTML document (its scripts get time to settle): the monitor samples while it renders.
@@ -350,7 +430,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     expect(await blind.r.render(doc)).toEqual({ ok: false, code: "export_limit" });
     const fine = renderer();
     expect((await fine.r.render(job("chart", chart, "png"))).ok).toBe(true);
-  }, 60_000);
+  });
 
   it("reply and file size limits, and at most `concurrent` renders at once", async () => {
     const big = renderer({ limits: { maxReplyBytes: 2000 } });
@@ -370,7 +450,7 @@ describe.skipIf(!BROWSER)("isolated renderer (real headless shell)", () => {
     const results = await Promise.all([1, 2, 3].map(() => one.r.render(job("chart", chart, "png"))));
     expect(results.map((r) => (r.ok ? "ok" : r.code))).toEqual(["ok", "ok", "export_busy"]);
     expect(most).toBe(1);
-  }, 60_000);
+  });
 });
 
 function alive(pid: number) {
@@ -442,7 +522,9 @@ describe("renderer without a browser or a sandbox", () => {
   });
 });
 
-describe("export routes (#51)", () => {
+// Their own budget (#207): setting up the app and a family (password hashing) took longer than the default 5 s on a
+// loaded machine.
+describe("export routes (#51)", { timeout: 30_000 }, () => {
   async function setup(render: (j: RenderJob) => Promise<RenderResult>) {
     const lines: Record<string, unknown>[] = [];
     const logStream = new Writable({
@@ -616,7 +698,7 @@ describe("the DevTools pipe is untrusted: a broken or hostile browser fails its 
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
     const { out, leftovers } = JSON.parse(r.stdout) as {
-      out: Record<string, { result: string; alive: boolean; ms: number }>;
+      out: Record<string, { result: string; alive: boolean; signal: string | null; order: string[] }>;
       leftovers: string[];
     };
     expect(leftovers).toEqual([]);
@@ -628,8 +710,15 @@ describe("the DevTools pipe is untrusted: a broken or hostile browser fails its 
     for (const m of modes) {
       expect(out[m]!.result, m).toBe(want[m] ?? "export_failed");
       expect(out[m]!.alive, m).toBe(false);
-      // A broken browser is killed at once, not asked to close (and waited for): well under the 1.5 s limit.
-      if (m !== "ok" && m !== "hang") expect(out[m]!.ms, m).toBeLessThan(1000);
+      // A broken browser is killed at once — its group's SIGKILL comes before any polite `Browser.close` is tried —
+      // and ends by that signal (asked to close, the stand-in would answer and exit by itself). Checked by order and
+      // signal, not by a time a loaded machine stretches (#207). A good one is asked to close first; one that ended
+      // by itself is not killed.
+      const o = out[m]!.order;
+      if (m === "ok") expect(o[0], m).toBe("close");
+      else if (m !== "close-before-navigate") expect(o[0], `${m}: ${o.join(",")}`).toBe("kill");
+      if (m === "ok" || m === "close-before-navigate") expect(out[m]!.signal, m).toBeNull();
+      else expect(out[m]!.signal, m).toBe("SIGKILL");
     }
   }, 90_000);
 });
@@ -665,7 +754,13 @@ const track = (l: Launched) => {
   startedGroups.add(l.child.pid!);
   return l;
 };
-const gone = async (pgid: number, ms: number) => {
+/**
+ * How long a test waits for something it caused to be over (a group gone, a folder removed, a lock free). Generous on
+ * purpose (#207): what these tests check is that it happens, not how fast a loaded machine gets to it — the bounds
+ * that are properties of their own (the time limit, the watchdog's cap, the sweep's stop) keep their own values.
+ */
+const SETTLE_MS = 15_000;
+const gone = async (pgid: number, ms = SETTLE_MS) => {
   const ok = await within(ms, () => !groupAlive(pgid));
   if (ok) startedGroups.delete(pgid);
   return ok;
@@ -733,8 +828,18 @@ describe("the browser never outlives its owner (#170)", () => {
     let err = "";
     host.stdout.on("data", (d: Buffer) => (out += d.toString()));
     host.stderr.on("data", (d: Buffer) => (err += d.toString()));
-    const exited = new Promise<void>((r) => host.once("exit", () => r()));
-    expect(await within(30_000, () => out.includes("\n")), err).toBe(true);
+    let hostEnded = false;
+    const exited = new Promise<void>((r) =>
+      host.once("exit", () => {
+        hostEnded = true;
+        r();
+      }),
+    );
+    // Starting the host (tsx) and its browser is setup, not the property: its own budget (#207 — over 30 s on a loaded
+    // machine). The property is the time from the owner's SIGKILL to nothing left (below). A host that ends before it
+    // is ready fails the test at once, with what it said.
+    expect(await within(90_000, () => out.includes("\n") || hostEnded), err).toBe(true);
+    expect(out.includes("\n") ? "" : `host ended before it was ready: ${err}`).toBe("");
     const info = JSON.parse(out.split("\n")[0]!) as {
       host: number;
       pgid: number;
@@ -755,9 +860,9 @@ describe("the browser never outlives its owner (#170)", () => {
     const killedAt = Date.now();
     process.kill(host.pid!, "SIGKILL");
     await exited;
-    expect(await gone(host.pid!, 2000)).toBe(true);
-    expect(await gone(info.pgid, 5000)).toBe(true);
-    expect(await within(2000, () => !fs.existsSync(info.workDir))).toBe(true);
+    expect(await gone(host.pid!)).toBe(true);
+    expect(await gone(info.pgid)).toBe(true);
+    expect(await within(SETTLE_MS, () => !fs.existsSync(info.workDir))).toBe(true);
     expect(fs.existsSync(renderLockPath(info.workDir))).toBe(false);
     for (const pid of info.members) expect(alive(pid), `pid ${pid}`).toBe(false);
     return Date.now() - killedAt;
@@ -765,14 +870,14 @@ describe("the browser never outlives its owner (#170)", () => {
 
   it("SIGKILL of the owner: a stand-in browser that ignores pipe EOF is killed, group and folder gone", async () => {
     expect(await orphan("fake")).toBeLessThan(5000);
-  }, 60_000);
+  }, 150_000);
 
   it.skipIf(!BROWSER)(
     "SIGKILL of the owner mid-render: the real headless shell (production launcher, its loop confirmed entered over DevTools) is gone too",
     async () => {
       expect(await orphan("real")).toBeLessThan(5000);
     },
-    60_000,
+    150_000,
   );
 
   /** A renderer over the stand-in browser that never answers; `launches` lists each started watchdog. */
@@ -811,7 +916,7 @@ describe("the browser never outlives its owner (#170)", () => {
     const { pgid, workDir } = launches[0]!;
     process.kill(pgid, "SIGKILL"); // the watchdog only
     expect(await pending).toEqual({ ok: false, code: "export_failed" });
-    expect(await gone(pgid, 2000)).toBe(true);
+    expect(await gone(pgid)).toBe(true);
     for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
     expect(fs.existsSync(workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(workDir))).toBe(false);
@@ -838,7 +943,7 @@ describe("the browser never outlives its owner (#170)", () => {
     closers.push(() => r.close());
     expect((await r.render(job("markdown", "x", "pdf"))).ok).toBe(false);
     const { l, workDir } = launches[0]!;
-    expect(await gone(l.child.pid!, 3000)).toBe(true);
+    expect(await gone(l.child.pid!)).toBe(true);
     // The browser either never started or is gone — and does not turn up later either.
     await new Promise((done) => setTimeout(done, 500));
     const pid = p.pid();
@@ -873,7 +978,7 @@ describe("the browser never outlives its owner (#170)", () => {
       });
       closers.push(() => r1.close());
       expect((await r1.render(job("markdown", "x", "pdf"))).ok).toBe(false);
-      expect(await gone(first!.child.pid!, 3000)).toBe(true);
+      expect(await gone(first!.child.pid!)).toBe(true);
       expect(signals(first!.child.pid!)).toBe(1);
       // The time limit: its kill, then the failed render's kill — one signal.
       let second: Launched | undefined;
@@ -886,7 +991,7 @@ describe("the browser never outlives its owner (#170)", () => {
       });
       closers.push(() => r2.close());
       expect(await r2.render(job("markdown", "x", "pdf"))).toEqual({ ok: false, code: "export_timeout" });
-      expect(await gone(second!.child.pid!, 3000)).toBe(true);
+      expect(await gone(second!.child.pid!)).toBe(true);
       await new Promise((done) => setTimeout(done, 200));
       expect(signals(second!.child.pid!)).toBe(1);
     } finally {
@@ -922,7 +1027,7 @@ describe("the browser never outlives its owner (#170)", () => {
     } finally {
       kill.mockRestore();
     }
-    expect(await gone(l!.child.pid!, 3000)).toBe(true);
+    expect(await gone(l!.child.pid!)).toBe(true);
   }, 30_000);
 
   it("a render that fails while its folder is prepared (e.g. a full disk) keeps no descriptor and no folder", async () => {
@@ -979,7 +1084,7 @@ describe("the browser never outlives its owner (#170)", () => {
     ).toBe(true);
     process.kill(pgid, "SIGTERM");
     expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
-    expect(await gone(pgid, 2000)).toBe(true);
+    expect(await gone(pgid)).toBe(true);
     for (const pid of seen) expect(alive(pid), `pid ${pid}`).toBe(false);
     expect(fs.existsSync(w.workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
@@ -991,17 +1096,17 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(await w.exited).toBe(WATCHDOG_EXIT.stopped);
     expect(Date.now() - started).toBeGreaterThanOrEqual(900);
     expect(Date.now() - started).toBeLessThan(4000);
-    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(await gone(w.l.child.pid!)).toBe(true);
     expect(fs.existsSync(w.workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
   }, 30_000);
 
   it("a browser that ends by itself: the watchdog removes the folder and lock before it exits 0", async () => {
     const w = watchdog([FAKE_JS, "ok"]);
-    expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
+    expect(await within(SETTLE_MS, () => alive(w.l.child.pid!))).toBe(true);
     w.l.input.end(); // the stand-in ends when its command pipe closes (as after `Browser.close`)
     expect(await w.exited).toBe(WATCHDOG_EXIT.done);
-    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
+    expect(await gone(w.l.child.pid!)).toBe(true);
     expect(fs.existsSync(w.workDir)).toBe(false);
     expect(fs.existsSync(renderLockPath(w.workDir))).toBe(false);
   }, 30_000);
@@ -1033,7 +1138,7 @@ describe("the browser never outlives its owner (#170)", () => {
       expect(fs.existsSync(renderLockPath(server.workDir))).toBe(true);
       const wd = undeletable();
       const w = watchdog([FAKE_JS, "ok"], { dir: wd });
-      expect(await within(5000, () => alive(w.l.child.pid!))).toBe(true);
+      expect(await within(SETTLE_MS, () => alive(w.l.child.pid!))).toBe(true);
       w.l.input.end();
       expect(await w.exited).toBe(WATCHDOG_EXIT.done);
       expect(fs.existsSync(wd.workDir)).toBe(true);
@@ -1079,7 +1184,7 @@ describe("the browser never outlives its owner (#170)", () => {
     closers.push(async () => fs.rmSync(lockPath, { force: true }));
     expect(fs.statSync(lockPath).ino).not.toBe(fs.statSync(`${lockPath}.orig`).ino);
     const w = watchdog([FAKE_JS, "ok"], { dir: d });
-    expect(await within(5000, () => !lockable(`${lockPath}.orig`))).toBe(true); // the server's file: held
+    expect(await within(SETTLE_MS, () => !lockable(`${lockPath}.orig`))).toBe(true); // the server's file: held
     expect(lockable(lockPath)).toBe(true); // the stand-in at the path: not
     w.l.input.end();
     expect(await w.exited).toBe(WATCHDOG_EXIT.done);
@@ -1120,8 +1225,8 @@ describe("the browser never outlives its owner (#170)", () => {
     expect(alive(got.pid)).toBe(true);
     expect(lockable(lockPath)).toBe(false); // still held — by the browser
     process.kill(-w.l.child.pid!, "SIGKILL"); // the group (the browser is in it)
-    expect(await gone(w.l.child.pid!, 2000)).toBe(true);
-    expect(await within(2000, () => lockable(lockPath))).toBe(true);
+    expect(await gone(w.l.child.pid!)).toBe(true);
+    expect(await within(SETTLE_MS, () => lockable(lockPath))).toBe(true);
   }, 30_000);
 
   it("the lock: no descriptor 5, or one that is not a regular file, and the watchdog does not start", async () => {
@@ -1198,7 +1303,7 @@ describe("the browser never outlives its owner (#170)", () => {
     // A render asked for after shutdown is refused too; only the first ever started a browser.
     expect(await r.render(job("markdown", "w", "pdf"))).toEqual({ ok: false, code: "export_unavailable" });
     expect(launches).toHaveLength(1);
-    expect(await gone(launches[0]!.pgid, 2000)).toBe(true);
+    expect(await gone(launches[0]!.pgid)).toBe(true);
     expect(fs.existsSync(launches[0]!.workDir)).toBe(false);
     expect(liveRenderCount()).toBe(0);
   }, 30_000);
@@ -1234,7 +1339,7 @@ describe("the browser never outlives its owner (#170)", () => {
     } finally {
       kill.mockRestore();
     }
-    expect(await gone(l!.child.pid!, 2000)).toBe(true);
+    expect(await gone(l!.child.pid!)).toBe(true);
   }, 30_000);
 
   /** A sweep root with old render folders (and their locks) and other things beside them. */
@@ -1264,7 +1369,7 @@ describe("the browser never outlives its owner (#170)", () => {
       startedGroups.add(holder.pid!);
       let said = "";
       holder.stdout.on("data", (d: Buffer) => (said += d.toString()));
-      expect(await within(5000, () => said.includes("L"))).toBe(true);
+      expect(await within(SETTLE_MS, () => said.includes("L"))).toBe(true);
       return holder;
     };
     return { root, age, dir, holdLock };
@@ -1311,7 +1416,7 @@ describe("the browser never outlives its owner (#170)", () => {
     // Once the holders are gone, their folder and stray lock go too; the lock-less folder is still only counted.
     for (const h of holders) {
       process.kill(-h.pid!, "SIGKILL");
-      expect(await gone(h.pid!, 2000)).toBe(true);
+      expect(await gone(h.pid!)).toBe(true);
     }
     expect(await sweepRenderDirs(t.root, { graceSec: 600 })).toEqual({ removed: 1, lockless: 1 });
     expect(fs.existsSync(heldLock)).toBe(false);
@@ -1435,10 +1540,30 @@ describe("the production launcher's sandbox policy (checked on every platform)",
 });
 
 /** A UDP listener on 127.0.0.1 that counts what arrives (STUN from WebRTC, anything else). */
+/**
+ * A UDP listener on 127.0.0.1 that counts what reaches it. It answers a STUN binding request (#207 review) so that a
+ * document's STUN attempt that does get through ends at once (a server-reflexive candidate) instead of after Chrome's
+ * ~40 s STUN timeout.
+ */
 async function udpListener() {
   const sock = dgram.createSocket("udp4");
   const got = { n: 0 };
-  sock.on("message", () => got.n++);
+  const COOKIE = 0x2112a442;
+  sock.on("message", (m, from) => {
+    got.n++;
+    if (m.length < 20 || m.readUInt16BE(0) !== 0x0001 || m.readUInt32BE(4) !== COOKIE) return;
+    const res = Buffer.alloc(32);
+    res.writeUInt16BE(0x0101, 0); // binding success
+    res.writeUInt16BE(12, 2);
+    res.writeUInt32BE(COOKIE, 4);
+    m.copy(res, 8, 8, 20); // transaction id
+    res.writeUInt16BE(0x0020, 20); // XOR-MAPPED-ADDRESS
+    res.writeUInt16BE(8, 22);
+    res.writeUInt16BE(0x0001, 24); // IPv4
+    res.writeUInt16BE(from.port ^ (COOKIE >>> 16), 26);
+    res.writeUInt32BE((from.address.split(".").reduce((a, b) => a * 256 + Number(b), 0) ^ COOKIE) >>> 0, 28);
+    sock.send(res, from.port, from.address);
+  });
   await new Promise<void>((r) => sock.bind(0, "127.0.0.1", () => r()));
   closers.push(() => new Promise<void>((r) => sock.close(() => r())));
   return { port: sock.address().port, got };
@@ -1446,41 +1571,94 @@ async function udpListener() {
 
 const webrtcHtml = (udpPort: number) => `<!doctype html><p>rtc</p><script>
   const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:127.0.0.1:${udpPort}" }] });
+  // How far ICE gathering got: finished (the state, or the final null candidate), and how many STUN attempts failed
+  // (a UDP socket refused or closed).
+  window.ice = { complete: false, errors: 0 };
+  pc.addEventListener("icecandidate", (e) => {
+    if (!e.candidate) window.ice.complete = true;
+  });
+  pc.addEventListener("icecandidateerror", () => window.ice.errors++);
+  pc.addEventListener("icegatheringstatechange", () => {
+    if (pc.iceGatheringState === "complete") window.ice.complete = true;
+  });
   pc.createDataChannel("x");
   pc.createOffer().then((o) => pc.setLocalDescription(o));
 </script>`;
+type IceState = { complete: boolean; errors: number };
+/**
+ * After the load: waits until `done(ice)` holds for the document's ICE gathering (`window.ice`), so the capture never
+ * ends the browser before the document has tried its UDP (#207 review). Not reached within the deadline (below the
+ * render's own budget) → the render fails, and with it the test.
+ */
+const afterIce =
+  (done: (ice: IceState) => boolean) =>
+  async (send: (method: string, params?: Record<string, unknown>) => Promise<unknown>) => {
+    const end = Date.now() + 45_000;
+    for (;;) {
+      const r = (await send("Runtime.evaluate", { expression: "window.ice", returnByValue: true })) as {
+        result?: { value?: IceState };
+      };
+      if (r.result?.value && done(r.result.value)) return;
+      if (Date.now() > end) throw new Error(`ICE: not reached (${JSON.stringify(r.result?.value)})`);
+      await new Promise((d) => setTimeout(d, 50));
+    }
+  };
 const dropWebrtcPolicy = (a: string[]) => a.filter((x) => !x.startsWith("--force-webrtc-ip-handling-policy"));
 
-describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", () => {
+describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/file:", SLOW, () => {
   it("WebRTC: no UDP leaves the renderer (control: without the policy switch and the sandbox it does)", async () => {
     const control = await udpListener();
     const c = renderer({
       launcher: unsandboxedLauncher,
-      test: { csp: false, intercept: false, proxy: false, args: dropWebrtcPolicy },
+      test: {
+        csp: false,
+        intercept: false,
+        proxy: false,
+        args: dropWebrtcPolicy,
+        // Gathering finished (its STUN answered by the listener) and the UDP arrived, before the capture (#207).
+        afterLoad: afterIce((ice) => ice.complete && control.got.n > 0),
+      },
     });
     expect((await c.r.render(job("html", webrtcHtml(control.port), "pdf"))).ok).toBe(true);
     expect(control.got.n).toBeGreaterThan(0);
     const prod = await udpListener();
-    const p = renderer();
+    // The same stage: gathering finished (with the policy switch there is no UDP socket to try), then nothing came.
+    const p = renderer({ test: { afterLoad: afterIce((ice) => ice.complete) } });
     expect((await p.r.render(job("html", webrtcHtml(prod.port), "pdf"))).ok).toBe(true);
     expect(prod.got.n).toBe(0);
     // QUIC (HTTP/3 over UDP) is off too: everything is TCP to the proxy.
     expect(browserArgs("/p", "http://127.0.0.1:1")).toContain("--disable-quic");
-  }, 60_000);
+    // RenderDocument off: with it the single-process shell could end itself on a self-navigating document (#207).
+    expect(browserArgs("/p", undefined).find((a) => a.startsWith("--disable-features="))).toMatch(
+      /[=,]RenderDocument(,|$)/,
+    );
+  });
 
   it("redirects: every hop is checked again — an allowed URL that redirects to the app is stopped at the hop", async () => {
     app.hits.length = 0;
     const redirect = `http://127.0.0.1:${app.port}/redirect-to-api`;
+    const after = `http://127.0.0.1:${app.port}/api/after-redirect`;
+    let blockedHop = false;
+    const wait = selfNavigation("/api/after-redirect", () => blockedHop);
     const { r, blocked } = renderer({
       launcher: unsandboxedLauncher,
-      test: { csp: false, proxy: false, allowUrls: [redirect] },
+      test: {
+        csp: false,
+        proxy: false,
+        allowUrls: [redirect],
+        ...wait,
+        blocked: (u) => {
+          blocked.push(u);
+          if (u === after) blockedHop = true;
+        },
+      },
     });
-    const html = `<!doctype html><p>r</p><script>setTimeout(() => { location.href = "${redirect}"; }, 30);</script>`;
-    await r.render(job("html", html, "pdf"));
+    const html = `<!doctype html><p>r</p><script>window.go = () => setTimeout(() => { location.href = "${redirect}"; });</script>`;
+    expect(await r.render(job("html", html, "pdf"))).toMatchObject({ ok: true });
     // The allowed first hop went out (so the test does exercise a redirect); its target never did.
     expect(app.hits.map((h) => h.url)).toEqual(["/redirect-to-api"]);
     expect(blocked).toContain(`http://127.0.0.1:${app.port}/api/after-redirect`);
-  }, 30_000);
+  });
 
   it("data:, blob: and file: — a frame, a worker or a navigation from them reaches nothing, and no local file is read", async () => {
     app.hits.length = 0;
@@ -1512,10 +1690,10 @@ describe.skipIf(!BROWSER)("more ways out: WebRTC/UDP, redirects, data:/blob:/fil
     expect(app.hits).toEqual([]);
     expect(JSON.stringify(seen)).not.toContain("FAMILY-SECRET");
     expect(JSON.stringify(seen)).toContain(DOCUMENT_URL);
-  }, 30_000);
+  });
 });
 
-describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production launcher)", () => {
+describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production launcher)", SLOW, () => {
   it("positive control: with every browser layer off, a document still renders inside the sandbox", async () => {
     const { r } = renderer({
       launcher: sandboxedLauncher,
@@ -1523,7 +1701,7 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     });
     const png = ok(await r.render(job("chart", chart, "png")));
     expect(isPng(png)).toBe(true);
-  }, 30_000);
+  });
 
   it("files: the browser itself (asked over DevTools, past every web rule) cannot open a file outside its folders", async () => {
     const secretDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-secret-")));
@@ -1550,17 +1728,26 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     };
     expect(await read(unsandboxedLauncher)).toContain("FAMILY-SECRET"); // control
     expect(await read(sandboxedLauncher)).not.toContain("FAMILY-SECRET");
-  }, 60_000);
+  });
 
-  it("WebRTC/UDP with the policy switch dropped and every browser layer off: the kernel stops the UDP", async () => {
+  it("smoke (not authoritative): Chrome in the sandbox with the policy switch dropped and every browser layer off sends no UDP", async () => {
+    // A secondary check only: Chrome's gathering never reports "complete" here (after the kernel refuses the send it
+    // closes each socket — a 701 candidate error — and stays "gathering"; measured over 50 s), so this render cannot
+    // prove that no send came late. The kernel rule itself is checked deterministically by the probe (the next describe).
     const l = await udpListener();
     const { r } = renderer({
       launcher: sandboxedLauncher,
-      test: { csp: false, intercept: false, proxy: false, args: dropWebrtcPolicy },
+      test: {
+        csp: false,
+        intercept: false,
+        proxy: false,
+        args: dropWebrtcPolicy,
+        afterLoad: afterIce((ice) => ice.complete || ice.errors > 0),
+      },
     });
     expect((await r.render(job("html", webrtcHtml(l.port), "pdf"))).ok).toBe(true);
     expect(l.got.n).toBe(0);
-  }, 30_000);
+  });
 
   it("the renderer's network policy, probed directly: no DNS, no UDP, no TCP but the proxy port", async () => {
     const l = await udpListener();
@@ -1599,5 +1786,44 @@ describe.skipIf(!BROWSER || !darwin)("the macOS kernel layer itself (production 
     expect(out.udpDns).toMatch(/^err:/);
     expect(out.lookup).toMatch(/^err:/);
     expect(l.got.n).toBe(0);
-  }, 30_000);
+  });
+});
+
+// No browser needed: runs on every Mac, with or without the headless shell (#207 review).
+describe.skipIf(!darwin)("the macOS kernel layer, probed without a browser", () => {
+  it("the kernel refuses UDP under the renderer's own profile: a probe's send fails (EPERM), nothing arrives; without the profile it does", async () => {
+    // The authoritative check of the kernel rule (#207 review): one process, one datagram, the errno — no inference
+    // from how Chrome's ICE behaves.
+    const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-probe-")));
+    closers.push(async () => fs.rmSync(workDir, { recursive: true, force: true }));
+    const node = fs.realpathSync(process.execPath);
+    const probe = [path.join(FIXTURES, "net-probe.mjs"), "udp"];
+    // Control: the same probe without the profile reaches the listener.
+    const open = await udpListener();
+    const c = spawnSync(node, [...probe, String(open.port)], { encoding: "utf8", timeout: 20_000 });
+    expect(JSON.parse(c.stdout)).toEqual({ udpLocal: "sent" });
+    expect(await within(SETTLE_MS, () => open.got.n > 0)).toBe(true);
+    // Under the renderer's profile (the one its browser runs in): the send itself is refused by the kernel.
+    const shut = await udpListener();
+    const policy = rendererSandbox({
+      browser: node,
+      args: [],
+      env: {},
+      workDir,
+      proxyPort: 9,
+      lockFd: -1,
+      deadlineSec: 30,
+    });
+    const r = await runIsolated({
+      ...policy,
+      command: node,
+      args: [...probe, String(shut.port)],
+      read: [FIXTURES],
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+    });
+    expect(JSON.parse(r.stdout).udpLocal).toMatch(/^err:(EPERM|EACCES)$/);
+    await new Promise((d) => setTimeout(d, 300));
+    expect(shut.got.n).toBe(0);
+  });
 });
