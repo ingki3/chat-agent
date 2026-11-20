@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SHARE_FORK_NOTICE, type PublicPart, type SharedView } from "@agentlee/shared";
 import { ApiError, conversations, errorText, files, shares, SHARES_KEY } from "../api.js";
+import { MyPublicLinks } from "../public-links/PublicLinkDialog.js";
 import { CONVERSATIONS_KEY } from "../Sidebar.js";
 import {
   BoundaryPicker,
@@ -173,6 +174,7 @@ export function SharesPage() {
         <Incoming />
         <ShareForm />
         <MyShares />
+        <MyPublicLinks />
       </div>
     </>
   );

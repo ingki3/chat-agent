@@ -24,7 +24,17 @@ import {
   browserArgs,
   CdpError,
   CdpPipe,
+  killLiveRenders,
+  makeRenderDir,
+  reapAfterWatchdog,
+  releaseRenderDir,
+  renderReaped,
   sandboxedLauncher,
+  signalRender,
+  trackRender,
+  WATCHDOG_EXIT,
+  WATCHDOG_MAX_SEC,
+  type RenderDir,
   type Launched,
   type Launcher,
 } from "./browser.js";
@@ -43,8 +53,10 @@ import { CDN_ALLOW_LIST, serveVersion, type Served } from "./serve.js";
  *  2. every connection goes to an egress proxy that allows CONNECT to the CDN host on 443 only (and, being the
  *     #42 proxy, never to loopback, private, link-local or metadata addresses);
  *  3. the macOS process sandbox: the process can reach only that proxy's loopback port.
- * Time, memory (RSS of the one process — `--single-process`, no fork) and reply size are limited; past a limit
- * the process group is killed.
+ * Time, memory (RSS of the render's group — one `--single-process` browser, no fork) and reply size are limited;
+ * past a limit the process group is killed. The same-uid browser runs under a watchdog outside the server
+ * (`browser.ts` `WATCHDOG_PL`, #170): when the server dies — however it dies — the browser is killed and its folder
+ * removed.
  *
  * Under the worker account (#122, `workers/account.ts`) — once its render self-check passed — the browser is not
  * started by the server at all: the server asks the root-owned launcher (`sudo -u <account> … run render <job>
@@ -90,6 +102,8 @@ export const RENDER_LIMITS = {
   timeoutMs: 20_000,
   /** Resident memory of the browser process (checked every 250 ms). */
   maxRssBytes: 768 * 1024 * 1024,
+  /** One memory sample may take this long; past it the memory counts as unmeasurable (stop, fail closed). */
+  sampleTimeoutMs: 2000,
   /** One DevTools reply (the base64 PNG/PDF). */
   maxReplyBytes: 48 * 1024 * 1024,
   /** The file itself. */
@@ -127,6 +141,8 @@ export type RenderTestHooks = {
   /** Requests refused by interception (counted, not logged). */
   blocked?: (url: string) => void;
   probe?: () => Promise<{ pid: number; rss: number }[]>;
+  /** Every event of the page's session (e.g. a `Runtime.bindingCalled` the test asked for). */
+  events?: (method: string, params: Record<string, unknown>) => void;
 };
 
 export type RendererOptions = {
@@ -195,8 +211,22 @@ type Session = {
   send: (method: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
 };
 
+/** Renderers not yet closed: `closeRenderers` shuts them all (server exit and signals, the tests' `afterAll`). */
+const openRenderers = new Set<Renderer>();
+
+/**
+ * Shutdown (#170): every renderer stops taking renders first — queued ones are turned away, one waiting for its proxy
+ * or about to start its browser starts none — and only then is every live render group SIGKILLed and its folder
+ * removed. Synchronous (safe in an `exit` hook).
+ */
+export function closeRenderers(): number {
+  for (const r of [...openRenderers]) r.shutdown();
+  return killLiveRenders();
+}
+
 export class Renderer {
   private active = 0;
+  private closed = false;
   private readonly queue: (() => void)[] = [];
   private readonly limits: typeof RENDER_LIMITS;
   private readonly egress: EgressService;
@@ -206,6 +236,21 @@ export class Renderer {
     this.limits = { ...RENDER_LIMITS, ...o.limits };
     this.egress = new EgressService({ ...o.egress, allow: RENDER_EGRESS_HOSTS });
     this.launcher = o.launcher ?? sandboxedLauncher;
+    openRenderers.add(this);
+  }
+
+  /**
+   * No more renders: queued ones end now (`export_unavailable`), and any render that has not started its browser yet
+   * never does. Running ones are killed by the caller (`closeRenderers` → `killLiveRenders`).
+   */
+  shutdown() {
+    this.closed = true;
+    openRenderers.delete(this);
+    // Each waiter is let go as if it got a slot (its `finally` frees one), and sees `closed`.
+    for (const next of this.queue.splice(0)) {
+      this.active++;
+      next();
+    }
   }
 
   get available(): boolean {
@@ -213,6 +258,7 @@ export class Renderer {
   }
 
   close(): Promise<void> {
+    this.shutdown();
     return this.egress.close();
   }
 
@@ -222,7 +268,7 @@ export class Renderer {
    */
   async render(job: RenderJob, via?: RenderVia): Promise<RenderResult> {
     const worker = via?.worker ?? this.o.account?.verified();
-    if (!worker && !this.o.browser) return { ok: false, code: "export_unavailable" };
+    if (this.closed || (!worker && !this.o.browser)) return { ok: false, code: "export_unavailable" };
     if (!worker) this.o.account?.onFallback?.();
     if (this.active >= this.limits.concurrent) {
       // A few wait for a free slot (each render is short); beyond that the caller is told to come back.
@@ -230,6 +276,7 @@ export class Renderer {
       await new Promise<void>((resolve) => this.queue.push(resolve));
     } else this.active++;
     try {
+      if (this.closed) return { ok: false, code: "export_unavailable" };
       return await this.run(
         this.o.browser,
         job,
@@ -263,21 +310,24 @@ export class Renderer {
     } catch {
       return { ok: false, code: "export_unavailable" };
     }
+    if (this.closed) return { ok: false, code: "export_unavailable" };
     // A fresh, empty profile per render: no cookies, storage or cache of anyone, removed afterwards. Under the
     // account: a job folder of the worker scratch (the launcher finds it by the job id alone).
     const worker = via?.worker;
     const dataDir = this.o.account?.dataDir;
     let made: { jobId: string; dir: string } | undefined;
     let workDir: string;
+    let render: RenderDir | undefined;
     try {
       if (worker) {
         if (!dataDir) return { ok: false, code: "export_unavailable" };
         made = makeWorkerJobDir(dataDir);
         workDir = made.dir;
-      } else
-        workDir = fs.realpathSync(
-          fs.mkdtempSync(path.join(this.o.tmpDir ?? os.tmpdir(), "agentlee-render-")),
-        );
+      } else {
+        // The folder and its lock file beside it, both new (#170).
+        render = makeRenderDir(this.o.tmpDir ?? os.tmpdir());
+        workDir = render.workDir;
+      }
     } catch {
       return { ok: false, code: "export_unavailable" };
     }
@@ -289,145 +339,183 @@ export class Renderer {
           // the self-check's look never decides the clean-up
         }
         removeWorkerJob(worker.account, dataDir, made.jobId, this.o.account?.clean);
-      } else fs.rmSync(workDir, { recursive: true, force: true });
+      } else if (render) releaseRenderDir(render); // kept while its reap goes on, or for good if never confirmed (#215)
     };
-    const home = path.join(workDir, "home");
-    const tmp = path.join(workDir, "tmp");
-    const profile = path.join(workDir, "profile");
-    for (const d of [home, tmp, profile]) fs.mkdirSync(d, { mode: 0o700 });
-    const env = { HOME: home, TMPDIR: tmp };
-    const base = browserArgs(profile, t.proxy === false ? undefined : proxy.url);
-    const args = t.args ? t.args(base) : base;
-    t.launched?.({ args, env, workDir });
-
-    let launched;
+    // From here on, the folder (and the server's lock descriptor) go in exactly one place: this `finally` (#170).
     try {
-      launched =
-        worker && made
-          ? this.launchAsAccount(worker.account, made.jobId, proxy.port)
-          : this.launcher({ browser: browser!, args, env, workDir, proxyPort: proxy.port });
-    } catch {
-      removeWorkDir();
-      return { ok: false, code: "export_unavailable" };
-    }
-    const { child, input, output } = launched;
-    const pid = child.pid;
-    let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
-    let exited = false;
-    let exitCode: number | null = null;
-    const exit = new Promise<void>((resolve) => {
-      child.once("exit", (code) => {
-        exited = true;
-        exitCode = code;
-        resolve();
-      });
-      child.once("error", () => {
-        exited = true;
-        resolve();
-      });
-    });
-    // Under the account the server cannot signal the browser (another uid): the launcher's reap kills the
-    // recorded, verified process (retried while it could not verify, python_run's rule), and our ends of the pipes
-    // close so nothing waits on them.
-    const reapOnce = (left: number) => {
-      if (!worker || !made) return;
-      const jobId = made.jobId;
-      (this.o.account?.reap ?? reapWorker)(worker.account, jobId, (code) => {
-        if (code !== 0 && left > 0 && !exited) setTimeout(() => reapOnce(left - 1), 500).unref();
-      });
-    };
-    const kill = (why: NonNullable<typeof killed>) => {
-      if (exited) return;
-      if (worker) {
-        if (killed) return;
-        killed = why;
-        reapOnce(REAP_RETRIES);
-        input.destroy();
-        output.destroy();
-        return;
-      }
-      killed ??= why;
+      const home = path.join(workDir, "home");
+      const tmp = path.join(workDir, "tmp");
+      const profile = path.join(workDir, "profile");
       try {
-        process.kill(-pid!, "SIGKILL");
+        for (const d of [home, tmp, profile]) fs.mkdirSync(d, { mode: 0o700 });
       } catch {
-        child.kill("SIGKILL");
+        return { ok: false, code: "export_unavailable" }; // e.g. a full disk: nothing started, nothing kept
       }
-    };
-    const cdp = new CdpPipe(input, output, L.maxReplyBytes);
-    const timer = setTimeout(() => {
-      kill("timeout");
-      cdp.close(new CdpError("closed"));
-    }, L.timeoutMs);
-    // The self-check's shutdown (account mode): stop the render now; it fails.
-    const onAbort = () => {
-      kill("protocol");
-      cdp.close(new CdpError("closed"));
-    };
-    if (via?.signal?.aborted) onAbort();
-    else via?.signal?.addEventListener("abort", onAbort, { once: true });
-    // Memory of the one browser process; not measurable while it runs → stop (fail closed). Under the account the
-    // launcher watches it (every 250 ms, exit 125 over the limit): the server's pid is sudo's.
-    let sampling = false;
-    const monitor = setInterval(() => {
-      if (worker || sampling || exited || !pid) return;
-      sampling = true;
-      (t.probe ?? (() => snapshot(pid)))()
-        .then((procs) => {
-          const me = procs.find((p) => p.pid === pid);
-          if (!me) {
-            if (!exited) kill("monitor");
-          } else if (me.rss * 1024 > L.maxRssBytes) kill("memory");
-        })
-        .catch(() => kill("monitor"))
-        .finally(() => (sampling = false));
-    }, 250);
-    child.once("exit", () => cdp.close(new CdpError("closed")));
-    // A browser that breaks the protocol (malformed or oversized messages — possibly a compromised renderer) is
-    // not asked to close: it is killed at once.
-    cdp.onClose((e) => {
-      if (e.code !== "closed") kill("protocol");
-    });
+      const env = { HOME: home, TMPDIR: tmp };
+      const base = browserArgs(profile, t.proxy === false ? undefined : proxy.url);
+      const args = t.args ? t.args(base) : base;
+      t.launched?.({ args, env, workDir });
 
-    let result: RenderResult;
-    try {
-      const body = await this.drive(cdp, job);
-      result =
-        body.length > L.maxFileBytes
-          ? { ok: false, code: "export_limit" }
-          : { ok: true, body, type: job.format === "png" ? "image/png" : "application/pdf" };
-    } catch (e) {
-      result = {
-        ok: false,
-        code: e instanceof CdpError && e.code === "too_large" ? "export_limit" : "export_failed",
+      let launched;
+      // Shut down while the folder was being made: no browser starts after `closeRenderers`.
+      if (this.closed) return { ok: false, code: "export_unavailable" };
+      try {
+        launched =
+          worker && made
+            ? this.launchAsAccount(worker.account, made.jobId, proxy.port)
+            : this.launcher({
+                browser: browser!,
+                args,
+                env,
+                workDir,
+                lockFd: render!.lockFd,
+                proxyPort: proxy.port,
+                // The watchdog's own cap (#170): a backstop a little past ours, enforced outside this process.
+                deadlineSec: Math.min(WATCHDOG_MAX_SEC, Math.ceil(L.timeoutMs / 1000) + 10),
+              });
+      } catch {
+        return { ok: false, code: "export_unavailable" };
+      }
+      const { child, input, output } = launched;
+      const pid = child.pid;
+      // Same uid: the watchdog's group (the browser is in it, #170) is ours to kill on shutdown (`killLiveRenders`)
+      // until the watchdog has exited. It reports its **own** end (`WATCHDOG_EXIT`): done or stopped (it killed and
+      // reaped the browser), not started, exec failed — nothing left. Any other end (a signal: the watchdog itself was
+      // interrupted) may leave the browser behind: the watchdog is already reaped then, so its group id is not ours to
+      // signal any more — the server reaps the render's own processes by pid (`reapAfterWatchdog`, #215) unless a reap
+      // is already going. The group itself is signalled at most once per render, and only while the watchdog lives
+      // (`signalRender`: its limits here, or `killLiveRenders`); that signal starts the same reap (#215: a browser forked
+      // as it landed survives it). A render being reaped stays tracked after the watchdog's exit until its reap is over,
+      // so shutdown takes it over. The folder goes in this render's `finally` (`releaseRenderDir`), after the reap.
+      if (!worker && pid) {
+        const untrack = trackRender(pid, render!, { argv: child.spawnargs, browser: browser! });
+        child.once("exit", (code) => {
+          const X = WATCHDOG_EXIT;
+          const clean =
+            code === X.done || code === X.stopped || code === X.notStarted || code === X.execFailed;
+          // Already reaped: its pid (the group id) is no longer ours — the reap by pid only, no group signal.
+          if (!clean) reapAfterWatchdog(pid);
+          untrack();
+        });
+      }
+      let killed: "timeout" | "memory" | "monitor" | "protocol" | undefined;
+      let exited = false;
+      let exitCode: number | null = null;
+      const exit = new Promise<void>((resolve) => {
+        child.once("exit", (code) => {
+          exited = true;
+          exitCode = code;
+          resolve();
+        });
+        child.once("error", () => {
+          exited = true;
+          resolve();
+        });
+      });
+      // Under the account the server cannot signal the browser (another uid): the launcher's reap kills the
+      // recorded, verified process (retried while it could not verify, python_run's rule), and our ends of the pipes
+      // close so nothing waits on them.
+      const reapOnce = (left: number) => {
+        if (!worker || !made) return;
+        const jobId = made.jobId;
+        (this.o.account?.reap ?? reapWorker)(worker.account, jobId, (code) => {
+          if (code !== 0 && left > 0 && !exited) setTimeout(() => reapOnce(left - 1), 500).unref();
+        });
       };
+      const kill = (why: NonNullable<typeof killed>) => {
+        if (exited) return;
+        if (worker) {
+          if (killed) return;
+          killed = why;
+          reapOnce(REAP_RETRIES);
+          input.destroy();
+          output.destroy();
+          return;
+        }
+        killed ??= why;
+        signalRender(pid!);
+      };
+      const cdp = new CdpPipe(input, output, L.maxReplyBytes);
+      const timer = setTimeout(() => {
+        kill("timeout");
+        cdp.close(new CdpError("closed"));
+      }, L.timeoutMs);
+      // The self-check's shutdown (account mode): stop the render now; it fails.
+      const onAbort = () => {
+        kill("protocol");
+        cdp.close(new CdpError("closed"));
+      };
+      if (via?.signal?.aborted) onAbort();
+      else via?.signal?.addEventListener("abort", onAbort, { once: true });
+      // Shut down between the spawn and here (`closeRenderers` found nothing of this render to kill yet): kill it now.
+      if (this.closed) onAbort();
+      // Memory of the render's group (the one browser process plus its watchdog, #170); not measurable while it runs →
+      // stop (fail closed). Under the account the launcher watches it (every 250 ms, exit 125 over the limit): the
+      // server's pid is sudo's.
+      let sampling = false;
+      const monitor = setInterval(() => {
+        if (worker || sampling || exited || !pid) return;
+        sampling = true;
+        (t.probe ?? (() => snapshot(pid, L.sampleTimeoutMs, true)))()
+          .then((procs) => {
+            if (!procs.length) {
+              if (!exited) kill("monitor");
+            } else if (procs.reduce((n, p) => n + p.rss, 0) * 1024 > L.maxRssBytes) kill("memory");
+          })
+          .catch(() => kill("monitor"))
+          .finally(() => (sampling = false));
+      }, 250);
+      child.once("exit", () => cdp.close(new CdpError("closed")));
+      // A browser that breaks the protocol (malformed or oversized messages — possibly a compromised renderer) is
+      // not asked to close: it is killed at once.
+      cdp.onClose((e) => {
+        if (e.code !== "closed") kill("protocol");
+      });
+
+      let result: RenderResult;
+      try {
+        const body = await this.drive(cdp, job);
+        result =
+          body.length > L.maxFileBytes
+            ? { ok: false, code: "export_limit" }
+            : { ok: true, body, type: job.format === "png" ? "image/png" : "application/pdf" };
+      } catch (e) {
+        result = {
+          ok: false,
+          code: e instanceof CdpError && e.code === "too_large" ? "export_limit" : "export_failed",
+        };
+      }
+      // The launcher's own limits (account mode): 124 its wall clock, 125 its memory watch. Its pipes may close a
+      // moment before its exit is seen: a failed render waits briefly for the exit code.
+      if (worker && !killed && !result.ok && !exited)
+        await Promise.race([exit, new Promise((r) => setTimeout(r, 1000).unref())]);
+      if (worker && !killed && exited) {
+        if (exitCode === 124) killed = "timeout";
+        else if (exitCode === 125) killed = "memory";
+      }
+      if (killed === "timeout") result = { ok: false, code: "export_timeout" };
+      else if (killed === "protocol")
+        result = { ok: false, code: cdp.error?.code === "too_large" ? "export_limit" : "export_failed" };
+      else if (killed) result = { ok: false, code: "export_limit" };
+      clearTimeout(timer);
+      via?.signal?.removeEventListener("abort", onAbort);
+      clearInterval(monitor);
+      // A failed render (bad reply, protocol error, limit) is killed outright; a good one is closed politely, then
+      // made sure of: the whole process group goes either way.
+      if (!result.ok) kill("protocol");
+      if (!exited) {
+        void cdp.send("Browser.close");
+        const hard = setTimeout(() => kill("monitor"), 2000);
+        await exit;
+        clearTimeout(hard);
+      }
+      cdp.close(new CdpError("closed"));
+      return result;
+    } finally {
+      // Same uid: once a signalled render's reap is over (#215) — its processes confirmed gone, or given up on.
+      if (render) await renderReaped(render);
+      removeWorkDir();
     }
-    // The launcher's own limits (account mode): 124 its wall clock, 125 its memory watch. Its pipes may close a
-    // moment before its exit is seen: a failed render waits briefly for the exit code.
-    if (worker && !killed && !result.ok && !exited)
-      await Promise.race([exit, new Promise((r) => setTimeout(r, 1000).unref())]);
-    if (worker && !killed && exited) {
-      if (exitCode === 124) killed = "timeout";
-      else if (exitCode === 125) killed = "memory";
-    }
-    if (killed === "timeout") result = { ok: false, code: "export_timeout" };
-    else if (killed === "protocol")
-      result = { ok: false, code: cdp.error?.code === "too_large" ? "export_limit" : "export_failed" };
-    else if (killed) result = { ok: false, code: "export_limit" };
-    clearTimeout(timer);
-    via?.signal?.removeEventListener("abort", onAbort);
-    clearInterval(monitor);
-    // A failed render (bad reply, protocol error, limit) is killed outright; a good one is closed politely, then
-    // made sure of: the whole process group goes either way.
-    if (!result.ok) kill("protocol");
-    if (!exited) {
-      void cdp.send("Browser.close");
-      const hard = setTimeout(() => kill("monitor"), 2000);
-      await exit;
-      clearTimeout(hard);
-    }
-    cdp.close(new CdpError("closed"));
-    removeWorkDir();
-    return result;
   }
 
   /** Opens the document in a new page and captures it. */
@@ -440,6 +528,11 @@ export class Renderer {
       await cdp.send("Target.attachToTarget", { targetId, flatten: true }),
     );
     const s: Session = { send: (m, p) => cdp.send(m, p ?? {}, sessionId) };
+    const offEvents = t.events
+      ? cdp.on((m) => {
+          if (m.sessionId === sessionId && m.method) t.events!(m.method, m.params ?? {});
+        })
+      : undefined;
 
     // Layer 1: every request of the page stops here. The document is delivered once; exact CDN URLs go on (to the
     // proxy); anything else — the app, loopback, the home network, other hosts, the document navigating itself —
@@ -529,6 +622,7 @@ export class Renderer {
       return Buffer.from(data, "base64");
     } finally {
       off();
+      offEvents?.();
     }
   }
 }

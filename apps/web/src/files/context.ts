@@ -9,7 +9,12 @@ import { fileViewPath, type FileLocator } from "@agentlee/shared";
 export const FileViewContext = createContext<string | null>(null);
 
 /** The viewer's address for a file (at a locator), or null without a conversation. */
-export function useFileViewHref(): (fileId: string, locator?: FileLocator) => string | null {
+export function useFileViewHref(): (
+  fileId: string,
+  locator?: FileLocator,
+  citationId?: string | null,
+) => string | null {
   const conversationId = useContext(FileViewContext);
-  return (fileId, locator) => (conversationId ? fileViewPath(conversationId, fileId, locator) : null);
+  return (fileId, locator, citationId) =>
+    conversationId ? fileViewPath(conversationId, fileId, locator, citationId ?? undefined) : null;
 }

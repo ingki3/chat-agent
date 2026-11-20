@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { CITATION_LIMITS } from "@agentlee/shared";
 
 export const MCP_SERVER_NAME = "agentlee";
 export const MCP_PATH = "/mcp";
@@ -51,6 +52,11 @@ export type McpHost = {
   runSkill(name: string, input: Record<string, unknown>, scope: ToolScope): Promise<SkillResult>;
   /** Told about every answered tool call (the connection test #17 checks that our server really served them). */
   onToolCall?(tool: string, scope: ToolScope, ok: boolean): void;
+  /**
+   * Whether this run may call `tool` now (takes one call of a run's budget — #211's research steps). Absent: yes. Checked
+   * by tools this package answers itself (`echo_time`); the host checks its own tools in `runTool` / `runSkill`.
+   */
+  mayCall?(tool: string, scope: ToolScope): boolean;
   /** The host's own tools (named as they are, no prefix), and how to run one. */
   tools?: readonly ServerToolInfo[];
   /**
@@ -63,6 +69,21 @@ export type McpHost = {
 
 /** Tool names this server offers (adapters list them as allowed; runtimes see `mcp__agentlee__<name>`). */
 export const skillToolName = (skill: string) => `skill_${skill}`;
+
+/** Characters a `cite` / `file_cite` snippet may have — UTF-16 units, as the server stores and compares it. */
+export const CITE_SNIPPET_MAX = CITATION_LIMITS.snippet;
+
+/**
+ * A cited passage (#186 review 2차): at most `CITE_SNIPPET_MAX` UTF-16 units (zod's `max` counts code points — an
+ * emoji is two units). Longer input is refused, never cut before it is compared.
+ */
+export const citeSnippet = (describe: string) =>
+  z
+    .string()
+    .min(1)
+    .max(CITE_SNIPPET_MAX)
+    .refine((s) => s.length <= CITE_SNIPPET_MAX, { message: `at most ${CITE_SNIPPET_MAX} UTF-16 units` })
+    .describe(describe);
 export function toolNames(host: Pick<McpHost, "skills" | "tools">): string[] {
   return [
     "echo_time",
@@ -95,6 +116,7 @@ function serverFor(host: McpHost, token: string, scope: ToolScope): McpServer {
     async () => {
       const name = host.userName(scope.userId);
       if (!name || !stillValid()) return text({ error: "unauthorized" }, true);
+      if (host.mayCall && !host.mayCall("echo_time", scope)) return text({ error: "not_allowed" }, true);
       const now = (host.now ?? (() => new Date()))();
       const timeZone = host.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
       host.onToolCall?.("echo_time", scope, true);

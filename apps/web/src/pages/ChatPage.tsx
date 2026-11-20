@@ -31,11 +31,21 @@ import {
   runs,
   settings as settingsApi,
   MEMORY_PROPOSALS_KEY,
+  research,
 } from "../api.js";
 import { AttachButton, AttachmentChips, useAttachments } from "../chat/Attachments.js";
 import { ChipChoice, differs, noticeText, takeFallbackNotice, withoutNotice } from "../chat/chip.js";
 import { CopyButton } from "../chat/CopyButton.js";
-import { confirmRunEnded } from "../chat/confirm-end.js";
+import { rereadQuery } from "../chat/reread.js";
+import { listBusy, olderStep, type OlderAsk } from "../chat/older-pages.js";
+import {
+  forgetReadsAfterEnd,
+  nextEnding,
+  pageSignal,
+  settleEnd,
+  startSettleLoop,
+  type Ending,
+} from "../chat/settle.js";
 import { IDLE, enter, free, type Deferred, type Queued } from "../chat/deferred-send.js";
 import { DividerView, FileRef, Parts, RUNTIME_LABEL, textOf } from "../chat/Parts.js";
 import { RuntimeChip } from "../chat/RuntimeChip.js";
@@ -104,7 +114,16 @@ export function ChatPage() {
   // Newest page first; "이전 메시지 보기" loads older pages (shown above).
   const messages = useInfiniteQuery({
     queryKey: ["messages", id],
-    queryFn: ({ pageParam }) => conversations.messages(id, pageParam),
+    // The signal reaches the request: when the screen goes, a read still on its way is cancelled with it. Pages read by
+    // the settle loop also get a time limit each (a hung request fails, the loop tries again); others wait.
+    queryFn: async ({ pageParam, signal }) => {
+      const page = pageSignal(qc, id, signal);
+      try {
+        return await conversations.messages(id, pageParam, page.signal);
+      } finally {
+        page.done();
+      }
+    },
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (last) => last.nextBefore ?? undefined,
   });
@@ -112,14 +131,31 @@ export function ChatPage() {
   // The run this page just started (review #116): an answer to an `active-run` request sent before it (a background
   // refetch still in flight, `null`) never replaces it — the stream would close and the reply never come.
   const startedHere = useRef<{ id: string; runId: string; at: number } | null>(null);
+  // A reply whose end is being settled (#103): every sign of an end marks it, one settle loop handles them all (see
+  // chat/settle.ts). Keyed by run (`nextEnding`): a sign about a run no longer followed is ignored; one about the
+  // run followed now replaces an older attempt; signs of the same end are one.
+  const [ending, setEnding] = useState<Ending | null>(null);
+  const beginEnding = useCallback(
+    (e: Ending) => {
+      const followed = qc.getQueryData<Run | null>(["active-run", e.conversationId]) ?? null;
+      setEnding((cur) => nextEnding(cur, e, followed?.endedAt === null ? followed.id : null));
+    },
+    [qc],
+  );
   const active = useQuery({
     queryKey: ["active-run", id],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const asked = Date.now();
-      const r = await conversations.activeRun(id);
+      const r = await conversations.activeRun(id, signal);
+      const cached = qc.getQueryData<Run | null>(["active-run", id]) ?? null;
       const mine = startedHere.current;
-      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId)
-        return qc.getQueryData<Run | null>(["active-run", id]) ?? null;
+      if (mine && mine.id === id && mine.at >= asked && r?.id !== mine.runId) return cached;
+      // The run followed live is over (or another took its place): it is let go only once its end is settled — a
+      // messages read after the end shows the reply final — never on this answer alone.
+      if (cached && cached.endedAt === null && !(r && r.id === cached.id && r.endedAt === null)) {
+        beginEnding({ conversationId: id, messageId: cached.assistantMessageId, runId: cached.id });
+        return cached;
+      }
       return r;
     },
   });
@@ -140,11 +176,8 @@ export function ChatPage() {
       qc.invalidateQueries({ queryKey: ["artifact"] }),
       qc.invalidateQueries({ queryKey: MY_ARTIFACTS_KEY }),
     ]);
-  const refresh = async () => {
-    // Messages first: the saved reply must be there before the live one is let go (no flash of stale text).
-    await qc.invalidateQueries({ queryKey: ["messages", id] });
-    await Promise.all([qc.invalidateQueries({ queryKey: ["active-run", id] }), refreshAround()]);
-  };
+  /** The run whose stream closed (with or without `done`): if it turns out to be still going, it is followed again. */
+  const closedRun = useRef<string | null>(null);
   const { live, reconnect } = useRunStream(
     active.data,
     (last) => {
@@ -153,10 +186,68 @@ export function ChatPage() {
           ...a,
           [last.messageId]: { notices: last.notices, ...(last.error ? { error: last.error } : {}) },
         }));
-      void refresh();
+      closedRun.current = last.runId;
+      beginEnding({ conversationId: id, messageId: last.messageId, runId: last.runId });
     },
-    () => void refresh(),
+    () => void qc.invalidateQueries({ queryKey: ["active-run", id] }),
   );
+  // No run in progress, yet the latest reply reads as unfinished: opened as its run ended (the messages read before
+  // the end, the run after it), or a reply sent from another tab — settled like any end (#103 review).
+  const lastAssistant = list?.findLast((m) => m.role === "assistant");
+  const noRun = active.isSuccess && !active.isFetching && (!active.data || active.data.endedAt !== null);
+  const unfinishedId =
+    noRun && (lastAssistant?.status === "pending" || lastAssistant?.status === "streaming")
+      ? lastAssistant.id
+      : null;
+  // Recorded once (while rendering, as derived state): its attempt then runs to its end — a status that changes
+  // meanwhile (the read after it) never cancels the attempt that found a run (another tab's) before applying it.
+  const [seenUnfinished, setSeenUnfinished] = useState<string | null>(null);
+  const unfinishedKey = unfinishedId ? `${id}\n${unfinishedId}` : null;
+  // (Only while nothing else settles here: that end, once settled, lets this be seen afresh.)
+  if (unfinishedKey && unfinishedKey !== seenUnfinished && ending?.conversationId !== id) {
+    setSeenUnfinished(unfinishedKey);
+    beginEnding({ conversationId: id, messageId: unfinishedId!, runId: null });
+  }
+
+  // The settle loop (`startSettleLoop`): a try now, then again after 2 s, doubling up to 30 s while it stays unsettled (a
+  // server that keeps a reply unfinished with no run is not asked every 2 s forever); one at a time; stopped when the
+  // conversation is left.
+  const around = useEffectEvent(() => refreshAround());
+  const followAgain = useEffectEvent(() => reconnect());
+  const marked = ending?.conversationId === id ? ending : null;
+  // What is being settled, as plain values (the loop restarts only for another reply or run).
+  const settleMessage = marked ? marked.messageId : null;
+  const settleRun = marked ? marked.runId : null;
+  /** The running loop's run and its poke (a stop answered with that run ended: check now, not after the backoff). */
+  const pokeSettle = useRef<{ runId: string | null; poke: () => void } | null>(null);
+  useEffect(() => {
+    if (!settleMessage) return;
+    const settling: Ending = { conversationId: id, messageId: settleMessage, runId: settleRun };
+    const ac = new AbortController();
+    const loop = startSettleLoop(
+      () =>
+        settleEnd({
+          qc,
+          ending: settling,
+          signal: ac.signal,
+          readActiveRun: conversations.activeRun,
+          around,
+        }),
+      (r) => {
+        if (r === "running" && settling.runId !== null && closedRun.current === settling.runId) followAgain();
+        setEnding((e) =>
+          e && e.conversationId === id && e.messageId === settleMessage && e.runId === settleRun ? null : e,
+        );
+      },
+    );
+    pokeSettle.current = { runId: settleRun, poke: loop.poke };
+    return () => {
+      ac.abort();
+      loop.stop();
+      pokeSettle.current = null;
+    };
+  }, [id, settleMessage, settleRun, qc]);
+  useEffect(() => () => forgetReadsAfterEnd(qc, id), [qc, id]);
   // A new artifact of a run started here is shown on its page by itself (#28, FR-6.1, #172).
   useAutoShow(live, id);
   // Gave up on the stream: keep looking at the run now and then — once it has ended, the saved reply shows.
@@ -165,41 +256,13 @@ export function ChatPage() {
   const busy = (!!live && !lost) || starting;
   // The reply has its `done` but the run is not read as ended yet (#141): an Enter now is sent once it is.
   const finishing = !!live && !lost && live.status !== undefined;
-  const recheck = useEffectEvent(() => void refresh());
+  // A lost stream: the run is looked at now and then — an answer that it is over settles it like any end.
+  const recheck = useEffectEvent(() => void qc.invalidateQueries({ queryKey: ["active-run", id] }));
   useEffect(() => {
     if (!lost) return;
     const t = setInterval(recheck, 5000);
     return () => clearInterval(t);
   }, [lost]);
-  // While finishing, the end of the run is read again now and then (#141): the read after `done` may have failed
-  // (its retry too, or a retry left waiting) — busy stays until a read says the run ended, never cleared on a guess.
-  // One read at a time (a slow one is never cut short by the next); a read is dropped once the reply stops finishing
-  // or the conversation is left, and never applied over another run (see confirmRunEnded).
-  const finishingRun = finishing ? live.runId : null;
-  const around = useEffectEvent(() => refreshAround());
-  useEffect(() => {
-    if (!finishingRun) return;
-    const ac = new AbortController();
-    let checking = false;
-    const t = setInterval(() => {
-      if (checking) return;
-      checking = true;
-      void confirmRunEnded({
-        qc,
-        conversationId: id,
-        runId: finishingRun,
-        signal: ac.signal,
-        read: conversations.activeRun,
-        around,
-      })
-        .catch(() => false) // tried again on the next tick
-        .finally(() => (checking = false));
-    }, 2000);
-    return () => {
-      clearInterval(t);
-      ac.abort();
-    };
-  }, [finishingRun, id, qc]);
 
   const { scroller, content, away, toBottom } = useStickToBottom();
 
@@ -215,7 +278,7 @@ export function ChatPage() {
         // An `active-run` read still in flight would answer from before this run: cancelled first.
         await qc.cancelQueries({ queryKey: ["active-run", id] });
         qc.setQueryData(["active-run", id], r.run);
-        await qc.invalidateQueries({ queryKey: ["messages", id] });
+        await rereadQuery(qc, ["messages", id]);
         // An edit or a regenerate may take a card's source out of the history (spec §10.3).
         void qc.invalidateQueries({ queryKey: MEMORY_PROPOSALS_KEY });
         toBottom();
@@ -242,6 +305,17 @@ export function ChatPage() {
     }),
     [busy, id, start],
   );
+  // 🔬 깊이 조사 (#211): the question becomes a user message and the plan card; the job runs on the server.
+  const startResearch = useCallback(
+    async (text: string, fileIds: string[]) => {
+      await research.start(id, text, fileIds);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["messages", id] }),
+        qc.invalidateQueries({ queryKey: ["files", id] }),
+      ]);
+    },
+    [id, qc],
+  );
   // How many files the conversation already has (the 20-per-conversation limit counts sent ones too).
   const fileList = useQuery({ queryKey: ["files", id], queryFn: () => filesApi.list(id) });
   const conversationId = useCallback(async () => id, [id]);
@@ -261,11 +335,19 @@ export function ChatPage() {
     ? () =>
         void runs
           .interrupt(live.runId)
-          .then(refresh)
+          // Ended already: settled like any end (with the `done` that may be on its way, the same end); still
+          // going: its stream's `done` ends it.
+          .then((run) => {
+            if (run.endedAt === null) return;
+            // Its end already applied (the run let go): a late answer starts nothing.
+            if (qc.getQueryData<Run | null>(["active-run", id])?.id !== run.id) return;
+            beginEnding({ conversationId: id, messageId: run.assistantMessageId, runId: run.id });
+            // The same end already settling (its loop waiting out a backoff): checked now.
+            if (pokeSettle.current?.runId === run.id) pokeSettle.current.poke();
+          })
           .catch((e: unknown) => setActionError(errorText(e)))
     : undefined;
 
-  const lastAssistant = list?.findLast((m) => m.role === "assistant");
   const chatSettings = conv.data?.settings ?? null;
   // "기본값을 쓸 수 없어 ○○로 시작했어요" — once (FR-12.6): the server hands it to exactly one caller (another tab, a
   // reload or a failed request never shows it twice); only that page shows it, while the conversation is open.
@@ -287,7 +369,17 @@ export function ChatPage() {
   const { hash } = useLocation();
   const target = hash.startsWith("#m-") ? hash.slice(3) : null;
   const found = !!target && !!list?.some((m) => m.id === target);
-  const { hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage } = messages;
+  const { hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } = messages;
+  /** Whether the messages are being read right now — the query's own state (a paused, offline read counts too). */
+  const messagesLoading = useCallback(() => listBusy(qc, ["messages", id]), [qc, id]);
+  // "이전 메시지 보기" while the list is being read: the click waits and goes once it is idle, and is kept until its page
+  // has arrived (chat/older-pages.ts; done by the effect after the schedule-result read below).
+  const olderAsked = useRef<OlderAsk | null>(null);
+  const pageCount = messages.data?.pages.length ?? 0;
+  const loadOlder = () => {
+    if (messagesLoading()) olderAsked.current = { conversationId: id, pages: pageCount };
+    else void fetchNextPage();
+  };
   const scrolledTo = useRef<string | null>(null);
   const search = useRef<{ key: string; pages: number }>({ key: "", pages: 0 });
   const [searchStopped, setSearchStopped] = useState<string | null>(null);
@@ -302,12 +394,23 @@ export function ChatPage() {
   const linkKey = `${linkKeyOf(id, hash)}@${linkGen.n}`;
   if (found && foundLink !== linkKey) setFoundLink(linkKey);
   const foundOnce = foundLink === linkKey;
+  /** "다시 시도" asked for this link: its next page is fetched once the list is not being read (counted then). */
+  const searchRetry = useRef<string | null>(null);
   useEffect(() => {
     if (search.current.key !== linkKey) search.current = { key: linkKey, pages: 0 };
     if (!target || !list || scrolledTo.current === linkKey) return;
     if (!found) {
       if (foundOnce) return;
-      if (isFetchingNextPage || searchStopped === linkKey) return;
+      // Not while the list is being read (a read after a reply's end): an older page would cut it short; resumed after
+      // (this effect runs again when the read ends). Checked on the query itself, as it is now.
+      if (isFetching || messagesLoading()) return;
+      if (searchRetry.current === linkKey) {
+        searchRetry.current = null;
+        search.current.pages = 1;
+        void fetchNextPage();
+        return;
+      }
+      if (searchStopped === linkKey) return;
       // Not there at all (deleted, another version), a failed page, or the cap: stop and say so.
       if (!hasNextPage || isFetchNextPageError || search.current.pages >= SEARCH_PAGES)
         return setSearchStopped(linkKey);
@@ -324,17 +427,19 @@ export function ChatPage() {
     found,
     list,
     hasNextPage,
-    isFetchingNextPage,
+    isFetching,
     isFetchNextPageError,
     fetchNextPage,
     linkKey,
     searchStopped,
     foundOnce,
+    messagesLoading,
   ]);
   const retrySearch = () => {
-    search.current = { key: linkKey, pages: 1 };
+    // The page is asked for (and counted) by the search effect, once the list is not being read.
+    search.current = { key: linkKey, pages: 0 };
+    searchRetry.current = linkKey;
     setSearchStopped(null);
-    void fetchNextPage();
   };
   // A schedule's result (#56, FR-8.3): when the conversation says there is one that is not shown yet, the view is read
   // again; "새 결과" goes only once that very message has loaded without error (and, for a link, was found).
@@ -350,13 +455,34 @@ export function ChatPage() {
   const linkHolds = linkSearching || (searchStopped === linkKey && resultId === target);
   const reread = useRef(0);
   useEffect(() => {
-    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure).
-    if (!newResult || resultLoaded || linkHolds || messages.isFetching) return;
+    // Not while a result link looks for its message itself (it loads the pages, and stops on a failure), nor while
+    // the list is being read (a page on its way would be cancelled).
+    if (!newResult || resultLoaded || linkHolds || messages.isFetching || messagesLoading()) return;
     if (reread.current === conv.dataUpdatedAt) return;
     reread.current = conv.dataUpdatedAt;
     void qc.invalidateQueries({ queryKey: ["messages", id] });
     void qc.invalidateQueries({ queryKey: ["active-run", id] });
-  }, [newResult, resultLoaded, linkHolds, messages.isFetching, conv.dataUpdatedAt, id, qc]);
+  }, [newResult, resultLoaded, linkHolds, messages.isFetching, messagesLoading, conv.dataUpdatedAt, id, qc]);
+  // The waiting older-page click — after the effect above (a schedule result's read it starts goes first: the list is
+  // then busy), after every render (the read's end re-renders, whenever it came); kept until its page arrived.
+  useEffect(() => {
+    const step = olderStep(olderAsked.current, {
+      conversationId: id,
+      pages: pageCount,
+      hasNextPage: !!hasNextPage,
+      errors: qc.getQueryState(["messages", id])?.errorUpdateCount ?? 0,
+      nextPageFailed: isFetchNextPageError,
+      busy: isFetching || messagesLoading(),
+    });
+    if (step === "done" || step === "none") olderAsked.current = null;
+    else if (step === "fetch") {
+      olderAsked.current = {
+        ...olderAsked.current!,
+        errorsAtStart: qc.getQueryState(["messages", id])?.errorUpdateCount ?? 0,
+      };
+      void fetchNextPage();
+    }
+  });
   useEffect(() => {
     if (!newResult || !resultLoaded || !linkOk) return;
     void conversations
@@ -399,7 +525,7 @@ export function ChatPage() {
                   type="button"
                   className="ghost small older"
                   disabled={messages.isFetchingNextPage}
-                  onClick={() => void messages.fetchNextPage()}
+                  onClick={loadOlder}
                 >
                   {messages.isFetchingNextPage ? "불러오는 중…" : "이전 메시지 보기"}
                 </button>
@@ -423,7 +549,10 @@ export function ChatPage() {
                     m={m}
                     live={live && m.id === live.messageId ? live : null}
                     after={after[m.id]}
-                    canRegenerate={!busy && m.id === lastAssistant?.id}
+                    // A 깊이 조사 card (#211) is not an answer to regenerate.
+                    canRegenerate={
+                      !busy && m.id === lastAssistant?.id && !m.parts.some((p) => p.type === "research")
+                    }
                     onRegenerate={regenerate}
                     onReconnect={reconnect}
                     onStop={stop}
@@ -476,6 +605,17 @@ export function ChatPage() {
         }
         conversation={conversationId}
         existingFiles={fileList.data ?? NO_FILES}
+        research={
+          conv.data?.owned === true
+            ? {
+                start: startResearch,
+                // Claude conversations only (#211 decision 3).
+                ...((chatSettings?.runtime ?? "claude-code") !== "claude-code"
+                  ? { disabled: "깊이 조사는 Claude 대화에서만 쓸 수 있어요" }
+                  : {}),
+              }
+            : undefined
+        }
       />
     </>
   );
@@ -546,6 +686,17 @@ export function NewChatPage() {
     await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
     navigate(`/c/${id}`);
   };
+  /** 🔬 깊이 조사 as the first question (#211): the same conversation creation and chip choice as a send. */
+  const startResearch = async (text: string, fileIds: string[]) => {
+    const chosen = await choice.settled();
+    const made = await make();
+    const id = made.id;
+    const change = made.with !== chosen ? asRequest(chosen) : undefined;
+    if (change) qc.setQueryData(["conversation", id], await conversations.changeSettings(id, change));
+    await research.start(id, text, fileIds);
+    await qc.invalidateQueries({ queryKey: CONVERSATIONS_KEY });
+    navigate(`/c/${id}`);
+  };
   // The server computes the choice (the same rules as the conversation is created with, limits included).
   const change = async (c: ChangeSettingsRequest) => {
     if (!start) return;
@@ -577,6 +728,13 @@ export function NewChatPage() {
         chip={<RuntimeChip settings={start} options={usable.data} onChange={change} />}
         conversation={conversation}
         existingFiles={NO_FILES}
+        research={{
+          start: startResearch,
+          // Claude conversations only (#211 decision 3): the chip's choice decides.
+          ...(start && start.runtime !== "claude-code"
+            ? { disabled: "깊이 조사는 Claude 대화에서만 쓸 수 있어요" }
+            : {}),
+        }}
       />
     </>
   );
@@ -817,6 +975,11 @@ function Composer(props: {
   conversation: () => Promise<string>;
   /** The conversation's files on the server (unsent ones are shown as chips). */
   existingFiles: readonly UploadedFile[];
+  /**
+   * 🔬 깊이 조사 (#211): the composer's text (and files) as a research question. `disabled`: the reason it cannot be
+   * used here (a Codex conversation) — shown on the button. Absent: no button (a shared reader, the new-chat screen).
+   */
+  research?: { start: (text: string, fileIds: string[]) => Promise<unknown>; disabled?: string } | undefined;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -838,6 +1001,22 @@ function Composer(props: {
       // Files that are gone (deleted elsewhere, or already sent): drop their chips so the next send works.
       if (e instanceof ApiError && e.code === "invalid_attachment")
         void attach.reconcile().catch(() => undefined);
+    } finally {
+      setSending(false);
+    }
+  };
+  /** Sends the composer's text and files as a 깊이 조사 question (never queued: a plan card comes first). */
+  const startResearch = async () => {
+    if (!props.research || !text.trim()) return;
+    setSending(true);
+    setError(null);
+    const fileIds = [...attach.ready];
+    try {
+      await props.research.start(text.trim(), fileIds);
+      setText("");
+      attach.sent(fileIds);
+    } catch (e) {
+      setError(errorText(e));
     } finally {
       setSending(false);
     }
@@ -955,6 +1134,25 @@ function Composer(props: {
           )}
           <span className="grow" />
           {props.chip}
+          {props.research && !stop && (
+            <button
+              type="button"
+              className="small research-start"
+              data-testid="research-start"
+              disabled={
+                !!props.research.disabled || !text.trim() || sending || props.busy || attach.uploading
+              }
+              title={
+                props.research.disabled ??
+                "입력한 질문을 깊이 조사해요: 계획을 먼저 보여 드리고, 승인하면 여러 출처를 찾아 검증한 보고서를 만들어요 (최대 30분)"
+              }
+              aria-label={props.research.disabled ? `깊이 조사 — ${props.research.disabled}` : "깊이 조사"}
+              onClick={() => void startResearch()}
+            >
+              <span aria-hidden>🔬</span>
+              <span className="research-label"> 깊이 조사</span>
+            </button>
+          )}
           {stop ? (
             <button type="button" onClick={stop}>
               ■ 중지

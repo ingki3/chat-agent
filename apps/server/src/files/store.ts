@@ -162,13 +162,22 @@ export class FileStore {
   verifiedCitations(
     conversationId: string,
     fileId: string,
-  ): { id: string; quote: string; locator: string }[] {
+    /** Just this citation (the viewer link's own, #186 review 8차). */
+    citationId: string,
+  ): { id: string; quote: string; locator: string; unitHash: string | null; snippet: string }[] {
     return this.db.$client
       .prepare(
-        `SELECT id, quote, locator FROM citations
-         WHERE conversation_id = ? AND file_id = ? AND status = 'verified' AND quote IS NOT NULL AND locator IS NOT NULL`,
+        `SELECT id, quote, locator, unit_hash AS unitHash, snippet FROM citations
+         WHERE id = ? AND conversation_id = ? AND file_id = ? AND status = 'verified' AND quote IS NOT NULL
+           AND locator IS NOT NULL`,
       )
-      .all(conversationId, fileId) as { id: string; quote: string; locator: string }[];
+      .all(citationId, conversationId, fileId) as {
+      id: string;
+      quote: string;
+      locator: string;
+      unitHash: string | null;
+      snippet: string;
+    }[];
   }
 
   list(conversationId: string): FileRow[] {

@@ -34,6 +34,9 @@ self.addEventListener("fetch", (event) => {
   // Artifact originals and downloads (#27): always from the server, with their sandboxing headers — never the
   // cached app shell in their place.
   if (/^\/a\/[^/]+\/v\//.test(url.pathname)) return;
+  // Public artifact links (#204): the page, its original and downloads always come from the server with their own
+  // headers (and a 404 once the link is off) — never the cached app shell, online or offline.
+  if (url.pathname.startsWith("/artifact/")) return;
   // The diagram frame (#182): always from the server, with its own sandboxing CSP.
   if (url.pathname === "/mermaid-frame") return;
   // Pages: network first (always the latest app), the cached shell when offline.

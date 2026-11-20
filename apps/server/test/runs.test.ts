@@ -16,6 +16,7 @@ import {
 } from "../src/runtime/adapter.js";
 import { FakeRuntime, type FakeScript } from "../src/runtime/fake.js";
 import { EVENT_RETENTION_MS, RunManager } from "../src/runtime/runs.js";
+import { framesJson, logsJson, messagesJson } from "./helpers/content-json.js";
 import { createFamily } from "./helpers/permission-matrix.js";
 import { runtimeContract } from "./helpers/runtime-contract.js";
 
@@ -1022,6 +1023,51 @@ describe("runs: chat screen support (#14)", () => {
     });
   });
 
+  it("the secret checks mask only the server's envelope: the same id or time inside content is still a leak (#208)", () => {
+    // The id and the time of a real failing run: `9876` inside the message id, `…9876…` inside the epoch time.
+    const ID = "326a179a-9ec3-4922-9876-052dfbe8f0b0";
+    const AT = 1795061987650;
+    const ISO = "2026-11-19T12:34:56.123Z";
+    const SECRETS = /9876|123456|326a179a|1795061987650|2026-11-19/;
+    const row = (parts: unknown[]) => ({
+      id: ID,
+      conversationId: ID,
+      seq: 1,
+      parts,
+      createdAt: AT,
+      replaces: ID,
+    });
+    const frame = (data: object) => ({ id: 9876, event: "tool_start", data: { messageId: ID, ...data } });
+    const clean = { type: "tool_call", id: "call-1", name: "login", input: { pin: "[숨김]" } };
+    // In the envelope only: not a leak.
+    expect(messagesJson([row([clean])])).not.toMatch(SECRETS);
+    expect(framesJson([frame({ type: "tool_start", input: clean.input })])).not.toMatch(SECRETS);
+    expect(
+      logsJson([{ msg: "skill.finished", userId: ID, runId: ID, conversationId: ID, durationMs: AT }]),
+    ).not.toMatch(SECRETS);
+    // The same values inside content, under any key and of any shape: each one is found.
+    const leaks: unknown[] = [
+      { password: ID },
+      { token: ISO },
+      { pinAt: 9876 },
+      { otpMs: 123456 },
+      { id: ID },
+      { createdAt: AT },
+      { messageId: ID },
+    ];
+    for (const leak of leaks) {
+      const call = { type: "tool_call", id: "call-1", name: "login", input: leak };
+      const result = { type: "tool_result", callId: "call-1", output: leak };
+      expect(messagesJson([row([call])]), JSON.stringify(leak)).toMatch(SECRETS);
+      expect(messagesJson([row([result])]), JSON.stringify(leak)).toMatch(SECRETS);
+      expect(framesJson([frame({ type: "tool_start", input: leak })]), JSON.stringify(leak)).toMatch(SECRETS);
+      expect(framesJson([frame({ type: "tool_end", output: leak })]), JSON.stringify(leak)).toMatch(SECRETS);
+      expect(logsJson([{ msg: "skill.finished", userId: ID, input: leak }]), JSON.stringify(leak)).toMatch(
+        SECRETS,
+      );
+    }
+  });
+
   it("numeric secrets and keys inside strings are removed from the stream, the API and the stored row; ordinary data stays", async () => {
     const script: FakeScript = () => [
       {
@@ -1047,7 +1093,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [framesJson(frames), messagesJson(api), messagesJson(stored)]) {
       expect(blob).not.toMatch(/123456|1234[^0-9]|9876|sk-proj-abcdefgh1234/);
       expect(blob).toContain("cl100k_base");
       expect(blob).toContain("ETH");
@@ -1076,7 +1122,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [framesJson(frames), messagesJson(api), messagesJson(stored)]) {
       expect(blob).not.toMatch(/hunter2|123456/);
       expect(blob).toContain("api.example");
       expect(blob).toContain("Basic authentication is an HTTP scheme");
@@ -1103,7 +1149,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [framesJson(frames), messagesJson(api), messagesJson(stored)]) {
       expect(blob).not.toMatch(/hunter2|123456/);
       expect(blob).toContain("9007199254740993");
     }
@@ -1237,7 +1283,7 @@ describe("runs: chat screen support (#14)", () => {
     await waitRun(run.id);
     const api = (await mom.get(`/api/conversations/${c.id}/messages`)).json().items as Message[];
     const stored = app.conversations!.messages(c.id, { limit: 100 });
-    for (const blob of [JSON.stringify(frames), JSON.stringify(api), JSON.stringify(stored)]) {
+    for (const blob of [framesJson(frames), messagesJson(api), messagesJson(stored)]) {
       expect(blob).not.toMatch(/hunter[2-9]|123456|654321|111222|333444|555666|777888|999000|tok-double-777/);
       expect(blob).toContain("kim");
     }

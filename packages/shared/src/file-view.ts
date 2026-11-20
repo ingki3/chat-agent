@@ -49,6 +49,8 @@ export const ViewSegment = z.object({
   cut: z.boolean(),
   /** One piece of a paragraph or table row split in reading order (HWP, #23): its offsets are not the unit's. */
   split: z.boolean(),
+  /** An XLSX row's sheet by its number in the workbook (#186 review 6차: names may be masked alike). */
+  sheetNo: z.number().int().positive().optional(),
 });
 export type ViewSegment = z.infer<typeof ViewSegment>;
 
@@ -76,6 +78,8 @@ export type LocateStatus = z.infer<typeof LocateStatus>;
  * - `other_file` — the locator is of another file
  * - `revision_changed` — the locator was made from other bytes
  * - `unit_missing` — no unit of the file is at that place (cut off by a limit, or never there)
+ * - `ambiguous` — the place names more than one unit (two sheets whose names read alike, a link naming no citation):
+ *   none is highlighted (#186 review 7차)
  * - `pending` / `failed` — the text is still being read / could not be read
  */
 export const LOCATE_REASONS = [
@@ -87,6 +91,7 @@ export const LOCATE_REASONS = [
   "other_file",
   "revision_changed",
   "unit_missing",
+  "ambiguous",
   "pending",
   "failed",
 ] as const;
@@ -102,6 +107,7 @@ export const LOCATE_REASON_TEXT: Record<LocateReason, string> = {
   other_file: "다른 파일의 위치라 강조하지 않았어요.",
   revision_changed: "인용한 뒤 파일 내용이 달라져 위치를 강조하지 않았어요.",
   unit_missing: "인용한 위치를 이 파일의 글자에서 찾지 못했어요.",
+  ambiguous: "이름이 같은 시트가 여러 개라 인용한 위치를 하나로 정할 수 없어 강조하지 않았어요.",
   pending: "아직 파일의 글자를 읽는 중이에요.",
   failed: "이 파일의 글자를 읽지 못해 위치를 보여 줄 수 없어요.",
 };
@@ -125,6 +131,8 @@ export const ViewTarget = z.object({
   focus: SegmentRange.optional(),
   /** `exact`: the passage's box on its page or image (fractions, origin top left). */
   bbox: box.optional(),
+  /** `exact`: the range is the passage's start only — it goes on past it (over several lines, #186 review 5차). */
+  start: z.literal(true).optional(),
 });
 export type ViewTarget = z.infer<typeof ViewTarget>;
 
@@ -144,9 +152,17 @@ export const FileViewResponse = z.object({
 export type FileViewResponse = z.infer<typeof FileViewResponse>;
 
 /** The viewer's in-app address: `/c/:conversationId/files/:fileId?loc=<locator JSON>`. */
-export function fileViewPath(conversationId: string, fileId: string, locator?: FileLocator): string {
+export function fileViewPath(
+  conversationId: string,
+  fileId: string,
+  locator?: FileLocator,
+  /** The citation the link opens (#186 review 5차): the viewer judges the range by that citation only. */
+  citationId?: string,
+): string {
   const base = `/c/${encodeURIComponent(conversationId)}/files/${encodeURIComponent(fileId)}`;
-  return locator ? `${base}?loc=${encodeURIComponent(JSON.stringify(locator))}` : base;
+  if (!locator) return base;
+  const cite = citationId ? `&cite=${encodeURIComponent(citationId)}` : "";
+  return `${base}?loc=${encodeURIComponent(JSON.stringify(locator))}${cite}`;
 }
 
 /** The locator of a `loc` query value, or undefined when it is not one. */

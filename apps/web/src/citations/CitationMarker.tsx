@@ -88,7 +88,7 @@ export function CitationMarker({ view }: { view: CitationView }) {
 
 export function CitationPreview({ id, view }: { id?: string; view: CitationView }) {
   const fileHref = useFileViewHref();
-  const open = view.locator ? fileHref(view.locator.fileId, view.locator) : null;
+  const open = view.locator ? fileHref(view.locator.fileId, view.locator, view.citationId) : null;
   return (
     <span
       id={id}

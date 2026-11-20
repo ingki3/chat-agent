@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import { TEST_MARKER, TEST_SKILL_TOOL, TEST_TOOL } from "../connections/tester.js";
 import { FINANCE_DISCLAIMER, financeLabel, type FinanceMeta, type RuntimeId } from "@agentlee/shared";
 import { OUR_TOOL_PREFIX, type McpConnection } from "./lockdown.js";
-import { CITATION_SCENARIOS, resolveRefs, type CitationScenarioName } from "./fake-citations.js";
+import {
+  CITATION_SCENARIOS,
+  resolveRefs,
+  type CitationScenario,
+  type CitationScenarioName,
+} from "./fake-citations.js";
 import { messageText, renderPriorContext, SUMMARY_MARKER } from "./context.js";
 import { docScenario } from "./fake-docs.js";
 import { pythonScenario, type PythonScenario } from "./fake-python.js";
@@ -10,6 +15,7 @@ import { FILE_SCENARIOS, type FileScenarioName } from "./fake-files.js";
 import { readReferences, switchSteps, type ReadReferences } from "./fake-switch.js";
 import { memorySteps } from "./fake-memory.js";
 import { dreamingSteps } from "./fake-dreaming.js";
+import { researchSteps } from "./fake-research.js";
 import {
   RuntimeFailure,
   SessionGoneError,
@@ -51,7 +57,7 @@ import {
  *                     `@@pause@@` is not sent but waits 1.5 s there (a diagram half-streamed, #182)
  *   /secrettool       a tool call whose input and output carry secret-looking fields (#14)
  *   /cite <scenario>   real calls of our web and citation tools on the fixture pages (`fake-citations.ts`:
- *                     conflict, insufficient, partial, reuse) and the scenario's answer with `[n]` markers: the run
+ *                     conflict, insufficient, partial, advice, reuse) and the scenario's answer with `[n]` markers: the run
  *                     manager's citation check then adds its note (#25)
  *   /cite-id <sourceId> <snippet>   one real `cite` of that id (e.g. another conversation's) and a cited sentence
  *   "매일 아침 8시 시장 브리핑" (매일/평일 + 시 + 브리핑·예약·알려줘)   a real call of our `schedule_create` with a
@@ -79,6 +85,8 @@ import {
  */
 export type FakeStep =
   | { text: string }
+  /** Text with `{{$<i>.<path>}}` filled in from the i-th call's output of this turn (#211: notes with a sourceId). */
+  | { textRefs: string }
   | { reasoning: string }
   | { delayMs: number }
   | { tool: string; ms: number; input?: unknown; output?: unknown; isError?: boolean }
@@ -90,7 +98,10 @@ export type FakeStep =
   | { usage: UsageReport }
   | { notice: string }
   | { limit: string; resetsAt?: number; retryAfterMs?: number; modelFamily?: string }
-  | { fail: string; code?: RuntimeFailure["code"] };
+  | { fail: string; code?: RuntimeFailure["code"] }
+  /** Waits until a `release` step with the same name runs (in any run of this process) — tests order a run's end. */
+  | { gate: string }
+  | { release: string };
 
 export type FakeScript = (input: TurnInput, memory: string[]) => FakeStep[];
 
@@ -333,8 +344,14 @@ export const FAKE_XSS = [
 function citationSteps(t: string): FakeStep[] | undefined {
   const named = /^\/cite\s+(\w+)$/.exec(t);
   if (named && Object.hasOwn(CITATION_SCENARIOS, named[1]!)) {
-    const sc = CITATION_SCENARIOS[named[1] as CitationScenarioName];
-    return [...sc.calls.map((c) => ({ call: c.tool, input: c.input })), { text: sc.answer }];
+    const sc: CitationScenario = CITATION_SCENARIOS[named[1] as CitationScenarioName];
+    return [
+      ...sc.calls.flatMap((c) => [
+        ...(c.before ? [{ text: c.before }] : []),
+        { call: c.tool, input: c.input },
+      ]),
+      { text: sc.answer },
+    ];
   }
   const file = /^\/file-(\w+)$/.exec(t);
   if (file && Object.hasOwn(FILE_SCENARIOS, file[1]!)) {
@@ -419,6 +436,8 @@ export const defaultScript: FakeScript = (input, memory) => {
   if (t.startsWith(TEST_MARKER)) return connectionTestSteps(t);
   const dreaming = dreamingSteps(t);
   if (dreaming) return dreaming;
+  const research = researchSteps(t);
+  if (research) return research;
   const switched = switchSteps(t);
   if (switched) return switched;
   const remembered = memorySteps(t);
@@ -489,6 +508,11 @@ export const defaultScript: FakeScript = (input, memory) => {
     }
     return steps;
   }
+  // `/gate <name>`: the reply waits half-way until `/release <name>` is sent (from any conversation) — so a test can
+  // look at the reply while it is certainly unfinished, then let it end (#103).
+  const gate = /^\/(gate|release)\s+([a-z0-9-]{1,64})$/.exec(t);
+  if (gate?.[1] === "gate") return [{ text: "기다릴게요. " }, { gate: gate[2]! }, { text: "끝났어요." }];
+  if (gate?.[1] === "release") return [{ release: gate[2]! }, { text: "풀었어요." }];
   const m = /^\/(tool|error|limit|long)\b\s*(\d+)?/.exec(t);
   if (m?.[1] === "tool")
     return [
@@ -509,6 +533,43 @@ export const defaultScript: FakeScript = (input, memory) => {
     { usage: { inputTokens: 10 * memory.length, outputTokens: words.length } },
   ];
 };
+
+/**
+ * Gates of `/gate` runs: the waiting replies of each name, or a release that came first (then the next wait takes it).
+ * Nothing is kept once used: a release frees its waiters and forgets the name, a stopped reply leaves its gate.
+ */
+const gates = new Map<string, { open: boolean; waiters: Set<() => void> }>();
+export function releaseGate(name: string): void {
+  const g = gates.get(name);
+  if (!g || !g.waiters.size) return void gates.set(name, { open: true, waiters: new Set() });
+  gates.delete(name);
+  for (const w of g.waiters) w();
+}
+export const waitGate = (name: string, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const g = gates.get(name);
+    if (g?.open) {
+      gates.delete(name);
+      return resolve();
+    }
+    if (signal.aborted) return resolve();
+    const entry = g ?? { open: false, waiters: new Set<() => void>() };
+    gates.set(name, entry);
+    const done = () => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    };
+    const stop = () => {
+      entry.waiters.delete(done);
+      if (!entry.waiters.size && gates.get(name) === entry) gates.delete(name);
+      resolve();
+    };
+    entry.waiters.add(done);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+
+/** How many gate names are held (tests). */
+export const fakeGateCount = () => gates.size;
 
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -674,6 +735,14 @@ export class FakeRuntime implements RuntimeAdapter {
               raw += step.text;
               reply.text = raw.trim();
               if (step.text) yield { type: "text_delta", text: step.text };
+            } else if ("textRefs" in step) {
+              const text = step.textRefs.replace(/\{\{(\$[\w-]+\.[\w.]+)\}\}/g, (m, ref: string) => {
+                const v = resolveRefs(ref, (i) => outputs[Number(i)]);
+                return typeof v === "string" && v !== ref ? v : m;
+              });
+              raw += text;
+              reply.text = raw.trim();
+              if (text) yield { type: "text_delta", text };
             } else if ("reasoning" in step) yield { type: "reasoning_delta", text: step.reasoning };
             else if ("delayMs" in step) await sleep(step.delayMs, ctrl.signal);
             else if ("tool" in step) {
@@ -711,6 +780,8 @@ export class FakeRuntime implements RuntimeAdapter {
               };
               return;
             } else if ("fail" in step) throw step.code ? new RuntimeFailure(step.code) : new Error(step.fail);
+            else if ("gate" in step) await waitGate(step.gate, ctrl.signal);
+            else if ("release" in step) releaseGate(step.release);
           }
         }
         return { events: events(), interrupt: async () => ctrl.abort() };

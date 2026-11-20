@@ -50,6 +50,8 @@ import {
   isDreamingTrigger,
   isDreamingStatus,
   isDreamingCode,
+  isPublicLinkCode,
+  isResearchCode,
   isScheduleStatus,
   isScheduleStep,
   isScheduleTrigger,
@@ -121,6 +123,10 @@ export const LOG_EVENTS = [
   "citation.finished",
   // PNG/PDF export (#51): format, fixed outcome code, duration and IDs — never the title or the content.
   "artifact.exported",
+  // Render folders the sweep keeps for want of a lock file (#170): a count only — never a path.
+  "artifact.render_dirs_kept",
+  // Renders whose processes were not confirmed gone within the reap's bound (#215): a count only; folder and lock kept.
+  "artifact.render_reap_incomplete",
   // Reference export (#26): entry count, `docx` and its fixed `doc_*` code, duration and IDs — never an entry,
   // a title or an address.
   "references.exported",
@@ -207,6 +213,17 @@ export const LOG_EVENTS = [
   "dreaming.run_started",
   "dreaming.run_finished",
   "dreaming.alert_sent",
+  // 깊이 조사 (#211): a job's start, approval (how many sub-questions), resume after a restart, stop, end (how many
+  // sources) and failure (a fixed code) — IDs and counts only; never the question, the plan, a note or the report.
+  "research.started",
+  "research.approved",
+  "research.resumed",
+  "research.stopped",
+  "research.done",
+  "research.failed",
+  // Public artifact links (#204): created, viewed, turned off, refused (secret) or rate limited — a fixed code and the
+  // owner's id only; never the token, a visitor's IP or user agent, or the title.
+  "public_link.event",
 ] as const;
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
@@ -341,6 +358,10 @@ const FIELDS = new Map<string, Check>([
   ["dreamingTrigger", isDreamingTrigger],
   ["dreamingStatus", isDreamingStatus],
   ["dreamingCode", isDreamingCode],
+  ["publicLinkCode", isPublicLinkCode],
+  /** 깊이 조사 (#211): the job's id and its fixed failure code. */
+  ["researchId", isId],
+  ["researchCode", isResearchCode],
 ]);
 
 /** Every key that may ever appear in a written record (tests and docs refer to it). */
@@ -625,6 +646,9 @@ export type LogFields = {
   dreamingTrigger?: string;
   dreamingStatus?: string;
   dreamingCode?: string;
+  publicLinkCode?: string;
+  researchId?: string;
+  researchCode?: string;
   /** A sandboxed worker kind (#122: extract, docgen, render), a failed self-check step, kinds not account-isolated. */
   workerKind?: string;
   workerStep?: string;

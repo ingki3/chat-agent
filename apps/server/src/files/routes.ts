@@ -22,7 +22,7 @@ import type { ConversationStore } from "../conversations/store.js";
 import { logEvent } from "../logging.js";
 import { contentMatches } from "./detect.js";
 import { toFileExtract, type FileExtracts } from "./extract.js";
-import { segmentLocator } from "./text.js";
+import { segmentLocator, unitAddressOf, unitHashOf } from "./text.js";
 import { resolveTarget, VIEW_LIMIT, VIEW_MAX, viewSegment, viewWindow } from "./viewer.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 import { sharedWith, viewOf } from "../shares/projection.js";
@@ -356,7 +356,7 @@ export function registerFileRoutes(
   if (extracts)
     app.get<{
       Params: { id: string };
-      Querystring: { loc?: string; from?: string; to?: string; limit?: string };
+      Querystring: { loc?: string; cite?: string; from?: string; to?: string; limit?: string };
     }>("/api/files/:id/view", { config: read }, async (req, reply) => {
       const f = store.get(req.params.id)!;
       const p = viewOf(app, req, { fileIn: f.conversationId });
@@ -364,6 +364,10 @@ export function registerFileRoutes(
         return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
       const loc = req.query.loc === undefined ? undefined : parseLocParam(req.query.loc);
       if (req.query.loc !== undefined && !loc)
+        return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
+      // `cite`: omitted, or one citation id — anything else (empty, too long, given twice) is refused.
+      const citeRaw: unknown = req.query.cite;
+      if (citeRaw !== undefined && (typeof citeRaw !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(citeRaw)))
         return reply.code(400).header("Cache-Control", "no-store").send({ error: "invalid_request" });
       const fromRaw = req.query.from === undefined ? undefined : Number.parseInt(req.query.from, 10);
       const from = fromRaw === undefined || !Number.isFinite(fromRaw) ? undefined : Math.max(0, fromRaw);
@@ -373,18 +377,43 @@ export function registerFileRoutes(
       const items = all.map((seg) => viewSegment(f, seg));
       let target = null;
       if (loc) {
-        const cited = store.verifiedCitations(f.conversationId, f.id).flatMap((c) => {
-          if (p && !p.citations.has(c.id)) return [];
-          try {
-            const raw = JSON.parse(c.locator) as { textHash?: unknown };
-            const l = FileLocator.safeParse(raw);
-            const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
-            return l.success ? [{ locator: l.data, quote: c.quote, textHash }] : [];
-          } catch {
-            return [];
-          }
-        });
-        target = resolveTarget(f, extract, items, loc, cited);
+        // The citation the link opens (`cite`, #186 review 5·6차): the range is judged by that one alone — a link
+        // naming none (an older link, or a copy whose row was not copied) opens at the unit only, never exact.
+        const cite = req.query.cite;
+        const cited =
+          cite === undefined
+            ? []
+            : store.verifiedCitations(f.conversationId, f.id, cite).flatMap((c) => {
+                // A shared viewer: only a citation of their projection.
+                if (p && !p.citations.has(c.id)) return [];
+                try {
+                  const raw = JSON.parse(c.locator) as {
+                    textHash?: unknown;
+                    sheetNo?: unknown;
+                  };
+                  const l = FileLocator.safeParse(raw);
+                  const textHash = typeof raw.textHash === "string" ? raw.textHash : undefined;
+                  const sheetNo = typeof raw.sheetNo === "number" ? raw.sheetNo : undefined;
+                  return l.success
+                    ? [
+                        {
+                          locator: l.data,
+                          quote: c.quote,
+                          textHash,
+                          unitHash: c.unitHash,
+                          sheetNo,
+                          snippet: c.snippet,
+                        },
+                      ]
+                    : [];
+                } catch {
+                  return [];
+                }
+              });
+        const units = new Map(
+          all.map((s) => [s.seq, { hash: unitHashOf(s), sheetNo: unitAddressOf(f, s).sheetNo }] as const),
+        );
+        target = resolveTarget(f, extract, items, loc, cited, units);
       }
       const toRaw = req.query.to === undefined ? undefined : Number.parseInt(req.query.to, 10);
       const to = toRaw === undefined || !Number.isFinite(toRaw) ? undefined : Math.max(0, toRaw);

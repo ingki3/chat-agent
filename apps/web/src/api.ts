@@ -1,4 +1,6 @@
 import {
+  ResearchJob,
+  type ResearchScope,
   AdminRuntimesResponse,
   BackupItem,
   BackupsResponse,
@@ -96,6 +98,13 @@ import {
   MemoryProposal,
   type MemoryApplyMode,
   ACCESS_ERRORS,
+  AdminPublicLinksResponse,
+  CreatePublicLinkResponse,
+  PUBLIC_LINK_ERRORS,
+  PublicLink,
+  PublicLinkCheck,
+  PublicLinkSettings,
+  PublicLinksResponse,
   AccessOverview,
   AccessPreview,
   AccessRegistration,
@@ -473,10 +482,13 @@ export const conversations = {
     Conversation.parse(await call("PATCH", `/api/conversations/${enc(id)}`, { researchMode })),
   remove: async (id: string) => call("DELETE", `/api/conversations/${enc(id)}`),
   /** A page of messages, oldest → newest; `before` asks for the page older than that seq. */
-  messages: async (id: string, before?: number) => {
+  messages: async (id: string, before?: number, signal?: AbortSignal) => {
     const r = (await call(
       "GET",
       `/api/conversations/${enc(id)}/messages?limit=100${before ? `&before=${before}` : ""}`,
+      undefined,
+      {},
+      signal,
     )) as { items: unknown[]; nextBefore: number | null };
     return { items: Message.array().parse(r.items), nextBefore: r.nextBefore };
   },
@@ -608,6 +620,25 @@ export const usage = {
     UsageSettings.parse(await call("PUT", "/api/admin/usage/settings", s)),
 };
 
+/** 깊이 조사 (#211): start from a conversation, then the card's actions. */
+export const research = {
+  start: async (conversationId: string, text: string, fileIds: string[]) =>
+    (await call("POST", `/api/conversations/${enc(conversationId)}/research`, {
+      text,
+      ...(fileIds.length ? { fileIds } : {}),
+    })) as { job: unknown; message: unknown; assistant: unknown },
+  get: async (id: string) => ResearchJob.parse(await call("GET", `/api/research/${enc(id)}`)),
+  eventsUrl: (id: string) => `/api/research/${enc(id)}/events`,
+  approve: async (id: string, subQuestions?: { question: string; scope: ResearchScope }[]) =>
+    ResearchJob.parse(
+      await call("POST", `/api/research/${enc(id)}/approve`, subQuestions ? { subQuestions } : {}),
+    ),
+  clarify: async (id: string, answer: string) =>
+    ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/clarify`, { answer })),
+  cancel: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/cancel`, {})),
+  stop: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/stop`, {})),
+};
+
 export const runs = {
   get: async (id: string) => Run.parse(await call("GET", `/api/runs/${enc(id)}`)),
   interrupt: async (id: string) => Run.parse(await call("POST", `/api/runs/${enc(id)}/interrupt`, {})),
@@ -688,6 +719,14 @@ const MESSAGES: Record<string, string> = {
   ...DREAMING_ERRORS,
   // Cloudflare Access 동기화 (#36)
   ...ACCESS_ERRORS,
+  // 깊이 조사 (#211)
+  research_claude_only: "깊이 조사는 Claude 대화에서만 쓸 수 있어요.",
+  research_busy: "진행 중인 깊이 조사가 있어요. 끝나거나 멈춘 뒤에 시작하세요.",
+  research_state: "이 깊이 조사는 지금 그렇게 할 수 없어요. 화면을 새로 고쳐 보세요.",
+  backend_unavailable: "이 조사 방식은 지금 쓸 수 없어요.",
+  no_runtime: "쓸 수 있는 런타임이 없어요 — 관리자에게 문의하세요.",
+  // 공개 링크 (#204)
+  ...PUBLIC_LINK_ERRORS,
 };
 export const errorText = (e: unknown) =>
   e instanceof ApiError ? (MESSAGES[e.code] ?? `오류가 났어요 (${e.code})`) : "서버에 연결하지 못했어요.";
@@ -716,11 +755,17 @@ export const files = {
    */
   view: async (
     id: string,
-    opts: { loc?: FileLocator | undefined; from?: number | undefined; to?: number | undefined } = {},
+    opts: {
+      loc?: FileLocator | undefined;
+      cite?: string | undefined;
+      from?: number | undefined;
+      to?: number | undefined;
+    } = {},
     signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams();
     if (opts.loc) q.set("loc", JSON.stringify(opts.loc));
+    if (opts.loc && opts.cite !== undefined) q.set("cite", opts.cite);
     if (opts.from !== undefined) q.set("from", String(opts.from));
     if (opts.to !== undefined) q.set("to", String(opts.to));
     const qs = q.toString();
@@ -819,6 +864,37 @@ export const references = {
     }
     return { blob: await res.blob(), name };
   },
+};
+
+export const PUBLIC_LINKS_KEY = ["public-links"] as const;
+/**
+ * Public artifact links (#204): the owner's pre-publish check, a new link (its token is in this one answer only), my
+ * links, turning one off; the admin's counts and switch-off (no title, no content).
+ */
+export const publicLinks = {
+  settings: async () => PublicLinkSettings.parse(await call("GET", "/api/public-links/settings")),
+  /** Every open link, and a page of the expired / turned-off ones (`cursor`: the previous page's `nextCursor`). */
+  mine: async (o: { artifactId?: string; cursor?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (o.artifactId) q.set("artifactId", o.artifactId);
+    if (o.cursor) q.set("cursor", o.cursor);
+    const qs = q.toString();
+    return PublicLinksResponse.parse(await call("GET", `/api/public-links${qs ? `?${qs}` : ""}`));
+  },
+  check: async (artifactId: string, version: number) =>
+    PublicLinkCheck.parse(
+      await call("GET", `/api/artifacts/${enc(artifactId)}/public-links/check?version=${version}`),
+    ),
+  create: async (artifactId: string, version: number, expiresInDays: number) =>
+    CreatePublicLinkResponse.parse(
+      await call("POST", `/api/artifacts/${enc(artifactId)}/public-links`, { version, expiresInDays }),
+    ),
+  disable: async (id: string) => PublicLink.parse(await call("DELETE", `/api/public-links/${enc(id)}`)),
+  adminList: async (cursor?: string) =>
+    AdminPublicLinksResponse.parse(
+      await call("GET", `/api/admin/public-links${cursor ? `?cursor=${enc(cursor)}` : ""}`),
+    ),
+  adminDisable: async (id: string) => call("POST", `/api/admin/public-links/${enc(id)}/disable`, {}),
 };
 
 export const SHARES_KEY = ["shares"] as const;

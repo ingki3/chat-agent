@@ -26,3 +26,14 @@ export function isApiRequest(req: { url: string; routeOptions?: { url?: string |
 export function isArtifactPath(url: string | undefined): boolean {
   return routerPath(url).startsWith("/a/");
 }
+
+/**
+ * A public artifact link's path (#204): exactly `/artifact/<token>`, `/artifact/<token>/raw` or
+ * `/artifact/<token>/download` — a well-formed token, nothing before or after (query string ignored, percent-encoding
+ * decoded as the router does). `/artifact`, `/artifacts` (the app's list page), `/artifact/` alone, other suffixes or a
+ * malformed token are not: they stay behind Access and the app login like every other path.
+ */
+const PUBLIC_LINK_PATH = /^\/artifact\/[A-Za-z0-9_-]{43}(?:\/raw|\/download)?$/;
+export function isPublicLinkPath(url: string | undefined): boolean {
+  return PUBLIC_LINK_PATH.test(routerPath(url));
+}

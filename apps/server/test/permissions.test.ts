@@ -37,7 +37,8 @@ const newApp = async () => {
   lastDb = createTestDb();
   // Its own data folder: the matrix stores uploaded files (#22), never in the repository's data/.
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentlee-perm-"));
-  const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir }), {
+  // Public links on (#204), so their owner-only routes answer as they do in use.
+  const app = await buildApp(loadConfig({ NODE_ENV: "test", DATA_DIR: dataDir, PUBLIC_LINKS_ENABLED: "1" }), {
     db: lastDb,
     logger: false,
     // Export routes (#51) answer 200 for whoever passes the check; the browser itself is tested elsewhere.

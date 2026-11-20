@@ -1478,26 +1478,68 @@ describe("youtube_audio_fetch: the real yt-dlp's download limit (TEST_YTDLP_PACK
 
 describe("runIsolated with fork: a child outside the group cannot keep the call open (#191 review 1)", () => {
   const pyIt = realPy?.ok ? it : it.skip;
-  /** python: fork a child that makes its own session and sleeps holding stdout/stderr; the parent then `rest`s. */
+  /**
+   * python: fork a child that makes its own session and sleeps holding stdout/stderr; the parent waits until the child
+   * has left the group (else the group kill at exit could reach it first and the pipes would simply close — #208),
+   * writes "<own pid> <child pid>" to `pids`, then `rest`s.
+   */
   const ESCAPE = String.raw`
 import os, sys, time
+r, w = os.pipe()
 pid = os.fork()
 if pid == 0:
+    os.close(r)
     os.setsid()
+    os.write(w, b"1")
+    os.close(w)
     time.sleep(30)
     os._exit(0)
-open("child.pid", "w").write(str(pid))
+os.close(w)
+os.read(r, 1)
+os.close(r)
+open("pids.tmp", "w").write(f"{os.getpid()} {pid}")
+os.replace("pids.tmp", "pids")
 time.sleep(float(sys.argv[1]))
 `;
+  const pidsOf = (cwd: string): [number, number] | undefined => {
+    try {
+      const [command, child] = fs.readFileSync(path.join(cwd, "pids"), "utf8").split(" ").map(Number);
+      return [command!, child!];
+    } catch {
+      return undefined;
+    }
+  };
+  /**
+   * Resolves once the command (not its escaped child) has exited and been reaped. Node reaps a child and emits its
+   * `exit` in the same callback, so from here on `runIsolated` has seen the exit and is in its drain (#208).
+   */
+  const commandGone = async (cwd: string) => {
+    const until = Date.now() + 30_000;
+    for (;;) {
+      const pids = pidsOf(cwd);
+      if (pids) {
+        try {
+          process.kill(pids[0], 0);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === "ESRCH") return;
+        }
+      }
+      if (Date.now() > until) throw new Error("the command did not exit");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
   pyIt(
     "exit, time limit, stop: each ends the call within the drain deadline; the escaped child is reported",
     async () => {
       const { FORK_DRAIN_MS, runIsolated } = await import("../src/isolation/sandbox.js");
       const py = (realPy as { ok: true; runtime: YoutubeEnv["runtime"] }).runtime;
-      const run = async (rest: string, extra: { timeoutMs?: number; signal?: AbortSignal } = {}) => {
+      const run = async (
+        rest: string,
+        extra: { timeoutMs?: number; signal?: AbortSignal; during?: (cwd: string) => Promise<void> } = {},
+      ) => {
         const cwd = tmp();
         const t0 = Date.now();
-        const r = await runIsolated({
+        const call = runIsolated({
           command: py.exe,
           args: ["-I", "-S", "-B", "-c", ESCAPE, rest],
           cwd,
@@ -1510,31 +1552,43 @@ time.sleep(float(sys.argv[1]))
           maxOutputBytes: 1024,
           ...(extra.signal ? { signal: extra.signal } : {}),
         });
-        const ms = Date.now() - t0;
-        const childPid = Number(fs.readFileSync(path.join(cwd, "child.pid"), "utf8"));
         closers.push(() => {
+          const pids = pidsOf(cwd);
           try {
-            process.kill(childPid, "SIGKILL");
+            if (pids) process.kill(pids[1], "SIGKILL");
           } catch {
             // gone
           }
         });
-        return { r, ms };
+        const mark = extra.during ? await extra.during(cwd).then(() => Date.now()) : t0;
+        const r = await call;
+        const end = Date.now();
+        // The child had left the group and was still alive while the call ended.
+        expect(pidsOf(cwd), "pids").toBeDefined();
+        return { r, ms: end - t0, sinceMark: end - mark };
       };
       // The command exits at once; the escaped child holds the pipes: cut after the drain deadline.
       const a = await run("0");
       expect(a.r.killed).toBe("escaped");
       expect(a.ms).toBeLessThan(FORK_DRAIN_MS + 3000);
       // The time limit: the command is killed with its group, the escaped child still holds the pipes — still ends.
-      const b = await run("30", { timeoutMs: 500 });
+      // (The limit leaves room for the command to start and fork under load: the child must exist before it fires.)
+      const b = await run("30", { timeoutMs: 3000 });
       expect(b.r.killed).toBe("timeout");
-      expect(b.ms).toBeLessThan(500 + FORK_DRAIN_MS + 3000);
-      // A stop after the command exited (during the drain): ends at once.
+      expect(b.ms).toBeLessThan(3000 + FORK_DRAIN_MS + 3000);
+      // A stop after the command exited (during the drain): ends at once. The stop is sent once the command is
+      // known to be gone — not after a fixed delay, which under load could land before the exit (#208).
       const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 300);
-      const c = await run("0", { signal: ctrl.signal });
+      const c = await run("0", {
+        signal: ctrl.signal,
+        during: async (cwd) => {
+          await commandGone(cwd);
+          ctrl.abort();
+        },
+      });
       expect(c.r.killed).toBe("aborted");
-      expect(c.ms).toBeLessThan(FORK_DRAIN_MS);
+      expect(c.sinceMark).toBeLessThan(FORK_DRAIN_MS);
+      // (Exactly when each of these ends, relative to the exit, is pinned with a fake clock in sandbox-drain.test.ts.)
     },
   );
 });

@@ -63,7 +63,7 @@ import { fixtureWebWorker } from "./runtime/fake-citations.js";
 import { sandboxedWorker } from "./web/service.js";
 import { ArtifactStore } from "./artifacts/store.js";
 import { registerArtifactRoutes, type AppPage } from "./artifacts/routes.js";
-import { findBrowser } from "./artifacts/browser.js";
+import { findBrowser, onRenderReapIncomplete, startRenderSweeps } from "./artifacts/browser.js";
 import { Renderer } from "./artifacts/export.js";
 import { registerSourceRoutes } from "./web/routes.js";
 import { registerReferenceRoutes } from "./references/routes.js";
@@ -71,6 +71,8 @@ import { FileStore, type FileStoreOptions } from "./files/store.js";
 import { registerFileRoutes } from "./files/routes.js";
 import { SharePolicy } from "./shares/projection.js";
 import { registerShareRoutes } from "./shares/routes.js";
+import { PublicLinkStore } from "./public-links/store.js";
+import { registerPublicLinkRoutes, type PublicLinkLimits } from "./public-links/routes.js";
 import { ShareStore } from "./shares/store.js";
 import { ForkService } from "./shares/fork.js";
 import { notifyResultSubscribers } from "./shares/notify.js";
@@ -128,7 +130,7 @@ import { registerNotificationRoutes } from "./notifications/routes.js";
 import { NotificationService, type NotificationServiceOptions } from "./notifications/service.js";
 import { loadOrCreateVapidKeys } from "./notifications/vapid.js";
 import { AppEvents } from "./events.js";
-import { isApiPath, isArtifactPath, routerPath } from "./paths.js";
+import { isApiPath, isArtifactPath, isPublicLinkPath, routerPath } from "./paths.js";
 import { MERMAID_FRAME_PATH, registerMermaidFrame } from "./mermaid-frame.js";
 import type { Config } from "./config.js";
 import { registerDiag, type DiagOptions } from "./diag.js";
@@ -150,6 +152,9 @@ import { DreamingStore } from "./dreaming/store.js";
 import { DreamingRunner } from "./dreaming/runner.js";
 import { DreamingEngine } from "./dreaming/engine.js";
 import { registerDreamingRoutes } from "./dreaming/routes.js";
+import { ResearchEngine, type ResearchEngineDeps } from "./research/engine.js";
+import { registerResearchRoutes } from "./research/routes.js";
+import { ResearchStore } from "./research/store.js";
 import { primeStoredSecrets, registerConfigSecrets } from "./secrets/sources.js";
 
 const VERSION = "0.0.0";
@@ -189,6 +194,8 @@ declare module "fastify" {
     connections: ConnectionService | undefined;
     /** Artifacts (#27); undefined without a database. */
     artifacts: ArtifactStore | undefined;
+    /** Public artifact links (#204); undefined without a database. */
+    publicLinks: PublicLinkStore | undefined;
     /** Usage records (#44) and their price tables (#32); undefined without a database. */
     usageStore: UsageStore | undefined;
     /** Usage screens and the daily cost check (#32); undefined without a database. */
@@ -223,6 +230,8 @@ declare module "fastify" {
     memoryProposals: MemoryProposals | undefined;
     /** 기억 정리 (#146); undefined without a database. */
     dreaming: { store: DreamingStore; engine: DreamingEngine; runner: DreamingRunner } | undefined;
+    /** 깊이 조사 (#211); undefined without a database. */
+    research: ResearchEngine | undefined;
   }
 }
 
@@ -363,6 +372,8 @@ export type BuildOptions = {
    * itself only in a server that holds the data folder lock).
    */
   dreaming?: { now?: () => number; timeoutMs?: number; start?: boolean; maxSleepMs?: number };
+  /** 깊이 조사 (#211): tests bring a manual clock, other limits and a short SSE heartbeat. */
+  research?: Partial<Pick<ResearchEngineDeps, "clock" | "limits" | "prompts">> & { heartbeatMs?: number };
   /**
    * The data folder lock this process holds (index.ts, `openStorageForWrite`, #37). The schedule engine starts only
    * with it and stops as soon as it is no longer held — it never runs on storage that is not this process's.
@@ -370,6 +381,8 @@ export type BuildOptions = {
   dataLock?: { held: () => boolean };
   /** Tests: the deletion jobs' retry timings and clock (#54). */
   purge?: Pick<PurgeOptions, "retryMs" | "maxRetryMs" | "now">;
+  /** Tests: public link rate limits and clock (#204). */
+  publicLinks?: { limits?: Partial<PublicLinkLimits>; now?: () => number };
   /** Tests: the background rescrub's retry timings (the compaction's `VACUUM` retry included). */
   rescrub?: Pick<
     RescrubOptions,
@@ -830,9 +843,10 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       opts.runs?.instructions ? { templates: opts.runs.instructions } : {},
     );
     const memoryProposals = new MemoryProposals(opts.db!, memory.store);
+    const fileTools = new FileTools(fileStore, fileExtracts, app.conversations!);
     const mcp = new McpService(mcpTokens, users, {
       log: app.log,
-      files: { tools: new FileTools(fileStore, fileExtracts, app.conversations!), citations },
+      files: { tools: fileTools, citations },
       web: {
         sources,
         citations,
@@ -914,6 +928,8 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       // The conversation's sources for the cited-source references (#53): only ids `cite` knows, with whether their
       // text is stored.
       contextSources: (conversationId) => sources.citable(conversationId),
+      // A follow-up writing an earlier answer's file citation number again (#186): checked against the file now.
+      fileRecheck: (scope, input) => fileTools.recheck(scope, input),
       ...opts.runs,
     });
     const deletion = new ConversationPurge(opts.db!, app.conversations!, {
@@ -1219,6 +1235,36 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     if (opts.dreaming?.start || (config.env !== "test" && dataLock))
       app.addHook("onReady", async () => dreamingEngine.start());
     app.addHook("preClose", async () => dreamingEngine.stop());
+    // 깊이 조사 (#211): jobs on the server, independent of the page — resumed from their checkpoint at start-up.
+    const research = new ResearchEngine({
+      db: opts.db!,
+      store: new ResearchStore(opts.db!, opts.research?.clock?.now.bind(opts.research.clock)),
+      conversations: app.conversations!,
+      registry: runtimes,
+      access: { resolve: (input) => connections.access.resolve(input) },
+      users,
+      mcp,
+      mcpTokens,
+      citations,
+      sources,
+      artifacts,
+      files: fileStore,
+      fileTools,
+      memory,
+      activeRun: (conversationId) => !!runManager.active(conversationId),
+      notifications: () => app.notifications,
+      usage,
+      forgetSession: (ref) => deletion.orphan(ref),
+      log: app.log,
+      ...opts.research,
+    });
+    app.decorate("research", research);
+    registerResearchRoutes(app, research, app.conversations!, {
+      ...(opts.research?.heartbeatMs ? { heartbeatMs: opts.research.heartbeatMs } : {}),
+      ...(opts.research?.clock ? { now: () => opts.research!.clock!.now() } : {}),
+    });
+    app.addHook("onReady", async () => void research.recover());
+    app.addHook("preClose", async () => research.shutdown());
     registerSourceRoutes(app, app.conversations!, sources);
     // Reference export (#26): the history's cited sources as APA / MLA / school entries; `.docx` by the #49 worker.
     registerReferenceRoutes(app, { db: opts.db!, conversations: app.conversations!, slots: docSlots });
@@ -1236,9 +1282,34 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       });
       ownRenderer = own;
       app.addHook("onClose", async () => own.close());
+      // A render whose processes could not be confirmed gone (#215): its folder and lock stay; say how many.
+      onRenderReapIncomplete((count) =>
+        logEvent(app.log, "warn", "artifact.render_reap_incomplete", { count }),
+      );
+      // Render folders left by a server or test run that died (#170): only ours, only provably ownerless — now and
+      // again later (a folder too young now is judged once it is old enough).
+      if (config.env !== "test") {
+        const stopSweeps = startRenderSweeps(undefined, undefined, {
+          // Folders without a lock file are never removed automatically (docs/ops.md §18.4): say how many there are.
+          onResult: (r) => {
+            if (r.lockless) logEvent(app.log, "warn", "artifact.render_dirs_kept", { count: r.lockless });
+          },
+        });
+        app.addHook("onClose", async () => stopSweeps());
+      }
       renderer = own;
     }
     registerArtifactRoutes(app, app.conversations!, artifacts, (url) => appPage(url), renderer);
+    // Public artifact links (#204): `/artifact/<token>` outside Access and the app login (PUBLIC_LINKS_ENABLED).
+    const publicLinks = new PublicLinkStore(opts.db!, opts.publicLinks?.now);
+    app.decorate("publicLinks", publicLinks);
+    registerPublicLinkRoutes(app, {
+      config,
+      store: publicLinks,
+      artifacts,
+      renderer,
+      ...opts.publicLinks,
+    });
     registerShareRoutes(app, sharing, users, {
       ...(opts.sse ?? {}),
       // "이어서 대화하기" (#52): the projection copied into the forker's own conversation, on their own defaults.
@@ -1300,7 +1371,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     app.decorate("notifications", undefined);
     app.decorate("connections", undefined);
     app.decorate("dreaming", undefined);
+    app.decorate("research", undefined);
     app.decorate("artifacts", undefined);
+    app.decorate("publicLinks", undefined);
     app.decorate("usageStore", undefined);
     app.decorate("usage", undefined);
     app.decorate("backups", undefined);
@@ -1369,6 +1442,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         isApiPath(req.url) ||
         isGatePath(req.url) ||
         isArtifactPath(req.url) ||
+        isPublicLinkPath(req.url) ||
         routerPath(req.url) === MERMAID_FRAME_PATH
       )
         return next();

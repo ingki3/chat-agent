@@ -400,6 +400,9 @@ export const notificationPrefs = sqliteTable("notification_prefs", {
   memoryApplied: integer("memory_applied", { mode: "boolean" }).notNull().default(true),
   /** 기억 정리 실패 (#188): the user's own round failed at its last attempt. */
   memoryFailed: integer("memory_failed", { mode: "boolean" }).notNull().default(true),
+  /** 깊이 조사 (#211): "완료" and "실패·중지" notifications — the user may turn each off. */
+  researchDone: integer("research_done", { mode: "boolean" }).notNull().default(true),
+  researchFailed: integer("research_failed", { mode: "boolean" }).notNull().default(true),
   /** Revision (#188 review 9): +1 on every write; every response carries it. */
   rev: integer("rev").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
@@ -550,7 +553,7 @@ export const usageRecords = sqliteTable(
     model: text("model").notNull(),
     connectionId: text("connection_id"),
     purpose: text("purpose", {
-      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming"],
+      enum: ["chat", "schedule", "title", "summary", "connection_test", "dreaming", "research"],
     }).notNull(),
     /** All input tokens, cached ones included (as the adapter contract reports them). */
     inputTokens: integer("input_tokens"),
@@ -761,6 +764,17 @@ export const citations = sqliteTable(
     fileId: text("file_id"),
     /** A verified file citation: where the passage is (`FileLocator` JSON). */
     locator: text("locator"),
+    /**
+     * The snippet is the model's whole input, compared and kept uncut (#186 review 3차) — only such a row's number is
+     * carried over to a later answer. Rows from before (cut at the old limit before masking) are false: never carried.
+     */
+    complete: integer("complete", { mode: "boolean" }).notNull().default(false),
+    /**
+     * A verified file citation (#186 review 4차): SHA-256 of the cited unit as it was verified — its whole text and
+     * its marks (`unitHashOf`). A later answer's carried number is verified only while the unit at that place is
+     * still exactly this; the viewer claims the range exact on the same condition.
+     */
+    unitHash: text("unit_hash"),
     createdAt: integer("created_at").notNull().default(now),
   },
   (t) => [uniqueIndex("citations_run_n_idx").on(t.runId, t.n)],
@@ -1681,4 +1695,95 @@ export const adminEmailChanges = sqliteTable(
     switchedAt: integer("switched_at"),
   },
   (t) => [index("admin_email_changes_state_idx").on(t.state)],
+);
+
+/**
+ * Public links to one artifact version (#204, PRD FR-14.7 v0.7): `/artifact/<token>` opens that version to anyone
+ * with the link, without Access or an app login. The token (32 random bytes, base64url) is shown once at creation;
+ * only its SHA-256 is stored (`token_hash`). The version is fixed at creation (later edits never show). A link is
+ * dead once `expires_at` passes, `disabled_at` is set (owner, admin, or the owner's deactivation), or its artifact —
+ * with its conversation or its owner — is deleted (foreign keys). Views are counted; no IP, user agent or referrer.
+ */
+export const publicLinks = sqliteTable(
+  "public_links",
+  {
+    id: text("id").primaryKey(),
+    tokenHash: text("token_hash").notNull().unique(),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    artifactId: text("artifact_id")
+      .notNull()
+      .references(() => artifacts.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    disabledAt: integer("disabled_at"),
+    viewCount: integer("view_count").notNull().default(0),
+    lastViewedAt: integer("last_viewed_at"),
+  },
+  (t) => [
+    index("public_links_owner_idx").on(t.ownerId, t.createdAt),
+    index("public_links_artifact_idx").on(t.artifactId),
+  ],
+);
+
+/**
+ * 깊이 조사 jobs (#211, PRD FR-17, docs/decisions/deep-research.md): one per research card of a conversation, owned by
+ * the conversation's owner. The checkpoint is this row — the plan, the stage, each sub-question's state and its
+ * verified notes (`state`, JSON) — written after every step, so a restart resumes a job from its last finished step (or
+ * fails it when its 30-minute deadline has passed). `deadline_at` is wall-clock: time the server was down counts.
+ * `active_ms`: active time used before approval (planning), taken off the cap.
+ */
+export const researchJobs = sqliteTable(
+  "research_jobs",
+  {
+    id: text("id").primaryKey(),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** The assistant message holding the card (`research` part). */
+    messageId: text("message_id").notNull(),
+    status: text("status", {
+      enum: [
+        "planning",
+        "clarifying",
+        "awaiting_approval",
+        "researching",
+        "writing",
+        "done",
+        "failed",
+        "stopped",
+        "cancelled",
+      ],
+    }).notNull(),
+    backend: text("backend").notNull().default("claude"),
+    question: text("question").notNull(),
+    /** The ids of the files sent with the question (the job's attachments). JSON array. */
+    fileIds: text("file_ids").notNull().default("[]"),
+    clarifyQuestion: text("clarify_question"),
+    clarifyAnswer: text("clarify_answer"),
+    /** JSON `ResearchPlan`, once written. */
+    plan: text("plan"),
+    /** JSON checkpoint (research/store.ts `JobState`). */
+    state: text("state").notNull().default("{}"),
+    /** JSON `ResearchResult`, once done. */
+    result: text("result"),
+    errorCode: text("error_code"),
+    activeMs: integer("active_ms").notNull().default(0),
+    /** +1 on every write (the API's `version`: pages keep the newest state they have seen). */
+    version: integer("version").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+    approvedAt: integer("approved_at"),
+    deadlineAt: integer("deadline_at"),
+    endedAt: integer("ended_at"),
+  },
+  (t) => [
+    index("research_jobs_conversation_idx").on(t.conversationId, t.createdAt),
+    index("research_jobs_owner_status_idx").on(t.ownerId, t.status),
+  ],
 );

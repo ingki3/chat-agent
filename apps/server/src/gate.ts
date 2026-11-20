@@ -100,7 +100,8 @@ export function registerGate(app: FastifyInstance, opts: GateOptions): void {
 
   app.addHook("onRequest", async (req, reply) => {
     // Only tunnel requests are gated; local requests already passed the trust boundary (Host + no Cf-* headers).
-    if (req.ctx.origin !== "edge" || isGatePath(req.url)) return;
+    // Public artifact links (#204) are public: no gate cookie either.
+    if (req.ctx.origin !== "edge" || isGatePath(req.url) || req.ctx.publicLink) return;
     if (valid(req)) return;
     if (isApiRequest(req))
       return reply.code(401).header("Cache-Control", "no-store").send({ error: "gate_required" });

@@ -239,6 +239,27 @@
       "when": 1794981214013,
       "tag": "0033_dreaming_user_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1795018045837,
+      "tag": "0034_citation_complete",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1795052772600,
+      "tag": "0035_public_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1795074398671,
+      "tag": "0036_research_jobs",
+      "breakpoints": true
     }
   ]
 }

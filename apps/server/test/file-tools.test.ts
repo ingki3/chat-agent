@@ -6,6 +6,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
+  CITATION_LIMITS,
+  CITATION_STATUS_TEXT,
   CSRF_HEADER,
   CitationNotePart,
   FileLocator,
@@ -31,11 +33,12 @@ import { ClaudeAdapter } from "../src/runtime/claude.js";
 import { CODEX_MODELS, CodexAdapter } from "../src/runtime/codex.js";
 import { FakeRuntime, type FakeScript, defaultScript } from "../src/runtime/fake.js";
 import { FILE_SCENARIOS, REPORT_PAGE12, type FileScenarioName } from "../src/runtime/fake-files.js";
-import { knownSecrets } from "../src/secrets/known.js";
+import { knownSecrets, scanStats } from "../src/secrets/known.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { callOurTool, liveCall } from "./helpers/live-mcp.js";
 import { createFamily } from "./helpers/permission-matrix.js";
+import { meterWork } from "./helpers/work-meter.js";
 import {
   MATRIX,
   matrixDoc,
@@ -44,6 +47,7 @@ import {
   hlist,
   hwpDoc,
   xp,
+  xnote,
   xt,
   xskip,
   SWITCHES,
@@ -1208,12 +1212,6 @@ describe("review #107 2차: sheets by id only, cited sheets by number, no place 
   });
 });
 
-/**
- * Time cap of the dense case: ~90 ms alone here, ~270 ms with the whole suite in parallel on a busy machine; the
- * quadratic distribution takes seconds. Shared CI runners are several times slower (as in redact.test.ts).
- */
-const PERF_MS = process.env.CI ? 1600 : 400;
-
 /** A file held open on our MCP server by a run that waits, so the test calls the tools with its token (raw answers). */
 async function holding(
   runtimesFor: (rt: FakeRuntime) => RuntimeRegistry = (rt) => {
@@ -1484,7 +1482,7 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
   });
 
   it("[P2] dense: 200k matches over 20k rows (1.78M characters) — distributed in linear time, then served from the cache", async () => {
-    const { scrubFile } = await import("../src/files/scrub.js");
+    const { scrubFile, scrubStats } = await import("../src/files/scrub.js");
     const { KnownSecrets } = await import("../src/secrets/known.js");
     const reg = new KnownSecrets();
     const secret = "s3cr3tXY";
@@ -1492,49 +1490,88 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
     const rowText = Array.from({ length: 10 }, (_, i) => `${secret}${i}`)
       .join(" | ")
       .padEnd(89, ".");
-    const units = Array.from({ length: 20_000 }, () => {
-      const marks: [number, number, Record<string, unknown>][] = [];
+    const rows = (n: number) =>
+      Array.from({ length: n }, () => {
+        const marks: [number, number, Record<string, unknown>][] = [];
+        let pos = 0;
+        for (let i = 0; i < 10; i++) {
+          marks.push([pos, pos + secret.length + 1, { col: i + 1 }]);
+          pos += secret.length + 1 + 3;
+        }
+        return { text: rowText, marks };
+      });
+    // A row of n cells, each holding the secret (n marks, n ranges in one unit).
+    const wide = (n: number) => {
+      const cells = Array.from({ length: n }, (_, i) => `${secret}${i % 10}`);
       let pos = 0;
-      for (let i = 0; i < 10; i++) {
-        marks.push([pos, pos + secret.length + 1, { col: i + 1 }]);
-        pos += secret.length + 1 + 3;
-      }
-      return { text: rowText, marks };
-    });
+      return {
+        text: cells.join(" | "),
+        marks: cells.map((c, i): [number, number, Record<string, unknown>] => {
+          const m: [number, number, Record<string, unknown>] = [pos, pos + c.length, { col: i + 1 }];
+          pos += c.length + 3;
+          return m;
+        }),
+      };
+    };
+    // The full size: every secret masked, every mark kept.
+    const units = rows(20_000);
     expect(units.reduce((n, u) => n + u.text.length + 1, 0)).toBeGreaterThan(1_770_000);
-    scrubFile(units.slice(0, 100), reg); // warm up
-    // The best of three: a busy machine's pauses are not the algorithm (a quadratic one takes seconds).
-    let ms = Infinity;
-    let out: ReturnType<typeof scrubFile> = [];
-    for (let i = 0; i < 3; i++) {
-      const t0 = performance.now();
-      out = scrubFile(units, reg);
-      ms = Math.min(ms, performance.now() - t0);
-    }
+    const out = scrubFile(units, reg);
     expect(out.every((u) => !u.text.includes(secret))).toBe(true);
     expect(out[0]!.marks!.length).toBe(10);
-    expect(ms, `scrubFile ${ms.toFixed(0)} ms`).toBeLessThan(PERF_MS);
-    // And inside one unit: a row of 20k cells, each holding the secret (20k marks, 20k ranges).
-    const cells = Array.from({ length: 20_000 }, (_, i) => `${secret}${i % 10}`);
-    let pos = 0;
-    const wide = {
-      text: cells.join(" | "),
-      marks: cells.map((c, i): [number, number, Record<string, unknown>] => {
-        const m: [number, number, Record<string, unknown>] = [pos, pos + c.length, { col: i + 1 }];
-        pos += c.length + 3;
-        return m;
-      }),
-    };
-    let ms1 = Infinity;
-    let one: ReturnType<typeof scrubFile>[number] | undefined;
-    for (let i = 0; i < 3; i++) {
-      const t1 = performance.now();
-      [one] = scrubFile([wide], reg);
-      ms1 = Math.min(ms1, performance.now() - t1);
-    }
+    const [one] = scrubFile([wide(20_000)], reg);
     expect(one!.marks!.length).toBe(20_000);
     expect(one!.text.includes(secret)).toBe(false);
-    expect(ms1, `one wide unit ${ms1.toFixed(0)} ms`).toBeLessThan(PERF_MS);
+    // Linear: counted, not timed (#213 — a time cap failed under a full run's load). The work of 8× the rows (and
+    // of a row 8× as wide) is ~8× — the built-ins' work (`meterWork`) and the distribution's own loops
+    // (`scrubStats`, each loop); a distribution that walks every range for each unit, or every range for each mark, is 64×.
+    const loops = ["skipped", "taken", "swept", "passed"] as const;
+    const work = (units: Parameters<typeof scrubFile>[0], marks: number) => {
+      const before = { ...scrubStats };
+      let res: ReturnType<typeof scrubFile> = [];
+      const w = meterWork(() => {
+        res = scrubFile(units, reg);
+      });
+      expect(res.reduce((n, u) => n + u.marks!.length, 0)).toBe(marks);
+      // Each loop's own count is there: every range is taken, every mark's two ends swept, every range passed; and
+      // with several units, every unit's ranges skipped by the next one.
+      const d = Object.fromEntries(loops.map((k) => [k, scrubStats[k] - before[k]])) as Record<
+        (typeof loops)[number],
+        number
+      >;
+      expect(d.taken).toBeGreaterThanOrEqual(marks);
+      expect(d.swept).toBeGreaterThanOrEqual(2 * marks);
+      expect(d.passed).toBeGreaterThanOrEqual(marks);
+      if (units.length > 1) expect(d.skipped).toBeGreaterThanOrEqual(marks - 10);
+      return w + loops.reduce((n, k) => n + d[k], 0);
+    };
+    for (const [what, make] of [
+      ["rows", (n: number) => work(rows(n), 10 * n)],
+      ["one wide row", (n: number) => work([wide(10 * n)], 10 * n)],
+    ] as const) {
+      const small = make(1000);
+      const big = make(8000);
+      expect(small, `${what}: the meter saw the work`).toBeGreaterThanOrEqual(10 * 1000);
+      expect(big / small, `${what}: ${small} → ${big}`).toBeLessThan(10);
+    }
+    // And the rows' own text is read a few times each, never once per row before it (review #217: summing every
+    // earlier row's length to place a row reads no built-in and passes no counted loop) — a getter counts it.
+    const reads = (n: number) => {
+      let count = 0;
+      const counted = rows(n).map(({ marks }) => ({
+        get text() {
+          count++;
+          return rowText;
+        },
+        marks,
+      }));
+      expect(scrubFile(counted, reg).reduce((k, u) => k + u.marks!.length, 0)).toBe(10 * n);
+      return count;
+    };
+    const fewRows = reads(1000);
+    const manyRows = reads(8000);
+    expect(fewRows, "the rows' text was read").toBeGreaterThanOrEqual(1000);
+    expect(manyRows / fewRows, `text reads: ${fewRows} → ${manyRows}`).toBeLessThan(10);
   });
 
   it("[P2] reads are served from the cache until the extraction or the known secrets change", async () => {
@@ -1545,10 +1582,10 @@ describe("review #107 4차: a secret cut by the unit length cap; linear distribu
     const up = await h.upload(h.f.cookies.owner, c.id, "big.csv", Buffer.from(csv));
     await h.app.fileExtracts!.idle();
     const first = h.app.fileExtracts!.segments(up.id, 5, 1);
-    const t0 = performance.now();
+    // Not scrubbed again: nothing handed to the matcher (counted, not timed — #213).
+    const scanned = scanStats.chars;
     for (let i = 0; i < 20; i++) h.app.fileExtracts!.segments(up.id, 5, 1);
-    const cached = (performance.now() - t0) / 20;
-    expect(cached, `cached read ${cached.toFixed(1)} ms`).toBeLessThan(PERF_MS / 10);
+    expect(scanStats.chars - scanned).toBe(0);
     // From the cache: the very same scrubbed rows, not scrubbed again.
     expect(h.app.fileExtracts!.segments(up.id, 5, 1)[0]).toBe(first[0]);
     // A new secret — the row's text exactly as stored ("row5 | vvv… | end"): present before, gone right after.
@@ -2744,7 +2781,9 @@ describe("이 PDF 12쪽 요약 in both runtimes (수용 기준 2·11)", () => {
       ).toEqual([false, false, false, false]);
       expectPage12(r, file.id, rt);
       notes[rt] = JSON.parse(
-        JSON.stringify(r.note, (k, v: unknown) => (k === "fileId" || k === "fileRevision" ? "<id>" : v)),
+        JSON.stringify(r.note, (k, v: unknown) =>
+          k === "fileId" || k === "fileRevision" || k === "citationId" ? "<id>" : v,
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
@@ -2777,13 +2816,15 @@ describe("수용 기준 2: PDF 1 + HWP 1 비교 요약 in both runtimes (#24)", 
       for (const x of cites) {
         const res = await get(
           f.cookies.owner,
-          `/api/files/${x.locator!.fileId}/view?loc=${encodeURIComponent(JSON.stringify(x.locator))}`,
+          `/api/files/${x.locator!.fileId}/view?loc=${encodeURIComponent(JSON.stringify(x.locator))}&cite=${x.citationId}`,
         );
         expect(res.statusCode, rt).toBe(200);
         expect((res.json() as { target: { status: string } }).target.status, rt).toBe("exact");
       }
       notes[rt] = JSON.parse(
-        JSON.stringify(r.note, (k, v: unknown) => (k === "fileId" || k === "fileRevision" ? "<id>" : v)),
+        JSON.stringify(r.note, (k, v: unknown) =>
+          k === "fileId" || k === "fileRevision" || k === "citationId" ? "<id>" : v,
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);
@@ -3675,4 +3716,594 @@ describe("HWPX switch/default around a subList (review #120 5차): in its real p
     ]);
     expect(JSON.stringify(Object.values(reads))).not.toContain("UNREAD");
   }, 60_000); // several HWPX extractions and a re-extraction: slower than 5 s on CI runners
+});
+
+describe("#186: an attachment is cited with file_cite only; a follow-up's numbers are carried over and checked again", () => {
+  /** The follow-up "요약해줘" that writes the earlier answer's numbers again, without any tool. */
+  const AGAIN = "요약하면 강 정화 활동으로 쓰레기 340kg을 치웠어요[1]. 학교 자원봉사자들도 함께했어요[2].";
+  const script: FakeScript = (input, memory) => {
+    const id = /^\/(\S+) (\S+)$/.exec(input.text);
+    if (input.text === "/again") return [{ text: AGAIN }];
+    // The production case: the file was read or searched, the answer writes [n] without file_cite.
+    if (id?.[1] === "read-no-cite")
+      return [
+        { call: "file_read", input: { fileId: id[2]!, from: 12, to: 12 } },
+        { text: "보고서에 따르면 쓰레기 340kg을 치웠어요[1]. 학교 12곳이 함께했어요[2]." },
+      ];
+    // A file_search hit number written as if it were a citation.
+    if (input.text === "/search-reuse")
+      return [{ call: "file_search", input: { query: "340 kg" } }, { text: "쓰레기 340kg을 치웠어요[1]." }];
+    return defaultScript(input, memory);
+  };
+  const unverified = (c: { status: string }) => {
+    expect(c.status).not.toBe("verified");
+    expect(CITATION_STATUS_TEXT[c.status as keyof typeof CITATION_STATUS_TEXT].startsWith("⚠️ ")).toBe(true);
+  };
+
+  it("the production case: [n] after file_read without file_cite is ⚠️ (unknown_source), never verified", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    const r = await send(f.cookies.owner, c.id, `/read-no-cite ${file.id}`, undefined, [file.id]);
+    expect(r.run.status).toBe("done");
+    expect(CitationNotePart.parse(r.note)).toEqual(r.note);
+    expect(r.note!.unbacked).toBeUndefined();
+    expect(r.note!.citations.map((x) => [x.n, x.status, x.title, x.fileId])).toEqual([
+      [1, "unknown_source", null, undefined],
+      [2, "unknown_source", null, undefined],
+    ]);
+    r.note!.citations.forEach(unverified);
+    // A follow-up writing those numbers again carries nothing (there was nothing to carry): flagged, no sources.
+    const again = await send(f.cookies.owner, c.id, "/again");
+    expect(again.note).toMatchObject({ unbacked: true, missing: [] });
+    again.note!.citations.forEach(unverified);
+  }, 30_000); // several runs and extractions in a row
+
+  it("file_cite → verified with the file's id; the follow-up's same numbers are carried and verified again; a file_search hit number is ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    const first = await send(f.cookies.owner, c.id, "/file-page12", undefined, [file.id]);
+    expectPage12(first, file.id, "first");
+    expect(first.note!.citations.map((x) => x.fileId)).toEqual([file.id, file.id]);
+
+    const again = await send(f.cookies.owner, c.id, "/again");
+    expect(again.results).toEqual([]);
+    expect(CitationNotePart.parse(again.note)).toEqual(again.note);
+    expect(again.note!.unbacked).toBeUndefined();
+    expect(
+      again.note!.citations.map((x) => [
+        x.n,
+        x.status,
+        x.title,
+        x.site,
+        x.fileId,
+        x.locator?.fileId,
+        x.quote,
+      ]),
+    ).toEqual([
+      [1, "verified", "report.pdf", "12쪽", file.id, file.id, REPORT_PAGE12.summary],
+      [2, "verified", "report.pdf", "12쪽", file.id, file.id, REPORT_PAGE12.volunteers],
+    ]);
+    expect(again.note!.missing).toEqual([]);
+    // Nothing was registered for the follow-up: its run has no citation rows of its own.
+    expect(
+      db.$client.prepare("SELECT count(*) AS n FROM citations WHERE run_id = ?").get(again.run.id),
+    ).toEqual({
+      n: 0,
+    });
+
+    // A file_search result number written as a citation: this run's numbers are its own — ⚠️, nothing carried.
+    const reuse = await send(f.cookies.owner, c.id, "/search-reuse");
+    const [search] = outputs(reuse);
+    expect(search!.content).toContain(`(결과 1) report.pdf · 12쪽\n${REPORT_PAGE12.summary}`);
+    expect(search!.content).not.toMatch(/\[\d+\] report\.pdf/);
+    expect(reuse.note!.citations.map((x) => [x.n, x.status, x.fileId])).toEqual([
+      [1, "unknown_source", undefined],
+    ]);
+    reuse.note!.citations.forEach(unverified);
+  }, 30_000); // several runs and extractions in a row
+
+  it("the file's text changed, being extracted again, deleted: the carried number is not verified", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const file = await upload(f.cookies.owner, c.id, "report.pdf");
+    expectPage12(await send(f.cookies.owner, c.id, "/file-page12", undefined, [file.id]), file.id, "first");
+    const sql = db.$client;
+    // The extraction now has another text on page 12 (a new extraction: its row's time moves on).
+    sql
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND unit = 12")
+      .run("Report page 12\nNothing about the river here.", file.id);
+    sql.prepare("UPDATE file_extracts SET updated_at = updated_at + 1 WHERE file_id = ?").run(file.id);
+    const changed = await send(f.cookies.owner, c.id, "/again");
+    expect(changed.note!.citations.map((x) => [x.status, x.fileId, x.site, x.locator, x.quote])).toEqual([
+      ["snippet_not_found", file.id, null, undefined, REPORT_PAGE12.summary],
+      ["snippet_not_found", file.id, null, undefined, REPORT_PAGE12.volunteers],
+    ]);
+    changed.note!.citations.forEach(unverified);
+    // Being extracted again: not readable now — ⚠️ (never the earlier verification).
+    sql.prepare("UPDATE file_extracts SET status = 'pending' WHERE file_id = ?").run(file.id);
+    const pending = await send(f.cookies.owner, c.id, "/again");
+    expect(pending.note!.citations.map((x) => [x.status, x.fileId])).toEqual([
+      ["fetch_failed", file.id],
+      ["fetch_failed", file.id],
+    ]);
+    pending.note!.citations.forEach(unverified);
+    // Deleted: nothing to check against — not carried, the markers flagged, no sources.
+    sql.prepare("DELETE FROM files WHERE id = ?").run(file.id);
+    const gone = await send(f.cookies.owner, c.id, "/again");
+    expect(gone.note).toMatchObject({ unbacked: true });
+    expect(gone.note!.citations.map((x) => [x.status, x.fileId, x.title])).toEqual([
+      ["unknown_source", undefined, null],
+      ["unknown_source", undefined, null],
+    ]);
+  }, 30_000); // several runs and extractions in a row
+});
+
+describe("#186 review 1차: list numbers, the whole snippet, the earlier place", () => {
+  const LONG = `검토 결과 ${"한글".repeat(120)} 결론은 보류입니다.`;
+  const ONLY_HERE = "특별한 문장은 여기에만 있습니다.";
+  const B_SENTENCE = "둘째 파일에만 있는 문장입니다.";
+  const SNIPPETS: Record<string, string> = { long: LONG, only: ONLY_HERE, b: B_SENTENCE };
+  const script: FakeScript = (input, memory) => {
+    const cite = /^\/cite (\S+) (\S+)$/.exec(input.text);
+    if (cite)
+      return [
+        { call: "file_cite", input: { fileId: cite[1]!, snippet: SNIPPETS[cite[2]!]! } },
+        { text: "그 파일에는 그렇게 적혀 있어요[1]." },
+      ];
+    if (input.text === "/again1") return [{ text: "다시 말하면 그렇게 적혀 있어요[1]." }];
+    if (input.text === "/list-first")
+      return [{ call: "file_list", input: {} }, { text: "목록의 첫 파일은 회의록이에요[1]." }];
+    return defaultScript(input, memory);
+  };
+  const touch = (db: { $client: import("better-sqlite3").Database }, fileId: string) =>
+    db.$client.prepare("UPDATE file_extracts SET updated_at = updated_at + 1 WHERE file_id = ?").run(fileId);
+
+  it("[P2] a turn that called file_list: its [1] (list item 1, another file) is not the earlier answer's [1]", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const a = await upload(f.cookies.owner, c.id, "a.txt", Buffer.from("첫째 파일의 회의록입니다.\n"));
+    const b = await upload(f.cookies.owner, c.id, "b.txt", Buffer.from(`${B_SENTENCE}\n`));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${b.id} b`, undefined, [a.id, b.id]);
+    expect(first.note!.citations.map((x) => [x.status, x.fileId])).toEqual([["verified", b.id]]);
+    const listed = await send(f.cookies.owner, c.id, "/list-first");
+    const [list] = outputs(listed);
+    expect((list!.items as { fileId: string }[])[0]!.fileId).toBe(a.id);
+    expect(listed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([["unknown_source", undefined]]);
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2] a passage whose page text is longer than the limit: the follow-up checks the whole snippet — a changed ending is ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // Decomposed Hangul: the snippet (NFC, < 500) matches more than 500 characters of the file's text.
+    const file = await upload(f.cookies.owner, c.id, "long.txt", Buffer.from(`${LONG.normalize("NFD")}\n`));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} long`, undefined, [file.id]);
+    const cited = first.note!.citations[0]!;
+    expect(cited.status).toBe("verified");
+    expect(LONG.length).toBeLessThan(CITATION_LIMITS.snippet);
+    expect(cited.quote!.length).toBe(CITATION_LIMITS.snippet); // the display quote is cut …
+    // … the whole passage stays server-side, in the citation row — never in the message (shares, streams).
+    expect(cited.citationId).toBeDefined();
+    const row = db.$client.prepare("SELECT snippet FROM citations WHERE id = ?").get(cited.citationId!) as {
+      snippet: string;
+    };
+    expect(row.snippet).toBe(LONG);
+    const stored = JSON.stringify(
+      app
+        .conversations!.messageById(first.run.assistantMessageId)!
+        .parts.filter((p) => p.type === "citation_note"),
+    );
+    expect(stored).not.toContain("보류");
+    expect(stored).not.toContain("보류".normalize("NFD"));
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe("verified");
+    // The ending (past the cut quote) changes: the whole passage is not there any more.
+    db.$client
+      .prepare("UPDATE file_segments SET text = replace(text, ?, ?) WHERE file_id = ?")
+      .run("보류".normalize("NFD"), "승인".normalize("NFD"), file.id);
+    touch(db, file.id);
+    const changed = await send(f.cookies.owner, c.id, "/again1");
+    expect(changed.note!.citations.map((x) => [x.status, x.fileId])).toEqual([
+      ["snippet_not_found", file.id],
+    ]);
+  }, 30_000); // several runs and extractions in a row
+
+  /** Rewrites one stored unit's lines (its marks follow), and bumps the extraction so the cache sees it. */
+  const editRun = (
+    db: { $client: import("better-sqlite3").Database },
+    fileId: string,
+    has: string,
+    edit: (line: number, text: string) => string,
+  ) => {
+    const seg = db.$client
+      .prepare("SELECT seq, text, marks FROM file_segments WHERE file_id = ? AND text LIKE ?")
+      .get(fileId, `%${has}%`) as { seq: number; text: string; marks: string };
+    const marks = JSON.parse(seg.marks) as [number, number, { line: number }][];
+    const lines = seg.text.split("\n").map((l, i) => edit(marks[i]![2].line, l));
+    let at = 0;
+    const next = lines.map((l, i) => {
+      const m = [at, at + l.length, { ...marks[i]![2] }];
+      at += l.length + 1;
+      return m;
+    });
+    db.$client
+      .prepare("UPDATE file_segments SET text = ?, marks = ? WHERE file_id = ? AND seq = ?")
+      .run(lines.join("\n"), JSON.stringify(next), fileId, seg.seq);
+    touch(db, fileId);
+  };
+  const viewAt = async (
+    app: Awaited<ReturnType<typeof start>>["app"],
+    cookie: string,
+    fileId: string,
+    loc: FileLocator,
+    cite?: string,
+  ) =>
+    (
+      await app.inject({
+        method: "GET",
+        url: `/api/files/${fileId}/view?loc=${encodeURIComponent(JSON.stringify(loc))}${cite ? `&cite=${cite}` : ""}`,
+        headers: { ...LOCAL, cookie },
+      })
+    ).json() as { target: { status: string; start?: true } | null };
+  /** A stored unit, by a piece of its text. */
+  const unitWith = (db: { $client: import("better-sqlite3").Database }, fileId: string, has: string) =>
+    db.$client
+      .prepare(
+        "SELECT seq, text, marks, locator FROM file_segments WHERE file_id = ? AND text LIKE ? ORDER BY seq",
+      )
+      .all(fileId, `%${has}%`) as { seq: number; text: string; marks: string | null; locator: string }[];
+
+  it("[P2 3·4차] the cited unit unchanged at the same place, or not verified: copies in another unit never move it; any change in the unit → ⚠️ (note and viewer alike)", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    const lines = Array.from({ length: 100 }, (_, i) => (i === 59 ? ONLY_HERE : `줄 ${i + 1} 내용입니다.`));
+    const file = await upload(f.cookies.owner, c.id, "dup.txt", Buffer.from(lines.join("\n") + "\n"));
+    await app.fileExtracts!.idle();
+    const first = await send(f.cookies.owner, c.id, `/cite ${file.id} only`, undefined, [file.id]);
+    const cited = first.note!.citations[0]!;
+    expect([cited.status, cited.locator?.line]).toEqual(["verified", 60]);
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target?.status,
+    ).toBe("exact");
+    // Line 5 (another stored unit) gets the sentence, 50 times and quoted: line 60 stays, and the viewer agrees.
+    editRun(db, file.id, "줄 5 내용", (n, l) =>
+      n === 5 ? `${`${ONLY_HERE} `.repeat(50)}“${ONLY_HERE}”` : l,
+    );
+    const again = await send(f.cookies.owner, c.id, "/again1");
+    const kept = again.note!.citations[0]!;
+    expect([kept.status, kept.locator]).toEqual(["verified", cited.locator]);
+    expect((await viewAt(app, f.cookies.owner, file.id, kept.locator!, kept.citationId)).target?.status).toBe(
+      "exact",
+    );
+    // Any change in the cited unit (another line of the same stored run — before or after it): not verified, and the
+    // viewer no longer claims the range either.
+    for (const n of [55, 65]) {
+      editRun(db, file.id, "줄 41 내용", (k, l) => (k === n ? `${l} 덧붙임.` : l));
+      expect(
+        (await send(f.cookies.owner, c.id, "/again1")).note!.citations.map((x) => x.status),
+        `${n}`,
+      ).toEqual(["snippet_not_found"]);
+      expect(
+        (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target?.status,
+        `${n}`,
+      ).not.toBe("exact");
+      editRun(db, file.id, "줄 41 내용", (k, l) => (k === n ? `줄 ${n} 내용입니다.` : l));
+      expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status, `${n}`).toBe(
+        "verified",
+      );
+    }
+    // Moved inside its own line, or gone: ⚠️ — never looked for elsewhere (line 5 has it).
+    editRun(db, file.id, "줄 41 내용", (n, l) => (n === 60 ? `설명: ${l}` : l));
+    const moved = await send(f.cookies.owner, c.id, "/again1");
+    expect(moved.note!.citations.map((x) => [x.status, x.locator])).toEqual([
+      ["snippet_not_found", undefined],
+    ]);
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 4차] Codex's repros: a number changed at the range end, a two-line passage, a moved cell, an identical re-extraction, a newly masked value", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // 100 → 1000 right after the cited range's end ("… USD 100" cited, the period not).
+    SNIPPETS.amount = "Approved amount is USD 100";
+    const amount = await upload(
+      f.cookies.owner,
+      c.id,
+      "amount.txt",
+      Buffer.from("Approved amount is USD 100.\n"),
+    );
+    await app.fileExtracts!.idle();
+    const a1 = (await send(f.cookies.owner, c.id, `/cite ${amount.id} amount`, undefined, [amount.id])).note!
+      .citations[0]!;
+    expect(a1.status).toBe("verified");
+    // One line only: exact, the whole passage (no "start only").
+    const single = (await viewAt(app, f.cookies.owner, amount.id, a1.locator!, a1.citationId)).target;
+    expect([single?.status, single?.start]).toEqual(["exact", undefined]);
+    editRun(db, amount.id, "Approved", () => "Approved amount is USD 1000.");
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+
+    // A passage over two lines of a TXT: verified when cited, on carry, and exact in the viewer.
+    SNIPPETS.two = "The committee approved the final amount.";
+    const late = `sk-ant-late${crypto.randomUUID().replaceAll("-", "")}`;
+    const two = await upload(
+      f.cookies.owner,
+      c.id,
+      "two.txt",
+      Buffer.from(`Intro ${late} here.\nThe committee approved\nthe final amount.\nOutro.\n`),
+    );
+    await app.fileExtracts!.idle();
+    const t1 = (await send(f.cookies.owner, c.id, `/cite ${two.id} two`, undefined, [two.id])).note!
+      .citations[0]!;
+    expect([t1.status, t1.locator?.line]).toEqual(["verified", 2]);
+    const t2 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect([t2.status, t2.locator]).toEqual(["verified", t1.locator]);
+    // Exact — and said to be the passage's start only (it goes on to the next line, review 5차 P3).
+    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!, t2.citationId)).target).toMatchObject({
+      status: "exact",
+      start: true,
+    });
+    // A link naming no citation (an older one, or a copy without its row) opens at the unit only (review 6차).
+    expect((await viewAt(app, f.cookies.owner, two.id, t2.locator!)).target?.status).toBe("unit");
+
+    // An identical re-extraction (as for a new extractor version — the rows' prefix hashes are cleared): still
+    // verified, still exact.
+    (app.fileExtracts as unknown as { reextract(id: string): void }).reextract(two.id);
+    await app.fileExtracts!.settled(two.id, 10_000);
+    await app.fileExtracts!.idle();
+    const row = db.$client
+      .prepare("SELECT locator FROM citations WHERE file_id = ? AND locator IS NOT NULL")
+      .get(two.id) as { locator: string };
+    expect(JSON.parse(row.locator).textHash).toBeUndefined();
+    const t3 = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect([t3.status, t3.locator]).toEqual(["verified", t1.locator]);
+    expect((await viewAt(app, f.cookies.owner, two.id, t3.locator!, t3.citationId)).target?.status).toBe(
+      "exact",
+    );
+
+    // A value of the cited unit masked now (registered later, on another line): the unit is not the one verified.
+    knownSecrets.add(late);
+    closers.push(() => knownSecrets.remove(late));
+    const masked = (await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!;
+    expect(masked.status).not.toBe("verified");
+    expect((await viewAt(app, f.cookies.owner, two.id, t1.locator!, t1.citationId)).target?.status).not.toBe(
+      "exact",
+    );
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 4차] a cell moved (the same row text, its cell now B1 instead of A1): not verified", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.cell = "첫째 칸에만 있는 문장입니다";
+    const csv = await upload(
+      f.cookies.owner,
+      c.id,
+      "cells.csv",
+      Buffer.from("첫째 칸에만 있는 문장입니다,둘째\n"),
+    );
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${csv.id} cell`, undefined, [csv.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.range]).toEqual(["verified", "A1"]);
+    const seg = db.$client.prepare("SELECT seq, marks FROM file_segments WHERE file_id = ?").get(csv.id) as {
+      seq: number;
+      marks: string;
+    };
+    const marks = JSON.parse(seg.marks) as [number, number, Record<string, unknown>][];
+    // The same text, its first cell now said to be B1 (and the second C1).
+    const moved = marks.map(([a, b, m]) => [
+      a,
+      b,
+      {
+        ...m,
+        ...(m.range === "A1" ? { range: "B1", col: 2 } : m.range === "B1" ? { range: "C1", col: 3 } : {}),
+      },
+    ]);
+    expect(JSON.stringify(moved)).not.toBe(seg.marks);
+    db.$client
+      .prepare("UPDATE file_segments SET marks = ? WHERE file_id = ? AND seq = ?")
+      .run(JSON.stringify(moved), csv.id, seg.seq);
+    touch(db, csv.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] a body paragraph is not its footnote: the body changed, a footnote with the body's old unit → ⚠️", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.body = "본문과 각주에 같은 문장이 있습니다";
+    const doc = await hwpxDoc(
+      xp(xt("본문과 각주에 같은 문장이 있습니다.") + xnote("각주의 다른 글입니다.", 2)),
+    );
+    const file = await upload(f.cookies.owner, c.id, "note.hwpx", doc);
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${file.id} body`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.kind, first.locator?.footnote]).toEqual([
+      "verified",
+      "paragraph",
+      undefined,
+    ]);
+    const [body] = unitWith(db, file.id, "본문과 각주에");
+    const [note] = unitWith(db, file.id, "각주의 다른 글");
+    expect(JSON.parse(note!.locator).footnote).toBe(2);
+    // The footnote now holds exactly the body's old unit (text and marks); the body itself changed.
+    db.$client
+      .prepare("UPDATE file_segments SET text = ?, marks = ? WHERE file_id = ? AND seq = ?")
+      .run(body!.text, body!.marks, file.id, note!.seq);
+    db.$client
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND seq = ?")
+      .run(`${body!.text} 덧붙임.`, file.id, body!.seq);
+    touch(db, file.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] two sheets whose names are masked alike stay two: the first sheet's row changed, the second's A1 never stands in", async () => {
+    const n1 = `sk-ant-sheetone${crypto.randomUUID().replaceAll("-", "")}`;
+    const n2 = `sk-ant-sheettwo${crypto.randomUUID().replaceAll("-", "")}`;
+    knownSecrets.add(n1);
+    knownSecrets.add(n2);
+    closers.push(() => (knownSecrets.remove(n1), knownSecrets.remove(n2)));
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.sheet = "두 시트에 같은 줄이 있습니다";
+    const row = [["두 시트에 같은 줄이 있습니다", "값"]];
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "sheets.xlsx",
+      xlsxOf([
+        [n1, row],
+        [n2, row],
+      ]),
+    );
+    await app.fileExtracts!.idle();
+    const first = (await send(f.cookies.owner, c.id, `/cite ${file.id} sheet`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([first.status, first.locator?.sheet, first.locator?.range]).toEqual(["verified", "[숨김]", "A1"]);
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).toBe("exact");
+    // A link naming no citation cannot tell the two sheets apart: the file opens, nothing is underlined (7차).
+    const blind = await app.inject({
+      method: "GET",
+      url: `/api/files/${file.id}/view?loc=${encodeURIComponent(JSON.stringify(first.locator))}`,
+      headers: { ...LOCAL, cookie: f.cookies.owner },
+    });
+    expect((blind.json() as { target: unknown }).target).toEqual({
+      status: "unit",
+      reasons: ["ambiguous"],
+      seqs: [],
+    });
+    const units = unitWith(db, file.id, "두 시트에");
+    expect(units).toHaveLength(2);
+    expect(units[0]!.text).toBe(units[1]!.text);
+    // Only the first sheet's row changes.
+    db.$client
+      .prepare("UPDATE file_segments SET text = ? WHERE file_id = ? AND seq = ?")
+      .run(`${units[0]!.text} 바뀜`, file.id, units[0]!.seq);
+    touch(db, file.id);
+    expect((await send(f.cookies.owner, c.id, "/again1")).note!.citations[0]!.status).toBe(
+      "snippet_not_found",
+    );
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, first.locator!, first.citationId)).target?.status,
+    ).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P2 5차] an old link is judged by its own citation: a newer citation at the same range never makes it exact", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.witness = "OriginalWitness 문장은 여기에 있습니다";
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "witness.txt",
+      Buffer.from("OriginalWitness 문장은 여기에 있습니다.\n둘째 줄입니다.\n"),
+    );
+    await app.fileExtracts!.idle();
+    const old = (await send(f.cookies.owner, c.id, `/cite ${file.id} witness`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect((await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status).toBe(
+      "exact",
+    );
+    // The unit changes (its other line); then the same range is cited anew.
+    editRun(db, file.id, "둘째 줄", (n, l) => (n === 2 ? "둘째 줄이 바뀌었습니다." : l));
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status,
+    ).not.toBe("exact");
+    const fresh = (await send(f.cookies.owner, c.id, `/cite ${file.id} witness`)).note!.citations[0]!;
+    expect([fresh.status, fresh.locator]).toEqual(["verified", old.locator]);
+    expect(fresh.citationId).not.toBe(old.citationId);
+    // The new link is exact; the old link (its own citation) is not; a link without an id sees them disagree.
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, fresh.locator!, fresh.citationId)).target?.status,
+    ).toBe("exact");
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, old.locator!, old.citationId)).target?.status,
+    ).not.toBe("exact");
+    expect((await viewAt(app, f.cookies.owner, file.id, old.locator!)).target?.status).not.toBe("exact");
+  }, 30_000); // several runs and extractions in a row
+
+  it("[P3 6차] a malformed cite is refused (only an omitted one is 'no citation'); a passage over two lines whose first line passes the display limit still says 'start'", async () => {
+    const { app, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    // The first line is 600 characters of "&amp; " (it reads "& …"): the passage goes on to the next line.
+    SNIPPETS.amp = `${"& ".repeat(100).trim()} 끝 문장입니다`;
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "amp.txt",
+      Buffer.from(`${"&amp; ".repeat(100).trim()}\n끝 문장입니다.\n`),
+    );
+    await app.fileExtracts!.idle();
+    const cited = (await send(f.cookies.owner, c.id, `/cite ${file.id} amp`, undefined, [file.id])).note!
+      .citations[0]!;
+    expect([cited.status, cited.locator?.line]).toEqual(["verified", 1]);
+    expect(
+      (await viewAt(app, f.cookies.owner, file.id, cited.locator!, cited.citationId)).target,
+    ).toMatchObject({
+      status: "exact",
+      start: true,
+    });
+    const at = (q: string) =>
+      app.inject({
+        method: "GET",
+        url: `/api/files/${file.id}/view?loc=${encodeURIComponent(JSON.stringify(cited.locator))}${q}`,
+        headers: { ...LOCAL, cookie: f.cookies.owner },
+      });
+    for (const q of [
+      "&cite=",
+      `&cite=${"a".repeat(65)}`,
+      `&cite=${cited.citationId}&cite=${cited.citationId}`,
+      "&cite=a%20b",
+    ])
+      expect((await at(q)).statusCode, q).toBe(400);
+    expect((await at("")).statusCode).toBe(200);
+    // An id the caller has no such citation for: a unit, never exact.
+    expect(((await at("&cite=nope")).json() as { target: { status: string } }).target.status).toBe("unit");
+  }, 30_000);
+
+  it("[P3 8차] the viewer reads the link's own row only, and a line citation whose stored passage is no longer found in the unit is not exact", async () => {
+    const { app, db, f, upload, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    SNIPPETS.line8 = "여덟째 검토의 한 줄 문장입니다";
+    const file = await upload(
+      f.cookies.owner,
+      c.id,
+      "line8.txt",
+      Buffer.from("여덟째 검토의 한 줄 문장입니다.\n다음 줄.\n"),
+    );
+    await app.fileExtracts!.idle();
+    const a = (await send(f.cookies.owner, c.id, `/cite ${file.id} line8`, undefined, [file.id])).note!
+      .citations[0]!;
+    const b = (await send(f.cookies.owner, c.id, `/cite ${file.id} line8`)).note!.citations[0]!;
+    expect(a.citationId).not.toBe(b.citationId);
+    // Only the asked row comes back from the store.
+    expect(app.files!.verifiedCitations(c.id, file.id, a.citationId!).map((r) => r.id)).toEqual([
+      a.citationId,
+    ]);
+    expect(app.files!.verifiedCitations(c.id, file.id, "nope")).toEqual([]);
+    expect((await viewAt(app, f.cookies.owner, file.id, a.locator!, a.citationId)).target?.status).toBe(
+      "exact",
+    );
+    // The row's stored passage masked since (the unit itself unchanged): not found there any more — not exact.
+    db.$client
+      .prepare("UPDATE citations SET snippet = ? WHERE id = ?")
+      .run("여덟째 검토의 [숨김] 문장입니다", a.citationId);
+    const t = (await viewAt(app, f.cookies.owner, file.id, a.locator!, a.citationId)).target!;
+    expect([t.status, t.start]).toEqual(["unit", undefined]);
+    // The other row (untouched) still is.
+    expect((await viewAt(app, f.cookies.owner, file.id, b.locator!, b.citationId)).target?.status).toBe(
+      "exact",
+    );
+  }, 30_000);
 });

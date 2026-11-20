@@ -624,6 +624,12 @@ function restoreLocked(o: RestoreOptions, target: string, backup: string): Resto
       // The runtime folders are not in backups: no CLI session can be resumed, the next turn starts a fresh one
       // from the server's history (as after a rewrite).
       db.$client.prepare("UPDATE runtime_sessions SET invalidated = 1").run();
+      // Public links (#204, review #209): a link turned off after the backup was made would be on again in it — the
+      // revocation is newer than the snapshot. Every restored link is turned off before the server can serve one;
+      // owners make new links where they still want them (docs/ops.md §21, §49.3).
+      db.$client
+        .prepare("UPDATE public_links SET disabled_at = ? WHERE disabled_at IS NULL")
+        .run((o.now ?? Date.now)());
       db.$client.pragma("wal_checkpoint(TRUNCATE)");
       db.$client.pragma("journal_mode = DELETE");
     } finally {

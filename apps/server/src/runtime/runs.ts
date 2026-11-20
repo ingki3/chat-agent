@@ -62,7 +62,7 @@ import {
 } from "../instructions/assemble.js";
 import { docBudgetBytes, docVersionsKey, EMPTY_DOCS, fitMaterial, type DocSet } from "../memory/inject.js";
 import { financeNote } from "../finance/checker.js";
-import { citationNote } from "../citations/checker.js";
+import { citationNote, ownsNumbers, type CitationCarry } from "../citations/checker.js";
 import { CitationStore } from "../citations/store.js";
 import { ArtifactStore } from "../artifacts/store.js";
 import { FINANCE_CHART_TOOL } from "@agentlee/mcp-tools/finance";
@@ -388,6 +388,11 @@ export type RunManagerOptions = {
    * source the conversation does not have is not referenced. Without it no source is referenced.
    */
   contextSources?: (conversationId: string) => ReadonlyMap<string, { text: boolean }>;
+  /**
+   * An earlier answer's file citation checked again for a follow-up that writes its number again (#186,
+   * `FileTools.recheck`). Without it file citations are not carried over (they stay `unknown_source`).
+   */
+  fileRecheck?: CitationCarry["recheckFile"];
   /**
    * 내 지침 (#144, docs/memory-spec.md §2): the documents a new session of this user gets — AGENT in the system
    * instructions, SOUL / USER / MEMORY in the user material box. Without it no documents go in.
@@ -965,6 +970,7 @@ export class RunManager {
           conversationId: row.conversationId,
           userId: row.userId,
           previous: () => this.previousCitations(row),
+          ...(this.opts.fileRecheck ? { recheckFile: this.opts.fileRecheck } : {}),
         });
         if (note) this.pushNote(row, parts, note);
       } catch {
@@ -975,7 +981,10 @@ export class RunManager {
 
   /**
    * The citations of the newest earlier answer of the conversation with a citation note (#150, numbers carried
-   * over — `citationNote`): active messages before this reply, the server's own notes only.
+   * over — `citationNote`): active messages before this reply, the server's own notes only. The search stops at an
+   * answer that numbered things of its own (review #186 2차: a list, a search, a fetch, a read, a citation —
+   * `ownsNumbers`) without a note to carry: a number after it may mean its item, never an older answer's source. A
+   * plain answer (no such tool) with only flagged markers (`unbacked`, #185) is looked past.
    */
   private previousCitations(row: RunRow): CitationEntry[] {
     const self = this.conversations.messageById(row.assistantMessageId);
@@ -984,9 +993,10 @@ export class RunManager {
       .messages(row.conversationId, { limit: 10_000 })
       .filter((m) => m.role === "assistant" && m.seq < self.seq);
     for (const m of earlier.reverse()) {
-      const note = (m.parts as MessagePart[]).find((p) => p.type === "citation_note");
-      // A note without sources (`unbacked`, #185) has nothing to carry: the answer before it is looked at.
+      const parts = m.parts as MessagePart[];
+      const note = parts.find((p) => p.type === "citation_note");
       if (note && !note.unbacked && note.citations.length) return note.citations;
+      if (parts.some((p) => p.type === "tool_call" && ownsNumbers(p.name))) return [];
     }
     return [];
   }

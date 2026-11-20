@@ -29,6 +29,8 @@ import {
   type CitationScenarioName,
 } from "../src/runtime/fake-citations.js";
 import { RunManager } from "../src/runtime/runs.js";
+import { knownSecrets } from "../src/secrets/known.js";
+import { projectPart } from "../src/shares/projection.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
 import { cx, newLog, replaySpawn } from "./helpers/codex-replay.js";
 import { liveCall } from "./helpers/live-mcp.js";
@@ -168,6 +170,18 @@ function expectScenario(name: CitationScenarioName | "reuse-fresh", r: Result, l
         "- 미국 수출 비중이 가장 컸어요",
       ]);
       break;
+    case "advice":
+      // #202: progress notes, the cited table, the opinion said so and the closing offer are not flagged.
+      expect(statuses(r), label).toEqual([
+        [1, "verified"],
+        [2, "verified"],
+        [3, "verified"],
+      ]);
+      expect(missingText(r), label).toEqual([
+        "- **전망:** 업계는 내년에도 두 자릿수 증가를 예상해요",
+        "미국 수출 비중이 가장 컸어요.",
+      ]);
+      break;
     case "reuse":
       // Pages of the earlier answer, checked again; [3] was never cited in this answer.
       expect(statuses(r), label).toEqual([
@@ -222,7 +236,7 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     expectScenario("conflict", await send(f.cookies.owner, c.id, "/cite conflict"));
     expectScenario("reuse", await send(f.cookies.owner, c.id, "/cite reuse"));
-    for (const name of ["insufficient", "partial"] as const) {
+    for (const name of ["insufficient", "partial", "advice"] as const) {
       const conv = app.conversations!.create(f.users.owner.id);
       expectScenario(name, await send(f.cookies.owner, conv.id, `/cite ${name}`));
     }
@@ -280,6 +294,65 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     expect(past.run.status).toBe("done");
     expect(past.note?.unbacked).toBeUndefined();
     expect(statuses(past)?.[0]).toEqual([1, "verified"]);
+  });
+
+  it("review #186 3차: a cite input's passage is masked as it is stored, streamed and shown to a shared viewer", async () => {
+    const secret = `sk-ant-citein${crypto.randomUUID().replaceAll("-", "")}`;
+    knownSecrets.add(secret);
+    try {
+      const script: FakeScript = (input, memory) =>
+        input.text === "/cite-secret"
+          ? [
+              {
+                call: "cite",
+                input: { sourceId: "made-up", snippet: `인용한 구절에 ${secret} 이 들어 있다.` },
+              },
+              { text: "그렇다고 해요[1]." },
+            ]
+          : defaultScript(input, memory);
+      const { app, f, send } = await start(fake(script));
+      const c = app.conversations!.create(f.users.owner.id);
+      const r = await send(f.cookies.owner, c.id, "/cite-secret");
+      const call = r.parts.find((p) => p.type === "tool_call" && p.name.endsWith("cite"));
+      expect(JSON.stringify(call)).toContain("인용한 구절에");
+      // Stored, streamed (tool_start), and as a shared viewer gets it (the same stored part, projected).
+      expect(JSON.stringify(r.parts)).not.toContain(secret);
+      expect(JSON.stringify(r.events)).not.toContain(secret);
+      expect(JSON.stringify(projectPart(call!))).not.toContain(secret);
+    } finally {
+      knownSecrets.remove(secret);
+    }
+  });
+
+  it("review #186 2차: an answer that numbered a list of its own ends the search — a later [1] never brings back an older source", async () => {
+    const script: FakeScript = (input, memory) => {
+      if (input.text === "/list")
+        return [{ call: "file_list", input: {} }, { text: "목록의 첫 번째 파일이에요[1]." }];
+      if (input.text === "/that-first") return [{ text: "그 첫 번째 파일은 회의록이에요[1]." }];
+      if (input.text === "/list-quiet")
+        return [{ call: "sources_list", input: {} }, { text: "목록을 봤어요." }];
+      return defaultScript(input, memory);
+    };
+    const { app, f, send } = await start(fake(script));
+    const c = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c.id, "/cite conflict"));
+    // Turn 2: the list's item 1 — flagged, not the web source.
+    const listed = await send(f.cookies.owner, c.id, "/list");
+    expect(statuses(listed)).toEqual([[1, "unknown_source"]]);
+    // Turn 3, no tool: "그 첫 번째 파일" [1] — the search stops at turn 2; the web source of turn 1 is not brought back.
+    const after = await send(f.cookies.owner, c.id, "/that-first");
+    expect(after.note?.unbacked).toBe(true);
+    expect(statuses(after)).toEqual([[1, "unknown_source"]]);
+    // A list answer without any marker ends the search too.
+    const c2 = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c2.id, "/cite conflict"));
+    await send(f.cookies.owner, c2.id, "/list-quiet");
+    expect(statuses(await send(f.cookies.owner, c2.id, "/that-first"))).toEqual([[1, "unknown_source"]]);
+    // A plain answer in between (no tool) is still looked past (normal chat: #150 behaviour unchanged).
+    const c3 = app.conversations!.create(f.users.owner.id);
+    expectScenario("conflict", await send(f.cookies.owner, c3.id, "/cite conflict"));
+    await send(f.cookies.owner, c3.id, "고마워요");
+    expect(statuses(await send(f.cookies.owner, c3.id, "/that-first"))).toEqual([[1, "verified"]]);
   });
 
   it("precedence (#150): once a run cites or fetches anything, every number is its own — nothing is carried", async () => {
@@ -367,19 +440,19 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const c = app.conversations!.create(f.users.owner.id);
     // The owner has the finance tools too (finance@5): the research section is what is looked at.
     const sections = (r: Result) => r.run.instructions!.split(",").filter((s) => !s.startsWith("finance@"));
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@9"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@11"]);
     const on = await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: true });
     expect(on.statusCode).toBe(200);
     expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual([
-      "common@9",
-      "research@3",
+      "common@11",
+      "research@4",
     ]);
     const prompt = rt.systemPrompts.at(-1)!;
     expect(prompt).toContain("# 자료 조사 모드");
-    expect(prompt).toContain("`cite`로 검증한 표시");
+    expect(prompt).toContain("`cite`(첨부 파일은 `file_cite`)로 검증한 표시");
     expect(prompt).toContain("`sources_list`");
     await api(f.cookies.owner, "PATCH", `/api/conversations/${c.id}`, { researchMode: false });
-    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@9"]);
+    expect(sections(await send(f.cookies.owner, c.id, "/cite insufficient"))).toEqual(["common@11"]);
     expect(rt.systemPrompts.at(-1)).not.toContain("# 자료 조사 모드");
   });
 
@@ -537,7 +610,7 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       const recap = await send(f.cookies.owner, recapConv.id, "/cite recap", rt);
       expectScenario("recap", recap, `${rt} recap`);
       const rest = [recap];
-      for (const name of ["insufficient", "partial", "many"] as const) {
+      for (const name of ["insufficient", "partial", "advice", "many"] as const) {
         const conv = app.conversations!.create(f.users.owner.id);
         if (name === "many") await send(f.cookies.owner, conv.id, "/cite fetchmany", rt);
         const r = await send(f.cookies.owner, conv.id, `/cite ${name}`, rt);
@@ -546,7 +619,11 @@ describe("the same citation scenarios in both runtimes (#25 completion criterion
       }
       // Source ids differ per conversation; everything else is the same in both runtimes.
       notes[rt] = [conflict, reuse, ...rest].map((r) =>
-        JSON.parse(JSON.stringify(r.note, (k, v: unknown) => (k === "sourceId" && v ? "<id>" : v))),
+        JSON.parse(
+          JSON.stringify(r.note, (k, v: unknown) =>
+            (k === "sourceId" || k === "citationId") && v ? "<id>" : v,
+          ),
+        ),
       );
     }
     expect(notes.codex).toEqual(notes["claude-code"]);

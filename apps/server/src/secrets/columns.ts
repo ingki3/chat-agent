@@ -228,6 +228,9 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
   // Its `textHash` (#24) is a hash over the cited unit's text: no value to mask, so it is dropped instead whenever
   // that file's stored text changes — the file rescrub and re-extraction (`forgetCitedTextHashes`, review #123 2차).
   "citations.locator": { write: "CitationStore.citeFile (scrubKnownDeep)", rescrub: "deep" },
+  // #186 review 4차: a hash of the cited unit's text and marks — no value to mask; a rescrub changes the unit's text,
+  // so the hash simply stops matching (the carried number and the viewer's exact range are then not claimed).
+  "citations.unit_hash": HASH,
   // Uploads (#22): the user's file name is scrubbed on write and rescrubbed. The file bytes are on disk, not in a
   // column, and are stored as they came (the user's own document — docs/ops.md §24).
   "files.id": ID,
@@ -460,4 +463,26 @@ export const TEXT_COLUMNS: Record<string, ColumnRule> = {
     exempt: "accepted limitation (as users.email): the admin's sign-in email; responses are scrubbed",
   },
   "admin_email_changes.state": ENUM,
+  // Public artifact links (#204): ids and the token's hash only — the token itself is never stored, and no visitor
+  // data (IP, user agent, referrer) is kept.
+  "public_links.id": ID,
+  "public_links.token_hash": HASH,
+  "public_links.owner_id": ID,
+  "public_links.artifact_id": ID,
+  // 깊이 조사 (#211): the question, the plan, the checkpoint (notes quote page and file text) and the clarifying
+  // exchange are user, model or page text — scrubbed on every write (ResearchStore) and again by the rescrub.
+  "research_jobs.id": ID,
+  "research_jobs.conversation_id": ID,
+  "research_jobs.owner_id": ID,
+  "research_jobs.message_id": ID,
+  "research_jobs.status": ENUM,
+  "research_jobs.backend": ENUM,
+  "research_jobs.question": { write: "ResearchStore.create (scrubKnown)", rescrub: "text" },
+  "research_jobs.file_ids": { exempt: "file ids (JSON array, checked against the conversation's files)" },
+  "research_jobs.clarify_question": { write: "ResearchStore.update (scrubKnown)", rescrub: "text" },
+  "research_jobs.clarify_answer": { write: "ResearchStore.update (scrubKnown)", rescrub: "text" },
+  "research_jobs.plan": { write: "ResearchStore.update (scrubKnownDeep)", rescrub: "deep" },
+  "research_jobs.state": { write: "ResearchStore.update (scrubKnownDeep)", rescrub: "deep" },
+  "research_jobs.result": { exempt: "ids, counts and flags only (JSON)" },
+  "research_jobs.error_code": ENUM,
 };

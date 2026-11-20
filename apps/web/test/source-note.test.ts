@@ -10,7 +10,8 @@ import {
   type FinanceNotePart,
   type PublicPart,
 } from "@agentlee/shared";
-import { Parts } from "../src/chat/Parts.js";
+import { markedRanges, Parts } from "../src/chat/Parts.js";
+import { markEffect, marksReady, subscribeMarks } from "../src/citations/marks.js";
 import { markerNumbers } from "../src/citations/markdown.js";
 import { citationView } from "../src/citations/segments.js";
 import { dataSourceViews, sourceNoteOf } from "../src/citations/source-note.js";
@@ -148,5 +149,86 @@ describe("the answer's source note (#185)", () => {
   it("no note part: no box", () => {
     expect(sourceNoteOf([{ type: "text", text: "349.8달러 [1]" }])).toBeUndefined();
     expect(render([{ type: "text", text: "349.8달러" }])).not.toContain("source-note");
+  });
+});
+
+describe("paragraphs without a citation (#202): one summary line, the paragraphs marked in the answer", () => {
+  const parts = (missingOf: string[], texts: string[]): PublicPart[] => {
+    const all = texts.join("");
+    return [
+      ...texts.map((t) => ({ type: "text" as const, text: t })),
+      {
+        ...citation,
+        missing: missingOf.map((s) => ({ start: all.indexOf(s), end: all.indexOf(s) + s.length })),
+        markers: [{ n: 1, start: all.indexOf("[1]"), end: all.indexOf("[1]") + 3 }],
+      },
+    ];
+  };
+
+  it("the note says how many — plain text until the marks are drawn (the button is e2e) — and never repeats their text", () => {
+    const texts = [TEXT + "\n\n", "미국 수출 비중이 가장 컸어요.\n\n업계는 증가를 예상해요."];
+    const html = render(parts(["미국 수출 비중이 가장 컸어요.", "업계는 증가를 예상해요."], texts));
+    expect(count(html, "source-note")).toBe(1);
+    // Server-rendered (no marks drawn yet — the renderer loads lazily): the count as text, no dead button.
+    expect(html).toContain('<span data-testid="citation-missing-warning">⚠️ 출처 표시 없는 문단 2개</span>');
+    expect(html).not.toContain("cite-missing-jump");
+    // Each paragraph once (in the answer), not again in the note; no excerpt list.
+    expect(html.split("미국 수출 비중이 가장 컸어요.")).toHaveLength(2);
+    expect(html).not.toContain("cite-missing-list");
+    expect(html).not.toContain("일부 내용에 출처 표시 없음");
+  });
+
+  it("an old note (ranges stored before #202, several text parts) renders: the count of the ranges that fit", () => {
+    const texts = ["자료를 찾아 볼게요.\n\n", TEXT];
+    const p = parts(["자료를 찾아 볼게요."], texts);
+    (p.at(-1) as CitationNotePart).missing.push({ start: 0, end: 9999 });
+    expect(render(p)).toContain("⚠️ 출처 표시 없는 문단 1개");
+  });
+
+  it("no ranges, or an unbacked note: no summary line", () => {
+    expect(render(parts([], [TEXT]))).not.toContain("citation-missing-warning");
+  });
+});
+
+describe("the summary line follows its marks (#202 review 2차)", () => {
+  it("a block's marks drawn → notified; gone (cleanup) → notified again, and the snapshot is false with no target", () => {
+    const targets: unknown[] = [];
+    const doc = { querySelectorAll: (sel: string) => (sel.includes('"m9"') ? targets : []) };
+    const g = globalThis as { document?: unknown };
+    const before = g.document;
+    g.document = doc;
+    try {
+      const seen: boolean[] = [];
+      const off = subscribeMarks(() => seen.push(marksReady("m9")));
+      targets.push({});
+      const cleanup = markEffect(true);
+      expect(seen).toEqual([true]);
+      // The block unmounts (or falls back to plain text): its targets are gone, the cleanup says so.
+      targets.length = 0;
+      cleanup!();
+      expect(seen).toEqual([true, false]);
+      // A block without marks says nothing.
+      expect(markEffect(false)).toBeUndefined();
+      expect(seen).toHaveLength(2);
+      off();
+      expect(marksReady(undefined)).toBe(false);
+    } finally {
+      g.document = before;
+    }
+  });
+});
+
+describe("older notes are counted, not marked (#202 review 4차)", () => {
+  it("only a note whose ranges are the screen's blocks (units: 2) is marked in place", () => {
+    const missing = [{ start: 0, end: 3 }];
+    const base = { ...citation, missing };
+    expect(markedRanges({ ...base, units: 2 })).toEqual(missing);
+    // Stored before: the old line split — counted ("출처 표시 없는 문단 N개" as text), never marked.
+    expect(markedRanges(base)).toBeUndefined();
+    expect(markedRanges({ ...base, units: 2, missing: [] })).toBeUndefined();
+    expect(markedRanges({ ...base, units: 2, unbacked: true })).toBeUndefined();
+    const html = render([{ type: "text", text: "가나다 라" }, base]);
+    expect(html).toContain('<span data-testid="citation-missing-warning">⚠️ 출처 표시 없는 문단 1개</span>');
+    expect(html).not.toContain("cite-missing-jump");
   });
 });

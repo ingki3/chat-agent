@@ -413,6 +413,8 @@ export class NotificationService {
           memoryProposals: row.memoryProposals,
           memoryApplied: row.memoryApplied,
           memoryFailed: row.memoryFailed,
+          researchDone: row.researchDone,
+          researchFailed: row.researchFailed,
           rev: row.rev,
         }
       : {
@@ -422,15 +424,23 @@ export class NotificationService {
           memoryProposals: true,
           memoryApplied: true,
           memoryFailed: true,
+          researchDone: true,
+          researchFailed: true,
           rev: 0,
         };
   }
 
   /** Whether the user wants this 기억 정리 notification (spec §8: the three user kinds can be turned off). */
-  wants(userId: string, kind: "memory_proposal" | "memory_applied" | "memory_failed"): boolean {
+  wants(
+    userId: string,
+    kind: "memory_proposal" | "memory_applied" | "memory_failed" | "research_done" | "research_failed",
+  ): boolean {
     const p = this.prefs(userId);
     if (kind === "memory_proposal") return p.memoryProposals !== false;
     if (kind === "memory_applied") return p.memoryApplied !== false;
+    // 깊이 조사 (#211): "완료" and "실패·중지", each its own switch.
+    if (kind === "research_done") return p.researchDone !== false;
+    if (kind === "research_failed") return p.researchFailed !== false;
     return p.memoryFailed !== false;
   }
 
@@ -444,6 +454,8 @@ export class NotificationService {
       memoryProposals: p.memoryProposals ?? before.memoryProposals ?? true,
       memoryApplied: p.memoryApplied ?? before.memoryApplied ?? true,
       memoryFailed: p.memoryFailed ?? before.memoryFailed ?? true,
+      researchDone: p.researchDone ?? before.researchDone ?? true,
+      researchFailed: p.researchFailed ?? before.researchFailed ?? true,
       updatedAt: this.now(),
     };
     // The revision goes up with every write, in the same statement (#188 review 9).

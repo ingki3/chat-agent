@@ -275,61 +275,75 @@ test("a failing end-of-run read is tried again while finishing: the queued Enter
   expect(h.sends).toEqual(["첫 질문", "실패 뒤 보낼 글"]);
 });
 
-test("a late end-of-run check never wipes the next run: its stream and ■ 중지 stay (#141)", async ({
+test("one end-of-run check at a time, and a stale `null` never wipes the next run: its stream and ■ 중지 stay (#141, #103)", async ({
   page,
   baseURL,
 }) => {
   const h = await openHeld(page, baseURL!, "늦은 종료 확인");
-  const url = `**/api/conversations/*/active-run`;
-  // After `done`: the normal read (1st) is held; the check kept up while finishing (2nd) is answered by the server at
-  // once — the run has ended, `null` — but that answer reaches the page only when the test says so.
-  let n = 0;
-  let normal: Route | undefined;
-  let late: { route: Route; response: Awaited<ReturnType<Route["fetch"]>> } | undefined;
-  let lateSettled: Promise<unknown> | undefined;
-  await page.route(url, async (route) => {
-    n++;
-    if (n === 1) normal = route;
-    else if (n === 2) {
-      const req = route.request();
-      lateSettled = Promise.race([
-        page.waitForEvent("requestfinished", { predicate: (r) => r === req, timeout: 0 }),
-        page.waitForEvent("requestfailed", { predicate: (r) => r === req, timeout: 0 }),
-      ]);
-      late = { route, response: await route.fetch() };
-    } else await route.continue();
-  });
-
+  // After `done`: the check of the run's end is held — busy all along, and no second check alongside it.
+  h.hold();
   await box(page).fill("첫 질문");
   await box(page).press("Enter");
   await expect(reply(page)).toHaveAttribute("data-status", "complete");
-  await expect.poll(() => late !== undefined, { timeout: 10_000 }).toBe(true);
-  expect(await late!.response.json()).toEqual({ run: null });
-
-  // The normal path confirms the end: free again.
-  await normal!.continue();
+  await expect.poll(() => h.held.length).toBe(1);
+  await page.evaluate(() => new Promise((r) => setTimeout(r, 4500))); // two of the 2 s ticks
+  expect(h.held).toHaveLength(1);
+  await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
+  await h.release();
   await expect(page.getByRole("button", { name: "보내기" })).toBeVisible();
 
-  // The next run, its stream held so it keeps going for as long as the test needs.
+  // The next run keeps going (it waits at a gate) and its stream is held.
+  const gate = crypto.randomUUID();
   const streams: Route[] = [];
   await page.route("**/api/runs/*/events*", (route) => void streams.push(route));
-  await box(page).fill("다음 질문");
+  await box(page).fill(`/gate ${gate}`);
   await box(page).press("Enter");
   await expect(box(page)).toHaveValue("");
   await expect.poll(() => streams.length).toBeGreaterThan(0);
   await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
 
-  // The stale `null` arrives now (or was dropped already, its request aborted when finishing ended).
-  await late!.route.fulfill({ response: late!.response }).catch(() => undefined);
-  await lateSettled;
-  await page.evaluate(() => new Promise((r) => setTimeout(r, 100))); // its handling, if any, has run
+  // A stale `null` (as a read sent before the send would answer): the next read of the run (on reconnecting, once
+  // its data is stale) gets it. The run in progress is not let go on it — its end is settled, and it has none.
+  let stale = 0;
+  await page.route(`**/api/conversations/*/active-run`, (route) =>
+    stale++ === 0 ? route.fulfill({ json: { run: null } }) : route.fallback(),
+  );
+  // Never freed, not even for a moment (a let-go and a later pick-up would flash 보내기).
+  await page.evaluate(() => {
+    const w = window as unknown as { freed?: boolean };
+    w.freed = false;
+    const check = () => {
+      if ([...document.querySelectorAll("button")].some((b) => b.textContent?.trim() === "보내기"))
+        w.freed = true;
+    };
+    new MutationObserver(check).observe(document.body, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+  });
+  await page.evaluate(async () => {
+    await new Promise((r) => setTimeout(r, 5500));
+    window.dispatchEvent(new Event("offline"));
+    window.dispatchEvent(new Event("online"));
+  });
+  await expect.poll(() => stale, { timeout: 10_000 }).toBeGreaterThan(1); // the stale one, then the settle's own read
+  await page.evaluate(() => new Promise((r) => setTimeout(r, 300))); // its handling has run
   await expect(page.getByRole("button", { name: "■ 중지" })).toBeVisible();
   await expect(page.getByRole("button", { name: "보내기" })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { freed?: boolean }).freed)).toBe(false);
   await expect(reply(page)).not.toHaveAttribute("data-status", "complete");
 
+  // Let it end: the stream carries on, the reply completes.
+  const other = await newConversation(page.request, baseURL!, `gate ${gate}`);
+  const released = await page.request.post(`/api/conversations/${other.id}/messages`, {
+    data: { text: `/release ${gate}` },
+    headers: { origin: baseURL!, "x-agent-lee": "1", "Idempotency-Key": crypto.randomUUID() },
+  });
+  expect(released.ok()).toBe(true);
   await page.unroute("**/api/runs/*/events*");
   for (const r of streams.splice(0)) await r.continue();
-  await expect(reply(page)).toContainText("다음 질문");
+  await expect(reply(page)).toContainText("끝났어요");
   await expect(reply(page)).toHaveAttribute("data-status", "complete");
-  expect(h.sends).toEqual(["첫 질문", "다음 질문"]);
+  expect(h.sends).toEqual(["첫 질문", `/gate ${gate}`]);
 });

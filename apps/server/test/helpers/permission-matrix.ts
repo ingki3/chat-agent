@@ -174,6 +174,12 @@ function artifact(f: Family) {
   return { id: a.id, params: { version: "1" } };
 }
 
+/** A public link (#204) of `owner`'s shared artifact. */
+function publicLink(f: Family) {
+  const { id } = artifact(f);
+  return f.app.publicLinks!.create({ ownerId: f.users.owner.id, artifactId: id, version: 1, days: 7 }).row.id;
+}
+
 /** An artifact of `owner` shared with no one (#29). */
 function unsharedArtifact(f: Family) {
   const c = f.app.conversations!.create(f.users.owner.id);
@@ -223,6 +229,31 @@ function share(revoked = false) {
     if (revoked) f.app.sharing!.store.revoke(s.id);
     return s.id;
   };
+}
+
+/**
+ * A 깊이 조사 job (#211) of `owner`'s conversation shared with `shared` — its card message in the projection. Ended
+ * (cancelled), so the owner's actions answer 409 past the resource check and the event stream closes at once.
+ */
+function researchJob(f: Family) {
+  const fx = conversation(f);
+  const id = crypto.randomUUID();
+  const card = f.app.conversations!.append(fx.id, {
+    role: "assistant",
+    parts: [{ type: "research", jobId: id }],
+  });
+  const store = f.app.research!.store;
+  store.create({
+    id,
+    conversationId: fx.id,
+    ownerId: f.users.owner.id,
+    messageId: card.id,
+    question: "질문",
+    fileIds: [],
+    backend: "claude",
+  });
+  store.update(id, { status: "cancelled", endedAt: Date.now() });
+  return id;
 }
 
 /** A live share (#29) of `owner`'s schedule-result conversation (#56) with `shared` — "새 결과 알림 받기" (#52). */
@@ -277,6 +308,32 @@ export const APP_MATRIX: MatrixRow[] = [
   { route: "GET /api/runs/:id/events", expect: READ, fixture: run },
   { route: "POST /api/runs/:id/interrupt", expect: OWNER_ONLY, fixture: run },
   { route: "GET /api/conversations/:id/active-run", expect: READ, fixture: conversation },
+  // 깊이 조사 (#211): the owner starts and acts; a shared viewer reads the card (its message is in the projection).
+  // No runtime in the matrix app: the owner's start is refused past the resource check (no_runtime); the fixture job
+  // has ended, so the owner's actions are refused by its state (research_state) — everyone else by the resource check.
+  {
+    route: "POST /api/conversations/:id/research",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: conversation,
+    body: { text: "조사해 줘" },
+    errors: { owner: "no_runtime", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "GET /api/research/:id", expect: READ, fixture: researchJob },
+  { route: "GET /api/research/:id/events", expect: READ, fixture: researchJob },
+  ...(["approve", "cancel", "stop"] as const).map((a) => ({
+    route: `POST /api/research/:id/${a}`,
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: researchJob,
+    body: {},
+    errors: { owner: "research_state", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  })),
+  {
+    route: "POST /api/research/:id/clarify",
+    expect: { ...OWNER_ONLY, owner: 409 },
+    fixture: researchJob,
+    body: { answer: "이번 달" },
+    errors: { owner: "research_state", shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
   { route: "GET /api/conversations/:id", expect: READ, fixture: conversation },
   {
     route: "PATCH /api/conversations/:id",
@@ -349,6 +406,16 @@ export const APP_MATRIX: MatrixRow[] = [
     errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
   },
   { route: "GET /api/artifacts/:id/shares", expect: OWNER_ONLY, fixture: artifact },
+  // Public links (#204): only the owner checks, makes or turns off one — the shared viewer (a recipient) never.
+  { route: "GET /api/artifacts/:id/public-links/check", expect: OWNER_ONLY, fixture: artifact },
+  {
+    route: "POST /api/artifacts/:id/public-links",
+    expect: { ...OWNER_ONLY, owner: 201 },
+    fixture: artifact,
+    body: { version: 1, expiresInDays: 7 },
+    errors: { shared: "forbidden", admin: "forbidden", stranger: "forbidden" },
+  },
+  { route: "DELETE /api/public-links/:id", expect: OWNER_ONLY, fixture: publicLink },
   { route: "GET /api/shares/:id", expect: OWNER_ONLY, fixture: share() },
   {
     route: "PATCH /api/shares/:id",
@@ -527,10 +594,14 @@ export const ADMIN_MATRIX_PREFIXES = [
   "/api/admin/access",
   // #173: the audio transcription fallback switch.
   "/api/admin/audio",
+  // #204: public links — counts, expiry, turn off (no title, no content).
+  "/api/admin/public-links",
 ];
 /** A route the admin reaches with the matrix's placeholder id: the handler answers 404 (not 403). */
 const ADMIN_BY_ID: Record<Who, number> = { ...ADMIN_ONLY, admin: 404 };
 export const ADMIN_MATRIX: AdminRow[] = [
+  { route: "GET /api/admin/public-links", expect: ADMIN_ONLY },
+  { route: "POST /api/admin/public-links/:id/disable", expect: ADMIN_BY_ID },
   { route: "GET /api/admin/usage", expect: ADMIN_ONLY },
   { route: "GET /api/admin/usage/prices", expect: ADMIN_ONLY },
   {

@@ -980,7 +980,7 @@ describe("redactSecrets", () => {
       if (/hunter2|123456/.test(redactString(x))) leaks.push(x);
     }
     expect(leaks.slice(0, 5)).toEqual([]);
-  });
+  }, 30_000); // 3,000 cases on a loaded runner: a time budget, not the check itself (ran 3.3 s and 5.06 s in CI, #219)
 
   it("pass C never changes what A and B handled precisely (well-formed JSON)", () => {
     const wellFormed = [

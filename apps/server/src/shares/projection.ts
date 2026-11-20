@@ -195,6 +195,19 @@ export class SharePolicy {
           .all(conversationId, ids) as { id: string }[]
       ).map((r) => r.id),
     );
+    // 깊이 조사 cards (#211) in the list: their job's report versions (made under `research:<job>`) go with them, and
+    // its steps' citations — as a run's do with its reply.
+    for (const j of this.sql
+      .prepare(
+        `select id from research_jobs where conversation_id = ? and message_id in (select value from json_each(?))`,
+      )
+      .all(conversationId, ids) as { id: string }[]) {
+      runIds.add(`research:${j.id}`);
+      for (const c of this.sql
+        .prepare(`select distinct run_id as r from citations where conversation_id = ? and run_id like ?`)
+        .all(conversationId, `research:${j.id}:%`) as { r: string }[])
+        runIds.add(c.r);
+    }
     const sent = this.sql
       .prepare(
         `select id, sha256 from files where conversation_id = ? and message_id in (select value from json_each(?))`,
@@ -221,13 +234,23 @@ export class SharePolicy {
         kept.map((v) => [v.a, v.v] as const),
       ).filter((f) => !named.has(f.id)),
     ];
+    // And the rows the messages' notes name (#186 review 3차): a fork's copied rows belong to no run of it.
+    const noted = new Set<string>();
+    for (const m of this.sql
+      .prepare(`select parts from messages where id in (select value from json_each(?))`)
+      .all(ids) as { parts: string }[])
+      for (const p of (safeParts(m.parts) ?? []) as { type?: unknown; citations?: unknown }[])
+        if (p?.type === "citation_note" && Array.isArray(p.citations))
+          for (const c of p.citations as { citationId?: unknown }[])
+            if (typeof c?.citationId === "string") noted.add(c.citationId);
     const cites = this.sql
       .prepare(
         `select c.id, c.source_id as s, c.quote, c.snippet, src.body_hash as h from citations c
            left join sources src on src.id = c.source_id and src.conversation_id = c.conversation_id
-           where c.conversation_id = ? and c.run_id in (select value from json_each(?))`,
+           where c.conversation_id = ? and (c.run_id in (select value from json_each(?))
+             or c.id in (select value from json_each(?)))`,
       )
-      .all(conversationId, json(runIds)) as {
+      .all(conversationId, json(runIds), json(noted)) as {
       id: string;
       s: string | null;
       quote: string | null;
@@ -470,7 +493,7 @@ export class SharePolicy {
       );
     const named = new Set(bundle.files.map((f) => f.id));
     const files = this.files.list(p.conversationId).filter((f) => named.has(f.id) && p.files.has(f.id));
-    return { bundle, versions, files };
+    return { bundle, versions, files, citations: p.citations };
   }
 
   /** Who shared what, when (FR-14.6), for the person it is shared with (`viewerId`: their first look, if any). */
@@ -510,6 +533,8 @@ export class SharePolicy {
 export type SharedBundle = Omit<SharedView, "share" | "viewer" | "own">;
 export type ForkSource = {
   bundle: SharedBundle;
+  /** The citation rows the viewer may see (#186: the ones a copied note names are copied). */
+  citations: ReadonlySet<string>;
   /** Artifact id → its visible versions (scrubbed rows), oldest first. */
   versions: Map<string, ArtifactVersionRow[]>;
   files: FileRow[];
@@ -551,4 +576,14 @@ export function sharedWith(
   conversationOnly = true,
 ): string[] {
   return app.sharing ? app.sharing.viewers(conversationId, conversationOnly, test) : [];
+}
+
+/** A stored `parts` column, parsed (null when it is not JSON). */
+function safeParts(raw: string): unknown[] | null {
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
