@@ -48,8 +48,9 @@ export function sourceTypeOf(url: string): SourceType {
   const tld = labels.at(-1) ?? "";
   const sld = labels.at(-2) ?? "";
   if (labels.length < 2) return "other";
-  // A second-level label counts under a country code only (`go.kr`, `ac.uk` — not `ac.example.com`).
-  const cc = labels.length >= 3 && /^[a-z]{2}$/.test(tld);
+  // A second-level label counts under a country code only (`go.kr`, `ac.uk` — not `ac.example.com`), the registry
+  // domain itself (`gov.uk`, `go.kr`) included.
+  const cc = /^[a-z]{2}$/.test(tld);
   // `gov`, `mil`; `go.kr`, `gov.uk`, `gouv.fr`, `gob.mx`, `govt.nz`; `europa.eu`; `int` (treaty organisations).
   if (tld === "gov" || tld === "mil" || tld === "int") return "government";
   if (cc && ["go", "gov", "gouv", "gob", "govt", "mil"].includes(sld)) return "government";

@@ -1371,9 +1371,18 @@ export function pickNotes(s: JobState, max: number): ResearchNote[] {
   //    or, if it has none, its first note, so every question is heard.
   const seen = new Set<string>();
   const given = new Set<number>();
+  // The pages a question could still bring that none has yet.
+  const unseen = (l: readonly ResearchNote[]) =>
+    new Set(l.filter((n) => !taken.has(n) && !seen.has(page(n))).map(page)).size;
   for (let progress = true; progress && out.length < max;) {
     progress = false;
-    for (const [qi, l] of lists.entries()) {
+    // Most constrained first (review #237 12차, best effort — not an optimal matching): each round serves the
+    // questions with the fewest pages still unseen first (ties in their own order), so a question whose only page
+    // is A takes A before one that has others.
+    const order = [...lists.entries()]
+      .map(([qi, l]) => ({ qi, l, left: unseen(l) }))
+      .sort((x, y) => x.left - y.left || x.qi - y.qi);
+    for (const { qi, l } of order) {
       if (out.length >= max) break;
       const next = l.find((n) => !taken.has(n) && !seen.has(page(n)));
       const pick = next ?? (given.has(qi) ? undefined : l.find((n) => !taken.has(n)));

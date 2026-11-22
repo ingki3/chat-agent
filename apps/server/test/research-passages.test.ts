@@ -505,3 +505,53 @@ describe("review #237 11차", () => {
     expect(title.isWellFormed()).toBe(true);
   });
 });
+
+describe("review #237 12차", () => {
+  const note = (id: string, key: string) => ({
+    id,
+    claim: id,
+    quote: id,
+    sourceId: key,
+    sourceKey: `u:${key}`,
+  });
+  const question = (q: number, found: ReturnType<typeof note>[]): QuestionRecord => ({
+    id: `q${q}`,
+    question: `q${q}`,
+    scope: "web",
+    round: 0,
+    status: "done",
+    sources: found.length,
+    dropped: 0,
+    found,
+  });
+  const own = (q: number, n: number) => Array.from({ length: n }, (_, i) => note(`q${q}-${i}`, `P${q}-${i}`));
+
+  it("a question whose only page another has too gets it first: 45 pages and all 6 questions", () => {
+    const s = emptyState();
+    s.questions = [
+      question(0, [note("q0-a", "A"), ...own(0, 11)]),
+      question(1, [note("q1-a", "A")]),
+      question(2, own(2, 11)),
+      question(3, own(3, 11)),
+      question(4, own(4, 10)),
+      question(5, own(5, 1)),
+    ];
+    const picked = pickNotes(s, 45);
+    expect(picked).toHaveLength(45);
+    expect(new Set(picked.map((n) => n.sourceKey)).size).toBe(45);
+    for (let q = 0; q < 6; q++)
+      expect(
+        picked.some((n) => n.id.startsWith(`q${q}-`)),
+        `q${q}`,
+      ).toBe(true);
+  });
+
+  it("registry domains themselves are classified (gov.uk, go.kr, ac.uk)", () => {
+    expect(
+      ["https://gov.uk/", "https://www.gov.uk/x", "https://go.kr/", "https://gov.au/"].map(sourceTypeOf),
+    ).toEqual(["government", "government", "government", "government"]);
+    expect(sourceTypeOf("https://ac.uk/")).toBe("academic");
+    expect(sourceTypeOf("https://example.com/")).toBe("other");
+    expect(sourceTypeOf("https://ac.example.com/")).toBe("other");
+  });
+});
