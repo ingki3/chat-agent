@@ -50,7 +50,8 @@ test("plan card: edit and approve, live progress, then the verified report", asy
   const reply = page.getByTestId("assistant").last();
   await expect(reply.getByTestId("artifact-card")).toBeVisible();
   await expect(reply).toContainText("깊이 조사 보고서");
-  await expect(reply).toContainText("확인된 출처 3개");
+  // Three passages of two pages: two sources (#233) — the completion message's own wording (the card says "·").
+  await expect(reply).toContainText("하위 질문 2개, 보고서에 인용한 출처 2개");
   await expect(card.getByTestId("research-stop")).toHaveCount(0);
 });
 

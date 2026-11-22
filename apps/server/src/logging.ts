@@ -223,6 +223,7 @@ export const LOG_EVENTS = [
   "research.stopped",
   "research.done",
   "research.failed",
+  "research.outline_unsaved",
   // Public artifact links (#204): created, viewed, turned off, refused (secret) or rate limited — a fixed code and the
   // owner's id only; never the token, a visitor's IP or user agent, or the title.
   "public_link.event",

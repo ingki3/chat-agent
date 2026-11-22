@@ -32,7 +32,11 @@ export type StepSpec = {
   model: string;
   effort: string | null;
   systemPrompt: string;
-  text: string;
+  /**
+   * The turn's text — or a function giving it, called right before the turn is sent (after the session and our MCP
+   * server are ready): a turn made of stored text goes through the secrets known at that moment (#233 review 19).
+   */
+  text: string | (() => string);
   /** Our MCP tools for the step (without prefix); empty: no MCP server. */
   tools: string[];
   /** Time limit of the step. */
@@ -148,7 +152,8 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
         void closeSession();
         return snapshot();
       }
-      turn = session.turn({ text: spec.text, model: spec.model, effort: spec.effort ?? undefined });
+      const turnText = typeof spec.text === "function" ? spec.text() : spec.text;
+      turn = session.turn({ text: turnText, model: spec.model, effort: spec.effort ?? undefined });
       for await (const ev of turn.events) {
         if (ended) break;
         if (ev.type === "text_delta") {

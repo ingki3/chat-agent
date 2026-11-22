@@ -42,5 +42,7 @@ export const MARKDOWN_STYLE =
   ".md code{font:13px/1.5 ui-monospace,Menlo,monospace;background:#8882;border-radius:4px;padding:1px 4px}" +
   ".md pre{padding:10px 12px;background:#8881;border:1px solid #8884;border-radius:8px;overflow:auto;white-space:pre-wrap;word-break:break-word}" +
   ".md pre code{background:none;padding:0}.md table{display:block;overflow:auto}" +
+  // Inline code keeps its spaces (a 깊이 조사 report shows names and passages as code, #233) and still wraps.
+  ".md :not(pre)>code{white-space:pre-wrap;overflow-wrap:anywhere}" +
   ".md th{position:static}.md img{max-width:100%}.md .math-display{overflow:auto;margin:0 0 12px}" +
   ".md a{color:#2f6fb0}.md hr{border:0;border-top:1px solid #8886;margin:16px 0}";
