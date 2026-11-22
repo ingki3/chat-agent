@@ -1876,6 +1876,56 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     }
   }, 30_000);
 
+  it("the API view of a job counts rows of one body once, even for notes stored before body keys (read only)", async () => {
+    const t = await start();
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    // As a job finished by older code: two rows of one body under two URL keys, the stored count 2.
+    const store = new SourceStore(t.db);
+    const scope = { userId: t.f.users.owner.id, conversationId: job.conversationId, runId: "research:old" };
+    const body = (FIXTURE_PAGES[0] as { text: string }).text;
+    const add = (url: string) =>
+      store.addPage(scope, {
+        url,
+        finalUrl: url,
+        title: "t",
+        site: "s",
+        contentType: "text/html",
+        body,
+        truncated: false,
+      })!.id;
+    const a = add("https://fixture.agentlee.test/x/one");
+    const b = add("https://fixture.agentlee.test/x/two");
+    const row = t.db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] };
+    Object.assign(state.questions[1]!, {
+      sources: 2,
+      found: [
+        {
+          id: "n1",
+          claim: "c",
+          quote: "q1",
+          sourceId: a,
+          sourceKey: "u:https://fixture.agentlee.test/x/one",
+        },
+        { id: "n2", claim: "c", quote: "q2", sourceId: b },
+      ],
+    });
+    const saved = JSON.stringify(state);
+    t.db.$client.prepare("update research_jobs set state = ? where id = ?").run(saved, job.id);
+    const view = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(view.questions[1]!.sources).toBe(1);
+    // Nothing written back.
+    expect(
+      (t.db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as { state: string })
+        .state,
+    ).toBe(saved);
+  });
+
   it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
     const { t2, job } = await resumedWith((state) => {
       for (const q of state.questions)

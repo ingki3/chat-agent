@@ -165,9 +165,29 @@ export function sourceCount(notes: readonly ResearchNote[]): number {
 const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));
 
 /** The job as the API shows it (owner or share recipient). Notes stay on the server. */
-export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: number }): ResearchJob {
+export function toResearchJob(
+  row: ResearchJobRow,
+  opts: {
+    owned: boolean;
+    now: number;
+    /**
+     * A web note's source identity from its stored row (`contentKeyOf`), read only (review #237 18차): a job's notes
+     * from before body-hash keys count rows of one body once in the view as well. Without it the notes' own keys.
+     */
+    contentKey?: ((sourceId: string) => string | undefined) | undefined;
+  },
+): ResearchJob {
   const s = stateOf(row);
   const plan = planOf(row);
+  // Copies with their keys as the rows say now — the checkpoint itself is not written here.
+  const keyed = (found: readonly ResearchNote[]) =>
+    opts.contentKey
+      ? found.map((n) => (n.sourceId ? { ...n, sourceKey: opts.contentKey!(n.sourceId) ?? n.sourceKey } : n))
+      : [...found];
+  for (const q of s.questions) {
+    q.found = keyed(q.found ?? []);
+    if (opts.contentKey) q.sources = sourceCount(q.found);
+  }
   const notes = s.questions.flatMap((q) => q.found ?? []);
   return {
     id: row.id,

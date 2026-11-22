@@ -1632,9 +1632,9 @@ export class McpService {
         scope,
       );
     if (tool.name === SOURCES_LIST_TOOL.name) {
-      const rows = web.sources.listFor(scope);
-      if (!rows) return { ok: false, code: "cite_not_allowed" };
-      const items = rows.slice(-SOURCES_LIST_MAX);
+      // The newest SOURCES_LIST_MAX rows' metadata only — no page text is read (review #237 18차).
+      const items = web.sources.recentFor(scope, SOURCES_LIST_MAX);
+      if (!items) return { ok: false, code: "cite_not_allowed" };
       return {
         ok: true,
         output: {
@@ -1646,7 +1646,7 @@ export class McpService {
             publishedAt: r.publishedAt ?? null,
             url: r.finalUrl ?? r.url,
             sourceType: sourceTypeOf(r.finalUrl ?? r.url),
-            hasText: r.kind === "page" && !!r.body,
+            hasText: r.kind === "page" && r.hasBody,
           })),
           content: frameExternal({
             source: "sources",

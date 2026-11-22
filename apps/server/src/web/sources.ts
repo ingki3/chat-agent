@@ -266,6 +266,56 @@ export class SourceStore {
   }
 
   /**
+   * The newest `limit` sources of the token's conversation (that user's rows), oldest first — metadata and whether a
+   * page's text is stored, **never the text** (review #237 18차: a page fetched many times would load every body).
+   * Undefined when the token's user does not own the conversation.
+   */
+  recentFor(
+    scope: SourceScope,
+    limit: number,
+  ): (Omit<SourceRow, "body" | "createdAt"> & { hasBody: boolean })[] | undefined {
+    if (!this.owns(scope)) return undefined;
+    const rows = this.db
+      .select({
+        id: sources.id,
+        userId: sources.userId,
+        conversationId: sources.conversationId,
+        runId: sources.runId,
+        kind: sources.kind,
+        provider: sources.provider,
+        url: sources.url,
+        finalUrl: sources.finalUrl,
+        title: sources.title,
+        site: sources.site,
+        publishedAt: sources.publishedAt,
+        fetchedAt: sources.fetchedAt,
+        contentType: sources.contentType,
+        bodyHash: sources.bodyHash,
+        truncated: sources.truncated,
+        snippet: sources.snippet,
+        hasBody: sql<number>`${sources.body} is not null`,
+      })
+      .from(sources)
+      .where(and(eq(sources.conversationId, scope.conversationId), eq(sources.userId, scope.userId)))
+      .orderBy(sql`rowid desc`)
+      .limit(limit)
+      .all();
+    return rows.reverse().map((r) => scrubKnownDeep({ ...r, hasBody: r.hasBody === 1 }));
+  }
+
+  /** What counting needs of a source (#234): its body hash and addresses — never its text. */
+  keyInfo(
+    conversationId: string,
+    id: string,
+  ): { bodyHash: string | null; finalUrl: string | null; url: string } | undefined {
+    return this.db
+      .select({ bodyHash: sources.bodyHash, finalUrl: sources.finalUrl, url: sources.url })
+      .from(sources)
+      .where(and(eq(sources.id, id), eq(sources.conversationId, conversationId)))
+      .get();
+  }
+
+  /**
    * One page of the token's conversation with its (scrubbed) text — `web_find` (#234). Undefined when the token's
    * user does not own the conversation or the row is not theirs.
    */

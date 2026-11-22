@@ -578,7 +578,8 @@ export class WebService {
         sourceType: sourceTypeOf(row.finalUrl ?? row.url),
         characters: pdf ? visibleIndex(text, text.length) : text.length,
         excerptCharacters: excerpt.length,
-        truncated: row.truncated,
+        // This fetch's own truncation (a reused row may have been stored from a shorter answer — review #237 18차).
+        truncated,
         // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).
         ...(unread ? { unreadPages: true } : {}),
         // The title is the page's (or a PDF author's) words too: inside the external-content block, never a field

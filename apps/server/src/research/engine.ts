@@ -719,6 +719,12 @@ export class ResearchEngine {
     }
   }
 
+  /** A web source's identity for counting (`contentKeyOf` of its stored row), or undefined when it is gone. */
+  contentKeyFor(conversationId: string, sourceId: string): string | undefined {
+    const src = this.deps.sources.keyInfo(conversationId, sourceId);
+    return src ? contentKeyOf(src) : undefined;
+  }
+
   /**
    * Each web note's source identity and kind from its own (never changed) source row (review #237 16·17차): the
    * content (`contentKeyOf` — the stored body's hash), so rows of one body count once whatever addresses they have.
@@ -726,7 +732,7 @@ export class ResearchEngine {
   private refreshPages(row: ResearchJobRow, notes: ResearchNote[]): void {
     for (const n of notes) {
       if (!n.sourceId) continue;
-      const src = this.deps.sources.get(row.conversationId, n.sourceId);
+      const src = this.deps.sources.keyInfo(row.conversationId, n.sourceId);
       if (!src) continue;
       n.sourceKey = contentKeyOf(src);
       n.sourceType = sourceTypeOf(src.finalUrl ?? src.url);

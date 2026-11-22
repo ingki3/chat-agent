@@ -55,7 +55,11 @@ export function registerResearchRoutes(
   });
 
   const view = (req: FastifyRequest, row: ResearchJobRow) =>
-    toResearchJob(row, { owned: row.ownerId === req.ctx.user!.id, now: now() });
+    toResearchJob(row, {
+      owned: row.ownerId === req.ctx.user!.id,
+      now: now(),
+      contentKey: (sourceId) => engine.contentKeyFor(row.conversationId, sourceId),
+    });
   const refused = (reply: FastifyReply, e: unknown) => {
     if (e instanceof ResearchError)
       return reply.code(e.status).header("Cache-Control", "no-store").send({ error: e.code });

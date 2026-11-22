@@ -4,7 +4,7 @@ import zlib from "node:zlib";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
 import { findSnippet, GAP_MARK, PAGE_GAP } from "../src/citations/verify.js";
@@ -396,6 +396,54 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const [row] = f.sources.list(f.c.id);
     expect(row!.body!.isWellFormed()).toBe(true);
     expect(row!.body!.length).toBe(PDF_TEXT_CHARS - 1);
+  });
+
+  it("a reused row answers with this fetch's own truncation (review #237 18차)", async () => {
+    const head = "가".repeat(PDF_TEXT_CHARS);
+    let text = head;
+    const reader: PdfReader = async () => ({ ok: true, text, truncated: false, unread: false });
+    fx.routes.set("/t/long.pdf", { headers: { "content-type": "application/pdf" }, body: "%PDF-1.7 x" });
+    const f = family();
+    const { call } = service(f, reader);
+    const first = await call("web_fetch", { url: "http://public.test/t/long.pdf" });
+    expect(first.body.truncated).toBe(false);
+    text = `${head}${"나".repeat(19)}`;
+    const second = await call("web_fetch", { url: "http://public.test/t/long.pdf" });
+    expect(second.body.sourceId).toBe(first.body.sourceId);
+    expect(second.body.truncated).toBe(true);
+  });
+
+  it("sources_list reads no page text, however many versions are stored; same items, same order", async () => {
+    const f = family();
+    const { call } = service(f);
+    const big = "본문 ".repeat(50_000);
+    for (let i = 0; i < 105; i++)
+      f.sources.addPage(f.scope, {
+        url: `http://public.test/v/${i % 3}`,
+        finalUrl: `http://public.test/v/${i % 3}`,
+        title: `판 ${i}`,
+        site: "public.test",
+        contentType: "text/html",
+        body: `${big}${i}`,
+        truncated: false,
+      });
+    f.sources.addSearchResult(f.scope, {
+      provider: "x",
+      url: "http://public.test/s",
+      title: "검색 결과",
+      site: "public.test",
+    });
+    const expected = f.sources.listFor(f.scope)!.slice(-100);
+    const list = vi.spyOn(SourceStore.prototype, "list");
+    const r = await call("sources_list", {});
+    expect(list).not.toHaveBeenCalled();
+    list.mockRestore();
+    const items = r.body.items as { sourceId: string; hasText: boolean; n: number }[];
+    expect(items.map((x) => x.sourceId)).toEqual(expected.map((x) => x.id));
+    expect(items.map((x) => x.hasText)).toEqual(expected.map((x) => x.kind === "page" && !!x.body));
+    expect(items.at(-1)!.n).toBe(100);
+    // The metadata query itself carries no body.
+    expect(f.sources.recentFor(f.scope, 3)!.every((x) => !("body" in x))).toBe(true);
   });
 
   it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {
