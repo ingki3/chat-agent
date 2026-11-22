@@ -7,6 +7,7 @@ import {
   type FileLocator,
   type MessagePart,
   type ResearchErrorCode,
+  type ResearchPhase,
   type ResearchPlan,
   type ResearchScope,
   type ResearchStatus,
@@ -35,6 +36,7 @@ import type { SessionRef } from "../runtime/runs.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { UsageAttempt } from "../usage/store.js";
 import type { SourceStore } from "../web/sources.js";
+import { activityOf, type LiveActivity } from "./activity.js";
 import { ResearchBackends } from "./backend.js";
 import { realClock, type Clock } from "./clock.js";
 import {
@@ -42,7 +44,7 @@ import {
   maskOutline,
   outlineTurn,
   parseGaps,
-  parseNotes,
+  parseNotesCounted,
   parseOutline,
   parsePlan,
   planTurn,
@@ -72,10 +74,12 @@ import {
   planOf,
   restoreOutline,
   storeOutline,
+  settleDropped,
   sourceCount,
   stateOf,
   type JobPatch,
   type JobState,
+  type LiveProgress,
   type QuestionRecord,
   type ResearchJobRow,
   type ResearchNote,
@@ -205,6 +209,23 @@ const UNVERIFIED_KEPT = 5;
  * its usage, its connection, its permission, the conversation switched — would only fail again.
  */
 const RETRYABLE: ReadonlySet<string> = new Set<ResearchErrorCode>(["runtime_error"]);
+/**
+ * Live progress (#232) goes out at most this often per job (a status change goes at once and takes the pending one
+ * with it); model text alone — a sign of life, no line of its own — only after `TEXT_EMIT_MS` without any.
+ */
+export const ACTIVITY_EMIT_MS = 1500;
+const TEXT_EMIT_MS = 10_000;
+
+/** A job's live progress and what its throttle needs (engine memory only). */
+type Progress = LiveProgress & {
+  activity: Map<string, LiveActivity>;
+  /** Each sub-question's searches and pages so far, over all its runs (a retry goes on counting). */
+  counts: Map<string, { search: number; fetch: number }>;
+  lastEmit: number;
+  /** When the pending broadcast goes (with `cancelEmit`). */
+  emitAt: number;
+  cancelEmit?: (() => void) | undefined;
+};
 
 function anySignal(...signals: AbortSignal[]): AbortSignal {
   const c = new AbortController();
@@ -240,6 +261,16 @@ export class ResearchEngine {
   private readonly cleanups = new Set<Promise<void>>();
   /** Every job execution in flight (tests and shutdown wait for them). */
   private readonly running = new Set<Promise<void>>();
+  /** Running jobs' live progress (#232): in memory only, broadcast throttled, gone with the execution. */
+  private readonly progress = new Map<string, Progress>();
+  /**
+   * Orders live states within one saved version (`ResearchJob.seq`): +1 on every live change, within this process.
+   * Across a restart a page tells processes apart by `boot`: a new one exists only once the old one has gone, so its
+   * states are the newer — never a matter of the wall clock, and nothing written for it.
+   */
+  private seq = 0;
+  /** This process (`ResearchJob.boot`): random, per start. */
+  readonly boot = crypto.randomBytes(4).toString("hex");
 
   constructor(private readonly deps: ResearchEngineDeps) {
     this.clock = deps.clock ?? realClock;
@@ -263,9 +294,22 @@ export class ResearchEngine {
     return this.deps.store.get(id);
   }
 
+  /** A running job's live progress (#232) — what `toResearchJob` adds to the saved state. */
+  progressOf(id: string): LiveProgress | undefined {
+    return this.progress.get(id);
+  }
+
   /** Called with the job's id after every change of it (the card's live progress). */
   subscribe(id: string, fn: () => void): () => void {
-    const h = (jobId: string) => jobId === id && fn();
+    // A subscriber that throws is its own problem: never the job's, never the other subscribers'.
+    const h = (jobId: string) => {
+      if (jobId !== id) return;
+      try {
+        fn();
+      } catch (e) {
+        logEvent(this.deps.log, "warn", "error", { researchId: id, err: e });
+      }
+    };
     this.events.on("change", h);
     return () => void this.events.off("change", h);
   }
@@ -422,11 +466,13 @@ export class ResearchEngine {
     const row = this.owned(id, userId);
     if (!["planning", "clarifying", "awaiting_approval"].includes(row.status))
       throw new ResearchError("research_state", 409);
-    this.save(id, { status: "cancelled", endedAt: this.clock.now() }, [
+    // Its steps stop only once the cancel is saved; a cancel that could not be saved is refused and the job goes on.
+    const ok = this.save(id, { status: "cancelled", endedAt: this.clock.now() }, [
       "planning",
       "clarifying",
       "awaiting_approval",
     ]);
+    if (!ok) throw new ResearchError("research_state", 409);
     this.live.get(id)?.abort.abort();
     return this.get(id)!;
   }
@@ -448,10 +494,8 @@ export class ResearchEngine {
   /** At start-up: jobs left planning or running by the previous process carry on from their checkpoint. */
   recover(): number {
     const rows = this.deps.store.withStatus(ACTIVE);
-    for (const r of rows) {
-      logEvent(this.deps.log, "info", "research.resumed", { userId: r.ownerId, researchId: r.id });
-      this.kick(r.id, { recovered: true });
-    }
+    // Logged as resumed when its execution starts (`execute`).
+    for (const r of rows) this.kick(r.id, { recovered: true });
     return rows.length;
   }
 
@@ -502,8 +546,145 @@ export class ResearchEngine {
     } catch {
       ok = false; // the database is going (shutdown): the next start resumes from the last checkpoint
     }
-    if (ok) this.events.emit("change", id);
+    if (ok) {
+      // A saved step is activity too: the latest event's time, in order (never the later of two clocks' readings).
+      const p = this.progress.get(id);
+      if (p) p.lastActivityAt = this.clock.now();
+      this.changed(id);
+    }
     return ok;
+  }
+
+  // ---- live progress (#232) ----
+
+  /**
+   * Tells the subscribers now. Saved changes always go at once (no status change is ever held back); a pending
+   * throttled activity broadcast goes with it, since every broadcast is the whole job as it is now.
+   */
+  private changed(id: string): void {
+    const p = this.progress.get(id);
+    if (p) {
+      p.cancelEmit?.();
+      p.cancelEmit = undefined;
+      p.lastEmit = this.clock.monotonic();
+    }
+    this.events.emit("change", id);
+  }
+
+  /**
+   * Live activity: at most one broadcast per `ACTIVITY_EMIT_MS` per job — the first at once, the rest coalesced into
+   * one at the end of the window. Nothing is written to the database (the checkpoint stays per step).
+   */
+  private touch(id: string, within = ACTIVITY_EMIT_MS): void {
+    const p = this.progress.get(id);
+    if (!p) return;
+    // The monotonic clock: setting the wall clock never moves a broadcast.
+    const now = this.clock.monotonic();
+    const at = Math.max(now, p.lastEmit + within);
+    // A pending one is only ever brought forward, never put off (text after a tool call keeps the tool's time).
+    if (p.cancelEmit && p.emitAt <= at) return;
+    p.cancelEmit?.();
+    p.cancelEmit = undefined;
+    if (at <= now) return this.changed(id);
+    p.emitAt = at;
+    p.cancelEmit = this.clock.timer(at - now, () => {
+      p.cancelEmit = undefined;
+      if (this.progress.get(id) === p) this.changed(id);
+    });
+  }
+
+  /** The job's live progress — only while that execution is the job's own (a late step of an earlier one adds none). */
+  private progressFor(id: string, live: Live): Progress | undefined {
+    if (this.live.get(id) !== live || live.abort.signal.aborted) return undefined;
+    let p = this.progress.get(id);
+    if (!p) {
+      const status = this.get(id)?.status;
+      p = {
+        phase: status === "writing" ? "writing" : status === "researching" ? "researching" : "planning",
+        phaseProgress: null,
+        lastActivityAt: this.clock.now(),
+        activity: new Map(),
+        counts: new Map(),
+        seq: ++this.seq,
+        lastEmit: Number.NEGATIVE_INFINITY,
+        emitAt: 0,
+      };
+      this.progress.set(id, p);
+    }
+    return p;
+  }
+
+  /** Something live changed: the time, and the order of the job's states within one saved version. */
+  private bump(p: Progress): void {
+    p.lastActivityAt = this.clock.now();
+    p.seq = ++this.seq;
+  }
+
+  /**
+   * What the job is doing now (#232) — a stage's own step: the reflection, an outline, the writer, the check. Goes
+   * out at once. `progress`: k of n within it — only from a real signal of the step (sections it reported done),
+   * never a guess; null otherwise (the card then shows the phase alone).
+   *
+   * A stage step of its own (the outline, #233) sets its phase first and passes `live`, so its text counts as activity
+   * too. `progress` only from a step's real signal (none yet: the writer writes the report in one pass).
+   */
+  private setPhase(
+    id: string,
+    live: Live,
+    phase: ResearchPhase,
+    progress: { done: number; total: number } | null = null,
+    opts: { quiet?: boolean } = {},
+  ): void {
+    const p = this.progressFor(id, live);
+    if (
+      !p ||
+      (p.phase === phase &&
+        p.phaseProgress?.done === progress?.done &&
+        p.phaseProgress?.total === progress?.total)
+    )
+      return;
+    p.phase = phase;
+    p.phaseProgress = progress;
+    this.bump(p);
+    // Quiet: a save right after tells the subscribers.
+    if (!opts.quiet) this.changed(id);
+  }
+
+  /**
+   * A step's progress hooks: its tool calls (a sub-question's line, with its counts over all its runs) and text (the time
+   * only).
+   */
+  private hooks(row: ResearchJobRow, live: Live | undefined, question: string | undefined) {
+    const id = row.id;
+    return {
+      onTool: (c: { name: string }) => {
+        const p = live && this.progressFor(id, live);
+        if (!p) return;
+        this.bump(p);
+        if (question) {
+          // The sub-question's own counts, over its runs ("N번째 검색", "N번째 페이지").
+          let counts = p.counts.get(question);
+          if (!counts) p.counts.set(question, (counts = { search: 0, fetch: 0 }));
+          if (c.name.endsWith("web_search")) counts.search++;
+          else if (c.name.endsWith("web_fetch")) counts.fetch++;
+          const a = activityOf(c.name, this.clock.now(), counts);
+          if (a) p.activity.set(question, a);
+        }
+        this.touch(id);
+      },
+      onToolEnd: () => {
+        const p = live && this.progressFor(id, live);
+        if (!p) return;
+        this.bump(p);
+        this.touch(id);
+      },
+      onText: () => {
+        const p = live && this.progressFor(id, live);
+        if (!p) return;
+        this.bump(p);
+        this.touch(id, TEXT_EMIT_MS);
+      },
+    };
   }
 
   private kick(id: string, opts: { recovered?: boolean } = {}): void {
@@ -520,7 +701,11 @@ export class ResearchEngine {
       })
       .finally(() => {
         live.cancelCap?.();
-        if (this.live.get(id) === live) this.live.delete(id);
+        if (this.live.get(id) === live) {
+          this.live.delete(id);
+          this.progress.get(id)?.cancelEmit?.();
+          this.progress.delete(id);
+        }
         this.running.delete(p);
       });
     this.running.add(p);
@@ -530,6 +715,10 @@ export class ResearchEngine {
     // A job resumed after a restart whose research then ran on (any step after the restart) is no longer "only what
     // the restart left": nothing found is `no_findings`, not `server_restart` (review #237 4차).
     let recovered = opts.recovered;
+    if (opts.recovered) {
+      const r = this.get(id);
+      if (r) logEvent(this.deps.log, "info", "research.resumed", { userId: r.ownerId, researchId: id });
+    }
     for (;;) {
       if (live.abort.signal.aborted) return;
       const row = this.get(id);
@@ -649,6 +838,9 @@ export class ResearchEngine {
     s: Pick<StepSpec, "text" | "tools" | "ms" | "toolCalls" | "signal"> & {
       name: string;
       prompt: ResearchPromptId;
+      /** Live progress (#232): the job's execution, and the sub-question whose line its tool calls make. */
+      live?: Live | undefined;
+      question?: string | undefined;
     },
   ): Promise<StepResult> {
     return runStep(
@@ -667,6 +859,7 @@ export class ResearchEngine {
         ms: Math.max(1, s.ms),
         toolCalls: s.toolCalls,
         signal: s.signal,
+        ...this.hooks(row, s.live, s.question),
       },
       {
         mcp: this.deps.mcp,
@@ -704,6 +897,7 @@ export class ResearchEngine {
       tools: [],
       ms: this.limits.planMs,
       signal: live.abort.signal,
+      live,
     });
     if (live.abort.signal.aborted) return;
     const activeMs = row.activeMs + (this.clock.now() - t0);
@@ -731,9 +925,13 @@ export class ResearchEngine {
   private normalizeNotes(row: ResearchJobRow, state: JobState): void {
     for (const q of state.questions) {
       this.refreshPages(row, q.found);
+      // What it had before this (a checkpoint from before #232: its kept and dropped) counts as submitted.
+      q.submitted ??= q.found.length + q.dropped;
       const seen = new Set<string>();
       q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
       q.sources = sourceCount(q.found);
+      // A duplicate removed here is 제외 too (derived, so normalising again adds nothing).
+      settleDropped(q);
     }
   }
 
@@ -796,12 +994,15 @@ export class ResearchEngine {
       if (q.status === "running")
         Object.assign(
           q,
-          q.retried ? { status: "waiting" } : { status: "waiting", found: [], sources: 0, dropped: 0 },
+          q.retried
+            ? { status: "waiting" }
+            : { status: "waiting", found: [], sources: 0, dropped: 0, submitted: 0 },
         );
     const stage = new AbortController();
     const cancel = this.clock.timer(researchEnd - this.clock.now(), () => stage.abort());
     const signal = anySignal(live.abort.signal, stage.signal, live.cap!.signal);
     const persist = () => this.save(row.id, { state }, ["researching"], live);
+    this.setPhase(row.id, live, "researching");
     let error: ResearchErrorCode | undefined;
     try {
       for (;;) {
@@ -827,6 +1028,8 @@ export class ResearchEngine {
             // of any status — a retry may run a done one again — never gets tools the owner did not approve.
             q.scope = clampScope(q.scope, state.scopes);
             q.status = "running";
+            // A run starting (a retry too): no line until its first call — never the last run's.
+            this.progress.get(row.id)?.activity.delete(q.id);
             persist();
             // A retry (#234) keeps what the first run verified and is told what it found and what failed.
             const before = q.retried ? q.found : [];
@@ -845,9 +1048,11 @@ export class ResearchEngine {
               ms: Math.min(this.limits.subagentMs, researchEnd - this.clock.now()),
               toolCalls: this.limits.subagentToolCalls,
               signal,
+              live,
+              question: q.id,
             });
             if (live.abort.signal.aborted) return;
-            const raw = parseNotes(r.text, this.limits.notesPerQuestion);
+            const { notes: raw, submitted } = parseNotesCounted(r.text, this.limits.notesPerQuestion);
             const checked = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
             // Pages as the source rows say now, before merging and counting (review #237 16차).
             this.refreshPages(row, before);
@@ -855,7 +1060,10 @@ export class ResearchEngine {
             const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
-            q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
+            // Every note submitted but not kept (#232: the card's 제외) — not verified, past the cap, a duplicate of
+            // the first run's — over all its runs (a checkpoint from before: its kept and dropped as submitted).
+            q.submitted = (q.retried ? (q.submitted ?? before.length + q.dropped) : 0) + submitted;
+            settleDropped(q);
             // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
             q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
             q.status =
@@ -920,6 +1128,7 @@ export class ResearchEngine {
           .slice(0, UNVERIFIED_KEPT * 2);
         // A reflection after a restart is research that ran on too (review #237 5차).
         ran = true;
+        this.setPhase(row.id, live, "reflecting");
         const r = await this.step(row, ctx, {
           name: `reflect${state.round}`,
           prompt: "reflect",
@@ -934,8 +1143,10 @@ export class ResearchEngine {
           tools: [],
           ms: Math.min(REFLECT_MS, researchEnd - this.clock.now()),
           signal,
+          live,
         });
         if (live.abort.signal.aborted) return;
+        this.setPhase(row.id, live, "researching");
         state.reflected = state.round;
         const asked = new Set(state.questions.map((q) => q.question));
         const gaps =
@@ -993,6 +1204,8 @@ export class ResearchEngine {
       this.fail(row.id, error, live);
       return ran;
     }
+    // The card's first look at writing already says so (the phase goes with the save's broadcast).
+    this.setPhase(row.id, live, "writing", null, { quiet: true });
     this.save(row.id, { status: "writing", state }, ["researching"], live);
     return ran;
   }
@@ -1077,6 +1290,7 @@ export class ResearchEngine {
     const notes = pickNotes(state, this.limits.maxNotes);
     if (!notes.length) return void this.fail(row.id, opts.recovered ? "server_restart" : "no_findings", live);
     const files = this.files(row);
+    this.setPhase(row.id, live, "writing");
     const writeEnd = row.deadlineAt - this.limits.wrapUpMs;
     const left = writeEnd - this.clock.now();
     let body = "";
@@ -1113,6 +1327,7 @@ export class ResearchEngine {
       const outlined =
         stored === undefined && outlineMs >= MIN_OUTLINE_MS && budget - outlineMs >= MIN_WRITE_MS;
       if (outlined) {
+        this.setPhase(row.id, live, "outlining");
         const o = await this.step(row, ctx, {
           name: `outline:${t0}`,
           prompt: "outline",
@@ -1121,6 +1336,7 @@ export class ResearchEngine {
           tools: [],
           ms: outlineMs,
           signal: anySignal(live.abort.signal, live.cap!.signal),
+          live,
         });
         if (live.abort.signal.aborted) return;
         // Through the known secrets, as the checkpoint stores it: a live run and a resumed one give the writer the same.
@@ -1138,6 +1354,7 @@ export class ResearchEngine {
       const wctx = outlined ? this.stepCtx(row) : ctx;
       if (typeof wctx === "string") return void this.fail(row.id, wctx, live);
       const name = `write:${this.clock.now()}`;
+      this.setPhase(row.id, live, "writing");
       const r = await this.step(row, wctx, {
         name,
         prompt: "writer",
@@ -1148,8 +1365,10 @@ export class ResearchEngine {
         tools: this.toolsFor(row.ownerId, files.length ? ["cite", "file_cite"] : ["cite"]),
         ms: Math.min(budget - (this.clock.now() - t0), writeEnd - this.clock.now()),
         signal: anySignal(live.abort.signal, live.cap!.signal),
+        live,
       });
       if (live.abort.signal.aborted) return;
+      this.setPhase(row.id, live, "verifying");
       if (r.ended === "timeout" || r.ended === "aborted") state.timedOut = true;
       const cites = this.citationsOf(`research:${row.id}:${name}`);
       const cleaned = cleanReport(r.text, cites);
@@ -1333,7 +1552,7 @@ export class ResearchEngine {
       })
       .immediate();
     if (!ok) return;
-    this.events.emit("change", row.id);
+    this.changed(row.id);
     logEvent(this.deps.log, "info", "research.done", {
       userId: row.ownerId,
       researchId: row.id,

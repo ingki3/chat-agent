@@ -11,7 +11,7 @@ import { createTestDb, type Db } from "../src/db/client.js";
 import { inProcessExtractor, ocrCapability } from "../src/files/extract.js";
 import { compose } from "../src/notifications/compose.js";
 import { ManualClock } from "../src/research/clock.js";
-import { RETRY_MARK, TURN_MARK } from "../src/research/prompts.js";
+import { parseNotesCounted, RETRY_MARK, TURN_MARK } from "../src/research/prompts.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
@@ -42,6 +42,9 @@ const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): Web
   };
 };
 import { RESEARCH_FIXTURE, researchSteps } from "../src/runtime/fake-research.js";
+import { ACTIVITY_LABEL, activityOf } from "../src/research/activity.js";
+import { ResearchStore, shown, toResearchJob, type QuestionRecord } from "../src/research/store.js";
+import { ACTIVITY_EMIT_MS } from "../src/research/engine.js";
 import {
   defaultScript,
   FakeRuntime,
@@ -1645,7 +1648,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     };
     for (const q of raw.questions)
       expect(Object.keys(q).sort()).toEqual(
-        ["dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
+        // (`activity`: the live line, #232 — null once the question is not running.)
+        ["activity", "dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
       );
   });
 
@@ -1708,9 +1712,11 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       "이는 선적 기준과 통관 기준의 차이 때문이다.",
     ]);
     const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    // The background question: one note dropped by the check, and the retry's repeat of a kept one left out by the
+    // merge (#232: both are 제외).
     expect(end.questions.map((q) => [q.status, q.notes, q.sources, q.dropped])).toEqual([
       ["done", 2, 2, 1],
-      ["done", 2, 2, 1],
+      ["done", 2, 2, 2],
     ]);
     // Raw API answer (no schema parse): the retry's bookkeeping and the notes stay on the server.
     const raw = JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
@@ -2489,5 +2495,717 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const report = t2.app.artifacts!.version(JSON.parse(end.result!).artifactId, 1)!.content;
     expect(report).not.toContain("늦은 보강 질문");
     expect(JSON.parse(end.result!)).toMatchObject({ timedOut: true });
+  });
+});
+
+describe("깊이 조사: live progress — activity, phase, last activity (#232)", () => {
+  const P = "mcp__agentlee__";
+  /** The scripts below hold their sub-researchers; #234's automatic retry of a weak one ends at once. */
+  const held = (over: (text: string) => FakeStep[] | undefined) =>
+    scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) ? [{ text: "DONE" }] : over(x),
+    );
+  const view = async (t: Awaited<ReturnType<typeof start>>, id: string) =>
+    ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${id}`)).json());
+  const untilView = async (
+    t: Awaited<ReturnType<typeof start>>,
+    id: string,
+    ok: (v: ResearchJob) => boolean,
+    what: string,
+  ) => {
+    const end = Date.now() + 4_000;
+    for (;;) {
+      const v = await view(t, id);
+      if (ok(v)) return v;
+      if (Date.now() > end) throw new Error(`timed out waiting for ${what}: ${JSON.stringify(v)}`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
+  it("shows each running sub-question's latest call (sanitised), the reflection and writing phases", async () => {
+    const script = held((x) => {
+      if (x.startsWith(TURN_MARK.subagent) && /증가율/.test(x))
+        return [
+          {
+            tool: `${P}web_search`,
+            ms: 0,
+            input: {
+              query: "10월 반도체 https://user:pw@www.example.com/a?token=abc123 수출 증가율 plainword42x",
+            },
+          },
+          { gate: "progress-search" },
+          { call: "web_fetch", input: { url: A.url } },
+          { gate: "progress-q1" },
+          {
+            textRefs: `NOTE ${JSON.stringify({ claim: "메모리", sourceId: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory })}\nDONE`,
+          },
+        ];
+      if (x.startsWith(TURN_MARK.subagent)) return [{ gate: "progress-q2" }, { text: "DONE" }];
+      if (x.startsWith(TURN_MARK.reflect)) return [{ gate: "progress-reflect" }, { text: '{"gaps": []}' }];
+      if (x.startsWith(TURN_MARK.writer)) return [{ gate: "progress-write" }, ...(researchSteps(x) ?? [])];
+      return undefined;
+    });
+    const t = await start({ script });
+    const { conversationId, job } = await begin(t);
+    shareWithShared(t.f, conversationId);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const waiting = await view(t, job.id);
+    // Waiting for the owner: no phase, no clock.
+    expect(waiting.phase).toBeNull();
+    expect(waiting.lastActivityAt).toBeNull();
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    // The search: which search it is — never its words (no free text in a label).
+    const searching = await untilView(
+      t,
+      job.id,
+      (v) => v.questions[0]?.activity?.kind === "search",
+      "search",
+    );
+    expect(searching.phase).toBe("researching");
+    expect(searching.questions[0]!.activity!.label).toBe("검색 중 · 1번째 검색");
+    expect(searching.questions[1]!.status).toBe("running");
+    expect(searching.questions[1]!.activity).toBeNull();
+    expect(searching.lastActivityAt).toBeGreaterThan(0);
+    // A share recipient (#29): the phase, the time and the counts — not what was searched or read.
+    const theirs = ResearchJob.parse(
+      (await t.api(t.f.cookies.shared, "GET", `/api/research/${job.id}`)).json(),
+    );
+    expect(theirs.phase).toBe("researching");
+    expect(theirs.lastActivityAt).toBeGreaterThan(0);
+    expect(theirs.questions.map((q) => q.activity)).toEqual([null, null]);
+    releaseGate("progress-search");
+    // The fetch: which page of the step it is — never its address.
+    const fetched = await untilView(
+      t,
+      job.id,
+      (v) => v.questions[0]?.activity?.kind === "fetch",
+      "the fetch",
+    );
+    expect(fetched.questions[0]!.activity!.label).toBe("페이지 읽는 중 · 1번째 페이지");
+    // A line that is somehow not valid (here: put in by hand) is left out — never the job, in GET and the stream.
+    const kept = t.app.research!.progressOf(job.id)!.activity as Map<string, unknown>;
+    kept.set("q2", { kind: "fetch", label: "x".repeat(300), at: 1 });
+    const address = await t.app.listen({ port: 0, host: "127.0.0.1" });
+    const first = async (cookie: string) => {
+      const res = await fetch(`${address}/api/research/${job.id}/events`, {
+        headers: { cookie, host: "localhost:3000" },
+      });
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("no event");
+        buf += dec.decode(value, { stream: true });
+        const data = /^data: (.*)$/m.exec(buf)?.[1];
+        if (data && buf.includes("\n\n")) {
+          await reader.cancel();
+          return ResearchJob.parse(JSON.parse(data));
+        }
+      }
+    };
+    const mine = await first(t.f.cookies.owner);
+    expect(mine.questions.map((q) => q.activity?.label ?? null)).toEqual([
+      "페이지 읽는 중 · 1번째 페이지",
+      null,
+    ]);
+    expect((await view(t, job.id)).questions[1]!.activity).toBeNull();
+    // The share recipient's stream: no lines at all.
+    expect((await first(t.f.cookies.shared)).questions.map((q) => q.activity)).toEqual([null, null]);
+    kept.delete("q2");
+    releaseGate("progress-q1");
+    releaseGate("progress-q2");
+    // The lead's reflection has a phase of its own ("보강할 곳 찾는 중").
+    const reflecting = await untilView(t, job.id, (v) => v.phase === "reflecting", "reflecting");
+    expect(reflecting.status).toBe("researching");
+    expect(reflecting.questions.every((q) => q.activity === null)).toBe(true);
+    releaseGate("progress-reflect");
+    await untilView(t, job.id, (v) => v.phase === "writing", "writing");
+    releaseGate("progress-write");
+    await statusIs(t.app, job.id, "done");
+    const end = await view(t, job.id);
+    expect(end.phase).toBeNull();
+    expect(end.lastActivityAt).toBeNull();
+    expect(end.questions.every((q) => q.activity === null)).toBe(true);
+    // Gone with the execution: nothing of it is kept (a restart begins from the saved status).
+    expect(t.app.research!.progressOf(job.id)).toBeUndefined();
+  });
+
+  it("coalesces activity broadcasts (≤ 1 per window, no database write) and never holds back a status change", async () => {
+    const clock = new ManualClock();
+    const searches = Array.from({ length: 6 }, (_, i): FakeStep => ({
+      tool: `${P}web_search`,
+      ms: 0,
+      input: { query: `검색어 ${i + 1}` },
+    }));
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [...searches, { gate: "throttle-q1" }, ...slowNotes().slice(1)]
+          : [{ gate: "throttle-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const versions: number[] = [];
+    const off = t.app.research!.subscribe(job.id, () => versions.push(t.app.research!.get(job.id)!.version));
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(
+      () => t.app.research!.progressOf(job.id)?.activity.get("q1")?.label === "검색 중 · 6번째 검색",
+      "six searches",
+    );
+    await until(() => t.counting.active === 2, "both running");
+    await new Promise((r) => setTimeout(r, 100));
+    const version = t.app.research!.get(job.id)!.version;
+    // Activity is not saved: the row's version counts only its saved steps.
+    const activityOnly = (list: number[]) => list.length - new Set(list).size;
+    const before = activityOnly(versions);
+    // The clock has not moved since the last saved step went out: the six calls (and their ends) wait in one window.
+    expect(before).toBe(0);
+    clock.advance(1500);
+    // The window's end: one broadcast for all of them, with the latest line.
+    expect(activityOnly(versions)).toBe(1);
+    expect(versions.at(-1)).toBe(version);
+    expect(t.app.research!.get(job.id)!.version).toBe(version);
+    expect((await view(t, job.id)).questions[0]!.activity).toMatchObject({
+      kind: "search",
+      label: "검색 중 · 6번째 검색",
+    });
+    // A status change goes at once, whatever the throttle holds.
+    const n = versions.length;
+    releaseGate("throttle-q1");
+    releaseGate("throttle-q2");
+    await until(() => versions.length > n && versions.at(-1)! > version, "the next saved step");
+    await statusIs(t.app, job.id, "done");
+    expect(versions.at(-1)).toBe(t.app.research!.get(job.id)!.version);
+    off();
+  });
+
+  it("a retry goes on counting its sub-question's searches, with no line until its first call", async () => {
+    const search = (q: string): FakeStep => ({ tool: `${P}web_search`, ms: 0, input: { query: q } });
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /증가율/.test(x))) return undefined;
+      // The retry: held before and after its first search.
+      if (x.includes(RETRY_MARK))
+        return [{ gate: "retry-before-232" }, search("다시"), { gate: "retry-after-232" }, { text: "DONE" }];
+      // The first run: two searches and nothing verified (so it is retried).
+      return [search("하나"), search("둘"), { text: "DONE" }];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const retryRunning = () =>
+      t.counting.turns.some(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /증가율/.test(x),
+      );
+    await until(retryRunning, "the retry");
+    const before = await view(t, job.id);
+    expect(before.questions[0]!.status).toBe("running");
+    expect(before.questions[0]!.activity).toBeNull();
+    releaseGate("retry-before-232");
+    const after = await untilView(t, job.id, (v) => !!v.questions[0]?.activity, "the retry's search");
+    expect(after.questions[0]!.activity!.label).toBe("검색 중 · 3번째 검색");
+    releaseGate("retry-after-232");
+    await statusIs(t.app, job.id, "done", "failed");
+  });
+
+  it("counts what a retry's merge leaves out as 제외 too: a duplicate of the first run's note, or one over the cap", async () => {
+    const note = (claim: string, ref: string, quote: string) =>
+      `NOTE ${JSON.stringify({ claim, sourceId: ref, quote })}\n`;
+    const run = async (o: {
+      limits?: { notesPerQuestion: number };
+      first: FakeStep[];
+      retry: FakeStep[];
+    }) => {
+      const script = scripted((x) =>
+        x.startsWith(TURN_MARK.subagent) && /증가율/.test(x)
+          ? x.includes(RETRY_MARK)
+            ? o.retry
+            : o.first
+          : undefined,
+      );
+      const t = await start({ script, ...(o.limits ? { limits: o.limits } : {}) });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await statusIs(t.app, job.id, "done");
+      return (await view(t, job.id)).questions[0]!;
+    };
+    const [Pa, Pb] = FIXTURE_PAGES as [{ url: string }, { url: string }];
+    // One verified note from one page (so retried); the retry finds the same passage again: kept once, 제외 1.
+    const dup = await run({
+      first: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        { textRefs: note("메모리", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE" },
+      ],
+      retry: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        { textRefs: note("메모리 다시", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE" },
+      ],
+    });
+    expect(dup).toMatchObject({ notes: 1, dropped: 1 });
+    // At the cap (2 here) from one page, the retry adds one from another page: still 2 kept, 제외 1.
+    const cap = await run({
+      limits: { notesPerQuestion: 2 },
+      first: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        {
+          textRefs:
+            note("증가", "{{$0.sourceId}}", RESEARCH_FIXTURE.growth) +
+            note("메모리", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) +
+            "DONE",
+        },
+      ],
+      retry: [
+        { call: "web_fetch", input: { url: Pb.url } },
+        { textRefs: note("통계", "{{$0.sourceId}}", RESEARCH_FIXTURE.stats) + "DONE" },
+      ],
+    });
+    expect(cap).toMatchObject({ notes: 2, dropped: 1 });
+  });
+
+  it("제외 is always what was submitted but not kept: past the cap in one run, and a duplicate removed on restore", async () => {
+    // One more good note than the cap in one run (the cap is 2 here — 12 in use): the cap kept, one left out.
+    const note = (quote: string) =>
+      `NOTE ${JSON.stringify({ claim: "증가", sourceId: "{{$0.sourceId}}", quote })}\n`;
+    const quotes = [
+      RESEARCH_FIXTURE.growth,
+      RESEARCH_FIXTURE.memory,
+      "업계는 연말까지 증가세가 이어질 것으로 본다.",
+    ];
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && /증가율/.test(x) && !x.includes(RETRY_MARK)
+        ? [{ call: "web_fetch", input: { url: A.url } }, { textRefs: quotes.map(note).join("") + "DONE" }]
+        : undefined,
+    );
+    const t = await start({ script, limits: { notesPerQuestion: 2 } });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect((await view(t, job.id)).questions[0]).toMatchObject({ notes: 2, dropped: 1 });
+    // Parsed past the cap, counted all the same.
+    expect(
+      parseNotesCounted(quotes.map((q) => note(q).replace("{{$0.sourceId}}", "s")).join(""), 2),
+    ).toMatchObject({
+      submitted: 3,
+    });
+
+    // Restoring a checkpoint with the same passage twice (from before #232: no `submitted`): one kept, 제외 1 — and
+    // normalising the same state again counts nothing twice.
+    const e = t.app.research! as unknown as {
+      normalizeNotes(row: unknown, state: { questions: QuestionRecord[] }): void;
+    };
+    const n = { id: "n1", claim: "c", quote: "같은 구절", sourceId: "s-gone" };
+    const q: QuestionRecord = {
+      id: "q1",
+      question: "질문",
+      scope: "web",
+      round: 0,
+      status: "done",
+      sources: 1,
+      found: [n, { ...n, id: "n2", quote: "같은  구절" }],
+      dropped: 0,
+    };
+    const state = { questions: [q] };
+    const row = t.app.research!.get(job.id)!;
+    e.normalizeNotes(row, state);
+    expect([q.found.length, q.dropped, q.submitted]).toEqual([1, 1, 2]);
+    e.normalizeNotes(row, state);
+    expect([q.found.length, q.dropped, q.submitted]).toEqual([1, 1, 2]);
+  });
+
+  it("a wall clock set back never holds an activity broadcast back longer than one window", async () => {
+    const clock = new ManualClock();
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [{ gate: "clock-q1" }, ...slowNotes().slice(1)]
+          : [{ gate: "clock-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.counting.active === 2, "both running");
+    await new Promise((r) => setTimeout(r, 100));
+    let n = 0;
+    const off = t.app.research!.subscribe(job.id, () => n++);
+    const e = t.app.research! as unknown as {
+      live: Map<string, unknown>;
+      hooks(row: unknown, live: unknown, question: string): { onTool(c: { name: string }): void };
+    };
+    const q1 = e.hooks(t.app.research!.get(job.id)!, e.live.get(job.id), "q1");
+    // The clock goes back a minute (an NTP step), then a search.
+    clock.shiftWall(-60_000);
+    q1.onTool({ name: `${P}web_search` });
+    expect(n).toBe(0);
+    clock.advance(ACTIVITY_EMIT_MS);
+    expect(n).toBe(1);
+    off();
+    releaseGate("clock-q1");
+    releaseGate("clock-q2");
+    await statusIs(t.app, job.id, "done");
+  });
+
+  it("broadcast timing follows the monotonic clock: wall jumps back or forward change nothing; text never puts a tool update off", async () => {
+    const clock = new ManualClock();
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [{ gate: "mono-q1" }, ...slowNotes().slice(1)]
+          : [{ gate: "mono-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.counting.active === 2, "both running");
+    await new Promise((r) => setTimeout(r, 100));
+    type Hooks = { onTool(c: { name: string }): void; onText(): void };
+    const e = t.app.research! as unknown as {
+      live: Map<string, unknown>;
+      hooks(row: unknown, live: unknown, question: string): Hooks;
+    };
+    const q1 = e.hooks(t.app.research!.get(job.id)!, e.live.get(job.id), "q1");
+    const labels: (string | undefined)[] = [];
+    const off = t.app.research!.subscribe(job.id, () =>
+      labels.push(t.app.research!.progressOf(job.id)?.activity.get("q1")?.label),
+    );
+    clock.advance(ACTIVITY_EMIT_MS);
+    // Codex's sequence: a search goes out at once; a fetch 100 ms later waits for the window; the wall clock goes
+    // back a minute at 200 ms; then model text — the fetch still goes out at 1.5 s.
+    q1.onTool({ name: `${P}web_search` });
+    expect(labels).toEqual(["검색 중 · 1번째 검색"]);
+    clock.advance(100);
+    q1.onTool({ name: `${P}web_fetch` });
+    clock.advance(100);
+    clock.shiftWall(-60_000);
+    q1.onText();
+    expect(labels).toHaveLength(1);
+    clock.advance(ACTIVITY_EMIT_MS - 200);
+    expect(labels).toEqual(["검색 중 · 1번째 검색", "페이지 읽는 중 · 1번째 페이지"]);
+    // A wall clock jump forward: the window still counts from the last broadcast.
+    clock.shiftWall(3_600_000);
+    q1.onTool({ name: `${P}web_search` });
+    expect(labels).toHaveLength(2);
+    clock.advance(ACTIVITY_EMIT_MS - 1);
+    expect(labels).toHaveLength(2);
+    clock.advance(1);
+    expect(labels.at(-1)).toBe("검색 중 · 2번째 검색");
+    off();
+    releaseGate("mono-q1");
+    releaseGate("mono-q2");
+    await statusIs(t.app, job.id, "done");
+  });
+
+  it("last activity is the latest event's time — a wall clock set back never makes it a time ahead", async () => {
+    const clock = new ManualClock();
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [{ gate: "last-q1" }, ...slowNotes().slice(1)]
+          : [{ gate: "last-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.counting.active === 2, "both running");
+    await new Promise((r) => setTimeout(r, 100));
+    const e = t.app.research! as unknown as {
+      live: Map<string, unknown>;
+      hooks(row: unknown, live: unknown, question: string): { onTool(c: { name: string }): void };
+    };
+    const q1 = e.hooks(t.app.research!.get(job.id)!, e.live.get(job.id), "q1");
+    const lastOf = () =>
+      toResearchJob(t.app.research!.get(job.id)!, {
+        owned: true,
+        now: clock.now(),
+        live: t.app.research!.progressOf(job.id),
+      }).lastActivityAt!;
+    // The wall clock goes back an hour; then a search: that is the last activity, at the (new) wall time.
+    clock.shiftWall(-3_600_000);
+    q1.onTool({ name: `${P}web_search` });
+    expect(lastOf()).toBe(clock.now());
+    // The row's own time (written by the store's clock) does not win over it.
+    expect(lastOf()).toBeLessThan(t.app.research!.get(job.id)!.updatedAt);
+    releaseGate("last-q1");
+    releaseGate("last-q2");
+    await statusIs(t.app, job.id, "done");
+  });
+
+  it("model text alone waits longer, but a tool call after it is not held back by that", async () => {
+    const clock = new ManualClock();
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [
+              { text: "생각하는 중 " },
+              { tool: `${P}web_search`, ms: 0, input: { query: "텍스트 다음 검색" } },
+              { gate: "text-q1" },
+              ...slowNotes().slice(1),
+            ]
+          : [{ gate: "text-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const versions: number[] = [];
+    const off = t.app.research!.subscribe(job.id, () => versions.push(t.app.research!.get(job.id)!.version));
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.app.research!.progressOf(job.id)?.activity.get("q1"), "the search");
+    await until(() => t.counting.active === 2, "both running");
+    await new Promise((r) => setTimeout(r, 100));
+    const n = versions.length;
+    clock.advance(1500);
+    expect(versions.length).toBe(n + 1);
+    releaseGate("text-q1");
+    releaseGate("text-q2");
+    await statusIs(t.app, job.id, "done");
+    off();
+  });
+
+  it("counts each sub-question's searches and pages; an earlier call ending keeps the line; phase k/n follows its total", async () => {
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? /증가율/.test(x)
+          ? [{ call: "web_fetch", input: { url: A.url } }, { gate: "calls-q1" }, ...slowNotes().slice(1)]
+          : [{ gate: "calls-q2" }, ...slowNotes().slice(1)]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.app.research!.progressOf(job.id)?.activity.get("q1")?.kind === "fetch", "q1's fetch");
+    await until(() => t.counting.active === 2, "both running");
+    type Hooks = {
+      onTool(c: { callId: string; name: string; input: unknown }): void;
+      onToolEnd(c: { callId: string }): void;
+    };
+    // The engine's own hooks, driven the way overlapping calls of a real runtime would.
+    const e = t.app.research! as unknown as {
+      live: Map<string, unknown>;
+      hooks(row: unknown, live: unknown, question: string): Hooks;
+      setPhase(id: string, live: unknown, phase: string, k: { done: number; total: number } | null): void;
+    };
+    const live = e.live.get(job.id);
+    const row = t.app.research!.get(job.id)!;
+    const q1 = e.hooks(row, live, "q1");
+    const q2 = e.hooks(row, live, "q2");
+    const line = (q: string) => t.app.research!.progressOf(job.id)!.activity.get(q);
+    // Each sub-question counts its searches and pages over its runs (its real fetch before: page 1); any fetch counts
+    // (a blank or broken URL too) and is the line now.
+    q1.onTool({ callId: "c1", name: `${P}web_search`, input: { query: "검색 A" } });
+    expect(line("q1")).toMatchObject({ kind: "search", label: "검색 중 · 1번째 검색" });
+    q1.onTool({ callId: "c2", name: `${P}web_fetch`, input: { url: "" } });
+    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 2번째 페이지" });
+    // The search started before it ends: the line stays the fetch's.
+    q1.onToolEnd({ callId: "c1" });
+    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 2번째 페이지" });
+    q1.onTool({ callId: "c3", name: `${P}web_fetch`, input: { url: "not a url" } });
+    expect(line("q1")).toMatchObject({ label: "페이지 읽는 중 · 3번째 페이지" });
+    q1.onTool({ callId: "c4", name: `${P}web_search`, input: {} });
+    expect(line("q1")).toMatchObject({ label: "검색 중 · 2번째 검색" });
+    // Another sub-question's step with the same call id (ids are per turn) is its own, with its own counts.
+    q2.onTool({ callId: "c2", name: `${P}web_search`, input: { query: "다른 단계" } });
+    q2.onToolEnd({ callId: "c2" });
+    expect(line("q2")).toMatchObject({ kind: "search", label: "검색 중 · 1번째 검색" });
+    expect(line("q1")).toMatchObject({ label: "검색 중 · 2번째 검색" });
+    // k of n: a new total counts even when k is the same.
+    e.setPhase(job.id, live, "writing", { done: 1, total: 3 });
+    e.setPhase(job.id, live, "writing", { done: 1, total: 5 });
+    expect(t.app.research!.progressOf(job.id)!.phaseProgress).toEqual({ done: 1, total: 5 });
+    releaseGate("calls-q1");
+    releaseGate("calls-q2");
+    await statusIs(t.app, job.id, "done");
+  });
+
+  it("enters writing with its phase in the same broadcast; a resumed job is told apart by its process (boot), with nothing written", async () => {
+    const db = createTestDb();
+    const holdWriter = held((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ gate: "write-hold-232" }] : undefined,
+    );
+    const t1 = await start({ db, script: holdWriter });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    const seen: [string, string | null | undefined][] = [];
+    t1.app.research!.subscribe(job.id, () => {
+      const row = t1.app.research!.get(job.id)!;
+      const v = toResearchJob(row, {
+        owned: true,
+        now: Date.now(),
+        live: t1.app.research!.progressOf(job.id),
+      });
+      seen.push([v.status, v.phase]);
+    });
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t1.app, job.id, "writing");
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    // Never "writing" with the research phase still on it.
+    expect(seen.filter(([status]) => status === "writing").map(([, phase]) => phase)).not.toContain(
+      "researching",
+    );
+    expect(seen.find(([status]) => status === "writing")?.[1]).toBe("writing");
+    const before = t1.app.research!.get(job.id)!.version;
+    const old = ResearchJob.parse(
+      (await t1.api(t1.f.cookies.owner, "GET", `/api/research/${job.id}`)).json(),
+    );
+    await t1.app.close();
+    // Resumed (writing again) without a write of its own: the same version, a new process — a page takes it as newer
+    // (newest(): another boot wins), whatever the clocks or counts.
+    const t2 = await start({ db, family: false, script: holdWriter });
+    await until(() => t2.app.research!.progressOf(job.id), "the resumed job's progress");
+    expect(t2.app.research!.get(job.id)!).toMatchObject({ status: "writing", version: before });
+    const api2 = (url: string) =>
+      t2.app.inject({ method: "GET", url, headers: { host: "localhost:3000", cookie: t1.f.cookies.owner } });
+    const now = ResearchJob.parse((await api2(`/api/research/${job.id}`)).json());
+    expect(old.boot).toMatch(/^[0-9a-f]{8}$/);
+    expect(now.boot).toMatch(/^[0-9a-f]{8}$/);
+    expect(now.boot).not.toBe(old.boot);
+    expect(now.version).toBe(old.version);
+  });
+
+  /** Every research write fails while `on` (the database refusing), the rest of the app as usual. */
+  const failingWrites = () => {
+    const update = ResearchStore.prototype.update;
+    const f = { on: false, refused: 0 };
+    ResearchStore.prototype.update = function (this: ResearchStore, ...args: Parameters<typeof update>) {
+      if (f.on) {
+        f.refused++;
+        throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+      }
+      return update.apply(this, args);
+    };
+    closers.push(() => {
+      ResearchStore.prototype.update = update;
+    });
+    return f;
+  };
+
+  it("a subscriber that throws never stops the job", async () => {
+    const t = await start();
+    const { job } = await begin(t);
+    let calls = 0;
+    t.app.research!.subscribe(job.id, () => {
+      calls++;
+      throw new Error("a broken subscriber");
+    });
+    const seen: string[] = [];
+    t.app.research!.subscribe(job.id, () => seen.push(t.app.research!.get(job.id)!.status));
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect(calls).toBeGreaterThan(2);
+    // The others still heard every change.
+    expect(seen).toContain("researching");
+    expect(seen.at(-1)).toBe("done");
+  });
+
+  it("a cancel that cannot be saved is refused and the job goes on (never stopped while still planning)", async () => {
+    const script = held((x) =>
+      x.startsWith(TURN_MARK.plan) ? [{ gate: "cancel-hold-232" }, ...(researchSteps(x) ?? [])] : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await until(() => t.counting.turns.some((x) => x.startsWith(TURN_MARK.plan)), "the plan step");
+    const f = failingWrites();
+    f.on = true;
+    const refused = await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/cancel`, {});
+    f.on = false;
+    expect(refused.statusCode).toBe(409);
+    expect(t.app.research!.get(job.id)!.status).toBe("planning");
+    // Its steps were not stopped: the plan arrives (the default plan after the gate).
+    releaseGate("cancel-hold-232");
+    await statusIs(t.app, job.id, "awaiting_approval");
+    // A cancel that is saved stops it.
+    const ok = await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/cancel`, {});
+    expect(ok.statusCode).toBe(200);
+    expect(t.app.research!.get(job.id)!.status).toBe("cancelled");
+  });
+
+  const LABELS =
+    /^(검색 중 · \d+번째 검색|페이지 읽는 중 · \d+번째 페이지|페이지에서 찾는 중|파일 검색 중|파일 읽는 중)$/;
+
+  it("labels are fixed phrases and counts only: no words, titles, file names, URLs or hosts", () => {
+    const counts = { search: 3, fetch: 2 };
+    const at = (name: string) => {
+      const a = activityOf(`${P}${name}`, 1, counts);
+      return a && shown(a)?.label;
+    };
+    expect(at("web_search")).toBe("검색 중 · 3번째 검색");
+    expect(at("web_fetch")).toBe("페이지 읽는 중 · 2번째 페이지");
+    expect(at("web_find")).toBe("페이지에서 찾는 중");
+    expect(at("file_search")).toBe("파일 검색 중");
+    expect(at("file_read")).toBe("파일 읽는 중");
+    expect(at("file_list")).toBe("파일 읽는 중");
+    expect(at("cite")).toBeUndefined();
+    expect(at("file_cite")).toBeUndefined();
+    expect(at("memory_list")).toBeUndefined();
+    // Whatever the counts, every label is one of the fixed ones, and short.
+    for (const name of ["web_search", "web_fetch", "web_find", "file_search", "file_read"])
+      for (const n of [0, 1, 12, 999_999, -5, Number.NaN, 2.7]) {
+        const l = shown(activityOf(`${P}${name}`, 1, { search: n, fetch: n }))!.label;
+        expect(l).toMatch(LABELS);
+        expect(Array.from(l).length).toBeLessThanOrEqual(40);
+      }
+    // The shared pattern (the schema's, the page's) is the same set, with bounded counts.
+    for (const l of [
+      "검색 중 · 3번째 검색",
+      "페이지 읽는 중 · 2번째 페이지",
+      "페이지에서 찾는 중",
+      "파일 검색 중",
+      "파일 읽는 중",
+    ])
+      expect(l).toMatch(ACTIVITY_LABEL);
+    expect("읽는 중: example.test").not.toMatch(ACTIVITY_LABEL);
+  });
+
+  it("a line that is not valid goes out as none (never breaking the job)", () => {
+    expect(shown({ kind: "fetch", label: "x".repeat(300), at: 1 })).toBeNull();
+    expect(shown({ kind: "fetch", label: "읽는 중: example.org", at: 1 })).toBeNull();
+    expect(shown({ kind: "nope", label: "파일 읽는 중", at: 1 } as never)).toBeNull();
+    expect(shown({ kind: "file", label: "파일 읽는 중", at: 1 })).toEqual({
+      kind: "file",
+      label: "파일 읽는 중",
+      at: 1,
+    });
+  });
+
+  it("never shows a marker from any tool input — words, URLs, titles, file ids", () => {
+    let seed = 232;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) % 2 ** 31;
+      return seed / 2 ** 31;
+    };
+    for (let k = 0; k < 200; k++) {
+      const M = `MK${Math.floor(rnd() * 1e9)
+        .toString(36)
+        .toUpperCase()}`;
+      const counts = { search: 0, fetch: 0 };
+      const calls: { name: string; input: unknown }[] = [
+        { name: `${P}web_search`, input: { query: `앞 ${M} 뒤` } },
+        { name: `${P}web_fetch`, input: { url: `https://${M}.example.org/${M}?q=${M}#${M}` } },
+        { name: `${P}web_find`, input: { sourceId: M, query: M } },
+        { name: `${P}file_search`, input: { fileId: M, query: M } },
+        { name: `${P}file_read`, input: { fileId: M } },
+      ];
+      for (const c of calls) {
+        if (c.name.endsWith("web_search")) counts.search++;
+        if (c.name.endsWith("web_fetch")) counts.fetch++;
+        // The input is never even given to the label (its signature has no place for it).
+        const l = shown(activityOf(c.name, 1, counts))!.label;
+        expect(l).toMatch(LABELS);
+        expect(l.toUpperCase()).not.toContain(M);
+        expect(JSON.stringify(c.input)).toContain(M);
+      }
+    }
   });
 });

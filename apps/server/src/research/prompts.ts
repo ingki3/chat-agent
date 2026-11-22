@@ -413,9 +413,20 @@ export type RawNote = {
  * dropped). At most `max` notes.
  */
 export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQuestion): RawNote[] {
+  return parseNotesCounted(text, max).notes;
+}
+
+/**
+ * `parseNotes`, and how many well-formed `NOTE` lines there were in all (`submitted`, #232 — the card's 제외 counts
+ * what was submitted but not kept, the ones past `max` too).
+ */
+export function parseNotesCounted(
+  text: string,
+  max: number = RESEARCH_LIMITS.notesPerQuestion,
+): { notes: RawNote[]; submitted: number } {
   const out: RawNote[] = [];
+  let submitted = 0;
   for (const line of text.split(/\r?\n/)) {
-    if (out.length >= max) break;
     const m = /^\s*(?:[-*]\s*)?NOTE\s+(\{.*\})\s*$/.exec(line);
     if (!m) continue;
     let v: Record<string, unknown>;
@@ -434,6 +445,8 @@ export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQ
       typeof v.fileId === "string" && v.fileId.trim() ? v.fileId.trim().replace(/^file:/, "") : undefined;
     if (!sourceId && !fileId) continue;
     const page = typeof v.page === "number" && Number.isInteger(v.page) && v.page > 0 ? v.page : undefined;
+    submitted++;
+    if (out.length >= max) continue;
     out.push({
       claim,
       claimKey: claimKeyOf(v.claim),
@@ -442,5 +455,5 @@ export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQ
       ...(page !== undefined && !sourceId ? { page } : {}),
     });
   }
-  return out;
+  return { notes: out, submitted };
 }
