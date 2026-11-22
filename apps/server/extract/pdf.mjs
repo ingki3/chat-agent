@@ -259,7 +259,15 @@ export async function pdf(buf, out, { pdfjs, assets, ocr, limits = PDF_LIMITS })
     try {
       const meta = await doc.getMetadata();
       const t = meta?.info?.Title;
-      if (typeof t === "string" && t.trim()) title = t.replace(/\s+/g, " ").trim().slice(0, 1000);
+      // Whitespace as one space; control characters (C0, C1) and bidirectional controls dropped (review #237 14차).
+      const clean =
+        typeof t === "string"
+          ? t
+              .replace(/\s+/g, " ")
+              .replace(/[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
+              .trim()
+          : "";
+      if (clean) title = clean.slice(0, 1000);
     } catch {
       title = undefined;
     }

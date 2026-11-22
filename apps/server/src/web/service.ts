@@ -566,6 +566,8 @@ export class WebService {
       contentType: s(r.contentType) ?? "text/plain",
       body: text,
       truncated,
+      // A PDF named by its metadata: the file-name title an earlier fetch of the same page may have stored.
+      ...(typeof r.pdf === "string" ? { titleFallback: pdfTitle(finalUrl) } : {}),
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
     const pdf = hasGapMarks(row.contentType);
@@ -579,7 +581,6 @@ export class WebService {
         sourceId: row.id,
         url: row.url,
         finalUrl: row.finalUrl,
-        title: row.title,
         site: row.site,
         publishedAt: row.publishedAt,
         contentType: row.contentType,
@@ -590,7 +591,12 @@ export class WebService {
         truncated: row.truncated,
         // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).
         ...(unread ? { unreadPages: true } : {}),
-        content: frameExternal({ source: row.finalUrl ?? row.url, content: excerpt }),
+        // The title is the page's (or a PDF author's) words too: inside the external-content block, never a field
+        // of its own (review #237 14차).
+        content: frameExternal({
+          source: row.finalUrl ?? row.url,
+          content: `title: ${row.title}\n\n${excerpt}`,
+        }),
       },
     };
   }

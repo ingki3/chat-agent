@@ -527,9 +527,12 @@ describe("web tools on our MCP server", () => {
       site: "예시 신문",
       userId: f.mom.id,
     });
+    // The title is page text: inside the framed block only (review #237 14차), stored as the source's title.
+    expect(r.body.title).toBeUndefined();
+    expect(row!.title).toBe('한국 반도체 수출 "사상 최대"');
+    expect(String(r.body.content)).toContain('title: 한국 반도체 수출 "사상 최대"');
     expect(r.body).toMatchObject({
       sourceId: row!.id,
-      title: '한국 반도체 수출 "사상 최대"',
       site: "예시 신문",
       finalUrl: "http://public.test/article.html",
       publishedAt: "2026-11-10T00:30:00.000Z",
@@ -565,7 +568,10 @@ describe("web tools on our MCP server", () => {
     expect(f.sources.get(f.c.id, out.sourceId as string)!.body).toBe(long);
     // Exactly the framed first EXCERPT_CHARS: nothing after the boundary reaches the model.
     expect(out.content).toBe(
-      frameExternal({ source: "http://public.test/l", content: long.slice(0, EXCERPT_CHARS) }),
+      frameExternal({
+        source: "http://public.test/l",
+        content: `title: 긴 글\n\n${long.slice(0, EXCERPT_CHARS)}`,
+      }),
     );
     expect(JSON.stringify(out)).not.toContain("AFTER_BOUNDARY_MARKER");
   });

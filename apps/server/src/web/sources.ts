@@ -20,6 +20,11 @@ export type PageInput = {
   contentType: string;
   body: string;
   truncated: boolean;
+  /**
+   * A web PDF named by its metadata title (#234): the file-name title it would have had. A stored row of the same
+   * page that still has that file name takes the better title (its id kept).
+   */
+  titleFallback?: string | undefined;
 };
 
 export type SearchInput = {
@@ -106,7 +111,13 @@ export class SourceStore {
         ),
       )
       .get();
-    if (same) return same;
+    if (same) {
+      const title = cut(p.title, SOURCE_LIMITS.title);
+      const fallback = p.titleFallback ? cut(p.titleFallback, SOURCE_LIMITS.title) : undefined;
+      if (fallback && same.title === fallback && title && title !== fallback)
+        return this.db.update(sources).set({ title }).where(eq(sources.id, same.id)).returning().get();
+      return same;
+    }
     return this.db
       .insert(sources)
       .values({

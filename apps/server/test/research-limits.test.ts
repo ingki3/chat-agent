@@ -180,12 +180,12 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(r.isError).toBe(false);
     expect(r.body).toMatchObject({
       contentType: "application/pdf",
-      title: "2027 시행계획.pdf",
       site: "public.test",
       sourceType: "other",
     });
     const [row] = f.sources.list(f.c.id);
-    expect(row).toMatchObject({ kind: "page", contentType: "application/pdf" });
+    expect(row).toMatchObject({ kind: "page", contentType: "application/pdf", title: "2027 시행계획.pdf" });
+    expect(String(r.body.content)).toContain("title: 2027 시행계획.pdf");
     expect(row!.body).toContain("수시모집 원서 접수는 2026년 9월 8일부터 12일까지 진행된다.");
   });
 
@@ -197,13 +197,50 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     fx.routes.set("/b/download.pdf", { headers: { "content-type": "application/pdf" }, body: plain });
     const f = family();
     const { call } = service(f, reader);
-    expect((await call("web_fetch", { url: "http://public.test/a/download.pdf" })).body).toMatchObject({
-      title: "Annual Research Report",
-    });
-    expect((await call("web_fetch", { url: "http://public.test/b/download.pdf" })).body).toMatchObject({
-      title: "download.pdf",
-    });
+    const a = await call("web_fetch", { url: "http://public.test/a/download.pdf" });
+    expect(String(a.body.content)).toContain("title: Annual Research Report");
+    expect(a.body.title).toBeUndefined();
+    const b = await call("web_fetch", { url: "http://public.test/b/download.pdf" });
+    expect(String(b.body.content)).toContain("title: download.pdf");
     expect(f.sources.list(f.c.id).map((r) => r.title)).toEqual(["Annual Research Report", "download.pdf"]);
+  });
+
+  it("a metadata title loses its control and bidi characters; nothing left → the file name", async () => {
+    const reader = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const tricky = await makePdf(["본문 글자가 있는 문서입니다."], {
+      title: "\u202Eevil\u0007 Report\u2066",
+    });
+    const empty = await makePdf(["본문 글자가 있는 다른 문서입니다."], { title: "\u202E\u200F\u0001" });
+    expect(await reader(tricky)).toMatchObject({ ok: true, title: "evil Report" });
+    expect((await reader(empty)) as { title?: string }).not.toHaveProperty("title");
+    fx.routes.set("/c/empty.pdf", { headers: { "content-type": "application/pdf" }, body: empty });
+    const f = family();
+    await service(f, reader).call("web_fetch", { url: "http://public.test/c/empty.pdf" });
+    expect(f.sources.list(f.c.id)[0]!.title).toBe("empty.pdf");
+  });
+
+  it("the same page fetched again with a metadata title replaces a stored file-name title (same source id)", async () => {
+    const titled = await makePdf(["같은 본문이다."], { title: "Annual Research Report" });
+    let withTitle = false;
+    const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    // The first read as an older server stored it (no title), the second with the metadata title.
+    const reader: PdfReader = async (b, signal) => {
+      const r = await real(b, signal);
+      if (!r.ok || withTitle) return r;
+      return { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
+    };
+    fx.routes.set("/d/download.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
+    const f = family();
+    const { call } = service(f, reader);
+    const first = await call("web_fetch", { url: "http://public.test/d/download.pdf" });
+    expect(f.sources.list(f.c.id)[0]!.title).toBe("download.pdf");
+    withTitle = true;
+    const second = await call("web_fetch", { url: "http://public.test/d/download.pdf" });
+    expect(second.body.sourceId).toBe(first.body.sourceId);
+    const rows = f.sources.list(f.c.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.title).toBe("Annual Research Report");
+    expect(String(second.body.content)).toContain("title: Annual Research Report");
   });
 
   it("without a reader a PDF is refused as before; a broken PDF is bad content; a PDF without text has no text", async () => {
