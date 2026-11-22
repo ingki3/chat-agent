@@ -11,6 +11,7 @@ import {
   hasGapMarks,
   stripGapMarks,
   touchesGap,
+  verifyStats,
   visibleIndex,
 } from "../src/citations/verify.js";
 import { parseNotes, subagentTurn } from "../src/research/prompts.js";
@@ -296,18 +297,33 @@ describe("web_find review #237 6차", () => {
     const page = "신청 기간은 9월이다. 신청 방법은 누리집에서 한다. ".repeat(60);
     const text = Array.from({ length: 90 }, () => page).join(`\n\n${PAGE_GAP}\n\n`);
     expect(text.length).toBeGreaterThan(150_000);
-    let t0 = performance.now();
+    // The marks are collected once per search and once per check (#234 6차: before, once per candidate — a search of
+    // a long PDF took ~30× as long). Counted, not timed.
+    let before = verifyStats.gapRanges;
     const r = findPassages(text, "신청", 8, { gaps: true });
-    const search = performance.now() - t0;
     expect(r.total).toBeGreaterThan(1000);
-    t0 = performance.now();
-    findSnippet(text, "신청 방법은 누리집에서 한다", undefined, { gaps: true });
-    findSnippet(text, "없는 문장이 하나 있다고 한다", undefined, { gaps: true });
-    const check = performance.now() - t0;
-    // Generous bounds for a laptop under test load (before: ~400 ms for the search alone).
-    expect(search).toBeLessThan(250);
-    expect(check).toBeLessThan(250);
-  });
+    expect(verifyStats.gapRanges - before).toBe(1);
+    // A snippet whose every occurrence (200 of them) runs onto a mark: each candidate is rejected in a row — and the
+    // marks are still collected once.
+    const marks = Array.from({ length: 200 }, () => `같은 문장이다.\n\n${PAGE_GAP}\n\n`).join("");
+    before = verifyStats.gapRanges;
+    expect(findSnippet(marks, `같은 문장이다. ${PAGE_GAP}`, undefined, { gaps: true }).found).toBe(false);
+    expect(verifyStats.gapRanges - before).toBe(1);
+    // (Without the marks honoured the same snippet is found: the candidates are real.)
+    expect(findSnippet(marks, `같은 문장이다. ${PAGE_GAP}`).found).toBe(true);
+    // A loose sanity check on time too: the median of five runs, against the same search without the marks.
+    const median = (fn: () => void) => {
+      const runs = Array.from({ length: 5 }, () => {
+        const t0 = performance.now();
+        fn();
+        return performance.now() - t0;
+      }).sort((a, b) => a - b);
+      return runs[2]!;
+    };
+    const base = median(() => findPassages(text, "신청", 8));
+    const search = median(() => findPassages(text, "신청", 8, { gaps: true }));
+    expect(search).toBeLessThan(Math.max(200, 10 * base));
+  }, 30_000);
 });
 
 describe("web_find review #237 7차", () => {
