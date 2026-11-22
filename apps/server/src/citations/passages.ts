@@ -87,8 +87,13 @@ export function termsOf(text: string): string[] {
   return [...text.normalize("NFC").matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => stemOf(m[0]));
 }
 
-/** Lower case, NFC, whitespace runs as one space — for finding a phrase. */
-const flat = (s: string) => s.normalize("NFC").replace(/\s+/gu, " ").trim().toLowerCase();
+/**
+ * Case folding for a search — the same for the page and the query, cluster by cluster: NFC, lower case, and the
+ * final sigma as sigma (`ς` → `σ`: `ΣΟΦΟΣ` lowercases to `σοφος` alone but `σοφοσ` inside a longer text).
+ */
+const fold = (t: string) => t.normalize("NFC").toLowerCase().replace(/ς/gu, "σ");
+/** Folded, whitespace runs as one space — a sentence for keywords. */
+const flat = (s: string) => fold(s.replace(/\s+/gu, " ").trim());
 /** A passage as it is shown and quoted: the page's characters, whitespace runs as one space. */
 export const passageText = (text: string, r: Range, gaps = false) => {
   const raw = text.slice(r.start, r.end);
@@ -112,9 +117,11 @@ const JOINS = /^[\p{M}ᅠ-ᇿힰ-퟿]$/u;
  * taken per cluster (a character with its combining marks, a decomposed Hangul syllable), so a decomposed page
  * matches a composed query and every position still points into the original text (review #237 6차).
  */
-function flatMap(text: string): { s: string; at: number[] } {
+function flatMap(text: string): { s: string; at: number[]; end: number[] } {
   const out: string[] = [];
   const at: number[] = [];
+  /** The end of the original cluster each character came from (a surrogate pair, combining marks — whole). */
+  const end: number[] = [];
   let space = false;
   let i = 0;
   while (i < text.length) {
@@ -134,15 +141,17 @@ function flatMap(text: string): { s: string; at: number[] } {
     if (space) {
       out.push(" ");
       at.push(start);
+      end.push(start);
       space = false;
     }
-    for (const ch of cluster.normalize("NFC").toLowerCase())
+    for (const ch of fold(cluster))
       for (let k = 0; k < ch.length; k++) {
         out.push(ch[k]!);
         at.push(start);
+        end.push(i);
       }
   }
-  return { s: out.join(""), at };
+  return { s: out.join(""), at, end };
 }
 
 /** The sentence `i` with `ranges[i].start <= pos < ranges[i + 1].start` (the last one before `pos`). */
@@ -170,7 +179,8 @@ export function findPassages(
   max: number,
   opts: { gaps?: boolean } = {},
 ): { total: number; passages: FoundPassage[] } {
-  const want = flat(query);
+  // The query folded exactly as the page is (the same clusters, the same case folding — review #237 7차).
+  const want = flatMap(query).s;
   const terms = [...new Set(termsOf(query))].filter((t) => t.length > 0);
   if (!want || !terms.length) return { total: 0, passages: [] };
   // The marks' ranges once per search (review #237 6차), each check a binary search.
@@ -187,10 +197,8 @@ export function findPassages(
   const f = flatMap(text);
   for (let at = f.s.indexOf(want); at !== -1; at = f.s.indexOf(want, at + 1)) {
     const a = f.at[at]!;
-    const lastAt = f.at[at + want.length - 1]!;
-    // The end of the original cluster the last character came from.
-    let b = lastAt + 1;
-    while (b < text.length && JOINS.test(String.fromCodePoint(text.codePointAt(b)!))) b++;
+    // The end of the original cluster the last character came from (never inside a surrogate pair).
+    const b = f.end[at + want.length - 1]!;
     if (gap(a, b)) continue;
     const first = sentenceAt(sentences, a);
     const last = sentenceAt(sentences, b - 1);

@@ -173,7 +173,10 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
             ? "runtime_auth"
             : e.code === "no_connection"
               ? "no_connection"
-              : "runtime_error"
+              : // The runtime's own refusal (a tool it was not offered) is kept: never a passing error (#234).
+                e.code === "runtime_policy"
+                ? "runtime_policy"
+                : "runtime_error"
           : "runtime_error";
       return { text, ended: "failed", toolCalls, error };
     }

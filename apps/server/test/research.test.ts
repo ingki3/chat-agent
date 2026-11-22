@@ -23,14 +23,14 @@ import { fixtureWebWorker, FIXTURE_PAGES, type FixturePage } from "../src/runtim
 import type { WebWorker } from "../src/web/service.js";
 
 /** The citation fixture pages and `extra` ones (#234), answered in-process. */
-const withPages = (extra: readonly FixturePage[]): WebWorker => {
+const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): WebWorker => {
   const base = fixtureWebWorker();
   return async (job, proxy) => {
     const p = job.op === "fetch" ? extra.find((x) => x.url === job.url) : undefined;
     return p
       ? {
           ok: true,
-          finalUrl: p.url,
+          finalUrl: p.finalUrl ?? p.url,
           title: p.title,
           site: p.site,
           contentType: "text/html",
@@ -135,8 +135,8 @@ async function start(
     notificationsNow?: () => number;
     family?: boolean;
     dataDir?: string;
-    /** More fixture pages (#234), answered in-process like the citation fixtures. */
-    pages?: FixturePage[];
+    /** More fixture pages (#234), answered in-process like the citation fixtures (`finalUrl`: a redirect's target). */
+    pages?: (FixturePage & { finalUrl?: string })[];
   } = {},
 ) {
   const db = o.db ?? createTestDb();
@@ -1504,6 +1504,58 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     await statusIs(t.app, job.id, "done");
     expect(gapRuns).toHaveLength(1);
     expect(stateOf(t, job.id).questions.some((q) => q.question.includes("확인 못 한 증가율"))).toBe(true);
+  });
+
+  it("one page reached by two URLs is one source: the question is still retried (review #237 7차)", async () => {
+    const via: FixturePage & { finalUrl: string } = {
+      url: "https://fixture.agentlee.test/r/chips-a",
+      finalUrl: A.url,
+      title: "10월 반도체 수출 32% 증가",
+      site: "가나다 신문",
+      text: (FIXTURE_PAGES[0] as { text: string }).text,
+    };
+    const retries: string[] = [];
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /배경/.test(x))) return undefined;
+      if (x.includes(RETRY_MARK)) {
+        retries.push(x);
+        return [{ text: "DONE" }];
+      }
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        { call: "web_fetch", input: { url: via.url } },
+        {
+          textRefs: notes(
+            { claim: "메모리 가격 회복", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory },
+            { claim: "32% 증가", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.growth },
+          ),
+        },
+      ];
+    });
+    const t = await start({ script, pages: [via] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    // Two source rows (two URLs), one page.
+    expect(new Set(q2.found.map((n) => n.sourceId)).size).toBe(2);
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions[1]!.sources).toBe(1);
+    expect(retries).toHaveLength(1);
+  });
+
+  it("the runtime's own refusal (runtime_policy) is kept and never retried", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) ? [{ fail: "policy", code: "runtime_policy" as const }] : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(t.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(0);
+    expect(failed.errorCode).toBe("runtime_policy");
   });
 
   it("a passing runtime error is retried once; an account's state (login) never — even with a note kept", async () => {

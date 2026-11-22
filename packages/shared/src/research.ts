@@ -135,6 +135,8 @@ export const ResearchErrorCode = z.enum([
   "not_allowed",
   /** The conversation was switched to another runtime (Codex) before or while the job ran. */
   "runtime_changed",
+  /** The runtime stopped itself — it tried a tool it was not offered (#234: never retried). */
+  "runtime_policy",
 ]);
 export type ResearchErrorCode = z.infer<typeof ResearchErrorCode>;
 

@@ -67,6 +67,7 @@ import {
   type ResearchStore,
   type UnverifiedClaim,
   claimKeyOf,
+  pageKeyOf,
 } from "./store.js";
 
 /**
@@ -154,6 +155,7 @@ export const RESEARCH_FAILURE_TEXT: Record<ResearchErrorCode | "stopped", string
   conversation_gone: "대화가 삭제됐어요",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요",
   runtime_changed: "대화가 Codex로 바뀌어 멈췄어요",
+  runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요",
   stopped: "중지했어요",
 };
 
@@ -964,6 +966,8 @@ export class ResearchEngine {
               sourceId: r.source.id,
               title: r.source.title,
               sourceType: sourceTypeOf(r.source.finalUrl ?? r.source.url),
+              // One page however it was reached (a redirect's URL and its final URL are two source rows).
+              sourceKey: pageKeyOf(r.source.finalUrl ?? r.source.url),
             };
         } else if (n.fileId && files.has(n.fileId) && this.deps.fileTools) {
           const f = this.deps.fileTools.fileFor(scope, n.fileId);
@@ -1264,7 +1268,7 @@ const allNotes = (s: JobState) => s.questions.flatMap((q) => q.found);
  */
 export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: number): ResearchNote[] {
   const key = (n: ResearchNote) => `${n.sourceId ?? n.fileId}\n${n.quote}`;
-  const src = (n: ResearchNote) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`);
+  const src = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
   const seen = new Set<string>();
   const all: ResearchNote[] = [];
   for (const n of [...before, ...after]) {

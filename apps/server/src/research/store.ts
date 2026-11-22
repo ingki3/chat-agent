@@ -31,6 +31,11 @@ export type ResearchNote = {
   page?: number | undefined;
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
+  /**
+   * Which page it rests on, however it was fetched (`pageKeyOf` of the final URL — a redirect's URL and the final
+   * URL are two source rows of one page): what `sourceCount` counts (#234).
+   */
+  sourceKey?: string | undefined;
   /** The identity of its claim (`claimKeyOf` of the whole claim as written) — never shown. */
   claimKey?: string | undefined;
   /** A web note's publisher kind by its domain (#234, `sourceTypeOf`): for the writer and the report (#233). */
@@ -126,9 +131,23 @@ export const fileIdsOf = (row: ResearchJobRow): string[] => {
   }
 };
 
-/** Distinct sources (pages and files) the verified notes rest on. */
+/** A page's identity across source rows: its final URL without the fragment, host in lower case (#234). */
+export function pageKeyOf(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return `u:${u.toString()}`;
+  } catch {
+    return `u:${url}`;
+  }
+}
+
+/**
+ * Distinct sources (pages and files) the verified notes rest on — one page once, however many source rows it has
+ * (`sourceKey`, review #237 7차); a note from before keeps its source id.
+ */
 export function sourceCount(notes: readonly ResearchNote[]): number {
-  return new Set(notes.map((n) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`))).size;
+  return new Set(notes.map((n) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`))).size;
 }
 
 const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));

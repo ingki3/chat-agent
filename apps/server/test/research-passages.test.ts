@@ -307,3 +307,26 @@ describe("web_find review #237 6차", () => {
     expect(check).toBeLessThan(250);
   });
 });
+
+describe("web_find review #237 7차", () => {
+  it("a match ending in a surrogate pair keeps it whole", () => {
+    const body = "일정은 확인 𠮷 표시로 알린다. 달력 📅 아이콘도 있다.";
+    const a = findPassages(body, "확인 𠮷", 5).passages[0]!;
+    expect(a.phrase).toBe(true);
+    expect(a.text).toContain("확인 𠮷");
+    const b = findPassages(body, "달력 📅", 5).passages[0]!;
+    expect(b.text).toContain("📅");
+    // No lone surrogate anywhere in what comes back.
+    for (const t of [a.text, b.text]) expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u.test(t)).toBe(false);
+  });
+
+  it("Greek capitals with a final sigma match the same way in the query and the page, across the split too", () => {
+    const solid = `${"α".repeat(396)}ΣΟΦΟΣ${"β".repeat(50)}`;
+    for (const q of ["ΣΟΦΟΣ", "σοφος", "σοφοσ"]) {
+      const r = findPassages(solid, q, 5);
+      expect(r.total, q).toBe(1);
+      expect(r.passages[0]!.phrase, q).toBe(true);
+      expect(r.passages[0]!.text, q).toContain("ΣΟΦΟΣ");
+    }
+  });
+});
