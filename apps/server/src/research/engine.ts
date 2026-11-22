@@ -39,8 +39,11 @@ import { ResearchBackends } from "./backend.js";
 import { realClock, type Clock } from "./clock.js";
 import {
   defaultResearchPrompts,
+  maskOutline,
+  outlineTurn,
   parseGaps,
   parseNotes,
+  parseOutline,
   parsePlan,
   planTurn,
   reflectTurn,
@@ -49,14 +52,26 @@ import {
   writerTurn,
   type AttachedFile,
   type RawNote,
+  type ReportOutline,
   type ResearchPromptId,
   type ResearchPrompts,
 } from "./prompts.js";
-import { cleanReport, mdText, renderReport, type ReportCitation } from "./report.js";
+import {
+  cleanReport,
+  codeSpan,
+  oneLine,
+  groupSources,
+  renderReport,
+  reportSourceKey,
+  type ReportCitation,
+  type ReportSource,
+} from "./report.js";
 import { runStep, type StepResult, type StepSpec } from "./step.js";
 import {
   fileIdsOf,
   planOf,
+  restoreOutline,
+  storeOutline,
   sourceCount,
   stateOf,
   type JobPatch,
@@ -179,6 +194,9 @@ type RunCtx = {
 const ACTIVE: ResearchStatus[] = ["planning", "researching", "writing"];
 /** The writer needs at least this much: less, and the report is the verified passages themselves. */
 const MIN_WRITE_MS = 30_000;
+/** The outline step before the writer (#233): at most this, a fifth of the writing budget, at least the minimum. */
+const OUTLINE_MS = 90_000;
+const MIN_OUTLINE_MS = 15_000;
 const REFLECT_MS = 90_000;
 /** Unverified claims kept per sub-question (for its retry and the lead's reflection). */
 const UNVERIFIED_KEPT = 5;
@@ -1063,18 +1081,72 @@ export class ResearchEngine {
     const left = writeEnd - this.clock.now();
     let body = "";
     let removed = 0;
-    let sources: (ReportCitation & { k: number })[] = [];
+    let sources: ReportSource[] = [];
     let fallback = false;
     if (left >= MIN_WRITE_MS && !live.cap?.signal.aborted) {
       const ctx = this.stepCtx(row);
       if (typeof ctx === "string") return void this.fail(row.id, ctx, live);
+      const budget = Math.min(this.limits.writeMs, left);
+      const t0 = this.clock.now();
+      // #233: the lead outlines the report first (no tools, a small share of the writing budget); the writer then
+      // writes the whole report in one pass along it. No outline (no time, a failed or unusable answer): as before.
+      const outlineMs = Math.min(OUTLINE_MS, Math.floor(budget / 5));
+      const ids = new Set(notes.map((n) => n.id));
+      // Asked already (a restart while writing): the checkpoint's outline, never asked again — unless what is stored
+      // cannot be read (#233 review 17: then asked again, budget permitting).
+      // `null`: asked, none. Anything else stored is used only when it is still a good outline for these notes
+      // (#233 reviews 17–18); one that cannot be read or no longer fits is asked again, budget permitting.
+      const stored =
+        state.outline === null || state.outline === undefined
+          ? state.outline
+          : parseOutline(JSON.stringify(restoreOutline(state.outline) ?? {}), ids);
+      let outline: ReportOutline | undefined = stored ?? undefined;
+      // Through the secrets known now (#233 reviews 17–18): the question, the plan and the notes as each turn gets
+      // them, masked right before that turn — a resumed job's checkpoint may predate a secret (the stored rows'
+      // rescrub runs in the background), and one may be registered while the outline step runs.
+      const scrub = (t: string) => scrubKnown(t);
+      const shown = () => ({
+        question: scrub(row.question),
+        plan: maskPlan(plan, scrub),
+        notes: notes.map((n) => maskNote(n, scrub)),
+      });
+      const outlined =
+        stored === undefined && outlineMs >= MIN_OUTLINE_MS && budget - outlineMs >= MIN_WRITE_MS;
+      if (outlined) {
+        const o = await this.step(row, ctx, {
+          name: `outline:${t0}`,
+          prompt: "outline",
+          // Built when the turn is sent (#233 review 19): masked with the secrets known then.
+          text: () => outlineTurn(shown()),
+          tools: [],
+          ms: outlineMs,
+          signal: anySignal(live.abort.signal, live.cap!.signal),
+        });
+        if (live.abort.signal.aborted) return;
+        // Through the known secrets, as the checkpoint stores it: a live run and a resumed one give the writer the same.
+        if (o.ended === "done") outline = maskOutline(parseOutline(o.text, ids), ids, scrub);
+        state.outline = outline ? storeOutline(outline) : null;
+        // The outline's checkpoint only saves asking again after a restart (#233 review 15): not saved (the database
+        // busy or going), the writer goes on — a later restart may ask for the outline once more. Stopped meanwhile:
+        // nothing more.
+        if (!this.save(row.id, { state }, ["writing"], live)) {
+          if (live.abort.signal.aborted || this.get(row.id)?.status !== "writing") return;
+          logEvent(this.deps.log, "warn", "research.outline_unsaved", { researchId: row.id });
+        }
+      }
+      // Every new step checks the conversation again (still Claude, the connection still there).
+      const wctx = outlined ? this.stepCtx(row) : ctx;
+      if (typeof wctx === "string") return void this.fail(row.id, wctx, live);
       const name = `write:${this.clock.now()}`;
-      const r = await this.step(row, ctx, {
+      const r = await this.step(row, wctx, {
         name,
         prompt: "writer",
-        text: writerTurn({ question: row.question, plan, notes }),
+        // Through the secrets known now — also an outline from the checkpoint (#233 review 16: the stored rows' rescrub
+        // after a start runs in the background), so a fresh and a resumed writer get the same.
+        // Built when the turn is sent (#233 review 19): masked with the secrets known then.
+        text: () => writerTurn({ ...shown(), outline: maskOutline(outline, ids, scrub) }),
         tools: this.toolsFor(row.ownerId, files.length ? ["cite", "file_cite"] : ["cite"]),
-        ms: Math.min(this.limits.writeMs, left),
+        ms: Math.min(budget - (this.clock.now() - t0), writeEnd - this.clock.now()),
         signal: anySignal(live.abort.signal, live.cap!.signal),
       });
       if (live.abort.signal.aborted) return;
@@ -1085,7 +1157,7 @@ export class ResearchEngine {
       removed = cleaned.removed;
       if (cleaned.numbering.length) {
         body = cleaned.body;
-        sources = cleaned.numbering.map(({ from, to }) => ({ ...cites.get(from)!, k: to }));
+        sources = groupSources(cleaned.numbering.map(({ from, to }) => ({ ...cites.get(from)!, k: to })));
       } else fallback = true;
     } else {
       fallback = true;
@@ -1119,6 +1191,12 @@ export class ResearchEngine {
         site: c.source?.site,
         place,
         quote: c.quote ?? c.snippet,
+        // The report numbers by source (#233): a page by its address, a file by its id.
+        key: reportSourceKey({
+          fileId: c.fileId,
+          url: c.source ? (c.source.finalUrl ?? c.source.url) : undefined,
+          sourceId: c.sourceId,
+        }),
       });
     }
     return out;
@@ -1129,21 +1207,28 @@ export class ResearchEngine {
     row: ResearchJobRow,
     state: JobState,
     notes: ResearchNote[],
-  ): { body: string; sources: (ReportCitation & { k: number })[] } {
+  ): { body: string; sources: ReportSource[] } {
     const kept = new Set(notes.map((n) => n.id));
-    const sources: (ReportCitation & { k: number })[] = [];
+    const cites: (ReportCitation & { k: number })[] = [];
+    // One number per page or file (#233), as the writer's report.
+    const bySource = new Map<string, number>();
     const sections: string[] = [];
     for (const q of state.questions) {
       const mine = q.found.filter((n) => kept.has(n.id));
       if (!mine.length) continue;
       const lines = mine.map((n) => {
-        const k = sources.length + 1;
-        sources.push({ ...this.describe(row, n), k });
-        return `- ${mdText(n.title ?? "", 60) || "출처"}: “${mdText(n.quote, 300)}” [${k}]`;
+        const c = this.describe(row, n);
+        const key = reportSourceKey({ fileId: n.fileId, url: c.url, sourceId: n.sourceId }) ?? `note:${n.id}`;
+        const k = bySource.get(key) ?? bySource.size + 1;
+        bySource.set(key, k);
+        cites.push({ ...c, k });
+        // Page and file text as code (#233 review 10): shown as written, nothing in it read as Markdown.
+        return `- ${codeSpan(oneLine(n.title ?? "") || "출처")}: ${codeSpan(oneLine(n.quote))} [${k}]`;
       });
-      sections.push(`## ${mdText(q.question, 120)}\n\n${lines.join("\n")}`);
+      // The sub-question as code too: the stored report holds it verbatim (#233 review 12).
+      sections.push(`## ${codeSpan(oneLine(q.question))}\n\n${lines.join("\n")}`);
     }
-    return { body: sections.join("\n\n"), sources };
+    return { body: sections.join("\n\n"), sources: groupSources(cites) };
   }
 
   private describe(row: ResearchJobRow, n: ResearchNote): ReportCitation {
@@ -1174,7 +1259,7 @@ export class ResearchEngine {
     row: ResearchJobRow,
     plan: ResearchPlan,
     state: JobState,
-    r: { body: string; removed: number; sources: (ReportCitation & { k: number })[]; fallback: boolean },
+    r: { body: string; removed: number; sources: ReportSource[]; fallback: boolean },
     live: Live,
   ): void {
     const { conversations, artifacts } = this.deps;
@@ -1466,4 +1551,24 @@ function placeOf(locator: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** A plan's text through `scrub` (#233 review 17): its title and sub-questions; ids, scopes and the rest as they are. */
+function maskPlan(plan: ResearchPlan, scrub: (t: string) => string): ResearchPlan {
+  return {
+    ...plan,
+    title: scrub(plan.title),
+    subQuestions: plan.subQuestions.map((q) => ({ ...q, question: scrub(q.question) })),
+  };
+}
+
+/** A note's text through `scrub` (#233 review 17): claim, passage, title and place; its ids as they are. */
+function maskNote(n: ResearchNote, scrub: (t: string) => string): ResearchNote {
+  return {
+    ...n,
+    claim: scrub(n.claim),
+    quote: scrub(n.quote),
+    ...(n.title !== undefined ? { title: scrub(n.title) } : {}),
+    ...(n.place !== undefined ? { place: scrub(n.place) } : {}),
+  };
 }
