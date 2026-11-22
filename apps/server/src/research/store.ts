@@ -69,6 +69,11 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes" | "activity"> &
   failure?: ResearchErrorCode | undefined;
   /** It was not (re)searched because too little time was left when its turn came (#234). */
   skipped?: "time" | undefined;
+  /**
+   * Well-formed notes its sub-researcher wrote over all its runs (#232). `dropped` is always `submitted` minus the
+   * notes kept — left out by the check, as a duplicate, over the cap or when a checkpoint is normalised.
+   */
+  submitted?: number | undefined;
 };
 
 /**
@@ -212,6 +217,16 @@ export function pageKeyOf(url: string): string {
  */
 export function sourceCount(notes: readonly ResearchNote[]): number {
   return new Set(notes.map((n) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`))).size;
+}
+
+/**
+ * A question's `dropped` from what it submitted and kept (#232): the one rule wherever its notes change, so
+ * normalising the same state again counts nothing twice. A checkpoint from before keeps its count as submitted.
+ */
+export function settleDropped(q: QuestionRecord): void {
+  q.submitted ??= q.found.length + q.dropped;
+  q.submitted = Math.max(q.submitted, q.found.length);
+  q.dropped = Math.max(0, q.submitted - q.found.length);
 }
 
 const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));

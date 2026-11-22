@@ -44,7 +44,7 @@ import {
   maskOutline,
   outlineTurn,
   parseGaps,
-  parseNotes,
+  parseNotesCounted,
   parseOutline,
   parsePlan,
   planTurn,
@@ -74,6 +74,7 @@ import {
   planOf,
   restoreOutline,
   storeOutline,
+  settleDropped,
   sourceCount,
   stateOf,
   type JobPatch,
@@ -924,9 +925,13 @@ export class ResearchEngine {
   private normalizeNotes(row: ResearchJobRow, state: JobState): void {
     for (const q of state.questions) {
       this.refreshPages(row, q.found);
+      // What it had before this (a checkpoint from before #232: its kept and dropped) counts as submitted.
+      q.submitted ??= q.found.length + q.dropped;
       const seen = new Set<string>();
       q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
       q.sources = sourceCount(q.found);
+      // A duplicate removed here is 제외 too (derived, so normalising again adds nothing).
+      settleDropped(q);
     }
   }
 
@@ -989,7 +994,9 @@ export class ResearchEngine {
       if (q.status === "running")
         Object.assign(
           q,
-          q.retried ? { status: "waiting" } : { status: "waiting", found: [], sources: 0, dropped: 0 },
+          q.retried
+            ? { status: "waiting" }
+            : { status: "waiting", found: [], sources: 0, dropped: 0, submitted: 0 },
         );
     const stage = new AbortController();
     const cancel = this.clock.timer(researchEnd - this.clock.now(), () => stage.abort());
@@ -1045,7 +1052,7 @@ export class ResearchEngine {
               question: q.id,
             });
             if (live.abort.signal.aborted) return;
-            const raw = parseNotes(r.text, this.limits.notesPerQuestion);
+            const { notes: raw, submitted } = parseNotesCounted(r.text, this.limits.notesPerQuestion);
             const checked = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
             // Pages as the source rows say now, before merging and counting (review #237 16차).
             this.refreshPages(row, before);
@@ -1053,12 +1060,10 @@ export class ResearchEngine {
             const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
-            // Every note left out (#232: the card's 제외): not verified, and what the merge with the first run's
-            // dropped — a duplicate of one of them, or over the cap.
-            q.dropped =
-              (q.retried ? q.dropped : 0) +
-              (raw.length - checked.notes.length) +
-              Math.max(0, before.length + checked.notes.length - notes.length);
+            // Every note submitted but not kept (#232: the card's 제외) — not verified, past the cap, a duplicate of
+            // the first run's — over all its runs (a checkpoint from before: its kept and dropped as submitted).
+            q.submitted = (q.retried ? (q.submitted ?? before.length + q.dropped) : 0) + submitted;
+            settleDropped(q);
             // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
             q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
             q.status =

@@ -11,7 +11,7 @@ import { createTestDb, type Db } from "../src/db/client.js";
 import { inProcessExtractor, ocrCapability } from "../src/files/extract.js";
 import { compose } from "../src/notifications/compose.js";
 import { ManualClock } from "../src/research/clock.js";
-import { RETRY_MARK, TURN_MARK } from "../src/research/prompts.js";
+import { parseNotesCounted, RETRY_MARK, TURN_MARK } from "../src/research/prompts.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
@@ -43,7 +43,7 @@ const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): Web
 };
 import { RESEARCH_FIXTURE, researchSteps } from "../src/runtime/fake-research.js";
 import { ACTIVITY_LABEL, activityOf } from "../src/research/activity.js";
-import { ResearchStore, shown, toResearchJob } from "../src/research/store.js";
+import { ResearchStore, shown, toResearchJob, type QuestionRecord } from "../src/research/store.js";
 import { ACTIVITY_EMIT_MS } from "../src/research/engine.js";
 import {
   defaultScript,
@@ -2764,6 +2764,57 @@ describe("깊이 조사: live progress — activity, phase, last activity (#232)
       ],
     });
     expect(cap).toMatchObject({ notes: 2, dropped: 1 });
+  });
+
+  it("제외 is always what was submitted but not kept: past the cap in one run, and a duplicate removed on restore", async () => {
+    // One more good note than the cap in one run (the cap is 2 here — 12 in use): the cap kept, one left out.
+    const note = (quote: string) =>
+      `NOTE ${JSON.stringify({ claim: "증가", sourceId: "{{$0.sourceId}}", quote })}\n`;
+    const quotes = [
+      RESEARCH_FIXTURE.growth,
+      RESEARCH_FIXTURE.memory,
+      "업계는 연말까지 증가세가 이어질 것으로 본다.",
+    ];
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && /증가율/.test(x) && !x.includes(RETRY_MARK)
+        ? [{ call: "web_fetch", input: { url: A.url } }, { textRefs: quotes.map(note).join("") + "DONE" }]
+        : undefined,
+    );
+    const t = await start({ script, limits: { notesPerQuestion: 2 } });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect((await view(t, job.id)).questions[0]).toMatchObject({ notes: 2, dropped: 1 });
+    // Parsed past the cap, counted all the same.
+    expect(
+      parseNotesCounted(quotes.map((q) => note(q).replace("{{$0.sourceId}}", "s")).join(""), 2),
+    ).toMatchObject({
+      submitted: 3,
+    });
+
+    // Restoring a checkpoint with the same passage twice (from before #232: no `submitted`): one kept, 제외 1 — and
+    // normalising the same state again counts nothing twice.
+    const e = t.app.research! as unknown as {
+      normalizeNotes(row: unknown, state: { questions: QuestionRecord[] }): void;
+    };
+    const n = { id: "n1", claim: "c", quote: "같은 구절", sourceId: "s-gone" };
+    const q: QuestionRecord = {
+      id: "q1",
+      question: "질문",
+      scope: "web",
+      round: 0,
+      status: "done",
+      sources: 1,
+      found: [n, { ...n, id: "n2", quote: "같은  구절" }],
+      dropped: 0,
+    };
+    const state = { questions: [q] };
+    const row = t.app.research!.get(job.id)!;
+    e.normalizeNotes(row, state);
+    expect([q.found.length, q.dropped, q.submitted]).toEqual([1, 1, 2]);
+    e.normalizeNotes(row, state);
+    expect([q.found.length, q.dropped, q.submitted]).toEqual([1, 1, 2]);
   });
 
   it("a wall clock set back never holds an activity broadcast back longer than one window", async () => {
