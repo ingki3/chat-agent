@@ -10,7 +10,7 @@ import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
 import { cutAt, cutOutsideGap, hasGapMarks, stripGapMarks, visibleIndex } from "../citations/verify.js";
 import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
-import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
+import { cut, pdfTitle, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
 /**
  * Web search and fetch for the runtimes (#50, PRD FR-5.1·5.2·5.7, network policy #42).
@@ -58,16 +58,7 @@ const code = (c: unknown): WebCode => (typeof c === "string" && KNOWN.has(c) ? (
 export const MAX_REDIRECTS = 5;
 export const FETCH_MS = 20_000;
 
-/** A PDF's title when it has none of its own: the file name of its address ("2027 시행계획.pdf"). */
-export function pdfTitle(u: URL): string | undefined {
-  const last = u.pathname.split("/").filter(Boolean).at(-1);
-  if (!last) return undefined;
-  try {
-    return cut(decodeURIComponent(last), SOURCE_LIMITS.title) || undefined;
-  } catch {
-    return cut(last, SOURCE_LIMITS.title) || undefined;
-  }
-}
+export { pdfTitle };
 
 /**
  * Characters of page text the model gets back from one fetch (the stored body is longer — `web_find` searches it,
@@ -567,7 +558,7 @@ export class WebService {
       body: text,
       truncated,
       // A PDF named by its metadata: the file-name title an earlier fetch of the same page may have stored.
-      ...(typeof r.pdf === "string" ? { titleFallback: pdfTitle(finalUrl) } : {}),
+      ...(typeof r.pdf === "string" ? { pdf: true } : {}),
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
     const pdf = hasGapMarks(row.contentType);

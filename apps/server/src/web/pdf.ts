@@ -5,6 +5,7 @@ import { PAGE_GAP, stripGapMarks } from "../citations/verify.js";
 import type { FileRow } from "../files/store.js";
 import { keptSegments, type ExtractRunner } from "../files/extract.js";
 import { scrubKnown } from "../secrets/known.js";
+import { cleanTitle } from "./sources.js";
 import type { WebCode } from "./service.js";
 
 /**
@@ -116,7 +117,7 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
         unread = true;
       }
       const text = parts.every((p) => p === PAGE_GAP) ? "" : parts.join("\n\n");
-      const title = typeof r.title === "string" ? scrubKnown(r.title).replace(/\s+/g, " ").trim() : "";
+      const title = typeof r.title === "string" ? cleanTitle(scrubKnown(r.title)) : "";
       return { ok: true, text, truncated: r.truncated || unread, unread, ...(title ? { title } : {}) };
     } catch {
       return { ok: false, code: "web_unavailable" };

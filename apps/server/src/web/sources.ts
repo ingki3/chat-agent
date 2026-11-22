@@ -21,10 +21,10 @@ export type PageInput = {
   body: string;
   truncated: boolean;
   /**
-   * A web PDF named by its metadata title (#234): the file-name title it would have had. A stored row of the same
-   * page that still has that file name takes the better title (its id kept).
+   * A web PDF (#234): a stored row of the same page whose title is still its own file-name fallback (`pdfTitle` of
+   * that row's final URL) takes this page's better title — its id kept.
    */
-  titleFallback?: string | undefined;
+  pdf?: boolean | undefined;
 };
 
 export type SearchInput = {
@@ -45,6 +45,32 @@ export const cut = (s: string, n: number) => {
   // On a code point (review #237 11차): never half a surrogate pair before the ellipsis.
   return t.length > n ? `${cutAt(t, n - 1)}…` : t;
 };
+/**
+ * A title without control characters (C0, C1) and bidirectional controls, whitespace as one space (#234, review
+ * #237 14·15차 — the PDF reader's metadata title gets the same in `extract/pdf.mjs`).
+ */
+export const cleanTitle = (t: string) =>
+  t
+    .replace(/\s+/gu, " ")
+    .replace(/[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
+    .trim();
+
+/**
+ * A PDF's title when it has none of its own: the file name of its address ("2027 시행계획.pdf"), cleaned
+ * (`cleanTitle`) and bounded; undefined when nothing is left (the caller then names it by its site).
+ */
+export function pdfTitle(u: URL): string | undefined {
+  const last = u.pathname.split("/").filter(Boolean).at(-1);
+  if (!last) return undefined;
+  let name: string;
+  try {
+    name = decodeURIComponent(last);
+  } catch {
+    name = last;
+  }
+  return cut(cleanTitle(name), SOURCE_LIMITS.title) || undefined;
+}
+
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
 export function toSource(r: SourceRow): Source {
@@ -113,7 +139,15 @@ export class SourceStore {
       .get();
     if (same) {
       const title = cut(p.title, SOURCE_LIMITS.title);
-      const fallback = p.titleFallback ? cut(p.titleFallback, SOURCE_LIMITS.title) : undefined;
+      // The fallback the stored row got from its own address (review #237 15차: a request URL that now redirects to
+      // another file name does not hide it).
+      let fallback: string | undefined;
+      if (p.pdf)
+        try {
+          fallback = pdfTitle(new URL(same.finalUrl ?? same.url));
+        } catch {
+          fallback = undefined;
+        }
       if (fallback && same.title === fallback && title && title !== fallback)
         return this.db.update(sources).set({ title }).where(eq(sources.id, same.id)).returning().get();
       return same;

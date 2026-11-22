@@ -16,7 +16,7 @@ import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
 import { extractorPdfReader, PDF_TEXT_CHARS, type PdfReader } from "../src/web/pdf.js";
 import { EXCERPT_CHARS, workerLimitsOf } from "../src/web/service.js";
-import { SourceStore, toSource } from "../src/web/sources.js";
+import { pdfTitle, SourceStore, toSource } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 import { startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
 import { run as runWorker } from "../../../packages/mcp-tools/web/worker.mjs";
@@ -241,6 +241,40 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.title).toBe("Annual Research Report");
     expect(String(second.body.content)).toContain("title: Annual Research Report");
+  });
+
+  it("a re-fetch through a URL that now redirects to another file still replaces the row's own file-name title", async () => {
+    const titled = await makePdf(["옮겨진 같은 본문이다."], { title: "Moved Report" });
+    let withTitle = false;
+    const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const reader: PdfReader = async (b, signal) => {
+      const r = await real(b, signal);
+      return !r.ok || withTitle ? r : { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
+    };
+    fx.routes.set("/e/old.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
+    fx.routes.set("/e/new.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
+    fx.redirects.set("/e/get", "/e/old.pdf");
+    const f = family();
+    const { call } = service(f, reader);
+    const first = await call("web_fetch", { url: "http://public.test/e/get" });
+    expect(f.sources.list(f.c.id)[0]!.title).toBe("old.pdf");
+    fx.redirects.set("/e/get", "/e/new.pdf");
+    withTitle = true;
+    const second = await call("web_fetch", { url: "http://public.test/e/get" });
+    expect(second.body.sourceId).toBe(first.body.sourceId);
+    expect(f.sources.list(f.c.id).map((r) => r.title)).toEqual(["Moved Report"]);
+  });
+
+  it("a file-name title loses decoded control and bidi characters; nothing left → the site", async () => {
+    expect(pdfTitle(new URL("https://a.test/report%E2%80%AE.pdf"))).toBe("report.pdf");
+    expect(pdfTitle(new URL("https://a.test/%E2%80%AE%07"))).toBeUndefined();
+    const plain = await makePdf(["이름 없는 문서 본문이다."]);
+    fx.routes.set("/g/%E2%80%AE%E2%81%A6", { headers: { "content-type": "application/pdf" }, body: plain });
+    const f = family();
+    await service(f, extractorPdfReader(inProcessExtractor(NO_OCR), tmp())).call("web_fetch", {
+      url: "http://public.test/g/%E2%80%AE%E2%81%A6",
+    });
+    expect(f.sources.list(f.c.id)[0]!.title).toBe("public.test");
   });
 
   it("without a reader a PDF is refused as before; a broken PDF is bad content; a PDF without text has no text", async () => {
