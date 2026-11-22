@@ -704,6 +704,25 @@ export class ResearchEngine {
 
   // ---- 2. research ----
 
+  /**
+   * Every checkpoint's notes, whatever stage it resumes in (review #237 8·10·11차): a web note's page (`sourceKey`)
+   * from its stored source row when missing (a checkpoint from before notes carried it — e.g. a job running at the
+   * deploy), the same passage of one page once (`noteKey`), and the question's source count again — before any retry
+   * or the writer's notes are decided on them.
+   */
+  private normalizeNotes(row: ResearchJobRow, state: JobState): void {
+    for (const q of state.questions) {
+      for (const n of q.found)
+        if (n.sourceId && !n.sourceKey) {
+          const src = this.deps.sources.get(row.conversationId, n.sourceId);
+          if (src) n.sourceKey = pageKeyOf(src.finalUrl ?? src.url);
+        }
+      const seen = new Set<string>();
+      q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
+      q.sources = sourceCount(q.found);
+    }
+  }
+
   /** Runs the research stage; true when at least one sub-question step ran. */
   private async research(row: ResearchJobRow, live: Live): Promise<boolean | undefined> {
     let ran = false;
@@ -718,26 +737,7 @@ export class ResearchEngine {
     // …and every question still to ask (an old checkpoint's gap question too) is held within them.
     for (const q of state.questions)
       if (q.status === "waiting" || q.status === "running") q.scope = clampScope(q.scope, state.scopes);
-    // A checkpoint from before notes carried their page (`sourceKey`, review #237 8차 — e.g. a job running at the
-    // deploy): each web note's page from its stored source row, and the questions' source counts again — before any
-    // retry is decided on them.
-    for (const q of state.questions) {
-      let filled = false;
-      for (const n of q.found)
-        if (n.sourceId && !n.sourceKey) {
-          const src = this.deps.sources.get(row.conversationId, n.sourceId);
-          if (src) {
-            n.sourceKey = pageKeyOf(src.finalUrl ?? src.url);
-            filled = true;
-          }
-        }
-      // The same passage of one page reached by two URLs is one note (review #237 10차), retried or not.
-      if (filled) {
-        const seen = new Set<string>();
-        q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
-        q.sources = sourceCount(q.found);
-      }
-    }
+    this.normalizeNotes(row, state);
     const files = this.files(row);
     /**
      * Every new step looks again (review 2): the conversation switched to Codex (or the connection gone) while the job
@@ -1032,6 +1032,8 @@ export class ResearchEngine {
     const plan = planOf(row);
     if (!plan || row.deadlineAt === null) return void this.fail(row.id, "runtime_error", live);
     const state = stateOf(row);
+    // A checkpoint restored straight into writing is normalised the same way (review #237 11차).
+    this.normalizeNotes(row, state);
     const notes = pickNotes(state, this.limits.maxNotes);
     if (!notes.length) return void this.fail(row.id, opts.recovered ? "server_restart" : "no_findings", live);
     const files = this.files(row);
@@ -1356,25 +1358,36 @@ export function mergeUnverified(
 
 /** At most `max` notes for the lead and the writer, taken in turn from each sub-question (none crowds out another). */
 export function pickNotes(s: JobState, max: number): ResearchNote[] {
-  // Each question's notes with one per page first (review #237 10차: a retry's new page must reach the writer even
-  // when an older page has twelve), then the rest in order; questions in turn.
-  const lists = s.questions.map((q) => {
-    const seen = new Set<string>();
-    const firsts: ResearchNote[] = [];
-    const rest: ResearchNote[] = [];
-    for (const n of q.found) {
-      const page = n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`;
-      if (seen.has(page)) rest.push(n);
-      else {
-        seen.add(page);
-        firsts.push(n);
-      }
-    }
-    return [...firsts, ...rest];
-  });
+  const page = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
+  const lists = s.questions.map((q) => q.found);
+  const taken = new Set<ResearchNote>();
   const out: ResearchNote[] = [];
-  for (let i = 0; out.length < max && lists.some((l) => i < l.length); i++)
-    for (const l of lists) if (i < l.length && out.length < max) out.push(l[i]!);
+  const take = (n: ResearchNote) => {
+    taken.add(n);
+    out.push(n);
+  };
+  // 1. Every page once (review #237 10·11차: a page only one question found, or a retry's new page, reaches the
+  //    writer whatever the others hold): questions in turn, each giving its next note from a page not taken yet —
+  //    or, if it has none, its first note, so every question is heard.
+  const seen = new Set<string>();
+  const given = new Set<number>();
+  for (let progress = true; progress && out.length < max;) {
+    progress = false;
+    for (const [qi, l] of lists.entries()) {
+      if (out.length >= max) break;
+      const next = l.find((n) => !taken.has(n) && !seen.has(page(n)));
+      const pick = next ?? (given.has(qi) ? undefined : l.find((n) => !taken.has(n)));
+      if (!pick) continue;
+      seen.add(page(pick));
+      given.add(qi);
+      take(pick);
+      progress = true;
+    }
+  }
+  // 2. The rest, questions in turn, each in its own order.
+  const rest = lists.map((l) => l.filter((n) => !taken.has(n)));
+  for (let i = 0; out.length < max && rest.some((l) => i < l.length); i++)
+    for (const l of rest) if (i < l.length && out.length < max) take(l[i]!);
   return out;
 }
 

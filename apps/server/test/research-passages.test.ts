@@ -18,6 +18,7 @@ import { claimKeyOf, emptyState, type QuestionRecord } from "../src/research/sto
 import { mergeNotes, mergeUnverified, pickNotes } from "../src/research/engine.js";
 import type { ResearchNote } from "../src/research/store.js";
 import { pdfTitle } from "../src/web/service.js";
+import { cut } from "../src/web/sources.js";
 
 /**
  * 깊이 조사의 조사 한계 (#234), the pure parts — no port, no fixture site: passages (`web_find`), PDF page marks,
@@ -457,5 +458,50 @@ describe("review #237 10차", () => {
     expect(cutAt(t, 10).isWellFormed()).toBe(true);
     const g = `${"가".repeat(9)}📅${"나".repeat(5)}`;
     expect(cutOutsideGap(g, 10).isWellFormed()).toBe(true);
+  });
+});
+
+describe("review #237 11차", () => {
+  const note = (id: string, key: string) => ({
+    id,
+    claim: id,
+    quote: id,
+    sourceId: key,
+    sourceKey: `u:${key}`,
+  });
+  const question = (q: number, found: ReturnType<typeof note>[]): QuestionRecord => ({
+    id: `q${q}`,
+    question: `q${q}`,
+    scope: "web",
+    round: 0,
+    status: "done",
+    sources: 1,
+    dropped: 0,
+    found,
+  });
+
+  it("every page reaches the writer: 17 pages, 11 of them only in the last question", () => {
+    const s = emptyState();
+    s.questions = [
+      ...Array.from({ length: 5 }, (_, q) =>
+        question(
+          q,
+          Array.from({ length: 12 }, (_, i) => note(`q${q}-${i}`, `A${q}`)),
+        ),
+      ),
+      question(5, [note("q5-a", "A5"), ...Array.from({ length: 11 }, (_, i) => note(`q5-n${i}`, `N${i}`))]),
+    ];
+    const picked = pickNotes(s, 45);
+    expect(picked).toHaveLength(45);
+    expect(new Set(picked.map((n) => n.sourceKey)).size).toBe(17);
+    expect(new Set(picked.map((n) => n.id)).size).toBe(45);
+  });
+
+  it("a title cut at its bound keeps surrogate pairs whole", () => {
+    const t = cut(`${"가".repeat(298)}📅${"나".repeat(10)}`, 300);
+    expect(t.isWellFormed()).toBe(true);
+    expect(t.endsWith("…")).toBe(true);
+    const title = pdfTitle(new URL(`https://a.test/${encodeURIComponent(`${"가".repeat(298)}📅끝.pdf`)}`))!;
+    expect(title.isWellFormed()).toBe(true);
   });
 });

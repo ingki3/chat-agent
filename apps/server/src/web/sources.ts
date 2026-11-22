@@ -3,7 +3,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
-import { hasGapMarks, visibleIndex } from "../citations/verify.js";
+import { cutAt, hasGapMarks, visibleIndex } from "../citations/verify.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 
 export type SourceRow = typeof sources.$inferSelect;
@@ -37,7 +37,8 @@ export const SOURCE_LIMITS = { title: 300, site: 120, snippet: 600, url: 2048 } 
 /** Whitespace collapsed and at most `n` characters (an ellipsis marks a cut). */
 export const cut = (s: string, n: number) => {
   const t = s.replace(/\s+/g, " ").trim();
-  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  // On a code point (review #237 11차): never half a surrogate pair before the ellipsis.
+  return t.length > n ? `${cutAt(t, n - 1)}…` : t;
 };
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 

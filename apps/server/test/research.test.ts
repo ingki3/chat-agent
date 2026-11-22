@@ -1771,6 +1771,68 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(after.questions[1]!.sources).toBe(2);
   });
 
+  it("every restored checkpoint is normalised — notes that already carry their page key, in research or writing", async () => {
+    for (const stage of ["research", "write"] as const) {
+      const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+        const store = new SourceStore(db);
+        const scope = { userId: ownerId, conversationId, runId: "research:old" };
+        const add = (url: string) =>
+          store.addPage(scope, {
+            url,
+            finalUrl: A.url,
+            title: "t",
+            site: "s",
+            contentType: "text/html",
+            body: (FIXTURE_PAGES[0] as { text: string }).text,
+            truncated: false,
+          })!.id;
+        const a = add(A.url);
+        const a2 = add(`https://fixture.agentlee.test/r/${stage}`);
+        const key = `u:${A.url}`;
+        for (const q of state.questions) Object.assign(q, { status: "done", retried: true });
+        Object.assign(state.questions[1]!, {
+          sources: 2,
+          found: [
+            {
+              id: "n1",
+              claim: "메모리",
+              quote: RESEARCH_FIXTURE.memory,
+              sourceId: a,
+              sourceKey: key,
+              title: "t",
+            },
+            {
+              id: "n2",
+              claim: "메모리",
+              quote: `${RESEARCH_FIXTURE.memory} `,
+              sourceId: a2,
+              sourceKey: key,
+              title: "t",
+            },
+          ],
+        });
+        if (stage === "write") {
+          state.stage = "write";
+          db.$client
+            .prepare("update research_jobs set status = 'writing' where conversation_id = ?")
+            .run(conversationId);
+        }
+      });
+      await statusIs(t2.app, job.id, "done");
+      const writer = t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+      // The writer got the passage once.
+      expect(writer.split(RESEARCH_FIXTURE.memory).length - 1, stage).toBe(1);
+      const after = JSON.parse(t2.app.research!.get(job.id)!.state) as {
+        questions: { sources: number; found: { id: string }[] }[];
+      };
+      expect(
+        after.questions[1]!.found.map((n) => n.id),
+        stage,
+      ).toEqual(["n1"]);
+      expect(after.questions[1]!.sources, stage).toBe(1);
+    }
+  }, 30_000);
+
   it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
     const { t2, job } = await resumedWith((state) => {
       for (const q of state.questions)
