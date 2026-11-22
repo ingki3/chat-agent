@@ -548,7 +548,9 @@ export class WebService {
       text = cutOutsideGap(p.text, PDF_TEXT_CHARS);
       truncated = p.truncated || p.text.length > PDF_TEXT_CHARS;
       unread = p.unread;
-      title ??= pdfTitle(finalUrl);
+      // The document's own title first (its metadata, review #237 13차), else the file name of its address; the
+      // source store bounds it on a code point and masks known secrets again.
+      title ??= p.title || pdfTitle(finalUrl);
     }
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);

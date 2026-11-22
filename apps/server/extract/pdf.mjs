@@ -254,7 +254,16 @@ export async function pdf(buf, out, { pdfjs, assets, ocr, limits = PDF_LIMITS })
     }
     // Pages past the limit are not read: the document ends early after the last page taken.
     if (pages > n) out.end();
-    return { units: pages, ocr: state };
+    // The document's own title (its Info dictionary), if any — a web PDF is named by it (#234).
+    let title;
+    try {
+      const meta = await doc.getMetadata();
+      const t = meta?.info?.Title;
+      if (typeof t === "string" && t.trim()) title = t.replace(/\s+/g, " ").trim().slice(0, 1000);
+    } catch {
+      title = undefined;
+    }
+    return { units: pages, ocr: state, ...(title ? { title } : {}) };
   } finally {
     await engine?.close();
     await task.destroy();

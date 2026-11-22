@@ -4,6 +4,7 @@ import path from "node:path";
 import { PAGE_GAP, stripGapMarks } from "../citations/verify.js";
 import type { FileRow } from "../files/store.js";
 import { keptSegments, type ExtractRunner } from "../files/extract.js";
+import { scrubKnown } from "../secrets/known.js";
 import type { WebCode } from "./service.js";
 
 /**
@@ -19,8 +20,10 @@ import type { WebCode } from "./service.js";
  * the source store masks them again on write.
  */
 
+/** `title`: the document's metadata title (known secrets masked), when it has one. */
 export type PdfText =
-  { ok: true; text: string; truncated: boolean; unread: boolean } | { ok: false; code: WebCode };
+  | { ok: true; text: string; truncated: boolean; unread: boolean; title?: string }
+  | { ok: false; code: WebCode };
 /** `signal`: the calling run was stopped — a waiting read never starts, a running extraction is stopped. */
 export type PdfReader = (bytes: Buffer, signal?: AbortSignal) => Promise<PdfText>;
 
@@ -113,7 +116,8 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
         unread = true;
       }
       const text = parts.every((p) => p === PAGE_GAP) ? "" : parts.join("\n\n");
-      return { ok: true, text, truncated: r.truncated || unread, unread };
+      const title = typeof r.title === "string" ? scrubKnown(r.title).replace(/\s+/g, " ").trim() : "";
+      return { ok: true, text, truncated: r.truncated || unread, unread, ...(title ? { title } : {}) };
     } catch {
       return { ok: false, code: "web_unavailable" };
     } finally {

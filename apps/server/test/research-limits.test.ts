@@ -74,7 +74,7 @@ function grayPng(size = 64): Buffer {
  * A synthetic PDF made here with pdfkit (pinned, already a dependency): one page per entry, Korean font embedded — a
  * text, or `{ scan: true }` for a page that is only a picture.
  */
-async function makePdf(pages: (string | { scan: true })[]): Promise<Buffer> {
+async function makePdf(pages: (string | { scan: true })[], o: { title?: string } = {}): Promise<Buffer> {
   const require = createRequire(import.meta.url);
   const PDFDocument = (await import(require.resolve("pdfkit"))).default as new (o?: object) => {
     registerFont(n: string, f: string): void;
@@ -86,7 +86,7 @@ async function makePdf(pages: (string | { scan: true })[]): Promise<Buffer> {
     on(e: string, f: (c?: Buffer) => void): void;
     end(): void;
   };
-  const doc = new PDFDocument({ autoFirstPage: true });
+  const doc = new PDFDocument({ autoFirstPage: true, ...(o.title ? { info: { Title: o.title } } : {}) });
   doc.registerFont("R", docLibraries().fonts.regular);
   doc.font("R");
   doc.fontSize(11);
@@ -187,6 +187,23 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const [row] = f.sources.list(f.c.id);
     expect(row).toMatchObject({ kind: "page", contentType: "application/pdf" });
     expect(row!.body).toContain("수시모집 원서 접수는 2026년 9월 8일부터 12일까지 진행된다.");
+  });
+
+  it("a PDF is named by its own metadata title, else by its file name (review #237 13차)", async () => {
+    const reader = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const titled = await makePdf(["연구 보고서 본문이다."], { title: "  Annual   Research Report " });
+    const plain = await makePdf(["연구 보고서 본문이다."]);
+    fx.routes.set("/a/download.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
+    fx.routes.set("/b/download.pdf", { headers: { "content-type": "application/pdf" }, body: plain });
+    const f = family();
+    const { call } = service(f, reader);
+    expect((await call("web_fetch", { url: "http://public.test/a/download.pdf" })).body).toMatchObject({
+      title: "Annual Research Report",
+    });
+    expect((await call("web_fetch", { url: "http://public.test/b/download.pdf" })).body).toMatchObject({
+      title: "download.pdf",
+    });
+    expect(f.sources.list(f.c.id).map((r) => r.title)).toEqual(["Annual Research Report", "download.pdf"]);
   });
 
   it("without a reader a PDF is refused as before; a broken PDF is bad content; a PDF without text has no text", async () => {
