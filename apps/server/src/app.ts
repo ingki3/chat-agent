@@ -944,7 +944,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         })),
       // The conversation's sources for the cited-source references (#53): only ids `cite` knows, with whether their
       // text is stored.
-      contextSources: (conversationId) => sources.citable(conversationId),
+      contextSources: (conversationId, ids) => sources.citable(conversationId, ids),
       // A follow-up writing an earlier answer's file citation number again (#186): checked against the file now.
       fileRecheck: (scope, input) => fileTools.recheck(scope, input),
       ...opts.runs,

@@ -446,10 +446,53 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(f.sources.recentFor(f.scope, 3)!.every((x) => !("body" in x))).toBe(true);
   });
 
+  it("has-text without the hash (a row from before) is still text; citable and listByIds take only the ids asked", () => {
+    const f = family();
+    const page = f.sources.addPage(f.scope, {
+      url: "http://public.test/old",
+      finalUrl: "http://public.test/old",
+      title: "옛 행",
+      site: "public.test",
+      contentType: "text/html",
+      body: "본문이 있는 옛 행이다.",
+      truncated: false,
+    })!;
+    const other = f.sources.addPage(f.scope, {
+      url: "http://public.test/other",
+      finalUrl: "http://public.test/other",
+      title: "다른 행",
+      site: "public.test",
+      contentType: "text/html",
+      body: "다른 본문이다.",
+      truncated: false,
+    })!;
+    // As a row stored before hashes were kept.
+    f.db.$client.prepare("update sources set body_hash = null where id = ?").run(page.id);
+    const search = f.sources.addSearchResult(f.scope, {
+      provider: "x",
+      url: "http://public.test/s",
+      title: "검색",
+      site: "public.test",
+    })!;
+    const listed = new Map(f.sources.recentFor(f.scope, 10)!.map((r) => [r.id, r.hasBody]));
+    expect([listed.get(page.id), listed.get(other.id), listed.get(search.id)]).toEqual([true, true, false]);
+    const cited = f.sources.citable(f.c.id, [page.id, search.id, "nope"]);
+    expect([...cited.entries()]).toEqual([
+      [page.id, { text: true }],
+      [search.id, { text: false }],
+    ]);
+    expect(f.sources.citable(f.c.id, []).size).toBe(0);
+    // Ids beyond SQLite's bound-variable limit: one JSON parameter, conversation-scoped, rowid order.
+    const many = new Set([other.id, ...Array.from({ length: 40_000 }, (_, i) => `x${i}`), page.id]);
+    expect(f.sources.listByIds(f.c.id, many).map((r) => r.id)).toEqual([page.id, other.id]);
+    expect(f.sources.listByIds("another-conversation", many)).toEqual([]);
+  });
+
   it("the sources_list query uses its index in rowid order (no sort) and never names the text column", () => {
     const f = family();
     const q = f.sources.recentQuery(f.scope, 100).toSQL();
-    expect(q.sql).not.toMatch(/"body"/);
+    // The text column appears only inside octet_length (taken from the record header, not the value).
+    expect(q.sql.replace(/octet_length\((?:"sources"\.)?"body"\)/g, "")).not.toMatch(/"body"/);
     const plan = (
       f.db.$client.prepare(`EXPLAIN QUERY PLAN ${q.sql}`).all(...(q.params as unknown[])) as {
         detail: string;

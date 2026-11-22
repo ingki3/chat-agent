@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   CSRF_HEADER,
@@ -29,6 +29,7 @@ import {
   type CitationScenarioName,
 } from "../src/runtime/fake-citations.js";
 import { RunManager } from "../src/runtime/runs.js";
+import { SourceStore } from "../src/web/sources.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { projectPart } from "../src/shares/projection.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
@@ -393,6 +394,31 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const twoParagraphs = await send(f.cookies.owner, c4.id, "/recap-two");
     expect(statuses(twoParagraphs)).toEqual([[1, "verified"]]);
     expect(missingText(twoParagraphs)).toEqual(["반도체 가격도 두 배가 됐어요."]);
+  });
+
+  it("#234: a run's references look up only the sources its history cites", async () => {
+    const { app, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "/cite conflict");
+    const cited = new Set(
+      (
+        app.conversations!.messages(c.id, { limit: 50 }).flatMap((m) => m.parts) as {
+          type: string;
+          citations?: { sourceId: string | null }[];
+        }[]
+      )
+        .filter((p) => p.type === "citation_note")
+        .flatMap((p) => p.citations!.flatMap((x) => (x.sourceId ? [x.sourceId] : []))),
+    );
+    expect(cited.size).toBeGreaterThan(0);
+    const spy = vi.spyOn(SourceStore.prototype, "citable");
+    await send(f.cookies.owner, c.id, "고마워요");
+    expect(spy).toHaveBeenCalled();
+    for (const call of spy.mock.calls) {
+      expect(call[1]).toBeDefined();
+      for (const id of call[1]!) expect(cited.has(id)).toBe(true);
+    }
+    spy.mockRestore();
   });
 
   it("#234: web_find makes the numbers this run's and its answer one that uses web sources", async () => {

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
@@ -65,6 +65,13 @@ export function pdfTitle(u: URL): string | undefined {
   }
   return cut(cleanTitle(name), SOURCE_LIMITS.title) || undefined;
 }
+
+/**
+ * Whether a row stores a page's text, without reading the text (review #237 19·20차): its hash (every text stored by
+ * `addPage` has one), or — a row from before with text but no hash — the text's byte length, which SQLite takes from
+ * the record header without loading the value.
+ */
+const HAS_TEXT = sql<number>`(${sources.bodyHash} is not null or octet_length(${sources.body}) is not null)`;
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
@@ -247,11 +254,21 @@ export class SourceStore {
    * Which ids are this conversation's sources and whether `cite` can check a passage against their stored text
    * (#53: the references a fresh session gets). Ids and flags only — no page text is read.
    */
-  citable(conversationId: string): Map<string, { text: boolean }> {
+  citable(conversationId: string, ids?: readonly string[]): Map<string, { text: boolean }> {
+    // Only the ids asked for (the history's citations — review #237 20차), and whether each has text without
+    // reading it (`HAS_TEXT`).
+    if (ids && !ids.length) return new Map();
     const rows = this.db
-      .select({ id: sources.id, kind: sources.kind, hasBody: sql<number>`${sources.body} is not null` })
+      .select({ id: sources.id, kind: sources.kind, hasBody: HAS_TEXT })
       .from(sources)
-      .where(eq(sources.conversationId, conversationId))
+      .where(
+        ids
+          ? and(
+              eq(sources.conversationId, conversationId),
+              sql`${sources.id} in (select value from json_each(${JSON.stringify(ids)}))`,
+            )
+          : eq(sources.conversationId, conversationId),
+      )
       .all();
     return new Map(rows.map((r) => [r.id, { text: r.kind === "page" && r.hasBody === 1 }]));
   }
@@ -288,9 +305,7 @@ export class SourceStore {
         bodyHash: sources.bodyHash,
         truncated: sources.truncated,
         snippet: sources.snippet,
-        // Whether a page's text is stored, without reading it: every stored text has its hash (`addPage`), a row
-        // without text has none (search results, a fork's copies) — review #237 19차.
-        hasBody: sql<number>`${sources.bodyHash} is not null`,
+        hasBody: HAS_TEXT,
       })
       .from(sources)
       .where(and(eq(sources.conversationId, scope.conversationId), eq(sources.userId, scope.userId)))
@@ -318,10 +333,16 @@ export class SourceStore {
    */
   listByIds(conversationId: string, ids: ReadonlySet<string>): SourceRow[] {
     if (!ids.size) return [];
+    // One JSON parameter, however many ids (review #237 20차: one bound variable per id stops at 32,766).
     return this.db
       .select()
       .from(sources)
-      .where(and(eq(sources.conversationId, conversationId), inArray(sources.id, [...ids])))
+      .where(
+        and(
+          eq(sources.conversationId, conversationId),
+          sql`${sources.id} in (select value from json_each(${JSON.stringify([...ids])}))`,
+        ),
+      )
       .orderBy(sql`rowid`)
       .all()
       .map((r) => scrubKnownDeep(r));

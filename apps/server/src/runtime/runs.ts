@@ -69,6 +69,7 @@ import { FINANCE_CHART_TOOL } from "@agentlee/mcp-tools/finance";
 import { SummaryStore } from "../conversations/summaries.js";
 import {
   attachmentLines,
+  citedSourceIds,
   citedSources,
   contextHistory,
   contextWindowOf,
@@ -387,7 +388,8 @@ export type RunManagerOptions = {
    * The conversation's sources (#53), by id: whether `cite` can check a passage against the stored text. A cited
    * source the conversation does not have is not referenced. Without it no source is referenced.
    */
-  contextSources?: (conversationId: string) => ReadonlyMap<string, { text: boolean }>;
+  /** Whether each of `ids` (sources the history cites) is this conversation's and has text. */
+  contextSources?: (conversationId: string, ids: readonly string[]) => ReadonlyMap<string, { text: boolean }>;
   /**
    * An earlier answer's file citation checked again for a follow-up that writes its number again (#186,
    * `FileTools.recheck`). Without it file citations are not carried over (they stay `unknown_source`).
@@ -1533,7 +1535,9 @@ export class RunManager {
     }
     let sources: ContextReferences["sources"] = [];
     try {
-      const stored = this.opts.contextSources?.(conversationId);
+      // Only the sources the history cites are looked up (review #237 20차).
+      const cited = citedSourceIds(context.history);
+      const stored = this.opts.contextSources?.(conversationId, cited);
       if (stored) sources = citedSources(context.history, (id) => stored.get(id));
     } catch {
       // none rather than no reply
