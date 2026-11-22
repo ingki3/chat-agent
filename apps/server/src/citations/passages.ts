@@ -193,7 +193,8 @@ export function findPassages(
   const want = flatMap(query).s;
   // The query's words folded as the page's are (`fold` — the final sigma too, review #237 8차).
   const terms = [...new Set(termsOf(fold(query)))].filter((t) => t.length > 0);
-  if (!want || !terms.length) return { total: 0, passages: [] };
+  // A query without words (`📅`, a symbol) is still a phrase to find; the keyword search needs words.
+  if (!want) return { total: 0, passages: [] };
   // The marks' ranges once per search (review #237 6차), each check a binary search.
   const ranges = opts.gaps === true ? gapRanges(text) : [];
   const gap = (a: number, b: number) => ranges.length > 0 && overlapsAny(ranges, a, b);
@@ -218,6 +219,7 @@ export function findPassages(
   }
   // The words, sentence by sentence.
   for (const [i, r] of sentences.entries()) {
+    if (!terms.length) break;
     if (phrased.has(i) || gap(r.start, r.end)) continue;
     const s = flat(text.slice(r.start, r.end));
     const words = new Set(termsOf(s));
@@ -277,11 +279,11 @@ function withContext(
     let start = Math.max(own.start, match.start - Math.floor(room / 2));
     const end = Math.min(own.end, Math.max(match.end, start + FIND_PASSAGE_CHARS));
     start = Math.max(own.start, Math.min(start, end - FIND_PASSAGE_CHARS));
-    // Both edges on code points (never half a surrogate pair).
-    return {
-      start: codePointCut(text, Math.min(start, match.start)),
-      end: codePointCut(text, Math.max(end, match.end)),
-    };
+    // Both edges on code points (never half a surrogate pair), and the cap applied again once the start moved
+    // (review #237 9차): at most `FIND_PASSAGE_CHARS` unless the match alone is longer; the match always whole.
+    const from = codePointCut(text, Math.min(start, match.start));
+    const to = codePointCut(text, Math.max(match.end, Math.min(end, from + FIND_PASSAGE_CHARS)));
+    return { start: from, end: Math.max(to, match.end) };
   }
   const blocked = (r: Range | undefined) => !r || gap(r.start, r.end);
   let start = own.start;

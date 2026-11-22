@@ -1295,17 +1295,23 @@ export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: n
   const key = noteKey;
   const src = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
   const seen = new Set<string>();
-  const all: ResearchNote[] = [];
-  for (const n of [...before, ...after]) {
-    if (seen.has(key(n))) continue;
-    seen.add(key(n));
-    all.push(n);
-  }
+  const dedupe = (xs: ResearchNote[]) =>
+    xs.filter((n) => {
+      if (seen.has(key(n))) return false;
+      seen.add(key(n));
+      return true;
+    });
+  // Deduplicated first, the first run's then the retry's (review #237 9차: a duplicate already in the first run's
+  // notes must not shift where the retry's begin).
+  const first = dedupe(before);
+  const added = dedupe(after);
+  const all = [...first, ...added];
   if (all.length <= max) return all;
-  const old = new Set(before.map(src));
+  // One place for every source the first run did not have, in the retry's order; then the rest in order.
+  const old = new Set(first.map(src));
   const kept = new Set<ResearchNote>();
   const fresh = new Set<string>();
-  for (const n of all.slice(before.length))
+  for (const n of added)
     if (!old.has(src(n)) && !fresh.has(src(n)) && kept.size < max) {
       fresh.add(src(n));
       kept.add(n);

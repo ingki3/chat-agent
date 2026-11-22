@@ -373,3 +373,50 @@ describe("review #237 8차", () => {
     }
   });
 });
+
+describe("review #237 9차", () => {
+  const k = (id: string, sourceId: string, sourceKey: string, quote: string): ResearchNote => ({
+    id,
+    claim: id,
+    quote,
+    sourceId,
+    sourceKey,
+  });
+
+  it("a duplicate already in the first run's notes does not cost a new source its place", () => {
+    // Eleven distinct notes of A and one duplicate of them (an old checkpoint), then B and C from the retry.
+    const before = [
+      ...Array.from({ length: 11 }, (_, i) => k(`a${i}`, "A", "u:A", `구절 ${i}`)),
+      k("a-dup", "A", "u:A", "구절  3"),
+    ];
+    const merged = mergeNotes(before, [k("b", "B", "u:B", "B 구절"), k("c", "C", "u:C", "C 구절")], 12);
+    expect(merged).toHaveLength(12);
+    expect(merged.filter((n) => n.sourceId === "B").map((n) => n.id)).toEqual(["b"]);
+    expect(merged.filter((n) => n.sourceId === "C").map((n) => n.id)).toEqual(["c"]);
+    expect(merged.filter((n) => n.sourceId === "A")).toHaveLength(10);
+    expect(merged.map((n) => n.id)).not.toContain("a-dup");
+  });
+
+  it("the centred cut stays within 700 when its start moves back for a surrogate pair", () => {
+    // A phrase across the 400-character split of a long sentence without spaces (so the centred cut applies), 📅 put
+    // where the cut's start lands between its halves (a = 49 before the fix: 701 characters).
+    for (let a = 0; a <= 396; a++) {
+      const body = `${"가".repeat(a)}📅${"다".repeat(396 - a)}목표구절${"라".repeat(500)}`;
+      for (const p of findPassages(body, "목표구절", 5).passages) {
+        expect(p.end - p.start, `${a}`).toBeLessThanOrEqual(700);
+        expect(p.text.isWellFormed()).toBe(true);
+        expect(p.text).toContain("목표구절");
+      }
+    }
+  });
+
+  it("a query without words (📅, ★) is still found as a phrase", () => {
+    const body = "회의 날짜는 📅 표시로 알린다. 중요한 곳은 ★ 표시다.";
+    const cal = findPassages(body, "📅", 5);
+    expect(cal.total).toBe(1);
+    expect(cal.passages[0]!.phrase).toBe(true);
+    expect(cal.passages[0]!.text).toContain("📅");
+    expect(findPassages(body, "★", 5).passages[0]!.text).toContain("★");
+    expect(findPassages(body, "🎉", 5)).toEqual({ total: 0, passages: [] });
+  });
+});
