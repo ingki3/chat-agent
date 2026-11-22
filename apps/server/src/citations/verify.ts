@@ -430,6 +430,14 @@ function pageOf(body: string, key: string | undefined): Page {
  */
 export const PAGE_GAP = "[읽지 못한 쪽]";
 
+/** Whether `[start, end)` of `body` overlaps any `PAGE_GAP` mark, even one character of it. */
+export function touchesGap(body: string, start: number, end: number): boolean {
+  const from = Math.max(0, start - PAGE_GAP.length + 1);
+  for (let at = body.indexOf(PAGE_GAP, from); at !== -1 && at < end; at = body.indexOf(PAGE_GAP, at + 1))
+    if (at + PAGE_GAP.length > start) return true;
+  return false;
+}
+
 export type SnippetMatch =
   { found: true; quote: string } | { found: false; reason: "too_short" | "not_found" };
 
@@ -488,8 +496,8 @@ function matchIn(
     if (before !== "" && before !== " " && !BOUNDARY_PUNCT.test(before)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
-    // Never across (or out of) a page that was not read (#234, review #237 2차).
-    if (body.slice(start, end).includes(PAGE_GAP)) continue;
+    // Never on any part of the mark of a page that was not read, nor across it (#234, review #237 2·3차).
+    if (touchesGap(body, start, end)) continue;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
     // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).

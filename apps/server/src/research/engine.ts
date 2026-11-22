@@ -179,8 +179,6 @@ const MIN_WRITE_MS = 30_000;
 const REFLECT_MS = 90_000;
 /** Unverified claims kept per sub-question (for its retry and the lead's reflection). */
 const UNVERIFIED_KEPT = 5;
-/** Characters of one unverified claim kept (claims are at most 500 — `parseNotes`). */
-const UNVERIFIED_CHARS = 300;
 /**
  * Runtime failures a weak sub-question is retried after (#234): a passing error. The account's state — its login,
  * its usage, its connection, its permission, the conversation switched — would only fail again.
@@ -752,7 +750,12 @@ export class ResearchEngine {
             // (review #237 2차: a fourth one queued behind three, or one resumed after a restart). A retry then keeps
             // what its first run found; a gap question stays unasked (the report says the time ran out).
             if ((q.retried || q.round > 0) && researchEnd - this.clock.now() < this.limits.minRoundMs) {
+              // Why it was not (re)searched (review #237 3차): the report counts it under the time limit, not as
+              // a question without evidence.
+              q.skipped = "time";
               if (q.retried) q.status = q.found.length ? "done" : "capped";
+              else q.status = "capped";
+              state.timedOut = true;
               return;
             }
             const ctx = fresh();
@@ -898,8 +901,10 @@ export class ResearchEngine {
     state.stage = "write";
     // Nothing verified: the job fails with how the questions' last runs ended — an account's state first (a retry
     // that ended `runtime_auth` after a passing `runtime_error` reports the login, review #237 2차).
+    // Only the last runs count (review #237 3차): retries that all ended cleanly with nothing leave no error — the
+    // writer then ends the job as `no_findings`.
     const last = state.questions.flatMap((q) => (q.failure ? [q.failure] : []));
-    error = last.find((c) => !RETRYABLE.has(c)) ?? last[0] ?? error;
+    error = last.find((c) => !RETRYABLE.has(c)) ?? last[0];
     if (error && !allNotes(state).length) return void this.fail(row.id, error, live);
     this.save(row.id, { status: "writing", state }, ["researching"], live);
   }
@@ -1115,7 +1120,10 @@ export class ResearchEngine {
     const conv = conversations.get(row.conversationId);
     // Stopped (or gone) meanwhile: no artifact, no message. Nothing below awaits, so no stop can come in between.
     if (!conv || this.get(row.id)?.status !== "writing") return;
-    const unanswered = state.questions.filter((q) => !q.found.length).map((q) => q.question);
+    // A question skipped for lack of time is under the time limit (`timedOut`), not "no evidence found" (#234).
+    const unanswered = state.questions
+      .filter((q) => !q.found.length && q.skipped !== "time")
+      .map((q) => q.question);
     const content = renderReport({
       title: plan.title,
       date: seoulDate(new Date(this.clock.now())),
@@ -1275,8 +1283,9 @@ export function mergeUnverified(
   failed: readonly string[],
   verified: readonly ResearchNote[],
 ): string[] {
-  // One key for the same claim however it was cut or spaced: normalised, then the length a kept claim has.
-  const key = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim().slice(0, UNVERIFIED_CHARS);
+  // One key for the same claim however it was spaced — the whole claim (review #237 3차: two claims that differ
+  // only past their first 300 characters are two claims). Prompts cut it for display only.
+  const key = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim();
   const backed = new Set(verified.map((n) => key(n.claim)));
   const seen = new Set<string>();
   const out: string[] = [];

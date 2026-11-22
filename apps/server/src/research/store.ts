@@ -46,8 +46,10 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
   unverified?: string[] | undefined;
   /** Notes kept because their quote was repaired to the page's own passage (`closestPassage`). */
   repaired?: number | undefined;
-  /** Why its last run failed without a note (a runtime error code): a passing one may be retried (#234). */
+  /** How its last run ended when it failed (a runtime error code): a passing one may be retried (#234). */
   failure?: ResearchErrorCode | undefined;
+  /** It was not (re)searched because too little time was left when its turn came (#234). */
+  skipped?: "time" | undefined;
 };
 
 /** The checkpoint (`research_jobs.state`): written after every step. */

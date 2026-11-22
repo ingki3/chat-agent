@@ -1,5 +1,5 @@
 import { CITATION_LIMITS } from "@agentlee/shared";
-import { KOREAN_PARTICLES, normalizeSnippet, normalizeWithMap, PAGE_GAP } from "./verify.js";
+import { KOREAN_PARTICLES, normalizeSnippet, normalizeWithMap, PAGE_GAP, touchesGap } from "./verify.js";
 
 /**
  * Passages of a stored page text (#234): its sentences, and the words they share with a query. Two users:
@@ -124,7 +124,7 @@ export function findPassages(
   const hits: { i: number; score: number; phrase: boolean }[] = [];
   for (const [i, r] of sentences.entries()) {
     // The mark of a page that was not read is no text of the page.
-    if (text.slice(r.start, r.end).includes(PAGE_GAP)) continue;
+    if (touchesGap(text, r.start, r.end)) continue;
     const s = flat(text.slice(r.start, r.end));
     const phrase = s.includes(want);
     const words = new Set(termsOf(s));
@@ -154,7 +154,7 @@ function withContext(text: string, sentences: Range[], i: number): Range {
     const cut = text.lastIndexOf(" ", own.start + FIND_PASSAGE_CHARS);
     return { start: own.start, end: cut > own.start ? cut : own.start + FIND_PASSAGE_CHARS };
   }
-  const gap = (r: Range | undefined) => !r || text.slice(r.start, r.end).includes(PAGE_GAP);
+  const gap = (r: Range | undefined) => !r || touchesGap(text, r.start, r.end);
   let start = own.start;
   let end = own.end;
   let back = true;
@@ -179,30 +179,32 @@ export type Closest =
   /** The quote stands in two different places of the page: neither is taken. */
   | { kind: "ambiguous" };
 
+const HANGUL = /^[가-힣]$/u;
+const DIGIT = /^\p{Nd}$/u;
+/** A space here may be added or left out: between a digit and a Hangul syllable (`10 월` / `10월`, `3 개`). */
+const looseSpace = (a: string | undefined, b: string | undefined) =>
+  !!a && !!b && ((DIGIT.test(a) && HANGUL.test(b)) || (HANGUL.test(a) && DIGIT.test(b)));
+
 /**
- * The quote in the form the repair compares (review #237 2차 — the coordinator's decision): the citation check's
- * own normalisation (`normalizeWithMap`: NFC, quote marks, dashes, `…` → `...`, whitespace runs; **case kept**, no
- * particle, symbol or hyphen change), and then whitespace dropped **only next to a character that is not a letter**
- * (a digit, a mark: `10 월` = `10월`, `32 %` = `32%`, `밝혔다 .` = `밝혔다.`). Between two letters spacing stays —
- * `아버지 가방에` is not `아버지가 방에`.
+ * The form the repair compares (review #237 3차 — the coordinator's final decision): the citation check's own
+ * normalisation (`normalizeWithMap`: NFC, quote marks, dashes, `…`, whitespace runs; case kept), with a space dropped
+ * **only between a digit and a Hangul syllable**. Every other space stays where it is: between two digits (`1 2 12`
+ * is not `12 1 2`), two letters (`아버지 가방에`), or next to any symbol or punctuation (`x! = y`, `.menu .item`).
  */
 function skeleton(text: string): { s: string; from: number[]; to: number[] } {
   const n = normalizeWithMap(text);
   const out: string[] = [];
   const from: number[] = [];
   const to: number[] = [];
-  const letter = (c: string | undefined) => !!c && /[\p{L}\p{M}]/u.test(c);
   for (let i = 0; i < n.norm.length; i++) {
     const c = n.norm[i]!;
-    if (c === " " && !(letter(n.norm[i - 1]) && letter(n.norm[i + 1]))) continue;
+    if (c === " " && looseSpace(n.norm[i - 1], n.norm[i + 1])) continue;
     out.push(c);
     from.push(n.from[i]!);
     to.push(n.to[i]!);
   }
   return { s: out.join(""), from, to };
 }
-
-const SENTENCE_END = /[.!?。！？]/u;
 
 const SIGNS: Record<string, string> = {
   "+": "+",
@@ -216,8 +218,7 @@ const SIGNS: Record<string, string> = {
 };
 /**
  * The numbers of a text with their sign and what scales them, in order: `%`, `%p`, `‰` or a Korean numeral unit
- * (`−5%` → `-5%`, `142억` → `142억`, `500만원` → `500만`, `1,234 명` → `1234`). A repaired note keeps only a claim whose numbers all stand in
- * the passage with the same sign and unit (`claimFitsPassage`).
+ * (`−5%` → `-5%`, `142억` → `142억`, `500만원` → `500만`, `1,234 명` → `1234`).
  */
 export function numberFacts(text: string): string[] {
   return [
@@ -229,61 +230,73 @@ export function numberFacts(text: string): string[] {
 
 /**
  * Whether a model's claim may stand on a repaired passage: every number of the claim (value, sign, unit) is one of
- * the passage's, and every currency or comparison sign of the claim is in the passage too.
+ * the passage's, and every symbol of the claim (Unicode `S*` — currency, math, modifier and other symbols: `₹`, `≠`,
+ * `$`, `<` …) is in the passage too.
  */
 export function claimFitsPassage(claim: string, passage: string): boolean {
   const have = new Set(numberFacts(passage));
   if (numberFacts(claim).some((f) => !have.has(f))) return false;
-  const signs = (t: string) => new Set(t.normalize("NFKC").match(/[$€£¥₩<>≤≥±]/gu) ?? []);
-  const p = signs(passage);
-  return [...signs(claim)].every((c) => p.has(c));
+  const symbols = (t: string) => new Set(t.normalize("NFC").match(/\p{S}/gu) ?? []);
+  const p = symbols(passage);
+  return [...symbols(claim)].every((c) => p.has(c));
 }
 
+/** A sentence's text as the check normalises it, without its sentence-final marks. */
+const sentenceForm = (t: string) =>
+  normalizeWithMap(t)
+    .norm.trim()
+    .replace(/[.!?。！？]+$/u, "")
+    .trim();
+
 /**
- * The page's own passage for a quote the citation check did not find — **only when the two differ in what the
- * check's normalisation nearly covers** (review #237 1·2차; the claim stays the model's, so the quote may differ in
- * nothing that carries meaning):
- * - whitespace inserted or left out next to a digit or a mark (`skeleton`);
- * - quote, dash and ellipsis glyphs (the check's own folds);
- * - `…` where the model joined two consecutive sentences of the page (the page has a sentence end there).
- * Any other difference — a particle, case, a hyphen inside a word, a currency or comparison sign, a unit, a word —
- * is no match. Not across a PDF page that was not read (`PAGE_GAP`). Two different places: `ambiguous`. The passage
- * is then checked again exactly (`findSnippet`), its token and number edges too.
+ * The page's own passage for a quote the citation check did not find — **only** in two cases (review #237 3차, the
+ * coordinator's final decision; the claim stays the model's, so nothing that carries meaning may differ):
+ * - (a) `…` joining consecutive sentences: the quote, split at `…`, is a sentence-final segment of one sentence and
+ *   then whole sentences, each exactly as the check normalises it, one right after another in the page. A `…` with
+ *   a digit on both sides (`3…5`) is never a join;
+ * - (b) a space added or left out between a digit and a Hangul syllable (`skeleton`) — nothing else differs.
+ * Any other difference is no match. Not across a PDF page that was not read (`PAGE_GAP`). Two different places:
+ * `ambiguous`. The passage is then checked again exactly (`findSnippet`), its token and number edges too.
  */
 export function closestPassage(text: string, quote: string): Closest {
   const q = normalizeSnippet(quote);
   if (Array.from(q.replace(/\s/gu, "")).length < CITATION_LIMITS.minSnippet) return { kind: "none" };
-  const pieces = q
-    .split(/\s*\.{3,}\s*/u)
-    .map((p) => skeleton(p).s)
-    .filter(Boolean);
-  if (!pieces.length) return { kind: "none" };
-  const page = skeleton(text);
   const found = new Set<string>();
-  for (let at = page.s.indexOf(pieces[0]!); at !== -1; at = page.s.indexOf(pieces[0]!, at + 1)) {
-    let end = at + pieces[0]!.length;
-    let ok = true;
-    for (const piece of pieces.slice(1)) {
-      // Joined with `…`: the page ends a sentence right there (the quote's own `.` or the page's).
-      if (!SENTENCE_END.test(page.s[end - 1] ?? "")) {
-        if (!SENTENCE_END.test(page.s[end] ?? "")) {
-          ok = false;
-          break;
-        }
-        end++;
-      }
-      if (!page.s.startsWith(piece, end)) {
-        ok = false;
-        break;
-      }
-      end += piece.length;
-    }
-    if (!ok) continue;
-    const raw = text.slice(page.from[at]!, page.to[end - 1]!);
-    if (raw.includes(PAGE_GAP)) continue;
+  const keep = (start: number, end: number) => {
+    if (touchesGap(text, start, end)) return;
+    const raw = text.slice(start, end);
     const passage = raw.replace(/\s+/gu, " ").trim();
-    if (passage.length > CITATION_LIMITS.snippet) continue;
-    found.add(passage);
+    if (passage.length <= CITATION_LIMITS.snippet) found.add(passage);
+  };
+  if (/\.{3,}/u.test(q)) {
+    if (/\p{Nd}\s*\.{3,}\s*\p{Nd}/u.test(q)) return { kind: "none" };
+    const pieces = q
+      .split(/\s*\.{3,}\s*/u)
+      .map(sentenceForm)
+      .filter(Boolean);
+    if (pieces.length < 2) return { kind: "none" };
+    const sentences = sentenceRanges(text);
+    const forms = sentences.map((r) => sentenceForm(text.slice(r.start, r.end)));
+    for (let i = 0; i + pieces.length <= sentences.length; i++) {
+      const first = forms[i]!;
+      const head = pieces[0]!;
+      // The first piece ends its sentence, starting at a word boundary (or is the whole sentence).
+      if (!first.endsWith(head)) continue;
+      const before = first.slice(0, first.length - head.length);
+      if (before && !/\s$/u.test(before)) continue;
+      if (!pieces.slice(1).every((p, k) => forms[i + 1 + k] === p)) continue;
+      // Where the first piece starts in the page: its sentence's start, past the words before it.
+      const r = sentences[i]!;
+      const own = normalizeWithMap(text.slice(r.start, r.end));
+      const lead = own.norm.length - own.norm.trimStart().length;
+      const at = before ? own.from[lead + before.length]! : 0;
+      keep(r.start + at, sentences[i + pieces.length - 1]!.end);
+    }
+  } else {
+    const want = skeleton(q).s;
+    const page = skeleton(text);
+    for (let at = page.s.indexOf(want); at !== -1; at = page.s.indexOf(want, at + 1))
+      keep(page.from[at]!, page.to[at + want.length - 1]!);
   }
   if (!found.size) return { kind: "none" };
   if (found.size > 1) return { kind: "ambiguous" };

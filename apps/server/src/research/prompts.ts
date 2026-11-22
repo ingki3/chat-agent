@@ -125,7 +125,7 @@ export function subagentTurn(input: {
           : []),
         ...(input.retry.unverified.length
           ? [
-              `원문에서 확인하지 못한 주장 (그 주장을 실제로 쓴 원문을 찾으면 그 구절로 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${c}`).join("\n") })}`,
+              `원문에서 확인하지 못한 주장 (그 주장을 실제로 쓴 원문을 찾으면 그 구절로 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
             ]
           : []),
       ]
@@ -184,7 +184,7 @@ export function reflectTurn(input: {
     `확인된 노트:\n${notesBlock(input.notes)}`,
     ...(input.unverified?.length
       ? [
-          `원문에서 확인하지 못해 뺀 주장 (중요하면 그 주장을 확인할 보강 질문을 만든다):\n${frameExternal({ source: "research-unverified", content: input.unverified.map((c) => `- ${c}`).join("\n") })}`,
+          `원문에서 확인하지 못해 뺀 주장 (중요하면 그 주장을 확인할 보강 질문을 만든다):\n${frameExternal({ source: "research-unverified", content: input.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
         ]
       : []),
   ].join("\n\n");

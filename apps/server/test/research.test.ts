@@ -1238,7 +1238,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
                   ref: "{{$0.sourceId}}",
                   // Only the form differs: a comma, spacing, quote marks and a particle the page does not have.
                   quote:
-                    "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32 % 늘어난 142억 달러로 집계됐다고 밝혔다”",
+                    "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
                 },
                 { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
                 // Other figures than the page's: never repaired.
@@ -1375,6 +1375,12 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
         "올해 지원 기준은 소득 < 500만원이다.",
         "이 기체의 성분은 CO 라고 밝혔다.",
         "We agreed to resign today.",
+        "선수들의 출발 순서는 1 2 12 순이다.",
+        "허용 길이는 3.5미터이다.",
+        "수식의 조건은 x! = y 이다.",
+        "The selector is .menu .item in this stylesheet.",
+        "표시 가격은 50 이상이다.",
+        "측정값은 기준값 50 부근이다.",
       ].join("\n"),
     };
     // Review #237 1·2차: each was "repaired" to the page's sentence and kept with the model's altered claim.
@@ -1387,22 +1393,29 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       { claim: "소득 500만원 초과가 지원 대상이다", quote: "올해 지원 기준은 소득 > 500만원이다" },
       { claim: "성분은 코발트(Co)다", quote: "이 기체의 성분은 Co 라고 밝혔다" },
       { claim: "They agreed to sign again today", quote: "We agreed to re-sign today" },
+      // Review #237 3차.
+      { claim: "12번 선수가 먼저 출발한다", quote: "선수들의 출발 순서는 12 1 2 순이다" },
+      { claim: "허용 길이는 3에서 5미터다", quote: "허용 길이는 3…5미터이다" },
+      { claim: "x와 y는 달라야 한다", quote: "수식의 조건은 x != y 이다" },
+      { claim: "두 클래스가 모두 있어야 적용된다", quote: "The selector is .menu.item in this stylesheet" },
+      { claim: "표시 가격은 ₹50 이상이다", quote: "표시 가격은 50이상이다" },
+      { claim: "측정값은 ≠ 50 이다", quote: "측정값은 기준값 50부근이다" },
     ];
-    const script = scripted((x) =>
-      x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
-        ? [
-            { call: "web_fetch", input: { url: page.url } },
-            { call: "web_fetch", input: { url: A.url } },
-            {
-              textRefs: notes(...inverted.map((n) => ({ ...n, ref: "{{$0.sourceId}}" })), {
-                claim: "메모리 가격 회복이 이끌었다",
-                ref: "{{$1.sourceId}}",
-                quote: RESEARCH_FIXTURE.memory,
-              }),
-            },
-          ]
-        : undefined,
-    );
+    // Twelve notes a run at most: the first eight in the first run, the rest in the (one-source) retry.
+    const script = scripted((x) => {
+      if (!x.startsWith(TURN_MARK.subagent) || !/배경/.test(x)) return undefined;
+      const mine = x.includes(RETRY_MARK) ? inverted.slice(8) : inverted.slice(0, 8);
+      return [
+        { call: "web_fetch", input: { url: page.url } },
+        { call: "web_fetch", input: { url: A.url } },
+        {
+          textRefs: notes(
+            { claim: "메모리 가격 회복이 이끌었다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.memory },
+            ...mine.map((n) => ({ ...n, ref: "{{$0.sourceId}}" })),
+          ),
+        },
+      ];
+    });
     const t = await start({ script, pages: [page] });
     const { job } = await begin(t);
     await statusIs(t.app, job.id, "awaiting_approval");
@@ -1496,6 +1509,22 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     const failed = await statusIs(t.app, job.id, "failed");
     expect(failed.errorCode).toBe("runtime_auth");
+  });
+
+  it("nothing verified and every retry ended cleanly: the job ends as no_findings, not the first runtime error", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? x.includes(RETRY_MARK)
+          ? [{ text: "DONE" }]
+          : [{ fail: "boom" }]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(failed.errorCode).toBe("no_findings");
   });
 
   it("time is checked again after the reflection: no new round, or no extra round, that no longer fits", async () => {
@@ -1612,7 +1641,18 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       .prepare("update research_jobs set state = ?, approved_at = ? where id = ?")
       .run(JSON.stringify(state), approvedAt, job.id);
     const t2 = await start({ db, family: false });
-    await statusIs(t2.app, job.id, "done", "failed");
+    const end = await statusIs(t2.app, job.id, "done", "failed");
     expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    // Skipped for lack of time (review #237 3차): under the time limit, not "근거를 찾지 못한 하위 질문".
+    const after = JSON.parse(end.state) as {
+      timedOut: boolean;
+      questions: { id: string; skipped?: string }[];
+    };
+    expect(after.timedOut).toBe(true);
+    expect(after.questions.find((q) => q.id === "r3q1")!.skipped).toBe("time");
+    expect(end.status).toBe("done");
+    const report = t2.app.artifacts!.version(JSON.parse(end.result!).artifactId, 1)!.content;
+    expect(report).not.toContain("늦은 보강 질문");
+    expect(JSON.parse(end.result!)).toMatchObject({ timedOut: true });
   });
 });
