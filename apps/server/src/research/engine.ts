@@ -67,7 +67,7 @@ import {
   type ResearchStore,
   type UnverifiedClaim,
   claimKeyOf,
-  pageKeyOf,
+  contentKeyOf,
 } from "./store.js";
 
 /**
@@ -720,18 +720,16 @@ export class ResearchEngine {
   }
 
   /**
-   * Each web note's page and kind from its source row **as stored now** (review #237 16차): a row refreshed by a later
-   * fetch (another final address) moves its notes with it, so two rows that now end at one page count once —
-   * whatever key a note carried before.
+   * Each web note's source identity and kind from its own (never changed) source row (review #237 16·17차): the
+   * content (`contentKeyOf` — the stored body's hash), so rows of one body count once whatever addresses they have.
    */
   private refreshPages(row: ResearchJobRow, notes: ResearchNote[]): void {
     for (const n of notes) {
       if (!n.sourceId) continue;
       const src = this.deps.sources.get(row.conversationId, n.sourceId);
       if (!src) continue;
-      const at = src.finalUrl ?? src.url;
-      n.sourceKey = pageKeyOf(at);
-      n.sourceType = sourceTypeOf(at);
+      n.sourceKey = contentKeyOf(src);
+      n.sourceType = sourceTypeOf(src.finalUrl ?? src.url);
     }
   }
 
@@ -1003,8 +1001,9 @@ export class ResearchEngine {
               sourceId: r.source.id,
               title: r.source.title,
               sourceType: sourceTypeOf(r.source.finalUrl ?? r.source.url),
-              // One page however it was reached (a redirect's URL and its final URL are two source rows).
-              sourceKey: pageKeyOf(r.source.finalUrl ?? r.source.url),
+              // One source however it was reached: its content (two rows of one body — a redirect, the same PDF at
+              // two addresses — are one, review #237 17차).
+              sourceKey: contentKeyOf(r.source),
             };
         } else if (n.fileId && files.has(n.fileId) && this.deps.fileTools) {
           const f = this.deps.fileTools.fileFor(scope, n.fileId);

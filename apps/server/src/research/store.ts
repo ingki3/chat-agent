@@ -32,8 +32,8 @@ export type ResearchNote = {
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
   /**
-   * Which page it rests on, however it was fetched (`pageKeyOf` of the final URL — a redirect's URL and the final
-   * URL are two source rows of one page): what `sourceCount` counts (#234).
+   * Which source it rests on, however it was fetched (`contentKeyOf` — the stored body's hash: rows of one body are one
+   * source): what `sourceCount` counts (#234).
    */
   sourceKey?: string | undefined;
   /** The identity of its claim (`claimKeyOf` of the whole claim as written) — never shown. */
@@ -130,6 +130,18 @@ export const fileIdsOf = (row: ResearchJobRow): string[] => {
     return [];
   }
 };
+
+/**
+ * A web source's identity for counting (#234, review #237 17차): its stored body's hash — the same text however it
+ * was reached (a redirect, a changed redirect target, the same PDF at two addresses) — else its final address.
+ */
+export function contentKeyOf(src: {
+  bodyHash?: string | null;
+  finalUrl?: string | null;
+  url: string;
+}): string {
+  return src.bodyHash ? `b:${src.bodyHash}` : pageKeyOf(src.finalUrl ?? src.url);
+}
 
 /** A page's identity across source rows: its final URL without the fragment, host in lower case (#234). */
 export function pageKeyOf(url: string): string {

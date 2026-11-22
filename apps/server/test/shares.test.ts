@@ -374,6 +374,42 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
     expect((await w.stranger.get(`/api/shared-with-me`)).json().items).toEqual([]);
   });
 
+  it("#234: a later fetch of a cited page never changes what a snapshot or the references show", async () => {
+    const w = await snapshotWorld();
+    const { viewer, c } = w;
+    citeInNotes(w);
+    const before = await viewer.get(`/api/conversations/${c.id}/references?style=apa`);
+    const beforeTxt = await viewer.get(`/api/conversations/${c.id}/references/download?style=apa&format=txt`);
+    // The owner's next turn fetches the same address again: it now ends elsewhere and has another title.
+    const again = new SourceStore(w.db).addPage(
+      { userId: w.f.users.owner.id, conversationId: c.id, runId: "later" },
+      {
+        url: "https://a.example/1",
+        finalUrl: "https://a.example/moved",
+        title: "바뀐 제목",
+        site: "moved.example",
+        contentType: "text/html",
+        body: "사과는 빨갛고 둥근 과일이며 여름에 많이 난다고 한다.",
+        truncated: false,
+      },
+    )!;
+    expect(again.id).not.toBe(w.s1);
+    const row = new SourceStore(w.db).get(c.id, w.s1)!;
+    expect([row.finalUrl, row.title]).toEqual(["https://a.example/1", "https://a.example/1"]);
+    const after = await viewer.get(`/api/conversations/${c.id}/references?style=apa`);
+    expect(after.json()).toEqual(before.json());
+    const afterTxt = await viewer.get(`/api/conversations/${c.id}/references/download?style=apa&format=txt`);
+    expect(afterTxt.body).toBe(beforeTxt.body);
+    expect(afterTxt.body).not.toContain("moved");
+    // The snapshot's messages still name the original page.
+    const res = await viewer.get(`/api/conversations/${c.id}/messages`);
+    expect(res.statusCode).toBe(200);
+    const msgs = JSON.stringify(res.json());
+    expect(msgs).toContain("https://a.example/1");
+    expect(msgs).not.toContain("바뀐 제목");
+    expect(msgs).not.toContain("a.example/moved");
+  });
+
   it("the reference export (#26) of a shared viewer lists what their projection cites only", async () => {
     const w = await snapshotWorld();
     const { viewer, owner, c } = w;

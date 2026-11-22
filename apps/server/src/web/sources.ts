@@ -120,6 +120,10 @@ export class SourceStore {
     // A fetched page never stores a known secret (review round 23) — e.g. a key the model put in the URL.
     const p = scrubKnownDeep(raw);
     const bodyHash = sha256(p.body);
+    // A row is never changed once stored (review #237 17차 — citations, share snapshots and references read it): the
+    // same row again only for the very same fetch — request and final address, body, title and type. Anything else
+    // is a new row (a new source id) with what this fetch found.
+    const title = cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title);
     const same = this.db
       .select()
       .from(sources)
@@ -129,21 +133,13 @@ export class SourceStore {
           eq(sources.kind, "page"),
           eq(sources.url, p.url),
           eq(sources.bodyHash, bodyHash),
+          eq(sources.finalUrl, p.finalUrl),
+          eq(sources.title, title),
+          eq(sources.contentType, p.contentType),
         ),
       )
       .get();
-    // The same page again (review #237 16차): the latest fetch wins — its final address and its title — the id kept.
-    if (same)
-      return this.db
-        .update(sources)
-        .set({
-          finalUrl: p.finalUrl,
-          title: cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title),
-          site: cut(p.site, SOURCE_LIMITS.site),
-        })
-        .where(eq(sources.id, same.id))
-        .returning()
-        .get();
+    if (same) return same;
     return this.db
       .insert(sources)
       .values({
@@ -155,7 +151,7 @@ export class SourceStore {
         provider: "web_fetch",
         url: p.url,
         finalUrl: p.finalUrl,
-        title: cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title),
+        title,
         site: cut(p.site, SOURCE_LIMITS.site),
         publishedAt: p.publishedAt ?? null,
         fetchedAt: this.now(),

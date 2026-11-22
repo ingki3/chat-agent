@@ -1546,7 +1546,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(retries).toHaveLength(1);
   });
 
-  it("a source row moved to another page by a later fetch counts with that page (review #237 16차)", async () => {
+  it("rows of one body (a redirect target that changed, a direct fetch) are one source (review #237 16·17차)", async () => {
     const oldUrl = "https://fixture.agentlee.test/docs/old.pdf";
     const newUrl = "https://agency.gov/docs/new.pdf";
     let oldFetches = 0;
@@ -1583,7 +1583,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const q2 = stateOf(t, job.id).questions[1]!;
     expect(q2.found).toHaveLength(2);
     expect(new Set(q2.found.map((n) => n.sourceId)).size).toBe(2);
-    expect(q2.found.map((n) => n.sourceType)).toEqual(["government", "government"]);
+    // Each row's own address (rows never change): the first at the old one, the direct fetch at the agency's.
+    expect(q2.found.map((n) => n.sourceType)).toEqual(["other", "government"]);
     const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
     expect(end.questions[1]!.sources).toBe(1);
   });

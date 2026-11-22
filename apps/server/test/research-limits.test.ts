@@ -219,52 +219,6 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(f.sources.list(f.c.id)[0]!.title).toBe("empty.pdf");
   });
 
-  it("the same page fetched again with a metadata title replaces a stored file-name title (same source id)", async () => {
-    const titled = await makePdf(["같은 본문이다."], { title: "Annual Research Report" });
-    let withTitle = false;
-    const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
-    // The first read as an older server stored it (no title), the second with the metadata title.
-    const reader: PdfReader = async (b, signal) => {
-      const r = await real(b, signal);
-      if (!r.ok || withTitle) return r;
-      return { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
-    };
-    fx.routes.set("/d/download.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
-    const f = family();
-    const { call } = service(f, reader);
-    const first = await call("web_fetch", { url: "http://public.test/d/download.pdf" });
-    expect(f.sources.list(f.c.id)[0]!.title).toBe("download.pdf");
-    withTitle = true;
-    const second = await call("web_fetch", { url: "http://public.test/d/download.pdf" });
-    expect(second.body.sourceId).toBe(first.body.sourceId);
-    const rows = f.sources.list(f.c.id);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.title).toBe("Annual Research Report");
-    expect(String(second.body.content)).toContain("title: Annual Research Report");
-  });
-
-  it("a re-fetch through a URL that now redirects to another file still replaces the row's own file-name title", async () => {
-    const titled = await makePdf(["옮겨진 같은 본문이다."], { title: "Moved Report" });
-    let withTitle = false;
-    const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
-    const reader: PdfReader = async (b, signal) => {
-      const r = await real(b, signal);
-      return !r.ok || withTitle ? r : { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
-    };
-    fx.routes.set("/e/old.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
-    fx.routes.set("/e/new.pdf", { headers: { "content-type": "application/pdf" }, body: titled });
-    fx.redirects.set("/e/get", "/e/old.pdf");
-    const f = family();
-    const { call } = service(f, reader);
-    const first = await call("web_fetch", { url: "http://public.test/e/get" });
-    expect(f.sources.list(f.c.id)[0]!.title).toBe("old.pdf");
-    fx.redirects.set("/e/get", "/e/new.pdf");
-    withTitle = true;
-    const second = await call("web_fetch", { url: "http://public.test/e/get" });
-    expect(second.body.sourceId).toBe(first.body.sourceId);
-    expect(f.sources.list(f.c.id).map((r) => r.title)).toEqual(["Moved Report"]);
-  });
-
   it("a file-name title loses decoded control and bidi characters; nothing left → the site", async () => {
     expect(pdfTitle(new URL("https://a.test/report%E2%80%AE.pdf"))).toBe("report.pdf");
     expect(pdfTitle(new URL("https://a.test/%E2%80%AE%07"))).toBeUndefined();
@@ -277,7 +231,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(f.sources.list(f.c.id)[0]!.title).toBe("public.test");
   });
 
-  it("the same page fetched again: the latest fetch wins — final address, title, site — the id kept", async () => {
+  it("a stored row never changes: another title or final address is a new row; the exact same fetch is the same row", async () => {
     let withTitle = false;
     const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
     const reader: PdfReader = async (b, signal) => {
@@ -285,30 +239,35 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
       return !r.ok || withTitle ? r : { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
     };
     const body = await makePdf(["같은 문서의 본문이다."], { title: "Latest Title" });
-    for (const p of ["/h/a.pdf", "/h/b.pdf", "/h/%E2%80%AE"])
+    for (const p of ["/h/a.pdf", "/h/b.pdf"])
       fx.routes.set(p, { headers: { "content-type": "application/pdf" }, body });
     const f = family();
     const { call } = service(f, reader);
-    // A redirect that now ends at another file: the row's final address and file-name title follow.
     fx.redirects.set("/h/get", "/h/a.pdf");
     const first = await call("web_fetch", { url: "http://public.test/h/get" });
+    // The very same fetch again: the same row.
+    expect((await call("web_fetch", { url: "http://public.test/h/get" })).body.sourceId).toBe(
+      first.body.sourceId,
+    );
+    // The redirect now ends at another file: a new row; the first one as it was.
     fx.redirects.set("/h/get", "/h/b.pdf");
-    const second = await call("web_fetch", { url: "http://public.test/h/get" });
-    expect(second.body.sourceId).toBe(first.body.sourceId);
-    expect(f.sources.list(f.c.id).map((r) => [r.finalUrl, r.title])).toEqual([
-      ["http://public.test/h/b.pdf", "b.pdf"],
-    ]);
-    // A title that fell back to the site, then a fetch with the document's own title.
-    const g = family();
-    const svc = service(g, reader);
-    await svc.call("web_fetch", { url: "http://public.test/h/%E2%80%AE" });
-    expect(g.sources.list(g.c.id)[0]!.title).toBe("public.test");
+    const moved = await call("web_fetch", { url: "http://public.test/h/get" });
+    // The same address now with the document's own title: a new row too.
     withTitle = true;
-    await svc.call("web_fetch", { url: "http://public.test/h/%E2%80%AE" });
-    expect(g.sources.list(g.c.id).map((r) => r.title)).toEqual(["Latest Title"]);
+    const titled = await call("web_fetch", { url: "http://public.test/h/get" });
+    const ids = [first, moved, titled].map((r) => String(r.body.sourceId));
+    expect(new Set(ids).size).toBe(3);
+    const byId = new Map(f.sources.list(f.c.id).map((r) => [r.id, r]));
+    expect(ids.map((id) => [byId.get(id)!.finalUrl, byId.get(id)!.title])).toEqual([
+      ["http://public.test/h/a.pdf", "a.pdf"],
+      ["http://public.test/h/b.pdf", "b.pdf"],
+      ["http://public.test/h/b.pdf", "Latest Title"],
+    ]);
+    // Each row's type and date are its own.
+    for (const id of ids) expect(byId.get(id)!.contentType).toBe("application/pdf");
   });
 
-  it("a row stored before with a bidi-control title is cleaned by the next fetch of the page", async () => {
+  it("a row stored before (a bidi-control title) stays as it was; a new fetch makes a clean row", async () => {
     const body = await makePdf(["오래된 행의 본문이다."]);
     fx.routes.set("/i/report.pdf", { headers: { "content-type": "application/pdf" }, body });
     const f = family();
@@ -324,8 +283,9 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
       truncated: false,
     })!;
     const r = await service(f, reader).call("web_fetch", { url: "http://public.test/i/report.pdf" });
-    expect(r.body.sourceId).toBe(old.id);
-    expect(f.sources.list(f.c.id).map((x) => x.title)).toEqual(["report.pdf"]);
+    expect(r.body.sourceId).not.toBe(old.id);
+    expect(f.sources.get(f.c.id, old.id)!.title).toBe("report\u202E.pdf");
+    expect(f.sources.get(f.c.id, String(r.body.sourceId))!.title).toBe("report.pdf");
   });
 
   it("without a reader a PDF is refused as before; a broken PDF is bad content; a PDF without text has no text", async () => {
