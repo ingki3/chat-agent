@@ -46,6 +46,8 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
   unverified?: string[] | undefined;
   /** Notes kept because their quote was repaired to the page's own passage (`closestPassage`). */
   repaired?: number | undefined;
+  /** Why its last run failed without a note (a runtime error code): a passing one may be retried (#234). */
+  failure?: ResearchErrorCode | undefined;
 };
 
 /** The checkpoint (`research_jobs.state`): written after every step. */

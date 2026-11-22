@@ -8,7 +8,7 @@ import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
-import { PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
+import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
 /**
@@ -160,10 +160,17 @@ export type WebWorker = (job: WorkerJob, proxy: { url: string; port: number }) =
 
 export const WORKER_LIMITS = {
   timeoutMs: 30_000,
-  // A PDF's bytes come back base64 (worker.mjs `maxPdfBytes`, 10 MB → 13.4 MB of text, #234).
-  maxOutputBytes: 16 * 1024 * 1024,
+  maxOutputBytes: 4 * 1024 * 1024,
   maxRssBytes: 256 * 1024 * 1024,
 };
+/**
+ * The output of a page fetch, the one job that may hand back a PDF's bytes (base64 — worker.mjs `maxPdfBytes`,
+ * 10 MiB → 13.4 MiB of text, #234). Searches and raw jobs keep `WORKER_LIMITS.maxOutputBytes`.
+ */
+export const FETCH_OUTPUT_BYTES = 16 * 1024 * 1024;
+/** The process limits of one worker job: the larger output for a page fetch only. */
+export const workerLimitsOf = (job: WorkerJob) =>
+  job.op === "fetch" ? { ...WORKER_LIMITS, maxOutputBytes: FETCH_OUTPUT_BYTES } : WORKER_LIMITS;
 
 /**
  * The worker in the sandbox: reads its own folder and node only, writes nothing, no children, no inherited
@@ -183,7 +190,7 @@ export function sandboxedWorker(node = fs.realpathSync(process.execPath)): WebWo
         write: [],
         network: { loopbackPorts: [proxy.port] },
         stdin: JSON.stringify(job),
-        ...WORKER_LIMITS,
+        ...workerLimitsOf(job),
       });
     } catch {
       return { ok: false, code: "web_unavailable" };
@@ -515,16 +522,29 @@ export class WebService {
     let text = typeof r.text === "string" ? r.text : "";
     let truncated = r.truncated === true;
     let title = typeof r.title === "string" ? r.title : undefined;
+    let unread = false;
     if (typeof r.pdf === "string") {
       // A PDF (#234): its bytes, read by the document extractor (sandboxed, no network, no OCR).
       if (!this.opts.pdf) return { ok: false, code: "web_unsupported_type" };
       const bytes = Buffer.from(r.pdf, "base64");
-      if (bytes.subarray(0, 5).toString("latin1") !== "%PDF-") return { ok: false, code: "web_bad_content" };
+      if (!isPdfBytes(bytes)) return { ok: false, code: "web_bad_content" };
       if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
-      const p = await this.opts.pdf(bytes);
+      // The run stopped meanwhile (its token revoked): the read waiting for a slot never starts, a running
+      // extraction is stopped (review #237 1차).
+      const stop = new AbortController();
+      const watch = this.opts.alive
+        ? setInterval(() => !this.opts.alive!(scope) && stop.abort(), 250).unref()
+        : undefined;
+      let p;
+      try {
+        p = await this.opts.pdf(bytes, stop.signal);
+      } finally {
+        clearInterval(watch);
+      }
       if (!p.ok) return { ok: false, code: p.code };
       text = p.text.length > PDF_TEXT_CHARS ? p.text.slice(0, PDF_TEXT_CHARS) : p.text;
       truncated = p.truncated || p.text.length > PDF_TEXT_CHARS;
+      unread = p.unread;
       title ??= pdfTitle(finalUrl);
     }
     if (!text.trim()) return { ok: false, code: "web_no_text" };
@@ -559,6 +579,8 @@ export class WebService {
         characters: text.length,
         excerptCharacters: excerpt.length,
         truncated: row.truncated,
+        // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).
+        ...(unread ? { unreadPages: true } : {}),
         content: frameExternal({ source: row.finalUrl ?? row.url, content: excerpt }),
       },
     };

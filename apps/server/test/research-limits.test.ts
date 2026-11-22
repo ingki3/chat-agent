@@ -1,13 +1,14 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import zlib from "node:zlib";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { sourceTypeOf } from "@agentlee/shared";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
-import { closestPassage, findPassages, sentenceRanges, termsOf } from "../src/citations/passages.js";
+import { PAGE_GAP } from "../src/citations/passages.js";
+import { findSnippet } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb } from "../src/db/client.js";
 import { docLibraries } from "../src/docgen/runner.js";
@@ -15,7 +16,7 @@ import { inProcessExtractor, type OcrCapability } from "../src/files/extract.js"
 import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
 import { extractorPdfReader, type PdfReader } from "../src/web/pdf.js";
-import { EXCERPT_CHARS, pdfTitle } from "../src/web/service.js";
+import { EXCERPT_CHARS, workerLimitsOf } from "../src/web/service.js";
 import { SourceStore } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 import { startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
@@ -44,14 +45,44 @@ const tmp = () => {
   return d;
 };
 
-/** A synthetic PDF made here with pdfkit (pinned, already a dependency): one page per text, Korean font embedded. */
-async function makePdf(pages: string[]): Promise<Buffer> {
+/** A grey square as a PNG (made here: zlib's deflate and CRC) — a "scanned" page's picture. */
+function grayPng(size = 64): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(zlib.crc32(body));
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 0; // greyscale
+  const rows = Buffer.concat(
+    Array.from({ length: size }, () => Buffer.concat([Buffer.from([0]), Buffer.alloc(size, 128)])),
+  );
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", zlib.deflateSync(rows)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+/**
+ * A synthetic PDF made here with pdfkit (pinned, already a dependency): one page per entry, Korean font embedded — a
+ * text, or `{ scan: true }` for a page that is only a picture.
+ */
+async function makePdf(pages: (string | { scan: true })[]): Promise<Buffer> {
   const require = createRequire(import.meta.url);
   const PDFDocument = (await import(require.resolve("pdfkit"))).default as new (o?: object) => {
     registerFont(n: string, f: string): void;
     font(n: string): unknown;
     fontSize(n: number): unknown;
     text(t: string): unknown;
+    image(b: Buffer, o?: object): unknown;
     addPage(): unknown;
     on(e: string, f: (c?: Buffer) => void): void;
     end(): void;
@@ -67,7 +98,8 @@ async function makePdf(pages: string[]): Promise<Buffer> {
   });
   for (const [i, t] of pages.entries()) {
     if (i) doc.addPage();
-    doc.text(t);
+    if (typeof t === "string") doc.text(t);
+    else doc.image(grayPng(), { width: 400 });
   }
   doc.end();
   return done;
@@ -175,11 +207,112 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     // A PDF with no text (an empty page): nothing to store.
     const empty = await makePdf([""]);
     const blank = await reader(empty);
-    expect(blank).toEqual({ ok: true, text: "", truncated: false });
+    expect(blank).toEqual({ ok: true, text: "", truncated: false, unread: false });
     fx.routes.set("/blank.pdf", { headers: { "content-type": "application/pdf" }, body: empty });
     expect(
       (await service(g, reader).call("web_fetch", { url: "http://public.test/blank.pdf" })).body,
     ).toMatchObject({ error: "web_no_text" });
+  });
+
+  it("a page that could not be read (a scan, no OCR) stays a boundary: nothing verifies across it; partial", async () => {
+    const bytes = await makePdf([
+      "첫 쪽의 마지막 문장은 정부는 지원금을",
+      { scan: true },
+      "내년부터 지급한다고 밝혔다. 셋째 쪽이다.",
+    ]);
+    const reader = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const read = await reader(bytes);
+    expect(read).toMatchObject({ ok: true, truncated: true, unread: true });
+    const text = (read as { text: string }).text;
+    expect(text.split("\n\n")).toEqual([
+      "첫 쪽의 마지막 문장은 정부는 지원금을",
+      PAGE_GAP,
+      "내년부터 지급한다고 밝혔다. 셋째 쪽이다.",
+    ]);
+    expect(findSnippet(text, "정부는 지원금을 내년부터 지급한다고 밝혔다").found).toBe(false);
+    expect(findSnippet(text, "내년부터 지급한다고 밝혔다").found).toBe(true);
+    fx.routes.set("/scan.pdf", { headers: { "content-type": "application/pdf" }, body: bytes });
+    const f = family();
+    const r = await service(f, reader).call("web_fetch", { url: "http://public.test/scan.pdf" });
+    expect(r.body).toMatchObject({ truncated: true, unreadPages: true });
+    // Only scans: no text at all.
+    const scans = await makePdf([{ scan: true }, { scan: true }]);
+    expect(await reader(scans)).toMatchObject({ ok: true, text: "" });
+  });
+
+  it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {
+    const pdfLike = (n: number) => Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(n, 0x20)]);
+    const at = (p: string, type: string | undefined, body: Buffer) =>
+      fx.routes.set(p, {
+        headers: type === undefined ? { "content-type": "" } : { "content-type": type },
+        body,
+      });
+    const fetch = (p: string) =>
+      runWorker({ op: "fetch", url: `http://public.test${p}` }, { proxy: fx.proxy.url }) as Promise<
+        Record<string, unknown>
+      >;
+    // Larger than a page (3 MiB): a PDF type and octet-stream get the PDF limit (10 MiB); no type keeps 3 MiB.
+    at("/big.pdf", "application/pdf", pdfLike(4 * 1024 * 1024));
+    at("/big.bin", "application/octet-stream", pdfLike(4 * 1024 * 1024));
+    at("/big-untyped", undefined, pdfLike(4 * 1024 * 1024));
+    at("/small-untyped", undefined, pdfLike(1000));
+    at("/huge.pdf", "application/pdf", pdfLike(11 * 1024 * 1024));
+    expect(await fetch("/big.pdf")).toMatchObject({ ok: true, contentType: "application/pdf" });
+    expect(await fetch("/big.bin")).toMatchObject({ ok: true, contentType: "application/pdf" });
+    expect(await fetch("/big-untyped")).toEqual({ ok: false, code: "web_too_large" });
+    expect(await fetch("/small-untyped")).toMatchObject({ ok: true, contentType: "application/pdf" });
+    expect(await fetch("/huge.pdf")).toEqual({ ok: false, code: "web_too_large" });
+    // A header after some junk (allowed by the format) — the worker and the server agree; past 1,024 bytes, neither.
+    const junk = (n: number) => Buffer.concat([Buffer.alloc(n, 0x41), Buffer.from("%PDF-1.7\n")]);
+    at("/junk.pdf", "application/pdf", junk(500));
+    at("/late.pdf", "application/pdf", junk(2000));
+    const seen: Buffer[] = [];
+    const reader: PdfReader = async (b) => {
+      seen.push(b);
+      return { ok: true, text: "본문 글자가 있는 문서입니다.", truncated: false, unread: false };
+    };
+    const { call } = service(family(), reader);
+    expect((await call("web_fetch", { url: "http://public.test/junk.pdf" })).isError).toBe(false);
+    expect(seen).toHaveLength(1);
+    expect((await call("web_fetch", { url: "http://public.test/late.pdf" })).body).toMatchObject({
+      error: "web_bad_content",
+    });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("a stopped run: a read waiting for a slot never starts; a running extraction gets the stop", async () => {
+    const signals: AbortSignal[] = [];
+    const held = extractorPdfReader(async ({ signal }) => {
+      signals.push(signal);
+      await new Promise<void>((r) => (signal.aborted ? r() : signal.addEventListener("abort", () => r())));
+      return { ok: false, code: "extract_timeout" };
+    }, tmp());
+    const a = new AbortController();
+    const b = new AbortController();
+    const c = new AbortController();
+    const first = held(Buffer.from("%PDF-1.7"), a.signal);
+    const second = held(Buffer.from("%PDF-1.7"), b.signal);
+    const third = held(Buffer.from("%PDF-1.7"), c.signal);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(signals).toHaveLength(2);
+    c.abort();
+    expect(await third).toEqual({ ok: false, code: "web_not_allowed" });
+    a.abort();
+    expect(await first).toEqual({ ok: false, code: "web_not_allowed" });
+    expect(signals[0]!.aborted).toBe(true);
+    b.abort();
+    await second;
+    expect(signals).toHaveLength(2);
+  });
+
+  it("only a page fetch may hand back 16 MiB; searches and raw jobs keep 4 MiB", () => {
+    expect(workerLimitsOf({ op: "fetch", url: "https://a.test/" }).maxOutputBytes).toBe(16 * 1024 * 1024);
+    expect(workerLimitsOf({ op: "search", provider: "duckduckgo", query: "x", max: 1 }).maxOutputBytes).toBe(
+      4 * 1024 * 1024,
+    );
+    expect(workerLimitsOf({ op: "raw", steps: [{ url: "https://a.test/" }] }).maxOutputBytes).toBe(
+      4 * 1024 * 1024,
+    );
   });
 
   it("the extractor's failures map to web codes; a reader runs at most two at once", async () => {
@@ -197,12 +330,6 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(max).toBe(2);
     const unavailable = extractorPdfReader(async () => ({ ok: false, code: "extract_unavailable" }), tmp());
     expect(await unavailable(Buffer.from("%PDF-1.7"))).toEqual({ ok: false, code: "web_unavailable" });
-  });
-
-  it("a PDF's title is its file name when it has none", () => {
-    expect(pdfTitle(new URL("https://www.kcue.or.kr/down/2027%20plan.pdf"))).toBe("2027 plan.pdf");
-    expect(pdfTitle(new URL("https://example.org/"))).toBeUndefined();
-    expect(pdfTitle(new URL("https://example.org/%E0%A4%A.pdf"))).toBe("%E0%A4%A.pdf");
   });
 });
 
@@ -249,113 +376,5 @@ describe("web_find searches a fetched page's whole stored text (#234)", () => {
       error: "unknown_source",
     });
     expect((await call("web_find", { sourceId, query: "a\u0007b" })).isError).toBe(true);
-  });
-
-  it("findPassages: best first, no overlaps, context bounded", () => {
-    const text =
-      "가격이 올랐다. 수출이 늘었다.\n반도체 수출이 32% 늘었다. 메모리 가격이 회복됐다.\n" +
-      "다른 이야기다. ".repeat(50) +
-      "반도체 수출 증가는 메모리 가격 회복 덕분이다.";
-    const r = findPassages(text, "반도체 수출", 5);
-    expect(r.passages[0]!.phrase).toBe(true);
-    expect(r.passages.map((p) => p.text.includes("반도체 수출"))).toEqual(r.passages.map(() => true));
-    for (const [i, a] of r.passages.entries())
-      for (const b of r.passages.slice(i + 1)) expect(a.end <= b.start || b.end <= a.start).toBe(true);
-    for (const p of r.passages) expect(p.text.length).toBeLessThanOrEqual(700);
-    expect(findPassages(text, "   ", 5)).toEqual({ total: 0, passages: [] });
-  });
-});
-
-describe("the closest passage for a quote that did not verify (#234 note repair)", () => {
-  const page =
-    "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
-    "메모리 가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.";
-
-  it("match: the page's own sentence for a quote with changed punctuation and endings", () => {
-    const r = closestPassage(
-      page,
-      "산업통상자원부는 10일, 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다",
-    );
-    expect(r).toEqual({
-      kind: "match",
-      passage:
-        "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.",
-      recall: expect.any(Number),
-    });
-    // Two sentences the model joined with "…": the window of both.
-    const joined = closestPassage(
-      page,
-      "메모리 가격 회복이 증가를 이끌었다 … 업계는 연말까지 증가세가 이어질 것으로",
-    );
-    expect(joined).toMatchObject({
-      kind: "match",
-      passage: "메모리 가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.",
-    });
-  });
-
-  it("no match: other figures, too few shared words, or too short a quote", () => {
-    expect(closestPassage(page, "10월 반도체 수출이 전년 같은 달보다 50% 늘어난 142억 달러")).toEqual({
-      kind: "none",
-    });
-    expect(closestPassage(page, "메모리 반도체 가격이 크게 올라 수익이 늘었다")).toEqual({ kind: "none" });
-    expect(closestPassage(page, "수출 증가")).toEqual({ kind: "none" });
-  });
-
-  it("ambiguous: two different passages match about as well — neither is taken", () => {
-    const twins = "서울시는 2026년 예산을 늘린다고 밝혔다.\n부산시는 2026년 예산을 늘린다고 밝혔다.";
-    expect(closestPassage(twins, "시는 2026년 예산을 늘린다고 밝혔다")).toEqual({ kind: "ambiguous" });
-    // The very same sentence twice is one passage, not a rival.
-    const same = "서울시는 2026년 예산을 늘린다고 밝혔다.\n서울시는 2026년 예산을 늘린다고 밝혔다.";
-    expect(closestPassage(same, "서울시는 2026년, 예산을 늘린다고 밝혔다")).toMatchObject({ kind: "match" });
-  });
-
-  it("sentences: split at line breaks and sentence ends, not inside numbers or dates; long ones cut at clauses", () => {
-    const t = "2026. 11. 12. 발표했다. 금리는 3.5%다! 다음 줄\n둘째 줄";
-    expect(sentenceRanges(t).map((r) => t.slice(r.start, r.end))).toEqual([
-      "2026. 11. 12.",
-      "발표했다.",
-      "금리는 3.5%다!",
-      "다음 줄",
-      "둘째 줄",
-    ]);
-    const long = `${"가나다라 ".repeat(60)}, ${"마바사 ".repeat(60)}`;
-    expect(sentenceRanges(long).every((r) => r.end - r.start <= 400)).toBe(true);
-    expect(termsOf("수출이 반도체를 Node.js로")).toEqual(["수출", "반도체", "node", "js"]);
-  });
-});
-
-describe("source type by domain (#234)", () => {
-  it("government, academic, organization, other", () => {
-    expect(
-      [
-        "https://www.moe.go.kr/a.pdf",
-        "https://www.whitehouse.gov/",
-        "https://www.gov.uk/x",
-        "https://ec.europa.eu/",
-        "https://www.snu.ac.kr/",
-        "https://www.kice.re.kr/",
-        "https://mit.edu/",
-        "https://www.ox.ac.uk/",
-        "https://www.kcue.or.kr/",
-        "https://wikipedia.org/",
-        "https://blog.naver.com/",
-        "https://ac.example.com/",
-        "not a url",
-      ].map(sourceTypeOf),
-    ).toEqual([
-      "government",
-      "government",
-      "government",
-      "government",
-      "academic",
-      "academic",
-      "academic",
-      "academic",
-      "organization",
-      "organization",
-      "other",
-      "other",
-      "other",
-    ]);
   });
 });

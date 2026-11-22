@@ -19,7 +19,27 @@ import {
   type RuntimeSession,
   type StartContext,
 } from "../src/runtime/adapter.js";
-import { fixtureWebWorker, FIXTURE_PAGES } from "../src/runtime/fake-citations.js";
+import { fixtureWebWorker, FIXTURE_PAGES, type FixturePage } from "../src/runtime/fake-citations.js";
+import type { WebWorker } from "../src/web/service.js";
+
+/** The citation fixture pages and `extra` ones (#234), answered in-process. */
+const withPages = (extra: readonly FixturePage[]): WebWorker => {
+  const base = fixtureWebWorker();
+  return async (job, proxy) => {
+    const p = job.op === "fetch" ? extra.find((x) => x.url === job.url) : undefined;
+    return p
+      ? {
+          ok: true,
+          finalUrl: p.url,
+          title: p.title,
+          site: p.site,
+          contentType: "text/html",
+          text: p.text,
+          truncated: false,
+        }
+      : base(job, proxy);
+  };
+};
 import { RESEARCH_FIXTURE } from "../src/runtime/fake-research.js";
 import {
   defaultScript,
@@ -115,6 +135,8 @@ async function start(
     notificationsNow?: () => number;
     family?: boolean;
     dataDir?: string;
+    /** More fixture pages (#234), answered in-process like the citation fixtures. */
+    pages?: FixturePage[];
   } = {},
 ) {
   const db = o.db ?? createTestDb();
@@ -130,7 +152,11 @@ async function start(
       logger: false,
       runtimes,
       runs: { flushMs: 0 },
-      web: { worker: fixtureWebWorker(), fetchProxy: stubProxy as never, providers: ["duckduckgo"] },
+      web: {
+        worker: withPages(o.pages ?? []),
+        fetchProxy: stubProxy as never,
+        providers: ["duckduckgo"],
+      },
       mcp: { skills: [SELFTEST_SKILL], egress: () => stubProxy as never },
       extract: {
         runner: inProcessExtractor(() => ocrCapability(path.join(os.tmpdir(), "agentlee-test-ocr-lang"))),
@@ -1159,9 +1185,25 @@ describe("깊이 조사: review 3 (#212)", () => {
       found: [],
       dropped: 0,
     });
+    // …and web questions it had finished without a note (review #237 1차): their automatic retry stays in the files.
+    for (const status of ["done", "capped"])
+      state.questions.push({
+        id: `r1q${status}`,
+        question: `웹에서 ${status}`,
+        scope: "web",
+        round: 1,
+        status,
+        sources: 0,
+        found: [],
+        dropped: 0,
+      });
     db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
     const t2 = await start({ db, family: false, dataDir });
     await statusIs(t2.app, job.id, "done", "failed");
+    // The finished web questions were retried — within the files.
+    const retried = t2.counting.turns.filter((x) => x.includes(RETRY_MARK) && /웹에서 (done|capped)/.test(x));
+    expect(retried).toHaveLength(2);
+    for (const x of retried) expect(x).toContain("범위: 첨부 파일만");
     expect(t2.fake.contexts.flatMap((x) => x.tools).filter((x) => x.startsWith("web_"))).toEqual([]);
     expect(sourcesOf(db, c.id)).toBe(0);
   });
@@ -1194,9 +1236,9 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
                 {
                   claim: "산업부는 32% 증가로 발표했다",
                   ref: "{{$0.sourceId}}",
-                  // A comma the page does not have, and the sentence's ending cut differently.
+                  // Only the form differs: a comma, spacing, quote marks and a particle the page does not have.
                   quote:
-                    "산업통상자원부는 10일, 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다",
+                    "“산업통상자원부는 10일, 10 월 반도체 수출은 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
                 },
                 { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
                 // Other figures than the page's: never repaired.
@@ -1212,7 +1254,11 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     await statusIs(t.app, job.id, "done");
     const q1 = stateOf(t, job.id).questions[0]!;
-    expect(q1.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.growth, RESEARCH_FIXTURE.stats]);
+    // The page's own words for the quote (up to its last word — the exact check took it as it stands).
+    expect(q1.found.map((n) => n.quote)).toEqual([
+      RESEARCH_FIXTURE.growth.slice(0, -1),
+      RESEARCH_FIXTURE.stats,
+    ]);
     expect(q1.repaired).toBe(1);
     expect(q1.unverified).toEqual(["수출이 50% 늘었다"]);
     expect(q1.found[0]!.sourceType).toBe("other");
@@ -1220,10 +1266,14 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(end.questions[0]).toEqual(
       expect.objectContaining({ notes: 2, dropped: 1, sources: 2, status: "done" }),
     );
-    // The server-only bookkeeping is not part of the API's job.
-    expect(Object.keys(end.questions[0]!).sort()).toEqual(
-      ["dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
-    );
+    // The server-only bookkeeping is not part of the API's job — in the raw answer, before any schema parse.
+    const raw = (await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json() as {
+      questions: Record<string, unknown>[];
+    };
+    for (const q of raw.questions)
+      expect(Object.keys(q).sort()).toEqual(
+        ["dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
+      );
     // The writer got the repaired passage: its citation verifies.
     expect(end.result).toMatchObject({ citations: 3 });
   });
@@ -1291,6 +1341,11 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       ["done", 2, 2, 1],
       ["done", 2, 2, 1],
     ]);
+    // Raw API answer (no schema parse): the retry's bookkeeping and the notes stay on the server.
+    const raw = JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    for (const k of ["retried", "unverified", "repaired", "failure", "found"])
+      expect(raw).not.toContain(`"${k}"`);
+    expect(raw).not.toContain("미국 수출 비중이 가장 컸다");
     // The lead's reflection saw the claims that could not be verified.
     const reflect = t.counting.turns.find((x) => x.startsWith(TURN_MARK.reflect))!;
     expect(reflect).toContain("원문에서 확인하지 못해 뺀 주장");
@@ -1305,5 +1360,162 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const subs = t.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent));
     expect(subs).toHaveLength(2);
     expect(subs.some((x) => x.includes(RETRY_MARK))).toBe(false);
+  });
+  it("a claim whose meaning differs from the page is never repaired: not in the notes, the writer or the report", async () => {
+    const page: FixturePage = {
+      url: "https://fixture.agentlee.test/gov/policy.html",
+      title: "정책 발표",
+      site: "정부 누리집",
+      text:
+        "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.\n부산시는 2026년 예산을 늘린다고 밝혔다.\n" +
+        "수출은 전년보다 −5% 줄었다.",
+    };
+    const inverted = [
+      { claim: "정부는 내년부터 지원금을 지급한다", quote: "정부는 내년부터 지원금을 지급한다고 밝혔다" },
+      { claim: "서울시는 2026년 예산을 늘린다", quote: "서울시는 2026년 예산을 늘린다고 밝혔다" },
+      { claim: "수출은 전년보다 5% 늘었다", quote: "수출은 전년보다 +5% 줄었다" },
+    ];
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
+        ? [
+            { call: "web_fetch", input: { url: page.url } },
+            { call: "web_fetch", input: { url: A.url } },
+            {
+              textRefs: notes(...inverted.map((n) => ({ ...n, ref: "{{$0.sourceId}}" })), {
+                claim: "메모리 가격 회복이 이끌었다",
+                ref: "{{$1.sourceId}}",
+                quote: RESEARCH_FIXTURE.memory,
+              }),
+            },
+          ]
+        : undefined,
+    );
+    const t = await start({ script, pages: [page] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    expect(q2.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.memory]);
+    expect(q2.repaired ?? 0).toBe(0);
+    expect(q2.unverified).toEqual(inverted.map((n) => n.claim));
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
+    for (const n of inverted) {
+      expect(writer).not.toContain(n.claim);
+      expect(content).not.toContain(n.claim);
+      expect(content).not.toContain(n.quote);
+    }
+  });
+
+  it("a retry that finds nothing keeps the claims that failed; the lead sees them", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
+        ? [
+            { call: "web_fetch", input: { url: A.url } },
+            {
+              textRefs: notes({
+                claim: "미국 수출 비중이 가장 컸다",
+                ref: "{{$0.sourceId}}",
+                quote: "미국 수출 비중이 가장 컸다",
+              }),
+            },
+          ]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect(stateOf(t, job.id).questions[1]!.unverified).toEqual(["미국 수출 비중이 가장 컸다"]);
+    const reflect = t.counting.turns.find((x) => x.startsWith(TURN_MARK.reflect))!;
+    expect(reflect).toContain("미국 수출 비중이 가장 컸다");
+  });
+
+  it("a passing runtime error is retried once; an account's state (usage, login) is not", async () => {
+    for (const [fail, retried] of [
+      [{ fail: "boom" }, true],
+      [{ fail: "login", code: "runtime_auth" as const }, false],
+    ] as const) {
+      const script = scripted((x) =>
+        x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK) ? [fail] : undefined,
+      );
+      const t = await start({ script });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await statusIs(t.app, job.id, "done");
+      const retries = t.counting.turns.filter(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK),
+      );
+      expect(
+        retries.some((x) => /배경/.test(x)),
+        fail.fail,
+      ).toBe(retried);
+      const q2 = stateOf(t, job.id).questions[1]! as { status?: string; retried?: boolean };
+      expect(q2.status, fail.fail).toBe(retried ? "done" : "failed");
+    }
+  });
+
+  it("time is checked again after the reflection: no new round, or no extra round, that no longer fits", async () => {
+    for (const [limits, spend, rounds] of [
+      // 20 minutes of research; the reflection takes 17.5 — 2.5 left, under a round's 3 minutes.
+      [{}, 17.5 * MIN, 0],
+      // No regular gap round (maxDepth 0): the extra one needs 8 minutes; the reflection leaves 7.
+      [{ maxDepth: 0 }, 13 * MIN, 0],
+      // …and with 19 left it runs.
+      [{ maxDepth: 0 }, 1 * MIN, 1],
+    ] as const) {
+      const clock = new ManualClock();
+      const script = scripted((x) => {
+        if (!x.startsWith(TURN_MARK.reflect)) return undefined;
+        clock.advance(spend);
+        return [{ text: JSON.stringify({ gaps: [{ question: "새 각도의 보강 질문", scope: "web" }] }) }];
+      });
+      const t = await start({ script, clock, limits });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await until(() => {
+        const s = t.app.research!.get(job.id)!.status;
+        if (s === "writing") clock.advance(MIN);
+        return s === "done" || s === "failed";
+      }, "the end");
+      const gap = t.counting.turns.filter(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes("새 각도") && !x.includes(RETRY_MARK),
+      );
+      expect(gap, `${spend}`).toHaveLength(rounds);
+    }
+  });
+
+  it("a retry still waiting after a restart starts only with a round's time left", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && x.includes("배경") ? [{ gate: "retry-restart-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(
+      () => t1.counting.active === 1 && t1.app.research!.get(job.id)!.state.includes('"status":"done"'),
+      "q1 done",
+    );
+    await t1.app.close();
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] };
+    // As if the server stopped right after it queued the background question's retry.
+    Object.assign(state.questions[1]!, { status: "waiting", retried: true, found: [], sources: 0 });
+    // 45 seconds of research left.
+    const approvedAt = Date.now() - (20 * MIN - 45_000);
+    db.$client
+      .prepare("update research_jobs set state = ?, approved_at = ? where id = ?")
+      .run(JSON.stringify(state), approvedAt, job.id);
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done", "failed");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
   });
 });

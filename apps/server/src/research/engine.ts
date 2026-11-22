@@ -177,8 +177,13 @@ const ACTIVE: ResearchStatus[] = ["planning", "researching", "writing"];
 /** The writer needs at least this much: less, and the report is the verified passages themselves. */
 const MIN_WRITE_MS = 30_000;
 const REFLECT_MS = 90_000;
-/** Unverified claims kept per sub-question run (for its retry and the lead's reflection). */
+/** Unverified claims kept per sub-question (for its retry and the lead's reflection). */
 const UNVERIFIED_KEPT = 5;
+/**
+ * Runtime failures a weak sub-question is retried after (#234): a passing error. The account's state — its login,
+ * its usage, its connection, its permission, the conversation switched — would only fail again.
+ */
+const RETRYABLE: ReadonlySet<string> = new Set<ResearchErrorCode>(["runtime_error"]);
 
 function anySignal(...signals: AbortSignal[]): AbortSignal {
   const c = new AbortController();
@@ -737,12 +742,20 @@ export class ResearchEngine {
     let error: ResearchErrorCode | undefined;
     try {
       for (;;) {
+        // A retry (#234) that is still to run (a restart) starts only with a round's time left; otherwise it keeps
+        // what its first run found.
+        if (researchEnd - this.clock.now() < this.limits.minRoundMs)
+          for (const q of state.questions)
+            if (q.status === "waiting" && q.retried) q.status = q.found.length ? "done" : "capped";
         const waiting = state.questions.filter((q) => q.status === "waiting");
         if (waiting.length && this.clock.now() < researchEnd && !signal.aborted)
           await pool(waiting, this.limits.concurrency, async (q) => {
             if (signal.aborted) return;
             const ctx = fresh();
             if (!ctx) return;
+            // Held within the approved sources right before it runs (review #237 1차): an old checkpoint's question
+            // of any status — a retry may run a done one again — never gets tools the owner did not approve.
+            q.scope = clampScope(q.scope, state.scopes);
             q.status = "running";
             persist();
             // A retry (#234) keeps what the first run verified and is told what it found and what failed.
@@ -769,7 +782,11 @@ export class ResearchEngine {
             q.found = notes;
             q.sources = sourceCount(notes);
             q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
-            q.unverified = checked.unverified;
+            q.unverified = mergeUnverified(
+              q.retried ? (q.unverified ?? []) : [],
+              checked.unverified,
+              checked.notes,
+            );
             q.repaired = (q.retried ? (q.repaired ?? 0) : 0) + checked.repaired;
             q.status =
               r.ended === "done"
@@ -779,6 +796,8 @@ export class ResearchEngine {
                     ? "done"
                     : "failed"
                   : "capped";
+            // Why it failed: a passing runtime error may be retried once (#234); an account's state may not.
+            q.failure = r.ended === "failed" && !notes.length ? (r.error ?? "runtime_error") : undefined;
             if (r.ended === "failed") error ??= r.error;
             persist();
           });
@@ -797,11 +816,16 @@ export class ResearchEngine {
         const weak = state.questions.filter(
           (q) =>
             !q.retried &&
-            (q.status === "done" || q.status === "capped") &&
+            (q.status === "done" ||
+              q.status === "capped" ||
+              (q.status === "failed" && RETRYABLE.has(q.failure ?? ""))) &&
             (q.found.length === 0 || q.sources <= 1),
         );
         if (weak.length) {
-          for (const q of weak) Object.assign(q, { retried: true, status: "waiting" });
+          for (const q of weak) {
+            q.scope = clampScope(q.scope, state.scopes);
+            Object.assign(q, { retried: true, status: "waiting", failure: undefined });
+          }
           logEvent(this.deps.log, "info", "research.retry", {
             userId: row.ownerId,
             researchId: row.id,
@@ -842,7 +866,12 @@ export class ResearchEngine {
                 .filter((g) => !asked.has(g.question))
                 .map((g) => ({ ...g, scope: clampScope(g.scope, state.scopes) }))
             : [];
-        if (!gaps.length) {
+        // The reflection took time: the new round starts only if it still fits — `extraRoundMs` for the round past
+        // `maxDepth`, `minRoundMs` otherwise (review #237 1차).
+        const left = researchEnd - this.clock.now();
+        const need =
+          state.round + 1 > this.limits.maxDepth ? this.limits.extraRoundMs : this.limits.minRoundMs;
+        if (!gaps.length || left < need) {
           persist();
           break;
         }
@@ -1202,18 +1231,50 @@ export function toolsOf(scope: ResearchScope): string[] {
 
 const allNotes = (s: JobState) => s.questions.flatMap((q) => q.found);
 
-/** A retry's notes after the first run's (#234): the same passage of the same source once, at most `max`. */
+/**
+ * A retry's notes after the first run's (#234): the same passage of the same source once, at most `max` — and every
+ * source the retry newly found keeps at least one place (review #237 1차: twelve notes of page A must not crowd out
+ * the retry's page B). Otherwise the first run's notes come first, then the retry's, in order.
+ */
 export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: number): ResearchNote[] {
   const key = (n: ResearchNote) => `${n.sourceId ?? n.fileId}\n${n.quote}`;
-  const seen = new Set(before.map(key));
-  const out = [...before];
-  for (const n of after) {
-    if (out.length >= max) break;
+  const src = (n: ResearchNote) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`);
+  const seen = new Set<string>();
+  const all: ResearchNote[] = [];
+  for (const n of [...before, ...after]) {
     if (seen.has(key(n))) continue;
     seen.add(key(n));
-    out.push(n);
+    all.push(n);
   }
-  return out;
+  if (all.length <= max) return all;
+  const old = new Set(before.map(src));
+  const kept = new Set<ResearchNote>();
+  const fresh = new Set<string>();
+  for (const n of all.slice(before.length))
+    if (!old.has(src(n)) && !fresh.has(src(n)) && kept.size < max) {
+      fresh.add(src(n));
+      kept.add(n);
+    }
+  let room = max - kept.size;
+  return all.filter((n) => kept.has(n) || (room > 0 && room-- > 0));
+}
+
+/**
+ * A sub-question's unverified claims after a run (#234): the earlier ones and the new failures, once each, without
+ * those a note of this run now backs (the same claim), at most `UNVERIFIED_KEPT` — a retry that finds nothing does
+ * not forget what failed before.
+ */
+export function mergeUnverified(
+  before: readonly string[],
+  failed: readonly string[],
+  verified: readonly ResearchNote[],
+): string[] {
+  const flat = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim();
+  const backed = new Set(verified.map((n) => flat(n.claim)));
+  const out: string[] = [];
+  for (const c of [...before, ...failed])
+    if (!backed.has(flat(c)) && !out.some((x) => flat(x) === flat(c))) out.push(c);
+  return out.slice(0, UNVERIFIED_KEPT);
 }
 
 /** At most `max` notes for the lead and the writer, taken in turn from each sub-question (none crowds out another). */

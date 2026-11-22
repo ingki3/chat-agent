@@ -34,9 +34,15 @@ const TYPES = new Map([
   ["text/markdown", "text"],
   ["application/json", "json"],
 ]);
-/** PDF content types (#234); `application/octet-stream` (or none) counts when the body starts with `%PDF-`. */
+/**
+ * PDF content types (#234). `application/octet-stream`, or no type at all, counts when `%PDF-` is in the first
+ * `PDF_SNIFF_BYTES`. The PDF byte limit (`maxPdfBytes`) applies to the PDF types and `octet-stream`; an answer
+ * without a type keeps the page limit (`maxBytes`) — it is read before its kind is known.
+ */
 const PDF_TYPES = new Set(["application/pdf", "application/x-pdf"]);
 const PDF_MAGIC = "%PDF-";
+/** Where a PDF's header may start — the server checks the same (`web/pdf.ts` `PDF_SNIFF_BYTES`). */
+export const PDF_SNIFF_BYTES = 1024;
 /** Whether these response headers may carry a PDF (the larger byte limit applies). */
 const mayBePdf = (headers) => {
   const mime = String(headers["content-type"] ?? "")
@@ -503,7 +509,7 @@ export async function fetchPage(input, o) {
   let mime = ct.split(";")[0].trim();
   // A PDF (#234): its bytes go back as they are — nothing parses it here. The server reads its text with the
   // document extractor (its own sandbox, no network). A PDF type whose body is not a PDF is refused.
-  const pdfMagic = r.body.subarray(0, 1024).toString("latin1").includes(PDF_MAGIC);
+  const pdfMagic = r.body.subarray(0, PDF_SNIFF_BYTES).toString("latin1").includes(PDF_MAGIC);
   if (PDF_TYPES.has(mime) || ((mime === "application/octet-stream" || !mime) && pdfMagic)) {
     if (!pdfMagic) throw new WebError("web_bad_content");
     if (r.body.length > Math.max(limits.maxBytes, limits.maxPdfBytes)) throw new WebError("web_too_large");

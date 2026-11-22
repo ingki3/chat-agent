@@ -6,9 +6,9 @@ import { KOREAN_PARTICLES } from "./verify.js";
  * - `web_find` — a researcher looks for a phrase or keywords in the whole text of a page it fetched (the model only
  *   saw the first `EXCERPT_CHARS`);
  * - `closestPassage` — a note whose quote the citation check did not find is matched to the one passage of its page
- *   that says the same words; that passage (the page's own text) replaces the quote and is checked again, so the
- *   check stays exact (`findSnippet`).
- * Both are deterministic: no model, no fuzzy scores other than shared words.
+ *   with the very same words, numbers and order (only form may differ); that passage (the page's own text) replaces
+ *   the quote and is checked again, so the check stays exact (`findSnippet`).
+ * Both are deterministic: no model, no similarity scores.
  */
 
 export type Range = { start: number; end: number };
@@ -91,13 +91,6 @@ export function termsOf(text: string): string[] {
   return [...text.normalize("NFC").matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => stemOf(m[0]));
 }
 
-/** The numbers of a text (`32`, `142`, `3.5`, `1,234` → `1234`): a passage that replaces a quote keeps them all. */
-export function numbersOf(text: string): Set<string> {
-  return new Set(
-    [...text.normalize("NFKC").matchAll(/\p{Nd}+(?:[.,]\p{Nd}+)*/gu)].map((m) => m[0].replace(/,/g, "")),
-  );
-}
-
 /** Lower case, NFC, whitespace runs as one space — for finding a phrase. */
 const flat = (s: string) => s.normalize("NFC").replace(/\s+/gu, " ").trim().toLowerCase();
 /** A passage as it is shown and quoted: the page's characters, whitespace runs as one space. */
@@ -171,59 +164,112 @@ function withContext(text: string, sentences: Range[], i: number): Range {
 // Note repair
 
 export type Closest =
-  | { kind: "match"; passage: string; recall: number }
+  | { kind: "match"; passage: string }
   | { kind: "none" }
-  /** Two different passages match about as well: neither is taken. */
+  /** The quote's words stand in two different passages of the page: neither is taken. */
   | { kind: "ambiguous" };
 
-/** The share of a quote's words a passage must contain, and the fewest words a quote needs to be repaired at all. */
-export const REPAIR = { minRecall: 0.75, minTerms: 4, maxSentences: 3, ambiguityMargin: 0.05 } as const;
+/** The fewest words a quote needs to be repaired at all; the longest passage it may become. */
+export const REPAIR = { minTerms: 4 } as const;
 
 /**
- * The passage of `text` closest to a quote the citation check did not find: windows of one to three consecutive
- * sentences (at most `CITATION_LIMITS.snippet` characters) scored by the quote's words they contain (recall) and how
- * few other words they add (precision), recall weighted (F₃). Taken only when it is confident:
- * - at least `minRecall` of the quote's words (`minTerms` or more) are in it;
- * - every number of the quote is in it (a passage with other figures never stands in for the quote);
- * - no other, non-overlapping passage with different words scores within `ambiguityMargin` of it.
+ * The only particles a repair forgives (subject, topic, object — `수출이` / `수출은` / `수출을`). Particles that carry
+ * meaning (`보다`, `까지`, `부터`, `에서`, `도`, `만` …) and every verb ending must be the page's exactly: `서울보다
+ * 부산이` is not `서울이 부산보다`, `지급한다` is not `지급하지 않는다` (review #237 1차).
+ */
+const LOOSE_PARTICLES = ["은", "는", "이", "가", "을", "를"];
+
+/** A word with a forgiven particle taken off (two characters stay at least), lower case, NFC. */
+function repairStem(word: string): string {
+  const w = word.normalize("NFC").toLowerCase();
+  for (const p of LOOSE_PARTICLES)
+    if (w.endsWith(p) && Array.from(w).length - 1 >= 2 && HANGUL_END.test(w)) return w.slice(0, -1);
+  return w;
+}
+
+type Tok = { stem: string; start: number; end: number };
+function repairTokens(text: string): Tok[] {
+  return [...text.matchAll(/[\p{L}\p{N}\p{M}]+/gu)].map((m) => ({
+    stem: repairStem(m[0]),
+    start: m.index,
+    end: m.index + m[0].length,
+  }));
+}
+
+const SIGNS: Record<string, string> = {
+  "+": "+",
+  "▲": "+",
+  "△": "+",
+  "-": "-",
+  "−": "-",
+  "–": "-",
+  "▼": "-",
+  "▽": "-",
+};
+/**
+ * The numbers of a text with their sign and the word or mark right after them, in order (`−5%` → `-5%`, `142억` →
+ * `142억`, `1,234 명` → `1234명`, `10 월` → `10월`):
+ * a repaired passage must have the very same list — value, sign, unit and the order that pairs them.
+ */
+export function numberFacts(text: string): string[] {
+  return [
+    ...text
+      .normalize("NFKC")
+      .matchAll(/([+\-−–▲△▼▽])?\s?(\p{Nd}+(?:[.,]\p{Nd}+)*)(?:\s?(%p|%|‰|[\p{L}]+))?/gu),
+  ].map((m) => `${m[1] ? SIGNS[m[1]] : ""}${m[2]!.replace(/,/g, "")}${m[3] ?? ""}`);
+}
+
+/**
+ * The page's own passage for a quote the citation check did not find — **only when the two differ in form, never
+ * in meaning** (review #237 1차). The quote's words must stand in the page in the same order, one after another,
+ * nothing added or left out in between: only whitespace, punctuation, quote marks, an ellipsis where the model
+ * joined two consecutive sentences, spacing inside a word (`10 월` / `10월`) and the subject, topic and object
+ * particles may differ (`LOOSE_PARTICLES`). Every number keeps its value, sign and unit (`numberFacts` — the
+ * passage reaches the sign just before it and the unit right after it). Not across a page the extractor could not
+ * read (`PAGE_GAP`, a PDF). Two different passages with these words: `ambiguous`. The passage is then checked again
+ * exactly, like any quote (`findSnippet`) — its numeric edges and token boundaries too.
  */
 export function closestPassage(text: string, quote: string): Closest {
-  const q = new Set(termsOf(quote));
-  if (q.size < REPAIR.minTerms) return { kind: "none" };
-  const nums = numbersOf(quote);
-  const sentences = sentenceRanges(text);
-  const terms = sentences.map((r) => termsOf(text.slice(r.start, r.end)));
-  type Cand = Range & { f: number; recall: number; key: string };
-  const cands: Cand[] = [];
-  for (let i = 0; i < sentences.length; i++) {
-    // Only windows that start with a sentence sharing a word with the quote (the rest cannot be the closest).
-    if (!terms[i]!.some((t) => q.has(t))) continue;
-    for (let n = 1; n <= REPAIR.maxSentences && i + n <= sentences.length; n++) {
-      const r = { start: sentences[i]!.start, end: sentences[i + n - 1]!.end };
-      const passage = passageText(text, r);
-      if (passage.length > CITATION_LIMITS.snippet) break;
-      const words = terms.slice(i, i + n).flat();
-      const set = new Set(words);
-      let shared = 0;
-      for (const t of q) if (set.has(t)) shared++;
-      const recall = shared / q.size;
-      if (recall < REPAIR.minRecall) continue;
-      const have = numbersOf(passage);
-      if ([...nums].some((x) => !have.has(x))) continue;
-      const precision = shared / Math.max(set.size, 1);
-      const f = (10 * precision * recall) / (9 * precision + recall);
-      cands.push({ ...r, f, recall, key: [...set].sort().join(" ") });
-    }
+  const q = repairTokens(quote);
+  if (q.length < REPAIR.minTerms) return { kind: "none" };
+  const want = q.map((t) => t.stem).join("");
+  const facts = numberFacts(quote).join(" ");
+  const page = repairTokens(text);
+  // The page's words as one string, and where each word starts in it.
+  const starts = new Map<number, number>();
+  const ends = new Map<number, number>();
+  let joined = "";
+  for (const [i, t] of page.entries()) {
+    starts.set(joined.length, i);
+    joined += t.stem;
+    ends.set(joined.length, i);
   }
-  if (!cands.length) return { kind: "none" };
-  cands.sort((a, b) => b.f - a.f || a.end - a.start - (b.end - b.start) || a.start - b.start);
-  const best = cands[0]!;
-  const rival = cands.find(
-    (c) =>
-      !(c.start < best.end && best.start < c.end) &&
-      c.key !== best.key &&
-      c.f >= best.f - REPAIR.ambiguityMargin,
-  );
-  if (rival) return { kind: "ambiguous" };
-  return { kind: "match", passage: passageText(text, best), recall: best.recall };
+  const found = new Set<string>();
+  for (let at = joined.indexOf(want); at !== -1; at = joined.indexOf(want, at + 1)) {
+    const a = starts.get(at);
+    const b = ends.get(at + want.length);
+    if (a === undefined || b === undefined) continue;
+    let start = page[a]!.start;
+    let end = page[b]!.end;
+    // The sign right before the first number and the unit marks right after the last belong to the passage.
+    const sign = /[+\-−–▲△▼▽]\s?$/u.exec(text.slice(Math.max(0, start - 2), start));
+    if (sign) start -= sign[0].length;
+    const unit = /^(?:%p|%|‰)/u.exec(text.slice(end, end + 2));
+    if (unit) end += unit[0].length;
+    const raw = text.slice(start, end);
+    if (raw.includes(PAGE_GAP)) continue;
+    const passage = raw.replace(/\s+/gu, " ").trim();
+    if (passage.length > CITATION_LIMITS.snippet) continue;
+    if (numberFacts(passage).join(" ") !== facts) continue;
+    found.add(passage);
+  }
+  if (!found.size) return { kind: "none" };
+  if (found.size > 1) return { kind: "ambiguous" };
+  return { kind: "match", passage: [...found][0]! };
 }
+
+/**
+ * Where a PDF page the extractor could not read (a scan, without OCR) stood in its text (#234, `web/pdf.ts`): its own
+ * line, so no passage — a citation, `web_find`, a repair — runs across it.
+ */
+export const PAGE_GAP = "[읽지 못한 쪽]";
