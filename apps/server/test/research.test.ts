@@ -41,7 +41,7 @@ const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): Web
       : base(job, proxy);
   };
 };
-import { RESEARCH_FIXTURE } from "../src/runtime/fake-research.js";
+import { RESEARCH_FIXTURE, researchSteps } from "../src/runtime/fake-research.js";
 import {
   defaultScript,
   FakeRuntime,
@@ -51,6 +51,7 @@ import {
 } from "../src/runtime/fake.js";
 import { createFamily, shareWithShared } from "./helpers/permission-matrix.js";
 import { McpTokens } from "../src/isolation/tokens.js";
+import { knownSecrets } from "../src/secrets/known.js";
 
 /**
  * 깊이 조사 (#211) end to end on the FakeRuntime (`fake-research.ts`): the plan card before any search, approval
@@ -113,7 +114,10 @@ class Counting implements RuntimeAdapter {
       },
     };
   }
+  /** Tests: awaited before a session starts (a slow runtime start). */
+  beforeStart?: (ctx: StartContext) => Promise<void>;
   async start(ctx: StartContext) {
+    await this.beforeStart?.(ctx);
     return this.wrap(await this.inner.start(ctx));
   }
   async resume(id: string, ctx: StartContext) {
@@ -260,21 +264,35 @@ describe("깊이 조사: plan → approve → research → verified report", () 
     const tools = t.fake.contexts.map((c) => c.tools);
     expect(tools).toContainEqual(["web_search", "web_fetch", "web_find"]);
     expect(tools.at(-1)).toEqual(["cite"]);
-    // The writer's sentence on the failed citation and its uncited one are gone (decision 4), counted in 한계.
-    expect(end.result).toMatchObject({ removed: 2, citations: 3, timedOut: false, fallback: false });
+    // The writer's sentence on the failed citation and its uncited one are gone (decision 4), counted in 한계. Its
+    // three passages are of two pages: two sources (#233).
+    expect(end.result).toMatchObject({ removed: 2, citations: 2, timedOut: false, fallback: false });
+    // #233: the lead outlined the report first (no tools), and the writer got that outline.
+    const outlineAt = t.counting.turns.findIndex((x) => x.startsWith(TURN_MARK.outline));
+    const writerAt = t.counting.turns.findIndex((x) => x.startsWith(TURN_MARK.writer));
+    expect(outlineAt).toBeGreaterThan(-1);
+    expect(writerAt).toBeGreaterThan(outlineAt);
+    expect(t.counting.turns[writerAt]).toContain('source="research-outline"');
+    expect(t.counting.turns[writerAt]).toContain('{"heading":"요약"');
+    expect(t.counting.turns[writerAt]).toContain('{"heading":"시사점"');
+    expect(tools.at(-2)).toEqual([]);
     const a = t.app.artifacts!.get(end.result!.artifactId)!;
     expect(a.kind).toBe("markdown");
     const content = t.app.artifacts!.version(a.id, 1)!.content;
-    expect(content).toMatch(/^# 10월 반도체 수출 조사\n/);
+    expect(content).toMatch(/^# `10월 반도체 수출 조사`\n/);
     expect(content).not.toContain("50%");
     expect(content).not.toContain("미국 수출 비중");
     expect(content).toContain("가나다 신문은 32% 증가로 보도했어요[");
     expect(content).toContain("## 출처");
     expect(content).toContain("서버가 원문과 대조해 확인하지 못한 문장 2개를 보고서에서 뺐어요.");
-    // Markers numbered 1… in order of appearance, every one listed with its passage.
+    // Markers numbered 1… by source in order of appearance, every source listed with its passages under it.
     const marks = [...new Set([...content.matchAll(/\[(\d)\]/g)].map((m) => Number(m[1])))];
-    expect(marks).toEqual([1, 2, 3]);
+    expect(marks).toEqual([1, 2]);
     expect(content).toContain(`(<${A.url}>)`);
+    expect(content).toMatch(/\n1\. \[[^\n]+\n {3}- `[^\n]+\n {3}- `[^\n]+\n2\. /);
+    // An interpretive sentence citing the facts it builds on stays, as does the 시사점 section (#233).
+    expect(content).toContain("어느 자료인지 밝혀 인용하는 편이 안전해요[1][2].");
+    expect(content).toContain("## 시사점\n\n- 수치를 쓸 때: 보도와 통계 중 어느 쪽인지 함께 밝혀요[1][2].");
     // The card's message: the summary and the report's card.
     const card = t.app.conversations!.messageById(done.messageId)!.parts as MessagePart[];
     expect(card.map((p) => p.type)).toEqual(["research", "text", "artifact_ref"]);
@@ -479,7 +497,7 @@ describe("깊이 조사: plan → approve → research → verified report", () 
     const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
     // The fake writer cites file notes with file_cite: the report lists the file with its passage.
     // The verified place of the passage (the check's own locator, not a page the model named).
-    expect(content).toMatch(/📎 실적\.txt · \S/);
+    expect(content).toMatch(/📎 `실적\.txt`\n {3}- `[^`\n]+` — `/);
     expect(content).toContain("1,234억");
   });
 });
@@ -545,7 +563,9 @@ describe("깊이 조사: the 30-minute cap, stop and restart", () => {
     const result = JSON.parse(done.result!) as { timedOut: boolean; fallback: boolean; removed: number };
     expect(result).toMatchObject({ timedOut: true, fallback: true });
     const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
-    expect(content).toContain(`“${RESEARCH_FIXTURE.memory.replace(".", "")}`);
+    // The fallback lists the verified passages as written (as code: nothing in them read as Markdown).
+    expect(content).toContain(`\`${RESEARCH_FIXTURE.memory}\``);
+    expect(content).not.toMatch(/[\u2060\u200B-\u200D\uFEFF]/);
     expect(content).toContain("확인된 원문 구절을 하위 질문별로 그대로 정리했어요");
     expect(content).not.toContain("쓰는 중");
   });
@@ -593,6 +613,340 @@ describe("깊이 조사: the 30-minute cap, stop and restart", () => {
     expect(asked).toHaveLength(1);
     expect(asked[0]).toContain("수출 증가의 배경");
     expect(JSON.parse(done.result!)).toMatchObject({ timedOut: false });
+  });
+
+  it("asks for the outline once per job: a restart while writing uses the checkpoint's (#233)", async () => {
+    const db = createTestDb();
+    const holdWriter = scripted((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ gate: "outline-restart-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: holdWriter });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    // Kept keyless (review 17): the stored rows' masking never meets an object key.
+    expect(t1.app.research!.get(job.id)!.state).toContain('"outline":[["요약"');
+    await t1.app.close();
+    expect(t1.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(1);
+
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(0);
+    const writer = t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).toContain('{"heading":"요약"');
+  });
+
+  it("masks a checkpoint's outline with the secrets known now when it resumes (#233 review 16)", async () => {
+    const db = createTestDb();
+    const token = `resume-${crypto.randomBytes(12).toString("base64url")}`;
+    const ids = (x: string) => [...x.matchAll(/^\{"note":"([^"]+)"/gm)].map((m) => m[1]);
+    const first = scripted((x) =>
+      x.startsWith(TURN_MARK.writer)
+        ? [{ gate: "outline-mask-hold" }]
+        : x.startsWith(TURN_MARK.outline)
+          ? [
+              {
+                text: JSON.stringify({
+                  sections: [
+                    { heading: `요약 ${token}`, notes: ids(x) },
+                    { heading: "시사점", notes: ids(x) },
+                  ],
+                }),
+              },
+            ]
+          : undefined,
+    );
+    const t1 = await start({ db, script: first });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    await t1.app.close();
+    // Registered while the server was down: the checkpoint still holds it, the resumed writer never sees it.
+    expect(t1.app.research!.get(job.id)!.state).toContain(token);
+    knownSecrets.add(token);
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    const writer = t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).toContain('{"heading":"요약 [숨김]"');
+    expect(writer).not.toContain(token);
+  });
+
+  it("masks outline fields one by one: a secret like `sections…` never breaks the outline (#233 review 16)", async () => {
+    knownSecrets.add("sections-testfixture");
+    const t = await start();
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done", "failed");
+    expect(done.status).toBe("done");
+    expect(t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))).toContain('{"heading":"요약"');
+  });
+
+  it("keeps the outline across a restart with a `sections…` secret registered (#233 review 17)", async () => {
+    knownSecrets.add("sections-testfixture");
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ gate: "outline-keys-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    await t1.app.close();
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(0);
+    const writer = t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).toContain('{"heading":"요약"');
+    expect(writer).toContain('{"heading":"시사점"');
+  });
+
+  it("asks again when the stored outline cannot be read (#233 review 17)", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ gate: "outline-shape-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    await t1.app.close();
+    // A masked key (as an older checkpoint's shape would be): not readable.
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const st = JSON.parse(row.state) as Record<string, unknown>;
+    st.outline = { "[숨김]": [] };
+    db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(st), job.id);
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(1);
+    expect(t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))).toContain('{"heading":"요약"');
+  });
+
+  it("masks the question and the notes with the secrets known now in both turns after a restart (#233 review 17)", async () => {
+    const db = createTestDb();
+    const token = `note-${crypto.randomBytes(12).toString("base64url")}`;
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.outline)
+        ? [{ gate: "mask-turns-hold" }]
+        : x.startsWith(TURN_MARK.subagent)
+          ? [
+              { call: "web_fetch", input: { url: A.url } },
+              {
+                textRefs: `NOTE ${JSON.stringify({ claim: `메모리 ${token}`, sourceId: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory })}\nDONE`,
+              },
+            ]
+          : undefined,
+    );
+    const t1 = await start({ db, script });
+    const { job } = await begin(t1, `10월 반도체 수출을 깊이 조사해 줘 ${token}`);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.outline)), "the outline");
+    await t1.app.close();
+    expect(t1.app.research!.get(job.id)!.state).toContain(token);
+    knownSecrets.add(token);
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    const turns = t2.counting.turns.filter(
+      (x) => x.startsWith(TURN_MARK.outline) || x.startsWith(TURN_MARK.writer),
+    );
+    expect(turns).toHaveLength(2);
+    for (const x of turns) expect(x).not.toContain(token);
+    expect(turns[1]).toContain("메모리 [숨김]");
+  });
+
+  it("masks the writer's turn with a secret registered while the outline step runs (#233 review 18)", async () => {
+    const token = `during-${crypto.randomBytes(12).toString("base64url")}`;
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.outline)
+        ? [{ gate: "outline-during-hold" }, ...(researchSteps(x) ?? [])]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t, `10월 반도체 수출을 깊이 조사해 줘 ${token}`);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t.counting.turns.some((x) => x.startsWith(TURN_MARK.outline)), "the outline");
+    knownSecrets.add(token);
+    releaseGate("outline-during-hold");
+    await statusIs(t.app, job.id, "done");
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).not.toContain(token);
+    expect(writer).toContain("[숨김]");
+  });
+
+  for (const [what, value] of [
+    ["an empty outline", []],
+    [
+      "an outline whose notes are not this job's",
+      [
+        ["요약", "", "", ["zz-1"]],
+        ["시사점", "", "", ["zz-2"]],
+      ],
+    ],
+  ] as const)
+    it(`asks again when the stored outline no longer fits: ${what} (#233 review 18)`, async () => {
+      const db = createTestDb();
+      const hold = scripted((x) =>
+        x.startsWith(TURN_MARK.writer) ? [{ gate: `outline-fit-hold-${what}` }] : undefined,
+      );
+      const t1 = await start({ db, script: hold });
+      const { job } = await begin(t1);
+      await statusIs(t1.app, job.id, "awaiting_approval");
+      await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+      await t1.app.close();
+      const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+        state: string;
+      };
+      const st = JSON.parse(row.state) as Record<string, unknown>;
+      st.outline = value;
+      db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(st), job.id);
+      const t2 = await start({ db, family: false });
+      await statusIs(t2.app, job.id, "done");
+      expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(1);
+      expect(t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))).toContain('{"heading":"요약"');
+    });
+
+  it("asks no outline again when the checkpoint says it gave none (#233 review 18)", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.writer) ? [{ gate: "outline-null-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.turns.some((x) => x.startsWith(TURN_MARK.writer)), "the writer");
+    await t1.app.close();
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const st = JSON.parse(row.state) as Record<string, unknown>;
+    st.outline = null;
+    db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(st), job.id);
+    const t2 = await start({ db, family: false });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(0);
+    expect(t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))).not.toContain("개요 (");
+  });
+
+  it("builds each turn when it is sent: a secret registered while the session starts never reaches it (#233 review 19)", async () => {
+    const token = `starting-${crypto.randomBytes(12).toString("base64url")}`;
+    const t = await start();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let waiting = 0;
+    // The writer's and the outline's sessions are slow to start.
+    t.counting.beforeStart = async (ctx) => {
+      if (/보고서 작성자|보고서의 \*\*개요\*\*|개요\*\*만/.test(ctx.systemPrompt)) {
+        waiting++;
+        await held;
+      }
+    };
+    const { job } = await begin(t, `10월 반도체 수출을 깊이 조사해 줘 ${token}`);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => waiting > 0, "a session starting");
+    knownSecrets.add(token);
+    release();
+    await statusIs(t.app, job.id, "done");
+    const turns = t.counting.turns.filter(
+      (x) => x.startsWith(TURN_MARK.outline) || x.startsWith(TURN_MARK.writer),
+    );
+    expect(turns).toHaveLength(2);
+    for (const x of turns) expect(x).not.toContain(token);
+  });
+
+  it("builds the writer's turn when it is sent: a secret registered while only its session starts is masked (#233 review 20)", async () => {
+    const token = `writer-start-${crypto.randomBytes(12).toString("base64url")}`;
+    const t = await start();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let waiting = false;
+    // Only the writer's session is slow to start — the outline's turn has been sent already.
+    t.counting.beforeStart = async (ctx) => {
+      if (/보고서 작성자/.test(ctx.systemPrompt)) {
+        waiting = true;
+        await held;
+      }
+    };
+    const { job } = await begin(t, `10월 반도체 수출을 깊이 조사해 줘 ${token}`);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => waiting, "the writer's session starting");
+    // The outline was asked before the secret was known: its turn has the token (so this is the writer's own case).
+    expect(t.counting.turns.find((x) => x.startsWith(TURN_MARK.outline))).toContain(token);
+    knownSecrets.add(token);
+    release();
+    await statusIs(t.app, job.id, "done");
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).not.toContain(token);
+    expect(writer).toContain("[숨김]");
+  });
+
+  it("gives the writer the outline through the known secrets, as the checkpoint stores it (#233 review 15)", async () => {
+    const secret = `outline-${crypto.randomBytes(12).toString("base64url")}`;
+    knownSecrets.add(secret);
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.outline)
+        ? [
+            {
+              textRefs: JSON.stringify({
+                sections: [
+                  {
+                    heading: `요약 ${secret}`,
+                    notes: [...x.matchAll(/^\{"note":"([^"]+)"/gm)].map((m) => m[1]),
+                  },
+                  { heading: "시사점", notes: [...x.matchAll(/^\{"note":"([^"]+)"/gm)].map((m) => m[1]) },
+                ],
+              }),
+            },
+          ]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).toContain('{"heading":"요약 [숨김]"');
+    expect(writer).not.toContain(secret);
+    expect(t.app.research!.get(job.id)!.state).not.toContain(secret);
+  });
+
+  it("goes on to the writer when the outline's checkpoint is not saved, and finishes (#233 review 15)", async () => {
+    const t = await start();
+    const store = (t.app.research as unknown as { deps: { store: { update: (...a: unknown[]) => boolean } } })
+      .deps.store;
+    // One write fails: the outline's checkpoint (the database busy for a moment).
+    const update = store.update.bind(store);
+    let failed = 0;
+    store.update = (...a: unknown[]) => {
+      const patch = a[1] as { state?: { outline?: unknown } };
+      if (!failed && patch.state?.outline !== undefined) {
+        failed++;
+        throw new Error("database busy");
+      }
+      return update(...a);
+    };
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    expect(failed).toBe(1);
+    expect(t.counting.turns.filter((x) => x.startsWith(TURN_MARK.outline))).toHaveLength(1);
+    const writer = t.counting.turns.filter((x) => x.startsWith(TURN_MARK.writer));
+    expect(writer).toHaveLength(1);
+    expect(writer[0]).toContain('{"heading":"요약"');
+    expect(JSON.parse(done.result!)).toMatchObject({ fallback: false, citations: 2 });
   });
 
   it("past its deadline after a restart, the job is written up from what was verified", async () => {
@@ -972,7 +1326,25 @@ describe("깊이 조사: review 1 (#212)", () => {
     await statusIs(t.app, job.id, "awaiting_approval");
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     const done = await statusIs(t.app, job.id, "done");
-    expect(JSON.parse(done.result!)).toMatchObject({ fallback: true, removed: 2 });
+    // The fallback report numbers by source too: three passages of two pages (#233).
+    expect(JSON.parse(done.result!)).toMatchObject({ fallback: true, removed: 2, citations: 2 });
+    const fb = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
+    expect(fb).toMatch(/\n1\. \[[^\n]+\n {3}- `[^\n]+\n {3}- `[^\n]+\n2\. /);
+    expect([...new Set([...fb.matchAll(/\[(\d)\]/g)].map((m) => m[1]))]).toEqual(["1", "2"]);
+  });
+
+  it("writes without an outline when the outline step gives nothing usable (#233)", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.outline) ? [{ text: "개요를 못 만들었어요." }] : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    expect(JSON.parse(done.result!)).toMatchObject({ fallback: false, removed: 2, citations: 2 });
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).not.toContain("개요 (");
   });
 
   it("finishes once: a report this job already made is used again, not doubled", async () => {

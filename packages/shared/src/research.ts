@@ -114,7 +114,11 @@ export const ResearchQuestionState = z.object({
   /** Which round asked it: 0 = the plan, 1–2 = gap-filling rounds. */
   round: z.number().int().min(0),
   status: z.enum(["waiting", "running", "done", "capped", "failed"]),
-  /** Distinct sources (pages, files) its verified notes rest on. */
+  /**
+   * Distinct sources (pages, files) its verified notes rest on — "검증한 자료" on the card, cited in the report or not:
+   * a web page by the hash of its stored body (#234 — the same body under another address is one; a row without a body
+   * hash by its final address's page key), an attachment by its file id (two files with the same content are two).
+   */
   sources: z.number().int().min(0),
   /** Notes the server could verify / that it dropped. */
   notes: z.number().int().min(0),
@@ -145,7 +149,10 @@ export const ResearchResult = z.object({
   version: z.number().int().positive(),
   /** Sentences removed because no server-checked citation backs them (shown in the report's "한계"). */
   removed: z.number().int().min(0),
-  /** Citations the report keeps (all verified). */
+  /**
+   * Sources the report cites (all verified) — "보고서에 인용한 출처" on the card: one per page (its stored final
+   * address, fragment dropped) or file, as the report's 출처 list numbers them (#233). Not the same count as `sources`.
+   */
   citations: z.number().int().min(0),
   /** The 30-minute cap ended research early: "시간 상한으로 일부만 조사". */
   timedOut: z.boolean(),
@@ -166,7 +173,7 @@ export const ResearchJob = z.object({
   stage: z.enum(["plan", "research", "write", "end"]),
   round: z.number().int().min(0),
   questions: z.array(ResearchQuestionState),
-  /** Distinct verified sources so far. */
+  /** Distinct verified sources so far — "검증한 자료", counted as a question's `sources` (not `result.citations`). */
   sources: z.number().int().min(0),
   /** Active time used so far (approval wait excluded), and the server's hard deadline once approved. */
   elapsedMs: z.number().int().min(0),

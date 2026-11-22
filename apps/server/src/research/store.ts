@@ -12,6 +12,7 @@ import {
 import type { Db } from "../db/client.js";
 import { researchJobs } from "../db/schema.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import type { ReportOutline } from "./prompts.js";
 
 export type ResearchJobRow = typeof researchJobs.$inferSelect;
 
@@ -68,6 +69,29 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
 };
 
 /** The checkpoint (`research_jobs.state`): written after every step. */
+/** An outline as the checkpoint keeps it: one `[heading, question, analysis, noteIds]` per section. */
+export type StoredOutline = [string, string, string, string[]][];
+
+/** The outline in its stored, keyless shape. */
+export function storeOutline(o: ReportOutline): StoredOutline {
+  return o.sections.map((x) => [x.heading, x.question, x.analysis, [...x.notes]]);
+}
+
+/** The outline from its stored shape; anything else (an older or a masked shape): none. */
+export function restoreOutline(v: unknown): ReportOutline | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const sections: ReportOutline["sections"] = [];
+  for (const x of v) {
+    if (!Array.isArray(x) || x.length !== 4) return undefined;
+    const [heading, question, analysis, notes] = x as unknown[];
+    if (typeof heading !== "string" || typeof question !== "string" || typeof analysis !== "string")
+      return undefined;
+    if (!Array.isArray(notes) || !notes.every((n) => typeof n === "string")) return undefined;
+    sections.push({ heading, question, analysis, notes: notes as string[] });
+  }
+  return { sections };
+}
+
 export type JobState = {
   stage: "plan" | "research" | "write" | "end";
   /** The research round being run (0 = the plan's questions). */
@@ -82,6 +106,12 @@ export type JobState = {
    * stays within them — a files-only plan never searches the web.
    */
   scopes?: ("web" | "files")[] | undefined;
+  /**
+   * The report's outline (#233), once the lead's outline step ran: its sections as `[heading, question, analysis,
+   * noteIds]` (arrays only — the stored rows' masking reads object keys too, review 17), or `null` when it gave none.
+   * A restart while writing uses it again instead of asking again (absent, or a shape it cannot read: not asked yet).
+   */
+  outline?: StoredOutline | null | undefined;
 };
 
 export const emptyState = (): JobState => ({
