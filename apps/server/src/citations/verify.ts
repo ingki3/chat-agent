@@ -398,8 +398,11 @@ const firstChar = (s: string) => Array.from(s)[0] ?? "";
  * a hit too (cheap next to normalising), so a hash that no longer matches its body is never trusted.
  */
 const BODY_CACHE_SIZE = 4;
-/** Texts normalised so far, snippets included (tests check that a repeated page comes from the cache). */
-export const verifyStats = { normalized: 0 };
+/**
+ * Texts normalised so far, snippets included (tests check that a repeated page comes from the cache), and how often a
+ * text's gap marks were collected (`gapRanges` — once per check or search, #234).
+ */
+export const verifyStats = { normalized: 0, gapRanges: 0 };
 type Page = { n: Normalized; d: Decoded };
 const bodyCache = new Map<string, { body: string; page: Page }>();
 /**
@@ -442,6 +445,7 @@ export const stripGapMarks = (t: string) => (t.includes(GAP_MARK) ? t.replaceAll
  * so — the cut keeps marks whole) reaches the end of the text.
  */
 export function gapRanges(body: string): [number, number][] {
+  verifyStats.gapRanges++;
   const out: [number, number][] = [];
   for (let a = body.indexOf(GAP_MARK); a !== -1;) {
     const b = body.indexOf(GAP_MARK, a + 1);
