@@ -2709,6 +2709,61 @@ describe("깊이 조사: live progress — activity, phase, last activity (#232)
     await statusIs(t.app, job.id, "done", "failed");
   });
 
+  it("counts what a retry's merge leaves out as 제외 too: a duplicate of the first run's note, or one over the cap", async () => {
+    const note = (claim: string, ref: string, quote: string) =>
+      `NOTE ${JSON.stringify({ claim, sourceId: ref, quote })}\n`;
+    const run = async (o: {
+      limits?: { notesPerQuestion: number };
+      first: FakeStep[];
+      retry: FakeStep[];
+    }) => {
+      const script = scripted((x) =>
+        x.startsWith(TURN_MARK.subagent) && /증가율/.test(x)
+          ? x.includes(RETRY_MARK)
+            ? o.retry
+            : o.first
+          : undefined,
+      );
+      const t = await start({ script, ...(o.limits ? { limits: o.limits } : {}) });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await statusIs(t.app, job.id, "done");
+      return (await view(t, job.id)).questions[0]!;
+    };
+    const [Pa, Pb] = FIXTURE_PAGES as [{ url: string }, { url: string }];
+    // One verified note from one page (so retried); the retry finds the same passage again: kept once, 제외 1.
+    const dup = await run({
+      first: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        { textRefs: note("메모리", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE" },
+      ],
+      retry: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        { textRefs: note("메모리 다시", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE" },
+      ],
+    });
+    expect(dup).toMatchObject({ notes: 1, dropped: 1 });
+    // At the cap (2 here) from one page, the retry adds one from another page: still 2 kept, 제외 1.
+    const cap = await run({
+      limits: { notesPerQuestion: 2 },
+      first: [
+        { call: "web_fetch", input: { url: Pa.url } },
+        {
+          textRefs:
+            note("증가", "{{$0.sourceId}}", RESEARCH_FIXTURE.growth) +
+            note("메모리", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) +
+            "DONE",
+        },
+      ],
+      retry: [
+        { call: "web_fetch", input: { url: Pb.url } },
+        { textRefs: note("통계", "{{$0.sourceId}}", RESEARCH_FIXTURE.stats) + "DONE" },
+      ],
+    });
+    expect(cap).toMatchObject({ notes: 2, dropped: 1 });
+  });
+
   it("a wall clock set back never holds an activity broadcast back longer than one window", async () => {
     const clock = new ManualClock();
     const script = held((x) =>

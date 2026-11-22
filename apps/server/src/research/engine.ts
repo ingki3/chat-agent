@@ -1053,7 +1053,12 @@ export class ResearchEngine {
             const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
-            q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
+            // Every note left out (#232: the card's 제외): not verified, and what the merge with the first run's
+            // dropped — a duplicate of one of them, or over the cap.
+            q.dropped =
+              (q.retried ? q.dropped : 0) +
+              (raw.length - checked.notes.length) +
+              Math.max(0, before.length + checked.notes.length - notes.length);
             // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
             q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
             q.status =
