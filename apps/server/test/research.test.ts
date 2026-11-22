@@ -1712,9 +1712,11 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       "이는 선적 기준과 통관 기준의 차이 때문이다.",
     ]);
     const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    // The background question: one note dropped by the check, and the retry's repeat of a kept one left out by the
+    // merge (#232: both are 제외).
     expect(end.questions.map((q) => [q.status, q.notes, q.sources, q.dropped])).toEqual([
       ["done", 2, 2, 1],
-      ["done", 2, 2, 1],
+      ["done", 2, 2, 2],
     ]);
     // Raw API answer (no schema parse): the retry's bookkeeping and the notes stay on the server.
     const raw = JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
