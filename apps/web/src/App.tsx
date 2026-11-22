@@ -96,7 +96,10 @@ function AuthGate() {
           <Route path="watchlist" element={<Navigate to="/" replace />} />
           <Route path="a/:id" element={<ArtifactRoute />} />
           <Route path="notifications" element={<NotificationsPage />} />
-          <Route path="settings" element={<SettingsPage onChanged={set} isAdmin={isAdmin} />} />
+          <Route
+            path="settings"
+            element={<SettingsPage onChanged={set} isAdmin={isAdmin} viaAccess={!!data.accessEmail} />}
+          />
           <Route path="settings/instructions" element={<InstructionsPage />} />
           <Route
             path="admin"
