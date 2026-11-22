@@ -255,3 +255,55 @@ describe("a retry's hints name only its scope's tools (#234)", () => {
     expect(turn("both")).toContain("file_search");
   });
 });
+
+describe("web_find review #237 6차", () => {
+  it("a phrase in a stretch longer than a passage: the passage holds all of it, context around it", () => {
+    const body = `${"가".repeat(389)}대학입학전형 시행계획${"나".repeat(400)}`;
+    const r = findPassages(body, "대학입학전형 시행계획", 5);
+    expect(r.total).toBe(1);
+    const p = r.passages[0]!;
+    expect(p.phrase).toBe(true);
+    expect(p.text).toContain("대학입학전형 시행계획");
+    expect(p.end - p.start).toBeLessThanOrEqual(700);
+    expect(p.start).toBeGreaterThan(0);
+    expect(p.end).toBeLessThan(body.length);
+  });
+
+  it("a decomposed (NFD) page matches a composed query — alone and across the old 400-character split", () => {
+    const phrase = "대학입학전형시행계획";
+    const nfd = phrase.normalize("NFD");
+    const alone = `올해 ${nfd}을 발표했다.`;
+    const one = findPassages(alone, phrase, 5);
+    expect(one.passages[0]!.phrase).toBe(true);
+    expect(one.passages[0]!.text.normalize("NFC")).toContain(phrase);
+    const solid = `${"가".repeat(396)}${nfd}${"나".repeat(50)}`;
+    const across = findPassages(solid, phrase, 5);
+    expect(across.total).toBe(1);
+    expect(across.passages[0]!.phrase).toBe(true);
+    expect(across.passages[0]!.text.normalize("NFC")).toContain(phrase);
+  });
+
+  it("another page's own U+E000 stays in the passage, which then verifies as it stands", () => {
+    const body = `이 문서의 기호는 A${GAP_MARK}B로 표시한다.`;
+    const [p] = findPassages(body, "기호", 5).passages;
+    expect(p!.text).toContain(GAP_MARK);
+    expect(findSnippet(body, p!.text).found).toBe(true);
+  });
+
+  it("a long PDF with many marks and many matches is searched and checked quickly (marks once per search)", () => {
+    const page = "신청 기간은 9월이다. 신청 방법은 누리집에서 한다. ".repeat(60);
+    const text = Array.from({ length: 90 }, () => page).join(`\n\n${PAGE_GAP}\n\n`);
+    expect(text.length).toBeGreaterThan(150_000);
+    let t0 = performance.now();
+    const r = findPassages(text, "신청", 8, { gaps: true });
+    const search = performance.now() - t0;
+    expect(r.total).toBeGreaterThan(1000);
+    t0 = performance.now();
+    findSnippet(text, "신청 방법은 누리집에서 한다", undefined, { gaps: true });
+    findSnippet(text, "없는 문장이 하나 있다고 한다", undefined, { gaps: true });
+    const check = performance.now() - t0;
+    // Generous bounds for a laptop under test load (before: ~400 ms for the search alone).
+    expect(search).toBeLessThan(250);
+    expect(check).toBeLessThan(250);
+  });
+});

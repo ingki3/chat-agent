@@ -8,7 +8,7 @@ import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
-import { cutOutsideGap, stripGapMarks, visibleIndex } from "../citations/verify.js";
+import { cutOutsideGap, hasGapMarks, stripGapMarks, visibleIndex } from "../citations/verify.js";
 import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
@@ -522,8 +522,8 @@ export class WebService {
     if (!r.ok) return { ok: false, code: code(r.code) };
     const finalUrl = typeof r.finalUrl === "string" ? linkOf(r.finalUrl) : undefined;
     if (!finalUrl) return { ok: false, code: "web_failed" };
-    // No page text carries the PDF reader's gap mark (#234, review #237 4차): only a mark it put there is one.
-    let text = typeof r.text === "string" ? stripGapMarks(r.text) : "";
+    // A page's own text as it is: a U+E000 in it is ordinary text — only a web PDF's marks are honoured (#234).
+    let text = typeof r.text === "string" ? r.text : "";
     let truncated = r.truncated === true;
     let title = typeof r.title === "string" ? r.title : undefined;
     let unread = false;
@@ -566,7 +566,10 @@ export class WebService {
       truncated,
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
-    const excerpt = stripGapMarks(text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text);
+    const pdf = hasGapMarks(row.contentType);
+    const cutText = text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text;
+    // A web PDF is shown without its marks' U+E000 and counted as its visible text; other pages as they are.
+    const excerpt = pdf ? stripGapMarks(cutText) : cutText;
     return {
       ok: true,
       output: {
@@ -579,7 +582,7 @@ export class WebService {
         contentType: row.contentType,
         // Official / academic / other by the address (#234): primary sources first.
         sourceType: sourceTypeOf(row.finalUrl ?? row.url),
-        characters: visibleIndex(text, text.length),
+        characters: pdf ? visibleIndex(text, text.length) : text.length,
         excerptCharacters: excerpt.length,
         truncated: row.truncated,
         // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).

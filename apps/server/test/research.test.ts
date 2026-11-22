@@ -1460,6 +1460,52 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(reflect).toContain("미국 수출 비중이 가장 컸다");
   });
 
+  it("no verified note but claims that failed: the lead's gap question to check them is added and run", async () => {
+    const gapRuns: string[] = [];
+    const script = scripted((x) => {
+      if (x.startsWith(TURN_MARK.reflect))
+        return [
+          {
+            text: JSON.stringify({
+              gaps: [{ question: "확인 못 한 증가율을 1차 자료로 확인", scope: "web" }],
+            }),
+          },
+        ];
+      if (!x.startsWith(TURN_MARK.subagent)) return undefined;
+      if (x.includes("확인 못 한 증가율") && !x.includes(RETRY_MARK)) {
+        gapRuns.push(x);
+        return [
+          { call: "web_fetch", input: { url: A.url } },
+          {
+            textRefs: notes({
+              claim: "메모리 가격 회복",
+              ref: "{{$0.sourceId}}",
+              quote: RESEARCH_FIXTURE.memory,
+            }),
+          },
+        ];
+      }
+      if (x.includes(RETRY_MARK)) return [{ text: "DONE" }];
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        {
+          textRefs: notes({
+            claim: "수출이 50% 늘었다",
+            ref: "{{$0.sourceId}}",
+            quote: RESEARCH_FIXTURE.wrong,
+          }),
+        },
+      ];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect(gapRuns).toHaveLength(1);
+    expect(stateOf(t, job.id).questions.some((q) => q.question.includes("확인 못 한 증가율"))).toBe(true);
+  });
+
   it("a passing runtime error is retried once; an account's state (login) never — even with a note kept", async () => {
     for (const [first, retried, status] of [
       [[{ fail: "boom" }], true, "done"],

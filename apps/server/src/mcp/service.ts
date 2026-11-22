@@ -1694,14 +1694,15 @@ export class McpService {
     const { total, passages } = findPassages(body, input.query, input.maxResults ?? 5, {
       gaps: hasGapMarks(row.contentType),
     });
-    const at = (p: { start: number }) => visibleIndex(body, p.start);
+    const pdf = hasGapMarks(row.contentType);
+    const at = (p: { start: number }) => (pdf ? visibleIndex(body, p.start) : p.start);
     return {
       ok: true,
       output: {
         sourceId: row.id,
         url: row.finalUrl ?? row.url,
         site: row.site,
-        characters: visibleIndex(body, body.length),
+        characters: pdf ? visibleIndex(body, body.length) : body.length,
         status: passages.length ? "find_found" : "find_none",
         matches: total,
         results: passages.map((p, i) => ({ n: i + 1, at: at(p), phrase: p.phrase })),

@@ -3,7 +3,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
-import { visibleIndex } from "../citations/verify.js";
+import { hasGapMarks, visibleIndex } from "../citations/verify.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 
 export type SourceRow = typeof sources.$inferSelect;
@@ -55,8 +55,12 @@ export function toSource(r: SourceRow): Source {
     fetchedAt: r.fetchedAt,
     contentType: r.contentType ?? null,
     bodyHash: r.bodyHash ?? null,
-    // Visible characters: a web PDF's gap marks (U+E000, #234) are not text.
-    characters: r.body ? visibleIndex(r.body, r.body.length) : 0,
+    // Visible characters: a web PDF's gap marks (U+E000, #234) are not text; any other page counts as stored.
+    characters: r.body
+      ? hasGapMarks(r.contentType)
+        ? visibleIndex(r.body, r.body.length)
+        : r.body.length
+      : 0,
     truncated: r.truncated,
     snippet: r.snippet ?? null,
   };

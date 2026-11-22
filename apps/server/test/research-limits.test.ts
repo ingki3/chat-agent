@@ -239,7 +239,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(await reader(scans)).toMatchObject({ ok: true, text: "" });
   });
 
-  it("the stored PDF text is cut before a gap mark, never through it; a page's own U+E000 is dropped", async () => {
+  it("the stored PDF text is cut before a gap mark, never through it; another page's own U+E000 is kept", async () => {
     const head = "가".repeat(PDF_TEXT_CHARS - 4);
     const reader: PdfReader = async () => ({
       ok: true,
@@ -261,7 +261,9 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(rows[0]!.body).not.toContain(GAP_MARK);
     await call("web_fetch", { url: "http://public.test/pua.txt" });
     const plain = f.sources.list(f.c.id)[1]!;
-    expect(plain.body).toBe("개인 영역 문자가 섞인 글이다.");
+    // Not a PDF: its own U+E000 is ordinary text, kept and counted (review #237 6차).
+    expect(plain.body).toBe(`개인 영역 문자${GAP_MARK}가 섞인 글이다.`);
+    expect(toSource(plain).characters).toBe(plain.body!.length);
   });
 
   it("a PDF's counts and web_find places are of the visible text (the marks' U+E000 left out)", async () => {

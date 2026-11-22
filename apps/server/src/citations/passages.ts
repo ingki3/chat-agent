@@ -1,4 +1,4 @@
-import { GAP_MARK, KOREAN_PARTICLES, PAGE_GAP, touchesGap } from "./verify.js";
+import { GAP_MARK, gapRanges, KOREAN_PARTICLES, PAGE_GAP } from "./verify.js";
 
 /**
  * Passages of a stored page text (#234): its sentences, and the words they share with a query — for `web_find`, where
@@ -90,8 +90,11 @@ export function termsOf(text: string): string[] {
 /** Lower case, NFC, whitespace runs as one space — for finding a phrase. */
 const flat = (s: string) => s.normalize("NFC").replace(/\s+/gu, " ").trim().toLowerCase();
 /** A passage as it is shown and quoted: the page's characters, whitespace runs as one space. */
-export const passageText = (text: string, r: Range) =>
-  text.slice(r.start, r.end).replaceAll(GAP_MARK, "").replace(/\s+/gu, " ").trim();
+export const passageText = (text: string, r: Range, gaps = false) => {
+  const raw = text.slice(r.start, r.end);
+  // Only a web PDF's U+E000 is a mark (shown without it); anywhere else it is the page's own character.
+  return (gaps ? raw.replaceAll(GAP_MARK, "") : raw).replace(/\s+/gu, " ").trim();
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // web_find
@@ -101,27 +104,43 @@ export type FoundPassage = Range & { text: string; phrase: boolean; score: numbe
 /** Characters of one returned passage at most (the matching sentence and what fits of its neighbours). */
 export const FIND_PASSAGE_CHARS = 700;
 
-/** Lower case, whitespace runs as one space, and for each character of that where it stands in `text`. */
+/** A code point that belongs to the cluster before it: a combining mark or a Hangul medial/final jamo (NFD). */
+const JOINS = /^[\p{M}ᅠ-ᇿힰ-퟿]$/u;
+
+/**
+ * Lower case, NFC, whitespace runs as one space — and for each character of that where it stands in `text`. NFC is
+ * taken per cluster (a character with its combining marks, a decomposed Hangul syllable), so a decomposed page
+ * matches a composed query and every position still points into the original text (review #237 6차).
+ */
 function flatMap(text: string): { s: string; at: number[] } {
   const out: string[] = [];
   const at: number[] = [];
   let space = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (/\s/u.test(c)) {
+  let i = 0;
+  while (i < text.length) {
+    const start = i;
+    const first = text.codePointAt(i)!;
+    i += first > 0xffff ? 2 : 1;
+    while (i < text.length) {
+      const cp = text.codePointAt(i)!;
+      if (!JOINS.test(String.fromCodePoint(cp))) break;
+      i += cp > 0xffff ? 2 : 1;
+    }
+    const cluster = text.slice(start, i);
+    if (/^\s$/u.test(cluster)) {
       space = out.length > 0;
       continue;
     }
     if (space) {
       out.push(" ");
-      at.push(i);
+      at.push(start);
       space = false;
     }
-    const l = c.toLowerCase();
-    for (const ch of l) {
-      out.push(ch);
-      at.push(i);
-    }
+    for (const ch of cluster.normalize("NFC").toLowerCase())
+      for (let k = 0; k < ch.length; k++) {
+        out.push(ch[k]!);
+        at.push(start);
+      }
   }
   return { s: out.join(""), at };
 }
@@ -154,23 +173,29 @@ export function findPassages(
   const want = flat(query);
   const terms = [...new Set(termsOf(query))].filter((t) => t.length > 0);
   if (!want || !terms.length) return { total: 0, passages: [] };
-  const gap = (a: number, b: number) => opts.gaps === true && touchesGap(text, a, b);
+  // The marks' ranges once per search (review #237 6차), each check a binary search.
+  const ranges = opts.gaps === true ? gapRanges(text) : [];
+  const gap = (a: number, b: number) => ranges.length > 0 && overlapsAny(ranges, a, b);
   const need = Math.max(1, Math.ceil(terms.length / 2));
   const sentences = sentenceRanges(text);
   if (!sentences.length) return { total: 0, passages: [] };
-  type Hit = { first: number; last: number; score: number; phrase: boolean };
+  /** `match`: where the phrase itself stands — the passage always holds all of it. */
+  type Hit = { first: number; last: number; score: number; phrase: boolean; match?: Range };
   const hits: Hit[] = [];
   const phrased = new Set<number>();
   // The phrase, in the whole text.
   const f = flatMap(text);
   for (let at = f.s.indexOf(want); at !== -1; at = f.s.indexOf(want, at + 1)) {
     const a = f.at[at]!;
-    const b = f.at[at + want.length - 1]! + 1;
+    const lastAt = f.at[at + want.length - 1]!;
+    // The end of the original cluster the last character came from.
+    let b = lastAt + 1;
+    while (b < text.length && JOINS.test(String.fromCodePoint(text.codePointAt(b)!))) b++;
     if (gap(a, b)) continue;
     const first = sentenceAt(sentences, a);
     const last = sentenceAt(sentences, b - 1);
     for (let k = first; k <= last; k++) phrased.add(k);
-    hits.push({ first, last, score: 2 * terms.length + 1, phrase: true });
+    hits.push({ first, last, score: 2 * terms.length + 1, phrase: true, match: { start: a, end: b } });
   }
   // The words, sentence by sentence.
   for (const [i, r] of sentences.entries()) {
@@ -185,16 +210,31 @@ export function findPassages(
   const taken: FoundPassage[] = [];
   for (const h of hits) {
     if (taken.length >= max) break;
-    const r = withContext(text, sentences, h.first, h.last, gap);
+    const r = withContext(text, sentences, h.first, h.last, gap, h.match);
     if (taken.some((t) => t.start < r.end && r.start < t.end)) continue;
-    taken.push({ ...r, text: passageText(text, r), phrase: h.phrase, score: h.score });
+    taken.push({ ...r, text: passageText(text, r, opts.gaps === true), phrase: h.phrase, score: h.score });
   }
   return { total: hits.length, passages: taken };
+}
+
+/** Whether `[a, b)` overlaps one of the sorted, disjoint `ranges` (binary search). */
+function overlapsAny(ranges: readonly [number, number][], a: number, b: number): boolean {
+  let lo = 0;
+  let hi = ranges.length;
+  // The first range that ends after `a`.
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid]![1] <= a) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < ranges.length && ranges[lo]![0] < b;
 }
 
 /**
  * Sentences `first`–`last` with their neighbours before and after while they fit in `FIND_PASSAGE_CHARS` — never
  * across a PDF page that was not read (`PAGE_GAP`, review #237 2차): a passage is always one stretch of read text.
+ * A phrase's own range (`match`) is always inside the passage (review #237 6차): a stretch too long for the limit is
+ * cut around the match, the room left split before and after it.
  */
 function withContext(
   text: string,
@@ -202,12 +242,20 @@ function withContext(
   first: number,
   last: number,
   gap: (a: number, b: number) => boolean,
+  match?: Range,
 ): Range {
   const own = { start: sentences[first]!.start, end: sentences[last]!.end };
-  // A very long stretch alone is cut at a space near the limit (its start is kept: that is where it matched).
   if (own.end - own.start >= FIND_PASSAGE_CHARS) {
-    const cut = text.lastIndexOf(" ", own.start + FIND_PASSAGE_CHARS);
-    return { start: own.start, end: cut > own.start ? cut : own.start + FIND_PASSAGE_CHARS };
+    if (!match) {
+      // A long sentence of keyword hits is cut at a space near the limit (its start kept).
+      const cut = text.lastIndexOf(" ", own.start + FIND_PASSAGE_CHARS);
+      return { start: own.start, end: cut > own.start ? cut : own.start + FIND_PASSAGE_CHARS };
+    }
+    const room = Math.max(0, FIND_PASSAGE_CHARS - (match.end - match.start));
+    let start = Math.max(own.start, match.start - Math.floor(room / 2));
+    const end = Math.min(own.end, Math.max(match.end, start + FIND_PASSAGE_CHARS));
+    start = Math.max(own.start, Math.min(start, end - FIND_PASSAGE_CHARS));
+    return { start: Math.min(start, match.start), end: Math.max(end, match.end) };
   }
   const blocked = (r: Range | undefined) => !r || gap(r.start, r.end);
   let start = own.start;

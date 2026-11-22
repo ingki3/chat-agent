@@ -519,9 +519,11 @@ export function findSnippetAt(
   if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet)
     return { found: false, reason: "too_short" };
   const page = pageOf(body, cacheKey);
+  // A web PDF's marks, once per check (review #237 6차 — not once per candidate).
+  const ranges = opts.gaps === true ? gapRanges(body) : [];
   // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
   for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const m = matchIn(body, page.n, page.d, want, opts.gaps === true);
+    const m = matchIn(body, page.n, page.d, want, ranges);
     if (m !== undefined) return { found: true, ...m };
   }
   return { found: false, reason: "not_found" };
@@ -536,7 +538,7 @@ function matchIn(
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
-  gaps: boolean,
+  gaps: readonly [number, number][],
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -551,7 +553,7 @@ function matchIn(
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
     // Never on any part of the mark of a page that was not read, nor across it (#234, review #237 2·3차).
-    if (gaps && touchesGap(body, start, end)) continue;
+    if (gaps.length && gaps.some(([a, b]) => a < end && start < b)) continue;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
     // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).

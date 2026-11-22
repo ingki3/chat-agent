@@ -854,6 +854,9 @@ export class ResearchEngine {
         const notes = allNotes(state);
         const ctx = fresh();
         if (!ctx) return void this.fail(row.id, ended!, live);
+        const unverifiedNow = state.questions
+          .flatMap((q) => claimsOf(q.unverified))
+          .slice(0, UNVERIFIED_KEPT * 2);
         // A reflection after a restart is research that ran on too (review #237 5차).
         ran = true;
         const r = await this.step(row, ctx, {
@@ -865,7 +868,7 @@ export class ResearchEngine {
             scopes: state.scopes ?? ["web"],
             asked: state.questions.map((q) => q.question),
             notes: pickNotes(state, this.limits.maxNotes),
-            unverified: state.questions.flatMap((q) => claimsOf(q.unverified)).slice(0, UNVERIFIED_KEPT * 2),
+            unverified: unverifiedNow,
           }),
           tools: [],
           ms: Math.min(REFLECT_MS, researchEnd - this.clock.now()),
@@ -875,7 +878,9 @@ export class ResearchEngine {
         state.reflected = state.round;
         const asked = new Set(state.questions.map((q) => q.question));
         const gaps =
-          r.ended === "done" && notes.length
+          // Gaps are taken with no verified note too when claims failed (the lead may ask to verify them —
+          // review #237 6차); still within the round's budget and time checks below.
+          r.ended === "done" && (notes.length || unverifiedNow.length)
             ? parseGaps(r.text, files.length > 0)
                 .filter((g) => !asked.has(g.question))
                 .map((g) => ({ ...g, scope: clampScope(g.scope, state.scopes) }))
