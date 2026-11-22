@@ -141,7 +141,9 @@ describe("research card progress (#232)", () => {
     const html = renderProgress(pjob());
     expect(html).toContain('data-testid="research-activity"');
     expect(html).toContain("페이지 읽는 중 · 1번째 페이지");
-    expect(html).toContain("노트 2개 · 확인 못 함 1개");
+    // `dropped` counts every note left out (unverified, a duplicate, over the cap): 제외, never 확인 못 함.
+    expect(html).toContain("노트 2개 · 제외 1개");
+    expect(html).not.toContain("확인 못 함");
     // A sub-question still waiting has no counts of notes yet, and no activity line.
     expect(html.match(/data-testid="research-activity"/g)).toHaveLength(1);
     expect(html).toContain("배경은 무엇인가 <span");
@@ -289,8 +291,24 @@ describe("research card progress (#232)", () => {
         })),
       }),
     );
-    for (const text of ["대기", "진행 중", "완료", "시간 초과", "실패"])
+    for (const text of ["대기", "진행 중", "완료", "한도 도달", "실패"])
       expect(html).toContain(`<span class="sr-only">${text}: </span>`);
     expect(html).toMatch(/<span aria-hidden="true" class="research-icon">/);
+  });
+
+  it("a sub-question waiting again (its retry queued) still shows what its first run kept and left out", () => {
+    const base = pjob().questions[1]!;
+    const queued = renderProgress(
+      pjob({ questions: [{ ...base, status: "waiting", notes: 1, dropped: 2, sources: 1 }] }),
+    );
+    expect(queued).toContain("검증한 자료 1개 · 노트 1개 · 제외 2개");
+    // A question not yet run has no note counts at all.
+    const fresh = renderProgress(pjob({ questions: [{ ...base, status: "waiting" }] }));
+    expect(fresh).toContain("검증한 자료 0개");
+    expect(fresh).not.toContain("노트");
+    // Nothing left out: no 제외.
+    const clean = renderProgress(pjob({ questions: [{ ...base, status: "done", notes: 2, dropped: 0 }] }));
+    expect(clean).toContain("노트 2개");
+    expect(clean).not.toContain("제외");
   });
 });

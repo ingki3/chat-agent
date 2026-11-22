@@ -218,6 +218,8 @@ const TEXT_EMIT_MS = 10_000;
 /** A job's live progress and what its throttle needs (engine memory only). */
 type Progress = LiveProgress & {
   activity: Map<string, LiveActivity>;
+  /** Each sub-question's searches and pages so far, over all its runs (a retry goes on counting). */
+  counts: Map<string, { search: number; fetch: number }>;
   lastEmit: number;
   /** When the pending broadcast goes (with `cancelEmit`). */
   emitAt: number;
@@ -601,6 +603,7 @@ export class ResearchEngine {
         phaseProgress: null,
         lastActivityAt: this.clock.now(),
         activity: new Map(),
+        counts: new Map(),
         seq: ++this.seq,
         lastEmit: Number.NEGATIVE_INFINITY,
         emitAt: 0,
@@ -647,19 +650,20 @@ export class ResearchEngine {
   }
 
   /**
-   * A step's progress hooks: its tool calls (a sub-question's line, with the step's own counts) and text (the time
+   * A step's progress hooks: its tool calls (a sub-question's line, with its counts over all its runs) and text (the time
    * only).
    */
   private hooks(row: ResearchJobRow, live: Live | undefined, question: string | undefined) {
     const id = row.id;
-    /** The step's searches and pages so far ("N번째 검색", "N번째 페이지"). */
-    const counts = { search: 0, fetch: 0 };
     return {
       onTool: (c: { name: string }) => {
         const p = live && this.progressFor(id, live);
         if (!p) return;
         this.bump(p);
         if (question) {
+          // The sub-question's own counts, over its runs ("N번째 검색", "N번째 페이지").
+          let counts = p.counts.get(question);
+          if (!counts) p.counts.set(question, (counts = { search: 0, fetch: 0 }));
           if (c.name.endsWith("web_search")) counts.search++;
           else if (c.name.endsWith("web_fetch")) counts.fetch++;
           const a = activityOf(c.name, this.clock.now(), counts);
@@ -1017,6 +1021,8 @@ export class ResearchEngine {
             // of any status — a retry may run a done one again — never gets tools the owner did not approve.
             q.scope = clampScope(q.scope, state.scopes);
             q.status = "running";
+            // A run starting (a retry too): no line until its first call — never the last run's.
+            this.progress.get(row.id)?.activity.delete(q.id);
             persist();
             // A retry (#234) keeps what the first run verified and is told what it found and what failed.
             const before = q.retried ? q.found : [];

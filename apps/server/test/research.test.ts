@@ -2680,6 +2680,35 @@ describe("깊이 조사: live progress — activity, phase, last activity (#232)
     off();
   });
 
+  it("a retry goes on counting its sub-question's searches, with no line until its first call", async () => {
+    const search = (q: string): FakeStep => ({ tool: `${P}web_search`, ms: 0, input: { query: q } });
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /증가율/.test(x))) return undefined;
+      // The retry: held before and after its first search.
+      if (x.includes(RETRY_MARK))
+        return [{ gate: "retry-before-232" }, search("다시"), { gate: "retry-after-232" }, { text: "DONE" }];
+      // The first run: two searches and nothing verified (so it is retried).
+      return [search("하나"), search("둘"), { text: "DONE" }];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const retryRunning = () =>
+      t.counting.turns.some(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /증가율/.test(x),
+      );
+    await until(retryRunning, "the retry");
+    const before = await view(t, job.id);
+    expect(before.questions[0]!.status).toBe("running");
+    expect(before.questions[0]!.activity).toBeNull();
+    releaseGate("retry-before-232");
+    const after = await untilView(t, job.id, (v) => !!v.questions[0]?.activity, "the retry's search");
+    expect(after.questions[0]!.activity!.label).toBe("검색 중 · 3번째 검색");
+    releaseGate("retry-after-232");
+    await statusIs(t.app, job.id, "done", "failed");
+  });
+
   it("a wall clock set back never holds an activity broadcast back longer than one window", async () => {
     const clock = new ManualClock();
     const script = held((x) =>
@@ -2835,7 +2864,7 @@ describe("깊이 조사: live progress — activity, phase, last activity (#232)
     off();
   });
 
-  it("counts each step's searches and pages; an earlier call ending keeps the line; phase k/n follows its total", async () => {
+  it("counts each sub-question's searches and pages; an earlier call ending keeps the line; phase k/n follows its total", async () => {
     const script = held((x) =>
       x.startsWith(TURN_MARK.subagent)
         ? /증가율/.test(x)
@@ -2864,19 +2893,20 @@ describe("깊이 조사: live progress — activity, phase, last activity (#232)
     const q1 = e.hooks(row, live, "q1");
     const q2 = e.hooks(row, live, "q2");
     const line = (q: string) => t.app.research!.progressOf(job.id)!.activity.get(q);
-    // Each step counts its own searches and pages; any fetch counts (a blank or broken URL too) and is the line now.
+    // Each sub-question counts its searches and pages over its runs (its real fetch before: page 1); any fetch counts
+    // (a blank or broken URL too) and is the line now.
     q1.onTool({ callId: "c1", name: `${P}web_search`, input: { query: "검색 A" } });
     expect(line("q1")).toMatchObject({ kind: "search", label: "검색 중 · 1번째 검색" });
     q1.onTool({ callId: "c2", name: `${P}web_fetch`, input: { url: "" } });
-    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 1번째 페이지" });
+    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 2번째 페이지" });
     // The search started before it ends: the line stays the fetch's.
     q1.onToolEnd({ callId: "c1" });
-    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 1번째 페이지" });
+    expect(line("q1")).toMatchObject({ kind: "fetch", label: "페이지 읽는 중 · 2번째 페이지" });
     q1.onTool({ callId: "c3", name: `${P}web_fetch`, input: { url: "not a url" } });
-    expect(line("q1")).toMatchObject({ label: "페이지 읽는 중 · 2번째 페이지" });
+    expect(line("q1")).toMatchObject({ label: "페이지 읽는 중 · 3번째 페이지" });
     q1.onTool({ callId: "c4", name: `${P}web_search`, input: {} });
     expect(line("q1")).toMatchObject({ label: "검색 중 · 2번째 검색" });
-    // Another step with the same call id (ids are per turn) is its own, with its own counts.
+    // Another sub-question's step with the same call id (ids are per turn) is its own, with its own counts.
     q2.onTool({ callId: "c2", name: `${P}web_search`, input: { query: "다른 단계" } });
     q2.onToolEnd({ callId: "c2" });
     expect(line("q2")).toMatchObject({ kind: "search", label: "검색 중 · 1번째 검색" });

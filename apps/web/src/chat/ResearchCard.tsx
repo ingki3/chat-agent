@@ -109,7 +109,7 @@ const Q_STATUS_TEXT: Record<ResearchQuestionState["status"], string> = {
   waiting: "대기",
   running: "진행 중",
   done: "완료",
-  capped: "시간 초과",
+  capped: "한도 도달",
   failed: "실패",
 };
 
@@ -435,8 +435,10 @@ export function Questions({ job }: { job: ResearchJob }) {
           {q.round > 0 ? <span className="chip small">보강</span> : null} {q.question}{" "}
           <span className="muted small" data-testid="research-counts">
             · 검증한 자료 {q.sources}개
-            {q.status !== "waiting" &&
-              ` · 노트 ${q.notes}개${q.dropped ? ` · 확인 못 함 ${q.dropped}개` : ""}`}
+            {/* Shown once there is something (a retry queued keeps its first run's); `dropped` counts every note
+                left out — unverified, a duplicate, over the cap — so it says 제외, not 확인 못 함. */}
+            {(q.status !== "waiting" || q.notes > 0 || q.dropped > 0) &&
+              ` · 노트 ${q.notes}개${q.dropped ? ` · 제외 ${q.dropped}개` : ""}`}
           </span>
           {q.status === "running" && q.activity && (
             <span className="research-activity muted small" data-testid="research-activity">
