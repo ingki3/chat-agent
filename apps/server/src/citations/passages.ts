@@ -58,10 +58,20 @@ function splitLong(text: string, s: number, e: number, out: Range[]): void {
   for (const m of piece.matchAll(/[,;:，；：](?=\s)/gu)) cut = m.index + 1;
   if (cut < SENTENCE_MAX / 4) cut = piece.lastIndexOf(" ");
   if (cut < SENTENCE_MAX / 4) cut = SENTENCE_MAX;
-  let a = s + cut;
+  // Never between the two halves of a surrogate pair (review #237 8차).
+  let a = codePointCut(text, s + cut);
+  if (a <= s) a = s + cut + 1;
   out.push({ start: s, end: trimEnd(text, s, a) });
   while (a < e && /\s/u.test(text[a]!)) a++;
   if (a < e) splitLong(text, a, e, out);
+}
+
+/** `i`, or one before it when `i` would split a surrogate pair. */
+export function codePointCut(text: string, i: number): number {
+  if (i <= 0 || i >= text.length) return i;
+  const hi = text.charCodeAt(i - 1);
+  const lo = text.charCodeAt(i);
+  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff ? i - 1 : i;
 }
 
 const trimEnd = (text: string, s: number, e: number) => {
@@ -181,7 +191,8 @@ export function findPassages(
 ): { total: number; passages: FoundPassage[] } {
   // The query folded exactly as the page is (the same clusters, the same case folding — review #237 7차).
   const want = flatMap(query).s;
-  const terms = [...new Set(termsOf(query))].filter((t) => t.length > 0);
+  // The query's words folded as the page's are (`fold` — the final sigma too, review #237 8차).
+  const terms = [...new Set(termsOf(fold(query)))].filter((t) => t.length > 0);
   if (!want || !terms.length) return { total: 0, passages: [] };
   // The marks' ranges once per search (review #237 6차), each check a binary search.
   const ranges = opts.gaps === true ? gapRanges(text) : [];
@@ -257,13 +268,20 @@ function withContext(
     if (!match) {
       // A long sentence of keyword hits is cut at a space near the limit (its start kept).
       const cut = text.lastIndexOf(" ", own.start + FIND_PASSAGE_CHARS);
-      return { start: own.start, end: cut > own.start ? cut : own.start + FIND_PASSAGE_CHARS };
+      return {
+        start: own.start,
+        end: cut > own.start ? cut : codePointCut(text, own.start + FIND_PASSAGE_CHARS),
+      };
     }
     const room = Math.max(0, FIND_PASSAGE_CHARS - (match.end - match.start));
     let start = Math.max(own.start, match.start - Math.floor(room / 2));
     const end = Math.min(own.end, Math.max(match.end, start + FIND_PASSAGE_CHARS));
     start = Math.max(own.start, Math.min(start, end - FIND_PASSAGE_CHARS));
-    return { start: Math.min(start, match.start), end: Math.max(end, match.end) };
+    // Both edges on code points (never half a surrogate pair).
+    return {
+      start: codePointCut(text, Math.min(start, match.start)),
+      end: codePointCut(text, Math.max(end, match.end)),
+    };
   }
   const blocked = (r: Range | undefined) => !r || gap(r.start, r.end);
   let start = own.start;

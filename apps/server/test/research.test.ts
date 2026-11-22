@@ -21,6 +21,7 @@ import {
 } from "../src/runtime/adapter.js";
 import { fixtureWebWorker, FIXTURE_PAGES, type FixturePage } from "../src/runtime/fake-citations.js";
 import type { WebWorker } from "../src/web/service.js";
+import { SourceStore } from "../src/web/sources.js";
 
 /** The citation fixture pages and `extra` ones (#234), answered in-process. */
 const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): WebWorker => {
@@ -1664,7 +1665,10 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
 
   /** A job held in research, closed, its checkpoint rewritten by `edit` — then resumed. */
   async function resumedWith(
-    edit: (state: { questions: Record<string, unknown>[] } & Record<string, unknown>) => void,
+    edit: (
+      state: { questions: Record<string, unknown>[] } & Record<string, unknown>,
+      ctx: { db: Db; conversationId: string; ownerId: string },
+    ) => void,
     approvedAgo?: number,
   ) {
     const db = createTestDb();
@@ -1679,7 +1683,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       state: string;
     };
     const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] } & Record<string, unknown>;
-    edit(state);
+    edit(state, { db, conversationId: job.conversationId, ownerId: t1.f.users.owner.id });
     db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
     if (approvedAgo !== undefined)
       db.$client
@@ -1688,6 +1692,42 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const t2 = await start({ db, family: false });
     return { t2, job, db };
   }
+
+  it("a checkpoint whose notes have no page key: the page is read from the source rows before the retry decision", async () => {
+    const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+      // One page, two source rows (a redirect's URL and the final URL), as the code before #234 stored them.
+      const store = new SourceStore(db);
+      const scope = { userId: ownerId, conversationId, runId: "research:old" };
+      const page = (url: string) =>
+        store.addPage(scope, {
+          url,
+          finalUrl: A.url,
+          title: "10월 반도체 수출",
+          site: "가나다 신문",
+          contentType: "text/html",
+          body: (FIXTURE_PAGES[0] as { text: string }).text,
+          truncated: false,
+        })!.id;
+      const a = page(A.url);
+      const b = page("https://fixture.agentlee.test/r/chips-a");
+      expect(a).not.toBe(b);
+      Object.assign(state.questions[0]!, { status: "done", retried: true });
+      Object.assign(state.questions[1]!, {
+        status: "done",
+        sources: 2,
+        found: [
+          { id: "n1", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a, title: "t" },
+          { id: "n2", claim: "32%", quote: RESEARCH_FIXTURE.growth, sourceId: b, title: "t" },
+        ],
+      });
+    });
+    await statusIs(t2.app, job.id, "done");
+    const retries = t2.counting.turns.filter((x) => x.includes(RETRY_MARK));
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toContain("수출 증가의 배경");
+    const after = JSON.parse(t2.app.research!.get(job.id)!.state) as { questions: { sources: number }[] };
+    expect(after.questions[1]!.sources).toBe(1);
+  });
 
   it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
     const { t2, job } = await resumedWith((state) => {

@@ -330,3 +330,46 @@ describe("web_find review #237 7차", () => {
     }
   });
 });
+
+describe("review #237 8차", () => {
+  const k = (id: string, sourceId: string, sourceKey: string, quote: string): ResearchNote => ({
+    id,
+    claim: id,
+    quote,
+    sourceId,
+    sourceKey,
+  });
+
+  it("one passage of one page reached by two URLs takes one slot; a new passage of that page still fits", () => {
+    const before = Array.from({ length: 11 }, (_, i) => k(`a${i}`, "A1", "u:A", `구절 ${i}`));
+    const merged = mergeNotes(
+      before,
+      [k("dup", "A2", "u:A", "구절  0"), k("new", "A2", "u:A", "새 구절")],
+      12,
+    );
+    expect(merged).toHaveLength(12);
+    expect(merged.map((n) => n.id)).toContain("new");
+    expect(merged.map((n) => n.id)).not.toContain("dup");
+    // The first kept note keeps its source id.
+    expect(merged.find((n) => n.quote === "구절 0")!.sourceId).toBe("A1");
+  });
+
+  it("the query's words are folded like the page's (a Greek final sigma in the keyword path)", () => {
+    const r = findPassages("ΤΟ ΚΟΣΜΟΣ ΕΙΝΑΙ ΜΕΓΑΛΟΣ.", "ΚΟΣΜΟΣ ΑΛΛΟ", 5);
+    expect(r.total).toBe(1);
+    expect(r.passages[0]!.phrase).toBe(false);
+  });
+
+  it("no cut splits a surrogate pair — the 400-character sentence split nor the 700-character passage", () => {
+    const split = `${"가".repeat(399)}📅${"나".repeat(100)}`;
+    for (const r of sentenceRanges(split)) expect(split.slice(r.start, r.end).isWellFormed()).toBe(true);
+    const long = `${"가".repeat(699)}📅${"나".repeat(300)}`;
+    for (const q of ["가가", "나나나", "📅", "가 나"])
+      for (const p of findPassages(long, q, 5).passages) expect(p.text.isWellFormed(), q).toBe(true);
+    const centred = `${"가".repeat(200)}📅${"다".repeat(300)}목표 구절${"라".repeat(300)}📅${"마".repeat(200)}`;
+    for (const p of findPassages(centred, "목표 구절", 5).passages) {
+      expect(p.text.isWellFormed()).toBe(true);
+      expect(p.text).toContain("목표 구절");
+    }
+  });
+});

@@ -718,6 +718,21 @@ export class ResearchEngine {
     // …and every question still to ask (an old checkpoint's gap question too) is held within them.
     for (const q of state.questions)
       if (q.status === "waiting" || q.status === "running") q.scope = clampScope(q.scope, state.scopes);
+    // A checkpoint from before notes carried their page (`sourceKey`, review #237 8차 — e.g. a job running at the
+    // deploy): each web note's page from its stored source row, and the questions' source counts again — before any
+    // retry is decided on them.
+    for (const q of state.questions) {
+      let filled = false;
+      for (const n of q.found)
+        if (n.sourceId && !n.sourceKey) {
+          const src = this.deps.sources.get(row.conversationId, n.sourceId);
+          if (src) {
+            n.sourceKey = pageKeyOf(src.finalUrl ?? src.url);
+            filled = true;
+          }
+        }
+      if (filled) q.sources = sourceCount(q.found);
+    }
     const files = this.files(row);
     /**
      * Every new step looks again (review 2): the conversation switched to Codex (or the connection gone) while the job
@@ -994,7 +1009,8 @@ export class ResearchEngine {
         unverified.push({ key: n.claimKey, claim: scrubKnown(n.claim) });
         continue;
       }
-      const key = `${note.sourceId ?? note.fileId}\n${note.quote}`;
+      // One passage of one page once, however it was reached (as `mergeNotes`).
+      const key = noteKey(note);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(note);
@@ -1262,12 +1278,21 @@ export function toolsOf(scope: ResearchScope): string[] {
 const allNotes = (s: JobState) => s.questions.flatMap((q) => q.found);
 
 /**
+ * A note's identity: the same passage of the same page once, however it was reached (review #237 8차) — the page
+ * (`sourceKey`, else the source or file id) and the quote with its spaces normalised.
+ */
+const noteKey = (n: ResearchNote) =>
+  `${n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`}\n${n.quote.normalize("NFC").replace(/\s+/gu, " ").trim()}`;
+
+/**
  * A retry's notes after the first run's (#234): the same passage of the same source once, at most `max` — and every
  * source the retry newly found keeps at least one place (review #237 1차: twelve notes of page A must not crowd out
  * the retry's page B). Otherwise the first run's notes come first, then the retry's, in order.
  */
 export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: number): ResearchNote[] {
-  const key = (n: ResearchNote) => `${n.sourceId ?? n.fileId}\n${n.quote}`;
+  // The same passage of the same page once, however it was reached (review #237 8차): the page (`sourceKey`) and the
+  // quote with its spaces normalised; the note kept first keeps its source id.
+  const key = noteKey;
   const src = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
   const seen = new Set<string>();
   const all: ResearchNote[] = [];
