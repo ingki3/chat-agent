@@ -472,10 +472,8 @@ export class SharePolicy {
         .filter((f) => p.files.has(f.id))
         .map((f) => this.file(f, p)),
       artifacts: this.artifacts.list(p.conversationId).flatMap((a) => this.artifact(a, p) ?? []),
-      sources: this.sources
-        .list(p.conversationId)
-        .filter((s) => p.sources.has(s.id))
-        .map(toSource),
+      // Only the visible rows are read (#234: a page may have many stored versions).
+      sources: this.sources.listByIds(p.conversationId, p.sources).map(toSource),
     };
   }
 

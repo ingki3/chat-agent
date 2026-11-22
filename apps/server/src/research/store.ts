@@ -5,8 +5,9 @@ import {
   ResearchResult,
   type ResearchErrorCode,
   type ResearchJob,
-  type ResearchQuestionState,
+  ResearchQuestionState,
   type ResearchStatus,
+  type SourceType,
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { researchJobs } from "../db/schema.js";
@@ -30,10 +31,41 @@ export type ResearchNote = {
   page?: number | undefined;
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
+  /**
+   * Which source it rests on, however it was fetched (`contentKeyOf` — the stored body's hash: rows of one body are one
+   * source): what `sourceCount` counts (#234).
+   */
+  sourceKey?: string | undefined;
+  /** The identity of its claim (`claimKeyOf` of the whole claim as written) — never shown. */
+  claimKey?: string | undefined;
+  /** A web note's publisher kind by its domain (#234, `sourceTypeOf`): for the writer and the report (#233). */
+  sourceType?: SourceType | undefined;
 };
 
+/** A claim whose quote was not verified: its identity (`claimKeyOf` of the whole claim) and its text. */
+export type UnverifiedClaim = { key: string; claim: string };
+
+/** The identity of a claim: a hash of all of it, normalised (`parseNotes` keeps only its first 500 characters). */
+export const claimKeyOf = (claim: string) =>
+  crypto.createHash("sha256").update(claim.normalize("NFC").replace(/\s+/gu, " ").trim()).digest("hex");
+
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
-export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & { found: ResearchNote[] };
+export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
+  found: ResearchNote[];
+  /**
+   * It was researched once more with rewritten queries (#234: no verified note, or one source only) — at most once.
+   */
+  retried?: boolean | undefined;
+  /**
+   * Claims whose quote could not be verified (the retry and the lead see them). An older checkpoint kept the text
+   * only.
+   */
+  unverified?: (UnverifiedClaim | string)[] | undefined;
+  /** How its last run ended when it failed (a runtime error code): a passing one may be retried (#234). */
+  failure?: ResearchErrorCode | undefined;
+  /** It was not (re)searched because too little time was left when its turn came (#234). */
+  skipped?: "time" | undefined;
+};
 
 /** The checkpoint (`research_jobs.state`): written after every step. */
 export type JobState = {
@@ -99,15 +131,69 @@ export const fileIdsOf = (row: ResearchJobRow): string[] => {
   }
 };
 
-/** Distinct sources (pages and files) the verified notes rest on. */
-export function sourceCount(notes: readonly ResearchNote[]): number {
-  return new Set(notes.map((n) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`))).size;
+/**
+ * A web source's identity for counting (#234, review #237 17차): its stored body's hash — the same text however it
+ * was reached (a redirect, a changed redirect target, the same PDF at two addresses) — else its final address.
+ */
+export function contentKeyOf(src: {
+  bodyHash?: string | null;
+  finalUrl?: string | null;
+  url: string;
+}): string {
+  return src.bodyHash ? `b:${src.bodyHash}` : pageKeyOf(src.finalUrl ?? src.url);
 }
 
+/** A page's identity across source rows: its final URL without the fragment, host in lower case (#234). */
+export function pageKeyOf(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return `u:${u.toString()}`;
+  } catch {
+    return `u:${url}`;
+  }
+}
+
+/**
+ * Distinct sources (pages and files) the verified notes rest on — one page once, however many source rows it has
+ * (`sourceKey`, review #237 7차); a note from before keeps its source id.
+ */
+export function sourceCount(notes: readonly ResearchNote[]): number {
+  return new Set(notes.map((n) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`))).size;
+}
+
+const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));
+
 /** The job as the API shows it (owner or share recipient). Notes stay on the server. */
-export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: number }): ResearchJob {
+export function toResearchJob(
+  row: ResearchJobRow,
+  opts: {
+    owned: boolean;
+    now: number;
+    /**
+     * A web note's source identity from its stored row (`contentKeyOf`), read only (review #237 18차): a job's notes
+     * from before body-hash keys count rows of one body once in the view as well. Without it the notes' own keys.
+     */
+    contentKey?: ((sourceId: string) => string | undefined) | undefined;
+  },
+): ResearchJob {
   const s = stateOf(row);
   const plan = planOf(row);
+  // Copies with their keys as the rows say now — the checkpoint itself is not written here. One lookup per source
+  // for the whole view (review #237 19차).
+  const known = new Map<string, string | undefined>();
+  const keyOf = (id: string) => {
+    if (!known.has(id)) known.set(id, opts.contentKey!(id));
+    return known.get(id);
+  };
+  const keyed = (found: readonly ResearchNote[]) =>
+    opts.contentKey
+      ? found.map((n) => (n.sourceId ? { ...n, sourceKey: keyOf(n.sourceId) ?? n.sourceKey } : n))
+      : [...found];
+  for (const q of s.questions) {
+    q.found = keyed(q.found ?? []);
+    if (opts.contentKey) q.sources = sourceCount(q.found);
+  }
   const notes = s.questions.flatMap((q) => q.found ?? []);
   return {
     id: row.id,
@@ -119,7 +205,14 @@ export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: 
     plan,
     stage: s.stage,
     round: s.round,
-    questions: s.questions.map(({ found, ...q }) => ({ ...q, notes: found?.length ?? 0 })),
+    // Only the API's fields: the notes and the retry's bookkeeping (#234) stay on the server.
+    questions: s.questions.map(
+      (q) =>
+        ({
+          ...Object.fromEntries(Object.entries(q).filter(([k]) => QUESTION_KEYS.has(k))),
+          notes: q.found?.length ?? 0,
+        }) as ResearchQuestionState,
+    ),
     sources: sourceCount(notes),
     // Planning time (before approval) plus the time since approval; the wait at the plan card does not count.
     elapsedMs: Math.max(

@@ -28,7 +28,8 @@ export function registerSourceRoutes(
     async (req, reply) => {
       const p = viewOf(app, req, { conversationId: req.params.id });
       if (p === null) return reply.code(403).header("Cache-Control", "no-store").send({ error: "forbidden" });
-      const rows = sources.list(req.params.id).filter((s) => !p || p.sources.has(s.id));
+      // A viewer's list reads only the rows its view shows (#234, review #237 19차); the owner's, all of them.
+      const rows = p ? sources.listByIds(req.params.id, p.sources) : sources.list(req.params.id);
       return reply
         .header("Cache-Control", "no-store")
         .send({ items: rows.map(toSource) } satisfies SourcesResponse);

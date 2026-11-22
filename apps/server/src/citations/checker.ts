@@ -1,6 +1,12 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
-import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import {
+  CITE_TOOL,
+  SOURCES_LIST_TOOL,
+  WEB_FETCH_TOOL,
+  WEB_FIND_TOOL,
+  WEB_SEARCH_TOOL,
+} from "@agentlee/mcp-tools/web";
 import { FILE_CITE_TOOL, FILE_LIST_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import {
   boundText,
@@ -258,6 +264,8 @@ function fileEntry(
 const OWN_NUMBER_TOOLS: ReadonlySet<string> = new Set([
   WEB_SEARCH_TOOL.name,
   WEB_FETCH_TOOL.name,
+  // #234: `web_find` numbers its passages `[1]`… — a number written after it is never an earlier answer's.
+  WEB_FIND_TOOL.name,
   skillToolName(GOOGLE_NEWS_SKILL.name),
   skillToolName(SEARCH_GOOGLE_SKILL.name),
   CITE_TOOL.name,

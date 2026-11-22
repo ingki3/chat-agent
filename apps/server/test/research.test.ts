@@ -11,7 +11,7 @@ import { createTestDb, type Db } from "../src/db/client.js";
 import { inProcessExtractor, ocrCapability } from "../src/files/extract.js";
 import { compose } from "../src/notifications/compose.js";
 import { ManualClock } from "../src/research/clock.js";
-import { TURN_MARK } from "../src/research/prompts.js";
+import { RETRY_MARK, TURN_MARK } from "../src/research/prompts.js";
 import {
   RuntimeRegistry,
   type RuntimeAdapter,
@@ -19,7 +19,28 @@ import {
   type RuntimeSession,
   type StartContext,
 } from "../src/runtime/adapter.js";
-import { fixtureWebWorker, FIXTURE_PAGES } from "../src/runtime/fake-citations.js";
+import { fixtureWebWorker, FIXTURE_PAGES, type FixturePage } from "../src/runtime/fake-citations.js";
+import type { WebWorker } from "../src/web/service.js";
+import { SourceStore } from "../src/web/sources.js";
+
+/** The citation fixture pages and `extra` ones (#234), answered in-process. */
+const withPages = (extra: readonly (FixturePage & { finalUrl?: string })[]): WebWorker => {
+  const base = fixtureWebWorker();
+  return async (job, proxy) => {
+    const p = job.op === "fetch" ? extra.find((x) => x.url === job.url) : undefined;
+    return p
+      ? {
+          ok: true,
+          finalUrl: p.finalUrl ?? p.url,
+          title: p.title,
+          site: p.site,
+          contentType: "text/html",
+          text: p.text,
+          truncated: false,
+        }
+      : base(job, proxy);
+  };
+};
 import { RESEARCH_FIXTURE } from "../src/runtime/fake-research.js";
 import {
   defaultScript,
@@ -115,6 +136,8 @@ async function start(
     notificationsNow?: () => number;
     family?: boolean;
     dataDir?: string;
+    /** More fixture pages (#234), answered in-process like the citation fixtures (`finalUrl`: a redirect's target). */
+    pages?: (FixturePage & { finalUrl?: string })[];
   } = {},
 ) {
   const db = o.db ?? createTestDb();
@@ -130,7 +153,11 @@ async function start(
       logger: false,
       runtimes,
       runs: { flushMs: 0 },
-      web: { worker: fixtureWebWorker(), fetchProxy: stubProxy as never, providers: ["duckduckgo"] },
+      web: {
+        worker: withPages(o.pages ?? []),
+        fetchProxy: stubProxy as never,
+        providers: ["duckduckgo"],
+      },
       mcp: { skills: [SELFTEST_SKILL], egress: () => stubProxy as never },
       extract: {
         runner: inProcessExtractor(() => ocrCapability(path.join(os.tmpdir(), "agentlee-test-ocr-lang"))),
@@ -231,7 +258,7 @@ describe("깊이 조사: plan → approve → research → verified report", () 
     expect(end.sources).toBe(2);
     // The sub-researchers got the web tools only; the writer `cite` only (no attachments).
     const tools = t.fake.contexts.map((c) => c.tools);
-    expect(tools).toContainEqual(["web_search", "web_fetch"]);
+    expect(tools).toContainEqual(["web_search", "web_fetch", "web_find"]);
     expect(tools.at(-1)).toEqual(["cite"]);
     // The writer's sentence on the failed citation and its uncited one are gone (decision 4), counted in 한계.
     expect(end.result).toMatchObject({ removed: 2, citations: 3, timedOut: false, fallback: false });
@@ -328,7 +355,10 @@ describe("깊이 조사: plan → approve → research → verified report", () 
       subQuestions.map((_, i) => [`q${i + 1}`, "web"]),
     );
     await statusIs(t.app, job.id, "done");
-    expect(t.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(6);
+    const subs = t.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent));
+    // Each rests on one page only: each is researched once more (#234), within the same bound.
+    expect(subs.filter((x) => !x.includes(RETRY_MARK))).toHaveLength(6);
+    expect(subs.filter((x) => x.includes(RETRY_MARK))).toHaveLength(6);
     expect(t.counting.max).toBe(3);
   });
 
@@ -557,7 +587,9 @@ describe("깊이 조사: the 30-minute cap, stop and restart", () => {
 
     const t2 = await start({ db, family: false });
     const done = await statusIs(t2.app, job.id, "done");
-    const asked = t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent));
+    const asked = t2.counting.turns.filter(
+      (x) => x.startsWith(TURN_MARK.subagent) && !x.includes(RETRY_MARK),
+    );
     expect(asked).toHaveLength(1);
     expect(asked[0]).toContain("수출 증가의 배경");
     expect(JSON.parse(done.result!)).toMatchObject({ timedOut: false });
@@ -1154,10 +1186,936 @@ describe("깊이 조사: review 3 (#212)", () => {
       found: [],
       dropped: 0,
     });
+    // …and web questions it had finished without a note (review #237 1차): their automatic retry stays in the files.
+    for (const status of ["done", "capped"])
+      state.questions.push({
+        id: `r1q${status}`,
+        question: `웹에서 ${status}`,
+        scope: "web",
+        round: 1,
+        status,
+        sources: 0,
+        found: [],
+        dropped: 0,
+      });
     db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
     const t2 = await start({ db, family: false, dataDir });
     await statusIs(t2.app, job.id, "done", "failed");
+    // The finished web questions were retried — within the files.
+    const retried = t2.counting.turns.filter((x) => x.includes(RETRY_MARK) && /웹에서 (done|capped)/.test(x));
+    expect(retried).toHaveLength(2);
+    for (const x of retried) expect(x).toContain("범위: 첨부 파일만");
     expect(t2.fake.contexts.flatMap((x) => x.tools).filter((x) => x.startsWith("web_"))).toEqual([]);
     expect(sourcesOf(db, c.id)).toBe(0);
+  });
+});
+
+describe("깊이 조사: fewer gaps — note repair and the automatic retry (#234)", () => {
+  const notes = (...n: { claim: string; ref: string; quote: string }[]) =>
+    n.map((x) => `NOTE ${JSON.stringify({ claim: x.claim, sourceId: x.ref, quote: x.quote })}`).join("\n") +
+    "\nDONE";
+  const stateOf = (t: Awaited<ReturnType<typeof start>>, id: string) =>
+    JSON.parse(t.app.research!.get(id)!.state) as {
+      questions: {
+        id: string;
+        question: string;
+        retried?: boolean;
+        unverified?: { key: string; claim: string }[];
+        found: { quote: string; sourceId?: string; sourceType?: string }[];
+      }[];
+    };
+
+  it("a quote that does not match exactly is never rewritten: dropped, its claim only a hint for the retry", async () => {
+    const formOnly =
+      "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”";
+    const retries: string[] = [];
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /증가율/.test(x))) return undefined;
+      if (x.includes(RETRY_MARK)) {
+        retries.push(x);
+        return [{ text: "DONE" }];
+      }
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        { call: "web_fetch", input: { url: FIXTURE_PAGES[1]!.url } },
+        {
+          textRefs: notes(
+            // Only a space differs (review #237 4차: still never rewritten — correctness before recall).
+            { claim: "산업부는 32% 증가로 발표했다", ref: "{{$0.sourceId}}", quote: formOnly },
+            { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
+            { claim: "수출이 50% 늘었다", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.wrong },
+          ),
+        },
+      ];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const q1 = stateOf(t, job.id).questions[0]!;
+    expect(q1.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.stats]);
+    expect(q1.unverified?.map((c) => c.claim)).toEqual(["산업부는 32% 증가로 발표했다", "수출이 50% 늘었다"]);
+    expect(q1.found[0]!.sourceType).toBe("other");
+    // One source left: retried, and told which claims failed.
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toContain("산업부는 32% 증가로 발표했다");
+    expect(retries[0]).toContain("서버는 구절을 고쳐 주지 않는다");
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).not.toContain("산업부는 32% 증가로 발표했다");
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions[0]).toEqual(
+      expect.objectContaining({ notes: 1, dropped: 2, sources: 1, status: "done" }),
+    );
+    // The server-only bookkeeping is not part of the API's job — in the raw answer, before any schema parse.
+    const raw = (await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json() as {
+      questions: Record<string, unknown>[];
+    };
+    for (const q of raw.questions)
+      expect(Object.keys(q).sort()).toEqual(
+        ["dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
+      );
+  });
+
+  it("a sub-question with one source (or none) is researched once more with rewritten queries; its notes are kept", async () => {
+    const [, B] = FIXTURE_PAGES as [unknown, { url: string }];
+    const retries: string[] = [];
+    const script = scripted((x) => {
+      if (!x.startsWith(TURN_MARK.subagent) || !/배경/.test(x)) return undefined;
+      if (!x.includes(RETRY_MARK))
+        return [
+          { call: "web_fetch", input: { url: A.url } },
+          {
+            textRefs: notes(
+              {
+                claim: "메모리 가격 회복이 이끌었다",
+                ref: "{{$0.sourceId}}",
+                quote: RESEARCH_FIXTURE.memory,
+              },
+              {
+                claim: "미국 수출 비중이 가장 컸다",
+                ref: "{{$0.sourceId}}",
+                quote: "미국 수출 비중이 가장 컸다",
+              },
+            ),
+          },
+        ];
+      retries.push(x);
+      return [
+        { call: "web_fetch", input: { url: B.url } },
+        { call: "web_fetch", input: { url: A.url } },
+        {
+          textRefs: notes(
+            // Already kept from the first run: not counted twice.
+            { claim: "메모리 가격 회복이 이끌었다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.memory },
+            {
+              claim: "기준 차이가 있다",
+              ref: "{{$0.sourceId}}",
+              quote: "이는 선적 기준과 통관 기준의 차이 때문이다.",
+            },
+          ),
+        },
+      ];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    // Once, for the weak one only (the growth question rests on two pages); told what failed and what it has.
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toContain("미국 수출 비중이 가장 컸다");
+    expect(retries[0]).toContain("다른 검색어");
+    expect(retries[0]).toContain(RESEARCH_FIXTURE.memory);
+    const subs = t.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent));
+    expect(subs.filter((x) => x.includes(RETRY_MARK))).toHaveLength(1);
+    const q2 = stateOf(t, job.id).questions[1]!;
+    expect(q2.retried).toBe(true);
+    expect(q2.found.map((n) => n.quote)).toEqual([
+      RESEARCH_FIXTURE.memory,
+      "이는 선적 기준과 통관 기준의 차이 때문이다.",
+    ]);
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions.map((q) => [q.status, q.notes, q.sources, q.dropped])).toEqual([
+      ["done", 2, 2, 1],
+      ["done", 2, 2, 1],
+    ]);
+    // Raw API answer (no schema parse): the retry's bookkeeping and the notes stay on the server.
+    const raw = JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    for (const k of ["retried", "unverified", "failure", "skipped", "found", "claimKey"])
+      expect(raw).not.toContain(`"${k}"`);
+    expect(raw).not.toContain("미국 수출 비중이 가장 컸다");
+    // The lead's reflection saw the claims that could not be verified.
+    const reflect = t.counting.turns.find((x) => x.startsWith(TURN_MARK.reflect))!;
+    expect(reflect).toContain("원문에서 확인하지 못해 뺀 주장");
+  });
+
+  it("no retry when a round no longer fits in the research time", async () => {
+    const t = await start({ limits: { minRoundMs: 21 * MIN } });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const subs = t.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent));
+    expect(subs).toHaveLength(2);
+    expect(subs.some((x) => x.includes(RETRY_MARK))).toBe(false);
+  });
+  it("a claim whose quote differs from the page in any way never stands: not in the notes, the writer or the report", async () => {
+    const page: FixturePage = {
+      url: "https://fixture.agentlee.test/gov/policy.html",
+      title: "정책 발표",
+      site: "정부 누리집",
+      text: [
+        "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.",
+        "부산시는 2026년 예산을 늘린다고 밝혔다.",
+        "수출은 전년보다 −5% 줄었다.",
+        "원고가 피고를 먼저 고소했다.",
+        "이 상품의 가격은 $50 이상이다.",
+        "올해 지원 기준은 소득 < 500만원이다.",
+        "이 기체의 성분은 CO 라고 밝혔다.",
+        "We agreed to resign today.",
+        "선수들의 출발 순서는 1 2 12 순이다.",
+        "허용 길이는 3.5미터이다.",
+        "수식의 조건은 x! = y 이다.",
+        "The selector is .menu .item in this stylesheet.",
+        "표시 가격은 50 이상이다.",
+        "측정값은 기준값 50 부근이다.",
+      ].join("\n"),
+    };
+    // Review #237 1–4차: each was once "repaired" to the page's sentence and kept with the model's altered claim; a
+    // quote is now never rewritten.
+    const inverted = [
+      { claim: "정부는 내년부터 지원금을 지급한다", quote: "정부는 내년부터 지원금을 지급한다고 밝혔다" },
+      { claim: "서울시는 2026년 예산을 늘린다", quote: "서울시는 2026년 예산을 늘린다고 밝혔다" },
+      { claim: "수출은 전년보다 5% 늘었다", quote: "수출은 전년보다 +5% 줄었다" },
+      { claim: "피고가 원고를 먼저 고소했다", quote: "원고를 피고가 먼저 고소했다" },
+      { claim: "가격은 €50 이상이다", quote: "이 상품의 가격은 €50 이상이다" },
+      { claim: "소득 500만원 초과가 지원 대상이다", quote: "올해 지원 기준은 소득 > 500만원이다" },
+      { claim: "성분은 코발트(Co)다", quote: "이 기체의 성분은 Co 라고 밝혔다" },
+      { claim: "They agreed to sign again today", quote: "We agreed to re-sign today" },
+      // Review #237 3차.
+      { claim: "12번 선수가 먼저 출발한다", quote: "선수들의 출발 순서는 12 1 2 순이다" },
+      { claim: "허용 길이는 3에서 5미터다", quote: "허용 길이는 3…5미터이다" },
+      { claim: "x와 y는 달라야 한다", quote: "수식의 조건은 x != y 이다" },
+      { claim: "두 클래스가 모두 있어야 적용된다", quote: "The selector is .menu.item in this stylesheet" },
+      { claim: "표시 가격은 ₹50 이상이다", quote: "표시 가격은 50이상이다" },
+      { claim: "측정값은 ≠ 50 이다", quote: "측정값은 기준값 50부근이다" },
+    ];
+    // Twelve notes a run at most: the first eight in the first run, the rest in the (one-source) retry.
+    const script = scripted((x) => {
+      if (!x.startsWith(TURN_MARK.subagent) || !/배경/.test(x)) return undefined;
+      const mine = x.includes(RETRY_MARK) ? inverted.slice(8) : inverted.slice(0, 8);
+      return [
+        { call: "web_fetch", input: { url: page.url } },
+        { call: "web_fetch", input: { url: A.url } },
+        {
+          textRefs: notes(
+            { claim: "메모리 가격 회복이 이끌었다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.memory },
+            ...mine.map((n) => ({ ...n, ref: "{{$0.sourceId}}" })),
+          ),
+        },
+      ];
+    });
+    const t = await start({ script, pages: [page] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const done = await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    expect(q2.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.memory]);
+    // The first five (the kept list's cap); none of the eight reached the notes, the writer or the report.
+    expect(q2.unverified?.map((c) => c.claim)).toEqual(inverted.slice(0, 5).map((n) => n.claim));
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
+    for (const n of inverted) {
+      expect(writer).not.toContain(n.claim);
+      expect(content).not.toContain(n.claim);
+      expect(content).not.toContain(n.quote);
+    }
+  });
+
+  it("a retry that finds nothing keeps the claims that failed; the lead sees them", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
+        ? [
+            { call: "web_fetch", input: { url: A.url } },
+            {
+              textRefs: notes({
+                claim: "미국 수출 비중이 가장 컸다",
+                ref: "{{$0.sourceId}}",
+                quote: "미국 수출 비중이 가장 컸다",
+              }),
+            },
+          ]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect(stateOf(t, job.id).questions[1]!.unverified?.map((c) => c.claim)).toEqual([
+      "미국 수출 비중이 가장 컸다",
+    ]);
+    const reflect = t.counting.turns.find((x) => x.startsWith(TURN_MARK.reflect))!;
+    expect(reflect).toContain("미국 수출 비중이 가장 컸다");
+  });
+
+  it("no verified note but claims that failed: the lead's gap question to check them is added and run", async () => {
+    const gapRuns: string[] = [];
+    const script = scripted((x) => {
+      if (x.startsWith(TURN_MARK.reflect))
+        return [
+          {
+            text: JSON.stringify({
+              gaps: [{ question: "확인 못 한 증가율을 1차 자료로 확인", scope: "web" }],
+            }),
+          },
+        ];
+      if (!x.startsWith(TURN_MARK.subagent)) return undefined;
+      if (x.includes("확인 못 한 증가율") && !x.includes(RETRY_MARK)) {
+        gapRuns.push(x);
+        return [
+          { call: "web_fetch", input: { url: A.url } },
+          {
+            textRefs: notes({
+              claim: "메모리 가격 회복",
+              ref: "{{$0.sourceId}}",
+              quote: RESEARCH_FIXTURE.memory,
+            }),
+          },
+        ];
+      }
+      if (x.includes(RETRY_MARK)) return [{ text: "DONE" }];
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        {
+          textRefs: notes({
+            claim: "수출이 50% 늘었다",
+            ref: "{{$0.sourceId}}",
+            quote: RESEARCH_FIXTURE.wrong,
+          }),
+        },
+      ];
+    });
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    expect(gapRuns).toHaveLength(1);
+    expect(stateOf(t, job.id).questions.some((q) => q.question.includes("확인 못 한 증가율"))).toBe(true);
+  });
+
+  it("one page reached by two URLs is one source: the question is still retried (review #237 7차)", async () => {
+    const via: FixturePage & { finalUrl: string } = {
+      url: "https://fixture.agentlee.test/r/chips-a",
+      finalUrl: A.url,
+      title: "10월 반도체 수출 32% 증가",
+      site: "가나다 신문",
+      text: (FIXTURE_PAGES[0] as { text: string }).text,
+    };
+    const retries: string[] = [];
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /배경/.test(x))) return undefined;
+      if (x.includes(RETRY_MARK)) {
+        retries.push(x);
+        return [{ text: "DONE" }];
+      }
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        { call: "web_fetch", input: { url: via.url } },
+        {
+          textRefs: notes(
+            { claim: "메모리 가격 회복", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory },
+            { claim: "32% 증가", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.growth },
+          ),
+        },
+      ];
+    });
+    const t = await start({ script, pages: [via] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    // Two source rows (two URLs), one page.
+    expect(new Set(q2.found.map((n) => n.sourceId)).size).toBe(2);
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions[1]!.sources).toBe(1);
+    expect(retries).toHaveLength(1);
+  });
+
+  it("rows of one body (a redirect target that changed, a direct fetch) are one source (review #237 16·17차)", async () => {
+    const oldUrl = "https://fixture.agentlee.test/docs/old.pdf";
+    const newUrl = "https://agency.gov/docs/new.pdf";
+    let oldFetches = 0;
+    const text = (FIXTURE_PAGES[0] as { text: string }).text;
+    const moving = {
+      url: oldUrl,
+      title: "보고서",
+      site: "기관",
+      text,
+      // The first fetch ends at the old address; later ones redirect to the agency's new one.
+      get finalUrl() {
+        return oldFetches++ === 0 ? oldUrl : newUrl;
+      },
+    };
+    const direct = { url: newUrl, finalUrl: newUrl, title: "보고서", site: "기관", text };
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /배경/.test(x))) return undefined;
+      if (!x.includes(RETRY_MARK))
+        return [
+          { call: "web_fetch", input: { url: oldUrl } },
+          { textRefs: notes({ claim: "메모리", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory }) },
+        ];
+      return [
+        { call: "web_fetch", input: { url: oldUrl } },
+        { call: "web_fetch", input: { url: newUrl } },
+        { textRefs: notes({ claim: "32%", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.growth }) },
+      ];
+    });
+    const t = await start({ script, pages: [moving, direct] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    expect(q2.found).toHaveLength(2);
+    expect(new Set(q2.found.map((n) => n.sourceId)).size).toBe(2);
+    // Each row's own address (rows never change): the first at the old one, the direct fetch at the agency's.
+    expect(q2.found.map((n) => n.sourceType)).toEqual(["other", "government"]);
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions[1]!.sources).toBe(1);
+  });
+
+  it("the runtime's own refusal (runtime_policy) is kept and never retried", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) ? [{ fail: "policy", code: "runtime_policy" as const }] : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(t.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(0);
+    expect(failed.errorCode).toBe("runtime_policy");
+  });
+
+  it("a passing runtime error is retried once; an account's state (login) never — even with a note kept", async () => {
+    for (const [first, retried, status] of [
+      [[{ fail: "boom" }], true, "done"],
+      [[{ fail: "login", code: "runtime_auth" as const }], false, "failed"],
+      // It kept a note from one page, then the login failed: one source, yet no retry (review #237 2차).
+      [
+        [
+          { call: "web_fetch", input: { url: A.url } },
+          {
+            textRefs: `NOTE ${JSON.stringify({ claim: "메모리", sourceId: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory })}\n`,
+          },
+          { fail: "login", code: "runtime_auth" as const },
+        ],
+        false,
+        "done",
+      ],
+    ] as const) {
+      const script = scripted((x) =>
+        x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
+          ? (first as unknown as FakeStep[])
+          : undefined,
+      );
+      const t = await start({ script });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      await statusIs(t.app, job.id, "done");
+      const retries = t.counting.turns.filter(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /배경/.test(x),
+      );
+      expect(retries.length, JSON.stringify(first)).toBe(retried ? 1 : 0);
+      expect(stateOf(t, job.id).questions[1]!.status as unknown, JSON.stringify(first)).toBe(status);
+    }
+    // Several whole jobs in a row: more time than the default under a full-suite load.
+  }, 30_000);
+
+  it("nothing verified: the job fails with how the last runs ended (a retry's login failure, not the first error)", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? x.includes(RETRY_MARK)
+          ? [{ fail: "login", code: "runtime_auth" }]
+          : [{ fail: "boom" }]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_auth");
+  });
+
+  it("nothing verified and every retry ended cleanly: the job ends as no_findings, not the first runtime error", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? x.includes(RETRY_MARK)
+          ? [{ text: "DONE" }]
+          : [{ fail: "boom" }]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(failed.errorCode).toBe("no_findings");
+  });
+
+  it("a runtime error whose retry was skipped for time is still the job's error", async () => {
+    const clock = new ManualClock();
+    let approvedAt = 0;
+    const script = scripted((x) => {
+      if (!x.startsWith(TURN_MARK.subagent)) return undefined;
+      if (!x.includes(RETRY_MARK)) return [{ fail: "boom" }];
+      // The first retry ends cleanly and leaves 2.5 minutes: the second is skipped when its slot comes.
+      clock.advance(approvedAt + 20 * MIN - 2.5 * MIN - clock.now());
+      return [{ text: "DONE" }];
+    });
+    const t = await start({ script, clock, limits: { concurrency: 1 } });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    approvedAt = t.app.research!.get(job.id)!.approvedAt!;
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(t.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(1);
+    expect(failed.errorCode).toBe("runtime_error");
+  });
+
+  it("resumed after a restart, research that then ran and found nothing is no_findings, not server_restart", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ gate: "nothing-hold" }] : undefined));
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    const nothing = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ text: "DONE" }] : undefined));
+    const t2 = await start({ db, family: false, script: nothing });
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(t2.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(2);
+    expect(failed.errorCode).toBe("no_findings");
+  });
+
+  /** A job held in research, closed, its checkpoint rewritten by `edit` — then resumed. */
+  async function resumedWith(
+    edit: (
+      state: { questions: Record<string, unknown>[] } & Record<string, unknown>,
+      ctx: { db: Db; conversationId: string; ownerId: string },
+    ) => void,
+    approvedAgo?: number,
+  ) {
+    const db = createTestDb();
+    const hold = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ gate: "edit-hold" }] : undefined));
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] } & Record<string, unknown>;
+    edit(state, { db, conversationId: job.conversationId, ownerId: t1.f.users.owner.id });
+    db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
+    if (approvedAgo !== undefined)
+      db.$client
+        .prepare("update research_jobs set approved_at = ? where id = ?")
+        .run(Date.now() - approvedAgo, job.id);
+    const t2 = await start({ db, family: false });
+    return { t2, job, db };
+  }
+
+  it("a checkpoint whose notes have no page key: the page is read from the source rows before the retry decision", async () => {
+    const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+      // One page, two source rows (a redirect's URL and the final URL), as the code before #234 stored them.
+      const store = new SourceStore(db);
+      const scope = { userId: ownerId, conversationId, runId: "research:old" };
+      const page = (url: string) =>
+        store.addPage(scope, {
+          url,
+          finalUrl: A.url,
+          title: "10월 반도체 수출",
+          site: "가나다 신문",
+          contentType: "text/html",
+          body: (FIXTURE_PAGES[0] as { text: string }).text,
+          truncated: false,
+        })!.id;
+      const a = page(A.url);
+      const b = page("https://fixture.agentlee.test/r/chips-a");
+      expect(a).not.toBe(b);
+      Object.assign(state.questions[0]!, { status: "done", retried: true });
+      Object.assign(state.questions[1]!, {
+        status: "done",
+        sources: 2,
+        found: [
+          { id: "n1", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a, title: "t" },
+          { id: "n2", claim: "32%", quote: RESEARCH_FIXTURE.growth, sourceId: b, title: "t" },
+        ],
+      });
+    });
+    await statusIs(t2.app, job.id, "done");
+    const retries = t2.counting.turns.filter((x) => x.includes(RETRY_MARK));
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toContain("수출 증가의 배경");
+    const after = JSON.parse(t2.app.research!.get(job.id)!.state) as { questions: { sources: number }[] };
+    expect(after.questions[1]!.sources).toBe(1);
+  });
+
+  it("restored notes of one passage of one page reached by two URLs become one note (no retry needed)", async () => {
+    const [, B] = FIXTURE_PAGES as [unknown, { url: string; text: string }];
+    const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+      const store = new SourceStore(db);
+      const scope = { userId: ownerId, conversationId, runId: "research:old" };
+      const page = (url: string, finalUrl: string, body: string) =>
+        store.addPage(scope, {
+          url,
+          finalUrl,
+          title: "t",
+          site: "s",
+          contentType: "text/html",
+          body,
+          truncated: false,
+        })!.id;
+      const a = page(A.url, A.url, (FIXTURE_PAGES[0] as { text: string }).text);
+      const a2 = page(
+        "https://fixture.agentlee.test/r/chips-a",
+        A.url,
+        (FIXTURE_PAGES[0] as { text: string }).text,
+      );
+      const b = page(B.url, B.url, B.text);
+      Object.assign(state.questions[0]!, { status: "done", retried: true });
+      Object.assign(state.questions[1]!, {
+        status: "done",
+        sources: 3,
+        found: [
+          { id: "n1", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a, title: "t" },
+          { id: "n2", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a2, title: "t" },
+          { id: "n3", claim: "통계", quote: RESEARCH_FIXTURE.stats, sourceId: b, title: "t" },
+        ],
+      });
+    });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(0);
+    const after = JSON.parse(t2.app.research!.get(job.id)!.state) as {
+      questions: { sources: number; found: { id: string }[] }[];
+    };
+    expect(after.questions[1]!.found.map((n) => n.id)).toEqual(["n1", "n3"]);
+    expect(after.questions[1]!.sources).toBe(2);
+  });
+
+  it("every restored checkpoint is normalised — notes that already carry their page key, in research or writing", async () => {
+    for (const stage of ["research", "write"] as const) {
+      const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+        const store = new SourceStore(db);
+        const scope = { userId: ownerId, conversationId, runId: "research:old" };
+        const add = (url: string) =>
+          store.addPage(scope, {
+            url,
+            finalUrl: A.url,
+            title: "t",
+            site: "s",
+            contentType: "text/html",
+            body: (FIXTURE_PAGES[0] as { text: string }).text,
+            truncated: false,
+          })!.id;
+        const a = add(A.url);
+        const a2 = add(`https://fixture.agentlee.test/r/${stage}`);
+        const key = `u:${A.url}`;
+        for (const q of state.questions) Object.assign(q, { status: "done", retried: true });
+        Object.assign(state.questions[1]!, {
+          sources: 2,
+          found: [
+            {
+              id: "n1",
+              claim: "메모리",
+              quote: RESEARCH_FIXTURE.memory,
+              sourceId: a,
+              sourceKey: key,
+              title: "t",
+            },
+            {
+              id: "n2",
+              claim: "메모리",
+              quote: `${RESEARCH_FIXTURE.memory} `,
+              sourceId: a2,
+              sourceKey: key,
+              title: "t",
+            },
+          ],
+        });
+        if (stage === "write") {
+          state.stage = "write";
+          db.$client
+            .prepare("update research_jobs set status = 'writing' where conversation_id = ?")
+            .run(conversationId);
+        }
+      });
+      await statusIs(t2.app, job.id, "done");
+      const writer = t2.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+      // The writer got the passage once.
+      expect(writer.split(RESEARCH_FIXTURE.memory).length - 1, stage).toBe(1);
+      const after = JSON.parse(t2.app.research!.get(job.id)!.state) as {
+        questions: { sources: number; found: { id: string }[] }[];
+      };
+      expect(
+        after.questions[1]!.found.map((n) => n.id),
+        stage,
+      ).toEqual(["n1"]);
+      expect(after.questions[1]!.sources, stage).toBe(1);
+    }
+  }, 30_000);
+
+  it("the API view of a job counts rows of one body once, even for notes stored before body keys (read only)", async () => {
+    const t = await start();
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    // As a job finished by older code: two rows of one body under two URL keys, the stored count 2.
+    const store = new SourceStore(t.db);
+    const scope = { userId: t.f.users.owner.id, conversationId: job.conversationId, runId: "research:old" };
+    const body = (FIXTURE_PAGES[0] as { text: string }).text;
+    const add = (url: string) =>
+      store.addPage(scope, {
+        url,
+        finalUrl: url,
+        title: "t",
+        site: "s",
+        contentType: "text/html",
+        body,
+        truncated: false,
+      })!.id;
+    const a = add("https://fixture.agentlee.test/x/one");
+    const b = add("https://fixture.agentlee.test/x/two");
+    const row = t.db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] };
+    Object.assign(state.questions[1]!, {
+      sources: 2,
+      found: [
+        {
+          id: "n1",
+          claim: "c",
+          quote: "q1",
+          sourceId: a,
+          sourceKey: "u:https://fixture.agentlee.test/x/one",
+        },
+        { id: "n2", claim: "c", quote: "q2", sourceId: b },
+      ],
+    });
+    const saved = JSON.stringify(state);
+    t.db.$client.prepare("update research_jobs set state = ? where id = ?").run(saved, job.id);
+    const view = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(view.questions[1]!.sources).toBe(1);
+    // Nothing written back.
+    expect(
+      (t.db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as { state: string })
+        .state,
+    ).toBe(saved);
+  });
+
+  it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
+    const { t2, job } = await resumedWith((state) => {
+      for (const q of state.questions)
+        Object.assign(q, { status: "done", retried: true, found: [], sources: 0 });
+    });
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.reflect))).toHaveLength(1);
+    expect(failed.errorCode).toBe("no_findings");
+  });
+
+  it("failing with a question skipped for time keeps its state (skipped, the time limit) with the error", async () => {
+    const { t2, job, db } = await resumedWith((state) => {
+      Object.assign(state.questions[0]!, { status: "done", retried: true, found: [], sources: 0 });
+      Object.assign(state.questions[1]!, {
+        status: "waiting",
+        retried: true,
+        failure: "runtime_error",
+        found: [],
+        sources: 0,
+      });
+    }, 21 * MIN);
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_error");
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const saved = JSON.parse(row.state) as {
+      timedOut: boolean;
+      questions: { status: string; skipped?: string }[];
+    };
+    expect(saved.timedOut).toBe(true);
+    expect(saved.questions[1]).toMatchObject({ status: "capped", skipped: "time" });
+  });
+
+  it('resumed with no research time left: what was waiting is under the time limit, not "no evidence"', async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && x.includes("배경") ? [{ gate: "late-budget-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(
+      () => t1.counting.active === 1 && t1.app.research!.get(job.id)!.state.includes('"status":"done"'),
+      "q1 done",
+    );
+    await t1.app.close();
+    // The research budget (20 minutes) already spent; the deadline still ahead for the writer.
+    db.$client
+      .prepare("update research_jobs set approved_at = ? where id = ?")
+      .run(Date.now() - 21 * MIN, job.id);
+    const t2 = await start({ db, family: false });
+    const end = await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    const after = JSON.parse(end.state) as { timedOut: boolean; questions: { skipped?: string }[] };
+    expect(after.timedOut).toBe(true);
+    expect(after.questions[1]!.skipped).toBe("time");
+    const report = t2.app.artifacts!.version(JSON.parse(end.result!).artifactId, 1)!.content;
+    expect(report).not.toContain("수출 증가의 배경은 무엇인가");
+  });
+
+  it("time is checked again after the reflection: no new round, or no extra round, that no longer fits", async () => {
+    // The clock is put just above a threshold before the reflection (in the background question's retry, the last
+    // step before it); the reflection then takes one minute (inside its 90 s) and names a gap.
+    for (const [limits, before, rounds] of [
+      // 3.5 minutes left before (a round fits), 2.5 after: no new round — the gap is not even added.
+      [{}, 3.5 * MIN, 0],
+      [{}, 4.5 * MIN, 1],
+      // No regular gap round (maxDepth 0): the extra one needs 8 minutes — 8.5 before, 7.5 after.
+      [{ maxDepth: 0 }, 8.5 * MIN, 0],
+      [{ maxDepth: 0 }, 9.5 * MIN, 1],
+    ] as const) {
+      const clock = new ManualClock();
+      const t0 = clock.now();
+      let approvedAt = 0;
+      const script = scripted((x) => {
+        if (x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /배경/.test(x)) {
+          clock.advance(approvedAt + 20 * MIN - before - clock.now());
+          return [{ text: "DONE" }];
+        }
+        if (!x.startsWith(TURN_MARK.reflect)) return undefined;
+        clock.advance(MIN);
+        return [{ text: JSON.stringify({ gaps: [{ question: "새 각도의 보강 질문", scope: "web" }] }) }];
+      });
+      const t = await start({ script, clock, limits });
+      const { job } = await begin(t);
+      await statusIs(t.app, job.id, "awaiting_approval");
+      await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      approvedAt = t.app.research!.get(job.id)!.approvedAt ?? t0;
+      await until(() => {
+        const s = t.app.research!.get(job.id)!.status;
+        if (s === "writing") clock.advance(MIN);
+        return s === "done" || s === "failed";
+      }, "the end");
+      const label = `${JSON.stringify(limits)} ${before / MIN}`;
+      const gap = t.counting.turns.filter(
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes("새 각도") && !x.includes(RETRY_MARK),
+      );
+      expect(gap, label).toHaveLength(rounds);
+      // Not merely left unasked: when it does not fit, the gap question is never added.
+      expect(
+        stateOf(t, job.id).questions.some((q) => q.question.includes("새 각도")),
+        label,
+      ).toBe(rounds > 0);
+    }
+    // Several whole jobs in a row: more time than the default under a full-suite load.
+  }, 30_000);
+
+  it("each queued retry checks the time when it gets its slot: a fourth one behind three does not start late", async () => {
+    let moved = false;
+    let started = 0;
+    const clock = new ManualClock();
+    let approvedAt = 0;
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK))) return undefined;
+      // The third retry to start (the pool is full) moves the clock to 2.5 minutes before the end of research.
+      if (++started === 3 && !moved) {
+        moved = true;
+        clock.advance(approvedAt + 20 * MIN - 2.5 * MIN - clock.now());
+      }
+      return [{ text: "DONE" }];
+    });
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const subQuestions = Array.from({ length: 4 }, (_, i) => ({ question: `측면 ${i + 1}`, scope: "web" }));
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, { subQuestions });
+    approvedAt = t.app.research!.get(job.id)!.approvedAt!;
+    await until(() => {
+      const s = t.app.research!.get(job.id)!.status;
+      if (s === "writing") clock.advance(MIN);
+      return s === "done" || s === "failed";
+    }, "the end");
+    const retries = t.counting.turns.filter(
+      (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK),
+    );
+    expect(retries).toHaveLength(3);
+  });
+
+  it("a retry still waiting after a restart starts only with a round's time left", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && x.includes("배경") ? [{ gate: "retry-restart-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(
+      () => t1.counting.active === 1 && t1.app.research!.get(job.id)!.state.includes('"status":"done"'),
+      "q1 done",
+    );
+    await t1.app.close();
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] };
+    // As if the server stopped right after it queued the background question's retry.
+    Object.assign(state.questions[1]!, { status: "waiting", retried: true, found: [], sources: 0 });
+    // …and a third-round gap question queued (review #237 2차).
+    state.questions.push({
+      id: "r3q1",
+      question: "늦은 보강 질문",
+      scope: "web",
+      round: 3,
+      status: "waiting",
+      sources: 0,
+      found: [],
+      dropped: 0,
+    });
+    // 45 seconds of research left.
+    const approvedAt = Date.now() - (20 * MIN - 45_000);
+    db.$client
+      .prepare("update research_jobs set state = ?, approved_at = ? where id = ?")
+      .run(JSON.stringify(state), approvedAt, job.id);
+    const t2 = await start({ db, family: false });
+    const end = await statusIs(t2.app, job.id, "done", "failed");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    // Skipped for lack of time (review #237 3차): under the time limit, not "근거를 찾지 못한 하위 질문".
+    const after = JSON.parse(end.state) as {
+      timedOut: boolean;
+      questions: { id: string; skipped?: string }[];
+    };
+    expect(after.timedOut).toBe(true);
+    expect(after.questions.find((q) => q.id === "r3q1")!.skipped).toBe("time");
+    expect(end.status).toBe("done");
+    const report = t2.app.artifacts!.version(JSON.parse(end.result!).artifactId, 1)!.content;
+    expect(report).not.toContain("늦은 보강 질문");
+    expect(JSON.parse(end.result!)).toMatchObject({ timedOut: true });
   });
 });

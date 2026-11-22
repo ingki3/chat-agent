@@ -9,7 +9,7 @@ import {
   type ResearchSubQuestion,
 } from "@agentlee/shared";
 import { INSTRUCTIONS_DIR } from "../instructions/assemble.js";
-import type { ResearchNote } from "./store.js";
+import { claimKeyOf, type ResearchNote } from "./store.js";
 
 /**
  * 깊이 조사's step prompts (#211): versioned Markdown in `apps/server/instructions/deep-research/` with the same header
@@ -92,20 +92,56 @@ export function planTurn(input: {
   ].join("\n\n");
 }
 
+/** The second line of a retry's turn (#234): what marks it (the FakeRuntime's scripts match it too). */
+export const RETRY_MARK = "[다시 조사]";
+
 export function subagentTurn(input: {
   question: string;
   plan: ResearchPlan;
   sub: ResearchSubQuestion;
   files: readonly AttachedFile[];
+  /**
+   * A retry (#234): the first run left no verified note or one source only. What it verified (kept — not to be found
+   * again) and the claims whose quote failed.
+   */
+  retry?: { found: readonly ResearchNote[]; unverified: readonly string[] } | undefined;
 }): string {
   const scope =
     input.sub.scope === "web"
-      ? "웹만 (web_search · web_fetch)"
+      ? "웹만 (web_search · web_fetch · web_find)"
       : input.sub.scope === "files"
         ? "첨부 파일만 (file_search · file_read)"
-        : "웹과 첨부 파일 (web_search · web_fetch · file_search · file_read)";
+        : "웹과 첨부 파일 (web_search · web_fetch · web_find · file_search · file_read)";
+  // The retry's hints name only the tools its scope has (review #237 5차).
+  const web = input.sub.scope !== "files";
+  const files = input.sub.scope !== "web";
+  const how = [
+    ...(web ? ["웹 페이지는 web_find로 저장된 본문에서 찾거나 web_fetch로 다시 읽어"] : []),
+    ...(files ? ["첨부 파일은 file_search로 찾아 file_read로 읽어"] : []),
+  ].join(", ");
+  const retry = input.retry
+    ? [
+        [
+          RETRY_MARK,
+          "이 하위 질문은 한 번 조사했지만 확인된 근거가 " +
+            (input.retry.found.length ? "출처 하나뿐이다." : "없다.") +
+            (web
+              ? " 앞과 **다른 검색어**로 다시 찾는다: 공식 기관·문서의 정식 이름, 동의어, 영어 표현, 연도·문서 종류(시행계획, 보도자료, 통계, PDF)를 넣는다. 이미 확인된 출처 말고 **다른 출처**, 특히 1차 자료(정부·공공기관·대학)를 찾는다. 긴 문서는 `web_find`로 본문 전체에서 찾는다."
+              : " 첨부 파일에서 앞과 **다른 검색어**(동의어, 정식 이름, 숫자·날짜, 표 제목)로 `file_search`를 다시 하고, 찾은 곳을 `file_read`로 읽는다."),
+        ].join("\n"),
+        ...(input.retry.found.length
+          ? [`이미 확인된 노트 (다시 쓰지 않는다):\n${notesBlock(input.retry.found)}`]
+          : []),
+        ...(input.retry.unverified.length
+          ? [
+              `원문에서 확인하지 못한 주장 (서버는 구절을 고쳐 주지 않는다 — 그 주장을 실제로 쓴 원문을 ${how} 글자 그대로 복사해 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+            ]
+          : []),
+      ]
+    : [];
   return [
     TURN_MARK.subagent,
+    ...retry,
     `전체 질문: ${input.question}`,
     `보고서: ${input.plan.title}`,
     `맡은 하위 질문: ${input.sub.question}`,
@@ -127,6 +163,7 @@ export function notesBlock(notes: readonly ResearchNote[]): string {
       // The verified place of a file passage: the writer's `file_cite` looks there first (its `page`).
       ...(n.place ? { place: n.place } : {}),
       ...(n.title ? { title: n.title } : {}),
+      ...(n.sourceType ? { sourceType: n.sourceType } : {}),
     }),
   );
   return frameExternal({ source: "research-notes", content: lines.join("\n") || "(노트 없음)" });
@@ -139,6 +176,8 @@ export function reflectTurn(input: {
   notes: readonly ResearchNote[];
   /** What the owner approved: gap questions may use only these sources. */
   scopes: readonly ("web" | "files")[];
+  /** Claims the sub-researchers wrote whose quote the server could not verify (#234): candidates for a gap question. */
+  unverified?: readonly string[] | undefined;
 }): string {
   const allowed =
     input.scopes.includes("web") && input.scopes.includes("files")
@@ -152,6 +191,11 @@ export function reflectTurn(input: {
     `쓸 수 있는 범위(scope): ${allowed}`,
     `이미 조사한 하위 질문:\n${input.asked.map((q) => `- ${q}`).join("\n")}`,
     `확인된 노트:\n${notesBlock(input.notes)}`,
+    ...(input.unverified?.length
+      ? [
+          `원문에서 확인하지 못해 뺀 주장 (중요하면 그 주장을 확인할 보강 질문을 만든다):\n${frameExternal({ source: "research-unverified", content: input.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+        ]
+      : []),
   ].join("\n\n");
 }
 
@@ -257,7 +301,15 @@ export function parseGaps(text: string, hasFiles: boolean): { question: string; 
 }
 
 /** A sub-researcher's note as written (before the server checks its passage). */
-export type RawNote = { claim: string; quote: string; sourceId?: string; fileId?: string; page?: number };
+export type RawNote = {
+  claim: string;
+  /** The identity of the whole claim as written (`claimKeyOf`, before `claim` is cut to 500 characters). */
+  claimKey: string;
+  quote: string;
+  sourceId?: string;
+  fileId?: string;
+  page?: number;
+};
 
 /**
  * The `NOTE {…}` lines of a sub-researcher's text — also of a turn that was stopped half-way (a line cut off is
@@ -287,6 +339,7 @@ export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQ
     const page = typeof v.page === "number" && Number.isInteger(v.page) && v.page > 0 ? v.page : undefined;
     out.push({
       claim,
+      claimKey: claimKeyOf(v.claim),
       quote,
       ...(sourceId ? { sourceId } : { fileId: fileId! }),
       ...(page !== undefined && !sourceId ? { page } : {}),

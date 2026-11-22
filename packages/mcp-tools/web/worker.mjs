@@ -14,6 +14,11 @@ import zlib from "node:zlib";
 export const LIMITS = {
   /** Body bytes, before and after decompression. */
   maxBytes: 3 * 1024 * 1024,
+  /**
+   * Body bytes of a PDF (#234): official documents are often larger than a page. Its bytes go back to the server as
+   * they are (base64) — the server's document extractor reads them in its own sandbox (no parser runs here).
+   */
+  maxPdfBytes: 10 * 1024 * 1024,
   /** Characters of extracted text kept. */
   maxChars: 400_000,
   maxRedirects: 5,
@@ -21,7 +26,7 @@ export const LIMITS = {
   totalMs: 20_000,
 };
 
-/** Content types we read. PDF and the rest are refused (`web_unsupported_type`). */
+/** Content types we read as text. PDF is handed back as bytes (`PDF_TYPES`); the rest is refused (`web_unsupported_type`). */
 const TYPES = new Map([
   ["text/html", "html"],
   ["application/xhtml+xml", "html"],
@@ -29,6 +34,24 @@ const TYPES = new Map([
   ["text/markdown", "text"],
   ["application/json", "json"],
 ]);
+/**
+ * PDF content types (#234). `application/octet-stream`, or no type at all, counts when `%PDF-` is in the first
+ * `PDF_SNIFF_BYTES`. The PDF byte limit (`maxPdfBytes`) applies to the PDF types and `octet-stream`; an answer
+ * without a type keeps the page limit (`maxBytes`) — it is read before its kind is known.
+ */
+const PDF_TYPES = new Set(["application/pdf", "application/x-pdf"]);
+const PDF_MAGIC = "%PDF-";
+/** Where a PDF's header may start — the server checks the same (`web/pdf.ts` `PDF_SNIFF_BYTES`). */
+export const PDF_SNIFF_BYTES = 1024;
+/** Whether these response headers may carry a PDF (the larger byte limit applies). */
+const mayBePdf = (headers) => {
+  const mime = String(headers["content-type"] ?? "")
+    .toLowerCase()
+    .split(";")[0]
+    .trim();
+  // An answer without a type keeps the page limit (it is read only if it is plainly HTML, or a small PDF).
+  return PDF_TYPES.has(mime) || mime === "application/octet-stream";
+};
 
 /** Fixed refusal codes (the server maps them; the model sees them). */
 export class WebError extends Error {
@@ -41,7 +64,8 @@ export class WebError extends Error {
 
 const HEADERS = {
   "user-agent": "Mozilla/5.0 (compatible; AgentLee/1.0; family assistant)",
-  accept: "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,*/*;q=0.1",
+  accept:
+    "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,application/pdf;q=0.8,*/*;q=0.1",
   "accept-language": "ko-KR,ko;q=0.9,en;q=0.8",
   "accept-encoding": "gzip, deflate, br",
 };
@@ -117,7 +141,7 @@ function tunnel(proxy, host, port, timeoutMs) {
 
 /**
  * One GET through a fresh tunnel. Resolves with status, headers and the (bounded, decompressed) body.
- * @param {URL} url @param {{ proxy: URL, deadline: number, maxBytes: number, headers?: Record<string,string> }} o
+ * @param {URL} url @param {{ proxy: URL, deadline: number, maxBytes: number, maxBytesFor?: (h: import("node:http").IncomingHttpHeaders) => number, headers?: Record<string,string> }} o
  */
 async function hop(url, o) {
   const port = checkHop(url);
@@ -196,22 +220,24 @@ async function hop(url, o) {
           sock.destroy();
           return resolve({ status, headers: res.headers, body: Buffer.alloc(0) });
         }
+        // The byte limit of this answer: a page fetch allows more for a PDF (`maxBytesFor`, #234).
+        const maxBytes = o.maxBytesFor ? o.maxBytesFor(res.headers) : o.maxBytes;
         const len = Number(res.headers["content-length"]);
-        if (Number.isFinite(len) && len > o.maxBytes) return fail(new WebError("web_too_large"));
+        if (Number.isFinite(len) && len > maxBytes) return fail(new WebError("web_too_large"));
         const enc = String(res.headers["content-encoding"] ?? "identity").toLowerCase();
         // Bytes on the wire are counted on their own: the limit holds before decompression as well (a gzip
         // header can carry megabytes that decompress to nothing).
         let wire = 0;
         res.on("data", (c) => {
           wire += c.length;
-          if (wire > o.maxBytes) {
+          if (wire > maxBytes) {
             limit ??= new WebError("web_too_large");
             fail(limit);
           }
         });
         stream = res;
         // Decompressed size is bounded as well (a small gzip can expand to gigabytes).
-        const zopts = { maxOutputLength: o.maxBytes + 1 };
+        const zopts = { maxOutputLength: maxBytes + 1 };
         if (enc === "gzip" || enc === "x-gzip") stream = res.pipe(zlib.createGunzip(zopts));
         else if (enc === "deflate") stream = res.pipe(zlib.createInflate(zopts));
         else if (enc === "br") stream = res.pipe(zlib.createBrotliDecompress(zopts));
@@ -220,7 +246,7 @@ async function hop(url, o) {
         let size = 0;
         stream.on("data", (c) => {
           size += c.length;
-          if (size > o.maxBytes) {
+          if (size > maxBytes) {
             limit ??= new WebError("web_too_large");
             return fail(limit);
           }
@@ -249,7 +275,7 @@ async function hop(url, o) {
  * re-resolves and re-checks the address).
  * With `manual`, a redirect is not followed: its absolute target comes back as `redirect` (the server checks every
  * hop's URL before it is requested — #113 — and sends the next hop as a job of its own).
- * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string, manual?: boolean }} o
+ * @param {string} input @param {{ proxy: string, limits?: Partial<typeof LIMITS>, headers?: Record<string,string>, httpsOnly?: boolean, ca?: string, manual?: boolean, pdf?: boolean }} o
  */
 export async function get(input, o) {
   const limits = { ...LIMITS, ...o.limits };
@@ -270,6 +296,13 @@ export async function get(input, o) {
       proxy,
       deadline,
       maxBytes: limits.maxBytes,
+      // A page fetch (#234): a PDF answer may be larger (`maxPdfBytes`); everything else keeps `maxBytes`.
+      ...(o.pdf
+        ? {
+            maxBytesFor: (h) =>
+              mayBePdf(h) ? Math.max(limits.maxBytes, limits.maxPdfBytes) : limits.maxBytes,
+          }
+        : {}),
       ...(o.headers ? { headers: o.headers } : {}),
       // Tests only (in-process): extra trusted roots. The sandboxed process never gets this.
       ...(o.ca ? { ca: o.ca } : {}),
@@ -460,8 +493,13 @@ function decode(body, contentType) {
 }
 
 /** @param {string} t */
-const bounded = (t, max) =>
-  t.length > max ? { text: t.slice(0, max), truncated: true } : { text: t, truncated: false };
+const bounded = (t, max) => {
+  if (t.length <= max) return { text: t, truncated: false };
+  // Never half a surrogate pair at the cut (#234): the stored text stays well formed.
+  const hi = t.charCodeAt(max - 1);
+  const end = hi >= 0xd800 && hi <= 0xdbff ? max - 1 : max;
+  return { text: t.slice(0, end), truncated: true };
+};
 
 /**
  * Fetches a page and extracts it.
@@ -469,11 +507,27 @@ const bounded = (t, max) =>
  */
 export async function fetchPage(input, o) {
   const limits = { ...LIMITS, ...o.limits };
-  const r = await get(input, o);
+  const r = await get(input, { ...o, pdf: true });
   if (r.redirect) return { redirect: r.redirect.toString() };
   if (r.status < 200 || r.status >= 300) throw new WebError("web_http_error");
   const ct = String(r.headers["content-type"] ?? "").toLowerCase();
   let mime = ct.split(";")[0].trim();
+  // A PDF (#234): its bytes go back as they are — nothing parses it here. The server reads its text with the
+  // document extractor (its own sandbox, no network). A PDF type whose body is not a PDF is refused.
+  const pdfMagic = r.body.subarray(0, PDF_SNIFF_BYTES).toString("latin1").includes(PDF_MAGIC);
+  if (PDF_TYPES.has(mime) || ((mime === "application/octet-stream" || !mime) && pdfMagic)) {
+    if (!pdfMagic) throw new WebError("web_bad_content");
+    if (r.body.length > Math.max(limits.maxBytes, limits.maxPdfBytes)) throw new WebError("web_too_large");
+    return {
+      finalUrl: r.url.toString(),
+      status: r.status,
+      contentType: "application/pdf",
+      title: undefined,
+      site: r.url.hostname.replace(/^www\./, ""),
+      publishedAt: undefined,
+      pdf: r.body.toString("base64"),
+    };
+  }
   if (!mime) {
     // No type: read it only if it is plainly HTML.
     const start = r.body.subarray(0, 512).toString("latin1").trimStart().toLowerCase();

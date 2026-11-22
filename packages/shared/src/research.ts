@@ -30,6 +30,12 @@ export const RESEARCH_LIMITS = {
   subagentMs: 6 * 60_000,
   /** Gap-filling rounds after the first (reflection depth). */
   maxDepth: 2,
+  /**
+   * One more gap-filling round beyond `maxDepth` (#234) — only when at least `extraRoundMs` of the research budget is
+   * still left at that point (a quick job uses the time it has; it never runs past its deadline).
+   */
+  extraDepth: 1,
+  extraRoundMs: 8 * 60_000,
   /** New sub-questions one reflection may add. */
   maxGapQuestions: 3,
   /**
@@ -129,6 +135,8 @@ export const ResearchErrorCode = z.enum([
   "not_allowed",
   /** The conversation was switched to another runtime (Codex) before or while the job ran. */
   "runtime_changed",
+  /** The runtime stopped itself — it tried a tool it was not offered (#234: never retried). */
+  "runtime_policy",
 ]);
 export type ResearchErrorCode = z.infer<typeof ResearchErrorCode>;
 

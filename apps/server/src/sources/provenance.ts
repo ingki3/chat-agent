@@ -1,6 +1,12 @@
 import { skillToolName } from "@agentlee/mcp-tools";
 import { GOOGLE_NEWS_SKILL, SEARCH_GOOGLE_SKILL } from "@agentlee/mcp-tools/skills";
-import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import {
+  CITE_TOOL,
+  SOURCES_LIST_TOOL,
+  WEB_FETCH_TOOL,
+  WEB_FIND_TOOL,
+  WEB_SEARCH_TOOL,
+} from "@agentlee/mcp-tools/web";
 import { FILE_CITE_TOOL, FILE_READ_TOOL, FILE_SEARCH_TOOL } from "@agentlee/mcp-tools/files";
 import type { MessagePart } from "@agentlee/shared";
 import { isFinanceTool } from "../instructions/assemble.js";
@@ -9,7 +15,8 @@ import { OUR_TOOL_PREFIX } from "../runtime/lockdown.js";
 /**
  * Where an answer's sources come from (#185, docs/decisions/sources.md): **the tools the answer called**, never its
  * text. A source is the record of a tool result that brought outside data into the answer:
- * - `web` — a page or search result (`web_search`, `web_fetch`, `sources_list`, `cite`, the search/news skills);
+ * - `web` — a page or search result (`web_search`, `web_fetch`, `web_find`, `sources_list`, `cite`, the search/news
+ *   skills);
  *   stored in `sources`, cited by number (`[n]`, the server checks the quoted passage);
  * - `file` — an uploaded file of the conversation (`file_read`, `file_search`, `file_cite`; an audio transcript is a
  *   file too — `audio_transcribe` writes it, `file_cite` cites it); cited by number with its place;
@@ -23,6 +30,8 @@ export type SourceKind = "web" | "file" | "finance";
 const BY_NAME: ReadonlyMap<string, SourceKind> = new Map([
   [WEB_SEARCH_TOOL.name, "web"],
   [WEB_FETCH_TOOL.name, "web"],
+  // #234: passages of a fetched page (numbered `[1]`… like a list).
+  [WEB_FIND_TOOL.name, "web"],
   [SOURCES_LIST_TOOL.name, "web"],
   [CITE_TOOL.name, "web"],
   [skillToolName(GOOGLE_NEWS_SKILL.name), "web"],

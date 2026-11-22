@@ -23,7 +23,7 @@
 
 | 종류 | 도구 | 식별 | 기준 시각 | 답변에서 가리키는 법 | 서버 검사 |
 |---|---|---|---|---|---|
-| `web` | `web_search`·`web_fetch`·`sources_list`·`cite`·검색·뉴스 스킬 | `sources` 행(id, URL, 사이트, 제목) | 게시일(`publishedAt`) | 번호 `[n]` (`cite`) | 인용 구절을 저장 본문과 대조 |
+| `web` | `web_search`·`web_fetch`·`web_find`(#234 — 가져온 페이지 본문 안에서 찾기, 결과 번호도 그 답의 것)·`sources_list`·`cite`·검색·뉴스 스킬 | `sources` 행(id, URL, 사이트, 제목) | 게시일(`publishedAt`) | 번호 `[n]` (`cite`) | 인용 구절을 저장 본문과 대조 |
 | `file` | `file_read`·`file_search`·`file_cite` (음성 전사도 `audio_transcribe`가 만든 파일 — `file_cite`로 인용) | 파일 id + 위치(쪽·문단·셀) | — | 번호 `[n]` (`file_cite`) | 인용 구절을 추출 본문과 대조 |
 | `finance` | `kr_*`·`us_*`·`fx_*`·`dart_*`·`sec_*`·`finance_chart`·금융 스킬 | 제공자 이름(`source`, 예: "네이버 증권") | `asOf`(시간대 포함)·`timeZone`·`kind`(종가·장중…) | 라벨(`sources[].label`)을 문장·머리말에 | 숫자마다 그 값의 출처·기준 날짜(장중이면 시각) |
 | 그 밖 | `artifact_*`·`memory_*`·`python_run`·`audio_transcribe` 등 | — | — | — | 출처가 아님 |

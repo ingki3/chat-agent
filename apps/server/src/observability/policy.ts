@@ -214,6 +214,9 @@ export const CITE_CODES = set([
   "cite_snippet_too_short",
   "cite_snippet_too_long",
   "cite_limit",
+  // web_find (#234): passages found / none.
+  "find_found",
+  "find_none",
 ]);
 
 /** Outcome codes of the artifact tools (#27, artifacts/store.ts `ARTIFACT_CODES` — a test keeps the two equal). */

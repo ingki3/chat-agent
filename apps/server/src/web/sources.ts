@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
+import { cutAt, hasGapMarks, visibleIndex } from "../citations/verify.js";
 import { scrubKnownDeep } from "../secrets/known.js";
 
 export type SourceRow = typeof sources.$inferSelect;
@@ -36,8 +37,58 @@ export const SOURCE_LIMITS = { title: 300, site: 120, snippet: 600, url: 2048 } 
 /** Whitespace collapsed and at most `n` characters (an ellipsis marks a cut). */
 export const cut = (s: string, n: number) => {
   const t = s.replace(/\s+/g, " ").trim();
-  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  // On a code point (review #237 11차): never half a surrogate pair before the ellipsis.
+  return t.length > n ? `${cutAt(t, n - 1)}…` : t;
 };
+/**
+ * A title without control characters (C0, C1) and bidirectional controls, whitespace as one space (#234, review
+ * #237 14·15차 — the PDF reader's metadata title gets the same in `extract/pdf.mjs`).
+ */
+export const cleanTitle = (t: string) =>
+  t
+    .replace(/\s+/gu, " ")
+    .replace(/[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
+    .trim();
+
+/**
+ * A PDF's title when it has none of its own: the file name of its address ("2027 시행계획.pdf"), cleaned
+ * (`cleanTitle`) and bounded; undefined when nothing is left (the caller then names it by its site).
+ */
+export function pdfTitle(u: URL): string | undefined {
+  const last = u.pathname.split("/").filter(Boolean).at(-1);
+  if (!last) return undefined;
+  let name: string;
+  try {
+    name = decodeURIComponent(last);
+  } catch {
+    name = last;
+  }
+  return cut(cleanTitle(name), SOURCE_LIMITS.title) || undefined;
+}
+
+/**
+ * Whether a row stores a page's text, without reading the text (review #237 19–21차): its byte length (from the
+ * record header — SQLite does not load the value), more than zero. A row from before without a hash counts; a row
+ * whose text was cleared (its hash left) does not.
+ */
+const HAS_TEXT = sql<number>`coalesce(octet_length(${sources.body}), 0) > 0`;
+
+/**
+ * Rows of a conversation among the ids of one JSON parameter (no bound-variable limit), each found by its primary
+ * key (`cross join` keeps the ids first — review #237 21차: a lookup of a few ids never walks a conversation's every
+ * row); the conversation is checked on each row found; rowid order. Parameters: the JSON array, the conversation.
+ */
+export const BY_IDS_SQL = `select s.* from json_each(?) as j cross join sources as s on s.id = j.value
+  where s.conversation_id = ? order by s.rowid`;
+
+/** A raw `sources` row (column names) as the typed row. */
+function rowOf(raw: Record<string, unknown>): SourceRow {
+  const out: Record<string, unknown> = {};
+  for (const [key, col] of Object.entries(getTableColumns(sources)))
+    out[key] = raw[col.name] === null ? null : col.mapFromDriverValue(raw[col.name]);
+  return out as SourceRow;
+}
+
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
 export function toSource(r: SourceRow): Source {
@@ -54,7 +105,12 @@ export function toSource(r: SourceRow): Source {
     fetchedAt: r.fetchedAt,
     contentType: r.contentType ?? null,
     bodyHash: r.bodyHash ?? null,
-    characters: r.body?.length ?? 0,
+    // Visible characters: a web PDF's gap marks (U+E000, #234) are not text; any other page counts as stored.
+    characters: r.body
+      ? hasGapMarks(r.contentType)
+        ? visibleIndex(r.body, r.body.length)
+        : r.body.length
+      : 0,
     truncated: r.truncated,
     snippet: r.snippet ?? null,
   };
@@ -87,6 +143,10 @@ export class SourceStore {
     // A fetched page never stores a known secret (review round 23) — e.g. a key the model put in the URL.
     const p = scrubKnownDeep(raw);
     const bodyHash = sha256(p.body);
+    // A row is never changed once stored (review #237 17차 — citations, share snapshots and references read it): the
+    // same row again only for the very same fetch — request and final address, body, title and type. Anything else
+    // is a new row (a new source id) with what this fetch found.
+    const title = cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title);
     const same = this.db
       .select()
       .from(sources)
@@ -96,6 +156,9 @@ export class SourceStore {
           eq(sources.kind, "page"),
           eq(sources.url, p.url),
           eq(sources.bodyHash, bodyHash),
+          eq(sources.finalUrl, p.finalUrl),
+          eq(sources.title, title),
+          eq(sources.contentType, p.contentType),
         ),
       )
       .get();
@@ -111,7 +174,7 @@ export class SourceStore {
         provider: "web_fetch",
         url: p.url,
         finalUrl: p.finalUrl,
-        title: cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title),
+        title,
         site: cut(p.site, SOURCE_LIMITS.site),
         publishedAt: p.publishedAt ?? null,
         fetchedAt: this.now(),
@@ -207,12 +270,24 @@ export class SourceStore {
    * Which ids are this conversation's sources and whether `cite` can check a passage against their stored text
    * (#53: the references a fresh session gets). Ids and flags only — no page text is read.
    */
-  citable(conversationId: string): Map<string, { text: boolean }> {
-    const rows = this.db
-      .select({ id: sources.id, kind: sources.kind, hasBody: sql<number>`${sources.body} is not null` })
-      .from(sources)
-      .where(eq(sources.conversationId, conversationId))
-      .all();
+  citable(conversationId: string, ids?: readonly string[]): Map<string, { text: boolean }> {
+    // Only the ids asked for (the history's citations — review #237 20차), and whether each has text without
+    // reading it (`HAS_TEXT`).
+    if (ids && !ids.length) return new Map();
+    const rows = ids
+      ? (this.db.$client
+          .prepare(
+            `select s.id as id, s.kind as kind, coalesce(octet_length(s.body), 0) > 0 as hasBody
+               from json_each(?) as j cross join sources as s on s.id = j.value
+              where s.conversation_id = ? order by s.rowid`,
+          )
+          .all(JSON.stringify(ids), conversationId) as { id: string; kind: string; hasBody: number }[])
+      : this.db
+          .select({ id: sources.id, kind: sources.kind, hasBody: HAS_TEXT })
+          .from(sources)
+          .where(eq(sources.conversationId, conversationId))
+          .orderBy(sql`rowid`)
+          .all();
     return new Map(rows.map((r) => [r.id, { text: r.kind === "page" && r.hasBody === 1 }]));
   }
 
@@ -223,6 +298,87 @@ export class SourceStore {
   listFor(scope: SourceScope): SourceRow[] | undefined {
     if (!this.owns(scope)) return undefined;
     return this.list(scope.conversationId).filter((r) => r.userId === scope.userId);
+  }
+
+  /**
+   * The query behind `recentFor` (its plan is checked by a test: the `sources_conversation_user_idx` index in rowid
+   * order, no sort, no text read).
+   */
+  recentQuery(scope: Pick<SourceScope, "userId" | "conversationId">, limit: number) {
+    return this.db
+      .select({
+        id: sources.id,
+        userId: sources.userId,
+        conversationId: sources.conversationId,
+        runId: sources.runId,
+        kind: sources.kind,
+        provider: sources.provider,
+        url: sources.url,
+        finalUrl: sources.finalUrl,
+        title: sources.title,
+        site: sources.site,
+        publishedAt: sources.publishedAt,
+        fetchedAt: sources.fetchedAt,
+        contentType: sources.contentType,
+        bodyHash: sources.bodyHash,
+        truncated: sources.truncated,
+        snippet: sources.snippet,
+        hasBody: HAS_TEXT,
+      })
+      .from(sources)
+      .where(and(eq(sources.conversationId, scope.conversationId), eq(sources.userId, scope.userId)))
+      .orderBy(sql`rowid desc`)
+      .limit(limit);
+  }
+
+  /**
+   * The newest `limit` sources of the token's conversation (that user's rows), oldest first — metadata and whether a
+   * page's text is stored, **never the text** (review #237 18차: a page fetched many times would load every body).
+   * Undefined when the token's user does not own the conversation.
+   */
+  recentFor(
+    scope: SourceScope,
+    limit: number,
+  ): (Omit<SourceRow, "body" | "createdAt"> & { hasBody: boolean })[] | undefined {
+    if (!this.owns(scope)) return undefined;
+    const rows = this.recentQuery(scope, limit).all();
+    return rows.reverse().map((r) => scrubKnownDeep({ ...r, hasBody: r.hasBody === 1 }));
+  }
+
+  /**
+   * The sources of a conversation among `ids`, oldest first (#234, review #237 19차): only those rows are read — a
+   * share's view or a viewer's list never loads the text of rows it does not show.
+   */
+  listByIds(conversationId: string, ids: ReadonlySet<string>): SourceRow[] {
+    if (!ids.size) return [];
+    // One JSON parameter, however many ids (review #237 20차: one bound variable per id stops at 32,766).
+    const raw = this.db.$client.prepare(BY_IDS_SQL).all(JSON.stringify([...ids]), conversationId) as Record<
+      string,
+      unknown
+    >[];
+    return raw.map((r) => scrubKnownDeep(rowOf(r)));
+  }
+
+  /** What counting needs of a source (#234): its body hash and addresses — never its text. */
+  keyInfo(
+    conversationId: string,
+    id: string,
+  ): { bodyHash: string | null; finalUrl: string | null; url: string } | undefined {
+    return this.db
+      .select({ bodyHash: sources.bodyHash, finalUrl: sources.finalUrl, url: sources.url })
+      .from(sources)
+      .where(and(eq(sources.id, id), eq(sources.conversationId, conversationId)))
+      .get();
+  }
+
+  /**
+   * One page of the token's conversation with its (scrubbed) text — `web_find` (#234). Undefined when the token's
+   * user does not own the conversation or the row is not theirs.
+   */
+  getFor(scope: SourceScope, id: string): SourceRow | undefined {
+    if (!this.owns(scope)) return undefined;
+    const row = this.get(scope.conversationId, id);
+    return row && row.userId === scope.userId ? row : undefined;
   }
 
   /**

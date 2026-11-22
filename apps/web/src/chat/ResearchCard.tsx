@@ -45,6 +45,7 @@ const ERROR_TEXT: Record<string, string> = {
   conversation_gone: "대화가 삭제됐어요.",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요.",
   runtime_changed: "대화가 Codex로 바뀌어 멈췄어요. 깊이 조사는 Claude 대화에서만 돼요.",
+  runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요.",
 };
 
 const SCOPE_TEXT: Record<ResearchScope, string> = { web: "웹", files: "첨부 파일", both: "웹 + 첨부" };

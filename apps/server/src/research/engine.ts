@@ -10,6 +10,7 @@ import {
   type ResearchPlan,
   type ResearchScope,
   type ResearchStatus,
+  sourceTypeOf,
 } from "@agentlee/shared";
 import type { ArtifactStore } from "../artifacts/store.js";
 import type { UserStore } from "../auth/users.js";
@@ -64,6 +65,9 @@ import {
   type ResearchJobRow,
   type ResearchNote,
   type ResearchStore,
+  type UnverifiedClaim,
+  claimKeyOf,
+  contentKeyOf,
 } from "./store.js";
 
 /**
@@ -151,6 +155,7 @@ export const RESEARCH_FAILURE_TEXT: Record<ResearchErrorCode | "stopped", string
   conversation_gone: "대화가 삭제됐어요",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요",
   runtime_changed: "대화가 Codex로 바뀌어 멈췄어요",
+  runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요",
   stopped: "중지했어요",
 };
 
@@ -175,6 +180,13 @@ const ACTIVE: ResearchStatus[] = ["planning", "researching", "writing"];
 /** The writer needs at least this much: less, and the report is the verified passages themselves. */
 const MIN_WRITE_MS = 30_000;
 const REFLECT_MS = 90_000;
+/** Unverified claims kept per sub-question (for its retry and the lead's reflection). */
+const UNVERIFIED_KEPT = 5;
+/**
+ * Runtime failures a weak sub-question is retried after (#234): a passing error. The account's state — its login,
+ * its usage, its connection, its permission, the conversation switched — would only fail again.
+ */
+const RETRYABLE: ReadonlySet<string> = new Set<ResearchErrorCode>(["runtime_error"]);
 
 function anySignal(...signals: AbortSignal[]): AbortSignal {
   const c = new AbortController();
@@ -497,6 +509,9 @@ export class ResearchEngine {
   }
 
   private async execute(id: string, live: Live, opts: { recovered?: boolean }): Promise<void> {
+    // A job resumed after a restart whose research then ran on (any step after the restart) is no longer "only what
+    // the restart left": nothing found is `no_findings`, not `server_restart` (review #237 4차).
+    let recovered = opts.recovered;
     for (;;) {
       if (live.abort.signal.aborted) return;
       const row = this.get(id);
@@ -505,8 +520,9 @@ export class ResearchEngine {
       if (row.status === "planning") await this.plan(row, live);
       else if (row.status === "researching" || row.status === "writing") {
         this.armCap(row, live);
-        if (row.status === "researching") await this.research(row, live);
-        else await this.write(row, live, opts);
+        if (row.status === "researching") {
+          if (await this.research(row, live)) recovered = false;
+        } else await this.write(row, live, { recovered: recovered === true });
       } else return;
       if (live.abort.signal.aborted) return;
       const after = this.get(id);
@@ -688,7 +704,44 @@ export class ResearchEngine {
 
   // ---- 2. research ----
 
-  private async research(row: ResearchJobRow, live: Live): Promise<void> {
+  /**
+   * Every checkpoint's notes, whatever stage it resumes in (review #237 8·10·11차): a web note's page (`sourceKey`)
+   * from its stored source row when missing (a checkpoint from before notes carried it — e.g. a job running at the
+   * deploy), the same passage of one page once (`noteKey`), and the question's source count again — before any retry
+   * or the writer's notes are decided on them.
+   */
+  private normalizeNotes(row: ResearchJobRow, state: JobState): void {
+    for (const q of state.questions) {
+      this.refreshPages(row, q.found);
+      const seen = new Set<string>();
+      q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
+      q.sources = sourceCount(q.found);
+    }
+  }
+
+  /** A web source's identity for counting (`contentKeyOf` of its stored row), or undefined when it is gone. */
+  contentKeyFor(conversationId: string, sourceId: string): string | undefined {
+    const src = this.deps.sources.keyInfo(conversationId, sourceId);
+    return src ? contentKeyOf(src) : undefined;
+  }
+
+  /**
+   * Each web note's source identity and kind from its own (never changed) source row (review #237 16·17차): the
+   * content (`contentKeyOf` — the stored body's hash), so rows of one body count once whatever addresses they have.
+   */
+  private refreshPages(row: ResearchJobRow, notes: ResearchNote[]): void {
+    for (const n of notes) {
+      if (!n.sourceId) continue;
+      const src = this.deps.sources.keyInfo(row.conversationId, n.sourceId);
+      if (!src) continue;
+      n.sourceKey = contentKeyOf(src);
+      n.sourceType = sourceTypeOf(src.finalUrl ?? src.url);
+    }
+  }
+
+  /** Runs the research stage; true when at least one sub-question step ran. */
+  private async research(row: ResearchJobRow, live: Live): Promise<boolean | undefined> {
+    let ran = false;
     const plan = planOf(row);
     if (!plan || row.approvedAt === null || row.deadlineAt === null)
       return void this.fail(row.id, "runtime_error", live);
@@ -700,6 +753,7 @@ export class ResearchEngine {
     // …and every question still to ask (an old checkpoint's gap question too) is held within them.
     for (const q of state.questions)
       if (q.status === "waiting" || q.status === "running") q.scope = clampScope(q.scope, state.scopes);
+    this.normalizeNotes(row, state);
     const files = this.files(row);
     /**
      * Every new step looks again (review 2): the conversation switched to Codex (or the connection gone) while the job
@@ -719,8 +773,13 @@ export class ResearchEngine {
       row.deadlineAt - this.limits.writeMs - this.limits.wrapUpMs,
     );
     // A restart: what was running is asked again from scratch.
+    // A retry (#234) keeps what its first run verified.
     for (const q of state.questions)
-      if (q.status === "running") Object.assign(q, { status: "waiting", found: [], sources: 0, dropped: 0 });
+      if (q.status === "running")
+        Object.assign(
+          q,
+          q.retried ? { status: "waiting" } : { status: "waiting", found: [], sources: 0, dropped: 0 },
+        );
     const stage = new AbortController();
     const cancel = this.clock.timer(researchEnd - this.clock.now(), () => stage.abort());
     const signal = anySignal(live.abort.signal, stage.signal, live.cap!.signal);
@@ -732,14 +791,38 @@ export class ResearchEngine {
         if (waiting.length && this.clock.now() < researchEnd && !signal.aborted)
           await pool(waiting, this.limits.concurrency, async (q) => {
             if (signal.aborted) return;
+            // A retry or a gap question (#234) starts only with a round's time left — checked when it gets its slot
+            // (review #237 2차: a fourth one queued behind three, or one resumed after a restart). A retry then keeps
+            // what its first run found; a gap question stays unasked (the report says the time ran out).
+            if ((q.retried || q.round > 0) && researchEnd - this.clock.now() < this.limits.minRoundMs) {
+              // Why it was not (re)searched (review #237 3차): the report counts it under the time limit, not as
+              // a question without evidence.
+              q.skipped = "time";
+              if (q.retried) q.status = q.found.length ? "done" : "capped";
+              else q.status = "capped";
+              state.timedOut = true;
+              return;
+            }
             const ctx = fresh();
             if (!ctx) return;
+            // Held within the approved sources right before it runs (review #237 1차): an old checkpoint's question
+            // of any status — a retry may run a done one again — never gets tools the owner did not approve.
+            q.scope = clampScope(q.scope, state.scopes);
             q.status = "running";
             persist();
+            // A retry (#234) keeps what the first run verified and is told what it found and what failed.
+            const before = q.retried ? q.found : [];
+            ran = true;
             const r = await this.step(row, ctx, {
-              name: q.id,
+              name: q.retried ? `${q.id}:retry` : q.id,
               prompt: "subagent",
-              text: subagentTurn({ question: row.question, plan, sub: q, files }),
+              text: subagentTurn({
+                question: row.question,
+                plan,
+                sub: q,
+                files,
+                ...(q.retried ? { retry: { found: before, unverified: claimsOf(q.unverified) } } : {}),
+              }),
               tools: this.toolsFor(row.ownerId, toolsOf(q.scope)),
               ms: Math.min(this.limits.subagentMs, researchEnd - this.clock.now()),
               toolCalls: this.limits.subagentToolCalls,
@@ -747,10 +830,16 @@ export class ResearchEngine {
             });
             if (live.abort.signal.aborted) return;
             const raw = parseNotes(r.text, this.limits.notesPerQuestion);
-            const notes = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
+            const checked = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
+            // Pages as the source rows say now, before merging and counting (review #237 16차).
+            this.refreshPages(row, before);
+            this.refreshPages(row, checked.notes);
+            const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
-            q.dropped = raw.length - notes.length;
+            q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
+            // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
+            q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
             q.status =
               r.ended === "done"
                 ? "done"
@@ -759,6 +848,9 @@ export class ResearchEngine {
                     ? "done"
                     : "failed"
                   : "capped";
+            // How its last run ended, whatever it kept (review #237 2차): a passing runtime error may be retried
+            // once (#234); an account's state (login, usage, connection, permission, a switched runtime) never.
+            q.failure = r.ended === "failed" ? (r.error ?? "runtime_error") : undefined;
             if (r.ended === "failed") error ??= r.error;
             persist();
           });
@@ -770,12 +862,46 @@ export class ResearchEngine {
             state.timedOut = true;
           break;
         }
-        if (state.round >= this.limits.maxDepth || state.reflected >= state.round) break;
         // Not enough time for another round: straight to writing (the forced wrap-up).
         if (researchEnd - this.clock.now() < this.limits.minRoundMs) break;
+        // Weak sub-questions (#234) — no verified note, or one source only — are researched once more with rewritten
+        // queries, whether or not the lead names them: within the same budgets, before the lead looks for gaps.
+        // Counted on the rows as they are now (a later fetch may have moved a row to another page).
+        this.normalizeNotes(row, state);
+        const weak = state.questions.filter(
+          (q) =>
+            !q.retried &&
+            (q.status === "done" || q.status === "capped" || q.status === "failed") &&
+            (q.failure === undefined || RETRYABLE.has(q.failure)) &&
+            (q.found.length === 0 || q.sources <= 1),
+        );
+        if (weak.length) {
+          for (const q of weak) {
+            q.scope = clampScope(q.scope, state.scopes);
+            // Its last failure stays until the retry actually runs (a retry skipped for time reports it).
+            Object.assign(q, { retried: true, status: "waiting" });
+          }
+          logEvent(this.deps.log, "info", "research.retry", {
+            userId: row.ownerId,
+            researchId: row.id,
+            count: weak.length,
+          });
+          persist();
+          continue;
+        }
+        // One more gap round than `maxDepth` only while plenty of research time is left (#234).
+        const depth =
+          this.limits.maxDepth +
+          (researchEnd - this.clock.now() >= this.limits.extraRoundMs ? this.limits.extraDepth : 0);
+        if (state.round >= depth || state.reflected >= state.round) break;
         const notes = allNotes(state);
         const ctx = fresh();
         if (!ctx) return void this.fail(row.id, ended!, live);
+        const unverifiedNow = state.questions
+          .flatMap((q) => claimsOf(q.unverified))
+          .slice(0, UNVERIFIED_KEPT * 2);
+        // A reflection after a restart is research that ran on too (review #237 5차).
+        ran = true;
         const r = await this.step(row, ctx, {
           name: `reflect${state.round}`,
           prompt: "reflect",
@@ -785,6 +911,7 @@ export class ResearchEngine {
             scopes: state.scopes ?? ["web"],
             asked: state.questions.map((q) => q.question),
             notes: pickNotes(state, this.limits.maxNotes),
+            unverified: unverifiedNow,
           }),
           tools: [],
           ms: Math.min(REFLECT_MS, researchEnd - this.clock.now()),
@@ -794,12 +921,19 @@ export class ResearchEngine {
         state.reflected = state.round;
         const asked = new Set(state.questions.map((q) => q.question));
         const gaps =
-          r.ended === "done" && notes.length
+          // Gaps are taken with no verified note too when claims failed (the lead may ask to verify them —
+          // review #237 6차); still within the round's budget and time checks below.
+          r.ended === "done" && (notes.length || unverifiedNow.length)
             ? parseGaps(r.text, files.length > 0)
                 .filter((g) => !asked.has(g.question))
                 .map((g) => ({ ...g, scope: clampScope(g.scope, state.scopes) }))
             : [];
-        if (!gaps.length) {
+        // The reflection took time: the new round starts only if it still fits — `extraRoundMs` for the round past
+        // `maxDepth`, `minRoundMs` otherwise (review #237 1차).
+        const left = researchEnd - this.clock.now();
+        const need =
+          state.round + 1 > this.limits.maxDepth ? this.limits.extraRoundMs : this.limits.minRoundMs;
+        if (!gaps.length || left < need) {
           persist();
           break;
         }
@@ -820,22 +954,45 @@ export class ResearchEngine {
     } finally {
       cancel();
     }
+    // What was never (re)asked ran out of time (the research budget, the cap — also one already spent at a restart):
+    // under the time limit in the report, not "no evidence found" (review #237 3·4차).
     for (const q of state.questions)
-      if (q.status === "waiting" || q.status === "running") q.status = "capped";
+      if (q.status === "waiting" || q.status === "running") {
+        q.status = "capped";
+        q.skipped = "time";
+        state.timedOut = true;
+      }
     state.stage = "write";
-    if (error && !allNotes(state).length) return void this.fail(row.id, error, live);
+    // Nothing verified: the job fails with how the questions' last runs ended — an account's state first (a retry
+    // that ended `runtime_auth` after a passing `runtime_error` reports the login, review #237 2차).
+    // Only the last runs count (review #237 3차): retries that all ended cleanly with nothing leave no error — the
+    // writer then ends the job as `no_findings`.
+    const last = state.questions.flatMap((q) => (q.failure ? [q.failure] : []));
+    error = last.find((c) => !RETRYABLE.has(c)) ?? last[0];
+    if (error && !allNotes(state).length) {
+      // The questions' end state (skipped for time, the time limit) is kept with the failure (review #237 5차).
+      this.save(row.id, { state }, ["researching"], live);
+      this.fail(row.id, error, live);
+      return ran;
+    }
     this.save(row.id, { status: "writing", state }, ["researching"], live);
+    return ran;
   }
 
-  /** The notes whose passage the server finds in their page (a source of the conversation) or attached file. */
+  /**
+   * The notes whose passage the server finds in their page (a source of the conversation) or attached file. A note
+   * whose quote is not found is never rewritten (review #237 4차 — any rewrite could change what its claim rests on):
+   * its claim comes back as `unverified`, a hint for the retry and the lead only.
+   */
   private async verifyNotes(
     row: ResearchJobRow,
     raw: RawNote[],
     files: ReadonlySet<string>,
-  ): Promise<ResearchNote[]> {
+  ): Promise<{ notes: ResearchNote[]; unverified: UnverifiedClaim[] }> {
     const scope = { conversationId: row.conversationId, userId: row.ownerId };
     const out: ResearchNote[] = [];
     const seen = new Set<string>();
+    const unverified: UnverifiedClaim[] = [];
     for (const n of raw) {
       let note: ResearchNote | undefined;
       try {
@@ -845,9 +1002,14 @@ export class ResearchEngine {
             note = {
               id: "",
               claim: scrubKnown(n.claim),
+              claimKey: n.claimKey,
               quote: r.quote,
               sourceId: r.source.id,
               title: r.source.title,
+              sourceType: sourceTypeOf(r.source.finalUrl ?? r.source.url),
+              // One source however it was reached: its content (two rows of one body — a redirect, the same PDF at
+              // two addresses — are one, review #237 17차).
+              sourceKey: contentKeyOf(r.source),
             };
         } else if (n.fileId && files.has(n.fileId) && this.deps.fileTools) {
           const f = this.deps.fileTools.fileFor(scope, n.fileId);
@@ -856,6 +1018,7 @@ export class ResearchEngine {
             note = {
               id: "",
               claim: scrubKnown(n.claim),
+              claimKey: n.claimKey,
               quote: c.quote,
               fileId: f.id,
               title: f.name,
@@ -869,13 +1032,20 @@ export class ResearchEngine {
       } catch {
         note = undefined;
       }
-      if (!note) continue;
-      const key = `${note.sourceId ?? note.fileId}\n${note.quote}`;
+      if (!note) {
+        unverified.push({ key: n.claimKey, claim: scrubKnown(n.claim) });
+        continue;
+      }
+      // One passage of one page once, however it was reached (as `mergeNotes`).
+      const key = noteKey(note);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(note);
     }
-    return out.map((n, i) => ({ ...n, id: `${crypto.randomUUID().slice(0, 8)}-${i}` }));
+    return {
+      notes: out.map((n, i) => ({ ...n, id: `${crypto.randomUUID().slice(0, 8)}-${i}` })),
+      unverified,
+    };
   }
 
   // ---- 3. write ----
@@ -884,6 +1054,8 @@ export class ResearchEngine {
     const plan = planOf(row);
     if (!plan || row.deadlineAt === null) return void this.fail(row.id, "runtime_error", live);
     const state = stateOf(row);
+    // A checkpoint restored straight into writing is normalised the same way (review #237 11차).
+    this.normalizeNotes(row, state);
     const notes = pickNotes(state, this.limits.maxNotes);
     if (!notes.length) return void this.fail(row.id, opts.recovered ? "server_restart" : "no_findings", live);
     const files = this.files(row);
@@ -1009,7 +1181,10 @@ export class ResearchEngine {
     const conv = conversations.get(row.conversationId);
     // Stopped (or gone) meanwhile: no artifact, no message. Nothing below awaits, so no stop can come in between.
     if (!conv || this.get(row.id)?.status !== "writing") return;
-    const unanswered = state.questions.filter((q) => !q.found.length).map((q) => q.question);
+    // A question skipped for lack of time is under the time limit (`timedOut`), not "no evidence found" (#234).
+    const unanswered = state.questions
+      .filter((q) => !q.found.length && q.skipped !== "time")
+      .map((q) => q.question);
     const content = renderReport({
       title: plan.title,
       date: seoulDate(new Date(this.clock.now())),
@@ -1124,19 +1299,126 @@ export class ResearchEngine {
 
 /** Our tools a sub-researcher of this scope gets. */
 export function toolsOf(scope: ResearchScope): string[] {
-  const web = ["web_search", "web_fetch"];
+  const web = ["web_search", "web_fetch", "web_find"];
   const files = ["file_search", "file_read"];
   return scope === "web" ? web : scope === "files" ? files : [...web, ...files];
 }
 
 const allNotes = (s: JobState) => s.questions.flatMap((q) => q.found);
 
+/**
+ * A note's identity: the same passage of the same page once, however it was reached (review #237 8차) — the page
+ * (`sourceKey`, else the source or file id) and the quote with its spaces normalised.
+ */
+const noteKey = (n: ResearchNote) =>
+  `${n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`}\n${n.quote.normalize("NFC").replace(/\s+/gu, " ").trim()}`;
+
+/**
+ * A retry's notes after the first run's (#234): the same passage of the same source once, at most `max` — and every
+ * source the retry newly found keeps at least one place (review #237 1차: twelve notes of page A must not crowd out
+ * the retry's page B). Otherwise the first run's notes come first, then the retry's, in order.
+ */
+export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: number): ResearchNote[] {
+  // The same passage of the same page once, however it was reached (review #237 8차): the page (`sourceKey`) and the
+  // quote with its spaces normalised; the note kept first keeps its source id.
+  const key = noteKey;
+  const src = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
+  const seen = new Set<string>();
+  const dedupe = (xs: ResearchNote[]) =>
+    xs.filter((n) => {
+      if (seen.has(key(n))) return false;
+      seen.add(key(n));
+      return true;
+    });
+  // Deduplicated first, the first run's then the retry's (review #237 9차: a duplicate already in the first run's
+  // notes must not shift where the retry's begin).
+  const first = dedupe(before);
+  const added = dedupe(after);
+  const all = [...first, ...added];
+  if (all.length <= max) return all;
+  // One place for every source the first run did not have, in the retry's order; then the rest in order.
+  const old = new Set(first.map(src));
+  const kept = new Set<ResearchNote>();
+  const fresh = new Set<string>();
+  for (const n of added)
+    if (!old.has(src(n)) && !fresh.has(src(n)) && kept.size < max) {
+      fresh.add(src(n));
+      kept.add(n);
+    }
+  let room = max - kept.size;
+  return all.filter((n) => kept.has(n) || (room > 0 && room-- > 0));
+}
+
+/** The texts of unverified claims (for the prompts). */
+const claimsOf = (u: QuestionRecord["unverified"]) =>
+  (u ?? []).map((c) => (typeof c === "string" ? c : c.claim));
+
+/**
+ * A sub-question's unverified claims after a run (#234): the earlier ones and the new failures, once each, without
+ * those a note of this run now backs (the same claim), at most `UNVERIFIED_KEPT` — a retry that finds nothing does
+ * not forget what failed before.
+ */
+export function mergeUnverified(
+  before: readonly (UnverifiedClaim | string)[],
+  failed: readonly UnverifiedClaim[],
+  verified: readonly ResearchNote[],
+): UnverifiedClaim[] {
+  // The whole claim is its identity (`claimKey`, a hash of all of it — review #237 3·4차); prompts cut it for display.
+  const backed = new Set(verified.map((n) => n.claimKey ?? claimKeyOf(n.claim)));
+  const seen = new Set<string>();
+  const out: UnverifiedClaim[] = [];
+  // Dedupe first, then cap (review #237 2차: five copies of one claim must not crowd out another).
+  for (const raw of [...before, ...failed]) {
+    // An older checkpoint kept the claim's text only.
+    const c = typeof raw === "string" ? { key: claimKeyOf(raw), claim: raw } : raw;
+    if (!c.claim || backed.has(c.key) || seen.has(c.key)) continue;
+    seen.add(c.key);
+    out.push(c);
+  }
+  return out.slice(0, UNVERIFIED_KEPT);
+}
+
 /** At most `max` notes for the lead and the writer, taken in turn from each sub-question (none crowds out another). */
 export function pickNotes(s: JobState, max: number): ResearchNote[] {
-  const lists = s.questions.map((q) => [...q.found]);
+  const page = (n: ResearchNote) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`);
+  const lists = s.questions.map((q) => q.found);
+  const taken = new Set<ResearchNote>();
   const out: ResearchNote[] = [];
-  for (let i = 0; out.length < max && lists.some((l) => i < l.length); i++)
-    for (const l of lists) if (i < l.length && out.length < max) out.push(l[i]!);
+  const take = (n: ResearchNote) => {
+    taken.add(n);
+    out.push(n);
+  };
+  // 1. Every page once (review #237 10·11차: a page only one question found, or a retry's new page, reaches the
+  //    writer whatever the others hold): questions in turn, each giving its next note from a page not taken yet —
+  //    or, if it has none, its first note, so every question is heard.
+  const seen = new Set<string>();
+  const given = new Set<number>();
+  // The pages a question could still bring that none has yet.
+  const unseen = (l: readonly ResearchNote[]) =>
+    new Set(l.filter((n) => !taken.has(n) && !seen.has(page(n))).map(page)).size;
+  for (let progress = true; progress && out.length < max;) {
+    progress = false;
+    // Most constrained first (review #237 12차, best effort — not an optimal matching): each round serves the
+    // questions with the fewest pages still unseen first (ties in their own order), so a question whose only page
+    // is A takes A before one that has others.
+    const order = [...lists.entries()]
+      .map(([qi, l]) => ({ qi, l, left: unseen(l) }))
+      .sort((x, y) => x.left - y.left || x.qi - y.qi);
+    for (const { qi, l } of order) {
+      if (out.length >= max) break;
+      const next = l.find((n) => !taken.has(n) && !seen.has(page(n)));
+      const pick = next ?? (given.has(qi) ? undefined : l.find((n) => !taken.has(n)));
+      if (!pick) continue;
+      seen.add(page(pick));
+      given.add(qi);
+      take(pick);
+      progress = true;
+    }
+  }
+  // 2. The rest, questions in turn, each in its own order.
+  const rest = lists.map((l) => l.filter((n) => !taken.has(n)));
+  for (let i = 0; out.length < max && rest.some((l) => i < l.length); i++)
+    for (const l of rest) if (i < l.length && out.length < max) take(l[i]!);
   return out;
 }
 

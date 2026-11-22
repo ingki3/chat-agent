@@ -19,7 +19,7 @@ import {
   type ReportCitation,
 } from "../src/research/report.js";
 import { pickNotes, summaryOf } from "../src/research/engine.js";
-import { emptyState } from "../src/research/store.js";
+import { claimKeyOf, emptyState } from "../src/research/store.js";
 
 /**
  * 깊이 조사's pure parts (#211): the removal of what has no verified citation (decision 4), the report around it, and
@@ -339,8 +339,8 @@ describe("what the server reads from the model", () => {
       'NOTE {"claim":"잘림","sourceId":"s2","quo',
     ].join("\n");
     expect(parseNotes(text)).toEqual([
-      { claim: "가", quote: "구절", sourceId: "s1" },
-      { claim: "나", quote: "파일 구절", fileId: "f1", page: 3 },
+      { claim: "가", claimKey: claimKeyOf("가"), quote: "구절", sourceId: "s1" },
+      { claim: "나", claimKey: claimKeyOf("나"), quote: "파일 구절", fileId: "f1", page: 3 },
     ]);
     expect(parseNotes(text, 1)).toHaveLength(1);
     expect(
