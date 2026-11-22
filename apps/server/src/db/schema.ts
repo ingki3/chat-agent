@@ -650,6 +650,8 @@ export const sources = sqliteTable(
   (t) => [
     index("sources_conversation_idx").on(t.conversationId, t.createdAt),
     index("sources_conversation_url_idx").on(t.conversationId, t.url),
+    // #234: a conversation's newest rows of one user, in rowid order (`sources_list`) — no sort, no body read.
+    index("sources_conversation_user_idx").on(t.conversationId, t.userId),
   ],
 );
 

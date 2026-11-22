@@ -179,10 +179,16 @@ export function toResearchJob(
 ): ResearchJob {
   const s = stateOf(row);
   const plan = planOf(row);
-  // Copies with their keys as the rows say now — the checkpoint itself is not written here.
+  // Copies with their keys as the rows say now — the checkpoint itself is not written here. One lookup per source
+  // for the whole view (review #237 19차).
+  const known = new Map<string, string | undefined>();
+  const keyOf = (id: string) => {
+    if (!known.has(id)) known.set(id, opts.contentKey!(id));
+    return known.get(id);
+  };
   const keyed = (found: readonly ResearchNote[]) =>
     opts.contentKey
-      ? found.map((n) => (n.sourceId ? { ...n, sourceKey: opts.contentKey!(n.sourceId) ?? n.sourceKey } : n))
+      ? found.map((n) => (n.sourceId ? { ...n, sourceKey: keyOf(n.sourceId) ?? n.sourceKey } : n))
       : [...found];
   for (const q of s.questions) {
     q.found = keyed(q.found ?? []);

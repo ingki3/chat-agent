@@ -446,6 +446,19 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(f.sources.recentFor(f.scope, 3)!.every((x) => !("body" in x))).toBe(true);
   });
 
+  it("the sources_list query uses its index in rowid order (no sort) and never names the text column", () => {
+    const f = family();
+    const q = f.sources.recentQuery(f.scope, 100).toSQL();
+    expect(q.sql).not.toMatch(/"body"/);
+    const plan = (
+      f.db.$client.prepare(`EXPLAIN QUERY PLAN ${q.sql}`).all(...(q.params as unknown[])) as {
+        detail: string;
+      }[]
+    ).map((r) => r.detail);
+    expect(plan.join(" | ")).toMatch(/USING INDEX sources_conversation_user_idx/);
+    expect(plan.join(" | ")).not.toMatch(/TEMP B-TREE/);
+  });
+
   it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {
     const pdfLike = (n: number) => Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(n, 0x20)]);
     const at = (p: string, type: string | undefined, body: Buffer) =>

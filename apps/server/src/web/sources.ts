@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
@@ -266,16 +266,11 @@ export class SourceStore {
   }
 
   /**
-   * The newest `limit` sources of the token's conversation (that user's rows), oldest first — metadata and whether a
-   * page's text is stored, **never the text** (review #237 18차: a page fetched many times would load every body).
-   * Undefined when the token's user does not own the conversation.
+   * The query behind `recentFor` (its plan is checked by a test: the `sources_conversation_user_idx` index in rowid
+   * order, no sort, no text read).
    */
-  recentFor(
-    scope: SourceScope,
-    limit: number,
-  ): (Omit<SourceRow, "body" | "createdAt"> & { hasBody: boolean })[] | undefined {
-    if (!this.owns(scope)) return undefined;
-    const rows = this.db
+  recentQuery(scope: Pick<SourceScope, "userId" | "conversationId">, limit: number) {
+    return this.db
       .select({
         id: sources.id,
         userId: sources.userId,
@@ -293,14 +288,43 @@ export class SourceStore {
         bodyHash: sources.bodyHash,
         truncated: sources.truncated,
         snippet: sources.snippet,
-        hasBody: sql<number>`${sources.body} is not null`,
+        // Whether a page's text is stored, without reading it: every stored text has its hash (`addPage`), a row
+        // without text has none (search results, a fork's copies) — review #237 19차.
+        hasBody: sql<number>`${sources.bodyHash} is not null`,
       })
       .from(sources)
       .where(and(eq(sources.conversationId, scope.conversationId), eq(sources.userId, scope.userId)))
       .orderBy(sql`rowid desc`)
-      .limit(limit)
-      .all();
+      .limit(limit);
+  }
+
+  /**
+   * The newest `limit` sources of the token's conversation (that user's rows), oldest first — metadata and whether a
+   * page's text is stored, **never the text** (review #237 18차: a page fetched many times would load every body).
+   * Undefined when the token's user does not own the conversation.
+   */
+  recentFor(
+    scope: SourceScope,
+    limit: number,
+  ): (Omit<SourceRow, "body" | "createdAt"> & { hasBody: boolean })[] | undefined {
+    if (!this.owns(scope)) return undefined;
+    const rows = this.recentQuery(scope, limit).all();
     return rows.reverse().map((r) => scrubKnownDeep({ ...r, hasBody: r.hasBody === 1 }));
+  }
+
+  /**
+   * The sources of a conversation among `ids`, oldest first (#234, review #237 19차): only those rows are read — a
+   * share's view or a viewer's list never loads the text of rows it does not show.
+   */
+  listByIds(conversationId: string, ids: ReadonlySet<string>): SourceRow[] {
+    if (!ids.size) return [];
+    return this.db
+      .select()
+      .from(sources)
+      .where(and(eq(sources.conversationId, conversationId), inArray(sources.id, [...ids])))
+      .orderBy(sql`rowid`)
+      .all()
+      .map((r) => scrubKnownDeep(r));
   }
 
   /** What counting needs of a source (#234): its body hash and addresses — never its text. */

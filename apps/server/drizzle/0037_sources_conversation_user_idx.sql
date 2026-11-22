@@ -1,0 +1,1 @@
+CREATE INDEX `sources_conversation_user_idx` ON `sources` (`conversation_id`,`user_id`);

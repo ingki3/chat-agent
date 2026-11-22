@@ -3,7 +3,7 @@ import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CitationNotePart,
   type MessagePart,
@@ -407,6 +407,16 @@ describe("family sharing — snapshot scope (#29, decision #3)", () => {
     const msgs = JSON.stringify(res.json());
     expect(msgs).toContain("https://a.example/1");
     expect(msgs).not.toContain("바뀐 제목");
+    // A viewer's source list and view read only their visible rows — never every stored version's text (#234 19차).
+    const list = vi.spyOn(SourceStore.prototype, "list");
+    const byIds = vi.spyOn(SourceStore.prototype, "listByIds");
+    const shown = await viewer.get(`/api/conversations/${c.id}/sources`);
+    expect(shown.statusCode).toBe(200);
+    expect(shown.json<{ items: { id: string }[] }>().items.map((x) => x.id)).toEqual([w.s1]);
+    expect(list).not.toHaveBeenCalled();
+    expect(byIds).toHaveBeenCalled();
+    list.mockRestore();
+    byIds.mockRestore();
     expect(msgs).not.toContain("a.example/moved");
   });
 

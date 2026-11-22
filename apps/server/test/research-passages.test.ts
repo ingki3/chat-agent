@@ -14,7 +14,7 @@ import {
   visibleIndex,
 } from "../src/citations/verify.js";
 import { parseNotes, subagentTurn } from "../src/research/prompts.js";
-import { claimKeyOf, emptyState, type QuestionRecord } from "../src/research/store.js";
+import { claimKeyOf, emptyState, toResearchJob, type QuestionRecord } from "../src/research/store.js";
 import { mergeNotes, mergeUnverified, pickNotes } from "../src/research/engine.js";
 import type { ResearchNote } from "../src/research/store.js";
 import { pdfTitle } from "../src/web/service.js";
@@ -553,5 +553,57 @@ describe("review #237 12차", () => {
     expect(sourceTypeOf("https://ac.uk/")).toBe("academic");
     expect(sourceTypeOf("https://example.com/")).toBe("other");
     expect(sourceTypeOf("https://ac.example.com/")).toBe("other");
+  });
+});
+
+describe("review #237 19차", () => {
+  it("the job view looks each source up once, however many notes rest on it", () => {
+    const s = emptyState();
+    s.questions = Array.from({ length: 6 }, (_, q) => ({
+      id: `q${q}`,
+      question: `q${q}`,
+      scope: "web" as const,
+      round: 0,
+      status: "done" as const,
+      sources: 1,
+      dropped: 0,
+      found: Array.from({ length: 12 }, (_, i) => ({
+        id: `${q}-${i}`,
+        claim: "c",
+        quote: `${i}`,
+        sourceId: "S",
+      })),
+    }));
+    const row = {
+      id: "j",
+      conversationId: "c",
+      messageId: "m",
+      status: "done",
+      question: "q",
+      clarifyQuestion: null,
+      clarifyAnswer: null,
+      plan: null,
+      state: JSON.stringify(s),
+      result: null,
+      errorCode: null,
+      activeMs: 0,
+      approvedAt: null,
+      deadlineAt: null,
+      endedAt: null,
+      createdAt: 0,
+      fileIds: "[]",
+      version: 1,
+    } as unknown as Parameters<typeof toResearchJob>[0];
+    let lookups = 0;
+    const view = toResearchJob(row, {
+      owned: true,
+      now: 0,
+      contentKey: () => {
+        lookups++;
+        return "b:one";
+      },
+    });
+    expect(lookups).toBe(1);
+    expect(view.sources).toBe(1);
   });
 });
