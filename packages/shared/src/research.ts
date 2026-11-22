@@ -115,8 +115,9 @@ export const ResearchQuestionState = z.object({
   round: z.number().int().min(0),
   status: z.enum(["waiting", "running", "done", "capped", "failed"]),
   /**
-   * Distinct sources (pages, files) its verified notes rest on — "검증한 자료" on the card: counted by content (#234,
-   * the same page under another address is one), all that was verified, cited in the report or not.
+   * Distinct sources (pages, files) its verified notes rest on — "검증한 자료" on the card, cited in the report or not:
+   * a web page by the hash of its stored body (#234 — the same body under another address is one; a row without a body
+   * hash by its final address's page key), an attachment by its file id (two files with the same content are two).
    */
   sources: z.number().int().min(0),
   /** Notes the server could verify / that it dropped. */
