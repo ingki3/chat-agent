@@ -425,17 +425,47 @@ function pageOf(body: string, key: string | undefined): Page {
 }
 
 /**
- * Where a PDF page the extractor could not read (a scan, without OCR) stood in a page's text (#234, `web/pdf.ts`):
- * its own line. No match — a citation, a note's check, `web_find`, a repair — ever contains or runs across it.
+ * A private-use character (U+E000) that brackets the mark of a PDF page the extractor could not read (#234,
+ * `web/pdf.ts`). It never comes from a page: the web service removes it from every text it stores
+ * (`stripGapMarks`), so only a mark the PDF reader put there has it — a page that merely says "[읽지 못한 쪽]" is
+ * ordinary text (review #237 4차). Display paths drop the character.
  */
-export const PAGE_GAP = "[읽지 못한 쪽]";
+export const GAP_MARK = "\uE000";
+/** The mark as stored: its own line, between two `GAP_MARK`s. */
+export const PAGE_GAP = `${GAP_MARK}[읽지 못한 쪽]${GAP_MARK}`;
 
-/** Whether `[start, end)` of `body` overlaps any `PAGE_GAP` mark, even one character of it. */
+/** A text without any `GAP_MARK` (what every non-PDF page and every extracted PDF page is stored as). */
+export const stripGapMarks = (t: string) => (t.includes(GAP_MARK) ? t.replaceAll(GAP_MARK, "") : t);
+
+/**
+ * The ranges of the marks in `body`: each pair of `GAP_MARK`s, mark to mark; a mark without its pair (never stored
+ * so — the cut keeps marks whole) reaches the end of the text.
+ */
+export function gapRanges(body: string): [number, number][] {
+  const out: [number, number][] = [];
+  for (let a = body.indexOf(GAP_MARK); a !== -1;) {
+    const b = body.indexOf(GAP_MARK, a + 1);
+    out.push([a, b === -1 ? body.length : b + 1]);
+    if (b === -1) break;
+    a = body.indexOf(GAP_MARK, b + 1);
+  }
+  return out;
+}
+
+/**
+ * Whether `[start, end)` of `body` overlaps a mark (even one character of it): no match — a citation, a note's
+ * check, `web_find` — ever stands on or across a page that was not read (review #237 2–4차).
+ */
 export function touchesGap(body: string, start: number, end: number): boolean {
-  const from = Math.max(0, start - PAGE_GAP.length + 1);
-  for (let at = body.indexOf(PAGE_GAP, from); at !== -1 && at < end; at = body.indexOf(PAGE_GAP, at + 1))
-    if (at + PAGE_GAP.length > start) return true;
-  return false;
+  if (!body.includes(GAP_MARK)) return false;
+  return gapRanges(body).some(([a, b]) => a < end && start < b);
+}
+
+/** At most `max` characters of `text`, never cutting a mark in two (the cut moves before it). */
+export function cutOutsideGap(text: string, max: number): string {
+  if (text.length <= max) return text;
+  for (const [a, b] of gapRanges(text)) if (a < max && max < b) return text.slice(0, a).trimEnd();
+  return text.slice(0, max);
 }
 
 export type SnippetMatch =

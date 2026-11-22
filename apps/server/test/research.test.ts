@@ -1219,52 +1219,52 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
         id: string;
         question: string;
         retried?: boolean;
-        repaired?: number;
-        unverified?: string[];
+        unverified?: { key: string; claim: string }[];
         found: { quote: string; sourceId?: string; sourceType?: string }[];
       }[];
     };
 
-  it("a quote that does not match exactly is repaired to the page's own sentence; other figures are still dropped", async () => {
-    const script = scripted((x) =>
-      x.startsWith(TURN_MARK.subagent) && /증가율/.test(x) && !x.includes(RETRY_MARK)
-        ? [
-            { call: "web_fetch", input: { url: A.url } },
-            { call: "web_fetch", input: { url: FIXTURE_PAGES[1]!.url } },
-            {
-              textRefs: notes(
-                {
-                  claim: "산업부는 32% 증가로 발표했다",
-                  ref: "{{$0.sourceId}}",
-                  // Only the form differs: a comma, spacing, quote marks and a particle the page does not have.
-                  quote:
-                    "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
-                },
-                { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
-                // Other figures than the page's: never repaired.
-                { claim: "수출이 50% 늘었다", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.wrong },
-              ),
-            },
-          ]
-        : undefined,
-    );
+  it("a quote that does not match exactly is never rewritten: dropped, its claim only a hint for the retry", async () => {
+    const formOnly =
+      "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”";
+    const retries: string[] = [];
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /증가율/.test(x))) return undefined;
+      if (x.includes(RETRY_MARK)) {
+        retries.push(x);
+        return [{ text: "DONE" }];
+      }
+      return [
+        { call: "web_fetch", input: { url: A.url } },
+        { call: "web_fetch", input: { url: FIXTURE_PAGES[1]!.url } },
+        {
+          textRefs: notes(
+            // Only a space differs (review #237 4차: still never rewritten — correctness before recall).
+            { claim: "산업부는 32% 증가로 발표했다", ref: "{{$0.sourceId}}", quote: formOnly },
+            { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
+            { claim: "수출이 50% 늘었다", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.wrong },
+          ),
+        },
+      ];
+    });
     const t = await start({ script });
     const { job } = await begin(t);
     await statusIs(t.app, job.id, "awaiting_approval");
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     await statusIs(t.app, job.id, "done");
     const q1 = stateOf(t, job.id).questions[0]!;
-    // The page's own words for the quote (up to its last word — the exact check took it as it stands).
-    expect(q1.found.map((n) => n.quote)).toEqual([
-      RESEARCH_FIXTURE.growth.slice(0, -1),
-      RESEARCH_FIXTURE.stats,
-    ]);
-    expect(q1.repaired).toBe(1);
-    expect(q1.unverified).toEqual(["수출이 50% 늘었다"]);
+    expect(q1.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.stats]);
+    expect(q1.unverified?.map((c) => c.claim)).toEqual(["산업부는 32% 증가로 발표했다", "수출이 50% 늘었다"]);
     expect(q1.found[0]!.sourceType).toBe("other");
+    // One source left: retried, and told which claims failed.
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toContain("산업부는 32% 증가로 발표했다");
+    expect(retries[0]).toContain("서버는 구절을 고쳐 주지 않는다");
+    const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
+    expect(writer).not.toContain("산업부는 32% 증가로 발표했다");
     const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
     expect(end.questions[0]).toEqual(
-      expect.objectContaining({ notes: 2, dropped: 1, sources: 2, status: "done" }),
+      expect.objectContaining({ notes: 1, dropped: 2, sources: 1, status: "done" }),
     );
     // The server-only bookkeeping is not part of the API's job — in the raw answer, before any schema parse.
     const raw = (await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json() as {
@@ -1274,8 +1274,6 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       expect(Object.keys(q).sort()).toEqual(
         ["dropped", "id", "notes", "question", "round", "scope", "sources", "status"].sort(),
       );
-    // The writer got the repaired passage: its citation verifies.
-    expect(end.result).toMatchObject({ citations: 3 });
   });
 
   it("a sub-question with one source (or none) is researched once more with rewritten queries; its notes are kept", async () => {
@@ -1343,7 +1341,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     ]);
     // Raw API answer (no schema parse): the retry's bookkeeping and the notes stay on the server.
     const raw = JSON.stringify((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
-    for (const k of ["retried", "unverified", "repaired", "failure", "found"])
+    for (const k of ["retried", "unverified", "failure", "skipped", "found", "claimKey"])
       expect(raw).not.toContain(`"${k}"`);
     expect(raw).not.toContain("미국 수출 비중이 가장 컸다");
     // The lead's reflection saw the claims that could not be verified.
@@ -1361,7 +1359,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(subs).toHaveLength(2);
     expect(subs.some((x) => x.includes(RETRY_MARK))).toBe(false);
   });
-  it("a claim whose meaning differs from the page is never repaired: not in the notes, the writer or the report", async () => {
+  it("a claim whose quote differs from the page in any way never stands: not in the notes, the writer or the report", async () => {
     const page: FixturePage = {
       url: "https://fixture.agentlee.test/gov/policy.html",
       title: "정책 발표",
@@ -1383,7 +1381,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
         "측정값은 기준값 50 부근이다.",
       ].join("\n"),
     };
-    // Review #237 1·2차: each was "repaired" to the page's sentence and kept with the model's altered claim.
+    // Review #237 1–4차: each was once "repaired" to the page's sentence and kept with the model's altered claim; a
+    // quote is now never rewritten.
     const inverted = [
       { claim: "정부는 내년부터 지원금을 지급한다", quote: "정부는 내년부터 지원금을 지급한다고 밝혔다" },
       { claim: "서울시는 2026년 예산을 늘린다", quote: "서울시는 2026년 예산을 늘린다고 밝혔다" },
@@ -1423,9 +1422,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const done = await statusIs(t.app, job.id, "done");
     const q2 = stateOf(t, job.id).questions[1]!;
     expect(q2.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.memory]);
-    expect(q2.repaired ?? 0).toBe(0);
     // The first five (the kept list's cap); none of the eight reached the notes, the writer or the report.
-    expect(q2.unverified).toEqual(inverted.slice(0, 5).map((n) => n.claim));
+    expect(q2.unverified?.map((c) => c.claim)).toEqual(inverted.slice(0, 5).map((n) => n.claim));
     const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
     const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
     for (const n of inverted) {
@@ -1455,7 +1453,9 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     await statusIs(t.app, job.id, "awaiting_approval");
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     await statusIs(t.app, job.id, "done");
-    expect(stateOf(t, job.id).questions[1]!.unverified).toEqual(["미국 수출 비중이 가장 컸다"]);
+    expect(stateOf(t, job.id).questions[1]!.unverified?.map((c) => c.claim)).toEqual([
+      "미국 수출 비중이 가장 컸다",
+    ]);
     const reflect = t.counting.turns.find((x) => x.startsWith(TURN_MARK.reflect))!;
     expect(reflect).toContain("미국 수출 비중이 가장 컸다");
   });
@@ -1493,7 +1493,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       expect(retries.length, JSON.stringify(first)).toBe(retried ? 1 : 0);
       expect(stateOf(t, job.id).questions[1]!.status as unknown, JSON.stringify(first)).toBe(status);
     }
-  });
+    // Several whole jobs in a row: more time than the default under a full-suite load.
+  }, 30_000);
 
   it("nothing verified: the job fails with how the last runs ended (a retry's login failure, not the first error)", async () => {
     const script = scripted((x) =>
@@ -1525,6 +1526,70 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
     const failed = await statusIs(t.app, job.id, "failed");
     expect(failed.errorCode).toBe("no_findings");
+  });
+
+  it("a runtime error whose retry was skipped for time is still the job's error", async () => {
+    const clock = new ManualClock();
+    let approvedAt = 0;
+    const script = scripted((x) => {
+      if (!x.startsWith(TURN_MARK.subagent)) return undefined;
+      if (!x.includes(RETRY_MARK)) return [{ fail: "boom" }];
+      // The first retry ends cleanly and leaves 2.5 minutes: the second is skipped when its slot comes.
+      clock.advance(approvedAt + 20 * MIN - 2.5 * MIN - clock.now());
+      return [{ text: "DONE" }];
+    });
+    const t = await start({ script, clock, limits: { concurrency: 1 } });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    approvedAt = t.app.research!.get(job.id)!.approvedAt!;
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(t.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(1);
+    expect(failed.errorCode).toBe("runtime_error");
+  });
+
+  it("resumed after a restart, research that then ran and found nothing is no_findings, not server_restart", async () => {
+    const db = createTestDb();
+    const hold = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ gate: "nothing-hold" }] : undefined));
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    const nothing = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ text: "DONE" }] : undefined));
+    const t2 = await start({ db, family: false, script: nothing });
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(t2.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(2);
+    expect(failed.errorCode).toBe("no_findings");
+  });
+
+  it('resumed with no research time left: what was waiting is under the time limit, not "no evidence"', async () => {
+    const db = createTestDb();
+    const hold = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent) && x.includes("배경") ? [{ gate: "late-budget-hold" }] : undefined,
+    );
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(
+      () => t1.counting.active === 1 && t1.app.research!.get(job.id)!.state.includes('"status":"done"'),
+      "q1 done",
+    );
+    await t1.app.close();
+    // The research budget (20 minutes) already spent; the deadline still ahead for the writer.
+    db.$client
+      .prepare("update research_jobs set approved_at = ? where id = ?")
+      .run(Date.now() - 21 * MIN, job.id);
+    const t2 = await start({ db, family: false });
+    const end = await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    const after = JSON.parse(end.state) as { timedOut: boolean; questions: { skipped?: string }[] };
+    expect(after.timedOut).toBe(true);
+    expect(after.questions[1]!.skipped).toBe("time");
+    const report = t2.app.artifacts!.version(JSON.parse(end.result!).artifactId, 1)!.content;
+    expect(report).not.toContain("수출 증가의 배경은 무엇인가");
   });
 
   it("time is checked again after the reflection: no new round, or no extra round, that no longer fits", async () => {
@@ -1571,7 +1636,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
         label,
       ).toBe(rounds > 0);
     }
-  });
+    // Several whole jobs in a row: more time than the default under a full-suite load.
+  }, 30_000);
 
   it("each queued retry checks the time when it gets its slot: a fourth one behind three does not start late", async () => {
     let moved = false;

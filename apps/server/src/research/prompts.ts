@@ -9,7 +9,7 @@ import {
   type ResearchSubQuestion,
 } from "@agentlee/shared";
 import { INSTRUCTIONS_DIR } from "../instructions/assemble.js";
-import type { ResearchNote } from "./store.js";
+import { claimKeyOf, type ResearchNote } from "./store.js";
 
 /**
  * 깊이 조사's step prompts (#211): versioned Markdown in `apps/server/instructions/deep-research/` with the same header
@@ -125,7 +125,7 @@ export function subagentTurn(input: {
           : []),
         ...(input.retry.unverified.length
           ? [
-              `원문에서 확인하지 못한 주장 (그 주장을 실제로 쓴 원문을 찾으면 그 구절로 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+              `원문에서 확인하지 못한 주장 (서버는 구절을 고쳐 주지 않는다 — 그 주장을 실제로 쓴 원문을 web_find나 web_fetch로 찾아 글자 그대로 복사해 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
             ]
           : []),
       ]
@@ -292,7 +292,15 @@ export function parseGaps(text: string, hasFiles: boolean): { question: string; 
 }
 
 /** A sub-researcher's note as written (before the server checks its passage). */
-export type RawNote = { claim: string; quote: string; sourceId?: string; fileId?: string; page?: number };
+export type RawNote = {
+  claim: string;
+  /** The identity of the whole claim as written (`claimKeyOf`, before `claim` is cut to 500 characters). */
+  claimKey: string;
+  quote: string;
+  sourceId?: string;
+  fileId?: string;
+  page?: number;
+};
 
 /**
  * The `NOTE {…}` lines of a sub-researcher's text — also of a turn that was stopped half-way (a line cut off is
@@ -322,6 +330,7 @@ export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQ
     const page = typeof v.page === "number" && Number.isInteger(v.page) && v.page > 0 ? v.page : undefined;
     out.push({
       claim,
+      claimKey: claimKeyOf(v.claim),
       quote,
       ...(sourceId ? { sourceId } : { fileId: fileId! }),
       ...(page !== undefined && !sourceId ? { page } : {}),

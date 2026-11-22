@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { PAGE_GAP } from "../citations/passages.js";
+import { PAGE_GAP, stripGapMarks } from "../citations/verify.js";
 import type { FileRow } from "../files/store.js";
 import { keptSegments, type ExtractRunner } from "../files/extract.js";
 import type { WebCode } from "./service.js";
@@ -103,7 +103,7 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
           parts.push(PAGE_GAP);
           unread = true;
         }
-        const text = k.scrubbed.text.trim();
+        const text = stripGapMarks(k.scrubbed.text).trim();
         if (text) parts.push(text);
         last = Math.max(last, page);
         cut = k.endsEarly || k.gap;

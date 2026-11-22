@@ -32,7 +32,6 @@ import type { DocSet } from "../memory/inject.js";
 import type { PublishInput } from "../notifications/compose.js";
 import type { RuntimeAdapter, RuntimeRegistry, UsageReport } from "../runtime/adapter.js";
 import type { SessionRef } from "../runtime/runs.js";
-import { claimFitsPassage, closestPassage } from "../citations/passages.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { UsageAttempt } from "../usage/store.js";
 import type { SourceStore } from "../web/sources.js";
@@ -66,6 +65,8 @@ import {
   type ResearchJobRow,
   type ResearchNote,
   type ResearchStore,
+  type UnverifiedClaim,
+  claimKeyOf,
 } from "./store.js";
 
 /**
@@ -506,6 +507,9 @@ export class ResearchEngine {
   }
 
   private async execute(id: string, live: Live, opts: { recovered?: boolean }): Promise<void> {
+    // A job resumed after a restart whose research then ran on (any step after the restart) is no longer "only what
+    // the restart left": nothing found is `no_findings`, not `server_restart` (review #237 4차).
+    let recovered = opts.recovered;
     for (;;) {
       if (live.abort.signal.aborted) return;
       const row = this.get(id);
@@ -514,8 +518,9 @@ export class ResearchEngine {
       if (row.status === "planning") await this.plan(row, live);
       else if (row.status === "researching" || row.status === "writing") {
         this.armCap(row, live);
-        if (row.status === "researching") await this.research(row, live);
-        else await this.write(row, live, opts);
+        if (row.status === "researching") {
+          if (await this.research(row, live)) recovered = false;
+        } else await this.write(row, live, { recovered: recovered === true });
       } else return;
       if (live.abort.signal.aborted) return;
       const after = this.get(id);
@@ -697,7 +702,9 @@ export class ResearchEngine {
 
   // ---- 2. research ----
 
-  private async research(row: ResearchJobRow, live: Live): Promise<void> {
+  /** Runs the research stage; true when at least one sub-question step ran. */
+  private async research(row: ResearchJobRow, live: Live): Promise<boolean | undefined> {
+    let ran = false;
     const plan = planOf(row);
     if (!plan || row.approvedAt === null || row.deadlineAt === null)
       return void this.fail(row.id, "runtime_error", live);
@@ -767,6 +774,7 @@ export class ResearchEngine {
             persist();
             // A retry (#234) keeps what the first run verified and is told what it found and what failed.
             const before = q.retried ? q.found : [];
+            ran = true;
             const r = await this.step(row, ctx, {
               name: q.retried ? `${q.id}:retry` : q.id,
               prompt: "subagent",
@@ -775,7 +783,7 @@ export class ResearchEngine {
                 plan,
                 sub: q,
                 files,
-                ...(q.retried ? { retry: { found: before, unverified: q.unverified ?? [] } } : {}),
+                ...(q.retried ? { retry: { found: before, unverified: claimsOf(q.unverified) } } : {}),
               }),
               tools: this.toolsFor(row.ownerId, toolsOf(q.scope)),
               ms: Math.min(this.limits.subagentMs, researchEnd - this.clock.now()),
@@ -791,7 +799,6 @@ export class ResearchEngine {
             q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
             // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
             q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
-            q.repaired = (q.retried ? (q.repaired ?? 0) : 0) + checked.repaired;
             q.status =
               r.ended === "done"
                 ? "done"
@@ -828,7 +835,8 @@ export class ResearchEngine {
         if (weak.length) {
           for (const q of weak) {
             q.scope = clampScope(q.scope, state.scopes);
-            Object.assign(q, { retried: true, status: "waiting", failure: undefined });
+            // Its last failure stays until the retry actually runs (a retry skipped for time reports it).
+            Object.assign(q, { retried: true, status: "waiting" });
           }
           logEvent(this.deps.log, "info", "research.retry", {
             userId: row.ownerId,
@@ -855,7 +863,7 @@ export class ResearchEngine {
             scopes: state.scopes ?? ["web"],
             asked: state.questions.map((q) => q.question),
             notes: pickNotes(state, this.limits.maxNotes),
-            unverified: state.questions.flatMap((q) => q.unverified ?? []).slice(0, UNVERIFIED_KEPT * 2),
+            unverified: state.questions.flatMap((q) => claimsOf(q.unverified)).slice(0, UNVERIFIED_KEPT * 2),
           }),
           tools: [],
           ms: Math.min(REFLECT_MS, researchEnd - this.clock.now()),
@@ -896,8 +904,14 @@ export class ResearchEngine {
     } finally {
       cancel();
     }
+    // What was never (re)asked ran out of time (the research budget, the cap — also one already spent at a restart):
+    // under the time limit in the report, not "no evidence found" (review #237 3·4차).
     for (const q of state.questions)
-      if (q.status === "waiting" || q.status === "running") q.status = "capped";
+      if (q.status === "waiting" || q.status === "running") {
+        q.status = "capped";
+        q.skipped = "time";
+        state.timedOut = true;
+      }
     state.stage = "write";
     // Nothing verified: the job fails with how the questions' last runs ended — an account's state first (a retry
     // that ended `runtime_auth` after a passing `runtime_error` reports the login, review #237 2차).
@@ -905,49 +919,38 @@ export class ResearchEngine {
     // writer then ends the job as `no_findings`.
     const last = state.questions.flatMap((q) => (q.failure ? [q.failure] : []));
     error = last.find((c) => !RETRYABLE.has(c)) ?? last[0];
-    if (error && !allNotes(state).length) return void this.fail(row.id, error, live);
+    if (error && !allNotes(state).length) {
+      this.fail(row.id, error, live);
+      return ran;
+    }
     this.save(row.id, { status: "writing", state }, ["researching"], live);
+    return ran;
   }
 
   /**
-   * The notes whose passage the server finds in their page (a source of the conversation) or attached file. A web
-   * note whose quote is not in its page is repaired first (#234): the page's own passage closest to the quote
-   * (`closestPassage` — the same words, every number, no rival passage) replaces it and is checked again, exactly, as
-   * any quote. Claims that still fail come back as `unverified` (the retry and the lead see them).
+   * The notes whose passage the server finds in their page (a source of the conversation) or attached file. A note
+   * whose quote is not found is never rewritten (review #237 4차 — any rewrite could change what its claim rests on):
+   * its claim comes back as `unverified`, a hint for the retry and the lead only.
    */
   private async verifyNotes(
     row: ResearchJobRow,
     raw: RawNote[],
     files: ReadonlySet<string>,
-  ): Promise<{ notes: ResearchNote[]; unverified: string[]; repaired: number }> {
+  ): Promise<{ notes: ResearchNote[]; unverified: UnverifiedClaim[] }> {
     const scope = { conversationId: row.conversationId, userId: row.ownerId };
     const out: ResearchNote[] = [];
     const seen = new Set<string>();
-    const unverified: string[] = [];
-    let repaired = 0;
+    const unverified: UnverifiedClaim[] = [];
     for (const n of raw) {
       let note: ResearchNote | undefined;
       try {
         if (n.sourceId) {
-          let r = this.deps.citations.recheck(scope, { sourceId: n.sourceId, snippet: n.quote });
-          if (r && r.status === "snippet_not_found" && r.source.kind === "page" && r.source.body) {
-            const near = closestPassage(r.source.body, scrubKnown(n.quote));
-            // The claim stays the model's: it must not carry a number or sign the passage does not have.
-            if (near.kind === "match" && claimFitsPassage(n.claim, near.passage)) {
-              const again = this.deps.citations.recheck(scope, {
-                sourceId: n.sourceId,
-                snippet: near.passage,
-              });
-              if (again?.status === "verified" && again.quote) {
-                r = again;
-                repaired++;
-              }
-            }
-          }
+          const r = this.deps.citations.recheck(scope, { sourceId: n.sourceId, snippet: n.quote });
           if (r?.status === "verified" && r.quote)
             note = {
               id: "",
               claim: scrubKnown(n.claim),
+              claimKey: n.claimKey,
               quote: r.quote,
               sourceId: r.source.id,
               title: r.source.title,
@@ -960,6 +963,7 @@ export class ResearchEngine {
             note = {
               id: "",
               claim: scrubKnown(n.claim),
+              claimKey: n.claimKey,
               quote: c.quote,
               fileId: f.id,
               title: f.name,
@@ -974,7 +978,7 @@ export class ResearchEngine {
         note = undefined;
       }
       if (!note) {
-        unverified.push(scrubKnown(n.claim));
+        unverified.push({ key: n.claimKey, claim: scrubKnown(n.claim) });
         continue;
       }
       const key = `${note.sourceId ?? note.fileId}\n${note.quote}`;
@@ -985,7 +989,6 @@ export class ResearchEngine {
     return {
       notes: out.map((n, i) => ({ ...n, id: `${crypto.randomUUID().slice(0, 8)}-${i}` })),
       unverified,
-      repaired,
     };
   }
 
@@ -1273,28 +1276,31 @@ export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: n
   return all.filter((n) => kept.has(n) || (room > 0 && room-- > 0));
 }
 
+/** The texts of unverified claims (for the prompts). */
+const claimsOf = (u: QuestionRecord["unverified"]) =>
+  (u ?? []).map((c) => (typeof c === "string" ? c : c.claim));
+
 /**
  * A sub-question's unverified claims after a run (#234): the earlier ones and the new failures, once each, without
  * those a note of this run now backs (the same claim), at most `UNVERIFIED_KEPT` — a retry that finds nothing does
  * not forget what failed before.
  */
 export function mergeUnverified(
-  before: readonly string[],
-  failed: readonly string[],
+  before: readonly (UnverifiedClaim | string)[],
+  failed: readonly UnverifiedClaim[],
   verified: readonly ResearchNote[],
-): string[] {
-  // One key for the same claim however it was spaced — the whole claim (review #237 3차: two claims that differ
-  // only past their first 300 characters are two claims). Prompts cut it for display only.
-  const key = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim();
-  const backed = new Set(verified.map((n) => key(n.claim)));
+): UnverifiedClaim[] {
+  // The whole claim is its identity (`claimKey`, a hash of all of it — review #237 3·4차); prompts cut it for display.
+  const backed = new Set(verified.map((n) => n.claimKey ?? claimKeyOf(n.claim)));
   const seen = new Set<string>();
-  const out: string[] = [];
+  const out: UnverifiedClaim[] = [];
   // Dedupe first, then cap (review #237 2차: five copies of one claim must not crowd out another).
-  for (const c of [...before, ...failed]) {
-    const k = key(c);
-    if (!k || backed.has(k) || seen.has(k)) continue;
-    seen.add(k);
-    out.push(k);
+  for (const raw of [...before, ...failed]) {
+    // An older checkpoint kept the claim's text only.
+    const c = typeof raw === "string" ? { key: claimKeyOf(raw), claim: raw } : raw;
+    if (!c.claim || backed.has(c.key) || seen.has(c.key)) continue;
+    seen.add(c.key);
+    out.push(c);
   }
   return out.slice(0, UNVERIFIED_KEPT);
 }

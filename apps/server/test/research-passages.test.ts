@@ -1,21 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { sourceTypeOf } from "@agentlee/shared";
+import { findPassages, PAGE_GAP, sentenceRanges, termsOf } from "../src/citations/passages.js";
 import {
-  claimFitsPassage,
-  closestPassage,
-  findPassages,
-  numberFacts,
-  PAGE_GAP,
-  sentenceRanges,
-  termsOf,
-} from "../src/citations/passages.js";
-import { findSnippet } from "../src/citations/verify.js";
+  cutOutsideGap,
+  findSnippet,
+  GAP_MARK,
+  gapRanges,
+  stripGapMarks,
+  touchesGap,
+} from "../src/citations/verify.js";
+import { parseNotes } from "../src/research/prompts.js";
+import { claimKeyOf } from "../src/research/store.js";
 import { mergeNotes, mergeUnverified } from "../src/research/engine.js";
 import type { ResearchNote } from "../src/research/store.js";
 import { pdfTitle } from "../src/web/service.js";
 
 /**
- * 깊이 조사의 조사 한계 (#234), the pure parts — no port, no fixture site: passages (`web_find`, the note repair),
+ * 깊이 조사의 조사 한계 (#234), the pure parts — no port, no fixture site: passages (`web_find`), PDF page marks,
  * the retry's merges, a PDF's title, the source type.
  */
 
@@ -35,130 +36,12 @@ describe("web_find passages", () => {
   });
 });
 
-describe("the closest passage for a quote that did not verify (#234 note repair)", () => {
-  const page =
-    "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
-    "메모리 가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.";
-
-  it("match (b): a space added or left out between a digit and a Hangul syllable — nothing else", () => {
-    expect(
-      closestPassage(
-        page,
-        "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
-      ),
-    ).toEqual({
-      kind: "match",
-      passage:
-        "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다",
-    });
-    expect(closestPassage("상자 3 개를 샀다고 밝혔다.", "상자 3개를 샀다고 밝혔다")).toEqual({
-      kind: "match",
-      passage: "상자 3 개를 샀다고 밝혔다",
-    });
-  });
-
-  it("match (a): … joining consecutive sentences, each piece exact (a sentence's end, then whole sentences)", () => {
-    expect(
-      closestPassage(
-        page,
-        "메모리 가격 회복이 증가를 이끌었다 … 업계는 연말까지 증가세가 이어질 것으로 본다",
-      ),
-    ).toEqual({
-      kind: "match",
-      passage: "메모리 가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.",
-    });
-    // The first piece may start inside its sentence (at a word).
-    expect(
-      closestPassage(page, "가격 회복이 증가를 이끌었다. … 업계는 연말까지 증가세가 이어질 것으로 본다."),
-    ).toEqual({
-      kind: "match",
-      passage: "가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.",
-    });
-  });
-
-  it("none (review #237 3차): spaces between digits or next to symbols, a decimal point as …, partial pieces", () => {
-    const facts = [
-      "선수들의 출발 순서는 1 2 12 순이다.",
-      "허용 길이는 3.5미터이다.",
-      "수식의 조건은 x! = y 이다.",
-      "The selector is .menu .item in this stylesheet.",
-      "표시 가격은 32% 늘었다.",
-      "기간은 2026–2027년이다.",
-      "첫 문장이다. 둘째 문장이다. 셋째 문장이다.",
-    ].join("\n");
-    for (const quote of [
-      "선수들의 출발 순서는 12 1 2 순이다",
-      "허용 길이는 3…5미터이다",
-      "허용 길이는 3 … 5미터이다",
-      "수식의 조건은 x != y 이다",
-      "The selector is .menu.item in this stylesheet",
-      "표시 가격은 32 % 늘었다",
-      "기간은 2026 - 2027년이다",
-      // The last piece is not a whole sentence; the pieces are not consecutive sentences.
-      "메모리 가격 회복이 증가를 이끌었다 … 업계는 연말까지 증가세가",
-      "첫 문장이다 … 셋째 문장이다",
-      // The first piece does not end its sentence.
-      "첫 문장 … 둘째 문장이다",
-    ])
-      expect(closestPassage(`${page}\n${facts}`, quote), quote).toEqual({ kind: "none" });
-  });
-
-  it("none: any other difference — particles, case, hyphens in a word, currency, comparison, sign, unit, words", () => {
-    const facts = [
-      "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.",
-      "부산시는 2026년 예산을 늘린다고 밝혔다.",
-      "수출은 전년보다 −5% 줄었다.",
-      "원고가 피고를 먼저 고소했다.",
-      "이 상품의 가격은 $50 이상이다.",
-      "올해 지원 기준은 소득 < 500만원이다.",
-      "이 기체의 성분은 CO 라고 밝혔다.",
-      "We agreed to resign today.",
-      "아버지 가방에 들어가신다.",
-      "서울보다 부산이 인구가 적다.",
-      "물가는 3% 올랐다.",
-    ].join("\n");
-    for (const quote of [
-      "정부는 내년부터 지원금을 지급한다고 밝혔다",
-      "서울시는 2026년 예산을 늘린다고 밝혔다",
-      "수출은 전년보다 +5% 줄었다",
-      "수출은 전년보다 5% 줄었다",
-      "원고를 피고가 먼저 고소했다",
-      "이 상품의 가격은 €50 이상이다",
-      "올해 지원 기준은 소득 > 500만원이다",
-      "이 기체의 성분은 Co 라고 밝혔다",
-      "We agreed to re-sign today",
-      "아버지가 방에 들어가신다",
-      "부산보다 서울이 인구가 적다",
-      "물가는 3%p 올랐다",
-      // A particle is a word too now: 수출은 is not 수출이.
-      "10월 반도체 수출은 전년 같은 달보다 32% 늘어난 142억 달러로",
-      // Words left out in between (a summary, not a quote).
-      "산업통상자원부는 반도체 수출이 32% 늘었다고 밝혔다",
-      // Two sentences joined where the page has no sentence end.
-      "산업통상자원부는 10일 … 10월 반도체 수출이",
-    ])
-      expect(closestPassage(`${page}\n${facts}`, quote), quote).toEqual({ kind: "none" });
-    expect(closestPassage(page, "수출")).toEqual({ kind: "none" });
-  });
-
-  it("ambiguous: two different places of the page; the same passage twice is one", () => {
-    const twins = "10 월 수출이 늘었다고 밝혔다.\n10월 수출이 늘었다고 밝혔다.";
-    expect(closestPassage(twins, "10월  수출이 늘었다고")).toEqual({ kind: "ambiguous" });
-    const same = "서울시는 2026년 예산을 늘린다고 밝혔다.\n서울시는 2026년 예산을 늘린다고 밝혔다.";
-    expect(closestPassage(same, "서울시는 2026 년 예산을 늘린다고 밝혔다")).toEqual({
-      kind: "match",
-      passage: "서울시는 2026년 예산을 늘린다고 밝혔다",
-    });
-  });
-
-  it("never across a PDF page that was not read — the repair, the exact check and web_find alike", () => {
+describe("PDF pages that were not read (#234 PAGE_GAP)", () => {
+  it("no match stands on any part of the mark or across it — the exact check and web_find alike", () => {
     const pdf = `1쪽 끝 문장이다. 정부는 지원금을\n\n${PAGE_GAP}\n\n내년부터 지급한다고 밝혔다. 3쪽 문장이다.`;
-    expect(closestPassage(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다")).toEqual({ kind: "none" });
     expect(findSnippet(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다").found).toBe(false);
-    // Even a snippet that copies the mark itself.
-    expect(findSnippet(pdf, `정부는 지원금을 ${PAGE_GAP} 내년부터 지급한다고 밝혔다`).found).toBe(false);
+    expect(findSnippet(pdf, "정부는 지원금을 [읽지 못한 쪽] 내년부터 지급한다고 밝혔다").found).toBe(false);
     expect(findSnippet(pdf, "내년부터 지급한다고 밝혔다").found).toBe(true);
-    // Not on any part of the mark either (review #237 3차).
     const meeting = `회의는 여기까지 진행했다.\n\n${PAGE_GAP}\n\n다음 회의는 내일 열린다.`;
     expect(findSnippet(meeting, "회의는 여기까지 진행했다. [읽지 못한").found).toBe(false);
     expect(findSnippet(meeting, "못한 쪽] 다음 회의는 내일 열린다").found).toBe(false);
@@ -166,32 +49,36 @@ describe("the closest passage for a quote that did not verify (#234 note repair)
     expect(findSnippet(meeting, "다음 회의는 내일 열린다").found).toBe(true);
     const found = findPassages(pdf, "지원금 지급", 5).passages;
     expect(found.length).toBeGreaterThan(0);
-    for (const p of found) expect(p.text).not.toContain(PAGE_GAP);
+    for (const p of found) {
+      expect(p.text).not.toContain(GAP_MARK);
+      expect(p.text).not.toContain("읽지 못한");
+    }
     expect(findPassages(pdf, "읽지 못한 쪽", 5).passages).toEqual([]);
   });
 
-  it("a repaired passage keeps only a claim whose numbers and signs it has", () => {
-    const passage = "이 상품의 가격은 $50 이상이고 수출은 −5% 줄었다";
-    expect(claimFitsPassage("가격은 $50 이상, 수출 −5%", passage)).toBe(true);
-    expect(claimFitsPassage("가격은 €50 이상", passage)).toBe(false);
-    expect(claimFitsPassage("수출은 5% 늘었다", passage)).toBe(false);
-    expect(claimFitsPassage("수출은 -7% 줄었다", passage)).toBe(false);
-    expect(claimFitsPassage("가격은 50 > 기준", passage)).toBe(false);
-    // Any symbol (Unicode S*), not a hand list (review #237 3차).
-    expect(claimFitsPassage("표시 가격은 ₹50 이상이다", "표시 가격은 50 이상이다")).toBe(false);
-    expect(claimFitsPassage("측정값은 ≠ 50 이다", "측정값은 기준값 50 부근이다")).toBe(false);
-    expect(claimFitsPassage("측정값은 50 부근이다", "측정값은 기준값 50 부근이다")).toBe(true);
+  it('a page that merely says "[읽지 못한 쪽]" is ordinary text (no mark without the reader\'s U+E000)', () => {
+    const plain = "화면에는 [읽지 못한 쪽]이라는 안내가 뜹니다.";
+    expect(findSnippet(plain, "화면에는 [읽지 못한 쪽]이라는 안내가 뜹니다.").found).toBe(true);
+    expect(touchesGap(plain, 0, plain.length)).toBe(false);
+    expect(stripGapMarks(`a${GAP_MARK}b`)).toBe("ab");
   });
 
-  it("numbers keep their sign, value and unit in order", () => {
-    expect(numberFacts("수출은 −5%, 수입은 +3.5%p, 1,234 명, 142억 달러")).toEqual([
-      "-5%",
-      "+3.5%p",
-      "1234",
-      "142억",
-    ]);
+  it("the stored bound never cuts a mark in two: the cut moves before it", () => {
+    const text = `${"가".repeat(90)}\n\n${PAGE_GAP}\n\n${"나".repeat(50)}`;
+    const at = 92 + 4; // inside the mark
+    const cut = cutOutsideGap(text, at);
+    expect(cut).toBe("가".repeat(90));
+    expect(gapRanges(cut)).toEqual([]);
+    expect(cutOutsideGap(text, 200)).toBe(text);
+    expect(cutOutsideGap(text, 50)).toBe("가".repeat(50));
+    // A cut past the mark keeps it whole.
+    const past = cutOutsideGap(text, 92 + PAGE_GAP.length + 5);
+    expect(gapRanges(past)).toHaveLength(1);
+    expect(past).toContain(PAGE_GAP);
   });
+});
 
+describe("passages", () => {
   it("sentences: split at line breaks and sentence ends, not inside numbers or dates; long ones cut at clauses", () => {
     const t = "2026. 11. 12. 발표했다. 금리는 3.5%다! 다음 줄\n둘째 줄";
     expect(sentenceRanges(t).map((r) => t.slice(r.start, r.end))).toEqual([
@@ -230,19 +117,41 @@ describe("a retry's merges (#234)", () => {
   });
 
   it("unverified claims: dedupe, then cap; the whole claim is the key; removed only when a kept note backs it", () => {
-    expect(mergeUnverified(["x", "y  z"], ["y z", "w"], [n("1", "A", "x")])).toEqual(["y z", "w"]);
-    expect(mergeUnverified(["a", "b", "c"], ["d", "e", "f"], [])).toEqual(["a", "b", "c", "d", "e"]);
+    const u = (claim: string) => ({ key: claimKeyOf(claim), claim });
+    const texts = (xs: { claim: string }[]) => xs.map((x) => x.claim);
+    expect(texts(mergeUnverified([u("x"), u("y  z")], [u("y z"), u("w")], [n("1", "A", "x")]))).toEqual([
+      "y  z",
+      "w",
+    ]);
+    expect(texts(mergeUnverified([u("a"), u("b"), u("c")], [u("d"), u("e"), u("f")], []))).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+    ]);
     // Five copies of one claim do not crowd out another.
-    expect(mergeUnverified(["a", "a", "a", "a", "a"], ["b"], [])).toEqual(["a", "b"]);
-    // A long claim kept cut to 300 characters is the same claim when a later note backs it whole.
-    // The whole claim is its identity (review #237 3차): the same first 300 characters, different endings.
-    const stem = "가".repeat(300);
-    const yes = `${stem} 승인하였다`;
-    const no = `${stem} 거부하였다`;
-    expect(mergeUnverified([yes, no], [], [n("1", "A", yes)])).toEqual([no]);
-    expect(mergeUnverified([], [yes], [])).toEqual([yes]);
-    // A retry that found nothing keeps what failed before.
-    expect(mergeUnverified(["a"], [], [])).toEqual(["a"]);
+    expect(texts(mergeUnverified([u("a"), u("a"), u("a"), u("a"), u("a")], [u("b")], []))).toEqual([
+      "a",
+      "b",
+    ]);
+    // An older checkpoint's plain texts.
+    expect(texts(mergeUnverified(["a"], [], []))).toEqual(["a"]);
+  });
+
+  it("claims that share their first 500 characters are two claims (the identity is the whole claim)", () => {
+    const stem = "가".repeat(500);
+    const line = (claim: string) =>
+      `NOTE ${JSON.stringify({ claim, sourceId: "s1", quote: "인용 구절입니다." })}`;
+    const [yes, no] = parseNotes([line(`${stem} 승인하였다`), line(`${stem} 거부하였다`)].join("\n"));
+    expect(yes!.claim).toBe(no!.claim); // the same 500 characters shown
+    expect(yes!.claimKey).not.toBe(no!.claimKey);
+    const kept = mergeUnverified(
+      [],
+      [yes!, no!].map((r) => ({ key: r.claimKey, claim: r.claim })),
+      [{ ...n("1", "s1", yes!.claim), claimKey: yes!.claimKey }],
+    );
+    expect(kept.map((k) => k.key)).toEqual([no!.claimKey]);
   });
 });
 

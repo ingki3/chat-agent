@@ -8,6 +8,7 @@ import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
+import { cutOutsideGap, stripGapMarks } from "../citations/verify.js";
 import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
@@ -521,7 +522,8 @@ export class WebService {
     if (!r.ok) return { ok: false, code: code(r.code) };
     const finalUrl = typeof r.finalUrl === "string" ? linkOf(r.finalUrl) : undefined;
     if (!finalUrl) return { ok: false, code: "web_failed" };
-    let text = typeof r.text === "string" ? r.text : "";
+    // No page text carries the PDF reader's gap mark (#234, review #237 4차): only a mark it put there is one.
+    let text = typeof r.text === "string" ? stripGapMarks(r.text) : "";
     let truncated = r.truncated === true;
     let title = typeof r.title === "string" ? r.title : undefined;
     let unread = false;
@@ -542,7 +544,8 @@ export class WebService {
         off?.();
       }
       if (!p.ok) return { ok: false, code: p.code };
-      text = p.text.length > PDF_TEXT_CHARS ? p.text.slice(0, PDF_TEXT_CHARS) : p.text;
+      // Cut to the stored bound — never through a gap mark (the cut moves before it).
+      text = cutOutsideGap(p.text, PDF_TEXT_CHARS);
       truncated = p.truncated || p.text.length > PDF_TEXT_CHARS;
       unread = p.unread;
       title ??= pdfTitle(finalUrl);
@@ -563,7 +566,7 @@ export class WebService {
       truncated,
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
-    const excerpt = text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text;
+    const excerpt = stripGapMarks(text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text);
     return {
       ok: true,
       output: {

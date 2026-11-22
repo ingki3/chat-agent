@@ -31,9 +31,18 @@ export type ResearchNote = {
   page?: number | undefined;
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
+  /** The identity of its claim (`claimKeyOf` of the whole claim as written) — never shown. */
+  claimKey?: string | undefined;
   /** A web note's publisher kind by its domain (#234, `sourceTypeOf`): for the writer and the report (#233). */
   sourceType?: SourceType | undefined;
 };
+
+/** A claim whose quote was not verified: its identity (`claimKeyOf` of the whole claim) and its text. */
+export type UnverifiedClaim = { key: string; claim: string };
+
+/** The identity of a claim: a hash of all of it, normalised (`parseNotes` keeps only its first 500 characters). */
+export const claimKeyOf = (claim: string) =>
+  crypto.createHash("sha256").update(claim.normalize("NFC").replace(/\s+/gu, " ").trim()).digest("hex");
 
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
 export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
@@ -42,10 +51,11 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
    * It was researched once more with rewritten queries (#234: no verified note, or one source only) — at most once.
    */
   retried?: boolean | undefined;
-  /** Claims of its last run whose quote could not be verified, nor repaired (the retry and the lead see them). */
-  unverified?: string[] | undefined;
-  /** Notes kept because their quote was repaired to the page's own passage (`closestPassage`). */
-  repaired?: number | undefined;
+  /**
+   * Claims whose quote could not be verified (the retry and the lead see them). An older checkpoint kept the text
+   * only.
+   */
+  unverified?: (UnverifiedClaim | string)[] | undefined;
   /** How its last run ended when it failed (a runtime error code): a passing one may be retried (#234). */
   failure?: ResearchErrorCode | undefined;
   /** It was not (re)searched because too little time was left when its turn came (#234). */

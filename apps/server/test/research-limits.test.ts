@@ -7,15 +7,14 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SELFTEST_SKILL } from "@agentlee/mcp-tools/skills";
 import { UserStore } from "../src/auth/users.js";
-import { PAGE_GAP } from "../src/citations/passages.js";
-import { findSnippet } from "../src/citations/verify.js";
+import { findSnippet, GAP_MARK, PAGE_GAP } from "../src/citations/verify.js";
 import { ConversationStore } from "../src/conversations/store.js";
 import { createTestDb } from "../src/db/client.js";
 import { docLibraries } from "../src/docgen/runner.js";
 import { inProcessExtractor, type OcrCapability } from "../src/files/extract.js";
 import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
-import { extractorPdfReader, type PdfReader } from "../src/web/pdf.js";
+import { extractorPdfReader, PDF_TEXT_CHARS, type PdfReader } from "../src/web/pdf.js";
 import { EXCERPT_CHARS, workerLimitsOf } from "../src/web/service.js";
 import { SourceStore } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
@@ -238,6 +237,31 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     // Only scans: no text at all.
     const scans = await makePdf([{ scan: true }, { scan: true }]);
     expect(await reader(scans)).toMatchObject({ ok: true, text: "" });
+  });
+
+  it("the stored PDF text is cut before a gap mark, never through it; a page's own U+E000 is dropped", async () => {
+    const head = "가".repeat(PDF_TEXT_CHARS - 4);
+    const reader: PdfReader = async () => ({
+      ok: true,
+      text: `${head}\n\n${PAGE_GAP}\n\n뒤쪽 글이다.`,
+      truncated: false,
+      unread: true,
+    });
+    fx.routes.set("/cut.pdf", { headers: { "content-type": "application/pdf" }, body: "%PDF-1.7 x" });
+    fx.routes.set("/pua.txt", {
+      headers: { "content-type": "text/plain" },
+      body: `개인 영역 문자${GAP_MARK}가 섞인 글이다.`,
+    });
+    const f = family();
+    const { call } = service(f, reader);
+    const r = await call("web_fetch", { url: "http://public.test/cut.pdf" });
+    expect(r.body).toMatchObject({ truncated: true });
+    const rows = f.sources.list(f.c.id);
+    expect(rows[0]!.body).toBe(head);
+    expect(rows[0]!.body).not.toContain(GAP_MARK);
+    await call("web_fetch", { url: "http://public.test/pua.txt" });
+    const plain = f.sources.list(f.c.id)[1]!;
+    expect(plain.body).toBe("개인 영역 문자가 섞인 글이다.");
   });
 
   it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {

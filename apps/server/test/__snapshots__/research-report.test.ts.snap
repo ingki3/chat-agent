@@ -279,7 +279,7 @@ exports[`the step prompts (versioned like the system instructions) > has every p
 {
   "plan": "plan@2",
   "reflect": "reflect@3",
-  "subagent": "subagent@2",
+  "subagent": "subagent@3",
   "writer": "writer@4",
 }
 `;
