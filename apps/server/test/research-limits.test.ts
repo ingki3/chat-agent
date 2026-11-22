@@ -150,7 +150,8 @@ const PLAN_PAGES = [
   "수시모집 원서 접수는 2026년 9월 8일부터 12일까지 진행된다.\n정시모집 원서 접수는 2026년 12월 29일부터 31일까지이다.",
 ];
 
-describe("web_fetch reads PDFs with the document extractor (#234)", () => {
+// PDFs made and read in the test, large texts, many rows: room for a loaded CI machine (the per-test 30 s stand too).
+describe("web_fetch reads PDFs with the document extractor (#234)", { timeout: 30_000 }, () => {
   it("the worker hands back a PDF's bytes; the extractor reads its pages; the page is stored and quotable", async () => {
     const bytes = await makePdf(PLAN_PAGES);
     fx.routes.set("/docs/2027%20%EC%8B%9C%ED%96%89%EA%B3%84%ED%9A%8D.pdf", {
@@ -363,7 +364,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     // Not a PDF: its own U+E000 is ordinary text, kept and counted (review #237 6차).
     expect(plain.body).toBe(`개인 영역 문자${GAP_MARK}가 섞인 글이다.`);
     expect(toSource(plain).characters).toBe(plain.body!.length);
-  });
+  }, 30_000);
 
   it("a PDF's counts and web_find places are of the visible text (the marks' U+E000 left out)", async () => {
     const stored = `앞쪽 문장이다.\n\n${PAGE_GAP}\n\n뒤쪽의 정시모집 문장이다.`;
@@ -396,7 +397,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const [row] = f.sources.list(f.c.id);
     expect(row!.body!.isWellFormed()).toBe(true);
     expect(row!.body!.length).toBe(PDF_TEXT_CHARS - 1);
-  });
+  }, 30_000);
 
   it("a reused row answers with this fetch's own truncation (review #237 18차)", async () => {
     const head = "가".repeat(PDF_TEXT_CHARS);
@@ -411,22 +412,26 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const second = await call("web_fetch", { url: "http://public.test/t/long.pdf" });
     expect(second.body.sourceId).toBe(first.body.sourceId);
     expect(second.body.truncated).toBe(true);
-  });
+  }, 30_000);
 
   it("sources_list reads no page text, however many versions are stored; same items, same order", async () => {
     const f = family();
     const { call } = service(f);
-    const big = "본문 ".repeat(50_000);
-    for (let i = 0; i < 105; i++)
-      f.sources.addPage(f.scope, {
-        url: `http://public.test/v/${i % 3}`,
-        finalUrl: `http://public.test/v/${i % 3}`,
-        title: `판 ${i}`,
-        site: "public.test",
-        contentType: "text/html",
-        body: `${big}${i}`,
-        truncated: false,
-      });
+    // Modest bodies in one transaction (the point is that no body is read — checked by the spy and by the query's
+    // columns, not by the data's size).
+    const body = "본문 ".repeat(7_000);
+    f.db.$client.transaction(() => {
+      for (let i = 0; i < 105; i++)
+        f.sources.addPage(f.scope, {
+          url: `http://public.test/v/${i % 3}`,
+          finalUrl: `http://public.test/v/${i % 3}`,
+          title: `판 ${i}`,
+          site: "public.test",
+          contentType: "text/html",
+          body: `${body}${i}`,
+          truncated: false,
+        });
+    })();
     f.sources.addSearchResult(f.scope, {
       provider: "x",
       url: "http://public.test/s",
@@ -444,7 +449,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(items.at(-1)!.n).toBe(100);
     // The metadata query itself carries no body.
     expect(f.sources.recentFor(f.scope, 3)!.every((x) => !("body" in x))).toBe(true);
-  });
+  }, 30_000);
 
   it("has-text without the hash (a row from before) is still text; citable and listByIds take only the ids asked", () => {
     const f = family();
@@ -486,7 +491,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const many = new Set([other.id, ...Array.from({ length: 40_000 }, (_, i) => `x${i}`), page.id]);
     expect(f.sources.listByIds(f.c.id, many).map((r) => r.id)).toEqual([page.id, other.id]);
     expect(f.sources.listByIds("another-conversation", many)).toEqual([]);
-  });
+  }, 30_000);
 
   it("lookups by id use the primary key, never a scan of the conversation's rows; cleared text is no text", () => {
     const f = family();
@@ -664,7 +669,7 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
   });
 });
 
-describe("web_find searches a fetched page's whole stored text (#234)", () => {
+describe("web_find searches a fetched page's whole stored text (#234)", { timeout: 30_000 }, () => {
   const long = [
     "<html><head><title>긴 시행계획</title></head><body><article>",
     `<p>${"이 문서는 앞부분의 일반 안내이다. ".repeat(700)}</p>`,

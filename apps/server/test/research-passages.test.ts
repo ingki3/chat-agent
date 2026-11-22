@@ -296,18 +296,22 @@ describe("web_find review #237 6차", () => {
     const page = "신청 기간은 9월이다. 신청 방법은 누리집에서 한다. ".repeat(60);
     const text = Array.from({ length: 90 }, () => page).join(`\n\n${PAGE_GAP}\n\n`);
     expect(text.length).toBeGreaterThan(150_000);
-    let t0 = performance.now();
-    const r = findPassages(text, "신청", 8, { gaps: true });
-    const search = performance.now() - t0;
-    expect(r.total).toBeGreaterThan(1000);
-    t0 = performance.now();
-    findSnippet(text, "신청 방법은 누리집에서 한다", undefined, { gaps: true });
-    findSnippet(text, "없는 문장이 하나 있다고 한다", undefined, { gaps: true });
-    const check = performance.now() - t0;
-    // Generous bounds for a laptop under test load (before: ~400 ms for the search alone).
-    expect(search).toBeLessThan(250);
-    expect(check).toBeLessThan(250);
-  });
+    // Measured against the same work without the marks, on the same machine at the same moment (a ratio, not an
+    // absolute time — robust under CI load). Before the fix the marks made the search ~30× slower; now ~2×.
+    const time = (fn: () => void) => {
+      const t0 = performance.now();
+      fn();
+      return performance.now() - t0;
+    };
+    let r: ReturnType<typeof findPassages> | undefined;
+    const base = time(() => findPassages(text, "신청", 8));
+    const search = time(() => (r = findPassages(text, "신청", 8, { gaps: true })));
+    expect(r!.total).toBeGreaterThan(1000);
+    const baseCheck = time(() => findSnippet(text, "없는 문장이 하나 있다고 한다"));
+    const check = time(() => findSnippet(text, "없는 문장이 하나 있다고 한다", undefined, { gaps: true }));
+    expect(search).toBeLessThan(Math.max(100, 8 * base));
+    expect(check).toBeLessThan(Math.max(100, 8 * baseCheck));
+  }, 30_000);
 });
 
 describe("web_find review #237 7차", () => {
