@@ -12,9 +12,12 @@ import { MyUsagePanel } from "./Usage.js";
 export function SettingsPage({
   onChanged,
   isAdmin,
+  viaAccess,
 }: {
   onChanged: (s: AuthState) => void;
   isAdmin: boolean;
+  /** Reached through Cloudflare Access: sign-in is the Access email (#178), so no password to change here (#229). */
+  viaAccess: boolean;
 }) {
   const [theme, set] = useState<ThemeChoice>(getTheme());
   const [changed, setChanged] = useState(false);
@@ -61,19 +64,21 @@ export function SettingsPage({
         <RuntimeConnections isAdmin={isAdmin} />
         <MyUsagePanel />
         <NotificationSettings />
-        <section className="panel">
-          {changed ? (
-            <p role="status">비밀번호를 바꿨어요. 다른 기기의 로그인은 끊겼어요.</p>
-          ) : (
-            <ChangePassword
-              embedded
-              onDone={(s) => {
-                onChanged(s);
-                setChanged(true);
-              }}
-            />
-          )}
-        </section>
+        {!viaAccess && (
+          <section className="panel">
+            {changed ? (
+              <p role="status">비밀번호를 바꿨어요. 다른 기기의 로그인은 끊겼어요.</p>
+            ) : (
+              <ChangePassword
+                embedded
+                onDone={(s) => {
+                  onChanged(s);
+                  setChanged(true);
+                }}
+              />
+            )}
+          </section>
+        )}
       </div>
     </>
   );
