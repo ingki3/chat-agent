@@ -541,7 +541,7 @@ export class WebService {
       unread = p.unread;
       // The document's own title first (its metadata, review #237 13차), else the file name of its address; the
       // source store bounds it on a code point and masks known secrets again.
-      title ??= p.title || pdfTitle(finalUrl);
+      title = p.title || pdfTitle(finalUrl);
     }
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
@@ -558,7 +558,6 @@ export class WebService {
       body: text,
       truncated,
       // A PDF named by its metadata: the file-name title an earlier fetch of the same page may have stored.
-      ...(typeof r.pdf === "string" ? { pdf: true } : {}),
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
     const pdf = hasGapMarks(row.contentType);

@@ -277,6 +277,57 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(f.sources.list(f.c.id)[0]!.title).toBe("public.test");
   });
 
+  it("the same page fetched again: the latest fetch wins — final address, title, site — the id kept", async () => {
+    let withTitle = false;
+    const real = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const reader: PdfReader = async (b, signal) => {
+      const r = await real(b, signal);
+      return !r.ok || withTitle ? r : { ok: true, text: r.text, truncated: r.truncated, unread: r.unread };
+    };
+    const body = await makePdf(["같은 문서의 본문이다."], { title: "Latest Title" });
+    for (const p of ["/h/a.pdf", "/h/b.pdf", "/h/%E2%80%AE"])
+      fx.routes.set(p, { headers: { "content-type": "application/pdf" }, body });
+    const f = family();
+    const { call } = service(f, reader);
+    // A redirect that now ends at another file: the row's final address and file-name title follow.
+    fx.redirects.set("/h/get", "/h/a.pdf");
+    const first = await call("web_fetch", { url: "http://public.test/h/get" });
+    fx.redirects.set("/h/get", "/h/b.pdf");
+    const second = await call("web_fetch", { url: "http://public.test/h/get" });
+    expect(second.body.sourceId).toBe(first.body.sourceId);
+    expect(f.sources.list(f.c.id).map((r) => [r.finalUrl, r.title])).toEqual([
+      ["http://public.test/h/b.pdf", "b.pdf"],
+    ]);
+    // A title that fell back to the site, then a fetch with the document's own title.
+    const g = family();
+    const svc = service(g, reader);
+    await svc.call("web_fetch", { url: "http://public.test/h/%E2%80%AE" });
+    expect(g.sources.list(g.c.id)[0]!.title).toBe("public.test");
+    withTitle = true;
+    await svc.call("web_fetch", { url: "http://public.test/h/%E2%80%AE" });
+    expect(g.sources.list(g.c.id).map((r) => r.title)).toEqual(["Latest Title"]);
+  });
+
+  it("a row stored before with a bidi-control title is cleaned by the next fetch of the page", async () => {
+    const body = await makePdf(["오래된 행의 본문이다."]);
+    fx.routes.set("/i/report.pdf", { headers: { "content-type": "application/pdf" }, body });
+    const f = family();
+    const reader = extractorPdfReader(inProcessExtractor(NO_OCR), tmp());
+    const text = ((await reader(body)) as { text: string }).text;
+    const old = f.sources.addPage(f.scope, {
+      url: "http://public.test/i/report.pdf",
+      finalUrl: "http://public.test/i/report.pdf",
+      title: "report\u202E.pdf",
+      site: "public.test",
+      contentType: "application/pdf",
+      body: text,
+      truncated: false,
+    })!;
+    const r = await service(f, reader).call("web_fetch", { url: "http://public.test/i/report.pdf" });
+    expect(r.body.sourceId).toBe(old.id);
+    expect(f.sources.list(f.c.id).map((x) => x.title)).toEqual(["report.pdf"]);
+  });
+
   it("without a reader a PDF is refused as before; a broken PDF is bad content; a PDF without text has no text", async () => {
     const f = family();
     fx.routes.set("/a.pdf", { headers: { "content-type": "application/pdf" }, body: "%PDF-1.7 broken" });

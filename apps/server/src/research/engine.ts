@@ -712,14 +712,26 @@ export class ResearchEngine {
    */
   private normalizeNotes(row: ResearchJobRow, state: JobState): void {
     for (const q of state.questions) {
-      for (const n of q.found)
-        if (n.sourceId && !n.sourceKey) {
-          const src = this.deps.sources.get(row.conversationId, n.sourceId);
-          if (src) n.sourceKey = pageKeyOf(src.finalUrl ?? src.url);
-        }
+      this.refreshPages(row, q.found);
       const seen = new Set<string>();
       q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
       q.sources = sourceCount(q.found);
+    }
+  }
+
+  /**
+   * Each web note's page and kind from its source row **as stored now** (review #237 16차): a row refreshed by a later
+   * fetch (another final address) moves its notes with it, so two rows that now end at one page count once —
+   * whatever key a note carried before.
+   */
+  private refreshPages(row: ResearchJobRow, notes: ResearchNote[]): void {
+    for (const n of notes) {
+      if (!n.sourceId) continue;
+      const src = this.deps.sources.get(row.conversationId, n.sourceId);
+      if (!src) continue;
+      const at = src.finalUrl ?? src.url;
+      n.sourceKey = pageKeyOf(at);
+      n.sourceType = sourceTypeOf(at);
     }
   }
 
@@ -815,6 +827,9 @@ export class ResearchEngine {
             if (live.abort.signal.aborted) return;
             const raw = parseNotes(r.text, this.limits.notesPerQuestion);
             const checked = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
+            // Pages as the source rows say now, before merging and counting (review #237 16차).
+            this.refreshPages(row, before);
+            this.refreshPages(row, checked.notes);
             const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
@@ -847,6 +862,8 @@ export class ResearchEngine {
         if (researchEnd - this.clock.now() < this.limits.minRoundMs) break;
         // Weak sub-questions (#234) — no verified note, or one source only — are researched once more with rewritten
         // queries, whether or not the lead names them: within the same budgets, before the lead looks for gaps.
+        // Counted on the rows as they are now (a later fetch may have moved a row to another page).
+        this.normalizeNotes(row, state);
         const weak = state.questions.filter(
           (q) =>
             !q.retried &&

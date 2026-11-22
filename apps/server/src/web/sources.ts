@@ -20,11 +20,6 @@ export type PageInput = {
   contentType: string;
   body: string;
   truncated: boolean;
-  /**
-   * A web PDF (#234): a stored row of the same page whose title is still its own file-name fallback (`pdfTitle` of
-   * that row's final URL) takes this page's better title — its id kept.
-   */
-  pdf?: boolean | undefined;
 };
 
 export type SearchInput = {
@@ -137,21 +132,18 @@ export class SourceStore {
         ),
       )
       .get();
-    if (same) {
-      const title = cut(p.title, SOURCE_LIMITS.title);
-      // The fallback the stored row got from its own address (review #237 15차: a request URL that now redirects to
-      // another file name does not hide it).
-      let fallback: string | undefined;
-      if (p.pdf)
-        try {
-          fallback = pdfTitle(new URL(same.finalUrl ?? same.url));
-        } catch {
-          fallback = undefined;
-        }
-      if (fallback && same.title === fallback && title && title !== fallback)
-        return this.db.update(sources).set({ title }).where(eq(sources.id, same.id)).returning().get();
-      return same;
-    }
+    // The same page again (review #237 16차): the latest fetch wins — its final address and its title — the id kept.
+    if (same)
+      return this.db
+        .update(sources)
+        .set({
+          finalUrl: p.finalUrl,
+          title: cut(p.title, SOURCE_LIMITS.title) || cut(p.site, SOURCE_LIMITS.title),
+          site: cut(p.site, SOURCE_LIMITS.site),
+        })
+        .where(eq(sources.id, same.id))
+        .returning()
+        .get();
     return this.db
       .insert(sources)
       .values({

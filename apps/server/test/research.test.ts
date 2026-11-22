@@ -1546,6 +1546,48 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(retries).toHaveLength(1);
   });
 
+  it("a source row moved to another page by a later fetch counts with that page (review #237 16차)", async () => {
+    const oldUrl = "https://fixture.agentlee.test/docs/old.pdf";
+    const newUrl = "https://agency.gov/docs/new.pdf";
+    let oldFetches = 0;
+    const text = (FIXTURE_PAGES[0] as { text: string }).text;
+    const moving = {
+      url: oldUrl,
+      title: "보고서",
+      site: "기관",
+      text,
+      // The first fetch ends at the old address; later ones redirect to the agency's new one.
+      get finalUrl() {
+        return oldFetches++ === 0 ? oldUrl : newUrl;
+      },
+    };
+    const direct = { url: newUrl, finalUrl: newUrl, title: "보고서", site: "기관", text };
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && /배경/.test(x))) return undefined;
+      if (!x.includes(RETRY_MARK))
+        return [
+          { call: "web_fetch", input: { url: oldUrl } },
+          { textRefs: notes({ claim: "메모리", ref: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory }) },
+        ];
+      return [
+        { call: "web_fetch", input: { url: oldUrl } },
+        { call: "web_fetch", input: { url: newUrl } },
+        { textRefs: notes({ claim: "32%", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.growth }) },
+      ];
+    });
+    const t = await start({ script, pages: [moving, direct] });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await statusIs(t.app, job.id, "done");
+    const q2 = stateOf(t, job.id).questions[1]!;
+    expect(q2.found).toHaveLength(2);
+    expect(new Set(q2.found.map((n) => n.sourceId)).size).toBe(2);
+    expect(q2.found.map((n) => n.sourceType)).toEqual(["government", "government"]);
+    const end = ResearchJob.parse((await t.api(t.f.cookies.owner, "GET", `/api/research/${job.id}`)).json());
+    expect(end.questions[1]!.sources).toBe(1);
+  });
+
   it("the runtime's own refusal (runtime_policy) is kept and never retried", async () => {
     const script = scripted((x) =>
       x.startsWith(TURN_MARK.subagent) ? [{ fail: "policy", code: "runtime_policy" as const }] : undefined,
