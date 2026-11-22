@@ -854,6 +854,8 @@ export class ResearchEngine {
         const notes = allNotes(state);
         const ctx = fresh();
         if (!ctx) return void this.fail(row.id, ended!, live);
+        // A reflection after a restart is research that ran on too (review #237 5차).
+        ran = true;
         const r = await this.step(row, ctx, {
           name: `reflect${state.round}`,
           prompt: "reflect",
@@ -920,6 +922,8 @@ export class ResearchEngine {
     const last = state.questions.flatMap((q) => (q.failure ? [q.failure] : []));
     error = last.find((c) => !RETRYABLE.has(c)) ?? last[0];
     if (error && !allNotes(state).length) {
+      // The questions' end state (skipped for time, the time limit) is kept with the failure (review #237 5차).
+      this.save(row.id, { state }, ["researching"], live);
       this.fail(row.id, error, live);
       return ran;
     }

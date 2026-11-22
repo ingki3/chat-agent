@@ -4,12 +4,15 @@ import { findPassages, PAGE_GAP, sentenceRanges, termsOf } from "../src/citation
 import {
   cutOutsideGap,
   findSnippet,
+  findSnippetAt,
   GAP_MARK,
   gapRanges,
+  hasGapMarks,
   stripGapMarks,
   touchesGap,
+  visibleIndex,
 } from "../src/citations/verify.js";
-import { parseNotes } from "../src/research/prompts.js";
+import { parseNotes, subagentTurn } from "../src/research/prompts.js";
 import { claimKeyOf } from "../src/research/store.js";
 import { mergeNotes, mergeUnverified } from "../src/research/engine.js";
 import type { ResearchNote } from "../src/research/store.js";
@@ -33,27 +36,39 @@ describe("web_find passages", () => {
       for (const b of r.passages.slice(i + 1)) expect(a.end <= b.start || b.end <= a.start).toBe(true);
     for (const p of r.passages) expect(p.text.length).toBeLessThanOrEqual(700);
     expect(findPassages(text, "   ", 5)).toEqual({ total: 0, passages: [] });
+    // A phrase across the split of a long sentence without spaces (400 characters a piece) is still found.
+    const solid = `${"가".repeat(396)}대학입학전형시행계획${"나".repeat(50)}`;
+    expect(solid.length).toBe(456);
+    const hit = findPassages(solid, "대학입학전형시행계획", 5);
+    expect(hit.total).toBe(1);
+    expect(hit.passages[0]!.phrase).toBe(true);
+    expect(hit.passages[0]!.text).toContain("대학입학전형시행계획");
   });
 });
 
 describe("PDF pages that were not read (#234 PAGE_GAP)", () => {
+  /** A web PDF's text as the PDF reader stored it: its marks hold (`hasGapMarks`). */
+  const G = { gaps: true } as const;
+
   it("no match stands on any part of the mark or across it — the exact check and web_find alike", () => {
     const pdf = `1쪽 끝 문장이다. 정부는 지원금을\n\n${PAGE_GAP}\n\n내년부터 지급한다고 밝혔다. 3쪽 문장이다.`;
-    expect(findSnippet(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다").found).toBe(false);
-    expect(findSnippet(pdf, "정부는 지원금을 [읽지 못한 쪽] 내년부터 지급한다고 밝혔다").found).toBe(false);
-    expect(findSnippet(pdf, "내년부터 지급한다고 밝혔다").found).toBe(true);
+    expect(findSnippet(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다", undefined, G).found).toBe(false);
+    expect(
+      findSnippet(pdf, "정부는 지원금을 [읽지 못한 쪽] 내년부터 지급한다고 밝혔다", undefined, G).found,
+    ).toBe(false);
+    expect(findSnippet(pdf, "내년부터 지급한다고 밝혔다", undefined, G).found).toBe(true);
     const meeting = `회의는 여기까지 진행했다.\n\n${PAGE_GAP}\n\n다음 회의는 내일 열린다.`;
-    expect(findSnippet(meeting, "회의는 여기까지 진행했다. [읽지 못한").found).toBe(false);
-    expect(findSnippet(meeting, "못한 쪽] 다음 회의는 내일 열린다").found).toBe(false);
-    expect(findSnippet(meeting, "읽지 못한 쪽").found).toBe(false);
-    expect(findSnippet(meeting, "다음 회의는 내일 열린다").found).toBe(true);
-    const found = findPassages(pdf, "지원금 지급", 5).passages;
+    expect(findSnippet(meeting, "회의는 여기까지 진행했다. [읽지 못한", undefined, G).found).toBe(false);
+    expect(findSnippet(meeting, "못한 쪽] 다음 회의는 내일 열린다", undefined, G).found).toBe(false);
+    expect(findSnippet(meeting, "읽지 못한 쪽", undefined, G).found).toBe(false);
+    expect(findSnippet(meeting, "다음 회의는 내일 열린다", undefined, G).found).toBe(true);
+    const found = findPassages(pdf, "지원금 지급", 5, G).passages;
     expect(found.length).toBeGreaterThan(0);
     for (const p of found) {
       expect(p.text).not.toContain(GAP_MARK);
       expect(p.text).not.toContain("읽지 못한");
     }
-    expect(findPassages(pdf, "읽지 못한 쪽", 5).passages).toEqual([]);
+    expect(findPassages(pdf, "읽지 못한 쪽", 5, G).passages).toEqual([]);
   });
 
   it('a page that merely says "[읽지 못한 쪽]" is ordinary text (no mark without the reader\'s U+E000)', () => {
@@ -61,6 +76,25 @@ describe("PDF pages that were not read (#234 PAGE_GAP)", () => {
     expect(findSnippet(plain, "화면에는 [읽지 못한 쪽]이라는 안내가 뜹니다.").found).toBe(true);
     expect(touchesGap(plain, 0, plain.length)).toBe(false);
     expect(stripGapMarks(`a${GAP_MARK}b`)).toBe("ab");
+  });
+
+  it("anything else (an attachment, another page) treats U+E000 as ordinary text — even an unpaired one", () => {
+    const attachment = `회의 메모${GAP_MARK}\n다음 회의는 내일 열린다.`;
+    expect(findSnippetAt(attachment, "다음 회의는 내일 열린다").found).toBe(true);
+    expect(findSnippet(attachment, "다음 회의는 내일 열린다", undefined, G).found).toBe(false);
+    expect(hasGapMarks("application/pdf")).toBe(true);
+    expect(hasGapMarks("text/html")).toBe(false);
+    expect(hasGapMarks(null)).toBe(false);
+    // Only a web PDF's search honours the marks.
+    expect(findPassages(attachment, "다음 회의", 5).passages).toHaveLength(1);
+  });
+
+  it("visible counts and places leave the marks' U+E000 out", () => {
+    const text = `앞 문장이다.\n\n${PAGE_GAP}\n\n뒤 문장이다.`;
+    const at = text.indexOf("뒤");
+    expect(visibleIndex(text, at)).toBe(stripGapMarks(text).indexOf("뒤"));
+    expect(visibleIndex(text, text.length)).toBe(stripGapMarks(text).length);
+    expect(visibleIndex("가나다", 2)).toBe(2);
   });
 
   it("the stored bound never cuts a mark in two: the cut moves before it", () => {
@@ -196,5 +230,28 @@ describe("source type by domain (#234)", () => {
       "other",
       "other",
     ]);
+  });
+});
+
+describe("a retry's hints name only its scope's tools (#234)", () => {
+  const plan = { title: "t", subQuestions: [], estimateMinutes: 5, backend: "claude" as const };
+  const turn = (scope: "web" | "files" | "both") =>
+    subagentTurn({
+      question: "q",
+      plan,
+      sub: { id: "q1", question: "하위", scope },
+      files: [{ id: "f1", name: "메모.txt" }],
+      retry: { found: [], unverified: ["확인 못 한 주장"] },
+    });
+  it("files only: file_search and file_read, never a web tool", () => {
+    const t = turn("files");
+    expect(t).toContain("file_search");
+    expect(t).not.toMatch(/web_(find|fetch|search)/);
+  });
+  it("web and both", () => {
+    expect(turn("web")).toContain("web_find");
+    expect(turn("web")).not.toContain("file_search");
+    expect(turn("both")).toContain("web_find");
+    expect(turn("both")).toContain("file_search");
   });
 });

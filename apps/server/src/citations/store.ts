@@ -4,7 +4,7 @@ import { CITATION_LIMITS, type CitationStatus, type CiteResult, type FileLocator
 import type { Db } from "../db/client.js";
 import { citations, conversations, files, sources } from "../db/schema.js";
 import type { SourceScope } from "../web/sources.js";
-import { findSnippet, normalizeSnippet } from "./verify.js";
+import { findSnippet, hasGapMarks, normalizeSnippet } from "./verify.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 
 export type CitationRow = typeof citations.$inferSelect;
@@ -329,7 +329,8 @@ function checkAgainst(
 ): { status: CitationStatus; quote: string | null } {
   if (!src) return { status: "unknown_source", quote: null };
   if (src.kind !== "page" || !src.body) return { status: "fetch_failed", quote: null };
-  const m = findSnippet(src.body, snippet, src.bodyHash ?? undefined);
+  // A web PDF's gap marks hold only in its own text (#234, review #237 5차).
+  const m = findSnippet(src.body, snippet, src.bodyHash ?? undefined, { gaps: hasGapMarks(src.contentType) });
   return m.found
     ? { status: "verified", quote: scrubKnown(m.quote) }
     : { status: "snippet_not_found", quote: null };

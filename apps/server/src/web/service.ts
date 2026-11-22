@@ -8,7 +8,7 @@ import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
-import { cutOutsideGap, stripGapMarks } from "../citations/verify.js";
+import { cutOutsideGap, stripGapMarks, visibleIndex } from "../citations/verify.js";
 import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
@@ -579,7 +579,7 @@ export class WebService {
         contentType: row.contentType,
         // Official / academic / other by the address (#234): primary sources first.
         sourceType: sourceTypeOf(row.finalUrl ?? row.url),
-        characters: text.length,
+        characters: visibleIndex(text, text.length),
         excerptCharacters: excerpt.length,
         truncated: row.truncated,
         // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).

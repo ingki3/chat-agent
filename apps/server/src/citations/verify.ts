@@ -468,6 +468,23 @@ export function cutOutsideGap(text: string, max: number): string {
   return text.slice(0, max);
 }
 
+/**
+ * `gaps`: the text is a web PDF's as the PDF reader stored it (#234) — its `PAGE_GAP` marks are honoured. Never for
+ * attachments or other pages: a U+E000 there is ordinary text (review #237 5차).
+ */
+export type SnippetOptions = { gaps?: boolean };
+
+/** Whether a stored web source's text carries PDF gap marks (the PDF path stores `application/pdf`). */
+export const hasGapMarks = (contentType: string | null | undefined) => contentType === "application/pdf";
+
+/** `body` without the gap marks' private-use characters, as shown (visible length and positions). */
+export const visibleIndex = (body: string, at: number) => {
+  if (!body.includes(GAP_MARK)) return at;
+  let n = 0;
+  for (let i = body.indexOf(GAP_MARK); i !== -1 && i < at; i = body.indexOf(GAP_MARK, i + 1)) n++;
+  return at - n;
+};
+
 export type SnippetMatch =
   { found: true; quote: string } | { found: false; reason: "too_short" | "not_found" };
 
@@ -476,8 +493,13 @@ export type SnippetMatch =
  * `CITATION_LIMITS.snippet` characters. `cacheKey` (the body's hash) lets repeated checks of one page reuse its
  * normalised text.
  */
-export function findSnippet(body: string, snippet: string, cacheKey?: string): SnippetMatch {
-  const m = findSnippetAt(body, snippet, cacheKey);
+export function findSnippet(
+  body: string,
+  snippet: string,
+  cacheKey?: string,
+  opts: SnippetOptions = {},
+): SnippetMatch {
+  const m = findSnippetAt(body, snippet, cacheKey, opts);
   return m.found ? { found: true, quote: m.quote } : m;
 }
 
@@ -489,6 +511,7 @@ export function findSnippetAt(
   body: string,
   snippet: string,
   cacheKey?: string,
+  opts: SnippetOptions = {},
 ):
   | { found: true; quote: string; start: number; end: number }
   | { found: false; reason: "too_short" | "not_found" } {
@@ -498,7 +521,7 @@ export function findSnippetAt(
   const page = pageOf(body, cacheKey);
   // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
   for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const m = matchIn(body, page.n, page.d, want);
+    const m = matchIn(body, page.n, page.d, want, opts.gaps === true);
     if (m !== undefined) return { found: true, ...m };
   }
   return { found: false, reason: "not_found" };
@@ -513,6 +536,7 @@ function matchIn(
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
+  gaps: boolean,
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -527,7 +551,7 @@ function matchIn(
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
     // Never on any part of the mark of a page that was not read, nor across it (#234, review #237 2·3차).
-    if (touchesGap(body, start, end)) continue;
+    if (gaps && touchesGap(body, start, end)) continue;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
     // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).

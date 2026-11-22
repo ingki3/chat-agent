@@ -112,20 +112,29 @@ export function subagentTurn(input: {
       : input.sub.scope === "files"
         ? "첨부 파일만 (file_search · file_read)"
         : "웹과 첨부 파일 (web_search · web_fetch · web_find · file_search · file_read)";
+  // The retry's hints name only the tools its scope has (review #237 5차).
+  const web = input.sub.scope !== "files";
+  const files = input.sub.scope !== "web";
+  const how = [
+    ...(web ? ["웹 페이지는 web_find로 저장된 본문에서 찾거나 web_fetch로 다시 읽어"] : []),
+    ...(files ? ["첨부 파일은 file_search로 찾아 file_read로 읽어"] : []),
+  ].join(", ");
   const retry = input.retry
     ? [
         [
           RETRY_MARK,
           "이 하위 질문은 한 번 조사했지만 확인된 근거가 " +
             (input.retry.found.length ? "출처 하나뿐이다." : "없다.") +
-            " 앞과 **다른 검색어**로 다시 찾는다: 공식 기관·문서의 정식 이름, 동의어, 영어 표현, 연도·문서 종류(시행계획, 보도자료, 통계, PDF)를 넣는다. 이미 확인된 출처 말고 **다른 출처**, 특히 1차 자료(정부·공공기관·대학)를 찾는다. 긴 문서는 `web_find`로 본문 전체에서 찾는다.",
+            (web
+              ? " 앞과 **다른 검색어**로 다시 찾는다: 공식 기관·문서의 정식 이름, 동의어, 영어 표현, 연도·문서 종류(시행계획, 보도자료, 통계, PDF)를 넣는다. 이미 확인된 출처 말고 **다른 출처**, 특히 1차 자료(정부·공공기관·대학)를 찾는다. 긴 문서는 `web_find`로 본문 전체에서 찾는다."
+              : " 첨부 파일에서 앞과 **다른 검색어**(동의어, 정식 이름, 숫자·날짜, 표 제목)로 `file_search`를 다시 하고, 찾은 곳을 `file_read`로 읽는다."),
         ].join("\n"),
         ...(input.retry.found.length
           ? [`이미 확인된 노트 (다시 쓰지 않는다):\n${notesBlock(input.retry.found)}`]
           : []),
         ...(input.retry.unverified.length
           ? [
-              `원문에서 확인하지 못한 주장 (서버는 구절을 고쳐 주지 않는다 — 그 주장을 실제로 쓴 원문을 web_find나 web_fetch로 찾아 글자 그대로 복사해 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+              `원문에서 확인하지 못한 주장 (서버는 구절을 고쳐 주지 않는다 — 그 주장을 실제로 쓴 원문을 ${how} 글자 그대로 복사해 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
             ]
           : []),
       ]

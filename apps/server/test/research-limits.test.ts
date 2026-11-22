@@ -16,7 +16,7 @@ import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
 import { extractorPdfReader, PDF_TEXT_CHARS, type PdfReader } from "../src/web/pdf.js";
 import { EXCERPT_CHARS, workerLimitsOf } from "../src/web/service.js";
-import { SourceStore } from "../src/web/sources.js";
+import { SourceStore, toSource } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 import { startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
 import { run as runWorker } from "../../../packages/mcp-tools/web/worker.mjs";
@@ -262,6 +262,23 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     await call("web_fetch", { url: "http://public.test/pua.txt" });
     const plain = f.sources.list(f.c.id)[1]!;
     expect(plain.body).toBe("개인 영역 문자가 섞인 글이다.");
+  });
+
+  it("a PDF's counts and web_find places are of the visible text (the marks' U+E000 left out)", async () => {
+    const stored = `앞쪽 문장이다.\n\n${PAGE_GAP}\n\n뒤쪽의 정시모집 문장이다.`;
+    const visible = stored.replaceAll(GAP_MARK, "");
+    const reader: PdfReader = async () => ({ ok: true, text: stored, truncated: true, unread: true });
+    fx.routes.set("/marks.pdf", { headers: { "content-type": "application/pdf" }, body: "%PDF-1.7 x" });
+    const f = family();
+    const { call } = service(f, reader);
+    const fetched = await call("web_fetch", { url: "http://public.test/marks.pdf" });
+    expect(fetched.body.characters).toBe(visible.length);
+    expect(f.sources.listFor(f.scope)!.map((r) => toSource(r).characters)).toEqual([visible.length]);
+    const found = await call("web_find", { sourceId: String(fetched.body.sourceId), query: "정시모집 문장" });
+    expect(found.body.characters).toBe(visible.length);
+    const [hit] = found.body.results as { at: number }[];
+    expect(hit!.at).toBe(visible.indexOf("뒤쪽"));
+    expect(String(found.body.content)).not.toContain(GAP_MARK);
   });
 
   it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {

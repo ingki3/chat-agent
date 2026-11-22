@@ -1564,6 +1564,68 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(failed.errorCode).toBe("no_findings");
   });
 
+  /** A job held in research, closed, its checkpoint rewritten by `edit` — then resumed. */
+  async function resumedWith(
+    edit: (state: { questions: Record<string, unknown>[] } & Record<string, unknown>) => void,
+    approvedAgo?: number,
+  ) {
+    const db = createTestDb();
+    const hold = scripted((x) => (x.startsWith(TURN_MARK.subagent) ? [{ gate: "edit-hold" }] : undefined));
+    const t1 = await start({ db, script: hold });
+    const { job } = await begin(t1);
+    await statusIs(t1.app, job.id, "awaiting_approval");
+    await t1.api(t1.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    await until(() => t1.counting.active === 2, "running sub-researchers");
+    await t1.app.close();
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] } & Record<string, unknown>;
+    edit(state);
+    db.$client.prepare("update research_jobs set state = ? where id = ?").run(JSON.stringify(state), job.id);
+    if (approvedAgo !== undefined)
+      db.$client
+        .prepare("update research_jobs set approved_at = ? where id = ?")
+        .run(Date.now() - approvedAgo, job.id);
+    const t2 = await start({ db, family: false });
+    return { t2, job, db };
+  }
+
+  it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
+    const { t2, job } = await resumedWith((state) => {
+      for (const q of state.questions)
+        Object.assign(q, { status: "done", retried: true, found: [], sources: 0 });
+    });
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.subagent))).toHaveLength(0);
+    expect(t2.counting.turns.filter((x) => x.startsWith(TURN_MARK.reflect))).toHaveLength(1);
+    expect(failed.errorCode).toBe("no_findings");
+  });
+
+  it("failing with a question skipped for time keeps its state (skipped, the time limit) with the error", async () => {
+    const { t2, job, db } = await resumedWith((state) => {
+      Object.assign(state.questions[0]!, { status: "done", retried: true, found: [], sources: 0 });
+      Object.assign(state.questions[1]!, {
+        status: "waiting",
+        retried: true,
+        failure: "runtime_error",
+        found: [],
+        sources: 0,
+      });
+    }, 21 * MIN);
+    const failed = await statusIs(t2.app, job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_error");
+    const row = db.$client.prepare("select state from research_jobs where id = ?").get(job.id) as {
+      state: string;
+    };
+    const saved = JSON.parse(row.state) as {
+      timedOut: boolean;
+      questions: { status: string; skipped?: string }[];
+    };
+    expect(saved.timedOut).toBe(true);
+    expect(saved.questions[1]).toMatchObject({ status: "capped", skipped: "time" });
+  });
+
   it('resumed with no research time left: what was waiting is under the time limit, not "no evidence"', async () => {
     const db = createTestDb();
     const hold = scripted((x) =>

@@ -103,6 +103,7 @@ import {
 } from "../web/service.js";
 import type { PdfReader } from "../web/pdf.js";
 import { findPassages } from "../citations/passages.js";
+import { hasGapMarks, visibleIndex } from "../citations/verify.js";
 
 /** PRD §7 finance skills (FR-7): hidden from youth accounts unless named explicitly (#30). */
 const FINANCE_SKILLS: ReadonlySet<string> = new Set(
@@ -1688,21 +1689,26 @@ export class McpService {
     const row = web.sources.getFor(scope, input.sourceId);
     if (!row) return { ok: false, code: "unknown_source" };
     if (row.kind !== "page" || !row.body) return { ok: false, code: "fetch_failed" };
-    const { total, passages } = findPassages(row.body, input.query, input.maxResults ?? 5);
+    const body = row.body;
+    // A web PDF's gap marks hold only in its own text (review #237 5차); counts and places are of the visible text.
+    const { total, passages } = findPassages(body, input.query, input.maxResults ?? 5, {
+      gaps: hasGapMarks(row.contentType),
+    });
+    const at = (p: { start: number }) => visibleIndex(body, p.start);
     return {
       ok: true,
       output: {
         sourceId: row.id,
         url: row.finalUrl ?? row.url,
         site: row.site,
-        characters: row.body.length,
+        characters: visibleIndex(body, body.length),
         status: passages.length ? "find_found" : "find_none",
         matches: total,
-        results: passages.map((p, i) => ({ n: i + 1, at: p.start, phrase: p.phrase })),
+        results: passages.map((p, i) => ({ n: i + 1, at: at(p), phrase: p.phrase })),
         content: frameExternal({
           source: row.finalUrl ?? row.url,
           content: passages.length
-            ? passages.map((p, i) => `[${i + 1}] (at ${p.start})\n${p.text}`).join("\n\n")
+            ? passages.map((p, i) => `[${i + 1}] (at ${at(p)})\n${p.text}`).join("\n\n")
             : "(no match)",
         }),
       },

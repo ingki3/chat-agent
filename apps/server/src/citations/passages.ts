@@ -101,38 +101,91 @@ export type FoundPassage = Range & { text: string; phrase: boolean; score: numbe
 /** Characters of one returned passage at most (the matching sentence and what fits of its neighbours). */
 export const FIND_PASSAGE_CHARS = 700;
 
+/** Lower case, whitespace runs as one space, and for each character of that where it stands in `text`. */
+function flatMap(text: string): { s: string; at: number[] } {
+  const out: string[] = [];
+  const at: number[] = [];
+  let space = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (/\s/u.test(c)) {
+      space = out.length > 0;
+      continue;
+    }
+    if (space) {
+      out.push(" ");
+      at.push(i);
+      space = false;
+    }
+    const l = c.toLowerCase();
+    for (const ch of l) {
+      out.push(ch);
+      at.push(i);
+    }
+  }
+  return { s: out.join(""), at };
+}
+
+/** The sentence `i` with `ranges[i].start <= pos < ranges[i + 1].start` (the last one before `pos`). */
+function sentenceAt(ranges: Range[], pos: number): number {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ranges[mid]!.start <= pos) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
 /**
- * The passages of `text` that best match `query`: a sentence that holds the whole phrase first (ignoring case and
- * spacing), then sentences with the most of its words (at least half of them; a word also counts inside a longer one,
- * `시행` in `시행계획`). Each comes with the sentences around it, at most `FIND_PASSAGE_CHARS`. Passages do not
- * overlap; best first, then in page order.
+ * The passages of `text` that best match `query`: where the whole phrase stands first (ignoring case and spacing —
+ * looked for in the whole text, so a sentence cut in pieces does not hide it), then sentences with the most of its
+ * words (at least half of them; a word also counts inside a longer one, `시행` in `시행계획`). Each comes with the
+ * sentences around it, at most `FIND_PASSAGE_CHARS`. Passages do not overlap; best first, then in page order.
+ * `gaps`: a web PDF's text — nothing is taken on or across its `PAGE_GAP` marks (#234).
  */
 export function findPassages(
   text: string,
   query: string,
   max: number,
+  opts: { gaps?: boolean } = {},
 ): { total: number; passages: FoundPassage[] } {
   const want = flat(query);
   const terms = [...new Set(termsOf(query))].filter((t) => t.length > 0);
   if (!want || !terms.length) return { total: 0, passages: [] };
+  const gap = (a: number, b: number) => opts.gaps === true && touchesGap(text, a, b);
   const need = Math.max(1, Math.ceil(terms.length / 2));
   const sentences = sentenceRanges(text);
-  const hits: { i: number; score: number; phrase: boolean }[] = [];
+  if (!sentences.length) return { total: 0, passages: [] };
+  type Hit = { first: number; last: number; score: number; phrase: boolean };
+  const hits: Hit[] = [];
+  const phrased = new Set<number>();
+  // The phrase, in the whole text.
+  const f = flatMap(text);
+  for (let at = f.s.indexOf(want); at !== -1; at = f.s.indexOf(want, at + 1)) {
+    const a = f.at[at]!;
+    const b = f.at[at + want.length - 1]! + 1;
+    if (gap(a, b)) continue;
+    const first = sentenceAt(sentences, a);
+    const last = sentenceAt(sentences, b - 1);
+    for (let k = first; k <= last; k++) phrased.add(k);
+    hits.push({ first, last, score: 2 * terms.length + 1, phrase: true });
+  }
+  // The words, sentence by sentence.
   for (const [i, r] of sentences.entries()) {
-    // The mark of a page that was not read is no text of the page.
-    if (touchesGap(text, r.start, r.end)) continue;
+    if (phrased.has(i) || gap(r.start, r.end)) continue;
     const s = flat(text.slice(r.start, r.end));
-    const phrase = s.includes(want);
     const words = new Set(termsOf(s));
     let n = 0;
     for (const t of terms) if (words.has(t) || (Array.from(t).length >= 2 && s.includes(t))) n++;
-    if (phrase || n >= need) hits.push({ i, score: (phrase ? terms.length + 1 : 0) + n, phrase });
+    if (n >= need) hits.push({ first: i, last: i, score: n, phrase: false });
   }
-  hits.sort((a, b) => b.score - a.score || a.i - b.i);
+  hits.sort((x, y) => y.score - x.score || x.first - y.first);
   const taken: FoundPassage[] = [];
   for (const h of hits) {
     if (taken.length >= max) break;
-    const r = withContext(text, sentences, h.i);
+    const r = withContext(text, sentences, h.first, h.last, gap);
     if (taken.some((t) => t.start < r.end && r.start < t.end)) continue;
     taken.push({ ...r, text: passageText(text, r), phrase: h.phrase, score: h.score });
   }
@@ -140,27 +193,33 @@ export function findPassages(
 }
 
 /**
- * Sentence `i` with its neighbours before and after while they fit in `FIND_PASSAGE_CHARS` — never across a PDF page
- * that was not read (`PAGE_GAP`, review #237 2차): a passage is always one stretch of read text.
+ * Sentences `first`–`last` with their neighbours before and after while they fit in `FIND_PASSAGE_CHARS` — never
+ * across a PDF page that was not read (`PAGE_GAP`, review #237 2차): a passage is always one stretch of read text.
  */
-function withContext(text: string, sentences: Range[], i: number): Range {
-  const own = sentences[i]!;
-  // A very long sentence alone is cut at a space near the limit (its start is kept: that is where it matched).
+function withContext(
+  text: string,
+  sentences: Range[],
+  first: number,
+  last: number,
+  gap: (a: number, b: number) => boolean,
+): Range {
+  const own = { start: sentences[first]!.start, end: sentences[last]!.end };
+  // A very long stretch alone is cut at a space near the limit (its start is kept: that is where it matched).
   if (own.end - own.start >= FIND_PASSAGE_CHARS) {
     const cut = text.lastIndexOf(" ", own.start + FIND_PASSAGE_CHARS);
     return { start: own.start, end: cut > own.start ? cut : own.start + FIND_PASSAGE_CHARS };
   }
-  const gap = (r: Range | undefined) => !r || touchesGap(text, r.start, r.end);
+  const blocked = (r: Range | undefined) => !r || gap(r.start, r.end);
   let start = own.start;
   let end = own.end;
   let back = true;
   let ahead = true;
   for (let k = 1; k <= 2; k++) {
-    const before = sentences[i - k];
-    if (back && !gap(before) && end - before!.start <= FIND_PASSAGE_CHARS) start = before!.start;
+    const before = sentences[first - k];
+    if (back && !blocked(before) && end - before!.start <= FIND_PASSAGE_CHARS) start = before!.start;
     else back = false;
-    const after = sentences[i + k];
-    if (ahead && !gap(after) && after!.end - start <= FIND_PASSAGE_CHARS) end = after!.end;
+    const after = sentences[last + k];
+    if (ahead && !blocked(after) && after!.end - start <= FIND_PASSAGE_CHARS) end = after!.end;
     else ahead = false;
   }
   return { start, end };
