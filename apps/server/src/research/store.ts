@@ -3,9 +3,11 @@ import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import {
   ResearchPlan,
   ResearchResult,
+  type ResearchActivity,
   type ResearchErrorCode,
   type ResearchJob,
   ResearchQuestionState,
+  type ResearchPhase,
   type ResearchStatus,
   type SourceType,
 } from "@agentlee/shared";
@@ -13,6 +15,7 @@ import type { Db } from "../db/client.js";
 import { researchJobs } from "../db/schema.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
 import type { ReportOutline } from "./prompts.js";
+import { activityView, type LiveActivity } from "./activity.js";
 
 export type ResearchJobRow = typeof researchJobs.$inferSelect;
 
@@ -51,7 +54,7 @@ export const claimKeyOf = (claim: string) =>
   crypto.createHash("sha256").update(claim.normalize("NFC").replace(/\s+/gu, " ").trim()).digest("hex");
 
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
-export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
+export type QuestionRecord = Omit<ResearchQuestionState, "notes" | "activity"> & {
   found: ResearchNote[];
   /**
    * It was researched once more with rewritten queries (#234: no verified note, or one source only) — at most once.
@@ -66,6 +69,25 @@ export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
   failure?: ResearchErrorCode | undefined;
   /** It was not (re)searched because too little time was left when its turn came (#234). */
   skipped?: "time" | undefined;
+};
+
+/**
+ * A running job's live progress (#232), kept by the engine in memory only: the phase, the latest tool call of each
+ * sub-question and when anything last happened. Never written to the checkpoint — a restart begins without it.
+ */
+export type LiveProgress = {
+  phase: ResearchPhase;
+  phaseProgress: { done: number; total: number } | null;
+  lastActivityAt: number;
+  activity: ReadonlyMap<string, LiveActivity>;
+  /** Orders live states of one saved version (a page keeps the higher of two of the same version). */
+  seq: number;
+};
+
+const ACTIVE_PHASE: Partial<Record<ResearchStatus, ResearchPhase>> = {
+  planning: "planning",
+  researching: "researching",
+  writing: "writing",
 };
 
 /** The checkpoint (`research_jobs.state`): written after every step. */
@@ -194,6 +216,15 @@ export function sourceCount(notes: readonly ResearchNote[]): number {
 
 const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));
 
+/**
+ * A sub-question's activity line as it goes out (GET and the live stream alike) — checked against its schema and the
+ * fixed labels first: one that is not valid is left out, never the job. The owner's only — a share recipient (#29)
+ * sees the phase, the time and the counts.
+ */
+export function shown(a: LiveActivity | undefined): ResearchActivity | null {
+  return a ? activityView(a) : null;
+}
+
 /** The job as the API shows it (owner or share recipient). Notes stay on the server. */
 export function toResearchJob(
   row: ResearchJobRow,
@@ -205,9 +236,15 @@ export function toResearchJob(
      * from before body-hash keys count rows of one body once in the view as well. Without it the notes' own keys.
      */
     contentKey?: ((sourceId: string) => string | undefined) | undefined;
+    /** The engine's live progress (#232) and this process's id (`boot`). */
+    live?: LiveProgress | undefined;
+    boot?: string | undefined;
   },
 ): ResearchJob {
   const s = stateOf(row);
+  // The live progress counts only while the job is active (a stop that came in between ends it at once).
+  const fallback = ACTIVE_PHASE[row.status];
+  const live = fallback ? opts.live : undefined;
   const plan = planOf(row);
   // Copies with their keys as the rows say now — the checkpoint itself is not written here. One lookup per source
   // for the whole view (review #237 19차).
@@ -234,6 +271,13 @@ export function toResearchJob(
     clarify: row.clarifyQuestion ? { question: row.clarifyQuestion, answer: row.clarifyAnswer } : null,
     plan,
     stage: s.stage,
+    phase: live?.phase ?? fallback ?? null,
+    phaseProgress: live?.phaseProgress ?? null,
+    // The live progress records every event in order (its saves too): its time is the latest event's. Without it
+    // (a restart, before the first event) the last save's.
+    lastActivityAt: fallback ? (live?.lastActivityAt ?? row.updatedAt) : null,
+    seq: live?.seq ?? 0,
+    ...(opts.boot ? { boot: opts.boot } : {}),
     round: s.round,
     // Only the API's fields: the notes and the retry's bookkeeping (#234) stay on the server.
     questions: s.questions.map(
@@ -241,6 +285,7 @@ export function toResearchJob(
         ({
           ...Object.fromEntries(Object.entries(q).filter(([k]) => QUESTION_KEYS.has(k))),
           notes: q.found?.length ?? 0,
+          activity: q.status === "running" && opts.owned ? shown(live?.activity.get(q.id)) : null,
         }) as ResearchQuestionState,
     ),
     sources: sourceCount(notes),

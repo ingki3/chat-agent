@@ -43,10 +43,16 @@ test("plan card: edit and approve, live progress, then the verified report", asy
     card.locator('[data-testid="research-question"][data-status="running"]').first(),
   ).toBeVisible();
   await expect(card.getByTestId("research-stop")).toBeVisible();
+  // What it is doing now (#232): the phase, a running sub-question's latest call, the time since the last activity.
+  await expect(card.getByTestId("research-phase")).toHaveText(/조사|보강|보고서|출처/);
+  await expect(card.getByTestId("research-activity").first()).toHaveText("페이지 읽는 중 · 1번째 페이지");
+  await expect(card.getByTestId("research-last-activity")).toContainText("마지막 활동");
 
   // Done: what did not verify was removed and counted; the report is an artifact card in the same message.
   await expect(card).toHaveAttribute("data-status", "done", { timeout: 30_000 });
   await expect(card.getByTestId("research-result")).toContainText("확인하지 못해 뺀 문장 2개");
+  // Each sub-question's notes, and the one its check could not verify.
+  await expect(card.getByTestId("research-counts").first()).toContainText("노트 2개 · 확인 못 함 1개");
   const reply = page.getByTestId("assistant").last();
   await expect(reply.getByTestId("artifact-card")).toBeVisible();
   await expect(reply).toContainText("깊이 조사 보고서");

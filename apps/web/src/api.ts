@@ -1,5 +1,5 @@
 import {
-  ResearchJob,
+  parseResearchJob,
   type ResearchScope,
   AdminRuntimesResponse,
   BackupItem,
@@ -627,16 +627,16 @@ export const research = {
       text,
       ...(fileIds.length ? { fileIds } : {}),
     })) as { job: unknown; message: unknown; assistant: unknown },
-  get: async (id: string) => ResearchJob.parse(await call("GET", `/api/research/${enc(id)}`)),
+  get: async (id: string) => parseResearchJob(await call("GET", `/api/research/${enc(id)}`)),
   eventsUrl: (id: string) => `/api/research/${enc(id)}/events`,
   approve: async (id: string, subQuestions?: { question: string; scope: ResearchScope }[]) =>
-    ResearchJob.parse(
+    parseResearchJob(
       await call("POST", `/api/research/${enc(id)}/approve`, subQuestions ? { subQuestions } : {}),
     ),
   clarify: async (id: string, answer: string) =>
-    ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/clarify`, { answer })),
-  cancel: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/cancel`, {})),
-  stop: async (id: string) => ResearchJob.parse(await call("POST", `/api/research/${enc(id)}/stop`, {})),
+    parseResearchJob(await call("POST", `/api/research/${enc(id)}/clarify`, { answer })),
+  cancel: async (id: string) => parseResearchJob(await call("POST", `/api/research/${enc(id)}/cancel`, {})),
+  stop: async (id: string) => parseResearchJob(await call("POST", `/api/research/${enc(id)}/stop`, {})),
 };
 
 export const runs = {

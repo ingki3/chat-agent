@@ -45,8 +45,12 @@ export type StepSpec = {
   toolCalls?: number | undefined;
   /** The job's own stop (the owner's stop, the stage's deadline, the conversation deleted, shutdown). */
   signal: AbortSignal;
-  /** Called on every tool start (progress). */
-  onTool?: (() => void) | undefined;
+  /** Called on every tool start (progress, #232): which tool — only its name, nothing of its input. */
+  onTool?: ((call: { name: string }) => void) | undefined;
+  /** Called when a tool call has ended. */
+  onToolEnd?: (() => void) | undefined;
+  /** Called on text from the model (a sign of life; never the text itself). */
+  onText?: (() => void) | undefined;
 };
 
 export type StepEnd = "done" | "timeout" | "capped" | "aborted" | "failed";
@@ -68,6 +72,15 @@ export type StepDeps = {
   /** Background work of a step after its result (closing a session that is slow to stop): shutdown waits for it. */
   track?: ((p: Promise<void>) => void) | undefined;
 };
+
+/** A progress hook never ends the step (it only shows progress). */
+function hook(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // progress only
+  }
+}
 
 /** Output beyond this is not read (a runaway step): it is stopped. */
 const OUTPUT_MAX = 200_000;
@@ -159,10 +172,13 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
         if (ev.type === "text_delta") {
           text += ev.text;
           if (text.length > OUTPUT_MAX) stop("capped");
+          else hook(() => spec.onText?.());
         } else if (ev.type === "tool_start") {
           toolCalls++;
-          spec.onTool?.();
+          hook(() => spec.onTool?.({ name: ev.name }));
           if (spec.toolCalls !== undefined && toolCalls > spec.toolCalls) stop("capped");
+        } else if (ev.type === "tool_end") {
+          hook(() => spec.onToolEnd?.());
         } else if (ev.type === "usage") record(spec, deps, usageReport(ev));
         else if (ev.type === "limit") limited = true;
       }

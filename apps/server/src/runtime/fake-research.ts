@@ -8,7 +8,8 @@ import type { FakeStep } from "./fake.js";
  * network), so the server's checks are the real ones:
  * - plan: two sub-questions on the October chip exports (a question with "모호" first asks one clarifying question);
  * - sub-researchers: real `web_fetch` calls, `NOTE` lines with the fetched `sourceId`s — one note quotes words the page
- *   does not have (the server drops it); "느린 조사" in the question makes each take 2.5 s (the progress e2e);
+ *   does not have (the server drops it); "느린 조사" in the question makes each take 2.5 s, reading its first page
+ *   for 1.5 s (the progress e2e: the activity line);
  * - a retry of a weak sub-question (#234 — the background question rests on one page): nothing new, at once;
  * - reflection: no gaps; outline (#233): four sections over the notes given;
  * - writer: real `cite` calls for the notes it was given and one with a passage no page has, then a report in which
@@ -49,11 +50,14 @@ export function researchSteps(t: string): FakeStep[] | undefined {
   }
   if (t.startsWith(TURN_MARK.subagent)) {
     if (t.includes(RETRY_MARK)) return [{ text: "DONE" }];
-    const slow = /느린 조사/.test(t) ? [{ delayMs: 2500 }] : [];
+    const slow = /느린 조사/.test(t) ? [{ delayMs: 1000 }] : [];
+    // The card's activity line (#232) shows the page being read meanwhile.
+    const reading = slow.length ? [{ delayMs: 1500 }] : [];
     if (/증가율/.test(t))
       return [
         ...slow,
         { call: "web_fetch", input: { url: A.url } },
+        ...reading,
         { call: "web_fetch", input: { url: B.url } },
         {
           textRefs:
@@ -66,6 +70,7 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     return [
       ...slow,
       { call: "web_fetch", input: { url: A.url } },
+      ...reading,
       {
         textRefs:
           note("메모리 가격 회복이 증가를 이끌었다", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE",

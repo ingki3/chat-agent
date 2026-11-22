@@ -28,6 +28,44 @@
 .research-questions li {
   margin: 3px 0;
 }
+/* Live progress (#232): the latest call under a running sub-question, a quiet pulse while the job works. */
+.research-activity {
+  display: block;
+  margin-left: 1.6em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.research-pulse {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--claude);
+  margin-right: 6px;
+  vertical-align: middle;
+  animation: research-pulse 1.6s ease-in-out infinite;
+}
+.research-questions li[data-status="running"] .research-icon {
+  display: inline-block;
+  animation: research-pulse 1.6s ease-in-out infinite;
+}
+@keyframes research-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .research-pulse,
+  .research-questions li[data-status="running"] .research-icon {
+    animation: none;
+  }
+}
 .research-plan.edit li {
   display: flex;
   gap: 6px;

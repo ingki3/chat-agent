@@ -59,6 +59,8 @@ export function registerResearchRoutes(
       owned: row.ownerId === req.ctx.user!.id,
       now: now(),
       contentKey: (sourceId) => engine.contentKeyFor(row.conversationId, sourceId),
+      live: engine.progressOf(row.id),
+      boot: engine.boot,
     });
   const refused = (reply: FastifyReply, e: unknown) => {
     if (e instanceof ResearchError)
