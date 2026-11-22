@@ -16,7 +16,7 @@ import { McpTokens } from "../src/isolation/tokens.js";
 import { McpService } from "../src/mcp/service.js";
 import { extractorPdfReader, PDF_TEXT_CHARS, type PdfReader } from "../src/web/pdf.js";
 import { EXCERPT_CHARS, workerLimitsOf } from "../src/web/service.js";
-import { pdfTitle, SourceStore, toSource } from "../src/web/sources.js";
+import { BY_IDS_SQL, pdfTitle, SourceStore, toSource } from "../src/web/sources.js";
 import { callOurTool } from "./helpers/live-mcp.js";
 import { startWebFixture, type WebFixture } from "./helpers/web-fixture.js";
 import { run as runWorker } from "../../../packages/mcp-tools/web/worker.mjs";
@@ -486,6 +486,39 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     const many = new Set([other.id, ...Array.from({ length: 40_000 }, (_, i) => `x${i}`), page.id]);
     expect(f.sources.listByIds(f.c.id, many).map((r) => r.id)).toEqual([page.id, other.id]);
     expect(f.sources.listByIds("another-conversation", many)).toEqual([]);
+  });
+
+  it("lookups by id use the primary key, never a scan of the conversation's rows; cleared text is no text", () => {
+    const f = family();
+    for (let i = 0; i < 30; i++)
+      f.sources.addPage(f.scope, {
+        url: `http://public.test/p/${i}`,
+        finalUrl: `http://public.test/p/${i}`,
+        title: `판 ${i}`,
+        site: "public.test",
+        contentType: "text/html",
+        body: `본문 ${i}`,
+        truncated: false,
+      });
+    f.db.$client.exec("analyze");
+    const plan = (
+      f.db.$client.prepare(`EXPLAIN QUERY PLAN ${BY_IDS_SQL}`).all(JSON.stringify(["a", "b"]), f.c.id) as {
+        detail: string;
+      }[]
+    )
+      .map((r) => r.detail)
+      .join(" | ");
+    // The ids first, each row by its key (a sort of the few rows found is fine).
+    expect(plan).toMatch(/SEARCH s USING INDEX sqlite_autoindex_sources_1 \(id=\?\)/);
+    expect(plan).not.toMatch(
+      /sources_conversation_idx|sources_conversation_url_idx|sources_conversation_user_idx/,
+    );
+    expect(plan).not.toMatch(/SCAN (sources|s)\b/);
+    // A row whose text was cleared (its hash left) has no text to cite.
+    const row = f.sources.list(f.c.id)[0]!;
+    f.db.$client.prepare("update sources set body = null where id = ?").run(row.id);
+    expect(f.sources.citable(f.c.id, [row.id]).get(row.id)).toEqual({ text: false });
+    expect(f.sources.recentFor(f.scope, 50)!.find((r) => r.id === row.id)!.hasBody).toBe(false);
   });
 
   it("the sources_list query uses its index in rowid order (no sort) and never names the text column", () => {

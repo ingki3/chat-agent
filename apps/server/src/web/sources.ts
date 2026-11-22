@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, isNull, sql } from "drizzle-orm";
 import type { Source } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { conversations, sources } from "../db/schema.js";
@@ -67,11 +67,27 @@ export function pdfTitle(u: URL): string | undefined {
 }
 
 /**
- * Whether a row stores a page's text, without reading the text (review #237 19·20차): its hash (every text stored by
- * `addPage` has one), or — a row from before with text but no hash — the text's byte length, which SQLite takes from
- * the record header without loading the value.
+ * Whether a row stores a page's text, without reading the text (review #237 19–21차): its byte length (from the
+ * record header — SQLite does not load the value), more than zero. A row from before without a hash counts; a row
+ * whose text was cleared (its hash left) does not.
  */
-const HAS_TEXT = sql<number>`(${sources.bodyHash} is not null or octet_length(${sources.body}) is not null)`;
+const HAS_TEXT = sql<number>`coalesce(octet_length(${sources.body}), 0) > 0`;
+
+/**
+ * Rows of a conversation among the ids of one JSON parameter (no bound-variable limit), each found by its primary
+ * key (`cross join` keeps the ids first — review #237 21차: a lookup of a few ids never walks a conversation's every
+ * row); the conversation is checked on each row found; rowid order. Parameters: the JSON array, the conversation.
+ */
+export const BY_IDS_SQL = `select s.* from json_each(?) as j cross join sources as s on s.id = j.value
+  where s.conversation_id = ? order by s.rowid`;
+
+/** A raw `sources` row (column names) as the typed row. */
+function rowOf(raw: Record<string, unknown>): SourceRow {
+  const out: Record<string, unknown> = {};
+  for (const [key, col] of Object.entries(getTableColumns(sources)))
+    out[key] = raw[col.name] === null ? null : col.mapFromDriverValue(raw[col.name]);
+  return out as SourceRow;
+}
 
 const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 
@@ -258,18 +274,20 @@ export class SourceStore {
     // Only the ids asked for (the history's citations — review #237 20차), and whether each has text without
     // reading it (`HAS_TEXT`).
     if (ids && !ids.length) return new Map();
-    const rows = this.db
-      .select({ id: sources.id, kind: sources.kind, hasBody: HAS_TEXT })
-      .from(sources)
-      .where(
-        ids
-          ? and(
-              eq(sources.conversationId, conversationId),
-              sql`${sources.id} in (select value from json_each(${JSON.stringify(ids)}))`,
-            )
-          : eq(sources.conversationId, conversationId),
-      )
-      .all();
+    const rows = ids
+      ? (this.db.$client
+          .prepare(
+            `select s.id as id, s.kind as kind, coalesce(octet_length(s.body), 0) > 0 as hasBody
+               from json_each(?) as j cross join sources as s on s.id = j.value
+              where s.conversation_id = ? order by s.rowid`,
+          )
+          .all(JSON.stringify(ids), conversationId) as { id: string; kind: string; hasBody: number }[])
+      : this.db
+          .select({ id: sources.id, kind: sources.kind, hasBody: HAS_TEXT })
+          .from(sources)
+          .where(eq(sources.conversationId, conversationId))
+          .orderBy(sql`rowid`)
+          .all();
     return new Map(rows.map((r) => [r.id, { text: r.kind === "page" && r.hasBody === 1 }]));
   }
 
@@ -334,18 +352,11 @@ export class SourceStore {
   listByIds(conversationId: string, ids: ReadonlySet<string>): SourceRow[] {
     if (!ids.size) return [];
     // One JSON parameter, however many ids (review #237 20차: one bound variable per id stops at 32,766).
-    return this.db
-      .select()
-      .from(sources)
-      .where(
-        and(
-          eq(sources.conversationId, conversationId),
-          sql`${sources.id} in (select value from json_each(${JSON.stringify([...ids])}))`,
-        ),
-      )
-      .orderBy(sql`rowid`)
-      .all()
-      .map((r) => scrubKnownDeep(r));
+    const raw = this.db.$client.prepare(BY_IDS_SQL).all(JSON.stringify([...ids]), conversationId) as Record<
+      string,
+      unknown
+    >[];
+    return raw.map((r) => scrubKnownDeep(rowOf(r)));
   }
 
   /** What counting needs of a source (#234): its body hash and addresses — never its text. */
