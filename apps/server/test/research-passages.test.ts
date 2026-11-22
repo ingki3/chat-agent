@@ -5,6 +5,7 @@ import {
   cutOutsideGap,
   findSnippet,
   findSnippetAt,
+  cutAt,
   GAP_MARK,
   gapRanges,
   hasGapMarks,
@@ -13,8 +14,8 @@ import {
   visibleIndex,
 } from "../src/citations/verify.js";
 import { parseNotes, subagentTurn } from "../src/research/prompts.js";
-import { claimKeyOf } from "../src/research/store.js";
-import { mergeNotes, mergeUnverified } from "../src/research/engine.js";
+import { claimKeyOf, emptyState, type QuestionRecord } from "../src/research/store.js";
+import { mergeNotes, mergeUnverified, pickNotes } from "../src/research/engine.js";
 import type { ResearchNote } from "../src/research/store.js";
 import { pdfTitle } from "../src/web/service.js";
 
@@ -418,5 +419,43 @@ describe("review #237 9차", () => {
     expect(cal.passages[0]!.text).toContain("📅");
     expect(findPassages(body, "★", 5).passages[0]!.text).toContain("★");
     expect(findPassages(body, "🎉", 5)).toEqual({ total: 0, passages: [] });
+  });
+});
+
+describe("review #237 10차", () => {
+  it("the writer's notes take one per page from each question first: every page reaches it", () => {
+    const s = emptyState();
+    s.questions = Array.from({ length: 6 }, (_, q): QuestionRecord => ({
+      id: `q${q}`,
+      question: `q${q}`,
+      scope: "web",
+      round: 0,
+      status: "done",
+      sources: 2,
+      dropped: 0,
+      found: [
+        ...Array.from({ length: 11 }, (_, i) => ({
+          id: `q${q}-a${i}`,
+          claim: "a",
+          quote: `A ${q} ${i}`,
+          sourceId: "A",
+          sourceKey: "u:A",
+        })),
+        { id: `q${q}-new`, claim: "n", quote: `N ${q}`, sourceId: `N${q}`, sourceKey: `u:N${q}` },
+      ],
+    }));
+    const picked = pickNotes(s, 45);
+    expect(picked).toHaveLength(45);
+    expect(new Set(picked.map((n) => n.sourceKey)).size).toBe(7);
+    for (let q = 0; q < 6; q++) expect(picked.some((n) => n.id === `q${q}-new`)).toBe(true);
+  });
+
+  it("cuts land on code points", () => {
+    const t = `${"가".repeat(9)}📅끝`;
+    expect(cutAt(t, 10)).toBe("가".repeat(9));
+    expect(cutAt(t, 11)).toBe(`${"가".repeat(9)}📅`);
+    expect(cutAt(t, 10).isWellFormed()).toBe(true);
+    const g = `${"가".repeat(9)}📅${"나".repeat(5)}`;
+    expect(cutOutsideGap(g, 10).isWellFormed()).toBe(true);
   });
 });

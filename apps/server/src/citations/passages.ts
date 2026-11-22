@@ -1,4 +1,6 @@
-import { GAP_MARK, gapRanges, KOREAN_PARTICLES, PAGE_GAP } from "./verify.js";
+import { codePointCut, GAP_MARK, gapRanges, KOREAN_PARTICLES, PAGE_GAP } from "./verify.js";
+
+export { codePointCut };
 
 /**
  * Passages of a stored page text (#234): its sentences, and the words they share with a query — for `web_find`, where
@@ -64,14 +66,6 @@ function splitLong(text: string, s: number, e: number, out: Range[]): void {
   out.push({ start: s, end: trimEnd(text, s, a) });
   while (a < e && /\s/u.test(text[a]!)) a++;
   if (a < e) splitLong(text, a, e, out);
-}
-
-/** `i`, or one before it when `i` would split a surrogate pair. */
-export function codePointCut(text: string, i: number): number {
-  if (i <= 0 || i >= text.length) return i;
-  const hi = text.charCodeAt(i - 1);
-  const lo = text.charCodeAt(i);
-  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff ? i - 1 : i;
 }
 
 const trimEnd = (text: string, s: number, e: number) => {

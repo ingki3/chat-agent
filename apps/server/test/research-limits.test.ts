@@ -283,6 +283,22 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     expect(String(found.body.content)).not.toContain(GAP_MARK);
   });
 
+  it("the stored body and the excerpt never end in half a surrogate pair (📅 at both cuts)", async () => {
+    // 📅 straddles the 10,000-character excerpt cut and the 400,000-character storage cut.
+    const text = `${"가".repeat(9_999)}📅${"나".repeat(PDF_TEXT_CHARS - 10_001 - 1)}📅${"다".repeat(100)}`;
+    expect(text.charCodeAt(9_999)).toBeGreaterThanOrEqual(0xd800);
+    expect(text.charCodeAt(PDF_TEXT_CHARS - 1)).toBeGreaterThanOrEqual(0xd800);
+    const reader: PdfReader = async () => ({ ok: true, text, truncated: false, unread: false });
+    fx.routes.set("/pair.pdf", { headers: { "content-type": "application/pdf" }, body: "%PDF-1.7 x" });
+    const f = family();
+    const r = await service(f, reader).call("web_fetch", { url: "http://public.test/pair.pdf" });
+    expect(String(r.body.content).isWellFormed()).toBe(true);
+    expect(Number(r.body.excerptCharacters)).toBe(9_999);
+    const [row] = f.sources.list(f.c.id);
+    expect(row!.body!.isWellFormed()).toBe(true);
+    expect(row!.body!.length).toBe(PDF_TEXT_CHARS - 1);
+  });
+
   it("PDF types, octet-stream and untyped answers; the header within the first 1,024 bytes on both sides", async () => {
     const pdfLike = (n: number) => Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(n, 0x20)]);
     const at = (p: string, type: string | undefined, body: Buffer) =>

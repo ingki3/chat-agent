@@ -731,7 +731,12 @@ export class ResearchEngine {
             filled = true;
           }
         }
-      if (filled) q.sources = sourceCount(q.found);
+      // The same passage of one page reached by two URLs is one note (review #237 10차), retried or not.
+      if (filled) {
+        const seen = new Set<string>();
+        q.found = q.found.filter((n) => !seen.has(noteKey(n)) && !!seen.add(noteKey(n)));
+        q.sources = sourceCount(q.found);
+      }
     }
     const files = this.files(row);
     /**
@@ -1351,7 +1356,22 @@ export function mergeUnverified(
 
 /** At most `max` notes for the lead and the writer, taken in turn from each sub-question (none crowds out another). */
 export function pickNotes(s: JobState, max: number): ResearchNote[] {
-  const lists = s.questions.map((q) => [...q.found]);
+  // Each question's notes with one per page first (review #237 10차: a retry's new page must reach the writer even
+  // when an older page has twelve), then the rest in order; questions in turn.
+  const lists = s.questions.map((q) => {
+    const seen = new Set<string>();
+    const firsts: ResearchNote[] = [];
+    const rest: ResearchNote[] = [];
+    for (const n of q.found) {
+      const page = n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`;
+      if (seen.has(page)) rest.push(n);
+      else {
+        seen.add(page);
+        firsts.push(n);
+      }
+    }
+    return [...firsts, ...rest];
+  });
   const out: ResearchNote[] = [];
   for (let i = 0; out.length < max && lists.some((l) => i < l.length); i++)
     for (const l of lists) if (i < l.length && out.length < max) out.push(l[i]!);

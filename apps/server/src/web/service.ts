@@ -8,7 +8,7 @@ import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
-import { cutOutsideGap, hasGapMarks, stripGapMarks, visibleIndex } from "../citations/verify.js";
+import { cutAt, cutOutsideGap, hasGapMarks, stripGapMarks, visibleIndex } from "../citations/verify.js";
 import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
@@ -567,7 +567,8 @@ export class WebService {
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
     const pdf = hasGapMarks(row.contentType);
-    const cutText = text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text;
+    // On a code point (review #237 10차): never half a surrogate pair at the end of the excerpt.
+    const cutText = cutAt(text, EXCERPT_CHARS);
     // A web PDF is shown without its marks' U+E000 and counted as its visible text; other pages as they are.
     const excerpt = pdf ? stripGapMarks(cutText) : cutText;
     return {

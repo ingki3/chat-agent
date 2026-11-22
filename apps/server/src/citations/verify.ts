@@ -461,11 +461,26 @@ export function touchesGap(body: string, start: number, end: number): boolean {
   return gapRanges(body).some(([a, b]) => a < end && start < b);
 }
 
-/** At most `max` characters of `text`, never cutting a mark in two (the cut moves before it). */
+/** `i`, or one before it when `i` would split a surrogate pair. */
+export function codePointCut(text: string, i: number): number {
+  if (i <= 0 || i >= text.length) return i;
+  const hi = text.charCodeAt(i - 1);
+  const lo = text.charCodeAt(i);
+  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff ? i - 1 : i;
+}
+
+/** At most `max` UTF-16 units of `text` on a code-point boundary (never half a surrogate pair). */
+export const cutAt = (text: string, max: number) =>
+  text.length <= max ? text : text.slice(0, codePointCut(text, max));
+
+/**
+ * At most `max` characters of `text`, never cutting a mark in two (the cut moves before it) nor a surrogate pair
+ * (review #237 10차 — half a pair is U+FFFD once stored).
+ */
 export function cutOutsideGap(text: string, max: number): string {
   if (text.length <= max) return text;
   for (const [a, b] of gapRanges(text)) if (a < max && max < b) return text.slice(0, a).trimEnd();
-  return text.slice(0, max);
+  return cutAt(text, max);
 }
 
 /**

@@ -1729,6 +1729,48 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(after.questions[1]!.sources).toBe(1);
   });
 
+  it("restored notes of one passage of one page reached by two URLs become one note (no retry needed)", async () => {
+    const [, B] = FIXTURE_PAGES as [unknown, { url: string; text: string }];
+    const { t2, job } = await resumedWith((state, { db, conversationId, ownerId }) => {
+      const store = new SourceStore(db);
+      const scope = { userId: ownerId, conversationId, runId: "research:old" };
+      const page = (url: string, finalUrl: string, body: string) =>
+        store.addPage(scope, {
+          url,
+          finalUrl,
+          title: "t",
+          site: "s",
+          contentType: "text/html",
+          body,
+          truncated: false,
+        })!.id;
+      const a = page(A.url, A.url, (FIXTURE_PAGES[0] as { text: string }).text);
+      const a2 = page(
+        "https://fixture.agentlee.test/r/chips-a",
+        A.url,
+        (FIXTURE_PAGES[0] as { text: string }).text,
+      );
+      const b = page(B.url, B.url, B.text);
+      Object.assign(state.questions[0]!, { status: "done", retried: true });
+      Object.assign(state.questions[1]!, {
+        status: "done",
+        sources: 3,
+        found: [
+          { id: "n1", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a, title: "t" },
+          { id: "n2", claim: "메모리", quote: RESEARCH_FIXTURE.memory, sourceId: a2, title: "t" },
+          { id: "n3", claim: "통계", quote: RESEARCH_FIXTURE.stats, sourceId: b, title: "t" },
+        ],
+      });
+    });
+    await statusIs(t2.app, job.id, "done");
+    expect(t2.counting.turns.filter((x) => x.includes(RETRY_MARK))).toHaveLength(0);
+    const after = JSON.parse(t2.app.research!.get(job.id)!.state) as {
+      questions: { sources: number; found: { id: string }[] }[];
+    };
+    expect(after.questions[1]!.found.map((n) => n.id)).toEqual(["n1", "n3"]);
+    expect(after.questions[1]!.sources).toBe(2);
+  });
+
   it("resumed where only the reflection then runs (nothing found): no_findings, not server_restart", async () => {
     const { t2, job } = await resumedWith((state) => {
       for (const q of state.questions)

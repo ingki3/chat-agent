@@ -493,8 +493,13 @@ function decode(body, contentType) {
 }
 
 /** @param {string} t */
-const bounded = (t, max) =>
-  t.length > max ? { text: t.slice(0, max), truncated: true } : { text: t, truncated: false };
+const bounded = (t, max) => {
+  if (t.length <= max) return { text: t, truncated: false };
+  // Never half a surrogate pair at the cut (#234): the stored text stays well formed.
+  const hi = t.charCodeAt(max - 1);
+  const end = hi >= 0xd800 && hi <= 0xdbff ? max - 1 : max;
+  return { text: t.slice(0, end), truncated: true };
+};
 
 /**
  * Fetches a page and extracts it.
