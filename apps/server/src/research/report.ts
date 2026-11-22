@@ -526,7 +526,7 @@ export function renderReport(r: ReportInput): string {
   return [
     // Verbatim as code (#233 review 12): the stored report holds the title as written.
     `# ${codeSpan(oneLine(r.title))}`,
-    `> 깊이 조사 보고서 · ${r.date} · 하위 질문 ${r.questions}개 · 출처 ${r.sources.length}개${r.timedOut ? " · 시간 상한으로 일부만 조사" : ""}`,
+    `> 깊이 조사 보고서 · ${r.date} · 하위 질문 ${r.questions}개 · 보고서에 인용한 출처 ${r.sources.length}개${r.timedOut ? " · 시간 상한으로 일부만 조사" : ""}`,
     r.body || "_확인된 근거로 쓸 수 있는 내용이 없었어요._",
     `## 출처\n\n${src.length ? src.join("\n") : "- (없음)"}`,
     `## 한계\n\n${limits.join("\n")}`,

@@ -590,7 +590,7 @@ describe("one number per source (#233)", () => {
     expect(md).toContain(
       "9. `페이지 9`\n   - `구절 9`\n10. `페이지 10`\n    - `구절 10`\n    - `둘째 구절`\n11.",
     );
-    expect(md).toContain("출처 11개");
+    expect(md).toContain("보고서에 인용한 출처 11개");
     // One ordered list, every source's passages inside its own item.
     const html = markdownHtml(md);
     expect(html.match(/<ol/g)).toHaveLength(1);

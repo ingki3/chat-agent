@@ -1283,7 +1283,7 @@ export class ResearchEngine {
     });
     const summary = summaryOf(r.body);
     const text = [
-      `**깊이 조사 보고서**를 만들었어요 — 하위 질문 ${state.questions.length}개, 확인된 출처 ${r.sources.length}개, 확인하지 못해 뺀 문장 ${r.removed}개.${state.timedOut ? " 시간 상한(30분)으로 일부만 조사했어요." : ""}`,
+      `**깊이 조사 보고서**를 만들었어요 — 하위 질문 ${state.questions.length}개, 보고서에 인용한 출처 ${r.sources.length}개, 확인하지 못해 뺀 문장 ${r.removed}개.${state.timedOut ? " 시간 상한(30분)으로 일부만 조사했어요." : ""}`,
       ...(summary ? [`보고서 요약 (출처는 보고서에 있어요):\n\n${summary}`] : []),
     ].join("\n\n");
     state.stage = "end";

@@ -48,3 +48,31 @@ describe("ResearchCard: failure text", () => {
     expect(render(job(null))).toContain("깊이 조사를 마치지 못했어요");
   });
 });
+
+/** The two counts the card shows (#233): what was verified, and what the report cites — different keys, different words. */
+describe("research card counts", () => {
+  it("labels verified material and the report's cited sources apart", () => {
+    const done: ResearchJob = {
+      ...job(null),
+      status: "done",
+      sources: 3,
+      questions: [
+        {
+          id: "q1",
+          question: "하위 질문",
+          scope: "web",
+          round: 0,
+          status: "done",
+          notes: 2,
+          dropped: 0,
+          sources: 3,
+        },
+      ],
+      result: { artifactId: "a1", version: 1, removed: 2, citations: 2, timedOut: false, fallback: false },
+    };
+    const html = render(done);
+    expect(html).toContain("검증한 자료 3개");
+    expect(html).toContain("보고서에 인용한 출처 2개 · 확인하지 못해 뺀 문장 2개");
+    expect(html).not.toMatch(/· 출처 \d/);
+  });
+});

@@ -150,8 +150,8 @@ function Body({ job }: { job: ResearchJob }) {
         <>
           <Questions job={job} />
           <p className="small" data-testid="research-result">
-            출처 {job.result?.citations ?? 0}개 · 확인하지 못해 뺀 문장 {job.result?.removed ?? 0}개
-            {job.result?.timedOut ? " · 시간 상한(30분)으로 일부만 조사" : ""}
+            보고서에 인용한 출처 {job.result?.citations ?? 0}개 · 확인하지 못해 뺀 문장{" "}
+            {job.result?.removed ?? 0}개{job.result?.timedOut ? " · 시간 상한(30분)으로 일부만 조사" : ""}
           </p>
         </>
       );
@@ -373,7 +373,7 @@ function Questions({ job }: { job: ResearchJob }) {
         <li key={q.id} data-testid="research-question" data-status={q.status}>
           <span aria-hidden>{Q_ICON[q.status]}</span>{" "}
           {q.round > 0 ? <span className="chip small">보강</span> : null} {q.question}{" "}
-          <span className="muted small">· 출처 {q.sources}개</span>
+          <span className="muted small">· 검증한 자료 {q.sources}개</span>
         </li>
       ))}
     </ul>
@@ -394,7 +394,7 @@ function Progress({ job }: { job: ResearchJob }) {
   return (
     <>
       <p className="small" data-testid="research-stage">
-        {stage} · 찾은 출처 {job.sources}개 · {minutes(Math.min(elapsed, RESEARCH_LIMITS.totalMs))} / 30분
+        {stage} · 검증한 자료 {job.sources}개 · {minutes(Math.min(elapsed, RESEARCH_LIMITS.totalMs))} / 30분
       </p>
       <Questions job={job} />
       {job.owned && <Actions job={job} stop />}

@@ -51,7 +51,7 @@ test("plan card: edit and approve, live progress, then the verified report", asy
   await expect(reply.getByTestId("artifact-card")).toBeVisible();
   await expect(reply).toContainText("깊이 조사 보고서");
   // Three passages of two pages: two sources (#233).
-  await expect(reply).toContainText("확인된 출처 2개");
+  await expect(reply).toContainText("보고서에 인용한 출처 2개");
   await expect(card.getByTestId("research-stop")).toHaveCount(0);
 });
 
