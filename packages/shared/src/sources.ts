@@ -27,3 +27,35 @@ export type Source = z.infer<typeof Source>;
 
 export const SourcesResponse = z.object({ items: z.array(Source) });
 export type SourcesResponse = z.infer<typeof SourcesResponse>;
+
+/**
+ * What kind of publisher an address belongs to, by its domain alone (#234 — primary sources first): `government`
+ * (`go.kr`, `gov`, `gov.uk`, `mil`, `europa.eu` …), `academic` (`ac.kr`, `edu`, `ac.uk`, Korean research institutes
+ * `re.kr`), `organization` (`or.kr`, `org` — public bodies and associations, but anyone can register `.org`) or
+ * `other`. A hint for the researcher and the report, never a check: a domain says nothing about a page's accuracy.
+ */
+export const SourceType = z.enum(["government", "academic", "organization", "other"]);
+export type SourceType = z.infer<typeof SourceType>;
+
+export function sourceTypeOf(url: string): SourceType {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return "other";
+  }
+  const labels = host.split(".");
+  const tld = labels.at(-1) ?? "";
+  const sld = labels.at(-2) ?? "";
+  if (labels.length < 2) return "other";
+  // A second-level label counts under a country code only (`go.kr`, `ac.uk` — not `ac.example.com`).
+  const cc = labels.length >= 3 && /^[a-z]{2}$/.test(tld);
+  // `gov`, `mil`; `go.kr`, `gov.uk`, `gouv.fr`, `gob.mx`, `govt.nz`; `europa.eu`; `int` (treaty organisations).
+  if (tld === "gov" || tld === "mil" || tld === "int") return "government";
+  if (cc && ["go", "gov", "gouv", "gob", "govt", "mil"].includes(sld)) return "government";
+  if (sld === "europa" && tld === "eu") return "government";
+  if (tld === "edu") return "academic";
+  if (cc && ["ac", "edu", "re"].includes(sld)) return "academic";
+  if (tld === "org" || (cc && sld === "or")) return "organization";
+  return "other";
+}

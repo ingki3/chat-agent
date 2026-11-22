@@ -246,7 +246,16 @@ describe("web fetch: limits, content types, no forwarded credentials", () => {
       ok: false,
       code: "web_timeout",
     });
-    expect(await fetchVia("http://public.test/doc.pdf")).toEqual({ ok: false, code: "web_unsupported_type" });
+    // A PDF (#234) comes back as its bytes, unparsed (the server's extractor reads it); a PDF type that is not one is refused.
+    expect(await fetchVia("http://public.test/doc.pdf")).toMatchObject({
+      ok: true,
+      contentType: "application/pdf",
+      pdf: Buffer.from("%PDF-1.7 ...").toString("base64"),
+    });
+    fx.routes.set("/fake.pdf", { headers: { "content-type": "application/pdf" }, body: "<html>no</html>" });
+    expect(await fetchVia("http://public.test/fake.pdf")).toEqual({ ok: false, code: "web_bad_content" });
+    fx.routes.set("/blob", { headers: { "content-type": "application/octet-stream" }, body: "binary" });
+    expect(await fetchVia("http://public.test/blob")).toEqual({ ok: false, code: "web_unsupported_type" });
     expect(await fetchVia("http://public.test/missing")).toEqual({ ok: false, code: "web_http_error" });
     expect(await fetchVia("http://nowhere.test/")).toEqual({ ok: false, code: "web_unreachable" });
     const plain = await fetchVia("http://public.test/plain.txt");
@@ -501,7 +510,13 @@ describe("web tools on our MCP server", () => {
   it("web_fetch stores the page and gives the model the source id and a bounded, framed excerpt", async () => {
     const f = family();
     const { svc, call, logs } = service(f);
-    expect(svc.toolNamesFor(f.mom.id)).toEqual(["echo_time", "web_fetch", "sources_list", "skill_selftest"]); // no provider: no search
+    expect(svc.toolNamesFor(f.mom.id)).toEqual([
+      "echo_time",
+      "web_fetch",
+      "web_find",
+      "sources_list",
+      "skill_selftest",
+    ]); // no provider: no search
     const r = await call("web_fetch", { url: "http://public.test/article.html" });
     expect(r.isError).toBe(false);
     const [row] = f.sources.list(f.c.id);
@@ -615,8 +630,16 @@ describe("web tools on our MCP server", () => {
         url: "http://public.test/article.html",
         site: "public.test",
         publishedAt: "2026-11-10T01:00:00.000Z",
+        sourceType: "other",
       },
-      { n: 2, sourceId: rows[1]!.id, url: "https://news.test/b", site: "뉴스", publishedAt: null },
+      {
+        n: 2,
+        sourceId: rows[1]!.id,
+        url: "https://news.test/b",
+        site: "뉴스",
+        publishedAt: null,
+        sourceType: "other",
+      },
     ]);
     const content = String(r.body.content);
     expect(content.match(/<\/external_content>/g)).toHaveLength(1); // the snippet cannot close the block
@@ -809,6 +832,7 @@ describe("web tools on our MCP server", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "web_find",
       "sources_list",
       "skill_selftest",
       "skill_google-news-search-skill",

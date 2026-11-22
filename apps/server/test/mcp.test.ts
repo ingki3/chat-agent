@@ -566,6 +566,7 @@ describe("runs give runtimes our MCP server (#43)", () => {
       "echo_time",
       "web_search",
       "web_fetch",
+      "web_find",
       "sources_list",
       "cite",
       "artifact_create",

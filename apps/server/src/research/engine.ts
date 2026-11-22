@@ -10,6 +10,7 @@ import {
   type ResearchPlan,
   type ResearchScope,
   type ResearchStatus,
+  sourceTypeOf,
 } from "@agentlee/shared";
 import type { ArtifactStore } from "../artifacts/store.js";
 import type { UserStore } from "../auth/users.js";
@@ -31,6 +32,7 @@ import type { DocSet } from "../memory/inject.js";
 import type { PublishInput } from "../notifications/compose.js";
 import type { RuntimeAdapter, RuntimeRegistry, UsageReport } from "../runtime/adapter.js";
 import type { SessionRef } from "../runtime/runs.js";
+import { closestPassage } from "../citations/passages.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { UsageAttempt } from "../usage/store.js";
 import type { SourceStore } from "../web/sources.js";
@@ -175,6 +177,8 @@ const ACTIVE: ResearchStatus[] = ["planning", "researching", "writing"];
 /** The writer needs at least this much: less, and the report is the verified passages themselves. */
 const MIN_WRITE_MS = 30_000;
 const REFLECT_MS = 90_000;
+/** Unverified claims kept per sub-question run (for its retry and the lead's reflection). */
+const UNVERIFIED_KEPT = 5;
 
 function anySignal(...signals: AbortSignal[]): AbortSignal {
   const c = new AbortController();
@@ -719,8 +723,13 @@ export class ResearchEngine {
       row.deadlineAt - this.limits.writeMs - this.limits.wrapUpMs,
     );
     // A restart: what was running is asked again from scratch.
+    // A retry (#234) keeps what its first run verified.
     for (const q of state.questions)
-      if (q.status === "running") Object.assign(q, { status: "waiting", found: [], sources: 0, dropped: 0 });
+      if (q.status === "running")
+        Object.assign(
+          q,
+          q.retried ? { status: "waiting" } : { status: "waiting", found: [], sources: 0, dropped: 0 },
+        );
     const stage = new AbortController();
     const cancel = this.clock.timer(researchEnd - this.clock.now(), () => stage.abort());
     const signal = anySignal(live.abort.signal, stage.signal, live.cap!.signal);
@@ -736,10 +745,18 @@ export class ResearchEngine {
             if (!ctx) return;
             q.status = "running";
             persist();
+            // A retry (#234) keeps what the first run verified and is told what it found and what failed.
+            const before = q.retried ? q.found : [];
             const r = await this.step(row, ctx, {
-              name: q.id,
+              name: q.retried ? `${q.id}:retry` : q.id,
               prompt: "subagent",
-              text: subagentTurn({ question: row.question, plan, sub: q, files }),
+              text: subagentTurn({
+                question: row.question,
+                plan,
+                sub: q,
+                files,
+                ...(q.retried ? { retry: { found: before, unverified: q.unverified ?? [] } } : {}),
+              }),
               tools: this.toolsFor(row.ownerId, toolsOf(q.scope)),
               ms: Math.min(this.limits.subagentMs, researchEnd - this.clock.now()),
               toolCalls: this.limits.subagentToolCalls,
@@ -747,10 +764,13 @@ export class ResearchEngine {
             });
             if (live.abort.signal.aborted) return;
             const raw = parseNotes(r.text, this.limits.notesPerQuestion);
-            const notes = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
+            const checked = await this.verifyNotes(row, raw, new Set(files.map((f) => f.id)));
+            const notes = mergeNotes(before, checked.notes, this.limits.notesPerQuestion);
             q.found = notes;
             q.sources = sourceCount(notes);
-            q.dropped = raw.length - notes.length;
+            q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
+            q.unverified = checked.unverified;
+            q.repaired = (q.retried ? (q.repaired ?? 0) : 0) + checked.repaired;
             q.status =
               r.ended === "done"
                 ? "done"
@@ -770,9 +790,31 @@ export class ResearchEngine {
             state.timedOut = true;
           break;
         }
-        if (state.round >= this.limits.maxDepth || state.reflected >= state.round) break;
         // Not enough time for another round: straight to writing (the forced wrap-up).
         if (researchEnd - this.clock.now() < this.limits.minRoundMs) break;
+        // Weak sub-questions (#234) — no verified note, or one source only — are researched once more with rewritten
+        // queries, whether or not the lead names them: within the same budgets, before the lead looks for gaps.
+        const weak = state.questions.filter(
+          (q) =>
+            !q.retried &&
+            (q.status === "done" || q.status === "capped") &&
+            (q.found.length === 0 || q.sources <= 1),
+        );
+        if (weak.length) {
+          for (const q of weak) Object.assign(q, { retried: true, status: "waiting" });
+          logEvent(this.deps.log, "info", "research.retry", {
+            userId: row.ownerId,
+            researchId: row.id,
+            count: weak.length,
+          });
+          persist();
+          continue;
+        }
+        // One more gap round than `maxDepth` only while plenty of research time is left (#234).
+        const depth =
+          this.limits.maxDepth +
+          (researchEnd - this.clock.now() >= this.limits.extraRoundMs ? this.limits.extraDepth : 0);
+        if (state.round >= depth || state.reflected >= state.round) break;
         const notes = allNotes(state);
         const ctx = fresh();
         if (!ctx) return void this.fail(row.id, ended!, live);
@@ -785,6 +827,7 @@ export class ResearchEngine {
             scopes: state.scopes ?? ["web"],
             asked: state.questions.map((q) => q.question),
             notes: pickNotes(state, this.limits.maxNotes),
+            unverified: state.questions.flatMap((q) => q.unverified ?? []).slice(0, UNVERIFIED_KEPT * 2),
           }),
           tools: [],
           ms: Math.min(REFLECT_MS, researchEnd - this.clock.now()),
@@ -827,20 +870,40 @@ export class ResearchEngine {
     this.save(row.id, { status: "writing", state }, ["researching"], live);
   }
 
-  /** The notes whose passage the server finds in their page (a source of the conversation) or attached file. */
+  /**
+   * The notes whose passage the server finds in their page (a source of the conversation) or attached file. A web
+   * note whose quote is not in its page is repaired first (#234): the page's own passage closest to the quote
+   * (`closestPassage` — the same words, every number, no rival passage) replaces it and is checked again, exactly, as
+   * any quote. Claims that still fail come back as `unverified` (the retry and the lead see them).
+   */
   private async verifyNotes(
     row: ResearchJobRow,
     raw: RawNote[],
     files: ReadonlySet<string>,
-  ): Promise<ResearchNote[]> {
+  ): Promise<{ notes: ResearchNote[]; unverified: string[]; repaired: number }> {
     const scope = { conversationId: row.conversationId, userId: row.ownerId };
     const out: ResearchNote[] = [];
     const seen = new Set<string>();
+    const unverified: string[] = [];
+    let repaired = 0;
     for (const n of raw) {
       let note: ResearchNote | undefined;
       try {
         if (n.sourceId) {
-          const r = this.deps.citations.recheck(scope, { sourceId: n.sourceId, snippet: n.quote });
+          let r = this.deps.citations.recheck(scope, { sourceId: n.sourceId, snippet: n.quote });
+          if (r && r.status === "snippet_not_found" && r.source.kind === "page" && r.source.body) {
+            const near = closestPassage(r.source.body, scrubKnown(n.quote));
+            if (near.kind === "match") {
+              const again = this.deps.citations.recheck(scope, {
+                sourceId: n.sourceId,
+                snippet: near.passage,
+              });
+              if (again?.status === "verified" && again.quote) {
+                r = again;
+                repaired++;
+              }
+            }
+          }
           if (r?.status === "verified" && r.quote)
             note = {
               id: "",
@@ -848,6 +911,7 @@ export class ResearchEngine {
               quote: r.quote,
               sourceId: r.source.id,
               title: r.source.title,
+              sourceType: sourceTypeOf(r.source.finalUrl ?? r.source.url),
             };
         } else if (n.fileId && files.has(n.fileId) && this.deps.fileTools) {
           const f = this.deps.fileTools.fileFor(scope, n.fileId);
@@ -869,13 +933,20 @@ export class ResearchEngine {
       } catch {
         note = undefined;
       }
-      if (!note) continue;
+      if (!note) {
+        if (unverified.length < UNVERIFIED_KEPT) unverified.push(scrubKnown(n.claim).slice(0, 300));
+        continue;
+      }
       const key = `${note.sourceId ?? note.fileId}\n${note.quote}`;
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(note);
     }
-    return out.map((n, i) => ({ ...n, id: `${crypto.randomUUID().slice(0, 8)}-${i}` }));
+    return {
+      notes: out.map((n, i) => ({ ...n, id: `${crypto.randomUUID().slice(0, 8)}-${i}` })),
+      unverified,
+      repaired,
+    };
   }
 
   // ---- 3. write ----
@@ -1124,12 +1195,26 @@ export class ResearchEngine {
 
 /** Our tools a sub-researcher of this scope gets. */
 export function toolsOf(scope: ResearchScope): string[] {
-  const web = ["web_search", "web_fetch"];
+  const web = ["web_search", "web_fetch", "web_find"];
   const files = ["file_search", "file_read"];
   return scope === "web" ? web : scope === "files" ? files : [...web, ...files];
 }
 
 const allNotes = (s: JobState) => s.questions.flatMap((q) => q.found);
+
+/** A retry's notes after the first run's (#234): the same passage of the same source once, at most `max`. */
+export function mergeNotes(before: ResearchNote[], after: ResearchNote[], max: number): ResearchNote[] {
+  const key = (n: ResearchNote) => `${n.sourceId ?? n.fileId}\n${n.quote}`;
+  const seen = new Set(before.map(key));
+  const out = [...before];
+  for (const n of after) {
+    if (out.length >= max) break;
+    if (seen.has(key(n))) continue;
+    seen.add(key(n));
+    out.push(n);
+  }
+  return out;
+}
 
 /** At most `max` notes for the lead and the writer, taken in turn from each sub-question (none crowds out another). */
 export function pickNotes(s: JobState, max: number): ResearchNote[] {

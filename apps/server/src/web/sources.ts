@@ -226,6 +226,16 @@ export class SourceStore {
   }
 
   /**
+   * One page of the token's conversation with its (scrubbed) text — `web_find` (#234). Undefined when the token's
+   * user does not own the conversation or the row is not theirs.
+   */
+  getFor(scope: SourceScope, id: string): SourceRow | undefined {
+    if (!this.owns(scope)) return undefined;
+    const row = this.get(scope.conversationId, id);
+    return row && row.userId === scope.userId ? row : undefined;
+  }
+
+  /**
    * One source of one conversation, with its body — for the citation check (#25), which cites by source id.
    * An id from another conversation is not found.
    */

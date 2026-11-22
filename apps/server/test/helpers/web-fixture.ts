@@ -45,7 +45,12 @@ export const ARTICLE = `<!doctype html><html><head><meta charset="utf-8">
 </article>
 <footer>FOOTER_TEXT 저작권</footer></body></html>`;
 
-export type FixtureRoute = { status?: number; headers?: Record<string, string | string[]>; body?: string };
+export type FixtureRoute = {
+  status?: number;
+  headers?: Record<string, string | string[]>;
+  /** Text (UTF-8) or bytes as they are (a PDF, #234). */
+  body?: string | Buffer;
+};
 
 export type WebFixture = {
   proxy: RunningEgress;

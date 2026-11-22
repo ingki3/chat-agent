@@ -278,8 +278,8 @@ exports[`cleanReport: the review corpus (#212) > cleans all 23 inputs as approve
 exports[`the step prompts (versioned like the system instructions) > has every prompt with its header, numbers filled in 1`] = `
 {
   "plan": "plan@2",
-  "reflect": "reflect@2",
-  "subagent": "subagent@1",
+  "reflect": "reflect@3",
+  "subagent": "subagent@2",
   "writer": "writer@4",
 }
 `;

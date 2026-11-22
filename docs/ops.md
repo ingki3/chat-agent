@@ -609,9 +609,9 @@ pnpm skills:status                        # 설치 상태·python·설정된 비
 - 대화 주인은 `GET /api/conversations/<id>/sources`로 목록을 본다(본문 제외). 관리자도 남의 목록은 못 본다.
 
 ### 17.3 막히는 것과 로그
-- 이 Mac·집 네트워크 주소(루프백·사설·링크 로컬·메타데이터), `localhost`·`.local` 같은 이름, 80/443 밖 포트, http/https가 아닌 주소, PDF, 3MB 넘는 응답, 20초 넘는 가져오기, 5번 넘는 리다이렉트는 거부된다. 모델은 `web_*` 코드만 본다.
+- 이 Mac·집 네트워크 주소(루프백·사설·링크 로컬·메타데이터), `localhost`·`.local` 같은 이름, 80/443 밖 포트, http/https가 아닌 주소, 3MB 넘는 응답(PDF는 10MB), 20초 넘는 가져오기, 5번 넘는 리다이렉트는 거부된다. 모델은 `web_*` 코드만 본다.
 - 로그에는 호출마다 `web.finished`(도구 이름, 결과 코드 `webCode`, 소요 시간, ID)만 남는다. URL·호스트·검색어·본문은 남지 않는다. 어떤 사이트에서 막혔는지는 로그로 알 수 없다(의도).
-- 자주 보이는 코드: `web_blocked`(정책 거부), `web_unreachable`(연결 실패·없는 이름), `web_no_text`(스크립트로만 그리는 페이지), `web_unsupported_type`(PDF 등), `web_search_blocked`(DuckDuckGo 봇 확인), 로그에만 남는 `web_secret_blocked`(요청에 알려진 비밀 — 모델에게는 `web_blocked`·빈 검색, §40).
+- 자주 보이는 코드: `web_blocked`(정책 거부), `web_unreachable`(연결 실패·없는 이름), `web_no_text`(스크립트로만 그리는 페이지), `web_unsupported_type`(이미지·압축 파일 등 — PDF는 #234부터 읽는다, §50.7), `web_search_blocked`(DuckDuckGo 봇 확인), 로그에만 남는 `web_secret_blocked`(요청에 알려진 비밀 — 모델에게는 `web_blocked`·빈 검색, §40).
 
 ## 18. 아티팩트 (#27)
 방식과 근거는 `docs/decisions/isolation.md` "아티팩트 서빙 (#27)"에 있다.
@@ -2370,7 +2370,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 
 ### 50.1 쓰는 연결과 비용
 - 그 대화의 Claude 연결·모델·추론 강도로 돈다(개인 연결이 먼저, 없으면 공용 — 대화와 같음). Codex 대화에서는 버튼이 비활성화된다.
-- 한 작업은 리드 계획 1번 + 서브 연구자(하위 질문마다 1번, 보강 포함 최대 12번 정도) + 보강 판단(최대 2번) + 작성 1번의 **일회성 세션**이다. 사용량은 관리자 → 사용량에 `깊이 조사`(`research`) 분류로, 단계마다(`run_id = research:<작업>:<단계>`) 쌓인다. 사용자별 횟수 한도는 없고 한 사람당 동시에 하나만 돈다.
+- 한 작업은 리드 계획 1번 + 서브 연구자(하위 질문마다 1번, 근거가 약한 하위 질문은 한 번 더 — §50.7, 보강 포함 최대 20번 정도) + 보강 판단(최대 2번, 시간이 넉넉하면 3번) + 작성 1번의 **일회성 세션**이다. 사용량은 관리자 → 사용량에 `깊이 조사`(`research`) 분류로, 단계마다(`run_id = research:<작업>:<단계>`) 쌓인다. 사용자별 횟수 한도는 없고 한 사람당 동시에 하나만 돈다.
 - 비싼 모델(Opus)을 쓰는 대화에서 시작하면 그 모델로 모든 단계를 돈다. 비용이 걱정되면 대화의 모델을 바꾼 뒤 시작한다.
 
 ### 50.2 시간과 재시작
@@ -2382,7 +2382,7 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 `research_done`(완료)·`research_failed`(실패·중지·근거 없음): 알림함 + 웹 푸시, 본문은 주제 앞부분 한 줄. 방해 금지 시간이면 알림함에만(끝나면 묶어서 푸시). 각자 설정 → 알림 → **깊이 조사 알림**에서 끈다.
 
 ### 50.4 로그·저장
-- 로그: `research.started`·`approved`·`resumed`·`stopped`·`done`·`failed` — 작업 id(`researchId`), 사용자 id, 개수, 고정 실패 코드(`researchCode`)만. 질문·계획·노트·보고서는 남지 않는다.
+- 로그: `research.started`·`approved`·`resumed`·`retry`(#234 — 다시 조사한 하위 질문 수)·`stopped`·`done`·`failed` — 작업 id(`researchId`), 사용자 id, 개수, 고정 실패 코드(`researchCode`)만. 질문·계획·노트·보고서는 남지 않는다.
 - 저장(0036 마이그레이션): `research_jobs`(질문, 계획, 체크포인트 — 노트에 페이지·파일 구절이 들어 있다, 결과 id·개수), `notification_prefs.research_done`·`research_failed`. 쓸 때마다 알려진 비밀 값을 가리고 재가림 대상이다. 대화·사용자 삭제 시 함께 지워지고 백업·복원에 그대로 포함된다(복원 뒤 진행 중이던 작업은 50.2처럼 이어지거나 끝난다).
 - 프롬프트: `apps/server/instructions/deep-research/{plan,subagent,reflect,writer}.md`(버전 머리말). 고치면 `version`을 올리고 `apps/server/test/__snapshots__/research-report.test.ts.snap`을 갱신한다(`pnpm vitest run apps/server/test/research-report.test.ts -u`, 바뀐 글을 리뷰에서 확인).
 
@@ -2390,5 +2390,12 @@ YouTube가 바뀌면 오래된 yt-dlp는 자주 깨진다(봇 확인·`n` 값·�
 Gemini Deep Research·OpenAI deep research 같은 외부 백엔드는 다음 단계(#211 2단계)에 붙인다: 관리자가 키·허용 여부를 정하고(공용 연결처럼 암호화 저장), 계획 카드에서 고르며, 외부로 질문(과 고른 첨부)이 간다는 안내, 청소년 기본 끔. 지금은 백엔드 인터페이스(`apps/server/src/research/backend.ts`)만 있고 설정할 것이 없다.
 
 ### 50.6 시험
-- `pnpm vitest run apps/server/test/research.test.ts apps/server/test/research-report.test.ts` — FakeRuntime·수동 시계로 전 과정(실제 검색·외부 호출 없음).
+- `pnpm vitest run apps/server/test/research.test.ts apps/server/test/research-report.test.ts apps/server/test/research-limits.test.ts` — FakeRuntime·수동 시계로 전 과정, PDF 읽기·`web_find`·노트 고치기(실제 검색·외부 호출 없음, PDF는 시험 안에서 pdfkit으로 만든다).
 - `E2E_PORT=3211 pnpm e2e e2e/deep-research.spec.ts`(먼저 `pnpm build`) — 계획 카드·진행·중지·Codex 대화.
+
+### 50.7 조사 한계 줄이기 (#234)
+- **PDF 읽기**: `web_fetch`가 PDF(`application/pdf`, 또는 형식 없는·`octet-stream` 응답이 `%PDF-`로 시작)를 10MB까지 받는다. 웹 작업자는 PDF를 해석하지 않고 바이트만 돌려주고(작업자 출력 상한 16MB), 서버가 **업로드 파일과 같은 문서 추출기**(#48, pdf.js — 샌드박스·네트워크 없음, 작업자 계정이 있으면 그 계정 #122)로 글자를 뽑는다. OCR은 끈다(스캔 PDF는 `web_no_text`). 임시 사본은 `uploads-tmp/web-pdf-<uuid>.pdf`(0600)로 만들고 바로 지운다(서버 시작 때 폴더째 비움). 동시에 2개까지. 제목이 없으면 주소의 파일 이름. 추출 실패는 `web_bad_content`·`web_timeout`·`web_too_large`·`web_unavailable`.
+- **`web_find`**(서버 MCP 도구, 웹 도구와 같이 제공): 이 대화에서 가져온 페이지의 **저장된 전체 본문**에서 구절·낱말을 찾아 앞뒤 문맥과 함께(구절 하나 700자, 최대 8개) 돌려준다. 모델이 보는 `web_fetch` 발췌는 앞 1만 자뿐이라 긴 공식 문서의 뒤쪽은 이것으로 찾는다. 남의 대화·사용자의 sourceId는 `unknown_source`, 검색 결과(본문 없음)는 `fetch_failed`. 로그는 `citation.finished`의 `citeCode` `find_found`·`find_none`.
+- **노트 고치기**: 서브 연구자 노트의 구절이 원문과 정확히 맞지 않으면 버리기 전에, 그 페이지 본문에서 같은 낱말(조사를 뗀 낱말의 75% 이상, 4개 이상)과 **같은 숫자를 모두** 가진 1–3문장 구절(500자 안)을 찾는다. 뚜렷한 하나가 있으면(비슷하게 맞는 다른 구절이 있으면 포기) 그 **원문 구절로 바꿔 다시 정확 대조**하고, 통과하면 남긴다 — 검증 기준은 그대로다. 파일 노트는 고치지 않는다.
+- **자동 재조사**: 확인된 노트가 0개이거나 출처가 1개뿐인 하위 질문은 리드가 지목하지 않아도 **한 번** 검색어를 바꿔 다시 조사한다(같은 도구 12번·6분, 동시 3개, 조사 예산이 3분 넘게 남았을 때만). 첫 조사의 노트는 남고, 확인하지 못한 주장 목록이 재조사와 리드의 보강 판단에 들어간다. 조사 예산이 8분 넘게 남았으면 보강 단계를 하나 더(최대 3) 허용한다.
+- **1차 자료 우선**: 서브 연구자 프롬프트(`subagent.md` v2)가 정부·공공기관·대학·연구기관 자료를 먼저 찾게 한다. `web_fetch`·`web_search`·`sources_list` 결과와 노트에 도메인으로 정한 `sourceType`(`government`·`academic`·`organization`·`other`, `sourceTypeOf`)이 붙는다 — 판단의 참고일 뿐 검증이 아니다. 보고서 출처 목록에 표시하는 것은 #233.

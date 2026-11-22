@@ -3,11 +3,12 @@ import net from "node:net";
 import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
 import type { SearchHit } from "@agentlee/mcp-tools/skills";
 import { WEB_WORKER_DIR, WEB_WORKER_ENTRY } from "@agentlee/mcp-tools/web";
-import { defuseExternal, frameExternal } from "@agentlee/shared";
+import { defuseExternal, frameExternal, sourceTypeOf } from "@agentlee/shared";
 import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
+import { PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
 import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
 /**
@@ -56,7 +57,21 @@ const code = (c: unknown): WebCode => (typeof c === "string" && KNOWN.has(c) ? (
 export const MAX_REDIRECTS = 5;
 export const FETCH_MS = 20_000;
 
-/** Characters of page text the model gets back from one fetch (the stored body is longer). */
+/** A PDF's title when it has none of its own: the file name of its address ("2027 시행계획.pdf"). */
+export function pdfTitle(u: URL): string | undefined {
+  const last = u.pathname.split("/").filter(Boolean).at(-1);
+  if (!last) return undefined;
+  try {
+    return cut(decodeURIComponent(last), SOURCE_LIMITS.title) || undefined;
+  } catch {
+    return cut(last, SOURCE_LIMITS.title) || undefined;
+  }
+}
+
+/**
+ * Characters of page text the model gets back from one fetch (the stored body is longer — `web_find` searches it,
+ * #234).
+ */
 export const EXCERPT_CHARS = 10_000;
 export const MAX_URL = SOURCE_LIMITS.url;
 
@@ -145,7 +160,8 @@ export type WebWorker = (job: WorkerJob, proxy: { url: string; port: number }) =
 
 export const WORKER_LIMITS = {
   timeoutMs: 30_000,
-  maxOutputBytes: 4 * 1024 * 1024,
+  // A PDF's bytes come back base64 (worker.mjs `maxPdfBytes`, 10 MB → 13.4 MB of text, #234).
+  maxOutputBytes: 16 * 1024 * 1024,
   maxRssBytes: 256 * 1024 * 1024,
 };
 
@@ -337,6 +353,11 @@ export type WebServiceOptions = {
   fetchProxy?: Proxy;
   /** Whether the calling run may still store what it fetched (false once it was stopped). Default: always. */
   alive?: (scope: ToolScope) => boolean;
+  /**
+   * A PDF's text (#234): the document extractor in its sandbox (`web/pdf.ts`). Without it a PDF is
+   * `web_unsupported_type`, as before.
+   */
+  pdf?: PdfReader;
 };
 
 export class WebService {
@@ -433,6 +454,8 @@ export class WebService {
       url: hit.url,
       site: hit.site,
       publishedAt: hit.publishedAt ?? null,
+      // Primary sources first (#234): the address's kind ("official", "academic", null).
+      sourceType: sourceTypeOf(hit.url),
     });
     const assemble = (hits: (SearchHit & { site: string })[], ids: (string | null)[]) => ({
       provider,
@@ -487,9 +510,23 @@ export class WebService {
     // keeps `web_secret_blocked` (#113 review: no answer tells a known secret apart).
     if (!r.ok && r.code === "web_secret_blocked") return markBlocked({ ok: false, code: "web_blocked" });
     if (!r.ok) return { ok: false, code: code(r.code) };
-    const text = typeof r.text === "string" ? r.text : "";
     const finalUrl = typeof r.finalUrl === "string" ? linkOf(r.finalUrl) : undefined;
     if (!finalUrl) return { ok: false, code: "web_failed" };
+    let text = typeof r.text === "string" ? r.text : "";
+    let truncated = r.truncated === true;
+    let title = typeof r.title === "string" ? r.title : undefined;
+    if (typeof r.pdf === "string") {
+      // A PDF (#234): its bytes, read by the document extractor (sandboxed, no network, no OCR).
+      if (!this.opts.pdf) return { ok: false, code: "web_unsupported_type" };
+      const bytes = Buffer.from(r.pdf, "base64");
+      if (bytes.subarray(0, 5).toString("latin1") !== "%PDF-") return { ok: false, code: "web_bad_content" };
+      if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
+      const p = await this.opts.pdf(bytes);
+      if (!p.ok) return { ok: false, code: p.code };
+      text = p.text.length > PDF_TEXT_CHARS ? p.text.slice(0, PDF_TEXT_CHARS) : p.text;
+      truncated = p.truncated || p.text.length > PDF_TEXT_CHARS;
+      title ??= pdfTitle(finalUrl);
+    }
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
     const site = s(r.site) ?? siteOf(finalUrl);
@@ -498,12 +535,12 @@ export class WebService {
     const row = this.opts.sources.addPage(scope, {
       url: checked.url.toString(),
       finalUrl: finalUrl.toString(),
-      title: s(r.title) ?? site,
+      title: s(title) ?? site,
       site,
       publishedAt: isoOf(s(r.publishedAt)),
       contentType: s(r.contentType) ?? "text/plain",
       body: text,
-      truncated: r.truncated === true,
+      truncated,
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
     const excerpt = text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text;
@@ -517,6 +554,8 @@ export class WebService {
         site: row.site,
         publishedAt: row.publishedAt,
         contentType: row.contentType,
+        // Official / academic / other by the address (#234): primary sources first.
+        sourceType: sourceTypeOf(row.finalUrl ?? row.url),
         characters: text.length,
         excerptCharacters: excerpt.length,
         truncated: row.truncated,

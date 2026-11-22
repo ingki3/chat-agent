@@ -5,8 +5,9 @@ import {
   ResearchResult,
   type ResearchErrorCode,
   type ResearchJob,
-  type ResearchQuestionState,
+  ResearchQuestionState,
   type ResearchStatus,
+  type SourceType,
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { researchJobs } from "../db/schema.js";
@@ -30,10 +31,22 @@ export type ResearchNote = {
   page?: number | undefined;
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
+  /** A web note's publisher kind by its domain (#234, `sourceTypeOf`): for the writer and the report (#233). */
+  sourceType?: SourceType | undefined;
 };
 
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
-export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & { found: ResearchNote[] };
+export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & {
+  found: ResearchNote[];
+  /**
+   * It was researched once more with rewritten queries (#234: no verified note, or one source only) — at most once.
+   */
+  retried?: boolean | undefined;
+  /** Claims of its last run whose quote could not be verified, nor repaired (the retry and the lead see them). */
+  unverified?: string[] | undefined;
+  /** Notes kept because their quote was repaired to the page's own passage (`closestPassage`). */
+  repaired?: number | undefined;
+};
 
 /** The checkpoint (`research_jobs.state`): written after every step. */
 export type JobState = {
@@ -104,6 +117,8 @@ export function sourceCount(notes: readonly ResearchNote[]): number {
   return new Set(notes.map((n) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`))).size;
 }
 
+const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));
+
 /** The job as the API shows it (owner or share recipient). Notes stay on the server. */
 export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: number }): ResearchJob {
   const s = stateOf(row);
@@ -119,7 +134,14 @@ export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: 
     plan,
     stage: s.stage,
     round: s.round,
-    questions: s.questions.map(({ found, ...q }) => ({ ...q, notes: found?.length ?? 0 })),
+    // Only the API's fields: the notes and the retry's bookkeeping (#234) stay on the server.
+    questions: s.questions.map(
+      (q) =>
+        ({
+          ...Object.fromEntries(Object.entries(q).filter(([k]) => QUESTION_KEYS.has(k))),
+          notes: q.found?.length ?? 0,
+        }) as ResearchQuestionState,
+    ),
     sources: sourceCount(notes),
     // Planning time (before approval) plus the time since approval; the wait at the plan card does not count.
     elapsedMs: Math.max(

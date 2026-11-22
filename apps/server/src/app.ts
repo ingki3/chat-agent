@@ -104,6 +104,7 @@ import { YoutubeAudioFetcher } from "./youtube/service.js";
 import { accountFromConfig, type ProbeRunner } from "./python/account.js";
 import { workerAccountFromConfig, type WorkerKind } from "./workers/account.js";
 import { accountOrSandboxDocRunner } from "./workers/docgen.js";
+import { extractorPdfReader } from "./web/pdf.js";
 import { accountOrSandboxExtractor } from "./workers/extract.js";
 import {
   computeFingerprints,
@@ -656,6 +657,21 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       { log: app.log, onReplaced: () => storedRescrub.cleanup(), ...opts.extract },
     );
     app.decorate("fileExtracts", fileExtracts);
+    // PDF pages of web_fetch (#234): the same extractor and sandbox, without OCR (a scan has no text to read).
+    const noOcr = (): OcrCapability => ({ available: false, reason: "not used for web pages" });
+    const webPdf = extractorPdfReader(
+      opts.extract?.runner ??
+        (extractorKind(config) === "in-process"
+          ? inProcessExtractor(noOcr)
+          : accountOrSandboxExtractor(
+              () => workerGates.verified("extract"),
+              sandboxedExtractor(noOcr),
+              config.dataDir,
+              noOcr,
+              () => sameUidUse("extract"),
+            )),
+      storagePaths(config.dataDir).uploadsTmp,
+    );
     app.addHook("onReady", async () => {
       const count = fileExtracts.resume();
       if (count) logEvent(app.log, "info", "file.extract_resumed", { count });
@@ -851,6 +867,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
         sources,
         citations,
         providers: config.webSearchProviders,
+        pdf: webPdf,
         // The FakeRuntime mode (e2e, local tries) answers the citation fixture pages in-process (no network).
         ...(config.fakeRuntime ? { worker: fixtureWebWorker(sandboxedWorker()) } : {}),
         ...opts.web,

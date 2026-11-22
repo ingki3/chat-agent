@@ -1,4 +1,4 @@
-import { TURN_MARK } from "../research/prompts.js";
+import { RETRY_MARK, TURN_MARK } from "../research/prompts.js";
 import { FIXTURE_PAGES, type FixturePage } from "./fake-citations.js";
 import type { FakeStep } from "./fake.js";
 
@@ -9,6 +9,7 @@ import type { FakeStep } from "./fake.js";
  * - plan: two sub-questions on the October chip exports (a question with "모호" first asks one clarifying question);
  * - sub-researchers: real `web_fetch` calls, `NOTE` lines with the fetched `sourceId`s — one note quotes words the page
  *   does not have (the server drops it); "느린 조사" in the question makes each take 2.5 s (the progress e2e);
+ * - a retry of a weak sub-question (#234 — the background question rests on one page): nothing new, at once;
  * - reflection: no gaps;
  * - writer: real `cite` calls for the notes it was given and one with a passage no page has, then a report in which
  *   one sentence leans on that failed citation and one has none — both are removed by the server.
@@ -46,6 +47,7 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     ];
   }
   if (t.startsWith(TURN_MARK.subagent)) {
+    if (t.includes(RETRY_MARK)) return [{ text: "DONE" }];
     const slow = /느린 조사/.test(t) ? [{ delayMs: 2500 }] : [];
     if (/증가율/.test(t))
       return [

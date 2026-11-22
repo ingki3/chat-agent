@@ -1131,6 +1131,7 @@ describe("cite and sources_list on our MCP server (#25)", () => {
     expect(svc.toolNamesFor(f.mom.id)).toEqual([
       "echo_time",
       "web_fetch",
+      "web_find",
       "sources_list",
       "cite",
       "skill_selftest",

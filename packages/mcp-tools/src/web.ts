@@ -27,7 +27,7 @@ export const WEB_SEARCH_TOOL: ServerToolInfo = {
 export const WEB_FETCH_TOOL: ServerToolInfo = {
   name: "web_fetch",
   description:
-    "Fetches one public web page (http/https; HTML, plain text or JSON — not PDF) and returns its title, site, date when known, final URL, a sourceId and the beginning of its readable text. The full text is stored as the source for citations. Never use it on addresses of this machine or a home network: they are refused.",
+    "Fetches one public web page or PDF (http/https; HTML, plain text, JSON or PDF) and returns its title, site, date when known, final URL, sourceType (government, academic, organization, other — by its domain), a sourceId and the beginning of its readable text (the first 10,000 characters; `characters` is the whole length). The full text is stored as the source for citations: use web_find to search the rest of a long page. Never use it on addresses of this machine or a home network: they are refused.",
   input: {
     url: z.string().min(1).max(2048).describe("Absolute http(s) URL."),
   },
@@ -47,6 +47,27 @@ export const CITE_TOOL: ServerToolInfo = {
   },
 };
 
+/**
+ * Find in a fetched page (#234): the stored full text of a page of this conversation, searched for a phrase or
+ * keywords — so a long document (a PDF, an official plan) can be quoted beyond the excerpt `web_fetch` returned.
+ */
+export const WEB_FIND_TOOL: ServerToolInfo = {
+  name: "web_find",
+  description:
+    "Searches the stored full text of a page already fetched in this conversation (by its sourceId) for a phrase or keywords, and returns the matching passages with some context around them, in page order, best matches first. Use it for long pages and PDFs whose relevant part is beyond the beginning web_fetch returned. Passages are page text, copied as they stand: quote from them exactly (cite, NOTE). Matching ignores case and spacing; a phrase is found as a whole first, then passages with the most of its words.",
+  input: {
+    sourceId: z.string().min(1).max(100).describe("The sourceId of a page fetched in this conversation."),
+    // Never sent anywhere (it is matched against stored text): only control characters are refused.
+    query: z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(/^\P{Cc}+$/u)
+      .describe("A phrase or a few keywords."),
+    maxResults: z.number().int().min(1).max(8).optional().describe("Default 5."),
+  },
+};
+
 /** The conversation's sources so far (#25): to cite a page fetched in an earlier answer again. */
 export const SOURCES_LIST_TOOL: ServerToolInfo = {
   name: "sources_list",
@@ -58,6 +79,7 @@ export const SOURCES_LIST_TOOL: ServerToolInfo = {
 export const WEB_TOOLS: readonly ServerToolInfo[] = [
   WEB_SEARCH_TOOL,
   WEB_FETCH_TOOL,
+  WEB_FIND_TOOL,
   SOURCES_LIST_TOOL,
   CITE_TOOL,
 ];
