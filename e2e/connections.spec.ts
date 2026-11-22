@@ -11,6 +11,9 @@ test("a member adds an API key, tests it and disconnects it; the key never comes
   await page.goto("/settings");
   const section = page.locator("#connections");
   await expect(section.getByRole("heading", { name: "내 런타임 연결" })).toBeVisible();
+  // A local sign-in (no Access) keeps its password form in settings (#229).
+  await expect(page.getByRole("heading", { name: "비밀번호 변경" })).toBeVisible();
+  await expect(page.getByLabel("현재 비밀번호")).toBeVisible();
   // Members do not see the Claude subscription option (PRD D2) — but they can sign in with their own ChatGPT.
   await expect(section.getByRole("option", { name: /Claude Code · .*구독/ })).toHaveCount(0);
   await expect(section.getByRole("option", { name: "Codex · 내 ChatGPT 계정으로 로그인" })).toHaveCount(1);

@@ -104,6 +104,13 @@ test("passing Access signs in without a password: one access-login call, straigh
   await page.reload();
   await expect(page.getByTestId("sidebar")).toBeAttached();
   expect(seen.accessLogins).toBe(1);
+  // Settings has no password to change through Access (#229); the other panels are there.
+  await page.goto("/settings");
+  await expect(page.getByRole("heading", { name: "내 지침" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "비밀번호 변경" })).toHaveCount(0);
+  await expect(
+    page.locator('input[autocomplete="current-password"], input[autocomplete="new-password"]'),
+  ).toHaveCount(0);
   await ctx.close();
 });
 
