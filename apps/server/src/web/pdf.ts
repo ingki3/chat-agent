@@ -44,6 +44,10 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
   let active = 0;
   const waiting = new Set<() => void>();
   /** A slot, or false once `signal` aborted while waiting for one. */
+  /** The next waiter, when a slot is free (one that gave up passes its turn on). */
+  const wakeNext = () => {
+    if (active < PDF_CONCURRENCY) waiting.values().next().value?.();
+  };
   const slot = async (signal: AbortSignal): Promise<false | (() => void)> => {
     while (active >= PDF_CONCURRENCY) {
       if (signal.aborted) return false;
@@ -57,11 +61,15 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
         signal.addEventListener("abort", wake, { once: true });
       });
     }
-    if (signal.aborted) return false;
+    // Checked again the moment the slot is taken: a read stopped meanwhile never starts (review #237 2차).
+    if (signal.aborted) {
+      wakeNext();
+      return false;
+    }
     active++;
     return () => {
       active--;
-      waiting.values().next().value?.();
+      wakeNext();
     };
   };
   return async (bytes, signal = new AbortController().signal) => {
@@ -73,6 +81,8 @@ export function extractorPdfReader(runner: ExtractRunner, tmpDir: string): PdfRe
       file = path.join(fs.realpathSync(tmpDir), `web-pdf-${crypto.randomUUID()}.pdf`);
       fs.writeFileSync(file, bytes, { mode: 0o600, flag: "wx" });
       const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      // Stopped while the copy was written: no extractor is started.
+      if (signal.aborted) return { ok: false, code: "web_not_allowed" };
       const r = await runner({
         // Only what the runners read: the kind, the size and hash (the worker account's input copy checks both).
         file: { kind: "pdf", bytes: bytes.length, sha256 } as FileRow,

@@ -1238,7 +1238,7 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
                   ref: "{{$0.sourceId}}",
                   // Only the form differs: a comma, spacing, quote marks and a particle the page does not have.
                   quote:
-                    "“산업통상자원부는 10일, 10 월 반도체 수출은 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
+                    "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32 % 늘어난 142억 달러로 집계됐다고 밝혔다”",
                 },
                 { claim: "통계는 28%다", ref: "{{$1.sourceId}}", quote: RESEARCH_FIXTURE.stats },
                 // Other figures than the page's: never repaired.
@@ -1366,14 +1366,27 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       url: "https://fixture.agentlee.test/gov/policy.html",
       title: "정책 발표",
       site: "정부 누리집",
-      text:
-        "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.\n부산시는 2026년 예산을 늘린다고 밝혔다.\n" +
+      text: [
+        "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.",
+        "부산시는 2026년 예산을 늘린다고 밝혔다.",
         "수출은 전년보다 −5% 줄었다.",
+        "원고가 피고를 먼저 고소했다.",
+        "이 상품의 가격은 $50 이상이다.",
+        "올해 지원 기준은 소득 < 500만원이다.",
+        "이 기체의 성분은 CO 라고 밝혔다.",
+        "We agreed to resign today.",
+      ].join("\n"),
     };
+    // Review #237 1·2차: each was "repaired" to the page's sentence and kept with the model's altered claim.
     const inverted = [
       { claim: "정부는 내년부터 지원금을 지급한다", quote: "정부는 내년부터 지원금을 지급한다고 밝혔다" },
       { claim: "서울시는 2026년 예산을 늘린다", quote: "서울시는 2026년 예산을 늘린다고 밝혔다" },
       { claim: "수출은 전년보다 5% 늘었다", quote: "수출은 전년보다 +5% 줄었다" },
+      { claim: "피고가 원고를 먼저 고소했다", quote: "원고를 피고가 먼저 고소했다" },
+      { claim: "가격은 €50 이상이다", quote: "이 상품의 가격은 €50 이상이다" },
+      { claim: "소득 500만원 초과가 지원 대상이다", quote: "올해 지원 기준은 소득 > 500만원이다" },
+      { claim: "성분은 코발트(Co)다", quote: "이 기체의 성분은 Co 라고 밝혔다" },
+      { claim: "They agreed to sign again today", quote: "We agreed to re-sign today" },
     ];
     const script = scripted((x) =>
       x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
@@ -1398,7 +1411,8 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const q2 = stateOf(t, job.id).questions[1]!;
     expect(q2.found.map((n) => n.quote)).toEqual([RESEARCH_FIXTURE.memory]);
     expect(q2.repaired ?? 0).toBe(0);
-    expect(q2.unverified).toEqual(inverted.map((n) => n.claim));
+    // The first five (the kept list's cap); none of the eight reached the notes, the writer or the report.
+    expect(q2.unverified).toEqual(inverted.slice(0, 5).map((n) => n.claim));
     const writer = t.counting.turns.find((x) => x.startsWith(TURN_MARK.writer))!;
     const content = t.app.artifacts!.version(JSON.parse(done.result!).artifactId, 1)!.content;
     for (const n of inverted) {
@@ -1433,13 +1447,27 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     expect(reflect).toContain("미국 수출 비중이 가장 컸다");
   });
 
-  it("a passing runtime error is retried once; an account's state (usage, login) is not", async () => {
-    for (const [fail, retried] of [
-      [{ fail: "boom" }, true],
-      [{ fail: "login", code: "runtime_auth" as const }, false],
+  it("a passing runtime error is retried once; an account's state (login) never — even with a note kept", async () => {
+    for (const [first, retried, status] of [
+      [[{ fail: "boom" }], true, "done"],
+      [[{ fail: "login", code: "runtime_auth" as const }], false, "failed"],
+      // It kept a note from one page, then the login failed: one source, yet no retry (review #237 2차).
+      [
+        [
+          { call: "web_fetch", input: { url: A.url } },
+          {
+            textRefs: `NOTE ${JSON.stringify({ claim: "메모리", sourceId: "{{$0.sourceId}}", quote: RESEARCH_FIXTURE.memory })}\n`,
+          },
+          { fail: "login", code: "runtime_auth" as const },
+        ],
+        false,
+        "done",
+      ],
     ] as const) {
       const script = scripted((x) =>
-        x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK) ? [fail] : undefined,
+        x.startsWith(TURN_MARK.subagent) && /배경/.test(x) && !x.includes(RETRY_MARK)
+          ? (first as unknown as FakeStep[])
+          : undefined,
       );
       const t = await start({ script });
       const { job } = await begin(t);
@@ -1447,46 +1475,104 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
       await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
       await statusIs(t.app, job.id, "done");
       const retries = t.counting.turns.filter(
-        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK),
+        (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /배경/.test(x),
       );
-      expect(
-        retries.some((x) => /배경/.test(x)),
-        fail.fail,
-      ).toBe(retried);
-      const q2 = stateOf(t, job.id).questions[1]! as { status?: string; retried?: boolean };
-      expect(q2.status, fail.fail).toBe(retried ? "done" : "failed");
+      expect(retries.length, JSON.stringify(first)).toBe(retried ? 1 : 0);
+      expect(stateOf(t, job.id).questions[1]!.status as unknown, JSON.stringify(first)).toBe(status);
     }
   });
 
+  it("nothing verified: the job fails with how the last runs ended (a retry's login failure, not the first error)", async () => {
+    const script = scripted((x) =>
+      x.startsWith(TURN_MARK.subagent)
+        ? x.includes(RETRY_MARK)
+          ? [{ fail: "login", code: "runtime_auth" }]
+          : [{ fail: "boom" }]
+        : undefined,
+    );
+    const t = await start({ script });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+    const failed = await statusIs(t.app, job.id, "failed");
+    expect(failed.errorCode).toBe("runtime_auth");
+  });
+
   it("time is checked again after the reflection: no new round, or no extra round, that no longer fits", async () => {
-    for (const [limits, spend, rounds] of [
-      // 20 minutes of research; the reflection takes 17.5 — 2.5 left, under a round's 3 minutes.
-      [{}, 17.5 * MIN, 0],
-      // No regular gap round (maxDepth 0): the extra one needs 8 minutes; the reflection leaves 7.
-      [{ maxDepth: 0 }, 13 * MIN, 0],
-      // …and with 19 left it runs.
-      [{ maxDepth: 0 }, 1 * MIN, 1],
+    // The clock is put just above a threshold before the reflection (in the background question's retry, the last
+    // step before it); the reflection then takes one minute (inside its 90 s) and names a gap.
+    for (const [limits, before, rounds] of [
+      // 3.5 minutes left before (a round fits), 2.5 after: no new round — the gap is not even added.
+      [{}, 3.5 * MIN, 0],
+      [{}, 4.5 * MIN, 1],
+      // No regular gap round (maxDepth 0): the extra one needs 8 minutes — 8.5 before, 7.5 after.
+      [{ maxDepth: 0 }, 8.5 * MIN, 0],
+      [{ maxDepth: 0 }, 9.5 * MIN, 1],
     ] as const) {
       const clock = new ManualClock();
+      const t0 = clock.now();
+      let approvedAt = 0;
       const script = scripted((x) => {
+        if (x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK) && /배경/.test(x)) {
+          clock.advance(approvedAt + 20 * MIN - before - clock.now());
+          return [{ text: "DONE" }];
+        }
         if (!x.startsWith(TURN_MARK.reflect)) return undefined;
-        clock.advance(spend);
+        clock.advance(MIN);
         return [{ text: JSON.stringify({ gaps: [{ question: "새 각도의 보강 질문", scope: "web" }] }) }];
       });
       const t = await start({ script, clock, limits });
       const { job } = await begin(t);
       await statusIs(t.app, job.id, "awaiting_approval");
       await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, {});
+      approvedAt = t.app.research!.get(job.id)!.approvedAt ?? t0;
       await until(() => {
         const s = t.app.research!.get(job.id)!.status;
         if (s === "writing") clock.advance(MIN);
         return s === "done" || s === "failed";
       }, "the end");
+      const label = `${JSON.stringify(limits)} ${before / MIN}`;
       const gap = t.counting.turns.filter(
         (x) => x.startsWith(TURN_MARK.subagent) && x.includes("새 각도") && !x.includes(RETRY_MARK),
       );
-      expect(gap, `${spend}`).toHaveLength(rounds);
+      expect(gap, label).toHaveLength(rounds);
+      // Not merely left unasked: when it does not fit, the gap question is never added.
+      expect(
+        stateOf(t, job.id).questions.some((q) => q.question.includes("새 각도")),
+        label,
+      ).toBe(rounds > 0);
     }
+  });
+
+  it("each queued retry checks the time when it gets its slot: a fourth one behind three does not start late", async () => {
+    let moved = false;
+    let started = 0;
+    const clock = new ManualClock();
+    let approvedAt = 0;
+    const script = scripted((x) => {
+      if (!(x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK))) return undefined;
+      // The third retry to start (the pool is full) moves the clock to 2.5 minutes before the end of research.
+      if (++started === 3 && !moved) {
+        moved = true;
+        clock.advance(approvedAt + 20 * MIN - 2.5 * MIN - clock.now());
+      }
+      return [{ text: "DONE" }];
+    });
+    const t = await start({ script, clock });
+    const { job } = await begin(t);
+    await statusIs(t.app, job.id, "awaiting_approval");
+    const subQuestions = Array.from({ length: 4 }, (_, i) => ({ question: `측면 ${i + 1}`, scope: "web" }));
+    await t.api(t.f.cookies.owner, "POST", `/api/research/${job.id}/approve`, { subQuestions });
+    approvedAt = t.app.research!.get(job.id)!.approvedAt!;
+    await until(() => {
+      const s = t.app.research!.get(job.id)!.status;
+      if (s === "writing") clock.advance(MIN);
+      return s === "done" || s === "failed";
+    }, "the end");
+    const retries = t.counting.turns.filter(
+      (x) => x.startsWith(TURN_MARK.subagent) && x.includes(RETRY_MARK),
+    );
+    expect(retries).toHaveLength(3);
   });
 
   it("a retry still waiting after a restart starts only with a round's time left", async () => {
@@ -1509,6 +1595,17 @@ describe("깊이 조사: fewer gaps — note repair and the automatic retry (#23
     const state = JSON.parse(row.state) as { questions: Record<string, unknown>[] };
     // As if the server stopped right after it queued the background question's retry.
     Object.assign(state.questions[1]!, { status: "waiting", retried: true, found: [], sources: 0 });
+    // …and a third-round gap question queued (review #237 2차).
+    state.questions.push({
+      id: "r3q1",
+      question: "늦은 보강 질문",
+      scope: "web",
+      round: 3,
+      status: "waiting",
+      sources: 0,
+      found: [],
+      dropped: 0,
+    });
     // 45 seconds of research left.
     const approvedAt = Date.now() - (20 * MIN - 45_000);
     db.$client

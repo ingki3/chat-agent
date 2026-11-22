@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sourceTypeOf } from "@agentlee/shared";
 import {
+  claimFitsPassage,
   closestPassage,
   findPassages,
   numberFacts,
@@ -39,16 +40,20 @@ describe("the closest passage for a quote that did not verify (#234 note repair)
     "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다.\n" +
     "메모리 가격 회복이 증가를 이끌었다. 업계는 연말까지 증가세가 이어질 것으로 본다.";
 
-  it("match: only the form differs — punctuation, spacing, quote marks, an ellipsis, subject/object particles", () => {
+  it("match: only spacing next to digits or marks, quote/dash glyphs, or a … between two sentences", () => {
     expect(
       closestPassage(
         page,
-        "“산업통상자원부는 10일, 10 월 반도체 수출은 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다”",
+        "“산업통상자원부는 10일 10 월 반도체 수출이 전년 같은 달보다 32 % 늘어난 142억 달러로 집계됐다고 밝혔다”",
       ),
     ).toEqual({
       kind: "match",
       passage:
         "산업통상자원부는 10일 10월 반도체 수출이 전년 같은 달보다 32% 늘어난 142억 달러로 집계됐다고 밝혔다",
+    });
+    expect(closestPassage("기간은 2026–2027년이다.", "기간은 2026 - 2027년이다")).toEqual({
+      kind: "match",
+      passage: "기간은 2026–2027년이다",
     });
     // Two consecutive sentences the model joined with "…".
     expect(
@@ -59,50 +64,81 @@ describe("the closest passage for a quote that did not verify (#234 note repair)
     });
   });
 
-  it("none: a different meaning is never repaired — negation, subject, sign, unit, word order, meaningful particles", () => {
-    const facts =
-      "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.\n부산시는 2026년 예산을 늘린다고 밝혔다.\n" +
-      "수출은 전년보다 −5% 줄었다.\n서울보다 부산이 인구가 적다.\n물가는 3% 올랐다.";
+  it("none: any other difference — particles, case, hyphens in a word, currency, comparison, sign, unit, words", () => {
+    const facts = [
+      "정부는 내년부터 지원금을 지급하지 않는다고 밝혔다.",
+      "부산시는 2026년 예산을 늘린다고 밝혔다.",
+      "수출은 전년보다 −5% 줄었다.",
+      "원고가 피고를 먼저 고소했다.",
+      "이 상품의 가격은 $50 이상이다.",
+      "올해 지원 기준은 소득 < 500만원이다.",
+      "이 기체의 성분은 CO 라고 밝혔다.",
+      "We agreed to resign today.",
+      "아버지 가방에 들어가신다.",
+      "서울보다 부산이 인구가 적다.",
+      "물가는 3% 올랐다.",
+    ].join("\n");
     for (const quote of [
       "정부는 내년부터 지원금을 지급한다고 밝혔다",
       "서울시는 2026년 예산을 늘린다고 밝혔다",
       "수출은 전년보다 +5% 줄었다",
       "수출은 전년보다 5% 줄었다",
-      "물가는 3%p 올랐다",
+      "원고를 피고가 먼저 고소했다",
+      "이 상품의 가격은 €50 이상이다",
+      "올해 지원 기준은 소득 > 500만원이다",
+      "이 기체의 성분은 Co 라고 밝혔다",
+      "We agreed to re-sign today",
+      "아버지가 방에 들어가신다",
       "부산보다 서울이 인구가 적다",
-      "서울까지 부산이 인구가 적다",
-      "10월 반도체 수출이 전년 같은 달보다 50% 늘어난 142억 달러",
+      "물가는 3%p 올랐다",
+      // A particle is a word too now: 수출은 is not 수출이.
+      "10월 반도체 수출은 전년 같은 달보다 32% 늘어난 142억 달러로",
+      // Words left out in between (a summary, not a quote).
+      "산업통상자원부는 반도체 수출이 32% 늘었다고 밝혔다",
+      // Two sentences joined where the page has no sentence end.
+      "산업통상자원부는 10일 … 10월 반도체 수출이",
     ])
       expect(closestPassage(`${page}\n${facts}`, quote), quote).toEqual({ kind: "none" });
-    // Too short to say anything.
-    expect(closestPassage(page, "수출 증가")).toEqual({ kind: "none" });
-    // Words left out in between (a summary, not a quote).
-    expect(closestPassage(page, "산업통상자원부는 반도체 수출이 32% 늘었다고 밝혔다")).toEqual({
-      kind: "none",
-    });
+    expect(closestPassage(page, "수출")).toEqual({ kind: "none" });
   });
 
-  it("ambiguous: the words stand in two different passages — neither is taken; the same passage twice is one", () => {
-    const twins = "서울시는 예산을 늘린다고 밝혔다.\n서울시가 예산을 늘린다고 밝혔다.";
-    expect(closestPassage(twins, "서울시, 예산을 늘린다고 밝혔다")).toEqual({ kind: "ambiguous" });
+  it("ambiguous: two different places of the page; the same passage twice is one", () => {
+    const twins = "10 월 수출이 늘었다고 밝혔다.\n10월 수출이 늘었다고 밝혔다.";
+    expect(closestPassage(twins, "10  월 수출이 늘었다고")).toEqual({ kind: "ambiguous" });
     const same = "서울시는 2026년 예산을 늘린다고 밝혔다.\n서울시는 2026년 예산을 늘린다고 밝혔다.";
-    expect(closestPassage(same, "서울시는 2026년, 예산을 늘린다고 밝혔다")).toEqual({
+    expect(closestPassage(same, "서울시는 2026 년 예산을 늘린다고 밝혔다")).toEqual({
       kind: "match",
       passage: "서울시는 2026년 예산을 늘린다고 밝혔다",
     });
   });
 
-  it("never across a PDF page that was not read; the exact check cannot either", () => {
-    const pdf = `1쪽 끝에 정부는 지원금을\n\n${PAGE_GAP}\n\n내년부터 지급한다고 밝혔다.`;
+  it("never across a PDF page that was not read — the repair, the exact check and web_find alike", () => {
+    const pdf = `1쪽 끝 문장이다. 정부는 지원금을\n\n${PAGE_GAP}\n\n내년부터 지급한다고 밝혔다. 3쪽 문장이다.`;
     expect(closestPassage(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다")).toEqual({ kind: "none" });
     expect(findSnippet(pdf, "정부는 지원금을 내년부터 지급한다고 밝혔다").found).toBe(false);
+    // Even a snippet that copies the mark itself.
+    expect(findSnippet(pdf, `정부는 지원금을 ${PAGE_GAP} 내년부터 지급한다고 밝혔다`).found).toBe(false);
+    expect(findSnippet(pdf, "내년부터 지급한다고 밝혔다").found).toBe(true);
+    const found = findPassages(pdf, "지원금 지급", 5).passages;
+    expect(found.length).toBeGreaterThan(0);
+    for (const p of found) expect(p.text).not.toContain(PAGE_GAP);
+    expect(findPassages(pdf, "읽지 못한 쪽", 5).passages).toEqual([]);
+  });
+
+  it("a repaired passage keeps only a claim whose numbers and signs it has", () => {
+    const passage = "이 상품의 가격은 $50 이상이고 수출은 −5% 줄었다";
+    expect(claimFitsPassage("가격은 $50 이상, 수출 −5%", passage)).toBe(true);
+    expect(claimFitsPassage("가격은 €50 이상", passage)).toBe(false);
+    expect(claimFitsPassage("수출은 5% 늘었다", passage)).toBe(false);
+    expect(claimFitsPassage("수출은 -7% 줄었다", passage)).toBe(false);
+    expect(claimFitsPassage("가격은 50 > 기준", passage)).toBe(false);
   });
 
   it("numbers keep their sign, value and unit in order", () => {
     expect(numberFacts("수출은 −5%, 수입은 +3.5%p, 1,234 명, 142억 달러")).toEqual([
       "-5%",
       "+3.5%p",
-      "1234명",
+      "1234",
       "142억",
     ]);
   });
@@ -144,9 +180,15 @@ describe("a retry's merges (#234)", () => {
     ]);
   });
 
-  it("unverified claims: earlier and new, once, without those now backed, at most five", () => {
-    expect(mergeUnverified(["x", "y  z"], ["y z", "w"], [n("1", "A", "x")])).toEqual(["y  z", "w"]);
+  it("unverified claims: dedupe, then cap; one key however cut or spaced; removed only when a kept note backs it", () => {
+    expect(mergeUnverified(["x", "y  z"], ["y z", "w"], [n("1", "A", "x")])).toEqual(["y z", "w"]);
     expect(mergeUnverified(["a", "b", "c"], ["d", "e", "f"], [])).toEqual(["a", "b", "c", "d", "e"]);
+    // Five copies of one claim do not crowd out another.
+    expect(mergeUnverified(["a", "a", "a", "a", "a"], ["b"], [])).toEqual(["a", "b"]);
+    // A long claim kept cut to 300 characters is the same claim when a later note backs it whole.
+    const long = "가".repeat(315);
+    expect(mergeUnverified([long.slice(0, 300)], [], [n("1", "A", long)])).toEqual([]);
+    expect(mergeUnverified([], [long], [])).toEqual([long.slice(0, 300)]);
     // A retry that found nothing keeps what failed before.
     expect(mergeUnverified(["a"], [], [])).toEqual(["a"]);
   });

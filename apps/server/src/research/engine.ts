@@ -32,7 +32,7 @@ import type { DocSet } from "../memory/inject.js";
 import type { PublishInput } from "../notifications/compose.js";
 import type { RuntimeAdapter, RuntimeRegistry, UsageReport } from "../runtime/adapter.js";
 import type { SessionRef } from "../runtime/runs.js";
-import { closestPassage } from "../citations/passages.js";
+import { claimFitsPassage, closestPassage } from "../citations/passages.js";
 import { scrubKnown } from "../secrets/known.js";
 import type { UsageAttempt } from "../usage/store.js";
 import type { SourceStore } from "../web/sources.js";
@@ -179,6 +179,8 @@ const MIN_WRITE_MS = 30_000;
 const REFLECT_MS = 90_000;
 /** Unverified claims kept per sub-question (for its retry and the lead's reflection). */
 const UNVERIFIED_KEPT = 5;
+/** Characters of one unverified claim kept (claims are at most 500 — `parseNotes`). */
+const UNVERIFIED_CHARS = 300;
 /**
  * Runtime failures a weak sub-question is retried after (#234): a passing error. The account's state — its login,
  * its usage, its connection, its permission, the conversation switched — would only fail again.
@@ -742,15 +744,17 @@ export class ResearchEngine {
     let error: ResearchErrorCode | undefined;
     try {
       for (;;) {
-        // A retry (#234) that is still to run (a restart) starts only with a round's time left; otherwise it keeps
-        // what its first run found.
-        if (researchEnd - this.clock.now() < this.limits.minRoundMs)
-          for (const q of state.questions)
-            if (q.status === "waiting" && q.retried) q.status = q.found.length ? "done" : "capped";
         const waiting = state.questions.filter((q) => q.status === "waiting");
         if (waiting.length && this.clock.now() < researchEnd && !signal.aborted)
           await pool(waiting, this.limits.concurrency, async (q) => {
             if (signal.aborted) return;
+            // A retry or a gap question (#234) starts only with a round's time left — checked when it gets its slot
+            // (review #237 2차: a fourth one queued behind three, or one resumed after a restart). A retry then keeps
+            // what its first run found; a gap question stays unasked (the report says the time ran out).
+            if ((q.retried || q.round > 0) && researchEnd - this.clock.now() < this.limits.minRoundMs) {
+              if (q.retried) q.status = q.found.length ? "done" : "capped";
+              return;
+            }
             const ctx = fresh();
             if (!ctx) return;
             // Held within the approved sources right before it runs (review #237 1차): an old checkpoint's question
@@ -782,11 +786,8 @@ export class ResearchEngine {
             q.found = notes;
             q.sources = sourceCount(notes);
             q.dropped = (q.retried ? q.dropped : 0) + (raw.length - checked.notes.length);
-            q.unverified = mergeUnverified(
-              q.retried ? (q.unverified ?? []) : [],
-              checked.unverified,
-              checked.notes,
-            );
+            // Backed only by the notes actually kept (review #237 2차: one the 12-cap dropped backs nothing).
+            q.unverified = mergeUnverified(q.retried ? (q.unverified ?? []) : [], checked.unverified, notes);
             q.repaired = (q.retried ? (q.repaired ?? 0) : 0) + checked.repaired;
             q.status =
               r.ended === "done"
@@ -796,8 +797,9 @@ export class ResearchEngine {
                     ? "done"
                     : "failed"
                   : "capped";
-            // Why it failed: a passing runtime error may be retried once (#234); an account's state may not.
-            q.failure = r.ended === "failed" && !notes.length ? (r.error ?? "runtime_error") : undefined;
+            // How its last run ended, whatever it kept (review #237 2차): a passing runtime error may be retried
+            // once (#234); an account's state (login, usage, connection, permission, a switched runtime) never.
+            q.failure = r.ended === "failed" ? (r.error ?? "runtime_error") : undefined;
             if (r.ended === "failed") error ??= r.error;
             persist();
           });
@@ -816,9 +818,8 @@ export class ResearchEngine {
         const weak = state.questions.filter(
           (q) =>
             !q.retried &&
-            (q.status === "done" ||
-              q.status === "capped" ||
-              (q.status === "failed" && RETRYABLE.has(q.failure ?? ""))) &&
+            (q.status === "done" || q.status === "capped" || q.status === "failed") &&
+            (q.failure === undefined || RETRYABLE.has(q.failure)) &&
             (q.found.length === 0 || q.sources <= 1),
         );
         if (weak.length) {
@@ -895,6 +896,10 @@ export class ResearchEngine {
     for (const q of state.questions)
       if (q.status === "waiting" || q.status === "running") q.status = "capped";
     state.stage = "write";
+    // Nothing verified: the job fails with how the questions' last runs ended — an account's state first (a retry
+    // that ended `runtime_auth` after a passing `runtime_error` reports the login, review #237 2차).
+    const last = state.questions.flatMap((q) => (q.failure ? [q.failure] : []));
+    error = last.find((c) => !RETRYABLE.has(c)) ?? last[0] ?? error;
     if (error && !allNotes(state).length) return void this.fail(row.id, error, live);
     this.save(row.id, { status: "writing", state }, ["researching"], live);
   }
@@ -922,7 +927,8 @@ export class ResearchEngine {
           let r = this.deps.citations.recheck(scope, { sourceId: n.sourceId, snippet: n.quote });
           if (r && r.status === "snippet_not_found" && r.source.kind === "page" && r.source.body) {
             const near = closestPassage(r.source.body, scrubKnown(n.quote));
-            if (near.kind === "match") {
+            // The claim stays the model's: it must not carry a number or sign the passage does not have.
+            if (near.kind === "match" && claimFitsPassage(n.claim, near.passage)) {
               const again = this.deps.citations.recheck(scope, {
                 sourceId: n.sourceId,
                 snippet: near.passage,
@@ -963,7 +969,7 @@ export class ResearchEngine {
         note = undefined;
       }
       if (!note) {
-        if (unverified.length < UNVERIFIED_KEPT) unverified.push(scrubKnown(n.claim).slice(0, 300));
+        unverified.push(scrubKnown(n.claim));
         continue;
       }
       const key = `${note.sourceId ?? note.fileId}\n${note.quote}`;
@@ -1269,11 +1275,18 @@ export function mergeUnverified(
   failed: readonly string[],
   verified: readonly ResearchNote[],
 ): string[] {
-  const flat = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim();
-  const backed = new Set(verified.map((n) => flat(n.claim)));
+  // One key for the same claim however it was cut or spaced: normalised, then the length a kept claim has.
+  const key = (c: string) => c.normalize("NFC").replace(/\s+/gu, " ").trim().slice(0, UNVERIFIED_CHARS);
+  const backed = new Set(verified.map((n) => key(n.claim)));
+  const seen = new Set<string>();
   const out: string[] = [];
-  for (const c of [...before, ...failed])
-    if (!backed.has(flat(c)) && !out.some((x) => flat(x) === flat(c))) out.push(c);
+  // Dedupe first, then cap (review #237 2차: five copies of one claim must not crowd out another).
+  for (const c of [...before, ...failed]) {
+    const k = key(c);
+    if (!k || backed.has(k) || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
   return out.slice(0, UNVERIFIED_KEPT);
 }
 

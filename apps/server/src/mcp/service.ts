@@ -876,6 +876,7 @@ export class McpService {
       worker,
       // A call still in flight when its run was stopped (its token revoked) stores no source and answers nothing.
       alive: (scope) => !this.tokens.wasRevoked(scope.runId),
+      onStop: (scope, fn) => this.tokens.onRevoke(scope.runId, fn),
       ...(o.fetchProxy ? { fetchProxy: o.fetchProxy } : {}),
       ...(o.pdf ? { pdf: o.pdf } : {}),
     });

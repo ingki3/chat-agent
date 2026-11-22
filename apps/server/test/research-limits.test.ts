@@ -303,6 +303,42 @@ describe("web_fetch reads PDFs with the document extractor (#234)", () => {
     b.abort();
     await second;
     expect(signals).toHaveLength(2);
+    // Stopped in the same moment a slot frees (review #237 2차): the stopped one never starts, the next one does.
+    const x = new AbortController();
+    const y = new AbortController();
+    const z = new AbortController();
+    const w = new AbortController();
+    const r1 = held(Buffer.from("%PDF-1.7"), x.signal);
+    const r2 = held(Buffer.from("%PDF-1.7"), y.signal);
+    const r3 = held(Buffer.from("%PDF-1.7"), z.signal);
+    const r4 = held(Buffer.from("%PDF-1.7"), w.signal);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(signals).toHaveLength(4);
+    z.abort();
+    x.abort();
+    expect(await r3).toEqual({ ok: false, code: "web_not_allowed" });
+    await r1;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(signals).toHaveLength(5);
+    expect(signals.at(-1)).toBe(w.signal);
+    y.abort();
+    w.abort();
+    await Promise.all([r2, r4]);
+  });
+
+  it("a run's stop reaches a PDF read at the revocation itself (no polling)", () => {
+    const tokens = new McpTokens();
+    const seen: string[] = [];
+    const off = tokens.onRevoke("run-1", () => seen.push("1"));
+    tokens.onRevoke("run-2", () => seen.push("2"));
+    tokens.revokeRun("run-1");
+    expect(seen).toEqual(["1"]);
+    off();
+    tokens.revokeRun("run-1");
+    expect(seen).toEqual(["1"]);
+    // Already stopped: called at once.
+    tokens.onRevoke("run-1", () => seen.push("late"));
+    expect(seen).toEqual(["1", "late"]);
   });
 
   it("only a page fetch may hand back 16 MiB; searches and raw jobs keep 4 MiB", () => {

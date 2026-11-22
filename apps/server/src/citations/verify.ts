@@ -424,6 +424,12 @@ function pageOf(body: string, key: string | undefined): Page {
   return page;
 }
 
+/**
+ * Where a PDF page the extractor could not read (a scan, without OCR) stood in a page's text (#234, `web/pdf.ts`):
+ * its own line. No match — a citation, a note's check, `web_find`, a repair — ever contains or runs across it.
+ */
+export const PAGE_GAP = "[읽지 못한 쪽]";
+
 export type SnippetMatch =
   { found: true; quote: string } | { found: false; reason: "too_short" | "not_found" };
 
@@ -482,6 +488,8 @@ function matchIn(
     if (before !== "" && before !== " " && !BOUNDARY_PUNCT.test(before)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
+    // Never across (or out of) a page that was not read (#234, review #237 2차).
+    if (body.slice(start, end).includes(PAGE_GAP)) continue;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
     // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).

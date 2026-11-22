@@ -360,6 +360,8 @@ export type WebServiceOptions = {
   fetchProxy?: Proxy;
   /** Whether the calling run may still store what it fetched (false once it was stopped). Default: always. */
   alive?: (scope: ToolScope) => boolean;
+  /** Calls `fn` the moment the calling run is stopped (its tokens revoked); returns the unsubscribe. */
+  onStop?: (scope: ToolScope, fn: () => void) => () => void;
   /**
    * A PDF's text (#234): the document extractor in its sandbox (`web/pdf.ts`). Without it a PDF is
    * `web_unsupported_type`, as before.
@@ -530,16 +532,14 @@ export class WebService {
       if (!isPdfBytes(bytes)) return { ok: false, code: "web_bad_content" };
       if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
       // The run stopped meanwhile (its token revoked): the read waiting for a slot never starts, a running
-      // extraction is stopped (review #237 1차).
+      // extraction is stopped — at the revocation itself, not on a timer (review #237 1·2차).
       const stop = new AbortController();
-      const watch = this.opts.alive
-        ? setInterval(() => !this.opts.alive!(scope) && stop.abort(), 250).unref()
-        : undefined;
+      const off = this.opts.onStop?.(scope, () => stop.abort());
       let p;
       try {
         p = await this.opts.pdf(bytes, stop.signal);
       } finally {
-        clearInterval(watch);
+        off?.();
       }
       if (!p.ok) return { ok: false, code: p.code };
       text = p.text.length > PDF_TEXT_CHARS ? p.text.slice(0, PDF_TEXT_CHARS) : p.text;
