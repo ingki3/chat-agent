@@ -123,6 +123,35 @@ describe("Markdown", () => {
     expect(html).toContain("<table>");
     expect(html).toContain('<td style="text-align:right">2</td>');
   });
+  it("renders a 깊이 조사 source list as written: page text as code, no math, no autolink (#233)", () => {
+    // As the server writes it (`renderReport` — its test has the same entries).
+    const html = render(
+      [
+        "1. `https://example.org/p?q=a\\b` — `www.example.org` — `https://example.org/p?q=a\\b`",
+        "   - `가격은 US$10, 단위 $20 www.x.org a@b.org https://y.test`",
+        "2. [`US$10 보고서`](<https://x.test/?unit=$20>) — `www.example.org`",
+        "   - `AT&amp;T`",
+        "   - `+ 실적` — `매출`",
+        "3. `` US$10 `x` `` — `a@b.org` — `https://[::1]/?unit=$20`",
+      ].join("\n"),
+    );
+    expect(html).not.toMatch(/katex|<math/);
+    expect([...html.matchAll(/<a [^>]*href="([^"]*)"/g)].map((m) => m[1])).toEqual([
+      "https://x.test/?unit=$20",
+    ]);
+    for (const t of [
+      "https://example.org/p?q=a\\b",
+      "www.example.org",
+      "가격은 US$10, 단위 $20 www.x.org a@b.org https://y.test",
+      "AT&amp;amp;T",
+      "+ 실적",
+      "US$10 `x`",
+      "a@b.org",
+      "https://[::1]/?unit=$20",
+      "US$10 보고서",
+    ])
+      expect(html).toContain(`<code>${t}</code>`);
+  });
   it("renders code blocks with a language label, highlighting and a copy button", () => {
     const html = render("```python\nimport math\nprint(1)\n```");
     expect(html).toContain('class="codeblk"');

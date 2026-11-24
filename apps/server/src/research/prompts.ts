@@ -9,7 +9,7 @@ import {
   type ResearchSubQuestion,
 } from "@agentlee/shared";
 import { INSTRUCTIONS_DIR } from "../instructions/assemble.js";
-import type { ResearchNote } from "./store.js";
+import { claimKeyOf, type ResearchNote } from "./store.js";
 
 /**
  * 깊이 조사's step prompts (#211): versioned Markdown in `apps/server/instructions/deep-research/` with the same header
@@ -20,7 +20,7 @@ import type { ResearchNote } from "./store.js";
  * MIT) — the text is our own (docs/decisions/deep-research.md).
  */
 
-export const RESEARCH_PROMPT_IDS = ["plan", "subagent", "reflect", "writer"] as const;
+export const RESEARCH_PROMPT_IDS = ["plan", "subagent", "reflect", "outline", "writer"] as const;
 export type ResearchPromptId = (typeof RESEARCH_PROMPT_IDS)[number];
 export type ResearchPrompt = { id: ResearchPromptId; version: number; body: string };
 export type ResearchPrompts = Record<ResearchPromptId, ResearchPrompt>;
@@ -67,6 +67,7 @@ export const TURN_MARK = {
   plan: "[깊이 조사 · 계획]",
   subagent: "[깊이 조사 · 조사]",
   reflect: "[깊이 조사 · 보강]",
+  outline: "[깊이 조사 · 개요]",
   writer: "[깊이 조사 · 작성]",
 } as const;
 
@@ -92,20 +93,56 @@ export function planTurn(input: {
   ].join("\n\n");
 }
 
+/** The second line of a retry's turn (#234): what marks it (the FakeRuntime's scripts match it too). */
+export const RETRY_MARK = "[다시 조사]";
+
 export function subagentTurn(input: {
   question: string;
   plan: ResearchPlan;
   sub: ResearchSubQuestion;
   files: readonly AttachedFile[];
+  /**
+   * A retry (#234): the first run left no verified note or one source only. What it verified (kept — not to be found
+   * again) and the claims whose quote failed.
+   */
+  retry?: { found: readonly ResearchNote[]; unverified: readonly string[] } | undefined;
 }): string {
   const scope =
     input.sub.scope === "web"
-      ? "웹만 (web_search · web_fetch)"
+      ? "웹만 (web_search · web_fetch · web_find)"
       : input.sub.scope === "files"
         ? "첨부 파일만 (file_search · file_read)"
-        : "웹과 첨부 파일 (web_search · web_fetch · file_search · file_read)";
+        : "웹과 첨부 파일 (web_search · web_fetch · web_find · file_search · file_read)";
+  // The retry's hints name only the tools its scope has (review #237 5차).
+  const web = input.sub.scope !== "files";
+  const files = input.sub.scope !== "web";
+  const how = [
+    ...(web ? ["웹 페이지는 web_find로 저장된 본문에서 찾거나 web_fetch로 다시 읽어"] : []),
+    ...(files ? ["첨부 파일은 file_search로 찾아 file_read로 읽어"] : []),
+  ].join(", ");
+  const retry = input.retry
+    ? [
+        [
+          RETRY_MARK,
+          "이 하위 질문은 한 번 조사했지만 확인된 근거가 " +
+            (input.retry.found.length ? "출처 하나뿐이다." : "없다.") +
+            (web
+              ? " 앞과 **다른 검색어**로 다시 찾는다: 공식 기관·문서의 정식 이름, 동의어, 영어 표현, 연도·문서 종류(시행계획, 보도자료, 통계, PDF)를 넣는다. 이미 확인된 출처 말고 **다른 출처**, 특히 1차 자료(정부·공공기관·대학)를 찾는다. 긴 문서는 `web_find`로 본문 전체에서 찾는다."
+              : " 첨부 파일에서 앞과 **다른 검색어**(동의어, 정식 이름, 숫자·날짜, 표 제목)로 `file_search`를 다시 하고, 찾은 곳을 `file_read`로 읽는다."),
+        ].join("\n"),
+        ...(input.retry.found.length
+          ? [`이미 확인된 노트 (다시 쓰지 않는다):\n${notesBlock(input.retry.found)}`]
+          : []),
+        ...(input.retry.unverified.length
+          ? [
+              `원문에서 확인하지 못한 주장 (서버는 구절을 고쳐 주지 않는다 — 그 주장을 실제로 쓴 원문을 ${how} 글자 그대로 복사해 노트를 쓴다. 못 찾으면 쓰지 않는다):\n${frameExternal({ source: "research-unverified", content: input.retry.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+            ]
+          : []),
+      ]
+    : [];
   return [
     TURN_MARK.subagent,
+    ...retry,
     `전체 질문: ${input.question}`,
     `보고서: ${input.plan.title}`,
     `맡은 하위 질문: ${input.sub.question}`,
@@ -127,6 +164,7 @@ export function notesBlock(notes: readonly ResearchNote[]): string {
       // The verified place of a file passage: the writer's `file_cite` looks there first (its `page`).
       ...(n.place ? { place: n.place } : {}),
       ...(n.title ? { title: n.title } : {}),
+      ...(n.sourceType ? { sourceType: n.sourceType } : {}),
     }),
   );
   return frameExternal({ source: "research-notes", content: lines.join("\n") || "(노트 없음)" });
@@ -139,6 +177,8 @@ export function reflectTurn(input: {
   notes: readonly ResearchNote[];
   /** What the owner approved: gap questions may use only these sources. */
   scopes: readonly ("web" | "files")[];
+  /** Claims the sub-researchers wrote whose quote the server could not verify (#234): candidates for a gap question. */
+  unverified?: readonly string[] | undefined;
 }): string {
   const allowed =
     input.scopes.includes("web") && input.scopes.includes("files")
@@ -152,19 +192,120 @@ export function reflectTurn(input: {
     `쓸 수 있는 범위(scope): ${allowed}`,
     `이미 조사한 하위 질문:\n${input.asked.map((q) => `- ${q}`).join("\n")}`,
     `확인된 노트:\n${notesBlock(input.notes)}`,
+    ...(input.unverified?.length
+      ? [
+          `원문에서 확인하지 못해 뺀 주장 (중요하면 그 주장을 확인할 보강 질문을 만든다):\n${frameExternal({ source: "research-unverified", content: input.unverified.map((c) => `- ${Array.from(c).slice(0, 300).join("")}`).join("\n") })}`,
+        ]
+      : []),
   ].join("\n\n");
+}
+
+/** The report's outline (#233): the lead's sections, in order — the writer follows it in one pass. */
+export type ReportOutline = {
+  sections: { heading: string; question: string; notes: string[]; analysis: string }[];
+};
+
+export function outlineTurn(input: {
+  question: string;
+  plan: ResearchPlan;
+  notes: readonly ResearchNote[];
+}): string {
+  return [
+    TURN_MARK.outline,
+    `질문: ${input.question}`,
+    `보고서 제목: ${input.plan.title}`,
+    `하위 질문:\n${input.plan.subQuestions.map((q) => `- ${q.question}`).join("\n")}`,
+    `확인된 노트:\n${notesBlock(input.notes)}`,
+  ].join("\n\n");
+}
+
+/** One line of the lead's outline as the writer reads it: no line breaks, no markup that starts a block. */
+/**
+ * One field of the lead's outline, verbatim (#233 reviews 15–16): nothing changed at all — the writer gets it as data,
+ * framed. Longer than `n` as written, with a line break in it, or empty: none — the field, or the section with its
+ * heading, is left out (never cut or rewritten: a secret in it must stay whole for the rescan).
+ */
+const outlineText = (s: string, n: number): string | undefined =>
+  s.trim() && !/[\r\n]/.test(s) && Array.from(s).length <= n ? s : undefined;
+
+/** Sections of an outline, at most (a summary, the sub-questions' topics, the 시사점). */
+export const OUTLINE_SECTIONS = 8;
+
+/**
+ * The outline through the secrets known now (#233 review 16), field by field — heading, question and planned analysis
+ * as text (the structure and the note ids stay as they are) — and checked again by the same rules (a masked field may
+ * be longer): what the writer gets, the first time and after a restart alike. Unusable then: none.
+ */
+export function maskOutline(
+  o: ReportOutline | undefined,
+  noteIds: ReadonlySet<string>,
+  scrub: (t: string) => string,
+): ReportOutline | undefined {
+  if (!o) return undefined;
+  return parseOutline(
+    JSON.stringify({
+      sections: o.sections.map((x) => ({
+        heading: scrub(x.heading),
+        question: scrub(x.question),
+        notes: x.notes,
+        analysis: scrub(x.analysis),
+      })),
+    }),
+    noteIds,
+  );
+}
+
+/**
+ * The lead's outline (at most 8 sections, note ids only of the notes given, a section without one left out); fewer
+ * than 2 sections is none — the writer then writes without one.
+ */
+export function parseOutline(text: string, noteIds: ReadonlySet<string>): ReportOutline | undefined {
+  const v = firstJson(text) as Record<string, unknown> | undefined;
+  const list = v && Array.isArray(v.sections) ? v.sections : [];
+  const sections: ReportOutline["sections"] = [];
+  for (const x of list) {
+    if (sections.length >= OUTLINE_SECTIONS) break;
+    const o = x && typeof x === "object" ? (x as Record<string, unknown>) : {};
+    const heading = typeof o.heading === "string" ? outlineText(o.heading, 60) : undefined;
+    if (!heading) continue;
+    const notes = Array.isArray(o.notes)
+      ? [...new Set(o.notes.filter((n): n is string => typeof n === "string" && noteIds.has(n)))].slice(0, 20)
+      : [];
+    // A section with none of the notes given rests on nothing: left out (#233 review).
+    if (!notes.length) continue;
+    sections.push({
+      heading,
+      question: typeof o.question === "string" ? (outlineText(o.question, 200) ?? "") : "",
+      notes,
+      analysis: typeof o.analysis === "string" ? (outlineText(o.analysis, 300) ?? "") : "",
+    });
+  }
+  return sections.length >= 2 ? { sections } : undefined;
 }
 
 export function writerTurn(input: {
   question: string;
   plan: ResearchPlan;
   notes: readonly ResearchNote[];
+  outline?: ReportOutline | undefined;
 }): string {
+  // The lead's outline is model text: data for the writer, framed like the notes, one JSON object per section.
+  const outline = input.outline?.sections.length
+    ? frameExternal({
+        source: "research-outline",
+        content: input.outline.sections.map((s) => JSON.stringify(s)).join("\n"),
+      })
+    : undefined;
   return [
     TURN_MARK.writer,
     `질문: ${input.question}`,
     `보고서 제목: ${input.plan.title}`,
     `하위 질문:\n${input.plan.subQuestions.map((q) => `- ${q.question}`).join("\n")}`,
+    ...(outline
+      ? [
+          `개요 (섹션마다 heading·question·notes·analysis, 이 순서대로 보고서 전체를 한 번에 쓴다):\n${outline}`,
+        ]
+      : []),
     `확인된 노트 (이것만 근거로 쓴다):\n${notesBlock(input.notes)}`,
   ].join("\n\n");
 }
@@ -257,16 +398,35 @@ export function parseGaps(text: string, hasFiles: boolean): { question: string; 
 }
 
 /** A sub-researcher's note as written (before the server checks its passage). */
-export type RawNote = { claim: string; quote: string; sourceId?: string; fileId?: string; page?: number };
+export type RawNote = {
+  claim: string;
+  /** The identity of the whole claim as written (`claimKeyOf`, before `claim` is cut to 500 characters). */
+  claimKey: string;
+  quote: string;
+  sourceId?: string;
+  fileId?: string;
+  page?: number;
+};
 
 /**
  * The `NOTE {…}` lines of a sub-researcher's text — also of a turn that was stopped half-way (a line cut off is
  * dropped). At most `max` notes.
  */
 export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQuestion): RawNote[] {
+  return parseNotesCounted(text, max).notes;
+}
+
+/**
+ * `parseNotes`, and how many well-formed `NOTE` lines there were in all (`submitted`, #232 — the card's 제외 counts
+ * what was submitted but not kept, the ones past `max` too).
+ */
+export function parseNotesCounted(
+  text: string,
+  max: number = RESEARCH_LIMITS.notesPerQuestion,
+): { notes: RawNote[]; submitted: number } {
   const out: RawNote[] = [];
+  let submitted = 0;
   for (const line of text.split(/\r?\n/)) {
-    if (out.length >= max) break;
     const m = /^\s*(?:[-*]\s*)?NOTE\s+(\{.*\})\s*$/.exec(line);
     if (!m) continue;
     let v: Record<string, unknown>;
@@ -285,12 +445,15 @@ export function parseNotes(text: string, max: number = RESEARCH_LIMITS.notesPerQ
       typeof v.fileId === "string" && v.fileId.trim() ? v.fileId.trim().replace(/^file:/, "") : undefined;
     if (!sourceId && !fileId) continue;
     const page = typeof v.page === "number" && Number.isInteger(v.page) && v.page > 0 ? v.page : undefined;
+    submitted++;
+    if (out.length >= max) continue;
     out.push({
       claim,
+      claimKey: claimKeyOf(v.claim),
       quote,
       ...(sourceId ? { sourceId } : { fileId: fileId! }),
       ...(page !== undefined && !sourceId ? { page } : {}),
     });
   }
-  return out;
+  return { notes: out, submitted };
 }

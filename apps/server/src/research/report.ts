@@ -6,6 +6,8 @@ import {
   sentenceSpans,
   type CitationMarker,
 } from "@agentlee/shared";
+import { markdownHtml } from "../artifacts/markdown.js";
+import { urlKey } from "../references/collect.js";
 
 /**
  * 깊이 조사's report (#211 decision 4): the writer's text is kept only where a server-checked citation backs it. The
@@ -17,6 +19,10 @@ import {
  * not verify are taken out of the sentences that stay, a heading left without content goes, and the markers are
  * numbered again in the order they appear. Tables and code blocks are not kept (the writer is told not to write
  * them): each of their content rows counts as removed. The server then adds the source list and "한계" itself.
+ *
+ * #233: markers are numbered by source (`key`: the page or file), not by passage — two passages of one page are one
+ * number, a run of markers that becomes one number is written once, and the source list shows each source once with
+ * its passages under it (`groupSources`, `renderReport`). The citations' own storage is unchanged.
  */
 
 /** One citation of the writer's step as the report uses it. */
@@ -32,6 +38,8 @@ export type ReportCitation = {
   place?: string | undefined;
   /** The passage as found in the source. */
   quote: string;
+  /** The source the passage is of (`reportSourceKey`): the report numbers by source (#233). */
+  key?: string | undefined;
 };
 
 export type CleanResult = {
@@ -39,7 +47,7 @@ export type CleanResult = {
   body: string;
   /** Sentences (and table / code rows) removed. */
   removed: number;
-  /** Old number → new number, in the new order. */
+  /** Old number → new number (one per source: several old numbers may share one), in the new order. */
   numbering: { from: number; to: number }[];
 };
 
@@ -328,19 +336,71 @@ export function cleanReport(text: string, cites: ReadonlyMap<number, ReportCitat
     .map((b, i) => (i === 0 ? "" : b.item && shown[i - 1]!.item ? "\n" : "\n\n") + b.text)
     .join("")
     .trim();
+  // One number per source (#233), in the order the sources first appear; a run of markers is written once each.
+  const bySource = new Map<string, number>();
   const map = new Map<number, number>();
   const numbering: CleanResult["numbering"] = [];
-  const body = held.replace(HELD, (_m, d: string) => {
-    const n = Number(d);
+  const numberOf = (n: number) => {
     let k = map.get(n);
     if (k === undefined) {
-      k = map.size + 1;
+      const key = cites.get(n)?.key ?? `n:${n}`;
+      k = bySource.get(key) ?? bySource.size + 1;
+      bySource.set(key, k);
       map.set(n, k);
       numbering.push({ from: n, to: k });
     }
-    return `[${k}]`;
+    return k;
+  };
+  const body = held.replace(HELD_RUN, (run) => {
+    const ks = [...run.matchAll(HELD)].map((m) => numberOf(Number(m[1])));
+    return [...new Set(ks)].map((k) => `[${k}]`).join("");
   });
   return { body, removed, numbering };
+}
+
+// Markers side by side, or apart by spaces only (`[1] [3]`), are one run — as the chat's chips read them.
+// eslint-disable-next-line no-control-regex -- see HELD
+const HELD_RUN = /\u0000\d{1,3}\u0000(?:[ \t]*\u0000\d{1,3}\u0000)*/g;
+
+/**
+ * One report source (#233), the same for the writer's report and the fallback: a file by its id; a page by its
+ * address as the references de-duplicate it (`urlKey` — no fragment, the query kept), else by the source's id.
+ */
+export function reportSourceKey(s: {
+  fileId?: string | null | undefined;
+  url?: string | null | undefined;
+  sourceId?: string | null | undefined;
+}): string | undefined {
+  if (s.fileId) return `file:${s.fileId}`;
+  // The stored, verified address (#233 review 8): two pages the crawler fetched apart stay two sources.
+  const u = s.url ? urlKey(s.url) : undefined;
+  return u ?? (s.sourceId ? `source:${s.sourceId}` : undefined);
+}
+
+/** The `href` a link to this address gets on the report page (rendered as the page renders it), or none. */
+export function linkedHref(url: string): string | undefined {
+  const d = /^https?:\/\//i.test(url) ? destination(url) : undefined;
+  if (!d) return undefined;
+  const m = /<a href="([^"]*)"/.exec(markdownHtml(`[x](${d})`));
+  return m?.[1]
+    ?.replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Whether the stored address itself can be linked (#233 review 13): an http(s) address, written as the URL standard
+ * writes it (`new URL(…).href` is the same string), that goes into a link verbatim and comes out as itself.
+ */
+function linkable(url: string): boolean {
+  let href: string;
+  try {
+    href = new URL(url).href;
+  } catch {
+    return false;
+  }
+  return href === url && linkedHref(url) === url;
 }
 
 /** Headings with nothing under them (before the next heading of the same or a higher level) go. */
@@ -356,35 +416,69 @@ function dropEmptySections(blocks: Block[]): Block[] {
   });
 }
 
-/** Page or file text going into the markdown: one line, no markup that could open a link, an image or a block. */
-export function mdText(s: string, max = 200): string {
-  const one = Array.from(
-    s
-      .replace(/[\r\n\t]+/g, " ")
-      .replace(/\s{2,}/g, " ")
-      .trim(),
-  );
-  const clipped = one.length > max ? `${one.slice(0, max - 1).join("")}…` : one.join("");
-  return clipped.replace(/([\\`*_{}[\]()<>#|!~])/g, "\\$1");
+/** One source of the report (#233): its number, and the passages of it the report cites (one line each). */
+export type ReportSource = {
+  k: number;
+  kind: "web" | "file";
+  title: string;
+  url?: string | undefined;
+  site?: string | undefined;
+  passages: { quote: string; place?: string | undefined }[];
+};
+
+/** The citations the body keeps, by their new number, as sources: the passages of one number listed together. */
+export function groupSources(cites: readonly (ReportCitation & { k: number })[]): ReportSource[] {
+  const out = new Map<number, ReportSource>();
+  for (const c of cites) {
+    let s = out.get(c.k);
+    if (!s) {
+      s = { k: c.k, kind: c.kind, title: c.title, url: c.url, site: c.site, passages: [] };
+      out.set(c.k, s);
+    }
+    if (!s.passages.some((p) => p.quote === c.quote && p.place === c.place))
+      s.passages.push({ quote: c.quote, ...(c.place ? { place: c.place } : {}) });
+  }
+  return [...out.values()].sort((a, b) => a.k - b.k);
 }
 
-const safeUrl = (u: string | undefined) => {
-  if (!u) return undefined;
-  try {
-    const p = new URL(u);
-    return p.protocol === "https:" || p.protocol === "http:" ? p.toString() : undefined;
-  } catch {
-    return undefined;
-  }
-};
+/**
+ * A link destination for this address, written verbatim inside `<…>` (#233 review 12: the stored report holds every
+ * address as it is, so a secret found in it later is masked whole) — or none, when Markdown would read the address
+ * differently there (an entity-like `&…;`, `\\`, `<`, `>`, a line break or space) or the page's link would not be
+ * exactly this address (`linkedHref`). Without one, the entry is shown as code, not linked.
+ */
+function destination(url: string): string | undefined {
+  if (/&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]*);|[\\<>\s]/i.test(url)) return undefined;
+  return `<${url}>`;
+}
+
+/**
+ * Page, file, user or model text as one line, otherwise verbatim (#233 review 13): each line break becomes a space —
+ * nothing trimmed, cut or collapsed (every such text is already bounded where it is stored: a source title 300, a
+ * site 120, a passage 500, a sub-question 300, the report title 120), so a secret found in it later is masked whole.
+ */
+export function oneLine(t: string): string {
+  return t.replace(/\r\n|\r|\n/g, " ");
+}
+
+/** Text as an inline code span (a fence longer than any run of backticks in it), one line. */
+export function codeSpan(t: string): string {
+  const v = t.replace(/\r\n|\r|\n/g, " ");
+  const fence = "`".repeat(Math.max(0, ...(v.match(/`+/g) ?? []).map((r) => r.length)) + 1);
+  // A renderer drops one space at each end when both ends have one, and a backtick at an end needs a space: one
+  // padding space each side then, so what is shown is the text as it is.
+  // (Spaces only: a renderer strips nothing then — no padding.)
+  const pad = /[^ ]/.test(v) && /^[ `]|[ `]$/.test(v) ? " " : "";
+  return `${fence}${pad}${v}${pad}${fence}`;
+}
 
 export type ReportInput = {
   title: string;
   /** "2026-11-19" (Asia/Seoul). */
   date: string;
   body: string;
-  /** The citations the body keeps, by their new number. */
-  sources: (ReportCitation & { k: number })[];
+  /** The sources the body cites, by their number. */
+  sources: ReportSource[];
   removed: number;
   timedOut: boolean;
   fallback: boolean;
@@ -395,14 +489,28 @@ export type ReportInput = {
 
 /** The whole report: title, the job's line, the body, the source list and "한계". */
 export function renderReport(r: ReportInput): string {
+  // One numbered item per source, its quoted passages under it (#233) — as deep as its number is wide (`10. ` takes
+  // four), or the list would end there.
   const src = r.sources.map((c) => {
-    const quote = `“${mdText(c.quote, 160)}”`;
-    if (c.kind === "file")
-      return `${c.k}. 📎 ${mdText(c.title, 80)}${c.place ? ` · ${mdText(c.place, 40)}` : ""} — ${quote}`;
-    const url = safeUrl(c.url);
-    const name = mdText(c.title || c.site || "웹 페이지", 100);
-    const link = url ? `[${name}](<${url.replace(/[<>\s]/g, encodeURIComponent)}>)` : name;
-    return `${c.k}. ${link}${c.site ? ` — ${mdText(c.site, 40)}` : ""} — ${quote}`;
+    const pad = " ".repeat(`${c.k}. `.length);
+    // Page and file text as code (#233 review 10): both renderers show it as written — no autolink, no math, no list
+    // marker (a sheet named `+ 실적`), nothing added to it (a secret found in it later is still masked whole).
+    const passages = c.passages.map(
+      (p) => `${pad}- ${p.place ? `${codeSpan(oneLine(p.place))} — ` : ""}${codeSpan(oneLine(p.quote))}`,
+    );
+    let head: string;
+    if (c.kind === "file") head = `${c.k}. 📎 ${codeSpan(oneLine(c.title))}`;
+    else {
+      const url = c.url && /^https?:\/\//i.test(c.url) ? c.url : undefined;
+      const name = codeSpan(oneLine(c.title || c.site || "웹 페이지"));
+      const site = c.site ? ` — ${codeSpan(oneLine(c.site))}` : "";
+      // Linked only when the stored address itself goes in verbatim and comes out as itself (#233 reviews 8, 12, 13);
+      // otherwise the stored address is shown as code, whole — never a link to an altered address.
+      if (!url) head = `${c.k}. ${name}${site}`;
+      else if (linkable(url)) head = `${c.k}. [${name}](${destination(url)!})${site}`;
+      else head = `${c.k}. ${name}${site} — ${codeSpan(oneLine(url))}`;
+    }
+    return [head, ...passages].join("\n");
   });
   const limits = [
     `- 서버가 원문과 대조해 확인하지 못한 문장 ${r.removed}개를 보고서에서 뺐어요.`,
@@ -411,13 +519,14 @@ export function renderReport(r: ReportInput): string {
       ? ["- 보고서 작성을 끝내지 못해, 확인된 원문 구절을 하위 질문별로 그대로 정리했어요."]
       : []),
     ...(r.unanswered.length
-      ? [`- 확인된 근거를 찾지 못한 하위 질문: ${r.unanswered.map((q) => mdText(q, 80)).join(" / ")}`]
+      ? [`- 확인된 근거를 찾지 못한 하위 질문: ${r.unanswered.map((q) => codeSpan(oneLine(q))).join(" / ")}`]
       : []),
     "- 이 보고서는 조사 중에 가져온 공개 웹 페이지와 첨부 파일에서 **원문 구절이 확인된** 내용만 담아요. 확인 시점 이후 바뀐 내용은 반영되지 않아요.",
   ];
   return [
-    `# ${mdText(r.title, 120)}`,
-    `> 깊이 조사 보고서 · ${r.date} · 하위 질문 ${r.questions}개 · 출처 ${r.sources.length}개${r.timedOut ? " · 시간 상한으로 일부만 조사" : ""}`,
+    // Verbatim as code (#233 review 12): the stored report holds the title as written.
+    `# ${codeSpan(oneLine(r.title))}`,
+    `> 깊이 조사 보고서 · ${r.date} · 하위 질문 ${r.questions}개 · 보고서에 인용한 출처 ${r.sources.length}개${r.timedOut ? " · 시간 상한으로 일부만 조사" : ""}`,
     r.body || "_확인된 근거로 쓸 수 있는 내용이 없었어요._",
     `## 출처\n\n${src.length ? src.join("\n") : "- (없음)"}`,
     `## 한계\n\n${limits.join("\n")}`,

@@ -125,6 +125,8 @@ export type WorkerResult =
       units: number | null;
       truncated: boolean;
       ocr: string;
+      /** A PDF's metadata title, when it has one (#234: a web PDF's name). */
+      title?: string;
       segments: WorkerSegment[];
     }
   | { ok: false; code: string };

@@ -218,9 +218,12 @@ export const LOG_EVENTS = [
   "research.started",
   "research.approved",
   "research.resumed",
+  // #234: how many weak sub-questions (no verified note, or one source) were researched once more.
+  "research.retry",
   "research.stopped",
   "research.done",
   "research.failed",
+  "research.outline_unsaved",
   // Public artifact links (#204): created, viewed, turned off, refused (secret) or rate limited — a fixed code and the
   // owner's id only; never the token, a visitor's IP or user agent, or the title.
   "public_link.event",

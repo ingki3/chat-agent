@@ -30,6 +30,12 @@ export const RESEARCH_LIMITS = {
   subagentMs: 6 * 60_000,
   /** Gap-filling rounds after the first (reflection depth). */
   maxDepth: 2,
+  /**
+   * One more gap-filling round beyond `maxDepth` (#234) — only when at least `extraRoundMs` of the research budget is
+   * still left at that point (a quick job uses the time it has; it never runs past its deadline).
+   */
+  extraDepth: 1,
+  extraRoundMs: 8 * 60_000,
   /** New sub-questions one reflection may add. */
   maxGapQuestions: 3,
   /**
@@ -101,6 +107,39 @@ export const RESEARCH_ENDED: ReadonlySet<ResearchStatus> = new Set([
   "cancelled",
 ]);
 
+/**
+ * What a job is doing right now (#232), finer than its status: the lead's reflection between rounds, the writer's
+ * outline and draft, the server's check of the report. Transient — kept in memory while the job runs (a restart starts
+ * from the status again: planning / researching / writing). Any stage may set it (an outline step sets `outlining`).
+ */
+export const ResearchPhase = z.enum([
+  "planning",
+  "researching",
+  "reflecting",
+  "outlining",
+  "writing",
+  "verifying",
+]);
+export type ResearchPhase = z.infer<typeof ResearchPhase>;
+
+/**
+ * Every activity label there is (#232): a fixed phrase and a count — never anything of a tool's input or output, the
+ * model's words, a page or a file. Checked by the server before it sends a line and by a page as it reads one.
+ */
+export const ACTIVITY_LABEL =
+  /^(검색 중 · \d{1,9}번째 검색|페이지 읽는 중 · \d{1,9}번째 페이지|페이지에서 찾는 중|파일 검색 중|파일 읽는 중)$/;
+
+/**
+ * A sub-researcher's latest tool call (#232), as the card shows it: the kind of step and its fixed label
+ * (`ACTIVITY_LABEL`). Transient like the phase.
+ */
+export const ResearchActivity = z.object({
+  kind: z.enum(["search", "fetch", "find", "file"]),
+  label: z.string().max(40).regex(ACTIVITY_LABEL),
+  at: z.number().int(),
+});
+export type ResearchActivity = z.infer<typeof ResearchActivity>;
+
 export const ResearchQuestionState = z.object({
   id: z.string(),
   question: z.string(),
@@ -108,11 +147,17 @@ export const ResearchQuestionState = z.object({
   /** Which round asked it: 0 = the plan, 1–2 = gap-filling rounds. */
   round: z.number().int().min(0),
   status: z.enum(["waiting", "running", "done", "capped", "failed"]),
-  /** Distinct sources (pages, files) its verified notes rest on. */
+  /**
+   * Distinct sources (pages, files) its verified notes rest on — "검증한 자료" on the card, cited in the report or not:
+   * a web page by the hash of its stored body (#234 — the same body under another address is one; a row without a body
+   * hash by its final address's page key), an attachment by its file id (two files with the same content are two).
+   */
   sources: z.number().int().min(0),
   /** Notes the server could verify / that it dropped. */
   notes: z.number().int().min(0),
   dropped: z.number().int().min(0),
+  /** The latest tool call while it runs (#232); null otherwise (and after a restart until its next call). */
+  activity: ResearchActivity.nullable().optional(),
 });
 export type ResearchQuestionState = z.infer<typeof ResearchQuestionState>;
 
@@ -129,6 +174,8 @@ export const ResearchErrorCode = z.enum([
   "not_allowed",
   /** The conversation was switched to another runtime (Codex) before or while the job ran. */
   "runtime_changed",
+  /** The runtime stopped itself — it tried a tool it was not offered (#234: never retried). */
+  "runtime_policy",
 ]);
 export type ResearchErrorCode = z.infer<typeof ResearchErrorCode>;
 
@@ -137,7 +184,10 @@ export const ResearchResult = z.object({
   version: z.number().int().positive(),
   /** Sentences removed because no server-checked citation backs them (shown in the report's "한계"). */
   removed: z.number().int().min(0),
-  /** Citations the report keeps (all verified). */
+  /**
+   * Sources the report cites (all verified) — "보고서에 인용한 출처" on the card: one per page (its stored final
+   * address, fragment dropped) or file, as the report's 출처 list numbers them (#233). Not the same count as `sources`.
+   */
   citations: z.number().int().min(0),
   /** The 30-minute cap ended research early: "시간 상한으로 일부만 조사". */
   timedOut: z.boolean(),
@@ -156,9 +206,22 @@ export const ResearchJob = z.object({
   clarify: z.object({ question: z.string(), answer: z.string().nullable() }).nullable(),
   plan: ResearchPlan.nullable(),
   stage: z.enum(["plan", "research", "write", "end"]),
+  /** What it is doing right now while active (#232); null once it waits for the owner or has ended. */
+  phase: ResearchPhase.nullable().optional(),
+  /** The writer's progress within a phase, if a step reports it ("섹션 k/n"). */
+  phaseProgress: z
+    .object({ done: z.number().int().min(0), total: z.number().int().min(1) })
+    .nullable()
+    .optional(),
+  /** When the job last did something (a tool call, text, a saved step) — "마지막 활동 n초 전". */
+  lastActivityAt: z.number().int().nullable().optional(),
+  /** Orders live states (#232) within one `version`: of two of the same version, the higher `seq` is newer. */
+  seq: z.number().int().min(0).optional(),
+  /** The server process that counted `seq` (random per start): `seq`s of two processes are not compared. */
+  boot: z.string().max(16).optional(),
   round: z.number().int().min(0),
   questions: z.array(ResearchQuestionState),
-  /** Distinct verified sources so far. */
+  /** Distinct verified sources so far — "검증한 자료", counted as a question's `sources` (not `result.citations`). */
   sources: z.number().int().min(0),
   /** Active time used so far (approval wait excluded), and the server's hard deadline once approved. */
   elapsedMs: z.number().int().min(0),
@@ -171,10 +234,39 @@ export const ResearchJob = z.object({
   approvedAt: z.number().int().nullable(),
   endedAt: z.number().int().nullable(),
   owned: z.boolean(),
-  /** +1 on every change: a page keeps the newest it has seen (an action's answer may be older than the stream). */
+  /**
+   * +1 on every saved change: a page keeps the newest it has seen (an action's answer may be older than the stream).
+   * Live activity (#232) is not saved and does not count: of two of the same version, the higher `seq` wins.
+   */
   version: z.number().int().min(0),
 });
 export type ResearchJob = z.infer<typeof ResearchJob>;
+
+/**
+ * A job as a page reads it (#232): a sub-question's live activity line that does not fit its schema is dropped (null)
+ * rather than the whole job refused — the line is a nicety, the job is not.
+ */
+export function parseResearchJob(raw: unknown): ResearchJob {
+  return ResearchJob.parse(withValidActivity(raw));
+}
+export function safeParseResearchJob(raw: unknown) {
+  return ResearchJob.safeParse(withValidActivity(raw));
+}
+function withValidActivity(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const job = raw as { questions?: unknown };
+  if (!Array.isArray(job.questions)) return raw;
+  return {
+    ...job,
+    questions: job.questions.map((q: unknown) => {
+      if (!q || typeof q !== "object" || !("activity" in q)) return q;
+      const a = (q as { activity: unknown }).activity;
+      return a === null || a === undefined || ResearchActivity.safeParse(a).success
+        ? q
+        : { ...q, activity: null };
+    }),
+  };
+}
 
 /** `POST /api/conversations/:id/research`: the question (the composer's text) and the files sent with it. */
 export const StartResearchRequest = z

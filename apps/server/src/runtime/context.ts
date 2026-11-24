@@ -206,6 +206,16 @@ export function contextHistory(messages: readonly MessageRow[]): StartContext["h
  * this conversation's sources now (`stored`: whether the source is one, and whether its page text is stored). An id
  * the conversation does not have (any more) is left out: a runtime is never handed an id `cite` would not know.
  */
+/** The source ids the history's citation notes name (what `citedSources` looks up). */
+export function citedSourceIds(messages: readonly MessageRow[]): string[] {
+  const ids = new Set<string>();
+  for (const m of messages)
+    for (const p of m.parts as MessagePart[])
+      if (p.type === "citation_note")
+        for (const c of p.citations) if (c.sourceId && c.url) ids.add(c.sourceId);
+  return [...ids];
+}
+
 export function citedSources(
   messages: readonly MessageRow[],
   stored: (sourceId: string) => { text: boolean } | undefined,

@@ -32,7 +32,11 @@ export type StepSpec = {
   model: string;
   effort: string | null;
   systemPrompt: string;
-  text: string;
+  /**
+   * The turn's text — or a function giving it, called right before the turn is sent (after the session and our MCP
+   * server are ready): a turn made of stored text goes through the secrets known at that moment (#233 review 19).
+   */
+  text: string | (() => string);
   /** Our MCP tools for the step (without prefix); empty: no MCP server. */
   tools: string[];
   /** Time limit of the step. */
@@ -41,8 +45,12 @@ export type StepSpec = {
   toolCalls?: number | undefined;
   /** The job's own stop (the owner's stop, the stage's deadline, the conversation deleted, shutdown). */
   signal: AbortSignal;
-  /** Called on every tool start (progress). */
-  onTool?: (() => void) | undefined;
+  /** Called on every tool start (progress, #232): which tool — only its name, nothing of its input. */
+  onTool?: ((call: { name: string }) => void) | undefined;
+  /** Called when a tool call has ended. */
+  onToolEnd?: (() => void) | undefined;
+  /** Called on text from the model (a sign of life; never the text itself). */
+  onText?: (() => void) | undefined;
 };
 
 export type StepEnd = "done" | "timeout" | "capped" | "aborted" | "failed";
@@ -64,6 +72,15 @@ export type StepDeps = {
   /** Background work of a step after its result (closing a session that is slow to stop): shutdown waits for it. */
   track?: ((p: Promise<void>) => void) | undefined;
 };
+
+/** A progress hook never ends the step (it only shows progress). */
+function hook(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // progress only
+  }
+}
 
 /** Output beyond this is not read (a runaway step): it is stopped. */
 const OUTPUT_MAX = 200_000;
@@ -148,16 +165,20 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
         void closeSession();
         return snapshot();
       }
-      turn = session.turn({ text: spec.text, model: spec.model, effort: spec.effort ?? undefined });
+      const turnText = typeof spec.text === "function" ? spec.text() : spec.text;
+      turn = session.turn({ text: turnText, model: spec.model, effort: spec.effort ?? undefined });
       for await (const ev of turn.events) {
         if (ended) break;
         if (ev.type === "text_delta") {
           text += ev.text;
           if (text.length > OUTPUT_MAX) stop("capped");
+          else hook(() => spec.onText?.());
         } else if (ev.type === "tool_start") {
           toolCalls++;
-          spec.onTool?.();
+          hook(() => spec.onTool?.({ name: ev.name }));
           if (spec.toolCalls !== undefined && toolCalls > spec.toolCalls) stop("capped");
+        } else if (ev.type === "tool_end") {
+          hook(() => spec.onToolEnd?.());
         } else if (ev.type === "usage") record(spec, deps, usageReport(ev));
         else if (ev.type === "limit") limited = true;
       }
@@ -173,7 +194,10 @@ export async function runStep(spec: StepSpec, deps: StepDeps): Promise<StepResul
             ? "runtime_auth"
             : e.code === "no_connection"
               ? "no_connection"
-              : "runtime_error"
+              : // The runtime's own refusal (a tool it was not offered) is kept: never a passing error (#234).
+                e.code === "runtime_policy"
+                ? "runtime_policy"
+                : "runtime_error"
           : "runtime_error";
       return { text, ended: "failed", toolCalls, error };
     }

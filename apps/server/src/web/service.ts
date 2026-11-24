@@ -3,12 +3,14 @@ import net from "node:net";
 import type { SkillResult, ToolScope } from "@agentlee/mcp-tools";
 import type { SearchHit } from "@agentlee/mcp-tools/skills";
 import { WEB_WORKER_DIR, WEB_WORKER_ENTRY } from "@agentlee/mcp-tools/web";
-import { defuseExternal, frameExternal } from "@agentlee/shared";
+import { defuseExternal, frameExternal, sourceTypeOf } from "@agentlee/shared";
 import { EgressService, isPrivateName } from "../isolation/egress.js";
 import { isBlockedAddress } from "../isolation/net.js";
 import { runIsolated } from "../isolation/sandbox.js";
 import { carriesSecret, SEARCH_DECOY, urlTexts } from "../secrets/egress.js";
-import { cut, SOURCE_LIMITS, type SourceStore } from "./sources.js";
+import { cutAt, cutOutsideGap, hasGapMarks, stripGapMarks, visibleIndex } from "../citations/verify.js";
+import { isPdfBytes, PDF_TEXT_CHARS, type PdfReader } from "./pdf.js";
+import { cut, pdfTitle, SOURCE_LIMITS, type SourceStore } from "./sources.js";
 
 /**
  * Web search and fetch for the runtimes (#50, PRD FR-5.1·5.2·5.7, network policy #42).
@@ -56,7 +58,12 @@ const code = (c: unknown): WebCode => (typeof c === "string" && KNOWN.has(c) ? (
 export const MAX_REDIRECTS = 5;
 export const FETCH_MS = 20_000;
 
-/** Characters of page text the model gets back from one fetch (the stored body is longer). */
+export { pdfTitle };
+
+/**
+ * Characters of page text the model gets back from one fetch (the stored body is longer — `web_find` searches it,
+ * #234).
+ */
 export const EXCERPT_CHARS = 10_000;
 export const MAX_URL = SOURCE_LIMITS.url;
 
@@ -148,6 +155,14 @@ export const WORKER_LIMITS = {
   maxOutputBytes: 4 * 1024 * 1024,
   maxRssBytes: 256 * 1024 * 1024,
 };
+/**
+ * The output of a page fetch, the one job that may hand back a PDF's bytes (base64 — worker.mjs `maxPdfBytes`,
+ * 10 MiB → 13.4 MiB of text, #234). Searches and raw jobs keep `WORKER_LIMITS.maxOutputBytes`.
+ */
+export const FETCH_OUTPUT_BYTES = 16 * 1024 * 1024;
+/** The process limits of one worker job: the larger output for a page fetch only. */
+export const workerLimitsOf = (job: WorkerJob) =>
+  job.op === "fetch" ? { ...WORKER_LIMITS, maxOutputBytes: FETCH_OUTPUT_BYTES } : WORKER_LIMITS;
 
 /**
  * The worker in the sandbox: reads its own folder and node only, writes nothing, no children, no inherited
@@ -167,7 +182,7 @@ export function sandboxedWorker(node = fs.realpathSync(process.execPath)): WebWo
         write: [],
         network: { loopbackPorts: [proxy.port] },
         stdin: JSON.stringify(job),
-        ...WORKER_LIMITS,
+        ...workerLimitsOf(job),
       });
     } catch {
       return { ok: false, code: "web_unavailable" };
@@ -337,6 +352,13 @@ export type WebServiceOptions = {
   fetchProxy?: Proxy;
   /** Whether the calling run may still store what it fetched (false once it was stopped). Default: always. */
   alive?: (scope: ToolScope) => boolean;
+  /** Calls `fn` the moment the calling run is stopped (its tokens revoked); returns the unsubscribe. */
+  onStop?: (scope: ToolScope, fn: () => void) => () => void;
+  /**
+   * A PDF's text (#234): the document extractor in its sandbox (`web/pdf.ts`). Without it a PDF is
+   * `web_unsupported_type`, as before.
+   */
+  pdf?: PdfReader;
 };
 
 export class WebService {
@@ -433,6 +455,8 @@ export class WebService {
       url: hit.url,
       site: hit.site,
       publishedAt: hit.publishedAt ?? null,
+      // Primary sources first (#234): the address's kind ("official", "academic", null).
+      sourceType: sourceTypeOf(hit.url),
     });
     const assemble = (hits: (SearchHit & { site: string })[], ids: (string | null)[]) => ({
       provider,
@@ -487,9 +511,38 @@ export class WebService {
     // keeps `web_secret_blocked` (#113 review: no answer tells a known secret apart).
     if (!r.ok && r.code === "web_secret_blocked") return markBlocked({ ok: false, code: "web_blocked" });
     if (!r.ok) return { ok: false, code: code(r.code) };
-    const text = typeof r.text === "string" ? r.text : "";
     const finalUrl = typeof r.finalUrl === "string" ? linkOf(r.finalUrl) : undefined;
     if (!finalUrl) return { ok: false, code: "web_failed" };
+    // A page's own text as it is: a U+E000 in it is ordinary text — only a web PDF's marks are honoured (#234).
+    let text = typeof r.text === "string" ? r.text : "";
+    let truncated = r.truncated === true;
+    let title = typeof r.title === "string" ? r.title : undefined;
+    let unread = false;
+    if (typeof r.pdf === "string") {
+      // A PDF (#234): its bytes, read by the document extractor (sandboxed, no network, no OCR).
+      if (!this.opts.pdf) return { ok: false, code: "web_unsupported_type" };
+      const bytes = Buffer.from(r.pdf, "base64");
+      if (!isPdfBytes(bytes)) return { ok: false, code: "web_bad_content" };
+      if (this.opts.alive && !this.opts.alive(scope)) return { ok: false, code: "web_not_allowed" };
+      // The run stopped meanwhile (its token revoked): the read waiting for a slot never starts, a running
+      // extraction is stopped — at the revocation itself, not on a timer (review #237 1·2차).
+      const stop = new AbortController();
+      const off = this.opts.onStop?.(scope, () => stop.abort());
+      let p;
+      try {
+        p = await this.opts.pdf(bytes, stop.signal);
+      } finally {
+        off?.();
+      }
+      if (!p.ok) return { ok: false, code: p.code };
+      // Cut to the stored bound — never through a gap mark (the cut moves before it).
+      text = cutOutsideGap(p.text, PDF_TEXT_CHARS);
+      truncated = p.truncated || p.text.length > PDF_TEXT_CHARS;
+      unread = p.unread;
+      // The document's own title first (its metadata, review #237 13차), else the file name of its address; the
+      // source store bounds it on a code point and masks known secrets again.
+      title = p.title || pdfTitle(finalUrl);
+    }
     if (!text.trim()) return { ok: false, code: "web_no_text" };
     const s = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
     const site = s(r.site) ?? siteOf(finalUrl);
@@ -498,29 +551,43 @@ export class WebService {
     const row = this.opts.sources.addPage(scope, {
       url: checked.url.toString(),
       finalUrl: finalUrl.toString(),
-      title: s(r.title) ?? site,
+      title: s(title) ?? site,
       site,
       publishedAt: isoOf(s(r.publishedAt)),
       contentType: s(r.contentType) ?? "text/plain",
       body: text,
-      truncated: r.truncated === true,
+      truncated,
+      // A PDF named by its metadata: the file-name title an earlier fetch of the same page may have stored.
     });
     if (!row) return { ok: false, code: "web_not_allowed" };
-    const excerpt = text.length > EXCERPT_CHARS ? text.slice(0, EXCERPT_CHARS) : text;
+    const pdf = hasGapMarks(row.contentType);
+    // On a code point (review #237 10차): never half a surrogate pair at the end of the excerpt.
+    const cutText = cutAt(text, EXCERPT_CHARS);
+    // A web PDF is shown without its marks' U+E000 and counted as its visible text; other pages as they are.
+    const excerpt = pdf ? stripGapMarks(cutText) : cutText;
     return {
       ok: true,
       output: {
         sourceId: row.id,
         url: row.url,
         finalUrl: row.finalUrl,
-        title: row.title,
         site: row.site,
         publishedAt: row.publishedAt,
         contentType: row.contentType,
-        characters: text.length,
+        // Official / academic / other by the address (#234): primary sources first.
+        sourceType: sourceTypeOf(row.finalUrl ?? row.url),
+        characters: pdf ? visibleIndex(text, text.length) : text.length,
         excerptCharacters: excerpt.length,
-        truncated: row.truncated,
-        content: frameExternal({ source: row.finalUrl ?? row.url, content: excerpt }),
+        // This fetch's own truncation (a reused row may have been stored from a shorter answer — review #237 18차).
+        truncated,
+        // A PDF with pages that have no text (scans): they stand as "[읽지 못한 쪽]" in the text (#234).
+        ...(unread ? { unreadPages: true } : {}),
+        // The title is the page's (or a PDF author's) words too: inside the external-content block, never a field
+        // of its own (review #237 14차).
+        content: frameExternal({
+          source: row.finalUrl ?? row.url,
+          content: `title: ${row.title}\n\n${excerpt}`,
+        }),
       },
     };
   }

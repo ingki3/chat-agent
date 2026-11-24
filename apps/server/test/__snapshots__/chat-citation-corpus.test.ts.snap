@@ -1,0 +1,678 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`chat citation check is unchanged by the report's Markdown (#233) > gives the same units, markers and missing ranges on the corpus 1`] = `
+[
+  {
+    "ends": [
+      {
+        "end": 10,
+        "n": 1,
+        "start": 7,
+      },
+      {
+        "end": 37,
+        "n": 2,
+        "start": 34,
+      },
+      {
+        "end": 40,
+        "n": 3,
+        "start": 37,
+      },
+    ],
+    "markers": [
+      {
+        "end": 10,
+        "n": 1,
+        "start": 7,
+      },
+      {
+        "end": 37,
+        "n": 2,
+        "start": 34,
+      },
+      {
+        "end": 40,
+        "n": 3,
+        "start": 37,
+      },
+    ],
+    "missing": [],
+    "plain": [
+      {
+        "end": 23,
+        "start": 0,
+      },
+      {
+        "end": 41,
+        "start": 25,
+      },
+    ],
+    "t": "수출이 늘었다[1]. 근거 없는 문장이다.
+
+두 번째 문단이다[2][3].",
+    "units": [
+      {
+        "end": 23,
+        "kind": "body",
+        "start": 0,
+      },
+      {
+        "end": 41,
+        "kind": "body",
+        "start": 25,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 16,
+        "n": 1,
+        "start": 13,
+      },
+      {
+        "end": 39,
+        "n": 2,
+        "start": 36,
+      },
+    ],
+    "markers": [
+      {
+        "end": 16,
+        "n": 1,
+        "start": 13,
+      },
+      {
+        "end": 39,
+        "n": 2,
+        "start": 36,
+      },
+    ],
+    "missing": [
+      {
+        "end": 24,
+        "start": 17,
+      },
+      {
+        "end": 27,
+        "start": 25,
+      },
+    ],
+    "plain": [
+      {
+        "end": 5,
+        "start": 3,
+      },
+      {
+        "end": 16,
+        "start": 9,
+      },
+      {
+        "end": 27,
+        "start": 19,
+      },
+      {
+        "end": 48,
+        "start": 31,
+      },
+    ],
+    "t": "## 요약
+
+- 항목이다[1]
+- 근거 없는 항목
+
+> 인용문이다[2].
+> 이어진다.",
+    "units": [
+      {
+        "end": 5,
+        "kind": "heading",
+        "start": 0,
+      },
+      {
+        "end": 16,
+        "kind": "body",
+        "start": 7,
+      },
+      {
+        "end": 24,
+        "kind": "body",
+        "start": 17,
+      },
+      {
+        "end": 27,
+        "kind": "body",
+        "start": 25,
+      },
+      {
+        "end": 48,
+        "kind": "body",
+        "start": 31,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 59,
+        "n": 2,
+        "start": 56,
+      },
+    ],
+    "markers": [
+      {
+        "end": 33,
+        "n": 1,
+        "start": 30,
+      },
+      {
+        "end": 59,
+        "n": 2,
+        "start": 56,
+      },
+    ],
+    "missing": [
+      {
+        "end": 29,
+        "start": 0,
+      },
+    ],
+    "plain": [
+      {
+        "end": 4,
+        "start": 2,
+      },
+      {
+        "end": 8,
+        "start": 7,
+      },
+      {
+        "end": 24,
+        "start": 23,
+      },
+      {
+        "end": 33,
+        "start": 27,
+      },
+      {
+        "end": 39,
+        "start": 38,
+      },
+      {
+        "end": 45,
+        "start": 42,
+      },
+      {
+        "end": 59,
+        "start": 49,
+      },
+    ],
+    "t": "| 자료 | 값 |
+|---|---|
+| 가 | 32%[1] |
+| 나 | 28% |
+
+출처: 통계청[2]",
+    "units": [
+      {
+        "end": 29,
+        "kind": "body",
+        "start": 0,
+        "table": true,
+      },
+      {
+        "end": 47,
+        "kind": "body",
+        "start": 29,
+      },
+      {
+        "end": 59,
+        "kind": "body",
+        "start": 49,
+      },
+    ],
+  },
+  {
+    "ends": [],
+    "markers": [
+      {
+        "end": 36,
+        "n": 1,
+        "start": 33,
+      },
+    ],
+    "missing": [
+      {
+        "end": 19,
+        "start": 0,
+      },
+    ],
+    "plain": [
+      {
+        "end": 3,
+        "start": 2,
+      },
+      {
+        "end": 7,
+        "start": 6,
+      },
+      {
+        "end": 23,
+        "start": 22,
+      },
+      {
+        "end": 28,
+        "start": 26,
+      },
+      {
+        "end": 36,
+        "start": 31,
+      },
+    ],
+    "t": "| 가 | 나 |
+|---|---|
+| 값 | 사실 | 숨은[1] |",
+    "units": [
+      {
+        "end": 19,
+        "kind": "body",
+        "start": 0,
+        "table": true,
+      },
+      {
+        "end": 38,
+        "kind": "body",
+        "start": 20,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 65,
+        "n": 3,
+        "start": 62,
+      },
+    ],
+    "markers": [
+      {
+        "end": 57,
+        "n": 2,
+        "start": 54,
+      },
+      {
+        "end": 65,
+        "n": 3,
+        "start": 62,
+      },
+    ],
+    "missing": [],
+    "plain": [
+      {
+        "end": 3,
+        "start": 0,
+      },
+      {
+        "end": 14,
+        "start": 9,
+      },
+      {
+        "end": 38,
+        "start": 33,
+      },
+      {
+        "end": 66,
+        "start": 58,
+      },
+    ],
+    "t": "코드 \`a[1]\`와 링크 [1](https://x.test), 자동 <https://x.test/[2]>도 있다[3].
+
+\`\`\`
+b[4]
+\`\`\`",
+    "units": [
+      {
+        "end": 66,
+        "kind": "body",
+        "start": 0,
+      },
+      {
+        "end": 9,
+        "inline": true,
+        "kind": "code",
+        "start": 3,
+      },
+      {
+        "end": 80,
+        "kind": "code",
+        "start": 68,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 20,
+        "n": 2,
+        "start": 17,
+      },
+      {
+        "end": 39,
+        "n": 3,
+        "start": 36,
+      },
+    ],
+    "markers": [
+      {
+        "end": 20,
+        "n": 2,
+        "start": 17,
+      },
+      {
+        "end": 39,
+        "n": 3,
+        "start": 36,
+      },
+    ],
+    "missing": [],
+    "plain": [
+      {
+        "end": 6,
+        "start": 0,
+      },
+      {
+        "end": 21,
+        "start": 10,
+      },
+      {
+        "end": 40,
+        "start": 29,
+      },
+    ],
+    "t": "각주가 있다[^1] 그리고 표시[2].
+
+[^1]: 각주 본문이다[3].",
+    "units": [
+      {
+        "end": 21,
+        "kind": "body",
+        "start": 0,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 43,
+        "n": 1,
+        "start": 40,
+      },
+    ],
+    "markers": [
+      {
+        "end": 43,
+        "n": 1,
+        "start": 40,
+      },
+    ],
+    "missing": [],
+    "plain": [
+      {
+        "end": 44,
+        "start": 35,
+      },
+      {
+        "end": 56,
+        "start": 46,
+      },
+    ],
+    "t": "![그림 **99%**](https://x.test/a.png) 설명이다[1].\\
+강제 줄바꿈 뒤다.",
+    "units": [
+      {
+        "end": 56,
+        "kind": "body",
+        "start": 0,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 18,
+        "n": 1,
+        "start": 15,
+      },
+    ],
+    "markers": [
+      {
+        "end": 18,
+        "n": 1,
+        "start": 15,
+      },
+      {
+        "end": 36,
+        "n": 2,
+        "start": 33,
+      },
+    ],
+    "missing": [
+      {
+        "end": 27,
+        "start": 21,
+      },
+    ],
+    "plain": [
+      {
+        "end": 6,
+        "start": 3,
+      },
+      {
+        "end": 19,
+        "start": 10,
+      },
+      {
+        "end": 55,
+        "start": 44,
+      },
+    ],
+    "t": "<b>99%</b> 원문이다[1].
+
+<div>블록 HTML[2]</div>
+
+※ 출처가 부족해요.",
+    "units": [
+      {
+        "end": 19,
+        "kind": "body",
+        "start": 0,
+      },
+      {
+        "end": 27,
+        "kind": "body",
+        "start": 21,
+      },
+      {
+        "end": 42,
+        "kind": "body",
+        "start": 27,
+      },
+      {
+        "end": 55,
+        "kind": "disclaimer",
+        "start": 44,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 75,
+        "n": 2,
+        "start": 72,
+      },
+    ],
+    "markers": [
+      {
+        "end": 54,
+        "n": 1,
+        "start": 51,
+      },
+      {
+        "end": 75,
+        "n": 2,
+        "start": 72,
+      },
+    ],
+    "missing": [
+      {
+        "end": 6,
+        "start": 0,
+      },
+      {
+        "end": 36,
+        "start": 12,
+      },
+    ],
+    "plain": [
+      {
+        "end": 6,
+        "start": 4,
+      },
+      {
+        "end": 16,
+        "start": 14,
+      },
+      {
+        "end": 20,
+        "start": 19,
+      },
+      {
+        "end": 45,
+        "start": 43,
+      },
+      {
+        "end": 54,
+        "start": 48,
+      },
+      {
+        "end": 76,
+        "start": 60,
+      },
+    ],
+    "t": "10. 비교
+
+    | 지역 | 값 |
+    |---|---|
+    | 서울 | 40%[1] |
+
+> 💡 분석
+> 해석이다[2].",
+    "units": [
+      {
+        "end": 6,
+        "kind": "body",
+        "start": 0,
+      },
+      {
+        "before": {
+          "end": 6,
+          "start": 4,
+        },
+        "end": 36,
+        "kind": "body",
+        "start": 12,
+        "table": true,
+      },
+      {
+        "end": 56,
+        "kind": "body",
+        "start": 41,
+      },
+      {
+        "end": 76,
+        "kind": "body",
+        "start": 60,
+      },
+    ],
+  },
+  {
+    "ends": [
+      {
+        "end": 16,
+        "n": 1,
+        "start": 13,
+      },
+    ],
+    "markers": [
+      {
+        "end": 16,
+        "n": 1,
+        "start": 13,
+      },
+    ],
+    "missing": [
+      {
+        "end": 40,
+        "start": 34,
+      },
+      {
+        "end": 68,
+        "start": 54,
+      },
+    ],
+    "plain": [
+      {
+        "end": 17,
+        "start": 9,
+      },
+      {
+        "end": 57,
+        "start": 54,
+      },
+      {
+        "end": 68,
+        "start": 63,
+      },
+    ],
+    "t": "[정책][ref]을 봤다[1].
+
+[ref]: https://x.test
+
+$$
+x[2]
+$$
+
+수식 $a[3]$도 있다.",
+    "units": [
+      {
+        "end": 17,
+        "kind": "body",
+        "start": 0,
+      },
+      {
+        "end": 40,
+        "kind": "body",
+        "start": 34,
+      },
+      {
+        "end": 52,
+        "kind": "code",
+        "start": 42,
+      },
+      {
+        "end": 68,
+        "kind": "body",
+        "start": 54,
+      },
+      {
+        "end": 63,
+        "inline": true,
+        "kind": "code",
+        "start": 57,
+      },
+    ],
+  },
+]
+`;

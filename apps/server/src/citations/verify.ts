@@ -398,8 +398,11 @@ const firstChar = (s: string) => Array.from(s)[0] ?? "";
  * a hit too (cheap next to normalising), so a hash that no longer matches its body is never trusted.
  */
 const BODY_CACHE_SIZE = 4;
-/** Texts normalised so far, snippets included (tests check that a repeated page comes from the cache). */
-export const verifyStats = { normalized: 0 };
+/**
+ * Texts normalised so far, snippets included (tests check that a repeated page comes from the cache), and how often a
+ * text's gap marks were collected (`gapRanges` — once per check or search, #234).
+ */
+export const verifyStats = { normalized: 0, gapRanges: 0 };
 type Page = { n: Normalized; d: Decoded };
 const bodyCache = new Map<string, { body: string; page: Page }>();
 /**
@@ -424,6 +427,83 @@ function pageOf(body: string, key: string | undefined): Page {
   return page;
 }
 
+/**
+ * A private-use character (U+E000) that brackets the mark of a PDF page the extractor could not read (#234,
+ * `web/pdf.ts`). It never comes from a page: the web service removes it from every text it stores
+ * (`stripGapMarks`), so only a mark the PDF reader put there has it — a page that merely says "[읽지 못한 쪽]" is
+ * ordinary text (review #237 4차). Display paths drop the character.
+ */
+export const GAP_MARK = "\uE000";
+/** The mark as stored: its own line, between two `GAP_MARK`s. */
+export const PAGE_GAP = `${GAP_MARK}[읽지 못한 쪽]${GAP_MARK}`;
+
+/** A text without any `GAP_MARK` (what every non-PDF page and every extracted PDF page is stored as). */
+export const stripGapMarks = (t: string) => (t.includes(GAP_MARK) ? t.replaceAll(GAP_MARK, "") : t);
+
+/**
+ * The ranges of the marks in `body`: each pair of `GAP_MARK`s, mark to mark; a mark without its pair (never stored
+ * so — the cut keeps marks whole) reaches the end of the text.
+ */
+export function gapRanges(body: string): [number, number][] {
+  verifyStats.gapRanges++;
+  const out: [number, number][] = [];
+  for (let a = body.indexOf(GAP_MARK); a !== -1;) {
+    const b = body.indexOf(GAP_MARK, a + 1);
+    out.push([a, b === -1 ? body.length : b + 1]);
+    if (b === -1) break;
+    a = body.indexOf(GAP_MARK, b + 1);
+  }
+  return out;
+}
+
+/**
+ * Whether `[start, end)` of `body` overlaps a mark (even one character of it): no match — a citation, a note's
+ * check, `web_find` — ever stands on or across a page that was not read (review #237 2–4차).
+ */
+export function touchesGap(body: string, start: number, end: number): boolean {
+  if (!body.includes(GAP_MARK)) return false;
+  return gapRanges(body).some(([a, b]) => a < end && start < b);
+}
+
+/** `i`, or one before it when `i` would split a surrogate pair. */
+export function codePointCut(text: string, i: number): number {
+  if (i <= 0 || i >= text.length) return i;
+  const hi = text.charCodeAt(i - 1);
+  const lo = text.charCodeAt(i);
+  return hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff ? i - 1 : i;
+}
+
+/** At most `max` UTF-16 units of `text` on a code-point boundary (never half a surrogate pair). */
+export const cutAt = (text: string, max: number) =>
+  text.length <= max ? text : text.slice(0, codePointCut(text, max));
+
+/**
+ * At most `max` characters of `text`, never cutting a mark in two (the cut moves before it) nor a surrogate pair
+ * (review #237 10차 — half a pair is U+FFFD once stored).
+ */
+export function cutOutsideGap(text: string, max: number): string {
+  if (text.length <= max) return text;
+  for (const [a, b] of gapRanges(text)) if (a < max && max < b) return text.slice(0, a).trimEnd();
+  return cutAt(text, max);
+}
+
+/**
+ * `gaps`: the text is a web PDF's as the PDF reader stored it (#234) — its `PAGE_GAP` marks are honoured. Never for
+ * attachments or other pages: a U+E000 there is ordinary text (review #237 5차).
+ */
+export type SnippetOptions = { gaps?: boolean };
+
+/** Whether a stored web source's text carries PDF gap marks (the PDF path stores `application/pdf`). */
+export const hasGapMarks = (contentType: string | null | undefined) => contentType === "application/pdf";
+
+/** `body` without the gap marks' private-use characters, as shown (visible length and positions). */
+export const visibleIndex = (body: string, at: number) => {
+  if (!body.includes(GAP_MARK)) return at;
+  let n = 0;
+  for (let i = body.indexOf(GAP_MARK); i !== -1 && i < at; i = body.indexOf(GAP_MARK, i + 1)) n++;
+  return at - n;
+};
+
 export type SnippetMatch =
   { found: true; quote: string } | { found: false; reason: "too_short" | "not_found" };
 
@@ -432,8 +512,13 @@ export type SnippetMatch =
  * `CITATION_LIMITS.snippet` characters. `cacheKey` (the body's hash) lets repeated checks of one page reuse its
  * normalised text.
  */
-export function findSnippet(body: string, snippet: string, cacheKey?: string): SnippetMatch {
-  const m = findSnippetAt(body, snippet, cacheKey);
+export function findSnippet(
+  body: string,
+  snippet: string,
+  cacheKey?: string,
+  opts: SnippetOptions = {},
+): SnippetMatch {
+  const m = findSnippetAt(body, snippet, cacheKey, opts);
   return m.found ? { found: true, quote: m.quote } : m;
 }
 
@@ -445,6 +530,7 @@ export function findSnippetAt(
   body: string,
   snippet: string,
   cacheKey?: string,
+  opts: SnippetOptions = {},
 ):
   | { found: true; quote: string; start: number; end: number }
   | { found: false; reason: "too_short" | "not_found" } {
@@ -452,9 +538,11 @@ export function findSnippetAt(
   if (Array.from(forms.stripped).length < CITATION_LIMITS.minSnippet)
     return { found: false, reason: "too_short" };
   const page = pageOf(body, cacheKey);
+  // A web PDF's marks, once per check (review #237 6차 — not once per candidate).
+  const ranges = opts.gaps === true ? gapRanges(body) : [];
   // A wrapped snippet is first looked for as it was sent, quotes and all; only then without them.
   for (const want of forms.wrapped === undefined ? [forms.stripped] : [forms.wrapped, forms.stripped]) {
-    const m = matchIn(body, page.n, page.d, want);
+    const m = matchIn(body, page.n, page.d, want, ranges);
     if (m !== undefined) return { found: true, ...m };
   }
   return { found: false, reason: "not_found" };
@@ -469,6 +557,7 @@ function matchIn(
   { norm, from, to }: Normalized,
   dec: Decoded,
   want: string,
+  gaps: readonly [number, number][],
 ): { quote: string; start: number; end: number } | undefined {
   const last = lastChar(want);
   // A numeric edge: a digit in the first / last two tokens, or a sign or currency sign at the start.
@@ -482,6 +571,8 @@ function matchIn(
     if (before !== "" && before !== " " && !BOUNDARY_PUNCT.test(before)) continue;
     const start = from[at]!;
     const end = to[at + want.length - 1]!;
+    // Never on any part of the mark of a page that was not read, nor across it (#234, review #237 2·3차).
+    if (gaps.length && gaps.some(([a, b]) => a < end && start < b)) continue;
     // A numeric edge must be a clause edge (review #97 round 22): the number's whole clause is quoted. A sign
     // before the start, across spaces, line breaks and currency signs, still belongs to the number (`-\n$5`).
     // Both on the decoded page: an entity's `;` is not a clause mark, `&minus;` is a sign (round 25).

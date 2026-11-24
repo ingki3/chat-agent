@@ -4,6 +4,8 @@ import {
   RESEARCH_ENDED,
   RESEARCH_LIMITS,
   ResearchJob,
+  safeParseResearchJob,
+  type ResearchPhase,
   type ResearchQuestionState,
   type ResearchScope,
 } from "@agentlee/shared";
@@ -18,9 +20,26 @@ import "./research.css";
  */
 
 const key = (id: string) => ["research", id] as const;
-/** The job's newer state of the two (its `version` counts every change on the server). */
-export const newest = (old: ResearchJob | undefined, next: ResearchJob) =>
-  old && old.version > next.version ? old : next;
+/**
+ * The job's newer state of the two (its `version` counts every saved change on the server). Live activity (#232) is
+ * not saved; of two of the same version:
+ * - from two server processes (`boot`): the one arriving now — a new process exists only once the old one has gone
+ *   (left over: an answer of the old one still on its way after the new one's first event, until the next change);
+ * - from one process: the higher `seq`;
+ * - only one of them with a `boot`: the later `lastActivityAt` (a tie: the one arriving now);
+ * - else (no live progress then, or a server without them): the later `lastActivityAt`.
+ */
+export const newest = (old: ResearchJob | undefined, next: ResearchJob) => {
+  if (!old) return next;
+  if (old.version !== next.version) return old.version > next.version ? old : next;
+  if (old.boot && next.boot && old.boot !== next.boot) return next;
+  // Only one says which process it is from: their seqs are not comparable — the later activity (a tie: the new one).
+  if (!old.boot !== !next.boot) return (old.lastActivityAt ?? 0) > (next.lastActivityAt ?? 0) ? old : next;
+  const a = old.seq ?? 0;
+  const b = next.seq ?? 0;
+  if (a > 0 || b > 0) return a > b ? old : next;
+  return (old.lastActivityAt ?? 0) > (next.lastActivityAt ?? 0) ? old : next;
+};
 
 const STATUS_TEXT: Record<ResearchJob["status"], string> = {
   planning: "계획을 세우는 중이에요…",
@@ -45,7 +64,36 @@ const ERROR_TEXT: Record<string, string> = {
   conversation_gone: "대화가 삭제됐어요.",
   not_allowed: "이 계정은 지금 Claude를 쓸 수 없어요.",
   runtime_changed: "대화가 Codex로 바뀌어 멈췄어요. 깊이 조사는 Claude 대화에서만 돼요.",
+  runtime_policy: "런타임이 허용되지 않은 도구를 쓰려고 해서 멈췄어요.",
 };
+
+/** What the job is doing now, within its status (#232). */
+const PHASE_TEXT: Record<ResearchPhase, string> = {
+  planning: "계획 세우는 중",
+  researching: "조사",
+  reflecting: "보강할 곳 찾는 중",
+  outlining: "보고서 개요 잡는 중",
+  writing: "보고서 쓰는 중",
+  verifying: "출처 확인하는 중",
+};
+
+/** "마지막 활동 5초 전" — from the server's time of the job's last activity, ticking on screen. */
+export function sinceText(at: number, now: number): string {
+  // A time ahead of this screen's clock (clocks apart, a clock set back) is just now.
+  const s = Math.floor((now - at) / 1000);
+  if (s < 1) return "방금";
+  if (s < 60) return `${s}초 전`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}분 전` : `${Math.floor(m / 60)}시간 전`;
+}
+
+/** The progress line's stage: the phase, the gap-filling round, the writer's k of n. */
+export function stageText(job: ResearchJob): string {
+  const phase = job.phase ?? (job.status === "writing" ? "writing" : "researching");
+  if (phase === "researching") return job.round > 0 ? `보강 조사 ${job.round}단계` : PHASE_TEXT.researching;
+  const k = job.phaseProgress;
+  return k ? `${PHASE_TEXT[phase]} — 섹션 ${Math.min(k.done + 1, k.total)}/${k.total}` : PHASE_TEXT[phase];
+}
 
 const SCOPE_TEXT: Record<ResearchScope, string> = { web: "웹", files: "첨부 파일", both: "웹 + 첨부" };
 const Q_ICON: Record<ResearchQuestionState["status"], string> = {
@@ -54,6 +102,15 @@ const Q_ICON: Record<ResearchQuestionState["status"], string> = {
   done: "✅",
   capped: "⏱",
   failed: "⚠️",
+};
+
+/** Each sub-question's state in words, for a screen reader (the icon is not read). */
+const Q_STATUS_TEXT: Record<ResearchQuestionState["status"], string> = {
+  waiting: "대기",
+  running: "진행 중",
+  done: "완료",
+  capped: "한도 도달",
+  failed: "실패",
 };
 
 const minutes = (ms: number) => {
@@ -80,7 +137,8 @@ function useResearch(id: string) {
     if (!live || typeof EventSource === "undefined") return;
     const es = new EventSource(research.eventsUrl(id));
     es.addEventListener("job", (e) => {
-      const parsed = ResearchJob.safeParse(JSON.parse((e as MessageEvent<string>).data));
+      // A bad activity line is dropped, never the whole update (#232).
+      const parsed = safeParseResearchJob(JSON.parse((e as MessageEvent<string>).data));
       if (parsed.success) qc.setQueryData<ResearchJob>(key(id), (old) => newest(old, parsed.data));
     });
     es.onerror = () => {
@@ -149,8 +207,8 @@ function Body({ job }: { job: ResearchJob }) {
         <>
           <Questions job={job} />
           <p className="small" data-testid="research-result">
-            출처 {job.result?.citations ?? 0}개 · 확인하지 못해 뺀 문장 {job.result?.removed ?? 0}개
-            {job.result?.timedOut ? " · 시간 상한(30분)으로 일부만 조사" : ""}
+            보고서에 인용한 출처 {job.result?.citations ?? 0}개 · 확인하지 못해 뺀 문장{" "}
+            {job.result?.removed ?? 0}개{job.result?.timedOut ? " · 시간 상한(30분)으로 일부만 조사" : ""}
           </p>
         </>
       );
@@ -365,21 +423,35 @@ function PlanReview({ job }: { job: ResearchJob }) {
   );
 }
 
-function Questions({ job }: { job: ResearchJob }) {
+export function Questions({ job }: { job: ResearchJob }) {
   return (
     <ul className="research-questions" data-testid="research-progress">
       {job.questions.map((q) => (
         <li key={q.id} data-testid="research-question" data-status={q.status}>
-          <span aria-hidden>{Q_ICON[q.status]}</span>{" "}
+          <span aria-hidden className="research-icon">
+            {Q_ICON[q.status]}
+          </span>
+          <span className="sr-only">{Q_STATUS_TEXT[q.status]}: </span>{" "}
           {q.round > 0 ? <span className="chip small">보강</span> : null} {q.question}{" "}
-          <span className="muted small">· 출처 {q.sources}개</span>
+          <span className="muted small" data-testid="research-counts">
+            · 검증한 자료 {q.sources}개
+            {/* Shown once there is something (a retry queued keeps its first run's); `dropped` counts every note
+                left out — unverified, a duplicate, over the cap — so it says 제외, not 확인 못 함. */}
+            {(q.status !== "waiting" || q.notes > 0 || q.dropped > 0) &&
+              ` · 노트 ${q.notes}개${q.dropped ? ` · 제외 ${q.dropped}개` : ""}`}
+          </span>
+          {q.status === "running" && q.activity && (
+            <span className="research-activity muted small" data-testid="research-activity">
+              {q.activity.label}
+            </span>
+          )}
         </li>
       ))}
     </ul>
   );
 }
 
-function Progress({ job }: { job: ResearchJob }) {
+export function Progress({ job }: { job: ResearchJob }) {
   // The time used ticks on screen between the server's updates.
   const [now, setNow] = useState(() => Date.now());
   const [base] = useState(() => ({ at: Date.now(), elapsed: job.elapsedMs }));
@@ -388,12 +460,18 @@ function Progress({ job }: { job: ResearchJob }) {
     return () => clearInterval(t);
   }, []);
   const elapsed = Math.max(job.elapsedMs, base.elapsed + (now - base.at));
-  const stage =
-    job.status === "writing" ? "작성·검증" : job.round > 0 ? `보강 조사 ${job.round}단계` : "조사";
   return (
     <>
-      <p className="small" data-testid="research-stage">
-        {stage} · 찾은 출처 {job.sources}개 · {minutes(Math.min(elapsed, RESEARCH_LIMITS.totalMs))} / 30분
+      <p className="small research-stage" data-testid="research-stage" data-phase={job.phase ?? undefined}>
+        <span className="research-pulse" aria-hidden />
+        <span data-testid="research-phase">{stageText(job)}</span> · 검증한 자료 {job.sources}개 ·{" "}
+        {minutes(Math.min(elapsed, RESEARCH_LIMITS.totalMs))} / 30분
+        {job.lastActivityAt ? (
+          <span className="muted" data-testid="research-last-activity">
+            {" "}
+            · 마지막 활동 {sinceText(job.lastActivityAt, now)}
+          </span>
+        ) : null}
       </p>
       <Questions job={job} />
       {job.owned && <Actions job={job} stop />}

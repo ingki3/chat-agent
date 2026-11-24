@@ -106,7 +106,25 @@ export class McpTokens {
     return this.revoked.has(runId);
   }
 
+  /** Called once when the run's tokens are revoked (#234: a PDF extraction of that run stops at once). */
+  private readonly stopWatchers = new Map<string, Set<() => void>>();
+  onRevoke(runId: string, fn: () => void): () => void {
+    if (this.revoked.has(runId)) {
+      fn();
+      return () => {};
+    }
+    let set = this.stopWatchers.get(runId);
+    if (!set) this.stopWatchers.set(runId, (set = new Set()));
+    set.add(fn);
+    return () => {
+      set.delete(fn);
+      if (!set.size) this.stopWatchers.delete(runId);
+    };
+  }
+
   revokeRun(runId: string): void {
+    const watchers = this.stopWatchers.get(runId);
+    this.stopWatchers.delete(runId);
     this.revoked.delete(runId);
     this.revoked.set(runId, this.now());
     if (this.revoked.size > 2000) this.revoked.delete(this.revoked.keys().next().value!);
@@ -115,6 +133,13 @@ export class McpTokens {
         this.byHash.delete(h);
         knownSecrets.remove(s.token);
       }
+    for (const fn of watchers ?? []) {
+      try {
+        fn();
+      } catch {
+        // a watcher's failure never stops the revocation
+      }
+    }
   }
 
   /** Whether any live token of this run is left (false once the run ended or was revoked). */

@@ -111,6 +111,8 @@ export async function run(job, deps = {}) {
     units: r.units ?? null,
     truncated: out.truncated,
     ocr: r.ocr ?? "none",
+    // A PDF's own title (metadata), when it has one (#234 — web PDFs; uploads keep their file name).
+    ...(typeof r.title === "string" ? { title: r.title } : {}),
     segments: out.items,
   };
 }

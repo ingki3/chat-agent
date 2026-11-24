@@ -3,14 +3,19 @@ import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import {
   ResearchPlan,
   ResearchResult,
+  type ResearchActivity,
   type ResearchErrorCode,
   type ResearchJob,
-  type ResearchQuestionState,
+  ResearchQuestionState,
+  type ResearchPhase,
   type ResearchStatus,
+  type SourceType,
 } from "@agentlee/shared";
 import type { Db } from "../db/client.js";
 import { researchJobs } from "../db/schema.js";
 import { scrubKnown, scrubKnownDeep } from "../secrets/known.js";
+import type { ReportOutline } from "./prompts.js";
+import { activityView, type LiveActivity } from "./activity.js";
 
 export type ResearchJobRow = typeof researchJobs.$inferSelect;
 
@@ -30,12 +35,90 @@ export type ResearchNote = {
   page?: number | undefined;
   /** A file passage's verified place ("3쪽", "표 2 · B3") — from the check, never the model's own page. */
   place?: string | undefined;
+  /**
+   * Which source it rests on, however it was fetched (`contentKeyOf` — the stored body's hash: rows of one body are one
+   * source): what `sourceCount` counts (#234).
+   */
+  sourceKey?: string | undefined;
+  /** The identity of its claim (`claimKeyOf` of the whole claim as written) — never shown. */
+  claimKey?: string | undefined;
+  /** A web note's publisher kind by its domain (#234, `sourceTypeOf`): for the writer and the report (#233). */
+  sourceType?: SourceType | undefined;
 };
 
+/** A claim whose quote was not verified: its identity (`claimKeyOf` of the whole claim) and its text. */
+export type UnverifiedClaim = { key: string; claim: string };
+
+/** The identity of a claim: a hash of all of it, normalised (`parseNotes` keeps only its first 500 characters). */
+export const claimKeyOf = (claim: string) =>
+  crypto.createHash("sha256").update(claim.normalize("NFC").replace(/\s+/gu, " ").trim()).digest("hex");
+
 /** A sub-question's state with its verified notes (`found`); the API shows only their count. */
-export type QuestionRecord = Omit<ResearchQuestionState, "notes"> & { found: ResearchNote[] };
+export type QuestionRecord = Omit<ResearchQuestionState, "notes" | "activity"> & {
+  found: ResearchNote[];
+  /**
+   * It was researched once more with rewritten queries (#234: no verified note, or one source only) — at most once.
+   */
+  retried?: boolean | undefined;
+  /**
+   * Claims whose quote could not be verified (the retry and the lead see them). An older checkpoint kept the text
+   * only.
+   */
+  unverified?: (UnverifiedClaim | string)[] | undefined;
+  /** How its last run ended when it failed (a runtime error code): a passing one may be retried (#234). */
+  failure?: ResearchErrorCode | undefined;
+  /** It was not (re)searched because too little time was left when its turn came (#234). */
+  skipped?: "time" | undefined;
+  /**
+   * Well-formed notes its sub-researcher wrote over all its runs (#232). `dropped` is always `submitted` minus the
+   * notes kept — left out by the check, as a duplicate, over the cap or when a checkpoint is normalised.
+   */
+  submitted?: number | undefined;
+};
+
+/**
+ * A running job's live progress (#232), kept by the engine in memory only: the phase, the latest tool call of each
+ * sub-question and when anything last happened. Never written to the checkpoint — a restart begins without it.
+ */
+export type LiveProgress = {
+  phase: ResearchPhase;
+  phaseProgress: { done: number; total: number } | null;
+  lastActivityAt: number;
+  activity: ReadonlyMap<string, LiveActivity>;
+  /** Orders live states of one saved version (a page keeps the higher of two of the same version). */
+  seq: number;
+};
+
+const ACTIVE_PHASE: Partial<Record<ResearchStatus, ResearchPhase>> = {
+  planning: "planning",
+  researching: "researching",
+  writing: "writing",
+};
 
 /** The checkpoint (`research_jobs.state`): written after every step. */
+/** An outline as the checkpoint keeps it: one `[heading, question, analysis, noteIds]` per section. */
+export type StoredOutline = [string, string, string, string[]][];
+
+/** The outline in its stored, keyless shape. */
+export function storeOutline(o: ReportOutline): StoredOutline {
+  return o.sections.map((x) => [x.heading, x.question, x.analysis, [...x.notes]]);
+}
+
+/** The outline from its stored shape; anything else (an older or a masked shape): none. */
+export function restoreOutline(v: unknown): ReportOutline | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const sections: ReportOutline["sections"] = [];
+  for (const x of v) {
+    if (!Array.isArray(x) || x.length !== 4) return undefined;
+    const [heading, question, analysis, notes] = x as unknown[];
+    if (typeof heading !== "string" || typeof question !== "string" || typeof analysis !== "string")
+      return undefined;
+    if (!Array.isArray(notes) || !notes.every((n) => typeof n === "string")) return undefined;
+    sections.push({ heading, question, analysis, notes: notes as string[] });
+  }
+  return { sections };
+}
+
 export type JobState = {
   stage: "plan" | "research" | "write" | "end";
   /** The research round being run (0 = the plan's questions). */
@@ -50,6 +133,12 @@ export type JobState = {
    * stays within them — a files-only plan never searches the web.
    */
   scopes?: ("web" | "files")[] | undefined;
+  /**
+   * The report's outline (#233), once the lead's outline step ran: its sections as `[heading, question, analysis,
+   * noteIds]` (arrays only — the stored rows' masking reads object keys too, review 17), or `null` when it gave none.
+   * A restart while writing uses it again instead of asking again (absent, or a shape it cannot read: not asked yet).
+   */
+  outline?: StoredOutline | null | undefined;
 };
 
 export const emptyState = (): JobState => ({
@@ -99,15 +188,94 @@ export const fileIdsOf = (row: ResearchJobRow): string[] => {
   }
 };
 
-/** Distinct sources (pages and files) the verified notes rest on. */
+/**
+ * A web source's identity for counting (#234, review #237 17차): its stored body's hash — the same text however it
+ * was reached (a redirect, a changed redirect target, the same PDF at two addresses) — else its final address.
+ */
+export function contentKeyOf(src: {
+  bodyHash?: string | null;
+  finalUrl?: string | null;
+  url: string;
+}): string {
+  return src.bodyHash ? `b:${src.bodyHash}` : pageKeyOf(src.finalUrl ?? src.url);
+}
+
+/** A page's identity across source rows: its final URL without the fragment, host in lower case (#234). */
+export function pageKeyOf(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return `u:${u.toString()}`;
+  } catch {
+    return `u:${url}`;
+  }
+}
+
+/**
+ * Distinct sources (pages and files) the verified notes rest on — one page once, however many source rows it has
+ * (`sourceKey`, review #237 7차); a note from before keeps its source id.
+ */
 export function sourceCount(notes: readonly ResearchNote[]): number {
-  return new Set(notes.map((n) => (n.sourceId ? `s:${n.sourceId}` : `f:${n.fileId}`))).size;
+  return new Set(notes.map((n) => (n.sourceId ? (n.sourceKey ?? `s:${n.sourceId}`) : `f:${n.fileId}`))).size;
+}
+
+/**
+ * A question's `dropped` from what it submitted and kept (#232): the one rule wherever its notes change, so
+ * normalising the same state again counts nothing twice. A checkpoint from before keeps its count as submitted.
+ */
+export function settleDropped(q: QuestionRecord): void {
+  q.submitted ??= q.found.length + q.dropped;
+  q.submitted = Math.max(q.submitted, q.found.length);
+  q.dropped = Math.max(0, q.submitted - q.found.length);
+}
+
+const QUESTION_KEYS = new Set(Object.keys(ResearchQuestionState.shape));
+
+/**
+ * A sub-question's activity line as it goes out (GET and the live stream alike) — checked against its schema and the
+ * fixed labels first: one that is not valid is left out, never the job. The owner's only — a share recipient (#29)
+ * sees the phase, the time and the counts.
+ */
+export function shown(a: LiveActivity | undefined): ResearchActivity | null {
+  return a ? activityView(a) : null;
 }
 
 /** The job as the API shows it (owner or share recipient). Notes stay on the server. */
-export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: number }): ResearchJob {
+export function toResearchJob(
+  row: ResearchJobRow,
+  opts: {
+    owned: boolean;
+    now: number;
+    /**
+     * A web note's source identity from its stored row (`contentKeyOf`), read only (review #237 18차): a job's notes
+     * from before body-hash keys count rows of one body once in the view as well. Without it the notes' own keys.
+     */
+    contentKey?: ((sourceId: string) => string | undefined) | undefined;
+    /** The engine's live progress (#232) and this process's id (`boot`). */
+    live?: LiveProgress | undefined;
+    boot?: string | undefined;
+  },
+): ResearchJob {
   const s = stateOf(row);
+  // The live progress counts only while the job is active (a stop that came in between ends it at once).
+  const fallback = ACTIVE_PHASE[row.status];
+  const live = fallback ? opts.live : undefined;
   const plan = planOf(row);
+  // Copies with their keys as the rows say now — the checkpoint itself is not written here. One lookup per source
+  // for the whole view (review #237 19차).
+  const known = new Map<string, string | undefined>();
+  const keyOf = (id: string) => {
+    if (!known.has(id)) known.set(id, opts.contentKey!(id));
+    return known.get(id);
+  };
+  const keyed = (found: readonly ResearchNote[]) =>
+    opts.contentKey
+      ? found.map((n) => (n.sourceId ? { ...n, sourceKey: keyOf(n.sourceId) ?? n.sourceKey } : n))
+      : [...found];
+  for (const q of s.questions) {
+    q.found = keyed(q.found ?? []);
+    if (opts.contentKey) q.sources = sourceCount(q.found);
+  }
   const notes = s.questions.flatMap((q) => q.found ?? []);
   return {
     id: row.id,
@@ -118,8 +286,23 @@ export function toResearchJob(row: ResearchJobRow, opts: { owned: boolean; now: 
     clarify: row.clarifyQuestion ? { question: row.clarifyQuestion, answer: row.clarifyAnswer } : null,
     plan,
     stage: s.stage,
+    phase: live?.phase ?? fallback ?? null,
+    phaseProgress: live?.phaseProgress ?? null,
+    // The live progress records every event in order (its saves too): its time is the latest event's. Without it
+    // (a restart, before the first event) the last save's.
+    lastActivityAt: fallback ? (live?.lastActivityAt ?? row.updatedAt) : null,
+    seq: live?.seq ?? 0,
+    ...(opts.boot ? { boot: opts.boot } : {}),
     round: s.round,
-    questions: s.questions.map(({ found, ...q }) => ({ ...q, notes: found?.length ?? 0 })),
+    // Only the API's fields: the notes and the retry's bookkeeping (#234) stay on the server.
+    questions: s.questions.map(
+      (q) =>
+        ({
+          ...Object.fromEntries(Object.entries(q).filter(([k]) => QUESTION_KEYS.has(k))),
+          notes: q.found?.length ?? 0,
+          activity: q.status === "running" && opts.owned ? shown(live?.activity.get(q.id)) : null,
+        }) as ResearchQuestionState,
+    ),
     sources: sourceCount(notes),
     // Planning time (before approval) plus the time since approval; the wait at the plan card does not count.
     elapsedMs: Math.max(

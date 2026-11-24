@@ -265,7 +265,7 @@ MCP 도구 `web_search(query)`·`web_fetch(url)`이다(`packages/mcp-tools/src/w
   - 같은 대화에서 같은 URL·같은 본문을 다시 가져오면 처음 id를 쓴다. 검색 결과도 같은 링크면 같은 id다.
   - 출처를 쓰기 전에 그 대화의 주인이 토큰의 사용자인지 다시 확인한다.
 - **본문 추출:** 의존성 없이 작업자 안에서 한다. `script`·`style`·`noscript`·`svg`·`iframe` 등과 주석을 버리고, `<article>`(없으면 `<main>`)의 가장 긴 것을 고른 뒤 `nav`·`footer`·`aside`·`form`·`header`를 뺀다. 블록 태그는 줄바꿈, 나머지 태그는 지우고 엔티티를 푼다. 문자셋은 헤더 → `<meta charset>` → UTF-8 순서(EUC-KR 시험).
-  - 받는 형식: `text/html`, `application/xhtml+xml`, `text/plain`, `text/markdown`, `application/json`(`+json` 포함). **PDF는 거부한다**(`web_unsupported_type`). 의존성 없이 PDF 글자를 뽑는 방법은 싸지 않다. 파일 도구(#48)의 PDF 추출을 붙일 때 다시 본다.
+  - 받는 형식: `text/html`, `application/xhtml+xml`, `text/plain`, `text/markdown`, `application/json`(`+json` 포함). PDF는 #234부터 받는다: 웹 작업자는 PDF를 **해석하지 않고** 바이트(최대 10MB, base64)만 돌려주고, 서버가 파일 도구(#48)의 문서 추출기(같은 고정 pdf.js, 네트워크 없는 별도 샌드박스, OCR 끔)로 글자를 뽑는다 — 새 의존성 없음. 그 밖의 형식은 거부한다(`web_unsupported_type`).
   - 글자가 없는 페이지(스크립트로만 그리는 페이지)는 `web_no_text`이고 저장하지 않는다.
 - **오류 코드(`WEB_CODES`):** `web_bad_url`, `web_blocked`, `web_unreachable`, `web_timeout`, `web_tls`, `web_too_large`, `web_too_many_redirects`, `web_unsupported_type`, `web_http_error`, `web_bad_content`, `web_no_text`, `web_search_blocked`, `web_search_unavailable`, `web_unavailable`(샌드박스 없음 — macOS가 아니면 이것으로 거부), `web_limit`, `web_failed`, `web_busy`, `web_not_allowed`, `web_bad_input`.
 - **로그(#46):** 호출마다 `web.finished` 하나. 필드는 도구 이름, `ok`/`error`, `webCode`, 소요 시간, ID뿐이다. **URL·호스트·검색어·본문은 남기지 않는다.** 호스트도 뺀 이유: 이름은 모델(또는 모델이 읽은 페이지)이 고르므로 하위 도메인 라벨에 무엇이든(비밀 포함) 실을 수 있다. 정해진 코드만 남긴다.

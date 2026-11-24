@@ -896,6 +896,11 @@ a.chip.fileref:hover {
   border-radius: 10px;
   background: var(--panel);
 }
+/* A markdown artifact's inline code keeps its spaces (깊이 조사 reports show names and passages as code, #233). */
+.artifact-doc .md :not(pre) > code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .artifact-doc .md {
   max-width: 860px;
   margin: 0 auto;

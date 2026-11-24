@@ -19,7 +19,13 @@ import {
   type BundledSkill,
   type CatalogueStatus,
 } from "@agentlee/mcp-tools/skills";
-import { CITE_TOOL, SOURCES_LIST_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL } from "@agentlee/mcp-tools/web";
+import {
+  CITE_TOOL,
+  SOURCES_LIST_TOOL,
+  WEB_FETCH_TOOL,
+  WEB_FIND_TOOL,
+  WEB_SEARCH_TOOL,
+} from "@agentlee/mcp-tools/web";
 import {
   FINANCE_CHART_TOOL,
   FINANCE_TOOLS,
@@ -45,6 +51,7 @@ import { firstRunAfter, ScheduleInputError } from "../schedules/store.js";
 import {
   artifactPath,
   frameExternal,
+  sourceTypeOf,
   ScheduleProposalInput,
   type ArtifactKind,
   type ScheduleProposalToolOutput,
@@ -94,6 +101,9 @@ import {
   type SearchProviderName,
   type WebWorker,
 } from "../web/service.js";
+import type { PdfReader } from "../web/pdf.js";
+import { findPassages } from "../citations/passages.js";
+import { hasGapMarks, visibleIndex } from "../citations/verify.js";
 
 /** PRD §7 finance skills (FR-7): hidden from youth accounts unless named explicitly (#30). */
 const FINANCE_SKILLS: ReadonlySet<string> = new Set(
@@ -669,6 +679,8 @@ export type WebOptions = {
   citations?: CitationStore;
   /** Search providers to try in order (`WEB_SEARCH_PROVIDERS`); default google, duckduckgo, then google-news. */
   providers?: readonly SearchProviderName[];
+  /** A PDF page's text (#234, `web/pdf.ts`): the document extractor. Without it `web_fetch` refuses PDFs. */
+  pdf?: PdfReader;
   /** Tests: the worker (in-process), the page proxy, and ready-made providers instead of `providers`. */
   worker?: WebWorker;
   fetchProxy?: Proxy;
@@ -763,6 +775,7 @@ export class McpService {
         ? [
             ...(this.web.canSearch ? [WEB_SEARCH_TOOL] : []),
             WEB_FETCH_TOOL,
+            WEB_FIND_TOOL,
             SOURCES_LIST_TOOL,
             ...(opts.web?.citations ? [CITE_TOOL] : []),
           ]
@@ -864,7 +877,9 @@ export class McpService {
       worker,
       // A call still in flight when its run was stopped (its token revoked) stores no source and answers nothing.
       alive: (scope) => !this.tokens.wasRevoked(scope.runId),
+      onStop: (scope, fn) => this.tokens.onRevoke(scope.runId, fn),
       ...(o.fetchProxy ? { fetchProxy: o.fetchProxy } : {}),
+      ...(o.pdf ? { pdf: o.pdf } : {}),
     });
   }
 
@@ -1172,7 +1187,7 @@ export class McpService {
             });
           return r;
         }
-        if (name === CITE_TOOL.name || name === SOURCES_LIST_TOOL.name) {
+        if (name === CITE_TOOL.name || name === SOURCES_LIST_TOOL.name || name === WEB_FIND_TOOL.name) {
           const r = this.callCitationTool(toolByName.get(name), input, scope);
           const status = r.ok ? (r.output as { status?: unknown }).status : undefined;
           logEvent(this.opts.log, r.ok ? "info" : "warn", "citation.finished", {
@@ -1611,10 +1626,15 @@ export class McpService {
       return { ok: false, code: "cite_not_allowed" };
     const parsed = z.strictObject(tool.input).safeParse(input);
     if (!parsed.success) return { ok: false, code: "cite_bad_input" };
+    if (tool.name === WEB_FIND_TOOL.name)
+      return this.findInSource(
+        parsed.data as { sourceId: string; query: string; maxResults?: number },
+        scope,
+      );
     if (tool.name === SOURCES_LIST_TOOL.name) {
-      const rows = web.sources.listFor(scope);
-      if (!rows) return { ok: false, code: "cite_not_allowed" };
-      const items = rows.slice(-SOURCES_LIST_MAX);
+      // The newest SOURCES_LIST_MAX rows' metadata only — no page text is read (review #237 18차).
+      const items = web.sources.recentFor(scope, SOURCES_LIST_MAX);
+      if (!items) return { ok: false, code: "cite_not_allowed" };
       return {
         ok: true,
         output: {
@@ -1625,7 +1645,8 @@ export class McpService {
             site: r.site,
             publishedAt: r.publishedAt ?? null,
             url: r.finalUrl ?? r.url,
-            hasText: r.kind === "page" && !!r.body,
+            sourceType: sourceTypeOf(r.finalUrl ?? r.url),
+            hasText: r.kind === "page" && r.hasBody,
           })),
           content: frameExternal({
             source: "sources",
@@ -1653,6 +1674,46 @@ export class McpService {
       if (e instanceof CiteRefused) return { ok: false, code: e.code };
       throw e;
     }
+  }
+
+  /**
+   * `web_find` (#234): the stored, scrubbed text of one page of the token's conversation, searched for the query —
+   * the best passages with their context, inside an `<external_content>` block (page text). Unknown or another
+   * conversation's id: `unknown_source`; a search result (no text): `fetch_failed`.
+   */
+  private findInSource(
+    input: { sourceId: string; query: string; maxResults?: number },
+    scope: ToolScope,
+  ): SkillResult {
+    const web = this.opts.web!;
+    const row = web.sources.getFor(scope, input.sourceId);
+    if (!row) return { ok: false, code: "unknown_source" };
+    if (row.kind !== "page" || !row.body) return { ok: false, code: "fetch_failed" };
+    const body = row.body;
+    // A web PDF's gap marks hold only in its own text (review #237 5차); counts and places are of the visible text.
+    const { total, passages } = findPassages(body, input.query, input.maxResults ?? 5, {
+      gaps: hasGapMarks(row.contentType),
+    });
+    const pdf = hasGapMarks(row.contentType);
+    const at = (p: { start: number }) => (pdf ? visibleIndex(body, p.start) : p.start);
+    return {
+      ok: true,
+      output: {
+        sourceId: row.id,
+        url: row.finalUrl ?? row.url,
+        site: row.site,
+        characters: pdf ? visibleIndex(body, body.length) : body.length,
+        status: passages.length ? "find_found" : "find_none",
+        matches: total,
+        results: passages.map((p, i) => ({ n: i + 1, at: at(p), phrase: p.phrase })),
+        content: frameExternal({
+          source: row.finalUrl ?? row.url,
+          content: passages.length
+            ? passages.map((p, i) => `[${i + 1}] (at ${at(p)})\n${p.text}`).join("\n\n")
+            : "(no match)",
+        }),
+      },
+    };
   }
 
   /**

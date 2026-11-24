@@ -1,4 +1,4 @@
-import { TURN_MARK } from "../research/prompts.js";
+import { RETRY_MARK, TURN_MARK } from "../research/prompts.js";
 import { FIXTURE_PAGES, type FixturePage } from "./fake-citations.js";
 import type { FakeStep } from "./fake.js";
 
@@ -8,10 +8,13 @@ import type { FakeStep } from "./fake.js";
  * network), so the server's checks are the real ones:
  * - plan: two sub-questions on the October chip exports (a question with "모호" first asks one clarifying question);
  * - sub-researchers: real `web_fetch` calls, `NOTE` lines with the fetched `sourceId`s — one note quotes words the page
- *   does not have (the server drops it); "느린 조사" in the question makes each take 2.5 s (the progress e2e);
- * - reflection: no gaps;
+ *   does not have (the server drops it); "느린 조사" in the question makes each take 2.5 s, reading its first page
+ *   for 1.5 s (the progress e2e: the activity line);
+ * - a retry of a weak sub-question (#234 — the background question rests on one page): nothing new, at once;
+ * - reflection: no gaps; outline (#233): four sections over the notes given;
  * - writer: real `cite` calls for the notes it was given and one with a passage no page has, then a report in which
- *   one sentence leans on that failed citation and one has none — both are removed by the server.
+ *   one sentence leans on that failed citation and one has none — both are removed by the server — with an
+ *   interpretive sentence citing its facts and a 시사점 section (#233).
  */
 
 const [A, B] = FIXTURE_PAGES as [FixturePage, FixturePage];
@@ -46,11 +49,15 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     ];
   }
   if (t.startsWith(TURN_MARK.subagent)) {
-    const slow = /느린 조사/.test(t) ? [{ delayMs: 2500 }] : [];
+    if (t.includes(RETRY_MARK)) return [{ text: "DONE" }];
+    const slow = /느린 조사/.test(t) ? [{ delayMs: 1000 }] : [];
+    // The card's activity line (#232) shows the page being read meanwhile.
+    const reading = slow.length ? [{ delayMs: 1500 }] : [];
     if (/증가율/.test(t))
       return [
         ...slow,
         { call: "web_fetch", input: { url: A.url } },
+        ...reading,
         { call: "web_fetch", input: { url: B.url } },
         {
           textRefs:
@@ -63,6 +70,7 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     return [
       ...slow,
       { call: "web_fetch", input: { url: A.url } },
+      ...reading,
       {
         textRefs:
           note("메모리 가격 회복이 증가를 이끌었다", "{{$0.sourceId}}", RESEARCH_FIXTURE.memory) + "DONE",
@@ -70,6 +78,27 @@ export function researchSteps(t: string): FakeStep[] | undefined {
     ];
   }
   if (t.startsWith(TURN_MARK.reflect)) return [{ text: '{"gaps": []}' }];
+  if (t.startsWith(TURN_MARK.outline)) {
+    // The outline (#233): the notes' ids, in the sections the writer below follows.
+    const ids = [...t.matchAll(/^\{"note":"([^"]+)"/gm)].map((m) => m[1]!);
+    return [
+      {
+        text: JSON.stringify({
+          sections: [
+            { heading: "요약", question: "10월 반도체 수출은 어땠나", notes: ids, analysis: "" },
+            { heading: "증가율", question: "얼마나 늘었나", notes: ids, analysis: "자료마다 다른 수치" },
+            { heading: "배경", question: "왜 늘었나", notes: ids, analysis: "" },
+            {
+              heading: "시사점",
+              question: "수치를 쓸 때 무엇을 조심하나",
+              notes: ids,
+              analysis: "출처 밝히기",
+            },
+          ],
+        }),
+      },
+    ];
+  }
   if (t.startsWith(TURN_MARK.writer)) {
     // The notes as the writer got them: one JSON object per line inside the notes block.
     const notes = [...t.matchAll(/^\{"note".*\}$/gm)].flatMap((m) => {
@@ -105,11 +134,16 @@ export function researchSteps(t: string): FakeStep[] | undefined {
         "",
         `가나다 신문은 32% 증가로 보도했어요${cited("32%")}. 라마바 통계는 28%로 집계했어요${cited("28%")}.`,
         `한 보도는 50% 늘었다고 했어요[${k + 1}].`,
+        `보도와 통계의 수치가 달라, 어느 자료인지 밝혀 인용하는 편이 안전해요${cited("32%")}${cited("28%")}.`,
         "",
         "## 배경",
         "",
         `- 메모리 가격 회복이 증가를 이끌었어요${cited("메모리")}.`,
         "- 미국 수출 비중이 가장 컸어요.",
+        "",
+        "## 시사점",
+        "",
+        `- 수치를 쓸 때: 보도와 통계 중 어느 쪽인지 함께 밝혀요${cited("32%")}${cited("28%")}.`,
       ].join("\n"),
     });
     return steps;

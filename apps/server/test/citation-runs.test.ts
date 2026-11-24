@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   CSRF_HEADER,
@@ -29,6 +29,7 @@ import {
   type CitationScenarioName,
 } from "../src/runtime/fake-citations.js";
 import { RunManager } from "../src/runtime/runs.js";
+import { SourceStore } from "../src/web/sources.js";
 import { knownSecrets } from "../src/secrets/known.js";
 import { projectPart } from "../src/shares/projection.js";
 import { replayQuery, sdk, type ReplayLog } from "./helpers/claude-replay.js";
@@ -393,6 +394,67 @@ describe("citation check under the run manager (#25, FakeRuntime)", () => {
     const twoParagraphs = await send(f.cookies.owner, c4.id, "/recap-two");
     expect(statuses(twoParagraphs)).toEqual([[1, "verified"]]);
     expect(missingText(twoParagraphs)).toEqual(["반도체 가격도 두 배가 됐어요."]);
+  });
+
+  it("#234: a run's references look up only the sources its history cites", async () => {
+    const { app, f, send } = await start(fake());
+    const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "/cite conflict");
+    const cited = new Set(
+      (
+        app.conversations!.messages(c.id, { limit: 50 }).flatMap((m) => m.parts) as {
+          type: string;
+          citations?: { sourceId: string | null }[];
+        }[]
+      )
+        .filter((p) => p.type === "citation_note")
+        .flatMap((p) => p.citations!.flatMap((x) => (x.sourceId ? [x.sourceId] : []))),
+    );
+    expect(cited.size).toBeGreaterThan(0);
+    const spy = vi.spyOn(SourceStore.prototype, "citable");
+    await send(f.cookies.owner, c.id, "고마워요");
+    expect(spy).toHaveBeenCalled();
+    for (const call of spy.mock.calls) {
+      expect(call[1]).toBeDefined();
+      for (const id of call[1]!) expect(cited.has(id)).toBe(true);
+    }
+    spy.mockRestore();
+  });
+
+  it("#234: web_find makes the numbers this run's and its answer one that uses web sources", async () => {
+    const script: FakeScript = (input, memory) => {
+      const m = /^\/find(-plain)? (\S+)$/.exec(input.text);
+      if (m)
+        return [
+          { call: "web_find", input: { sourceId: m[2]!, query: "반도체 수출" } },
+          {
+            text: m[1] ? "반도체 수출이 늘었어요[1].\n\n가격도 올랐어요." : CITATION_SCENARIOS.recap.answer,
+          },
+        ];
+      if (input.text === "/fetch-plain")
+        return [{ call: "web_fetch", input: { url: FIXTURE_PAGES[0]!.url } }, { text: "페이지를 읽었어요." }];
+      return defaultScript(input, memory);
+    };
+    const { app, f, send, api } = await start(fake(script));
+    const idOf = async (conversationId: string) =>
+      (
+        (await api(f.cookies.owner, "GET", `/api/conversations/${conversationId}/sources`)).json() as {
+          items: { id: string; kind: string }[];
+        }
+      ).items.find((x) => x.kind === "page")!.id;
+    // After an answer with verified [1]–[3]: the passages web_find numbered are this run's — nothing carried.
+    const c = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c.id, "/cite conflict");
+    const found = await send(f.cookies.owner, c.id, `/find ${await idOf(c.id)}`);
+    expect(found.run.status).toBe("done");
+    expect(statuses(found)).toEqual([1, 2, 3, 9].map((n) => [n, "unknown_source"]));
+    // No earlier citations: still an answer using web sources — the note flags the marker and the uncited paragraph.
+    const c2 = app.conversations!.create(f.users.owner.id);
+    await send(f.cookies.owner, c2.id, "/fetch-plain");
+    const plain = await send(f.cookies.owner, c2.id, `/find-plain ${await idOf(c2.id)}`);
+    expect(plain.note).toBeDefined();
+    expect(statuses(plain)).toEqual([[1, "unknown_source"]]);
+    expect(missingText(plain)).toEqual(["가격도 올랐어요."]);
   });
 
   it("a source id of another conversation or another user cited through the run's token: unknown_source", async () => {
