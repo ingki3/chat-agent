@@ -254,6 +254,7 @@ describe("관리자 → 미디어 생성 (#238)", () => {
       limitRemainingUsd: null,
       usageUsd: null,
       checkedAt: null,
+      generation: expect.any(String),
     });
     expect(m.settings).toEqual({
       kinds: {
@@ -344,6 +345,7 @@ describe("관리자 → 미디어 생성 (#238)", () => {
       limitRemainingUsd: null,
       usageUsd: null,
       checkedAt: null,
+      generation: expect.any(String),
     });
     expect(t.app.media!.keys.resolve()).toEqual({ key: ENV_KEY, source: "env" });
   });
@@ -927,5 +929,78 @@ describe("media: review round 1 regressions (#244)", () => {
     expect(b.allows(u, 49.99)).toBe(true);
     for (const bad of [-1, -0.000001, NaN, Infinity, -Infinity])
       expect(b.allows(u, bad), String(bad)).toBe(false);
+  });
+
+  it("round 2: an old key's delayed 401 or outage after a new key is media_key_changed, not the new key's error", async () => {
+    for (const status of [401, 503]) {
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => (release = r));
+      const inner = fixtureOpenRouterFetch();
+      let hold = false;
+      const fetchImpl = (async (u: string | URL | Request, init?: RequestInit) => {
+        if (hold && String(u) === MEDIA_CATALOG_URLS.video) {
+          await gate;
+          return new Response("{}", { status });
+        }
+        return inner(u, init);
+      }) as typeof fetch;
+      const t = service({ fetchImpl });
+      await t.svc.registerKey(GOOD_KEY, yes);
+      hold = true;
+      const pending = t.svc.catalog("video");
+      await t.svc.registerKey(KEY_B, yes);
+      release();
+      await expect(pending, String(status)).rejects.toMatchObject({ code: "media_key_changed", status: 409 });
+      // The same key's own failure still maps as before.
+      const again = t.svc.catalog("video", true);
+      await expect(again).rejects.toMatchObject({
+        code: status === 401 ? "media_key_invalid" : "media_catalog_failed",
+      });
+    }
+  });
+
+  it("round 2: a non-OK answer's body is cancelled before the error", async () => {
+    for (const status of [401, 403, 503]) {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) {
+          c.enqueue(new TextEncoder().encode("x".repeat(1024)));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const fetchImpl = (async () => new Response(body, { status })) as unknown as typeof fetch;
+      await expect(openRouterGet(OPENROUTER_KEY_URL, { fetchImpl })).rejects.toMatchObject({
+        code: status === 503 ? "failed" : "unauthorized",
+      });
+      expect(cancelled, String(status)).toBe(true);
+    }
+  });
+
+  it("round 2: a UTF-8 BOM before the JSON is dropped (as Response.text() does), within the byte cap", async () => {
+    const bytes = new Uint8Array([
+      0xef,
+      0xbb,
+      0xbf,
+      ...new TextEncoder().encode('{"data":{"limit":null,"limit_remaining":null}}'),
+    ]);
+    const fetchImpl = (async () => new Response(bytes)) as unknown as typeof fetch;
+    expect(await checkKey(GOOD_KEY, fetchImpl)).toEqual({
+      limitUsd: null,
+      limitRemainingUsd: null,
+      usageUsd: null,
+    });
+  });
+
+  it("round 2: the key view carries a generation that changes with every key change", async () => {
+    const t = service();
+    const g0 = t.svc.view().key.generation;
+    await t.svc.registerKey(GOOD_KEY, yes);
+    const g1 = t.svc.view().key.generation;
+    await t.svc.deleteKey(yes);
+    const g2 = t.svc.view().key.generation;
+    expect(new Set([g0, g1, g2]).size).toBe(3);
+    expect(g1).not.toContain(GOOD_KEY.slice(-4));
   });
 });

@@ -53,8 +53,11 @@ export async function openRouterGet(
   } catch {
     throw new OpenRouterError("failed");
   }
-  if (res.status === 401 || res.status === 403) throw new OpenRouterError("unauthorized");
-  if (!res.ok) throw new OpenRouterError("failed");
+  if (!res.ok) {
+    // The outcome is known: the rest of the body is not received.
+    await res.body?.cancel().catch(() => {});
+    throw new OpenRouterError(res.status === 401 || res.status === 403 ? "unauthorized" : "failed");
+  }
   const text = await readLimited(res);
   try {
     return JSON.parse(text) as unknown;
@@ -92,7 +95,8 @@ export async function readLimited(res: Response, max: number = OPENROUTER_MAX_BY
   } catch {
     throw new OpenRouterError("failed");
   }
-  return Buffer.concat(chunks).toString("utf8");
+  // As `Response.text()` decodes: UTF-8, a leading BOM dropped.
+  return new TextDecoder("utf-8").decode(Buffer.concat(chunks));
 }
 
 /**

@@ -79,6 +79,20 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   page.once("dialog", (d) => void d.accept());
   await keyForm.getByRole("button", { name: "키 지우기" }).click();
   await expect(keyForm.getByTestId("media-key")).toContainText("키 없음");
+  // Nothing of the deleted key's lists stays on screen (review r2): no models, prices or list source — only the
+  // saved choice itself, marked as not in a list.
+  await expect(form.getByTestId("media-model-image")).toHaveCount(0);
+  await expect(form.getByTestId("media-catalog-source-image")).toHaveCount(0);
+  await expect(image.locator("option")).toHaveText(["모델 고르기", "fixture/image-one (목록에 없음)"]);
+  await expect(form.getByLabel("음악 모델").locator("option")).toHaveText(["모델 고르기"]);
+  // A new key reads its own lists.
+  await keyForm.getByLabel("OpenRouter API 키").fill("sk-or-v1-e2e-synthetic-second-0000000000000vvvv");
+  await keyForm.getByRole("button", { name: "확인하고 저장" }).click();
+  await expect(keyForm.getByTestId("media-key")).toContainText("vvvv");
+  await expect(form.getByTestId("media-model-image")).toContainText("$0.04/image");
+  page.once("dialog", (d) => void d.accept());
+  await keyForm.getByRole("button", { name: "키 지우기" }).click();
+  await expect(keyForm.getByTestId("media-key")).toContainText("키 없음");
 });
 
 test("a member gets neither the tab's data nor the key routes", async ({ page }) => {

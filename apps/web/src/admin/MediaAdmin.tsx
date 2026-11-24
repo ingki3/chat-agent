@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MEDIA_KIND_LABEL,
@@ -12,6 +12,9 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 
 export const MEDIA_KEY = ["admin", "media"] as const;
+/** Every catalog query; each one is keyed by the server's key generation too (a list of another key never shows). */
+export const MEDIA_CATALOG_KEY = ["admin", "media-catalog"] as const;
+const catalogKey = (generation: string, kind: MediaKind) => [...MEDIA_CATALOG_KEY, generation, kind] as const;
 
 const SOURCE: Record<MediaAdminView["key"]["source"], string> = {
   admin: "관리자가 등록한 키",
@@ -32,18 +35,20 @@ const time = (ms: number) =>
 function KeySection({ m }: { m: MediaAdminView }) {
   const qc = useQueryClient();
   const [key, setKey] = useState("");
-  const done = (r: MediaAdminView) => {
+  /** A key saved or deleted: every list read with the old one goes (removed, not just marked stale). */
+  const keyChanged = (r: MediaAdminView) => {
+    qc.removeQueries({ queryKey: MEDIA_CATALOG_KEY });
     qc.setQueryData(MEDIA_KEY, r);
-    void qc.invalidateQueries({ queryKey: ["admin", "media-catalog"] });
   };
+  const done = (r: MediaAdminView) => qc.setQueryData(MEDIA_KEY, r);
   const save = useMutation({
     mutationFn: () => admin.setMediaKey(key.trim()),
     onSuccess: (r) => {
       setKey("");
-      done(r);
+      keyChanged(r);
     },
   });
-  const remove = useMutation({ mutationFn: admin.deleteMediaKey, onSuccess: done });
+  const remove = useMutation({ mutationFn: admin.deleteMediaKey, onSuccess: keyChanged });
   const check = useMutation({ mutationFn: admin.checkMediaKey, onSuccess: done });
   const k = m.key;
   const submit = (e: FormEvent) => {
@@ -131,25 +136,37 @@ function KindRow({
   kind,
   value,
   hasKey,
+  generation,
   onChange,
 }: {
   kind: MediaKind;
   value: MediaSettings["kinds"][MediaKind];
   hasKey: boolean;
+  /** The server's key generation: the list shown is always one read in this generation. */
+  generation: string;
   onChange: (v: MediaSettings["kinds"][MediaKind]) => void;
 }) {
   const qc = useQueryClient();
   const catalog = useQuery({
-    queryKey: ["admin", "media-catalog", kind],
+    queryKey: catalogKey(generation, kind),
     queryFn: () => admin.mediaCatalog(kind),
     enabled: hasKey,
     staleTime: 5 * 60_000,
   });
+  // The generation now (a refresh that started under another one is not applied).
+  const current = useRef(generation);
+  useEffect(() => {
+    current.current = generation;
+  }, [generation]);
   const reload = useMutation({
-    mutationFn: () => admin.mediaCatalog(kind, true),
-    onSuccess: (r) => qc.setQueryData(["admin", "media-catalog", kind], r),
+    mutationFn: async () => ({ started: generation, r: await admin.mediaCatalog(kind, true) }),
+    onSuccess: ({ started, r }) => {
+      if (started === current.current) qc.setQueryData(catalogKey(started, kind), r);
+    },
   });
-  const models = catalog.data?.models ?? [];
+  // Without a key nothing of a list is shown (no models, prices or source).
+  const list = hasKey ? catalog.data : undefined;
+  const models = list?.models ?? [];
   const chosen = models.find((x) => x.id === value.model);
   const label = MEDIA_KIND_LABEL[kind];
   return (
@@ -185,13 +202,13 @@ function KindRow({
       >
         목록 새로 고침
       </button>
-      {catalog.data && (
-        <span className="muted small">
+      {list && (
+        <span className="muted small" data-testid={`media-catalog-source-${kind}`}>
           {" "}
-          {models.length}개 · {catalog.data.source}
+          {models.length}개 · {list.source}
         </span>
       )}
-      {(catalog.isError || reload.isError) && (
+      {hasKey && (catalog.isError || reload.isError) && (
         <p className="error small" role="alert" data-testid={`media-catalog-error-${kind}`}>
           {label} 목록: {errorText(catalog.error ?? reload.error)}
         </p>
@@ -245,6 +262,7 @@ function SettingsForm({ m }: { m: MediaAdminView }) {
               kind={k}
               value={draft.kinds[k]}
               hasKey={hasKey}
+              generation={m.key.generation}
               onChange={(v) => set({ kinds: { ...draft.kinds, [k]: v } })}
             />
           ))}

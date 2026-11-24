@@ -99,6 +99,11 @@ export const MediaKeyView = z.object({
   limitRemainingUsd: z.number().nullable(),
   usageUsd: z.number().nullable(),
   checkedAt: z.number().int().nullable(),
+  /**
+   * Changes whenever the key in use may have (saved, deleted, server restart): the screen keys its catalog cache on
+   * it so a list read with another key is never shown. Not derived from the key.
+   */
+  generation: z.string(),
 });
 export type MediaKeyView = z.infer<typeof MediaKeyView>;
 

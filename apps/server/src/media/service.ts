@@ -64,6 +64,8 @@ export class MediaAdminService {
   >();
   /** Bumped on every key change (saved, deleted): a catalog read under another generation is never kept. */
   private gen = 0;
+  /** This process's id: with `gen`, the screen's catalog cache key (a restart never reuses an old one). */
+  private readonly boot = crypto.randomBytes(6).toString("hex");
   private envStatus: EnvStatus | undefined;
   private readonly now: () => number;
 
@@ -114,6 +116,7 @@ export class MediaAdminService {
       limitRemainingUsd: own?.limitRemainingUsd ?? null,
       usageUsd: own?.usageUsd ?? null,
       checkedAt: own?.checkedAt ?? null,
+      generation: `${this.boot}:${this.gen}`,
     };
   }
 
@@ -205,17 +208,23 @@ export class MediaAdminService {
       this.now() - hit.at < (this.o.catalogTtlMs ?? CATALOG_TTL_MS)
     )
       return hit.catalog;
-    let catalog: MediaCatalog;
+    let catalog: MediaCatalog | undefined;
+    let failure: unknown;
     try {
       catalog = await fetchCatalog(kind, { apiKey: resolved.key, ...this.fetchOpts() });
     } catch (e) {
-      if (e instanceof OpenRouterError && e.code === "unauthorized")
-        throw new MediaError(400, "media_key_invalid");
-      throw new MediaError(502, "media_catalog_failed", kind);
+      failure = e;
     }
+    // First whether the key is still the one this read used — for a failure as for a success: an old key's
+    // 401 or outage is not the new key's.
     const now = this.o.keys.resolve();
     if (this.gen !== gen || !now || fingerprint(now.key) !== fp)
       throw new MediaError(409, "media_key_changed");
+    if (!catalog) {
+      if (failure instanceof OpenRouterError && failure.code === "unauthorized")
+        throw new MediaError(400, "media_key_invalid");
+      throw new MediaError(502, "media_catalog_failed", kind);
+    }
     this.cache.set(kind, { at: this.now(), fp, gen, catalog });
     return catalog;
   }
