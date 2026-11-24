@@ -110,6 +110,8 @@ export const LOG_EVENTS = [
   "media.finished",
   // A media generation's usage row could not be written (twice): the operator checks the billing (#238).
   "media.usage_failed",
+  // The previous process's media reservations could not be taken up at start (#238): the start fails.
+  "media.recovery_failed",
   // python_run working folders left from the last process could not all be removed at start (#47; nothing else).
   "python.sweep_failed",
   // python_run account self-check (#47 round 2): the outcome only, no detail.

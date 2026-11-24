@@ -105,7 +105,7 @@ import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch } from "./media/fixture.js";
 import { MediaGenerator } from "./media/generate.js";
-import { MediaSettler } from "./media/settle.js";
+import { MediaSettler, recoverMediaReservations } from "./media/settle.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -667,6 +667,9 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
     });
     // Late cost settlement (#238 review r2): generations still waiting for their cost are looked up again with a
     // backoff, also after a restart. Not in tests (they drive `runOnce`).
+    // Before anything can take a request (#238 review r4): the previous process's `reserved` rows are taken up
+    // here, while the app is built — all of them, in one transaction; a failure that persists fails the start.
+    recoverMediaReservations(usage, { log: app.log });
     const mediaSettler = new MediaSettler({
       usage,
       keys: openRouterKeys,

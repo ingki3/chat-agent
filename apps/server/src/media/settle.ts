@@ -10,9 +10,9 @@ import type { OpenRouterKeys } from "./keys.js";
  * are on the row — and settles the same row when the cost comes. After `MAX_TRIES` tries or `MAX_AGE_MS` the row is
  * `unconfirmed` for good (its reserved bound stays in that day's budget; the usage screen counts it as 미제공).
  *
- * At start (`recover`), a row a previous process left `reserved` (it stopped between sending and settling) is
- * taken up: with its generation id (written as soon as the 2xx headers came) it waits for its cost like any other;
- * without one it is `unconfirmed`, keeping its reserved amount.
+ * A row a previous process left `reserved` (it stopped between sending and settling) is taken up at start by
+ * `recoverMediaReservations`, before the server takes requests: with its generation id (written as soon as the 2xx
+ * headers came) it waits for its cost like any other; without one it is `unconfirmed`, keeping its reserved amount.
  */
 export const SETTLE_INTERVAL_MS = 60_000;
 export const SETTLE_FIRST_MS = 15_000;
@@ -27,15 +27,10 @@ export class MediaSettler {
   private stopped = false;
   private readonly abort = new AbortController();
   private readonly now: () => number;
-  /** This process's start: `reserved` rows older than it were a previous process's. */
-  private readonly startedAt: number;
 
   constructor(
     private readonly o: {
-      usage: Pick<
-        UsageStore,
-        "dueMedia" | "settleMedia" | "triedMedia" | "unconfirmMedia" | "recoverReservedMedia"
-      >;
+      usage: Pick<UsageStore, "dueMedia" | "settleMedia" | "triedMedia" | "unconfirmMedia">;
       keys: Pick<OpenRouterKeys, "resolve">;
       fetchImpl?: typeof fetch | undefined;
       now?: () => number;
@@ -43,20 +38,6 @@ export class MediaSettler {
     },
   ) {
     this.now = o.now ?? Date.now;
-    this.startedAt = this.now();
-  }
-
-  /** Takes up a previous process's `reserved` rows (see the class note). Never throws. */
-  recover(): number {
-    try {
-      return this.o.usage.recoverReservedMedia(this.startedAt);
-    } catch {
-      logEvent(this.o.log, "warn", "media.usage_failed", {
-        mediaCode: "media_usage_failed",
-        mediaStep: "settle",
-      });
-      return 0;
-    }
   }
 
   /** One pass over the rows due now (tests call it directly). Never throws; does nothing once stopped. */
@@ -70,18 +51,20 @@ export class MediaSettler {
     try {
       const at = this.now();
       const key = this.o.keys.resolve();
-      // The rows whose backoff has passed (or that are to be given up), at most a batch — due ones first.
-      for (const r of this.o.usage.dueMedia(at, {
+      // The rows whose backoff has passed (or that are to be given up), at most a batch — due ones first. Without
+      // a key nothing can be looked up: only the rows to be given up are taken (review r4).
+      const rows = this.o.usage.dueMedia(at, {
         maxTries: MAX_TRIES,
         maxAgeMs: MAX_AGE_MS,
         limit: BATCH,
-      })) {
+        giveUpOnly: !key,
+      });
+      for (const r of rows) {
         if (this.stopped) return;
-        if (!r.generationId || r.tries >= MAX_TRIES || at - r.createdAt > MAX_AGE_MS) {
+        if (!key || !r.generationId || r.tries >= MAX_TRIES || at - r.createdAt > MAX_AGE_MS) {
           this.o.usage.unconfirmMedia(r.runKey);
           continue;
         }
-        if (!key) return;
         const cost = await generationCost(r.generationId, key.key, this.o.fetchImpl, this.abort.signal);
         // Stopped meanwhile: the row stays as it is (looked up again at the next start).
         if (this.stopped) return;
@@ -98,7 +81,6 @@ export class MediaSettler {
 
   start(): void {
     if (this.timer || this.stopped) return;
-    this.recover();
     this.first = setTimeout(() => void this.runOnce(), SETTLE_FIRST_MS);
     this.first.unref();
     this.timer = setInterval(() => void this.runOnce(), SETTLE_INTERVAL_MS);
@@ -113,5 +95,42 @@ export class MediaSettler {
     this.timer = undefined;
     this.abort.abort();
     await this.running;
+  }
+}
+
+/** Tries of the start-up recovery, and the wait between them. */
+export const RECOVER_TRIES = 3;
+export const RECOVER_WAIT_MS = 200;
+
+export class MediaRecoveryError extends Error {
+  constructor() {
+    super("media reservations of the previous process could not be taken up");
+    this.name = "MediaRecoveryError";
+  }
+}
+
+/**
+ * Start-up recovery of a previous process's `reserved` rows (#238 review r4) — synchronously while the app is built,
+ * so before the server takes any request and no media call of this process exists: all `reserved` rows are taken
+ * up, in one transaction (no clock compared: one server holds the data folder's lock). A failure is tried again
+ * (`RECOVER_TRIES`, `RECOVER_WAIT_MS` apart — a short write lock passes); if it still fails the start fails, loudly
+ * (`media.recovery_failed`), rather than leave rows reserved for good.
+ */
+export function recoverMediaReservations(
+  usage: Pick<UsageStore, "recoverReservedMedia">,
+  o: { log?: EventLogger | undefined; tries?: number; waitMs?: number } = {},
+): number {
+  const tries = o.tries ?? RECOVER_TRIES;
+  for (let i = 1; ; i++) {
+    try {
+      return usage.recoverReservedMedia();
+    } catch {
+      if (i >= tries) {
+        logEvent(o.log, "error", "media.recovery_failed", { mediaCode: "media_usage_failed" });
+        throw new MediaRecoveryError();
+      }
+      // A synchronous wait: this runs while the app is built, nothing else is waiting on this thread yet.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, o.waitMs ?? RECOVER_WAIT_MS);
+    }
   }
 }

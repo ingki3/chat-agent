@@ -19,7 +19,12 @@ import zlib from "node:zlib";
 import { byteRange, FILE_CSP } from "../src/files/routes.js";
 import { imageCostBound, speechCostBound } from "../src/media/cost.js";
 import { imageSize, MAX_PARTS, MAX_RUNS, stripImage, textRuns } from "../src/media/strip.js";
-import { MAX_TRIES, MediaSettler } from "../src/media/settle.js";
+import {
+  MAX_TRIES,
+  MediaRecoveryError,
+  MediaSettler,
+  recoverMediaReservations,
+} from "../src/media/settle.js";
 import { compose } from "../src/notifications/compose.js";
 import { usageRecords } from "../src/db/schema.js";
 import { addRow, emptyTotals, UsageService } from "../src/usage/service.js";
@@ -1911,15 +1916,8 @@ describe("media tools: review round 3 regressions (#246)", () => {
       model: "m",
       estimateUsd: 0.25,
     });
-    const later = Date.now() + 10;
-    const settler = new MediaSettler({
-      usage: t.app.usageStore!,
-      keys: t.app.media!.keys,
-      fetchImpl: t.fetchImpl,
-      now: () => later + 5,
-    });
-    await new Promise((r) => setTimeout(r, 20));
-    expect(settler.recover()).toBe(2);
+    // Start-up recovery takes up every reserved row (one server holds the data folder's lock).
+    expect(recoverMediaReservations(t.app.usageStore!)).toBe(2);
     const states = t.db.$client
       .prepare(
         "SELECT run_id r, media_settlement s, estimated_cost_micros e FROM usage_records WHERE run_id LIKE 'old%' ORDER BY run_id",
@@ -1929,17 +1927,6 @@ describe("media tools: review round 3 regressions (#246)", () => {
       { r: mediaRunKey("old", "1"), s: "awaiting_cost", e: 500_000 },
       { r: mediaRunKey("old", "2"), s: "unconfirmed", e: 250_000 },
     ]);
-    // Rows of this process's calls in flight (newer than its start) are not touched.
-    t.app.usageStore!.reserveMedia({
-      userId: t.f.users.owner.id,
-      conversationId: conv.id,
-      runId: "new",
-      callId: "1",
-      model: "m",
-      estimateUsd: 0.1,
-    });
-    const fresh = new MediaSettler({ usage: t.app.usageStore!, keys: t.app.media!.keys, now: () => 0 });
-    expect(fresh.recover()).toBe(0);
   });
 
   it("P2: an image model record without its id (or another id) is media_lookup_failed — no POST", async () => {
@@ -2038,19 +2025,8 @@ describe("media tools: review round 3 regressions (#246)", () => {
     db.$client
       .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
       .run();
-    let now = 1_000_000;
+    const now = 100 * 3600_000;
     const store = new UsageStore(db, () => now);
-    // An old row that was tried long ago (due), then 100 rows tried just now (backoff not passed).
-    store.reserveMedia({
-      userId: "u1",
-      conversationId: null,
-      runId: "due",
-      callId: "0",
-      model: "m",
-      estimateUsd: 1,
-    });
-    store.answeredMedia(mediaRunKey("due", "0"), "gen-due");
-    now += 10 * 60_000;
     for (let i = 0; i < 100; i++) {
       store.reserveMedia({
         userId: "u1",
@@ -2062,11 +2038,24 @@ describe("media tools: review round 3 regressions (#246)", () => {
       });
       store.answeredMedia(mediaRunKey("w", String(i)), `gen-w-${i}`);
     }
-    // Make the old one the newest-tried but due (its backoff of 2 min passed), the others not due.
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "due",
+      callId: "0",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.answeredMedia(mediaRunKey("due", "0"), "gen-due");
+    // The first 100 by `updated_at`: tried 30 minutes ago, but 8 times — their backoff (4 h 16 min) is not over.
     db.$client
-      .prepare("UPDATE usage_records SET updated_at = ?, media_settle_tries = 1 WHERE run_id LIKE 'due%'")
+      .prepare("UPDATE usage_records SET updated_at = ?, media_settle_tries = 8 WHERE run_id LIKE 'w#%'")
+      .run(now - 30 * 60_000);
+    // The 101st: tried more recently (3 minutes ago), once — its 2-minute backoff is over.
+    db.$client
+      .prepare("UPDATE usage_records SET updated_at = ?, media_settle_tries = 1 WHERE run_id LIKE 'due#%'")
       .run(now - 3 * 60_000);
-    db.$client.prepare("UPDATE usage_records SET updated_at = ? WHERE run_id LIKE 'w#%'").run(now - 10);
+    // A limit before the backoff check would take the 100 waiting ones and miss it.
     const due = store.dueMedia(now, { maxTries: 12, maxAgeMs: 1e12, limit: 100 });
     expect(due.map((r) => r.runKey)).toEqual([mediaRunKey("due", "0")]);
   });
@@ -2089,5 +2078,170 @@ describe("media tools: review round 3 regressions (#246)", () => {
     }>();
     expect(report.total.costPending).toBe(1);
     expect(report.recent[0]).toMatchObject({ costPending: true, costUsd: null });
+  });
+});
+
+// ---------------------------------------------------------------- review round 4 (#246)
+
+describe("media tools: review round 4 regressions (#246)", () => {
+  const user = (db: ReturnType<typeof createTestDb>) =>
+    db.$client
+      .prepare("INSERT INTO users (id, email, name, role) VALUES ('u1', 'u1@x.test', 'u1', 'member')")
+      .run();
+
+  it("P2: recovery does not depend on the clock — rows at the same ms or 'in the future' are taken up at start", async () => {
+    const db = createTestDb();
+    user(db);
+    // The previous process's rows, written with a clock ahead of this start (it went backwards) and at its exact ms.
+    const startAt = Date.now();
+    const old = new UsageStore(db, () => startAt + 60_000);
+    old.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "a",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.5,
+    });
+    old.generationMedia(mediaRunKey("a", "1"), "gen-a-1");
+    const same = new UsageStore(db, () => startAt);
+    same.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "b",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.2,
+    });
+    // A new server on that database: recovery runs while the app is built, before any request.
+    const dir = tmp();
+    const app = await buildApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATA_DIR: path.join(dir, "data"),
+        MASTER_KEY_PATH: path.join(dir, "k"),
+      }),
+      { db, media: { fetchImpl: fixtureOpenRouterFetch(), now: () => startAt } },
+    );
+    closers.push(() => app.close());
+    const rows = db.$client
+      .prepare(
+        "SELECT run_id r, media_settlement s, estimated_cost_micros e FROM usage_records ORDER BY run_id",
+      )
+      .all();
+    expect(rows).toEqual([
+      { r: mediaRunKey("a", "1"), s: "awaiting_cost", e: 500_000 },
+      { r: mediaRunKey("b", "1"), s: "unconfirmed", e: 200_000 },
+    ]);
+  });
+
+  it("P2: a recovery write that fails is tried again; one that keeps failing fails the start (no row left reserved quietly)", () => {
+    let calls = 0;
+    const flaky = {
+      recoverReservedMedia: () => {
+        calls++;
+        if (calls === 1) throw new Error("SQLITE_BUSY");
+        return 3;
+      },
+    };
+    expect(recoverMediaReservations(flaky, { waitMs: 1 })).toBe(3);
+    expect(calls).toBe(2);
+    const down = {
+      recoverReservedMedia: () => {
+        throw new Error("SQLITE_BUSY");
+      },
+    };
+    const lines: unknown[] = [];
+    const log = { info: () => {}, warn: () => {}, error: (...args: unknown[]) => void lines.push(args) };
+    expect(() => recoverMediaReservations(down, { waitMs: 1, log: log as never })).toThrow(
+      MediaRecoveryError,
+    );
+    expect(JSON.stringify(lines)).toContain("media.recovery_failed");
+    // One transaction: a failure in the second move leaves the first undone too.
+    const db = createTestDb();
+    user(db);
+    const store = new UsageStore(db, () => 1);
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "a",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.generationMedia(mediaRunKey("a", "1"), "gen-a-1");
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "b",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    db.$client.exec(
+      "CREATE TRIGGER no_unconfirm BEFORE UPDATE OF media_settlement ON usage_records WHEN NEW.media_settlement = 'unconfirmed' BEGIN SELECT RAISE(ABORT, 'busy'); END",
+    );
+    expect(() => store.recoverReservedMedia()).toThrow();
+    const states = () =>
+      (
+        db.$client.prepare("SELECT media_settlement s FROM usage_records ORDER BY run_id").all() as {
+          s: string;
+        }[]
+      ).map((r) => r.s);
+    expect(states()).toEqual(["reserved", "reserved"]);
+    db.$client.exec("DROP TRIGGER no_unconfirm");
+    expect(recoverMediaReservations(store)).toBe(2);
+    expect(states()).toEqual(["awaiting_cost", "unconfirmed"]);
+  });
+
+  it("P3: without a key the settler still gives up the rows to be given up (all of them, up to the batch)", async () => {
+    const db = createTestDb();
+    user(db);
+    const now = 10 * 24 * 3600_000;
+    const store = new UsageStore(db, () => now);
+    // First by `updated_at`: a row that would need a lookup; then one whose tries are used up.
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "look",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.answeredMedia(mediaRunKey("look", "1"), "gen-look");
+    store.reserveMedia({
+      userId: "u1",
+      conversationId: null,
+      runId: "spent",
+      callId: "1",
+      model: "m",
+      estimateUsd: 1,
+    });
+    store.answeredMedia(mediaRunKey("spent", "1"), "gen-spent");
+    db.$client
+      .prepare("UPDATE usage_records SET updated_at = ? WHERE run_id LIKE 'look#%'")
+      .run(now - 10 * 60_000);
+    db.$client
+      .prepare("UPDATE usage_records SET updated_at = ?, media_settle_tries = ? WHERE run_id LIKE 'spent#%'")
+      .run(now - 60_000, MAX_TRIES);
+    let fetched = 0;
+    const settler = new MediaSettler({
+      usage: store,
+      keys: { resolve: () => undefined },
+      fetchImpl: (async () => {
+        fetched++;
+        return Response.json({});
+      }) as unknown as typeof fetch,
+      now: () => now,
+    });
+    await settler.runOnce();
+    const states = db.$client
+      .prepare("SELECT run_id r, media_settlement s FROM usage_records ORDER BY run_id")
+      .all();
+    expect(states).toEqual([
+      { r: mediaRunKey("look", "1"), s: "awaiting_cost" },
+      { r: mediaRunKey("spent", "1"), s: "unconfirmed" },
+    ]);
+    expect(fetched).toBe(0);
   });
 });
