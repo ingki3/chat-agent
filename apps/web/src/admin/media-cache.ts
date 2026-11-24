@@ -160,7 +160,7 @@ export class MediaScreenStore {
     const { values, base } = this.pending;
     this.pending = r.ok
       ? { phase: "confirming", values, base, afterTicket: this.reads.current() }
-      : { phase: "failed", values, base, code: r.code, kind: r.kind };
+      : { phase: "failed", values, base, code: r.code, kind: r.kind, afterTicket: this.reads.current() };
     this.slot = null;
     this.emit();
     return true;
@@ -249,7 +249,15 @@ export const inputAfterSave = (input: string, saved: string): string => (input.t
 export type SettingsSave =
   | { phase: "sending"; values: MediaSettings; base: string }
   | { phase: "confirming"; values: MediaSettings; base: string; afterTicket: number }
-  | { phase: "failed"; values: MediaSettings; base: string; code: string; kind?: string | undefined };
+  | {
+      phase: "failed";
+      values: MediaSettings;
+      base: string;
+      code: string;
+      kind?: string | undefined;
+      /** The latest read started at the refusal: a later one shows the latest values (review r10). */
+      afterTicket: number;
+    };
 
 export type FormState = {
   values: MediaSettings;
@@ -258,6 +266,8 @@ export type FormState = {
   saved: boolean;
   /** The failed save's code, when its values are still the draft shown. */
   failed: string | null;
+  /** A status read started after the refusal is shown (the latest values are here; a re-save may go). */
+  refreshed: boolean;
 };
 
 export function formState(o: {
@@ -271,16 +281,23 @@ export function formState(o: {
 }): FormState {
   const { save } = o;
   const busy = o.busy ?? false;
-  if (save?.phase === "sending") return { values: save.values, locked: true, saved: false, failed: null };
+  const none = { failed: null, refreshed: false };
+  if (save?.phase === "sending") return { values: save.values, locked: true, saved: false, ...none };
   if (save?.phase === "confirming" && o.shownTicket <= save.afterTicket)
-    return { values: save.values, locked: true, saved: true, failed: null };
+    return { values: save.values, locked: true, saved: true, ...none };
   if (save?.phase === "failed" && o.edit === null)
-    return { values: save.values, locked: busy, saved: false, failed: save.code };
+    return {
+      values: save.values,
+      locked: busy,
+      saved: false,
+      failed: save.code,
+      refreshed: o.shownTicket > save.afterTicket,
+    };
   return {
     values: formValue(o.edit, o.server),
     locked: busy,
     saved: save?.phase === "confirming" && o.edit === null,
-    failed: null,
+    ...none,
   };
 }
 

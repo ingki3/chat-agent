@@ -307,6 +307,7 @@ function SettingsForm({
     locked,
     saved,
     failed,
+    refreshed,
   } = formState({
     edit,
     save: pending,
@@ -438,7 +439,10 @@ function SettingsForm({
         {failed && (
           <p className="error small" role="alert">
             {failedKind && `${MEDIA_KIND_LABEL[failedKind]}: `}
-            {errorText(new ApiError(0, failed))}
+            {/* Until a read started after the refusal is shown, the latest values are not here yet. */}
+            {failed === "media_settings_changed" && !refreshed
+              ? "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…"
+              : errorText(new ApiError(0, failed))}
           </p>
         )}
         {saved && (
@@ -463,7 +467,11 @@ function SettingsForm({
         )}
         {conflict ? (
           <span className="actions">
-            <button type="button" onClick={() => submit(m.settingsRevision)} disabled={invalid || locked}>
+            <button
+              type="button"
+              onClick={() => submit(m.settingsRevision)}
+              disabled={invalid || locked || !refreshed}
+            >
               이 값으로 다시 저장
             </button>
             <button

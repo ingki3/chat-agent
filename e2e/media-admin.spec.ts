@@ -101,6 +101,9 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await form.getByLabel("1인당 하루 비용 한도 (USD)").fill("12");
   await form.getByRole("button", { name: "확인하고 저장" }).click();
   await expect(form.getByRole("alert")).toContainText("다른 곳에서 설정이 바뀌었어요");
+  // Once the read after the refusal is here, it says so and the re-save opens (review r10).
+  await expect(form.getByRole("alert")).toContainText("최신 값을 불러왔어요");
+  await expect(form.getByRole("button", { name: "이 값으로 다시 저장" })).toBeEnabled();
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("12");
   await form.getByRole("button", { name: "이 값으로 다시 저장" }).click();
   await expect(form.getByRole("status")).toHaveText("저장했어요.");

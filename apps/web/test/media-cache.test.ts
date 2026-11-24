@@ -301,6 +301,7 @@ describe("media admin screen rules (#238)", () => {
       locked: false,
       saved: false,
       failed: "media_settings_changed",
+      refreshed: false,
     });
     expect(draftBase(null, again.save)).toBe("R5");
     expect(expectedRevision(draftBase(null, again.save), "R6")).toBe("R5");
@@ -387,5 +388,21 @@ describe("media admin screen rules (#238)", () => {
     t.st.clearSave(); // the admin edits
     expect(t.st.reloadFailed).toBe(false);
     expect(t.st.save).toBeNull();
+  });
+
+  it("r10: after a refusal, the latest values count as here only once a read started after it is shown", () => {
+    const t = store();
+    const before = t.st.reads.start(); // the read shown at the refusal
+    const id = t.st.beginSave(twenty, "R1")!;
+    t.st.settleSave(id, { ok: false, code: "media_settings_changed" });
+    // Still the old read: "불러오는 중…", no re-save yet.
+    expect(shown(t.st, fifty, before)).toMatchObject({ failed: "media_settings_changed", refreshed: false });
+    // The recovery read (started after the refusal) arrives: the latest values are here, re-save may go.
+    const after = t.st.reads.start();
+    expect(shown(t.st, { ...fifty, dailyCostLimitUsd: 35 }, after)).toMatchObject({
+      values: twenty,
+      failed: "media_settings_changed",
+      refreshed: true,
+    });
   });
 });
