@@ -77,19 +77,62 @@ export function catalogView(
 export const formValue = (edit: MediaSettings | null, server: MediaSettings): MediaSettings => edit ?? server;
 
 /**
- * The screen's memory that must outlive the component (review r5): status read tickets and rejected generations
- * live with the QueryClient — leaving the menu and coming back keeps them, as the query cache does.
+ * The screen's memory with the QueryClient's lifetime, as an external store (`useSyncExternalStore`): whichever
+ * form is mounted now sees its changes — the settings save in progress, the rejected generations — and every
+ * request to read the status again goes through one place (`requestRefresh`), coalesced into one read per turn.
  */
 export class MediaScreenStore {
   readonly reads = new StatusReads();
   readonly rejected = new RejectedGenerations();
   private pending: SettingsSave | null = null;
-  /** A settings save sent or waiting for its confirming read (review r6: a re-entered form stays locked). */
+  private version = 0;
+  private readonly listeners = new Set<() => void>();
+  private scheduled = false;
+  private run: (() => void) | null = null;
+
+  constructor(private readonly schedule: (f: () => void) => void = (f) => void setTimeout(f, 0)) {}
+
+  subscribe = (l: () => void): (() => void) => {
+    this.listeners.add(l);
+    return () => void this.listeners.delete(l);
+  };
+  getSnapshot = (): number => this.version;
+  private emit(): void {
+    this.version += 1;
+    for (const l of [...this.listeners]) l();
+  }
+
   get save(): SettingsSave | null {
     return this.pending;
   }
   setSave(v: SettingsSave | null): void {
     this.pending = v;
+    this.emit();
+  }
+
+  /** How the status is read again (set by the mounted screen; the QueryClient's, so any screen's will do). */
+  setRefresh(run: () => void): void {
+    this.run = run;
+  }
+  /** One status read for every request made in the same turn (a write's error and its settle, four 409s). */
+  requestRefresh(): void {
+    if (this.scheduled) return;
+    this.scheduled = true;
+    this.schedule(() => {
+      this.scheduled = false;
+      this.run?.();
+    });
+  }
+
+  /**
+   * A call refused for `generation` (a catalog or a key write): an out-of-date status rejects the generation and
+   * asks for one status read. Returns whether the error is one to show.
+   */
+  stale(e: unknown, generation: string): boolean {
+    if (!isStaleKeyError(e)) return true;
+    if (this.rejected.reject(generation)) this.emit();
+    this.requestRefresh();
+    return false;
   }
 }
 const stores = new WeakMap<object, MediaScreenStore>();
@@ -117,26 +160,45 @@ export const keyWriteArgs = (generation: string): KeyWrite => ({ expectedGenerat
 export const inputAfterSave = (input: string, saved: string): string => (input.trim() === saved ? "" : input);
 
 /**
- * A settings save in progress (review r5): `sending` until the server answers, then `confirming` until a status read
- * shows the saved version (or a later one). Throughout, the form shows the submitted values and is locked — no
- * flash back to older values, no edit made meanwhile that the save would drop.
+ * A settings save (review r5–r7), held in the screen store so whichever form is mounted shows it: `sending` until
+ * the server answers; `confirming` until a status read shows the saved version (or a later one — also when that read
+ * came before the answer); `failed` with the server's code (the admin's values stay as their draft). Throughout
+ * `sending`/`confirming` the form shows the submitted values and is locked.
  */
 export type SettingsSave =
-  | { phase: "sending"; values: MediaSettings }
-  | { phase: "confirming"; values: MediaSettings; version: number };
+  | { phase: "sending"; values: MediaSettings; base: number }
+  | { phase: "confirming"; values: MediaSettings; base: number; version: number }
+  | { phase: "failed"; values: MediaSettings; base: number; code: string; kind?: string | undefined };
 
-export type FormState = { values: MediaSettings; locked: boolean };
+export type FormState = {
+  values: MediaSettings;
+  locked: boolean;
+  /** The save went through and a status read shows it. */
+  saved: boolean;
+  /** The failed save's code, when its values are still the draft shown. */
+  failed: string | null;
+};
 
 export function formState(o: {
   edit: MediaSettings | null;
   save: SettingsSave | null;
   server: MediaSettings;
   serverVersion: number;
+  /** Another read the form waits for ("최신 값 불러오기"). */
+  busy?: boolean;
 }): FormState {
   const { save } = o;
-  if (save && (save.phase === "sending" || o.serverVersion < save.version))
-    return { values: save.values, locked: true };
-  return { values: formValue(o.edit, o.server), locked: false };
+  const busy = o.busy ?? false;
+  if (save?.phase === "sending" || (save?.phase === "confirming" && o.serverVersion < save.version))
+    return { values: save.values, locked: true, saved: false, failed: null };
+  if (save?.phase === "failed" && o.edit === null)
+    return { values: save.values, locked: busy, saved: false, failed: save.code };
+  return {
+    values: formValue(o.edit, o.server),
+    locked: busy,
+    saved: save?.phase === "confirming" && o.edit === null,
+    failed: null,
+  };
 }
 
 /**
@@ -145,3 +207,7 @@ export function formState(o: {
  */
 export const expectedVersion = (editBase: number | null, serverVersion: number): number =>
   editBase ?? serverVersion;
+
+/** The base of the draft shown: the edit's, else a failed save's (its values are the draft), else none. */
+export const draftBase = (editBase: number | null, save: SettingsSave | null): number | null =>
+  editBase ?? (save?.phase === "failed" ? save.base : null);

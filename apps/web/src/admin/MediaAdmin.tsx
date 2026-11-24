@@ -1,4 +1,4 @@
-import { useCallback, useState, type FormEvent } from "react";
+import { useEffect, useState, useSyncExternalStore, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MEDIA_KIND_LABEL,
@@ -12,6 +12,7 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 import {
   catalogView,
+  draftBase,
   expectedVersion,
   formState,
   inputAfterSave,
@@ -22,9 +23,7 @@ import {
   type KeySave,
   type KeyWrite,
   type MediaScreenStore,
-  onCatalogError,
   type RejectedGenerations,
-  type SettingsSave,
 } from "./media-cache.js";
 
 export const MEDIA_KEY = ["admin", "media"] as const;
@@ -41,8 +40,8 @@ type Screen = {
   rejected: RejectedGenerations;
   /** A generation was just rejected (re-render: every kind hides its list at once). */
   onReject: (e: unknown, generation: string) => boolean;
-  /** Reads the status now; rejects when that read fails (the caller keeps what it holds). */
-  reload: () => Promise<void>;
+  /** Reads the status now; true only when a new status actually arrived (offline or failed: false). */
+  reload: () => Promise<boolean>;
   store: MediaScreenStore;
 };
 
@@ -280,66 +279,74 @@ function KindRow({
 }
 
 function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
-  // The admin's unsaved edit and the version it started from; null = the form follows the latest status read.
+  // The admin's unsaved edit and the version it started from; null = the form follows the latest status read (or a
+  // failed save's values, kept in the store).
   const [edit, setEdit] = useState<MediaSettings | null>(null);
   const [editBase, setEditBase] = useState<number | null>(null);
-  // The save in progress lives with the QueryClient (a re-entered form stays locked on the submitted values).
+  // The save itself lives in the screen store: whichever form is mounted when it settles shows its outcome.
   const { store } = screen;
-  const [, rerender] = useState(0);
-  const inFlight = store.save;
-  const setInFlight = (v: SettingsSave | null) => {
-    store.setSave(v);
-    rerender((n) => n + 1);
-  };
-  const [conflict, setConflict] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const pending = store.save;
   const [reloading, setReloading] = useState(false);
   const [reloadFailed, setReloadFailed] = useState(false);
-  const { values: draft, locked } = formState({
+  const {
+    values: draft,
+    locked,
+    saved,
+    failed,
+  } = formState({
     edit,
-    save: inFlight,
+    save: pending,
     server: m.settings,
     serverVersion: m.settingsVersion,
+    busy: reloading,
   });
+  const base = draftBase(editBase, pending);
+  const conflict = failed === "media_settings_changed";
   const save = useMutation({
     // Only the values and version fixed at the click are sent.
     mutationFn: (o: { values: MediaSettings; version: number }) =>
       admin.saveMediaSettings(o.values, o.version),
-    // The answer only says which version to wait for; the form shows the status read that has it.
-    onSuccess: (r, o) => {
-      setInFlight({ phase: "confirming", values: o.values, version: r.settingsVersion });
-      setEdit(null);
-      setEditBase(null);
-      setSaved(true);
-    },
-    // An error keeps the admin's values as their edit (never silently replaced).
-    onError: (e, o) => {
-      setInFlight(null);
-      setEdit(o.values);
-      if (e instanceof ApiError && e.code === "media_settings_changed") setConflict(true);
-    },
+    // These run on the mutation, mounted form or not: the outcome goes to the store.
+    onSuccess: (r, o) =>
+      store.setSave({ phase: "confirming", values: o.values, base: o.version, version: r.settingsVersion }),
+    // An error keeps the admin's values as the draft (never silently replaced).
+    onError: (e, o) =>
+      store.setSave({
+        phase: "failed",
+        values: o.values,
+        base: o.version,
+        code: e instanceof ApiError ? e.code : "unknown",
+        kind: e instanceof ApiError ? (e.body as { kind?: string } | undefined)?.kind : undefined,
+      }),
     onSettled: screen.refresh,
   });
   const submit = (version: number) => {
-    setSaved(false);
-    setConflict(false);
-    setInFlight({ phase: "sending", values: draft });
+    setReloadFailed(false);
+    setEdit(null);
+    setEditBase(null);
+    store.setSave({ phase: "sending", values: draft, base: version });
     save.mutate({ values: draft, version });
   };
   const hasKey = m.key.source !== "none";
   const set = (patch: Partial<MediaSettings>) => {
     if (locked) return;
-    setSaved(false);
-    setInFlight(null);
-    if (edit === null) setEditBase(m.settingsVersion);
+    setReloadFailed(false);
+    setEditBase(base ?? m.settingsVersion);
     setEdit({ ...draft, ...patch });
+    // An edit takes over from a finished or failed save.
+    if (pending && pending.phase !== "sending") store.setSave(null);
   };
   const invalid = MEDIA_KINDS.some((k) => draft.kinds[k].enabled && !draft.kinds[k].model);
   const failedKind =
-    save.error instanceof ApiError ? (save.error.body as { kind?: MediaKind } | undefined)?.kind : undefined;
+    failed &&
+    pending?.phase === "failed" &&
+    pending.kind &&
+    (MEDIA_KINDS as readonly string[]).includes(pending.kind)
+      ? (pending.kind as MediaKind)
+      : undefined;
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (!conflict) submit(expectedVersion(editBase, m.settingsVersion));
+    if (!conflict && !locked) submit(expectedVersion(base, m.settingsVersion));
   };
   const num = (v: string) => (v === "" ? NaN : Number(v));
   return (
@@ -417,10 +424,10 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
           보내요. 모든 요청은 데이터 수집을 거부하고(<code>data_collection: deny</code>), 비밀값이 든
           프롬프트는 보내지 않아요.
         </p>
-        {save.isError && (
+        {failed && (
           <p className="error small" role="alert">
             {failedKind && `${MEDIA_KIND_LABEL[failedKind]}: `}
-            {errorText(save.error)}
+            {errorText(new ApiError(0, failed))}
           </p>
         )}
         {saved && !locked && (
@@ -428,9 +435,14 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
             저장했어요.
           </p>
         )}
-        {locked && (
+        {locked && !reloading && (
           <p className="muted small" role="status">
             저장하는 중…
+          </p>
+        )}
+        {reloading && (
+          <p className="muted small" role="status">
+            최신 값을 불러오는 중…
           </p>
         )}
         {reloadFailed && (
@@ -440,25 +452,24 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
         )}
         {conflict ? (
           <span className="actions">
-            <button type="button" onClick={() => submit(m.settingsVersion)} disabled={invalid}>
+            <button type="button" onClick={() => submit(m.settingsVersion)} disabled={invalid || locked}>
               이 값으로 다시 저장
             </button>
             <button
               type="button"
-              disabled={reloading}
+              disabled={locked}
               onClick={() => {
-                // The edit goes only once the latest values are actually here; a failed read keeps it.
+                // The draft goes only once a new status actually arrived; offline or failed, it stays.
                 setReloading(true);
                 setReloadFailed(false);
-                screen
+                void screen
                   .reload()
-                  .then(() => {
-                    setConflict(false);
+                  .then((arrived) => {
+                    if (!arrived) return setReloadFailed(true);
                     setEdit(null);
                     setEditBase(null);
-                    save.reset();
+                    store.setSave(null);
                   })
-                  .catch(() => setReloadFailed(true))
                   .finally(() => setReloading(false));
               }}
             >
@@ -467,8 +478,8 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
           </span>
         ) : (
           <span className="actions">
-            <button className="primary" disabled={invalid}>
-              {save.isPending ? "모델 확인 중…" : "확인하고 저장"}
+            <button className="primary" disabled={invalid || locked}>
+              {pending?.phase === "sending" ? "모델 확인 중…" : "확인하고 저장"}
             </button>
           </span>
         )}
@@ -481,8 +492,10 @@ function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
 export function MediaAdmin() {
   const qc = useQueryClient();
   // Lives with the QueryClient: leaving the menu and coming back keeps the tickets and the rejected generations.
-  const { reads, rejected } = mediaScreenStore(qc);
-  const [, rerender] = useState(0);
+  const store = mediaScreenStore(qc);
+  const { reads, rejected } = store;
+  // Every change of the store (a save's outcome, a rejected generation) re-renders the screen mounted now.
+  useSyncExternalStore(store.subscribe, store.getSnapshot);
   // Only the latest started status read is shown: an older one that answers later keeps what is shown.
   const q = useQuery({
     queryKey: MEDIA_KEY,
@@ -495,26 +508,32 @@ export function MediaAdmin() {
   });
   // After a write (or a refused catalog): any status read in flight is cancelled — watched or not — and the status
   // is invalidated and read again even with no one watching it (the next visit then reads it anyway).
-  const refresh = useCallback(() => {
-    void (async () => {
-      await qc.cancelQueries({ queryKey: MEDIA_KEY });
-      await qc.invalidateQueries({ queryKey: MEDIA_KEY, refetchType: "all" });
-    })();
-  }, [qc]);
-  const store = mediaScreenStore(qc);
+  // Requests for a new read all go through the store (one read per turn).
+  useEffect(() => {
+    store.setRefresh(() => {
+      void (async () => {
+        await qc.cancelQueries({ queryKey: MEDIA_KEY });
+        await qc.invalidateQueries({ queryKey: MEDIA_KEY, refetchType: "all" });
+      })();
+    });
+  }, [qc, store]);
+  const refresh = () => store.requestRefresh();
   const screen: Screen = {
     refresh,
     rejected,
     store,
     reload: async () => {
-      await qc.cancelQueries({ queryKey: MEDIA_KEY });
-      await qc.refetchQueries({ queryKey: MEDIA_KEY, type: "all" }, { throwOnError: true });
+      const before = qc.getQueryState(MEDIA_KEY)?.dataUpdatedAt ?? 0;
+      try {
+        await qc.cancelQueries({ queryKey: MEDIA_KEY });
+        await qc.refetchQueries({ queryKey: MEDIA_KEY, type: "all" }, { throwOnError: true });
+      } catch {
+        return false;
+      }
+      // Resolved is not arrived: a paused (offline) read resolves with nothing new.
+      return (qc.getQueryState(MEDIA_KEY)?.dataUpdatedAt ?? 0) > before;
     },
-    onReject: (e, generation) => {
-      const show = onCatalogError(e, generation, rejected, refresh);
-      if (!show) rerender((n) => n + 1);
-      return show;
-    },
+    onReject: (e, generation) => store.stale(e, generation),
   };
   const m = q.data;
   // Only a first load that failed shows the empty error; with a status shown, a failed re-read keeps the screen.

@@ -107,6 +107,51 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await page.reload();
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("12");
 
+  // Review r7: the menu is left and entered again while a save is on its way — the form mounted then settles it.
+  const limit = form.getByLabel("1인당 하루 비용 한도 (USD)");
+  const reenter = async () => {
+    await page.getByRole("tab", { name: "사용자" }).click();
+    await page.getByRole("tab", { name: "미디어 생성" }).click();
+  };
+  let release: () => void = () => {};
+  const held = (answer?: { status: number; body: unknown }) =>
+    page.route("**/api/admin/media/settings", async (route) => {
+      await new Promise<void>((r) => (release = r));
+      if (answer) await route.fulfill({ status: answer.status, json: answer.body });
+      else await route.continue();
+    });
+  await held();
+  await limit.fill("33");
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await reenter();
+  await expect(form.getByRole("status")).toHaveText("저장하는 중…");
+  await expect(limit).toHaveValue("33");
+  await expect(limit).toBeDisabled();
+  release();
+  await expect(form.getByRole("status")).toHaveText("저장했어요.");
+  await expect(limit).toHaveValue("33");
+  await expect(limit).toBeEnabled();
+  await page.unroute("**/api/admin/media/settings");
+  // Refused after re-entry: the error shows in the form mounted now, the admin's value stays.
+  await held({ status: 409, body: { error: "media_settings_changed" } });
+  await limit.fill("44");
+  await form.getByRole("button", { name: "확인하고 저장" }).click();
+  await reenter();
+  await expect(limit).toBeDisabled();
+  release();
+  await expect(form.getByRole("alert")).toContainText("다른 곳에서 설정이 바뀌었어요");
+  await expect(limit).toHaveValue("44");
+  await expect(limit).toBeEnabled();
+  await page.unroute("**/api/admin/media/settings");
+  // "최신 값 불러오기" offline: nothing arrives, so the draft stays (and a retry is offered).
+  await page.context().setOffline(true);
+  await form.getByRole("button", { name: "최신 값 불러오기" }).click();
+  await expect(form.getByRole("alert").filter({ hasText: "최신 값을 불러오지 못했어요" })).toBeVisible();
+  await expect(limit).toHaveValue("44");
+  await page.context().setOffline(false);
+  await form.getByRole("button", { name: "최신 값 불러오기" }).click();
+  await expect(limit).toHaveValue("33");
+
   // Turning a kind on needs a model (the save button waits for one).
   await form.getByLabel("음성 생성 켜기").check();
   await expect(form.getByText("켜려면 모델을 골라요.")).toBeVisible();

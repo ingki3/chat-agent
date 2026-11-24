@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
 import {
   catalogView,
+  draftBase,
   expectedVersion,
   formState,
+  MediaScreenStore,
   inputAfterSave,
   keySaveArgs,
   keyWriteArgs,
@@ -190,18 +192,18 @@ describe("media admin screen rules (#238)", () => {
     // Sent: the submitted $20 is shown and the form is locked.
     let st = formState({
       edit: null,
-      save: { phase: "sending", values: twenty },
+      save: { phase: "sending", values: twenty, base: 0 },
       server: fifty,
       serverVersion: 0,
     });
-    expect(st).toEqual({ values: twenty, locked: true });
+    expect(st).toMatchObject({ values: twenty, locked: true });
     // Saved as v1, but the status read still shows v0 ($50): still $20, still locked.
-    const confirming = { phase: "confirming" as const, values: twenty, version: 1 };
+    const confirming = { phase: "confirming" as const, values: twenty, base: 0, version: 1 };
     st = formState({ edit: null, save: confirming, server: fifty, serverVersion: 0 });
-    expect(st).toEqual({ values: twenty, locked: true });
+    expect(st).toMatchObject({ values: twenty, locked: true });
     // The read shows v1: unlocked, following it; an edit now starts from $20.
     st = formState({ edit: null, save: confirming, server: twenty, serverVersion: 1 });
-    expect(st).toEqual({ values: twenty, locked: false });
+    expect(st).toMatchObject({ values: twenty, locked: false });
     const next = { ...st.values, perRunLimits: { ...st.values.perRunLimits, image: 2 } };
     expect(next).toMatchObject({ dailyCostLimitUsd: 20, perRunLimits: { image: 2 } });
     expect(expectedVersion(1, 1)).toBe(1);
@@ -210,7 +212,7 @@ describe("media admin screen rules (#238)", () => {
   it("r5: an edit typed while a save is in flight is impossible (locked), never dropped silently", () => {
     const st = formState({
       edit: null,
-      save: { phase: "sending", values: twenty },
+      save: { phase: "sending", values: twenty, base: 0 },
       server: fifty,
       serverVersion: 0,
     });
@@ -226,7 +228,7 @@ describe("media admin screen rules (#238)", () => {
 
   it("r5: a failed save (or re-read) keeps the admin's values as their edit", () => {
     // After an error the component puts the submitted values back as the edit: they win over any read.
-    expect(formState({ edit: twenty, save: null, server: fifty, serverVersion: 3 })).toEqual({
+    expect(formState({ edit: twenty, save: null, server: fifty, serverVersion: 3 })).toMatchObject({
       values: twenty,
       locked: false,
     });
@@ -276,10 +278,10 @@ describe("media admin screen rules (#238)", () => {
 
   it("r6: a save waiting for its confirming read stays with the QueryClient — a re-entered form is still locked", () => {
     const qc = {};
-    mediaScreenStore(qc).setSave({ phase: "confirming", values: twenty, version: 5 });
+    mediaScreenStore(qc).setSave({ phase: "confirming", values: twenty, base: 4, version: 5 });
     // The menu is left and entered again (a new form): the same store, the same lock.
     const again = mediaScreenStore(qc);
-    expect(formState({ edit: null, save: again.save, server: fifty, serverVersion: 4 })).toEqual({
+    expect(formState({ edit: null, save: again.save, server: fifty, serverVersion: 4 })).toMatchObject({
       values: twenty,
       locked: true,
     });
@@ -291,5 +293,85 @@ describe("media admin screen rules (#238)", () => {
     expect(s.catalogError({ code: "media_key_changed" }, keyWriteArgs("p:3").expectedGeneration)).toBe(false);
     expect(s.list(catalog("p:3"))).toBeUndefined();
     expect(s.refreshes).toBe(1);
+  });
+
+  // ---- round 7 ----------------------------------------------------------------------------------------------
+
+  /** A store whose coalesced refresh runs when `flush` is called (a turn of the event loop). */
+  function store() {
+    const queued: (() => void)[] = [];
+    const st = new MediaScreenStore((f) => void queued.push(f));
+    let reads = 0;
+    st.setRefresh(() => void reads++);
+    let renders = 0;
+    st.subscribe(() => void renders++);
+    return {
+      st,
+      flush: () => queued.splice(0).forEach((f) => f()),
+      reads: () => reads,
+      renders: () => renders,
+    };
+  }
+
+  it("r7: a save sent from one form and answered after re-entry settles in the form mounted now (success)", () => {
+    const t = store();
+    t.st.setSave({ phase: "sending", values: twenty, base: 0 });
+    // The menu is left and entered again: the new form reads the same store (and is subscribed to it).
+    const renders = t.renders();
+    // The PUT answers (mutation callback, whatever form is mounted): v1 to wait for.
+    t.st.setSave({ phase: "confirming", values: twenty, base: 0, version: 1 });
+    expect(t.renders()).toBeGreaterThan(renders);
+    expect(formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 0 })).toMatchObject({
+      values: twenty,
+      locked: true,
+    });
+    expect(formState({ edit: null, save: t.st.save, server: twenty, serverVersion: 1 })).toMatchObject({
+      values: twenty,
+      locked: false,
+      saved: true,
+    });
+  });
+
+  it("r7: the status read already showed the new version before the PUT answered — unlocked at once", () => {
+    const save = { phase: "confirming" as const, values: twenty, base: 0, version: 1 };
+    expect(formState({ edit: null, save, server: twenty, serverVersion: 1 }).locked).toBe(false);
+    expect(formState({ edit: null, save, server: twenty, serverVersion: 2 }).locked).toBe(false);
+  });
+
+  it("r7: a save refused after re-entry — the form mounted now shows the error and keeps the values as the draft", () => {
+    const t = store();
+    t.st.setSave({ phase: "sending", values: twenty, base: 3 });
+    t.st.setSave({ phase: "failed", values: twenty, base: 3, code: "media_settings_changed" });
+    const st = formState({ edit: null, save: t.st.save, server: fifty, serverVersion: 4 });
+    expect(st).toEqual({ values: twenty, locked: false, saved: false, failed: "media_settings_changed" });
+    // The draft keeps its own base (a plain save again would be refused too; "이 값으로 다시 저장" uses v4).
+    expect(draftBase(null, t.st.save)).toBe(3);
+    expect(expectedVersion(draftBase(null, t.st.save), 4)).toBe(3);
+  });
+
+  it("r7: while '최신 값 불러오기' reads, the form is locked; nothing arrived (offline) keeps the draft", () => {
+    const failed = { phase: "failed" as const, values: twenty, base: 3, code: "media_settings_changed" };
+    expect(formState({ edit: null, save: failed, server: fifty, serverVersion: 4, busy: true }).locked).toBe(
+      true,
+    );
+    // The read resolved without new data: the component keeps `failed` (draft) — the same state as before.
+    expect(formState({ edit: null, save: failed, server: fifty, serverVersion: 4 }).values).toBe(twenty);
+  });
+
+  it("r7: a key write's 409 and its settle in the same turn start one status read", () => {
+    const t = store();
+    expect(t.st.stale({ code: "media_key_changed" }, "p:3")).toBe(false); // onError
+    t.st.requestRefresh(); // onSettled
+    t.flush();
+    expect(t.reads()).toBe(1);
+    expect(t.st.rejected.has("p:3")).toBe(true);
+    // A later write asks again in its own turn.
+    t.st.requestRefresh();
+    t.flush();
+    expect(t.reads()).toBe(2);
+    // Errors that are not stale are shown and start nothing by themselves.
+    expect(t.st.stale({ code: "media_key_invalid" }, "p:3")).toBe(true);
+    t.flush();
+    expect(t.reads()).toBe(2);
   });
 });
