@@ -1,5 +1,5 @@
-import { useState, type FormEvent } from "react";
-import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useCallback, useState, type FormEvent } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MEDIA_KIND_LABEL,
   MEDIA_KINDS,
@@ -10,7 +10,14 @@ import {
 } from "@agentlee/shared";
 import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
-import { catalogView, isStaleKeyError, newerStatus } from "./media-cache.js";
+import {
+  catalogView,
+  formValue,
+  isStaleKeyError,
+  onCatalogError,
+  RejectedGenerations,
+  StatusReads,
+} from "./media-cache.js";
 
 export const MEDIA_KEY = ["admin", "media"] as const;
 /** Every catalog query; each one is keyed by the server's key generation too (a list of another key never shows). */
@@ -18,21 +25,15 @@ export const MEDIA_CATALOG_KEY = ["admin", "media-catalog"] as const;
 const catalogKey = (generation: string, kind: MediaKind) => [...MEDIA_CATALOG_KEY, generation, kind] as const;
 
 /**
- * A fresh key status from a write (key saved, deleted, re-checked; settings saved): the status read in flight is
- * cancelled first, then the newer of the two is kept (`newerStatus`); lists of other generations go.
+ * What the screen's parts share (see `media-cache.ts`): `refresh` starts a new status read (the latest started one is
+ * the only one shown — writes never set the status), `rejected` holds the generations a catalog call refused.
  */
-async function applyStatus(qc: QueryClient, r: MediaAdminView): Promise<void> {
-  await qc.cancelQueries({ queryKey: MEDIA_KEY });
-  const kept = newerStatus(qc.getQueryData<MediaAdminView>(MEDIA_KEY), r);
-  qc.setQueryData(MEDIA_KEY, kept);
-  qc.removeQueries({
-    queryKey: MEDIA_CATALOG_KEY,
-    predicate: (q) => q.queryKey[2] !== kept.key.generation,
-  });
-}
-
-/** The status is out of date (a catalog said so): read it again — that re-keys the catalog queries. */
-const refetchStatus = (qc: QueryClient) => void qc.invalidateQueries({ queryKey: MEDIA_KEY });
+type Screen = {
+  refresh: () => void;
+  rejected: RejectedGenerations;
+  /** A generation was just rejected (re-render: every kind hides its list at once). */
+  onReject: (e: unknown, generation: string) => boolean;
+};
 
 const SOURCE: Record<MediaAdminView["key"]["source"], string> = {
   admin: "관리자가 등록한 키",
@@ -50,19 +51,16 @@ const time = (ms: number) =>
   });
 
 /** The OpenRouter key: checked with OpenRouter before it is saved; only its last 4 characters are ever shown. */
-function KeySection({ m }: { m: MediaAdminView }) {
-  const qc = useQueryClient();
+function KeySection({ m, screen }: { m: MediaAdminView; screen: Screen }) {
   const [key, setKey] = useState("");
-  const done = (r: MediaAdminView) => applyStatus(qc, r);
+  // Whatever a write's outcome, the status shown comes from a new status read (never from the write's answer).
   const save = useMutation({
     mutationFn: () => admin.setMediaKey(key.trim()),
-    onSuccess: (r) => {
-      setKey("");
-      return done(r);
-    },
+    onSuccess: () => setKey(""),
+    onSettled: screen.refresh,
   });
-  const remove = useMutation({ mutationFn: admin.deleteMediaKey, onSuccess: done });
-  const check = useMutation({ mutationFn: admin.checkMediaKey, onSuccess: done });
+  const remove = useMutation({ mutationFn: admin.deleteMediaKey, onSettled: screen.refresh });
+  const check = useMutation({ mutationFn: admin.checkMediaKey, onSettled: screen.refresh });
   const k = m.key;
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -149,6 +147,7 @@ function KindRow({
   kind,
   value,
   status,
+  screen,
   onChange,
 }: {
   kind: MediaKind;
@@ -158,14 +157,13 @@ function KindRow({
    * state never carries over to another key.
    */
   status: MediaAdminView;
+  screen: Screen;
   onChange: (v: MediaSettings["kinds"][MediaKind]) => void;
 }) {
   const qc = useQueryClient();
   const generation = status.key.generation;
   const hasKey = status.key.source !== "none";
-  const onStale = (e: unknown) => {
-    if (isStaleKeyError(e)) refetchStatus(qc);
-  };
+  const onStale = (e: unknown) => void screen.onReject(e, generation);
   const catalog = useQuery({
     queryKey: catalogKey(generation, kind),
     // The server refuses a read for another generation than this one (`media_key_changed`).
@@ -177,7 +175,7 @@ function KindRow({
         throw e;
       }
     },
-    enabled: hasKey,
+    enabled: hasKey && !screen.rejected.has(generation),
     staleTime: 5 * 60_000,
     retry: (n, e) => !isStaleKeyError(e) && n < 2,
   });
@@ -188,7 +186,7 @@ function KindRow({
     onError: onStale,
   });
   // Only a list read in the shown status's own generation, and only with a key (no models, prices or source else).
-  const list = catalogView(status, catalog.data);
+  const list = catalogView(status, catalog.data, screen.rejected);
   const models = list?.models ?? [];
   // An out-of-date status is not an error to show: the status is being read again.
   const shownError = [reload.error, catalog.error].find((e) => e && !isStaleKeyError(e)) ?? null;
@@ -222,7 +220,7 @@ function KindRow({
       <button
         type="button"
         aria-label={`${label} 목록 새로 고침`}
-        disabled={!hasKey || reload.isPending}
+        disabled={!hasKey || reload.isPending || screen.rejected.has(generation)}
         onClick={() => reload.mutate()}
       >
         목록 새로 고침
@@ -250,29 +248,31 @@ function KindRow({
   );
 }
 
-function SettingsForm({ m }: { m: MediaAdminView }) {
-  const qc = useQueryClient();
-  const [draft, setDraft] = useState<MediaSettings>(m.settings);
+function SettingsForm({ m, screen }: { m: MediaAdminView; screen: Screen }) {
+  // The admin's unsaved edit; null = the form follows the latest status read.
+  const [edit, setEdit] = useState<MediaSettings | null>(null);
   const [saved, setSaved] = useState(false);
+  const draft = formValue(edit, m.settings);
   const save = useMutation({
-    mutationFn: () => admin.saveMediaSettings(draft),
-    onSuccess: async (r) => {
-      setDraft(r.settings);
+    mutationFn: (s: MediaSettings) => admin.saveMediaSettings(s),
+    onSuccess: () => {
+      setEdit(null);
       setSaved(true);
-      await applyStatus(qc, r);
     },
+    // An error keeps the edit (and shows); either way the status is read again.
+    onSettled: screen.refresh,
   });
   const hasKey = m.key.source !== "none";
   const set = (patch: Partial<MediaSettings>) => {
     setSaved(false);
-    setDraft((d) => ({ ...d, ...patch }));
+    setEdit({ ...draft, ...patch });
   };
   const invalid = MEDIA_KINDS.some((k) => draft.kinds[k].enabled && !draft.kinds[k].model);
   const failedKind =
     save.error instanceof ApiError ? (save.error.body as { kind?: MediaKind } | undefined)?.kind : undefined;
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    save.mutate();
+    save.mutate(draft);
   };
   const num = (v: string) => (v === "" ? NaN : Number(v));
   return (
@@ -287,6 +287,7 @@ function SettingsForm({ m }: { m: MediaAdminView }) {
               kind={k}
               value={draft.kinds[k]}
               status={m}
+              screen={screen}
               onChange={(v) => set({ kinds: { ...draft.kinds, [k]: v } })}
             />
           ))}
@@ -370,11 +371,33 @@ function SettingsForm({ m }: { m: MediaAdminView }) {
 /** 관리자 → 미디어 생성 (#238 stage 1): the OpenRouter key, per-kind models and the cost limits. */
 export function MediaAdmin() {
   const qc = useQueryClient();
-  // A read that answers after a newer status arrived (a write's) never puts the older one back.
+  const [reads] = useState(() => new StatusReads());
+  const [rejected] = useState(() => new RejectedGenerations());
+  const [, rerender] = useState(0);
+  // Only the latest started status read is shown: an older one that answers later keeps what is shown.
   const q = useQuery({
     queryKey: MEDIA_KEY,
-    queryFn: async () => newerStatus(qc.getQueryData<MediaAdminView>(MEDIA_KEY), await admin.media()),
+    queryFn: async () => {
+      const ticket = reads.start();
+      const r = await admin.media();
+      const shown = qc.getQueryData<MediaAdminView>(MEDIA_KEY);
+      return reads.isLatest(ticket) || !shown ? r : shown;
+    },
   });
+  // A new read, cancelling any in flight (that one's answer is then never shown).
+  const refresh = useCallback(
+    () => void qc.invalidateQueries({ queryKey: MEDIA_KEY }, { cancelRefetch: true }),
+    [qc],
+  );
+  const screen: Screen = {
+    refresh,
+    rejected,
+    onReject: (e, generation) => {
+      const show = onCatalogError(e, generation, rejected, refresh);
+      if (!show) rerender((n) => n + 1);
+      return show;
+    },
+  };
   const m = q.data;
   if (q.isError) return <p className="error small">{errorText(q.error)}</p>;
   if (!m) return <p className="muted small">불러오는 중…</p>;
@@ -385,8 +408,8 @@ export function MediaAdmin() {
         OpenRouter 모델로 이미지·음성·음악·영상을 만들어요(운영 문서 51절). 종류마다 켜고 모델을 골라요. 생성
         비용은 OpenRouter가 알려 준 실제 금액으로 사용량에 &quot;미디어 생성&quot;으로 기록돼요.
       </p>
-      <KeySection m={m} />
-      <SettingsForm m={m} />
+      <KeySection m={m} screen={screen} />
+      <SettingsForm m={m} screen={screen} />
     </section>
   );
 }

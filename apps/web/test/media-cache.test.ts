@@ -1,31 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MEDIA_SETTINGS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
-import { catalogView, isStaleKeyError, newerStatus, parseGeneration } from "../src/admin/media-cache.js";
+import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
+import {
+  catalogView,
+  formValue,
+  isStaleKeyError,
+  onCatalogError,
+  RejectedGenerations,
+  StatusReads,
+} from "../src/admin/media-cache.js";
 
 /**
- * 관리자 → 미디어 생성 (#238 review r3): which key status and which catalog the screen may show. The races Codex
- * reproduced (another tab swapping the key, a delayed status read after a delete, a refresh error before a key
- * change) are played here through the same decisions the components make.
+ * 관리자 → 미디어 생성 (#238 review r3–r4): what the screen may show. The races Codex reproduced in JSDOM are
+ * played through the same decisions the components make: only the latest started status read is shown (writes
+ * never set it), a rejected generation hides every list at once, one status read per rejected generation, and the
+ * settings form follows the latest read until edited.
  */
 
 const status = (
   generation: string,
   source: MediaAdmin["key"]["source"] = "admin",
-  last4: string | null = "cccc",
-) =>
-  ({
-    key: {
-      source,
-      last4: source === "admin" ? last4 : null,
-      limitUsd: null,
-      limitRemainingUsd: null,
-      usageUsd: null,
-      checkedAt: null,
-      generation,
-    },
-    settings: DEFAULT_MEDIA_SETTINGS,
-    youthStrictModeration: true,
-  }) satisfies MediaAdmin;
+  extra: Partial<MediaAdmin["key"]> = {},
+  settings = DEFAULT_MEDIA_SETTINGS,
+): MediaAdmin => ({
+  key: {
+    source,
+    last4: source === "admin" ? "cccc" : null,
+    limitUsd: null,
+    limitRemainingUsd: null,
+    usageUsd: null,
+    checkedAt: null,
+    generation,
+    ...extra,
+  },
+  settings,
+  youthStrictModeration: true,
+});
 const catalog = (generation: string, id = "d/model"): MediaCatalog => ({
   kind: "image",
   source: "/api/v1/images/models",
@@ -33,65 +42,135 @@ const catalog = (generation: string, id = "d/model"): MediaCatalog => ({
   generation,
 });
 
-describe("media admin screen: status and catalog rules (#238)", () => {
-  it("parses generations", () => {
-    expect(parseGeneration("ab12:7")).toEqual({ boot: "ab12", n: 7 });
-    expect(parseGeneration("nope")).toBeUndefined();
-  });
+/**
+ * The screen's status cache as the component runs it: `begin` = a status read started (a ticket); `answer` = that
+ * read answered (shown only when it is the latest started). Writes have no way in — they only `begin` a read.
+ */
+function screen(initial?: MediaAdmin) {
+  const reads = new StatusReads();
+  const rejected = new RejectedGenerations();
+  let shown = initial;
+  let refreshes = 0;
+  return {
+    rejected,
+    get shown() {
+      return shown;
+    },
+    get refreshes() {
+      return refreshes;
+    },
+    begin: () => reads.start(),
+    answer(ticket: number, r: MediaAdmin) {
+      if (reads.isLatest(ticket) || !shown) shown = r;
+    },
+    /** A write finished (either way): it starts a read; its own answer is not used. */
+    writeSettled: () => reads.start(),
+    catalogError(e: unknown, generation: string) {
+      return onCatalogError(e, generation, rejected, () => {
+        refreshes += 1;
+      });
+    },
+    list: (c: MediaCatalog | undefined) => catalogView(shown, c, rejected),
+  };
+}
 
-  it("a status never goes back to an older generation of the same process; another process always wins", () => {
-    const old = status("p:1");
-    const fresh = status("p:2", "none");
-    expect(newerStatus(undefined, old)).toBe(old);
-    expect(newerStatus(fresh, old)).toBe(fresh);
-    expect(newerStatus(old, fresh)).toBe(fresh);
-    const same = status("p:2", "none");
-    expect(newerStatus(fresh, same)).toBe(same);
-    const restarted = status("q:0", "env");
-    expect(newerStatus(fresh, restarted)).toBe(restarted);
-  });
-
-  it("a list shows only in its own generation, and never without a key", () => {
-    expect(catalogView(status("p:1"), catalog("p:1"))).toEqual(catalog("p:1"));
-    expect(catalogView(status("p:1"), catalog("p:2"))).toBeUndefined();
-    expect(catalogView(status("p:1", "none"), catalog("p:1"))).toBeUndefined();
+describe("media admin screen rules (#238)", () => {
+  it("a list shows only in its own generation, with a key, and not in a rejected generation", () => {
+    const rejected = new RejectedGenerations();
+    expect(catalogView(status("p:1"), catalog("p:1"), rejected)).toEqual(catalog("p:1"));
+    expect(catalogView(status("p:1"), catalog("p:2"), rejected)).toBeUndefined();
+    expect(catalogView(status("p:1", "none"), catalog("p:1"), rejected)).toBeUndefined();
     expect(catalogView(undefined, catalog("p:1"))).toBeUndefined();
-    expect(catalogView(status("p:1"), undefined)).toBeUndefined();
+    rejected.reject("p:1");
+    expect(catalogView(status("p:1"), catalog("p:1"), rejected)).toBeUndefined();
   });
 
-  it("only media_key_changed and media_no_key mean 'read the status again'", () => {
+  it("only media_key_changed and media_no_key are 'read the status again' (not shown as errors)", () => {
     expect(isStaleKeyError({ code: "media_key_changed" })).toBe(true);
     expect(isStaleKeyError({ code: "media_no_key" })).toBe(true);
     expect(isStaleKeyError({ code: "media_key_invalid" })).toBe(false);
-    expect(isStaleKeyError(new Error("x"))).toBe(false);
     expect(isStaleKeyError(undefined)).toBe(false);
+    const r = new RejectedGenerations();
+    let n = 0;
+    expect(onCatalogError({ code: "media_key_invalid" }, "p:1", r, () => n++)).toBe(true);
+    expect(n).toBe(0);
+    expect(r.has("p:1")).toBe(false);
   });
 
-  it("race: another tab swaps C for D, then a manual refresh — D's list never shows next to C's last 4", () => {
-    // The screen still shows C (p:1); the server is at D (p:2). A refresh asks for p:1 → refused (stale), so
-    // nothing is stored; even a list the server read as D carries p:2 and is not shown beside C.
-    const screen = status("p:1", "admin", "cccc");
-    expect(catalogView(screen, catalog("p:2"))).toBeUndefined();
-    expect(isStaleKeyError({ code: "media_key_changed" })).toBe(true);
-    // The status is read again: D (p:2) — now D's own list shows.
-    const reread = newerStatus(screen, status("p:2", "admin", "dddd"));
-    expect(reread.key.last4).toBe("dddd");
-    expect(catalogView(reread, catalog("p:2"))).toBeDefined();
+  it("r4: a 409, then the status read still pending — no list of any kind is shown meanwhile", () => {
+    const s = screen(status("p:7"));
+    const lists = MEDIA_KINDS.map((k) => ({ ...catalog("p:7"), kind: k }));
+    expect(lists.every((c) => s.list(c))).toBe(true);
+    expect(s.catalogError({ code: "media_key_changed" }, "p:7")).toBe(false);
+    s.begin(); // the recovery read, not answered yet
+    expect(lists.map((c) => s.list(c))).toEqual([undefined, undefined, undefined, undefined]);
+    expect(s.shown!.key.generation).toBe("p:7");
   });
 
-  it("race: a status read started before a delete answers after it — the deleted key does not come back", () => {
-    const afterDelete = status("p:3", "none");
-    const delayed = status("p:2", "admin", "cccc");
-    const shown = newerStatus(afterDelete, delayed);
-    expect(shown.key.source).toBe("none");
-    expect(catalogView(shown, catalog("p:2"))).toBeUndefined();
+  it("r4: four kinds hit the same stale generation — one status read", () => {
+    const s = screen(status("p:7"));
+    MEDIA_KINDS.forEach(() => s.catalogError({ code: "media_key_changed" }, "p:7"));
+    expect(s.refreshes).toBe(1);
+    // A later generation rejected starts its own one.
+    s.catalogError({ code: "media_no_key" }, "p:8");
+    expect(s.refreshes).toBe(2);
   });
 
-  it("race: a refresh failed under key A, then the key changes — A's list and generation no longer apply", () => {
-    // The row is remounted per generation (its React key), so the failed refresh's state is gone; the stored
-    // lists of A's generation are not shown under B's.
-    const b = newerStatus(status("p:4"), status("p:5", "env"));
-    expect(catalogView(b, catalog("p:4"))).toBeUndefined();
-    expect(catalogView(b, catalog("p:5"))).toBeDefined();
+  it("r4: a delayed settings answer during the recovery read — the final read wins", () => {
+    const s = screen(status("p:7"));
+    s.catalogError({ code: "media_key_changed" }, "p:7");
+    const recovery = s.begin();
+    // The settings save of p:7 finally answers: it starts a newer read; its own answer is never shown.
+    const after = s.writeSettled();
+    s.answer(recovery, status("p:8", "none")); // older read: dropped
+    expect(s.shown!.key.generation).toBe("p:7");
+    s.answer(after, status("p:8", "none"));
+    expect(s.shown!.key).toMatchObject({ generation: "p:8", source: "none" });
+    expect(s.list(catalog("p:7"))).toBeUndefined();
+  });
+
+  it("r4: after a restart, an old process's delayed delete answer is ignored (only reads set the status)", () => {
+    const s = screen(status("old:10"));
+    const read = s.begin();
+    s.answer(read, status("new:1", "admin", { last4: "bbbb" }));
+    expect(s.shown!.key.last4).toBe("bbbb");
+    // The delete answer of the old process arrives: it only starts a read, which answers with the new process.
+    const after = s.writeSettled();
+    s.answer(after, status("new:1", "admin", { last4: "bbbb" }));
+    expect(s.shown!.key).toMatchObject({ generation: "new:1", source: "admin", last4: "bbbb" });
+    expect(s.list(catalog("new:1"))).toBeDefined();
+  });
+
+  it("r4: same generation, a delayed settings answer and a fresh balance — the latest read wins", () => {
+    const s = screen(status("p:3", "admin", { limitRemainingUsd: 40, checkedAt: 1 }));
+    const saveRead = s.writeSettled(); // a settings save (old $50) finished late
+    const checkRead = s.writeSettled(); // the balance re-check ($5) finished after it
+    s.answer(
+      checkRead,
+      status(
+        "p:3",
+        "admin",
+        { limitRemainingUsd: 5, checkedAt: 2 },
+        { ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 20 },
+      ),
+    );
+    s.answer(saveRead, status("p:3", "admin", { limitRemainingUsd: 40, checkedAt: 1 })); // older read: dropped
+    expect(s.shown!.key.limitRemainingUsd).toBe(5);
+    expect(s.shown!.settings.dailyCostLimitUsd).toBe(20);
+  });
+
+  it("the form follows the latest read until edited; the edit stays until saved", () => {
+    const server = { ...DEFAULT_MEDIA_SETTINGS, dailyCostLimitUsd: 20 };
+    expect(formValue(null, server)).toBe(server);
+    const edit = { ...server, dailyCostLimitUsd: 7 };
+    expect(formValue(edit, { ...server, dailyCostLimitUsd: 30 })).toBe(edit);
+  });
+
+  it("StatusReads: only the latest ticket", () => {
+    const r = new StatusReads();
+    const a = r.start();
+    const b = r.start();
+    expect(r.isLatest(a)).toBe(false);
+    expect(r.isLatest(b)).toBe(true);
   });
 });

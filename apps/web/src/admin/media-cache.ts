@@ -1,41 +1,44 @@
-import type { MediaAdmin, MediaCatalog } from "@agentlee/shared";
+import type { MediaAdmin, MediaCatalog, MediaSettings } from "@agentlee/shared";
 
 /**
- * The admin screen's rules for which key status and which catalog it may show (#238 review r3), kept apart from the
- * components so they can be tested without a DOM. One closed design:
+ * The admin screen's rules for what it may show (#238 review r3–r4), kept apart from the components so they can be
+ * tested without a DOM. One closed design:
  *
- * - Every key status carries the server's key generation `<process id>:<key changes>`. A status never replaces one
- *   with a higher counter of the **same** process (a delayed GET or save answer from before a key change); a status
- *   from another process (a restart) always wins.
- * - Every catalog carries the generation it was actually read with. It is shown only while the key status shown has
- *   that same generation (and a key). Anything else shows no list.
- * - A catalog answer `media_key_changed` or `media_no_key` means the screen's status is out of date: hide the list
- *   and read the status again (which re-keys the catalog queries).
+ * 1. **The key status and settings shown are the answer of the most recently started status read — only.** Write
+ *    answers (key saved, deleted, re-checked; settings saved) are never shown as status: whatever a write's outcome
+ *    (success or failure), a new status read is started, and an answer of a read that is no longer the latest one
+ *    started is dropped (`StatusReads`). Restarts, delayed writes and balance checks need no ordering of their own.
+ * 2. **A catalog shows only in its own generation, and never in a rejected one.** Every catalog answer carries the
+ *    key generation it was read with; it shows only while the status shown has that same generation and a key.
+ *    When any catalog call answers `media_key_changed` or `media_no_key`, that generation is rejected for the whole
+ *    screen (all four kinds hide their lists at once) and one status read is started — once per generation
+ *    (`RejectedGenerations`), however many kinds hit it.
+ * 3. **The settings form follows the latest status until the admin edits it** (`formValue`); an edit is kept until
+ *    it is saved (then the form follows the next status read again).
  */
 
-export type Generation = { boot: string; n: number };
-
-export function parseGeneration(g: string): Generation | undefined {
-  const m = /^(.+):(\d+)$/.exec(g);
-  return m ? { boot: m[1]!, n: Number(m[2]) } : undefined;
+/** Hands out a ticket per status read started; only the latest ticket's answer may be shown. */
+export class StatusReads {
+  private started = 0;
+  start(): number {
+    return ++this.started;
+  }
+  isLatest(ticket: number): boolean {
+    return ticket === this.started;
+  }
 }
 
-/** The status to keep: `incoming`, unless it is an older generation of the same server process than `current`. */
-export function newerStatus(current: MediaAdmin | undefined, incoming: MediaAdmin): MediaAdmin {
-  if (!current) return incoming;
-  const a = parseGeneration(current.key.generation);
-  const b = parseGeneration(incoming.key.generation);
-  if (!a || !b || a.boot !== b.boot) return incoming;
-  return b.n < a.n ? current : incoming;
-}
-
-/** The list to show for this status: only one read in the status's own generation, and only with a key. */
-export function catalogView(
-  status: Pick<MediaAdmin, "key"> | undefined,
-  catalog: MediaCatalog | undefined,
-): MediaCatalog | undefined {
-  if (!status || status.key.source === "none" || !catalog) return undefined;
-  return catalog.generation === status.key.generation ? catalog : undefined;
+/** Key generations a catalog call said are out of date. `reject` is true only the first time (start one read). */
+export class RejectedGenerations {
+  private readonly gens = new Set<string>();
+  reject(generation: string): boolean {
+    if (this.gens.has(generation)) return false;
+    this.gens.add(generation);
+    return true;
+  }
+  has(generation: string): boolean {
+    return this.gens.has(generation);
+  }
 }
 
 /** Error codes that say the screen's key status is out of date (not an error to show: the status is read again). */
@@ -43,3 +46,32 @@ export const STALE_KEY_CODES: ReadonlySet<string> = new Set(["media_key_changed"
 
 export const isStaleKeyError = (e: unknown): boolean =>
   typeof e === "object" && e !== null && STALE_KEY_CODES.has(String((e as { code?: unknown }).code));
+
+/**
+ * A catalog call failed under `generation`: an out-of-date status rejects the generation and starts one status read
+ * (`refresh`, only for the first call to hit it). Returns whether the error is one to show.
+ */
+export function onCatalogError(
+  e: unknown,
+  generation: string,
+  rejected: RejectedGenerations,
+  refresh: () => void,
+): boolean {
+  if (!isStaleKeyError(e)) return true;
+  if (rejected.reject(generation)) refresh();
+  return false;
+}
+
+/** The list to show: read in the shown status's own generation, with a key, and that generation not rejected. */
+export function catalogView(
+  status: Pick<MediaAdmin, "key"> | undefined,
+  catalog: MediaCatalog | undefined,
+  rejected?: Pick<RejectedGenerations, "has">,
+): MediaCatalog | undefined {
+  if (!status || status.key.source === "none" || !catalog) return undefined;
+  if (rejected?.has(status.key.generation)) return undefined;
+  return catalog.generation === status.key.generation ? catalog : undefined;
+}
+
+/** The settings the form shows: the admin's unsaved edit, else the latest status read's. */
+export const formValue = (edit: MediaSettings | null, server: MediaSettings): MediaSettings => edit ?? server;
