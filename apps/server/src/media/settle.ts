@@ -98,28 +98,22 @@ export class MediaSettler {
   }
 }
 
-/** Tries of the start-up recovery, and the wait between them. */
+/** Tries of one start-up recovery attempt, and the wait between them. */
 export const RECOVER_TRIES = 3;
 export const RECOVER_WAIT_MS = 200;
-
-export class MediaRecoveryError extends Error {
-  constructor() {
-    super("media reservations of the previous process could not be taken up");
-    this.name = "MediaRecoveryError";
-  }
-}
+/** Background retries after a failed start-up recovery: 5 s, 10 s, 20 s … up to 5 min apart. */
+export const RECOVER_RETRY_FIRST_MS = 5_000;
+export const RECOVER_RETRY_MAX_MS = 5 * 60_000;
 
 /**
- * Start-up recovery of a previous process's `reserved` rows (#238 review r4) — synchronously while the app is built,
- * so before the server takes any request and no media call of this process exists: all `reserved` rows are taken
- * up, in one transaction (no clock compared: one server holds the data folder's lock). A failure is tried again
- * (`RECOVER_TRIES`, `RECOVER_WAIT_MS` apart — a short write lock passes); if it still fails the start fails, loudly
- * (`media.recovery_failed`), rather than leave rows reserved for good.
+ * One recovery of a previous process's `reserved` rows (#238 review r4–r5): all of them, in one transaction (no
+ * clock compared: only the lock-holding server runs this, before any media call of its own). Tried `tries` times,
+ * `waitMs` apart (a short write lock passes). The count, or null when it did not succeed (logged).
  */
 export function recoverMediaReservations(
   usage: Pick<UsageStore, "recoverReservedMedia">,
   o: { log?: EventLogger | undefined; tries?: number; waitMs?: number } = {},
-): number {
+): number | null {
   const tries = o.tries ?? RECOVER_TRIES;
   for (let i = 1; ; i++) {
     try {
@@ -127,10 +121,81 @@ export function recoverMediaReservations(
     } catch {
       if (i >= tries) {
         logEvent(o.log, "error", "media.recovery_failed", { mediaCode: "media_usage_failed" });
-        throw new MediaRecoveryError();
+        return null;
       }
-      // A synchronous wait: this runs while the app is built, nothing else is waiting on this thread yet.
+      // A synchronous wait: the first attempt runs while the app is built, before it takes any request.
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, o.waitMs ?? RECOVER_WAIT_MS);
     }
+  }
+}
+
+/**
+ * The start-up recovery and what happens when it fails (#238 review r5; the user's decision: chat stays available,
+ * media bookkeeping waits). Only the lock-holding server start runs it (`app.ts`, `opts.dataLock`). It is tried
+ * while the app is built; if it fails the server starts anyway, but **new paid media calls are refused**
+ * (`media_recovering`) while it is retried in the background with a backoff — the block is in place before any
+ * media call, so no new reservation mixes into the rows being recovered. On success the block is lifted.
+ */
+export class MediaRecovery {
+  private pending = false;
+  private stopped = false;
+  private timer: NodeJS.Timeout | undefined;
+  private retries = 0;
+
+  constructor(
+    private readonly o: {
+      usage: Pick<UsageStore, "recoverReservedMedia">;
+      log?: EventLogger | undefined;
+      waitMs?: number;
+      /** Tests: the background retries are driven by hand (`retryNow`). */
+      background?: boolean;
+    },
+  ) {}
+
+  /** Whether new paid media calls must wait (the recovery has not succeeded yet). */
+  recovering(): boolean {
+    return this.pending;
+  }
+
+  /** The start-up attempt (synchronous). False: it failed, the block is on and retries are scheduled. */
+  runAtStart(): boolean {
+    if (this.attemptOnce()) return true;
+    this.pending = true;
+    this.schedule();
+    return false;
+  }
+
+  /** One more attempt now; lifts the block on success. */
+  retryNow(): boolean {
+    if (!this.pending) return true;
+    if (!this.attemptOnce()) return false;
+    this.pending = false;
+    logEvent(this.o.log, "info", "media.recovered", {});
+    return true;
+  }
+
+  private attemptOnce(): boolean {
+    return (
+      recoverMediaReservations(this.o.usage, {
+        log: this.o.log,
+        waitMs: this.o.waitMs ?? RECOVER_WAIT_MS,
+      }) !== null
+    );
+  }
+
+  private schedule(): void {
+    if (this.stopped || this.o.background === false || !this.pending) return;
+    const delay = Math.min(RECOVER_RETRY_MAX_MS, RECOVER_RETRY_FIRST_MS * 2 ** this.retries++);
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      if (!this.retryNow()) this.schedule();
+    }, delay);
+    this.timer.unref();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
 }

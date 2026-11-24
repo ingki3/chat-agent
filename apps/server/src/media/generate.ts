@@ -97,6 +97,11 @@ export type MediaGeneratorOptions = {
    * lookup (A→B→A) is a change too. Without it only the key itself is compared.
    */
   keyGeneration?: () => string;
+  /**
+   * While the start-up recovery of a previous process's reservations has not succeeded (`MediaRecovery`), no new
+   * paid call starts (`media_recovering`, retryable).
+   */
+  recovering?: () => boolean;
   users: Pick<UserStore, "byId">;
   fetchImpl?: typeof fetch | undefined;
   /** The `.env` skill secrets (by env name): the egress check knows them too. */
@@ -263,6 +268,7 @@ export class MediaGenerator {
     if (!parsed.success) throw new MediaToolError("media_bad_input");
     const revision = this.o.settings.revision();
     const generation = this.o.keyGeneration?.();
+    if (this.o.recovering?.()) throw new MediaToolError("media_recovering");
     const settings = this.o.settings.get();
     const k = settings.kinds[kind];
     if (!k.enabled || !k.model) throw new MediaToolError("media_disabled");

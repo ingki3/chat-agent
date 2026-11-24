@@ -228,6 +228,7 @@ export const MEDIA_TOOL_CODES = [
   "media_changed",
   /** A usage row of a generation could not be written (operator's log and error list only). */
   "media_usage_failed",
+  "media_recovering",
 ] as const;
 export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
 
@@ -254,5 +255,7 @@ export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
     "OpenRouter에서 모델 정보(옵션·가격)를 확인하지 못해 보내지 않았어요. 잠시 뒤에 다시 해 보세요.",
   media_no_price:
     "이 모델의 비용 상한을 정할 수 없어 보내지 않았어요(가격 단위를 알 수 없음). 관리자에게 다른 모델을 부탁하세요.",
+  media_recovering:
+    "서버가 지난번 미디어 생성 비용 기록을 정리하는 중이라 지금은 만들 수 없어요. 잠시 뒤에 다시 해 주세요.",
   media_changed: "그사이 관리자가 생성 설정이나 키를 바꿨어요. 다시 요청해 주세요.",
 };

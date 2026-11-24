@@ -19,12 +19,7 @@ import zlib from "node:zlib";
 import { byteRange, FILE_CSP } from "../src/files/routes.js";
 import { imageCostBound, speechCostBound } from "../src/media/cost.js";
 import { imageSize, MAX_PARTS, MAX_RUNS, stripImage, textRuns } from "../src/media/strip.js";
-import {
-  MAX_TRIES,
-  MediaRecoveryError,
-  MediaSettler,
-  recoverMediaReservations,
-} from "../src/media/settle.js";
+import { MAX_TRIES, MediaSettler, recoverMediaReservations } from "../src/media/settle.js";
 import { compose } from "../src/notifications/compose.js";
 import { usageRecords } from "../src/db/schema.js";
 import { addRow, emptyTotals, UsageService } from "../src/usage/service.js";
@@ -2113,7 +2108,8 @@ describe("media tools: review round 4 regressions (#246)", () => {
       model: "m",
       estimateUsd: 0.2,
     });
-    // A new server on that database: recovery runs while the app is built, before any request.
+    // A new lock-holding server on that database (`dataLock`, as index.ts starts it): recovery runs while the app
+    // is built, before any request. Both clocks pinned to the start's ms.
     const dir = tmp();
     const app = await buildApp(
       loadConfig({
@@ -2121,7 +2117,12 @@ describe("media tools: review round 4 regressions (#246)", () => {
         DATA_DIR: path.join(dir, "data"),
         MASTER_KEY_PATH: path.join(dir, "k"),
       }),
-      { db, media: { fetchImpl: fixtureOpenRouterFetch(), now: () => startAt } },
+      {
+        db,
+        dataLock: { held: () => true },
+        media: { fetchImpl: fixtureOpenRouterFetch(), now: () => startAt },
+        usage: { now: () => startAt },
+      },
     );
     closers.push(() => app.close());
     const rows = db.$client
@@ -2153,9 +2154,7 @@ describe("media tools: review round 4 regressions (#246)", () => {
     };
     const lines: unknown[] = [];
     const log = { info: () => {}, warn: () => {}, error: (...args: unknown[]) => void lines.push(args) };
-    expect(() => recoverMediaReservations(down, { waitMs: 1, log: log as never })).toThrow(
-      MediaRecoveryError,
-    );
+    expect(recoverMediaReservations(down, { waitMs: 1, log: log as never })).toBeNull();
     expect(JSON.stringify(lines)).toContain("media.recovery_failed");
     // One transaction: a failure in the second move leaves the first undone too.
     const db = createTestDb();
@@ -2243,5 +2242,134 @@ describe("media tools: review round 4 regressions (#246)", () => {
       { r: mediaRunKey("spent", "1"), s: "unconfirmed" },
     ]);
     expect(fetched).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------- review round 5 (#246)
+
+describe("media tools: review round 5 — recovery failure keeps the server up (#246)", () => {
+  it("a server whose recovery fails starts, chats, refuses media (media_recovering) until a retry succeeds", async () => {
+    const db = createTestDb();
+    const dir = path.join(tmp(), "data");
+    const registry = new RuntimeRegistry();
+    registry.register(new FakeRuntime({ runTools: true }));
+    // Users first (createFamily needs an app); the trigger is set before the second app is built.
+    const first = await buildApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATA_DIR: dir,
+        MASTER_KEY_PATH: path.join(dir, "..", "k"),
+        OPENROUTER_API_KEY: KEY,
+      }),
+      { db, runtimes: registry, runs: { flushMs: 0 } },
+    );
+    const f = await createFamily(first);
+    await first.close();
+    new UsageStore(db, () => 1).reserveMedia({
+      userId: f.users.owner.id,
+      conversationId: null,
+      runId: "old",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.5,
+    });
+    db.$client.exec(
+      "CREATE TRIGGER no_recover BEFORE UPDATE OF media_settlement ON usage_records BEGIN SELECT RAISE(ABORT, 'busy'); END",
+    );
+    const app = await buildApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATA_DIR: dir,
+        MASTER_KEY_PATH: path.join(dir, "..", "k"),
+        OPENROUTER_API_KEY: KEY,
+      }),
+      {
+        db,
+        dataLock: { held: () => true },
+        runtimes: registry,
+        runs: { flushMs: 0 },
+        media: {
+          fetchImpl: fixtureOpenRouterFetch(),
+          sleep: async () => {},
+          recovery: { waitMs: 1, background: false },
+        },
+      },
+    );
+    closers.push(() => app.close());
+    expect(app.media!.recovery.recovering()).toBe(true);
+    // Chat works.
+    const conv = app.conversations!.create(f.users.owner.id);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/conversations/${conv.id}/messages`,
+      headers: { ...WRITE, cookie: f.cookies.owner, "content-type": "application/json" },
+      payload: { text: "안녕" },
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const run = await waitRun(app, (res.json() as { run: Run }).run.id);
+    expect(run.run.status).toBe("done");
+    // Media waits (a fixed, retryable answer) — nothing is reserved meanwhile.
+    app.media!.settings.set(settingsWith({ image: "fixture/image-one" }));
+    db.$client.prepare("UPDATE runs SET ended_at = NULL WHERE id = ?").run(run.run.id);
+    const scope = { userId: f.users.owner.id, conversationId: conv.id, runId: run.run.id };
+    expect(await app.media!.tools.run("image", scope, { prompt: "산" })).toMatchObject({
+      ok: false,
+      code: "media_recovering",
+      hint: MEDIA_TOOL_HINTS.media_recovering,
+    });
+    const count = () =>
+      (
+        db.$client.prepare("SELECT count(*) n FROM usage_records WHERE purpose = 'media'").get() as {
+          n: number;
+        }
+      ).n;
+    expect(count()).toBe(1);
+    // Still failing: still blocked. Then the lock is gone: the retry succeeds and media is allowed again.
+    expect(app.media!.recovery.retryNow()).toBe(false);
+    expect(app.media!.recovery.recovering()).toBe(true);
+    db.$client.exec("DROP TRIGGER no_recover");
+    expect(app.media!.recovery.retryNow()).toBe(true);
+    expect(app.media!.recovery.recovering()).toBe(false);
+    expect(
+      (
+        db.$client
+          .prepare("SELECT media_settlement s FROM usage_records WHERE run_id = ?")
+          .get(mediaRunKey("old", "1")) as {
+          s: string;
+        }
+      ).s,
+    ).toBe("unconfirmed");
+    expect((await app.media!.tools.run("image", scope, { prompt: "산" })).ok).toBe(true);
+  });
+
+  it("a buildApp that does not hold the data lock never recovers (another server's calls may be in flight)", async () => {
+    const t = await start();
+    t.app.usageStore!.reserveMedia({
+      userId: t.f.users.owner.id,
+      conversationId: null,
+      runId: "inflight",
+      callId: "1",
+      model: "m",
+      estimateUsd: 0.5,
+    });
+    const dir = tmp();
+    const other = await buildApp(
+      loadConfig({
+        NODE_ENV: "test",
+        DATA_DIR: path.join(dir, "data"),
+        MASTER_KEY_PATH: path.join(dir, "k"),
+      }),
+      { db: t.db, media: { fetchImpl: fixtureOpenRouterFetch() } },
+    );
+    closers.push(() => other.close());
+    expect(other.media!.recovery.recovering()).toBe(false);
+    expect(t.usageRows()).toEqual([expect.objectContaining({ estimated_cost_micros: 500_000 })]);
+    expect(
+      (
+        t.db.$client
+          .prepare("SELECT media_settlement s FROM usage_records WHERE purpose = 'media'")
+          .get() as { s: string }
+      ).s,
+    ).toBe("reserved");
   });
 });
