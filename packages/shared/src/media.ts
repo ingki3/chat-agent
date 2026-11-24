@@ -142,6 +142,11 @@ export const MediaCatalog = z.object({
   /** Where the list came from (shown in small print). */
   source: z.string(),
   models: z.array(MediaModel),
+  /**
+   * The key generation (`MediaKeyView.generation`) this list was actually read with: the screen shows a list only
+   * while its key status has this same generation.
+   */
+  generation: z.string(),
 });
 export type MediaCatalog = z.infer<typeof MediaCatalog>;
 

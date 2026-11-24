@@ -59,9 +59,12 @@ export function registerMediaRoutes(
   app.get("/api/admin/media/catalog/:kind", { config: admin }, async (req, reply) => {
     const kind = MediaKind.safeParse((req.params as { kind?: string }).kind);
     if (!kind.success) return bad(reply);
-    const fresh = (req.query as { fresh?: string } | undefined)?.fresh === "1";
+    const q = (req.query as { fresh?: string; generation?: string } | undefined) ?? {};
+    const fresh = q.fresh === "1";
+    // The screen's key generation: a read for another one is refused (`media_key_changed`).
+    if (q.generation !== undefined && !/^[0-9A-Za-z-]{1,64}:\d{1,12}$/.test(q.generation)) return bad(reply);
     try {
-      return send(reply, await media.catalog(kind.data, fresh));
+      return send(reply, await media.catalog(kind.data, fresh, q.generation));
     } catch (e) {
       return refuse(reply, e);
     }

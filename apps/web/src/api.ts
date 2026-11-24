@@ -363,8 +363,16 @@ export const admin = {
   setMediaKey: async (key: string) => MediaAdmin.parse(await call("PUT", "/api/admin/media/key", { key })),
   deleteMediaKey: async () => MediaAdmin.parse(await call("DELETE", "/api/admin/media/key")),
   checkMediaKey: async () => MediaAdmin.parse(await call("POST", "/api/admin/media/key/check", {})),
-  mediaCatalog: async (kind: MediaKind, fresh = false) =>
-    MediaCatalog.parse(await call("GET", `/api/admin/media/catalog/${enc(kind)}${fresh ? "?fresh=1" : ""}`)),
+  /** `generation`: the screen's key generation — the server refuses a read for another one (`media_key_changed`). */
+  mediaCatalog: async (kind: MediaKind, fresh = false, generation?: string) => {
+    const q = new URLSearchParams();
+    if (fresh) q.set("fresh", "1");
+    if (generation !== undefined) q.set("generation", generation);
+    const qs = q.toString();
+    return MediaCatalog.parse(
+      await call("GET", `/api/admin/media/catalog/${enc(kind)}${qs ? `?${qs}` : ""}`),
+    );
+  },
   saveMediaSettings: async (settings: MediaSettings) =>
     MediaAdmin.parse(await call("PUT", "/api/admin/media/settings", settings)),
   runtimes: async () => AdminRuntimesResponse.parse(await call("GET", "/api/admin/runtimes")).items,

@@ -246,7 +246,7 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
 export async function fetchCatalog(
   kind: MediaKind,
   o: { apiKey?: string | undefined; fetchImpl?: typeof fetch },
-): Promise<MediaCatalog> {
+): Promise<Omit<MediaCatalog, "generation">> {
   const answer = await openRouterGet(MEDIA_CATALOG_URLS[kind], o);
   const data = isObj(answer) && Array.isArray(answer.data) ? answer.data : null;
   if (!data) throw new OpenRouterError("failed");

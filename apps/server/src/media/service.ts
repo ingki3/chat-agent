@@ -41,6 +41,8 @@ export type MediaAdminOptions = {
   now?: () => number;
   /** How long a fetched catalog is reused for the screen (saving always fetches it again). */
   catalogTtlMs?: number;
+  /** Tests: the process id part of the key generation (default: random). */
+  bootId?: string;
 };
 
 const CATALOG_TTL_MS = 10 * 60_000;
@@ -64,13 +66,19 @@ export class MediaAdminService {
   >();
   /** Bumped on every key change (saved, deleted): a catalog read under another generation is never kept. */
   private gen = 0;
-  /** This process's id: with `gen`, the screen's catalog cache key (a restart never reuses an old one). */
-  private readonly boot = crypto.randomBytes(6).toString("hex");
+  /** This process's id: with `gen`, the key generation (a restart never reuses an old one). */
+  private readonly boot: string;
   private envStatus: EnvStatus | undefined;
   private readonly now: () => number;
 
   constructor(private readonly o: MediaAdminOptions) {
     this.now = o.now ?? Date.now;
+    this.boot = o.bootId ?? crypto.randomBytes(6).toString("hex");
+  }
+
+  /** The key generation: `<process id>:<key changes so far>` — never derived from the key. */
+  generation(): string {
+    return `${this.boot}:${this.gen}`;
   }
 
   private exclusive<T>(job: () => Promise<T>): Promise<T> {
@@ -116,7 +124,7 @@ export class MediaAdminService {
       limitRemainingUsd: own?.limitRemainingUsd ?? null,
       usageUsd: own?.usageUsd ?? null,
       checkedAt: own?.checkedAt ?? null,
-      generation: `${this.boot}:${this.gen}`,
+      generation: this.generation(),
     };
   }
 
@@ -192,9 +200,13 @@ export class MediaAdminService {
 
   /**
    * A kind's catalog, read with the key in use (reused for a while unless `fresh` — only while that same key is in
-   * use). A read that started before the key changed is neither kept nor returned (`media_key_changed`).
+   * use), answered with the generation it was read with. A read that started before the key changed is neither kept
+   * nor returned (`media_key_changed`); so is one asked for under another generation than the current one
+   * (`expected` — the screen's).
    */
-  async catalog(kind: MediaKind, fresh = false): Promise<MediaCatalog> {
+  async catalog(kind: MediaKind, fresh = false, expected?: string): Promise<MediaCatalog> {
+    if (expected !== undefined && expected !== this.generation())
+      throw new MediaError(409, "media_key_changed");
     const resolved = this.o.keys.resolve();
     if (!resolved) throw new MediaError(400, "media_no_key");
     const fp = fingerprint(resolved.key);
@@ -208,7 +220,7 @@ export class MediaAdminService {
       this.now() - hit.at < (this.o.catalogTtlMs ?? CATALOG_TTL_MS)
     )
       return hit.catalog;
-    let catalog: MediaCatalog | undefined;
+    let catalog: Omit<MediaCatalog, "generation"> | undefined;
     let failure: unknown;
     try {
       catalog = await fetchCatalog(kind, { apiKey: resolved.key, ...this.fetchOpts() });
@@ -225,8 +237,9 @@ export class MediaAdminService {
         throw new MediaError(400, "media_key_invalid");
       throw new MediaError(502, "media_catalog_failed", kind);
     }
-    this.cache.set(kind, { at: this.now(), fp, gen, catalog });
-    return catalog;
+    const answer: MediaCatalog = { ...catalog, generation: `${this.boot}:${gen}` };
+    this.cache.set(kind, { at: this.now(), fp, gen, catalog: answer });
+    return answer;
   }
 
   /**

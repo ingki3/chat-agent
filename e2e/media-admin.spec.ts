@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { ADMIN, MOM, useAccount } from "./helpers.js";
+import { ADMIN, MOM, csrf, useAccount } from "./helpers.js";
 
 /**
  * 관리자 → 미디어 생성 (#238 stage 1). The e2e server (FAKE_RUNTIME) answers for OpenRouter with a scripted fake
@@ -9,6 +9,7 @@ import { ADMIN, MOM, useAccount } from "./helpers.js";
  */
 test("the admin registers an OpenRouter key, picks a model per kind and sets the limits", async ({
   page,
+  baseURL,
 }, info) => {
   test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
   await useAccount(page, ADMIN);
@@ -75,6 +76,20 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await expect(form.getByRole("button", { name: "확인하고 저장" })).toBeDisabled();
   await form.getByLabel("음성 생성 켜기").uncheck();
 
+  // Another tab swaps the key (review r3): this tab still shows wxyz. A manual refresh is refused for the old key
+  // generation, the status is read again, and the new key's own list shows — never its list next to wxyz.
+  const other = await page.request.put("/api/admin/media/key", {
+    headers: csrf(baseURL!),
+    data: { key: "sk-or-v1-e2e-synthetic-other-tab-00000000000dddd" },
+  });
+  expect(other.status()).toBe(200);
+  await expect(keyForm.getByTestId("media-key")).toContainText("wxyz");
+  await form.getByRole("button", { name: "이미지 목록 새로 고침" }).click();
+  await expect(keyForm.getByTestId("media-key")).toContainText("dddd");
+  await expect(keyForm.getByTestId("media-key")).not.toContainText("wxyz");
+  await expect(form.getByTestId("media-model-image")).toContainText("$0.04/image");
+  await expect(form.getByTestId("media-catalog-error-image")).toHaveCount(0);
+
   // Deleting the key: back to none (this e2e server has no .env key).
   page.once("dialog", (d) => void d.accept());
   await keyForm.getByRole("button", { name: "키 지우기" }).click();
@@ -90,9 +105,13 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await keyForm.getByRole("button", { name: "확인하고 저장" }).click();
   await expect(keyForm.getByTestId("media-key")).toContainText("vvvv");
   await expect(form.getByTestId("media-model-image")).toContainText("$0.04/image");
-  page.once("dialog", (d) => void d.accept());
-  await keyForm.getByRole("button", { name: "키 지우기" }).click();
+  // Another tab deletes it: a manual refresh here ends in "키 없음" with no list and no error left over.
+  expect((await page.request.delete("/api/admin/media/key", { headers: csrf(baseURL!) })).status()).toBe(200);
+  await form.getByRole("button", { name: "이미지 목록 새로 고침" }).click();
   await expect(keyForm.getByTestId("media-key")).toContainText("키 없음");
+  await expect(form.getByTestId("media-model-image")).toHaveCount(0);
+  await expect(form.getByTestId("media-catalog-source-image")).toHaveCount(0);
+  await expect(form.getByTestId("media-catalog-error-image")).toHaveCount(0);
 });
 
 test("a member gets neither the tab's data nor the key routes", async ({ page }) => {

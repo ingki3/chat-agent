@@ -171,7 +171,7 @@ describe("media: the OpenRouter reads (#238)", () => {
   it("reads each kind's catalog from its own list, with price and options", async () => {
     const rec = recordingFetch();
     const get = (kind: MediaKind) => fetchCatalog(kind, { apiKey: GOOD_KEY, fetchImpl: rec.fetchImpl });
-    const image = MediaCatalog.parse(await get("image"));
+    const image = MediaCatalog.omit({ generation: true }).parse(await get("image"));
     expect(image.models.map((m) => m.id)).toEqual(["fixture/image-one", "fixture/image-two"]);
     expect(image.models[0]).toMatchObject({
       price: "$0.04/image",
@@ -713,7 +713,7 @@ describe("media: review round 1 regressions (#244)", () => {
   });
 
   /** The service on a real database, with a settings store whose status write can be made to fail. */
-  function service(o: { fetchImpl?: typeof fetch } = {}) {
+  function service(o: { fetchImpl?: typeof fetch; bootId?: string } = {}) {
     const db = createTestDb();
     const real = new SettingsStore(db, crypto.randomBytes(32));
     let failStatus = false;
@@ -737,6 +737,7 @@ describe("media: review round 1 regressions (#244)", () => {
       keys,
       store: new MediaSettingsStore(real),
       fetchImpl: o.fetchImpl ?? fixtureOpenRouterFetch(),
+      ...(o.bootId ? { bootId: o.bootId } : {}),
     });
     return { db, svc, keys, removes, fail: (on: boolean) => (failStatus = on) };
   }
@@ -993,14 +994,51 @@ describe("media: review round 1 regressions (#244)", () => {
     });
   });
 
-  it("round 2: the key view carries a generation that changes with every key change", async () => {
-    const t = service();
-    const g0 = t.svc.view().key.generation;
+  it("round 3: the generation is <process id>:<key changes> — deterministic, and independent of the key", async () => {
+    const a = service({ bootId: "boot01" });
+    const b = service({ bootId: "boot01" });
+    const gens = async (t: ReturnType<typeof service>, key: string) => {
+      const out = [t.svc.view().key.generation];
+      await t.svc.registerKey(key, yes);
+      out.push(t.svc.view().key.generation);
+      await t.svc.deleteKey(yes);
+      out.push(t.svc.view().key.generation);
+      return out;
+    };
+    expect(await gens(a, GOOD_KEY)).toEqual(["boot01:0", "boot01:1", "boot01:2"]);
+    // Another key, same process id: the very same generations (nothing of the key goes into them).
+    expect(await gens(b, KEY_B)).toEqual(["boot01:0", "boot01:1", "boot01:2"]);
+    // The default process id is random hex.
+    expect(service().svc.view().key.generation).toMatch(/^[0-9a-f]{12}:0$/);
+  });
+
+  it("round 3: a catalog answers with the generation it was read with; a read for another generation is refused", async () => {
+    const t = service({ bootId: "boot02" });
     await t.svc.registerKey(GOOD_KEY, yes);
-    const g1 = t.svc.view().key.generation;
-    await t.svc.deleteKey(yes);
-    const g2 = t.svc.view().key.generation;
-    expect(new Set([g0, g1, g2]).size).toBe(3);
-    expect(g1).not.toContain(GOOD_KEY.slice(-4));
+    expect((await t.svc.catalog("image")).generation).toBe("boot02:1");
+    expect((await t.svc.catalog("image", false, "boot02:1")).generation).toBe("boot02:1");
+    await expect(t.svc.catalog("image", false, "boot02:0")).rejects.toMatchObject({
+      code: "media_key_changed",
+      status: 409,
+    });
+    await expect(t.svc.catalog("image", true, "other:1")).rejects.toMatchObject({
+      code: "media_key_changed",
+    });
+    // Through the route too (and a malformed generation is a bad request).
+    const app = await start();
+    await app.api(app.f.cookies.admin, "PUT", "/api/admin/media/key", { key: GOOD_KEY });
+    const view = MediaAdmin.parse((await app.api(app.f.cookies.admin, "GET", "/api/admin/media")).json());
+    const ok = await app.api(
+      app.f.cookies.admin,
+      "GET",
+      `/api/admin/media/catalog/image?generation=${encodeURIComponent(view.key.generation)}`,
+    );
+    expect(ok.statusCode, ok.body).toBe(200);
+    expect(MediaCatalog.parse(ok.json()).generation).toBe(view.key.generation);
+    const stale = await app.api(app.f.cookies.admin, "GET", "/api/admin/media/catalog/image?generation=x:0");
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toEqual({ error: "media_key_changed" });
+    const bad = await app.api(app.f.cookies.admin, "GET", "/api/admin/media/catalog/image?generation=%20");
+    expect(bad.statusCode).toBe(400);
   });
 });
