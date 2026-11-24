@@ -1,12 +1,25 @@
+import crypto from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { ADMIN, MOM, authFile, csrf, useAccount } from "./helpers.js";
+import {
+  ADMIN,
+  MOM,
+  authFile,
+  csrf,
+  newConversation,
+  newMember,
+  sendMessage,
+  signIn,
+  useAccount,
+} from "./helpers.js";
 
 /**
  * 관리자 → 미디어 생성 (#238 stage 1). The e2e server (FAKE_RUNTIME) answers for OpenRouter with a scripted fake
  * (`apps/server/src/media/fixture.ts`): a key starting with `sk-or-v1-e2e` is accepted, any other refused, and the
  * catalogs are small made-up lists — the real openrouter.ai is never called. The settings are server-wide, so the
- * write flow runs in one project only.
+ * write flow runs in one project only, and the tests of this file one after another (the chat test of stage 2
+ * turns the kinds on with a key of its own after the admin flow has left none).
  */
+test.describe.configure({ mode: "serial" });
 let closeOther: (() => Promise<void>) | undefined;
 test.afterEach(async () => {
   await closeOther?.();
@@ -55,8 +68,17 @@ test("the admin registers an OpenRouter key, picks a model per kind and sets the
   await form.getByLabel("영상 모델").selectOption("fixture/video-one");
   await expect(form.getByTestId("media-model-video")).toContainText("최대 12초");
   await form.getByLabel("영상 생성 켜기").check();
-  // Music lists only models with audio output.
-  await expect(form.getByLabel("음악 모델").locator("option")).toHaveCount(2);
+  // Music lists only models with audio output — a voice-chat model last, saying what it is (#238 stage 2).
+  await expect(form.getByLabel("음악 모델").locator("option")).toHaveCount(3);
+  await form.getByLabel("음악 모델").selectOption("fixture/voice-chat");
+  await expect(form.getByTestId("media-model-music")).toContainText("음성 대화 모델(음악 생성용 아님)");
+  await form.getByLabel("음악 모델").selectOption("fixture/music-clip");
+  await expect(form.getByTestId("media-model-music")).toContainText("$0.04/request");
+  await form.getByLabel("음악 모델").selectOption("");
+  // Speech: its price from the general Models API (the speech list has none).
+  await form.getByLabel("음성 모델").selectOption("fixture/voice-one");
+  await expect(form.getByTestId("media-model-speech")).toContainText("$0.000015/character");
+  await form.getByLabel("음성 모델").selectOption("");
 
   await expect(form.getByLabel("1인당 하루 비용 한도 (USD)")).toHaveValue("50");
   await expect(form.getByLabel("한 번 실행에서 이미지 최대 횟수")).toHaveValue("4");
@@ -270,4 +292,104 @@ test("a member gets neither the tab's data nor the key routes", async ({ page })
   await useAccount(page, MOM);
   expect((await page.request.get("/api/admin/media")).status()).toBe(403);
   expect((await page.request.get("/api/admin/media/catalog/image")).status()).toBe(403);
+});
+
+test("stage 2: a generated image shows in the reply, generated speech plays in an audio player", async ({
+  page,
+  browser,
+  baseURL,
+}, info) => {
+  test.skip(info.project.name !== "desktop", "server-wide settings: one project writes them");
+  // The admin: a key of the fixture OpenRouter, image and speech on.
+  const admin = await browser.newContext({ storageState: authFile(ADMIN), baseURL: baseURL! });
+  closeOther = () => admin.close();
+  const status = (await (await admin.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+    settings: Record<string, unknown> & { kinds: Record<string, unknown> };
+  };
+  const put = await admin.request.put("/api/admin/media/key", {
+    headers: csrf(baseURL!),
+    data: {
+      key: "sk-or-v1-e2e-synthetic-chat-000000000000000chat",
+      expectedGeneration: status.key.generation,
+    },
+  });
+  expect(put.status()).toBe(200);
+  const now = (await put.json()) as { settingsRevision: string; settings: typeof status.settings };
+  const saved = await admin.request.put("/api/admin/media/settings", {
+    headers: csrf(baseURL!),
+    data: {
+      settings: {
+        ...now.settings,
+        kinds: {
+          ...now.settings.kinds,
+          image: { enabled: true, model: "fixture/image-one" },
+          speech: { enabled: true, model: "fixture/voice-one" },
+        },
+      },
+      expectedRevision: now.settingsRevision,
+    },
+  });
+  expect(saved.status(), await saved.text()).toBe(200);
+
+  // A family member of its own asks for an image, then for speech.
+  await signIn(page, baseURL!, await newMember(browser, baseURL!, "media-chat"));
+  const conv = await newConversation(page.request, baseURL!, `미디어 ${crypto.randomUUID().slice(0, 8)}`);
+  await page.goto(`/c/${conv.id}`);
+  await sendMessage(page, "/image 노을 진 바다 위 작은 배");
+  const imageReply = page.getByTestId("assistant").last();
+  await expect(imageReply).toHaveAttribute("data-status", "complete");
+  const img = imageReply.getByTestId("file-ref-image");
+  await expect(img).toBeVisible();
+  // Really loaded through the inline route (a 64×64 PNG of the fixture).
+  await expect.poll(() => img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth)).toBe(64);
+  expect(await img.getAttribute("src")).toMatch(/^\/api\/files\/[^/]+\/content\?inline=1$/);
+  await expect(imageReply.getByTestId("file-ref")).toContainText(/image-.*\.png/);
+
+  await sendMessage(page, "/speech 안녕하세요, 오늘 날씨가 좋네요.");
+  const speechReply = page.getByTestId("assistant").last();
+  await expect(speechReply).toHaveAttribute("data-status", "complete");
+  const audio = speechReply.getByTestId("file-ref-audio");
+  await expect(audio).toBeVisible();
+  await expect(audio).toHaveAttribute("controls", "");
+  // The player read the MP3's header (served inline, the page's CSP lets media from 'self').
+  await expect
+    .poll(() => audio.evaluate((el: HTMLAudioElement) => (el.error ? -1 : el.readyState)), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThanOrEqual(1);
+  await expect(speechReply.getByTestId("file-ref")).toContainText(/speech-.*\.mp3/);
+
+  // Back off for the other specs: kinds off, key removed.
+  const after = (await (await admin.request.get("/api/admin/media")).json()) as {
+    key: { generation: string };
+    settingsRevision: string;
+    settings: typeof status.settings;
+  };
+  expect(
+    (
+      await admin.request.put("/api/admin/media/settings", {
+        headers: csrf(baseURL!),
+        data: {
+          settings: {
+            ...after.settings,
+            kinds: {
+              ...after.settings.kinds,
+              image: { enabled: false, model: "fixture/image-one" },
+              speech: { enabled: false, model: "fixture/voice-one" },
+            },
+          },
+          expectedRevision: after.settingsRevision,
+        },
+      })
+    ).status(),
+  ).toBe(200);
+  expect(
+    (
+      await admin.request.delete("/api/admin/media/key", {
+        headers: csrf(baseURL!),
+        data: { expectedGeneration: after.key.generation },
+      })
+    ).status(),
+  ).toBe(200);
 });

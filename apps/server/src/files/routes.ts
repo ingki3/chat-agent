@@ -37,12 +37,18 @@ export const CONVERSATION_FILES_KIND = "conversation-files";
 export const FILE_CODES = ["file_ok", "file_aborted", "invalid_request", ...FILE_ERRORS] as const;
 
 /**
- * Kinds a browser may show in the page (`?inline=1`): raster images only. Everything else — PDF, office files,
- * text — is always a download; active content (SVG, HTML, XML) is not even accepted (FILE_KINDS).
+ * Kinds a browser may show in the page (`?inline=1`): raster images (PNG, JPG, WebP) and audio (M4A, MP3, WAV —
+ * the chat's `<audio>` player, #238). Everything else — PDF, office files, text, video — is always a download;
+ * active content (SVG, HTML, XML) is not even accepted (FILE_KINDS).
  */
-export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg"]);
-/** CSP of every served original: nothing in it may run or load anything, and it gets an opaque origin. */
-export const FILE_CSP = "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'";
+export const INLINE_KINDS: ReadonlySet<FileKind> = new Set(["png", "jpg", "webp", "m4a", "mp3", "wav"]);
+/**
+ * CSP of every served original: nothing in it may run or load anything, and it gets an opaque origin. An image or
+ * an audio file opened on its own is drawn by the browser's own viewer, which loads that one file (`img-src`,
+ * `media-src` 'self'); nothing else.
+ */
+export const FILE_CSP =
+  "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'";
 
 const ERROR_STATUS: Record<FileError | "invalid_request", number> = {
   file_too_large: 413,

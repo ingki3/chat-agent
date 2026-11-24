@@ -210,13 +210,17 @@ describe("media: the OpenRouter reads (#238)", () => {
     const speech = await get("speech");
     expect(speech.models[0]).toMatchObject({
       id: "fixture/voice-one",
-      price: "$0.000015/characters",
+      // Not in the speech list: from the general Models API (`output_modalities=speech`), per character.
+      price: "$0.000015/character",
       options: ["voice: alloy·nova", "response_format: mp3·pcm", "speed: 0.7–1.2"],
     });
     // Music: the general list filtered by audio output — a text-only model there is left out.
     const music = await get("music");
-    expect(music.models.map((m) => m.id)).toEqual(["fixture/music-clip"]);
+    // A voice-chat model (it lists voices) is listed after the music models and says what it is.
+    expect(music.models.map((m) => m.id)).toEqual(["fixture/music-clip", "fixture/voice-chat"]);
     expect(music.models[0]!.price).toBe("$0.04/request");
+    expect(music.models[0]!.voiceChat).toBeUndefined();
+    expect(music.models[1]).toMatchObject({ voiceChat: true, options: ["음성 대화 모델(음악 생성용 아님)"] });
     const video = await get("video");
     expect(video.models[0]).toMatchObject({
       id: "fixture/video-one",
@@ -224,9 +228,13 @@ describe("media: the OpenRouter reads (#238)", () => {
       maxDurationSec: 12,
     });
     expect(video.models[0]!.options).toContain("길이: 4·6·8·12초");
+    // Image prices from each model's endpoint records (built from the id), speech prices from the Models API.
     expect(rec.requests.map((r) => r.url)).toEqual([
       MEDIA_CATALOG_URLS.image,
+      "https://openrouter.ai/api/v1/images/models/fixture/image-one/endpoints",
+      "https://openrouter.ai/api/v1/images/models/fixture/image-two/endpoints",
       MEDIA_CATALOG_URLS.speech,
+      "https://openrouter.ai/api/v1/models?output_modalities=speech",
       MEDIA_CATALOG_URLS.music,
       MEDIA_CATALOG_URLS.video,
     ]);
@@ -418,11 +426,12 @@ describe("관리자 → 미디어 생성 (#238)", () => {
       expect(r.statusCode, r.body).toBe(200);
       expect(MediaCatalog.parse(r.json()).models.length).toBeGreaterThan(0);
     }
-    expect(t.requests.length - before).toBe(4);
+    // Image: the list and one price read per model (2); speech: the list and the Models API prices.
+    expect(t.requests.length - before).toBe(7);
     await t.api(t.f.cookies.admin, "GET", "/api/admin/media/catalog/image");
-    expect(t.requests.length - before).toBe(4);
+    expect(t.requests.length - before).toBe(7);
     await t.api(t.f.cookies.admin, "GET", "/api/admin/media/catalog/image?fresh=1");
-    expect(t.requests.length - before).toBe(5);
+    expect(t.requests.length - before).toBe(10);
     expect((await t.api(t.f.cookies.owner, "GET", "/api/admin/media/catalog/image")).statusCode).toBe(403);
   });
 
@@ -847,7 +856,7 @@ describe("media: review round 1 regressions (#244)", () => {
     expect(rec.requests.length).toBe(n);
     await t.svc.registerKey(KEY_B, t.svc.generation(), yes);
     await t.svc.catalog("speech");
-    const last = rec.requests.at(-1)!;
+    const last = rec.requests.at(-2)!;
     expect(last.url).toBe(MEDIA_CATALOG_URLS.speech);
     expect(new Headers(last.init.headers).get("authorization")).toBe(`Bearer ${KEY_B}`);
   });

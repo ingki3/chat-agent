@@ -104,6 +104,7 @@ import { MediaBudget } from "./media/budget.js";
 import { MediaAdminService } from "./media/service.js";
 import { registerMediaRoutes } from "./media/routes.js";
 import { fixtureOpenRouterFetch } from "./media/fixture.js";
+import { MediaGenerator } from "./media/generate.js";
 import { youtubeState, type YoutubeState } from "./youtube/packages.js";
 import { sandboxedYoutubeRunner, type YoutubeRunner } from "./youtube/runner.js";
 import { YoutubeAudioFetcher } from "./youtube/service.js";
@@ -212,7 +213,13 @@ declare module "fastify" {
      * tools read these); undefined without a database.
      */
     media:
-      | { keys: OpenRouterKeys; settings: MediaSettingsStore; budget: MediaBudget; admin: MediaAdminService }
+      | {
+          keys: OpenRouterKeys;
+          settings: MediaSettingsStore;
+          budget: MediaBudget;
+          admin: MediaAdminService;
+          tools: MediaGenerator;
+        }
       | undefined;
     /**
      * The data folder's file-write lock (#37): every writer of files under `files/`, `artifacts/` or `sources/`
@@ -356,7 +363,7 @@ export type BuildOptions = {
    * 미디어 생성 (#238): OpenRouter's answers (tests mock it; the FAKE_RUNTIME e2e run uses a scripted one — no
    * real call either way) and the budget's clock.
    */
-  media?: { fetchImpl?: typeof fetch; now?: () => number };
+  media?: { fetchImpl?: typeof fetch; now?: () => number; sleep?: (ms: number) => Promise<void> };
   python?: {
     runner?: PythonRunner;
     state?: () => ScratchpadState;
@@ -628,16 +635,31 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       store: mediaSettings,
       ...mediaFetch,
     });
+    const mediaBudget = new MediaBudget(
+      opts.db!,
+      () => mediaSettings.get(),
+      usageService.timeZone,
+      opts.media?.now ?? opts.usage?.now ?? Date.now,
+    );
+    // image_generate / speech_generate (#238 stage 2): offered while the kind is on (관리자 → 미디어 생성).
+    const mediaTools = new MediaGenerator({
+      db: opts.db!,
+      files: () => app.files,
+      keys: openRouterKeys,
+      settings: mediaSettings,
+      budget: mediaBudget,
+      usage,
+      users,
+      fetchImpl: mediaFetchImpl,
+      secrets: config.skillSecrets,
+      ...(opts.media?.sleep ? { sleep: opts.media.sleep } : {}),
+    });
     app.decorate("media", {
       keys: openRouterKeys,
       settings: mediaSettings,
-      budget: new MediaBudget(
-        opts.db!,
-        () => mediaSettings.get(),
-        usageService.timeZone,
-        opts.media?.now ?? opts.usage?.now ?? Date.now,
-      ),
+      budget: mediaBudget,
       admin: mediaAdmin,
+      tools: mediaTools,
     });
     registerMediaRoutes(app, { users, media: mediaAdmin });
     // Web search and fetch (#50): results are stored as sources of the run's conversation.
@@ -933,6 +955,7 @@ export async function buildApp(config: Config, opts: BuildOptions = {}): Promise
       ...(config.pythonRun || opts.python?.runner ? { scratchpad } : {}),
       audio,
       youtube,
+      media: mediaTools,
       // Finance tools (#30): the OpenDART key and the SEC contact come from `.env` (SKILL_SECRET_NAMES).
       finance: {
         secrets: config.skillSecrets,

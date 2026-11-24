@@ -149,6 +149,8 @@ export const MediaModel = z.object({
   options: z.array(z.string()),
   /** Video only: the longest length the model lists (seconds). */
   maxDurationSec: z.number().nullable().optional(),
+  /** Music only: a voice-chat model (it lists voices — GPT Audio and the like), not a music model. */
+  voiceChat: z.boolean().optional(),
 });
 export type MediaModel = z.infer<typeof MediaModel>;
 
@@ -174,4 +176,67 @@ export const MEDIA_ERRORS: Record<string, string> = {
   media_key_changed: "그사이 OpenRouter 키가 바뀌었어요. 목록을 다시 불러오세요.",
   media_settings_changed: "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러왔어요 — 다시 확인 후 저장하세요.",
   media_model_unknown: "고른 모델이 OpenRouter 목록에 없어요. 목록을 새로 불러와 다시 고르세요.",
+};
+
+// ---------------------------------------------------------------- stage 2: the tools
+
+/** `image_generate` / `speech_generate` (#238 stage 2): input limits and the stored files. */
+export const MEDIA_TOOL_LIMITS = {
+  promptChars: 4000,
+  speechChars: 4000,
+  instructionsChars: 500,
+  voiceChars: 100,
+  /** Conversation images an image call may take as references (png·jpg·webp of the same conversation). */
+  referenceFiles: 4,
+  referenceBytes: 10 * 1024 * 1024,
+  /** How long one generation may take (the image providers can take a minute). */
+  imageTimeoutMs: 180_000,
+  speechTimeoutMs: 120_000,
+  /** Tries of `GET /generation?id=` after a speech call (its record can lag a little), and the wait between. */
+  costTries: 3,
+  costWaitMs: 1500,
+} as const;
+
+/** Outcome codes of the media tools (fixed: logged and shown to the model). */
+export const MEDIA_TOOL_CODES = [
+  "media_ok",
+  "media_disabled",
+  "media_no_key",
+  "media_bad_input",
+  "media_not_allowed",
+  "media_quota",
+  "media_budget",
+  "media_secret_blocked",
+  "media_bad_option",
+  "media_unsupported_model",
+  "media_reference_invalid",
+  "media_refused",
+  "media_payment",
+  "media_rate_limited",
+  "media_failed",
+  "media_file_limit",
+  "media_cancelled",
+  "media_busy",
+] as const;
+export type MediaToolCode = (typeof MEDIA_TOOL_CODES)[number];
+
+/** What the model is told with a refusal (fixed words; it relays them to the user in its own words). */
+export const MEDIA_TOOL_HINTS: Partial<Record<MediaToolCode, string>> = {
+  media_disabled: "관리자가 이 생성 기능을 꺼 두었거나 모델을 정하지 않았어요. 관리자에게 켜 달라고 하세요.",
+  media_no_key: "OpenRouter 키가 없어 만들 수 없어요. 관리자에게 키 등록을 부탁하세요.",
+  media_quota: "이번 답변에서 만들 수 있는 횟수를 다 썼어요. 다음 메시지에서 다시 요청해 주세요.",
+  media_budget:
+    "오늘 쓸 수 있는 미디어 생성 비용 한도에 닿았어요. 내일 다시 하거나 관리자에게 한도를 물어보세요.",
+  media_bad_option: "이 모델이 받지 않는 옵션이에요. hint의 값 중에서 고르거나 옵션을 빼고 다시 해 보세요.",
+  media_unsupported_model:
+    "관리자가 고른 모델이 이 서버가 저장할 수 있는 형식(이미지 png·jpg·webp, 음성 mp3)을 내놓지 않아요. 관리자에게 다른 모델을 부탁하세요.",
+  media_reference_invalid:
+    "참고 이미지는 이 대화의 png·jpg·webp 파일(10MB 이하, 4개까지)만 쓸 수 있어요. file_list의 fileId를 쓰세요.",
+  media_refused:
+    "제공자가 이 요청을 거절했어요(내용 정책일 수 있어요). 요청을 바꾸지 말고 사용자에게 그대로 알리세요.",
+  media_payment: "OpenRouter 잔액이나 키 한도가 부족해요. 관리자에게 알려 주세요.",
+  media_rate_limited: "OpenRouter가 잠시 요청을 막았어요. 조금 뒤에 다시 해 보세요.",
+  media_failed: "생성하지 못했어요. 잠시 뒤에 다시 해 보거나 사용자에게 알리세요.",
+  media_file_limit: "이 대화의 파일이 너무 많아(20개) 저장할 수 없어요. 새 대화에서 해 주세요.",
+  media_busy: "다른 생성이 진행 중이에요. 끝난 뒤에 다시 해 주세요.",
 };

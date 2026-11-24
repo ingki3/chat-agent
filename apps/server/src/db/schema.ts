@@ -816,6 +816,7 @@ export const files = sqliteTable(
         "md",
         "png",
         "jpg",
+        "webp",
         "m4a",
         "mp3",
         "wav",

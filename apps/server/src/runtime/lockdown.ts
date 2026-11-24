@@ -3,13 +3,21 @@
  * (isolation/sandbox.ts) is the second. The adapters (#15, #16) pass these settings unchanged.
  */
 import { AUDIO_TRANSCRIBE_TOOL } from "@agentlee/mcp-tools/audio";
+import { IMAGE_GENERATE_TOOL, SPEECH_GENERATE_TOOL } from "@agentlee/mcp-tools/media";
 import { YOUTUBE_AUDIO_TOOL } from "@agentlee/mcp-tools/youtube";
-import { AUDIO_LIMITS, YOUTUBE_LIMITS } from "@agentlee/shared";
+import { AUDIO_LIMITS, MEDIA_TOOL_LIMITS, YOUTUBE_LIMITS } from "@agentlee/shared";
 
-/** Our tools that may take minutes (#173, #191), with the call budget each one enforces itself. */
+/** Our tools that may take minutes (#173, #191, #238), with the call budget each one enforces itself. */
 const SLOW_TOOLS: readonly { name: string; callTimeoutMs: number }[] = [
   { name: AUDIO_TRANSCRIBE_TOOL.name, callTimeoutMs: AUDIO_LIMITS.callTimeoutMs },
   { name: YOUTUBE_AUDIO_TOOL.name, callTimeoutMs: YOUTUBE_LIMITS.callTimeoutMs },
+  { name: IMAGE_GENERATE_TOOL.name, callTimeoutMs: MEDIA_TOOL_LIMITS.imageTimeoutMs + 30_000 },
+  {
+    name: SPEECH_GENERATE_TOOL.name,
+    callTimeoutMs:
+      MEDIA_TOOL_LIMITS.speechTimeoutMs +
+      MEDIA_TOOL_LIMITS.costTries * (MEDIA_TOOL_LIMITS.costWaitMs + 15_000),
+  },
 ];
 
 export const AGENTLEE_MCP = "agentlee";

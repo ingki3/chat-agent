@@ -23,6 +23,39 @@ export const MEDIA_CATALOG_URLS: Record<MediaKind, string> = {
   video: `${OPENROUTER_API}/videos/models`,
 };
 
+/**
+ * Where the prices are when a kind's own catalog has none (OpenRouter docs and OpenAPI spec, 2026-11-24):
+ *
+ * - images: `/images/models` gives each model's `endpoints` as a **URL string** (`/api/v1/images/models/<id>/endpoints`);
+ *   the per-endpoint records there carry `pricing: [{ billable, unit, cost_usd, variant? }]`. The URL is built here
+ *   from the model id (never followed from the answer);
+ * - speech: `/audio/speech/models` has no prices at all; the general Models API lists TTS models with
+ *   `output_modalities=speech` and a `pricing` map of decimal strings (`prompt` per character of input, `completion`
+ *   per second of audio for per-second models — TTS guide "Pricing");
+ * - music: the general Models API's `pricing` map itself (`prompt`, `completion`, `request`, `audio_output`, …).
+ */
+export const SPEECH_PRICING_URL = `${OPENROUTER_API}/models?output_modalities=speech`;
+/** `author/slug` (maybe `:variant`) — the only shape put into a per-model URL. */
+const MODEL_PATH = /^[A-Za-z0-9._~-]{1,100}\/[A-Za-z0-9._~:-]{1,100}$/;
+const modelPath = (id: string) =>
+  MODEL_PATH.test(id) && !id.includes("..") ? id.split("/").map(encodeURIComponent).join("/") : null;
+/** An image model's per-endpoint records (pricing, definitive parameters); null for an id of another shape. */
+export const imageEndpointsUrl = (id: string): string | null => {
+  const p = modelPath(id);
+  return p ? `${OPENROUTER_API}/images/models/${p}/endpoints` : null;
+};
+/** A speech model with each endpoint's own parameters (voices); null for an id of another shape. */
+export const speechModelUrl = (id: string): string | null => {
+  const p = modelPath(id);
+  return p ? `${OPENROUTER_API}/audio/speech/models/${p}` : null;
+};
+export const OPENROUTER_IMAGES_URL = `${OPENROUTER_API}/images`;
+export const OPENROUTER_SPEECH_URL = `${OPENROUTER_API}/audio/speech`;
+/** `GET /generation?id=` (a generation's cost, `data.total_cost`); the id as OpenRouter writes it. */
+export const GENERATION_ID = /^gen-[0-9A-Za-z-]{1,124}$/;
+export const generationUrl = (id: string): string | null =>
+  GENERATION_ID.test(id) ? `${OPENROUTER_API}/generation?id=${id}` : null;
+
 export const OPENROUTER_TIMEOUT_MS = 15_000;
 /** The largest answer read (the models list is the big one). */
 export const OPENROUTER_MAX_BYTES = 8 * 1024 * 1024;
@@ -72,31 +105,8 @@ export async function openRouterGet(
  * answer without `Content-Length`, or a compressed one, is never read to its end). Same as the Cloudflare client.
  */
 export async function readLimited(res: Response, max: number = OPENROUTER_MAX_BYTES): Promise<string> {
-  if (!res.body) return "";
-  const declared = Number(res.headers.get("content-length") ?? NaN);
-  if (Number.isFinite(declared) && declared > max) {
-    await res.body.cancel().catch(() => {});
-    throw new OpenRouterError("failed");
-  }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > max) {
-        await reader.cancel().catch(() => {});
-        throw new OpenRouterError("failed");
-      }
-      chunks.push(value);
-    }
-  } catch {
-    throw new OpenRouterError("failed");
-  }
   // As `Response.text()` decodes: UTF-8, a leading BOM dropped.
-  return new TextDecoder("utf-8").decode(Buffer.concat(chunks));
+  return new TextDecoder("utf-8").decode(await readBytes(res, max));
 }
 
 /**
@@ -139,6 +149,14 @@ const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? 
 const MODEL_ID = /^[A-Za-z0-9._~:/-]{1,200}$/;
 const clip = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
+/** "$0.0000006", never "$6e-7": up to 6 significant digits, plain decimals (per-character prices are tiny). */
+const USD = new Intl.NumberFormat("en-US", {
+  maximumSignificantDigits: 6,
+  maximumFractionDigits: 12,
+  useGrouping: false,
+});
+const usd = (n: number) => `$${USD.format(n)}`;
+
 /** "$0.04 / image"-like texts from a price map (USD amounts as numbers or decimal strings): the non-zero ones. */
 export function priceText(pricing: unknown, unitOf: (key: string) => string = (k) => k): string | null {
   if (!isObj(pricing)) return null;
@@ -146,7 +164,7 @@ export function priceText(pricing: unknown, unitOf: (key: string) => string = (k
   for (const [k, v] of Object.entries(pricing)) {
     const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
     if (!Number.isFinite(n) || n <= 0) continue;
-    parts.push(`$${String(+n.toPrecision(6))}/${clip(unitOf(k), 30)}`);
+    parts.push(`${usd(n)}/${clip(unitOf(k), 30)}`);
     if (parts.length >= 3) break;
   }
   return parts.length ? parts.join(", ") : null;
@@ -176,28 +194,65 @@ export function optionTexts(params: unknown): string[] {
 const listOf = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x) => typeof x === "string" || typeof x === "number").map(String) : [];
 
-/** First pricing found on a speech/image entry or its endpoints (the shapes differ by catalog). */
+/** `[{billable, unit, cost_usd}]` price lines (the image endpoints' shape): "$0.05/image" (the output's, if listed). */
+export function priceLines(lines: unknown): string | null {
+  if (!Array.isArray(lines)) return null;
+  const rows = lines
+    .filter(isObj)
+    .map((l) => ({
+      out: l.billable === "output_image",
+      unit: str(l.unit) ?? str(l.billable) ?? "단위",
+      variant: str(l.variant),
+      cost: typeof l.cost_usd === "number" ? l.cost_usd : Number(str(l.cost_usd) ?? NaN),
+    }))
+    .filter((l) => Number.isFinite(l.cost) && l.cost > 0);
+  // The output image's price when listed (what a call costs); the input lines only when there is none.
+  const shown = rows.some((l) => l.out) ? rows.filter((l) => l.out) : rows;
+  const texts = [
+    ...new Set(
+      shown.map((l) => `${usd(l.cost)}/${clip(l.unit, 30)}${l.variant ? ` (${clip(l.variant, 20)})` : ""}`),
+    ),
+  ].slice(0, 3);
+  return texts.length ? texts.join(", ") : null;
+}
+
+/** First pricing found on an entry or its inline endpoints (a map, or the image endpoints' price lines). */
 function entryPrice(e: Json): string | null {
-  const direct = priceText(e.pricing);
+  const direct = priceText(e.pricing) ?? priceLines(e.pricing);
   if (direct) return direct;
   if (Array.isArray(e.endpoints))
     for (const ep of e.endpoints) {
       if (!isObj(ep)) continue;
-      const p = priceText(ep.pricing);
+      const p = priceText(ep.pricing) ?? priceLines(ep.pricing);
       if (p) return p;
-      if (Array.isArray(ep.pricing)) {
-        // `[{billable, unit, cost_usd}]` lines (the image endpoints' shape)
-        const lines = ep.pricing
-          .filter(isObj)
-          .map((l) => ({ unit: str(l.unit) ?? str(l.billable) ?? "단위", cost: Number(l.cost_usd) }))
-          .filter((l) => Number.isFinite(l.cost) && l.cost > 0)
-          .slice(0, 3)
-          .map((l) => `$${String(+l.cost.toPrecision(6))}/${clip(l.unit, 30)}`);
-        if (lines.length) return lines.join(", ");
-      }
     }
   return null;
 }
+
+/** The lowest per-image output price of an image model's endpoint records (USD), for a call's estimate. */
+export function imageUnitCost(endpoints: unknown): number | null {
+  if (!Array.isArray(endpoints)) return null;
+  let best: number | null = null;
+  for (const ep of endpoints) {
+    if (!isObj(ep) || !Array.isArray(ep.pricing)) continue;
+    for (const l of ep.pricing) {
+      if (!isObj(l) || l.billable !== "output_image" || l.unit !== "image") continue;
+      const c = typeof l.cost_usd === "number" ? l.cost_usd : NaN;
+      if (Number.isFinite(c) && c >= 0) best = best === null ? c : Math.min(best, c);
+    }
+  }
+  return best;
+}
+
+/** Speech prices of the general Models API (`prompt`: per character of input, `completion`: per second). */
+const SPEECH_UNITS: Record<string, string> = { prompt: "character", completion: "second" };
+
+/**
+ * Music: the general Models API lists every model with audio output — music models (Lyria) and voice-chat models
+ * (GPT Audio and the like) alike. The documented tell is `supported_voices`: a voice-chat model lists its voices, a
+ * music model has none (null). Such models stay listed (the admin decides) but say what they are.
+ */
+export const VOICE_CHAT_NOTE = "음성 대화 모델(음악 생성용 아님)";
 
 function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
   const id = str(e.id);
@@ -225,11 +280,13 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
   if (kind === "music") {
     const arch = isObj(e.architecture) ? e.architecture : {};
     if (!listOf(arch.output_modalities).includes("audio")) return null;
+    const voiceChat = listOf(e.supported_voices).length > 0;
     return {
       id,
       name,
       price: priceText(e.pricing),
-      options: optionTexts(e.supported_parameters),
+      options: [...(voiceChat ? [VOICE_CHAT_NOTE] : []), ...optionTexts(e.supported_parameters)].slice(0, 12),
+      ...(voiceChat ? { voiceChat: true } : {}),
     };
   }
   if (kind === "speech") {
@@ -242,12 +299,72 @@ function parseEntry(kind: MediaKind, e: Json): MediaModel | null {
   return { id, name, price: entryPrice(e), options: optionTexts(e.supported_parameters) };
 }
 
-/** A kind's catalog as the screen lists it (entries that do not parse are left out, never guessed). */
+/** Runs `fn` over `items`, at most `limit` at a time. */
+async function eachLimited<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) await fn(items[next++]!);
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
+/** Per-model price reads at once (the image catalog), and the whole price read's time budget. */
+export const PRICE_READS_AT_ONCE = 6;
+export const PRICE_READS_BUDGET_MS = 20_000;
+
+/**
+ * Fills in the prices a kind's catalog does not carry itself (see `SPEECH_PRICING_URL`). Best effort: a price that
+ * cannot be read stays null ("목록에 없음") — the list itself is never failed by it.
+ */
+async function addPrices(
+  kind: MediaKind,
+  models: MediaModel[],
+  o: { apiKey?: string | undefined; fetchImpl?: typeof fetch },
+): Promise<void> {
+  if (kind === "speech") {
+    if (models.every((m) => m.price)) return;
+    let answer: unknown;
+    try {
+      answer = await openRouterGet(SPEECH_PRICING_URL, o);
+    } catch {
+      return;
+    }
+    const data = isObj(answer) && Array.isArray(answer.data) ? answer.data : [];
+    const byId = new Map<string, string>();
+    for (const e of data) {
+      if (!isObj(e)) continue;
+      const id = str(e.id);
+      const price = priceText(e.pricing, (k) => SPEECH_UNITS[k] ?? k);
+      if (id && price && !byId.has(id)) byId.set(id, price);
+    }
+    for (const m of models) m.price ??= byId.get(m.id) ?? null;
+    return;
+  }
+  if (kind !== "image") return;
+  const missing = models.filter((m) => !m.price && imageEndpointsUrl(m.id));
+  const deadline = AbortSignal.timeout(PRICE_READS_BUDGET_MS);
+  await eachLimited(missing, PRICE_READS_AT_ONCE, async (m) => {
+    if (deadline.aborted) return;
+    try {
+      const answer = await openRouterGet(imageEndpointsUrl(m.id)!, o);
+      const eps = isObj(answer) && Array.isArray(answer.endpoints) ? answer.endpoints : [];
+      m.price = entryPrice({ endpoints: eps });
+    } catch {
+      // stays null
+    }
+  });
+}
+
+/**
+ * A kind's catalog as the screen lists it (entries that do not parse are left out, never guessed). `prices: false`
+ * (a save's model check) reads only the list itself.
+ */
 export async function fetchCatalog(
   kind: MediaKind,
-  o: { apiKey?: string | undefined; fetchImpl?: typeof fetch },
+  o: { apiKey?: string | undefined; fetchImpl?: typeof fetch; prices?: boolean },
 ): Promise<Omit<MediaCatalog, "generation">> {
-  const answer = await openRouterGet(MEDIA_CATALOG_URLS[kind], o);
+  const req = { apiKey: o.apiKey, ...(o.fetchImpl ? { fetchImpl: o.fetchImpl } : {}) };
+  const answer = await openRouterGet(MEDIA_CATALOG_URLS[kind], req);
   const data = isObj(answer) && Array.isArray(answer.data) ? answer.data : null;
   if (!data) throw new OpenRouterError("failed");
   const seen = new Set<string>();
@@ -260,6 +377,81 @@ export async function fetchCatalog(
     models.push(m);
     if (models.length >= CATALOG_MAX_MODELS) break;
   }
-  models.sort((a, b) => a.id.localeCompare(b.id));
+  if (o.prices !== false) await addPrices(kind, models, req);
+  models.sort((a, b) => Number(!!a.voiceChat) - Number(!!b.voiceChat) || a.id.localeCompare(b.id));
   return { kind, source: MEDIA_CATALOG_URLS[kind].replace("https://openrouter.ai", ""), models };
+}
+
+// ---------------------------------------------------------------- generation requests
+
+/**
+ * One POST of a generation (`/images`, `/audio/speech`) to its fixed URL: JSON body, key only in `Authorization`,
+ * redirects refused, every text of the body checked by the caller first. The `Response` when OK (the caller reads
+ * it with `readLimited` / `readBytes`); otherwise `MediaHttpError` with the status (the body is not read).
+ */
+export class MediaHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`http_${status}`);
+  }
+}
+
+export async function openRouterPost(
+  url: string,
+  body: Record<string, unknown>,
+  o: {
+    apiKey: string;
+    fetchImpl?: typeof fetch | undefined;
+    timeoutMs: number;
+    signal?: AbortSignal | undefined;
+  },
+): Promise<Response> {
+  if ((url !== OPENROUTER_IMAGES_URL && url !== OPENROUTER_SPEECH_URL) || carriesSecret([url]))
+    throw new MediaHttpError(0);
+  const doFetch = o.fetchImpl ?? fetch;
+  const timeout = AbortSignal.timeout(o.timeoutMs);
+  let res: Response;
+  try {
+    res = await doFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${o.apiKey}` },
+      body: JSON.stringify(body),
+      redirect: "error",
+      signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
+    });
+  } catch {
+    throw new MediaHttpError(0);
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new MediaHttpError(res.status);
+  }
+  return res;
+}
+
+/** The answer's bytes, at most `max` (a declared or streamed length over it is `OpenRouterError`). */
+export async function readBytes(res: Response, max: number): Promise<Buffer> {
+  if (!res.body) return Buffer.alloc(0);
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body.cancel().catch(() => {});
+    throw new OpenRouterError("failed");
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        throw new OpenRouterError("failed");
+      }
+      chunks.push(value);
+    }
+  } catch {
+    throw new OpenRouterError("failed");
+  }
+  return Buffer.concat(chunks);
 }

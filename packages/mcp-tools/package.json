@@ -59,6 +59,11 @@
       "development": "./src/youtube.ts",
       "default": "./dist/youtube.js"
     },
+    "./media": {
+      "types": "./src/media.ts",
+      "development": "./src/media.ts",
+      "default": "./dist/media.js"
+    },
     "./memory": {
       "types": "./src/memory.ts",
       "development": "./src/memory.ts",
