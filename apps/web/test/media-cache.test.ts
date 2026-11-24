@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { onlineManager, QueryClient } from "@tanstack/react-query";
 import { DEFAULT_MEDIA_SETTINGS, MEDIA_KINDS, type MediaAdmin, type MediaCatalog } from "@agentlee/shared";
 import {
   catalogView,
+  anySavePaused,
   conflictNotice,
   draftBase,
+  SETTINGS_SAVE_KEY,
   pendingText,
   readState,
   expectedRevision,
@@ -439,5 +442,39 @@ describe("media admin screen rules (#238)", () => {
     // A paused write says it waits for the connection.
     expect(pendingText(true, "확인 중…")).toBe("연결을 기다리는 중…");
     expect(pendingText(false, "확인 중…")).toBe("확인 중…");
+  });
+
+  it("r13: an offline-paused settings save is found in the MutationCache by its key (any form knows)", async () => {
+    const qc = new QueryClient();
+    qc.mount(); // resumes paused mutations when back online, as the app's client does
+    const find = () =>
+      anySavePaused(
+        qc
+          .getMutationCache()
+          .findAll({ mutationKey: SETTINGS_SAVE_KEY, status: "pending" })
+          .map((m) => m.state.isPaused),
+      );
+    expect(find()).toBe(false);
+    onlineManager.setOnline(false);
+    try {
+      let finish: () => void = () => {};
+      const done = new Promise<void>((r) => (finish = r));
+      const mutation = qc.getMutationCache().build(qc, {
+        mutationKey: SETTINGS_SAVE_KEY,
+        mutationFn: () => done,
+      });
+      const run = mutation.execute(undefined);
+      await new Promise((r) => setTimeout(r, 0));
+      // Offline: pending and paused — the same cache a newly mounted form reads.
+      expect(find()).toBe(true);
+      onlineManager.setOnline(true);
+      finish();
+      await run;
+      expect(find()).toBe(false);
+    } finally {
+      onlineManager.setOnline(true);
+      qc.unmount();
+    }
+    expect(anySavePaused([])).toBe(false);
   });
 });

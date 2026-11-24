@@ -324,6 +324,11 @@ export function conflictNotice(refreshed: boolean, read: ReadState): string | nu
   return "다른 곳에서 설정이 바뀌었어요. 최신 값을 불러오는 중…";
 }
 
+/** The settings save's mutation key: its pause is read from the MutationCache, so any mounted form knows (r13). */
+export const SETTINGS_SAVE_KEY = ["admin", "media-settings-save"] as const;
+/** Whether any pending settings save is paused (waiting for the connection). */
+export const anySavePaused = (paused: readonly boolean[]): boolean => paused.some(Boolean);
+
 /** A write's button text while it is out: waiting for the connection (a paused mutation), or under way. */
 export const pendingText = (paused: boolean, busy: string): string => (paused ? "연결을 기다리는 중…" : busy);
 

@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type FormEvent } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MEDIA_KIND_LABEL,
   MEDIA_KINDS,
@@ -12,8 +12,10 @@ import { admin, ApiError, errorText } from "../api.js";
 import { usd } from "../usage-format.js";
 import {
   catalogView,
+  anySavePaused,
   conflictNotice,
   draftBase,
+  SETTINGS_SAVE_KEY,
   pendingText,
   readState,
   type ReadState,
@@ -323,8 +325,16 @@ function SettingsForm({
     busy: store.op !== null,
   });
   const base = draftBase(editBase, pending);
+  // Read from the MutationCache, not this form's observer: a form mounted after the save was sent knows it too.
+  const savePaused = anySavePaused(
+    useMutationState({
+      filters: { mutationKey: SETTINGS_SAVE_KEY, status: "pending" },
+      select: (mu) => mu.state.isPaused,
+    }),
+  );
   const conflict = failed === "media_settings_changed";
   const save = useMutation({
+    mutationKey: SETTINGS_SAVE_KEY,
     // Only the values and version fixed at the click are sent.
     mutationFn: (o: { id: number; values: MediaSettings; revision: string }) =>
       admin.saveMediaSettings(o.values, o.revision),
@@ -502,7 +512,7 @@ function SettingsForm({
         ) : (
           <span className="actions">
             <button className="primary" disabled={invalid || locked}>
-              {pending?.phase === "sending" ? pendingText(save.isPaused, "모델 확인 중…") : "확인하고 저장"}
+              {pending?.phase === "sending" ? pendingText(savePaused, "모델 확인 중…") : "확인하고 저장"}
             </button>
           </span>
         )}
